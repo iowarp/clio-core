@@ -1,7 +1,7 @@
 # Dockerfile for building the Content Transfer Engine (CTE)
 # Inherits from iowarp/iowarp-cte-build:latest which contains all build dependencies
 
-FROM iowarp/iowarp-runtime-build:latest
+FROM iowarp/iowarp-deps:latest
 
 # Set working directory
 WORKDIR /workspace

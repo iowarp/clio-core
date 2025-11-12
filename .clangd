@@ -1,11 +1,9 @@
 ---
 CompileFlags:
-  Add: 
-    - -I/mnt/home/Projects/iowarp/iowarp-runtime/include
-    - -I/mnt/home/Projects/iowarp/iowarp-runtime/chimods/admin/include
-    - -I/mnt/home/Projects/iowarp/iowarp-runtime/chimods/bdev/include
-    - -I/mnt/home/Projects/iowarp/iowarp-runtime/chimods/MOD_NAME/include
   CompilationDatabase: ./build
+  Remove:
+    - -march=*
+    - -mtune=*
 
 Index:
   Background: Build
@@ -18,6 +16,12 @@ Diagnostics:
     Remove:
       - readability-magic-numbers
       - readability-identifier-length
+  Suppress:
+    - pp_file_not_found
+    - undeclared_var_use
+    - expected_class_name
+    - unknown_typename
+    - fatal_too_many_errors
 
 InlayHints:
   Enabled: true
