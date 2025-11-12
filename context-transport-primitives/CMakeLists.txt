@@ -27,7 +27,13 @@ option(HSHM_ENABLE_LIBFABRIC "Enable Libfabric transport" OFF)
 option(HSHM_ENABLE_THALLIUM "Build tests which depend on thallium" OFF)
 option(HSHM_ENABLE_OPENMP "Enable the use of OpenMP" OFF)
 option(HSHM_ENABLE_CEREAL "Enable serialization using cereal" ON)
-option(HSHM_ENABLE_COVERAGE "Check how well tests cover code" OFF)
+# Coverage is controlled by WRP_CORE_ENABLE_COVERAGE in root CMakeLists.txt
+# Set local variable for backward compatibility with existing checks
+if(DEFINED WRP_CORE_ENABLE_COVERAGE)
+  set(HSHM_ENABLE_COVERAGE ${WRP_CORE_ENABLE_COVERAGE})
+else()
+  set(HSHM_ENABLE_COVERAGE OFF)
+endif()
 option(HSHM_ENABLE_DOXYGEN "Check how well the code is documented" OFF)
 
 option(HSHM_ENABLE_WINDOWS_THREADS "Support spawning windows threads" OFF)

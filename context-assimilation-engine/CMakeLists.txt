@@ -22,7 +22,9 @@ include(CTest)
 # CAE Feature Options - External Library Support
 option(CAE_ENABLE_HDF5 "Enable HDF5 format support in CAE" ON)
 option(CAE_ENABLE_GLOBUS "Enable Globus transfer support in CAE" OFF)
-option(CAE_ENABLE_COVERAGE "Enable code coverage instrumentation" OFF)
+
+# Coverage is controlled by WRP_CORE_ENABLE_COVERAGE in root CMakeLists.txt
+# Root CMakeLists already applies coverage flags globally via add_compile_options/add_link_options
 
 # -----------------------------------------------------------------------------
 # Compiler Optimization
@@ -36,17 +38,6 @@ if(CMAKE_BUILD_TYPE STREQUAL "Debug")
 else()
     message("IN RELEASE MODE")
     add_compile_definitions(CAE_LOG_VERBOSITY=1)
-endif()
-
-# Add coverage flags if enabled
-if(CAE_ENABLE_COVERAGE)
-    message(STATUS "Code coverage: ENABLED")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} --coverage -fprofile-arcs -ftest-coverage")
-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} --coverage -fprofile-arcs -ftest-coverage")
-    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} --coverage")
-    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} --coverage")
-else()
-    message(STATUS "Code coverage: DISABLED")
 endif()
 
 # ------------------------------------------------------------------------------
