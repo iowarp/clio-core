@@ -10,8 +10,20 @@ set(CHIMAERA_COMMON_INCLUDED TRUE)
 # Dependencies
 #------------------------------------------------------------------------------
 
-# Find HermesShm
-find_package(HermesShm CONFIG REQUIRED)
+# Find HermesShm - skip if already available as subdirectory
+# Check for both the namespaced alias (hshm::cxx) and the raw target (cxx)
+if(NOT TARGET hshm::cxx AND NOT TARGET cxx)
+  find_package(HermesShm CONFIG REQUIRED)
+endif()
+
+# Verify HSHM target exists (alias is created in context-transport-primitives/src/CMakeLists.txt)
+if(TARGET hshm::cxx)
+  message(STATUS "Using HermesShm target: hshm::cxx")
+elseif(TARGET cxx)
+  message(STATUS "Using HermesShm target: cxx")
+else()
+  message(FATAL_ERROR "Neither hshm::cxx nor cxx target found")
+endif()
 
 # Find Boost components
 find_package(Boost REQUIRED COMPONENTS fiber context system)

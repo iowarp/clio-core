@@ -11,11 +11,12 @@ add_library(wrp_cte_cae_config SHARED
 target_include_directories(wrp_cte_cae_config PRIVATE
     ${CMAKE_SOURCE_DIR}
     ${CMAKE_SOURCE_DIR}/core/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/..  # For adapter/cae_config.h include
 )
 
 target_link_libraries(wrp_cte_cae_config
     yaml-cpp
-    hshm::cxx
+    ${HSHM_TARGET}
     wrp_cte_core_client
 )
 

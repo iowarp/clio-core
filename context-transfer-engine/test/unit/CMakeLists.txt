@@ -34,6 +34,7 @@ target_link_libraries(cte_core_unit_tests
     wrp_cte_core_runtime         # CTE core runtime library
     chimaera::cxx                # Modern Chimaera core framework target
     chimaera::admin_client       # Modern Chimaera admin target (if needed)
+    chimaera::bdev_client        # Bdev client for BdevType enum
     Catch2::Catch2WithMain       # Catch2 testing framework with main
     MPI::MPI_CXX                 # MPI support if needed
 )
@@ -44,6 +45,7 @@ target_link_libraries(test_core_functionality
     wrp_cte_core_runtime         # CTE core runtime library
     chimaera::cxx                # Modern Chimaera core framework target
     chimaera::admin_client       # Modern Chimaera admin target (if needed)
+    chimaera::bdev_client        # Bdev client for BdevType enum
     Catch2::Catch2WithMain       # Catch2 testing framework with main
     MPI::MPI_CXX                 # MPI support if needed
 )
@@ -54,6 +56,7 @@ target_link_libraries(test_query
     wrp_cte_core_runtime         # CTE core runtime library
     chimaera::cxx                # Modern Chimaera core framework target
     chimaera::admin_client       # Modern Chimaera admin target (if needed)
+    chimaera::bdev_client        # Bdev client for BdevType enum
     Catch2::Catch2WithMain       # Catch2 testing framework with main
     MPI::MPI_CXX                 # MPI support if needed
 )

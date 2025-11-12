@@ -1,80 +1,52 @@
 cmake_minimum_required(VERSION 3.20)
 project(content_transfer_engine)
 
-option(WRP_CTE_ENABLE_PYTHON "Enable Python bindings" ON)
-option(CTE_ENABLE_ASAN "Enable AddressSanitizer for debugging" OFF)
+# Python bindings are controlled by WRP_CORE_ENABLE_PYTHON in root CMakeLists.txt
+# Component-specific option: only effective when WRP_CORE_ENABLE_PYTHON=ON
+option(WRP_CTE_ENABLE_PYTHON "Enable Python bindings for CTE (requires WRP_CORE_ENABLE_PYTHON=ON)" ON)
+# CTE_ENABLE_ASAN is set by root CMakeLists.txt
 
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
+# C++ standard, compile commands, RPATH, ASAN, and output directories are all set by root CMakeLists.txt
 
-# Export compile commands for IDE integration and development tools
-set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+# CTE_ENABLE_CMAKE_DOTENV is set by root CMakeLists.txt
+# DOTENV handling is done by root CMakeLists.txt
 
-# Configure RPATH settings for better runtime linking
-set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
-set(CMAKE_BUILD_WITH_INSTALL_RPATH FALSE)
-if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
-    set(CMAKE_INSTALL_PREFIX "/usr/local" CACHE PATH "Default install prefix" FORCE)
-endif()
-
-# Platform-specific RPATH configuration
-if(APPLE)
-    set(CMAKE_MACOSX_RPATH TRUE)
-    set(CMAKE_INSTALL_RPATH "@loader_path/../lib:@loader_path:${CMAKE_INSTALL_PREFIX}/lib")
-elseif(UNIX)
-    set(CMAKE_INSTALL_RPATH "$ORIGIN/../lib:$ORIGIN:${CMAKE_INSTALL_PREFIX}/lib")
-endif()
-
-# AddressSanitizer (ASAN) configuration
-if(CTE_ENABLE_ASAN)
-    message(STATUS "AddressSanitizer (ASAN) enabled")
-    add_compile_options(-fsanitize=address -fno-omit-frame-pointer)
-    add_link_options(-fsanitize=address)
-endif()
-
-# Set all binary output directories to build/bin
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
-set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
-set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
-
-# For multi-config generators (Visual Studio, Xcode)
-foreach(OUTPUTCONFIG ${CMAKE_CONFIGURATION_TYPES})
-    string(TOUPPER ${OUTPUTCONFIG} OUTPUTCONFIG)
-    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_${OUTPUTCONFIG} ${CMAKE_BINARY_DIR}/bin)
-    set(CMAKE_LIBRARY_OUTPUT_DIRECTORY_${OUTPUTCONFIG} ${CMAKE_BINARY_DIR}/bin)
-    set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY_${OUTPUTCONFIG} ${CMAKE_BINARY_DIR}/bin)
-endforeach()
-
-# Optional: Load .env.cmake if it exists (controlled by CTE_ENABLE_CMAKE_DOTENV option)
-option(CTE_ENABLE_CMAKE_DOTENV "Enable loading .env.cmake file if it exists" OFF)
-
-if(CTE_ENABLE_CMAKE_DOTENV AND EXISTS "${CMAKE_SOURCE_DIR}/.env.cmake")
-    message(STATUS "Loading .env.cmake configuration")
-    include("${CMAKE_SOURCE_DIR}/.env.cmake")
-    
-    # Convert the CMAKE_PREFIX_PATH environment variable to a CMake list and prepend to CMAKE_PREFIX_PATH
-    if(DEFINED ENV{CMAKE_PREFIX_PATH})
-        # Convert colon-separated path to semicolon-separated list for CMake
-        string(REPLACE ":" ";" ENV_CMAKE_PREFIX_PATH "$ENV{CMAKE_PREFIX_PATH}")
-        # Prepend to existing CMAKE_PREFIX_PATH
-        list(PREPEND CMAKE_PREFIX_PATH ${ENV_CMAKE_PREFIX_PATH})
-        message(STATUS "CMAKE_PREFIX_PATH set to: ${CMAKE_PREFIX_PATH}")
-    endif() 
-endif()
+# Add local cmake modules to path
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
 # Find required Chimaera framework packages following MODULE_DEVELOPMENT_GUIDE.md patterns
 # For internal ChiMod development within the main repository, we need the core framework
-find_package(chimaera REQUIRED)              # Core Chimaera (automatically includes ChimaeraCommon.cmake)
-find_package(chimaera_admin REQUIRED)        # Admin ChiMod (often required for ChiMod operations)
+# Skip find_package if targets already exist (unified build as subdirectory)
+if(NOT TARGET chimaera::cxx AND NOT TARGET chimaera_cxx)
+  find_package(chimaera REQUIRED)              # Core Chimaera (automatically includes ChimaeraCommon.cmake)
+  message(STATUS "Found Chimaera package: ${chimaera_FOUND}")
+else()
+  # When built as subdirectory, manually include ChimaeraCommon.cmake
+  message(STATUS "Using Chimaera as subdirectory - including ChimaeraCommon.cmake")
+  list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../runtime/cmake")
+  include(ChimaeraCommon)
+endif()
 
-message(STATUS "Found Chimaera packages:")
-message(STATUS "  chimaera: ${chimaera_FOUND}")
-message(STATUS "  chimaera_admin: ${chimaera_admin_FOUND}")
+# Determine which HermesShm target to use (for both installed and subdirectory modes)
+include(FindHSHMTarget)
 
-# Add nanobind for Python bindings
-find_first_path_python()
-add_subdirectory(external/nanobind)
+if(NOT TARGET chimaera::admin_client AND NOT TARGET chimaera_admin_client)
+  find_package(chimaera_admin REQUIRED)        # Admin ChiMod (often required for ChiMod operations)
+  message(STATUS "Found chimaera_admin package: ${chimaera_admin_FOUND}")
+else()
+  message(STATUS "Using chimaera_admin as subdirectory")
+endif()
 
+# Python bindings configuration
+# nanobind is configured by root CMakeLists.txt when WRP_CORE_ENABLE_PYTHON=ON
+# No local nanobind setup needed - use the root configuration
+if(WRP_CORE_ENABLE_PYTHON)
+  if(NOT COMMAND nanobind_add_module)
+    message(WARNING "WRP_CORE_ENABLE_PYTHON is ON but nanobind_add_module command not found. Python bindings may fail.")
+  else()
+    message(STATUS "Python bindings available - nanobind configured by root CMakeLists.txt")
+  endif()
+endif()
 
 message(STATUS "Found Chimaera framework - building full ChiMod implementation")
 
@@ -88,6 +60,7 @@ add_subdirectory(core)
 add_subdirectory(adapter)
 
 # Enable testing
+# CTest is included by root CMakeLists.txt
 include(CTest)
 
 # Add tests (skip external tests during internal development)

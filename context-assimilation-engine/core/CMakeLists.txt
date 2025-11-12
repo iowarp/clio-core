@@ -4,17 +4,30 @@ project(wrp_cae_core VERSION 1.0.0)
 #------------------------------------------------------------------------------
 # Find Chimaera package
 #------------------------------------------------------------------------------
-find_package(chimaera REQUIRED)
-
-# Add Chimaera CMake modules to the module path
-list(APPEND CMAKE_MODULE_PATH "${chimaera_DIR}")
-
-include(ChimaeraCommon)
+# Skip find_package if targets already exist (unified build as subdirectory)
+if(NOT TARGET chimaera::cxx AND NOT TARGET chimaera_cxx)
+  find_package(chimaera REQUIRED)
+  # Add Chimaera CMake modules to the module path
+  list(APPEND CMAKE_MODULE_PATH "${chimaera_DIR}")
+  include(ChimaeraCommon)
+  message(STATUS "Found Chimaera package")
+else()
+  # When built as subdirectory, manually include ChimaeraCommon.cmake
+  message(STATUS "Using Chimaera as subdirectory - including ChimaeraCommon.cmake")
+  list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../../runtime/cmake")
+  include(ChimaeraCommon)
+endif()
 
 #------------------------------------------------------------------------------
 # Find wrp_cte package
 #------------------------------------------------------------------------------
-find_package(wrp_cte_core REQUIRED)
+# Skip find_package if targets already exist (unified build as subdirectory)
+if(NOT TARGET wrp_cte::core_client AND NOT TARGET wrp_cte_core_client)
+  find_package(wrp_cte_core REQUIRED)
+  message(STATUS "Found wrp_cte_core package")
+else()
+  message(STATUS "Using wrp_cte_core as subdirectory")
+endif()
 
 #------------------------------------------------------------------------------
 # Find yaml-cpp package (required for OMNI file parsing)

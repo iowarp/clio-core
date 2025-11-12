@@ -2,7 +2,10 @@
 cmake_minimum_required(VERSION 3.10)
 
 # Include common utilities for dependency management
-include(${CMAKE_SOURCE_DIR}/cmake/ChimaeraCommon.cmake)
+# ChimaeraCommon.cmake is already included by parent CMakeLists.txt, but include it again if not found
+if(NOT COMMAND add_chimod_client)
+  include(${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/ChimaeraCommon.cmake)
+endif()
 
 # Test executable name
 set(TEST_TARGET chimaera_unit_tests)
@@ -155,13 +158,14 @@ add_executable(${FLUSH_TEST_TARGET} ${FLUSH_TEST_SOURCES})
 # Include directories for flush tests
 target_include_directories(${FLUSH_TEST_TARGET} PRIVATE
   ${CMAKE_SOURCE_DIR}/include
-  ${CMAKE_SOURCE_DIR}/test  # For test utilities
+  ${CMAKE_SOURCE_DIR}/runtime/test  # For simple_test.h
   ${CMAKE_SOURCE_DIR}/modules/admin/include  # For admin tasks
   ${CMAKE_SOURCE_DIR}/modules/MOD_NAME/include  # For MOD_NAME tasks
 )
 
 # Link against required libraries for flush tests
 target_link_libraries(${FLUSH_TEST_TARGET}
+  cxx                             # Core Chimaera runtime library
   chimaera_admin_runtime          # Admin module runtime
   chimaera_admin_client           # Admin module client
   chimaera_MOD_NAME_runtime       # MOD_NAME module runtime for work tracking
@@ -176,7 +180,8 @@ set_target_properties(${FLUSH_TEST_TARGET} PROPERTIES
   CXX_STANDARD_REQUIRED ON
 )
 
-# Removed CHIMAERA_RUNTIME compile definition - using runtime IsRuntime() checks instead
+# Define CHIMAERA_RUNTIME for runtime mode
+target_compile_definitions(${FLUSH_TEST_TARGET} PRIVATE CHIMAERA_RUNTIME=1)
 
 # Copy flush test executable to bin directory
 set_target_properties(${FLUSH_TEST_TARGET} PROPERTIES
@@ -375,7 +380,7 @@ target_include_directories(${IPC_ALLOCATE_BUFFER_TEST_TARGET} PRIVATE
 
 # Link against required libraries for IPC AllocateBuffer tests
 target_link_libraries(${IPC_ALLOCATE_BUFFER_TEST_TARGET}
-  cxx                        # Main Chimaera library
+  chimaera_cxx               # Main Chimaera library
   hshm::cxx                  # HermesShm library
   ${CMAKE_THREAD_LIBS_INIT}  # Threading support
 )
@@ -396,7 +401,7 @@ add_executable(${UNORDERED_MAP_LL_TEST_TARGET} ${UNORDERED_MAP_LL_TEST_SOURCES})
 
 # Include directories for Unordered Map LL tests
 target_include_directories(${UNORDERED_MAP_LL_TEST_TARGET} PRIVATE
-  ${CMAKE_SOURCE_DIR}/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/../../include  # Runtime include directory for chimaera headers
 )
 
 # Link against required libraries for Unordered Map LL tests
@@ -458,9 +463,9 @@ target_include_directories(${TEST_TARGET} PRIVATE
 
 # Link against required libraries
 target_link_libraries(${TEST_TARGET}
-  cxx                        # Main Chimaera library
-  hshm::cxx                       # HermesShm library
-  ${CMAKE_THREAD_LIBS_INIT}       # Threading support
+  chimaera_cxx               # Main Chimaera library
+  hshm::cxx                  # HermesShm library
+  ${CMAKE_THREAD_LIBS_INIT}  # Threading support
 )
 
 # Set C++ standard

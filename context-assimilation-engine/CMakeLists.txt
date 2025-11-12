@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.25)
 project(cae VERSION 1.0.0)
-set(CMAKE_CXX_STANDARD 17)
+# CMAKE_CXX_STANDARD is set by root CMakeLists.txt
 
 # -----------------------------------------------------------------------------
 # Set CAE Version Variables
@@ -13,6 +13,7 @@ set(CAE_VERSION_PATCH ${PROJECT_VERSION_PATCH})
 # Define Options
 # -----------------------------------------------------------------------------
 # Enable testing by default (can be disabled with -DBUILD_TESTING=OFF)
+# CTest is included by root CMakeLists.txt
 include(CTest)
 
 # CAE Feature Options - External Library Support
@@ -23,17 +24,14 @@ option(CAE_ENABLE_COVERAGE "Enable code coverage instrumentation" OFF)
 # -----------------------------------------------------------------------------
 # Compiler Optimization
 # -----------------------------------------------------------------------------
-set(CMAKE_CXX_STANDARD 17)
+# CMAKE_CXX_STANDARD and CMAKE_POSITION_INDEPENDENT_CODE are set by root CMakeLists.txt
 
+# CAE-specific debug/release flags
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     message("IN DEBUG MODE")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g -O0")
-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -g -O0")
     add_compile_definitions(CAE_LOG_VERBOSITY=10)
 else()
     message("IN RELEASE MODE")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g -O3")
-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -g -O3")
     add_compile_definitions(CAE_LOG_VERBOSITY=1)
 endif()
 
@@ -47,9 +45,6 @@ if(CAE_ENABLE_COVERAGE)
 else()
     message(STATUS "Code coverage: DISABLED")
 endif()
-
-# Enable Position Independent Code globally
-set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # ------------------------------------------------------------------------------
 # Setup install and output Directories
@@ -76,22 +71,10 @@ endif()
 # Find Packages
 # -----------------------------------------------------------------------------
 
-# This is for compatibility with CLANG + Spack
-set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+# CMAKE_EXPORT_COMPILE_COMMANDS and RPATH settings are set by root CMakeLists.txt
 list(APPEND CMAKE_INSTALL_RPATH "${CAE_INSTALL_LIB_DIR}")
-set(CMAKE_BUILD_WITH_INSTALL_RPATH ON)
-SET(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
 
-# ------------------------------------------------------------------------------
-# Setup CMake Environment
-# ------------------------------------------------------------------------------
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY
-    ${PROJECT_BINARY_DIR}/bin CACHE PATH "Single Directory for all Executables.")
-set(EXECUTABLE_OUTPUT_PATH ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})
-set(CMAKE_LIBRARY_OUTPUT_DIRECTORY
-    ${PROJECT_BINARY_DIR}/bin CACHE PATH "Single Directory for all Libraries")
-set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY
-    ${PROJECT_BINARY_DIR}/bin CACHE PATH "Single Directory for all static libraries.")
+# Output directories are set by root CMakeLists.txt
 
 # -----------------------------------------------------------------------------
 # Build OMNI Module

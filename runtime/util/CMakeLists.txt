@@ -9,20 +9,19 @@ add_executable(chimaera_start_runtime
 )
 # Removed CHIMAERA_RUNTIME compile definition - using runtime IsRuntime() checks instead
 target_link_libraries(chimaera_start_runtime
-  PUBLIC cxx
+  PUBLIC chimaera_cxx
 )
+# Include directories are now inherited from chimaera_cxx target
 
-# Build chimaera_stop_runtime  
+# Build chimaera_stop_runtime
 add_executable(chimaera_stop_runtime
   ${CMAKE_CURRENT_SOURCE_DIR}/chimaera_stop_runtime.cc
 )
 # chimaera_stop_runtime is client-only code, so do not define CHIMAERA_RUNTIME
 target_link_libraries(chimaera_stop_runtime
-  PUBLIC cxx
+  PUBLIC chimaera_cxx
 )
-target_include_directories(chimaera_stop_runtime PRIVATE
-  ${CMAKE_SOURCE_DIR}/modules/admin/include
-)
+# Include directories are now inherited from chimaera_cxx target
 
 # Build chi_refresh_repo
 add_executable(chi_refresh_repo
@@ -39,11 +38,9 @@ add_executable(chimaera_compose
 )
 # chimaera_compose is client-only code, so do not define CHIMAERA_RUNTIME
 target_link_libraries(chimaera_compose
-  PUBLIC cxx
+  PUBLIC chimaera_cxx
 )
-target_include_directories(chimaera_compose PRIVATE
-  ${CMAKE_SOURCE_DIR}/modules/admin/include
-)
+# Include directories are now inherited from chimaera_cxx target
 
 # Install utilities
 install(TARGETS chimaera_start_runtime chimaera_stop_runtime chi_refresh_repo chimaera_compose

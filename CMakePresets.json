@@ -19,7 +19,7 @@
                 "WRP_CORE_ENABLE_CEE": "ON",
                 "WRP_CTE_ENABLE_PYTHON": "ON",
                 "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
-                "ENABLE_ASAN": "ON"
+                "WRP_CORE_ENABLE_ASAN": "ON"
             }
         },
         {
@@ -37,7 +37,7 @@
                 "WRP_RUNTIME_ENABLE_CUDA": "ON",
                 "CMAKE_CUDA_ARCHITECTURES": "86",
                 "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
-                "ENABLE_ASAN": "ON"
+                "WRP_CORE_ENABLE_ASAN": "ON"
             }
         },
         {
@@ -54,7 +54,7 @@
                 "CTE_ENABLE_ROCM": "ON",
                 "WRP_RUNTIME_ENABLE_ROCM": "ON",
                 "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
-                "ENABLE_ASAN": "ON"
+                "WRP_CORE_ENABLE_ASAN": "ON"
             }
         },
         {
@@ -69,7 +69,7 @@
                 "WRP_CORE_ENABLE_CAE": "ON",
                 "WRP_CORE_ENABLE_CEE": "ON",
                 "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
-                "ENABLE_ASAN": "OFF"
+                "WRP_CORE_ENABLE_ASAN": "OFF"
             }
         }
     ]

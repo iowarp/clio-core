@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.10)
 project(hermes_shm LANGUAGES C CXX)
 include(CTest)
-set(CMAKE_CXX_STANDARD 17)
+# CMAKE_CXX_STANDARD is set by root CMakeLists.txt
 
 # ------------------------------------------------------------------------------
 # Global variables
@@ -17,11 +17,10 @@ add_compile_definitions(_CRT_SECURE_NO_DEPRECATE)
 # ------------------------------------------------------------------------------
 # Options
 # ------------------------------------------------------------------------------
-set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+# CMAKE_EXPORT_COMPILE_COMMANDS is set by root CMakeLists.txt
 option(BUILD_SHARED_LIBS "Build shared libraries (.dll/.so) instead of static ones (.lib/.a)" ON)
 option(HSHM_BUILD_TESTS "Build tests" ON)
 option(HSHM_BUILD_BENCHMARKS "Build benchmarks" OFF)
-option(HSHM_ENABLE_CMAKE_DOTENV "Build benchmarks" OFF)
 
 option(HSHM_ENABLE_MPI "Enable MPI support" OFF)
 option(HSHM_ENABLE_ZMQ "Enable ZeroMQ transport" ON)
@@ -59,23 +58,13 @@ endif()
 # ------------------------------------------------------------------------------
 # DOTENV
 # ------------------------------------------------------------------------------
-if(HSHM_ENABLE_CMAKE_DOTENV)
-    if(EXISTS ${CMAKE_SOURCE_DIR}/.env.cmake)
-        include(.env.cmake)
-    endif()
-endif()
+# DOTENV handling is done by root CMakeLists.txt
 
 # ------------------------------------------------------------------------------
 # Setup CMake Environment
 # ------------------------------------------------------------------------------
 set(HSHM_EXPORTED_TARGETS "HermesShm")
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY
-    ${PROJECT_BINARY_DIR}/bin CACHE PATH "Single Directory for all Executables.")
-set(EXECUTABLE_OUTPUT_PATH ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})
-set(CMAKE_LIBRARY_OUTPUT_DIRECTORY
-    ${PROJECT_BINARY_DIR}/bin CACHE PATH "Single Directory for all Libraries")
-set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY
-    ${PROJECT_BINARY_DIR}/bin CACHE PATH "Single Directory for all static libraries.")
+# Output directories are set by root CMakeLists.txt
 
 # ------------------------------------------------------------------------------
 # Setup install and output Directories
@@ -108,7 +97,7 @@ endif()
 # Optimization
 # ------------------------------------------------------------------------------
 
-# set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+# CMAKE_POSITION_INDEPENDENT_CODE is set by root CMakeLists.txt
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID MATCHES "^(Apple)?Clang$" OR CMAKE_CXX_COMPILER_ID STREQUAL "MinGW" OR CMAKE_CXX_COMPILER_ID MATCHES "^Intel")
     if(CMAKE_BUILD_TYPE STREQUAL "Debug")
         message("IN DEBUG MODE")
@@ -149,11 +138,8 @@ endif()
 # ------------------------------------------------------------------------------
 include(cmake/HermesShmCommonConfig.cmake)
 
-# This is for compatability with CLANG + Spack
-set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+# CMAKE_EXPORT_COMPILE_COMMANDS and RPATH settings are set by root CMakeLists.txt
 list(APPEND CMAKE_INSTALL_RPATH "${HSHM_INSTALL_LIB_DIR}")
-set(CMAKE_BUILD_WITH_INSTALL_RPATH ON)
-SET(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
 
 # ENABLE GPU SUPPORT
 if(HSHM_ENABLE_CUDA)
@@ -286,7 +272,7 @@ endif()
 # Build tests + benchmarks
 # ------------------------------------------------------------------------------
 set(TEST_MAIN ${HSHM_ROOT}/test/unit)
-enable_testing()
+# enable_testing() is handled by root CMakeLists.txt
 
 if(HSHM_BUILD_TESTS)
     message("Building HSHM unit tests")

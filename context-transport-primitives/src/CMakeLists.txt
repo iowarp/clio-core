@@ -20,6 +20,11 @@ target_include_directories(cxx INTERFACE ${HSHM_INSTALL_INCLUDE_DIR})
 target_link_directories(cxx INTERFACE ${HSHM_INSTALL_LIB_DIR})
 hshm_target_compile_definitions(cxx)
 
+# Create hshm::cxx alias for unified builds (when used as subdirectory)
+if(NOT TARGET hshm::cxx)
+  add_library(hshm::cxx ALIAS cxx)
+endif()
+
 list(APPEND HSHM_LIBS cxx)
 
 # BUILD HSHM FOR CUDA ONLY

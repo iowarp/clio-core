@@ -5,59 +5,6 @@ project(chimaera VERSION 1.0.0)
 # This will be called after the utilities are included below
 
 #------------------------------------------------------------------------------
-# SECTION 1: OPTIONS
-#------------------------------------------------------------------------------
-option(CHIMAERA_ENABLE_CMAKE_DOTENV "Enable reading environment variables from .env.cmake" ON)
-option(CHIMAERA_ENABLE_TESTS "Enable testing" ON)
-option(CHIMAERA_ENABLE_ASAN "Enable AddressSanitizer for debugging" OFF)
-
-# Read environment variables from .env.cmake if enabled
-if(CHIMAERA_ENABLE_CMAKE_DOTENV)
-  if(EXISTS "${CMAKE_SOURCE_DIR}/.env.cmake")
-    include("${CMAKE_SOURCE_DIR}/.env.cmake")
-  endif()
-endif()
-
-# Set C++ standard
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
-# Enable compile commands export
-set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-
-# Enable RPATH
-set(CMAKE_SKIP_BUILD_RPATH FALSE)
-set(CMAKE_BUILD_WITH_INSTALL_RPATH FALSE)
-set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
-set(CMAKE_INSTALL_RPATH "${CMAKE_INSTALL_PREFIX}/lib")
-
-#------------------------------------------------------------------------------
-# SECTION 2: COMPILER OPTIMIZATION
-#------------------------------------------------------------------------------
-# Add compiler flags following Google C++ style guide
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -pedantic")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC")
-# Disable some problematic warnings for external dependencies
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-unused-parameter -Wno-unused-variable")
-
-# Debug configuration
-set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g -O0 -DDEBUG")
-
-# Release configuration
-set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -DNDEBUG")
-
-# AddressSanitizer configuration
-if(CHIMAERA_ENABLE_ASAN)
-  message(STATUS "AddressSanitizer enabled")
-  set(ASAN_FLAGS "-fsanitize=address -fno-omit-frame-pointer -g")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${ASAN_FLAGS}")
-  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${ASAN_FLAGS}")
-  set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fsanitize=address")
-  set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -fsanitize=address")
-endif()
-
-
-#------------------------------------------------------------------------------
 # SECTION 3: CHIMOD CMAKE UTILITIES AND DEPENDENCIES
 #------------------------------------------------------------------------------
 # Include common utilities and dependencies early so find_package calls are available
@@ -67,10 +14,16 @@ include(cmake/ChimaeraCommon.cmake)
 # SECTION 4: DEPENDENCY VERIFICATION
 #------------------------------------------------------------------------------
 # Verify that required dependencies were found by ChimaeraCommon.cmake
-if(NOT HermesShm_FOUND)
+# Check for both package and target availability (supports both installed and subdirectory modes)
+if(NOT HermesShm_FOUND AND NOT TARGET cxx AND NOT TARGET hshm::cxx)
   message(FATAL_ERROR "Hermes SHM (HSHM) not found")
 endif()
-message(STATUS "found hermes_shm at ${HermesShm_PREFIX}")
+
+if(HermesShm_FOUND)
+  message(STATUS "found hermes_shm at ${HermesShm_PREFIX}")
+else()
+  message(STATUS "using hermes_shm as subdirectory (target: cxx)")
+endif()
 
 # Note: ZeroMQ support disabled for stub implementation
 
@@ -81,23 +34,20 @@ message(STATUS "found hermes_shm at ${HermesShm_PREFIX}")
 include_directories(${CMAKE_SOURCE_DIR}/include)
 include_directories(${HermesShm_INCLUDE_DIRS})
 
-# Set output directories for binaries and libraries
-# Put all outputs in bin directory for easier access
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
-set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
-set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+# Output directories are set by root CMakeLists.txt
+
+# Read namespace from chimaera_repo.yaml BEFORE processing subdirectories
+# This searches up the directory tree starting from CMAKE_SOURCE_DIR
+read_repo_namespace(CHIMAERA_NAMESPACE "${CMAKE_SOURCE_DIR}")
+# Set namespace as cache variable so it's available to all CMakeLists.txt
+set(CHIMAERA_NAMESPACE "${CHIMAERA_NAMESPACE}" CACHE STRING "Project namespace for chimod targets")
+message(STATUS "Chimaera namespace: ${CHIMAERA_NAMESPACE}")
 
 # Add utilities subdirectory FIRST so chi_refresh_repo builds before everything else
 add_subdirectory(util)
 
 # Add source subdirectory to build main library
 add_subdirectory(src)
-
-# Read namespace from chimaera_repo.yaml in project root
-read_repo_namespace(CHIMAERA_NAMESPACE "${CMAKE_SOURCE_DIR}")
-# Set namespace as cache variable so it's available to all CMakeLists.txt
-set(CHIMAERA_NAMESPACE "${CHIMAERA_NAMESPACE}" CACHE STRING "Project namespace for chimod targets")
-message(STATUS "Chimaera namespace: ${CHIMAERA_NAMESPACE}")
 
 # Add modules subdirectory
 add_subdirectory(modules)
@@ -107,7 +57,7 @@ add_subdirectory(benchmark)
 
 # Add test subdirectory if testing is enabled
 if(CHIMAERA_ENABLE_TESTS)
-  enable_testing()
+  # enable_testing() is handled by root CMakeLists.txt
   add_subdirectory(test)
   message(STATUS "Unit tests enabled - added test subdirectory")
 endif()
@@ -126,7 +76,7 @@ set(MAIN_EXPORT_NAME "${CHIMAERA_NAMESPACE}_coreTargets")
 set(MAIN_PACKAGE_NAME "${CHIMAERA_NAMESPACE}")
 
 # Install main library
-install(TARGETS cxx
+install(TARGETS ${CHIMAERA_NAMESPACE}_cxx
   EXPORT ${MAIN_EXPORT_NAME}
   LIBRARY DESTINATION lib
   ARCHIVE DESTINATION lib

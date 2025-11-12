@@ -40,6 +40,6 @@ the build docker action present in each of the repos.
 11. Remove each subdirecotry .claude, .github. Unify the subdirectory .vscode directories.
 Create a unified cpp lint and clangd. Remove .env and .env.cmake. Remove env.sh. Migrate
 LICENSE to the root repo. Remove from each of the subdirectories afterward. Create unified
-CMakePresets in the root directory and remove from subdirectories afterwords.
+CMakePresets in the root directory and remove from subdirectories afterwords. 
 
 We will ensure everything compiles later. 

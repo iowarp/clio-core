@@ -8,23 +8,57 @@ option(WRP_CORE_ENABLE_RUNTIME "Enable runtime component" ON)
 option(WRP_CORE_ENABLE_CTE "Enable context-transfer-engine component" ON)
 option(WRP_CORE_ENABLE_CAE "Enable context-assimilation-engine component" ON)
 option(WRP_CORE_ENABLE_CEE "Enable context-exploration-engine component" ON)
-option(IOWARP_ENABLE_TESTS "Enable testing for all components" ON)
-option(IOWARP_ENABLE_CMAKE_DOTENV "Enable reading environment variables from .env.cmake" ON)
-option(IOWARP_ENABLE_ASAN "Enable AddressSanitizer for debugging" OFF)
+option(WRP_CORE_ENABLE_TESTS "Enable testing for all components" ON)
+option(WRP_CORE_ENABLE_CMAKE_DOTENV "Enable reading environment variables from .env.cmake" ON)
+option(WRP_CORE_ENABLE_PYTHON "Enable Python bindings for all components" OFF)
+option(WRP_CORE_ENABLE_ASAN "Enable AddressSanitizer for debugging" OFF)
 
 # Read environment variables from .env.cmake if enabled
-if(IOWARP_ENABLE_CMAKE_DOTENV)
+if(WRP_CORE_ENABLE_CMAKE_DOTENV)
   if(EXISTS "${CMAKE_SOURCE_DIR}/.env.cmake")
     include("${CMAKE_SOURCE_DIR}/.env.cmake")
   endif()
 endif()
 
 #------------------------------------------------------------------------------
+# Python Bindings Configuration
+#------------------------------------------------------------------------------
+if(WRP_CORE_ENABLE_PYTHON)
+  message(STATUS "Python bindings enabled - configuring nanobind")
+
+  # Include helper function for finding Python from HSHM
+  list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/context-transport-primitives/cmake")
+  include(HermesShmCommonConfig)
+
+  # Find Python executable using HSHM helper
+  find_first_path_python()
+
+  # Find Python for nanobind
+  find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
+
+  # Add nanobind subdirectory if it exists
+  if(EXISTS "${CMAKE_SOURCE_DIR}/external/nanobind")
+    add_subdirectory(external/nanobind)
+    message(STATUS "Added nanobind from external/nanobind")
+  else()
+    message(FATAL_ERROR "nanobind not found in external/ - required when WRP_CORE_ENABLE_PYTHON=ON")
+  endif()
+else()
+  message(STATUS "Python bindings disabled")
+endif()
+
+#------------------------------------------------------------------------------
 # Global Settings
 #------------------------------------------------------------------------------
+# C++ Standard - Applied to all subdirectories
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Export compile commands for IDE integration - Applied to all subdirectories
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+# Position Independent Code - Applied to all subdirectories
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # Enable RPATH
 set(CMAKE_SKIP_BUILD_RPATH FALSE)
@@ -47,7 +81,7 @@ endif()
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -pedantic")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC")
 # Disable some problematic warnings for external dependencies
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-unused-parameter -Wno-unused-variable")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-unused-parameter -Wno-unused-variable -Wno-reorder")
 
 # Debug configuration
 set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g -O0 -DDEBUG")
@@ -56,7 +90,7 @@ set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g -O0 -DDEBUG")
 set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -DNDEBUG")
 
 # AddressSanitizer configuration
-if(IOWARP_ENABLE_ASAN)
+if(WRP_CORE_ENABLE_ASAN)
     message(STATUS "AddressSanitizer (ASAN) enabled for iowarp-core")
     add_compile_options(-fsanitize=address -fno-omit-frame-pointer)
     add_link_options(-fsanitize=address)
@@ -80,7 +114,7 @@ endforeach()
 #------------------------------------------------------------------------------
 # Testing
 #------------------------------------------------------------------------------
-if(IOWARP_ENABLE_TESTS)
+if(WRP_CORE_ENABLE_TESTS)
     enable_testing()
     include(CTest)
 endif()
@@ -91,6 +125,8 @@ endif()
 
 # Context Transport Primitives (formerly cte-hermes-shm) - Required by runtime
 message(STATUS "Building context-transport-primitives component")
+# Enable ELF support for adapter real API functionality
+set(HSHM_ENABLE_ELF ON CACHE BOOL "Enable ELF support for adapters" FORCE)
 add_subdirectory(context-transport-primitives)
 
 # Runtime component
@@ -134,6 +170,7 @@ message(STATUS "  Runtime:                      ${WRP_CORE_ENABLE_RUNTIME}")
 message(STATUS "  Context Transfer Engine:      ${WRP_CORE_ENABLE_CTE}")
 message(STATUS "  Context Assimilation Engine:  ${WRP_CORE_ENABLE_CAE}")
 message(STATUS "  Context Exploration Engine:   ${WRP_CORE_ENABLE_CEE}")
-message(STATUS "  Enable Tests:                 ${IOWARP_ENABLE_TESTS}")
-message(STATUS "  AddressSanitizer:             ${IOWARP_ENABLE_ASAN}")
+message(STATUS "  Enable Tests:                 ${WRP_CORE_ENABLE_TESTS}")
+message(STATUS "  Python Bindings:              ${WRP_CORE_ENABLE_PYTHON}")
+message(STATUS "  AddressSanitizer:             ${WRP_CORE_ENABLE_ASAN}")
 message(STATUS "")
