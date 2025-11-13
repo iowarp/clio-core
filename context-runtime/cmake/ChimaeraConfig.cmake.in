@@ -1,0 +1,23 @@
+# ChimaeraConfig.cmake.in
+# Config file for the Chimaera package
+
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+
+# Find required dependencies - skip HermesShm if already available as subdirectory
+# Check for both the namespaced alias (hshm::cxx) and the raw target (cxx)
+if(NOT TARGET hshm::cxx AND NOT TARGET cxx)
+  find_dependency(HermesShm CONFIG REQUIRED)
+endif()
+find_dependency(cereal REQUIRED)
+find_dependency(Boost REQUIRED COMPONENTS fiber context system)
+
+# Include the exported targets
+include("${CMAKE_CURRENT_LIST_DIR}/@MAIN_EXPORT_NAME@.cmake")
+
+# Include ChimaeraCommon.cmake for external ChiMod development
+include("${CMAKE_CURRENT_LIST_DIR}/ChimaeraCommon.cmake")
+
+# Provide components
+check_required_components(@MAIN_PACKAGE_NAME@)

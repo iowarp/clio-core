@@ -6,44 +6,10 @@ cmake-build-*/
 /dist
 /bench
 
-# CMake generated files
-CMakeCache.txt
-CMakeFiles/
-CMakeScripts/
-cmake_install.cmake
-cmake_uninstall.cmake
-CTestTestfile.cmake
-DartConfiguration.tcl
-CPackConfig.cmake
-CPackSourceConfig.cmake
-Testing/
+# CMake generated files (only in build directories)
+# Build directories already ignored above, but add specific patterns for safety
 compile_commands.json
-*.cmake.in
-CMakeDoxyfile.in
-CMakeDoxygenDefaults.cmake
 _deps/
-
-# Makefiles
-Makefile
-*.make
-
-# Ninja build files
-.ninja_deps
-.ninja_log
-.ninja_*
-*.ninja
-build.ninja
-rules.ninja
-
-# Package config files (generated in build directories)
-# Note: CMake source files in cmake/ directories should be tracked
-*Config*.cmake
-!cmake/*Config*.cmake
-!*/cmake/*Config*.cmake
-*Targets.cmake
-nanobind-config-version.cmake
-pybind11Config*.cmake
-pybind11Targets.cmake
 
 # Compiled Object files
 *.o
