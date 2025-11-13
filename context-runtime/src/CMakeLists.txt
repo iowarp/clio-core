@@ -26,6 +26,11 @@ target_include_directories(${CHIMAERA_LIB_NAME} PUBLIC
 # Add runtime definition
 # Removed CHIMAERA_RUNTIME compile definition - using runtime IsRuntime() checks instead
 
+# Add CMAKE_INSTALL_PREFIX as a compile definition for ChiMod search paths
+target_compile_definitions(${CHIMAERA_LIB_NAME} PRIVATE
+  CHI_INSTALL_PREFIX="${CMAKE_INSTALL_PREFIX}"
+)
+
 # Determine which HermesShm target to use (handles both installed and subdirectory modes)
 # When used as subdirectory, prefer hermes_shm_host directly for proper include propagation
 set(HSHM_TARGET "")

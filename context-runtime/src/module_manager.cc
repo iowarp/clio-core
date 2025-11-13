@@ -178,6 +178,15 @@ std::vector<std::string> ModuleManager::GetScanDirectories() const {
     directories.push_back(path_str.substr(start));
   }
 
+  // Add CMAKE_INSTALL_PREFIX/lib if it was defined at compile time
+#ifdef CHI_INSTALL_PREFIX
+  std::string install_prefix(CHI_INSTALL_PREFIX);
+  if (!install_prefix.empty()) {
+    std::string install_lib_path = install_prefix + "/lib";
+    directories.push_back(install_lib_path);
+  }
+#endif
+
   // Add default directories
   directories.push_back("./lib");
   directories.push_back("../lib");
