@@ -35,8 +35,11 @@ Makefile
 build.ninja
 rules.ninja
 
-# Package config files
+# Package config files (generated in build directories)
+# Note: CMake source files in cmake/ directories should be tracked
 *Config*.cmake
+!cmake/*Config*.cmake
+!*/cmake/*Config*.cmake
 *Targets.cmake
 nanobind-config-version.cmake
 pybind11Config*.cmake
