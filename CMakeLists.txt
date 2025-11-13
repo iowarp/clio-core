@@ -13,44 +13,78 @@ option(WRP_CORE_ENABLE_CTE "Enable context-transfer-engine component" ON)
 option(WRP_CORE_ENABLE_CAE "Enable context-assimilation-engine component" ON)
 option(WRP_CORE_ENABLE_CEE "Enable context-exploration-engine component" ON)
 
-# Global options
-option(WRP_CORE_ENABLE_TESTS "Enable testing for all components" OFF)
+# Global master switches
+option(WRP_CORE_ENABLE_TESTS "Master switch: Enable testing for all components" OFF)
+option(WRP_CORE_ENABLE_BENCHMARKS "Master switch: Enable benchmarks for all components" OFF)
 option(WRP_CORE_ENABLE_CMAKE_DOTENV "Enable reading environment variables from .env.cmake" ON)
 option(WRP_CORE_ENABLE_PYTHON "Enable Python bindings for all components" OFF)
 option(WRP_CORE_ENABLE_ASAN "Enable AddressSanitizer for debugging" OFF)
 option(WRP_CORE_ENABLE_COVERAGE "Enable code coverage instrumentation for all components" OFF)
 
-# Automatically set component test/benchmark variables based on global flags and component enable status
-# These are variables, not options - they're derived from WRP_CORE_ENABLE_TESTS and WRP_CORE_ENABLE_[COMPONENT]
-# Tests are enabled if both the global test flag AND the component are enabled
-set(HSHM_ENABLE_TESTS ${WRP_CORE_ENABLE_TESTS})
-set(CHIMAERA_ENABLE_TESTS ${WRP_CORE_ENABLE_TESTS})
+# Individual component test/benchmark options
+# These allow fine-grained control when master switches are ON
+option(HSHM_ENABLE_TESTS "Enable tests for HermesShm (context-transport-primitives)" ON)
+option(HSHM_ENABLE_BENCHMARKS "Enable benchmarks for HermesShm (context-transport-primitives)" ON)
+option(CHIMAERA_ENABLE_TESTS "Enable tests for Chimaera runtime" ON)
+option(CHIMAERA_ENABLE_BENCHMARKS "Enable benchmarks for Chimaera runtime" ON)
+option(WRP_CTE_ENABLE_TESTS "Enable tests for CTE (context-transfer-engine)" ON)
+option(WRP_CTE_ENABLE_BENCHMARKS "Enable benchmarks for CTE (context-transfer-engine)" ON)
+option(WRP_CAE_ENABLE_TESTS "Enable tests for CAE (context-assimilation-engine)" ON)
+option(WRP_CAE_ENABLE_BENCHMARKS "Enable benchmarks for CAE (context-assimilation-engine)" ON)
+option(WRP_CEE_ENABLE_TESTS "Enable tests for CEE (context-exploration-engine)" ON)
+option(WRP_CEE_ENABLE_BENCHMARKS "Enable benchmarks for CEE (context-exploration-engine)" ON)
 
-# CTE tests: enabled if global tests ON and CTE component ON
-if(WRP_CORE_ENABLE_TESTS AND WRP_CORE_ENABLE_CTE)
-    set(WRP_CTE_ENABLE_TESTS ON)
-else()
+# Hierarchical control logic:
+# If WRP_CORE_ENABLE_TESTS is OFF, force all component tests OFF
+# If WRP_CORE_ENABLE_BENCHMARKS is OFF, force all component benchmarks OFF
+# Otherwise, use individual component values
+
+# Apply master test switch
+if(NOT WRP_CORE_ENABLE_TESTS)
+    set(HSHM_ENABLE_TESTS OFF)
+    set(CHIMAERA_ENABLE_TESTS OFF)
     set(WRP_CTE_ENABLE_TESTS OFF)
-endif()
-
-# CAE tests: enabled if global tests ON and CAE component ON
-if(WRP_CORE_ENABLE_TESTS AND WRP_CORE_ENABLE_CAE)
-    set(WRP_CAE_ENABLE_TESTS ON)
-else()
     set(WRP_CAE_ENABLE_TESTS OFF)
-endif()
-
-# CEE tests: enabled if global tests ON and CEE component ON
-if(WRP_CORE_ENABLE_TESTS AND WRP_CORE_ENABLE_CEE)
-    set(WRP_CEE_ENABLE_TESTS ON)
-else()
     set(WRP_CEE_ENABLE_TESTS OFF)
 endif()
 
-# Benchmarks (currently always OFF, but follow same pattern for consistency)
-set(HSHM_ENABLE_BENCHMARKS OFF)
-set(CHIMAERA_ENABLE_BENCHMARKS OFF)
-set(WRP_CTE_ENABLE_BENCHMARKS OFF)
+# Apply master benchmark switch
+if(NOT WRP_CORE_ENABLE_BENCHMARKS)
+    set(HSHM_ENABLE_BENCHMARKS OFF)
+    set(CHIMAERA_ENABLE_BENCHMARKS OFF)
+    set(WRP_CTE_ENABLE_BENCHMARKS OFF)
+    set(WRP_CAE_ENABLE_BENCHMARKS OFF)
+    set(WRP_CEE_ENABLE_BENCHMARKS OFF)
+endif()
+
+# Also disable tests/benchmarks for disabled components
+if(NOT WRP_CORE_ENABLE_CTE)
+    set(WRP_CTE_ENABLE_TESTS OFF)
+    set(WRP_CTE_ENABLE_BENCHMARKS OFF)
+endif()
+
+if(NOT WRP_CORE_ENABLE_CAE)
+    set(WRP_CAE_ENABLE_TESTS OFF)
+    set(WRP_CAE_ENABLE_BENCHMARKS OFF)
+endif()
+
+if(NOT WRP_CORE_ENABLE_CEE)
+    set(WRP_CEE_ENABLE_TESTS OFF)
+    set(WRP_CEE_ENABLE_BENCHMARKS OFF)
+endif()
+
+# Print final test/benchmark configuration
+message(STATUS "Test/Benchmark Configuration:")
+message(STATUS "  HSHM_ENABLE_TESTS: ${HSHM_ENABLE_TESTS}")
+message(STATUS "  HSHM_ENABLE_BENCHMARKS: ${HSHM_ENABLE_BENCHMARKS}")
+message(STATUS "  CHIMAERA_ENABLE_TESTS: ${CHIMAERA_ENABLE_TESTS}")
+message(STATUS "  CHIMAERA_ENABLE_BENCHMARKS: ${CHIMAERA_ENABLE_BENCHMARKS}")
+message(STATUS "  WRP_CTE_ENABLE_TESTS: ${WRP_CTE_ENABLE_TESTS}")
+message(STATUS "  WRP_CTE_ENABLE_BENCHMARKS: ${WRP_CTE_ENABLE_BENCHMARKS}")
+message(STATUS "  WRP_CAE_ENABLE_TESTS: ${WRP_CAE_ENABLE_TESTS}")
+message(STATUS "  WRP_CAE_ENABLE_BENCHMARKS: ${WRP_CAE_ENABLE_BENCHMARKS}")
+message(STATUS "  WRP_CEE_ENABLE_TESTS: ${WRP_CEE_ENABLE_TESTS}")
+message(STATUS "  WRP_CEE_ENABLE_BENCHMARKS: ${WRP_CEE_ENABLE_BENCHMARKS}")
 
 # Read environment variables from .env.cmake if enabled
 if(WRP_CORE_ENABLE_CMAKE_DOTENV)
