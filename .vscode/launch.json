@@ -51,12 +51,27 @@
             ],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}",
-            "environment": [
+            "environment": [],
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "setupCommands": [
                 {
-                    "name": "CHIMAERA_DISABLE_RUNTIME_INIT",
-                    "value": "1"
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
                 }
             ],
+            "preLaunchTask": "cmake-build-debug"
+        },
+        {
+            "name": "Debug test_bdev_chimod",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/bin/chimaera_bdev_chimod_tests",
+            "args": [],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}",
+            "environment": [],
             "externalConsole": false,
             "MIMode": "gdb",
             "setupCommands": [

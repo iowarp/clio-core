@@ -167,7 +167,6 @@ bool Heap::Allocate(size_t block_size, int block_type, Block &block) {
 
   if (old_heap + aligned_size > total_size_) {
     // Out of space - rollback
-    heap_.fetch_sub(aligned_size);
     return false;
   }
 

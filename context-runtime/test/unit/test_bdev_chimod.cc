@@ -476,6 +476,10 @@ TEST_CASE("bdev_write_read_basic", "[bdev][io][basic]") {
         REQUIRE(read_data[j] == write_data[j]);
       }
 
+      // Free buffers
+      CHI_IPC->FreeBuffer(write_buffer);
+      CHI_IPC->FreeBuffer(read_buffer);
+
       HILOG(kInfo, "Iteration {}: Successfully wrote and read {} bytes", i,
             write_data.size());
     }
@@ -548,6 +552,10 @@ TEST_CASE("bdev_async_operations", "[bdev][async][io]") {
       for (size_t j = 0; j < write_data.size(); ++j) {
         REQUIRE(async_read_data[j] == write_data[j]);
       }
+
+      // Free buffers
+      CHI_IPC->FreeBuffer(async_write_buffer);
+      CHI_IPC->FreeBuffer(async_read_buffer);
 
       HILOG(kInfo,
             "Iteration {}: Successfully completed async allocate/write/read "
@@ -656,6 +664,12 @@ TEST_CASE("bdev_performance_metrics", "[bdev][performance][metrics]") {
       read_task2->Wait();
       REQUIRE(read_task2->return_code_ == 0);
       CHI_IPC->DelTask(read_task2);
+
+      // Free buffers
+      CHI_IPC->FreeBuffer(data1_write_buffer);
+      CHI_IPC->FreeBuffer(data2_write_buffer);
+      CHI_IPC->FreeBuffer(data1_read_buffer);
+      CHI_IPC->FreeBuffer(data2_read_buffer);
 
       HILOG(kInfo, "Iteration {}: Completed I/O operations", i);
     }
@@ -816,6 +830,10 @@ TEST_CASE("bdev_ram_allocation_and_io", "[bdev][ram][io]") {
         std::equal(write_data.begin(), write_data.end(), read_data.begin());
     REQUIRE(data_matches);
 
+    // Free buffers
+    CHI_IPC->FreeBuffer(write_buffer);
+    CHI_IPC->FreeBuffer(read_buffer);
+
     // Free the block
     std::vector<chimaera::bdev::Block> free_blocks;
     free_blocks.push_back(block);
@@ -918,6 +936,10 @@ TEST_CASE("bdev_ram_large_blocks", "[bdev][ram][large]") {
         REQUIRE(read_data[j] == test_data[j]);
       }
 
+      // Free buffers
+      CHI_IPC->FreeBuffer(test_write_buffer);
+      CHI_IPC->FreeBuffer(test_read_buffer);
+
       // Free all allocated blocks
       auto free_task =
           bdev_client.AsyncFreeBlocks(HSHM_MCTX, pool_query, blocks);
@@ -993,6 +1015,10 @@ TEST_CASE("bdev_ram_bounds_checking", "[bdev][ram][bounds]") {
     }
     REQUIRE(read_data.empty()); // Should fail
     CHI_IPC->DelTask(read_task);
+
+    // Free buffers
+    CHI_IPC->FreeBuffer(error_write_buffer);
+    CHI_IPC->FreeBuffer(error_read_buffer);
 
     HILOG(kInfo, "Iteration {}: RAM backend bounds checking working correctly",
           i);
@@ -1174,6 +1200,12 @@ TEST_CASE("bdev_file_vs_ram_comparison", "[bdev][file][ram][comparison]") {
     REQUIRE(ram_write_time.count() < file_write_time.count());
     REQUIRE(ram_read_time.count() < file_read_time.count());
 
+    // Free buffers
+    CHI_IPC->FreeBuffer(file_write_buffer);
+    CHI_IPC->FreeBuffer(ram_write_buffer);
+    CHI_IPC->FreeBuffer(file_read_buffer);
+    CHI_IPC->FreeBuffer(ram_read_buffer);
+
     // Clean up
     std::vector<chimaera::bdev::Block> file_free_blocks;
     file_free_blocks.push_back(file_block);
@@ -1257,6 +1289,10 @@ TEST_CASE("bdev_file_explicit_backend", "[bdev][file][explicit]") {
     bool data_ok =
         std::equal(test_data.begin(), test_data.end(), read_data.begin());
     REQUIRE(data_ok);
+
+    // Free buffers
+    CHI_IPC->FreeBuffer(final_write_buffer);
+    CHI_IPC->FreeBuffer(final_read_buffer);
 
     std::vector<chimaera::bdev::Block> free_blocks;
     free_blocks.push_back(block);
@@ -1418,6 +1454,9 @@ TEST_CASE("bdev_parallel_io_operations", "[bdev][parallel][io]") {
         REQUIRE(free_task->return_code_.load() == 0);
         CHI_IPC->DelTask(free_task);
       }
+
+      // Free buffer after all operations complete
+      CHI_IPC->FreeBuffer(write_buffer);
     };
 
     // Launch worker threads
@@ -1568,6 +1607,10 @@ TEST_CASE("bdev_force_net_flag", "[bdev][network][force_net]") {
       }
 
       CHI_IPC->DelTask(read_task);
+
+      // Free buffers
+      CHI_IPC->FreeBuffer(write_buffer);
+      CHI_IPC->FreeBuffer(read_buffer);
 
       HILOG(kInfo,
             "Iteration {}: TASK_FORCE_NET test completed - data verified "
