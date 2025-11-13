@@ -15,9 +15,9 @@ RUN sudo chown -R $(whoami):$(whoami) /workspace && \
     git submodule update --init --recursive && \
     mkdir -p build && \
     cmake --preset release && \
-    cmake --build build -j$(nproc) && \
-    sudo cmake --install build --prefix /usr/local && \
-    sudo cmake --install build --prefix /iowarp-core && \
+    sudo make -j$(nproc) install && \
+    cmake ../ --DCMAKE_INSTALL_PREFIX=/iowarp-core && \
+    sudo make -j$(nproc) install && \
     sudo rm -rf /workspace
 
 
