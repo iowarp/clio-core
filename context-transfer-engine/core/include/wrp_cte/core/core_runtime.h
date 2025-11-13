@@ -102,7 +102,8 @@ public:
   void GetTagSize(hipc::FullPtr<GetTagSizeTask> task, chi::RunContext &ctx);
 
   // Pure virtual methods - implementations are in autogen/core_lib_exec.cc
-  void Init(const chi::PoolId &pool_id, const std::string &pool_name) override;
+  void Init(const chi::PoolId &pool_id, const std::string &pool_name,
+            chi::u32 container_id = 0) override;
   void Run(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr,
            chi::RunContext &rctx) override;
   void Monitor(chi::MonitorModeId mode, chi::u32 method,

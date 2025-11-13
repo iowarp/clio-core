@@ -17,9 +17,10 @@ namespace wrp_cae::core {
 // Container Virtual API Implementations
 //==============================================================================
 
-void Runtime::Init(const chi::PoolId &pool_id, const std::string &pool_name) {
+void Runtime::Init(const chi::PoolId &pool_id, const std::string &pool_name,
+                   chi::u32 container_id) {
   // Call base class initialization
-  chi::Container::Init(pool_id, pool_name);
+  chi::Container::Init(pool_id, pool_name, container_id);
 
   // Initialize the client for this ChiMod
   client_ = Client(pool_id);

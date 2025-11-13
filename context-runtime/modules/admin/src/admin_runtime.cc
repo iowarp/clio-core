@@ -413,9 +413,8 @@ void Runtime::SendIn(hipc::FullPtr<SendTask> task, chi::RunContext &rctx) {
     }
 
     HILOG(kDebug,
-          "[SendIn] Successfully sent task copy {} to node {} ({}) "
-          "asynchronously",
-          task_copy->task_id_, target_node_id, target_host->ip_address);
+          "[SEND] Task {} sent to node {}",
+          task_copy->task_id_, target_node_id);
   }
 
   HILOG(kDebug, "=== [SendIn END] Task {} completed sending to {} targets ===",
@@ -525,8 +524,8 @@ void Runtime::SendOut(hipc::FullPtr<SendTask> task) {
     }
 
     HILOG(kDebug,
-          "[SendOut] Successfully sent outputs for task {} to node {} ({})",
-          origin_task->task_id_, target_node_id, target_host->ip_address);
+          "[SEND] Task {} outputs sent back to node {}",
+          origin_task->task_id_, target_node_id);
   }
 
   // Delete the task after sending outputs
@@ -636,7 +635,7 @@ void Runtime::RecvIn(hipc::FullPtr<RecvTask> task,
 
     // Mark task as remote, set as data owner, unset periodic and TASK_FORCE_NET
     task_ptr->SetFlags(TASK_REMOTE | TASK_DATA_OWNER);
-    task_ptr->ClearFlags(TASK_PERIODIC | TASK_FORCE_NET);
+    task_ptr->ClearFlags(TASK_PERIODIC | TASK_FORCE_NET | TASK_ROUTED);
 
     // Add task to recv_map for later lookup (use net_key from task_id)
     size_t net_key = task_ptr->task_id_.net_key_;
@@ -653,7 +652,7 @@ void Runtime::RecvIn(hipc::FullPtr<RecvTask> task,
 
     // Enqueue task for execution
     ipc_manager->Enqueue(task_ptr);
-    HILOG(kDebug, "[RecvIn] Enqueued task {} for execution",
+    HILOG(kDebug, "[RECV] Task {} received and enqueued",
           task_ptr->task_id_);
   }
 
@@ -806,8 +805,8 @@ void Runtime::RecvOut(hipc::FullPtr<RecvTask> task,
     // Aggregate replica results into origin task
     container->Aggregate(origin_task->method_, origin_task, replica);
     HILOG(kDebug,
-          "[RecvOut] Aggregated results from replica {} into origin task {}",
-          replica->task_id_, origin_task->task_id_);
+          "[RECV] Task {} outputs received and aggregated",
+          origin_task->task_id_);
 
     // Increment completed replicas counter in origin's rctx
     chi::u32 completed = origin_rctx->completed_replicas_.fetch_add(1) + 1;
@@ -841,20 +840,12 @@ void Runtime::RecvOut(hipc::FullPtr<RecvTask> task,
         send_map_.erase(net_key);
       }
 
-      // Handle task completion based on whether it's periodic
-      if (origin_task->IsPeriodic()) {
-        // Periodic task - add back to blocked queue for next iteration
-        auto *worker =
-            HSHM_THREAD_MODEL->GetTls<chi::Worker>(chi::chi_cur_worker_key_);
-        worker->AddToBlockedQueue(origin_rctx);
-      } else {
-        // Non-periodic task - free RunContext and mark as complete
-        delete origin_rctx;
-        origin_task->run_ctx_ = nullptr;
-        origin_task->is_complete_.store(1);
-        HILOG(kDebug, "=== [TASK COMPLETE] Task {} finished successfully ===",
-              origin_task->task_id_);
-      }
+      // Add task back to blocked queue for both periodic and non-periodic tasks
+      // ExecTask will handle checking if the task is complete and ending it properly
+      auto *worker = CHI_CUR_WORKER;
+      worker->AddToBlockedQueue(origin_rctx);
+      HILOG(kDebug, "[RecvOut] Added origin task {} back to blocked queue",
+            origin_task->task_id_);
     }
   }
 

@@ -133,6 +133,11 @@ void Task::Aggregate(const hipc::FullPtr<Task> &replica_task) {
   if (!replica_task.IsNull() && replica_task->GetReturnCode() != 0) {
     SetReturnCode(replica_task->GetReturnCode());
   }
+  // Copy the completer from the replica task
+  if (!replica_task.IsNull()) {
+    SetCompleter(replica_task->GetCompleter());
+  }
+  HILOG(kDebug, "[COMPLETER] Aggregated task {} with completer {}", task_id_, GetCompleter());
 }
 
 size_t Task::EstCpuTime() const {

@@ -151,6 +151,20 @@ auto task = ipc_manager->NewTask<CreateTask>(
 );
 ```
 
+### Container ID Assignment
+
+When creating pools, **the container ID MUST be set to the node ID** of the physical node where the container is created. This ensures proper routing of DirectHash queries to physical nodes.
+
+**Implementation:**
+- `ModuleManager::CreateContainer()` takes a `container_id` parameter
+- `PoolManager::CreatePool()` passes `ipc_manager->GetNodeId()` as the container ID
+- The container's `container_id_` field is set to the physical node ID
+
+This mapping allows DirectHash to correctly route tasks:
+1. Hash value determines container ID: `container_id = hash % num_containers`
+2. Container ID maps to physical node ID via the address table
+3. Task completer reflects the physical node ID where it executed
+
 ### ChiMod Name Parameter
 ChiMod clients MUST use `CreateParams::chimod_lib_name` instead of hardcoded module names in CreateTask operations.
 
@@ -361,6 +375,16 @@ environment:
 ```
 
 ## Documentation
+
+### Contributing Guide
+New contributors should start with the comprehensive guide at: `docs/contributing.md`
+
+This guide covers:
+- Development environment setup with DevContainers (Windows, macOS, Linux)
+- VSCode configuration and recommended extensions
+- Code style and formatting with clang-format
+- Build system and testing procedures
+- Git workflow and project structure
 
 ### CTE Core API Documentation
 Complete API documentation and usage guide is available at: `context-transfer-engine/docs/cte/cte.md`

@@ -113,6 +113,25 @@ bool PoolManager::HasPool(PoolId pool_id) const {
   return pool_container_map_.find(pool_id) != pool_container_map_.end();
 }
 
+bool PoolManager::HasContainer(PoolId pool_id, ContainerId container_id) const {
+  if (!is_initialized_) {
+    return false;
+  }
+
+  // Check if pool exists on this node
+  if (!HasPool(pool_id)) {
+    return false;
+  }
+
+  // Get this node's ID
+  auto* ipc_manager = CHI_IPC;
+  u32 node_id = ipc_manager->GetNodeId();
+
+  // Container exists locally if container_id matches this node's ID
+  // This follows the pattern where container_id == node_id for locally owned containers
+  return container_id == node_id;
+}
+
 PoolId PoolManager::FindPoolByName(const std::string& pool_name) const {
   if (!is_initialized_) {
     return PoolId::GetNull();
@@ -366,18 +385,27 @@ bool PoolManager::CreatePool(FullPtr<Task> task, RunContext* run_ctx) {
 
   Container* container = nullptr;
   try {
-    // For now, create only one container (num_containers parameter for future
-    // use)
-    container =
-        module_manager->CreateContainer(chimod_name, target_pool_id, pool_name);
+    // Create container
+    container = module_manager->CreateContainer(chimod_name, target_pool_id,
+                                                 pool_name);
     if (!container) {
       HELOG(kError, "PoolManager: Failed to create container for ChiMod: {}", chimod_name);
       pool_metadata_.erase(target_pool_id);
       return false;
     }
 
-    // Initialize container with pool ID and name (this will call InitClient internally)
-    container->Init(target_pool_id, pool_name);
+    // Get this node's ID to use as the container ID
+    auto* ipc_manager = CHI_IPC;
+    u32 node_id = ipc_manager->GetNodeId();
+    HILOG(kInfo, "Creating container for pool {} on node {} with container_id={}",
+          target_pool_id, node_id, node_id);
+
+    // Initialize container with pool ID, name, and container ID (this will call InitClient internally)
+    container->Init(target_pool_id, pool_name, node_id);
+
+    HILOG(kInfo,
+          "Container initialized with pool ID {}, name {}, and container ID {}",
+          target_pool_id, pool_name, container->container_id_);
 
     // Register the container BEFORE running Create method
     // This allows Create to spawn tasks that can find this container in the map

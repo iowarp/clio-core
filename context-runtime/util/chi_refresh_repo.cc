@@ -241,9 +241,10 @@ class ChiModGenerator {
     oss << "// Container Virtual API Implementations\n";
     oss << "//==============================================================================\n";
     oss << "\n";
-    oss << "void Runtime::Init(const chi::PoolId &pool_id, const std::string &pool_name) {\n";
+    oss << "void Runtime::Init(const chi::PoolId &pool_id, const std::string &pool_name,\n";
+    oss << "                   chi::u32 container_id) {\n";
     oss << "  // Call base class initialization\n";
-    oss << "  chi::Container::Init(pool_id, pool_name);\n";
+    oss << "  chi::Container::Init(pool_id, pool_name, container_id);\n";
     oss << "\n";
     oss << "  // Initialize the client for this ChiMod\n";
     oss << "  client_ = Client(pool_id);\n";

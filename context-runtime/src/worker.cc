@@ -143,10 +143,10 @@ void Worker::Run() {
 
     if (did_work_) {
       // Work was done - reset idle counters
-      if (sleep_count_ > 0) {
-        HILOG(kInfo, "Worker {}: Woke up after {} sleeps", worker_id_,
-              sleep_count_);
-      }
+    //   if (sleep_count_ > 0) {
+    //     HILOG(kInfo, "Worker {}: Woke up after {} sleeps", worker_id_,
+    //           sleep_count_);
+    //   }
       idle_iterations_ = 0;
       current_sleep_us_ = 0;
       sleep_count_ = 0;
@@ -176,11 +176,15 @@ u32 Worker::ProcessNewTasks() {
       hipc::FullPtr<Task> task_full_ptr(task_typed_ptr);
 
       if (!task_full_ptr.IsNull()) {
-        // Allocate stack and RunContext before routing
+        // Get container for routing
         auto *pool_manager = CHI_POOL_MANAGER;
         Container *container =
             pool_manager->GetContainer(task_full_ptr->pool_id_);
-        BeginTask(task_full_ptr, container, assigned_lane_);
+
+        // Allocate stack and RunContext before routing
+        if (!task_full_ptr->IsRouted()) {
+          BeginTask(task_full_ptr, container, assigned_lane_);
+        }
 
         // Route task using consolidated routing function
         if (RouteTask(task_full_ptr, assigned_lane_, container)) {
@@ -247,10 +251,10 @@ void Worker::SuspendMe() {
       return;
     }
 
-    if (sleep_count_ == 0) {
-      HILOG(kInfo, "Worker {}: Sleeping for {} us", worker_id_,
-            current_sleep_us_);
-    }
+    // if (sleep_count_ == 0) {
+    //   HILOG(kInfo, "Worker {}: Sleeping for {} us", worker_id_,
+    //         current_sleep_us_);
+    // }
 
     // Sleep for calculated duration
     HSHM_THREAD_MODEL->SleepForUs(static_cast<size_t>(current_sleep_us_));
@@ -434,6 +438,9 @@ bool Worker::RouteLocal(const FullPtr<Task> &task_ptr, TaskLane *lane,
   // Set the completer_ field to track which container will execute this task
   task_ptr->SetCompleter(container->container_id_);
 
+  auto *ipc_manager = CHI_IPC;
+  u32 node_id = ipc_manager->GetNodeId();
+
   // Task is local and should be executed directly
   // Set TASK_ROUTED flag to indicate this task has been routed
   task_ptr->SetFlags(TASK_ROUTED);
@@ -545,6 +552,12 @@ Worker::ResolveDirectIdQuery(const PoolQuery &query, PoolId pool_id,
   // Get the container ID from the query
   ContainerId container_id = query.GetContainerId();
 
+  // Boundary case optimization: Check if container exists on this node
+  if (pool_manager->HasContainer(pool_id, container_id)) {
+    // Container is local, resolve to Local query
+    return {PoolQuery::Local()};
+  }
+
   // Get the physical node ID for this container
   u32 node_id = pool_manager->GetContainerNodeId(pool_id, container_id);
 
@@ -569,6 +582,12 @@ Worker::ResolveDirectHashQuery(const PoolQuery &query, PoolId pool_id,
   // Hash to get container ID
   u32 hash_value = query.GetHash();
   ContainerId container_id = hash_value % pool_info->num_containers_;
+
+  // Boundary case optimization: Check if container exists on this node
+  if (pool_manager->HasContainer(pool_id, container_id)) {
+    // Container is local, resolve to Local query
+    return {PoolQuery::Local()};
+  }
 
   // Get the physical node ID for this container
   u32 node_id = pool_manager->GetContainerNodeId(pool_id, container_id);
@@ -602,6 +621,15 @@ Worker::ResolveRangeQuery(const PoolQuery &query, PoolId pool_id,
   // Validate range
   if (range_count == 0) {
     return {}; // Empty range
+  }
+
+  // Boundary case optimization: Check if single-container range is local
+  if (range_count == 1) {
+    ContainerId container_id = range_offset;
+    if (pool_manager->HasContainer(pool_id, container_id)) {
+      // Container is local, resolve to Local query
+      return {PoolQuery::Local()};
+    }
   }
 
   std::vector<PoolQuery> result_queries;
@@ -882,12 +910,20 @@ void Worker::ExecTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
     return; // Consider null tasks as completed
   }
 
-  // Call appropriate fiber function based on task state
-  if (is_started) {
-    ResumeFiber(task_ptr, run_ctx);
+  // Check if task is already completed (e.g., from distributed execution)
+  // If so, skip execution and go directly to ending the task
+  if (task_ptr->IsComplete()) {
+    HILOG(kDebug, "[ExecTask] Task {} already complete, skipping to end",
+          task_ptr->task_id_);
+    // Don't return - fall through to cleanup logic below
   } else {
-    BeginFiber(task_ptr, run_ctx, FiberExecutionFunction);
-    task_ptr->SetFlags(TASK_STARTED);
+    // Call appropriate fiber function based on task state
+    if (is_started) {
+      ResumeFiber(task_ptr, run_ctx);
+    } else {
+      BeginFiber(task_ptr, run_ctx, FiberExecutionFunction);
+      task_ptr->SetFlags(TASK_STARTED);
+    }
   }
 
   // Only set did_work_ if the task actually did work
@@ -1068,8 +1104,15 @@ void Worker::ProcessPeriodicQueue(hshm::ext_ring_buffer<RunContext *> &queue,
       // This allows the task to call Wait() again if needed
       run_ctx->is_blocked = false;
 
-      // Execute task with existing RunContext
-      ExecTask(run_ctx->task, run_ctx, is_started);
+      // For periodic tasks, unmark TASK_ROUTED and route again
+      run_ctx->task->ClearFlags(TASK_ROUTED);
+      Container *container = run_ctx->container;
+
+      // Route task again - this will handle both local and distributed routing
+      if (RouteTask(run_ctx->task, run_ctx->lane, container)) {
+        // Routing successful, execute the task
+        ExecTask(run_ctx->task, run_ctx, is_started);
+      }
     } else {
       // Time threshold not reached yet - re-add to same queue
       queue.push(run_ctx);
@@ -1137,31 +1180,9 @@ void Worker::AddToBlockedQueue(RunContext *run_ctx) {
     return;
   }
 
-  // Check if this is a time-based periodic task or a cooperative task
-  if (run_ctx->block_time_us > 0.0) {
-    // Time-based periodic task - add to appropriate periodic queue
-    // Record the time when task was blocked
-    run_ctx->block_start.Now();
-
-    // Determine which periodic queue based on block_time_us:
-    // Queue[0]: block_time_us <= 50us
-    // Queue[1]: block_time_us <= 200us
-    // Queue[2]: block_time_us <= 50ms (50000us)
-    // Queue[3]: block_time_us > 50ms
-    u32 queue_idx;
-    if (run_ctx->block_time_us <= 50.0) {
-      queue_idx = 0;
-    } else if (run_ctx->block_time_us <= 200.0) {
-      queue_idx = 1;
-    } else if (run_ctx->block_time_us <= 50000.0) {
-      queue_idx = 2;
-    } else {
-      queue_idx = 3;
-    }
-
-    // Add to the appropriate periodic queue
-    periodic_queues_[queue_idx].push(run_ctx);
-  } else {
+  // Check if task should go to blocked queue or periodic queue
+  // Go to blocked queue if: block_time is 0 OR task is already started
+  if (run_ctx->block_time_us == 0.0) {
     // Cooperative task waiting for subtasks - add to blocked queue
     // Increment block count for cooperative tasks
     run_ctx->block_count_++;
@@ -1184,6 +1205,29 @@ void Worker::AddToBlockedQueue(RunContext *run_ctx) {
 
     // Add to the appropriate blocked queue
     blocked_queues_[queue_idx].push(run_ctx);
+  } else {
+    // Time-based periodic task - add to periodic queue
+    // Record the time when task was blocked
+    run_ctx->block_start.Now();
+
+    // Determine which periodic queue based on block_time_us:
+    // Queue[0]: block_time_us <= 50us
+    // Queue[1]: block_time_us <= 200us
+    // Queue[2]: block_time_us <= 50ms (50000us)
+    // Queue[3]: block_time_us > 50ms
+    u32 queue_idx;
+    if (run_ctx->block_time_us <= 50.0) {
+      queue_idx = 0;
+    } else if (run_ctx->block_time_us <= 200.0) {
+      queue_idx = 1;
+    } else if (run_ctx->block_time_us <= 50000.0) {
+      queue_idx = 2;
+    } else {
+      queue_idx = 3;
+    }
+
+    // Add to the appropriate periodic queue
+    periodic_queues_[queue_idx].push(run_ctx);
   }
 }
 

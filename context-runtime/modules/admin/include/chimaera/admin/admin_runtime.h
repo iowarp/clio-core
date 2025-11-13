@@ -74,7 +74,8 @@ public:
   /**
    * Initialize container with pool information
    */
-  void Init(const chi::PoolId &pool_id, const std::string &pool_name) override;
+  void Init(const chi::PoolId &pool_id, const std::string &pool_name,
+            chi::u32 container_id = 0) override;
 
   /**
    * Execute a method on a task

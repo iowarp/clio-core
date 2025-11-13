@@ -71,13 +71,15 @@ class Container {
    * Initialize container with pool information
    * @param pool_id The unique ID of this pool
    * @param pool_name The semantic name of this pool (user-provided)
+   * @param container_id The container ID (typically the node ID where this container exists)
    *
    * ChiMod runtime classes should override this method to initialize their client member.
    */
-  virtual void Init(const PoolId& pool_id, const std::string& pool_name) {
+  virtual void Init(const PoolId& pool_id, const std::string& pool_name,
+                    u32 container_id = 0) {
     pool_id_ = pool_id;
     pool_name_ = pool_name;
-    container_id_ = 0;
+    container_id_ = container_id;
     pool_query_ = PoolQuery();  // Default pool query
   }
 

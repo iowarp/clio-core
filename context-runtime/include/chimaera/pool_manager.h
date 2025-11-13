@@ -192,6 +192,14 @@ class PoolManager {
   bool HasPool(PoolId pool_id) const;
 
   /**
+   * Check if a specific container exists on this node for a given pool
+   * @param pool_id Pool identifier
+   * @param container_id Container identifier
+   * @return true if the container exists locally, false otherwise
+   */
+  bool HasContainer(PoolId pool_id, ContainerId container_id) const;
+
+  /**
    * Find pool by name (globally unique)
    * @param pool_name Pool name
    * @return PoolId if found, PoolId::GetNull() if not found

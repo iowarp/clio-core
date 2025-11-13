@@ -97,8 +97,8 @@ class ModuleManager {
    * @param pool_name Pool name for the container
    * @return Pointer to Container or nullptr if failed
    */
-  Container* CreateContainer(const std::string& chimod_name, 
-                                const PoolId& pool_id, 
+  Container* CreateContainer(const std::string& chimod_name,
+                                const PoolId& pool_id,
                                 const std::string& pool_name);
 
   /**

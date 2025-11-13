@@ -12,6 +12,6 @@ docker build --no-cache -t iowarp/core-build:latest -f "${SCRIPT_DIR}/local.Dock
 docker build --no-cache -t iowarp/core:latest -f "${SCRIPT_DIR}/deploy.Dockerfile" "${PROJECT_ROOT}"
 
 # Build the benchmark Docker images
-docker build --no-cache -t iowarp/redis-bench:latest -f "${SCRIPT_DIR}/redis_bench/Dockerfile" "${PROJECT_ROOT}"
+# docker build --no-cache -t iowarp/redis-bench:latest -f "${SCRIPT_DIR}/redis_bench/Dockerfile" "${PROJECT_ROOT}"
 
-docker build --no-cache -t iowarp/cte-bench:latest -f "${SCRIPT_DIR}/wrp_cte_bench/Dockerfile" "${PROJECT_ROOT}"
+# docker build --no-cache -t iowarp/cte-bench:latest -f "${SCRIPT_DIR}/wrp_cte_bench/Dockerfile" "${PROJECT_ROOT}"
