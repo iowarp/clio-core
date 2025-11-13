@@ -17,7 +17,7 @@ RUN sudo chown -R $(whoami):$(whoami) /workspace && \
     cd build && \
     cmake --preset release ../ && \
     sudo make -j$(nproc) install && \
-    cmake ../ --DCMAKE_INSTALL_PREFIX=/iowarp-core && \
+    cmake ../ -DCMAKE_INSTALL_PREFIX=/iowarp-core && \
     sudo make -j$(nproc) install && \
     sudo rm -rf /workspace
 
