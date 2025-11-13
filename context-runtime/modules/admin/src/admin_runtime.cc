@@ -862,12 +862,10 @@ void Runtime::Recv(hipc::FullPtr<RecvTask> task, chi::RunContext &rctx) {
   auto *ipc_manager = CHI_IPC;
   hshm::lbm::Server *lbm_server = ipc_manager->GetMainServer();
   if (!lbm_server) {
-    HELOG(kFatal, "Admin: Main server not available");
     chi::Worker *worker = CHI_CUR_WORKER;
     if (worker) {
       worker->SetTaskDidWork(false);
     }
-    task->SetReturnCode(1);
     return;
   }
 
