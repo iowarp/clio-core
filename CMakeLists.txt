@@ -173,6 +173,43 @@ endif()
 if(WRP_CORE_ENABLE_TESTS)
   message(STATUS "Adding Catch2 testing framework")
   add_subdirectory(external/Catch2)
+
+  # Force installation of Catch2 libraries even when used as subproject
+  # This ensures libCatch2d.so and libCatch2Maind.so are installed to /usr/local/lib
+  install(
+    TARGETS
+      Catch2
+      Catch2WithMain
+    EXPORT
+      Catch2Targets
+    LIBRARY DESTINATION
+      ${CMAKE_INSTALL_LIBDIR}
+    ARCHIVE DESTINATION
+      ${CMAKE_INSTALL_LIBDIR}
+    RUNTIME DESTINATION
+      ${CMAKE_INSTALL_BINDIR}
+  )
+
+  # Install Catch2 headers
+  install(
+    DIRECTORY
+      "${CMAKE_CURRENT_SOURCE_DIR}/external/Catch2/src/catch2"
+      "${CMAKE_CURRENT_BINARY_DIR}/external/Catch2/generated-includes/catch2"
+    DESTINATION
+      "${CMAKE_INSTALL_INCLUDEDIR}"
+    FILES_MATCHING
+      PATTERN "*.hpp"
+  )
+
+  # Install Catch2 CMake config files
+  install(
+    EXPORT
+      Catch2Targets
+    NAMESPACE
+      Catch2::
+    DESTINATION
+      "${CMAKE_INSTALL_LIBDIR}/cmake/Catch2"
+  )
 endif()
 
 # Add cereal header-only library

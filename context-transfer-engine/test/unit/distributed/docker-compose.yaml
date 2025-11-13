@@ -1,15 +1,15 @@
 services:
   # Node 1 - Primary node that builds and runs tests
   cte-node1:
-    image: iowarp/context-transfer-engine-build:latest
+    image: iowarp/core-build:latest
+    pull_policy: never
     container_name: cte-distributed-node1
     hostname: iowarp-node1
     networks:
       cte-cluster:
         ipv4_address: 172.26.0.10
     volumes:
-      - ./hostfile:/etc/iowarp/hostfile:ro
-      - ./wrp_config.yaml:/etc/iowarp/wrp_config.yaml:ro
+      - ${IOWARP_CORE_ROOT:-.}/context-transfer-engine/test/unit/distributed:/etc/iowarp:ro
       - hdd1-storage:/mnt/hdd1
       - hdd2-storage:/mnt/hdd2
       - hdd3-storage:/mnt/hdd3
@@ -21,8 +21,6 @@ services:
       - TEST_FILTER=${TEST_FILTER:-}
       - SECTION_FILTER=${SECTION_FILTER:-}
       - WRP_RUNTIME_CONF=/etc/iowarp/wrp_config.yaml
-      - LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libasan.so.8
-      - ASAN_OPTIONS=detect_leaks=0:detect_odr_violation=0:halt_on_error=1:abort_on_error=1:print_stacktrace=1:symbolize=1
     shm_size: '16gb'
     mem_limit: 16g
     entrypoint: [ "/bin/bash", "-c" ]
@@ -42,9 +40,6 @@ services:
         chimaera_start_runtime &
         RUNTIME_PID=$$! &&
         echo \"Node 1: Runtime started (PID $$RUNTIME_PID)\" &&
-        sleep 5 &&
-        echo 'Node 1: Waiting for all nodes to be ready...' &&
-        sleep 5 &&
         echo '========================================' &&
         echo 'Node 1: Creating CTE pools via chimaera_compose' &&
         echo '========================================' &&
@@ -79,24 +74,22 @@ services:
 
   # Node 2 - Secondary node
   cte-node2:
-    image: iowarp/context-transfer-engine-build:latest
+    image: iowarp/core-build:latest
+    pull_policy: never
     container_name: cte-distributed-node2
     hostname: iowarp-node2
     networks:
       cte-cluster:
         ipv4_address: 172.26.0.11
     volumes:
-      - ./hostfile:/etc/iowarp/hostfile:ro
-      - ./wrp_config.yaml:/etc/iowarp/wrp_config.yaml:ro
+      - ${IOWARP_CORE_ROOT:-.}/context-transfer-engine/test/unit/distributed:/etc/iowarp:ro
+      
       - hdd2-storage:/mnt/hdd2
-      - ../../../build/bin:/workspace/build/bin:ro
     environment:
       - NODE_ID=2
       - NODE_IP=172.26.0.11
       - CONTAINER_HOSTFILE=/etc/iowarp/hostfile
       - WRP_RUNTIME_CONF=/etc/iowarp/wrp_config.yaml
-      - LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libasan.so.8
-      - ASAN_OPTIONS=detect_leaks=0:detect_odr_violation=0:halt_on_error=1:abort_on_error=1:print_stacktrace=1:symbolize=1
     shm_size: '16gb'
     mem_limit: 16g
     entrypoint: [ "/bin/bash", "-c" ]
@@ -122,24 +115,22 @@ services:
 
   # Node 3 - Secondary node
   cte-node3:
-    image: iowarp/context-transfer-engine-build:latest
+    image: iowarp/core-build:latest
+    pull_policy: never
     container_name: cte-distributed-node3
     hostname: iowarp-node3
     networks:
       cte-cluster:
         ipv4_address: 172.26.0.12
     volumes:
-      - ./hostfile:/etc/iowarp/hostfile:ro
-      - ./wrp_config.yaml:/etc/iowarp/wrp_config.yaml:ro
+      - ${IOWARP_CORE_ROOT:-.}/context-transfer-engine/test/unit/distributed:/etc/iowarp:ro
+      
       - hdd3-storage:/mnt/hdd3
-      - ../../../build/bin:/workspace/build/bin:ro
     environment:
       - NODE_ID=3
       - NODE_IP=172.26.0.12
       - CONTAINER_HOSTFILE=/etc/iowarp/hostfile
       - WRP_RUNTIME_CONF=/etc/iowarp/wrp_config.yaml
-      - LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libasan.so.8
-      - ASAN_OPTIONS=detect_leaks=0:detect_odr_violation=0:halt_on_error=1:abort_on_error=1:print_stacktrace=1:symbolize=1
     shm_size: '16gb'
     mem_limit: 16g
     entrypoint: [ "/bin/bash", "-c" ]
@@ -165,23 +156,22 @@ services:
 
   # Node 4 - Secondary node
   cte-node4:
-    image: iowarp/context-transfer-engine-build:latest
+    image: iowarp/core-build:latest
+    pull_policy: never
     container_name: cte-distributed-node4
     hostname: iowarp-node4
     networks:
       cte-cluster:
         ipv4_address: 172.26.0.13
     volumes:
-      - ./hostfile:/etc/iowarp/hostfile:ro
-      - ./wrp_config.yaml:/etc/iowarp/wrp_config.yaml:ro
+      - ${IOWARP_CORE_ROOT:-.}/context-transfer-engine/test/unit/distributed:/etc/iowarp:ro
+      
       - hdd4-storage:/mnt/hdd4
     environment:
       - NODE_ID=4
       - NODE_IP=172.26.0.13
       - CONTAINER_HOSTFILE=/etc/iowarp/hostfile
       - WRP_RUNTIME_CONF=/etc/iowarp/wrp_config.yaml
-      - LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libasan.so.8
-      - ASAN_OPTIONS=detect_leaks=0:detect_odr_violation=0:halt_on_error=1:abort_on_error=1:print_stacktrace=1:symbolize=1
     shm_size: '16gb'
     mem_limit: 16g
     entrypoint: [ "/bin/bash", "-c" ]
