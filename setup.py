@@ -32,6 +32,7 @@ class CMakeBuild(build_ext):
     def run(self):
         """Build IOWarp core following the quick installation steps."""
         try:
+            subprocess.check_call(['git', 'submodule', 'update', '--init', '--recursive'])
             subprocess.check_output(["cmake", "--version"])
         except OSError:
             raise RuntimeError(
