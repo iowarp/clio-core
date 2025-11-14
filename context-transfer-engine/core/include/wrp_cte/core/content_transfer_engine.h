@@ -64,21 +64,25 @@ public:
   /**
    * Query tags by regex pattern
    * @param tag_re Tag regex pattern
+   * @param max_tags Maximum number of tags to return (0 = no limit)
    * @param pool_query Pool query for routing (default: Broadcast)
    * @return Vector of matching tag names
    */
   std::vector<std::string> TagQuery(const std::string &tag_re,
+                                     chi::u32 max_tags = 0,
                                      const chi::PoolQuery &pool_query = chi::PoolQuery::Broadcast());
 
   /**
    * Query blobs by tag and blob regex patterns
    * @param tag_re Tag regex pattern
    * @param blob_re Blob regex pattern
+   * @param max_blobs Maximum number of blobs to return (0 = no limit)
    * @param pool_query Pool query for routing (default: Broadcast)
-   * @return Vector of matching blob names
+   * @return Vector of pairs (tag_name, blob_name) for matching blobs
    */
-  std::vector<std::string> BlobQuery(const std::string &tag_re,
+  std::vector<std::pair<std::string, std::string>> BlobQuery(const std::string &tag_re,
                                       const std::string &blob_re,
+                                      chi::u32 max_blobs = 0,
                                       const chi::PoolQuery &pool_query = chi::PoolQuery::Broadcast());
 
 private:

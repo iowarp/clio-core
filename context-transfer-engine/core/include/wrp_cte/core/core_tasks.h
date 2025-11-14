@@ -12,6 +12,9 @@
 #include <chimaera/bdev/bdev_client.h>
 #include <yaml-cpp/yaml.h>
 #include <chrono>
+// Include cereal for serialization
+#include <cereal/cereal.hpp>
+#include <cereal/archives/binary.hpp>
 
 namespace wrp_cte::core {
 
@@ -1142,23 +1145,34 @@ struct GetContainedBlobsTask : public chi::Task {
 
 /**
  * TagQuery task - Query tags by regex pattern
+ * New behavior:
+ * - Accepts an input maximum number of tags to store (max_tags_). 0 means no
+ *   limit.
+ * - Returns a vector of tag names matching the query.
+ * - total_tags_matched_ sums the total number of tags that matched the
+ *   pattern across replicas during Aggregate.
  */
 struct TagQueryTask : public chi::Task {
-  IN hipc::string tag_regex_;              // Tag regex pattern
-  OUT hipc::vector<hipc::string> tag_names_; // Matching tag names
+  IN hipc::string tag_regex_;
+  IN chi::u32 max_tags_;
+  OUT chi::u64 total_tags_matched_;
+  OUT hipc::vector<hipc::string> results_;
 
   // SHM constructor
   explicit TagQueryTask(const hipc::CtxAllocator<CHI_MAIN_ALLOC_T> &alloc)
-      : chi::Task(alloc), tag_regex_(alloc), tag_names_(alloc) {}
+      : chi::Task(alloc), tag_regex_(alloc), max_tags_(0),
+        total_tags_matched_(0), results_(alloc) {}
 
   // Emplace constructor
   explicit TagQueryTask(const hipc::CtxAllocator<CHI_MAIN_ALLOC_T> &alloc,
                         const chi::TaskId &task_id,
                         const chi::PoolId &pool_id,
                         const chi::PoolQuery &pool_query,
-                        const std::string &tag_regex)
+                        const std::string &tag_regex,
+                        chi::u32 max_tags = 0)
       : chi::Task(alloc, task_id, pool_id, pool_query, Method::kTagQuery),
-        tag_regex_(alloc, tag_regex), tag_names_(alloc) {
+        tag_regex_(alloc, tag_regex), max_tags_(max_tags),
+        total_tags_matched_(0), results_(alloc) {
     task_id_ = task_id;
     pool_id_ = pool_id;
     method_ = Method::kTagQuery;
@@ -1170,14 +1184,14 @@ struct TagQueryTask : public chi::Task {
    * Serialize IN and INOUT parameters
    */
   template <typename Archive> void SerializeIn(Archive &ar) {
-    ar(tag_regex_);
+    ar(tag_regex_, max_tags_);
   }
 
   /**
    * Serialize OUT and INOUT parameters
    */
   template <typename Archive> void SerializeOut(Archive &ar) {
-    ar(tag_names_);
+    ar(total_tags_matched_, results_);
   }
 
   /**
@@ -1185,31 +1199,48 @@ struct TagQueryTask : public chi::Task {
    */
   void Copy(const hipc::FullPtr<TagQueryTask> &other) {
     tag_regex_ = other->tag_regex_;
-    tag_names_ = other->tag_names_;
+    max_tags_ = other->max_tags_;
+    total_tags_matched_ = other->total_tags_matched_;
+    results_ = other->results_;
   }
 
   /**
    * Aggregate results from multiple nodes
    */
   void Aggregate(const hipc::FullPtr<TagQueryTask> &other) {
-    // Append tag names from other task
-    for (const auto &tag_name : other->tag_names_) {
-      tag_names_.emplace_back(tag_name);
+    // Sum total matched tags across replicas
+    total_tags_matched_ += other->total_tags_matched_;
+
+    // Append results up to max_tags_ (if non-zero)
+    for (const auto &tag_name : other->results_) {
+      if (max_tags_ != 0 && results_.size() >= static_cast<size_t>(max_tags_))
+        break;
+      results_.emplace_back(tag_name);
     }
   }
 };
 
 /**
  * BlobQuery task - Query blobs by tag and blob regex patterns
+ * New behavior:
+ * - Accepts an input maximum number of blobs to store (max_blobs_). 0 means no
+ *   limit.
+ * - Returns a vector of pairs where each pair contains (tag_name, blob_name)
+ *   for blobs matching the query.
+ * - total_blobs_matched_ sums the total number of blobs that matched across
+ *   replicas during Aggregate.
  */
 struct BlobQueryTask : public chi::Task {
-  IN hipc::string tag_regex_;               // Tag regex pattern
-  IN hipc::string blob_regex_;              // Blob regex pattern
-  OUT hipc::vector<hipc::string> blob_names_; // Matching blob names
+  IN hipc::string tag_regex_;
+  IN hipc::string blob_regex_;
+  IN chi::u32 max_blobs_;
+  OUT chi::u64 total_blobs_matched_;
+  OUT hipc::vector<hipc::pair<hipc::string, hipc::string>> results_;
 
   // SHM constructor
   explicit BlobQueryTask(const hipc::CtxAllocator<CHI_MAIN_ALLOC_T> &alloc)
-      : chi::Task(alloc), tag_regex_(alloc), blob_regex_(alloc), blob_names_(alloc) {}
+      : chi::Task(alloc), tag_regex_(alloc), blob_regex_(alloc), max_blobs_(0),
+        total_blobs_matched_(0), results_(alloc) {}
 
   // Emplace constructor
   explicit BlobQueryTask(const hipc::CtxAllocator<CHI_MAIN_ALLOC_T> &alloc,
@@ -1217,9 +1248,11 @@ struct BlobQueryTask : public chi::Task {
                          const chi::PoolId &pool_id,
                          const chi::PoolQuery &pool_query,
                          const std::string &tag_regex,
-                         const std::string &blob_regex)
+                         const std::string &blob_regex,
+                         chi::u32 max_blobs = 0)
       : chi::Task(alloc, task_id, pool_id, pool_query, Method::kBlobQuery),
-        tag_regex_(alloc, tag_regex), blob_regex_(alloc, blob_regex), blob_names_(alloc) {
+        tag_regex_(alloc, tag_regex), blob_regex_(alloc, blob_regex),
+        max_blobs_(max_blobs), total_blobs_matched_(0), results_(alloc) {
     task_id_ = task_id;
     pool_id_ = pool_id;
     method_ = Method::kBlobQuery;
@@ -1231,14 +1264,14 @@ struct BlobQueryTask : public chi::Task {
    * Serialize IN and INOUT parameters
    */
   template <typename Archive> void SerializeIn(Archive &ar) {
-    ar(tag_regex_, blob_regex_);
+    ar(tag_regex_, blob_regex_, max_blobs_);
   }
 
   /**
    * Serialize OUT and INOUT parameters
    */
   template <typename Archive> void SerializeOut(Archive &ar) {
-    ar(blob_names_);
+    ar(total_blobs_matched_, results_);
   }
 
   /**
@@ -1247,20 +1280,37 @@ struct BlobQueryTask : public chi::Task {
   void Copy(const hipc::FullPtr<BlobQueryTask> &other) {
     tag_regex_ = other->tag_regex_;
     blob_regex_ = other->blob_regex_;
-    blob_names_ = other->blob_names_;
+    max_blobs_ = other->max_blobs_;
+    total_blobs_matched_ = other->total_blobs_matched_;
+    results_ = other->results_;
   }
 
   /**
    * Aggregate results from multiple nodes
    */
   void Aggregate(const hipc::FullPtr<BlobQueryTask> &other) {
-    // Append blob names from other task
-    for (const auto &blob_name : other->blob_names_) {
-      blob_names_.emplace_back(blob_name);
+    // Sum total matched blobs across replicas
+    total_blobs_matched_ += other->total_blobs_matched_;
+
+    // Append results up to max_blobs_ (if non-zero)
+    for (const auto &pair : other->results_) {
+      if (max_blobs_ != 0 && results_.size() >= static_cast<size_t>(max_blobs_))
+        break;
+      results_.emplace_back(pair);
     }
   }
 };
 
 } // namespace wrp_cte::core
+
+// Cereal serialization support for hipc::pair
+namespace cereal {
+
+template <class Archive, typename FirstT, typename SecondT>
+void serialize(Archive &ar, hipc::pair<FirstT, SecondT> &pair) {
+  ar(pair.first_, pair.second_);
+}
+
+} // namespace cereal
 
 #endif // WRPCTE_CORE_TASKS_H_

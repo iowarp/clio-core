@@ -1928,31 +1928,37 @@ void Runtime::TagQuery(hipc::FullPtr<TagQueryTask> task, chi::RunContext &ctx) {
 
   try {
     std::string tag_regex = task->tag_regex_.str();
-    std::vector<std::string> matching_tags;
 
     // Create regex pattern
     std::regex pattern(tag_regex);
 
-    // Iterate over tag table and find matching tags
+    // Collect matching tags (name + id)
+    std::vector<std::pair<std::string, TagId>> matching_tags;
     tag_name_to_id_.for_each(
         [&pattern, &matching_tags](const std::string &tag_name,
                                    const TagId &tag_id) {
-          (void)tag_id; // Suppress unused parameter warning
           if (std::regex_match(tag_name, pattern)) {
-            matching_tags.push_back(tag_name);
+            matching_tags.emplace_back(tag_name, tag_id);
           }
         });
 
-    // Copy results to task output
-    task->tag_names_.clear();
-    for (const auto &tag_name : matching_tags) {
-      task->tag_names_.emplace_back(tag_name.c_str());
+    // Total matched tags (summed across replicas during Aggregate)
+    task->total_tags_matched_ = matching_tags.size();
+
+    // Build results: just tag names matching the query. Respect max_tags_ if non-zero.
+    task->results_.clear();
+    for (const auto &tn : matching_tags) {
+      if (task->max_tags_ != 0 && task->results_.size() >= task->max_tags_) {
+        break;
+      }
+      const std::string &tag_name = tn.first;
+      task->results_.emplace_back(tag_name.c_str());
     }
 
     // Success
     task->return_code_.store(0);
-    HILOG(kDebug, "TagQuery successful: pattern={}, found {} tags", tag_regex,
-          matching_tags.size());
+    HILOG(kDebug, "TagQuery successful: pattern={}, found {} tags",
+          tag_regex, matching_tags.size());
 
   } catch (const std::exception &e) {
     task->return_code_.store(1);
@@ -1976,53 +1982,57 @@ void Runtime::BlobQuery(hipc::FullPtr<BlobQueryTask> task,
     std::regex tag_pattern(tag_regex);
     std::regex blob_pattern(blob_regex);
 
-    // Find matching tag IDs
-    std::vector<TagId> matching_tag_ids;
+    // Find matching tag IDs and names
+    std::vector<std::pair<std::string, TagId>> matching_tags;
     tag_name_to_id_.for_each(
-        [&tag_pattern, &matching_tag_ids](const std::string &tag_name,
-                                          const TagId &tag_id) {
+        [&tag_pattern, &matching_tags](const std::string &tag_name,
+                                      const TagId &tag_id) {
           if (std::regex_match(tag_name, tag_pattern)) {
-            matching_tag_ids.push_back(tag_id);
+            matching_tags.emplace_back(tag_name, tag_id);
           }
         });
 
-    // Find blobs in matching tags
-    std::vector<std::string> matching_blobs;
-    for (const auto &tag_id : matching_tag_ids) {
+    // Build results: pairs of (tag_name, blob_name) for matching blobs.
+    // Also compute total_blobs_matched_.
+    task->results_.clear();
+    task->total_blobs_matched_ = 0;
+
+    for (const auto &tn : matching_tags) {
+      const std::string &tag_name = tn.first;
+      const TagId &tag_id = tn.second;
+
       // Construct prefix for this tag's blobs
       std::string prefix = std::to_string(tag_id.major_) + "." +
                            std::to_string(tag_id.minor_) + ".";
 
-      // Iterate through tag_blob_name_to_info_ and filter by prefix
+      // Iterate and collect matching blobs for this tag
       tag_blob_name_to_info_.for_each(
-          [&prefix, &blob_pattern, &matching_blobs](
+          [&prefix, &blob_pattern, &tag_name, &task](
               const std::string &composite_key, const BlobInfo &blob_info) {
-            (void)blob_info; // Suppress unused parameter warning
-            // Check if composite key starts with the tag prefix
+            (void)blob_info;
             if (composite_key.rfind(prefix, 0) == 0) {
-              // Extract blob name (everything after the prefix)
               std::string blob_name = composite_key.substr(prefix.length());
-
-              // Check if blob name matches regex
               if (std::regex_match(blob_name, blob_pattern)) {
-                matching_blobs.push_back(blob_name);
+                // Increase total matched counter (counts all matches)
+                task->total_blobs_matched_++;
+                // Respect max_blobs_ if set
+                if (task->max_blobs_ == 0 || 
+                    task->results_.size() < static_cast<size_t>(task->max_blobs_)) {
+                  hipc::pair<hipc::string, hipc::string> pair(
+                      task->results_.GetAllocator(), tag_name.c_str(), blob_name.c_str());
+                  task->results_.emplace_back(std::move(pair));
+                }
               }
             }
           });
-    }
-
-    // Copy results to task output
-    task->blob_names_.clear();
-    for (const auto &blob_name : matching_blobs) {
-      task->blob_names_.emplace_back(blob_name.c_str());
     }
 
     // Success
     task->return_code_.store(0);
     HILOG(
         kDebug,
-        "BlobQuery successful: tag_pattern={}, blob_pattern={}, found {} blobs",
-        tag_regex, blob_regex, matching_blobs.size());
+        "BlobQuery successful: tag_pattern={}, blob_pattern={}, found {} blobs total",
+        tag_regex, blob_regex, task->total_blobs_matched_);
 
   } catch (const std::exception &e) {
     task->return_code_.store(1);

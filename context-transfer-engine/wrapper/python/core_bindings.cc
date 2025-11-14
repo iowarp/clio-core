@@ -1,5 +1,6 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/chrono.h>
+#include <nanobind/stl/pair.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
 
@@ -73,21 +74,21 @@ NB_MODULE(wrp_cte_core_ext, m) {
       .def("ReorganizeBlob", &wrp_cte::core::Client::ReorganizeBlob,
            "mctx"_a, "tag_id"_a, "blob_name"_a, "new_score"_a,
            "Reorganize single blob with new score for data placement optimization")
-      .def("TagQuery",
-           [](wrp_cte::core::Client &self, const hipc::MemContext &mctx,
-              const std::string &tag_regex, const chi::PoolQuery &pool_query) {
-             return self.TagQuery(mctx, tag_regex, pool_query);
-           },
-           "mctx"_a, "tag_regex"_a, "pool_query"_a,
-           "Query tags by regex pattern")
-      .def("BlobQuery",
-           [](wrp_cte::core::Client &self, const hipc::MemContext &mctx,
-              const std::string &tag_regex, const std::string &blob_regex,
-              const chi::PoolQuery &pool_query) {
-             return self.BlobQuery(mctx, tag_regex, blob_regex, pool_query);
-           },
-           "mctx"_a, "tag_regex"_a, "blob_regex"_a, "pool_query"_a,
-           "Query blobs by tag and blob regex patterns");
+     .def("TagQuery",
+         [](wrp_cte::core::Client &self, const hipc::MemContext &mctx,
+            const std::string &tag_regex, uint32_t max_tags, const chi::PoolQuery &pool_query) {
+           return self.TagQuery(mctx, tag_regex, max_tags, pool_query);
+         },
+         "mctx"_a, "tag_regex"_a, "max_tags"_a = 0, "pool_query"_a,
+         "Query tags by regex pattern, returns vector of tag names")
+     .def("BlobQuery",
+         [](wrp_cte::core::Client &self, const hipc::MemContext &mctx,
+            const std::string &tag_regex, const std::string &blob_regex,
+            uint32_t max_blobs, const chi::PoolQuery &pool_query) {
+           return self.BlobQuery(mctx, tag_regex, blob_regex, max_blobs, pool_query);
+         },
+         "mctx"_a, "tag_regex"_a, "blob_regex"_a, "max_blobs"_a = 0, "pool_query"_a,
+         "Query blobs by tag and blob regex patterns, returns vector of (tag_name, blob_name) pairs");
 
   // Module-level convenience functions
   m.def(
