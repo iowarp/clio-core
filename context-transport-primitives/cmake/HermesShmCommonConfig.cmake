@@ -82,14 +82,17 @@ if(HSHM_ENABLE_CEREAL)
         if(cereal_FOUND)
             message(STATUS "found cereal at ${cereal_DIR}")
         else()
-            message(STATUS "cereal not found via find_package, checking if headers are available")
             # Cereal is header-only, so we can create an interface target if headers exist
-            if(EXISTS "${HSHM_INCLUDE_DIR}/cereal")
-                add_library(cereal INTERFACE IMPORTED)
-                set_target_properties(cereal PROPERTIES
-                    INTERFACE_INCLUDE_DIRECTORIES "${HSHM_INCLUDE_DIR}"
-                )
-                message(STATUS "Created cereal interface target from installed headers")
+            # Only do this when using installed package (HSHM_INCLUDE_DIR is absolute)
+            if(DEFINED HSHM_INCLUDE_DIR AND IS_ABSOLUTE "${HSHM_INCLUDE_DIR}")
+                if(EXISTS "${HSHM_INCLUDE_DIR}/cereal")
+                    message(STATUS "cereal not found via find_package, but headers exist at ${HSHM_INCLUDE_DIR}/cereal")
+                    add_library(cereal INTERFACE IMPORTED)
+                    set_target_properties(cereal PROPERTIES
+                        INTERFACE_INCLUDE_DIRECTORIES "${HSHM_INCLUDE_DIR}"
+                    )
+                    message(STATUS "Created cereal interface target from installed headers")
+                endif()
             endif()
         endif()
     endif()
