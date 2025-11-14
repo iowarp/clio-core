@@ -20,8 +20,11 @@ hshm_target_compile_definitions(hermes_shm_host)
 list(APPEND HSHM_LIBS hermes_shm_host)
 add_library(cxx INTERFACE)
 target_link_libraries(cxx INTERFACE hermes_shm_host)
-target_include_directories(cxx INTERFACE ${HSHM_INSTALL_INCLUDE_DIR})
-target_link_directories(cxx INTERFACE ${HSHM_INSTALL_LIB_DIR})
+target_include_directories(cxx INTERFACE
+    $<BUILD_INTERFACE:${HSHM_ROOT}/include>
+    $<BUILD_INTERFACE:${PROJECT_BINARY_DIR}/include>
+    $<INSTALL_INTERFACE:${HSHM_INSTALL_INCLUDE_DIR}>
+)
 hshm_target_compile_definitions(cxx)
 
 # Create hshm::cxx alias for unified builds (when used as subdirectory)
@@ -40,8 +43,11 @@ if(HSHM_ENABLE_CUDA)
     list(APPEND HSHM_LIBS hermes_shm_cuda)
     add_library(cudacxx INTERFACE)
     target_link_libraries(cudacxx INTERFACE hermes_shm_cuda)
-    target_include_directories(cudacxx INTERFACE ${HSHM_INSTALL_INCLUDE_DIR})
-    target_link_directories(cudacxx INTERFACE ${HSHM_INSTALL_LIB_DIR})
+    target_include_directories(cudacxx INTERFACE
+        $<BUILD_INTERFACE:${HSHM_ROOT}/include>
+        $<BUILD_INTERFACE:${PROJECT_BINARY_DIR}/include>
+        $<INSTALL_INTERFACE:${HSHM_INSTALL_INCLUDE_DIR}>
+    )
     hshm_target_compile_definitions(cudacxx)
     list(APPEND HSHM_LIBS cudacxx)
 endif()
@@ -55,8 +61,11 @@ if(HSHM_ENABLE_ROCM)
     list(APPEND HSHM_LIBS hermes_shm_rocm_gpu)
     add_library(rocmcxx_gpu INTERFACE)
     target_link_libraries(rocmcxx_gpu INTERFACE hermes_shm_rocm_gpu)
-    target_include_directories(rocmcxx_gpu INTERFACE ${HSHM_INSTALL_INCLUDE_DIR})
-    target_link_directories(rocmcxx_gpu INTERFACE ${HSHM_INSTALL_LIB_DIR})
+    target_include_directories(rocmcxx_gpu INTERFACE
+        $<BUILD_INTERFACE:${HSHM_ROOT}/include>
+        $<BUILD_INTERFACE:${PROJECT_BINARY_DIR}/include>
+        $<INSTALL_INTERFACE:${HSHM_INSTALL_INCLUDE_DIR}>
+    )
     hshm_target_compile_definitions(rocmcxx_gpu)
     list(APPEND HSHM_LIBS rocmcxx_gpu)
 
@@ -66,8 +75,11 @@ if(HSHM_ENABLE_ROCM)
     list(APPEND HSHM_LIBS hermes_shm_rocm_host)
     add_library(rocmcxx_host INTERFACE)
     target_link_libraries(rocmcxx_host INTERFACE hermes_shm_rocm_host)
-    target_include_directories(rocmcxx_host INTERFACE ${HSHM_INSTALL_INCLUDE_DIR})
-    target_link_directories(rocmcxx_host INTERFACE ${HSHM_INSTALL_LIB_DIR})
+    target_include_directories(rocmcxx_host INTERFACE
+        $<BUILD_INTERFACE:${HSHM_ROOT}/include>
+        $<BUILD_INTERFACE:${PROJECT_BINARY_DIR}/include>
+        $<INSTALL_INTERFACE:${HSHM_INSTALL_INCLUDE_DIR}>
+    )
     hshm_target_compile_definitions(rocmcxx_host)
     list(APPEND HSHM_LIBS rocmcxx_host)
 endif()

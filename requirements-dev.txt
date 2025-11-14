@@ -1,0 +1,16 @@
+# Development requirements
+-r requirements.txt
+
+# Build tools
+build
+twine
+wheel
+
+# Testing
+pytest>=7.0.0
+pytest-cov
+
+# Code quality
+black
+flake8
+mypy

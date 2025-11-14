@@ -56,11 +56,11 @@ install(
         FILES
         ${WRP_CTE_HEADERS}
         DESTINATION
-        ${CMAKE_INSTALL_PREFIX}/include/adapter
+        include/adapter
         COMPONENT
         headers
 )
-install(DIRECTORY mapper DESTINATION ${CMAKE_INSTALL_PREFIX}/include/adapter)
+install(DIRECTORY mapper DESTINATION include/adapter)
 
 #-----------------------------------------------------------------------------
 # Install CAE config library

@@ -357,7 +357,7 @@ endif()
 # ------------------------------------------------------------------------------
 # Install hshm
 # ------------------------------------------------------------------------------
-install(DIRECTORY include DESTINATION ${CMAKE_INSTALL_PREFIX})
+install(DIRECTORY include/ DESTINATION include)
 
 # Component config files are no longer installed separately
 # All configuration is handled by unified IOWarp Core (IowarpCoreConfig.cmake)

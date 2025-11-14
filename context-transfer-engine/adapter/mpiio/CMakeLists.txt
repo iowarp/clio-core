@@ -41,7 +41,7 @@ install(
         FILES
         ${WRP_CTE_HEADERS}
         DESTINATION
-        ${CMAKE_INSTALL_PREFIX}/include/adapter/stdio
+        include/adapter/mpiio
         COMPONENT
         headers
 )

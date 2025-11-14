@@ -167,7 +167,7 @@ install(
   FILES
   ${WRP_CTE_HEADERS}
   DESTINATION
-  ${CMAKE_INSTALL_PREFIX}/include/adapter/vfd
+  include/adapter/vfd
   COMPONENT
   headers
 )

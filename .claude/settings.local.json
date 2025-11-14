@@ -2,7 +2,11 @@
   "permissions": {
     "allow": [
       "Bash(cmake:*)",
-      "Bash(docker compose:*)"
+      "Bash(docker compose:*)",
+      "Bash(python -m build:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)"
     ],
     "deny": [],
     "ask": []

@@ -146,7 +146,14 @@ herr_t Hdf5FileAssimilator::VisitCallback(hid_t loc_id, const char* name,
 
   // Check if this is a dataset
   H5O_info_t obj_info;
+  // Handle HDF5 API version differences for H5Oget_info_by_name
+#if H5_VERSION_GE(1, 12, 0)
+  // HDF5 1.12+ API: includes fields parameter for selective info retrieval
+  herr_t status = H5Oget_info_by_name(loc_id, name, &obj_info, H5O_INFO_BASIC, H5P_DEFAULT);
+#else
+  // HDF5 1.10 API: no fields parameter
   herr_t status = H5Oget_info_by_name(loc_id, name, &obj_info, H5P_DEFAULT);
+#endif
   if (status < 0) {
     return 0;  // Continue iteration even on error
   }

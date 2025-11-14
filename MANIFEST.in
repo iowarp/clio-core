@@ -1,0 +1,66 @@
+# Include essential package files
+include README.md
+include LICENSE
+include CLAUDE.md
+include CMakeLists.txt
+include CMakePresets.json
+include CPPLINT.cfg
+include pyproject.toml
+include setup.py
+include requirements.txt
+include requirements-dev.txt
+include test_package.py
+
+# Include .gitmodules for reference
+include .gitmodules
+
+# Include all component directories with their source and build files
+recursive-include context-runtime *.h *.hpp *.hxx *.cc *.cpp *.c *.cmake *.txt *.yaml *.yml *.json *.md *.in *.proto
+recursive-include context-transfer-engine *.h *.hpp *.hxx *.cc *.cpp *.c *.cmake *.txt *.yaml *.yml *.json *.md *.in *.proto *.py
+recursive-include context-assimilation-engine *.h *.hpp *.hxx *.cc *.cpp *.c *.cmake *.txt *.yaml *.yml *.json *.md *.in *.proto
+recursive-include context-transport-primitives *.h *.hpp *.hxx *.cc *.cpp *.c *.cmake *.txt *.yaml *.yml *.json *.md *.in *.proto
+recursive-include context-exploration-engine *.h *.hpp *.hxx *.cc *.cpp *.c *.cmake *.txt *.yaml *.yml *.json *.md *.in *.proto
+
+# Include external dependencies (git submodules content)
+recursive-include external/cereal *.h *.hpp *.hxx *.cmake *.txt *.md *.in
+recursive-include external/yaml-cpp *.h *.hpp *.hxx *.cc *.cpp *.c *.cmake *.txt *.md *.in
+recursive-include external/Catch2 *.h *.hpp *.hxx *.cc *.cpp *.c *.cmake *.txt *.md *.in
+recursive-include external/nanobind *.h *.hpp *.hxx *.cc *.cpp *.c *.cmake *.txt *.md *.in *.py
+
+# Include docker configuration
+recursive-include docker *.yml *.yaml *.sh Dockerfile* *.conf *.md
+
+# Include Python package
+recursive-include iowarp_core *.py
+
+# Include AI prompts
+recursive-include ai-prompts *.md
+
+# Exclude build artifacts and temporary files
+global-exclude *.pyc
+global-exclude *.pyo
+global-exclude __pycache__
+global-exclude *.so
+global-exclude *.a
+global-exclude *.o
+global-exclude *.obj
+global-exclude .git*
+global-exclude CMakeCache.txt
+global-exclude cmake_install.cmake
+global-exclude CTestTestfile.cmake
+global-exclude Makefile
+global-exclude *.make
+recursive-exclude * CMakeFiles
+recursive-exclude * _deps
+recursive-exclude * build
+recursive-exclude * Testing
+recursive-exclude * .github
+recursive-exclude * .vscode
+recursive-exclude * .devcontainer
+recursive-exclude * .claude
+
+# Exclude .vscode, .devcontainer, .github, and .claude unless specifically needed
+prune .vscode
+prune .github
+prune .devcontainer
+prune .claude
