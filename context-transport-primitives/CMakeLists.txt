@@ -312,7 +312,7 @@ install(
     ${PROJECT_BINARY_DIR}/CMakeFiles/HermesShmConfig.cmake
     ${PROJECT_BINARY_DIR}/CMakeFiles/HermesShmCommonConfig.cmake
     DESTINATION
-    ${CMAKE_INSTALL_PREFIX}/lib/cmake/HermesShm
+    lib/cmake/HermesShm
 )
 
 install(EXPORT ${HSHM_EXPORTED_TARGETS}
