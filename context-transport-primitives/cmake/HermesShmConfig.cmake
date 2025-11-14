@@ -30,10 +30,11 @@ set(HSHM_ENABLE_ROCM @HSHM_ENABLE_ROCM@)
 set(HIP_PLATFORM @HIP_PLATFORM@)
 set(HSHM_NO_COMPILE @HSHM_NO_COMPILE@)
 
-set(HSHM_PREFIX @CMAKE_INSTALL_PREFIX@)
-set(HSHM_LIB_DIR @HSHM_INSTALL_LIB_DIR@)
-set(HSHM_INCLUDE_DIR @HSHM_INSTALL_INCLUDE_DIR@)
-set(HSHM_BIN_DIR @HSHM_INSTALL_BIN_DIR@)
+# Compute paths relative to the config file location
+get_filename_component(HSHM_PREFIX "${CMAKE_CURRENT_LIST_DIR}/../../../" ABSOLUTE)
+set(HSHM_LIB_DIR "${HSHM_PREFIX}/@HSHM_INSTALL_LIB_DIR@")
+set(HSHM_INCLUDE_DIR "${HSHM_PREFIX}/@HSHM_INSTALL_INCLUDE_DIR@")
+set(HSHM_BIN_DIR "${HSHM_PREFIX}/@HSHM_INSTALL_BIN_DIR@")
 
 set(HermesShm_PREFIX ${HSHM_PREFIX})
 set(HermesShm_LIB_DIR ${HSHM_LIB_DIR})
@@ -47,13 +48,13 @@ endif()
 set(REAL_TIME_FLAGS @REAL_TIME_FLAGS@)
 
 # Find the HermesShm Package
-include(@CMAKE_INSTALL_PREFIX@/lib/cmake/HermesShm/HermesShmCoreConfig.cmake)
-include(@CMAKE_INSTALL_PREFIX@/lib/cmake/HermesShm/HermesShmCommonConfig.cmake)
+include(${CMAKE_CURRENT_LIST_DIR}/HermesShmCoreConfig.cmake)
+include(${CMAKE_CURRENT_LIST_DIR}/HermesShmCommonConfig.cmake)
 include_directories(${HSHM_INCLUDE_DIR})
 link_directories(${HSHM_LIB_DIR})
 
 # Add my library to RPATH
-list(APPEND CMAKE_INSTALL_RPATH "@HSHM_INSTALL_LIB_DIR@")
+list(APPEND CMAKE_INSTALL_RPATH "${HSHM_LIB_DIR}")
 
 # ROCm: Target link directories / includes
 if(HSHM_ENABLE_ROCM)
@@ -63,5 +64,5 @@ if(HSHM_ENABLE_ROCM)
 
     # TODO(llogan): This is a hack to make vscode detect HIP headers and not show errors
     set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -isystem ${rocm_path}/include -D__HIP_PLATFORM_AMD__")
-    set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -isystem @HSHM_INSTALL_INCLUDE_DIR@")
+    set(CMAKE_HIP_FLAGS "${CMAKE_HIP_FLAGS} -isystem ${HSHM_INCLUDE_DIR}")
 endif()
