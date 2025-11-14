@@ -73,7 +73,11 @@ def generate_test_config():
     port = find_available_port()
     print(f"  Using port: {port}")
 
-    # Generate minimal config
+    # Create a temporary directory for storage devices
+    storage_dir = os.path.join(temp_dir, "cte_test_storage")
+    os.makedirs(storage_dir, exist_ok=True)
+
+    # Generate minimal config with storage devices
     config = {
         'networking': {
             'protocol': 'zmq',
@@ -87,7 +91,13 @@ def generate_test_config():
             'main_segment_size': '1G',
             'client_data_segment_size': '512M',
             'runtime_data_segment_size': '512M'
-        }
+        },
+        'devices': [
+            {
+                'mount_point': storage_dir,
+                'capacity': '1G'
+            }
+        ]
     }
 
     # Write config to temporary file
