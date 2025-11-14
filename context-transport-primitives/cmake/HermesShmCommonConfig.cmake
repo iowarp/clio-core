@@ -370,15 +370,15 @@ macro(jarvis_repo_add REPO_PATH PIPELINE_PATH)
 
     # Install jarvis repo
     install(DIRECTORY ${REPO_PATH}
-        DESTINATION ${CMAKE_INSTALL_PREFIX}/jarvis)
+        DESTINATION jarvis)
 
     # Add jarvis repo after installation
     # Ensure install commands use env vars from host system, particularly PATH and PYTHONPATH
-    install(CODE "execute_process(COMMAND env \"PATH=$ENV{PATH}\" \"PYTHONPATH=$ENV{PYTHONPATH}\" jarvis repo add ${CMAKE_INSTALL_PREFIX}/jarvis/${REPO_NAME})")
+    install(CODE "execute_process(COMMAND env \"PATH=$ENV{PATH}\" \"PYTHONPATH=$ENV{PYTHONPATH}\" jarvis repo add \${CMAKE_INSTALL_PREFIX}/jarvis/${REPO_NAME})")
 
     if(REPO_NAME)
         install(DIRECTORY ${PIPELINE_PATH}
-            DESTINATION ${CMAKE_INSTALL_PREFIX}/jarvis)
+            DESTINATION jarvis)
     endif()
 endmacro()
 
