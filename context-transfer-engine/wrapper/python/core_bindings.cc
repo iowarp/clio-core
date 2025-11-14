@@ -8,6 +8,7 @@
 #include <wrp_cte/core/core_client.h>
 #include <wrp_cte/core/core_tasks.h>
 #include <chimaera/chimaera.h>
+#include <chimaera/bdev/bdev_tasks.h>
 
 namespace nb = nanobind;
 using namespace nb::literals;
@@ -24,19 +25,27 @@ NB_MODULE(wrp_cte_core_ext, m) {
       .value("kDelTag", wrp_cte::core::CteOp::kDelTag)
       .value("kGetTagSize", wrp_cte::core::CteOp::kGetTagSize);
 
-  // Bind UniqueId type (used by both TagId and BlobId)
-  // Note: Both TagId and BlobId are aliases for chi::UniqueId, so we register the base type
+  // Bind BdevType enum
+  nb::enum_<chimaera::bdev::BdevType>(m, "BdevType")
+      .value("kFile", chimaera::bdev::BdevType::kFile)
+      .value("kRam", chimaera::bdev::BdevType::kRam);
+
+  // Bind UniqueId type (used by TagId, BlobId, and PoolId)
+  // Note: TagId, BlobId, and PoolId are all aliases for chi::UniqueId, so we register the base type
   auto unique_id_class = nb::class_<wrp_cte::core::TagId>(m, "UniqueId")
       .def(nb::init<>())
+      .def(nb::init<chi::u32, chi::u32>(), "major"_a, "minor"_a,
+           "Create UniqueId with major and minor values")
       .def_static("GetNull", &wrp_cte::core::TagId::GetNull)
       .def("ToU64", &wrp_cte::core::TagId::ToU64)
       .def("IsNull", &wrp_cte::core::TagId::IsNull)
       .def_rw("major_", &wrp_cte::core::TagId::major_)
       .def_rw("minor_", &wrp_cte::core::TagId::minor_);
 
-  // Create aliases for TagId and BlobId
+  // Create aliases for TagId, BlobId, and PoolId (all are UniqueId)
   m.attr("TagId") = unique_id_class;
   m.attr("BlobId") = unique_id_class;
+  m.attr("PoolId") = unique_id_class;
 
   // Note: Timestamp (chrono time_point) is automatically handled by
   // nanobind/stl/chrono.h
@@ -99,7 +108,31 @@ NB_MODULE(wrp_cte_core_ext, m) {
            return self.BlobQuery(mctx, tag_regex, blob_regex, max_blobs, pool_query);
          },
          "mctx"_a, "tag_regex"_a, "blob_regex"_a, "max_blobs"_a = 0, "pool_query"_a,
-         "Query blobs by tag and blob regex patterns, returns vector of (tag_name, blob_name) pairs");
+         "Query blobs by tag and blob regex patterns, returns vector of (tag_name, blob_name) pairs")
+     .def("RegisterTarget",
+         [](wrp_cte::core::Client &self, const hipc::MemContext &mctx,
+            const std::string &target_name, chimaera::bdev::BdevType bdev_type,
+            uint64_t total_size, const chi::PoolQuery &target_query, const chi::PoolId &bdev_id) {
+           return self.RegisterTarget(mctx, target_name, bdev_type, total_size, target_query, bdev_id);
+         },
+         "mctx"_a, "target_name"_a, "bdev_type"_a, "total_size"_a, 
+         "target_query"_a, "bdev_id"_a,
+         "Register a storage target. Returns 0 on success, non-zero on failure")
+     .def("RegisterTarget",
+         [](wrp_cte::core::Client &self, const hipc::MemContext &mctx,
+            const std::string &target_name, chimaera::bdev::BdevType bdev_type,
+            uint64_t total_size) {
+           return self.RegisterTarget(mctx, target_name, bdev_type, total_size);
+         },
+         "mctx"_a, "target_name"_a, "bdev_type"_a, "total_size"_a,
+         "Register a storage target with default query and pool ID. Returns 0 on success, non-zero on failure")
+     .def("DelBlob",
+         [](wrp_cte::core::Client &self, const hipc::MemContext &mctx,
+            const wrp_cte::core::TagId &tag_id, const std::string &blob_name) {
+           return self.DelBlob(mctx, tag_id, blob_name);
+         },
+         "mctx"_a, "tag_id"_a, "blob_name"_a,
+         "Delete a blob from a tag. Returns True on success, False otherwise");
 
   // Bind Tag wrapper class - provides convenient API for tag operations
   // This class wraps tag operations and provides automatic memory management
