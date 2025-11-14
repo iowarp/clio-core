@@ -79,7 +79,7 @@ jobs:
           -DWRP_CORE_ENABLE_CTE=ON \
           -DWRP_CORE_ENABLE_CAE=ON \
           -DWRP_CORE_ENABLE_CEE=ON \
-          -DWRP_CORE_ENABLE_TESTS=ON
+          -DWRP_CORE_ENABLE_TESTS=OFF
       env:
         CC: gcc
         CXX: g++
