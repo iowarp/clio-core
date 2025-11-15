@@ -118,7 +118,7 @@ IOWarp Core uses **direct installation to sys.prefix** (not wheel bundling):
 - **CMake configs** → `{sys.prefix}/lib/cmake/`
 
 This approach is standard for C++ libraries with Python bindings and ensures:
-- ✅ CMake can find packages with `find_package(IowarpCore)`
+- ✅ CMake can find packages with `find_package(iowarp-core)`
 - ✅ Binaries are automatically in PATH
 - ✅ Works like system package managers (apt, yum, conda)
 

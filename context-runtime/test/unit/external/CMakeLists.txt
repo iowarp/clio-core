@@ -6,7 +6,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Unified IOWarp Core package - includes HermesShm, Chimaera, and build utilities
-find_package(IowarpCore REQUIRED)
+find_package(iowarp-core REQUIRED)
 # This automatically provides:
 #   - All hshm::* modular targets (hshm::cxx, hshm::configure, hshm::serialize, etc.)
 #   - chimaera::cxx (core runtime library)

@@ -202,11 +202,11 @@ ChiMod libraries automatically handle common dependencies:
 
 **For External Applications:**
 
-Use the unified `find_package(IowarpCore)` which automatically includes all components and ChiMods:
+Use the unified `find_package(iowarp-core)` which automatically includes all components and ChiMods:
 
 ```cmake
 # Single find_package call includes everything
-find_package(IowarpCore REQUIRED)
+find_package(iowarp-core REQUIRED)
 # This automatically provides:
 #   Core Components:
 #     - All hshm::* modular targets (hshm::cxx, hshm::configure, hshm::serialize, etc.)

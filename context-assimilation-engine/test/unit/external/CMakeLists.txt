@@ -14,7 +14,7 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 # Unified IOWarp Core package - includes everything
-find_package(IowarpCore CONFIG REQUIRED)
+find_package(iowarp-core CONFIG REQUIRED)
 # This automatically provides:
 #   Core Components:
 #     - All hshm::* modular targets (hshm::cxx, hshm::configure, hshm::serialize, etc.)

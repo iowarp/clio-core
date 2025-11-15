@@ -673,13 +673,13 @@ include(CMakePackageConfigHelpers)
 # Configure the package config file from template
 configure_package_config_file(
     "${CMAKE_SOURCE_DIR}/cmake/IowarpCoreConfig.cmake.in"
-    "${CMAKE_CURRENT_BINARY_DIR}/IowarpCoreConfig.cmake"
+    "${CMAKE_CURRENT_BINARY_DIR}/iowarp-coreConfig.cmake"
     INSTALL_DESTINATION lib/cmake/iowarp-core
 )
 
 # Generate the version file
 write_basic_package_version_file(
-    "${CMAKE_CURRENT_BINARY_DIR}/IowarpCoreConfigVersion.cmake"
+    "${CMAKE_CURRENT_BINARY_DIR}/iowarp-coreConfigVersion.cmake"
     VERSION ${PROJECT_VERSION}
     COMPATIBILITY SameMajorVersion
 )
@@ -687,8 +687,8 @@ write_basic_package_version_file(
 # Install the package config files
 install(
     FILES
-        "${CMAKE_CURRENT_BINARY_DIR}/IowarpCoreConfig.cmake"
-        "${CMAKE_CURRENT_BINARY_DIR}/IowarpCoreConfigVersion.cmake"
+        "${CMAKE_CURRENT_BINARY_DIR}/iowarp-coreConfig.cmake"
+        "${CMAKE_CURRENT_BINARY_DIR}/iowarp-coreConfigVersion.cmake"
         "${CMAKE_SOURCE_DIR}/cmake/IowarpCoreCommon.cmake"
     DESTINATION
         lib/cmake/iowarp-core
@@ -696,7 +696,7 @@ install(
 
 message(STATUS "")
 message(STATUS "IOWarp Core unified package configuration:")
-message(STATUS "  Package name: IowarpCore")
+message(STATUS "  Package name: iowarp-core")
 message(STATUS "  Install destination: lib/cmake/iowarp-core")
 message(STATUS "  Components included:")
 message(STATUS "    - HermesShm (context-transport-primitives)")

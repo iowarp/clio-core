@@ -4,7 +4,7 @@ project(hermes_shm_external_test)
 # External libraries
 # ------------------------------------------------------------------------------
 # Use unified IOWarp Core package which includes HermesShm
-find_package(IowarpCore CONFIG REQUIRED)
+find_package(iowarp-core CONFIG REQUIRED)
 message(STATUS "found IowarpCore at ${IowarpCore_DIR}")
 message(STATUS "  HermesShm (context-transport-primitives) included in IowarpCore")
 

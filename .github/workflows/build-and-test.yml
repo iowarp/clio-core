@@ -145,40 +145,43 @@ jobs:
         echo "=== Testing CTE external integration ==="
         cd context-transfer-engine/test/unit/external
         mkdir -p build && cd build
-        cmake -DCMAKE_PREFIX_PATH="${{ github.workspace }}/install;/usr/local/lib/cmake;/usr/local/cmake;/usr/local" ..
+        echo "CMAKE_PREFIX_PATH: ${{ github.workspace }}/install/lib/cmake;${{ github.workspace }}/install"
+        cmake -DCMAKE_PREFIX_PATH="${{ github.workspace }}/install/lib/cmake;${{ github.workspace }}/install;/usr/local/lib/cmake;/usr/local/cmake;/usr/local" \
+              --debug-find \
+              ..
         cmake --build .
-        echo "CTE external test built successfully"
-      continue-on-error: true
+        echo "✓ CTE external test built successfully"
+      continue-on-error: false
 
     - name: Test external project linking (Runtime)
       run: |
         echo "=== Testing Runtime external integration ==="
         cd context-runtime/test/unit/external
         mkdir -p build && cd build
-        cmake -DCMAKE_PREFIX_PATH="${{ github.workspace }}/install;/usr/local/lib/cmake;/usr/local/cmake;/usr/local" ..
+        cmake -DCMAKE_PREFIX_PATH="${{ github.workspace }}/install/lib/cmake;${{ github.workspace }}/install;/usr/local/lib/cmake;/usr/local/cmake;/usr/local" ..
         cmake --build .
-        echo "Runtime external test built successfully"
-      continue-on-error: true
+        echo "✓ Runtime external test built successfully"
+      continue-on-error: false
 
     - name: Test external project linking (Transport Primitives)
       run: |
         echo "=== Testing Transport Primitives external integration ==="
         cd context-transport-primitives/test/unit/external
         mkdir -p build && cd build
-        cmake -DCMAKE_PREFIX_PATH="${{ github.workspace }}/install;/usr/local/lib/cmake;/usr/local/cmake;/usr/local" ..
+        cmake -DCMAKE_PREFIX_PATH="${{ github.workspace }}/install/lib/cmake;${{ github.workspace }}/install;/usr/local/lib/cmake;/usr/local/cmake;/usr/local" ..
         cmake --build .
-        echo "Transport Primitives external test built successfully"
-      continue-on-error: true
+        echo "✓ Transport Primitives external test built successfully"
+      continue-on-error: false
 
     - name: Test external project linking (CAE)
       run: |
         echo "=== Testing CAE external integration ==="
         cd context-assimilation-engine/test/unit/external
         mkdir -p build && cd build
-        cmake -DCMAKE_PREFIX_PATH="${{ github.workspace }}/install;/usr/local/lib/cmake;/usr/local/cmake;/usr/local" ..
+        cmake -DCMAKE_PREFIX_PATH="${{ github.workspace }}/install/lib/cmake;${{ github.workspace }}/install;/usr/local/lib/cmake;/usr/local/cmake;/usr/local" ..
         cmake --build .
-        echo "CAE external test built successfully"
-      continue-on-error: true
+        echo "✓ CAE external test built successfully"
+      continue-on-error: false
 
     - name: Create package with CPack
       run: |

@@ -14,7 +14,7 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 # Unified IOWarp Core package - includes everything
-find_package(IowarpCore CONFIG REQUIRED)
+find_package(iowarp-core CONFIG REQUIRED)
 # This automatically provides:
 #   Core Components:
 #     - All hshm::* modular targets (hshm::cxx, hshm::configure, hshm::serialize, etc.)
@@ -69,14 +69,14 @@ add_custom_target(run_external_test
 message(STATUS "CTE External Integration Test Configuration:")
 message(STATUS "  CMAKE_BUILD_TYPE: ${CMAKE_BUILD_TYPE}")
 message(STATUS "  CMAKE_CXX_STANDARD: ${CMAKE_CXX_STANDARD}")
-message(STATUS "  IOWarp Core Found: ${IowarpCore_FOUND}")
+message(STATUS "  IOWarp Core Found: ${iowarp-core_FOUND}")
 
 # Instructions for external developers
 message(STATUS "")
 message(STATUS "External Developer Notes:")
 message(STATUS "  This test demonstrates proper external linking to IOWarp libraries.")
-message(STATUS "  Required package: IowarpCore (single unified package)")
-message(STATUS "  IowarpCore automatically provides:")
+message(STATUS "  Required package: iowarp-core (single unified package)")
+message(STATUS "  iowarp-core automatically provides:")
 message(STATUS "    - HermesShm: All hshm::* modular targets")
 message(STATUS "    - Chimaera: chimaera::cxx and build utilities")
 message(STATUS "    - Core ChiMods: admin, bdev (always available)")

@@ -347,7 +347,7 @@ int main() {
 **Build and Link:**
 ```cmake
 # Unified package includes everything - HermesShm, Chimaera, and all ChiMods
-find_package(IowarpCore REQUIRED)
+find_package(iowarp-core REQUIRED)
 
 target_link_libraries(my_app
   chimaera::admin_client  # Admin ChiMod (always available)
@@ -359,7 +359,7 @@ target_link_libraries(my_app
 )
 ```
 
-**What `find_package(IowarpCore)` provides:**
+**What `find_package(iowarp-core)` provides:**
 
 *Core Components:*
 - All `hshm::*` modular targets (cxx, configure, serialize, interceptor, lightbeam, thread_all, mpi, compress, encrypt)
