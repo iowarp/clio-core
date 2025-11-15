@@ -68,21 +68,21 @@ public:
     if (g_client_initialized) {
       return true; // Already initialized
     }
-    
+
     INFO("Initializing Chimaera client...");
-    bool success = chi::CHIMAERA_CLIENT_INIT();
-    
+    bool success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
+
     if (success) {
       g_client_initialized = true;
-      
+
       // Give client time to connect to runtime
       std::this_thread::sleep_for(200ms);
-      
+
       INFO("Client initialization successful");
     } else {
       INFO("Failed to initialize Chimaera client");
     }
-    
+
     return success;
   }
   
@@ -152,8 +152,8 @@ TEST_CASE("Basic Client Initialization", "[client][basic]") {
   
   SECTION("Client initialization without runtime") {
     // Attempting client init without runtime should work gracefully
-    bool client_result = chi::CHIMAERA_CLIENT_INIT();
-    
+    bool client_result = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
+
     // This may succeed or fail depending on implementation
     // The important thing is it doesn't crash
     INFO("Client init without runtime result: " << client_result);

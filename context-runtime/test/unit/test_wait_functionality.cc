@@ -99,21 +99,21 @@ namespace {
       if (g_client_initialized) {
         return true; // Already initialized
       }
-      
+
       INFO("Initializing Chimaera client...");
-      bool success = chi::CHIMAERA_CLIENT_INIT();
-      
+      bool success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
+
       if (success) {
         g_client_initialized = true;
-        
+
         // Give client time to connect to runtime
         std::this_thread::sleep_for(200ms);
-        
+
         INFO("Client initialization successful");
       } else {
         INFO("Failed to initialize Chimaera client");
       }
-      
+
       return success;
     }
     

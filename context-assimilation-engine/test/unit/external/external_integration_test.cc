@@ -46,7 +46,7 @@ public:
 
             // Step 2: Initialize Chimaera client
             std::cout << "2. Initializing Chimaera client..." << std::endl;
-            bool client_init = chi::CHIMAERA_CLIENT_INIT();
+            bool client_init = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
             if (!client_init) {
                 std::cerr << "Failed to initialize Chimaera client" << std::endl;
                 return false;

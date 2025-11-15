@@ -16,13 +16,12 @@ services:
         container_name: iowarp-runtime
 
         # Mount shared CTE configuration
-        volumes:
-            - ./wrp_conf.yaml:/etc/iowarp/wrp_conf.yaml:ro
+        # volumes:
+        #    - ./wrp_conf.yaml:/etc/iowarp/wrp_conf.yaml:ro
 
-        # Expose ZeroMQ port for client connections
-        ports:
-            - "9182:9182"
-            - "9183:9183"
+        # Note: ports section not needed with network_mode: host
+        # The container uses the host's network directly, so ports 5555 and 5556
+        # are automatically accessible from the host
 
         # Resource limits
         # Large shared memory for CTE operations
@@ -31,6 +30,9 @@ services:
 
         # Make IPC namespace accessible to host so external applications can connect
         ipc: host
+        
+        # Share network namespace with host - container uses host's network directly
+        network_mode: host
 
         # Keep container running as a daemon
         stdin_open: true

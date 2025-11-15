@@ -18,7 +18,7 @@ add_executable(cte_core_unit_tests
 )
 
 # Create single version of test_core_functionality that uses environment variable
-# CTE_INIT_RUNTIME to control whether runtime is initialized (default: yes)
+# CHIMAERA_WITH_RUNTIME to control whether runtime is initialized (default: yes)
 add_executable(test_core_functionality
     test_core_functionality.cc
 )
@@ -59,9 +59,9 @@ target_link_libraries(test_query
 )
 
 # Set compile definitions for runtime initialization control
-# Note: Runtime initialization is now controlled by CTE_INIT_RUNTIME environment variable
+# Note: Runtime initialization is now controlled by CHIMAERA_WITH_RUNTIME environment variable
 # at runtime, not at compile time
-target_compile_definitions(cte_core_unit_tests PRIVATE CTE_INIT_RUNTIME=1)
+target_compile_definitions(cte_core_unit_tests PRIVATE CHIMAERA_WITH_RUNTIME=1)
 
 # Set compilation standards and warnings
 target_compile_features(cte_core_unit_tests PRIVATE cxx_std_17)

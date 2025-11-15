@@ -114,7 +114,7 @@ public:
     }
 
     INFO("Initializing Chimaera client for CoMutex tests...");
-    bool success = chi::CHIMAERA_CLIENT_INIT();
+    bool success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
 
     if (success) {
       g_client_initialized = true;

@@ -57,11 +57,11 @@ namespace fs = std::filesystem;
 
 /**
  * Helper function to check if runtime should be initialized
- * Reads CTE_INIT_RUNTIME environment variable
+ * Reads CHIMAERA_WITH_RUNTIME environment variable
  * Returns true if unset or set to any value except "0", "false", "no", "off"
  */
 bool ShouldInitializeRuntime() {
-  const char* env_val = std::getenv("CTE_INIT_RUNTIME");
+  const char* env_val = std::getenv("CHIMAERA_WITH_RUNTIME");
   if (env_val == nullptr) {
     return true; // Default: initialize runtime
   }
@@ -128,11 +128,11 @@ public:
 
     // Initialize Chimaera runtime and client for functional testing
     if (ShouldInitializeRuntime()) {
-      INFO("Initializing runtime (CTE_INIT_RUNTIME not set or enabled)");
+      INFO("Initializing runtime (CHIMAERA_WITH_RUNTIME not set or enabled)");
       REQUIRE(initializeBoth());
     } else {
-      INFO("Runtime already initialized externally (CTE_INIT_RUNTIME="
-           << std::getenv("CTE_INIT_RUNTIME") << ")");
+      INFO("Runtime already initialized externally (CHIMAERA_WITH_RUNTIME="
+           << std::getenv("CHIMAERA_WITH_RUNTIME") << ")");
       REQUIRE(initializeClient());
     }
 
@@ -191,11 +191,11 @@ public:
 
   /**
    * Initialize Chimaera client following the module test guide pattern
-   * Note: The CHIMAERA_CLIENT_INIT macro has internal state tracking
+   * Note: The CHIMAERA_INIT macro has internal state tracking
    */
   bool initializeClient() {
     INFO("Initializing Chimaera client...");
-    bool success = chi::CHIMAERA_CLIENT_INIT();
+    bool success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
     if (success) {
       std::this_thread::sleep_for(200ms); // Allow connection
 

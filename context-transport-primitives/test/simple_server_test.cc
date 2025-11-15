@@ -4,18 +4,12 @@
 #include <thread>
 #include <chrono>
 #include <atomic>
-#include <signal.h>
 #include <cstring>
 #include <string>
 #include <cereal/types/string.hpp>
 
-// Global running flag for signal handling
+// Global running flag
 std::atomic<bool> running{true};
-
-void signal_handler(int signal) {
-    std::cout << "\nReceived signal " << signal << ", stopping server..." << std::endl;
-    running = false;
-}
 
 void print_usage(const char* program_name) {
     std::cout << "Usage: " << program_name << " <ip_address> <protocol>" << std::endl;
@@ -58,9 +52,7 @@ int main(int argc, char* argv[]) {
     // Create server using the selected backend
     if (protocol == "thallium") {
         hshm::lbm::thallium::Server server;
-        signal(SIGINT, signal_handler);
-        signal(SIGTERM, signal_handler);
-        
+
         try {
             std::cout << "Starting Thallium server..." << std::endl;
             server.StartServer(url);
@@ -89,8 +81,6 @@ int main(int argc, char* argv[]) {
         }
     } else {
         hshm::lbm::Server server;
-        signal(SIGINT, signal_handler);
-        signal(SIGTERM, signal_handler);
         std::cout << "Starting ZMQ server..." << std::endl;
         server.StartServer(url);
         

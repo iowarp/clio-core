@@ -82,6 +82,18 @@
                 }
             ],
             "preLaunchTask": "cmake-build-debug"
+        },
+        {
+            "name": "Python: CEE Demo",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/context-exploration-engine/api/demo/demo.py",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}/context-exploration-engine/api/demo",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/build/lib"
+            },
+            "justMyCode": false
         }
     ]
 }

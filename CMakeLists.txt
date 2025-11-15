@@ -28,7 +28,7 @@ option(WRP_CORE_ENABLE_CMAKE_DOTENV "Enable reading environment variables from .
 option(WRP_CORE_ENABLE_ASAN "Enable AddressSanitizer for debugging" OFF)
 option(WRP_CORE_ENABLE_COVERAGE "Enable code coverage instrumentation for all components" OFF)
 option(WRP_CORE_ENABLE_DOXYGEN "Check how well the code is documented" OFF)
-option(WRP_CORE_ENABLE_RPATH "Enable RPATH for installed libraries" OFF)
+option(WRP_CORE_ENABLE_RPATH "Enable RPATH for installed libraries" ON)
 option(WRP_CORE_ENABLE_CPACK "Enable CPack for package generation" OFF)
 option(BUILD_SHARED_LIBS "Build shared libraries (.dll/.so) instead of static ones (.lib/.a)" ON)
 

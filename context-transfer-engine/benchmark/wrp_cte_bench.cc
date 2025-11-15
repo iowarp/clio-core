@@ -129,11 +129,11 @@ double CalcBandwidth(chi::u64 total_bytes, double milliseconds) {
 
 /**
  * Helper function to check if runtime should be initialized
- * Reads CTE_INIT_RUNTIME environment variable
+ * Reads CHIMAERA_WITH_RUNTIME environment variable
  * Returns true if unset or set to any value except "0", "false", "no", "off"
  */
 bool ShouldInitializeRuntime() {
-  const char *env_val = std::getenv("CTE_INIT_RUNTIME");
+  const char *env_val = std::getenv("CHIMAERA_WITH_RUNTIME");
   if (env_val == nullptr) {
     return false; // Default for benchmark: assume runtime already initialized
   }
@@ -424,11 +424,11 @@ int main(int argc, char **argv) {
                 << std::endl;
       std::cerr << std::endl;
       std::cerr << "Environment variables:" << std::endl;
-      std::cerr << "  CTE_INIT_RUNTIME: Set to '1', 'true', 'yes', or 'on' to "
+      std::cerr << "  CHIMAERA_WITH_RUNTIME: Set to '1', 'true', 'yes', or 'on' to "
                    "initialize runtime"
                 << std::endl;
       std::cerr
-          << "                    Default: assumes runtime already initialized"
+          << "                         Default: assumes runtime already initialized"
           << std::endl;
     }
     MPI_Finalize();
@@ -440,8 +440,8 @@ int main(int argc, char **argv) {
 
   if (should_init_runtime) {
     if (rank == 0) {
-      std::cout << "Initializing Chimaera runtime (CTE_INIT_RUNTIME="
-                << std::getenv("CTE_INIT_RUNTIME") << ")..." << std::endl;
+      std::cout << "Initializing Chimaera runtime (CHIMAERA_WITH_RUNTIME="
+                << std::getenv("CHIMAERA_WITH_RUNTIME") << ")..." << std::endl;
     }
 
     // Initialize runtime
@@ -476,7 +476,7 @@ int main(int argc, char **argv) {
     }
 
     // Initialize client only
-    if (!chi::CHIMAERA_CLIENT_INIT()) {
+    if (!chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, false)) {
       if (rank == 0) {
         std::cerr << "Error: Failed to initialize Chimaera client" << std::endl;
       }

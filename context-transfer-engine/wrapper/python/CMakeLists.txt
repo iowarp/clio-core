@@ -85,7 +85,7 @@ if(BUILD_TESTING)
         PROPERTIES
         LABELS "python;bindings"
         TIMEOUT 120
-        ENVIRONMENT "CTE_INIT_RUNTIME=0"
+        ENVIRONMENT "CHIMAERA_WITH_RUNTIME=0"
     )
 
     # Ensure test depends on the built module

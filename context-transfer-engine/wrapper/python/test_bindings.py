@@ -21,7 +21,7 @@ Usage:
     python3 test_bindings.py
 
     # Run without runtime initialization
-    CTE_INIT_RUNTIME=0 python3 test_bindings.py
+    CHIMAERA_WITH_RUNTIME=0 python3 test_bindings.py
 
 Example Usage in Your Code:
 ---------------------------
@@ -48,7 +48,7 @@ Example Usage in Your Code:
 
 Environment Variables:
 ---------------------
-    CTE_INIT_RUNTIME: Set to "0" or "false" to skip runtime initialization
+    CHIMAERA_WITH_RUNTIME: Set to "0" or "false" to skip runtime initialization
     CHIMAERA_DISABLE_RUNTIME_INIT: Set to "1" to disable runtime initialization
     CHI_SERVER_CONF: Path to Chimaera server configuration file
     CHI_REPO_PATH: Path to ChiMod repository (for finding shared libraries)
@@ -73,15 +73,15 @@ _initialization_attempted = False
 
 def should_initialize_runtime():
     """Check if runtime should be initialized (following C++ test patterns)
-    
-    Reads CTE_INIT_RUNTIME environment variable (CTE-specific) or 
+
+    Reads CHIMAERA_WITH_RUNTIME environment variable (unified) or
     CHIMAERA_DISABLE_RUNTIME_INIT (runtime-specific, following test_bdev_chimod.cc pattern).
-    
+
     Following pattern from context-runtime/test/unit/test_bdev_chimod.cc:108-116:
     - Checks CHIMAERA_DISABLE_RUNTIME_INIT=1 to skip (for distributed tests)
     - Default: initialize runtime
-    
-    For CTE tests, also checks CTE_INIT_RUNTIME:
+
+    For CTE tests, also checks CHIMAERA_WITH_RUNTIME:
     - Not set or "1"/"true"/"yes"/"on": Initialize runtime (default: true)
     - "0"/"false"/"no"/"off": Skip initialization (runtime already initialized externally)
     """
@@ -89,9 +89,9 @@ def should_initialize_runtime():
     disable_runtime_init = os.getenv("CHIMAERA_DISABLE_RUNTIME_INIT")
     if disable_runtime_init is not None and str(disable_runtime_init) == "1":
         return False  # Skip runtime initialization
-    
-    # Then check CTE-specific flag (from CTE test pattern)
-    env_val = os.getenv("CTE_INIT_RUNTIME")
+
+    # Then check unified flag (from CTE test pattern)
+    env_val = os.getenv("CHIMAERA_WITH_RUNTIME")
     if env_val is None:
         return True  # Default: initialize runtime
     
@@ -695,7 +695,7 @@ def main():
             print("📋 Skipping Runtime Initialization (CHIMAERA_DISABLE_RUNTIME_INIT=1)")
             print("   Runtime should already be initialized externally (distributed mode)")
         else:
-            print("📋 Initializing Runtime (CTE_INIT_RUNTIME enabled)...")
+            print("📋 Initializing Runtime (CHIMAERA_WITH_RUNTIME enabled)...")
             print("   Note: Runtime initialization happens FIRST before any client code")
             
             # Import module first (needed for runtime init)
@@ -715,12 +715,12 @@ def main():
             runtime_ok = initialize_runtime_early(cte)
         print()
     else:
-        cte_flag = os.getenv("CTE_INIT_RUNTIME")
+        cte_flag = os.getenv("CHIMAERA_WITH_RUNTIME")
         disable_flag = os.getenv("CHIMAERA_DISABLE_RUNTIME_INIT")
         if disable_flag == "1":
             print("📋 Skipping Runtime Initialization (CHIMAERA_DISABLE_RUNTIME_INIT=1)")
         elif cte_flag:
-            print(f"📋 Skipping Runtime Initialization (CTE_INIT_RUNTIME={cte_flag})")
+            print(f"📋 Skipping Runtime Initialization (CHIMAERA_WITH_RUNTIME={cte_flag})")
         else:
             print("📋 Skipping Runtime Initialization")
         print("   Runtime should already be initialized externally")

@@ -8,7 +8,13 @@
 namespace iowarp {
 
 ContextInterface::ContextInterface() : is_initialized_(false) {
-  // Initialize CAE client (which initializes CTE and Chimaera internally)
+  // Initialize Chimaera as a client for the context interface
+  if (!chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, false)) {
+    std::cerr << "Error: Failed to initialize Chimaera client" << std::endl;
+    return;
+  }
+
+  // Initialize CAE client (which initializes CTE internally)
   if (!WRP_CAE_CLIENT_INIT()) {
     std::cerr << "Error: Failed to initialize CAE client" << std::endl;
     return;

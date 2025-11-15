@@ -29,8 +29,8 @@ int main() {
   try {
     // Step 1: Initialize Chimaera client
     std::cout << "\n1. Initializing Chimaera client..." << std::endl;
-    bool client_init_success = chi::CHIMAERA_CLIENT_INIT();
-    
+    bool client_init_success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
+
     if (!client_init_success) {
       std::cout << "NOTICE: Chimaera client initialization failed." << std::endl;
       std::cout << "This is expected when no runtime is active." << std::endl;

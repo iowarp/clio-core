@@ -13,7 +13,7 @@ int main() {
   
   try {
     // Initialize Chimaera client
-    if (!chi::CHIMAERA_CLIENT_INIT()) {
+    if (!chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true)) {
       std::cerr << "Failed to initialize Chimaera client" << std::endl;
       return 1;
     }

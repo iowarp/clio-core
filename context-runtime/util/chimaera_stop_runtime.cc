@@ -20,7 +20,7 @@ int main(int argc, char* argv[]) {
   try {
     // Initialize Chimaera client components
     HILOG(kDebug, "Initializing Chimaera client...");
-    if (!chi::CHIMAERA_CLIENT_INIT()) {
+    if (!chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, false)) {
       HELOG(kError, "Failed to initialize Chimaera client components");
       return 1;
     }

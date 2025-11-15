@@ -94,7 +94,7 @@ public:
     }
 
     INFO("Initializing Chimaera client...");
-    bool success = chi::CHIMAERA_CLIENT_INIT();
+    bool success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
 
     if (success) {
       g_client_initialized = true;
@@ -236,7 +236,7 @@ TEST_CASE("Chimaera Client Initialization", "[client][initialization]") {
   SECTION("Client initialization should fail without runtime") {
     // Attempting client init without runtime should work
     // (the framework should handle missing runtime gracefully)
-    bool client_result = chi::CHIMAERA_CLIENT_INIT();
+    bool client_result = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
 
     // This may succeed or fail depending on implementation
     // The important thing is it doesn't crash

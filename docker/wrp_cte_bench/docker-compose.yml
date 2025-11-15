@@ -17,11 +17,11 @@
 #   TEST_CASE         - Benchmark test: Put, Get, PutGet (default: Put)
 #   NUM_PROCS         - Number of parallel processes (default: 1)
 #   DEPTH             - Queue depth for concurrent operations (default: 4)
-#   IO_SIZE           - Size of each I/O operation (default: 1m)
-#                       Supports: b (bytes), k (KB), m (MB), g (GB)
-#   IO_COUNT          - Number of operations to perform (default: 100)
-#   CTE_INIT_RUNTIME  - Initialize CTE runtime in benchmark (default: 0, runtime handled by iowarp service)
-#   WRP_RUNTIME_CONF  - Path to CTE configuration file (default: /etc/iowarp/cte_config.yaml)
+#   IO_SIZE              - Size of each I/O operation (default: 1m)
+#                          Supports: b (bytes), k (KB), m (MB), g (GB)
+#   IO_COUNT             - Number of operations to perform (default: 100)
+#   CHIMAERA_WITH_RUNTIME - Initialize CTE runtime in benchmark (default: 0, runtime handled by iowarp service)
+#   WRP_RUNTIME_CONF     - Path to CTE configuration file (default: /etc/iowarp/cte_config.yaml)
 
 services:
   # IOWarp Runtime Service
@@ -68,7 +68,7 @@ services:
     environment:
       # CTE Runtime Configuration
       # Do NOT initialize runtime in benchmark (runtime service handles this)
-      - CTE_INIT_RUNTIME=${CTE_INIT_RUNTIME:-0}
+      - CHIMAERA_WITH_RUNTIME=${CHIMAERA_WITH_RUNTIME:-0}
 
       # Benchmark Test Parameters
       # Test case selection: Put (write), Get (read), PutGet (mixed)
@@ -114,7 +114,7 @@ services:
   #   volumes:
   #     - ./cte_config.yaml:/etc/iowarp/cte_config.yaml:ro
   #   environment:
-  #     - CTE_INIT_RUNTIME=0
+  #     - CHIMAERA_WITH_RUNTIME=0
   #     - WRP_RUNTIME_CONF=/etc/iowarp/cte_config.yaml
   #     - TEST_CASE=Put
   #     - NUM_PROCS=4
@@ -137,7 +137,7 @@ services:
   #   volumes:
   #     - ./cte_config.yaml:/etc/iowarp/cte_config.yaml:ro
   #   environment:
-  #     - CTE_INIT_RUNTIME=0
+  #     - CHIMAERA_WITH_RUNTIME=0
   #     - WRP_RUNTIME_CONF=/etc/iowarp/cte_config.yaml
   #     - TEST_CASE=Get
   #     - NUM_PROCS=4
@@ -160,7 +160,7 @@ services:
   #   volumes:
   #     - ./cte_config.yaml:/etc/iowarp/cte_config.yaml:ro
   #   environment:
-  #     - CTE_INIT_RUNTIME=0
+  #     - CHIMAERA_WITH_RUNTIME=0
   #     - WRP_RUNTIME_CONF=/etc/iowarp/cte_config.yaml
   #     - TEST_CASE=PutGet
   #     - NUM_PROCS=4
@@ -183,7 +183,7 @@ services:
   #   volumes:
   #     - ./cte_config.yaml:/etc/iowarp/cte_config.yaml:ro
   #   environment:
-  #     - CTE_INIT_RUNTIME=0
+  #     - CHIMAERA_WITH_RUNTIME=0
   #     - WRP_RUNTIME_CONF=/etc/iowarp/cte_config.yaml
   #     - TEST_CASE=Put
   #     - NUM_PROCS=1
@@ -206,7 +206,7 @@ services:
   #   volumes:
   #     - ./cte_config.yaml:/etc/iowarp/cte_config.yaml:ro
   #   environment:
-  #     - CTE_INIT_RUNTIME=0
+  #     - CHIMAERA_WITH_RUNTIME=0
   #     - WRP_RUNTIME_CONF=/etc/iowarp/cte_config.yaml
   #     - TEST_CASE=Put
   #     - NUM_PROCS=16

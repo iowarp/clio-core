@@ -157,16 +157,16 @@ public:
    */
   bool initializeClient() {
     if (g_client_initialized) return true;
-    
+
     INFO("Initializing Chimaera client...");
-    bool success = chi::CHIMAERA_CLIENT_INIT();
+    bool success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
     if (success) {
       g_client_initialized = true;
       std::this_thread::sleep_for(200ms); // Allow connection
-      
+
       REQUIRE(CHI_IPC != nullptr);
       REQUIRE(CHI_IPC->IsInitialized());
-      
+
       INFO("Chimaera client initialized successfully");
     } else {
       FAIL("Failed to initialize Chimaera client");
