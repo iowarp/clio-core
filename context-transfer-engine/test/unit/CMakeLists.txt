@@ -36,7 +36,6 @@ target_link_libraries(cte_core_unit_tests
     chimaera::admin_client       # Modern Chimaera admin target (if needed)
     chimaera::bdev_client        # Bdev client for BdevType enum
     Catch2::Catch2WithMain       # Catch2 testing framework with main
-    MPI::MPI_CXX                 # MPI support if needed
 )
 
 # Link test_core_functionality
@@ -47,7 +46,6 @@ target_link_libraries(test_core_functionality
     chimaera::admin_client       # Modern Chimaera admin target (if needed)
     chimaera::bdev_client        # Bdev client for BdevType enum
     Catch2::Catch2WithMain       # Catch2 testing framework with main
-    MPI::MPI_CXX                 # MPI support if needed
 )
 
 # Link test_query
@@ -58,7 +56,6 @@ target_link_libraries(test_query
     chimaera::admin_client       # Modern Chimaera admin target (if needed)
     chimaera::bdev_client        # Bdev client for BdevType enum
     Catch2::Catch2WithMain       # Catch2 testing framework with main
-    MPI::MPI_CXX                 # MPI support if needed
 )
 
 # Set compile definitions for runtime initialization control

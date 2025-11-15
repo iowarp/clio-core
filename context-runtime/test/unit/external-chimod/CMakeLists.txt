@@ -5,12 +5,6 @@ project(external_chimod_test)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Load environment variables from .env.cmake if it exists
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.env.cmake")
-  message(STATUS "Loading environment from ${CMAKE_CURRENT_SOURCE_DIR}/.env.cmake")
-  include("${CMAKE_CURRENT_SOURCE_DIR}/.env.cmake")
-endif()
-
 # Find required Chimaera packages
 find_package(chimaera REQUIRED)
 find_package(chimaera_admin REQUIRED)

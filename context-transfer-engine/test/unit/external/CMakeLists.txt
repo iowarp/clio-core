@@ -13,13 +13,8 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Debug)
 endif()
 
-# Add .env.cmake if it exists (for development environment)
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../../../.env.cmake")
-    include("${CMAKE_CURRENT_SOURCE_DIR}/../../../.env.cmake")
-endif()
-
 # Unified IOWarp Core package - includes everything
-find_package(IowarpCore REQUIRED)
+find_package(IowarpCore CONFIG REQUIRED)
 # This automatically provides:
 #   Core Components:
 #     - All hshm::* modular targets (hshm::cxx, hshm::configure, hshm::serialize, etc.)

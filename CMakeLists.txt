@@ -79,6 +79,7 @@ option(WRP_CTE_ENABLE_BENCHMARKS "Enable benchmarks for CTE" ON)
 option(WRP_CTE_ENABLE_PYTHON "Enable Python bindings for CTE (requires WRP_CORE_ENABLE_PYTHON=ON)" ON)
 
 # CTE Adapter Options (require WRP_CORE_ENABLE_ELF=ON)
+option(WRP_CTE_ENABLE_POSIX_ADAPTER "Enable POSIX adapter" ON)
 option(WRP_CTE_ENABLE_STDIO_ADAPTER "Enable STDIO adapter" OFF)
 option(WRP_CTE_ENABLE_MPIIO_ADAPTER "Enable MPI-IO adapter" OFF)
 option(WRP_CTE_ENABLE_VFD "Enable HDF5 VFD adapter" OFF)

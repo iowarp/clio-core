@@ -31,9 +31,11 @@ if(WRP_CORE_ENABLE_ELF)
 
     # Core adapters that are built when ELF is enabled
     add_subdirectory(filesystem)
-    add_subdirectory(posix)
 
     # Optional adapters - controlled by root CMakeLists.txt options
+    if (WRP_CTE_ENABLE_POSIX_ADAPTER)
+        add_subdirectory(posix)
+    endif()
     if (WRP_CTE_ENABLE_STDIO_ADAPTER)
         add_subdirectory(stdio)
     endif()
