@@ -66,7 +66,7 @@ if [ "$NEED_BOOST" = "1" ] || [ "$NEED_BOOST" = "TRUE" ]; then
     echo ">>> Downloading and building Boost..."
 
     BOOST_VERSION="1.89.0"
-    BOOST_ARCHIVE="boost-${BOOST_VERSION}-b2-nodocs.tar.gz"
+    BOOST_ARCHIVE="boost-${BOOST_VERSION}-cmake.tar.gz"
     BOOST_URL="https://github.com/boostorg/boost/releases/download/boost-${BOOST_VERSION}/${BOOST_ARCHIVE}"
     BOOST_DIR="boost-${BOOST_VERSION}"
 
