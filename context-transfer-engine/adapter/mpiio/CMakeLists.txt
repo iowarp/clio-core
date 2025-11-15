@@ -28,9 +28,9 @@ target_link_libraries(wrp_cte_mpiio
 install(
         TARGETS
         wrp_cte_mpiio
-        LIBRARY DESTINATION ${HERMES_INSTALL_LIB_DIR}
-        ARCHIVE DESTINATION ${HERMES_INSTALL_LIB_DIR}
-        RUNTIME DESTINATION ${HERMES_INSTALL_BIN_DIR}
+        LIBRARY DESTINATION lib
+        ARCHIVE DESTINATION lib
+        RUNTIME DESTINATION bin
 )
 
 # -----------------------------------------------------------------------------

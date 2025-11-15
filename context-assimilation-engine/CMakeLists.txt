@@ -44,23 +44,8 @@ endif()
 # ------------------------------------------------------------------------------
 # Setup install and output Directories
 # ------------------------------------------------------------------------------
-include(GNUInstallDirs)
-
-if(NOT CAE_INSTALL_BIN_DIR)
-    set(CAE_INSTALL_BIN_DIR ${CMAKE_INSTALL_BINDIR})
-endif()
-
-if(NOT CAE_INSTALL_LIB_DIR)
-    set(CAE_INSTALL_LIB_DIR ${CMAKE_INSTALL_LIBDIR})
-endif()
-
-if(NOT CAE_INSTALL_INCLUDE_DIR)
-    set(CAE_INSTALL_INCLUDE_DIR ${CMAKE_INSTALL_INCLUDEDIR})
-endif()
-
-if(NOT CAE_INSTALL_DATA_DIR)
-    set(CAE_INSTALL_DATA_DIR ${CMAKE_INSTALL_DATADIR})
-endif()
+# Installation directories use relative paths for proper --prefix override support
+# Removed CAE_INSTALL_*_DIR macros - use lib, include, bin, share directly
 
 # -----------------------------------------------------------------------------
 # Find Packages

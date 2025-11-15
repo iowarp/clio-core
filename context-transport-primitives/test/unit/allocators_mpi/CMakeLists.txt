@@ -36,9 +36,9 @@ endforeach()
 if (HSHM_ENABLE_MPI)
     install(TARGETS
             test_allocator_mpi_exec
-            LIBRARY DESTINATION ${HSHM_INSTALL_LIB_DIR}
-            ARCHIVE DESTINATION ${HSHM_INSTALL_LIB_DIR}
-            RUNTIME DESTINATION ${HSHM_INSTALL_BIN_DIR})
+            LIBRARY DESTINATION lib
+            ARCHIVE DESTINATION lib
+            RUNTIME DESTINATION bin)
 endif()
 
 #-----------------------------------------------------------------------------

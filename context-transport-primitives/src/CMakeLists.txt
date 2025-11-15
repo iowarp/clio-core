@@ -23,7 +23,7 @@ target_link_libraries(cxx INTERFACE hermes_shm_host)
 target_include_directories(cxx INTERFACE
     $<BUILD_INTERFACE:${HSHM_ROOT}/include>
     $<BUILD_INTERFACE:${PROJECT_BINARY_DIR}/include>
-    $<INSTALL_INTERFACE:${HSHM_INSTALL_INCLUDE_DIR}>
+    $<INSTALL_INTERFACE:include>
 )
 hshm_target_compile_definitions(cxx)
 
@@ -46,7 +46,7 @@ if(HSHM_ENABLE_CUDA)
     target_include_directories(cudacxx INTERFACE
         $<BUILD_INTERFACE:${HSHM_ROOT}/include>
         $<BUILD_INTERFACE:${PROJECT_BINARY_DIR}/include>
-        $<INSTALL_INTERFACE:${HSHM_INSTALL_INCLUDE_DIR}>
+        $<INSTALL_INTERFACE:include>
     )
     hshm_target_compile_definitions(cudacxx)
     list(APPEND HSHM_LIBS cudacxx)
@@ -64,7 +64,7 @@ if(HSHM_ENABLE_ROCM)
     target_include_directories(rocmcxx_gpu INTERFACE
         $<BUILD_INTERFACE:${HSHM_ROOT}/include>
         $<BUILD_INTERFACE:${PROJECT_BINARY_DIR}/include>
-        $<INSTALL_INTERFACE:${HSHM_INSTALL_INCLUDE_DIR}>
+        $<INSTALL_INTERFACE:include>
     )
     hshm_target_compile_definitions(rocmcxx_gpu)
     list(APPEND HSHM_LIBS rocmcxx_gpu)
@@ -78,7 +78,7 @@ if(HSHM_ENABLE_ROCM)
     target_include_directories(rocmcxx_host INTERFACE
         $<BUILD_INTERFACE:${HSHM_ROOT}/include>
         $<BUILD_INTERFACE:${PROJECT_BINARY_DIR}/include>
-        $<INSTALL_INTERFACE:${HSHM_INSTALL_INCLUDE_DIR}>
+        $<INSTALL_INTERFACE:include>
     )
     hshm_target_compile_definitions(rocmcxx_host)
     list(APPEND HSHM_LIBS rocmcxx_host)
@@ -113,9 +113,9 @@ install(TARGETS
     ${_CEREAL_TARGET}
     EXPORT
     ${HSHM_EXPORTED_TARGETS}
-    LIBRARY DESTINATION ${HSHM_INSTALL_LIB_DIR}
-    ARCHIVE DESTINATION ${HSHM_INSTALL_LIB_DIR}
-    RUNTIME DESTINATION ${HSHM_INSTALL_BIN_DIR})
+    LIBRARY DESTINATION lib
+    ARCHIVE DESTINATION lib
+    RUNTIME DESTINATION bin)
 
 # -----------------------------------------------------------------------------
 # Coverage

@@ -26,9 +26,9 @@ add_test(NAME test_cereal COMMAND ${CMAKE_BINARY_DIR}/bin/test_cereal_exec)
 #------------------------------------------------------------------------------
 install(TARGETS
         test_cereal_exec
-        LIBRARY DESTINATION ${HSHM_INSTALL_LIB_DIR}
-        ARCHIVE DESTINATION ${HSHM_INSTALL_LIB_DIR}
-        RUNTIME DESTINATION ${HSHM_INSTALL_BIN_DIR})
+        LIBRARY DESTINATION lib
+        ARCHIVE DESTINATION lib
+        RUNTIME DESTINATION bin)
 
 #-----------------------------------------------------------------------------
 # Coverage

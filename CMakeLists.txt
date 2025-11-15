@@ -29,6 +29,7 @@ option(WRP_CORE_ENABLE_ASAN "Enable AddressSanitizer for debugging" OFF)
 option(WRP_CORE_ENABLE_COVERAGE "Enable code coverage instrumentation for all components" OFF)
 option(WRP_CORE_ENABLE_DOXYGEN "Check how well the code is documented" OFF)
 option(WRP_CORE_ENABLE_RPATH "Enable RPATH for installed libraries" OFF)
+option(WRP_CORE_ENABLE_CPACK "Enable CPack for package generation" OFF)
 option(BUILD_SHARED_LIBS "Build shared libraries (.dll/.so) instead of static ones (.lib/.a)" ON)
 
 #------------------------------------------------------------------------------
@@ -749,4 +750,39 @@ if(DEFINED SKBUILD)
     # We just need to ensure they go to the right location for Python import
 
     message(STATUS "Python package files will be installed to: ${CMAKE_INSTALL_PREFIX}/iowarp")
+endif()
+
+#------------------------------------------------------------------------------
+# CPack Configuration
+#------------------------------------------------------------------------------
+if(WRP_CORE_ENABLE_CPACK)
+    set(CPACK_PACKAGE_NAME "iowarp-core")
+    set(CPACK_PACKAGE_VENDOR "IOWarp Team")
+    set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "IOWarp Core: High-performance distributed I/O and task execution runtime")
+    set(CPACK_PACKAGE_VERSION_MAJOR ${PROJECT_VERSION_MAJOR})
+    set(CPACK_PACKAGE_VERSION_MINOR ${PROJECT_VERSION_MINOR})
+    set(CPACK_PACKAGE_VERSION_PATCH ${PROJECT_VERSION_PATCH})
+    set(CPACK_PACKAGE_VERSION ${PROJECT_VERSION})
+    set(CPACK_PACKAGE_CONTACT "grc@illinoistech.edu")
+    set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE")
+    set(CPACK_RESOURCE_FILE_README "${CMAKE_CURRENT_SOURCE_DIR}/README.md")
+
+    # Package generators
+    set(CPACK_GENERATOR "TGZ;DEB")
+
+    # DEB-specific settings
+    set(CPACK_DEBIAN_PACKAGE_MAINTAINER "IOWarp Team <grc@illinoistech.edu>")
+    set(CPACK_DEBIAN_PACKAGE_SECTION "devel")
+    set(CPACK_DEBIAN_PACKAGE_PRIORITY "optional")
+    set(CPACK_DEBIAN_PACKAGE_DEPENDS "libboost-fiber-dev, libboost-context-dev, libboost-filesystem-dev, libzmq3-dev, libyaml-cpp-dev")
+
+    # Component installation
+    set(CPACK_COMPONENTS_ALL libraries headers cmake)
+    set(CPACK_COMPONENT_LIBRARIES_DISPLAY_NAME "Runtime Libraries")
+    set(CPACK_COMPONENT_HEADERS_DISPLAY_NAME "C++ Headers")
+    set(CPACK_COMPONENT_CMAKE_DISPLAY_NAME "CMake Configuration Files")
+
+    include(CPack)
+
+    message(STATUS "CPack enabled - package generation available")
 endif()

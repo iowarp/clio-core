@@ -269,9 +269,9 @@ endif()
 # Install Targets
 # ------------------------------------------------------------------------------
 install(TARGETS cte_core_unit_tests test_core_functionality test_query
-    LIBRARY DESTINATION ${HERMES_INSTALL_LIB_DIR}
-    ARCHIVE DESTINATION ${HERMES_INSTALL_LIB_DIR}
-    RUNTIME DESTINATION ${HERMES_INSTALL_BIN_DIR}
+    LIBRARY DESTINATION lib
+    ARCHIVE DESTINATION lib
+    RUNTIME DESTINATION bin
 )
 
 # ------------------------------------------------------------------------------

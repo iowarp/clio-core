@@ -51,21 +51,8 @@ set(HSHM_EXPORTED_TARGETS "HermesShm")
 # ------------------------------------------------------------------------------
 # Setup install and output Directories
 # ------------------------------------------------------------------------------
-if(NOT HSHM_INSTALL_BIN_DIR)
-    set(HSHM_INSTALL_BIN_DIR ${CMAKE_INSTALL_PREFIX}/bin)
-endif()
-
-if(NOT HSHM_INSTALL_LIB_DIR)
-    set(HSHM_INSTALL_LIB_DIR ${CMAKE_INSTALL_PREFIX}/lib)
-endif()
-
-if(NOT HSHM_INSTALL_INCLUDE_DIR)
-    set(HSHM_INSTALL_INCLUDE_DIR ${CMAKE_INSTALL_PREFIX}/include)
-endif()
-
-if(NOT HSHM_INSTALL_DATA_DIR)
-    set(HSHM_INSTALL_DATA_DIR ${CMAKE_INSTALL_PREFIX}/share)
-endif()
+# Installation directories use relative paths for proper --prefix override support
+# Removed HSHM_INSTALL_*_DIR macros - use lib, include, bin, share directly
 
 # ------------------------------------------------------------------------------
 # CMake Modules

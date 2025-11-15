@@ -20,6 +20,6 @@ install(TARGETS
     test_interceptor_stat
     test_interceptor_lib_stat
     test_interceptor_my_lib_stat
-    LIBRARY DESTINATION ${HSHM_INSTALL_LIB_DIR}
-    ARCHIVE DESTINATION ${HSHM_INSTALL_LIB_DIR}
-    RUNTIME DESTINATION ${HSHM_INSTALL_BIN_DIR})
+    LIBRARY DESTINATION lib
+    ARCHIVE DESTINATION lib
+    RUNTIME DESTINATION bin)
