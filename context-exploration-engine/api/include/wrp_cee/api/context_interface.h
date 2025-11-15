@@ -55,16 +55,26 @@ public:
   /**
    * Retrieve the identities and data of objects matching patterns
    *
-   * NOTE: This functionality is not yet implemented and will be added in a future version.
+   * This method queries for blobs matching the specified patterns and retrieves their
+   * data into a packed binary buffer. Blobs are retrieved in batches for efficiency.
+   *
+   * The retrieved data is packed sequentially into a buffer and returned as a single
+   * packed string. Buffer is automatically allocated and freed.
    *
    * @param tag_re Tag regex pattern to match
    * @param blob_re Blob regex pattern to match
-   * @param max_results Maximum number of results to return (0 = unlimited)
-   * @return Vector of object identities (currently returns empty vector)
+   * @param max_results Maximum number of blobs to retrieve (0 = unlimited, default: 1024)
+   * @param max_context_size Maximum total context size in bytes (default: 256MB)
+   * @param max_blob_size Maximum size per blob in bytes (default: 1MB, larger blobs skipped)
+   * @param batch_size Number of concurrent AsyncGetBlob operations (default: 32)
+   * @return Vector containing one string with packed binary context data (empty if no data)
    */
   std::vector<std::string> ContextRetrieve(const std::string &tag_re,
                                             const std::string &blob_re,
-                                            unsigned int max_results = 0);
+                                            unsigned int max_results = 1024,
+                                            size_t max_context_size = 256 * 1024 * 1024,
+                                            size_t max_blob_size = 1 * 1024 * 1024,
+                                            unsigned int batch_size = 32);
 
   /**
    * Split/splice objects into a new context
