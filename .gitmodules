@@ -13,9 +13,6 @@
 [submodule "external/libzmq"]
 	path = external/libzmq
 	url = https://github.com/zeromq/libzmq.git
-[submodule "external/boost"]
-	path = external/boost
-	url = https://github.com/boostorg/boost.git
 [submodule "external/hdf5"]
 	path = external/hdf5
 	url = https://github.com/HDFGroup/hdf5.git
