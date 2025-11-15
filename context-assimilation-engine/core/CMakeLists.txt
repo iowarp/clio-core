@@ -65,6 +65,8 @@ endif()
 add_chimod_client(
   SOURCES
     src/core_client.cc
+  LINK_LIBRARIES
+    wrp_cte_core_client
 )
 
 #------------------------------------------------------------------------------

@@ -165,17 +165,17 @@ struct AssimilationCtx {
 
 Python bindings are available when nanobind is installed and enabled during build.
 
-**Module**: `iowarp_cee_api`
+**Module**: `wrp_cee`
 
 **Example**:
 ```python
-import iowarp_cee_api
+import wrp_cee
 
 # Create interface
-ctx = iowarp_cee_api.ContextInterface()
+ctx = wrp_cee.ContextInterface()
 
 # Create an assimilation context
-assim_ctx = iowarp_cee_api.AssimilationCtx(
+assim_ctx = wrp_cee.AssimilationCtx(
     src="file::/data/input.bin",
     dst="iowarp::my_dataset",
     format="binary"
@@ -213,7 +213,7 @@ Python bindings require nanobind to be installed:
 ```bash
 pip install nanobind
 cmake --preset=debug
-cmake --build build --target iowarp_cee_api
+cmake --build build --target wrp_cee
 ```
 
 If nanobind is not found, the build will skip Python bindings with a warning.

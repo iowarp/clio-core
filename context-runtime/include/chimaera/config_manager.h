@@ -216,7 +216,7 @@ class ConfigManager : public hshm::BaseConfig {
   size_t client_data_segment_size_ = hshm::Unit<size_t>::Megabytes(256);
   size_t runtime_data_segment_size_ = hshm::Unit<size_t>::Megabytes(256);
 
-  u32 port_ = 9128;
+  u32 port_ = 5555;
   u32 neighborhood_size_ = 32;
 
   // Shared memory segment names with environment variable support

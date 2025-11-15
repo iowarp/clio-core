@@ -10,6 +10,7 @@ cmake-build-*/
 # Build directories already ignored above, but add specific patterns for safety
 compile_commands.json
 _deps/
+venv
 
 # Compiled Object files
 *.o

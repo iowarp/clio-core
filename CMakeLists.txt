@@ -79,7 +79,7 @@ option(CHIMAERA_ENABLE_BENCHMARKS "Enable benchmarks for Chimaera runtime" ON)
 option(WRP_CTE_ENABLE_TESTS "Enable tests for CTE" ON)
 option(WRP_CTE_ENABLE_BENCHMARKS "Enable benchmarks for CTE" ON)
 option(WRP_CTE_ENABLE_PYTHON "Enable Python bindings for CTE (requires WRP_CORE_ENABLE_PYTHON=ON)" ON)
-option(WRP_CORE_INSTALL_WRAPPER_TO_VENV "Install Python wrappers to Python site-packages instead of lib/" OFF)
+option(WRP_CORE_INSTALL_WRAPPER_TO_VENV "Install Python wrappers to Python site-packages instead of lib/" ON)
 
 # CTE Adapter Options (require WRP_CORE_ENABLE_ELF=ON)
 option(WRP_CTE_ENABLE_POSIX_ADAPTER "Enable POSIX adapter" ON)

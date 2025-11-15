@@ -15,7 +15,7 @@ memory:
 
 # Network configuration
 networking:
-  port: 9128
+  port: 5555
   neighborhood_size: 1
   hostfile: /tmp/cee_hostfile
 

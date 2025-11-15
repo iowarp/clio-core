@@ -49,8 +49,21 @@ exec "$@"' > /usr/local/bin/docker-entrypoint.sh \
 RUN echo "iowarp ALL=(ALL) NOPASSWD: /bin/chmod 666 /var/run/docker.sock" >> /etc/sudoers.d/docker-socket \
     && chmod 0440 /etc/sudoers.d/docker-socket
 
+# Switch to iowarp user for venv creation
 USER iowarp
 WORKDIR /workspace
+
+# Create Python virtual environment in user's home directory
+RUN python3 -m venv /home/iowarp/venv \
+    && /home/iowarp/venv/bin/pip install --upgrade pip setuptools wheel \
+    && /home/iowarp/venv/bin/pip install pyyaml nanobind
+
+# Add venv activation to bashrc
+RUN echo '' >> /home/iowarp/.bashrc \
+    && echo '# Activate Python virtual environment' >> /home/iowarp/.bashrc \
+    && echo 'if [ -f /home/iowarp/venv/bin/activate ]; then' >> /home/iowarp/.bashrc \
+    && echo '    source /home/iowarp/venv/bin/activate' >> /home/iowarp/.bashrc \
+    && echo 'fi' >> /home/iowarp/.bashrc
 
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["/bin/bash"]

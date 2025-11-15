@@ -1,0 +1,40 @@
+# IOWarp Runtime Docker Compose Configuration
+#
+# This compose file runs the IOWarp runtime service for user applications.
+# The iowarp service provides the CTE runtime that applications can connect to.
+#
+# Usage:
+#   docker-compose up                       # Run runtime service
+#   docker-compose up -d                    # Start runtime in background
+#   docker-compose down                     # Stop service
+
+services:
+    # IOWarp Runtime Service
+    # Provides the CTE runtime daemon that applications connect to
+    iowarp-runtime:
+        image: iowarp/iowarp:latest
+        container_name: iowarp-runtime
+
+        # Mount shared CTE configuration
+        volumes:
+            - ./wrp_conf.yaml:/etc/iowarp/wrp_conf.yaml:ro
+
+        # Expose ZeroMQ port for client connections
+        ports:
+            - "9182:9182"
+            - "9183:9183"
+
+        # Resource limits
+        # Large shared memory for CTE operations
+        shm_size: 8g
+        mem_limit: 8g
+
+        # Make IPC namespace accessible to host so external applications can connect
+        ipc: host
+
+        # Keep container running as a daemon
+        stdin_open: true
+        tty: true
+
+        # Restart policy - no restart for manual runs
+        restart: "no"
