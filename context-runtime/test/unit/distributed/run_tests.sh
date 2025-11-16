@@ -81,7 +81,7 @@ run_test_docker_direct() {
 
     # Execute test on node1 using installed binary
     docker exec iowarp-distributed-node1 bash -c "
-        export CHIMAERA_DISABLE_RUNTIME_INIT=1
+        export CHIMAERA_WITH_RUNTIME=0
         chimaera_bdev_chimod_tests $TEST_FILTER
     "
 

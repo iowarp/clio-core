@@ -41,7 +41,7 @@
  #include <chrono>
  #include <limits.h>
 
- #include "simple_test.h"
+ #include "../../../context-runtime/test/simple_test.h"
 
  using namespace std::chrono_literals;
 
@@ -91,9 +91,6 @@
    std::vector<std::string> test_tags_;
    std::vector<std::pair<std::string, std::string>> test_blobs_; // (tag_name, blob_name)
 
-   // Flag to track if setup has been completed (singleton initialization)
-   bool setup_completed_ = false;
-
    CTEQueryTestFixture() {
      // Initialize test storage path in home directory
      std::string home_dir = hshm::SystemInfo::Getenv("HOME");
@@ -126,11 +123,8 @@
        g_initialized = true;
      }
 
-     // Create test data only once (singleton pattern)
-     if (!setup_completed_) {
-       setupTestData();
-       setup_completed_ = true;
-     }
+     // Create test data
+     setupTestData();
    }
 
    ~CTEQueryTestFixture() {
@@ -212,8 +206,7 @@
   * Test TagQuery with exact match pattern
   */
  TEST_CASE("TagQuery - Exact Match", "[query][tagquery][exact]") {
-   auto *fixture = hshm::Singleton<CTEQueryTestFixture>::GetInstance();
-  (void)fixture; // Suppress unused variable warning
+   CTEQueryTestFixture fixture;
 
    auto *cte_client = WRP_CTE_CLIENT;
    auto results = cte_client->TagQuery(HSHM_MCTX, "user_data", 0, chi::PoolQuery::Broadcast());
@@ -235,8 +228,7 @@
   * Test TagQuery with wildcard pattern
   */
  TEST_CASE("TagQuery - Wildcard Pattern", "[query][tagquery][wildcard]") {
-   auto *fixture = hshm::Singleton<CTEQueryTestFixture>::GetInstance();
-  (void)fixture; // Suppress unused variable warning
+   CTEQueryTestFixture fixture;
    INFO("Testing TagQuery with wildcard pattern");
 
    // Query for all tags starting with "user_"
@@ -266,8 +258,7 @@
   * Test TagQuery with alternation pattern
   */
  TEST_CASE("TagQuery - Alternation Pattern", "[query][tagquery][alternation]") {
-   auto *fixture = hshm::Singleton<CTEQueryTestFixture>::GetInstance();
-  (void)fixture; // Suppress unused variable warning
+   CTEQueryTestFixture fixture;
    INFO("Testing TagQuery with alternation pattern");
 
    // Query for tags matching either "system_config" or "system_cache"
@@ -297,8 +288,7 @@
   * Test TagQuery with match-all pattern
   */
  TEST_CASE("TagQuery - Match All Pattern", "[query][tagquery][matchall]") {
-   auto *fixture = hshm::Singleton<CTEQueryTestFixture>::GetInstance();
-  (void)fixture; // Suppress unused variable warning
+   CTEQueryTestFixture fixture;
    INFO("Testing TagQuery with match-all pattern");
 
    // Query for all tags
@@ -306,10 +296,10 @@
    auto results = cte_client->TagQuery(HSHM_MCTX, ".*", 0, chi::PoolQuery::Broadcast());
 
    INFO("Query returned " << results.size() << " tags");
-   REQUIRE(results.size() >= fixture->test_tags_.size());
+   REQUIRE(results.size() >= fixture.test_tags_.size());
 
    // Verify all test tags are present
-   for (const auto& expected_tag : fixture->test_tags_) {
+   for (const auto& expected_tag : fixture.test_tags_) {
      bool found = false;
      for (const auto &tag_name : results) {
        if (tag_name == expected_tag) {
@@ -328,8 +318,7 @@
   * Test TagQuery with no matches
   */
  TEST_CASE("TagQuery - No Matches", "[query][tagquery][nomatch]") {
-   auto *fixture = hshm::Singleton<CTEQueryTestFixture>::GetInstance();
-  (void)fixture; // Suppress unused variable warning
+   CTEQueryTestFixture fixture;
    INFO("Testing TagQuery with pattern that matches nothing");
 
    // Query for non-existent tag pattern
@@ -344,8 +333,7 @@
   * Test BlobQuery with exact tag and blob match
   */
  TEST_CASE("BlobQuery - Exact Match", "[query][blobquery][exact]") {
-   auto *fixture = hshm::Singleton<CTEQueryTestFixture>::GetInstance();
-  (void)fixture; // Suppress unused variable warning
+   CTEQueryTestFixture fixture;
    INFO("Testing BlobQuery with exact match patterns");
 
    // Query for specific blob in specific tag
@@ -370,8 +358,7 @@
   * Test BlobQuery with wildcard patterns
   */
  TEST_CASE("BlobQuery - Wildcard Patterns", "[query][blobquery][wildcard]") {
-   auto *fixture = hshm::Singleton<CTEQueryTestFixture>::GetInstance();
-  (void)fixture; // Suppress unused variable warning
+   CTEQueryTestFixture fixture;
    INFO("Testing BlobQuery with wildcard patterns");
 
    // Query for all .dat blobs in user_data tag
@@ -397,8 +384,7 @@
   * Test BlobQuery with multiple tag matches
   */
  TEST_CASE("BlobQuery - Multiple Tags", "[query][blobquery][multitag]") {
-   auto *fixture = hshm::Singleton<CTEQueryTestFixture>::GetInstance();
-  (void)fixture; // Suppress unused variable warning
+   CTEQueryTestFixture fixture;
    INFO("Testing BlobQuery with multiple tag matches");
 
    // Query for all .txt files in any "user_" tag
@@ -422,8 +408,7 @@
   * Test BlobQuery with match-all patterns
   */
  TEST_CASE("BlobQuery - Match All", "[query][blobquery][matchall]") {
-   auto *fixture = hshm::Singleton<CTEQueryTestFixture>::GetInstance();
-  (void)fixture; // Suppress unused variable warning
+   CTEQueryTestFixture fixture;
    INFO("Testing BlobQuery with match-all patterns");
 
    // Query for all blobs in all tags
@@ -431,15 +416,14 @@
    auto results = cte_client->BlobQuery(HSHM_MCTX, ".*", ".*", 0, chi::PoolQuery::Broadcast());
 
    INFO("Total blobs matched: " << results.size());
-   REQUIRE(results.size() >= fixture->test_blobs_.size());
+   REQUIRE(results.size() >= fixture.test_blobs_.size());
  }
 
  /**
   * Test BlobQuery with no blob matches
   */
  TEST_CASE("BlobQuery - No Blob Matches", "[query][blobquery][noblob]") {
-   auto *fixture = hshm::Singleton<CTEQueryTestFixture>::GetInstance();
-  (void)fixture; // Suppress unused variable warning
+   CTEQueryTestFixture fixture;
    INFO("Testing BlobQuery with blob pattern that matches nothing");
 
    // Query for non-existent blob pattern in existing tag
@@ -454,8 +438,7 @@
   * Test BlobQuery with no tag matches
   */
  TEST_CASE("BlobQuery - No Tag Matches", "[query][blobquery][notag]") {
-   auto *fixture = hshm::Singleton<CTEQueryTestFixture>::GetInstance();
-  (void)fixture; // Suppress unused variable warning
+   CTEQueryTestFixture fixture;
    INFO("Testing BlobQuery with tag pattern that matches nothing");
 
    // Query for non-existent tag pattern
@@ -470,8 +453,7 @@
   * Test Query API with Local pool query
   */
  TEST_CASE("Query - Local Pool Query", "[query][poolquery][local]") {
-   auto *fixture = hshm::Singleton<CTEQueryTestFixture>::GetInstance();
-  (void)fixture; // Suppress unused variable warning
+   CTEQueryTestFixture fixture;
    INFO("Testing query APIs with Local pool query");
 
    auto *cte_client = WRP_CTE_CLIENT;

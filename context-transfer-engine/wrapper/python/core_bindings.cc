@@ -30,6 +30,12 @@ NB_MODULE(wrp_cte_core_ext, m) {
       .value("kFile", chimaera::bdev::BdevType::kFile)
       .value("kRam", chimaera::bdev::BdevType::kRam);
 
+  // Bind ChimaeraMode enum
+  nb::enum_<chi::ChimaeraMode>(m, "ChimaeraMode")
+      .value("kClient", chi::ChimaeraMode::kClient)
+      .value("kServer", chi::ChimaeraMode::kServer)
+      .value("kRuntime", chi::ChimaeraMode::kRuntime);
+
   // Bind UniqueId type (used by TagId, BlobId, and PoolId)
   // Note: TagId, BlobId, and PoolId are all aliases for chi::UniqueId, so we register the base type
   auto unique_id_class = nb::class_<wrp_cte::core::TagId>(m, "UniqueId")
@@ -186,12 +192,18 @@ NB_MODULE(wrp_cte_core_ext, m) {
       []() -> wrp_cte::core::Client { return *WRP_CTE_CLIENT; },
       "Get a copy of the global CTE client instance");
 
-  // Chimaera runtime initialization functions
-  m.def("chimaera_runtime_init", &chi::CHIMAERA_RUNTIME_INIT,
-        "Initialize the Chimaera runtime");
-
-  m.def("chimaera_client_init", &chi::CHIMAERA_CLIENT_INIT,
-        "Initialize the Chimaera client");
+  // Chimaera initialization function (unified)
+  m.def("chimaera_init", &chi::CHIMAERA_INIT,
+        "mode"_a, "default_with_runtime"_a = false,
+        "Initialize Chimaera with specified mode.\n\n"
+        "Args:\n"
+        "    mode: ChimaeraMode.kClient or ChimaeraMode.kServer/kRuntime\n"
+        "    default_with_runtime: If True, starts runtime in addition to client (default: False)\n\n"
+        "Environment variable CHIMAERA_WITH_RUNTIME overrides default_with_runtime:\n"
+        "    CHIMAERA_WITH_RUNTIME=1 - Start runtime regardless of mode\n"
+        "    CHIMAERA_WITH_RUNTIME=0 - Don't start runtime (client only)\n\n"
+        "Returns:\n"
+        "    bool: True if initialization successful, False otherwise");
 
   // CTE-specific initialization
   // Note: Lambda wrapper used to avoid chi::PoolQuery::Dynamic() evaluation at import

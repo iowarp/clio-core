@@ -15,8 +15,7 @@ The unit tests demonstrate and verify the complete Chimaera workflow:
 ## Test Categories
 
 ### Core Functionality Tests
-- **Runtime Initialization** `[runtime][initialization]` - Tests for `CHIMAERA_RUNTIME_INIT()`
-- **Client Initialization** `[client][initialization]` - Tests for `CHIMAERA_CLIENT_INIT()`
+- **Chimaera Initialization** `[initialization]` - Tests for `CHIMAERA_INIT()`
 - **MOD_NAME Task Execution** `[task][mod_name]` - Custom task creation and execution
 - **Async Task Handling** `[task][mod_name][async]` - Asynchronous task submission
 
@@ -98,9 +97,7 @@ ctest -V
 ### Test Fixture: `ChimaeraRuntimeFixture`
 
 The test fixture provides:
-- **`initializeRuntime()`** - Start Chimaera runtime components
-- **`initializeClient()`** - Initialize client connection
-- **`initializeBoth()`** - Complete setup (runtime + client)
+- **`initialize()`** - Complete Chimaera initialization (client with embedded runtime)
 - **`waitForTaskCompletion()`** - Wait for async task completion with timeout
 - **`createModNamePool()`** - Create MOD_NAME pool using admin client
 - **`cleanup()`** - Automatic resource cleanup
@@ -129,7 +126,7 @@ TEST_CASE("My New Test", "[category][subcategory]") {
   
   SECTION("Test scenario description") {
     // 1. Setup
-    REQUIRE(fixture.initializeBoth());
+    REQUIRE(fixture.initialize());
     
     // 2. Execute
     // ... your test code ...
@@ -150,7 +147,7 @@ TEST_CASE("Custom Task Test", "[task][custom]") {
   
   SECTION("Task execution") {
     // Initialize everything
-    REQUIRE(fixture.initializeBoth());
+    REQUIRE(fixture.initialize());
     REQUIRE(fixture.createModNamePool());
     
     // Create client
@@ -196,7 +193,7 @@ constexpr chi::PoolId kTestModNamePoolId = 100; // Test pool ID
 
 ### Common Issues
 
-1. **Tests timeout** - Increase `kTestTimeoutMs` or check runtime initialization
+1. **Tests timeout** - Increase `kTestTimeoutMs` or check Chimaera initialization
 2. **Pool creation fails** - Verify admin ChiMod is available and working
 3. **Task submission fails** - Check IPC manager initialization and pool existence
 4. **Memory errors** - Ensure proper task cleanup using `CHI_IPC->DelTask()`

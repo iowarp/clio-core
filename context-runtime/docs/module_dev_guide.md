@@ -3645,28 +3645,43 @@ Applications using your external ChiMod would reference it as:
 #include <[namespace]/admin/admin_client.h>
 
 int main() {
-  // Initialize Chimaera client
-  chi::CHIMAERA_CLIENT_INIT();
-  
+  // Initialize Chimaera (client mode with embedded runtime)
+  chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
+
   // Create your ChiMod client
   const chi::PoolId pool_id = chi::PoolId(7000, 0);
   myproject::my_module::Client client(pool_id);
-  
+
   // Use your ChiMod
   auto pool_query = chi::PoolQuery::Local();
   client.Create(HSHM_MCTX, pool_query);
 }
 ```
 
-### CHIMAERA_RUNTIME_INIT for Testing and Benchmarks
+### CHIMAERA_INIT Initialization Modes
 
-For simple unit tests and benchmarks, Chimaera provides `CHIMAERA_RUNTIME_INIT()` as a convenience function that initializes both the client and runtime in a single process. This is an alternative to using `CHIMAERA_CLIENT_INIT()` when you need both components initialized together.
+Chimaera provides a unified initialization function `CHIMAERA_INIT()` that supports different operational modes:
 
-**Important Notes:**
-- **Primary Use Case**: Unit tests and benchmarks only
-- **Not for Production**: Should NOT be used in main production applications
-- **Single Process**: Initializes both client and runtime in the same process
-- **Simplified Testing**: Eliminates need for separate runtime and client processes during testing
+**Client Mode with Embedded Runtime (Most Common):**
+```cpp
+// Initialize both client and runtime in single process
+// Recommended for: Applications, unit tests, and benchmarks
+chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
+```
+
+**Client-Only Mode (Advanced):**
+```cpp
+// Initialize client only - connects to external runtime
+// Recommended for: Production deployments with separate runtime process
+chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, false);
+```
+
+**Runtime/Server Mode (Advanced):**
+```cpp
+// Initialize runtime/server only - no client
+// Recommended for: Standalone runtime processes
+chi::CHIMAERA_INIT(chi::ChimaeraMode::kServer, false);
+```
 
 **Usage Example (Unit Tests/Benchmarks):**
 ```cpp
@@ -3675,7 +3690,7 @@ For simple unit tests and benchmarks, Chimaera provides `CHIMAERA_RUNTIME_INIT()
 
 TEST(MyModuleTest, BasicOperation) {
   // Initialize both client and runtime in single process
-  chi::CHIMAERA_RUNTIME_INIT();
+  chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
 
   // Create your ChiMod client
   const chi::PoolId pool_id = chi::PoolId(7000, 0);
@@ -3689,9 +3704,10 @@ TEST(MyModuleTest, BasicOperation) {
 }
 ```
 
-**When to Use Each:**
-- **CHIMAERA_CLIENT_INIT()**: Production applications connecting to existing runtime
-- **CHIMAERA_RUNTIME_INIT()**: Unit tests, benchmarks, and simple testing scenarios
+**When to Use Each Mode:**
+- **Client with Embedded Runtime** (`kClient, true`): Unit tests, benchmarks, and standalone applications
+- **Client Only** (`kClient, false`): Production applications connecting to existing external runtime
+- **Server/Runtime Only** (`kServer, false`): Dedicated runtime processes
 
 ### Dependencies and Installation Paths
 

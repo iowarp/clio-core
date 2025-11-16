@@ -10,7 +10,7 @@
  * have access to the file, you may request a copy from help@hdfgroup.org.   *
  * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 
-#include <catch2/catch_all.hpp>
+#include "simple_test.h"
 #include <filesystem>
 #include <cstdlib>
 #include <memory>
@@ -45,6 +45,9 @@ namespace {
  */
 class CTECoreTestFixture {
 public:
+  // Flag to track if setup has been completed (singleton initialization)
+  bool setup_completed_ = false;
+
   // Semantic names for queue IDs and priorities (following CLAUDE.md requirements)
   static constexpr chi::QueueId kTestMainQueueId = chi::QueueId(1);
   
@@ -73,7 +76,8 @@ public:
     }
     
     // Initialize Chimaera runtime and client for proper functionality
-    REQUIRE(initializeBoth());
+    bool success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
+    REQUIRE(success);
     
     // Generate unique pool ID for this test
     int rand_id = 1000 + rand() % 9000;  // Random ID 1000-9999
@@ -130,56 +134,14 @@ public:
    * Initialize Chimaera runtime following the module test guide pattern
    * This sets up the shared memory infrastructure needed for real API calls
    */
-  bool initializeRuntime() {
-    if (g_runtime_initialized) return true;
-    
-    INFO("Initializing Chimaera runtime...");
-    bool success = chi::CHIMAERA_RUNTIME_INIT();
-    if (success) {
-      g_runtime_initialized = true;
-      std::this_thread::sleep_for(500ms); // Allow initialization
-      
-      // Verify core managers are initialized
-      REQUIRE(CHI_CHIMAERA_MANAGER != nullptr);
-      REQUIRE(CHI_IPC != nullptr);
-      REQUIRE(CHI_POOL_MANAGER != nullptr);
-      REQUIRE(CHI_MODULE_MANAGER != nullptr);
-      
-      INFO("Chimaera runtime initialized successfully");
-    } else {
-      FAIL("Failed to initialize Chimaera runtime");
-    }
-    return success;
-  }
 
   /**
    * Initialize Chimaera client following the module test guide pattern
    */
-  bool initializeClient() {
-    if (g_client_initialized) return true;
-
-    INFO("Initializing Chimaera client...");
-    bool success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
-    if (success) {
-      g_client_initialized = true;
-      std::this_thread::sleep_for(200ms); // Allow connection
-
-      REQUIRE(CHI_IPC != nullptr);
-      REQUIRE(CHI_IPC->IsInitialized());
-
-      INFO("Chimaera client initialized successfully");
-    } else {
-      FAIL("Failed to initialize Chimaera client");
-    }
-    return success;
-  }
 
   /**
    * Initialize both runtime and client
    */
-  bool initializeBoth() { 
-    return initializeRuntime() && initializeClient(); 
-  }
 
 private:
   /**
@@ -198,19 +160,20 @@ private:
  * 2. Client is properly initialized with pool ID
  * 3. Basic client functionality is accessible
  */
-TEST_CASE_METHOD(CTECoreTestFixture, "CTE Core Client Creation", "[cte][core][client][creation]") {
-  SECTION("Client creation with pool ID") {
+TEST_CASE("CTE Core Client Creation", "[cte][core][client][creation]") {
+
+  auto *fixture = hshm::Singleton<CTECoreTestFixture>::GetInstance();  SECTION("Client creation with pool ID") {
     // Client should be successfully created in fixture
-    REQUIRE(core_client_ != nullptr);
+    REQUIRE(fixture->core_client_ != nullptr);
     
-    INFO("CTE Core client created successfully with pool ID: " << core_pool_id_.ToU64());
+    INFO("CTE Core client created successfully with pool ID: " << fixture->core_pool_id_.ToU64());
   }
   
   SECTION("Pool ID validation") {
     // Verify pool ID is set correctly
-    REQUIRE(core_pool_id_.ToU64() != 0);
+    REQUIRE(fixture->core_pool_id_.ToU64() != 0);
     
-    INFO("Pool ID verified: " << core_pool_id_.ToU64());
+    INFO("Pool ID verified: " << fixture->core_pool_id_.ToU64());
   }
 }
 
@@ -223,7 +186,8 @@ TEST_CASE_METHOD(CTECoreTestFixture, "CTE Core Client Creation", "[cte][core][cl
  * 3. Custom parameters can be configured
  */
 TEST_CASE("CTE CreateParams Configuration", "[cte][core][params]") {
-  SECTION("Default CreateParams") {
+
+  auto *fixture = hshm::Singleton<CTECoreTestFixture>::GetInstance();  SECTION("Default CreateParams") {
     wrp_cte::core::CreateParams params;
 
     // Check default values
@@ -255,22 +219,23 @@ TEST_CASE("CTE CreateParams Configuration", "[cte][core][params]") {
  * 2. File paths and sizes are handled correctly
  * 3. BdevType enumeration works as expected
  */
-TEST_CASE_METHOD(CTECoreTestFixture, "Target Configuration Validation", "[cte][core][target][config]") {
-  SECTION("File-based target configuration") {
+TEST_CASE("Target Configuration Validation", "[cte][core][target][config]") {
+
+  auto *fixture = hshm::Singleton<CTECoreTestFixture>::GetInstance();  SECTION("File-based target configuration") {
     const std::string target_name = "test_target_validation";
     const chimaera::bdev::BdevType bdev_type = chimaera::bdev::BdevType::kFile;
     
     // Verify configuration parameters are valid
     REQUIRE(!target_name.empty());
-    REQUIRE(!test_storage_path_.empty());
-    REQUIRE(kTestTargetSize > 0);
+    REQUIRE(!fixture->test_storage_path_.empty());
+    REQUIRE(CTECoreTestFixture::kTestTargetSize > 0);
     REQUIRE(bdev_type == chimaera::bdev::BdevType::kFile);  // Use bdev_type to avoid unused warning
     
     INFO("Target configuration validated:");
     INFO("  Name: " << target_name);
     INFO("  Type: File-based bdev");
-    INFO("  Path: " << test_storage_path_);
-    INFO("  Size: " << kTestTargetSize << " bytes");
+    INFO("  Path: " << fixture->test_storage_path_);
+    INFO("  Size: " << CTECoreTestFixture::kTestTargetSize << " bytes");
   }
   
   SECTION("Target size validation") {
@@ -298,7 +263,8 @@ TEST_CASE_METHOD(CTECoreTestFixture, "Target Configuration Validation", "[cte][c
  * 3. Blob ID mapping functionality works
  */
 TEST_CASE("Tag Information Structure", "[cte][core][tag][info]") {
-  SECTION("TagInfo structure validation") {
+
+  auto *fixture = hshm::Singleton<CTECoreTestFixture>::GetInstance();  SECTION("TagInfo structure validation") {
     // NOTE: Allocator-based constructor tests are commented out due to HSHM memory manager 
     // initialization complexity. These tests validate that the constructor signatures 
     // are correct and the code compiles properly.
@@ -337,7 +303,8 @@ TEST_CASE("Tag Information Structure", "[cte][core][tag][info]") {
  * 3. Score and size parameters are validated
  */
 TEST_CASE("Blob Information Structure", "[cte][core][blob][info]") {
-  SECTION("BlobInfo parameter validation") {
+
+  auto *fixture = hshm::Singleton<CTECoreTestFixture>::GetInstance();  SECTION("BlobInfo parameter validation") {
     // NOTE: Allocator-based constructor tests are commented out due to HSHM memory manager
     // initialization complexity. These tests validate parameter ranges and types.
     
@@ -387,7 +354,8 @@ TEST_CASE("Blob Information Structure", "[cte][core][blob][info]") {
  * 3. Task flags and methods are set correctly
  */
 TEST_CASE("Task Structure Validation", "[cte][core][tasks]") {
-  SECTION("Task structure compilation validation") {
+
+  auto *fixture = hshm::Singleton<CTECoreTestFixture>::GetInstance();  SECTION("Task structure compilation validation") {
     // NOTE: Allocator-based task constructor tests are commented out due to HSHM memory 
     // manager initialization complexity. These tests validate that the task structures
     // compile correctly and have the expected member variables.
@@ -434,12 +402,13 @@ TEST_CASE("Task Structure Validation", "[cte][core][tasks]") {
  * 2. Data integrity verification functions
  * 3. Pattern-based data generation
  */
-TEST_CASE_METHOD(CTECoreTestFixture, "Data Helper Functions", "[cte][core][helpers]") {
-  SECTION("Test data creation") {
+TEST_CASE("Data Helper Functions", "[cte][core][helpers]") {
+
+  auto *fixture = hshm::Singleton<CTECoreTestFixture>::GetInstance();  SECTION("Test data creation") {
     const size_t test_size = 1024;
     const char test_pattern = 'X';
     
-    auto test_data = CreateTestData(test_size, test_pattern);
+    auto test_data = fixture->CreateTestData(test_size, test_pattern);
     
     REQUIRE(test_data.size() == test_size);
     REQUIRE(test_data[0] == test_pattern);
@@ -453,17 +422,17 @@ TEST_CASE_METHOD(CTECoreTestFixture, "Data Helper Functions", "[cte][core][helpe
     const size_t test_size = 512;
     const char test_pattern = 'Z';
     
-    auto original_data = CreateTestData(test_size, test_pattern);
+    auto original_data = fixture->CreateTestData(test_size, test_pattern);
     
     // Create copy for verification
     std::vector<char> copied_data = original_data;
     
-    REQUIRE(VerifyTestData(copied_data, test_pattern));
+    REQUIRE(fixture->VerifyTestData(copied_data, test_pattern));
     
     // Corrupt data and verify detection
     if (!copied_data.empty()) {
       copied_data[10] = 'X';  // Corrupt one byte
-      REQUIRE_FALSE(VerifyTestData(copied_data, test_pattern));
+      REQUIRE_FALSE(fixture->VerifyTestData(copied_data, test_pattern));
     }
     
     INFO("Data integrity verification validated");
@@ -482,16 +451,17 @@ TEST_CASE_METHOD(CTECoreTestFixture, "Data Helper Functions", "[cte][core][helpe
  * Note: This is a structural validation test that verifies the testing
  * framework components are properly set up for full integration testing.
  */
-TEST_CASE_METHOD(CTECoreTestFixture, "CTE Core Workflow Validation", "[cte][core][workflow]") {
-  SECTION("Component initialization validation") {
+TEST_CASE("CTE Core Workflow Validation", "[cte][core][workflow]") {
+
+  auto *fixture = hshm::Singleton<CTECoreTestFixture>::GetInstance();  SECTION("Component initialization validation") {
     // Verify all test components are properly initialized
-    REQUIRE(core_client_ != nullptr);
-    REQUIRE(!test_storage_path_.empty());
-    REQUIRE(core_pool_id_.ToU64() != 0);
+    REQUIRE(fixture->core_client_ != nullptr);
+    REQUIRE(!fixture->test_storage_path_.empty());
+    REQUIRE(fixture->core_pool_id_.ToU64() != 0);
     
     INFO("All test components initialized successfully");
-    INFO("Storage path: " << test_storage_path_);
-    INFO("Pool ID: " << core_pool_id_.ToU64());
+    INFO("Storage path: " << fixture->test_storage_path_);
+    INFO("Pool ID: " << fixture->core_pool_id_.ToU64());
   }
   
   SECTION("Test data workflow") {
@@ -500,11 +470,11 @@ TEST_CASE_METHOD(CTECoreTestFixture, "CTE Core Workflow Validation", "[cte][core
     const char workflow_pattern = 'W';
     
     // Step 1: Create test data
-    auto workflow_data = CreateTestData(workflow_data_size, workflow_pattern);
+    auto workflow_data = fixture->CreateTestData(workflow_data_size, workflow_pattern);
     REQUIRE(!workflow_data.empty());
     
     // Step 2: Verify data integrity
-    REQUIRE(VerifyTestData(workflow_data, workflow_pattern));
+    REQUIRE(fixture->VerifyTestData(workflow_data, workflow_pattern));
     
     // Step 3: Simulate data operations (copy, modify, verify)
     std::vector<char> processed_data = workflow_data;
@@ -544,8 +514,9 @@ TEST_CASE_METHOD(CTECoreTestFixture, "CTE Core Workflow Validation", "[cte][core
  * 2. Multiple concurrent operations simulation
  * 3. Resource usage validation
  */
-TEST_CASE_METHOD(CTECoreTestFixture, "Performance Test Structure", "[cte][core][performance]") {
-  SECTION("Large data handling simulation") {
+TEST_CASE("Performance Test Structure", "[cte][core][performance]") {
+
+  auto *fixture = hshm::Singleton<CTECoreTestFixture>::GetInstance();  SECTION("Large data handling simulation") {
     // Test with progressively larger data sizes
     std::vector<size_t> data_sizes = {
       1024,           // 1KB
@@ -555,9 +526,9 @@ TEST_CASE_METHOD(CTECoreTestFixture, "Performance Test Structure", "[cte][core][
     };
     
     for (size_t size : data_sizes) {
-      auto large_data = CreateTestData(size);
+      auto large_data = fixture->CreateTestData(size);
       REQUIRE(large_data.size() == size);
-      REQUIRE(VerifyTestData(large_data));
+      REQUIRE(fixture->VerifyTestData(large_data));
       
       INFO("Large data handling validated for size: " << size << " bytes");
     }
@@ -574,13 +545,13 @@ TEST_CASE_METHOD(CTECoreTestFixture, "Performance Test Structure", "[cte][core][
     // Create multiple data sets
     for (size_t i = 0; i < operation_count; ++i) {
       char pattern = static_cast<char>('A' + (i % 26));
-      operation_data.push_back(CreateTestData(operation_data_size, pattern));
+      operation_data.push_back(fixture->CreateTestData(operation_data_size, pattern));
     }
     
     // Verify all data sets
     for (size_t i = 0; i < operation_count; ++i) {
       char pattern = static_cast<char>('A' + (i % 26));
-      REQUIRE(VerifyTestData(operation_data[i], pattern));
+      REQUIRE(fixture->VerifyTestData(operation_data[i], pattern));
     }
     
     INFO("Multiple operation simulation completed with " << operation_count << " operations");

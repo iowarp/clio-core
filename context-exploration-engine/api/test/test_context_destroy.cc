@@ -80,9 +80,9 @@ int main(int argc, char** argv) {
     // Initialize Chimaera runtime if requested (for unit tests)
     const char* init_chimaera = std::getenv("INIT_CHIMAERA");
     if (init_chimaera && std::strcmp(init_chimaera, "1") == 0) {
-      std::cout << "Initializing Chimaera runtime (INIT_CHIMAERA=1)..." << std::endl;
-      chi::CHIMAERA_RUNTIME_INIT();
-      std::cout << "Chimaera runtime initialized" << std::endl;
+      std::cout << "Initializing Chimaera (INIT_CHIMAERA=1)..." << std::endl;
+      chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
+      std::cout << "Chimaera initialized" << std::endl;
     }
 
     // Verify Chimaera IPC is available

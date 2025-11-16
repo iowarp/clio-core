@@ -78,14 +78,15 @@ public:
   ChimaeraTestFixture() = default;
   ~ChimaeraTestFixture() { cleanup(); }
 
-  bool initializeRuntime() {
-    if (g_runtime_initialized) return true;
-    
-    bool success = chi::CHIMAERA_RUNTIME_INIT();
+  bool initialize() {
+    if (g_initialized) return true;
+
+    // Use unified initialization (client mode with embedded runtime)
+    bool success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
     if (success) {
-      g_runtime_initialized = true;
+      g_initialized = true;
       std::this_thread::sleep_for(500ms); // Allow initialization
-      
+
       // Verify core managers
       REQUIRE(CHI_CHIMAERA_MANAGER != nullptr);
       REQUIRE(CHI_IPC != nullptr);
@@ -93,24 +94,6 @@ public:
       REQUIRE(CHI_MODULE_MANAGER != nullptr);
     }
     return success;
-  }
-
-  bool initializeClient() {
-    if (g_client_initialized) return true;
-    
-    bool success = chi::CHIMAERA_CLIENT_INIT();
-    if (success) {
-      g_client_initialized = true;
-      std::this_thread::sleep_for(200ms); // Allow connection
-      
-      REQUIRE(CHI_IPC != nullptr);
-      REQUIRE(CHI_IPC->IsInitialized());
-    }
-    return success;
-  }
-
-  bool initializeBoth() { 
-    return initializeRuntime() && initializeClient(); 
   }
 
   // Utility method for async task completion
@@ -136,8 +119,7 @@ private:
     // Framework handles automatic cleanup
   }
   
-  static bool g_runtime_initialized;
-  static bool g_client_initialized;
+  static bool g_initialized;
 };
 ```
 
@@ -169,8 +151,7 @@ namespace {
   constexpr chi::PoolId kTestPoolId = chi::PoolId(500, 0);
   
   // Global state
-  bool g_runtime_initialized = false;
-  bool g_client_initialized = false;
+  bool g_initialized = false;
 }
 
 // Test fixture class (implementation as shown above)
@@ -182,18 +163,13 @@ class YourModuleTestFixture {
 // INITIALIZATION TESTS  
 //==============================================================================
 
-TEST_CASE("Runtime and Client Initialization", "[initialization]") {
+TEST_CASE("Chimaera Initialization", "[initialization]") {
   YourModuleTestFixture fixture;
 
-  SECTION("Runtime initialization should succeed") {
-    REQUIRE(fixture.initializeRuntime());
+  SECTION("Unified initialization should succeed") {
+    REQUIRE(fixture.initialize());
     REQUIRE(CHI_CHIMAERA_MANAGER->IsInitialized());
     REQUIRE(CHI_CHIMAERA_MANAGER->IsRuntime());
-  }
-
-  SECTION("Client initialization requires runtime first") {
-    REQUIRE(fixture.initializeRuntime());
-    REQUIRE(fixture.initializeClient());
     REQUIRE(CHI_IPC->IsInitialized());
   }
 }
@@ -204,7 +180,7 @@ TEST_CASE("Runtime and Client Initialization", "[initialization]") {
 
 TEST_CASE("ChiMod Complete Workflow", "[workflow]") {
   YourModuleTestFixture fixture;
-  REQUIRE(fixture.initializeBoth());
+  REQUIRE(fixture.initialize());
 
   SECTION("Create admin pool and ChiMod container") {
     // Step 1: Create admin pool

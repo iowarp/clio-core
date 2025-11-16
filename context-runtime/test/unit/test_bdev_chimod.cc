@@ -56,8 +56,7 @@ const chi::u64 k256KB = 262144;
 const chi::u64 k1MB = 1048576;
 
 // Global test state
-bool g_runtime_initialized = false;
-bool g_client_initialized = false;
+bool g_initialized = false;
 int g_test_counter = 0;
 
 /**
@@ -93,78 +92,25 @@ inline chimaera::bdev::ArrayVector<chimaera::bdev::Block, 16> ConvertBlocks(
 class BdevChimodFixture {
 public:
   BdevChimodFixture() : current_test_file_("") {
+    // Initialize Chimaera once per test suite
+    if (!g_initialized) {
+      HILOG(kInfo, "Initializing Chimaera...");
+      bool success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
+      if (success) {
+        g_initialized = true;
+        std::this_thread::sleep_for(500ms);
+        HILOG(kInfo, "Chimaera initialization successful");
+      } else {
+        HILOG(kInfo, "Failed to initialize Chimaera");
+      }
+    }
+
     // Generate unique test file name
     current_test_file_ = kTestFilePrefix + std::to_string(getpid()) + "_" +
                          std::to_string(++g_test_counter) + ".dat";
   }
 
   ~BdevChimodFixture() { cleanup(); }
-
-  /**
-   * Initialize Chimaera runtime (server-side)
-   * Can be disabled via CHIMAERA_DISABLE_RUNTIME_INIT=1 environment variable
-   * for distributed tests where runtime is already running in containers
-   */
-  bool initializeRuntime() {
-    // Check if runtime initialization is disabled via environment variable
-    const char *disable_init = std::getenv("CHIMAERA_DISABLE_RUNTIME_INIT");
-    if (disable_init != nullptr && std::string(disable_init) == "1") {
-      HILOG(kInfo,
-            "CHIMAERA_DISABLE_RUNTIME_INIT=1: Skipping runtime initialization");
-      g_runtime_initialized = true; // Mark as initialized to skip future calls
-      return true;
-    }
-
-    if (g_runtime_initialized) {
-      return true; // Already initialized
-    }
-
-    HILOG(kInfo, "Initializing Chimaera runtime...");
-    bool success = chi::CHIMAERA_RUNTIME_INIT();
-
-    if (success) {
-      g_runtime_initialized = true;
-
-      // Give runtime time to initialize all components
-      std::this_thread::sleep_for(500ms);
-
-      HILOG(kInfo, "Runtime initialization successful");
-    } else {
-      HILOG(kInfo, "Failed to initialize Chimaera runtime");
-    }
-
-    return success;
-  }
-
-  /**
-   * Initialize Chimaera client components
-   */
-  bool initializeClient() {
-    if (g_client_initialized) {
-      return true; // Already initialized
-    }
-
-    HILOG(kInfo, "Initializing Chimaera client...");
-    bool success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
-
-    if (success) {
-      g_client_initialized = true;
-
-      // Give client time to connect to runtime
-      std::this_thread::sleep_for(200ms);
-
-      HILOG(kInfo, "Client initialization successful");
-    } else {
-      HILOG(kInfo, "Failed to initialize Chimaera client");
-    }
-
-    return success;
-  }
-
-  /**
-   * Initialize both runtime and client (full setup)
-   */
-  bool initializeBoth() { return initializeRuntime() && initializeClient(); }
 
   /**
    * Create a test file with specified size
@@ -289,7 +235,7 @@ TEST_CASE("bdev_container_creation", "[bdev][create]") {
   BdevChimodFixture fixture;
 
   SECTION("Initialize runtime and client") {
-    REQUIRE(fixture.initializeBoth());
+    REQUIRE(g_initialized);
   }
 
   SECTION("Create test file") {
@@ -314,7 +260,7 @@ TEST_CASE("bdev_block_allocation_4kb", "[bdev][allocate][4kb]") {
   BdevChimodFixture fixture;
 
   SECTION("Setup") {
-    REQUIRE(fixture.initializeBoth());
+    REQUIRE(g_initialized);
     REQUIRE(fixture.createTestFile(kDefaultFileSize));
   }
 
@@ -372,7 +318,7 @@ TEST_CASE("bdev_write_read_basic", "[bdev][io][basic]") {
   BdevChimodFixture fixture;
 
   SECTION("Setup") {
-    REQUIRE(fixture.initializeBoth());
+    REQUIRE(g_initialized);
     REQUIRE(fixture.createTestFile(kDefaultFileSize));
   }
 
@@ -470,7 +416,7 @@ TEST_CASE("bdev_async_operations", "[bdev][async][io]") {
   BdevChimodFixture fixture;
 
   SECTION("Setup") {
-    REQUIRE(fixture.initializeBoth());
+    REQUIRE(g_initialized);
     REQUIRE(fixture.createTestFile(kLargeFileSize));
   }
 
@@ -549,12 +495,12 @@ TEST_CASE("bdev_performance_metrics", "[bdev][performance][metrics]") {
   BdevChimodFixture fixture;
 
   SECTION("Setup") {
-    REQUIRE(fixture.initializeBoth());
+    REQUIRE(g_initialized);
     REQUIRE(fixture.createTestFile(kLargeFileSize));
   }
 
   SECTION("Track performance metrics during operations") {
-    REQUIRE(fixture.initializeBoth());
+    REQUIRE(g_initialized);
     REQUIRE(fixture.createTestFile(kLargeFileSize));
 
     chi::PoolId custom_pool_id(105, 0);
@@ -680,7 +626,7 @@ TEST_CASE("bdev_error_conditions", "[bdev][error][edge_cases]") {
   BdevChimodFixture fixture;
 
   SECTION("Setup") {
-    REQUIRE(fixture.initializeBoth());
+    REQUIRE(g_initialized);
     REQUIRE(fixture.createTestFile(kDefaultFileSize));
   }
 
@@ -707,7 +653,7 @@ TEST_CASE("bdev_error_conditions", "[bdev][error][edge_cases]") {
 
 TEST_CASE("bdev_ram_container_creation", "[bdev][ram][create]") {
   BdevChimodFixture fixture;
-  REQUIRE(fixture.initializeBoth());
+  REQUIRE(g_initialized);
 
   // Admin client is automatically initialized via CHI_ADMIN singleton
   std::this_thread::sleep_for(100ms);
@@ -733,7 +679,7 @@ TEST_CASE("bdev_ram_container_creation", "[bdev][ram][create]") {
 
 TEST_CASE("bdev_ram_allocation_and_io", "[bdev][ram][io]") {
   BdevChimodFixture fixture;
-  REQUIRE(fixture.initializeBoth());
+  REQUIRE(g_initialized);
 
   // Admin client is automatically initialized via CHI_ADMIN singleton
   std::this_thread::sleep_for(100ms);
@@ -830,7 +776,7 @@ TEST_CASE("bdev_ram_allocation_and_io", "[bdev][ram][io]") {
 
 TEST_CASE("bdev_ram_large_blocks", "[bdev][ram][large]") {
   BdevChimodFixture fixture;
-  REQUIRE(fixture.initializeBoth());
+  REQUIRE(g_initialized);
 
   // Admin client is automatically initialized via CHI_ADMIN singleton
   std::this_thread::sleep_for(100ms);
@@ -934,7 +880,7 @@ TEST_CASE("bdev_ram_large_blocks", "[bdev][ram][large]") {
 
 TEST_CASE("bdev_ram_bounds_checking", "[bdev][ram][bounds]") {
   BdevChimodFixture fixture;
-  REQUIRE(fixture.initializeBoth());
+  REQUIRE(g_initialized);
 
   // Admin client is automatically initialized via CHI_ADMIN singleton
   std::this_thread::sleep_for(100ms);
@@ -1011,7 +957,7 @@ TEST_CASE("bdev_ram_bounds_checking", "[bdev][ram][bounds]") {
 
 TEST_CASE("bdev_file_vs_ram_comparison", "[bdev][file][ram][comparison]") {
   BdevChimodFixture fixture;
-  REQUIRE(fixture.initializeBoth());
+  REQUIRE(g_initialized);
   REQUIRE(fixture.createTestFile(kDefaultFileSize));
 
   // Admin client is automatically initialized via CHI_ADMIN singleton
@@ -1207,7 +1153,7 @@ TEST_CASE("bdev_file_vs_ram_comparison", "[bdev][file][ram][comparison]") {
 
 TEST_CASE("bdev_file_explicit_backend", "[bdev][file][explicit]") {
   BdevChimodFixture fixture;
-  REQUIRE(fixture.initializeBoth());
+  REQUIRE(g_initialized);
   REQUIRE(fixture.createTestFile(kDefaultFileSize));
 
   // Admin client is automatically initialized via CHI_ADMIN singleton
@@ -1291,7 +1237,7 @@ TEST_CASE("bdev_file_explicit_backend", "[bdev][file][explicit]") {
 
 TEST_CASE("bdev_error_conditions_enhanced", "[bdev][error][enhanced]") {
   BdevChimodFixture fixture;
-  REQUIRE(fixture.initializeBoth());
+  REQUIRE(g_initialized);
 
   // Admin client is automatically initialized via CHI_ADMIN singleton
   std::this_thread::sleep_for(100ms);
@@ -1361,7 +1307,7 @@ TEST_CASE("bdev_parallel_io_operations", "[bdev][parallel][io]") {
   BdevChimodFixture fixture;
 
   SECTION("Setup") {
-    REQUIRE(fixture.initializeBoth());
+    REQUIRE(g_initialized);
     REQUIRE(
         fixture.createTestFile(100 * 1024 * 1024)); // 100MB for parallel ops
   }
@@ -1489,7 +1435,7 @@ TEST_CASE("bdev_force_net_flag", "[bdev][network][force_net]") {
   BdevChimodFixture fixture;
 
   SECTION("Setup") {
-    REQUIRE(fixture.initializeBoth());
+    REQUIRE(g_initialized);
     REQUIRE(fixture.createTestFile(kDefaultFileSize));
   }
 

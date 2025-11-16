@@ -10,7 +10,7 @@
  * have access to the file, you may request a copy from help@hdfgroup.org.   *
  * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 
-#include <catch2/catch_all.hpp>
+#include "simple_test.h"
 #include <filesystem>
 #include <cstdlib>
 #include <memory>
@@ -43,6 +43,9 @@ namespace fs = std::filesystem;
  */
 class CTECoreTestFixture {
 public:
+  // Flag to track if setup has been completed (singleton initialization)
+  bool setup_completed_ = false;
+
   // Semantic names for test constants (following CLAUDE.md requirements)
   static constexpr chi::QueueId kCTETestQueueId = chi::QueueId(1);
   static constexpr chi::u64 kTestTargetSize = 10 * 1024 * 1024;  // 10MB
@@ -108,15 +111,16 @@ public:
  * - Configuration parameters are applied correctly
  * - Both synchronous and asynchronous creation patterns
  */
-TEST_CASE_METHOD(CTECoreTestFixture, "Create CTE Core Pool", "[cte][core][pool]") {
-  SECTION("Basic pool creation test") {
+TEST_CASE("Create CTE Core Pool", "[cte][core][pool]") {
+
+  auto *fixture = hshm::Singleton<CTECoreTestFixture>::GetInstance();  SECTION("Basic pool creation test") {
     // Verify client is properly initialized
-    REQUIRE(core_client_ != nullptr);
+    REQUIRE(fixture->core_client_ != nullptr);
     
     // Verify pool ID is set
-    REQUIRE(core_pool_id_.ToU64() != 0);
+    REQUIRE(fixture->core_pool_id_.ToU64() != 0);
     
-    INFO("CTE Core client initialized with pool ID: " << core_pool_id_.ToU64());
+    INFO("CTE Core client initialized with pool ID: " << fixture->core_pool_id_.ToU64());
     INFO("Test demonstrates proper client creation pattern");
   }
   
@@ -147,21 +151,22 @@ TEST_CASE_METHOD(CTECoreTestFixture, "Create CTE Core Pool", "[cte][core][pool]"
  * - Target configuration with specified size
  * - Error handling for invalid configurations
  */
-TEST_CASE_METHOD(CTECoreTestFixture, "Register Target", "[cte][core][target]") {
-  SECTION("File-based target configuration") {
+TEST_CASE("Register Target", "[cte][core][target]") {
+
+  auto *fixture = hshm::Singleton<CTECoreTestFixture>::GetInstance();  SECTION("File-based target configuration") {
     const std::string target_name = "cte_test_target";
     const chimaera::bdev::BdevType bdev_type = chimaera::bdev::BdevType::kFile;
     
     // Validate target configuration parameters
     REQUIRE(!target_name.empty());
-    REQUIRE(!test_storage_path_.empty());
-    REQUIRE(kTestTargetSize > 0);
+    REQUIRE(!fixture->test_storage_path_.empty());
+    REQUIRE(CTECoreTestFixture::kTestTargetSize > 0);
     REQUIRE(bdev_type == chimaera::bdev::BdevType::kFile);
     
     INFO("Target configuration validated:");
     INFO("  Name: " << target_name);
-    INFO("  Path: " << test_storage_path_);
-    INFO("  Size: " << kTestTargetSize << " bytes");
+    INFO("  Path: " << fixture->test_storage_path_);
+    INFO("  Size: " << CTECoreTestFixture::kTestTargetSize << " bytes");
     INFO("  Type: File-based bdev");
   }
   
@@ -203,8 +208,9 @@ TEST_CASE_METHOD(CTECoreTestFixture, "Register Target", "[cte][core][target]") {
  * - Blob metadata and parameter handling
  * - Score validation (0-1 range)
  */
-TEST_CASE_METHOD(CTECoreTestFixture, "PutBlob Operations", "[cte][core][putblob]") {
-  SECTION("PutBlob parameter validation") {
+TEST_CASE("PutBlob Operations", "[cte][core][putblob]") {
+
+  auto *fixture = hshm::Singleton<CTECoreTestFixture>::GetInstance();  SECTION("PutBlob parameter validation") {
     // Test valid blob parameters - Updated for new pattern
     const std::string valid_blob_name = "test_blob_001";
     const chi::u32 valid_blob_id = 0;  // Use null ID for PutBlob
@@ -287,8 +293,6 @@ TEST_CASE_METHOD(CTECoreTestFixture, "PutBlob Operations", "[cte][core][putblob]
     }
     
     // Test edge cases
-    REQUIRE(0.0f == Catch::Approx(0.0f));
-    REQUIRE(1.0f == Catch::Approx(1.0f));
   }
 }
 
@@ -301,8 +305,9 @@ TEST_CASE_METHOD(CTECoreTestFixture, "PutBlob Operations", "[cte][core][putblob]
  * - Error handling for non-existent blobs
  * - Partial blob retrieval (offset/size)
  */
-TEST_CASE_METHOD(CTECoreTestFixture, "GetBlob Operations", "[cte][core][getblob]") {
-  SECTION("GetBlob parameter validation") {
+TEST_CASE("GetBlob Operations", "[cte][core][getblob]") {
+
+  auto *fixture = hshm::Singleton<CTECoreTestFixture>::GetInstance();  SECTION("GetBlob parameter validation") {
     // Test valid retrieval parameters - Updated for new pattern
     const chi::u32 valid_tag_id = 100;
     const std::string valid_blob_name = "";  // Empty name for GetBlob
@@ -333,16 +338,16 @@ TEST_CASE_METHOD(CTECoreTestFixture, "GetBlob Operations", "[cte][core][getblob]
     const char test_pattern = 'D';  // 'D' for Data integrity
     
     // Create test data
-    auto original_data = CreateTestData(test_data_size, test_pattern);
+    auto original_data = fixture->CreateTestData(test_data_size, test_pattern);
     REQUIRE(original_data.size() == test_data_size);
     
     // Verify data creation integrity
-    REQUIRE(VerifyTestData(original_data, test_pattern));
+    REQUIRE(fixture->VerifyTestData(original_data, test_pattern));
     
     // Simulate storage and retrieval
     auto copied_data = original_data;  // Simulate perfect storage/retrieval
     REQUIRE(copied_data == original_data);
-    REQUIRE(VerifyTestData(copied_data, test_pattern));
+    REQUIRE(fixture->VerifyTestData(copied_data, test_pattern));
     
     INFO("Data integrity test completed:");
     INFO("  Data size: " << test_data_size << " bytes");
@@ -360,7 +365,7 @@ TEST_CASE_METHOD(CTECoreTestFixture, "GetBlob Operations", "[cte][core][getblob]
     REQUIRE(partial_offset + partial_size <= total_size);
     
     // Create full data set
-    auto full_data = CreateTestData(total_size, 'P');  // 'P' for Partial
+    auto full_data = fixture->CreateTestData(total_size, 'P');  // 'P' for Partial
     
     // Simulate partial extraction
     std::vector<char> partial_data(
@@ -414,21 +419,22 @@ TEST_CASE_METHOD(CTECoreTestFixture, "GetBlob Operations", "[cte][core][getblob]
  * 5. Blob retrieval operations
  * 6. Data integrity throughout workflow
  */
-TEST_CASE_METHOD(CTECoreTestFixture, "CTE Core Integration Workflow", "[cte][core][integration]") {
-  SECTION("Complete workflow simulation") {
+TEST_CASE("CTE Core Integration Workflow", "[cte][core][integration]") {
+
+  auto *fixture = hshm::Singleton<CTECoreTestFixture>::GetInstance();  SECTION("Complete workflow simulation") {
     INFO("=== CTE Core Integration Workflow Test ===");
     
     // Step 1: Pool initialization (already done in fixture)
-    REQUIRE(core_client_ != nullptr);
-    REQUIRE(core_pool_id_.ToU64() != 0);
-    INFO("Step 1 ✓: Pool initialized with ID " << core_pool_id_.ToU64());
+    REQUIRE(fixture->core_client_ != nullptr);
+    REQUIRE(fixture->core_pool_id_.ToU64() != 0);
+    INFO("Step 1 ✓: Pool initialized with ID " << fixture->core_pool_id_.ToU64());
     
     // Step 2: Target registration simulation
     const std::string target_name = "integration_target";
     REQUIRE(!target_name.empty());
-    REQUIRE(!test_storage_path_.empty());
-    REQUIRE(kTestTargetSize > 0);
-    INFO("Step 2 ✓: Target '" << target_name << "' configured for " << kTestTargetSize << " bytes");
+    REQUIRE(!fixture->test_storage_path_.empty());
+    REQUIRE(CTECoreTestFixture::kTestTargetSize > 0);
+    INFO("Step 2 ✓: Target '" << target_name << "' configured for " << CTECoreTestFixture::kTestTargetSize << " bytes");
     
     // Step 3: Tag creation simulation
     const std::string tag_name = "integration_tag";
@@ -446,13 +452,13 @@ TEST_CASE_METHOD(CTECoreTestFixture, "CTE Core Integration Workflow", "[cte][cor
     for (size_t i = 0; i < blob_count; ++i) {
       blob_names.push_back("integration_blob_" + std::to_string(i));
       blob_ids.push_back(0);  // Use null ID for PutBlob
-      blob_data.push_back(CreateTestData(1024 * (i + 1), static_cast<char>('A' + i)));
+      blob_data.push_back(fixture->CreateTestData(1024 * (i + 1), static_cast<char>('A' + i)));
       
       // Validate each blob - Updated for new pattern
       REQUIRE(!blob_names[i].empty());
       REQUIRE(blob_ids[i] == 0);  // Null ID for PutBlob
       REQUIRE(blob_data[i].size() == 1024 * (i + 1));
-      REQUIRE(VerifyTestData(blob_data[i], static_cast<char>('A' + i)));
+      REQUIRE(fixture->VerifyTestData(blob_data[i], static_cast<char>('A' + i)));
     }
     INFO("Step 4 ✓: " << blob_count << " blobs prepared and validated");
     
@@ -461,7 +467,7 @@ TEST_CASE_METHOD(CTECoreTestFixture, "CTE Core Integration Workflow", "[cte][cor
       // Simulate retrieval and verify integrity
       auto retrieved_data = blob_data[i];  // Perfect retrieval simulation
       REQUIRE(retrieved_data == blob_data[i]);
-      REQUIRE(VerifyTestData(retrieved_data, static_cast<char>('A' + i)));
+      REQUIRE(fixture->VerifyTestData(retrieved_data, static_cast<char>('A' + i)));
     }
     INFO("Step 5 ✓: All " << blob_count << " blobs retrieved with data integrity verified");
     
@@ -479,9 +485,9 @@ TEST_CASE_METHOD(CTECoreTestFixture, "CTE Core Integration Workflow", "[cte][cor
     };
     
     for (size_t size : test_sizes) {
-      auto test_data = CreateTestData(size, 'S');  // 'S' for Scalability
+      auto test_data = fixture->CreateTestData(size, 'S');  // 'S' for Scalability
       REQUIRE(test_data.size() == size);
-      REQUIRE(VerifyTestData(test_data, 'S'));
+      REQUIRE(fixture->VerifyTestData(test_data, 'S'));
       
       INFO("Performance test - data size: " << size << " bytes ✓");
     }
@@ -489,3 +495,5 @@ TEST_CASE_METHOD(CTECoreTestFixture, "CTE Core Integration Workflow", "[cte][cor
     INFO("Performance characteristics validated across multiple data sizes");
   }
 }
+// Main function using simple_test.h framework
+SIMPLE_TEST_MAIN()

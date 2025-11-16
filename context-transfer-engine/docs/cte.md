@@ -411,7 +411,7 @@ CTE Core provides singleton access patterns:
 
 ```cpp
 // Initialize CTE client (must be called once)
-// NOTE: This automatically calls CHIMAERA_CLIENT_INIT internally
+// NOTE: This automatically calls chi::CHIMAERA_INIT internally
 // config_path: Optional path to YAML configuration file
 // pool_query: Pool query type for CTE container creation (default: Dynamic)
 bool WRP_CTE_CLIENT_INIT(const std::string &config_path = "",
@@ -422,8 +422,8 @@ auto *client = WRP_CTE_CLIENT;
 ```
 
 **Important Notes:**
-- `WRP_CTE_CLIENT_INIT` automatically calls `CHIMAERA_CLIENT_INIT` internally
-- You do NOT need to call `CHIMAERA_CLIENT_INIT` separately when using CTE Core
+- `WRP_CTE_CLIENT_INIT` automatically calls `chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true)` internally
+- You do NOT need to call `chi::CHIMAERA_INIT` separately when using CTE Core
 - Configuration is managed per-Runtime instance (no global ConfigManager singleton)
 - The config file path can also be specified via the `WRP_RUNTIME_CONF` environment variable
 
@@ -437,12 +437,9 @@ auto *client = WRP_CTE_CLIENT;
 #include <wrp_cte/core/core_tasks.h>
 
 int main() {
-  // Initialize Chimaera runtime
-  chi::CHIMAERA_RUNTIME_INIT();
-
   // Initialize CTE subsystem
-  // NOTE: WRP_CTE_CLIENT_INIT automatically calls CHIMAERA_CLIENT_INIT internally
-  // You do NOT need to call CHIMAERA_CLIENT_INIT separately
+  // NOTE: WRP_CTE_CLIENT_INIT automatically calls chi::CHIMAERA_INIT internally
+  // You do NOT need to call chi::CHIMAERA_INIT separately
   wrp_cte::core::WRP_CTE_CLIENT_INIT("/path/to/config.yaml");
 
   // Get global CTE client instance (created during initialization)

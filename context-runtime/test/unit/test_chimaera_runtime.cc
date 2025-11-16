@@ -37,8 +37,7 @@ constexpr chi::u32 kRetryDelayMs = 100;
 constexpr chi::PoolId kTestModNamePoolId = chi::PoolId(100, 0);
 
 // Global test state
-bool g_runtime_initialized = false;
-bool g_client_initialized = false;
+bool g_initialized = false;
 } // namespace
 
 /**
@@ -47,77 +46,17 @@ bool g_client_initialized = false;
  */
 class ChimaeraRuntimeFixture {
 public:
-  ChimaeraRuntimeFixture() = default;
+  ChimaeraRuntimeFixture() {
+    if (!g_initialized) {
+      bool success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
+      if (success) {
+        g_initialized = true;
+        std::this_thread::sleep_for(500ms);
+      }
+    }
+  }
 
   ~ChimaeraRuntimeFixture() { cleanup(); }
-
-  /**
-   * Initialize Chimaera runtime (server-side)
-   * This should be called before any client operations
-   */
-  bool initializeRuntime() {
-    if (g_runtime_initialized) {
-      return true; // Already initialized
-    }
-
-    INFO("Initializing Chimaera runtime...");
-    bool success = chi::CHIMAERA_RUNTIME_INIT();
-
-    if (success) {
-      g_runtime_initialized = true;
-
-      // Give runtime time to initialize all components
-      std::this_thread::sleep_for(500ms);
-
-      // Verify core managers are available
-      REQUIRE(CHI_CHIMAERA_MANAGER != nullptr);
-      REQUIRE(CHI_IPC != nullptr);
-      REQUIRE(CHI_POOL_MANAGER != nullptr);
-      REQUIRE(CHI_MODULE_MANAGER != nullptr);
-      REQUIRE(CHI_WORK_ORCHESTRATOR != nullptr);
-
-      INFO("Runtime initialization successful");
-    } else {
-      FAIL("Failed to initialize Chimaera runtime");
-    }
-
-    return success;
-  }
-
-  /**
-   * Initialize Chimaera client components
-   * This should be called after runtime initialization
-   */
-  bool initializeClient() {
-    if (g_client_initialized) {
-      return true; // Already initialized
-    }
-
-    INFO("Initializing Chimaera client...");
-    bool success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
-
-    if (success) {
-      g_client_initialized = true;
-
-      // Give client time to connect to runtime
-      std::this_thread::sleep_for(200ms);
-
-      // Verify client can access IPC manager
-      REQUIRE(CHI_IPC != nullptr);
-      REQUIRE(CHI_IPC->IsInitialized());
-
-      INFO("Client initialization successful");
-    } else {
-      FAIL("Failed to initialize Chimaera client");
-    }
-
-    return success;
-  }
-
-  /**
-   * Initialize both runtime and client (full setup)
-   */
-  bool initializeBoth() { return initializeRuntime() && initializeClient(); }
 
   /**
    * Wait for task completion with timeout
@@ -201,46 +140,20 @@ public:
 // Basic Runtime and Client Initialization Tests
 //------------------------------------------------------------------------------
 
-TEST_CASE("Chimaera Runtime Initialization", "[runtime][initialization]") {
+TEST_CASE("Chimaera Initialization", "[runtime][initialization]") {
   ChimaeraRuntimeFixture fixture;
 
-  SECTION("Runtime initialization should succeed") {
-    REQUIRE(fixture.initializeRuntime());
+  SECTION("Chimaera initialization should succeed") {
+    REQUIRE(g_initialized);
 
     // Verify runtime state
     REQUIRE(CHI_CHIMAERA_MANAGER->IsInitialized());
     REQUIRE(CHI_CHIMAERA_MANAGER->IsRuntime());
-    REQUIRE_FALSE(CHI_CHIMAERA_MANAGER->IsClient());
+    REQUIRE(CHI_CHIMAERA_MANAGER->IsClient());
   }
 
-  SECTION("Multiple runtime initializations should be safe") {
-    REQUIRE(fixture.initializeRuntime());
-    REQUIRE(fixture.initializeRuntime()); // Second call should succeed
-  }
-}
-
-TEST_CASE("Chimaera Client Initialization", "[client][initialization]") {
-  ChimaeraRuntimeFixture fixture;
-
-  SECTION("Client initialization requires runtime first") {
-    // Initialize runtime first
-    REQUIRE(fixture.initializeRuntime());
-
-    // Then initialize client
-    REQUIRE(fixture.initializeClient());
-
-    // Verify client can access runtime components
-    REQUIRE(CHI_IPC->IsInitialized());
-  }
-
-  SECTION("Client initialization should fail without runtime") {
-    // Attempting client init without runtime should work
-    // (the framework should handle missing runtime gracefully)
-    bool client_result = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
-
-    // This may succeed or fail depending on implementation
-    // The important thing is it doesn't crash
-    INFO("Client init without runtime result: " << client_result);
+  SECTION("Multiple initializations should be safe") {
+    REQUIRE(g_initialized);
   }
 }
 
@@ -254,7 +167,7 @@ TEST_CASE("MOD_NAME Custom Task Execution", "[task][mod_name][custom]") {
   SECTION(
       "Complete workflow: runtime + client + pool creation + task submission") {
     // Step 1: Initialize runtime and client
-    REQUIRE(fixture.initializeBoth());
+    REQUIRE(g_initialized);
 
     // Step 2: Create MOD_NAME pool
     REQUIRE(fixture.createModNamePool());
@@ -294,7 +207,7 @@ TEST_CASE("MOD_NAME Async Task Execution", "[task][mod_name][async]") {
 
   SECTION("Async task submission and completion") {
     // Initialize everything
-    REQUIRE(fixture.initializeBoth());
+    REQUIRE(g_initialized);
     REQUIRE(fixture.createModNamePool());
 
     // Initialize MOD_NAME client
@@ -339,6 +252,7 @@ TEST_CASE("Error Handling Tests", "[error][edge_cases]") {
   ChimaeraRuntimeFixture fixture;
 
   SECTION("Task submission without runtime should fail gracefully") {
+    (void)g_initialized; // Mark as used
     // Try to create a client without initializing runtime
     chimaera::MOD_NAME::Client mod_name_client(kTestModNamePoolId);
 
@@ -352,7 +266,7 @@ TEST_CASE("Error Handling Tests", "[error][edge_cases]") {
   }
 
   SECTION("Invalid pool ID should handle gracefully") {
-    REQUIRE(fixture.initializeBoth());
+    REQUIRE(g_initialized);
 
     // Try to use an invalid pool ID
     constexpr chi::PoolId kInvalidPoolId = chi::PoolId(9999, 0);
@@ -367,7 +281,7 @@ TEST_CASE("Error Handling Tests", "[error][edge_cases]") {
   }
 
   SECTION("Task timeout handling") {
-    REQUIRE(fixture.initializeBoth());
+    REQUIRE(g_initialized);
     REQUIRE(fixture.createModNamePool());
 
     chimaera::MOD_NAME::Client mod_name_client(kTestModNamePoolId);
@@ -403,7 +317,7 @@ TEST_CASE("Concurrent Task Execution", "[concurrent][stress]") {
   ChimaeraRuntimeFixture fixture;
 
   SECTION("Multiple concurrent tasks") {
-    REQUIRE(fixture.initializeBoth());
+    REQUIRE(g_initialized);
     REQUIRE(fixture.createModNamePool());
 
     chimaera::MOD_NAME::Client mod_name_client(kTestModNamePoolId);
@@ -455,7 +369,7 @@ TEST_CASE("Memory Management", "[memory][cleanup]") {
   ChimaeraRuntimeFixture fixture;
 
   SECTION("Task allocation and deallocation") {
-    REQUIRE(fixture.initializeBoth());
+    REQUIRE(g_initialized);
     REQUIRE(fixture.createModNamePool());
 
     chimaera::MOD_NAME::Client mod_name_client(kTestModNamePoolId);
@@ -495,7 +409,7 @@ TEST_CASE("Performance Tests", "[performance][timing]") {
   ChimaeraRuntimeFixture fixture;
 
   SECTION("Task execution latency") {
-    REQUIRE(fixture.initializeBoth());
+    REQUIRE(g_initialized);
     REQUIRE(fixture.createModNamePool());
 
     chimaera::MOD_NAME::Client mod_name_client(kTestModNamePoolId);

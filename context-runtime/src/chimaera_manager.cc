@@ -126,7 +126,7 @@ bool Chimaera::ClientInit() {
 }
 
 bool Chimaera::ServerInit() {
-  if (is_runtime_mode_ || runtime_is_initializing_) {
+  if (is_runtime_mode_ || runtime_is_initializing_ || client_is_initializing_) {
     return true;
   }
 
@@ -176,10 +176,6 @@ bool Chimaera::ServerInit() {
     return false;
   }
 
-  is_runtime_mode_ = true;
-  is_initialized_ = true;
-  runtime_is_initializing_ = false;
-
   // Process compose section if present
   const auto &compose_config = config_manager->GetComposeConfig();
   if (!compose_config.pools_.empty()) {
@@ -209,6 +205,12 @@ bool Chimaera::ServerInit() {
     runtime_is_initializing_ = false;
     return false;
   }
+
+
+
+  is_runtime_mode_ = true;
+  is_initialized_ = true;
+  runtime_is_initializing_ = false;
 
   return true;
 }

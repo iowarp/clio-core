@@ -11,6 +11,12 @@
 namespace chi {
 
 bool CHIMAERA_INIT(ChimaeraMode mode, bool default_with_runtime) {
+  // Static guard to prevent double initialization
+  static bool s_initialized = false;
+  if (s_initialized) {
+    return true;  // Already initialized, return success
+  }
+
   auto* chimaera_manager = CHI_CHIMAERA_MANAGER;
 
   // Check environment variable CHIMAERA_WITH_RUNTIME
@@ -51,17 +57,9 @@ bool CHIMAERA_INIT(ChimaeraMode mode, bool default_with_runtime) {
     }
   }
 
+  // Mark as initialized on success
+  s_initialized = true;
   return true;
-}
-
-bool CHIMAERA_CLIENT_INIT() {
-  auto* chimaera_manager = CHI_CHIMAERA_MANAGER;
-  return chimaera_manager->ClientInit();
-}
-
-bool CHIMAERA_RUNTIME_INIT() {
-  auto* chimaera_manager = CHI_CHIMAERA_MANAGER;
-  return chimaera_manager->ServerInit();
 }
 
 }  // namespace chi

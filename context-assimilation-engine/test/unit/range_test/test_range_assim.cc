@@ -122,7 +122,7 @@ int main(int argc, char* argv[]) {
     const char* init_chimaera = std::getenv("INIT_CHIMAERA");
     if (init_chimaera && std::strcmp(init_chimaera, "1") == 0) {
       std::cout << "Initializing Chimaera runtime (INIT_CHIMAERA=1)..." << std::endl;
-      chi::CHIMAERA_RUNTIME_INIT();
+      chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
       std::cout << "Chimaera runtime initialized" << std::endl;
     }
 
@@ -145,6 +145,10 @@ int main(int argc, char* argv[]) {
     // Connect to CTE
     std::cout << "\n[SETUP] Connecting to CTE..." << std::endl;
     wrp_cte::core::WRP_CTE_CLIENT_INIT();
+
+    // Initialize CAE client
+    std::cout << "\n[SETUP] Initializing CAE client..." << std::endl;
+    WRP_CAE_CLIENT_INIT();
 
     // Create CAE pool
     std::cout << "\n[SETUP] Creating CAE pool..." << std::endl;

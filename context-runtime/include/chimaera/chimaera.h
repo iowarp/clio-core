@@ -46,22 +46,6 @@ enum class ChimaeraMode {
  */
 bool CHIMAERA_INIT(ChimaeraMode mode, bool default_with_runtime = false);
 
-/**
- * Initialize Chimaera client components
- * @return true if initialization successful, false otherwise
- * @deprecated Use CHIMAERA_INIT(ChimaeraMode::kClient, false) instead
- */
-bool CHIMAERA_CLIENT_INIT();
-
-/**
- * Initialize Chimaera runtime components
- * @return true if initialization successful, false otherwise
- * @deprecated Use CHIMAERA_INIT(ChimaeraMode::kRuntime, true) instead
- */
-bool CHIMAERA_RUNTIME_INIT();
-
-
-
 }  // namespace chi
 
 #endif  // CHIMAERA_INCLUDE_CHIMAERA_CHIMAERA_H_

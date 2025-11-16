@@ -48,24 +48,16 @@ public:
         std::cout << "Initializing CTE Core system..." << std::endl;
 
         try {
-            // Step 1: Initialize Chimaera runtime
-            std::cout << "1. Initializing Chimaera runtime..." << std::endl;
-            bool runtime_init = chi::CHIMAERA_RUNTIME_INIT();
-            if (!runtime_init) {
-                std::cerr << "Failed to initialize Chimaera runtime" << std::endl;
+            // Step 1: Initialize Chimaera (runtime + client)
+            std::cout << "1. Initializing Chimaera..." << std::endl;
+            bool chimaera_init = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
+            if (!chimaera_init) {
+                std::cerr << "Failed to initialize Chimaera" << std::endl;
                 return false;
             }
 
-            // Step 2: Initialize Chimaera client
-            std::cout << "2. Initializing Chimaera client..." << std::endl;
-            bool client_init = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
-            if (!client_init) {
-                std::cerr << "Failed to initialize Chimaera client" << std::endl;
-                return false;
-            }
-
-            // Step 3: Initialize CTE subsystem
-            std::cout << "3. Initializing CTE subsystem..." << std::endl;
+            // Step 2: Initialize CTE subsystem
+            std::cout << "2. Initializing CTE subsystem..." << std::endl;
             bool cte_init = wrp_cte::core::WRP_CTE_CLIENT_INIT();
             if (!cte_init) {
                 std::cerr << "Failed to initialize CTE subsystem" << std::endl;

@@ -543,60 +543,60 @@ endif()
 
 # Add Catch2 testing framework if tests are enabled
 if(WRP_CORE_ENABLE_TESTS)
-  message(STATUS "Adding Catch2 testing framework")
+  message(STATUS "Adding Catch2 testing framework") 
   add_subdirectory(external/Catch2)
 
-  # Force installation of Catch2 libraries even when used as subproject
-  # This ensures libCatch2d.so and libCatch2Maind.so are installed to /usr/local/lib
-  install(
-    TARGETS
-      Catch2
-      Catch2WithMain
-    EXPORT
-      Catch2Targets
-    LIBRARY DESTINATION
-      ${CMAKE_INSTALL_LIBDIR}
-    ARCHIVE DESTINATION
-      ${CMAKE_INSTALL_LIBDIR}
-    RUNTIME DESTINATION
-      ${CMAKE_INSTALL_BINDIR}
-  )
+#   # Force installation of Catch2 libraries even when used as subproject
+#   # This ensures libCatch2d.so and libCatch2Maind.so are installed to /usr/local/lib
+#   install(
+#     TARGETS
+#       Catch2
+#       Catch2WithMain
+#     EXPORT
+#       Catch2Targets
+#     LIBRARY DESTINATION
+#       ${CMAKE_INSTALL_LIBDIR}
+#     ARCHIVE DESTINATION
+#       ${CMAKE_INSTALL_LIBDIR}
+#     RUNTIME DESTINATION
+#       ${CMAKE_INSTALL_BINDIR}
+#   )
 
-  # Install Catch2 headers
-  install(
-    DIRECTORY
-      "${CMAKE_CURRENT_SOURCE_DIR}/external/Catch2/src/catch2"
-      "${CMAKE_CURRENT_BINARY_DIR}/external/Catch2/generated-includes/catch2"
-    DESTINATION
-      "${CMAKE_INSTALL_INCLUDEDIR}"
-    FILES_MATCHING
-      PATTERN "*.hpp"
-  )
+#   # Install Catch2 headers
+#   install(
+#     DIRECTORY
+#       "${CMAKE_CURRENT_SOURCE_DIR}/external/Catch2/src/catch2"
+#       "${CMAKE_CURRENT_BINARY_DIR}/external/Catch2/generated-includes/catch2"
+#     DESTINATION
+#       "${CMAKE_INSTALL_INCLUDEDIR}"
+#     FILES_MATCHING
+#       PATTERN "*.hpp"
+#   )
 
-  # Install Catch2 CMake config files
-  install(
-    EXPORT
-      Catch2Targets
-    NAMESPACE
-      Catch2::
-    DESTINATION
-      "${CMAKE_INSTALL_LIBDIR}/cmake/Catch2"
-  )
-endif()
+#   # Install Catch2 CMake config files
+#   install(
+#     EXPORT
+#       Catch2Targets
+#     NAMESPACE
+#       Catch2::
+#     DESTINATION
+#       "${CMAKE_INSTALL_LIBDIR}/cmake/Catch2"
+#   )
+# endif()
 
-# cereal header-only library - use installed version if available
-if(NOT TARGET cereal AND NOT TARGET cereal::cereal)
-    message(STATUS "cereal not found via find_package, checking submodule")
-    if(EXISTS "${CMAKE_SOURCE_DIR}/external/cereal/CMakeLists.txt")
-        message(STATUS "Building cereal library from submodule (header-only)")
-        set(JUST_INSTALL_CEREAL ON CACHE BOOL "Just install cereal headers" FORCE)
-        set(BUILD_DOC OFF CACHE BOOL "Disable cereal documentation" FORCE)
-        set(BUILD_SANDBOX OFF CACHE BOOL "Disable cereal sandbox" FORCE)
-        set(SKIP_PERFORMANCE_COMPARISON ON CACHE BOOL "Skip cereal performance comparison" FORCE)
-        add_subdirectory(external/cereal)
-    else()
-        message(FATAL_ERROR "cereal not found. Please install cereal or run install.sh to build from submodules.")
-    endif()
+# # cereal header-only library - use installed version if available
+# if(NOT TARGET cereal AND NOT TARGET cereal::cereal)
+#     message(STATUS "cereal not found via find_package, checking submodule")
+#     if(EXISTS "${CMAKE_SOURCE_DIR}/external/cereal/CMakeLists.txt")
+#         message(STATUS "Building cereal library from submodule (header-only)")
+#         set(JUST_INSTALL_CEREAL ON CACHE BOOL "Just install cereal headers" FORCE)
+#         set(BUILD_DOC OFF CACHE BOOL "Disable cereal documentation" FORCE)
+#         set(BUILD_SANDBOX OFF CACHE BOOL "Disable cereal sandbox" FORCE)
+#         set(SKIP_PERFORMANCE_COMPARISON ON CACHE BOOL "Skip cereal performance comparison" FORCE)
+#         add_subdirectory(external/cereal)
+#     else()
+#         message(FATAL_ERROR "cereal not found. Please install cereal or run install.sh to build from submodules.")
+#     endif()
 else()
     message(STATUS "Using installed cereal")
 endif()

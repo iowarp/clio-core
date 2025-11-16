@@ -36,28 +36,20 @@ public:
         std::cout << "Initializing CAE Core system..." << std::endl;
 
         try {
-            // Step 1: Initialize Chimaera runtime
-            std::cout << "1. Initializing Chimaera runtime..." << std::endl;
-            bool runtime_init = chi::CHIMAERA_RUNTIME_INIT();
-            if (!runtime_init) {
-                std::cerr << "Failed to initialize Chimaera runtime" << std::endl;
+            // Step 1: Initialize Chimaera (runtime + client)
+            std::cout << "1. Initializing Chimaera..." << std::endl;
+            bool chimaera_init = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
+            if (!chimaera_init) {
+                std::cerr << "Failed to initialize Chimaera" << std::endl;
                 return false;
             }
 
-            // Step 2: Initialize Chimaera client
-            std::cout << "2. Initializing Chimaera client..." << std::endl;
-            bool client_init = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
-            if (!client_init) {
-                std::cerr << "Failed to initialize Chimaera client" << std::endl;
-                return false;
-            }
-
-            // Step 3: Create CAE client instance
-            std::cout << "3. Creating CAE client instance..." << std::endl;
+            // Step 2: Create CAE client instance
+            std::cout << "2. Creating CAE client instance..." << std::endl;
             cae_client_ = std::make_unique<wrp_cae::core::Client>();
 
-            // Step 4: Create CAE container
-            std::cout << "4. Creating CAE container..." << std::endl;
+            // Step 3: Create CAE container
+            std::cout << "3. Creating CAE container..." << std::endl;
             wrp_cae::core::CreateParams create_params;
 
             try {
