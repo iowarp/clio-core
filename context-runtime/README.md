@@ -117,9 +117,9 @@ Create a simple application using the bdev ChiMod:
 #include <chimaera/admin/admin_client.h>
 
 int main() {
-  // Initialize Chimaera client
-  chi::CHIMAERA_CLIENT_INIT();
-  
+  // Initialize Chimaera (client mode with embedded runtime)
+  chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
+
   // Create admin client (always required)
   chimaera::admin::Client admin_client(chi::PoolId(7000, 0));
   admin_client.Create(HSHM_MCTX, chi::PoolQuery::Local());
@@ -190,16 +190,22 @@ make
 
 Chimaera applications can run in two modes:
 
-**Client Mode** (Most Common):
+**Client Mode with Embedded Runtime** (Most Common):
 ```cpp
-// Initialize as client - connects to existing runtime
-chi::CHIMAERA_CLIENT_INIT();
+// Initialize as client with embedded runtime - starts runtime and connects client
+chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
 ```
 
-**Runtime Mode** (Advanced):
+**Client-Only Mode** (Advanced - requires external runtime):
 ```cpp
-// Initialize as runtime - starts embedded runtime process
-chi::CHIMAERA_RUNTIME_INIT();
+// Initialize as client only - connects to existing external runtime
+chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, false);
+```
+
+**Runtime/Server Mode** (Advanced - embedded applications):
+```cpp
+// Initialize as runtime/server - starts runtime only (no client)
+chi::CHIMAERA_INIT(chi::ChimaeraMode::kServer, false);
 ```
 
 ## ChiMod Development

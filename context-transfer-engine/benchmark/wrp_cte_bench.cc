@@ -127,21 +127,6 @@ double CalcBandwidth(chi::u64 total_bytes, double milliseconds) {
   return megabytes / seconds;
 }
 
-/**
- * Helper function to check if runtime should be initialized
- * Reads CTE_INIT_RUNTIME environment variable
- * Returns true if unset or set to any value except "0", "false", "no", "off"
- */
-bool ShouldInitializeRuntime() {
-  const char *env_val = std::getenv("CTE_INIT_RUNTIME");
-  if (env_val == nullptr) {
-    return false; // Default for benchmark: assume runtime already initialized
-  }
-  std::string val(env_val);
-  // Convert to lowercase for case-insensitive comparison
-  std::transform(val.begin(), val.end(), val.begin(), ::tolower);
-  return !(val == "0" || val == "false" || val == "no" || val == "off");
-}
 
 } // namespace
 
@@ -424,77 +409,44 @@ int main(int argc, char **argv) {
                 << std::endl;
       std::cerr << std::endl;
       std::cerr << "Environment variables:" << std::endl;
-      std::cerr << "  CTE_INIT_RUNTIME: Set to '1', 'true', 'yes', or 'on' to "
+      std::cerr << "  CHIMAERA_WITH_RUNTIME: Set to '1', 'true', 'yes', or 'on' to "
                    "initialize runtime"
                 << std::endl;
       std::cerr
-          << "                    Default: assumes runtime already initialized"
+          << "                         Default: assumes runtime already initialized"
           << std::endl;
     }
     MPI_Finalize();
     return 1;
   }
 
-  // Initialize Chimaera client and optionally runtime
-  bool should_init_runtime = ShouldInitializeRuntime();
+  // Initialize Chimaera runtime and client
+  if (rank == 0) {
+    std::cout << "Initializing Chimaera runtime..." << std::endl;
+  }
 
-  if (should_init_runtime) {
+  // Initialize Chimaera (client with embedded runtime)
+  if (!chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true)) {
     if (rank == 0) {
-      std::cout << "Initializing Chimaera runtime (CTE_INIT_RUNTIME="
-                << std::getenv("CTE_INIT_RUNTIME") << ")..." << std::endl;
+      std::cerr << "Error: Failed to initialize Chimaera runtime" << std::endl;
     }
+    MPI_Finalize();
+    return 1;
+  }
 
-    // Initialize runtime
-    if (!chi::CHIMAERA_RUNTIME_INIT()) {
-      if (rank == 0) {
-        std::cerr << "Error: Failed to initialize Chimaera runtime"
-                  << std::endl;
-      }
-      MPI_Finalize();
-      return 1;
-    }
+  std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
-
-    // Initialize CTE client
-    if (!wrp_cte::core::WRP_CTE_CLIENT_INIT()) {
-      if (rank == 0) {
-        std::cerr << "Error: Failed to initialize CTE client" << std::endl;
-      }
-      MPI_Finalize();
-      return 1;
-    }
-
+  // Initialize CTE client
+  if (!wrp_cte::core::WRP_CTE_CLIENT_INIT()) {
     if (rank == 0) {
-      std::cout << "Runtime and client initialized successfully" << std::endl;
+      std::cerr << "Error: Failed to initialize CTE client" << std::endl;
     }
-  } else {
-    if (rank == 0) {
-      std::cout
-          << "Initializing CTE client only (runtime assumed initialized)..."
-          << std::endl;
-    }
+    MPI_Finalize();
+    return 1;
+  }
 
-    // Initialize client only
-    if (!chi::CHIMAERA_CLIENT_INIT()) {
-      if (rank == 0) {
-        std::cerr << "Error: Failed to initialize Chimaera client" << std::endl;
-      }
-      MPI_Finalize();
-      return 1;
-    }
-
-    if (!wrp_cte::core::WRP_CTE_CLIENT_INIT()) {
-      if (rank == 0) {
-        std::cerr << "Error: Failed to initialize CTE client" << std::endl;
-      }
-      MPI_Finalize();
-      return 1;
-    }
-
-    if (rank == 0) {
-      std::cout << "Client initialized successfully" << std::endl;
-    }
+  if (rank == 0) {
+    std::cout << "Runtime and client initialized successfully" << std::endl;
   }
 
   // Small delay to ensure all ranks are synchronized

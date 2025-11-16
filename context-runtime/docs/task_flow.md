@@ -118,7 +118,7 @@ Tasks progress through seven distinct stages in their lifecycle:
 **Location**: `util/chimaera_start_runtime.cc:120-158`
 
 **Process**:
-1. Main function calls `chi::CHIMAERA_RUNTIME_INIT()`
+1. Main function calls `chi::CHIMAERA_INIT(chi::ChimaeraMode::kServer, false)`
 2. Chimaera manager initializes in server mode (`src/chimaera_manager.cc:54-93`)
 3. Initialization sequence:
    - ConfigManager loads configuration

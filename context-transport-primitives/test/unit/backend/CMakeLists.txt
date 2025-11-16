@@ -19,11 +19,11 @@ if (HSHM_ENABLE_MPI)
     # Test Cases
     #------------------------------------------------------------------------------
 
-    add_test(NAME test_memory_slots COMMAND
+    add_test(NAME ctp_memory_slots COMMAND
             mpirun -n 2 ${CMAKE_BINARY_DIR}/bin/test_backend_exec "MemorySlot")
-    add_test(NAME test_reserve COMMAND
+    add_test(NAME ctp_reserve COMMAND
             ${CMAKE_BINARY_DIR}/bin/test_backend_exec "BackendReserve")
-    add_test(NAME test_memory_manager COMMAND
+    add_test(NAME ctp_memory_manager COMMAND
             mpirun -n 2 ${CMAKE_BINARY_DIR}/bin/test_backend_exec "MemoryManager")
 
     #------------------------------------------------------------------------------

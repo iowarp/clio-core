@@ -118,7 +118,7 @@ bdev_client.Create(HSHM_MCTX, pool_query, "/dev/nvme0n1", pool_id, BdevType::kFi
 
 *File-based storage:*
 ```cpp
-chi::CHIMAERA_CLIENT_INIT();
+chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
 const chi::PoolId pool_id = chi::PoolId(8000, 0);
 chimaera::bdev::Client bdev_client(pool_id);
 
@@ -489,8 +489,8 @@ struct CreateParams {
 
 int main() {
   try {
-    // Initialize Chimaera client
-    chi::CHIMAERA_CLIENT_INIT();
+    // Initialize Chimaera (client mode with embedded runtime)
+    chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
     
     // Create admin client first (always required)
     const chi::PoolId admin_pool_id = chi::kAdminPoolId;
@@ -583,8 +583,8 @@ int main() {
 
 int main() {
   try {
-    // Initialize Chimaera client
-    chi::CHIMAERA_CLIENT_INIT();
+    // Initialize Chimaera (client mode with embedded runtime)
+    chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
     
     // Create admin client first (always required)
     const chi::PoolId admin_pool_id = chi::kAdminPoolId;

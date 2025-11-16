@@ -26,7 +26,7 @@ int main(int argc, char** argv) {
   std::string config_path = argv[1];
 
   // Initialize Chimaera client
-  if (!chi::CHIMAERA_CLIENT_INIT()) {
+  if (!chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, false)) {
     std::cerr << "Failed to initialize Chimaera client\n";
     return 1;
   }

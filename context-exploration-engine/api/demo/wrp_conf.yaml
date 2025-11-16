@@ -1,11 +1,12 @@
+---
 # WRP Configuration Example
 # Demonstrates how to configure Chimaera runtime with CTE and CAE ChiMods
 # This configuration combines runtime settings with declarative pool creation
 
 # Worker thread configuration
 workers:
-  sched_threads: 8
-  slow_threads: 8
+  sched_threads: 1
+  slow_threads: 0
 
 # Memory segment configuration
 memory:
@@ -40,6 +41,14 @@ compose:
     pool_name: cte_main
     pool_query: local
     pool_id: "512.0"
+
+    storage:
+      # RAM-based cache storage (use ram:: prefix)
+      - path: "ram::cte_cache"
+        bdev_type: "ram"
+        capacity_limit: "512MB"
+        score: 1.0           # Manual score override - fastest tier
+
   # CAE Core ChiMod for data assimilation
   # Pool ID: 400.0 (defined in wrp_cae/core/constants.h as kCaePoolId)
   # Pool name: "cae_main" (user-defined)

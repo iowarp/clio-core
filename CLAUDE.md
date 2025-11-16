@@ -7,6 +7,9 @@ This repository contains the unified IOWarp Core framework, integrating multiple
 - **context-assimilation-engine**: Context assimilation engine
 - **context-exploration-engine**: Context exploration engine
 
+NEVER BUILD OUTSIDE OF THE BUILD DIRECTORY. DO NOT PLACE BUILD FILES IN SOURCE DIRECTORIES.
+NEVER EVER EVER.
+
 ## Code Style
 
 Use the Google C++ style guide for C++.
@@ -55,6 +58,10 @@ cmake --preset=debug -DWRP_CORE_ENABLE_CTE=ON -DWRP_CORE_ENABLE_CAE=OFF
 - Use find_package() for all dependencies
 - Follow ChiMod build patterns from MODULE_DEVELOPMENT_GUIDE.md
 - All compilation warnings have been resolved as of the current state
+
+### HSHM Usage
+
+Always use HSHM_MCTX macro unless we are writing GPU code, which necessitates a specific mctx to be created.
 
 ### ChiMod Build Patterns
 
@@ -410,6 +417,89 @@ ASSERT_EQ(create_task->GetReturnCode(), 0) << "Create task failed with return co
 ```
 
 This requirement applies to ALL ChiMod Create operations in unit tests including admin, bdev, and any custom ChiMods.
+
+### Test Framework Requirements
+
+**CRITICAL**: Unit tests that initialize the Chimaera runtime MUST use the `simple_test.h` framework. **DO NOT use Catch2** with Chimaera runtime initialization.
+
+**Catch2 Incompatibility:**
+- Catch2's test framework causes segmentation faults when used with Chimaera runtime initialization
+- This issue was confirmed by copying working test code from `test_bdev_chimod.cc` (which uses simple_test.h) to a Catch2-based test - the identical code segfaulted with Catch2 but worked with simple_test.h
+- Root cause: Catch2's test runner infrastructure conflicts with Chimaera's runtime initialization
+
+**Required Test Framework:**
+- Use `#include "../../../context-runtime/test/simple_test.h"` instead of Catch2
+- Available macros: `TEST_CASE`, `SECTION`, `REQUIRE`, `REQUIRE_FALSE`, `REQUIRE_NOTHROW`, `INFO`, `FAIL`
+- Use `SIMPLE_TEST_MAIN()` at the end of your test file
+- Note: simple_test.h does NOT provide `CHECK` macro - use `REQUIRE` instead
+
+**Example simple_test.h Test:**
+```cpp
+#include "../../../context-runtime/test/simple_test.h"
+
+TEST_CASE("My Test", "[mytag]") {
+  // Test code here
+  REQUIRE(some_condition);
+}
+
+SIMPLE_TEST_MAIN()
+```
+
+### Chimaera Initialization in Unit Tests
+
+**CRITICAL**: All unit tests MUST use the unified `CHIMAERA_INIT()` function. Do NOT use deprecated initialization functions or direct calls to `CHIMAERA_RUNTIME_INIT()` or `CHIMAERA_CLIENT_INIT()`.
+
+**Required Pattern for All Unit Tests:**
+```cpp
+// At the beginning of your test or test fixture setup
+bool success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
+REQUIRE(success);
+
+// Optional: Wait for initialization to complete
+std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+// Verify core managers are available
+REQUIRE(CHI_IPC != nullptr);
+REQUIRE(CHI_IPC->IsInitialized());
+```
+
+**Initialization Parameters:**
+- **Mode**: Always use `chi::ChimaeraMode::kClient` for unit tests
+- **default_with_runtime**: Always use `true` for unit tests (starts runtime automatically)
+- **Environment Variable**: `CHIMAERA_WITH_RUNTIME` is handled automatically by `CHIMAERA_INIT()`
+  - If set to `1`: Runtime will be started
+  - If set to `0`: Only client initialization (useful for external runtime scenarios)
+  - If not set: Uses the `default_with_runtime` parameter value
+
+**DEPRECATED - Do NOT Use:**
+- `initializeBoth()` - Remove from all test fixtures
+- `initializeRuntime()` - Remove from all test fixtures
+- `initializeClient()` - Remove from all test fixtures
+- `chi::CHIMAERA_RUNTIME_INIT()` - Do not call directly in tests
+- `chi::CHIMAERA_CLIENT_INIT()` - Do not call directly in tests
+
+**Example Test Fixture:**
+```cpp
+class MyTestFixture {
+public:
+  MyTestFixture() {
+    // Initialize Chimaera with client mode and runtime
+    bool success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
+    REQUIRE(success);
+
+    // Give runtime time to initialize
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+    // Verify initialization
+    REQUIRE(CHI_IPC != nullptr);
+    REQUIRE(CHI_POOL_MANAGER != nullptr);
+  }
+
+  ~MyTestFixture() {
+    // Cleanup handled automatically
+  }
+};
+```
 
 ## Device Configuration
 

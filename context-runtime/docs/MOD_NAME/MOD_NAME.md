@@ -72,7 +72,7 @@ void Create(const hipc::MemContext& mctx, const chi::PoolQuery& pool_query)
 
 **Usage:**
 ```cpp
-chi::CHIMAERA_CLIENT_INIT();
+chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
 const chi::PoolId pool_id = chi::PoolId(9000, 0);
 chimaera::MOD_NAME::Client mod_client(pool_id);
 
@@ -316,7 +316,7 @@ struct CreateParams {
 int main() {
   try {
     // Initialize Chimaera client
-    chi::CHIMAERA_CLIENT_INIT();
+    chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
     
     // Create admin client first (always required)
     const chi::PoolId admin_pool_id = chi::PoolId(7000, 0);

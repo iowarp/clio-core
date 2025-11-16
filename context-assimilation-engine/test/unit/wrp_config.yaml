@@ -1,24 +1,70 @@
-# Content Transfer Engine (CTE) Configuration File
-# RAM-only storage configuration for benchmark testing
+# WRP Configuration Example
+# Demonstrates how to configure Chimaera runtime with CTE and CAE ChiMods
+# This configuration combines runtime settings with declarative pool creation
 
-# Target management settings
-targets:
-  neighborhood: 1  # Single-node configuration
-  default_target_timeout_ms: 30000
-  poll_period_ms: 5000  # Period to rescan targets for statistics (capacity, bandwidth, etc.)
+# Worker thread configuration
+workers:
+  sched_threads: 1
+  slow_threads: 0
 
-# Storage block device configuration
-# RAM-only configuration for benchmark testing
-storage:
-  # Primary RAM storage
-  - path: "ram::cte_ram_tier1"
-    bdev_type: "ram"
-    capacity_limit: "16GB"
-    score: 0.0           # Manual score override (0.0-1.0) - highest tier
+# Memory segment configuration
+memory:
+  main_segment_size: 4GB
+  client_data_segment_size: 2GB
+  runtime_data_segment_size: 2GB
 
-# Data Placement Engine configuration
-dpe:
-  dpe_type: "max_bw"  # Options: "random", "round_robin", "max_bw"
+# Network configuration
+networking:
+  port: 5555
+  neighborhood_size: 1
 
-# Note: This configuration uses only RAM-based storage for maximum performance
-# benchmarking. All data is stored in memory with no persistent storage.
+# Logging configuration
+logging:
+  level: info
+  file: /tmp/chimaera.log
+
+# Runtime configuration
+runtime:
+  stack_size: 65536
+  queue_depth: 10000
+  lane_map_policy: round_robin
+  heartbeat_interval: 1000
+
+# Compose section - declarative pool creation
+# Creates CTE and CAE ChiMods with their respective configurations
+compose:
+  # CTE Core ChiMod with storage configuration
+  # Pool ID: 512.0 (defined in wrp_cte/core/constants.h)
+  # Pool name: "cte_main" (user-defined)
+  - mod_name: wrp_cte_core
+    pool_name: cte_main
+    pool_query: local
+    pool_id: "512.0"
+
+    targets:
+      neighborhood: 1  # Single-node configuration
+      default_target_timeout_ms: 30000
+      poll_period_ms: 5000  # Period to rescan targets for statistics (capacity, bandwidth, etc.)
+
+    # Storage block device configuration
+    # RAM-only configuration for benchmark testing
+    storage:
+      # Primary RAM storage
+      - path: "ram::cte_ram_tier1"
+        bdev_type: "ram"
+        capacity_limit: "16GB"
+        score: 0.0           # Manual score override (0.0-1.0) - highest tier
+
+    # Data Placement Engine configuration
+    dpe:
+      dpe_type: "max_bw"  # Options: "random", "round_robin", "max_bw"
+
+
+  # CAE Core ChiMod for data assimilation
+  # Pool ID: 400.0 (defined in wrp_cae/core/constants.h as kCaePoolId)
+  # Pool name: "cae_main" (user-defined)
+  - mod_name: wrp_cae_core
+    pool_name: cae_main
+    pool_query: local
+    pool_id: "400.0"
+  

@@ -22,7 +22,7 @@ services:
       - SECTION_FILTER=${SECTION_FILTER:-}
       - WRP_RUNTIME_CONF=/etc/iowarp/wrp_config.yaml
       - CTE_NUM_NODES=4
-      - CTE_INIT_RUNTIME=0
+      - CHIMAERA_WITH_RUNTIME=0
     shm_size: '16gb'
     mem_limit: 16g
     entrypoint: [ "/bin/bash", "-c" ]

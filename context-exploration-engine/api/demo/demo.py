@@ -121,7 +121,12 @@ def demo_context_retrieve(ctx_interface, tag_name):
 
         # Show a preview of the data
         if total_bytes > 0:
-            preview = packed_data[0][:100].decode('utf-8', errors='replace')
+            # Handle both bytes and string types
+            first_data = packed_data[0][:100]
+            if isinstance(first_data, bytes):
+                preview = first_data.decode('utf-8', errors='replace')
+            else:
+                preview = first_data
             print(f"  Preview: {preview}...")
     else:
         print("No data retrieved")

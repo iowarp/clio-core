@@ -4,6 +4,7 @@ FROM iowarp/iowarp-deps:latest
 USER root
 
 # Install Docker CLI and Docker-in-Docker dependencies
+# Also install network diagnostic tools (netstat, lsof, ss, etc.)
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     curl \
@@ -11,6 +12,9 @@ RUN apt-get update && apt-get install -y \
     lsb-release \
     iptables \
     supervisor \
+    net-tools \
+    lsof \
+    iproute2 \
     && rm -rf /var/lib/apt/lists/*
 
 # Add Docker's official GPG key and repository

@@ -135,13 +135,13 @@ class WrpCteBench(Application):
         self.setenv('CTE_BENCH_IO_SIZE', str(self.config['io_size']))
         self.setenv('CTE_BENCH_IO_COUNT', str(self.config['io_count']))
 
-        # Set CTE_INIT_RUNTIME environment variable based on configuration
+        # Set CHIMAERA_WITH_RUNTIME environment variable based on configuration
         if self.config['init_runtime']:
-            self.setenv('CTE_INIT_RUNTIME', '1')
-            self.log("Runtime initialization enabled (CTE_INIT_RUNTIME=1)")
+            self.setenv('CHIMAERA_WITH_RUNTIME', '1')
+            self.log("Runtime initialization enabled (CHIMAERA_WITH_RUNTIME=1)")
         else:
-            self.setenv('CTE_INIT_RUNTIME', '0')
-            self.log("Runtime initialization disabled (CTE_INIT_RUNTIME=0)")
+            self.setenv('CHIMAERA_WITH_RUNTIME', '0')
+            self.log("Runtime initialization disabled (CHIMAERA_WITH_RUNTIME=0)")
 
         self.log("CTE benchmark configuration completed successfully")
 

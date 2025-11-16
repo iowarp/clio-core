@@ -68,7 +68,7 @@ void Create(const hipc::MemContext& mctx, const chi::PoolQuery& pool_query,
 
 **Usage:**
 ```cpp
-chi::CHIMAERA_CLIENT_INIT();
+chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
 const chi::PoolId pool_id = chi::kAdminPoolId;  // Use predefined admin pool ID
 chimaera::admin::Client admin_client(pool_id);
 
@@ -329,13 +329,13 @@ struct CreateParams {
 #include <chimaera/admin/admin_client.h>
 
 int main() {
-  // Initialize Chimaera client
-  chi::CHIMAERA_CLIENT_INIT();
-  
+  // Initialize Chimaera (client mode with embedded runtime)
+  chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
+
   // Create admin client with proper admin pool ID
   const chi::PoolId pool_id = chi::kAdminPoolId;
   chimaera::admin::Client admin_client(pool_id);
-  
+
   // Create admin container (pool name MUST be "admin")
   auto pool_query = chi::PoolQuery::Local();
   admin_client.Create(HSHM_MCTX, pool_query, "admin");

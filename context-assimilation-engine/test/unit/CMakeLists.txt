@@ -79,7 +79,7 @@ function(add_cae_unit_test TEST_NAME TEST_SOURCE)
 
   # Set test environment variables
   set_tests_properties(${TEST_NAME} PROPERTIES
-    ENVIRONMENT "INIT_CHIMAERA=1;WRP_CTE_CONF=${CMAKE_CURRENT_SOURCE_DIR}/wrp_config.yaml"
+    ENVIRONMENT "CHIMAERA_WITH_RUNTIME=1;CHI_SERVER_CONF=/workspace/context-assimilation-engine/test/unit/wrp_config.yaml"
     TIMEOUT 300  # 5 minute timeout
   )
 endfunction()
@@ -93,7 +93,7 @@ endfunction()
 # - Calls ParseOmni to transfer to CTE
 # - Validates data integrity in CTE
 #------------------------------------------------------------------------------
-add_cae_unit_test(test_binary_assim
+add_cae_unit_test(cae_binary_assim
   ${CMAKE_CURRENT_SOURCE_DIR}/binary_assim/test_binary_assim.cc
 )
 
@@ -111,13 +111,13 @@ install(FILES
 # - Transfers specific byte ranges
 # - Validates correct data and size in CTE
 #------------------------------------------------------------------------------
-add_cae_unit_test(test_range_assim
+add_cae_unit_test(cae_range_assim
   ${CMAKE_CURRENT_SOURCE_DIR}/range_test/test_range_assim.cc
 )
 
 # Set smaller file size for range test to speed up CI
-set_tests_properties(test_range_assim PROPERTIES
-  ENVIRONMENT "INIT_CHIMAERA=1;WRP_CTE_CONF=${CMAKE_CURRENT_SOURCE_DIR}/wrp_config.yaml;TEST_FILE_SIZE=10"  # 10MB instead of default
+set_tests_properties(cae_range_assim PROPERTIES
+  ENVIRONMENT "CHIMAERA_WITH_RUNTIME=1;CHI_SERVER_CONF=/workspace/context-assimilation-engine/test/unit/wrp_config.yaml;TEST_FILE_SIZE=10"  # 10MB instead of default
 )
 
 #------------------------------------------------------------------------------
@@ -129,7 +129,7 @@ set_tests_properties(test_range_assim PROPERTIES
 # - Missing required fields
 # - Malformed URIs
 #------------------------------------------------------------------------------
-add_cae_unit_test(test_error_handling
+add_cae_unit_test(cae_error_handling
   ${CMAKE_CURRENT_SOURCE_DIR}/error_test/test_error_handling.cc
 )
 
@@ -144,14 +144,14 @@ add_cae_unit_test(test_error_handling
 # Note: Requires WRP_CORE_ENABLE_HDF5=ON
 #------------------------------------------------------------------------------
 if(HDF5_ENABLED)
-  add_cae_unit_test(test_hdf5_assim
+  add_cae_unit_test(cae_hdf5_assim
     ${CMAKE_CURRENT_SOURCE_DIR}/hdf5_assim/test_hdf5_assim.cc
     EXTRA_LIBS ${HDF5_LIBRARIES}
     EXTRA_INCLUDES ${HDF5_INCLUDE_DIRS}
   )
 
   # Set test labels
-  set_tests_properties(test_hdf5_assim PROPERTIES LABELS "format;hdf5")
+  set_tests_properties(cae_hdf5_assim PROPERTIES LABELS "format;hdf5")
 endif()
 
 #------------------------------------------------------------------------------
@@ -167,9 +167,9 @@ endif()
 #------------------------------------------------------------------------------
 
 # Create test labels for selective execution
-set_tests_properties(test_binary_assim PROPERTIES LABELS "core;basic")
-set_tests_properties(test_range_assim PROPERTIES LABELS "core;advanced")
-set_tests_properties(test_error_handling PROPERTIES LABELS "core;validation")
+set_tests_properties(cae_binary_assim PROPERTIES LABELS "core;basic")
+set_tests_properties(cae_range_assim PROPERTIES LABELS "core;advanced")
+set_tests_properties(cae_error_handling PROPERTIES LABELS "core;validation")
 
 #------------------------------------------------------------------------------
 # Test Summary Target

@@ -16,19 +16,19 @@ target_link_libraries(test_solvers_exec
 # ------------------------------------------------------------------------------
 
 # Nonlinear Least Squares tests
-add_test(NAME test_NonlinearLeastSquares_QuadraticFitting COMMAND
+add_test(NAME ctp_NonlinearLeastSquares_QuadraticFitting COMMAND
         ${CMAKE_BINARY_DIR}/bin/test_solvers_exec "NonlinearLeastSquares_QuadraticFitting")
 
-add_test(NAME test_NonlinearLeastSquares_ExponentialFitting COMMAND
+add_test(NAME ctp_NonlinearLeastSquares_ExponentialFitting COMMAND
         ${CMAKE_BINARY_DIR}/bin/test_solvers_exec "NonlinearLeastSquares_ExponentialFitting")
 
-add_test(NAME test_NonlinearLeastSquares_EmptyParameters COMMAND
+add_test(NAME ctp_NonlinearLeastSquares_EmptyParameters COMMAND
         ${CMAKE_BINARY_DIR}/bin/test_solvers_exec "NonlinearLeastSquares_EmptyParameters")
 
-add_test(NAME test_NonlinearLeastSquares_ParameterAccess COMMAND
+add_test(NAME ctp_NonlinearLeastSquares_ParameterAccess COMMAND
         ${CMAKE_BINARY_DIR}/bin/test_solvers_exec "NonlinearLeastSquares_ParameterAccess")
 
-add_test(NAME test_NonlinearLeastSquares_LinearCase COMMAND
+add_test(NAME ctp_NonlinearLeastSquares_LinearCase COMMAND
         ${CMAKE_BINARY_DIR}/bin/test_solvers_exec "NonlinearLeastSquares_LinearCase")
 
 # ------------------------------------------------------------------------------

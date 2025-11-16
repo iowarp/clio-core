@@ -64,9 +64,9 @@ bool initializeRuntime() {
 
   INFO("Initializing Chimaera runtime...");
 
-  // Initialize Chimaera runtime first
-  if (!chi::CHIMAERA_RUNTIME_INIT()) {
-    INFO("Chimaera runtime initialization failed - continuing without CTE "
+  // Initialize Chimaera first
+  if (!chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true)) {
+    INFO("Chimaera initialization failed - continuing without CTE "
          "tracking");
     initialized = true;
     return true; // Continue test without CTE, POSIX still works

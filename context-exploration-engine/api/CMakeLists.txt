@@ -51,6 +51,9 @@ if(WRP_CORE_ENABLE_PYTHON)
     # Find Python for nanobind
     find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
 
+    # Print Python installation path
+    message(STATUS "Python_SITEARCH: ${Python_SITEARCH}")
+
     # Create Python module
     nanobind_add_module(wrp_cee
       src/python_bindings.cc

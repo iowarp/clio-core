@@ -25,7 +25,7 @@ set(MP_ALLOCATORS
         StackAllocator
         ScalablePageAllocator)
 foreach(ALLOCATOR ${MP_ALLOCATORS})
-    add_test(NAME test_${ALLOCATOR}_mpi COMMAND
+    add_test(NAME ctp_${ALLOCATOR}_mpi COMMAND
             mpirun -n 4 ${CMAKE_BINARY_DIR}/bin/test_allocator_mpi_exec "${ALLOCATOR}Mpi")
 endforeach()
 

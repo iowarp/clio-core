@@ -134,7 +134,7 @@ Make a default configuration in the config directory. Turn this config into a C+
 
 ### Initialization
 
-Create a new class called Chimaera with methods ClientInit and ServerInit in include/chimaera/chimaera.h. Make a singleton using hshm for this class. Implement the following methods in the created source file: CHIMAERA_CLIENT_INIT and CHIMAERA_RUNTIME_INIT, which both call the singletons.
+Create a new class called Chimaera with methods for unified initialization in include/chimaera/chimaera.h. Make a singleton using hshm for this class. Implement the CHIMAERA_INIT method in the created source file, which takes a ChimaeraMode enum (kClient, kServer/kRuntime) and an optional boolean for starting an embedded runtime.
 
 ### Configuration Manager
 Make a singleton using hshm for this class. The configuration manager is responsible for parsing the chimaera server YAML file. A singleton should be made so that subsequent classes can access the config data. This class should inherit from the BaseConfig from hshm.

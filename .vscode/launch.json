@@ -82,6 +82,91 @@
                 }
             ],
             "preLaunchTask": "cmake-build-debug"
+        },
+        {
+            "name": "C++: CEE Demo",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "/usr/bin/python3",
+            "args": [
+                "${workspaceFolder}/context-exploration-engine/api/demo/demo.py"
+            ],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}/context-exploration-engine/api/demo",
+            "environment": [
+                {
+                    "name": "PYTHONPATH",
+                    "value": "${workspaceFolder}/build/bin"
+                },
+                {
+                    "name": "CHIMAERA_WITH_RUNTIME",
+                    "value": "1"
+                },
+                {
+                    "name": "CHI_SERVER_CONF",
+                    "value": "/workspace/context-exploration-engine/api/demo/wrp_conf.yaml"
+                }
+            ],
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                }
+            ]
+        },
+        {
+            "name": "Debug CTE Query Blob Extension Test",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/bin/test_query",
+            "args": [
+                "[query][blobquery][extension]"
+            ],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}/build/context-transfer-engine/test/unit",
+            "environment": [],
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                }
+            ],
+            "preLaunchTask": "cmake-build-debug"
+        },
+        {
+            "name": "Debug cae_binary_assim test",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/bin/cae_binary_assim",
+            "args": [],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}/build",
+            "environment": [
+                {
+                    "name": "CHIMAERA_WITH_RUNTIME",
+                    "value": "1"
+                },
+                {
+                    "name": "CHI_SERVER_CONF",
+                    "value": "/workspace/context-assimilation-engine/test/unit/wrp_config.yaml"
+                }
+            ],
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                }
+            ],
+            "preLaunchTask": "cmake-build-debug"
         }
     ]
 }

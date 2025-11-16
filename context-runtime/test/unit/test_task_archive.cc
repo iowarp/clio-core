@@ -753,7 +753,7 @@ int main(int argc, char *argv[]) {
   (void)argv;
 
   // Initialize Chimaera runtime for memory management
-  bool runtime_success = chi::CHIMAERA_RUNTIME_INIT();
+  bool runtime_success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
   if (!runtime_success) {
     std::cerr << "Failed to initialize Chimaera runtime" << std::endl;
     return 1;

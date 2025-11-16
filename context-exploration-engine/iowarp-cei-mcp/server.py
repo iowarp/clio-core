@@ -153,29 +153,19 @@ def _initialize_runtime() -> bool:
             # Get config path
             config_path = os.getenv("CHI_SERVER_CONF", "")
             
-            # Step 1: Initialize Chimaera runtime
-            runtime_result = False
-            if hasattr(cte, 'chimaera_runtime_init'):
+            # Step 1: Initialize Chimaera (unified init)
+            chimaera_result = False
+            if hasattr(cte, 'chimaera_init') and hasattr(cte, 'ChimaeraMode'):
                 try:
-                    runtime_result = cte.chimaera_runtime_init()
-                    if runtime_result:
-                        time.sleep(0.5)  # Give runtime time to initialize (500ms as per tests)
+                    chimaera_result = cte.chimaera_init(cte.ChimaeraMode.kClient, True)
+                    if chimaera_result:
+                        time.sleep(0.5)  # Give Chimaera time to initialize (500ms as per tests)
                 except Exception:
                     pass  # May fail in some environments
-            
-            # Step 2: Initialize Chimaera client (only if runtime succeeded)
-            client_result = False
-            if runtime_result and hasattr(cte, 'chimaera_client_init'):
-                try:
-                    client_result = cte.chimaera_client_init()
-                    if client_result:
-                        time.sleep(0.2)  # Give client time to connect (200ms as per tests)
-                except Exception:
-                    pass  # May fail in some environments
-            
-            # Step 3: Initialize CTE subsystem (only if client succeeded)
+
+            # Step 2: Initialize CTE subsystem (only if Chimaera succeeded)
             cte_result = False
-            if client_result and hasattr(cte, 'initialize_cte') and hasattr(cte, 'PoolQuery'):
+            if chimaera_result and hasattr(cte, 'initialize_cte') and hasattr(cte, 'PoolQuery'):
                 try:
                     pool_query = cte.PoolQuery.Dynamic()
                     cte_result = cte.initialize_cte(config_path, pool_query)
@@ -587,9 +577,8 @@ def initialize_cte_runtime() -> str:
     This function follows the initialization pattern from test_bindings.py:
     1. Setup environment paths (CHI_REPO_PATH, LD_LIBRARY_PATH)
     2. Use CHI_SERVER_CONF if available, otherwise try empty config
-    3. Initialize Chimaera runtime (chimaera_runtime_init) - wait 500ms
-    4. Initialize Chimaera client (chimaera_client_init) - wait 200ms
-    5. Initialize CTE subsystem (initialize_cte with config_path)
+    3. Initialize Chimaera (chimaera_init with kClient mode, True) - wait 500ms
+    4. Initialize CTE subsystem (initialize_cte with config_path)
     
     Returns:
         JSON with initialization status and detailed results
@@ -732,29 +721,32 @@ def initialize_cte_runtime() -> str:
             
             log_progress(result) # Log after getting/generating config path
             
-            # Step 1: Initialize Chimaera runtime (following test_bindings.py pattern)
+            # Step 1: Initialize Chimaera (unified init - following test_bindings.py pattern)
             # Note: This may fail if runtime is already running or config is missing
-            if hasattr(cte, 'chimaera_runtime_init'):
+            if hasattr(cte, 'chimaera_init') and hasattr(cte, 'ChimaeraMode'):
                 try:
                     # Try to initialize - if it fails, it may return False or raise an exception
                     # In some cases, C++ FATAL may cause process abort which we can't catch
-                    runtime_result = cte.chimaera_runtime_init()
-                    result['runtime_init'] = bool(runtime_result)
-                    if runtime_result:
-                        # Give runtime time to initialize all components (500ms as per tests)
+                    chimaera_result = cte.chimaera_init(cte.ChimaeraMode.kClient, True)
+                    result['runtime_init'] = bool(chimaera_result)
+                    result['client_init'] = bool(chimaera_result)
+                    if chimaera_result:
+                        # Give Chimaera time to initialize all components (500ms as per tests)
                         time.sleep(0.5)
-                        result['messages'].append('Chimaera runtime initialized successfully')
+                        result['messages'].append('Chimaera initialized successfully')
                     else:
-                        # Runtime init returned False - might already be initialized or failed silently
-                        result['messages'].append('Chimaera runtime init returned False - may already be initialized or needs external setup')
+                        # Init returned False - might already be initialized or failed silently
+                        result['messages'].append('Chimaera init returned False - may already be initialized or needs external setup')
                         # Don't mark as failed yet - might still work
                         result['runtime_init'] = True  # Assume it's okay to proceed
+                        result['client_init'] = True
                 except SystemExit as e:
                     # Process may exit due to FATAL errors in C++ code - we can't prevent this
                     # But we try to return JSON before exit
-                    result['messages'].append(f'Chimaera runtime init caused process exit (code: {e.code}) - port may be in use or config invalid')
+                    result['messages'].append(f'Chimaera init caused process exit (code: {e.code}) - port may be in use or config invalid')
                     result['runtime_init'] = False
-                    result['error'] = 'Process exit during runtime initialization'
+                    result['client_init'] = False
+                    result['error'] = 'Process exit during Chimaera initialization'
                     # Try to return immediately before process exits
                     try:
                         os.dup2(old_stderr_fd, 2)
@@ -763,32 +755,14 @@ def initialize_cte_runtime() -> str:
                         pass
                     return json.dumps(result, indent=2)
                 except Exception as e:
-                    result['messages'].append(f'Chimaera runtime init failed: {type(e).__name__}: {str(e)}')
+                    result['messages'].append(f'Chimaera init failed: {type(e).__name__}: {str(e)}')
                     result['runtime_init'] = False
+                    result['client_init'] = False
             else:
-                result['messages'].append('chimaera_runtime_init not available in bindings')
-            log_progress(result) # Log after runtime init
-            
-            # Step 2: Initialize Chimaera client (following test_bindings.py pattern)
-            if hasattr(cte, 'chimaera_client_init') and result['runtime_init']:
-                try:
-                    client_result = cte.chimaera_client_init()
-                    result['client_init'] = client_result
-                    if client_result:
-                        # Give client time to connect to runtime (200ms as per tests)
-                        time.sleep(0.2)
-                        result['messages'].append('Chimaera client initialized successfully')
-                    else:
-                        result['messages'].append('Chimaera client init returned False (may be already initialized)')
-                except Exception as e:
-                    result['messages'].append(f'Chimaera client init failed: {str(e)}')
-            elif not result['runtime_init']:
-                result['messages'].append('Skipping client init (runtime not initialized)')
-            else:
-                result['messages'].append('chimaera_client_init not available in bindings')
-            log_progress(result) # Log after client init
-            
-            # Step 3: Initialize CTE subsystem (following test_bindings.py pattern)
+                result['messages'].append('chimaera_init not available in bindings')
+            log_progress(result) # Log after Chimaera init
+
+            # Step 2: Initialize CTE subsystem (following test_bindings.py pattern)
             if hasattr(cte, 'initialize_cte') and hasattr(cte, 'PoolQuery') and result['client_init']:
                 try:
                     pool_query = cte.PoolQuery.Dynamic()

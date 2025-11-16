@@ -48,8 +48,7 @@ namespace {
   constexpr chi::PoolId kComparisonPoolId = chi::PoolId(9001, 0);
   
   // Global test state
-  bool g_runtime_initialized = false;
-  bool g_client_initialized = false;
+  bool g_initialized = false;
   int g_test_counter = 0;
   
   /**
@@ -58,70 +57,21 @@ namespace {
    */
   class WaitTestFixture {
   public:
-    WaitTestFixture() {
-      // Reset global counters for each test
-      g_test_counter = 0;
-    }
     
     ~WaitTestFixture() {
       cleanup();
     }
     
-    /**
-     * Initialize Chimaera runtime (server-side)
-     */
-    bool initializeRuntime() {
-      if (g_runtime_initialized) {
-        return true; // Already initialized
+    WaitTestFixture() {
+      if (!g_initialized) {
+        bool success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
+        if (success) {
+          g_initialized = true;
+          std::this_thread::sleep_for(500ms);
+        }
       }
-      
-      INFO("Initializing Chimaera runtime...");
-      bool success = chi::CHIMAERA_RUNTIME_INIT();
-      
-      if (success) {
-        g_runtime_initialized = true;
-        
-        // Give runtime time to initialize all components
-        std::this_thread::sleep_for(500ms);
-        
-        INFO("Runtime initialization successful");
-      } else {
-        INFO("Failed to initialize Chimaera runtime");
-      }
-      
-      return success;
-    }
-    
-    /**
-     * Initialize Chimaera client components
-     */
-    bool initializeClient() {
-      if (g_client_initialized) {
-        return true; // Already initialized
-      }
-      
-      INFO("Initializing Chimaera client...");
-      bool success = chi::CHIMAERA_CLIENT_INIT();
-      
-      if (success) {
-        g_client_initialized = true;
-        
-        // Give client time to connect to runtime
-        std::this_thread::sleep_for(200ms);
-        
-        INFO("Client initialization successful");
-      } else {
-        INFO("Failed to initialize Chimaera client");
-      }
-      
-      return success;
-    }
-    
-    /**
-     * Initialize both runtime and client (full setup)
-     */
-    bool initializeBoth() {
-      return initializeRuntime() && initializeClient();
+      // Reset global counters for each test
+      g_test_counter = 0;
     }
     
     /**
@@ -201,9 +151,9 @@ namespace {
 
 TEST_CASE("wait_test_basic_functionality", "[wait_test][basic]") {
   WaitTestFixture fixture;
-  
+
   SECTION("Initialize runtime and client") {
-    REQUIRE(fixture.initializeBoth());
+    REQUIRE(g_initialized);
   }
   
   SECTION("Create container") {
@@ -257,9 +207,9 @@ TEST_CASE("wait_test_basic_functionality", "[wait_test][basic]") {
 
 TEST_CASE("wait_test_recursive_functionality", "[wait_test][recursive]") {
   WaitTestFixture fixture;
-  
+
   SECTION("Initialize runtime and client") {
-    REQUIRE(fixture.initializeBoth());
+    REQUIRE(g_initialized);
   }
   
   SECTION("Create container") {
@@ -313,9 +263,9 @@ TEST_CASE("wait_test_recursive_functionality", "[wait_test][recursive]") {
 
 TEST_CASE("wait_test_async_functionality", "[wait_test][async]") {
   WaitTestFixture fixture;
-  
+
   SECTION("Initialize runtime and client") {
-    REQUIRE(fixture.initializeBoth());
+    REQUIRE(g_initialized);
   }
   
   SECTION("Create container") {
@@ -390,9 +340,9 @@ TEST_CASE("wait_test_async_functionality", "[wait_test][async]") {
 
 TEST_CASE("wait_test_edge_cases", "[wait_test][edge_cases]") {
   WaitTestFixture fixture;
-  
+
   SECTION("Initialize runtime and client") {
-    REQUIRE(fixture.initializeBoth());
+    REQUIRE(g_initialized);
   }
   
   SECTION("Create container") {

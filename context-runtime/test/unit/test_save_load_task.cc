@@ -49,8 +49,8 @@ hipc::CtxAllocator<CHI_MAIN_ALLOC_T> GetTestAllocator() {
 class ChimaeraTestFixture {
 public:
   ChimaeraTestFixture() {
-    // Initialize Chimaera runtime
-    chi::CHIMAERA_RUNTIME_INIT();
+    // Initialize Chimaera (client with embedded runtime)
+    chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
 
     // Initialize admin module
     auto *module_manager = CHI_MODULE_MANAGER;

@@ -13,7 +13,7 @@ services:
       - NODE_ID=1
       - NODE_IP=172.25.0.10
       - CONTAINER_HOSTFILE=/etc/iowarp/hostfile
-      - CHIMAERA_DISABLE_RUNTIME_INIT=1
+      - CHIMAERA_WITH_RUNTIME=0
       - CHI_NUM_CONTAINERS=4
     shm_size: '16gb'
     mem_limit: 16g
@@ -46,7 +46,7 @@ services:
       - NODE_ID=2
       - NODE_IP=172.25.0.11
       - CONTAINER_HOSTFILE=/etc/iowarp/hostfile
-      - CHIMAERA_DISABLE_RUNTIME_INIT=1
+      - CHIMAERA_WITH_RUNTIME=0
       - CHI_NUM_CONTAINERS=4
     shm_size: '16gb'
     mem_limit: 16g
@@ -76,7 +76,7 @@ services:
       - NODE_ID=3
       - NODE_IP=172.25.0.12
       - CONTAINER_HOSTFILE=/etc/iowarp/hostfile
-      - CHIMAERA_DISABLE_RUNTIME_INIT=1
+      - CHIMAERA_WITH_RUNTIME=0
       - CHI_NUM_CONTAINERS=4
     shm_size: '16gb'
     mem_limit: 16g
@@ -106,7 +106,7 @@ services:
       - NODE_ID=4
       - NODE_IP=172.25.0.13
       - CONTAINER_HOSTFILE=/etc/iowarp/hostfile
-      - CHIMAERA_DISABLE_RUNTIME_INIT=1
+      - CHIMAERA_WITH_RUNTIME=0
       - CHI_NUM_CONTAINERS=4
     shm_size: '16gb'
     mem_limit: 16g

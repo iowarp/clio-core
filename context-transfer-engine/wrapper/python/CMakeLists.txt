@@ -3,6 +3,9 @@ cmake_minimum_required(VERSION 3.20)
 # Find Python for nanobind
 find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
 
+# Print Python installation path
+message(STATUS "Python_SITEARCH: ${Python_SITEARCH}")
+
 # Create the Python module
 nanobind_add_module(
     wrp_cte_core_ext
@@ -85,7 +88,7 @@ if(BUILD_TESTING)
         PROPERTIES
         LABELS "python;bindings"
         TIMEOUT 120
-        ENVIRONMENT "CTE_INIT_RUNTIME=0"
+        ENVIRONMENT "CHIMAERA_WITH_RUNTIME=0"
     )
 
     # Ensure test depends on the built module

@@ -98,19 +98,12 @@ def initialize_runtime():
     os.environ['CHI_REPO_PATH'] = os.getcwd()
 
     try:
-        # Initialize runtime
-        print("Initializing Chimaera runtime...")
-        if not cte.chimaera_runtime_init():
-            print("❌ Runtime init failed")
+        # Initialize Chimaera (unified init)
+        print("Initializing Chimaera...")
+        if not cte.chimaera_init(cte.ChimaeraMode.kClient, True):
+            print("❌ Chimaera init failed")
             return False
         time.sleep(0.5)
-
-        # Initialize client
-        print("Initializing Chimaera client...")
-        if not cte.chimaera_client_init():
-            print("❌ Client init failed")
-            return False
-        time.sleep(0.2)
 
         # Initialize CTE
         print("Initializing CTE subsystem...")

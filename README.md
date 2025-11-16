@@ -136,35 +136,199 @@ Interactive tools and interfaces for exploring scientific data contents and meta
 
 ## Getting Started
 
-### Quick Install with pip (Recommended) - Zero System Dependencies!
+### Quick Install with pip (Easiest)
 
-The easiest way to install IOWarp is using pip. **No system packages required** - all dependencies (MPI, HDF5, ZeroMQ) are automatically installed from PyPI!
+The easiest way to install IOWarp Core is using pip. All dependencies are automatically built and installed into your Python environment - no system packages required!
 
-**Prerequisites:** Only Python 3.8+ and a C++ compiler
+**Prerequisites:** Only Python 3.8+ and a C++17 compiler
 
 ```bash
 # Ubuntu/Debian
+sudo apt-get update
 sudo apt-get install -y build-essential python3-dev python3-pip
 
 # macOS (Xcode command line tools)
 xcode-select --install
 ```
 
-**Install IOWarp:**
+**Install IOWarp Core:**
 ```bash
-# One command - everything is automatic!
-pip install git+https://github.com/iowarp/core.git
-
-# Or from a local clone
-git clone https://github.com/iowarp/core.git
+# Clone the repository (pip install requires local clone)
+git clone --recurse-submodules https://github.com/iowarp/core.git
 cd core
+
+# Basic installation - builds and installs everything automatically
+pip install .
+
+# Or install in editable mode for development
+pip install -e .
+```
+
+**Customization with Environment Variables:**
+
+You can customize the pip installation using CMake environment variables:
+
+```bash
+# Enable tests and benchmarks
+WRP_CORE_ENABLE_TESTS=ON WRP_CORE_ENABLE_BENCHMARKS=ON pip install .
+
+# Enable MPI support (requires MPI to be installed)
+WRP_CORE_ENABLE_MPI=ON pip install .
+
+# Enable specific components only
+WRP_CORE_ENABLE_CTE=ON WRP_CORE_ENABLE_CAE=OFF WRP_CORE_ENABLE_CEE=OFF pip install .
+
+# Enable compression and encryption support
+WRP_CORE_ENABLE_COMPRESS=ON WRP_CORE_ENABLE_ENCRYPT=ON pip install .
+
+# Enable GPU support (CUDA or ROCm)
+WRP_CORE_ENABLE_CUDA=ON pip install .
+WRP_CORE_ENABLE_ROCM=ON pip install .
+
+# Enable advanced networking (libfabric/Thallium)
+WRP_CORE_ENABLE_LIBFABRIC=ON WRP_CORE_ENABLE_THALLIUM=ON pip install .
+
+# Full customization example
+WRP_CORE_ENABLE_TESTS=ON \
+WRP_CORE_ENABLE_BENCHMARKS=ON \
+WRP_CORE_ENABLE_MPI=ON \
+WRP_CORE_ENABLE_COMPRESS=ON \
+WRP_CORE_ENABLE_OPENMP=ON \
 pip install .
 ```
 
-**Verify installation:**
+**Available CMake Options (for pip install):**
+
+*Component Control:*
+- `WRP_CORE_ENABLE_RUNTIME`: Enable runtime component (default: ON)
+- `WRP_CORE_ENABLE_CTE`: Enable Context Transfer Engine (default: ON)
+- `WRP_CORE_ENABLE_CAE`: Enable Context Assimilation Engine (default: ON)
+- `WRP_CORE_ENABLE_CEE`: Enable Context Exploration Engine (default: ON)
+
+*Build Features:*
+- `WRP_CORE_ENABLE_TESTS`: Enable tests (default: OFF)
+- `WRP_CORE_ENABLE_BENCHMARKS`: Enable benchmarks (default: OFF)
+- `WRP_CORE_ENABLE_PYTHON`: Enable Python bindings (default: OFF, automatically ON for pip)
+
+*Distributed Computing:*
+- `WRP_CORE_ENABLE_MPI`: Enable MPI support (default: OFF)
+- `WRP_CORE_ENABLE_ZMQ`: Enable ZeroMQ transport (default: ON)
+- `WRP_CORE_ENABLE_LIBFABRIC`: Enable libfabric transport (default: OFF)
+- `WRP_CORE_ENABLE_THALLIUM`: Enable Thallium RPC (default: OFF)
+
+*Data Processing:*
+- `WRP_CORE_ENABLE_CEREAL`: Enable serialization (default: ON)
+- `WRP_CORE_ENABLE_COMPRESS`: Enable compression libraries (default: OFF)
+- `WRP_CORE_ENABLE_ENCRYPT`: Enable encryption (default: OFF)
+- `WRP_CORE_ENABLE_HDF5`: Enable HDF5 support (default: ON)
+
+*Performance:*
+- `WRP_CORE_ENABLE_OPENMP`: Enable OpenMP (default: OFF)
+- `WRP_CORE_ENABLE_CUDA`: Enable CUDA support (default: OFF)
+- `WRP_CORE_ENABLE_ROCM`: Enable ROCm support (default: OFF)
+
+*Development/Debugging:*
+- `WRP_CORE_ENABLE_ASAN`: Enable AddressSanitizer (default: OFF)
+- `WRP_CORE_ENABLE_COVERAGE`: Enable code coverage (default: OFF)
+- `WRP_CORE_ENABLE_DOXYGEN`: Enable documentation checks (default: OFF)
+
+**Verify Installation:**
 ```python
-import iowarp
-print(f"IOWarp version: {iowarp.get_version()}")
+import wrp_cte  # Context Transfer Engine
+import wrp_cee  # Context Exploration Engine
+print("IOWarp Core successfully installed!")
+```
+
+**Note:** First installation takes 10-15 minutes as dependencies build from source. Everything is installed to your Python environment - no manual environment variable configuration needed!
+
+### Alternative: Install Using install.sh
+
+For system-wide installations or when you need more control over the build configuration, use the install.sh script:
+
+**Install IOWarp Core:**
+```bash
+# Clone the repository
+git clone --recurse-submodules https://github.com/iowarp/core.git
+cd core
+
+# Install to /usr/local (requires sudo for final install step)
+./install.sh
+
+# Or install to custom location (no sudo required)
+INSTALL_PREFIX=$HOME/iowarp ./install.sh
+```
+
+**Customization with Environment Variables:**
+
+The install.sh script accepts environment variables to customize the build:
+
+```bash
+# Install with tests and benchmarks enabled
+BUILD_TESTS=ON BUILD_BENCHMARKS=ON ./install.sh
+
+# Install with MPI support (checks for MPI installation first)
+WITH_MPI=ON ./install.sh
+
+# Install only dependencies (useful for development)
+DEPS_ONLY=TRUE ./install.sh
+
+# Custom install prefix with parallel build jobs
+INSTALL_PREFIX=/opt/iowarp BUILD_JOBS=8 ./install.sh
+
+# Full customization example
+INSTALL_PREFIX=$HOME/iowarp \
+BUILD_TESTS=ON \
+BUILD_BENCHMARKS=ON \
+WITH_MPI=ON \
+BUILD_JOBS=16 \
+./install.sh
+```
+
+**install.sh-Specific Environment Variables:**
+- `INSTALL_PREFIX`: Installation directory (default: `/usr/local`)
+- `BUILD_JOBS`: Number of parallel build jobs (default: `$(nproc)`)
+- `DEPS_ONLY`: Only build dependencies, skip IOWarp Core (default: `FALSE`)
+- `BUILD_TESTS`: Enable building tests - maps to `WRP_CORE_ENABLE_TESTS` (default: `OFF`)
+- `BUILD_BENCHMARKS`: Enable building benchmarks - maps to `WRP_CORE_ENABLE_BENCHMARKS` (default: `OFF`)
+- `WITH_MPI`: Enable MPI support - maps to `WRP_CORE_ENABLE_MPI` (default: `OFF`)
+
+**All CMake Options Also Work:**
+
+You can use ANY of the CMake options listed in the pip section above with install.sh:
+
+```bash
+# Enable compression and encryption
+WRP_CORE_ENABLE_COMPRESS=ON WRP_CORE_ENABLE_ENCRYPT=ON ./install.sh
+
+# Disable specific components
+WRP_CORE_ENABLE_CAE=OFF WRP_CORE_ENABLE_CEE=OFF ./install.sh
+
+# Enable CUDA support
+WRP_CORE_ENABLE_CUDA=ON ./install.sh
+
+# Enable debugging tools
+WRP_CORE_ENABLE_ASAN=ON WRP_CORE_ENABLE_COVERAGE=ON ./install.sh
+
+# Combined example with both install.sh and CMake options
+INSTALL_PREFIX=$HOME/iowarp \
+BUILD_JOBS=16 \
+WITH_MPI=ON \
+WRP_CORE_ENABLE_COMPRESS=ON \
+WRP_CORE_ENABLE_CUDA=ON \
+WRP_CORE_ENABLE_OPENMP=ON \
+./install.sh
+```
+
+**Set Environment Variables After Installation:**
+
+After installation, add these to your `~/.bashrc` or `~/.zshrc`:
+
+```bash
+export INSTALL_PREFIX=/usr/local  # Or your custom path
+export CMAKE_PREFIX_PATH="$INSTALL_PREFIX:$CMAKE_PREFIX_PATH"
+export LD_LIBRARY_PATH="$INSTALL_PREFIX/lib:$LD_LIBRARY_PATH"
+export PKG_CONFIG_PATH="$INSTALL_PREFIX/lib/pkgconfig:$PKG_CONFIG_PATH"
+export PYTHONPATH="$INSTALL_PREFIX/lib/python$(python3 -c 'import sys; print(".".join(map(str, sys.version_info[:2])))')/site-packages:$PYTHONPATH"
 ```
 
 **Note:** First installation takes 10-15 minutes as dependencies build from source.
@@ -321,8 +485,8 @@ Here's a simple example using the Chimaera runtime with the bdev ChiMod:
 #include <chimaera/admin/admin_client.h>
 
 int main() {
-  // Initialize Chimaera client
-  chi::CHIMAERA_CLIENT_INIT();
+  // Initialize Chimaera (client mode with embedded runtime)
+  chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
 
   // Create admin client (always required)
   chimaera::admin::Client admin_client(chi::PoolId(7000, 0));

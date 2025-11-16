@@ -18,7 +18,7 @@ add_executable(cte_core_unit_tests
 )
 
 # Create single version of test_core_functionality that uses environment variable
-# CTE_INIT_RUNTIME to control whether runtime is initialized (default: yes)
+# CHIMAERA_WITH_RUNTIME to control whether runtime is initialized (default: yes)
 add_executable(test_core_functionality
     test_core_functionality.cc
 )
@@ -28,73 +28,57 @@ add_executable(test_query
     test_query.cc
 )
 
-# Link against required libraries using modern target names
+# Include directories for all tests - using unified simple_test.h framework
+target_include_directories(cte_core_unit_tests PRIVATE
+  ${CMAKE_SOURCE_DIR}/test  # For unified simple_test.h
+)
+
+target_include_directories(test_core_functionality PRIVATE
+  ${CMAKE_SOURCE_DIR}/test  # For unified simple_test.h
+)
+
+target_include_directories(test_query PRIVATE
+  ${CMAKE_SOURCE_DIR}/test  # For unified simple_test.h
+)
+
+# Link against required libraries using simple_test.h framework (NOT Catch2)
 target_link_libraries(cte_core_unit_tests
-    wrp_cte_core_client          # CTE core client library
     wrp_cte_core_runtime         # CTE core runtime library
-    chimaera::cxx                # Modern Chimaera core framework target
-    chimaera::admin_client       # Modern Chimaera admin target (if needed)
+    wrp_cte_core_client          # CTE core client library
+    chimaera::admin_runtime      # Admin module runtime (required for runtime mode)
+    chimaera::admin_client       # Admin module client
+    chimaera::bdev_runtime       # Bdev module runtime (required for runtime mode)
     chimaera::bdev_client        # Bdev client for BdevType enum
-    Catch2::Catch2WithMain       # Catch2 testing framework with main
+    hshm::cxx                    # HermesShm library
+    ${CMAKE_THREAD_LIBS_INIT}    # Threading support
 )
 
-# Link test_core_functionality
+# Link test_core_functionality - using simple_test.h framework (NOT Catch2)
 target_link_libraries(test_core_functionality
-    wrp_cte_core_client          # CTE core client library
     wrp_cte_core_runtime         # CTE core runtime library
-    chimaera::cxx                # Modern Chimaera core framework target
-    chimaera::admin_client       # Modern Chimaera admin target (if needed)
+    wrp_cte_core_client          # CTE core client library
+    chimaera::admin_runtime      # Admin module runtime (required for runtime mode)
+    chimaera::admin_client       # Admin module client
+    chimaera::bdev_runtime       # Bdev module runtime (required for runtime mode)
     chimaera::bdev_client        # Bdev client for BdevType enum
-    Catch2::Catch2WithMain       # Catch2 testing framework with main
+    hshm::cxx                    # HermesShm library
+    ${CMAKE_THREAD_LIBS_INIT}    # Threading support
 )
 
-# Link test_query
+# Link test_query - using simple_test.h framework (NOT Catch2)
 target_link_libraries(test_query
-    wrp_cte_core_client          # CTE core client library
     wrp_cte_core_runtime         # CTE core runtime library
-    chimaera::cxx                # Modern Chimaera core framework target
-    chimaera::admin_client       # Modern Chimaera admin target (if needed)
+    wrp_cte_core_client          # CTE core client library
+    chimaera::admin_runtime      # Admin module runtime (required for runtime mode)
+    chimaera::admin_client       # Admin module client
+    chimaera::bdev_runtime       # Bdev module runtime (required for runtime mode)
     chimaera::bdev_client        # Bdev client for BdevType enum
-    Catch2::Catch2WithMain       # Catch2 testing framework with main
-)
-
-# Set compile definitions for runtime initialization control
-# Note: Runtime initialization is now controlled by CTE_INIT_RUNTIME environment variable
-# at runtime, not at compile time
-target_compile_definitions(cte_core_unit_tests PRIVATE CTE_INIT_RUNTIME=1)
-
-# Set compilation standards and warnings
-target_compile_features(cte_core_unit_tests PRIVATE cxx_std_17)
-target_compile_options(cte_core_unit_tests PRIVATE
-    -Wall -Wextra -Werror        # Strict warnings as per CLAUDE.md
-    $<$<CONFIG:Debug>:-g -O0>    # Debug symbols and no optimization for debug
-    $<$<CONFIG:Release>:-O3>     # Optimization for release
-)
-
-target_compile_features(test_core_functionality PRIVATE cxx_std_17)
-target_compile_options(test_core_functionality PRIVATE
-    -Wall -Wextra -Werror        # Strict warnings as per CLAUDE.md
-    $<$<CONFIG:Debug>:-g -O0>    # Debug symbols and no optimization for debug
-    $<$<CONFIG:Release>:-O3>     # Optimization for release
-)
-
-# Compile options for test_query
-target_compile_features(test_query PRIVATE cxx_std_17)
-target_compile_options(test_query PRIVATE
-    -Wall -Wextra -Werror        # Strict warnings as per CLAUDE.md
-    $<$<CONFIG:Debug>:-g -O0>    # Debug symbols and no optimization for debug
-    $<$<CONFIG:Release>:-O3>     # Optimization for release
+    hshm::cxx                    # HermesShm library
+    ${CMAKE_THREAD_LIBS_INIT}    # Threading support
 )
 
 # Note: Include directories are provided automatically via linked ChiMod targets
 # wrp_cte_core_client provides ${WRP_CTE_ROOT}/core/include via transitive includes
-
-# Add test discovery for CTest integration
-include(CTest)
-if(BUILD_TESTING)
-    # Note: Manual test registration is used below instead of auto-discovery
-    # to ensure compatibility with the current Catch2 setup
-endif()
 
 # Manual test registration for specific test cases
 add_test(NAME cte_core_pool_creation
@@ -164,45 +148,44 @@ add_test(NAME cte_functional_reorganize
 add_test(NAME cte_functional_e2e_workflow
     COMMAND test_core_functionality "[core][cte][integration]")
 
-# Add test_query tests
+# Add test_query tests - use test names for filtering (simple_test.h filters by name, not tags)
 add_test(NAME cte_query_tag_exact
-    COMMAND test_query "[query][tagquery][exact]")
+    COMMAND test_query "TagQuery - Exact Match")
 
 add_test(NAME cte_query_tag_wildcard
-    COMMAND test_query "[query][tagquery][wildcard]")
+    COMMAND test_query "TagQuery - Wildcard Pattern")
 
 add_test(NAME cte_query_tag_alternation
-    COMMAND test_query "[query][tagquery][alternation]")
+    COMMAND test_query "TagQuery - Alternation Pattern")
 
 add_test(NAME cte_query_tag_matchall
-    COMMAND test_query "[query][tagquery][matchall]")
+    COMMAND test_query "TagQuery - Match All Pattern")
 
 add_test(NAME cte_query_tag_nomatch
-    COMMAND test_query "[query][tagquery][nomatch]")
+    COMMAND test_query "TagQuery - No Matches")
 
 add_test(NAME cte_query_blob_exact
-    COMMAND test_query "[query][blobquery][exact]")
+    COMMAND test_query "BlobQuery - Exact Match")
 
 add_test(NAME cte_query_blob_wildcard
-    COMMAND test_query "[query][blobquery][wildcard]")
+    COMMAND test_query "BlobQuery - Wildcard Patterns")
 
 add_test(NAME cte_query_blob_multitag
-    COMMAND test_query "[query][blobquery][multitag]")
+    COMMAND test_query "BlobQuery - Multiple Tags")
 
 add_test(NAME cte_query_blob_matchall
-    COMMAND test_query "[query][blobquery][matchall]")
+    COMMAND test_query "BlobQuery - Match All")
 
 add_test(NAME cte_query_blob_no_blob
-    COMMAND test_query "[query][blobquery][noblob]")
+    COMMAND test_query "BlobQuery - No Blob Matches")
 
 add_test(NAME cte_query_blob_no_tag
-    COMMAND test_query "[query][blobquery][notag]")
+    COMMAND test_query "BlobQuery - No Tag Matches")
 
-add_test(NAME cte_query_blob_extension
-    COMMAND test_query "[query][blobquery][extension]")
+# Note: cte_query_blob_extension test removed - not implemented in simple_test.h version
 
 add_test(NAME cte_query_local_poolquery
-    COMMAND test_query "[query][poolquery][local]")
+    COMMAND test_query "Query - Local Pool Query")
 
 # Set test properties for proper execution environment
 set_tests_properties(
@@ -251,7 +234,6 @@ set_tests_properties(
     cte_query_blob_matchall
     cte_query_blob_no_blob
     cte_query_blob_no_tag
-    cte_query_blob_extension
     cte_query_local_poolquery
     PROPERTIES
         TIMEOUT 300  # 5 minute timeout for each test

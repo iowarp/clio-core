@@ -417,7 +417,7 @@ bool PoolManager::CreatePool(FullPtr<Task> task, RunContext* run_ctx) {
     }
 
     // Run create method on container (task and run_ctx guaranteed by
-    // CHIMAERA_RUNTIME_INIT)
+    // CHIMAERA_INIT)
     // Create methods can spawn tasks internally that need to find this container
     container->Run(0, task, *run_ctx);  // Method::kCreate = 0
 

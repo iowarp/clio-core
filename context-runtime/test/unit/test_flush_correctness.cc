@@ -24,8 +24,9 @@ namespace {
 class ChimaeraTestFixture {
  public:
   ChimaeraTestFixture() {
-    // Use the standard Chimaera initialization
-    chi::CHIMAERA_RUNTIME_INIT();
+    // Use the unified Chimaera initialization
+    bool success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
+    REQUIRE(success);
   }
 
   ~ChimaeraTestFixture() {

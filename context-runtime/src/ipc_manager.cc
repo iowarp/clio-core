@@ -578,9 +578,9 @@ bool IpcManager::LoadHostfile() {
             host_ips[offset], node_id);
     }
     HILOG(kInfo, "=== Total hosts loaded: {} ===", hostfile_map_.size());
-
-    HILOG(kDebug, "Loaded {} hosts from hostfile: {}", hostfile_map_.size(),
-          hostfile_path);
+    if (hostfile_map_.empty()) {
+      HELOG(kFatal, "There were no hosts in the hostfile {}", hostfile_path);
+    }
     return true;
 
   } catch (const std::exception &e) {

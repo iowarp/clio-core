@@ -430,7 +430,7 @@ int main(int argc, char **argv) {
   }
 
   // Initialize Chimaera client
-  if (!chi::CHIMAERA_CLIENT_INIT()) {
+  if (!chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, false)) {
     std::cerr << "ERROR: Failed to initialize Chimaera client\n";
     return 1;
   }

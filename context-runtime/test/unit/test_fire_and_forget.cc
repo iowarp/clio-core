@@ -50,8 +50,7 @@ namespace {
   constexpr chi::PoolId kComparisonPoolId = chi::PoolId(8002, 0);
   
   // Global test state
-  bool g_runtime_initialized = false;
-  bool g_client_initialized = false;
+  bool g_initialized = false;
   int g_test_counter = 0;
   
   // Shared state for tracking task execution and cleanup
@@ -76,62 +75,6 @@ namespace {
       cleanup();
     }
     
-    /**
-     * Initialize Chimaera runtime (server-side)
-     */
-    bool initializeRuntime() {
-      if (g_runtime_initialized) {
-        return true; // Already initialized
-      }
-      
-      INFO("Initializing Chimaera runtime...");
-      bool success = chi::CHIMAERA_RUNTIME_INIT();
-      
-      if (success) {
-        g_runtime_initialized = true;
-        
-        // Give runtime time to initialize all components
-        std::this_thread::sleep_for(500ms);
-        
-        INFO("Runtime initialization successful");
-      } else {
-        INFO("Failed to initialize Chimaera runtime");
-      }
-      
-      return success;
-    }
-    
-    /**
-     * Initialize Chimaera client components
-     */
-    bool initializeClient() {
-      if (g_client_initialized) {
-        return true; // Already initialized
-      }
-      
-      INFO("Initializing Chimaera client...");
-      bool success = chi::CHIMAERA_CLIENT_INIT();
-      
-      if (success) {
-        g_client_initialized = true;
-        
-        // Give client time to connect to runtime
-        std::this_thread::sleep_for(200ms);
-        
-        INFO("Client initialization successful");
-      } else {
-        INFO("Failed to initialize Chimaera client");
-      }
-      
-      return success;
-    }
-    
-    /**
-     * Initialize both runtime and client (full setup)
-     */
-    bool initializeBoth() {
-      return initializeRuntime() && initializeClient();
-    }
     
     /**
      * Create MOD_NAME container for testing
@@ -258,7 +201,7 @@ TEST_CASE("fire_and_forget_task_flag_detection", "[fire_and_forget][flag_detecti
   FireAndForgetFixture fixture;
   
   SECTION("Initialize runtime and client") {
-    REQUIRE(fixture.initializeBoth());
+    REQUIRE(g_initialized);
   }
   
   SECTION("Create container") {
@@ -310,7 +253,7 @@ TEST_CASE("fire_and_forget_client_api", "[fire_and_forget][client_api]") {
   FireAndForgetFixture fixture;
   
   SECTION("Initialize runtime and client") {
-    REQUIRE(fixture.initializeBoth());
+    REQUIRE(g_initialized);
   }
   
   SECTION("Create container") {
@@ -370,7 +313,7 @@ TEST_CASE("fire_and_forget_task_execution", "[fire_and_forget][execution]") {
   FireAndForgetFixture fixture;
   
   SECTION("Initialize runtime and client") {
-    REQUIRE(fixture.initializeBoth());
+    REQUIRE(g_initialized);
   }
   
   SECTION("Create container") {
@@ -447,7 +390,7 @@ TEST_CASE("fire_and_forget_memory_cleanup", "[fire_and_forget][memory_cleanup]")
   FireAndForgetFixture fixture;
   
   SECTION("Initialize runtime and client") {
-    REQUIRE(fixture.initializeBoth());
+    REQUIRE(g_initialized);
   }
   
   SECTION("Create container") {
@@ -540,7 +483,7 @@ TEST_CASE("fire_and_forget_vs_regular_task_behavior", "[fire_and_forget][compari
   FireAndForgetFixture fixture;
   
   SECTION("Initialize runtime and client") {
-    REQUIRE(fixture.initializeBoth());
+    REQUIRE(g_initialized);
   }
   
   SECTION("Create containers") {
@@ -624,7 +567,7 @@ TEST_CASE("fire_and_forget_error_conditions", "[fire_and_forget][error_handling]
   FireAndForgetFixture fixture;
   
   SECTION("Initialize runtime and client") {
-    REQUIRE(fixture.initializeBoth());
+    REQUIRE(g_initialized);
   }
   
   SECTION("Create container") {
@@ -715,7 +658,7 @@ TEST_CASE("fire_and_forget_integration", "[fire_and_forget][integration]") {
   FireAndForgetFixture fixture;
   
   SECTION("Initialize runtime and client") {
-    REQUIRE(fixture.initializeBoth());
+    REQUIRE(g_initialized);
   }
   
   SECTION("Create container") {

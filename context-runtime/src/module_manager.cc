@@ -51,8 +51,8 @@ bool ModuleManager::LoadChiMod(const std::string &lib_path) {
   // Load the shared library
   chimod_info->lib.Load(lib_path);
   if (chimod_info->lib.IsNull()) {
-    HILOG(kInfo, "Didn't load ChiMod (1): {} {}", lib_path,
-          chimod_info->lib.GetError());
+    // HILOG(kInfo, "Skipping check on {} (1): {} {}", lib_path,
+    //       chimod_info->lib.GetError());
     return false;
   }
 

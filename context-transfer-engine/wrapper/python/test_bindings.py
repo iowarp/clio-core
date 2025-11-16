@@ -21,15 +21,14 @@ Usage:
     python3 test_bindings.py
 
     # Run without runtime initialization
-    CTE_INIT_RUNTIME=0 python3 test_bindings.py
+    CHIMAERA_WITH_RUNTIME=0 python3 test_bindings.py
 
 Example Usage in Your Code:
 ---------------------------
     import wrp_cte_core_ext as cte
-    
+
     # 1. Initialize runtime (if not already done externally)
-    cte.chimaera_runtime_init()
-    cte.chimaera_client_init()
+    cte.chimaera_init(cte.ChimaeraMode.kClient, True)
     cte.initialize_cte(config_path, cte.PoolQuery.Dynamic())
     
     # 2. Bundle data (context_bundle)
@@ -48,8 +47,7 @@ Example Usage in Your Code:
 
 Environment Variables:
 ---------------------
-    CTE_INIT_RUNTIME: Set to "0" or "false" to skip runtime initialization
-    CHIMAERA_DISABLE_RUNTIME_INIT: Set to "1" to disable runtime initialization
+    CHIMAERA_WITH_RUNTIME: Set to "0" or "false" to skip runtime initialization
     CHI_SERVER_CONF: Path to Chimaera server configuration file
     CHI_REPO_PATH: Path to ChiMod repository (for finding shared libraries)
     LD_LIBRARY_PATH: Library path for runtime dependencies
@@ -72,29 +70,17 @@ _initialization_attempted = False
 
 
 def should_initialize_runtime():
-    """Check if runtime should be initialized (following C++ test patterns)
-    
-    Reads CTE_INIT_RUNTIME environment variable (CTE-specific) or 
-    CHIMAERA_DISABLE_RUNTIME_INIT (runtime-specific, following test_bdev_chimod.cc pattern).
-    
-    Following pattern from context-runtime/test/unit/test_bdev_chimod.cc:108-116:
-    - Checks CHIMAERA_DISABLE_RUNTIME_INIT=1 to skip (for distributed tests)
-    - Default: initialize runtime
-    
-    For CTE tests, also checks CTE_INIT_RUNTIME:
+    """Check if runtime should be initialized
+
+    Reads CHIMAERA_WITH_RUNTIME environment variable:
     - Not set or "1"/"true"/"yes"/"on": Initialize runtime (default: true)
     - "0"/"false"/"no"/"off": Skip initialization (runtime already initialized externally)
     """
-    # First check runtime-specific disable flag (from test_bdev_chimod.cc pattern)
-    disable_runtime_init = os.getenv("CHIMAERA_DISABLE_RUNTIME_INIT")
-    if disable_runtime_init is not None and str(disable_runtime_init) == "1":
-        return False  # Skip runtime initialization
-    
-    # Then check CTE-specific flag (from CTE test pattern)
-    env_val = os.getenv("CTE_INIT_RUNTIME")
+    # Check unified flag
+    env_val = os.getenv("CHIMAERA_WITH_RUNTIME")
     if env_val is None:
         return True  # Default: initialize runtime
-    
+
     # Case-insensitive check for false values
     env_val_lower = str(env_val).lower()
     return env_val_lower not in ("0", "false", "no", "off")
@@ -271,15 +257,10 @@ def initialize_runtime_early(cte):
         config_path = generate_config()  # Creates YAML config with networking, storage, etc.
         os.environ["CHI_SERVER_CONF"] = config_path
         
-        # Step 3: Initialize runtime (server-side)
-        if not cte.chimaera_runtime_init():
-            raise RuntimeError("Failed to initialize Chimaera runtime")
-        time.sleep(0.5)  # Give runtime time to initialize components
-        
-        # Step 4: Initialize client (client-side)
-        if not cte.chimaera_client_init():
-            raise RuntimeError("Failed to initialize Chimaera client")
-        time.sleep(0.2)  # Give client time to connect
+        # Step 3: Initialize Chimaera (unified init - both runtime and client)
+        if not cte.chimaera_init(cte.ChimaeraMode.kClient, True):
+            raise RuntimeError("Failed to initialize Chimaera")
+        time.sleep(0.5)  # Give Chimaera time to initialize
         
         # Step 5: Initialize CTE subsystem
         pool_query = cte.PoolQuery.Dynamic()
@@ -287,9 +268,8 @@ def initialize_runtime_early(cte):
             raise RuntimeError("Failed to initialize CTE subsystem")
     
     This follows the C++ test pattern from context-runtime/test/unit/test_chimaera_runtime.cc:
-    - Calls CHIMAERA_RUNTIME_INIT() directly
-    - Sleeps 500ms after runtime init
-    - Sleeps 200ms after client init
+    - Calls CHIMAERA_INIT(ChimaeraMode::kClient, true)
+    - Sleeps 500ms after initialization
     - Verifies initialization state
 
     Returns True if successful, False otherwise.
@@ -313,60 +293,35 @@ def initialize_runtime_early(cte):
             print("   Continuing with binding tests only...")
             return False
 
-        # Step 1: Initialize Chimaera runtime (CHIMAERA_RUNTIME_INIT)
-        # Following pattern from test_chimaera_runtime.cc:58-84
-        if not runtime_initialized:
-            print("🔧 Initializing Chimaera runtime (CHIMAERA_RUNTIME_INIT)...")
+        # Step 1: Initialize Chimaera (unified init - both runtime and client)
+        # Following pattern from test_chimaera_runtime.cc
+        if not runtime_initialized or not client_initialized:
+            print("🔧 Initializing Chimaera (unified CHIMAERA_INIT)...")
             print("   Note: If runtime isn't configured, this may cause FATAL and process exit")
             sys.stdout.flush()  # Ensure output is flushed before potential abort
 
             try:
-                runtime_result = cte.chimaera_runtime_init()
+                init_result = cte.chimaera_init(cte.ChimaeraMode.kClient, True)
             except Exception as e:
-                print(f"⚠️  Chimaera runtime initialization exception: {e}")
+                print(f"⚠️  Chimaera initialization exception: {e}")
                 print("   Continuing with binding tests only...")
                 return False
 
-            if not runtime_result:
-                print("⚠️  Chimaera runtime initialization returned False")
+            if not init_result:
+                print("⚠️  Chimaera initialization returned False")
                 print("   This may indicate runtime configuration issues")
                 print("   Continuing with binding tests only...")
                 return False
 
             runtime_initialized = True
-
-            # Give runtime time to initialize all components (following C++ pattern: 500ms)
-            time.sleep(0.5)
-
-            # Verify initialization succeeded (following C++ pattern that checks managers)
-            # Note: In Python we can't directly access singletons, but we can verify
-            # the initialization succeeded by checking if we can proceed to client init
-            print("✅ Chimaera runtime initialized")
-            sys.stdout.flush()
-
-        # Step 2: Initialize Chimaera client
-        # Following pattern from test_chimaera_runtime.cc:91-114
-        if not client_initialized:
-            print("🔧 Initializing Chimaera client...")
-            sys.stdout.flush()
-
-            try:
-                client_result = cte.chimaera_client_init()
-            except Exception as e:
-                print(f"⚠️  Chimaera client initialization exception: {e}")
-                print("   Continuing with binding tests only...")
-                return False
-
-            if not client_result:
-                print("⚠️  Chimaera client initialization returned False")
-                print("   This may indicate client configuration issues")
-                print("   Continuing with binding tests only...")
-                return False
-
             client_initialized = True
 
-            # Give client time to connect to runtime (following C++ pattern: 200ms)
-            time.sleep(0.2)
+            # Give Chimaera time to initialize all components (following C++ pattern: 500ms)
+            time.sleep(0.5)
+
+            # Verify initialization succeeded
+            print("✅ Chimaera initialized")
+            sys.stdout.flush()
 
             # Verify client initialization (following C++ pattern that checks IPC)
             # In C++ tests they verify: REQUIRE(CHI_IPC != nullptr) and REQUIRE(CHI_IPC->IsInitialized())
@@ -689,38 +644,29 @@ def main():
     # Runtime initialization happens at the very beginning if enabled
     runtime_ok = False
     if should_initialize_runtime():
-        # Check which environment variable was set
-        disable_flag = os.getenv("CHIMAERA_DISABLE_RUNTIME_INIT")
-        if disable_flag == "1":
-            print("📋 Skipping Runtime Initialization (CHIMAERA_DISABLE_RUNTIME_INIT=1)")
-            print("   Runtime should already be initialized externally (distributed mode)")
-        else:
-            print("📋 Initializing Runtime (CTE_INIT_RUNTIME enabled)...")
-            print("   Note: Runtime initialization happens FIRST before any client code")
-            
-            # Import module first (needed for runtime init)
-            try:
-                import wrp_cte_core_ext as cte
-            except ImportError as e:
-                print(f"❌ Cannot import module for runtime init: {e}")
-                return 1
-            
-            # Set up environment paths for ChiMod discovery (before runtime init)
-            # Following pattern from context-transfer-engine/test/unit/test_query.cc:114-136
-            print("🔧 Setting up environment paths for ChiMod discovery...")
-            setup_environment_paths()
-            
-            # Initialize runtime NOW (before any client code)
-            # Following pattern from context-runtime/test/unit/test_chimaera_runtime.cc:58-84
-            runtime_ok = initialize_runtime_early(cte)
+        print("📋 Initializing Runtime (CHIMAERA_WITH_RUNTIME enabled)...")
+        print("   Note: Runtime initialization happens FIRST before any client code")
+
+        # Import module first (needed for runtime init)
+        try:
+            import wrp_cte_core_ext as cte
+        except ImportError as e:
+            print(f"❌ Cannot import module for runtime init: {e}")
+            return 1
+
+        # Set up environment paths for ChiMod discovery (before runtime init)
+        # Following pattern from context-transfer-engine/test/unit/test_query.cc:114-136
+        print("🔧 Setting up environment paths for ChiMod discovery...")
+        setup_environment_paths()
+
+        # Initialize runtime NOW (before any client code)
+        # Following pattern from context-runtime/test/unit/test_chimaera_runtime.cc:58-84
+        runtime_ok = initialize_runtime_early(cte)
         print()
     else:
-        cte_flag = os.getenv("CTE_INIT_RUNTIME")
-        disable_flag = os.getenv("CHIMAERA_DISABLE_RUNTIME_INIT")
-        if disable_flag == "1":
-            print("📋 Skipping Runtime Initialization (CHIMAERA_DISABLE_RUNTIME_INIT=1)")
-        elif cte_flag:
-            print(f"📋 Skipping Runtime Initialization (CTE_INIT_RUNTIME={cte_flag})")
+        cte_flag = os.getenv("CHIMAERA_WITH_RUNTIME")
+        if cte_flag:
+            print(f"📋 Skipping Runtime Initialization (CHIMAERA_WITH_RUNTIME={cte_flag})")
         else:
             print("📋 Skipping Runtime Initialization")
         print("   Runtime should already be initialized externally")

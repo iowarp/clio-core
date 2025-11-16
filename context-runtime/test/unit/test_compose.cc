@@ -155,7 +155,7 @@ int main(int argc, char **argv) {
 
   // Initialize runtime
   std::cout << "Initializing Chimaera runtime...\n";
-  if (!chi::CHIMAERA_RUNTIME_INIT()) {
+  if (!chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true)) {
     std::cerr << "Failed to initialize Chimaera runtime\n";
     return 1;
   }

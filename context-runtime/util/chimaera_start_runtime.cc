@@ -3,7 +3,6 @@
  */
 
 #include <chrono>
-#include <csignal>
 #include <iostream>
 #include <thread>
 
@@ -13,21 +12,6 @@
 
 namespace {
 volatile bool g_keep_running = true;
-
-void signal_handler(int signal) {
-  if (signal == SIGINT) {
-    // Ctrl-C should exit immediately without graceful shutdown
-    HILOG(kDebug, "Received SIGINT (Ctrl-C), exiting immediately...");
-    std::exit(1);
-  } else if (signal == SIGTERM) {
-    // SIGTERM allows graceful shutdown
-    HILOG(kDebug, "Received SIGTERM, shutting down gracefully...");
-    g_keep_running = false;
-  } else {
-    HILOG(kDebug, "Received signal {}, shutting down...", signal);
-    g_keep_running = false;
-  }
-}
 
 /**
  * Find and initialize the admin ChiMod
@@ -110,12 +94,8 @@ void ShutdownAdminChiMod() {
 int main(int argc, char* argv[]) {
   HILOG(kDebug, "Starting Chimaera runtime...");
 
-  // Set up signal handling
-  std::signal(SIGINT, signal_handler);
-  std::signal(SIGTERM, signal_handler);
-
   // Initialize Chimaera runtime
-  if (!chi::CHIMAERA_RUNTIME_INIT()) {
+  if (!chi::CHIMAERA_INIT(chi::ChimaeraMode::kRuntime, true)) {
     HELOG(kError, "Failed to initialize Chimaera runtime");
     return 1;
   }

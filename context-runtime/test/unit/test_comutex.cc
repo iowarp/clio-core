@@ -55,8 +55,7 @@ constexpr chi::u32 kMediumHoldMs = 500; // Medium hold duration
 constexpr chi::u32 kLongHoldMs = 1000;  // Long hold duration
 
 // Global test state
-bool g_runtime_initialized = false;
-bool g_client_initialized = false;
+bool g_initialized = false;
 
 // Test result tracking
 std::atomic<int> g_completed_tasks{0};
@@ -69,75 +68,33 @@ std::atomic<int> g_successful_tasks{0};
  */
 class CoMutexTestFixture {
 public:
-  CoMutexTestFixture() : test_pool_id_(generateTestPoolId()) {}
+  CoMutexTestFixture() : test_pool_id_(generateTestPoolId()) {
+    // Initialize Chimaera once per test suite
+    if (!g_initialized) {
+      INFO("Initializing Chimaera for CoMutex tests...");
+      bool success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
+      if (success) {
+        g_initialized = true;
+        std::this_thread::sleep_for(500ms);
 
-  ~CoMutexTestFixture() { cleanup(); }
-
-  /**
-   * Initialize Chimaera runtime (server-side)
-   */
-  bool initializeRuntime() {
-    if (g_runtime_initialized) {
-      return true; // Already initialized
-    }
-
-    INFO("Initializing Chimaera runtime for CoMutex tests...");
-    bool success = chi::CHIMAERA_RUNTIME_INIT();
-
-    if (success) {
-      g_runtime_initialized = true;
-
-      // Give runtime time to initialize all components
-      std::this_thread::sleep_for(500ms);
-
-      // Verify core managers are available
-      REQUIRE(CHI_CHIMAERA_MANAGER != nullptr);
-      REQUIRE(CHI_IPC != nullptr);
-      REQUIRE(CHI_POOL_MANAGER != nullptr);
-      REQUIRE(CHI_MODULE_MANAGER != nullptr);
-      REQUIRE(CHI_WORK_ORCHESTRATOR != nullptr);
-
-      INFO("Runtime initialization successful");
-    } else {
-      FAIL("Failed to initialize Chimaera runtime");
-    }
-
-    return success;
-  }
-
-  /**
-   * Initialize Chimaera client components
-   */
-  bool initializeClient() {
-    if (g_client_initialized) {
-      return true; // Already initialized
-    }
-
-    INFO("Initializing Chimaera client for CoMutex tests...");
-    bool success = chi::CHIMAERA_CLIENT_INIT();
-
-    if (success) {
-      g_client_initialized = true;
-
-      // Give client time to connect to runtime
-      std::this_thread::sleep_for(200ms);
+        // Verify core managers are available
+        REQUIRE(CHI_CHIMAERA_MANAGER != nullptr);
+        REQUIRE(CHI_IPC != nullptr);
+        REQUIRE(CHI_POOL_MANAGER != nullptr);
+        REQUIRE(CHI_MODULE_MANAGER != nullptr);
+        REQUIRE(CHI_WORK_ORCHESTRATOR != nullptr);
 
       // Verify client can access IPC manager
-      REQUIRE(CHI_IPC != nullptr);
       REQUIRE(CHI_IPC->IsInitialized());
 
-      INFO("Client initialization successful");
-    } else {
-      FAIL("Failed to initialize Chimaera client");
+        INFO("Chimaera initialization successful");
+      } else {
+        FAIL("Failed to initialize Chimaera");
+      }
     }
-
-    return success;
   }
 
-  /**
-   * Initialize both runtime and client
-   */
-  bool initializeBoth() { return initializeRuntime() && initializeClient(); }
+  ~CoMutexTestFixture() { cleanup(); }
 
   /**
    * Wait for task completion with timeout
@@ -260,7 +217,7 @@ TEST_CASE("CoMutex Basic Locking", "[comutex][basic]") {
   CoMutexTestFixture fixture;
 
   SECTION("Single CoMutex task should execute successfully") {
-    REQUIRE(fixture.initializeBoth());
+    REQUIRE(g_initialized);
     REQUIRE(fixture.createModNamePool());
 
     chimaera::MOD_NAME::Client mod_name_client(fixture.getTestPoolId());
@@ -281,7 +238,7 @@ TEST_CASE("CoMutex Basic Locking", "[comutex][basic]") {
   }
 
   SECTION("Sequential CoMutex tasks should execute in order") {
-    REQUIRE(fixture.initializeBoth());
+    REQUIRE(g_initialized);
     REQUIRE(fixture.createModNamePool());
 
     chimaera::MOD_NAME::Client mod_name_client(fixture.getTestPoolId());
@@ -326,7 +283,7 @@ TEST_CASE("CoMutex Concurrent Access", "[comutex][concurrent]") {
   CoMutexTestFixture fixture;
 
   SECTION("Concurrent CoMutex tasks with same TaskId should proceed together") {
-    REQUIRE(fixture.initializeBoth());
+    REQUIRE(g_initialized);
     REQUIRE(fixture.createModNamePool());
 
     chimaera::MOD_NAME::Client mod_name_client(fixture.getTestPoolId());
@@ -386,7 +343,7 @@ TEST_CASE("CoMutex Concurrent Access", "[comutex][concurrent]") {
   }
 
   SECTION("Concurrent CoMutex tasks with different TaskIds should serialize") {
-    REQUIRE(fixture.initializeBoth());
+    REQUIRE(g_initialized);
     REQUIRE(fixture.createModNamePool());
 
     chimaera::MOD_NAME::Client mod_name_client(fixture.getTestPoolId());
@@ -435,7 +392,7 @@ TEST_CASE("CoRwLock Basic Reader-Writer Semantics", "[corwlock][basic]") {
   CoMutexTestFixture fixture;
 
   SECTION("Single reader task should execute successfully") {
-    REQUIRE(fixture.initializeBoth());
+    REQUIRE(g_initialized);
     REQUIRE(fixture.createModNamePool());
 
     chimaera::MOD_NAME::Client mod_name_client(fixture.getTestPoolId());
@@ -454,7 +411,7 @@ TEST_CASE("CoRwLock Basic Reader-Writer Semantics", "[corwlock][basic]") {
   }
 
   SECTION("Single writer task should execute successfully") {
-    REQUIRE(fixture.initializeBoth());
+    REQUIRE(g_initialized);
     REQUIRE(fixture.createModNamePool());
 
     chimaera::MOD_NAME::Client mod_name_client(fixture.getTestPoolId());
@@ -473,7 +430,7 @@ TEST_CASE("CoRwLock Basic Reader-Writer Semantics", "[corwlock][basic]") {
   }
 
   SECTION("Sequential reader-writer tasks should execute in order") {
-    REQUIRE(fixture.initializeBoth());
+    REQUIRE(g_initialized);
     REQUIRE(fixture.createModNamePool());
 
     chimaera::MOD_NAME::Client mod_name_client(fixture.getTestPoolId());
@@ -516,7 +473,7 @@ TEST_CASE("CoRwLock Multiple Readers", "[corwlock][readers]") {
   CoMutexTestFixture fixture;
 
   SECTION("Multiple concurrent readers should proceed together") {
-    REQUIRE(fixture.initializeBoth());
+    REQUIRE(g_initialized);
     REQUIRE(fixture.createModNamePool());
 
     chimaera::MOD_NAME::Client mod_name_client(fixture.getTestPoolId());
@@ -580,7 +537,7 @@ TEST_CASE("CoRwLock Writer Exclusivity", "[corwlock][writers]") {
   CoMutexTestFixture fixture;
 
   SECTION("Multiple writers should execute exclusively") {
-    REQUIRE(fixture.initializeBoth());
+    REQUIRE(g_initialized);
     REQUIRE(fixture.createModNamePool());
 
     chimaera::MOD_NAME::Client mod_name_client(fixture.getTestPoolId());
@@ -641,7 +598,7 @@ TEST_CASE("CoRwLock Reader-Writer Interaction", "[corwlock][interaction]") {
   CoMutexTestFixture fixture;
 
   SECTION("Writer should block readers and vice versa") {
-    REQUIRE(fixture.initializeBoth());
+    REQUIRE(g_initialized);
     REQUIRE(fixture.createModNamePool());
 
     chimaera::MOD_NAME::Client mod_name_client(fixture.getTestPoolId());
@@ -697,7 +654,7 @@ TEST_CASE("TaskId Grouping", "[tasknode][grouping]") {
   CoMutexTestFixture fixture;
 
   SECTION("Tasks with same TaskId should group together for CoMutex") {
-    REQUIRE(fixture.initializeBoth());
+    REQUIRE(g_initialized);
     REQUIRE(fixture.createModNamePool());
 
     chimaera::MOD_NAME::Client mod_name_client(fixture.getTestPoolId());
@@ -742,7 +699,7 @@ TEST_CASE("TaskId Grouping", "[tasknode][grouping]") {
   }
 
   SECTION("Tasks with same TaskId should group together for CoRwLock readers") {
-    REQUIRE(fixture.initializeBoth());
+    REQUIRE(g_initialized);
     REQUIRE(fixture.createModNamePool());
 
     chimaera::MOD_NAME::Client mod_name_client(fixture.getTestPoolId());
@@ -793,7 +750,7 @@ TEST_CASE("CoMutex Error Handling", "[comutex][error]") {
   CoMutexTestFixture fixture;
 
   SECTION("CoMutex tasks should handle zero hold duration") {
-    REQUIRE(fixture.initializeBoth());
+    REQUIRE(g_initialized);
     REQUIRE(fixture.createModNamePool());
 
     chimaera::MOD_NAME::Client mod_name_client(fixture.getTestPoolId());
@@ -813,7 +770,7 @@ TEST_CASE("CoMutex Error Handling", "[comutex][error]") {
   }
 
   SECTION("CoMutex should handle large number of concurrent tasks") {
-    REQUIRE(fixture.initializeBoth());
+    REQUIRE(g_initialized);
     REQUIRE(fixture.createModNamePool());
 
     chimaera::MOD_NAME::Client mod_name_client(fixture.getTestPoolId());
@@ -854,7 +811,7 @@ TEST_CASE("CoRwLock Error Handling", "[corwlock][error]") {
   CoMutexTestFixture fixture;
 
   SECTION("CoRwLock tasks should handle zero hold duration") {
-    REQUIRE(fixture.initializeBoth());
+    REQUIRE(g_initialized);
     REQUIRE(fixture.createModNamePool());
 
     chimaera::MOD_NAME::Client mod_name_client(fixture.getTestPoolId());
@@ -886,7 +843,7 @@ TEST_CASE("CoMutex Performance", "[comutex][performance]") {
   CoMutexTestFixture fixture;
 
   SECTION("CoMutex overhead measurement") {
-    REQUIRE(fixture.initializeBoth());
+    REQUIRE(g_initialized);
     REQUIRE(fixture.createModNamePool());
 
     chimaera::MOD_NAME::Client mod_name_client(fixture.getTestPoolId());
@@ -935,7 +892,7 @@ TEST_CASE("CoRwLock Performance", "[corwlock][performance]") {
   CoMutexTestFixture fixture;
 
   SECTION("Reader vs Writer performance comparison") {
-    REQUIRE(fixture.initializeBoth());
+    REQUIRE(g_initialized);
     REQUIRE(fixture.createModNamePool());
 
     chimaera::MOD_NAME::Client mod_name_client(fixture.getTestPoolId());
@@ -985,7 +942,7 @@ TEST_CASE("CoMutex and CoRwLock Integration", "[integration]") {
   CoMutexTestFixture fixture;
 
   SECTION("Mixed CoMutex and CoRwLock operations should coexist") {
-    REQUIRE(fixture.initializeBoth());
+    REQUIRE(g_initialized);
     REQUIRE(fixture.createModNamePool());
 
     chimaera::MOD_NAME::Client mod_name_client(fixture.getTestPoolId());
