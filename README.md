@@ -136,35 +136,104 @@ Interactive tools and interfaces for exploring scientific data contents and meta
 
 ## Getting Started
 
-### Quick Install with pip (Recommended) - Zero System Dependencies!
+### Quick Install with pip (Easiest)
 
-The easiest way to install IOWarp is using pip. **No system packages required** - all dependencies (MPI, HDF5, ZeroMQ) are automatically installed from PyPI!
+The easiest way to install IOWarp Core is using pip. All dependencies are automatically built and installed into your Python environment - no system packages required!
 
-**Prerequisites:** Only Python 3.8+ and a C++ compiler
+**Prerequisites:** Only Python 3.8+ and a C++17 compiler
 
 ```bash
 # Ubuntu/Debian
+sudo apt-get update
 sudo apt-get install -y build-essential python3-dev python3-pip
 
 # macOS (Xcode command line tools)
 xcode-select --install
 ```
 
-**Install IOWarp:**
+**Install IOWarp Core:**
 ```bash
-# One command - everything is automatic!
-pip install git+https://github.com/iowarp/core.git
-
-# Or from a local clone
-git clone https://github.com/iowarp/core.git
+# Clone the repository (pip install requires local clone)
+git clone --recurse-submodules https://github.com/iowarp/core.git
 cd core
+
+# Install with pip (builds and installs everything automatically)
 pip install .
+
+# Or install in editable mode for development
+pip install -e .
 ```
 
-**Verify installation:**
+**Verify Installation:**
 ```python
-import iowarp
-print(f"IOWarp version: {iowarp.get_version()}")
+import wrp_cte  # Context Transfer Engine
+import wrp_cee  # Context Exploration Engine
+print("IOWarp Core successfully installed!")
+```
+
+**Note:** First installation takes 10-15 minutes as dependencies build from source. Everything is installed to your Python environment - no need to set environment variables!
+
+### Alternative: Install Using install.sh
+
+For system-wide installations or when you need more control over the build configuration, use the install.sh script:
+
+**Install IOWarp Core:**
+```bash
+# Clone the repository
+git clone --recurse-submodules https://github.com/iowarp/core.git
+cd core
+
+# Install to /usr/local (requires sudo for final install step)
+./install.sh
+
+# Or install to custom location (no sudo required)
+INSTALL_PREFIX=$HOME/iowarp ./install.sh
+```
+
+**Customization with Environment Variables:**
+
+The install.sh script accepts several environment variables to customize the build:
+
+```bash
+# Install with tests and benchmarks enabled
+BUILD_TESTS=ON BUILD_BENCHMARKS=ON ./install.sh
+
+# Install with MPI support
+WITH_MPI=ON ./install.sh
+
+# Install only dependencies (useful for development)
+DEPS_ONLY=TRUE ./install.sh
+
+# Custom install prefix with parallel build jobs
+INSTALL_PREFIX=/opt/iowarp BUILD_JOBS=8 ./install.sh
+
+# Full customization example
+INSTALL_PREFIX=$HOME/iowarp \
+BUILD_TESTS=ON \
+BUILD_BENCHMARKS=ON \
+WITH_MPI=ON \
+BUILD_JOBS=16 \
+./install.sh
+```
+
+**Available Environment Variables:**
+- `INSTALL_PREFIX`: Installation directory (default: `/usr/local`)
+- `BUILD_JOBS`: Number of parallel build jobs (default: `$(nproc)`)
+- `DEPS_ONLY`: Only build dependencies, skip IOWarp Core (default: `FALSE`)
+- `BUILD_TESTS`: Enable building tests (default: `OFF`)
+- `BUILD_BENCHMARKS`: Enable building benchmarks (default: `OFF`)
+- `WITH_MPI`: Enable MPI support (default: `OFF`)
+
+**Set Environment Variables After Installation:**
+
+After installation, add these to your `~/.bashrc` or `~/.zshrc`:
+
+```bash
+export INSTALL_PREFIX=/usr/local  # Or your custom path
+export CMAKE_PREFIX_PATH="$INSTALL_PREFIX:$CMAKE_PREFIX_PATH"
+export LD_LIBRARY_PATH="$INSTALL_PREFIX/lib:$LD_LIBRARY_PATH"
+export PKG_CONFIG_PATH="$INSTALL_PREFIX/lib/pkgconfig:$PKG_CONFIG_PATH"
+export PYTHONPATH="$INSTALL_PREFIX/lib/python$(python3 -c 'import sys; print(".".join(map(str, sys.version_info[:2])))')/site-packages:$PYTHONPATH"
 ```
 
 **Note:** First installation takes 10-15 minutes as dependencies build from source.

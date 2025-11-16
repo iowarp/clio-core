@@ -12,6 +12,9 @@ cd "$SCRIPT_DIR"
 : ${INSTALL_PREFIX:=/usr/local}
 : ${BUILD_JOBS:=$(nproc)}
 : ${DEPS_ONLY:=FALSE}
+: ${BUILD_BENCHMARKS:=OFF}
+: ${BUILD_TESTS:=OFF}
+: ${WITH_MPI:=OFF}
 
 echo "======================================================================"
 echo "IOWarp Core Installer"
@@ -19,7 +22,46 @@ echo "======================================================================"
 echo "Install prefix: $INSTALL_PREFIX"
 echo "Build jobs: $BUILD_JOBS"
 echo "Dependencies only: $DEPS_ONLY"
+echo "Build benchmarks: $BUILD_BENCHMARKS"
+echo "Build tests: $BUILD_TESTS"
+echo "With MPI: $WITH_MPI"
 echo ""
+
+#------------------------------------------------------------------------------
+# Step 0: Check for MPI if enabled
+#------------------------------------------------------------------------------
+if [ "$WITH_MPI" = "ON" ] || [ "$WITH_MPI" = "on" ] || [ "$WITH_MPI" = "1" ] || [ "$WITH_MPI" = "TRUE" ] || [ "$WITH_MPI" = "true" ]; then
+    echo ">>> Checking for MPI installation..."
+
+    # Check for mpicc or mpicxx
+    if ! command -v mpicc &> /dev/null && ! command -v mpicxx &> /dev/null && ! command -v mpic++ &> /dev/null; then
+        echo "ERROR: MPI is not installed on this system!"
+        echo ""
+        echo "WITH_MPI=ON was specified, but no MPI compiler wrappers were found."
+        echo "Please install MPI before running this script with MPI enabled."
+        echo ""
+        echo "Installation instructions:"
+        echo "  Ubuntu/Debian: sudo apt-get install libmpich-dev mpich"
+        echo "                 or: sudo apt-get install libopenmpi-dev openmpi-bin"
+        echo "  macOS:         brew install mpich"
+        echo "                 or: brew install open-mpi"
+        echo ""
+        exit 1
+    fi
+
+    # Detect which MPI implementation is installed
+    if command -v mpicc &> /dev/null; then
+        MPI_VERSION=$(mpicc --version 2>&1 | head -n 1)
+        echo "✓ MPI found: $MPI_VERSION"
+    elif command -v mpicxx &> /dev/null; then
+        MPI_VERSION=$(mpicxx --version 2>&1 | head -n 1)
+        echo "✓ MPI found: $MPI_VERSION"
+    elif command -v mpic++ &> /dev/null; then
+        MPI_VERSION=$(mpic++ --version 2>&1 | head -n 1)
+        echo "✓ MPI found: $MPI_VERSION"
+    fi
+    echo ""
+fi
 
 #------------------------------------------------------------------------------
 # Step 1: Detect Missing Dependencies
@@ -261,7 +303,10 @@ cmake -S . -B "$BUILD_DIR" \
     -DCMAKE_PREFIX_PATH="$INSTALL_PREFIX/lib/cmake;$INSTALL_PREFIX/cmake;$INSTALL_PREFIX" \
     -DWRP_CORE_ENABLE_ZMQ=ON \
     -DWRP_CORE_ENABLE_CEREAL=ON \
-    -DWRP_CORE_ENABLE_HDF5=ON
+    -DWRP_CORE_ENABLE_HDF5=ON \
+    -DBUILD_TESTING="$BUILD_TESTS" \
+    -DWRP_CORE_BUILD_BENCHMARKS="$BUILD_BENCHMARKS" \
+    -DWRP_CORE_ENABLE_MPI="$WITH_MPI"
 
 # Build IOWarp Core
 cmake --build "$BUILD_DIR" -j${BUILD_JOBS}
