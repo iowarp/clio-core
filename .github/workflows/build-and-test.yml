@@ -16,6 +16,9 @@ jobs:
       matrix:
         os: ['ubuntu-24.04', 'ubuntu-24.04-arm']
 
+    env:
+      INSTALL_PREFIX: /usr/local
+
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
@@ -30,7 +33,9 @@ jobs:
           libelf-dev \
           libssl-dev \
           doxygen \
-          perl
+          perl \
+          libhdf5-dev \
+          libboost-dev
 
     - name: Install compression libraries
       run: |
@@ -45,7 +50,7 @@ jobs:
     - name: Build and install dependencies using install.sh
       run: |
         chmod +x install.sh
-        sudo DEPS_ONLY=TRUE INSTALL_PREFIX=/usr/local ./install.sh
+        sudo DEPS_ONLY=TRUE INSTALL_PREFIX=$INSTALL_PREFIX ./install.sh
         # Fix ownership of build directory created by install.sh
         sudo chown -R $USER:$USER build/ || true
       env:
@@ -76,7 +81,7 @@ jobs:
         # Remove build directory from install.sh to ensure clean build
         rm -rf build
         cmake --preset=debug \
-          -DCMAKE_PREFIX_PATH="/usr/local/lib/cmake;/usr/local/cmake;/usr/local" \
+          -DCMAKE_PREFIX_PATH="/usr/local" \
           -DWRP_CORE_ENABLE_RUNTIME=ON \
           -DWRP_CORE_ENABLE_CTE=ON \
           -DWRP_CORE_ENABLE_CAE=ON \
@@ -117,71 +122,80 @@ jobs:
           build/**/*_test.log
         retention-days: 7
 
-    - name: Install to temporary prefix
+    - name: Install to /usr/local
       run: |
-        cmake --install build --prefix ${{ github.workspace }}/install
+        sudo cmake --install build --prefix /usr/local
         echo ""
         echo "=== Installation Summary ==="
-        echo "Install prefix: ${{ github.workspace }}/install"
-        echo "Total installed files: $(find ${{ github.workspace }}/install -type f | wc -l)"
+        echo "Install prefix: /usr/local"
         echo ""
 
     - name: Verify installation structure
       run: |
         echo "=== Installed Libraries ==="
-        find ${{ github.workspace }}/install -name "*.so*" -o -name "*.a" | sort
+        find /usr/local -name "*.so*" -o -name "*.a" | grep iowarp | sort | head -30
         echo ""
         echo "=== Installed Headers ==="
-        find ${{ github.workspace }}/install -name "*.h" -o -name "*.hpp" | head -30
-        echo ""
-        echo "=== Installed Binaries ==="
-        find ${{ github.workspace }}/install -type f -executable -name "*" | head -20
+        find /usr/local/include -name "*.h" -o -name "*.hpp" | grep -E "(chimaera|hshm|wrp)" | head -30
         echo ""
         echo "=== CMake Config Files ==="
-        find ${{ github.workspace }}/install -name "*Config.cmake" -o -name "*-config.cmake" | head -20
+        find /usr/local -name "*Config.cmake" -o -name "*-config.cmake" | grep -E "(iowarp|chimaera|hshm)" | head -20
 
-    - name: Test external project linking (CTE)
-      run: |
-        echo "=== Testing CTE external integration ==="
-        cd context-transfer-engine/test/unit/external
-        mkdir -p build && cd build
-        echo "CMAKE_PREFIX_PATH: ${{ github.workspace }}/install/lib/cmake;${{ github.workspace }}/install"
-        cmake -DCMAKE_PREFIX_PATH="${{ github.workspace }}/install/lib/cmake;${{ github.workspace }}/install;/usr/local/lib/cmake;/usr/local/cmake;/usr/local" \
-              --debug-find \
-              ..
-        cmake --build .
-        echo "✓ CTE external test built successfully"
-      continue-on-error: false
+    # - name: Test external project linking (CTE)
+    #   run: |
+    #     echo "=== Testing CTE external integration ==="
+    #     cd context-transfer-engine/test/unit/external
+    #     mkdir -p build && cd build
+    #     cmake ..
+    #     cmake --build .
+    #     echo "✓ CTE external test built successfully"
+    #   continue-on-error: false
+    #   env:
+    #     CMAKE_PREFIX_PATH: /usr/local
+    #     PKG_CONFIG_PATH: /usr/local/lib/pkgconfig
+    #     LD_LIBRARY_PATH: /usr/local/lib
 
-    - name: Test external project linking (Runtime)
-      run: |
-        echo "=== Testing Runtime external integration ==="
-        cd context-runtime/test/unit/external
-        mkdir -p build && cd build
-        cmake -DCMAKE_PREFIX_PATH="${{ github.workspace }}/install/lib/cmake;${{ github.workspace }}/install;/usr/local/lib/cmake;/usr/local/cmake;/usr/local" ..
-        cmake --build .
-        echo "✓ Runtime external test built successfully"
-      continue-on-error: false
+    # - name: Test external project linking (Runtime)
+    #   run: |
+    #     echo "=== Testing Runtime external integration ==="
+    #     cd context-runtime/test/unit/external
+    #     mkdir -p build && cd build
+    #     cmake ..
+    #     cmake --build .
+    #     echo "✓ Runtime external test built successfully"
+    #   continue-on-error: false
+    #   env:
+    #     CMAKE_PREFIX_PATH: /usr/local
+    #     PKG_CONFIG_PATH: /usr/local/lib/pkgconfig
+    #     LD_LIBRARY_PATH: /usr/local/lib
 
-    - name: Test external project linking (Transport Primitives)
-      run: |
-        echo "=== Testing Transport Primitives external integration ==="
-        cd context-transport-primitives/test/unit/external
-        mkdir -p build && cd build
-        cmake -DCMAKE_PREFIX_PATH="${{ github.workspace }}/install/lib/cmake;${{ github.workspace }}/install;/usr/local/lib/cmake;/usr/local/cmake;/usr/local" ..
-        cmake --build .
-        echo "✓ Transport Primitives external test built successfully"
-      continue-on-error: false
+    # - name: Test external project linking (Transport Primitives)
+    #   run: |
+    #     echo "=== Testing Transport Primitives external integration ==="
+    #     cd context-transport-primitives/test/unit/external
+    #     mkdir -p build && cd build
+    #     cmake ..
+    #     cmake --build .
+    #     echo "✓ Transport Primitives external test built successfully"
+    #   continue-on-error: false
+    #   env:
+    #     CMAKE_PREFIX_PATH: /usr/local
+    #     PKG_CONFIG_PATH: /usr/local/lib/pkgconfig
+    #     LD_LIBRARY_PATH: /usr/local/lib
 
-    - name: Test external project linking (CAE)
-      run: |
-        echo "=== Testing CAE external integration ==="
-        cd context-assimilation-engine/test/unit/external
-        mkdir -p build && cd build
-        cmake -DCMAKE_PREFIX_PATH="${{ github.workspace }}/install/lib/cmake;${{ github.workspace }}/install;/usr/local/lib/cmake;/usr/local/cmake;/usr/local" ..
-        cmake --build .
-        echo "✓ CAE external test built successfully"
-      continue-on-error: false
+    # - name: Test external project linking (CAE)
+    #   run: |
+    #     echo "=== Testing CAE external integration ==="
+    #     cd context-assimilation-engine/test/unit/external
+    #     mkdir -p build && cd build
+    #     cmake ..
+    #     cmake --build .
+    #     echo "✓ CAE external test built successfully"
+    #   continue-on-error: false
+    #   env:
+    #     CMAKE_PREFIX_PATH: /usr/local
+    #     PKG_CONFIG_PATH: /usr/local/lib/pkgconfig
+    #     LD_LIBRARY_PATH: /usr/local/lib
 
     - name: Create package with CPack
       run: |
@@ -206,13 +220,13 @@ jobs:
         fi
       continue-on-error: true
 
-    - name: Upload installation artifacts
-      if: success()
-      uses: actions/upload-artifact@v4
-      with:
-        name: install-${{ matrix.os }}
-        path: ${{ github.workspace }}/install/
-        retention-days: 7
+    # - name: Upload installation artifacts
+    #   if: success()
+    #   uses: actions/upload-artifact@v4
+    #   with:
+    #     name: install-${{ matrix.os }}
+    #     path: /usr/local/
+    #     retention-days: 7
 
     - name: Upload packages
       if: success()

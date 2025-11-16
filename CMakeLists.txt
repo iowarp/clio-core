@@ -198,8 +198,7 @@ if(WRP_CORE_ENABLE_DOXYGEN)
     message(STATUS "found doxygen at ${DOXYGEN_EXECUTABLE}")
 endif()
 
-# Catch2 is built from submodule - see component subdirectories section below
-# No find_package needed here
+# Catch2 - handled later in component subdirectories section
 
 # YAML-CPP - always use submodule (built later)
 
@@ -211,39 +210,24 @@ else()
     set(YAML_CPP_LIBS yaml-cpp)
 endif()
 
-# Boost components - try system first, fall back to submodule
-find_package(Boost QUIET COMPONENTS fiber context system)
+# Boost components - find from system or install.sh installation
+find_package(Boost REQUIRED COMPONENTS fiber context system)
 if(Boost_FOUND)
     message(STATUS "found boost at ${Boost_INCLUDE_DIRS}")
-else()
-    message(STATUS "System Boost not found, building from submodule")
-
-    # Initialize boost submodule if not already done
-    if(NOT EXISTS "${CMAKE_SOURCE_DIR}/external/boost/CMakeLists.txt")
-        message(STATUS "Initializing boost submodule...")
-        execute_process(
-            COMMAND git submodule update --init --recursive external/boost
-            WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-            RESULT_VARIABLE GIT_SUBMOD_RESULT
-        )
-        if(NOT GIT_SUBMOD_RESULT EQUAL "0")
-            message(FATAL_ERROR "git submodule update --init failed for external/boost")
-        endif()
-    endif()
-
-    # Build required Boost libraries from submodule
-    set(BOOST_INCLUDE_LIBRARIES fiber context system)
-    set(BOOST_ENABLE_CMAKE ON)
-    add_subdirectory(external/boost EXCLUDE_FROM_ALL)
-    message(STATUS "Building Boost fiber, context, and system from submodule")
 endif()
 
-# Cereal
-# Skip find_package if target already exists (from submodule)
+# Cereal - Try system first, fall back to submodule
 if(NOT TARGET cereal AND NOT TARGET cereal::cereal)
-    find_package(cereal REQUIRED)
+    find_package(cereal QUIET)
     if(cereal_FOUND)
-        message(STATUS "found cereal at ${cereal_DIR}")
+        message(STATUS "Found cereal from system at ${cereal_DIR}")
+    else()
+        message(STATUS "System cereal not found, using submodule")
+        set(JUST_INSTALL_CEREAL ON CACHE BOOL "Just install cereal headers" FORCE)
+        set(BUILD_DOC OFF CACHE BOOL "Disable cereal documentation" FORCE)
+        set(BUILD_SANDBOX OFF CACHE BOOL "Disable cereal sandbox" FORCE)
+        set(SKIP_PERFORMANCE_COMPARISON ON CACHE BOOL "Skip cereal performance comparison" FORCE)
+        add_subdirectory(external/cereal)
     endif()
 endif()
 
@@ -441,13 +425,8 @@ if(WRP_CORE_ENABLE_PYTHON)
   # Find Python for nanobind
   find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
 
-  # Add nanobind subdirectory if it exists
-  if(EXISTS "${CMAKE_SOURCE_DIR}/external/nanobind")
-    add_subdirectory(external/nanobind)
-    message(STATUS "Added nanobind from external/nanobind")
-  else()
-    message(FATAL_ERROR "nanobind not found in external/ - required when WRP_CORE_ENABLE_PYTHON=ON")
-  endif()
+  # Add nanobind as subdirectory (git submodule)
+  add_subdirectory(external/nanobind)
 else()
   message(STATUS "Python bindings disabled")
 endif()
@@ -541,76 +520,30 @@ endif()
 # Component Subdirectories
 #------------------------------------------------------------------------------
 
-# Add Catch2 testing framework if tests are enabled
+# Catch2 testing framework - Try system first, fall back to submodule
 if(WRP_CORE_ENABLE_TESTS)
-  message(STATUS "Adding Catch2 testing framework") 
-  add_subdirectory(external/Catch2)
-
-#   # Force installation of Catch2 libraries even when used as subproject
-#   # This ensures libCatch2d.so and libCatch2Maind.so are installed to /usr/local/lib
-#   install(
-#     TARGETS
-#       Catch2
-#       Catch2WithMain
-#     EXPORT
-#       Catch2Targets
-#     LIBRARY DESTINATION
-#       ${CMAKE_INSTALL_LIBDIR}
-#     ARCHIVE DESTINATION
-#       ${CMAKE_INSTALL_LIBDIR}
-#     RUNTIME DESTINATION
-#       ${CMAKE_INSTALL_BINDIR}
-#   )
-
-#   # Install Catch2 headers
-#   install(
-#     DIRECTORY
-#       "${CMAKE_CURRENT_SOURCE_DIR}/external/Catch2/src/catch2"
-#       "${CMAKE_CURRENT_BINARY_DIR}/external/Catch2/generated-includes/catch2"
-#     DESTINATION
-#       "${CMAKE_INSTALL_INCLUDEDIR}"
-#     FILES_MATCHING
-#       PATTERN "*.hpp"
-#   )
-
-#   # Install Catch2 CMake config files
-#   install(
-#     EXPORT
-#       Catch2Targets
-#     NAMESPACE
-#       Catch2::
-#     DESTINATION
-#       "${CMAKE_INSTALL_LIBDIR}/cmake/Catch2"
-#   )
-# endif()
-
-# # cereal header-only library - use installed version if available
-# if(NOT TARGET cereal AND NOT TARGET cereal::cereal)
-#     message(STATUS "cereal not found via find_package, checking submodule")
-#     if(EXISTS "${CMAKE_SOURCE_DIR}/external/cereal/CMakeLists.txt")
-#         message(STATUS "Building cereal library from submodule (header-only)")
-#         set(JUST_INSTALL_CEREAL ON CACHE BOOL "Just install cereal headers" FORCE)
-#         set(BUILD_DOC OFF CACHE BOOL "Disable cereal documentation" FORCE)
-#         set(BUILD_SANDBOX OFF CACHE BOOL "Disable cereal sandbox" FORCE)
-#         set(SKIP_PERFORMANCE_COMPARISON ON CACHE BOOL "Skip cereal performance comparison" FORCE)
-#         add_subdirectory(external/cereal)
-#     else()
-#         message(FATAL_ERROR "cereal not found. Please install cereal or run install.sh to build from submodules.")
-#     endif()
-else()
-    message(STATUS "Using installed cereal")
+  message(STATUS "Finding Catch2 testing framework")
+  find_package(Catch2 3 QUIET)
+  if(Catch2_FOUND)
+    message(STATUS "Found Catch2 from system at ${Catch2_DIR}")
+  else()
+    message(STATUS "System Catch2 not found, using submodule")
+    add_subdirectory(external/Catch2)
+  endif()
 endif()
 
-# Add yaml-cpp library (only if not already found by IowarpCoreCommon)
+
+# yaml-cpp - Try system first, fall back to submodule
 if(NOT TARGET yaml-cpp AND NOT TARGET yaml-cpp::yaml-cpp)
-  message(STATUS "Building yaml-cpp library from submodule")
-  set(YAML_CPP_BUILD_TESTS OFF CACHE BOOL "Disable yaml-cpp tests" FORCE)
-  set(YAML_CPP_BUILD_TOOLS OFF CACHE BOOL "Disable yaml-cpp tools" FORCE)
-  set(YAML_CPP_BUILD_CONTRIB OFF CACHE BOOL "Disable yaml-cpp contrib" FORCE)
-  set(YAML_BUILD_SHARED_LIBS ${BUILD_SHARED_LIBS} CACHE BOOL "Build yaml-cpp as shared library" FORCE)
-  add_subdirectory(external/yaml-cpp)
+  find_package(yaml-cpp QUIET)
+  if(yaml-cpp_FOUND)
+    message(STATUS "Found yaml-cpp from system")
+  else()
+    message(STATUS "System yaml-cpp not found, using submodule")
+    add_subdirectory(external/yaml-cpp)
+  endif()
 else()
-  message(STATUS "yaml-cpp already found by IowarpCoreCommon, skipping submodule build")
+  message(STATUS "yaml-cpp already found by IowarpCoreCommon")
 endif()
 
 # Context Transport Primitives (formerly cte-hermes-shm) - Required by runtime

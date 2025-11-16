@@ -9,10 +9,11 @@
 #   ./install_docker.sh
 #
 # What this does:
-#   1. Builds the minimal Docker image with source code and submodules
+#   1. Builds the minimal Docker image with source code
 #   2. Starts a container and runs pip install inside it
 #   3. Installs IOWarp Core to the container's virtual environment (/opt/venv)
 #   4. Verifies the installation by checking for libraries and CMake configs
+#   Note: Dependencies are automatically downloaded/built by install.sh if not found
 #==============================================================================
 
 set -e  # Exit on error
@@ -76,31 +77,19 @@ ls -la /iowarp-core | head -15
 echo ''
 
 echo '==================================================================='
-echo 'Step 0: Checking git repository and submodules'
+echo 'Step 0: Checking git repository'
 echo '==================================================================='
 # Configure git to trust the directory
 git config --global --add safe.directory /iowarp-core 2>/dev/null || true
 
 # Check if this is a git repository
 if [ -d .git ]; then
-    echo 'Git repository detected, checking submodules...'
-
-    # Check if submodules are already initialized
-    if [ -f external/boost/README.md ] || [ -f external/boost/bootstrap.sh ]; then
-        echo 'Submodules appear to be initialized already'
-    else
-        echo 'Initializing submodules...'
-        git submodule update --init --recursive 2>&1 || {
-            echo 'Warning: Submodule initialization had issues, but continuing...'
-        }
-    fi
+    echo 'Git repository detected'
 else
-    echo 'Not a git repository, skipping submodule initialization'
-    echo 'Assuming submodules are already initialized in the image'
+    echo 'Not a git repository'
 fi
 
-echo 'Checking critical submodule directories:'
-ls -d external/boost external/libzmq external/hdf5 external/yaml-cpp external/cereal 2>/dev/null || echo 'Some submodules may be missing'
+echo 'Note: Dependencies will be downloaded/built by install.sh if not found on system'
 
 echo ''
 echo '==================================================================='
@@ -122,7 +111,7 @@ echo 'Step 2: Installing IOWarp Core with pip'
 echo '==================================================================='
 echo 'This will:'
 echo '  - Run setup.py which calls install.sh'
-echo '  - Build missing dependencies from submodules'
+echo '  - Download and build missing dependencies from GitHub releases'
 echo '  - Build and install IOWarp Core libraries'
 echo '  - Install to virtual environment at /opt/venv'
 echo ''
@@ -131,7 +120,8 @@ echo 'Files in current directory:'
 ls -la | head -20
 echo ''
 
-pip install -v .
+# pip install -v .
+bash install.sh
 
 echo ''
 echo '==================================================================='

@@ -19,7 +19,7 @@ if(HSHM_ENABLE_ZMQ)
 endif()
 
 # distributed_lightbeam_test requires MPI
-if(HSHM_ENABLE_MPI)
+if(HSHM_ENABLE_MPI AND HSHM_ENABLE_ZMQ)
     add_executable(distributed_lightbeam_test distributed_lightbeam_test.cc)
     target_link_libraries(distributed_lightbeam_test
         hermes_shm_host
@@ -27,6 +27,7 @@ if(HSHM_ENABLE_MPI)
         hshm::mpi
         hshm::serialize
     )
+    target_compile_definitions(distributed_lightbeam_test PRIVATE HSHM_ENABLE_ZMQ)
     install(TARGETS distributed_lightbeam_test
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}

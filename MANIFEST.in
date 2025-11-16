@@ -2,6 +2,7 @@
 include README.md
 include LICENSE
 include CLAUDE.md
+include .gitmodules
 include CMakeLists.txt
 include CMakePresets.json
 include CPPLINT.cfg
@@ -11,9 +12,6 @@ include requirements.txt
 include requirements-dev.txt
 include test_package.py
 
-# Include .gitmodules for reference
-include .gitmodules
-
 # Include all component directories with their source and build files
 recursive-include context-runtime *.h *.hpp *.hxx *.cc *.cpp *.c *.cmake *.txt *.yaml *.yml *.json *.md *.in *.proto
 recursive-include context-transfer-engine *.h *.hpp *.hxx *.cc *.cpp *.c *.cmake *.txt *.yaml *.yml *.json *.md *.in *.proto *.py
@@ -21,11 +19,14 @@ recursive-include context-assimilation-engine *.h *.hpp *.hxx *.cc *.cpp *.c *.c
 recursive-include context-transport-primitives *.h *.hpp *.hxx *.cc *.cpp *.c *.cmake *.txt *.yaml *.yml *.json *.md *.in *.proto
 recursive-include context-exploration-engine *.h *.hpp *.hxx *.cc *.cpp *.c *.cmake *.txt *.yaml *.yml *.json *.md *.in *.proto
 
-# Include external dependencies (git submodules content)
-recursive-include external/cereal *.h *.hpp *.hxx *.cmake *.txt *.md *.in
-recursive-include external/yaml-cpp *.h *.hpp *.hxx *.cc *.cpp *.c *.cmake *.txt *.md *.in
-recursive-include external/Catch2 *.h *.hpp *.hxx *.cc *.cpp *.c *.cmake *.txt *.md *.in
-recursive-include external/nanobind *.h *.hpp *.hxx *.cc *.cpp *.c *.cmake *.txt *.md *.in *.py
+# Include submodules
+recursive-include external/nanobind *.h *.hpp *.hxx *.cc *.cpp *.c *.cmake *.txt *.yaml *.yml *.json *.md *.in *.py *.sym
+recursive-include external/yaml-cpp *.h *.hpp *.hxx *.cc *.cpp *.c *.cmake *.txt *.yaml *.yml *.json *.md *.in
+recursive-include external/Catch2 *.h *.hpp *.hxx *.cc *.cpp *.c *.cmake *.txt *.yaml *.yml *.json *.md *.in
+recursive-include external/cereal *.h *.hpp *.hxx *.cc *.cpp *.c *.cmake *.txt *.yaml *.yml *.json *.md *.in
+
+# Note: Other external dependencies (ZeroMQ, HDF5) are downloaded/built by install.sh
+# No need to package them with the source distribution
 
 # Include docker configuration
 recursive-include docker *.yml *.yaml *.sh Dockerfile* *.conf *.md

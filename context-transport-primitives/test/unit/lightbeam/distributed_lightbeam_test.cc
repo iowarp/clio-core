@@ -32,7 +32,7 @@ Transport ParseTransport(const std::string& s) {
   throw std::runtime_error("Unknown transport type: " + s);
 }
 
-void Clients(std::vector<std::unique_ptr<Client>>& clients,
+void Clients(std::vector<std::unique_ptr<ZeroMqClient>>& clients,
              const std::string& magic) {
   int my_rank = 0;
   MPI_Comm_rank(MPI_COMM_WORLD, &my_rank);
@@ -248,10 +248,10 @@ int main(int argc, char** argv) {
   for (int i = 0; i < world_size; ++i) {
     server_addrs.emplace_back(&all_addrs[i * addr_len]);
   }
-  std::vector<std::unique_ptr<Client>> clients;
+  std::vector<std::unique_ptr<ZeroMqClient>> clients;
   for (int i = 0; i < world_size; ++i) {
-    auto client_ptr = TransportFactory::GetClient(server_addrs[i], transport,
-                                                  protocol, 0, "");
+    int target_port = port + i;
+    auto client_ptr = std::make_unique<ZeroMqClient>(server_addrs[i], protocol, target_port);
     clients.emplace_back(std::move(client_ptr));
   }
   int sent = 0;

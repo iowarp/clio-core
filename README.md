@@ -154,7 +154,7 @@ xcode-select --install
 **Install IOWarp Core:**
 ```bash
 # Clone the repository (pip install requires local clone)
-git clone --recurse-submodules https://github.com/iowarp/core.git
+git clone https://github.com/iowarp/core.git
 cd core
 
 # Basic installation - builds and installs everything automatically
@@ -248,7 +248,7 @@ For system-wide installations or when you need more control over the build confi
 **Install IOWarp Core:**
 ```bash
 # Clone the repository
-git clone --recurse-submodules https://github.com/iowarp/core.git
+git clone https://github.com/iowarp/core.git
 cd core
 
 # Install to /usr/local (requires sudo for final install step)
@@ -264,10 +264,10 @@ The install.sh script accepts environment variables to customize the build:
 
 ```bash
 # Install with tests and benchmarks enabled
-BUILD_TESTS=ON BUILD_BENCHMARKS=ON ./install.sh
+WRP_CORE_ENABLE_TESTS=ON WRP_CORE_ENABLE_BENCHMARKS=ON ./install.sh
 
 # Install with MPI support (checks for MPI installation first)
-WITH_MPI=ON ./install.sh
+WRP_CORE_ENABLE_MPI=ON ./install.sh
 
 # Install only dependencies (useful for development)
 DEPS_ONLY=TRUE ./install.sh
@@ -277,9 +277,9 @@ INSTALL_PREFIX=/opt/iowarp BUILD_JOBS=8 ./install.sh
 
 # Full customization example
 INSTALL_PREFIX=$HOME/iowarp \
-BUILD_TESTS=ON \
-BUILD_BENCHMARKS=ON \
-WITH_MPI=ON \
+WRP_CORE_ENABLE_TESTS=ON \
+WRP_CORE_ENABLE_BENCHMARKS=ON \
+WRP_CORE_ENABLE_MPI=ON \
 BUILD_JOBS=16 \
 ./install.sh
 ```
@@ -288,9 +288,9 @@ BUILD_JOBS=16 \
 - `INSTALL_PREFIX`: Installation directory (default: `/usr/local`)
 - `BUILD_JOBS`: Number of parallel build jobs (default: `$(nproc)`)
 - `DEPS_ONLY`: Only build dependencies, skip IOWarp Core (default: `FALSE`)
-- `BUILD_TESTS`: Enable building tests - maps to `WRP_CORE_ENABLE_TESTS` (default: `OFF`)
-- `BUILD_BENCHMARKS`: Enable building benchmarks - maps to `WRP_CORE_ENABLE_BENCHMARKS` (default: `OFF`)
-- `WITH_MPI`: Enable MPI support - maps to `WRP_CORE_ENABLE_MPI` (default: `OFF`)
+- `WRP_CORE_ENABLE_TESTS`: Enable building tests (default: `OFF`)
+- `WRP_CORE_ENABLE_BENCHMARKS`: Enable building benchmarks (default: `OFF`)
+- `WRP_CORE_ENABLE_MPI`: Enable MPI support (default: `OFF`)
 
 **All CMake Options Also Work:**
 
@@ -312,7 +312,7 @@ WRP_CORE_ENABLE_ASAN=ON WRP_CORE_ENABLE_COVERAGE=ON ./install.sh
 # Combined example with both install.sh and CMake options
 INSTALL_PREFIX=$HOME/iowarp \
 BUILD_JOBS=16 \
-WITH_MPI=ON \
+WRP_CORE_ENABLE_MPI=ON \
 WRP_CORE_ENABLE_COMPRESS=ON \
 WRP_CORE_ENABLE_CUDA=ON \
 WRP_CORE_ENABLE_OPENMP=ON \
@@ -352,6 +352,8 @@ These dependencies must be installed on your system:
 - **Boost** >= 1.70 (components: context, fiber, system)
 - **libelf** (ELF binary parsing for adapter functionality)
 - **ZeroMQ (libzmq)** (distributed communication)
+- **yaml-cpp** - YAML configuration library (git submodule in external/yaml-cpp)
+- **cereal** - Serialization library (git submodule in external/cereal)
 - **Threads** (POSIX threads library)
 
 **Compression Libraries** (if `HSHM_ENABLE_COMPRESS=ON`):
@@ -373,7 +375,7 @@ These dependencies must be installed on your system:
 These dependencies enable additional features:
 
 **Testing:**
-- **Catch2** >= 3.0.1 (if `WRP_CORE_ENABLE_TESTS=ON`)
+- **Catch2** >= 3.0.1 (if `WRP_CORE_ENABLE_TESTS=ON`) - git submodule in external/Catch2
 
 **Documentation:**
 - **Doxygen** (if `HSHM_ENABLE_DOXYGEN=ON`)
@@ -398,15 +400,7 @@ These dependencies enable additional features:
 
 **Python Bindings:**
 - **Python 3** with development headers (if `WRP_CORE_ENABLE_PYTHON=ON`)
-- **nanobind** (included as submodule in `external/nanobind`)
-
-#### Submodules (Included)
-
-These dependencies are included as git submodules and built automatically:
-- **cereal** (in `external/cereal`) - Header-only serialization library
-- **yaml-cpp** (in `external/yaml-cpp`) - YAML parsing
-- **Catch2** (in `external/Catch2`) - Testing framework
-- **nanobind** (in `external/nanobind`) - Python bindings (if enabled)
+- **nanobind** - Python bindings library (git submodule in external/nanobind)
 
 #### Installation Commands
 
@@ -430,8 +424,11 @@ sudo apt-get install -y libhdf5-dev
 # Optional: MPI support
 sudo apt-get install -y libmpich-dev
 
-# Optional: Testing framework (or use submodule)
-sudo apt-get install -y catch2
+# Optional: Testing framework (git submodule, no need to install separately)
+
+# Optional: YAML library (git submodule, no need to install separately)
+
+# Optional: Serialization library (git submodule, no need to install separately)
 ```
 
 **Docker Container (Recommended):**

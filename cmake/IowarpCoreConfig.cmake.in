@@ -37,8 +37,12 @@ include("${CMAKE_CURRENT_LIST_DIR}/IowarpCoreCommon.cmake")
 include(CMakeFindDependencyMacro)
 
 # Find common dependencies used by IOWarp Core components
-find_dependency(Boost REQUIRED COMPONENTS fiber context filesystem)
-find_dependency(cereal REQUIRED)
+# These dependencies are OPTIONAL for external users because:
+# 1. IOWarp Core libraries are already built and contain the symbols
+# 2. External users don't need these packages unless they're building new ChiMods
+# 3. The headers that external users include don't expose Boost/cereal types in public APIs
+find_package(Boost QUIET COMPONENTS fiber context filesystem)
+find_package(cereal QUIET CONFIG)
 
 # Find HDF5 if CAE is enabled (required for CAE runtime)
 if(@WRP_CORE_ENABLE_CAE@)
