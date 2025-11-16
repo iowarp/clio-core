@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "iowarp-core"
-version = "0.1.0"
+version = "0.1.4"
 description = "IOWarp Core: High-performance distributed I/O and task execution runtime"
 readme = "README.md"
 requires-python = ">=3.8"
