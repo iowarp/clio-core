@@ -13,7 +13,7 @@ add_dependencies(test_compress_exec hermes_shm_host)
 target_link_libraries(test_compress_exec
         hermes_shm_host Catch2::Catch2)
 
-add_test(NAME test_compress COMMAND
+add_test(NAME ctp_compress COMMAND
         ${CMAKE_BINARY_DIR}/bin/test_compress_exec "~[error=FatalError]")
 
 #-----------------------------------------------------------------------------

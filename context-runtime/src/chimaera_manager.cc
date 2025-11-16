@@ -85,16 +85,19 @@ Chimaera::~Chimaera() {
 
 bool Chimaera::ClientInit() {
   HILOG(kInfo, "Chimaera::ClientInit");
-  if (is_client_mode_ || client_is_initializing_ || runtime_is_initializing_) {
+  if (is_client_initialized_ || client_is_initializing_ || runtime_is_initializing_) {
     return true;
   }
 
+  // Set mode flags at the start
+  is_client_mode_ = true;
   client_is_initializing_ = true;
 
   HILOG(kDebug, "IpcManager::ClientInit");
   // Initialize configuration manager
   auto *config_manager = CHI_CONFIG_MANAGER;
   if (!config_manager->Init()) {
+    is_client_mode_ = false;
     client_is_initializing_ = false;
     return false;
   }
@@ -103,6 +106,7 @@ bool Chimaera::ClientInit() {
   // Initialize IPC manager for client
   auto *ipc_manager = CHI_IPC;
   if (!ipc_manager->ClientInit()) {
+    is_client_mode_ = false;
     client_is_initializing_ = false;
     return false;
   }
@@ -118,7 +122,7 @@ bool Chimaera::ClientInit() {
     g_admin = new chimaera::admin::Client(chi::kAdminPoolId);
   }
 
-  is_client_mode_ = true;
+  is_client_initialized_ = true;
   is_initialized_ = true;
   client_is_initializing_ = false;
 
@@ -126,15 +130,18 @@ bool Chimaera::ClientInit() {
 }
 
 bool Chimaera::ServerInit() {
-  if (is_runtime_mode_ || runtime_is_initializing_ || client_is_initializing_) {
+  if (is_runtime_initialized_ || runtime_is_initializing_ || client_is_initializing_) {
     return true;
   }
 
+  // Set mode flags at the start
+  is_runtime_mode_ = true;
   runtime_is_initializing_ = true;
 
   // Initialize configuration manager first
   auto *config_manager = CHI_CONFIG_MANAGER;
   if (!config_manager->Init()) {
+    is_runtime_mode_ = false;
     runtime_is_initializing_ = false;
     return false;
   }
@@ -142,6 +149,7 @@ bool Chimaera::ServerInit() {
   // Initialize IPC manager for server
   auto *ipc_manager = CHI_IPC;
   if (!ipc_manager->ServerInit()) {
+    is_runtime_mode_ = false;
     runtime_is_initializing_ = false;
     return false;
   }
@@ -152,6 +160,7 @@ bool Chimaera::ServerInit() {
   // Initialize module manager first (needed for admin chimod)
   auto *module_manager = CHI_MODULE_MANAGER;
   if (!module_manager->Init()) {
+    is_runtime_mode_ = false;
     runtime_is_initializing_ = false;
     return false;
   }
@@ -159,12 +168,14 @@ bool Chimaera::ServerInit() {
   // Initialize work orchestrator before pool manager
   auto *work_orchestrator = CHI_WORK_ORCHESTRATOR;
   if (!work_orchestrator->Init()) {
+    is_runtime_mode_ = false;
     runtime_is_initializing_ = false;
     return false;
   }
 
   // Start worker threads
   if (!work_orchestrator->StartWorkers()) {
+    is_runtime_mode_ = false;
     runtime_is_initializing_ = false;
     return false;
   }
@@ -172,6 +183,7 @@ bool Chimaera::ServerInit() {
   // Initialize pool manager (server mode only) after work orchestrator
   auto *pool_manager = CHI_POOL_MANAGER;
   if (!pool_manager->ServerInit()) {
+    is_runtime_mode_ = false;
     runtime_is_initializing_ = false;
     return false;
   }
@@ -202,13 +214,12 @@ bool Chimaera::ServerInit() {
   // This ensures clients can connect only when runtime is fully ready
   if (!ipc_manager->StartLocalServer()) {
     HELOG(kError, "Failed to start local server - runtime initialization failed");
+    is_runtime_mode_ = false;
     runtime_is_initializing_ = false;
     return false;
   }
 
-
-
-  is_runtime_mode_ = true;
+  is_runtime_initialized_ = true;
   is_initialized_ = true;
   runtime_is_initializing_ = false;
 
@@ -227,6 +238,7 @@ void Chimaera::ClientFinalize() {
   ipc_manager->ClientFinalize();
 
   is_client_mode_ = false;
+  is_client_initialized_ = false;
   // Only set is_initialized_ = false if both modes are inactive
   if (!is_runtime_mode_) {
     is_initialized_ = false;
@@ -252,6 +264,7 @@ void Chimaera::ServerFinalize() {
   ipc_manager->ServerFinalize();
 
   is_runtime_mode_ = false;
+  is_runtime_initialized_ = false;
   // Only set is_initialized_ = false if both modes are inactive
   if (!is_client_mode_) {
     is_initialized_ = false;

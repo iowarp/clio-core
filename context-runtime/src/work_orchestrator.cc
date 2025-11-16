@@ -189,10 +189,10 @@ bool WorkOrchestrator::Init() {
   }
 
   // Create process reaper workers
-  if (!CreateWorkers(kProcessReaper,
-                     config->GetWorkerThreadCount(kProcessReaper))) {
-    return false;
-  }
+  // if (!CreateWorkers(kProcessReaper,
+  //                    config->GetWorkerThreadCount(kProcessReaper))) {
+  //   return false;
+  // }
 
   is_initialized_ = true;
   return true;

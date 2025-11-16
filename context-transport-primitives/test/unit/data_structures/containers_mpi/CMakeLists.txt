@@ -21,7 +21,7 @@ if (HSHM_ENABLE_MPI)
     #------------------------------------------------------------------------------
 
     # LIST TESTS
-    add_test(NAME test_mpsc_queue_mpi COMMAND
+    add_test(NAME ctp_mpsc_queue_mpi COMMAND
             mpirun -n 2 ${CMAKE_BINARY_DIR}/bin/test_data_structure_mpi_exec "TestMpscQueueMpi")
 
     #------------------------------------------------------------------------------

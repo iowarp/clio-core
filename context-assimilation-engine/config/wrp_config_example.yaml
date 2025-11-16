@@ -1,4 +1,3 @@
----
 # WRP Configuration Example
 # Demonstrates how to configure Chimaera runtime with CTE and CAE ChiMods
 # This configuration combines runtime settings with declarative pool creation
@@ -16,9 +15,8 @@ memory:
 
 # Network configuration
 networking:
-  port: 8080
+  port: 5555
   neighborhood_size: 32
-  hostfile: /etc/iowarp/hostfile
 
 # Logging configuration
 logging:

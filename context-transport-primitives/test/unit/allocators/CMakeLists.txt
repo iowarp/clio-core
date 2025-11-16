@@ -34,7 +34,7 @@ set(ALLOCATORS
         LocaFullPtrs)
 
 foreach(ALLOCATOR ${ALLOCATORS})
-        add_test(NAME test_${ALLOCATOR} COMMAND
+        add_test(NAME ctp_${ALLOCATOR} COMMAND
                 ${CMAKE_BINARY_DIR}/bin/test_allocator_exec "${ALLOCATOR}")
 endforeach()
 
@@ -45,7 +45,7 @@ if(HSHM_ENABLE_OPENMP)
                 ScalablePageAllocator)
 
         foreach(ALLOCATOR ${MT_ALLOCATORS})
-                add_test(NAME test_${ALLOCATOR}_4t COMMAND
+                add_test(NAME ctp_${ALLOCATOR}_4t COMMAND
                         ${CMAKE_BINARY_DIR}/bin/test_allocator_mp_exec "${ALLOCATOR}Multithreaded")
         endforeach()
 endif()

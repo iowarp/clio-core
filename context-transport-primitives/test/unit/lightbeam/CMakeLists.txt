@@ -11,7 +11,7 @@ if(HSHM_ENABLE_ZMQ)
     add_executable(test_lightbeam_new test_lightbeam_new.cc)
     target_link_libraries(test_lightbeam_new hermes_shm_host hshm::lightbeam hshm::serialize)
     target_compile_definitions(test_lightbeam_new PRIVATE HSHM_ENABLE_ZMQ)
-    add_test(NAME test_lightbeam_new COMMAND test_lightbeam_new)
+    add_test(NAME ctp_lightbeam_new COMMAND test_lightbeam_new)
     install(TARGETS test_lightbeam_new
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}

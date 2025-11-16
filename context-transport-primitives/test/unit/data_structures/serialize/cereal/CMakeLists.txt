@@ -19,7 +19,7 @@ add_dependencies(test_cereal_exec
         hermes_shm_host)
 target_link_libraries(test_cereal_exec ${LIBS})
 
-add_test(NAME test_cereal COMMAND ${CMAKE_BINARY_DIR}/bin/test_cereal_exec)
+add_test(NAME ctp_cereal COMMAND ${CMAKE_BINARY_DIR}/bin/test_cereal_exec)
 
 #------------------------------------------------------------------------------
 # Install Targets

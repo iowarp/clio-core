@@ -138,6 +138,35 @@
                 }
             ],
             "preLaunchTask": "cmake-build-debug"
+        },
+        {
+            "name": "Debug cae_binary_assim test",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/bin/cae_binary_assim",
+            "args": [],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}/build",
+            "environment": [
+                {
+                    "name": "CHIMAERA_WITH_RUNTIME",
+                    "value": "1"
+                },
+                {
+                    "name": "CHI_SERVER_CONF",
+                    "value": "/workspace/context-assimilation-engine/test/unit/wrp_config.yaml"
+                }
+            ],
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                }
+            ],
+            "preLaunchTask": "cmake-build-debug"
         }
     ]
 }

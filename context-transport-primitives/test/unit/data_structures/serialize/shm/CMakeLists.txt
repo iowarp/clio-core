@@ -18,7 +18,7 @@ add_dependencies(test_shm_exec
         hermes_shm_host)
 target_link_libraries(test_shm_exec ${LIBS})
 
-add_test(NAME test_shm COMMAND ${CMAKE_BINARY_DIR}/bin/test_shm_exec)
+add_test(NAME ctp_shm COMMAND ${CMAKE_BINARY_DIR}/bin/test_shm_exec)
 
 #------------------------------------------------------------------------------
 # Install Targets
