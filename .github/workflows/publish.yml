@@ -45,7 +45,7 @@ jobs:
           echo "Building release version: $VERSION"
         else
           # Dev version from branch commit
-          BASE_VERSION=$(grep -E '^version = ' pyproject.toml | sed 's/version = "\(.*\)"/\1/')
+          BASE_VERSION=$(grep '^version = ' pyproject.toml | cut -d'"' -f2)
           TIMESTAMP=$(date +%Y%m%d%H%M%S)
           SHORT_SHA=${GITHUB_SHA:0:7}
           BRANCH_NAME=${GITHUB_REF#refs/heads/}

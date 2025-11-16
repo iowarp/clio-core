@@ -98,16 +98,6 @@ def wrp_cae_omni():
     run_binary("wrp_cae_omni")
 
 
-def wrp_cte():
-    """Entry point for wrp_cte binary (Hermes)."""
-    run_binary("wrp_cte")
-
-
-def wrp_runtime():
-    """Entry point for wrp_runtime binary (Chimaera)."""
-    run_binary("wrp_runtime")
-
-
 def chi_refresh_repo():
     """Entry point for chi_refresh_repo binary."""
     run_binary("chi_refresh_repo")
@@ -146,3 +136,29 @@ def test_hdf5_assim():
 def test_range_assim():
     """Entry point for test_range_assim binary."""
     run_binary("test_range_assim")
+
+
+# User-friendly aliases
+def wrp_start():
+    """Alias for chimaera_start_runtime (start IOWarp runtime)."""
+    run_binary("chimaera_start_runtime")
+
+
+def wrp_stop():
+    """Alias for chimaera_stop_runtime (stop IOWarp runtime)."""
+    run_binary("chimaera_stop_runtime")
+
+
+def wrp_compose():
+    """Alias for chimaera_compose (compose cluster configuration)."""
+    run_binary("chimaera_compose")
+
+
+def wrp_refresh():
+    """Alias for chi_refresh_repo (refresh repository)."""
+    run_binary("chi_refresh_repo")
+
+
+def wrp_cae():
+    """Alias for wrp_cae_omni (CAE OMNI processor)."""
+    run_binary("wrp_cae_omni")

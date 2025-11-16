@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "iowarp-core"
-dynamic = ["version"]
+version = "0.1.0"
 description = "IOWarp Core: High-performance distributed I/O and task execution runtime"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -38,23 +38,32 @@ Homepage = "https://github.com/iowarp"
 # When installed via pip or uv, these commands will be available in the environment's bin directory.
 # The Python wrappers handle finding binaries (bundled or system-installed) and setting up library paths.
 #
-# Main entry point allows: uvx iowarp-core
-# Individual tools allow: wrp_runtime, wrp_cte, etc.
+# Main entry point: uvx iowarp-core
+# Other commands: uvx --from iowarp-core <command>
 
 [project.scripts]
 # Main entry point (allows: uvx iowarp-core)
-iowarp-core = "iowarp_core._cli:wrp_runtime"
+iowarp-core = "iowarp_core._cli:chimaera_start_runtime"
 
-# Production tools
-wrp_cae_omni = "iowarp_core._cli:wrp_cae_omni"
-wrp_cte = "iowarp_core._cli:wrp_cte"
-wrp_runtime = "iowarp_core._cli:wrp_runtime"
-chi_refresh_repo = "iowarp_core._cli:chi_refresh_repo"
-chimaera_compose = "iowarp_core._cli:chimaera_compose"
+# Original names (backwards compatibility)
 chimaera_start_runtime = "iowarp_core._cli:chimaera_start_runtime"
 chimaera_stop_runtime = "iowarp_core._cli:chimaera_stop_runtime"
+chimaera_compose = "iowarp_core._cli:chimaera_compose"
+chi_refresh_repo = "iowarp_core._cli:chi_refresh_repo"
+wrp_cae_omni = "iowarp_core._cli:wrp_cae_omni"
 
-# Test binaries excluded from distribution
+# User-friendly aliases (new, easier to remember)
+wrp_start = "iowarp_core._cli:wrp_start"
+wrp_stop = "iowarp_core._cli:wrp_stop"
+wrp_compose = "iowarp_core._cli:wrp_compose"
+wrp_refresh = "iowarp_core._cli:wrp_refresh"
+wrp_cae = "iowarp_core._cli:wrp_cae"
+
+# Test binaries (for validation)
+test_binary_assim = "iowarp_core._cli:test_binary_assim"
+test_error_handling = "iowarp_core._cli:test_error_handling"
+test_hdf5_assim = "iowarp_core._cli:test_hdf5_assim"
+test_range_assim = "iowarp_core._cli:test_range_assim"
 
 [tool.setuptools]
 packages = ["iowarp_core"]
