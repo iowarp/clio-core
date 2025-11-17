@@ -49,11 +49,12 @@ jobs:
 
   build:
     # Binary wheel distribution for multiple Python versions and architectures
+    # Using ubuntu-20.04 for better manylinux compatibility (GLIBC 2.31 -> manylinux_2_31)
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
       matrix:
-        os: ['ubuntu-latest', 'ubuntu-24.04-arm']
+        os: ['ubuntu-20.04', 'ubuntu-24.04-arm']
         python-version: ['3.10', '3.11', '3.12', '3.13']
 
     steps:
@@ -129,7 +130,7 @@ jobs:
 
   test-sdist:
     needs: build-sdist
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-20.04
     timeout-minutes: 60
 
     steps:
@@ -192,14 +193,14 @@ jobs:
 
   test-wheel-py313:
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-20.04
     timeout-minutes: 60
 
     steps:
     - name: Download Python 3.13 wheel artifact
       uses: actions/download-artifact@v4
       with:
-        name: distributions-ubuntu-latest-py3.13
+        name: distributions-ubuntu-20.04-py3.13
         path: dist/
 
     - name: Set up Miniconda
@@ -256,21 +257,15 @@ jobs:
       run: |
         echo "=== Repairing wheel with auditwheel ==="
 
-        # Determine platform tag based on architecture
-        ARCH=$(uname -m)
-        if [ "$ARCH" = "x86_64" ]; then
-          PLAT="manylinux_2_17_x86_64"
-        elif [ "$ARCH" = "aarch64" ]; then
-          PLAT="manylinux_2_17_aarch64"
-        else
-          echo "Unsupported architecture: $ARCH"
-          exit 1
-        fi
-
-        echo "Platform: $PLAT (detected from $ARCH)"
+        # Let auditwheel auto-detect the best manylinux tag based on system GLIBC
+        # ubuntu-20.04 (GLIBC 2.31) -> manylinux_2_31
+        # ubuntu-24.04-arm (GLIBC varies) -> auto-detected
+        echo "System GLIBC version:"
+        ldd --version | head -1
 
         # Repair wheel to bundle all dependencies and create manylinux-compliant wheel
-        auditwheel repair dist/*.whl -w dist/repaired/ --plat $PLAT
+        # auditwheel will automatically select the appropriate manylinux tag
+        auditwheel repair dist/*.whl -w dist/repaired/
 
         # Replace original wheel with repaired version
         rm dist/*.whl
