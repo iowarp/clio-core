@@ -251,11 +251,60 @@ jobs:
         echo "=== Unzip wheel to inspect structure ==="
         unzip -l dist/*.whl | head -50
 
-    - name: Check wheel with auditwheel
+    - name: Repair wheel with auditwheel (create manylinux-compliant wheel)
       shell: bash -l {0}
       run: |
-        echo "=== Auditwheel check ==="
-        auditwheel show dist/*.whl || true
+        echo "=== Repairing wheel with auditwheel ==="
+
+        # Determine platform tag based on architecture
+        ARCH=$(uname -m)
+        if [ "$ARCH" = "x86_64" ]; then
+          PLAT="manylinux_2_17_x86_64"
+        elif [ "$ARCH" = "aarch64" ]; then
+          PLAT="manylinux_2_17_aarch64"
+        else
+          echo "Unsupported architecture: $ARCH"
+          exit 1
+        fi
+
+        echo "Platform: $PLAT (detected from $ARCH)"
+
+        # Repair wheel to bundle all dependencies and create manylinux-compliant wheel
+        auditwheel repair dist/*.whl -w dist/repaired/ --plat $PLAT
+
+        # Replace original wheel with repaired version
+        rm dist/*.whl
+        mv dist/repaired/*.whl dist/
+        rm -rf dist/repaired/
+
+        # Verify repaired wheel
+        echo ""
+        echo "=== Verifying repaired wheel ==="
+        auditwheel show dist/*.whl
+        echo ""
+        echo "=== Repaired wheel file ==="
+        ls -lh dist/
+
+    - name: Test wheel on clean system (without conda)
+      shell: bash
+      run: |
+        echo "=== Testing repaired wheel on clean system ==="
+        echo "This test verifies the wheel works without conda dependencies"
+
+        # Use system Python (not conda) to create a clean environment
+        /usr/bin/python3 -m venv /tmp/clean_wheel_test
+        source /tmp/clean_wheel_test/bin/activate
+
+        # Install wheel in clean environment
+        pip install dist/*.whl
+
+        # Test import
+        python -c "import iowarp_core; print('✓ Import successful on clean system')"
+        python -c "import iowarp_core; print('✓ Version:', iowarp_core.get_version())"
+        python -c "import sys; print('✓ Python version:', sys.version)"
+
+        deactivate
+        echo "✓ Clean system test passed - wheel is properly bundled!"
 
     - name: Install from wheel
       shell: bash -l {0}
