@@ -176,6 +176,18 @@ echo ""
 
 RECIPE_DIR="$SCRIPT_DIR/conda"
 
+# Verify conda-build is available
+if ! command -v conda-build &> /dev/null; then
+    echo -e "${RED}ERROR: conda-build command not found after installation attempt${NC}"
+    echo "Available conda commands:"
+    conda --help | grep "^  " || true
+    exit 1
+fi
+
+echo -e "${BLUE}Using conda-build: $(which conda-build)${NC}"
+echo -e "${BLUE}Conda build output directory: $(conda info --base)/conda-bld${NC}"
+echo ""
+
 if ! conda build "$RECIPE_DIR" -c conda-forge; then
     echo ""
     echo -e "${RED}======================================================================"
@@ -205,22 +217,51 @@ echo -e "Package built successfully!"
 echo -e "======================================================================${NC}"
 echo ""
 
-# Get the output package path (optional - for informational purposes only)
-# Note: This command may fail in some environments, but it's not critical
-echo -e "${BLUE}Locating built package...${NC}"
-set +e  # Temporarily disable exit-on-error for this non-critical operation
-PACKAGE_PATH=$(conda build "$RECIPE_DIR" --output 2>&1)
-PACKAGE_EXIT_CODE=$?
-set -e  # Re-enable exit-on-error
-
-if [ $PACKAGE_EXIT_CODE -eq 0 ] && [ -n "$PACKAGE_PATH" ]; then
-    echo -e "${BLUE}Package location:${NC}"
-    echo "  $PACKAGE_PATH"
+# Show what was created in conda-bld directory
+echo -e "${BLUE}Checking conda-bld directory contents...${NC}"
+CONDA_BLD_PATH="$CONDA_PREFIX/conda-bld"
+if [ -d "$CONDA_BLD_PATH" ]; then
+    echo "Directory structure:"
+    ls -lah "$CONDA_BLD_PATH" 2>/dev/null || true
+    echo ""
+    echo "Searching for built packages:"
+    find "$CONDA_BLD_PATH" -type f \( -name "*.tar.bz2" -o -name "*.conda" \) -ls 2>/dev/null || echo "No package files found"
     echo ""
 else
-    echo -e "${YELLOW}Note: Could not determine package path (this is non-critical)${NC}"
+    echo -e "${YELLOW}Warning: $CONDA_BLD_PATH does not exist${NC}"
     echo ""
 fi
+
+# Find the built package in the conda-bld directory
+echo -e "${BLUE}Locating built package...${NC}"
+CONDA_BLD_PATH="$CONDA_PREFIX/conda-bld"
+
+# Conda places packages in platform-specific subdirectories (linux-64, osx-64, noarch, etc.)
+# Search in all subdirectories for the package (both .tar.bz2 and .conda formats)
+PACKAGE_PATH=$(find "$CONDA_BLD_PATH" -type f \( -name "iowarp-core-*.tar.bz2" -o -name "iowarp-core-*.conda" \) 2>/dev/null | sort -V | tail -n 1)
+
+if [ -z "$PACKAGE_PATH" ]; then
+    echo -e "${RED}Error: Could not find built package in $CONDA_BLD_PATH${NC}"
+    echo ""
+    echo -e "${YELLOW}Conda build directory contents:${NC}"
+    if [ -d "$CONDA_BLD_PATH" ]; then
+        ls -la "$CONDA_BLD_PATH" 2>/dev/null || true
+        echo ""
+        echo -e "${YELLOW}Searching for package files in subdirectories:${NC}"
+        find "$CONDA_BLD_PATH" -type f \( -name "*.tar.bz2" -o -name "*.conda" \) 2>/dev/null || echo "No package files found"
+    else
+        echo "Directory $CONDA_BLD_PATH does not exist!"
+        echo ""
+        echo -e "${YELLOW}This usually means conda-build didn't complete successfully.${NC}"
+        echo "Check the build output above for errors."
+    fi
+    echo ""
+    exit 1
+fi
+
+echo -e "${BLUE}Package location:${NC}"
+echo "  $PACKAGE_PATH"
+echo ""
 
 # Install the package non-interactively
 echo -e "${BLUE}>>> Installing iowarp-core...${NC}"
@@ -231,7 +272,9 @@ conda config --set always_yes true 2>/dev/null || true
 conda config --add channels conda-forge 2>/dev/null || true
 conda config --set channel_priority flexible 2>/dev/null || true
 
-if conda install --use-local iowarp-core -c conda-forge -y 2>&1; then
+# Install directly from the package file
+# Note: conda-forge channel is already configured above, so no -c flag needed
+if conda install "$PACKAGE_PATH" -y 2>&1; then
     echo ""
     echo -e "${GREEN}======================================================================"
     echo -e "✓ IOWarp Core installed successfully!"
@@ -260,7 +303,7 @@ else
     echo ""
     echo -e "${YELLOW}You can try installing manually:${NC}"
     echo "  conda config --add channels conda-forge"
-    echo "  conda install --use-local iowarp-core -c conda-forge"
+    echo "  conda install $PACKAGE_PATH"
     echo ""
     echo -e "${YELLOW}Or check that conda-forge channel is available:${NC}"
     echo "  conda config --show channels"
