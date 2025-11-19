@@ -362,12 +362,12 @@ class CMakeBuild(build_ext):
 
                 print(f"\nTotal conda dependencies copied: {len(copied_libs)}")
 
-        # Note: RPATH fixing is not needed because:
-        # - CMake already sets correct relative RPATH ($ORIGIN) at build time
-        # - All IOWarp libraries and binaries are already relocatable
-        # - Bundled libraries retain their CMake-configured RPATH when copied
+        # Note: RPATH is set to absolute paths by CMake at build time
+        # - CMake sets absolute RPATH (${CMAKE_INSTALL_PREFIX}/lib) for source builds
+        # - This is intended for source-only builds, not relocatable binary distributions
+        # - If creating relocatable packages, RPATH would need to be fixed post-build
         print("\nBinary copying complete!")
-        print("Note: Libraries already have correct RPATH set by CMake build system\n")
+        print("Note: Libraries have absolute RPATH set by CMake build system\n")
 
 
 class BinaryDistribution(Distribution):

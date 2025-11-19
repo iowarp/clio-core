@@ -40,6 +40,26 @@ NEVER DO MOCK CODE OR STUB CODE UNLESS SPECIFICALLY STATED OTHERWISE. ALWAYS IMP
 
 ## Build Configuration
 
+### Dependency Management Strategy
+
+**IMPORTANT**: IOWarp Core uses **conda for all major dependencies** to avoid library conflicts.
+
+**Why Conda?**
+- Prevents version conflicts between system and conda libraries (e.g., system HDF5 with conda libcurl)
+- Ensures reproducible builds across different systems
+- All dependencies are installed in the devcontainer: boost, hdf5, yaml-cpp, zeromq, cereal, catch2, poco, nlohmann_json, etc.
+- No need to install system development packages via apt
+
+**In the Devcontainer:**
+- The conda base environment is auto-activated with all dependencies
+- CMake will automatically find conda packages via `CMAKE_PREFIX_PATH`
+- Do NOT install development libraries via apt (libboost-dev, libhdf5-dev, etc.) - use conda instead
+
+**Outside the Devcontainer:**
+- Option 1 (Recommended): Use conda to install dependencies: `conda install boost hdf5 yaml-cpp zeromq cereal catch2 poco nlohmann_json`
+- Option 2: Run `install.sh` to build dependencies from source
+- Option 3: Use system packages at your own risk (may cause library conflicts)
+
 ### Component Build Options
 The unified IOWarp Core build system provides options to enable/disable components:
 - `WRP_CORE_ENABLE_RUNTIME`: Enable runtime component (default: ON)
@@ -60,11 +80,11 @@ cmake --preset=debug -DWRP_CORE_ENABLE_CTE=ON -DWRP_CORE_ENABLE_CAE=OFF
 - All compilation warnings have been resolved as of the current state
 
 ### RPATH Configuration
-The build system uses **relative RPATHs** for relocatable installations:
-- **Linux**: Uses `$ORIGIN` for runtime library search paths relative to the binary/library
-- **macOS**: Uses `@loader_path` for runtime library search paths relative to the binary/library
-- Libraries search for dependencies in `$ORIGIN/../lib` and `$ORIGIN` (or macOS equivalents)
-- This allows the entire installation directory to be moved to any location without breaking library dependencies
+The build system uses **absolute RPATHs** for source-only builds:
+- **Linux**: Uses `${CMAKE_INSTALL_PREFIX}/lib` for runtime library search paths
+- **macOS**: Uses `${CMAKE_INSTALL_PREFIX}/lib` for runtime library search paths
+- Libraries are linked with absolute paths to the installation directory
+- This configuration is designed for building from source only, not for relocatable binary distributions
 - RPATH is enabled by default via `WRP_CORE_ENABLE_RPATH=ON`
 
 ### HSHM Usage

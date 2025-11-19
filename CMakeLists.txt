@@ -445,6 +445,7 @@ if(WRP_CORE_ENABLE_HDF5)
                 set(HDF5_LIBRARIES hdf5-static)
             endif()
         endif()
+
     else()
         message(FATAL_ERROR "HDF5 not found. Please install HDF5 or run install.sh to build from submodules.")
     endif()
@@ -504,23 +505,22 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # RPATH configuration (optional)
 if(WRP_CORE_ENABLE_RPATH)
-    message(STATUS "RPATH enabled with relative paths for relocatable installations")
+    message(STATUS "RPATH enabled with absolute paths (source-only builds)")
     set(CMAKE_SKIP_BUILD_RPATH FALSE)
     set(CMAKE_BUILD_WITH_INSTALL_RPATH FALSE)
     set(CMAKE_INSTALL_RPATH_USE_LINK_PATH FALSE)
 
-    # Platform-specific RPATH configuration using relative paths
-    # This allows the installation to be relocated to any directory
-    # Order matters: Check same directory first, then ../lib for binaries
+    # Platform-specific RPATH configuration using absolute paths
+    # This is intended for source-only builds, not relocatable installations
     if(APPLE)
         set(CMAKE_MACOSX_RPATH TRUE)
-        # Use @loader_path for macOS - relative to the loading binary/library
-        set(CMAKE_INSTALL_RPATH "@loader_path:@loader_path/../lib")
-        set(CMAKE_BUILD_RPATH "@loader_path:@loader_path/../lib")
+        # Use absolute path to installation lib directory
+        set(CMAKE_INSTALL_RPATH "${CMAKE_INSTALL_PREFIX}/lib")
+        set(CMAKE_BUILD_RPATH "${CMAKE_BINARY_DIR}/bin")
     elseif(UNIX)
-        # Use $ORIGIN for Linux - relative to the loading binary/library
-        set(CMAKE_INSTALL_RPATH "$ORIGIN:$ORIGIN/../lib")
-        set(CMAKE_BUILD_RPATH "$ORIGIN:$ORIGIN/../lib")
+        # Use absolute path to installation lib directory
+        set(CMAKE_INSTALL_RPATH "${CMAKE_INSTALL_PREFIX}/lib")
+        set(CMAKE_BUILD_RPATH "${CMAKE_BINARY_DIR}/bin")
     endif()
 else()
     message(STATUS "RPATH disabled - libraries will not have embedded runtime paths")

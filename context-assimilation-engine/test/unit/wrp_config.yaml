@@ -1,5 +1,5 @@
 # WRP Configuration Example
-# Demonstrates how to configure Chimaera runtime with CTE and CAE ChiMods
+# Demonstrates how to configure Chimaera runtime with CTE and CAE modules
 # This configuration combines runtime settings with declarative pool creation
 
 # Worker thread configuration
@@ -31,9 +31,9 @@ runtime:
   heartbeat_interval: 1000
 
 # Compose section - declarative pool creation
-# Creates CTE and CAE ChiMods with their respective configurations
+# Creates CTE and CAE modules with their respective configurations
 compose:
-  # CTE Core ChiMod with storage configuration
+  # CTE Core module with storage configuration
   # Pool ID: 512.0 (defined in wrp_cte/core/constants.h)
   # Pool name: "cte_main" (user-defined)
   - mod_name: wrp_cte_core
@@ -60,7 +60,7 @@ compose:
       dpe_type: "max_bw"  # Options: "random", "round_robin", "max_bw"
 
 
-  # CAE Core ChiMod for data assimilation
+  # CAE Core module for data assimilation
   # Pool ID: 400.0 (defined in wrp_cae/core/constants.h as kCaePoolId)
   # Pool name: "cae_main" (user-defined)
   - mod_name: wrp_cae_core
