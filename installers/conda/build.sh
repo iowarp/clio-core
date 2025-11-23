@@ -37,11 +37,12 @@ mkdir -p build
 cd build
 
 # Configure with CMake using the conda preset
-# The conda preset is optimized for conda-build and automatically detects $CONDA_PREFIX
+# The conda preset enables WRP_CORE_ENABLE_CONDA which uses $CONDA_PREFIX for paths
 cmake .. \
     --preset conda \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX=$PREFIX \
+    -DWRP_CORE_ENABLE_CONDA=ON \
     "${CMAKE_EXTRA_ARGS[@]}"
 
 # Build and install
