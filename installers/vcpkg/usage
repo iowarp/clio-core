@@ -1,0 +1,23 @@
+iowarp-core provides CMake targets:
+
+Core Components:
+    find_package(iowarp-core CONFIG REQUIRED)
+
+    # Link to ChiMod libraries
+    target_link_libraries(main PRIVATE
+        chimaera::admin_client      # Admin ChiMod
+        chimaera::bdev_client       # Block device ChiMod
+        wrp_cte::core_client        # Context Transfer Engine (if enabled)
+        wrp_cae::core_client        # Context Assimilation Engine (if enabled)
+    )
+
+Individual Components (advanced usage):
+    find_package(HermesShm CONFIG REQUIRED)
+    find_package(chimaera CONFIG REQUIRED)
+    find_package(chimaera_admin CONFIG REQUIRED)
+    find_package(chimaera_bdev CONFIG REQUIRED)
+    find_package(wrp_cte_core CONFIG REQUIRED)
+    find_package(wrp_cae_core CONFIG REQUIRED)
+
+For more information, see:
+    https://www.iowarp.ai/docs

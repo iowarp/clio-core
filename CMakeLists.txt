@@ -28,32 +28,31 @@ option(WRP_CORE_ENABLE_CMAKE_DOTENV "Enable reading environment variables from .
 option(WRP_CORE_ENABLE_ASAN "Enable AddressSanitizer for debugging" OFF)
 option(WRP_CORE_ENABLE_COVERAGE "Enable code coverage instrumentation for all components" OFF)
 option(WRP_CORE_ENABLE_DOXYGEN "Check how well the code is documented" OFF)
-option(WRP_CORE_ENABLE_RPATH "Enable RPATH for installed libraries" ON)
+option(WRP_CORE_ENABLE_RPATH "Enable RPATH configuration with absolute paths" ON)
 option(WRP_CORE_ENABLE_CPACK "Enable CPack for package generation" OFF)
+option(WRP_CORE_ENABLE_CONDA "Enable Conda environment configuration (adds Conda paths to include/link directories)" OFF)
 option(BUILD_SHARED_LIBS "Build shared libraries (.dll/.so) instead of static ones (.lib/.a)" ON)
 
 # Installation Prefix Configuration
-# - Conda (primary): CMAKE_INSTALL_PREFIX is automatically set to $CONDA_PREFIX during conda build
-# - Custom installs: Set CMAKE_INSTALL_PREFIX to desired root directory
+# - For Conda builds: Set CMAKE_INSTALL_PREFIX via -DCMAKE_INSTALL_PREFIX=$CONDA_PREFIX
+# - For custom installs: Set CMAKE_INSTALL_PREFIX to desired root directory
 # Libraries install to ${CMAKE_INSTALL_PREFIX}/lib
 # Python bindings install to ${CMAKE_INSTALL_PREFIX}/lib/pythonX.Y/site-packages
 
 #------------------------------------------------------------------------------
-# Build System Detection and Configuration
+# Conda Environment Configuration (Explicit)
 #------------------------------------------------------------------------------
-# Detect if we're building in a Conda environment
-if(DEFINED ENV{CONDA_PREFIX})
-    set(IN_CONDA_BUILD TRUE)
-    message(STATUS "Conda environment detected: $ENV{CONDA_PREFIX}")
-
-    # Conda automatically sets CMAKE_INSTALL_PREFIX to $CONDA_PREFIX
-    # Verify this is set correctly
-    if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
-        set(CMAKE_INSTALL_PREFIX "$ENV{CONDA_PREFIX}" CACHE PATH "Install prefix" FORCE)
-        message(STATUS "Setting CMAKE_INSTALL_PREFIX to CONDA_PREFIX: ${CMAKE_INSTALL_PREFIX}")
+# Conda support is enabled explicitly via WRP_CORE_ENABLE_CONDA option.
+# When enabled, the build system expects CONDA_PREFIX to be set.
+if(WRP_CORE_ENABLE_CONDA)
+    if(NOT DEFINED ENV{CONDA_PREFIX})
+        message(FATAL_ERROR "WRP_CORE_ENABLE_CONDA is ON but CONDA_PREFIX environment variable is not set")
     endif()
 
-    # Add conda prefix to CMAKE_PREFIX_PATH for better dependency discovery
+    set(IN_CONDA_BUILD TRUE)
+    message(STATUS "Conda environment enabled: $ENV{CONDA_PREFIX}")
+
+    # Add conda prefix to CMAKE_PREFIX_PATH for dependency discovery
     list(APPEND CMAKE_PREFIX_PATH "$ENV{CONDA_PREFIX}")
 
     # Conda-specific library and include paths
@@ -70,21 +69,12 @@ if(DEFINED ENV{CONDA_PREFIX})
     message(STATUS "  CMAKE_PREFIX_PATH:  ${CMAKE_PREFIX_PATH}")
 else()
     set(IN_CONDA_BUILD FALSE)
-    message(STATUS "Not building in Conda environment")
-endif()
-
-# Detect if we're building with scikit-build-core (pip install)
-if(DEFINED SKBUILD)
-    set(IN_PIP_BUILD TRUE)
-    message(STATUS "Pip/scikit-build-core build detected")
-else()
-    set(IN_PIP_BUILD FALSE)
+    message(STATUS "Conda environment support disabled (use -DWRP_CORE_ENABLE_CONDA=ON to enable)")
 endif()
 
 # Print build system summary
 message(STATUS "Build system configuration:")
 message(STATUS "  Conda build:        ${IN_CONDA_BUILD}")
-message(STATUS "  Pip build:          ${IN_PIP_BUILD}")
 message(STATUS "  Install prefix:     ${CMAKE_INSTALL_PREFIX}")
 
 #------------------------------------------------------------------------------
@@ -496,28 +486,81 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # Position Independent Code - Applied to all subdirectories
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-# RPATH configuration (optional)
+# RPATH configuration - Conditionally enabled based on WRP_CORE_ENABLE_RPATH
 if(WRP_CORE_ENABLE_RPATH)
-    message(STATUS "RPATH enabled with absolute paths (source-only builds)")
-    set(CMAKE_SKIP_BUILD_RPATH FALSE)
-    set(CMAKE_BUILD_WITH_INSTALL_RPATH FALSE)
-    set(CMAKE_INSTALL_RPATH_USE_LINK_PATH FALSE)
+message(STATUS "RPATH ENABLED with ABSOLUTE paths including all dependency locations")
+set(CMAKE_SKIP_BUILD_RPATH FALSE)
+set(CMAKE_BUILD_WITH_INSTALL_RPATH FALSE)
+set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)  # CRITICAL: Include dependency library paths!
 
-    # Platform-specific RPATH configuration using absolute paths
-    # This is intended for source-only builds, not relocatable installations
-    if(APPLE)
-        set(CMAKE_MACOSX_RPATH TRUE)
-        # Use absolute path to installation lib directory
-        set(CMAKE_INSTALL_RPATH "${CMAKE_INSTALL_PREFIX}/lib")
-        set(CMAKE_BUILD_RPATH "${CMAKE_BINARY_DIR}/bin")
-    elseif(UNIX)
-        # Use absolute path to installation lib directory
-        set(CMAKE_INSTALL_RPATH "${CMAKE_INSTALL_PREFIX}/lib")
-        set(CMAKE_BUILD_RPATH "${CMAKE_BINARY_DIR}/bin")
-    endif()
+# Build list of ABSOLUTE RPATH entries
+set(ABSOLUTE_RPATH_LIST "")
+
+# 1. Installation lib directory (ABSOLUTE)
+list(APPEND ABSOLUTE_RPATH_LIST "${CMAKE_INSTALL_PREFIX}/lib")
+
+# 2. Conda environment lib directory (if Conda support is enabled)
+if(IN_CONDA_BUILD)
+    list(APPEND ABSOLUTE_RPATH_LIST "$ENV{CONDA_PREFIX}/lib")
+    message(STATUS "  Adding Conda lib to RPATH: $ENV{CONDA_PREFIX}/lib")
+endif()
+
+# 3. Add Boost library directories (ABSOLUTE paths from find_package)
+if(Boost_LIBRARY_DIRS)
+    foreach(BOOST_LIB_DIR ${Boost_LIBRARY_DIRS})
+        list(APPEND ABSOLUTE_RPATH_LIST "${BOOST_LIB_DIR}")
+        message(STATUS "  Adding Boost lib to RPATH: ${BOOST_LIB_DIR}")
+    endforeach()
+endif()
+
+# 4. Add HDF5 library directories if enabled
+if(WRP_CORE_ENABLE_HDF5 AND HDF5_LIBRARY_DIRS)
+    foreach(HDF5_LIB_DIR ${HDF5_LIBRARY_DIRS})
+        list(APPEND ABSOLUTE_RPATH_LIST "${HDF5_LIB_DIR}")
+        message(STATUS "  Adding HDF5 lib to RPATH: ${HDF5_LIB_DIR}")
+    endforeach()
+endif()
+
+# 5. Add any CMAKE_PREFIX_PATH lib directories
+if(CMAKE_PREFIX_PATH)
+    foreach(PREFIX_PATH ${CMAKE_PREFIX_PATH})
+        if(EXISTS "${PREFIX_PATH}/lib")
+            list(APPEND ABSOLUTE_RPATH_LIST "${PREFIX_PATH}/lib")
+            message(STATUS "  Adding prefix lib to RPATH: ${PREFIX_PATH}/lib")
+        endif()
+        if(EXISTS "${PREFIX_PATH}/lib64")
+            list(APPEND ABSOLUTE_RPATH_LIST "${PREFIX_PATH}/lib64")
+            message(STATUS "  Adding prefix lib64 to RPATH: ${PREFIX_PATH}/lib64")
+        endif()
+    endforeach()
+endif()
+
+# Remove duplicates
+list(REMOVE_DUPLICATES ABSOLUTE_RPATH_LIST)
+
+# Platform-specific RPATH configuration
+if(APPLE)
+    set(CMAKE_MACOSX_RPATH TRUE)
+    set(CMAKE_INSTALL_RPATH "${ABSOLUTE_RPATH_LIST}")
+    set(CMAKE_BUILD_RPATH "${CMAKE_BINARY_DIR}/bin")
+elseif(UNIX)
+    set(CMAKE_INSTALL_RPATH "${ABSOLUTE_RPATH_LIST}")
+    set(CMAKE_BUILD_RPATH "${CMAKE_BINARY_DIR}/bin")
+endif()
+
+message(STATUS "==================================================================")
+message(STATUS "RPATH Configuration (ABSOLUTE paths):")
+message(STATUS "  CMAKE_INSTALL_PREFIX: ${CMAKE_INSTALL_PREFIX}")
+message(STATUS "  Final INSTALL_RPATH: ${CMAKE_INSTALL_RPATH}")
+message(STATUS "  Final BUILD_RPATH: ${CMAKE_BUILD_RPATH}")
+message(STATUS "")
+message(STATUS "IMPORTANT: RPATH is baked in at BUILD time!")
+message(STATUS "  If you install to a different --prefix, you MUST rebuild!")
+message(STATUS "  Example: cmake --preset=release -DCMAKE_INSTALL_PREFIX=/new/path")
+message(STATUS "==================================================================")
+message(STATUS "")
 else()
-    message(STATUS "RPATH disabled - libraries will not have embedded runtime paths")
-    set(CMAKE_SKIP_INSTALL_RPATH TRUE)
+message(STATUS "RPATH DISABLED - libraries may require LD_LIBRARY_PATH configuration")
 endif()
 
 #------------------------------------------------------------------------------
@@ -709,28 +752,6 @@ message(STATUS "    AddressSanitizer:           ${WRP_CORE_ENABLE_ASAN}")
 message(STATUS "    Code Coverage:              ${WRP_CORE_ENABLE_COVERAGE}")
 message(STATUS "")
 
-#------------------------------------------------------------------------------
-# Python Package Installation Support
-#------------------------------------------------------------------------------
-# When building with scikit-build-core (pip install), install Python package files
-
-# Check if we're being built by scikit-build-core
-if(DEFINED SKBUILD)
-    message(STATUS "Building with scikit-build-core for Python package installation")
-
-    # Install Python package __init__.py
-    install(
-        FILES
-            "${CMAKE_CURRENT_SOURCE_DIR}/iowarp/__init__.py"
-        DESTINATION
-            "iowarp"
-    )
-
-    # The Python extensions (wrp_cte_core) are already installed by the component CMakeLists.txt
-    # We just need to ensure they go to the right location for Python import
-
-    message(STATUS "Python package files will be installed to: ${CMAKE_INSTALL_PREFIX}/iowarp")
-endif()
 
 #------------------------------------------------------------------------------
 # CPack Configuration

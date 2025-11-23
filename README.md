@@ -175,110 +175,161 @@ wrp_cae_omni
 
 **Note:** Build from source takes 10-30 minutes on first install (compiles C++ dependencies).
 
-### Quick Install with pip (Easiest)
+### Install Using Package Managers
 
-The easiest way to install IOWarp Core is using pip. All dependencies are automatically built and installed into your Python environment - no system packages required!
+<details>
+<summary><b>🐍 Install with Conda (Recommended)</b></summary>
 
-**Prerequisites:** Only Python 3.8+ and a C++17 compiler
+Conda provides isolated environments and manages all dependencies automatically. This is the recommended method for most users.
+
+#### Install Conda
+
+If you don't have Conda installed, install Miniforge (recommended) or Miniconda:
 
 ```bash
-# Ubuntu/Debian
-sudo apt-get update
-sudo apt-get install -y build-essential python3-dev python3-pip
+# Linux/macOS - Install Miniforge (includes conda-forge by default)
+curl -L -O "https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-$(uname)-$(uname -m).sh"
+bash Miniforge3-$(uname)-$(uname -m).sh
 
-# macOS (Xcode command line tools)
-xcode-select --install
+# Or install Miniconda
+# Linux
+wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
+bash Miniconda3-latest-Linux-x86_64.sh
+
+# macOS
+curl -O https://repo.anaconda.com/miniconda/Miniconda3-latest-MacOSX-x86_64.sh
+bash Miniconda3-latest-MacOSX-x86_64.sh
 ```
 
-**Install IOWarp Core:**
+#### Install IOWarp Core
+
 ```bash
-# Clone the repository (pip install requires local clone)
+# Clone the repository
 git clone https://github.com/iowarp/core.git
 cd core
 
-# Basic installation - builds and installs everything automatically
-pip install .
+# Create a new conda environment with all dependencies
+conda env create -f environment.yml
 
-# Or install in editable mode for development
-pip install -e .
+# Activate the environment
+conda activate iowarp
+
+# Install IOWarp Core
+./installers/conda/install.sh
 ```
 
-**Customization with Environment Variables:**
+**What Gets Installed:**
 
-You can customize the pip installation using CMake environment variables:
+All dependencies are managed by Conda:
+- Boost, HDF5, yaml-cpp, ZeroMQ, cereal, Catch2
+- Poco, nlohmann_json
+- Optional: MPI, compression libraries, encryption libraries
+
+**Environment Variables:**
+
+The Conda environment automatically configures paths. After activation, you can use IOWarp Core immediately:
 
 ```bash
-# Enable tests and benchmarks
-WRP_CORE_ENABLE_TESTS=ON WRP_CORE_ENABLE_BENCHMARKS=ON pip install .
-
-# Enable MPI support (requires MPI to be installed)
-WRP_CORE_ENABLE_MPI=ON pip install .
-
-# Enable specific components only
-WRP_CORE_ENABLE_CTE=ON WRP_CORE_ENABLE_CAE=OFF WRP_CORE_ENABLE_CEE=OFF pip install .
-
-# Enable compression and encryption support
-WRP_CORE_ENABLE_COMPRESS=ON WRP_CORE_ENABLE_ENCRYPT=ON pip install .
-
-# Enable GPU support (CUDA or ROCm)
-WRP_CORE_ENABLE_CUDA=ON pip install .
-WRP_CORE_ENABLE_ROCM=ON pip install .
-
-# Enable advanced networking (libfabric/Thallium)
-WRP_CORE_ENABLE_LIBFABRIC=ON WRP_CORE_ENABLE_THALLIUM=ON pip install .
-
-# Full customization example
-WRP_CORE_ENABLE_TESTS=ON \
-WRP_CORE_ENABLE_BENCHMARKS=ON \
-WRP_CORE_ENABLE_MPI=ON \
-WRP_CORE_ENABLE_COMPRESS=ON \
-WRP_CORE_ENABLE_OPENMP=ON \
-pip install .
+conda activate iowarp
+# All tools and libraries are ready to use!
 ```
 
-**Available CMake Options (for pip install):**
+**Customization:**
 
-*Component Control:*
-- `WRP_CORE_ENABLE_RUNTIME`: Enable runtime component (default: ON)
-- `WRP_CORE_ENABLE_CTE`: Enable Context Transfer Engine (default: ON)
-- `WRP_CORE_ENABLE_CAE`: Enable Context Assimilation Engine (default: ON)
-- `WRP_CORE_ENABLE_CEE`: Enable Context Exploration Engine (default: ON)
+```bash
+# Install with tests and benchmarks
+WRP_CORE_ENABLE_TESTS=ON WRP_CORE_ENABLE_BENCHMARKS=ON ./installers/conda/install.sh
 
-*Build Features:*
-- `WRP_CORE_ENABLE_TESTS`: Enable tests (default: OFF)
-- `WRP_CORE_ENABLE_BENCHMARKS`: Enable benchmarks (default: OFF)
-- `WRP_CORE_ENABLE_PYTHON`: Enable Python bindings (default: OFF, automatically ON for pip)
+# Enable MPI support
+WRP_CORE_ENABLE_MPI=ON ./installers/conda/install.sh
 
-*Distributed Computing:*
-- `WRP_CORE_ENABLE_MPI`: Enable MPI support (default: OFF)
-- `WRP_CORE_ENABLE_ZMQ`: Enable ZeroMQ transport (default: ON)
-- `WRP_CORE_ENABLE_LIBFABRIC`: Enable libfabric transport (default: OFF)
-- `WRP_CORE_ENABLE_THALLIUM`: Enable Thallium RPC (default: OFF)
-
-*Data Processing:*
-- `WRP_CORE_ENABLE_CEREAL`: Enable serialization (default: ON)
-- `WRP_CORE_ENABLE_COMPRESS`: Enable compression libraries (default: OFF)
-- `WRP_CORE_ENABLE_ENCRYPT`: Enable encryption (default: OFF)
-- `WRP_CORE_ENABLE_HDF5`: Enable HDF5 support (default: ON)
-
-*Performance:*
-- `WRP_CORE_ENABLE_OPENMP`: Enable OpenMP (default: OFF)
-- `WRP_CORE_ENABLE_CUDA`: Enable CUDA support (default: OFF)
-- `WRP_CORE_ENABLE_ROCM`: Enable ROCm support (default: OFF)
-
-*Development/Debugging:*
-- `WRP_CORE_ENABLE_ASAN`: Enable AddressSanitizer (default: OFF)
-- `WRP_CORE_ENABLE_COVERAGE`: Enable code coverage (default: OFF)
-- `WRP_CORE_ENABLE_DOXYGEN`: Enable documentation checks (default: OFF)
+# Custom conda prefix
+CONDA_PREFIX=$HOME/miniconda3/envs/my_iowarp ./installers/conda/install.sh
+```
 
 **Verify Installation:**
-```python
-import wrp_cte  # Context Transfer Engine
-import wrp_cee  # Context Exploration Engine
-print("IOWarp Core successfully installed!")
+```bash
+conda activate iowarp
+python -c "import wrp_cte; import wrp_cee; print('IOWarp Core successfully installed!')"
 ```
 
-**Note:** First installation takes 10-15 minutes as dependencies build from source. Everything is installed to your Python environment - no manual environment variable configuration needed!
+</details>
+
+<details>
+<summary><b>📦 Install with vcpkg</b></summary>
+
+vcpkg is a cross-platform C++ package manager that simplifies dependency management.
+
+#### Install vcpkg
+
+```bash
+# Clone vcpkg
+git clone https://github.com/microsoft/vcpkg.git
+cd vcpkg
+
+# Bootstrap vcpkg
+./bootstrap-vcpkg.sh  # Linux/macOS
+# or
+./bootstrap-vcpkg.bat  # Windows
+
+# Add to PATH (optional but recommended)
+export PATH="$PWD:$PATH"
+echo 'export PATH="/path/to/vcpkg:$PATH"' >> ~/.bashrc
+```
+
+#### Install IOWarp Core
+
+```bash
+# Clone the repository
+git clone https://github.com/iowarp/core.git
+cd core
+
+# Install dependencies using vcpkg
+./installers/vcpkg/install.sh
+```
+
+**What Gets Installed:**
+
+vcpkg manages all C++ dependencies:
+- Boost (context, fiber, system components)
+- HDF5, yaml-cpp, ZeroMQ
+- cereal, Catch2, Poco
+- nlohmann-json
+- Optional: MPI, compression libraries, encryption libraries
+
+**CMake Integration:**
+
+vcpkg automatically integrates with CMake. The installer sets up the toolchain file:
+
+```bash
+# CMake will automatically find vcpkg-installed packages
+cmake --preset=debug -DCMAKE_TOOLCHAIN_FILE=/path/to/vcpkg/scripts/buildsystems/vcpkg.cmake
+```
+
+**Customization:**
+
+```bash
+# Custom vcpkg installation path
+VCPKG_ROOT=/path/to/vcpkg ./installers/vcpkg/install.sh
+
+# Enable optional features
+WRP_CORE_ENABLE_TESTS=ON \
+WRP_CORE_ENABLE_MPI=ON \
+./installers/vcpkg/install.sh
+```
+
+**Environment Variables:**
+
+After installation, add to your `~/.bashrc` or `~/.zshrc`:
+
+```bash
+export VCPKG_ROOT=/path/to/vcpkg
+export CMAKE_TOOLCHAIN_FILE=$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake
+```
+
+</details>
+
+**Note:** First installation takes 10-15 minutes as dependencies build from source.
 
 ### Alternative: Install Using install.sh
 
@@ -331,9 +382,44 @@ BUILD_JOBS=16 \
 - `WRP_CORE_ENABLE_BENCHMARKS`: Enable building benchmarks (default: `OFF`)
 - `WRP_CORE_ENABLE_MPI`: Enable MPI support (default: `OFF`)
 
-**All CMake Options Also Work:**
+**Available CMake Options:**
 
-You can use ANY of the CMake options listed in the pip section above with install.sh:
+All CMake build options can be used with install.sh as environment variables:
+
+*Component Control:*
+- `WRP_CORE_ENABLE_RUNTIME`: Enable runtime component (default: ON)
+- `WRP_CORE_ENABLE_CTE`: Enable Context Transfer Engine (default: ON)
+- `WRP_CORE_ENABLE_CAE`: Enable Context Assimilation Engine (default: ON)
+- `WRP_CORE_ENABLE_CEE`: Enable Context Exploration Engine (default: ON)
+
+*Build Features:*
+- `WRP_CORE_ENABLE_TESTS`: Enable tests (default: OFF)
+- `WRP_CORE_ENABLE_BENCHMARKS`: Enable benchmarks (default: OFF)
+- `WRP_CORE_ENABLE_PYTHON`: Enable Python bindings (default: OFF)
+
+*Distributed Computing:*
+- `WRP_CORE_ENABLE_MPI`: Enable MPI support (default: OFF)
+- `WRP_CORE_ENABLE_ZMQ`: Enable ZeroMQ transport (default: ON)
+- `WRP_CORE_ENABLE_LIBFABRIC`: Enable libfabric transport (default: OFF)
+- `WRP_CORE_ENABLE_THALLIUM`: Enable Thallium RPC (default: OFF)
+
+*Data Processing:*
+- `WRP_CORE_ENABLE_CEREAL`: Enable serialization (default: ON)
+- `WRP_CORE_ENABLE_COMPRESS`: Enable compression libraries (default: OFF)
+- `WRP_CORE_ENABLE_ENCRYPT`: Enable encryption (default: OFF)
+- `WRP_CORE_ENABLE_HDF5`: Enable HDF5 support (default: ON)
+
+*Performance:*
+- `WRP_CORE_ENABLE_OPENMP`: Enable OpenMP (default: OFF)
+- `WRP_CORE_ENABLE_CUDA`: Enable CUDA support (default: OFF)
+- `WRP_CORE_ENABLE_ROCM`: Enable ROCm support (default: OFF)
+
+*Development/Debugging:*
+- `WRP_CORE_ENABLE_ASAN`: Enable AddressSanitizer (default: OFF)
+- `WRP_CORE_ENABLE_COVERAGE`: Enable code coverage (default: OFF)
+- `WRP_CORE_ENABLE_DOXYGEN`: Enable documentation checks (default: OFF)
+
+**Examples:**
 
 ```bash
 # Enable compression and encryption

@@ -14,6 +14,7 @@
             "description": "Conda build configuration - optimized for conda-build",
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Release",
+                "WRP_CORE_ENABLE_CONDA": "ON",
                 "WRP_CORE_ENABLE_RUNTIME": "ON",
                 "WRP_CORE_ENABLE_CTE": "ON",
                 "WRP_CORE_ENABLE_CAE": "ON",

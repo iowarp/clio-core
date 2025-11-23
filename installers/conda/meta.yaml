@@ -1,0 +1,59 @@
+{% set name = "iowarp-core" %}
+{% set version = environ.get('GIT_DESCRIBE_TAG', '0.0.0').lstrip('v') %}
+
+package:
+  name: {{ name|lower }}
+  version: {{ version }}
+
+source:
+  # For local builds - path is relative to installers/conda directory
+  path: ../..
+  # Git metadata for version extraction
+  # When building from a git checkout, conda-build will automatically
+  # set GIT_DESCRIBE_TAG from the repository
+
+build:
+  number: 0
+  skip: true  # [win]
+
+requirements:
+  build:
+    - {{ compiler('c') }}
+    - {{ compiler('cxx') }}
+    - cmake >=3.15
+    - make
+    - git
+  host:
+    - python
+    - hdf5
+    - zeromq
+    - libboost
+    - boost-cpp
+    - cereal
+    - yaml-cpp
+    - nanobind
+  run:
+    - python
+    - {{ pin_compatible('libboost', max_pin='x.x') }}
+    - boost-cpp
+    - hdf5
+    - zeromq
+    - yaml-cpp
+    - cereal
+
+about:
+  home: https://www.iowarp.ai
+  license: BSD-3-Clause
+  license_file: LICENSE
+  summary: 'IOWarp Context Management Platform'
+  description: |
+    IOWarp is a context management platform designed to accelerate scientific
+    workflows by solving data bottlenecks using AI. It enables AI agents to
+    orchestrate large-scale data, complex multi-step workflows, and autonomous
+    agentic orchestration in high-performance computing environments.
+  dev_url: https://github.com/iowarp/core
+  doc_url: https://www.iowarp.ai/docs/intro
+
+extra:
+  recipe-maintainers:
+    - iowarp
