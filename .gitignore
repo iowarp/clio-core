@@ -24,6 +24,7 @@ venv
 *.dylib
 *.dll
 *.pyd
+*.egg-info
 
 # Static libraries
 libnanobind-static.a
