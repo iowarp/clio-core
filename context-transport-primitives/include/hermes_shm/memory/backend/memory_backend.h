@@ -104,11 +104,11 @@ class MemoryBackend {
   char *data_;      // Data buffer for allocators
   size_t data_size_;// Data buffer size for allocators
   int data_id_;     // Device ID for the data buffer (GPU ID, etc.)
-  u64 root_offset_; // Offset from root backend (0 if this is root, non-zero for sub-allocators)
+  u64 data_offset_; // Offset from root backend (0 if this is root, non-zero for sub-allocators)
 
  public:
   HSHM_CROSS_FUN
-  MemoryBackend() : header_(nullptr), md_(nullptr), md_size_(0), data_(nullptr), data_size_(0), data_id_(-1), root_offset_(0) {}
+  MemoryBackend() : header_(nullptr), md_(nullptr), md_size_(0), data_(nullptr), data_size_(0), data_id_(-1), data_offset_(0) {}
 
   ~MemoryBackend() = default;
 
@@ -157,11 +157,24 @@ class MemoryBackend {
   HSHM_CROSS_FUN
   const MemoryBackendId &GetId() const { return header_->id_; }
 
+  /**
+   * Shift the data pointer by an offset amount
+   * Updates both data_size_ and data_offset_ fields
+   *
+   * @param offset The amount to shift the data pointer
+   */
+  HSHM_CROSS_FUN
+  void Shift(size_t offset) {
+    data_ += offset;
+    data_size_ -= offset;
+    data_offset_ += offset;
+  }
+
   HSHM_CROSS_FUN
   void Print() const {
     header_->Print();
-    printf("(%s) MemoryBackend: md: %p, md_size: %lu, data: %p, data_size: %lu, root_offset: %lu\n",
-           kCurrentDevice, md_, (long unsigned)md_size_, data_, (long unsigned)data_size_, (long unsigned)root_offset_);
+    printf("(%s) MemoryBackend: md: %p, md_size: %lu, data: %p, data_size: %lu, data_offset: %lu\n",
+           kCurrentDevice, md_, (long unsigned)md_size_, data_, (long unsigned)data_size_, (long unsigned)data_offset_);
   }
 
   /// Each allocator must define its own shm_init.

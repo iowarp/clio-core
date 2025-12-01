@@ -16,8 +16,7 @@ class ThreadBlock : slist_node {
     BuddyAllocator thread_;  // Can be private memory
 
     ThreadBlock(MemoryBackend backend) {
-        // Set memory backend offset to be (char*)this + sizeof(ThreadBlock) - backend.data_.
-        // Ensure the size of the backend also changes
+        // Shift memory backend by (char*)this + sizeof(ThreadBlock) - backend.data_.
         // Call shm_init for thread_ with this backend.
     }
 }
@@ -28,11 +27,12 @@ class ProcessBlock : slist_node {
     BuddyAllocatorHeader root_;  // Shared-memory
     pre::slist<ThreadBlock> thread_;
 
-    ProcessBlock() {
-        // Create a memory backend for the 
+    ProcessBlock(const MemoryBackend &backend, void *region) {
+        // 
+        // Call root_.shm_init with region
     }
 
-    ThreadBlock* AllocateThreadBlock(MemoryBackend &backend, size_t region_size) {
+    ThreadBlock* AllocateThreadBlock(const MemoryBackend &backend, size_t region_size) {
         // Acquire lock_
         // Allocate region_size + sizeof(ThreadBlock) from root_
         // If that fails, return nullptr

@@ -81,8 +81,6 @@ class _ArenaAllocator : public Allocator {
                 MemoryBackend backend) {
     id_ = id;
     backend_ = backend;
-    data_ = backend_.data_;
-    data_size_ = arena_size;  // Use arena_size, not backend's data_size
     accel_id_ = backend_.data_id_;
 
     // Allocate and construct header
@@ -109,10 +107,10 @@ class _ArenaAllocator : public Allocator {
    * @return Offset pointer to allocated memory
    */
   HSHM_CROSS_FUN
-  OffsetPointer AllocateOffset(const hipc::MemContext &ctx, size_t size, size_t alignment = 1) {
+  OffsetPtr AllocateOffset(const hipc::MemContext &ctx, size_t size, size_t alignment = 1) {
     size_t off = header_->heap_.Allocate(size, alignment);
     header_->AddSize(size);
-    return OffsetPointer(off);
+    return OffsetPtr(off);
   }
 
   /**
@@ -121,11 +119,11 @@ class _ArenaAllocator : public Allocator {
    * Arena allocators do not support reallocation.
    */
   HSHM_CROSS_FUN
-  OffsetPointer ReallocateOffsetNoNullCheck(const hipc::MemContext &ctx,
-                                            OffsetPointer p, size_t new_size) {
+  OffsetPtr ReallocateOffsetNoNullCheck(const hipc::MemContext &ctx,
+                                            OffsetPtr p, size_t new_size) {
     HSHM_THROW_ERROR(NOT_IMPLEMENTED,
                      "ArenaAllocator does not support reallocation");
-    return OffsetPointer(0);
+    return OffsetPtr(0);
   }
 
   /**
@@ -135,7 +133,7 @@ class _ArenaAllocator : public Allocator {
    * Memory is freed in bulk when the arena is reset or destroyed.
    */
   HSHM_CROSS_FUN
-  void FreeOffsetNoNullCheck(const hipc::MemContext &ctx, OffsetPointer p) {
+  void FreeOffsetNoNullCheck(const hipc::MemContext &ctx, OffsetPtr p) {
     // Arena allocator does not support individual frees
     // This is intentionally a no-op (not an error)
   }
@@ -179,7 +177,7 @@ class _ArenaAllocator : public Allocator {
   void Reset() {
     size_t current_size = header_->GetCurrentlyAllocatedSize();
     header_->SubSize(current_size);
-    header_->heap_.Init(0, data_size_);
+    header_->heap_.Init(0, header_->heap_.GetMaxSize());
   }
 
   /**

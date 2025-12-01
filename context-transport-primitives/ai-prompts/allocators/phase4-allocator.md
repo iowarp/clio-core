@@ -103,3 +103,21 @@ template<bool ATOMIC>
 class ArenaAllocator {}
 ```
 
+# Make Pointer better
+@CLAUDE.md
+
+Remove data_ and data_size_ from allocator. Use only backend.data_ and backend.size_
+Backend should also have a function called Shift. 
+Shift takes as input:
+1. OffsetPointer shift (the offset from the beginning of data)
+This will change both the size and offset.
+
+FullPtr(CtxAllocator ctx_alloc, OffsetPointer ptr) and similar constructors should be updated to do:
+ptr_ = ctx_alloc.backend.data_ + ctx_alloc.backend.offset_ + ptr;
+
+Verify that unit tests still pass after this change.
+
+Let's also make the following changes:
+1. OffsetPointer -> OffsetPtr. Make OffsetPtr templated, with default void.
+2. Pointer -> ShmPtr. Make ShmPtr templated, with default void.
+3. Remove TypedPointer and replace all occurences with ShmPtr

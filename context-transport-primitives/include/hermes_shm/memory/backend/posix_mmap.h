@@ -95,7 +95,7 @@ class PosixMmap : public MemoryBackend {
     data_ = ptr + aligned_md_size;
     data_size_ = size;
     data_id_ = -1;
-    root_offset_ = 0;
+    data_offset_ = 0;
 
     return true;
   }

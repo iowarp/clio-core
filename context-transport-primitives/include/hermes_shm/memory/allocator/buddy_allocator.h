@@ -44,11 +44,11 @@ struct FreeBuddyPage : public pre::slist_node {
  * Coalesce page node for RB tree-based coalescing
  */
 struct CoalesceBuddyPage : public pre::rb_node {
-  OffsetPointer key;  /**< Offset pointer used as key for RB tree */
+  OffsetPtr key;  /**< Offset pointer used as key for RB tree */
   size_t size_;       /**< Size of the page */
 
-  CoalesceBuddyPage() : pre::rb_node(), key(OffsetPointer::GetNull()), size_(0) {}
-  explicit CoalesceBuddyPage(const OffsetPointer &k, size_t size)
+  CoalesceBuddyPage() : pre::rb_node(), key(OffsetPtr::GetNull()), size_(0) {}
+  explicit CoalesceBuddyPage(const OffsetPtr &k, size_t size)
       : pre::rb_node(), key(k), size_(size) {}
 
   // Comparison operators required by rb_tree
@@ -94,7 +94,7 @@ class BuddyAllocator {
   pre::slist<false> *round_down_lists_;  /**< Free lists for sizes 16KB - 1MB (round down) */
 
  public:
-  char *data_;                  /**< Pointer to memory backend data */
+  MemoryBackend backend_;       /**< Memory backend for compatibility with FullPtr */
 
   /**
    * Get allocator ID (required for FullPtr construction)
@@ -107,12 +107,16 @@ class BuddyAllocator {
   /**
    * Initialize the buddy allocator
    *
-   * @param data Pointer to memory backend
+   * @param data ShmPtr to memory backend
    * @param heap_size Total size of heap to manage
    * @return true on success, false on failure
    */
   bool shm_init(char *data, size_t heap_size) {
-    data_ = data;
+    // Initialize backend structure for FullPtr compatibility
+    backend_.data_ = data;
+    backend_.data_size_ = heap_size;
+    backend_.data_offset_ = 0;
+    backend_.SetInitialized();
 
     // Calculate space needed for free list metadata
     size_t metadata_size = kNumFreeLists * sizeof(pre::slist<false>);
@@ -123,7 +127,7 @@ class BuddyAllocator {
     }
 
     // Allocate free lists from beginning of heap
-    round_up_lists_ = reinterpret_cast<pre::slist<false>*>(data_);
+    round_up_lists_ = reinterpret_cast<pre::slist<false>*>(backend_.data_);
     round_down_lists_ = round_up_lists_ + kNumRoundUpLists;
 
     // Initialize all free lists
@@ -148,7 +152,7 @@ class BuddyAllocator {
    * @param size Size in bytes to allocate
    * @return Offset pointer to allocated memory (after BuddyPage header)
    */
-  OffsetPointer AllocateOffset(size_t size) {
+  OffsetPtr AllocateOffset(size_t size) {
     if (size < kMinSize) {
       size = kMinSize;
     }
@@ -165,14 +169,14 @@ class BuddyAllocator {
    *
    * @param offset Offset pointer to memory (after BuddyPage header)
    */
-  void FreeOffset(OffsetPointer offset) {
+  void FreeOffset(OffsetPtr offset) {
     if (offset.IsNull()) {
       return;
     }
 
     // Get the actual page start (before BuddyPage header)
     size_t page_offset = offset.load() - sizeof(BuddyPage);
-    BuddyPage *page = reinterpret_cast<BuddyPage*>(data_ + page_offset);
+    BuddyPage *page = reinterpret_cast<BuddyPage*>(backend_.data_ + page_offset);
     size_t page_size = page->size_;
 
     // Convert to FreeBuddyPage
@@ -181,7 +185,7 @@ class BuddyAllocator {
 
     // Add to appropriate free list
     size_t list_idx = GetFreeListIndex(page_size);
-    Pointer shm_ptr;
+    ShmPtr shm_ptr;
     shm_ptr.off_ = page_offset;
     if (list_idx < kNumRoundUpLists) {
       FullPtr<pre::slist_node> node_ptr(this, shm_ptr);
@@ -196,7 +200,7 @@ class BuddyAllocator {
   /**
    * Allocate small memory (<16KB) using round-up sizing
    */
-  OffsetPointer AllocateSmall(size_t size) {
+  OffsetPtr AllocateSmall(size_t size) {
     size_t total_size = size + sizeof(BuddyPage);
     size_t list_idx = GetRoundUpListIndex(total_size);
     size_t alloc_size = static_cast<size_t>(1) << (list_idx + kMinLog2);
@@ -219,7 +223,7 @@ class BuddyAllocator {
     for (size_t i = 0; i < kNumRoundDownLists; ++i) {
       if (!round_down_lists_[i].empty()) {
         auto node = round_down_lists_[i].pop(this);
-        FreeBuddyPage *free_page = reinterpret_cast<FreeBuddyPage*>(data_ + node.shm_.off_.load());
+        FreeBuddyPage *free_page = reinterpret_cast<FreeBuddyPage*>(backend_.data_ + node.shm_.off_.load());
         if (free_page->size_ >= alloc_size) {
           return SplitLargeAndAllocate(node.shm_.off_.load(), free_page->size_, alloc_size, list_idx);
         } else {
@@ -246,7 +250,7 @@ class BuddyAllocator {
   /**
    * Allocate large memory (>16KB) using round-down sizing with best-fit
    */
-  OffsetPointer AllocateLarge(size_t size) {
+  OffsetPtr AllocateLarge(size_t size) {
     size_t total_size = size + sizeof(BuddyPage);
     size_t list_idx = GetRoundDownListIndex(total_size);
 
@@ -267,7 +271,7 @@ class BuddyAllocator {
     for (size_t i = list_idx + 1; i < kNumRoundDownLists; ++i) {
       if (!round_down_lists_[i].empty()) {
         auto node = round_down_lists_[i].pop(this);
-        FreeBuddyPage *free_page = reinterpret_cast<FreeBuddyPage*>(data_ + node.shm_.off_.load());
+        FreeBuddyPage *free_page = reinterpret_cast<FreeBuddyPage*>(backend_.data_ + node.shm_.off_.load());
         return SubsetAndAllocate(node.shm_.off_.load(), free_page->size_, total_size);
       }
     }
@@ -278,7 +282,7 @@ class BuddyAllocator {
     // Retry
     if (!round_down_lists_[list_idx].empty()) {
       auto node = round_down_lists_[list_idx].pop(this);
-      FreeBuddyPage *free_page = reinterpret_cast<FreeBuddyPage*>(data_ + node.shm_.off_.load());
+      FreeBuddyPage *free_page = reinterpret_cast<FreeBuddyPage*>(backend_.data_ + node.shm_.off_.load());
       if (free_page->size_ >= total_size) {
         return SubsetAndAllocate(node.shm_.off_.load(), free_page->size_, total_size);
       }
@@ -305,7 +309,7 @@ class BuddyAllocator {
 
       while (!list->empty()) {
         auto node = list->pop(this);
-        FreeBuddyPage *free_page = reinterpret_cast<FreeBuddyPage*>(data_ + node.shm_.off_.load());
+        FreeBuddyPage *free_page = reinterpret_cast<FreeBuddyPage*>(backend_.data_ + node.shm_.off_.load());
         size_t page_size = free_page->size_;
 
         // Convert to CoalesceBuddyPage
@@ -314,7 +318,7 @@ class BuddyAllocator {
         coalesce_page->size_ = page_size;
 
         // Insert into RB tree
-        FullPtr<CoalesceBuddyPage> tree_node(coalesce_page, static_cast<Pointer>(node.shm_));
+        FullPtr<CoalesceBuddyPage> tree_node(coalesce_page, static_cast<ShmPtr>(node.shm_));
         coalesce_tree.emplace(this, tree_node);
       }
     }
@@ -342,7 +346,7 @@ class BuddyAllocator {
   /**
    * Split a large page and allocate the requested size
    */
-  OffsetPointer SplitAndAllocate(size_t page_offset, size_t src_list, size_t dst_list) {
+  OffsetPtr SplitAndAllocate(size_t page_offset, size_t src_list, size_t dst_list) {
     size_t src_size = static_cast<size_t>(1) << (src_list + kMinLog2);
     size_t dst_size = static_cast<size_t>(1) << (dst_list + kMinLog2);
 
@@ -355,11 +359,11 @@ class BuddyAllocator {
       size_t buddy_offset = current_offset + current_size;
 
       // Add buddy to free list
-      FreeBuddyPage *buddy = reinterpret_cast<FreeBuddyPage*>(data_ + buddy_offset);
+      FreeBuddyPage *buddy = reinterpret_cast<FreeBuddyPage*>(backend_.data_ + buddy_offset);
       buddy->size_ = current_size;
 
       size_t buddy_list = GetFreeListIndex(current_size);
-      Pointer buddy_shm;
+      ShmPtr buddy_shm;
       buddy_shm.off_ = buddy_offset;
       FullPtr<pre::slist_node> buddy_node(this, buddy_shm);
       round_up_lists_[buddy_list].emplace(this, buddy_node);
@@ -371,7 +375,7 @@ class BuddyAllocator {
   /**
    * Split a large page from round-down lists
    */
-  OffsetPointer SplitLargeAndAllocate(size_t page_offset, size_t page_size, size_t alloc_size, size_t dst_list) {
+  OffsetPtr SplitLargeAndAllocate(size_t page_offset, size_t page_size, size_t alloc_size, size_t dst_list) {
     if (page_size == alloc_size) {
       return FinalizeAllocation(page_offset, alloc_size);
     }
@@ -380,12 +384,12 @@ class BuddyAllocator {
     size_t remainder_offset = page_offset + alloc_size;
     size_t remainder_size = page_size - alloc_size;
 
-    FreeBuddyPage *remainder = reinterpret_cast<FreeBuddyPage*>(data_ + remainder_offset);
+    FreeBuddyPage *remainder = reinterpret_cast<FreeBuddyPage*>(backend_.data_ + remainder_offset);
     remainder->size_ = remainder_size;
 
     size_t remainder_list = GetFreeListIndex(remainder_size);
-    Pointer remainder_shm;
-    remainder_shm.off_ = OffsetPointer(remainder_offset);
+    ShmPtr remainder_shm;
+    remainder_shm.off_ = OffsetPtr(remainder_offset);
     FullPtr<pre::slist_node> remainder_node(this, remainder_shm);
     if (remainder_list < kNumRoundUpLists) {
       round_up_lists_[remainder_list].emplace(this, remainder_node);
@@ -399,7 +403,7 @@ class BuddyAllocator {
   /**
    * Subset a large allocation and return remainder to free list
    */
-  OffsetPointer SubsetAndAllocate(size_t page_offset, size_t page_size, size_t alloc_size) {
+  OffsetPtr SubsetAndAllocate(size_t page_offset, size_t page_size, size_t alloc_size) {
     if (page_size == alloc_size) {
       return FinalizeAllocation(page_offset, alloc_size);
     }
@@ -408,12 +412,12 @@ class BuddyAllocator {
     size_t remainder_offset = page_offset + alloc_size;
     size_t remainder_size = page_size - alloc_size;
 
-    FreeBuddyPage *remainder = reinterpret_cast<FreeBuddyPage*>(data_ + remainder_offset);
+    FreeBuddyPage *remainder = reinterpret_cast<FreeBuddyPage*>(backend_.data_ + remainder_offset);
     remainder->size_ = remainder_size;
 
     size_t remainder_list = GetFreeListIndex(remainder_size);
-    Pointer remainder_shm;
-    remainder_shm.off_ = OffsetPointer(remainder_offset);
+    ShmPtr remainder_shm;
+    remainder_shm.off_ = OffsetPtr(remainder_offset);
     FullPtr<pre::slist_node> remainder_node(this, remainder_shm);
     if (remainder_list < kNumRoundUpLists) {
       round_up_lists_[remainder_list].emplace(this, remainder_node);
@@ -427,9 +431,9 @@ class BuddyAllocator {
   /**
    * Allocate from heap
    */
-  OffsetPointer AllocateFromHeap(size_t size) {
+  OffsetPtr AllocateFromHeap(size_t size) {
     if (heap_current_ + size > heap_end_) {
-      return OffsetPointer::GetNull();
+      return OffsetPtr::GetNull();
     }
 
     size_t alloc_offset = heap_current_;
@@ -441,11 +445,11 @@ class BuddyAllocator {
   /**
    * Finalize allocation by setting page header and returning user offset
    */
-  OffsetPointer FinalizeAllocation(size_t page_offset, size_t page_size) {
-    BuddyPage *page = reinterpret_cast<BuddyPage*>(data_ + page_offset);
+  OffsetPtr FinalizeAllocation(size_t page_offset, size_t page_size) {
+    BuddyPage *page = reinterpret_cast<BuddyPage*>(backend_.data_ + page_offset);
     page->size_ = page_size;
 
-    return OffsetPointer(page_offset + sizeof(BuddyPage));
+    return OffsetPtr(page_offset + sizeof(BuddyPage));
   }
 
   /**

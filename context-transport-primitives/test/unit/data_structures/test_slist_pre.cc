@@ -66,7 +66,7 @@ TEST_CASE("slist_pre - Basic Operations", "[slist_pre]") {
 
     // Emplace the node (cast to slist_node*)
     auto *link_node_ptr = reinterpret_cast<pre::slist_node*>(node_ptr.ptr_);
-    FullPtr<pre::slist_node> link_ptr(link_node_ptr, static_cast<Pointer>(node_ptr.shm_));
+    FullPtr<pre::slist_node> link_ptr(link_node_ptr, static_cast<ShmPtr>(node_ptr.shm_));
     list.emplace(alloc, link_ptr);
 
     REQUIRE(list.size() == 1);
@@ -95,7 +95,7 @@ TEST_CASE("slist_pre - Basic Operations", "[slist_pre]") {
       node_ptr.ptr_->value_ = i;
 
       auto *link_node_ptr = reinterpret_cast<pre::slist_node*>(node_ptr.ptr_);
-      FullPtr<pre::slist_node> link_ptr(link_node_ptr, static_cast<Pointer>(node_ptr.shm_));
+      FullPtr<pre::slist_node> link_ptr(link_node_ptr, static_cast<ShmPtr>(node_ptr.shm_));
       list.emplace(alloc, link_ptr);
     }
 
@@ -135,7 +135,7 @@ TEST_CASE("slist_pre - Basic Operations", "[slist_pre]") {
     auto node_ptr = ctx_alloc->Allocate<TestNode>(ctx_alloc.ctx_, sizeof(TestNode));
     node_ptr.ptr_->value_ = 100;
     auto *link_node_ptr = reinterpret_cast<pre::slist_node*>(node_ptr.ptr_);
-      FullPtr<pre::slist_node> link_ptr(link_node_ptr, static_cast<Pointer>(node_ptr.shm_));
+      FullPtr<pre::slist_node> link_ptr(link_node_ptr, static_cast<ShmPtr>(node_ptr.shm_));
     list.emplace(alloc, link_ptr);
 
     // Peek should return the head without removing it
@@ -156,7 +156,7 @@ TEST_CASE("slist_pre - Basic Operations", "[slist_pre]") {
       auto node_ptr = ctx_alloc->Allocate<TestNode>(ctx_alloc.ctx_, sizeof(TestNode));
       node_ptr.ptr_->value_ = i;
       auto *link_node_ptr = reinterpret_cast<pre::slist_node*>(node_ptr.ptr_);
-      FullPtr<pre::slist_node> link_ptr(link_node_ptr, static_cast<Pointer>(node_ptr.shm_));
+      FullPtr<pre::slist_node> link_ptr(link_node_ptr, static_cast<ShmPtr>(node_ptr.shm_));
       list.emplace(alloc, link_ptr);
     }
     REQUIRE(list.size() == 3);
@@ -171,7 +171,7 @@ TEST_CASE("slist_pre - Basic Operations", "[slist_pre]") {
       auto node_ptr = ctx_alloc->Allocate<TestNode>(ctx_alloc.ctx_, sizeof(TestNode));
       node_ptr.ptr_->value_ = i;
       auto *link_node_ptr = reinterpret_cast<pre::slist_node*>(node_ptr.ptr_);
-      FullPtr<pre::slist_node> link_ptr(link_node_ptr, static_cast<Pointer>(node_ptr.shm_));
+      FullPtr<pre::slist_node> link_ptr(link_node_ptr, static_cast<ShmPtr>(node_ptr.shm_));
       list.emplace(alloc, link_ptr);
     }
     REQUIRE(list.size() == 3);
@@ -206,7 +206,7 @@ TEST_CASE("slist_pre - Atomic Version", "[slist_pre][atomic]") {
       auto node_ptr = ctx_alloc->Allocate<TestNode>(ctx_alloc.ctx_, sizeof(TestNode));
       node_ptr.ptr_->value_ = i;
       auto *link_node_ptr = reinterpret_cast<pre::slist_node*>(node_ptr.ptr_);
-      FullPtr<pre::slist_node> link_ptr(link_node_ptr, static_cast<Pointer>(node_ptr.shm_));
+      FullPtr<pre::slist_node> link_ptr(link_node_ptr, static_cast<ShmPtr>(node_ptr.shm_));
       list.emplace(alloc, link_ptr);
     }
 
@@ -243,7 +243,7 @@ TEST_CASE("slist_pre - Node Reuse", "[slist_pre]") {
 
     // Emplace, pop, modify, and re-emplace
     auto *link_node_ptr = reinterpret_cast<pre::slist_node*>(node_ptr.ptr_);
-      FullPtr<pre::slist_node> link_ptr(link_node_ptr, static_cast<Pointer>(node_ptr.shm_));
+      FullPtr<pre::slist_node> link_ptr(link_node_ptr, static_cast<ShmPtr>(node_ptr.shm_));
     list.emplace(alloc, link_ptr);
 
     auto popped = list.pop(alloc);
@@ -284,7 +284,7 @@ TEST_CASE("slist_pre - Large List", "[slist_pre]") {
       auto node_ptr = ctx_alloc->Allocate<TestNode>(ctx_alloc.ctx_, sizeof(TestNode));
       node_ptr.ptr_->value_ = i;
       auto *link_node_ptr = reinterpret_cast<pre::slist_node*>(node_ptr.ptr_);
-      FullPtr<pre::slist_node> link_ptr(link_node_ptr, static_cast<Pointer>(node_ptr.shm_));
+      FullPtr<pre::slist_node> link_ptr(link_node_ptr, static_cast<ShmPtr>(node_ptr.shm_));
       list.emplace(alloc, link_ptr);
     }
 

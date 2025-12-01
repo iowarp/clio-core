@@ -81,7 +81,7 @@ class ZeroMqClient : public Client {
 
   // Expose from raw pointer - calls base implementation
   Bulk Expose(const char* data, size_t data_size, u32 flags) override {
-    hipc::FullPtr<char> ptr(const_cast<char*>(data), hipc::Pointer());
+    hipc::FullPtr<char> ptr(const_cast<char*>(data), hipc::ShmPtr());
     return Expose(ptr, data_size, flags);
   }
 
@@ -194,7 +194,7 @@ class ZeroMqServer : public Server {
 
   // Expose from raw pointer - calls base implementation
   Bulk Expose(char* data, size_t data_size, u32 flags) override {
-    hipc::FullPtr<char> ptr(data, hipc::Pointer());
+    hipc::FullPtr<char> ptr(data, hipc::ShmPtr());
     return Expose(ptr, data_size, flags);
   }
 

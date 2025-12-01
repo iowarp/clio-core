@@ -68,8 +68,8 @@ bool VerifyRBProperties(AllocT *alloc, pre::rb_tree<NodeT, false> &tree) {
   }
 
   // Helper lambda to check properties recursively
-  std::function<int(OffsetPointer, KeyT*, KeyT*)> check_node =
-      [&](OffsetPointer node_off, KeyT *min_key, KeyT *max_key) -> int {
+  std::function<int(OffsetPtr, KeyT*, KeyT*)> check_node =
+      [&](OffsetPtr node_off, KeyT *min_key, KeyT *max_key) -> int {
     if (node_off.IsNull()) {
       return 1;  // Null nodes are black (property 3)
     }
@@ -131,7 +131,7 @@ TEST_CASE("rb_tree_pre - Basic Operations", "[rb_tree_pre]") {
     node_ptr.ptr_->value_ = 100;
 
     // Insert the node (TestRBNode inherits from rb_node, so we can cast)
-    FullPtr<TestRBNode<int>> test_ptr(node_ptr.ptr_, static_cast<Pointer>(node_ptr.shm_));
+    FullPtr<TestRBNode<int>> test_ptr(node_ptr.ptr_, static_cast<ShmPtr>(node_ptr.shm_));
     tree.emplace(alloc, test_ptr);
 
     REQUIRE(tree.size() == 1);
@@ -154,7 +154,7 @@ TEST_CASE("rb_tree_pre - Basic Operations", "[rb_tree_pre]") {
       node_ptr.ptr_->key = i;
       node_ptr.ptr_->value_ = i * 10;
 
-      FullPtr<TestRBNode<int>> test_ptr(node_ptr.ptr_, static_cast<Pointer>(node_ptr.shm_));
+      FullPtr<TestRBNode<int>> test_ptr(node_ptr.ptr_, static_cast<ShmPtr>(node_ptr.shm_));
       tree.emplace(alloc, test_ptr);
     }
 
@@ -179,7 +179,7 @@ TEST_CASE("rb_tree_pre - Basic Operations", "[rb_tree_pre]") {
       node_ptr.ptr_->key = i;
       node_ptr.ptr_->value_ = i * 10;
 
-      FullPtr<TestRBNode<int>> test_ptr(node_ptr.ptr_, static_cast<Pointer>(node_ptr.shm_));
+      FullPtr<TestRBNode<int>> test_ptr(node_ptr.ptr_, static_cast<ShmPtr>(node_ptr.shm_));
       tree.emplace(alloc, test_ptr);
     }
 
@@ -198,7 +198,7 @@ TEST_CASE("rb_tree_pre - Basic Operations", "[rb_tree_pre]") {
       node_ptr.ptr_->key = key;
       node_ptr.ptr_->value_ = key;
 
-      FullPtr<TestRBNode<int>> test_ptr(node_ptr.ptr_, static_cast<Pointer>(node_ptr.shm_));
+      FullPtr<TestRBNode<int>> test_ptr(node_ptr.ptr_, static_cast<ShmPtr>(node_ptr.shm_));
       tree.emplace(alloc, test_ptr);
 
       REQUIRE(VerifyRBProperties(alloc, tree));
@@ -222,7 +222,7 @@ TEST_CASE("rb_tree_pre - Basic Operations", "[rb_tree_pre]") {
     node1_ptr.ptr_->key = 42;
     node1_ptr.ptr_->value_ = 100;
 
-    FullPtr<TestRBNode<int>> test_ptr1(node1_ptr.ptr_, static_cast<Pointer>(node1_ptr.shm_));
+    FullPtr<TestRBNode<int>> test_ptr1(node1_ptr.ptr_, static_cast<ShmPtr>(node1_ptr.shm_));
     tree.emplace(alloc, test_ptr1);
 
     REQUIRE(tree.size() == 1);
@@ -232,7 +232,7 @@ TEST_CASE("rb_tree_pre - Basic Operations", "[rb_tree_pre]") {
     node2_ptr.ptr_->key = 42;
     node2_ptr.ptr_->value_ = 200;
 
-    FullPtr<TestRBNode<int>> test_ptr2(node2_ptr.ptr_, static_cast<Pointer>(node2_ptr.shm_));
+    FullPtr<TestRBNode<int>> test_ptr2(node2_ptr.ptr_, static_cast<ShmPtr>(node2_ptr.shm_));
     tree.emplace(alloc, test_ptr2);
 
     // Size should remain 1 (duplicate not inserted)
@@ -270,7 +270,7 @@ TEST_CASE("rb_tree_pre - Deletion", "[rb_tree_pre]") {
     node_ptr.ptr_->key = 42;
     node_ptr.ptr_->value_ = 100;
 
-    FullPtr<TestRBNode<int>> test_ptr(node_ptr.ptr_, static_cast<Pointer>(node_ptr.shm_));
+    FullPtr<TestRBNode<int>> test_ptr(node_ptr.ptr_, static_cast<ShmPtr>(node_ptr.shm_));
     tree.emplace(alloc, test_ptr);
 
     REQUIRE(tree.size() == 1);
@@ -293,7 +293,7 @@ TEST_CASE("rb_tree_pre - Deletion", "[rb_tree_pre]") {
       node_ptr.ptr_->key = i * 10;
       node_ptr.ptr_->value_ = i;
 
-      FullPtr<TestRBNode<int>> test_ptr(node_ptr.ptr_, static_cast<Pointer>(node_ptr.shm_));
+      FullPtr<TestRBNode<int>> test_ptr(node_ptr.ptr_, static_cast<ShmPtr>(node_ptr.shm_));
       tree.emplace(alloc, test_ptr);
     }
 
@@ -317,7 +317,7 @@ TEST_CASE("rb_tree_pre - Deletion", "[rb_tree_pre]") {
       node_ptr.ptr_->key = key;
       node_ptr.ptr_->value_ = key;
 
-      FullPtr<TestRBNode<int>> test_ptr(node_ptr.ptr_, static_cast<Pointer>(node_ptr.shm_));
+      FullPtr<TestRBNode<int>> test_ptr(node_ptr.ptr_, static_cast<ShmPtr>(node_ptr.shm_));
       tree.emplace(alloc, test_ptr);
     }
 
@@ -350,7 +350,7 @@ TEST_CASE("rb_tree_pre - Deletion", "[rb_tree_pre]") {
       node_ptr.ptr_->key = i;
       node_ptr.ptr_->value_ = i;
 
-      FullPtr<TestRBNode<int>> test_ptr(node_ptr.ptr_, static_cast<Pointer>(node_ptr.shm_));
+      FullPtr<TestRBNode<int>> test_ptr(node_ptr.ptr_, static_cast<ShmPtr>(node_ptr.shm_));
       tree.emplace(alloc, test_ptr);
     }
 
@@ -366,7 +366,7 @@ TEST_CASE("rb_tree_pre - Deletion", "[rb_tree_pre]") {
       node_ptr.ptr_->key = i;
       node_ptr.ptr_->value_ = i;
 
-      FullPtr<TestRBNode<int>> test_ptr(node_ptr.ptr_, static_cast<Pointer>(node_ptr.shm_));
+      FullPtr<TestRBNode<int>> test_ptr(node_ptr.ptr_, static_cast<ShmPtr>(node_ptr.shm_));
       tree.emplace(alloc, test_ptr);
     }
 
@@ -406,7 +406,7 @@ TEST_CASE("rb_tree_pre - Large Tree", "[rb_tree_pre]") {
       node_ptr.ptr_->key = i;
       node_ptr.ptr_->value_ = i;
 
-      FullPtr<TestRBNode<int>> test_ptr(node_ptr.ptr_, static_cast<Pointer>(node_ptr.shm_));
+      FullPtr<TestRBNode<int>> test_ptr(node_ptr.ptr_, static_cast<ShmPtr>(node_ptr.shm_));
       tree.emplace(alloc, test_ptr);
     }
 
@@ -447,7 +447,7 @@ TEST_CASE("rb_tree_pre - Atomic Version", "[rb_tree_pre][atomic]") {
       node_ptr.ptr_->key = i;
       node_ptr.ptr_->value_ = i * 2;
 
-      FullPtr<TestRBNode<int>> test_ptr(node_ptr.ptr_, static_cast<Pointer>(node_ptr.shm_));
+      FullPtr<TestRBNode<int>> test_ptr(node_ptr.ptr_, static_cast<ShmPtr>(node_ptr.shm_));
       tree.emplace(alloc, test_ptr);
     }
 

@@ -46,7 +46,7 @@ TEST_CASE("BuddyAllocator - Small Allocations", "[buddy_allocator]") {
   }
 
   SECTION("Multiple small allocations") {
-    std::vector<OffsetPointer> allocations;
+    std::vector<OffsetPtr> allocations;
 
     // Allocate 10 small blocks
     for (int i = 0; i < 10; ++i) {
@@ -94,7 +94,7 @@ TEST_CASE("BuddyAllocator - Large Allocations", "[buddy_allocator]") {
   }
 
   SECTION("Multiple large allocations") {
-    std::vector<OffsetPointer> allocations;
+    std::vector<OffsetPtr> allocations;
 
     // Allocate 5 large blocks
     for (int i = 0; i < 5; ++i) {
@@ -163,7 +163,7 @@ TEST_CASE("BuddyAllocator - Free and Reallocation", "[buddy_allocator]") {
   }
 
   SECTION("Multiple free and reallocate") {
-    std::vector<OffsetPointer> allocations;
+    std::vector<OffsetPtr> allocations;
 
     // Allocate 10 blocks
     for (int i = 0; i < 10; ++i) {
@@ -195,7 +195,7 @@ TEST_CASE("BuddyAllocator - Coalescing", "[buddy_allocator]") {
 
   SECTION("Coalesce adjacent small blocks") {
     // Allocate several small blocks
-    std::vector<OffsetPointer> allocations;
+    std::vector<OffsetPtr> allocations;
     for (int i = 0; i < 8; ++i) {
       auto offset = allocator.AllocateOffset(1024);
       REQUIRE_FALSE(offset.IsNull());
@@ -215,8 +215,8 @@ TEST_CASE("BuddyAllocator - Coalescing", "[buddy_allocator]") {
 
   SECTION("Fragmentation and coalescing") {
     // Create a fragmented heap
-    std::vector<OffsetPointer> keep;
-    std::vector<OffsetPointer> free_later;
+    std::vector<OffsetPtr> keep;
+    std::vector<OffsetPtr> free_later;
 
     // Allocate alternating blocks
     for (int i = 0; i < 16; ++i) {
@@ -255,7 +255,7 @@ TEST_CASE("BuddyAllocator - Mixed Small and Large", "[buddy_allocator]") {
   allocator.shm_init(backend.data_, heap_size);
 
   SECTION("Interleaved small and large allocations") {
-    std::vector<OffsetPointer> allocations;
+    std::vector<OffsetPtr> allocations;
 
     // Mix of small and large
     allocations.push_back(allocator.AllocateOffset(128));
@@ -288,7 +288,7 @@ TEST_CASE("BuddyAllocator - Stress Test", "[buddy_allocator]") {
   allocator.shm_init(backend.data_, heap_size);
 
   SECTION("Many allocations and frees") {
-    std::vector<OffsetPointer> active;
+    std::vector<OffsetPtr> active;
 
     // Allocate 100 blocks of varying sizes
     for (int i = 0; i < 100; ++i) {
@@ -337,7 +337,7 @@ TEST_CASE("BuddyAllocator - Out of Memory", "[buddy_allocator]") {
   allocator.shm_init(backend.data_, heap_size);
 
   SECTION("Exhaust heap") {
-    std::vector<OffsetPointer> allocations;
+    std::vector<OffsetPtr> allocations;
 
     // Keep allocating until we fail
     for (int i = 0; i < 1000; ++i) {

@@ -62,7 +62,7 @@ class ArrayBackend : public MemoryBackend {
     data_size_ = size;
     data_ = region;
     data_id_ = -1;
-    root_offset_ = offset;
+    data_offset_ = offset;
 
     return true;
   }
