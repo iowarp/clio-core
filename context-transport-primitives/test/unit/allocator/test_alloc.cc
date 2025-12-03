@@ -37,7 +37,7 @@ hipc::BaseAllocator<hipc::_ArenaAllocator<false>>* CreateArenaAllocator(hipc::Ma
   heap_backend.data_size_ = heap_size;
 
   // Initialize allocator with heap backend
-  alloc->shm_init(0, heap_size, heap_backend);
+  alloc->shm_init(heap_backend, 0);
 
   return alloc;
 }

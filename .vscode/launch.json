@@ -167,6 +167,38 @@
                 }
             ],
             "preLaunchTask": "cmake-build-debug"
+        },
+        {
+            "name": "Debug MP Allocator Multiple Test (Deadlock)",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/bin/test_mp_allocator_exec",
+            "args": [
+                "[multiple]"
+            ],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}/build",
+            "environment": [],
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Set breakpoint at SetupTls",
+                    "text": "-break-insert ProcessBlock::SetupTls",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Set breakpoint at lock acquisitions",
+                    "text": "-break-insert AllocateFromProcessOrGlobal",
+                    "ignoreFailures": true
+                }
+            ],
+            "preLaunchTask": "cmake-build-debug"
         }
     ]
 }

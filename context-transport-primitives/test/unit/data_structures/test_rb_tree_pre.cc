@@ -44,7 +44,7 @@ ArenaAllocator<ATOMIC>* CreateTestAllocator(MallocBackend &backend, size_t arena
   backend.shm_init(MemoryBackendId(0, 0), arena_size);
 
   ArenaAllocator<ATOMIC> *alloc = new ArenaAllocator<ATOMIC>();
-  alloc->shm_init(0, arena_size, backend);
+  alloc->shm_init(backend, 0);
 
   return alloc;
 }

@@ -147,7 +147,7 @@ int main(int argc, char **argv) {
 
   if (rank == 0) {
     std::cout << "Rank 0: Initializing allocator" << std::endl;
-    allocator.shm_init(backend, kShmSize);
+    allocator.shm_init(backend, 0);
     std::cout << "Rank 0: Allocator initialized successfully" << std::endl;
   } else {
     std::cout << "Rank " << rank << ": Attaching to allocator" << std::endl;

@@ -37,7 +37,7 @@ class MpAllocatorTest {
     // MakeAlloc automatically passes backend as first parameter to shm_init
     std::cout << "sizeof(MultiProcessAllocator) = " << sizeof(MultiProcessAllocator) << std::endl;
     std::cout << "sizeof(_MultiProcessAllocator) = " << sizeof(_MultiProcessAllocator) << std::endl;
-    alloc_ = backend_.MakeAlloc<MultiProcessAllocator>(kAllocSize);
+    alloc_ = backend_.MakeAlloc<MultiProcessAllocator>(0);
     std::cout << "Allocator placed at: " << (void*)alloc_ << std::endl;
     std::cout << "Accessing pid_count_: " << alloc_->pid_count_ << std::endl;
     std::cout << "Allocator pointer: " << (void*)alloc_ << std::endl;

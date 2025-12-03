@@ -924,7 +924,7 @@ struct FullPtr : public ShmPointer {
   }
 
   /** Check if null */
-  HSHM_INLINE_CROSS_FUN bool IsNull() const { return ptr_ == nullptr; }
+  HSHM_INLINE_CROSS_FUN bool IsNull() const { return ptr_ == nullptr || shm_.IsNull(); }
 
   /** Get null */
   HSHM_INLINE_CROSS_FUN static FullPtr GetNull() {
@@ -992,8 +992,8 @@ class BaseAllocator : public CoreAllocT {
    * each allocator has its own arguments to this method.
    * */
   template <typename... Args>
-  HSHM_CROSS_FUN void shm_init(Args... args) {
-    CoreAllocT::shm_init(std::forward<Args>(args)...);
+  HSHM_CROSS_FUN void shm_init(Args&&... args) {
+    static_cast<CoreAllocT*>(this)->shm_init(std::forward<Args>(args)...);
   }
 
   /**
@@ -1001,7 +1001,7 @@ class BaseAllocator : public CoreAllocT {
    * */
   HSHM_CROSS_FUN
   void shm_attach(const MemoryBackend &backend) {
-    CoreAllocT::shm_attach(backend);
+    static_cast<CoreAllocT*>(this)->shm_attach(backend);
   }
 
   /**====================================

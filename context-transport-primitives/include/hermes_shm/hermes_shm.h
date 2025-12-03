@@ -84,7 +84,7 @@
 // #include "memory/allocator/allocator_factory_.h"
 // #include "memory/allocator/gpu_stack_allocator.h"
 // #include "memory/allocator/heap.h"
-#include "memory/allocator/malloc_allocator.h"
+// #include "memory/allocator/malloc_allocator.h"
 // #include "memory/allocator/mp_page.h"
 // #include "memory/allocator/page_allocator.h"
 // #include "memory/allocator/scalable_page_allocator.h"
