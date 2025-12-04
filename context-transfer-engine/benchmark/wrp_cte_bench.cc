@@ -107,23 +107,25 @@ std::string FormatSize(chi::u64 bytes) {
 }
 
 /**
- * Convert milliseconds to appropriate unit
+ * Convert microseconds to appropriate unit
  */
-std::string FormatTime(double milliseconds) {
-  if (milliseconds >= 1000.0) {
-    return std::to_string(milliseconds / 1000.0) + " s";
+std::string FormatTime(double microseconds) {
+  if (microseconds >= 1000000.0) {
+    return std::to_string(microseconds / 1000000.0) + " s";
+  } else if (microseconds >= 1000.0) {
+    return std::to_string(microseconds / 1000.0) + " ms";
   } else {
-    return std::to_string(milliseconds) + " ms";
+    return std::to_string(microseconds) + " us";
   }
 }
 
 /**
  * Calculate bandwidth in MB/s
  */
-double CalcBandwidth(chi::u64 total_bytes, double milliseconds) {
-  if (milliseconds <= 0.0)
+double CalcBandwidth(chi::u64 total_bytes, double microseconds) {
+  if (microseconds <= 0.0)
     return 0.0;
-  double seconds = milliseconds / 1000.0;
+  double seconds = microseconds / 1000000.0;
   double megabytes = static_cast<double>(total_bytes) / (1024.0 * 1024.0);
   return megabytes / seconds;
 }
@@ -220,7 +222,7 @@ private:
 
     auto end_time = high_resolution_clock::now();
     thread_times[thread_id] =
-        duration_cast<milliseconds>(end_time - start_time).count();
+        duration_cast<microseconds>(end_time - start_time).count();
 
     // Free shared memory buffer
     CHI_IPC->FreeBuffer(shm_buffer);
@@ -287,7 +289,7 @@ private:
 
     auto end_time = high_resolution_clock::now();
     thread_times[thread_id] =
-        duration_cast<milliseconds>(end_time - start_time).count();
+        duration_cast<microseconds>(end_time - start_time).count();
   }
 
   void RunGetBenchmark() {
@@ -369,7 +371,7 @@ private:
 
     auto end_time = high_resolution_clock::now();
     thread_times[thread_id] =
-        duration_cast<milliseconds>(end_time - start_time).count();
+        duration_cast<microseconds>(end_time - start_time).count();
 
     // Free shared memory buffer
     CHI_IPC->FreeBuffer(shm_buffer);
@@ -413,20 +415,27 @@ private:
     double avg_bw = CalcBandwidth(total_bytes, avg_time);
     double agg_bw = CalcBandwidth(aggregate_bytes, avg_time);
 
+    // Calculate bandwidth in bytes/sec for finer granularity
+    double min_bw_bytes = min_time > 0 ? (static_cast<double>(total_bytes) / (min_time / 1000000.0)) : 0.0;
+    double max_bw_bytes = max_time > 0 ? (static_cast<double>(total_bytes) / (max_time / 1000000.0)) : 0.0;
+    double avg_bw_bytes = avg_time > 0 ? (static_cast<double>(total_bytes) / (avg_time / 1000000.0)) : 0.0;
+    double agg_bw_bytes = avg_time > 0 ? (static_cast<double>(aggregate_bytes) / (avg_time / 1000000.0)) : 0.0;
+
     std::cout << std::endl;
     std::cout << "=== " << operation << " Benchmark Results ===" << std::endl;
-    std::cout << "Time (min): " << FormatTime(min_time) << std::endl;
-    std::cout << "Time (max): " << FormatTime(max_time) << std::endl;
-    std::cout << "Time (avg): " << FormatTime(avg_time) << std::endl;
+    std::cout << std::fixed << std::setprecision(3);
+    std::cout << "Time (min): " << min_time << " us (" << (min_time / 1000.0) << " ms)" << std::endl;
+    std::cout << "Time (max): " << max_time << " us (" << (max_time / 1000.0) << " ms)" << std::endl;
+    std::cout << "Time (avg): " << avg_time << " us (" << (avg_time / 1000.0) << " ms)" << std::endl;
     std::cout << std::endl;
     std::cout << std::fixed << std::setprecision(2);
-    std::cout << "Bandwidth per thread (min): " << min_bw << " MB/s"
+    std::cout << "Bandwidth per thread (min): " << min_bw << " MB/s (" << min_bw_bytes << " bytes/s)"
               << std::endl;
-    std::cout << "Bandwidth per thread (max): " << max_bw << " MB/s"
+    std::cout << "Bandwidth per thread (max): " << max_bw << " MB/s (" << max_bw_bytes << " bytes/s)"
               << std::endl;
-    std::cout << "Bandwidth per thread (avg): " << avg_bw << " MB/s"
+    std::cout << "Bandwidth per thread (avg): " << avg_bw << " MB/s (" << avg_bw_bytes << " bytes/s)"
               << std::endl;
-    std::cout << "Aggregate bandwidth: " << agg_bw << " MB/s" << std::endl;
+    std::cout << "Aggregate bandwidth: " << agg_bw << " MB/s (" << agg_bw_bytes << " bytes/s)" << std::endl;
     std::cout << "===========================" << std::endl;
   }
 
