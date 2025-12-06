@@ -564,10 +564,20 @@ class _MultiProcessAllocator : public Allocator {
    * @param p The offset pointer to free
    */
   void FreeOffsetNoNullCheck(OffsetPtr<> p) {
-    (void)p;  // TODO: Implement tier-aware freeing
-    // For now, this is a no-op to match the multi-tier design
-    // In a full implementation, we would track which tier the allocation came from
-    // and return it to the appropriate allocator
+    ProcessBlock *pblock = GetProcessBlock();
+    if (pblock == nullptr) {
+      return;
+    }
+
+    // Try to get ThreadBlock from TLS
+    ThreadBlock *tblock = reinterpret_cast<ThreadBlock*>(
+        HSHM_THREAD_MODEL->GetTls<void>(pblock->tblock_key_));
+    if (tblock == nullptr) {
+      return;
+    }
+
+    // Free from ThreadBlock allocator
+    tblock->alloc_.FreeOffset(p);
   }
 
   /**

@@ -167,12 +167,13 @@ class slist {
      * Advances the iterator to the next node in the list.
      * This operator is self-contained and does not require the parent list.
      *
-     * @return Iterator pointing to the next node, or null iterator if at end
+     * @return Reference to this iterator after advancement
      */
     HSHM_CROSS_FUN
-    Iterator operator++() {
+    Iterator& operator++() {
       if (IsNull() || alloc_ == nullptr) {
-        return Iterator();
+        // Already at end, remain null
+        return *this;
       }
 
       // Get the next pointer from current node
