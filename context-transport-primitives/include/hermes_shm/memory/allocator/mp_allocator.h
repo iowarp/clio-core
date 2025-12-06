@@ -63,8 +63,10 @@ class ThreadBlock : public pre::slist_node {
   bool shm_init(const MemoryBackend &backend, FullPtr<void> region, size_t region_size, int tid) {
     tid_ = tid;
 
-    // The region already excludes the ThreadBlock header, so just use ShiftTo
-    MemoryBackend thread_backend = backend.ShiftTo(region, region_size);
+    // Create shifted backend positioned at the allocator object address
+    // ShiftTo takes &alloc_ as input and updates data_offset_ to (ptr - data_)
+    MemoryBackend thread_backend = backend.ShiftTo(
+        reinterpret_cast<char*>(&alloc_), region_size);
 
     // Initialize the buddy allocator with the shifted backend
     alloc_.shm_init(thread_backend);
@@ -134,8 +136,10 @@ class ProcessBlock : public pre::slist_node {
     lock_.Init();
     threads_.Init();
 
-    // The region already excludes the ProcessBlock header, so just use ShiftTo
-    MemoryBackend process_backend = backend.ShiftTo(region, region_size);
+    // Create shifted backend positioned at the allocator object address
+    // ShiftTo takes &alloc_ as input and updates data_offset_ to (ptr - data_)
+    MemoryBackend process_backend = backend.ShiftTo(
+        reinterpret_cast<char*>(&alloc_), region_size);
 
     // Initialize buddy allocator for managing thread blocks
     alloc_.shm_init(process_backend);
@@ -342,7 +346,6 @@ class _MultiProcessAllocator : public Allocator {
     // Check if we already have a ThreadBlock in TLS
     void *tblock_data = HSHM_THREAD_MODEL->GetTls<void>(pblock->tblock_key_);
     if (tblock_data != nullptr) {
-      printf("[EnsureTls] Found existing ThreadBlock in TLS\n");
       return reinterpret_cast<ThreadBlock*>(tblock_data);
     }
 
@@ -354,9 +357,6 @@ class _MultiProcessAllocator : public Allocator {
       printf("[EnsureTls] Failed to allocate ThreadBlock region\n");
       return nullptr;
     }
-
-    // Construct ThreadBlock object at the region start
-    new (tblock_ptr.ptr_) ThreadBlock();
 
     // Create managed_region starting AFTER the ThreadBlock object
     OffsetPtr<> shifted_off(tblock_ptr.shm_.off_.load() + sizeof(ThreadBlock));

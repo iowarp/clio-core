@@ -137,12 +137,19 @@ This will store the difference between data_ and the beginning of the shared seg
 In each MemoryBackend, we need to set this priv_header_off_. 
 
 For example, for PosixShmMmap, we do a mixed allocation.
-The very first kBackendHeaderSize bytes of the buffer returned is the private header
-the next kBackendHeaderSize bytes are the shared header.
+1. The very first kBackendHeaderSize bytes of the buffer returned is the private header
+2. The next kBackendHeaderSize bytes are the shared header.
+3. The next bytes can be the metadata.
+4. And then data_ is set.
+5. And then priv_header_off_ is data_ - (1).
+
 
 For PosixMmap,
-After md, the next kBackendHeader bytes are the private header and the next are the shared header.
-After this is what gets stored in data_. 
+1. We mmap the buffer
+2. The very first kBackendHeaderSize bytes of the buffer returned is the private header
+3. The next kBackendHeaderSize bytes are the shared header. 
+4. After md, the next kBackendHeader bytes are the private header and the next are the shared header.
+5. After this is what gets stored in data_. 
 
 In MemoryBackend:
 ```
@@ -154,5 +161,6 @@ GetSharedHeader(char *data): GetPrivateHeader<char>(data) + kBackendHeaderSize
 
 In Allocator:
 ```
-GetPrivateHeader(): backend_.GetPrivateHeader();
+GetPrivateHeader(): backend_.GetPrivateHeader(GetBackendData());
+GetSharedHeader(): backend_.GetSharedHeader(GetBackendData());
 ```

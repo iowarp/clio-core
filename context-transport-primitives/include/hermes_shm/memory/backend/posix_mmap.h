@@ -64,8 +64,6 @@ class PosixMmap : public MemoryBackend {
 
     // Initialize flags before calling methods that use it
     flags_.Clear();
-    SetInitialized();
-    Own();
 
     // Calculate sizes: 2*kBackendHeaderSize (shared + private headers) + header + md section + alignment + data section
     constexpr size_t kAlignment = 4096;  // 4KB alignment
@@ -140,23 +138,15 @@ class PosixMmap : public MemoryBackend {
 
   /** Unmap shared memory */
   void _Detach() {
-    if (!IsInitialized()) {
-      return;
-    }
     if (map_ptr_) {
       SystemInfo::UnmapMemory(map_ptr_, total_size_);  // Unmap from mapping start (includes private region)
       map_ptr_ = nullptr;
     }
-    UnsetInitialized();
   }
 
   /** Destroy shared memory */
   void _Destroy() {
-    if (!IsInitialized()) {
-      return;
-    }
     _Detach();
-    UnsetInitialized();
   }
 };
 

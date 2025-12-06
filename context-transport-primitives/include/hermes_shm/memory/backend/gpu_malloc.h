@@ -53,7 +53,6 @@ class GpuMalloc : public MemoryBackend, public UrlMemoryBackend {
 
     // Initialize flags before calling methods that use it
     flags_.Clear();
-    SetInitialized();
     Own();
 
     // Calculate sizes: header + md section + alignment
@@ -107,7 +106,6 @@ class GpuMalloc : public MemoryBackend, public UrlMemoryBackend {
   /** Deserialize the backend */
   bool shm_attach(const std::string &url) {
     flags_.Clear();
-    SetInitialized();
     Disown();
 
     if (!SystemInfo::OpenSharedMemory(fd_, url)) {
@@ -159,7 +157,6 @@ class GpuMalloc : public MemoryBackend, public UrlMemoryBackend {
 
   /** Unmap shared memory */
   void _Detach() {
-    if (!IsInitialized()) {
       return;
     }
     // Unmap the metadata region
@@ -171,12 +168,10 @@ class GpuMalloc : public MemoryBackend, public UrlMemoryBackend {
       GpuApi::CloseIpcMemHandle(accel_data_);
     }
     SystemInfo::CloseSharedMemory(fd_);
-    UnsetInitialized();
   }
 
   /** Destroy shared memory */
   void _Destroy() {
-    if (!IsInitialized()) {
       return;
     }
     // Free GPU memory
@@ -189,7 +184,6 @@ class GpuMalloc : public MemoryBackend, public UrlMemoryBackend {
     }
     SystemInfo::CloseSharedMemory(fd_);
     SystemInfo::DestroySharedMemory(url_);
-    UnsetInitialized();
   }
 };
 

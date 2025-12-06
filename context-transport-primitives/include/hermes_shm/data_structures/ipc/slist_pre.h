@@ -140,6 +140,18 @@ class slist {
     }
 
     /**
+     * Set this iterator to null (equal to end())
+     *
+     * Makes this iterator equivalent to the end marker by setting
+     * both current and previous pointers to null.
+     */
+    HSHM_CROSS_FUN
+    void SetNull() {
+      current_ = OffsetPtr<>::GetNull();
+      prev_ = OffsetPtr<>::GetNull();
+    }
+
+    /**
      * Equality comparison
      *
      * @param other Iterator to compare with
@@ -173,6 +185,7 @@ class slist {
     Iterator& operator++() {
       if (IsNull() || alloc_ == nullptr) {
         // Already at end, remain null
+        SetNull();
         return *this;
       }
 

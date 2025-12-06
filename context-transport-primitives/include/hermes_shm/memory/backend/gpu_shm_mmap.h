@@ -64,7 +64,6 @@ class GpuShmMmap : public MemoryBackend, public UrlMemoryBackend {
 
     // Initialize flags before calling methods that use it
     flags_.Clear();
-    SetInitialized();
     Own();
 
     // Calculate sizes: header + md section + alignment + data section
@@ -118,7 +117,6 @@ class GpuShmMmap : public MemoryBackend, public UrlMemoryBackend {
   /** SHM deserialize */
   bool shm_attach(const std::string& url) {
     flags_.Clear();
-    SetInitialized();
     Disown();
 
     if (!SystemInfo::OpenSharedMemory(fd_, url)) {
@@ -175,7 +173,6 @@ class GpuShmMmap : public MemoryBackend, public UrlMemoryBackend {
 
   /** Detach shared memory */
   void _Detach() {
-    if (!IsInitialized()) {
       return;
     }
     // Unregister GPU memory
@@ -190,17 +187,14 @@ class GpuShmMmap : public MemoryBackend, public UrlMemoryBackend {
       SystemInfo::UnmapMemory(reinterpret_cast<void *>(header_), total_size_);
     }
     SystemInfo::CloseSharedMemory(fd_);
-    UnsetInitialized();
   }
 
   /** Destroy shared memory */
   void _Destroy() {
-    if (!IsInitialized()) {
       return;
     }
     _Detach();
     SystemInfo::DestroySharedMemory(url_);
-    UnsetInitialized();
   }
 };
 

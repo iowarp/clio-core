@@ -47,9 +47,6 @@ class MallocBackend : public MemoryBackend {
 
     // Initialize flags before calling methods that use it
     flags_.Clear();
-    SetInitialized();
-    Own();
-
     // Calculate sizes: 2*kBackendHeaderSize (shared + private headers) + header + md section + alignment + data section
     constexpr size_t kAlignment = 4096;  // 4KB alignment
     size_t header_size = sizeof(MemoryBackendHeader);

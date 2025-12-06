@@ -44,50 +44,46 @@ class ArrayBackend : public MemoryBackend {
    * Initialize ArrayBackend with external array
    *
    * @param backend_id Backend identifier
-   * @param size Size of the ENTIRE array (INCLUDING headers)
-   * @param region Pointer to the BEGINNING of the array (headers are here)
+   * @param size Size of the ENTIRE array
+   * @param region Pointer to the BEGINNING of the array
    * @param offset Offset within the array
    * @return true on success
    *
-   * Memory layout in the array:
+   * Memory layout in the region:
    * - Bytes 0 to kBackendHeaderSize-1: Private header
    * - Bytes kBackendHeaderSize to 2*kBackendHeaderSize-1: Shared header
-   * - Bytes 2*kBackendHeaderSize+: Metadata and data
+   * - Bytes 2*kBackendHeaderSize onwards: Backend header (header_)
+   * - Then data_ follows after backend header
    */
   HSHM_CROSS_FUN
   bool shm_init(const MemoryBackendId &backend_id, size_t size, char *region, u64 offset = 0) {
-    SetInitialized();
-    Own();
 
-    // Headers are at the beginning of the array
-    char *priv_header = region;
+    // Headers are at the beginning of the region
     char *shared_header = region + kBackendHeaderSize;
-    char *data_start = region + 2 * kBackendHeaderSize;
+    char *backend_header_ptr = region + 2 * kBackendHeaderSize;
 
-    // Store metadata header pointer at the shared header location
-    header_ = reinterpret_cast<MemoryBackendHeader*>(shared_header);
-    md_ = shared_header;
-    md_size_ = kBackendHeaderSize;
+    // Store backend metadata header
+    header_ = reinterpret_cast<MemoryBackendHeader*>(backend_header_ptr);
+    md_ = backend_header_ptr;
+    md_size_ = sizeof(MemoryBackendHeader);
 
     // Initialize header
     header_->id_ = backend_id;
     header_->md_size_ = md_size_;
-    header_->data_size_ = size - 2 * kBackendHeaderSize;
+    header_->data_size_ = size - 2 * kBackendHeaderSize - sizeof(MemoryBackendHeader);
     header_->data_id_ = -1;
     header_->flags_.Clear();
 
-    // Data segment starts after both headers
-    data_size_ = size - 2 * kBackendHeaderSize;
-    data_capacity_ = size - 2 * kBackendHeaderSize;
-    data_ = data_start;
+    // data_ points to start of data region (after backend header)
+    data_ = backend_header_ptr + sizeof(MemoryBackendHeader);
+    data_size_ = size - 2 * kBackendHeaderSize - sizeof(MemoryBackendHeader);
+    data_capacity_ = size - 2 * kBackendHeaderSize - sizeof(MemoryBackendHeader);
     data_id_ = -1;
     data_offset_ = offset;
 
-    // Set priv_header_off_: offset from data_ back to start of private header
-    // priv_header_off_ = distance from data_start back to the beginning of the array
-    priv_header_off_ = 2 * kBackendHeaderSize;
-
-    (void)priv_header;  // Mark as intentionally unused
+    // Set priv_header_off_: distance from data_ back to region start
+    // priv_header_off_ = data_ - region
+    priv_header_off_ = static_cast<size_t>(data_ - region);
 
     return true;
   }

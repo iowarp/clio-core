@@ -80,8 +80,6 @@ class PosixShmMmap : public MemoryBackend, public UrlMemoryBackend {
 
     // Initialize flags before calling methods that use it
     flags_.Clear();
-    SetInitialized();
-    Own();
 
     // Calculate sizes: header + md section + alignment + data section
     constexpr size_t kAlignment = 4096;  // 4KB alignment
@@ -114,7 +112,8 @@ class PosixShmMmap : public MemoryBackend, public UrlMemoryBackend {
 
     // ptr points to start of private header
     // ptr + kBackendHeaderSize points to start of shared region (which begins with shared header)
-    char *shared_ptr = shared_region_start + 2 * kBackendHeaderSize;
+    char *shared_region_start = ptr + kBackendHeaderSize;
+    char *shared_ptr = shared_region_start + kBackendHeaderSize;
 
     // Now we have: [kBackendHeaderSize private header | kBackendHeaderSize shared header | aligned_md_size | data]
     // The first kBackendHeaderSize is private (process-local), the second is shared
@@ -159,7 +158,6 @@ class PosixShmMmap : public MemoryBackend, public UrlMemoryBackend {
    */
   bool shm_attach(const std::string &url) {
     flags_.Clear();
-    SetInitialized();
     Disown();
 
     if (!SystemInfo::OpenSharedMemory(fd_, url)) {

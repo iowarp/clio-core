@@ -164,31 +164,6 @@ class MemoryBackend {
 
   ~MemoryBackend() = default;
 
-  /** Mark data as valid */
-  HSHM_CROSS_FUN
-  void SetInitialized() { flags_.SetBits(MEMORY_BACKEND_INITIALIZED); }
-
-  /** Check if data is valid */
-  HSHM_CROSS_FUN
-  bool IsInitialized() { return flags_.Any(MEMORY_BACKEND_INITIALIZED); }
-
-  /** Mark data as invalid */
-  HSHM_CROSS_FUN
-  void UnsetInitialized() { flags_.UnsetBits(MEMORY_BACKEND_INITIALIZED); }
-
-
-  /** Mark data as having an allocation */
-  HSHM_CROSS_FUN
-  void SetHasAlloc() { header_->flags_.SetBits(MEMORY_BACKEND_HAS_ALLOC); }
-
-  /** Check if data has an allocation */
-  HSHM_CROSS_FUN
-  bool IsHasAlloc() { return header_->flags_.Any(MEMORY_BACKEND_HAS_ALLOC); }
-
-  /** Unmark data as having an allocation */
-  HSHM_CROSS_FUN
-  void UnsetHasAlloc() { header_->flags_.UnsetBits(MEMORY_BACKEND_HAS_ALLOC); }
-
   /** This is the process which destroys the backend */
   HSHM_CROSS_FUN
   void Own() { flags_.SetBits(MEMORY_BACKEND_OWNED); }
@@ -237,6 +212,25 @@ class MemoryBackend {
     size_t shift_amount = off - data_offset_;
     shifted.data_size_ -= shift_amount;
     shifted.data_offset_ = off;
+    return shifted;
+  }
+
+  /**
+   * Create a shifted backend positioned at a raw pointer location
+   *
+   * Updates only the data_offset to track where in the root backend this pointer is located.
+   * data_ remains unchanged (still points to root data). The data_offset is calculated as
+   * the distance from the root data_ to the given pointer.
+   *
+   * @param ptr Raw pointer to position the backend at
+   * @param region_size Total size of the managed region
+   * @return A new MemoryBackend with updated data_offset
+   */
+  HSHM_CROSS_FUN
+  MemoryBackend ShiftTo(char *ptr, size_t region_size) const {
+    MemoryBackend shifted = *this;
+    shifted.data_offset_ = static_cast<size_t>(ptr - data_);
+    shifted.data_size_ = region_size;
     return shifted;
   }
 
