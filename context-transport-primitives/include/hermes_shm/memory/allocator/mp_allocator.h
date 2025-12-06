@@ -773,14 +773,14 @@ class _MultiProcessAllocator : public Allocator {
   }
 
   /**
-   * Get the custom header of the shared-memory allocator
+   * Get the shared header (stored in backend's shared header region)
    *
-   * MultiProcessAllocator does not support custom headers, so this returns nullptr.
+   * MultiProcessAllocator does not support shared headers, so this returns nullptr.
    *
    * @return nullptr
    */
   template <typename HEADER_T>
-  HSHM_INLINE_CROSS_FUN HEADER_T *GetCustomHeader() {
+  HSHM_INLINE_CROSS_FUN HEADER_T *GetSharedHeader() {
     return nullptr;
   }
 };

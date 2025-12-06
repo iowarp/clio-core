@@ -110,3 +110,22 @@ MpPrivateHeader* GetPrivate() {
 Let's remove CtxAllocator concept completely.
 We will pass allocator pointers around.
 
+@CLAUDE.md
+
+The current issue is that alloc_ must be the last entry of the shared memory in order to avoid corrupting class parameters. For pblock and tblock, this is an easy change.
+
+However, the main block is different due to the custom header. Simply placing alloc_ at the end there is problematic.
+
+How do we fix this:
+1. Make custom header a part of the backend, not the allocator. I actually like this a lot. 
+
+Each backend has a private header and a shared header, both 4KB long. 
+Add a new method called GetSharedHeader to MemoryBackend. GetPrivateRegion should be renamed to GetPrivateHeader(). kBackendPrivate should be renamed to kBackendHeaderSize
+
+GetPrivateRegion() should be GetSharedHeader() - kBackendHeaderSize. GetSharedHeader() should be data_ - kBackendHeaderSize().
+
+Remove all logic in the allocators for considering custom_header_size_. Remove custom_header_size_ completely from allocators. We should rename GetCustomHeader in Allocator to GetSharedHeader().
+
+We should add a new class variable to allocator called data_start_ (this is not custom_header_size_). This represents the start of data relative to this_. Technically, this is just the size of the allocator class: data_start_ = sizeof(AllocT).
+
+GetAllocatorDataStart() should not depend on GetCustomHeader / GetSharedHeader anymore. Instead we should return (this) + data_start_
