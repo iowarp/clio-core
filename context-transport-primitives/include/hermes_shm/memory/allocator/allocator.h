@@ -1384,9 +1384,6 @@ class BaseAllocator : public CoreAllocT {
     // The allocator's shm_init will use GetAllocatorDataOff() to handle offset calculations
     SubAllocCoreT *sub_alloc_core = backend.MakeAlloc<SubAllocCoreT>(std::forward<Args>(args)...);
 
-    // Disown the local backend so its destructor doesn't free the region
-    backend.Disown();
-
     // Return as wrapped type
     return reinterpret_cast<SubAllocT*>(sub_alloc_core);
   }

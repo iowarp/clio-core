@@ -47,11 +47,7 @@ class PosixMmap : public MemoryBackend {
 
   /** Destructor */
   ~PosixMmap() {
-    if (IsOwned()) {
-      _Destroy();
-    } else {
-      _Detach();
-    }
+    _Detach();
   }
 
   /** Initialize backend */

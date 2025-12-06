@@ -43,11 +43,7 @@ class PosixShmMmap : public MemoryBackend, public UrlMemoryBackend {
   HSHM_CROSS_FUN
   ~PosixShmMmap() {
 #if HSHM_IS_HOST
-    if (IsOwned()) {
-      _Destroy();
-    } else {
-      _Detach();
-    }
+    _Detach();
 #endif
   }
 
@@ -158,7 +154,6 @@ class PosixShmMmap : public MemoryBackend, public UrlMemoryBackend {
    */
   bool shm_attach(const std::string &url) {
     flags_.Clear();
-    Disown();
 
     if (!SystemInfo::OpenSharedMemory(fd_, url)) {
       const char *err_buf = strerror(errno);

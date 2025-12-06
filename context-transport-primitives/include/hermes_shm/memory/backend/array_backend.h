@@ -33,7 +33,7 @@ class ArrayBackend : public MemoryBackend {
   ArrayBackend() = default;
 
   ~ArrayBackend() {
-    if (IsOwned() && header_ != nullptr) {
+    if (header_ != nullptr) {
       header_->~MemoryBackendHeader();
       free(header_);
       header_ = nullptr;

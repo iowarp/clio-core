@@ -35,7 +35,6 @@ class GpuMalloc : public MemoryBackend, public UrlMemoryBackend {
 
   /** Destructor */
   ~GpuMalloc() {
-    if (IsOwned()) {
       _Destroy();
     } else {
       _Detach();
@@ -53,7 +52,6 @@ class GpuMalloc : public MemoryBackend, public UrlMemoryBackend {
 
     // Initialize flags before calling methods that use it
     flags_.Clear();
-    Own();
 
     // Calculate sizes: header + md section + alignment
     constexpr size_t kAlignment = 4096;  // 4KB alignment
@@ -106,7 +104,6 @@ class GpuMalloc : public MemoryBackend, public UrlMemoryBackend {
   /** Deserialize the backend */
   bool shm_attach(const std::string &url) {
     flags_.Clear();
-    Disown();
 
     if (!SystemInfo::OpenSharedMemory(fd_, url)) {
       const char *err_buf = strerror(errno);

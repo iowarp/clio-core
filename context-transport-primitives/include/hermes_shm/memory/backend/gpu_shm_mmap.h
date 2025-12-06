@@ -45,7 +45,6 @@ class GpuShmMmap : public MemoryBackend, public UrlMemoryBackend {
   HSHM_CROSS_FUN
   ~GpuShmMmap() {
 #if HSHM_IS_HOST
-    if (IsOwned()) {
       _Destroy();
     } else {
       _Detach();
@@ -64,7 +63,6 @@ class GpuShmMmap : public MemoryBackend, public UrlMemoryBackend {
 
     // Initialize flags before calling methods that use it
     flags_.Clear();
-    Own();
 
     // Calculate sizes: header + md section + alignment + data section
     constexpr size_t kAlignment = 4096;  // 4KB alignment
@@ -117,7 +115,6 @@ class GpuShmMmap : public MemoryBackend, public UrlMemoryBackend {
   /** SHM deserialize */
   bool shm_attach(const std::string& url) {
     flags_.Clear();
-    Disown();
 
     if (!SystemInfo::OpenSharedMemory(fd_, url)) {
       const char *err_buf = strerror(errno);

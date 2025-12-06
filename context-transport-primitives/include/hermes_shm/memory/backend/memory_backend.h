@@ -164,18 +164,6 @@ class MemoryBackend {
 
   ~MemoryBackend() = default;
 
-  /** This is the process which destroys the backend */
-  HSHM_CROSS_FUN
-  void Own() { flags_.SetBits(MEMORY_BACKEND_OWNED); }
-
-  /** This is owned */
-  HSHM_CROSS_FUN
-  bool IsOwned() { return flags_.Any(MEMORY_BACKEND_OWNED); }
-
-  /** This is not the process which destroys the backend */
-  HSHM_CROSS_FUN
-  void Disown() { flags_.UnsetBits(MEMORY_BACKEND_OWNED); }
-
   /** Get the ID of this backend */
   HSHM_CROSS_FUN
   MemoryBackendId &GetId() { return header_->id_; }
