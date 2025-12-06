@@ -253,10 +253,11 @@ class MemoryBackend {
   MemoryBackend ShiftTo(FullPtr<T, PointerT> ptr, size_t size) const;
 
   /**
-   * Get pointer to the shared header (4KB before private header)
+   * Get pointer to the shared header (4KB before data_, at data_ - kBackendHeaderSize)
    *
    * This region is shared between processes and typically used for
    * allocator-level shared metadata (e.g., custom allocator headers).
+   * Located AFTER the private header (closer to data_).
    *
    * @tparam T Type to cast the shared header to (default: char)
    * @return Pointer to the kBackendHeaderSize-byte shared header, or nullptr if data_ is null
@@ -267,7 +268,7 @@ class MemoryBackend {
     if (data_ == nullptr) {
       return nullptr;
     }
-    return reinterpret_cast<T*>(data_ - 2 * kBackendHeaderSize);
+    return reinterpret_cast<T*>(data_ - kBackendHeaderSize);
   }
 
   /**
@@ -282,14 +283,15 @@ class MemoryBackend {
     if (data_ == nullptr) {
       return nullptr;
     }
-    return reinterpret_cast<const T*>(data_ - 2 * kBackendHeaderSize);
+    return reinterpret_cast<const T*>(data_ - kBackendHeaderSize);
   }
 
   /**
-   * Get pointer to the private header (4KB before data_)
+   * Get pointer to the private header (8KB before data_, at data_ - 2*kBackendHeaderSize)
    *
    * This region is process-local and not shared between processes.
    * Each process that attaches gets its own independent copy.
+   * Located BEFORE the shared header.
    * Useful for thread-local storage and process-specific metadata.
    *
    * @tparam T Type to cast the private header to (default: char)
@@ -301,7 +303,7 @@ class MemoryBackend {
     if (data_ == nullptr) {
       return nullptr;
     }
-    return reinterpret_cast<T*>(data_ - kBackendHeaderSize);
+    return reinterpret_cast<T*>(data_ - 2 * kBackendHeaderSize);
   }
 
   /**
@@ -316,7 +318,7 @@ class MemoryBackend {
     if (data_ == nullptr) {
       return nullptr;
     }
-    return reinterpret_cast<const T*>(data_ - kBackendHeaderSize);
+    return reinterpret_cast<const T*>(data_ - 2 * kBackendHeaderSize);
   }
 
   /**

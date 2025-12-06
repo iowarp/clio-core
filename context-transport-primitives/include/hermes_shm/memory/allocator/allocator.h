@@ -123,13 +123,14 @@ class Allocator {
   }
 
   /**
-   * Get typed private header (process-local storage before backend.data_)
+   * Get typed private header (process-local storage, 8KB before backend.data_)
+   * Located at (GetBackendData() - 2*kBackendHeaderSize)
    * This region is kBackendHeaderSize bytes and is NOT shared between processes
    * @return Pointer to private header of type HEADER_T
    */
   template <typename HEADER_T>
   HSHM_INLINE_CROSS_FUN HEADER_T* GetPrivateHeader() const {
-    return reinterpret_cast<HEADER_T*>(GetBackendData() - kBackendHeaderSize);
+    return reinterpret_cast<HEADER_T*>(GetBackendData() - 2 * kBackendHeaderSize);
   }
 
   /**
