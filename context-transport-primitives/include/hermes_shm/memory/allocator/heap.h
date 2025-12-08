@@ -70,6 +70,11 @@ class Heap {
    */
   HSHM_CROSS_FUN
   size_t Allocate(size_t size) {
+    // Check if heap may have enough space
+    if (heap_.load() + size > max_offset_) {
+      return 0;
+    }
+    
     // Atomically fetch current offset and advance heap by size
     size_t off = heap_.fetch_add(size);
 
@@ -78,6 +83,7 @@ class Heap {
 
     // Check if allocation would exceed maximum offset
     if (end_off > max_offset_) {
+      max_offset_ = end_off;
       return 0;  // Return 0 to indicate failure (out of memory)
     }
 

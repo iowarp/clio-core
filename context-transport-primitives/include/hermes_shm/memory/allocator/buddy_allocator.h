@@ -101,7 +101,9 @@ class _BuddyAllocator : public Allocator {
   Heap<false> small_arena_; /**< Arena for small allocations */
 
   pre::slist<false> small_pages_[kMaxSmallPages];   /**< Free lists for sizes 32B - 16KB */
-  pre::slist<false> large_pages_[kMaxLargePages]; /**< Free lists for sizes 16KB - 1MB */
+  pre::slist<false>
+      large_pages_[kMaxLargePages]; /**< Free lists for sizes 16KB - 1MB */
+  pre::slist<false> regions_;   /**< List of big_heap_ regions */
 
   // _MultiProcessAllocator needs access to reconstruct pointers when attaching
   friend class _MultiProcessAllocator;
@@ -148,18 +150,9 @@ class _BuddyAllocator : public Allocator {
       large_pages_[i].Init();
     }
 
-    // Initialize heaps
-    size_t heap_begin = GetAllocatorDataOff();
-    size_t heap_max_offset = GetAllocatorDataOff() + GetAllocatorDataSize();
-
-    if (GetAllocatorDataOff() + GetAllocatorDataSize() >
-        backend.data_capacity_) {
-      throw std::runtime_error("BuddyAllocator: Not enough space in backend");
-    }
-
     // Big heap gets all available space initially
-    big_heap_.Init(heap_begin, heap_max_offset);
-    
+    Expand(OffsetPtr<>(GetAllocatorDataOff()), GetAllocatorDataSize());
+
     // Small arena is initially empty - will be populated on first small allocation
     small_arena_.Init(0, 0);
 
@@ -306,7 +299,14 @@ class _BuddyAllocator : public Allocator {
     if (region.IsNull() || region_size == 0) {
       return;
     }
-    big_heap_.Init(region.load(), region.load() + region_size);
+    FullPtr<BuddyPage> node(this, OffsetPtr<BuddyPage>(region.load()));
+    node->size_ = region_size;
+    regions_.emplace(this, node.Cast<pre::slist_node>());
+    region += sizeof(BuddyPage);
+    region_size -= sizeof(BuddyPage);
+    DivideArenaIntoPages(big_heap_);
+    big_heap_.Init(region.load(),
+                                        region.load() + region_size);
   }
 
  private:
@@ -367,39 +367,21 @@ class _BuddyAllocator : public Allocator {
     size_t list_idx = GetLargePageListIndexForAlloc(size);
 
     // Step 2: Check each entry in this list for a fit
-    size_t found_offset = FindFirstFit(list_idx, total_size);
-    if (found_offset != 0) {
-      hipc::FullPtr<FreeLargeBuddyPage> free_page(this, OffsetPtr<FreeLargeBuddyPage>(found_offset));
-      size_t page_size = free_page.ptr_->free_size_;
+    for (size_t i = list_idx; i < kMaxLargePages; ++i) {
+        size_t found_offset = FindFirstFit(list_idx, total_size);
+        if (found_offset != 0) {
+        hipc::FullPtr<FreeLargeBuddyPage> free_page(this, OffsetPtr<FreeLargeBuddyPage>(found_offset));
+        size_t page_size = free_page.ptr_->free_size_;
 
-      // If there's remainder, add it back to appropriate list using exact size
-      if (page_size > total_size) {
-        AddRemainderToFreeList(found_offset + total_size, page_size - total_size);
-      }
-
-      return FinalizeAllocation(found_offset, size);
-    }
-
-    // Step 3: Check larger free lists for first match
-    for (size_t i = list_idx + 1; i < kMaxLargePages; ++i) {
-      if (!large_pages_[i].empty()) {
-        auto node = large_pages_[i].pop(this);
-        if (!node.IsNull()) {
-          size_t page_offset = node.shm_.off_.load();
-          hipc::FullPtr<FreeLargeBuddyPage> free_page(this, OffsetPtr<FreeLargeBuddyPage>(page_offset));
-          size_t page_size = free_page.ptr_->free_size_;
-
-          // Subset and allocate
-          if (page_size > total_size) {
-            AddRemainderToFreeList(page_offset + total_size, page_size - total_size);
-          }
-
-          return FinalizeAllocation(page_offset, size);
+        // If there's remainder, add it back to appropriate list using exact size
+        if (page_size > total_size) {
+            AddRemainderToFreeList(found_offset + total_size, page_size - total_size);
         }
-        // If pop returned null despite list not being empty, continue to next list
-      }
-    }
 
+        return FinalizeAllocation(found_offset, size);
+        }
+    }
+    
     // Step 4: Try allocating from heap
     size_t heap_offset = big_heap_.Allocate(total_size);
     if (heap_offset != 0) {
@@ -451,18 +433,15 @@ class _BuddyAllocator : public Allocator {
   bool RepopulateSmallArena() {
     size_t arena_size = kSmallArenaSize + kSmallArenaPages * sizeof(BuddyPage);
 
+    // Divide small arena into pages
+    DivideArenaIntoPages(small_arena_);
+
     // Step 4.2.1: Try allocating from big_heap_ first
     size_t heap_offset = big_heap_.Allocate(arena_size);
 
     if (heap_offset != 0) {
       // Step 4.1: Set arena bounds
       small_arena_.Init(heap_offset, heap_offset + arena_size);
-
-      // Step 4.2: Divide into pages using greedy algorithm
-      DivideArenaIntoPages();
-
-      // Step 4.3: Arena is now fully divided into free list pages
-      // Arena is marked as consumed by DivideArenaIntoPages
 
       return true;
     }
@@ -473,7 +452,6 @@ class _BuddyAllocator : public Allocator {
         size_t offset = FindFirstFit(list_idx, arena_size);
         if (offset != 0) {
           small_arena_.Init(offset, offset + arena_size);
-          DivideArenaIntoPages();
           return true;
         }
       }
@@ -489,11 +467,11 @@ class _BuddyAllocator : public Allocator {
    * the arena space into free pages, adding them to the appropriate free lists.
    * After this function, the arena is marked as fully consumed.
    */
-  void DivideArenaIntoPages() {
+  void DivideArenaIntoPages(Heap<false> &heap) {
     // Get the arena bounds from the heap
     // After Init(), heap_ points to the beginning and hasn't moved yet
-    size_t arena_begin = small_arena_.GetOffset();
-    size_t arena_end = small_arena_.GetMaxOffset();
+    size_t arena_begin = heap.GetOffset();
+    size_t arena_end = heap.GetMaxOffset();
     size_t remaining_offset = arena_begin;
     size_t remaining_size = arena_end - arena_begin;
 
@@ -530,7 +508,7 @@ class _BuddyAllocator : public Allocator {
     // Any remaining space smaller than kMinSize + sizeof(BuddyPage) is wasted
 
     // Mark arena as fully consumed by setting it to point to the end
-    small_arena_.Init(arena_end, arena_end);
+    heap.Init(arena_end, arena_end);
   }
 
   /**

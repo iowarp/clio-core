@@ -169,12 +169,12 @@
             "preLaunchTask": "cmake-build-debug"
         },
         {
-            "name": "Debug MP Allocator Multiple Test (Deadlock)",
+            "name": "Debug MP Allocator Allocate + Free Immediate",
             "type": "cppdbg",
             "request": "launch",
             "program": "${workspaceFolder}/build/bin/test_mp_allocator_exec",
             "args": [
-                "MultiProcessAllocator - Multi-threaded Random"
+                "MultiProcessAllocator - Allocate and Free Immediate"
             ],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}/build",
@@ -201,12 +201,12 @@
             "preLaunchTask": "cmake-build-debug"
         },
         {
-            "name": "Debug BuddyAllocator Random Allocation Test",
+            "name": "BuddyAllocator - Large Then Small",
             "type": "cppdbg",
             "request": "launch",
             "program": "${workspaceFolder}/build/bin/test_buddy_allocator_exec",
             "args": [
-                "BuddyAllocator - Random Allocation"
+                "BuddyAllocator - Large Then Small"
             ],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}/build",

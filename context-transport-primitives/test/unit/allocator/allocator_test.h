@@ -105,8 +105,8 @@ class AllocatorTest {
    * @param iterations Number of iterations
    */
   void TestRandomAllocation(size_t iterations) {
-    const size_t kMaxAllocSize = 16 * 1024;  // 16 MB
-    const size_t kMaxTotalSize = 32 * 1024 * 1024;  // 16 MB
+    const size_t kMaxAllocSize = 16 * 1024 * 1024;  // 16 MB
+    const size_t kMaxTotalSize = 32 * 1024 * 1024;  // 32 MB
     const size_t kMaxAllocations = 5000;
 
     std::uniform_int_distribution<size_t> size_dist(1, kMaxAllocSize);
