@@ -40,7 +40,6 @@ class ArrayBackend : public MemoryBackend {
    * @param backend_id Backend identifier
    * @param size Size of the ENTIRE array
    * @param region Pointer to the BEGINNING of the array
-   * @param offset Offset within the array
    * @return true on success
    *
    * Memory layout in the region:
@@ -49,7 +48,7 @@ class ArrayBackend : public MemoryBackend {
    * - Bytes 2*kBackendHeaderSize onwards: Custom header and data
    */
   HSHM_CROSS_FUN
-  bool shm_init(const MemoryBackendId &backend_id, size_t size, char *region, u64 offset = 0) {
+  bool shm_init(const MemoryBackendId &backend_id, size_t size, char *region) {
     // Headers are at the beginning of the region
     region_ = region;
     char *priv_header_ptr = region + kBackendHeaderSize;

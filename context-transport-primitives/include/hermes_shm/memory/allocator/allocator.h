@@ -1116,7 +1116,8 @@ class BaseAllocator : public CoreAllocT {
   template <typename T = void, typename PointerT = ShmPtr<>>
   HSHM_INLINE_CROSS_FUN FullPtr<T, PointerT> Allocate(size_t size) {
     auto offset_ptr = AllocateOffset(size);
-    return FullPtr<T, PointerT>(this, OffsetPtr<T>(offset_ptr.load()));
+    auto *alloc_ptr = static_cast<Allocator*>(this);
+    return FullPtr<T, PointerT>(alloc_ptr, OffsetPtr<T>(offset_ptr.load()));
   }
 
   /**
@@ -1215,6 +1216,13 @@ class BaseAllocator : public CoreAllocT {
     auto new_full_ptr = Reallocate<void, PointerT>(old_full_ptr, new_count * sizeof(T));
     p = FullPtr<T, PointerT>(reinterpret_cast<T*>(new_full_ptr.ptr_), new_full_ptr.shm_);
     return p;
+  }
+
+  /** Free a region */
+  template <typename T, typename PointerT = ShmPtr<>>
+  HSHM_INLINE_CROSS_FUN void FreeRegion(const FullPtr<T, PointerT> &p) {
+    DestructObj(p.ptr_);
+    FreeOffsetNoNullCheck(p.shm_.off_);
   }
 
   /**
@@ -1331,51 +1339,28 @@ class BaseAllocator : public CoreAllocT {
   /**
    * Create a sub-allocator within this allocator
    *
-   * @tparam SubAllocCoreT The sub-allocator core type to create
-   * @param sub_id The unique sub-allocator ID (deprecated, not used)
+   * @tparam SubAllocT The sub-allocator type to create (e.g., ArenaAllocator, BuddyAllocator)
    * @param size Size of the region for the sub-allocator
    * @param args Additional arguments for the sub-allocator initialization
    * @return Pointer to the created sub-allocator
    */
-  template<typename SubAllocCoreT, typename ...Args>
-  HSHM_CROSS_FUN BaseAllocator<SubAllocCoreT> *CreateSubAllocator(u64 sub_id,
-                                                                   size_t size,
-                                                                   Args&& ...args) {
-    (void)sub_id;  // Unused parameter
-
-    // Calculate total size needed:
-    // - 2*kBackendHeaderSize for shared and private headers
-    // - sizeof(SubAllocCoreT) for the allocator object itself
-    // - size for the allocator's managed region
-    using SubAllocT = BaseAllocator<SubAllocCoreT>;
-    size_t alloc_size = sizeof(SubAllocCoreT);
-    size_t total_size = 2 * hipc::kBackendHeaderSize + alloc_size + size;
-
+  template <typename SubAllocT, typename... Args>
+  HSHM_CROSS_FUN FullPtr<SubAllocT> CreateSubAllocator(size_t size,
+                                                       Args &&...args) {
     // Allocate region from this allocator
-    FullPtr<char> region = Allocate<char>(total_size);
-    if (region.IsNull()) {
-      return nullptr;
+    FullPtr<SubAllocT> sub_alloc = AllocateRegion<SubAllocT>(size);
+    if (sub_alloc.IsNull()) {
+      return FullPtr<SubAllocT>::GetNull();
     }
 
-    // Get the backend ID from this allocator
-    CoreAllocT *core_this = static_cast<CoreAllocT*>(this);
-    MemoryBackendId backend_id = core_this->GetId();
+    // Get backend
+    MemoryBackend backend = static_cast<CoreAllocT*>(this)->GetBackend();
 
-    // Create ArrayBackend for the sub-allocator
-    // The ArrayBackend points to: [kBackendHeaderSize private][kBackendHeaderSize shared][SubAllocCoreT object][managed region]
-    hipc::ArrayBackend backend;
-    char *region_ptr = region.ptr_;
-    u64 region_offset = region.shm_.off_.load();
-    size_t total_region_size = 2 * hipc::kBackendHeaderSize + alloc_size + size;
-    backend.shm_init(backend_id, total_region_size, region_ptr, region_offset);
+    // Initialize sub-allocator
+    sub_alloc->shm_init(backend, size, std::forward<Args>(args)...);
 
-    // Use MakeAlloc to construct and initialize the sub-allocator
-    // MakeAlloc automatically passes backend as first parameter to shm_init
-    // The allocator's shm_init will use GetAllocatorDataOff() to handle offset calculations
-    SubAllocCoreT *sub_alloc_core = backend.MakeAlloc<SubAllocCoreT>(std::forward<Args>(args)...);
-
-    // Return as wrapped type
-    return reinterpret_cast<SubAllocT*>(sub_alloc_core);
+    // Return the sub-allocator
+    return sub_alloc;
   }
 
   /**
@@ -1385,21 +1370,11 @@ class BaseAllocator : public CoreAllocT {
    * @param sub_alloc ShmPtr to the sub-allocator to free
    */
   template<typename AllocT>
-  HSHM_CROSS_FUN void FreeSubAllocator(AllocT *sub_alloc) {
-    if (sub_alloc == nullptr) {
+  HSHM_CROSS_FUN void FreeSubAllocator(const FullPtr<AllocT> &sub_alloc) {
+    if (sub_alloc.IsNull()) {
       return;
     }
-
-    // Get the offset of the sub-allocator's data region
-    CoreAllocT *core_this = static_cast<CoreAllocT*>(this);
-    OffsetPtr<> offset_ptr(reinterpret_cast<char*>(sub_alloc) - core_this->GetBackendData());
-
-    // Free the data region
-    FreeOffsetNoNullCheck(offset_ptr);
-
-    // Destroy and free the allocator object
-    sub_alloc->~AllocT();
-    free(sub_alloc);
+    FreeRegion(sub_alloc);
   }
 };
 
