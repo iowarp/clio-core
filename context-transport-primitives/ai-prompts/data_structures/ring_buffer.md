@@ -23,8 +23,10 @@ Please also add the relevant typedefs from the main branch. Every typedef from t
 We should have a test verifying each typedef data structure.
 We should have a single workload generator class testing all angles of the queues.
 We may not use each workload for each typedef, but they should all be in a single class.
+We should have a single source file for all ring buffer tests.
+We have to have a SINGLE workload generator class for ALL ring_buffer queues. FOR ALL OF THEM. Not one for each, just a single class for ALL RING BUFFER QUEUES.
+ONE SOURCE FILE!!! DO NOT MAKE SEPARATE SOURCE FILES FOR THE RING BUFFER TESTS!!! ONE FILE!!! ONE CLASS IN THE FILE FOR WORKLOAD GENERATION!!! AND THEN SEPARATE TESTS IN THAT FILE CALLING WORKLOAD GENERATOR FOR EACH QUEUE TYPE!!!! 
 
 For mpsc_ring_buffer, we need the following test: 
-1. We will spawn 4 producer threads. Each producer thread will emplace 256 elements. The queue should have size 8.
-1. One thread consumes constantly. It will consume until X entries are received
-So one thread that consumes, and then N threads that are emplacing. The queue for emplacing should be 2*number of threads. Each thread should emplace elements for at least 2 seconds constantly.
+1. We will spawn 4 producer threads. Each producer thread will emplace for 2 seconds. The queue should have capacity 8 to ensure there is contention among the threads.
+2. We will spawn one consumer thread, which is polling the queue constantly. It will poll continuously for 4 seconds.
