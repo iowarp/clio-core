@@ -156,23 +156,7 @@ class Container {
    */
   HSHM_DLL virtual void Aggregate(u32 method,
                                  hipc::FullPtr<Task> origin_task,
-                                 hipc::FullPtr<Task> replica_task) = 0;
-
- protected:
-  /**
-   * Get the allocator for this container
-   */
-  AllocT* GetAllocator() const {
-    return CHI_IPC->GetMainAllocator();
-  }
-
-  /**
-   * Check if the container's pool ID is null/invalid
-   * @return true if pool_id_ is null, false otherwise
-   */
-  bool IsNull() const {
-    return pool_id_.IsNull();
-  }
+                                 hipc::FullPtr<Task> replica_task) = 0; 
 };
 
 /**

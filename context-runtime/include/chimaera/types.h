@@ -322,7 +322,19 @@ typedef hshm::priv::string<CHI_MAIN_ALLOC_T> string;
 
 template<typename T>
 using vector = hshm::priv::vector<T, CHI_MAIN_ALLOC_T>;
-}  // namespace chi
+}  // namespace chi::priv
+
+namespace chi::ipc {
+template <typename T>
+using multi_mpsc_ring_buffer =
+    hipc::multi_mpsc_ring_buffer<T, CHI_MAIN_ALLOC_T>;
+
+template <typename T>
+using mpsc_ring_buffer = hipc::mpsc_ring_buffer<T, CHI_MAIN_ALLOC_T>;
+
+template <typename T>
+using vector = hipc::vector<T, CHI_MAIN_ALLOC_T>;
+}  // namespace chi::ipc
 
 // Hash function specializations for std::unordered_map
 namespace std {

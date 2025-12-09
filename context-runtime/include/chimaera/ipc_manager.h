@@ -26,9 +26,8 @@ using WorkQueue = chi::ipc::mpsc_ring_buffer<hipc::ShmPtr<TaskLane>>;
  * Contains shared data structures using delay_ar for better type safety
  */
 struct IpcSharedHeader {
-  hipc::delay_ar<TaskQueue>
-      external_queue; // External/Process TaskQueue in shared memory
-  hipc::delay_ar<chi::ipc::vector<WorkQueue>>
+  TaskQueue external_queue; // External/Process TaskQueue in shared memory
+  chi::ipc::vector<WorkQueue>
       worker_queues; // Vector of worker active queues
   u32 num_workers;   // Number of workers for which queues are allocated
   u64 node_id;       // 64-bit hash of the hostname for node identification
@@ -145,12 +144,12 @@ public:
    * Converts hipc::ShmPtr<> to FullPtr<char> and calls the main FreeBuffer
    * @param buffer_ptr hipc::ShmPtr<> to buffer to free
    */
-  void FreeBuffer(hipc::ShmPtr<> buffer_ptr) {
+  void FreeBuffer(hipc::ShmPtr<char> buffer_ptr) {
     if (buffer_ptr.IsNull()) {
       return;
     }
     // Convert hipc::ShmPtr<> to FullPtr<char> and call main FreeBuffer
-    hipc::FullPtr<char> full_ptr(buffer_ptr);
+    hipc::FullPtr<char> full_ptr(ToFullPtr<char>(buffer_ptr));
     FreeBuffer(full_ptr);
   }
 
@@ -174,8 +173,7 @@ public:
       // Get lane as FullPtr and use TaskQueue's EmplaceTask method
       // Priority 0 for normal task submission
       auto &lane_ref = external_queue_->GetLane(lane_id, 0);
-      hipc::FullPtr<TaskLane> lane_ptr(&lane_ref);
-      ::chi::TaskQueue::EmplaceTask(lane_ptr, typed_ptr);
+      lane_ref.Push(task_ptr.template Cast<Task>().shm_);
     }
   }
 

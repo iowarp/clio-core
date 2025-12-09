@@ -737,7 +737,7 @@ using AtomicShmPtr = ShmPtrBase<T, true>;
 
 
 /** Struct containing both private and shared pointer */
-template <typename T = char, typename PointerT = ShmPtr<>>
+template <typename T = char, typename PointerT = ShmPtr<T>>
 struct FullPtr : public ShmPointer {
   T *ptr_;
   PointerT shm_;

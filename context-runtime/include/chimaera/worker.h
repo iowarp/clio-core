@@ -241,7 +241,7 @@ private:
    * @param queue Reference to the ext_ring_buffer to process
    * @param queue_idx Index of the queue being processed (0-3)
    */
-  void ProcessBlockedQueue(hshm::ext_ring_buffer<RunContext *> &queue,
+  void ProcessBlockedQueue(std::queue<RunContext *> &queue,
                            u32 queue_idx);
 
   /**
@@ -249,7 +249,7 @@ private:
    * @param queue Reference to the ext_ring_buffer to process
    * @param queue_idx Index of the queue being processed (0-3)
    */
-  void ProcessPeriodicQueue(hshm::ext_ring_buffer<RunContext *> &queue,
+  void ProcessPeriodicQueue(std::queue<RunContext *> &queue,
                             u32 queue_idx);
 
 public:
@@ -390,27 +390,27 @@ private:
 
   // Stack and RunContext cache for efficient reuse
   // Using ext_ring_buffer for O(1) enqueue/dequeue operations
-  hshm::ext_ring_buffer<StackAndContext> stack_cache_;
+  std::queue<StackAndContext> stack_cache_;
 
   // Blocked queue system for cooperative tasks (waiting for subtasks):
   // - Queue[0]: Tasks blocked <=2 times (checked every % 2 iterations)
   // - Queue[1]: Tasks blocked <= 4 times (checked every % 4 iterations)
   // - Queue[2]: Tasks blocked <= 8 times (checked every % 8 iterations)
   // - Queue[3]: Tasks blocked > 8 times (checked every % 16 iterations)
-  // Using hshm::ext_ring_buffer for O(1) enqueue/dequeue operations
+  // Using std::queue for O(1) enqueue/dequeue operations
   static constexpr u32 NUM_BLOCKED_QUEUES = 4;
   static constexpr u32 BLOCKED_QUEUE_SIZE = 1024;
-  hshm::ext_ring_buffer<RunContext *> blocked_queues_[NUM_BLOCKED_QUEUES];
+  std::queue<RunContext *> blocked_queues_[NUM_BLOCKED_QUEUES];
 
   // Periodic queue system for time-based periodic tasks:
   // - Queue[0]: Tasks with block_time_us <= 50us (checked every 16 iterations)
   // - Queue[1]: Tasks with block_time_us <= 200us (checked every 32 iterations)
   // - Queue[2]: Tasks with block_time_us <= 50ms/50000us (checked every 64 iterations)
   // - Queue[3]: Tasks with block_time_us > 50ms (checked every 128 iterations)
-  // Using hshm::ext_ring_buffer for O(1) enqueue/dequeue operations
+  // Using std::queue for O(1) enqueue/dequeue operations
   static constexpr u32 NUM_PERIODIC_QUEUES = 4;
   static constexpr u32 PERIODIC_QUEUE_SIZE = 1024;
-  hshm::ext_ring_buffer<RunContext *> periodic_queues_[NUM_PERIODIC_QUEUES];
+  std::queue<RunContext *> periodic_queues_[NUM_PERIODIC_QUEUES];
 
   // Worker spawn time and queue processing tracking
   hshm::Timepoint spawn_time_; // Time when worker was spawned

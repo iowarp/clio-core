@@ -41,13 +41,6 @@ class Client {
  public:
   virtual ~Client() = default;
 
-  // Expose from raw pointer
-  virtual Bulk Expose(const char* data, size_t data_size, u32 flags) = 0;
-
-  // Expose from hipc::ShmPtr<>
-  virtual Bulk Expose(const hipc::ShmPtr<>& ptr, size_t data_size,
-                      u32 flags) = 0;
-
   // Expose from hipc::FullPtr
   virtual Bulk Expose(const hipc::FullPtr<char>& ptr, size_t data_size,
                       u32 flags) = 0;
@@ -59,13 +52,6 @@ class Client {
 class Server {
  public:
   virtual ~Server() = default;
-
-  // Expose from raw pointer
-  virtual Bulk Expose(char* data, size_t data_size, u32 flags) = 0;
-
-  // Expose from hipc::ShmPtr<>
-  virtual Bulk Expose(const hipc::ShmPtr<>& ptr, size_t data_size,
-                      u32 flags) = 0;
 
   // Expose from hipc::FullPtr
   virtual Bulk Expose(const hipc::FullPtr<char>& ptr, size_t data_size,

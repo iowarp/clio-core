@@ -34,13 +34,13 @@ Worker::Worker(u32 worker_id, ThreadType thread_type)
   // Initialize all 4 blocked queues with capacity 1024 each
   for (u32 i = 0; i < NUM_BLOCKED_QUEUES; ++i) {
     blocked_queues_[i] =
-        hshm::ext_ring_buffer<RunContext *>(BLOCKED_QUEUE_SIZE);
+        std::queue<RunContext *>(BLOCKED_QUEUE_SIZE);
   }
 
   // Initialize all 4 periodic queues with capacity 1024 each
   for (u32 i = 0; i < NUM_PERIODIC_QUEUES; ++i) {
     periodic_queues_[i] =
-        hshm::ext_ring_buffer<RunContext *>(PERIODIC_QUEUE_SIZE);
+        std::queue<RunContext *>(PERIODIC_QUEUE_SIZE);
   }
 
   // Record worker spawn time
@@ -1026,7 +1026,7 @@ void Worker::RerouteDynamicTask(const FullPtr<Task> &task_ptr,
   }
 }
 
-void Worker::ProcessBlockedQueue(hshm::ext_ring_buffer<RunContext *> &queue,
+void Worker::ProcessBlockedQueue(std::queue<RunContext *> &queue,
                                  u32 queue_idx) {
   // Process only first 8 tasks in the queue
   size_t queue_size = queue.GetSize();
@@ -1071,7 +1071,7 @@ void Worker::ProcessBlockedQueue(hshm::ext_ring_buffer<RunContext *> &queue,
   }
 }
 
-void Worker::ProcessPeriodicQueue(hshm::ext_ring_buffer<RunContext *> &queue,
+void Worker::ProcessPeriodicQueue(std::queue<RunContext *> &queue,
                                   u32 queue_idx) {
   (void)queue_idx; // Unused parameter, kept for API consistency
 
