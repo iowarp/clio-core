@@ -206,7 +206,7 @@ hipc::FullPtr<WorkQueue> IpcManager::GetWorkerQueue(u32 worker_id) {
     return hipc::FullPtr<WorkQueue>::GetNull();
   }
 
-  // Get the vector of worker queues from delay_ar
+  // Get the vector of worker queues
   auto &worker_queues_vector = shared_header_->worker_queues;
 
   if (worker_id >= worker_queues_vector.size()) {

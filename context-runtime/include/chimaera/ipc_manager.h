@@ -24,7 +24,7 @@ using WorkQueue = chi::ipc::mpsc_ring_buffer<hipc::ShmPtr<TaskLane>>;
 
 /**
  * Custom header structure for shared memory allocator
- * Contains shared data structures using delay_ar for better type safety
+ * Contains shared data structures
  */
 struct IpcSharedHeader {
   TaskQueue external_queue; // External/Process TaskQueue in shared memory

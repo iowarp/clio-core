@@ -21,13 +21,6 @@
 #include "hermes_shm/util/singleton.h"
 #include "hermes_shm/util/type_switch.h"
 
-TEST_CASE("ShmArchive") {
-  hipc::delay_ar<int> x;
-  x.shm_init(10);
-  REQUIRE(sizeof(hipc::delay_ar<int>) == sizeof(int));
-  REQUIRE(*x == 10);
-}
-
 TEST_CASE("TypeSwitch") {
   typedef hshm::type_switch<int, int, std::string, std::string, size_t,
                             size_t>::type internal_t;
