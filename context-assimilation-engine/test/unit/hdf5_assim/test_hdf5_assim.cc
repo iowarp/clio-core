@@ -199,7 +199,6 @@ int main(int argc, char* argv[]) {
     wrp_cae::core::CreateParams params;
 
     cae_client.Create(
-        HSHM_MCTX,
         chi::PoolQuery::Local(),
         "test_cae_pool",
         wrp_cae::core::kCaePoolId,
@@ -226,7 +225,7 @@ int main(int argc, char* argv[]) {
     std::cout << "\n[STEP 5] Calling ParseOmni..." << std::endl;
     std::vector<wrp_cae::core::AssimilationCtx> contexts = {ctx};
     chi::u32 num_tasks_scheduled = 0;
-    chi::u32 result_code = cae_client.ParseOmni(HSHM_MCTX, contexts, num_tasks_scheduled);
+    chi::u32 result_code = cae_client.ParseOmni(contexts, num_tasks_scheduled);
 
     std::cout << "ParseOmni completed:" << std::endl;
     std::cout << "  result_code: " << result_code << std::endl;
@@ -268,7 +267,7 @@ int main(int argc, char* argv[]) {
       std::cout << "  Full tag name: " << full_tag_name << std::endl;
 
       // Check if tag exists
-      wrp_cte::core::TagId tag_id = cte_client->GetOrCreateTag(HSHM_MCTX, full_tag_name);
+      wrp_cte::core::TagId tag_id = cte_client->GetOrCreateTag(full_tag_name);
       if (tag_id.IsNull()) {
         std::cerr << "  WARNING: Tag not found in CTE: " << full_tag_name << std::endl;
         continue;
@@ -278,7 +277,7 @@ int main(int argc, char* argv[]) {
       std::cout << "  Tag found (ID: " << tag_id << ")" << std::endl;
 
       // Get tag size
-      size_t tag_size = cte_client->GetTagSize(HSHM_MCTX, tag_id);
+      size_t tag_size = cte_client->GetTagSize(tag_id);
       std::cout << "  Tag size: " << tag_size << " bytes" << std::endl;
 
       if (tag_size == 0) {

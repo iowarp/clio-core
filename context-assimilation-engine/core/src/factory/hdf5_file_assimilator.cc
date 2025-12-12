@@ -279,7 +279,7 @@ int Hdf5FileAssimilator::ProcessDataset(hid_t file_id,
 
   HILOG(kInfo, "ProcessDataset: Submitting description blob (size: {} bytes)...", desc_size);
   auto desc_task = cte_client_->AsyncPutBlob(
-      tag_id, "description", 0, desc_size, desc_buffer.shm_, 1.0f, 0);
+      tag_id, "description", 0, desc_size, desc_buffer.shm_.template Cast<void>(), 1.0f, 0);
   HILOG(kInfo, "ProcessDataset: Waiting for description blob task...");
   desc_task->Wait();
 
@@ -428,7 +428,7 @@ int Hdf5FileAssimilator::ProcessDataset(hid_t file_id,
       HILOG(kInfo, "ProcessDataset: Submitting AsyncPutBlob for chunk {}...", chunk_idx);
       auto task = cte_client_->AsyncPutBlob(
           tag_id, blob_name, 0, current_chunk_size,
-          chunk_buffer.shm_, 1.0f, 0);
+          chunk_buffer.shm_.template Cast<void>(), 1.0f, 0);
 
       active_tasks.push_back(task);
       HILOG(kInfo, "ProcessDataset: Task submitted for chunk {}, active_tasks count: {}",
@@ -454,7 +454,7 @@ int Hdf5FileAssimilator::ProcessDataset(hid_t file_id,
         HELOG(kError, "Hdf5FileAssimilator: PutBlob task failed with code {}",
               first_task->return_code_.load());
         // Free the buffer before deleting the task
-        CHI_IPC->FreeBuffer(first_task->blob_data_);
+        CHI_IPC->FreeBuffer(first_task->blob_data_.template Cast<char>());
         CHI_IPC->DelTask(first_task);
         CHI_IPC->FreeBuffer(read_buffer);
         H5Tclose(datatype_id);
@@ -465,7 +465,7 @@ int Hdf5FileAssimilator::ProcessDataset(hid_t file_id,
 
       HILOG(kInfo, "ProcessDataset: First task completed successfully");
       // Free the buffer before deleting the task
-      CHI_IPC->FreeBuffer(first_task->blob_data_);
+      CHI_IPC->FreeBuffer(first_task->blob_data_.template Cast<char>());
       CHI_IPC->DelTask(first_task);
       active_tasks.erase(active_tasks.begin());
     }
@@ -480,7 +480,7 @@ int Hdf5FileAssimilator::ProcessDataset(hid_t file_id,
       HELOG(kError, "Hdf5FileAssimilator: PutBlob task failed with code {}",
             task->return_code_.load());
       // Free the buffer before deleting the task
-      CHI_IPC->FreeBuffer(task->blob_data_);
+      CHI_IPC->FreeBuffer(task->blob_data_.template Cast<char>());
       CHI_IPC->DelTask(task);
       CHI_IPC->FreeBuffer(read_buffer);
       H5Tclose(datatype_id);
@@ -489,7 +489,7 @@ int Hdf5FileAssimilator::ProcessDataset(hid_t file_id,
       return -12;
     }
     // Free the buffer before deleting the task
-    CHI_IPC->FreeBuffer(task->blob_data_);
+    CHI_IPC->FreeBuffer(task->blob_data_.template Cast<char>());
     CHI_IPC->DelTask(task);
   }
 

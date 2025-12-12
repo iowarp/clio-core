@@ -110,7 +110,7 @@ int BinaryFileAssimilator::Schedule(const AssimilationCtx& ctx) {
 
   HILOG(kInfo, "BinaryFileAssimilator: Storing description blob: '{}'", description);
   auto desc_task = cte_client_->AsyncPutBlob(
-      tag_id, "description", 0, desc_size, desc_buffer.shm_, 1.0f, 0);
+      tag_id, "description", 0, desc_size, desc_buffer.shm_.template Cast<void>(), 1.0f, 0);
   desc_task->Wait();
 
   if (desc_task->return_code_.load() != 0) {
@@ -204,7 +204,7 @@ int BinaryFileAssimilator::Schedule(const AssimilationCtx& ctx) {
       HILOG(kInfo, "BinaryFileAssimilator: About to call AsyncPutBlob for chunk {}", chunk_idx);
       auto task = cte_client_->AsyncPutBlob(
           tag_id, blob_name, 0,
-          current_chunk_size, buffer_ptr.shm_, 1.0f, 0);
+          current_chunk_size, buffer_ptr.shm_.template Cast<void>(), 1.0f, 0);
 
       active_tasks.push_back(task);
       
@@ -222,13 +222,13 @@ int BinaryFileAssimilator::Schedule(const AssimilationCtx& ctx) {
         HELOG(kError, "BinaryFileAssimilator: PutBlob task failed with code {}",
               first_task->return_code_.load());
         // Free the buffer before deleting the task
-        CHI_IPC->FreeBuffer(first_task->blob_data_);
+        CHI_IPC->FreeBuffer(first_task->blob_data_.template Cast<char>());
         CHI_IPC->DelTask(first_task);
         return -10;
       }
 
       // Free the buffer before deleting the task
-      CHI_IPC->FreeBuffer(first_task->blob_data_);
+      CHI_IPC->FreeBuffer(first_task->blob_data_.template Cast<char>());
       CHI_IPC->DelTask(first_task);
       active_tasks.erase(active_tasks.begin());
     }
@@ -242,12 +242,12 @@ int BinaryFileAssimilator::Schedule(const AssimilationCtx& ctx) {
       HELOG(kError, "BinaryFileAssimilator: PutBlob task failed with code {}",
             task->return_code_.load());
       // Free the buffer before deleting the task
-      CHI_IPC->FreeBuffer(task->blob_data_);
+      CHI_IPC->FreeBuffer(task->blob_data_.template Cast<char>());
       CHI_IPC->DelTask(task);
       return -10;
     }
     // Free the buffer before deleting the task
-    CHI_IPC->FreeBuffer(task->blob_data_);
+    CHI_IPC->FreeBuffer(task->blob_data_.template Cast<char>());
     CHI_IPC->DelTask(task);
   }
 

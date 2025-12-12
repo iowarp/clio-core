@@ -965,6 +965,38 @@ class basic_string {
   }
 
   /**
+   * Assignment operator from std::basic_string.
+   * Assigns the contents of a std::basic_string to this string.
+   *
+   * @param str The std::basic_string to assign from
+   * @return Reference to this string
+   */
+  template<typename U>
+  HSHM_CROSS_FUN
+  basic_string& operator=(const std::basic_string<T, U>& str) {
+    if (!UsingSso()) {
+      delete storage_.vec_;
+    }
+    size_ = 0;
+    using_sso_ = true;
+
+    size_type len = str.size();
+    if (len < SSOSize - 1) {
+      std::memcpy(storage_.buffer_, str.data(), len * sizeof(T));
+      storage_.buffer_[len] = T();
+      size_ = len;
+    } else {
+      storage_.vec_ = new vector<T, AllocT>(alloc_);
+      for (size_type i = 0; i < len; ++i) {
+        storage_.vec_->push_back(str[i]);
+      }
+      size_ = len;
+      using_sso_ = false;
+    }
+    return *this;
+  }
+
+  /**
    * Get element at position with bounds checking.
    * Throws std::out_of_range if position is out of bounds.
    *

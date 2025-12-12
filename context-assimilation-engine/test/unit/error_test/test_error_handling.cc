@@ -64,7 +64,7 @@ bool TestErrorCase(wrp_cae::core::Client& cae_client,
   // Call ParseOmni with vector containing single context
   std::vector<wrp_cae::core::AssimilationCtx> contexts = {ctx};
   chi::u32 num_tasks_scheduled = 0;
-  chi::u32 result_code = cae_client.ParseOmni(HSHM_MCTX, contexts, num_tasks_scheduled);
+  chi::u32 result_code = cae_client.ParseOmni(contexts, num_tasks_scheduled);
 
   std::cout << "ParseOmni result: result_code=" << result_code
             << ", num_tasks=" << num_tasks_scheduled << std::endl;
@@ -151,7 +151,6 @@ int main(int argc, char* argv[]) {
     wrp_cae::core::CreateParams params;
 
     cae_client.Create(
-        HSHM_MCTX,
         chi::PoolQuery::Local(),
         "test_cae_error_pool",
         wrp_cae::core::kCaePoolId,

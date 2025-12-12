@@ -75,7 +75,7 @@ void Runtime::ParseOmni(hipc::FullPtr<ParseOmniTask> task, chi::RunContext& ctx)
       HELOG(kError, "ParseOmni: Assimilator failed for context {}/{} with error code: {}",
             i + 1, assimilation_contexts.size(), result);
       task->result_code_ = result;
-      task->error_message_ = hshm::priv::string(CHI_IPC->GetMainAlloc(), "Assimilator failed");
+      task->error_message_ = std::string("Assimilator failed");
       task->num_tasks_scheduled_ = tasks_scheduled;
       return;
     }
