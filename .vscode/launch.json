@@ -5,7 +5,7 @@
             "name": "Debug ChiMod Runtime",
             "type": "cppdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/build/bin/chimaera_runtime",
+            "program": "${workspaceFolder}/build/bin/chimaera_start_runtime",
             "args": [],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}",

@@ -13,8 +13,6 @@
 // Include cereal for serialization
 #include <cereal/archives/binary.hpp>
 #include <cereal/cereal.hpp>
-#include <cereal/types/string.hpp>
-#include <cereal/types/vector.hpp>
 
 // TaskQueue types are now available via include
 

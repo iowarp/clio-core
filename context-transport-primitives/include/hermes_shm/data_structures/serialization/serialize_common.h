@@ -211,4 +211,27 @@ HSHM_CROSS_FUN void load_map(Ar &ar, ContainerT &obj) {
 
 }  // namespace hshm::ipc
 
+#if HSHM_ENABLE_CEREAL
+// Forward declarations for hshm::priv types
+namespace hshm::priv {
+template <typename T, typename AllocT, size_t SSOSize> class basic_string;
+template <typename T, typename AllocT> class vector;
+}  // namespace hshm::priv
+
+// Tell cereal to use member load/save functions for hshm::priv types
+namespace cereal {
+template<typename T, typename AllocT, size_t SSOSize>
+struct specialize<cereal::BinaryOutputArchive, hshm::priv::basic_string<T, AllocT, SSOSize>, cereal::specialization::member_load_save> {};
+
+template<typename T, typename AllocT, size_t SSOSize>
+struct specialize<cereal::BinaryInputArchive, hshm::priv::basic_string<T, AllocT, SSOSize>, cereal::specialization::member_load_save> {};
+
+template<typename T, typename AllocT>
+struct specialize<cereal::BinaryOutputArchive, hshm::priv::vector<T, AllocT>, cereal::specialization::member_load_save> {};
+
+template<typename T, typename AllocT>
+struct specialize<cereal::BinaryInputArchive, hshm::priv::vector<T, AllocT>, cereal::specialization::member_load_save> {};
+}  // namespace cereal
+#endif  // HSHM_ENABLE_CEREAL
+
 #endif  // HSHM_SHM_SERIALIZE_COMMON_H_

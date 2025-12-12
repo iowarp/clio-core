@@ -1979,6 +1979,7 @@ class basic_string {
    */
   template<class Archive>
   void save(Archive& ar) const {
+    hshm::ipc::save_string(ar, *this);
   }
 
   /**
@@ -1990,6 +1991,7 @@ class basic_string {
    */
   template<class Archive>
   void load(Archive& ar) {
+    hshm::ipc::load_string(ar, *this);
   }
 };
 

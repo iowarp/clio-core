@@ -695,6 +695,7 @@ TEST_CASE("Vector: large capacity growth", "[priv_vector][stress]") {
 
 #ifdef HSHM_ENABLE_CEREAL
 #include <cereal/archives/binary.hpp>
+#include <cereal/types/string.hpp>
 #include <sstream>
 
 // Define a simple struct with cereal serialization for testing

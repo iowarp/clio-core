@@ -85,7 +85,7 @@
             "binaryDir": "${sourceDir}/build",
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Debug",
-                "WRP_CORE_ENABLE_RUNTIME": "OFF",
+                "WRP_CORE_ENABLE_RUNTIME": "ON",
                 "WRP_CORE_ENABLE_CTE": "OFF",
                 "WRP_CORE_ENABLE_CAE": "OFF",
                 "WRP_CORE_ENABLE_CEE": "OFF",

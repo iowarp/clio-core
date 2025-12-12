@@ -1353,6 +1353,7 @@ class vector {
    */
   template<class Archive>
   void save(Archive& ar) const {
+    hshm::ipc::save_vec<Archive, vector<T, AllocT>, T>(ar, *this);
   }
 
   /**
@@ -1364,14 +1365,9 @@ class vector {
    */
   template<class Archive>
   void load(Archive& ar) {
+    hshm::ipc::load_vec<Archive, vector<T, AllocT>, T>(ar, *this);
   }
 };
-
-}  // namespace hshm::priv
-
-// Cereal external serialization functions (ADL-discoverable in hshm::priv namespace)
-namespace hshm::priv {
-
 
 }  // namespace hshm::priv
 

@@ -10,8 +10,6 @@
 // Include cereal for serialization
 #include <cereal/archives/binary.hpp>
 #include <cereal/cereal.hpp>
-#include <cereal/types/string.hpp>
-#include <cereal/types/vector.hpp>
 
 // Include Lightbeam for networking
 #include <hermes_shm/lightbeam/zmq_transport.h>
