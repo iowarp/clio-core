@@ -26,82 +26,120 @@ void Runtime::Init(const chi::PoolId &pool_id, const std::string &pool_name,
   client_ = Client(pool_id);
 }
 
-void Runtime::Run(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr, chi::RunContext& rctx) {
+void Runtime::Run(chi::u32 method, chi::Future<chi::Task>& task_future, chi::RunContext& rctx) {
   switch (method) {
     case Method::kCreate: {
-      Create(task_ptr.Cast<CreateTask>(), rctx);
+      // Extract task FullPtr from Future and cast to specific type
+      hipc::FullPtr<CreateTask> typed_task = task_future.GetTaskPtr().template Cast<CreateTask>();
+      Create(typed_task, rctx);
       break;
     }
     case Method::kDestroy: {
-      Destroy(task_ptr.Cast<DestroyTask>(), rctx);
+      // Extract task FullPtr from Future and cast to specific type
+      hipc::FullPtr<DestroyTask> typed_task = task_future.GetTaskPtr().template Cast<DestroyTask>();
+      Destroy(typed_task, rctx);
       break;
     }
     case Method::kRegisterTarget: {
-      RegisterTarget(task_ptr.Cast<RegisterTargetTask>(), rctx);
+      // Extract task FullPtr from Future and cast to specific type
+      hipc::FullPtr<RegisterTargetTask> typed_task = task_future.GetTaskPtr().template Cast<RegisterTargetTask>();
+      RegisterTarget(typed_task, rctx);
       break;
     }
     case Method::kUnregisterTarget: {
-      UnregisterTarget(task_ptr.Cast<UnregisterTargetTask>(), rctx);
+      // Extract task FullPtr from Future and cast to specific type
+      hipc::FullPtr<UnregisterTargetTask> typed_task = task_future.GetTaskPtr().template Cast<UnregisterTargetTask>();
+      UnregisterTarget(typed_task, rctx);
       break;
     }
     case Method::kListTargets: {
-      ListTargets(task_ptr.Cast<ListTargetsTask>(), rctx);
+      // Extract task FullPtr from Future and cast to specific type
+      hipc::FullPtr<ListTargetsTask> typed_task = task_future.GetTaskPtr().template Cast<ListTargetsTask>();
+      ListTargets(typed_task, rctx);
       break;
     }
     case Method::kStatTargets: {
-      StatTargets(task_ptr.Cast<StatTargetsTask>(), rctx);
+      // Extract task FullPtr from Future and cast to specific type
+      hipc::FullPtr<StatTargetsTask> typed_task = task_future.GetTaskPtr().template Cast<StatTargetsTask>();
+      StatTargets(typed_task, rctx);
       break;
     }
     case Method::kGetOrCreateTag: {
-      GetOrCreateTag(task_ptr.Cast<core::GetOrCreateTagTask<core::CreateParams>>(), rctx);
+      // Extract task FullPtr from Future and cast to specific type
+      hipc::FullPtr<core::GetOrCreateTagTask<core::CreateParams>> typed_task = task_future.GetTaskPtr().template Cast<core::GetOrCreateTagTask<core::CreateParams>>();
+      GetOrCreateTag(typed_task, rctx);
       break;
     }
     case Method::kPutBlob: {
-      PutBlob(task_ptr.Cast<PutBlobTask>(), rctx);
+      // Extract task FullPtr from Future and cast to specific type
+      hipc::FullPtr<PutBlobTask> typed_task = task_future.GetTaskPtr().template Cast<PutBlobTask>();
+      PutBlob(typed_task, rctx);
       break;
     }
     case Method::kGetBlob: {
-      GetBlob(task_ptr.Cast<GetBlobTask>(), rctx);
+      // Extract task FullPtr from Future and cast to specific type
+      hipc::FullPtr<GetBlobTask> typed_task = task_future.GetTaskPtr().template Cast<GetBlobTask>();
+      GetBlob(typed_task, rctx);
       break;
     }
     case Method::kReorganizeBlob: {
-      ReorganizeBlob(task_ptr.Cast<ReorganizeBlobTask>(), rctx);
+      // Extract task FullPtr from Future and cast to specific type
+      hipc::FullPtr<ReorganizeBlobTask> typed_task = task_future.GetTaskPtr().template Cast<ReorganizeBlobTask>();
+      ReorganizeBlob(typed_task, rctx);
       break;
     }
     case Method::kDelBlob: {
-      DelBlob(task_ptr.Cast<DelBlobTask>(), rctx);
+      // Extract task FullPtr from Future and cast to specific type
+      hipc::FullPtr<DelBlobTask> typed_task = task_future.GetTaskPtr().template Cast<DelBlobTask>();
+      DelBlob(typed_task, rctx);
       break;
     }
     case Method::kDelTag: {
-      DelTag(task_ptr.Cast<DelTagTask>(), rctx);
+      // Extract task FullPtr from Future and cast to specific type
+      hipc::FullPtr<DelTagTask> typed_task = task_future.GetTaskPtr().template Cast<DelTagTask>();
+      DelTag(typed_task, rctx);
       break;
     }
     case Method::kGetTagSize: {
-      GetTagSize(task_ptr.Cast<GetTagSizeTask>(), rctx);
+      // Extract task FullPtr from Future and cast to specific type
+      hipc::FullPtr<GetTagSizeTask> typed_task = task_future.GetTaskPtr().template Cast<GetTagSizeTask>();
+      GetTagSize(typed_task, rctx);
       break;
     }
     case Method::kPollTelemetryLog: {
-      PollTelemetryLog(task_ptr.Cast<PollTelemetryLogTask>(), rctx);
+      // Extract task FullPtr from Future and cast to specific type
+      hipc::FullPtr<PollTelemetryLogTask> typed_task = task_future.GetTaskPtr().template Cast<PollTelemetryLogTask>();
+      PollTelemetryLog(typed_task, rctx);
       break;
     }
     case Method::kGetBlobScore: {
-      GetBlobScore(task_ptr.Cast<GetBlobScoreTask>(), rctx);
+      // Extract task FullPtr from Future and cast to specific type
+      hipc::FullPtr<GetBlobScoreTask> typed_task = task_future.GetTaskPtr().template Cast<GetBlobScoreTask>();
+      GetBlobScore(typed_task, rctx);
       break;
     }
     case Method::kGetBlobSize: {
-      GetBlobSize(task_ptr.Cast<GetBlobSizeTask>(), rctx);
+      // Extract task FullPtr from Future and cast to specific type
+      hipc::FullPtr<GetBlobSizeTask> typed_task = task_future.GetTaskPtr().template Cast<GetBlobSizeTask>();
+      GetBlobSize(typed_task, rctx);
       break;
     }
     case Method::kGetContainedBlobs: {
-      GetContainedBlobs(task_ptr.Cast<GetContainedBlobsTask>(), rctx);
+      // Extract task FullPtr from Future and cast to specific type
+      hipc::FullPtr<GetContainedBlobsTask> typed_task = task_future.GetTaskPtr().template Cast<GetContainedBlobsTask>();
+      GetContainedBlobs(typed_task, rctx);
       break;
     }
     case Method::kTagQuery: {
-      TagQuery(task_ptr.Cast<TagQueryTask>(), rctx);
+      // Extract task FullPtr from Future and cast to specific type
+      hipc::FullPtr<TagQueryTask> typed_task = task_future.GetTaskPtr().template Cast<TagQueryTask>();
+      TagQuery(typed_task, rctx);
       break;
     }
     case Method::kBlobQuery: {
-      BlobQuery(task_ptr.Cast<BlobQueryTask>(), rctx);
+      // Extract task FullPtr from Future and cast to specific type
+      hipc::FullPtr<BlobQueryTask> typed_task = task_future.GetTaskPtr().template Cast<BlobQueryTask>();
+      BlobQuery(typed_task, rctx);
       break;
     }
     default: {
@@ -112,84 +150,84 @@ void Runtime::Run(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr, chi::RunCo
 }
 
 void Runtime::Del(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr) {
-  // Use IPC manager to deallocate task from shared memory
+  // Use IPC manager to deallocate task from private memory
   auto* ipc_manager = CHI_IPC;
   
   switch (method) {
     case Method::kCreate: {
-      ipc_manager->DelTask(task_ptr.Cast<CreateTask>());
+      ipc_manager->DelTask(task_ptr.template Cast<CreateTask>());
       break;
     }
     case Method::kDestroy: {
-      ipc_manager->DelTask(task_ptr.Cast<DestroyTask>());
+      ipc_manager->DelTask(task_ptr.template Cast<DestroyTask>());
       break;
     }
     case Method::kRegisterTarget: {
-      ipc_manager->DelTask(task_ptr.Cast<RegisterTargetTask>());
+      ipc_manager->DelTask(task_ptr.template Cast<RegisterTargetTask>());
       break;
     }
     case Method::kUnregisterTarget: {
-      ipc_manager->DelTask(task_ptr.Cast<UnregisterTargetTask>());
+      ipc_manager->DelTask(task_ptr.template Cast<UnregisterTargetTask>());
       break;
     }
     case Method::kListTargets: {
-      ipc_manager->DelTask(task_ptr.Cast<ListTargetsTask>());
+      ipc_manager->DelTask(task_ptr.template Cast<ListTargetsTask>());
       break;
     }
     case Method::kStatTargets: {
-      ipc_manager->DelTask(task_ptr.Cast<StatTargetsTask>());
+      ipc_manager->DelTask(task_ptr.template Cast<StatTargetsTask>());
       break;
     }
     case Method::kGetOrCreateTag: {
-      ipc_manager->DelTask(task_ptr.Cast<core::GetOrCreateTagTask<core::CreateParams>>());
+      ipc_manager->DelTask(task_ptr.template Cast<core::GetOrCreateTagTask<core::CreateParams>>());
       break;
     }
     case Method::kPutBlob: {
-      ipc_manager->DelTask(task_ptr.Cast<PutBlobTask>());
+      ipc_manager->DelTask(task_ptr.template Cast<PutBlobTask>());
       break;
     }
     case Method::kGetBlob: {
-      ipc_manager->DelTask(task_ptr.Cast<GetBlobTask>());
+      ipc_manager->DelTask(task_ptr.template Cast<GetBlobTask>());
       break;
     }
     case Method::kReorganizeBlob: {
-      ipc_manager->DelTask(task_ptr.Cast<ReorganizeBlobTask>());
+      ipc_manager->DelTask(task_ptr.template Cast<ReorganizeBlobTask>());
       break;
     }
     case Method::kDelBlob: {
-      ipc_manager->DelTask(task_ptr.Cast<DelBlobTask>());
+      ipc_manager->DelTask(task_ptr.template Cast<DelBlobTask>());
       break;
     }
     case Method::kDelTag: {
-      ipc_manager->DelTask(task_ptr.Cast<DelTagTask>());
+      ipc_manager->DelTask(task_ptr.template Cast<DelTagTask>());
       break;
     }
     case Method::kGetTagSize: {
-      ipc_manager->DelTask(task_ptr.Cast<GetTagSizeTask>());
+      ipc_manager->DelTask(task_ptr.template Cast<GetTagSizeTask>());
       break;
     }
     case Method::kPollTelemetryLog: {
-      ipc_manager->DelTask(task_ptr.Cast<PollTelemetryLogTask>());
+      ipc_manager->DelTask(task_ptr.template Cast<PollTelemetryLogTask>());
       break;
     }
     case Method::kGetBlobScore: {
-      ipc_manager->DelTask(task_ptr.Cast<GetBlobScoreTask>());
+      ipc_manager->DelTask(task_ptr.template Cast<GetBlobScoreTask>());
       break;
     }
     case Method::kGetBlobSize: {
-      ipc_manager->DelTask(task_ptr.Cast<GetBlobSizeTask>());
+      ipc_manager->DelTask(task_ptr.template Cast<GetBlobSizeTask>());
       break;
     }
     case Method::kGetContainedBlobs: {
-      ipc_manager->DelTask(task_ptr.Cast<GetContainedBlobsTask>());
+      ipc_manager->DelTask(task_ptr.template Cast<GetContainedBlobsTask>());
       break;
     }
     case Method::kTagQuery: {
-      ipc_manager->DelTask(task_ptr.Cast<TagQueryTask>());
+      ipc_manager->DelTask(task_ptr.template Cast<TagQueryTask>());
       break;
     }
     case Method::kBlobQuery: {
-      ipc_manager->DelTask(task_ptr.Cast<BlobQueryTask>());
+      ipc_manager->DelTask(task_ptr.template Cast<BlobQueryTask>());
       break;
     }
     default: {
@@ -201,100 +239,100 @@ void Runtime::Del(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr) {
 }
 
 void Runtime::SaveTask(chi::u32 method, chi::SaveTaskArchive& archive, 
-                        hipc::FullPtr<chi::Task> task_ptr) {
+                        chi::Future<chi::Task>& task_future) {
   switch (method) {
     case Method::kCreate: {
-      auto typed_task = task_ptr.Cast<CreateTask>();
+      auto* typed_task = static_cast<CreateTask*>(task_future.get());
       archive << *typed_task;
       break;
     }
     case Method::kDestroy: {
-      auto typed_task = task_ptr.Cast<DestroyTask>();
+      auto* typed_task = static_cast<DestroyTask*>(task_future.get());
       archive << *typed_task;
       break;
     }
     case Method::kRegisterTarget: {
-      auto typed_task = task_ptr.Cast<RegisterTargetTask>();
+      auto* typed_task = static_cast<RegisterTargetTask*>(task_future.get());
       archive << *typed_task;
       break;
     }
     case Method::kUnregisterTarget: {
-      auto typed_task = task_ptr.Cast<UnregisterTargetTask>();
+      auto* typed_task = static_cast<UnregisterTargetTask*>(task_future.get());
       archive << *typed_task;
       break;
     }
     case Method::kListTargets: {
-      auto typed_task = task_ptr.Cast<ListTargetsTask>();
+      auto* typed_task = static_cast<ListTargetsTask*>(task_future.get());
       archive << *typed_task;
       break;
     }
     case Method::kStatTargets: {
-      auto typed_task = task_ptr.Cast<StatTargetsTask>();
+      auto* typed_task = static_cast<StatTargetsTask*>(task_future.get());
       archive << *typed_task;
       break;
     }
     case Method::kGetOrCreateTag: {
-      auto typed_task = task_ptr.Cast<core::GetOrCreateTagTask<core::CreateParams>>();
+      auto* typed_task = static_cast<core::GetOrCreateTagTask<core::CreateParams>*>(task_future.get());
       archive << *typed_task;
       break;
     }
     case Method::kPutBlob: {
-      auto typed_task = task_ptr.Cast<PutBlobTask>();
+      auto* typed_task = static_cast<PutBlobTask*>(task_future.get());
       archive << *typed_task;
       break;
     }
     case Method::kGetBlob: {
-      auto typed_task = task_ptr.Cast<GetBlobTask>();
+      auto* typed_task = static_cast<GetBlobTask*>(task_future.get());
       archive << *typed_task;
       break;
     }
     case Method::kReorganizeBlob: {
-      auto typed_task = task_ptr.Cast<ReorganizeBlobTask>();
+      auto* typed_task = static_cast<ReorganizeBlobTask*>(task_future.get());
       archive << *typed_task;
       break;
     }
     case Method::kDelBlob: {
-      auto typed_task = task_ptr.Cast<DelBlobTask>();
+      auto* typed_task = static_cast<DelBlobTask*>(task_future.get());
       archive << *typed_task;
       break;
     }
     case Method::kDelTag: {
-      auto typed_task = task_ptr.Cast<DelTagTask>();
+      auto* typed_task = static_cast<DelTagTask*>(task_future.get());
       archive << *typed_task;
       break;
     }
     case Method::kGetTagSize: {
-      auto typed_task = task_ptr.Cast<GetTagSizeTask>();
+      auto* typed_task = static_cast<GetTagSizeTask*>(task_future.get());
       archive << *typed_task;
       break;
     }
     case Method::kPollTelemetryLog: {
-      auto typed_task = task_ptr.Cast<PollTelemetryLogTask>();
+      auto* typed_task = static_cast<PollTelemetryLogTask*>(task_future.get());
       archive << *typed_task;
       break;
     }
     case Method::kGetBlobScore: {
-      auto typed_task = task_ptr.Cast<GetBlobScoreTask>();
+      auto* typed_task = static_cast<GetBlobScoreTask*>(task_future.get());
       archive << *typed_task;
       break;
     }
     case Method::kGetBlobSize: {
-      auto typed_task = task_ptr.Cast<GetBlobSizeTask>();
+      auto* typed_task = static_cast<GetBlobSizeTask*>(task_future.get());
       archive << *typed_task;
       break;
     }
     case Method::kGetContainedBlobs: {
-      auto typed_task = task_ptr.Cast<GetContainedBlobsTask>();
+      auto* typed_task = static_cast<GetContainedBlobsTask*>(task_future.get());
       archive << *typed_task;
       break;
     }
     case Method::kTagQuery: {
-      auto typed_task = task_ptr.Cast<TagQueryTask>();
+      auto* typed_task = static_cast<TagQueryTask*>(task_future.get());
       archive << *typed_task;
       break;
     }
     case Method::kBlobQuery: {
-      auto typed_task = task_ptr.Cast<BlobQueryTask>();
+      auto* typed_task = static_cast<BlobQueryTask*>(task_future.get());
       archive << *typed_task;
       break;
     }
@@ -306,178 +344,197 @@ void Runtime::SaveTask(chi::u32 method, chi::SaveTaskArchive& archive,
 }
 
 void Runtime::LoadTask(chi::u32 method, chi::LoadTaskArchive& archive, 
-                        hipc::FullPtr<chi::Task>& task_ptr) {
+                        chi::Future<chi::Task>& task_future) {
   auto* ipc_manager = CHI_IPC;
   
   switch (method) {
     case Method::kCreate: {
       // Allocate task using typed NewTask if not already allocated
-      if (task_ptr.IsNull()) {
-        task_ptr = ipc_manager->NewTask<CreateTask>().template Cast<chi::Task>();
+      if (task_future.IsNull()) {
+        auto new_task_ptr = ipc_manager->NewTask<CreateTask>();
+        task_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
-      auto typed_task = task_ptr.Cast<CreateTask>();
+      auto* typed_task = static_cast<CreateTask*>(task_future.get());
       archive >> *typed_task;
       break;
     }
     case Method::kDestroy: {
       // Allocate task using typed NewTask if not already allocated
-      if (task_ptr.IsNull()) {
-        task_ptr = ipc_manager->NewTask<DestroyTask>().template Cast<chi::Task>();
+      if (task_future.IsNull()) {
+        auto new_task_ptr = ipc_manager->NewTask<DestroyTask>();
+        task_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
-      auto typed_task = task_ptr.Cast<DestroyTask>();
+      auto* typed_task = static_cast<DestroyTask*>(task_future.get());
       archive >> *typed_task;
       break;
     }
     case Method::kRegisterTarget: {
       // Allocate task using typed NewTask if not already allocated
-      if (task_ptr.IsNull()) {
-        task_ptr = ipc_manager->NewTask<RegisterTargetTask>().template Cast<chi::Task>();
+      if (task_future.IsNull()) {
+        auto new_task_ptr = ipc_manager->NewTask<RegisterTargetTask>();
+        task_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
-      auto typed_task = task_ptr.Cast<RegisterTargetTask>();
+      auto* typed_task = static_cast<RegisterTargetTask*>(task_future.get());
       archive >> *typed_task;
       break;
     }
     case Method::kUnregisterTarget: {
       // Allocate task using typed NewTask if not already allocated
-      if (task_ptr.IsNull()) {
-        task_ptr = ipc_manager->NewTask<UnregisterTargetTask>().template Cast<chi::Task>();
+      if (task_future.IsNull()) {
+        auto new_task_ptr = ipc_manager->NewTask<UnregisterTargetTask>();
+        task_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
-      auto typed_task = task_ptr.Cast<UnregisterTargetTask>();
+      auto* typed_task = static_cast<UnregisterTargetTask*>(task_future.get());
       archive >> *typed_task;
       break;
     }
     case Method::kListTargets: {
       // Allocate task using typed NewTask if not already allocated
-      if (task_ptr.IsNull()) {
-        task_ptr = ipc_manager->NewTask<ListTargetsTask>().template Cast<chi::Task>();
+      if (task_future.IsNull()) {
+        auto new_task_ptr = ipc_manager->NewTask<ListTargetsTask>();
+        task_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
-      auto typed_task = task_ptr.Cast<ListTargetsTask>();
+      auto* typed_task = static_cast<ListTargetsTask*>(task_future.get());
       archive >> *typed_task;
       break;
     }
     case Method::kStatTargets: {
       // Allocate task using typed NewTask if not already allocated
-      if (task_ptr.IsNull()) {
-        task_ptr = ipc_manager->NewTask<StatTargetsTask>().template Cast<chi::Task>();
+      if (task_future.IsNull()) {
+        auto new_task_ptr = ipc_manager->NewTask<StatTargetsTask>();
+        task_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
-      auto typed_task = task_ptr.Cast<StatTargetsTask>();
+      auto* typed_task = static_cast<StatTargetsTask*>(task_future.get());
       archive >> *typed_task;
       break;
     }
     case Method::kGetOrCreateTag: {
       // Allocate task using typed NewTask if not already allocated
-      if (task_ptr.IsNull()) {
-        task_ptr = ipc_manager->NewTask<core::GetOrCreateTagTask<core::CreateParams>>().template Cast<chi::Task>();
+      if (task_future.IsNull()) {
+        auto new_task_ptr = ipc_manager->NewTask<core::GetOrCreateTagTask<core::CreateParams>>();
+        task_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
-      auto typed_task = task_ptr.Cast<core::GetOrCreateTagTask<core::CreateParams>>();
+      auto* typed_task = static_cast<core::GetOrCreateTagTask<core::CreateParams>*>(task_future.get());
       archive >> *typed_task;
       break;
     }
     case Method::kPutBlob: {
       // Allocate task using typed NewTask if not already allocated
-      if (task_ptr.IsNull()) {
-        task_ptr = ipc_manager->NewTask<PutBlobTask>().template Cast<chi::Task>();
+      if (task_future.IsNull()) {
+        auto new_task_ptr = ipc_manager->NewTask<PutBlobTask>();
+        task_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
-      auto typed_task = task_ptr.Cast<PutBlobTask>();
+      auto* typed_task = static_cast<PutBlobTask*>(task_future.get());
       archive >> *typed_task;
       break;
     }
     case Method::kGetBlob: {
       // Allocate task using typed NewTask if not already allocated
-      if (task_ptr.IsNull()) {
-        task_ptr = ipc_manager->NewTask<GetBlobTask>().template Cast<chi::Task>();
+      if (task_future.IsNull()) {
+        auto new_task_ptr = ipc_manager->NewTask<GetBlobTask>();
+        task_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
-      auto typed_task = task_ptr.Cast<GetBlobTask>();
+      auto* typed_task = static_cast<GetBlobTask*>(task_future.get());
       archive >> *typed_task;
       break;
     }
     case Method::kReorganizeBlob: {
       // Allocate task using typed NewTask if not already allocated
-      if (task_ptr.IsNull()) {
-        task_ptr = ipc_manager->NewTask<ReorganizeBlobTask>().template Cast<chi::Task>();
+      if (task_future.IsNull()) {
+        auto new_task_ptr = ipc_manager->NewTask<ReorganizeBlobTask>();
+        task_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
-      auto typed_task = task_ptr.Cast<ReorganizeBlobTask>();
+      auto* typed_task = static_cast<ReorganizeBlobTask*>(task_future.get());
       archive >> *typed_task;
       break;
     }
     case Method::kDelBlob: {
       // Allocate task using typed NewTask if not already allocated
-      if (task_ptr.IsNull()) {
-        task_ptr = ipc_manager->NewTask<DelBlobTask>().template Cast<chi::Task>();
+      if (task_future.IsNull()) {
+        auto new_task_ptr = ipc_manager->NewTask<DelBlobTask>();
+        task_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
-      auto typed_task = task_ptr.Cast<DelBlobTask>();
+      auto* typed_task = static_cast<DelBlobTask*>(task_future.get());
       archive >> *typed_task;
       break;
     }
     case Method::kDelTag: {
       // Allocate task using typed NewTask if not already allocated
-      if (task_ptr.IsNull()) {
-        task_ptr = ipc_manager->NewTask<DelTagTask>().template Cast<chi::Task>();
+      if (task_future.IsNull()) {
+        auto new_task_ptr = ipc_manager->NewTask<DelTagTask>();
+        task_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
-      auto typed_task = task_ptr.Cast<DelTagTask>();
+      auto* typed_task = static_cast<DelTagTask*>(task_future.get());
       archive >> *typed_task;
       break;
     }
     case Method::kGetTagSize: {
       // Allocate task using typed NewTask if not already allocated
-      if (task_ptr.IsNull()) {
-        task_ptr = ipc_manager->NewTask<GetTagSizeTask>().template Cast<chi::Task>();
+      if (task_future.IsNull()) {
+        auto new_task_ptr = ipc_manager->NewTask<GetTagSizeTask>();
+        task_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
-      auto typed_task = task_ptr.Cast<GetTagSizeTask>();
+      auto* typed_task = static_cast<GetTagSizeTask*>(task_future.get());
       archive >> *typed_task;
       break;
     }
     case Method::kPollTelemetryLog: {
       // Allocate task using typed NewTask if not already allocated
-      if (task_ptr.IsNull()) {
-        task_ptr = ipc_manager->NewTask<PollTelemetryLogTask>().template Cast<chi::Task>();
+      if (task_future.IsNull()) {
+        auto new_task_ptr = ipc_manager->NewTask<PollTelemetryLogTask>();
+        task_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
-      auto typed_task = task_ptr.Cast<PollTelemetryLogTask>();
+      auto* typed_task = static_cast<PollTelemetryLogTask*>(task_future.get());
       archive >> *typed_task;
       break;
     }
     case Method::kGetBlobScore: {
       // Allocate task using typed NewTask if not already allocated
-      if (task_ptr.IsNull()) {
-        task_ptr = ipc_manager->NewTask<GetBlobScoreTask>().template Cast<chi::Task>();
+      if (task_future.IsNull()) {
+        auto new_task_ptr = ipc_manager->NewTask<GetBlobScoreTask>();
+        task_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
-      auto typed_task = task_ptr.Cast<GetBlobScoreTask>();
+      auto* typed_task = static_cast<GetBlobScoreTask*>(task_future.get());
       archive >> *typed_task;
       break;
     }
     case Method::kGetBlobSize: {
       // Allocate task using typed NewTask if not already allocated
-      if (task_ptr.IsNull()) {
-        task_ptr = ipc_manager->NewTask<GetBlobSizeTask>().template Cast<chi::Task>();
+      if (task_future.IsNull()) {
+        auto new_task_ptr = ipc_manager->NewTask<GetBlobSizeTask>();
+        task_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
-      auto typed_task = task_ptr.Cast<GetBlobSizeTask>();
+      auto* typed_task = static_cast<GetBlobSizeTask*>(task_future.get());
       archive >> *typed_task;
       break;
     }
     case Method::kGetContainedBlobs: {
       // Allocate task using typed NewTask if not already allocated
-      if (task_ptr.IsNull()) {
-        task_ptr = ipc_manager->NewTask<GetContainedBlobsTask>().template Cast<chi::Task>();
+      if (task_future.IsNull()) {
+        auto new_task_ptr = ipc_manager->NewTask<GetContainedBlobsTask>();
+        task_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
-      auto typed_task = task_ptr.Cast<GetContainedBlobsTask>();
+      auto* typed_task = static_cast<GetContainedBlobsTask*>(task_future.get());
       archive >> *typed_task;
       break;
     }
     case Method::kTagQuery: {
       // Allocate task using typed NewTask if not already allocated
-      if (task_ptr.IsNull()) {
-        task_ptr = ipc_manager->NewTask<TagQueryTask>().template Cast<chi::Task>();
+      if (task_future.IsNull()) {
+        auto new_task_ptr = ipc_manager->NewTask<TagQueryTask>();
+        task_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
-      auto typed_task = task_ptr.Cast<TagQueryTask>();
+      auto* typed_task = static_cast<TagQueryTask*>(task_future.get());
       archive >> *typed_task;
       break;
     }
     case Method::kBlobQuery: {
       // Allocate task using typed NewTask if not already allocated
-      if (task_ptr.IsNull()) {
-        task_ptr = ipc_manager->NewTask<BlobQueryTask>().template Cast<chi::Task>();
+      if (task_future.IsNull()) {
+        auto new_task_ptr = ipc_manager->NewTask<BlobQueryTask>();
+        task_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
-      auto typed_task = task_ptr.Cast<BlobQueryTask>();
+      auto* typed_task = static_cast<BlobQueryTask*>(task_future.get());
       archive >> *typed_task;
       break;
     }
@@ -489,16 +546,17 @@ void Runtime::LoadTask(chi::u32 method, chi::LoadTaskArchive& archive,
 }
 
 void Runtime::LocalLoadIn(chi::u32 method, chi::LocalLoadTaskArchive& archive, 
-                           hipc::FullPtr<chi::Task>& task_ptr) {
+                           chi::Future<chi::Task>& task_future) {
   auto* ipc_manager = CHI_IPC;
   
   switch (method) {
     case Method::kCreate: {
       // Allocate task using typed NewTask if not already allocated
-      if (task_ptr.IsNull()) {
-        task_ptr = ipc_manager->NewTask<CreateTask>().template Cast<chi::Task>();
+      if (task_future.IsNull()) {
+        auto new_task_ptr = ipc_manager->NewTask<CreateTask>();
+        task_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
-      auto typed_task = task_ptr.Cast<CreateTask>();
+      auto* typed_task = static_cast<CreateTask*>(task_future.get());
       // Call BaseSerializeIn and SerializeIn using LocalLoadTaskArchive
       typed_task->BaseSerializeIn(archive);
       typed_task->SerializeIn(archive);
@@ -506,10 +564,11 @@ void Runtime::LocalLoadIn(chi::u32 method, chi::LocalLoadTaskArchive& archive,
     }
     case Method::kDestroy: {
       // Allocate task using typed NewTask if not already allocated
-      if (task_ptr.IsNull()) {
-        task_ptr = ipc_manager->NewTask<DestroyTask>().template Cast<chi::Task>();
+      if (task_future.IsNull()) {
+        auto new_task_ptr = ipc_manager->NewTask<DestroyTask>();
+        task_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
-      auto typed_task = task_ptr.Cast<DestroyTask>();
+      auto* typed_task = static_cast<DestroyTask*>(task_future.get());
       // Call BaseSerializeIn and SerializeIn using LocalLoadTaskArchive
       typed_task->BaseSerializeIn(archive);
       typed_task->SerializeIn(archive);
@@ -517,10 +576,11 @@ void Runtime::LocalLoadIn(chi::u32 method, chi::LocalLoadTaskArchive& archive,
     }
     case Method::kRegisterTarget: {
       // Allocate task using typed NewTask if not already allocated
-      if (task_ptr.IsNull()) {
-        task_ptr = ipc_manager->NewTask<RegisterTargetTask>().template Cast<chi::Task>();
+      if (task_future.IsNull()) {
+        auto new_task_ptr = ipc_manager->NewTask<RegisterTargetTask>();
+        task_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
-      auto typed_task = task_ptr.Cast<RegisterTargetTask>();
+      auto* typed_task = static_cast<RegisterTargetTask*>(task_future.get());
       // Call BaseSerializeIn and SerializeIn using LocalLoadTaskArchive
       typed_task->BaseSerializeIn(archive);
       typed_task->SerializeIn(archive);
@@ -528,10 +588,11 @@ void Runtime::LocalLoadIn(chi::u32 method, chi::LocalLoadTaskArchive& archive,
     }
     case Method::kUnregisterTarget: {
       // Allocate task using typed NewTask if not already allocated
-      if (task_ptr.IsNull()) {
-        task_ptr = ipc_manager->NewTask<UnregisterTargetTask>().template Cast<chi::Task>();
+      if (task_future.IsNull()) {
+        auto new_task_ptr = ipc_manager->NewTask<UnregisterTargetTask>();
+        task_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
-      auto typed_task = task_ptr.Cast<UnregisterTargetTask>();
+      auto* typed_task = static_cast<UnregisterTargetTask*>(task_future.get());
       // Call BaseSerializeIn and SerializeIn using LocalLoadTaskArchive
       typed_task->BaseSerializeIn(archive);
       typed_task->SerializeIn(archive);
@@ -539,10 +600,11 @@ void Runtime::LocalLoadIn(chi::u32 method, chi::LocalLoadTaskArchive& archive,
     }
     case Method::kListTargets: {
       // Allocate task using typed NewTask if not already allocated
-      if (task_ptr.IsNull()) {
-        task_ptr = ipc_manager->NewTask<ListTargetsTask>().template Cast<chi::Task>();
+      if (task_future.IsNull()) {
+        auto new_task_ptr = ipc_manager->NewTask<ListTargetsTask>();
+        task_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
-      auto typed_task = task_ptr.Cast<ListTargetsTask>();
+      auto* typed_task = static_cast<ListTargetsTask*>(task_future.get());
       // Call BaseSerializeIn and SerializeIn using LocalLoadTaskArchive
       typed_task->BaseSerializeIn(archive);
       typed_task->SerializeIn(archive);
@@ -550,10 +612,11 @@ void Runtime::LocalLoadIn(chi::u32 method, chi::LocalLoadTaskArchive& archive,
     }
     case Method::kStatTargets: {
       // Allocate task using typed NewTask if not already allocated
-      if (task_ptr.IsNull()) {
-        task_ptr = ipc_manager->NewTask<StatTargetsTask>().template Cast<chi::Task>();
+      if (task_future.IsNull()) {
+        auto new_task_ptr = ipc_manager->NewTask<StatTargetsTask>();
+        task_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
-      auto typed_task = task_ptr.Cast<StatTargetsTask>();
+      auto* typed_task = static_cast<StatTargetsTask*>(task_future.get());
       // Call BaseSerializeIn and SerializeIn using LocalLoadTaskArchive
       typed_task->BaseSerializeIn(archive);
       typed_task->SerializeIn(archive);
@@ -561,10 +624,11 @@ void Runtime::LocalLoadIn(chi::u32 method, chi::LocalLoadTaskArchive& archive,
     }
     case Method::kGetOrCreateTag: {
       // Allocate task using typed NewTask if not already allocated
-      if (task_ptr.IsNull()) {
-        task_ptr = ipc_manager->NewTask<core::GetOrCreateTagTask<core::CreateParams>>().template Cast<chi::Task>();
+      if (task_future.IsNull()) {
+        auto new_task_ptr = ipc_manager->NewTask<core::GetOrCreateTagTask<core::CreateParams>>();
+        task_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
-      auto typed_task = task_ptr.Cast<core::GetOrCreateTagTask<core::CreateParams>>();
+      auto* typed_task = static_cast<core::GetOrCreateTagTask<core::CreateParams>*>(task_future.get());
       // Call BaseSerializeIn and SerializeIn using LocalLoadTaskArchive
       typed_task->BaseSerializeIn(archive);
       typed_task->SerializeIn(archive);
@@ -572,10 +636,11 @@ void Runtime::LocalLoadIn(chi::u32 method, chi::LocalLoadTaskArchive& archive,
     }
     case Method::kPutBlob: {
       // Allocate task using typed NewTask if not already allocated
-      if (task_ptr.IsNull()) {
-        task_ptr = ipc_manager->NewTask<PutBlobTask>().template Cast<chi::Task>();
+      if (task_future.IsNull()) {
+        auto new_task_ptr = ipc_manager->NewTask<PutBlobTask>();
+        task_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
-      auto typed_task = task_ptr.Cast<PutBlobTask>();
+      auto* typed_task = static_cast<PutBlobTask*>(task_future.get());
       // Call BaseSerializeIn and SerializeIn using LocalLoadTaskArchive
       typed_task->BaseSerializeIn(archive);
       typed_task->SerializeIn(archive);
@@ -583,10 +648,11 @@ void Runtime::LocalLoadIn(chi::u32 method, chi::LocalLoadTaskArchive& archive,
     }
     case Method::kGetBlob: {
       // Allocate task using typed NewTask if not already allocated
-      if (task_ptr.IsNull()) {
-        task_ptr = ipc_manager->NewTask<GetBlobTask>().template Cast<chi::Task>();
+      if (task_future.IsNull()) {
+        auto new_task_ptr = ipc_manager->NewTask<GetBlobTask>();
+        task_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
-      auto typed_task = task_ptr.Cast<GetBlobTask>();
+      auto* typed_task = static_cast<GetBlobTask*>(task_future.get());
       // Call BaseSerializeIn and SerializeIn using LocalLoadTaskArchive
       typed_task->BaseSerializeIn(archive);
       typed_task->SerializeIn(archive);
@@ -594,10 +660,11 @@ void Runtime::LocalLoadIn(chi::u32 method, chi::LocalLoadTaskArchive& archive,
     }
     case Method::kReorganizeBlob: {
       // Allocate task using typed NewTask if not already allocated
-      if (task_ptr.IsNull()) {
-        task_ptr = ipc_manager->NewTask<ReorganizeBlobTask>().template Cast<chi::Task>();
+      if (task_future.IsNull()) {
+        auto new_task_ptr = ipc_manager->NewTask<ReorganizeBlobTask>();
+        task_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
-      auto typed_task = task_ptr.Cast<ReorganizeBlobTask>();
+      auto* typed_task = static_cast<ReorganizeBlobTask*>(task_future.get());
       // Call BaseSerializeIn and SerializeIn using LocalLoadTaskArchive
       typed_task->BaseSerializeIn(archive);
       typed_task->SerializeIn(archive);
@@ -605,10 +672,11 @@ void Runtime::LocalLoadIn(chi::u32 method, chi::LocalLoadTaskArchive& archive,
     }
     case Method::kDelBlob: {
       // Allocate task using typed NewTask if not already allocated
-      if (task_ptr.IsNull()) {
-        task_ptr = ipc_manager->NewTask<DelBlobTask>().template Cast<chi::Task>();
+      if (task_future.IsNull()) {
+        auto new_task_ptr = ipc_manager->NewTask<DelBlobTask>();
+        task_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
-      auto typed_task = task_ptr.Cast<DelBlobTask>();
+      auto* typed_task = static_cast<DelBlobTask*>(task_future.get());
       // Call BaseSerializeIn and SerializeIn using LocalLoadTaskArchive
       typed_task->BaseSerializeIn(archive);
       typed_task->SerializeIn(archive);
@@ -616,10 +684,11 @@ void Runtime::LocalLoadIn(chi::u32 method, chi::LocalLoadTaskArchive& archive,
     }
     case Method::kDelTag: {
       // Allocate task using typed NewTask if not already allocated
-      if (task_ptr.IsNull()) {
-        task_ptr = ipc_manager->NewTask<DelTagTask>().template Cast<chi::Task>();
+      if (task_future.IsNull()) {
+        auto new_task_ptr = ipc_manager->NewTask<DelTagTask>();
+        task_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
-      auto typed_task = task_ptr.Cast<DelTagTask>();
+      auto* typed_task = static_cast<DelTagTask*>(task_future.get());
       // Call BaseSerializeIn and SerializeIn using LocalLoadTaskArchive
       typed_task->BaseSerializeIn(archive);
       typed_task->SerializeIn(archive);
@@ -627,10 +696,11 @@ void Runtime::LocalLoadIn(chi::u32 method, chi::LocalLoadTaskArchive& archive,
     }
     case Method::kGetTagSize: {
       // Allocate task using typed NewTask if not already allocated
-      if (task_ptr.IsNull()) {
-        task_ptr = ipc_manager->NewTask<GetTagSizeTask>().template Cast<chi::Task>();
+      if (task_future.IsNull()) {
+        auto new_task_ptr = ipc_manager->NewTask<GetTagSizeTask>();
+        task_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
-      auto typed_task = task_ptr.Cast<GetTagSizeTask>();
+      auto* typed_task = static_cast<GetTagSizeTask*>(task_future.get());
       // Call BaseSerializeIn and SerializeIn using LocalLoadTaskArchive
       typed_task->BaseSerializeIn(archive);
       typed_task->SerializeIn(archive);
@@ -638,10 +708,11 @@ void Runtime::LocalLoadIn(chi::u32 method, chi::LocalLoadTaskArchive& archive,
     }
     case Method::kPollTelemetryLog: {
       // Allocate task using typed NewTask if not already allocated
-      if (task_ptr.IsNull()) {
-        task_ptr = ipc_manager->NewTask<PollTelemetryLogTask>().template Cast<chi::Task>();
+      if (task_future.IsNull()) {
+        auto new_task_ptr = ipc_manager->NewTask<PollTelemetryLogTask>();
+        task_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
-      auto typed_task = task_ptr.Cast<PollTelemetryLogTask>();
+      auto* typed_task = static_cast<PollTelemetryLogTask*>(task_future.get());
       // Call BaseSerializeIn and SerializeIn using LocalLoadTaskArchive
       typed_task->BaseSerializeIn(archive);
       typed_task->SerializeIn(archive);
@@ -649,10 +720,11 @@ void Runtime::LocalLoadIn(chi::u32 method, chi::LocalLoadTaskArchive& archive,
     }
     case Method::kGetBlobScore: {
       // Allocate task using typed NewTask if not already allocated
-      if (task_ptr.IsNull()) {
-        task_ptr = ipc_manager->NewTask<GetBlobScoreTask>().template Cast<chi::Task>();
+      if (task_future.IsNull()) {
+        auto new_task_ptr = ipc_manager->NewTask<GetBlobScoreTask>();
+        task_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
-      auto typed_task = task_ptr.Cast<GetBlobScoreTask>();
+      auto* typed_task = static_cast<GetBlobScoreTask*>(task_future.get());
       // Call BaseSerializeIn and SerializeIn using LocalLoadTaskArchive
       typed_task->BaseSerializeIn(archive);
       typed_task->SerializeIn(archive);
@@ -660,10 +732,11 @@ void Runtime::LocalLoadIn(chi::u32 method, chi::LocalLoadTaskArchive& archive,
     }
     case Method::kGetBlobSize: {
       // Allocate task using typed NewTask if not already allocated
-      if (task_ptr.IsNull()) {
-        task_ptr = ipc_manager->NewTask<GetBlobSizeTask>().template Cast<chi::Task>();
+      if (task_future.IsNull()) {
+        auto new_task_ptr = ipc_manager->NewTask<GetBlobSizeTask>();
+        task_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
-      auto typed_task = task_ptr.Cast<GetBlobSizeTask>();
+      auto* typed_task = static_cast<GetBlobSizeTask*>(task_future.get());
       // Call BaseSerializeIn and SerializeIn using LocalLoadTaskArchive
       typed_task->BaseSerializeIn(archive);
       typed_task->SerializeIn(archive);
@@ -671,10 +744,11 @@ void Runtime::LocalLoadIn(chi::u32 method, chi::LocalLoadTaskArchive& archive,
     }
     case Method::kGetContainedBlobs: {
       // Allocate task using typed NewTask if not already allocated
-      if (task_ptr.IsNull()) {
-        task_ptr = ipc_manager->NewTask<GetContainedBlobsTask>().template Cast<chi::Task>();
+      if (task_future.IsNull()) {
+        auto new_task_ptr = ipc_manager->NewTask<GetContainedBlobsTask>();
+        task_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
-      auto typed_task = task_ptr.Cast<GetContainedBlobsTask>();
+      auto* typed_task = static_cast<GetContainedBlobsTask*>(task_future.get());
       // Call BaseSerializeIn and SerializeIn using LocalLoadTaskArchive
       typed_task->BaseSerializeIn(archive);
       typed_task->SerializeIn(archive);
@@ -682,10 +756,11 @@ void Runtime::LocalLoadIn(chi::u32 method, chi::LocalLoadTaskArchive& archive,
     }
     case Method::kTagQuery: {
       // Allocate task using typed NewTask if not already allocated
-      if (task_ptr.IsNull()) {
-        task_ptr = ipc_manager->NewTask<TagQueryTask>().template Cast<chi::Task>();
+      if (task_future.IsNull()) {
+        auto new_task_ptr = ipc_manager->NewTask<TagQueryTask>();
+        task_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
-      auto typed_task = task_ptr.Cast<TagQueryTask>();
+      auto* typed_task = static_cast<TagQueryTask*>(task_future.get());
       // Call BaseSerializeIn and SerializeIn using LocalLoadTaskArchive
       typed_task->BaseSerializeIn(archive);
       typed_task->SerializeIn(archive);
@@ -693,10 +768,11 @@ void Runtime::LocalLoadIn(chi::u32 method, chi::LocalLoadTaskArchive& archive,
     }
     case Method::kBlobQuery: {
       // Allocate task using typed NewTask if not already allocated
-      if (task_ptr.IsNull()) {
-        task_ptr = ipc_manager->NewTask<BlobQueryTask>().template Cast<chi::Task>();
+      if (task_future.IsNull()) {
+        auto new_task_ptr = ipc_manager->NewTask<BlobQueryTask>();
+        task_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
-      auto typed_task = task_ptr.Cast<BlobQueryTask>();
+      auto* typed_task = static_cast<BlobQueryTask*>(task_future.get());
       // Call BaseSerializeIn and SerializeIn using LocalLoadTaskArchive
       typed_task->BaseSerializeIn(archive);
       typed_task->SerializeIn(archive);
@@ -710,136 +786,136 @@ void Runtime::LocalLoadIn(chi::u32 method, chi::LocalLoadTaskArchive& archive,
 }
 
 void Runtime::LocalSaveOut(chi::u32 method, chi::LocalSaveTaskArchive& archive, 
-                            hipc::FullPtr<chi::Task> task_ptr) {
+                            chi::Future<chi::Task>& task_future) {
   switch (method) {
     case Method::kCreate: {
-      auto typed_task = task_ptr.Cast<CreateTask>();
+      auto* typed_task = static_cast<CreateTask*>(task_future.get());
       // Call BaseSerializeOut and SerializeOut using LocalSaveTaskArchive
       typed_task->BaseSerializeOut(archive);
       typed_task->SerializeOut(archive);
       break;
     }
     case Method::kDestroy: {
-      auto typed_task = task_ptr.Cast<DestroyTask>();
+      auto* typed_task = static_cast<DestroyTask*>(task_future.get());
       // Call BaseSerializeOut and SerializeOut using LocalSaveTaskArchive
       typed_task->BaseSerializeOut(archive);
       typed_task->SerializeOut(archive);
       break;
     }
     case Method::kRegisterTarget: {
-      auto typed_task = task_ptr.Cast<RegisterTargetTask>();
+      auto* typed_task = static_cast<RegisterTargetTask*>(task_future.get());
       // Call BaseSerializeOut and SerializeOut using LocalSaveTaskArchive
       typed_task->BaseSerializeOut(archive);
       typed_task->SerializeOut(archive);
       break;
     }
     case Method::kUnregisterTarget: {
-      auto typed_task = task_ptr.Cast<UnregisterTargetTask>();
+      auto* typed_task = static_cast<UnregisterTargetTask*>(task_future.get());
       // Call BaseSerializeOut and SerializeOut using LocalSaveTaskArchive
       typed_task->BaseSerializeOut(archive);
       typed_task->SerializeOut(archive);
       break;
     }
     case Method::kListTargets: {
-      auto typed_task = task_ptr.Cast<ListTargetsTask>();
+      auto* typed_task = static_cast<ListTargetsTask*>(task_future.get());
       // Call BaseSerializeOut and SerializeOut using LocalSaveTaskArchive
       typed_task->BaseSerializeOut(archive);
       typed_task->SerializeOut(archive);
       break;
     }
     case Method::kStatTargets: {
-      auto typed_task = task_ptr.Cast<StatTargetsTask>();
+      auto* typed_task = static_cast<StatTargetsTask*>(task_future.get());
       // Call BaseSerializeOut and SerializeOut using LocalSaveTaskArchive
       typed_task->BaseSerializeOut(archive);
       typed_task->SerializeOut(archive);
       break;
     }
     case Method::kGetOrCreateTag: {
-      auto typed_task = task_ptr.Cast<core::GetOrCreateTagTask<core::CreateParams>>();
+      auto* typed_task = static_cast<core::GetOrCreateTagTask<core::CreateParams>*>(task_future.get());
       // Call BaseSerializeOut and SerializeOut using LocalSaveTaskArchive
       typed_task->BaseSerializeOut(archive);
       typed_task->SerializeOut(archive);
       break;
     }
     case Method::kPutBlob: {
-      auto typed_task = task_ptr.Cast<PutBlobTask>();
+      auto* typed_task = static_cast<PutBlobTask*>(task_future.get());
       // Call BaseSerializeOut and SerializeOut using LocalSaveTaskArchive
       typed_task->BaseSerializeOut(archive);
       typed_task->SerializeOut(archive);
       break;
     }
     case Method::kGetBlob: {
-      auto typed_task = task_ptr.Cast<GetBlobTask>();
+      auto* typed_task = static_cast<GetBlobTask*>(task_future.get());
       // Call BaseSerializeOut and SerializeOut using LocalSaveTaskArchive
       typed_task->BaseSerializeOut(archive);
       typed_task->SerializeOut(archive);
       break;
     }
     case Method::kReorganizeBlob: {
-      auto typed_task = task_ptr.Cast<ReorganizeBlobTask>();
+      auto* typed_task = static_cast<ReorganizeBlobTask*>(task_future.get());
       // Call BaseSerializeOut and SerializeOut using LocalSaveTaskArchive
       typed_task->BaseSerializeOut(archive);
       typed_task->SerializeOut(archive);
       break;
     }
     case Method::kDelBlob: {
-      auto typed_task = task_ptr.Cast<DelBlobTask>();
+      auto* typed_task = static_cast<DelBlobTask*>(task_future.get());
       // Call BaseSerializeOut and SerializeOut using LocalSaveTaskArchive
       typed_task->BaseSerializeOut(archive);
       typed_task->SerializeOut(archive);
       break;
     }
     case Method::kDelTag: {
-      auto typed_task = task_ptr.Cast<DelTagTask>();
+      auto* typed_task = static_cast<DelTagTask*>(task_future.get());
       // Call BaseSerializeOut and SerializeOut using LocalSaveTaskArchive
       typed_task->BaseSerializeOut(archive);
       typed_task->SerializeOut(archive);
       break;
     }
     case Method::kGetTagSize: {
-      auto typed_task = task_ptr.Cast<GetTagSizeTask>();
+      auto* typed_task = static_cast<GetTagSizeTask*>(task_future.get());
       // Call BaseSerializeOut and SerializeOut using LocalSaveTaskArchive
       typed_task->BaseSerializeOut(archive);
       typed_task->SerializeOut(archive);
       break;
     }
     case Method::kPollTelemetryLog: {
-      auto typed_task = task_ptr.Cast<PollTelemetryLogTask>();
+      auto* typed_task = static_cast<PollTelemetryLogTask*>(task_future.get());
       // Call BaseSerializeOut and SerializeOut using LocalSaveTaskArchive
       typed_task->BaseSerializeOut(archive);
       typed_task->SerializeOut(archive);
       break;
     }
     case Method::kGetBlobScore: {
-      auto typed_task = task_ptr.Cast<GetBlobScoreTask>();
+      auto* typed_task = static_cast<GetBlobScoreTask*>(task_future.get());
       // Call BaseSerializeOut and SerializeOut using LocalSaveTaskArchive
       typed_task->BaseSerializeOut(archive);
       typed_task->SerializeOut(archive);
       break;
     }
     case Method::kGetBlobSize: {
-      auto typed_task = task_ptr.Cast<GetBlobSizeTask>();
+      auto* typed_task = static_cast<GetBlobSizeTask*>(task_future.get());
       // Call BaseSerializeOut and SerializeOut using LocalSaveTaskArchive
       typed_task->BaseSerializeOut(archive);
       typed_task->SerializeOut(archive);
       break;
     }
     case Method::kGetContainedBlobs: {
-      auto typed_task = task_ptr.Cast<GetContainedBlobsTask>();
+      auto* typed_task = static_cast<GetContainedBlobsTask*>(task_future.get());
       // Call BaseSerializeOut and SerializeOut using LocalSaveTaskArchive
       typed_task->BaseSerializeOut(archive);
       typed_task->SerializeOut(archive);
       break;
     }
     case Method::kTagQuery: {
-      auto typed_task = task_ptr.Cast<TagQueryTask>();
+      auto* typed_task = static_cast<TagQueryTask*>(task_future.get());
       // Call BaseSerializeOut and SerializeOut using LocalSaveTaskArchive
       typed_task->BaseSerializeOut(archive);
       typed_task->SerializeOut(archive);
       break;
     }
     case Method::kBlobQuery: {
-      auto typed_task = task_ptr.Cast<BlobQueryTask>();
+      auto* typed_task = static_cast<BlobQueryTask*>(task_future.get());
       // Call BaseSerializeOut and SerializeOut using LocalSaveTaskArchive
       typed_task->BaseSerializeOut(archive);
       typed_task->SerializeOut(archive);
@@ -852,8 +928,8 @@ void Runtime::LocalSaveOut(chi::u32 method, chi::LocalSaveTaskArchive& archive,
   }
 }
 
-void Runtime::NewCopy(chi::u32 method, const hipc::FullPtr<chi::Task>& orig_task,
-                       hipc::FullPtr<chi::Task>& dup_task, bool deep) {
+void Runtime::NewCopy(chi::u32 method, chi::Future<chi::Task>& orig_future,
+                       chi::Future<chi::Task>& dup_future, bool deep) {
   auto* ipc_manager = CHI_IPC;
   if (!ipc_manager) {
     return;
@@ -861,258 +937,239 @@ void Runtime::NewCopy(chi::u32 method, const hipc::FullPtr<chi::Task>& orig_task
   
   switch (method) {
     case Method::kCreate: {
-      // Allocate new task using SHM default constructor
-      auto typed_task = ipc_manager->NewTask<CreateTask>();
-      if (!typed_task.IsNull()) {
-        // Copy base Task fields first
-        typed_task.template Cast<chi::Task>()->Copy(orig_task);
-        // Then copy task-specific fields
-        typed_task->Copy(orig_task.Cast<CreateTask>());
-        // Cast to base Task type for return
-        dup_task = typed_task.template Cast<chi::Task>();
+      // Allocate new task using standard new (returns FullPtr with null allocator)
+      auto new_task_ptr = ipc_manager->NewTask<CreateTask>();
+      if (!new_task_ptr.IsNull()) {
+        // Copy task fields (includes base Task fields)
+        auto task_typed = orig_future.GetTaskPtr().template Cast<CreateTask>();
+        new_task_ptr->Copy(task_typed);
+        // Create Future for the new task
+        dup_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
       break;
     }
     case Method::kDestroy: {
-      // Allocate new task using SHM default constructor
-      auto typed_task = ipc_manager->NewTask<DestroyTask>();
-      if (!typed_task.IsNull()) {
-        // Copy base Task fields first
-        typed_task.template Cast<chi::Task>()->Copy(orig_task);
-        // Then copy task-specific fields
-        typed_task->Copy(orig_task.Cast<DestroyTask>());
-        // Cast to base Task type for return
-        dup_task = typed_task.template Cast<chi::Task>();
+      // Allocate new task using standard new (returns FullPtr with null allocator)
+      auto new_task_ptr = ipc_manager->NewTask<DestroyTask>();
+      if (!new_task_ptr.IsNull()) {
+        // Copy task fields (includes base Task fields)
+        auto task_typed = orig_future.GetTaskPtr().template Cast<DestroyTask>();
+        new_task_ptr->Copy(task_typed);
+        // Create Future for the new task
+        dup_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
       break;
     }
     case Method::kRegisterTarget: {
-      // Allocate new task using SHM default constructor
-      auto typed_task = ipc_manager->NewTask<RegisterTargetTask>();
-      if (!typed_task.IsNull()) {
-        // Copy base Task fields first
-        typed_task.template Cast<chi::Task>()->Copy(orig_task);
-        // Then copy task-specific fields
-        typed_task->Copy(orig_task.Cast<RegisterTargetTask>());
-        // Cast to base Task type for return
-        dup_task = typed_task.template Cast<chi::Task>();
+      // Allocate new task using standard new (returns FullPtr with null allocator)
+      auto new_task_ptr = ipc_manager->NewTask<RegisterTargetTask>();
+      if (!new_task_ptr.IsNull()) {
+        // Copy task fields (includes base Task fields)
+        auto task_typed = orig_future.GetTaskPtr().template Cast<RegisterTargetTask>();
+        new_task_ptr->Copy(task_typed);
+        // Create Future for the new task
+        dup_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
       break;
     }
     case Method::kUnregisterTarget: {
-      // Allocate new task using SHM default constructor
-      auto typed_task = ipc_manager->NewTask<UnregisterTargetTask>();
-      if (!typed_task.IsNull()) {
-        // Copy base Task fields first
-        typed_task.template Cast<chi::Task>()->Copy(orig_task);
-        // Then copy task-specific fields
-        typed_task->Copy(orig_task.Cast<UnregisterTargetTask>());
-        // Cast to base Task type for return
-        dup_task = typed_task.template Cast<chi::Task>();
+      // Allocate new task using standard new (returns FullPtr with null allocator)
+      auto new_task_ptr = ipc_manager->NewTask<UnregisterTargetTask>();
+      if (!new_task_ptr.IsNull()) {
+        // Copy task fields (includes base Task fields)
+        auto task_typed = orig_future.GetTaskPtr().template Cast<UnregisterTargetTask>();
+        new_task_ptr->Copy(task_typed);
+        // Create Future for the new task
+        dup_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
       break;
     }
     case Method::kListTargets: {
-      // Allocate new task using SHM default constructor
-      auto typed_task = ipc_manager->NewTask<ListTargetsTask>();
-      if (!typed_task.IsNull()) {
-        // Copy base Task fields first
-        typed_task.template Cast<chi::Task>()->Copy(orig_task);
-        // Then copy task-specific fields
-        typed_task->Copy(orig_task.Cast<ListTargetsTask>());
-        // Cast to base Task type for return
-        dup_task = typed_task.template Cast<chi::Task>();
+      // Allocate new task using standard new (returns FullPtr with null allocator)
+      auto new_task_ptr = ipc_manager->NewTask<ListTargetsTask>();
+      if (!new_task_ptr.IsNull()) {
+        // Copy task fields (includes base Task fields)
+        auto task_typed = orig_future.GetTaskPtr().template Cast<ListTargetsTask>();
+        new_task_ptr->Copy(task_typed);
+        // Create Future for the new task
+        dup_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
       break;
     }
     case Method::kStatTargets: {
-      // Allocate new task using SHM default constructor
-      auto typed_task = ipc_manager->NewTask<StatTargetsTask>();
-      if (!typed_task.IsNull()) {
-        // Copy base Task fields first
-        typed_task.template Cast<chi::Task>()->Copy(orig_task);
-        // Then copy task-specific fields
-        typed_task->Copy(orig_task.Cast<StatTargetsTask>());
-        // Cast to base Task type for return
-        dup_task = typed_task.template Cast<chi::Task>();
+      // Allocate new task using standard new (returns FullPtr with null allocator)
+      auto new_task_ptr = ipc_manager->NewTask<StatTargetsTask>();
+      if (!new_task_ptr.IsNull()) {
+        // Copy task fields (includes base Task fields)
+        auto task_typed = orig_future.GetTaskPtr().template Cast<StatTargetsTask>();
+        new_task_ptr->Copy(task_typed);
+        // Create Future for the new task
+        dup_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
       break;
     }
     case Method::kGetOrCreateTag: {
-      // Allocate new task using SHM default constructor
-      auto typed_task = ipc_manager->NewTask<core::GetOrCreateTagTask<core::CreateParams>>();
-      if (!typed_task.IsNull()) {
-        // Copy base Task fields first
-        typed_task.template Cast<chi::Task>()->Copy(orig_task);
-        // Then copy task-specific fields
-        typed_task->Copy(orig_task.Cast<core::GetOrCreateTagTask<core::CreateParams>>());
-        // Cast to base Task type for return
-        dup_task = typed_task.template Cast<chi::Task>();
+      // Allocate new task using standard new (returns FullPtr with null allocator)
+      auto new_task_ptr = ipc_manager->NewTask<core::GetOrCreateTagTask<core::CreateParams>>();
+      if (!new_task_ptr.IsNull()) {
+        // Copy task fields (includes base Task fields)
+        auto task_typed = orig_future.GetTaskPtr().template Cast<core::GetOrCreateTagTask<core::CreateParams>>();
+        new_task_ptr->Copy(task_typed);
+        // Create Future for the new task
+        dup_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
       break;
     }
     case Method::kPutBlob: {
-      // Allocate new task using SHM default constructor
-      auto typed_task = ipc_manager->NewTask<PutBlobTask>();
-      if (!typed_task.IsNull()) {
-        // Copy base Task fields first
-        typed_task.template Cast<chi::Task>()->Copy(orig_task);
-        // Then copy task-specific fields
-        typed_task->Copy(orig_task.Cast<PutBlobTask>());
-        // Cast to base Task type for return
-        dup_task = typed_task.template Cast<chi::Task>();
+      // Allocate new task using standard new (returns FullPtr with null allocator)
+      auto new_task_ptr = ipc_manager->NewTask<PutBlobTask>();
+      if (!new_task_ptr.IsNull()) {
+        // Copy task fields (includes base Task fields)
+        auto task_typed = orig_future.GetTaskPtr().template Cast<PutBlobTask>();
+        new_task_ptr->Copy(task_typed);
+        // Create Future for the new task
+        dup_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
       break;
     }
     case Method::kGetBlob: {
-      // Allocate new task using SHM default constructor
-      auto typed_task = ipc_manager->NewTask<GetBlobTask>();
-      if (!typed_task.IsNull()) {
-        // Copy base Task fields first
-        typed_task.template Cast<chi::Task>()->Copy(orig_task);
-        // Then copy task-specific fields
-        typed_task->Copy(orig_task.Cast<GetBlobTask>());
-        // Cast to base Task type for return
-        dup_task = typed_task.template Cast<chi::Task>();
+      // Allocate new task using standard new (returns FullPtr with null allocator)
+      auto new_task_ptr = ipc_manager->NewTask<GetBlobTask>();
+      if (!new_task_ptr.IsNull()) {
+        // Copy task fields (includes base Task fields)
+        auto task_typed = orig_future.GetTaskPtr().template Cast<GetBlobTask>();
+        new_task_ptr->Copy(task_typed);
+        // Create Future for the new task
+        dup_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
       break;
     }
     case Method::kReorganizeBlob: {
-      // Allocate new task using SHM default constructor
-      auto typed_task = ipc_manager->NewTask<ReorganizeBlobTask>();
-      if (!typed_task.IsNull()) {
-        // Copy base Task fields first
-        typed_task.template Cast<chi::Task>()->Copy(orig_task);
-        // Then copy task-specific fields
-        typed_task->Copy(orig_task.Cast<ReorganizeBlobTask>());
-        // Cast to base Task type for return
-        dup_task = typed_task.template Cast<chi::Task>();
+      // Allocate new task using standard new (returns FullPtr with null allocator)
+      auto new_task_ptr = ipc_manager->NewTask<ReorganizeBlobTask>();
+      if (!new_task_ptr.IsNull()) {
+        // Copy task fields (includes base Task fields)
+        auto task_typed = orig_future.GetTaskPtr().template Cast<ReorganizeBlobTask>();
+        new_task_ptr->Copy(task_typed);
+        // Create Future for the new task
+        dup_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
       break;
     }
     case Method::kDelBlob: {
-      // Allocate new task using SHM default constructor
-      auto typed_task = ipc_manager->NewTask<DelBlobTask>();
-      if (!typed_task.IsNull()) {
-        // Copy base Task fields first
-        typed_task.template Cast<chi::Task>()->Copy(orig_task);
-        // Then copy task-specific fields
-        typed_task->Copy(orig_task.Cast<DelBlobTask>());
-        // Cast to base Task type for return
-        dup_task = typed_task.template Cast<chi::Task>();
+      // Allocate new task using standard new (returns FullPtr with null allocator)
+      auto new_task_ptr = ipc_manager->NewTask<DelBlobTask>();
+      if (!new_task_ptr.IsNull()) {
+        // Copy task fields (includes base Task fields)
+        auto task_typed = orig_future.GetTaskPtr().template Cast<DelBlobTask>();
+        new_task_ptr->Copy(task_typed);
+        // Create Future for the new task
+        dup_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
       break;
     }
     case Method::kDelTag: {
-      // Allocate new task using SHM default constructor
-      auto typed_task = ipc_manager->NewTask<DelTagTask>();
-      if (!typed_task.IsNull()) {
-        // Copy base Task fields first
-        typed_task.template Cast<chi::Task>()->Copy(orig_task);
-        // Then copy task-specific fields
-        typed_task->Copy(orig_task.Cast<DelTagTask>());
-        // Cast to base Task type for return
-        dup_task = typed_task.template Cast<chi::Task>();
+      // Allocate new task using standard new (returns FullPtr with null allocator)
+      auto new_task_ptr = ipc_manager->NewTask<DelTagTask>();
+      if (!new_task_ptr.IsNull()) {
+        // Copy task fields (includes base Task fields)
+        auto task_typed = orig_future.GetTaskPtr().template Cast<DelTagTask>();
+        new_task_ptr->Copy(task_typed);
+        // Create Future for the new task
+        dup_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
       break;
     }
     case Method::kGetTagSize: {
-      // Allocate new task using SHM default constructor
-      auto typed_task = ipc_manager->NewTask<GetTagSizeTask>();
-      if (!typed_task.IsNull()) {
-        // Copy base Task fields first
-        typed_task.template Cast<chi::Task>()->Copy(orig_task);
-        // Then copy task-specific fields
-        typed_task->Copy(orig_task.Cast<GetTagSizeTask>());
-        // Cast to base Task type for return
-        dup_task = typed_task.template Cast<chi::Task>();
+      // Allocate new task using standard new (returns FullPtr with null allocator)
+      auto new_task_ptr = ipc_manager->NewTask<GetTagSizeTask>();
+      if (!new_task_ptr.IsNull()) {
+        // Copy task fields (includes base Task fields)
+        auto task_typed = orig_future.GetTaskPtr().template Cast<GetTagSizeTask>();
+        new_task_ptr->Copy(task_typed);
+        // Create Future for the new task
+        dup_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
       break;
     }
     case Method::kPollTelemetryLog: {
-      // Allocate new task using SHM default constructor
-      auto typed_task = ipc_manager->NewTask<PollTelemetryLogTask>();
-      if (!typed_task.IsNull()) {
-        // Copy base Task fields first
-        typed_task.template Cast<chi::Task>()->Copy(orig_task);
-        // Then copy task-specific fields
-        typed_task->Copy(orig_task.Cast<PollTelemetryLogTask>());
-        // Cast to base Task type for return
-        dup_task = typed_task.template Cast<chi::Task>();
+      // Allocate new task using standard new (returns FullPtr with null allocator)
+      auto new_task_ptr = ipc_manager->NewTask<PollTelemetryLogTask>();
+      if (!new_task_ptr.IsNull()) {
+        // Copy task fields (includes base Task fields)
+        auto task_typed = orig_future.GetTaskPtr().template Cast<PollTelemetryLogTask>();
+        new_task_ptr->Copy(task_typed);
+        // Create Future for the new task
+        dup_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
       break;
     }
     case Method::kGetBlobScore: {
-      // Allocate new task using SHM default constructor
-      auto typed_task = ipc_manager->NewTask<GetBlobScoreTask>();
-      if (!typed_task.IsNull()) {
-        // Copy base Task fields first
-        typed_task.template Cast<chi::Task>()->Copy(orig_task);
-        // Then copy task-specific fields
-        typed_task->Copy(orig_task.Cast<GetBlobScoreTask>());
-        // Cast to base Task type for return
-        dup_task = typed_task.template Cast<chi::Task>();
+      // Allocate new task using standard new (returns FullPtr with null allocator)
+      auto new_task_ptr = ipc_manager->NewTask<GetBlobScoreTask>();
+      if (!new_task_ptr.IsNull()) {
+        // Copy task fields (includes base Task fields)
+        auto task_typed = orig_future.GetTaskPtr().template Cast<GetBlobScoreTask>();
+        new_task_ptr->Copy(task_typed);
+        // Create Future for the new task
+        dup_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
       break;
     }
     case Method::kGetBlobSize: {
-      // Allocate new task using SHM default constructor
-      auto typed_task = ipc_manager->NewTask<GetBlobSizeTask>();
-      if (!typed_task.IsNull()) {
-        // Copy base Task fields first
-        typed_task.template Cast<chi::Task>()->Copy(orig_task);
-        // Then copy task-specific fields
-        typed_task->Copy(orig_task.Cast<GetBlobSizeTask>());
-        // Cast to base Task type for return
-        dup_task = typed_task.template Cast<chi::Task>();
+      // Allocate new task using standard new (returns FullPtr with null allocator)
+      auto new_task_ptr = ipc_manager->NewTask<GetBlobSizeTask>();
+      if (!new_task_ptr.IsNull()) {
+        // Copy task fields (includes base Task fields)
+        auto task_typed = orig_future.GetTaskPtr().template Cast<GetBlobSizeTask>();
+        new_task_ptr->Copy(task_typed);
+        // Create Future for the new task
+        dup_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
       break;
     }
     case Method::kGetContainedBlobs: {
-      // Allocate new task using SHM default constructor
-      auto typed_task = ipc_manager->NewTask<GetContainedBlobsTask>();
-      if (!typed_task.IsNull()) {
-        // Copy base Task fields first
-        typed_task.template Cast<chi::Task>()->Copy(orig_task);
-        // Then copy task-specific fields
-        typed_task->Copy(orig_task.Cast<GetContainedBlobsTask>());
-        // Cast to base Task type for return
-        dup_task = typed_task.template Cast<chi::Task>();
+      // Allocate new task using standard new (returns FullPtr with null allocator)
+      auto new_task_ptr = ipc_manager->NewTask<GetContainedBlobsTask>();
+      if (!new_task_ptr.IsNull()) {
+        // Copy task fields (includes base Task fields)
+        auto task_typed = orig_future.GetTaskPtr().template Cast<GetContainedBlobsTask>();
+        new_task_ptr->Copy(task_typed);
+        // Create Future for the new task
+        dup_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
       break;
     }
     case Method::kTagQuery: {
-      // Allocate new task using SHM default constructor
-      auto typed_task = ipc_manager->NewTask<TagQueryTask>();
-      if (!typed_task.IsNull()) {
-        // Copy base Task fields first
-        typed_task.template Cast<chi::Task>()->Copy(orig_task);
-        // Then copy task-specific fields
-        typed_task->Copy(orig_task.Cast<TagQueryTask>());
-        // Cast to base Task type for return
-        dup_task = typed_task.template Cast<chi::Task>();
+      // Allocate new task using standard new (returns FullPtr with null allocator)
+      auto new_task_ptr = ipc_manager->NewTask<TagQueryTask>();
+      if (!new_task_ptr.IsNull()) {
+        // Copy task fields (includes base Task fields)
+        auto task_typed = orig_future.GetTaskPtr().template Cast<TagQueryTask>();
+        new_task_ptr->Copy(task_typed);
+        // Create Future for the new task
+        dup_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
       break;
     }
     case Method::kBlobQuery: {
-      // Allocate new task using SHM default constructor
-      auto typed_task = ipc_manager->NewTask<BlobQueryTask>();
-      if (!typed_task.IsNull()) {
-        // Copy base Task fields first
-        typed_task.template Cast<chi::Task>()->Copy(orig_task);
-        // Then copy task-specific fields
-        typed_task->Copy(orig_task.Cast<BlobQueryTask>());
-        // Cast to base Task type for return
-        dup_task = typed_task.template Cast<chi::Task>();
+      // Allocate new task using standard new (returns FullPtr with null allocator)
+      auto new_task_ptr = ipc_manager->NewTask<BlobQueryTask>();
+      if (!new_task_ptr.IsNull()) {
+        // Copy task fields (includes base Task fields)
+        auto task_typed = orig_future.GetTaskPtr().template Cast<BlobQueryTask>();
+        new_task_ptr->Copy(task_typed);
+        // Create Future for the new task
+        dup_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
       break;
     }
     default: {
       // For unknown methods, create base Task copy
-      auto typed_task = ipc_manager->NewTask<chi::Task>();
-      if (!typed_task.IsNull()) {
-        typed_task->Copy(orig_task);
-        dup_task = typed_task;  // Already chi::Task type
+      auto new_task_ptr = ipc_manager->NewTask<chi::Task>();
+      if (!new_task_ptr.IsNull()) {
+        new_task_ptr->Copy(orig_future.GetTaskPtr());
+        dup_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr);
       }
       break;
     }
@@ -1121,183 +1178,164 @@ void Runtime::NewCopy(chi::u32 method, const hipc::FullPtr<chi::Task>& orig_task
   (void)deep;    // Deep copy parameter reserved for future use
 }
 
-void Runtime::Aggregate(chi::u32 method, hipc::FullPtr<chi::Task> origin_task,
-                         hipc::FullPtr<chi::Task> replica_task) {
+void Runtime::Aggregate(chi::u32 method, chi::Future<chi::Task>& origin_future,
+                         chi::Future<chi::Task>& replica_future) {
   switch (method) {
     case Method::kCreate: {
-      auto typed_origin = origin_task.Cast<CreateTask>();
-      auto typed_replica = replica_task.Cast<CreateTask>();
-      // Call base Task aggregate to propagate return codes
-      origin_task->Aggregate(replica_task);
-      // Use SFINAE-based macro to call task-specific Aggregate if available, otherwise Copy
-      CHI_AGGREGATE_OR_COPY(typed_origin, typed_replica);
+      // Get typed tasks for Aggregate call
+      auto typed_origin = origin_future.GetTaskPtr().template Cast<CreateTask>();
+      auto typed_replica = replica_future.GetTaskPtr().template Cast<CreateTask>();
+      // Call Aggregate (uses task-specific Aggregate if available, otherwise base Task::Aggregate)
+      typed_origin->Aggregate(typed_replica);
       break;
     }
     case Method::kDestroy: {
-      auto typed_origin = origin_task.Cast<DestroyTask>();
-      auto typed_replica = replica_task.Cast<DestroyTask>();
-      // Call base Task aggregate to propagate return codes
-      origin_task->Aggregate(replica_task);
-      // Use SFINAE-based macro to call task-specific Aggregate if available, otherwise Copy
-      CHI_AGGREGATE_OR_COPY(typed_origin, typed_replica);
+      // Get typed tasks for Aggregate call
+      auto typed_origin = origin_future.GetTaskPtr().template Cast<DestroyTask>();
+      auto typed_replica = replica_future.GetTaskPtr().template Cast<DestroyTask>();
+      // Call Aggregate (uses task-specific Aggregate if available, otherwise base Task::Aggregate)
+      typed_origin->Aggregate(typed_replica);
       break;
     }
     case Method::kRegisterTarget: {
-      auto typed_origin = origin_task.Cast<RegisterTargetTask>();
-      auto typed_replica = replica_task.Cast<RegisterTargetTask>();
-      // Call base Task aggregate to propagate return codes
-      origin_task->Aggregate(replica_task);
-      // Use SFINAE-based macro to call task-specific Aggregate if available, otherwise Copy
-      CHI_AGGREGATE_OR_COPY(typed_origin, typed_replica);
+      // Get typed tasks for Aggregate call
+      auto typed_origin = origin_future.GetTaskPtr().template Cast<RegisterTargetTask>();
+      auto typed_replica = replica_future.GetTaskPtr().template Cast<RegisterTargetTask>();
+      // Call Aggregate (uses task-specific Aggregate if available, otherwise base Task::Aggregate)
+      typed_origin->Aggregate(typed_replica);
       break;
     }
     case Method::kUnregisterTarget: {
-      auto typed_origin = origin_task.Cast<UnregisterTargetTask>();
-      auto typed_replica = replica_task.Cast<UnregisterTargetTask>();
-      // Call base Task aggregate to propagate return codes
-      origin_task->Aggregate(replica_task);
-      // Use SFINAE-based macro to call task-specific Aggregate if available, otherwise Copy
-      CHI_AGGREGATE_OR_COPY(typed_origin, typed_replica);
+      // Get typed tasks for Aggregate call
+      auto typed_origin = origin_future.GetTaskPtr().template Cast<UnregisterTargetTask>();
+      auto typed_replica = replica_future.GetTaskPtr().template Cast<UnregisterTargetTask>();
+      // Call Aggregate (uses task-specific Aggregate if available, otherwise base Task::Aggregate)
+      typed_origin->Aggregate(typed_replica);
       break;
     }
     case Method::kListTargets: {
-      auto typed_origin = origin_task.Cast<ListTargetsTask>();
-      auto typed_replica = replica_task.Cast<ListTargetsTask>();
-      // Call base Task aggregate to propagate return codes
-      origin_task->Aggregate(replica_task);
-      // Use SFINAE-based macro to call task-specific Aggregate if available, otherwise Copy
-      CHI_AGGREGATE_OR_COPY(typed_origin, typed_replica);
+      // Get typed tasks for Aggregate call
+      auto typed_origin = origin_future.GetTaskPtr().template Cast<ListTargetsTask>();
+      auto typed_replica = replica_future.GetTaskPtr().template Cast<ListTargetsTask>();
+      // Call Aggregate (uses task-specific Aggregate if available, otherwise base Task::Aggregate)
+      typed_origin->Aggregate(typed_replica);
       break;
     }
     case Method::kStatTargets: {
-      auto typed_origin = origin_task.Cast<StatTargetsTask>();
-      auto typed_replica = replica_task.Cast<StatTargetsTask>();
-      // Call base Task aggregate to propagate return codes
-      origin_task->Aggregate(replica_task);
-      // Use SFINAE-based macro to call task-specific Aggregate if available, otherwise Copy
-      CHI_AGGREGATE_OR_COPY(typed_origin, typed_replica);
+      // Get typed tasks for Aggregate call
+      auto typed_origin = origin_future.GetTaskPtr().template Cast<StatTargetsTask>();
+      auto typed_replica = replica_future.GetTaskPtr().template Cast<StatTargetsTask>();
+      // Call Aggregate (uses task-specific Aggregate if available, otherwise base Task::Aggregate)
+      typed_origin->Aggregate(typed_replica);
       break;
     }
     case Method::kGetOrCreateTag: {
-      auto typed_origin = origin_task.Cast<core::GetOrCreateTagTask<core::CreateParams>>();
-      auto typed_replica = replica_task.Cast<core::GetOrCreateTagTask<core::CreateParams>>();
-      // Call base Task aggregate to propagate return codes
-      origin_task->Aggregate(replica_task);
-      // Use SFINAE-based macro to call task-specific Aggregate if available, otherwise Copy
-      CHI_AGGREGATE_OR_COPY(typed_origin, typed_replica);
+      // Get typed tasks for Aggregate call
+      auto typed_origin = origin_future.GetTaskPtr().template Cast<core::GetOrCreateTagTask<core::CreateParams>>();
+      auto typed_replica = replica_future.GetTaskPtr().template Cast<core::GetOrCreateTagTask<core::CreateParams>>();
+      // Call Aggregate (uses task-specific Aggregate if available, otherwise base Task::Aggregate)
+      typed_origin->Aggregate(typed_replica);
       break;
     }
     case Method::kPutBlob: {
-      auto typed_origin = origin_task.Cast<PutBlobTask>();
-      auto typed_replica = replica_task.Cast<PutBlobTask>();
-      // Call base Task aggregate to propagate return codes
-      origin_task->Aggregate(replica_task);
-      // Use SFINAE-based macro to call task-specific Aggregate if available, otherwise Copy
-      CHI_AGGREGATE_OR_COPY(typed_origin, typed_replica);
+      // Get typed tasks for Aggregate call
+      auto typed_origin = origin_future.GetTaskPtr().template Cast<PutBlobTask>();
+      auto typed_replica = replica_future.GetTaskPtr().template Cast<PutBlobTask>();
+      // Call Aggregate (uses task-specific Aggregate if available, otherwise base Task::Aggregate)
+      typed_origin->Aggregate(typed_replica);
       break;
     }
     case Method::kGetBlob: {
-      auto typed_origin = origin_task.Cast<GetBlobTask>();
-      auto typed_replica = replica_task.Cast<GetBlobTask>();
-      // Call base Task aggregate to propagate return codes
-      origin_task->Aggregate(replica_task);
-      // Use SFINAE-based macro to call task-specific Aggregate if available, otherwise Copy
-      CHI_AGGREGATE_OR_COPY(typed_origin, typed_replica);
+      // Get typed tasks for Aggregate call
+      auto typed_origin = origin_future.GetTaskPtr().template Cast<GetBlobTask>();
+      auto typed_replica = replica_future.GetTaskPtr().template Cast<GetBlobTask>();
+      // Call Aggregate (uses task-specific Aggregate if available, otherwise base Task::Aggregate)
+      typed_origin->Aggregate(typed_replica);
       break;
     }
     case Method::kReorganizeBlob: {
-      auto typed_origin = origin_task.Cast<ReorganizeBlobTask>();
-      auto typed_replica = replica_task.Cast<ReorganizeBlobTask>();
-      // Call base Task aggregate to propagate return codes
-      origin_task->Aggregate(replica_task);
-      // Use SFINAE-based macro to call task-specific Aggregate if available, otherwise Copy
-      CHI_AGGREGATE_OR_COPY(typed_origin, typed_replica);
+      // Get typed tasks for Aggregate call
+      auto typed_origin = origin_future.GetTaskPtr().template Cast<ReorganizeBlobTask>();
+      auto typed_replica = replica_future.GetTaskPtr().template Cast<ReorganizeBlobTask>();
+      // Call Aggregate (uses task-specific Aggregate if available, otherwise base Task::Aggregate)
+      typed_origin->Aggregate(typed_replica);
       break;
     }
     case Method::kDelBlob: {
-      auto typed_origin = origin_task.Cast<DelBlobTask>();
-      auto typed_replica = replica_task.Cast<DelBlobTask>();
-      // Call base Task aggregate to propagate return codes
-      origin_task->Aggregate(replica_task);
-      // Use SFINAE-based macro to call task-specific Aggregate if available, otherwise Copy
-      CHI_AGGREGATE_OR_COPY(typed_origin, typed_replica);
+      // Get typed tasks for Aggregate call
+      auto typed_origin = origin_future.GetTaskPtr().template Cast<DelBlobTask>();
+      auto typed_replica = replica_future.GetTaskPtr().template Cast<DelBlobTask>();
+      // Call Aggregate (uses task-specific Aggregate if available, otherwise base Task::Aggregate)
+      typed_origin->Aggregate(typed_replica);
       break;
     }
     case Method::kDelTag: {
-      auto typed_origin = origin_task.Cast<DelTagTask>();
-      auto typed_replica = replica_task.Cast<DelTagTask>();
-      // Call base Task aggregate to propagate return codes
-      origin_task->Aggregate(replica_task);
-      // Use SFINAE-based macro to call task-specific Aggregate if available, otherwise Copy
-      CHI_AGGREGATE_OR_COPY(typed_origin, typed_replica);
+      // Get typed tasks for Aggregate call
+      auto typed_origin = origin_future.GetTaskPtr().template Cast<DelTagTask>();
+      auto typed_replica = replica_future.GetTaskPtr().template Cast<DelTagTask>();
+      // Call Aggregate (uses task-specific Aggregate if available, otherwise base Task::Aggregate)
+      typed_origin->Aggregate(typed_replica);
       break;
     }
     case Method::kGetTagSize: {
-      auto typed_origin = origin_task.Cast<GetTagSizeTask>();
-      auto typed_replica = replica_task.Cast<GetTagSizeTask>();
-      // Call base Task aggregate to propagate return codes
-      origin_task->Aggregate(replica_task);
-      // Use SFINAE-based macro to call task-specific Aggregate if available, otherwise Copy
-      CHI_AGGREGATE_OR_COPY(typed_origin, typed_replica);
+      // Get typed tasks for Aggregate call
+      auto typed_origin = origin_future.GetTaskPtr().template Cast<GetTagSizeTask>();
+      auto typed_replica = replica_future.GetTaskPtr().template Cast<GetTagSizeTask>();
+      // Call Aggregate (uses task-specific Aggregate if available, otherwise base Task::Aggregate)
+      typed_origin->Aggregate(typed_replica);
       break;
     }
     case Method::kPollTelemetryLog: {
-      auto typed_origin = origin_task.Cast<PollTelemetryLogTask>();
-      auto typed_replica = replica_task.Cast<PollTelemetryLogTask>();
-      // Call base Task aggregate to propagate return codes
-      origin_task->Aggregate(replica_task);
-      // Use SFINAE-based macro to call task-specific Aggregate if available, otherwise Copy
-      CHI_AGGREGATE_OR_COPY(typed_origin, typed_replica);
+      // Get typed tasks for Aggregate call
+      auto typed_origin = origin_future.GetTaskPtr().template Cast<PollTelemetryLogTask>();
+      auto typed_replica = replica_future.GetTaskPtr().template Cast<PollTelemetryLogTask>();
+      // Call Aggregate (uses task-specific Aggregate if available, otherwise base Task::Aggregate)
+      typed_origin->Aggregate(typed_replica);
       break;
     }
     case Method::kGetBlobScore: {
-      auto typed_origin = origin_task.Cast<GetBlobScoreTask>();
-      auto typed_replica = replica_task.Cast<GetBlobScoreTask>();
-      // Call base Task aggregate to propagate return codes
-      origin_task->Aggregate(replica_task);
-      // Use SFINAE-based macro to call task-specific Aggregate if available, otherwise Copy
-      CHI_AGGREGATE_OR_COPY(typed_origin, typed_replica);
+      // Get typed tasks for Aggregate call
+      auto typed_origin = origin_future.GetTaskPtr().template Cast<GetBlobScoreTask>();
+      auto typed_replica = replica_future.GetTaskPtr().template Cast<GetBlobScoreTask>();
+      // Call Aggregate (uses task-specific Aggregate if available, otherwise base Task::Aggregate)
+      typed_origin->Aggregate(typed_replica);
       break;
     }
     case Method::kGetBlobSize: {
-      auto typed_origin = origin_task.Cast<GetBlobSizeTask>();
-      auto typed_replica = replica_task.Cast<GetBlobSizeTask>();
-      // Call base Task aggregate to propagate return codes
-      origin_task->Aggregate(replica_task);
-      // Use SFINAE-based macro to call task-specific Aggregate if available, otherwise Copy
-      CHI_AGGREGATE_OR_COPY(typed_origin, typed_replica);
+      // Get typed tasks for Aggregate call
+      auto typed_origin = origin_future.GetTaskPtr().template Cast<GetBlobSizeTask>();
+      auto typed_replica = replica_future.GetTaskPtr().template Cast<GetBlobSizeTask>();
+      // Call Aggregate (uses task-specific Aggregate if available, otherwise base Task::Aggregate)
+      typed_origin->Aggregate(typed_replica);
       break;
     }
     case Method::kGetContainedBlobs: {
-      auto typed_origin = origin_task.Cast<GetContainedBlobsTask>();
-      auto typed_replica = replica_task.Cast<GetContainedBlobsTask>();
-      // Call base Task aggregate to propagate return codes
-      origin_task->Aggregate(replica_task);
-      // Use SFINAE-based macro to call task-specific Aggregate if available, otherwise Copy
-      CHI_AGGREGATE_OR_COPY(typed_origin, typed_replica);
+      // Get typed tasks for Aggregate call
+      auto typed_origin = origin_future.GetTaskPtr().template Cast<GetContainedBlobsTask>();
+      auto typed_replica = replica_future.GetTaskPtr().template Cast<GetContainedBlobsTask>();
+      // Call Aggregate (uses task-specific Aggregate if available, otherwise base Task::Aggregate)
+      typed_origin->Aggregate(typed_replica);
       break;
     }
     case Method::kTagQuery: {
-      auto typed_origin = origin_task.Cast<TagQueryTask>();
-      auto typed_replica = replica_task.Cast<TagQueryTask>();
-      // Call base Task aggregate to propagate return codes
-      origin_task->Aggregate(replica_task);
-      // Use SFINAE-based macro to call task-specific Aggregate if available, otherwise Copy
-      CHI_AGGREGATE_OR_COPY(typed_origin, typed_replica);
+      // Get typed tasks for Aggregate call
+      auto typed_origin = origin_future.GetTaskPtr().template Cast<TagQueryTask>();
+      auto typed_replica = replica_future.GetTaskPtr().template Cast<TagQueryTask>();
+      // Call Aggregate (uses task-specific Aggregate if available, otherwise base Task::Aggregate)
+      typed_origin->Aggregate(typed_replica);
       break;
     }
     case Method::kBlobQuery: {
-      auto typed_origin = origin_task.Cast<BlobQueryTask>();
-      auto typed_replica = replica_task.Cast<BlobQueryTask>();
-      // Call base Task aggregate to propagate return codes
-      origin_task->Aggregate(replica_task);
-      // Use SFINAE-based macro to call task-specific Aggregate if available, otherwise Copy
-      CHI_AGGREGATE_OR_COPY(typed_origin, typed_replica);
+      // Get typed tasks for Aggregate call
+      auto typed_origin = origin_future.GetTaskPtr().template Cast<BlobQueryTask>();
+      auto typed_replica = replica_future.GetTaskPtr().template Cast<BlobQueryTask>();
+      // Call Aggregate (uses task-specific Aggregate if available, otherwise base Task::Aggregate)
+      typed_origin->Aggregate(typed_replica);
       break;
     }
     default: {
       // For unknown methods, use base Task Aggregate (which also propagates return codes)
-      origin_task->Aggregate(replica_task);
+      origin_future->Aggregate(replica_future.GetTaskPtr());
       break;
     }
   }

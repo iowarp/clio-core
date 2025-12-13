@@ -325,15 +325,14 @@ struct AllocateBlocksTask : public chi::Task {
   OUT ArrayVector<Block, 16> blocks_;  // Allocated blocks information (max 16 blocks)
 
   /** SHM default constructor */
-  explicit AllocateBlocksTask(AllocT* alloc)
-      : chi::Task(alloc), size_(0), blocks_() {}
+  AllocateBlocksTask()
+      : chi::Task(), size_(0), blocks_() {}
 
   /** Emplace constructor */
-  explicit AllocateBlocksTask(AllocT* alloc,
-                              const chi::TaskId &task_node,
+  explicit AllocateBlocksTask(const chi::TaskId &task_node,
                               const chi::PoolId &pool_id,
                               const chi::PoolQuery &pool_query, chi::u64 size)
-      : chi::Task(alloc, task_node, pool_id, pool_query, 10), size_(size),
+      : chi::Task(task_node, pool_id, pool_query, 10), size_(size),
         blocks_() {
     // Initialize task
     task_id_ = task_node;
@@ -370,16 +369,15 @@ struct FreeBlocksTask : public chi::Task {
   IN ArrayVector<Block, 16> blocks_;  // Blocks to free (max 16 blocks)
 
   /** SHM default constructor */
-  explicit FreeBlocksTask(AllocT* alloc)
-      : chi::Task(alloc), blocks_() {}
+  FreeBlocksTask()
+      : chi::Task(), blocks_() {}
 
   /** Emplace constructor for multiple blocks */
-  explicit FreeBlocksTask(AllocT* alloc,
-                          const chi::TaskId &task_node,
+  explicit FreeBlocksTask(const chi::TaskId &task_node,
                           const chi::PoolId &pool_id,
                           const chi::PoolQuery &pool_query,
                           const std::vector<Block> &blocks)
-      : chi::Task(alloc, task_node, pool_id, pool_query, 10), blocks_() {
+      : chi::Task(task_node, pool_id, pool_query, 10), blocks_() {
     // Initialize task
     task_id_ = task_node;
     pool_id_ = pool_id;
@@ -426,16 +424,15 @@ struct WriteTask : public chi::Task {
   OUT chi::u64 bytes_written_;       // Number of bytes actually written
 
   /** SHM default constructor */
-  explicit WriteTask(AllocT* alloc)
-      : chi::Task(alloc), blocks_(), length_(0), bytes_written_(0) {}
+  WriteTask()
+      : chi::Task(), blocks_(), length_(0), bytes_written_(0) {}
 
   /** Emplace constructor */
-  explicit WriteTask(AllocT* alloc,
-                     const chi::TaskId &task_node, const chi::PoolId &pool_id,
+  explicit WriteTask(const chi::TaskId &task_node, const chi::PoolId &pool_id,
                      const chi::PoolQuery &pool_query,
                      const ArrayVector<Block, 16> &blocks,
                      hipc::ShmPtr<> data, size_t length)
-      : chi::Task(alloc, task_node, pool_id, pool_query, 10), blocks_(blocks),
+      : chi::Task(task_node, pool_id, pool_query, 10), blocks_(blocks),
         data_(data), length_(length), bytes_written_(0) {
     // Initialize task
     task_id_ = task_node;
@@ -500,16 +497,15 @@ struct ReadTask : public chi::Task {
   OUT chi::u64 bytes_read_; // Number of bytes actually read
 
   /** SHM default constructor */
-  explicit ReadTask(AllocT* alloc)
-      : chi::Task(alloc), blocks_(), length_(0), bytes_read_(0) {}
+  ReadTask()
+      : chi::Task(), blocks_(), length_(0), bytes_read_(0) {}
 
   /** Emplace constructor */
-  explicit ReadTask(AllocT* alloc,
-                    const chi::TaskId &task_node, const chi::PoolId &pool_id,
+  explicit ReadTask(const chi::TaskId &task_node, const chi::PoolId &pool_id,
                     const chi::PoolQuery &pool_query,
                     const ArrayVector<Block, 16> &blocks,
                     hipc::ShmPtr<> data, size_t length)
-      : chi::Task(alloc, task_node, pool_id, pool_query, 10), blocks_(blocks),
+      : chi::Task(task_node, pool_id, pool_query, 10), blocks_(blocks),
         data_(data), length_(length), bytes_read_(0) {
     // Initialize task
     task_id_ = task_node;
@@ -569,15 +565,14 @@ struct GetStatsTask : public chi::Task {
   OUT chi::u64 remaining_size_; // Remaining allocatable space
 
   /** SHM default constructor */
-  explicit GetStatsTask(AllocT* alloc)
-      : chi::Task(alloc), remaining_size_(0) {}
+  GetStatsTask()
+      : chi::Task(), remaining_size_(0) {}
 
   /** Emplace constructor */
-  explicit GetStatsTask(AllocT* alloc,
-                        const chi::TaskId &task_node,
+  explicit GetStatsTask(const chi::TaskId &task_node,
                         const chi::PoolId &pool_id,
                         const chi::PoolQuery &pool_query)
-      : chi::Task(alloc, task_node, pool_id, pool_query, 10),
+      : chi::Task(task_node, pool_id, pool_query, 10),
         remaining_size_(0) {
     // Initialize task
     task_id_ = task_node;

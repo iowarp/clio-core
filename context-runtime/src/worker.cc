@@ -155,19 +155,49 @@ u32 Worker::ProcessNewTasks() {
   u32 tasks_processed = 0;
 
   while (tasks_processed < MAX_TASKS_PER_ITERATION) {
-    hipc::ShmPtr<Task> task_typed_ptr;
+    hipc::ShmPtr<FutureShm<CHI_MAIN_ALLOC_T>> future_shm_ptr;
 
-    // Pop task from assigned lane
-    if (assigned_lane_ && ::chi::TaskQueue_PopTask(assigned_lane_, task_typed_ptr)) {
+    // Pop FutureShm from assigned lane
+    if (assigned_lane_ && ::chi::TaskQueue_PopTask(assigned_lane_, future_shm_ptr)) {
       tasks_processed++;
-      // Convert TypedPointer to FullPtr for consistent API usage
-      hipc::FullPtr<Task> task_full_ptr(CHI_IPC->GetMainAlloc(), task_typed_ptr);
 
-      if (!task_full_ptr.IsNull()) {
+      auto *alloc = CHI_IPC->GetMainAlloc();
+      hipc::FullPtr<FutureShm<CHI_MAIN_ALLOC_T>> future_shm(alloc, future_shm_ptr);
+
+      if (!future_shm.IsNull()) {
+        // Get pool_id from FutureShm
+        PoolId pool_id = future_shm->pool_id_;
+
         // Get container for routing
         auto *pool_manager = CHI_POOL_MANAGER;
-        Container *container =
-            pool_manager->GetContainer(task_full_ptr->pool_id_);
+        Container *container = pool_manager->GetContainer(pool_id);
+
+        if (!container) {
+          // Container not found - mark as complete with error
+          future_shm->is_complete_.store(1);
+          continue;
+        }
+
+        // Deserialize task inputs from FutureShm using LocalLoadTaskArchive
+        std::vector<char> serialized_data(future_shm->serialized_task_.begin(),
+                                           future_shm->serialized_task_.end());
+        LocalLoadTaskArchive archive(serialized_data);
+        archive.SetMsgType(LocalMsgType::kSerializeIn);
+
+        // Allocate new task using standard new
+        auto *task_ptr = new Task();
+
+        // Deserialize into the task
+        archive >> (*task_ptr);
+
+        // Wrap task in FullPtr with null allocator (private memory)
+        hipc::FullPtr<Task> task_full_ptr;
+        task_full_ptr.ptr_ = task_ptr;
+        task_full_ptr.shm_.alloc_id_ = hipc::AllocatorId::GetNull();
+        task_full_ptr.shm_.off_ = 0;
+
+        // Link task to FutureShm
+        task_full_ptr->SetFutureShm(future_shm_ptr);
 
         // Allocate stack and RunContext before routing
         if (!task_full_ptr->IsRouted()) {
@@ -969,12 +999,25 @@ void Worker::EndTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
     HILOG(kDebug, "Worker: Sent remote task outputs back to node {}",
           ret_node_id);
   } else {
-    // Mark task as complete via FutureShm
+    // Serialize outputs back to FutureShm for local completion
     if (!task_ptr->future_shm_.IsNull()) {
-      auto *alloc = task_ptr->GetAllocator();
-      hipc::FullPtr<FutureShm<CHI_MAIN_ALLOC_T>> future_ptr(alloc, task_ptr->future_shm_);
-      if (!future_ptr.IsNull()) {
-        future_ptr->is_complete_.store(1);
+      auto *alloc = CHI_IPC->GetMainAlloc();
+      hipc::FullPtr<FutureShm<CHI_MAIN_ALLOC_T>> future_shm(alloc, task_ptr->future_shm_);
+      if (!future_shm.IsNull()) {
+        // Serialize task outputs using LocalSaveTaskArchive
+        LocalSaveTaskArchive archive(LocalMsgType::kSerializeOut);
+        archive << (*task_ptr.ptr_);
+
+        // Copy serialized outputs to FutureShm
+        const std::vector<char>& serialized = archive.GetData();
+        future_shm->serialized_task_.clear();
+        future_shm->serialized_task_.reserve(serialized.size());
+        for (char c : serialized) {
+          future_shm->serialized_task_.push_back(c);
+        }
+
+        // Mark task as complete
+        future_shm->is_complete_.store(1);
       }
     }
   }
@@ -1251,7 +1294,10 @@ void Worker::FiberExecutionFunction(boost::context::detail::transfer_t t) {
 
       if (container) {
         // Call the container's Run function with the task
-        container->Run(task_ptr->method_, task_ptr, *run_ctx);
+        // Wrap task in Future for Run method
+        auto *alloc = CHI_IPC->GetMainAlloc();
+        chi::Future<chi::Task> task_future(alloc, task_ptr);
+        container->Run(task_ptr->method_, task_future, *run_ctx);
       } else {
         // Container not found - this is an error condition
         HILOG(kWarning, "Container not found in RunContext for pool_id: {}",

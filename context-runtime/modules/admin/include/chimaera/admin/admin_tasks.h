@@ -73,25 +73,24 @@ struct BaseCreateTask : public chi::Task {
   volatile bool do_compose_;
 
   /** SHM default constructor */
-  explicit BaseCreateTask(AllocT* alloc)
-      : chi::Task(alloc), chimod_name_(alloc), pool_name_(alloc),
-        chimod_params_(alloc), new_pool_id_(chi::PoolId::GetNull()),
-        error_message_(alloc), is_admin_(IS_ADMIN), do_compose_(DO_COMPOSE) {}
+  BaseCreateTask()
+      : chi::Task(), chimod_name_(CHI_IPC->GetMainAlloc()), pool_name_(CHI_IPC->GetMainAlloc()),
+        chimod_params_(CHI_IPC->GetMainAlloc()), new_pool_id_(chi::PoolId::GetNull()),
+        error_message_(CHI_IPC->GetMainAlloc()), is_admin_(IS_ADMIN), do_compose_(DO_COMPOSE) {}
 
   /** Emplace constructor with CreateParams arguments */
   template <typename... CreateParamsArgs>
-  explicit BaseCreateTask(AllocT* alloc,
-                          const chi::TaskId &task_node,
+  explicit BaseCreateTask(const chi::TaskId &task_node,
                           const chi::PoolId &task_pool_id,
                           const chi::PoolQuery &pool_query,
                           const std::string &chimod_name,
                           const std::string &pool_name,
                           const chi::PoolId &target_pool_id,
                           CreateParamsArgs &&...create_params_args)
-      : chi::Task(alloc, task_node, task_pool_id, pool_query, 0),
-        chimod_name_(alloc, chimod_name), pool_name_(alloc, pool_name),
-        chimod_params_(alloc), new_pool_id_(target_pool_id),
-        error_message_(alloc), is_admin_(IS_ADMIN), do_compose_(DO_COMPOSE) {
+      : chi::Task(task_node, task_pool_id, pool_query, 0),
+        chimod_name_(CHI_IPC->GetMainAlloc(), chimod_name), pool_name_(CHI_IPC->GetMainAlloc(), pool_name),
+        chimod_params_(CHI_IPC->GetMainAlloc()), new_pool_id_(target_pool_id),
+        error_message_(CHI_IPC->GetMainAlloc()), is_admin_(IS_ADMIN), do_compose_(DO_COMPOSE) {
     // Initialize base task
     task_id_ = task_node;
     method_ = MethodId;
@@ -104,20 +103,19 @@ struct BaseCreateTask : public chi::Task {
       // Create and serialize the CreateParams with provided arguments
       CreateParamsT params(
           std::forward<CreateParamsArgs>(create_params_args)...);
-      chi::Task::Serialize(alloc, chimod_params_, params);
+      chi::Task::Serialize(CHI_IPC->GetMainAlloc(), chimod_params_, params);
     }
   }
 
   /** Compose constructor - takes PoolConfig directly */
-  explicit BaseCreateTask(AllocT* alloc,
-                          const chi::TaskId &task_node,
+  explicit BaseCreateTask(const chi::TaskId &task_node,
                           const chi::PoolId &task_pool_id,
                           const chi::PoolQuery &pool_query,
                           const chi::PoolConfig &pool_config)
-      : chi::Task(alloc, task_node, task_pool_id, pool_query, 0),
-        chimod_name_(alloc, pool_config.mod_name_),
-        pool_name_(alloc, pool_config.pool_name_), chimod_params_(alloc),
-        new_pool_id_(pool_config.pool_id_), error_message_(alloc),
+      : chi::Task(task_node, task_pool_id, pool_query, 0),
+        chimod_name_(CHI_IPC->GetMainAlloc(), pool_config.mod_name_),
+        pool_name_(CHI_IPC->GetMainAlloc(), pool_config.pool_name_), chimod_params_(CHI_IPC->GetMainAlloc()),
+        new_pool_id_(pool_config.pool_id_), error_message_(CHI_IPC->GetMainAlloc()),
         is_admin_(IS_ADMIN), do_compose_(DO_COMPOSE) {
     // Initialize base task
     task_id_ = task_node;
@@ -126,7 +124,7 @@ struct BaseCreateTask : public chi::Task {
     pool_query_ = pool_query;
 
     // Serialize PoolConfig directly into chimod_params_
-    chi::Task::Serialize(alloc, chimod_params_, pool_config);
+    chi::Task::Serialize(CHI_IPC->GetMainAlloc(), chimod_params_, pool_config);
   }
 
   /**
@@ -234,20 +232,19 @@ struct DestroyPoolTask : public chi::Task {
   OUT chi::priv::string error_message_; ///< Error description if destruction failed
 
   /** SHM default constructor */
-  explicit DestroyPoolTask(AllocT* alloc)
-      : chi::Task(alloc), target_pool_id_(), destruction_flags_(0),
-        error_message_(alloc) {}
+  DestroyPoolTask()
+      : chi::Task(), target_pool_id_(), destruction_flags_(0),
+        error_message_(CHI_IPC->GetMainAlloc()) {}
 
   /** Emplace constructor */
-  explicit DestroyPoolTask(AllocT* alloc,
-                           const chi::TaskId &task_node,
+  explicit DestroyPoolTask(const chi::TaskId &task_node,
                            const chi::PoolId &pool_id,
                            const chi::PoolQuery &pool_query,
                            chi::PoolId target_pool_id,
                            chi::u32 destruction_flags = 0)
-      : chi::Task(alloc, task_node, pool_id, pool_query, 10),
+      : chi::Task(task_node, pool_id, pool_query, 10),
         target_pool_id_(target_pool_id), destruction_flags_(destruction_flags),
-        error_message_(alloc) {
+        error_message_(CHI_IPC->GetMainAlloc()) {
     // Initialize task
     task_id_ = task_node;
     pool_id_ = pool_id;
@@ -298,20 +295,19 @@ struct StopRuntimeTask : public chi::Task {
   OUT chi::priv::string error_message_; ///< Error description if shutdown failed
 
   /** SHM default constructor */
-  explicit StopRuntimeTask(AllocT* alloc)
-      : chi::Task(alloc), shutdown_flags_(0), grace_period_ms_(5000),
-        error_message_(alloc) {}
+  StopRuntimeTask()
+      : chi::Task(), shutdown_flags_(0), grace_period_ms_(5000),
+        error_message_(CHI_IPC->GetMainAlloc()) {}
 
   /** Emplace constructor */
-  explicit StopRuntimeTask(AllocT* alloc,
-                           const chi::TaskId &task_node,
+  explicit StopRuntimeTask(const chi::TaskId &task_node,
                            const chi::PoolId &pool_id,
                            const chi::PoolQuery &pool_query,
                            chi::u32 shutdown_flags = 0,
                            chi::u32 grace_period_ms = 5000)
-      : chi::Task(alloc, task_node, pool_id, pool_query, 10),
+      : chi::Task(task_node, pool_id, pool_query, 10),
         shutdown_flags_(shutdown_flags), grace_period_ms_(grace_period_ms),
-        error_message_(alloc) {
+        error_message_(CHI_IPC->GetMainAlloc()) {
     // Initialize task
     task_id_ = task_node;
     pool_id_ = pool_id;
@@ -360,14 +356,13 @@ struct FlushTask : public chi::Task {
                                  ///< containers
 
   /** SHM default constructor */
-  explicit FlushTask(AllocT* alloc)
-      : chi::Task(alloc), total_work_done_(0) {}
+  FlushTask()
+      : chi::Task(), total_work_done_(0) {}
 
   /** Emplace constructor */
-  explicit FlushTask(AllocT* alloc,
-                     const chi::TaskId &task_node, const chi::PoolId &pool_id,
+  explicit FlushTask(const chi::TaskId &task_node, const chi::PoolId &pool_id,
                      const chi::PoolQuery &pool_query)
-      : chi::Task(alloc, task_node, pool_id, pool_query, 10),
+      : chi::Task(task_node, pool_id, pool_query, 10),
         total_work_done_(0) {
     // Initialize task
     task_id_ = task_node;
@@ -432,21 +427,20 @@ struct SendTask : public chi::Task {
   OUT chi::priv::string error_message_; ///< Error description if transfer failed
 
   /** SHM default constructor */
-  explicit SendTask(AllocT* alloc)
-      : chi::Task(alloc), msg_type_(chi::MsgType::kSerializeIn),
+  SendTask()
+      : chi::Task(), msg_type_(chi::MsgType::kSerializeIn),
         origin_task_(hipc::FullPtr<chi::Task>()), pool_queries_(),
-        transfer_flags_(0), error_message_(alloc) {}
+        transfer_flags_(0), error_message_(CHI_IPC->GetMainAlloc()) {}
 
   /** Emplace constructor */
-  explicit SendTask(AllocT* alloc,
-                    const chi::TaskId &task_node, const chi::PoolId &pool_id,
+  explicit SendTask(const chi::TaskId &task_node, const chi::PoolId &pool_id,
                     const chi::PoolQuery &pool_query, chi::MsgType msg_type,
                     hipc::FullPtr<chi::Task> subtask,
                     const std::vector<chi::PoolQuery> &pool_queries,
                     chi::u32 transfer_flags = 0)
-      : chi::Task(alloc, task_node, pool_id, pool_query, Method::kSend),
+      : chi::Task(task_node, pool_id, pool_query, Method::kSend),
         msg_type_(msg_type), origin_task_(subtask), pool_queries_(pool_queries),
-        transfer_flags_(transfer_flags), error_message_(alloc) {
+        transfer_flags_(transfer_flags), error_message_(CHI_IPC->GetMainAlloc()) {
     // Initialize task
     task_id_ = task_node;
     pool_id_ = pool_id;
@@ -498,16 +492,15 @@ struct RecvTask : public chi::Task {
   OUT chi::priv::string error_message_; ///< Error description if transfer failed
 
   /** SHM default constructor */
-  explicit RecvTask(AllocT* alloc)
-      : chi::Task(alloc), transfer_flags_(0), error_message_(alloc) {}
+  RecvTask()
+      : chi::Task(), transfer_flags_(0), error_message_(CHI_IPC->GetMainAlloc()) {}
 
   /** Emplace constructor */
-  explicit RecvTask(AllocT* alloc,
-                    const chi::TaskId &task_node, const chi::PoolId &pool_id,
+  explicit RecvTask(const chi::TaskId &task_node, const chi::PoolId &pool_id,
                     const chi::PoolQuery &pool_query,
                     chi::u32 transfer_flags = 0)
-      : chi::Task(alloc, task_node, pool_id, pool_query, Method::kRecv),
-        transfer_flags_(transfer_flags), error_message_(alloc) {
+      : chi::Task(task_node, pool_id, pool_query, Method::kRecv),
+        transfer_flags_(transfer_flags), error_message_(CHI_IPC->GetMainAlloc()) {
     // Initialize task
     task_id_ = task_node;
     pool_id_ = pool_id;

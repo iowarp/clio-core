@@ -47,11 +47,11 @@ struct TaskStat {
 /**
  * Base task class for Chimaera distributed execution
  *
- * Inherits from hipc::ShmContainer to support shared memory operations.
  * All tasks represent C++ functions similar to RPCs that can be executed
- * across the distributed system.
+ * across the distributed system. Tasks are now allocated in private memory
+ * using standard new/delete.
  */
-class Task : public hipc::ShmContainer<CHI_MAIN_ALLOC_T> {
+class Task {
  public:
   typedef CHI_MAIN_ALLOC_T AllocT;
   IN PoolId pool_id_;       /**< Pool identifier for task execution */
@@ -68,20 +68,17 @@ class Task : public hipc::ShmContainer<CHI_MAIN_ALLOC_T> {
   hipc::ShmPtr<FutureShm<AllocT>> future_shm_; /**< Pointer to FutureShm for async operations */
 
   /**
-   * SHM default constructor
+   * Default constructor
    */
-  explicit Task(AllocT* alloc)
-      : hipc::ShmContainer<AllocT>(alloc) {
+  Task() {
     SetNull();
   }
 
   /**
    * Emplace constructor with task initialization
    */
-  explicit Task(AllocT* alloc,
-                const TaskId &task_id, const PoolId &pool_id,
-                const PoolQuery &pool_query, const MethodId &method)
-      : hipc::ShmContainer<AllocT>(alloc) {
+  explicit Task(const TaskId &task_id, const PoolId &pool_id,
+                const PoolQuery &pool_query, const MethodId &method) {
     // Initialize task
     task_id_ = task_id;
     pool_id_ = pool_id;
@@ -352,9 +349,23 @@ class Task : public hipc::ShmContainer<CHI_MAIN_ALLOC_T> {
   /**
    * Base aggregate method - propagates return codes from replica tasks
    * Sets this task's return code to the replica's return code if replica has non-zero return code
+   * Accepts any task type that inherits from Task
    * @param replica_task The replica task to aggregate from
    */
-  HSHM_CROSS_FUN void Aggregate(const hipc::FullPtr<Task> &replica_task);
+  template<typename TaskT>
+  HSHM_CROSS_FUN void Aggregate(const hipc::FullPtr<TaskT> &replica_task) {
+    // Cast to base Task for aggregation
+    auto base_replica = replica_task.template Cast<Task>();
+    // Propagate return code from replica to this task
+    if (!base_replica.IsNull() && base_replica->GetReturnCode() != 0) {
+      SetReturnCode(base_replica->GetReturnCode());
+    }
+    // Copy the completer from the replica task
+    if (!base_replica.IsNull()) {
+      SetCompleter(base_replica->GetCompleter());
+    }
+    HILOG(kDebug, "[COMPLETER] Aggregated task {} with completer {}", task_id_, GetCompleter());
+  }
 
   /**
    * Estimate CPU time for this task based on I/O size and compute time

@@ -258,14 +258,16 @@ class ChiModGenerator {
     oss << "  client_ = Client(pool_id);\n";
     oss << "}\n";
     oss << "\n";
-    oss << "void Runtime::Run(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr, chi::RunContext& rctx) {\n";
+    oss << "void Runtime::Run(chi::u32 method, chi::Future<chi::Task>& task_future, chi::RunContext& rctx) {\n";
     oss << "  switch (method) {\n";
 
     // Add Run switch cases for each method
     for (const auto& method : methods) {
       std::string task_type = GetTaskTypeName(method.method_name, chimod_name);
       oss << "    case Method::" << method.constant_name << ": {\n";
-      oss << "      " << method.method_name << "(task_ptr.Cast<" << task_type << ">(), rctx);\n";
+      oss << "      // Extract task FullPtr from Future and cast to specific type\n";
+      oss << "      hipc::FullPtr<" << task_type << "> typed_task = task_future.GetTaskPtr().template Cast<" << task_type << ">();\n";
+      oss << "      " << method.method_name << "(typed_task, rctx);\n";
       oss << "      break;\n";
       oss << "    }\n";
     }
@@ -278,7 +280,7 @@ class ChiModGenerator {
     oss << "}\n";
     oss << "\n";
     oss << "void Runtime::Del(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr) {\n";
-    oss << "  // Use IPC manager to deallocate task from shared memory\n";
+    oss << "  // Use IPC manager to deallocate task from private memory\n";
     oss << "  auto* ipc_manager = CHI_IPC;\n";
     oss << "  \n";
     oss << "  switch (method) {\n";
@@ -287,7 +289,7 @@ class ChiModGenerator {
     for (const auto& method : methods) {
       std::string task_type = GetTaskTypeName(method.method_name, chimod_name);
       oss << "    case Method::" << method.constant_name << ": {\n";
-      oss << "      ipc_manager->DelTask(task_ptr.Cast<" << task_type << ">());\n";
+      oss << "      ipc_manager->DelTask(task_ptr.template Cast<" << task_type << ">());\n";
       oss << "      break;\n";
       oss << "    }\n";
     }
@@ -301,14 +303,14 @@ class ChiModGenerator {
     oss << "}\n";
     oss << "\n";
     oss << "void Runtime::SaveTask(chi::u32 method, chi::SaveTaskArchive& archive, \n";
-    oss << "                        hipc::FullPtr<chi::Task> task_ptr) {\n";
+    oss << "                        chi::Future<chi::Task>& task_future) {\n";
     oss << "  switch (method) {\n";
 
     // Add SaveTask switch cases
     for (const auto& method : methods) {
       std::string task_type = GetTaskTypeName(method.method_name, chimod_name);
       oss << "    case Method::" << method.constant_name << ": {\n";
-      oss << "      auto typed_task = task_ptr.Cast<" << task_type << ">();\n";
+      oss << "      auto* typed_task = static_cast<" << task_type << "*>(task_future.get());\n";
       oss << "      archive << *typed_task;\n";
       oss << "      break;\n";
       oss << "    }\n";
@@ -322,7 +324,7 @@ class ChiModGenerator {
     oss << "}\n";
     oss << "\n";
     oss << "void Runtime::LoadTask(chi::u32 method, chi::LoadTaskArchive& archive, \n";
-    oss << "                        hipc::FullPtr<chi::Task>& task_ptr) {\n";
+    oss << "                        chi::Future<chi::Task>& task_future) {\n";
     oss << "  auto* ipc_manager = CHI_IPC;\n";
     oss << "  \n";
     oss << "  switch (method) {\n";
@@ -332,10 +334,11 @@ class ChiModGenerator {
       std::string task_type = GetTaskTypeName(method.method_name, chimod_name);
       oss << "    case Method::" << method.constant_name << ": {\n";
       oss << "      // Allocate task using typed NewTask if not already allocated\n";
-      oss << "      if (task_ptr.IsNull()) {\n";
-      oss << "        task_ptr = ipc_manager->NewTask<" << task_type << ">().template Cast<chi::Task>();\n";
+      oss << "      if (task_future.IsNull()) {\n";
+      oss << "        auto new_task_ptr = ipc_manager->NewTask<" << task_type << ">();\n";
+      oss << "        task_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());\n";
       oss << "      }\n";
-      oss << "      auto typed_task = task_ptr.Cast<" << task_type << ">();\n";
+      oss << "      auto* typed_task = static_cast<" << task_type << "*>(task_future.get());\n";
       oss << "      archive >> *typed_task;\n";
       oss << "      break;\n";
       oss << "    }\n";
@@ -349,7 +352,7 @@ class ChiModGenerator {
     oss << "}\n";
     oss << "\n";
     oss << "void Runtime::LocalLoadIn(chi::u32 method, chi::LocalLoadTaskArchive& archive, \n";
-    oss << "                           hipc::FullPtr<chi::Task>& task_ptr) {\n";
+    oss << "                           chi::Future<chi::Task>& task_future) {\n";
     oss << "  auto* ipc_manager = CHI_IPC;\n";
     oss << "  \n";
     oss << "  switch (method) {\n";
@@ -359,10 +362,11 @@ class ChiModGenerator {
       std::string task_type = GetTaskTypeName(method.method_name, chimod_name);
       oss << "    case Method::" << method.constant_name << ": {\n";
       oss << "      // Allocate task using typed NewTask if not already allocated\n";
-      oss << "      if (task_ptr.IsNull()) {\n";
-      oss << "        task_ptr = ipc_manager->NewTask<" << task_type << ">().template Cast<chi::Task>();\n";
+      oss << "      if (task_future.IsNull()) {\n";
+      oss << "        auto new_task_ptr = ipc_manager->NewTask<" << task_type << ">();\n";
+      oss << "        task_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());\n";
       oss << "      }\n";
-      oss << "      auto typed_task = task_ptr.Cast<" << task_type << ">();\n";
+      oss << "      auto* typed_task = static_cast<" << task_type << "*>(task_future.get());\n";
       oss << "      // Call BaseSerializeIn and SerializeIn using LocalLoadTaskArchive\n";
       oss << "      typed_task->BaseSerializeIn(archive);\n";
       oss << "      typed_task->SerializeIn(archive);\n";
@@ -378,14 +382,14 @@ class ChiModGenerator {
     oss << "}\n";
     oss << "\n";
     oss << "void Runtime::LocalSaveOut(chi::u32 method, chi::LocalSaveTaskArchive& archive, \n";
-    oss << "                            hipc::FullPtr<chi::Task> task_ptr) {\n";
+    oss << "                            chi::Future<chi::Task>& task_future) {\n";
     oss << "  switch (method) {\n";
 
     // Add LocalSaveOut switch cases
     for (const auto& method : methods) {
       std::string task_type = GetTaskTypeName(method.method_name, chimod_name);
       oss << "    case Method::" << method.constant_name << ": {\n";
-      oss << "      auto typed_task = task_ptr.Cast<" << task_type << ">();\n";
+      oss << "      auto* typed_task = static_cast<" << task_type << "*>(task_future.get());\n";
       oss << "      // Call BaseSerializeOut and SerializeOut using LocalSaveTaskArchive\n";
       oss << "      typed_task->BaseSerializeOut(archive);\n";
       oss << "      typed_task->SerializeOut(archive);\n";
@@ -400,8 +404,8 @@ class ChiModGenerator {
     oss << "  }\n";
     oss << "}\n";
     oss << "\n";
-    oss << "void Runtime::NewCopy(chi::u32 method, const hipc::FullPtr<chi::Task>& orig_task,\n";
-    oss << "                       hipc::FullPtr<chi::Task>& dup_task, bool deep) {\n";
+    oss << "void Runtime::NewCopy(chi::u32 method, chi::Future<chi::Task>& orig_future,\n";
+    oss << "                       chi::Future<chi::Task>& dup_future, bool deep) {\n";
     oss << "  auto* ipc_manager = CHI_IPC;\n";
     oss << "  if (!ipc_manager) {\n";
     oss << "    return;\n";
@@ -413,15 +417,14 @@ class ChiModGenerator {
     for (const auto& method : methods) {
       std::string task_type = GetTaskTypeName(method.method_name, chimod_name);
       oss << "    case Method::" << method.constant_name << ": {\n";
-      oss << "      // Allocate new task using SHM default constructor\n";
-      oss << "      auto typed_task = ipc_manager->NewTask<" << task_type << ">();\n";
-      oss << "      if (!typed_task.IsNull()) {\n";
-      oss << "        // Copy base Task fields first\n";
-      oss << "        typed_task.template Cast<chi::Task>()->Copy(orig_task);\n";
-      oss << "        // Then copy task-specific fields\n";
-      oss << "        typed_task->Copy(orig_task.Cast<" << task_type << ">());\n";
-      oss << "        // Cast to base Task type for return\n";
-      oss << "        dup_task = typed_task.template Cast<chi::Task>();\n";
+      oss << "      // Allocate new task using standard new (returns FullPtr with null allocator)\n";
+      oss << "      auto new_task_ptr = ipc_manager->NewTask<" << task_type << ">();\n";
+      oss << "      if (!new_task_ptr.IsNull()) {\n";
+      oss << "        // Copy task fields (includes base Task fields)\n";
+      oss << "        auto task_typed = orig_future.GetTaskPtr().template Cast<" << task_type << ">();\n";
+      oss << "        new_task_ptr->Copy(task_typed);\n";
+      oss << "        // Create Future for the new task\n";
+      oss << "        dup_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());\n";
       oss << "      }\n";
       oss << "      break;\n";
       oss << "    }\n";
@@ -429,10 +432,10 @@ class ChiModGenerator {
 
     oss << "    default: {\n";
     oss << "      // For unknown methods, create base Task copy\n";
-    oss << "      auto typed_task = ipc_manager->NewTask<chi::Task>();\n";
-    oss << "      if (!typed_task.IsNull()) {\n";
-    oss << "        typed_task->Copy(orig_task);\n";
-    oss << "        dup_task = typed_task;  // Already chi::Task type\n";
+    oss << "      auto new_task_ptr = ipc_manager->NewTask<chi::Task>();\n";
+    oss << "      if (!new_task_ptr.IsNull()) {\n";
+    oss << "        new_task_ptr->Copy(orig_future.GetTaskPtr());\n";
+    oss << "        dup_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr);\n";
     oss << "      }\n";
     oss << "      break;\n";
     oss << "    }\n";
@@ -441,27 +444,26 @@ class ChiModGenerator {
     oss << "  (void)deep;    // Deep copy parameter reserved for future use\n";
     oss << "}\n";
     oss << "\n";
-    oss << "void Runtime::Aggregate(chi::u32 method, hipc::FullPtr<chi::Task> origin_task,\n";
-    oss << "                         hipc::FullPtr<chi::Task> replica_task) {\n";
+    oss << "void Runtime::Aggregate(chi::u32 method, chi::Future<chi::Task>& origin_future,\n";
+    oss << "                         chi::Future<chi::Task>& replica_future) {\n";
     oss << "  switch (method) {\n";
 
     // Add Aggregate switch cases
     for (const auto& method : methods) {
       std::string task_type = GetTaskTypeName(method.method_name, chimod_name);
       oss << "    case Method::" << method.constant_name << ": {\n";
-      oss << "      auto typed_origin = origin_task.Cast<" << task_type << ">();\n";
-      oss << "      auto typed_replica = replica_task.Cast<" << task_type << ">();\n";
-      oss << "      // Call base Task aggregate to propagate return codes\n";
-      oss << "      origin_task->Aggregate(replica_task);\n";
-      oss << "      // Use SFINAE-based macro to call task-specific Aggregate if available, otherwise Copy\n";
-      oss << "      CHI_AGGREGATE_OR_COPY(typed_origin, typed_replica);\n";
+      oss << "      // Get typed tasks for Aggregate call\n";
+      oss << "      auto typed_origin = origin_future.GetTaskPtr().template Cast<" << task_type << ">();\n";
+      oss << "      auto typed_replica = replica_future.GetTaskPtr().template Cast<" << task_type << ">();\n";
+      oss << "      // Call Aggregate (uses task-specific Aggregate if available, otherwise base Task::Aggregate)\n";
+      oss << "      typed_origin->Aggregate(typed_replica);\n";
       oss << "      break;\n";
       oss << "    }\n";
     }
 
     oss << "    default: {\n";
     oss << "      // For unknown methods, use base Task Aggregate (which also propagates return codes)\n";
-    oss << "      origin_task->Aggregate(replica_task);\n";
+    oss << "      origin_future->Aggregate(replica_future.GetTaskPtr());\n";
     oss << "      break;\n";
     oss << "    }\n";
     oss << "  }\n";

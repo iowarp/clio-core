@@ -58,7 +58,7 @@ public:
   /**
    * Execute a method on a task
    */
-  void Run(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr, chi::RunContext& rctx) override;
+  void Run(chi::u32 method, chi::Future<chi::Task>& task_future, chi::RunContext& rctx) override;
 
   /**
    * Delete/cleanup a task
@@ -112,38 +112,38 @@ public:
   /**
    * Serialize task parameters for network transfer (unified method)
    */
-  void SaveTask(chi::u32 method, chi::SaveTaskArchive& archive, hipc::FullPtr<chi::Task> task_ptr) override;
+  void SaveTask(chi::u32 method, chi::SaveTaskArchive& archive, chi::Future<chi::Task>& task_future) override;
 
   /**
    * Deserialize task parameters from network transfer (unified method)
    */
-  void LoadTask(chi::u32 method, chi::LoadTaskArchive& archive, hipc::FullPtr<chi::Task>& task_ptr) override;
+  void LoadTask(chi::u32 method, chi::LoadTaskArchive& archive, chi::Future<chi::Task>& task_future) override;
 
   /**
    * Deserialize task input parameters using LocalSerialize (for local transfers)
    */
   void LocalLoadIn(chi::u32 method, chi::LocalLoadTaskArchive& archive,
-                   hipc::FullPtr<chi::Task>& task_ptr) override;
+                   chi::Future<chi::Task>& task_future) override;
 
   /**
    * Serialize task output parameters using LocalSerialize (for local transfers)
    */
   void LocalSaveOut(chi::u32 method, chi::LocalSaveTaskArchive& archive,
-                    hipc::FullPtr<chi::Task> task_ptr) override;
+                    chi::Future<chi::Task>& task_future) override;
 
   /**
    * Create a new copy of a task (deep copy for distributed execution)
    */
   void NewCopy(chi::u32 method,
-               const hipc::FullPtr<chi::Task> &orig_task,
-               hipc::FullPtr<chi::Task> &dup_task, bool deep) override;
+               chi::Future<chi::Task>& orig_future,
+               chi::Future<chi::Task>& dup_future, bool deep) override;
 
   /**
    * Aggregate a replica task into the origin task (for merging replica results)
    */
   void Aggregate(chi::u32 method,
-                 hipc::FullPtr<chi::Task> origin_task,
-                 hipc::FullPtr<chi::Task> replica_task) override;
+                 chi::Future<chi::Task>& origin_future,
+                 chi::Future<chi::Task>& replica_future) override;
 };
 
 } // namespace chimaera::MOD_NAME

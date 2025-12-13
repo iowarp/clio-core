@@ -203,8 +203,8 @@ Runtime::~Runtime() {
 }
 
 void Runtime::Create(hipc::FullPtr<CreateTask> task, chi::RunContext &ctx) {
-  // Get the creation parameters using task's allocator
-  auto alloc = task->GetAllocator();
+  // Get the creation parameters using main allocator
+  auto alloc = CHI_IPC->GetMainAlloc();
   CreateParams params = task->GetParams(alloc);
 
   // Get the pool name which serves as the file path for file-based operations

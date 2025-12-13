@@ -6,6 +6,8 @@
 #include "chimaera/task_queue.h"
 #include "chimaera/types.h"
 #include "chimaera/worker.h"
+#include "chimaera/future.h"
+#include "chimaera/local_task_archives.h"
 #include "hermes_shm/memory/backend/posix_shm_mmap.h"
 #include <atomic>
 #include <iostream>
@@ -98,29 +100,31 @@ public:
   void ServerFinalize();
 
   /**
-   * Create a new task in shared memory (always uses main segment)
+   * Create a new task in private memory (using standard new)
    * @param args Constructor arguments for the task
-   * @return FullPtr to allocated task
+   * @return FullPtr wrapping the task with null allocator
    */
   template <typename TaskT, typename... Args>
-  FullPtr<TaskT> NewTask(Args &&...args) {
-    if (!main_allocator_) {
-      return FullPtr<TaskT>();
-    }
-
-    return main_allocator_->template NewObj<TaskT>(main_allocator_,
-                                                   std::forward<Args>(args)...);
+  hipc::FullPtr<TaskT> NewTask(Args &&...args) {
+    TaskT* ptr = new TaskT(std::forward<Args>(args)...);
+    // Create a FullPtr with null allocator ID and zero offset (private memory)
+    // Use explicit initialization to avoid template constructor overload issues
+    hipc::FullPtr<TaskT> result;
+    result.ptr_ = ptr;
+    result.shm_.alloc_id_ = hipc::AllocatorId::GetNull();
+    result.shm_.off_ = 0;
+    return result;
   }
 
   /**
-   * Delete a task from shared memory (always uses main segment)
+   * Delete a task from private memory (using standard delete)
    * @param task_ptr FullPtr to task to delete
    */
-  template <typename TaskT> void DelTask(FullPtr<TaskT> task_ptr) {
-    if (task_ptr.IsNull() || !main_allocator_)
+  template <typename TaskT> void DelTask(hipc::FullPtr<TaskT> task_ptr) {
+    if (task_ptr.IsNull())
       return;
 
-    main_allocator_->template DelObj<TaskT>(task_ptr);
+    delete task_ptr.ptr_;
   }
 
   /**
@@ -154,26 +158,102 @@ public:
   }
 
   /**
+   * Send task asynchronously (serializes into Future)
+   * Creates a Future wrapper, serializes task inputs, and enqueues to worker
+   * @param task_ptr Task to send
+   * @return Future<TaskT> for polling completion and retrieving results
+   */
+  template <typename TaskT> Future<TaskT> Send(hipc::FullPtr<TaskT> task_ptr) {
+    // 1. Get main allocator for FutureShm allocation
+    auto *alloc = GetMainAlloc();
+
+    // 2. Create Future with allocator and task_ptr
+    Future<TaskT> future(alloc, task_ptr);
+
+    // 3. Serialize task using LocalSaveTaskArchive with kSerializeIn mode
+    LocalSaveTaskArchive archive(LocalMsgType::kSerializeIn);
+    archive << (*task_ptr.ptr_);
+
+    // 4. Get serialized data and copy to FutureShm's hipc::vector
+    const std::vector<char>& serialized = archive.GetData();
+    auto& future_shm = future.GetFutureShm();
+    future_shm->serialized_task_.reserve(serialized.size());
+    future_shm->serialized_task_.assign(serialized.begin(), serialized.end());
+
+    // 5. Map task to lane using configured policy
+    u32 num_lanes = shared_header_->num_sched_queues;
+    if (num_lanes == 0)
+      return future; // Avoid division by zero
+
+    // 6. Enqueue the FutureShm's ShmPtr to the worker queue
+    LaneId lane_id = MapTaskToLane(num_lanes);
+    auto& lane_ref = worker_queues_->GetLane(lane_id, 0);
+    lane_ref.Push(future_shm->shm_);
+
+    // 7. Return the Future
+    return future;
+  }
+
+  /**
+   * Receive task results (deserializes from completed Future)
+   * Polls for completion and deserializes task outputs into task
+   * @param future Future containing completed task
+   */
+  template <typename TaskT> void Recv(Future<TaskT>& future) {
+    // 1. Poll for completion by checking is_complete atomic in FutureShm
+    auto& future_shm = future.GetFutureShm();
+    while (future_shm->is_complete_.load() == 0) {
+      // Busy wait or could add a short sleep
+      std::this_thread::yield();
+    }
+
+    // 2. Get the serialized task data from FutureShm
+    hipc::vector<char, CHI_MAIN_ALLOC_T>& serialized = future_shm->serialized_task_;
+
+    // 3. Convert hipc::vector to std::vector for LocalLoadTaskArchive
+    std::vector<char> buffer(serialized.begin(), serialized.end());
+
+    // 4. Create LocalLoadTaskArchive with kSerializeOut mode
+    LocalLoadTaskArchive archive(buffer);
+    archive.SetMsgType(LocalMsgType::kSerializeOut);
+
+    // 5. Deserialize task outputs into the Future's task pointer
+    TaskT* task_ptr = future.get();
+    archive >> (*task_ptr);
+  }
+
+  /**
    * Enqueue task to process queue (priority 0 - normal tasks)
    * Uses the configured lane mapping policy to select the target lane
+   * Backward compatibility method - now uses Future-based infrastructure
    * @param task_ptr Task to enqueue
    */
-  template <typename TaskT> void Enqueue(FullPtr<TaskT> &task_ptr) {
+  template <typename TaskT> void Enqueue(hipc::FullPtr<TaskT> &task_ptr) {
     if (!worker_queues_.IsNull() && worker_queues_.ptr_ && shared_header_) {
-      // Create ShmPtr from the task FullPtr
-      hipc::ShmPtr<Task> typed_ptr(task_ptr.shm_);
+      // Use Send infrastructure which creates Future and serializes
+      auto *alloc = GetMainAlloc();
+      Future<TaskT> future(alloc, task_ptr);
 
+      // Serialize task using LocalSaveTaskArchive with kSerializeIn mode
+      LocalSaveTaskArchive archive(LocalMsgType::kSerializeIn);
+      archive << (*task_ptr.ptr_);
+
+      // Get serialized data and copy to FutureShm's hipc::vector
+      const std::vector<char>& serialized = archive.GetData();
+      auto& future_shm = future.GetFutureShm();
+      future_shm->serialized_task_.reserve(serialized.size());
+      for (char c : serialized) {
+        future_shm->serialized_task_.push_back(c);
+      }
+
+      // Map task to lane using configured policy
       u32 num_lanes = shared_header_->num_sched_queues;
       if (num_lanes == 0)
         return; // Avoid division by zero
 
-      // Map task to lane using configured policy
       LaneId lane_id = MapTaskToLane(num_lanes);
-
-      // Get lane as FullPtr and use TaskQueue's EmplaceTask method
-      // Priority 0 for normal task submission
-      auto &lane_ref = worker_queues_->GetLane(lane_id, 0);
-      lane_ref.Push(task_ptr.template Cast<Task>().shm_);
+      auto& lane_ref = worker_queues_->GetLane(lane_id, 0);
+      lane_ref.Push(future_shm.shm_);
     }
   }
 

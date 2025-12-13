@@ -127,8 +127,8 @@ void Task::Yield(double block_time_us) {
 bool Task::IsComplete() const {
   // Check if FutureShm is available
   if (!future_shm_.IsNull()) {
-    // Get the FutureShm object via allocator
-    auto *alloc = this->GetAllocator();
+    // Get the FutureShm object via IPC manager's allocator
+    auto *alloc = CHI_IPC->GetMainAlloc();
     hipc::FullPtr<FutureShm<AllocT>> future_ptr(alloc, future_shm_);
     if (!future_ptr.IsNull()) {
       return future_ptr->is_complete_.load() != 0;
@@ -138,17 +138,7 @@ bool Task::IsComplete() const {
   return true;
 }
 
-void Task::Aggregate(const hipc::FullPtr<Task> &replica_task) {
-  // If replica task has non-zero return code, propagate it to this task
-  if (!replica_task.IsNull() && replica_task->GetReturnCode() != 0) {
-    SetReturnCode(replica_task->GetReturnCode());
-  }
-  // Copy the completer from the replica task
-  if (!replica_task.IsNull()) {
-    SetCompleter(replica_task->GetCompleter());
-  }
-  HILOG(kDebug, "[COMPLETER] Aggregated task {} with completer {}", task_id_, GetCompleter());
-}
+// Task::Aggregate is now a template method in task.h
 
 size_t Task::EstCpuTime() const {
   // Calculate: io_size / 4GBps + compute + 5

@@ -54,7 +54,7 @@ If things fail to compile, then fix chi_refresh_repo and rerun.
 Async* operations will need to return a ``Future<Task>`` object instead of Task*. Future is a new template class you should create.
 
 Future will store:
-1. A raw pointer to the Task (e.g., CreateTask*)
+1. A FullPtr pointer to the Task
 2. A FullPtr to a FutreShm object, which contains a hipc::vector representing the serialized task and an atomic is_complete_ bool. We should remove is_complete_ in the task as well.
 
 Two constructors:
@@ -102,6 +102,8 @@ Update DelTask in IpcManager to use standard delete instead of Allocator::DelObj
 Update EVERY task to no longer take in ``CHI_MAIN_ALLOC_T *alloc`` as an input. For all tasks depending on it, please use CHI_IPC->GetMainAlloc() instead.
 Update EVERY *_runtime.cc code to take as input a Future<TaskT> instead of FullPtr<TaskT>.
 Update the SendIn, SaveIn, LoadIn, LoadOut, LocalLoadIn, and LocalSaveOut methods to use take as input Future<TaskT> instead of FullPtr<TaskT> by updating chi_refresh_repo.
+
+Comment out the admin SendIn, LoadIn, SendOut, and LoadOut method bodies. We will come back to those.
 
 # Worker 
 

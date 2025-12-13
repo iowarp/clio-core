@@ -118,7 +118,7 @@ void Runtime::GetOrCreatePool(
 
   } catch (const std::exception &e) {
     task->return_code_ = 99;
-    auto alloc = task->GetAllocator();
+    auto alloc = CHI_IPC->GetMainAlloc();
     std::string error_msg = std::string("Exception during pool creation: ") + e.what();
     task->error_message_ = chi::priv::string(alloc, error_msg);
     HELOG(kError, "Admin: Pool creation failed with exception: {}", e.what());
@@ -168,7 +168,7 @@ void Runtime::DestroyPool(hipc::FullPtr<DestroyPoolTask> task,
 
   } catch (const std::exception &e) {
     task->return_code_ = 99;
-    auto alloc = task->GetAllocator();
+    auto alloc = CHI_IPC->GetMainAlloc();
     std::string error_msg = std::string("Exception during pool destruction: ") + e.what();
     task->error_message_ = chi::priv::string(alloc, error_msg);
     HELOG(kError, "Admin: Pool destruction failed with exception: {}",
@@ -199,7 +199,7 @@ void Runtime::StopRuntime(hipc::FullPtr<StopRuntimeTask> task,
 
   } catch (const std::exception &e) {
     task->return_code_ = 99;
-    auto alloc = task->GetAllocator();
+    auto alloc = CHI_IPC->GetMainAlloc();
     std::string error_msg = std::string("Exception during runtime shutdown: ") + e.what();
     task->error_message_ = chi::priv::string(alloc, error_msg);
     HELOG(kError, "Admin: Runtime shutdown failed with exception: {}",
@@ -277,6 +277,8 @@ void Runtime::Flush(hipc::FullPtr<FlushTask> task, chi::RunContext &rctx) {
  * @param rctx RunContext for managing subtasks
  */
 void Runtime::SendIn(hipc::FullPtr<SendTask> task, chi::RunContext &rctx) {
+  // COMMENTED OUT - Will be reimplemented with Future-based approach
+  /*
   // Set I/O size to 1MB to ensure routing to slow workers
   task->stat_.io_size_ = 1024 * 1024; // 1MB
 
@@ -421,6 +423,8 @@ void Runtime::SendIn(hipc::FullPtr<SendTask> task, chi::RunContext &rctx) {
   HILOG(kDebug, "=== [SendIn END] Task {} completed sending to {} targets ===",
         origin_task->task_id_, num_replicas);
   task->SetReturnCode(0);
+  */
+  task->SetReturnCode(0);
 }
 
 /**
@@ -428,6 +432,8 @@ void Runtime::SendIn(hipc::FullPtr<SendTask> task, chi::RunContext &rctx) {
  * @param task SendTask containing origin_task
  */
 void Runtime::SendOut(hipc::FullPtr<SendTask> task) {
+  // COMMENTED OUT - Will be reimplemented with Future-based approach
+  /*
   // Set I/O size to 1MB to ensure routing to slow workers
   task->stat_.io_size_ = 1024 * 1024; // 1MB
 
@@ -535,6 +541,8 @@ void Runtime::SendOut(hipc::FullPtr<SendTask> task) {
         origin_task->task_id_);
 
   task->SetReturnCode(0);
+  */
+  task->SetReturnCode(0);
 }
 
 /**
@@ -569,6 +577,8 @@ void Runtime::Send(hipc::FullPtr<SendTask> task, chi::RunContext &rctx) {
 void Runtime::RecvIn(hipc::FullPtr<RecvTask> task,
                      chi::LoadTaskArchive &archive,
                      hshm::lbm::Server *lbm_server) {
+  // COMMENTED OUT - Will be reimplemented with Future-based approach
+  /*
   // Set I/O size to 1MB to ensure routing to slow workers
   task->stat_.io_size_ = 1024 * 1024; // 1MB
 
@@ -659,6 +669,8 @@ void Runtime::RecvIn(hipc::FullPtr<RecvTask> task,
 
   HILOG(kDebug, "=== [RecvIn END] Processed {} task(s) ===", task_infos.size());
   task->SetReturnCode(0);
+  */
+  task->SetReturnCode(0);
 }
 
 /**
@@ -670,6 +682,8 @@ void Runtime::RecvIn(hipc::FullPtr<RecvTask> task,
 void Runtime::RecvOut(hipc::FullPtr<RecvTask> task,
                       chi::LoadTaskArchive &archive,
                       hshm::lbm::Server *lbm_server) {
+  // COMMENTED OUT - Will be reimplemented with Future-based approach
+  /*
   // Set I/O size to 1MB to ensure routing to slow workers
   task->stat_.io_size_ = 1024 * 1024; // 1MB
 
@@ -852,6 +866,8 @@ void Runtime::RecvOut(hipc::FullPtr<RecvTask> task,
 
   HILOG(kDebug,
         "=== [RecvOut END] Processed {} task output(s) ===", task_infos.size());
+  task->SetReturnCode(0);
+  */
   task->SetReturnCode(0);
 }
 

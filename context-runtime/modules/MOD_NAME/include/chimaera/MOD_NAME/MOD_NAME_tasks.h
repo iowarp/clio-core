@@ -54,20 +54,19 @@ struct CustomTask : public chi::Task {
   IN chi::u32 operation_id_;
 
   /** SHM default constructor */
-  explicit CustomTask(AllocT* alloc)
-      : chi::Task(alloc),
-        data_(alloc), operation_id_(0) {}
+  CustomTask()
+      : chi::Task(),
+        data_(CHI_IPC->GetMainAlloc()), operation_id_(0) {}
 
   /** Emplace constructor */
   explicit CustomTask(
-      AllocT* alloc,
       const chi::TaskId &task_node,
       const chi::PoolId &pool_id,
       const chi::PoolQuery &pool_query,
       const std::string &data,
       chi::u32 operation_id)
-      : chi::Task(alloc, task_node, pool_id, pool_query, 10),
-        data_(alloc, data), operation_id_(operation_id) {
+      : chi::Task(task_node, pool_id, pool_query, 10),
+        data_(CHI_IPC->GetMainAlloc(), data), operation_id_(operation_id) {
     // Initialize task
     task_id_ = task_node;
     pool_id_ = pool_id;
@@ -114,18 +113,17 @@ struct CoMutexTestTask : public chi::Task {
   IN chi::u32 hold_duration_ms_; // How long to hold the mutex
 
   /** SHM default constructor */
-  explicit CoMutexTestTask(AllocT* alloc) 
-      : chi::Task(alloc), test_id_(0), hold_duration_ms_(0) {}
+  CoMutexTestTask()
+      : chi::Task(), test_id_(0), hold_duration_ms_(0) {}
 
   /** Emplace constructor */
   explicit CoMutexTestTask(
-      AllocT* alloc,
       const chi::TaskId &task_node,
-      const chi::PoolId &pool_id, 
+      const chi::PoolId &pool_id,
       const chi::PoolQuery &pool_query,
       chi::u32 test_id,
       chi::u32 hold_duration_ms)
-      : chi::Task(alloc, task_node, pool_id, pool_query, 20),
+      : chi::Task(task_node, pool_id, pool_query, 20),
         test_id_(test_id), hold_duration_ms_(hold_duration_ms) {
     // Initialize task
     task_id_ = task_node;
@@ -166,19 +164,18 @@ struct CoRwLockTestTask : public chi::Task {
   IN chi::u32 hold_duration_ms_; // How long to hold the lock
 
   /** SHM default constructor */
-  explicit CoRwLockTestTask(AllocT* alloc) 
-      : chi::Task(alloc), test_id_(0), is_writer_(false), hold_duration_ms_(0) {}
+  CoRwLockTestTask()
+      : chi::Task(), test_id_(0), is_writer_(false), hold_duration_ms_(0) {}
 
   /** Emplace constructor */
   explicit CoRwLockTestTask(
-      AllocT* alloc,
       const chi::TaskId &task_node,
-      const chi::PoolId &pool_id, 
+      const chi::PoolId &pool_id,
       const chi::PoolQuery &pool_query,
       chi::u32 test_id,
       bool is_writer,
       chi::u32 hold_duration_ms)
-      : chi::Task(alloc, task_node, pool_id, pool_query, 21),
+      : chi::Task(task_node, pool_id, pool_query, 21),
         test_id_(test_id), is_writer_(is_writer), hold_duration_ms_(hold_duration_ms) {
     // Initialize task
     task_id_ = task_node;
@@ -221,18 +218,17 @@ struct WaitTestTask : public chi::Task {
   INOUT chi::u32 current_depth_;   // Current recursion level (starts at 0)
 
   /** SHM default constructor */
-  explicit WaitTestTask(AllocT* alloc) 
-      : chi::Task(alloc), depth_(0), test_id_(0), current_depth_(0) {}
+  WaitTestTask()
+      : chi::Task(), depth_(0), test_id_(0), current_depth_(0) {}
 
   /** Emplace constructor */
   explicit WaitTestTask(
-      AllocT* alloc,
       const chi::TaskId &task_node,
-      const chi::PoolId &pool_id, 
+      const chi::PoolId &pool_id,
       const chi::PoolQuery &pool_query,
       chi::u32 depth,
       chi::u32 test_id)
-      : chi::Task(alloc, task_node, pool_id, pool_query, 23),
+      : chi::Task(task_node, pool_id, pool_query, 23),
         depth_(depth), test_id_(test_id), current_depth_(0) {
     // Initialize task
     task_id_ = task_node;

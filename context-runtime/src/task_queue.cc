@@ -7,48 +7,48 @@
 namespace chi {
 
 /**
- * Emplace a task into a task lane
+ * Emplace a FutureShm into a task lane
  * @param lane_ptr Pointer to the task lane
- * @param task_ptr Pointer to the task to enqueue
+ * @param future_shm_ptr Pointer to the FutureShm to enqueue
  * @return true if successful, false otherwise
  */
-bool TaskQueue_EmplaceTask(hipc::FullPtr<TaskLane>& lane_ptr, hipc::ShmPtr<Task> task_ptr) {
-  if (lane_ptr.IsNull() || task_ptr.IsNull()) {
+bool TaskQueue_EmplaceTask(hipc::FullPtr<TaskLane>& lane_ptr, hipc::ShmPtr<FutureShm<CHI_MAIN_ALLOC_T>> future_shm_ptr) {
+  if (lane_ptr.IsNull() || future_shm_ptr.IsNull()) {
     return false;
   }
 
   // Push to the lane
-  lane_ptr->Push(task_ptr);
+  lane_ptr->Push(future_shm_ptr);
 
   return true;
 }
 
 /**
- * Pop a task from a task lane
+ * Pop a FutureShm from a task lane
  * @param lane_ptr Pointer to the task lane
- * @param task_ptr Reference to store the popped task
- * @return true if a task was popped, false otherwise
+ * @param future_shm_ptr Reference to store the popped FutureShm
+ * @return true if a FutureShm was popped, false otherwise
  */
-bool TaskQueue_PopTask(hipc::FullPtr<TaskLane>& lane_ptr, hipc::ShmPtr<Task>& task_ptr) {
+bool TaskQueue_PopTask(hipc::FullPtr<TaskLane>& lane_ptr, hipc::ShmPtr<FutureShm<CHI_MAIN_ALLOC_T>>& future_shm_ptr) {
   if (lane_ptr.IsNull()) {
     return false;
   }
 
-  return lane_ptr->Pop(task_ptr);
+  return lane_ptr->Pop(future_shm_ptr);
 }
 
 /**
- * Pop a task from a task lane (overload for raw pointer)
+ * Pop a FutureShm from a task lane (overload for raw pointer)
  * @param lane_ptr Raw pointer to the task lane
- * @param task_ptr Reference to store the popped task
- * @return true if a task was popped, false otherwise
+ * @param future_shm_ptr Reference to store the popped FutureShm
+ * @return true if a FutureShm was popped, false otherwise
  */
-bool TaskQueue_PopTask(TaskLane *lane_ptr, hipc::ShmPtr<Task>& task_ptr) {
+bool TaskQueue_PopTask(TaskLane *lane_ptr, hipc::ShmPtr<FutureShm<CHI_MAIN_ALLOC_T>>& future_shm_ptr) {
   if (!lane_ptr) {
     return false;
   }
 
-  return lane_ptr->Pop(task_ptr);
+  return lane_ptr->Pop(future_shm_ptr);
 }
 
 }  // namespace chi

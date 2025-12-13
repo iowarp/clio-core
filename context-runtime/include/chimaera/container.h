@@ -11,6 +11,7 @@
 
 #include "chimaera/pool_query.h"
 #include "chimaera/task.h"
+#include "chimaera/future.h"
 #include "chimaera/task_archives.h"
 #include "chimaera/local_task_archives.h"
 #include "chimaera/task_queue.h"
@@ -87,7 +88,7 @@ class Container {
   /**
    * Execute a method on a task - must be implemented by derived classes
    */
-  virtual void Run(u32 method, hipc::FullPtr<Task> task_ptr,
+  virtual void Run(u32 method, Future<Task>& task_future,
                    RunContext& rctx) = 0;
 
   /**
@@ -122,10 +123,10 @@ class Container {
    * Uses switch-case structure based on method ID to dispatch to appropriate serialization
    * @param method The method ID to serialize
    * @param archive SaveTaskArchive configured with srl_mode (true=In, false=Out)
-   * @param task_ptr Pointer to the task to serialize
+   * @param task_future Future wrapping the task to serialize
    */
   virtual void SaveTask(u32 method, SaveTaskArchive& archive,
-                        hipc::FullPtr<Task> task_ptr) = 0;
+                        Future<Task>& task_future) = 0;
 
   /**
    * Deserialize task parameters from network transfer (unified method)
@@ -133,10 +134,10 @@ class Container {
    * Uses switch-case structure based on method ID to dispatch to appropriate deserialization
    * @param method The method ID to deserialize
    * @param archive LoadTaskArchive configured with srl_mode (true=In, false=Out)
-   * @param task_ptr Pointer to the task to deserialize into
+   * @param task_future Future wrapping the task to deserialize into
    */
   virtual void LoadTask(u32 method, LoadTaskArchive& archive,
-                        hipc::FullPtr<Task>& task_ptr) = 0;
+                        Future<Task>& task_future) = 0;
 
   /**
    * Serialize task input parameters using LocalSerialize (for local transfers)
@@ -144,10 +145,10 @@ class Container {
    * Uses switch-case structure based on method ID to dispatch to appropriate serialization
    * @param method The method ID to serialize
    * @param archive LocalLoadTaskArchive for deserializing inputs
-   * @param task_ptr Pointer to the task to load inputs into
+   * @param task_future Future wrapping the task to load inputs into
    */
   virtual void LocalLoadIn(u32 method, LocalLoadTaskArchive& archive,
-                           hipc::FullPtr<Task>& task_ptr) = 0;
+                           Future<Task>& task_future) = 0;
 
   /**
    * Serialize task output parameters using LocalSerialize (for local transfers)
@@ -155,10 +156,10 @@ class Container {
    * Uses switch-case structure based on method ID to dispatch to appropriate serialization
    * @param method The method ID to serialize
    * @param archive LocalSaveTaskArchive for serializing outputs
-   * @param task_ptr Pointer to the task to save outputs from
+   * @param task_future Future wrapping the task to save outputs from
    */
   virtual void LocalSaveOut(u32 method, LocalSaveTaskArchive& archive,
-                            hipc::FullPtr<Task> task_ptr) = 0;
+                            Future<Task>& task_future) = 0;
 
   /**
    * Create a new copy of a task (deep copy for distributed execution) - must be
@@ -166,20 +167,20 @@ class Container {
    * ID to dispatch to appropriate task type copying
    */
   HSHM_DLL virtual void NewCopy(u32 method,
-                               const hipc::FullPtr<Task> &orig_task,
-                               hipc::FullPtr<Task> &dup_task, bool deep) = 0;
+                               Future<Task> &orig_future,
+                               Future<Task> &dup_future, bool deep) = 0;
 
   /**
    * Aggregate a replica task into the origin task - must be implemented by derived classes
    * Uses switch-case structure based on method ID to dispatch to appropriate task type aggregation
    * This is used for merging replica results back into the origin task after distributed execution
    * @param method The method ID for the task type
-   * @param origin_task Pointer to the origin task to aggregate into
-   * @param replica_task Pointer to the replica task to aggregate from
+   * @param origin_future Future wrapping the origin task to aggregate into
+   * @param replica_future Future wrapping the replica task to aggregate from
    */
   HSHM_DLL virtual void Aggregate(u32 method,
-                                 hipc::FullPtr<Task> origin_task,
-                                 hipc::FullPtr<Task> replica_task) = 0; 
+                                 Future<Task>& origin_future,
+                                 Future<Task>& replica_future) = 0; 
 };
 
 /**

@@ -17,15 +17,16 @@ namespace external_test::simple_mod {
 // Container Virtual API Implementations
 //==============================================================================
 
-void Runtime::Init(const chi::PoolId &pool_id, const std::string &pool_name) {
+void Runtime::Init(const chi::PoolId &pool_id, const std::string &pool_name,
+                   chi::u32 container_id) {
   // Call base class initialization
-  chi::Container::Init(pool_id, pool_name);
+  chi::Container::Init(pool_id, pool_name, container_id);
 
   // Initialize the client for this ChiMod
   client_ = Client(pool_id);
 }
 
-void Runtime::Run(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr, chi::RunContext& rctx) {
+void Runtime::Run(chi::u32 method, chi::Future<chi::Task>& task_future, chi::RunContext& rctx) {
   switch (method) {
     default: {
       // Unknown method - do nothing
@@ -35,7 +36,7 @@ void Runtime::Run(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr, chi::RunCo
 }
 
 void Runtime::Del(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr) {
-  // Use IPC manager to deallocate task from shared memory
+  // Use IPC manager to deallocate task from private memory
   auto* ipc_manager = CHI_IPC;
   
   switch (method) {
@@ -48,7 +49,7 @@ void Runtime::Del(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr) {
 }
 
 void Runtime::SaveTask(chi::u32 method, chi::SaveTaskArchive& archive, 
-                        hipc::FullPtr<chi::Task> task_ptr) {
+                        chi::Future<chi::Task>& task_future) {
   switch (method) {
     default: {
       // Unknown method - do nothing
@@ -58,7 +59,7 @@ void Runtime::SaveTask(chi::u32 method, chi::SaveTaskArchive& archive,
 }
 
 void Runtime::LoadTask(chi::u32 method, chi::LoadTaskArchive& archive, 
-                        hipc::FullPtr<chi::Task>& task_ptr) {
+                        chi::Future<chi::Task>& task_future) {
   auto* ipc_manager = CHI_IPC;
   
   switch (method) {
@@ -69,8 +70,30 @@ void Runtime::LoadTask(chi::u32 method, chi::LoadTaskArchive& archive,
   }
 }
 
-void Runtime::NewCopy(chi::u32 method, const hipc::FullPtr<chi::Task>& orig_task,
-                       hipc::FullPtr<chi::Task>& dup_task, bool deep) {
+void Runtime::LocalLoadIn(chi::u32 method, chi::LocalLoadTaskArchive& archive, 
+                           chi::Future<chi::Task>& task_future) {
+  auto* ipc_manager = CHI_IPC;
+  
+  switch (method) {
+    default: {
+      // Unknown method - do nothing
+      break;
+    }
+  }
+}
+
+void Runtime::LocalSaveOut(chi::u32 method, chi::LocalSaveTaskArchive& archive, 
+                            chi::Future<chi::Task>& task_future) {
+  switch (method) {
+    default: {
+      // Unknown method - do nothing
+      break;
+    }
+  }
+}
+
+void Runtime::NewCopy(chi::u32 method, chi::Future<chi::Task>& orig_future,
+                       chi::Future<chi::Task>& dup_future, bool deep) {
   auto* ipc_manager = CHI_IPC;
   if (!ipc_manager) {
     return;
@@ -79,10 +102,10 @@ void Runtime::NewCopy(chi::u32 method, const hipc::FullPtr<chi::Task>& orig_task
   switch (method) {
     default: {
       // For unknown methods, create base Task copy
-      auto typed_task = ipc_manager->NewTask<chi::Task>();
-      if (!typed_task.IsNull()) {
-        typed_task->Copy(orig_task);
-        dup_task = typed_task;  // Already chi::Task type
+      auto new_task_ptr = ipc_manager->NewTask<chi::Task>();
+      if (!new_task_ptr.IsNull()) {
+        new_task_ptr->Copy(orig_future.GetTaskPtr());
+        dup_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr);
       }
       break;
     }
@@ -91,12 +114,12 @@ void Runtime::NewCopy(chi::u32 method, const hipc::FullPtr<chi::Task>& orig_task
   (void)deep;    // Deep copy parameter reserved for future use
 }
 
-void Runtime::Aggregate(chi::u32 method, hipc::FullPtr<chi::Task> origin_task,
-                         hipc::FullPtr<chi::Task> replica_task) {
+void Runtime::Aggregate(chi::u32 method, chi::Future<chi::Task>& origin_future,
+                         chi::Future<chi::Task>& replica_future) {
   switch (method) {
     default: {
-      // For unknown methods, use base Task Copy
-      origin_task->Copy(replica_task);
+      // For unknown methods, use base Task Aggregate (which also propagates return codes)
+      origin_future->Aggregate(replica_future.GetTaskPtr());
       break;
     }
   }

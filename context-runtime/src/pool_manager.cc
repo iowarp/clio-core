@@ -419,7 +419,10 @@ bool PoolManager::CreatePool(FullPtr<Task> task, RunContext* run_ctx) {
     // Run create method on container (task and run_ctx guaranteed by
     // CHIMAERA_INIT)
     // Create methods can spawn tasks internally that need to find this container
-    container->Run(0, task, *run_ctx);  // Method::kCreate = 0
+    // Wrap task in Future for Run method
+    auto *alloc = ipc_manager->GetMainAlloc();
+    chi::Future<chi::Task> task_future(alloc, task);
+    container->Run(0, task_future, *run_ctx);  // Method::kCreate = 0
 
     if (!task->GetReturnCode() == 0) {
       HELOG(kError, "PoolManager: Failed to create container for ChiMod: {}", chimod_name);

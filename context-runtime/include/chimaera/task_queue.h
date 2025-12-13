@@ -2,6 +2,7 @@
 #define CHIMAERA_INCLUDE_CHIMAERA_TASK_QUEUE_H_
 
 #include "chimaera/types.h"
+#include "chimaera/future.h"
 
 namespace chi {
 
@@ -21,15 +22,16 @@ struct TaskQueueHeader {
   WorkerId assigned_worker_id;
   u32 task_count;        // Number of tasks currently in the queue
   bool is_enqueued;      // Whether this queue is currently enqueued in worker
-  
+
   TaskQueueHeader() : pool_id(), assigned_worker_id(0), task_count(0), is_enqueued(false) {}
-  TaskQueueHeader(PoolId pid, WorkerId wid = 0) 
+  TaskQueueHeader(PoolId pid, WorkerId wid = 0)
     : pool_id(pid), assigned_worker_id(wid), task_count(0), is_enqueued(false) {}
 };
 
 // Type alias for individual lanes with per-lane headers (moved outside TaskQueue class)
+// Worker queues now store FutureShm pointers instead of Task pointers
 using TaskLane =
-    hipc::multi_mpsc_ring_buffer<hipc::ShmPtr<Task>,
+    hipc::multi_mpsc_ring_buffer<hipc::ShmPtr<FutureShm<CHI_MAIN_ALLOC_T>>,
                                  CHI_MAIN_ALLOC_T>::ring_buffer_type;
 
 /**
@@ -39,7 +41,7 @@ using TaskLane =
  * compatibility with existing code that expects the multi_mpsc_ring_buffer
  * interface.
  */
-typedef hipc::multi_mpsc_ring_buffer<hipc::ShmPtr<Task>, CHI_MAIN_ALLOC_T>
+typedef hipc::multi_mpsc_ring_buffer<hipc::ShmPtr<FutureShm<CHI_MAIN_ALLOC_T>>, CHI_MAIN_ALLOC_T>
     TaskQueue;
 
 // template <typename 
@@ -111,20 +113,20 @@ typedef hipc::multi_mpsc_ring_buffer<hipc::ShmPtr<Task>, CHI_MAIN_ALLOC_T>
 // };
 
 /**
- * Pop a task from a task lane (FullPtr overload)
+ * Pop a FutureShm from a task lane (FullPtr overload)
  * @param lane_ptr FullPtr to the task lane
- * @param task_ptr Reference to store the popped task
- * @return true if a task was popped, false otherwise
+ * @param future_shm_ptr Reference to store the popped FutureShm
+ * @return true if a FutureShm was popped, false otherwise
  */
-bool TaskQueue_PopTask(hipc::FullPtr<TaskLane>& lane_ptr, hipc::ShmPtr<Task>& task_ptr);
+bool TaskQueue_PopTask(hipc::FullPtr<TaskLane>& lane_ptr, hipc::ShmPtr<FutureShm<CHI_MAIN_ALLOC_T>>& future_shm_ptr);
 
 /**
- * Pop a task from a task lane (raw pointer overload)
+ * Pop a FutureShm from a task lane (raw pointer overload)
  * @param lane_ptr Raw pointer to the task lane
- * @param task_ptr Reference to store the popped task
- * @return true if a task was popped, false otherwise
+ * @param future_shm_ptr Reference to store the popped FutureShm
+ * @return true if a FutureShm was popped, false otherwise
  */
-bool TaskQueue_PopTask(TaskLane *lane_ptr, hipc::ShmPtr<Task>& task_ptr);
+bool TaskQueue_PopTask(TaskLane *lane_ptr, hipc::ShmPtr<FutureShm<CHI_MAIN_ALLOC_T>>& future_shm_ptr);
 
 } // namespace chi
 

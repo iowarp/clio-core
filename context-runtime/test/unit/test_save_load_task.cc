@@ -110,17 +110,19 @@ TEST_CASE("SaveTask and LoadTask - Admin CreateTask full flow",
 
   // Step 2: SaveIn - serialize IN/INOUT parameters
   chi::SaveTaskArchive save_in_archive(chi::MsgType::kSerializeIn);
+  chi::Future<chi::Task> orig_task_future(alloc, orig_task.template Cast<chi::Task>());
   container->SaveTask(chimaera::admin::Method::kCreate, save_in_archive,
-                      orig_task.template Cast<chi::Task>());
+                      orig_task_future);
 
   // Step 3: LoadIn - deserialize IN/INOUT parameters into new task
   std::string save_in_data = save_in_archive.GetData();
   REQUIRE(!save_in_data.empty());
 
   chi::LoadTaskArchive load_in_archive(save_in_data);
-  hipc::FullPtr<chi::Task> loaded_in_task_ptr;
+  chi::Future<chi::Task> loaded_in_task_future;
   container->LoadTask(chimaera::admin::Method::kCreate, load_in_archive,
-                      loaded_in_task_ptr);
+                      loaded_in_task_future);
+  hipc::FullPtr<chi::Task> loaded_in_task_ptr = loaded_in_task_future.GetTaskPtr();
 
   REQUIRE(!loaded_in_task_ptr.IsNull());
   auto loaded_in_task = loaded_in_task_ptr.Cast<chimaera::admin::CreateTask>();
@@ -148,17 +150,19 @@ TEST_CASE("SaveTask and LoadTask - Admin CreateTask full flow",
 
   // Step 6: SaveOut - serialize OUT/INOUT parameters
   chi::SaveTaskArchive save_out_archive(chi::MsgType::kSerializeOut);
+  chi::Future<chi::Task> loaded_in_task_future2(alloc, loaded_in_task.template Cast<chi::Task>());
   container->SaveTask(chimaera::admin::Method::kCreate, save_out_archive,
-                      loaded_in_task.template Cast<chi::Task>());
+                      loaded_in_task_future2);
 
   // Step 7: LoadOut - deserialize OUT/INOUT parameters
   std::string save_out_data = save_out_archive.GetData();
   REQUIRE(!save_out_data.empty());
 
   chi::LoadTaskArchive load_out_archive(save_out_data);
-  hipc::FullPtr<chi::Task> loaded_out_task_ptr;
+  chi::Future<chi::Task> loaded_out_task_future;
   container->LoadTask(chimaera::admin::Method::kCreate, load_out_archive,
-                      loaded_out_task_ptr);
+                      loaded_out_task_future);
+  hipc::FullPtr<chi::Task> loaded_out_task_ptr = loaded_out_task_future.GetTaskPtr();
 
   REQUIRE(!loaded_out_task_ptr.IsNull());
   auto loaded_out_task =
@@ -211,15 +215,17 @@ TEST_CASE("SaveTask and LoadTask - Admin FlushTask full flow",
 
   // Step 2: SaveIn - FlushTask has no IN parameters beyond base Task
   chi::SaveTaskArchive save_in_archive(chi::MsgType::kSerializeIn);
+  chi::Future<chi::Task> orig_task_future(alloc, orig_task.template Cast<chi::Task>());
   container->SaveTask(chimaera::admin::Method::kFlush, save_in_archive,
-                      orig_task.template Cast<chi::Task>());
+                      orig_task_future);
 
   // Step 3: LoadIn
   std::string save_in_data = save_in_archive.GetData();
   chi::LoadTaskArchive load_in_archive(save_in_data);
-  hipc::FullPtr<chi::Task> loaded_in_task_ptr;
+  chi::Future<chi::Task> loaded_in_task_future;
   container->LoadTask(chimaera::admin::Method::kFlush, load_in_archive,
-                      loaded_in_task_ptr);
+                      loaded_in_task_future);
+  hipc::FullPtr<chi::Task> loaded_in_task_ptr = loaded_in_task_future.GetTaskPtr();
 
   REQUIRE(!loaded_in_task_ptr.IsNull());
   auto loaded_in_task = loaded_in_task_ptr.Cast<chimaera::admin::FlushTask>();
@@ -236,15 +242,17 @@ TEST_CASE("SaveTask and LoadTask - Admin FlushTask full flow",
 
   // Step 6: SaveOut
   chi::SaveTaskArchive save_out_archive(chi::MsgType::kSerializeOut);
+  chi::Future<chi::Task> loaded_in_task_future2(alloc, loaded_in_task.template Cast<chi::Task>());
   container->SaveTask(chimaera::admin::Method::kFlush, save_out_archive,
-                      loaded_in_task.template Cast<chi::Task>());
+                      loaded_in_task_future2);
 
   // Step 7: LoadOut
   std::string save_out_data = save_out_archive.GetData();
   chi::LoadTaskArchive load_out_archive(save_out_data);
-  hipc::FullPtr<chi::Task> loaded_out_task_ptr;
+  chi::Future<chi::Task> loaded_out_task_future;
   container->LoadTask(chimaera::admin::Method::kFlush, load_out_archive,
-                      loaded_out_task_ptr);
+                      loaded_out_task_future);
+  hipc::FullPtr<chi::Task> loaded_out_task_ptr = loaded_out_task_future.GetTaskPtr();
 
   REQUIRE(!loaded_out_task_ptr.IsNull());
   auto loaded_out_task = loaded_out_task_ptr.Cast<chimaera::admin::FlushTask>();
@@ -297,15 +305,17 @@ TEST_CASE("SaveTask and LoadTask - Admin SendTask full flow",
 
   // Step 2: SaveIn
   chi::SaveTaskArchive save_in_archive(chi::MsgType::kSerializeIn);
+  chi::Future<chi::Task> orig_task_future(alloc, orig_task.template Cast<chi::Task>());
   container->SaveTask(chimaera::admin::Method::kSend, save_in_archive,
-                      orig_task.template Cast<chi::Task>());
+                      orig_task_future);
 
   // Step 3: LoadIn
   std::string save_in_data = save_in_archive.GetData();
   chi::LoadTaskArchive load_in_archive(save_in_data);
-  hipc::FullPtr<chi::Task> loaded_in_task_ptr;
+  chi::Future<chi::Task> loaded_in_task_future;
   container->LoadTask(chimaera::admin::Method::kSend, load_in_archive,
-                      loaded_in_task_ptr);
+                      loaded_in_task_future);
+  hipc::FullPtr<chi::Task> loaded_in_task_ptr = loaded_in_task_future.GetTaskPtr();
 
   REQUIRE(!loaded_in_task_ptr.IsNull());
   auto loaded_in_task = loaded_in_task_ptr.Cast<chimaera::admin::SendTask>();
@@ -325,15 +335,17 @@ TEST_CASE("SaveTask and LoadTask - Admin SendTask full flow",
 
   // Step 6: SaveOut
   chi::SaveTaskArchive save_out_archive(chi::MsgType::kSerializeOut);
+  chi::Future<chi::Task> loaded_in_task_future2(alloc, loaded_in_task.template Cast<chi::Task>());
   container->SaveTask(chimaera::admin::Method::kSend, save_out_archive,
-                      loaded_in_task.template Cast<chi::Task>());
+                      loaded_in_task_future2);
 
   // Step 7: LoadOut
   std::string save_out_data = save_out_archive.GetData();
   chi::LoadTaskArchive load_out_archive(save_out_data);
-  hipc::FullPtr<chi::Task> loaded_out_task_ptr;
+  chi::Future<chi::Task> loaded_out_task_future;
   container->LoadTask(chimaera::admin::Method::kSend, load_out_archive,
-                      loaded_out_task_ptr);
+                      loaded_out_task_future);
+  hipc::FullPtr<chi::Task> loaded_out_task_ptr = loaded_out_task_future.GetTaskPtr();
 
   REQUIRE(!loaded_out_task_ptr.IsNull());
   auto loaded_out_task = loaded_out_task_ptr.Cast<chimaera::admin::SendTask>();
@@ -385,15 +397,17 @@ TEST_CASE("SaveTask and LoadTask - Admin DestroyPoolTask full flow",
 
   // Step 2: SaveIn
   chi::SaveTaskArchive save_in_archive(chi::MsgType::kSerializeIn);
+  chi::Future<chi::Task> orig_task_future(alloc, orig_task.template Cast<chi::Task>());
   container->SaveTask(chimaera::admin::Method::kDestroyPool, save_in_archive,
-                      orig_task.template Cast<chi::Task>());
+                      orig_task_future);
 
   // Step 3: LoadIn
   std::string save_in_data = save_in_archive.GetData();
   chi::LoadTaskArchive load_in_archive(save_in_data);
-  hipc::FullPtr<chi::Task> loaded_in_task_ptr;
+  chi::Future<chi::Task> loaded_in_task_future;
   container->LoadTask(chimaera::admin::Method::kDestroyPool, load_in_archive,
-                      loaded_in_task_ptr);
+                      loaded_in_task_future);
+  hipc::FullPtr<chi::Task> loaded_in_task_ptr = loaded_in_task_future.GetTaskPtr();
 
   REQUIRE(!loaded_in_task_ptr.IsNull());
   auto loaded_in_task =
@@ -411,15 +425,17 @@ TEST_CASE("SaveTask and LoadTask - Admin DestroyPoolTask full flow",
 
   // Step 6: SaveOut
   chi::SaveTaskArchive save_out_archive(chi::MsgType::kSerializeOut);
+  chi::Future<chi::Task> loaded_in_task_future2(alloc, loaded_in_task.template Cast<chi::Task>());
   container->SaveTask(chimaera::admin::Method::kDestroyPool, save_out_archive,
-                      loaded_in_task.template Cast<chi::Task>());
+                      loaded_in_task_future2);
 
   // Step 7: LoadOut
   std::string save_out_data = save_out_archive.GetData();
   chi::LoadTaskArchive load_out_archive(save_out_data);
-  hipc::FullPtr<chi::Task> loaded_out_task_ptr;
+  chi::Future<chi::Task> loaded_out_task_future;
   container->LoadTask(chimaera::admin::Method::kDestroyPool, load_out_archive,
-                      loaded_out_task_ptr);
+                      loaded_out_task_future);
+  hipc::FullPtr<chi::Task> loaded_out_task_ptr = loaded_out_task_future.GetTaskPtr();
 
   REQUIRE(!loaded_out_task_ptr.IsNull());
   auto loaded_out_task =

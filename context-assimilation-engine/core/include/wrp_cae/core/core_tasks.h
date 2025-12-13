@@ -59,25 +59,24 @@ struct ParseOmniTask : public chi::Task {
   OUT chi::priv::string error_message_;   // Output: Error message if failed
 
   // SHM constructor
-  explicit ParseOmniTask(CHI_MAIN_ALLOC_T *alloc)
-      : chi::Task(alloc),
-        serialized_ctx_(alloc),
+  ParseOmniTask()
+      : chi::Task(),
+        serialized_ctx_(CHI_IPC->GetMainAlloc()),
         num_tasks_scheduled_(0),
         result_code_(0),
-        error_message_(alloc) {}
+        error_message_(CHI_IPC->GetMainAlloc()) {}
 
   // Emplace constructor - accepts vector of AssimilationCtx and serializes internally
   explicit ParseOmniTask(
-      CHI_MAIN_ALLOC_T *alloc,
       const chi::TaskId &task_node,
       const chi::PoolId &pool_id,
       const chi::PoolQuery &pool_query,
       const std::vector<wrp_cae::core::AssimilationCtx> &contexts)
-      : chi::Task(alloc, task_node, pool_id, pool_query, Method::kParseOmni),
-        serialized_ctx_(alloc),
+      : chi::Task(task_node, pool_id, pool_query, Method::kParseOmni),
+        serialized_ctx_(CHI_IPC->GetMainAlloc()),
         num_tasks_scheduled_(0),
         result_code_(0),
-        error_message_(alloc) {
+        error_message_(CHI_IPC->GetMainAlloc()) {
     task_id_ = task_node;
     method_ = Method::kParseOmni;
     task_flags_.Clear();
@@ -89,7 +88,7 @@ struct ParseOmniTask : public chi::Task {
       cereal::BinaryOutputArchive ar(ss);
       ar(contexts);
     }
-    serialized_ctx_ = chi::priv::string(alloc, ss.str());
+    serialized_ctx_ = chi::priv::string(CHI_IPC->GetMainAlloc(), ss.str());
   }
 
   // Copy method for distributed execution (optional)

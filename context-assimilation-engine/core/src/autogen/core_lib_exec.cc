@@ -26,18 +26,24 @@ void Runtime::Init(const chi::PoolId &pool_id, const std::string &pool_name,
   client_ = Client(pool_id);
 }
 
-void Runtime::Run(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr, chi::RunContext& rctx) {
+void Runtime::Run(chi::u32 method, chi::Future<chi::Task>& task_future, chi::RunContext& rctx) {
   switch (method) {
     case Method::kCreate: {
-      Create(task_ptr.Cast<CreateTask>(), rctx);
+      // Extract task FullPtr from Future and cast to specific type
+      hipc::FullPtr<CreateTask> typed_task = task_future.GetTaskPtr().template Cast<CreateTask>();
+      Create(typed_task, rctx);
       break;
     }
     case Method::kDestroy: {
-      Destroy(task_ptr.Cast<DestroyTask>(), rctx);
+      // Extract task FullPtr from Future and cast to specific type
+      hipc::FullPtr<DestroyTask> typed_task = task_future.GetTaskPtr().template Cast<DestroyTask>();
+      Destroy(typed_task, rctx);
       break;
     }
     case Method::kParseOmni: {
-      ParseOmni(task_ptr.Cast<ParseOmniTask>(), rctx);
+      // Extract task FullPtr from Future and cast to specific type
+      hipc::FullPtr<ParseOmniTask> typed_task = task_future.GetTaskPtr().template Cast<ParseOmniTask>();
+      ParseOmni(typed_task, rctx);
       break;
     }
     default: {
@@ -48,20 +54,20 @@ void Runtime::Run(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr, chi::RunCo
 }
 
 void Runtime::Del(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr) {
-  // Use IPC manager to deallocate task from shared memory
+  // Use IPC manager to deallocate task from private memory
   auto* ipc_manager = CHI_IPC;
   
   switch (method) {
     case Method::kCreate: {
-      ipc_manager->DelTask(task_ptr.Cast<CreateTask>());
+      ipc_manager->DelTask(task_ptr.template Cast<CreateTask>());
       break;
     }
     case Method::kDestroy: {
-      ipc_manager->DelTask(task_ptr.Cast<DestroyTask>());
+      ipc_manager->DelTask(task_ptr.template Cast<DestroyTask>());
       break;
     }
     case Method::kParseOmni: {
-      ipc_manager->DelTask(task_ptr.Cast<ParseOmniTask>());
+      ipc_manager->DelTask(task_ptr.template Cast<ParseOmniTask>());
       break;
     }
     default: {
@@ -73,20 +79,20 @@ void Runtime::Del(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr) {
 }
 
 void Runtime::SaveTask(chi::u32 method, chi::SaveTaskArchive& archive, 
-                        hipc::FullPtr<chi::Task> task_ptr) {
+                        chi::Future<chi::Task>& task_future) {
   switch (method) {
     case Method::kCreate: {
-      auto typed_task = task_ptr.Cast<CreateTask>();
+      auto* typed_task = static_cast<CreateTask*>(task_future.get());
       archive << *typed_task;
       break;
     }
     case Method::kDestroy: {
-      auto typed_task = task_ptr.Cast<DestroyTask>();
+      auto* typed_task = static_cast<DestroyTask*>(task_future.get());
       archive << *typed_task;
       break;
     }
     case Method::kParseOmni: {
-      auto typed_task = task_ptr.Cast<ParseOmniTask>();
+      auto* typed_task = static_cast<ParseOmniTask*>(task_future.get());
       archive << *typed_task;
       break;
     }
@@ -98,34 +104,37 @@ void Runtime::SaveTask(chi::u32 method, chi::SaveTaskArchive& archive,
 }
 
 void Runtime::LoadTask(chi::u32 method, chi::LoadTaskArchive& archive, 
-                        hipc::FullPtr<chi::Task>& task_ptr) {
+                        chi::Future<chi::Task>& task_future) {
   auto* ipc_manager = CHI_IPC;
   
   switch (method) {
     case Method::kCreate: {
       // Allocate task using typed NewTask if not already allocated
-      if (task_ptr.IsNull()) {
-        task_ptr = ipc_manager->NewTask<CreateTask>().template Cast<chi::Task>();
+      if (task_future.IsNull()) {
+        auto new_task_ptr = ipc_manager->NewTask<CreateTask>();
+        task_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
-      auto typed_task = task_ptr.Cast<CreateTask>();
+      auto* typed_task = static_cast<CreateTask*>(task_future.get());
       archive >> *typed_task;
       break;
     }
     case Method::kDestroy: {
       // Allocate task using typed NewTask if not already allocated
-      if (task_ptr.IsNull()) {
-        task_ptr = ipc_manager->NewTask<DestroyTask>().template Cast<chi::Task>();
+      if (task_future.IsNull()) {
+        auto new_task_ptr = ipc_manager->NewTask<DestroyTask>();
+        task_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
-      auto typed_task = task_ptr.Cast<DestroyTask>();
+      auto* typed_task = static_cast<DestroyTask*>(task_future.get());
       archive >> *typed_task;
       break;
     }
     case Method::kParseOmni: {
       // Allocate task using typed NewTask if not already allocated
-      if (task_ptr.IsNull()) {
-        task_ptr = ipc_manager->NewTask<ParseOmniTask>().template Cast<chi::Task>();
+      if (task_future.IsNull()) {
+        auto new_task_ptr = ipc_manager->NewTask<ParseOmniTask>();
+        task_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
-      auto typed_task = task_ptr.Cast<ParseOmniTask>();
+      auto* typed_task = static_cast<ParseOmniTask*>(task_future.get());
       archive >> *typed_task;
       break;
     }
@@ -137,16 +146,17 @@ void Runtime::LoadTask(chi::u32 method, chi::LoadTaskArchive& archive,
 }
 
 void Runtime::LocalLoadIn(chi::u32 method, chi::LocalLoadTaskArchive& archive, 
-                           hipc::FullPtr<chi::Task>& task_ptr) {
+                           chi::Future<chi::Task>& task_future) {
   auto* ipc_manager = CHI_IPC;
   
   switch (method) {
     case Method::kCreate: {
       // Allocate task using typed NewTask if not already allocated
-      if (task_ptr.IsNull()) {
-        task_ptr = ipc_manager->NewTask<CreateTask>().template Cast<chi::Task>();
+      if (task_future.IsNull()) {
+        auto new_task_ptr = ipc_manager->NewTask<CreateTask>();
+        task_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
-      auto typed_task = task_ptr.Cast<CreateTask>();
+      auto* typed_task = static_cast<CreateTask*>(task_future.get());
       // Call BaseSerializeIn and SerializeIn using LocalLoadTaskArchive
       typed_task->BaseSerializeIn(archive);
       typed_task->SerializeIn(archive);
@@ -154,10 +164,11 @@ void Runtime::LocalLoadIn(chi::u32 method, chi::LocalLoadTaskArchive& archive,
     }
     case Method::kDestroy: {
       // Allocate task using typed NewTask if not already allocated
-      if (task_ptr.IsNull()) {
-        task_ptr = ipc_manager->NewTask<DestroyTask>().template Cast<chi::Task>();
+      if (task_future.IsNull()) {
+        auto new_task_ptr = ipc_manager->NewTask<DestroyTask>();
+        task_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
-      auto typed_task = task_ptr.Cast<DestroyTask>();
+      auto* typed_task = static_cast<DestroyTask*>(task_future.get());
       // Call BaseSerializeIn and SerializeIn using LocalLoadTaskArchive
       typed_task->BaseSerializeIn(archive);
       typed_task->SerializeIn(archive);
@@ -165,10 +176,11 @@ void Runtime::LocalLoadIn(chi::u32 method, chi::LocalLoadTaskArchive& archive,
     }
     case Method::kParseOmni: {
       // Allocate task using typed NewTask if not already allocated
-      if (task_ptr.IsNull()) {
-        task_ptr = ipc_manager->NewTask<ParseOmniTask>().template Cast<chi::Task>();
+      if (task_future.IsNull()) {
+        auto new_task_ptr = ipc_manager->NewTask<ParseOmniTask>();
+        task_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
-      auto typed_task = task_ptr.Cast<ParseOmniTask>();
+      auto* typed_task = static_cast<ParseOmniTask*>(task_future.get());
       // Call BaseSerializeIn and SerializeIn using LocalLoadTaskArchive
       typed_task->BaseSerializeIn(archive);
       typed_task->SerializeIn(archive);
@@ -182,24 +194,24 @@ void Runtime::LocalLoadIn(chi::u32 method, chi::LocalLoadTaskArchive& archive,
 }
 
 void Runtime::LocalSaveOut(chi::u32 method, chi::LocalSaveTaskArchive& archive, 
-                            hipc::FullPtr<chi::Task> task_ptr) {
+                            chi::Future<chi::Task>& task_future) {
   switch (method) {
     case Method::kCreate: {
-      auto typed_task = task_ptr.Cast<CreateTask>();
+      auto* typed_task = static_cast<CreateTask*>(task_future.get());
       // Call BaseSerializeOut and SerializeOut using LocalSaveTaskArchive
       typed_task->BaseSerializeOut(archive);
       typed_task->SerializeOut(archive);
       break;
     }
     case Method::kDestroy: {
-      auto typed_task = task_ptr.Cast<DestroyTask>();
+      auto* typed_task = static_cast<DestroyTask*>(task_future.get());
       // Call BaseSerializeOut and SerializeOut using LocalSaveTaskArchive
       typed_task->BaseSerializeOut(archive);
       typed_task->SerializeOut(archive);
       break;
     }
     case Method::kParseOmni: {
-      auto typed_task = task_ptr.Cast<ParseOmniTask>();
+      auto* typed_task = static_cast<ParseOmniTask*>(task_future.get());
       // Call BaseSerializeOut and SerializeOut using LocalSaveTaskArchive
       typed_task->BaseSerializeOut(archive);
       typed_task->SerializeOut(archive);
@@ -212,8 +224,8 @@ void Runtime::LocalSaveOut(chi::u32 method, chi::LocalSaveTaskArchive& archive,
   }
 }
 
-void Runtime::NewCopy(chi::u32 method, const hipc::FullPtr<chi::Task>& orig_task,
-                       hipc::FullPtr<chi::Task>& dup_task, bool deep) {
+void Runtime::NewCopy(chi::u32 method, chi::Future<chi::Task>& orig_future,
+                       chi::Future<chi::Task>& dup_future, bool deep) {
   auto* ipc_manager = CHI_IPC;
   if (!ipc_manager) {
     return;
@@ -221,50 +233,47 @@ void Runtime::NewCopy(chi::u32 method, const hipc::FullPtr<chi::Task>& orig_task
   
   switch (method) {
     case Method::kCreate: {
-      // Allocate new task using SHM default constructor
-      auto typed_task = ipc_manager->NewTask<CreateTask>();
-      if (!typed_task.IsNull()) {
-        // Copy base Task fields first
-        typed_task.template Cast<chi::Task>()->Copy(orig_task);
-        // Then copy task-specific fields
-        typed_task->Copy(orig_task.Cast<CreateTask>());
-        // Cast to base Task type for return
-        dup_task = typed_task.template Cast<chi::Task>();
+      // Allocate new task using standard new (returns FullPtr with null allocator)
+      auto new_task_ptr = ipc_manager->NewTask<CreateTask>();
+      if (!new_task_ptr.IsNull()) {
+        // Copy task fields (includes base Task fields)
+        auto task_typed = orig_future.GetTaskPtr().template Cast<CreateTask>();
+        new_task_ptr->Copy(task_typed);
+        // Create Future for the new task
+        dup_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
       break;
     }
     case Method::kDestroy: {
-      // Allocate new task using SHM default constructor
-      auto typed_task = ipc_manager->NewTask<DestroyTask>();
-      if (!typed_task.IsNull()) {
-        // Copy base Task fields first
-        typed_task.template Cast<chi::Task>()->Copy(orig_task);
-        // Then copy task-specific fields
-        typed_task->Copy(orig_task.Cast<DestroyTask>());
-        // Cast to base Task type for return
-        dup_task = typed_task.template Cast<chi::Task>();
+      // Allocate new task using standard new (returns FullPtr with null allocator)
+      auto new_task_ptr = ipc_manager->NewTask<DestroyTask>();
+      if (!new_task_ptr.IsNull()) {
+        // Copy task fields (includes base Task fields)
+        auto task_typed = orig_future.GetTaskPtr().template Cast<DestroyTask>();
+        new_task_ptr->Copy(task_typed);
+        // Create Future for the new task
+        dup_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
       break;
     }
     case Method::kParseOmni: {
-      // Allocate new task using SHM default constructor
-      auto typed_task = ipc_manager->NewTask<ParseOmniTask>();
-      if (!typed_task.IsNull()) {
-        // Copy base Task fields first
-        typed_task.template Cast<chi::Task>()->Copy(orig_task);
-        // Then copy task-specific fields
-        typed_task->Copy(orig_task.Cast<ParseOmniTask>());
-        // Cast to base Task type for return
-        dup_task = typed_task.template Cast<chi::Task>();
+      // Allocate new task using standard new (returns FullPtr with null allocator)
+      auto new_task_ptr = ipc_manager->NewTask<ParseOmniTask>();
+      if (!new_task_ptr.IsNull()) {
+        // Copy task fields (includes base Task fields)
+        auto task_typed = orig_future.GetTaskPtr().template Cast<ParseOmniTask>();
+        new_task_ptr->Copy(task_typed);
+        // Create Future for the new task
+        dup_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr.template Cast<chi::Task>());
       }
       break;
     }
     default: {
       // For unknown methods, create base Task copy
-      auto typed_task = ipc_manager->NewTask<chi::Task>();
-      if (!typed_task.IsNull()) {
-        typed_task->Copy(orig_task);
-        dup_task = typed_task;  // Already chi::Task type
+      auto new_task_ptr = ipc_manager->NewTask<chi::Task>();
+      if (!new_task_ptr.IsNull()) {
+        new_task_ptr->Copy(orig_future.GetTaskPtr());
+        dup_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr);
       }
       break;
     }
@@ -273,39 +282,36 @@ void Runtime::NewCopy(chi::u32 method, const hipc::FullPtr<chi::Task>& orig_task
   (void)deep;    // Deep copy parameter reserved for future use
 }
 
-void Runtime::Aggregate(chi::u32 method, hipc::FullPtr<chi::Task> origin_task,
-                         hipc::FullPtr<chi::Task> replica_task) {
+void Runtime::Aggregate(chi::u32 method, chi::Future<chi::Task>& origin_future,
+                         chi::Future<chi::Task>& replica_future) {
   switch (method) {
     case Method::kCreate: {
-      auto typed_origin = origin_task.Cast<CreateTask>();
-      auto typed_replica = replica_task.Cast<CreateTask>();
-      // Call base Task aggregate to propagate return codes
-      origin_task->Aggregate(replica_task);
-      // Use SFINAE-based macro to call task-specific Aggregate if available, otherwise Copy
-      CHI_AGGREGATE_OR_COPY(typed_origin, typed_replica);
+      // Get typed tasks for Aggregate call
+      auto typed_origin = origin_future.GetTaskPtr().template Cast<CreateTask>();
+      auto typed_replica = replica_future.GetTaskPtr().template Cast<CreateTask>();
+      // Call Aggregate (uses task-specific Aggregate if available, otherwise base Task::Aggregate)
+      typed_origin->Aggregate(typed_replica);
       break;
     }
     case Method::kDestroy: {
-      auto typed_origin = origin_task.Cast<DestroyTask>();
-      auto typed_replica = replica_task.Cast<DestroyTask>();
-      // Call base Task aggregate to propagate return codes
-      origin_task->Aggregate(replica_task);
-      // Use SFINAE-based macro to call task-specific Aggregate if available, otherwise Copy
-      CHI_AGGREGATE_OR_COPY(typed_origin, typed_replica);
+      // Get typed tasks for Aggregate call
+      auto typed_origin = origin_future.GetTaskPtr().template Cast<DestroyTask>();
+      auto typed_replica = replica_future.GetTaskPtr().template Cast<DestroyTask>();
+      // Call Aggregate (uses task-specific Aggregate if available, otherwise base Task::Aggregate)
+      typed_origin->Aggregate(typed_replica);
       break;
     }
     case Method::kParseOmni: {
-      auto typed_origin = origin_task.Cast<ParseOmniTask>();
-      auto typed_replica = replica_task.Cast<ParseOmniTask>();
-      // Call base Task aggregate to propagate return codes
-      origin_task->Aggregate(replica_task);
-      // Use SFINAE-based macro to call task-specific Aggregate if available, otherwise Copy
-      CHI_AGGREGATE_OR_COPY(typed_origin, typed_replica);
+      // Get typed tasks for Aggregate call
+      auto typed_origin = origin_future.GetTaskPtr().template Cast<ParseOmniTask>();
+      auto typed_replica = replica_future.GetTaskPtr().template Cast<ParseOmniTask>();
+      // Call Aggregate (uses task-specific Aggregate if available, otherwise base Task::Aggregate)
+      typed_origin->Aggregate(typed_replica);
       break;
     }
     default: {
       // For unknown methods, use base Task Aggregate (which also propagates return codes)
-      origin_task->Aggregate(replica_task);
+      origin_future->Aggregate(replica_future.GetTaskPtr());
       break;
     }
   }
