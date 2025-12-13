@@ -192,6 +192,11 @@ function(add_cuda_executable TARGET DO_COPY)
         POSITION_INDEPENDENT_CODE ON
     )
 
+    # When copying sources, we need to add the include path back to the original source directory
+    if(${DO_COPY})
+        target_include_directories(${TARGET} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    endif()
+
     target_compile_options(${TARGET} PUBLIC
         $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
 endfunction()

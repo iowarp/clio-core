@@ -292,9 +292,15 @@ function(hshm_target_compile_definitions target)
         HSHM_DEBUG_LOCK=$<BOOL:${HSHM_DEBUG_LOCK}>
         HSHM_DEFAULT_ALLOC_T=hipc::ThreadLocalAllocator
         HSHM_ENABLE_DLL_EXPORT=$<BOOL:${BUILD_SHARED_LIBS}>
-        HSHM_ENABLE_CUDA=$<BOOL:${HSHM_ENABLE_CUDA}>
-        HSHM_ENABLE_ROCM=$<BOOL:${HSHM_ENABLE_ROCM}>
     )
+
+    # Only add CUDA/ROCM definitions for GPU targets, not host targets
+    if(NOT target STREQUAL "hermes_shm_host" AND NOT target STREQUAL "cxx")
+        list(APPEND common_definitions
+            HSHM_ENABLE_CUDA=$<BOOL:${HSHM_ENABLE_CUDA}>
+            HSHM_ENABLE_ROCM=$<BOOL:${HSHM_ENABLE_ROCM}>
+        )
+    endif()
 
     if(target_type STREQUAL "INTERFACE_LIBRARY")
         target_compile_definitions(${target} INTERFACE ${common_definitions})
@@ -302,8 +308,6 @@ function(hshm_target_compile_definitions target)
         target_compile_definitions(${target} PUBLIC ${common_definitions})
         target_compile_definitions(${target} PRIVATE
             HSHM_ENABLE_DLL_EXPORT=$<BOOL:${BUILD_SHARED_LIBS}>
-            HSHM_ENABLE_CUDA=$<BOOL:${HSHM_ENABLE_CUDA}>
-            HSHM_ENABLE_ROCM=$<BOOL:${HSHM_ENABLE_ROCM}>
         )
     endif()
 endfunction()

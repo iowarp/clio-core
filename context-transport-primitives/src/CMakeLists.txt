@@ -56,6 +56,7 @@ if(HSHM_ENABLE_CUDA)
         $<INSTALL_INTERFACE:include>
     )
     hshm_target_compile_definitions(cudacxx)
+    add_library(hshm::cuda_cxx ALIAS cudacxx)
     list(APPEND HSHM_LIBS cudacxx)
 endif()
 

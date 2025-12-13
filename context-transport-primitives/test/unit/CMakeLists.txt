@@ -25,6 +25,10 @@ if(HSHM_ENABLE_ENCRYPT)
     add_subdirectory(encrypt)
 endif()
 
+if(HSHM_ENABLE_CUDA OR HSHM_ENABLE_ROCM)
+    add_subdirectory(gpu)
+endif()
+
 # Lightbeam tests disabled - depend on deleted code
 # if(HSHM_ENABLE_ZMQ)
 #     add_subdirectory(lightbeam)

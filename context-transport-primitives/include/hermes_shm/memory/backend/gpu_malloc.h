@@ -1,6 +1,14 @@
-//
-// Created by llogan on 25/10/24.
-//
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+ * Distributed under BSD 3-Clause license.                                   *
+ * Copyright by The HDF Group.                                               *
+ * Copyright by the Illinois Institute of Technology.                        *
+ * All rights reserved.                                                      *
+ *                                                                           *
+ * This file is part of Hermes. The full Hermes copyright notice, including  *
+ * terms governing use, modification, and redistribution, is contained in    *
+ * the COPYING file, which can be found at the top directory. If you do not  *
+ * have access to the file, you may request a copy from help@hdfgroup.org.   *
+ * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 
 #ifndef GPU_MALLOC_H
 #define GPU_MALLOC_H
@@ -18,15 +26,30 @@
 
 namespace hshm::ipc {
 
-struct GpuMallocHeader : public MemoryBackendHeader {
-  GpuIpcMemHandle ipc_;
+/**
+ * Header extension for GpuMalloc backend
+ * Stores IPC handle for GPU memory sharing
+ */
+struct GpuMallocPrivateHeader {
+  GpuIpcMemHandle ipc_handle_;  // IPC handle for data_ buffer
 };
 
+/**
+ * GPU-only memory backend using cudaMalloc/hipMalloc
+ *
+ * Memory layout:
+ *   - Header (MemoryBackendHeader): Allocated with regular malloc on host
+ *   - Private header (GpuMallocPrivateHeader): Also allocated with malloc, stores IPC handle
+ *   - Data: Allocated with cudaMalloc/hipMalloc on GPU
+ *
+ * The header and private header are stored in regular host memory for metadata access,
+ * while the actual data buffer is pure GPU memory accessible via IPC.
+ */
 class GpuMalloc : public MemoryBackend, public UrlMemoryBackend {
  protected:
   File fd_;
   std::string url_;
-  size_t total_size_;
+  size_t metadata_size_;  // Size of shared memory for metadata only
 
  public:
   /** Constructor */
@@ -35,34 +58,39 @@ class GpuMalloc : public MemoryBackend, public UrlMemoryBackend {
 
   /** Destructor */
   ~GpuMalloc() {
+    if (IsOwner()) {
       _Destroy();
     } else {
       _Detach();
     }
   }
 
-  /** Initialize backend */
-  bool shm_init(const MemoryBackendId &backend_id, size_t accel_data_size,
+  /**
+   * Initialize backend with GPU memory
+   *
+   * @param backend_id Unique identifier for this backend
+   * @param data_size Size of GPU data buffer
+   * @param url POSIX shared memory name for metadata sharing
+   * @param gpu_id GPU device ID
+   * @return true on success, false on failure
+   */
+  bool shm_init(const MemoryBackendId &backend_id, size_t data_size,
                 const std::string &url, int gpu_id = 0) {
-    // Enforce minimum backend size of 1MB
-    constexpr size_t kMinBackendSize = 1024 * 1024;  // 1MB
-    if (accel_data_size < kMinBackendSize) {
-      accel_data_size = kMinBackendSize;
+    // Enforce minimum data size of 1MB
+    constexpr size_t kMinDataSize = 1024 * 1024;  // 1MB
+    if (data_size < kMinDataSize) {
+      data_size = kMinDataSize;
     }
 
     // Initialize flags before calling methods that use it
     flags_.Clear();
 
-    // Calculate sizes: header + md section + alignment
-    constexpr size_t kAlignment = 4096;  // 4KB alignment
-    size_t header_size = sizeof(GpuMallocHeader);
-    size_t md_size = header_size;  // md section stores the header
-    size_t aligned_md_size = ((md_size + kAlignment - 1) / kAlignment) * kAlignment;
-    total_size_ = aligned_md_size;  // GPU data is separate, not in shared memory
+    // Calculate metadata size: backend header + private header
+    metadata_size_ = 2 * kBackendHeaderSize;
 
-    // Create shared memory for metadata
+    // Create shared memory for metadata only
     SystemInfo::DestroySharedMemory(url);
-    if (!SystemInfo::CreateNewSharedMemory(fd_, url, total_size_)) {
+    if (!SystemInfo::CreateNewSharedMemory(fd_, url, metadata_size_)) {
       char *err_buf = strerror(errno);
       HILOG(kError, "shm_open failed: {}", err_buf);
       return false;
@@ -70,33 +98,51 @@ class GpuMalloc : public MemoryBackend, public UrlMemoryBackend {
     url_ = url;
 
     // Map shared memory for metadata
-    char *ptr = reinterpret_cast<char *>(
-        SystemInfo::MapSharedMemory(fd_, total_size_, 0));
-    if (!ptr) {
+    region_ = reinterpret_cast<char *>(
+        SystemInfo::MapSharedMemory(fd_, metadata_size_, 0));
+    if (!region_) {
       HSHM_THROW_ERROR(SHMEM_CREATE_FAILED);
     }
 
-    // Layout: [GpuMallocHeader | padding to 4KB]
-    header_ = reinterpret_cast<MemoryBackendHeader *>(ptr);
-    GpuMallocHeader *gpu_header = reinterpret_cast<GpuMallocHeader *>(ptr);
-    new (gpu_header) GpuMallocHeader();
-    gpu_header->id_ = backend_id;
-    gpu_header->md_size_ = md_size;
-    gpu_header->accel_data_size_ = accel_data_size;
-    gpu_header->accel_id_ = gpu_id;
-    gpu_header->flags_.Clear();
+    // Layout in region_: [MemoryBackendHeader | GpuMallocPrivateHeader]
+    header_ = reinterpret_cast<MemoryBackendHeader *>(region_);
+    GpuMallocPrivateHeader *priv_header =
+        reinterpret_cast<GpuMallocPrivateHeader *>(region_ + kBackendHeaderSize);
 
-    // md_ points to the header itself (metadata for process connection)
-    md_ = ptr;
-    md_size_ = md_size;
+    // Initialize headers
+    new (header_) MemoryBackendHeader();
+    new (priv_header) GpuMallocPrivateHeader();
 
-    // Allocate GPU memory separately
-    accel_data_ = _Map(accel_data_size);
-    accel_data_size_ = accel_data_size;
-    accel_id_ = gpu_id;
+    // Set backend header fields
+    header_->id_ = backend_id;
+    header_->backend_size_ = metadata_size_ + data_size;  // Total logical size
+    header_->data_capacity_ = data_size;
+    header_->data_id_ = gpu_id;
+    header_->priv_header_off_ = kBackendHeaderSize;
+    header_->flags_.Clear();
 
-    // Store IPC handle for GPU memory in shared metadata
-    GpuApi::GetIpcMemHandle(gpu_header->ipc_, (void *)accel_data_);
+    // Copy to local object
+    id_ = backend_id;
+    backend_size_ = header_->backend_size_;
+    data_capacity_ = data_size;
+    data_id_ = gpu_id;
+    priv_header_off_ = kBackendHeaderSize;
+
+    // Allocate GPU memory separately using cudaMalloc/hipMalloc
+    data_ = GpuApi::Malloc<char>(data_size);
+    if (!data_) {
+      HILOG(kError, "Failed to allocate GPU memory");
+      SystemInfo::UnmapMemory(region_, metadata_size_);
+      SystemInfo::CloseSharedMemory(fd_);
+      return false;
+    }
+
+    // Get IPC handle for GPU memory and store in private header
+    GpuApi::GetIpcMemHandle(priv_header->ipc_handle_, (void *)data_);
+
+    // Set GPU-only flag
+    SetGpuOnly();
+    header_->flags_ = flags_;
 
     // Mark this process as the owner of the backend
     SetOwner();
@@ -104,7 +150,12 @@ class GpuMalloc : public MemoryBackend, public UrlMemoryBackend {
     return true;
   }
 
-  /** Deserialize the backend */
+  /**
+   * Attach to existing GPU memory backend
+   *
+   * @param url POSIX shared memory name for metadata
+   * @return true on success, false on failure
+   */
   bool shm_attach(const std::string &url) {
     flags_.Clear();
 
@@ -115,29 +166,31 @@ class GpuMalloc : public MemoryBackend, public UrlMemoryBackend {
     }
     url_ = url;
 
-    // Map just the header to get size information
-    constexpr size_t kAlignment = 4096;
-    char *ptr = reinterpret_cast<char *>(
-        SystemInfo::MapSharedMemory(fd_, kAlignment, 0));
-    if (!ptr) {
+    // Map metadata region
+    metadata_size_ = 2 * kBackendHeaderSize;
+    region_ = reinterpret_cast<char *>(
+        SystemInfo::MapSharedMemory(fd_, metadata_size_, 0));
+    if (!region_) {
+      SystemInfo::CloseSharedMemory(fd_);
       return false;
     }
 
-    // Calculate total size for metadata
-    GpuMallocHeader *gpu_header = reinterpret_cast<GpuMallocHeader *>(ptr);
-    size_t md_size = gpu_header->md_size_;
-    size_t aligned_md_size = ((md_size + kAlignment - 1) / kAlignment) * kAlignment;
-    total_size_ = aligned_md_size;
+    // Get pointers to headers
+    header_ = reinterpret_cast<MemoryBackendHeader *>(region_);
+    GpuMallocPrivateHeader *priv_header =
+        reinterpret_cast<GpuMallocPrivateHeader *>(region_ + kBackendHeaderSize);
 
-    // Set up pointers
-    header_ = reinterpret_cast<MemoryBackendHeader *>(ptr);
-    md_ = ptr;
-    md_size_ = md_size;
+    // Copy header fields to local object
+    id_ = header_->id_;
+    backend_size_ = header_->backend_size_;
+    data_capacity_ = header_->data_capacity_;
+    data_id_ = header_->data_id_;
+    priv_header_off_ = header_->priv_header_off_;
+    flags_ = header_->flags_;
 
     // Open GPU memory from IPC handle
-    accel_data_size_ = gpu_header->accel_data_size_;
-    accel_id_ = gpu_header->accel_id_;
-    GpuApi::OpenIpcMemHandle(gpu_header->ipc_, &accel_data_);
+    // Open IPC handle for GPU memory
+    GpuApi::OpenIpcMemHandle(priv_header->ipc_handle_, (void **)&data_);
 
     // Mark this process as NOT the owner (attaching to existing backend)
     UnsetOwner();
@@ -152,41 +205,48 @@ class GpuMalloc : public MemoryBackend, public UrlMemoryBackend {
   void shm_destroy() { _Destroy(); }
 
  protected:
-  /** Map shared memory */
-  template <typename T = char>
-  T *_Map(size_t size) {
-    return GpuApi::Malloc<T>(size);
-  }
-
-  /** Unmap shared memory */
+  /** Detach from memory */
   void _Detach() {
+    if (!flags_.Any(MEMORY_BACKEND_INITIALIZED)) {
       return;
     }
+
+    // Clear GPU memory pointer (don't free, we're not the owner)
+    data_ = nullptr;
+
     // Unmap the metadata region
-    if (md_) {
-      SystemInfo::UnmapMemory(reinterpret_cast<void *>(md_), total_size_);
+    if (region_) {
+      SystemInfo::UnmapMemory(region_, metadata_size_);
+      region_ = nullptr;
+      header_ = nullptr;
     }
-    // Close IPC handle for GPU memory
-    if (accel_data_) {
-      GpuApi::CloseIpcMemHandle(accel_data_);
-    }
+
     SystemInfo::CloseSharedMemory(fd_);
+    flags_.UnsetBits(MEMORY_BACKEND_INITIALIZED);
   }
 
-  /** Destroy shared memory */
+  /** Destroy memory */
   void _Destroy() {
+    if (!flags_.Any(MEMORY_BACKEND_INITIALIZED)) {
       return;
     }
-    // Free GPU memory
-    if (accel_data_) {
-      GpuApi::Free(accel_data_);
+
+    // Free GPU memory (owner only)
+    if (data_) {
+      GpuApi::Free(data_);
+      data_ = nullptr;
     }
+
     // Unmap and destroy shared metadata
-    if (md_) {
-      SystemInfo::UnmapMemory(reinterpret_cast<void *>(md_), total_size_);
+    if (region_) {
+      SystemInfo::UnmapMemory(region_, metadata_size_);
+      region_ = nullptr;
+      header_ = nullptr;
     }
+
     SystemInfo::CloseSharedMemory(fd_);
     SystemInfo::DestroySharedMemory(url_);
+    flags_.UnsetBits(MEMORY_BACKEND_INITIALIZED);
   }
 };
 

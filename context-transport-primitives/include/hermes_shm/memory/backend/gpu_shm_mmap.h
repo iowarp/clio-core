@@ -30,11 +30,21 @@
 
 namespace hshm::ipc {
 
+/**
+ * GPU-accessible shared memory backend using POSIX shared memory with CUDA/ROCm IPC
+ *
+ * Similar to PosixShmMmap but registers memory with GPU for IPC access.
+ * Memory layout in file:
+ *   [4KB backend header] [4KB shared header] [data]
+ *
+ * Memory layout in virtual memory (region_):
+ *   [4KB private header] [4KB shared header] [data]
+ */
 class GpuShmMmap : public MemoryBackend, public UrlMemoryBackend {
  protected:
   File fd_;
   std::string url_;
-  size_t total_size_;
+  GpuIpcMemHandle ipc_handle_;  // IPC handle for GPU memory sharing
 
  public:
   /** Constructor */
@@ -45,6 +55,7 @@ class GpuShmMmap : public MemoryBackend, public UrlMemoryBackend {
   HSHM_CROSS_FUN
   ~GpuShmMmap() {
 #if HSHM_IS_HOST
+    if (IsOwner()) {
       _Destroy();
     } else {
       _Detach();
@@ -52,71 +63,95 @@ class GpuShmMmap : public MemoryBackend, public UrlMemoryBackend {
 #endif
   }
 
-  /** Initialize shared memory */
-  bool shm_init(const MemoryBackendId& backend_id, size_t size,
-                const std::string& url, int gpu_id = 0) {
+  /**
+   * Initialize backend with GPU-accessible shared memory
+   *
+   * @param backend_id Unique identifier for this backend
+   * @param backend_size Total size of the region (including headers and data)
+   * @param url POSIX shared memory object name (e.g., "/my_gpu_shm")
+   * @param gpu_id GPU device ID to register memory with
+   * @return true on success, false on failure
+   */
+  bool shm_init(const MemoryBackendId &backend_id, size_t backend_size,
+                const std::string &url, int gpu_id = 0) {
     // Enforce minimum backend size of 1MB
     constexpr size_t kMinBackendSize = 1024 * 1024;  // 1MB
-    if (size < kMinBackendSize) {
-      size = kMinBackendSize;
+    if (backend_size < kMinBackendSize) {
+      backend_size = kMinBackendSize;
     }
 
-    // Initialize flags before calling methods that use it
-    flags_.Clear();
+    // File layout: [4KB backend header] [4KB shared header] [data]
+    size_t shared_size = backend_size - kBackendHeaderSize;
 
-    // Calculate sizes: header + md section + alignment + data section
-    constexpr size_t kAlignment = 4096;  // 4KB alignment
-    size_t header_size = sizeof(MemoryBackendHeader);
-    size_t md_size = header_size;  // md section stores the header
-    size_t aligned_md_size = ((md_size + kAlignment - 1) / kAlignment) * kAlignment;
-    total_size_ = aligned_md_size + size;
-
-    // Create shared memory
+    // Create shared memory object with entire backend size
     SystemInfo::DestroySharedMemory(url);
-    if (!SystemInfo::CreateNewSharedMemory(fd_, url, total_size_)) {
+    if (!SystemInfo::CreateNewSharedMemory(fd_, url, backend_size)) {
       char *err_buf = strerror(errno);
       HILOG(kError, "shm_open failed: {}", err_buf);
       return false;
     }
     url_ = url;
 
-    // Map the entire shared memory region as one contiguous block
-    char *ptr = reinterpret_cast<char *>(
-        SystemInfo::MapSharedMemory(fd_, total_size_, 0));
-    if (!ptr) {
-      HSHM_THROW_ERROR(SHMEM_CREATE_FAILED);
+    // Map the first 4KB (backend header) using MapShared
+    header_ = reinterpret_cast<MemoryBackendHeader *>(
+        SystemInfo::MapSharedMemory(fd_, kBackendHeaderSize, 0));
+    if (!header_) {
+      HILOG(kError, "Failed to map header");
+      SystemInfo::CloseSharedMemory(fd_);
+      return false;
     }
 
-    // Layout: [MemoryBackendHeader | padding to 4KB] [accel_data]
-    header_ = reinterpret_cast<MemoryBackendHeader *>(ptr);
+    // Map the entire region using MapMixed
+    // Private portion: 4KB (private header)
+    // Shared portion: backend_size - 4KB (shared header + data)
+    // Offset into file: 0 (maps entire file starting from offset 0)
+    region_ = reinterpret_cast<char *>(
+        SystemInfo::MapMixedMemory(fd_, kBackendHeaderSize, shared_size, 0));
+    if (!region_) {
+      HILOG(kError, "Failed to create mixed mapping");
+      SystemInfo::UnmapMemory(header_, kBackendHeaderSize);
+      SystemInfo::CloseSharedMemory(fd_);
+      return false;
+    }
+
+    // Calculate pointers
+    char *shared_header_ptr = region_ + kBackendHeaderSize;
+    data_ = shared_header_ptr + kBackendHeaderSize;
+
+    // Initialize backend header fields
+    id_ = backend_id;
+    backend_size_ = backend_size;
+    data_capacity_ = backend_size - 2 * kBackendHeaderSize;
+    data_id_ = gpu_id;
+    priv_header_off_ = static_cast<size_t>(data_ - region_);
+    flags_.Clear();
+
+    // Set GPU-only flag since this backend requires GPU IPC
+    SetGpuOnly();
+
+    // Copy all header fields to shared header
     new (header_) MemoryBackendHeader();
-    header_->id_ = backend_id;
-    header_->md_size_ = md_size;
-    header_->accel_data_size_ = size;
-    header_->accel_id_ = gpu_id;
-    header_->flags_.Clear();
+    (*header_) = (const MemoryBackendHeader&)*this;
 
-    // md_ points to the header itself (metadata for process connection)
-    md_ = ptr;
-    md_size_ = md_size;
+    // Register memory with GPU for IPC
+    _RegisterWithGpu(region_, backend_size);
 
-    // accel_data_ starts at 4KB aligned boundary after md section
-    accel_data_ = ptr + aligned_md_size;
-    accel_data_size_ = size;
-    accel_id_ = gpu_id;
+    // Get IPC handle for this memory region
+    GpuApi::GetIpcMemHandle(ipc_handle_, (void *)data_);
 
-    // Register both metadata and data sections with GPU
-    Register(md_, aligned_md_size);
-    Register(accel_data_, size);
-
-    // Mark this process as the owner of the backend
+    // Mark this process as the owner
     SetOwner();
 
     return true;
   }
 
-  /** SHM deserialize */
-  bool shm_attach(const std::string& url) {
+  /**
+   * Attach to existing GPU-accessible shared memory
+   *
+   * @param url POSIX shared memory object name
+   * @return true on success, false on failure
+   */
+  bool shm_attach(const std::string &url) {
     flags_.Clear();
 
     if (!SystemInfo::OpenSharedMemory(fd_, url)) {
@@ -126,76 +161,105 @@ class GpuShmMmap : public MemoryBackend, public UrlMemoryBackend {
     }
     url_ = url;
 
-    // First, map just the header to get the size information
-    constexpr size_t kAlignment = 4096;
-    char *ptr = reinterpret_cast<char *>(
-        SystemInfo::MapSharedMemory(fd_, kAlignment, 0));
-    if (!ptr) {
+    // Map the first 4KB (backend header) to read size information
+    header_ = reinterpret_cast<MemoryBackendHeader *>(
+        SystemInfo::MapSharedMemory(fd_, kBackendHeaderSize, 0));
+    if (!header_) {
+      HILOG(kError, "Failed to map header");
+      SystemInfo::CloseSharedMemory(fd_);
       return false;
     }
 
-    // Calculate total size based on header information
-    header_ = reinterpret_cast<MemoryBackendHeader *>(ptr);
-    size_t md_size = header_->md_size_;
-    size_t aligned_md_size = ((md_size + kAlignment - 1) / kAlignment) * kAlignment;
-    total_size_ = aligned_md_size + header_->accel_data_size_;
+    // Get backend size from header
+    size_t backend_size = header_->backend_size_;
+    size_t shared_size = backend_size - kBackendHeaderSize;
 
-    // Unmap the header
-    SystemInfo::UnmapMemory(ptr, kAlignment);
-
-    // Map the entire region
-    ptr = reinterpret_cast<char *>(
-        SystemInfo::MapSharedMemory(fd_, total_size_, 0));
-    if (!ptr) {
+    // Map the entire region using MapMixed
+    region_ = reinterpret_cast<char *>(
+        SystemInfo::MapMixedMemory(fd_, kBackendHeaderSize, shared_size, 0));
+    if (!region_) {
+      HILOG(kError, "Failed to create mixed mapping");
+      SystemInfo::UnmapMemory(header_, kBackendHeaderSize);
+      SystemInfo::CloseSharedMemory(fd_);
       return false;
     }
 
-    // Set up pointers
-    header_ = reinterpret_cast<MemoryBackendHeader *>(ptr);
-    md_ = ptr;
-    md_size_ = header_->md_size_;
-    accel_data_ = ptr + aligned_md_size;
-    accel_data_size_ = header_->accel_data_size_;
-    accel_id_ = header_->accel_id_;
+    // Calculate pointers
+    char *shared_header_ptr = region_ + kBackendHeaderSize;
+    data_ = shared_header_ptr + kBackendHeaderSize;
 
-    // Register both metadata and data sections with GPU
-    Register(md_, aligned_md_size);
-    Register(accel_data_, accel_data_size_);
+    // Copy header fields to local object
+    id_ = header_->id_;
+    backend_size_ = header_->backend_size_;
+    data_capacity_ = header_->data_capacity_;
+    data_id_ = header_->data_id_;
+    priv_header_off_ = header_->priv_header_off_;
+    flags_ = header_->flags_;
 
-    // Mark this process as NOT the owner (attaching to existing backend)
+    // Register memory with GPU for IPC
+    _RegisterWithGpu(region_, backend_size);
+
+    // Mark this process as NOT the owner
     UnsetOwner();
 
     return true;
   }
 
-  /** Map shared memory */
-  template <typename T>
-  void Register(T* ptr, size_t size) {
+  /** Detach from shared memory */
+  void shm_detach() { _Detach(); }
+
+  /** Destroy shared memory */
+  void shm_destroy() { _Destroy(); }
+
+ protected:
+  /**
+   * Register memory region with GPU for IPC access
+   */
+  void _RegisterWithGpu(void *ptr, size_t size) {
     GpuApi::RegisterHostMemory(ptr, size);
   }
 
-  /** Detach shared memory */
+  /**
+   * Unregister memory region from GPU
+   */
+  void _UnregisterFromGpu(void *ptr) {
+    GpuApi::UnregisterHostMemory(ptr);
+  }
+
+  /** Detach from shared memory */
   void _Detach() {
+    if (!flags_.Any(MEMORY_BACKEND_INITIALIZED)) {
       return;
     }
-    // Unregister GPU memory
-    if (md_) {
-      GpuApi::UnregisterHostMemory(md_);
+
+    // Unregister from GPU
+    if (region_) {
+      _UnregisterFromGpu(region_);
     }
-    if (accel_data_ && accel_data_ != md_) {
-      GpuApi::UnregisterHostMemory(accel_data_);
+
+    // Unmap memory
+    if (region_) {
+      SystemInfo::UnmapMemory(region_, backend_size_);
+      region_ = nullptr;
+      data_ = nullptr;
     }
-    // Unmap the entire contiguous region
     if (header_) {
-      SystemInfo::UnmapMemory(reinterpret_cast<void *>(header_), total_size_);
+      SystemInfo::UnmapMemory(header_, kBackendHeaderSize);
+      header_ = nullptr;
     }
+
+    // Close file descriptor
     SystemInfo::CloseSharedMemory(fd_);
+
+    flags_.UnsetBits(MEMORY_BACKEND_INITIALIZED);
   }
 
   /** Destroy shared memory */
   void _Destroy() {
+    if (!flags_.Any(MEMORY_BACKEND_INITIALIZED)) {
       return;
     }
+
     _Detach();
     SystemInfo::DestroySharedMemory(url_);
   }

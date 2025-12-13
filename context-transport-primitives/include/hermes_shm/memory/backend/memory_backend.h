@@ -134,6 +134,7 @@ struct MemoryBackendHeader {
 
 #define MEMORY_BACKEND_INITIALIZED BIT_OPT(u64, 0)
 #define MEMORY_BACKEND_OWNED BIT_OPT(u64, 1)
+#define MEMORY_BACKEND_GPU_ONLY BIT_OPT(u64, 2)
 
 class UrlMemoryBackend {};
 
@@ -142,6 +143,23 @@ class UrlMemoryBackend {};
  * Each header (shared and private) is 4KB
  */
 static constexpr size_t kBackendHeaderSize = 4 * 1024;  // 4KB per header (shared + private = 8KB total)
+
+/** Forward declaration for kernel functions */
+class MemoryBackend;
+
+/**
+ * GPU kernel for MakeAlloc - constructs and initializes allocator on GPU
+ */
+template<typename AllocT, typename... Args>
+HSHM_GPU_KERNEL
+void MakeAllocKernel(MemoryBackend* backend, AllocT** result, Args... args);
+
+/**
+ * GPU kernel for AttachAlloc - attaches to allocator on GPU
+ */
+template<typename AllocT>
+HSHM_GPU_KERNEL
+void AttachAllocKernel(MemoryBackend* backend, AllocT** result);
 
 class MemoryBackend : public MemoryBackendHeader {
  public:
@@ -197,6 +215,45 @@ class MemoryBackend : public MemoryBackendHeader {
   HSHM_CROSS_FUN
   void UnsetOwner() {
     flags_.UnsetBits(MEMORY_BACKEND_OWNED);
+  }
+
+  /**
+   * Set the MEMORY_BACKEND_GPU_ONLY flag
+   * Indicates this backend is GPU-only and requires accelerator path for host access
+   */
+  HSHM_CROSS_FUN
+  void SetGpuOnly() {
+    flags_.SetBits(MEMORY_BACKEND_GPU_ONLY);
+  }
+
+  /**
+   * Check if this backend is GPU-only
+   * @return true if MEMORY_BACKEND_GPU_ONLY flag is set
+   */
+  HSHM_CROSS_FUN
+  bool IsGpuOnly() const {
+    return flags_.Any(MEMORY_BACKEND_GPU_ONLY) != 0;
+  }
+
+  /**
+   * Unset the MEMORY_BACKEND_GPU_ONLY flag
+   */
+  HSHM_CROSS_FUN
+  void UnsetGpuOnly() {
+    flags_.UnsetBits(MEMORY_BACKEND_GPU_ONLY);
+  }
+
+  /**
+   * Determine if we need to use the accelerator path
+   * @return true if this backend is GPU-only AND we're executing on the host
+   */
+  HSHM_CROSS_FUN
+  bool DoAccelPath() const {
+#if HSHM_IS_HOST
+    return IsGpuOnly();
+#else
+    return false;
+#endif
   }
 
   /**
@@ -368,12 +425,21 @@ class MemoryBackend : public MemoryBackendHeader {
     return reinterpret_cast<AllocT*>(data_);
   }
 
+  /** Friend declarations for kernel functions */
+  template<typename AllocT, typename... Args>
+  friend HSHM_GPU_KERNEL void MakeAllocKernel(MemoryBackend* backend, AllocT** result, Args... args);
+
+  template<typename AllocT>
+  friend HSHM_GPU_KERNEL void AttachAllocKernel(MemoryBackend* backend, AllocT** result);
+
   /**
    * Create and initialize an allocator in one line
    *
    * This method casts the data_ pointer to the allocator type,
    * constructs the allocator using placement new, and calls shm_init
    * with this backend as the first argument, followed by any additional arguments.
+   *
+   * If DoAccelPath() is true, executes via GPU kernel.
    *
    * @tparam AllocT The allocator type to create
    * @tparam Args Variadic template for additional shm_init arguments (after backend)
@@ -383,10 +449,38 @@ class MemoryBackend : public MemoryBackendHeader {
   template<typename AllocT, typename... Args>
   HSHM_CROSS_FUN
   AllocT* MakeAlloc(Args&&... args) {
-    AllocT* alloc = Cast<AllocT>();
-    new (alloc) AllocT();
-    alloc->shm_init(*this, std::forward<Args>(args)...);
-    return alloc;
+    if (!DoAccelPath()) {
+      // Direct path: execute on current device
+      AllocT* alloc = Cast<AllocT>();
+      new (alloc) AllocT();
+      alloc->shm_init(*this, std::forward<Args>(args)...);
+      return alloc;
+    } else {
+#if HSHM_ENABLE_CUDA
+      // Accelerator path: launch GPU kernel from host
+      AllocT* result_host;
+      AllocT** result_dev;
+      cudaMalloc(&result_dev, sizeof(AllocT*));
+      MakeAllocKernel<AllocT><<<1, 1>>>(this, result_dev, args...);
+      cudaDeviceSynchronize();
+      cudaMemcpy(&result_host, result_dev, sizeof(AllocT*), cudaMemcpyDeviceToHost);
+      cudaFree(result_dev);
+      return result_host;
+#elif HSHM_ENABLE_ROCM
+      // Accelerator path: launch GPU kernel from host (ROCm)
+      AllocT* result_host;
+      AllocT** result_dev;
+      hipMalloc(&result_dev, sizeof(AllocT*));
+      hipLaunchKernelGGL(MakeAllocKernel<AllocT>, dim3(1), dim3(1), 0, 0, this, result_dev, args...);
+      hipDeviceSynchronize();
+      hipMemcpy(&result_host, result_dev, sizeof(AllocT*), hipMemcpyDeviceToHost);
+      hipFree(result_dev);
+      return result_host;
+#else
+      // No GPU support compiled in - should not reach here
+      return nullptr;
+#endif
+    }
   }
 
   /**
@@ -395,15 +489,45 @@ class MemoryBackend : public MemoryBackendHeader {
    * This method casts the data_ pointer to the allocator type and
    * calls shm_attach to connect to the existing shared memory allocator.
    *
+   * If DoAccelPath() is true, executes via GPU kernel.
+   *
    * @tparam AllocT The allocator type to attach to
    * @return Pointer to the attached allocator
    */
   template<typename AllocT>
   HSHM_CROSS_FUN
   AllocT* AttachAlloc() {
-    AllocT* alloc = Cast<AllocT>();
-    alloc->shm_attach(*this);
-    return alloc;
+    if (!DoAccelPath()) {
+      // Direct path: execute on current device
+      AllocT* alloc = Cast<AllocT>();
+      alloc->shm_attach(*this);
+      return alloc;
+    } else {
+#if HSHM_ENABLE_CUDA
+      // Accelerator path: launch GPU kernel from host
+      AllocT* result_host;
+      AllocT** result_dev;
+      cudaMalloc(&result_dev, sizeof(AllocT*));
+      AttachAllocKernel<AllocT><<<1, 1>>>(this, result_dev);
+      cudaDeviceSynchronize();
+      cudaMemcpy(&result_host, result_dev, sizeof(AllocT*), cudaMemcpyDeviceToHost);
+      cudaFree(result_dev);
+      return result_host;
+#elif HSHM_ENABLE_ROCM
+      // Accelerator path: launch GPU kernel from host (ROCm)
+      AllocT* result_host;
+      AllocT** result_dev;
+      hipMalloc(&result_dev, sizeof(AllocT*));
+      hipLaunchKernelGGL(AttachAllocKernel<AllocT>, dim3(1), dim3(1), 0, 0, this, result_dev);
+      hipDeviceSynchronize();
+      hipMemcpy(&result_host, result_dev, sizeof(AllocT*), hipMemcpyDeviceToHost);
+      hipFree(result_dev);
+      return result_host;
+#else
+      // No GPU support compiled in - should not reach here
+      return nullptr;
+#endif
+    }
   }
 
   HSHM_CROSS_FUN
@@ -419,6 +543,28 @@ class MemoryBackend : public MemoryBackendHeader {
   // virtual void shm_destroy() = 0;
 };
 
+/**
+ * GPU kernel for MakeAlloc - constructs and initializes allocator on GPU
+ */
+template<typename AllocT, typename... Args>
+HSHM_GPU_KERNEL
+void MakeAllocKernel(MemoryBackend* backend, AllocT** result, Args... args) {
+  AllocT* alloc = backend->template Cast<AllocT>();
+  new (alloc) AllocT();
+  alloc->shm_init(*backend, args...);
+  *result = alloc;
+}
+
+/**
+ * GPU kernel for AttachAlloc - attaches to allocator on GPU
+ */
+template<typename AllocT>
+HSHM_GPU_KERNEL
+void AttachAllocKernel(MemoryBackend* backend, AllocT** result) {
+  AllocT* alloc = backend->template Cast<AllocT>();
+  alloc->shm_attach(*backend);
+  *result = alloc;
+}
 
 }  // namespace hshm::ipc
 

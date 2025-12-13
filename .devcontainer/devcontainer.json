@@ -9,7 +9,8 @@
     "containerEnv": {
         "IOWARP_CORE_ROOT": "${localWorkspaceFolder}",
         "CONDA_DEFAULT_ENV": "base",
-        "CONDA_AUTO_ACTIVATE_BASE": "true"
+        "CONDA_AUTO_ACTIVATE_BASE": "true",
+        "CUDA_HOME": "/usr/local/cuda-12.6"
     },
     "mounts": [
         "source=${localEnv:HOME}/.ssh,target=/tmp/host-ssh,type=bind,readonly",
@@ -21,6 +22,9 @@
         "--privileged",
         "--shm-size=2gb"
     ],
+    "hostRequirements": {
+        "gpu": "optional"
+    },
     "customizations": {
         "vscode": {
             "extensions": [

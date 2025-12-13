@@ -51,8 +51,9 @@ int ContextInterface::ContextBundle(
     wrp_cae::core::Client cae_client(wrp_cae::core::kCaePoolId);
 
     // Call ParseOmni with vector of contexts
+    hipc::MemoryContext mctx;
     chi::u32 num_tasks_scheduled = 0;
-    chi::u32 result = cae_client.ParseOmni(HSHM_MCTX, bundle, num_tasks_scheduled);
+    chi::u32 result = cae_client.ParseOmni(mctx, bundle, num_tasks_scheduled);
 
     if (result != 0) {
       std::cerr << "Error: ParseOmni failed with result code " << result << std::endl;
