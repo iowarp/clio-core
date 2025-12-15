@@ -26,7 +26,7 @@ struct qtok_t {
   qtok_id id_;
 
   /** Default constructor */
-  HSHM_INLINE_CROSS_FUN qtok_t() = default;
+  qtok_t() = default;
 
   /** Emplace constructor */
   HSHM_INLINE_CROSS_FUN explicit qtok_t(qtok_id id) : id_(id) {}

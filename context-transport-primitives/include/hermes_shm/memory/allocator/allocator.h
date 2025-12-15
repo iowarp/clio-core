@@ -56,7 +56,6 @@ struct ShmPtrBase;
 struct AllocatorHeader {
   hipc::atomic<hshm::size_t> total_alloc_;
 
-  HSHM_CROSS_FUN
   AllocatorHeader() = default;
 
   HSHM_CROSS_FUN
@@ -367,7 +366,7 @@ struct OffsetPtrBase : public ShmPointer {
   }
 
   /** Default constructor */
-  HSHM_INLINE_CROSS_FUN OffsetPtrBase() = default;
+  OffsetPtrBase() = default;
 
   /** Full constructor */
   HSHM_INLINE_CROSS_FUN explicit OffsetPtrBase(size_t off) : off_(off) {}
@@ -594,7 +593,7 @@ struct ShmPtrBase : public ShmPointer {
   }
 
   /** Default constructor */
-  HSHM_INLINE_CROSS_FUN ShmPtrBase() = default;
+  ShmPtrBase() = default;
 
   /** Full constructor */
   HSHM_INLINE_CROSS_FUN explicit ShmPtrBase(AllocatorId id, size_t off)
@@ -793,7 +792,7 @@ struct FullPtr : public ShmPointer {
   }
 
   /** Default constructor */
-  HSHM_INLINE_CROSS_FUN FullPtr() = default;
+  FullPtr() = default;
 
   /** Full constructor */
   HSHM_INLINE_CROSS_FUN FullPtr(const T *ptr, const PointerT &shm)

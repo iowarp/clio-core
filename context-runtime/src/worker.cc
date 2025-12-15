@@ -158,7 +158,7 @@ u32 Worker::ProcessNewTasks() {
     hipc::ShmPtr<FutureShm<CHI_MAIN_ALLOC_T>> future_shm_ptr;
 
     // Pop FutureShm from assigned lane
-    if (assigned_lane_ && ::chi::TaskQueue_PopTask(assigned_lane_, future_shm_ptr)) {
+    if (assigned_lane_ && assigned_lane_->Pop(future_shm_ptr)) {
       tasks_processed++;
 
       auto *alloc = CHI_IPC->GetMainAlloc();
