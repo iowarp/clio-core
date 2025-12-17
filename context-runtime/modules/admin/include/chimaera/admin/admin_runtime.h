@@ -80,13 +80,13 @@ public:
   /**
    * Execute a method on a task
    */
-  void Run(chi::u32 method, chi::Future<chi::Task>& task_future,
+  void Run(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr,
            chi::RunContext &rctx) override;
 
   /**
    * Delete/cleanup a task
    */
-  void Del(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr) override;
+  void DelTask(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr) override;
 
   //===========================================================================
   // Method implementations
@@ -174,31 +174,29 @@ public:
    * Serialize task parameters (IN or OUT based on archive mode)
    */
   void SaveTask(chi::u32 method, chi::SaveTaskArchive &archive,
-                chi::Future<chi::Task>& task_future) override;
+                hipc::FullPtr<chi::Task> task_ptr) override;
 
   /**
    * Deserialize task parameters (IN or OUT based on archive mode)
    */
-  void LoadTask(chi::u32 method, chi::LoadTaskArchive &archive,
-                chi::Future<chi::Task>& task_future) override;
+  hipc::FullPtr<chi::Task> LoadTask(chi::u32 method, chi::LoadTaskArchive &archive) override;
 
   /**
    * Deserialize task input parameters using LocalSerialize (for local transfers)
    */
-  void LocalLoadIn(chi::u32 method, chi::LocalLoadTaskArchive &archive,
-                   chi::Future<chi::Task>& task_future) override;
+  hipc::FullPtr<chi::Task> LocalLoadTask(chi::u32 method, chi::LocalLoadTaskArchive &archive) override;
 
   /**
    * Serialize task output parameters using LocalSerialize (for local transfers)
    */
-  void LocalSaveOut(chi::u32 method, chi::LocalSaveTaskArchive &archive,
-                    chi::Future<chi::Task>& task_future) override;
+  void LocalSaveTask(chi::u32 method, chi::LocalSaveTaskArchive &archive,
+                     hipc::FullPtr<chi::Task> task_ptr) override;
 
   /**
    * Create a new copy of a task (deep copy for distributed execution)
    */
-  void NewCopy(chi::u32 method, chi::Future<chi::Task>& orig_future,
-               chi::Future<chi::Task>& dup_future, bool deep) override;
+  hipc::FullPtr<chi::Task> NewCopyTask(chi::u32 method, hipc::FullPtr<chi::Task> orig_task_ptr,
+                                        bool deep) override;
 
   /**
    * Create a new task of the specified method type
@@ -209,8 +207,8 @@ public:
    * Aggregate a replica task into the origin task (for merging replica results)
    */
   void Aggregate(chi::u32 method,
-                 chi::Future<chi::Task>& origin_future,
-                 chi::Future<chi::Task>& replica_future) override;
+                 hipc::FullPtr<chi::Task> origin_task_ptr,
+                 hipc::FullPtr<chi::Task> replica_task_ptr) override;
 
 private:
   /**

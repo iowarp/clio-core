@@ -156,6 +156,8 @@ u32 Worker::ProcessNewTasks() {
 
   while (tasks_processed < MAX_TASKS_PER_ITERATION) {
     hipc::ShmPtr<FutureShm<CHI_MAIN_ALLOC_T>> future_shm_ptr;
+    HSHM_THREAD_MODEL->Yield();
+    continue;
 
     // Pop FutureShm from assigned lane
     if (assigned_lane_ && assigned_lane_->Pop(future_shm_ptr)) {
@@ -202,11 +204,11 @@ u32 Worker::ProcessNewTasks() {
           run_ctx->future_ = std::move(future);
         }
 
-        // Deserialize task inputs from FutureShm using container->LocalLoadIn
+        // Deserialize task inputs from FutureShm using container->LocalLoadTask
         std::vector<char> serialized_data(future_shm->serialized_task_.begin(),
                                            future_shm->serialized_task_.end());
         LocalLoadTaskArchive archive(serialized_data);
-        container->LocalLoadIn(method_id, archive, run_ctx->future_);
+        task_full_ptr = container->LocalLoadTask(method_id, archive);
 
         // Route task using consolidated routing function
         if (RouteTask(task_full_ptr, assigned_lane_, container)) {
@@ -998,10 +1000,10 @@ void Worker::EndTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
           ret_node_id);
   } else {
     // Local task completion using Future
-    // 1. Serialize outputs using container->LocalSaveOut
+    // 1. Serialize outputs using container->LocalSaveTask
     LocalSaveTaskArchive archive(LocalMsgType::kSerializeOut);
     if (run_ctx->container) {
-      run_ctx->container->LocalSaveOut(task_ptr->method_, archive, run_ctx->future_);
+      run_ctx->container->LocalSaveTask(task_ptr->method_, archive, task_ptr);
     }
 
     // Copy serialized outputs to FutureShm
@@ -1015,8 +1017,8 @@ void Worker::EndTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
     // 2. Mark task as complete
     run_ctx->future_.SetComplete();
 
-    // 3. Delete task using container->Del
-    run_ctx->container->Del(task_ptr->method_, task_ptr);
+    // 3. Delete task using container->DelTask
+    run_ctx->container->DelTask(task_ptr->method_, task_ptr);
   }
 
   // Deallocate stack and context
@@ -1291,10 +1293,7 @@ void Worker::FiberExecutionFunction(boost::context::detail::transfer_t t) {
 
       if (container) {
         // Call the container's Run function with the task
-        // Wrap task in Future for Run method
-        auto *alloc = CHI_IPC->GetMainAlloc();
-        chi::Future<chi::Task> task_future(alloc, task_ptr);
-        container->Run(task_ptr->method_, task_future, *run_ctx);
+        container->Run(task_ptr->method_, task_ptr, *run_ctx);
       } else {
         // Container not found - this is an error condition
         HILOG(kWarning, "Container not found in RunContext for pool_id: {}",

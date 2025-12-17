@@ -22,16 +22,16 @@ class Runtime : public chi::Container {
   ~Runtime() override = default;
 
   // Virtual methods implemented in autogen/core_lib_exec.cc
-  void Run(chi::u32 method, chi::Future<chi::Task>& task_future, chi::RunContext& rctx) override;
-  void Del(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr) override;
+  void Run(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr, chi::RunContext& rctx) override;
+  void DelTask(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr) override;
   chi::u64 GetWorkRemaining() const override;
-  void SaveTask(chi::u32 method, chi::SaveTaskArchive& archive, chi::Future<chi::Task>& task_future) override;
-  void LoadTask(chi::u32 method, chi::LoadTaskArchive& archive, chi::Future<chi::Task>& task_future) override;
-  void LocalLoadIn(chi::u32 method, chi::LocalLoadTaskArchive& archive, chi::Future<chi::Task>& task_future) override;
-  void LocalSaveOut(chi::u32 method, chi::LocalSaveTaskArchive& archive, chi::Future<chi::Task>& task_future) override;
-  void NewCopy(chi::u32 method, chi::Future<chi::Task>& orig_future, chi::Future<chi::Task>& dup_future, bool deep) override;
+  void SaveTask(chi::u32 method, chi::SaveTaskArchive& archive, hipc::FullPtr<chi::Task> task_ptr) override;
+  hipc::FullPtr<chi::Task> LoadTask(chi::u32 method, chi::LoadTaskArchive& archive) override;
+  hipc::FullPtr<chi::Task> LocalLoadTask(chi::u32 method, chi::LocalLoadTaskArchive& archive) override;
+  void LocalSaveTask(chi::u32 method, chi::LocalSaveTaskArchive& archive, hipc::FullPtr<chi::Task> task_ptr) override;
+  hipc::FullPtr<chi::Task> NewCopyTask(chi::u32 method, hipc::FullPtr<chi::Task> orig_task_ptr, bool deep) override;
   hipc::FullPtr<chi::Task> NewTask(chi::u32 method) override;
-  void Aggregate(chi::u32 method, chi::Future<chi::Task>& origin_future, chi::Future<chi::Task>& replica_future) override;
+  void Aggregate(chi::u32 method, hipc::FullPtr<chi::Task> origin_task_ptr, hipc::FullPtr<chi::Task> replica_task_ptr) override;
 
   /**
    * Initialize container with pool information (REQUIRED)

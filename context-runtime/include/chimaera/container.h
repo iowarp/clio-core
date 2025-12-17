@@ -88,13 +88,13 @@ class Container {
   /**
    * Execute a method on a task - must be implemented by derived classes
    */
-  virtual void Run(u32 method, Future<Task>& task_future,
+  virtual void Run(u32 method, hipc::FullPtr<Task> task_ptr,
                    RunContext& rctx) = 0;
 
   /**
    * Delete/cleanup a task - must be implemented by derived classes
    */
-  virtual void Del(u32 method, hipc::FullPtr<Task> task_ptr) = 0;
+  virtual void DelTask(u32 method, hipc::FullPtr<Task> task_ptr) = 0;
 
   /**
    * Get remaining work count for this container - PURE VIRTUAL
@@ -123,32 +123,32 @@ class Container {
    * Uses switch-case structure based on method ID to dispatch to appropriate serialization
    * @param method The method ID to serialize
    * @param archive SaveTaskArchive configured with srl_mode (true=In, false=Out)
-   * @param task_future Future wrapping the task to serialize
+   * @param task_ptr Full pointer to the task to serialize
    */
   virtual void SaveTask(u32 method, SaveTaskArchive& archive,
-                        Future<Task>& task_future) = 0;
+                        hipc::FullPtr<Task> task_ptr) = 0;
 
   /**
    * Deserialize task parameters from network transfer (unified method)
    * Must be implemented by derived classes
    * Uses switch-case structure based on method ID to dispatch to appropriate deserialization
+   * Internally calls NewTask to allocate the task pointer
    * @param method The method ID to deserialize
    * @param archive LoadTaskArchive configured with srl_mode (true=In, false=Out)
-   * @param task_future Future wrapping the task to deserialize into
+   * @return Full pointer to the newly allocated and deserialized task
    */
-  virtual void LoadTask(u32 method, LoadTaskArchive& archive,
-                        Future<Task>& task_future) = 0;
+  virtual hipc::FullPtr<Task> LoadTask(u32 method, LoadTaskArchive& archive) = 0;
 
   /**
-   * Serialize task input parameters using LocalSerialize (for local transfers)
+   * Deserialize task input parameters using LocalSerialize (for local transfers)
    * Must be implemented by derived classes
    * Uses switch-case structure based on method ID to dispatch to appropriate serialization
+   * Internally calls NewTask to allocate the task pointer
    * @param method The method ID to serialize
    * @param archive LocalLoadTaskArchive for deserializing inputs
-   * @param task_future Future wrapping the task to load inputs into
+   * @return Full pointer to the newly allocated and loaded task
    */
-  virtual void LocalLoadIn(u32 method, LocalLoadTaskArchive& archive,
-                           Future<Task>& task_future) = 0;
+  virtual hipc::FullPtr<Task> LocalLoadTask(u32 method, LocalLoadTaskArchive& archive) = 0;
 
   /**
    * Serialize task output parameters using LocalSerialize (for local transfers)
@@ -156,19 +156,23 @@ class Container {
    * Uses switch-case structure based on method ID to dispatch to appropriate serialization
    * @param method The method ID to serialize
    * @param archive LocalSaveTaskArchive for serializing outputs
-   * @param task_future Future wrapping the task to save outputs from
+   * @param task_ptr Full pointer to the task to save outputs from
    */
-  virtual void LocalSaveOut(u32 method, LocalSaveTaskArchive& archive,
-                            Future<Task>& task_future) = 0;
+  virtual void LocalSaveTask(u32 method, LocalSaveTaskArchive& archive,
+                              hipc::FullPtr<Task> task_ptr) = 0;
 
   /**
    * Create a new copy of a task (deep copy for distributed execution) - must be
    * implemented by derived classes Uses switch-case structure based on method
    * ID to dispatch to appropriate task type copying
+   * @param method The method ID for the task type
+   * @param orig_task_ptr Full pointer to the original task
+   * @param deep Whether to perform a deep copy
+   * @return Full pointer to the newly created copy
    */
-  HSHM_DLL virtual void NewCopy(u32 method,
-                               Future<Task> &orig_future,
-                               Future<Task> &dup_future, bool deep) = 0;
+  HSHM_DLL virtual hipc::FullPtr<Task> NewCopyTask(u32 method,
+                                                    hipc::FullPtr<Task> orig_task_ptr,
+                                                    bool deep) = 0;
 
   /**
    * Create a new task of the specified method type
@@ -184,12 +188,12 @@ class Container {
    * Uses switch-case structure based on method ID to dispatch to appropriate task type aggregation
    * This is used for merging replica results back into the origin task after distributed execution
    * @param method The method ID for the task type
-   * @param origin_future Future wrapping the origin task to aggregate into
-   * @param replica_future Future wrapping the replica task to aggregate from
+   * @param origin_task_ptr Full pointer to the origin task to aggregate into
+   * @param replica_task_ptr Full pointer to the replica task to aggregate from
    */
   HSHM_DLL virtual void Aggregate(u32 method,
-                                 Future<Task>& origin_future,
-                                 Future<Task>& replica_future) = 0; 
+                                   hipc::FullPtr<Task> origin_task_ptr,
+                                   hipc::FullPtr<Task> replica_task_ptr) = 0; 
 };
 
 /**

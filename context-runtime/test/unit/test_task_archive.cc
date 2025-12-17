@@ -492,38 +492,38 @@ public:
     return 0; // Test implementation returns no work
   }
 
-  void Run(chi::u32 method, chi::Future<chi::Task>& task_future,
+  void Run(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr,
            chi::RunContext &rctx) override {
     // Test implementation - do nothing
     (void)method;
-    (void)task_future;
+    (void)task_ptr;
     (void)rctx;
   }
 
-  void Del(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr) override {
+  void DelTask(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr) override {
     // Test implementation - do nothing
     (void)method;
     (void)task_ptr;
   }
 
   void SaveTask(chi::u32 method, chi::SaveTaskArchive &archive,
-                chi::Future<chi::Task>& task_future) override {
+                hipc::FullPtr<chi::Task> task_ptr) override {
     // Test implementation - just call task serialization
     (void)method;
-    auto* task_ptr = task_future.get();
     archive << *task_ptr;
   }
 
-  void LoadTask(chi::u32 method, chi::LoadTaskArchive &archive,
-                chi::Future<chi::Task>& task_future) override {
-    // Test implementation - just call task deserialization
+  hipc::FullPtr<chi::Task> LoadTask(chi::u32 method, chi::LoadTaskArchive &archive) override {
+    // Test implementation - allocate task and deserialize
     (void)method;
-    auto* task_ptr = task_future.get();
+    auto* ipc_manager = CHI_IPC;
+    auto task_ptr = ipc_manager->NewTask<chi::Task>();
     archive >> *task_ptr;
+    return task_ptr;
   }
 
-  void NewCopy(chi::u32 method, chi::Future<chi::Task>& orig_future,
-               chi::Future<chi::Task>& dup_future, bool deep) override {
+  hipc::FullPtr<chi::Task> NewCopyTask(chi::u32 method, hipc::FullPtr<chi::Task> orig_task_ptr,
+                                        bool deep) override {
     // Test implementation - create new task and copy
     (void)method;
     (void)deep;
@@ -531,10 +531,11 @@ public:
     if (ipc_manager) {
       auto new_task_ptr = ipc_manager->NewTask<chi::Task>();
       if (!new_task_ptr.IsNull()) {
-        new_task_ptr->Copy(orig_future.GetTaskPtr());
-        dup_future = chi::Future<chi::Task>(ipc_manager->GetMainAlloc(), new_task_ptr);
+        new_task_ptr->Copy(orig_task_ptr);
       }
+      return new_task_ptr;
     }
+    return hipc::FullPtr<chi::Task>();
   }
 
   hipc::FullPtr<chi::Task> NewTask(chi::u32 method) override {
@@ -547,28 +548,28 @@ public:
     return hipc::FullPtr<chi::Task>();
   }
 
-  void Aggregate(chi::u32 method, chi::Future<chi::Task>& origin_future,
-                 chi::Future<chi::Task>& replica_future) override {
+  void Aggregate(chi::u32 method, hipc::FullPtr<chi::Task> origin_task_ptr,
+                 hipc::FullPtr<chi::Task> replica_task_ptr) override {
     // Test implementation - do nothing
     (void)method;
-    (void)origin_future;
-    (void)replica_future;
+    (void)origin_task_ptr;
+    (void)replica_task_ptr;
   }
 
-  void LocalLoadIn(chi::u32 method, chi::LocalLoadTaskArchive &archive,
-                   chi::Future<chi::Task>& task_future) override {
+  hipc::FullPtr<chi::Task> LocalLoadTask(chi::u32 method, chi::LocalLoadTaskArchive &archive) override {
+    // Test implementation - allocate task
+    (void)method;
+    (void)archive;
+    auto* ipc_manager = CHI_IPC;
+    return ipc_manager->NewTask<chi::Task>();
+  }
+
+  void LocalSaveTask(chi::u32 method, chi::LocalSaveTaskArchive &archive,
+                     hipc::FullPtr<chi::Task> task_ptr) override {
     // Test implementation - do nothing
     (void)method;
     (void)archive;
-    (void)task_future;
-  }
-
-  void LocalSaveOut(chi::u32 method, chi::LocalSaveTaskArchive &archive,
-                    chi::Future<chi::Task>& task_future) override {
-    // Test implementation - do nothing
-    (void)method;
-    (void)archive;
-    (void)task_future;
+    (void)task_ptr;
   }
 };
 
@@ -582,22 +583,15 @@ TEST_CASE("Container Serialization Methods", "[task_archive][container]") {
     // Test SaveTask with SerializeIn mode (inputs)
     chi::SaveTaskArchive save_archive(chi::MsgType::kSerializeIn);
     chi::u32 method = task_ptr->method_;
-    chi::Future<chi::Task> task_future(alloc, task_ptr);
-    REQUIRE_NOTHROW(container.SaveTask(method, save_archive, task_future));
+    REQUIRE_NOTHROW(container.SaveTask(method, save_archive, task_ptr));
     std::string serialized_data = save_archive.GetData();
     REQUIRE_FALSE(serialized_data.empty());
 
     // Test LoadTask with SerializeIn mode (inputs)
-    auto new_task = CreateTestTask();
-    new_task->SetNull();
-    auto alloc_in = GetTestAllocator();
-    hipc::FullPtr<chi::Task> new_task_ptr(alloc_in, new_task.get());
-    new_task_ptr->method_ =
-        original_task->method_; // LoadTask needs method for switch-case
-    chi::Future<chi::Task> new_task_future(alloc_in, new_task_ptr);
     chi::LoadTaskArchive load_archive(serialized_data);
     load_archive.msg_type_ = chi::MsgType::kSerializeIn;  // SerializeIn mode
-    REQUIRE_NOTHROW(container.LoadTask(method, load_archive, new_task_future));
+    hipc::FullPtr<chi::Task> new_task_ptr;
+    REQUIRE_NOTHROW(new_task_ptr = container.LoadTask(method, load_archive));
 
     // Verify data was loaded (though specific verification depends on
     // switch-case implementation) For base Task, the default case should call
@@ -613,22 +607,15 @@ TEST_CASE("Container Serialization Methods", "[task_archive][container]") {
     // Test SaveTask with SerializeOut mode (outputs)
     chi::SaveTaskArchive save_archive(chi::MsgType::kSerializeOut);
     chi::u32 method = task_ptr->method_;
-    chi::Future<chi::Task> task_future(alloc, task_ptr);
-    REQUIRE_NOTHROW(container.SaveTask(method, save_archive, task_future));
+    REQUIRE_NOTHROW(container.SaveTask(method, save_archive, task_ptr));
     std::string serialized_data = save_archive.GetData();
     REQUIRE_FALSE(serialized_data.empty());
 
     // Test LoadTask with SerializeOut mode (outputs)
-    auto new_task = CreateTestTask();
-    new_task->SetNull();
-    auto alloc_out = GetTestAllocator();
-    hipc::FullPtr<chi::Task> new_task_ptr(alloc_out, new_task.get());
-    new_task_ptr->method_ =
-        original_task->method_; // LoadTask needs method for switch-case
-    chi::Future<chi::Task> new_task_future(alloc_out, new_task_ptr);
     chi::LoadTaskArchive load_archive(serialized_data);
     load_archive.msg_type_ = chi::MsgType::kSerializeOut;  // SerializeOut mode
-    REQUIRE_NOTHROW(container.LoadTask(method, load_archive, new_task_future));
+    hipc::FullPtr<chi::Task> new_task_ptr;
+    REQUIRE_NOTHROW(new_task_ptr = container.LoadTask(method, load_archive));
   }
 }
 

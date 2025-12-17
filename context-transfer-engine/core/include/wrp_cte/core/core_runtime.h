@@ -104,25 +104,23 @@ public:
   // Pure virtual methods - implementations are in autogen/core_lib_exec.cc
   void Init(const chi::PoolId &pool_id, const std::string &pool_name,
             chi::u32 container_id = 0) override;
-  void Run(chi::u32 method, chi::Future<chi::Task>& task_future,
+  void Run(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr,
            chi::RunContext &rctx) override;
   void Monitor(chi::MonitorModeId mode, chi::u32 method,
                chi::Future<chi::Task>& task_future, chi::RunContext &rctx);
-  void Del(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr) override;
+  void DelTask(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr) override;
   chi::u64 GetWorkRemaining() const override;
   void SaveTask(chi::u32 method, chi::SaveTaskArchive &archive,
-                chi::Future<chi::Task>& task_future) override;
-  void LoadTask(chi::u32 method, chi::LoadTaskArchive &archive,
-                chi::Future<chi::Task>& task_future) override;
-  void LocalLoadIn(chi::u32 method, chi::LocalLoadTaskArchive &archive,
-                   chi::Future<chi::Task>& task_future) override;
-  void LocalSaveOut(chi::u32 method, chi::LocalSaveTaskArchive &archive,
-                    chi::Future<chi::Task>& task_future) override;
-  void NewCopy(chi::u32 method, chi::Future<chi::Task>& orig_future,
-               chi::Future<chi::Task>& dup_future, bool deep) override;
+                hipc::FullPtr<chi::Task> task_ptr) override;
+  hipc::FullPtr<chi::Task> LoadTask(chi::u32 method, chi::LoadTaskArchive &archive) override;
+  hipc::FullPtr<chi::Task> LocalLoadTask(chi::u32 method, chi::LocalLoadTaskArchive &archive) override;
+  void LocalSaveTask(chi::u32 method, chi::LocalSaveTaskArchive &archive,
+                     hipc::FullPtr<chi::Task> task_ptr) override;
+  hipc::FullPtr<chi::Task> NewCopyTask(chi::u32 method, hipc::FullPtr<chi::Task> orig_task_ptr,
+                                        bool deep) override;
   hipc::FullPtr<chi::Task> NewTask(chi::u32 method) override;
-  void Aggregate(chi::u32 method, chi::Future<chi::Task>& origin_future,
-                 chi::Future<chi::Task>& replica_future) override;
+  void Aggregate(chi::u32 method, hipc::FullPtr<chi::Task> origin_task_ptr,
+                 hipc::FullPtr<chi::Task> replica_task_ptr) override;
 
 private:
   // Queue ID constants (REQUIRED: Use semantic names, not raw integers)
