@@ -137,7 +137,6 @@ void test_bundle_and_retrieve_workflow() {
   std::cout << "  [STEP 2.5] Registering RAM storage target with CTE..." << std::endl;
   auto* cte_client = WRP_CTE_CLIENT;
   chi::u32 register_result = cte_client->RegisterTarget(
-      HSHM_MCTX,
       "ram::cee_test_storage",  // Target name (RAM storage)
       chimaera::bdev::BdevType::kRam,  // RAM block device type
       4ULL * 1024 * 1024 * 1024,  // 4GB capacity
@@ -152,7 +151,6 @@ void test_bundle_and_retrieve_workflow() {
   wrp_cae::core::CreateParams params;
 
   cae_client.Create(
-      HSHM_MCTX,
       chi::PoolQuery::Local(),
       "test_cee_cae_pool",
       wrp_cae::core::kCaePoolId,

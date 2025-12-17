@@ -51,9 +51,8 @@ int ContextInterface::ContextBundle(
     wrp_cae::core::Client cae_client(wrp_cae::core::kCaePoolId);
 
     // Call ParseOmni with vector of contexts
-    hipc::MemoryContext mctx;
     chi::u32 num_tasks_scheduled = 0;
-    chi::u32 result = cae_client.ParseOmni(mctx, bundle, num_tasks_scheduled);
+    chi::u32 result = cae_client.ParseOmni(bundle, num_tasks_scheduled);
 
     if (result != 0) {
       std::cerr << "Error: ParseOmni failed with result code " << result << std::endl;
@@ -91,7 +90,6 @@ std::vector<std::string> ContextInterface::ContextQuery(
     // Call BlobQuery with tag and blob regex patterns
     // Use Broadcast to query across all nodes
     auto query_results = cte_client->BlobQuery(
-        HSHM_MCTX,
         tag_re,
         blob_re,
         max_results,  // max_blobs (0 = unlimited)
@@ -139,7 +137,6 @@ std::vector<std::string> ContextInterface::ContextRetrieve(
 
     // Use BlobQuery to get list of blobs matching the pattern
     auto query_results = cte_client->BlobQuery(
-        HSHM_MCTX,
         tag_re,
         blob_re,
         max_results,
@@ -168,21 +165,21 @@ std::vector<std::string> ContextInterface::ContextRetrieve(
       size_t batch_count = batch_end - batch_start;
 
       // Schedule AsyncGetBlob operations for this batch
-      std::vector<hipc::FullPtr<wrp_cte::core::GetBlobTask>> tasks;
+      std::vector<chi::Future<wrp_cte::core::GetBlobTask>> tasks;
       tasks.reserve(batch_count);
 
       for (size_t i = batch_start; i < batch_end; ++i) {
         const auto& [tag_name, blob_name] = query_results[i];
 
         // Get or create tag to get tag_id
-        wrp_cte::core::TagId tag_id = cte_client->GetOrCreateTag(HSHM_MCTX, tag_name);
+        wrp_cte::core::TagId tag_id = cte_client->GetOrCreateTag(tag_name);
         if (tag_id.IsNull()) {
           std::cerr << "Warning: Failed to get tag '" << tag_name << "', skipping blob" << std::endl;
           continue;
         }
 
         // Get blob size first
-        chi::u64 blob_size = cte_client->GetBlobSize(HSHM_MCTX, tag_id, blob_name);
+        chi::u64 blob_size = cte_client->GetBlobSize(tag_id, blob_name);
         if (blob_size == 0) {
           std::cerr << "Warning: Blob '" << blob_name << "' has zero size, skipping" << std::endl;
           continue;
@@ -196,12 +193,12 @@ std::vector<std::string> ContextInterface::ContextRetrieve(
         }
 
         // Calculate buffer pointer for this blob
-        hipc::ShmPtr<> blob_buffer_ptr = context_buffer.shm_;
-        blob_buffer_ptr.off_ = blob_buffer_ptr.off_ + buffer_offset;
+        hipc::ShmPtr<> blob_buffer_ptr;
+        blob_buffer_ptr.alloc_id_ = context_buffer.shm_.alloc_id_;
+        blob_buffer_ptr.off_ = context_buffer.shm_.off_.load() + buffer_offset;
 
         // Schedule AsyncGetBlob
         auto task = cte_client->AsyncGetBlob(
-            HSHM_MCTX,
             tag_id,
             blob_name,
             0,              // offset within blob
@@ -215,7 +212,7 @@ std::vector<std::string> ContextInterface::ContextRetrieve(
 
       // Wait for all tasks in this batch to complete
       for (auto& task : tasks) {
-        task->Wait();
+        task.Wait();
         if (task->return_code_.load() != 0) {
           std::cerr << "Warning: GetBlob failed for a blob in batch" << std::endl;
         }
@@ -223,7 +220,7 @@ std::vector<std::string> ContextInterface::ContextRetrieve(
 
       // Delete all tasks in this batch
       for (auto& task : tasks) {
-        ipc_manager->DelTask(task);
+        ipc_manager->DelTask(task.GetTaskPtr());
       }
     }
 
@@ -287,7 +284,7 @@ int ContextInterface::ContextDestroy(
     // Iterate over each context name and delete the corresponding tag
     int error_count = 0;
     for (const auto& context_name : context_names) {
-      bool result = cte_client->DelTag(HSHM_MCTX, context_name);
+      bool result = cte_client->DelTag(context_name);
       if (!result) {
         std::cerr << "Error: Failed to delete context '" << context_name << "'" << std::endl;
         error_count++;
