@@ -156,9 +156,6 @@ u32 Worker::ProcessNewTasks() {
 
   while (tasks_processed < MAX_TASKS_PER_ITERATION) {
     hipc::ShmPtr<FutureShm<CHI_MAIN_ALLOC_T>> future_shm_ptr;
-    HSHM_THREAD_MODEL->Yield();
-    continue;
-
     // Pop FutureShm from assigned lane
     if (assigned_lane_ && assigned_lane_->Pop(future_shm_ptr)) {
       tasks_processed++;

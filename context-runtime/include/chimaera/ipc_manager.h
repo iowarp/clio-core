@@ -174,7 +174,7 @@ public:
     // 4. Get serialized data and copy to FutureShm's hipc::vector
     const std::vector<char>& serialized = archive.GetData();
     auto& future_shm = future.GetFutureShm();
-    future_shm->serialized_task_.reserve(serialized.size());
+    future_shm->serialized_task_.resize(serialized.size());
     memcpy(future_shm->serialized_task_.data(), serialized.data(), serialized.size());
 
     // 5. Map task to lane using configured policy
