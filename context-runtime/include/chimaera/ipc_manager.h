@@ -535,4 +535,18 @@ HSHM_DEFINE_GLOBAL_PTR_VAR_H(chi::IpcManager, g_ipc_manager);
 // Macro for accessing the IPC manager singleton using global pointer variable
 #define CHI_IPC HSHM_GET_GLOBAL_PTR_VAR(::chi::IpcManager, g_ipc_manager)
 
+// Define Future::Wait() after IpcManager is fully defined
+// This avoids circular dependency issues between future.h and ipc_manager.h
+namespace chi {
+
+template<typename TaskT, typename AllocT>
+void Future<TaskT, AllocT>::Wait() {
+  if (!task_ptr_.IsNull()) {
+    // Call IpcManager::Recv() to poll for completion and deserialize results
+    CHI_IPC->Recv(*this);
+  }
+}
+
+}  // namespace chi
+
 #endif // CHIMAERA_INCLUDE_CHIMAERA_MANAGERS_IPC_MANAGER_H_

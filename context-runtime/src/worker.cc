@@ -178,34 +178,23 @@ u32 Worker::ProcessNewTasks() {
           continue;
         }
 
-        // Create task using container->NewTask based on method_id
-        hipc::FullPtr<Task> task_full_ptr = container->NewTask(method_id);
-
-        if (task_full_ptr.IsNull()) {
-          // Task allocation failed - mark as complete with error
-          future_shm->is_complete_.store(1);
-          continue;
-        }
+        // Deserialize task inputs from FutureShm using container->LocalLoadTask
+        std::vector<char> serialized_data(future_shm->serialized_task_.begin(),
+                                          future_shm->serialized_task_.end());
+        LocalLoadTaskArchive archive(serialized_data);
+        FullPtr<Task> task_full_ptr = container->LocalLoadTask(method_id, archive);
+        Future<Task> future(future_shm, task_full_ptr);
 
         // Allocate stack and RunContext before routing
         if (!task_full_ptr->IsRouted()) {
           BeginTask(task_full_ptr, container, assigned_lane_, future_shm_ptr);
         }
 
-        // Construct Future<Task> from FutureShm and Task
-        Future<Task> future(future_shm, task_full_ptr);
-
         // Store future in RunContext
         RunContext *run_ctx = task_full_ptr->run_ctx_;
         if (run_ctx) {
           run_ctx->future_ = std::move(future);
         }
-
-        // Deserialize task inputs from FutureShm using container->LocalLoadTask
-        std::vector<char> serialized_data(future_shm->serialized_task_.begin(),
-                                           future_shm->serialized_task_.end());
-        LocalLoadTaskArchive archive(serialized_data);
-        task_full_ptr = container->LocalLoadTask(method_id, archive);
 
         // Route task using consolidated routing function
         if (RouteTask(task_full_ptr, assigned_lane_, container)) {

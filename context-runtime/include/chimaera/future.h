@@ -11,6 +11,7 @@ namespace chi {
 
 // Forward declarations
 class Task;
+class IpcManager;
 
 /**
  * FutureShm - Shared memory container for task future state
@@ -162,12 +163,9 @@ class Future {
 
   /**
    * Wait for task completion (blocking)
+   * Calls IpcManager::Recv() to handle task completion and deserialization
    */
-  void Wait() const {
-    if (!task_ptr_.IsNull()) {
-      task_ptr_->Wait();
-    }
-  }
+  void Wait();
 
   /**
    * Mark the task as complete
