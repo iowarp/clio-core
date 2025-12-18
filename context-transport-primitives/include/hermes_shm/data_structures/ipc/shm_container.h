@@ -46,7 +46,7 @@ class ShmContainer {
   HSHM_INLINE_CROSS_FUN
   explicit ShmContainer(AllocT *alloc) {
     if (alloc) {
-      this_ = OffsetPtr<void>(reinterpret_cast<size_t>(alloc));
+      this_ = OffsetPtr<void>((size_t)this - (size_t)alloc);
     } else {
       this_ = OffsetPtr<void>::GetNull();
     }
@@ -62,7 +62,7 @@ class ShmContainer {
     if (this_.IsNull()) {
       return nullptr;
     }
-    return reinterpret_cast<AllocT*>(this_.load());
+    return reinterpret_cast<AllocT*>((char*)this - this_.load());
   }
 };
 

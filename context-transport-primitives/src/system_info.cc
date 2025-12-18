@@ -408,7 +408,17 @@ void *SystemInfo::MapMixedMemory(const File &fd, size_t private_size,
   void *result = mmap64(shared_ptr, shared_size, PROT_READ | PROT_WRITE,
                         MAP_SHARED | MAP_FIXED, fd.posix_fd_, shared_offset);
   if (result == MAP_FAILED || result != shared_ptr) {
-    perror("MapMixedMemory: MAP_FIXED mmap failed");
+    int saved_errno = errno;
+    fprintf(stderr, "MapMixedMemory: MAP_FIXED mmap failed\n");
+    fprintf(stderr, "  Requested addr: %p\n", shared_ptr);
+    fprintf(stderr, "  Size: %zu bytes\n", shared_size);
+    fprintf(stderr, "  fd: %d\n", fd.posix_fd_);
+    fprintf(stderr, "  offset: %ld\n", shared_offset);
+    fprintf(stderr, "  errno: %d (%s)\n", saved_errno, strerror(saved_errno));
+    if (result != MAP_FAILED && result != shared_ptr) {
+      fprintf(stderr, "  Got addr: %p (unexpected!)\n", result);
+      munmap(result, shared_size);
+    }
     // Clean up: unmap the entire region
     munmap(ptr, total_size);
     return nullptr;

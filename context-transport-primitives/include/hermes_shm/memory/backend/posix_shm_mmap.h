@@ -46,15 +46,15 @@ class PosixShmMmap : public MemoryBackend, public UrlMemoryBackend {
    * Initialize backend with mixed private/shared mapping
    *
    * @param backend_id Unique identifier for this backend
-   * @param backend_size Total size of the region (including headers and data)
+   * @param backend_size Total size of the region (including all headers and data)
    * @param url POSIX shared memory object name (e.g., "/my_shm")
    * @return true on success, false on failure
    *
    * Memory layout in file:
-   *   [4KB backend header] [4KB shared header] [data]
+   *   [4KB backend header] [4KB private header] [4KB shared header] [data]
    *
-   * Memory layout in virtual memory (region_):
-   *   [4KB private header] [4KB shared header] [data]
+   * Memory layout in virtual memory:
+   *   [4KB backend header MAP_SHARED] [4KB private header MAP_PRIVATE] [4KB shared header MAP_SHARED] [data MAP_SHARED]
    */
   bool shm_init(const MemoryBackendId &backend_id, size_t backend_size,
                 const std::string &url) {
@@ -64,49 +64,54 @@ class PosixShmMmap : public MemoryBackend, public UrlMemoryBackend {
       backend_size = kMinBackendSize;
     }
 
-    // File layout: [4KB backend header] [4KB shared header] [data]
-    size_t shared_size = backend_size - kBackendHeaderSize;
+    // File layout: [4KB backend header] [4KB private header] [4KB shared header] [data]
+    // Total file size includes all three headers plus data
+    size_t total_file_size = backend_size + kBackendHeaderSize;  // backend_size already includes private + shared headers + data
 
-    // Create shared memory object with entire backend size
+    // Create shared memory object with entire size
     SystemInfo::DestroySharedMemory(url);
-    if (!SystemInfo::CreateNewSharedMemory(fd_, url, backend_size)) {
+    if (!SystemInfo::CreateNewSharedMemory(fd_, url, total_file_size)) {
       char *err_buf = strerror(errno);
       HILOG(kError, "shm_open failed: {}", err_buf);
       return false;
     }
     url_ = url;
 
-    // Map the first 4KB (backend header) using MapShared
+    // Step 1: Map the backend header (4KB) as MAP_SHARED at offset 0
     header_ = reinterpret_cast<MemoryBackendHeader *>(
         SystemInfo::MapSharedMemory(fd_, kBackendHeaderSize, 0));
     if (!header_) {
-      HILOG(kError, "Failed to map header");
+      HILOG(kError, "Failed to map backend header");
       SystemInfo::CloseSharedMemory(fd_);
       return false;
     }
 
-    // Map the entire region using MapMixed
+    // Step 2: Map the rest using MapMixedMemory at offset kBackendHeaderSize
     // Private portion: 4KB (private header)
-    // Shared portion: backend_size - 4KB (shared header + data)
-    // Offset into file: 0 (maps entire file starting from offset 0)
+    // Shared portion: backend_size - kBackendHeaderSize (shared header + data)
+    // Offset into file: kBackendHeaderSize (skip the backend header in file)
+    size_t shared_portion_size = backend_size - kBackendHeaderSize;
     region_ = reinterpret_cast<char *>(
-        SystemInfo::MapMixedMemory(fd_, kBackendHeaderSize, shared_size,  0));
+        SystemInfo::MapMixedMemory(fd_, kBackendHeaderSize, shared_portion_size, kBackendHeaderSize));
     if (!region_) {
       HILOG(kError, "Failed to create mixed mapping");
+      SystemInfo::UnmapMemory(header_, kBackendHeaderSize);
       SystemInfo::CloseSharedMemory(fd_);
       return false;
     }
 
-    // region_ points to start of private header
-    // region_ + kBackendHeaderSize points to start of shared header (maps to file offset 0, which is the backend header)
-    // region_ + 2*kBackendHeaderSize points to start of data
+    // Memory layout after mapping:
+    // header_ points to: [4KB backend header MAP_SHARED] at file offset 0
+    // region_ points to: [4KB private header MAP_PRIVATE] [4KB shared header MAP_SHARED] [data MAP_SHARED]
+    //                     where shared portion maps to file offset kBackendHeaderSize
 
-    // Calculate pointers
-    char *shared_header_ptr = region_ + kBackendHeaderSize;
-    data_ = shared_header_ptr + kBackendHeaderSize;
+    // Calculate data pointer
+    // region_[0..4KB) = private header
+    // region_[4KB..8KB) = shared header (maps to file offset 4KB..8KB)
+    // region_[8KB...) = data (maps to file offset 8KB...)
+    data_ = region_ + 2 * kBackendHeaderSize;
 
-    // Note: header_ is a separate mapping, so we need to update our view
-    // The shared header in the mixed region also contains the backend header data
+    // Initialize local fields
     id_ = backend_id;
     backend_size_ = backend_size;
     data_capacity_ = backend_size - 2 * kBackendHeaderSize;
@@ -114,9 +119,13 @@ class PosixShmMmap : public MemoryBackend, public UrlMemoryBackend {
     priv_header_off_ = static_cast<size_t>(data_ - region_);
     flags_.Clear();
 
-    // Copy all header fields to shared header
-    new (header_) MemoryBackendHeader();
+    // Copy all header fields to backend header (file offset 0)
     (*header_) = (const MemoryBackendHeader&)*this;
+
+    HILOG(kInfo, "shm_init: Initialized with backend_size={}, data_capacity={}",
+          backend_size_, data_capacity_);
+    HILOG(kInfo, "shm_init: header_={}, region_={}, data_={}",
+          (void*)header_, (void*)region_, (void*)data_);
 
     // Mark this process as the owner of the backend
     SetOwner();
@@ -129,6 +138,10 @@ class PosixShmMmap : public MemoryBackend, public UrlMemoryBackend {
    *
    * @param url POSIX shared memory object name
    * @return true on success, false on failure
+   *
+   * This method mirrors shm_init exactly:
+   * - Maps backend header (4KB) as MAP_SHARED at offset 0
+   * - Maps rest using MapMixedMemory at offset kBackendHeaderSize
    */
   bool shm_attach(const std::string &url) {
     if (!SystemInfo::OpenSharedMemory(fd_, url)) {
@@ -138,34 +151,62 @@ class PosixShmMmap : public MemoryBackend, public UrlMemoryBackend {
     }
     url_ = url;
 
-    // First, map the first 4KB (backend header) using MapShared
+    // Step 1: Map the backend header (4KB) as MAP_SHARED at offset 0
     header_ = reinterpret_cast<MemoryBackendHeader *>(
         SystemInfo::MapSharedMemory(fd_, kBackendHeaderSize, 0));
     if (!header_) {
-      HILOG(kError, "Failed to map header");
+      HILOG(kError, "Failed to map backend header");
+      SystemInfo::CloseSharedMemory(fd_);
+      return false;
+    }
+    (MemoryBackendHeader&)*this = (*header_);
+
+    // Read backend_size from backend header
+    size_t backend_size = header_->backend_size_;
+
+    HILOG(kInfo, "shm_attach: Read backend_size={} from backend header at {}",
+          backend_size, (void*)header_);
+    HILOG(kInfo, "shm_attach: Header fields: id_=({},{}), data_capacity_={}, priv_header_off_={}",
+          header_->id_.major_, header_->id_.minor_, header_->data_capacity_, header_->priv_header_off_);
+
+    // Validate backend_size before subtraction to prevent underflow
+    if (backend_size < kBackendHeaderSize) {
+      HELOG(kError, "Invalid backend_size in header: {} bytes (must be >= {} bytes)",
+            backend_size, kBackendHeaderSize);
+      SystemInfo::UnmapMemory(header_, kBackendHeaderSize);
       SystemInfo::CloseSharedMemory(fd_);
       return false;
     }
 
-    // Read backend size from header
-    size_t backend_size = header_->backend_size_;
-    size_t shared_size = backend_size - kBackendHeaderSize;
-
-    // Map the entire region using MapMixed with offset 0
+    // Step 2: Map the rest using MapMixedMemory at offset kBackendHeaderSize
     // Private portion: 4KB (private header)
-    // Shared portion: backend_size - 4KB (shared header + data)
-    // Offset into file: 0 (maps entire file starting from offset 0)
-    region_ = reinterpret_cast<char *>(SystemInfo::MapMixedMemory(
-        fd_, kBackendHeaderSize, shared_size, 0));
+    // Shared portion: backend_size - kBackendHeaderSize (shared header + data)
+    // Offset into file: kBackendHeaderSize (skip the backend header in file)
+    size_t shared_portion_size = backend_size - kBackendHeaderSize;
+    region_ = reinterpret_cast<char *>(
+        SystemInfo::MapMixedMemory(fd_, kBackendHeaderSize, shared_portion_size, kBackendHeaderSize));
     if (!region_) {
       HILOG(kError, "Failed to create mixed mapping during attach");
+      SystemInfo::UnmapMemory(header_, kBackendHeaderSize);
       SystemInfo::CloseSharedMemory(fd_);
       return false;
     }
 
-    // Set up pointers (same layout as shm_init)
-    char *shared_header_ptr = region_ + kBackendHeaderSize;
-    data_ = shared_header_ptr + kBackendHeaderSize;
+    // Memory layout after mapping (same as shm_init):
+    // header_ points to: [4KB backend header MAP_SHARED] at file offset 0
+    // region_ points to: [4KB private header MAP_PRIVATE] [4KB shared header MAP_SHARED] [data MAP_SHARED]
+    //                     where shared portion maps to file offset kBackendHeaderSize
+
+    // Calculate data pointer (same layout as shm_init)
+    // region_[0..4KB) = private header
+    // region_[4KB..8KB) = shared header (maps to file offset 4KB..8KB)
+    // region_[8KB...) = data (maps to file offset 8KB...)
+    data_ = region_ + 2 * kBackendHeaderSize;
+
+    HILOG(kInfo, "shm_attach: Attached with backend_size={}, data_capacity={}",
+          backend_size, header_->data_capacity_);
+    HILOG(kInfo, "shm_attach: header_={}, region_={}, data_={}",
+          (void*)header_, (void*)region_, (void*)data_);
 
     // Mark this process as NOT the owner (attaching to existing backend)
     UnsetOwner();
@@ -195,16 +236,16 @@ class PosixShmMmap : public MemoryBackend, public UrlMemoryBackend {
     if (header_ == nullptr) {
       return;
     }
-    // Unmap the entire contiguous region
+    // Unmap the mixed mapping region (private header + shared header + data)
     if (region_ != nullptr) {
-      SystemInfo::UnmapMemory(region_, header_->backend_size_ - kBackendHeaderSize);
+      // Total size is: private header (kBackendHeaderSize) + shared portion (backend_size_ - kBackendHeaderSize)
+      SystemInfo::UnmapMemory(region_, header_->backend_size_);
+      region_ = nullptr;
     }
-    if (header_ != nullptr) {
-      SystemInfo::UnmapMemory(reinterpret_cast<char *>(header_), kBackendHeaderSize);
-    }
+    // Unmap the backend header (separately mapped as MAP_SHARED)
+    SystemInfo::UnmapMemory(header_, kBackendHeaderSize);
     SystemInfo::CloseSharedMemory(fd_);
     header_ = nullptr;
-    region_ = nullptr;
   }
 
   /** Destroy shared memory */
