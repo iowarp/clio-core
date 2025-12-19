@@ -578,7 +578,7 @@ TEST_CASE("Container Serialization Methods", "[task_archive][container]") {
     TestContainer container;
     auto original_task = CreateTestTask();
     auto alloc = GetTestAllocator();
-    hipc::FullPtr<chi::Task> task_ptr(alloc, original_task.get());
+    hipc::FullPtr<chi::Task> task_ptr(original_task.get());
 
     // Test SaveTask with SerializeIn mode (inputs)
     chi::SaveTaskArchive save_archive(chi::MsgType::kSerializeIn);
@@ -602,7 +602,7 @@ TEST_CASE("Container Serialization Methods", "[task_archive][container]") {
     TestContainer container;
     auto original_task = CreateTestTask();
     auto alloc = GetTestAllocator();
-    hipc::FullPtr<chi::Task> task_ptr(alloc, original_task.get());
+    hipc::FullPtr<chi::Task> task_ptr(original_task.get());
 
     // Test SaveTask with SerializeOut mode (outputs)
     chi::SaveTaskArchive save_archive(chi::MsgType::kSerializeOut);

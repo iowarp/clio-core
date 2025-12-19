@@ -744,12 +744,9 @@ void Runtime::RecvOut(hipc::FullPtr<RecvTask> task,
       return;
     }
 
-    // Call LoadTask to deserialize - this will expose buffers via ar.bulk()
-    // and populate archive.recv
-    // Note: We pass the existing replica pointer to be updated in-place
-    hipc::FullPtr<chi::Task> loaded_replica = container->LoadTask(replica->method_, archive);
-    // The loaded task should match the replica (same task being deserialized)
-    (void)loaded_replica;  // Suppress unused variable warning
+    // Deserialize outputs directly into the replica task using the archive
+    // This exposes buffers via ar.bulk() and populates archive.recv
+    archive >> (*replica.ptr_);
   }
 
   // Receive all bulk data using Lightbeam
