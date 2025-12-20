@@ -24,6 +24,13 @@ void Runtime::Init(const chi::PoolId &pool_id, const std::string &pool_name,
 
   // Initialize the client for this ChiMod
   client_ = Client(pool_id);
+
+  // Initialize lock vectors for send_map and recv_map (one lock per worker thread)
+  auto *config_manager = CHI_CONFIG_MANAGER;
+  size_t num_workers = config_manager->GetSchedulerWorkerCount() +
+                       config_manager->GetSlowWorkerCount();
+  send_map_locks_.resize(num_workers);
+  recv_map_locks_.resize(num_workers);
 }
 
 void Runtime::Run(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr, chi::RunContext& rctx) {
