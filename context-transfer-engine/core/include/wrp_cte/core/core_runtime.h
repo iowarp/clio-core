@@ -166,7 +166,7 @@ private:
   Config config_;
 
   // Telemetry ring buffer for performance monitoring
-  static const size_t kTelemetryRingSize = 1024; // Ring buffer size
+  static inline constexpr size_t kTelemetryRingSize = 1024; // Ring buffer size
   std::unique_ptr<hipc::circular_mpsc_ring_buffer<CteTelemetry, CHI_MAIN_ALLOC_T>> telemetry_log_;
   std::atomic<std::uint64_t>
       telemetry_counter_; // Atomic counter for logical time
