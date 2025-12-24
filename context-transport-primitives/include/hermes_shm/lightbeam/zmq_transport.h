@@ -6,12 +6,15 @@
 #include <cereal/types/string.hpp>
 #include <cereal/types/vector.hpp>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <unistd.h>
 
+#include "hermes_shm/util/logging.h"
 #include "lightbeam.h"
 
 // Cereal serialization for Bulk
+// Note: data is transferred separately via bulk transfer mechanism, not serialized here
 namespace cereal {
 template <class Archive>
 void serialize(Archive& ar, hshm::lbm::Bulk& bulk) {
@@ -179,7 +182,7 @@ class ZeroMqServer : public Server {
   }
 
   template <typename MetaT>
-  int RecvMetadata(MetaT& meta) {
+  int RecvMetadata(MetaT& meta, bool* has_more_parts = nullptr) {
     // Receive metadata message (non-blocking)
     zmq_msg_t msg;
     zmq_msg_init(&msg);
@@ -191,20 +194,64 @@ class ZeroMqServer : public Server {
       return err;
     }
 
+    // Check if there are more message parts (bulk data following metadata)
+    int more = 0;
+    size_t more_size = sizeof(more);
+    zmq_getsockopt(socket_, ZMQ_RCVMORE, &more, &more_size);
+    if (has_more_parts) {
+      *has_more_parts = (more != 0);
+    }
+
     // Deserialize metadata
+    size_t msg_size = zmq_msg_size(&msg);
     try {
-      std::string meta_str(static_cast<char*>(zmq_msg_data(&msg)),
-                           zmq_msg_size(&msg));
+      std::string meta_str(static_cast<char*>(zmq_msg_data(&msg)), msg_size);
       std::istringstream iss(meta_str, std::ios::binary);
       cereal::BinaryInputArchive ar(iss);
       ar(meta);
     } catch (const std::exception& e) {
+      // If deserialization fails, this might be bulk data from a previous
+      // incomplete receive or a spurious epoll trigger. Discard and return.
+      if (more) {
+        // Multi-part message with stale data - discard remaining parts
+        HILOG(kDebug, "ZeroMQ RecvMetadata: Discarding stale multi-part message "
+              "(msg_size={}, has_more=true)", msg_size);
+        DiscardRemainingParts();
+      } else if (msg_size > 10000) {
+        // Large standalone message (likely bulk data) - log as debug
+        HILOG(kDebug, "ZeroMQ RecvMetadata: Received large non-metadata message "
+              "(msg_size={}), skipping", msg_size);
+      } else {
+        // Small message that failed to parse - this is a real error
+        HELOG(kError, "ZeroMQ RecvMetadata: Deserialization failed - {} (msg_size={})",
+              e.what(), msg_size);
+      }
       zmq_msg_close(&msg);
       return -1;  // Deserialization error
     }
 
     zmq_msg_close(&msg);
     return 0;  // Success
+  }
+
+  /**
+   * Discard remaining parts of a multi-part message
+   * Used to re-synchronize after a failed receive
+   */
+  void DiscardRemainingParts() {
+    int more = 1;
+    while (more) {
+      zmq_msg_t msg;
+      zmq_msg_init(&msg);
+      int rc = zmq_msg_recv(&msg, socket_, 0);
+      if (rc == -1) {
+        zmq_msg_close(&msg);
+        break;
+      }
+      size_t more_size = sizeof(more);
+      zmq_getsockopt(socket_, ZMQ_RCVMORE, &more, &more_size);
+      zmq_msg_close(&msg);
+    }
   }
 
   template <typename MetaT>
@@ -269,12 +316,22 @@ class ZeroMqServer : public Server {
     return fd;
   }
 
+  /**
+   * Lock the socket for exclusive access during multi-part receive
+   * Use this when you need to perform a multi-part receive (RecvMetadata + RecvBulks)
+   * @return A lock guard that will unlock automatically when destroyed
+   */
+  std::unique_lock<std::mutex> LockSocket() {
+    return std::unique_lock<std::mutex>(socket_mutex_);
+  }
+
  private:
   std::string addr_;
   std::string protocol_;
   int port_;
   void* ctx_;
   void* socket_;
+  mutable std::mutex socket_mutex_;  /**< Mutex to serialize socket access */
 };
 
 // --- Base Class Template Implementations ---
@@ -286,8 +343,8 @@ int Client::Send(MetaT& meta, const LbmContext& ctx) {
 }
 
 template <typename MetaT>
-int Server::RecvMetadata(MetaT& meta) {
-  return static_cast<ZeroMqServer*>(this)->RecvMetadata(meta);
+int Server::RecvMetadata(MetaT& meta, bool* has_more_parts) {
+  return static_cast<ZeroMqServer*>(this)->RecvMetadata(meta, has_more_parts);
 }
 
 template <typename MetaT>

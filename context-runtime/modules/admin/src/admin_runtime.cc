@@ -12,6 +12,7 @@
 #include <chimaera/pool_manager.h>
 #include <chimaera/task_archives.h>
 #include <chimaera/worker.h>
+#include <hermes_shm/lightbeam/zmq_transport.h>
 #include <zmq.h>
 
 #include <chrono>
@@ -906,9 +907,15 @@ void Runtime::Recv(hipc::FullPtr<RecvTask> task, chi::RunContext &rctx) {
     }
   }
 
+  // Lock the socket to prevent race conditions during multi-part receive
+  // The lock is held until RecvBulks completes in RecvIn/RecvOut
+  auto *zmq_server = static_cast<hshm::lbm::ZeroMqServer *>(lbm_server);
+  auto socket_lock = zmq_server->LockSocket();
+
   // Receive metadata first to determine mode (non-blocking)
   chi::LoadTaskArchive archive;
-  int rc = lbm_server->RecvMetadata(archive);
+  bool has_more_parts = false;
+  int rc = lbm_server->RecvMetadata(archive, &has_more_parts);
   if (rc == EAGAIN) {
     // No message available - this is normal for polling, mark as no work done
     chi::Worker *worker = CHI_CUR_WORKER;
@@ -919,14 +926,12 @@ void Runtime::Recv(hipc::FullPtr<RecvTask> task, chi::RunContext &rctx) {
     return;
   }
   if (rc != 0) {
-    // Error receiving metadata
+    // Error receiving metadata - could be various causes
     if (rc == -1) {
-      HELOG(kError,
-            "Admin: Lightbeam RecvMetadata deserialization failed (error code "
-            "{}). "
-            "This likely indicates a version mismatch between nodes. "
-            "Ensure all nodes are rebuilt with the same code version.",
-            rc);
+      // Deserialization failed - detailed logging already done in RecvMetadata
+      // This might be stale bulk data from a previous operation, which is
+      // handled gracefully by discarding and retrying on next poll
+      HILOG(kDebug, "Admin: RecvMetadata returned -1 (deserialization issue)");
     } else {
       HELOG(kError, "Admin: Lightbeam RecvMetadata failed with error code {}",
             rc);

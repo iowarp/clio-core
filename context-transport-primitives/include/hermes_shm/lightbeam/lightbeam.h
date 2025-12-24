@@ -25,6 +25,7 @@ struct Bulk {
   hshm::bitfield32_t flags;  // BULK_EXPOSE or BULK_XFER
   void* desc = nullptr;      // For RDMA memory registration
   void* mr = nullptr;        // For RDMA memory region handle (fid_mr*)
+  // Note: Cereal serialization is defined as non-member function in zmq_transport.h
 };
 
 // --- Metadata Base Class ---
@@ -58,7 +59,7 @@ class Server {
                       u32 flags) = 0;
 
   template <typename MetaT>
-  int RecvMetadata(MetaT& meta);
+  int RecvMetadata(MetaT& meta, bool* has_more_parts = nullptr);
 
   template <typename MetaT>
   int RecvBulks(MetaT& meta);

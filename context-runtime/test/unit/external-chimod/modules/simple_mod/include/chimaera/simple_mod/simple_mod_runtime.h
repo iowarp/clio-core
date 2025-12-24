@@ -46,8 +46,10 @@ public:
    * Initialize container with pool information
    * @param pool_id The unique ID of this pool
    * @param pool_name The semantic name of this pool (user-provided)
+   * @param container_id The container ID
    */
-  void Init(const chi::PoolId& pool_id, const std::string& pool_name) override;
+  void Init(const chi::PoolId& pool_id, const std::string& pool_name,
+            chi::u32 container_id = 0) override;
 
   /**
    * Execute a method on a task
@@ -57,7 +59,7 @@ public:
   /**
    * Delete/cleanup a task
    */
-  void Del(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr) override;
+  void DelTask(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr) override;
 
   //===========================================================================
   // Method implementations
@@ -84,35 +86,54 @@ public:
   chi::u64 GetWorkRemaining() const override;
 
   //===========================================================================
-  // Task Serialization Methods (automatically generated in autogen/)
+  // Container Virtual Methods (automatically generated in autogen/)
   //===========================================================================
 
   /**
-   * Serialize task IN parameters for network transfer (auto-generated)
+   * Serialize task parameters for network transfer (auto-generated)
+   * @param method The method ID
+   * @param archive SaveTaskArchive for serialization
+   * @param task_ptr The task to serialize
    */
-  void SaveIn(chi::u32 method, chi::TaskSaveInArchive& archive, hipc::FullPtr<chi::Task> task_ptr) override;
+  void SaveTask(chi::u32 method, chi::SaveTaskArchive& archive,
+                hipc::FullPtr<chi::Task> task_ptr) override;
 
   /**
-   * Deserialize task IN parameters from network transfer (auto-generated)
+   * Deserialize task parameters from network transfer (auto-generated)
+   * @param method The method ID
+   * @param archive LoadTaskArchive for deserialization
+   * @return The deserialized task
    */
-  void LoadIn(chi::u32 method, chi::TaskLoadInArchive& archive, hipc::FullPtr<chi::Task> task_ptr) override;
+  hipc::FullPtr<chi::Task> LoadTask(chi::u32 method, chi::LoadTaskArchive& archive) override;
 
   /**
-   * Serialize task OUT parameters for network transfer (auto-generated)
+   * Deserialize task for local transfer (auto-generated)
    */
-  void SaveOut(chi::u32 method, chi::TaskSaveOutArchive& archive, hipc::FullPtr<chi::Task> task_ptr) override;
+  hipc::FullPtr<chi::Task> LocalLoadTask(chi::u32 method, chi::LocalLoadTaskArchive& archive) override;
 
   /**
-   * Deserialize task OUT parameters from network transfer (auto-generated)
+   * Serialize task for local transfer (auto-generated)
    */
-  void LoadOut(chi::u32 method, chi::TaskLoadOutArchive& archive, hipc::FullPtr<chi::Task> task_ptr) override;
+  void LocalSaveTask(chi::u32 method, chi::LocalSaveTaskArchive& archive,
+                     hipc::FullPtr<chi::Task> task_ptr) override;
 
   /**
    * Create a new copy of a task for distributed execution (auto-generated)
    */
-  void NewCopy(chi::u32 method, 
-               const hipc::FullPtr<chi::Task> &orig_task,
-               hipc::FullPtr<chi::Task> &dup_task, bool deep) override;
+  hipc::FullPtr<chi::Task> NewCopyTask(chi::u32 method,
+                                        hipc::FullPtr<chi::Task> orig_task_ptr,
+                                        bool deep) override;
+
+  /**
+   * Create a new task of the specified method type (auto-generated)
+   */
+  hipc::FullPtr<chi::Task> NewTask(chi::u32 method) override;
+
+  /**
+   * Aggregate a replica task into the origin task (auto-generated)
+   */
+  void Aggregate(chi::u32 method, hipc::FullPtr<chi::Task> origin_task_ptr,
+                 hipc::FullPtr<chi::Task> replica_task_ptr) override;
 };
 
 }  // namespace external_test::simple_mod

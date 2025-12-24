@@ -1466,95 +1466,146 @@ TEST_CASE("bdev_parallel_io_operations", "[bdev][parallel][io]") {
  * execution
  */
 TEST_CASE("bdev_force_net_flag", "[bdev][network][force_net]") {
+  HILOG(kInfo, "[bdev_force_net_flag] TEST START");
   BdevChimodFixture fixture;
 
   SECTION("Setup") {
+    HILOG(kInfo, "[bdev_force_net_flag] Setup section: g_initialized={}", g_initialized);
     REQUIRE(g_initialized);
+    HILOG(kInfo, "[bdev_force_net_flag] Creating test file...");
     REQUIRE(fixture.createTestFile(kDefaultFileSize));
+    HILOG(kInfo, "[bdev_force_net_flag] Test file created: {}", fixture.getTestFile());
   }
 
   SECTION("Write and Read with TASK_FORCE_NET") {
+    HILOG(kInfo, "[bdev_force_net_flag] Write/Read section starting");
     chi::PoolId custom_pool_id(105, 0);
+    HILOG(kInfo, "[bdev_force_net_flag] Creating bdev client with pool_id=(major:{}, minor:{})",
+          custom_pool_id.major_, custom_pool_id.minor_);
     chimaera::bdev::Client client(custom_pool_id);
 
+    HILOG(kInfo, "[bdev_force_net_flag] Calling client.Create() with Dynamic pool query...");
     bool success =
         client.Create(chi::PoolQuery::Dynamic(), fixture.getTestFile(),
                       custom_pool_id, chimaera::bdev::BdevType::kFile);
+    HILOG(kInfo, "[bdev_force_net_flag] client.Create() returned success={}, return_code={}",
+          success, client.GetReturnCode());
     REQUIRE(success);
     REQUIRE(client.GetReturnCode() == 0);
 
-    HILOG(kInfo, "Created BDev container for TASK_FORCE_NET test");
+    HILOG(kInfo, "[bdev_force_net_flag] Created BDev container for TASK_FORCE_NET test");
+
+    // Get number of containers for logging
+    const chi::u32 num_containers = fixture.getNumContainers();
+    HILOG(kInfo, "[bdev_force_net_flag] num_containers={}", num_containers);
 
     // Run TASK_FORCE_NET test using DirectHash for distributed execution
     for (int i = 0; i < 16; ++i) {
+      HILOG(kInfo, "[bdev_force_net_flag] === ITERATION {} START ===", i);
       auto pool_query = chi::PoolQuery::DirectHash(i);
+      chi::ContainerId expected_container = static_cast<chi::ContainerId>(i % num_containers);
+      HILOG(kInfo, "[bdev_force_net_flag] Iteration {}: DirectHash({}) -> expected_container={}",
+            i, i, expected_container);
 
       // Allocate a block
+      HILOG(kInfo, "[bdev_force_net_flag] Iteration {}: Calling AsyncAllocateBlocks(k64KB)...", i);
       auto alloc_task = client.AsyncAllocateBlocks(pool_query, k64KB);
+      HILOG(kInfo, "[bdev_force_net_flag] Iteration {}: AsyncAllocateBlocks returned, calling Wait()...", i);
       alloc_task.Wait();
+      HILOG(kInfo, "[bdev_force_net_flag] Iteration {}: AllocateBlocks Wait() returned, return_code={}, blocks.size()={}",
+            i, alloc_task->return_code_, alloc_task->blocks_.size());
       REQUIRE(alloc_task->return_code_ == 0);
       REQUIRE(alloc_task->blocks_.size() > 0);
 
       chimaera::bdev::Block block = alloc_task->blocks_[0];
+      HILOG(kInfo, "[bdev_force_net_flag] Iteration {}: Allocated block: offset={}, size={}, completer={}",
+            i, block.offset_, block.size_, alloc_task->GetCompleter());
       CHI_IPC->DelTask(alloc_task.GetTaskPtr());
+      HILOG(kInfo, "[bdev_force_net_flag] Iteration {}: Deleted alloc_task", i);
 
       // Prepare test data
       std::vector<hshm::u8> write_data =
           fixture.generateTestData(k64KB, 0xAB + i);
+      HILOG(kInfo, "[bdev_force_net_flag] Iteration {}: Generated test_data of size {}", i, write_data.size());
 
       // Create write task with TASK_FORCE_NET flag
+      HILOG(kInfo, "[bdev_force_net_flag] Iteration {}: Allocating write buffer...", i);
       auto write_buffer = CHI_IPC->AllocateBuffer(write_data.size());
       REQUIRE_FALSE(write_buffer.IsNull());
       memcpy(write_buffer.ptr_, write_data.data(), write_data.size());
+      HILOG(kInfo, "[bdev_force_net_flag] Iteration {}: Write buffer allocated and filled", i);
 
       // Use NewTask directly to create write task
       auto *ipc_manager = CHI_IPC;
+      HILOG(kInfo, "[bdev_force_net_flag] Iteration {}: Creating WriteTask with NewTask...", i);
       auto write_task_ptr = ipc_manager->NewTask<chimaera::bdev::WriteTask>(
           chi::CreateTaskId(), client.pool_id_, pool_query, WrapBlock(block),
           write_buffer.shm_.template Cast<void>().template Cast<void>(), write_data.size());
+      HILOG(kInfo, "[bdev_force_net_flag] Iteration {}: WriteTask created, task_id=(pid:{}, tid:{}, major:{}), pool_id=({}, {}), method={}",
+            i, write_task_ptr->task_id_.pid_, write_task_ptr->task_id_.tid_, write_task_ptr->task_id_.major_,
+            write_task_ptr->pool_id_.major_, write_task_ptr->pool_id_.minor_,
+            write_task_ptr->method_);
 
       // Set TASK_FORCE_NET flag BEFORE enqueueing
       write_task_ptr->SetFlags(TASK_FORCE_NET);
       REQUIRE(write_task_ptr->task_flags_.Any(TASK_FORCE_NET));
-      HILOG(kInfo, "Iteration {}: Write task TASK_FORCE_NET flag set", i);
+      HILOG(kInfo, "[bdev_force_net_flag] Iteration {}: Write task TASK_FORCE_NET flag set, has_flag={}",
+            i, write_task_ptr->task_flags_.Any(TASK_FORCE_NET));
 
       // Enqueue the task
+      HILOG(kInfo, "[bdev_force_net_flag] Iteration {}: Calling ipc_manager->Send() for write task...", i);
       auto write_task = ipc_manager->Send(write_task_ptr);
+      HILOG(kInfo, "[bdev_force_net_flag] Iteration {}: Send() returned, calling Wait()...", i);
 
       // Wait for write to complete
       write_task.Wait();
+      HILOG(kInfo, "[bdev_force_net_flag] Iteration {}: Write Wait() returned, return_code={}, bytes_written={}, completer={}",
+            i, write_task->return_code_, write_task->bytes_written_, write_task->GetCompleter());
       REQUIRE(write_task->return_code_ == 0);
       REQUIRE(write_task->bytes_written_ == write_data.size());
       CHI_IPC->DelTask(write_task.GetTaskPtr());
+      HILOG(kInfo, "[bdev_force_net_flag] Iteration {}: Deleted write_task", i);
 
       HILOG(kInfo,
-            "Iteration {}: Write with TASK_FORCE_NET completed successfully",
+            "[bdev_force_net_flag] Iteration {}: Write with TASK_FORCE_NET completed successfully",
             i);
 
       // Create read task with TASK_FORCE_NET flag
+      HILOG(kInfo, "[bdev_force_net_flag] Iteration {}: Allocating read buffer...", i);
       auto read_buffer = CHI_IPC->AllocateBuffer(k64KB);
       REQUIRE_FALSE(read_buffer.IsNull());
+      HILOG(kInfo, "[bdev_force_net_flag] Iteration {}: Read buffer allocated", i);
 
       // Use NewTask directly to create read task
+      HILOG(kInfo, "[bdev_force_net_flag] Iteration {}: Creating ReadTask with NewTask...", i);
       auto read_task_ptr = ipc_manager->NewTask<chimaera::bdev::ReadTask>(
           chi::CreateTaskId(), client.pool_id_, pool_query, WrapBlock(block),
           read_buffer.shm_.template Cast<void>().template Cast<void>(), k64KB);
+      HILOG(kInfo, "[bdev_force_net_flag] Iteration {}: ReadTask created, task_id=(pid:{}, tid:{}, major:{}), pool_id=({}, {}), method={}",
+            i, read_task_ptr->task_id_.pid_, read_task_ptr->task_id_.tid_, read_task_ptr->task_id_.major_,
+            read_task_ptr->pool_id_.major_, read_task_ptr->pool_id_.minor_,
+            read_task_ptr->method_);
 
       // Set TASK_FORCE_NET flag BEFORE enqueueing
       read_task_ptr->SetFlags(TASK_FORCE_NET);
       REQUIRE(read_task_ptr->task_flags_.Any(TASK_FORCE_NET));
-      HILOG(kInfo, "Iteration {}: Read task TASK_FORCE_NET flag set", i);
+      HILOG(kInfo, "[bdev_force_net_flag] Iteration {}: Read task TASK_FORCE_NET flag set, has_flag={}",
+            i, read_task_ptr->task_flags_.Any(TASK_FORCE_NET));
 
       // Enqueue the task
+      HILOG(kInfo, "[bdev_force_net_flag] Iteration {}: Calling ipc_manager->Send() for read task...", i);
       auto read_task = ipc_manager->Send(read_task_ptr);
+      HILOG(kInfo, "[bdev_force_net_flag] Iteration {}: Send() returned, calling Wait()...", i);
 
       // Wait for read to complete
       read_task.Wait();
+      HILOG(kInfo, "[bdev_force_net_flag] Iteration {}: Read Wait() returned, return_code={}, bytes_read={}, completer={}",
+            i, read_task->return_code_, read_task->bytes_read_, read_task->GetCompleter());
       REQUIRE(read_task->return_code_ == 0);
       REQUIRE(read_task->bytes_read_ == write_data.size());
 
       HILOG(kInfo,
-            "Iteration {}: Read with TASK_FORCE_NET completed successfully", i);
+            "[bdev_force_net_flag] Iteration {}: Read with TASK_FORCE_NET completed successfully", i);
 
       // Verify data integrity
       std::vector<hshm::u8> read_data(read_task->bytes_read_);
@@ -1564,19 +1615,26 @@ TEST_CASE("bdev_force_net_flag", "[bdev][network][force_net]") {
       for (size_t j = 0; j < write_data.size(); ++j) {
         REQUIRE(read_data[j] == write_data[j]);
       }
+      HILOG(kInfo, "[bdev_force_net_flag] Iteration {}: Data verification passed", i);
 
       CHI_IPC->DelTask(read_task.GetTaskPtr());
+      HILOG(kInfo, "[bdev_force_net_flag] Iteration {}: Deleted read_task", i);
 
       // Free buffers
+      HILOG(kInfo, "[bdev_force_net_flag] Iteration {}: Freeing write buffer...", i);
       CHI_IPC->FreeBuffer(write_buffer);
+      HILOG(kInfo, "[bdev_force_net_flag] Iteration {}: Freeing read buffer...", i);
       CHI_IPC->FreeBuffer(read_buffer);
+      HILOG(kInfo, "[bdev_force_net_flag] Iteration {}: Buffers freed", i);
 
       HILOG(kInfo,
-            "Iteration {}: TASK_FORCE_NET test completed - data verified "
-            "successfully",
+            "[bdev_force_net_flag] === ITERATION {} COMPLETE - data verified "
+            "successfully ===",
             i);
     }
+    HILOG(kInfo, "[bdev_force_net_flag] All 16 iterations passed");
   }
+  HILOG(kInfo, "[bdev_force_net_flag] TEST COMPLETE");
 }
 
 //==============================================================================
