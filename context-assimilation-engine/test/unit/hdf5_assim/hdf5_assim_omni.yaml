@@ -9,10 +9,10 @@
 
 version: "1.0"
 
-# Assimilation task for HDF5 file
+# Assimilation task for HDF5 file (all datasets)
 transfers:
   - name: "example_hdf5_assimilation"
-    description: "Load HDF5 datasets into CTE tags"
+    description: "Load all HDF5 datasets into CTE tags"
 
     # Source: HDF5 file path
     # Format: hdf5::/path/to/file.h5
@@ -33,7 +33,31 @@ transfers:
     range_off: 0
     range_size: 0
 
-# Example with multiple HDF5 files
+  # Example with dataset filtering (NEW FEATURE)
+  - name: "filtered_hdf5_assimilation"
+    description: "Load only specific datasets using glob patterns"
+    src: "hdf5::/path/to/example_data.h5"
+    dst: "iowarp::filtered_data"
+    format: "hdf5"
+    depends_on: ""
+
+    # Dataset filtering (optional)
+    # If omitted, all datasets are processed
+    dataset_filter:
+      # Include patterns: Only process datasets matching these glob patterns
+      # Empty list means include all datasets
+      include_patterns:
+        - "*/Geolocation/*"           # All geolocation datasets
+        - "/data/temperature"          # Specific dataset
+        - "/ASTER/*/SWIR/*"           # Wildcard matching
+
+      # Exclude patterns: Skip datasets matching these glob patterns
+      # Exclude patterns are applied first, before include patterns
+      exclude_patterns:
+        - "*/Calibration/*"           # Skip all calibration data
+        - "*_backup"                  # Skip backup datasets
+
+  # Example with multiple HDF5 files
   - name: "science_data_assimilation"
     description: "Load scientific simulation results"
     src: "hdf5::/data/simulation/results.h5"
@@ -54,3 +78,10 @@ transfers:
 # - Hierarchical groups are preserved in the tag names
 # - Metadata about tensor shape and type is stored in the description blob
 # - Large datasets are automatically chunked into multiple blobs
+#
+# Dataset Filtering:
+# - Use dataset_filter.include_patterns to select specific datasets
+# - Use dataset_filter.exclude_patterns to skip datasets
+# - Patterns support glob wildcards: * (any characters), ? (single character), [] (character class)
+# - Exclude patterns are applied before include patterns
+# - If no include_patterns specified, all datasets (not excluded) are included

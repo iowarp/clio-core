@@ -2,7 +2,9 @@
 #define WRP_CAE_CORE_ASSIMILATION_CTX_H_
 
 #include <string>
+#include <vector>
 #include <cereal/types/string.hpp>
+#include <cereal/types/vector.hpp>
 
 namespace wrp_cae::core {
 
@@ -19,6 +21,10 @@ struct AssimilationCtx {
   size_t range_size;       // Number of bytes to read
   std::string src_token;   // Authentication token for source (e.g., Globus access token)
   std::string dst_token;   // Authentication token for destination
+
+  // Dataset filtering (for HDF5 and other hierarchical formats)
+  std::vector<std::string> include_patterns;  // Glob patterns for datasets to include
+  std::vector<std::string> exclude_patterns;  // Glob patterns for datasets to exclude
 
   // Default constructor
   AssimilationCtx()
@@ -45,7 +51,8 @@ struct AssimilationCtx {
   // Serialization support for cereal
   template<class Archive>
   void serialize(Archive& ar) {
-    ar(src, dst, format, depends_on, range_off, range_size, src_token, dst_token);
+    ar(src, dst, format, depends_on, range_off, range_size, src_token, dst_token,
+       include_patterns, exclude_patterns);
   }
 };
 

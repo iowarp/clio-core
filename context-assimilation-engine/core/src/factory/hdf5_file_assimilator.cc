@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <vector>
 #include <cstring>
+#include <fnmatch.h>
 
 // Include wrp_cte headers after closing any wrp_cae namespace to avoid Method namespace collision
 #include <wrp_cte/core/core_client.h>
@@ -76,12 +77,44 @@ int Hdf5FileAssimilator::Schedule(const AssimilationCtx& ctx) {
   HILOG(kInfo, "Hdf5FileAssimilator: Discovered {} dataset(s) in '{}'",
         dataset_paths.size(), src_path);
 
-  // Process each dataset
+  // Apply dataset filtering if patterns are specified
+  std::vector<std::string> filtered_paths;
+  if (!ctx.include_patterns.empty() || !ctx.exclude_patterns.empty()) {
+    HILOG(kInfo, "Hdf5FileAssimilator: Applying dataset filters...");
+    HILOG(kInfo, "  Include patterns: {}", ctx.include_patterns.size());
+    for (const auto& pattern : ctx.include_patterns) {
+      HILOG(kInfo, "    - '{}'", pattern);
+    }
+    HILOG(kInfo, "  Exclude patterns: {}", ctx.exclude_patterns.size());
+    for (const auto& pattern : ctx.exclude_patterns) {
+      HILOG(kInfo, "    - '{}'", pattern);
+    }
+
+    HILOG(kInfo, "Hdf5FileAssimilator: Checking {} discovered datasets against filters",
+          dataset_paths.size());
+    // Print first 5 dataset paths for debugging
+    for (size_t i = 0; i < std::min(size_t(5), dataset_paths.size()); ++i) {
+      HILOG(kInfo, "  Sample dataset {}: '{}'", i+1, dataset_paths[i]);
+    }
+
+    for (const auto& dataset_path : dataset_paths) {
+      if (MatchesFilter(dataset_path, ctx.include_patterns, ctx.exclude_patterns)) {
+        filtered_paths.push_back(dataset_path);
+      }
+    }
+    HILOG(kInfo, "Hdf5FileAssimilator: Filtered to {} dataset(s) (from {})",
+          filtered_paths.size(), dataset_paths.size());
+  } else {
+    HILOG(kInfo, "Hdf5FileAssimilator: No dataset filters specified, processing all datasets");
+    filtered_paths = dataset_paths;
+  }
+
+  // Process each filtered dataset
   int total_errors = 0;
-  for (size_t i = 0; i < dataset_paths.size(); ++i) {
-    const auto& dataset_path = dataset_paths[i];
+  for (size_t i = 0; i < filtered_paths.size(); ++i) {
+    const auto& dataset_path = filtered_paths[i];
     HILOG(kInfo, "Hdf5FileAssimilator: Processing dataset {}/{}: '{}'",
-          i + 1, dataset_paths.size(), dataset_path);
+          i + 1, filtered_paths.size(), dataset_path);
     int result = ProcessDataset(file_id, dataset_path, tag_prefix);
     if (result != 0) {
       HELOG(kError, "Hdf5FileAssimilator: Failed to process dataset '{}' (error code: {})",
@@ -98,12 +131,12 @@ int Hdf5FileAssimilator::Schedule(const AssimilationCtx& ctx) {
 
   if (total_errors > 0) {
     HELOG(kError, "Hdf5FileAssimilator: Completed with {} error(s) out of {} dataset(s)",
-          total_errors, dataset_paths.size());
+          total_errors, filtered_paths.size());
     return -6;
   }
 
   HILOG(kInfo, "Hdf5FileAssimilator: Successfully processed all {} dataset(s) from '{}'",
-        dataset_paths.size(), src_path);
+        filtered_paths.size(), src_path);
   HILOG(kInfo, "Hdf5FileAssimilator::Schedule() - EXIT (success)");
 
   return 0;
@@ -158,9 +191,10 @@ herr_t Hdf5FileAssimilator::VisitCallback(hid_t loc_id, const char* name,
     return 0;  // Continue iteration even on error
   }
 
-  // If it's a dataset, add it to the list
+  // If it's a dataset, add it to the list with leading slash
+  // (to match h5dump/h5ls output and user expectations)
   if (obj_info.type == H5O_TYPE_DATASET) {
-    dataset_paths->push_back(std::string(name));
+    dataset_paths->push_back("/" + std::string(name));
   }
 
   return 0;  // Continue iteration
@@ -171,12 +205,11 @@ int Hdf5FileAssimilator::DiscoverDatasets(hid_t file_id,
   HILOG(kInfo, "DiscoverDatasets: Starting dataset discovery for file_id: {}", file_id);
   dataset_paths.clear();
 
-  // Use H5Literate to visit all links in the file recursively
-  // Starting from root group, index 0, with VisitCallback
-  hsize_t idx = 0;
-  HILOG(kInfo, "DiscoverDatasets: Calling H5Literate...");
-  herr_t status = H5Literate(file_id, H5_INDEX_NAME, H5_ITER_NATIVE,
-                             &idx, VisitCallback, &dataset_paths);
+  // Use H5Lvisit to visit all links in the file recursively (including nested groups)
+  // H5Lvisit traverses the entire HDF5 hierarchy, unlike H5Literate which only visits root level
+  HILOG(kInfo, "DiscoverDatasets: Calling H5Lvisit...");
+  herr_t status = H5Lvisit(file_id, H5_INDEX_NAME, H5_ITER_NATIVE,
+                           VisitCallback, &dataset_paths);
 
   if (status < 0) {
     HELOG(kError, "Hdf5FileAssimilator: H5Literate failed");
@@ -563,6 +596,52 @@ std::string Hdf5FileAssimilator::GetUrlPath(const std::string& url) {
     return "";
   }
   return url.substr(pos + 2);
+}
+
+bool Hdf5FileAssimilator::MatchGlobPattern(const std::string& str,
+                                           const std::string& pattern) {
+  // Use fnmatch for glob pattern matching (supports *, ?, [])
+  // FNM_PATHNAME: '/' must be matched explicitly
+  // FNM_PERIOD: leading '.' must be matched explicitly
+  int result = fnmatch(pattern.c_str(), str.c_str(), 0);
+  return result == 0;
+}
+
+bool Hdf5FileAssimilator::MatchesFilter(
+    const std::string& dataset_path,
+    const std::vector<std::string>& include_patterns,
+    const std::vector<std::string>& exclude_patterns) {
+
+  // First check exclude patterns - if any match, exclude the dataset
+  for (const auto& exclude_pattern : exclude_patterns) {
+    if (MatchGlobPattern(dataset_path, exclude_pattern)) {
+      HILOG(kDebug, "Dataset '{}' excluded by pattern '{}'",
+            dataset_path, exclude_pattern);
+      return false;
+    }
+  }
+
+  // If no include patterns specified, include all (that weren't excluded)
+  if (include_patterns.empty()) {
+    return true;
+  }
+
+  // Check if dataset matches any include pattern
+  for (const auto& include_pattern : include_patterns) {
+    bool matches = MatchGlobPattern(dataset_path, include_pattern);
+    HILOG(kInfo, "Checking dataset '{}' against pattern '{}': {}",
+          dataset_path, include_pattern, matches ? "MATCH" : "NO MATCH");
+    if (matches) {
+      HILOG(kInfo, "Dataset '{}' included by pattern '{}'",
+            dataset_path, include_pattern);
+      return true;
+    }
+  }
+
+  // No include pattern matched, so exclude the dataset
+  HILOG(kInfo, "Dataset '{}' does not match any include pattern",
+        dataset_path);
+  return false;
 }
 
 }  // namespace wrp_cae::core

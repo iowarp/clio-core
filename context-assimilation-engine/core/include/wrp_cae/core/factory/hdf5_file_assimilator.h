@@ -38,6 +38,25 @@ class Hdf5FileAssimilator : public BaseAssimilator {
 
  private:
   /**
+   * Check if a dataset path matches the filter patterns
+   * @param dataset_path Dataset path to check (e.g., "/data/temperature")
+   * @param include_patterns Glob patterns to include (empty means include all)
+   * @param exclude_patterns Glob patterns to exclude
+   * @return true if dataset should be included, false otherwise
+   */
+  bool MatchesFilter(const std::string& dataset_path,
+                     const std::vector<std::string>& include_patterns,
+                     const std::vector<std::string>& exclude_patterns);
+
+  /**
+   * Check if a string matches a glob pattern
+   * @param str String to check
+   * @param pattern Glob pattern (supports *, ?, [])
+   * @return true if string matches pattern
+   */
+  bool MatchGlobPattern(const std::string& str, const std::string& pattern);
+
+  /**
    * Open HDF5 file in read-only mode (serial)
    * @param file_path Path to the HDF5 file
    * @return HDF5 file ID, or negative value on error
