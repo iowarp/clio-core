@@ -453,10 +453,6 @@ bool Worker::RouteTask(Future<Task> &future, TaskLane *lane,
   // Get task pointer from future
   FullPtr<Task> task_ptr = future.GetTaskPtr();
 
-  HLOG(kDebug, "Worker::RouteTask START - worker_id={}, method={}, pool_id={}",
-       worker_id_, task_ptr.IsNull() ? 0 : task_ptr->method_,
-       task_ptr.IsNull() ? PoolId() : task_ptr->pool_id_);
-
   if (task_ptr.IsNull()) {
     HLOG(kDebug, "Worker::RouteTask - task_ptr is null, returning false");
     return false;
@@ -478,16 +474,10 @@ bool Worker::RouteTask(Future<Task> &future, TaskLane *lane,
     run_ctx->exec_mode = ExecMode::kExec;
   }
 
-  HLOG(kDebug, "Worker::RouteTask - routing_mode={}",
-       static_cast<int>(task_ptr->pool_query_.GetRoutingMode()));
-
   // Resolve pool query and route task to container
   // Note: ResolveDynamicQuery may override exec_mode to kDynamicSchedule
   std::vector<PoolQuery> pool_queries =
       ResolvePoolQuery(task_ptr->pool_query_, task_ptr->pool_id_, task_ptr);
-
-  HLOG(kDebug, "Worker::RouteTask - pool_queries.size()={}",
-       pool_queries.size());
 
   // Check if pool_queries is empty - this indicates an error in resolution
   if (pool_queries.empty()) {
@@ -505,13 +495,9 @@ bool Worker::RouteTask(Future<Task> &future, TaskLane *lane,
 
   // Check if task should be processed locally
   bool is_local = IsTaskLocal(task_ptr, pool_queries);
-  HLOG(kDebug, "Worker::RouteTask - IsTaskLocal={}", is_local);
-
   if (is_local) {
     // Route task locally using container query and Monitor with kLocalSchedule
-    bool route_result = RouteLocal(future, lane, container);
-    HLOG(kDebug, "Worker::RouteTask - RouteLocal returned {}", route_result);
-    return route_result;
+    return RouteLocal(future, lane, container);
   } else {
     // Route task globally using admin client's ClientSendTaskIn method
     // RouteGlobal never fails, so no need for fallback logic
@@ -1095,13 +1081,6 @@ void Worker::ResumeFiber(const FullPtr<Task> &task_ptr, RunContext *run_ctx) {
 
 void Worker::ExecTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
                       bool is_started) {
-  HLOG(kDebug,
-       "Worker::ExecTask START - method={}, pool_id={}, is_started={}, "
-       "exec_mode={}",
-       task_ptr.IsNull() ? 0 : task_ptr->method_,
-       task_ptr.IsNull() ? PoolId() : task_ptr->pool_id_, is_started,
-       run_ctx ? static_cast<int>(run_ctx->exec_mode) : -1);
-
   // Set task_did_work_ to true by default (tasks can override via
   // CHI_CUR_WORKER)
   // This comes before the null check since the task was scheduled
@@ -1115,17 +1094,11 @@ void Worker::ExecTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
 
   // Call appropriate fiber function based on task state
   if (is_started) {
-    HLOG(kDebug, "Worker::ExecTask - calling ResumeFiber");
     ResumeFiber(task_ptr, run_ctx);
   } else {
-    HLOG(kDebug, "Worker::ExecTask - calling BeginFiber");
     BeginFiber(task_ptr, run_ctx, FiberExecutionFunction);
     task_ptr->SetFlags(TASK_STARTED);
   }
-
-  HLOG(kDebug,
-       "Worker::ExecTask - fiber returned, is_yielded_={}, exec_mode={}",
-       run_ctx->is_yielded_, static_cast<int>(run_ctx->exec_mode));
 
   // Only set did_work_ if the task actually did work
   if (GetTaskDidWork() && run_ctx->exec_mode != ExecMode::kDynamicSchedule) {
