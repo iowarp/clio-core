@@ -5,7 +5,8 @@
  * header files (.h) for ChiMods based on their chimaera_mod.yaml configuration files.
  *
  * The libexec source files implement Container virtual API methods (Run, Del,
- * SaveTask, LoadTask, NewCopy) with switch-case dispatch.
+ * SaveTask, LoadTask, AllocLoadTask, LocalLoadTask, LocalAllocLoadTask,
+ * NewCopy, Aggregate) with switch-case dispatch.
  *
  * Usage:
  *     chi_refresh_repo <chimod_repo_path>
@@ -323,47 +324,63 @@ class ChiModGenerator {
     oss << "  }\n";
     oss << "}\n";
     oss << "\n";
-    oss << "hipc::FullPtr<chi::Task> Runtime::LoadTask(chi::u32 method, chi::LoadTaskArchive& archive) {\n";
-    oss << "  auto* ipc_manager = CHI_IPC;\n";
+    oss << "void Runtime::LoadTask(chi::u32 method, chi::LoadTaskArchive& archive,\n";
+    oss << "                        hipc::FullPtr<chi::Task> task_ptr) {\n";
     oss << "  switch (method) {\n";
 
     // Add LoadTask switch cases
     for (const auto& method : methods) {
       std::string task_type = GetTaskTypeName(method.method_name, chimod_name);
       oss << "    case Method::" << method.constant_name << ": {\n";
-      oss << "      auto task_ptr = ipc_manager->NewTask<" << task_type << ">();\n";
-      oss << "      archive >> *task_ptr.ptr_;\n";
-      oss << "      return task_ptr.template Cast<chi::Task>();\n";
+      oss << "      auto typed_task = task_ptr.template Cast<" << task_type << ">();\n";
+      oss << "      archive >> *typed_task.ptr_;\n";
+      oss << "      break;\n";
       oss << "    }\n";
     }
 
     oss << "    default: {\n";
-    oss << "      // Unknown method - return null\n";
-    oss << "      return hipc::FullPtr<chi::Task>();\n";
+    oss << "      // Unknown method - do nothing\n";
+    oss << "      break;\n";
     oss << "    }\n";
     oss << "  }\n";
     oss << "}\n";
     oss << "\n";
-    oss << "hipc::FullPtr<chi::Task> Runtime::LocalLoadTask(chi::u32 method, chi::LocalLoadTaskArchive& archive) {\n";
-    oss << "  auto* ipc_manager = CHI_IPC;\n";
+    oss << "hipc::FullPtr<chi::Task> Runtime::AllocLoadTask(chi::u32 method, chi::LoadTaskArchive& archive) {\n";
+    oss << "  hipc::FullPtr<chi::Task> task_ptr = NewTask(method);\n";
+    oss << "  if (!task_ptr.IsNull()) {\n";
+    oss << "    LoadTask(method, archive, task_ptr);\n";
+    oss << "  }\n";
+    oss << "  return task_ptr;\n";
+    oss << "}\n";
+    oss << "\n";
+    oss << "void Runtime::LocalLoadTask(chi::u32 method, chi::LocalLoadTaskArchive& archive,\n";
+    oss << "                            hipc::FullPtr<chi::Task> task_ptr) {\n";
     oss << "  switch (method) {\n";
 
     // Add LocalLoadTask switch cases
     for (const auto& method : methods) {
       std::string task_type = GetTaskTypeName(method.method_name, chimod_name);
       oss << "    case Method::" << method.constant_name << ": {\n";
-      oss << "      auto task_ptr = ipc_manager->NewTask<" << task_type << ">();\n";
+      oss << "      auto typed_task = task_ptr.template Cast<" << task_type << ">();\n";
       oss << "      // Call SerializeIn - task will call Task::SerializeIn for base fields\n";
-      oss << "      task_ptr.ptr_->SerializeIn(archive);\n";
-      oss << "      return task_ptr.template Cast<chi::Task>();\n";
+      oss << "      typed_task.ptr_->SerializeIn(archive);\n";
+      oss << "      break;\n";
       oss << "    }\n";
     }
 
     oss << "    default: {\n";
-    oss << "      // Unknown method - return null\n";
-    oss << "      return hipc::FullPtr<chi::Task>();\n";
+    oss << "      // Unknown method - do nothing\n";
+    oss << "      break;\n";
     oss << "    }\n";
     oss << "  }\n";
+    oss << "}\n";
+    oss << "\n";
+    oss << "hipc::FullPtr<chi::Task> Runtime::LocalAllocLoadTask(chi::u32 method, chi::LocalLoadTaskArchive& archive) {\n";
+    oss << "  hipc::FullPtr<chi::Task> task_ptr = NewTask(method);\n";
+    oss << "  if (!task_ptr.IsNull()) {\n";
+    oss << "    LocalLoadTask(method, archive, task_ptr);\n";
+    oss << "  }\n";
+    oss << "  return task_ptr;\n";
     oss << "}\n";
     oss << "\n";
     oss << "void Runtime::LocalSaveTask(chi::u32 method, chi::LocalSaveTaskArchive& archive, \n";

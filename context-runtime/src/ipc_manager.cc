@@ -339,7 +339,8 @@ bool IpcManager::ServerInitQueues() {
     ConfigManager *config = CHI_CONFIG_MANAGER;
     u32 sched_count = config->GetSchedulerWorkerCount();
     u32 slow_count = config->GetSlowWorkerCount();
-    u32 total_workers = sched_count + slow_count;
+    u32 net_worker_count = 1;  // Dedicated network worker (hardcoded to 1)
+    u32 total_workers = sched_count + slow_count + net_worker_count;
 
     // Number of scheduling queues equals number of sched workers
     u32 num_sched_queues = sched_count;
@@ -349,7 +350,7 @@ bool IpcManager::ServerInitQueues() {
     shared_header_->num_sched_queues = num_sched_queues;
 
     // Initialize TaskQueue in shared header
-    // Number of lanes equals number of sched workers for optimal distribution
+    // Number of lanes equals total worker count (including net worker)
     new (&shared_header_->worker_queues) TaskQueue(
         main_allocator_,
         total_workers,  // num_lanes equals total worker count
@@ -360,7 +361,15 @@ bool IpcManager::ServerInitQueues() {
     worker_queues_ = hipc::FullPtr<TaskQueue>(main_allocator_,
                                               &shared_header_->worker_queues);
 
-    return !worker_queues_.IsNull();
+    // Initialize network queue for send operations
+    // One lane with two priorities (SendIn and SendOut)
+    net_queue_ = main_allocator_->NewObj<NetQueue>(
+        main_allocator_,
+        1,     // num_lanes: single lane for network operations
+        2,     // num_priorities: 0=SendIn, 1=SendOut
+        1024); // depth_per_queue
+
+    return !worker_queues_.IsNull() && !net_queue_.IsNull();
   } catch (const std::exception &e) {
     return false;
   }
@@ -880,6 +889,38 @@ void IpcManager::ClearClientPool() {
   HLOG(kInfo, "[ClientPool] Clearing {} persistent connections",
         client_pool_.size());
   client_pool_.clear();
+}
+
+void IpcManager::EnqueueNetTask(Future<Task> future, NetQueuePriority priority) {
+  if (net_queue_.IsNull()) {
+    HLOG(kError, "EnqueueNetTask: net_queue_ is null");
+    return;
+  }
+
+  // Get lane 0 (single lane) with the specified priority
+  u32 priority_idx = static_cast<u32>(priority);
+  auto& lane = net_queue_->GetLane(0, priority_idx);
+  lane.Push(future);
+
+  HLOG(kDebug, "EnqueueNetTask: Enqueued task to priority {} queue", priority_idx);
+}
+
+bool IpcManager::TryPopNetTask(NetQueuePriority priority, Future<Task>& future) {
+  if (net_queue_.IsNull()) {
+    return false;
+  }
+
+  // Get lane 0 (single lane) with the specified priority
+  u32 priority_idx = static_cast<u32>(priority);
+  auto& lane = net_queue_->GetLane(0, priority_idx);
+
+  if (lane.Pop(future)) {
+    // Fix the allocator pointer after popping
+    future.SetAllocator(main_allocator_);
+    return true;
+  }
+
+  return false;
 }
 
 } // namespace chi

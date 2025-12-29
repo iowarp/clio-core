@@ -178,112 +178,128 @@ void Runtime::SaveTask(chi::u32 method, chi::SaveTaskArchive& archive,
   }
 }
 
-hipc::FullPtr<chi::Task> Runtime::LoadTask(chi::u32 method, chi::LoadTaskArchive& archive) {
-  auto* ipc_manager = CHI_IPC;
+void Runtime::LoadTask(chi::u32 method, chi::LoadTaskArchive& archive,
+                        hipc::FullPtr<chi::Task> task_ptr) {
   switch (method) {
     case Method::kCreate: {
-      auto task_ptr = ipc_manager->NewTask<CreateTask>();
-      archive >> *task_ptr.ptr_;
-      return task_ptr.template Cast<chi::Task>();
+      auto typed_task = task_ptr.template Cast<CreateTask>();
+      archive >> *typed_task.ptr_;
+      break;
     }
     case Method::kDestroy: {
-      auto task_ptr = ipc_manager->NewTask<DestroyTask>();
-      archive >> *task_ptr.ptr_;
-      return task_ptr.template Cast<chi::Task>();
+      auto typed_task = task_ptr.template Cast<DestroyTask>();
+      archive >> *typed_task.ptr_;
+      break;
     }
     case Method::kGetOrCreatePool: {
-      auto task_ptr = ipc_manager->NewTask<admin::GetOrCreatePoolTask<admin::CreateParams>>();
-      archive >> *task_ptr.ptr_;
-      return task_ptr.template Cast<chi::Task>();
+      auto typed_task = task_ptr.template Cast<admin::GetOrCreatePoolTask<admin::CreateParams>>();
+      archive >> *typed_task.ptr_;
+      break;
     }
     case Method::kDestroyPool: {
-      auto task_ptr = ipc_manager->NewTask<DestroyPoolTask>();
-      archive >> *task_ptr.ptr_;
-      return task_ptr.template Cast<chi::Task>();
+      auto typed_task = task_ptr.template Cast<DestroyPoolTask>();
+      archive >> *typed_task.ptr_;
+      break;
     }
     case Method::kStopRuntime: {
-      auto task_ptr = ipc_manager->NewTask<StopRuntimeTask>();
-      archive >> *task_ptr.ptr_;
-      return task_ptr.template Cast<chi::Task>();
+      auto typed_task = task_ptr.template Cast<StopRuntimeTask>();
+      archive >> *typed_task.ptr_;
+      break;
     }
     case Method::kFlush: {
-      auto task_ptr = ipc_manager->NewTask<FlushTask>();
-      archive >> *task_ptr.ptr_;
-      return task_ptr.template Cast<chi::Task>();
+      auto typed_task = task_ptr.template Cast<FlushTask>();
+      archive >> *typed_task.ptr_;
+      break;
     }
     case Method::kSend: {
-      auto task_ptr = ipc_manager->NewTask<SendTask>();
-      archive >> *task_ptr.ptr_;
-      return task_ptr.template Cast<chi::Task>();
+      auto typed_task = task_ptr.template Cast<SendTask>();
+      archive >> *typed_task.ptr_;
+      break;
     }
     case Method::kRecv: {
-      auto task_ptr = ipc_manager->NewTask<RecvTask>();
-      archive >> *task_ptr.ptr_;
-      return task_ptr.template Cast<chi::Task>();
+      auto typed_task = task_ptr.template Cast<RecvTask>();
+      archive >> *typed_task.ptr_;
+      break;
     }
     default: {
-      // Unknown method - return null
-      return hipc::FullPtr<chi::Task>();
+      // Unknown method - do nothing
+      break;
     }
   }
 }
 
-hipc::FullPtr<chi::Task> Runtime::LocalLoadTask(chi::u32 method, chi::LocalLoadTaskArchive& archive) {
-  auto* ipc_manager = CHI_IPC;
+hipc::FullPtr<chi::Task> Runtime::AllocLoadTask(chi::u32 method, chi::LoadTaskArchive& archive) {
+  hipc::FullPtr<chi::Task> task_ptr = NewTask(method);
+  if (!task_ptr.IsNull()) {
+    LoadTask(method, archive, task_ptr);
+  }
+  return task_ptr;
+}
+
+void Runtime::LocalLoadTask(chi::u32 method, chi::LocalLoadTaskArchive& archive,
+                            hipc::FullPtr<chi::Task> task_ptr) {
   switch (method) {
     case Method::kCreate: {
-      auto task_ptr = ipc_manager->NewTask<CreateTask>();
+      auto typed_task = task_ptr.template Cast<CreateTask>();
       // Call SerializeIn - task will call Task::SerializeIn for base fields
-      task_ptr.ptr_->SerializeIn(archive);
-      return task_ptr.template Cast<chi::Task>();
+      typed_task.ptr_->SerializeIn(archive);
+      break;
     }
     case Method::kDestroy: {
-      auto task_ptr = ipc_manager->NewTask<DestroyTask>();
+      auto typed_task = task_ptr.template Cast<DestroyTask>();
       // Call SerializeIn - task will call Task::SerializeIn for base fields
-      task_ptr.ptr_->SerializeIn(archive);
-      return task_ptr.template Cast<chi::Task>();
+      typed_task.ptr_->SerializeIn(archive);
+      break;
     }
     case Method::kGetOrCreatePool: {
-      auto task_ptr = ipc_manager->NewTask<admin::GetOrCreatePoolTask<admin::CreateParams>>();
+      auto typed_task = task_ptr.template Cast<admin::GetOrCreatePoolTask<admin::CreateParams>>();
       // Call SerializeIn - task will call Task::SerializeIn for base fields
-      task_ptr.ptr_->SerializeIn(archive);
-      return task_ptr.template Cast<chi::Task>();
+      typed_task.ptr_->SerializeIn(archive);
+      break;
     }
     case Method::kDestroyPool: {
-      auto task_ptr = ipc_manager->NewTask<DestroyPoolTask>();
+      auto typed_task = task_ptr.template Cast<DestroyPoolTask>();
       // Call SerializeIn - task will call Task::SerializeIn for base fields
-      task_ptr.ptr_->SerializeIn(archive);
-      return task_ptr.template Cast<chi::Task>();
+      typed_task.ptr_->SerializeIn(archive);
+      break;
     }
     case Method::kStopRuntime: {
-      auto task_ptr = ipc_manager->NewTask<StopRuntimeTask>();
+      auto typed_task = task_ptr.template Cast<StopRuntimeTask>();
       // Call SerializeIn - task will call Task::SerializeIn for base fields
-      task_ptr.ptr_->SerializeIn(archive);
-      return task_ptr.template Cast<chi::Task>();
+      typed_task.ptr_->SerializeIn(archive);
+      break;
     }
     case Method::kFlush: {
-      auto task_ptr = ipc_manager->NewTask<FlushTask>();
+      auto typed_task = task_ptr.template Cast<FlushTask>();
       // Call SerializeIn - task will call Task::SerializeIn for base fields
-      task_ptr.ptr_->SerializeIn(archive);
-      return task_ptr.template Cast<chi::Task>();
+      typed_task.ptr_->SerializeIn(archive);
+      break;
     }
     case Method::kSend: {
-      auto task_ptr = ipc_manager->NewTask<SendTask>();
+      auto typed_task = task_ptr.template Cast<SendTask>();
       // Call SerializeIn - task will call Task::SerializeIn for base fields
-      task_ptr.ptr_->SerializeIn(archive);
-      return task_ptr.template Cast<chi::Task>();
+      typed_task.ptr_->SerializeIn(archive);
+      break;
     }
     case Method::kRecv: {
-      auto task_ptr = ipc_manager->NewTask<RecvTask>();
+      auto typed_task = task_ptr.template Cast<RecvTask>();
       // Call SerializeIn - task will call Task::SerializeIn for base fields
-      task_ptr.ptr_->SerializeIn(archive);
-      return task_ptr.template Cast<chi::Task>();
+      typed_task.ptr_->SerializeIn(archive);
+      break;
     }
     default: {
-      // Unknown method - return null
-      return hipc::FullPtr<chi::Task>();
+      // Unknown method - do nothing
+      break;
     }
   }
+}
+
+hipc::FullPtr<chi::Task> Runtime::LocalAllocLoadTask(chi::u32 method, chi::LocalLoadTaskArchive& archive) {
+  hipc::FullPtr<chi::Task> task_ptr = NewTask(method);
+  if (!task_ptr.IsNull()) {
+    LocalLoadTask(method, archive, task_ptr);
+  }
+  return task_ptr;
 }
 
 void Runtime::LocalSaveTask(chi::u32 method, chi::LocalSaveTaskArchive& archive, 

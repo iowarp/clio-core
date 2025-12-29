@@ -129,26 +129,46 @@ class Container {
                         hipc::FullPtr<Task> task_ptr) = 0;
 
   /**
-   * Deserialize task parameters from network transfer (unified method)
+   * Deserialize task parameters into an existing task from network transfer
    * Must be implemented by derived classes
    * Uses switch-case structure based on method ID to dispatch to appropriate deserialization
-   * Internally calls NewTask to allocate the task pointer
+   * Does not allocate - assumes task_ptr is already allocated
+   * @param method The method ID to deserialize
+   * @param archive LoadTaskArchive configured with srl_mode (true=In, false=Out)
+   * @param task_ptr Full pointer to the pre-allocated task to load into
+   */
+  virtual void LoadTask(u32 method, LoadTaskArchive& archive,
+                        hipc::FullPtr<Task> task_ptr) = 0;
+
+  /**
+   * Allocate and deserialize task parameters from network transfer
+   * Wrapper that calls NewTask followed by LoadTask
    * @param method The method ID to deserialize
    * @param archive LoadTaskArchive configured with srl_mode (true=In, false=Out)
    * @return Full pointer to the newly allocated and deserialized task
    */
-  virtual hipc::FullPtr<Task> LoadTask(u32 method, LoadTaskArchive& archive) = 0;
+  virtual hipc::FullPtr<Task> AllocLoadTask(u32 method, LoadTaskArchive& archive) = 0;
 
   /**
-   * Deserialize task input parameters using LocalSerialize (for local transfers)
+   * Deserialize task input parameters into an existing task using LocalSerialize
    * Must be implemented by derived classes
-   * Uses switch-case structure based on method ID to dispatch to appropriate serialization
-   * Internally calls NewTask to allocate the task pointer
-   * @param method The method ID to serialize
+   * Uses switch-case structure based on method ID to dispatch to appropriate deserialization
+   * Does not allocate - assumes task_ptr is already allocated
+   * @param method The method ID to deserialize
+   * @param archive LocalLoadTaskArchive for deserializing inputs
+   * @param task_ptr Full pointer to the pre-allocated task to load into
+   */
+  virtual void LocalLoadTask(u32 method, LocalLoadTaskArchive& archive,
+                             hipc::FullPtr<Task> task_ptr) = 0;
+
+  /**
+   * Allocate and deserialize task input parameters using LocalSerialize
+   * Wrapper that calls NewTask followed by LocalLoadTask
+   * @param method The method ID to deserialize
    * @param archive LocalLoadTaskArchive for deserializing inputs
    * @return Full pointer to the newly allocated and loaded task
    */
-  virtual hipc::FullPtr<Task> LocalLoadTask(u32 method, LocalLoadTaskArchive& archive) = 0;
+  virtual hipc::FullPtr<Task> LocalAllocLoadTask(u32 method, LocalLoadTaskArchive& archive) = 0;
 
   /**
    * Serialize task output parameters using LocalSerialize (for local transfers)

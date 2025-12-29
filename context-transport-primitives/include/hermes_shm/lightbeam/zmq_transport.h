@@ -27,7 +27,7 @@ void serialize(Archive& ar, hshm::lbm::Bulk& bulk) {
 
 template <class Archive>
 void serialize(Archive& ar, hshm::lbm::LbmMeta& meta) {
-  ar(meta.send, meta.recv);
+  ar(meta.send, meta.recv, meta.send_bulks, meta.recv_bulks);
 }
 }  // namespace cereal
 
@@ -148,8 +148,6 @@ class ZeroMqClient : public Client {
 
   template <typename MetaT>
   int Send(MetaT& meta, const LbmContext& ctx = LbmContext()) {
-    HLOG(kDebug, "ZeroMqClient::Send - START to {}:{}", addr_, port_);
-
     // Serialize metadata (includes both send and recv vectors)
     std::ostringstream oss(std::ios::binary);
     {
@@ -157,24 +155,14 @@ class ZeroMqClient : public Client {
       ar(meta);
     }
     std::string meta_str = oss.str();
-    HLOG(kDebug, "ZeroMqClient::Send - serialized metadata size={}",
-         meta_str.size());
 
-    // Count bulks marked for WRITE
-    size_t write_bulk_count = 0;
-    for (const auto& bulk : meta.send) {
-      if (bulk.flags.Any(BULK_XFER)) {
-        write_bulk_count++;
-      }
-    }
+    // Use pre-computed send_bulks count for ZMQ_SNDMORE handling
+    size_t write_bulk_count = meta.send_bulks;
 
     // IMPORTANT: Always use blocking send for distributed messaging
     // ZMQ_DONTWAIT with newly-created connections causes messages to be lost
     // because the connection may not be established when send is called
     int base_flags = 0;  // Use blocking sends
-
-    HLOG(kInfo, "ZeroMqClient::Send - write_bulk_count={}, base_flags={}",
-         write_bulk_count, base_flags);
 
     // Send metadata - use ZMQ_SNDMORE only if there are WRITE bulks to follow
     int flags = base_flags;
@@ -183,10 +171,8 @@ class ZeroMqClient : public Client {
     }
 
     int rc = zmq_send(socket_, meta_str.data(), meta_str.size(), flags);
-    HLOG(kDebug, "ZeroMqClient::Send - zmq_send metadata rc={}, errno={}", rc,
-         rc == -1 ? zmq_errno() : 0);
     if (rc == -1) {
-      HLOG(kDebug, "ZeroMqClient::Send - FAILED: {}",
+      HLOG(kError, "ZeroMqClient::Send - FAILED: {}",
            zmq_strerror(zmq_errno()));
       return zmq_errno();
     }
@@ -206,20 +192,11 @@ class ZeroMqClient : public Client {
 
       rc = zmq_send(socket_, meta.send[i].data.ptr_, meta.send[i].size, flags);
       if (rc == -1) {
-        HLOG(kDebug, "ZeroMqClient::Send - bulk {} FAILED: {}", i,
+        HLOG(kError, "ZeroMqClient::Send - bulk {} FAILED: {}", i,
              zmq_strerror(zmq_errno()));
         return zmq_errno();
       }
     }
-
-    HLOG(kDebug, "ZeroMqClient::Send - SUCCESS to {}:{}", addr_, port_);
-
-    // Give TCP stack time to transmit the message before socket is destroyed.
-    // This is a diagnostic workaround - proper fix would be to reuse
-    // connections.
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    HLOG(kDebug, "ZeroMqClient::Send - post-send delay completed");
-
     return 0;  // Success
   }
 
@@ -272,24 +249,13 @@ class ZeroMqServer : public Server {
     return bulk;
   }
 
+  /**
+   * Receive and deserialize metadata from the network
+   * @param meta The metadata structure to populate
+   * @return 0 on success, EAGAIN if no message, -1 on deserialization error
+   */
   template <typename MetaT>
-  int RecvMetadata(MetaT& meta, bool* has_more_parts = nullptr) {
-    static thread_local int recv_attempt_count = 0;
-    recv_attempt_count++;
-
-    // Check socket events periodically for diagnostics
-    if (recv_attempt_count % 1000 == 1) {
-      int events = 0;
-      size_t events_size = sizeof(events);
-      zmq_getsockopt(socket_, ZMQ_EVENTS, &events, &events_size);
-      HLOG(kDebug,
-           "ZeroMqServer::RecvMetadata - ZMQ_EVENTS={} "
-           "(POLLIN={}, POLLOUT={}), attempt={}, socket={}",
-           events, (events & ZMQ_POLLIN) ? 1 : 0,
-           (events & ZMQ_POLLOUT) ? 1 : 0, recv_attempt_count,
-           reinterpret_cast<uintptr_t>(socket_));
-    }
-
+  int RecvMetadata(MetaT& meta) {
     // Receive metadata message (non-blocking)
     zmq_msg_t msg;
     zmq_msg_init(&msg);
@@ -298,27 +264,7 @@ class ZeroMqServer : public Server {
     if (rc == -1) {
       int err = zmq_errno();
       zmq_msg_close(&msg);
-      // Only log every 1000th EAGAIN to avoid spam
-      if (err != EAGAIN || recv_attempt_count % 1000 == 0) {
-        HLOG(kInfo,
-             "ZeroMqServer::RecvMetadata - err={} ({}), attempt={}, socket={}",
-             err, zmq_strerror(err), recv_attempt_count,
-             reinterpret_cast<uintptr_t>(socket_));
-      }
       return err;
-    }
-
-    HLOG(kInfo,
-         "ZeroMqServer::RecvMetadata - RECEIVED message! size={}, "
-         "attempt={}",
-         zmq_msg_size(&msg), recv_attempt_count);
-
-    // Check if there are more message parts (bulk data following metadata)
-    int more = 0;
-    size_t more_size = sizeof(more);
-    zmq_getsockopt(socket_, ZMQ_RCVMORE, &more, &more_size);
-    if (has_more_parts) {
-      *has_more_parts = (more != 0);
     }
 
     // Deserialize metadata
@@ -329,100 +275,37 @@ class ZeroMqServer : public Server {
       cereal::BinaryInputArchive ar(iss);
       ar(meta);
     } catch (const std::exception& e) {
-      // If deserialization fails, this might be bulk data from a previous
-      // incomplete receive or a spurious epoll trigger. Discard and return.
-      if (more) {
-        // Multi-part message with stale data - discard remaining parts
-        HLOG(kDebug,
-             "ZeroMQ RecvMetadata: Discarding stale multi-part message "
-             "(msg_size={}, has_more=true)",
-             msg_size);
-        DiscardRemainingParts();
-      } else if (msg_size > 10000) {
-        // Large standalone message (likely bulk data) - log as debug
-        HLOG(kDebug,
-             "ZeroMQ RecvMetadata: Received large non-metadata message "
-             "(msg_size={}), skipping",
-             msg_size);
-      } else {
-        // Small message that failed to parse - this is a real error
-        HLOG(kError,
-             "ZeroMQ RecvMetadata: Deserialization failed - {} (msg_size={})",
-             e.what(), msg_size);
-      }
+      HLOG(kFatal,
+           "ZeroMQ RecvMetadata: Deserialization failed - {} (msg_size={})",
+           e.what(), msg_size);
       zmq_msg_close(&msg);
       return -1;  // Deserialization error
     }
-
     zmq_msg_close(&msg);
     return 0;  // Success
   }
 
   /**
-   * Discard remaining parts of a multi-part message
-   * Used to re-synchronize after a failed receive
+   * Receive bulk data into pre-allocated buffers
+   * Uses meta.send_bulks (from sender's metadata) to know exact count
+   * @param meta The metadata with recv buffers already populated
+   * @return 0 on success, errno on failure
    */
-  void DiscardRemainingParts() {
-    int more = 1;
-    while (more) {
-      zmq_msg_t msg;
-      zmq_msg_init(&msg);
-      int rc = zmq_msg_recv(&msg, socket_, 0);
-      if (rc == -1) {
-        zmq_msg_close(&msg);
-        break;
-      }
-      size_t more_size = sizeof(more);
-      zmq_getsockopt(socket_, ZMQ_RCVMORE, &more, &more_size);
-      zmq_msg_close(&msg);
-    }
-  }
-
   template <typename MetaT>
   int RecvBulks(MetaT& meta) {
-    // Count bulks marked with BULK_XFER (only these will be received)
-    size_t write_bulk_count = 0;
-    for (const auto& bulk : meta.recv) {
-      if (bulk.flags.Any(BULK_XFER)) {
-        write_bulk_count++;
-      }
-    }
-
-    // If no WRITE bulks, return immediately
-    if (write_bulk_count == 0) {
-      return 0;
-    }
-
-    // Receive only bulks marked with BULK_XFER
     size_t recv_count = 0;
     for (size_t i = 0; i < meta.recv.size(); ++i) {
       if (!meta.recv[i].flags.Any(BULK_XFER)) {
-        continue;  // Skip bulks not marked for WRITE
+        continue;
       }
-
-      int rc = zmq_recv(socket_, meta.recv[i].data.ptr_, meta.recv[i].size, 0);
+      recv_count++;
+      // Use ZMQ_RCVMORE if more bulks remain
+      int flags = (recv_count < meta.send_bulks) ? ZMQ_RCVMORE : 0;
+      int rc = zmq_recv(socket_, meta.recv[i].data.ptr_, meta.recv[i].size, flags);
       if (rc == -1) {
         return zmq_errno();
       }
-      recv_count++;
-
-      // Check if there are more message parts
-      int more = 0;
-      size_t more_size = sizeof(more);
-      zmq_getsockopt(socket_, ZMQ_RCVMORE, &more, &more_size);
-
-      // If this is the last expected WRITE bulk but more parts exist, it's an
-      // error
-      if (recv_count == write_bulk_count && more) {
-        return -1;  // More parts than expected
-      }
-
-      // If we expect more WRITE bulks but no more parts, it's incomplete
-      if (recv_count < write_bulk_count && !more) {
-        return -1;  // Fewer parts than expected
-      }
     }
-
     return 0;  // Success
   }
 
@@ -440,23 +323,12 @@ class ZeroMqServer : public Server {
     return fd;
   }
 
-  /**
-   * Lock the socket for exclusive access during multi-part receive
-   * Use this when you need to perform a multi-part receive (RecvMetadata +
-   * RecvBulks)
-   * @return A lock guard that will unlock automatically when destroyed
-   */
-  std::unique_lock<std::mutex> LockSocket() {
-    return std::unique_lock<std::mutex>(socket_mutex_);
-  }
-
  private:
   std::string addr_;
   std::string protocol_;
   int port_;
   void* ctx_;
   void* socket_;
-  mutable std::mutex socket_mutex_; /**< Mutex to serialize socket access */
 };
 
 // --- Base Class Template Implementations ---
@@ -468,8 +340,8 @@ int Client::Send(MetaT& meta, const LbmContext& ctx) {
 }
 
 template <typename MetaT>
-int Server::RecvMetadata(MetaT& meta, bool* has_more_parts) {
-  return static_cast<ZeroMqServer*>(this)->RecvMetadata(meta, has_more_parts);
+int Server::RecvMetadata(MetaT& meta) {
+  return static_cast<ZeroMqServer*>(this)->RecvMetadata(meta);
 }
 
 template <typename MetaT>

@@ -418,19 +418,11 @@ struct FlushTask : public chi::Task {
 using DestroyTask = DestroyPoolTask;
 
 /**
- * SendTask - Unified task for sending task inputs or outputs over network
- * Replaces ClientSendTaskIn and ServerSendTaskOut
+ * SendTask - Periodic task for sending queued tasks over network
+ * Polls net_queue_ for tasks and sends them to remote nodes
+ * This is a periodic task similar to RecvTask
  */
 struct SendTask : public chi::Task {
-  // Message type: kSerializeIn (inputs), kSerializeOut (outputs), or kHeartbeat
-  IN chi::MsgType msg_type_;
-
-  // Subtask to serialize and send
-  INOUT hipc::FullPtr<chi::Task> origin_task_;
-
-  // Pool queries for target nodes
-  INOUT std::vector<chi::PoolQuery> pool_queries_;
-
   // Network transfer parameters
   IN chi::u32 transfer_flags_; ///< Flags controlling transfer behavior
 
@@ -439,18 +431,13 @@ struct SendTask : public chi::Task {
 
   /** SHM default constructor */
   SendTask()
-      : chi::Task(), msg_type_(chi::MsgType::kSerializeIn),
-        origin_task_(hipc::FullPtr<chi::Task>()), pool_queries_(),
-        transfer_flags_(0), error_message_(CHI_IPC->GetMainAlloc()) {}
+      : chi::Task(), transfer_flags_(0), error_message_(CHI_IPC->GetMainAlloc()) {}
 
   /** Emplace constructor */
   explicit SendTask(const chi::TaskId &task_node, const chi::PoolId &pool_id,
-                    const chi::PoolQuery &pool_query, chi::MsgType msg_type,
-                    hipc::FullPtr<chi::Task> subtask,
-                    const std::vector<chi::PoolQuery> &pool_queries,
+                    const chi::PoolQuery &pool_query,
                     chi::u32 transfer_flags = 0)
       : chi::Task(task_node, pool_id, pool_query, Method::kSend),
-        msg_type_(msg_type), origin_task_(subtask), pool_queries_(pool_queries),
         transfer_flags_(transfer_flags), error_message_(CHI_IPC->GetMainAlloc()) {
     // Initialize task
     task_id_ = task_node;
@@ -459,8 +446,6 @@ struct SendTask : public chi::Task {
     task_flags_.Clear();
     pool_query_ = pool_query;
     stat_.io_size_ = 1024 * 1024; // 1MB
-    // Mark as fire-and-forget since SendTask will never be awaited
-    SetFireAndForget();
   }
 
   /**
@@ -468,7 +453,7 @@ struct SendTask : public chi::Task {
    */
   template <typename Archive> void SerializeIn(Archive &ar) {
     Task::SerializeIn(ar);
-    ar(msg_type_, origin_task_, pool_queries_, transfer_flags_);
+    ar(transfer_flags_);
   }
 
   /**
@@ -476,7 +461,7 @@ struct SendTask : public chi::Task {
    */
   template <typename Archive> void SerializeOut(Archive &ar) {
     Task::SerializeOut(ar);
-    ar(msg_type_, origin_task_, pool_queries_, error_message_);
+    ar(error_message_);
   }
 
   /**
@@ -487,9 +472,6 @@ struct SendTask : public chi::Task {
     // Copy base Task fields
     Task::Copy(other.template Cast<Task>());
     // Copy SendTask-specific fields
-    msg_type_ = other->msg_type_;
-    origin_task_ = other->origin_task_;
-    pool_queries_ = other->pool_queries_;
     transfer_flags_ = other->transfer_flags_;
     error_message_ = other->error_message_;
   }

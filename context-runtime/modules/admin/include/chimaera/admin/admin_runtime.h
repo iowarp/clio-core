@@ -6,9 +6,7 @@
 #include <chimaera/chimaera.h>
 #include <chimaera/container.h>
 #include <chimaera/pool_manager.h>
-#include <chimaera/comutex.h>
 #include <chimaera/unordered_map_ll.h>
-#include <vector>
 
 namespace chimaera::admin {
 
@@ -51,18 +49,10 @@ private:
 
   // Network task tracking maps (keyed by net_key for efficient lookup)
   // Using lock-free unordered_map_ll with 1024 buckets for high concurrency
+  // Thread safety: All Send/Recv tasks are routed to a single dedicated net worker
   static constexpr size_t kNumMapBuckets = 1024;
   chi::unordered_map_ll<size_t, hipc::FullPtr<chi::Task>> send_map_{kNumMapBuckets};  // Tasks sent to remote nodes
   chi::unordered_map_ll<size_t, hipc::FullPtr<chi::Task>> recv_map_{kNumMapBuckets};  // Tasks received from remote nodes
-
-  // CoMutex vector for synchronizing map access (one per worker thread)
-  // Mutable to allow locking in const methods like GetWorkRemaining()
-  mutable std::vector<chi::CoMutex> send_map_locks_;
-  mutable std::vector<chi::CoMutex> recv_map_locks_;
-
-  // CoMutex vector for synchronizing ZeroMQ client sends (one per destination)
-  // Prevents multi-part message interleaving when multiple threads send to same node
-  mutable std::vector<chi::CoMutex> client_send_locks_;
 
 public:
   /**
@@ -142,12 +132,12 @@ public:
   /**
    * Helper: Send task inputs to remote node
    */
-  void SendIn(hipc::FullPtr<SendTask> task, chi::RunContext &rctx);
+  void SendIn(hipc::FullPtr<chi::Task> origin_task, chi::RunContext &rctx);
 
   /**
    * Helper: Send task outputs back to origin node
    */
-  void SendOut(hipc::FullPtr<SendTask> task);
+  void SendOut(hipc::FullPtr<chi::Task> origin_task);
 
   /**
    * Handle Recv - Receive task inputs or outputs from network
@@ -181,14 +171,26 @@ public:
                 hipc::FullPtr<chi::Task> task_ptr) override;
 
   /**
-   * Deserialize task parameters (IN or OUT based on archive mode)
+   * Deserialize task parameters into an existing task (IN or OUT based on archive mode)
    */
-  hipc::FullPtr<chi::Task> LoadTask(chi::u32 method, chi::LoadTaskArchive &archive) override;
+  void LoadTask(chi::u32 method, chi::LoadTaskArchive &archive,
+                hipc::FullPtr<chi::Task> task_ptr) override;
 
   /**
-   * Deserialize task input parameters using LocalSerialize (for local transfers)
+   * Allocate and deserialize task parameters from network transfer
    */
-  hipc::FullPtr<chi::Task> LocalLoadTask(chi::u32 method, chi::LocalLoadTaskArchive &archive) override;
+  hipc::FullPtr<chi::Task> AllocLoadTask(chi::u32 method, chi::LoadTaskArchive &archive) override;
+
+  /**
+   * Deserialize task input parameters into an existing task using LocalSerialize
+   */
+  void LocalLoadTask(chi::u32 method, chi::LocalLoadTaskArchive &archive,
+                     hipc::FullPtr<chi::Task> task_ptr) override;
+
+  /**
+   * Allocate and deserialize task input parameters using LocalSerialize
+   */
+  hipc::FullPtr<chi::Task> LocalAllocLoadTask(chi::u32 method, chi::LocalLoadTaskArchive &archive) override;
 
   /**
    * Serialize task output parameters using LocalSerialize (for local transfers)

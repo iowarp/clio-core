@@ -224,14 +224,26 @@ class Runtime : public chi::Container {
                 hipc::FullPtr<chi::Task> task_ptr) override;
 
   /**
-   * Deserialize task parameters from network transfer (unified method)
+   * Deserialize task parameters into an existing task from network transfer
    */
-  hipc::FullPtr<chi::Task> LoadTask(chi::u32 method, chi::LoadTaskArchive& archive) override;
+  void LoadTask(chi::u32 method, chi::LoadTaskArchive& archive,
+                hipc::FullPtr<chi::Task> task_ptr) override;
 
   /**
-   * Deserialize task input parameters using LocalSerialize (for local transfers)
+   * Allocate and deserialize task parameters from network transfer
    */
-  hipc::FullPtr<chi::Task> LocalLoadTask(chi::u32 method, chi::LocalLoadTaskArchive& archive) override;
+  hipc::FullPtr<chi::Task> AllocLoadTask(chi::u32 method, chi::LoadTaskArchive& archive) override;
+
+  /**
+   * Deserialize task input parameters into an existing task using LocalSerialize
+   */
+  void LocalLoadTask(chi::u32 method, chi::LocalLoadTaskArchive& archive,
+                     hipc::FullPtr<chi::Task> task_ptr) override;
+
+  /**
+   * Allocate and deserialize task input parameters using LocalSerialize
+   */
+  hipc::FullPtr<chi::Task> LocalAllocLoadTask(chi::u32 method, chi::LocalLoadTaskArchive& archive) override;
 
   /**
    * Serialize task output parameters using LocalSerialize (for local transfers)

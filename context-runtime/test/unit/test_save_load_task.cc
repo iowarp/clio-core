@@ -289,28 +289,17 @@ TEST_CASE("SaveTask and LoadTask - Admin SendTask full flow",
   auto *container = pool_manager->GetContainer(chi::kAdminPoolId);
   REQUIRE(container != nullptr);
 
-  // Create a subtask to include in SendTask
-  auto subtask = ipc_manager->NewTask<chi::Task>(
-      chi::TaskId(10, 20, 30, 0, 40), chi::PoolId(100, 0),
-      chi::PoolQuery::Local(), chi::MethodId(50));
-
-  // Step 1: Create original SendTask
-  std::vector<chi::PoolQuery> pool_queries = {chi::PoolQuery::Local(),
-                                              chi::PoolQuery::Local()};
+  // Step 1: Create original SendTask (simplified - only transfer_flags parameter)
   auto orig_task = ipc_manager->NewTask<chimaera::admin::SendTask>(
       chi::TaskId(555, 666, 777, 0, 888), chi::kAdminPoolId,
       chi::PoolQuery::Local(),
-      chi::MsgType::kSerializeIn, // msg_type IN parameter
-      subtask, pool_queries,
       123); // transfer_flags IN parameter
 
   REQUIRE(!orig_task.IsNull());
 
   // Record original values
   chi::TaskId orig_task_id = orig_task->task_id_;
-  chi::MsgType orig_msg_type = orig_task->msg_type_;
   chi::u32 orig_transfer_flags = orig_task->transfer_flags_;
-  size_t orig_pool_queries_size = orig_task->pool_queries_.size();
 
   // Step 2: SaveIn
   chi::SaveTaskArchive save_in_archive(chi::MsgType::kSerializeIn);
@@ -332,13 +321,7 @@ TEST_CASE("SaveTask and LoadTask - Admin SendTask full flow",
   // Step 4: Verify IN parameters
   SECTION("Verify IN parameters after LoadIn") {
     REQUIRE(loaded_in_task->task_id_ == orig_task_id);
-    REQUIRE(loaded_in_task->msg_type_ == orig_msg_type);
     REQUIRE(loaded_in_task->transfer_flags_ == orig_transfer_flags);
-    REQUIRE(loaded_in_task->pool_queries_.size() == orig_pool_queries_size);
-    // Note: origin_task_ (FullPtr<Task>) cannot be properly serialized/deserialized
-    // because FullPtr serialization is not fully implemented. In production, the
-    // network transport layer would handle subtask serialization separately.
-    // REQUIRE(!loaded_in_task->origin_task_.IsNull());
   }
 
   // Step 5: Modify output parameters
@@ -362,22 +345,14 @@ TEST_CASE("SaveTask and LoadTask - Admin SendTask full flow",
 
   REQUIRE(!loaded_out_task.IsNull());
 
-  // Step 8: Verify INOUT and OUT parameters
+  // Step 8: Verify OUT parameters
   SECTION("Verify OUT parameters after LoadOut") {
-    // Verify INOUT parameters preserved
-    REQUIRE(loaded_out_task->msg_type_ == orig_msg_type);
-    REQUIRE(loaded_out_task->pool_queries_.size() == orig_pool_queries_size);
-    // Note: origin_task_ (FullPtr<Task>) cannot be properly serialized/deserialized
-    // because FullPtr serialization is not fully implemented.
-    // REQUIRE(!loaded_out_task->origin_task_.IsNull());
-
     // Verify OUT parameters
     REQUIRE(loaded_out_task->error_message_.str() ==
             "send completed successfully");
   }
 
   // Cleanup
-  ipc_manager->DelTask(subtask);
   ipc_manager->DelTask(orig_task);
   ipc_manager->DelTask(loaded_in_task);
   ipc_manager->DelTask(loaded_out_task);

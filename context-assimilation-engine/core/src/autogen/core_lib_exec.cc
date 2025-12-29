@@ -103,57 +103,73 @@ void Runtime::SaveTask(chi::u32 method, chi::SaveTaskArchive& archive,
   }
 }
 
-hipc::FullPtr<chi::Task> Runtime::LoadTask(chi::u32 method, chi::LoadTaskArchive& archive) {
-  auto* ipc_manager = CHI_IPC;
+void Runtime::LoadTask(chi::u32 method, chi::LoadTaskArchive& archive,
+                        hipc::FullPtr<chi::Task> task_ptr) {
   switch (method) {
     case Method::kCreate: {
-      auto task_ptr = ipc_manager->NewTask<CreateTask>();
-      archive >> *task_ptr.ptr_;
-      return task_ptr.template Cast<chi::Task>();
+      auto typed_task = task_ptr.template Cast<CreateTask>();
+      archive >> *typed_task.ptr_;
+      break;
     }
     case Method::kDestroy: {
-      auto task_ptr = ipc_manager->NewTask<DestroyTask>();
-      archive >> *task_ptr.ptr_;
-      return task_ptr.template Cast<chi::Task>();
+      auto typed_task = task_ptr.template Cast<DestroyTask>();
+      archive >> *typed_task.ptr_;
+      break;
     }
     case Method::kParseOmni: {
-      auto task_ptr = ipc_manager->NewTask<ParseOmniTask>();
-      archive >> *task_ptr.ptr_;
-      return task_ptr.template Cast<chi::Task>();
+      auto typed_task = task_ptr.template Cast<ParseOmniTask>();
+      archive >> *typed_task.ptr_;
+      break;
     }
     default: {
-      // Unknown method - return null
-      return hipc::FullPtr<chi::Task>();
+      // Unknown method - do nothing
+      break;
     }
   }
 }
 
-hipc::FullPtr<chi::Task> Runtime::LocalLoadTask(chi::u32 method, chi::LocalLoadTaskArchive& archive) {
-  auto* ipc_manager = CHI_IPC;
+hipc::FullPtr<chi::Task> Runtime::AllocLoadTask(chi::u32 method, chi::LoadTaskArchive& archive) {
+  hipc::FullPtr<chi::Task> task_ptr = NewTask(method);
+  if (!task_ptr.IsNull()) {
+    LoadTask(method, archive, task_ptr);
+  }
+  return task_ptr;
+}
+
+void Runtime::LocalLoadTask(chi::u32 method, chi::LocalLoadTaskArchive& archive,
+                            hipc::FullPtr<chi::Task> task_ptr) {
   switch (method) {
     case Method::kCreate: {
-      auto task_ptr = ipc_manager->NewTask<CreateTask>();
+      auto typed_task = task_ptr.template Cast<CreateTask>();
       // Call SerializeIn - task will call Task::SerializeIn for base fields
-      task_ptr.ptr_->SerializeIn(archive);
-      return task_ptr.template Cast<chi::Task>();
+      typed_task.ptr_->SerializeIn(archive);
+      break;
     }
     case Method::kDestroy: {
-      auto task_ptr = ipc_manager->NewTask<DestroyTask>();
+      auto typed_task = task_ptr.template Cast<DestroyTask>();
       // Call SerializeIn - task will call Task::SerializeIn for base fields
-      task_ptr.ptr_->SerializeIn(archive);
-      return task_ptr.template Cast<chi::Task>();
+      typed_task.ptr_->SerializeIn(archive);
+      break;
     }
     case Method::kParseOmni: {
-      auto task_ptr = ipc_manager->NewTask<ParseOmniTask>();
+      auto typed_task = task_ptr.template Cast<ParseOmniTask>();
       // Call SerializeIn - task will call Task::SerializeIn for base fields
-      task_ptr.ptr_->SerializeIn(archive);
-      return task_ptr.template Cast<chi::Task>();
+      typed_task.ptr_->SerializeIn(archive);
+      break;
     }
     default: {
-      // Unknown method - return null
-      return hipc::FullPtr<chi::Task>();
+      // Unknown method - do nothing
+      break;
     }
   }
+}
+
+hipc::FullPtr<chi::Task> Runtime::LocalAllocLoadTask(chi::u32 method, chi::LocalLoadTaskArchive& archive) {
+  hipc::FullPtr<chi::Task> task_ptr = NewTask(method);
+  if (!task_ptr.IsNull()) {
+    LocalLoadTask(method, archive, task_ptr);
+  }
+  return task_ptr;
 }
 
 void Runtime::LocalSaveTask(chi::u32 method, chi::LocalSaveTaskArchive& archive, 

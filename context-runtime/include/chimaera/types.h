@@ -236,12 +236,11 @@ struct AddressHash {
 #define TASK_ROUTED BIT_OPT(chi::u32, 1)
 #define TASK_DATA_OWNER BIT_OPT(chi::u32, 2)
 #define TASK_REMOTE BIT_OPT(chi::u32, 3)
-#define TASK_FIRE_AND_FORGET BIT_OPT(chi::u32, 4)
 #define TASK_FORCE_NET                                                         \
   BIT_OPT(chi::u32,                                                            \
-          5) ///< Force task through network code even for local execution
+          4) ///< Force task through network code even for local execution
 #define TASK_STARTED                                                           \
-  BIT_OPT(chi::u32, 6) ///< Task execution has been started (set in BeginTask,
+  BIT_OPT(chi::u32, 5) ///< Task execution has been started (set in BeginTask,
                        ///< unset in ReschedulePeriodicTask)
 
 // Bulk transfer flags are defined in hermes_shm/lightbeam/lightbeam.h:
@@ -252,7 +251,8 @@ struct AddressHash {
 enum ThreadType {
   kSchedWorker = 0,    ///< Scheduler worker for fast tasks (EstCpuTime < 50us)
   kSlow = 1,           ///< Slow worker for long-running tasks (EstCpuTime >= 50us)
-  kProcessReaper = 2   ///< Process reaper thread
+  kProcessReaper = 2,  ///< Process reaper thread
+  kNetWorker = 3       ///< Network worker for Send/Recv tasks
 };
 
 // Lane mapping policies for task distribution

@@ -170,28 +170,6 @@ class Task {
   HSHM_CROSS_FUN bool IsRemote() const { return task_flags_.Any(TASK_REMOTE); }
 
   /**
-   * Check if task is fire-and-forget (will never be awaited)
-   * @return true if task has fire-and-forget flag set
-   */
-  HSHM_CROSS_FUN bool IsFireAndForget() const {
-    return task_flags_.Any(TASK_FIRE_AND_FORGET);
-  }
-
-  /**
-   * Set task as fire-and-forget (will never be awaited)
-   */
-  HSHM_CROSS_FUN void SetFireAndForget() {
-    task_flags_.SetBits(TASK_FIRE_AND_FORGET);
-  }
-
-  /**
-   * Unset fire-and-forget flag
-   */
-  HSHM_CROSS_FUN void UnsetFireAndForget() {
-    task_flags_.UnsetBits(TASK_FIRE_AND_FORGET);
-  }
-
-  /**
    * Get task execution period in specified time unit
    * @param unit Time unit constant (kNano, kMicro, kMilli, kSec, kMin, kHour)
    * @return Period in specified unit, 0 if not periodic

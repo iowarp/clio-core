@@ -343,233 +343,249 @@ void Runtime::SaveTask(chi::u32 method, chi::SaveTaskArchive& archive,
   }
 }
 
-hipc::FullPtr<chi::Task> Runtime::LoadTask(chi::u32 method, chi::LoadTaskArchive& archive) {
-  auto* ipc_manager = CHI_IPC;
+void Runtime::LoadTask(chi::u32 method, chi::LoadTaskArchive& archive,
+                        hipc::FullPtr<chi::Task> task_ptr) {
   switch (method) {
     case Method::kCreate: {
-      auto task_ptr = ipc_manager->NewTask<CreateTask>();
-      archive >> *task_ptr.ptr_;
-      return task_ptr.template Cast<chi::Task>();
+      auto typed_task = task_ptr.template Cast<CreateTask>();
+      archive >> *typed_task.ptr_;
+      break;
     }
     case Method::kDestroy: {
-      auto task_ptr = ipc_manager->NewTask<DestroyTask>();
-      archive >> *task_ptr.ptr_;
-      return task_ptr.template Cast<chi::Task>();
+      auto typed_task = task_ptr.template Cast<DestroyTask>();
+      archive >> *typed_task.ptr_;
+      break;
     }
     case Method::kRegisterTarget: {
-      auto task_ptr = ipc_manager->NewTask<RegisterTargetTask>();
-      archive >> *task_ptr.ptr_;
-      return task_ptr.template Cast<chi::Task>();
+      auto typed_task = task_ptr.template Cast<RegisterTargetTask>();
+      archive >> *typed_task.ptr_;
+      break;
     }
     case Method::kUnregisterTarget: {
-      auto task_ptr = ipc_manager->NewTask<UnregisterTargetTask>();
-      archive >> *task_ptr.ptr_;
-      return task_ptr.template Cast<chi::Task>();
+      auto typed_task = task_ptr.template Cast<UnregisterTargetTask>();
+      archive >> *typed_task.ptr_;
+      break;
     }
     case Method::kListTargets: {
-      auto task_ptr = ipc_manager->NewTask<ListTargetsTask>();
-      archive >> *task_ptr.ptr_;
-      return task_ptr.template Cast<chi::Task>();
+      auto typed_task = task_ptr.template Cast<ListTargetsTask>();
+      archive >> *typed_task.ptr_;
+      break;
     }
     case Method::kStatTargets: {
-      auto task_ptr = ipc_manager->NewTask<StatTargetsTask>();
-      archive >> *task_ptr.ptr_;
-      return task_ptr.template Cast<chi::Task>();
+      auto typed_task = task_ptr.template Cast<StatTargetsTask>();
+      archive >> *typed_task.ptr_;
+      break;
     }
     case Method::kGetOrCreateTag: {
-      auto task_ptr = ipc_manager->NewTask<core::GetOrCreateTagTask<core::CreateParams>>();
-      archive >> *task_ptr.ptr_;
-      return task_ptr.template Cast<chi::Task>();
+      auto typed_task = task_ptr.template Cast<core::GetOrCreateTagTask<core::CreateParams>>();
+      archive >> *typed_task.ptr_;
+      break;
     }
     case Method::kPutBlob: {
-      auto task_ptr = ipc_manager->NewTask<PutBlobTask>();
-      archive >> *task_ptr.ptr_;
-      return task_ptr.template Cast<chi::Task>();
+      auto typed_task = task_ptr.template Cast<PutBlobTask>();
+      archive >> *typed_task.ptr_;
+      break;
     }
     case Method::kGetBlob: {
-      auto task_ptr = ipc_manager->NewTask<GetBlobTask>();
-      archive >> *task_ptr.ptr_;
-      return task_ptr.template Cast<chi::Task>();
+      auto typed_task = task_ptr.template Cast<GetBlobTask>();
+      archive >> *typed_task.ptr_;
+      break;
     }
     case Method::kReorganizeBlob: {
-      auto task_ptr = ipc_manager->NewTask<ReorganizeBlobTask>();
-      archive >> *task_ptr.ptr_;
-      return task_ptr.template Cast<chi::Task>();
+      auto typed_task = task_ptr.template Cast<ReorganizeBlobTask>();
+      archive >> *typed_task.ptr_;
+      break;
     }
     case Method::kDelBlob: {
-      auto task_ptr = ipc_manager->NewTask<DelBlobTask>();
-      archive >> *task_ptr.ptr_;
-      return task_ptr.template Cast<chi::Task>();
+      auto typed_task = task_ptr.template Cast<DelBlobTask>();
+      archive >> *typed_task.ptr_;
+      break;
     }
     case Method::kDelTag: {
-      auto task_ptr = ipc_manager->NewTask<DelTagTask>();
-      archive >> *task_ptr.ptr_;
-      return task_ptr.template Cast<chi::Task>();
+      auto typed_task = task_ptr.template Cast<DelTagTask>();
+      archive >> *typed_task.ptr_;
+      break;
     }
     case Method::kGetTagSize: {
-      auto task_ptr = ipc_manager->NewTask<GetTagSizeTask>();
-      archive >> *task_ptr.ptr_;
-      return task_ptr.template Cast<chi::Task>();
+      auto typed_task = task_ptr.template Cast<GetTagSizeTask>();
+      archive >> *typed_task.ptr_;
+      break;
     }
     case Method::kPollTelemetryLog: {
-      auto task_ptr = ipc_manager->NewTask<PollTelemetryLogTask>();
-      archive >> *task_ptr.ptr_;
-      return task_ptr.template Cast<chi::Task>();
+      auto typed_task = task_ptr.template Cast<PollTelemetryLogTask>();
+      archive >> *typed_task.ptr_;
+      break;
     }
     case Method::kGetBlobScore: {
-      auto task_ptr = ipc_manager->NewTask<GetBlobScoreTask>();
-      archive >> *task_ptr.ptr_;
-      return task_ptr.template Cast<chi::Task>();
+      auto typed_task = task_ptr.template Cast<GetBlobScoreTask>();
+      archive >> *typed_task.ptr_;
+      break;
     }
     case Method::kGetBlobSize: {
-      auto task_ptr = ipc_manager->NewTask<GetBlobSizeTask>();
-      archive >> *task_ptr.ptr_;
-      return task_ptr.template Cast<chi::Task>();
+      auto typed_task = task_ptr.template Cast<GetBlobSizeTask>();
+      archive >> *typed_task.ptr_;
+      break;
     }
     case Method::kGetContainedBlobs: {
-      auto task_ptr = ipc_manager->NewTask<GetContainedBlobsTask>();
-      archive >> *task_ptr.ptr_;
-      return task_ptr.template Cast<chi::Task>();
+      auto typed_task = task_ptr.template Cast<GetContainedBlobsTask>();
+      archive >> *typed_task.ptr_;
+      break;
     }
     case Method::kTagQuery: {
-      auto task_ptr = ipc_manager->NewTask<TagQueryTask>();
-      archive >> *task_ptr.ptr_;
-      return task_ptr.template Cast<chi::Task>();
+      auto typed_task = task_ptr.template Cast<TagQueryTask>();
+      archive >> *typed_task.ptr_;
+      break;
     }
     case Method::kBlobQuery: {
-      auto task_ptr = ipc_manager->NewTask<BlobQueryTask>();
-      archive >> *task_ptr.ptr_;
-      return task_ptr.template Cast<chi::Task>();
+      auto typed_task = task_ptr.template Cast<BlobQueryTask>();
+      archive >> *typed_task.ptr_;
+      break;
     }
     default: {
-      // Unknown method - return null
-      return hipc::FullPtr<chi::Task>();
+      // Unknown method - do nothing
+      break;
     }
   }
 }
 
-hipc::FullPtr<chi::Task> Runtime::LocalLoadTask(chi::u32 method, chi::LocalLoadTaskArchive& archive) {
-  auto* ipc_manager = CHI_IPC;
+hipc::FullPtr<chi::Task> Runtime::AllocLoadTask(chi::u32 method, chi::LoadTaskArchive& archive) {
+  hipc::FullPtr<chi::Task> task_ptr = NewTask(method);
+  if (!task_ptr.IsNull()) {
+    LoadTask(method, archive, task_ptr);
+  }
+  return task_ptr;
+}
+
+void Runtime::LocalLoadTask(chi::u32 method, chi::LocalLoadTaskArchive& archive,
+                            hipc::FullPtr<chi::Task> task_ptr) {
   switch (method) {
     case Method::kCreate: {
-      auto task_ptr = ipc_manager->NewTask<CreateTask>();
+      auto typed_task = task_ptr.template Cast<CreateTask>();
       // Call SerializeIn - task will call Task::SerializeIn for base fields
-      task_ptr.ptr_->SerializeIn(archive);
-      return task_ptr.template Cast<chi::Task>();
+      typed_task.ptr_->SerializeIn(archive);
+      break;
     }
     case Method::kDestroy: {
-      auto task_ptr = ipc_manager->NewTask<DestroyTask>();
+      auto typed_task = task_ptr.template Cast<DestroyTask>();
       // Call SerializeIn - task will call Task::SerializeIn for base fields
-      task_ptr.ptr_->SerializeIn(archive);
-      return task_ptr.template Cast<chi::Task>();
+      typed_task.ptr_->SerializeIn(archive);
+      break;
     }
     case Method::kRegisterTarget: {
-      auto task_ptr = ipc_manager->NewTask<RegisterTargetTask>();
+      auto typed_task = task_ptr.template Cast<RegisterTargetTask>();
       // Call SerializeIn - task will call Task::SerializeIn for base fields
-      task_ptr.ptr_->SerializeIn(archive);
-      return task_ptr.template Cast<chi::Task>();
+      typed_task.ptr_->SerializeIn(archive);
+      break;
     }
     case Method::kUnregisterTarget: {
-      auto task_ptr = ipc_manager->NewTask<UnregisterTargetTask>();
+      auto typed_task = task_ptr.template Cast<UnregisterTargetTask>();
       // Call SerializeIn - task will call Task::SerializeIn for base fields
-      task_ptr.ptr_->SerializeIn(archive);
-      return task_ptr.template Cast<chi::Task>();
+      typed_task.ptr_->SerializeIn(archive);
+      break;
     }
     case Method::kListTargets: {
-      auto task_ptr = ipc_manager->NewTask<ListTargetsTask>();
+      auto typed_task = task_ptr.template Cast<ListTargetsTask>();
       // Call SerializeIn - task will call Task::SerializeIn for base fields
-      task_ptr.ptr_->SerializeIn(archive);
-      return task_ptr.template Cast<chi::Task>();
+      typed_task.ptr_->SerializeIn(archive);
+      break;
     }
     case Method::kStatTargets: {
-      auto task_ptr = ipc_manager->NewTask<StatTargetsTask>();
+      auto typed_task = task_ptr.template Cast<StatTargetsTask>();
       // Call SerializeIn - task will call Task::SerializeIn for base fields
-      task_ptr.ptr_->SerializeIn(archive);
-      return task_ptr.template Cast<chi::Task>();
+      typed_task.ptr_->SerializeIn(archive);
+      break;
     }
     case Method::kGetOrCreateTag: {
-      auto task_ptr = ipc_manager->NewTask<core::GetOrCreateTagTask<core::CreateParams>>();
+      auto typed_task = task_ptr.template Cast<core::GetOrCreateTagTask<core::CreateParams>>();
       // Call SerializeIn - task will call Task::SerializeIn for base fields
-      task_ptr.ptr_->SerializeIn(archive);
-      return task_ptr.template Cast<chi::Task>();
+      typed_task.ptr_->SerializeIn(archive);
+      break;
     }
     case Method::kPutBlob: {
-      auto task_ptr = ipc_manager->NewTask<PutBlobTask>();
+      auto typed_task = task_ptr.template Cast<PutBlobTask>();
       // Call SerializeIn - task will call Task::SerializeIn for base fields
-      task_ptr.ptr_->SerializeIn(archive);
-      return task_ptr.template Cast<chi::Task>();
+      typed_task.ptr_->SerializeIn(archive);
+      break;
     }
     case Method::kGetBlob: {
-      auto task_ptr = ipc_manager->NewTask<GetBlobTask>();
+      auto typed_task = task_ptr.template Cast<GetBlobTask>();
       // Call SerializeIn - task will call Task::SerializeIn for base fields
-      task_ptr.ptr_->SerializeIn(archive);
-      return task_ptr.template Cast<chi::Task>();
+      typed_task.ptr_->SerializeIn(archive);
+      break;
     }
     case Method::kReorganizeBlob: {
-      auto task_ptr = ipc_manager->NewTask<ReorganizeBlobTask>();
+      auto typed_task = task_ptr.template Cast<ReorganizeBlobTask>();
       // Call SerializeIn - task will call Task::SerializeIn for base fields
-      task_ptr.ptr_->SerializeIn(archive);
-      return task_ptr.template Cast<chi::Task>();
+      typed_task.ptr_->SerializeIn(archive);
+      break;
     }
     case Method::kDelBlob: {
-      auto task_ptr = ipc_manager->NewTask<DelBlobTask>();
+      auto typed_task = task_ptr.template Cast<DelBlobTask>();
       // Call SerializeIn - task will call Task::SerializeIn for base fields
-      task_ptr.ptr_->SerializeIn(archive);
-      return task_ptr.template Cast<chi::Task>();
+      typed_task.ptr_->SerializeIn(archive);
+      break;
     }
     case Method::kDelTag: {
-      auto task_ptr = ipc_manager->NewTask<DelTagTask>();
+      auto typed_task = task_ptr.template Cast<DelTagTask>();
       // Call SerializeIn - task will call Task::SerializeIn for base fields
-      task_ptr.ptr_->SerializeIn(archive);
-      return task_ptr.template Cast<chi::Task>();
+      typed_task.ptr_->SerializeIn(archive);
+      break;
     }
     case Method::kGetTagSize: {
-      auto task_ptr = ipc_manager->NewTask<GetTagSizeTask>();
+      auto typed_task = task_ptr.template Cast<GetTagSizeTask>();
       // Call SerializeIn - task will call Task::SerializeIn for base fields
-      task_ptr.ptr_->SerializeIn(archive);
-      return task_ptr.template Cast<chi::Task>();
+      typed_task.ptr_->SerializeIn(archive);
+      break;
     }
     case Method::kPollTelemetryLog: {
-      auto task_ptr = ipc_manager->NewTask<PollTelemetryLogTask>();
+      auto typed_task = task_ptr.template Cast<PollTelemetryLogTask>();
       // Call SerializeIn - task will call Task::SerializeIn for base fields
-      task_ptr.ptr_->SerializeIn(archive);
-      return task_ptr.template Cast<chi::Task>();
+      typed_task.ptr_->SerializeIn(archive);
+      break;
     }
     case Method::kGetBlobScore: {
-      auto task_ptr = ipc_manager->NewTask<GetBlobScoreTask>();
+      auto typed_task = task_ptr.template Cast<GetBlobScoreTask>();
       // Call SerializeIn - task will call Task::SerializeIn for base fields
-      task_ptr.ptr_->SerializeIn(archive);
-      return task_ptr.template Cast<chi::Task>();
+      typed_task.ptr_->SerializeIn(archive);
+      break;
     }
     case Method::kGetBlobSize: {
-      auto task_ptr = ipc_manager->NewTask<GetBlobSizeTask>();
+      auto typed_task = task_ptr.template Cast<GetBlobSizeTask>();
       // Call SerializeIn - task will call Task::SerializeIn for base fields
-      task_ptr.ptr_->SerializeIn(archive);
-      return task_ptr.template Cast<chi::Task>();
+      typed_task.ptr_->SerializeIn(archive);
+      break;
     }
     case Method::kGetContainedBlobs: {
-      auto task_ptr = ipc_manager->NewTask<GetContainedBlobsTask>();
+      auto typed_task = task_ptr.template Cast<GetContainedBlobsTask>();
       // Call SerializeIn - task will call Task::SerializeIn for base fields
-      task_ptr.ptr_->SerializeIn(archive);
-      return task_ptr.template Cast<chi::Task>();
+      typed_task.ptr_->SerializeIn(archive);
+      break;
     }
     case Method::kTagQuery: {
-      auto task_ptr = ipc_manager->NewTask<TagQueryTask>();
+      auto typed_task = task_ptr.template Cast<TagQueryTask>();
       // Call SerializeIn - task will call Task::SerializeIn for base fields
-      task_ptr.ptr_->SerializeIn(archive);
-      return task_ptr.template Cast<chi::Task>();
+      typed_task.ptr_->SerializeIn(archive);
+      break;
     }
     case Method::kBlobQuery: {
-      auto task_ptr = ipc_manager->NewTask<BlobQueryTask>();
+      auto typed_task = task_ptr.template Cast<BlobQueryTask>();
       // Call SerializeIn - task will call Task::SerializeIn for base fields
-      task_ptr.ptr_->SerializeIn(archive);
-      return task_ptr.template Cast<chi::Task>();
+      typed_task.ptr_->SerializeIn(archive);
+      break;
     }
     default: {
-      // Unknown method - return null
-      return hipc::FullPtr<chi::Task>();
+      // Unknown method - do nothing
+      break;
     }
   }
+}
+
+hipc::FullPtr<chi::Task> Runtime::LocalAllocLoadTask(chi::u32 method, chi::LocalLoadTaskArchive& archive) {
+  hipc::FullPtr<chi::Task> task_ptr = NewTask(method);
+  if (!task_ptr.IsNull()) {
+    LocalLoadTask(method, archive, task_ptr);
+  }
+  return task_ptr;
 }
 
 void Runtime::LocalSaveTask(chi::u32 method, chi::LocalSaveTaskArchive& archive, 

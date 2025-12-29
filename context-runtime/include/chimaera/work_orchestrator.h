@@ -127,6 +127,12 @@ class WorkOrchestrator {
    */
   void AssignToWorkerType(ThreadType thread_type, const FullPtr<Task>& task_ptr);
 
+  /**
+   * Get the dedicated network worker
+   * @return Pointer to the network worker
+   */
+  Worker* GetNetWorker() const { return net_worker_; }
+
  private:
   /**
    * Spawn worker threads using HSHM thread model
@@ -168,6 +174,7 @@ class WorkOrchestrator {
   // Worker groups for task routing based on execution characteristics
   std::vector<Worker*> scheduler_workers_; ///< Fast task workers (EstCpuTime < 50us)
   std::vector<Worker*> slow_workers_;      ///< Slow task workers (EstCpuTime >= 50us)
+  Worker* net_worker_;                     ///< Dedicated network worker for Send/Recv tasks
 
   // Active lanes pointer to IPC Manager worker queues
   void* active_lanes_;

@@ -22,6 +22,20 @@
 namespace chi {
 
 /**
+ * Network queue priority levels for send operations
+ */
+enum class NetQueuePriority : u32 {
+  kSendIn = 0,   ///< Priority 0: SendIn operations (sending task inputs)
+  kSendOut = 1   ///< Priority 1: SendOut operations (sending task outputs)
+};
+
+/**
+ * Network queue for storing Future<SendTask> objects
+ * One lane with two priorities (SendIn and SendOut)
+ */
+using NetQueue = hipc::multi_mpsc_ring_buffer<Future<Task>, CHI_MAIN_ALLOC_T>;
+
+/**
  * Typedef for worker queue type to simplify usage
  */
 using WorkQueue = chi::ipc::mpsc_ring_buffer<hipc::ShmPtr<TaskLane>>;
@@ -200,13 +214,20 @@ class IpcManager {
       Future<TaskT> queue_future(user_future.GetFutureShm(), null_task_ptr);
 
       // 5. Map task to lane using configured policy
-      u32 num_lanes = shared_header_->num_sched_queues;
-      if (num_lanes == 0) {
-        return user_future;  // Avoid division by zero
+      // Route Send/Recv tasks to net worker's lane
+      LaneId lane_id;
+      if (IsNetworkTask(task_ptr)) {
+        // Get net worker's lane (last lane in the queue)
+        lane_id = shared_header_->num_workers - 1;
+      } else {
+        u32 num_lanes = shared_header_->num_sched_queues;
+        if (num_lanes == 0) {
+          return user_future;  // Avoid division by zero
+        }
+        lane_id = MapTaskToLane(num_lanes);
       }
 
       // 6. Enqueue the Future object to the worker queue
-      LaneId lane_id = MapTaskToLane(num_lanes);
       auto &lane_ref = worker_queues_->GetLane(lane_id, 0);
       // Convert Future<TaskT> to Future<Task> for the queue
       Future<Task> task_future = queue_future.template Cast<Task>();
@@ -226,7 +247,7 @@ class IpcManager {
 
       // 2. Set the parent task RunContext from current worker (if available and
       // awake_event is true)
-      if (awake_event && !task_ptr->IsFireAndForget()) {
+      if (awake_event) {
         Worker *worker = CHI_CUR_WORKER;
         if (worker) {
           RunContext *run_ctx = worker->GetCurrentRunContext();
@@ -237,11 +258,18 @@ class IpcManager {
       }
 
       // 3. Map task to lane using configured policy
-      u32 num_lanes = shared_header_->num_sched_queues;
-      if (num_lanes == 0) return future;  // Avoid division by zero
+      // Route Send/Recv tasks to net worker's lane
+      LaneId lane_id;
+      if (IsNetworkTask(task_ptr)) {
+        // Get net worker's lane (last lane in the queue)
+        lane_id = shared_header_->num_workers - 1;
+      } else {
+        u32 num_lanes = shared_header_->num_sched_queues;
+        if (num_lanes == 0) return future;  // Avoid division by zero
+        lane_id = MapTaskToLane(num_lanes);
+      }
 
       // 4. Enqueue the Future object to the worker queue
-      LaneId lane_id = MapTaskToLane(num_lanes);
       auto &lane_ref = worker_queues_->GetLane(lane_id, 0);
       // Convert Future<TaskT> to Future<Task> for the queue
       Future<Task> task_future = future.template Cast<Task>();
@@ -503,7 +531,47 @@ class IpcManager {
    */
   void ClearClientPool();
 
+  /**
+   * Enqueue a Future<SendTask> to the network queue
+   * @param future Future containing the SendTask to enqueue
+   * @param priority Network queue priority (kSendIn or kSendOut)
+   */
+  void EnqueueNetTask(Future<Task> future, NetQueuePriority priority);
+
+  /**
+   * Try to pop a Future<SendTask> from the network queue
+   * @param priority Network queue priority to pop from
+   * @param future Output parameter for the popped Future
+   * @return true if a Future was popped, false if queue is empty
+   */
+  bool TryPopNetTask(NetQueuePriority priority, Future<Task>& future);
+
+  /**
+   * Get the network queue for direct access
+   * @return Pointer to the network queue or nullptr if not initialized
+   */
+  NetQueue* GetNetQueue() { return net_queue_.ptr_; }
+
  private:
+  /**
+   * Check if task is a network task (Send or Recv)
+   * Network tasks are routed to the dedicated network worker
+   * @param task_ptr Task to check
+   * @return true if task is a Send or Recv admin task
+   */
+  template <typename TaskT>
+  bool IsNetworkTask(const hipc::FullPtr<TaskT>& task_ptr) const {
+    if (task_ptr.IsNull()) {
+      return false;
+    }
+    // Admin kSend = 14, kRecv = 15
+    constexpr u32 kAdminSend = 14;
+    constexpr u32 kAdminRecv = 15;
+    const Task* task = task_ptr.ptr_;
+    return task->pool_id_ == kAdminPoolId &&
+           (task->method_ == kAdminSend || task->method_ == kAdminRecv);
+  }
+
   /**
    * Map task to lane ID using the configured policy
    * Dispatches to the appropriate policy-specific function
@@ -606,6 +674,9 @@ class IpcManager {
   // The worker task queues (multi-lane queue)
   hipc::FullPtr<TaskQueue> worker_queues_;
 
+  // Network queue for send operations (one lane, two priorities)
+  hipc::FullPtr<NetQueue> net_queue_;
+
   // Local ZeroMQ server (using lightbeam)
   std::unique_ptr<hshm::lbm::Server> local_server_;
 
@@ -650,9 +721,16 @@ namespace chi {
 
 template <typename TaskT, typename AllocT>
 void Future<TaskT, AllocT>::Wait() {
-  if (!task_ptr_.IsNull()) {
+  if (!task_ptr_.IsNull() && !future_shm_.IsNull()) {
     // Call IpcManager::Recv() to poll for completion and deserialize results
     CHI_IPC->Recv(*this);
+
+    // Free the FutureShm object now that we're done with it
+    auto *alloc = CHI_IPC->GetMainAlloc();
+    if (alloc != nullptr) {
+      alloc->DelObj(future_shm_);
+    }
+    future_shm_.SetNull();
   }
 }
 

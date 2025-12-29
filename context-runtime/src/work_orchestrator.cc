@@ -147,6 +147,7 @@ bool WorkOrchestrator::Init() {
   // Initialize scheduling state
   next_worker_index_for_scheduling_.store(0);
   active_lanes_ = nullptr;
+  net_worker_ = nullptr;
 
   // Initialize HSHM thread group first
   auto thread_model = HSHM_THREAD_MODEL;
@@ -173,6 +174,11 @@ bool WorkOrchestrator::Init() {
     if (!CreateWorker(kSlow)) {
       return false;
     }
+  }
+
+  // Create dedicated network worker (hardcoded to 1 for now)
+  if (!CreateWorker(kNetWorker)) {
+    return false;
   }
 
   is_initialized_ = true;
@@ -386,6 +392,10 @@ bool WorkOrchestrator::CreateWorker(ThreadType thread_type) {
   case kSlow:
     sched_workers_.push_back(std::move(worker));
     slow_workers_.push_back(worker_ptr);
+    break;
+  case kNetWorker:
+    sched_workers_.push_back(std::move(worker));
+    net_worker_ = worker_ptr;
     break;
   default:
     // Unknown worker type

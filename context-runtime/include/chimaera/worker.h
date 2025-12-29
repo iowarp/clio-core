@@ -1,12 +1,13 @@
 #ifndef CHIMAERA_INCLUDE_CHIMAERA_WORKERS_WORKER_H_
 #define CHIMAERA_INCLUDE_CHIMAERA_WORKERS_WORKER_H_
 
+#include <sys/epoll.h>
+
 #include <boost/context/detail/fcontext.hpp>
 #include <chrono>
 #include <functional>
 #include <mutex>
 #include <queue>
-#include <sys/epoll.h>
 #include <thread>
 #include <vector>
 
@@ -20,7 +21,8 @@
 namespace chi {
 
 // Forward declaration to avoid circular dependency
-using WorkQueue = hshm::ipc::mpsc_ring_buffer<hipc::ShmPtr<TaskLane>, CHI_MAIN_ALLOC_T>;
+using WorkQueue =
+    hshm::ipc::mpsc_ring_buffer<hipc::ShmPtr<TaskLane>, CHI_MAIN_ALLOC_T>;
 
 // Forward declarations
 class Task;
@@ -47,7 +49,7 @@ struct StackAndContext {
 //   Worker* worker = CHI_CUR_WORKER;
 //   FullPtr<Task> current_task = worker->GetCurrentTask();
 //   RunContext* run_ctx = worker->GetCurrentRunContext();
-#define CHI_CUR_WORKER                                                         \
+#define CHI_CUR_WORKER \
   (HSHM_THREAD_MODEL->GetTls<chi::Worker>(chi::chi_cur_worker_key_))
 
 /**
@@ -57,7 +59,7 @@ struct StackAndContext {
  * and provides task execution environment with stack allocation.
  */
 class Worker {
-public:
+ public:
   /**
    * Constructor
    * @param worker_id Unique worker identifier
@@ -172,7 +174,8 @@ public:
    * Add run context to blocked queue based on block count
    * @param run_ctx_ptr Pointer to run context (task accessible via
    * run_ctx_ptr->task)
-   * @param wait_for_task If true, do not add to blocked queue (task is waiting for subtask completion)
+   * @param wait_for_task If true, do not add to blocked queue (task is waiting
+   * for subtask completion)
    */
   void AddToBlockedQueue(RunContext *run_ctx_ptr, bool wait_for_task = false);
 
@@ -207,8 +210,7 @@ public:
    * execution
    * @return true if task was successfully routed, false otherwise
    */
-  bool RouteTask(Future<Task> &future, TaskLane *lane,
-                 Container *&container);
+  bool RouteTask(Future<Task> &future, TaskLane *lane, Container *&container);
 
   /**
    * Resolve a pool query into concrete physical addresses
@@ -221,7 +223,7 @@ public:
                                           PoolId pool_id,
                                           const FullPtr<Task> &task_ptr);
 
-private:
+ private:
   // Pool query resolution helper functions
   std::vector<PoolQuery> ResolveLocalQuery(const PoolQuery &query,
                                            const FullPtr<Task> &task_ptr);
@@ -249,24 +251,23 @@ private:
    * @param queue Reference to the ext_ring_buffer to process
    * @param queue_idx Index of the queue being processed (0-3)
    */
-  void ProcessBlockedQueue(std::queue<RunContext *> &queue,
-                           u32 queue_idx);
+  void ProcessBlockedQueue(std::queue<RunContext *> &queue, u32 queue_idx);
 
   /**
    * Process a periodic queue, checking time-based tasks and executing if ready
    * @param queue Reference to the ext_ring_buffer to process
    * @param queue_idx Index of the queue being processed (0-3)
    */
-  void ProcessPeriodicQueue(std::queue<RunContext *> &queue,
-                            u32 queue_idx);
+  void ProcessPeriodicQueue(std::queue<RunContext *> &queue, u32 queue_idx);
 
   /**
    * Process event queue for waking up tasks when subtasks complete
-   * Iterates over event_queue_, removes tasks from blocked_queue_, and calls ExecTask
+   * Iterates over event_queue_, removes tasks from blocked_queue_, and calls
+   * ExecTask
    */
   void ProcessEventQueue();
 
-public:
+ public:
   /**
    * Check if task should be processed locally based on task flags and pool
    * queries
@@ -285,8 +286,7 @@ public:
    * execution
    * @return true if local routing successful, false otherwise
    */
-  bool RouteLocal(Future<Task> &future, TaskLane *lane,
-                  Container *&container);
+  bool RouteLocal(Future<Task> &future, TaskLane *lane, Container *&container);
 
   /**
    * Route task globally using admin client's ClientSendTaskIn method
@@ -297,13 +297,22 @@ public:
   bool RouteGlobal(Future<Task> &future,
                    const std::vector<PoolQuery> &pool_queries);
 
-private:
+  /**
+   * End task execution and perform cleanup
+   * @param task_ptr Full pointer to task to end
+   * @param run_ctx Pointer to RunContext for task
+   * @param can_resched Whether task can be rescheduled (false on error)
+   */
+  void EndTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
+               bool can_resched);
+
+ private:
   /**
    * Allocate stack and RunContext for task execution (64KB default)
    * @param size Stack size in bytes
    * @return RunContext pointer with stack_ptr set
    */
-  RunContext *AllocateStackAndContext(size_t size = 65536); // 64KB default
+  RunContext *AllocateStackAndContext(size_t size = 65536);  // 64KB default
 
   /**
    * Deallocate task execution stack and RunContext
@@ -317,10 +326,11 @@ private:
    * @param future Future object containing the task and completion state
    * @param container Container for the task
    * @param lane Lane for the task (can be nullptr)
-   * @param destroy_in_end_task Flag indicating if task should be destroyed in EndTask
+   * @param destroy_in_end_task Flag indicating if task should be destroyed in
+   * EndTask
    */
-  void BeginTask(Future<Task> &future, Container *container,
-                 TaskLane *lane, bool destroy_in_end_task);
+  void BeginTask(Future<Task> &future, Container *container, TaskLane *lane,
+                 bool destroy_in_end_task);
 
   /**
    * Continue processing blocked tasks that are ready to resume
@@ -367,16 +377,6 @@ private:
   void ResumeFiber(const FullPtr<Task> &task_ptr, RunContext *run_ctx);
 
   /**
-   * End task execution and perform cleanup
-   * @param task_ptr Full pointer to task to end
-   * @param run_ctx Pointer to RunContext for task
-   * @param should_complete Whether task should be marked as complete
-   * @param is_remote Whether task is remote and needs to send outputs back
-   */
-  void EndTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
-               bool should_complete, bool is_remote);
-
-  /**
    * End dynamic scheduling task and re-route with updated pool query
    * @param task_ptr Full pointer to task to re-route
    * @param run_ctx Pointer to RunContext for task
@@ -394,7 +394,8 @@ private:
   bool is_running_;
   bool is_initialized_;
   bool did_work_;       // Tracks if any work was done in current loop iteration
-  bool task_did_work_;  // Tracks if current task did actual work (set by tasks via CHI_CUR_WORKER)
+  bool task_did_work_;  // Tracks if current task did actual work (set by tasks
+                        // via CHI_CUR_WORKER)
 
   // Current RunContext for this worker thread
   RunContext *current_run_context_;
@@ -419,12 +420,14 @@ private:
   // Event queue for waking up tasks when their subtasks complete
   // Allocated from main allocator with same depth as TaskLane
   static constexpr u32 EVENT_QUEUE_DEPTH = 1024;
-  hipc::mpsc_ring_buffer<RunContext*, CHI_MAIN_ALLOC_T>* event_queue_;
+  hipc::mpsc_ring_buffer<RunContext *, CHI_MAIN_ALLOC_T> *event_queue_;
 
   // Periodic queue system for time-based periodic tasks:
   // - Queue[0]: Tasks with yield_time_us_ <= 50us (checked every 16 iterations)
-  // - Queue[1]: Tasks with yield_time_us_ <= 200us (checked every 32 iterations)
-  // - Queue[2]: Tasks with yield_time_us_ <= 50ms/50000us (checked every 64 iterations)
+  // - Queue[1]: Tasks with yield_time_us_ <= 200us (checked every 32
+  // iterations)
+  // - Queue[2]: Tasks with yield_time_us_ <= 50ms/50000us (checked every 64
+  // iterations)
   // - Queue[3]: Tasks with yield_time_us_ > 50ms (checked every 128 iterations)
   // Using std::queue for O(1) enqueue/dequeue operations
   static constexpr u32 NUM_PERIODIC_QUEUES = 4;
@@ -432,17 +435,17 @@ private:
   std::queue<RunContext *> periodic_queues_[NUM_PERIODIC_QUEUES];
 
   // Worker spawn time and queue processing tracking
-  hshm::Timepoint spawn_time_; // Time when worker was spawned
-  u64 last_long_queue_check_;  // Last time (in 10us units) long queue was
-                               // processed
+  hshm::Timepoint spawn_time_;  // Time when worker was spawned
+  u64 last_long_queue_check_;   // Last time (in 10us units) long queue was
+                                // processed
 
   // Iteration counter for periodic blocked queue checks
-  u64 iteration_count_; // Number of iterations completed
+  u64 iteration_count_;  // Number of iterations completed
 
   // Sleep management for idle workers
-  u64 idle_iterations_;     // Number of consecutive iterations with no work
-  u32 current_sleep_us_;    // Current sleep duration in microseconds
-  u64 sleep_count_;         // Number of times sleep was called in current idle period
+  u64 idle_iterations_;   // Number of consecutive iterations with no work
+  u32 current_sleep_us_;  // Current sleep duration in microseconds
+  u64 sleep_count_;  // Number of times sleep was called in current idle period
   hshm::Timepoint idle_start_;  // Time when worker became idle
 
   // Epoll file descriptor and events buffer for efficient worker suspension
@@ -451,6 +454,6 @@ private:
   struct epoll_event epoll_events_[MAX_EPOLL_EVENTS];
 };
 
-} // namespace chi
+}  // namespace chi
 
-#endif // CHIMAERA_INCLUDE_CHIMAERA_WORKERS_WORKER_H_
+#endif  // CHIMAERA_INCLUDE_CHIMAERA_WORKERS_WORKER_H_

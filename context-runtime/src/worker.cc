@@ -286,7 +286,7 @@ u32 Worker::ProcessNewTasks() {
         std::vector<char> serialized_data(future_shm->serialized_task_.begin(),
                                           future_shm->serialized_task_.end());
         LocalLoadTaskArchive archive(serialized_data);
-        task_full_ptr = container->LocalLoadTask(method_id, archive);
+        task_full_ptr = container->LocalAllocLoadTask(method_id, archive);
 
         // Update the Future's task pointer
         future.GetTaskPtr() = task_full_ptr;
@@ -486,10 +486,8 @@ bool Worker::RouteTask(Future<Task> &future, TaskLane *lane,
          "Pool ID: {}, Method: {}",
          worker_id_, task_ptr->pool_id_, task_ptr->method_);
 
-    // End the task with should_complete=false since RunContext is already
-    // allocated
-    RunContext *run_ctx = task_ptr->run_ctx_;
-    EndTask(task_ptr, run_ctx, false, false);
+    // RunContext is already allocated, just return false to indicate local
+    // execution
     return false;
   }
 
@@ -616,38 +614,26 @@ bool Worker::RouteGlobal(Future<Task> &future,
          pool_queries[i].GetNodeId());
   }
 
-  try {
-    // Create admin client to send task to target node
-    chimaera::admin::Client admin_client(kAdminPoolId);
-    HLOG(kDebug,
-         "Worker::RouteGlobal - created admin_client, calling AsyncSend");
+  auto *ipc_manager = CHI_IPC;
 
-    // Send task using unified Send API with SerializeIn mode
-    admin_client.AsyncSend(
-        chi::MsgType::kSerializeIn,  // SerializeIn - sending inputs
-        task_ptr,                    // Task pointer to send
-        pool_queries                 // Pool queries vector for target nodes
-    );
-
-    HLOG(kDebug, "Worker::RouteGlobal - AsyncSend completed");
-
-    // Set TASK_ROUTED flag on original task
-    task_ptr->SetFlags(TASK_ROUTED);
-
-    // Always return true (never fail)
-    return true;
-
-  } catch (const std::exception &e) {
-    // Handle any exceptions - still never fail
-    HLOG(kError, "Worker::RouteGlobal - exception: {}", e.what());
-    task_ptr->SetFlags(TASK_ROUTED);
-    return true;
-  } catch (...) {
-    // Handle unknown exceptions - still never fail
-    HLOG(kError, "Worker::RouteGlobal - unknown exception");
-    task_ptr->SetFlags(TASK_ROUTED);
-    return true;
+  // Store pool_queries in task's RunContext for SendIn to access
+  RunContext *run_ctx = task_ptr->run_ctx_;
+  if (run_ctx != nullptr) {
+    run_ctx->pool_queries = pool_queries;
   }
+
+  HLOG(kDebug, "Worker::RouteGlobal - enqueueing task directly to net_queue_");
+
+  // Enqueue the original task directly to net_queue_ priority 0 (SendIn)
+  ipc_manager->EnqueueNetTask(future, NetQueuePriority::kSendIn);
+
+  HLOG(kDebug, "Worker::RouteGlobal - enqueued to net_queue_");
+
+  // Set TASK_ROUTED flag on original task
+  task_ptr->SetFlags(TASK_ROUTED);
+
+  // Always return true (never fail)
+  return true;
 }
 
 std::vector<PoolQuery> Worker::ResolvePoolQuery(const PoolQuery &query,
@@ -659,25 +645,40 @@ std::vector<PoolQuery> Worker::ResolvePoolQuery(const PoolQuery &query,
   }
 
   RoutingMode routing_mode = query.GetRoutingMode();
+  std::vector<PoolQuery> result;
 
   switch (routing_mode) {
     case RoutingMode::Local:
-      return ResolveLocalQuery(query, task_ptr);
+      result = ResolveLocalQuery(query, task_ptr);
+      break;
     case RoutingMode::Dynamic:
-      return ResolveDynamicQuery(query, pool_id, task_ptr);
+      result = ResolveDynamicQuery(query, pool_id, task_ptr);
+      break;
     case RoutingMode::DirectId:
-      return ResolveDirectIdQuery(query, pool_id, task_ptr);
+      result = ResolveDirectIdQuery(query, pool_id, task_ptr);
+      break;
     case RoutingMode::DirectHash:
-      return ResolveDirectHashQuery(query, pool_id, task_ptr);
+      result = ResolveDirectHashQuery(query, pool_id, task_ptr);
+      break;
     case RoutingMode::Range:
-      return ResolveRangeQuery(query, pool_id, task_ptr);
+      result = ResolveRangeQuery(query, pool_id, task_ptr);
+      break;
     case RoutingMode::Broadcast:
-      return ResolveBroadcastQuery(query, pool_id, task_ptr);
+      result = ResolveBroadcastQuery(query, pool_id, task_ptr);
+      break;
     case RoutingMode::Physical:
-      return ResolvePhysicalQuery(query, pool_id, task_ptr);
+      result = ResolvePhysicalQuery(query, pool_id, task_ptr);
+      break;
   }
 
-  return {};
+  // Set ret_node_ on all resolved queries to this node's ID
+  auto *ipc_manager = CHI_IPC;
+  u32 this_node_id = ipc_manager->GetNodeId();
+  for (auto &pq : result) {
+    pq.SetReturnNode(this_node_id);
+  }
+
+  return result;
 }
 
 std::vector<PoolQuery> Worker::ResolveLocalQuery(
@@ -1120,91 +1121,80 @@ void Worker::ExecTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
     return;
   }
 
-  // Handle task completion and rescheduling
-  if (task_ptr->IsPeriodic()) {
-    // Periodic tasks are always rescheduled regardless of execution success
-    ReschedulePeriodicTask(run_ctx, task_ptr);
-  } else {
-    // Determine if task should be completed and cleaned up
-    bool is_remote = task_ptr->IsRemote();
-
-    // Non-periodic task completed - decrement work count
-    if (run_ctx->container != nullptr) {
-      // Decrement work remaining in the container for non-periodic tasks
-      run_ctx->container->UpdateWork(task_ptr, *run_ctx, -1);
-    }
-
-    // End task execution and cleanup
-    EndTask(task_ptr, run_ctx, true, is_remote);
-  }
+  // End task execution and cleanup (handles periodic rescheduling internally)
+  EndTask(task_ptr, run_ctx, true);
 }
 
 void Worker::EndTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
-                     bool should_complete, bool is_remote) {
-  HLOG(kInfo, "[TRACE] EndTask - task_id={}, pool_id={}, method={}, should_complete={}, is_remote={}",
-       task_ptr->task_id_, task_ptr->pool_id_, task_ptr->method_, should_complete, is_remote);
-  if (!should_complete) {
+                     bool can_resched) {
+  // Get task properties at the start
+  bool is_remote = task_ptr->IsRemote();
+  bool is_periodic = task_ptr->IsPeriodic();
+
+  HLOG(kInfo,
+       "[TRACE] EndTask - task_id={}, pool_id={}, method={}, is_remote={}, "
+       "is_periodic={}, can_resched={}",
+       task_ptr->task_id_, task_ptr->pool_id_, task_ptr->method_, is_remote,
+       is_periodic, can_resched);
+
+  // Handle periodic task rescheduling
+  if (is_periodic && can_resched) {
+    ReschedulePeriodicTask(run_ctx, task_ptr);
     return;
   }
 
-  // Check if task is remote and needs to send outputs back
+  // Decrement work remaining for non-periodic tasks
+  if (!is_periodic && run_ctx->container != nullptr) {
+    run_ctx->container->UpdateWork(task_ptr, *run_ctx, -1);
+  }
+
+  // If task is remote, enqueue to net_queue_ for SendOut and return immediately
   if (is_remote) {
-    // Get return node ID from pool_query
-    chi::u32 ret_node_id = task_ptr->pool_query_.GetReturnNode();
+    auto *ipc_manager = CHI_IPC;
+    ipc_manager->EnqueueNetTask(run_ctx->future_, NetQueuePriority::kSendOut);
+    HLOG(kDebug,
+         "[TRACE] EndTask - enqueued remote task {} to net_queue_ for SendOut",
+         task_ptr->task_id_);
+    return;
+  }
 
-    // Create pool query for return node
-    std::vector<chi::PoolQuery> return_queries;
-    return_queries.push_back(chi::PoolQuery::Physical(ret_node_id));
-
-    // Create admin client to send task outputs back
-    chimaera::admin::Client admin_client(kAdminPoolId);
-
-    // Send task outputs using SerializeOut mode
-    admin_client.AsyncSend(
-        chi::MsgType::kSerializeOut,  // SerializeOut - sending outputs
-        task_ptr,                     // Task pointer with results
-        return_queries                // Send back to return node
-    );
-
-    HLOG(kDebug, "Worker: Sent remote task outputs back to node {}",
-         ret_node_id);
-  } else {
-    // Local task completion using Future
-    // 1. Serialize outputs using container->LocalSaveTask (only if task will be
-    // destroyed)
-    if (run_ctx->destroy_in_end_task_ || task_ptr->IsFireAndForget()) {
-      LocalSaveTaskArchive archive(LocalMsgType::kSerializeOut);
-      if (run_ctx->container) {
-        run_ctx->container->LocalSaveTask(task_ptr->method_, archive, task_ptr);
-      }
-
-      // Copy serialized outputs to FutureShm
-      const std::vector<char> &serialized = archive.GetData();
-      auto &future_shm = run_ctx->future_.GetFutureShm();
-      future_shm->serialized_task_.resize(serialized.size());
-      std::memcpy(future_shm->serialized_task_.data(), serialized.data(),
-                  serialized.size());
+  // Local task completion using Future
+  // 1. Serialize outputs using container->LocalSaveTask (only if task will be
+  // destroyed)
+  if (run_ctx->destroy_in_end_task_) {
+    LocalSaveTaskArchive archive(LocalMsgType::kSerializeOut);
+    if (run_ctx->container != nullptr) {
+      run_ctx->container->LocalSaveTask(task_ptr->method_, archive, task_ptr);
     }
 
-    // 2. Mark task as complete
-    HLOG(kInfo, "[TRACE] EndTask - calling SetComplete for task_id={}", task_ptr->task_id_);
-    run_ctx->future_.SetComplete();
-    HLOG(kInfo, "[TRACE] EndTask - SetComplete done for task_id={}", task_ptr->task_id_);
+    // Copy serialized outputs to FutureShm
+    const std::vector<char> &serialized = archive.GetData();
+    auto &future_shm = run_ctx->future_.GetFutureShm();
+    future_shm->serialized_task_.resize(serialized.size());
+    std::memcpy(future_shm->serialized_task_.data(), serialized.data(),
+                serialized.size());
+  }
 
-    // 2.5. Wake up parent task if waiting for this subtask
-    RunContext *parent_task = run_ctx->future_.GetParentTask();
-    if (parent_task != nullptr && parent_task->event_queue_ != nullptr) {
-      auto *parent_event_queue = reinterpret_cast<
-          hipc::mpsc_ring_buffer<RunContext *, CHI_MAIN_ALLOC_T> *>(
-          parent_task->event_queue_);
-      parent_event_queue->Emplace(parent_task);
-    }
+  // 2. Mark task as complete
+  HLOG(kInfo, "[TRACE] EndTask - calling SetComplete for task_id={}",
+       task_ptr->task_id_);
+  run_ctx->future_.SetComplete();
+  HLOG(kInfo, "[TRACE] EndTask - SetComplete done for task_id={}",
+       task_ptr->task_id_);
 
-    // 3. Delete task using container->DelTask (only if destroy_in_end_task is
-    // true or task is fire-and-forget)
-    if (run_ctx->destroy_in_end_task_ || task_ptr->IsFireAndForget()) {
-      run_ctx->container->DelTask(task_ptr->method_, task_ptr);
-    }
+  // 2.5. Wake up parent task if waiting for this subtask
+  RunContext *parent_task = run_ctx->future_.GetParentTask();
+  if (parent_task != nullptr && parent_task->event_queue_ != nullptr) {
+    auto *parent_event_queue = reinterpret_cast<
+        hipc::mpsc_ring_buffer<RunContext *, CHI_MAIN_ALLOC_T> *>(
+        parent_task->event_queue_);
+    parent_event_queue->Emplace(parent_task);
+  }
+
+  // 3. Delete task using container->DelTask (only if destroy_in_end_task is
+  // true)
+  if (run_ctx->destroy_in_end_task_) {
+    run_ctx->container->DelTask(task_ptr->method_, task_ptr);
   }
 
   // Deallocate stack and context
@@ -1242,7 +1232,7 @@ void Worker::RerouteDynamicTask(const FullPtr<Task> &task_ptr,
       HLOG(kDebug,
            "Worker::RerouteDynamicTask - still kDynamicSchedule, calling "
            "EndTask");
-      EndTask(task_ptr, run_ctx, true, false);
+      EndTask(task_ptr, run_ctx, false);
       return;
     }
     // Successfully re-routed - execute the task again
@@ -1263,7 +1253,9 @@ void Worker::ProcessBlockedQueue(std::queue<RunContext *> &queue,
   size_t check_limit = std::min(queue_size, size_t(8));
 
   if (queue_size > 0) {
-    HLOG(kInfo, "[TRACE] ProcessBlockedQueue - queue_idx={}, queue_size={}, check_limit={}",
+    HLOG(kInfo,
+         "[TRACE] ProcessBlockedQueue - queue_idx={}, queue_size={}, "
+         "check_limit={}",
          queue_idx, queue_size, check_limit);
   }
 
@@ -1280,8 +1272,11 @@ void Worker::ProcessBlockedQueue(std::queue<RunContext *> &queue,
       continue;
     }
 
-    HLOG(kInfo, "[TRACE] ProcessBlockedQueue - processing task_id={}, pool_id={}, method={}",
-         run_ctx->task->task_id_, run_ctx->task->pool_id_, run_ctx->task->method_);
+    HLOG(kInfo,
+         "[TRACE] ProcessBlockedQueue - processing task_id={}, pool_id={}, "
+         "method={}",
+         run_ctx->task->task_id_, run_ctx->task->pool_id_,
+         run_ctx->task->method_);
 
     // Always execute tasks from blocked queue
     // (Event queue will handle subtask completion wakeup)
@@ -1295,7 +1290,8 @@ void Worker::ProcessBlockedQueue(std::queue<RunContext *> &queue,
     // This allows the task to call Wait() again if needed
     run_ctx->is_yielded_ = false;
 
-    HLOG(kInfo, "[TRACE] ProcessBlockedQueue - calling ExecTask, is_started={}", is_started);
+    HLOG(kInfo, "[TRACE] ProcessBlockedQueue - calling ExecTask, is_started={}",
+         is_started);
 
     // Execute task with existing RunContext
     ExecTask(run_ctx->task, run_ctx, is_started);

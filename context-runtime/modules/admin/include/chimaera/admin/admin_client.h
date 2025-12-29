@@ -115,51 +115,27 @@ class Client : public chi::ContainerClient {
   }
 
   /**
-   * Send task to remote nodes (synchronous)
-   * Can be used for both SerializeIn (sending inputs) and SerializeOut (sending outputs)
+   * Create a periodic SendTask for polling the network queue
+   * This task polls net_queue_ and processes send operations
+   * @param pool_query Pool query for routing
+   * @param transfer_flags Transfer flags
+   * @param period_us Period in microseconds (default 25us)
+   * @return Future for the periodic SendTask
    */
-  template <typename TaskType>
-  void Send(chi::MsgType msg_type,
-            const hipc::FullPtr<TaskType>& subtask,
-            const std::vector<chi::PoolQuery>& pool_queries,
-            chi::u32 transfer_flags = 0) {
-    auto task = AsyncSend(msg_type, subtask, pool_queries, transfer_flags);
-    task.Wait();
-
-    // Check for errors
-    if (task->GetReturnCode() != 0) {
-      std::string error = task->error_message_.str();
-      auto* ipc_manager = CHI_IPC;
-      ipc_manager->DelTask(task.GetTaskPtr());
-      throw std::runtime_error("Send failed: " + error);
-    }
-
-    // Clean up task
-    auto* ipc_manager = CHI_IPC;
-    ipc_manager->DelTask(task.GetTaskPtr());
-  }
-
-  /**
-   * Send task to remote nodes (asynchronous)
-   * Can be used for SerializeIn (sending inputs), SerializeOut (sending outputs), or Heartbeat
-   */
-  template <typename TaskType>
-  chi::Future<SendTask> AsyncSend(chi::MsgType msg_type,
-      const hipc::FullPtr<TaskType>& subtask,
-      const std::vector<chi::PoolQuery>& pool_queries,
-      chi::u32 transfer_flags = 0) {
+  chi::Future<SendTask> AsyncSendPoll(const chi::PoolQuery& pool_query,
+      chi::u32 transfer_flags = 0,
+      double period_us = 25) {
     auto* ipc_manager = CHI_IPC;
 
-    // Use local routing
-    chi::PoolQuery local_pool_query = chi::PoolQuery::Local();
-
-    // Cast subtask to base Task type
-    hipc::FullPtr<chi::Task> base_subtask = subtask.template Cast<chi::Task>();
-
-    // Allocate SendTask
+    // Allocate SendTask for polling
     auto task = ipc_manager->NewTask<SendTask>(
-        chi::CreateTaskId(), pool_id_, local_pool_query,
-        msg_type, base_subtask, pool_queries, transfer_flags);
+        chi::CreateTaskId(), pool_id_, pool_query, transfer_flags);
+
+    // Set task as periodic if period is specified
+    if (period_us > 0) {
+      task->SetPeriod(period_us, chi::kMicro);
+      task->SetFlags(TASK_PERIODIC);
+    }
 
     // Submit to runtime and return Future
     return ipc_manager->Send(task);
