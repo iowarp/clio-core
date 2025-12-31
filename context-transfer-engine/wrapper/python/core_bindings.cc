@@ -83,23 +83,40 @@ NB_MODULE(wrp_cte_core_ext, m) {
       .def_rw("read_time_", &wrp_cte::core::CteTelemetry::read_time_)
       .def_rw("logical_time_", &wrp_cte::core::CteTelemetry::logical_time_);
 
-  // Bind Client class with PollTelemetryLog, ReorganizeBlob, and Query methods
-  // Note: Query methods use lambda wrappers to avoid evaluating chi::PoolQuery
-  // static methods (Broadcast/Dynamic) at module import time, which would
-  // cause std::bad_cast errors before runtime initialization
+  // Bind Client class with async API methods wrapped for synchronous Python use
+  // Note: All methods use lambda wrappers to call async methods and wait for completion
   nb::class_<wrp_cte::core::Client>(m, "Client")
       .def(nb::init<>())
       .def(nb::init<const chi::PoolId &>())
-      .def("PollTelemetryLog", &wrp_cte::core::Client::PollTelemetryLog,
-           "minimum_logical_time"_a,
-           "Poll telemetry log with minimum logical time filter")
-      .def("ReorganizeBlob", &wrp_cte::core::Client::ReorganizeBlob,
-           "tag_id"_a, "blob_name"_a, "new_score"_a,
-           "Reorganize single blob with new score for data placement optimization")
+      .def("PollTelemetryLog",
+          [](wrp_cte::core::Client &self, std::uint64_t minimum_logical_time) {
+            auto task = self.AsyncPollTelemetryLog(minimum_logical_time);
+            task.Wait();
+            // Convert chi::priv::vector to std::vector for Python
+            std::vector<wrp_cte::core::CteTelemetry> result;
+            for (size_t i = 0; i < task->entries_.size(); ++i) {
+              result.push_back(task->entries_[i]);
+            }
+            return result;
+          },
+          "minimum_logical_time"_a,
+          "Poll telemetry log with minimum logical time filter")
+      .def("ReorganizeBlob",
+          [](wrp_cte::core::Client &self,
+             const wrp_cte::core::TagId &tag_id, const std::string &blob_name,
+             float new_score) {
+            auto task = self.AsyncReorganizeBlob(tag_id, blob_name, new_score);
+            task.Wait();
+            return task->return_code_ == 0;
+          },
+          "tag_id"_a, "blob_name"_a, "new_score"_a,
+          "Reorganize single blob with new score for data placement optimization")
      .def("TagQuery",
          [](wrp_cte::core::Client &self,
             const std::string &tag_regex, uint32_t max_tags, const chi::PoolQuery &pool_query) {
-           return self.TagQuery(tag_regex, max_tags, pool_query);
+           auto task = self.AsyncTagQuery(tag_regex, max_tags, pool_query);
+           task.Wait();
+           return task->results_;
          },
          "tag_regex"_a, "max_tags"_a = 0, "pool_query"_a,
          "Query tags by regex pattern, returns vector of tag names")
@@ -107,7 +124,15 @@ NB_MODULE(wrp_cte_core_ext, m) {
          [](wrp_cte::core::Client &self,
             const std::string &tag_regex, const std::string &blob_regex,
             uint32_t max_blobs, const chi::PoolQuery &pool_query) {
-           return self.BlobQuery(tag_regex, blob_regex, max_blobs, pool_query);
+           auto task = self.AsyncBlobQuery(tag_regex, blob_regex, max_blobs, pool_query);
+           task.Wait();
+           // Convert separate tag_names_ and blob_names_ vectors to vector of pairs
+           std::vector<std::pair<std::string, std::string>> result;
+           size_t count = std::min(task->tag_names_.size(), task->blob_names_.size());
+           for (size_t i = 0; i < count; ++i) {
+             result.emplace_back(task->tag_names_[i], task->blob_names_[i]);
+           }
+           return result;
          },
          "tag_regex"_a, "blob_regex"_a, "max_blobs"_a = 0, "pool_query"_a,
          "Query blobs by tag and blob regex patterns, returns vector of (tag_name, blob_name) pairs")
@@ -115,7 +140,9 @@ NB_MODULE(wrp_cte_core_ext, m) {
          [](wrp_cte::core::Client &self,
             const std::string &target_name, chimaera::bdev::BdevType bdev_type,
             uint64_t total_size, const chi::PoolQuery &target_query, const chi::PoolId &bdev_id) {
-           return self.RegisterTarget(target_name, bdev_type, total_size, target_query, bdev_id);
+           auto task = self.AsyncRegisterTarget(target_name, bdev_type, total_size, target_query, bdev_id);
+           task.Wait();
+           return task->return_code_;
          },
          "target_name"_a, "bdev_type"_a, "total_size"_a,
          "target_query"_a, "bdev_id"_a,
@@ -124,14 +151,18 @@ NB_MODULE(wrp_cte_core_ext, m) {
          [](wrp_cte::core::Client &self,
             const std::string &target_name, chimaera::bdev::BdevType bdev_type,
             uint64_t total_size) {
-           return self.RegisterTarget(target_name, bdev_type, total_size);
+           auto task = self.AsyncRegisterTarget(target_name, bdev_type, total_size);
+           task.Wait();
+           return task->return_code_;
          },
          "target_name"_a, "bdev_type"_a, "total_size"_a,
          "Register a storage target with default query and pool ID. Returns 0 on success, non-zero on failure")
      .def("DelBlob",
          [](wrp_cte::core::Client &self,
             const wrp_cte::core::TagId &tag_id, const std::string &blob_name) {
-           return self.DelBlob(tag_id, blob_name);
+           auto task = self.AsyncDelBlob(tag_id, blob_name);
+           task.Wait();
+           return task->return_code_ == 0;
          },
          "tag_id"_a, "blob_name"_a,
          "Delete a blob from a tag. Returns True on success, False otherwise");

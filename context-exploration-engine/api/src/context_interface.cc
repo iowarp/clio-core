@@ -50,9 +50,12 @@ int ContextInterface::ContextBundle(
     // Connect to CAE core container using the standard pool ID
     wrp_cae::core::Client cae_client(wrp_cae::core::kCaePoolId);
 
-    // Call ParseOmni with vector of contexts
-    chi::u32 num_tasks_scheduled = 0;
-    chi::u32 result = cae_client.ParseOmni(bundle, num_tasks_scheduled);
+    // Call AsyncParseOmni with vector of contexts and wait for completion
+    auto task = cae_client.AsyncParseOmni(bundle);
+    task.Wait();
+
+    chi::u32 result = task->result_code_;
+    chi::u32 num_tasks_scheduled = task->num_tasks_scheduled_;
 
     if (result != 0) {
       std::cerr << "Error: ParseOmni failed with result code " << result << std::endl;
@@ -87,18 +90,19 @@ std::vector<std::string> ContextInterface::ContextQuery(
       return std::vector<std::string>();
     }
 
-    // Call BlobQuery with tag and blob regex patterns
+    // Call AsyncBlobQuery with tag and blob regex patterns
     // Use Broadcast to query across all nodes
-    auto query_results = cte_client->BlobQuery(
+    auto task = cte_client->AsyncBlobQuery(
         tag_re,
         blob_re,
         max_results,  // max_blobs (0 = unlimited)
         chi::PoolQuery::Broadcast());
+    task.Wait();
 
-    // Convert pair<string, string> results to just blob names
+    // Extract results from task - blob names only
     std::vector<std::string> results;
-    for (const auto& pair : query_results) {
-      results.push_back(pair.second);  // pair.second is the blob name
+    for (size_t i = 0; i < task->blob_names_.size(); ++i) {
+      results.push_back(task->blob_names_[i]);
     }
 
     return results;
@@ -135,12 +139,20 @@ std::vector<std::string> ContextInterface::ContextRetrieve(
       return std::vector<std::string>();
     }
 
-    // Use BlobQuery to get list of blobs matching the pattern
-    auto query_results = cte_client->BlobQuery(
+    // Use AsyncBlobQuery to get list of blobs matching the pattern
+    auto query_task = cte_client->AsyncBlobQuery(
         tag_re,
         blob_re,
         max_results,
         chi::PoolQuery::Broadcast());
+    query_task.Wait();
+
+    // Build query_results from separate tag_names_ and blob_names_ vectors
+    std::vector<std::pair<std::string, std::string>> query_results;
+    size_t result_count = std::min(query_task->tag_names_.size(), query_task->blob_names_.size());
+    for (size_t i = 0; i < result_count; ++i) {
+      query_results.emplace_back(query_task->tag_names_[i], query_task->blob_names_[i]);
+    }
 
     if (query_results.empty()) {
       std::cout << "ContextRetrieve: No blobs found matching patterns" << std::endl;
@@ -172,14 +184,18 @@ std::vector<std::string> ContextInterface::ContextRetrieve(
         const auto& [tag_name, blob_name] = query_results[i];
 
         // Get or create tag to get tag_id
-        wrp_cte::core::TagId tag_id = cte_client->GetOrCreateTag(tag_name);
+        auto tag_task = cte_client->AsyncGetOrCreateTag(tag_name);
+        tag_task.Wait();
+        wrp_cte::core::TagId tag_id = tag_task->tag_id_;
         if (tag_id.IsNull()) {
           std::cerr << "Warning: Failed to get tag '" << tag_name << "', skipping blob" << std::endl;
           continue;
         }
 
         // Get blob size first
-        chi::u64 blob_size = cte_client->GetBlobSize(tag_id, blob_name);
+        auto size_task = cte_client->AsyncGetBlobSize(tag_id, blob_name);
+        size_task.Wait();
+        chi::u64 blob_size = size_task->size_;
         if (blob_size == 0) {
           std::cerr << "Warning: Blob '" << blob_name << "' has zero size, skipping" << std::endl;
           continue;
@@ -284,7 +300,9 @@ int ContextInterface::ContextDestroy(
     // Iterate over each context name and delete the corresponding tag
     int error_count = 0;
     for (const auto& context_name : context_names) {
-      bool result = cte_client->DelTag(context_name);
+      auto task = cte_client->AsyncDelTag(context_name);
+      task.Wait();
+      bool result = (task->return_code_ == 0);
       if (!result) {
         std::cerr << "Error: Failed to delete context '" << context_name << "'" << std::endl;
         error_count++;

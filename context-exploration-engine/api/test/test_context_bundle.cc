@@ -136,12 +136,14 @@ void test_bundle_and_retrieve_workflow() {
   // Step 2.5: Register a RAM storage target with CTE
   std::cout << "  [STEP 2.5] Registering RAM storage target with CTE..." << std::endl;
   auto* cte_client = WRP_CTE_CLIENT;
-  chi::u32 register_result = cte_client->RegisterTarget(
+  auto register_task = cte_client->AsyncRegisterTarget(
       "ram::cee_test_storage",  // Target name (RAM storage)
       chimaera::bdev::BdevType::kRam,  // RAM block device type
       4ULL * 1024 * 1024 * 1024,  // 4GB capacity
       chi::PoolQuery::Local(),  // Local pool query for single-node
       chi::PoolId(800, 0));  // Explicit bdev pool ID
+  register_task.Wait();
+  chi::u32 register_result = register_task->return_code_;
   assert(register_result == 0 && "Failed to register storage target");
   std::cout << "  Storage target registered successfully" << std::endl;
 
@@ -150,11 +152,12 @@ void test_bundle_and_retrieve_workflow() {
   wrp_cae::core::Client cae_client;
   wrp_cae::core::CreateParams params;
 
-  cae_client.Create(
+  auto create_task = cae_client.AsyncCreate(
       chi::PoolQuery::Local(),
       "test_cee_cae_pool",
       wrp_cae::core::kCaePoolId,
       params);
+  create_task.Wait();
 
   std::cout << "  CAE pool created with ID: " << cae_client.pool_id_ << std::endl;
 
