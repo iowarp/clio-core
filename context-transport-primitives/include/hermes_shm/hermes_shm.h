@@ -26,7 +26,6 @@
 #include "types/bitfield.h"
 #include "types/hash.h"
 #include "types/numbers.h"
-#include "types/qtok.h"
 #include "types/real_number.h"
 
 // Utilities (low-level support)
@@ -97,12 +96,12 @@
 // Data structures
 // IPC data structures (inter-process communication containers)
 #include "data_structures/ipc/algorithm.h"
+#include "data_structures/ipc/multi_ring_buffer.h"
 #include "data_structures/ipc/rb_tree_pre.h"
 #include "data_structures/ipc/ring_buffer.h"
 #include "data_structures/ipc/shm_container.h"
 #include "data_structures/ipc/slist_pre.h"
 #include "data_structures/ipc/vector.h"
-#include "data_structures/ipc/multi_ring_buffer.h"
 
 // Private data structures (single-process containers)
 #include "data_structures/priv/string.h"
