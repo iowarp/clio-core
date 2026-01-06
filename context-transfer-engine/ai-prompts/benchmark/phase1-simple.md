@@ -4,4 +4,4 @@ You may use MPI for building the benchmark to support parallel I/O.
 
 Implement the benchmarks under the benchmark directory.
 
-Build a jarvis package for the benchmark under test/jarvis_wrp_cte/jarvis_wrp_cte/wrp_cte_bench. Read @docs/jarvis/package_dev_guide.md to see how to build a package properly. This is an application package.
+Build a jarvis package for the benchmark under test/jarvis_iowarp/jarvis_iowarp/wrp_cte_bench. Read @docs/jarvis/package_dev_guide.md to see how to build a package properly. This is an application package.

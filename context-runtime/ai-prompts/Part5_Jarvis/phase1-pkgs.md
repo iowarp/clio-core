@@ -1,5 +1,5 @@
 @CLAUDE.md Build a jarvis package for deploying this repo. Read @docs/jarvis/package_dev_guide.md
-to see how. Create the jarvis repo in a new directory test/jarvis_wrp_runtime. 
+to see how. Create the jarvis repo in a new directory test/jarvis_iowarp. 
 
 ## wrp_runtime
 

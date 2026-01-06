@@ -19,14 +19,13 @@
 
 #include "hermes_shm/constants/macros.h"
 #include "hermes_shm/introspect/system_info.h"
-#include "hermes_shm/memory/backend/memory_backend.h"
 #include "hermes_shm/memory/backend/array_backend.h"
+#include "hermes_shm/memory/backend/memory_backend.h"
 #include "hermes_shm/thread/thread_model/thread_model.h"
 #include "hermes_shm/types/atomic.h"
 #include "hermes_shm/types/bitfield.h"
 #include "hermes_shm/types/hash.h"
 #include "hermes_shm/types/numbers.h"
-#include "hermes_shm/types/real_number.h"
 #include "hermes_shm/util/errors.h"
 
 namespace hshm::ipc {
@@ -43,10 +42,10 @@ class Allocator;
 class ShmPointer {};
 
 /** Forward declarations for pointer types */
-template<typename T = void, bool ATOMIC = false>
+template <typename T = void, bool ATOMIC = false>
 struct OffsetPtrBase;
 
-template<typename T = void, bool ATOMIC = false>
+template <typename T = void, bool ATOMIC = false>
 struct ShmPtrBase;
 
 /**
@@ -59,9 +58,7 @@ struct AllocatorHeader {
   AllocatorHeader() = default;
 
   HSHM_CROSS_FUN
-  void Configure() {
-    total_alloc_ = 0;
-  }
+  void Configure() { total_alloc_ = 0; }
 
   HSHM_INLINE_CROSS_FUN
   void AddSize(hshm::size_t size) {
@@ -84,18 +81,23 @@ struct AllocatorHeader {
 /** The allocator information struct */
 class Allocator {
  public:
-  size_t alloc_header_size_;  /**< Size of the allocator object (sizeof derived class) */
-  size_t data_start_;         /**< Offset of allocator's managed data region (relative to this) */
-  size_t this_;               /**< Offset of this allocator object within backend data (this - backend.data_) */
-  size_t region_size_;        /**< Size of the region this allocator manages */
+  size_t alloc_header_size_; /**< Size of the allocator object (sizeof derived
+                                class) */
+  size_t data_start_; /**< Offset of allocator's managed data region (relative
+                         to this) */
+  size_t this_; /**< Offset of this allocator object within backend data (this -
+                   backend.data_) */
+  size_t region_size_; /**< Size of the region this allocator manages */
 
  private:
-  MemoryBackend backend_;  /**< Memory backend (not fully compatible with shared memory) */
+  MemoryBackend
+      backend_; /**< Memory backend (not fully compatible with shared memory) */
 
  public:
   /** Default constructor */
   HSHM_INLINE_CROSS_FUN
-  Allocator() : alloc_header_size_(0), data_start_(0), this_(0), region_size_(0) {}
+  Allocator()
+      : alloc_header_size_(0), data_start_(0), this_(0), region_size_(0) {}
 
   /** Get the allocator identifier from backend */
   HSHM_INLINE_CROSS_FUN
@@ -109,38 +111,38 @@ class Allocator {
    * Get backend data pointer (reconstructs from allocator position)
    */
   HSHM_INLINE_CROSS_FUN
-  char *GetBackendData() {
-    return reinterpret_cast<char *>(this) - this_;
-  }
+  char *GetBackendData() { return reinterpret_cast<char *>(this) - this_; }
 
   /**
    * Get backend data pointer (reconstructs from allocator position)
    */
   HSHM_INLINE_CROSS_FUN
-  char* GetBackendData() const {
-    return reinterpret_cast<char*>(const_cast<Allocator*>(this)) - this_;
+  char *GetBackendData() const {
+    return reinterpret_cast<char *>(const_cast<Allocator *>(this)) - this_;
   }
 
   /**
    * Get typed private header (process-local storage)
    * This region is kBackendHeaderSize bytes and is NOT shared between processes
-   * Uses GetBackend() to access the proper priv_header_off_ for correct calculation
+   * Uses GetBackend() to access the proper priv_header_off_ for correct
+   * calculation
    * @return Pointer to private header of type HEADER_T
    */
   template <typename HEADER_T>
-  HSHM_INLINE_CROSS_FUN HEADER_T* GetPrivateHeader() {
-    return const_cast<HEADER_T*>(
-        static_cast<const Allocator*>(this)->GetPrivateHeader<HEADER_T>());
+  HSHM_INLINE_CROSS_FUN HEADER_T *GetPrivateHeader() {
+    return const_cast<HEADER_T *>(
+        static_cast<const Allocator *>(this)->GetPrivateHeader<HEADER_T>());
   }
 
   /**
    * Get typed private header (process-local storage) - const version
    * This region is kBackendHeaderSize bytes and is NOT shared between processes
-   * Uses GetBackend() to access the proper priv_header_off_ for correct calculation
+   * Uses GetBackend() to access the proper priv_header_off_ for correct
+   * calculation
    * @return Const pointer to private header of type HEADER_T
    */
   template <typename HEADER_T>
-  HSHM_INLINE_CROSS_FUN const HEADER_T* GetPrivateHeader() const {
+  HSHM_INLINE_CROSS_FUN const HEADER_T *GetPrivateHeader() const {
     return backend_.GetPrivateHeader<HEADER_T>(GetBackendData());
   }
 
@@ -178,7 +180,6 @@ class Allocator {
     return backend_.GetSharedHeader<HEADER_T>(GetBackendData());
   }
 
-  
   /**
    * Get the size of the backend data capacity
    * This is the total size available to the allocator
@@ -195,8 +196,9 @@ class Allocator {
    * @return Pointer to the start of allocator data
    */
   HSHM_INLINE_CROSS_FUN
-  char* GetAllocatorDataStart() const {
-    return reinterpret_cast<char*>(const_cast<Allocator*>(this)) + data_start_;
+  char *GetAllocatorDataStart() const {
+    return reinterpret_cast<char *>(const_cast<Allocator *>(this)) +
+           data_start_;
   }
 
   /**
@@ -206,20 +208,16 @@ class Allocator {
    * @return Offset from backend data_ to allocator data start
    */
   HSHM_INLINE_CROSS_FUN
-  size_t GetAllocatorDataOff() const {
-    return this_ + data_start_;
-  }
+  size_t GetAllocatorDataOff() const { return this_ + data_start_; }
 
   /**
-   * Get the size of the allocator's data region (excluding allocator object and custom header)
-   * This is the size available for the allocator's managed heap
+   * Get the size of the allocator's data region (excluding allocator object and
+   * custom header) This is the size available for the allocator's managed heap
    *
    * @return Size of allocator data region in bytes
    */
   HSHM_INLINE_CROSS_FUN
-  size_t GetAllocatorDataSize() const {
-    return region_size_ - data_start_;
-  }
+  size_t GetAllocatorDataSize() const { return region_size_ - data_start_; }
 
   /**
    * Determine whether or not this allocator contains a process-specific
@@ -232,7 +230,7 @@ class Allocator {
   HSHM_INLINE_CROSS_FUN bool ContainsPtr(const T *ptr) const {
     MemoryBackend backend = GetBackend();
     const char *shared_header = backend.GetSharedHeader<char>();
-    const char *char_ptr = reinterpret_cast<const char*>(ptr);
+    const char *char_ptr = reinterpret_cast<const char *>(ptr);
     size_t off = char_ptr - shared_header;
     return char_ptr >= shared_header && off < backend.data_capacity_;
   }
@@ -240,8 +238,9 @@ class Allocator {
   /**
    * Check if an OffsetPtr is within this allocator's region
    */
-  template<typename T, bool ATOMIC>
-  HSHM_INLINE_CROSS_FUN bool ContainsPtr(const OffsetPtrBase<T, ATOMIC> &ptr) const {
+  template <typename T, bool ATOMIC>
+  HSHM_INLINE_CROSS_FUN bool ContainsPtr(
+      const OffsetPtrBase<T, ATOMIC> &ptr) const {
     size_t off = ptr.off_.load();
     return off < backend_.data_capacity_;
   }
@@ -249,8 +248,9 @@ class Allocator {
   /**
    * Check if a ShmPtr is within this allocator's region
    */
-  template<typename T, bool ATOMIC>
-  HSHM_INLINE_CROSS_FUN bool ContainsPtr(const ShmPtrBase<T, ATOMIC> &ptr) const {
+  template <typename T, bool ATOMIC>
+  HSHM_INLINE_CROSS_FUN bool ContainsPtr(
+      const ShmPtrBase<T, ATOMIC> &ptr) const {
     size_t off = ptr.off_.load();
     return off < backend_.data_capacity_;
   }
@@ -260,18 +260,16 @@ class Allocator {
   void Print() {
 #if HSHM_IS_HOST
     MemoryBackend backend = GetBackend();
-    printf("(%s) Allocator: id: (%u,%u), size: %lu\n",
-           kCurrentDevice, GetId().major_,
-           GetId().minor_, (unsigned long)backend.data_capacity_);
+    printf("(%s) Allocator: id: (%u,%u), size: %lu\n", kCurrentDevice,
+           GetId().major_, GetId().minor_,
+           (unsigned long)backend.data_capacity_);
 #endif
   }
 
  protected:
   /** Set the backend (for use by derived classes during initialization) */
   HSHM_INLINE_CROSS_FUN
-  void SetBackend(const MemoryBackend &backend) {
-    backend_ = backend;
-  }
+  void SetBackend(const MemoryBackend &backend) { backend_ = backend; }
 
   /**====================================
    * Object Constructors
@@ -359,8 +357,7 @@ struct OffsetPtrBase : public ShmPointer {
   }
 
   /** ostream operator */
-  friend std::ostream &operator<<(std::ostream &os,
-                                  const OffsetPtrBase &ptr) {
+  friend std::ostream &operator<<(std::ostream &os, const OffsetPtrBase &ptr) {
     os << ptr.off_.load();
     return os;
   }
@@ -377,27 +374,27 @@ struct OffsetPtrBase : public ShmPointer {
       : off_(off.load()) {}
 
   /** Copy constructor from different type */
-  template<typename U>
-  HSHM_INLINE_CROSS_FUN explicit OffsetPtrBase(const OffsetPtrBase<U, ATOMIC> &other)
+  template <typename U>
+  HSHM_INLINE_CROSS_FUN explicit OffsetPtrBase(
+      const OffsetPtrBase<U, ATOMIC> &other)
       : off_(other.off_.load()) {}
 
   /** ShmPtr constructor */
-  HSHM_INLINE_CROSS_FUN explicit OffsetPtrBase(AllocatorId alloc_id,
-                                                   size_t off)
+  HSHM_INLINE_CROSS_FUN explicit OffsetPtrBase(AllocatorId alloc_id, size_t off)
       : off_(off) {
     (void)alloc_id;
   }
 
   /** ShmPtr constructor (alloc + atomic offset)*/
   HSHM_INLINE_CROSS_FUN explicit OffsetPtrBase(AllocatorId id,
-                                                   OffsetPtrBase<T, true> off)
+                                               OffsetPtrBase<T, true> off)
       : off_(off.load()) {
     (void)id;
   }
 
   /** ShmPtr constructor (alloc + non-offeset) */
   HSHM_INLINE_CROSS_FUN explicit OffsetPtrBase(AllocatorId id,
-                                                   OffsetPtrBase<T, false> off)
+                                               OffsetPtrBase<T, false> off)
       : off_(off.load()) {
     (void)id;
   }
@@ -407,8 +404,7 @@ struct OffsetPtrBase : public ShmPointer {
       : off_(other.off_.load()) {}
 
   /** Other copy constructor */
-  HSHM_INLINE_CROSS_FUN OffsetPtrBase(
-      const OffsetPtrBase<T, !ATOMIC> &other)
+  HSHM_INLINE_CROSS_FUN OffsetPtrBase(const OffsetPtrBase<T, !ATOMIC> &other)
       : off_(other.off_.load()) {}
 
   /** Move constructor */
@@ -512,8 +508,7 @@ struct OffsetPtrBase : public ShmPointer {
   }
 
   /** Atomic copy assign operator */
-  HSHM_INLINE_CROSS_FUN OffsetPtrBase &operator=(
-      const OffsetPtrBase &count) {
+  HSHM_INLINE_CROSS_FUN OffsetPtrBase &operator=(const OffsetPtrBase &count) {
     off_ = count.load();
     return *this;
   }
@@ -576,7 +571,7 @@ using AtomicOffsetPtr = OffsetPtrBase<T, true>;
  * */
 template <typename T, bool ATOMIC>
 struct ShmPtrBase : public ShmPointer {
-  AllocatorId alloc_id_;           /// Allocator the pointer comes from
+  AllocatorId alloc_id_;          /// Allocator the pointer comes from
   OffsetPtrBase<T, ATOMIC> off_;  /// Offset within the allocator's slot
 
   /** Serialize a pointer */
@@ -593,16 +588,15 @@ struct ShmPtrBase : public ShmPointer {
   }
 
   /** Default constructor - initializes to null */
-  HSHM_INLINE_CROSS_FUN ShmPtrBase() {
-    alloc_id_.SetNull();
-  }
+  HSHM_INLINE_CROSS_FUN ShmPtrBase() { alloc_id_.SetNull(); }
 
   /** Full constructor */
   HSHM_INLINE_CROSS_FUN explicit ShmPtrBase(AllocatorId id, size_t off)
       : alloc_id_(id), off_(off) {}
 
   /** Full constructor using offset pointer */
-  HSHM_INLINE_CROSS_FUN explicit ShmPtrBase(AllocatorId id, OffsetPtrBase<T, ATOMIC> off)
+  HSHM_INLINE_CROSS_FUN explicit ShmPtrBase(AllocatorId id,
+                                            OffsetPtrBase<T, ATOMIC> off)
       : alloc_id_(id), off_(off) {}
 
   /** Copy constructor */
@@ -614,7 +608,7 @@ struct ShmPtrBase : public ShmPointer {
       : alloc_id_(other.alloc_id_), off_(other.off_.load()) {}
 
   /** Copy constructor from different type */
-  template<typename U>
+  template <typename U>
   HSHM_INLINE_CROSS_FUN explicit ShmPtrBase(const ShmPtrBase<U, ATOMIC> &other)
       : alloc_id_(other.alloc_id_), off_(other.off_.load()) {}
 
@@ -637,7 +631,8 @@ struct ShmPtrBase : public ShmPointer {
 
   /** Get the null pointer */
   HSHM_INLINE_CROSS_FUN static ShmPtrBase GetNull() {
-    return ShmPtrBase{AllocatorId::GetNull(), OffsetPtrBase<T, ATOMIC>::GetNull()};
+    return ShmPtrBase{AllocatorId::GetNull(),
+                      OffsetPtrBase<T, ATOMIC>::GetNull()};
   }
 
   /** Copy assignment operator */
@@ -760,7 +755,6 @@ using ShmPtr = ShmPtrBase<T, false>;
 template <typename T = void>
 using AtomicShmPtr = ShmPtrBase<T, true>;
 
-
 /** Struct containing both private and shared pointer */
 template <typename T = char, bool ATOMIC = false>
 struct FullPtr : public ShmPointer {
@@ -805,7 +799,8 @@ struct FullPtr : public ShmPointer {
    * @param ptr Raw pointer to wrap (can be stack or heap memory)
    */
   HSHM_INLINE_CROSS_FUN explicit FullPtr(T *ptr)
-      : ptr_(ptr), shm_(AllocatorId::GetNull(), reinterpret_cast<size_t>(ptr)) {}
+      : ptr_(ptr),
+        shm_(AllocatorId::GetNull(), reinterpret_cast<size_t>(ptr)) {}
 
   /** Shared half + alloc constructor for OffsetPtr */
   template <typename AllocT>
@@ -815,7 +810,7 @@ struct FullPtr : public ShmPointer {
       shm_.off_ = shm.load();
       shm_.alloc_id_ = alloc->GetId();
       char *backend_data = alloc->GetBackendData();
-      ptr_ = reinterpret_cast<T*>(backend_data + shm.load());
+      ptr_ = reinterpret_cast<T *>(backend_data + shm.load());
     } else {
       SetNull();
     }
@@ -826,7 +821,7 @@ struct FullPtr : public ShmPointer {
   HSHM_CROSS_FUN explicit FullPtr(AllocT *alloc, size_t offset) {
     shm_.off_ = offset;
     shm_.alloc_id_ = alloc->GetId();
-    ptr_ = reinterpret_cast<T*>(alloc->GetBackendData() + offset);
+    ptr_ = reinterpret_cast<T *>(alloc->GetBackendData() + offset);
   }
 
   /** Shared half + alloc constructor for ShmPtr */
@@ -836,7 +831,7 @@ struct FullPtr : public ShmPointer {
     if (alloc->ContainsPtr(shm)) {
       shm_.off_ = shm.off_.load();
       shm_.alloc_id_ = shm.alloc_id_;
-      ptr_ = reinterpret_cast<T*>(alloc->GetBackendData() + shm.off_.load());
+      ptr_ = reinterpret_cast<T *>(alloc->GetBackendData() + shm.off_.load());
     } else {
       SetNull();
     }
@@ -885,14 +880,20 @@ struct FullPtr : public ShmPointer {
   }
 
   /** Overload arrow */
-  template<typename U = T>
-  HSHM_INLINE_CROSS_FUN typename std::enable_if<!std::is_void<U>::value, U*>::type
-  operator->() const { return ptr_; }
+  template <typename U = T>
+  HSHM_INLINE_CROSS_FUN
+      typename std::enable_if<!std::is_void<U>::value, U *>::type
+      operator->() const {
+    return ptr_;
+  }
 
   /** Overload dereference */
-  template<typename U = T>
-  HSHM_INLINE_CROSS_FUN typename std::enable_if<!std::is_void<U>::value, U&>::type
-  operator*() const { return *ptr_; }
+  template <typename U = T>
+  HSHM_INLINE_CROSS_FUN
+      typename std::enable_if<!std::is_void<U>::value, U &>::type
+      operator*() const {
+    return *ptr_;
+  }
 
   /** Equality operator */
   HSHM_INLINE_CROSS_FUN bool operator==(const FullPtr &other) const {
@@ -957,7 +958,9 @@ struct FullPtr : public ShmPointer {
   }
 
   /** Check if null */
-  HSHM_INLINE_CROSS_FUN bool IsNull() const { return ptr_ == nullptr || shm_.IsNull(); }
+  HSHM_INLINE_CROSS_FUN bool IsNull() const {
+    return ptr_ == nullptr || shm_.IsNull();
+  }
 
   /** Validate that ptr_ and shm_ are consistent with allocator backend
    *
@@ -969,8 +972,9 @@ struct FullPtr : public ShmPointer {
     if (IsNull()) {
       return true;  // Null pointers are always valid
     }
-    size_t calculated_offset = reinterpret_cast<size_t>(ptr_) -
-                               reinterpret_cast<size_t>(alloc->GetBackendData());
+    size_t calculated_offset =
+        reinterpret_cast<size_t>(ptr_) -
+        reinterpret_cast<size_t>(alloc->GetBackendData());
     size_t stored_offset = shm_.off_.load();
     return calculated_offset == stored_offset;
   }
@@ -984,7 +988,7 @@ struct FullPtr : public ShmPointer {
   HSHM_INLINE_CROSS_FUN void SetNull() { ptr_ = nullptr; }
 
   /** Reintrepret cast to other internal type */
-  template <typename U, bool ATOMIC2=ATOMIC>
+  template <typename U, bool ATOMIC2 = ATOMIC>
   HSHM_INLINE_CROSS_FUN FullPtr<U, ATOMIC2> &Cast() {
     return DeepCast<FullPtr<U, ATOMIC2>>();
   }
@@ -1041,8 +1045,8 @@ class BaseAllocator : public CoreAllocT {
    * each allocator has its own arguments to this method.
    * */
   template <typename... Args>
-  HSHM_CROSS_FUN void shm_init(Args&&... args) {
-    static_cast<CoreAllocT*>(this)->shm_init(std::forward<Args>(args)...);
+  HSHM_CROSS_FUN void shm_init(Args &&...args) {
+    static_cast<CoreAllocT *>(this)->shm_init(std::forward<Args>(args)...);
   }
 
   /**
@@ -1050,7 +1054,7 @@ class BaseAllocator : public CoreAllocT {
    * */
   HSHM_CROSS_FUN
   void shm_attach(const MemoryBackend &backend) {
-    static_cast<CoreAllocT*>(this)->shm_attach(backend);
+    static_cast<CoreAllocT *>(this)->shm_attach(backend);
   }
 
   /**====================================
@@ -1116,16 +1120,18 @@ class BaseAllocator : public CoreAllocT {
   /**
    * Check if OffsetPtr is contained in this allocator
    */
-  template<typename T, bool ATOMIC>
-  HSHM_INLINE_CROSS_FUN bool ContainsPtr(const OffsetPtrBase<T, ATOMIC> &ptr) const {
+  template <typename T, bool ATOMIC>
+  HSHM_INLINE_CROSS_FUN bool ContainsPtr(
+      const OffsetPtrBase<T, ATOMIC> &ptr) const {
     return CoreAllocT::template ContainsPtr<T>(ptr);
   }
 
   /**
    * Check if ShmPtr is contained in this allocator
    */
-  template<typename T, bool ATOMIC>
-  HSHM_INLINE_CROSS_FUN bool ContainsPtr(const ShmPtrBase<T, ATOMIC> &ptr) const {
+  template <typename T, bool ATOMIC>
+  HSHM_INLINE_CROSS_FUN bool ContainsPtr(
+      const ShmPtrBase<T, ATOMIC> &ptr) const {
     return CoreAllocT::template ContainsPtr<T>(ptr);
   }
 
@@ -1148,7 +1154,7 @@ class BaseAllocator : public CoreAllocT {
   template <typename T = void>
   HSHM_INLINE_CROSS_FUN FullPtr<T> Allocate(size_t size) {
     auto offset_ptr = AllocateOffset(size);
-    auto *alloc_ptr = static_cast<Allocator*>(this);
+    auto *alloc_ptr = static_cast<Allocator *>(this);
     return FullPtr<T>(alloc_ptr, OffsetPtr<T>(offset_ptr.load()));
   }
 
@@ -1159,9 +1165,8 @@ class BaseAllocator : public CoreAllocT {
    * @return the reallocated FullPtr.
    * */
   template <typename T = void>
-  HSHM_INLINE_CROSS_FUN FullPtr<T> Reallocate(
-      const FullPtr<T> &p,
-      size_t new_size) {
+  HSHM_INLINE_CROSS_FUN FullPtr<T> Reallocate(const FullPtr<T> &p,
+                                              size_t new_size) {
     if (p.IsNull()) {
       return Allocate<T>(new_size);
     }
@@ -1180,10 +1185,6 @@ class BaseAllocator : public CoreAllocT {
     }
     FreeOffsetNoNullCheck(OffsetPtr<>(p.shm_.off_.load()));
   }
-
-
-
-
 
   /**====================================
    * Private Object Allocators
@@ -1221,8 +1222,7 @@ class BaseAllocator : public CoreAllocT {
 
   /** Allocate + construct an array of objects */
   template <typename T, typename... Args>
-  HSHM_INLINE_CROSS_FUN FullPtr<T> NewObjs(size_t count,
-                                   Args &&...args) {
+  HSHM_INLINE_CROSS_FUN FullPtr<T> NewObjs(size_t count, Args &&...args) {
     auto alloc_result = AllocateObjs<T>(count);
     ConstructObjs<T>(alloc_result.ptr_, 0, count, std::forward<Args>(args)...);
     return alloc_result;
@@ -1244,11 +1244,11 @@ class BaseAllocator : public CoreAllocT {
    * */
   template <typename T>
   HSHM_INLINE_CROSS_FUN FullPtr<T> ReallocateObjs(FullPtr<T> &p,
-                                                             size_t new_count) {
+                                                  size_t new_count) {
     auto *alloc = this;
-    FullPtr<void> old_full_ptr(alloc, reinterpret_cast<void*>(p.ptr_));
+    FullPtr<void> old_full_ptr(alloc, reinterpret_cast<void *>(p.ptr_));
     auto new_full_ptr = Reallocate<void>(old_full_ptr, new_count * sizeof(T));
-    p = FullPtr<T>(alloc, reinterpret_cast<T*>(new_full_ptr.ptr_));
+    p = FullPtr<T>(alloc, reinterpret_cast<T *>(new_full_ptr.ptr_));
     return p;
   }
 
@@ -1263,11 +1263,10 @@ class BaseAllocator : public CoreAllocT {
    * Free + destruct objects
    * */
   template <typename T>
-  HSHM_INLINE_CROSS_FUN void DelObjs(FullPtr<T> &p,
-                                     size_t count) {
+  HSHM_INLINE_CROSS_FUN void DelObjs(FullPtr<T> &p, size_t count) {
     DestructObjs<T>(p.ptr_, count);
     auto *alloc = this;
-    FullPtr<void> void_ptr(alloc, reinterpret_cast<void*>(p.ptr_));
+    FullPtr<void> void_ptr(alloc, reinterpret_cast<void *>(p.ptr_));
     Free<void>(void_ptr);
   }
 
@@ -1278,7 +1277,6 @@ class BaseAllocator : public CoreAllocT {
   HSHM_INLINE_CROSS_FUN void DelObj(FullPtr<T> &p) {
     DelObjs<T>(p, 1);
   }
-
 
   /**====================================
    * Object Constructors
@@ -1374,7 +1372,8 @@ class BaseAllocator : public CoreAllocT {
   /**
    * Create a sub-allocator within this allocator
    *
-   * @tparam SubAllocT The sub-allocator type to create (e.g., ArenaAllocator, BuddyAllocator)
+   * @tparam SubAllocT The sub-allocator type to create (e.g., ArenaAllocator,
+   * BuddyAllocator)
    * @param size Size of the region for the sub-allocator
    * @param args Additional arguments for the sub-allocator initialization
    * @return Pointer to the created sub-allocator
@@ -1389,7 +1388,7 @@ class BaseAllocator : public CoreAllocT {
     }
 
     // Get backend
-    MemoryBackend backend = static_cast<CoreAllocT*>(this)->GetBackend();
+    MemoryBackend backend = static_cast<CoreAllocT *>(this)->GetBackend();
 
     // Initialize sub-allocator
     sub_alloc->shm_init(backend, size, std::forward<Args>(args)...);
@@ -1404,7 +1403,7 @@ class BaseAllocator : public CoreAllocT {
    * @tparam AllocT The sub-allocator type
    * @param sub_alloc ShmPtr to the sub-allocator to free
    */
-  template<typename AllocT>
+  template <typename AllocT>
   HSHM_CROSS_FUN void FreeSubAllocator(const FullPtr<AllocT> &sub_alloc) {
     if (sub_alloc.IsNull()) {
       return;
@@ -1412,7 +1411,6 @@ class BaseAllocator : public CoreAllocT {
     FreeRegion(sub_alloc);
   }
 };
-
 
 /** Thread-local storage manager */
 template <typename AllocT>

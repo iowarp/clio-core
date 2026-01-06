@@ -106,12 +106,17 @@ RUN echo '' >> /home/iowarp/.bashrc \
     && echo 'export NVIDIA_DRIVER_CAPABILITIES=compute,utility' >> /home/iowarp/.bashrc
 
 # Install Jarvis (IOWarp runtime deployment tool)
-# RUN cd /home/iowarp \
-#     && git clone https://github.com/iowarp/runtime-deployment.git \
-#     && cd runtime-deployment \
-#     && python3 -m pip install -e . -r requirements.txt \
-#     && jarvis init \
-#     && jarvis rg build
+# Note: Must source conda in non-interactive shell since .bashrc isn't loaded during build
+SHELL ["/bin/bash", "-c"]
+RUN cd /home/iowarp \
+    && git clone https://github.com/iowarp/runtime-deployment.git \
+    && cd runtime-deployment \
+    && source /home/iowarp/miniconda3/etc/profile.d/conda.sh \
+    && conda activate base \
+    && pip install -e . -r requirements.txt  \
+    && jarvis init \
+    && jarvis rg build
+
 
 WORKDIR /workspace
 

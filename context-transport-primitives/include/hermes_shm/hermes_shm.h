@@ -26,7 +26,6 @@
 #include "types/bitfield.h"
 #include "types/hash.h"
 #include "types/numbers.h"
-#include "types/real_number.h"
 
 // Utilities (low-level support)
 #include "util/affinity.h"

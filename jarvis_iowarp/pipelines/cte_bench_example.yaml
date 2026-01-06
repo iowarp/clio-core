@@ -5,10 +5,10 @@
 name: cte_benchmark_example
 
 pkgs:
-  - pkg_type: jarvis_wrp_runtime.wrp_runtime
+  - pkg_type: jarvis_iowarp.wrp_runtime
     pkg_name: runtime
 
-  - pkg_type: jarvis_wrp_cte.wrp_cte
+  - pkg_type: jarvis_iowarp.wrp_cte
     pkg_name: cte_core
     devices:
       - ["${HOME}/cte_benchmark/storage1.bin", "500MB", 0.8]
@@ -20,7 +20,7 @@ pkgs:
     default_target_timeout_ms: 30000     # Target timeout (ms)
     poll_period_ms: 5000                 # Period to rescan targets for statistics (capacity, bandwidth, etc.) (ms)
 
-  - pkg_type: jarvis_wrp_cte.wrp_cte_bench
+  - pkg_type: jarvis_iowarp.wrp_cte_bench
     pkg_name: put_benchmark
     test_case: "Put"                     # Benchmark type: Put, Get, or PutGet
     depth: 4                             # Number of concurrent async operations

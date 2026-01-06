@@ -75,7 +75,7 @@ endif()
 #------------------------------------------------------------------------------
 # Add Jarvis WRP runtime packages
 if(WRP_CORE_ENABLE_JARVIS)
-    jarvis_repo_add(${CHIMAERA_ROOT}/test/jarvis_wrp_runtime)
+    jarvis_repo_add(${CHIMAERA_ROOT}/test/jarvis_iowarp)
 endif()
 
 #------------------------------------------------------------------------------

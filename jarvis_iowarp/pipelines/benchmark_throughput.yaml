@@ -14,7 +14,7 @@ env:
 
 pkgs:
   # IOWarp Runtime Service
-  - pkg_type: jarvis_wrp_runtime.wrp_runtime
+  - pkg_type: jarvis_iowarp.wrp_runtime
     pkg_name: runtime
     # Runtime configuration
     sched_workers: 1
@@ -31,7 +31,7 @@ pkgs:
     sleep: 1
 
   # BDev I/O Throughput Benchmark
-  - pkg_type: jarvis_wrp_runtime.wrp_benchmark
+  - pkg_type: jarvis_iowarp.wrp_benchmark
     pkg_name: benchmark
     # Benchmark configuration
     test_case: "bdev_io"            # Test case: bdev_io, bdev_allocation, latency

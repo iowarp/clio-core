@@ -11,7 +11,7 @@ env:
 
 pkgs:
   # Stage 1: Launch IOWarp runtime on all nodes
-  - pkg_type: jarvis_wrp_runtime.wrp_runtime
+  - pkg_type: jarvis_iowarp.wrp_runtime
     pkg_name: runtime
     sched_workers: 8
     process_reaper_workers: 1
@@ -27,7 +27,7 @@ pkgs:
     sleep: 5
 
   # Stage 2: Run distributed tests with 4 nodes
-  - pkg_type: jarvis_wrp_runtime.wrp_distributed
+  - pkg_type: jarvis_iowarp.wrp_distributed
     pkg_name: distributed_test
     num_nodes: 4
     test_case: "all"

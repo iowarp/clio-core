@@ -1,4 +1,4 @@
-@CLAUDE.md Build a jarvis package for configuring the CTE. Build a repo called test/jarvis_wrp_cte.
+@CLAUDE.md Build a jarvis package for configuring the CTE. Build a repo called test/jarvis_iowarp.
 Check @docs/jarvis/package_development_guide.md.
 
 ## wrp_cte

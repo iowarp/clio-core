@@ -27,8 +27,8 @@ Similar to range, except it will be a PoolQuery::Broadcast instead.
 
 ### Jarvis Package
 Create a jarvis package for this unit test called wrp_distributed.
-Base the unit test package on test/jarvis_wrp_runtime/jarvis_wrp_runtime/wrp_runtime/pkg.py
-and test/jarvis_wrp_runtime/jarvis_wrp_runtime/wrp_benchmark/pkg.py.
+Base the unit test package on test/jarvis_iowarp/jarvis_iowarp/wrp_runtime/pkg.py
+and test/jarvis_iowarp/jarvis_iowarp/wrp_benchmark/pkg.py.
 
 We can just use LocalExec for the execution.
 

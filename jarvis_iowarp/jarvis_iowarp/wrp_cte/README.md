@@ -127,7 +127,7 @@ wrp_cte:
 
 ## File Locations
 
-- **Package Source**: `test/jarvis_wrp_cte/wrp_cte/pkg.py`
+- **Package Source**: `test/jarvis_iowarp/wrp_cte/pkg.py`
 - **Configuration Output**: `{shared_dir}/cte_config.yaml`
 - **Template Reference**: `config/cte_example.yaml`
 
