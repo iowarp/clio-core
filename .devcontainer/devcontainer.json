@@ -1,7 +1,7 @@
 {
     "name": "IOWarp Core",
     "build": {
-        "dockerfile": "Dockerfile",
+        "dockerfile": "Dockerfile.app",
         "context": "."
     },
     "workspaceFolder": "/workspace",
