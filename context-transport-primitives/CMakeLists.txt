@@ -210,6 +210,7 @@ if(HSHM_ENABLE_COMPRESS)
 endif()
 target_compile_definitions(compress INTERFACE
     HSHM_ENABLE_COMPRESS=$<BOOL:${HSHM_ENABLE_COMPRESS}>
+    HSHM_HAS_LIBPRESSIO=$<BOOL:${HSHM_HAS_LIBPRESSIO}>
 )
 add_library(hshm::compress ALIAS compress)
 

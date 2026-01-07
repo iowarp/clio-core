@@ -24,6 +24,9 @@
 #include "snappy.h"
 #include "zlib.h"
 #include "zstd.h"
+#if HSHM_HAS_LIBPRESSIO
+#include "libpressio.h"
+#endif
 
 #endif  // HSHM_ENABLE_COMPRESS
 

@@ -341,6 +341,36 @@ if(WRP_CORE_ENABLE_COMPRESS)
     pkg_check_modules(blosc2 REQUIRED blosc2)
     message(STATUS "found blosc2.h at ${blosc2_INCLUDE_DIRS}")
 
+    # LibPressio - try find_package first (CMake-based), fall back to pkg-config
+    # Make it optional since libpressio may not be installed
+    set(HSHM_HAS_LIBPRESSIO OFF)
+    find_package(LibPressio QUIET)
+    if(LibPressio_FOUND)
+        message(STATUS "found libpressio.h via CMake at ${LibPressio_INCLUDE_DIRS}")
+        if(TARGET LibPressio::libpressio)
+            set(libpressio_LIBRARIES LibPressio::libpressio)
+        elseif(TARGET libpressio)
+            set(libpressio_LIBRARIES libpressio)
+        else()
+            # Fallback - use the library directly
+            set(libpressio_LIBRARIES liblibpressio)
+        endif()
+        set(libpressio_INCLUDE_DIRS ${LibPressio_INCLUDE_DIRS})
+        set(libpressio_LIBRARY_DIRS "")
+        set(HSHM_HAS_LIBPRESSIO ON)
+    else()
+        pkg_check_modules(libpressio QUIET libpressio)
+        if(libpressio_FOUND)
+            message(STATUS "found libpressio.h at ${libpressio_INCLUDE_DIRS}")
+            set(HSHM_HAS_LIBPRESSIO ON)
+        else()
+            message(STATUS "libpressio not found - LibPressio wrapper will be disabled")
+            set(libpressio_LIBRARIES "")
+            set(libpressio_INCLUDE_DIRS "")
+            set(libpressio_LIBRARY_DIRS "")
+        endif()
+    endif()
+
     set(COMPRESS_LIBS
         bz2
         ${lzo2_LIBRARIES}
@@ -374,6 +404,12 @@ if(WRP_CORE_ENABLE_COMPRESS)
         ${snappy_LIBRARY_DIRS}
         ${blosc2_LIBRARY_DIRS}
     )
+    # Only add libpressio if found
+    if(HSHM_HAS_LIBPRESSIO)
+        list(APPEND COMPRESS_LIBS ${libpressio_LIBRARIES})
+        list(APPEND COMPRESS_INCLUDES ${libpressio_INCLUDE_DIRS})
+        list(APPEND COMPRESS_LIB_DIRS ${libpressio_LIBRARY_DIRS})
+    endif()
 endif()
 
 # Encryption libraries (conditional)
