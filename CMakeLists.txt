@@ -147,6 +147,11 @@ option(CAE_ENABLE_GLOBUS "Enable Globus transfer support in CAE" OFF)
 option(WRP_CEE_ENABLE_TESTS "Enable tests for CEE" ON)
 option(WRP_CEE_ENABLE_BENCHMARKS "Enable benchmarks for CEE" ON)
 
+#------------------------------------------------------------------------------
+# External Examples and Applications
+#------------------------------------------------------------------------------
+option(WRP_CORE_ENABLE_GRAY_SCOTT "Enable Gray-Scott ADIOS2 example (requires ADIOS2)" OFF)
+
 #==============================================================================
 # END BUILD CONFIGURATION OPTIONS
 #==============================================================================
@@ -481,6 +486,19 @@ endif()
 # Poco and nlohmann_json (optional - for CAE Globus support)
 find_package(Poco COMPONENTS Net NetSSL Crypto JSON QUIET)
 find_package(nlohmann_json QUIET)
+
+# ADIOS2 (optional - for Gray-Scott example)
+if(WRP_CORE_ENABLE_GRAY_SCOTT)
+    find_package(MPI REQUIRED COMPONENTS C CXX)
+    find_package(ADIOS2 REQUIRED)
+    if(ADIOS2_FOUND)
+        message(STATUS "found ADIOS2 at ${ADIOS2_DIR}")
+    else()
+        message(FATAL_ERROR "WRP_CORE_ENABLE_GRAY_SCOTT is ON but ADIOS2 not found. Please install ADIOS2 or disable the option.")
+    endif()
+else()
+    message(STATUS "Gray-Scott example disabled")
+endif()
 
 #------------------------------------------------------------------------------
 # Python Bindings Configuration

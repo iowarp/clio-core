@@ -1,0 +1,15 @@
+{
+  "L": 128,
+  "Du": 0.2,
+  "Dv": 0.1,
+  "F": 0.02,
+  "k": 0.048,
+  "dt": 1.0,
+  "plotgap": 10,
+  "steps": 10000,
+  "noise": 0.01,
+  "output": "gs.bp",
+  "checkpoint": false,
+  "checkpoint_freq": 2000,
+  "checkpoint_output": "ckpt.bp"
+}

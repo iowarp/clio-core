@@ -96,12 +96,13 @@ if(BUILD_TESTING)
 
     # Configure telemetry test with runtime initialization
     # Uses the same config as ADIOS2 adapter tests
+    # CRITICAL: Put conda libs FIRST in LD_LIBRARY_PATH to avoid OpenSSL version conflicts
     set_tests_properties(
         python_telemetry_test
         PROPERTIES
         LABELS "python;bindings;telemetry"
         TIMEOUT 180
-        ENVIRONMENT "CHIMAERA_WITH_RUNTIME=1;WRP_RUNTIME_CONF=${CMAKE_SOURCE_DIR}/context-transfer-engine/test/unit/adapters/adios2/cte_config.yaml;LD_LIBRARY_PATH=/home/iowarp/miniconda3/lib:$ENV{LD_LIBRARY_PATH}"
+        ENVIRONMENT "CHIMAERA_WITH_RUNTIME=1;WRP_RUNTIME_CONF=${CMAKE_SOURCE_DIR}/context-transfer-engine/test/unit/adapters/adios2/cte_config.yaml;LD_LIBRARY_PATH=/home/iowarp/miniconda3/lib"
     )
 
     # Ensure test depends on the built module
