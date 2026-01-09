@@ -7,5 +7,7 @@ if(WRP_CORE_ENABLE_ELF AND WRP_CTE_ENABLE_POSIX_ADAPTER)
 endif()
 
 # ADIOS2 adapter tests (doesn't require ELF interception)
-# Always add if ADIOS2 is found
-add_subdirectory(adios2)
+# Only add if ADIOS2 adapter is enabled
+if(WRP_CTE_ENABLE_ADIOS2_ADAPTER)
+    add_subdirectory(adios2)
+endif()
