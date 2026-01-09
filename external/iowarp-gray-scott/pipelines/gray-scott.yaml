@@ -1,0 +1,73 @@
+name: gray-scott-workflow
+hostfile: null
+interceptors: []
+
+# Environment variables for this pipeline
+environment:
+  PATH: /workspace/external/iowarp-gray-scott/build/bin:${PATH}
+
+# Container configuration (optional)
+container_base: iowarp/iowarp-build:latest
+container_build: ''
+container_engine: podman
+container_image: ''
+container_ssh_port: 2222
+
+# Packages in this pipeline
+pkgs:
+  # Gray-Scott Reaction-Diffusion Simulation
+  - pkg_type: builtin.adios2_gray_scott
+
+    # Simulation Parameters
+    L: 64                    # Grid size (L×L×L cube)
+    steps: 100               # Total simulation steps
+    plotgap: 5               # Output frequency (every N steps)
+    dt: 2.0                  # Time step size
+    noise: 0.01              # Initial noise level
+
+    # Chemical Reaction Parameters
+    Du: 0.2                  # Diffusion rate of substance U
+    Dv: 0.1                  # Diffusion rate of substance V
+    F: 0.01                  # Feed rate of U
+    k: 0.05                  # Kill rate of V
+
+    # MPI Configuration
+    nprocs: 2                # Number of MPI processes
+    ppn: 16                  # Processes per node
+
+    # I/O Configuration
+    engine: bp5              # ADIOS2 engine (bp5, hermes, iowarp, sst)
+    out_file: /workspace/external/iowarp-gray-scott/gs-output.bp
+    db_path: /workspace/external/iowarp-gray-scott/metadata.db
+
+    # Checkpoint Configuration
+    checkpoint: false        # Enable/disable checkpointing
+    checkpoint_freq: 70      # Checkpoint frequency (steps)
+    checkpoint_output: ckpt.bp
+
+    # Restart Configuration
+    restart: false           # Enable restart from checkpoint
+    restart_input: ckpt.bp   # Checkpoint file to restart from
+
+    # ADIOS2 Advanced Options
+    adios_span: false        # Use ADIOS2 span feature
+    adios_memory_selection: false
+    mesh_type: image         # Mesh type for visualization
+
+    # Workflow Control
+    full_run: false          # Run postprocessing (pdf_calc) automatically
+    limit: 0                 # Data value limit for tracking
+    Execution_order: '1'     # Execution order in pipeline
+
+    # Deployment Options
+    deploy_mode: default     # Deployment mode (default, container)
+    hostfile: ''             # Override pipeline hostfile
+    interceptors: []         # List of interceptor packages
+
+    # Debugging Options
+    do_dbg: false            # Enable debug mode
+    dbg_port: 1234           # Debug port
+    hide_output: false       # Hide command output
+    sleep: 0                 # Sleep time before execution (seconds)
+    timeout: 300             # Operation timeout (seconds)
+    retry_count: 3           # Number of retry attempts
