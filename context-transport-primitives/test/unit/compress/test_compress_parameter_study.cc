@@ -33,20 +33,101 @@
 
 #ifdef __linux__
 #include <time.h>
+#include <sched.h>
+#include <pthread.h>
 #endif
 
-// Benchmark result structure
+#include <thread>
+#include <atomic>
+
+// Benchmark result structure with new statistics
 struct BenchmarkResult {
     std::string library;
     std::string distribution;
     size_t chunk_size;
+    double target_cpu_util;         // Target CPU utilization (0-100)
     double compress_time_ms;
     double decompress_time_ms;
     double compression_ratio;
     double compress_cpu_percent;
     double decompress_cpu_percent;
+    // Data distribution statistics
+    double shannon_entropy;         // First-order entropy (bits per byte)
+    double mad;                     // Mean Absolute Deviation
+    double second_derivative_mean;  // Mean of second derivatives (curvature)
     bool success;
 };
+
+// Global flag for workload jitter thread
+std::atomic<bool> g_benchmark_running{false};
+
+/**
+ * Set CPU affinity to pin thread to core 0.
+ * This ensures reproducible benchmarking on a specific core.
+ */
+void SetCPUAffinity() {
+#ifdef __linux__
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(0, &cpuset);  // Pin to core 0
+
+    pthread_t current_thread = pthread_self();
+    int result = pthread_setaffinity_np(current_thread, sizeof(cpu_set_t), &cpuset);
+
+    if (result != 0) {
+        std::cerr << "Warning: Failed to set CPU affinity to core 0" << std::endl;
+    }
+#endif
+}
+
+/**
+ * Workload jitter generator thread.
+ * Generates a background workload to achieve target CPU utilization.
+ * Uses a busy loop with sleep to control CPU usage within 5-10% error.
+ *
+ * @param target_cpu_util Target CPU utilization percentage (0-100)
+ */
+void WorkloadJitter(double target_cpu_util) {
+    // Set affinity to core 0 (same as benchmark thread)
+    SetCPUAffinity();
+
+    if (target_cpu_util <= 0.0) {
+        // No workload needed, just wait for benchmark to finish
+        while (g_benchmark_running.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        return;
+    }
+
+    // Calculate busy and sleep times to achieve target CPU utilization
+    // We use a 10ms cycle time for fine-grained control
+    const double cycle_time_ms = 10.0;
+    const double busy_time_ms = cycle_time_ms * (target_cpu_util / 100.0);
+    const double sleep_time_ms = cycle_time_ms - busy_time_ms;
+
+    while (g_benchmark_running.load()) {
+        // Busy loop for busy_time_ms
+        auto busy_start = std::chrono::high_resolution_clock::now();
+        while (true) {
+            auto now = std::chrono::high_resolution_clock::now();
+            auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(now - busy_start);
+            if (elapsed.count() / 1000000.0 >= busy_time_ms) {
+                break;
+            }
+            // Busy work (prevent optimization)
+            volatile double x = 0.0;
+            for (int i = 0; i < 1000; i++) {
+                x += std::sin(static_cast<double>(i));
+            }
+        }
+
+        // Sleep for sleep_time_ms
+        if (sleep_time_ms > 0.0) {
+            std::this_thread::sleep_for(std::chrono::microseconds(
+                static_cast<long>(sleep_time_ms * 1000.0)));
+        }
+    }
+}
 
 // CPU usage tracking using clock_gettime with process-wide CPU measurement
 struct CPUUsage {
@@ -67,6 +148,100 @@ struct CPUUsage {
         return {0.0};
     }
 #endif
+};
+
+/**
+ * Data distribution statistics calculator.
+ * Computes metrics to characterize data compressibility.
+ */
+class DataStatistics {
+public:
+    /**
+     * Calculate first-order entropy (Shannon entropy) in bits per byte.
+     * Measures the randomness/information content of the data.
+     *
+     * H1 = -Σ(p_i * log2(p_i)) where p_i is the probability of byte value i
+     *
+     * @param data Input data buffer
+     * @param size Number of bytes
+     * @return Shannon entropy in bits per byte (0-8 bits)
+     */
+    static double CalculateShannonEntropy(const uint8_t* data, size_t size) {
+        if (size == 0) {
+            return 0.0;
+        }
+
+        // Count frequency of each byte value (0-255)
+        std::vector<size_t> histogram(256, 0);
+        for (size_t i = 0; i < size; i++) {
+            histogram[data[i]]++;
+        }
+
+        // Calculate Shannon entropy: H = -Σ(p_i * log2(p_i))
+        double entropy = 0.0;
+        for (size_t i = 0; i < 256; i++) {
+            if (histogram[i] > 0) {
+                double p_i = static_cast<double>(histogram[i]) / static_cast<double>(size);
+                entropy += -p_i * std::log2(p_i);
+            }
+        }
+        return entropy;  // bits per byte
+    }
+
+    /**
+     * Calculate Mean Absolute Deviation (MAD) of byte values in data.
+     *
+     * MAD = sqrt(Σ|x_i - mean| / n)
+     *
+     * @param data Pointer to uint8_t data
+     * @param size Number of bytes
+     * @return MAD value
+     */
+    static double calculateMAD(const uint8_t* data, size_t size) {
+        if (size == 0) return 0.0;
+
+        // Calculate mean
+        double mean = 0.0;
+        for (size_t i = 0; i < size; i++) {
+            mean += static_cast<double>(data[i]);
+        }
+        mean /= static_cast<double>(size);
+
+        // Calculate mean absolute deviation
+        double sum_abs_dev = 0.0;
+        for (size_t i = 0; i < size; i++) {
+            double diff = std::abs(static_cast<double>(data[i]) - mean);
+            sum_abs_dev += diff;
+        }
+        double mad = sum_abs_dev / static_cast<double>(size);
+
+        // Return square root of MAD
+        return std::sqrt(mad);
+    }
+
+    /**
+     * Calculate mean of second derivatives (curvature/smoothness indicator).
+     *
+     * Second derivative: κ[i] = x[i+1] - 2*x[i] + x[i-1]
+     * Measures local curvature/smoothness of the data.
+     *
+     * @param data Pointer to byte data
+     * @param size Number of bytes
+     * @return Mean absolute second derivative
+     */
+    static double calculateSecondDerivativeMean(const uint8_t* data, size_t size) {
+        if (size < 3) {
+            return 0.0;
+        }
+
+        double sum_abs_curvature = 0.0;
+        for (size_t i = 1; i < size - 1; i++) {
+            // κ_i = x_{i+1} - 2*x_i + x_{i-1}
+            double curvature = static_cast<double>(data[i+1]) - 2.0 * static_cast<double>(data[i]) + static_cast<double>(data[i-1]);
+            sum_abs_curvature += std::abs(curvature);
+        }
+        return sum_abs_curvature / static_cast<double>(size - 2);  // N-2 derivatives
+    }
 };
 
 // Data distribution generators
@@ -278,15 +453,17 @@ public:
     }
 };
 
-// Run benchmark for a single configuration
+// Run benchmark for a single configuration with target CPU utilization
 BenchmarkResult benchmarkCompressor(hshm::Compressor* compressor,
                                      const char* lib_name,
                                      const std::string& distribution,
-                                     size_t chunk_size) {
+                                     size_t chunk_size,
+                                     double target_cpu_util) {
     BenchmarkResult result;
     result.library = lib_name;
     result.distribution = distribution;
     result.chunk_size = chunk_size;
+    result.target_cpu_util = target_cpu_util;
     result.success = false;
 
     // Generate input data (char data type only)
@@ -304,32 +481,59 @@ BenchmarkResult benchmarkCompressor(hshm::Compressor* compressor,
         DataGenerator::generateRepeating(input_data.data(), chunk_size, 1, distribution);
     }
 
+    // Calculate data distribution statistics
+    result.shannon_entropy = DataStatistics::CalculateShannonEntropy(input_data.data(), chunk_size);
+    result.mad = DataStatistics::calculateMAD(input_data.data(), chunk_size);
+    result.second_derivative_mean = DataStatistics::calculateSecondDerivativeMean(input_data.data(), chunk_size);
+
     // Allocate output buffers
     std::vector<uint8_t> compressed_data(chunk_size * 2);  // Oversized
     std::vector<uint8_t> decompressed_data(chunk_size);
 
-    // Measure compression
+    // Measure compression - loop until minimum 20ms elapsed
+    const double min_time_ms = 20.0;
     size_t cmpr_size = compressed_data.size();
-    CPUUsage cpu_before = CPUUsage::getCurrent();
-    auto start = std::chrono::high_resolution_clock::now();
+    int compress_iterations = 0;
+    double total_compress_time_ms = 0.0;
+    double total_compress_cpu_ms = 0.0;
 
-    bool comp_ok = compressor->Compress(compressed_data.data(), cmpr_size,
-                                        input_data.data(), chunk_size);
+    auto benchmark_start = std::chrono::high_resolution_clock::now();
 
-    auto end = std::chrono::high_resolution_clock::now();
-    CPUUsage cpu_after = CPUUsage::getCurrent();
+    do {
+        cmpr_size = compressed_data.size();  // Reset size for each iteration
+        CPUUsage iter_cpu_before = CPUUsage::getCurrent();
+        auto iter_start = std::chrono::high_resolution_clock::now();
 
-    if (!comp_ok || cmpr_size == 0) {
-        return result;
-    }
+        bool comp_ok = compressor->Compress(compressed_data.data(), cmpr_size,
+                                            input_data.data(), chunk_size);
 
-    auto compress_duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start);
-    result.compress_time_ms = compress_duration.count() / 1000000.0;
+        auto iter_end = std::chrono::high_resolution_clock::now();
+        CPUUsage iter_cpu_after = CPUUsage::getCurrent();
+
+        if (!comp_ok || cmpr_size == 0) {
+            return result;
+        }
+
+        auto iter_duration = std::chrono::duration_cast<std::chrono::nanoseconds>(iter_end - iter_start);
+        total_compress_time_ms += iter_duration.count() / 1000000.0;
+        total_compress_cpu_ms += (iter_cpu_after.cpu_time_ms - iter_cpu_before.cpu_time_ms);
+        compress_iterations++;
+
+        // Check total elapsed time
+        auto now = std::chrono::high_resolution_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - benchmark_start);
+        if (elapsed.count() >= min_time_ms) {
+            break;
+        }
+    } while (true);
+
+    // Average the results
+    result.compress_time_ms = total_compress_time_ms / compress_iterations;
 
     // Calculate CPU utilization percentage
     if (result.compress_time_ms > 0.0) {
-        double cpu_time_ms = cpu_after.cpu_time_ms - cpu_before.cpu_time_ms;
-        result.compress_cpu_percent = (cpu_time_ms / result.compress_time_ms) * 100.0;
+        double avg_cpu_time_ms = total_compress_cpu_ms / compress_iterations;
+        result.compress_cpu_percent = (avg_cpu_time_ms / result.compress_time_ms) * 100.0;
     } else {
         result.compress_cpu_percent = 0.0;
     }
@@ -341,28 +545,48 @@ BenchmarkResult benchmarkCompressor(hshm::Compressor* compressor,
         result.compression_ratio = 0.0;
     }
 
-    // Measure decompression
-    size_t decmpr_size = chunk_size;
-    cpu_before = CPUUsage::getCurrent();
-    start = std::chrono::high_resolution_clock::now();
+    // Measure decompression - loop until minimum 20ms elapsed
+    int decompress_iterations = 0;
+    double total_decompress_time_ms = 0.0;
+    double total_decompress_cpu_ms = 0.0;
 
-    bool decomp_ok = compressor->Decompress(decompressed_data.data(), decmpr_size,
-                                            compressed_data.data(), cmpr_size);
+    benchmark_start = std::chrono::high_resolution_clock::now();
 
-    end = std::chrono::high_resolution_clock::now();
-    cpu_after = CPUUsage::getCurrent();
+    do {
+        size_t decmpr_size = chunk_size;
+        CPUUsage iter_cpu_before = CPUUsage::getCurrent();
+        auto iter_start = std::chrono::high_resolution_clock::now();
 
-    if (!decomp_ok || decmpr_size != chunk_size) {
-        return result;
-    }
+        bool decomp_ok = compressor->Decompress(decompressed_data.data(), decmpr_size,
+                                                compressed_data.data(), cmpr_size);
 
-    auto decompress_duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start);
-    result.decompress_time_ms = decompress_duration.count() / 1000000.0;
+        auto iter_end = std::chrono::high_resolution_clock::now();
+        CPUUsage iter_cpu_after = CPUUsage::getCurrent();
+
+        if (!decomp_ok || decmpr_size != chunk_size) {
+            return result;
+        }
+
+        auto iter_duration = std::chrono::duration_cast<std::chrono::nanoseconds>(iter_end - iter_start);
+        total_decompress_time_ms += iter_duration.count() / 1000000.0;
+        total_decompress_cpu_ms += (iter_cpu_after.cpu_time_ms - iter_cpu_before.cpu_time_ms);
+        decompress_iterations++;
+
+        // Check total elapsed time
+        auto now = std::chrono::high_resolution_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - benchmark_start);
+        if (elapsed.count() >= min_time_ms) {
+            break;
+        }
+    } while (true);
+
+    // Average the results
+    result.decompress_time_ms = total_decompress_time_ms / decompress_iterations;
 
     // Calculate CPU utilization percentage
     if (result.decompress_time_ms > 0.0) {
-        double cpu_time_ms = cpu_after.cpu_time_ms - cpu_before.cpu_time_ms;
-        result.decompress_cpu_percent = (cpu_time_ms / result.decompress_time_ms) * 100.0;
+        double avg_cpu_time_ms = total_decompress_cpu_ms / decompress_iterations;
+        result.decompress_cpu_percent = (avg_cpu_time_ms / result.decompress_time_ms) * 100.0;
     } else {
         result.decompress_cpu_percent = 0.0;
     }
@@ -378,9 +602,10 @@ BenchmarkResult benchmarkCompressor(hshm::Compressor* compressor,
 
 // Print CSV header
 void printCSVHeader(std::ostream& os) {
-    os << "Library,Distribution,Chunk Size (bytes),"
+    os << "Library,Distribution,Chunk Size (bytes),Target CPU Util (%),"
               << "Compress Time (ms),Decompress Time (ms),"
-              << "Compression Ratio,Compress CPU %,Decompress CPU %,Success\n";
+              << "Compression Ratio,Compress CPU %,Decompress CPU %,"
+              << "Shannon Entropy (bits/byte),MAD,Second Derivative Mean,Success\n";
 }
 
 // Print result as CSV
@@ -388,18 +613,35 @@ void printResultCSV(const BenchmarkResult& result, std::ostream& os) {
     os << result.library << ","
               << result.distribution << ","
               << result.chunk_size << ","
-              << std::fixed << std::setprecision(3) << result.compress_time_ms << ","
+              << std::fixed << std::setprecision(1) << result.target_cpu_util << ","
+              << std::setprecision(3) << result.compress_time_ms << ","
               << result.decompress_time_ms << ","
               << std::setprecision(4) << result.compression_ratio << ","
               << std::setprecision(2) << result.compress_cpu_percent << ","
               << result.decompress_cpu_percent << ","
+              << std::setprecision(4) << result.shannon_entropy << ","
+              << std::setprecision(2) << result.mad << ","
+              << std::setprecision(3) << result.second_derivative_mean << ","
               << (result.success ? "YES" : "NO") << "\n";
 }
 
 TEST_CASE("Compression Parameter Study") {
+    // Set CPU affinity to core 0 for reproducible results
+    SetCPUAffinity();
+
     // Fixed chunk size: 64KB for faster testing and focused parameter analysis
     const std::vector<size_t> chunk_sizes = {
         64 * 1024      // 64KB only
+    };
+
+    // Target CPU utilization levels to test
+    // Tests impact of background CPU load on compression performance
+    const std::vector<double> target_cpu_utils = {
+        0.0,    // No background load
+        25.0,   // Light background load
+        50.0,   // Moderate background load
+        75.0,   // Heavy background load
+        100.0   // Maximum background load
     };
 
     // Distribution parameter study for char data (0-128 range focus):
@@ -509,20 +751,83 @@ TEST_CASE("Compression Parameter Study") {
         try {
             for (const auto& distribution : distributions) {
                 for (size_t chunk_size : chunk_sizes) {
-                    std::cerr << "  Testing: " << distribution
-                              << ", " << (chunk_size/1024) << "KB" << std::endl;
+                    for (double target_cpu_util : target_cpu_utils) {
+                        std::cerr << "  Testing: " << distribution
+                                  << ", " << (chunk_size/1024) << "KB"
+                                  << ", CPU util: " << target_cpu_util << "%" << std::endl;
 
-                    auto result = benchmarkCompressor(compressor, lib_name.c_str(),
-                                                     distribution, chunk_size);
+                        // Run benchmark 3 times and average results
+                        std::vector<BenchmarkResult> results;
+                        for (int iteration = 0; iteration < 3; iteration++) {
+                            std::cerr << "    Iteration " << (iteration + 1) << "/3" << std::endl;
 
-                    // Print to both console and file
-                    printResultCSV(result, std::cout);
-                    if (outfile.is_open()) {
-                        printResultCSV(result, outfile);
-                    }
-                    std::cout.flush();
-                    if (outfile.is_open()) {
-                        outfile.flush();
+                            // Start workload jitter thread
+                            g_benchmark_running.store(true);
+                            std::thread jitter_thread(WorkloadJitter, target_cpu_util);
+
+                            // Run benchmark
+                            auto result = benchmarkCompressor(compressor, lib_name.c_str(),
+                                                             distribution, chunk_size, target_cpu_util);
+
+                            // Stop workload jitter thread
+                            g_benchmark_running.store(false);
+                            jitter_thread.join();
+
+                            results.push_back(result);
+                        }
+
+                        // Calculate average of all 3 iterations
+                        BenchmarkResult avg_result;
+                        avg_result.library = lib_name;
+                        avg_result.distribution = distribution;
+                        avg_result.chunk_size = chunk_size;
+                        avg_result.target_cpu_util = target_cpu_util;
+                        avg_result.success = true;
+
+                        // Initialize accumulators
+                        double sum_compress_time = 0.0;
+                        double sum_decompress_time = 0.0;
+                        double sum_compression_ratio = 0.0;
+                        double sum_compress_cpu = 0.0;
+                        double sum_decompress_cpu = 0.0;
+                        double sum_shannon = 0.0;
+                        double sum_mad = 0.0;
+                        double sum_second_deriv = 0.0;
+
+                        // Accumulate all metrics
+                        for (const auto& result : results) {
+                            if (!result.success) {
+                                avg_result.success = false;
+                            }
+                            sum_compress_time += result.compress_time_ms;
+                            sum_decompress_time += result.decompress_time_ms;
+                            sum_compression_ratio += result.compression_ratio;
+                            sum_compress_cpu += result.compress_cpu_percent;
+                            sum_decompress_cpu += result.decompress_cpu_percent;
+                            sum_shannon += result.shannon_entropy;
+                            sum_mad += result.mad;
+                            sum_second_deriv += result.second_derivative_mean;
+                        }
+
+                        // Calculate averages
+                        avg_result.compress_time_ms = sum_compress_time / 3.0;
+                        avg_result.decompress_time_ms = sum_decompress_time / 3.0;
+                        avg_result.compression_ratio = sum_compression_ratio / 3.0;
+                        avg_result.compress_cpu_percent = sum_compress_cpu / 3.0;
+                        avg_result.decompress_cpu_percent = sum_decompress_cpu / 3.0;
+                        avg_result.shannon_entropy = sum_shannon / 3.0;
+                        avg_result.mad = sum_mad / 3.0;
+                        avg_result.second_derivative_mean = sum_second_deriv / 3.0;
+
+                        // Print averaged result to both console and file
+                        printResultCSV(avg_result, std::cout);
+                        if (outfile.is_open()) {
+                            printResultCSV(avg_result, outfile);
+                        }
+                        std::cout.flush();
+                        if (outfile.is_open()) {
+                            outfile.flush();
+                        }
                     }
                 }
             }

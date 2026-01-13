@@ -31,8 +31,8 @@ plt.rcParams['xtick.labelsize'] = 8
 plt.rcParams['ytick.labelsize'] = 8
 plt.rcParams['legend.fontsize'] = 8
 
-# Color palette for libraries - using distinct colors
-LIBRARY_COLORS = {
+# Base color palette for compressor families
+BASE_LIBRARY_COLORS = {
     # Lossless compressors
     'BZIP2': '#1f77b4',
     'Blosc2': '#ff7f0e',
@@ -51,6 +51,70 @@ LIBRARY_COLORS = {
     'FPZIP': '#2ecc71',      # Green for FPZIP direct wrappers
     'BitGrooming': '#e67e22', # Orange for BitGrooming direct wrappers
 }
+
+def get_library_color(lib_name, all_libraries):
+    """Get unique color for a library, generating variants for parameterized compressors.
+
+    For parameterized compressors (e.g., BitGrooming_nsd_1, BitGrooming_nsd_2, BitGrooming_nsd_3),
+    generates color variants by adjusting brightness.
+
+    Args:
+        lib_name: Library name (may include parameters)
+        all_libraries: List of all library names to determine variant index
+
+    Returns:
+        Hex color string
+    """
+    # Check for parameter patterns
+    base_name = None
+    param_value = None
+
+    if '_tol_' in lib_name:
+        base_name = 'ZFP'
+        param_value = lib_name.split('_tol_')[1]
+    elif '_nsd_' in lib_name:
+        base_name = 'BitGrooming'
+        param_value = lib_name.split('_nsd_')[1]
+    elif '_prec_' in lib_name:
+        base_name = 'FPZIP'
+        param_value = lib_name.split('_prec_')[1]
+    else:
+        # Non-parameterized library - use base color directly
+        return BASE_LIBRARY_COLORS.get(lib_name, '#808080')
+
+    # Get base color
+    base_color = BASE_LIBRARY_COLORS.get(base_name, '#808080')
+
+    # Find all variants of this compressor family
+    variants = sorted([lib for lib in all_libraries if lib.startswith(base_name + '_')])
+    if not variants:
+        return base_color
+
+    # Get variant index
+    try:
+        variant_idx = variants.index(lib_name)
+    except ValueError:
+        return base_color
+
+    # Generate color variant by adjusting brightness
+    # Convert hex to RGB
+    base_color = base_color.lstrip('#')
+    r, g, b = int(base_color[0:2], 16), int(base_color[2:4], 16), int(base_color[4:6], 16)
+
+    # Adjust brightness: darker for lower indices, lighter for higher indices
+    num_variants = len(variants)
+    if num_variants == 1:
+        return f'#{r:02x}{g:02x}{b:02x}'
+
+    # Scale from 0.6 (darkest) to 1.4 (lightest)
+    brightness = 0.6 + (0.8 * variant_idx / (num_variants - 1))
+
+    # Apply brightness adjustment
+    r = int(min(255, r * brightness))
+    g = int(min(255, g * brightness))
+    b = int(min(255, b * brightness))
+
+    return f'#{r:02x}{g:02x}{b:02x}'
 
 def get_base_compressor_name(lib_name):
     """Extract base compressor name from parameter variants.
@@ -89,11 +153,69 @@ def load_data(csv_path):
         df = df[df['Decompress Time (ms)'] > 0]
         df = df[df['Compression Ratio'] > 0]
 
+        # Check if we have Target CPU Util column (new version)
+        has_cpu_util = 'Target CPU Util (%)' in df.columns
+
         print(f"✓ Processed {len(df)} valid records")
+        if has_cpu_util:
+            cpu_utils = sorted(df['Target CPU Util (%)'].unique())
+            print(f"✓ Found CPU utilization levels: {cpu_utils}")
         return df
     except Exception as e:
         print(f"✗ Error loading CSV: {e}")
         sys.exit(1)
+
+def create_cpu_util_line_chart(ax, df_subset, libraries, metric, ylabel, title, use_log_scale=False):
+    """
+    Create a line chart showing how metric varies with CPU utilization.
+    One line per library.
+
+    Args:
+        ax: Matplotlib axis
+        df_subset: DataFrame subset for this distribution
+        libraries: List of unique libraries (top N for readability)
+        metric: Column name for the metric to plot
+        ylabel: Y-axis label
+        title: Chart title
+        use_log_scale: Whether to use log scale for y-axis
+    """
+    # Get CPU utilization levels
+    cpu_utils = sorted(df_subset['Target CPU Util (%)'].unique())
+
+    # Plot line for each library (limit to top 10 for readability)
+    for lib in libraries[:10]:
+        lib_data = df_subset[df_subset['Library'] == lib]
+        if len(lib_data) == 0:
+            continue
+
+        # Get values for each CPU util level
+        values = []
+        for cpu_util in cpu_utils:
+            cpu_data = lib_data[lib_data['Target CPU Util (%)'] == cpu_util]
+            if len(cpu_data) > 0:
+                val = cpu_data[metric].mean()
+                if use_log_scale and val <= 0:
+                    val = 0.001
+                values.append(val)
+            else:
+                values.append(None)
+
+        # Get unique color for this library
+        color = get_library_color(lib, libraries)
+
+        # Plot line
+        ax.plot(cpu_utils, values, marker='o', linewidth=2, markersize=6,
+                label=lib, color=color, alpha=0.8)
+
+    # Customize chart
+    ax.set_xlabel('Target CPU Utilization (%)', fontweight='bold')
+    ax.set_ylabel(ylabel, fontweight='bold')
+    ax.set_title(title, fontweight='bold', pad=10)
+    ax.legend(loc='best', fontsize=7, framealpha=0.9)
+    ax.grid(True, alpha=0.3, linestyle='--')
+
+    if use_log_scale:
+        ax.set_yscale('log')
 
 def create_simple_bar_chart(ax, df_subset, libraries, metric, ylabel, title, use_log_scale=False):
     """
@@ -124,8 +246,8 @@ def create_simple_bar_chart(ax, df_subset, libraries, metric, ylabel, title, use
         else:
             values.append(0.001 if use_log_scale else 0)
 
-    # Create color list using base compressor names
-    colors = [LIBRARY_COLORS.get(get_base_compressor_name(lib), '#808080') for lib in libraries]
+    # Create color list using unique colors for each library variant
+    colors = [get_library_color(lib, libraries) for lib in libraries]
 
     # Plot bars
     ax.bar(x_positions, values, color=colors, alpha=0.8, edgecolor='black', linewidth=0.5)
@@ -193,17 +315,82 @@ def get_distribution_description(distribution):
 
     return ""
 
+def create_cpu_util_impact_page(df_subset, distribution, libraries):
+    """
+    Create a page showing CPU utilization impact for a specific distribution.
+    Shows line charts of how compression metrics change with CPU load.
+
+    Args:
+        df_subset: DataFrame subset for this distribution
+        distribution: Distribution name
+        libraries: List of unique libraries (top 10 will be plotted)
+    """
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+    # Get descriptive subtitle
+    description = get_distribution_description(distribution)
+    data_type = "Float Data Type" if distribution.endswith('_float') else "Char Data Type"
+
+    # Create title
+    if description:
+        title = f'CPU Utilization Impact: {distribution}\n{description}\n{data_type}, 64KB Chunk Size'
+    else:
+        title = f'CPU Utilization Impact: {distribution}\n{data_type}, 64KB Chunk Size'
+
+    fig.suptitle(title, fontsize=13, fontweight='bold', y=0.995)
+
+    # 1. Compression Time vs CPU Util (log scale)
+    create_cpu_util_line_chart(
+        axes[0, 0], df_subset, libraries,
+        'Compress Time (ms)', 'Time (ms, log scale)',
+        'Compression Time vs CPU Utilization', use_log_scale=True
+    )
+
+    # 2. Decompression Time vs CPU Util (log scale)
+    create_cpu_util_line_chart(
+        axes[0, 1], df_subset, libraries,
+        'Decompress Time (ms)', 'Time (ms, log scale)',
+        'Decompression Time vs CPU Utilization', use_log_scale=True
+    )
+
+    # 3. Compression Ratio vs CPU Util (should be constant, no log scale)
+    create_cpu_util_line_chart(
+        axes[1, 0], df_subset, libraries,
+        'Compression Ratio', 'Ratio (higher = better)',
+        'Compression Ratio vs CPU Utilization', use_log_scale=False
+    )
+
+    # 4. Hide the last subplot (not needed)
+    axes[1, 1].axis('off')
+
+    # Add note about data statistics being constant
+    axes[1, 1].text(0.5, 0.5,
+                    'Data Statistics (Shannon Entropy, MAD, Second Derivative)\n'
+                    'are constant per distribution and do not vary with CPU utilization.\n\n'
+                    'These statistics are included in the CSV output for\n'
+                    'training the dynamic compression selection model.',
+                    ha='center', va='center', fontsize=10,
+                    bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+
+    plt.tight_layout(rect=[0, 0, 1, 0.99])
+    return fig
+
 def create_page(df_subset, distribution, libraries):
     """
     Create a page with bar charts for a specific distribution (64KB fixed size).
     For lossy compressors (with SNR data), creates 4x2 grid with quality metrics.
     For lossless compressors, creates 3x2 grid.
 
+    If Target CPU Util column exists, only use data at 0% CPU utilization for comparison.
+
     Args:
         df_subset: DataFrame subset for this distribution
         distribution: Distribution name
         libraries: List of unique libraries
     """
+    # Filter to 0% CPU utilization if the column exists
+    if 'Target CPU Util (%)' in df_subset.columns:
+        df_subset = df_subset[df_subset['Target CPU Util (%)'] == 0.0]
     # Check if this distribution has SNR data (lossy compressors)
     has_quality_metrics = 'SNR (dB)' in df_subset.columns and df_subset['SNR (dB)'].notna().any()
 
@@ -527,10 +714,19 @@ def main():
     print(f"✓ Found {len(lossy_libraries)} lossy compressors")
     print()
 
+    # Check if we have CPU utilization data
+    has_cpu_util = False
+    if df_lossless is not None and 'Target CPU Util (%)' in df_lossless.columns:
+        has_cpu_util = True
+    elif df_lossy is not None and 'Target CPU Util (%)' in df_lossy.columns:
+        has_cpu_util = True
+
     # Generate PDF report with lossless pages first, lossy pages at the end
     pdf_path = OUTPUT_DIR / 'parameter_study_full_report.pdf'
     print(f"Generating PDF report: {pdf_path}")
     print(f"  Layout: {len(lossless_distributions)} lossless pages, then {len(lossy_distributions)} lossy pages")
+    if has_cpu_util:
+        print(f"  Note: Bar charts use 0% CPU utilization data for comparison")
     print()
 
     with PdfPages(pdf_path) as pdf:
@@ -566,6 +762,44 @@ def main():
     print(f"  Pages {len(lossless_distributions)+1}-{len(all_distributions)}: Lossy compressors (float data)")
     print()
 
+    # Generate CPU utilization impact report if we have the data
+    if has_cpu_util:
+        pdf_cpu_path = OUTPUT_DIR / 'cpu_utilization_impact_report.pdf'
+        print(f"Generating CPU utilization impact report: {pdf_cpu_path}")
+        print()
+
+        with PdfPages(pdf_cpu_path) as pdf:
+            page_num = 1
+
+            # Generate CPU util impact pages for lossless distributions
+            for dist in lossless_distributions:
+                print(f"  Page {page_num}: {dist} (lossless CPU impact)")
+
+                if df_lossless is not None:
+                    df_dist = df_lossless[df_lossless['Distribution'] == dist]
+                    if len(df_dist) > 0:
+                        fig = create_cpu_util_impact_page(df_dist, dist, lossless_libraries)
+                        pdf.savefig(fig, bbox_inches='tight')
+                        plt.close(fig)
+                        page_num += 1
+
+            # Generate CPU util impact pages for lossy distributions
+            for dist in lossy_distributions:
+                print(f"  Page {page_num}: {dist} (lossy CPU impact)")
+
+                if df_lossy is not None:
+                    df_dist = df_lossy[df_lossy['Distribution'] == dist]
+                    if len(df_dist) > 0:
+                        fig = create_cpu_util_impact_page(df_dist, dist, lossy_libraries)
+                        pdf.savefig(fig, bbox_inches='tight')
+                        plt.close(fig)
+                        page_num += 1
+
+        print()
+        print(f"✓ CPU utilization impact report saved: {pdf_cpu_path.name}")
+        print(f"  Shows how compression performance changes with CPU load (0%-100%)")
+        print()
+
     # Combine data for statistics (keep separate context)
     df_combined = pd.concat([df for df in [df_lossless, df_lossy] if df is not None], ignore_index=True)
 
@@ -588,10 +822,19 @@ def main():
     print("=" * 80)
     print()
     print("Generated files:")
-    print(f"  • {pdf_path.name} - {len(all_distributions)}-page detailed report")
+    print(f"  • {pdf_path.name} - {len(all_distributions)}-page detailed report (0% CPU baseline)")
+    if has_cpu_util:
+        print(f"  • cpu_utilization_impact_report.pdf - CPU load impact analysis")
     print(f"  • {stats_path.name} - Detailed statistics and analysis")
     print(f"  • {table_path.name} - Best compressor lookup table")
     print()
+    if has_cpu_util:
+        print("New metrics collected:")
+        print("  • Target CPU Utilization (0%, 25%, 50%, 75%, 100%)")
+        print("  • Shannon Entropy (bits per byte)")
+        print("  • Data Variance")
+        print("  • Second Derivative Mean (curvature)")
+        print()
 
 if __name__ == '__main__':
     main()
