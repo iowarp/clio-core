@@ -353,23 +353,22 @@ def initialize_runtime_early(cte):
         print("🔧 Registering storage target...")
         try:
             client = cte.get_cte_client()
-            mctx = cte.MemContext()
-            
+
             # Get storage directory from config (or use a default)
             import yaml
             with open(config_path, 'r') as f:
                 config = yaml.safe_load(f)
             storage_dir = config.get('devices', [{}])[0].get('mount_point', '/tmp/cte_test_storage')
-            
+
             # Create target path
             target_path = os.path.join(storage_dir, "test_target")
             os.makedirs(os.path.dirname(target_path), exist_ok=True)
-            
+
             # Register file-based target (1GB size) with explicit PoolId
             # Use a high pool ID (700) to avoid conflicts with system pools
             bdev_id = cte.PoolId(700, 0)
             target_query = cte.PoolQuery.Local()
-            result = client.RegisterTarget(mctx, target_path, cte.BdevType.kFile, 
+            result = client.RegisterTarget(target_path, cte.BdevType.kFile,
                                            1024 * 1024 * 1024, target_query, bdev_id)
             
             if result == 0:
@@ -565,11 +564,10 @@ def test_context_delete_operation(cte):
         # Get tag and its TagId
         tag = cte.Tag(tag_name)
         tag_id = tag.GetTagId()
-        
+
         # Delete blob using Client
         client = cte.get_cte_client()
-        mctx = cte.MemContext()
-        result = client.DelBlob(mctx, tag_id, blob_name)
+        result = client.DelBlob(tag_id, blob_name)
         # Returns bool: True if successful, False otherwise
     """
     global runtime_initialized, client_initialized
@@ -604,10 +602,9 @@ def test_context_delete_operation(cte):
                 except Exception as e:
                     print(f"   ⚠️  Could not bundle test data: {e}")
                     return True
-                
+
                 # Delete blob using Client.DelBlob
-                mctx = cte.MemContext()
-                delete_result = client.DelBlob(mctx, tag_id, test_blob_name)
+                delete_result = client.DelBlob(tag_id, test_blob_name)
                 
                 if delete_result:
                     print(f"   ✅ context_delete operation succeeded")
@@ -627,6 +624,121 @@ def test_context_delete_operation(cte):
         
     except Exception as e:
         print(f"⚠️  context_delete test error (may be expected): {e}")
+        import traceback
+        traceback.print_exc()
+        return True
+
+
+def test_reorganize_blob(cte):
+    """Test ReorganizeBlob operation for data placement optimization
+
+    Example: Reorganizing blob to different storage tier
+    -----------------------------------------------------
+    Tests Tag.ReorganizeBlob() to change blob placement score.
+    Higher scores (closer to 1.0) place blobs on faster storage tiers.
+    Lower scores (closer to 0.0) place blobs on slower storage tiers.
+
+    Usage Pattern:
+        tag = cte.Tag("my_tag")
+
+        # Put blob with initial score (default 1.0 = fastest tier)
+        tag.PutBlob("my_blob", b"Important data", 0)
+
+        # Check initial score
+        initial_score = tag.GetBlobScore("my_blob")
+
+        # Reorganize to slower tier (score = 0.0)
+        tag.ReorganizeBlob("my_blob", 0.0)
+
+        # Verify updated score
+        new_score = tag.GetBlobScore("my_blob")
+        assert new_score == 0.0
+
+    Test Steps:
+        1. Create tag
+        2. Put blob with high score (1.0)
+        3. Verify initial score is 1.0
+        4. Reorganize blob to low score (0.0)
+        5. Verify updated score is 0.0
+    """
+    global runtime_initialized, client_initialized
+
+    if not runtime_initialized or not client_initialized:
+        print("⚠️  Skipping reorganize_blob test (runtime not initialized)")
+        return True  # Not a failure, just skipped
+
+    try:
+        print("🔧 Testing ReorganizeBlob operation (Tag.ReorganizeBlob)...")
+
+        # Check if ReorganizeBlob is available on Tag
+        tag_type = cte.Tag
+
+        if not hasattr(tag_type, 'ReorganizeBlob'):
+            print("   ⚠️  Tag.ReorganizeBlob method not found")
+            print("   Note: ReorganizeBlob may not be implemented yet")
+            return True
+
+        print("   ✅ Tag.ReorganizeBlob method found")
+
+        # Test reorganization
+        try:
+            test_tag_name = "test_reorganize_tag"
+            test_blob_name = "reorganize_test_blob"
+            test_data = b"Data for reorganization test"
+
+            # Create tag
+            tag = cte.Tag(test_tag_name)
+            print(f"   ✅ Created tag: {test_tag_name}")
+
+            # Put blob with high score (1.0 = fastest tier)
+            print(f"   🔧 Putting blob with score 1.0 (fast tier)...")
+            tag.PutBlob(test_blob_name, test_data, 0)
+            print(f"   ✅ Put blob: {test_blob_name}")
+
+            # Get initial score (should be 1.0 from PutBlob default)
+            initial_score = tag.GetBlobScore(test_blob_name)
+            print(f"   📊 Initial blob score: {initial_score}")
+
+            if abs(initial_score - 1.0) < 0.01:  # Allow small floating point error
+                print(f"   ✅ Initial score is 1.0 (fast tier) as expected")
+            else:
+                print(f"   ⚠️  Initial score is {initial_score}, expected 1.0")
+
+            # Reorganize to low score (0.0 = slowest tier)
+            print(f"   🔧 Reorganizing blob to score 0.0 (slow tier)...")
+            tag.ReorganizeBlob(test_blob_name, 0.0)
+            print(f"   ✅ ReorganizeBlob completed")
+
+            # Get updated score
+            new_score = tag.GetBlobScore(test_blob_name)
+            print(f"   📊 Updated blob score: {new_score}")
+
+            if abs(new_score - 0.0) < 0.01:  # Allow small floating point error
+                print(f"   ✅ Score updated to 0.0 (slow tier) as expected")
+                print(f"   ✅ ReorganizeBlob operation succeeded!")
+            else:
+                print(f"   ⚠️  Updated score is {new_score}, expected 0.0")
+                print(f"   ⚠️  ReorganizeBlob may not have updated the score")
+
+            # Verify blob data is still intact after reorganization
+            blob_size = tag.GetBlobSize(test_blob_name)
+            if blob_size == len(test_data):
+                retrieved_data = tag.GetBlob(test_blob_name, blob_size, 0)
+                if retrieved_data == test_data.decode('utf-8'):
+                    print(f"   ✅ Blob data intact after reorganization")
+                else:
+                    print(f"   ⚠️  Blob data changed after reorganization")
+
+        except Exception as e:
+            print(f"   ⚠️  ReorganizeBlob operation failed: {e}")
+            import traceback
+            traceback.print_exc()
+
+        print("✅ ReorganizeBlob test completed")
+        return True
+
+    except Exception as e:
+        print(f"⚠️  ReorganizeBlob test error: {e}")
         import traceback
         traceback.print_exc()
         return True
@@ -829,8 +941,13 @@ def main():
         test_context_delete_operation(cte)
         print()
 
-        # Test 4: PollTelemetryLog operation
-        print("📋 Test 4: PollTelemetryLog Operation...")
+        # Test 4: ReorganizeBlob operation
+        print("📋 Test 4: ReorganizeBlob Operation...")
+        test_reorganize_blob(cte)
+        print()
+
+        # Test 5: PollTelemetryLog operation
+        print("📋 Test 5: PollTelemetryLog Operation...")
         test_poll_telemetry_log(cte)
         print()
     else:

@@ -425,94 +425,99 @@ bool IpcManager::StartLocalServer() {
   }
 }
 
-bool IpcManager::TestLocalServer() {
-  try {
-    ConfigManager *config = CHI_CONFIG_MANAGER;
-    std::string addr = "127.0.0.1";
-    std::string protocol = "tcp";
-    u32 port = config->GetPort() + 1;
-
-    auto client = hshm::lbm::TransportFactory::GetClient(
-        addr, hshm::lbm::Transport::kZeroMq, protocol, port);
-
-    if (!client) {
-      return false;
-    }
-
-    // Create empty metadata with heartbeat message type
-    chi::SaveTaskArchive archive(chi::MsgType::kHeartbeat, client.get());
-
-    // Use synchronous send (single attempt, no retry)
-    hshm::lbm::LbmContext ctx(hshm::lbm::LBM_SYNC);
-    int rc = client->Send(archive, ctx);
-
-    if (rc == 0) {
-      HLOG(kDebug, "Successfully sent heartbeat to local server");
-      return true;
-    }
-
-    HLOG(kDebug, "Failed to send heartbeat with error code {}", rc);
-    return false;
-  } catch (const std::exception &e) {
-    HLOG(kWarning, "Exception during heartbeat send: {}", e.what());
-    return false;
-  }
-}
-
 bool IpcManager::WaitForLocalServer() {
   ConfigManager *config = CHI_CONFIG_MANAGER;
 
   // Read environment variables for wait configuration
   const char *wait_env = std::getenv("CHI_WAIT_SERVER");
-  const char *poll_env = std::getenv("CHI_POLL_SERVER");
-
-  if (wait_env) {
+  if (wait_env != nullptr) {
     wait_server_timeout_ = static_cast<u32>(std::atoi(wait_env));
   }
-  if (poll_env) {
-    poll_server_interval_ = static_cast<u32>(std::atoi(poll_env));
-  }
 
-  // Ensure poll interval is at least 1 second to avoid busy-waiting
-  if (poll_server_interval_ == 0) {
-    poll_server_interval_ = 1;
-  }
-
-  u32 port = config->GetPort() + 1;
+  // Heartbeat server runs on port+2 (main server on port, PULL on port+1)
+  u32 heartbeat_port = config->GetPort() + 2;
   HLOG(kInfo,
-        "Waiting for local server at 127.0.0.1:{} (timeout={}s, "
-        "poll_interval={}s)",
-        port, wait_server_timeout_, poll_server_interval_);
+       "Waiting for runtime heartbeat on 127.0.0.1:{} (timeout={}s)",
+       heartbeat_port, wait_server_timeout_);
 
-  u32 elapsed = 0;
-  u32 attempt = 0;
-
-  while (elapsed < wait_server_timeout_) {
-    attempt++;
-
-    if (TestLocalServer()) {
-      HLOG(kInfo,
-            "Successfully connected to local server after {} seconds ({} "
-            "attempts)",
-            elapsed, attempt);
-      return true;
-    }
-
-    HLOG(kDebug, "Local server not available yet (attempt {}, elapsed {}s)",
-          attempt, elapsed);
-
-    // Sleep for poll interval
-    sleep(poll_server_interval_);
-    elapsed += poll_server_interval_;
+  // Create ZeroMQ REQ socket for heartbeat request/response
+  void *hb_ctx = zmq_ctx_new();
+  if (hb_ctx == nullptr) {
+    HLOG(kError, "Failed to create ZMQ context");
+    return false;
   }
 
-  HLOG(kError,
-        "Timeout waiting for local server after {} seconds ({} attempts)",
-        wait_server_timeout_, attempt);
-  HLOG(kError, "This usually means:");
-  HLOG(kError, "1. Chimaera runtime is not running");
-  HLOG(kError, "2. Local server failed to start");
-  HLOG(kError, "3. Network connectivity issues");
+  void *hb_socket = zmq_socket(hb_ctx, ZMQ_REQ);
+  if (hb_socket == nullptr) {
+    HLOG(kError, "Failed to create ZMQ REQ socket");
+    zmq_ctx_destroy(hb_ctx);
+    return false;
+  }
+
+  // Set linger to 0 so close doesn't block
+  int linger = 0;
+  zmq_setsockopt(hb_socket, ZMQ_LINGER, &linger, sizeof(linger));
+
+  // Set receive timeout in milliseconds
+  int timeout_ms = static_cast<int>(wait_server_timeout_ * 1000);
+  zmq_setsockopt(hb_socket, ZMQ_RCVTIMEO, &timeout_ms, sizeof(timeout_ms));
+
+  // Connect to heartbeat server
+  std::string url = "tcp://127.0.0.1:" + std::to_string(heartbeat_port);
+  int rc = zmq_connect(hb_socket, url.c_str());
+  if (rc == -1) {
+    HLOG(kError, "Failed to connect to heartbeat server at {}: {}",
+         url, zmq_strerror(zmq_errno()));
+    zmq_close(hb_socket);
+    zmq_ctx_destroy(hb_ctx);
+    return false;
+  }
+
+  // Send heartbeat request (value 1)
+  int32_t request = 1;
+  rc = zmq_send(hb_socket, &request, sizeof(request), 0);
+  if (rc == -1) {
+    HLOG(kError, "Failed to send heartbeat request: {}",
+         zmq_strerror(zmq_errno()));
+    zmq_close(hb_socket);
+    zmq_ctx_destroy(hb_ctx);
+    return false;
+  }
+  HLOG(kDebug, "Sent heartbeat request, waiting for response...");
+
+  // RECEIVE heartbeat response (blocking with timeout)
+  int32_t response = -1;
+  rc = zmq_recv(hb_socket, &response, sizeof(response), 0);
+  if (rc == -1) {
+    int err = zmq_errno();
+    if (err == EAGAIN) {
+      HLOG(kError,
+           "Timeout waiting for runtime after {} seconds",
+           wait_server_timeout_);
+    } else {
+      HLOG(kError, "Failed to receive heartbeat response: {}",
+           zmq_strerror(err));
+    }
+    HLOG(kError, "This usually means:");
+    HLOG(kError, "1. Chimaera runtime is not running");
+    HLOG(kError, "2. Runtime failed to start heartbeat server");
+    HLOG(kError, "3. Network connectivity issues");
+    zmq_close(hb_socket);
+    zmq_ctx_destroy(hb_ctx);
+    return false;
+  }
+
+  // Check response value (0 = success)
+  HLOG(kInfo, "Received heartbeat response: {}", response);
+  zmq_close(hb_socket);
+  zmq_ctx_destroy(hb_ctx);
+
+  if (response == 0) {
+    HLOG(kInfo, "Successfully connected to runtime (heartbeat received)");
+    return true;
+  }
+
+  HLOG(kError, "Runtime responded with error code: {}", response);
   return false;
 }
 
@@ -770,6 +775,41 @@ bool IpcManager::TryStartMainServer(const std::string &hostname) {
     }
 
     HLOG(kDebug, "Main server successfully bound to {}:{}", hostname, port);
+
+    // Create heartbeat server on port+2 for client connection verification
+    u32 heartbeat_port = port + 2;
+    HLOG(kDebug, "Starting heartbeat server on {}:{}", hostname, heartbeat_port);
+
+    // Create raw ZMQ context and REP socket for heartbeat
+    heartbeat_ctx_ = zmq_ctx_new();
+    if (heartbeat_ctx_ == nullptr) {
+      HLOG(kError, "Failed to create ZMQ context for heartbeat server");
+      return false;
+    }
+
+    heartbeat_socket_ = zmq_socket(heartbeat_ctx_, ZMQ_REP);
+    if (heartbeat_socket_ == nullptr) {
+      HLOG(kError, "Failed to create ZMQ REP socket for heartbeat server");
+      zmq_ctx_destroy(heartbeat_ctx_);
+      heartbeat_ctx_ = nullptr;
+      return false;
+    }
+
+    std::string heartbeat_url =
+        protocol + "://" + hostname + ":" + std::to_string(heartbeat_port);
+    int rc = zmq_bind(heartbeat_socket_, heartbeat_url.c_str());
+    if (rc == -1) {
+      HLOG(kError, "Failed to bind heartbeat server to {}: {}",
+           heartbeat_url, zmq_strerror(zmq_errno()));
+      zmq_close(heartbeat_socket_);
+      zmq_ctx_destroy(heartbeat_ctx_);
+      heartbeat_socket_ = nullptr;
+      heartbeat_ctx_ = nullptr;
+      return false;
+    }
+
+    HLOG(kInfo, "Heartbeat server started on {}", heartbeat_url);
+
     return true;
 
   } catch (const std::exception &e) {
@@ -785,6 +825,10 @@ bool IpcManager::TryStartMainServer(const std::string &hostname) {
 
 hshm::lbm::Server *IpcManager::GetMainServer() const {
   return main_server_.get();
+}
+
+void *IpcManager::GetHeartbeatSocket() const {
+  return heartbeat_socket_;
 }
 
 const Host &IpcManager::GetThisHost() const { return this_host_; }

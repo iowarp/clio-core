@@ -148,4 +148,14 @@ std::vector<std::string> Tag::GetContainedBlobs() {
   return blobs;
 }
 
+void Tag::ReorganizeBlob(const std::string &blob_name, float new_score) {
+  auto *cte_client = WRP_CTE_CLIENT;
+  auto task = cte_client->AsyncReorganizeBlob(tag_id_, blob_name, new_score);
+  task.Wait();
+
+  if (task->GetReturnCode() != 0) {
+    throw std::runtime_error("ReorganizeBlob operation failed");
+  }
+}
+
 } // namespace wrp_cte::core

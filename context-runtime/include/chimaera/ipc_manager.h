@@ -440,6 +440,12 @@ class IpcManager {
   hshm::lbm::Server *GetMainServer() const;
 
   /**
+   * Get the heartbeat socket for polling heartbeat requests
+   * @return Raw ZMQ REP socket pointer, or nullptr if not initialized
+   */
+  void *GetHeartbeatSocket() const;
+
+  /**
    * Get this host identified during host identification
    * @return Const reference to this Host struct
    */
@@ -622,19 +628,10 @@ class IpcManager {
   bool ClientInitQueues();
 
   /**
-   * Test connection to local server
-   * Creates lightbeam client and attempts connection to local server
-   * Does not print any logging output
-   * @return true if connection successful, false otherwise
-   */
-  bool TestLocalServer();
-
-  /**
-   * Wait for local server to become available
-   * Polls TestLocalServer until server is available or timeout expires
-   * Uses CHI_WAIT_SERVER and CHI_POLL_SERVER environment variables
-   * Inherits logging from TestLocalServer attempts
-   * @return true if server becomes available, false on timeout
+   * Wait for local server to become available using heartbeat mechanism
+   * Sends ZMQ_REQ heartbeat and waits for ZMQ_REP response with timeout
+   * Uses CHI_WAIT_SERVER environment variable for timeout (default 30s)
+   * @return true if heartbeat response received, false on timeout
    */
   bool WaitForLocalServer();
 
@@ -678,6 +675,10 @@ class IpcManager {
 
   // Main ZeroMQ server for distributed communication
   std::unique_ptr<hshm::lbm::Server> main_server_;
+
+  // Heartbeat server for client connection verification (ZMQ_REP)
+  void *heartbeat_ctx_;     ///< ZMQ context for heartbeat server
+  void *heartbeat_socket_;  ///< ZMQ REP socket for heartbeat server
 
   // Hostfile management
   std::unordered_map<u64, Host> hostfile_map_;  // Map node_id -> Host
@@ -725,7 +726,7 @@ void Future<TaskT, AllocT>::Wait() {
     // Wait for completion by polling is_complete atomic
     // Busy-wait with thread yielding - works for both client and runtime contexts
     // Coroutine contexts should use co_await Future instead
-    std::atomic<u32> &is_complete = future_shm_->is_complete_;
+    hipc::atomic<u32> &is_complete = future_shm_->is_complete_;
     while (is_complete.load() == 0) {
       HSHM_THREAD_MODEL->Yield();
     }

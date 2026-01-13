@@ -165,6 +165,31 @@ class Client : public chi::ContainerClient {
     // Submit to runtime and return Future
     return ipc_manager->Send(task_ptr);
   }
+
+  /**
+   * Heartbeat - Check if runtime is alive (asynchronous)
+   * Polls for ZMQ heartbeat requests and responds
+   * @param pool_query Pool routing information
+   * @param period_us Period in microseconds (default 5000us = 5ms, 0 = one-shot)
+   * @return Future for the heartbeat task
+   */
+  chi::Future<HeartbeatTask> AsyncHeartbeat(const chi::PoolQuery& pool_query,
+      double period_us = 5000) {
+    auto* ipc_manager = CHI_IPC;
+
+    // Allocate HeartbeatTask
+    auto task = ipc_manager->NewTask<HeartbeatTask>(
+        chi::CreateTaskId(), pool_id_, pool_query);
+
+    // Set task as periodic if period is specified
+    if (period_us > 0) {
+      task->SetPeriod(period_us, chi::kMicro);
+      task->SetFlags(TASK_PERIODIC);
+    }
+
+    // Submit to runtime and return Future
+    return ipc_manager->Send(task);
+  }
 };
 
 }  // namespace chimaera::admin

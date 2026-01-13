@@ -80,8 +80,18 @@ struct CreateParams {
     // The pool_config.config_ contains the full CTE configuration YAML
     // in the format of config/cte_config.yaml (targets, storage, dpe sections).
     // Parse it directly into the Config object
+    HLOG(kDebug, "CTE CreateParams::LoadConfig() - config string length: {}", pool_config.config_.length());
+    HLOG(kDebug, "CTE CreateParams::LoadConfig() - config string:\n{}", pool_config.config_);
     if (!pool_config.config_.empty()) {
-      config_.LoadFromString(pool_config.config_);
+      bool success = config_.LoadFromString(pool_config.config_);
+      if (!success) {
+        HLOG(kError, "CTE CreateParams::LoadConfig() - Failed to load config from string");
+      } else {
+        HLOG(kInfo, "CTE CreateParams::LoadConfig() - Successfully loaded config with {} storage devices",
+             config_.storage_.devices_.size());
+      }
+    } else {
+      HLOG(kWarning, "CTE CreateParams::LoadConfig() - Empty config string provided");
     }
   }
 };

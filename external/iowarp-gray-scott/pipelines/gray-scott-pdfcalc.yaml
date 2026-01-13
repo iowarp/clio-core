@@ -1,0 +1,74 @@
+name: gray-scott-pdfcalc-workflow
+hostfile: null
+interceptors: []
+
+# Packages run sequentially by default
+# Gray-scott will run with run_async=true to run in background
+# Then pdf_calc starts and reads the data as it's being written
+environment:
+  PATH: /workspace/external/iowarp-gray-scott/build/bin:${PATH}
+
+# Container configuration (optional)
+container_base: iowarp/iowarp-build:latest
+container_build: ''
+container_engine: podman
+container_image: ''
+container_ssh_port: 2222
+
+pkgs:
+  # Gray-Scott Producer (runs in background)
+  - pkg_type: builtin.adios2_gray_scott
+
+    # Simulation Parameters
+    L: 64
+    steps: 100
+    plotgap: 5
+    dt: 2.0
+    noise: 0.01
+
+    # Chemical Reaction Parameters
+    Du: 0.2
+    Dv: 0.1
+    F: 0.01
+    k: 0.05
+
+    # MPI Configuration
+    nprocs: 2
+    ppn: 16
+
+    # I/O Configuration
+    engine: bp5
+    out_file: /workspace/external/iowarp-gray-scott/gs-output.bp
+    db_path: /workspace/external/iowarp-gray-scott/metadata.db
+    run_async: true  # Run in background for parallel execution
+
+    # Checkpoint/Restart disabled for this test
+    checkpoint: false
+    restart: false
+
+    # ADIOS2 Advanced Options
+    adios_span: false
+    adios_memory_selection: false
+    mesh_type: image
+
+    # Workflow Control
+    full_run: false
+    limit: 0
+    Execution_order: '1'
+
+  # PDF Calc Consumer (runs after gray-scott starts)
+  - pkg_type: builtin.adios2_pdf_calc
+
+    # MPI Configuration
+    nprocs: 2
+    ppn: 16
+
+    # I/O Configuration
+    input_file: /workspace/external/iowarp-gray-scott/gs-output.bp
+    output_file: /workspace/external/iowarp-gray-scott/pdf-output.bp
+
+    # Analysis Parameters
+    nbins: 100
+    output_inputdata: NO
+    wait_for_producer: true  # Wait for gray-scott to create output file
+    engine: bp5

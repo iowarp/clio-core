@@ -194,37 +194,37 @@ class Runtime : public chi::Container {
    * Create the container (Method::kCreate)
    * This method both creates and initializes the container
    */
-  void Create(hipc::FullPtr<CreateTask> task, chi::RunContext& ctx);
+  chi::TaskResume Create(hipc::FullPtr<CreateTask> task, chi::RunContext& ctx);
 
   /**
    * Allocate multiple blocks (Method::kAllocateBlocks)
    */
-  void AllocateBlocks(hipc::FullPtr<AllocateBlocksTask> task, chi::RunContext& ctx);
+  chi::TaskResume AllocateBlocks(hipc::FullPtr<AllocateBlocksTask> task, chi::RunContext& ctx);
 
   /**
    * Free data blocks (Method::kFreeBlocks)
    */
-  void FreeBlocks(hipc::FullPtr<FreeBlocksTask> task, chi::RunContext& ctx);
+  chi::TaskResume FreeBlocks(hipc::FullPtr<FreeBlocksTask> task, chi::RunContext& ctx);
 
   /**
    * Write data to a block (Method::kWrite)
    */
-  void Write(hipc::FullPtr<WriteTask> task, chi::RunContext& ctx);
+  chi::TaskResume Write(hipc::FullPtr<WriteTask> task, chi::RunContext& ctx);
 
   /**
    * Read data from a block (Method::kRead)
    */
-  void Read(hipc::FullPtr<ReadTask> task, chi::RunContext& ctx);
+  chi::TaskResume Read(hipc::FullPtr<ReadTask> task, chi::RunContext& ctx);
 
   /**
    * Get performance statistics (Method::kGetStats)
    */
-  void GetStats(hipc::FullPtr<GetStatsTask> task, chi::RunContext& ctx);
+  chi::TaskResume GetStats(hipc::FullPtr<GetStatsTask> task, chi::RunContext& ctx);
 
   /**
    * Destroy the container (Method::kDestroy)
    */
-  void Destroy(hipc::FullPtr<DestroyTask> task, chi::RunContext& ctx);
+  chi::TaskResume Destroy(hipc::FullPtr<DestroyTask> task, chi::RunContext& ctx);
 
   /**
    * REQUIRED VIRTUAL METHODS FROM chi::Container

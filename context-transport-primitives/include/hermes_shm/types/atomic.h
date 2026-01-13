@@ -483,10 +483,19 @@ template <typename T>
 struct std_atomic {
   std::atomic<T> x;
 
-  /** Serialization */
+  /** Serialization - properly handles std::atomic by loading/storing value */
   template <typename Ar>
-  void serialize(Ar &ar) {
-    ar(x);
+  void save(Ar &ar) const {
+    T val = x.load(std::memory_order_relaxed);
+    ar(val);
+  }
+
+  /** Deserialization - properly handles std::atomic by loading/storing value */
+  template <typename Ar>
+  void load(Ar &ar) {
+    T val;
+    ar(val);
+    x.store(val, std::memory_order_relaxed);
   }
 
   /** Integer convertion */

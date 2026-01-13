@@ -514,6 +514,33 @@
                 }
             ],
             "preLaunchTask": "cmake-build-debug"
+        },
+        {
+            "name": "Debug Gray-Scott",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/bin/gray-scott",
+            "args": [
+                "/home/iowarp/.ppi-jarvis/shared/cte_benchmark_example/gsbench/settings-files.json"
+            ],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}/build",
+            "environment": [
+                {
+                    "name": "CHIMAERA_WITH_RUNTIME",
+                    "value": "0"
+                }
+            ],
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                }
+            ],
+            "preLaunchTask": "cmake-build-debug"
         }
     ]
 }

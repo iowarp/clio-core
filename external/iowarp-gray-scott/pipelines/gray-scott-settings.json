@@ -1,0 +1,21 @@
+{
+  "L": 32,
+  "Du": 0.2,
+  "Dv": 0.1,
+  "F": 0.01,
+  "k": 0.05,
+  "dt": 2.0,
+  "plotgap": 10,
+  "steps": 100,
+  "noise": 0.01,
+  "output": "/workspace/external/iowarp-gray-scott/gs-output.bp",
+  "checkpoint": true,
+  "checkpoint_freq": 70,
+  "checkpoint_output": "ckpt.bp",
+  "restart": false,
+  "restart_input": "ckpt.bp",
+  "adios_span": false,
+  "adios_memory_selection": false,
+  "mesh_type": "image",
+  "adios_config": "/home/iowarp/.ppi-jarvis/shared/gray-scott-workflow/adios2_gray_scott/adios2.xml"
+}

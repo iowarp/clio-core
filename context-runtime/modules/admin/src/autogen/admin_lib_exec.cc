@@ -32,7 +32,7 @@ chi::TaskResume Runtime::Run(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr,
     case Method::kCreate: {
       // Cast task FullPtr to specific type
       hipc::FullPtr<CreateTask> typed_task = task_ptr.template Cast<CreateTask>();
-      Create(typed_task, rctx);
+      co_await Create(typed_task, rctx);
       break;
     }
     case Method::kDestroy: {
@@ -56,25 +56,31 @@ chi::TaskResume Runtime::Run(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr,
     case Method::kStopRuntime: {
       // Cast task FullPtr to specific type
       hipc::FullPtr<StopRuntimeTask> typed_task = task_ptr.template Cast<StopRuntimeTask>();
-      StopRuntime(typed_task, rctx);
+      co_await StopRuntime(typed_task, rctx);
       break;
     }
     case Method::kFlush: {
       // Cast task FullPtr to specific type
       hipc::FullPtr<FlushTask> typed_task = task_ptr.template Cast<FlushTask>();
-      Flush(typed_task, rctx);
+      co_await Flush(typed_task, rctx);
       break;
     }
     case Method::kSend: {
       // Cast task FullPtr to specific type
       hipc::FullPtr<SendTask> typed_task = task_ptr.template Cast<SendTask>();
-      Send(typed_task, rctx);
+      co_await Send(typed_task, rctx);
       break;
     }
     case Method::kRecv: {
       // Cast task FullPtr to specific type
       hipc::FullPtr<RecvTask> typed_task = task_ptr.template Cast<RecvTask>();
-      Recv(typed_task, rctx);
+      co_await Recv(typed_task, rctx);
+      break;
+    }
+    case Method::kHeartbeat: {
+      // Cast task FullPtr to specific type
+      hipc::FullPtr<HeartbeatTask> typed_task = task_ptr.template Cast<HeartbeatTask>();
+      co_await Heartbeat(typed_task, rctx);
       break;
     }
     default: {
@@ -121,6 +127,10 @@ void Runtime::DelTask(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr) {
     }
     case Method::kRecv: {
       ipc_manager->DelTask(task_ptr.template Cast<RecvTask>());
+      break;
+    }
+    case Method::kHeartbeat: {
+      ipc_manager->DelTask(task_ptr.template Cast<HeartbeatTask>());
       break;
     }
     default: {
@@ -174,6 +184,11 @@ void Runtime::SaveTask(chi::u32 method, chi::SaveTaskArchive& archive,
       archive << *typed_task.ptr_;
       break;
     }
+    case Method::kHeartbeat: {
+      auto typed_task = task_ptr.template Cast<HeartbeatTask>();
+      archive << *typed_task.ptr_;
+      break;
+    }
     default: {
       // Unknown method - do nothing
       break;
@@ -221,6 +236,11 @@ void Runtime::LoadTask(chi::u32 method, chi::LoadTaskArchive& archive,
     }
     case Method::kRecv: {
       auto typed_task = task_ptr.template Cast<RecvTask>();
+      archive >> *typed_task.ptr_;
+      break;
+    }
+    case Method::kHeartbeat: {
+      auto typed_task = task_ptr.template Cast<HeartbeatTask>();
       archive >> *typed_task.ptr_;
       break;
     }
@@ -290,6 +310,12 @@ void Runtime::LocalLoadTask(chi::u32 method, chi::LocalLoadTaskArchive& archive,
       typed_task.ptr_->SerializeIn(archive);
       break;
     }
+    case Method::kHeartbeat: {
+      auto typed_task = task_ptr.template Cast<HeartbeatTask>();
+      // Call SerializeIn - task will call Task::SerializeIn for base fields
+      typed_task.ptr_->SerializeIn(archive);
+      break;
+    }
     default: {
       // Unknown method - do nothing
       break;
@@ -352,6 +378,12 @@ void Runtime::LocalSaveTask(chi::u32 method, chi::LocalSaveTaskArchive& archive,
     }
     case Method::kRecv: {
       auto typed_task = task_ptr.template Cast<RecvTask>();
+      // Call SerializeOut - task will call Task::SerializeOut for base fields
+      typed_task.ptr_->SerializeOut(archive);
+      break;
+    }
+    case Method::kHeartbeat: {
+      auto typed_task = task_ptr.template Cast<HeartbeatTask>();
       // Call SerializeOut - task will call Task::SerializeOut for base fields
       typed_task.ptr_->SerializeOut(archive);
       break;
@@ -458,6 +490,17 @@ hipc::FullPtr<chi::Task> Runtime::NewCopyTask(chi::u32 method, hipc::FullPtr<chi
       }
       break;
     }
+    case Method::kHeartbeat: {
+      // Allocate new task
+      auto new_task_ptr = ipc_manager->NewTask<HeartbeatTask>();
+      if (!new_task_ptr.IsNull()) {
+        // Copy task fields (includes base Task fields)
+        auto task_typed = orig_task_ptr.template Cast<HeartbeatTask>();
+        new_task_ptr->Copy(task_typed);
+        return new_task_ptr.template Cast<chi::Task>();
+      }
+      break;
+    }
     default: {
       // For unknown methods, create base Task copy
       auto new_task_ptr = ipc_manager->NewTask<chi::Task>();
@@ -510,6 +553,10 @@ hipc::FullPtr<chi::Task> Runtime::NewTask(chi::u32 method) {
     }
     case Method::kRecv: {
       auto new_task_ptr = ipc_manager->NewTask<RecvTask>();
+      return new_task_ptr.template Cast<chi::Task>();
+    }
+    case Method::kHeartbeat: {
+      auto new_task_ptr = ipc_manager->NewTask<HeartbeatTask>();
       return new_task_ptr.template Cast<chi::Task>();
     }
     default: {
@@ -582,6 +629,14 @@ void Runtime::Aggregate(chi::u32 method, hipc::FullPtr<chi::Task> origin_task_pt
       // Get typed tasks for Aggregate call
       auto typed_origin = origin_task_ptr.template Cast<RecvTask>();
       auto typed_replica = replica_task_ptr.template Cast<RecvTask>();
+      // Call Aggregate (uses task-specific Aggregate if available, otherwise base Task::Aggregate)
+      typed_origin.ptr_->Aggregate(typed_replica);
+      break;
+    }
+    case Method::kHeartbeat: {
+      // Get typed tasks for Aggregate call
+      auto typed_origin = origin_task_ptr.template Cast<HeartbeatTask>();
+      auto typed_replica = replica_task_ptr.template Cast<HeartbeatTask>();
       // Call Aggregate (uses task-specific Aggregate if available, otherwise base Task::Aggregate)
       typed_origin.ptr_->Aggregate(typed_replica);
       break;

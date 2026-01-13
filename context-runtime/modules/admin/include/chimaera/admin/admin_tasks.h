@@ -68,9 +68,9 @@ struct BaseCreateTask : public chi::Task {
   // Results for pool operations
   OUT chi::priv::string error_message_;
 
-  // Volatile flags set by template parameters
-  volatile bool is_admin_;
-  volatile bool do_compose_;
+  // Flags set by template parameters (must be serialized for remote execution)
+  bool is_admin_;
+  bool do_compose_;
 
   // Client pointer for PostWait callback (not serialized)
   chi::ContainerClient *client_;
@@ -80,7 +80,10 @@ struct BaseCreateTask : public chi::Task {
       : chi::Task(), chimod_name_(CHI_IPC->GetMainAlloc()), pool_name_(CHI_IPC->GetMainAlloc()),
         chimod_params_(CHI_IPC->GetMainAlloc()), new_pool_id_(chi::PoolId::GetNull()),
         error_message_(CHI_IPC->GetMainAlloc()), is_admin_(IS_ADMIN), do_compose_(DO_COMPOSE),
-        client_(nullptr) {}
+        client_(nullptr) {
+    HLOG(kDebug, "BaseCreateTask default constructor: IS_ADMIN={}, DO_COMPOSE={}, do_compose_={}",
+         IS_ADMIN, DO_COMPOSE, do_compose_);
+  }
 
   /** Emplace constructor with CreateParams arguments */
   template <typename... CreateParamsArgs>
@@ -123,6 +126,8 @@ struct BaseCreateTask : public chi::Task {
         pool_name_(CHI_IPC->GetMainAlloc(), pool_config.pool_name_), chimod_params_(CHI_IPC->GetMainAlloc()),
         new_pool_id_(pool_config.pool_id_), error_message_(CHI_IPC->GetMainAlloc()),
         is_admin_(IS_ADMIN), do_compose_(DO_COMPOSE), client_(nullptr) {
+    HLOG(kDebug, "BaseCreateTask COMPOSE constructor: IS_ADMIN={}, DO_COMPOSE={}, do_compose_={}, pool_name={}",
+         IS_ADMIN, DO_COMPOSE, do_compose_, pool_config.pool_name_);
     // Initialize base task
     task_id_ = task_node;
     method_ = MethodId;
@@ -169,20 +174,22 @@ struct BaseCreateTask : public chi::Task {
 
   /**
    * Serialize IN and INOUT parameters for network transfer
-   * This includes: chimod_name_, pool_name_, chimod_params_, new_pool_id_
+   * This includes: chimod_name_, pool_name_, chimod_params_, new_pool_id_, is_admin_, do_compose_
    */
   template <typename Archive> void SerializeIn(Archive &ar) {
+    HLOG(kDebug, "BaseCreateTask::SerializeIn BEFORE: do_compose_={}, is_admin_={}", do_compose_, is_admin_);
     Task::SerializeIn(ar);
-    ar(chimod_name_, pool_name_, chimod_params_, new_pool_id_);
+    ar(chimod_name_, pool_name_, chimod_params_, new_pool_id_, is_admin_, do_compose_);
+    HLOG(kDebug, "BaseCreateTask::SerializeIn AFTER: do_compose_={}, is_admin_={}", do_compose_, is_admin_);
   }
 
   /**
    * Serialize OUT and INOUT parameters for network transfer
-   * This includes: chimod_name_, chimod_params_, new_pool_id_, error_message_
+   * This includes: chimod_name_, chimod_params_, new_pool_id_, error_message_, is_admin_, do_compose_
    */
   template <typename Archive> void SerializeOut(Archive &ar) {
     Task::SerializeOut(ar);
-    ar(chimod_name_, chimod_params_, new_pool_id_, error_message_);
+    ar(chimod_name_, chimod_params_, new_pool_id_, error_message_, is_admin_, do_compose_);
   }
 
   /**
@@ -190,6 +197,8 @@ struct BaseCreateTask : public chi::Task {
    * @param other Pointer to the source task to copy from
    */
   void Copy(const hipc::FullPtr<BaseCreateTask> &other) {
+    HLOG(kDebug, "BaseCreateTask::Copy() BEFORE: this->do_compose_={}, other->do_compose_={}",
+         do_compose_, other->do_compose_);
     // Copy base Task fields
     Task::Copy(other.template Cast<Task>());
     // Copy BaseCreateTask-specific fields
@@ -200,6 +209,7 @@ struct BaseCreateTask : public chi::Task {
     error_message_ = other->error_message_;
     is_admin_ = other->is_admin_;
     do_compose_ = other->do_compose_;
+    HLOG(kDebug, "BaseCreateTask::Copy() AFTER: this->do_compose_={}", do_compose_);
   }
 
   /** Aggregate replica results into this task */
@@ -585,6 +595,68 @@ struct RecvTask : public chi::Task {
 
   /** Aggregate replica results into this task */
   void Aggregate(const hipc::FullPtr<RecvTask> &other) {
+    Task::Aggregate(other.template Cast<Task>());
+    Copy(other);
+  }
+};
+
+/**
+ * HeartbeatTask - Runtime health check
+ * Used to verify runtime is alive and responding
+ * Returns 0 on success to indicate runtime is healthy
+ */
+struct HeartbeatTask : public chi::Task {
+  // Heartbeat response
+  OUT int32_t response_; ///< 0 = success, non-zero = error
+
+  /** SHM default constructor */
+  HeartbeatTask()
+      : chi::Task(), response_(-1) {}
+
+  /** Emplace constructor */
+  explicit HeartbeatTask(const chi::TaskId &task_node, const chi::PoolId &pool_id,
+                         const chi::PoolQuery &pool_query)
+      : chi::Task(task_node, pool_id, pool_query, Method::kHeartbeat),
+        response_(-1) {
+    // Initialize task
+    task_id_ = task_node;
+    pool_id_ = pool_id;
+    method_ = Method::kHeartbeat;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  /**
+   * Serialize IN and INOUT parameters for network transfer
+   * No additional parameters for HeartbeatTask
+   */
+  template <typename Archive> void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+    // No additional parameters to serialize for heartbeat
+  }
+
+  /**
+   * Serialize OUT and INOUT parameters for network transfer
+   * This includes: response_
+   */
+  template <typename Archive> void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+    ar(response_);
+  }
+
+  /**
+   * Copy from another HeartbeatTask (assumes this task is already constructed)
+   * @param other Pointer to the source task to copy from
+   */
+  void Copy(const hipc::FullPtr<HeartbeatTask> &other) {
+    // Copy base Task fields
+    Task::Copy(other.template Cast<Task>());
+    // Copy HeartbeatTask-specific fields
+    response_ = other->response_;
+  }
+
+  /** Aggregate replica results into this task */
+  void Aggregate(const hipc::FullPtr<HeartbeatTask> &other) {
     Task::Aggregate(other.template Cast<Task>());
     Copy(other);
   }

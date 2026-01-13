@@ -332,6 +332,10 @@ TaskResume PoolManager::CreatePool(FullPtr<Task> task, RunContext* run_ctx) {
       chimaera::admin::BaseCreateTask<chimaera::admin::CreateParams>*>(
       task.ptr_);
 
+  // Debug: Log do_compose_ value after cast
+  HLOG(kDebug, "PoolManager::CreatePool: After cast, do_compose_={}, is_admin_={}",
+       create_task->do_compose_, create_task->is_admin_);
+
   // Extract parameters from the task
   const std::string chimod_name = create_task->chimod_name_.str();
   const std::string pool_name = create_task->pool_name_.str();

@@ -264,12 +264,16 @@ class ChiModGenerator {
     oss << "  switch (method) {\n";
 
     // Add Run switch cases for each method
+    // All method calls use co_await since Run is a coroutine and methods
+    // may return TaskResume (coroutines). Methods returning void are wrapped
+    // to be awaitable. This ensures coroutines actually execute rather than
+    // being discarded when the return value is ignored.
     for (const auto& method : methods) {
       std::string task_type = GetTaskTypeName(method.method_name, chimod_name);
       oss << "    case Method::" << method.constant_name << ": {\n";
       oss << "      // Cast task FullPtr to specific type\n";
       oss << "      hipc::FullPtr<" << task_type << "> typed_task = task_ptr.template Cast<" << task_type << ">();\n";
-      oss << "      " << method.method_name << "(typed_task, rctx);\n";
+      oss << "      co_await " << method.method_name << "(typed_task, rctx);\n";
       oss << "      break;\n";
       oss << "    }\n";
     }

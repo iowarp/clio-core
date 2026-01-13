@@ -71,23 +71,27 @@ public:
 
   /**
    * Handle Create task
+   * Returns TaskResume for consistency with Run method
    */
-  void Create(hipc::FullPtr<CreateTask> task, chi::RunContext& rctx);
+  chi::TaskResume Create(hipc::FullPtr<CreateTask> task, chi::RunContext& rctx);
 
   /**
    * Handle Custom task
+   * Returns TaskResume for consistency with Run method
    */
-  void Custom(hipc::FullPtr<CustomTask> task, chi::RunContext& rctx);
+  chi::TaskResume Custom(hipc::FullPtr<CustomTask> task, chi::RunContext& rctx);
 
   /**
    * Handle CoMutexTest task
+   * Returns TaskResume for consistency with Run method
    */
-  void CoMutexTest(hipc::FullPtr<CoMutexTestTask> task, chi::RunContext& rctx);
+  chi::TaskResume CoMutexTest(hipc::FullPtr<CoMutexTestTask> task, chi::RunContext& rctx);
 
   /**
    * Handle CoRwLockTest task
+   * Returns TaskResume for consistency with Run method
    */
-  void CoRwLockTest(hipc::FullPtr<CoRwLockTestTask> task, chi::RunContext& rctx);
+  chi::TaskResume CoRwLockTest(hipc::FullPtr<CoRwLockTestTask> task, chi::RunContext& rctx);
 
   /**
    * Handle WaitTest task
@@ -97,8 +101,9 @@ public:
 
   /**
    * Handle Destroy task - Alias for DestroyPool (DestroyTask = DestroyPoolTask)
+   * Returns TaskResume for consistency with Run method
    */
-  void Destroy(hipc::FullPtr<DestroyTask> task, chi::RunContext& rctx);
+  chi::TaskResume Destroy(hipc::FullPtr<DestroyTask> task, chi::RunContext& rctx);
 
   /**
    * Get remaining work count for this container

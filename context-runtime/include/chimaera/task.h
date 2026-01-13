@@ -1,16 +1,17 @@
 #ifndef CHIMAERA_INCLUDE_CHIMAERA_TASK_H_
 #define CHIMAERA_INCLUDE_CHIMAERA_TASK_H_
 
+#include <sys/types.h>
+
 #include <atomic>
 #include <coroutine>
 #include <sstream>
 #include <vector>
-#include <sys/types.h>
 
 #include "chimaera/pool_query.h"
 #include "chimaera/types.h"
-#include "hermes_shm/data_structures/ipc/vector.h"
 #include "hermes_shm/data_structures/ipc/shm_container.h"
+#include "hermes_shm/data_structures/ipc/vector.h"
 #include "hermes_shm/memory/allocator/allocator.h"
 
 // Include cereal for serialization
@@ -22,7 +23,6 @@ namespace hshm::priv {
 template <typename T, typename AllocT, size_t SmallSize>
 class basic_string;
 }
-
 
 namespace chi {
 
@@ -37,8 +37,8 @@ struct RunContext;
  * Used to route tasks to appropriate worker groups
  */
 struct TaskStat {
-  size_t io_size_{0};    /**< I/O size in bytes */
-  size_t compute_{0};    /**< Normalized compute time in microseconds */
+  size_t io_size_{0}; /**< I/O size in bytes */
+  size_t compute_{0}; /**< Normalized compute time in microseconds */
 };
 
 // Define macros for container template
@@ -61,23 +61,23 @@ class Task {
   IN MethodId method_;      /**< Method identifier for task type */
   IN ibitfield task_flags_; /**< Task properties and flags */
   IN double period_ns_;     /**< Period in nanoseconds for periodic tasks */
-  IN RunContext *run_ctx_; /**< Pointer to runtime context for task execution */
-  OUT u32 return_code_; /**< Task return code (0=success, non-zero=error) */
-  OUT ContainerId completer_; /**< Container ID that completed this task */
-  TaskStat stat_;   /**< Task statistics for I/O and compute tracking */
+  IN RunContext* run_ctx_; /**< Pointer to runtime context for task execution */
+  OUT hipc::atomic<u32>
+      return_code_; /**< Task return code (0=success, non-zero=error) */
+  OUT hipc::atomic<ContainerId>
+      completer_; /**< Container ID that completed this task */
+  TaskStat stat_; /**< Task statistics for I/O and compute tracking */
 
   /**
    * Default constructor
    */
-  Task() {
-    SetNull();
-  }
+  Task() { SetNull(); }
 
   /**
    * Emplace constructor with task initialization
    */
-  explicit Task(const TaskId &task_id, const PoolId &pool_id,
-                const PoolQuery &pool_query, const MethodId &method) {
+  explicit Task(const TaskId& task_id, const PoolId& pool_id,
+                const PoolQuery& pool_query, const MethodId& method) {
     // Initialize task
     task_id_ = task_id;
     pool_id_ = pool_id;
@@ -86,8 +86,8 @@ class Task {
     pool_query_ = pool_query;
     period_ns_ = 0.0;
     run_ctx_ = nullptr;
-    return_code_ = 0; // Initialize as success
-    completer_ = 0; // Initialize as null (0 is invalid container ID)
+    return_code_.store(0);  // Initialize as success
+    completer_.store(0);    // Initialize as null (0 is invalid container ID)
   }
 
   /**
@@ -98,7 +98,7 @@ class Task {
    *
    * @param other Pointer to the source task to copy from
    */
-  HSHM_CROSS_FUN void Copy(const hipc::FullPtr<Task> &other) {
+  HSHM_CROSS_FUN void Copy(const hipc::FullPtr<Task>& other) {
     pool_id_ = other->pool_id_;
     task_id_ = other->task_id_;
     pool_query_ = other->pool_query_;
@@ -106,8 +106,8 @@ class Task {
     task_flags_ = other->task_flags_;
     period_ns_ = other->period_ns_;
     run_ctx_ = other->run_ctx_;
-    return_code_ = other->return_code_;
-    completer_ = other->completer_;
+    return_code_.store(other->return_code_.load());
+    completer_.store(other->completer_.load());
     stat_ = other->stat_;
   }
 
@@ -122,8 +122,8 @@ class Task {
     task_flags_.Clear();
     period_ns_ = 0.0;
     run_ctx_ = nullptr;
-    return_code_ = 0; // Initialize as success
-    completer_ = 0; // Initialize as null (0 is invalid container ID)
+    return_code_.store(0);  // Initialize as success
+    completer_.store(0);    // Initialize as null (0 is invalid container ID)
     stat_.io_size_ = 0;
     stat_.compute_ = 0;
   }
@@ -193,8 +193,8 @@ class Task {
    * @param args The arguments to serialize
    */
   template <typename... Args>
-  static void Serialize(AllocT* alloc,
-                        chi::priv::string &output_str, const Args &...args) {
+  static void Serialize(AllocT* alloc, chi::priv::string& output_str,
+                        const Args&... args) {
     std::ostringstream os;
     cereal::BinaryOutputArchive archive(os);
     archive(args...);
@@ -209,7 +209,7 @@ class Task {
    * @return The deserialized object
    */
   template <typename OutT>
-  static OutT Deserialize(const chi::priv::string &input_str) {
+  static OutT Deserialize(const chi::priv::string& input_str) {
     std::string data = input_str.str();
     std::istringstream is(data);
     cereal::BinaryInputArchive archive(is);
@@ -221,15 +221,16 @@ class Task {
 
   /**
    * Serialize task for incoming network transfer (IN and INOUT parameters)
-   * This method serializes the base Task fields first, then should be overridden
-   * by derived classes to serialize their specific fields.
+   * This method serializes the base Task fields first, then should be
+   * overridden by derived classes to serialize their specific fields.
    *
    * IMPORTANT: Derived classes MUST call Task::SerializeIn(ar) first before
    * serializing their own fields.
    *
    * @param ar Archive to serialize to
    */
-  template <typename Archive> void SerializeIn(Archive &ar) {
+  template <typename Archive>
+  void SerializeIn(Archive& ar) {
     // Serialize base Task fields (IN and INOUT parameters)
     ar(pool_id_, task_id_, pool_query_, method_, task_flags_, period_ns_,
        return_code_);
@@ -237,19 +238,21 @@ class Task {
 
   /**
    * Serialize task for outgoing network transfer (OUT and INOUT parameters)
-   * This method serializes the base Task OUT fields first, then should be overridden
-   * by derived classes to serialize their specific OUT fields.
+   * This method serializes the base Task OUT fields first, then should be
+   * overridden by derived classes to serialize their specific OUT fields.
    *
    * IMPORTANT: Derived classes MUST call Task::SerializeOut(ar) first before
    * serializing their own OUT fields.
    *
    * @param ar Archive to serialize to
    */
-  template <typename Archive> void SerializeOut(Archive &ar) {
+  template <typename Archive>
+  void SerializeOut(Archive& ar) {
     // Serialize base Task OUT fields only
     // Only serialize OUT fields - do NOT re-serialize IN fields
-    // (pool_id_, task_id_, pool_query_, method_, task_flags_, period_ns_ are all IN)
-    // Only return_code_ and completer_ are OUT fields that need to be sent back
+    // (pool_id_, task_id_, pool_query_, method_, task_flags_, period_ns_ are
+    // all IN) Only return_code_ and completer_ are OUT fields that need to be
+    // sent back
     ar(return_code_, completer_);
   }
 
@@ -257,21 +260,21 @@ class Task {
    * Get the task return code
    * @return Return code (0=success, non-zero=error)
    */
-  HSHM_CROSS_FUN u32 GetReturnCode() const { return return_code_; }
+  HSHM_CROSS_FUN u32 GetReturnCode() const { return return_code_.load(); }
 
   /**
    * Set the task return code
    * @param return_code Return code to set (0=success, non-zero=error)
    */
   HSHM_CROSS_FUN void SetReturnCode(u32 return_code) {
-    return_code_ = return_code;
+    return_code_.store(return_code);
   }
 
   /**
    * Get the completer container ID (which container completed this task)
    * @return Container ID that completed this task
    */
-  HSHM_CROSS_FUN ContainerId GetCompleter() const { return completer_; }
+  HSHM_CROSS_FUN ContainerId GetCompleter() const { return completer_.load(); }
 
   /**
    * Post-wait callback called after task completion
@@ -288,21 +291,21 @@ class Task {
    * @param completer Container ID to set
    */
   HSHM_CROSS_FUN void SetCompleter(ContainerId completer) {
-    completer_ = completer;
+    completer_.store(completer);
   }
 
   /**
-   * Base aggregate method - propagates return codes and completer from replica tasks
-   * Sets this task's return code to the replica's return code if replica has non-zero return code
-   * Accepts any task type that inherits from Task
+   * Base aggregate method - propagates return codes and completer from replica
+   * tasks Sets this task's return code to the replica's return code if replica
+   * has non-zero return code Accepts any task type that inherits from Task
    *
-   * IMPORTANT: Derived classes that override Aggregate MUST call Task::Aggregate(replica_task)
-   * first before aggregating their own fields.
+   * IMPORTANT: Derived classes that override Aggregate MUST call
+   * Task::Aggregate(replica_task) first before aggregating their own fields.
    *
    * @param replica_task The replica task to aggregate from
    */
-  template<typename TaskT>
-  HSHM_CROSS_FUN void Aggregate(const hipc::FullPtr<TaskT> &replica_task) {
+  template <typename TaskT>
+  HSHM_CROSS_FUN void Aggregate(const hipc::FullPtr<TaskT>& replica_task) {
     // Cast to base Task for aggregation
     auto base_replica = replica_task.template Cast<Task>();
     // Propagate return code from replica to this task
@@ -313,7 +316,8 @@ class Task {
     if (!base_replica.IsNull()) {
       SetCompleter(base_replica->GetCompleter());
     }
-    HLOG(kDebug, "[COMPLETER] Aggregated task {} with completer {}", task_id_, GetCompleter());
+    HLOG(kDebug, "[COMPLETER] Aggregated task {} with completer {}", task_id_,
+         GetCompleter());
   }
 
   /**
@@ -328,8 +332,8 @@ class Task {
  * Execution mode for task processing
  */
 enum class ExecMode : u32 {
-  kExec = 0,              /**< Normal task execution */
-  kDynamicSchedule = 1    /**< Dynamic scheduling - route after execution */
+  kExec = 0,           /**< Normal task execution */
+  kDynamicSchedule = 1 /**< Dynamic scheduling - route after execution */
 };
 
 // ============================================================================
@@ -342,7 +346,7 @@ enum class ExecMode : u32 {
  * This container holds the serialized task data and completion status
  * for asynchronous task operations.
  */
-template<typename AllocT = CHI_MAIN_ALLOC_T>
+template <typename AllocT = CHI_MAIN_ALLOC_T>
 class FutureShm : public hipc::ShmContainer<AllocT> {
  public:
   /** Pool ID for the task */
@@ -355,14 +359,13 @@ class FutureShm : public hipc::ShmContainer<AllocT> {
   hipc::vector<char, AllocT> serialized_task_;
 
   /** Atomic completion flag (0=not complete, 1=complete) */
-  std::atomic<u32> is_complete_;
+  hipc::atomic<u32> is_complete_;
 
   /**
    * SHM default constructor
    */
   explicit FutureShm(AllocT* alloc)
-      : hipc::ShmContainer<AllocT>(alloc),
-        serialized_task_(alloc) {
+      : hipc::ShmContainer<AllocT>(alloc), serialized_task_(alloc) {
     pool_id_ = PoolId::GetNull();
     method_id_ = 0;
     is_complete_.store(0);
@@ -378,14 +381,14 @@ class FutureShm : public hipc::ShmContainer<AllocT> {
  * @tparam TaskT The task type (e.g., CreateTask, CustomTask)
  * @tparam AllocT The allocator type (defaults to CHI_MAIN_ALLOC_T)
  */
-template<typename TaskT, typename AllocT = CHI_MAIN_ALLOC_T>
+template <typename TaskT, typename AllocT = CHI_MAIN_ALLOC_T>
 class Future {
  public:
   using FutureT = FutureShm<AllocT>;
 
   // Allow all Future instantiations to access each other's private members
   // This enables the Cast method to work across different task types
-  template<typename OtherTaskT, typename OtherAllocT>
+  template <typename OtherTaskT, typename OtherAllocT>
   friend class Future;
 
  private:
@@ -405,14 +408,14 @@ class Future {
   /**
    * Constructor with allocator - allocates new FutureShm
    * @param alloc Allocator to use for FutureShm allocation
-   * @param task_ptr FullPtr to the task (wraps private memory with null allocator)
+   * @param task_ptr FullPtr to the task (wraps private memory with null
+   * allocator)
    */
   Future(AllocT* alloc, hipc::FullPtr<TaskT> task_ptr)
-      : task_ptr_(task_ptr),
-        parent_task_(nullptr),
-        is_owner_(false) {
+      : task_ptr_(task_ptr), parent_task_(nullptr), is_owner_(false) {
     // Allocate FutureShm object
-    future_shm_ = alloc->template NewObj<FutureT>(alloc).template Cast<FutureT>();
+    future_shm_ =
+        alloc->template NewObj<FutureT>(alloc).template Cast<FutureT>();
     // Copy pool_id to FutureShm
     if (!task_ptr_.IsNull() && !future_shm_.IsNull()) {
       future_shm_->pool_id_ = task_ptr_->pool_id_;
@@ -423,10 +426,12 @@ class Future {
   /**
    * Constructor with allocator and existing FutureShm
    * @param alloc Allocator (for FullPtr construction)
-   * @param task_ptr FullPtr to the task (wraps private memory with null allocator)
+   * @param task_ptr FullPtr to the task (wraps private memory with null
+   * allocator)
    * @param future_shm ShmPtr to existing FutureShm object
    */
-  Future(AllocT* alloc, hipc::FullPtr<TaskT> task_ptr, hipc::ShmPtr<FutureT> future_shm)
+  Future(AllocT* alloc, hipc::FullPtr<TaskT> task_ptr,
+         hipc::ShmPtr<FutureT> future_shm)
       : task_ptr_(task_ptr),
         future_shm_(alloc, future_shm),
         parent_task_(nullptr),
@@ -435,7 +440,8 @@ class Future {
   /**
    * Constructor from FullPtr<FutureShm> and FullPtr<Task>
    * @param future_shm FullPtr to existing FutureShm object
-   * @param task_ptr FullPtr to the task (wraps private memory with null allocator)
+   * @param task_ptr FullPtr to the task (wraps private memory with null
+   * allocator)
    */
   Future(hipc::FullPtr<FutureT> future_shm, hipc::FullPtr<TaskT> task_ptr)
       : task_ptr_(task_ptr),
@@ -555,41 +561,31 @@ class Future {
    * Get raw pointer to the task
    * @return Pointer to the task object
    */
-  TaskT* get() const {
-    return task_ptr_.ptr_;
-  }
+  TaskT* get() const { return task_ptr_.ptr_; }
 
   /**
    * Get the FullPtr to the task (non-const version)
    * @return FullPtr to the task object
    */
-  hipc::FullPtr<TaskT>& GetTaskPtr() {
-    return task_ptr_;
-  }
+  hipc::FullPtr<TaskT>& GetTaskPtr() { return task_ptr_; }
 
   /**
    * Get the FullPtr to the task (const version)
    * @return FullPtr to the task object
    */
-  const hipc::FullPtr<TaskT>& GetTaskPtr() const {
-    return task_ptr_;
-  }
+  const hipc::FullPtr<TaskT>& GetTaskPtr() const { return task_ptr_; }
 
   /**
    * Dereference operator - access task members
    * @return Reference to the task object
    */
-  TaskT& operator*() const {
-    return *task_ptr_.ptr_;
-  }
+  TaskT& operator*() const { return *task_ptr_.ptr_; }
 
   /**
    * Arrow operator - access task members
    * @return Pointer to the task object
    */
-  TaskT* operator->() const {
-    return task_ptr_.ptr_;
-  }
+  TaskT* operator->() const { return task_ptr_.ptr_; }
 
   /**
    * Check if the task is complete
@@ -620,33 +616,25 @@ class Future {
   /**
    * Mark the task as complete (alias for Complete)
    */
-  void SetComplete() {
-    Complete();
-  }
+  void SetComplete() { Complete(); }
 
   /**
    * Check if this future is null
    * @return True if future is null, false otherwise
    */
-  bool IsNull() const {
-    return task_ptr_.IsNull();
-  }
+  bool IsNull() const { return task_ptr_.IsNull(); }
 
   /**
    * Get the FutureShm FullPtr
    * @return FullPtr to the FutureShm object
    */
-  hipc::FullPtr<FutureT>& GetFutureShm() {
-    return future_shm_;
-  }
+  hipc::FullPtr<FutureT>& GetFutureShm() { return future_shm_; }
 
   /**
    * Get the FutureShm FullPtr (const version)
    * @return FullPtr to the FutureShm object
    */
-  const hipc::FullPtr<FutureT>& GetFutureShm() const {
-    return future_shm_;
-  }
+  const hipc::FullPtr<FutureT>& GetFutureShm() const { return future_shm_; }
 
   /**
    * Get the pool ID from the FutureShm
@@ -681,11 +669,12 @@ class Future {
    * @tparam NewTaskT The new task type to cast to
    * @return Future<NewTaskT> with the same underlying state (non-owning)
    */
-  template<typename NewTaskT>
+  template <typename NewTaskT>
   Future<NewTaskT, AllocT> Cast() const {
     Future<NewTaskT, AllocT> result;
     // Use reinterpret_cast to copy the memory layout
-    // This works because Future<TaskT> and Future<NewTaskT> have identical sizes
+    // This works because Future<TaskT> and Future<NewTaskT> have identical
+    // sizes
     result.task_ptr_ = task_ptr_.template Cast<NewTaskT>();
     result.future_shm_ = future_shm_;
     result.parent_task_ = parent_task_;
@@ -697,17 +686,13 @@ class Future {
    * Get the parent task RunContext pointer
    * @return Pointer to parent RunContext or nullptr
    */
-  RunContext* GetParentTask() const {
-    return parent_task_;
-  }
+  RunContext* GetParentTask() const { return parent_task_; }
 
   /**
    * Set the parent task RunContext pointer
    * @param parent_task Pointer to parent RunContext
    */
-  void SetParentTask(RunContext* parent_task) {
-    parent_task_ = parent_task;
-  }
+  void SetParentTask(RunContext* parent_task) { parent_task_ = parent_task; }
 
   // =========================================================================
   // C++20 Coroutine Awaitable Interface
@@ -721,9 +706,7 @@ class Future {
    * If the task is already complete, the coroutine won't suspend.
    * @return True if task is complete, false if coroutine should suspend
    */
-  bool await_ready() const noexcept {
-    return IsComplete();
-  }
+  bool await_ready() const noexcept { return IsComplete(); }
 
   /**
    * Suspend the coroutine and register for resumption (coroutine await_suspend)
@@ -736,13 +719,14 @@ class Future {
    * @param handle The coroutine handle to resume when task completes
    * @return True to suspend, false to continue without suspending
    */
-  template<typename PromiseT>
+  template <typename PromiseT>
   bool await_suspend(std::coroutine_handle<PromiseT> handle) noexcept {
-    // Mark this Future as owner of the task (will be destroyed on Future destruction)
+    // Mark this Future as owner of the task (will be destroyed on Future
+    // destruction)
     is_owner_ = true;
     auto* run_ctx = handle.promise().get_run_context();
-    HLOG(kDebug, "Future::await_suspend: run_ctx={}, handle={}",
-         (void*)run_ctx, (void*)handle.address());
+    HLOG(kDebug, "Future::await_suspend: run_ctx={}, handle={}", (void*)run_ctx,
+         (void*)handle.address());
     if (!run_ctx) {
       // No RunContext available, don't suspend
       HLOG(kWarning, "Future::await_suspend: run_ctx is null, not suspending!");
@@ -763,12 +747,13 @@ class Future {
    * Get the result after resumption (coroutine await_resume)
    *
    * Returns reference to this Future so caller can access the completed task.
-   * Marks this Future as the owner if not already set (for await_ready=true case).
-   * Calls PostWait() on the task for post-completion actions.
+   * Marks this Future as the owner if not already set (for await_ready=true
+   * case). Calls PostWait() on the task for post-completion actions.
    * @return Reference to this Future
    */
   Future<TaskT, AllocT>& await_resume() noexcept {
-    // If await_ready returned true, await_suspend wasn't called, so set ownership here
+    // If await_ready returned true, await_suspend wasn't called, so set
+    // ownership here
     is_owner_ = true;
     // Call PostWait() callback on the task for post-completion actions
     if (!task_ptr_.IsNull()) {
@@ -789,27 +774,36 @@ class Future {
 struct TaskQueueHeader {
   PoolId pool_id;
   WorkerId assigned_worker_id;
-  u32 task_count;        // Number of tasks currently in the queue
-  bool is_enqueued;      // Whether this queue is currently enqueued in worker
-  int signal_fd_;        // Signal file descriptor for awakening worker
-  pid_t tid_;            // Thread ID of the worker owning this lane
-  std::atomic<bool> active_;  // Whether worker is accepting tasks (true) or blocked in epoll_wait (false)
+  u32 task_count;    // Number of tasks currently in the queue
+  bool is_enqueued;  // Whether this queue is currently enqueued in worker
+  int signal_fd_;    // Signal file descriptor for awakening worker
+  pid_t tid_;        // Thread ID of the worker owning this lane
+  std::atomic<bool> active_;  // Whether worker is accepting tasks (true) or
+                              // blocked in epoll_wait (false)
 
   TaskQueueHeader()
-    : pool_id(), assigned_worker_id(0), task_count(0), is_enqueued(false),
-      signal_fd_(-1), tid_(0) {
+      : pool_id(),
+        assigned_worker_id(0),
+        task_count(0),
+        is_enqueued(false),
+        signal_fd_(-1),
+        tid_(0) {
     active_.store(true);
   }
 
   TaskQueueHeader(PoolId pid, WorkerId wid = 0)
-    : pool_id(pid), assigned_worker_id(wid), task_count(0), is_enqueued(false),
-      signal_fd_(-1), tid_(0) {
+      : pool_id(pid),
+        assigned_worker_id(wid),
+        task_count(0),
+        is_enqueued(false),
+        signal_fd_(-1),
+        tid_(0) {
     active_.store(true);
   }
 };
 
-// Type alias for individual lanes with per-lane headers (moved outside TaskQueue class)
-// Worker queues store Future<Task> objects directly
+// Type alias for individual lanes with per-lane headers (moved outside
+// TaskQueue class) Worker queues store Future<Task> objects directly
 using TaskLane =
     hipc::multi_mpsc_ring_buffer<Future<Task>,
                                  CHI_MAIN_ALLOC_T>::ring_buffer_type;
@@ -821,8 +815,7 @@ using TaskLane =
  * compatibility with existing code that expects the multi_mpsc_ring_buffer
  * interface.
  */
-typedef hipc::multi_mpsc_ring_buffer<Future<Task>, CHI_MAIN_ALLOC_T>
-    TaskQueue;
+typedef hipc::multi_mpsc_ring_buffer<Future<Task>, CHI_MAIN_ALLOC_T> TaskQueue;
 
 // ============================================================================
 // RunContext (uses Future<Task> and TaskLane* - both must be complete above)
@@ -841,42 +834,58 @@ struct RunContext {
   ThreadType thread_type;
   u32 worker_id;
   FullPtr<Task> task; /**< Task being executed by this context */
-  bool is_yielded_;    /**< Task is waiting for completion */
-  double est_load;    /**< Estimated time until task should wake up (microseconds) */
-  double yield_time_us_;  /**< Time in microseconds for task to yield */
+  bool is_yielded_;   /**< Task is waiting for completion */
+  double
+      est_load; /**< Estimated time until task should wake up (microseconds) */
+  double yield_time_us_;       /**< Time in microseconds for task to yield */
   hshm::Timepoint block_start; /**< Time when task was blocked (real time) */
-  Container *container;  /**< Current container being executed */
-  TaskLane *lane;        /**< Current lane being processed */
-  ExecMode exec_mode;    /**< Execution mode (kExec or kDynamicSchedule) */
-  void *event_queue_;    /**< Pointer to worker's event queue */
-  std::vector<PoolQuery> pool_queries;  /**< Pool queries for task distribution */
+  Container* container;        /**< Current container being executed */
+  TaskLane* lane;              /**< Current lane being processed */
+  ExecMode exec_mode; /**< Execution mode (kExec or kDynamicSchedule) */
+  void* event_queue_; /**< Pointer to worker's event queue */
+  std::vector<PoolQuery>
+      pool_queries; /**< Pool queries for task distribution */
   std::vector<FullPtr<Task>> subtasks_; /**< Replica tasks for this execution */
-  u32 completed_replicas_; /**< Count of completed replicas */
-  u32 yield_count_;  /**< Number of times task has yielded */
-  Future<Task, CHI_MAIN_ALLOC_T> future_;  /**< Future for async completion tracking */
-  bool destroy_in_end_task_;  /**< Flag to indicate if task should be destroyed in EndTask */
-  std::atomic<bool> is_notified_;  /**< Atomic flag to prevent duplicate event queue additions */
+  u32 completed_replicas_;              /**< Count of completed replicas */
+  u32 yield_count_;                     /**< Number of times task has yielded */
+  Future<Task, CHI_MAIN_ALLOC_T>
+      future_;               /**< Future for async completion tracking */
+  bool destroy_in_end_task_; /**< Flag to indicate if task should be destroyed
+                                in EndTask */
+  std::atomic<bool> is_notified_; /**< Atomic flag to prevent duplicate event
+                                     queue additions */
 
   RunContext()
       : coro_handle_(nullptr),
-        thread_type(kSchedWorker), worker_id(0), is_yielded_(false),
-        est_load(0.0), yield_time_us_(0.0), block_start(),
-        container(nullptr), lane(nullptr), exec_mode(ExecMode::kExec),
+        thread_type(kSchedWorker),
+        worker_id(0),
+        is_yielded_(false),
+        est_load(0.0),
+        yield_time_us_(0.0),
+        block_start(),
+        container(nullptr),
+        lane(nullptr),
+        exec_mode(ExecMode::kExec),
         event_queue_(nullptr),
-        completed_replicas_(0), yield_count_(0), destroy_in_end_task_(false),
-        is_notified_(false) {
-  }
+        completed_replicas_(0),
+        yield_count_(0),
+        destroy_in_end_task_(false),
+        is_notified_(false) {}
 
   /**
    * Move constructor
    */
-  RunContext(RunContext &&other) noexcept
+  RunContext(RunContext&& other) noexcept
       : coro_handle_(other.coro_handle_),
         thread_type(other.thread_type),
-        worker_id(other.worker_id), task(std::move(other.task)),
-        is_yielded_(other.is_yielded_), est_load(other.est_load),
-        yield_time_us_(other.yield_time_us_), block_start(other.block_start),
-        container(other.container), lane(other.lane),
+        worker_id(other.worker_id),
+        task(std::move(other.task)),
+        is_yielded_(other.is_yielded_),
+        est_load(other.est_load),
+        yield_time_us_(other.yield_time_us_),
+        block_start(other.block_start),
+        container(other.container),
+        lane(other.lane),
         exec_mode(other.exec_mode),
         event_queue_(other.event_queue_),
         pool_queries(std::move(other.pool_queries)),
@@ -893,7 +902,7 @@ struct RunContext {
   /**
    * Move assignment operator
    */
-  RunContext &operator=(RunContext &&other) noexcept {
+  RunContext& operator=(RunContext&& other) noexcept {
     if (this != &other) {
       coro_handle_ = other.coro_handle_;
       thread_type = other.thread_type;
@@ -921,8 +930,8 @@ struct RunContext {
   }
 
   // Delete copy constructor and copy assignment
-  RunContext(const RunContext &) = delete;
-  RunContext &operator=(const RunContext &) = delete;
+  RunContext(const RunContext&) = delete;
+  RunContext& operator=(const RunContext&) = delete;
 
   /**
    * Clear all STL containers for reuse
@@ -1157,9 +1166,7 @@ class TaskResume {
    * Check if the coroutine is already done
    * @return True if coroutine completed, false otherwise
    */
-  bool await_ready() const noexcept {
-    return handle_ && handle_.done();
-  }
+  bool await_ready() const noexcept { return handle_ && handle_.done(); }
 
   /**
    * Suspend the calling coroutine and run this one to completion or suspension
@@ -1171,19 +1178,19 @@ class TaskResume {
    * IMPORTANT: Propagates the RunContext from the caller to the inner coroutine
    * so that nested co_await calls on Futures work correctly.
    *
-   * When the inner coroutine suspends on a Future, the caller is also suspended.
-   * When the awaited Future completes, the inner coroutine's handle (stored in
-   * run_ctx->coro_handle_) is resumed. The await_resume of this TaskResume will
-   * then continue running the inner coroutine to completion.
+   * When the inner coroutine suspends on a Future, the caller is also
+   * suspended. When the awaited Future completes, the inner coroutine's handle
+   * (stored in run_ctx->coro_handle_) is resumed. The await_resume of this
+   * TaskResume will then continue running the inner coroutine to completion.
    *
    * @tparam PromiseT The promise type of the calling coroutine
    * @param caller_handle The coroutine handle of the caller
-   * @return True if we should suspend (inner suspended), false if inner completed
+   * @return True if we should suspend (inner suspended), false if inner
+   * completed
    */
-  template<typename PromiseT>
+  template <typename PromiseT>
   bool await_suspend(std::coroutine_handle<PromiseT> caller_handle) noexcept {
     if (!handle_) {
-      HLOG(kDebug, "TaskResume::await_suspend: handle_ is null, returning false");
       return false;  // Nothing to run, don't suspend
     }
 
@@ -1193,51 +1200,45 @@ class TaskResume {
     // CRITICAL: Propagate RunContext from caller to inner coroutine
     // This allows nested co_await on Futures to properly suspend
     RunContext* caller_run_ctx = caller_handle.promise().get_run_context();
-    HLOG(kDebug, "TaskResume::await_suspend: caller_run_ctx={}, inner_handle={}",
-         (void*)caller_run_ctx, (void*)handle_.address());
     if (caller_run_ctx) {
       handle_.promise().set_run_context(caller_run_ctx);
     }
 
     // NOTE: We do NOT set caller_handle in inner's promise yet!
     // If the inner coroutine completes synchronously during resume(),
-    // final_suspend would try to resume caller while we're still inside await_suspend,
-    // causing undefined behavior. We only set it after confirming suspension.
+    // final_suspend would try to resume caller while we're still inside
+    // await_suspend, causing undefined behavior. We only set it after
+    // confirming suspension.
 
     // Resume the inner coroutine
-    HLOG(kDebug, "TaskResume::await_suspend: About to resume inner");
     handle_.resume();
-    HLOG(kDebug, "TaskResume::await_suspend: Returned from resume, done={}",
-         handle_.done());
 
     // Check if inner coroutine is done
     if (handle_.done()) {
       // Inner completed synchronously, destroy it
-      HLOG(kDebug, "TaskResume::await_suspend: Inner done, destroying");
       handle_.destroy();
       handle_ = nullptr;
       return false;  // Don't suspend caller
     }
 
     // Inner coroutine suspended (on co_await Future or yield)
-    // NOW it's safe to set caller_handle - the inner will complete asynchronously
-    // and final_suspend will properly resume the caller
-    HLOG(kDebug, "TaskResume::await_suspend: Setting caller in inner's promise");
+    // NOW it's safe to set caller_handle - the inner will complete
+    // asynchronously and final_suspend will properly resume the caller
     handle_.promise().set_caller(caller_handle);
 
-    // The inner's handle is now stored in run_ctx->coro_handle_ by Future::await_suspend
-    // When the awaited Future completes, worker will resume inner via run_ctx->coro_handle_
-    // When inner eventually completes, final_suspend will resume the caller (this coroutine)
-    HLOG(kDebug, "TaskResume::await_suspend: Returning true (suspended)");
+    // The inner's handle is now stored in run_ctx->coro_handle_ by
+    // Future::await_suspend When the awaited Future completes, worker will
+    // resume inner via run_ctx->coro_handle_ When inner eventually completes,
+    // final_suspend will resume the caller (this coroutine)
     return true;
   }
 
   /**
    * Resume after await - cleanup inner coroutine and update run_ctx
    *
-   * This is called when the caller is resumed after the inner coroutine completes.
-   * The inner's final_suspend resumes the caller, which triggers this method.
-   * We need to:
+   * This is called when the caller is resumed after the inner coroutine
+   * completes. The inner's final_suspend resumes the caller, which triggers
+   * this method. We need to:
    * 1. Get run_ctx from inner's promise (before destroying)
    * 2. Destroy inner's handle (it's done)
    * 3. Update run_ctx->coro_handle_ to caller's handle so subsequent events
@@ -1289,9 +1290,7 @@ class YieldAwaiter {
    * Yield is never immediately ready - always suspends
    * @return Always false (always suspend)
    */
-  bool await_ready() const noexcept {
-    return false;
-  }
+  bool await_ready() const noexcept { return false; }
 
   /**
    * Suspend the coroutine and mark for yielded resumption
@@ -1300,7 +1299,7 @@ class YieldAwaiter {
    * @param handle The coroutine handle to resume after yield
    * @return True to suspend, false if no RunContext available
    */
-  template<typename PromiseT>
+  template <typename PromiseT>
   bool await_suspend(std::coroutine_handle<PromiseT> handle) noexcept {
     auto* run_ctx = handle.promise().get_run_context();
     if (!run_ctx) {
@@ -1333,9 +1332,7 @@ class YieldAwaiter {
  *   co_await chi::yield();       // Yield immediately
  *   co_await chi::yield(25.0);   // Yield with 25 microsecond delay
  */
-inline YieldAwaiter yield(double us = 0.0) {
-  return YieldAwaiter(us);
-}
+inline YieldAwaiter yield(double us = 0.0) { return YieldAwaiter(us); }
 
 // Cleanup macros
 #undef CLASS_NAME
@@ -1347,7 +1344,8 @@ inline YieldAwaiter yield(double us = 0.0) {
  */
 namespace detail {
 // Primary template - assumes no Aggregate method, calls Copy
-template <typename T, typename = void> struct aggregate_or_copy {
+template <typename T, typename = void>
+struct aggregate_or_copy {
   static void call(hipc::FullPtr<T> origin, hipc::FullPtr<T> replica) {
     origin->Copy(replica);
   }
@@ -1355,19 +1353,19 @@ template <typename T, typename = void> struct aggregate_or_copy {
 
 // Specialization for types with Aggregate method - calls Aggregate
 template <typename T>
-struct aggregate_or_copy<T, std::void_t<decltype(std::declval<T *>()->Aggregate(
+struct aggregate_or_copy<T, std::void_t<decltype(std::declval<T*>()->Aggregate(
                                 std::declval<hipc::FullPtr<T>>()))>> {
   static void call(hipc::FullPtr<T> origin, hipc::FullPtr<T> replica) {
     origin->Aggregate(replica);
   }
 };
-} // namespace detail
+}  // namespace detail
 
 // Macro for convenient usage - automatically dispatches to Aggregate or Copy
-#define CHI_AGGREGATE_OR_COPY(origin_ptr, replica_ptr)                         \
-  chi::detail::aggregate_or_copy<typename std::remove_pointer<                 \
+#define CHI_AGGREGATE_OR_COPY(origin_ptr, replica_ptr)         \
+  chi::detail::aggregate_or_copy<typename std::remove_pointer< \
       decltype((origin_ptr).ptr_)>::type>::call((origin_ptr), (replica_ptr))
 
-} // namespace chi
+}  // namespace chi
 
-#endif // CHIMAERA_INCLUDE_CHIMAERA_TASK_H_
+#endif  // CHIMAERA_INCLUDE_CHIMAERA_TASK_H_

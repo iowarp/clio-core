@@ -98,14 +98,17 @@ chi::TaskResume Runtime::Create(hipc::FullPtr<CreateTask> task, chi::RunContext 
 
   // Get configuration from params (loaded from pool_config.config_ via
   // LoadConfig)
+  HLOG(kDebug, "CTE Create: About to call GetParams(), do_compose_={}", task->do_compose_);
   auto params = task->GetParams(main_allocator);
   config_ = params.config_;
+  HLOG(kDebug, "CTE Create: GetParams() returned, storage devices in config: {}", config_.storage_.devices_.size());
 
   // Configuration is now loaded from compose pool_config via
   // CreateParams::LoadConfig()
 
   // Store storage configuration in runtime
   storage_devices_ = config_.storage_.devices_;
+  HLOG(kDebug, "CTE Create: Copied storage devices to runtime, count: {}", storage_devices_.size());
 
   // Initialize the client with the pool ID
   client_.Init(task->new_pool_id_);

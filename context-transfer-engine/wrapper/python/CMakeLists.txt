@@ -68,14 +68,14 @@ if(BUILD_TESTING)
         WORKING_DIRECTORY $<TARGET_FILE_DIR:wrp_cte_core_ext>
     )
 
-    # Set environment variable to skip runtime initialization by default
-    # This allows tests to pass even without full Chimaera runtime setup
+    # Set environment variable to enable runtime initialization
+    # This allows tests to run with full Chimaera runtime setup
     set_tests_properties(
         python_bindings_test
         PROPERTIES
         LABELS "python;bindings"
         TIMEOUT 120
-        ENVIRONMENT "CHIMAERA_WITH_RUNTIME=0"
+        ENVIRONMENT "CHIMAERA_WITH_RUNTIME=1"
     )
 
     # Ensure test depends on the built module

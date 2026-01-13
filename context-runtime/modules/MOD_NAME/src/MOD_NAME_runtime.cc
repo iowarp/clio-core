@@ -18,7 +18,7 @@ namespace chimaera::MOD_NAME {
 // Method implementations
 //===========================================================================
 
-void Runtime::Create(hipc::FullPtr<CreateTask> task, chi::RunContext &rctx) {
+chi::TaskResume Runtime::Create(hipc::FullPtr<CreateTask> task, chi::RunContext &rctx) {
   HLOG(kDebug, "MOD_NAME: Executing Create task for pool {}", task->pool_id_);
 
   // Container is already initialized via Init() before Create is called
@@ -29,9 +29,11 @@ void Runtime::Create(hipc::FullPtr<CreateTask> task, chi::RunContext &rctx) {
         "MOD_NAME: Container created and initialized for pool: {} (ID: {}, "
         "count: {})",
         pool_name_, task->pool_id_, create_count_);
+  (void)rctx;
+  co_return;
 }
 
-void Runtime::Custom(hipc::FullPtr<CustomTask> task, chi::RunContext &rctx) {
+chi::TaskResume Runtime::Custom(hipc::FullPtr<CustomTask> task, chi::RunContext &rctx) {
   HLOG(kDebug, "MOD_NAME: Executing Custom task with data: {}",
         task->data_.c_str());
 
@@ -41,9 +43,11 @@ void Runtime::Custom(hipc::FullPtr<CustomTask> task, chi::RunContext &rctx) {
   // In a real implementation, this would perform the custom operation
 
   HLOG(kDebug, "MOD_NAME: Custom completed (count: {})", custom_count_);
+  (void)rctx;
+  co_return;
 }
 
-void Runtime::Destroy(hipc::FullPtr<DestroyTask> task, chi::RunContext &rctx) {
+chi::TaskResume Runtime::Destroy(hipc::FullPtr<DestroyTask> task, chi::RunContext &rctx) {
   HLOG(kDebug, "MOD_NAME: Executing Destroy task - Pool ID: {}",
         task->target_pool_id_);
 
@@ -54,6 +58,8 @@ void Runtime::Destroy(hipc::FullPtr<DestroyTask> task, chi::RunContext &rctx) {
   // In a real implementation, this would clean up MOD_NAME-specific resources
   // For now, just mark as successful
   HLOG(kDebug, "MOD_NAME: Container destroyed successfully");
+  (void)rctx;
+  co_return;
 }
 
 chi::u64 Runtime::GetWorkRemaining() const {
@@ -65,7 +71,7 @@ chi::u64 Runtime::GetWorkRemaining() const {
 // Task Serialization Method Implementations now in autogen/MOD_NAME_lib_exec.cc
 //===========================================================================
 
-void Runtime::CoMutexTest(hipc::FullPtr<CoMutexTestTask> task,
+chi::TaskResume Runtime::CoMutexTest(hipc::FullPtr<CoMutexTestTask> task,
                           chi::RunContext &rctx) {
   HLOG(kDebug, "MOD_NAME: Executing CoMutexTest task {} (hold: {}ms)",
         task->test_id_, task->hold_duration_ms_);
@@ -89,9 +95,11 @@ void Runtime::CoMutexTest(hipc::FullPtr<CoMutexTestTask> task,
 
   task->return_code_ = 0; // Success (0 means success in most conventions)
   HLOG(kDebug, "MOD_NAME: CoMutexTest {} completed", task->test_id_);
+  (void)rctx;
+  co_return;
 }
 
-void Runtime::CoRwLockTest(hipc::FullPtr<CoRwLockTestTask> task,
+chi::TaskResume Runtime::CoRwLockTest(hipc::FullPtr<CoRwLockTestTask> task,
                            chi::RunContext &rctx) {
   HLOG(kDebug, "MOD_NAME: Executing CoRwLockTest task {} ({}, hold: {}ms)",
         task->test_id_, (task->is_writer_ ? "writer" : "reader"),
@@ -134,6 +142,8 @@ void Runtime::CoRwLockTest(hipc::FullPtr<CoRwLockTestTask> task,
 
   task->return_code_ = 0; // Success (0 means success in most conventions)
   HLOG(kDebug, "MOD_NAME: CoRwLockTest {} completed", task->test_id_);
+  (void)rctx;
+  co_return;
 }
 
 chi::TaskResume Runtime::WaitTest(hipc::FullPtr<WaitTestTask> task,

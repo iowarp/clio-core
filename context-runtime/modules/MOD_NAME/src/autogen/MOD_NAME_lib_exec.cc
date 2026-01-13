@@ -32,31 +32,31 @@ chi::TaskResume Runtime::Run(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr,
     case Method::kCreate: {
       // Cast task FullPtr to specific type
       hipc::FullPtr<CreateTask> typed_task = task_ptr.template Cast<CreateTask>();
-      Create(typed_task, rctx);
+      co_await Create(typed_task, rctx);
       break;
     }
     case Method::kDestroy: {
       // Cast task FullPtr to specific type
       hipc::FullPtr<DestroyTask> typed_task = task_ptr.template Cast<DestroyTask>();
-      Destroy(typed_task, rctx);
+      co_await Destroy(typed_task, rctx);
       break;
     }
     case Method::kCustom: {
       // Cast task FullPtr to specific type
       hipc::FullPtr<CustomTask> typed_task = task_ptr.template Cast<CustomTask>();
-      Custom(typed_task, rctx);
+      co_await Custom(typed_task, rctx);
       break;
     }
     case Method::kCoMutexTest: {
       // Cast task FullPtr to specific type
       hipc::FullPtr<CoMutexTestTask> typed_task = task_ptr.template Cast<CoMutexTestTask>();
-      CoMutexTest(typed_task, rctx);
+      co_await CoMutexTest(typed_task, rctx);
       break;
     }
     case Method::kCoRwLockTest: {
       // Cast task FullPtr to specific type
       hipc::FullPtr<CoRwLockTestTask> typed_task = task_ptr.template Cast<CoRwLockTestTask>();
-      CoRwLockTest(typed_task, rctx);
+      co_await CoRwLockTest(typed_task, rctx);
       break;
     }
     case Method::kWaitTest: {

@@ -209,6 +209,10 @@ NB_MODULE(wrp_cte_core_ext, m) {
       .def("GetContainedBlobs", &wrp_cte::core::Tag::GetContainedBlobs,
            "Get all blob names contained in this tag. "
            "Returns: list of str")
+      .def("ReorganizeBlob", &wrp_cte::core::Tag::ReorganizeBlob,
+           "blob_name"_a, "new_score"_a,
+           "Reorganize blob with new score for data placement optimization. "
+           "Args: blob_name (str), new_score (float, 0.0-1.0 where higher = faster tier)")
       .def("GetTagId", &wrp_cte::core::Tag::GetTagId,
            "Get the TagId for this tag. "
            "Returns: TagId");

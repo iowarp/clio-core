@@ -32,43 +32,43 @@ chi::TaskResume Runtime::Run(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr,
     case Method::kCreate: {
       // Cast task FullPtr to specific type
       hipc::FullPtr<CreateTask> typed_task = task_ptr.template Cast<CreateTask>();
-      Create(typed_task, rctx);
+      co_await Create(typed_task, rctx);
       break;
     }
     case Method::kDestroy: {
       // Cast task FullPtr to specific type
       hipc::FullPtr<DestroyTask> typed_task = task_ptr.template Cast<DestroyTask>();
-      Destroy(typed_task, rctx);
+      co_await Destroy(typed_task, rctx);
       break;
     }
     case Method::kAllocateBlocks: {
       // Cast task FullPtr to specific type
       hipc::FullPtr<AllocateBlocksTask> typed_task = task_ptr.template Cast<AllocateBlocksTask>();
-      AllocateBlocks(typed_task, rctx);
+      co_await AllocateBlocks(typed_task, rctx);
       break;
     }
     case Method::kFreeBlocks: {
       // Cast task FullPtr to specific type
       hipc::FullPtr<FreeBlocksTask> typed_task = task_ptr.template Cast<FreeBlocksTask>();
-      FreeBlocks(typed_task, rctx);
+      co_await FreeBlocks(typed_task, rctx);
       break;
     }
     case Method::kWrite: {
       // Cast task FullPtr to specific type
       hipc::FullPtr<WriteTask> typed_task = task_ptr.template Cast<WriteTask>();
-      Write(typed_task, rctx);
+      co_await Write(typed_task, rctx);
       break;
     }
     case Method::kRead: {
       // Cast task FullPtr to specific type
       hipc::FullPtr<ReadTask> typed_task = task_ptr.template Cast<ReadTask>();
-      Read(typed_task, rctx);
+      co_await Read(typed_task, rctx);
       break;
     }
     case Method::kGetStats: {
       // Cast task FullPtr to specific type
       hipc::FullPtr<GetStatsTask> typed_task = task_ptr.template Cast<GetStatsTask>();
-      GetStats(typed_task, rctx);
+      co_await GetStats(typed_task, rctx);
       break;
     }
     default: {

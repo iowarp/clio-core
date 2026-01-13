@@ -333,7 +333,7 @@ WorkerIOContext *Runtime::GetWorkerIOContext(size_t worker_id) {
   return ctx;
 }
 
-void Runtime::Create(hipc::FullPtr<CreateTask> task, chi::RunContext &ctx) {
+chi::TaskResume Runtime::Create(hipc::FullPtr<CreateTask> task, chi::RunContext &ctx) {
   // Get the creation parameters using main allocator
   auto alloc = CHI_IPC->GetMainAlloc();
   CreateParams params = task->GetParams(alloc);
@@ -362,7 +362,7 @@ void Runtime::Create(hipc::FullPtr<CreateTask> task, chi::RunContext &ctx) {
       HLOG(kError, "Failed to open file: {}, fd: {}, errno: {}, strerror: {}",
            pool_name, file_fd_, errno, strerror(errno));
       task->return_code_ = 1;
-      return;
+      co_return;
     }
 
     // Get file size
@@ -371,7 +371,7 @@ void Runtime::Create(hipc::FullPtr<CreateTask> task, chi::RunContext &ctx) {
       task->return_code_ = 2;
       close(file_fd_);
       file_fd_ = -1;
-      return;
+      co_return;
     }
 
     file_size_ = st.st_size;
@@ -395,7 +395,7 @@ void Runtime::Create(hipc::FullPtr<CreateTask> task, chi::RunContext &ctx) {
              pool_name, errno, strerror(errno));
         close(file_fd_);
         file_fd_ = -1;
-        return;
+        co_return;
       }
       HLOG(kDebug, "ftruncate succeeded, file_size_={}", file_size_);
     }
@@ -416,14 +416,14 @@ void Runtime::Create(hipc::FullPtr<CreateTask> task, chi::RunContext &ctx) {
     if (params.total_size_ == 0) {
       // RAM backend requires explicit size
       task->return_code_ = 4;
-      return;
+      co_return;
     }
 
     ram_size_ = params.total_size_;
     ram_buffer_ = static_cast<char *>(malloc(ram_size_));
     if (ram_buffer_ == nullptr) {
       task->return_code_ = 5;
-      return;
+      co_return;
     }
 
     // Initialize RAM buffer to zero
@@ -452,9 +452,11 @@ void Runtime::Create(hipc::FullPtr<CreateTask> task, chi::RunContext &ctx) {
 
   // Set success result
   task->return_code_ = 0;
+  (void)ctx;
+  co_return;
 }
 
-void Runtime::AllocateBlocks(hipc::FullPtr<AllocateBlocksTask> task,
+chi::TaskResume Runtime::AllocateBlocks(hipc::FullPtr<AllocateBlocksTask> task,
                              chi::RunContext &ctx) {
   // Get worker ID for allocation
   int worker_id = static_cast<int>(GetWorkerID(ctx));
@@ -463,7 +465,7 @@ void Runtime::AllocateBlocks(hipc::FullPtr<AllocateBlocksTask> task,
   if (total_size == 0) {
     task->blocks_.clear();
     task->return_code_ = 0;  // Nothing to allocate
-    return;
+    co_return;
   }
 
   // Create local vector in private memory to build up the block list
@@ -525,7 +527,7 @@ void Runtime::AllocateBlocks(hipc::FullPtr<AllocateBlocksTask> task,
       task->blocks_.clear();
       HLOG(kError, "Out of space: {} bytes requested", total_size);
       task->return_code_ = 1;  // Out of space
-      return;
+      co_return;
     }
 
     // Check if we would exceed max_blocks limit
@@ -539,7 +541,7 @@ void Runtime::AllocateBlocks(hipc::FullPtr<AllocateBlocksTask> task,
            "Operation requires {} blocks but max_blocks_per_operation is {}",
            io_divisions.size(), max_blocks_per_operation_);
       task->return_code_ = 2;  // Too many blocks required
-      return;
+      co_return;
     }
 
     // Add the allocated block to the local vector
@@ -554,9 +556,11 @@ void Runtime::AllocateBlocks(hipc::FullPtr<AllocateBlocksTask> task,
   }
 
   task->return_code_ = 0;
+  (void)ctx;
+  co_return;
 }
 
-void Runtime::FreeBlocks(hipc::FullPtr<FreeBlocksTask> task,
+chi::TaskResume Runtime::FreeBlocks(hipc::FullPtr<FreeBlocksTask> task,
                          chi::RunContext &ctx) {
   // Get worker ID for free operation
   int worker_id = static_cast<int>(GetWorkerID(ctx));
@@ -569,9 +573,11 @@ void Runtime::FreeBlocks(hipc::FullPtr<FreeBlocksTask> task,
   }
 
   task->return_code_ = 0;
+  (void)ctx;
+  co_return;
 }
 
-void Runtime::Write(hipc::FullPtr<WriteTask> task, chi::RunContext &ctx) {
+chi::TaskResume Runtime::Write(hipc::FullPtr<WriteTask> task, chi::RunContext &ctx) {
   // Set I/O size in task stat for routing decisions
   task->stat_.io_size_ = task->length_;
 
@@ -587,9 +593,11 @@ void Runtime::Write(hipc::FullPtr<WriteTask> task, chi::RunContext &ctx) {
       task->bytes_written_ = 0;
       break;
   }
+  (void)ctx;
+  co_return;
 }
 
-void Runtime::Read(hipc::FullPtr<ReadTask> task, chi::RunContext &ctx) {
+chi::TaskResume Runtime::Read(hipc::FullPtr<ReadTask> task, chi::RunContext &ctx) {
   // Set I/O size in task stat for routing decisions
   task->stat_.io_size_ = task->length_;
 
@@ -605,9 +613,11 @@ void Runtime::Read(hipc::FullPtr<ReadTask> task, chi::RunContext &ctx) {
       task->bytes_read_ = 0;
       break;
   }
+  (void)ctx;
+  co_return;
 }
 
-void Runtime::GetStats(hipc::FullPtr<GetStatsTask> task, chi::RunContext &ctx) {
+chi::TaskResume Runtime::GetStats(hipc::FullPtr<GetStatsTask> task, chi::RunContext &ctx) {
   // Return the user-provided performance characteristics
   task->metrics_ = perf_metrics_;
   // Get remaining size from heap allocator
@@ -615,9 +625,11 @@ void Runtime::GetStats(hipc::FullPtr<GetStatsTask> task, chi::RunContext &ctx) {
   task->remaining_size_ = remaining;
   HLOG(kDebug, "GetStats: file_size_={}, remaining={}", file_size_, remaining);
   task->return_code_ = 0;
+  (void)ctx;
+  co_return;
 }
 
-void Runtime::Destroy(hipc::FullPtr<DestroyTask> task, chi::RunContext &ctx) {
+chi::TaskResume Runtime::Destroy(hipc::FullPtr<DestroyTask> task, chi::RunContext &ctx) {
   // Close file descriptor if open
   if (file_fd_ >= 0) {
     close(file_fd_);
@@ -627,6 +639,8 @@ void Runtime::Destroy(hipc::FullPtr<DestroyTask> task, chi::RunContext &ctx) {
   // Note: GlobalBlockMap and Heap cleanup is handled by their destructors
 
   task->return_code_ = 0;
+  (void)ctx;
+  co_return;
 }
 
 void Runtime::InitializeAllocator() {

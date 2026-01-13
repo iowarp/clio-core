@@ -11,6 +11,7 @@
  * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 
 #include "iowarp_engine.h"
+
 #include <stdexcept>
 #include <string>
 
@@ -26,9 +27,12 @@ namespace coeus {
 IowarpEngine::IowarpEngine(adios2::core::IO &io, const std::string &name,
                            const adios2::Mode mode, adios2::helper::Comm comm)
     : adios2::plugin::PluginEngineInterface(io, name, mode, std::move(comm)),
-      current_tag_(nullptr), current_step_(0),
-      rank_(m_Comm.Rank()), open_(false) {
+      current_tag_(nullptr),
+      current_step_(0),
+      rank_(m_Comm.Rank()),
+      open_(false) {
   // CTE client will be accessed via WRP_CTE_CLIENT singleton when needed
+  wrp_cte::core::WRP_CTE_CLIENT_INIT("", chi::PoolQuery::Local());
 }
 
 /**
@@ -68,8 +72,8 @@ void IowarpEngine::Init_() {
  */
 adios2::StepStatus IowarpEngine::BeginStep(adios2::StepMode mode,
                                            const float timeoutSeconds) {
-  (void)mode;           // Suppress unused parameter warning
-  (void)timeoutSeconds; // Suppress unused parameter warning
+  (void)mode;            // Suppress unused parameter warning
+  (void)timeoutSeconds;  // Suppress unused parameter warning
 
   // Lazy initialization if not already initialized
   if (!open_) {
@@ -117,7 +121,7 @@ size_t IowarpEngine::CurrentStep() const { return current_step_; }
  * @param transportIndex Transport index to close (-1 for all)
  */
 void IowarpEngine::DoClose(const int transportIndex) {
-  (void)transportIndex; // Suppress unused parameter warning
+  (void)transportIndex;  // Suppress unused parameter warning
 
   if (!open_) {
     return;
@@ -206,9 +210,8 @@ void IowarpEngine::DoPutDeferred_(const adios2::core::Variable<T> &variable,
 
   // Put blob asynchronously
   try {
-    auto task = current_tag_->AsyncPutBlob(blob_name,
-                                           buffer.shm_.template Cast<void>(),
-                                           data_size, 0, 1.0F);
+    auto task = current_tag_->AsyncPutBlob(
+        blob_name, buffer.shm_.template Cast<void>(), data_size, 0, 1.0F);
 
     // Store task and buffer in deferred_tasks_ vector
     // Buffer will be kept alive until EndStep processes the task
@@ -283,7 +286,7 @@ void IowarpEngine::DoGetDeferred_(const adios2::core::Variable<T> &variable,
   DoGetSync_(variable, values);
 }
 
-} // namespace coeus
+}  // namespace coeus
 
 /**
  * C wrapper to create engine
@@ -294,8 +297,7 @@ void IowarpEngine::DoGetDeferred_(const adios2::core::Variable<T> &variable,
  * @return Engine pointer
  */
 extern "C" {
-coeus::IowarpEngine *EngineCreate(adios2::core::IO &io,
-                                  const std::string &name,
+coeus::IowarpEngine *EngineCreate(adios2::core::IO &io, const std::string &name,
                                   const adios2::Mode mode,
                                   adios2::helper::Comm comm) {
   return new coeus::IowarpEngine(io, name, mode, std::move(comm));

@@ -33,7 +33,7 @@ namespace chimaera::admin {
 // Method implementations
 //===========================================================================
 
-void Runtime::Create(hipc::FullPtr<CreateTask> task, chi::RunContext &rctx) {
+chi::TaskResume Runtime::Create(hipc::FullPtr<CreateTask> task, chi::RunContext &rctx) {
   // Admin container creation logic (IS_ADMIN=true)
   HLOG(kDebug, "Admin: Initializing admin container");
 
@@ -55,11 +55,17 @@ void Runtime::Create(hipc::FullPtr<CreateTask> task, chi::RunContext &rctx) {
   // This task polls net_queue_ for send operations
   client_.AsyncSendPoll(chi::PoolQuery::Local(), 0, 25);
 
+  // Spawn periodic Heartbeat task with 5ms period
+  // This task polls for ZMQ heartbeat requests and responds
+  client_.AsyncHeartbeat(chi::PoolQuery::Local(), 5000);
+
   HLOG(kDebug,
        "Admin: Container created and initialized for pool: {} (ID: {}, count: "
        "{})",
        pool_name_, task->new_pool_id_, create_count_);
-  HLOG(kDebug, "Admin: Spawned periodic Recv and Send tasks with 25us period");
+  HLOG(kDebug, "Admin: Spawned periodic Recv, Send, and Heartbeat tasks");
+  (void)rctx;
+  co_return;
 }
 
 chi::TaskResume Runtime::GetOrCreatePool(
@@ -67,6 +73,10 @@ chi::TaskResume Runtime::GetOrCreatePool(
         chimaera::admin::GetOrCreatePoolTask<chimaera::admin::CreateParams>>
         task,
     chi::RunContext &rctx) {
+  // Debug: Log do_compose_ value
+  HLOG(kDebug, "Admin::GetOrCreatePool ENTRY: task->do_compose_={}, task->is_admin_={}",
+       task->do_compose_, task->is_admin_);
+
   // Get pool manager once - used by both dynamic scheduling and normal
   // execution
   auto *pool_manager = CHI_POOL_MANAGER;
@@ -187,7 +197,7 @@ chi::TaskResume Runtime::DestroyPool(hipc::FullPtr<DestroyPoolTask> task,
   co_return;
 }
 
-void Runtime::StopRuntime(hipc::FullPtr<StopRuntimeTask> task,
+chi::TaskResume Runtime::StopRuntime(hipc::FullPtr<StopRuntimeTask> task,
                           chi::RunContext &rctx) {
   HLOG(kDebug, "Admin: Executing StopRuntime task - Grace period: {}ms",
        task->grace_period_ms_);
@@ -210,12 +220,14 @@ void Runtime::StopRuntime(hipc::FullPtr<StopRuntimeTask> task,
 
   } catch (const std::exception &e) {
     task->return_code_ = 99;
-    auto alloc = CHI_IPC->GetMainAlloc();
+    auto *alloc = CHI_IPC->GetMainAlloc();
     std::string error_msg =
         std::string("Exception during runtime shutdown: ") + e.what();
     task->error_message_ = chi::priv::string(alloc, error_msg);
     HLOG(kError, "Admin: Runtime shutdown failed with exception: {}", e.what());
   }
+  (void)rctx;
+  co_return;
 }
 
 void Runtime::InitiateShutdown(chi::u32 grace_period_ms) {
@@ -512,7 +524,7 @@ void Runtime::SendOut(hipc::FullPtr<chi::Task> origin_task) {
  * Main Send function - periodic task that polls net_queue_ for send operations
  * Polls both SendIn (priority 0) and SendOut (priority 1) queues
  */
-void Runtime::Send(hipc::FullPtr<SendTask> task, chi::RunContext &rctx) {
+chi::TaskResume Runtime::Send(hipc::FullPtr<SendTask> task, chi::RunContext &rctx) {
   auto *ipc_manager = CHI_IPC;
   chi::Future<chi::Task> queued_future;
 
@@ -537,6 +549,7 @@ void Runtime::Send(hipc::FullPtr<SendTask> task, chi::RunContext &rctx) {
   }
 
   task->SetReturnCode(0);
+  co_return;
 }
 
 /**
@@ -782,16 +795,17 @@ void Runtime::RecvOut(hipc::FullPtr<RecvTask> task,
  * Main Recv function - receives metadata and dispatches based on mode
  * Note: This is a periodic task - only logs when actual work is done
  */
-void Runtime::Recv(hipc::FullPtr<RecvTask> task, chi::RunContext &rctx) {
+chi::TaskResume Runtime::Recv(hipc::FullPtr<RecvTask> task, chi::RunContext &rctx) {
   // Get the main server from CHI_IPC (already bound during initialization)
   auto *ipc_manager = CHI_IPC;
+
   hshm::lbm::Server *lbm_server = ipc_manager->GetMainServer();
-  if (!lbm_server) {
+  if (lbm_server == nullptr) {
     chi::Worker *worker = CHI_CUR_WORKER;
-    if (worker) {
+    if (worker != nullptr) {
       worker->SetTaskDidWork(false);
     }
-    return;
+    co_return;
   }
 
   // Note: No socket lock needed - single net worker processes all Recv tasks
@@ -802,11 +816,11 @@ void Runtime::Recv(hipc::FullPtr<RecvTask> task, chi::RunContext &rctx) {
   if (rc == EAGAIN) {
     // No message available - this is normal for polling, mark as no work done
     chi::Worker *worker = CHI_CUR_WORKER;
-    if (worker) {
+    if (worker != nullptr) {
       worker->SetTaskDidWork(false);
     }
     task->SetReturnCode(0);
-    return;
+    co_return;
   }
 
   if (rc != 0) {
@@ -815,7 +829,7 @@ void Runtime::Recv(hipc::FullPtr<RecvTask> task, chi::RunContext &rctx) {
            rc);
     }
     task->SetReturnCode(2);
-    return;
+    co_return;
   }
 
   // Dispatch based on message type
@@ -837,6 +851,40 @@ void Runtime::Recv(hipc::FullPtr<RecvTask> task, chi::RunContext &rctx) {
   }
 
   (void)rctx;
+  co_return;
+}
+
+/**
+ * Handle Heartbeat - Respond to heartbeat request
+ * Polls heartbeat server for ZMQ REQ/REP requests and responds
+ * Also sets task response to 0 to indicate runtime is healthy
+ * @param task The heartbeat task
+ * @param rctx Run context
+ */
+chi::TaskResume Runtime::Heartbeat(hipc::FullPtr<HeartbeatTask> task, chi::RunContext &rctx) {
+  auto *ipc_manager = CHI_IPC;
+
+  // Poll heartbeat socket - RECEIVE request and SEND response
+  // This ensures clients can verify the runtime is running
+  void *hb_socket = ipc_manager->GetHeartbeatSocket();
+  if (hb_socket != nullptr) {
+    // RECEIVE heartbeat request (non-blocking)
+    int32_t request;
+    int rc = zmq_recv(hb_socket, &request, sizeof(request), ZMQ_DONTWAIT);
+    if (rc != -1) {
+      // Received a heartbeat request - SEND response (0 = success)
+      int32_t response = 0;
+      zmq_send(hb_socket, &response, sizeof(response), 0);
+      HLOG(kDebug, "Heartbeat: received request {}, sent response {}",
+           request, response);
+    }
+  }
+
+  // Set task response to indicate runtime is healthy
+  task->response_ = 0;
+  task->SetReturnCode(0);
+  (void)rctx;
+  co_return;
 }
 
 chi::u64 Runtime::GetWorkRemaining() const {
