@@ -4,15 +4,6 @@
 
 cmake_minimum_required(VERSION 3.10)
 
-# Find ADIOS2
-find_package(ADIOS2 QUIET)
-if(NOT ADIOS2_FOUND)
-  message(WARNING "ADIOS2 not found. ADIOS2 adapter tests will not be built.")
-  return()
-endif()
-
-message(STATUS "Building ADIOS2 adapter tests")
-
 # Create the ADIOS2 adapter test executable
 add_executable(test_adios2_adapter
     test_adios2_adapter.cc
