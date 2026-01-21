@@ -458,11 +458,15 @@ chi::TaskResume Runtime::Create(hipc::FullPtr<CreateTask> task, chi::RunContext 
 
 chi::TaskResume Runtime::AllocateBlocks(hipc::FullPtr<AllocateBlocksTask> task,
                              chi::RunContext &ctx) {
+  HLOG(kDebug, "bdev::AllocateBlocks: ENTER - pool_id_=({},{}), size={}, container_id={}",
+       task->pool_id_.major_, task->pool_id_.minor_, task->size_, container_id_);
+
   // Get worker ID for allocation
   int worker_id = static_cast<int>(GetWorkerID(ctx));
 
   chi::u64 total_size = task->size_;
   if (total_size == 0) {
+    HLOG(kDebug, "bdev::AllocateBlocks: size is 0, returning empty blocks");
     task->blocks_.clear();
     task->return_code_ = 0;  // Nothing to allocate
     co_return;
@@ -554,6 +558,9 @@ chi::TaskResume Runtime::AllocateBlocks(hipc::FullPtr<AllocateBlocksTask> task,
   for (size_t i = 0; i < local_blocks.size(); i++) {
     task->blocks_.emplace_back(local_blocks[i]);
   }
+
+  HLOG(kDebug, "bdev::AllocateBlocks: SUCCESS - allocated {} blocks, task->blocks_.size()={}",
+       local_blocks.size(), task->blocks_.size());
 
   task->return_code_ = 0;
   (void)ctx;

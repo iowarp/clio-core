@@ -13,6 +13,7 @@
 #include "hermes_shm/data_structures/ipc/shm_container.h"
 #include "hermes_shm/data_structures/ipc/vector.h"
 #include "hermes_shm/memory/allocator/allocator.h"
+#include "hermes_shm/util/logging.h"
 
 // Include cereal for serialization
 #include <cereal/archives/binary.hpp>
@@ -31,6 +32,15 @@ class Task;
 class Container;
 class IpcManager;
 struct RunContext;
+class Worker;
+
+/**
+ * Get the current RunContext from thread-local Worker storage
+ * This function is implemented in worker.cc to avoid circular dependency
+ * between task.h and worker.h
+ * @return Pointer to current RunContext, or nullptr if not in a worker thread
+ */
+RunContext* GetCurrentRunContextFromWorker();
 
 /**
  * Task statistics for I/O and compute time tracking
@@ -404,6 +414,12 @@ class Future {
   /** Flag indicating if this Future owns the task and should destroy it */
   bool is_owner_;
 
+  /**
+   * Implementation of await_suspend
+   * Defined after RunContext to access its members
+   */
+  bool await_suspend_impl(std::coroutine_handle<> handle) noexcept;
+
  public:
   /**
    * Constructor with allocator - allocates new FutureShm
@@ -706,7 +722,9 @@ class Future {
    * If the task is already complete, the coroutine won't suspend.
    * @return True if task is complete, false if coroutine should suspend
    */
-  bool await_ready() const noexcept { return IsComplete(); }
+  bool await_ready() const noexcept {
+    return IsComplete();
+  }
 
   /**
    * Suspend the coroutine and register for resumption (coroutine await_suspend)
@@ -715,43 +733,31 @@ class Future {
    * handle in the RunContext so the worker can resume it when the task
    * completes. Also marks this Future as the owner of the task.
    *
-   * @tparam PromiseT The promise type of the calling coroutine
+   * Uses type-erased coroutine handle and gets RunContext from thread-local
+   * Worker storage rather than from the promise to ensure proper template
+   * instantiation.
+   *
    * @param handle The coroutine handle to resume when task completes
    * @return True to suspend, false to continue without suspending
    */
-  template <typename PromiseT>
-  bool await_suspend(std::coroutine_handle<PromiseT> handle) noexcept {
-    // Mark this Future as owner of the task (will be destroyed on Future
-    // destruction)
+  bool await_suspend(std::coroutine_handle<> handle) noexcept {
+    // Mark this Future as owner of the task
     is_owner_ = true;
-    auto* run_ctx = handle.promise().get_run_context();
-    HLOG(kDebug, "Future::await_suspend: run_ctx={}, handle={}", (void*)run_ctx,
-         (void*)handle.address());
-    if (!run_ctx) {
-      // No RunContext available, don't suspend
-      HLOG(kWarning, "Future::await_suspend: run_ctx is null, not suspending!");
-      return false;
-    }
-    // Store parent context for resumption tracking
-    SetParentTask(run_ctx);
-    // Store coroutine handle in RunContext for worker to resume
-    run_ctx->coro_handle_ = handle;
-    run_ctx->is_yielded_ = true;
-    run_ctx->yield_time_us_ = 0.0;
-    HLOG(kDebug, "Future::await_suspend: Set coro_handle_={} on run_ctx={}",
-         (void*)handle.address(), (void*)run_ctx);
-    return true;  // Suspend the coroutine
+
+    // Get RunContext via helper function (defined in worker.cc)
+    // This avoids needing RunContext to be complete at this point
+    return await_suspend_impl(handle);
   }
 
   /**
    * Get the result after resumption (coroutine await_resume)
    *
-   * Returns reference to this Future so caller can access the completed task.
+   * Returns void to avoid GCC 11 "statement has no effect" warning
+   * which causes the compiler to skip the await machinery entirely.
    * Marks this Future as the owner if not already set (for await_ready=true
    * case). Calls PostWait() on the task for post-completion actions.
-   * @return Reference to this Future
    */
-  Future<TaskT, AllocT>& await_resume() noexcept {
+  void await_resume() noexcept {
     // If await_ready returned true, await_suspend wasn't called, so set
     // ownership here
     is_owner_ = true;
@@ -759,7 +765,6 @@ class Future {
     if (!task_ptr_.IsNull()) {
       task_ptr_->PostWait();
     }
-    return *this;
   }
 };
 
@@ -948,6 +953,30 @@ struct RunContext {
     is_notified_.store(false);
   }
 };
+
+// ============================================================================
+// Future::await_suspend_impl implementation (must be after RunContext definition)
+// ============================================================================
+
+template <typename TaskT, typename AllocT>
+bool Future<TaskT, AllocT>::await_suspend_impl(std::coroutine_handle<> handle) noexcept {
+  // Get RunContext from the current worker's thread-local storage
+  // Uses helper function to avoid circular dependency with worker.h
+  RunContext* run_ctx = GetCurrentRunContextFromWorker();
+
+  if (!run_ctx) {
+    // No RunContext available, don't suspend
+    HLOG(kWarning, "Future::await_suspend: run_ctx is null, not suspending!");
+    return false;
+  }
+  // Store parent context for resumption tracking
+  SetParentTask(run_ctx);
+  // Store coroutine handle in RunContext for worker to resume
+  run_ctx->coro_handle_ = handle;
+  run_ctx->is_yielded_ = true;
+  run_ctx->yield_time_us_ = 0.0;
+  return true;  // Suspend the coroutine
+}
 
 // ============================================================================
 // TaskResume and YieldAwaiter (must be after RunContext for member access)

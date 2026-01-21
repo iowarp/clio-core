@@ -255,11 +255,17 @@ chi::TaskResume Runtime::RegisterTarget(hipc::FullPtr<RegisterTargetTask> task,
 
     // Create the bdev container using the client
     chi::PoolQuery pool_query = chi::PoolQuery::Dynamic();
+    HLOG(kDebug, "RegisterTarget: Creating bdev with custom_pool_id=({},{}), target_name={}",
+          bdev_pool_id.major_, bdev_pool_id.minor_, target_name);
     auto create_task = bdev_client.AsyncCreate(pool_query, target_name,
                                                 bdev_pool_id, bdev_type, total_size);
     co_await create_task;
+    HLOG(kDebug, "RegisterTarget: After create, create_task->new_pool_id_=({},{}), create_task->return_code_={}",
+          create_task->new_pool_id_.major_, create_task->new_pool_id_.minor_, create_task->return_code_.load());
     bdev_client.pool_id_ = create_task->new_pool_id_;
     bdev_client.return_code_ = create_task->return_code_;
+    HLOG(kDebug, "RegisterTarget: After assignment, bdev_client.pool_id_=({},{})",
+          bdev_client.pool_id_.major_, bdev_client.pool_id_.minor_);
 
     // Check if creation was successful
     if (bdev_client.return_code_ != 0) {
@@ -293,9 +299,13 @@ chi::TaskResume Runtime::RegisterTarget(hipc::FullPtr<RegisterTargetTask> task,
     auto *ipc_manager = CHI_IPC;
     auto *main_allocator = ipc_manager->GetMainAlloc();
     TargetInfo target_info(main_allocator);
+    HLOG(kDebug, "RegisterTarget: Before move, bdev_client.pool_id_=({},{})",
+          bdev_client.pool_id_.major_, bdev_client.pool_id_.minor_);
     target_info.target_name_ = target_name;
     target_info.bdev_pool_name_ = bdev_pool_name;
     target_info.bdev_client_ = std::move(bdev_client);
+    HLOG(kDebug, "RegisterTarget: After move, target_info.bdev_client_.pool_id_=({},{})",
+          target_info.bdev_client_.pool_id_.major_, target_info.bdev_client_.pool_id_.minor_);
     target_info.target_query_ =
         task->target_query_; // Store target query for bdev API calls
     target_info.bytes_read_ = 0;
@@ -1298,6 +1308,10 @@ chi::TaskResume Runtime::AllocateNewData(BlobInfo &blob_info, chi::u64 offset,
   registered_targets_.for_each(
       [&available_targets](const chi::PoolId &target_id,
                            const TargetInfo &target_info) {
+        HLOG(kDebug, "AllocateNewData: for_each - key=({},{}), value.bdev_client_.pool_id_=({},{}), remaining_space={}",
+              target_id.major_, target_id.minor_,
+              target_info.bdev_client_.pool_id_.major_, target_info.bdev_client_.pool_id_.minor_,
+              target_info.remaining_space_);
         available_targets.push_back(target_info);
       });
   HLOG(kDebug, "AllocateNewData: Ordered targets: {}",
@@ -1313,6 +1327,8 @@ chi::TaskResume Runtime::AllocateNewData(BlobInfo &blob_info, chi::u64 offset,
       DpeFactory::CreateDpe(config.dpe_.dpe_type_);
 
   // Select targets using DPE algorithm before allocation loop
+  HLOG(kDebug, "AllocateNewData: Before SelectTargets, available_targets[0].bdev_client_.pool_id_=({},{})",
+        available_targets[0].bdev_client_.pool_id_.major_, available_targets[0].bdev_client_.pool_id_.minor_);
   std::vector<TargetInfo> ordered_targets =
       dpe->SelectTargets(available_targets, blob_score, additional_size);
 
@@ -1320,6 +1336,9 @@ chi::TaskResume Runtime::AllocateNewData(BlobInfo &blob_info, chi::u64 offset,
     error_code = 2;
     co_return;
   }
+
+  HLOG(kDebug, "AllocateNewData: After SelectTargets, ordered_targets[0].bdev_client_.pool_id_=({},{})",
+        ordered_targets[0].bdev_client_.pool_id_.major_, ordered_targets[0].bdev_client_.pool_id_.minor_);
 
   // Use for loop to iterate over pre-selected targets in order
   chi::u64 remaining_to_allocate = additional_size;
@@ -1329,7 +1348,13 @@ chi::TaskResume Runtime::AllocateNewData(BlobInfo &blob_info, chi::u64 offset,
       break;
     }
 
+    HLOG(kDebug, "AllocateNewData: In loop, selected_target_info.bdev_client_.pool_id_=({},{}), name={}",
+          selected_target_info.bdev_client_.pool_id_.major_,
+          selected_target_info.bdev_client_.pool_id_.minor_,
+          selected_target_info.target_name_);
     chi::PoolId selected_target_id = selected_target_info.bdev_client_.pool_id_;
+    HLOG(kDebug, "AllocateNewData: After copy, selected_target_id=({},{}) ToU64={}",
+          selected_target_id.major_, selected_target_id.minor_, selected_target_id.ToU64());
 
     // Find the selected target info for allocation using TargetId
     TargetInfo *target_info = registered_targets_.find(selected_target_id);
@@ -1612,17 +1637,34 @@ chi::TaskResume Runtime::ReadData(const std::vector<BlobBlock> &blocks,
 
 chi::TaskResume Runtime::AllocateFromTarget(TargetInfo &target_info, chi::u64 size,
                                             chi::u64 &allocated_offset, bool &success) {
+  HLOG(kDebug, "AllocateFromTarget: ENTER - target_name={}, bdev_client_.pool_id_=({},{}), size={}, remaining_space={}",
+       target_info.target_name_,
+       target_info.bdev_client_.pool_id_.major_, target_info.bdev_client_.pool_id_.minor_,
+       size, target_info.remaining_space_);
+
   // Check if target has sufficient space
   if (target_info.remaining_space_ < size) {
+    HLOG(kDebug, "AllocateFromTarget: Insufficient space - remaining={} < size={}",
+         target_info.remaining_space_, size);
     success = false;
     co_return;
   }
 
   try {
+    HLOG(kDebug, "AllocateFromTarget: Calling AsyncAllocateBlocks with pool_id_=({},{})",
+         target_info.bdev_client_.pool_id_.major_, target_info.bdev_client_.pool_id_.minor_);
+
     // Use bdev client AsyncAllocateBlocks method to get actual offset
     auto alloc_task = target_info.bdev_client_.AsyncAllocateBlocks(
         target_info.target_query_, size);
+
+    HLOG(kDebug, "AllocateFromTarget: AsyncAllocateBlocks returned, IsComplete()={}, co_awaiting...",
+         alloc_task.IsComplete() ? "true" : "false");
+
     co_await alloc_task;
+
+    HLOG(kDebug, "AllocateFromTarget: co_await complete, alloc_task->blocks_.size()={}, return_code={}",
+         alloc_task->blocks_.size(), alloc_task->return_code_.load());
 
     std::vector<chimaera::bdev::Block> allocated_blocks;
     for (size_t i = 0; i < alloc_task->blocks_.size(); ++i) {
@@ -1631,6 +1673,7 @@ chi::TaskResume Runtime::AllocateFromTarget(TargetInfo &target_info, chi::u64 si
 
     // Check if we got any blocks
     if (allocated_blocks.empty()) {
+      HLOG(kDebug, "AllocateFromTarget: FAILED - allocated_blocks is empty");
       success = false;
       co_return;
     }
@@ -2077,3 +2120,9 @@ chi::PoolQuery Runtime::HashBlobToContainer(const TagId &tag_id,
 
 // Define ChiMod entry points using CHI_TASK_CC macro
 CHI_TASK_CC(wrp_cte::core::Runtime)
+
+// Explicit template instantiation to force generation of Future::await_suspend_impl
+// This is needed because the C++20 coroutine machinery may not be instantiating
+// the template method automatically
+template bool chi::Future<chimaera::bdev::AllocateBlocksTask, CHI_MAIN_ALLOC_T>::await_suspend_impl(
+    std::coroutine_handle<> handle) noexcept;

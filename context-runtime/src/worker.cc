@@ -1489,4 +1489,12 @@ void Worker::ReschedulePeriodicTask(RunContext *run_ctx,
   AddToBlockedQueue(run_ctx);
 }
 
+RunContext* GetCurrentRunContextFromWorker() {
+  Worker* worker = CHI_CUR_WORKER;
+  if (worker) {
+    return worker->GetCurrentRunContext();
+  }
+  return nullptr;
+}
+
 }  // namespace chi

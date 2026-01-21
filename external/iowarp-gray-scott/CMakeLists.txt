@@ -14,7 +14,9 @@ option(ENABLE_VTK "Build VTK visualization apps" OFF)
 
 # Find required packages
 find_package(MPI REQUIRED)
-find_package(ADIOS2 REQUIRED)
+if(NOT ADIOS2_FOUND)
+  find_package(ADIOS2 REQUIRED)
+endif()
 
 # Configuration messages
 message(STATUS "========================================")

@@ -4,6 +4,17 @@
 
 cmake_minimum_required(VERSION 3.10)
 
+# Find ADIOS2 (only if not already found)
+if(NOT ADIOS2_FOUND)
+  find_package(ADIOS2 QUIET)
+  if(NOT ADIOS2_FOUND)
+    message(WARNING "ADIOS2 not found. ADIOS2 adapter tests will not be built.")
+    return()
+  endif()
+endif()
+
+message(STATUS "Building ADIOS2 adapter tests")
+
 # Create the ADIOS2 adapter test executable
 add_executable(test_adios2_adapter
     test_adios2_adapter.cc
@@ -64,6 +75,18 @@ add_test(NAME adios2_adapter_integration
 
 # Set test properties for proper execution environment
 # Use CMAKE_CURRENT_SOURCE_DIR to get the path to cte_config.yaml
+# Get conda lib path from environment or CMAKE_PREFIX_PATH
+set(CONDA_LIB_PATH "")
+if(DEFINED ENV{CONDA_PREFIX})
+    set(CONDA_LIB_PATH "$ENV{CONDA_PREFIX}/lib")
+elseif(CMAKE_PREFIX_PATH)
+    # Extract first entry as likely conda path
+    list(GET CMAKE_PREFIX_PATH 0 FIRST_PREFIX)
+    if(EXISTS "${FIRST_PREFIX}/lib")
+        set(CONDA_LIB_PATH "${FIRST_PREFIX}/lib")
+    endif()
+endif()
+
 set_tests_properties(
     adios2_adapter_init
     adios2_adapter_step
@@ -78,7 +101,7 @@ set_tests_properties(
     PROPERTIES
         TIMEOUT 300  # 5 minute timeout for each test
         LABELS "unit;adapter;adios2"
-        ENVIRONMENT "ADIOS2_PLUGIN_PATH=${CMAKE_BINARY_DIR}/bin;CHIMAERA_WITH_RUNTIME=1;WRP_RUNTIME_CONF=${CMAKE_CURRENT_SOURCE_DIR}/cte_config.yaml;LD_LIBRARY_PATH=/home/iowarp/miniconda3/lib:$ENV{LD_LIBRARY_PATH}"
+        ENVIRONMENT "ADIOS2_PLUGIN_PATH=${CMAKE_BINARY_DIR}/bin;CHIMAERA_WITH_RUNTIME=1;WRP_RUNTIME_CONF=${CMAKE_CURRENT_SOURCE_DIR}/cte_config.yaml;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:${CONDA_LIB_PATH}:$ENV{LD_LIBRARY_PATH}"
 )
 
 # Install test target

@@ -1,3 +1,18 @@
+# Find ADIOS2 (only if not already found)
+if(NOT ADIOS2_FOUND)
+  find_package(ADIOS2 QUIET)
+  if(NOT ADIOS2_FOUND)
+    message(WARNING "ADIOS2 not found. ADIOS2 adapter will not be built.")
+    message(STATUS "To install ADIOS2: conda install adios2 or build from source")
+    return()
+  endif()
+endif()
+
+message(STATUS "Found ADIOS2")
+if(ADIOS2_CONFIG)
+  message(STATUS "ADIOS2 config: ${ADIOS2_CONFIG}")
+endif()
+
 # Find MPI (optional for ADIOS2 adapter)
 find_package(MPI QUIET COMPONENTS CXX)
 if(NOT MPI_CXX_FOUND)

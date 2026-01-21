@@ -6,7 +6,18 @@
 set -e  # Exit on error
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TEST_BINARY="/workspace/build/bin/test_mixed_mapping"
+# Find test binary relative to script location (script is in source tree, binary in build tree)
+# The binary is at: ${BUILD_DIR}/bin/test_mixed_mapping
+# We determine BUILD_DIR from CMAKE_BINARY_DIR which is passed via environment or derived
+if [ -n "$CMAKE_BINARY_DIR" ]; then
+    TEST_BINARY="$CMAKE_BINARY_DIR/bin/test_mixed_mapping"
+else
+    # Default: look for build directory relative to source root
+    # Script is at: core/context-transport-primitives/test/unit/introspect/
+    # So source root is 4 directories up
+    SOURCE_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
+    TEST_BINARY="$SOURCE_ROOT/build/bin/test_mixed_mapping"
+fi
 
 echo "========================================"
 echo "Mixed Mapping Test Script"
