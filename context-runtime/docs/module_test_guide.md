@@ -98,18 +98,17 @@ public:
 
   // Utility method for async task completion
   template<typename TaskT>
-  bool waitForTaskCompletion(hipc::FullPtr<TaskT> task, chi::u32 timeout_ms = 5000) {
-    if (task.IsNull()) return false;
-    
+  bool waitForTaskCompletion(chi::Future<TaskT>& task, chi::u32 timeout_ms = 5000) {
     auto start_time = std::chrono::steady_clock::now();
     auto timeout_duration = std::chrono::milliseconds(timeout_ms);
-    
-    while (task->is_complete_.load() == 0) {
+
+    // Wait for completion with timeout
+    while (!task.IsComplete()) {
       auto current_time = std::chrono::steady_clock::now();
       if (current_time - start_time > timeout_duration) {
         return false; // Timeout
       }
-      task->Yield(); // Efficient waiting using task's yield mechanism
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     return true;
   }
@@ -186,23 +185,16 @@ TEST_CASE("ChiMod Complete Workflow", "[workflow]") {
     // Step 1: Create admin pool
     chimaera::admin::Client admin_client(chi::kAdminPoolId);
     chi::PoolQuery pool_query = chi::PoolQuery::Local();
-    admin_client.Create(HSHM_MCTX, pool_query);
+    admin_client.Create(pool_query, "admin", chi::kAdminPoolId);
     std::this_thread::sleep_for(100ms);
 
-    // Step 2: Create ChiMod pool via admin
-    chimaera::your_module::CreateParams params;
-    params.config_data_ = "test_config";
-    params.worker_count_ = 2;
-
-    auto create_task = admin_client.AsyncGetOrCreatePool<chimaera::your_module::CreateParams>(
-        HSHM_MCTX, pool_query, kTestPoolId, params);
-    
-    REQUIRE(fixture.waitForTaskCompletion(create_task));
-
-    // Step 3: Initialize ChiMod client
+    // Step 2: Initialize ChiMod client and create pool
     chimaera::your_module::Client module_client(kTestPoolId);
-    module_client.Create(HSHM_MCTX, pool_query);
+    module_client.Create(pool_query, "test_module", kTestPoolId);
     std::this_thread::sleep_for(100ms);
+
+    // Verify creation succeeded
+    REQUIRE(module_client.GetReturnCode() == 0);
   }
 
   SECTION("Test synchronous operations") {
@@ -210,7 +202,7 @@ TEST_CASE("ChiMod Complete Workflow", "[workflow]") {
     
     std::string input = "test_data";
     std::string output;
-    chi::u32 result = module_client.ProcessData(HSHM_MCTX, pool_query, input, output);
+    chi::u32 result = module_client.ProcessData(pool_query, input, output);
     
     REQUIRE(result == 0);
     REQUIRE_FALSE(output.empty());
@@ -219,37 +211,33 @@ TEST_CASE("ChiMod Complete Workflow", "[workflow]") {
 
   SECTION("Test asynchronous operations") {
     chimaera::your_module::Client module_client(kTestPoolId);
-    
-    auto task = module_client.AsyncProcessData(HSHM_MCTX, pool_query, "async_test");
-    REQUIRE_FALSE(task.IsNull());
-    
-    REQUIRE(fixture.waitForTaskCompletion(task, kTestTimeoutMs));
+
+    auto task = module_client.AsyncProcessData(pool_query, "async_test");
+
+    // Wait for task completion
+    task.Wait();
     REQUIRE(task->result_code_ == 0);
-    
+
     std::string output = task->output_data_.str();
     REQUIRE_FALSE(output.empty());
     INFO("Async operation result: " << output);
-    
   }
 
   SECTION("Error handling and edge cases") {
     // Test invalid pool ID
-    constexpr chi::PoolId kInvalidPoolId = 9999;
+    constexpr chi::PoolId kInvalidPoolId = chi::PoolId(9999, 0);
     chimaera::your_module::Client invalid_client(kInvalidPoolId);
-    
-    // Should not crash
-    REQUIRE_NOTHROW(invalid_client.Create(HSHM_MCTX, pool_query));
-    
+
+    // Should not crash, but may fail
+    REQUIRE_NOTHROW(invalid_client.Create(pool_query, "invalid_pool", kInvalidPoolId));
+
     // Test task timeout
     chimaera::your_module::Client module_client(kTestPoolId);
-    auto task = module_client.AsyncProcessData(HSHM_MCTX, pool_query, "timeout_test");
-    
+    auto task = module_client.AsyncProcessData(pool_query, "timeout_test");
+
     // Test with very short timeout
     bool completed = fixture.waitForTaskCompletion(task, 50); // 50ms timeout
     INFO("Task completed within short timeout: " << completed);
-    
-    if (!task.IsNull()) {
-    }
   }
 }
 
@@ -322,18 +310,33 @@ cmake --build build
 
 ### Common Patterns
 
-**Resource Cleanup Pattern:**
+**Async Task Pattern:**
 ```cpp
-class ResourceGuard {
-public:
-  ResourceGuard(hipc::FullPtr<TaskType> task) : task_(task) {}
-private:
-  hipc::FullPtr<TaskType> task_;
-};
+// Submit async task and wait for completion
+auto task = client.AsyncOperation(pool_query, params);
+task.Wait();
 
-// Usage
-auto task = client.AsyncOperation(...);
-ResourceGuard guard(task); // Automatic cleanup on scope exit
+// Check result
+if (task->result_code_ == 0) {
+  // Success - access output
+  std::string output = task->output_data_.str();
+}
+```
+
+**Multiple Parallel Tasks:**
+```cpp
+std::vector<chi::Future<TaskType>> tasks;
+
+// Submit multiple tasks
+for (int i = 0; i < num_tasks; ++i) {
+  tasks.push_back(client.AsyncOperation(pool_query, params));
+}
+
+// Wait for all tasks
+for (auto& task : tasks) {
+  task.Wait();
+  REQUIRE(task->result_code_ == 0);
+}
 ```
 
 This testing approach ensures your ChiMod is validated across key operational scenarios while maintaining focus on essential setup and workflow patterns.

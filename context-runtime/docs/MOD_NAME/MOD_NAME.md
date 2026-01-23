@@ -9,7 +9,7 @@ The MOD_NAME ChiMod serves as a template and example module for developing custo
 - Custom operation support with configurable parameters
 - CoMutex (Coroutine Mutex) testing and validation
 - CoRwLock (Coroutine Reader-Writer Lock) testing
-- Fire-and-forget task pattern demonstration
+- Recursive task.Wait() testing functionality
 - Configurable worker count and operation parameters
 
 ## CMake Integration
@@ -59,16 +59,21 @@ explicit Client(const chi::PoolId& pool_id)
 
 #### Container Management
 
-##### `Create()` - Synchronous
-Creates and initializes the MOD_NAME container.
+##### `AsyncCreate()`
+Creates and initializes the MOD_NAME container asynchronously.
 
 ```cpp
-void Create(const hipc::MemContext& mctx, const chi::PoolQuery& pool_query)
+chi::Future<CreateTask> AsyncCreate(const chi::PoolQuery& pool_query,
+                                    const std::string& pool_name,
+                                    const chi::PoolId& custom_pool_id)
 ```
 
 **Parameters:**
-- `mctx`: Memory context for task allocation
 - `pool_query`: Pool domain query (typically `chi::PoolQuery::Local()`)
+- `pool_name`: Name for the pool
+- `custom_pool_id`: Explicit pool ID for the container
+
+**Returns:** Future for asynchronous completion checking
 
 **Usage:**
 ```cpp
@@ -77,161 +82,119 @@ const chi::PoolId pool_id = chi::PoolId(9000, 0);
 chimaera::MOD_NAME::Client mod_client(pool_id);
 
 auto pool_query = chi::PoolQuery::Local();
-mod_client.Create(HSHM_MCTX, pool_query);
+auto create_task = mod_client.AsyncCreate(pool_query, "my_mod_name", pool_id);
+create_task.Wait();
+
+if (create_task->GetReturnCode() != 0) {
+  std::cerr << "MOD_NAME creation failed" << std::endl;
+  return;
+}
 ```
-
-##### `AsyncCreate()` - Asynchronous
-Creates and initializes the MOD_NAME container asynchronously.
-
-```cpp
-hipc::FullPtr<CreateTask> AsyncCreate(const hipc::MemContext& mctx,
-                                     const chi::PoolQuery& pool_query)
-```
-
-**Returns:** Task pointer for asynchronous completion checking
 
 #### Custom Operations
 
-##### `Custom()` - Synchronous
-Executes a custom operation with configurable parameters.
+##### `AsyncCustom()`
+Executes a custom operation with configurable parameters asynchronously.
 
 ```cpp
-chi::u32 Custom(const hipc::MemContext& mctx,
-               const chi::PoolQuery& pool_query,
-               const std::string& input_data, chi::u32 operation_id,
-               std::string& output_data)
+chi::Future<CustomTask> AsyncCustom(const chi::PoolQuery& pool_query,
+                                    const std::string& input_data,
+                                    chi::u32 operation_id)
 ```
 
 **Parameters:**
-- `mctx`: Memory context for task allocation
 - `pool_query`: Pool domain query
 - `input_data`: Input data string for the operation
 - `operation_id`: Identifier for the type of operation to perform
-- `output_data`: Output parameter to receive processed data
 
-**Returns:** Result code (0 = success, non-zero = error)
+**Returns:** Future for asynchronous completion checking. Access output data via `task->data_` after calling `Wait()`.
 
 **Usage:**
 ```cpp
 std::string input = "test data for processing";
-std::string output;
-chi::u32 result = mod_client.Custom(HSHM_MCTX, pool_query, input, 1, output);
+auto custom_task = mod_client.AsyncCustom(pool_query, input, 1);
+custom_task.Wait();
 
-if (result == 0) {
-  std::cout << "Custom operation succeeded. Output: " << output << std::endl;
+if (custom_task->result_code_ == 0) {
+  std::cout << "Custom operation succeeded. Output: " << custom_task->data_.str() << std::endl;
 } else {
-  std::cout << "Custom operation failed with code: " << result << std::endl;
+  std::cout << "Custom operation failed with code: " << custom_task->result_code_ << std::endl;
 }
-```
-
-##### `AsyncCustom()` - Asynchronous
-Executes a custom operation asynchronously.
-
-```cpp
-hipc::FullPtr<CustomTask> AsyncCustom(const hipc::MemContext& mctx,
-                                     const chi::PoolQuery& pool_query,
-                                     const std::string& input_data,
-                                     chi::u32 operation_id)
 ```
 
 #### Concurrency Testing Operations
 
-##### `CoMutexTest()` - Synchronous
-Tests CoMutex (Coroutine Mutex) functionality.
+##### `AsyncCoMutexTest()`
+Tests CoMutex (Coroutine Mutex) functionality asynchronously.
 
 ```cpp
-chi::u32 CoMutexTest(const hipc::MemContext& mctx,
-                    const chi::PoolQuery& pool_query, chi::u32 test_id,
-                    chi::u32 hold_duration_ms)
+chi::Future<CoMutexTestTask> AsyncCoMutexTest(
+    const chi::PoolQuery& pool_query,
+    chi::u32 test_id, chi::u32 hold_duration_ms)
 ```
 
 **Parameters:**
-- `mctx`: Memory context for task allocation
 - `pool_query`: Pool domain query
 - `test_id`: Identifier for the test instance
 - `hold_duration_ms`: Duration to hold the mutex lock in milliseconds
 
-**Returns:** Test result code
+**Returns:** Future for asynchronous completion checking
 
 **Usage:**
 ```cpp
 // Test CoMutex with 1 second hold duration
-chi::u32 result = mod_client.CoMutexTest(HSHM_MCTX, pool_query, 1, 1000);
-std::cout << "CoMutex test result: " << result << std::endl;
+auto mutex_task = mod_client.AsyncCoMutexTest(pool_query, 1, 1000);
+mutex_task.Wait();
+std::cout << "CoMutex test result: " << mutex_task->result_ << std::endl;
 ```
 
-##### `AsyncCoMutexTest()` - Asynchronous
-```cpp
-hipc::FullPtr<CoMutexTestTask> AsyncCoMutexTest(
-    const hipc::MemContext& mctx, const chi::PoolQuery& pool_query,
-    chi::u32 test_id, chi::u32 hold_duration_ms)
-```
-
-##### `CoRwLockTest()` - Synchronous
-Tests CoRwLock (Coroutine Reader-Writer Lock) functionality.
+##### `AsyncCoRwLockTest()`
+Tests CoRwLock (Coroutine Reader-Writer Lock) functionality asynchronously.
 
 ```cpp
-chi::u32 CoRwLockTest(const hipc::MemContext& mctx,
-                     const chi::PoolQuery& pool_query, chi::u32 test_id,
-                     bool is_writer, chi::u32 hold_duration_ms)
+chi::Future<CoRwLockTestTask> AsyncCoRwLockTest(
+    const chi::PoolQuery& pool_query,
+    chi::u32 test_id, bool is_writer, chi::u32 hold_duration_ms)
 ```
 
 **Parameters:**
-- `mctx`: Memory context for task allocation
 - `pool_query`: Pool domain query
 - `test_id`: Identifier for the test instance
 - `is_writer`: True for write lock test, false for read lock test
 - `hold_duration_ms`: Duration to hold the lock in milliseconds
 
-**Returns:** Test result code
+**Returns:** Future for asynchronous completion checking
 
 **Usage:**
 ```cpp
 // Test read lock
-chi::u32 read_result = mod_client.CoRwLockTest(HSHM_MCTX, pool_query, 1, false, 500);
+auto read_task = mod_client.AsyncCoRwLockTest(pool_query, 1, false, 500);
+read_task.Wait();
 
-// Test write lock  
-chi::u32 write_result = mod_client.CoRwLockTest(HSHM_MCTX, pool_query, 2, true, 500);
+// Test write lock
+auto write_task = mod_client.AsyncCoRwLockTest(pool_query, 2, true, 500);
+write_task.Wait();
 
-std::cout << "Read lock test result: " << read_result << std::endl;
-std::cout << "Write lock test result: " << write_result << std::endl;
+std::cout << "Read lock test result: " << read_task->result_ << std::endl;
+std::cout << "Write lock test result: " << write_task->result_ << std::endl;
 ```
 
-##### `AsyncCoRwLockTest()` - Asynchronous
-```cpp
-hipc::FullPtr<CoRwLockTestTask> AsyncCoRwLockTest(
-    const hipc::MemContext& mctx, const chi::PoolQuery& pool_query,
-    chi::u32 test_id, bool is_writer, chi::u32 hold_duration_ms)
-```
-
-#### Fire-and-Forget Operations
-
-##### `FireAndForgetTest()` - Fire-and-Forget
-Submits a fire-and-forget task that will be automatically deleted after completion.
+##### `AsyncWaitTest()`
+Tests recursive task.Wait() functionality with specified depth.
 
 ```cpp
-void FireAndForgetTest(const hipc::MemContext& mctx,
-                      const chi::PoolQuery& pool_query, 
-                      chi::u32 test_id,
-                      chi::u32 processing_time_ms,
-                      const std::string& log_message)
+chi::Future<WaitTestTask> AsyncWaitTest(const chi::PoolQuery& pool_query,
+                                        chi::u32 depth,
+                                        chi::u32 test_id)
 ```
 
 **Parameters:**
-- `mctx`: Memory context for task allocation
-- `pool_query`: Pool domain query
-- `test_id`: Identifier for the test instance
-- `processing_time_ms`: Duration to simulate processing in milliseconds
-- `log_message`: Message to log during task execution
+- `pool_query`: Pool routing information
+- `depth`: Number of recursive calls to make
+- `test_id`: Test identifier for tracking
 
-**Usage:**
-```cpp
-// Submit fire-and-forget task (no return value, automatically cleaned up)
-mod_client.FireAndForgetTest(HSHM_MCTX, pool_query, 1, 2000, "Test message");
-std::cout << "Fire-and-forget task submitted" << std::endl;
-```
+**Returns:** Future for asynchronous completion checking
 
-**Important:** This method does not return a task pointer as the task is automatically deleted upon completion. No manual cleanup is required.
 
 ## Task Types
 
@@ -268,18 +231,13 @@ Task for testing CoRwLock functionality.
 - `hold_duration_ms_`: Duration to hold lock in milliseconds (IN)
 - `result_`: Test result code (OUT)
 
-### FireAndForgetTestTask
-Task for testing fire-and-forget pattern.
+### WaitTestTask
+Task for testing recursive task.Wait() functionality.
 
 **Key Fields:**
-- `test_id_`: Test instance identifier (IN)
-- `processing_time_ms_`: Processing duration in milliseconds (IN)
-- `log_message_`: Message to log during execution (IN)
-
-**Special Properties:**
-- Automatically flagged with `TASK_FIRE_AND_FORGET`
-- No output parameters (automatically deleted after completion)
-- No manual cleanup required
+- `depth_`: Number of recursive calls to make (IN)
+- `test_id_`: Test identifier for tracking (IN)
+- `result_`: Test result code (OUT)
 
 ### DestroyTask
 Standard destruction task (alias for `chimaera::admin::DestroyTask`).
@@ -314,40 +272,40 @@ struct CreateParams {
 #include <chimaera/admin/admin_client.h>
 
 int main() {
-  try {
-    // Initialize Chimaera client
-    chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
-    
-    // Create admin client first (always required)
-    const chi::PoolId admin_pool_id = chi::PoolId(7000, 0);
-    chimaera::admin::Client admin_client(admin_pool_id);
-    admin_client.Create(HSHM_MCTX, chi::PoolQuery::Local());
-    
-    // Create MOD_NAME client
-    const chi::PoolId mod_pool_id = chi::PoolId(9000, 0);
-    chimaera::MOD_NAME::Client mod_client(mod_pool_id);
-    
-    // Initialize MOD_NAME container
-    mod_client.Create(HSHM_MCTX, chi::PoolQuery::Local());
-    
-    // Test custom operations
-    std::string input_data = "Hello, Chimaera!";
-    std::string output_data;
-    chi::u32 result = mod_client.Custom(HSHM_MCTX, chi::PoolQuery::Local(), 
-                                       input_data, 1, output_data);
-    
-    if (result == 0) {
-      std::cout << "Custom operation successful!" << std::endl;
-      std::cout << "Input: " << input_data << std::endl;
-      std::cout << "Output: " << output_data << std::endl;
-    }
-    
-    return 0;
-    
-  } catch (const std::exception& e) {
-    std::cerr << "Error: " << e.what() << std::endl;
+  // Initialize Chimaera client
+  chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
+
+  // Create admin client first (always required)
+  const chi::PoolId admin_pool_id = chi::kAdminPoolId;
+  chimaera::admin::Client admin_client(admin_pool_id);
+  auto admin_task = admin_client.AsyncCreate(chi::PoolQuery::Local(), "admin", admin_pool_id);
+  admin_task.Wait();
+
+  // Create MOD_NAME client
+  const chi::PoolId mod_pool_id = chi::PoolId(9000, 0);
+  chimaera::MOD_NAME::Client mod_client(mod_pool_id);
+
+  // Initialize MOD_NAME container
+  auto create_task = mod_client.AsyncCreate(chi::PoolQuery::Local(), "my_mod_name", mod_pool_id);
+  create_task.Wait();
+
+  if (create_task->GetReturnCode() != 0) {
+    std::cerr << "MOD_NAME creation failed" << std::endl;
     return 1;
   }
+
+  // Test custom operations
+  std::string input_data = "Hello, Chimaera!";
+  auto custom_task = mod_client.AsyncCustom(chi::PoolQuery::Local(), input_data, 1);
+  custom_task.Wait();
+
+  if (custom_task->result_code_ == 0) {
+    std::cout << "Custom operation successful!" << std::endl;
+    std::cout << "Input: " << input_data << std::endl;
+    std::cout << "Output: " << custom_task->data_.str() << std::endl;
+  }
+
+  return 0;
 }
 ```
 
@@ -356,9 +314,9 @@ int main() {
 // Test CoMutex functionality
 std::cout << "Testing CoMutex..." << std::endl;
 for (int i = 0; i < 5; ++i) {
-  chi::u32 result = mod_client.CoMutexTest(HSHM_MCTX, chi::PoolQuery::Local(), 
-                                          i, 100);  // 100ms hold
-  std::cout << "CoMutex test " << i << " result: " << result << std::endl;
+  auto mutex_task = mod_client.AsyncCoMutexTest(chi::PoolQuery::Local(), i, 100);  // 100ms hold
+  mutex_task.Wait();
+  std::cout << "CoMutex test " << i << " result: " << mutex_task->result_ << std::endl;
 }
 
 // Test CoRwLock functionality
@@ -366,56 +324,37 @@ std::cout << "Testing CoRwLock..." << std::endl;
 
 // Test multiple readers (should allow concurrency)
 for (int i = 0; i < 3; ++i) {
-  chi::u32 result = mod_client.CoRwLockTest(HSHM_MCTX, chi::PoolQuery::Local(), 
-                                           i, false, 200);  // Read lock, 200ms
-  std::cout << "Read lock test " << i << " result: " << result << std::endl;
+  auto read_task = mod_client.AsyncCoRwLockTest(chi::PoolQuery::Local(), i, false, 200);  // Read lock, 200ms
+  read_task.Wait();
+  std::cout << "Read lock test " << i << " result: " << read_task->result_ << std::endl;
 }
 
 // Test exclusive writer (should serialize with other operations)
-chi::u32 write_result = mod_client.CoRwLockTest(HSHM_MCTX, chi::PoolQuery::Local(), 
-                                               100, true, 300);  // Write lock, 300ms
-std::cout << "Write lock test result: " << write_result << std::endl;
-```
-
-### Fire-and-Forget Pattern
-```cpp
-// Submit multiple fire-and-forget tasks
-std::cout << "Submitting fire-and-forget tasks..." << std::endl;
-
-for (int i = 0; i < 10; ++i) {
-  std::string message = "Fire-and-forget task #" + std::to_string(i);
-  mod_client.FireAndForgetTest(HSHM_MCTX, chi::PoolQuery::Local(), 
-                              i, 500, message);  // 500ms processing
-}
-
-std::cout << "All fire-and-forget tasks submitted (will complete automatically)" << std::endl;
-
-// No need to wait or clean up - tasks handle themselves
-// This is useful for logging, metrics, or background processing tasks
+auto write_task = mod_client.AsyncCoRwLockTest(chi::PoolQuery::Local(), 100, true, 300);  // Write lock, 300ms
+write_task.Wait();
+std::cout << "Write lock test result: " << write_task->result_ << std::endl;
 ```
 
 ### Asynchronous Operations
 ```cpp
 // Example of using asynchronous operations for parallel execution
-std::vector<hipc::FullPtr<CustomTask>> tasks;
+std::vector<chi::Future<CustomTask>> tasks;
 
 // Submit multiple async operations
 for (int i = 0; i < 5; ++i) {
   std::string input = "Async operation " + std::to_string(i);
-  auto task = mod_client.AsyncCustom(HSHM_MCTX, chi::PoolQuery::Local(), 
+  auto task = mod_client.AsyncCustom(chi::PoolQuery::Local(),
                                     input, i);
-  tasks.push_back(task);
+  tasks.push_back(std::move(task));
 }
 
 // Wait for all tasks to complete and collect results
 for (size_t i = 0; i < tasks.size(); ++i) {
-  tasks[i]->Wait();
-  
+  tasks[i].Wait();
+
   std::cout << "Task " << i << " completed:" << std::endl;
   std::cout << "  Result code: " << tasks[i]->result_code_ << std::endl;
   std::cout << "  Output data: " << tasks[i]->data_.str() << std::endl;
-  
-  // Clean up
 }
 ```
 
@@ -475,24 +414,15 @@ public:
 
 ## Error Handling
 
-Check result codes and handle errors appropriately:
+All operations are asynchronous and return `chi::Future<TaskType>`. Check task result codes after calling `Wait()`:
 
 ```cpp
-// Synchronous operations return result codes
-chi::u32 result = mod_client.Custom(HSHM_MCTX, pool_query, input, 1, output);
-if (result != 0) {
-  std::cerr << "Custom operation failed with code: " << result << std::endl;
-}
-
-// For asynchronous operations, check task result_code_
-auto task = mod_client.AsyncCustom(HSHM_MCTX, pool_query, input, 1);
-task->Wait();
+auto task = mod_client.AsyncCustom(pool_query, input, 1);
+task.Wait();
 
 if (task->result_code_ != 0) {
-  std::cerr << "Async custom operation failed with code: " 
-            << task->result_code_ << std::endl;
+  std::cerr << "Custom operation failed with code: " << task->result_code_ << std::endl;
 }
-
 ```
 
 ## Development Guidelines
@@ -518,9 +448,8 @@ if (task->result_code_ != 0) {
 ### Task Design Patterns
 
 1. **Standard Tasks**: Request-response pattern with input/output parameters
-2. **Fire-and-Forget**: Background tasks that don't need responses
-3. **Long-Running**: Tasks that may take significant time to complete
-4. **Batch Operations**: Tasks that process multiple items efficiently
+2. **Long-Running**: Tasks that may take significant time to complete
+3. **Batch Operations**: Tasks that process multiple items efficiently
 
 ## Important Notes
 
@@ -528,10 +457,10 @@ if (task->result_code_ != 0) {
 
 2. **Admin Dependency**: The MOD_NAME module requires the admin module to be initialized first.
 
-3. **Fire-and-Forget**: These tasks are automatically cleaned up and don't provide return values.
+3. **Concurrency Testing**: The CoMutex and CoRwLock tests are useful for validating runtime behavior.
 
-4. **Concurrency Testing**: The CoMutex and CoRwLock tests are useful for validating runtime behavior.
+4. **Thread Safety**: Operations are designed for single-threaded access per client instance.
 
-5. **Thread Safety**: Operations are designed for single-threaded access per client instance.
+5. **Development Template**: Use this module as a starting point for custom ChiMod development.
 
-6. **Development Template**: Use this module as a starting point for custom ChiMod development.
+6. **Async-Only API**: All client operations are asynchronous and return `chi::Future<TaskType>`. Call `Wait()` to block for completion.

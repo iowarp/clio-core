@@ -13,6 +13,67 @@ set(SRC_FILES
 
 # Create library with system_info.cc
 add_library(hermes_shm_host ${SRC_FILES})
+
+#------------------------------------------------------------------------------
+# Compression Predictor Libraries (Optional)
+#------------------------------------------------------------------------------
+
+# XGBoost Predictor Library
+find_package(xgboost QUIET)
+if(xgboost_FOUND)
+    add_library(xgboost_predictor
+        compression/xgboost_predictor.cc
+    )
+    target_include_directories(xgboost_predictor PUBLIC
+        $<BUILD_INTERFACE:${HSHM_ROOT}/include>
+        $<BUILD_INTERFACE:${PROJECT_BINARY_DIR}/include>
+        $<INSTALL_INTERFACE:include>
+    )
+    target_link_libraries(xgboost_predictor PUBLIC
+        xgboost::xgboost
+    )
+    set_property(TARGET xgboost_predictor PROPERTY CXX_STANDARD 17)
+    list(APPEND HSHM_LIBS xgboost_predictor)
+    message(STATUS "Building XGBoost predictor library")
+endif()
+
+# Dense NN Predictor Library (requires Eigen, MiniDNN, and nlohmann_json)
+find_package(Eigen3 QUIET)
+find_package(nlohmann_json QUIET)
+# MiniDNN is header-only, check if it exists
+set(MINIDNN_INCLUDE_DIR "${HSHM_ROOT}/external/MiniDNN/include")
+if(EXISTS "${MINIDNN_INCLUDE_DIR}/MiniDNN.h")
+    set(MINIDNN_FOUND TRUE)
+else()
+    set(MINIDNN_FOUND FALSE)
+endif()
+
+if(Eigen3_FOUND AND MINIDNN_FOUND AND nlohmann_json_FOUND)
+    add_library(dense_nn_predictor
+        compression/dense_nn_predictor.cc
+    )
+    target_include_directories(dense_nn_predictor PUBLIC
+        $<BUILD_INTERFACE:${HSHM_ROOT}/include>
+        $<BUILD_INTERFACE:${PROJECT_BINARY_DIR}/include>
+        $<BUILD_INTERFACE:${MINIDNN_INCLUDE_DIR}>
+        $<INSTALL_INTERFACE:include>
+    )
+    target_link_libraries(dense_nn_predictor PUBLIC
+        Eigen3::Eigen
+        nlohmann_json::nlohmann_json
+    )
+    set_property(TARGET dense_nn_predictor PROPERTY CXX_STANDARD 17)
+    list(APPEND HSHM_LIBS dense_nn_predictor)
+    message(STATUS "Building Dense NN predictor library with MiniDNN + Eigen")
+elseif(NOT Eigen3_FOUND)
+    message(STATUS "Eigen3 not found - Dense NN predictor will not be built")
+    message(STATUS "  Install with: conda install -c conda-forge eigen")
+elseif(NOT MINIDNN_FOUND)
+    message(STATUS "MiniDNN not found - Dense NN predictor will not be built")
+    message(STATUS "  Clone to: ${HSHM_ROOT}/external/MiniDNN")
+elseif(NOT nlohmann_json_FOUND)
+    message(STATUS "nlohmann_json not found - Dense NN predictor will not be built")
+endif()
 target_link_libraries(hermes_shm_host PUBLIC
     ${REAL_TIME_FLAGS}
     configure

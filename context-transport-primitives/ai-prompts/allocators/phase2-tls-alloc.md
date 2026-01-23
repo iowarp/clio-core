@@ -11,7 +11,7 @@ template<typename AllocT>
 class Test {
     hipc::CtxAllocator<AllocT> ctx_alloc_;
     Test(hipc::Allocator *alloc) {
-        ctx_alloc_ = CtxAllocator<AllocT>(HSHM_MCTX, alloc);
+        ctx_alloc_ = CtxAllocator<AllocT>(alloc);
     }
 }
 ```

@@ -31,6 +31,13 @@ add_executable(benchmark_compress_lossy_parameter_study_exec
         test_init.cc
         test_compress_lossy_parameter_study.cc)
 
+# Compression predictor tests (C++ ML models)
+add_executable(test_xgboost_predictor
+        test_xgboost_predictor.cc)
+
+add_executable(test_dense_nn_predictor
+        test_dense_nn_predictor.cc)
+
 add_dependencies(test_compress_exec hermes_shm_host)
 target_link_libraries(test_compress_exec
         hermes_shm_host hshm::compress Catch2::Catch2)
@@ -84,6 +91,42 @@ target_link_libraries(benchmark_compress_lossy_parameter_study_exec
         hermes_shm_host hshm::compress Catch2::Catch2 ${LOSSY_LIBS})
 target_compile_definitions(benchmark_compress_lossy_parameter_study_exec
         PRIVATE HSHM_ENABLE_COMPRESS=1)
+
+# Link XGBoost predictor test
+find_package(xgboost QUIET)
+if(xgboost_FOUND AND TARGET xgboost_predictor)
+    target_link_libraries(test_xgboost_predictor
+            xgboost_predictor)
+    set_property(TARGET test_xgboost_predictor PROPERTY CXX_STANDARD 17)
+    message(STATUS "XGBoost predictor test enabled")
+else()
+    message(STATUS "XGBoost predictor not available, test will not be built")
+    # Create a dummy target that does nothing
+    set_target_properties(test_xgboost_predictor PROPERTIES EXCLUDE_FROM_ALL TRUE)
+endif()
+
+# Link Dense NN predictor test (uses MiniDNN + Eigen)
+find_package(Eigen3 QUIET)
+find_package(nlohmann_json QUIET)
+set(MINIDNN_INCLUDE_DIR "${HSHM_ROOT}/external/MiniDNN/include")
+if(EXISTS "${MINIDNN_INCLUDE_DIR}/MiniDNN.h")
+    set(MINIDNN_FOUND TRUE)
+else()
+    set(MINIDNN_FOUND FALSE)
+endif()
+
+if(Eigen3_FOUND AND MINIDNN_FOUND AND nlohmann_json_FOUND AND TARGET dense_nn_predictor)
+    target_link_libraries(test_dense_nn_predictor
+            dense_nn_predictor)
+    target_include_directories(test_dense_nn_predictor PRIVATE
+            ${MINIDNN_INCLUDE_DIR})
+    set_property(TARGET test_dense_nn_predictor PROPERTY CXX_STANDARD 17)
+    message(STATUS "Dense NN predictor test enabled with MiniDNN + Eigen")
+else()
+    message(STATUS "Dense NN predictor not available (requires Eigen3 + MiniDNN + nlohmann_json)")
+    # Create a dummy target that does nothing
+    set_target_properties(test_dense_nn_predictor PROPERTIES EXCLUDE_FROM_ALL TRUE)
+endif()
 
 add_test(NAME ctp_compress COMMAND
         ${CMAKE_BINARY_DIR}/bin/test_compress_exec "~[error=FatalError]")

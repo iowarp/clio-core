@@ -285,7 +285,7 @@ std::vector<wrp_cae::core::AssimilationCtx> LoadOmni(const std::string& omni_pat
 try {
   auto contexts = LoadOmni("/path/to/config.yaml");
   // Pass to ParseOmni
-  cae_client.ParseOmni(HSHM_MCTX, contexts, num_tasks_scheduled);
+  cae_client.ParseOmni(contexts, num_tasks_scheduled);
 } catch (const std::exception& e) {
   std::cerr << "Failed to load OMNI: " << e.what() << std::endl;
 }

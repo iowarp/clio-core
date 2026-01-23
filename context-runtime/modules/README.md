@@ -58,7 +58,7 @@ make
 chimaera::MOD_NAME::Client client(pool_id);
 
 // Initialize the container
-client.Create(HSHM_MCTX, chi::DomainQuery());
+client.Create(chi::DomainQuery());
 
 // Execute a custom operation
 std::string output;

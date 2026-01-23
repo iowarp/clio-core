@@ -9,7 +9,7 @@ The Content Transfer Engine (CTE) Core is a high-performance distributed storage
 - **Block-based Data Management**: Efficient block-level data placement across multiple targets
 - **Performance Monitoring**: Built-in telemetry and performance metrics collection
 - **Configurable Data Placement**: Multiple data placement algorithms (random, round-robin, max bandwidth)
-- **Asynchronous Operations**: Both synchronous and asynchronous APIs for all operations
+- **Asynchronous Operations**: Async-only API with C++20 coroutine support
 
 CTE Core implements a ChiMod (Chimaera Module) that integrates with the Chimaera distributed runtime system, providing scalable data management across multiple nodes in a cluster.
 
@@ -137,6 +137,8 @@ The main entry point for CTE Core functionality is the `wrp_cte::core::Client` c
 
 #### Class Definition
 
+The CTE client provides an **async-only API**. All methods return `chi::Future<TaskType>` for asynchronous completion.
+
 ```cpp
 namespace wrp_cte::core {
 
@@ -147,87 +149,88 @@ public:
   explicit Client(const chi::PoolId &pool_id);
 
   // Container lifecycle
-  void Create(const hipc::MemContext &mctx,
-              const chi::PoolQuery &pool_query,
-              const std::string &pool_name,
-              const chi::PoolId &custom_pool_id,
-              const CreateParams &params = CreateParams());
+  chi::Future<CreateTask> AsyncCreate(
+      const chi::PoolQuery &pool_query,
+      const std::string &pool_name,
+      const chi::PoolId &custom_pool_id,
+      const CreateParams &params = CreateParams());
 
   // Target management
-  chi::u32 RegisterTarget(const hipc::MemContext &mctx,
-                          const std::string &target_name,
-                          chimaera::bdev::BdevType bdev_type,
-                          chi::u64 total_size,
-                          const chi::PoolQuery &target_query = chi::PoolQuery::Local(),
-                          const chi::PoolId &bdev_id = chi::PoolId::GetNull());
+  chi::Future<RegisterTargetTask> AsyncRegisterTarget(
+      const std::string &target_name,
+      chimaera::bdev::BdevType bdev_type,
+      chi::u64 total_size,
+      const chi::PoolQuery &target_query = chi::PoolQuery::Local(),
+      const chi::PoolId &bdev_id = chi::PoolId::GetNull());
 
-  chi::u32 UnregisterTarget(const hipc::MemContext &mctx,
-                            const std::string &target_name);
+  chi::Future<UnregisterTargetTask> AsyncUnregisterTarget(
+      const std::string &target_name);
 
-  std::vector<std::string> ListTargets(const hipc::MemContext &mctx);
+  chi::Future<ListTargetsTask> AsyncListTargets();
 
-  chi::u32 StatTargets(const hipc::MemContext &mctx);
+  chi::Future<StatTargetsTask> AsyncStatTargets();
 
   // Tag management
-  TagId GetOrCreateTag(const hipc::MemContext &mctx,
-                       const std::string &tag_name,
-                       const TagId &tag_id = TagId::GetNull());
+  chi::Future<GetOrCreateTagTask<CreateParams>> AsyncGetOrCreateTag(
+      const std::string &tag_name,
+      const TagId &tag_id = TagId::GetNull());
 
-  bool DelTag(const hipc::MemContext &mctx, const TagId &tag_id);
-  bool DelTag(const hipc::MemContext &mctx, const std::string &tag_name);
+  chi::Future<DelTagTask> AsyncDelTag(const TagId &tag_id);
+  chi::Future<DelTagTask> AsyncDelTag(const std::string &tag_name);
 
-  size_t GetTagSize(const hipc::MemContext &mctx, const TagId &tag_id);
+  chi::Future<GetTagSizeTask> AsyncGetTagSize(const TagId &tag_id);
 
   // Blob operations
-  bool PutBlob(const hipc::MemContext &mctx, const TagId &tag_id,
-               const std::string &blob_name,
-               chi::u64 offset, chi::u64 size, hipc::ShmPtr<> blob_data,
-               float score, chi::u32 flags);
+  chi::Future<PutBlobTask> AsyncPutBlob(
+      const TagId &tag_id,
+      const std::string &blob_name,
+      chi::u64 offset, chi::u64 size,
+      hipc::ShmPtr<> blob_data,
+      float score, chi::u32 flags);
 
-  bool GetBlob(const hipc::MemContext &mctx, const TagId &tag_id,
-               const std::string &blob_name,
-               chi::u64 offset, chi::u64 size, chi::u32 flags,
-               hipc::ShmPtr<> blob_data);
+  chi::Future<GetBlobTask> AsyncGetBlob(
+      const TagId &tag_id,
+      const std::string &blob_name,
+      chi::u64 offset, chi::u64 size,
+      chi::u32 flags,
+      hipc::ShmPtr<> blob_data);
 
-  bool DelBlob(const hipc::MemContext &mctx, const TagId &tag_id,
-               const std::string &blob_name);
+  chi::Future<DelBlobTask> AsyncDelBlob(
+      const TagId &tag_id,
+      const std::string &blob_name);
 
-  chi::u32 ReorganizeBlob(const hipc::MemContext &mctx,
-                          const TagId &tag_id,
-                          const std::string &blob_name,
-                          float new_score);
+  chi::Future<ReorganizeBlobTask> AsyncReorganizeBlob(
+      const TagId &tag_id,
+      const std::string &blob_name,
+      float new_score);
 
   // Blob metadata operations
-  float GetBlobScore(const hipc::MemContext &mctx, const TagId &tag_id,
-                     const std::string &blob_name);
+  chi::Future<GetBlobScoreTask> AsyncGetBlobScore(
+      const TagId &tag_id,
+      const std::string &blob_name);
 
-  chi::u64 GetBlobSize(const hipc::MemContext &mctx, const TagId &tag_id,
-                       const std::string &blob_name);
+  chi::Future<GetBlobSizeTask> AsyncGetBlobSize(
+      const TagId &tag_id,
+      const std::string &blob_name);
 
-  std::vector<std::string> GetContainedBlobs(const hipc::MemContext &mctx,
-                                             const TagId &tag_id);
+  chi::Future<GetContainedBlobsTask> AsyncGetContainedBlobs(
+      const TagId &tag_id);
 
   // Telemetry
-  std::vector<CteTelemetry> PollTelemetryLog(const hipc::MemContext &mctx,
-                                             std::uint64_t minimum_logical_time);
+  chi::Future<PollTelemetryLogTask> AsyncPollTelemetryLog(
+      std::uint64_t minimum_logical_time);
 
-  // Async variants (all methods have Async versions)
-  hipc::FullPtr<CreateTask> AsyncCreate(...);
-  hipc::FullPtr<RegisterTargetTask> AsyncRegisterTarget(...);
-  hipc::FullPtr<UnregisterTargetTask> AsyncUnregisterTarget(...);
-  hipc::FullPtr<ListTargetsTask> AsyncListTargets(...);
-  hipc::FullPtr<StatTargetsTask> AsyncStatTargets(...);
-  hipc::FullPtr<GetOrCreateTagTask<CreateParams>> AsyncGetOrCreateTag(...);
-  hipc::FullPtr<DelTagTask> AsyncDelTag(...);
-  hipc::FullPtr<GetTagSizeTask> AsyncGetTagSize(...);
-  hipc::FullPtr<PutBlobTask> AsyncPutBlob(...);
-  hipc::FullPtr<GetBlobTask> AsyncGetBlob(...);
-  hipc::FullPtr<DelBlobTask> AsyncDelBlob(...);
-  hipc::FullPtr<ReorganizeBlobTask> AsyncReorganizeBlob(...);
-  hipc::FullPtr<GetBlobScoreTask> AsyncGetBlobScore(...);
-  hipc::FullPtr<GetBlobSizeTask> AsyncGetBlobSize(...);
-  hipc::FullPtr<GetContainedBlobsTask> AsyncGetContainedBlobs(...);
-  hipc::FullPtr<PollTelemetryLogTask> AsyncPollTelemetryLog(...);
+  // Query operations
+  chi::Future<TagQueryTask> AsyncTagQuery(
+      const std::string &tag_regex,
+      chi::u32 max_tags = 0,
+      const chi::PoolQuery &pool_query = chi::PoolQuery::Broadcast());
+
+  chi::Future<BlobQueryTask> AsyncBlobQuery(
+      const std::string &tag_regex,
+      const std::string &blob_regex,
+      chi::u32 max_blobs = 0,
+      const chi::PoolQuery &pool_query = chi::PoolQuery::Broadcast());
 };
 
 }  // namespace wrp_cte::core
@@ -235,7 +238,7 @@ public:
 
 ### Tag Wrapper Class
 
-The `wrp_cte::core::Tag` class provides a simplified, object-oriented interface for blob operations within a specific tag. This wrapper class eliminates the need to pass `TagId` and memory context parameters for each operation, making the API more convenient and less error-prone.
+The `wrp_cte::core::Tag` class provides a simplified, object-oriented interface for blob operations within a specific tag. This wrapper class eliminates the need to pass `TagId` parameters for each operation, making the API more convenient and less error-prone.
 
 #### Class Definition
 
@@ -251,24 +254,27 @@ public:
   // Constructors
   explicit Tag(const std::string &tag_name);  // Creates or gets existing tag
   explicit Tag(const TagId &tag_id);          // Uses existing TagId directly
-  
-  // Blob storage operations
+
+  // Blob storage operations (synchronous wrappers)
   void PutBlob(const std::string &blob_name, const char *data, size_t data_size, size_t off = 0);
-  void PutBlob(const std::string &blob_name, const hipc::ShmPtr<> &data, size_t data_size, 
+  void PutBlob(const std::string &blob_name, const hipc::ShmPtr<> &data, size_t data_size,
                size_t off = 0, float score = 1.0f);
-  
+
   // Asynchronous blob storage
-  hipc::FullPtr<PutBlobTask> AsyncPutBlob(const std::string &blob_name, const hipc::ShmPtr<> &data, 
-                                          size_t data_size, size_t off = 0, float score = 1.0f);
-  
-  // Blob retrieval operations
-  void GetBlob(const std::string &blob_name, char *data, size_t data_size, size_t off = 0);      // Automatic memory management
-  void GetBlob(const std::string &blob_name, hipc::ShmPtr<> data, size_t data_size, size_t off = 0); // Manual memory management
-  
-  // Blob metadata operations
+  chi::Future<PutBlobTask> AsyncPutBlob(const std::string &blob_name, const hipc::ShmPtr<> &data,
+                                        size_t data_size, size_t off = 0, float score = 1.0f);
+
+  // Blob retrieval operations (synchronous wrappers)
+  void GetBlob(const std::string &blob_name, char *data, size_t data_size, size_t off = 0);
+  void GetBlob(const std::string &blob_name, hipc::ShmPtr<> data, size_t data_size, size_t off = 0);
+
+  // Blob metadata operations (synchronous wrappers)
   float GetBlobScore(const std::string &blob_name);
   chi::u64 GetBlobSize(const std::string &blob_name);
   std::vector<std::string> GetContainedBlobs();
+
+  // Blob reorganization
+  void ReorganizeBlob(const std::string &blob_name, float new_score);
 
   // Tag accessor
   const TagId& GetTagId() const { return tag_id_; }
@@ -280,21 +286,22 @@ public:
 #### Key Features
 
 - **Automatic Tag Management**: Constructor with tag name automatically creates or retrieves existing tags
-- **Simplified API**: No need to pass TagId or MemContext for each operation
+- **Simplified API**: No need to pass TagId for each operation
 - **Memory Management**: Raw data variant automatically handles shared memory allocation and cleanup
 - **Exception Safety**: Operations throw exceptions on failure for clear error handling
 - **Score Support**: Blob scoring for intelligent data placement across storage targets
 - **Blob Enumeration**: `GetContainedBlobs()` method returns all blob names in the tag
+- **Reorganization Support**: `ReorganizeBlob()` method for data tier migration
 
 #### Memory Management Guidelines
 
-**For Synchronous Operations:**
+**For Synchronous Tag Wrapper Operations:**
 - Raw data variant (`const char*`) automatically manages shared memory lifecycle
 - Shared memory variant requires caller to manage `hipc::ShmPtr<>` lifecycle
 
 **For Asynchronous Operations:**
 - Only shared memory variant available to avoid memory lifecycle issues
-- Caller must keep `hipc::FullPtr<char>` alive until async task completes
+- Caller must keep shared memory buffers alive until async task completes
 - See usage examples below for proper async memory management patterns
 
 ### Data Structures
@@ -317,33 +324,36 @@ struct CreateParams {
 
 #### ListTargets Return Type
 
-The `ListTargets` method returns a vector of target names (strings):
+The `AsyncListTargets` method returns a Future. Access target names via `task->target_names_` after `Wait()`:
 
 ```cpp
-std::vector<std::string> ListTargets(const hipc::MemContext &mctx);
+chi::Future<ListTargetsTask> AsyncListTargets();
 ```
 
 Example usage:
 ```cpp
-auto target_names = cte_client->ListTargets(mctx);
-for (const auto& target_name : target_names) {
+auto task = cte_client->AsyncListTargets();
+task.Wait();
+for (const auto& target_name : task->target_names_) {
     std::cout << "Target: " << target_name << "\n";
 }
 ```
 
 #### GetOrCreateTag Return Type
 
-The `GetOrCreateTag` method returns a `TagId` directly:
+The `AsyncGetOrCreateTag` method returns a Future. Access the TagId via `task->tag_id_` after `Wait()`:
 
 ```cpp
-TagId GetOrCreateTag(const hipc::MemContext &mctx,
-                     const std::string &tag_name,
-                     const TagId &tag_id = TagId::GetNull());
+chi::Future<GetOrCreateTagTask<CreateParams>> AsyncGetOrCreateTag(
+    const std::string &tag_name,
+    const TagId &tag_id = TagId::GetNull());
 ```
 
 Example usage:
 ```cpp
-TagId tag_id = cte_client->GetOrCreateTag(mctx, "my_dataset");
+auto task = cte_client->AsyncGetOrCreateTag("my_dataset");
+task.Wait();
+TagId tag_id = task->tag_id_;
 ```
 
 #### BlobInfo
@@ -457,34 +467,34 @@ int main() {
 ```cpp
 // Get global CTE client
 auto *cte_client = WRP_CTE_CLIENT;
-hipc::MemContext mctx;
 
 // Register a file-based storage target
 std::string target_path = "/mnt/nvme/cte_storage.dat";
 chi::u64 target_size = 100ULL * 1024 * 1024 * 1024;  // 100GB
 
-chi::u32 result = cte_client->RegisterTarget(
-    mctx,
+auto reg_task = cte_client->AsyncRegisterTarget(
     target_path,
     chimaera::bdev::BdevType::kFile,
     target_size
 );
+reg_task.Wait();
 
-if (result == 0) {
+if (reg_task->return_code_ == 0) {
     std::cout << "Target registered successfully\n";
 }
 
 // Register a RAM-based cache target
-result = cte_client->RegisterTarget(
-    mctx,
-    "/tmp/cte_cache",
+auto cache_task = cte_client->AsyncRegisterTarget(
+    "ram::cte_cache",
     chimaera::bdev::BdevType::kRam,
     8ULL * 1024 * 1024 * 1024  // 8GB
 );
+cache_task.Wait();
 
 // List all registered targets
-auto targets = cte_client->ListTargets(mctx);
-for (const auto& target_name : targets) {
+auto list_task = cte_client->AsyncListTargets();
+list_task.Wait();
+for (const auto& target_name : list_task->target_names_) {
     std::cout << "Target: " << target_name << "\n";
 }
 ```
@@ -496,22 +506,21 @@ for (const auto& target_name : targets) {
 ```cpp
 // Get global CTE client
 auto *cte_client = WRP_CTE_CLIENT;
-hipc::MemContext mctx;
 
 // Create or get a tag for grouping related blobs
-TagId tag_id = cte_client->GetOrCreateTag(mctx, "dataset_v1");
+auto tag_task = cte_client->AsyncGetOrCreateTag("dataset_v1");
+tag_task.Wait();
+TagId tag_id = tag_task->tag_id_;
 
 // Prepare data for storage
 std::vector<char> data(1024 * 1024);  // 1MB of data
 std::fill(data.begin(), data.end(), 'A');
 
 // Allocate shared memory for the data
-// NOTE: AllocateBuffer is NOT templated - it returns hipc::FullPtr<char>
 hipc::FullPtr<char> shm_buffer = CHI_IPC->AllocateBuffer(data.size());
 memcpy(shm_buffer.ptr_, data.data(), data.size());
 
-bool success = cte_client->PutBlob(
-    mctx,
+auto put_task = cte_client->AsyncPutBlob(
     tag_id,
     "blob_001",           // Blob name
     0,                    // Offset
@@ -520,23 +529,25 @@ bool success = cte_client->PutBlob(
     0.8f,                 // Score (0-1, higher = hotter data)
     0                     // Flags
 );
+put_task.Wait();
 
-if (success) {
+if (put_task->return_code_ == 0) {
     std::cout << "Blob stored successfully\n";
 
     // Get blob size
-    chi::u64 blob_size = cte_client->GetBlobSize(mctx, tag_id, "blob_001");
-    std::cout << "Stored blob size: " << blob_size << " bytes\n";
+    auto size_task = cte_client->AsyncGetBlobSize(tag_id, "blob_001");
+    size_task.Wait();
+    std::cout << "Stored blob size: " << size_task->size_ << " bytes\n";
 
     // Get blob score
-    float blob_score = cte_client->GetBlobScore(mctx, tag_id, "blob_001");
-    std::cout << "Blob score: " << blob_score << "\n";
+    auto score_task = cte_client->AsyncGetBlobScore(tag_id, "blob_001");
+    score_task.Wait();
+    std::cout << "Blob score: " << score_task->score_ << "\n";
 }
 
 // Retrieve the blob
 auto retrieve_buffer = CHI_IPC->AllocateBuffer(data.size());
-success = cte_client->GetBlob(
-    mctx,
+auto get_task = cte_client->AsyncGetBlob(
     tag_id,
     "blob_001",           // Blob name for lookup
     0,                    // Offset
@@ -544,23 +555,28 @@ success = cte_client->GetBlob(
     0,                    // Flags
     retrieve_buffer.shm_  // Buffer for data
 );
+get_task.Wait();
 
 // Get all blob names in the tag
-std::vector<std::string> blob_names = cte_client->GetContainedBlobs(mctx, tag_id);
-std::cout << "Tag contains " << blob_names.size() << " blobs\n";
-for (const auto& name : blob_names) {
+auto blobs_task = cte_client->AsyncGetContainedBlobs(tag_id);
+blobs_task.Wait();
+std::cout << "Tag contains " << blobs_task->blob_names_.size() << " blobs\n";
+for (const auto& name : blobs_task->blob_names_) {
     std::cout << "  - " << name << "\n";
 }
 
 // Get total size of all blobs in tag
-size_t tag_size = cte_client->GetTagSize(mctx, tag_id);
-std::cout << "Tag total size: " << tag_size << " bytes\n";
+auto tag_size_task = cte_client->AsyncGetTagSize(tag_id);
+tag_size_task.Wait();
+std::cout << "Tag total size: " << tag_size_task->size_ << " bytes\n";
 
 // Delete a specific blob
-success = cte_client->DelBlob(mctx, tag_id, "blob_001");
+auto del_blob_task = cte_client->AsyncDelBlob(tag_id, "blob_001");
+del_blob_task.Wait();
 
 // Delete entire tag (removes all blobs)
-success = cte_client->DelTag(mctx, tag_id);
+auto del_tag_task = cte_client->AsyncDelTag(tag_id);
+del_tag_task.Wait();
 ```
 
 #### Using the Tag Wrapper (Recommended for Convenience)
@@ -577,19 +593,19 @@ try {
     // Store blob - automatically handles shared memory management
     dataset_tag.PutBlob("blob_001", data.data(), data.size());
     std::cout << "Blob stored successfully\n";
-    
+
     // Get blob size
     chi::u64 blob_size = dataset_tag.GetBlobSize("blob_001");
     std::cout << "Stored blob size: " << blob_size << " bytes\n";
-    
-    // Get blob score  
+
+    // Get blob score
     float blob_score = dataset_tag.GetBlobScore("blob_001");
     std::cout << "Blob score: " << blob_score << "\n";
-    
+
     // Retrieve the blob using automatic memory management (recommended)
     std::vector<char> retrieve_data(blob_size);
     dataset_tag.GetBlob("blob_001", retrieve_data.data(), blob_size);
-    
+
     // Alternative: Retrieve using manual shared memory management
     // auto retrieve_buffer = CHI_IPC->AllocateBuffer(blob_size);
     // dataset_tag.GetBlob("blob_001", retrieve_buffer.shm_, blob_size);
@@ -600,20 +616,24 @@ try {
     std::vector<std::string> blob_names = dataset_tag.GetContainedBlobs();
     std::cout << "Tag contains " << blob_names.size() << " blobs\n";
 
+    // Reorganize blob with new score
+    dataset_tag.ReorganizeBlob("blob_001", 0.95f);  // Move to hot tier
+
 } catch (const std::exception& e) {
     std::cerr << "Error: " << e.what() << "\n";
 }
 
-// For tag-level operations, you still need the core client:
+// For tag-level operations, you can use the core client:
 auto *cte_client = WRP_CTE_CLIENT;
-hipc::MemContext mctx;
 
 // Get total size of all blobs in tag
-size_t tag_size = cte_client->GetTagSize(mctx, dataset_tag.GetTagId());
-std::cout << "Tag total size: " << tag_size << " bytes\n";
+auto tag_size_task = cte_client->AsyncGetTagSize(dataset_tag.GetTagId());
+tag_size_task.Wait();
+std::cout << "Tag total size: " << tag_size_task->size_ << " bytes\n";
 
 // Delete entire tag (removes all blobs)
-bool success = cte_client->DelTag(mctx, dataset_tag.GetTagId());
+auto del_task = cte_client->AsyncDelTag(dataset_tag.GetTagId());
+del_task.Wait();
 ```
 
 ### Tag Wrapper Usage Examples
@@ -766,14 +786,14 @@ wrp_cte::core::Tag async_tag("async_operations");
 
 // Prepare data for async operations
 std::vector<std::vector<char>> async_data;
-std::vector<hipc::FullPtr<void>> shm_buffers;
-std::vector<hipc::FullPtr<PutBlobTask>> async_tasks;
+std::vector<hipc::FullPtr<char>> shm_buffers;
+std::vector<chi::Future<PutBlobTask>> async_tasks;
 
 for (int i = 0; i < 5; ++i) {
     // Prepare data
     async_data.emplace_back(1024 * 256);  // 256KB each
     std::fill(async_data[i].begin(), async_data[i].end(), 'Z' - i);
-    
+
     // Allocate shared memory (must keep alive until async operation completes)
     auto shm_buffer = CHI_IPC->AllocateBuffer(async_data[i].size());
     if (shm_buffer.IsNull()) {
@@ -796,7 +816,7 @@ for (int i = 0; i < 5; ++i) {
 
         // Store references to keep alive
         shm_buffers.push_back(std::move(shm_buffer));
-        async_tasks.push_back(task);
+        async_tasks.push_back(std::move(task));
 
         std::cout << "Started async put for blob " << i << "\n";
 
@@ -809,16 +829,15 @@ for (int i = 0; i < 5; ++i) {
 std::cout << "Waiting for async operations to complete...\n";
 for (size_t i = 0; i < async_tasks.size(); ++i) {
     try {
-        async_tasks[i]->Wait();
-        if (async_tasks[i]->result_code_ == 0) {
+        async_tasks[i].Wait();  // Note: Wait() on Future, not pointer
+        if (async_tasks[i]->return_code_ == 0) {
             std::cout << "Async operation " << i << " completed successfully\n";
         } else {
-            std::cout << "Async operation " << i << " failed with code " 
-                      << async_tasks[i]->result_code_ << "\n";
+            std::cout << "Async operation " << i << " failed with code "
+                      << async_tasks[i]->return_code_ << "\n";
         }
-        
-        // Clean up task
-        
+        // Task is automatically cleaned up when Future goes out of scope
+
     } catch (const std::exception& e) {
         std::cerr << "Error waiting for async operation " << i << ": " << e.what() << "\n";
     }
@@ -830,50 +849,68 @@ for (size_t i = 0; i < async_tasks.size(); ++i) {
 ### Asynchronous Operations
 
 ```cpp
+// Get global CTE client
+auto *cte_client = WRP_CTE_CLIENT;
+
+// Allocate shared memory for the data
+hipc::FullPtr<char> shm_buffer = CHI_IPC->AllocateBuffer(data.size());
+memcpy(shm_buffer.ptr_, data.data(), data.size());
+
 // Asynchronous blob operations for better performance
-auto put_task = cte_client.AsyncPutBlob(
-    mctx, tag_id, "async_blob", BlobId::GetNull(),
-    0, data.size(), data_ptr, 0.5f, 0
+auto put_task = cte_client->AsyncPutBlob(
+    tag_id, "async_blob",
+    0, data.size(), shm_buffer.shm_, 0.5f, 0
 );
 
 // Do other work while blob is being stored
 ProcessOtherData();
 
 // Wait for completion
-put_task->Wait();
-if (put_task->result_code_ == 0) {
+put_task.Wait();
+if (put_task->return_code_ == 0) {
     std::cout << "Async put completed successfully\n";
 }
-
-// Clean up task
+// Task is automatically cleaned up when Future goes out of scope
 
 // Multiple async operations
-std::vector<hipc::FullPtr<PutBlobTask>> tasks;
+std::vector<chi::Future<PutBlobTask>> tasks;
+std::vector<hipc::FullPtr<char>> buffers;  // Keep buffers alive
+
 for (int i = 0; i < 10; ++i) {
-    auto task = cte_client.AsyncPutBlob(
-        mctx, tag_id, 
+    // Allocate buffer for each task
+    auto buffer = CHI_IPC->AllocateBuffer(data.size());
+    memcpy(buffer.ptr_, data.data(), data.size());
+
+    auto task = cte_client->AsyncPutBlob(
+        tag_id,
         "blob_" + std::to_string(i),
-        BlobId::GetNull(),
-        0, data.size(), data_ptr, 0.5f, 0
+        0, data.size(), buffer.shm_, 0.5f, 0
     );
-    tasks.push_back(task);
+
+    buffers.push_back(std::move(buffer));  // Keep buffer alive
+    tasks.push_back(std::move(task));
 }
 
 // Wait for all to complete
 for (auto& task : tasks) {
-    task->Wait();
+    task.Wait();
 }
+// buffers and tasks automatically cleaned up here
 ```
 
 ### Performance Monitoring
 
 ```cpp
+// Get global CTE client
+auto *cte_client = WRP_CTE_CLIENT;
+
 // Poll telemetry log for performance analysis
 std::uint64_t last_logical_time = 0;
 
-auto telemetry = cte_client.PollTelemetryLog(mctx, last_logical_time);
+auto telemetry_task = cte_client->AsyncPollTelemetryLog(last_logical_time);
+telemetry_task.Wait();
 
-for (const auto& entry : telemetry) {
+for (const auto& entry : telemetry_task->telemetry_) {
     std::cout << "Operation: ";
     switch (entry.op_) {
         case CteOp::kPutBlob: std::cout << "PUT"; break;
@@ -886,22 +923,25 @@ for (const auto& entry : telemetry) {
         case CteOp::kGetTagSize: std::cout << "TAG_SIZE"; break;
         default: std::cout << "OTHER"; break;
     }
-    std::cout << " Size: " << entry.size_ 
+    std::cout << " Size: " << entry.size_
               << " Offset: " << entry.off_
               << " LogicalTime: " << entry.logical_time_ << "\n";
+
+    // Update last_logical_time for next poll
+    if (entry.logical_time_ > last_logical_time) {
+        last_logical_time = entry.logical_time_;
+    }
 }
 
 // Update target statistics
-cte_client.StatTargets(mctx);
+auto stat_task = cte_client->AsyncStatTargets();
+stat_task.Wait();
 
-// Check updated target metrics
-auto targets = cte_client.ListTargets(mctx);
-for (const auto& target : targets) {
-    std::cout << "Target: " << target.target_name_ << "\n"
-              << "  Bytes read: " << target.bytes_read_ << "\n"
-              << "  Bytes written: " << target.bytes_written_ << "\n"
-              << "  Read ops: " << target.ops_read_ << "\n"
-              << "  Write ops: " << target.ops_written_ << "\n";
+// List all targets
+auto list_task = cte_client->AsyncListTargets();
+list_task.Wait();
+for (const auto& target_name : list_task->target_names_) {
+    std::cout << "Target: " << target_name << "\n";
 }
 ```
 
@@ -911,24 +951,31 @@ for (const auto& target : targets) {
 // Reorganize blobs based on new access patterns
 // Higher scores (closer to 1.0) indicate hotter data
 
-TagId tag_id = tag_info.tag_id_;
+auto *cte_client = WRP_CTE_CLIENT;
 
-// Reorganize multiple blobs by calling ReorganizeBlob once per blob
+// Reorganize multiple blobs by calling AsyncReorganizeBlob once per blob
 std::vector<std::string> blob_names = {"blob_001", "blob_002", "blob_003"};
 std::vector<float> new_scores = {0.95f, 0.7f, 0.3f};  // Hot, warm, cold
 
 for (size_t i = 0; i < blob_names.size(); ++i) {
-    chi::u32 result = cte_client.ReorganizeBlob(mctx, tag_id, blob_names[i], new_scores[i]);
-    if (result == 0) {
+    auto reorg_task = cte_client->AsyncReorganizeBlob(tag_id, blob_names[i], new_scores[i]);
+    reorg_task.Wait();
+    if (reorg_task->return_code_ == 0) {
         std::cout << "Blob " << blob_names[i] << " reorganized successfully\n";
     }
 }
 
 // Example: Reorganize single blob
-chi::u32 result = cte_client.ReorganizeBlob(mctx, tag_id, "important_blob", 0.95f);
-if (result == 0) {
+auto single_task = cte_client->AsyncReorganizeBlob(tag_id, "important_blob", 0.95f);
+single_task.Wait();
+if (single_task->return_code_ == 0) {
     std::cout << "Single blob reorganized successfully\n";
 }
+
+// Using Tag wrapper (simpler API)
+wrp_cte::core::Tag my_tag("my_dataset");
+my_tag.ReorganizeBlob("hot_data", 0.95f);  // Move to hot tier
+my_tag.ReorganizeBlob("cold_archive", 0.2f);  // Move to cold tier
 ```
 
 ## Configuration
@@ -1107,45 +1154,41 @@ pip install ./wrapper/python
 ```python
 import wrp_cte_core_ext as cte
 
-# Initialize Chimaera runtime
-cte.chimaera_runtime_init()
-
 # Initialize CTE
-# NOTE: This automatically calls chimaera_client_init() internally
-# You do NOT need to call chimaera_client_init() separately
+# NOTE: This automatically calls chi::CHIMAERA_INIT() internally
 cte.initialize_cte("/path/to/config.yaml")
 
 # Get global CTE client
 client = cte.get_cte_client()
 
-# Create memory context
-mctx = cte.MemContext()
+# Create or get a tag
+tag_task = client.async_get_or_create_tag("my_dataset")
+tag_task.wait()
+tag_id = tag_task.tag_id
 
 # Poll telemetry log
 minimum_logical_time = 0
-telemetry_entries = client.PollTelemetryLog(mctx, minimum_logical_time)
+telemetry_task = client.async_poll_telemetry_log(minimum_logical_time)
+telemetry_task.wait()
 
-for entry in telemetry_entries:
-    print(f"Operation: {entry.op_}")
-    print(f"Size: {entry.size_}")
-    print(f"Offset: {entry.off_}")
-    print(f"Logical Time: {entry.logical_time_}")
+for entry in telemetry_task.telemetry:
+    print(f"Operation: {entry.op}")
+    print(f"Size: {entry.size}")
+    print(f"Offset: {entry.off}")
+    print(f"Logical Time: {entry.logical_time}")
 
 # Reorganize blobs with new scores
-tag_id = cte.TagId()
-tag_id.major_ = 0
-tag_id.minor_ = 1
-
 blob_names = ["blob_001", "blob_002", "blob_003"]
 new_scores = [0.95, 0.85, 0.75]  # Different tier assignments
 
-# Call ReorganizeBlob once per blob
+# Call async_reorganize_blob once per blob
 for blob_name, new_score in zip(blob_names, new_scores):
-    result = client.ReorganizeBlob(mctx, tag_id, blob_name, new_score)
-    if result == 0:
+    task = client.async_reorganize_blob(tag_id, blob_name, new_score)
+    task.wait()
+    if task.return_code == 0:
         print(f"Blob {blob_name} reorganized successfully")
     else:
-        print(f"Reorganization of {blob_name} failed with error code: {result}")
+        print(f"Reorganization of {blob_name} failed with error code: {task.return_code}")
 ```
 
 ### Python Data Types
@@ -1170,44 +1213,43 @@ print(cte.CteOp.kDelBlob)    # Delete blob operation
 
 ### Python Blob Reorganization
 
-The Python bindings support blob reorganization for dynamic data placement optimization using the `ReorganizeBlob` method:
+The Python bindings support blob reorganization for dynamic data placement optimization using the async API:
 
 ```python
 import wrp_cte_core_ext as cte
 
 # Initialize CTE system (as shown in previous examples)
-# ...
-
+cte.initialize_cte("/path/to/config.yaml")
 client = cte.get_cte_client()
-mctx = cte.MemContext()
 
 # Get or create tag for the blobs
-tag_id = cte.TagId()
-tag_id.major_ = 0
-tag_id.minor_ = 1
+tag_task = client.async_get_or_create_tag("my_dataset")
+tag_task.wait()
+tag_id = tag_task.tag_id
 
 # Example 1: Reorganize multiple blobs to different tiers
 blob_names = ["hot_data", "warm_data", "cold_archive"]
 new_scores = [0.95, 0.6, 0.2]  # Hot, warm, and cold tiers
 
-# Call ReorganizeBlob once per blob
+# Call async_reorganize_blob once per blob
 for blob_name, new_score in zip(blob_names, new_scores):
-    result = client.ReorganizeBlob(mctx, tag_id, blob_name, new_score)
-    if result == 0:
+    task = client.async_reorganize_blob(tag_id, blob_name, new_score)
+    task.wait()
+    if task.return_code == 0:
         print(f"Blob {blob_name} reorganized successfully")
     else:
-        print(f"Reorganization of {blob_name} failed with error code: {result}")
+        print(f"Reorganization of {blob_name} failed with error code: {task.return_code}")
 
 # Example 2: Promote frequently accessed blobs based on telemetry
-telemetry = client.PollTelemetryLog(mctx, 0)
+telemetry_task = client.async_poll_telemetry_log(0)
+telemetry_task.wait()
 access_counts = {}
 
 # Count accesses per blob name (requires tracking blob names from telemetry)
-# Note: You may need to maintain a blob_id to blob_name mapping
-for entry in telemetry:
-    if entry.op_ == cte.CteOp.kGetBlob:
+for entry in telemetry_task.telemetry:
+    if entry.op == cte.CteOp.kGetBlob:
         # Track access patterns
-        blob_key = (entry.blob_id_.major_, entry.blob_id_.minor_)
+        blob_key = (entry.blob_id.major, entry.blob_id.minor)
         access_counts[blob_key] = access_counts.get(blob_key, 0) + 1
 
 # Batch reorganize based on access frequency
@@ -1233,8 +1275,9 @@ for blob_key, count in access_counts.items():
 # Perform reorganization for each blob
 if blobs_to_reorganize:
     for blob_name, new_score in zip(blobs_to_reorganize, new_scores_list):
-        result = client.ReorganizeBlob(mctx, tag_id, blob_name, new_score)
-        if result == 0:
+        task = client.async_reorganize_blob(tag_id, blob_name, new_score)
+        task.wait()
+        if task.return_code == 0:
             print(f"Reorganized blob {blob_name} successfully")
 
 # Example 3: Tier-based reorganization strategy
@@ -1243,24 +1286,27 @@ if blobs_to_reorganize:
 # Small, frequently accessed -> Hot tier (0.9)
 small_hot_blobs = ["config", "index", "metadata"]
 for blob_name in small_hot_blobs:
-    result = client.ReorganizeBlob(mctx, tag_id, blob_name, 0.9)
-    if result == 0:
+    task = client.async_reorganize_blob(tag_id, blob_name, 0.9)
+    task.wait()
+    if task.return_code == 0:
         print(f"Hot tier blob {blob_name} reorganized")
 
 # Medium, occasionally accessed -> Warm tier (0.5-0.7)
 warm_blobs = ["dataset_recent_01", "dataset_recent_02"]
 warm_scores = [0.6, 0.5]
 for blob_name, score in zip(warm_blobs, warm_scores):
-    result = client.ReorganizeBlob(mctx, tag_id, blob_name, score)
-    if result == 0:
+    task = client.async_reorganize_blob(tag_id, blob_name, score)
+    task.wait()
+    if task.return_code == 0:
         print(f"Warm tier blob {blob_name} reorganized")
 
 # Large, rarely accessed -> Cold tier (0.1-0.3)
 cold_blobs = ["archive_2023", "backup_full"]
 cold_scores = [0.2, 0.1]
 for blob_name, score in zip(cold_blobs, cold_scores):
-    result = client.ReorganizeBlob(mctx, tag_id, blob_name, score)
-    if result == 0:
+    task = client.async_reorganize_blob(tag_id, blob_name, score)
+    task.wait()
+    if task.return_code == 0:
         print(f"Cold tier blob {blob_name} reorganized")
 ```
 
@@ -1271,14 +1317,16 @@ for blob_name, score in zip(cold_blobs, cold_scores):
 - `0.1 - 0.3`: Low tier (HDD, archival data)
 - `0.0`: Lowest tier (cold storage, rarely accessed)
 
-**Method Signature:**
+**Method Pattern:**
 ```python
-result = client.ReorganizeBlob(
-    mctx,           # Memory context
+# All Python client methods use async pattern
+task = client.async_reorganize_blob(
     tag_id,         # Tag ID containing the blob
     blob_name,      # Blob name (string)
     new_score       # New score (float, 0.0 to 1.0)
 )
+task.wait()
+result = task.return_code  # 0 = success
 ```
 
 **Return Codes:**
@@ -1286,7 +1334,7 @@ result = client.ReorganizeBlob(
 - `Non-zero`: Error - reorganization failed (tag not found, blob not found, insufficient space, etc.)
 
 **Important Notes:**
-- Call `ReorganizeBlob` once per blob to reorganize multiple blobs
+- All Python client methods follow the async pattern with `.wait()` completion
 - All blobs must belong to the specified `tag_id`
 - Scores must be in the range `[0.0, 1.0]`
 - Higher scores indicate hotter data that should be placed on faster storage tiers
@@ -1323,7 +1371,7 @@ tag.PutBlob("item", shm_buffer.shm_, data_size, 0, score);
 ```cpp
 // Always keep shared memory alive until async task completes
 std::vector<hipc::FullPtr<char>> buffers;  // Keep alive
-std::vector<hipc::FullPtr<PutBlobTask>> tasks;
+std::vector<chi::Future<PutBlobTask>> tasks;
 
 for (auto& data_chunk : data_chunks) {
     auto buffer = CHI_IPC->AllocateBuffer(data_chunk.size());
@@ -1332,14 +1380,14 @@ for (auto& data_chunk : data_chunks) {
     auto task = tag.AsyncPutBlob("chunk", buffer.shm_, data_chunk.size());
 
     buffers.push_back(std::move(buffer));  // Keep alive!
-    tasks.push_back(task);
+    tasks.push_back(std::move(task));
 }
 
 // Wait for completion and cleanup
 for (auto& task : tasks) {
-    task->Wait();
+    task.Wait();  // Note: Wait() on Future, not pointer
 }
-// buffers automatically cleaned up here
+// buffers and tasks automatically cleaned up here
 ```
 
 #### Performance Optimization
@@ -1394,23 +1442,27 @@ try {
 }
 ```
 
-**Direct Client (Return Code-based):**
+**Direct Client (Async with Return Code):**
 ```cpp
 auto *client = WRP_CTE_CLIENT;
-hipc::MemContext mctx;
 
-TagId tag_id = client->GetOrCreateTag(mctx, "dataset");
-bool success = client->PutBlob(mctx, tag_id, "data",
-                               0, size, buffer, 0.5f, 0);
+auto tag_task = client->AsyncGetOrCreateTag("dataset");
+tag_task.Wait();
+TagId tag_id = tag_task->tag_id_;
 
-if (!success) {
-    std::cerr << "PutBlob failed\n";
+auto put_task = client->AsyncPutBlob(tag_id, "data",
+                                     0, size, buffer.shm_, 0.5f, 0);
+put_task.Wait();
+
+if (put_task->return_code_ != 0) {
+    std::cerr << "PutBlob failed with code: " << put_task->return_code_ << "\n";
     return false;
 }
 
-chi::u64 stored_size = client->GetBlobSize(mctx, tag_id, "data");
-if (stored_size != size) {
-    std::cerr << "Size mismatch: expected " << size << ", got " << stored_size << "\n";
+auto size_task = client->AsyncGetBlobSize(tag_id, "data");
+size_task.Wait();
+if (size_task->size_ != size) {
+    std::cerr << "Size mismatch: expected " << size << ", got " << size_task->size_ << "\n";
     return false;
 }
 ```
@@ -1420,7 +1472,7 @@ if (stored_size != size) {
 - Both Tag wrapper and Client are thread-safe
 - Multiple threads can safely share the same Tag or Client instance
 - Shared memory buffers (`hipc::FullPtr`) should not be shared between threads
-- Each thread should use its own `hipc::MemContext` for optimal performance
+- Each thread should maintain its own buffer allocations for optimal performance
 
 ### Multi-Node Deployment
 
@@ -1449,17 +1501,18 @@ Extend the DPE (Data Placement Engine) by implementing custom placement strategi
 
 ### Error Handling
 
-All operations return result codes:
+All async operations return a Future. After calling `Wait()`, check the `return_code_` field:
 - `0`: Success
 - Non-zero: Error (specific codes depend on operation)
 
 Always check return values and handle errors appropriately:
 
 ```cpp
-chi::u32 result = cte_client.RegisterTarget(...);
-if (result != 0) {
+auto task = cte_client->AsyncRegisterTarget(target_name, bdev_type, size);
+task.Wait();
+if (task->return_code_ != 0) {
     // Handle error
-    std::cerr << "Failed to register target, error code: " << result << "\n";
+    std::cerr << "Failed to register target, error code: " << task->return_code_ << "\n";
 }
 ```
 
@@ -1473,7 +1526,8 @@ if (result != 0) {
 
 - CTE Core uses shared memory for zero-copy data transfer
 - The `hipc::ShmPtr<>` type represents shared memory locations
-- Memory contexts (`hipc::MemContext`) manage allocation lifecycle
+- `hipc::FullPtr<char>` manages allocation lifecycle with RAII cleanup
+- Use `CHI_IPC->AllocateBuffer(size)` to allocate shared memory buffers
 
 ## Troubleshooting
 
@@ -1514,15 +1568,19 @@ export CTE_LOG_LEVEL=DEBUG
 Use the telemetry API to collect performance metrics:
 
 ```cpp
+auto *cte_client = WRP_CTE_CLIENT;
+
 // Continuous monitoring loop
 while (running) {
-    auto telemetry = cte_client.PollTelemetryLog(mctx, last_logical_time);
-    ProcessTelemetry(telemetry);
-    
-    if (!telemetry.empty()) {
-        last_logical_time = telemetry.back().logical_time_;
+    auto telemetry_task = cte_client->AsyncPollTelemetryLog(last_logical_time);
+    telemetry_task.Wait();
+
+    ProcessTelemetry(telemetry_task->telemetry_);
+
+    if (!telemetry_task->telemetry_.empty()) {
+        last_logical_time = telemetry_task->telemetry_.back().logical_time_;
     }
-    
+
     std::this_thread::sleep_for(std::chrono::seconds(1));
 }
 ```

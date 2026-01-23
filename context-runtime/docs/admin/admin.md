@@ -53,18 +53,21 @@ explicit Client(const chi::PoolId& pool_id)
 
 #### Container Management
 
-##### `Create()` - Synchronous
-Creates and initializes the admin container.
+##### `AsyncCreate()`
+Creates and initializes the admin container asynchronously.
 
 ```cpp
-void Create(const hipc::MemContext& mctx, const chi::PoolQuery& pool_query, 
-           const std::string& pool_name)
+chi::Future<CreateTask> AsyncCreate(const chi::PoolQuery& pool_query,
+                                    const std::string& pool_name,
+                                    const chi::PoolId& custom_pool_id)
 ```
 
 **Parameters:**
-- `mctx`: Memory context for task allocation
 - `pool_query`: Pool domain query (typically `chi::PoolQuery::Local()`)
 - `pool_name`: Pool name (MUST be "admin" for admin containers)
+- `custom_pool_id`: Explicit pool ID for the container
+
+**Returns:** Future for asynchronous completion checking
 
 **Usage:**
 ```cpp
@@ -73,148 +76,74 @@ const chi::PoolId pool_id = chi::kAdminPoolId;  // Use predefined admin pool ID
 chimaera::admin::Client admin_client(pool_id);
 
 auto pool_query = chi::PoolQuery::Local();
-admin_client.Create(HSHM_MCTX, pool_query, "admin");  // Pool name MUST be "admin"
+auto task = admin_client.AsyncCreate(pool_query, "admin", pool_id);
+task.Wait();
+
+if (task->GetReturnCode() != 0) {
+  std::cerr << "Admin creation failed" << std::endl;
+  return;
+}
 ```
-
-##### `AsyncCreate()` - Asynchronous
-Creates and initializes the admin container asynchronously.
-
-```cpp
-hipc::FullPtr<CreateTask> AsyncCreate(const hipc::MemContext& mctx,
-                                     const chi::PoolQuery& pool_query,
-                                     const std::string& pool_name)
-```
-
-**Returns:** Task pointer for asynchronous completion checking
 
 #### Pool Management Operations
 
-##### `DestroyPool()` - Synchronous
-Destroys an existing ChiPool.
+##### `AsyncDestroyPool()`
+Destroys an existing ChiPool asynchronously.
 
 ```cpp
-void DestroyPool(const hipc::MemContext& mctx,
-                const chi::PoolQuery& pool_query, 
-                chi::PoolId target_pool_id,
-                chi::u32 destruction_flags = 0)
+chi::Future<DestroyPoolTask> AsyncDestroyPool(
+    const chi::PoolQuery& pool_query,
+    chi::PoolId target_pool_id, chi::u32 destruction_flags = 0)
 ```
 
 **Parameters:**
-- `mctx`: Memory context for task allocation
 - `pool_query`: Pool domain query
 - `target_pool_id`: ID of the pool to destroy
 - `destruction_flags`: Optional flags controlling destruction behavior (default: 0)
 
-**Throws:** `std::runtime_error` if destruction fails
+#### Network Communication Operations
 
-##### `AsyncDestroyPool()` - Asynchronous
-Destroys an existing ChiPool asynchronously.
-
-```cpp
-hipc::FullPtr<DestroyPoolTask> AsyncDestroyPool(
-    const hipc::MemContext& mctx, const chi::PoolQuery& pool_query,
-    chi::PoolId target_pool_id, chi::u32 destruction_flags = 0)
-```
-
-#### Distributed Task Operations
-
-##### `ClientSendTaskIn()` - Synchronous
-Sends a task to remote nodes for distributed processing.
+##### `AsyncSendPoll()` - Asynchronous
+Creates a periodic task to poll the network queue and send outgoing messages.
 
 ```cpp
-template <typename TaskType>
-void ClientSendTaskIn(const hipc::MemContext& mctx,
-                     const std::vector<chi::PoolQuery>& pool_queries,
-                     const hipc::FullPtr<TaskType>& task_to_send)
+chi::Future<SendTask> AsyncSendPoll(const chi::PoolQuery& pool_query,
+                                    chi::u32 transfer_flags = 0,
+                                    double period_us = 25)
 ```
 
 **Parameters:**
-- `mctx`: Memory context for task allocation
-- `pool_queries`: Vector of pool queries identifying target nodes
-- `task_to_send`: Pointer to the task to send
-
-**Throws:** `std::runtime_error` if task send fails
-
-##### `AsyncClientSendTaskIn()` - Asynchronous
-```cpp
-template <typename TaskType>
-hipc::FullPtr<ClientSendTaskInTask> AsyncClientSendTaskIn(
-    const hipc::MemContext& mctx,
-    const std::vector<chi::PoolQuery>& pool_queries,
-    const hipc::FullPtr<TaskType>& task_to_send)
-```
-
-##### `ServerRecvTaskIn()` - Synchronous
-Polls and receives tasks from remote nodes.
-
-```cpp
-void ServerRecvTaskIn(const hipc::MemContext& mctx,
-                     const chi::PoolQuery& pool_query)
-```
-
-This is typically called periodically to check for incoming tasks from remote nodes.
-
-##### `AsyncServerRecvTaskIn()` - Asynchronous
-```cpp
-hipc::FullPtr<ServerRecvTaskInTask> AsyncServerRecvTaskIn(
-    const hipc::MemContext& mctx, const chi::PoolQuery& pool_query)
-```
-
-##### `ServerSendTaskOut()` - Synchronous
-Sends completed task results to remote nodes.
-
-```cpp
-template <typename TaskType>
-void ServerSendTaskOut(const hipc::MemContext& mctx,
-                      const chi::PoolQuery& pool_query,
-                      chi::u32 target_node_id,
-                      const hipc::FullPtr<TaskType>& completed_task)
-```
-
-**Parameters:**
-- `mctx`: Memory context for task allocation
 - `pool_query`: Pool domain query
-- `target_node_id`: ID of the target node to send results to
-- `completed_task`: Pointer to the completed task
+- `transfer_flags`: Transfer behavior flags (default: 0)
+- `period_us`: Period in microseconds for polling (default: 25us, 0 = one-shot)
 
-##### `AsyncServerSendTaskOut()` - Asynchronous
-```cpp
-template <typename TaskType>
-hipc::FullPtr<ServerSendTaskOutTask> AsyncServerSendTaskOut(
-    const hipc::MemContext& mctx, const chi::PoolQuery& pool_query,
-    chi::u32 target_node_id, const hipc::FullPtr<TaskType>& completed_task)
-```
-
-##### `ClientRecvTaskOut()` - Synchronous
-Polls and receives task results from remote nodes.
+##### `AsyncRecv()` - Asynchronous
+Creates a periodic task to receive incoming messages from the network.
 
 ```cpp
-void ClientRecvTaskOut(const hipc::MemContext& mctx,
-                      const chi::PoolQuery& pool_query)
+chi::Future<RecvTask> AsyncRecv(const chi::PoolQuery& pool_query,
+                                chi::u32 transfer_flags = 0,
+                                double period_us = 25)
 ```
 
-##### `AsyncClientRecvTaskOut()` - Asynchronous
-```cpp
-hipc::FullPtr<ClientRecvTaskOutTask> AsyncClientRecvTaskOut(
-    const hipc::MemContext& mctx, const chi::PoolQuery& pool_query)
-```
+**Parameters:**
+- `pool_query`: Pool domain query
+- `transfer_flags`: Transfer behavior flags (default: 0)
+- `period_us`: Period in microseconds for polling (default: 25us, 0 = one-shot)
 
 #### Administrative Operations
 
-##### `Flush()` - Synchronous
-Flushes all administrative operations.
+##### `AsyncFlush()`
+Flushes all administrative operations asynchronously.
 
 ```cpp
-void Flush(const hipc::MemContext& mctx, const chi::PoolQuery& pool_query)
+chi::Future<FlushTask> AsyncFlush(const chi::PoolQuery& pool_query)
 ```
 
-**Throws:** `std::runtime_error` if flush operation fails
+**Parameters:**
+- `pool_query`: Pool domain query
 
-##### `AsyncFlush()` - Asynchronous
-```cpp
-hipc::FullPtr<FlushTask> AsyncFlush(const hipc::MemContext& mctx,
-                                   const chi::PoolQuery& pool_query)
-```
+**Returns:** Future for asynchronous completion checking
 
 #### Runtime Control
 
@@ -222,18 +151,44 @@ hipc::FullPtr<FlushTask> AsyncFlush(const hipc::MemContext& mctx,
 Stops the entire Chimaera runtime system.
 
 ```cpp
-hipc::FullPtr<StopRuntimeTask> AsyncStopRuntime(
-    const hipc::MemContext& mctx, const chi::PoolQuery& pool_query,
+chi::Future<StopRuntimeTask> AsyncStopRuntime(
+    const chi::PoolQuery& pool_query,
     chi::u32 shutdown_flags = 0, chi::u32 grace_period_ms = 5000)
 ```
 
 **Parameters:**
-- `mctx`: Memory context for task allocation
 - `pool_query`: Pool domain query
 - `shutdown_flags`: Optional flags controlling shutdown behavior (default: 0)
 - `grace_period_ms`: Grace period in milliseconds for clean shutdown (default: 5000ms)
 
 **Note:** This operation is only available asynchronously as the runtime shutdown process requires careful coordination.
+
+#### Compose Operation
+
+##### `AsyncCompose()` - Asynchronous
+Creates a pool from a PoolConfig (for declarative pool creation).
+
+```cpp
+chi::Future<ComposeTask<chi::PoolConfig>> AsyncCompose(
+    const chi::PoolConfig& pool_config)
+```
+
+**Parameters:**
+- `pool_config`: Configuration for the pool to create
+
+#### Heartbeat Operation
+
+##### `AsyncHeartbeat()` - Asynchronous
+Polls for ZMQ heartbeat requests and responds.
+
+```cpp
+chi::Future<HeartbeatTask> AsyncHeartbeat(const chi::PoolQuery& pool_query,
+                                          double period_us = 5000)
+```
+
+**Parameters:**
+- `pool_query`: Pool domain query
+- `period_us`: Period in microseconds (default: 5000us = 5ms, 0 = one-shot)
 
 ## Task Types
 
@@ -246,7 +201,7 @@ Container creation task for the admin module. This is an alias for `chimaera::ad
 - `pool_name_`: Name of the pool (must be "admin" for admin containers)
 - `chimod_params_`: Serialized parameters
 - `pool_id_`: Pool identifier (input/output)
-- `result_code_`: Operation result (0 = success)
+- `return_code_`: Operation result (0 = success)
 - `error_message_`: Error description if creation failed
 
 ### DestroyPoolTask
@@ -255,7 +210,7 @@ Pool destruction task.
 **Key Fields:**
 - `target_pool_id_`: ID of the pool to destroy
 - `destruction_flags_`: Flags controlling destruction behavior
-- `result_code_`: Operation result (0 = success)
+- `return_code_`: Operation result (0 = success)
 - `error_message_`: Error description if destruction failed
 
 ### StopRuntimeTask
@@ -264,42 +219,22 @@ Runtime shutdown task.
 **Key Fields:**
 - `shutdown_flags_`: Flags controlling shutdown behavior
 - `grace_period_ms_`: Grace period for clean shutdown
-- `result_code_`: Operation result (0 = success)
+- `return_code_`: Operation result (0 = success)
 - `error_message_`: Error description if shutdown failed
 
 ### FlushTask
 Administrative flush task.
 
 **Key Fields:**
-- `result_code_`: Operation result (0 = success)
+- `return_code_`: Operation result (0 = success)
 - `total_work_done_`: Total work remaining across all containers
 
-### Distributed Task Communication Tasks
-
-#### ClientSendTaskInTask
-Sends task input to remote nodes.
+### SendTask / RecvTask
+Network communication tasks for sending and receiving messages.
 
 **Key Fields:**
-- `pool_queries_`: Target node pool queries
-- `task_to_send_`: Task to transmit
 - `transfer_flags_`: Transfer behavior flags
-- `result_code_`: Transfer result
-- `error_message_`: Error description if transfer failed
-
-#### ServerRecvTaskInTask
-Receives task input from remote nodes (periodic polling).
-
-#### ServerSendTaskOutTask
-Sends completed task results to remote nodes.
-
-**Key Fields:**
-- `completed_task_`: Completed task to send
-- `transfer_flags_`: Transfer behavior flags
-- `result_code_`: Transfer result
-- `error_message_`: Error description if transfer failed
-
-#### ClientRecvTaskOutTask
-Receives task results from remote nodes (periodic polling).
+- `return_code_`: Transfer result
 
 ## Configuration
 
@@ -310,12 +245,9 @@ The admin module uses minimal configuration parameters:
 struct CreateParams {
   // Required: chimod library name for module manager
   static constexpr const char *chimod_lib_name = "chimaera_admin";
-  
+
   // Default constructor
   CreateParams() = default;
-  
-  // Constructor with allocator
-  explicit CreateParams(const hipc::CtxAllocator<CHI_MAIN_ALLOC_T> &alloc);
 };
 ```
 
@@ -336,13 +268,20 @@ int main() {
   const chi::PoolId pool_id = chi::kAdminPoolId;
   chimaera::admin::Client admin_client(pool_id);
 
-  // Create admin container (pool name MUST be "admin")
+  // Create admin container asynchronously (pool name MUST be "admin")
   auto pool_query = chi::PoolQuery::Local();
-  admin_client.Create(HSHM_MCTX, pool_query, "admin");
-  
+  auto create_task = admin_client.AsyncCreate(pool_query, "admin", pool_id);
+  create_task.Wait();
+
+  if (create_task->GetReturnCode() != 0) {
+    std::cerr << "Admin creation failed" << std::endl;
+    return 1;
+  }
+
   // Perform admin operations...
-  admin_client.Flush(HSHM_MCTX, pool_query);
-  
+  auto flush_task = admin_client.AsyncFlush(pool_query);
+  flush_task.Wait();
+
   return 0;
 }
 ```
@@ -351,30 +290,13 @@ int main() {
 ```cpp
 // Destroy a specific pool
 chi::PoolId target_pool = chi::PoolId(8000, 0);
-try {
-  admin_client.DestroyPool(HSHM_MCTX, pool_query, target_pool);
+auto destroy_task = admin_client.AsyncDestroyPool(pool_query, target_pool);
+destroy_task.Wait();
+
+if (destroy_task->return_code_ != 0) {
+  std::cerr << "Pool destruction failed" << std::endl;
+} else {
   std::cout << "Pool destroyed successfully" << std::endl;
-} catch (const std::runtime_error& e) {
-  std::cerr << "Pool destruction failed: " << e.what() << std::endl;
-}
-```
-
-### Distributed Task Operations
-```cpp
-// Send a task to remote nodes
-std::vector<chi::PoolQuery> target_nodes = {
-  chi::PoolQuery::Remote(1),  // Node 1
-  chi::PoolQuery::Remote(2)   // Node 2
-};
-
-// Assume we have a task to send
-hipc::FullPtr<SomeTaskType> task = /* create task */;
-
-try {
-  admin_client.ClientSendTaskIn(HSHM_MCTX, target_nodes, task);
-  std::cout << "Task sent to remote nodes successfully" << std::endl;
-} catch (const std::runtime_error& e) {
-  std::cerr << "Task send failed: " << e.what() << std::endl;
 }
 ```
 
@@ -382,7 +304,7 @@ try {
 ```cpp
 // Gracefully stop the runtime with 10 second grace period
 auto stop_task = admin_client.AsyncStopRuntime(
-  HSHM_MCTX, pool_query, 0, 10000);  // 10 seconds
+  pool_query, 0, 10000);  // 10 seconds
 
 // Don't wait for completion as runtime will shut down
 std::cout << "Runtime shutdown initiated" << std::endl;
@@ -415,25 +337,19 @@ std::cout << "Runtime shutdown initiated" << std::endl;
 
 ## Error Handling
 
-Most synchronous methods throw `std::runtime_error` on failure. The error message contains details about the failure cause.
-
-For asynchronous operations, check the `result_code_` field of the returned task:
+All operations are asynchronous and return `chi::Future<TaskType>`. Check the `return_code_` field of the returned task after calling `Wait()`:
 - `0`: Success
 - Non-zero: Error occurred (check `error_message_` field)
 
 **Example:**
 ```cpp
-auto task = admin_client.AsyncDestroyPool(HSHM_MCTX, pool_query, target_pool);
-task->Wait();
+auto task = admin_client.AsyncDestroyPool(pool_query, target_pool);
+task.Wait();
 
-if (task->result_code_ != 0) {
+if (task->return_code_ != 0) {
   std::string error = task->error_message_.str();
   std::cerr << "Operation failed: " << error << std::endl;
 }
-
-// Clean up
-auto* ipc_manager = CHI_IPC;
-ipc_manager->DelTask(task);
 ```
 
 ## Important Notes
@@ -444,8 +360,8 @@ ipc_manager->DelTask(task);
 
 3. **Admin Dependency**: The admin module is required by all other ChiMods and must be linked in all Chimaera applications.
 
-3. **Asynchronous Operations**: Always clean up task pointers after completion using `ipc_manager->DelTask(task)`.
+4. **Future API**: Asynchronous operations return `chi::Future<TaskType>`. Call `.Wait()` on the future and access task data with `->`.
 
-4. **Pool Queries**: Use `chi::PoolQuery::Local()` for local operations and `chi::PoolQuery::Remote(node_id)` for distributed operations.
+5. **Pool Queries**: Use `chi::PoolQuery::Local()` for local operations and `chi::PoolQuery::Remote(node_id)` for distributed operations.
 
-5. **Thread Safety**: All operations are designed to be called from the main thread. Multi-threaded access requires external synchronization.
+6. **Thread Safety**: All operations are designed to be called from the main thread. Multi-threaded access requires external synchronization.

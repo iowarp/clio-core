@@ -352,7 +352,7 @@ public:
   void DeserializeAndSchedule(TaskInputArchiveIN& ar, 
                               chi::u32 method,
                               u32 source_node) {
-    hipc::CtxAllocator<CHI_MAIN_ALLOC_T> alloc(HSHM_MCTX, CHI_IPC->GetAllocator());
+    hipc::CtxAllocator<CHI_MAIN_ALLOC_T> alloc(CHI_IPC->GetAllocator());
     
     switch (method) {
       case Method::kCreate: {
@@ -442,7 +442,7 @@ void Worker::ResolveTask(hipc::FullPtr<Task> task) {
     auto* admin_container = pool_manager_->GetContainer(admin_pool_id);
     
     // Create network forward task
-    hipc::CtxAllocator<CHI_MAIN_ALLOC_T> alloc(HSHM_MCTX, CHI_IPC->GetAllocator());
+    hipc::CtxAllocator<CHI_MAIN_ALLOC_T> alloc(CHI_IPC->GetAllocator());
     auto forward_task = CHI_IPC->NewTask<NetworkForwardTask>(
         chi::kMainSegment, alloc,
         task->task_node_,

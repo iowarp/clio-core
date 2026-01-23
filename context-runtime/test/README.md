@@ -153,10 +153,10 @@ TEST_CASE("Custom Task Test", "[task][custom]") {
     // Create client
     chimaera::MOD_NAME::Client client(kTestModNamePoolId);
     chi::DomainQuery pool_query;
-    client.Create(HSHM_MCTX, pool_query);
+    client.Create(pool_query);
     
     // Submit task
-    auto task = client.AsyncCustom(HSHM_MCTX, pool_query, "test_data", 123);
+    auto task = client.AsyncCustom(pool_query, "test_data", 123);
     REQUIRE_FALSE(task.IsNull());
     
     // Wait for completion

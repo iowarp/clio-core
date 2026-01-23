@@ -122,19 +122,19 @@ int main() {
 
   // Create admin client (always required)
   chimaera::admin::Client admin_client(chi::PoolId(7000, 0));
-  admin_client.Create(HSHM_MCTX, chi::PoolQuery::Local());
+  admin_client.Create(chi::PoolQuery::Local());
   
   // Create bdev client for high-speed RAM storage
   chimaera::bdev::Client bdev_client(chi::PoolId(8000, 0));
-  bdev_client.Create(HSHM_MCTX, chi::PoolQuery::Local(), 
+  bdev_client.Create(chi::PoolQuery::Local(), 
                     chimaera::bdev::BdevType::kRam, "", 1024*1024*1024); // 1GB RAM
   
   // Allocate and use a block
-  auto block = bdev_client.Allocate(HSHM_MCTX, 4096);  // 4KB block
+  auto block = bdev_client.Allocate(4096);  // 4KB block
   std::vector<hshm::u8> data(4096, 0xAB);
-  bdev_client.Write(HSHM_MCTX, block, data);
-  auto read_data = bdev_client.Read(HSHM_MCTX, block);
-  bdev_client.Free(HSHM_MCTX, block);
+  bdev_client.Write(block, data);
+  auto read_data = bdev_client.Read(block);
+  bdev_client.Free(block);
   
   return 0;
 }

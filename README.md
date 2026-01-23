@@ -271,25 +271,25 @@ int main() {
   // 3. Create CTE client
   wrp_cte::core::Client cte_client;
   wrp_cte::core::CreateParams params;
-  cte_client.Create(HSHM_MCTX, chi::PoolQuery::Dynamic(),
+  cte_client.Create(chi::PoolQuery::Dynamic(),
                     wrp_cte::core::kCtePoolName,
                     wrp_cte::core::kCtePoolId, params);
 
   // 4. Register a storage target (100MB file-based)
-  cte_client.RegisterTarget(HSHM_MCTX, "/tmp/cte_storage",
+  cte_client.RegisterTarget("/tmp/cte_storage",
                             chimaera::bdev::BdevType::kFile,
                             100 * 1024 * 1024);
 
   // 5. Create a tag (container for blobs)
   wrp_cte::core::TagId tag_id = cte_client.GetOrCreateTag(
-      HSHM_MCTX, "my_tag", wrp_cte::core::TagId::GetNull());
+      "my_tag", wrp_cte::core::TagId::GetNull());
 
   // 6. Store blob data
   std::vector<char> data(4096, 'A');
   hipc::FullPtr<char> shared_data = CHI_IPC->AllocateBuffer(data.size());
   memcpy(shared_data.ptr_, data.data(), data.size());
 
-  cte_client.PutBlob(HSHM_MCTX, tag_id, "my_blob",
+  cte_client.PutBlob(tag_id, "my_blob",
                      0,                    // offset
                      data.size(),          // size
                      shared_data.shm_,     // shared memory pointer
@@ -299,7 +299,7 @@ int main() {
 
   // 7. Retrieve blob data
   hipc::FullPtr<char> read_buf = CHI_IPC->AllocateBuffer(data.size());
-  cte_client.GetBlob(HSHM_MCTX, tag_id, "my_blob",
+  cte_client.GetBlob(tag_id, "my_blob",
                      0,                    // offset
                      data.size(),          // size
                      0,                    // flags
@@ -308,7 +308,7 @@ int main() {
   CHI_IPC->FreeBuffer(read_buf);
 
   // 8. Cleanup
-  cte_client.DelTag(HSHM_MCTX, tag_id);
+  cte_client.DelTag(tag_id);
   return 0;
 }
 ```
