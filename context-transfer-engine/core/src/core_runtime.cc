@@ -576,6 +576,48 @@ chi::TaskResume Runtime::PutBlob(hipc::FullPtr<PutBlobTask> task, chi::RunContex
       co_return;
     }
 
+#ifdef WRP_CORE_ENABLE_COMPRESS
+    // Handle compression based on context mode
+    if (task->context_.dynamic_compress_ == 2) {
+      // Dynamic mode: analyze and schedule
+      co_await DynamicPutSchedule(task, ctx);
+    }
+
+    // Perform static compression if requested (mode 1 or after dynamic analysis)
+    if (task->context_.dynamic_compress_ == 1 && task->context_.compress_lib_ != 0) {
+      // Get data pointer
+      auto data_ptr = task->data_.get_mctx(HSHM_MCTX);
+
+      // Compress data using compress_factory
+      hshm::compress::CompressFactory factory;
+      auto compressor = factory.Get(task->context_.compress_lib_);
+
+      if (compressor) {
+        // Allocate compressed buffer
+        size_t compressed_size = compressor->GetBound(task->size_);
+        auto *ipc_manager = CHI_IPC;
+        hipc::FullPtr<char> compressed_buffer = ipc_manager->AllocateBuffer(compressed_size);
+
+        if (!compressed_buffer.IsNull()) {
+          // Compress
+          auto compressed_ptr = compressed_buffer.get_mctx(HSHM_MCTX);
+          size_t actual_compressed_size = 0;
+          bool success = compressor->Compress(
+              data_ptr, task->size_,
+              compressed_ptr, compressed_size,
+              actual_compressed_size);
+
+          if (success && actual_compressed_size < task->size_) {
+            // Use compressed data
+            task->data_ = compressed_buffer.template Cast<void>();
+            task->size_ = actual_compressed_size;
+            // compress_lib_ is already set in context
+          }
+        }
+      }
+    }
+#endif  // WRP_CORE_ENABLE_COMPRESS
+
     // Step 1: Check if blob exists
     BlobInfo *blob_info_ptr = CheckBlobExists(blob_name, tag_id);
     bool blob_found = (blob_info_ptr != nullptr);
@@ -715,6 +757,59 @@ chi::TaskResume Runtime::GetBlob(hipc::FullPtr<GetBlobTask> task, chi::RunContex
       task->return_code_ = read_result;
       co_return;
     }
+
+#ifdef WRP_CORE_ENABLE_COMPRESS
+    // Step 2.5: Decompression (if blob is compressed)
+    if (blob_info_ptr->compress_lib_ != 0) {
+      // Get compression library
+      hshm::compress::CompressFactory factory;
+      auto decompressor = factory.Get(blob_info_ptr->compress_lib_);
+
+      if (decompressor) {
+        // Get current data pointer
+        auto data_ptr = blob_data_ptr.get_mctx(HSHM_MCTX);
+
+        // Allocate decompressed buffer
+        // Note: We estimate decompressed size as 4x compressed size
+        size_t estimated_decompressed_size = size * 4;
+        auto *ipc_manager = CHI_IPC;
+        hipc::FullPtr<char> decompressed_buffer =
+            ipc_manager->AllocateBuffer(estimated_decompressed_size);
+
+        if (!decompressed_buffer.IsNull()) {
+          // Decompress
+          auto decompressed_ptr = decompressed_buffer.get_mctx(HSHM_MCTX);
+          size_t actual_decompressed_size = 0;
+          bool success = decompressor->Decompress(
+              data_ptr, size,
+              decompressed_ptr, estimated_decompressed_size,
+              actual_decompressed_size);
+
+          if (success) {
+            // Replace compressed data with decompressed data
+            task->blob_data_ = decompressed_buffer.template Cast<void>();
+            task->size_ = actual_decompressed_size;
+
+            HLOG(kDebug, "GetBlob: Decompressed blob with lib={}, "
+                         "original_size={}, compressed_size={}",
+                 blob_info_ptr->compress_lib_, actual_decompressed_size, size);
+          } else {
+            HLOG(kError, "GetBlob: Decompression failed for blob with lib={}",
+                 blob_info_ptr->compress_lib_);
+            task->return_code_ = 8;  // Decompression failed
+            co_return;
+          }
+        } else {
+          HLOG(kError, "GetBlob: Failed to allocate decompression buffer");
+          task->return_code_ = 9;  // Allocation failed
+          co_return;
+        }
+      } else {
+        HLOG(kWarning, "GetBlob: Unknown compression library id={}",
+             blob_info_ptr->compress_lib_);
+      }
+    }
+#endif  // WRP_CORE_ENABLE_COMPRESS
 
     // Step 3: Update timestamp (no lock needed - just updating values, not
     // modifying map structure)
@@ -2314,6 +2409,75 @@ std::tuple<int, int, double> Runtime::BestCompressForNode(
     // Objective: maximize compression ratio
     return BestCompressRatio(chunk, chunk_size, container_id, stats, context);
   }
+}
+
+chi::TaskResume Runtime::DynamicPutSchedule(
+    hipc::FullPtr<PutBlobTask> task, chi::RunContext& ctx) {
+
+  // Get chunk data
+  auto data_ptr = task->data_.get_mctx(HSHM_MCTX);
+  void* chunk = data_ptr;
+  chi::u64 chunk_size = task->size_;
+
+  // Estimate compression characteristics
+  auto stats = EstCompressionStats(chunk, chunk_size, task->context_);
+
+  if (stats.empty()) {
+    // No suitable compression found, use no compression
+    task->context_.compress_lib_ = 0;
+    task->context_.dynamic_compress_ = 1;  // Switch to static mode
+    co_return;
+  }
+
+  // Get CPU utilization (simplified - assume 50%)
+  double cpu_util = 0.5;
+
+  // Calculate network bandwidth (simplified - assume 10 Gbps)
+  double network_bw_bytes_per_sec = 1.25e9;  // 10 Gbps = 1.25 GB/s
+
+  // Case 1: Compress here, store here (producer node)
+  auto [tier1, lib1, time1] = BestCompressForNode(
+      task->context_, chunk, chunk_size, 0, stats);
+  double case1_time = time1 * (1.0 + cpu_util);
+
+  // Case 2: Compress here, send to consumer (if known)
+  double case2_time = std::numeric_limits<double>::max();
+  if (task->context_.consumer_node_ >= 0) {
+    auto [tier2, lib2, time2] = BestCompressForNode(
+        task->context_, chunk, chunk_size, task->context_.consumer_node_, stats);
+    double transfer_time_ms = (chunk_size / network_bw_bytes_per_sec) * 1000.0;
+    case2_time = time2 * (1.0 + cpu_util) + transfer_time_ms;
+  }
+
+  // Case 3: Send uncompressed to consumer, compress there
+  double case3_time = std::numeric_limits<double>::max();
+  if (task->context_.consumer_node_ >= 0) {
+    auto [tier3, lib3, time3] = BestCompressForNode(
+        task->context_, chunk, chunk_size, task->context_.consumer_node_, stats);
+    double transfer_time_ms = (chunk_size / network_bw_bytes_per_sec) * 1000.0;
+    case3_time = time3 + transfer_time_ms;
+  }
+
+  // Choose best case
+  if (case1_time <= case2_time && case1_time <= case3_time) {
+    // Compress locally
+    auto [tier, lib, time] = BestCompressForNode(
+        task->context_, chunk, chunk_size, 0, stats);
+    task->context_.compress_lib_ = lib;
+    task->context_.dynamic_compress_ = 1;  // Execute static compression
+  } else if (case2_time <= case3_time) {
+    // Compress locally, send to consumer
+    auto [tier, lib, time] = BestCompressForNode(
+        task->context_, chunk, chunk_size, task->context_.consumer_node_, stats);
+    task->context_.compress_lib_ = lib;
+    task->context_.dynamic_compress_ = 1;  // Execute static compression
+  } else {
+    // Send uncompressed (defer compression)
+    task->context_.compress_lib_ = 0;
+    task->context_.dynamic_compress_ = 0;  // Skip compression
+  }
+
+  co_return;
 }
 #endif  // WRP_CORE_ENABLE_COMPRESS
 
