@@ -533,6 +533,7 @@ chi::TaskResume Runtime::Send(hipc::FullPtr<SendTask> task,
   auto *ipc_manager = CHI_IPC;
   chi::Future<chi::Task> queued_future;
   bool did_send = false;
+  int send_in_count = 0;
 
   // Poll priority 0 (SendIn) queue - tasks waiting to be sent to remote nodes
   while (ipc_manager->TryPopNetTask(chi::NetQueuePriority::kSendIn,
@@ -540,20 +541,35 @@ chi::TaskResume Runtime::Send(hipc::FullPtr<SendTask> task,
     // Get the original task from the Future
     auto origin_task = queued_future.GetTaskPtr();
     if (!origin_task.IsNull()) {
+      HLOG(kInfo, "[Send] Processing SendIn task method={}, pool_id={}",
+           origin_task->method_, origin_task->pool_id_);
       SendIn(origin_task, rctx);
       did_send = true;
+      send_in_count++;
     }
   }
 
+  if (send_in_count > 0) {
+    HLOG(kInfo, "[Send] Processed {} SendIn tasks", send_in_count);
+  }
+
   // Poll priority 1 (SendOut) queue - tasks with outputs to send back
+  int send_out_count = 0;
   while (ipc_manager->TryPopNetTask(chi::NetQueuePriority::kSendOut,
                                     queued_future)) {
     // Get the original task from the Future
     auto origin_task = queued_future.GetTaskPtr();
     if (!origin_task.IsNull()) {
+      HLOG(kInfo, "[Send] Processing SendOut task method={}, pool_id={}",
+           origin_task->method_, origin_task->pool_id_);
       SendOut(origin_task);
       did_send = true;
+      send_out_count++;
     }
+  }
+
+  if (send_out_count > 0) {
+    HLOG(kInfo, "[Send] Processed {} SendOut tasks", send_out_count);
   }
 
   // Track whether this execution did actual work

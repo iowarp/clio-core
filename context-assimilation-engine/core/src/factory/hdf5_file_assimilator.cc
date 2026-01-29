@@ -1,6 +1,7 @@
 #include <wrp_cae/core/factory/hdf5_file_assimilator.h>
 #include <wrp_cae/core/core_client.h>
 #include <wrp_cae/core/core_tasks.h>
+#include <wrp_cae/core/constants.h>  // For kCaePoolId
 #include <chimaera/chimaera.h>
 #include <chimaera/ipc_manager.h>
 #include <sys/stat.h>
@@ -143,37 +144,49 @@ chi::TaskResume Hdf5FileAssimilator::Schedule(const AssimilationCtx& ctx, int& e
     HLOG(kInfo, "Hdf5FileAssimilator: Creating {} distributed tasks across {} nodes",
           filtered_paths.size(), num_nodes);
 
-    // Get CAE client for creating tasks
-    auto* cae_client = WRP_CAE_CLIENT;
-    if (!cae_client) {
-      HLOG(kError, "Hdf5FileAssimilator: CAE client not initialized");
-      error_code = -7;
-      co_return;
-    }
+    // Create a local CAE client with the correct pool_id for distributed tasks
+    // Do NOT use WRP_CAE_CLIENT global singleton as it may not be properly initialized
+    // with the correct pool_id from the runtime's compose configuration
+    wrp_cae::core::Client cae_client(kCaePoolId);
+    HLOG(kInfo, "Hdf5FileAssimilator: Created CAE client with pool_id {} for distributed tasks",
+          kCaePoolId);
 
     // Create futures for all dataset tasks
     std::vector<chi::Future<ProcessHdf5DatasetTask>> futures;
     futures.reserve(filtered_paths.size());
+
+    // Get current node ID for return routing
+    chi::u32 current_node = static_cast<chi::u32>(CHI_IPC->GetNodeId());
 
     for (size_t i = 0; i < filtered_paths.size(); ++i) {
       const auto& dataset_path = filtered_paths[i];
       // Round-robin distribution to nodes
       chi::u32 target_node = static_cast<chi::u32>(i % num_nodes);
       auto pool_query = chi::PoolQuery::Physical(target_node);
+      // Set return node so remote nodes know where to send responses
+      pool_query.SetReturnNode(current_node);
 
-      HLOG(kInfo, "Hdf5FileAssimilator: Routing dataset {}/{} '{}' to node {}",
-            i + 1, filtered_paths.size(), dataset_path, target_node);
+      HLOG(kInfo, "Hdf5FileAssimilator: Routing dataset {}/{} '{}' to node {} (return to {})",
+            i + 1, filtered_paths.size(), dataset_path, target_node, current_node);
 
-      auto future = cae_client->AsyncProcessHdf5Dataset(
+      HLOG(kInfo, "Hdf5FileAssimilator: Calling AsyncProcessHdf5Dataset for pool_id={}",
+            kCaePoolId);
+
+      auto future = cae_client.AsyncProcessHdf5Dataset(
           pool_query, src_path, dataset_path, tag_prefix);
+
+      HLOG(kInfo, "Hdf5FileAssimilator: AsyncProcessHdf5Dataset returned, task_ptr IsNull={}",
+            future.GetTaskPtr().IsNull());
+
       futures.push_back(std::move(future));
     }
 
-    // Wait for all tasks to complete
+    // Wait for all tasks to complete using co_await (not blocking Wait!)
+    // Using co_await allows the coroutine to yield, letting other tasks run
     HLOG(kInfo, "Hdf5FileAssimilator: Waiting for {} distributed tasks to complete...",
           futures.size());
     for (size_t i = 0; i < futures.size(); ++i) {
-      futures[i].Wait();
+      co_await futures[i];  // Yield coroutine, allow other tasks to run
       auto task = futures[i].get();
       if (task->result_code_ != 0) {
         HLOG(kError, "Hdf5FileAssimilator: Dataset {} failed (error: {})",

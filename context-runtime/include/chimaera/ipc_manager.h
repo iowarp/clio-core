@@ -268,6 +268,10 @@ class IpcManager {
         lane_id = scheduler_->RuntimeMapTask(worker, task_future);
       }
 
+      // Debug: Log task enqueueing
+      HLOG(kInfo, "IpcManager::Send: Enqueueing task method={}, pool_id={} to lane_id={}",
+           task_ptr->method_, task_ptr->pool_id_, lane_id);
+
       // 4. Enqueue the Future object to the worker queue
       auto &lane_ref = worker_queues_->GetLane(lane_id, 0);
       // Convert Future<TaskT> to Future<Task> for the queue

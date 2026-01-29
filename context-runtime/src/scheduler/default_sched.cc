@@ -104,13 +104,25 @@ u32 DefaultScheduler::ClientMapTask(IpcManager *ipc_manager,
 }
 
 u32 DefaultScheduler::RuntimeMapTask(Worker *worker, const Future<Task> &task) {
-  // Return current worker - no migration in default scheduler
-  // The task will execute on whichever worker picked it up
+  // Use round-robin distribution among scheduler workers
+  // This prevents deadlock when tasks are created from within a container
+  // (If all tasks were assigned to the current worker, it would block forever)
   (void)task;  // Unused in default scheduler
-  if (worker != nullptr) {
-    return worker->GetId();
+  (void)worker;  // Unused - we use round-robin instead of current worker
+
+  if (scheduler_workers_.empty()) {
+    // Fallback if no scheduler workers configured
+    return 0;
   }
-  return 0;
+
+  // Round-robin assignment among scheduler workers
+  size_t idx = scheduler_idx_.fetch_add(1, std::memory_order_relaxed) % scheduler_workers_.size();
+  u32 worker_id = scheduler_workers_[idx]->GetId();
+
+  HLOG(kDebug, "RuntimeMapTask: Round-robin assigned to worker {} (idx={})",
+       worker_id, idx);
+
+  return worker_id;
 }
 
 void DefaultScheduler::RebalanceWorker(Worker *worker) {
