@@ -159,6 +159,13 @@ public:
   chi::TaskResume Heartbeat(hipc::FullPtr<HeartbeatTask> task, chi::RunContext &rctx);
 
   /**
+   * Handle WreapDeadIpcs - Periodic task to reap shared memory from dead processes
+   * Calls IpcManager::WreapDeadIpcs() to clean up orphaned shared memory segments
+   * Returns TaskResume for consistency with other methods called from Run
+   */
+  chi::TaskResume WreapDeadIpcs(hipc::FullPtr<WreapDeadIpcsTask> task, chi::RunContext &rctx);
+
+  /**
    * Handle Monitor - Collect and return worker statistics
    * Iterates through all workers and collects their current statistics
    * Returns serialized statistics in JSON format
@@ -173,15 +180,6 @@ public:
    * @param rctx Runtime context for the current worker
    */
   chi::TaskResume SubmitBatch(hipc::FullPtr<SubmitBatchTask> task, chi::RunContext &rctx);
-
-  /**
-   * Handle RegisterMemory - Register a client's per-process shared memory
-   * Called when a client creates new shared memory and needs to register it
-   * with the runtime for cross-process access
-   * @param task The RegisterMemoryTask containing shared memory info
-   * @param rctx Runtime context for the current worker
-   */
-  chi::TaskResume RegisterMemory(hipc::FullPtr<RegisterMemoryTask> task, chi::RunContext &rctx);
 
   /**
    * Helper: Receive task inputs from remote node

@@ -664,6 +664,71 @@ struct HeartbeatTask : public chi::Task {
 };
 
 /**
+ * WreapDeadIpcsTask - Periodic task to reap shared memory from dead processes
+ *
+ * This task periodically calls IpcManager::WreapDeadIpcs() to clean up
+ * shared memory segments belonging to processes that have terminated.
+ * Scheduled by default every second during admin container creation.
+ */
+struct WreapDeadIpcsTask : public chi::Task {
+  // Output: Number of segments reaped in this invocation
+  OUT chi::u64 reaped_count_;
+
+  /** SHM default constructor */
+  WreapDeadIpcsTask()
+      : chi::Task(), reaped_count_(0) {}
+
+  /** Emplace constructor */
+  explicit WreapDeadIpcsTask(const chi::TaskId &task_node,
+                              const chi::PoolId &pool_id,
+                              const chi::PoolQuery &pool_query)
+      : chi::Task(task_node, pool_id, pool_query, Method::kWreapDeadIpcs),
+        reaped_count_(0) {
+    // Initialize task
+    task_id_ = task_node;
+    pool_id_ = pool_id;
+    method_ = Method::kWreapDeadIpcs;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  /**
+   * Serialize IN and INOUT parameters for network transfer
+   * No additional parameters for WreapDeadIpcsTask
+   */
+  template <typename Archive> void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+    // No additional parameters to serialize
+  }
+
+  /**
+   * Serialize OUT and INOUT parameters for network transfer
+   * This includes: reaped_count_
+   */
+  template <typename Archive> void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+    ar(reaped_count_);
+  }
+
+  /**
+   * Copy from another WreapDeadIpcsTask (assumes this task is already constructed)
+   * @param other Pointer to the source task to copy from
+   */
+  void Copy(const hipc::FullPtr<WreapDeadIpcsTask> &other) {
+    // Copy base Task fields
+    Task::Copy(other.template Cast<Task>());
+    // Copy WreapDeadIpcsTask-specific fields
+    reaped_count_ = other->reaped_count_;
+  }
+
+  /** Aggregate replica results into this task */
+  void Aggregate(const hipc::FullPtr<WreapDeadIpcsTask> &other) {
+    Task::Aggregate(other.template Cast<Task>());
+    Copy(other);
+  }
+};
+
+/**
  * MonitorTask - Monitor runtime and worker statistics
  *
  * This task collects statistics from all workers in the runtime including:
@@ -907,97 +972,6 @@ struct SubmitBatchTask : public chi::Task {
    * Aggregate replica results into this task
    */
   void Aggregate(const hipc::FullPtr<SubmitBatchTask> &other) {
-    Task::Aggregate(other.template Cast<Task>());
-    Copy(other);
-  }
-};
-
-/**
- * RegisterMemoryTask - Register a client's per-process shared memory with the runtime
- * This task is sent by clients when they create new shared memory segments
- * The runtime will attach to the shared memory and register it in its alloc_map_
- */
-struct RegisterMemoryTask : public chi::Task {
-  // Shared memory registration info
-  IN chi::priv::string shm_name_;      ///< Shared memory segment name
-  IN pid_t owner_pid_;                 ///< PID of the owning process
-  IN chi::u32 shm_index_;              ///< Index within owner's segments
-  IN size_t shm_size_;                 ///< Size of the shared memory
-  IN chi::u32 alloc_major_;            ///< Allocator ID major component
-  IN chi::u32 alloc_minor_;            ///< Allocator ID minor component
-
-  // Results
-  OUT chi::priv::string error_message_; ///< Error description if registration failed
-
-  /** SHM default constructor */
-  RegisterMemoryTask()
-      : chi::Task(), shm_name_(HSHM_MALLOC),
-        owner_pid_(0), shm_index_(0), shm_size_(0),
-        alloc_major_(0), alloc_minor_(0),
-        error_message_(HSHM_MALLOC) {}
-
-  /** Emplace constructor */
-  explicit RegisterMemoryTask(const chi::TaskId &task_node,
-                              const chi::PoolId &pool_id,
-                              const chi::PoolQuery &pool_query,
-                              const chi::ClientShmInfo &info)
-      : chi::Task(task_node, pool_id, pool_query, Method::kRegisterMemory),
-        shm_name_(HSHM_MALLOC, info.shm_name),
-        owner_pid_(info.owner_pid), shm_index_(info.shm_index),
-        shm_size_(info.size), alloc_major_(info.alloc_id.major_),
-        alloc_minor_(info.alloc_id.minor_),
-        error_message_(HSHM_MALLOC) {
-    // Initialize task
-    task_id_ = task_node;
-    pool_id_ = pool_id;
-    method_ = Method::kRegisterMemory;
-    task_flags_.Clear();
-    pool_query_ = pool_query;
-  }
-
-  /**
-   * Get ClientShmInfo from task fields
-   */
-  chi::ClientShmInfo GetShmInfo() const {
-    return chi::ClientShmInfo(
-        shm_name_.str(), owner_pid_, shm_index_, shm_size_,
-        hipc::AllocatorId(alloc_major_, alloc_minor_));
-  }
-
-  /**
-   * Serialize IN and INOUT parameters for network transfer
-   */
-  template <typename Archive>
-  void SerializeIn(Archive &ar) {
-    Task::SerializeIn(ar);
-    ar(shm_name_, owner_pid_, shm_index_, shm_size_, alloc_major_, alloc_minor_);
-  }
-
-  /**
-   * Serialize OUT and INOUT parameters for network transfer
-   */
-  template <typename Archive>
-  void SerializeOut(Archive &ar) {
-    Task::SerializeOut(ar);
-    ar(error_message_);
-  }
-
-  /**
-   * Copy from another RegisterMemoryTask
-   */
-  void Copy(const hipc::FullPtr<RegisterMemoryTask> &other) {
-    Task::Copy(other.template Cast<Task>());
-    shm_name_ = other->shm_name_;
-    owner_pid_ = other->owner_pid_;
-    shm_index_ = other->shm_index_;
-    shm_size_ = other->shm_size_;
-    alloc_major_ = other->alloc_major_;
-    alloc_minor_ = other->alloc_minor_;
-    error_message_ = other->error_message_;
-  }
-
-  /** Aggregate replica results into this task */
-  void Aggregate(const hipc::FullPtr<RegisterMemoryTask> &other) {
     Task::Aggregate(other.template Cast<Task>());
     Copy(other);
   }

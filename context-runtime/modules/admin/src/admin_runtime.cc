@@ -60,6 +60,10 @@ chi::TaskResume Runtime::Create(hipc::FullPtr<CreateTask> task,
   // This task polls for ZMQ heartbeat requests and responds
   client_.AsyncHeartbeat(chi::PoolQuery::Local(), 5000);
 
+  // Spawn periodic WreapDeadIpcs task with 1 second period
+  // This task reaps shared memory segments from dead processes
+  client_.AsyncWreapDeadIpcs(chi::PoolQuery::Local(), 1000000);
+
   HLOG(kDebug,
        "Admin: Container created and initialized for pool: {} (ID: {}, count: "
        "{})",
@@ -1033,49 +1037,23 @@ chi::TaskResume Runtime::SubmitBatch(hipc::FullPtr<SubmitBatchTask> task,
   co_return;
 }
 
-chi::TaskResume Runtime::RegisterMemory(hipc::FullPtr<RegisterMemoryTask> task,
-                                        chi::RunContext &rctx) {
-  HLOG(kInfo, "Admin: Executing RegisterMemory task - shm_name={}, owner_pid={}",
-       task->shm_name_.str(), task->owner_pid_);
-
+chi::TaskResume Runtime::WreapDeadIpcs(hipc::FullPtr<WreapDeadIpcsTask> task,
+                                       chi::RunContext &rctx) {
   auto *ipc_manager = CHI_IPC;
 
-  // Initialize output values
-  task->error_message_ = "";
+  // Call IpcManager::WreapDeadIpcs to reap shared memory from dead processes
+  task->reaped_count_ = ipc_manager->WreapDeadIpcs();
 
-  try {
-    // Get alloc_id from task fields
-    hipc::AllocatorId alloc_id(task->alloc_major_, task->alloc_minor_);
-
-    // Register the shared memory with IpcManager
-    // shm_name is derived from alloc_id (chimaera_{pid}_{index})
-    if (!ipc_manager->RegisterMemory(alloc_id, task->shm_size_)) {
-      task->SetReturnCode(1);
-      auto *alloc = ipc_manager->GetMainAlloc();
-      std::string shm_name = "chimaera_" + std::to_string(task->alloc_major_) +
-                             "_" + std::to_string(task->alloc_minor_);
-      task->error_message_ = chi::priv::string(
-          HSHM_MALLOC, "Failed to register shared memory: " + shm_name);
-      HLOG(kError, "Admin: RegisterMemory failed for {}", shm_name);
-      co_return;
-    }
-
-    task->SetReturnCode(0);
-    std::string shm_name = "chimaera_" + std::to_string(task->alloc_major_) +
-                           "_" + std::to_string(task->alloc_minor_);
-    HLOG(kInfo, "Admin: RegisterMemory completed successfully for {}",
-         shm_name);
-
-  } catch (const std::exception &e) {
-    task->SetReturnCode(99);
-    auto *alloc = ipc_manager->GetMainAlloc();
-    std::string error_msg =
-        std::string("Exception during memory registration: ") + e.what();
-    task->error_message_ = chi::priv::string(HSHM_MALLOC, error_msg);
-    HLOG(kError, "Admin: RegisterMemory failed with exception: {}", e.what());
+  // Mark whether we did work (for periodic task efficiency tracking)
+  if (task->reaped_count_ > 0) {
+    rctx.did_work_ = true;
+    HLOG(kInfo, "Admin: WreapDeadIpcs reaped {} shared memory segments",
+         task->reaped_count_);
+  } else {
+    rctx.did_work_ = false;
   }
 
-  (void)rctx;
+  task->SetReturnCode(0);
   co_return;
 }
 

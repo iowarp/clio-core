@@ -673,6 +673,33 @@ class IpcManager {
    */
   ClientShmInfo GetClientShmInfo(u32 index) const;
 
+  /**
+   * Reap shared memory segments from dead processes
+   *
+   * Iterates over all registered shared memory segments and checks if the
+   * owning process (identified by pid = AllocatorId.major) is still alive.
+   * For segments belonging to dead processes, destroys the shared memory
+   * backend and removes tracking entries.
+   *
+   * Does not reap:
+   * - Segments owned by the current process
+   * - The main allocator segment (AllocatorId 1.0)
+   *
+   * @return Number of shared memory segments reaped
+   */
+  size_t WreapDeadIpcs();
+
+  /**
+   * Reap all shared memory segments
+   *
+   * Destroys all shared memory backends (except main allocator) and clears
+   * all tracking structures. This is typically called during shutdown to
+   * clean up all IPC resources.
+   *
+   * @return Number of shared memory segments reaped
+   */
+  size_t WreapAllIpcs();
+
  private:
   /**
    * Check if task is a network task (Send or Recv)

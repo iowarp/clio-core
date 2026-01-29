@@ -10,6 +10,7 @@
 #include "chimaera/task_queue.h"
 #include "chimaera/scheduler/scheduler_factory.h"
 #include <arpa/inet.h>
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <endian.h>
@@ -1075,6 +1076,178 @@ ClientShmInfo IpcManager::GetClientShmInfo(u32 index) const {
   }
 
   return ClientShmInfo(shm_name, pid, index, size, alloc_id);
+}
+
+size_t IpcManager::WreapDeadIpcs() {
+  std::lock_guard<std::mutex> lock(shm_mutex_);
+
+  pid_t current_pid = getpid();
+  size_t reaped_count = 0;
+
+  // Build list of allocator keys to remove (can't modify map while iterating)
+  std::vector<u64> keys_to_remove;
+
+  for (const auto &pair : alloc_map_) {
+    u64 alloc_key = pair.first;
+
+    // Extract pid from allocator key (major is in upper 32 bits)
+    u32 major = static_cast<u32>(alloc_key >> 32);
+    u32 minor = static_cast<u32>(alloc_key & 0xFFFFFFFF);
+
+    // Skip main allocator (1.0)
+    if (major == 1 && minor == 0) {
+      continue;
+    }
+
+    // Skip our own process's segments
+    pid_t owner_pid = static_cast<pid_t>(major);
+    if (owner_pid == current_pid) {
+      continue;
+    }
+
+    // Check if the owning process is still alive
+    // kill(pid, 0) returns 0 if process exists, -1 with ESRCH if not
+    if (kill(owner_pid, 0) == -1 && errno == ESRCH) {
+      // Process is dead - mark for removal
+      HLOG(kInfo, "WreapDeadIpcs: Process {} is dead, marking allocator ({}.{}) for removal",
+           owner_pid, major, minor);
+      keys_to_remove.push_back(alloc_key);
+    }
+  }
+
+  // Remove marked allocators and their backends
+  for (u64 key : keys_to_remove) {
+    // Find the allocator in the map
+    auto map_it = alloc_map_.find(key);
+    if (map_it == alloc_map_.end()) {
+      continue;
+    }
+
+    hipc::MultiProcessAllocator *allocator = map_it->second;
+
+    // Get the allocator ID to construct shm_name
+    hipc::AllocatorId alloc_id = allocator->GetId();
+    std::string shm_name = "chimaera_" + std::to_string(alloc_id.major_) +
+                           "_" + std::to_string(alloc_id.minor_);
+
+    // Find and destroy the corresponding backend
+    for (auto backend_it = client_backends_.begin();
+         backend_it != client_backends_.end(); ++backend_it) {
+      if (*backend_it && (*backend_it)->header_ &&
+          (*backend_it)->header_->id_.major_ == alloc_id.major_ &&
+          (*backend_it)->header_->id_.minor_ == alloc_id.minor_) {
+        // Destroy the shared memory
+        HLOG(kInfo, "WreapDeadIpcs: Destroying shared memory {} for allocator ({}.{})",
+             shm_name, alloc_id.major_, alloc_id.minor_);
+        (*backend_it)->shm_destroy();
+        client_backends_.erase(backend_it);
+        break;
+      }
+    }
+
+    // Remove from alloc_vector_ if present
+    auto vec_it = std::find(alloc_vector_.begin(), alloc_vector_.end(), allocator);
+    if (vec_it != alloc_vector_.end()) {
+      alloc_vector_.erase(vec_it);
+    }
+
+    // Clear last_alloc_ if it points to this allocator
+    if (last_alloc_ == allocator) {
+      last_alloc_ = alloc_vector_.empty() ? nullptr : alloc_vector_.back();
+    }
+
+    // Remove from alloc_map_
+    alloc_map_.erase(map_it);
+    reaped_count++;
+  }
+
+  if (reaped_count > 0) {
+    HLOG(kInfo, "WreapDeadIpcs: Reaped {} shared memory segments from dead processes",
+         reaped_count);
+  }
+
+  return reaped_count;
+}
+
+size_t IpcManager::WreapAllIpcs() {
+  std::lock_guard<std::mutex> lock(shm_mutex_);
+
+  size_t reaped_count = 0;
+
+  // Build list of all allocator keys except main allocator (1.0)
+  std::vector<u64> keys_to_remove;
+
+  for (const auto &pair : alloc_map_) {
+    u64 alloc_key = pair.first;
+
+    // Extract pid from allocator key (major is in upper 32 bits)
+    u32 major = static_cast<u32>(alloc_key >> 32);
+    u32 minor = static_cast<u32>(alloc_key & 0xFFFFFFFF);
+
+    // Skip main allocator (1.0) - it's managed separately
+    if (major == 1 && minor == 0) {
+      continue;
+    }
+
+    keys_to_remove.push_back(alloc_key);
+  }
+
+  // Destroy all backends and remove from tracking structures
+  for (u64 key : keys_to_remove) {
+    auto map_it = alloc_map_.find(key);
+    if (map_it == alloc_map_.end()) {
+      continue;
+    }
+
+    hipc::MultiProcessAllocator *allocator = map_it->second;
+
+    // Get the allocator ID to construct shm_name
+    hipc::AllocatorId alloc_id = allocator->GetId();
+    std::string shm_name = "chimaera_" + std::to_string(alloc_id.major_) +
+                           "_" + std::to_string(alloc_id.minor_);
+
+    // Find and destroy the corresponding backend
+    for (auto backend_it = client_backends_.begin();
+         backend_it != client_backends_.end(); ++backend_it) {
+      if (*backend_it && (*backend_it)->header_ &&
+          (*backend_it)->header_->id_.major_ == alloc_id.major_ &&
+          (*backend_it)->header_->id_.minor_ == alloc_id.minor_) {
+        // Destroy the shared memory
+        HLOG(kInfo, "WreapAllIpcs: Destroying shared memory {} for allocator ({}.{})",
+             shm_name, alloc_id.major_, alloc_id.minor_);
+        (*backend_it)->shm_destroy();
+        client_backends_.erase(backend_it);
+        break;
+      }
+    }
+
+    // Remove from alloc_map_
+    alloc_map_.erase(map_it);
+    reaped_count++;
+  }
+
+  // Clear remaining structures
+  alloc_vector_.clear();
+  last_alloc_ = nullptr;
+
+  // Note: client_backends_ may still have some entries if backends were
+  // not found in the loop above (shouldn't happen in normal operation)
+  if (!client_backends_.empty()) {
+    HLOG(kWarning, "WreapAllIpcs: {} backends remaining after cleanup",
+         client_backends_.size());
+    // Destroy any remaining backends
+    for (auto &backend : client_backends_) {
+      if (backend) {
+        backend->shm_destroy();
+        reaped_count++;
+      }
+    }
+    client_backends_.clear();
+  }
+
+  HLOG(kInfo, "WreapAllIpcs: Reaped {} shared memory segments", reaped_count);
+
+  return reaped_count;
 }
 
 } // namespace chi
