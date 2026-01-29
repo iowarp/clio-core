@@ -1,10 +1,12 @@
 #include <wrp_cae/core/core_runtime.h>
 #include <wrp_cae/core/factory/assimilation_ctx.h>
 #include <wrp_cae/core/factory/assimilator_factory.h>
+#include <wrp_cae/core/factory/hdf5_file_assimilator.h>
 #include <cereal/archives/binary.hpp>
 #include <cereal/types/vector.hpp>
 #include <sstream>
 #include <vector>
+#include <hdf5.h>
 
 // Include wrp_cte headers before opening namespace to avoid Method namespace collision
 #include <wrp_cte/core/core_client.h>
@@ -96,6 +98,40 @@ chi::TaskResume Runtime::ParseOmni(hipc::FullPtr<ParseOmniTask> task, chi::RunCo
   task->num_tasks_scheduled_ = tasks_scheduled;
 
   HLOG(kInfo, "ParseOmni: Successfully scheduled {} assimilations", tasks_scheduled);
+  co_return;
+}
+
+chi::TaskResume Runtime::ProcessHdf5Dataset(hipc::FullPtr<ProcessHdf5DatasetTask> task, chi::RunContext& ctx) {
+  HLOG(kInfo, "ProcessHdf5Dataset: file='{}', dataset='{}', tag_prefix='{}'",
+        task->file_path_.str(), task->dataset_path_.str(), task->tag_prefix_.str());
+
+  // Open the HDF5 file
+  hid_t file_id = H5Fopen(task->file_path_.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
+  if (file_id < 0) {
+    HLOG(kError, "ProcessHdf5Dataset: Failed to open HDF5 file: {}", task->file_path_.str());
+    task->result_code_ = -1;
+    task->error_message_ = chi::priv::string("Failed to open HDF5 file", CHI_IPC->GetMainAlloc());
+    co_return;
+  }
+
+  // Create assimilator and process the dataset
+  wrp_cae::core::Hdf5FileAssimilator assimilator(cte_client_);
+  int result = 0;
+  co_await assimilator.ProcessDataset(file_id, task->dataset_path_.str(), task->tag_prefix_.str(), result);
+
+  // Close the HDF5 file
+  H5Fclose(file_id);
+
+  if (result != 0) {
+    HLOG(kError, "ProcessHdf5Dataset: Failed to process dataset '{}' (error: {})",
+          task->dataset_path_.str(), result);
+    task->result_code_ = result;
+    task->error_message_ = chi::priv::string("Dataset processing failed", CHI_IPC->GetMainAlloc());
+  } else {
+    HLOG(kInfo, "ProcessHdf5Dataset: Successfully processed dataset '{}'", task->dataset_path_.str());
+    task->result_code_ = 0;
+  }
+
   co_return;
 }
 

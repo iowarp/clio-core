@@ -58,6 +58,32 @@ class Client : public chi::ContainerClient {
     return ipc_manager->Send(task);
   }
 
+  /**
+   * Asynchronous ProcessHdf5Dataset - Process a single HDF5 dataset
+   * Can be routed to a specific node for distributed processing
+   * @param pool_query Pool query for routing (use PoolQuery::Physical(node_id) for specific node)
+   * @param file_path Path to the HDF5 file
+   * @param dataset_path Path to the dataset within the HDF5 file
+   * @param tag_prefix Tag prefix for CTE storage
+   */
+  chi::Future<ProcessHdf5DatasetTask> AsyncProcessHdf5Dataset(
+      const chi::PoolQuery& pool_query,
+      const std::string& file_path,
+      const std::string& dataset_path,
+      const std::string& tag_prefix) {
+    auto* ipc_manager = CHI_IPC;
+
+    auto task = ipc_manager->NewTask<ProcessHdf5DatasetTask>(
+        chi::CreateTaskId(),
+        pool_id_,
+        pool_query,
+        file_path,
+        dataset_path,
+        tag_prefix);
+
+    return ipc_manager->Send(task);
+  }
+
 };
 
 }  // namespace wrp_cae::core

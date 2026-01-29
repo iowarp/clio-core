@@ -79,9 +79,11 @@ class Hdf5FileAssimilator : public BaseAssimilator {
    */
   int DiscoverDatasets(hid_t file_id, std::vector<std::string>& dataset_paths);
 
+ public:
   /**
    * Process a single dataset: create tag, store description, transfer chunks
    * This is a coroutine that uses co_await for async CTE operations.
+   * Made public for use by Runtime::ProcessHdf5Dataset for distributed processing.
    * @param file_id HDF5 file ID
    * @param dataset_path Path to dataset within file (e.g., "/data/temperature")
    * @param tag_prefix Prefix for tag name (destination path without protocol)
@@ -90,6 +92,8 @@ class Hdf5FileAssimilator : public BaseAssimilator {
    */
   chi::TaskResume ProcessDataset(hid_t file_id, const std::string& dataset_path,
                                   const std::string& tag_prefix, int& error_code);
+
+ private:
 
   /**
    * Get human-readable type name for HDF5 datatype

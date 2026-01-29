@@ -127,6 +127,86 @@ struct ParseOmniTask : public chi::Task {
   }
 };
 
+/**
+ * ProcessHdf5DatasetTask - Process a single HDF5 dataset
+ * Used for distributed processing where each dataset can be routed to different nodes
+ */
+struct ProcessHdf5DatasetTask : public chi::Task {
+  // Task-specific data
+  IN chi::priv::string file_path_;      // HDF5 file path
+  IN chi::priv::string dataset_path_;   // Dataset path within HDF5 file
+  IN chi::priv::string tag_prefix_;     // Tag prefix for CTE storage
+  OUT chi::u32 result_code_;            // Result code (0 = success)
+  OUT chi::priv::string error_message_; // Error message if failed
+
+  // SHM constructor
+  ProcessHdf5DatasetTask()
+      : chi::Task(),
+        file_path_(CHI_IPC->GetMainAlloc()),
+        dataset_path_(CHI_IPC->GetMainAlloc()),
+        tag_prefix_(CHI_IPC->GetMainAlloc()),
+        result_code_(0),
+        error_message_(CHI_IPC->GetMainAlloc()) {}
+
+  // Emplace constructor
+  explicit ProcessHdf5DatasetTask(
+      const chi::TaskId &task_node,
+      const chi::PoolId &pool_id,
+      const chi::PoolQuery &pool_query,
+      const std::string &file_path,
+      const std::string &dataset_path,
+      const std::string &tag_prefix)
+      : chi::Task(task_node, pool_id, pool_query, Method::kProcessHdf5Dataset),
+        file_path_(CHI_IPC->GetMainAlloc(), file_path),
+        dataset_path_(CHI_IPC->GetMainAlloc(), dataset_path),
+        tag_prefix_(CHI_IPC->GetMainAlloc(), tag_prefix),
+        result_code_(0),
+        error_message_(CHI_IPC->GetMainAlloc()) {
+    task_id_ = task_node;
+    method_ = Method::kProcessHdf5Dataset;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  /**
+   * Serialize IN and INOUT parameters
+   */
+  template <typename Archive> void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+    ar(file_path_, dataset_path_, tag_prefix_);
+  }
+
+  /**
+   * Serialize OUT and INOUT parameters
+   */
+  template <typename Archive> void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+    ar(result_code_, error_message_);
+  }
+
+  // Copy method for distributed execution
+  void Copy(const hipc::FullPtr<ProcessHdf5DatasetTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+    file_path_ = other->file_path_;
+    dataset_path_ = other->dataset_path_;
+    tag_prefix_ = other->tag_prefix_;
+    result_code_ = other->result_code_;
+    error_message_ = other->error_message_;
+  }
+
+  /**
+   * Aggregate replica results into this task
+   */
+  void Aggregate(const hipc::FullPtr<ProcessHdf5DatasetTask> &other) {
+    Task::Aggregate(other.template Cast<Task>());
+    // Keep the first error if any
+    if (result_code_ == 0 && other->result_code_ != 0) {
+      result_code_ = other->result_code_;
+      error_message_ = other->error_message_;
+    }
+  }
+};
+
 }  // namespace wrp_cae::core
 
 #endif  // WRP_CAE_CORE_TASKS_H_

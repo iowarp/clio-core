@@ -1,5 +1,8 @@
 #include <wrp_cae/core/factory/hdf5_file_assimilator.h>
+#include <wrp_cae/core/core_client.h>
+#include <wrp_cae/core/core_tasks.h>
 #include <chimaera/chimaera.h>
+#include <chimaera/ipc_manager.h>
 #include <sys/stat.h>
 #include <algorithm>
 #include <vector>
@@ -115,25 +118,101 @@ chi::TaskResume Hdf5FileAssimilator::Schedule(const AssimilationCtx& ctx, int& e
     filtered_paths = dataset_paths;
   }
 
-  // Process each filtered dataset
-  int total_errors = 0;
-  for (size_t i = 0; i < filtered_paths.size(); ++i) {
-    const auto& dataset_path = filtered_paths[i];
-    HLOG(kInfo, "Hdf5FileAssimilator: Processing dataset {}/{}: '{}'",
-          i + 1, filtered_paths.size(), dataset_path);
-    int result = 0;
-    co_await ProcessDataset(file_id, dataset_path, tag_prefix, result);
-    if (result != 0) {
-      HLOG(kError, "Hdf5FileAssimilator: Failed to process dataset '{}' (error code: {})",
-            dataset_path, result);
-      total_errors++;
+  // Get distributed processing info from CTE/IPC manager
+  size_t num_nodes = 1;
+  auto* ipc_manager = CHI_IPC;
+  std::vector<chi::Host> all_hosts;
+  if (ipc_manager) {
+    all_hosts = ipc_manager->GetAllHosts();
+    num_nodes = all_hosts.size();
+    if (num_nodes > 1) {
+      HLOG(kInfo, "Hdf5FileAssimilator: CTE distributed mode - {} nodes available", num_nodes);
     } else {
-      HLOG(kInfo, "Hdf5FileAssimilator: Successfully processed dataset '{}'", dataset_path);
+      HLOG(kInfo, "Hdf5FileAssimilator: Single node mode");
     }
   }
 
-  HLOG(kInfo, "Hdf5FileAssimilator: Closing HDF5 file...");
+  // Close file before distributing tasks (each task will open it independently)
+  HLOG(kInfo, "Hdf5FileAssimilator: Closing HDF5 file before distributed processing...");
   CloseHdf5File(file_id);
+
+  // Distribute datasets across nodes using CTE task routing
+  int total_errors = 0;
+  if (num_nodes > 1 && !all_hosts.empty()) {
+    // Distributed mode: create per-dataset tasks routed to specific nodes
+    HLOG(kInfo, "Hdf5FileAssimilator: Creating {} distributed tasks across {} nodes",
+          filtered_paths.size(), num_nodes);
+
+    // Get CAE client for creating tasks
+    auto* cae_client = WRP_CAE_CLIENT;
+    if (!cae_client) {
+      HLOG(kError, "Hdf5FileAssimilator: CAE client not initialized");
+      error_code = -7;
+      co_return;
+    }
+
+    // Create futures for all dataset tasks
+    std::vector<chi::Future<ProcessHdf5DatasetTask>> futures;
+    futures.reserve(filtered_paths.size());
+
+    for (size_t i = 0; i < filtered_paths.size(); ++i) {
+      const auto& dataset_path = filtered_paths[i];
+      // Round-robin distribution to nodes
+      chi::u32 target_node = static_cast<chi::u32>(i % num_nodes);
+      auto pool_query = chi::PoolQuery::Physical(target_node);
+
+      HLOG(kInfo, "Hdf5FileAssimilator: Routing dataset {}/{} '{}' to node {}",
+            i + 1, filtered_paths.size(), dataset_path, target_node);
+
+      auto future = cae_client->AsyncProcessHdf5Dataset(
+          pool_query, src_path, dataset_path, tag_prefix);
+      futures.push_back(std::move(future));
+    }
+
+    // Wait for all tasks to complete
+    HLOG(kInfo, "Hdf5FileAssimilator: Waiting for {} distributed tasks to complete...",
+          futures.size());
+    for (size_t i = 0; i < futures.size(); ++i) {
+      futures[i].Wait();
+      auto task = futures[i].get();
+      if (task->result_code_ != 0) {
+        HLOG(kError, "Hdf5FileAssimilator: Dataset {} failed (error: {})",
+              filtered_paths[i], task->result_code_);
+        total_errors++;
+      } else {
+        HLOG(kInfo, "Hdf5FileAssimilator: Dataset {} completed successfully",
+              filtered_paths[i]);
+      }
+    }
+  } else {
+    // Single node mode: process locally
+    // Re-open the file for local processing
+    file_id = OpenHdf5File(src_path);
+    if (file_id < 0) {
+      HLOG(kError, "Hdf5FileAssimilator: Failed to re-open HDF5 file for local processing");
+      error_code = -8;
+      co_return;
+    }
+
+    for (size_t i = 0; i < filtered_paths.size(); ++i) {
+      const auto& dataset_path = filtered_paths[i];
+      HLOG(kInfo, "Hdf5FileAssimilator: Processing dataset {}/{}: '{}'",
+            i + 1, filtered_paths.size(), dataset_path);
+      int result = 0;
+      co_await ProcessDataset(file_id, dataset_path, tag_prefix, result);
+      if (result != 0) {
+        HLOG(kError, "Hdf5FileAssimilator: Failed to process dataset '{}' (error code: {})",
+              dataset_path, result);
+        total_errors++;
+      } else {
+        HLOG(kInfo, "Hdf5FileAssimilator: Successfully processed dataset '{}'", dataset_path);
+      }
+    }
+
+    HLOG(kInfo, "Hdf5FileAssimilator: Closing HDF5 file...");
+    CloseHdf5File(file_id);
+  }
+
   HLOG(kInfo, "Hdf5FileAssimilator: HDF5 file closed");
 
   if (total_errors > 0) {
@@ -347,7 +426,9 @@ chi::TaskResume Hdf5FileAssimilator::ProcessDataset(hid_t file_id,
   HLOG(kInfo, "Hdf5FileAssimilator: Stored description for '{}': {}", tag_name, description);
 
   // Define chunking parameters
-  static constexpr size_t kMaxChunkSize = 1024 * 1024;  // 1 MB
+  // Note: kMaxChunkSize must be < 2MB due to hermes_shm MultiProcessAllocator
+  // thread_unit_ limit (2MB). Using 1.5MB to leave room for allocator overhead.
+  static constexpr size_t kMaxChunkSize = 1536 * 1024;  // 1.5 MB
   static constexpr size_t kMaxParallelTasks = 32;
 
   // Calculate number of chunks
@@ -355,170 +436,86 @@ chi::TaskResume Hdf5FileAssimilator::ProcessDataset(hid_t file_id,
   HLOG(kInfo, "ProcessDataset: Starting data transfer - total_bytes: {}, num_chunks: {}, kMaxChunkSize: {}",
         total_bytes, num_chunks, kMaxChunkSize);
 
-  // Allocate buffer for reading chunks
-  size_t buffer_size = std::min(kMaxChunkSize, total_bytes);
-  HLOG(kInfo, "ProcessDataset: Allocating read buffer of size: {} bytes", buffer_size);
-  auto read_buffer = CHI_IPC->AllocateBuffer(buffer_size);
-  char* buffer = read_buffer.ptr_;
+  // Allocate buffer for reading entire dataset using malloc (not IPC allocator)
+  // This avoids the 2MB allocator limit for HDF5 read operations
+  HLOG(kInfo, "ProcessDataset: Allocating read buffer of size: {} bytes (malloc)", total_bytes);
+  char* dataset_buffer = static_cast<char*>(malloc(total_bytes));
+  if (!dataset_buffer) {
+    HLOG(kError, "Hdf5FileAssimilator: Failed to allocate {} bytes for dataset '{}'",
+          total_bytes, dataset_path);
+    H5Tclose(datatype_id);
+    H5Sclose(dataspace_id);
+    H5Dclose(dataset_id);
+    error_code = -7;
+    co_return;
+  }
 
-  // Process chunks in batches
+  // Read the entire dataset in one H5Dread call
+  HLOG(kInfo, "ProcessDataset: Reading entire dataset with H5Dread...");
+  herr_t read_status = H5Dread(dataset_id, datatype_id, H5S_ALL, H5S_ALL,
+                               H5P_DEFAULT, dataset_buffer);
+  if (read_status < 0) {
+    HLOG(kError, "Hdf5FileAssimilator: H5Dread failed for dataset '{}'", dataset_path);
+    free(dataset_buffer);
+    H5Tclose(datatype_id);
+    H5Sclose(dataspace_id);
+    H5Dclose(dataset_id);
+    error_code = -8;
+    co_return;
+  }
+  HLOG(kInfo, "ProcessDataset: Dataset read successfully ({} bytes)", total_bytes);
+
+  // Process data in chunks and send to CTE
   size_t chunk_idx = 0;
   size_t bytes_processed = 0;
   std::vector<chi::Future<wrp_cte::core::PutBlobTask>> active_tasks;
 
-  HLOG(kInfo, "ProcessDataset: Starting chunk processing loop...");
+  HLOG(kInfo, "ProcessDataset: Starting chunk transfer loop...");
   while (bytes_processed < total_bytes) {
     HLOG(kInfo, "ProcessDataset: Loop iteration - bytes_processed: {}/{}, active_tasks: {}",
           bytes_processed, total_bytes, active_tasks.size());
+
     // Submit tasks up to the parallel limit
     while (active_tasks.size() < kMaxParallelTasks && bytes_processed < total_bytes) {
-      HLOG(kInfo, "ProcessDataset: Preparing chunk {} (bytes_processed: {}/{})",
-            chunk_idx, bytes_processed, total_bytes);
-      // Calculate chunk size
       size_t current_chunk_size = std::min(kMaxChunkSize, total_bytes - bytes_processed);
-
-      // Calculate hyperslab parameters for this chunk
-      // We read the dataset linearly, treating it as a flat array
-      size_t element_offset = bytes_processed / type_size;
-      size_t elements_to_read = current_chunk_size / type_size;
-
-      // For simplicity, we'll read the entire dataset into memory for small datasets
-      // For large datasets, we use hyperslab selection
-      if (total_bytes <= kMaxChunkSize) {
-        // Small dataset - read entire dataset in one go
-        HLOG(kInfo, "ProcessDataset: Reading small dataset (entire dataset in one go)...");
-        herr_t read_status = H5Dread(dataset_id, datatype_id, H5S_ALL, H5S_ALL,
-                                     H5P_DEFAULT, buffer);
-        if (read_status < 0) {
-          HLOG(kError, "Hdf5FileAssimilator: Failed to read dataset '{}'", dataset_path);
-          CHI_IPC->FreeBuffer(read_buffer);
-          H5Tclose(datatype_id);
-          H5Sclose(dataspace_id);
-          H5Dclose(dataset_id);
-          error_code = -7;
-          co_return;
-        }
-        HLOG(kInfo, "ProcessDataset: Small dataset read successfully");
-      } else {
-        // Large dataset - use hyperslab selection
-        // Create memory dataspace for this chunk
-        hsize_t mem_dims[1] = {elements_to_read};
-        hid_t memspace = H5Screate_simple(1, mem_dims, nullptr);
-        if (memspace < 0) {
-          HLOG(kError, "Hdf5FileAssimilator: Failed to create memory space for chunk {}",
-                chunk_idx);
-          CHI_IPC->FreeBuffer(read_buffer);
-          H5Tclose(datatype_id);
-          H5Sclose(dataspace_id);
-          H5Dclose(dataset_id);
-          error_code = -8;
-          co_return;
-        }
-
-        // Select hyperslab in file dataspace
-        // Flatten the dataset to 1D for easier chunking
-        hsize_t start[1] = {element_offset};
-        hsize_t count[1] = {elements_to_read};
-        hsize_t stride[1] = {1};
-        hsize_t block[1] = {1};
-
-        // Create a flattened dataspace
-        hsize_t total_elements_hsize = total_elements;
-        hid_t flat_space = H5Screate_simple(1, &total_elements_hsize, nullptr);
-        if (flat_space < 0) {
-          HLOG(kError, "Hdf5FileAssimilator: Failed to create flat space for chunk {}",
-                chunk_idx);
-          H5Sclose(memspace);
-          CHI_IPC->FreeBuffer(read_buffer);
-          H5Tclose(datatype_id);
-          H5Sclose(dataspace_id);
-          H5Dclose(dataset_id);
-          error_code = -9;
-          co_return;
-        }
-
-        herr_t select_status = H5Sselect_hyperslab(flat_space, H5S_SELECT_SET,
-                                                   start, stride, count, block);
-        if (select_status < 0) {
-          HLOG(kError, "Hdf5FileAssimilator: Failed to select hyperslab for chunk {}",
-                chunk_idx);
-          H5Sclose(flat_space);
-          H5Sclose(memspace);
-          CHI_IPC->FreeBuffer(read_buffer);
-          H5Tclose(datatype_id);
-          H5Sclose(dataspace_id);
-          H5Dclose(dataset_id);
-          error_code = -10;
-          co_return;
-        }
-
-        // Read the hyperslab
-        herr_t read_status = H5Dread(dataset_id, datatype_id, memspace,
-                                    flat_space, H5P_DEFAULT, buffer);
-        H5Sclose(flat_space);
-        H5Sclose(memspace);
-
-        if (read_status < 0) {
-          HLOG(kError, "Hdf5FileAssimilator: Failed to read chunk {} from dataset '{}'",
-                chunk_idx, dataset_path);
-          CHI_IPC->FreeBuffer(read_buffer);
-          H5Tclose(datatype_id);
-          H5Sclose(dataspace_id);
-          H5Dclose(dataset_id);
-          error_code = -11;
-          co_return;
-        }
-      }
 
       // Create blob name with chunk index
       std::string blob_name = "chunk_" + std::to_string(chunk_idx);
-      HLOG(kInfo, "ProcessDataset: Creating blob '{}' with size: {} bytes", blob_name, current_chunk_size);
+      HLOG(kInfo, "ProcessDataset: Creating blob '{}' with size: {} bytes (chunk {}/{})",
+            blob_name, current_chunk_size, chunk_idx + 1, num_chunks);
 
-      // Allocate a new buffer for this chunk (since we need to keep reading)
+      // Allocate IPC buffer for this chunk and copy data
       auto chunk_buffer = CHI_IPC->AllocateBuffer(current_chunk_size);
-      std::memcpy(chunk_buffer.ptr_, buffer, current_chunk_size);
+      std::memcpy(chunk_buffer.ptr_, dataset_buffer + bytes_processed, current_chunk_size);
 
       // Submit PutBlob task asynchronously
-      HLOG(kInfo, "ProcessDataset: Submitting AsyncPutBlob for chunk {}...", chunk_idx);
       auto task = cte_client_->AsyncPutBlob(
           tag_id, blob_name, 0, current_chunk_size,
           chunk_buffer.shm_.template Cast<void>(), 1.0f, 0);
 
       active_tasks.push_back(task);
-      HLOG(kInfo, "ProcessDataset: Task submitted for chunk {}, active_tasks count: {}",
-            chunk_idx, active_tasks.size());
 
       bytes_processed += current_chunk_size;
       chunk_idx++;
-
-      // For small datasets, we're done after one chunk
-      if (total_bytes <= kMaxChunkSize) {
-        HLOG(kInfo, "ProcessDataset: Small dataset - exiting submission loop");
-        break;
-      }
     }
 
     // Wait for at least one task to complete before continuing
     if (!active_tasks.empty()) {
-      HLOG(kInfo, "ProcessDataset: Waiting for first task to complete...");
       auto& first_task = active_tasks.front();
       co_await first_task;
 
       if (first_task->return_code_ != 0) {
         HLOG(kError, "Hdf5FileAssimilator: PutBlob task failed with code {}",
               first_task->return_code_);
-        // Free the buffer before deleting the task
         CHI_IPC->FreeBuffer(first_task->blob_data_.template Cast<char>());
-        CHI_IPC->FreeBuffer(read_buffer);
+        free(dataset_buffer);
         H5Tclose(datatype_id);
         H5Sclose(dataspace_id);
         H5Dclose(dataset_id);
-        error_code = -12;
+        error_code = -9;
         co_return;
       }
 
-      HLOG(kInfo, "ProcessDataset: First task completed successfully");
-      // Free the buffer before deleting the task
       CHI_IPC->FreeBuffer(first_task->blob_data_.template Cast<char>());
       active_tasks.erase(active_tasks.begin());
     }
@@ -532,21 +529,19 @@ chi::TaskResume Hdf5FileAssimilator::ProcessDataset(hid_t file_id,
     if (task->return_code_ != 0) {
       HLOG(kError, "Hdf5FileAssimilator: PutBlob task failed with code {}",
             task->return_code_);
-      // Free the buffer before deleting the task
       CHI_IPC->FreeBuffer(task->blob_data_.template Cast<char>());
-      CHI_IPC->FreeBuffer(read_buffer);
+      free(dataset_buffer);
       H5Tclose(datatype_id);
       H5Sclose(dataspace_id);
       H5Dclose(dataset_id);
-      error_code = -12;
+      error_code = -10;
       co_return;
     }
-    // Free the buffer before deleting the task
     CHI_IPC->FreeBuffer(task->blob_data_.template Cast<char>());
   }
 
   HLOG(kInfo, "ProcessDataset: All tasks completed, cleaning up resources...");
-  CHI_IPC->FreeBuffer(read_buffer);
+  free(dataset_buffer);
   HLOG(kInfo, "ProcessDataset: Buffer freed");
   H5Tclose(datatype_id);
   HLOG(kInfo, "ProcessDataset: Datatype closed");

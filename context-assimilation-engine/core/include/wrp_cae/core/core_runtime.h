@@ -67,6 +67,13 @@ class Runtime : public chi::Container {
    */
   chi::TaskResume ParseOmni(hipc::FullPtr<ParseOmniTask> task, chi::RunContext& ctx);
 
+  /**
+   * ProcessHdf5Dataset - Process a single HDF5 dataset (Method::kProcessHdf5Dataset)
+   * Used for distributed processing where each dataset task is routed to a specific node.
+   * @return TaskResume for coroutine suspension/resumption
+   */
+  chi::TaskResume ProcessHdf5Dataset(hipc::FullPtr<ProcessHdf5DatasetTask> task, chi::RunContext& ctx);
+
  private:
   Client client_;
   std::shared_ptr<wrp_cte::core::Client> cte_client_;
