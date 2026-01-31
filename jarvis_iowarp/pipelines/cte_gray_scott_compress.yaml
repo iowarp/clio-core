@@ -8,6 +8,10 @@ pkgs:
   - pkg_type: jarvis_iowarp.wrp_runtime
     pkg_name: runtime
     log_level: "debug"
+    # Memory configuration to fit within /dev/shm (2GB limit)
+    # Total: 512M + (4 procs × 256M) = 1.5GB, within limit
+    main_segment_size: "512M"
+    client_data_segment_size: "256M"
 
   - pkg_type: jarvis_iowarp.wrp_cte
     pkg_name: cte_core
@@ -48,13 +52,13 @@ pkgs:
     #   - Smaller plotgap (more frequent writes)
     #   - More steps (more total I/O operations)
 
-    L: 32                                # Grid size (L x L x L), affects data size per write
+    L: 128                               # Grid size (L x L x L), affects data size per write
     steps: 20                            # Total simulation steps
-    plotgap: 10                          # Write output every N steps (affects I/O frequency)
+    plotgap: 5                           # Write output every N steps (affects I/O frequency)
 
     # MPI Configuration
-    nprocs: 1                            # Number of MPI processes
-    ppn: 1                               # Processes per node
+    nprocs: 2                            # Number of MPI processes
+    ppn: 2                               # Processes per node
 
     # Output Configuration
     out_file: "${HOME}/cte_gs_compress/gs_output.bp"
