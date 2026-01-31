@@ -40,22 +40,42 @@ IowarpEngine::IowarpEngine(adios2::core::IO &io, const std::string &name,
       compress_lib_(0),
       compress_trace_(false),
       total_io_time_ms_(0.0) {
+  std::cerr << "[IowarpEngine] DEBUG: Constructor entered, rank=" << rank_
+            << ", name=" << name << std::endl;
+  std::cerr.flush();
+
   // Initialize CTE client - assumes Chimaera runtime is already running
+  std::cerr << "[IowarpEngine] DEBUG: About to call WRP_CTE_CLIENT_INIT" << std::endl;
+  std::cerr.flush();
   wrp_cte::core::WRP_CTE_CLIENT_INIT("", chi::PoolQuery::Local());
+  std::cerr << "[IowarpEngine] DEBUG: WRP_CTE_CLIENT_INIT completed" << std::endl;
+  std::cerr.flush();
 
   // Read compression environment variables
+  std::cerr << "[IowarpEngine] DEBUG: About to read compression env vars" << std::endl;
+  std::cerr.flush();
   ReadCompressionEnvVars();
+  std::cerr << "[IowarpEngine] DEBUG: Compression env vars read, mode=" << compress_mode_ << std::endl;
+  std::cerr.flush();
 
 #ifdef WRP_CTE_ENABLE_COMPRESS
   // Initialize compressor client if compression is enabled
   if (compress_mode_ != 0) {
+    std::cerr << "[IowarpEngine] DEBUG: Creating compressor client" << std::endl;
+    std::cerr.flush();
     compressor_client_ = std::make_unique<wrp_cte::compressor::Client>();
+    std::cerr << "[IowarpEngine] DEBUG: Compressor client created, calling AsyncCreate" << std::endl;
+    std::cerr.flush();
     // Create the compressor pool
     auto create_task = compressor_client_->AsyncCreate(
         chi::PoolQuery::Local(),
         "wrp_cte_compressor",
         chi::PoolId(513));
+    std::cerr << "[IowarpEngine] DEBUG: AsyncCreate called, about to Wait()" << std::endl;
+    std::cerr.flush();
     create_task.Wait();
+    std::cerr << "[IowarpEngine] DEBUG: Wait() completed, return_code=" << create_task->GetReturnCode() << std::endl;
+    std::cerr.flush();
     if (create_task->GetReturnCode() != 0) {
       if (rank_ == 0) {
         std::cerr << "[IowarpEngine] Warning: Failed to create compressor pool, "
@@ -71,6 +91,9 @@ IowarpEngine::IowarpEngine(adios2::core::IO &io, const std::string &name,
 
   // Start wall clock timer
   wall_clock_start_ = std::chrono::high_resolution_clock::now();
+
+  std::cerr << "[IowarpEngine] DEBUG: Constructor completed, starting timing measurement" << std::endl;
+  std::cerr.flush();
 
   if (rank_ == 0) {
     std::cerr << "[IowarpEngine] Starting timing measurement" << std::endl;
@@ -108,6 +131,9 @@ IowarpEngine::~IowarpEngine() {
  * Initialize the engine
  */
 void IowarpEngine::Init_() {
+  std::cerr << "[IowarpEngine] DEBUG: Init_() entered, open_=" << open_ << std::endl;
+  std::cerr.flush();
+
   if (open_) {
     throw std::runtime_error("IowarpEngine::Init_: Engine already initialized");
   }
@@ -115,13 +141,22 @@ void IowarpEngine::Init_() {
   // Create or get tag for this ADIOS file/session
   // Use the engine name as the tag name
   try {
+    std::cerr << "[IowarpEngine] DEBUG: About to create Tag with name=" << m_Name << std::endl;
+    std::cerr.flush();
     current_tag_ = std::make_unique<wrp_cte::core::Tag>(m_Name);
+    std::cerr << "[IowarpEngine] DEBUG: Tag created successfully" << std::endl;
+    std::cerr.flush();
     open_ = true;
   } catch (const std::exception &e) {
+    std::cerr << "[IowarpEngine] DEBUG: Tag creation failed: " << e.what() << std::endl;
+    std::cerr.flush();
     throw std::runtime_error(
         std::string("IowarpEngine::Init_: Failed to create/get tag: ") +
         e.what());
   }
+
+  std::cerr << "[IowarpEngine] DEBUG: Init_() completed" << std::endl;
+  std::cerr.flush();
 }
 
 /**
@@ -132,16 +167,25 @@ void IowarpEngine::Init_() {
  */
 adios2::StepStatus IowarpEngine::BeginStep(adios2::StepMode mode,
                                            const float timeoutSeconds) {
+  std::cerr << "[IowarpEngine] DEBUG: BeginStep() entered, open_=" << open_ << std::endl;
+  std::cerr.flush();
+
   (void)mode;            // Suppress unused parameter warning
   (void)timeoutSeconds;  // Suppress unused parameter warning
 
   // Lazy initialization if not already initialized
   if (!open_) {
+    std::cerr << "[IowarpEngine] DEBUG: BeginStep() calling Init_()" << std::endl;
+    std::cerr.flush();
     Init_();
+    std::cerr << "[IowarpEngine] DEBUG: BeginStep() Init_() returned" << std::endl;
+    std::cerr.flush();
   }
 
   // Increment step counter
   IncrementCurrentStep();
+  std::cerr << "[IowarpEngine] DEBUG: BeginStep() completed, step=" << current_step_ << std::endl;
+  std::cerr.flush();
 
   return adios2::StepStatus::OK;
 }

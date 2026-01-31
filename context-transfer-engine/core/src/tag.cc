@@ -1,20 +1,39 @@
 #include <wrp_cte/core/core_client.h>
 #include <cstring>
 #include <stdexcept>
+#include <iostream>
 
 namespace wrp_cte::core {
 
 Tag::Tag(const std::string &tag_name) : tag_name_(tag_name) {
+  std::cerr << "[Tag::Tag] DEBUG: Entered constructor for tag_name=" << tag_name << std::endl;
+  std::cerr.flush();
+
   // Call the WRP_CTE client AsyncGetOrCreateTag function
+  std::cerr << "[Tag::Tag] DEBUG: Getting WRP_CTE_CLIENT..." << std::endl;
+  std::cerr.flush();
   auto *cte_client = WRP_CTE_CLIENT;
+  std::cerr << "[Tag::Tag] DEBUG: Got cte_client=" << (void*)cte_client << std::endl;
+  std::cerr.flush();
+
+  std::cerr << "[Tag::Tag] DEBUG: Calling AsyncGetOrCreateTag..." << std::endl;
+  std::cerr.flush();
   auto task = cte_client->AsyncGetOrCreateTag(tag_name);
+  std::cerr << "[Tag::Tag] DEBUG: AsyncGetOrCreateTag returned, calling Wait()..." << std::endl;
+  std::cerr.flush();
   task.Wait();
+  std::cerr << "[Tag::Tag] DEBUG: Wait() completed" << std::endl;
+  std::cerr.flush();
 
   if (task->GetReturnCode() != 0) {
+    std::cerr << "[Tag::Tag] ERROR: GetOrCreateTag operation failed with code " << task->GetReturnCode() << std::endl;
+    std::cerr.flush();
     throw std::runtime_error("GetOrCreateTag operation failed");
   }
 
   tag_id_ = task->tag_id_;
+  std::cerr << "[Tag::Tag] DEBUG: Constructor completed successfully" << std::endl;
+  std::cerr.flush();
 }
 
 Tag::Tag(const TagId &tag_id) : tag_id_(tag_id), tag_name_("") {}

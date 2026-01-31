@@ -23,7 +23,7 @@ namespace wrp_cte::compressor {
 using chi::chi_cur_worker_key_;
 using chi::Worker;
 
-void Runtime::Create(hipc::FullPtr<CreateTask> task, chi::RunContext &ctx) {
+chi::TaskResume Runtime::Create(hipc::FullPtr<CreateTask> task, chi::RunContext &ctx) {
   // Note: This is a simplified Create task since we don't have a CreateTask defined
   // In the actual implementation, you would extract config from task parameters
 
@@ -98,10 +98,10 @@ void Runtime::Create(hipc::FullPtr<CreateTask> task, chi::RunContext &ctx) {
   HLOG(kInfo, "CTE Compressor container created and initialized for pool: {} (ID: {})",
        pool_name_, pool_id_);
 
-  return;
+  co_return;
 }
 
-void Runtime::Destroy(hipc::FullPtr<DestroyTask> task, chi::RunContext &ctx) {
+chi::TaskResume Runtime::Destroy(hipc::FullPtr<DestroyTask> task, chi::RunContext &ctx) {
   try {
     // Reset predictors
     qtable_predictor_.reset();
@@ -119,13 +119,14 @@ void Runtime::Destroy(hipc::FullPtr<DestroyTask> task, chi::RunContext &ctx) {
   } catch (const std::exception &e) {
     HLOG(kError, "Exception during compressor destroy: {}", e.what());
   }
+  co_return;
 }
 
-void Runtime::Monitor(hipc::FullPtr<MonitorTask> task, chi::RunContext &ctx) {
+chi::TaskResume Runtime::Monitor(hipc::FullPtr<MonitorTask> task, chi::RunContext &ctx) {
   // Dynamic schedule: just set pool query
   if (ctx.exec_mode_ == chi::ExecMode::kDynamicSchedule) {
     task->pool_query_ = chi::PoolQuery::Local();
-    return;
+    co_return;
   }
 
   try {
@@ -141,7 +142,7 @@ void Runtime::Monitor(hipc::FullPtr<MonitorTask> task, chi::RunContext &ctx) {
     if (list_task->return_code_ != 0u) {
       HLOG(kWarning, "Failed to list targets from core (error code: {})",
            list_task->return_code_);
-      return;
+      co_return;
     }
 
     // Update target states for each registered target
@@ -174,6 +175,7 @@ void Runtime::Monitor(hipc::FullPtr<MonitorTask> task, chi::RunContext &ctx) {
   } catch (const std::exception& e) {
     HLOG(kError, "Exception during monitor: {}", e.what());
   }
+  co_return;
 }
 
 // ==============================================================================
@@ -454,12 +456,12 @@ static void WriteTraceLog(const std::string& trace_folder, const std::string& lo
   }
 }
 
-void Runtime::DynamicSchedule(hipc::FullPtr<DynamicScheduleTask> task,
+chi::TaskResume Runtime::DynamicSchedule(hipc::FullPtr<DynamicScheduleTask> task,
                                          chi::RunContext& ctx) {
   // Dynamic scheduling phase - determine routing
   if (ctx.exec_mode_ == chi::ExecMode::kDynamicSchedule) {
     task->pool_query_ = chi::PoolQuery::Local();
-    return;
+    co_return;
   }
 
   try {
@@ -481,7 +483,7 @@ void Runtime::DynamicSchedule(hipc::FullPtr<DynamicScheduleTask> task,
       context.compress_lib_ = 0;
       context.dynamic_compress_ = 0;
       task->return_code_ = 1;
-      return;
+      co_return;
     }
 
     // Get compression stats
@@ -492,7 +494,7 @@ void Runtime::DynamicSchedule(hipc::FullPtr<DynamicScheduleTask> task,
       context.compress_lib_ = 0;
       context.dynamic_compress_ = 0;
       task->return_code_ = 0;
-      return;
+      co_return;
     }
 
     // Log predicted compression stats if tracing enabled
@@ -536,15 +538,15 @@ void Runtime::DynamicSchedule(hipc::FullPtr<DynamicScheduleTask> task,
     task->return_code_ = 1;
   }
 
-  return;
+  co_return;
 }
 
-void Runtime::Compress(hipc::FullPtr<CompressTask> task,
+chi::TaskResume Runtime::Compress(hipc::FullPtr<CompressTask> task,
                                   chi::RunContext& ctx) {
   // Dynamic scheduling phase - determine routing
   if (ctx.exec_mode_ == chi::ExecMode::kDynamicSchedule) {
     task->pool_query_ = chi::PoolQuery::Local();
-    return;
+    co_return;
   }
 
   try {
@@ -556,12 +558,12 @@ void Runtime::Compress(hipc::FullPtr<CompressTask> task,
     // Validate inputs
     if (input_data == nullptr || input_size == 0) {
       task->return_code_ = 1;  // Invalid input
-      return;
+      co_return;
     }
 
     if (context.compress_lib_ <= 0) {
       task->return_code_ = 2;  // No compression library specified
-      return;
+      co_return;
     }
 
     // Map compress_lib_ ID to library name
@@ -582,7 +584,7 @@ void Runtime::Compress(hipc::FullPtr<CompressTask> task,
     if (!compressor) {
       HLOG(kWarning, "Failed to create compressor for library: {}", library_name);
       task->return_code_ = 3;  // Compressor creation failed
-      return;
+      co_return;
     }
 
     auto compress_start = std::chrono::high_resolution_clock::now();
@@ -606,7 +608,7 @@ void Runtime::Compress(hipc::FullPtr<CompressTask> task,
       task->output_data_ = malloc(compressed_size);
       if (task->output_data_ == nullptr) {
         task->return_code_ = 4;  // Memory allocation failed
-        return;
+        co_return;
       }
 
       // Copy compressed data to output
@@ -665,15 +667,15 @@ void Runtime::Compress(hipc::FullPtr<CompressTask> task,
     task->return_code_ = 6;  // Exception occurred
   }
 
-  return;
+  co_return;
 }
 
-void Runtime::Decompress(hipc::FullPtr<DecompressTask> task,
+chi::TaskResume Runtime::Decompress(hipc::FullPtr<DecompressTask> task,
                                     chi::RunContext& ctx) {
   // Dynamic scheduling phase - determine routing
   if (ctx.exec_mode_ == chi::ExecMode::kDynamicSchedule) {
     task->pool_query_ = chi::PoolQuery::Local();
-    return;
+    co_return;
   }
 
   try {
@@ -687,12 +689,12 @@ void Runtime::Decompress(hipc::FullPtr<DecompressTask> task,
     // Validate inputs
     if (input_data == nullptr || input_size == 0) {
       task->return_code_ = 1;  // Invalid input
-      return;
+      co_return;
     }
 
     if (compress_lib <= 0) {
       task->return_code_ = 2;  // No compression library specified
-      return;
+      co_return;
     }
 
     // Map compress_lib ID to library name
@@ -713,7 +715,7 @@ void Runtime::Decompress(hipc::FullPtr<DecompressTask> task,
     if (!decompressor) {
       HLOG(kWarning, "Failed to create decompressor for library: {}", library_name);
       task->return_code_ = 3;  // Decompressor creation failed
-      return;
+      co_return;
     }
 
     auto decompress_start = std::chrono::high_resolution_clock::now();
@@ -735,7 +737,7 @@ void Runtime::Decompress(hipc::FullPtr<DecompressTask> task,
       task->output_data_ = malloc(decompressed_size);
       if (task->output_data_ == nullptr) {
         task->return_code_ = 4;  // Memory allocation failed
-        return;
+        co_return;
       }
 
       // Copy decompressed data to output
@@ -765,7 +767,7 @@ void Runtime::Decompress(hipc::FullPtr<DecompressTask> task,
     task->return_code_ = 6;  // Exception occurred
   }
 
-  return;
+  co_return;
 }
 
 void Runtime::LogCompressionTelemetry(const CompressionTelemetry& telemetry) {

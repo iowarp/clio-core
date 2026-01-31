@@ -1288,61 +1288,74 @@ TEST_CASE("Unified Compression Benchmark") {
 
   // Process compressors (in parallel if num_threads > 1)
   if (num_threads == 1) {
-    // Sequential execution (original code path)
+    // Sequential execution with progress reporting
+    size_t seq_completed = 0;
+    auto seq_start_time = std::chrono::steady_clock::now();
+
     for (const auto& test : compressors) {
-    const std::string& lib_name = test.name;
-    const std::string& config_name = test.configuration;
-    hshm::Compressor* compressor = test.compressor.get();
+      const std::string& lib_name = test.name;
+      const std::string& config_name = test.configuration;
+      hshm::Compressor* compressor = test.compressor.get();
 
-    std::cerr << "Starting benchmark for: " << lib_name << " [" << config_name << "]" << std::endl;
-    std::cout.flush();
+      try {
+        for (const auto& [data_type, dtype] : data_types) {
+          // Skip lossy compressors for non-float data
+          // ZFP, SZ3, and FPZIP are designed only for floating-point compression
+          bool is_lossy = (lib_name == "ZFP" || lib_name == "SZ3" || lib_name == "FPZIP");
+          bool is_float_type = (dtype == hshm::DataType::FLOAT32);
 
-    try {
-      for (const auto& [data_type, dtype] : data_types) {
-        // Skip lossy compressors for non-float data
-        // ZFP, SZ3, and FPZIP are designed only for floating-point compression
-        bool is_lossy = (lib_name == "ZFP" || lib_name == "SZ3" || lib_name == "FPZIP");
-        bool is_float_type = (dtype == hshm::DataType::FLOAT32);
+          if (is_lossy && !is_float_type) {
+            continue;
+          }
 
-        if (is_lossy && !is_float_type) {
-          std::cerr << "  Skipping " << lib_name << " for data type '" << data_type
-                    << "' (lossy compressors only work on float data)" << std::endl;
-          continue;
-        }
+          size_t type_size = hshm::DataStatisticsFactory::GetTypeSize(dtype);
+          for (const auto& dist_config : distributions) {
+            for (size_t data_size : data_sizes) {
+              // Skip if data size is not aligned with data type
+              if (data_size % type_size != 0) {
+                continue;
+              }
 
-        size_t type_size = hshm::DataStatisticsFactory::GetTypeSize(dtype);
-        for (const auto& dist_config : distributions) {
-          for (size_t data_size : data_sizes) {
-            // Skip if data size is not aligned with data type
-            if (data_size % type_size != 0) {
-              continue;
+              auto result = BenchmarkCompressor(
+                  compressor, lib_name, config_name, data_type, dist_config, data_size,
+                  dtype);
+
+              // Write to file
+              PrintResultCSV(result, outfile);
+              outfile.flush();
+
+              // Progress reporting
+              ++seq_completed;
+              if (seq_completed % 100 == 0 || seq_completed == total_samples) {
+                auto now = std::chrono::steady_clock::now();
+                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - seq_start_time).count();
+                double percent = (seq_completed * 100.0) / total_samples;
+                double rate = seq_completed / (elapsed / 60.0 + 0.001);
+                double eta_min = (total_samples - seq_completed) / rate;
+
+                std::cerr << "\r[Progress] " << seq_completed << " / " << total_samples
+                          << " (" << std::fixed << std::setprecision(1) << percent << "%) | "
+                          << "Rate: " << std::fixed << std::setprecision(0) << rate << " samples/min | "
+                          << "ETA: " << std::fixed << std::setprecision(0) << eta_min << " min   "
+                          << std::flush;
+
+                if (seq_completed == total_samples) {
+                  std::cerr << std::endl;
+                }
+              }
             }
-
-            std::cerr << "  Testing: " << data_type << ", " << dist_config.name
-                      << ", " << (data_size / 1024) << "KB" << std::endl;
-
-            auto result = BenchmarkCompressor(
-                compressor, lib_name, config_name, data_type, dist_config, data_size,
-                dtype);
-
-            // Write to file only (not stdout to avoid corruption)
-            PrintResultCSV(result, outfile);
-            outfile.flush();
           }
         }
+      } catch (const std::exception& e) {
+        std::cerr << "\nError benchmarking " << lib_name << " [" << config_name << "]: " << e.what()
+                  << std::endl;
+        continue;
+      } catch (...) {
+        std::cerr << "\nUnknown error benchmarking " << lib_name << " [" << config_name << "]" << std::endl;
+        continue;
       }
-    } catch (const std::exception& e) {
-      std::cerr << "Error benchmarking " << lib_name << " [" << config_name << "]: " << e.what()
-                << std::endl;
-      continue;
-    } catch (...) {
-      std::cerr << "Unknown error benchmarking " << lib_name << " [" << config_name << "]" << std::endl;
-      continue;
     }
-
-      std::cerr << "Completed benchmark for: " << lib_name << " [" << config_name << "]" << std::endl;
-      std::cout.flush();
-    }
+    std::cerr << "\nSequential execution completed!" << std::endl;
   } else {
     // Parallel execution with work stealing
     std::vector<std::thread> workers;

@@ -1,5 +1,5 @@
-#ifndef CORE_AUTOGEN_METHODS_H_
-#define CORE_AUTOGEN_METHODS_H_
+#ifndef WRP_CTE_CORE_AUTOGEN_METHODS_H_
+#define WRP_CTE_CORE_AUTOGEN_METHODS_H_
 
 #include <chimaera/chimaera.h>
 

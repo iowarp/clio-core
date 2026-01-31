@@ -11,6 +11,7 @@ pkgs:
 
   - pkg_type: jarvis_iowarp.wrp_cte
     pkg_name: cte_core
+    pool_name: "wrp_cte_core"
     devices:
       - ["${HOME}/cte_gs_compress/storage.bin", "2GB", 0.8]
 
@@ -26,7 +27,7 @@ pkgs:
     #   - "dynamic" or "auto": Adaptive compression (system chooses algorithm)
     #   - Library name: "zstd", "lz4", "brotli", "bzip2", "blosc2",
     #                   "fpzip", "lzma", "snappy", "sz3", "zfp", "zlib"
-    iowarp_compress: "brotli"           # Use dynamic/adaptive compression
+    iowarp_compress: "none"              # Disable compression for testing
     iowarp_compress_trace: "off"         # Compression tracing: "on" or "off"
 
   - pkg_type: builtin.adios2_gray_scott
@@ -47,13 +48,13 @@ pkgs:
     #   - Smaller plotgap (more frequent writes)
     #   - More steps (more total I/O operations)
 
-    L: 128                               # Grid size (L x L x L), affects data size per write
-    steps: 100                           # Total simulation steps
-    plotgap: 5                           # Write output every N steps (affects I/O frequency)
+    L: 32                                # Grid size (L x L x L), affects data size per write
+    steps: 20                            # Total simulation steps
+    plotgap: 10                          # Write output every N steps (affects I/O frequency)
 
     # MPI Configuration
-    nprocs: 8                            # Number of MPI processes
-    ppn: 8                               # Processes per node
+    nprocs: 1                            # Number of MPI processes
+    ppn: 1                               # Processes per node
 
     # Output Configuration
     out_file: "${HOME}/cte_gs_compress/gs_output.bp"

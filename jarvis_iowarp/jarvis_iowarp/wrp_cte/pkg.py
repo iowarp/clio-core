@@ -419,7 +419,7 @@ class WrpCte(Service):
         # Build compose entry for wrp_cte_core module
         compose_entry = {
             'mod_name': 'wrp_cte_core',
-            'pool_name': self.config.get('pool_name', 'wrp_cte'),
+            'pool_name': self.config.get('pool_name', 'wrp_cte_core'),
             'pool_query': self.config.get('pool_query', 'local'),
             'pool_id': self.config.get('pool_id', 512.0),
             'targets': {

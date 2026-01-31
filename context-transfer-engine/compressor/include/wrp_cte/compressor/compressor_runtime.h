@@ -62,40 +62,40 @@ private:
    * Create the container (Method::kCreate)
    * Initializes predictors and loads AI models
    */
-  void Create(hipc::FullPtr<CreateTask> task, chi::RunContext &ctx);
+  chi::TaskResume Create(hipc::FullPtr<CreateTask> task, chi::RunContext &ctx);
 
   /**
    * Destroy the container (Method::kDestroy)
    * Cleanup resources and predictors
    */
-  void Destroy(hipc::FullPtr<DestroyTask> task, chi::RunContext &ctx);
+  chi::TaskResume Destroy(hipc::FullPtr<DestroyTask> task, chi::RunContext &ctx);
 
   /**
    * Monitor targets (Method::kMonitor)
    * Periodically polls core for target information and updates cache
    */
-  void Monitor(hipc::FullPtr<MonitorTask> task, chi::RunContext &ctx);
+  chi::TaskResume Monitor(hipc::FullPtr<MonitorTask> task, chi::RunContext &ctx);
 
   /**
    * Dynamic compression scheduling (Method::kDynamicSchedule)
    * Analyzes data and determines optimal compression strategy
    */
-  void DynamicSchedule(hipc::FullPtr<DynamicScheduleTask> task,
-                       chi::RunContext &ctx);
+  chi::TaskResume DynamicSchedule(hipc::FullPtr<DynamicScheduleTask> task,
+                                   chi::RunContext &ctx);
 
   /**
    * Compress data (Method::kCompress)
    * Executes compression with specified library and parameters
    */
-  void Compress(hipc::FullPtr<CompressTask> task,
-                chi::RunContext &ctx);
+  chi::TaskResume Compress(hipc::FullPtr<CompressTask> task,
+                            chi::RunContext &ctx);
 
   /**
    * Decompress data (Method::kDecompress)
    * Executes decompression with specified library and parameters
    */
-  void Decompress(hipc::FullPtr<DecompressTask> task,
-                  chi::RunContext &ctx);
+  chi::TaskResume Decompress(hipc::FullPtr<DecompressTask> task,
+                              chi::RunContext &ctx);
 
   // Autogen-provided methods
   void Init(const chi::PoolId &pool_id, const std::string &pool_name,
@@ -108,55 +108,20 @@ private:
   void Aggregate(chi::u32 method, hipc::FullPtr<chi::Task> origin_task,
                  hipc::FullPtr<chi::Task> replica_task) override;
 
-  // Autogen provides these - signatures may differ from base class virtual methods
-  void Del(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr);
-  void LoadTaskImpl(chi::u32 method, chi::LoadTaskArchive& archive,
-                    hipc::FullPtr<chi::Task>& task_ptr);
-  void NewCopy(chi::u32 method, const hipc::FullPtr<chi::Task>& orig_task,
-               hipc::FullPtr<chi::Task>& dup_task, bool deep);
-
-  // Base class pure virtual method wrappers - delegate to autogen methods
-  void DelTask(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr) override {
-    Del(method, task_ptr);
-  }
-
+  // Container virtual method implementations (defined in autogen/compressor_lib_exec.cc)
+  void DelTask(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr) override;
   void LoadTask(chi::u32 method, chi::LoadTaskArchive &archive,
-                hipc::FullPtr<chi::Task> task_ptr) override {
-    LoadTaskImpl(method, archive, task_ptr);
-  }
-
+                hipc::FullPtr<chi::Task> task_ptr) override;
+  hipc::FullPtr<chi::Task> AllocLoadTask(chi::u32 method, chi::LoadTaskArchive &archive) override;
   hipc::FullPtr<chi::Task> NewCopyTask(chi::u32 method, hipc::FullPtr<chi::Task> orig_task_ptr,
-                                        bool deep) override {
-    hipc::FullPtr<chi::Task> dup_task;
-    NewCopy(method, orig_task_ptr, dup_task, deep);
-    return dup_task;
-  }
-
-  hipc::FullPtr<chi::Task> NewTask(chi::u32 method) override {
-    return CHI_IPC->NewTask<chi::Task>();
-  }
-
-  hipc::FullPtr<chi::Task> AllocLoadTask(chi::u32 method, chi::LoadTaskArchive &archive) override {
-    hipc::FullPtr<chi::Task> task_ptr;
-    LoadTaskImpl(method, archive, task_ptr);
-    return task_ptr;
-  }
-
+                                        bool deep) override;
+  hipc::FullPtr<chi::Task> NewTask(chi::u32 method) override;
   void LocalLoadTask(chi::u32 method, chi::LocalLoadTaskArchive &archive,
-                     hipc::FullPtr<chi::Task> task_ptr) override {
-    (void)method; (void)archive; (void)task_ptr;
-  }
-
+                     hipc::FullPtr<chi::Task> task_ptr) override;
   hipc::FullPtr<chi::Task> LocalAllocLoadTask(chi::u32 method,
-                                               chi::LocalLoadTaskArchive &archive) override {
-    (void)method; (void)archive;
-    return hipc::FullPtr<chi::Task>();
-  }
-
+                                               chi::LocalLoadTaskArchive &archive) override;
   void LocalSaveTask(chi::u32 method, chi::LocalSaveTaskArchive &archive,
-                     hipc::FullPtr<chi::Task> task_ptr) override {
-    (void)method; (void)archive; (void)task_ptr;
-  }
+                     hipc::FullPtr<chi::Task> task_ptr) override;
 
 private:
   // AI model predictors
