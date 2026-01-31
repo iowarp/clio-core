@@ -7,6 +7,12 @@ This repository contains the unified IOWarp Core framework, integrating multiple
 - **context-assimilation-engine**: Context assimilation engine
 - **context-exploration-engine**: Context exploration engine
 
+## Chimods
+
+When building chimods, make sure to edit chimaera_mod.yaml and chimaera_repo.yaml.
+
+If you add new methods to a chimod, please use chi_refresh_repo to autogenerate the relevant selection files.
+
 ## ⚠️ CRITICAL BUILD RULE ⚠️
 
 **NEVER HARDCODE ABSOLUTE PATHS INSIDE THE CMAKES**
