@@ -98,8 +98,15 @@ USER iowarp
 WORKDIR /home/iowarp
 
 # Install Miniconda (skip if already installed in base image)
+# Detect architecture and download appropriate installer (x86_64 or aarch64)
 RUN if [ ! -d "/home/iowarp/miniconda3" ]; then \
-    wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O /tmp/miniconda.sh \
+    ARCH=$(uname -m) && \
+    if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then \
+        MINICONDA_URL="https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-aarch64.sh"; \
+    else \
+        MINICONDA_URL="https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh"; \
+    fi && \
+    wget "$MINICONDA_URL" -O /tmp/miniconda.sh \
     && bash /tmp/miniconda.sh -b -p /home/iowarp/miniconda3 \
     && rm /tmp/miniconda.sh; \
     fi
@@ -152,8 +159,8 @@ RUN /home/iowarp/miniconda3/bin/conda tos accept --override-channels --channel h
 
 # Set conda environment variables for CMake to find packages
 ENV CONDA_PREFIX=/home/iowarp/miniconda3
-ENV PKG_CONFIG_PATH=/home/iowarp/miniconda3/lib/pkgconfig:${PKG_CONFIG_PATH}
-ENV CMAKE_PREFIX_PATH=/home/iowarp/miniconda3:${CMAKE_PREFIX_PATH}
+ENV PKG_CONFIG_PATH=/home/iowarp/miniconda3/lib/pkgconfig
+ENV CMAKE_PREFIX_PATH=/home/iowarp/miniconda3
 
 #------------------------------------------------------------
 # Build Lossy Compression Libraries from Source
@@ -307,8 +314,15 @@ RUN mkdir -p ~/.spack && \
     echo "    buildable: false" >> ~/.spack/packages.yaml
 
 # Add conda activation and LD_LIBRARY_PATH to bashrc
-RUN echo '' >> /home/iowarp/.bashrc \
-    && echo 'export LD_LIBRARY_PATH=/usr/local/lib:/home/iowarp/miniconda3/lib:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH' >> /home/iowarp/.bashrc \
+# Use architecture-aware library path (x86_64 or aarch64)
+RUN ARCH=$(uname -m) && \
+    if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then \
+        LIB_ARCH="aarch64-linux-gnu"; \
+    else \
+        LIB_ARCH="x86_64-linux-gnu"; \
+    fi && \
+    echo '' >> /home/iowarp/.bashrc \
+    && echo "export LD_LIBRARY_PATH=/usr/local/lib:/home/iowarp/miniconda3/lib:/usr/lib/${LIB_ARCH}:\$LD_LIBRARY_PATH" >> /home/iowarp/.bashrc \
     && echo '' >> /home/iowarp/.bashrc \
     && echo '# >>> conda initialize >>>' >> /home/iowarp/.bashrc \
     && echo '# Conda base environment is auto-activated with all dev dependencies' >> /home/iowarp/.bashrc \

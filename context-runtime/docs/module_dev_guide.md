@@ -187,27 +187,26 @@ using CreateTask = chimaera::admin::GetOrCreatePoolTask<CreateParams>;
  */
 struct CustomTask : public chi::Task {
   // Task-specific data using HSHM macros
-  INOUT chi::string data_;      // Input/output string
-  IN chi::u32 operation_id_;     // Input parameter
-  OUT chi::u32 result_code_;     // Output result
+  INOUT chi::priv::string data_;  // Input/output string (use HSHM_MALLOC)
+  IN chi::u32 operation_id_;      // Input parameter
+  OUT chi::u32 result_code_;      // Output result
 
-  // SHM constructor
-  explicit CustomTask(const hipc::CtxAllocator<CHI_MAIN_ALLOC_T> &alloc)
-      : chi::Task(alloc), 
-        data_(alloc), 
-        operation_id_(0), 
+  // SHM default constructor - uses HSHM_MALLOC for string initialization
+  CustomTask()
+      : chi::Task(),
+        data_(HSHM_MALLOC),
+        operation_id_(0),
         result_code_(0) {}
 
-  // Emplace constructor
+  // Emplace constructor - no allocator parameter needed
   explicit CustomTask(
-      const hipc::CtxAllocator<CHI_MAIN_ALLOC_T> &alloc,
       const chi::TaskId &task_id,
       const chi::PoolId &pool_id,
       const chi::PoolQuery &pool_query,
       const std::string &data,
       chi::u32 operation_id)
-      : chi::Task(alloc, task_id, pool_id, pool_query, 10),
-        data_(alloc, data),
+      : chi::Task(task_id, pool_id, pool_query, Method::kCustom),
+        data_(HSHM_MALLOC, data),
         operation_id_(operation_id),
         result_code_(0) {
     task_id_ = task_id;
@@ -595,7 +594,7 @@ void Runtime::GetOrCreatePool(
   } catch (const std::exception &e) {
     task->return_code_ = 99;
     task->error_message_ = chi::priv::string(
-        CHI_IPC->GetMainAlloc(),
+        HSHM_MALLOC,
         std::string("Exception during pool creation: ") + e.what());
     HLOG(kError, "Admin: Pool creation failed with exception: {}", e.what());
   }
@@ -1040,19 +1039,18 @@ struct ReadTask : public chi::Task {
   INOUT size_t length_;
   OUT chi::u64 bytes_read_;
 
-  /** SHM constructor */
-  explicit ReadTask(const hipc::CtxAllocator<CHI_MAIN_ALLOC_T> &alloc)
-      : chi::Task(alloc), length_(0), bytes_read_(0) {}
+  /** SHM default constructor - no allocator parameter */
+  ReadTask()
+      : chi::Task(), length_(0), bytes_read_(0) {}
 
-  /** Emplace constructor */
-  explicit ReadTask(const hipc::CtxAllocator<CHI_MAIN_ALLOC_T> &alloc,
-                    const chi::TaskId &task_node,
+  /** Emplace constructor - no allocator parameter */
+  explicit ReadTask(const chi::TaskId &task_node,
                     const chi::PoolId &pool_id,
                     const chi::PoolQuery &pool_query,
                     const Block &block,
                     hipc::ShmPtr<> data,
                     size_t length)
-      : chi::Task(alloc, task_node, pool_id, pool_query, 10),
+      : chi::Task(task_node, pool_id, pool_query, Method::kRead),
         block_(block), data_(data), length_(length), bytes_read_(0) {
     task_id_ = task_node;
     pool_id_ = pool_id;
@@ -1323,9 +1321,9 @@ struct BaseCreateTask : public chi::Task {
   
   // Serialization methods
   template<typename... Args>
-  void SetParams(const hipc::CtxAllocator<CHI_MAIN_ALLOC_T> &alloc, Args &&...args);
-  
-  CreateParamsT GetParams(const hipc::CtxAllocator<CHI_MAIN_ALLOC_T> &alloc) const;
+  void SetParams(AllocT* alloc, Args &&...args);
+
+  CreateParamsT GetParams() const;
 };
 ```
 
@@ -1360,16 +1358,14 @@ using CreateTask = chimaera::admin::BaseCreateTask<MyCreateParams, Method::kGetO
 
 If you have existing custom CreateTask implementations, migrate to BaseCreateTask:
 
-**Before (Custom Implementation):**
+**Before (Custom Implementation - Deprecated):**
 ```cpp
 struct CreateTask : public chi::Task {
-  // Custom constructor implementations
-  explicit CreateTask(const hipc::CtxAllocator<CHI_MAIN_ALLOC_T> &alloc,
-                      const chi::TaskId &task_id,
+  // Custom constructor implementations (deprecated - no longer takes allocator)
+  explicit CreateTask(const chi::TaskId &task_id,
                       const chi::PoolId &pool_id,
                       const chi::PoolQuery &pool_query)
-      : chi::Task(alloc, task_id, pool_id, pool_query, 0) {
-    method_ = Method::kCreate;  // Static casting required
+      : chi::Task(task_id, pool_id, pool_query, Method::kCreate) {
     // ... initialization code ...
   }
 };
@@ -2113,17 +2109,16 @@ The runtime uses PoolQuery to determine task routing through several stages:
 
 ### PoolQuery in Task Definitions
 
-Tasks must include PoolQuery in their constructors:
+Tasks must include PoolQuery in their constructors (no allocator parameter needed):
 
 ```cpp
 class CustomTask : public chi::Task {
  public:
-  CustomTask(hipc::Allocator *alloc,
-             const chi::TaskId &task_id,
+  CustomTask(const chi::TaskId &task_id,
              const chi::PoolId &pool_id,
              const chi::PoolQuery &pool_query,  // Required parameter
              /* custom parameters */)
-      : chi::Task(alloc, task_id, pool_id, pool_query, method_id) {
+      : chi::Task(task_id, pool_id, pool_query, method_id) {
     // Task initialization
   }
 };
@@ -2356,22 +2351,21 @@ auto result = future->output_field_;
 
 ## Memory Management
 
-### Allocator Usage
+### Task Memory Allocation
+
+Tasks are allocated in private memory using standard `new`/`delete`. The `HSHM_MALLOC` constant is used for initializing shared-memory strings within tasks:
+
 ```cpp
-// Get context allocator for current segment
-hipc::CtxAllocator<CHI_MAIN_ALLOC_T> ctx_alloc(allocator);
+// In task constructors, use HSHM_MALLOC for string initialization
+chi::priv::string my_string(HSHM_MALLOC, "initial value");
 
-// Allocate serializable string
-chi::string my_string(ctx_alloc, "initial value");
-
-// Allocate vector
-chi::vector<u32> my_vector(ctx_alloc);
-my_vector.resize(100);
+// Empty string initialization
+chi::priv::string empty_string(HSHM_MALLOC);
 ```
 
 ### Best Practices
-1. Always use HSHM types for shared data
-2. Pass CtxAllocator to constructors
+1. Always use HSHM types (chi::priv::string, chi::ipc::vector) for shared data
+2. Use HSHM_MALLOC for string initialization in task constructors
 3. Use FullPtr for cross-process references
 4. Let framework handle task cleanup via `ipc_manager->DelTask()`
 
@@ -2432,7 +2426,7 @@ auto* ipc_manager = CHI_IPC;
 hipc::FullPtr<char> temp_buffer = ipc_manager->AllocateBuffer(data_size);
 
 // ✅ Good: Use chi::ipc types for persistent task data
-chi::ipc::string task_string(ctx_alloc, "persistent data");
+chi::ipc::string task_string(HSHM_MALLOC, "persistent data");
 
 // ❌ Avoid: Don't use CHI_IPC for small, simple task parameters
 // Use chi::ipc types directly in task definitions instead
@@ -2452,12 +2446,22 @@ Use `chi::ipc::string` or `chi::priv::string` instead of `std::string` in task d
 struct CustomTask : public chi::Task {
   INOUT chi::priv::string input_data_;     // Shared-memory compatible string
   INOUT chi::priv::string output_data_;    // Results stored in shared memory
-  
-  CustomTask(const hipc::CtxAllocator<CHI_MAIN_ALLOC_T>& alloc,
-             const std::string& input) 
-    : input_data_(alloc, input),      // Initialize from std::string
-      output_data_(alloc) {}          // Empty initialization
-      
+
+  // Default constructor - use HSHM_MALLOC for string initialization
+  CustomTask()
+      : chi::Task(),
+        input_data_(HSHM_MALLOC),
+        output_data_(HSHM_MALLOC) {}
+
+  // Emplace constructor - no allocator parameter needed
+  explicit CustomTask(const chi::TaskId& task_id,
+                      const chi::PoolId& pool_id,
+                      const chi::PoolQuery& pool_query,
+                      const std::string& input)
+      : chi::Task(task_id, pool_id, pool_query, Method::kCustom),
+        input_data_(HSHM_MALLOC, input),   // Initialize from std::string
+        output_data_(HSHM_MALLOC) {}       // Empty initialization
+
   // Conversion to std::string when needed
   std::string getResult() const {
     return std::string(output_data_.data(), output_data_.size());
@@ -2473,11 +2477,21 @@ Use `chi::ipc::vector` instead of `std::vector` for arrays in task definitions:
 struct ProcessArrayTask : public chi::Task {
   INOUT chi::ipc::vector<chi::u32> data_array_;
   INOUT chi::ipc::vector<chi::f32> result_array_;
-  
-  ProcessArrayTask(const hipc::CtxAllocator<CHI_MAIN_ALLOC_T>& alloc,
-                   const std::vector<chi::u32>& input_data)
-    : data_array_(alloc),
-      result_array_(alloc) {
+
+  // Default constructor
+  ProcessArrayTask()
+      : chi::Task(),
+        data_array_(HSHM_MALLOC),
+        result_array_(HSHM_MALLOC) {}
+
+  // Emplace constructor - no allocator parameter needed
+  explicit ProcessArrayTask(const chi::TaskId& task_id,
+                            const chi::PoolId& pool_id,
+                            const chi::PoolQuery& pool_query,
+                            const std::vector<chi::u32>& input_data)
+      : chi::Task(task_id, pool_id, pool_query, Method::kProcessArray),
+        data_array_(HSHM_MALLOC),
+        result_array_(HSHM_MALLOC) {
     // Copy from std::vector to shared-memory vector
     data_array_.resize(input_data.size());
     std::copy(input_data.begin(), input_data.end(), data_array_.begin());
@@ -2502,12 +2516,12 @@ struct ProcessArrayTask : public chi::Task {
 ```cpp
 // Converting between std::string and shared-memory string types
 std::string std_str = "example data";
-chi::priv::string shm_str(ctx_alloc, std_str);          // std -> shared memory
+chi::priv::string shm_str(HSHM_MALLOC, std_str);   // std -> shared memory
 std::string result = std::string(shm_str);         // shared memory -> std
 
 // Converting between std::vector and shared-memory vector types
 std::vector<int> std_vec = {1, 2, 3, 4, 5};
-chi::ipc::vector<int> shm_vec(ctx_alloc);
+chi::ipc::vector<int> shm_vec(HSHM_MALLOC);
 shm_vec.assign(std_vec.begin(), std_vec.end());    // std -> shared memory
 
 std::vector<int> result_vec(shm_vec.begin(), shm_vec.end());  // shared memory -> std
@@ -2719,26 +2733,19 @@ struct ReadTask : public chi::Task {
   INOUT size_t length_;         // Buffer length
   OUT chi::u64 bytes_read_;     // Bytes actually read
 
-  /** SHM constructor */
-  explicit ReadTask(const hipc::CtxAllocator<CHI_MAIN_ALLOC_T> &alloc)
-      : chi::Task(alloc), length_(0), bytes_read_(0) {}
+  /** SHM default constructor */
+  ReadTask()
+      : chi::Task(), length_(0), bytes_read_(0) {}
 
   /** Emplace constructor */
-  explicit ReadTask(const hipc::CtxAllocator<CHI_MAIN_ALLOC_T> &alloc,
-                    const chi::TaskId &task_node,
+  explicit ReadTask(const chi::TaskId &task_node,
                     const chi::PoolId &pool_id,
                     const chi::PoolQuery &pool_query,
                     const Block &block,
                     hipc::ShmPtr<> data,
                     size_t length)
-      : chi::Task(alloc, task_node, pool_id, pool_query, 10),
-        block_(block), data_(data), length_(length), bytes_read_(0) {
-    task_id_ = task_node;
-    pool_id_ = pool_id;
-    method_ = Method::kRead;
-    task_flags_.Clear();
-    pool_query_ = pool_query;
-  }
+      : chi::Task(task_node, pool_id, pool_query, Method::kRead),
+        block_(block), data_(data), length_(length), bytes_read_(0) {}
 
   /** Serialize IN and INOUT parameters */
   template <typename Archive>
@@ -4384,7 +4391,7 @@ When creating a new Chimaera module, ensure you have:
 - [ ] Tasks inherit from `chi::Task` or use GetOrCreatePoolTask template (recommended for non-admin modules)
 - [ ] **Use GetOrCreatePoolTask**: For non-admin modules instead of BaseCreateTask directly
 - [ ] **Use BaseCreateTask with IS_ADMIN=true**: Only for admin module
-- [ ] SHM constructor with CtxAllocator parameter (if custom task)
+- [ ] SHM default constructor (if custom task)
 - [ ] Emplace constructor with all required parameters (if custom task)
 - [ ] Uses HSHM serializable types (chi::string, chi::vector, etc.)
 - [ ] Method constant assigned in constructor (e.g., `method_ = Method::kCreate;`)

@@ -1,10 +1,11 @@
 #ifndef WRP_CAE_CORE_TASKS_H_
 #define WRP_CAE_CORE_TASKS_H_
 
+#include <chimaera/admin/admin_tasks.h>
 #include <chimaera/chimaera.h>
 #include <wrp_cae/core/autogen/core_methods.h>
-#include <chimaera/admin/admin_tasks.h>
 #include <wrp_cae/core/factory/assimilation_ctx.h>
+
 #include <cereal/archives/binary.hpp>
 #include <cereal/types/vector.hpp>
 #include <sstream>
@@ -18,7 +19,7 @@ namespace wrp_cae::core {
  */
 struct CreateParams {
   // Required: chimod library name for module manager
-  static constexpr const char* chimod_lib_name = "wrp_cae_core";
+  static constexpr const char *chimod_lib_name = "wrp_cae_core";
 
   // Default constructor
   CreateParams() {}
@@ -27,12 +28,11 @@ struct CreateParams {
   CreateParams(CHI_MAIN_ALLOC_T *alloc) {}
 
   // Copy constructor with allocator (for BaseCreateTask)
-  CreateParams(CHI_MAIN_ALLOC_T *alloc,
-               const CreateParams& other) {}
+  CreateParams(CHI_MAIN_ALLOC_T *alloc, const CreateParams &other) {}
 
   // Serialization support for cereal
-  template<class Archive>
-  void serialize(Archive& ar) {
+  template <class Archive>
+  void serialize(Archive &ar) {
     // No members to serialize
   }
 };
@@ -53,10 +53,12 @@ using DestroyTask = chi::Task;  // Simple task for destruction
  */
 struct ParseOmniTask : public chi::Task {
   // Task-specific data using HSHM macros
-  IN chi::priv::string serialized_ctx_;   // Input: Serialized AssimilationCtx (internal use)
-  OUT chi::u32 num_tasks_scheduled_; // Output: Number of assimilation tasks scheduled
-  OUT chi::u32 result_code_;         // Output: Result code (0 = success)
-  OUT chi::priv::string error_message_;   // Output: Error message if failed
+  IN chi::priv::string
+      serialized_ctx_;  // Input: Serialized AssimilationCtx (internal use)
+  OUT chi::u32
+      num_tasks_scheduled_;   // Output: Number of assimilation tasks scheduled
+  OUT chi::u32 result_code_;  // Output: Result code (0 = success)
+  OUT chi::priv::string error_message_;  // Output: Error message if failed
 
   // SHM constructor
   ParseOmniTask()
@@ -66,10 +68,10 @@ struct ParseOmniTask : public chi::Task {
         result_code_(0),
         error_message_(HSHM_MALLOC) {}
 
-  // Emplace constructor - accepts vector of AssimilationCtx and serializes internally
+  // Emplace constructor - accepts vector of AssimilationCtx and serializes
+  // internally
   explicit ParseOmniTask(
-      const chi::TaskId &task_node,
-      const chi::PoolId &pool_id,
+      const chi::TaskId &task_node, const chi::PoolId &pool_id,
       const chi::PoolQuery &pool_query,
       const std::vector<wrp_cae::core::AssimilationCtx> &contexts)
       : chi::Task(task_node, pool_id, pool_query, Method::kParseOmni),
@@ -94,7 +96,8 @@ struct ParseOmniTask : public chi::Task {
   /**
    * Serialize IN and INOUT parameters
    */
-  template <typename Archive> void SerializeIn(Archive &ar) {
+  template <typename Archive>
+  void SerializeIn(Archive &ar) {
     Task::SerializeIn(ar);
     ar(serialized_ctx_);
   }
@@ -102,7 +105,8 @@ struct ParseOmniTask : public chi::Task {
   /**
    * Serialize OUT and INOUT parameters
    */
-  template <typename Archive> void SerializeOut(Archive &ar) {
+  template <typename Archive>
+  void SerializeOut(Archive &ar) {
     Task::SerializeOut(ar);
     ar(num_tasks_scheduled_, result_code_, error_message_);
   }
@@ -129,39 +133,39 @@ struct ParseOmniTask : public chi::Task {
 
 /**
  * ProcessHdf5DatasetTask - Process a single HDF5 dataset
- * Used for distributed processing where each dataset can be routed to different nodes
+ * Used for distributed processing where each dataset can be routed to different
+ * nodes
  */
 struct ProcessHdf5DatasetTask : public chi::Task {
   // Task-specific data
-  IN chi::priv::string file_path_;      // HDF5 file path
-  IN chi::priv::string dataset_path_;   // Dataset path within HDF5 file
-  IN chi::priv::string tag_prefix_;     // Tag prefix for CTE storage
-  OUT chi::u32 result_code_;            // Result code (0 = success)
-  OUT chi::priv::string error_message_; // Error message if failed
+  IN chi::priv::string file_path_;       // HDF5 file path
+  IN chi::priv::string dataset_path_;    // Dataset path within HDF5 file
+  IN chi::priv::string tag_prefix_;      // Tag prefix for CTE storage
+  OUT chi::u32 result_code_;             // Result code (0 = success)
+  OUT chi::priv::string error_message_;  // Error message if failed
 
   // SHM constructor
   ProcessHdf5DatasetTask()
       : chi::Task(),
-        file_path_(CHI_IPC->GetMainAlloc()),
-        dataset_path_(CHI_IPC->GetMainAlloc()),
-        tag_prefix_(CHI_IPC->GetMainAlloc()),
+        file_path_(HSHM_MALLOC),
+        dataset_path_(HSHM_MALLOC),
+        tag_prefix_(HSHM_MALLOC),
         result_code_(0),
-        error_message_(CHI_IPC->GetMainAlloc()) {}
+        error_message_(HSHM_MALLOC) {}
 
   // Emplace constructor
-  explicit ProcessHdf5DatasetTask(
-      const chi::TaskId &task_node,
-      const chi::PoolId &pool_id,
-      const chi::PoolQuery &pool_query,
-      const std::string &file_path,
-      const std::string &dataset_path,
-      const std::string &tag_prefix)
+  explicit ProcessHdf5DatasetTask(const chi::TaskId &task_node,
+                                  const chi::PoolId &pool_id,
+                                  const chi::PoolQuery &pool_query,
+                                  const std::string &file_path,
+                                  const std::string &dataset_path,
+                                  const std::string &tag_prefix)
       : chi::Task(task_node, pool_id, pool_query, Method::kProcessHdf5Dataset),
-        file_path_(CHI_IPC->GetMainAlloc(), file_path),
-        dataset_path_(CHI_IPC->GetMainAlloc(), dataset_path),
-        tag_prefix_(CHI_IPC->GetMainAlloc(), tag_prefix),
+        file_path_(HSHM_MALLOC, file_path),
+        dataset_path_(HSHM_MALLOC, dataset_path),
+        tag_prefix_(HSHM_MALLOC, tag_prefix),
         result_code_(0),
-        error_message_(CHI_IPC->GetMainAlloc()) {
+        error_message_(HSHM_MALLOC) {
     task_id_ = task_node;
     method_ = Method::kProcessHdf5Dataset;
     task_flags_.Clear();
@@ -171,7 +175,8 @@ struct ProcessHdf5DatasetTask : public chi::Task {
   /**
    * Serialize IN and INOUT parameters
    */
-  template <typename Archive> void SerializeIn(Archive &ar) {
+  template <typename Archive>
+  void SerializeIn(Archive &ar) {
     Task::SerializeIn(ar);
     ar(file_path_, dataset_path_, tag_prefix_);
   }
@@ -179,7 +184,8 @@ struct ProcessHdf5DatasetTask : public chi::Task {
   /**
    * Serialize OUT and INOUT parameters
    */
-  template <typename Archive> void SerializeOut(Archive &ar) {
+  template <typename Archive>
+  void SerializeOut(Archive &ar) {
     Task::SerializeOut(ar);
     ar(result_code_, error_message_);
   }
