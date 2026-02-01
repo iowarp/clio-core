@@ -1,0 +1,49 @@
+# CTE Compression Benchmark Pipeline
+# Purpose: Run synthetic workloads with configurable data patterns to benchmark compression
+# Requirements: chimaera_start_runtime in PATH, synthetic_workload_exec in PATH
+
+name: cte_compress_benchmark
+
+pkgs:
+  # Start Chimaera runtime
+  - pkg_type: jarvis_iowarp.wrp_runtime
+    pkg_name: runtime
+    log_level: "info"
+    # Memory configuration
+    main_segment_size: "512M"
+    client_data_segment_size: "256M"
+
+  # Configure CTE Core with storage targets
+  - pkg_type: jarvis_iowarp.wrp_cte
+    pkg_name: cte_core
+    pool_name: "wrp_cte_core"
+    devices:
+      - ["${HOME}/compress_bench/storage.bin", "2GB", 0.8]
+
+    # CTE Configuration Parameters
+    dpe_type: "max_bw"                   # Data placement engine: random, round_robin, max_bw
+    neighborhood: 4                      # Number of targets
+    default_target_timeout_ms: 30000     # Target timeout (ms)
+    poll_period_ms: 5000                 # Period to rescan targets (ms)
+
+    # Compression Configuration
+    iowarp_compress: "dynamic"           # Dynamic compression scheduling
+    iowarp_compress_trace: "off"         # Compression tracing
+
+  # Run compression benchmark with Gray-Scott-like data
+  - pkg_type: jarvis_iowarp.wrp_compress_bench
+    pkg_name: grayscott_bench
+    io_size: "4MB"                       # Total I/O per rank
+    transfer_size: "128KB"               # Chunk size
+    compute_time: 100                    # Compute time per iteration (ms)
+    iterations: 10                       # Number of iterations
+    pattern: "grayscott:100"             # 100% Gray-Scott pattern
+    compress: "dynamic"                  # Use dynamic compression scheduling
+    nprocs: 2                            # Number of MPI processes
+    ppn: 2                               # Processes per node
+    output_file: "grayscott_bench.txt"   # Save results to file
+    trace: false                         # Disable detailed tracing
+
+# Environment configuration (optional)
+# env:
+#   WRP_CTE_LOG_LEVEL: "debug"

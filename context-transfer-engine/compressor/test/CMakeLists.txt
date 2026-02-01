@@ -182,3 +182,52 @@ add_test(NAME test_compression_benchmark COMMAND test_compression_benchmark_exec
 install(TARGETS test_compression_benchmark_exec
     RUNTIME DESTINATION bin
 )
+
+#------------------------------------------------------------------------------
+# Synthetic Workload Generator (MPI-based benchmark)
+#------------------------------------------------------------------------------
+
+# Only build if MPI is available
+find_package(MPI QUIET)
+if(MPI_FOUND)
+    add_executable(synthetic_workload_exec
+        synthetic_workload.cc
+    )
+
+    target_include_directories(synthetic_workload_exec PRIVATE
+        ${MPI_CXX_INCLUDE_PATH}
+    )
+
+    target_link_libraries(synthetic_workload_exec
+        wrp_cte::compressor_client
+        wrp_cte::core_client
+        wrp_cte::core_runtime
+        chimaera::cxx
+        hshm::compress
+        hshm::cxx
+        ${MPI_CXX_LIBRARIES}
+        ${CMAKE_THREAD_LIBS_INIT}
+    )
+
+    target_compile_features(synthetic_workload_exec PRIVATE cxx_std_17)
+
+    # Add MPI compile flags
+    if(MPI_CXX_COMPILE_FLAGS)
+        target_compile_options(synthetic_workload_exec PRIVATE ${MPI_CXX_COMPILE_FLAGS})
+    endif()
+
+    # Add MPI link flags
+    if(MPI_CXX_LINK_FLAGS)
+        set_target_properties(synthetic_workload_exec PROPERTIES
+            LINK_FLAGS "${MPI_CXX_LINK_FLAGS}"
+        )
+    endif()
+
+    install(TARGETS synthetic_workload_exec
+        RUNTIME DESTINATION bin
+    )
+
+    message(STATUS "Synthetic workload generator enabled (MPI found)")
+else()
+    message(STATUS "Synthetic workload generator disabled (MPI not found)")
+endif()

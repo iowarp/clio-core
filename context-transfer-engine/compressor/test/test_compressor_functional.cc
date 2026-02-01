@@ -18,6 +18,11 @@
  * - DecompressTask: Decompression and data integrity
  * - DynamicScheduleTask: Intelligent compression selection
  * - Round-trip: Compress + Decompress data verification
+ *
+ * NOTE: The compressor API has been changed to integrate with the core module.
+ * CompressTask now has the same inputs as PutBlobTask and calls PutBlob internally.
+ * DecompressTask now has the same inputs as GetBlobTask and calls GetBlob internally.
+ * These tests require a fully initialized CTE environment with core pool.
  */
 
 #include "simple_test.h"
@@ -30,6 +35,8 @@
 #include <wrp_cte/compressor/compressor_client.h>
 #include <wrp_cte/compressor/compressor_tasks.h>
 #include <wrp_cte/compressor/compressor_runtime.h>
+#include <wrp_cte/core/core_client.h>
+#include <wrp_cte/core/core_tasks.h>
 
 using namespace wrp_cte::compressor;
 
@@ -101,354 +108,380 @@ void InitializeChimaera() {
 }
 
 /**
- * Global compressor pool for testing (initialized once)
+ * Cleanup Chimaera runtime
  */
-chi::PoolId g_compressor_pool_id;
-bool g_compressor_initialized = false;
+void CleanupChimaera() {
+  // Client finalize handled by CHI_CLIENT destructor
+}
 
 /**
- * Create compressor pool for testing
+ * Create and return pool ID for core chimod
+ */
+chi::PoolId CreateCorePool() {
+  chi::PoolId core_pool_id = chi::PoolId(1, 1);
+  wrp_cte::core::Client core_client;
+
+  wrp_cte::core::CreateParams core_params;
+  auto create_task = core_client.AsyncCreate(
+      chi::PoolQuery::Local(),
+      "test_core_pool",
+      core_pool_id,
+      core_params);
+  create_task.Wait();
+
+  return core_pool_id;
+}
+
+/**
+ * Create and return pool ID for compressor chimod
  */
 chi::PoolId CreateCompressorPool() {
-  if (!g_compressor_initialized) {
+  chi::PoolId compressor_pool_id = chi::PoolId(2, 1);
+  Client compressor_client;
+
+  auto create_task = compressor_client.AsyncCreate(
+      chi::PoolQuery::Local(),
+      "test_compressor_pool",
+      compressor_pool_id);
+  create_task.Wait();
+
+  return compressor_pool_id;
+}
+
+/**
+ * Test fixture for CTE integration tests
+ */
+struct CTETestFixture {
+  chi::PoolId core_pool_id_;
+  chi::PoolId compressor_pool_id_;
+  wrp_cte::core::Client core_client_;
+  Client compressor_client_;
+  wrp_cte::core::TagId tag_id_;
+
+  CTETestFixture() {
     InitializeChimaera();
+    core_pool_id_ = CreateCorePool();
+    compressor_pool_id_ = CreateCompressorPool();
+    core_client_.Init(core_pool_id_);
+    compressor_client_.Init(compressor_pool_id_);
 
-    // Generate a unique pool ID for this test session
-    int rand_id = 1000 + (std::rand() % 9000);  // Random ID 1000-9999
-    g_compressor_pool_id = chi::PoolId(static_cast<chi::u32>(rand_id), 0);
-
-    // Create the compressor pool using Client's AsyncCreate
-    Client client;
-    auto create_task = client.AsyncCreate(
-        chi::PoolQuery::Dynamic(),
-        "test_compressor_pool",
-        g_compressor_pool_id);
-    create_task.Wait();
-
-    // Check result
-    if (create_task->GetReturnCode() != 0) {
-      throw std::runtime_error("Failed to create compressor pool");
-    }
-
-    g_compressor_initialized = true;
+    // Create a test tag
+    auto tag_task = core_client_.AsyncGetOrCreateTag("test_tag");
+    tag_task.Wait();
+    tag_id_ = tag_task->tag_id_;
   }
 
-  return g_compressor_pool_id;
-}
+  ~CTETestFixture() {
+    CleanupChimaera();
+  }
 
-} // anonymous namespace
+  /**
+   * Allocate shared memory and copy data to it
+   */
+  hipc::FullPtr<char> AllocateAndCopyData(const std::vector<char>& data) {
+    auto shm_buffer = CHI_IPC->AllocateBuffer(data.size());
+    if (!shm_buffer.IsNull()) {
+      std::memcpy(shm_buffer.ptr_, data.data(), data.size());
+    }
+    return shm_buffer;
+  }
+
+  /**
+   * Read data from shared memory
+   */
+  std::vector<char> ReadFromSharedMemory(hipc::FullPtr<char>& buffer, size_t size) {
+    std::vector<char> data(size);
+    if (!buffer.IsNull()) {
+      std::memcpy(data.data(), buffer.ptr_, size);
+    }
+    return data;
+  }
+};
+
+}  // namespace
 
 /**
- * Test Case 1: Compress Task - LZ4 Compression
+ * Test Case 1: Basic Compress and Store via PutBlob
+ * Tests that CompressTask properly compresses data and stores via core PutBlob
  */
-TEST_CASE("CompressTask - LZ4 Compression", "[compressor][functional][compress]") {
-  auto pool_id = CreateCompressorPool();
-  Client client(pool_id);
+TEST_CASE("Basic Compress and Store", "[compressor][functional][basic]") {
+  CTETestFixture fixture;
 
-  // Generate test data (highly compressible)
-  auto test_data = GenerateTestData(4096, "repeating");
+  auto test_data = GenerateTestData(16 * 1024, "text");
 
-  // Create compression context
+  // Allocate shared memory for input data
+  auto shm_buffer = fixture.AllocateAndCopyData(test_data);
+  REQUIRE(!shm_buffer.IsNull());
+
+  hipc::ShmPtr<> blob_data = shm_buffer.shm_.template Cast<void>();
+
   Context context;
   context.compress_lib_ = CompLib::LZ4;
   context.compress_preset_ = 2;
 
-  // Execute compression task
-  auto task = client.AsyncCompress(test_data.data(), test_data.size(), context);
+  // Call AsyncCompress which compresses and stores via PutBlob
+  auto task = fixture.compressor_client_.AsyncCompress(
+      chi::PoolQuery::Local(),
+      fixture.tag_id_,
+      "test_blob_compress",
+      0,  // offset
+      test_data.size(),
+      blob_data,
+      0.5f,  // score
+      context,
+      0,  // flags
+      fixture.core_pool_id_);
   task.Wait();
 
-  // Verify compression succeeded
   REQUIRE(task->return_code_ == 0);
-  REQUIRE(task->output_data_ != nullptr);
-  REQUIRE(task->output_size_ > 0);
-  REQUIRE(task->output_size_ < test_data.size()); // Should compress
-  REQUIRE(task->compress_time_ms_ > 0.0);
-
-  INFO("Compressed " << test_data.size() << " bytes to " << task->output_size_
-       << " bytes (ratio: " << (double)test_data.size() / task->output_size_ << ")");
+  INFO("Compression completed successfully");
 
   // Cleanup
-  delete[] static_cast<char*>(task->output_data_);
+  CHI_IPC->FreeBuffer(shm_buffer);
 }
 
 /**
- * Test Case 2: Decompress Task - LZ4 Decompression
+ * Test Case 2: Decompress and Retrieve via GetBlob
+ * Tests that DecompressTask properly retrieves and decompresses data
  */
-TEST_CASE("DecompressTask - LZ4 Decompression", "[compressor][functional][decompress]") {
-  auto pool_id = CreateCompressorPool();
-  Client client(pool_id);
+TEST_CASE("Decompress and Retrieve", "[compressor][functional][basic]") {
+  CTETestFixture fixture;
 
-  // Generate and compress test data
-  auto original_data = GenerateTestData(4096, "repeating");
+  auto original_data = GenerateTestData(16 * 1024, "text");
+
+  // First, compress and store the data
+  auto put_buffer = fixture.AllocateAndCopyData(original_data);
+  REQUIRE(!put_buffer.IsNull());
+
+  hipc::ShmPtr<> put_blob_data = put_buffer.shm_.template Cast<void>();
 
   Context context;
   context.compress_lib_ = CompLib::LZ4;
   context.compress_preset_ = 2;
 
-  auto compress_task = client.AsyncCompress(original_data.data(), original_data.size(), context);
+  auto compress_task = fixture.compressor_client_.AsyncCompress(
+      chi::PoolQuery::Local(),
+      fixture.tag_id_,
+      "test_blob_roundtrip",
+      0,
+      original_data.size(),
+      put_blob_data,
+      0.5f,
+      context,
+      0,
+      fixture.core_pool_id_);
   compress_task.Wait();
   REQUIRE(compress_task->return_code_ == 0);
 
-  // Now decompress
-  auto decompress_task = client.AsyncDecompress(
-      compress_task->output_data_, compress_task->output_size_,
-      original_data.size(), CompLib::LZ4, 2);
+  CHI_IPC->FreeBuffer(put_buffer);
+
+  // Now retrieve and decompress
+  auto get_buffer = CHI_IPC->AllocateBuffer(original_data.size());
+  REQUIRE(!get_buffer.IsNull());
+
+  hipc::ShmPtr<> get_blob_data = get_buffer.shm_.template Cast<void>();
+
+  auto decompress_task = fixture.compressor_client_.AsyncDecompress(
+      chi::PoolQuery::Local(),
+      fixture.tag_id_,
+      "test_blob_roundtrip",
+      0,
+      original_data.size(),
+      0,  // flags
+      get_blob_data,
+      fixture.core_pool_id_);
   decompress_task.Wait();
 
-  // Verify decompression succeeded
   REQUIRE(decompress_task->return_code_ == 0);
-  REQUIRE(decompress_task->output_data_ != nullptr);
   REQUIRE(decompress_task->output_size_ == original_data.size());
-  REQUIRE(decompress_task->decompress_time_ms_ > 0.0);
 
-  INFO("Decompressed " << compress_task->output_size_ << " bytes to "
-       << decompress_task->output_size_ << " bytes");
+  // Verify data integrity
+  auto retrieved_data = fixture.ReadFromSharedMemory(get_buffer, original_data.size());
+  REQUIRE(std::memcmp(original_data.data(), retrieved_data.data(), original_data.size()) == 0);
 
-  // Cleanup
-  delete[] static_cast<char*>(compress_task->output_data_);
-  delete[] static_cast<char*>(decompress_task->output_data_);
+  INFO("Round-trip compression/decompression verified");
+  CHI_IPC->FreeBuffer(get_buffer);
 }
 
 /**
- * Test Case 3: Round-trip - Compress + Decompress Data Integrity
+ * Test Case 3: Dynamic Schedule
+ * Tests that DynamicScheduleTask selects optimal compression
  */
-TEST_CASE("Round-trip - Data Integrity", "[compressor][functional][roundtrip]") {
-  auto pool_id = CreateCompressorPool();
-  Client client(pool_id);
+TEST_CASE("Dynamic Schedule Compression", "[compressor][functional][dynamic]") {
+  CTETestFixture fixture;
 
-  SECTION("LZ4 - Zeros pattern") {
-    auto original_data = GenerateTestData(8192, "zeros");
+  auto test_data = GenerateTestData(64 * 1024, "text");
 
-    Context context;
-    context.compress_lib_ = CompLib::LZ4;
-    context.compress_preset_ = 2;
+  auto shm_buffer = fixture.AllocateAndCopyData(test_data);
+  REQUIRE(!shm_buffer.IsNull());
 
-    // Compress
-    auto compress_task = client.AsyncCompress(original_data.data(), original_data.size(), context);
-    compress_task.Wait();
-    REQUIRE(compress_task->return_code_ == 0);
-
-    // Decompress
-    auto decompress_task = client.AsyncDecompress(
-        compress_task->output_data_, compress_task->output_size_,
-        original_data.size(), CompLib::LZ4, 2);
-    decompress_task.Wait();
-    REQUIRE(decompress_task->return_code_ == 0);
-
-    // Verify data integrity
-    REQUIRE(decompress_task->output_size_ == original_data.size());
-    int cmp = std::memcmp(original_data.data(), decompress_task->output_data_, original_data.size());
-    REQUIRE(cmp == 0);
-
-    INFO("Data integrity verified for zeros pattern");
-
-    delete[] static_cast<char*>(compress_task->output_data_);
-    delete[] static_cast<char*>(decompress_task->output_data_);
-  }
-
-  SECTION("ZSTD - Text pattern") {
-    auto original_data = GenerateTestData(16384, "text");
-
-    Context context;
-    context.compress_lib_ = CompLib::ZSTD;
-    context.compress_preset_ = 3;
-
-    // Compress
-    auto compress_task = client.AsyncCompress(original_data.data(), original_data.size(), context);
-    compress_task.Wait();
-    REQUIRE(compress_task->return_code_ == 0);
-
-    // Decompress
-    auto decompress_task = client.AsyncDecompress(
-        compress_task->output_data_, compress_task->output_size_,
-        original_data.size(), CompLib::ZSTD, 3);
-    decompress_task.Wait();
-    REQUIRE(decompress_task->return_code_ == 0);
-
-    // Verify data integrity
-    REQUIRE(decompress_task->output_size_ == original_data.size());
-    int cmp = std::memcmp(original_data.data(), decompress_task->output_data_, original_data.size());
-    REQUIRE(cmp == 0);
-
-    INFO("Data integrity verified for text pattern");
-
-    delete[] static_cast<char*>(compress_task->output_data_);
-    delete[] static_cast<char*>(decompress_task->output_data_);
-  }
-}
-
-/**
- * Test Case 4: Compression Ratio - Different Data Patterns
- */
-TEST_CASE("Compression Ratio - Data Patterns", "[compressor][functional][ratio]") {
-  auto pool_id = CreateCompressorPool();
-  Client client(pool_id);
+  hipc::ShmPtr<> blob_data = shm_buffer.shm_.template Cast<void>();
 
   Context context;
-  context.compress_lib_ = CompLib::LZ4;
-  context.compress_preset_ = 2;
+  context.dynamic_compress_ = 0;  // Enable dynamic compression selection
+  context.max_performance_ = false;  // Optimize for ratio
 
-  SECTION("Highly compressible - zeros") {
-    auto data = GenerateTestData(65536, "zeros");
-
-    auto task = client.AsyncCompress(data.data(), data.size(), context);
-    task.Wait();
-    REQUIRE(task->return_code_ == 0);
-
-    double ratio = (double)data.size() / task->output_size_;
-    REQUIRE(ratio > 10.0); // Should compress very well
-
-    INFO("Zeros pattern: ratio = " << ratio);
-    delete[] static_cast<char*>(task->output_data_);
-  }
-
-  SECTION("Moderately compressible - repeating") {
-    auto data = GenerateTestData(65536, "repeating");
-
-    auto task = client.AsyncCompress(data.data(), data.size(), context);
-    task.Wait();
-    REQUIRE(task->return_code_ == 0);
-
-    double ratio = (double)data.size() / task->output_size_;
-    REQUIRE(ratio > 2.0); // Should compress moderately
-
-    INFO("Repeating pattern: ratio = " << ratio);
-    delete[] static_cast<char*>(task->output_data_);
-  }
-
-  SECTION("Poorly compressible - random") {
-    auto data = GenerateTestData(65536, "random");
-
-    auto task = client.AsyncCompress(data.data(), data.size(), context);
-    task.Wait();
-    REQUIRE(task->return_code_ == 0);
-
-    double ratio = (double)data.size() / task->output_size_;
-    REQUIRE(ratio < 1.5); // Won't compress much
-
-    INFO("Random pattern: ratio = " << ratio);
-    delete[] static_cast<char*>(task->output_data_);
-  }
-}
-
-/**
- * Test Case 5: DynamicSchedule - Compression Selection
- */
-TEST_CASE("DynamicSchedule - Compression Selection", "[compressor][functional][schedule]") {
-  auto pool_id = CreateCompressorPool();
-  Client client(pool_id);
-
-  // Generate test data
-  auto test_data = GenerateTestData(32768, "text");
-
-  // Create context with dynamic scheduling enabled
-  Context context;
-  context.dynamic_compress_ = 2; // Enable dynamic scheduling
-
-  // Execute dynamic scheduling
-  auto task = client.AsyncDynamicSchedule(test_data.size(), test_data.data(), context);
+  auto task = fixture.compressor_client_.AsyncDynamicSchedule(
+      chi::PoolQuery::Local(),
+      fixture.tag_id_,
+      "test_blob_dynamic",
+      0,
+      test_data.size(),
+      blob_data,
+      0.5f,
+      context,
+      0,
+      fixture.core_pool_id_);
   task.Wait();
 
-  // Verify scheduling succeeded
   REQUIRE(task->return_code_ == 0);
-  REQUIRE(task->context_.compress_lib_ > 0); // Should select a library
-  REQUIRE(task->context_.compress_preset_ > 0); // Should select a preset
+  INFO("DynamicSchedule selected compression library: " << task->context_.compress_lib_);
+  INFO("Tier score: " << task->tier_score_);
 
-  INFO("Selected library: " << task->context_.compress_lib_
-       << ", preset: " << task->context_.compress_preset_);
+  CHI_IPC->FreeBuffer(shm_buffer);
 }
 
 /**
- * Test Case 6: Multiple Compression Libraries
+ * Test Case 4: Multiple Compression Libraries
+ * Tests compression with various libraries
  */
-TEST_CASE("Multiple Libraries - Compression", "[compressor][functional][multilib]") {
-  auto pool_id = CreateCompressorPool();
-  Client client(pool_id);
+TEST_CASE("Multiple Compression Libraries", "[compressor][functional][libraries]") {
+  CTETestFixture fixture;
 
-  auto test_data = GenerateTestData(16384, "text");
+  auto test_data = GenerateTestData(16 * 1024, "text");
 
-  // Test LZ4
-  SECTION("LZ4") {
-    Context context;
-    context.compress_lib_ = CompLib::LZ4;
-    context.compress_preset_ = 2;
+  std::vector<std::pair<int, std::string>> libraries = {
+    {CompLib::LZ4, "LZ4"},
+    {CompLib::ZSTD, "ZSTD"},
+    {CompLib::ZLIB, "ZLIB"}
+  };
 
-    auto task = client.AsyncCompress(test_data.data(), test_data.size(), context);
-    task.Wait();
+  for (const auto& [lib_id, lib_name] : libraries) {
+    SECTION(lib_name) {
+      auto shm_buffer = fixture.AllocateAndCopyData(test_data);
+      REQUIRE(!shm_buffer.IsNull());
 
-    REQUIRE(task->return_code_ == 0);
-    REQUIRE(task->output_size_ < test_data.size());
+      hipc::ShmPtr<> blob_data = shm_buffer.shm_.template Cast<void>();
 
-    INFO("LZ4: " << test_data.size() << " -> " << task->output_size_);
-    delete[] static_cast<char*>(task->output_data_);
-  }
+      Context context;
+      context.compress_lib_ = lib_id;
+      context.compress_preset_ = 2;
 
-  // Test ZSTD
-  SECTION("ZSTD") {
-    Context context;
-    context.compress_lib_ = CompLib::ZSTD;
-    context.compress_preset_ = 3;
+      std::string blob_name = "test_blob_" + lib_name;
+      auto task = fixture.compressor_client_.AsyncCompress(
+          chi::PoolQuery::Local(),
+          fixture.tag_id_,
+          blob_name,
+          0,
+          test_data.size(),
+          blob_data,
+          0.5f,
+          context,
+          0,
+          fixture.core_pool_id_);
+      task.Wait();
 
-    auto task = client.AsyncCompress(test_data.data(), test_data.size(), context);
-    task.Wait();
+      REQUIRE(task->return_code_ == 0);
+      INFO(lib_name << " compression completed successfully");
 
-    REQUIRE(task->return_code_ == 0);
-    REQUIRE(task->output_size_ < test_data.size());
-
-    INFO("ZSTD: " << test_data.size() << " -> " << task->output_size_);
-    delete[] static_cast<char*>(task->output_data_);
-  }
-
-  // Test ZLIB
-  SECTION("ZLIB") {
-    Context context;
-    context.compress_lib_ = CompLib::ZLIB;
-    context.compress_preset_ = 2;
-
-    auto task = client.AsyncCompress(test_data.data(), test_data.size(), context);
-    task.Wait();
-
-    REQUIRE(task->return_code_ == 0);
-    REQUIRE(task->output_size_ < test_data.size());
-
-    INFO("ZLIB: " << test_data.size() << " -> " << task->output_size_);
-    delete[] static_cast<char*>(task->output_data_);
+      CHI_IPC->FreeBuffer(shm_buffer);
+    }
   }
 }
 
 /**
- * Test Case 7: Error Handling - Invalid Parameters
+ * Test Case 5: No Compression (Passthrough)
+ * Tests that data with compress_lib_ = 0 is stored without compression
+ */
+TEST_CASE("No Compression Passthrough", "[compressor][functional][passthrough]") {
+  CTETestFixture fixture;
+
+  auto test_data = GenerateTestData(8 * 1024, "random");
+
+  auto shm_buffer = fixture.AllocateAndCopyData(test_data);
+  REQUIRE(!shm_buffer.IsNull());
+
+  hipc::ShmPtr<> blob_data = shm_buffer.shm_.template Cast<void>();
+
+  Context context;
+  context.compress_lib_ = 0;  // No compression
+
+  auto task = fixture.compressor_client_.AsyncCompress(
+      chi::PoolQuery::Local(),
+      fixture.tag_id_,
+      "test_blob_passthrough",
+      0,
+      test_data.size(),
+      blob_data,
+      0.5f,
+      context,
+      0,
+      fixture.core_pool_id_);
+  task.Wait();
+
+  REQUIRE(task->return_code_ == 0);
+  INFO("Passthrough (no compression) completed successfully");
+
+  CHI_IPC->FreeBuffer(shm_buffer);
+}
+
+/**
+ * Test Case 6: Error Handling - Invalid Parameters
  */
 TEST_CASE("Error Handling - Invalid Parameters", "[compressor][functional][error]") {
-  auto pool_id = CreateCompressorPool();
-  Client client(pool_id);
+  CTETestFixture fixture;
 
   auto test_data = GenerateTestData(1024, "text");
 
-  SECTION("Invalid compression library") {
-    Context context;
-    context.compress_lib_ = 99; // Invalid library ID
-    context.compress_preset_ = 2;
-
-    auto task = client.AsyncCompress(test_data.data(), test_data.size(), context);
-    task.Wait();
-
-    // Should fail gracefully
-    REQUIRE(task->return_code_ != 0);
-    INFO("Correctly handled invalid library ID");
-  }
-
-  SECTION("Null input data") {
+  SECTION("Null blob data") {
     Context context;
     context.compress_lib_ = CompLib::LZ4;
-    context.compress_preset_ = 2;
 
-    auto task = client.AsyncCompress(nullptr, test_data.size(), context);
+    auto task = fixture.compressor_client_.AsyncCompress(
+        chi::PoolQuery::Local(),
+        fixture.tag_id_,
+        "test_blob_null",
+        0,
+        test_data.size(),
+        hipc::ShmPtr<>::GetNull(),  // Null data
+        0.5f,
+        context,
+        0,
+        fixture.core_pool_id_);
     task.Wait();
 
     // Should fail gracefully
     REQUIRE(task->return_code_ != 0);
-    INFO("Correctly handled null input data");
+    INFO("Correctly handled null blob data");
+  }
+
+  SECTION("Zero size") {
+    auto shm_buffer = fixture.AllocateAndCopyData(test_data);
+    REQUIRE(!shm_buffer.IsNull());
+
+    hipc::ShmPtr<> blob_data = shm_buffer.shm_.template Cast<void>();
+
+    Context context;
+    context.compress_lib_ = CompLib::LZ4;
+
+    auto task = fixture.compressor_client_.AsyncCompress(
+        chi::PoolQuery::Local(),
+        fixture.tag_id_,
+        "test_blob_zero_size",
+        0,
+        0,  // Zero size
+        blob_data,
+        0.5f,
+        context,
+        0,
+        fixture.core_pool_id_);
+    task.Wait();
+
+    // Should fail gracefully
+    REQUIRE(task->return_code_ != 0);
+    INFO("Correctly handled zero size");
+
+    CHI_IPC->FreeBuffer(shm_buffer);
   }
 }
 

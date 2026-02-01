@@ -159,164 +159,220 @@ struct CompressionTelemetry {
 };
 
 /**
- * DynamicSchedule task - Analyzes data and determines optimal compression strategy
+ * DynamicScheduleTask - Analyzes data and determines optimal compression strategy
+ * Then performs compression and calls PutBlob to store the data.
+ * Has the same inputs as PutBlobTask for seamless integration.
  */
 struct DynamicScheduleTask : public chi::Task {
-  IN chi::u64 chunk_size_;           // Size of data chunk to analyze
-  IN void *chunk_data_;               // Pointer to data chunk
-  INOUT Context context_;             // Compression context (updated with predictions)
-  OUT int return_code_;               // 0 on success, error code otherwise
+  // Same inputs as PutBlobTask
+  IN wrp_cte::core::TagId tag_id_;        // Tag ID for blob grouping
+  INOUT chi::priv::string blob_name_;     // Blob name (required)
+  IN chi::u64 offset_;                    // Offset within blob
+  IN chi::u64 size_;                      // Size of blob data
+  IN hipc::ShmPtr<> blob_data_;           // Blob data (shared memory pointer)
+  IN float score_;                        // Score 0-1 for placement decisions
+  INOUT Context context_;                 // Context for compression control and statistics
+  IN chi::u32 flags_;                     // Operation flags
+  IN chi::PoolId core_pool_id_;           // Pool ID of core chimod for PutBlob
+
+  // Output fields
+  OUT float tier_score_;                  // Selected tier score (0-1, normalized)
 
   // SHM constructor
   DynamicScheduleTask()
-      : chi::Task(), chunk_size_(0), chunk_data_(nullptr),
-        context_(), return_code_(-1) {}
+      : chi::Task(), tag_id_(wrp_cte::core::TagId::GetNull()),
+        blob_name_(HSHM_MALLOC), offset_(0), size_(0),
+        blob_data_(hipc::ShmPtr<>::GetNull()), score_(0.5f),
+        context_(), flags_(0), core_pool_id_(chi::PoolId::GetNull()),
+        tier_score_(0.0f) {}
 
   // Emplace constructor
   explicit DynamicScheduleTask(const chi::TaskId &task_id,
                                const chi::PoolId &pool_id,
                                const chi::PoolQuery &pool_query,
-                               chi::u64 chunk_size,
-                               void *chunk_data,
-                               const Context &context)
+                               const wrp_cte::core::TagId &tag_id,
+                               const std::string &blob_name,
+                               chi::u64 offset, chi::u64 size,
+                               hipc::ShmPtr<> blob_data,
+                               float score, const Context &context,
+                               chi::u32 flags,
+                               const chi::PoolId &core_pool_id)
       : chi::Task(task_id, pool_id, pool_query, Method::kDynamicSchedule),
-        chunk_size_(chunk_size), chunk_data_(chunk_data),
-        context_(context), return_code_(-1) {}
+        tag_id_(tag_id), blob_name_(HSHM_MALLOC, blob_name),
+        offset_(offset), size_(size), blob_data_(blob_data), score_(score),
+        context_(context), flags_(flags), core_pool_id_(core_pool_id),
+        tier_score_(0.0f) {}
 
   void Copy(const hipc::FullPtr<DynamicScheduleTask>& other) {
-    chunk_size_ = other->chunk_size_;
-    chunk_data_ = other->chunk_data_;
+    tag_id_ = other->tag_id_;
+    blob_name_ = other->blob_name_;
+    offset_ = other->offset_;
+    size_ = other->size_;
+    blob_data_ = other->blob_data_;
+    score_ = other->score_;
     context_ = other->context_;
-    return_code_ = other->return_code_;
+    flags_ = other->flags_;
+    core_pool_id_ = other->core_pool_id_;
+    tier_score_ = other->tier_score_;
   }
 
   /** Serialize */
   template <typename Ar>
   void SerializeStart(Ar &ar) {
     task_serialize<Ar>(ar);
-    ar(chunk_size_, context_, return_code_);
-    // Note: chunk_data_ is not serialized (local pointer)
+    ar(tag_id_, blob_name_, offset_, size_, score_, context_, flags_,
+       core_pool_id_, tier_score_);
+    ar.bulk(blob_data_, size_, BULK_XFER);
   }
 
   /** Deserialize */
   template <typename Ar>
-  void SerializeEnd(Ar &ar) {}
+  void SerializeEnd(Ar &ar) {
+    ar(blob_name_, context_, tier_score_);
+  }
 };
 
 /**
- * Compress task - Performs actual compression
+ * CompressTask - Performs compression and calls PutBlob to store the data.
+ * Has the same inputs as PutBlobTask for seamless integration.
  */
 struct CompressTask : public chi::Task {
-  IN void *input_data_;               // Input data pointer
-  IN chi::u64 input_size_;            // Input data size
-  IN Context context_;                // Compression context (library, preset, etc.)
-  OUT void *output_data_;             // Output compressed data (allocated by task)
-  OUT chi::u64 output_size_;          // Output compressed size
-  OUT double compress_time_ms_;       // Compression time in milliseconds
-  OUT int return_code_;               // 0 on success, error code otherwise
+  // Same inputs as PutBlobTask
+  IN wrp_cte::core::TagId tag_id_;        // Tag ID for blob grouping
+  INOUT chi::priv::string blob_name_;     // Blob name (required)
+  IN chi::u64 offset_;                    // Offset within blob
+  IN chi::u64 size_;                      // Size of blob data
+  IN hipc::ShmPtr<> blob_data_;           // Blob data (shared memory pointer)
+  IN float score_;                        // Score 0-1 for placement decisions
+  INOUT Context context_;                 // Context for compression control and statistics
+  IN chi::u32 flags_;                     // Operation flags
+  IN chi::PoolId core_pool_id_;           // Pool ID of core chimod for PutBlob
+
+  // Output fields
+  OUT float tier_score_;                  // Selected tier score (0-1, normalized)
 
   // SHM constructor
   CompressTask()
-      : chi::Task(), input_data_(nullptr), input_size_(0),
-        context_(), output_data_(nullptr), output_size_(0),
-        compress_time_ms_(0.0), return_code_(-1) {}
+      : chi::Task(), tag_id_(wrp_cte::core::TagId::GetNull()),
+        blob_name_(HSHM_MALLOC), offset_(0), size_(0),
+        blob_data_(hipc::ShmPtr<>::GetNull()), score_(0.5f),
+        context_(), flags_(0), core_pool_id_(chi::PoolId::GetNull()),
+        tier_score_(0.0f) {}
 
   // Emplace constructor
   explicit CompressTask(const chi::TaskId &task_id,
                         const chi::PoolId &pool_id,
                         const chi::PoolQuery &pool_query,
-                        void *input_data,
-                        chi::u64 input_size,
-                        const Context &context)
+                        const wrp_cte::core::TagId &tag_id,
+                        const std::string &blob_name,
+                        chi::u64 offset, chi::u64 size,
+                        hipc::ShmPtr<> blob_data,
+                        float score, const Context &context,
+                        chi::u32 flags,
+                        const chi::PoolId &core_pool_id)
       : chi::Task(task_id, pool_id, pool_query, Method::kCompress),
-        input_data_(input_data), input_size_(input_size),
-        context_(context), output_data_(nullptr), output_size_(0),
-        compress_time_ms_(0.0), return_code_(-1) {}
+        tag_id_(tag_id), blob_name_(HSHM_MALLOC, blob_name),
+        offset_(offset), size_(size), blob_data_(blob_data), score_(score),
+        context_(context), flags_(flags), core_pool_id_(core_pool_id),
+        tier_score_(0.0f) {}
 
   void Copy(const hipc::FullPtr<CompressTask>& other) {
-    input_data_ = other->input_data_;
-    input_size_ = other->input_size_;
+    tag_id_ = other->tag_id_;
+    blob_name_ = other->blob_name_;
+    offset_ = other->offset_;
+    size_ = other->size_;
+    blob_data_ = other->blob_data_;
+    score_ = other->score_;
     context_ = other->context_;
-    output_data_ = other->output_data_;
-    output_size_ = other->output_size_;
-    compress_time_ms_ = other->compress_time_ms_;
-    return_code_ = other->return_code_;
+    flags_ = other->flags_;
+    core_pool_id_ = other->core_pool_id_;
+    tier_score_ = other->tier_score_;
   }
 
   /** Serialize */
   template <typename Ar>
   void SerializeStart(Ar &ar) {
     task_serialize<Ar>(ar);
-    ar(input_size_, context_, output_size_, compress_time_ms_, return_code_);
-    // Note: input_data_ and output_data_ are not serialized (local pointers)
+    ar(tag_id_, blob_name_, offset_, size_, score_, context_, flags_,
+       core_pool_id_, tier_score_);
+    ar.bulk(blob_data_, size_, BULK_XFER);
   }
 
   /** Deserialize */
   template <typename Ar>
-  void SerializeEnd(Ar &ar) {}
+  void SerializeEnd(Ar &ar) {
+    ar(blob_name_, context_, tier_score_);
+  }
 };
 
 /**
- * Decompress task - Performs decompression
+ * DecompressTask - Calls GetBlob to retrieve data, then performs decompression.
+ * Has the same inputs as GetBlobTask plus decompression output.
  */
 struct DecompressTask : public chi::Task {
-  IN void *input_data_;               // Compressed data pointer
-  IN chi::u64 input_size_;            // Compressed data size
-  IN chi::u64 expected_output_size_;  // Expected decompressed size
-  IN int compress_lib_;               // Compression library used
-  IN int compress_preset_;            // Compression preset used
-  OUT void *output_data_;             // Output decompressed data (allocated by task)
-  OUT chi::u64 output_size_;          // Actual decompressed size
-  OUT double decompress_time_ms_;     // Decompression time in milliseconds
-  OUT int return_code_;               // 0 on success, error code otherwise
+  // Same inputs as GetBlobTask
+  IN wrp_cte::core::TagId tag_id_;        // Tag ID for blob lookup
+  IN chi::priv::string blob_name_;        // Blob name (required)
+  IN chi::u64 offset_;                    // Offset within blob
+  IN chi::u64 size_;                      // Size of data to retrieve (decompressed size)
+  IN chi::u32 flags_;                     // Operation flags
+  IN hipc::ShmPtr<> blob_data_;           // Output buffer for decompressed data
+  IN chi::PoolId core_pool_id_;           // Pool ID of core chimod for GetBlob
+
+  // Output fields
+  OUT chi::u64 output_size_;              // Actual decompressed size
+  OUT double decompress_time_ms_;         // Decompression time in milliseconds
 
   // SHM constructor
   DecompressTask()
-      : chi::Task(), input_data_(nullptr), input_size_(0),
-        expected_output_size_(0), compress_lib_(0), compress_preset_(2),
-        output_data_(nullptr), output_size_(0), decompress_time_ms_(0.0),
-        return_code_(-1) {}
+      : chi::Task(), tag_id_(wrp_cte::core::TagId::GetNull()),
+        blob_name_(HSHM_MALLOC), offset_(0), size_(0), flags_(0),
+        blob_data_(hipc::ShmPtr<>::GetNull()),
+        core_pool_id_(chi::PoolId::GetNull()),
+        output_size_(0), decompress_time_ms_(0.0) {}
 
   // Emplace constructor
   explicit DecompressTask(const chi::TaskId &task_id,
                           const chi::PoolId &pool_id,
                           const chi::PoolQuery &pool_query,
-                          void *input_data,
-                          chi::u64 input_size,
-                          chi::u64 expected_output_size,
-                          int compress_lib,
-                          int compress_preset)
+                          const wrp_cte::core::TagId &tag_id,
+                          const std::string &blob_name,
+                          chi::u64 offset, chi::u64 size,
+                          chi::u32 flags, hipc::ShmPtr<> blob_data,
+                          const chi::PoolId &core_pool_id)
       : chi::Task(task_id, pool_id, pool_query, Method::kDecompress),
-        input_data_(input_data), input_size_(input_size),
-        expected_output_size_(expected_output_size),
-        compress_lib_(compress_lib), compress_preset_(compress_preset),
-        output_data_(nullptr), output_size_(0), decompress_time_ms_(0.0),
-        return_code_(-1) {}
+        tag_id_(tag_id), blob_name_(HSHM_MALLOC, blob_name),
+        offset_(offset), size_(size), flags_(flags), blob_data_(blob_data),
+        core_pool_id_(core_pool_id),
+        output_size_(0), decompress_time_ms_(0.0) {}
 
   void Copy(const hipc::FullPtr<DecompressTask>& other) {
-    input_data_ = other->input_data_;
-    input_size_ = other->input_size_;
-    expected_output_size_ = other->expected_output_size_;
-    compress_lib_ = other->compress_lib_;
-    compress_preset_ = other->compress_preset_;
-    output_data_ = other->output_data_;
+    tag_id_ = other->tag_id_;
+    blob_name_ = other->blob_name_;
+    offset_ = other->offset_;
+    size_ = other->size_;
+    flags_ = other->flags_;
+    blob_data_ = other->blob_data_;
+    core_pool_id_ = other->core_pool_id_;
     output_size_ = other->output_size_;
     decompress_time_ms_ = other->decompress_time_ms_;
-    return_code_ = other->return_code_;
   }
 
   /** Serialize */
   template <typename Ar>
   void SerializeStart(Ar &ar) {
     task_serialize<Ar>(ar);
-    ar(input_size_, expected_output_size_, compress_lib_, compress_preset_,
-       output_size_, decompress_time_ms_, return_code_);
-    // Note: input_data_ and output_data_ are not serialized (local pointers)
+    ar(tag_id_, blob_name_, offset_, size_, flags_, core_pool_id_,
+       output_size_, decompress_time_ms_);
+    ar.bulk(blob_data_, size_, BULK_EXPOSE);
   }
 
   /** Deserialize */
   template <typename Ar>
-  void SerializeEnd(Ar &ar) {}
+  void SerializeEnd(Ar &ar) {
+    ar(output_size_, decompress_time_ms_);
+    ar.bulk(blob_data_, size_, BULK_XFER);
+  }
 };
 
 }  // namespace wrp_cte::compressor

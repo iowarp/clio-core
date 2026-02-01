@@ -70,7 +70,7 @@ IowarpEngine::IowarpEngine(adios2::core::IO &io, const std::string &name,
     auto create_task = compressor_client_->AsyncCreate(
         chi::PoolQuery::Local(),
         "wrp_cte_compressor",
-        chi::PoolId(513));
+        chi::PoolId(513, 0));
     std::cerr << "[IowarpEngine] DEBUG: AsyncCreate called, about to Wait()" << std::endl;
     std::cerr.flush();
     create_task.Wait();

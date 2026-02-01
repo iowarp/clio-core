@@ -174,9 +174,9 @@ private:
    * @param container_id Container ID for placement
    * @param stats Vector of compression statistics
    * @param context Compression context
-   * @return Tuple of (tier_id, compress_lib, compress_preset, estimated_time)
+   * @return Tuple of (tier_id, compress_lib, compress_preset, estimated_time, tier_score)
    */
-  std::tuple<int, int, int, double> BestCompressRatio(
+  std::tuple<int, int, int, double, float> BestCompressRatio(
       const void* chunk, chi::u64 chunk_size, int container_id,
       const std::vector<CompressionStats>& stats, const Context& context);
 
@@ -187,9 +187,9 @@ private:
    * @param container_id Container ID for placement
    * @param stats Vector of compression statistics
    * @param context Compression context
-   * @return Tuple of (tier_id, compress_lib, compress_preset, estimated_time)
+   * @return Tuple of (tier_id, compress_lib, compress_preset, estimated_time, tier_score)
    */
-  std::tuple<int, int, int, double> BestCompressTime(
+  std::tuple<int, int, int, double, float> BestCompressTime(
       const void* chunk, chi::u64 chunk_size, int container_id,
       const std::vector<CompressionStats>& stats, const Context& context);
 
@@ -200,9 +200,9 @@ private:
    * @param chunk_size Size of chunk
    * @param container_id Container ID for placement
    * @param stats Vector of compression statistics
-   * @return Tuple of (tier_id, compress_lib, compress_preset, estimated_time)
+   * @return Tuple of (tier_id, compress_lib, compress_preset, estimated_time, tier_score)
    */
-  std::tuple<int, int, int, double> BestCompressForNode(
+  std::tuple<int, int, int, double, float> BestCompressForNode(
       const Context& context, const void* chunk, chi::u64 chunk_size,
       int container_id, const std::vector<CompressionStats>& stats);
 

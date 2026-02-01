@@ -14,8 +14,9 @@
 #include <vector>
 
 #include "chimaera/worker.h"
-#include "hermes_shm/util/logging.h"
 #include "hermes_shm/compress/compress_factory.h"
+#include "hermes_shm/compress/data_stats.h"
+#include "hermes_shm/util/logging.h"
 
 namespace wrp_cte::compressor {
 
@@ -23,9 +24,34 @@ namespace wrp_cte::compressor {
 using chi::chi_cur_worker_key_;
 using chi::Worker;
 
-chi::TaskResume Runtime::Create(hipc::FullPtr<CreateTask> task, chi::RunContext &ctx) {
-  // Note: This is a simplified Create task since we don't have a CreateTask defined
-  // In the actual implementation, you would extract config from task parameters
+/**
+ * Compression header prepended to compressed data for self-describing format.
+ * This allows decompression without external metadata.
+ */
+struct CompressionHeader {
+  static constexpr uint32_t kMagic = 0x43544543;  // "CTEC" in ASCII
+  uint32_t magic_;           // Magic number to identify compressed data
+  uint32_t compress_lib_;    // Compression library ID
+  uint32_t compress_preset_; // Compression preset
+  uint64_t original_size_;   // Original uncompressed size
+
+  CompressionHeader()
+      : magic_(kMagic), compress_lib_(0), compress_preset_(0),
+        original_size_(0) {}
+
+  CompressionHeader(uint32_t lib, uint32_t preset, uint64_t orig_size)
+      : magic_(kMagic), compress_lib_(lib), compress_preset_(preset),
+        original_size_(orig_size) {}
+
+  bool IsValid() const { return magic_ == kMagic; }
+};
+static_assert(sizeof(CompressionHeader) == 24, "CompressionHeader must be 24 bytes");
+
+chi::TaskResume Runtime::Create(hipc::FullPtr<CreateTask> task,
+                                chi::RunContext& ctx) {
+  // Note: This is a simplified Create task since we don't have a CreateTask
+  // defined In the actual implementation, you would extract config from task
+  // parameters
 
   // Initialize atomic counters
   compression_logical_time_ = 0;
@@ -39,7 +65,8 @@ chi::TaskResume Runtime::Create(hipc::FullPtr<CreateTask> task, chi::RunContext 
         HLOG(kInfo, "Q-table model loaded successfully with {} states",
              qtable_predictor_->GetNumStates());
       } else {
-        HLOG(kWarning, "Failed to load Q-table model from: {}", config_.qtable_model_path_);
+        HLOG(kWarning, "Failed to load Q-table model from: {}",
+             config_.qtable_model_path_);
         qtable_predictor_.reset();
       }
     } catch (const std::exception& e) {
@@ -51,12 +78,14 @@ chi::TaskResume Runtime::Create(hipc::FullPtr<CreateTask> task, chi::RunContext 
   // Load LinReg table model if configured
   if (!config_.linreg_model_path_.empty()) {
     try {
-      HLOG(kInfo, "Loading LinReg table model from: {}", config_.linreg_model_path_);
+      HLOG(kInfo, "Loading LinReg table model from: {}",
+           config_.linreg_model_path_);
       linreg_predictor_ = std::make_unique<LinRegTablePredictor>();
       if (linreg_predictor_->Load(config_.linreg_model_path_)) {
         HLOG(kInfo, "LinReg table model loaded successfully");
       } else {
-        HLOG(kWarning, "Failed to load LinReg table model from: {}", config_.linreg_model_path_);
+        HLOG(kWarning, "Failed to load LinReg table model from: {}",
+             config_.linreg_model_path_);
         linreg_predictor_.reset();
       }
     } catch (const std::exception& e) {
@@ -67,21 +96,26 @@ chi::TaskResume Runtime::Create(hipc::FullPtr<CreateTask> task, chi::RunContext 
 
   // Load distribution classifier if configured
   if (!config_.distribution_model_path_.empty()) {
-    // Note: DistributionClassifier is template-based - use DistributionClassifierFactory::Classify() directly
-    // No model loading needed - the factory uses built-in mathematical classification
-    HLOG(kInfo, "Distribution classifier available via factory (no model loading required)");
+    // Note: DistributionClassifier is template-based - use
+    // DistributionClassifierFactory::Classify() directly No model loading
+    // needed - the factory uses built-in mathematical classification
+    HLOG(kInfo,
+         "Distribution classifier available via factory (no model loading "
+         "required)");
   }
 
 #ifdef WRP_COMPRESSOR_ENABLE_DENSE_NN
   // Load DNN model weights as fallback if Q-table not available
   if (!qtable_predictor_ && !config_.dnn_model_weights_path_.empty()) {
     try {
-      HLOG(kInfo, "Loading DNN model weights from: {}", config_.dnn_model_weights_path_);
+      HLOG(kInfo, "Loading DNN model weights from: {}",
+           config_.dnn_model_weights_path_);
       nn_predictor_ = std::make_unique<DenseNNPredictor>();
       if (nn_predictor_->LoadWeights(config_.dnn_model_weights_path_)) {
         HLOG(kInfo, "DNN model loaded successfully");
       } else {
-        HLOG(kWarning, "Failed to load DNN model weights from: {}", config_.dnn_model_weights_path_);
+        HLOG(kWarning, "Failed to load DNN model weights from: {}",
+             config_.dnn_model_weights_path_);
         nn_predictor_.reset();
       }
     } catch (const std::exception& e) {
@@ -92,16 +126,20 @@ chi::TaskResume Runtime::Create(hipc::FullPtr<CreateTask> task, chi::RunContext 
 #endif  // WRP_COMPRESSOR_ENABLE_DENSE_NN
 
   if (!qtable_predictor_ && !linreg_predictor_) {
-    HLOG(kDebug, "No compression predictor configured, dynamic compression prediction disabled");
+    HLOG(kDebug,
+         "No compression predictor configured, dynamic compression prediction "
+         "disabled");
   }
 
-  HLOG(kInfo, "CTE Compressor container created and initialized for pool: {} (ID: {})",
+  HLOG(kInfo,
+       "CTE Compressor container created and initialized for pool: {} (ID: {})",
        pool_name_, pool_id_);
 
   co_return;
 }
 
-chi::TaskResume Runtime::Destroy(hipc::FullPtr<DestroyTask> task, chi::RunContext &ctx) {
+chi::TaskResume Runtime::Destroy(hipc::FullPtr<DestroyTask> task,
+                                 chi::RunContext& ctx) {
   try {
     // Reset predictors
     qtable_predictor_.reset();
@@ -116,13 +154,14 @@ chi::TaskResume Runtime::Destroy(hipc::FullPtr<DestroyTask> task, chi::RunContex
     // ShmPtr cleanup handled automatically
 
     HLOG(kInfo, "CTE Compressor container destroyed successfully");
-  } catch (const std::exception &e) {
+  } catch (const std::exception& e) {
     HLOG(kError, "Exception during compressor destroy: {}", e.what());
   }
   co_return;
 }
 
-chi::TaskResume Runtime::Monitor(hipc::FullPtr<MonitorTask> task, chi::RunContext &ctx) {
+chi::TaskResume Runtime::Monitor(hipc::FullPtr<MonitorTask> task,
+                                 chi::RunContext& ctx) {
   // Dynamic schedule: just set pool query
   if (ctx.exec_mode_ == chi::ExecMode::kDynamicSchedule) {
     task->pool_query_ = chi::PoolQuery::Local();
@@ -132,7 +171,8 @@ chi::TaskResume Runtime::Monitor(hipc::FullPtr<MonitorTask> task, chi::RunContex
   try {
     // Initialize core client if needed
     if (!core_client_) {
-      core_client_ = std::make_unique<wrp_cte::core::Client>(task->core_pool_id_);
+      core_client_ =
+          std::make_unique<wrp_cte::core::Client>(task->core_pool_id_);
     }
 
     // List all registered targets from core
@@ -149,7 +189,6 @@ chi::TaskResume Runtime::Monitor(hipc::FullPtr<MonitorTask> task, chi::RunContex
     std::lock_guard<std::mutex> lock(target_states_mutex_);
 
     for (const auto& target_name : list_task->target_names_) {
-
       // Get detailed info for this target
       auto info_task = core_client_->AsyncGetTargetInfo(target_name);
       info_task.Wait();
@@ -163,8 +202,11 @@ chi::TaskResume Runtime::Monitor(hipc::FullPtr<MonitorTask> task, chi::RunContex
         state.bytes_written_ = info_task->bytes_written_;
         state.last_updated_ = std::chrono::steady_clock::now();
 
-        HLOG(kDebug, "Updated target state: {} (score={:.3f}, remaining={} bytes, written={} bytes)",
-             target_name, state.target_score_, state.remaining_space_, state.bytes_written_);
+        HLOG(kDebug,
+             "Updated target state: {} (score={:.3f}, remaining={} bytes, "
+             "written={} bytes)",
+             target_name, state.target_score_, state.remaining_space_,
+             state.bytes_written_);
       } else {
         HLOG(kWarning, "Failed to get info for target '{}' (error code: {})",
              target_name, info_task->return_code_);
@@ -186,47 +228,27 @@ std::vector<CompressionStats> Runtime::EstCompressionStats(
     const void* chunk, chi::u64 chunk_size, const Context& context) {
   std::vector<CompressionStats> results;
 
-  // Calculate compression features from chunk data
-  const auto* data = static_cast<const uint8_t*>(chunk);
-  chi::u64 sample_size = std::min(chunk_size, static_cast<chi::u64>(65536));
+  // Determine data type from context
+  // context.data_type_: 0 = char/uint8, 1 = float
+  hshm::DataType data_type = (context.data_type_ == 1) ? hshm::DataType::FLOAT32
+                                                       : hshm::DataType::UINT8;
+  size_t type_size = hshm::DataStatisticsFactory::GetTypeSize(data_type);
 
-  // Calculate Shannon entropy
-  std::vector<int> histogram(256, 0);
-  for (chi::u64 i = 0; i < sample_size; ++i) {
-    histogram[data[i]]++;
-  }
-  double entropy = 0.0;
-  for (int count : histogram) {
-    if (count > 0) {
-      double prob = static_cast<double>(count) / static_cast<double>(sample_size);
-      entropy -= prob * std::log2(prob);
-    }
+  // Calculate number of elements (sample up to 64KB for efficiency)
+  chi::u64 sample_bytes = std::min(chunk_size, static_cast<chi::u64>(65536));
+  size_t num_elements = sample_bytes / type_size;
+  if (num_elements == 0) {
+    num_elements = 1;
   }
 
-  // Calculate MAD (Mean Absolute Deviation)
-  double mean = 0.0;
-  for (chi::u64 i = 0; i < sample_size; ++i) {
-    mean += data[i];
-  }
-  mean /= static_cast<double>(sample_size);
-  double mad = 0.0;
-  for (chi::u64 i = 0; i < sample_size; ++i) {
-    mad += std::abs(static_cast<double>(data[i]) - mean);
-  }
-  mad /= static_cast<double>(sample_size);
-
-  // Calculate second derivative mean (curvature)
-  double second_deriv_sum = 0.0;
-  chi::u64 deriv_count = 0;
-  for (chi::u64 i = 1; i < sample_size - 1 && i < 999; ++i) {
-    double second_deriv = static_cast<double>(data[i + 1]) -
-                          2.0 * static_cast<double>(data[i]) +
-                          static_cast<double>(data[i - 1]);
-    second_deriv_sum += std::abs(second_deriv);
-    deriv_count++;
-  }
-  double second_derivative_mean = (deriv_count > 0) ?
-      (second_deriv_sum / static_cast<double>(deriv_count)) : 0.0;
+  // Calculate compression features using DataStatisticsFactory
+  double entropy = hshm::DataStatisticsFactory::CalculateShannonEntropy(
+      chunk, num_elements, data_type);
+  double mad =
+      hshm::DataStatisticsFactory::CalculateMAD(chunk, num_elements, data_type);
+  double second_derivative_mean =
+      hshm::DataStatisticsFactory::CalculateSecondDerivative(
+          chunk, num_elements, data_type);
 
   // Determine candidate compression libraries and configs
   // Library IDs: BROTLI=0, BZIP2=1, Blosc2=2, FPZIP=3, LZ4=4, LZMA=5,
@@ -239,11 +261,11 @@ std::vector<CompressionStats> Runtime::EstCompressionStats(
   } else {
     // Dynamic mode: test common library/config combinations
     candidate_lib_configs = {
-      {10, 0},  // ZSTD balanced
-      {10, 3},  // ZSTD fast
-      {4, 3},   // LZ4 fast
-      {1, 1},   // BZIP2 best
-      {9, 0},   // ZLIB balanced
+        {10, 0},  // ZSTD balanced
+        {10, 3},  // ZSTD fast
+        {4, 3},   // LZ4 fast
+        {1, 1},   // BZIP2 best
+        {9, 0},   // ZLIB balanced
     };
   }
 
@@ -294,7 +316,8 @@ std::vector<CompressionStats> Runtime::EstCompressionStats(
     }
 
     // Filter out compressions below PSNR threshold
-    if (context.target_psnr_ > 0 && pred.psnr_db > 0 && pred.psnr_db < context.target_psnr_) {
+    if (context.target_psnr_ > 0 && pred.psnr_db > 0 &&
+        pred.psnr_db < context.target_psnr_) {
       continue;
     }
 
@@ -307,16 +330,16 @@ std::vector<CompressionStats> Runtime::EstCompressionStats(
   return results;
 }
 
-double Runtime::EstWorkflowCompressTime(
-    chi::u64 chunk_size, double tier_bw, const CompressionStats& stats,
-    const Context& context) {
-
+double Runtime::EstWorkflowCompressTime(chi::u64 chunk_size, double tier_bw,
+                                        const CompressionStats& stats,
+                                        const Context& context) {
   double compressed_size = chunk_size / stats.compression_ratio_;
   double transfer_time_ms = (compressed_size / tier_bw) * 1000.0;
 
   if (stats.psnr_db_ == 0.0) {
     // Lossless compression
-    return stats.compress_time_ms_ + stats.decompress_time_ms_ + transfer_time_ms;
+    return stats.compress_time_ms_ + stats.decompress_time_ms_ +
+           transfer_time_ms;
   } else {
     // Lossy compression - may need verification decompression
     double psnr_check_prob = static_cast<double>(context.psnr_chance_) / 100.0;
@@ -326,15 +349,15 @@ double Runtime::EstWorkflowCompressTime(
   }
 }
 
-std::tuple<int, int, int, double> Runtime::BestCompressRatio(
+std::tuple<int, int, int, double, float> Runtime::BestCompressRatio(
     const void* chunk, chi::u64 chunk_size, int container_id,
     const std::vector<CompressionStats>& stats, const Context& context) {
-
   int best_tier = 0;
   int best_lib = 0;
   int best_preset = 2;  // Default: BALANCED
   double best_time = std::numeric_limits<double>::max();
   double best_ratio = 1.0;
+  float best_tier_score = 0.0F;
 
   // Get target bandwidth from cached target states
   double tier_bw = 1e9;  // Default: 1 GB/s
@@ -342,14 +365,15 @@ std::tuple<int, int, int, double> Runtime::BestCompressRatio(
     std::lock_guard<std::mutex> lock(target_states_mutex_);
     if (!target_states_.empty()) {
       // Find target with highest score (best performance)
-      float max_score = 0.0f;
+      float max_score = 0.0F;
       for (const auto& [name, state] : target_states_) {
         if (state.target_score_ > max_score) {
           max_score = state.target_score_;
+          best_tier_score = max_score;
           // Estimate bandwidth from normalized log score
           // score = log(bw+1) / log(1000+1), solve for bw
           tier_bw = std::pow(1001.0, max_score) - 1.0;
-          tier_bw = std::max(tier_bw, 1e6);  // At least 1 MB/s
+          tier_bw = std::max(tier_bw, 1e6);   // At least 1 MB/s
           tier_bw = std::min(tier_bw, 1e10);  // Cap at 10 GB/s
         }
       }
@@ -358,7 +382,8 @@ std::tuple<int, int, int, double> Runtime::BestCompressRatio(
 
   for (const auto& stat : stats) {
     // Calculate workflow time for this compression
-    double est_time = EstWorkflowCompressTime(chunk_size, tier_bw, stat, context);
+    double est_time =
+        EstWorkflowCompressTime(chunk_size, tier_bw, stat, context);
 
     // Choose compression with best ratio that meets time constraints
     if (stat.compression_ratio_ > best_ratio) {
@@ -370,17 +395,17 @@ std::tuple<int, int, int, double> Runtime::BestCompressRatio(
     }
   }
 
-  return std::make_tuple(best_tier, best_lib, best_preset, best_time);
+  return std::make_tuple(best_tier, best_lib, best_preset, best_time, best_tier_score);
 }
 
-std::tuple<int, int, int, double> Runtime::BestCompressTime(
+std::tuple<int, int, int, double, float> Runtime::BestCompressTime(
     const void* chunk, chi::u64 chunk_size, int container_id,
     const std::vector<CompressionStats>& stats, const Context& context) {
-
   int best_tier = 0;
   int best_lib = 0;
   int best_preset = 2;  // Default: BALANCED
   double best_time = std::numeric_limits<double>::max();
+  float best_tier_score = 0.0F;
 
   // Get target bandwidth from cached target states
   double tier_bw = 1e9;  // Default: 1 GB/s
@@ -388,14 +413,15 @@ std::tuple<int, int, int, double> Runtime::BestCompressTime(
     std::lock_guard<std::mutex> lock(target_states_mutex_);
     if (!target_states_.empty()) {
       // Find target with highest score (best performance)
-      float max_score = 0.0f;
+      float max_score = 0.0F;
       for (const auto& [name, state] : target_states_) {
         if (state.target_score_ > max_score) {
           max_score = state.target_score_;
+          best_tier_score = max_score;
           // Estimate bandwidth from normalized log score
           // score = log(bw+1) / log(1000+1), solve for bw
           tier_bw = std::pow(1001.0, max_score) - 1.0;
-          tier_bw = std::max(tier_bw, 1e6);  // At least 1 MB/s
+          tier_bw = std::max(tier_bw, 1e6);   // At least 1 MB/s
           tier_bw = std::min(tier_bw, 1e10);  // Cap at 10 GB/s
         }
       }
@@ -404,7 +430,8 @@ std::tuple<int, int, int, double> Runtime::BestCompressTime(
 
   // For each compression library and tier, calculate workflow time
   for (const auto& stat : stats) {
-    double est_time = EstWorkflowCompressTime(chunk_size, tier_bw, stat, context);
+    double est_time =
+        EstWorkflowCompressTime(chunk_size, tier_bw, stat, context);
 
     // Choose combination with best performance
     if (est_time < best_time) {
@@ -415,21 +442,19 @@ std::tuple<int, int, int, double> Runtime::BestCompressTime(
     }
   }
 
-  return std::make_tuple(best_tier, best_lib, best_preset, best_time);
+  return std::make_tuple(best_tier, best_lib, best_preset, best_time, best_tier_score);
 }
 
-std::tuple<int, int, int, double> Runtime::BestCompressForNode(
+std::tuple<int, int, int, double, float> Runtime::BestCompressForNode(
     const Context& context, const void* chunk, chi::u64 chunk_size,
     int container_id, const std::vector<CompressionStats>& stats) {
-
   // Choose strategy based on context objective
   if (context.max_performance_) {
     // Objective: minimize time
     return BestCompressTime(chunk, chunk_size, container_id, stats, context);
-  } else {
-    // Objective: maximize compression ratio
-    return BestCompressRatio(chunk, chunk_size, container_id, stats, context);
   }
+  // Objective: maximize compression ratio
+  return BestCompressRatio(chunk, chunk_size, container_id, stats, context);
 }
 
 // ==============================================================================
@@ -440,12 +465,14 @@ std::tuple<int, int, int, double> Runtime::BestCompressForNode(
 static std::atomic<chi::u64> g_trace_key_counter{1};
 
 // Helper function to write trace log entry
-static void WriteTraceLog(const std::string& trace_folder, const std::string& log_name,
-                          chi::u32 container_id, const std::string& entry) {
+static void WriteTraceLog(const std::string& trace_folder,
+                          const std::string& log_name, chi::u32 container_id,
+                          const std::string& entry) {
   if (trace_folder.empty()) return;
 
   try {
-    std::string log_path = trace_folder + "/" + log_name + "." + std::to_string(container_id);
+    std::string log_path =
+        trace_folder + "/" + log_name + "." + std::to_string(container_id);
     std::ofstream log_file(log_path, std::ios::app);
     if (log_file.is_open()) {
       log_file << entry << std::endl;
@@ -456,8 +483,8 @@ static void WriteTraceLog(const std::string& trace_folder, const std::string& lo
   }
 }
 
-chi::TaskResume Runtime::DynamicSchedule(hipc::FullPtr<DynamicScheduleTask> task,
-                                         chi::RunContext& ctx) {
+chi::TaskResume Runtime::DynamicSchedule(
+    hipc::FullPtr<DynamicScheduleTask> task, chi::RunContext& ctx) {
   // Dynamic scheduling phase - determine routing
   if (ctx.exec_mode_ == chi::ExecMode::kDynamicSchedule) {
     task->pool_query_ = chi::PoolQuery::Local();
@@ -465,9 +492,11 @@ chi::TaskResume Runtime::DynamicSchedule(hipc::FullPtr<DynamicScheduleTask> task
   }
 
   try {
-    // Extract task parameters
-    chi::u64 chunk_size = task->chunk_size_;
-    void* chunk_data = task->chunk_data_;
+    // Extract task parameters (same as PutBlobTask)
+    chi::u64 chunk_size = task->size_;
+    // Convert ShmPtr to raw pointer via FullPtr
+    auto blob_fullptr = CHI_IPC->ToFullPtr<char>(task->blob_data_.template Cast<char>());
+    void* chunk_data = blob_fullptr.ptr_;
     Context& context = task->context_;
 
     // Initialize tracing if enabled
@@ -501,30 +530,29 @@ chi::TaskResume Runtime::DynamicSchedule(hipc::FullPtr<DynamicScheduleTask> task
     if (context.trace_ && !stats.empty()) {
       for (const auto& stat : stats) {
         std::ostringstream log_entry;
-        log_entry << context.trace_key_ << ","
-                  << stat.compress_lib_ << ","
-                  << stat.compression_ratio_ << ","
-                  << stat.compress_time_ms_ << ","
-                  << stat.decompress_time_ms_ << ","
-                  << stat.psnr_db_;
+        log_entry << context.trace_key_ << "," << stat.compress_lib_ << ","
+                  << stat.compression_ratio_ << "," << stat.compress_time_ms_
+                  << "," << stat.decompress_time_ms_ << "," << stat.psnr_db_;
         WriteTraceLog(config_.trace_folder_path_, "predicted_stats.log",
                       pool_id_.major_, log_entry.str());
       }
     }
 
     // Choose best compression strategy
-    // For simplicity, use container_id = 0 (can be enhanced to use actual container ID)
-    auto [best_tier, best_lib, best_preset, best_time] = BestCompressForNode(context, chunk_data,
-                                                                               chunk_size, 0, stats);
+    auto [best_tier, best_lib, best_preset, best_time, tier_score] =
+        BestCompressForNode(context, chunk_data, chunk_size, container_id_, stats);
 
     // Update context with selected compression library and preset
     context.compress_lib_ = best_lib;
     context.compress_preset_ = best_preset;
+    task->tier_score_ = tier_score;
 
     // Log scheduling decision time if tracing enabled
     if (context.trace_) {
       auto end_time = std::chrono::high_resolution_clock::now();
-      auto duration_ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
+      auto duration_ms =
+          std::chrono::duration<double, std::milli>(end_time - start_time)
+              .count();
 
       std::ostringstream log_entry;
       log_entry << context.trace_key_ << "," << duration_ms;
@@ -532,7 +560,19 @@ chi::TaskResume Runtime::DynamicSchedule(hipc::FullPtr<DynamicScheduleTask> task
                     pool_id_.major_, log_entry.str());
     }
 
-    task->return_code_ = 0;
+    // Now call Compress to perform compression and PutBlob
+    auto compress_task = client_.AsyncCompress(
+        chi::PoolQuery::Local(),
+        task->tag_id_, task->blob_name_.str(), task->offset_, task->size_,
+        task->blob_data_, task->score_, context, task->flags_,
+        task->core_pool_id_);
+    compress_task.Wait();
+
+    // Copy results back
+    task->context_ = compress_task->context_;
+    task->tier_score_ = compress_task->tier_score_;
+    task->return_code_ = compress_task->return_code_;
+
   } catch (const std::exception& e) {
     HLOG(kError, "Exception in DynamicSchedule: {}", e.what());
     task->return_code_ = 1;
@@ -550,39 +590,68 @@ chi::TaskResume Runtime::Compress(hipc::FullPtr<CompressTask> task,
   }
 
   try {
-    // Extract task parameters
-    void* input_data = task->input_data_;
-    chi::u64 input_size = task->input_size_;
+    // Extract task parameters (same as PutBlobTask)
+    chi::u64 input_size = task->size_;
     Context& context = task->context_;
 
     // Validate inputs
-    if (input_data == nullptr || input_size == 0) {
+    if (task->blob_data_.IsNull() || input_size == 0) {
       task->return_code_ = 1;  // Invalid input
       co_return;
     }
 
+    // Initialize core client if needed
+    if (!core_client_) {
+      core_client_ = std::make_unique<wrp_cte::core::Client>(task->core_pool_id_);
+    }
+
+    // Get tier score for output
+    float tier_score = 0.0F;
+    {
+      std::lock_guard<std::mutex> lock(target_states_mutex_);
+      for (const auto& [name, state] : target_states_) {
+        if (state.target_score_ > tier_score) {
+          tier_score = state.target_score_;
+        }
+      }
+    }
+    task->tier_score_ = tier_score;
+
+    // If no compression requested, just call PutBlob directly
     if (context.compress_lib_ <= 0) {
-      task->return_code_ = 2;  // No compression library specified
+      auto put_task = core_client_->AsyncPutBlob(
+          task->tag_id_, task->blob_name_.str(),
+          task->offset_, task->size_, task->blob_data_, task->score_,
+          context, task->flags_, chi::PoolQuery::Local());
+      put_task.Wait();
+      task->context_ = put_task->context_;
+      task->return_code_ = put_task->return_code_;
       co_return;
     }
 
     // Map compress_lib_ ID to library name
-    const char* lib_names[] = {"brotli", "bzip2", "blosc2", "fpzip", "lz4",
-                                "lzma", "snappy", "sz3", "zfp", "zlib", "zstd"};
-    std::string library_name = (context.compress_lib_ >= 0 && context.compress_lib_ <= 10) ?
-                               lib_names[context.compress_lib_] : "zstd";
+    const char* lib_names[] = {"brotli", "bzip2", "blosc2", "fpzip",
+                               "lz4",    "lzma",  "snappy", "sz3",
+                               "zfp",    "zlib",  "zstd"};
+    std::string library_name =
+        (context.compress_lib_ >= 0 && context.compress_lib_ <= 10)
+            ? lib_names[context.compress_lib_]
+            : "zstd";
 
     // Map preset integer to enum
     hshm::CompressionPreset preset = hshm::CompressionPreset::BALANCED;
-    if (context.compress_preset_ == 1) preset = hshm::CompressionPreset::FAST;
-    else if (context.compress_preset_ == 2) preset = hshm::CompressionPreset::BALANCED;
-    else if (context.compress_preset_ == 3) preset = hshm::CompressionPreset::BEST;
+    if (context.compress_preset_ == 1) {
+      preset = hshm::CompressionPreset::FAST;
+    } else if (context.compress_preset_ == 3) {
+      preset = hshm::CompressionPreset::BEST;
+    }
 
     // Create compressor with specified preset
     auto compressor = hshm::CompressionFactory::GetPreset(library_name, preset);
 
     if (!compressor) {
-      HLOG(kWarning, "Failed to create compressor for library: {}", library_name);
+      HLOG(kWarning, "Failed to create compressor for library: {}",
+           library_name);
       task->return_code_ = 3;  // Compressor creation failed
       co_return;
     }
@@ -594,72 +663,89 @@ chi::TaskResume Runtime::Compress(hipc::FullPtr<CompressTask> task,
 
     // Compress the data
     size_t compressed_size = compressed_buffer.size();
+    // Convert ShmPtr to raw pointer via FullPtr
+    auto input_fullptr = CHI_IPC->ToFullPtr<char>(task->blob_data_.template Cast<char>());
+    char* input_ptr = input_fullptr.ptr_;
     bool success = compressor->Compress(compressed_buffer.data(), compressed_size,
-                                        reinterpret_cast<char*>(input_data), input_size);
+                                        input_ptr, input_size);
 
     auto compress_end = std::chrono::high_resolution_clock::now();
-    double compress_time = std::chrono::duration<double, std::milli>(compress_end - compress_start).count();
+    double compress_time =
+        std::chrono::duration<double, std::milli>(compress_end - compress_start)
+            .count();
 
-    if (success && compressed_size < input_size) {
-      // Compression succeeded and reduced size
+    // Check if compression succeeded and is beneficial
+    // Include header size in the total stored size
+    size_t header_size = sizeof(CompressionHeader);
+    size_t total_stored_size = compressed_size + header_size;
+
+    if (success && total_stored_size < input_size) {
+      // Compression succeeded and reduced size (including header overhead)
       compressed_buffer.resize(compressed_size);
 
-      // Allocate output buffer (caller will free this)
-      task->output_data_ = malloc(compressed_size);
-      if (task->output_data_ == nullptr) {
+      // Update context with compression statistics
+      context.actual_original_size_ = input_size;
+      context.actual_compressed_size_ = total_stored_size;
+      context.actual_compression_ratio_ =
+          static_cast<double>(input_size) / static_cast<double>(total_stored_size);
+      context.actual_compress_time_ms_ = compress_time;
+
+      // Allocate shared memory for header + compressed data
+      auto compressed_shm = CHI_IPC->AllocateBuffer(total_stored_size);
+      if (compressed_shm.IsNull()) {
+        HLOG(kError, "Failed to allocate shared memory for compressed data");
         task->return_code_ = 4;  // Memory allocation failed
         co_return;
       }
 
-      // Copy compressed data to output
-      std::memcpy(task->output_data_, compressed_buffer.data(), compressed_size);
-      task->output_size_ = compressed_size;
+      // Write compression header
+      CompressionHeader header(context.compress_lib_, context.compress_preset_, input_size);
+      std::memcpy(compressed_shm.ptr_, &header, header_size);
+
+      // Write compressed data after header
+      std::memcpy(compressed_shm.ptr_ + header_size,
+                  compressed_buffer.data(), compressed_size);
+
+      // Call PutBlob with header + compressed data
+      hipc::ShmPtr<> compressed_shm_ptr = compressed_shm.shm_.template Cast<void>();
+      auto put_task = core_client_->AsyncPutBlob(
+          task->tag_id_, task->blob_name_.str(),
+          task->offset_, total_stored_size,
+          compressed_shm_ptr, task->score_,
+          context, task->flags_, chi::PoolQuery::Local());
+      put_task.Wait();
+
+      // Free compressed data buffer
+      CHI_IPC->FreeBuffer(compressed_shm);
 
       // Log compression telemetry
-      CompressionTelemetry telemetry(
-          CteOp::kPutBlob, context.compress_lib_, input_size, compressed_size,
-          compress_time, 0.0, 0.0, std::chrono::steady_clock::now(),
-          compression_logical_time_.fetch_add(1));
+      CompressionTelemetry telemetry(CteOp::kPutBlob, context.compress_lib_,
+                                     input_size, total_stored_size, compress_time,
+                                     0.0, 0.0, std::chrono::steady_clock::now(),
+                                     compression_logical_time_.fetch_add(1));
       LogCompressionTelemetry(telemetry);
 
-      HLOG(kDebug, "Compression: {} bytes -> {} bytes (ratio: {:.2f}, time: {:.2f}ms)",
-           input_size, compressed_size, static_cast<double>(input_size) / compressed_size,
+      HLOG(kDebug,
+           "Compression: {} bytes -> {} bytes (ratio: {:.2f}, time: {:.2f}ms)",
+           input_size, total_stored_size,
+           static_cast<double>(input_size) / static_cast<double>(total_stored_size),
            compress_time);
 
-      // Update target capacity in cache (optimistic update)
-      {
-        std::lock_guard<std::mutex> lock(target_states_mutex_);
-        if (!target_states_.empty()) {
-          // Find target with highest score (most likely to be used for placement)
-          std::string best_target_name;
-          float max_score = -1.0f;
-          for (const auto& [name, state] : target_states_) {
-            if (state.target_score_ > max_score) {
-              max_score = state.target_score_;
-              best_target_name = name;
-            }
-          }
-
-          // Update the best target's capacity
-          if (!best_target_name.empty()) {
-            auto& target = target_states_[best_target_name];
-            if (target.remaining_space_ >= compressed_size) {
-              target.remaining_space_ -= compressed_size;
-              target.bytes_written_ += compressed_size;
-              HLOG(kDebug, "Updated target '{}' capacity: -{} bytes (remaining: {} bytes)",
-                   best_target_name, compressed_size, target.remaining_space_);
-            }
-          }
-        }
-      }
-
-      task->return_code_ = 0;  // Success
+      task->context_ = context;
+      task->return_code_ = put_task->return_code_;
     } else {
-      // Compression failed or didn't reduce size
-      HLOG(kDebug, "Compression not beneficial, returning original data");
-      task->output_data_ = nullptr;
-      task->output_size_ = input_size;
-      task->return_code_ = 5;  // Compression not beneficial
+      // Compression failed or didn't reduce size - store original data
+      HLOG(kDebug, "Compression not beneficial, storing original data");
+
+      auto put_task = core_client_->AsyncPutBlob(
+          task->tag_id_, task->blob_name_.str(),
+          task->offset_, task->size_, task->blob_data_, task->score_,
+          context, task->flags_, chi::PoolQuery::Local());
+      put_task.Wait();
+
+      context.compress_lib_ = 0;  // Mark as uncompressed
+      task->context_ = put_task->context_;
+      task->return_code_ = put_task->return_code_;
     }
 
   } catch (const std::exception& e) {
@@ -679,87 +765,129 @@ chi::TaskResume Runtime::Decompress(hipc::FullPtr<DecompressTask> task,
   }
 
   try {
-    // Extract task parameters
-    void* input_data = task->input_data_;
-    chi::u64 input_size = task->input_size_;
-    chi::u64 expected_output_size = task->expected_output_size_;
-    int compress_lib = task->compress_lib_;
-    int compress_preset = task->compress_preset_;
+    // Extract task parameters (same as GetBlobTask)
+    chi::u64 expected_size = task->size_;
 
-    // Validate inputs
-    if (input_data == nullptr || input_size == 0) {
-      task->return_code_ = 1;  // Invalid input
+    // Validate output buffer
+    if (task->blob_data_.IsNull()) {
+      task->return_code_ = 1;  // Invalid output buffer
       co_return;
     }
 
-    if (compress_lib <= 0) {
-      task->return_code_ = 2;  // No compression library specified
+    // Initialize core client if needed
+    if (!core_client_) {
+      core_client_ = std::make_unique<wrp_cte::core::Client>(task->core_pool_id_);
+    }
+
+    // Allocate temporary buffer to receive compressed data from GetBlob
+    // We don't know the compressed size, so allocate expected_size as upper bound
+    auto temp_buffer = CHI_IPC->AllocateBuffer(expected_size);
+    if (temp_buffer.IsNull()) {
+      task->return_code_ = 2;  // Memory allocation failed
+      co_return;
+    }
+    hipc::ShmPtr<> temp_buffer_ptr = temp_buffer.shm_.template Cast<void>();
+
+    // Call GetBlob to retrieve the (potentially compressed) data
+    auto get_task = core_client_->AsyncGetBlob(
+        task->tag_id_, task->blob_name_.str(),
+        task->offset_, expected_size, task->flags_,
+        temp_buffer_ptr, chi::PoolQuery::Local());
+    get_task.Wait();
+
+    if (get_task->return_code_ != 0) {
+      CHI_IPC->FreeBuffer(temp_buffer);
+      task->return_code_ = 10 + get_task->return_code_;  // GetBlob failed
       co_return;
     }
 
-    // Map compress_lib ID to library name
-    const char* lib_names[] = {"brotli", "bzip2", "blosc2", "fpzip", "lz4",
-                                "lzma", "snappy", "sz3", "zfp", "zlib", "zstd"};
-    std::string library_name = (compress_lib >= 0 && compress_lib <= 10) ?
-                               lib_names[compress_lib] : "zstd";
+    // Check for compression header
+    auto* header = reinterpret_cast<CompressionHeader*>(temp_buffer.ptr_);
+    size_t header_size = sizeof(CompressionHeader);
 
-    // Map preset integer to enum
-    hshm::CompressionPreset preset = hshm::CompressionPreset::BALANCED;
-    if (compress_preset == 1) preset = hshm::CompressionPreset::FAST;
-    else if (compress_preset == 2) preset = hshm::CompressionPreset::BALANCED;
-    else if (compress_preset == 3) preset = hshm::CompressionPreset::BEST;
+    if (header->IsValid()) {
+      // Data is compressed - decompress it
+      int compress_lib = static_cast<int>(header->compress_lib_);
+      int compress_preset = static_cast<int>(header->compress_preset_);
+      chi::u64 original_size = header->original_size_;
 
-    // Create decompressor with same preset that was used for compression
-    auto decompressor = hshm::CompressionFactory::GetPreset(library_name, preset);
+      // Map compress_lib ID to library name
+      const char* lib_names[] = {"brotli", "bzip2", "blosc2", "fpzip",
+                                 "lz4",    "lzma",  "snappy", "sz3",
+                                 "zfp",    "zlib",  "zstd"};
+      std::string library_name = (compress_lib >= 0 && compress_lib <= 10)
+                                     ? lib_names[compress_lib]
+                                     : "zstd";
 
-    if (!decompressor) {
-      HLOG(kWarning, "Failed to create decompressor for library: {}", library_name);
-      task->return_code_ = 3;  // Decompressor creation failed
-      co_return;
-    }
+      // Map preset integer to enum
+      hshm::CompressionPreset preset = hshm::CompressionPreset::BALANCED;
+      if (compress_preset == 1) {
+        preset = hshm::CompressionPreset::FAST;
+      } else if (compress_preset == 3) {
+        preset = hshm::CompressionPreset::BEST;
+      }
 
-    auto decompress_start = std::chrono::high_resolution_clock::now();
-
-    // Allocate buffer for decompressed data
-    std::vector<char> decompressed_buffer(expected_output_size);
-
-    // Decompress the data
-    size_t decompressed_size = decompressed_buffer.size();
-    bool success = decompressor->Decompress(decompressed_buffer.data(), decompressed_size,
-                                            reinterpret_cast<char*>(input_data), input_size);
-
-    auto decompress_end = std::chrono::high_resolution_clock::now();
-    double decompress_time = std::chrono::duration<double, std::milli>(decompress_end - decompress_start).count();
-
-    if (success) {
-      // Decompression succeeded
-      // Allocate output buffer (caller will free this)
-      task->output_data_ = malloc(decompressed_size);
-      if (task->output_data_ == nullptr) {
-        task->return_code_ = 4;  // Memory allocation failed
+      // Create decompressor
+      auto decompressor = hshm::CompressionFactory::GetPreset(library_name, preset);
+      if (!decompressor) {
+        CHI_IPC->FreeBuffer(temp_buffer);
+        HLOG(kWarning, "Failed to create decompressor for library: {}", library_name);
+        task->return_code_ = 3;  // Decompressor creation failed
         co_return;
       }
 
-      // Copy decompressed data to output
-      std::memcpy(task->output_data_, decompressed_buffer.data(), decompressed_size);
-      task->output_size_ = decompressed_size;
+      auto decompress_start = std::chrono::high_resolution_clock::now();
 
-      // Log decompression telemetry
-      CompressionTelemetry telemetry(
-          CteOp::kGetBlob, compress_lib, decompressed_size, input_size,
-          0.0, decompress_time, 0.0, std::chrono::steady_clock::now(),
-          compression_logical_time_.fetch_add(1));
-      LogCompressionTelemetry(telemetry);
+      // Get compressed data (after header)
+      char* compressed_data = temp_buffer.ptr_ + header_size;
+      size_t compressed_size = expected_size - header_size;
 
-      HLOG(kDebug, "Decompression: {} bytes -> {} bytes (time: {:.2f}ms)",
-           input_size, decompressed_size, decompress_time);
+      // Decompress to output buffer
+      auto output_fullptr = CHI_IPC->ToFullPtr<char>(task->blob_data_.template Cast<char>());
+      size_t decompressed_size = original_size;
+      bool success = decompressor->Decompress(
+          output_fullptr.ptr_, decompressed_size,
+          compressed_data, compressed_size);
 
-      task->return_code_ = 0;  // Success
+      auto decompress_end = std::chrono::high_resolution_clock::now();
+      double decompress_time = std::chrono::duration<double, std::milli>(
+                                   decompress_end - decompress_start).count();
+
+      CHI_IPC->FreeBuffer(temp_buffer);
+
+      if (success) {
+        task->output_size_ = decompressed_size;
+        task->decompress_time_ms_ = decompress_time;
+
+        // Log decompression telemetry
+        CompressionTelemetry telemetry(
+            CteOp::kGetBlob, compress_lib, decompressed_size, compressed_size, 0.0,
+            decompress_time, 0.0, std::chrono::steady_clock::now(),
+            compression_logical_time_.fetch_add(1));
+        LogCompressionTelemetry(telemetry);
+
+        HLOG(kDebug, "Decompression: {} bytes -> {} bytes (time: {:.2f}ms)",
+             compressed_size, decompressed_size, decompress_time);
+
+        task->return_code_ = 0;  // Success
+      } else {
+        HLOG(kError, "Decompression failed");
+        task->output_size_ = 0;
+        task->decompress_time_ms_ = 0.0;
+        task->return_code_ = 5;  // Decompression failed
+      }
     } else {
-      HLOG(kError, "Decompression failed");
-      task->output_data_ = nullptr;
-      task->output_size_ = 0;
-      task->return_code_ = 5;  // Decompression failed
+      // No compression header - data is uncompressed
+      // Copy directly to output buffer
+      auto output_fullptr = CHI_IPC->ToFullPtr<char>(task->blob_data_.template Cast<char>());
+      std::memcpy(output_fullptr.ptr_, temp_buffer.ptr_, expected_size);
+      CHI_IPC->FreeBuffer(temp_buffer);
+
+      task->output_size_ = expected_size;
+      task->decompress_time_ms_ = 0.0;
+      task->return_code_ = 0;  // Success (no decompression needed)
+
+      HLOG(kDebug, "GetBlob (no compression): {} bytes", expected_size);
     }
 
   } catch (const std::exception& e) {
@@ -780,17 +908,17 @@ void Runtime::LogCompressionTelemetry(const CompressionTelemetry& telemetry) {
   // Log to trace file if tracing is enabled
   if (!config_.trace_folder_path_.empty()) {
     std::ostringstream log_entry;
-    log_entry << telemetry.logical_time_ << ","
-              << telemetry.compress_lib_ << ","
-              << telemetry.original_size_ << ","
+    log_entry << telemetry.logical_time_ << "," << telemetry.compress_lib_
+              << "," << telemetry.original_size_ << ","
               << telemetry.compressed_size_ << ","
               << telemetry.compress_time_ms_ << ","
-              << telemetry.decompress_time_ms_ << ","
-              << telemetry.psnr_db_;
+              << telemetry.decompress_time_ms_ << "," << telemetry.psnr_db_;
 
-    std::string log_name = (telemetry.op_ == CteOp::kPutBlob) ?
-                           "compress_stats.log" : "decompress_stats.log";
-    WriteTraceLog(config_.trace_folder_path_, log_name, pool_id_.major_, log_entry.str());
+    std::string log_name = (telemetry.op_ == CteOp::kPutBlob)
+                               ? "compress_stats.log"
+                               : "decompress_stats.log";
+    WriteTraceLog(config_.trace_folder_path_, log_name, pool_id_.major_,
+                  log_entry.str());
   }
 }
 
@@ -799,7 +927,7 @@ chi::u64 Runtime::GetWorkRemaining() const {
   return 0;
 }
 
-} // namespace wrp_cte::compressor
+}  // namespace wrp_cte::compressor
 
 // Define ChiMod entry points using CHI_TASK_CC macro
 CHI_TASK_CC(wrp_cte::compressor::Runtime)

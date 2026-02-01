@@ -1,0 +1,164 @@
+# CTE Compression Benchmark - Comprehensive Pipeline
+# Purpose: Compare compression performance across different data patterns and compression options
+# Requirements: chimaera_start_runtime in PATH, synthetic_workload_exec in PATH
+#
+# This pipeline runs multiple benchmarks to compare:
+# 1. Different data patterns (grayscott, mixed, gaussian)
+# 2. Different compression strategies (dynamic, zstd, lz4, none)
+
+name: cte_compress_benchmark_comprehensive
+
+pkgs:
+  # Start Chimaera runtime with larger memory for comprehensive testing
+  - pkg_type: jarvis_iowarp.wrp_runtime
+    pkg_name: runtime
+    log_level: "info"
+    main_segment_size: "1G"
+    client_data_segment_size: "512M"
+
+  # Configure CTE Core with storage targets
+  - pkg_type: jarvis_iowarp.wrp_cte
+    pkg_name: cte_core
+    pool_name: "wrp_cte_core"
+    devices:
+      - ["${HOME}/compress_bench_comp/storage1.bin", "4GB", 0.9]
+      - ["${HOME}/compress_bench_comp/storage2.bin", "4GB", 0.8]
+
+    dpe_type: "max_bw"
+    neighborhood: 4
+    default_target_timeout_ms: 30000
+    poll_period_ms: 5000
+    iowarp_compress: "dynamic"
+    iowarp_compress_trace: "on"          # Enable tracing for analysis
+
+  #---------------------------------------------------------------------------
+  # Benchmark 1: Gray-Scott pattern with dynamic compression
+  #---------------------------------------------------------------------------
+  - pkg_type: jarvis_iowarp.wrp_compress_bench
+    pkg_name: bench_grayscott_dynamic
+    io_size: "8MB"
+    transfer_size: "128KB"
+    compute_time: 200
+    iterations: 20
+    pattern: "grayscott:100"
+    compress: "dynamic"
+    nprocs: 4
+    ppn: 4
+    output_file: "results/grayscott_dynamic.txt"
+    trace: true
+
+  #---------------------------------------------------------------------------
+  # Benchmark 2: Gray-Scott pattern with ZSTD compression
+  #---------------------------------------------------------------------------
+  - pkg_type: jarvis_iowarp.wrp_compress_bench
+    pkg_name: bench_grayscott_zstd
+    io_size: "8MB"
+    transfer_size: "128KB"
+    compute_time: 200
+    iterations: 20
+    pattern: "grayscott:100"
+    compress: "zstd"
+    nprocs: 4
+    ppn: 4
+    output_file: "results/grayscott_zstd.txt"
+    trace: true
+
+  #---------------------------------------------------------------------------
+  # Benchmark 3: Gray-Scott pattern with LZ4 compression (fast)
+  #---------------------------------------------------------------------------
+  - pkg_type: jarvis_iowarp.wrp_compress_bench
+    pkg_name: bench_grayscott_lz4
+    io_size: "8MB"
+    transfer_size: "128KB"
+    compute_time: 200
+    iterations: 20
+    pattern: "grayscott:100"
+    compress: "lz4"
+    nprocs: 4
+    ppn: 4
+    output_file: "results/grayscott_lz4.txt"
+    trace: true
+
+  #---------------------------------------------------------------------------
+  # Benchmark 4: Gray-Scott pattern with no compression (baseline)
+  #---------------------------------------------------------------------------
+  - pkg_type: jarvis_iowarp.wrp_compress_bench
+    pkg_name: bench_grayscott_none
+    io_size: "8MB"
+    transfer_size: "128KB"
+    compute_time: 200
+    iterations: 20
+    pattern: "grayscott:100"
+    compress: "none"
+    nprocs: 4
+    ppn: 4
+    output_file: "results/grayscott_none.txt"
+    trace: false
+
+  #---------------------------------------------------------------------------
+  # Benchmark 5: Mixed pattern (realistic simulation output)
+  #---------------------------------------------------------------------------
+  - pkg_type: jarvis_iowarp.wrp_compress_bench
+    pkg_name: bench_mixed_dynamic
+    io_size: "8MB"
+    transfer_size: "128KB"
+    compute_time: 200
+    iterations: 20
+    pattern: "grayscott:60,gaussian:25,uniform:15"
+    compress: "dynamic"
+    nprocs: 4
+    ppn: 4
+    output_file: "results/mixed_dynamic.txt"
+    trace: true
+
+  #---------------------------------------------------------------------------
+  # Benchmark 6: Gaussian pattern (smooth data)
+  #---------------------------------------------------------------------------
+  - pkg_type: jarvis_iowarp.wrp_compress_bench
+    pkg_name: bench_gaussian_dynamic
+    io_size: "8MB"
+    transfer_size: "128KB"
+    compute_time: 200
+    iterations: 20
+    pattern: "gaussian:100"
+    compress: "dynamic"
+    nprocs: 4
+    ppn: 4
+    output_file: "results/gaussian_dynamic.txt"
+    trace: true
+
+  #---------------------------------------------------------------------------
+  # Benchmark 7: Uniform pattern (high entropy, hard to compress)
+  #---------------------------------------------------------------------------
+  - pkg_type: jarvis_iowarp.wrp_compress_bench
+    pkg_name: bench_uniform_dynamic
+    io_size: "8MB"
+    transfer_size: "128KB"
+    compute_time: 200
+    iterations: 20
+    pattern: "uniform:100"
+    compress: "dynamic"
+    nprocs: 4
+    ppn: 4
+    output_file: "results/uniform_dynamic.txt"
+    trace: true
+
+  #---------------------------------------------------------------------------
+  # Benchmark 8: Constant pattern (maximally compressible)
+  #---------------------------------------------------------------------------
+  - pkg_type: jarvis_iowarp.wrp_compress_bench
+    pkg_name: bench_constant_dynamic
+    io_size: "8MB"
+    transfer_size: "128KB"
+    compute_time: 200
+    iterations: 20
+    pattern: "constant:100"
+    compress: "dynamic"
+    nprocs: 4
+    ppn: 4
+    output_file: "results/constant_dynamic.txt"
+    trace: true
+
+# Environment configuration
+env:
+  WRP_CTE_LOG_LEVEL: "info"
