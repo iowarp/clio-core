@@ -428,6 +428,53 @@ set_target_properties(${SUBMIT_BATCH_TEST_TARGET} PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 
+# Autogen Coverage test executable (comprehensive autogen code path coverage)
+set(AUTOGEN_COVERAGE_TEST_TARGET chimaera_autogen_coverage_tests)
+set(AUTOGEN_COVERAGE_TEST_SOURCES
+  test_autogen_coverage.cc
+)
+
+# Create Autogen Coverage test executable
+add_executable(${AUTOGEN_COVERAGE_TEST_TARGET} ${AUTOGEN_COVERAGE_TEST_SOURCES})
+
+# Include directories for Autogen Coverage tests
+target_include_directories(${AUTOGEN_COVERAGE_TEST_TARGET} PRIVATE
+  ${CHIMAERA_ROOT}/include
+  ${CHIMAERA_ROOT}/test  # For simple_test.h
+  ${CHIMAERA_ROOT}/modules/admin/include  # For admin tasks
+  ${CHIMAERA_ROOT}/modules/bdev/include   # For bdev tasks
+  ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include  # For CTE core tasks
+  ${CMAKE_SOURCE_DIR}/context-assimilation-engine/core/include  # For CAE core tasks
+)
+
+# Link against required libraries for Autogen Coverage tests
+target_link_libraries(${AUTOGEN_COVERAGE_TEST_TARGET}
+  chimaera_admin_runtime          # Admin module runtime
+  chimaera_admin_client           # Admin module client
+  chimaera_bdev_runtime           # Bdev module runtime
+  chimaera_bdev_client            # Bdev module client
+  wrp_cte_core_runtime            # CTE core runtime (for CTE tasks)
+  wrp_cte_core_client             # CTE core client (for CTE tasks)
+  wrp_cae_core_runtime            # CAE core runtime (for CAE tasks)
+  wrp_cae_core_client             # CAE core client (for CAE tasks)
+  hshm::cxx                       # HermesShm library
+  ${CMAKE_THREAD_LIBS_INIT}       # Threading support
+)
+
+# Set C++ standard for Autogen Coverage tests
+set_target_properties(${AUTOGEN_COVERAGE_TEST_TARGET} PROPERTIES
+  CXX_STANDARD 17
+  CXX_STANDARD_REQUIRED ON
+)
+
+# Define CHIMAERA_RUNTIME for runtime mode
+target_compile_definitions(${AUTOGEN_COVERAGE_TEST_TARGET} PRIVATE CHIMAERA_RUNTIME=1)
+
+# Copy Autogen Coverage test executable to bin directory
+set_target_properties(${AUTOGEN_COVERAGE_TEST_TARGET} PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+
 # Create test executable
 add_executable(${TEST_TARGET} ${TEST_SOURCES})
 
@@ -1029,6 +1076,102 @@ if(CHIMAERA_ENABLE_TESTS)
   # )
 
 
+  # Local Task Archive Tests
+  add_test(
+    NAME cr_local_task_archive_basic_tests
+    COMMAND ${LOCAL_TASK_ARCHIVE_TEST_TARGET} "basic"
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_local_task_archive_basic_tests PROPERTIES
+    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin"
+  )
+
+  add_test(
+    NAME cr_local_task_archive_bulk_tests
+    COMMAND ${LOCAL_TASK_ARCHIVE_TEST_TARGET} "bulk"
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_local_task_archive_bulk_tests PROPERTIES
+    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin"
+  )
+
+  add_test(
+    NAME cr_local_task_archive_operator_tests
+    COMMAND ${LOCAL_TASK_ARCHIVE_TEST_TARGET} "operator"
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_local_task_archive_operator_tests PROPERTIES
+    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin"
+  )
+
+  add_test(
+    NAME cr_local_task_archive_message_tests
+    COMMAND ${LOCAL_TASK_ARCHIVE_TEST_TARGET} "Message"
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_local_task_archive_message_tests PROPERTIES
+    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin"
+  )
+
+  add_test(
+    NAME cr_all_local_task_archive_tests
+    COMMAND ${LOCAL_TASK_ARCHIVE_TEST_TARGET}
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_all_local_task_archive_tests PROPERTIES
+    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin"
+  )
+
+  # SubmitBatch Tests
+  add_test(
+    NAME cr_submit_batch_tests
+    COMMAND ${SUBMIT_BATCH_TEST_TARGET}
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_submit_batch_tests PROPERTIES
+    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin"
+  )
+
+  # Autogen Coverage Tests
+  add_test(
+    NAME cr_autogen_coverage_tests
+    COMMAND ${AUTOGEN_COVERAGE_TEST_TARGET}
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_autogen_coverage_tests PROPERTIES
+    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin"
+  )
+
+  # SaveLoad Task Tests
+  add_test(
+    NAME cr_save_load_task_tests
+    COMMAND ${SAVE_LOAD_TASK_TEST_TARGET}
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_save_load_task_tests PROPERTIES
+    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin"
+  )
+
+  # Compose Tests
+  add_test(
+    NAME cr_compose_tests
+    COMMAND ${COMPOSE_TEST_TARGET}
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_compose_tests PROPERTIES
+    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin"
+  )
+
+  # Unordered Map LL Tests
+  add_test(
+    NAME cr_unordered_map_ll_tests
+    COMMAND ${UNORDERED_MAP_LL_TEST_TARGET}
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_unordered_map_ll_tests PROPERTIES
+    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin"
+  )
+
   # Add a comprehensive test that runs all tests
   add_test(
     NAME cr_all_chimaera_tests
@@ -1281,7 +1424,7 @@ add_custom_target(test_all_unit
 )
 
 # Install test executables (optional)
-install(TARGETS ${TEST_TARGET} ${TASK_ARCHIVE_TEST_TARGET} ${FLUSH_TEST_TARGET} ${BDEV_TEST_TARGET} ${COMUTEX_TEST_TARGET} ${WAIT_FUNCTIONALITY_TEST_TARGET} ${IPC_ALLOCATE_BUFFER_TEST_TARGET} ${UNORDERED_MAP_LL_TEST_TARGET} ${SAVE_LOAD_TASK_TEST_TARGET} ${COMPOSE_TEST_TARGET} ${LOCAL_TASK_ARCHIVE_TEST_TARGET}
+install(TARGETS ${TEST_TARGET} ${TASK_ARCHIVE_TEST_TARGET} ${FLUSH_TEST_TARGET} ${BDEV_TEST_TARGET} ${COMUTEX_TEST_TARGET} ${WAIT_FUNCTIONALITY_TEST_TARGET} ${IPC_ALLOCATE_BUFFER_TEST_TARGET} ${UNORDERED_MAP_LL_TEST_TARGET} ${SAVE_LOAD_TASK_TEST_TARGET} ${COMPOSE_TEST_TARGET} ${LOCAL_TASK_ARCHIVE_TEST_TARGET} ${AUTOGEN_COVERAGE_TEST_TARGET}
   RUNTIME DESTINATION bin
 )
 
