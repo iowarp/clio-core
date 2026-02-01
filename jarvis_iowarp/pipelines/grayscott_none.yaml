@@ -1,0 +1,44 @@
+# Gray-Scott Benchmark with NO Compression (Baseline)
+# Configuration: 64MB/rank, 4MB transfers, 8 ranks, 10s compute
+# Storage: 2GB RAM, 10GB NVMe
+
+name: grayscott_none
+
+pkgs:
+  # Start Chimaera runtime with 2GB RAM
+  - pkg_type: jarvis_iowarp.wrp_runtime
+    pkg_name: runtime
+    log_level: "info"
+    main_segment_size: "2G"
+    client_data_segment_size: "512M"
+
+  # Configure CTE Core with RAM + NVMe storage
+  - pkg_type: jarvis_iowarp.wrp_cte
+    pkg_name: cte_core
+    pool_name: "wrp_cte_core"
+    devices:
+      - ["ram::cache", "2GB", 1.0]                          # RAM tier
+      - ["${HOME}/grayscott_bench/nvme.bin", "10GB", 0.5]   # NVMe tier
+
+    dpe_type: "max_bw"
+    neighborhood: 4
+    default_target_timeout_ms: 60000
+    poll_period_ms: 5000
+    iowarp_compress: "none"
+    iowarp_compress_trace: "off"
+
+  # Run Gray-Scott benchmark
+  - pkg_type: jarvis_iowarp.wrp_compress_bench
+    pkg_name: grayscott_bench
+    io_size: "64MB"
+    transfer_size: "4MB"
+    compute_time: 10000
+    iterations: 10
+    pattern: "grayscott:100"
+    compress: "none"
+    nprocs: 8
+    ppn: 8
+    output_file: "results/grayscott_none.txt"
+    trace: false
+
+# Environment will be inherited from shell

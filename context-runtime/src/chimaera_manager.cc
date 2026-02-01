@@ -284,6 +284,13 @@ void Chimaera::ServerFinalize() {
   auto *pool_manager = CHI_POOL_MANAGER;
   pool_manager->Finalize();
   auto *ipc_manager = CHI_IPC;
+
+  // Reap all shared memory segments before finalizing IPC
+  size_t reaped = ipc_manager->WreapAllIpcs();
+  if (reaped > 0) {
+    HLOG(kInfo, "ServerFinalize: Reaped {} shared memory segments", reaped);
+  }
+
   ipc_manager->ServerFinalize();
 
   is_runtime_mode_ = false;

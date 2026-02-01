@@ -1,0 +1,10 @@
+module_name: compressor
+namespace: wrp_cte
+version: 1.0.0
+
+kCreate: 0
+kDestroy: 1
+kMonitor: 9
+kDynamicSchedule: 10
+kCompress: 11
+kDecompress: 12

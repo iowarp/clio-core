@@ -17,3 +17,8 @@ add_chimod_runtime(
   INCLUDE_DIRECTORIES
     ${CHIMAERA_ROOT}/modules/admin/include  # MOD_NAME needs admin headers
 )
+
+# Add unit tests subdirectory
+if(CHIMAERA_ENABLE_TESTS)
+  add_subdirectory(test)
+endif()

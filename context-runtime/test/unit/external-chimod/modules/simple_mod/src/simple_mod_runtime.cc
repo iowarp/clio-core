@@ -11,6 +11,7 @@
 #include <chimaera/module_manager.h>
 #include <chimaera/pool_manager.h>
 #include <chimaera/task_archives.h>
+#include <hermes_shm/memory/allocator/malloc_allocator.h>
 
 #include <iostream>
 
@@ -69,9 +70,8 @@ void Runtime::Destroy(hipc::FullPtr<DestroyTask> task, chi::RunContext &rctx) {
 
   } catch (const std::exception &e) {
     task->return_code_ = 99;
-    auto alloc = CHI_IPC->GetMainAlloc();
     task->error_message_ = chi::priv::string(
-        alloc,
+        HSHM_MALLOC,
         std::string("Exception during simple_mod destruction: ") + e.what());
     std::cerr << "SimpleMod: Destruction failed with exception: " << e.what()
               << std::endl;

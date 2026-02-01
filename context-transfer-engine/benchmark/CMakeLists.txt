@@ -19,3 +19,6 @@ target_compile_features(wrp_cte_bench PRIVATE cxx_std_17)
 install(TARGETS wrp_cte_bench
   RUNTIME DESTINATION bin
 )
+
+# NOTE: Compression benchmark (wrp_cte_compress_bench) has been moved to
+# context-transfer-engine/compressor/test/

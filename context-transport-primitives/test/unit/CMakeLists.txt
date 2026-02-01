@@ -1,5 +1,8 @@
 project(hermes_shm)
 
+# Find Catch2 testing framework
+find_package(Catch2 3 REQUIRED)
+
 set(TEST_MAIN ${CMAKE_CURRENT_SOURCE_DIR})
 
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})

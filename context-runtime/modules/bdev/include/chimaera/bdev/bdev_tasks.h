@@ -44,105 +44,6 @@ struct Block {
   }
 };
 
-/**
- * Fixed-size array with dynamic element count
- *
- * @tparam T Element type
- * @tparam MAX_SIZE Maximum number of elements that can be stored
- *
- * ArrayVector provides a fixed-capacity container with vector-like semantics.
- * The storage is preallocated to avoid dynamic memory allocation in shared
- * memory. The actual number of elements is tracked in a size variable.
- */
-template <typename T, size_t MAX_SIZE>
-struct ArrayVector {
-  T data_[MAX_SIZE];  // Preallocated array storage
-  chi::u32 size_;     // Number of actually allocated entries
-
-  /** Default constructor */
-  ArrayVector() : size_(0) {}
-
-  /**
-   * Add element by constructing in-place
-   * @param args Constructor arguments for T
-   * @return Reference to the newly constructed element
-   */
-  template <typename... Args>
-  T &emplace_back(Args &&...args) {
-    if (size_ >= MAX_SIZE) {
-      throw std::runtime_error("ArrayVector: emplace_back exceeds capacity");
-    }
-    data_[size_] = T(std::forward<Args>(args)...);
-    return data_[size_++];
-  }
-
-  /**
-   * Add element by copy
-   * @param value Element to add
-   */
-  void push_back(const T &value) {
-    if (size_ >= MAX_SIZE) {
-      throw std::runtime_error("ArrayVector: push_back exceeds capacity");
-    }
-    data_[size_++] = value;
-  }
-
-  /**
-   * Get current number of elements
-   * @return Number of elements currently stored
-   */
-  chi::u32 size() const { return size_; }
-
-  /**
-   * Get maximum capacity
-   * @return Maximum number of elements that can be stored
-   */
-  constexpr chi::u32 capacity() const { return MAX_SIZE; }
-
-  /**
-   * Access element by index (non-const)
-   * @param index Element index
-   * @return Reference to element at index
-   */
-  T &operator[](chi::u32 index) {
-    if (index >= size_) {
-      throw std::out_of_range("ArrayVector: index out of range");
-    }
-    return data_[index];
-  }
-
-  /**
-   * Access element by index (const)
-   * @param index Element index
-   * @return Const reference to element at index
-   */
-  const T &operator[](chi::u32 index) const {
-    if (index >= size_) {
-      throw std::out_of_range("ArrayVector: index out of range");
-    }
-    return data_[index];
-  }
-
-  /**
-   * Clear all elements (reset size to 0)
-   */
-  void clear() { size_ = 0; }
-
-  /**
-   * Cereal serialization support
-   * Serializes only the active elements (size_ and first size_ elements of
-   * data_)
-   */
-  template <class Archive>
-  void serialize(Archive &ar) {
-    chi::u32 local_size = size_;  // Create non-volatile copy for serialization
-    ar(local_size);
-    size_ = local_size;  // Update size_ after deserialization
-    for (chi::u32 i = 0; i < size_; ++i) {
-      ar(data_[i]);
-    }
-  }
-};
 
 /**
  * Performance metrics structure
@@ -333,17 +234,16 @@ using CreateTask = chimaera::admin::GetOrCreatePoolTask<CreateParams>;
 struct AllocateBlocksTask : public chi::Task {
   // Task-specific data
   IN chi::u64 size_;  // Requested total size
-  OUT ArrayVector<Block, 128>
-      blocks_;  // Allocated blocks information (max 128 blocks)
+  OUT chi::priv::vector<Block> blocks_;  // Allocated blocks information
 
   /** SHM default constructor */
-  AllocateBlocksTask() : chi::Task(), size_(0), blocks_() {}
+  AllocateBlocksTask() : chi::Task(), size_(0), blocks_(HSHM_MALLOC) {}
 
   /** Emplace constructor */
   explicit AllocateBlocksTask(const chi::TaskId &task_node,
                               const chi::PoolId &pool_id,
                               const chi::PoolQuery &pool_query, chi::u64 size)
-      : chi::Task(task_node, pool_id, pool_query, 10), size_(size), blocks_() {
+      : chi::Task(task_node, pool_id, pool_query, 10), size_(size), blocks_(HSHM_MALLOC) {
     // Initialize task
     task_id_ = task_node;
     pool_id_ = pool_id;
@@ -391,17 +291,17 @@ struct AllocateBlocksTask : public chi::Task {
  */
 struct FreeBlocksTask : public chi::Task {
   // Task-specific data
-  IN ArrayVector<Block, 128> blocks_;  // Blocks to free (max 128 blocks)
+  IN chi::priv::vector<Block> blocks_;  // Blocks to free
 
   /** SHM default constructor */
-  FreeBlocksTask() : chi::Task(), blocks_() {}
+  FreeBlocksTask() : chi::Task(), blocks_(HSHM_MALLOC) {}
 
   /** Emplace constructor for multiple blocks */
   explicit FreeBlocksTask(const chi::TaskId &task_node,
                           const chi::PoolId &pool_id,
                           const chi::PoolQuery &pool_query,
                           const std::vector<Block> &blocks)
-      : chi::Task(task_node, pool_id, pool_query, 10), blocks_() {
+      : chi::Task(task_node, pool_id, pool_query, 10), blocks_(HSHM_MALLOC) {
     // Initialize task
     task_id_ = task_node;
     pool_id_ = pool_id;
@@ -409,11 +309,8 @@ struct FreeBlocksTask : public chi::Task {
     task_flags_.Clear();
     pool_query_ = pool_query;
 
-    // Copy blocks from std::vector to ArrayVector
+    // Copy blocks from std::vector to chi::priv::vector
     for (const auto &block : blocks) {
-      if (blocks_.size() >= blocks_.capacity()) {
-        throw std::runtime_error("FreeBlocksTask: too many blocks (max 16)");
-      }
       blocks_.push_back(block);
     }
   }
@@ -455,18 +352,18 @@ struct FreeBlocksTask : public chi::Task {
  */
 struct WriteTask : public chi::Task {
   // Task-specific data
-  IN ArrayVector<Block, 128> blocks_;  // Blocks to write to (max 128 blocks)
-  IN hipc::ShmPtr<> data_;             // Data to write (pointer-based)
-  IN size_t length_;                   // Size of data to write
-  OUT chi::u64 bytes_written_;         // Number of bytes actually written
+  IN chi::priv::vector<Block> blocks_;  // Blocks to write to
+  IN hipc::ShmPtr<> data_;              // Data to write (pointer-based)
+  IN size_t length_;                    // Size of data to write
+  OUT chi::u64 bytes_written_;          // Number of bytes actually written
 
   /** SHM default constructor */
-  WriteTask() : chi::Task(), blocks_(), length_(0), bytes_written_(0) {}
+  WriteTask() : chi::Task(), blocks_(HSHM_MALLOC), length_(0), bytes_written_(0) {}
 
   /** Emplace constructor */
   explicit WriteTask(const chi::TaskId &task_node, const chi::PoolId &pool_id,
                      const chi::PoolQuery &pool_query,
-                     const ArrayVector<Block, 128> &blocks, hipc::ShmPtr<> data,
+                     const chi::priv::vector<Block> &blocks, hipc::ShmPtr<> data,
                      size_t length)
       : chi::Task(task_node, pool_id, pool_query, 10),
         blocks_(blocks),
@@ -534,19 +431,19 @@ struct WriteTask : public chi::Task {
  */
 struct ReadTask : public chi::Task {
   // Task-specific data
-  IN ArrayVector<Block, 128> blocks_;  // Blocks to read from (max 128 blocks)
-  OUT hipc::ShmPtr<> data_;            // Read data (pointer-based)
+  IN chi::priv::vector<Block> blocks_;  // Blocks to read from
+  OUT hipc::ShmPtr<> data_;             // Read data (pointer-based)
   INOUT size_t
       length_;  // Size of data buffer (IN: buffer size, OUT: actual size)
   OUT chi::u64 bytes_read_;  // Number of bytes actually read
 
   /** SHM default constructor */
-  ReadTask() : chi::Task(), blocks_(), length_(0), bytes_read_(0) {}
+  ReadTask() : chi::Task(), blocks_(HSHM_MALLOC), length_(0), bytes_read_(0) {}
 
   /** Emplace constructor */
   explicit ReadTask(const chi::TaskId &task_node, const chi::PoolId &pool_id,
                     const chi::PoolQuery &pool_query,
-                    const ArrayVector<Block, 128> &blocks, hipc::ShmPtr<> data,
+                    const chi::priv::vector<Block> &blocks, hipc::ShmPtr<> data,
                     size_t length)
       : chi::Task(task_node, pool_id, pool_query, 10),
         blocks_(blocks),

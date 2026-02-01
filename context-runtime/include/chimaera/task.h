@@ -199,13 +199,13 @@ class Task {
   HSHM_CROSS_FUN void ClearFlags(u32 flags) { task_flags_.UnsetBits(flags); }
 
   /**
-   * Serialize data structures to chi::ipc::string using cereal
-   * @param alloc Context allocator for memory management
+   * Serialize data structures to chi::priv::string using cereal
+   * @param alloc Malloc allocator for memory management (private data)
    * @param output_str The string to store serialized data
    * @param args The arguments to serialize
    */
   template <typename... Args>
-  static void Serialize(AllocT* alloc, chi::priv::string& output_str,
+  static void Serialize(hipc::MallocAllocator* alloc, chi::priv::string& output_str,
                         const Args&... args) {
     std::ostringstream os;
     cereal::BinaryOutputArchive archive(os);
@@ -373,6 +373,11 @@ class FutureShm : public hipc::ShmContainer<AllocT> {
   /** Atomic completion flag (0=not complete, 1=complete) */
   hipc::atomic<u32> is_complete_;
 
+  /** Size of the shared memory segment containing this FutureShm
+   *  Used for lazy registration - shm_name derived from alloc_id (pid.count)
+   */
+  size_t shm_size_;
+
   /**
    * SHM default constructor
    */
@@ -381,6 +386,7 @@ class FutureShm : public hipc::ShmContainer<AllocT> {
     pool_id_ = PoolId::GetNull();
     method_id_ = 0;
     is_complete_.store(0);
+    shm_size_ = 0;
   }
 };
 
@@ -431,13 +437,15 @@ class Future {
    */
   Future(AllocT* alloc, hipc::FullPtr<TaskT> task_ptr)
       : task_ptr_(task_ptr), parent_task_(nullptr), is_owner_(false) {
-    // Allocate FutureShm object
-    future_shm_ =
-        alloc->template NewObj<FutureT>(alloc).template Cast<FutureT>();
-    // Copy pool_id to FutureShm
-    if (!task_ptr_.IsNull() && !future_shm_.IsNull()) {
-      future_shm_->pool_id_ = task_ptr_->pool_id_;
-      future_shm_->method_id_ = task_ptr_->method_;
+    // Allocate FutureShm object (null check for safety)
+    if (alloc != nullptr) {
+      future_shm_ =
+          alloc->template NewObj<FutureT>(alloc).template Cast<FutureT>();
+      // Copy pool_id to FutureShm
+      if (!task_ptr_.IsNull() && !future_shm_.IsNull()) {
+        future_shm_->pool_id_ = task_ptr_->pool_id_;
+        future_shm_->method_id_ = task_ptr_->method_;
+      }
     }
   }
 
@@ -490,12 +498,9 @@ class Future {
   /**
    * Fix the allocator pointer after construction from ShmPtr
    * Call this immediately after popping from ring buffer
-   * @param alloc Allocator to use for FullPtr
+   * Uses IpcManager::ToFullPtr to resolve the allocator from the ShmPtr
    */
-  void SetAllocator(AllocT* alloc) {
-    // Reconstruct the FullPtr with the allocator
-    future_shm_ = hipc::FullPtr<FutureT>(alloc, future_shm_.shm_);
-  }
+  void SetAllocator();
 
   /**
    * Destructor - destroys the task if this Future owns it

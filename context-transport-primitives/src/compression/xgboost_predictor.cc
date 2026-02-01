@@ -3,7 +3,7 @@
  * @brief Implementation of XGBoost-based compression predictor
  */
 
-#include "context-transport-primitives/compression/xgboost_predictor.h"
+#include "hermes_shm/compress/dynamic/compression/xgboost_predictor.h"
 #include <fstream>
 #include <sstream>
 #include <chrono>

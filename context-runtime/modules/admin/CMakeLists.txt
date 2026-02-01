@@ -13,3 +13,8 @@ add_chimod_runtime(
     src/admin_runtime.cc
     src/autogen/admin_lib_exec.cc
 )
+
+# Add unit tests subdirectory
+if(CHIMAERA_ENABLE_TESTS)
+  add_subdirectory(test)
+endif()

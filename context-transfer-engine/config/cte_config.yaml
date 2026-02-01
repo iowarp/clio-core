@@ -32,6 +32,15 @@ compose:
   dpe:
     dpe_type: "max_bw"  # Options: "random", "round_robin", "max_bw"
 
+  # Compression and prediction model configuration
+  compression:
+    monitor_interval_ms: 5                    # Interval for collecting target capacities and stats
+    qtable_model_path: ""                     # Path to Q-table model directory (contains qtable.json, binning_params.json)
+    qtable_learning_rate: 0.3                 # Learning rate for Q-table online reinforcement learning (default: 0.3)
+    dnn_model_weights_path: ""                # Path to DNN model weights JSON file (fallback, empty = disabled)
+    dnn_samples_before_reinforce: 1000        # Number of samples before reinforcing DNN model
+    trace_folder_path: ""                     # Path to folder for CTE trace logs (empty = disabled)
+
   # Note: This configuration is suitable for Docker single-node deployment
   # For multi-node or production deployments, adjust:
   # - neighborhood: increase for distributed buffering

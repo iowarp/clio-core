@@ -408,7 +408,7 @@ chi::TaskResume Hdf5FileAssimilator::ProcessDataset(hid_t file_id,
 
   HLOG(kInfo, "ProcessDataset: Submitting description blob (size: {} bytes)...", desc_size);
   auto desc_task = cte_client_->AsyncPutBlob(
-      tag_id, "description", 0, desc_size, desc_buffer.shm_.template Cast<void>(), 1.0f, 0);
+      tag_id, "description", 0, desc_size, desc_buffer.shm_.template Cast<void>(), 1.0f, wrp_cte::core::Context(), 0);
   HLOG(kInfo, "ProcessDataset: Waiting for description blob task...");
   co_await desc_task;
 
@@ -491,7 +491,7 @@ chi::TaskResume Hdf5FileAssimilator::ProcessDataset(hid_t file_id,
       // Submit PutBlob task asynchronously
       auto task = cte_client_->AsyncPutBlob(
           tag_id, blob_name, 0, current_chunk_size,
-          chunk_buffer.shm_.template Cast<void>(), 1.0f, 0);
+          chunk_buffer.shm_.template Cast<void>(), 1.0f, wrp_cte::core::Context(), 0);
 
       active_tasks.push_back(task);
 

@@ -6,7 +6,7 @@ cmake_minimum_required(VERSION 3.10)
 message(STATUS "Building Chimaera modules (ChiMods)...")
 
 # Add individual module subdirectories
-add_subdirectory(MOD_NAME)
+add_subdirectory(MOD_NAME)  # Test module for Wait functionality
 
 # Add admin module (critical system module)
 add_subdirectory(admin)

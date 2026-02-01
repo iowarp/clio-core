@@ -55,12 +55,6 @@ class WrpRuntime(Service):
                 'default': '512M'
             },
             {
-                'name': 'runtime_data_segment_size',
-                'msg': 'Runtime data segment size (e.g., 512M, 256M)',
-                'type': str,
-                'default': '512M'
-            },
-            {
                 'name': 'port',
                 'msg': 'ZeroMQ port for networking',
                 'type': int,
@@ -136,15 +130,13 @@ class WrpRuntime(Service):
         # Parse size strings to bytes
         main_size = SizeType(self.config['main_segment_size']).bytes
         client_size = SizeType(self.config['client_data_segment_size']).bytes
-        runtime_size = SizeType(self.config['runtime_data_segment_size']).bytes
 
         # Build configuration dictionary matching chimaera_default.yaml format
         # Worker threads are now consolidated into runtime section
         config_dict = {
             'memory': {
                 'main_segment_size': main_size,
-                'client_data_segment_size': client_size,
-                'runtime_data_segment_size': runtime_size
+                'client_data_segment_size': client_size
             },
             'networking': {
                 'port': self.config['port'],

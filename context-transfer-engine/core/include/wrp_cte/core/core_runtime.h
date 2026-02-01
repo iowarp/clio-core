@@ -7,6 +7,7 @@
 #include <chimaera/corwlock.h>
 #include <chimaera/unordered_map_ll.h>
 #include <hermes_shm/data_structures/ipc/ring_buffer.h>
+#include <hermes_shm/memory/allocator/malloc_allocator.h>
 #include <wrp_cte/core/core_client.h>
 #include <wrp_cte/core/core_config.h>
 #include <wrp_cte/core/core_tasks.h>
@@ -17,6 +18,7 @@ class Config;
 }
 
 namespace wrp_cte::core {
+
 
 /**
  * CTE Core Runtime Container
@@ -39,7 +41,7 @@ public:
   /**
    * Destroy the container (Method::kDestroy)
    */
-  void Destroy(hipc::FullPtr<DestroyTask> task, chi::RunContext &ctx);
+  chi::TaskResume Destroy(hipc::FullPtr<DestroyTask> task, chi::RunContext &ctx);
 
   /**
    * Register a target (Method::kRegisterTarget)
@@ -51,24 +53,30 @@ public:
   /**
    * Unregister a target (Method::kUnregisterTarget)
    */
-  void UnregisterTarget(hipc::FullPtr<UnregisterTargetTask> task,
+  chi::TaskResume UnregisterTarget(hipc::FullPtr<UnregisterTargetTask> task,
                         chi::RunContext &ctx);
 
   /**
    * List registered targets (Method::kListTargets)
    */
-  void ListTargets(hipc::FullPtr<ListTargetsTask> task, chi::RunContext &ctx);
+  chi::TaskResume ListTargets(hipc::FullPtr<ListTargetsTask> task, chi::RunContext &ctx);
 
   /**
    * Update target statistics (Method::kStatTargets)
    */
-  void StatTargets(hipc::FullPtr<StatTargetsTask> task, chi::RunContext &ctx);
+  chi::TaskResume StatTargets(hipc::FullPtr<StatTargetsTask> task, chi::RunContext &ctx);
+
+  /**
+   * Get target information (Method::kGetTargetInfo)
+   * Returns target score, remaining space, and performance metrics
+   */
+  chi::TaskResume GetTargetInfo(hipc::FullPtr<GetTargetInfoTask> task, chi::RunContext &ctx);
 
   /**
    * Get or create a tag (Method::kGetOrCreateTag)
    */
   template <typename CreateParamsT = CreateParams>
-  void GetOrCreateTag(hipc::FullPtr<GetOrCreateTagTask<CreateParamsT>> task,
+  chi::TaskResume GetOrCreateTag(hipc::FullPtr<GetOrCreateTagTask<CreateParamsT>> task,
                       chi::RunContext &ctx);
 
   /**
@@ -105,30 +113,31 @@ public:
   /**
    * Get tag size operation - returns total size of all blobs in tag
    */
-  void GetTagSize(hipc::FullPtr<GetTagSizeTask> task, chi::RunContext &ctx);
+  chi::TaskResume GetTagSize(hipc::FullPtr<GetTagSizeTask> task, chi::RunContext &ctx);
 
   // Pure virtual methods - implementations are in autogen/core_lib_exec.cc
   void Init(const chi::PoolId &pool_id, const std::string &pool_name,
             chi::u32 container_id = 0) override;
   chi::TaskResume Run(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr,
                       chi::RunContext &rctx) override;
-  void Monitor(chi::MonitorModeId mode, chi::u32 method,
-               chi::Future<chi::Task>& task_future, chi::RunContext &rctx);
-  void DelTask(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr) override;
   chi::u64 GetWorkRemaining() const override;
+
+  // Container virtual method implementations (defined in autogen/core_lib_exec.cc)
+  void DelTask(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr) override;
   void SaveTask(chi::u32 method, chi::SaveTaskArchive &archive,
                 hipc::FullPtr<chi::Task> task_ptr) override;
   void LoadTask(chi::u32 method, chi::LoadTaskArchive &archive,
                 hipc::FullPtr<chi::Task> task_ptr) override;
   hipc::FullPtr<chi::Task> AllocLoadTask(chi::u32 method, chi::LoadTaskArchive &archive) override;
-  void LocalLoadTask(chi::u32 method, chi::LocalLoadTaskArchive &archive,
-                     hipc::FullPtr<chi::Task> task_ptr) override;
-  hipc::FullPtr<chi::Task> LocalAllocLoadTask(chi::u32 method, chi::LocalLoadTaskArchive &archive) override;
-  void LocalSaveTask(chi::u32 method, chi::LocalSaveTaskArchive &archive,
-                     hipc::FullPtr<chi::Task> task_ptr) override;
   hipc::FullPtr<chi::Task> NewCopyTask(chi::u32 method, hipc::FullPtr<chi::Task> orig_task_ptr,
                                         bool deep) override;
   hipc::FullPtr<chi::Task> NewTask(chi::u32 method) override;
+  void LocalLoadTask(chi::u32 method, chi::LocalLoadTaskArchive &archive,
+                     hipc::FullPtr<chi::Task> task_ptr) override;
+  hipc::FullPtr<chi::Task> LocalAllocLoadTask(chi::u32 method,
+                                               chi::LocalLoadTaskArchive &archive) override;
+  void LocalSaveTask(chi::u32 method, chi::LocalSaveTaskArchive &archive,
+                     hipc::FullPtr<chi::Task> task_ptr) override;
   void Aggregate(chi::u32 method, hipc::FullPtr<chi::Task> origin_task_ptr,
                  hipc::FullPtr<chi::Task> replica_task_ptr) override;
 
@@ -177,7 +186,7 @@ private:
 
   // Telemetry ring buffer for performance monitoring
   static inline constexpr size_t kTelemetryRingSize = 1024; // Ring buffer size
-  std::unique_ptr<hipc::circular_mpsc_ring_buffer<CteTelemetry, CHI_MAIN_ALLOC_T>> telemetry_log_;
+  std::unique_ptr<hipc::circular_mpsc_ring_buffer<CteTelemetry, hipc::MallocAllocator>> telemetry_log_;
   std::atomic<std::uint64_t>
       telemetry_counter_; // Atomic counter for logical time
 
@@ -340,7 +349,7 @@ private:
    * @param task PollTelemetryLog task containing parameters and results
    * @param ctx Runtime context for task execution
    */
-  void PollTelemetryLog(hipc::FullPtr<PollTelemetryLogTask> task,
+  chi::TaskResume PollTelemetryLog(hipc::FullPtr<PollTelemetryLogTask> task,
                         chi::RunContext &ctx);
 
   /**
@@ -348,21 +357,21 @@ private:
    * @param task GetBlobScore task containing blob lookup parameters and results
    * @param ctx Runtime context for task execution
    */
-  void GetBlobScore(hipc::FullPtr<GetBlobScoreTask> task, chi::RunContext &ctx);
+  chi::TaskResume GetBlobScore(hipc::FullPtr<GetBlobScoreTask> task, chi::RunContext &ctx);
 
   /**
    * Get blob size operation - returns the size of a blob in bytes
    * @param task GetBlobSize task containing blob lookup parameters and results
    * @param ctx Runtime context for task execution
    */
-  void GetBlobSize(hipc::FullPtr<GetBlobSizeTask> task, chi::RunContext &ctx);
+  chi::TaskResume GetBlobSize(hipc::FullPtr<GetBlobSizeTask> task, chi::RunContext &ctx);
 
   /**
    * Get contained blobs operation - returns all blob names in a tag
    * @param task GetContainedBlobs task containing tag ID and results
    * @param ctx Runtime context for task execution
    */
-  void GetContainedBlobs(hipc::FullPtr<GetContainedBlobsTask> task,
+  chi::TaskResume GetContainedBlobs(hipc::FullPtr<GetContainedBlobsTask> task,
                          chi::RunContext &ctx);
 
   /**
@@ -370,14 +379,14 @@ private:
    * @param task TagQuery task containing regex pattern and results
    * @param ctx Runtime context for task execution
    */
-  void TagQuery(hipc::FullPtr<TagQueryTask> task, chi::RunContext &ctx);
+  chi::TaskResume TagQuery(hipc::FullPtr<TagQueryTask> task, chi::RunContext &ctx);
 
   /**
    * Query blobs by tag and blob regex patterns (Method::kBlobQuery)
    * @param task BlobQuery task containing regex patterns and results
    * @param ctx Runtime context for task execution
    */
-  void BlobQuery(hipc::FullPtr<BlobQueryTask> task, chi::RunContext &ctx);
+  chi::TaskResume BlobQuery(hipc::FullPtr<BlobQueryTask> task, chi::RunContext &ctx);
 
 private:
   /**

@@ -334,9 +334,8 @@ WorkerIOContext *Runtime::GetWorkerIOContext(size_t worker_id) {
 }
 
 chi::TaskResume Runtime::Create(hipc::FullPtr<CreateTask> task, chi::RunContext &ctx) {
-  // Get the creation parameters using main allocator
-  auto alloc = CHI_IPC->GetMainAlloc();
-  CreateParams params = task->GetParams(alloc);
+  // Get the creation parameters
+  CreateParams params = task->GetParams();
 
   // Get the pool name which serves as the file path for file-based operations
   std::string pool_name = task->pool_name_.str();
@@ -556,7 +555,7 @@ chi::TaskResume Runtime::AllocateBlocks(hipc::FullPtr<AllocateBlocksTask> task,
   // operator
   // task->blocks_ = local_blocks;
   for (size_t i = 0; i < local_blocks.size(); i++) {
-    task->blocks_.emplace_back(local_blocks[i]);
+    task->blocks_.push_back(local_blocks[i]);
   }
 
   HLOG(kDebug, "bdev::AllocateBlocks: SUCCESS - allocated {} blocks, task->blocks_.size()={}",

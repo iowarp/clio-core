@@ -21,6 +21,10 @@
 #include <wrp_cte/core/core_client.h>
 #include <wrp_cte/core/core_tasks.h>
 
+#ifdef WRP_CTE_ENABLE_COMPRESS
+#include <wrp_cte/compressor/compressor_client.h>
+#endif
+
 namespace coeus {
 
 class IowarpEngine : public adios2::plugin::PluginEngineInterface {
@@ -125,8 +129,37 @@ class IowarpEngine : public adios2::plugin::PluginEngineInterface {
   /** Vector of deferred put tasks for current step */
   std::vector<DeferredTask> deferred_tasks_;
 
+  /** Compression mode from environment: 0=none, 1=static, 2=dynamic */
+  int compress_mode_;
+
+  /** Compression library ID for static mode */
+  int compress_lib_;
+
+  /** Enable compression tracing */
+  bool compress_trace_;
+
+  /** Total I/O time in milliseconds */
+  double total_io_time_ms_;
+
+  /** Wall clock start time */
+  std::chrono::high_resolution_clock::time_point wall_clock_start_;
+
+#ifdef WRP_CTE_ENABLE_COMPRESS
+  /** Compressor client for dynamic compression scheduling */
+  std::unique_ptr<wrp_cte::compressor::Client> compressor_client_;
+#endif
+
   /** Increment the current step */
   void IncrementCurrentStep() { current_step_++; }
+
+  /** Read compression environment variables */
+  void ReadCompressionEnvVars();
+
+  /** Parse compression library name to ID */
+  int ParseCompressionLib(const std::string &lib_str);
+
+  /** Create Context object for Put operations based on environment settings */
+  wrp_cte::core::Context CreateCompressionContext();
 };
 
 }  // namespace coeus

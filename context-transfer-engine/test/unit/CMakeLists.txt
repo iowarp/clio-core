@@ -257,6 +257,9 @@ install(TARGETS cte_core_unit_tests test_core_functionality test_query
 )
 
 # ------------------------------------------------------------------------------
+# Note: Compression tests have been moved to compressor chimod tests
+# See context-transfer-engine/compressor/test/ for compression functionality tests
+# ------------------------------------------------------------------------------
 # Add External Integration Tests
 # ------------------------------------------------------------------------------
 # External test demonstrates proper external linking patterns

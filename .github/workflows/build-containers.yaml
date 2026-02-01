@@ -1,14 +1,31 @@
 name: Build Containers
 
+# DEPRECATED: This workflow is kept for backward compatibility.
+# Use build-dep-containers.yaml and build-core-containers.yaml instead.
+#
+# Container naming:
+#   OLD NAME              -> NEW NAME
+#   iowarp/iowarp-deps    -> iowarp/deps-cpu (or iowarp/deps-nvidia for GPU)
+#   iowarp/core-build     -> iowarp/build-cpu
+#   iowarp/core           -> iowarp/deploy-cpu
+
 on:
   workflow_dispatch:
   workflow_call:
 
 jobs:
-  build-core:
-    name: Build Core Containers
+  # Call the new core containers workflow
+  build-core-containers:
+    name: Build Core Containers (New)
+    uses: ./.github/workflows/build-core-containers.yaml
+    secrets: inherit
+
+  # Build legacy aliases for backward compatibility
+  build-legacy-aliases:
+    name: Build Legacy Container Aliases
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 30
+    needs: build-core-containers
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -19,75 +36,20 @@ jobs:
           username: ${{ secrets.DOCKER_HUB_USERNAME }}
           password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
         id: buildx
 
-      - name: Build and push build container
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./docker/build.Dockerfile
-          builder: ${{ steps.buildx.outputs.name }}
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: iowarp/core-build:latest
-          cache-from: type=registry,ref=iowarp/core-build:buildcache
-          cache-to: type=registry,ref=iowarp/core-build:buildcache,mode=max
+      # Tag build-cpu as core-build for backward compatibility
+      - name: Create core-build alias
+        run: |
+          docker buildx imagetools create \
+            --tag iowarp/core-build:latest \
+            iowarp/build-cpu:latest
 
-      - name: Build and push deploy container
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./docker/deploy.Dockerfile
-          builder: ${{ steps.buildx.outputs.name }}
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: iowarp/core:latest
-          cache-from: type=registry,ref=iowarp/core:buildcache
-          cache-to: type=registry,ref=iowarp/core:buildcache,mode=max
-
-  build-benchmarks:
-    name: Build Benchmark Containers
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    needs: build-core
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKER_HUB_USERNAME }}
-          password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-        id: buildx
-
-      - name: Build and push redis benchmark
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./docker/redis_bench/Dockerfile
-          builder: ${{ steps.buildx.outputs.name }}
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: iowarp/redis-bench:latest
-
-      - name: Build and push CTE benchmark
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./docker/wrp_cte_bench/Dockerfile
-          builder: ${{ steps.buildx.outputs.name }}
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: iowarp/cte-bench:latest
+      # Tag deploy-cpu as core for backward compatibility
+      - name: Create core alias
+        run: |
+          docker buildx imagetools create \
+            --tag iowarp/core:latest \
+            iowarp/deploy-cpu:latest

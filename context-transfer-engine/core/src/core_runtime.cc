@@ -1,17 +1,26 @@
-#include "chimaera/worker.h"
-#include "hermes_shm/util/logging.h"
-#include <algorithm>
-#include <cmath>
-#include <cstdlib>
-#include <cstring>
-#include <functional>
-#include <memory>
-#include <regex>
-#include <string>
-#include <unordered_map>
+#include <chimaera/admin/admin_client.h>
 #include <wrp_cte/core/core_config.h>
 #include <wrp_cte/core/core_dpe.h>
 #include <wrp_cte/core/core_runtime.h>
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <functional>
+#include <limits>
+#include <memory>
+#include <regex>
+#include <sstream>
+#include <string>
+#include <tuple>
+#include <unordered_map>
+#include <vector>
+
+#include "chimaera/worker.h"
+#include "hermes_shm/util/logging.h"
 
 namespace wrp_cte::core {
 
@@ -64,7 +73,8 @@ chi::u64 Runtime::ParseCapacityToBytes(const std::string &capacity_str) {
   return static_cast<chi::u64>(value * multiplier);
 }
 
-chi::TaskResume Runtime::Create(hipc::FullPtr<CreateTask> task, chi::RunContext &ctx) {
+chi::TaskResume Runtime::Create(hipc::FullPtr<CreateTask> task,
+                                chi::RunContext &ctx) {
   // Initialize unordered_map_ll instances with 64 buckets to match lock count
   // This ensures each bucket can have its own lock for maximum concurrency
   registered_targets_ =
@@ -84,13 +94,13 @@ chi::TaskResume Runtime::Create(hipc::FullPtr<CreateTask> task, chi::RunContext 
     tag_locks_.emplace_back(std::make_unique<chi::CoRwLock>());
   }
 
-  // Get main allocator from IPC manager
+  // Get IPC manager for later use
   auto *ipc_manager = CHI_IPC;
-  auto *main_allocator = ipc_manager->GetMainAlloc();
 
-  // Initialize telemetry ring buffer using unique_ptr
-  telemetry_log_ = std::make_unique<hipc::circular_mpsc_ring_buffer<CteTelemetry, CHI_MAIN_ALLOC_T>>(
-      main_allocator, kTelemetryRingSize);
+  // Initialize telemetry ring buffer using unique_ptr with HSHM_MALLOC
+  telemetry_log_ = std::make_unique<
+      hipc::circular_mpsc_ring_buffer<CteTelemetry, hipc::MallocAllocator>>(
+      HSHM_MALLOC, kTelemetryRingSize);
 
   // Initialize atomic counters
   next_tag_id_minor_ = 1;
@@ -98,17 +108,21 @@ chi::TaskResume Runtime::Create(hipc::FullPtr<CreateTask> task, chi::RunContext 
 
   // Get configuration from params (loaded from pool_config.config_ via
   // LoadConfig)
-  HLOG(kDebug, "CTE Create: About to call GetParams(), do_compose_={}", task->do_compose_);
-  auto params = task->GetParams(main_allocator);
+  HLOG(kDebug, "CTE Create: About to call GetParams(), do_compose_={}",
+       task->do_compose_);
+  auto params = task->GetParams();
   config_ = params.config_;
-  HLOG(kDebug, "CTE Create: GetParams() returned, storage devices in config: {}", config_.storage_.devices_.size());
+  HLOG(kDebug,
+       "CTE Create: GetParams() returned, storage devices in config: {}",
+       config_.storage_.devices_.size());
 
   // Configuration is now loaded from compose pool_config via
   // CreateParams::LoadConfig()
 
   // Store storage configuration in runtime
   storage_devices_ = config_.storage_.devices_;
-  HLOG(kDebug, "CTE Create: Copied storage devices to runtime, count: {}", storage_devices_.size());
+  HLOG(kDebug, "CTE Create: Copied storage devices to runtime, count: {}",
+       storage_devices_.size());
 
   // Initialize the client with the pool ID
   client_.Init(task->new_pool_id_);
@@ -126,9 +140,9 @@ chi::TaskResume Runtime::Create(hipc::FullPtr<CreateTask> task, chi::RunContext 
     chi::u32 actual_neighborhood = std::min(neighborhood_size, num_nodes);
 
     HLOG(kDebug,
-          "Registering targets for storage devices across neighborhood (size: "
-          "{} nodes):",
-          actual_neighborhood);
+         "Registering targets for storage devices across neighborhood (size: "
+         "{} nodes):",
+         actual_neighborhood);
 
     // Iterate over storage devices
     for (size_t device_idx = 0; device_idx < storage_devices_.size();
@@ -156,29 +170,29 @@ chi::TaskResume Runtime::Create(hipc::FullPtr<CreateTask> task, chi::RunContext 
         chi::PoolQuery target_query =
             chi::PoolQuery::DirectHash(container_hash);
 
-        // Generate unique bdev_id: base major (513) + device index, minor is
-        // container hash
-        chi::PoolId bdev_id(513 + static_cast<chi::u32>(device_idx), 0);
+        // Generate unique bdev_id: base major 512 and (1 + device index), minor
+        // is container hash
+        chi::PoolId bdev_id(512, 1 + static_cast<chi::u32>(device_idx));
 
         // Call RegisterTarget using client member variable with target_query
         // and bdev_id
         HLOG(kDebug,
-              "Registering target ({}): {} ({}, {} bytes) on node {} with "
-              "bdev_id=({},{})",
-              client_.pool_id_, target_path, device.bdev_type_, capacity_bytes,
-              container_hash, bdev_id.major_, bdev_id.minor_);
-        auto reg_task = client_.AsyncRegisterTarget(target_path, bdev_type,
-                                                     capacity_bytes, target_query, bdev_id);
+             "Registering target ({}): {} ({}, {} bytes) on node {} with "
+             "bdev_id=({},{})",
+             client_.pool_id_, target_path, device.bdev_type_, capacity_bytes,
+             container_hash, bdev_id.major_, bdev_id.minor_);
+        auto reg_task = client_.AsyncRegisterTarget(
+            target_path, bdev_type, capacity_bytes, target_query, bdev_id);
         co_await reg_task;
         chi::u32 result = reg_task->GetReturnCode();
 
         if (result == 0) {
           HLOG(kDebug, "  - Registered target: {} ({}, {} bytes) on node {}",
-                target_path, device.bdev_type_, capacity_bytes, container_hash);
+               target_path, device.bdev_type_, capacity_bytes, container_hash);
         } else {
           HLOG(kWarning,
-                "  - Failed to register target {} on node {} (error code: {})",
-                target_path, container_hash, result);
+               "  - Failed to register target {} on node {} (error code: {})",
+               target_path, container_hash, result);
         }
       }
     }
@@ -191,15 +205,15 @@ chi::TaskResume Runtime::Create(hipc::FullPtr<CreateTask> task, chi::RunContext 
   // kBlobOperationsQueue, kStatsQueue) are no longer created explicitly
 
   HLOG(kInfo,
-        "CTE Core container created and initialized for pool: {} (ID: {})",
-        pool_name_, task->new_pool_id_);
+       "CTE Core container created and initialized for pool: {} (ID: {})",
+       pool_name_, task->new_pool_id_);
 
   HLOG(kInfo, "Configuration: neighborhood={}, poll_period_ms={}",
-        config_.targets_.neighborhood_, config_.targets_.poll_period_ms_);
+       config_.targets_.neighborhood_, config_.targets_.poll_period_ms_);
   co_return;
 }
 
-void Runtime::Destroy(hipc::FullPtr<DestroyTask> task, chi::RunContext &ctx) {
+chi::TaskResume Runtime::Destroy(hipc::FullPtr<DestroyTask> task, chi::RunContext &ctx) {
   try {
     // Clear all registered targets and their associated data
     registered_targets_.clear();
@@ -226,6 +240,7 @@ void Runtime::Destroy(hipc::FullPtr<DestroyTask> task, chi::RunContext &ctx) {
   } catch (const std::exception &e) {
     task->return_code_ = 1;
   }
+  co_return;
 }
 
 chi::TaskResume Runtime::RegisterTarget(hipc::FullPtr<RegisterTargetTask> task,
@@ -242,35 +257,41 @@ chi::TaskResume Runtime::RegisterTarget(hipc::FullPtr<RegisterTargetTask> task,
     chi::u64 total_size = task->total_size_;
     chi::PoolId bdev_pool_id = task->bdev_id_;
     HLOG(kDebug, "Registering target ({}): {} ({} bytes) with bdev_id=({},{})",
-          client_.pool_id_, target_name, total_size, bdev_pool_id.major_,
-          bdev_pool_id.minor_);
+         client_.pool_id_, target_name, total_size, bdev_pool_id.major_,
+         bdev_pool_id.minor_);
 
     // Create bdev client and container first to get the TargetId (pool_id)
     chimaera::bdev::Client bdev_client;
     std::string bdev_pool_name =
-        target_name; // Use target_name as the bdev pool name
+        target_name;  // Use target_name as the bdev pool name
 
     HLOG(kDebug, "Creating bdev with pool ID: major={}, minor={}",
-          bdev_pool_id.major_, bdev_pool_id.minor_);
+         bdev_pool_id.major_, bdev_pool_id.minor_);
 
     // Create the bdev container using the client
     chi::PoolQuery pool_query = chi::PoolQuery::Dynamic();
-    HLOG(kDebug, "RegisterTarget: Creating bdev with custom_pool_id=({},{}), target_name={}",
-          bdev_pool_id.major_, bdev_pool_id.minor_, target_name);
-    auto create_task = bdev_client.AsyncCreate(pool_query, target_name,
-                                                bdev_pool_id, bdev_type, total_size);
+    HLOG(kDebug,
+         "RegisterTarget: Creating bdev with custom_pool_id=({},{}), "
+         "target_name={}",
+         bdev_pool_id.major_, bdev_pool_id.minor_, target_name);
+    auto create_task = bdev_client.AsyncCreate(
+        pool_query, target_name, bdev_pool_id, bdev_type, total_size);
     co_await create_task;
-    HLOG(kDebug, "RegisterTarget: After create, create_task->new_pool_id_=({},{}), create_task->return_code_={}",
-          create_task->new_pool_id_.major_, create_task->new_pool_id_.minor_, create_task->return_code_.load());
+    HLOG(kDebug,
+         "RegisterTarget: After create, create_task->new_pool_id_=({},{}), "
+         "create_task->return_code_={}",
+         create_task->new_pool_id_.major_, create_task->new_pool_id_.minor_,
+         create_task->return_code_.load());
     bdev_client.pool_id_ = create_task->new_pool_id_;
     bdev_client.return_code_ = create_task->return_code_;
-    HLOG(kDebug, "RegisterTarget: After assignment, bdev_client.pool_id_=({},{})",
-          bdev_client.pool_id_.major_, bdev_client.pool_id_.minor_);
+    HLOG(kDebug,
+         "RegisterTarget: After assignment, bdev_client.pool_id_=({},{})",
+         bdev_client.pool_id_.major_, bdev_client.pool_id_.minor_);
 
     // Check if creation was successful
     if (bdev_client.return_code_ != 0) {
       HLOG(kError, "Failed to create bdev container {} : {}", target_name,
-            bdev_client.return_code_);
+           bdev_client.return_code_);
       task->return_code_ = 1;
       co_return;
     }
@@ -296,18 +317,20 @@ chi::TaskResume Runtime::RegisterTarget(hipc::FullPtr<RegisterTargetTask> task,
     remaining_size = stats_task->remaining_size_;
 
     // Create target info with bdev client and performance stats
-    auto *ipc_manager = CHI_IPC;
-    auto *main_allocator = ipc_manager->GetMainAlloc();
-    TargetInfo target_info(main_allocator);
+    // Use default constructor (allocator not used in struct)
+    TargetInfo target_info;
     HLOG(kDebug, "RegisterTarget: Before move, bdev_client.pool_id_=({},{})",
-          bdev_client.pool_id_.major_, bdev_client.pool_id_.minor_);
+         bdev_client.pool_id_.major_, bdev_client.pool_id_.minor_);
     target_info.target_name_ = target_name;
     target_info.bdev_pool_name_ = bdev_pool_name;
     target_info.bdev_client_ = std::move(bdev_client);
-    HLOG(kDebug, "RegisterTarget: After move, target_info.bdev_client_.pool_id_=({},{})",
-          target_info.bdev_client_.pool_id_.major_, target_info.bdev_client_.pool_id_.minor_);
+    HLOG(
+        kDebug,
+        "RegisterTarget: After move, target_info.bdev_client_.pool_id_=({},{})",
+        target_info.bdev_client_.pool_id_.major_,
+        target_info.bdev_client_.pool_id_.minor_);
     target_info.target_query_ =
-        task->target_query_; // Store target query for bdev API calls
+        task->target_query_;  // Store target query for bdev API calls
     target_info.bytes_read_ = 0;
     target_info.bytes_written_ = 0;
     target_info.ops_read_ = 0;
@@ -316,41 +339,42 @@ chi::TaskResume Runtime::RegisterTarget(hipc::FullPtr<RegisterTargetTask> task,
     // config
     float manual_score = GetManualScoreForTarget(target_name);
     if (manual_score >= 0.0f) {
-      target_info.target_score_ = manual_score; // Use configured manual score
+      target_info.target_score_ = manual_score;  // Use configured manual score
       HLOG(kDebug, "Target '{}' using manual score: {:.2f}", target_name,
-            manual_score);
+           manual_score);
     } else {
       target_info.target_score_ =
-          0.0f; // Will be calculated based on performance metrics
+          0.0f;  // Will be calculated based on performance metrics
     }
     target_info.remaining_space_ =
-        total_size; // Use actual remaining space from bdev
+        total_size;  // Use actual remaining space from bdev
     target_info.perf_metrics_ =
-        perf_metrics; // Store the entire PerfMetrics structure
+        perf_metrics;  // Store the entire PerfMetrics structure
 
     // Register the target using TargetId as key
     {
       chi::ScopedCoRwWriteLock write_lock(*target_locks_[lock_index]);
       registered_targets_.insert_or_assign(target_id, target_info);
-      target_name_to_id_.insert_or_assign(target_name,
-                                          target_id); // Maintain reverse lookup
+      target_name_to_id_.insert_or_assign(
+          target_name,
+          target_id);  // Maintain reverse lookup
     }
 
-    task->return_code_ = 0; // Success
+    task->return_code_ = 0;  // Success
     HLOG(kDebug,
-          "Target '{}' registered with ID (major={}, minor={}) - bdev pool: {} "
-          "(type={}, path={}, "
-          "size={}, remaining={})",
-          target_name, target_id.major_, target_id.minor_, bdev_pool_name,
-          static_cast<int>(bdev_type), target_name, total_size, remaining_size);
+         "Target '{}' registered with ID (major={}, minor={}) - bdev pool: {} "
+         "(type={}, path={}, "
+         "size={}, remaining={})",
+         target_name, target_id.major_, target_id.minor_, bdev_pool_name,
+         static_cast<int>(bdev_type), target_name, total_size, remaining_size);
     HLOG(kDebug,
-          "  Initial statistics: read_bw={} MB/s, write_bw={} MB/s, "
-          "avg_latency={} μs, iops={}",
-          perf_metrics.read_bandwidth_mbps_, perf_metrics.write_bandwidth_mbps_,
-          (target_info.perf_metrics_.read_latency_us_ +
-           target_info.perf_metrics_.write_latency_us_) /
-              2.0,
-          perf_metrics.iops_);
+         "  Initial statistics: read_bw={} MB/s, write_bw={} MB/s, "
+         "avg_latency={} μs, iops={}",
+         perf_metrics.read_bandwidth_mbps_, perf_metrics.write_bandwidth_mbps_,
+         (target_info.perf_metrics_.read_latency_us_ +
+          target_info.perf_metrics_.write_latency_us_) /
+             2.0,
+         perf_metrics.iops_);
 
   } catch (const std::exception &e) {
     task->return_code_ = 1;
@@ -358,12 +382,12 @@ chi::TaskResume Runtime::RegisterTarget(hipc::FullPtr<RegisterTargetTask> task,
   co_return;
 }
 
-void Runtime::UnregisterTarget(hipc::FullPtr<UnregisterTargetTask> task,
+chi::TaskResume Runtime::UnregisterTarget(hipc::FullPtr<UnregisterTargetTask> task,
                                chi::RunContext &ctx) {
   // Dynamic scheduling phase - determine routing
   if (ctx.exec_mode_ == chi::ExecMode::kDynamicSchedule) {
     task->pool_query_ = chi::PoolQuery::Local();
-    return;
+    co_return;
   }
 
   try {
@@ -373,7 +397,7 @@ void Runtime::UnregisterTarget(hipc::FullPtr<UnregisterTargetTask> task,
     chi::PoolId *target_id_ptr = target_name_to_id_.find(target_name);
     if (target_id_ptr == nullptr) {
       task->return_code_ = 1;
-      return;
+      co_return;
     }
 
     const chi::PoolId &target_id = *target_id_ptr;
@@ -384,27 +408,28 @@ void Runtime::UnregisterTarget(hipc::FullPtr<UnregisterTargetTask> task,
       chi::ScopedCoRwWriteLock write_lock(*target_locks_[lock_index]);
       if (!registered_targets_.contains(target_id)) {
         task->return_code_ = 1;
-        return;
+        co_return;
       }
 
       registered_targets_.erase(target_id);
-      target_name_to_id_.erase(target_name); // Remove reverse lookup
+      target_name_to_id_.erase(target_name);  // Remove reverse lookup
     }
 
-    task->return_code_ = 0; // Success
+    task->return_code_ = 0;  // Success
     HLOG(kDebug, "Target '{}' unregistered", target_name);
 
   } catch (const std::exception &e) {
     task->return_code_ = 1;
   }
+  co_return;
 }
 
-void Runtime::ListTargets(hipc::FullPtr<ListTargetsTask> task,
+chi::TaskResume Runtime::ListTargets(hipc::FullPtr<ListTargetsTask> task,
                           chi::RunContext &ctx) {
   // Dynamic scheduling phase - determine routing
   if (ctx.exec_mode_ == chi::ExecMode::kDynamicSchedule) {
     task->pool_query_ = chi::PoolQuery::Local();
-    return;
+    co_return;
   }
 
   try {
@@ -423,19 +448,20 @@ void Runtime::ListTargets(hipc::FullPtr<ListTargetsTask> task,
           task->target_names_.push_back(target_info.target_name_);
         });
 
-    task->return_code_ = 0; // Success
+    task->return_code_ = 0;  // Success
 
   } catch (const std::exception &e) {
     task->return_code_ = 1;
   }
+  co_return;
 }
 
-void Runtime::StatTargets(hipc::FullPtr<StatTargetsTask> task,
+chi::TaskResume Runtime::StatTargets(hipc::FullPtr<StatTargetsTask> task,
                           chi::RunContext &ctx) {
   // Dynamic scheduling phase - determine routing
   if (ctx.exec_mode_ == chi::ExecMode::kDynamicSchedule) {
     task->pool_query_ = chi::PoolQuery::Local();
-    return;
+    co_return;
   }
 
   try {
@@ -452,15 +478,16 @@ void Runtime::StatTargets(hipc::FullPtr<StatTargetsTask> task,
           UpdateTargetStats(target_id, target_info);
         });
 
-    task->return_code_ = 0; // Success
+    task->return_code_ = 0;  // Success
 
   } catch (const std::exception &e) {
     task->return_code_ = 1;
   }
+  co_return;
 }
 
 template <typename CreateParamsT>
-void Runtime::GetOrCreateTag(
+chi::TaskResume Runtime::GetOrCreateTag(
     hipc::FullPtr<GetOrCreateTagTask<CreateParamsT>> task,
     chi::RunContext &ctx) {
   // Dynamic scheduling phase - determine routing
@@ -477,7 +504,7 @@ void Runtime::GetOrCreateTag(
       chi::u32 hash_value = static_cast<chi::u32>(string_hasher(tag_name));
       task->pool_query_ = chi::PoolQuery::DirectHash(hash_value);
     }
-    return;
+    co_return;
   }
 
   try {
@@ -506,7 +533,7 @@ void Runtime::GetOrCreateTag(
 
       task->tag_id_ = preferred_id;
       task->return_code_ = 0;
-      return;
+      co_return;
     }
 
     // Canonical node: Create full TagInfo structure
@@ -529,14 +556,61 @@ void Runtime::GetOrCreateTag(
       }
     }
 
-    task->return_code_ = 0; // Success
+    task->return_code_ = 0;  // Success
 
   } catch (const std::exception &e) {
     task->return_code_ = 1;
   }
+  co_return;
 }
 
-chi::TaskResume Runtime::PutBlob(hipc::FullPtr<PutBlobTask> task, chi::RunContext &ctx) {
+chi::TaskResume Runtime::GetTargetInfo(hipc::FullPtr<GetTargetInfoTask> task,
+                            chi::RunContext &ctx) {
+  // Dynamic scheduling phase - determine routing
+  if (ctx.exec_mode_ == chi::ExecMode::kDynamicSchedule) {
+    task->pool_query_ = chi::PoolQuery::Local();
+    co_return;
+  }
+
+  try {
+    std::string target_name = task->target_name_.str();
+
+    // Look up target by name
+    chi::PoolId *target_id_ptr = target_name_to_id_.find(target_name);
+    if (target_id_ptr == nullptr) {
+      task->return_code_ = 1;  // Target not found
+      co_return;
+    }
+
+    chi::PoolId target_id = *target_id_ptr;
+    size_t lock_index = GetTargetLockIndex(target_id);
+    chi::ScopedCoRwReadLock read_lock(*target_locks_[lock_index]);
+
+    // Find target in registered_targets_
+    auto target_ptr = registered_targets_.find(target_id);
+    if (!target_ptr) {
+      task->return_code_ = 2;  // Target not in registered list
+      co_return;
+    }
+
+    // Copy target information to task output
+    task->target_score_ = target_ptr->target_score_;
+    task->remaining_space_ = target_ptr->remaining_space_;
+    task->bytes_read_ = target_ptr->bytes_read_;
+    task->bytes_written_ = target_ptr->bytes_written_;
+    task->ops_read_ = target_ptr->ops_read_;
+    task->ops_written_ = target_ptr->ops_written_;
+
+    task->return_code_ = 0;  // Success
+
+  } catch (const std::exception &e) {
+    task->return_code_ = 3;
+  }
+  co_return;
+}
+
+chi::TaskResume Runtime::PutBlob(hipc::FullPtr<PutBlobTask> task,
+                                 chi::RunContext &ctx) {
   // Dynamic scheduling phase - determine routing
   if (ctx.exec_mode_ == chi::ExecMode::kDynamicSchedule) {
     task->pool_query_ =
@@ -559,18 +633,18 @@ chi::TaskResume Runtime::PutBlob(hipc::FullPtr<PutBlobTask> task, chi::RunContex
 
     // Validate input parameters
     if (size == 0) {
-      task->return_code_ = 2; // Error: Invalid size (zero)
+      task->return_code_ = 2;  // Error: Invalid size (zero)
       co_return;
     }
 
     if (blob_data.IsNull()) {
-      task->return_code_ = 3; // Error: Null data pointer
+      task->return_code_ = 3;  // Error: Null data pointer
       co_return;
     }
 
     // Validate that blob_name is provided
     if (blob_name.empty()) {
-      task->return_code_ = 4; // Error: No blob name provided
+      task->return_code_ = 4;  // Error: No blob name provided
       co_return;
     }
 
@@ -582,7 +656,7 @@ chi::TaskResume Runtime::PutBlob(hipc::FullPtr<PutBlobTask> task, chi::RunContex
     if (!blob_found) {
       blob_info_ptr = CreateNewBlob(blob_name, tag_id, blob_score);
       if (blob_info_ptr == nullptr) {
-        task->return_code_ = 5; // Error: Failed to create blob
+        task->return_code_ = 5;  // Error: Failed to create blob
         co_return;
       }
     }
@@ -594,25 +668,33 @@ chi::TaskResume Runtime::PutBlob(hipc::FullPtr<PutBlobTask> task, chi::RunContex
     // Step 3: Allocate additional space if needed for blob extension
     // (no lock held during expensive bdev allocation)
     chi::u32 allocation_result = 0;
-    co_await AllocateNewData(*blob_info_ptr, offset, size, blob_score, allocation_result);
+    co_await AllocateNewData(*blob_info_ptr, offset, size, blob_score,
+                             allocation_result);
 
     if (allocation_result != 0) {
       HLOG(kError, "Allocation failure: {}", allocation_result);
       task->return_code_ =
-          10 + allocation_result; // Error: Allocation failure (10-19 range)
+          10 + allocation_result;  // Error: Allocation failure (10-19 range)
       co_return;
     }
 
-    // Step 4: Write data to blob blocks
+    // Step 4: Write data to blob blocks (compressed or uncompressed)
     // (no lock held during expensive I/O operations)
     chi::u32 write_result = 0;
-    co_await ModifyExistingData(blob_info_ptr->blocks_, blob_data, size, offset, write_result);
+    co_await ModifyExistingData(blob_info_ptr->blocks_, blob_data, size, offset,
+                                write_result);
 
     if (write_result != 0) {
       task->return_code_ =
-          20 + write_result; // Error: Write failure (20-29 range)
+          20 + write_result;  // Error: Write failure (20-29 range)
       co_return;
     }
+
+    // Store compression metadata in BlobInfo for future decompression
+    Context &context = task->context_;
+    blob_info_ptr->compress_lib_ = context.compress_lib_;
+    blob_info_ptr->compress_preset_ = context.compress_preset_;
+    blob_info_ptr->trace_key_ = context.trace_key_;
 
     // Step 5: Calculate size change after I/O completes
     chi::u64 new_blob_size = blob_info_ptr->GetTotalSize();
@@ -648,7 +730,7 @@ chi::TaskResume Runtime::PutBlob(hipc::FullPtr<PutBlobTask> task, chi::RunContex
           co_return;
         }
       }
-    } // Release read lock
+    }  // Release read lock
 
     // Log telemetry and success messages
     LogTelemetry(CteOp::kPutBlob, offset, size, tag_id, now,
@@ -658,12 +740,13 @@ chi::TaskResume Runtime::PutBlob(hipc::FullPtr<PutBlobTask> task, chi::RunContex
 
   } catch (const std::exception &e) {
     HLOG(kError, "PutBlob failed with exception: {}", e.what());
-    task->return_code_ = 1; // Error: General exception
+    task->return_code_ = 1;  // Error: General exception
   }
   co_return;
 }
 
-chi::TaskResume Runtime::GetBlob(hipc::FullPtr<GetBlobTask> task, chi::RunContext &ctx) {
+chi::TaskResume Runtime::GetBlob(hipc::FullPtr<GetBlobTask> task,
+                                 chi::RunContext &ctx) {
   // Dynamic scheduling phase - determine routing
   if (ctx.exec_mode_ == chi::ExecMode::kDynamicSchedule) {
     task->pool_query_ =
@@ -708,7 +791,8 @@ chi::TaskResume Runtime::GetBlob(hipc::FullPtr<GetBlobTask> task, chi::RunContex
 
     // Step 2: Read data from blob blocks (no lock held during I/O)
     chi::u32 read_result = 0;
-    co_await ReadData(blob_info_ptr->blocks_, blob_data_ptr, size, offset, read_result);
+    co_await ReadData(blob_info_ptr->blocks_, blob_data_ptr, size, offset,
+                      read_result);
     if (read_result != 0) {
       task->return_code_ = read_result;
       co_return;
@@ -718,7 +802,7 @@ chi::TaskResume Runtime::GetBlob(hipc::FullPtr<GetBlobTask> task, chi::RunContex
     // modifying map structure)
     auto now = std::chrono::steady_clock::now();
     size_t tag_lock_index = GetTagLockIndex(tag_id);
-    (void)tag_lock_index; // Suppress unused variable warning
+    (void)tag_lock_index;  // Suppress unused variable warning
     size_t num_blocks = 0;
     blob_info_ptr->last_read_ = now;
     num_blocks = blob_info_ptr->blocks_.size();
@@ -729,7 +813,7 @@ chi::TaskResume Runtime::GetBlob(hipc::FullPtr<GetBlobTask> task, chi::RunContex
 
     task->return_code_ = 0;
     HLOG(kDebug, "GetBlob successful: name={}, offset={}, size={}, blocks={}",
-          blob_name, offset, size, num_blocks);
+         blob_name, offset, size, num_blocks);
 
   } catch (const std::exception &e) {
     task->return_code_ = 1;
@@ -754,12 +838,12 @@ chi::TaskResume Runtime::ReorganizeBlob(hipc::FullPtr<ReorganizeBlobTask> task,
 
     // Validate inputs
     if (blob_name.empty()) {
-      task->return_code_ = 1; // Invalid input - empty blob name
+      task->return_code_ = 1;  // Invalid input - empty blob name
       co_return;
     }
 
     if (new_score < 0.0f || new_score > 1.0f) {
-      task->return_code_ = 1; // Invalid score range
+      task->return_code_ = 1;  // Invalid score range
       co_return;
     }
 
@@ -771,7 +855,7 @@ chi::TaskResume Runtime::ReorganizeBlob(hipc::FullPtr<ReorganizeBlobTask> task,
     // Step 1: Get blob info directly from table
     BlobInfo *blob_info_ptr = CheckBlobExists(blob_name, tag_id);
     if (blob_info_ptr == nullptr) {
-      task->return_code_ = 3; // Blob not found
+      task->return_code_ = 3;  // Blob not found
       co_return;
     }
 
@@ -779,15 +863,15 @@ chi::TaskResume Runtime::ReorganizeBlob(hipc::FullPtr<ReorganizeBlobTask> task,
     float current_score = blob_info_ptr->score_;
     float score_diff = std::abs(new_score - current_score);
     HLOG(kDebug,
-          "SCORE CHECK: blob={}, current={}, new={}, diff={}, threshold={}",
-          blob_name, current_score, new_score, score_diff,
-          score_difference_threshold);
+         "SCORE CHECK: blob={}, current={}, new={}, diff={}, threshold={}",
+         blob_name, current_score, new_score, score_diff,
+         score_difference_threshold);
 
     if (score_diff < score_difference_threshold) {
       // Score difference too small, no reorganization needed
       task->return_code_ = 0;
       HLOG(kDebug,
-            "ReorganizeBlob: score difference below threshold, skipping");
+           "ReorganizeBlob: score difference below threshold, skipping");
       co_return;
     }
 
@@ -795,7 +879,7 @@ chi::TaskResume Runtime::ReorganizeBlob(hipc::FullPtr<ReorganizeBlobTask> task,
     BlobInfo &blob_info = *blob_info_ptr;
 
     HLOG(kDebug, "UPDATING SCORE: blob={}, old_score={}, new_score={}",
-          blob_name, blob_info.score_, new_score);
+         blob_name, blob_info.score_, new_score);
     blob_info.score_ = new_score;
 
     // Step 4: Get blob size from blob_info
@@ -813,34 +897,34 @@ chi::TaskResume Runtime::ReorganizeBlob(hipc::FullPtr<ReorganizeBlobTask> task,
         ipc_manager->AllocateBuffer(blob_size);
     if (blob_data_buffer.IsNull()) {
       HLOG(kError, "Failed to allocate buffer for blob during reorganization");
-      task->return_code_ = 5; // Buffer allocation failed
+      task->return_code_ = 5;  // Buffer allocation failed
       co_return;
     }
 
     // Step 6: Get blob data
     auto get_task =
-        client_.AsyncGetBlob(tag_id, blob_name, 0,
-                             blob_size, 0, blob_data_buffer.shm_.template Cast<void>());
+        client_.AsyncGetBlob(tag_id, blob_name, 0, blob_size, 0,
+                             blob_data_buffer.shm_.template Cast<void>());
     co_await get_task;
 
-    if (get_task->return_code_ != 0) {
+    if (get_task->return_code_ != 0u) {
       HLOG(kWarning, "Failed to get blob data during reorganization");
-      task->return_code_ = 6; // Get blob failed
+      task->return_code_ = 6;  // Get blob failed
       co_return;
     }
 
     // Step 7: Put blob with new score (data reorganization)
     HLOG(kDebug,
-          "ReorganizeBlob calling AsyncPutBlob for blob={}, new_score={}",
-          blob_name, new_score);
-    auto put_task =
-        client_.AsyncPutBlob(tag_id, blob_name, 0,
-                             blob_size, blob_data_buffer.shm_.template Cast<void>(), new_score, 0);
+         "ReorganizeBlob calling AsyncPutBlob for blob={}, new_score={}",
+         blob_name, new_score);
+    auto put_task = client_.AsyncPutBlob(
+        tag_id, blob_name, 0, blob_size,
+        blob_data_buffer.shm_.template Cast<void>(), new_score, Context(), 0);
     co_await put_task;
 
     if (put_task->return_code_ != 0) {
       HLOG(kWarning, "Failed to put blob during reorganization");
-      task->return_code_ = 7; // Put blob failed
+      task->return_code_ = 7;  // Put blob failed
       co_return;
     }
 
@@ -848,17 +932,18 @@ chi::TaskResume Runtime::ReorganizeBlob(hipc::FullPtr<ReorganizeBlobTask> task,
     task->return_code_ = 0;
 
     HLOG(kDebug,
-          "ReorganizeBlob completed: tag_id={},{}, blob={}, new_score={}",
-          tag_id.major_, tag_id.minor_, blob_name, new_score);
+         "ReorganizeBlob completed: tag_id={},{}, blob={}, new_score={}",
+         tag_id.major_, tag_id.minor_, blob_name, new_score);
 
   } catch (const std::exception &e) {
     HLOG(kError, "ReorganizeBlob failed: {}", e.what());
-    task->return_code_ = 1; // Error during reorganization
+    task->return_code_ = 1;  // Error during reorganization
   }
   co_return;
 }
 
-chi::TaskResume Runtime::DelBlob(hipc::FullPtr<DelBlobTask> task, chi::RunContext &ctx) {
+chi::TaskResume Runtime::DelBlob(hipc::FullPtr<DelBlobTask> task,
+                                 chi::RunContext &ctx) {
   // Dynamic scheduling phase - determine routing
   if (ctx.exec_mode_ == chi::ExecMode::kDynamicSchedule) {
     task->pool_query_ =
@@ -881,7 +966,7 @@ chi::TaskResume Runtime::DelBlob(hipc::FullPtr<DelBlobTask> task, chi::RunContex
     BlobInfo *blob_info_ptr = CheckBlobExists(blob_name, tag_id);
 
     if (blob_info_ptr == nullptr) {
-      task->return_code_ = 1; // Blob not found
+      task->return_code_ = 1;  // Blob not found
       co_return;
     }
 
@@ -893,8 +978,8 @@ chi::TaskResume Runtime::DelBlob(hipc::FullPtr<DelBlobTask> task, chi::RunContex
     co_await FreeAllBlobBlocks(*blob_info_ptr, free_result);
     if (free_result != 0) {
       HLOG(kWarning,
-            "Failed to free some blocks for blob={}, continuing with deletion",
-            blob_name);
+           "Failed to free some blocks for blob={}, continuing with deletion",
+           blob_name);
       // Continue with deletion even if freeing fails to avoid orphaned blob
       // entries
     }
@@ -906,7 +991,7 @@ chi::TaskResume Runtime::DelBlob(hipc::FullPtr<DelBlobTask> task, chi::RunContex
       if (blob_size <= tag_info_ptr->total_size_) {
         tag_info_ptr->total_size_ -= blob_size;
       } else {
-        tag_info_ptr->total_size_ = 0; // Clamp to 0 if we would underflow
+        tag_info_ptr->total_size_ = 0;  // Clamp to 0 if we would underflow
       }
     }
 
@@ -922,7 +1007,7 @@ chi::TaskResume Runtime::DelBlob(hipc::FullPtr<DelBlobTask> task, chi::RunContex
     // Success
     task->return_code_ = 0;
     HLOG(kDebug, "DelBlob successful: name={}, blob_size={}", blob_name,
-          blob_size);
+         blob_size);
 
   } catch (const std::exception &e) {
     task->return_code_ = 1;
@@ -930,7 +1015,8 @@ chi::TaskResume Runtime::DelBlob(hipc::FullPtr<DelBlobTask> task, chi::RunContex
   co_return;
 }
 
-chi::TaskResume Runtime::DelTag(hipc::FullPtr<DelTagTask> task, chi::RunContext &ctx) {
+chi::TaskResume Runtime::DelTag(hipc::FullPtr<DelTagTask> task,
+                                chi::RunContext &ctx) {
   try {
     TagId tag_id = task->tag_id_;
     std::string tag_name = task->tag_name_.str();
@@ -940,20 +1026,20 @@ chi::TaskResume Runtime::DelTag(hipc::FullPtr<DelTagTask> task, chi::RunContext 
       // Look up tag ID by name
       TagId *found_tag_id_ptr = tag_name_to_id_.find(tag_name);
       if (found_tag_id_ptr == nullptr) {
-        task->return_code_ = 1; // Tag not found by name
+        task->return_code_ = 1;  // Tag not found by name
         co_return;
       }
       tag_id = *found_tag_id_ptr;
-      task->tag_id_ = tag_id; // Update task with resolved tag ID
+      task->tag_id_ = tag_id;  // Update task with resolved tag ID
     } else if (tag_id.IsNull() && tag_name.empty()) {
-      task->return_code_ = 1; // Neither tag ID nor tag name provided
+      task->return_code_ = 1;  // Neither tag ID nor tag name provided
       co_return;
     }
 
     // Step 2: Find the tag by ID
     TagInfo *tag_info_ptr = tag_id_to_info_.find(tag_id);
     if (tag_info_ptr == nullptr) {
-      task->return_code_ = 1; // Tag not found by ID
+      task->return_code_ = 1;  // Tag not found by ID
       co_return;
     }
 
@@ -987,8 +1073,7 @@ chi::TaskResume Runtime::DelTag(hipc::FullPtr<DelTagTask> task, chi::RunContext 
         const std::string &blob_name = blob_names_to_delete[j];
 
         // Call AsyncDelBlob from client
-        auto async_task =
-            client_.AsyncDelBlob(tag_id, blob_name);
+        auto async_task = client_.AsyncDelBlob(tag_id, blob_name);
         async_tasks.push_back(async_task);
       }
 
@@ -999,7 +1084,7 @@ chi::TaskResume Runtime::DelTag(hipc::FullPtr<DelTagTask> task, chi::RunContext 
         // Check if DelBlob succeeded
         if (task->return_code_ != 0) {
           HLOG(kWarning,
-                "DelBlob failed for blob during tag deletion, continuing");
+               "DelBlob failed for blob during tag deletion, continuing");
           // Continue with other blobs even if one fails
         }
 
@@ -1040,8 +1125,8 @@ chi::TaskResume Runtime::DelTag(hipc::FullPtr<DelTagTask> task, chi::RunContext 
     // Success
     task->return_code_ = 0;
     HLOG(kDebug,
-          "DelTag successful: tag_id={},{}, removed {} blobs, total_size={}",
-          tag_id.major_, tag_id.minor_, blob_count, total_size);
+         "DelTag successful: tag_id={},{}, removed {} blobs, total_size={}",
+         tag_id.major_, tag_id.minor_, blob_count, total_size);
 
   } catch (const std::exception &e) {
     task->return_code_ = 1;
@@ -1049,12 +1134,12 @@ chi::TaskResume Runtime::DelTag(hipc::FullPtr<DelTagTask> task, chi::RunContext 
   co_return;
 }
 
-void Runtime::GetTagSize(hipc::FullPtr<GetTagSizeTask> task,
+chi::TaskResume Runtime::GetTagSize(hipc::FullPtr<GetTagSizeTask> task,
                          chi::RunContext &ctx) {
   // Dynamic scheduling phase - determine routing
   if (ctx.exec_mode_ == chi::ExecMode::kDynamicSchedule) {
     task->pool_query_ = chi::PoolQuery::Broadcast();
-    return;
+    co_return;
   }
 
   try {
@@ -1063,9 +1148,9 @@ void Runtime::GetTagSize(hipc::FullPtr<GetTagSizeTask> task,
     // Find the tag
     TagInfo *tag_info_ptr = tag_id_to_info_.find(tag_id);
     if (tag_info_ptr == nullptr) {
-      task->return_code_ = 1; // Tag not found
+      task->return_code_ = 1;  // Tag not found
       task->tag_size_ = 0;
-      return;
+      co_return;
     }
 
     // Update timestamp and return the total size
@@ -1080,19 +1165,20 @@ void Runtime::GetTagSize(hipc::FullPtr<GetTagSizeTask> task,
                  tag_info_ptr->last_modified_, now);
 
     HLOG(kDebug, "GetTagSize successful: tag_id={},{}, total_size={}",
-          tag_id.major_, tag_id.minor_, task->tag_size_);
+         tag_id.major_, tag_id.minor_, task->tag_size_);
 
   } catch (const std::exception &e) {
     task->return_code_ = 1;
     task->tag_size_ = 0;
   }
+  co_return;
 }
 
 // Private helper methods
 const Config &Runtime::GetConfig() const { return config_; }
 
 chi::TaskResume Runtime::UpdateTargetStats(const chi::PoolId &target_id,
-                                            TargetInfo &target_info) {
+                                           TargetInfo &target_info) {
   // Get actual statistics from bdev using the AsyncGetStats method
   chi::u64 remaining_size;
   auto stats_task = target_info.bdev_client_.AsyncGetStats();
@@ -1118,7 +1204,7 @@ chi::TaskResume Runtime::UpdateTargetStats(const chi::PoolId &target_id,
     if (max_bandwidth > 0.0) {
       // Find the maximum bandwidth across all targets for normalization
       double global_max_bandwidth =
-          1000.0; // TODO: Calculate actual max from all targets
+          1000.0;  // TODO: Calculate actual max from all targets
 
       // Use logarithmic scaling for target score: log(bandwidth_i) /
       // log(bandwidth_MAX)
@@ -1129,7 +1215,7 @@ chi::TaskResume Runtime::UpdateTargetStats(const chi::PoolId &target_id,
       target_info.target_score_ =
           std::max(0.0f, std::min(1.0f, target_info.target_score_));
     } else {
-      target_info.target_score_ = 0.0f; // No bandwidth, lowest score
+      target_info.target_score_ = 0.0f;  // No bandwidth, lowest score
     }
   }
   co_return;
@@ -1146,11 +1232,11 @@ float Runtime::GetManualScoreForTarget(const std::string &target_name) {
 
     // Also check if target name matches the device path directly
     if (target_name == expected_target_name || target_name == device.path_) {
-      return device.score_; // Return configured score (-1.0f if not set)
+      return device.score_;  // Return configured score (-1.0f if not set)
     }
   }
 
-  return -1.0f; // No manual score configured for this target
+  return -1.0f;  // No manual score configured for this target
 }
 
 TagId Runtime::GetOrAssignTagId(const std::string &tag_name,
@@ -1173,10 +1259,8 @@ TagId Runtime::GetOrAssignTagId(const std::string &tag_name,
     tag_id = GenerateNewTagId();
   }
 
-  // Create tag info
-  auto *ipc_manager = CHI_IPC;
-  auto *main_allocator = ipc_manager->GetMainAlloc();
-  TagInfo tag_info(main_allocator);
+  // Create tag info (use default constructor, allocator not used in struct)
+  TagInfo tag_info;
   tag_info.tag_name_ = tag_name;
   tag_info.tag_id_ = tag_id;
 
@@ -1191,7 +1275,7 @@ TagId Runtime::GetOrAssignTagId(const std::string &tag_name,
 chi::u64 Runtime::GetWorkRemaining() const {
   // Return approximate work remaining (simple implementation)
   // In a real implementation, this would sum tasks across all queues
-  return 0; // For now, always return 0 work remaining
+  return 0;  // For now, always return 0 work remaining
 }
 
 // Helper methods for lock index calculation
@@ -1227,7 +1311,7 @@ TagId Runtime::GenerateNewTagId() {
 }
 
 // Explicit template instantiations for required template methods
-template void Runtime::GetOrCreateTag<CreateParams>(
+template chi::TaskResume Runtime::GetOrCreateTag<CreateParams>(
     hipc::FullPtr<GetOrCreateTagTask<CreateParams>> task, chi::RunContext &ctx);
 
 // Blob management helper functions
@@ -1261,9 +1345,8 @@ BlobInfo *Runtime::CreateNewBlob(const std::string &blob_name,
   }
 
   // Prepare blob info structure BEFORE acquiring lock
-  auto *ipc_manager = CHI_IPC;
-  auto *main_allocator = ipc_manager->GetMainAlloc();
-  BlobInfo new_blob_info(main_allocator);
+  // Use default constructor (allocator not used in struct)
+  BlobInfo new_blob_info;
   new_blob_info.blob_name_ = blob_name;
   new_blob_info.score_ = blob_score;
 
@@ -1281,7 +1364,7 @@ BlobInfo *Runtime::CreateNewBlob(const std::string &blob_name,
     auto insert_result =
         tag_blob_name_to_info_.insert_or_assign(composite_key, new_blob_info);
     blob_info_ptr = insert_result.second;
-  } // Release lock immediately after insertion
+  }  // Release lock immediately after insertion
 
   return blob_info_ptr;
 }
@@ -1308,14 +1391,17 @@ chi::TaskResume Runtime::AllocateNewData(BlobInfo &blob_info, chi::u64 offset,
   registered_targets_.for_each(
       [&available_targets](const chi::PoolId &target_id,
                            const TargetInfo &target_info) {
-        HLOG(kDebug, "AllocateNewData: for_each - key=({},{}), value.bdev_client_.pool_id_=({},{}), remaining_space={}",
-              target_id.major_, target_id.minor_,
-              target_info.bdev_client_.pool_id_.major_, target_info.bdev_client_.pool_id_.minor_,
-              target_info.remaining_space_);
+        HLOG(kDebug,
+             "AllocateNewData: for_each - key=({},{}), "
+             "value.bdev_client_.pool_id_=({},{}), remaining_space={}",
+             target_id.major_, target_id.minor_,
+             target_info.bdev_client_.pool_id_.major_,
+             target_info.bdev_client_.pool_id_.minor_,
+             target_info.remaining_space_);
         available_targets.push_back(target_info);
       });
   HLOG(kDebug, "AllocateNewData: Ordered targets: {}",
-        available_targets.size());
+       available_targets.size());
   if (available_targets.empty()) {
     error_code = 1;
     co_return;
@@ -1327,8 +1413,11 @@ chi::TaskResume Runtime::AllocateNewData(BlobInfo &blob_info, chi::u64 offset,
       DpeFactory::CreateDpe(config.dpe_.dpe_type_);
 
   // Select targets using DPE algorithm before allocation loop
-  HLOG(kDebug, "AllocateNewData: Before SelectTargets, available_targets[0].bdev_client_.pool_id_=({},{})",
-        available_targets[0].bdev_client_.pool_id_.major_, available_targets[0].bdev_client_.pool_id_.minor_);
+  HLOG(kDebug,
+       "AllocateNewData: Before SelectTargets, "
+       "available_targets[0].bdev_client_.pool_id_=({},{})",
+       available_targets[0].bdev_client_.pool_id_.major_,
+       available_targets[0].bdev_client_.pool_id_.minor_);
   std::vector<TargetInfo> ordered_targets =
       dpe->SelectTargets(available_targets, blob_score, additional_size);
 
@@ -1337,8 +1426,11 @@ chi::TaskResume Runtime::AllocateNewData(BlobInfo &blob_info, chi::u64 offset,
     co_return;
   }
 
-  HLOG(kDebug, "AllocateNewData: After SelectTargets, ordered_targets[0].bdev_client_.pool_id_=({},{})",
-        ordered_targets[0].bdev_client_.pool_id_.major_, ordered_targets[0].bdev_client_.pool_id_.minor_);
+  HLOG(kDebug,
+       "AllocateNewData: After SelectTargets, "
+       "ordered_targets[0].bdev_client_.pool_id_=({},{})",
+       ordered_targets[0].bdev_client_.pool_id_.major_,
+       ordered_targets[0].bdev_client_.pool_id_.minor_);
 
   // Use for loop to iterate over pre-selected targets in order
   chi::u64 remaining_to_allocate = additional_size;
@@ -1348,18 +1440,22 @@ chi::TaskResume Runtime::AllocateNewData(BlobInfo &blob_info, chi::u64 offset,
       break;
     }
 
-    HLOG(kDebug, "AllocateNewData: In loop, selected_target_info.bdev_client_.pool_id_=({},{}), name={}",
-          selected_target_info.bdev_client_.pool_id_.major_,
-          selected_target_info.bdev_client_.pool_id_.minor_,
-          selected_target_info.target_name_);
+    HLOG(kDebug,
+         "AllocateNewData: In loop, "
+         "selected_target_info.bdev_client_.pool_id_=({},{}), name={}",
+         selected_target_info.bdev_client_.pool_id_.major_,
+         selected_target_info.bdev_client_.pool_id_.minor_,
+         selected_target_info.target_name_);
     chi::PoolId selected_target_id = selected_target_info.bdev_client_.pool_id_;
-    HLOG(kDebug, "AllocateNewData: After copy, selected_target_id=({},{}) ToU64={}",
-          selected_target_id.major_, selected_target_id.minor_, selected_target_id.ToU64());
+    HLOG(kDebug,
+         "AllocateNewData: After copy, selected_target_id=({},{}) ToU64={}",
+         selected_target_id.major_, selected_target_id.minor_,
+         selected_target_id.ToU64());
 
     // Find the selected target info for allocation using TargetId
     TargetInfo *target_info = registered_targets_.find(selected_target_id);
     if (target_info == nullptr) {
-      continue; // Try next target
+      continue;  // Try next target
     }
 
     // Calculate how much we can allocate from this target
@@ -1367,10 +1463,10 @@ chi::TaskResume Runtime::AllocateNewData(BlobInfo &blob_info, chi::u64 offset,
         std::min(remaining_to_allocate, target_info->remaining_space_);
 
     HLOG(kDebug,
-          "Target [{}]: remaining_space={} bytes, allocate_size={} bytes, "
-          "remaining_to_allocate={} bytes",
-          selected_target_id.ToU64(), target_info->remaining_space_,
-          allocate_size, remaining_to_allocate);
+         "Target [{}]: remaining_space={} bytes, allocate_size={} bytes, "
+         "remaining_to_allocate={} bytes",
+         selected_target_id.ToU64(), target_info->remaining_space_,
+         allocate_size, remaining_to_allocate);
 
     if (allocate_size == 0) {
       // No space available, try next target
@@ -1381,7 +1477,8 @@ chi::TaskResume Runtime::AllocateNewData(BlobInfo &blob_info, chi::u64 offset,
     // Allocate space using bdev client
     chi::u64 allocated_offset;
     bool alloc_success = false;
-    co_await AllocateFromTarget(*target_info, allocate_size, allocated_offset, alloc_success);
+    co_await AllocateFromTarget(*target_info, allocate_size, allocated_offset,
+                                alloc_success);
     if (!alloc_success) {
       // Allocation failed, try next target
       continue;
@@ -1402,16 +1499,16 @@ chi::TaskResume Runtime::AllocateNewData(BlobInfo &blob_info, chi::u64 offset,
     co_return;
   }
 
-  error_code = 0; // Success
+  error_code = 0;  // Success
   co_return;
 }
 
-chi::TaskResume Runtime::ModifyExistingData(const std::vector<BlobBlock> &blocks,
-                                            hipc::ShmPtr<> data, size_t data_size,
-                                            size_t data_offset_in_blob, chi::u32 &error_code) {
+chi::TaskResume Runtime::ModifyExistingData(
+    const std::vector<BlobBlock> &blocks, hipc::ShmPtr<> data, size_t data_size,
+    size_t data_offset_in_blob, chi::u32 &error_code) {
   HLOG(kDebug,
-        "ModifyExistingData: blocks={}, data_size={}, data_offset_in_blob={}",
-        blocks.size(), data_size, data_offset_in_blob);
+       "ModifyExistingData: blocks={}, data_size={}, data_offset_in_blob={}",
+       blocks.size(), data_size, data_offset_in_blob);
 
   // Step 1: Initially store the remaining_size equal to data_size
   size_t remaining_size = data_size;
@@ -1460,23 +1557,22 @@ chi::TaskResume Runtime::ModifyExistingData(const std::vector<BlobBlock> &blocks
       size_t data_buffer_offset = write_start_in_blob - data_offset_in_blob;
 
       HLOG(kDebug,
-            "ModifyExistingData: block[{}] - writing write_size={}, "
-            "write_start_in_block={}, data_buffer_offset={}",
-            block_idx, write_size, write_start_in_block, data_buffer_offset);
+           "ModifyExistingData: block[{}] - writing write_size={}, "
+           "write_start_in_block={}, data_buffer_offset={}",
+           block_idx, write_size, write_start_in_block, data_buffer_offset);
 
       // Step 5: Perform async write on the updated range
       chimaera::bdev::Block bdev_block(
           block.target_offset_ + write_start_in_block, write_size, 0);
       hipc::ShmPtr<> data_ptr = data + data_buffer_offset;
 
-      // Wrap single block in ArrayVector for AsyncWrite
-      chimaera::bdev::ArrayVector<chimaera::bdev::Block, 128> blocks;
+      // Wrap single block in chi::priv::vector for AsyncWrite
+      chi::priv::vector<chimaera::bdev::Block> blocks(HSHM_MALLOC);
       blocks.push_back(bdev_block);
 
       chimaera::bdev::Client cte_clientcopy = block.bdev_client_;
-      auto write_task =
-          cte_clientcopy.AsyncWrite(block.target_query_,
-                                    blocks, data_ptr, write_size);
+      auto write_task = cte_clientcopy.AsyncWrite(block.target_query_, blocks,
+                                                  data_ptr, write_size);
 
       write_tasks.push_back(write_task);
       expected_write_sizes.push_back(write_size);
@@ -1492,8 +1588,8 @@ chi::TaskResume Runtime::ModifyExistingData(const std::vector<BlobBlock> &blocks
 
   // Step 7: Wait for all Async write operations to complete
   HLOG(kDebug,
-        "ModifyExistingData: Waiting for {} async write tasks to complete",
-        write_tasks.size());
+       "ModifyExistingData: Waiting for {} async write tasks to complete",
+       write_tasks.size());
   for (size_t task_idx = 0; task_idx < write_tasks.size(); ++task_idx) {
     auto task = write_tasks[task_idx];
     size_t expected_size = expected_write_sizes[task_idx];
@@ -1501,32 +1597,32 @@ chi::TaskResume Runtime::ModifyExistingData(const std::vector<BlobBlock> &blocks
     co_await task;
 
     HLOG(kDebug,
-          "ModifyExistingData: task[{}] completed - bytes_written={}, "
-          "expected={}, status={}",
-          task_idx, task->bytes_written_, expected_size,
-          (task->bytes_written_ == expected_size ? "SUCCESS" : "FAILED"));
+         "ModifyExistingData: task[{}] completed - bytes_written={}, "
+         "expected={}, status={}",
+         task_idx, task->bytes_written_, expected_size,
+         (task->bytes_written_ == expected_size ? "SUCCESS" : "FAILED"));
 
     if (task->bytes_written_ != expected_size) {
       HLOG(kError,
-            "ModifyExistingData: WRITE FAILED - task[{}] wrote {} bytes, "
-            "expected {}",
-            task_idx, task->bytes_written_, expected_size);
+           "ModifyExistingData: WRITE FAILED - task[{}] wrote {} bytes, "
+           "expected {}",
+           task_idx, task->bytes_written_, expected_size);
       error_code = 1;
       co_return;
     }
-
   }
 
   HLOG(kDebug, "ModifyExistingData: All write tasks completed successfully");
-  error_code = 0; // Success
+  error_code = 0;  // Success
   co_return;
 }
 
 chi::TaskResume Runtime::ReadData(const std::vector<BlobBlock> &blocks,
                                   hipc::ShmPtr<> data, size_t data_size,
-                                  size_t data_offset_in_blob, chi::u32 &error_code) {
+                                  size_t data_offset_in_blob,
+                                  chi::u32 &error_code) {
   HLOG(kDebug, "ReadData: blocks={}, data_size={}, data_offset_in_blob={}",
-        blocks.size(), data_size, data_offset_in_blob);
+       blocks.size(), data_size, data_offset_in_blob);
 
   // Step 1: Initially store the remaining_size equal to data_size
   size_t remaining_size = data_size;
@@ -1543,8 +1639,8 @@ chi::TaskResume Runtime::ReadData(const std::vector<BlobBlock> &blocks,
   for (size_t block_idx = 0; block_idx < blocks.size(); ++block_idx) {
     const BlobBlock &block = blocks[block_idx];
     HLOG(kDebug, "ReadData: block[{}] - target_offset={}, size={}, pool_id={}",
-          block_idx, block.target_offset_, block.size_,
-          block.bdev_client_.pool_id_.ToU64());
+         block_idx, block.target_offset_, block.size_,
+         block.bdev_client_.pool_id_.ToU64());
 
     // Step 7: If remaining size is 0, quit the for loop
     if (remaining_size == 0) {
@@ -1573,23 +1669,22 @@ chi::TaskResume Runtime::ReadData(const std::vector<BlobBlock> &blocks,
       size_t data_buffer_offset = read_start_in_blob - data_offset_in_blob;
 
       HLOG(kDebug,
-            "ReadData: block[{}] - reading read_size={}, "
-            "read_start_in_block={}, data_buffer_offset={}",
-            block_idx, read_size, read_start_in_block, data_buffer_offset);
+           "ReadData: block[{}] - reading read_size={}, "
+           "read_start_in_block={}, data_buffer_offset={}",
+           block_idx, read_size, read_start_in_block, data_buffer_offset);
 
       // Step 5: Perform async read on the range
       chimaera::bdev::Block bdev_block(
           block.target_offset_ + read_start_in_block, read_size, 0);
       hipc::ShmPtr<> data_ptr = data + data_buffer_offset;
 
-      // Wrap single block in ArrayVector for AsyncRead
-      chimaera::bdev::ArrayVector<chimaera::bdev::Block, 128> blocks;
+      // Wrap single block in chi::priv::vector for AsyncRead
+      chi::priv::vector<chimaera::bdev::Block> blocks(HSHM_MALLOC);
       blocks.push_back(bdev_block);
 
       chimaera::bdev::Client cte_clientcopy = block.bdev_client_;
-      auto read_task =
-          cte_clientcopy.AsyncRead(block.target_query_,
-                                   blocks, data_ptr, read_size);
+      auto read_task = cte_clientcopy.AsyncRead(block.target_query_, blocks,
+                                                data_ptr, read_size);
 
       read_tasks.push_back(read_task);
       expected_read_sizes.push_back(read_size);
@@ -1605,65 +1700,75 @@ chi::TaskResume Runtime::ReadData(const std::vector<BlobBlock> &blocks,
 
   // Step 7: Wait for all Async read operations to complete
   HLOG(kDebug, "ReadData: Waiting for {} async read tasks to complete",
-        read_tasks.size());
+       read_tasks.size());
   for (size_t task_idx = 0; task_idx < read_tasks.size(); ++task_idx) {
     auto task = read_tasks[task_idx];
     size_t expected_size = expected_read_sizes[task_idx];
 
     co_await task;
 
-    HLOG(
-        kDebug,
-        "ReadData: task[{}] completed - bytes_read={}, expected={}, status={}",
-        task_idx, task->bytes_read_, expected_size,
-        (task->bytes_read_ == expected_size ? "SUCCESS" : "FAILED"));
+    HLOG(kDebug,
+         "ReadData: task[{}] completed - bytes_read={}, expected={}, status={}",
+         task_idx, task->bytes_read_, expected_size,
+         (task->bytes_read_ == expected_size ? "SUCCESS" : "FAILED"));
 
     if (task->bytes_read_ != expected_size) {
       HLOG(kError,
-            "ReadData: READ FAILED - task[{}] read {} bytes, expected {}",
-            task_idx, task->bytes_read_, expected_size);
+           "ReadData: READ FAILED - task[{}] read {} bytes, expected {}",
+           task_idx, task->bytes_read_, expected_size);
       error_code = 1;
       co_return;
     }
-
   }
 
   HLOG(kDebug, "ReadData: All read tasks completed successfully");
-  error_code = 0; // Success
+  error_code = 0;  // Success
   co_return;
 }
 
 // Block management helper functions
 
-chi::TaskResume Runtime::AllocateFromTarget(TargetInfo &target_info, chi::u64 size,
-                                            chi::u64 &allocated_offset, bool &success) {
-  HLOG(kDebug, "AllocateFromTarget: ENTER - target_name={}, bdev_client_.pool_id_=({},{}), size={}, remaining_space={}",
-       target_info.target_name_,
-       target_info.bdev_client_.pool_id_.major_, target_info.bdev_client_.pool_id_.minor_,
-       size, target_info.remaining_space_);
+chi::TaskResume Runtime::AllocateFromTarget(TargetInfo &target_info,
+                                            chi::u64 size,
+                                            chi::u64 &allocated_offset,
+                                            bool &success) {
+  HLOG(kDebug,
+       "AllocateFromTarget: ENTER - target_name={}, "
+       "bdev_client_.pool_id_=({},{}), size={}, remaining_space={}",
+       target_info.target_name_, target_info.bdev_client_.pool_id_.major_,
+       target_info.bdev_client_.pool_id_.minor_, size,
+       target_info.remaining_space_);
 
   // Check if target has sufficient space
   if (target_info.remaining_space_ < size) {
-    HLOG(kDebug, "AllocateFromTarget: Insufficient space - remaining={} < size={}",
+    HLOG(kDebug,
+         "AllocateFromTarget: Insufficient space - remaining={} < size={}",
          target_info.remaining_space_, size);
     success = false;
     co_return;
   }
 
   try {
-    HLOG(kDebug, "AllocateFromTarget: Calling AsyncAllocateBlocks with pool_id_=({},{})",
-         target_info.bdev_client_.pool_id_.major_, target_info.bdev_client_.pool_id_.minor_);
+    HLOG(
+        kDebug,
+        "AllocateFromTarget: Calling AsyncAllocateBlocks with pool_id_=({},{})",
+        target_info.bdev_client_.pool_id_.major_,
+        target_info.bdev_client_.pool_id_.minor_);
 
     // Use bdev client AsyncAllocateBlocks method to get actual offset
     auto alloc_task = target_info.bdev_client_.AsyncAllocateBlocks(
         target_info.target_query_, size);
 
-    HLOG(kDebug, "AllocateFromTarget: AsyncAllocateBlocks returned, IsComplete()={}, co_awaiting...",
+    HLOG(kDebug,
+         "AllocateFromTarget: AsyncAllocateBlocks returned, IsComplete()={}, "
+         "co_awaiting...",
          alloc_task.IsComplete() ? "true" : "false");
 
     co_await alloc_task;
 
-    HLOG(kDebug, "AllocateFromTarget: co_await complete, alloc_task->blocks_.size()={}, return_code={}",
+    HLOG(kDebug,
+         "AllocateFromTarget: co_await complete, "
+         "alloc_task->blocks_.size()={}, return_code={}",
          alloc_task->blocks_.size(), alloc_task->return_code_.load());
 
     std::vector<chimaera::bdev::Block> allocated_blocks;
@@ -1698,7 +1803,8 @@ chi::TaskResume Runtime::AllocateFromTarget(TargetInfo &target_info, chi::u64 si
   }
 }
 
-chi::TaskResume Runtime::FreeAllBlobBlocks(BlobInfo &blob_info, chi::u32 &error_code) {
+chi::TaskResume Runtime::FreeAllBlobBlocks(BlobInfo &blob_info,
+                                           chi::u32 &error_code) {
   // Map: PoolId -> (target_query, vector<Block>)
   std::unordered_map<chi::PoolId, std::pair<chi::PoolQuery,
                                             std::vector<chimaera::bdev::Block>>>
@@ -1710,7 +1816,7 @@ chi::TaskResume Runtime::FreeAllBlobBlocks(BlobInfo &blob_info, chi::u32 &error_
     chimaera::bdev::Block block;
     block.offset_ = blob_block.target_offset_;
     block.size_ = blob_block.size_;
-    block.block_type_ = 0; // Default block type
+    block.block_type_ = 0;  // Default block type
 
     // Store target_query with blocks for this pool
     if (blocks_by_pool.find(pool_id) == blocks_by_pool.end()) {
@@ -1777,7 +1883,7 @@ size_t Runtime::GetTelemetryEntries(std::vector<CteTelemetry> &entries,
     if (success) {
       temp_entries.push_back(entry);
     } else {
-      break; // Queue is empty
+      break;  // Queue is empty
     }
   }
 
@@ -1791,7 +1897,7 @@ size_t Runtime::GetTelemetryEntries(std::vector<CteTelemetry> &entries,
   return entries.size();
 }
 
-void Runtime::PollTelemetryLog(hipc::FullPtr<PollTelemetryLogTask> task,
+chi::TaskResume Runtime::PollTelemetryLog(hipc::FullPtr<PollTelemetryLogTask> task,
                                chi::RunContext &ctx) {
   try {
     std::uint64_t minimum_logical_time = task->minimum_logical_time_;
@@ -1799,6 +1905,7 @@ void Runtime::PollTelemetryLog(hipc::FullPtr<PollTelemetryLogTask> task,
     // Get telemetry entries with logical time filtering
     std::vector<CteTelemetry> all_entries;
     size_t retrieved_count = GetTelemetryEntries(all_entries, 1000);
+    (void)retrieved_count;
 
     // Filter entries by minimum logical time
     task->entries_.clear();
@@ -1819,15 +1926,16 @@ void Runtime::PollTelemetryLog(hipc::FullPtr<PollTelemetryLogTask> task,
     task->last_logical_time_ = 0;
   }
   (void)ctx;
+  co_return;
 }
 
-void Runtime::GetBlobScore(hipc::FullPtr<GetBlobScoreTask> task,
+chi::TaskResume Runtime::GetBlobScore(hipc::FullPtr<GetBlobScoreTask> task,
                            chi::RunContext &ctx) {
   // Dynamic scheduling phase - determine routing
   if (ctx.exec_mode_ == chi::ExecMode::kDynamicSchedule) {
     task->pool_query_ =
         HashBlobToContainer(task->tag_id_, task->blob_name_.str());
-    return;
+    co_return;
   }
 
   try {
@@ -1838,15 +1946,15 @@ void Runtime::GetBlobScore(hipc::FullPtr<GetBlobScoreTask> task,
     // Validate that blob_name is provided
     if (blob_name.empty()) {
       task->return_code_ = 1;
-      return;
+      co_return;
     }
 
     // Step 1: Check if blob exists
     BlobInfo *blob_info_ptr = CheckBlobExists(blob_name, tag_id);
 
     if (blob_info_ptr == nullptr) {
-      task->return_code_ = 1; // Blob not found
-      return;
+      task->return_code_ = 1;  // Blob not found
+      co_return;
     }
 
     // Step 2: Return the blob score
@@ -1864,20 +1972,21 @@ void Runtime::GetBlobScore(hipc::FullPtr<GetBlobScoreTask> task,
     // Success
     task->return_code_ = 0;
     HLOG(kDebug, "GetBlobScore successful: name={}, score={}", blob_name,
-          blob_info_ptr->score_);
+         blob_info_ptr->score_);
 
   } catch (const std::exception &e) {
     task->return_code_ = 1;
   }
+  co_return;
 }
 
-void Runtime::GetBlobSize(hipc::FullPtr<GetBlobSizeTask> task,
+chi::TaskResume Runtime::GetBlobSize(hipc::FullPtr<GetBlobSizeTask> task,
                           chi::RunContext &ctx) {
   // Dynamic scheduling phase - determine routing
   if (ctx.exec_mode_ == chi::ExecMode::kDynamicSchedule) {
     task->pool_query_ =
         HashBlobToContainer(task->tag_id_, task->blob_name_.str());
-    return;
+    co_return;
   }
 
   try {
@@ -1888,14 +1997,14 @@ void Runtime::GetBlobSize(hipc::FullPtr<GetBlobSizeTask> task,
     // Validate that blob_name is provided
     if (blob_name.empty()) {
       task->return_code_ = 1;
-      return;
+      co_return;
     }
 
     // Step 1: Check if blob exists
     BlobInfo *blob_info_ptr = CheckBlobExists(blob_name, tag_id);
     if (blob_info_ptr == nullptr) {
-      task->return_code_ = 1; // Blob not found
-      return;
+      task->return_code_ = 1;  // Blob not found
+      co_return;
     }
 
     // Step 2: Calculate and return the blob size
@@ -1913,19 +2022,20 @@ void Runtime::GetBlobSize(hipc::FullPtr<GetBlobSizeTask> task,
     // Success
     task->return_code_ = 0;
     HLOG(kDebug, "GetBlobSize successful: name={}, size={}", blob_name,
-          task->size_);
+         task->size_);
 
   } catch (const std::exception &e) {
     task->return_code_ = 1;
   }
+  co_return;
 }
 
-void Runtime::GetContainedBlobs(hipc::FullPtr<GetContainedBlobsTask> task,
+chi::TaskResume Runtime::GetContainedBlobs(hipc::FullPtr<GetContainedBlobsTask> task,
                                 chi::RunContext &ctx) {
   // Dynamic scheduling phase - determine routing
   if (ctx.exec_mode_ == chi::ExecMode::kDynamicSchedule) {
     task->pool_query_ = chi::PoolQuery::Broadcast();
-    return;
+    co_return;
   }
 
   try {
@@ -1935,8 +2045,8 @@ void Runtime::GetContainedBlobs(hipc::FullPtr<GetContainedBlobsTask> task,
     // Validate tag exists
     TagInfo *tag_info_ptr = tag_id_to_info_.find(tag_id);
     if (tag_info_ptr == nullptr) {
-      task->return_code_ = 1; // Tag not found
-      return;
+      task->return_code_ = 1;  // Tag not found
+      co_return;
     }
 
     // Clear output vector
@@ -1967,19 +2077,20 @@ void Runtime::GetContainedBlobs(hipc::FullPtr<GetContainedBlobsTask> task,
                  std::chrono::steady_clock::now());
 
     HLOG(kDebug, "GetContainedBlobs successful: tag_id={},{}, found {} blobs",
-          tag_id.major_, tag_id.minor_, task->blob_names_.size());
+         tag_id.major_, tag_id.minor_, task->blob_names_.size());
 
   } catch (const std::exception &e) {
-    task->return_code_ = 1; // Error during operation
+    task->return_code_ = 1;  // Error during operation
     HLOG(kError, "GetContainedBlobs failed: {}", e.what());
   }
+  co_return;
 }
 
-void Runtime::TagQuery(hipc::FullPtr<TagQueryTask> task, chi::RunContext &ctx) {
+chi::TaskResume Runtime::TagQuery(hipc::FullPtr<TagQueryTask> task, chi::RunContext &ctx) {
   // Dynamic scheduling phase - determine routing
   if (ctx.exec_mode_ == chi::ExecMode::kDynamicSchedule) {
     task->pool_query_ = chi::PoolQuery::Broadcast();
-    return;
+    co_return;
   }
 
   try {
@@ -2001,7 +2112,8 @@ void Runtime::TagQuery(hipc::FullPtr<TagQueryTask> task, chi::RunContext &ctx) {
     // Total matched tags (summed across replicas during Aggregate)
     task->total_tags_matched_ = matching_tags.size();
 
-    // Build results: just tag names matching the query. Respect max_tags_ if non-zero.
+    // Build results: just tag names matching the query. Respect max_tags_ if
+    // non-zero.
     task->results_.clear();
     for (const auto &tn : matching_tags) {
       if (task->max_tags_ != 0 && task->results_.size() >= task->max_tags_) {
@@ -2013,21 +2125,22 @@ void Runtime::TagQuery(hipc::FullPtr<TagQueryTask> task, chi::RunContext &ctx) {
 
     // Success
     task->return_code_ = 0;
-    HLOG(kDebug, "TagQuery successful: pattern={}, found {} tags",
-          tag_regex, matching_tags.size());
+    HLOG(kDebug, "TagQuery successful: pattern={}, found {} tags", tag_regex,
+         matching_tags.size());
 
   } catch (const std::exception &e) {
     task->return_code_ = 1;
     HLOG(kError, "TagQuery failed: {}", e.what());
   }
+  co_return;
 }
 
-void Runtime::BlobQuery(hipc::FullPtr<BlobQueryTask> task,
+chi::TaskResume Runtime::BlobQuery(hipc::FullPtr<BlobQueryTask> task,
                         chi::RunContext &ctx) {
   // Dynamic scheduling phase - determine routing
   if (ctx.exec_mode_ == chi::ExecMode::kDynamicSchedule) {
     task->pool_query_ = chi::PoolQuery::Broadcast();
-    return;
+    co_return;
   }
 
   try {
@@ -2042,7 +2155,7 @@ void Runtime::BlobQuery(hipc::FullPtr<BlobQueryTask> task,
     std::vector<std::pair<std::string, TagId>> matching_tags;
     tag_name_to_id_.for_each(
         [&tag_pattern, &matching_tags](const std::string &tag_name,
-                                      const TagId &tag_id) {
+                                       const TagId &tag_id) {
           if (std::regex_match(tag_name, tag_pattern)) {
             matching_tags.emplace_back(tag_name, tag_id);
           }
@@ -2074,7 +2187,8 @@ void Runtime::BlobQuery(hipc::FullPtr<BlobQueryTask> task,
                 task->total_blobs_matched_++;
                 // Respect max_blobs_ if set
                 if (task->max_blobs_ == 0 ||
-                    task->tag_names_.size() < static_cast<size_t>(task->max_blobs_)) {
+                    task->tag_names_.size() <
+                        static_cast<size_t>(task->max_blobs_)) {
                   task->tag_names_.push_back(tag_name);
                   task->blob_names_.push_back(blob_name);
                 }
@@ -2085,15 +2199,16 @@ void Runtime::BlobQuery(hipc::FullPtr<BlobQueryTask> task,
 
     // Success
     task->return_code_ = 0;
-    HLOG(
-        kDebug,
-        "BlobQuery successful: tag_pattern={}, blob_pattern={}, found {} blobs total",
-        tag_regex, blob_regex, task->total_blobs_matched_);
+    HLOG(kDebug,
+         "BlobQuery successful: tag_pattern={}, blob_pattern={}, found {} "
+         "blobs total",
+         tag_regex, blob_regex, task->total_blobs_matched_);
 
   } catch (const std::exception &e) {
     task->return_code_ = 1;
     HLOG(kError, "BlobQuery failed: {}", e.what());
   }
+  co_return;
 }
 
 // ==============================================================================
@@ -2116,13 +2231,14 @@ chi::PoolQuery Runtime::HashBlobToContainer(const TagId &tag_id,
   return chi::PoolQuery::DirectHash(hash_value);
 }
 
-} // namespace wrp_cte::core
+}  // namespace wrp_cte::core
 
 // Define ChiMod entry points using CHI_TASK_CC macro
 CHI_TASK_CC(wrp_cte::core::Runtime)
 
-// Explicit template instantiation to force generation of Future::await_suspend_impl
-// This is needed because the C++20 coroutine machinery may not be instantiating
-// the template method automatically
-template bool chi::Future<chimaera::bdev::AllocateBlocksTask, CHI_MAIN_ALLOC_T>::await_suspend_impl(
-    std::coroutine_handle<> handle) noexcept;
+// Explicit template instantiation to force generation of
+// Future::await_suspend_impl This is needed because the C++20 coroutine
+// machinery may not be instantiating the template method automatically
+template bool
+chi::Future<chimaera::bdev::AllocateBlocksTask, CHI_MAIN_ALLOC_T>::
+    await_suspend_impl(std::coroutine_handle<> handle) noexcept;

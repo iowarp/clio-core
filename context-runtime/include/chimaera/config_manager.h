@@ -208,7 +208,6 @@ class ConfigManager : public hshm::BaseConfig {
 
   size_t main_segment_size_ = hshm::Unit<size_t>::Gigabytes(1);
   size_t client_data_segment_size_ = hshm::Unit<size_t>::Megabytes(256);
-  size_t runtime_data_segment_size_ = hshm::Unit<size_t>::Megabytes(256);
 
   u32 port_ = 5555;
   u32 neighborhood_size_ = 32;
@@ -216,7 +215,6 @@ class ConfigManager : public hshm::BaseConfig {
   // Shared memory segment names with environment variable support
   std::string main_segment_name_ = "chi_main_segment_${USER}";
   std::string client_data_segment_name_ = "chi_client_data_segment_${USER}";
-  std::string runtime_data_segment_name_ = "chi_runtime_data_segment_${USER}";
 
   // Networking configuration
   std::string hostfile_path_ = "";

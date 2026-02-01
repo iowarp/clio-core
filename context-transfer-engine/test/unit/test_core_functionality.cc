@@ -640,6 +640,7 @@ TEST_CASE("FUNCTIONAL - PutBlob Operations",
         fixture->core_client_->AsyncPutBlob(tag_id, blob_name,
                                             0,  // offset
                                             blob_size, blob_data_ptr, score,
+                                            wrp_cte::core::Context(),  // context
                                             0  // flags
         );
 
@@ -686,7 +687,7 @@ TEST_CASE("FUNCTIONAL - PutBlob Operations",
 
       // Store the blob using AsyncPutBlob
       auto put_task = fixture->core_client_->AsyncPutBlob(
-          tag_id, blob_name, 0, blob_size, blob_data_ptr, score, 0);
+          tag_id, blob_name, 0, blob_size, blob_data_ptr, score, wrp_cte::core::Context(), 0);
 
       if (!put_task.IsNull() &&
           fixture->WaitForTaskCompletion(put_task, 10000) &&
@@ -728,7 +729,7 @@ TEST_CASE("FUNCTIONAL - PutBlob Operations",
 
       // Store chunk at specific offset using AsyncPutBlob
       auto chunk_task = fixture->core_client_->AsyncPutBlob(
-          tag_id, blob_name, offset, chunk_size, chunk_ptr, 0.8f, 0);
+          tag_id, blob_name, offset, chunk_size, chunk_ptr, 0.8f, wrp_cte::core::Context(), 0);
 
       if (!chunk_task.IsNull() &&
           fixture->WaitForTaskCompletion(chunk_task, 10000) &&
@@ -764,7 +765,7 @@ TEST_CASE("FUNCTIONAL - PutBlob Operations",
     // ACTUAL FUNCTIONAL TEST - call the real AsyncPutBlob API
     INFO("Calling fixture->core_client_->AsyncPutBlob()...");
     auto put_task = fixture->core_client_->AsyncPutBlob(
-        tag_id, blob_name, 0, blob_size, blob_data_ptr, 0.7f, 0);
+        tag_id, blob_name, 0, blob_size, blob_data_ptr, 0.7f, wrp_cte::core::Context(), 0);
 
     REQUIRE(!put_task.IsNull());
     INFO("AsyncPutBlob returned valid task, waiting for completion...");
@@ -797,7 +798,7 @@ TEST_CASE("FUNCTIONAL - PutBlob Operations",
     if (!data_fullptr.IsNull() &&
         fixture->CopyToSharedMemory(data_fullptr, test_data)) {
       auto error_task = fixture->core_client_->AsyncPutBlob(tag_id, "", 0, 512,
-                                                            data_ptr, 0.5f, 0);
+                                                            data_ptr, 0.5f, wrp_cte::core::Context(), 0);
       if (!error_task.IsNull()) {
         bool completed = fixture->WaitForTaskCompletion(error_task, 5000);
         bool success = completed && (error_task->return_code_ == 0);
@@ -811,7 +812,7 @@ TEST_CASE("FUNCTIONAL - PutBlob Operations",
     INFO("Testing valid blob name...");
     if (!data_fullptr.IsNull()) {
       auto valid_task = fixture->core_client_->AsyncPutBlob(
-          tag_id, "valid_name", 0, 512, data_ptr, 0.5f, 0);
+          tag_id, "valid_name", 0, 512, data_ptr, 0.5f, wrp_cte::core::Context(), 0);
       if (!valid_task.IsNull()) {
         bool completed = fixture->WaitForTaskCompletion(valid_task, 5000);
         bool success = completed && (valid_task->return_code_ == 0);
@@ -825,7 +826,7 @@ TEST_CASE("FUNCTIONAL - PutBlob Operations",
     if (!data_fullptr.IsNull()) {
       auto invalid_tag_task = fixture->core_client_->AsyncPutBlob(
           wrp_cte::core::TagId{99999, 0}, "valid_name", 0, 512, data_ptr, 0.5f,
-          0);
+          wrp_cte::core::Context(), 0);
       if (!invalid_tag_task.IsNull()) {
         bool completed = fixture->WaitForTaskCompletion(invalid_tag_task, 5000);
         bool success = completed && (invalid_tag_task->return_code_ == 0);
@@ -904,7 +905,7 @@ TEST_CASE("FUNCTIONAL - GetBlob Operations",
 
     INFO("Storing blob for retrieval test...");
     auto put_task = fixture->core_client_->AsyncPutBlob(
-        tag_id, blob_name, 0, blob_size, put_data_ptr, 0.8f, 0);
+        tag_id, blob_name, 0, blob_size, put_data_ptr, 0.8f, wrp_cte::core::Context(), 0);
 
     REQUIRE(!put_task.IsNull());
     REQUIRE(fixture->WaitForTaskCompletion(put_task, 10000));
@@ -978,7 +979,7 @@ TEST_CASE("FUNCTIONAL - GetBlob Operations",
       REQUIRE(fixture->CopyToSharedMemory(put_fullptr, blob_data));
 
       auto put_task = fixture->core_client_->AsyncPutBlob(
-          tag_id, blob_name, 0, blob_size, put_ptr, 0.5f, 0);
+          tag_id, blob_name, 0, blob_size, put_ptr, 0.5f, wrp_cte::core::Context(), 0);
 
       if (!put_task.IsNull() &&
           fixture->WaitForTaskCompletion(put_task, 10000) &&
@@ -1054,7 +1055,7 @@ TEST_CASE("FUNCTIONAL - GetBlob Operations",
 
     INFO("Storing full blob (" << total_size << " bytes)...");
     auto put_task = fixture->core_client_->AsyncPutBlob(
-        tag_id, blob_name, 0, total_size, put_ptr, 0.9f, 0);
+        tag_id, blob_name, 0, total_size, put_ptr, 0.9f, wrp_cte::core::Context(), 0);
 
     REQUIRE(!put_task.IsNull());
     REQUIRE(fixture->WaitForTaskCompletion(put_task, 10000));
@@ -1126,7 +1127,7 @@ TEST_CASE("FUNCTIONAL - GetBlob Operations",
 
     INFO("Storing blob for async retrieval...");
     auto put_task = fixture->core_client_->AsyncPutBlob(
-        tag_id, blob_name, 0, blob_size, put_ptr, 0.7f, 0);
+        tag_id, blob_name, 0, blob_size, put_ptr, 0.7f, wrp_cte::core::Context(), 0);
 
     REQUIRE(!put_task.IsNull());
     REQUIRE(fixture->WaitForTaskCompletion(put_task, 10000));
@@ -1288,7 +1289,7 @@ TEST_CASE("FUNCTIONAL - PutBlob-GetBlob Integration Cycles",
     // STEP 1: Store the blob
     INFO("Step 1: Storing blob with AsyncPutBlob...");
     auto put_task = fixture->core_client_->AsyncPutBlob(
-        tag_id, blob_name, 0, blob_size, put_ptr, score, 0);
+        tag_id, blob_name, 0, blob_size, put_ptr, score, wrp_cte::core::Context(), 0);
 
     REQUIRE(!put_task.IsNull());
     REQUIRE(fixture->WaitForTaskCompletion(put_task, 10000));
@@ -1379,7 +1380,7 @@ TEST_CASE("FUNCTIONAL - PutBlob-GetBlob Integration Cycles",
       REQUIRE(fixture->CopyToSharedMemory(put_fullptr, blob_data));
 
       auto put_task = fixture->core_client_->AsyncPutBlob(
-          tag_id, blob_name, 0, blob_size, put_ptr, score, 0);
+          tag_id, blob_name, 0, blob_size, put_ptr, score, wrp_cte::core::Context(), 0);
 
       if (!put_task.IsNull() &&
           fixture->WaitForTaskCompletion(put_task, 10000) &&
@@ -1469,7 +1470,7 @@ TEST_CASE("FUNCTIONAL - PutBlob-GetBlob Integration Cycles",
     if (!put1_fullptr.IsNull() &&
         fixture->CopyToSharedMemory(put1_fullptr, tag1_data)) {
       auto put1_task = fixture->core_client_->AsyncPutBlob(
-          tag1_id, blob_name, 0, blob_size, put1_ptr, 0.5f, 0);
+          tag1_id, blob_name, 0, blob_size, put1_ptr, 0.5f, wrp_cte::core::Context(), 0);
       if (!put1_task.IsNull() &&
           fixture->WaitForTaskCompletion(put1_task, 10000) &&
           put1_task->return_code_ == 0) {
@@ -1488,7 +1489,7 @@ TEST_CASE("FUNCTIONAL - PutBlob-GetBlob Integration Cycles",
     if (!put2_fullptr.IsNull() &&
         fixture->CopyToSharedMemory(put2_fullptr, tag2_data)) {
       auto put2_task = fixture->core_client_->AsyncPutBlob(
-          tag2_id, blob_name, 0, blob_size, put2_ptr, 0.5f, 0);
+          tag2_id, blob_name, 0, blob_size, put2_ptr, 0.5f, wrp_cte::core::Context(), 0);
       if (!put2_task.IsNull() &&
           fixture->WaitForTaskCompletion(put2_task, 10000) &&
           put2_task->return_code_ == 0) {
@@ -1571,7 +1572,7 @@ TEST_CASE("FUNCTIONAL - PutBlob-GetBlob Integration Cycles",
     // STEP 1: Async Put
     INFO("Step 1: Async PutBlob...");
     auto put_task = fixture->core_client_->AsyncPutBlob(
-        tag_id, blob_name, 0, blob_size, put_ptr, 0.7f, 0);
+        tag_id, blob_name, 0, blob_size, put_ptr, 0.7f, wrp_cte::core::Context(), 0);
 
     REQUIRE(!put_task.IsNull());
     INFO("Waiting for async put completion...");
@@ -1653,7 +1654,7 @@ TEST_CASE("FUNCTIONAL - PutBlob-GetBlob Integration Cycles",
       hipc::ShmPtr<> chunk_ptr = chunk_fullptr.shm_.template Cast<void>();
 
       auto chunk_task = fixture->core_client_->AsyncPutBlob(
-          tag_id, blob_name, offset, chunk_size, chunk_ptr, 0.6f, 0);
+          tag_id, blob_name, offset, chunk_size, chunk_ptr, 0.6f, wrp_cte::core::Context(), 0);
 
       if (!chunk_task.IsNull() &&
           fixture->WaitForTaskCompletion(chunk_task, 10000) &&
@@ -1818,7 +1819,7 @@ TEST_CASE("FUNCTIONAL - PutBlob-GetBlob Comprehensive Integration",
 
   // Create PutBlob task
   auto put_task = fixture->core_client_->AsyncPutBlob(
-      tag_id, blob_name, 0, test_data_size, put_data_ptr, blob_score, 0);
+      tag_id, blob_name, 0, test_data_size, put_data_ptr, blob_score, wrp_cte::core::Context(), 0);
 
   REQUIRE(!put_task.IsNull());
   INFO("✓ PutBlob task created with:");
@@ -1971,7 +1972,7 @@ TEST_CASE("FUNCTIONAL - ReorganizeBlob Operations",
 
       auto put_task = fixture->core_client_->AsyncPutBlob(
           tag_id, blob_name, 0, blob_size,
-          put_buffer.shm_.template Cast<void>(), initial_score, 0);
+          put_buffer.shm_.template Cast<void>(), initial_score, wrp_cte::core::Context(), 0);
 
       REQUIRE(!put_task.IsNull());
       REQUIRE(fixture->WaitForTaskCompletion(put_task, 10000));
@@ -2062,7 +2063,7 @@ TEST_CASE("FUNCTIONAL - ReorganizeBlob Operations",
 
       auto put_task = fixture->core_client_->AsyncPutBlob(
           tag_id, blob_name, 0, blob_size,
-          put_buffer.shm_.template Cast<void>(), initial_scores[i], 0);
+          put_buffer.shm_.template Cast<void>(), initial_scores[i], wrp_cte::core::Context(), 0);
 
       REQUIRE(!put_task.IsNull());
       REQUIRE(fixture->WaitForTaskCompletion(put_task, 10000));
@@ -2128,7 +2129,7 @@ TEST_CASE("FUNCTIONAL - ReorganizeBlob Operations",
 
       auto put_task = fixture->core_client_->AsyncPutBlob(
           tag_id, blob_name, 0, blob_size,
-          put_buffer.shm_.template Cast<void>(), initial_score, 0);
+          put_buffer.shm_.template Cast<void>(), initial_score, wrp_cte::core::Context(), 0);
 
       REQUIRE(!put_task.IsNull());
       REQUIRE(fixture->WaitForTaskCompletion(put_task, 10000));
@@ -2358,7 +2359,7 @@ TEST_CASE("FUNCTIONAL - Distributed Execution Validation",
 
     // Execute PutBlob operation
     auto put_task = fixture->core_client_->AsyncPutBlob(
-        tag_id, blob_name, 0, blob_size, blob_data_ptr, score, 0);
+        tag_id, blob_name, 0, blob_size, blob_data_ptr, score, wrp_cte::core::Context(), 0);
 
     REQUIRE(!put_task.IsNull());
     REQUIRE(fixture->WaitForTaskCompletion(put_task, 10000));

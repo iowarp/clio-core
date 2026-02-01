@@ -67,9 +67,29 @@ struct StorageConfig {
  */
 struct DpeConfig {
   std::string dpe_type_;  // DPE algorithm type ("random", "round_robin", "max_bw")
-  
+
   DpeConfig() : dpe_type_("max_bw") {}
   explicit DpeConfig(const std::string& dpe_type) : dpe_type_(dpe_type) {}
+};
+
+/**
+ * Compression and DNN Monitoring configuration
+ */
+struct CompressionConfig {
+  chi::u32 monitor_interval_ms_;         // Interval for collecting target capacities and stats (default 5ms)
+  std::string dnn_model_weights_path_;   // Path to DNN model weights JSON file (deprecated, use qtable)
+  std::string qtable_model_path_;        // Path to Q-table model directory (contains qtable.json, binning_params.json)
+  chi::u32 dnn_samples_before_reinforce_; // Number of samples to collect before reinforcing DNN
+  std::string trace_folder_path_;        // Path to folder for CTE trace logs
+  float qtable_learning_rate_;           // Learning rate for Q-table online updates (default 0.3)
+
+  CompressionConfig()
+      : monitor_interval_ms_(5),
+        dnn_model_weights_path_(""),
+        qtable_model_path_(""),
+        dnn_samples_before_reinforce_(1000),
+        trace_folder_path_(""),
+        qtable_learning_rate_(0.3f) {}
 };
 
 /**
@@ -97,6 +117,11 @@ class Config {
    * Data Placement Engine configuration
    */
   DpeConfig dpe_;
+
+  /**
+   * Compression and DNN Monitoring configuration
+   */
+  CompressionConfig compression_;
 
   /**
    * Default constructor
@@ -207,6 +232,13 @@ class Config {
    * @return true if successful, false otherwise
    */
   bool ParseDpeConfig(const YAML::Node &node);
+
+  /**
+   * Parse compression configuration from YAML
+   * @param node YAML node containing compression config
+   * @return true if successful, false otherwise
+   */
+  bool ParseCompressionConfig(const YAML::Node &node);
 
   /**
    * Parse size string to bytes (e.g., "1GB", "512MB", "2TB")
