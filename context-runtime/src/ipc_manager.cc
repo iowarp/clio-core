@@ -1359,12 +1359,6 @@ Future<Task> IpcManager::MakeFuture(hipc::FullPtr<Task> task_ptr,
   if (!CHI_CHIMAERA_MANAGER->IsRuntime() || force_copy) {
     // CLIENT PATH or FORCE COPY: Serialize the task into Future
     HLOG(kInfo, "MakeFuture: CLIENT PATH");
-    // Get shm_size from allocator for lazy registration
-    size_t shm_size = 0;
-    if (last_alloc_ != nullptr) {
-      shm_size = last_alloc_->GetBackend().backend_size_;
-    }
-
     // Get copy space size from task
     size_t copy_space_size = task_ptr.IsNull() ? 4096 : task_ptr->GetCopySpaceSize();
 
@@ -1385,7 +1379,6 @@ Future<Task> IpcManager::MakeFuture(hipc::FullPtr<Task> task_ptr,
       future_shm_ptr->method_id_ = task_ptr->method_;
     }
     future_shm_ptr->capacity_.store(copy_space_size);
-    future_shm_ptr->shm_size_ = shm_size;
 
     // Create Future with ShmPtr and task_ptr
     hipc::ShmPtr<FutureShm<CHI_MAIN_ALLOC_T>> future_shm_shmptr = buffer.shm_.template Cast<FutureShm<CHI_MAIN_ALLOC_T>>();

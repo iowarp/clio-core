@@ -397,21 +397,16 @@ struct FutureShm {
   u32 method_id_;
 
   /** Size of the output data (0 if fits in copy_space) */
-  std::atomic<size_t> output_size_;
+  hipc::atomic<size_t> output_size_;
 
   /** Actual size of data currently in copy_space */
-  std::atomic<size_t> input_size_;
+  hipc::atomic<size_t> input_size_;
 
   /** Total capacity of copy_space buffer */
-  std::atomic<size_t> capacity_;
+  hipc::atomic<size_t> capacity_;
 
   /** Atomic bitfield for completion and data availability flags */
   hshm::abitfield32_t is_complete_;
-
-  /** Size of the shared memory segment containing this FutureShm
-   *  Used for lazy registration - shm_name derived from alloc_id (pid.count)
-   */
-  size_t shm_size_;
 
   /** Copy space for serialized task data (flexible array member) */
   char copy_space[];
@@ -427,7 +422,6 @@ struct FutureShm {
     input_size_.store(0);
     capacity_.store(0);
     is_complete_.SetBits(0);
-    shm_size_ = 0;
   }
 };
 

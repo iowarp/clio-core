@@ -204,61 +204,6 @@ class IpcManager {
     FreeBuffer(full_ptr);
   }
 
-  /**
-   * Free a FutureShm object using the correct allocator
-   * Looks up allocator by alloc_id in the shm_ member
-   * @tparam FutureT The FutureShm type
-   * @param future_shm ShmPtr to the FutureShm to free
-   */
-  template <typename FutureT>
-  void FreeFutureShm(hipc::ShmPtr<FutureT> &future_shm) {
-    if (future_shm.IsNull()) {
-      return;
-    }
-
-    // Convert ShmPtr to FullPtr to access shm_ member and free buffer
-    hipc::FullPtr<FutureT> future_full = ToFullPtr(future_shm);
-
-    HLOG(kInfo, "FreeFutureShm: Freeing FutureShm at offset {}, alloc ({}.{})",
-         future_shm.off_.load(), future_shm.alloc_id_.major_, future_shm.alloc_id_.minor_);
-
-    // Get allocator ID from the shm_ member
-    hipc::AllocatorId alloc_id = future_full.shm_.alloc_id_;
-
-    // Check if allocator ID is null (shouldn't happen for FutureShm)
-    if (alloc_id == hipc::AllocatorId::GetNull()) {
-      // Null allocator - FutureShm allocated in private memory (unusual)
-      HLOG(kInfo, "FreeFutureShm: Null allocator, skipping");
-      return;
-    }
-
-    // Explicitly call destructor (was constructed with placement new)
-    future_full->~FutureT();
-
-    // Cast FullPtr<FutureT> to FullPtr<char> for Free method
-    hipc::FullPtr<char> buffer_ptr = future_full.shm_.template Cast<char>();
-
-    // Check main allocator
-    if (main_allocator_ && alloc_id == main_allocator_id_) {
-      HLOG(kInfo, "FreeFutureShm: Freeing from main allocator");
-      main_allocator_->Free(buffer_ptr);
-      future_shm.SetNull();
-      return;
-    }
-
-    // Check per-process shared memory allocators via alloc_map_
-    u64 alloc_key = (static_cast<u64>(alloc_id.major_) << 32) |
-                    static_cast<u64>(alloc_id.minor_);
-    auto it = alloc_map_.find(alloc_key);
-    if (it != alloc_map_.end()) {
-      HLOG(kInfo, "FreeFutureShm: Freeing from per-process allocator");
-      it->second->Free(buffer_ptr);
-      future_shm.SetNull();
-      return;
-    }
-
-    HLOG(kWarning, "FreeFutureShm: No allocator found");
-  }
 
   /**
    * Create a Future for a task with optional serialization
@@ -968,10 +913,10 @@ void Future<TaskT, AllocT>::Wait() {
     // Call PostWait() callback on the task for post-completion actions
     task_ptr_->PostWait();
 
-    // Free the FutureShm object using the correct allocator
-    // FutureShm is allocated from per-process shared memory, look up by
-    // alloc_id
-    CHI_IPC->FreeFutureShm(future_shm_);
+    // Free the FutureShm buffer (allocated with AllocateBuffer)
+    // Cast ShmPtr<FutureShm> to ShmPtr<char> for FreeBuffer
+    hipc::ShmPtr<char> buffer_shm = future_shm_.template Cast<char>();
+    CHI_IPC->FreeBuffer(buffer_shm);
     future_shm_.SetNull();
   }
 }
@@ -984,9 +929,10 @@ void Future<TaskT, AllocT>::Destroy() {
     task_ptr_.SetNull();
   }
   // Also free FutureShm if it wasn't freed in Wait()
-  // FutureShm is allocated from per-process shared memory, look up by alloc_id
   if (!future_shm_.IsNull()) {
-    CHI_IPC->FreeFutureShm(future_shm_);
+    // Cast ShmPtr<FutureShm> to ShmPtr<char> for FreeBuffer
+    hipc::ShmPtr<char> buffer_shm = future_shm_.template Cast<char>();
+    CHI_IPC->FreeBuffer(buffer_shm);
     future_shm_.SetNull();
   }
   is_owner_ = false;
