@@ -2,15 +2,18 @@
 #define CHIMAERA_INCLUDE_CHIMAERA_MANAGERS_IPC_MANAGER_H_
 
 #include <atomic>
+#include <chrono>
 #include <iostream>
 #include <memory>
 #include <mutex>
 #include <random>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
 #include "chimaera/chimaera_manager.h"
+#include "chimaera/corwlock.h"
 #include "chimaera/local_task_archives.h"
 #include "chimaera/scheduler/scheduler.h"
 #include "chimaera/task.h"
@@ -181,6 +184,35 @@ class IpcManager {
   FullPtr<char> AllocateBuffer(size_t size);
 
   /**
+   * Allocate and construct a typed object in shared memory
+   * Calls AllocateBuffer(sizeof(T)) and constructs object in-place using placement new
+   * @tparam T The type of object to allocate
+   * @tparam Args Constructor argument types
+   * @param args Arguments to pass to the constructor
+   * @return FullPtr<T> to the newly constructed object
+   */
+  template <typename T, typename... Args>
+  hipc::FullPtr<T> AllocateObj(Args&&... args) {
+    // Allocate memory for the object
+    hipc::FullPtr<char> buffer = AllocateBuffer(sizeof(T));
+    if (buffer.IsNull()) {
+      return hipc::FullPtr<T>();
+    }
+
+    // Construct the object in-place using placement new
+    T* ptr = new (buffer.ptr_) T(std::forward<Args>(args)...);
+    if (!ptr) {
+      FreeBuffer(buffer);
+      return hipc::FullPtr<T>();
+    }
+
+    // Return FullPtr<T> with same allocator info as the buffer
+    return hipc::FullPtr<T>(buffer.alloc_, hipc::ShmPtr<T>(
+        buffer.shm_.alloc_id_,
+        hipc::ShmOffset(reinterpret_cast<uintptr_t>(ptr))));
+  }
+
+  /**
    * Free buffer from appropriate memory segment
    * Client uses cdata segment, runtime uses rdata segment
    * @param buffer_ptr FullPtr to buffer to free
@@ -241,6 +273,20 @@ class IpcManager {
          "FreeFutureShm: Could not find allocator for alloc_id ({}.{})",
          alloc_id.major_, alloc_id.minor_);
   }
+
+  /**
+   * Create a Future for a task with optional serialization
+   * Used internally by Send and as a public interface for future creation
+   *
+   * Two execution paths:
+   * - Client mode OR force_copy: Serialize the task into the Future
+   * - Runtime mode without force_copy: Wrap task_ptr directly without serialization
+   *
+   * @param task_ptr Task to wrap in Future
+   * @param force_copy If true, always serialize the task regardless of mode
+   * @return Future<Task> wrapping the task
+   */
+  Future<Task> MakeFuture(hipc::FullPtr<Task> task_ptr, bool force_copy = false);
 
   /**
    * Send task asynchronously (serializes into Future)
@@ -372,7 +418,8 @@ class IpcManager {
    * Called after Future::Wait() has confirmed task completion
    *
    * Two execution paths:
-   * - Client mode (!IsRuntime): Deserialize task outputs from FutureShm
+   * - Path 1 (fits): Data fits in serialized_task_capacity, deserialize directly
+   * - Path 2 (streaming): Data larger than capacity, assemble from stream
    * - Runtime mode (IsRuntime): No-op (task already has correct outputs)
    *
    * @param future Future containing completed task
@@ -384,12 +431,57 @@ class IpcManager {
       auto &future_shm = future.GetFutureShm();
       TaskT *task_ptr = future.get();
 
-      // Get the serialized task data from FutureShm
-      hipc::vector<char, CHI_MAIN_ALLOC_T> &serialized =
-          future_shm->serialized_task_;
+      // Check if data fits in copy space or requires streaming
+      size_t output_size = future_shm->output_size_;
+      size_t copy_space_capacity = future_shm->serialized_task_.capacity();
 
-      // Convert hipc::vector to std::vector for LocalLoadTaskArchive
-      std::vector<char> buffer(serialized.begin(), serialized.end());
+      std::vector<char> buffer;
+
+      if (output_size == 0 || output_size <= copy_space_capacity) {
+        // Path 1: Data fits in copy space - deserialize directly
+        hipc::vector<char, CHI_MAIN_ALLOC_T> &serialized =
+            future_shm->serialized_task_;
+        buffer.assign(serialized.begin(), serialized.end());
+      } else {
+        // Path 2: Data larger than copy space - assemble from streaming
+        // Preallocate vector with output_size_
+        buffer.reserve(output_size);
+
+        // Loop: wait for FUTURE_NEW_DATA, copy from copy space, unset flag
+        size_t bytes_received = 0;
+        while (bytes_received < output_size) {
+          // Wait for FUTURE_NEW_DATA to be set (worker has data in copy space)
+          hshm::Timepoint start_time;
+          start_time.Now();
+          while (!future_shm->is_complete_.Test(FutureShm<CHI_MAIN_ALLOC_T>::FUTURE_NEW_DATA)) {
+            // Check timeout (avoid infinite wait)
+            double elapsed_us = start_time.GetUsecFromStart();
+            if (elapsed_us > 5000000.0) {  // 5 second timeout
+              HLOG(kError, "Recv: Timeout waiting for FUTURE_NEW_DATA from worker");
+              break;
+            }
+            HSHM_THREAD_MODEL->Yield();
+          }
+
+          // Copy data from copy space into buffer
+          hipc::vector<char, CHI_MAIN_ALLOC_T> &copy_space =
+              future_shm->serialized_task_;
+          size_t bytes_to_copy = std::min(copy_space.size(),
+                                          output_size - bytes_received);
+          buffer.insert(buffer.end(), copy_space.begin(),
+                       copy_space.begin() + bytes_to_copy);
+          bytes_received += bytes_to_copy;
+
+          // Unset FUTURE_NEW_DATA to signal worker that we consumed the data
+          future_shm->is_complete_.Unset(FutureShm<CHI_MAIN_ALLOC_T>::FUTURE_NEW_DATA);
+
+          // Continue to next chunk if needed
+          if (bytes_received < output_size) {
+            // Wait a bit before polling for next chunk
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+          }
+        }
+      }
 
       // Create LocalLoadTaskArchive with kSerializeOut mode
       LocalLoadTaskArchive archive(buffer);
@@ -538,6 +630,7 @@ class IpcManager {
    * pointer)
    * 2. Main allocator - runtime shared memory for queues/futures
    * 3. Per-process shared memory allocators via alloc_map_
+   * Acquires reader lock on allocator_map_lock_ for thread-safe access
    * @param shm_ptr The ShmPtr to convert
    * @return FullPtr with matching allocator and pointer, or null FullPtr if no
    * match
@@ -558,6 +651,10 @@ class IpcManager {
     }
 
     // Case 3: Check per-process shared memory allocators via alloc_map_
+    // Acquire reader lock for thread-safe access to allocator_map_
+    allocator_map_lock_.ReadLock();
+    auto lock_guard = hshm::ScopeGuard([this]() { allocator_map_lock_.ReadUnlock(); });
+
     // Convert AllocatorId to lookup key (combine major and minor)
     u64 alloc_key = (static_cast<u64>(shm_ptr.alloc_id_.major_) << 32) |
                     static_cast<u64>(shm_ptr.alloc_id_.minor_);
@@ -576,6 +673,7 @@ class IpcManager {
    * Checks main allocator first, then per-process allocators
    * If no allocator contains the pointer, returns a FullPtr with null allocator
    * (private memory)
+   * Acquires reader lock on allocator_map_lock_ for thread-safe access
    * @param ptr The raw pointer to convert
    * @return FullPtr with matching allocator and pointer, or FullPtr with null
    * allocator if no match (private memory)
@@ -592,6 +690,10 @@ class IpcManager {
     }
 
     // Check per-process shared memory allocators
+    // Acquire reader lock for thread-safe access
+    allocator_map_lock_.ReadLock();
+    auto lock_guard = hshm::ScopeGuard([this]() { allocator_map_lock_.ReadUnlock(); });
+
     for (auto *alloc : alloc_vector_) {
       if (alloc && alloc->ContainsPtr(ptr)) {
         return hipc::FullPtr<T>(alloc, ptr);
@@ -841,8 +943,16 @@ class IpcManager {
    * Map of AllocatorId -> Allocator for all registered shared memory segments
    * Key is the allocator ID (major.minor), value is the allocator pointer
    * Used by ToFullPtr to find the correct allocator for a ShmPtr
+   * Protected by allocator_map_lock_ for thread-safe access
    */
   std::unordered_map<u64, hipc::MultiProcessAllocator *> alloc_map_;
+
+  /**
+   * RwLock for protecting allocator_map_ access
+   * Reader lock: for normal ToFullPtr lookups and allocation attempts
+   * Writer lock: for IpcManager cleanup and memory increase operations
+   */
+  chi::CoRwLock allocator_map_lock_;
 
   /**
    * Vector of allocators owned by this process

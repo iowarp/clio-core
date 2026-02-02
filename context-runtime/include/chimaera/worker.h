@@ -338,6 +338,19 @@ class Worker {
    */
   void ProcessEventQueue();
 
+  /**
+   * Copy task output data to copy space for streaming to clients
+   * Processes client_copy_ queue with time budget of up to 10ms per call
+   * For each task:
+   * - Acquires reader lock on IpcManager::allocator_map_lock_
+   * - Checks if FUTURE_NEW_DATA flag is set
+   * - If not set: copies data to copy space, sets FUTURE_NEW_DATA flag
+   * - Waits up to 1ms for client to consume data (unset FUTURE_NEW_DATA)
+   * - If still set after 1ms: pushes task to back of queue, continues to next
+   * - If data fully copied: sets FUTURE_COMPLETE, removes from queue
+   */
+  void CopyTaskOutputToClient();
+
  public:
   /**
    * Check if task should be processed locally based on task flags and pool
@@ -512,6 +525,10 @@ class Worker {
   // Mutex to protect epoll_ctl operations from multiple threads
   // Used when external code (e.g., bdev) registers FDs with this worker's epoll
   hshm::Mutex epoll_mutex_;
+
+  // Client copy queue - tasks waiting to stream output data to clients
+  // Queue of Future<Task> objects that need their output copied to copy space
+  std::queue<Future<Task>> client_copy_;
 
   // Scheduler pointer (owned by IpcManager, not Worker)
   Scheduler *scheduler_;

@@ -454,9 +454,7 @@ class Future {
   /**
    * Constructor with allocator - allocates new FutureShm
    * @param alloc Allocator to use for FutureShm allocation
-   * @param task_ptr FullPtr to the task (wraps private memory with null
-   * allocator)
-   * @deprecated Use CHI_IPC->AllocateObj<FutureShm>() instead
+   * @param task_ptr FullPtr to the task (wraps private memory with null allocator)
    */
   Future(AllocT* alloc, hipc::FullPtr<TaskT> task_ptr)
       : task_ptr_(task_ptr), parent_task_(nullptr), is_owner_(false) {
@@ -473,20 +471,6 @@ class Future {
       }
     }
   }
-
-  /**
-   * Constructor with allocator and existing FutureShm
-   * @param alloc Allocator (for FullPtr construction)
-   * @param task_ptr FullPtr to the task (wraps private memory with null
-   * allocator)
-   * @param future_shm ShmPtr to existing FutureShm object
-   */
-  Future(AllocT* alloc, hipc::FullPtr<TaskT> task_ptr,
-         hipc::ShmPtr<FutureT> future_shm)
-      : task_ptr_(task_ptr),
-        future_shm_(alloc, future_shm),
-        parent_task_(nullptr),
-        is_owner_(false) {}
 
   /**
    * Constructor from FullPtr<FutureShm> and FullPtr<Task>

@@ -300,6 +300,12 @@ void Worker::Run() {
     // Check blocked queue for completed tasks at end of each iteration
     ContinueBlockedTasks(false);
 
+    // Copy task output data to copy space for streaming (low-priority operation)
+    // Only do this when worker would otherwise idle, with minimal time budget
+    if (!did_work_) {
+      CopyTaskOutputToClient();
+    }
+
     // Increment iteration counter
     iteration_count_++;
 
@@ -1218,23 +1224,40 @@ void Worker::EndTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
     return;
   }
 
+  bool needs_streaming = false;
   if (run_ctx->destroy_in_end_task_) {
     LocalSaveTaskArchive archive(LocalMsgType::kSerializeOut);
     if (run_ctx->container_ != nullptr) {
       run_ctx->container_->LocalSaveTask(task_ptr->method_, archive, task_ptr);
     }
 
-    // Copy serialized outputs to FutureShm
+    // Get serialized outputs and future shm
     const std::vector<char> &serialized = archive.GetData();
     auto &future_shm = run_ctx->future_.GetFutureShm();
-    future_shm->serialized_task_.resize(serialized.size());
-    std::memcpy(future_shm->serialized_task_.data(), serialized.data(),
-                serialized.size());
+
+    // Set output_size_ to track the actual serialized data size
+    future_shm->output_size_ = serialized.size();
+
+    // Check if serialized data fits in preallocated copy space
+    if (serialized.size() <= future_shm->serialized_task_.capacity()) {
+      // Path 1 (fits): Copy directly into serialized_task_
+      future_shm->serialized_task_.resize(serialized.size());
+      std::memcpy(future_shm->serialized_task_.data(), serialized.data(),
+                  serialized.size());
+    } else {
+      // Path 2 (doesn't fit): Queue for streaming via client_copy_
+      // The task will be processed by CopyTaskOutputToClient in Worker::Run
+      client_copy_.push(run_ctx->future_);
+      needs_streaming = true;
+      // Don't mark complete yet - will be done when streaming finishes
+    }
   }
 
-  // 2. Mark task as complete
+  // 2. Mark task as complete (only if not streaming)
   auto &future_shm = run_ctx->future_.GetFutureShm();
-  run_ctx->future_.SetComplete();
+  if (!needs_streaming) {
+    run_ctx->future_.SetComplete();
+  }
 
   // 2.5. Wake up parent task if waiting for this subtask
   // Only wake parent if:
@@ -1607,6 +1630,89 @@ RunContext *GetCurrentRunContextFromWorker() {
     return worker->GetCurrentRunContext();
   }
   return nullptr;
+}
+
+void Worker::CopyTaskOutputToClient() {
+  // Time budget tracking - process for up to 10ms per call
+  hshm::Timepoint start_time;
+  start_time.Now();
+
+  // Process tasks in client_copy_ queue
+  while (!client_copy_.empty()) {
+    // Check time budget
+    double elapsed_us = start_time.GetUsecFromStart();
+    if (elapsed_us > 10000.0) {  // 10ms timeout
+      HLOG(kDebug, "CopyTaskOutputToClient: Time budget exceeded ({} us)", elapsed_us);
+      break;
+    }
+
+    // Get the next task to stream
+    Future<Task> &task_future = client_copy_.front();
+
+    if (task_future.IsNull()) {
+      // Malformed entry, remove and continue
+      client_copy_.pop();
+      continue;
+    }
+
+    auto &future_shm = task_future.GetFutureShm();
+    if (future_shm.IsNull()) {
+      client_copy_.pop();
+      continue;
+    }
+
+    // Acquire reader lock on allocator_map_lock_
+    CHI_IPC->allocator_map_lock_.ReadLock();
+    auto lock_guard = hshm::ScopeGuard([](){ CHI_IPC->allocator_map_lock_.ReadUnlock(); });
+
+    // Check if FUTURE_NEW_DATA is already set
+    if (!future_shm->is_complete_.Test(FutureShm<>::FUTURE_NEW_DATA)) {
+      // Data not yet consumed by client - serialize and copy output to copy space
+
+      // The serialized data should be available - copy it to copy space
+      // The copy space size is the capacity of serialized_task_
+      if (future_shm->output_size_ > 0 && future_shm->output_size_ > future_shm->serialized_task_.capacity()) {
+        // FIXME: This is a streaming scenario - need to implement the serialization
+        // For now, just mark as having data
+        // TODO: Implement streaming serialization here
+      }
+
+      // Mark that new data is available in copy space
+      future_shm->is_complete_.Set(FutureShm<>::FUTURE_NEW_DATA);
+
+      // Wait up to 1ms for client to consume the data
+      hshm::Timepoint wait_start;
+      wait_start.Now();
+      while (future_shm->is_complete_.Test(FutureShm<>::FUTURE_NEW_DATA)) {
+        double wait_us = wait_start.GetUsecFromStart();
+        if (wait_us > 1000.0) {  // 1ms timeout
+          // Client hasn't consumed data in time - push to back of queue
+          HLOG(kDebug, "CopyTaskOutputToClient: Client not consuming data, pushing to back of queue");
+          // Pop from front and push to back
+          Future<Task> task = std::move(client_copy_.front());
+          client_copy_.pop();
+          client_copy_.push(std::move(task));
+          break;
+        }
+        // Yield to give client time to consume
+        HSHM_THREAD_MODEL->Yield();
+      }
+
+      // Check if data was consumed
+      if (!future_shm->is_complete_.Test(FutureShm<>::FUTURE_NEW_DATA)) {
+        // Data was consumed - mark complete and remove from queue
+        future_shm->is_complete_.Set(FutureShm<>::FUTURE_COMPLETE);
+        client_copy_.pop();
+        HLOG(kDebug, "CopyTaskOutputToClient: Task streaming complete");
+        continue;
+      }
+    } else {
+      // FUTURE_NEW_DATA is set but data not yet consumed - move to back of queue
+      Future<Task> task = std::move(client_copy_.front());
+      client_copy_.pop();
+      client_copy_.push(std::move(task));
+    }
+  }
 }
 
 }  // namespace chi

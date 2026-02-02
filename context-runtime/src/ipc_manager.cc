@@ -955,6 +955,10 @@ bool IpcManager::TryPopNetTask(NetQueuePriority priority, Future<Task>& future) 
 
 bool IpcManager::IncreaseMemory(size_t size) {
   std::lock_guard<std::mutex> lock(shm_mutex_);
+  // Acquire writer lock on allocator_map_lock_ during memory increase
+  // This ensures exclusive access to the allocator_map_ structures
+  allocator_map_lock_.WriteLock();
+  auto lock_guard = hshm::ScopeGuard([this]() { allocator_map_lock_.WriteUnlock(); });
 
   pid_t pid = getpid();
   u32 index = shm_count_.fetch_add(1, std::memory_order_relaxed);
@@ -1022,6 +1026,9 @@ bool IpcManager::IncreaseMemory(size_t size) {
 
 bool IpcManager::RegisterMemory(const hipc::AllocatorId &alloc_id, size_t shm_size) {
   std::lock_guard<std::mutex> lock(shm_mutex_);
+  // Acquire writer lock on allocator_map_lock_ during memory registration
+  allocator_map_lock_.WriteLock();
+  auto lock_guard = hshm::ScopeGuard([this]() { allocator_map_lock_.WriteUnlock(); });
 
   // Derive shm_name from alloc_id: chimaera_{pid}_{index}
   pid_t owner_pid = static_cast<pid_t>(alloc_id.major_);
@@ -1104,6 +1111,9 @@ ClientShmInfo IpcManager::GetClientShmInfo(u32 index) const {
 
 size_t IpcManager::WreapDeadIpcs() {
   std::lock_guard<std::mutex> lock(shm_mutex_);
+  // Acquire writer lock on allocator_map_lock_ during reaping
+  allocator_map_lock_.WriteLock();
+  auto lock_guard = hshm::ScopeGuard([this]() { allocator_map_lock_.WriteUnlock(); });
 
   pid_t current_pid = getpid();
   size_t reaped_count = 0;
@@ -1195,6 +1205,9 @@ size_t IpcManager::WreapDeadIpcs() {
 
 size_t IpcManager::WreapAllIpcs() {
   std::lock_guard<std::mutex> lock(shm_mutex_);
+  // Acquire writer lock on allocator_map_lock_ during cleanup
+  allocator_map_lock_.WriteLock();
+  auto lock_guard = hshm::ScopeGuard([this]() { allocator_map_lock_.WriteUnlock(); });
 
   size_t reaped_count = 0;
 
@@ -1326,6 +1339,43 @@ size_t IpcManager::ClearUserIpcs() {
   }
 
   return removed_count;
+}
+
+Future<Task> IpcManager::MakeFuture(hipc::FullPtr<Task> task_ptr,
+                                    bool force_copy) {
+  if (!CHI_CHIMAERA_MANAGER->IsRuntime() || force_copy) {
+    // CLIENT PATH or FORCE COPY: Serialize the task into Future
+    // Get allocator from per-process shared memory
+    CHI_MAIN_ALLOC_T *alloc = last_alloc_;
+    size_t shm_size = 0;
+    if (alloc != nullptr) {
+      shm_size = alloc->GetBackend().backend_size_;
+    }
+
+    // Create Future with allocator and task_ptr
+    Future<Task> future(alloc, task_ptr);
+
+    // Serialize task using LocalSaveTaskArchive with kSerializeIn mode
+    LocalSaveTaskArchive archive(LocalMsgType::kSerializeIn);
+    archive << (*task_ptr.ptr_);
+
+    // Get serialized data and copy to FutureShm's hipc::vector
+    const std::vector<char> &serialized = archive.GetData();
+    auto &future_shm = future.GetFutureShm();
+    future_shm->serialized_task_.resize(serialized.size());
+    memcpy(future_shm->serialized_task_.data(), serialized.data(),
+           serialized.size());
+
+    // Set shm_size for lazy registration by worker
+    future_shm->shm_size_ = shm_size;
+
+    return future;
+  } else {
+    // RUNTIME PATH: Create Future with task pointer directly (no serialization)
+    CHI_MAIN_ALLOC_T *alloc = last_alloc_;
+    Future<Task> future(alloc, task_ptr);
+    return future;
+  }
 }
 
 } // namespace chi
