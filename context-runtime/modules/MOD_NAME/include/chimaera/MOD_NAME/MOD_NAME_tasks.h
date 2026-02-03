@@ -56,7 +56,8 @@ struct CustomTask : public chi::Task {
   /** SHM default constructor */
   CustomTask()
       : chi::Task(),
-        data_(HSHM_MALLOC), operation_id_(0) {}
+        data_(HSHM_MALLOC), operation_id_(0) {
+  }
 
   /** Emplace constructor */
   explicit CustomTask(
@@ -73,6 +74,10 @@ struct CustomTask : public chi::Task {
     method_ = Method::kCustom;
     task_flags_.Clear();
     pool_query_ = pool_query;
+  }
+
+  /** Destructor */
+  ~CustomTask() {
   }
 
   /**
@@ -100,11 +105,15 @@ struct CustomTask : public chi::Task {
    * @param other Pointer to the source task to copy from
    */
   void Copy(const hipc::FullPtr<CustomTask> &other) {
+    HLOG(kInfo, "CustomTask::Copy() - ENTRY, this={}, other={}, this.data_.data()={}, other.data_.data()={}",
+         (void*)this, (void*)other.ptr_, (void*)data_.data(), (void*)other->data_.data());
     // Copy base Task fields
     Task::Copy(other.template Cast<Task>());
     // Copy CustomTask-specific fields
     data_ = other->data_;
     operation_id_ = other->operation_id_;
+    HLOG(kInfo, "CustomTask::Copy() - EXIT, this={}, this.data_.data()={}",
+         (void*)this, (void*)data_.data());
   }
 
   /**

@@ -330,8 +330,12 @@ class IpcManager {
    */
   template <typename TaskT>
   void Recv(Future<TaskT> &future) {
-    if (!CHI_CHIMAERA_MANAGER->IsRuntime()) {
+    bool is_runtime = CHI_CHIMAERA_MANAGER->IsRuntime();
+    HLOG(kInfo, "Recv: ENTRY, IsRuntime()={}, task_ptr={}", is_runtime, (void*)future.get());
+
+    if (!is_runtime) {
       // CLIENT PATH: Deserialize task outputs from FutureShm
+      HLOG(kInfo, "Recv: Taking CLIENT PATH - will deserialize");
       auto future_shm = future.GetFutureShm();
       TaskT *task_ptr = future.get();
 
@@ -403,10 +407,15 @@ class IpcManager {
       archive.SetMsgType(LocalMsgType::kSerializeOut);
 
       // Deserialize task outputs into the Future's task pointer
+      HLOG(kInfo, "Recv: About to deserialize into task_ptr={}", (void*)task_ptr);
       archive >> (*task_ptr);
+      HLOG(kInfo, "Recv: Deserialization complete");
+    } else {
+      // RUNTIME PATH: No deserialization needed - task already has correct
+      // outputs
+      HLOG(kInfo, "Recv: RUNTIME PATH - skipping deserialization");
     }
-    // RUNTIME PATH: No deserialization needed - task already has correct
-    // outputs
+    HLOG(kInfo, "Recv: EXIT");
   }
 
   /**

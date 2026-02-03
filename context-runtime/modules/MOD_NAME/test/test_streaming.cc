@@ -36,20 +36,26 @@ constexpr chi::u32 kTestTimeoutMs = 30000; // 30 second timeout for streaming te
 constexpr chi::u32 kMaxRetries = 100;
 constexpr chi::u32 kRetryDelayMs = 50;
 
-// Test pool ID generator - avoid hardcoding, use dynamic generation
-chi::PoolId generateTestPoolId() {
-  // Generate pool ID based on current time to avoid conflicts
-  auto now = std::chrono::high_resolution_clock::now();
-  auto duration = now.time_since_epoch();
-  auto microseconds =
-      std::chrono::duration_cast<std::chrono::microseconds>(duration).count();
-  // Use lower 32 bits to avoid overflow, add offset to avoid admin pool range
-  return chi::PoolId(static_cast<chi::u32>(microseconds & 0xFFFFFFFF) + 1000,
-                     0);
-}
-
 // Global test state
 bool g_initialized = false;
+chi::PoolId g_test_pool_id = chi::PoolId::GetNull();
+
+// Get shared pool ID for all streaming tests (generated once)
+chi::PoolId getSharedTestPoolId() {
+  if (g_test_pool_id.IsNull()) {
+    // Generate pool ID based on current time to avoid conflicts
+    auto now = std::chrono::high_resolution_clock::now();
+    auto duration = now.time_since_epoch();
+    auto microseconds =
+        std::chrono::duration_cast<std::chrono::microseconds>(duration).count();
+    // Use lower 32 bits to avoid overflow, add offset to avoid admin pool range
+    g_test_pool_id = chi::PoolId(static_cast<chi::u32>(microseconds & 0xFFFFFFFF) + 1000, 0);
+    INFO("Generated shared pool ID: " << g_test_pool_id.ToU64());
+  } else {
+    INFO("Reusing shared pool ID: " << g_test_pool_id.ToU64());
+  }
+  return g_test_pool_id;
+}
 
 } // namespace
 
@@ -59,7 +65,7 @@ bool g_initialized = false;
  */
 class StreamingTestFixture {
 public:
-  StreamingTestFixture() : test_pool_id_(generateTestPoolId()) {
+  StreamingTestFixture() : test_pool_id_(getSharedTestPoolId()) {
     // Initialize Chimaera once per test suite
     if (!g_initialized) {
       INFO("Initializing Chimaera for streaming tests...");
@@ -167,12 +173,10 @@ public:
       auto create_task =
           mod_name_client.AsyncCreate(pool_query, mod_pool_name, test_pool_id_);
       create_task.Wait();
-      mod_name_client.pool_id_ = create_task->new_pool_id_;
-      mod_name_client.return_code_ = create_task->return_code_;
       bool mod_success = (create_task->return_code_ == 0);
       REQUIRE(mod_success);
 
-      INFO("MOD_NAME pool created successfully with dynamic ID: "
+      INFO("MOD_NAME pool created successfully with ID: "
            << test_pool_id_.ToU64());
       return true;
 

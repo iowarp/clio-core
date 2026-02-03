@@ -881,10 +881,13 @@ void IpcManager::FreeBuffer(FullPtr<char> buffer_ptr) {
 
   // Check if allocator ID is null (private memory allocated with HSHM_MALLOC)
   if (buffer_ptr.shm_.alloc_id_ == hipc::AllocatorId::GetNull()) {
-    // Private memory - use HSHM_MALLOC->Free() to properly deallocate
+    // Private memory - use HSHM_MALLOC->Free() for RUNTIME-allocated buffers
+    // In RUNTIME mode, AllocateBuffer uses HSHM_MALLOC which adds MallocPage header
     HLOG(kInfo,
-         "FreeBuffer: Using HSHM_MALLOC->Free() for private memory at ptr_={}",
-         (void *)buffer_ptr.ptr_);
+         "FreeBuffer: Freeing NULL allocator ID buffer - ptr_={}, off_={}",
+         (void *)buffer_ptr.ptr_, buffer_ptr.shm_.off_.load());
+
+    // HSHM_MALLOC->Free() expects a FullPtr and will handle MallocPage header
     HSHM_MALLOC->Free(buffer_ptr);
     return;
   }
@@ -1440,6 +1443,7 @@ Future<Task> IpcManager::MakeFuture(hipc::FullPtr<Task> task_ptr,
 
     // Serialize task using LocalSaveTaskArchive with kSerializeIn mode
     LocalSaveTaskArchive archive(LocalMsgType::kSerializeIn);
+    HLOG(kInfo, "MakeFuture: CLIENT PATH - About to serialize task_ptr={}", (void*)task_ptr.ptr_);
     archive << (*task_ptr.ptr_);
 
     // Get serialized data and copy to FutureShm's copy_space
@@ -1448,6 +1452,14 @@ Future<Task> IpcManager::MakeFuture(hipc::FullPtr<Task> task_ptr,
     HLOG(kInfo,
          "MakeFuture: CLIENT PATH - Serialized {} bytes, copy_space_size={}",
          serialized_size, copy_space_size);
+    if (serialized_size >= 16) {
+      HLOG(kInfo,
+           "MakeFuture: CLIENT PATH - Serialized data (first 16 bytes): {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}",
+           (unsigned char)serialized[0], (unsigned char)serialized[1], (unsigned char)serialized[2], (unsigned char)serialized[3],
+           (unsigned char)serialized[4], (unsigned char)serialized[5], (unsigned char)serialized[6], (unsigned char)serialized[7],
+           (unsigned char)serialized[8], (unsigned char)serialized[9], (unsigned char)serialized[10], (unsigned char)serialized[11],
+           (unsigned char)serialized[12], (unsigned char)serialized[13], (unsigned char)serialized[14], (unsigned char)serialized[15]);
+    }
     if (serialized_size >= 8) {
       HLOG(kInfo,
            "MakeFuture: CLIENT PATH - First 8 bytes: {} {} {} {} {} {} {} {}",

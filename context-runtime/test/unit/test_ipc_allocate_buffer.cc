@@ -200,9 +200,11 @@ TEST_CASE("CHI_IPC AllocateBuffer client vs runtime behavior",
   auto* chimaera_manager = CHI_CHIMAERA_MANAGER;
   REQUIRE(chimaera_manager != nullptr);
 
-  SECTION("Client mode allocation") {
-    // In client mode, should use client data segment
-    REQUIRE_FALSE(chimaera_manager->IsRuntime());
+  SECTION("Colocated client mode allocation") {
+    // In colocated mode (client with runtime), both client and runtime are available
+    // AllocateBuffer should work correctly regardless of mode
+    REQUIRE(chimaera_manager->IsRuntime());  // Colocated mode has runtime
+    REQUIRE(chimaera_manager->IsClient());   // And client
 
     hipc::FullPtr<char> buffer = ipc_manager->AllocateBuffer(100);
     REQUIRE_FALSE(buffer.IsNull());

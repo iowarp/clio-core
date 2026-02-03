@@ -11,10 +11,12 @@ namespace hshm::ipc {
  * Stored before each allocated block
  */
 struct MallocPage {
-  size_t page_size_;  // Size of this allocation including header
+  static constexpr uint64_t MAGIC = 0xDEADBEEFCAFEBABEULL;
+  uint64_t magic_;        // Magic number to change alignment
+  size_t page_size_;      // Size of this allocation including header
 
-  MallocPage() : page_size_(0) {}
-  explicit MallocPage(size_t size) : page_size_(size) {}
+  MallocPage() : magic_(MAGIC), page_size_(0) {}
+  explicit MallocPage(size_t size) : magic_(MAGIC), page_size_(size) {}
 };
 
 /**

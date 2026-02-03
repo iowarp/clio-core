@@ -541,7 +541,8 @@ chi::TaskResume Runtime::Send(hipc::FullPtr<SendTask> task,
     // Get the original task from the Future
     auto origin_task = queued_future.GetTaskPtr();
     if (!origin_task.IsNull()) {
-      HLOG(kInfo, "Send: Popped SendIn task {} from net queue", origin_task->task_id_);
+      HLOG(kInfo, "Send: Popped SendIn task {} from net queue",
+           origin_task->task_id_);
       SendIn(origin_task, rctx);
       did_send = true;
     }
@@ -553,18 +554,15 @@ chi::TaskResume Runtime::Send(hipc::FullPtr<SendTask> task,
     // Get the original task from the Future
     auto origin_task = queued_future.GetTaskPtr();
     if (!origin_task.IsNull()) {
-      HLOG(kInfo, "Send: Popped SendOut task {} from net queue", origin_task->task_id_);
+      HLOG(kInfo, "Send: Popped SendOut task {} from net queue",
+           origin_task->task_id_);
       SendOut(origin_task);
       did_send = true;
     }
   }
 
   // Track whether this execution did actual work
-  if (did_send) {
-    rctx.did_work_ = true;
-  } else {
-    rctx.did_work_ = false;
-  }
+  rctx.did_work_ = did_send;
 
   task->SetReturnCode(0);
   co_return;
@@ -859,7 +857,8 @@ chi::TaskResume Runtime::Recv(hipc::FullPtr<RecvTask> task,
 
   // Dispatch based on message type
   chi::MsgType msg_type = archive.GetMsgType();
-  HLOG(kInfo, "Recv: Received message with type {}", static_cast<int>(msg_type));
+  HLOG(kInfo, "Recv: Received message with type {}",
+       static_cast<int>(msg_type));
   switch (msg_type) {
     case chi::MsgType::kSerializeIn:
       HLOG(kInfo, "Recv: Processing SerializeIn message");
