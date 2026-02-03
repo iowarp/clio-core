@@ -443,6 +443,7 @@ target_include_directories(${AUTOGEN_COVERAGE_TEST_TARGET} PRIVATE
   ${CHIMAERA_ROOT}/test  # For simple_test.h
   ${CHIMAERA_ROOT}/modules/admin/include  # For admin tasks
   ${CHIMAERA_ROOT}/modules/bdev/include   # For bdev tasks
+  ${CHIMAERA_ROOT}/modules/MOD_NAME/include  # For MOD_NAME tasks
   ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include  # For CTE core tasks
   ${CMAKE_SOURCE_DIR}/context-assimilation-engine/core/include  # For CAE core tasks
 )
@@ -453,6 +454,8 @@ target_link_libraries(${AUTOGEN_COVERAGE_TEST_TARGET}
   chimaera_admin_client           # Admin module client
   chimaera_bdev_runtime           # Bdev module runtime
   chimaera_bdev_client            # Bdev module client
+  chimaera_MOD_NAME_runtime       # MOD_NAME module runtime
+  chimaera_MOD_NAME_client        # MOD_NAME module client
   wrp_cte_core_runtime            # CTE core runtime (for CTE tasks)
   wrp_cte_core_client             # CTE core client (for CTE tasks)
   wrp_cae_core_runtime            # CAE core runtime (for CAE tasks)

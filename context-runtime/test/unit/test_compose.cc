@@ -98,16 +98,24 @@ TEST_CASE("Parse compose configuration", "[compose]") {
   // Get compose config
   const auto& compose_config = config_manager->GetComposeConfig();
 
-  // Verify compose section was parsed
-  REQUIRE(compose_config.pools_.size() == 1);
+  // Verify compose section was parsed - at least 1 pool should exist
+  // (there may be more from server initialization)
+  REQUIRE(compose_config.pools_.size() >= 1);
 
-  // Verify pool configuration
-  const auto& pool_config = compose_config.pools_[0];
-  REQUIRE(pool_config.mod_name_ == "chimaera_bdev");
-  REQUIRE(pool_config.pool_name_ == "/tmp/test_bdev.dat");
-  REQUIRE(pool_config.pool_id_.major_ == 200);
-  REQUIRE(pool_config.pool_id_.minor_ == 0);
-  REQUIRE(pool_config.pool_query_.IsDynamicMode());
+  // Find our test pool configuration (chimaera_bdev with pool_name /tmp/test_bdev.dat)
+  bool found_test_pool = false;
+  for (const auto& pool_config : compose_config.pools_) {
+    if (pool_config.mod_name_ == "chimaera_bdev" &&
+        pool_config.pool_name_ == "/tmp/test_bdev.dat") {
+      // Verify pool configuration
+      REQUIRE(pool_config.pool_id_.major_ == 200);
+      REQUIRE(pool_config.pool_id_.minor_ == 0);
+      REQUIRE(pool_config.pool_query_.IsDynamicMode());
+      found_test_pool = true;
+      break;
+    }
+  }
+  REQUIRE(found_test_pool);
 
   std::cout << "Parse compose config test passed\n";
 }
