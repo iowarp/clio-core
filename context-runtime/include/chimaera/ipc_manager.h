@@ -448,8 +448,21 @@ class IpcManager {
       auto future_shm = future.GetFutureShm();
       TaskT *task_ptr = future.get();
 
-      // Get output size from FutureShm
+      // Wait for first data to be available (signaled by FUTURE_NEW_DATA or
+      // FUTURE_COMPLETE) This ensures output_size_ is valid before we read it
+      hshm::abitfield32_t &flags = future_shm->flags_;
+      while (!flags.Any(FutureShm::FUTURE_NEW_DATA) &&
+             !flags.Any(FutureShm::FUTURE_COMPLETE)) {
+        HSHM_THREAD_MODEL->Yield();
+      }
+
+      // Memory fence: Ensure we see worker's writes to output_size_
+      std::atomic_thread_fence(std::memory_order_acquire);
+
+      // Get output size from FutureShm (now valid)
       size_t output_size = future_shm->output_size_.load();
+
+      HLOG(kInfo, "Recv: CLIENT PATH - output_size={}", output_size);
 
       // Use LocalTransfer to receive all data
       LocalTransfer receiver(future_shm, output_size);
@@ -459,6 +472,11 @@ class IpcManager {
       if (!recv_complete) {
         HLOG(kError, "Recv: LocalTransfer failed - received {}/{} bytes",
              receiver.GetBytesTransferred(), output_size);
+      }
+
+      // Wait for FUTURE_COMPLETE to ensure all data has been sent
+      while (!flags.Any(FutureShm::FUTURE_COMPLETE)) {
+        HSHM_THREAD_MODEL->Yield();
       }
 
       // Create LocalLoadTaskArchive with kSerializeOut mode
@@ -997,22 +1015,32 @@ void Future<TaskT, AllocT>::Wait() {
   is_owner_ = true;
 
   if (!task_ptr_.IsNull() && !future_shm_.IsNull()) {
-    // Wait for completion by polling flags bitfield
-    // Busy-wait with thread yielding - works for both client and runtime
-    // contexts Coroutine contexts should use co_await Future instead
     // Convert ShmPtr to FullPtr to access flags_
     hipc::FullPtr<FutureShm> future_full = CHI_IPC->ToFullPtr(future_shm_);
     if (future_full.IsNull()) {
       HLOG(kError, "Future::Wait: ToFullPtr returned null for future_shm_");
       return;
     }
-    hshm::abitfield32_t &flags = future_full->flags_;
-    while (!flags.Any(FutureShm::FUTURE_COMPLETE)) {
-      HSHM_THREAD_MODEL->Yield();
-    }
 
-    // Call IpcManager::Recv() to deserialize results (client path only)
-    CHI_IPC->Recv(*this);
+    // Determine path: client vs runtime
+    bool is_runtime = CHI_CHIMAERA_MANAGER->IsRuntime();
+    Worker *worker = CHI_CUR_WORKER;
+    bool use_runtime_path = is_runtime && worker != nullptr;
+
+    if (use_runtime_path) {
+      // RUNTIME PATH: Wait for FUTURE_COMPLETE first (task outputs are direct)
+      // No deserialization needed, just wait for completion signal
+      hshm::abitfield32_t &flags = future_full->flags_;
+      while (!flags.Any(FutureShm::FUTURE_COMPLETE)) {
+        HSHM_THREAD_MODEL->Yield();
+      }
+    } else {
+      // CLIENT PATH: Call Recv() first to handle streaming
+      // Recv() uses LocalTransfer which will consume chunks as they arrive
+      // FUTURE_COMPLETE will be set by worker after all data is sent
+      // Don't wait for FUTURE_COMPLETE first - that causes deadlock for streaming
+      CHI_IPC->Recv(*this);
+    }
 
     // Call PostWait() callback on the task for post-completion actions
     task_ptr_->PostWait();
