@@ -32,10 +32,4 @@ if (HSHM_ENABLE_OPENMP)
             ARCHIVE DESTINATION lib
             RUNTIME DESTINATION bin)
 
-    #-----------------------------------------------------------------------------
-    # Coverage
-    #-----------------------------------------------------------------------------
-    if(HSHM_ENABLE_COVERAGE)
-        set_coverage_flags(test_thread_exec)
-    endif()
 endif()

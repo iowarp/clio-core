@@ -98,15 +98,3 @@ install(TARGETS
         ARCHIVE DESTINATION lib
         RUNTIME DESTINATION bin)
 
-#-----------------------------------------------------------------------------
-# Coverage
-#-----------------------------------------------------------------------------
-if(HSHM_ENABLE_COVERAGE)
-    set_coverage_flags(test_sub_alloc_exec)
-    set_coverage_flags(test_arena_alloc_exec)
-    set_coverage_flags(test_buddy_allocator_exec)
-    set_coverage_flags(test_mp_allocator_exec)
-    set_coverage_flags(test_mp_allocator_multiprocess_exec)
-    set_coverage_flags(test_buddy_allocator_multiprocess_exec_2)
-    set_coverage_flags(test_hshm_malloc_exec)
-endif()

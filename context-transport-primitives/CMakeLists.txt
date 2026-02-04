@@ -215,7 +215,6 @@ function(hshm_target_compile_definitions target)
         HSHM_COMPILER_GNU=$<BOOL:${HSHM_COMPILER_GNU}>
         HSHM_ENABLE_WINDOWS_SYSINFO=$<BOOL:${HSHM_ENABLE_WINDOWS_SYSINFO}>
         HSHM_ENABLE_PROCFS_SYSINFO=$<BOOL:${HSHM_ENABLE_PROCFS_SYSINFO}>
-        HSHM_ENABLE_COVERAGE=$<BOOL:${HSHM_ENABLE_COVERAGE}>
         HSHM_ENABLE_DOXYGEN=$<BOOL:${HSHM_ENABLE_DOXYGEN}>
         HSHM_DEBUG_LOCK=$<BOOL:${HSHM_DEBUG_LOCK}>
         HSHM_DEFAULT_ALLOC_T=hipc::ThreadLocalAllocator
@@ -331,25 +330,6 @@ if(HSHM_ENABLE_DOXYGEN)
         COMMENT
         "HTML documentation"
     )
-endif()
-
-# ------------------------------------------------------------------------------
-# Code Coverage
-# ------------------------------------------------------------------------------
-if(NOT IS_HSHM_MAIN)
-    if(HSHM_ENABLE_COVERAGE)
-        set(COVERAGE_FLAGS "-fprofile-arcs -ftest-coverage" CACHE STRING
-            "Flags to the coverage program to perform coverage inspection")
-        mark_as_advanced(COVERAGE_FLAGS)
-
-        macro(set_coverage_flags target)
-            set_target_properties(${target}
-                PROPERTIES
-                COMPILE_FLAGS ${COVERAGE_FLAGS}
-                LINK_FLAGS ${COVERAGE_FLAGS}
-            )
-        endmacro()
-    endif()
 endif()
 
 if(NOT IS_HSHM_MAIN)

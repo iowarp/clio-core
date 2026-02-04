@@ -42,9 +42,3 @@ install(TARGETS
         RUNTIME DESTINATION bin)
 
 #------------------------------------------------------------------------------
-# Coverage
-#------------------------------------------------------------------------------
-
-if(HSHM_ENABLE_COVERAGE)
-    set_coverage_flags(test_compress_exec)
-endif()

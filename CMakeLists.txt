@@ -201,7 +201,8 @@ set(HSHM_ENABLE_ENCRYPT ${WRP_CORE_ENABLE_ENCRYPT} CACHE BOOL "Enable Encrypt (c
 set(HSHM_ENABLE_ELF ${WRP_CORE_ENABLE_ELF} CACHE BOOL "Enable ELF (controlled by WRP_CORE_ENABLE_ELF)" FORCE)
 set(HSHM_ENABLE_CUDA ${WRP_CORE_ENABLE_CUDA} CACHE BOOL "Enable CUDA (controlled by WRP_CORE_ENABLE_CUDA)" FORCE)
 set(HSHM_ENABLE_ROCM ${WRP_CORE_ENABLE_ROCM} CACHE BOOL "Enable ROCm (controlled by WRP_CORE_ENABLE_ROCM)" FORCE)
-set(HSHM_ENABLE_COVERAGE ${WRP_CORE_ENABLE_COVERAGE} CACHE BOOL "Enable Coverage (controlled by WRP_CORE_ENABLE_COVERAGE)" FORCE)
+# Note: Coverage is handled globally via add_compile_options when WRP_CORE_ENABLE_COVERAGE=ON
+# No need for component-level HSHM_ENABLE_COVERAGE
 
 # Also disable tests/benchmarks for disabled components
 if(NOT WRP_CORE_ENABLE_CTE)

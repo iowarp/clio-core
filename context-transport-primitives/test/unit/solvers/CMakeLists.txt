@@ -40,9 +40,3 @@ install(TARGETS
         ARCHIVE DESTINATION lib
         RUNTIME DESTINATION bin)
 
-# -----------------------------------------------------------------------------
-# Coverage
-# -----------------------------------------------------------------------------
-if(HSHM_ENABLE_COVERAGE)
-        set_coverage_flags(test_solvers_exec)
-endif()

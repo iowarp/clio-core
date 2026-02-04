@@ -32,10 +32,4 @@ if (HSHM_ENABLE_MPI)
             ARCHIVE DESTINATION lib
             RUNTIME DESTINATION bin)
 
-    #-----------------------------------------------------------------------------
-    # Coverage
-    #-----------------------------------------------------------------------------
-    if(HSHM_ENABLE_COVERAGE)
-        set_coverage_flags(test_backend_exec)
-    endif()
 endif()

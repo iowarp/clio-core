@@ -111,16 +111,3 @@ install(TARGETS
         ARCHIVE DESTINATION lib
         RUNTIME DESTINATION bin)
 
-#-----------------------------------------------------------------------------
-# Coverage
-#-----------------------------------------------------------------------------
-if(HSHM_ENABLE_COVERAGE)
-    set_coverage_flags(test_slist_pre_exec)
-    set_coverage_flags(test_rb_tree_pre_exec)
-    set_coverage_flags(test_vector_exec)
-    set_coverage_flags(test_ring_buffer_exec)
-    set_coverage_flags(test_ring_buffer_spsc_exec)
-    set_coverage_flags(test_ring_buffer_ext_exec)
-    set_coverage_flags(test_ring_buffer_mpsc_exec)
-    set_coverage_flags(test_multi_ring_buffer_exec)
-endif()

@@ -452,7 +452,7 @@ TEST_CASE("rb_tree_pre - Atomic Version", "[rb_tree_pre][atomic]") {
   MallocBackend backend;
   size_t arena_size = 10 * 1024 * 1024;
   auto *alloc = CreateTestAllocator<true>(backend, arena_size);
-  
+
 
   SECTION("Basic atomic operations") {
     pre::rb_tree<TestRBNode<int>, true> tree;
@@ -481,4 +481,211 @@ TEST_CASE("rb_tree_pre - Atomic Version", "[rb_tree_pre][atomic]") {
     REQUIRE(tree.size() == 13);
   }
 
+}
+
+TEST_CASE("rb_tree_pre - Deletion Edge Cases", "[rb_tree_pre][deletion]") {
+  MallocBackend backend;
+  size_t arena_size = 10 * 1024 * 1024;
+  auto *alloc = CreateTestAllocator<false>(backend, arena_size);
+
+  SECTION("Delete root node") {
+    pre::rb_tree<TestRBNode<int>, false> tree;
+    tree.Init();
+
+    // Insert root and two children
+    auto root = alloc->Allocate<TestRBNode<int>>(sizeof(TestRBNode<int>));
+    root.ptr_->key = 50;
+    hipc::ShmPtrBase<TestRBNode<int>> root_shm(root.shm_.alloc_id_, root.shm_.off_.load());
+    FullPtr<TestRBNode<int>> root_ptr(alloc, root_shm);
+    root_ptr.ptr_ = root.ptr_;
+    tree.emplace(alloc, root_ptr);
+
+    auto left = alloc->Allocate<TestRBNode<int>>(sizeof(TestRBNode<int>));
+    left.ptr_->key = 25;
+    hipc::ShmPtrBase<TestRBNode<int>> left_shm(left.shm_.alloc_id_, left.shm_.off_.load());
+    FullPtr<TestRBNode<int>> left_ptr(alloc, left_shm);
+    left_ptr.ptr_ = left.ptr_;
+    tree.emplace(alloc, left_ptr);
+
+    auto right = alloc->Allocate<TestRBNode<int>>(sizeof(TestRBNode<int>));
+    right.ptr_->key = 75;
+    hipc::ShmPtrBase<TestRBNode<int>> right_shm(right.shm_.alloc_id_, right.shm_.off_.load());
+    FullPtr<TestRBNode<int>> right_ptr(alloc, right_shm);
+    right_ptr.ptr_ = right.ptr_;
+    tree.emplace(alloc, right_ptr);
+
+    REQUIRE(tree.size() == 3);
+    REQUIRE(VerifyRBProperties(alloc, tree));
+
+    // Delete root
+    auto popped = tree.pop(alloc, 50);
+    REQUIRE_FALSE(popped.IsNull());
+    REQUIRE(tree.size() == 2);
+    REQUIRE(VerifyRBProperties(alloc, tree));
+
+    // Both children should still be findable
+    REQUIRE_FALSE(tree.find(alloc, 25).IsNull());
+    REQUIRE_FALSE(tree.find(alloc, 75).IsNull());
+  }
+
+  SECTION("Delete node with only left child") {
+    pre::rb_tree<TestRBNode<int>, false> tree;
+    tree.Init();
+
+    // Create structure: 50 -> 25 -> 10
+    std::vector<int> keys = {50, 25, 75, 10};
+    for (int key : keys) {
+      auto node = alloc->Allocate<TestRBNode<int>>(sizeof(TestRBNode<int>));
+      node.ptr_->key = key;
+      hipc::ShmPtrBase<TestRBNode<int>> shm(node.shm_.alloc_id_, node.shm_.off_.load());
+      FullPtr<TestRBNode<int>> ptr(alloc, shm);
+      ptr.ptr_ = node.ptr_;
+      tree.emplace(alloc, ptr);
+    }
+
+    REQUIRE(tree.size() == 4);
+
+    // Delete 25 (has left child 10)
+    auto popped = tree.pop(alloc, 25);
+    REQUIRE_FALSE(popped.IsNull());
+    REQUIRE(tree.size() == 3);
+    REQUIRE(VerifyRBProperties(alloc, tree));
+    REQUIRE_FALSE(tree.find(alloc, 10).IsNull());
+  }
+
+  SECTION("Delete node with only right child") {
+    pre::rb_tree<TestRBNode<int>, false> tree;
+    tree.Init();
+
+    // Create structure with right-only child
+    std::vector<int> keys = {50, 25, 75, 90};
+    for (int key : keys) {
+      auto node = alloc->Allocate<TestRBNode<int>>(sizeof(TestRBNode<int>));
+      node.ptr_->key = key;
+      hipc::ShmPtrBase<TestRBNode<int>> shm(node.shm_.alloc_id_, node.shm_.off_.load());
+      FullPtr<TestRBNode<int>> ptr(alloc, shm);
+      ptr.ptr_ = node.ptr_;
+      tree.emplace(alloc, ptr);
+    }
+
+    REQUIRE(tree.size() == 4);
+
+    // Delete 75 (has right child 90)
+    auto popped = tree.pop(alloc, 75);
+    REQUIRE_FALSE(popped.IsNull());
+    REQUIRE(tree.size() == 3);
+    REQUIRE(VerifyRBProperties(alloc, tree));
+    REQUIRE_FALSE(tree.find(alloc, 90).IsNull());
+  }
+
+  SECTION("Delete node with two children - successor is direct child") {
+    pre::rb_tree<TestRBNode<int>, false> tree;
+    tree.Init();
+
+    // Create structure where successor is direct right child
+    std::vector<int> keys = {50, 25, 75, 60};
+    for (int key : keys) {
+      auto node = alloc->Allocate<TestRBNode<int>>(sizeof(TestRBNode<int>));
+      node.ptr_->key = key;
+      hipc::ShmPtrBase<TestRBNode<int>> shm(node.shm_.alloc_id_, node.shm_.off_.load());
+      FullPtr<TestRBNode<int>> ptr(alloc, shm);
+      ptr.ptr_ = node.ptr_;
+      tree.emplace(alloc, ptr);
+    }
+
+    // Delete 50 - successor 60 is left child of 75
+    auto popped = tree.pop(alloc, 50);
+    REQUIRE_FALSE(popped.IsNull());
+    REQUIRE(VerifyRBProperties(alloc, tree));
+  }
+
+  SECTION("Delete black leaf causing fix") {
+    pre::rb_tree<TestRBNode<int>, false> tree;
+    tree.Init();
+
+    // Insert nodes in order that creates black leaves
+    std::vector<int> keys = {50, 25, 75, 10, 30, 60, 90, 5};
+    for (int key : keys) {
+      auto node = alloc->Allocate<TestRBNode<int>>(sizeof(TestRBNode<int>));
+      node.ptr_->key = key;
+      hipc::ShmPtrBase<TestRBNode<int>> shm(node.shm_.alloc_id_, node.shm_.off_.load());
+      FullPtr<TestRBNode<int>> ptr(alloc, shm);
+      ptr.ptr_ = node.ptr_;
+      tree.emplace(alloc, ptr);
+    }
+
+    REQUIRE(VerifyRBProperties(alloc, tree));
+
+    // Delete various nodes and verify RB properties after each
+    std::vector<int> delete_order = {5, 30, 10, 90, 60};
+    for (int key : delete_order) {
+      auto popped = tree.pop(alloc, key);
+      REQUIRE_FALSE(popped.IsNull());
+      REQUIRE(VerifyRBProperties(alloc, tree));
+    }
+  }
+
+  SECTION("Stress test - random deletion order") {
+    pre::rb_tree<TestRBNode<int>, false> tree;
+    tree.Init();
+
+    const int NUM_NODES = 100;
+    std::vector<int> keys;
+    for (int i = 0; i < NUM_NODES; ++i) {
+      keys.push_back(i);
+      auto node = alloc->Allocate<TestRBNode<int>>(sizeof(TestRBNode<int>));
+      node.ptr_->key = i;
+      hipc::ShmPtrBase<TestRBNode<int>> shm(node.shm_.alloc_id_, node.shm_.off_.load());
+      FullPtr<TestRBNode<int>> ptr(alloc, shm);
+      ptr.ptr_ = node.ptr_;
+      tree.emplace(alloc, ptr);
+    }
+
+    REQUIRE(tree.size() == NUM_NODES);
+    REQUIRE(VerifyRBProperties(alloc, tree));
+
+    // Delete in reverse order (different pattern than insertion)
+    for (int i = NUM_NODES - 1; i >= 0; --i) {
+      auto popped = tree.pop(alloc, i);
+      REQUIRE_FALSE(popped.IsNull());
+      if (tree.size() > 0) {
+        REQUIRE(VerifyRBProperties(alloc, tree));
+      }
+    }
+
+    REQUIRE(tree.empty());
+  }
+}
+
+TEST_CASE("rb_tree_pre - String Keys", "[rb_tree_pre][string_keys]") {
+  MallocBackend backend;
+  size_t arena_size = 10 * 1024 * 1024;
+  auto *alloc = CreateTestAllocator<false>(backend, arena_size);
+
+  SECTION("String key operations") {
+    pre::rb_tree<TestRBNode<std::string>, false> tree;
+    tree.Init();
+
+    std::vector<std::string> keys = {"apple", "banana", "cherry", "date", "elderberry"};
+
+    for (const auto& key : keys) {
+      auto node = alloc->Allocate<TestRBNode<std::string>>(sizeof(TestRBNode<std::string>));
+      new (node.ptr_) TestRBNode<std::string>(key, 0);
+      hipc::ShmPtrBase<TestRBNode<std::string>> shm(node.shm_.alloc_id_, node.shm_.off_.load());
+      FullPtr<TestRBNode<std::string>> ptr(alloc, shm);
+      ptr.ptr_ = node.ptr_;
+      tree.emplace(alloc, ptr);
+    }
+
+    REQUIRE(tree.size() == keys.size());
+
+    // Find operations
+    REQUIRE_FALSE(tree.find(alloc, std::string("cherry")).IsNull());
+    REQUIRE(tree.find(alloc, std::string("fig")).IsNull());
+
+    // Delete
+    auto popped = tree.pop(alloc, std::string("banana"));
+    REQUIRE_FALSE(popped.IsNull());
+    REQUIRE(tree.size() == keys.size() - 1);
+  }
 }

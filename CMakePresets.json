@@ -27,6 +27,7 @@
                 "WRP_CORE_ENABLE_ASAN": "OFF",
                 "WRP_CORE_ENABLE_RPATH": "ON",
                 "WRP_CORE_ENABLE_PYTHON": "ON",
+                "WRP_CORE_ENABLE_COVERAGE": "ON",
                 "HSHM_ENABLE_LIBPRESSIO": "ON",
                 "HSHM_ENABLE_ZMQ": "ON",
                 "HSHM_ENABLE_CEREAL": "ON",

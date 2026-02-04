@@ -10,6 +10,7 @@ add_subdirectory(allocator)
 add_subdirectory(backend)
 add_subdirectory(data_structures)
 add_subdirectory(introspect)
+add_subdirectory(util)
 # Following test directories disabled - depend on deleted code:
 # add_subdirectory(types)
 add_subdirectory(thread)

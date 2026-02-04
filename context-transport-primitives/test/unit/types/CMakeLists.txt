@@ -51,12 +51,3 @@ install(TARGETS
         ARCHIVE DESTINATION lib
         RUNTIME DESTINATION bin)
 
-#-----------------------------------------------------------------------------
-# Coverage
-#-----------------------------------------------------------------------------
-if(HSHM_ENABLE_COVERAGE)
-    set_coverage_flags(test_types_exec)
-    if (HSHM_ENABLE_MPI AND HSHM_ENABLE_OPENMP)
-        set_coverage_flags(test_timers_exec)
-    endif()
-endif()

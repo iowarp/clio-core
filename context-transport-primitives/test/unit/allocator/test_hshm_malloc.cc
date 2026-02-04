@@ -217,4 +217,165 @@ TEST_CASE("HSHM_MALLOC: verify single free only", "[hshm_malloc][single_free]") 
   std::cout << "Single free verified - not attempting double free" << std::endl;
 }
 
+/**
+ * Test reallocation functionality
+ */
+TEST_CASE("HSHM_MALLOC: reallocation", "[hshm_malloc][realloc]") {
+  std::cout << "\n=== Test 7: Reallocation ===" << std::endl;
+
+  // Initial allocation
+  size_t initial_size = 512;
+  auto buffer = HSHM_MALLOC->AllocateObjs<char>(initial_size);
+  REQUIRE(!buffer.IsNull());
+
+  std::cout << "Initial allocation: " << initial_size << " bytes at ptr_=" << (void*)buffer.ptr_ << std::endl;
+
+  // Write unique pattern
+  for (size_t i = 0; i < initial_size; i++) {
+    buffer.ptr_[i] = static_cast<char>(i % 256);
+  }
+
+  // Reallocate to larger size
+  size_t new_size = 2048;
+  auto new_buffer = HSHM_MALLOC->ReallocateObjs<char>(buffer, new_size);
+  REQUIRE(!new_buffer.IsNull());
+
+  std::cout << "Reallocated to " << new_size << " bytes at ptr_=" << (void*)new_buffer.ptr_ << std::endl;
+
+  // Verify original data is preserved
+  for (size_t i = 0; i < initial_size; i++) {
+    REQUIRE(new_buffer.ptr_[i] == static_cast<char>(i % 256));
+  }
+  std::cout << "Original data preserved after reallocation" << std::endl;
+
+  // Write to the new space
+  for (size_t i = initial_size; i < new_size; i++) {
+    new_buffer.ptr_[i] = static_cast<char>((i + 100) % 256);
+  }
+
+  // Verify all data
+  for (size_t i = initial_size; i < new_size; i++) {
+    REQUIRE(new_buffer.ptr_[i] == static_cast<char>((i + 100) % 256));
+  }
+  std::cout << "New space is accessible" << std::endl;
+
+  // Free
+  HSHM_MALLOC->Free(new_buffer);
+  std::cout << "Reallocation test completed successfully" << std::endl;
+}
+
+/**
+ * Test reallocation to smaller size
+ */
+TEST_CASE("HSHM_MALLOC: realloc smaller", "[hshm_malloc][realloc_small]") {
+  std::cout << "\n=== Test 8: Reallocation to Smaller Size ===" << std::endl;
+
+  // Initial large allocation
+  size_t initial_size = 4096;
+  auto buffer = HSHM_MALLOC->AllocateObjs<char>(initial_size);
+  REQUIRE(!buffer.IsNull());
+
+  std::cout << "Initial allocation: " << initial_size << " bytes" << std::endl;
+
+  // Write pattern
+  for (size_t i = 0; i < initial_size; i++) {
+    buffer.ptr_[i] = static_cast<char>(i % 256);
+  }
+
+  // Reallocate to smaller size
+  size_t new_size = 256;
+  auto new_buffer = HSHM_MALLOC->ReallocateObjs<char>(buffer, new_size);
+  REQUIRE(!new_buffer.IsNull());
+
+  std::cout << "Reallocated to " << new_size << " bytes" << std::endl;
+
+  // Verify data in smaller region is preserved
+  for (size_t i = 0; i < new_size; i++) {
+    REQUIRE(new_buffer.ptr_[i] == static_cast<char>(i % 256));
+  }
+  std::cout << "Data preserved in smaller buffer" << std::endl;
+
+  HSHM_MALLOC->Free(new_buffer);
+  std::cout << "Smaller reallocation test completed" << std::endl;
+}
+
+/**
+ * Test TLS functions (no-op but should not crash)
+ */
+TEST_CASE("HSHM_MALLOC: TLS functions", "[hshm_malloc][tls]") {
+  std::cout << "\n=== Test 9: TLS Functions ===" << std::endl;
+
+  // These are no-ops for MallocAllocator but should not crash
+  HSHM_MALLOC->CreateTls();
+  std::cout << "CreateTls() completed (no-op)" << std::endl;
+
+  HSHM_MALLOC->FreeTls();
+  std::cout << "FreeTls() completed (no-op)" << std::endl;
+
+  std::cout << "TLS functions test passed" << std::endl;
+}
+
+/**
+ * Test GetCurrentlyAllocatedSize
+ */
+TEST_CASE("HSHM_MALLOC: allocated size tracking", "[hshm_malloc][size_tracking]") {
+  std::cout << "\n=== Test 10: Allocated Size Tracking ===" << std::endl;
+
+  // This will return 0 unless HSHM_ALLOC_TRACK_SIZE is defined
+  size_t initial = HSHM_MALLOC->GetCurrentlyAllocatedSize();
+  std::cout << "Initial allocated size: " << initial << std::endl;
+
+  // The result depends on compile-time flag, so just verify it doesn't crash
+  std::cout << "GetCurrentlyAllocatedSize() test passed" << std::endl;
+}
+
+/**
+ * Test various allocation sizes
+ */
+TEST_CASE("HSHM_MALLOC: various sizes", "[hshm_malloc][sizes]") {
+  std::cout << "\n=== Test 11: Various Allocation Sizes ===" << std::endl;
+
+  std::vector<size_t> sizes = {1, 16, 32, 64, 128, 256, 512, 1024, 4096, 16384, 65536, 262144};
+
+  for (size_t size : sizes) {
+    auto buffer = HSHM_MALLOC->AllocateObjs<char>(size);
+    REQUIRE(!buffer.IsNull());
+
+    // Write and verify
+    std::memset(buffer.ptr_, 0xAB, size);
+    for (size_t i = 0; i < size; i++) {
+      REQUIRE(buffer.ptr_[i] == static_cast<char>(0xAB));
+    }
+
+    HSHM_MALLOC->Free(buffer);
+    std::cout << "  Size " << size << " bytes: OK" << std::endl;
+  }
+
+  std::cout << "Various sizes test passed" << std::endl;
+}
+
+/**
+ * Stress test with rapid alloc/free cycles
+ */
+TEST_CASE("HSHM_MALLOC: stress test", "[hshm_malloc][stress]") {
+  std::cout << "\n=== Test 12: Stress Test ===" << std::endl;
+
+  const int iterations = 10000;
+  const size_t size = 1024;
+
+  for (int i = 0; i < iterations; i++) {
+    auto buffer = HSHM_MALLOC->AllocateObjs<char>(size);
+    REQUIRE(!buffer.IsNull());
+
+    // Quick write
+    buffer.ptr_[0] = static_cast<char>(i % 256);
+    buffer.ptr_[size - 1] = static_cast<char>(i % 256);
+
+    HSHM_MALLOC->Free(buffer);
+  }
+
+  std::cout << "Completed " << iterations << " alloc/free cycles" << std::endl;
+  std::cout << "Stress test passed" << std::endl;
+}
+
 SIMPLE_TEST_MAIN()
