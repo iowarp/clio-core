@@ -428,7 +428,29 @@ u32 Worker::ProcessNewTasks() {
       tasks_processed++;
       SetCurrentRunContext(nullptr);
 
-      // Get FutureShm once (avoid duplicate calls)
+      // IMPORTANT: Register allocator BEFORE calling GetFutureShm()
+      // GetFutureShm() calls ToFullPtr() which requires the allocator to be
+      // registered to convert the ShmPtr to FullPtr
+      auto *ipc_manager = CHI_IPC;
+      auto future_shm_ptr = future.GetFutureShmPtr();
+      if (!future_shm_ptr.IsNull()) {
+        hipc::AllocatorId alloc_id = future_shm_ptr.alloc_id_;
+        if (alloc_id != hipc::AllocatorId::GetNull()) {
+          // Try to convert - if it fails, register the memory first
+          auto test_ptr = ipc_manager->ToFullPtr(future_shm_ptr);
+          if (test_ptr.IsNull()) {
+            bool registered = ipc_manager->RegisterMemory(alloc_id);
+            if (!registered) {
+              HLOG(kError,
+                   "Worker {}: Failed to register memory for alloc_id ({}.{})",
+                   worker_id_, alloc_id.major_, alloc_id.minor_);
+              continue;
+            }
+          }
+        }
+      }
+
+      // Now safe to get FutureShm - allocator is registered
       auto future_shm = future.GetFutureShm();
       if (future_shm.IsNull()) {
         HLOG(kError, "Worker {}: Failed to get FutureShm (null pointer)",
@@ -436,10 +458,10 @@ u32 Worker::ProcessNewTasks() {
         continue;
       }
 
-      // Ensure IPC allocator is registered for this Future
+      // Ensure IPC allocator is registered for this Future (double-check)
       if (!EnsureIpcRegistered(future_shm)) {
-        // Registration failed - mark task as error and skip
-        future_shm->flags_.SetBits(1);
+        // Registration failed - mark task as error and complete so client doesn't hang
+        future_shm->flags_.SetBits(1 | FutureShm::FUTURE_COMPLETE);
         continue;
       }
 
@@ -455,7 +477,8 @@ u32 Worker::ProcessNewTasks() {
         // Container not found - mark as complete with error
         HLOG(kError, "Worker {}: Container not found for pool_id={}, method={}",
              worker_id_, pool_id, method_id);
-        future_shm->flags_.SetBits(1);
+        // Set both error bit AND FUTURE_COMPLETE so client doesn't hang
+        future_shm->flags_.SetBits(1 | FutureShm::FUTURE_COMPLETE);
         continue;
       }
 
@@ -1700,6 +1723,11 @@ RunContext *GetCurrentRunContextFromWorker() {
 
 void Worker::CopyTaskOutputToClient() {
   // Process transfers in client_copy_ queue
+  // Mark did_work_ if there are any transfers to prevent worker suspension
+  if (!client_copy_.empty()) {
+    did_work_ = true;
+  }
+
   while (!client_copy_.empty()) {
     LocalTransfer &transfer = client_copy_.front();
 

@@ -13,8 +13,8 @@ memory:
 networking:
   port: 8080
   neighborhood_size: 32
-  # Hostfile path inside Docker container (mounted at /test_config)
-  hostfile: /test_config/hostfile
+  # Hostfile path inside Docker container (mounted workspace)
+  hostfile: /workspace/context-transfer-engine/test/integration/distributed/hostfile
 
 # Logging configuration
 logging:

@@ -10,7 +10,7 @@ memory:
 networking:
   port: 5555
   neighborhood_size: 4  # Stress test with small neighborhood size for range/broadcast queries
-  hostfile: "/etc/iowarp/hostfile"  # Path to hostfile in container
+  hostfile: "/workspace/context-runtime/test/integration/distributed/hostfile"
 
 # Logging configuration
 logging:

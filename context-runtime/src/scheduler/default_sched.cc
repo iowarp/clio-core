@@ -62,15 +62,17 @@ u32 DefaultScheduler::ClientMapTask(IpcManager *ipc_manager,
     return 0;
   }
 
-  // Check if this is a network task
+  // Check if this is a network task (Send or Recv from admin pool)
   Task *task_ptr = task.get();
-  bool is_network_task = false;
   if (task_ptr != nullptr && task_ptr->pool_id_ == chi::kAdminPoolId) {
     u32 method_id = task_ptr->method_;
-    is_network_task = (method_id == 14 || method_id == 15);  // kSend or kRecv
+    if (method_id == 14 || method_id == 15) {  // kSend or kRecv
+      // Route to network worker (last worker)
+      return num_lanes - 1;
+    }
   }
 
-  // Always use PID+TID hash-based mapping
+  // Use PID+TID hash-based mapping for other tasks
   u32 lane = MapByPidTid(num_lanes);
 
   return lane;

@@ -16,7 +16,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../../../" && pwd)"
 
 # Export workspace path for docker-compose
-export IOWARP_CORE_ROOT="${REPO_ROOT}"
+# Priority: HOST_WORKSPACE > existing IOWARP_CORE_ROOT > computed REPO_ROOT
+if [ -n "${HOST_WORKSPACE:-}" ]; then
+    # Explicitly set by user
+    export IOWARP_CORE_ROOT="${HOST_WORKSPACE}"
+elif [ -z "${IOWARP_CORE_ROOT:-}" ]; then
+    # IOWARP_CORE_ROOT not set, use computed path
+    export IOWARP_CORE_ROOT="${REPO_ROOT}"
+fi
+# Otherwise keep existing IOWARP_CORE_ROOT (e.g., from devcontainer.json)
 
 # Configuration
 NUM_NODES=${NUM_NODES:-4}
@@ -167,6 +175,7 @@ log_info "IOWarp Distributed Test Runner"
 log_info "Configuration:"
 log_info "  Nodes: $NUM_NODES"
 log_info "  Test filter: $TEST_FILTER"
+log_info "  Workspace path: $IOWARP_CORE_ROOT"
 log_info ""
 
 case $COMMAND in

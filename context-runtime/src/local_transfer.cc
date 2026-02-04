@@ -92,6 +92,9 @@ bool LocalTransfer::Send(u32 max_xfer_time_us) {
   }
 
   if (bytes_transferred_ >= total_size_) {
+    // All data already transferred - ensure FUTURE_COMPLETE is set
+    // This handles the case where total_size_ == 0 (no output data)
+    SetComplete();
     return true;
   }
 
