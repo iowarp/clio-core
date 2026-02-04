@@ -1,21 +1,37 @@
+# Distributed Integration Tests for Chimaera Runtime
+# Uses deps-cpu container with mounted build directory for coverage support
+#
+# Usage:
+#   # Standard run
+#   docker compose up
+#
+#   # With custom workspace path (for devcontainers)
+#   HOST_WORKSPACE=/host/path/to/workspace docker compose up
+#
+# Coverage: gcda files are written directly to the mounted build directory,
+# allowing coverage data to be collected after test execution.
+
 services:
   # Node 1 - Test coordinator that runs the test binary
   iowarp-node1:
-    image: iowarp/core-build:latest
+    image: iowarp/deps-cpu:latest
     container_name: iowarp-distributed-node1
     hostname: iowarp-node1
     networks:
       iowarp-cluster:
         ipv4_address: 172.25.0.10
     volumes:
-      - ${IOWARP_CORE_ROOT:-.}/context-runtime/test/unit/distributed/:/etc/iowarp:ro
-      - ${IOWARP_BUILD_DIR:-${IOWARP_CORE_ROOT:-.}/build}:/workspace/build:rw
+      # Mount the entire workspace for coverage support
+      - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-/workspace}}:/workspace:rw
     environment:
       - NODE_ID=1
       - NODE_IP=172.25.0.10
-      - CONTAINER_HOSTFILE=/etc/iowarp/hostfile
+      - WRP_RUNTIME_CONF=/workspace/context-runtime/test/integration/distributed/wrp_conf.yaml
+      - CONTAINER_HOSTFILE=/workspace/context-runtime/test/integration/distributed/hostfile
       - CHIMAERA_WITH_RUNTIME=0
       - CHI_NUM_CONTAINERS=4
+      - PATH=/workspace/build/bin:/usr/local/bin:/usr/bin:/bin
+      - LD_LIBRARY_PATH=/workspace/build/bin:$LD_LIBRARY_PATH
     shm_size: '16gb'
     mem_limit: 16g
     working_dir: /workspace
@@ -23,33 +39,37 @@ services:
     command: >
       "
         echo 'Node 1: Starting runtime...' &&
-        export PATH=/usr/local/bin:$PATH &&
-        chimaera_start_runtime &
+        /workspace/build/bin/chimaera_start_runtime &
         RUNTIME_PID=\$! &&
         echo 'Node 1: Runtime started (PID \$RUNTIME_PID). Running distributed tests...' &&
-        chimaera_bdev_chimod_tests &&
+        sleep 3 &&
+        /workspace/build/bin/chimaera_bdev_chimod_tests ${TEST_FILTER:-} &&
+        TEST_EXIT=\$? &&
         echo 'Node 1: Tests completed.' &&
-        kill \$RUNTIME_PID &&
-        wait \$RUNTIME_PID
+        kill \$RUNTIME_PID 2>/dev/null || true &&
+        wait \$RUNTIME_PID 2>/dev/null || true &&
+        exit \$TEST_EXIT
       "
 
   # Node 2
   iowarp-node2:
-    image: iowarp/core-build:latest
+    image: iowarp/deps-cpu:latest
     container_name: iowarp-distributed-node2
     hostname: iowarp-node2
     networks:
       iowarp-cluster:
         ipv4_address: 172.25.0.11
     volumes:
-      - ${IOWARP_CORE_ROOT:-.}/context-runtime/test/unit/distributed/:/etc/iowarp:ro
-      - ${IOWARP_BUILD_DIR:-${IOWARP_CORE_ROOT:-.}/build}:/workspace/build:rw
+      - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-/workspace}}:/workspace:rw
     environment:
       - NODE_ID=2
       - NODE_IP=172.25.0.11
-      - CONTAINER_HOSTFILE=/etc/iowarp/hostfile
+      - WRP_RUNTIME_CONF=/workspace/context-runtime/test/integration/distributed/wrp_conf.yaml
+      - CONTAINER_HOSTFILE=/workspace/context-runtime/test/integration/distributed/hostfile
       - CHIMAERA_WITH_RUNTIME=0
       - CHI_NUM_CONTAINERS=4
+      - PATH=/workspace/build/bin:/usr/local/bin:/usr/bin:/bin
+      - LD_LIBRARY_PATH=/workspace/build/bin:$LD_LIBRARY_PATH
     shm_size: '16gb'
     mem_limit: 16g
     working_dir: /workspace
@@ -57,30 +77,28 @@ services:
     command: >
       "
         echo 'Node 2: Starting runtime...' &&
-        export PATH=/usr/local/bin:$PATH &&
-        chimaera_start_runtime &
-        RUNTIME_PID=\$! &&
-        echo \"Node 2: Runtime started (PID \$RUNTIME_PID). Waiting for tests...\" &&
-        tail -f /dev/null
+        /workspace/build/bin/chimaera_start_runtime
       "
 
   # Node 3
   iowarp-node3:
-    image: iowarp/core-build:latest
+    image: iowarp/deps-cpu:latest
     container_name: iowarp-distributed-node3
     hostname: iowarp-node3
     networks:
       iowarp-cluster:
         ipv4_address: 172.25.0.12
     volumes:
-      - ${IOWARP_CORE_ROOT:-.}/context-runtime/test/unit/distributed/:/etc/iowarp:ro
-      - ${IOWARP_BUILD_DIR:-${IOWARP_CORE_ROOT:-.}/build}:/workspace/build:rw
+      - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-/workspace}}:/workspace:rw
     environment:
       - NODE_ID=3
       - NODE_IP=172.25.0.12
-      - CONTAINER_HOSTFILE=/etc/iowarp/hostfile
+      - WRP_RUNTIME_CONF=/workspace/context-runtime/test/integration/distributed/wrp_conf.yaml
+      - CONTAINER_HOSTFILE=/workspace/context-runtime/test/integration/distributed/hostfile
       - CHIMAERA_WITH_RUNTIME=0
       - CHI_NUM_CONTAINERS=4
+      - PATH=/workspace/build/bin:/usr/local/bin:/usr/bin:/bin
+      - LD_LIBRARY_PATH=/workspace/build/bin:$LD_LIBRARY_PATH
     shm_size: '16gb'
     mem_limit: 16g
     working_dir: /workspace
@@ -88,30 +106,28 @@ services:
     command: >
       "
         echo 'Node 3: Starting runtime...' &&
-        export PATH=/usr/local/bin:$PATH &&
-        chimaera_start_runtime &
-        RUNTIME_PID=\$! &&
-        echo \"Node 3: Runtime started (PID \$RUNTIME_PID). Waiting for tests...\" &&
-        tail -f /dev/null
+        /workspace/build/bin/chimaera_start_runtime
       "
 
   # Node 4
   iowarp-node4:
-    image: iowarp/core-build:latest
+    image: iowarp/deps-cpu:latest
     container_name: iowarp-distributed-node4
     hostname: iowarp-node4
     networks:
       iowarp-cluster:
         ipv4_address: 172.25.0.13
     volumes:
-      - ${IOWARP_CORE_ROOT:-.}/context-runtime/test/unit/distributed/:/etc/iowarp:ro
-      - ${IOWARP_BUILD_DIR:-${IOWARP_CORE_ROOT:-.}/build}:/workspace/build:rw
+      - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-/workspace}}:/workspace:rw
     environment:
       - NODE_ID=4
       - NODE_IP=172.25.0.13
-      - CONTAINER_HOSTFILE=/etc/iowarp/hostfile
+      - WRP_RUNTIME_CONF=/workspace/context-runtime/test/integration/distributed/wrp_conf.yaml
+      - CONTAINER_HOSTFILE=/workspace/context-runtime/test/integration/distributed/hostfile
       - CHIMAERA_WITH_RUNTIME=0
       - CHI_NUM_CONTAINERS=4
+      - PATH=/workspace/build/bin:/usr/local/bin:/usr/bin:/bin
+      - LD_LIBRARY_PATH=/workspace/build/bin:$LD_LIBRARY_PATH
     shm_size: '16gb'
     mem_limit: 16g
     working_dir: /workspace
@@ -119,11 +135,7 @@ services:
     command: >
       "
         echo 'Node 4: Starting runtime...' &&
-        export PATH=/usr/local/bin:$PATH &&
-        chimaera_start_runtime &
-        RUNTIME_PID=\$! &&
-        echo \"Node 4: Runtime started (PID \$RUNTIME_PID). Waiting for tests...\" &&
-        tail -f /dev/null
+        /workspace/build/bin/chimaera_start_runtime
       "
 
 networks:

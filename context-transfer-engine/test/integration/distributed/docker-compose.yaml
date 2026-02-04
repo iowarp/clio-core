@@ -1,18 +1,31 @@
+# Distributed Integration Tests for Context Transfer Engine (CTE)
+# Uses deps-cpu container with mounted build directory for coverage support
+#
+# Usage:
+#   # Standard run
+#   ./run_tests.sh
+#
+#   # With custom workspace path (for devcontainers)
+#   HOST_WORKSPACE=/host/path/to/workspace ./run_tests.sh
+#
+#   # Run specific test
+#   ./run_tests.sh -t "PutBlob"
+#
+# Coverage: gcda files are written directly to the mounted build directory,
+# allowing coverage data to be collected after test execution.
+
 services:
-  # Node 1 - Primary node that builds and runs tests
+  # Node 1 - Primary node that runs tests
   cte-node1:
-    image: iowarp/core-build:latest
-    pull_policy: never
+    image: iowarp/deps-cpu:latest
     container_name: cte-distributed-node1
     hostname: iowarp-node1
     networks:
       cte-cluster:
         ipv4_address: 172.26.0.10
     volumes:
-      # Use HOST_WORKSPACE for Docker-in-Docker environments (devcontainers)
-      # HOST_WORKSPACE should be the actual host path, not the container mount point
-      - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-.}}/context-transfer-engine/test/unit/distributed:/test_config:ro
-      - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-.}}/build:/workspace/build:rw
+      # Mount the entire workspace for coverage support
+      - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-/workspace}}:/workspace:rw
       - hdd1-storage:/mnt/hdd1
       - hdd2-storage:/mnt/hdd2
       - hdd3-storage:/mnt/hdd3
@@ -20,14 +33,17 @@ services:
     environment:
       - NODE_ID=1
       - NODE_IP=172.26.0.10
-      - CONTAINER_HOSTFILE=/test_config/hostfile
+      - WRP_RUNTIME_CONF=/workspace/context-transfer-engine/test/integration/distributed/wrp_config.yaml
+      - CONTAINER_HOSTFILE=/workspace/context-transfer-engine/test/integration/distributed/hostfile
       - TEST_FILTER=${TEST_FILTER:-}
       - SECTION_FILTER=${SECTION_FILTER:-}
-      - WRP_RUNTIME_CONF=/test_config/wrp_config.yaml
       - CTE_NUM_NODES=4
       - CHIMAERA_WITH_RUNTIME=0
+      - PATH=/workspace/build/bin:/usr/local/bin:/usr/bin:/bin
+      - LD_LIBRARY_PATH=/workspace/build/bin:$LD_LIBRARY_PATH
     shm_size: '16gb'
     mem_limit: 16g
+    working_dir: /workspace
     entrypoint: [ "/bin/bash", "-c" ]
     command: >
       "
@@ -36,23 +52,19 @@ services:
         echo 'Node 1: Starting initialization' &&
         echo '========================================' &&
         echo 'Node 1: Setting up permissions...' &&
-        sudo chown -R iowarp:iowarp /mnt &&
+        sudo chown -R $$(id -u):$$(id -g) /mnt 2>/dev/null || true &&
         echo 'Node 1: Creating storage directories...' &&
         mkdir -p /mnt/hdd1 /mnt/hdd2 /mnt/hdd3 /mnt/hdd4 &&
-        export PATH=/usr/local/bin:$$PATH &&
-        export WRP_RUNTIME_CONF=/test_config/wrp_config.yaml &&
-        export CONTAINER_HOSTFILE=/test_config/hostfile &&
         echo '========================================' &&
         echo 'Node 1: Starting Chimaera runtime in background' &&
         echo '========================================' &&
-        chimaera_start_runtime &
+        /workspace/build/bin/chimaera_start_runtime &
         RUNTIME_PID=$$! &&
         echo \"Node 1: Runtime started (PID $$RUNTIME_PID)\" &&
-        sleep 2 &&
+        sleep 3 &&
         echo '========================================' &&
         echo 'Node 1: Running distributed unit tests' &&
         echo '========================================' &&
-        echo 'Flushing output before test execution...' &&
         sync &&
         if [ -z \"$$TEST_FILTER\" ]; then
           echo 'Running all tests (no filter)' &&
@@ -63,33 +75,34 @@ services:
           /workspace/build/bin/test_core_functionality \"$$TEST_FILTER\" 2>&1
           TEST_EXIT_CODE=$$?
         fi &&
-        echo '========================================'
-        echo 'Node 1: Tests complete'
-        echo '========================================'
+        echo '========================================' &&
+        echo 'Node 1: Tests complete' &&
+        echo '========================================' &&
         exit $$TEST_EXIT_CODE
       "
 
   # Node 2 - Secondary node
   cte-node2:
-    image: iowarp/core-build:latest
-    pull_policy: never
+    image: iowarp/deps-cpu:latest
     container_name: cte-distributed-node2
     hostname: iowarp-node2
     networks:
       cte-cluster:
         ipv4_address: 172.26.0.11
     volumes:
-      - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-.}}/context-transfer-engine/test/unit/distributed:/test_config:ro
-      - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-.}}/build:/workspace/build:rw
+      - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-/workspace}}:/workspace:rw
       - hdd2-storage:/mnt/hdd2
     environment:
       - NODE_ID=2
       - NODE_IP=172.26.0.11
-      - CONTAINER_HOSTFILE=/test_config/hostfile
-      - WRP_RUNTIME_CONF=/test_config/wrp_config.yaml
+      - WRP_RUNTIME_CONF=/workspace/context-transfer-engine/test/integration/distributed/wrp_config.yaml
+      - CONTAINER_HOSTFILE=/workspace/context-transfer-engine/test/integration/distributed/hostfile
       - CTE_NUM_NODES=4
+      - PATH=/workspace/build/bin:/usr/local/bin:/usr/bin:/bin
+      - LD_LIBRARY_PATH=/workspace/build/bin:$LD_LIBRARY_PATH
     shm_size: '16gb'
     mem_limit: 16g
+    working_dir: /workspace
     entrypoint: [ "/bin/bash", "-c" ]
     command: >
       "
@@ -97,38 +110,36 @@ services:
         echo '========================================' &&
         echo 'Node 2: Starting initialization' &&
         echo '========================================' &&
-        sudo chown -R iowarp:iowarp /mnt &&
+        sudo chown -R $$(id -u):$$(id -g) /mnt 2>/dev/null || true &&
         mkdir -p /mnt/hdd2 &&
-        export PATH=/usr/local/bin:$$PATH &&
-        export WRP_RUNTIME_CONF=/test_config/wrp_config.yaml &&
-        export CONTAINER_HOSTFILE=/test_config/hostfile &&
         echo '========================================' &&
         echo 'Node 2: Starting Chimaera runtime in foreground' &&
         echo '========================================' &&
-        chimaera_start_runtime
+        /workspace/build/bin/chimaera_start_runtime
       "
 
   # Node 3 - Secondary node
   cte-node3:
-    image: iowarp/core-build:latest
-    pull_policy: never
+    image: iowarp/deps-cpu:latest
     container_name: cte-distributed-node3
     hostname: iowarp-node3
     networks:
       cte-cluster:
         ipv4_address: 172.26.0.12
     volumes:
-      - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-.}}/context-transfer-engine/test/unit/distributed:/test_config:ro
-      - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-.}}/build:/workspace/build:rw
+      - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-/workspace}}:/workspace:rw
       - hdd3-storage:/mnt/hdd3
     environment:
       - NODE_ID=3
       - NODE_IP=172.26.0.12
-      - CONTAINER_HOSTFILE=/test_config/hostfile
-      - WRP_RUNTIME_CONF=/test_config/wrp_config.yaml
+      - WRP_RUNTIME_CONF=/workspace/context-transfer-engine/test/integration/distributed/wrp_config.yaml
+      - CONTAINER_HOSTFILE=/workspace/context-transfer-engine/test/integration/distributed/hostfile
       - CTE_NUM_NODES=4
+      - PATH=/workspace/build/bin:/usr/local/bin:/usr/bin:/bin
+      - LD_LIBRARY_PATH=/workspace/build/bin:$LD_LIBRARY_PATH
     shm_size: '16gb'
     mem_limit: 16g
+    working_dir: /workspace
     entrypoint: [ "/bin/bash", "-c" ]
     command: >
       "
@@ -136,38 +147,36 @@ services:
         echo '========================================' &&
         echo 'Node 3: Starting initialization' &&
         echo '========================================' &&
-        sudo chown -R iowarp:iowarp /mnt &&
+        sudo chown -R $$(id -u):$$(id -g) /mnt 2>/dev/null || true &&
         mkdir -p /mnt/hdd3 &&
-        export PATH=/usr/local/bin:$$PATH &&
-        export WRP_RUNTIME_CONF=/test_config/wrp_config.yaml &&
-        export CONTAINER_HOSTFILE=/test_config/hostfile &&
         echo '========================================' &&
         echo 'Node 3: Starting Chimaera runtime in foreground' &&
         echo '========================================' &&
-        chimaera_start_runtime
+        /workspace/build/bin/chimaera_start_runtime
       "
 
   # Node 4 - Secondary node
   cte-node4:
-    image: iowarp/core-build:latest
-    pull_policy: never
+    image: iowarp/deps-cpu:latest
     container_name: cte-distributed-node4
     hostname: iowarp-node4
     networks:
       cte-cluster:
         ipv4_address: 172.26.0.13
     volumes:
-      - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-.}}/context-transfer-engine/test/unit/distributed:/test_config:ro
-      - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-.}}/build:/workspace/build:rw
+      - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-/workspace}}:/workspace:rw
       - hdd4-storage:/mnt/hdd4
     environment:
       - NODE_ID=4
       - NODE_IP=172.26.0.13
-      - CONTAINER_HOSTFILE=/test_config/hostfile
-      - WRP_RUNTIME_CONF=/test_config/wrp_config.yaml
+      - WRP_RUNTIME_CONF=/workspace/context-transfer-engine/test/integration/distributed/wrp_config.yaml
+      - CONTAINER_HOSTFILE=/workspace/context-transfer-engine/test/integration/distributed/hostfile
       - CTE_NUM_NODES=4
+      - PATH=/workspace/build/bin:/usr/local/bin:/usr/bin:/bin
+      - LD_LIBRARY_PATH=/workspace/build/bin:$LD_LIBRARY_PATH
     shm_size: '16gb'
     mem_limit: 16g
+    working_dir: /workspace
     entrypoint: [ "/bin/bash", "-c" ]
     command: >
       "
@@ -175,15 +184,12 @@ services:
         echo '========================================' &&
         echo 'Node 4: Starting initialization' &&
         echo '========================================' &&
-        sudo chown -R iowarp:iowarp /mnt &&
+        sudo chown -R $$(id -u):$$(id -g) /mnt 2>/dev/null || true &&
         mkdir -p /mnt/hdd4 &&
-        export PATH=/usr/local/bin:$$PATH &&
-        export WRP_RUNTIME_CONF=/test_config/wrp_config.yaml &&
-        export CONTAINER_HOSTFILE=/test_config/hostfile &&
         echo '========================================' &&
         echo 'Node 4: Starting Chimaera runtime in foreground' &&
         echo '========================================' &&
-        chimaera_start_runtime
+        /workspace/build/bin/chimaera_start_runtime
       "
 
 volumes:

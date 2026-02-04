@@ -1,17 +1,22 @@
 #!/bin/bash
-# Run IOWarp Distributed Unit Test
+# Run IOWarp Distributed Integration Test (Chimaera Runtime)
 #
 # This script manages the distributed test environment, including:
-# - Docker cluster setup
-# - Hostfile generation
-# - Test execution
+# - Docker cluster setup using deps-cpu container
+# - Test execution with coverage support
 # - Cleanup
+#
+# Coverage: Uses deps-cpu container with mounted workspace, allowing
+# gcda files to be written directly to the build directory for coverage.
 
 set -e
 
 # Script directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../../../../" && pwd)"
+
+# Export workspace path for docker-compose
+export IOWARP_CORE_ROOT="${REPO_ROOT}"
 
 # Configuration
 NUM_NODES=${NUM_NODES:-4}

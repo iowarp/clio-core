@@ -1,10 +1,18 @@
 #!/bin/bash
-# Distributed CTE Test Runner
+# Distributed CTE Integration Test Runner
 # This script sets up and runs the distributed CTE tests in Docker containers
+#
+# Coverage: Uses deps-cpu container with mounted workspace, allowing
+# gcda files to be written directly to the build directory for coverage.
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../../../../" && pwd)"
+
+# Export workspace path for docker-compose
+export IOWARP_CORE_ROOT="${REPO_ROOT}"
+
 cd "$SCRIPT_DIR"
 
 # Colors for output
