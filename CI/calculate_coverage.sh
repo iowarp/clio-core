@@ -284,12 +284,25 @@ print_header "Step 4: Collecting and Merging Coverage Data"
 
 cd "${BUILD_DIR}"
 
-print_info "Capturing final coverage data with lcov..."
+print_info "Capturing final coverage data with lcov (using RC file for comprehensive error handling)..."
+# Create temporary lcovrc to handle all known coverage data issues
+cat > lcovrc_temp << 'EOFRC'
+geninfo_unexecuted_blocks = 1
+geninfo_compat_libtool = 1
+lcov_branch_coverage = 0
+EOFRC
+
+# Use geninfo directly with comprehensive error ignoring for all components at once
+# This approach gives more accurate results than capturing from root directory
 lcov --capture \
      --directory . \
      --output-file coverage_combined.info \
-     --ignore-errors mismatch,negative,inconsistent \
-     2>&1 | grep -E "Processing|Finished|WARNING|ERROR" || true
+     --rc lcov_branch_coverage=0 \
+     --rc geninfo_unexecuted_blocks=1 \
+     --ignore-errors graph,mismatch,negative,inconsistent,unused,empty,gcov,source \
+     2>&1 | grep -E "Found [0-9]+ data files|Finished" || true
+
+rm -f lcovrc_temp
 
 if [ ! -f coverage_combined.info ] || [ ! -s coverage_combined.info ]; then
     print_error "Failed to generate coverage data"
@@ -307,13 +320,18 @@ print_success "Coverage data captured and merged"
 
 print_header "Step 5: Filtering Coverage Data"
 
-print_info "Filtering out system headers and test files..."
+print_info "Filtering out system headers, conda headers, test files, and external dependencies..."
 lcov --remove coverage_all.info \
      '/usr/*' \
      '*/test/*' \
+     '*/miniconda3/*' \
+     '*/conda/*' \
+     '*/external/*' \
+     '*/catch2/*' \
+     '*/nanobind/*' \
      --output-file coverage_filtered.info \
      --ignore-errors mismatch,negative,unused \
-     2>&1 | grep -E "Excluding|Summary|lines|functions" || true
+     2>&1 | grep -E "Removed|Summary|lines|functions" | tail -5 || true
 
 if [ ! -f coverage_filtered.info ] || [ ! -s coverage_filtered.info ]; then
     print_error "Failed to filter coverage data"

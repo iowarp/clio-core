@@ -58,6 +58,24 @@ set(LOCAL_TRANSFER_TEST_SOURCES
   test_local_transfer.cc
 )
 
+# External Client test executable
+set(EXTERNAL_CLIENT_TEST_TARGET chimaera_external_client_tests)
+set(EXTERNAL_CLIENT_TEST_SOURCES
+  test_external_client.cc
+)
+
+# Runtime Cleanup test executable
+set(RUNTIME_CLEANUP_TEST_TARGET chimaera_runtime_cleanup_tests)
+set(RUNTIME_CLEANUP_TEST_SOURCES
+  test_runtime_cleanup.cc
+)
+
+# IPC Errors test executable
+set(IPC_ERRORS_TEST_TARGET chimaera_ipc_errors_tests)
+set(IPC_ERRORS_TEST_SOURCES
+  test_ipc_errors.cc
+)
+
 # Create core test executable
 add_executable(${TEST_TARGET} ${TEST_SOURCES})
 
@@ -246,6 +264,75 @@ set_target_properties(${LOCAL_TRANSFER_TEST_TARGET} PROPERTIES
 )
 
 set_target_properties(${LOCAL_TRANSFER_TEST_TARGET} PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+
+# Create External Client test executable
+add_executable(${EXTERNAL_CLIENT_TEST_TARGET} ${EXTERNAL_CLIENT_TEST_SOURCES})
+
+target_include_directories(${EXTERNAL_CLIENT_TEST_TARGET} PRIVATE
+  ${CHIMAERA_ROOT}/include
+  ${CHIMAERA_ROOT}/test  # For simple_test.h
+)
+
+target_link_libraries(${EXTERNAL_CLIENT_TEST_TARGET}
+  chimaera_cxx               # Main Chimaera library
+  hshm::cxx                  # HermesShm library
+  ${CMAKE_THREAD_LIBS_INIT}  # Threading support
+)
+
+set_target_properties(${EXTERNAL_CLIENT_TEST_TARGET} PROPERTIES
+  CXX_STANDARD 17
+  CXX_STANDARD_REQUIRED ON
+)
+
+set_target_properties(${EXTERNAL_CLIENT_TEST_TARGET} PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+
+# Create Runtime Cleanup test executable
+add_executable(${RUNTIME_CLEANUP_TEST_TARGET} ${RUNTIME_CLEANUP_TEST_SOURCES})
+
+target_include_directories(${RUNTIME_CLEANUP_TEST_TARGET} PRIVATE
+  ${CHIMAERA_ROOT}/include
+  ${CHIMAERA_ROOT}/test  # For simple_test.h
+)
+
+target_link_libraries(${RUNTIME_CLEANUP_TEST_TARGET}
+  chimaera_cxx               # Main Chimaera library
+  hshm::cxx                  # HermesShm library
+  ${CMAKE_THREAD_LIBS_INIT}  # Threading support
+)
+
+set_target_properties(${RUNTIME_CLEANUP_TEST_TARGET} PROPERTIES
+  CXX_STANDARD 17
+  CXX_STANDARD_REQUIRED ON
+)
+
+set_target_properties(${RUNTIME_CLEANUP_TEST_TARGET} PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+
+# Create IPC Errors test executable
+add_executable(${IPC_ERRORS_TEST_TARGET} ${IPC_ERRORS_TEST_SOURCES})
+
+target_include_directories(${IPC_ERRORS_TEST_TARGET} PRIVATE
+  ${CHIMAERA_ROOT}/include
+  ${CHIMAERA_ROOT}/test  # For simple_test.h
+)
+
+target_link_libraries(${IPC_ERRORS_TEST_TARGET}
+  chimaera_cxx               # Main Chimaera library
+  hshm::cxx                  # HermesShm library
+  ${CMAKE_THREAD_LIBS_INIT}  # Threading support
+)
+
+set_target_properties(${IPC_ERRORS_TEST_TARGET} PROPERTIES
+  CXX_STANDARD 17
+  CXX_STANDARD_REQUIRED ON
+)
+
+set_target_properties(${IPC_ERRORS_TEST_TARGET} PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 
@@ -606,6 +693,39 @@ if(CHIMAERA_ENABLE_TESTS)
     TIMEOUT 300
   )
 
+  # External Client Tests
+  add_test(
+    NAME cr_external_client_connection_tests
+    COMMAND ${EXTERNAL_CLIENT_TEST_TARGET}
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_external_client_connection_tests PROPERTIES
+    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin"
+    TIMEOUT 120
+  )
+
+  # Runtime Cleanup Tests
+  add_test(
+    NAME cr_runtime_cleanup_tests
+    COMMAND ${RUNTIME_CLEANUP_TEST_TARGET}
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_runtime_cleanup_tests PROPERTIES
+    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin"
+    TIMEOUT 120
+  )
+
+  # IPC Errors Tests
+  add_test(
+    NAME cr_ipc_errors_tests
+    COMMAND ${IPC_ERRORS_TEST_TARGET}
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_ipc_errors_tests PROPERTIES
+    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin"
+    TIMEOUT 120
+  )
+
   # Set test properties for timeout and environment
   set_tests_properties(
     cr_runtime_initialization_tests
@@ -709,6 +829,9 @@ install(TARGETS
   ${PER_PROCESS_SHM_TEST_TARGET}
   ${STREAMING_TEST_TARGET}
   ${LOCAL_TRANSFER_TEST_TARGET}
+  ${EXTERNAL_CLIENT_TEST_TARGET}
+  ${RUNTIME_CLEANUP_TEST_TARGET}
+  ${IPC_ERRORS_TEST_TARGET}
   RUNTIME DESTINATION bin
 )
 
