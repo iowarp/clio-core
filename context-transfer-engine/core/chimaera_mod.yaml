@@ -31,3 +31,4 @@ kGetBlobSize: 23        # Get the size of a blob
 kPollTelemetryLog: 21  # Poll telemetry log with minimum logical time filter
 kTagQuery: 30          # Query tags by regex pattern
 kBlobQuery: 31         # Query blobs by tag and blob regex patterns
+kGetTargetInfo: 32     # Get target information (score, capacity, perf metrics)

@@ -1,14 +1,16 @@
+#include <hdf5.h>
 #include <wrp_cae/core/core_runtime.h>
 #include <wrp_cae/core/factory/assimilation_ctx.h>
 #include <wrp_cae/core/factory/assimilator_factory.h>
 #include <wrp_cae/core/factory/hdf5_file_assimilator.h>
+
 #include <cereal/archives/binary.hpp>
 #include <cereal/types/vector.hpp>
 #include <sstream>
 #include <vector>
-#include <hdf5.h>
 
-// Include wrp_cte headers before opening namespace to avoid Method namespace collision
+// Include wrp_cte headers before opening namespace to avoid Method namespace
+// collision
 #include <wrp_cte/core/core_client.h>
 #include <wrp_cte/core/core_tasks.h>
 
@@ -22,11 +24,12 @@ void Runtime::Create(hipc::FullPtr<CreateTask> task, chi::RunContext& ctx) {
   // Do NOT call Init() here
 
   // Initialize CTE client using the CTE pool ID
-  cte_client_ = std::make_shared<wrp_cte::core::Client>(wrp_cte::core::kCtePoolId);
+  cte_client_ =
+      std::make_shared<wrp_cte::core::Client>(wrp_cte::core::kCtePoolId);
 
   // Additional container-specific initialization logic here
   HLOG(kInfo, "Core container created and initialized for pool: {} (ID: {})",
-        pool_name_, pool_id_);
+       pool_name_, pool_id_);
 }
 
 chi::u64 Runtime::GetWorkRemaining() const {
@@ -35,9 +38,10 @@ chi::u64 Runtime::GetWorkRemaining() const {
   return 0;
 }
 
-chi::TaskResume Runtime::ParseOmni(hipc::FullPtr<ParseOmniTask> task, chi::RunContext& ctx) {
+chi::TaskResume Runtime::ParseOmni(hipc::FullPtr<ParseOmniTask> task,
+                                   chi::RunContext& ctx) {
   HLOG(kInfo, "ParseOmni called with {} bytes of serialized data",
-        task->serialized_ctx_.size());
+       task->serialized_ctx_.size());
 
   // Deserialize the vector of AssimilationCtx
   std::vector<AssimilationCtx> assimilation_contexts;
@@ -46,14 +50,16 @@ chi::TaskResume Runtime::ParseOmni(hipc::FullPtr<ParseOmniTask> task, chi::RunCo
     cereal::BinaryInputArchive ar(ss);
     ar(assimilation_contexts);
   } catch (const std::exception& e) {
-    HLOG(kError, "ParseOmni: Failed to deserialize AssimilationCtx vector: {}", e.what());
+    HLOG(kError, "ParseOmni: Failed to deserialize AssimilationCtx vector: {}",
+         e.what());
     task->result_code_ = -1;
     task->error_message_ = e.what();
     task->num_tasks_scheduled_ = 0;
     co_return;
   }
 
-  HLOG(kInfo, "ParseOmni: Processing {} assimilation contexts", assimilation_contexts.size());
+  HLOG(kInfo, "ParseOmni: Processing {} assimilation contexts",
+       assimilation_contexts.size());
 
   // Process each assimilation context
   chi::u32 tasks_scheduled = 0;
@@ -62,17 +68,20 @@ chi::TaskResume Runtime::ParseOmni(hipc::FullPtr<ParseOmniTask> task, chi::RunCo
   for (size_t i = 0; i < assimilation_contexts.size(); ++i) {
     const auto& assimilation_ctx = assimilation_contexts[i];
 
-    HLOG(kInfo, "ParseOmni: Processing context {}/{} - src: {}, dst: {}, format: {}",
-          i + 1, assimilation_contexts.size(),
-          assimilation_ctx.src, assimilation_ctx.dst, assimilation_ctx.format);
+    HLOG(kInfo,
+         "ParseOmni: Processing context {}/{} - src: {}, dst: {}, format: {}",
+         i + 1, assimilation_contexts.size(), assimilation_ctx.src,
+         assimilation_ctx.dst, assimilation_ctx.format);
 
     // Get appropriate assimilator for this context
     auto assimilator = factory.Get(assimilation_ctx.src);
 
     if (!assimilator) {
-      HLOG(kError, "ParseOmni: No assimilator found for source: {}", assimilation_ctx.src);
+      HLOG(kError, "ParseOmni: No assimilator found for source: {}",
+           assimilation_ctx.src);
       task->result_code_ = -2;
-      task->error_message_ = "No assimilator found for source: " + assimilation_ctx.src;
+      task->error_message_ =
+          "No assimilator found for source: " + assimilation_ctx.src;
       task->num_tasks_scheduled_ = tasks_scheduled;
       co_return;
     }
@@ -81,8 +90,10 @@ chi::TaskResume Runtime::ParseOmni(hipc::FullPtr<ParseOmniTask> task, chi::RunCo
     int result = 0;
     co_await assimilator->Schedule(assimilation_ctx, result);
     if (result != 0) {
-      HLOG(kError, "ParseOmni: Assimilator failed for context {}/{} with error code: {}",
-            i + 1, assimilation_contexts.size(), result);
+      HLOG(
+          kError,
+          "ParseOmni: Assimilator failed for context {}/{} with error code: {}",
+          i + 1, assimilation_contexts.size(), result);
       task->result_code_ = result;
       task->error_message_ = std::string("Assimilator failed");
       task->num_tasks_scheduled_ = tasks_scheduled;
@@ -97,38 +108,48 @@ chi::TaskResume Runtime::ParseOmni(hipc::FullPtr<ParseOmniTask> task, chi::RunCo
   task->error_message_ = "";
   task->num_tasks_scheduled_ = tasks_scheduled;
 
-  HLOG(kInfo, "ParseOmni: Successfully scheduled {} assimilations", tasks_scheduled);
+  HLOG(kInfo, "ParseOmni: Successfully scheduled {} assimilations",
+       tasks_scheduled);
   co_return;
 }
 
-chi::TaskResume Runtime::ProcessHdf5Dataset(hipc::FullPtr<ProcessHdf5DatasetTask> task, chi::RunContext& ctx) {
+chi::TaskResume Runtime::ProcessHdf5Dataset(
+    hipc::FullPtr<ProcessHdf5DatasetTask> task, chi::RunContext& ctx) {
   HLOG(kInfo, "ProcessHdf5Dataset: file='{}', dataset='{}', tag_prefix='{}'",
-        task->file_path_.str(), task->dataset_path_.str(), task->tag_prefix_.str());
+       task->file_path_.str(), task->dataset_path_.str(),
+       task->tag_prefix_.str());
 
   // Open the HDF5 file
-  hid_t file_id = H5Fopen(task->file_path_.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
+  hid_t file_id =
+      H5Fopen(task->file_path_.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
   if (file_id < 0) {
-    HLOG(kError, "ProcessHdf5Dataset: Failed to open HDF5 file: {}", task->file_path_.str());
+    HLOG(kError, "ProcessHdf5Dataset: Failed to open HDF5 file: {}",
+         task->file_path_.str());
     task->result_code_ = -1;
-    task->error_message_ = chi::priv::string("Failed to open HDF5 file", CHI_IPC->GetMainAlloc());
+    task->error_message_ =
+        chi::priv::string("Failed to open HDF5 file", HSHM_MALLOC);
     co_return;
   }
 
   // Create assimilator and process the dataset
   wrp_cae::core::Hdf5FileAssimilator assimilator(cte_client_);
   int result = 0;
-  co_await assimilator.ProcessDataset(file_id, task->dataset_path_.str(), task->tag_prefix_.str(), result);
+  co_await assimilator.ProcessDataset(file_id, task->dataset_path_.str(),
+                                      task->tag_prefix_.str(), result);
 
   // Close the HDF5 file
   H5Fclose(file_id);
 
   if (result != 0) {
-    HLOG(kError, "ProcessHdf5Dataset: Failed to process dataset '{}' (error: {})",
-          task->dataset_path_.str(), result);
+    HLOG(kError,
+         "ProcessHdf5Dataset: Failed to process dataset '{}' (error: {})",
+         task->dataset_path_.str(), result);
     task->result_code_ = result;
-    task->error_message_ = chi::priv::string("Dataset processing failed", CHI_IPC->GetMainAlloc());
+    task->error_message_ =
+        chi::priv::string("Dataset processing failed", HSHM_MALLOC);
   } else {
-    HLOG(kInfo, "ProcessHdf5Dataset: Successfully processed dataset '{}'", task->dataset_path_.str());
+    HLOG(kInfo, "ProcessHdf5Dataset: Successfully processed dataset '{}'",
+         task->dataset_path_.str());
     task->result_code_ = 0;
   }
 

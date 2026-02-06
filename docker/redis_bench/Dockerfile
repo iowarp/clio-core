@@ -7,7 +7,7 @@
 #   docker run iowarp/cte-redis-bench:latest SetGet 4 1m 10000
 #   docker run iowarp/cte-redis-bench:latest All 4 1m 10000
 
-FROM iowarp/core-build:latest
+FROM iowarp/build-cpu:latest
 
 # Install Redis server and tools
 # Using redis from Ubuntu repositories for simplicity and stability

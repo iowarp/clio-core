@@ -198,6 +198,31 @@ class Client : public chi::ContainerClient {
   }
 
   /**
+   * WreapDeadIpcs - Periodic task to reap shared memory from dead processes
+   * Calls IpcManager::WreapDeadIpcs() to clean up orphaned shared memory segments
+   * @param pool_query Pool routing information
+   * @param period_us Period in microseconds (default 1000000us = 1s)
+   * @return Future for the WreapDeadIpcs task
+   */
+  chi::Future<WreapDeadIpcsTask> AsyncWreapDeadIpcs(const chi::PoolQuery& pool_query,
+      double period_us = 1000000) {
+    auto* ipc_manager = CHI_IPC;
+
+    // Allocate WreapDeadIpcsTask
+    auto task = ipc_manager->NewTask<WreapDeadIpcsTask>(
+        chi::CreateTaskId(), pool_id_, pool_query);
+
+    // Set task as periodic if period is specified
+    if (period_us > 0) {
+      task->SetPeriod(period_us, chi::kMicro);
+      task->SetFlags(TASK_PERIODIC);
+    }
+
+    // Submit to runtime and return Future
+    return ipc_manager->Send(task);
+  }
+
+  /**
    * Monitor worker statistics (asynchronous)
    * Collects current statistics from all workers including:
    * - Number of queued, blocked, and periodic tasks
@@ -254,6 +279,7 @@ class Client : public chi::ContainerClient {
     // Submit to runtime and return Future
     return ipc_manager->Send(task);
   }
+
 };
 
 }  // namespace chimaera::admin

@@ -11,7 +11,7 @@
 * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
 
 #include "basic_test.h"
-#include "hermes_shm/util/compress/compress_factory.h"
+#include "hermes_shm/compress/compress_factory.h"
 #include <utility>
 
 TEST_CASE("TestCompress") {

@@ -60,6 +60,10 @@ chi::TaskResume Runtime::Create(hipc::FullPtr<CreateTask> task,
   // This task polls for ZMQ heartbeat requests and responds
   client_.AsyncHeartbeat(chi::PoolQuery::Local(), 5000);
 
+  // Spawn periodic WreapDeadIpcs task with 1 second period
+  // This task reaps shared memory segments from dead processes
+  client_.AsyncWreapDeadIpcs(chi::PoolQuery::Local(), 1000000);
+
   HLOG(kDebug,
        "Admin: Container created and initialized for pool: {} (ID: {}, count: "
        "{})",
@@ -140,10 +144,9 @@ chi::TaskResume Runtime::GetOrCreatePool(
 
   } catch (const std::exception &e) {
     task->return_code_ = 99;
-    auto alloc = CHI_IPC->GetMainAlloc();
     std::string error_msg =
         std::string("Exception during pool creation: ") + e.what();
-    task->error_message_ = chi::priv::string(alloc, error_msg);
+    task->error_message_ = chi::priv::string(HSHM_MALLOC, error_msg);
     HLOG(kError, "Admin: Pool creation failed with exception: {}", e.what());
   }
   co_return;
@@ -191,10 +194,9 @@ chi::TaskResume Runtime::DestroyPool(hipc::FullPtr<DestroyPoolTask> task,
 
   } catch (const std::exception &e) {
     task->return_code_ = 99;
-    auto alloc = CHI_IPC->GetMainAlloc();
     std::string error_msg =
         std::string("Exception during pool destruction: ") + e.what();
-    task->error_message_ = chi::priv::string(alloc, error_msg);
+    task->error_message_ = chi::priv::string(HSHM_MALLOC, error_msg);
     HLOG(kError, "Admin: Pool destruction failed with exception: {}", e.what());
   }
   co_return;
@@ -223,10 +225,9 @@ chi::TaskResume Runtime::StopRuntime(hipc::FullPtr<StopRuntimeTask> task,
 
   } catch (const std::exception &e) {
     task->return_code_ = 99;
-    auto *alloc = CHI_IPC->GetMainAlloc();
     std::string error_msg =
         std::string("Exception during runtime shutdown: ") + e.what();
-    task->error_message_ = chi::priv::string(alloc, error_msg);
+    task->error_message_ = chi::priv::string(HSHM_MALLOC, error_msg);
     HLOG(kError, "Admin: Runtime shutdown failed with exception: {}", e.what());
   }
   (void)rctx;
@@ -917,7 +918,7 @@ chi::TaskResume Runtime::Heartbeat(hipc::FullPtr<HeartbeatTask> task,
 }
 
 chi::TaskResume Runtime::Monitor(hipc::FullPtr<MonitorTask> task,
-                                  chi::RunContext &rctx) {
+                                 chi::RunContext &rctx) {
   HLOG(kInfo, "Admin: Executing Monitor task - START");
 
   // Get work orchestrator to access all workers
@@ -937,7 +938,8 @@ chi::TaskResume Runtime::Monitor(hipc::FullPtr<MonitorTask> task,
 
   // Collect stats from all workers
   for (size_t i = 0; i < num_workers; ++i) {
-    chi::Worker *worker = work_orchestrator->GetWorker(static_cast<chi::u32>(i));
+    chi::Worker *worker =
+        work_orchestrator->GetWorker(static_cast<chi::u32>(i));
     if (!worker) {
       continue;
     }
@@ -948,7 +950,8 @@ chi::TaskResume Runtime::Monitor(hipc::FullPtr<MonitorTask> task,
   }
 
   task->SetReturnCode(0);
-  HLOG(kInfo, "Monitor: Collected stats from {} workers - COMPLETE", task->info_.size());
+  HLOG(kInfo, "Monitor: Collected stats from {} workers - COMPLETE",
+       task->info_.size());
 
   (void)rctx;
   co_return;
@@ -1026,10 +1029,31 @@ chi::TaskResume Runtime::SubmitBatch(hipc::FullPtr<SubmitBatchTask> task,
   }
 
   task->SetReturnCode(0);
-  HLOG(kInfo, "SubmitBatch: Completed {} of {} tasks",
-       task->tasks_completed_, total_tasks);
+  HLOG(kInfo, "SubmitBatch: Completed {} of {} tasks", task->tasks_completed_,
+       total_tasks);
 
   (void)rctx;
+  co_return;
+}
+
+chi::TaskResume Runtime::WreapDeadIpcs(hipc::FullPtr<WreapDeadIpcsTask> task,
+                                       chi::RunContext &rctx) {
+  auto *ipc_manager = CHI_IPC;
+
+  // Call IpcManager::WreapDeadIpcs to reap shared memory from dead processes
+  task->reaped_count_ = ipc_manager->WreapDeadIpcs();
+  // task->reaped_count_ = 0;
+
+  // Mark whether we did work (for periodic task efficiency tracking)
+  if (task->reaped_count_ > 0) {
+    rctx.did_work_ = true;
+    HLOG(kInfo, "Admin: WreapDeadIpcs reaped {} shared memory segments",
+         task->reaped_count_);
+  } else {
+    rctx.did_work_ = false;
+  }
+
+  task->SetReturnCode(0);
   co_return;
 }
 

@@ -89,8 +89,15 @@ option(WRP_CORE_ENABLE_THALLIUM "Build tests which depend on thallium" OFF)
 # Data and Serialization Features
 #------------------------------------------------------------------------------
 option(WRP_CORE_ENABLE_CEREAL "Enable serialization using cereal" ON)
-option(WRP_CORE_ENABLE_COMPRESS "Enable compression" OFF)
+option(WRP_CTE_ENABLE_COMPRESS "Enable compression support (builds compressor chimod and tests)" OFF)
 option(WRP_CORE_ENABLE_ENCRYPT "Enable encryption" OFF)
+
+# Set internal compression flags from WRP_CTE_ENABLE_COMPRESS
+if(WRP_CTE_ENABLE_COMPRESS)
+    set(WRP_CORE_ENABLE_COMPRESS ON)
+else()
+    set(WRP_CORE_ENABLE_COMPRESS OFF)
+endif()
 option(WRP_CORE_ENABLE_HDF5 "Enable HDF5 support in CAE" ON)
 
 #------------------------------------------------------------------------------
@@ -189,7 +196,7 @@ set(HSHM_ENABLE_THALLIUM ${WRP_CORE_ENABLE_THALLIUM} CACHE BOOL "Enable Thallium
 set(HSHM_ENABLE_OPENMP ${WRP_CORE_ENABLE_OPENMP} CACHE BOOL "Enable OpenMP (controlled by WRP_CORE_ENABLE_OPENMP)" FORCE)
 set(HSHM_ENABLE_CEREAL ${WRP_CORE_ENABLE_CEREAL} CACHE BOOL "Enable Cereal (controlled by WRP_CORE_ENABLE_CEREAL)" FORCE)
 set(HSHM_ENABLE_DOXYGEN ${WRP_CORE_ENABLE_DOXYGEN} CACHE BOOL "Enable Doxygen (controlled by WRP_CORE_ENABLE_DOXYGEN)" FORCE)
-set(HSHM_ENABLE_COMPRESS ${WRP_CORE_ENABLE_COMPRESS} CACHE BOOL "Enable Compress (controlled by WRP_CORE_ENABLE_COMPRESS)" FORCE)
+set(HSHM_ENABLE_COMPRESS ${WRP_CTE_ENABLE_COMPRESS} CACHE BOOL "Enable Compress (controlled by WRP_CTE_ENABLE_COMPRESS)" FORCE)
 set(HSHM_ENABLE_ENCRYPT ${WRP_CORE_ENABLE_ENCRYPT} CACHE BOOL "Enable Encrypt (controlled by WRP_CORE_ENABLE_ENCRYPT)" FORCE)
 set(HSHM_ENABLE_ELF ${WRP_CORE_ENABLE_ELF} CACHE BOOL "Enable ELF (controlled by WRP_CORE_ENABLE_ELF)" FORCE)
 set(HSHM_ENABLE_CUDA ${WRP_CORE_ENABLE_CUDA} CACHE BOOL "Enable CUDA (controlled by WRP_CORE_ENABLE_CUDA)" FORCE)
@@ -317,12 +324,12 @@ endif()
 find_package(Threads REQUIRED)
 
 # Compression libraries (conditional)
-if(WRP_CORE_ENABLE_COMPRESS)
-    message(STATUS "WRP_CORE_ENABLE_COMPRESS is ON")
+if(WRP_CTE_ENABLE_COMPRESS)
+    message(STATUS "WRP_CTE_ENABLE_COMPRESS is ON")
 
     # Verify conda environment is enabled for compression libraries
     if(NOT WRP_CORE_ENABLE_CONDA OR NOT IN_CONDA_BUILD)
-        message(FATAL_ERROR "WRP_CORE_ENABLE_COMPRESS requires WRP_CORE_ENABLE_CONDA=ON. Please enable conda or install compression libraries manually.")
+        message(FATAL_ERROR "WRP_CTE_ENABLE_COMPRESS requires WRP_CORE_ENABLE_CONDA=ON. Please enable conda or install compression libraries manually.")
     endif()
 
     # Libraries with pkg-config support - verify they're from conda
@@ -402,7 +409,7 @@ if(WRP_CORE_ENABLE_COMPRESS)
 
     # LibPressio - try find_package first (CMake-based), fall back to pkg-config
     # Make it optional since libpressio may not be installed
-    set(HSHM_HAS_LIBPRESSIO OFF)
+    set(HSHM_ENABLE_LIBPRESSIO OFF)
     find_package(LibPressio QUIET)
     if(LibPressio_FOUND)
         message(STATUS "found libpressio.h via CMake at ${LibPressio_INCLUDE_DIRS}")
@@ -416,12 +423,12 @@ if(WRP_CORE_ENABLE_COMPRESS)
         endif()
         set(libpressio_INCLUDE_DIRS ${LibPressio_INCLUDE_DIRS})
         set(libpressio_LIBRARY_DIRS "")
-        set(HSHM_HAS_LIBPRESSIO ON)
+        set(HSHM_ENABLE_LIBPRESSIO ON)
     else()
         pkg_check_modules(libpressio QUIET libpressio)
         if(libpressio_FOUND)
             message(STATUS "found libpressio.h at ${libpressio_INCLUDE_DIRS}")
-            set(HSHM_HAS_LIBPRESSIO ON)
+            set(HSHM_ENABLE_LIBPRESSIO ON)
         else()
             message(STATUS "libpressio not found - LibPressio wrapper will be disabled")
             set(libpressio_LIBRARIES "")
@@ -464,11 +471,14 @@ if(WRP_CORE_ENABLE_COMPRESS)
         ${blosc2_LIBRARY_DIRS}
     )
     # Only add libpressio if found
-    if(HSHM_HAS_LIBPRESSIO)
+    if(HSHM_ENABLE_LIBPRESSIO)
         list(APPEND COMPRESS_LIBS ${libpressio_LIBRARIES})
         list(APPEND COMPRESS_INCLUDES ${libpressio_INCLUDE_DIRS})
         list(APPEND COMPRESS_LIB_DIRS ${libpressio_LIBRARY_DIRS})
     endif()
+
+    # Make HSHM_ENABLE_LIBPRESSIO available to subdirectories (HSHM)
+    set(HSHM_ENABLE_LIBPRESSIO ${HSHM_ENABLE_LIBPRESSIO} CACHE BOOL "Enable LibPressio wrapper (auto-detected)" FORCE)
 endif()
 
 # Encryption libraries (conditional)

@@ -201,82 +201,9 @@ target_compile_definitions(mpi INTERFACE
 )
 add_library(hshm::mpi ALIAS mpi)
 
-# hshm::compress - Compression support
-add_library(compress INTERFACE)
-if(HSHM_ENABLE_COMPRESS)
-    target_link_libraries(compress INTERFACE ${COMPRESS_LIBS})
-    target_link_directories(compress INTERFACE ${COMPRESS_LIB_DIRS})
-    target_include_directories(compress INTERFACE ${COMPRESS_INCLUDES})
-endif()
-target_compile_definitions(compress INTERFACE
-    HSHM_ENABLE_COMPRESS=$<BOOL:${HSHM_ENABLE_COMPRESS}>
-    HSHM_HAS_LIBPRESSIO=$<BOOL:${HSHM_HAS_LIBPRESSIO}>
-)
-add_library(hshm::compress ALIAS compress)
-
-# hshm::encrypt - Encryption support
-add_library(encrypt INTERFACE)
-if(HSHM_ENABLE_ENCRYPT)
-    target_link_libraries(encrypt INTERFACE ${ENCRYPT_LIBS})
-    target_link_directories(encrypt INTERFACE ${ENCRYPT_LIB_DIRS})
-    target_include_directories(encrypt INTERFACE ${ENCRYPT_INCLUDES})
-endif()
-target_compile_definitions(encrypt INTERFACE
-    HSHM_ENABLE_ENCRYPT=$<BOOL:${HSHM_ENABLE_ENCRYPT}>
-)
-add_library(hshm::encrypt ALIAS encrypt)
-
-# Legacy host_deps for backwards compatibility (will be removed)
-add_library(host_deps INTERFACE)
-target_link_libraries(host_deps INTERFACE
-    configure
-    serialize
-    interceptor
-    lightbeam
-    thread_all
-    mpi
-    compress
-    encrypt
-    ${REAL_TIME_FLAGS}
-)
-
-# -----------------------------------------------------------------------------
-# Documentation
-# -----------------------------------------------------------------------------
-if(HSHM_ENABLE_DOXYGEN)
-    add_doxygen_doc(
-        BUILD_DIR
-        ${CMAKE_CURRENT_BINARY_DIR}/_build
-        DOXY_FILE
-        ${CMAKE_CURRENT_SOURCE_DIR}/doc/Doxyfile.in
-        TARGET_NAME
-        dox
-        COMMENT
-        "HTML documentation"
-    )
-endif()
-
-# ------------------------------------------------------------------------------
-# Code Coverage
-# ------------------------------------------------------------------------------
-if(NOT IS_HSHM_MAIN)
-    if(HSHM_ENABLE_COVERAGE)
-        set(COVERAGE_FLAGS "-fprofile-arcs -ftest-coverage" CACHE STRING
-            "Flags to the coverage program to perform coverage inspection")
-        mark_as_advanced(COVERAGE_FLAGS)
-
-        macro(set_coverage_flags target)
-            set_target_properties(${target}
-                PROPERTIES
-                COMPILE_FLAGS ${COVERAGE_FLAGS}
-                LINK_FLAGS ${COVERAGE_FLAGS}
-            )
-        endmacro()
-    endif()
-endif()
-
 # ------------------------------------------------------------------------------
 # CMake function for target compile definitions
+# (must be defined before add_subdirectory(src) which uses it)
 # ------------------------------------------------------------------------------
 function(hshm_target_compile_definitions target)
     get_target_property(target_type ${target} TYPE)
@@ -323,9 +250,107 @@ function(hshm_target_compile_definitions target)
 endfunction()
 
 # ------------------------------------------------------------------------------
-# Build hermes_shm
+# Code Coverage (must be defined before add_subdirectory(src) which uses it)
+# ------------------------------------------------------------------------------
+if(NOT IS_HSHM_MAIN)
+    if(HSHM_ENABLE_COVERAGE)
+        set(COVERAGE_FLAGS "-fprofile-arcs -ftest-coverage" CACHE STRING
+            "Flags to the coverage program to perform coverage inspection")
+        mark_as_advanced(COVERAGE_FLAGS)
+
+        macro(set_coverage_flags target)
+            set_target_properties(${target}
+                PROPERTIES
+                COMPILE_FLAGS ${COVERAGE_FLAGS}
+                LINK_FLAGS ${COVERAGE_FLAGS}
+            )
+        endmacro()
+    endif()
+endif()
+
+# ------------------------------------------------------------------------------
+# Build hermes_shm source libraries (must be before hshm::compress so that
+# qtable_predictor and dense_nn_predictor targets are available)
 # ------------------------------------------------------------------------------
 add_subdirectory(src)
+
+# hshm::compress - Compression support
+add_library(compress INTERFACE)
+if(HSHM_ENABLE_COMPRESS)
+    target_link_libraries(compress INTERFACE ${COMPRESS_LIBS})
+    target_link_directories(compress INTERFACE ${COMPRESS_LIB_DIRS})
+    target_include_directories(compress INTERFACE ${COMPRESS_INCLUDES})
+    # Link qtable_predictor if it was built
+    if(TARGET qtable_predictor)
+        target_link_libraries(compress INTERFACE qtable_predictor)
+    endif()
+    # Link dense_nn_predictor if it was built (requires Eigen3)
+    if(TARGET dense_nn_predictor)
+        target_link_libraries(compress INTERFACE dense_nn_predictor)
+    endif()
+endif()
+target_compile_definitions(compress INTERFACE
+    HSHM_ENABLE_COMPRESS=$<BOOL:${HSHM_ENABLE_COMPRESS}>
+    HSHM_ENABLE_LIBPRESSIO=$<BOOL:${HSHM_ENABLE_LIBPRESSIO}>
+)
+add_library(hshm::compress ALIAS compress)
+
+# hshm::encrypt - Encryption support
+add_library(encrypt INTERFACE)
+if(HSHM_ENABLE_ENCRYPT)
+    target_link_libraries(encrypt INTERFACE ${ENCRYPT_LIBS})
+    target_link_directories(encrypt INTERFACE ${ENCRYPT_LIB_DIRS})
+    target_include_directories(encrypt INTERFACE ${ENCRYPT_INCLUDES})
+endif()
+target_compile_definitions(encrypt INTERFACE
+    HSHM_ENABLE_ENCRYPT=$<BOOL:${HSHM_ENABLE_ENCRYPT}>
+)
+add_library(hshm::encrypt ALIAS encrypt)
+
+# Legacy host_deps for backwards compatibility (will be removed)
+add_library(host_deps INTERFACE)
+target_link_libraries(host_deps INTERFACE
+    configure
+    serialize
+    interceptor
+    lightbeam
+    thread_all
+    mpi
+    compress
+    encrypt
+    ${REAL_TIME_FLAGS}
+)
+
+# Install interface libraries (compiled libraries are installed in src/CMakeLists.txt)
+install(TARGETS
+    configure
+    serialize
+    interceptor
+    lightbeam
+    thread_all
+    mpi
+    compress
+    encrypt
+    host_deps
+    EXPORT
+    ${HSHM_EXPORTED_TARGETS}
+)
+
+# -----------------------------------------------------------------------------
+# Documentation
+# -----------------------------------------------------------------------------
+if(HSHM_ENABLE_DOXYGEN)
+    add_doxygen_doc(
+        BUILD_DIR
+        ${CMAKE_CURRENT_BINARY_DIR}/_build
+        DOXY_FILE
+        ${CMAKE_CURRENT_SOURCE_DIR}/doc/Doxyfile.in
+        TARGET_NAME
+        dox
+        COMMENT
+        "HTML documentation"
+    )
+endif()
 
 if(NOT IS_HSHM_MAIN)
     add_custom_target(lint COMMAND bash ${HSHM_ROOT}/scripts/lint.sh ${HSHM_ROOT})

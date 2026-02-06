@@ -99,7 +99,7 @@ Update EVERY chimod to return Future<TaskT> from the Async* methods instead of a
 
 Update NewTask in IpcManager to use standard new instead of main_alloc_.
 Update DelTask in IpcManager to use standard delete instead of Allocator::DelObj.
-Update EVERY task to no longer take in ``CHI_MAIN_ALLOC_T *alloc`` as an input. For all tasks depending on it, please use CHI_IPC->GetMainAlloc() instead.
+Update EVERY task to no longer take in ``CHI_MAIN_ALLOC_T *alloc`` as an input. For all tasks depending on it, please use HSHM_MALLOC instead.
 Update EVERY *_runtime.cc code to take as input a Future<TaskT> instead of FullPtr<TaskT>.
 Update the SendIn, SaveIn, LoadIn, LoadOut, LocalLoadIn, and LocalSaveOut methods to use take as input Future<TaskT> instead of FullPtr<TaskT> by updating chi_refresh_repo.
 

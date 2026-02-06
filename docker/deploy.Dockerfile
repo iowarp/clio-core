@@ -1,6 +1,9 @@
 # Deployment Dockerfile for IOWarp Core
+# DEPRECATED: Use deploy-cpu.Dockerfile instead.
+# This file is kept for backward compatibility.
+#
 # Inherits from the build container
-FROM iowarp/core-build:latest
+FROM iowarp/build-cpu:latest
 
 # Create empty runtime configuration file (if not inherited from base)
 RUN sudo mkdir -p /etc/iowarp && \

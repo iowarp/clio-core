@@ -26,3 +26,4 @@ kRecv: 15                # Receive task inputs or outputs from network
 kHeartbeat: 16           # Heartbeat for runtime health check
 kMonitor: 17             # Monitor the runtime
 kSubmitBatch: 18         # Submit a batch of tasks in a single RPC
+kWreapDeadIpcs: 19       # Periodic task to reap dead IPC segments

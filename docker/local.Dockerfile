@@ -1,4 +1,6 @@
-FROM iowarp/iowarp-deps:latest
+# Local build Dockerfile - builds from existing build directory
+# Note: Use deps-cpu instead of the old iowarp-deps
+FROM iowarp/deps-cpu:latest
 
 COPY . /workspace
 

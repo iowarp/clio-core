@@ -44,7 +44,6 @@ workers:
 memory:
   main_segment_size: 1GB
   client_data_segment_size: 256MB
-  runtime_data_segment_size: 256MB
 
 networking:
   port: 5555

@@ -120,7 +120,7 @@ chi::TaskResume BinaryFileAssimilator::Schedule(const AssimilationCtx& ctx, int&
 
   HLOG(kInfo, "BinaryFileAssimilator: Storing description blob: '{}'", description);
   auto desc_task = cte_client_->AsyncPutBlob(
-      tag_id, "description", 0, desc_size, desc_buffer.shm_.template Cast<void>(), 1.0f, 0);
+      tag_id, "description", 0, desc_size, desc_buffer.shm_.template Cast<void>(), 1.0f, wrp_cte::core::Context(), 0);
   co_await desc_task;
 
   if (desc_task->return_code_ != 0) {
@@ -216,7 +216,7 @@ chi::TaskResume BinaryFileAssimilator::Schedule(const AssimilationCtx& ctx, int&
       HLOG(kInfo, "BinaryFileAssimilator: About to call AsyncPutBlob for chunk {}", chunk_idx);
       auto task = cte_client_->AsyncPutBlob(
           tag_id, blob_name, 0,
-          current_chunk_size, buffer_ptr.shm_.template Cast<void>(), 1.0f, 0);
+          current_chunk_size, buffer_ptr.shm_.template Cast<void>(), 1.0f, wrp_cte::core::Context(), 0);
 
       active_tasks.push_back(task);
       

@@ -294,8 +294,8 @@ void IOWorkerThread(size_t thread_id, const BenchmarkConfig &config,
       size_t bytes_remaining = config.io_size - bytes_written;
       size_t bytes_to_write = std::min(bytes_remaining, size_t(4096));
 
-      // Create ArrayVector with single block for Write operation
-      chimaera::bdev::ArrayVector<chimaera::bdev::Block, 128> single_block;
+      // Create chi::priv::vector with single block for Write operation
+      chi::priv::vector<chimaera::bdev::Block> single_block(HSHM_MALLOC);
       single_block.push_back(blocks[block_idx]);
 
       auto write_task = bdev_client.AsyncWrite(chi::PoolQuery::Local(),

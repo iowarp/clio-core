@@ -164,8 +164,8 @@ u32 DefaultScheduler::MapByPidTid(u32 num_lanes) {
 }
 
 void DefaultScheduler::AssignToWorkerType(ThreadType thread_type,
-                                          const FullPtr<Task> &task_ptr) {
-  if (task_ptr.IsNull()) {
+                                          Future<Task> &future) {
+  if (future.IsNull()) {
     return;
   }
 
@@ -197,11 +197,6 @@ void DefaultScheduler::AssignToWorkerType(ThreadType thread_type,
   // Get the worker's assigned lane and emplace the task
   TaskLane *lane = worker->GetLane();
   if (lane != nullptr) {
-    // RUNTIME PATH: Create Future with task pointer set (no serialization)
-    auto *ipc_manager = CHI_IPC;
-    auto *alloc = ipc_manager->GetMainAlloc();
-    Future<Task> future(alloc, task_ptr);
-
     // Emplace the Future into the lane
     lane->Emplace(future);
   }

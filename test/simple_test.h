@@ -132,6 +132,26 @@ public:
 #define INFO(message) \
     std::cout << "  [INFO] " << message << std::endl
 
+// Check if a test name matches a filter (supports [tag] matching)
+inline bool matches_filter(const std::string& name, const std::string& filter) {
+    if (filter.empty()) return true;
+    // If filter contains '[', extract all [tag] tokens and check each
+    if (filter.find('[') != std::string::npos) {
+        size_t pos = 0;
+        while (pos < filter.size()) {
+            size_t start = filter.find('[', pos);
+            if (start == std::string::npos) break;
+            size_t end = filter.find(']', start);
+            if (end == std::string::npos) break;
+            std::string tag = filter.substr(start, end - start + 1);
+            if (name.find(tag) == std::string::npos) return false;
+            pos = end + 1;
+        }
+        return true;
+    }
+    return name.find(filter) != std::string::npos;
+}
+
 // Main test runner with optional filter
 inline int run_all_tests(const std::string& filter = "") {
     const auto& tests = TestRegistry::instance().get_tests();
@@ -139,7 +159,7 @@ inline int run_all_tests(const std::string& filter = "") {
     // Count tests that match filter
     int matching_tests = 0;
     for (const auto& test : tests) {
-        if (filter.empty() || test.first.find(filter) != std::string::npos) {
+        if (matches_filter(test.first, filter)) {
             matching_tests++;
         }
     }
@@ -152,7 +172,7 @@ inline int run_all_tests(const std::string& filter = "") {
 
     for (const auto& test : tests) {
         // Skip tests that don't match filter
-        if (!filter.empty() && test.first.find(filter) == std::string::npos) {
+        if (!matches_filter(test.first, filter)) {
             continue;
         }
 
@@ -195,7 +215,7 @@ inline int run_all_tests(const std::string& filter = "") {
 // Main TEST_CASE macro that works with string names
 #define TEST_CASE(test_name, tags) \
     void UNIQUE_NAME(test_func_)(); \
-    static SimpleTest::TestRegistrar UNIQUE_NAME(test_reg_)(test_name, UNIQUE_NAME(test_func_)); \
+    static SimpleTest::TestRegistrar UNIQUE_NAME(test_reg_)(std::string(test_name) + " " + std::string(tags), UNIQUE_NAME(test_func_)); \
     void UNIQUE_NAME(test_func_)()
 
 // Main function for test executable

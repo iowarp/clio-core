@@ -3,7 +3,7 @@
  * @brief Implementation of Dense Neural Network compression predictor using MiniDNN
  */
 
-#include "context-transport-primitives/compression/dense_nn_predictor.h"
+#include "hermes_shm/compress/dynamic/compression/dense_nn_predictor.h"
 #include <fstream>
 #include <chrono>
 #include <filesystem>
@@ -560,60 +560,6 @@ std::vector<CompressionPrediction> DenseNNPredictor::PredictBatch(
   }
 
   return results;
-}
-
-bool DenseNNPredictor::TrainRatioModel(
-    const std::vector<CompressionFeatures>& features,
-    const std::vector<float>& labels,
-    const TrainingConfig& config) {
-  std::lock_guard<std::mutex> lock(mutex_);
-
-  // Store architecture for save/load
-  ratio_hidden_layers_ = config.hidden_layers;
-  ratio_dropout_rate_ = config.dropout_rate;
-
-  ratio_network_ = std::make_unique<MiniDNN::Network>();
-  bool success = TrainNetwork(features, labels, config, *ratio_network_, ratio_scaler_);
-  if (success) {
-    ratio_model_ready_ = true;
-  }
-  return success;
-}
-
-bool DenseNNPredictor::TrainPSNRModel(
-    const std::vector<CompressionFeatures>& features,
-    const std::vector<float>& labels,
-    const TrainingConfig& config) {
-  std::lock_guard<std::mutex> lock(mutex_);
-
-  // Store architecture for save/load
-  psnr_hidden_layers_ = config.hidden_layers;
-  psnr_dropout_rate_ = config.dropout_rate;
-
-  psnr_network_ = std::make_unique<MiniDNN::Network>();
-  bool success = TrainNetwork(features, labels, config, *psnr_network_, psnr_scaler_);
-  if (success) {
-    psnr_model_ready_ = true;
-  }
-  return success;
-}
-
-bool DenseNNPredictor::TrainTimeModel(
-    const std::vector<CompressionFeatures>& features,
-    const std::vector<float>& labels,
-    const TrainingConfig& config) {
-  std::lock_guard<std::mutex> lock(mutex_);
-
-  // Store architecture for save/load
-  time_hidden_layers_ = config.hidden_layers;
-  time_dropout_rate_ = config.dropout_rate;
-
-  time_network_ = std::make_unique<MiniDNN::Network>();
-  bool success = TrainNetwork(features, labels, config, *time_network_, time_scaler_);
-  if (success) {
-    time_model_ready_ = true;
-  }
-  return success;
 }
 
 bool DenseNNPredictor::Train(

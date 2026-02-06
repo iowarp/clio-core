@@ -45,21 +45,21 @@
 #include "util/type_switch.h"
 
 // Compression utilities (guarded by HSHM_ENABLE_COMPRESS)
-#include "util/compress/blosc.h"
-#include "util/compress/brotli.h"
-#include "util/compress/bzip2.h"
-#include "util/compress/compress.h"
-#include "util/compress/compress_factory.h"
-#include "util/compress/lz4.h"
-#include "util/compress/lzma.h"
-#include "util/compress/lzo.h"
-#include "util/compress/snappy.h"
-#include "util/compress/zlib.h"
-#include "util/compress/zstd.h"
+#include "compress/blosc.h"
+#include "compress/brotli.h"
+#include "compress/bzip2.h"
+#include "compress/compress.h"
+#include "compress/compress_factory.h"
+#include "compress/lz4.h"
+#include "compress/lzma.h"
+#include "compress/lzo.h"
+#include "compress/snappy.h"
+#include "compress/zlib.h"
+#include "compress/zstd.h"
 
 // Encryption utilities (guarded by HSHM_ENABLE_ENCRYPT)
-#include "util/encrypt/aes.h"
-#include "util/encrypt/encrypt.h"
+#include "encrypt/aes.h"
+#include "encrypt/encrypt.h"
 
 // Thread models and synchronization (guarded by respective HSHM_ENABLE_*
 // macros)

@@ -5,7 +5,6 @@
 memory:
   main_segment_size: 1073741824      # 1GB
   client_data_segment_size: 536870912 # 512MB
-  runtime_data_segment_size: 536870912 # 512MB
 
 # Network configuration
 networking:

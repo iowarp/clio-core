@@ -18,6 +18,7 @@
 #include "chimaera/task_queue.h"
 #include "chimaera/types.h"
 #include "chimaera/scheduler/scheduler.h"
+#include "hermes_shm/memory/allocator/malloc_allocator.h"
 
 namespace chi {
 
@@ -473,9 +474,9 @@ class Worker {
   std::queue<RunContext *> blocked_queues_[NUM_BLOCKED_QUEUES];
 
   // Event queue for waking up tasks when their subtasks complete
-  // Allocated from main allocator with same depth as TaskLane
+  // Allocated from malloc allocator (temporary runtime data, not IPC)
   static constexpr u32 EVENT_QUEUE_DEPTH = 1024;
-  hipc::mpsc_ring_buffer<RunContext *, CHI_MAIN_ALLOC_T> *event_queue_;
+  hshm::ipc::mpsc_ring_buffer<RunContext *, hshm::ipc::MallocAllocator> *event_queue_;
 
   // Periodic queue system for time-based periodic tasks:
   // - Queue[0]: Tasks with yield_time_us_ <= 50us (checked every 16 iterations)

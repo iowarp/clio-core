@@ -9,6 +9,7 @@
 
 // Main HSHM include
 #include <hermes_shm/hermes_shm.h>
+#include <hermes_shm/memory/allocator/malloc_allocator.h>
 
 /**
  * Core type definitions for Chimaera distributed task execution framework
@@ -265,13 +266,11 @@ constexpr PoolId kAdminPoolId =
 // Allocator type aliases using HSHM conventions
 #define CHI_MAIN_ALLOC_T hipc::MultiProcessAllocator
 #define CHI_CDATA_ALLOC_T hipc::MultiProcessAllocator
-#define CHI_RDATA_ALLOC_T CHI_CDATA_ALLOC_T  // Runtime data uses same allocator as client data
 
 // Memory segment identifiers
 enum MemorySegment {
   kMainSegment = 0,
-  kClientDataSegment = 1,
-  kRuntimeDataSegment = 2
+  kClientDataSegment = 1
 };
 
 // Input/Output parameter macros
@@ -312,10 +311,11 @@ template <typename T> using FullPtr = hipc::FullPtr<T>;
 }  // namespace chi
 
 namespace chi::priv {
-typedef hshm::priv::string<CHI_MAIN_ALLOC_T> string;
+// Private data structures use MallocAllocator (heap memory, not shared)
+typedef hshm::priv::string<hipc::MallocAllocator> string;
 
 template<typename T>
-using vector = hshm::priv::vector<T, CHI_MAIN_ALLOC_T>;
+using vector = hshm::priv::vector<T, hipc::MallocAllocator>;
 }  // namespace chi::priv
 
 namespace chi::ipc {

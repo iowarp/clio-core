@@ -63,9 +63,9 @@ class DefaultScheduler : public Scheduler {
   /**
    * Assign a task to a worker of the specified type using round-robin.
    * @param thread_type Type of worker to assign to (kSchedWorker or kSlow)
-   * @param task_ptr Pointer to the task to assign
+   * @param future Future containing the task to assign
    */
-  void AssignToWorkerType(ThreadType thread_type, const FullPtr<Task> &task_ptr);
+  void AssignToWorkerType(ThreadType thread_type, Future<Task> &future);
 
   /**
    * Get the network worker

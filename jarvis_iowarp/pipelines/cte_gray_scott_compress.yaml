@@ -1,0 +1,78 @@
+# CTE Gray-Scott Compression Pipeline
+# Purpose: Run Gray-Scott simulation with CTE and dynamic compression
+# Requirements: chimaera_start_runtime in PATH, gray-scott executable, iowarp_engine plugin
+
+name: cte_gray_scott_compress
+
+pkgs:
+  - pkg_type: jarvis_iowarp.wrp_runtime
+    pkg_name: runtime
+    log_level: "debug"
+    # Memory configuration to fit within /dev/shm (2GB limit)
+    # Total: 512M + (4 procs × 256M) = 1.5GB, within limit
+    main_segment_size: "512M"
+    client_data_segment_size: "256M"
+
+  - pkg_type: jarvis_iowarp.wrp_cte
+    pkg_name: cte_core
+    pool_name: "wrp_cte_core"
+    devices:
+      - ["${HOME}/cte_gs_compress/storage.bin", "2GB", 0.8]
+
+    # CTE Configuration Parameters
+    dpe_type: "max_bw"                   # Data placement engine: random, round_robin, max_bw
+    neighborhood: 4                      # Number of targets (nodes CTE can buffer to)
+    default_target_timeout_ms: 30000     # Target timeout (ms)
+    poll_period_ms: 5000                 # Period to rescan targets for statistics (ms)
+
+    # Compression Configuration (IOWarp Engine environment variables)
+    # iowarp_compress options:
+    #   - "none" or "off": No compression
+    #   - "dynamic" or "auto": Adaptive compression (system chooses algorithm)
+    #   - Library name: "zstd", "lz4", "brotli", "bzip2", "blosc2",
+    #                   "fpzip", "lzma", "snappy", "sz3", "zfp", "zlib"
+    iowarp_compress: "none"              # Disable compression for testing
+    iowarp_compress_trace: "off"         # Compression tracing: "on" or "off"
+
+  - pkg_type: builtin.adios2_gray_scott
+    pkg_name: gray_scott
+    # Gray-Scott I/O Parameters
+    # These parameters directly affect BeginStep, DoPutDeferred_, EndStep, and data size
+    #
+    # Data size per write per rank:
+    #   size = (L^3 / nprocs) * sizeof(double) * 2 variables
+    #   Example: L=128, nprocs=8 -> (128^3 / 8) * 8 * 2 = 4 MB per rank per write
+    #
+    # Number of writes (BeginStep/EndStep calls):
+    #   num_writes = steps / plotgap
+    #   Example: steps=100, plotgap=5 -> 20 writes
+    #
+    # I/O time percentage increases with:
+    #   - Larger L (more data per write)
+    #   - Smaller plotgap (more frequent writes)
+    #   - More steps (more total I/O operations)
+
+    L: 128                               # Grid size (L x L x L), affects data size per write
+    steps: 20                            # Total simulation steps
+    plotgap: 5                           # Write output every N steps (affects I/O frequency)
+
+    # MPI Configuration
+    nprocs: 2                            # Number of MPI processes
+    ppn: 2                               # Processes per node
+
+    # Output Configuration
+    out_file: "${HOME}/cte_gs_compress/gs_output.bp"
+    adios_config: "adios2-iowarp.xml"    # ADIOS2 config specifying iowarp_engine plugin
+    engine: "iowarp"                     # Use plugin engine (iowarp_engine)
+
+    # Simulation Parameters (do not significantly affect I/O)
+    Du: 0.2                              # Diffusion rate of U
+    Dv: 0.1                              # Diffusion rate of V
+    F: 0.02                              # Feed rate
+    k: 0.048                             # Kill rate
+    dt: 1.0                              # Time step
+    noise: 0.01                          # Initial noise
+
+# Environment configuration (optional)
+# env:
+#   WRP_CTE_LOG_LEVEL: "info"

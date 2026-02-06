@@ -6,3 +6,4 @@ description: "Content Transfer Engine - A system for placing data in tiered stor
 # Module discovery - directories to scan for ChiMods
 modules:
   - core
+  - compressor

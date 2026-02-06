@@ -56,7 +56,7 @@ struct CustomTask : public chi::Task {
   /** SHM default constructor */
   CustomTask()
       : chi::Task(),
-        data_(CHI_IPC->GetMainAlloc()), operation_id_(0) {}
+        data_(HSHM_MALLOC), operation_id_(0) {}
 
   /** Emplace constructor */
   explicit CustomTask(
@@ -66,7 +66,7 @@ struct CustomTask : public chi::Task {
       const std::string &data,
       chi::u32 operation_id)
       : chi::Task(task_node, pool_id, pool_query, 10),
-        data_(CHI_IPC->GetMainAlloc(), data), operation_id_(operation_id) {
+        data_(HSHM_MALLOC, data), operation_id_(operation_id) {
     // Initialize task
     task_id_ = task_node;
     pool_id_ = pool_id;

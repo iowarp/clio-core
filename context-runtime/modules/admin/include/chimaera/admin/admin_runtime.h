@@ -159,6 +159,13 @@ public:
   chi::TaskResume Heartbeat(hipc::FullPtr<HeartbeatTask> task, chi::RunContext &rctx);
 
   /**
+   * Handle WreapDeadIpcs - Periodic task to reap shared memory from dead processes
+   * Calls IpcManager::WreapDeadIpcs() to clean up orphaned shared memory segments
+   * Returns TaskResume for consistency with other methods called from Run
+   */
+  chi::TaskResume WreapDeadIpcs(hipc::FullPtr<WreapDeadIpcsTask> task, chi::RunContext &rctx);
+
+  /**
    * Handle Monitor - Collect and return worker statistics
    * Iterates through all workers and collects their current statistics
    * Returns serialized statistics in JSON format

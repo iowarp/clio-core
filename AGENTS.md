@@ -7,8 +7,37 @@ This repository contains the unified IOWarp Core framework, integrating multiple
 - **context-assimilation-engine**: Context assimilation engine
 - **context-exploration-engine**: Context exploration engine
 
-NEVER BUILD OUTSIDE OF THE BUILD DIRECTORY. DO NOT PLACE BUILD FILES IN SOURCE DIRECTORIES.
-NEVER EVER EVER.
+## Chimods
+
+When building chimods, make sure to edit chimaera_mod.yaml and chimaera_repo.yaml.
+
+If you add new methods to a chimod, please edit chimaera_mod.yaml and use the chi_refresh_repo binary to autogenerate the relevant autogen files.
+
+
+## ⚠️ CRITICAL BUILD RULE ⚠️
+
+**NEVER HARDCODE ABSOLUTE PATHS INSIDE THE CMAKES**
+
+**NEVER BUILD OUTSIDE OF THE BUILD DIRECTORY. DO NOT PLACE BUILD FILES IN SOURCE DIRECTORIES. NEVER EVER EVER.**
+
+### What This Means:
+
+**NEVER do any of the following:**
+- ❌ `rm -rf /workspace/build/*` followed by `cmake ..` (creates in-source build)
+- ❌ Building third-party libraries in `/workspace` or any subdirectory
+- ❌ Running cmake commands that create `CMakeFiles/`, `CMakeCache.txt`, or `Makefile` in source directories
+- ❌ Creating `/tmp/build_*` directories for third-party dependencies and leaving them
+
+**ALWAYS do this:**
+- ✅ Build third-party libraries in a SEPARATE directory completely outside `/workspace` (e.g., `~/builds/libpressio`)
+- ✅ Keep `/workspace/build` intact - use `cmake ..` from within it to reconfigure
+- ✅ Clean build artifacts: `cd /workspace/build && make clean` (NOT `rm -rf /workspace/build/*`)
+- ✅ Remove temporary build directories after installation: `rm -rf ~/builds/*`
+
+**If you accidentally create build artifacts in source directories:**
+1. Immediately stop
+2. Remove ALL CMakeFiles, CMakeCache.txt, cmake_install.cmake, Makefile from source tree
+3. Rebuild properly from `/workspace/build`
 
 ## Code Style
 
@@ -61,6 +90,12 @@ NEVER DO MOCK CODE OR STUB CODE UNLESS SPECIFICALLY STATED OTHERWISE. ALWAYS IMP
 - Option 1 (Recommended): Use conda to install dependencies: `conda install boost hdf5 yaml-cpp zeromq cereal catch2 poco nlohmann_json`
 - Option 2: Run `install.sh` to build dependencies from source
 - Option 3: Use system packages at your own risk (may cause library conflicts)
+
+**ADIOS2 Exception:**
+- ADIOS2 is built from source (not from conda) to ensure C++20 compatibility
+- Uses ADIOS2 v2.11.0 which supports both x86_64 and ARM64 architectures
+- Built with MPI, HDF5, and ZeroMQ support (using conda's HDF5 and ZeroMQ libraries)
+- SST is disabled due to ARM64 Linux compatibility issues in the DILL library
 
 ### Component Build Options
 The unified IOWarp Core build system provides options to enable/disable components:

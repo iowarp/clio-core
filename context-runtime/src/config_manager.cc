@@ -82,8 +82,6 @@ size_t ConfigManager::GetMemorySegmentSize(MemorySegment segment) const {
     return main_segment_size_;
   case kClientDataSegment:
     return client_data_segment_size_;
-  case kRuntimeDataSegment:
-    return runtime_data_segment_size_;
   default:
     return 0;
   }
@@ -103,9 +101,6 @@ ConfigManager::GetSharedMemorySegmentName(MemorySegment segment) const {
     break;
   case kClientDataSegment:
     segment_name = client_data_segment_name_;
-    break;
-  case kRuntimeDataSegment:
-    segment_name = runtime_data_segment_name_;
     break;
   default:
     return "";
@@ -134,7 +129,6 @@ void ConfigManager::LoadDefault() {
 
   main_segment_size_ = 1024 * 1024 * 1024;        // 1GB
   client_data_segment_size_ = 512 * 1024 * 1024;  // 512MB
-  runtime_data_segment_size_ = 512 * 1024 * 1024; // 512MB
 
   port_ = 5555;
   neighborhood_size_ = 32;
@@ -142,7 +136,6 @@ void ConfigManager::LoadDefault() {
   // Set default shared memory segment names with environment variables
   main_segment_name_ = "chi_main_segment_${USER}";
   client_data_segment_name_ = "chi_client_data_segment_${USER}";
-  runtime_data_segment_name_ = "chi_runtime_data_segment_${USER}";
 
   // Set default hostfile path (empty means no networking/distributed mode)
   hostfile_path_ = "";
@@ -222,10 +215,6 @@ void ConfigManager::ParseYAML(YAML::Node &yaml_conf) {
     if (memory["client_data_segment_size"]) {
       client_data_segment_size_ = hshm::ConfigParse::ParseSize(
           memory["client_data_segment_size"].as<std::string>());
-    }
-    if (memory["runtime_data_segment_size"]) {
-      runtime_data_segment_size_ = hshm::ConfigParse::ParseSize(
-          memory["runtime_data_segment_size"].as<std::string>());
     }
   }
 

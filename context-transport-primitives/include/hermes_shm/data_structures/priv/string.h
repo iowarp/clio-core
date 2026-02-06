@@ -647,13 +647,13 @@ class basic_string {
   }
 
   /**
-   * Constructor from C-style string.
+   * Constructor from C-style string (allocator first - preferred).
    * Creates a string from a null-terminated C-style string.
    *
-   * @param s The C-style string (null-terminated)
    * @param alloc Pointer to allocator instance
+   * @param s The C-style string (null-terminated)
    */
-  basic_string(const T* s, AllocT* alloc)
+  basic_string(AllocT* alloc, const T* s)
     : size_(0), using_sso_(true), alloc_(alloc) {
     if (s != nullptr) {
       size_type len = 0;
@@ -674,6 +674,16 @@ class basic_string {
       storage_.buffer_[0] = T();
     }
   }
+
+  /**
+   * Constructor from C-style string (legacy order - deprecated).
+   * Creates a string from a null-terminated C-style string.
+   *
+   * @param s The C-style string (null-terminated)
+   * @param alloc Pointer to allocator instance
+   */
+  basic_string(const T* s, AllocT* alloc)
+    : basic_string(alloc, s) {}
 
   /**
    * Constructor from character count.

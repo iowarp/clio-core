@@ -1,7 +1,10 @@
 # Dockerfile for building the Content Transfer Engine (CTE)
-# Inherits from iowarp/iowarp-cte-build:latest which contains all build dependencies
+# DEPRECATED: Use build-cpu.Dockerfile instead.
+# This file is kept for backward compatibility.
+#
+# Inherits from iowarp/deps-cpu:latest which contains all build dependencies
 
-FROM iowarp/iowarp-deps:latest
+FROM iowarp/deps-cpu:latest
 
 # Set working directory
 WORKDIR /workspace

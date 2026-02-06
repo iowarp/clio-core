@@ -7,7 +7,7 @@
 #
 # Note: This container uses environment variables only and automatically stops the Chimaera runtime after benchmark completion
 
-FROM iowarp/core-build:latest
+FROM iowarp/build-cpu:latest
 
 # Create benchmark directory
 RUN sudo mkdir -p /benchmarks && \

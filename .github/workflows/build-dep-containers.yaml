@@ -1,0 +1,120 @@
+name: Build Dependency Containers
+
+on:
+  workflow_dispatch:
+  workflow_call:
+  # Trigger on changes to dependency Dockerfiles
+  push:
+    branches:
+      - main
+    paths:
+      - 'docker/deps-cpu.Dockerfile'
+      - 'docker/deps-nvidia.Dockerfile'
+
+jobs:
+  # Build AMD64 on native x86_64 runner
+  build-deps-cpu-amd64:
+    name: Build CPU Dependencies (AMD64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push deps-cpu (AMD64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./docker/deps-cpu.Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: iowarp/deps-cpu:latest-amd64
+          cache-from: type=registry,ref=iowarp/deps-cpu:buildcache-amd64
+          cache-to: type=registry,ref=iowarp/deps-cpu:buildcache-amd64,mode=max
+
+  # Build ARM64 on native ARM64 runner (much faster than QEMU emulation)
+  build-deps-cpu-arm64:
+    name: Build CPU Dependencies (ARM64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push deps-cpu (ARM64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./docker/deps-cpu.Dockerfile
+          platforms: linux/arm64
+          push: true
+          tags: iowarp/deps-cpu:latest-arm64
+          cache-from: type=registry,ref=iowarp/deps-cpu:buildcache-arm64
+          cache-to: type=registry,ref=iowarp/deps-cpu:buildcache-arm64,mode=max
+
+  # Create multi-arch manifest after both builds complete
+  create-deps-cpu-manifest:
+    name: Create Multi-Arch Manifest (deps-cpu)
+    runs-on: ubuntu-latest
+    needs: [build-deps-cpu-amd64, build-deps-cpu-arm64]
+    steps:
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
+
+      - name: Create and push multi-arch manifest
+        run: |
+          docker buildx imagetools create \
+            --tag iowarp/deps-cpu:latest \
+            iowarp/deps-cpu:latest-amd64 \
+            iowarp/deps-cpu:latest-arm64
+
+  build-deps-nvidia:
+    name: Build NVIDIA Dependencies Container
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    needs: create-deps-cpu-manifest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push deps-nvidia container
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./docker/deps-nvidia.Dockerfile
+          # NVIDIA container only supports x86_64 due to CUDA packages
+          platforms: linux/amd64
+          push: true
+          tags: iowarp/deps-nvidia:latest
+          cache-from: type=registry,ref=iowarp/deps-nvidia:buildcache
+          cache-to: type=registry,ref=iowarp/deps-nvidia:buildcache,mode=max
