@@ -21,7 +21,7 @@ The Chimaera runtime uses a pluggable scheduler architecture to control how task
 The IOWarp runtime separates concerns across three main components:
 
 - **ConfigManager**: Manages configuration (number of threads, queue depth, etc.)
-- **WorkOrchestrator**: Creates workers, spawns threads, assigns lanes to workers
+- **WorkOrchestrator**: Creates workers, spawns threads, assigns lanes to workers (1:1 mapping for all workers)
 - **Scheduler**: Decides worker partitioning, task-to-worker mapping, and load balancing
 - **IpcManager**: Manages shared memory, queues, and provides task routing infrastructure
 
@@ -39,13 +39,13 @@ The IOWarp runtime separates concerns across three main components:
          │
          ↓
 ┌─────────────────┐
-│   Scheduler     │──→ Partitions workers into groups
-└─────────────────┘    Updates IpcManager with scheduler worker count
+│   Scheduler     │──→ Tracks worker groups for routing decisions
+└─────────────────┘    Updates IpcManager with scheduler queue count
          │
          ↓
 ┌─────────────────┐
-│ WorkOrchestrator│──→ Gets task-processing workers from scheduler
-└─────────────────┘    Maps lanes to those workers (1:1)
+│ WorkOrchestrator│──→ Maps ALL workers to lanes (1:1 mapping)
+└─────────────────┘    Spawns OS threads for each worker
          │
          ↓
 ┌─────────────────┐
@@ -62,11 +62,10 @@ All schedulers must inherit from the `Scheduler` base class and implement the fo
 ```cpp
 class Scheduler {
 public:
+  virtual ~Scheduler() = default;
+
   // Partition workers into groups after WorkOrchestrator creates them
   virtual void DivideWorkers(WorkOrchestrator *work_orch) = 0;
-
-  // Get the list of workers that process tasks from worker queues
-  virtual std::vector<Worker*> GetTaskProcessingWorkers() = 0;
 
   // Map tasks from clients to worker lanes
   virtual u32 ClientMapTask(IpcManager *ipc_manager, const Future<Task> &task) = 0;
@@ -88,54 +87,36 @@ public:
 
 **Purpose**: Partition workers into functional groups after they've been created.
 
-**Called**: Once during initialization, after WorkOrchestrator creates all workers.
+**Called**: Once during initialization, after WorkOrchestrator creates all workers but before threads are spawned.
 
 **Responsibilities**:
 - Access workers via `work_orch->GetWorker(worker_id)`
-- Set worker thread types via `worker->SetThreadType(thread_type)`
-- Organize workers into scheduler-specific groups
-- **Update IpcManager** with actual scheduler worker count via `IpcManager::SetNumSchedQueues()`
+- Organize workers into scheduler-specific groups (e.g., task workers, network worker)
+- **Update IpcManager** with the total worker count via `IpcManager::SetNumSchedQueues()`
+
+**Important**: All workers are assigned lanes by `WorkOrchestrator::SpawnWorkerThreads()` using 1:1 mapping. The scheduler does NOT control lane assignment — it only tracks worker groups for routing decisions.
 
 **Example**:
 ```cpp
 void MyScheduler::DivideWorkers(WorkOrchestrator *work_orch) {
   u32 total_workers = work_orch->GetTotalWorkerCount();
 
-  // Partition workers: first N-1 are task workers, last is network
+  // Track workers: first N-1 are task workers, last is network
   for (u32 i = 0; i < total_workers - 1; ++i) {
     Worker *worker = work_orch->GetWorker(i);
-    worker->SetThreadType(kSchedWorker);
-    task_workers_.push_back(worker);
+    if (worker) {
+      task_workers_.push_back(worker);
+    }
   }
 
   // Last worker is network worker
-  Worker *net_worker = work_orch->GetWorker(total_workers - 1);
-  net_worker->SetThreadType(kNetWorker);
-  net_worker_ = net_worker;
+  net_worker_ = work_orch->GetWorker(total_workers - 1);
 
-  // IMPORTANT: Update IpcManager with actual scheduler worker count
+  // IMPORTANT: Update IpcManager with worker count
   IpcManager *ipc = CHI_IPC;
   if (ipc) {
-    ipc->SetNumSchedQueues(task_workers_.size());
+    ipc->SetNumSchedQueues(total_workers);
   }
-}
-```
-
-#### `GetTaskProcessingWorkers()`
-
-**Purpose**: Return the list of workers that should process tasks from worker queues.
-
-**Called**: By WorkOrchestrator during `SpawnWorkerThreads()` for lane assignment.
-
-**Responsibilities**:
-- Return a vector of workers that will be assigned to task queue lanes
-- These workers receive tasks from clients and runtime
-- Typically excludes network workers or other specialized workers
-
-**Example**:
-```cpp
-std::vector<Worker*> MyScheduler::GetTaskProcessingWorkers() {
-  return task_workers_;  // Return your scheduler-specific worker group
 }
 ```
 
@@ -148,14 +129,25 @@ std::vector<Worker*> MyScheduler::GetTaskProcessingWorkers() {
 **Responsibilities**:
 - Return a lane ID in range `[0, num_sched_queues)`
 - Use `ipc_manager->GetNumSchedQueues()` to get valid lane count
+- Route special tasks (e.g., network Send/Recv) to the appropriate worker
 - Common strategies: PID+TID hash, round-robin, locality-aware
 
 **Example**:
 ```cpp
 u32 MyScheduler::ClientMapTask(IpcManager *ipc_manager, const Future<Task> &task) {
   u32 num_lanes = ipc_manager->GetNumSchedQueues();
+  if (num_lanes == 0) return 0;
 
-  // PID+TID hash-based mapping
+  // Route network tasks (Send/Recv from admin pool) to last worker
+  Task *task_ptr = task.get();
+  if (task_ptr != nullptr && task_ptr->pool_id_ == chi::kAdminPoolId) {
+    u32 method_id = task_ptr->method_;
+    if (method_id == 14 || method_id == 15) {  // kSend or kRecv
+      return num_lanes - 1;
+    }
+  }
+
+  // PID+TID hash-based mapping for other tasks
   auto *sys_info = HSHM_SYSTEM_INFO;
   pid_t pid = sys_info->pid_;
   auto tid = HSHM_THREAD_MODEL->GetTid();
@@ -169,16 +161,30 @@ u32 MyScheduler::ClientMapTask(IpcManager *ipc_manager, const Future<Task> &task
 
 **Purpose**: Determine which worker should execute a task when routing from within the runtime.
 
-**Called**: When workers route tasks to other workers (work stealing, load balancing).
+**Called**: By `Worker::RouteLocal()` to decide whether a task should execute on the current worker or be forwarded to another.
 
 **Responsibilities**:
 - Return a worker ID for task execution
-- Can implement work migration, affinity, or return current worker
+- Route periodic network tasks (Send/Recv) to the dedicated network worker
+- For all other tasks, return the current worker's ID (no migration)
 
 **Example**:
 ```cpp
 u32 MyScheduler::RuntimeMapTask(Worker *worker, const Future<Task> &task) {
-  // No migration - task stays on current worker
+  // Route periodic network tasks to the network worker
+  Task *task_ptr = task.get();
+  if (task_ptr != nullptr && task_ptr->IsPeriodic()) {
+    if (task_ptr->pool_id_ == chi::kAdminPoolId) {
+      u32 method_id = task_ptr->method_;
+      if (method_id == 14 || method_id == 15) {  // kSend or kRecv
+        if (net_worker_ != nullptr) {
+          return net_worker_->GetId();
+        }
+      }
+    }
+  }
+
+  // All other tasks execute on the current worker
   return worker ? worker->GetId() : 0;
 }
 ```
@@ -192,13 +198,13 @@ u32 MyScheduler::RuntimeMapTask(Worker *worker, const Future<Task> &task) {
 **Responsibilities**:
 - Implement work stealing algorithms
 - Migrate tasks between workers
-- Optional - can be a no-op for simple schedulers
+- Optional — can be a no-op for simple schedulers
 
 **Example**:
 ```cpp
 void MyScheduler::RebalanceWorker(Worker *worker) {
   // Simple schedulers can leave this empty
-  // Advanced schedulers can implement work stealing here
+  (void)worker;
 }
 ```
 
@@ -216,6 +222,8 @@ void MyScheduler::RebalanceWorker(Worker *worker) {
 **Example**:
 ```cpp
 void MyScheduler::AdjustPolling(RunContext *run_ctx) {
+  if (!run_ctx) return;
+
   const double kMaxPollingIntervalUs = 100000.0; // 100ms
 
   if (run_ctx->did_work_) {
@@ -223,10 +231,11 @@ void MyScheduler::AdjustPolling(RunContext *run_ctx) {
     run_ctx->yield_time_us_ = run_ctx->true_period_ns_ / 1000.0;
   } else {
     // Exponential backoff when idle
-    run_ctx->yield_time_us_ = std::min(
-      run_ctx->yield_time_us_ * 2.0,
-      kMaxPollingIntervalUs
-    );
+    double current = run_ctx->yield_time_us_;
+    if (current <= 0.0) {
+      current = run_ctx->true_period_ns_ / 1000.0;
+    }
+    run_ctx->yield_time_us_ = std::min(current * 2.0, kMaxPollingIntervalUs);
   }
 }
 ```
@@ -239,23 +248,21 @@ Understanding the worker lifecycle is crucial for scheduler implementation:
 1. ConfigManager loads configuration (num_threads, queue_depth)
    ↓
 2. WorkOrchestrator::Init()
-   - Creates num_threads + 1 workers (all initially kSchedWorker type)
+   - Creates num_threads + 1 workers
    - Calls Scheduler::DivideWorkers()
    ↓
 3. Scheduler::DivideWorkers()
-   - Partitions workers into functional groups
-   - Sets thread types (kSchedWorker, kNetWorker, etc.)
+   - Tracks workers into functional groups (task workers, network worker)
    - Updates IpcManager::SetNumSchedQueues()
    ↓
 4. WorkOrchestrator::StartWorkers()
    - Calls SpawnWorkerThreads()
-   - Gets task-processing workers from Scheduler::GetTaskProcessingWorkers()
-   - Maps lanes to those workers (1:1 mapping)
+   - Maps ALL workers to lanes (1:1 mapping: worker i → lane i)
    - Spawns actual OS threads
    ↓
 5. Workers run task processing loops
    - Process tasks from assigned lanes
-   - Call Scheduler::RuntimeMapTask() for task routing
+   - Call Scheduler::RuntimeMapTask() for task routing in RouteLocal()
    - Call Scheduler::RebalanceWorker() periodically
 ```
 
@@ -276,12 +283,11 @@ namespace chi {
 
 class MyScheduler : public Scheduler {
 public:
-  MyScheduler() = default;
+  MyScheduler() : net_worker_(nullptr) {}
   ~MyScheduler() override = default;
 
   // Implement required interface methods
   void DivideWorkers(WorkOrchestrator *work_orch) override;
-  std::vector<Worker*> GetTaskProcessingWorkers() override;
   u32 ClientMapTask(IpcManager *ipc_manager, const Future<Task> &task) override;
   u32 RuntimeMapTask(Worker *worker, const Future<Task> &task) override;
   void RebalanceWorker(Worker *worker) override;
@@ -289,7 +295,7 @@ public:
 
 private:
   // Your scheduler-specific state
-  std::vector<Worker*> task_workers_;
+  std::vector<Worker*> scheduler_workers_;
   Worker *net_worker_;
 };
 
@@ -312,33 +318,36 @@ Create `context-runtime/src/scheduler/my_scheduler.cc`:
 namespace chi {
 
 void MyScheduler::DivideWorkers(WorkOrchestrator *work_orch) {
+  if (!work_orch) return;
+
   u32 total_workers = work_orch->GetTotalWorkerCount();
 
-  // Partition: all but last worker are task workers
-  for (u32 i = 0; i < total_workers - 1; ++i) {
+  scheduler_workers_.clear();
+  net_worker_ = nullptr;
+
+  // Network worker is always the last worker
+  net_worker_ = work_orch->GetWorker(total_workers - 1);
+
+  // Scheduler workers are all workers except the last one
+  u32 num_sched_workers = (total_workers == 1) ? 1 : (total_workers - 1);
+  for (u32 i = 0; i < num_sched_workers; ++i) {
     Worker *worker = work_orch->GetWorker(i);
-    worker->SetThreadType(kSchedWorker);
-    task_workers_.push_back(worker);
+    if (worker) {
+      scheduler_workers_.push_back(worker);
+    }
   }
 
-  // Last worker is network worker
-  Worker *net_worker = work_orch->GetWorker(total_workers - 1);
-  net_worker->SetThreadType(kNetWorker);
-  net_worker_ = net_worker;
-
-  // CRITICAL: Update IpcManager with actual scheduler worker count
+  // CRITICAL: Update IpcManager with the number of workers
   IpcManager *ipc = CHI_IPC;
   if (ipc) {
-    ipc->SetNumSchedQueues(task_workers_.size());
+    ipc->SetNumSchedQueues(total_workers);
   }
-}
-
-std::vector<Worker*> MyScheduler::GetTaskProcessingWorkers() {
-  return task_workers_;
 }
 
 u32 MyScheduler::ClientMapTask(IpcManager *ipc_manager, const Future<Task> &task) {
   u32 num_lanes = ipc_manager->GetNumSchedQueues();
+  if (num_lanes == 0) return 0;
+
   // Implement your mapping strategy here
   return 0; // Simple: always map to lane 0
 }
@@ -348,10 +357,11 @@ u32 MyScheduler::RuntimeMapTask(Worker *worker, const Future<Task> &task) {
 }
 
 void MyScheduler::RebalanceWorker(Worker *worker) {
-  // Implement work stealing or leave empty
+  (void)worker;
 }
 
 void MyScheduler::AdjustPolling(RunContext *run_ctx) {
+  if (!run_ctx) return;
   // Implement adaptive polling or leave with default behavior
 }
 
@@ -399,25 +409,24 @@ runtime:
 The `DefaultScheduler` provides a reference implementation with these characteristics:
 
 ### Worker Partitioning
-- All `num_threads` workers are scheduler workers (task-processing)
-- Last worker (beyond num_threads) is network worker
-- No separate slow worker pool
+- Tracks all workers except the last as scheduler workers
+- Last worker is designated as the network worker
+- All workers get lanes assigned by WorkOrchestrator (1:1 mapping)
+- `SetNumSchedQueues(total_workers)` includes all workers for client task mapping
 
 ### Task Mapping Strategy
-- **Client Tasks**: PID+TID hash-based mapping
+- **Client Tasks**: PID+TID hash-based mapping for regular tasks
   - Ensures different processes/threads use different lanes
-  - Provides load distribution
-- **Runtime Tasks**: No migration (tasks stay on current worker)
+  - Network tasks (Send/Recv from admin pool, methods 14/15) are routed to the last worker (network worker)
+- **Runtime Tasks**: Tasks execute on the current worker, except periodic Send/Recv tasks which are routed to the network worker
 
 ### Load Balancing
 - No active rebalancing (simple design)
 - Tasks processed by worker that picks them up
 
 ### Polling Adjustment
-- Exponential backoff for idle periodic tasks
-- Doubles polling interval when no work done
-- Caps at 100ms maximum interval
-- Resets to original period when work resumes
+- Currently disabled (early return) to avoid hanging issues
+- When enabled, implements exponential backoff for idle periodic tasks
 
 ### Code Reference
 
@@ -433,35 +442,29 @@ See implementation in:
 void MyScheduler::DivideWorkers(WorkOrchestrator *work_orch) {
   // ... partition workers ...
 
-  // CRITICAL: Update IpcManager with actual scheduler worker count
+  // CRITICAL: Update IpcManager with worker count
   IpcManager *ipc = CHI_IPC;
   if (ipc) {
-    ipc->SetNumSchedQueues(actual_scheduler_worker_count);
+    ipc->SetNumSchedQueues(total_workers);
   }
 }
 ```
 
-**Why**: Clients use `GetNumSchedQueues()` to map tasks to lanes. If this doesn't match the actual number of task-processing workers, tasks will be mapped to non-existent or wrong workers.
+**Why**: Clients use `GetNumSchedQueues()` to map tasks to lanes. If this doesn't match the actual number of workers/lanes, tasks will be mapped to non-existent or wrong workers.
 
-### 2. Return Consistent Worker Lists
+### 2. Route Network Tasks to the Network Worker
 
-```cpp
-std::vector<Worker*> MyScheduler::GetTaskProcessingWorkers() {
-  return task_workers_;  // Must be stable after DivideWorkers
-}
-```
-
-**Why**: WorkOrchestrator uses this list for lane assignment. Changing the list after initialization will break lane mappings.
+Both `ClientMapTask` and `RuntimeMapTask` should route Send/Recv tasks (methods 14/15 from admin pool) to the dedicated network worker (last worker). This prevents network I/O from blocking task processing workers.
 
 ### 3. Validate Lane IDs
 
 ```cpp
 u32 MyScheduler::ClientMapTask(IpcManager *ipc_manager, const Future<Task> &task) {
   u32 num_lanes = ipc_manager->GetNumSchedQueues();
-  u32 lane = ComputeLane(...);
+  if (num_lanes == 0) return 0;
 
-  // Ensure lane is in valid range
-  return lane % num_lanes;
+  u32 lane = ComputeLane(...);
+  return lane % num_lanes;  // Ensure lane is in valid range
 }
 ```
 
@@ -469,11 +472,12 @@ u32 MyScheduler::ClientMapTask(IpcManager *ipc_manager, const Future<Task> &task
 
 ```cpp
 void MyScheduler::DivideWorkers(WorkOrchestrator *work_orch) {
-  if (!work_orch) {
-    HLOG(kError, "work_orch is null");
-    return;
-  }
+  if (!work_orch) return;
   // ... proceed ...
+}
+
+u32 MyScheduler::RuntimeMapTask(Worker *worker, const Future<Task> &task) {
+  return worker ? worker->GetId() : 0;
 }
 ```
 
@@ -484,17 +488,10 @@ If your scheduler maintains shared state accessed by multiple workers:
 - Use mutexes for complex data structures
 - Prefer lock-free designs when possible
 
-### 6. Minimize DivideWorkers Overhead
-
-`DivideWorkers` is called during initialization:
-- Avoid expensive operations
-- Don't allocate large data structures
-- Keep partitioning logic simple
-
-### 7. Test with Different Configurations
+### 6. Test with Different Configurations
 
 Test your scheduler with various `num_threads` values:
-- Single thread (num_threads = 1)
+- Single thread (num_threads = 1): single worker serves dual role
 - Small (num_threads = 2-4)
 - Large (num_threads = 16+)
 
@@ -529,12 +526,9 @@ Access workers through WorkOrchestrator:
 u32 total_workers = work_orch->GetTotalWorkerCount();
 Worker *worker = work_orch->GetWorker(worker_id);
 
-// Set thread type
-worker->SetThreadType(kSchedWorker);
-
 // Get worker properties
 u32 id = worker->GetId();
-ThreadType type = worker->GetThreadType();
+TaskLane *lane = worker->GetLane();
 ```
 
 ### Logging
@@ -567,16 +561,13 @@ Implement work stealing in `RebalanceWorker`:
 
 ```cpp
 void MyScheduler::RebalanceWorker(Worker *worker) {
-  // Check if worker has no work
   TaskLane *my_lane = worker->GetLane();
   if (my_lane->Empty()) {
-    // Try to steal from other workers
-    for (Worker *victim : task_workers_) {
+    for (Worker *victim : scheduler_workers_) {
       if (victim == worker) continue;
 
       TaskLane *victim_lane = victim->GetLane();
       if (!victim_lane->Empty()) {
-        // Steal task from victim
         Future<Task> stolen_task;
         if (victim_lane->Pop(stolen_task)) {
           my_lane->Push(stolen_task);
@@ -608,7 +599,6 @@ Use task priorities for scheduling:
 
 ```cpp
 void MyScheduler::DivideWorkers(WorkOrchestrator *work_orch) {
-  // Partition workers into high-priority and low-priority groups
   u32 total = work_orch->GetTotalWorkerCount();
   u32 high_prio_count = total / 2;
 
@@ -633,8 +623,8 @@ void MyScheduler::DivideWorkers(WorkOrchestrator *work_orch) {
 
 **Check**:
 1. Did you call `IpcManager::SetNumSchedQueues()` in `DivideWorkers`?
-2. Does `GetTaskProcessingWorkers()` return the correct workers?
-3. Are lanes properly mapped in WorkOrchestrator?
+2. Are all workers getting lanes via WorkOrchestrator's 1:1 mapping?
+3. Does `ClientMapTask` return lane IDs in valid range?
 
 ### Client Mapping Errors
 
@@ -652,7 +642,7 @@ void MyScheduler::DivideWorkers(WorkOrchestrator *work_orch) {
 **Check**:
 1. Are you checking for null pointers?
 2. Does `DivideWorkers` handle `total_workers < expected`?
-3. Are worker thread types set correctly?
+3. Is the single-worker case handled (when `total_workers == 1`)?
 
 ## References
 
