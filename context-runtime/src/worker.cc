@@ -715,7 +715,7 @@ bool Worker::RouteTask(Future<Task> &future, TaskLane *lane,
     return false;
   }
 
-  HLOG(kInfo, "Worker {}: RouteTask called for task method={}, pool_id={}, routing_mode={}",
+  HLOG(kDebug, "Worker {}: RouteTask called for task method={}, pool_id={}, routing_mode={}",
        worker_id_, task_ptr->method_, task_ptr->pool_id_, static_cast<int>(task_ptr->pool_query_.GetRoutingMode()));
 
   // Check if task has already been routed - if so, return true immediately
@@ -817,7 +817,7 @@ bool Worker::RouteLocal(Future<Task> &future, TaskLane *lane,
   // Get task pointer from future
   FullPtr<Task> task_ptr = future.GetTaskPtr();
 
-  HLOG(kInfo, "Worker {}: RouteLocal called for task method={}, pool_id={}",
+  HLOG(kDebug, "Worker {}: RouteLocal called for task method={}, pool_id={}",
        worker_id_, task_ptr->method_, task_ptr->pool_id_);
 
   // Use scheduler to determine target worker for this task
@@ -857,7 +857,7 @@ bool Worker::RouteLocal(Future<Task> &future, TaskLane *lane,
          worker_id_, task_ptr->pool_id_);
     return false;
   }
-  HLOG(kInfo, "Worker {}: RouteLocal - found container for pool_id={}",
+  HLOG(kDebug, "Worker {}: RouteLocal - found container for pool_id={}",
        worker_id_, task_ptr->pool_id_);
 
   // Set the completer_ field to track which container will execute this task
