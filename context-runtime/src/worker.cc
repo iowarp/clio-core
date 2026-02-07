@@ -711,8 +711,12 @@ bool Worker::RouteTask(Future<Task> &future, TaskLane *lane,
   FullPtr<Task> task_ptr = future.GetTaskPtr();
 
   if (task_ptr.IsNull()) {
+    HLOG(kWarning, "Worker {}: RouteTask - task_ptr is null", worker_id_);
     return false;
   }
+
+  HLOG(kInfo, "Worker {}: RouteTask called for task method={}, pool_id={}, routing_mode={}",
+       worker_id_, task_ptr->method_, task_ptr->pool_id_, static_cast<int>(task_ptr->pool_query_.GetRoutingMode()));
 
   // Check if task has already been routed - if so, return true immediately
   if (task_ptr->IsRouted()) {
@@ -813,6 +817,9 @@ bool Worker::RouteLocal(Future<Task> &future, TaskLane *lane,
   // Get task pointer from future
   FullPtr<Task> task_ptr = future.GetTaskPtr();
 
+  HLOG(kInfo, "Worker {}: RouteLocal called for task method={}, pool_id={}",
+       worker_id_, task_ptr->method_, task_ptr->pool_id_);
+
   // Use scheduler to determine target worker for this task
   u32 target_worker_id = worker_id_;  // Default to current worker
   if (scheduler_ != nullptr) {
@@ -846,8 +853,12 @@ bool Worker::RouteLocal(Future<Task> &future, TaskLane *lane,
   auto *pool_manager = CHI_POOL_MANAGER;
   container = pool_manager->GetContainer(task_ptr->pool_id_);
   if (!container) {
+    HLOG(kError, "Worker {}: RouteLocal - container not found for pool_id={}",
+         worker_id_, task_ptr->pool_id_);
     return false;
   }
+  HLOG(kInfo, "Worker {}: RouteLocal - found container for pool_id={}",
+       worker_id_, task_ptr->pool_id_);
 
   // Set the completer_ field to track which container will execute this task
   task_ptr->SetCompleter(container->container_id_);
@@ -870,6 +881,14 @@ bool Worker::RouteGlobal(Future<Task> &future,
 
   auto *ipc_manager = CHI_IPC;
 
+  // Log the global routing for debugging
+  if (!pool_queries.empty()) {
+    const auto& query = pool_queries[0];
+    HLOG(kInfo, "Worker {}: RouteGlobal - routing task method={}, pool_id={} to node {} (routing_mode={})",
+         worker_id_, task_ptr->method_, task_ptr->pool_id_,
+         query.GetNodeId(), static_cast<int>(query.GetRoutingMode()));
+  }
+
   // Store pool_queries in task's RunContext for SendIn to access
   if (task_ptr->run_ctx_) {
     RunContext *run_ctx = task_ptr->run_ctx_.get();
@@ -881,6 +900,8 @@ bool Worker::RouteGlobal(Future<Task> &future,
 
   // Set TASK_ROUTED flag on original task
   task_ptr->SetFlags(TASK_ROUTED);
+
+  HLOG(kInfo, "Worker {}: RouteGlobal - task enqueued to net_queue", worker_id_);
 
   // Always return true (never fail)
   return true;

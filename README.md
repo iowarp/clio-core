@@ -499,7 +499,7 @@ We welcome contributions to the IOWarp Core project!
 - Add comprehensive unit tests for new functionality
 - Never use mock/stub code unless explicitly required - implement real, working code
 
-See [CLAUDE.md](CLAUDE.md) for complete coding standards and workflow guidelines.
+See [AGENTS.md](AGENTS.md) for complete coding standards and workflow guidelines.
 
 ## License
 

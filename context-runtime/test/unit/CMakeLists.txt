@@ -694,14 +694,48 @@ if(CHIMAERA_ENABLE_TESTS)
   )
 
   # External Client Tests
+  # NOTE: Each test case must run in its own process because CHIMAERA_INIT has
+  # a static guard that prevents re-initialization. Running all tests in one
+  # process causes the static guard to return true for subsequent calls,
+  # breaking tests that expect initialization failure.
   add_test(
-    NAME cr_external_client_connection_tests
-    COMMAND ${EXTERNAL_CLIENT_TEST_TARGET}
+    NAME cr_external_client_basic_connection
+    COMMAND ${EXTERNAL_CLIENT_TEST_TARGET} "ExternalClient - Basic Connection"
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
-  set_tests_properties(cr_external_client_connection_tests PROPERTIES
+  set_tests_properties(cr_external_client_basic_connection PROPERTIES
     ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin"
-    TIMEOUT 120
+    TIMEOUT 60
+  )
+
+  add_test(
+    NAME cr_external_client_multiple_clients
+    COMMAND ${EXTERNAL_CLIENT_TEST_TARGET} "ExternalClient - Multiple Clients"
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_external_client_multiple_clients PROPERTIES
+    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin"
+    TIMEOUT 60
+  )
+
+  add_test(
+    NAME cr_external_client_without_server
+    COMMAND ${EXTERNAL_CLIENT_TEST_TARGET} "ExternalClient - Connection Without Server"
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_external_client_without_server PROPERTIES
+    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin"
+    TIMEOUT 60
+  )
+
+  add_test(
+    NAME cr_external_client_operations
+    COMMAND ${EXTERNAL_CLIENT_TEST_TARGET} "ExternalClient - Client Operations"
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_external_client_operations PROPERTIES
+    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin"
+    TIMEOUT 60
   )
 
   # Runtime Cleanup Tests

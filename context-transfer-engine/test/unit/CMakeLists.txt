@@ -587,52 +587,30 @@ set_tests_properties(
 )
 
 # Add tiered storage stress tests
-add_test(NAME cte_tiered_storage_put
-    COMMAND test_tiered_storage_stress "TieredStorage - Put 128MB with 64MB DRAM")
-
-add_test(NAME cte_tiered_storage_reorganize
-    COMMAND test_tiered_storage_stress "TieredStorage - ReorganizeBlob to score 0")
-
-add_test(NAME cte_tiered_storage_integrity
-    COMMAND test_tiered_storage_stress "TieredStorage - Verify data integrity")
-
-add_test(NAME cte_tiered_storage_cleanup
-    COMMAND test_tiered_storage_stress "TieredStorage - Cleanup")
+# NOTE: These tests are chained (Put -> Reorganize -> Integrity -> Cleanup)
+# and share global state via g_fixture, so they must run together in a single
+# process. Running them as separate ctest entries would lose shared state.
+add_test(NAME cte_tiered_storage_all
+    COMMAND test_tiered_storage_stress)
 
 set_tests_properties(
-    cte_tiered_storage_put
-    cte_tiered_storage_reorganize
-    cte_tiered_storage_integrity
-    cte_tiered_storage_cleanup
+    cte_tiered_storage_all
     PROPERTIES
-        TIMEOUT 300  # 5 minute timeout for each test
+        TIMEOUT 300  # 5 minute timeout
         LABELS "stress;tiered;cte"
 )
 
 # Add reorganize blob tests
-add_test(NAME cte_reorganize_put_dram
-    COMMAND test_reorganize_blob "ReorganizeBlob - PutBlob to DRAM")
-
-add_test(NAME cte_reorganize_move_disk
-    COMMAND test_reorganize_blob "ReorganizeBlob - Move to Disk")
-
-add_test(NAME cte_reorganize_integrity
-    COMMAND test_reorganize_blob "ReorganizeBlob - Verify Data Integrity")
-
-add_test(NAME cte_reorganize_promote_dram
-    COMMAND test_reorganize_blob "ReorganizeBlob - Promote to DRAM")
-
-add_test(NAME cte_reorganize_cleanup
-    COMMAND test_reorganize_blob "ReorganizeBlob - Cleanup")
+# NOTE: These tests are chained (Put -> Move -> Integrity -> Promote -> Cleanup)
+# and share global state via g_fixture, so they must run together in a single
+# process. Running them as separate ctest entries would lose shared state.
+add_test(NAME cte_reorganize_all
+    COMMAND test_reorganize_blob)
 
 set_tests_properties(
-    cte_reorganize_put_dram
-    cte_reorganize_move_disk
-    cte_reorganize_integrity
-    cte_reorganize_promote_dram
-    cte_reorganize_cleanup
+    cte_reorganize_all
     PROPERTIES
-        TIMEOUT 300  # 5 minute timeout for each test
+        TIMEOUT 300  # 5 minute timeout
         LABELS "unit;reorganize;cte"
 )
 

@@ -106,6 +106,9 @@ class Client : public chi::ContainerClient {
       const std::string& tag_prefix) {
     auto* ipc_manager = CHI_IPC;
 
+    HLOG(kInfo, "AsyncProcessHdf5Dataset: Creating task for pool_id={}, file={}, dataset={}",
+         pool_id_, file_path, dataset_path);
+
     auto task = ipc_manager->NewTask<ProcessHdf5DatasetTask>(
         chi::CreateTaskId(),
         pool_id_,
@@ -113,6 +116,13 @@ class Client : public chi::ContainerClient {
         file_path,
         dataset_path,
         tag_prefix);
+
+    if (task.IsNull()) {
+      HLOG(kError, "AsyncProcessHdf5Dataset: NewTask returned null!");
+    } else {
+      HLOG(kInfo, "AsyncProcessHdf5Dataset: Task created, method={}, calling Send",
+           task->method_);
+    }
 
     return ipc_manager->Send(task);
   }

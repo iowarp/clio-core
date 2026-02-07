@@ -115,22 +115,18 @@ u32 DefaultScheduler::RuntimeMapTask(Worker *worker, const Future<Task> &task) {
   // Check if this is a periodic Send or Recv task from admin pool
   Task *task_ptr = task.get();
   if (task_ptr != nullptr && task_ptr->IsPeriodic()) {
-    // Check if this is from admin pool (kAdminPoolId)
     if (task_ptr->pool_id_ == chi::kAdminPoolId) {
-      // Check if this is Send (14) or Recv (15) method
       u32 method_id = task_ptr->method_;
       if (method_id == 14 || method_id == 15) {  // kSend or kRecv
         // Schedule on network worker
         if (net_worker_ != nullptr) {
-          u32 net_worker_id = net_worker_->GetId();
-          return net_worker_id;
+          return net_worker_->GetId();
         }
       }
     }
   }
 
-  // For all other tasks, return current worker - no migration in default
-  // scheduler
+  // All other tasks execute on the current worker
   if (worker != nullptr) {
     return worker->GetId();
   }

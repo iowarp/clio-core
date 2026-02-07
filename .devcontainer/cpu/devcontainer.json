@@ -1,59 +1,59 @@
 {
-    "name": "IOWarp Core (CPU-only)",
-    "build": {
-        "dockerfile": "Dockerfile",
-        "context": "../..",
-        "options": [
-            "--tag=iowarp/core-devcontainer:latest"
-        ]
-    },
-    "workspaceFolder": "/workspace",
-    "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached",
-    "containerEnv": {
-        "IOWARP_CORE_ROOT": "${localWorkspaceFolder}",
-        "CONDA_DEFAULT_ENV": "base",
-        "CONDA_AUTO_ACTIVATE_BASE": "true",
-        "CONDA_PREFIX": "/home/iowarp/miniconda3",
-        "LD_LIBRARY_PATH": "/home/iowarp/miniconda3/lib:/usr/lib/x86_64-linux-gnu"
-    },
-    "mounts": [
-        "source=${localEnv:HOME}/.ssh,target=/tmp/host-ssh,type=bind,readonly",
-        "source=${localEnv:HOME}/.claude,target=/tmp/host-claude,type=bind,readonly",
-        "source=${localEnv:HOME}/.claude.json,target=/tmp/host-claude.json,type=bind,readonly",
-        "source=/var/run/docker.sock,target=/var/run/docker.sock,type=bind"
-    ],
-    "runArgs": [
-        "--privileged",
-        "--shm-size=2gb"
-    ],
-    "customizations": {
-        "vscode": {
-            "extensions": [
-                "anthropic.claude-code",
-                "ms-vscode.cpptools",
-                "ms-vscode.cmake-tools",
-                "twxs.cmake",
-                "KylinIdeTeam.cppdebug",
-                "llvm-vs-code-extensions.vscode-clangd",
-                "ms-vscode.cmake-tools",
-                "ms-azuretools.vscode-docker",
-                "ms-python.python",
-                "ms-python.vscode-pylance",
-                "ms-python.debugpy"
-            ],
-            "settings": {
-                "cmake.configureOnOpen": false,
-                "python.defaultInterpreterPath": "/home/iowarp/miniconda3/bin/python",
-                "python.terminal.activateEnvironment": true,
-                "python.venvPath": "/home/iowarp",
-                "python.condaPath": "/home/iowarp/miniconda3/bin/conda",
-                "python.formatting.provider": "black",
-                "python.linting.enabled": true,
-                "python.linting.pylintEnabled": false,
-                "python.linting.flake8Enabled": true
-            }
-        }
-    },
-    "postCreateCommand": "bash -c 'git config --global --add safe.directory /workspace && sudo rm -rf /home/iowarp/.ssh && sudo cp -r /tmp/host-ssh /home/iowarp/.ssh && sudo chown -R iowarp:iowarp /home/iowarp/.ssh && chmod 700 /home/iowarp/.ssh && chmod 600 /home/iowarp/.ssh/* && chmod 644 /home/iowarp/.ssh/*.pub 2>/dev/null || true && sudo cp -r /tmp/host-claude /home/iowarp/.claude && sudo cp /tmp/host-claude.json /home/iowarp/.claude.json && sudo chown -R iowarp:iowarp /home/iowarp/.claude /home/iowarp/.claude.json && sudo chmod 666 /var/run/docker.sock && sudo service ssh start && eval \"$(~/miniconda3/bin/conda shell.bash hook)\" && echo \"Conda initialized. Use: conda activate <env>\"'",
-    "remoteUser": "iowarp"
+  "name": "IOWarp Core (CPU-only)",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": "../..",
+    "options": [
+      "--tag=iowarp/core-devcontainer:latest"
+    ]
+  },
+  "workspaceFolder": "/workspace",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached",
+  "containerEnv": {
+    "IOWARP_CORE_ROOT": "${localWorkspaceFolder}",
+    "CONDA_DEFAULT_ENV": "base",
+    "CONDA_AUTO_ACTIVATE_BASE": "true",
+    "CONDA_PREFIX": "/home/iowarp/miniconda3",
+    "LD_LIBRARY_PATH": "/home/iowarp/miniconda3/lib:/usr/lib/x86_64-linux-gnu"
+  },
+  "mounts": [
+    "source=${localEnv:HOME}/.ssh,target=/tmp/host-ssh,type=bind,readonly",
+    "source=${localEnv:HOME}/.claude,target=/tmp/host-claude,type=bind,readonly",
+    "source=${localEnv:HOME}/.claude.json,target=/tmp/host-claude.json,type=bind,readonly",
+    "source=/var/run/docker.sock,target=/var/run/docker.sock,type=bind"
+  ],
+  "runArgs": [
+    "--privileged",
+    "--shm-size=2gb"
+  ],
+  "initializeCommand": "bash -c 'mkdir -p ~/.ssh ~/.claude && chmod 700 ~/.ssh && touch ~/.claude.json'",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "anthropic.claude-code",
+        "ms-vscode.cpptools",
+        "ms-vscode.cmake-tools",
+        "twxs.cmake",
+        "KylinIdeTeam.cppdebug",
+        "llvm-vs-code-extensions.vscode-clangd",
+        "ms-azuretools.vscode-docker",
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+        "ms-python.debugpy"
+      ],
+      "settings": {
+        "cmake.configureOnOpen": false,
+        "python.defaultInterpreterPath": "/home/iowarp/miniconda3/bin/python",
+        "python.terminal.activateEnvironment": true,
+        "python.venvPath": "/home/iowarp",
+        "python.condaPath": "/home/iowarp/miniconda3/bin/conda",
+        "python.formatting.provider": "black",
+        "python.linting.enabled": true,
+        "python.linting.pylintEnabled": false,
+        "python.linting.flake8Enabled": true
+      }
+    }
+  },
+  "postCreateCommand": "bash -c 'git config --global --add safe.directory /workspace && sudo rm -rf /home/iowarp/.ssh && if [ -d /tmp/host-ssh ]; then sudo cp -r /tmp/host-ssh /home/iowarp/.ssh && sudo chown -R iowarp:iowarp /home/iowarp/.ssh && chmod 700 /home/iowarp/.ssh && chmod 600 /home/iowarp/.ssh/* 2>/dev/null || true && chmod 644 /home/iowarp/.ssh/*.pub 2>/dev/null || true; fi && if [ -d /tmp/host-claude ] && [ \"$(ls -A /tmp/host-claude)\" ]; then sudo cp -r /tmp/host-claude /home/iowarp/.claude && sudo chown -R iowarp:iowarp /home/iowarp/.claude; fi && if [ -f /tmp/host-claude.json ] && [ -s /tmp/host-claude.json ]; then sudo cp /tmp/host-claude.json /home/iowarp/.claude.json && sudo chown iowarp:iowarp /home/iowarp/.claude.json; fi && sudo chmod 666 /var/run/docker.sock && sudo service ssh start && eval \"$(~/miniconda3/bin/conda shell.bash hook)\" && echo \"Conda initialized. Use: conda activate <env>\"'",
+  "remoteUser": "iowarp"
 }

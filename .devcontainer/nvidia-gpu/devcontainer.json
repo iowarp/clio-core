@@ -31,6 +31,7 @@
         "--shm-size=2gb",
         "--gpus=all"
     ],
+    "initializeCommand": "bash -c 'umask 077 && mkdir -p ~/.ssh ~/.claude && chmod 700 ~/.ssh && touch ~/.claude.json'",
     // NOTE: If container fails to start with GPU error, run on host:
     //   sudo apt-get install -y nvidia-container-toolkit
     //   sudo nvidia-ctk runtime configure --runtime=docker
@@ -65,6 +66,6 @@
             }
         }
     },
-    "postCreateCommand": "bash -c 'git config --global --add safe.directory /workspace && sudo rm -rf /home/iowarp/.ssh && sudo cp -r /tmp/host-ssh /home/iowarp/.ssh && sudo chown -R iowarp:iowarp /home/iowarp/.ssh && chmod 700 /home/iowarp/.ssh && chmod 600 /home/iowarp/.ssh/* && chmod 644 /home/iowarp/.ssh/*.pub 2>/dev/null || true && sudo cp -r /tmp/host-claude /home/iowarp/.claude && sudo cp /tmp/host-claude.json /home/iowarp/.claude.json && sudo chown -R iowarp:iowarp /home/iowarp/.claude /home/iowarp/.claude.json && sudo chmod 666 /var/run/docker.sock && sudo service ssh start && eval \"$(~/miniconda3/bin/conda shell.bash hook)\" && echo \"Conda initialized. Use: conda activate <env>\"'",
+    "postCreateCommand": "bash -c 'git config --global --add safe.directory /workspace && sudo rm -rf /home/iowarp/.ssh && if [ -d /tmp/host-ssh ]; then sudo cp -r /tmp/host-ssh /home/iowarp/.ssh && sudo chown -R iowarp:iowarp /home/iowarp/.ssh && chmod 700 /home/iowarp/.ssh && chmod 600 /home/iowarp/.ssh/* 2>/dev/null || true && chmod 644 /home/iowarp/.ssh/*.pub 2>/dev/null || true; fi && if [ -d /tmp/host-claude ] && [ \"$(ls -A /tmp/host-claude)\" ]; then sudo cp -r /tmp/host-claude /home/iowarp/.claude && sudo chown -R iowarp:iowarp /home/iowarp/.claude; fi && if [ -f /tmp/host-claude.json ] && [ -s /tmp/host-claude.json ]; then sudo cp /tmp/host-claude.json /home/iowarp/.claude.json && sudo chown iowarp:iowarp /home/iowarp/.claude.json; fi && sudo chmod 666 /var/run/docker.sock && sudo service ssh start && eval \"$(~/miniconda3/bin/conda shell.bash hook)\" && echo \"Conda initialized. Use: conda activate <env>\"'",
     "remoteUser": "iowarp"
 }
