@@ -995,6 +995,8 @@ FullPtr<char> IpcManager::AllocateBuffer(size_t size) {
 }
 
 void IpcManager::FreeBuffer(FullPtr<char> buffer_ptr) {
+#if HSHM_IS_HOST
+  // HOST PATH: Check various allocators
   if (buffer_ptr.IsNull()) {
     return;
   }
@@ -1025,6 +1027,9 @@ void IpcManager::FreeBuffer(FullPtr<char> buffer_ptr) {
 
   HLOG(kWarning, "FreeBuffer: Could not find allocator for alloc_id ({}.{})",
        buffer_ptr.shm_.alloc_id_.major_, buffer_ptr.shm_.alloc_id_.minor_);
+#else
+  // GPU PATH: Handled by inline __device__ implementation in ipc_manager.h
+#endif  // HSHM_IS_HOST
 }
 
 hshm::lbm::Client *IpcManager::GetOrCreateClient(const std::string &addr,

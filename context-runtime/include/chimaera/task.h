@@ -117,13 +117,13 @@ class Task {
   /**
    * Default constructor
    */
-  Task() { SetNull(); }
+  HSHM_CROSS_FUN Task() { SetNull(); }
 
   /**
    * Emplace constructor with task initialization
    */
-  explicit Task(const TaskId& task_id, const PoolId& pool_id,
-                const PoolQuery& pool_query, const MethodId& method) {
+  HSHM_CROSS_FUN explicit Task(const TaskId& task_id, const PoolId& pool_id,
+                                const PoolQuery& pool_query, const MethodId& method) {
     // Initialize task
     task_id_ = task_id;
     pool_id_ = pool_id;
@@ -458,7 +458,7 @@ struct FutureShm {
    * Default constructor - initializes fields
    * Note: copy_space is allocated as part of the buffer, not separately
    */
-  FutureShm() {
+  HSHM_CROSS_FUN FutureShm() {
     pool_id_ = PoolId::GetNull();
     method_id_ = 0;
     input_size_.store(0);
@@ -514,7 +514,7 @@ class Future {
    * @param task_ptr FullPtr to the task (wraps private memory with null
    * allocator)
    */
-  Future(hipc::ShmPtr<FutureT> future_shm, hipc::FullPtr<TaskT> task_ptr)
+  HSHM_CROSS_FUN Future(hipc::ShmPtr<FutureT> future_shm, hipc::FullPtr<TaskT> task_ptr)
       : task_ptr_(task_ptr),
         future_shm_(future_shm),
         parent_task_(nullptr),
@@ -525,14 +525,14 @@ class Future {
   /**
    * Default constructor - creates null future
    */
-  Future() : parent_task_(nullptr), is_owner_(false) {}
+  HSHM_CROSS_FUN Future() : parent_task_(nullptr), is_owner_(false) {}
 
   /**
    * Constructor from ShmPtr<FutureShm> - used by ring buffer deserialization
    * Task pointer will be null and must be set later
    * @param future_shm_ptr ShmPtr to FutureShm object
    */
-  explicit Future(const hipc::ShmPtr<FutureT>& future_shm_ptr)
+  HSHM_CROSS_FUN explicit Future(const hipc::ShmPtr<FutureT>& future_shm_ptr)
       : future_shm_(future_shm_ptr),
         parent_task_(nullptr),
         is_owner_(false) {
@@ -690,13 +690,13 @@ class Future {
    * Check if this future is null
    * @return True if future is null, false otherwise
    */
-  bool IsNull() const { return task_ptr_.IsNull(); }
+  HSHM_CROSS_FUN bool IsNull() const { return task_ptr_.IsNull(); }
 
   /**
    * Get the internal ShmPtr to FutureShm (for internal use)
    * @return ShmPtr to the FutureShm object
    */
-  hipc::ShmPtr<FutureT> GetFutureShmPtr() const {
+  HSHM_CROSS_FUN hipc::ShmPtr<FutureT> GetFutureShmPtr() const {
     return future_shm_;
   }
 

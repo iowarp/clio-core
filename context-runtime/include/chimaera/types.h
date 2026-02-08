@@ -57,12 +57,12 @@ using i64 = hshm::i64;
 using ibitfield = hshm::ibitfield;
 
 // Time unit constants for period conversions (divisors from nanoseconds)
-constexpr double kNano = 1.0;          // 1 nanosecond
-constexpr double kMicro = 1000.0;      // 1000 nanoseconds = 1 microsecond
-constexpr double kMilli = 1000000.0;   // 1,000,000 nanoseconds = 1 millisecond
-constexpr double kSec = 1000000000.0;  // 1,000,000,000 nanoseconds = 1 second
-constexpr double kMin = 60000000000.0; // 60 seconds = 1 minute
-constexpr double kHour = 3600000000000.0; // 3600 seconds = 1 hour
+constexpr double kNano = 1.0;           // 1 nanosecond
+constexpr double kMicro = 1000.0;       // 1000 nanoseconds = 1 microsecond
+constexpr double kMilli = 1000000.0;    // 1,000,000 nanoseconds = 1 millisecond
+constexpr double kSec = 1000000000.0;   // 1,000,000,000 nanoseconds = 1 second
+constexpr double kMin = 60000000000.0;  // 60 seconds = 1 minute
+constexpr double kHour = 3600000000000.0;  // 3600 seconds = 1 hour
 
 // Forward declarations
 class Task;
@@ -83,30 +83,32 @@ struct UniqueId {
   u32 major_;
   u32 minor_;
 
-  constexpr UniqueId() : major_(0), minor_(0) {}
-  constexpr UniqueId(u32 major, u32 minor) : major_(major), minor_(minor) {}
+  HSHM_CROSS_FUN constexpr UniqueId() : major_(0), minor_(0) {}
+  HSHM_CROSS_FUN constexpr UniqueId(u32 major, u32 minor)
+      : major_(major), minor_(minor) {}
 
   // Equality operators
-  bool operator==(const UniqueId &other) const {
+  HSHM_CROSS_FUN bool operator==(const UniqueId &other) const {
     return major_ == other.major_ && minor_ == other.minor_;
   }
 
-  bool operator!=(const UniqueId &other) const { return !(*this == other); }
+  HSHM_CROSS_FUN bool operator!=(const UniqueId &other) const {
+    return !(*this == other);
+  }
 
   // Comparison operators for ordering
-  bool operator<(const UniqueId &other) const {
-    if (major_ != other.major_)
-      return major_ < other.major_;
+  HSHM_CROSS_FUN bool operator<(const UniqueId &other) const {
+    if (major_ != other.major_) return major_ < other.major_;
     return minor_ < other.minor_;
   }
 
   // Convert to u64 for compatibility and hashing
-  u64 ToU64() const {
+  HSHM_CROSS_FUN u64 ToU64() const {
     return (static_cast<u64>(major_) << 32) | static_cast<u64>(minor_);
   }
 
   // Create from u64
-  static UniqueId FromU64(u64 value) {
+  HSHM_CROSS_FUN static UniqueId FromU64(u64 value) {
     return UniqueId(static_cast<u32>(value >> 32),
                     static_cast<u32>(value & 0xFFFFFFFF));
   }
@@ -116,16 +118,19 @@ struct UniqueId {
    * @param str String representation of ID (e.g., "200.0")
    * @return Parsed UniqueId
    */
-  static UniqueId FromString(const std::string& str);
+  static UniqueId FromString(const std::string &str);
 
   // Get null/invalid instance
-  static constexpr UniqueId GetNull() { return UniqueId(0, 0); }
+  HSHM_CROSS_FUN static constexpr UniqueId GetNull() { return UniqueId(0, 0); }
 
   // Check if this is a null/invalid ID
-  bool IsNull() const { return major_ == 0 && minor_ == 0; }
+  HSHM_CROSS_FUN bool IsNull() const { return major_ == 0 && minor_ == 0; }
 
   // Serialization support
-  template <typename Ar> HSHM_CROSS_FUN void serialize(Ar &ar) { ar(major_, minor_); }
+  template <typename Ar>
+  HSHM_CROSS_FUN void serialize(Ar &ar) {
+    ar(major_, minor_);
+  }
 };
 
 /**
@@ -144,25 +149,35 @@ inline std::ostream &operator<<(std::ostream &os, const PoolId &pool_id) {
  * Task identifier containing process, thread, and sequence information
  */
 struct TaskId {
-  u32 pid_;   ///< Process ID
-  u32 tid_;   ///< Thread ID
-  u32 major_; ///< Major sequence number (monotonically increasing per thread)
-  u32 replica_id_; ///< Replica identifier (for replicated tasks)
-  u32 unique_;     ///< Unique identifier incremented for both root tasks and
-                   ///< subtasks
-  u64 node_id_;    ///< Node identifier for distributed execution
-  size_t net_key_; ///< Network key for send/recv map lookup (pointer-based)
+  u32 pid_;    ///< Process ID
+  u32 tid_;    ///< Thread ID
+  u32 major_;  ///< Major sequence number (monotonically increasing per thread)
+  u32 replica_id_;  ///< Replica identifier (for replicated tasks)
+  u32 unique_;      ///< Unique identifier incremented for both root tasks and
+                    ///< subtasks
+  u64 node_id_;     ///< Node identifier for distributed execution
+  size_t net_key_;  ///< Network key for send/recv map lookup (pointer-based)
 
-  TaskId()
-      : pid_(0), tid_(0), major_(0), replica_id_(0), unique_(0), node_id_(0),
+  HSHM_CROSS_FUN TaskId()
+      : pid_(0),
+        tid_(0),
+        major_(0),
+        replica_id_(0),
+        unique_(0),
+        node_id_(0),
         net_key_(0) {}
-  TaskId(u32 pid, u32 tid, u32 major, u32 replica_id = 0, u32 unique = 0,
-         u64 node_id = 0, size_t net_key = 0)
-      : pid_(pid), tid_(tid), major_(major), replica_id_(replica_id),
-        unique_(unique), node_id_(node_id), net_key_(net_key) {}
+  HSHM_CROSS_FUN TaskId(u32 pid, u32 tid, u32 major, u32 replica_id = 0,
+                        u32 unique = 0, u64 node_id = 0, size_t net_key = 0)
+      : pid_(pid),
+        tid_(tid),
+        major_(major),
+        replica_id_(replica_id),
+        unique_(unique),
+        node_id_(node_id),
+        net_key_(net_key) {}
 
   // Equality operators
-  bool operator==(const TaskId &other) const {
+  HSHM_CROSS_FUN bool operator==(const TaskId &other) const {
     return pid_ == other.pid_ && tid_ == other.tid_ && major_ == other.major_ &&
            replica_id_ == other.replica_id_ && unique_ == other.unique_ &&
            node_id_ == other.node_id_ && net_key_ == other.net_key_;
@@ -171,7 +186,7 @@ struct TaskId {
   bool operator!=(const TaskId &other) const { return !(*this == other); }
 
   // Convert to u64 for hashing (combine all fields)
-  u64 ToU64() const {
+  HSHM_CROSS_FUN u64 ToU64() const {
     // Combine multiple fields using XOR and shifts for better distribution
     u64 hash1 = (static_cast<u64>(pid_) << 32) | static_cast<u64>(tid_);
     u64 hash2 =
@@ -182,7 +197,8 @@ struct TaskId {
   }
 
   // Serialization support
-  template <typename Ar> HSHM_CROSS_FUN void serialize(Ar &ar) {
+  template <typename Ar>
+  HSHM_CROSS_FUN void serialize(Ar &ar) {
     ar(pid_, tid_, major_, replica_id_, unique_, node_id_, net_key_);
   }
 };
@@ -215,7 +231,7 @@ static constexpr GroupId kPhysical =
     0; /**< Physical address wrapper around node_id */
 static constexpr GroupId kLocal = 1;  /**< Containers on THIS node */
 static constexpr GroupId kGlobal = 2; /**< All containers in the pool */
-} // namespace Group
+}  // namespace Group
 
 /**
  * Container address containing pool, group, and minor ID components
@@ -244,7 +260,8 @@ struct Address {
   bool operator!=(const Address &other) const { return !(*this == other); }
 
   // Cereal serialization support
-  template <class Archive> void serialize(Archive &ar) {
+  template <class Archive>
+  void serialize(Archive &ar) {
     ar(pool_id_, group_id_, minor_id_);
   }
 };
@@ -264,12 +281,12 @@ struct AddressHash {
 #define TASK_ROUTED BIT_OPT(chi::u32, 1)
 #define TASK_DATA_OWNER BIT_OPT(chi::u32, 2)
 #define TASK_REMOTE BIT_OPT(chi::u32, 3)
-#define TASK_FORCE_NET                                                         \
-  BIT_OPT(chi::u32,                                                            \
-          4) ///< Force task through network code even for local execution
-#define TASK_STARTED                                                           \
-  BIT_OPT(chi::u32, 5) ///< Task execution has been started (set in BeginTask,
-                       ///< unset in ReschedulePeriodicTask)
+#define TASK_FORCE_NET \
+  BIT_OPT(chi::u32,    \
+          4)  ///< Force task through network code even for local execution
+#define TASK_STARTED \
+  BIT_OPT(chi::u32, 5)  ///< Task execution has been started (set in BeginTask,
+                        ///< unset in ReschedulePeriodicTask)
 
 // Bulk transfer flags are defined in hermes_shm/lightbeam/lightbeam.h:
 // - BULK_EXPOSE: Bulk is exposed (sender exposes for reading)
@@ -277,26 +294,23 @@ struct AddressHash {
 
 // Lane mapping policies for task distribution
 enum class LaneMapPolicy {
-  kMapByPidTid = 0, ///< Map tasks to lanes by hashing PID+TID (ensures
-                    ///< per-thread affinity)
+  kMapByPidTid = 0,  ///< Map tasks to lanes by hashing PID+TID (ensures
+                     ///< per-thread affinity)
   kRoundRobin =
-      1, ///< Map tasks to lanes using round-robin (static counter, default)
-  kRandom = 2 ///< Map tasks to lanes randomly
+      1,  ///< Map tasks to lanes using round-robin (static counter, default)
+  kRandom = 2  ///< Map tasks to lanes randomly
 };
 
 // Special pool IDs
 constexpr PoolId kAdminPoolId =
-    UniqueId(1, 0); // Admin ChiMod pool ID (reserved)
+    UniqueId(1, 0);  // Admin ChiMod pool ID (reserved)
 
 // Allocator type aliases using HSHM conventions
 #define CHI_MAIN_ALLOC_T hipc::MultiProcessAllocator
 #define CHI_CDATA_ALLOC_T hipc::MultiProcessAllocator
 
 // Memory segment identifiers
-enum MemorySegment {
-  kMainSegment = 0,
-  kClientDataSegment = 1
-};
+enum MemorySegment { kMainSegment = 0, kClientDataSegment = 1 };
 
 // Input/Output parameter macros
 #define IN
@@ -346,7 +360,8 @@ inline HSHM_CROSS_FUN TaskId CreateTaskId() {
 #endif
 
 // Template aliases for full pointers using HSHM
-template <typename T> using FullPtr = hipc::FullPtr<T>;
+template <typename T>
+using FullPtr = hipc::FullPtr<T>;
 
 }  // namespace chi
 
@@ -354,7 +369,7 @@ namespace chi::priv {
 // Private data structures use MallocAllocator (heap memory, not shared)
 typedef hshm::priv::string<hipc::MallocAllocator> string;
 
-template<typename T>
+template <typename T>
 using vector = hshm::priv::vector<T, hipc::MallocAllocator>;
 }  // namespace chi::priv
 
@@ -372,18 +387,20 @@ using vector = hipc::vector<T, CHI_MAIN_ALLOC_T>;
 
 // Hash function specializations for std::unordered_map
 namespace std {
-template <> struct hash<chi::UniqueId> {
+template <>
+struct hash<chi::UniqueId> {
   size_t operator()(const chi::UniqueId &id) const {
     return hash<chi::u32>()(id.major_) ^ (hash<chi::u32>()(id.minor_) << 1);
   }
 };
 
-template <> struct hash<chi::TaskId> {
+template <>
+struct hash<chi::TaskId> {
   size_t operator()(const chi::TaskId &id) const {
     return hash<chi::u64>()(id.ToU64());
   }
 };
 
-} // namespace std
+}  // namespace std
 
-#endif // CHIMAERA_INCLUDE_CHIMAERA_TYPES_H_
+#endif  // CHIMAERA_INCLUDE_CHIMAERA_TYPES_H_

@@ -472,6 +472,63 @@ __global__ void test_gpu_serialize_for_cpu_kernel(
 }
 
 /**
+ * GPU kernel that calls ACTUAL MakeCopyFuture and returns FutureShm for CPU deserialization
+ */
+__global__ void test_gpu_make_copy_future_for_cpu_kernel(
+    const hipc::MemoryBackend backend,
+    hipc::ShmPtr<chi::FutureShm> *d_future_shm_out,
+    int *d_result)
+{
+  CHIMAERA_GPU_INIT(backend);
+
+  if (thread_id == 0) {
+    *d_result = 1;  // Kernel started
+
+    // Create task on GPU
+    chi::TaskId task_id = chi::CreateTaskId();
+    chi::PoolId pool_id(5000, 0);
+    chi::PoolQuery query = chi::PoolQuery::Local();
+    chi::u32 gpu_id = 42;
+    chi::u32 test_value = 99999;
+
+    *d_result = 2;  // About to call NewTask
+
+    auto task = (&g_ipc_manager)->NewTask<chimaera::MOD_NAME::GpuSubmitTask>(
+        task_id, pool_id, query, gpu_id, test_value);
+
+    if (task.IsNull()) {
+      *d_result = -1;  // NewTask failed
+      return;
+    }
+
+    *d_result = 3;  // NewTask succeeded, about to call MakeCopyFutureGpu
+
+    // Call MakeCopyFutureGpu - simplified GPU version that mirrors passing test
+    auto future = (&g_ipc_manager)->MakeCopyFutureGpu(task);
+
+    *d_result = 4;  // MakeCopyFutureGpu returned
+
+    if (future.IsNull()) {
+      *d_result = -2;  // MakeCopyFuture failed
+      return;
+    }
+
+    // Get the FutureShm ShmPtr using GetFutureShmPtr() method
+    hipc::ShmPtr<chi::FutureShm> future_shm_ptr = future.GetFutureShmPtr();
+    if (future_shm_ptr.IsNull()) {
+      *d_result = -3;  // GetFutureShmPtr failed
+      return;
+    }
+
+    // Return the ShmPtr so CPU can deserialize
+    *d_future_shm_out = future_shm_ptr;
+    *d_result = 0;  // Success
+  }
+
+  __syncthreads();
+}
+
+/**
  * Helper function to run GPU kernel and check results
  * @param kernel_name Name of the kernel for error messages
  * @param backend GPU memory backend
@@ -560,8 +617,8 @@ TEST_CASE("GPU IPC AllocateBuffer basic functionality", "[gpu][ipc][allocate_buf
   hipc::MemoryBackendId backend_id(2, 0);  // Use ID 2.0 for GPU backend
   size_t gpu_memory_size = 10 * 1024 * 1024;  // 10MB GPU memory
 
-  hipc::GpuMalloc gpu_backend;
-  REQUIRE(gpu_backend.shm_init(backend_id, gpu_memory_size, "gpu_test", 0));
+  hipc::GpuShmMmap gpu_backend;
+  REQUIRE(gpu_backend.shm_init(backend_id, gpu_memory_size, "/gpu_test", 0));
 
   SECTION("GPU kernel minimal (no macro)") {
     int block_size = 32;
@@ -688,6 +745,76 @@ TEST_CASE("GPU IPC AllocateBuffer basic functionality", "[gpu][ipc][allocate_buf
   //   int block_size = 32;
   //   REQUIRE(run_gpu_kernel_test("multiple_allocs", gpu_backend, block_size));
   // }
+
+  SECTION("GPU MakeCopyFuture -> CPU Deserialize") {
+    INFO("Testing GPU: NewTask->MakeCopyFuture, CPU: Deserialize from FutureShm");
+
+    // Allocate GPU memory for output
+    hipc::ShmPtr<chi::FutureShm> *d_future_shm_ptr = hshm::GpuApi::Malloc<hipc::ShmPtr<chi::FutureShm>>(sizeof(hipc::ShmPtr<chi::FutureShm>));
+    int *d_result = hshm::GpuApi::Malloc<int>(sizeof(int));
+
+    // Initialize
+    hipc::ShmPtr<chi::FutureShm> h_null_ptr;
+    h_null_ptr.SetNull();
+    hshm::GpuApi::Memcpy(d_future_shm_ptr, &h_null_ptr, sizeof(hipc::ShmPtr<chi::FutureShm>));
+    int h_result_init = -999;
+    hshm::GpuApi::Memcpy(d_result, &h_result_init, sizeof(int));
+
+    // Increase stack size for GPU kernel (MakeCopyFuture uses significant stack)
+    size_t stack_size_limit = 8192;  // 8KB stack per thread
+    cudaDeviceSetLimit(cudaLimitStackSize, stack_size_limit);
+
+    // Run GPU kernel that calls MakeCopyFuture
+    test_gpu_make_copy_future_for_cpu_kernel<<<1, 1>>>(gpu_backend, d_future_shm_ptr, d_result);
+
+    cudaError_t err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+      INFO("CUDA error: " << cudaGetErrorString(err));
+    }
+    REQUIRE(err == cudaSuccess);
+
+    // Copy result from GPU
+    int h_result = -999;
+    hshm::GpuApi::Memcpy(&h_result, d_result, sizeof(int));
+
+    INFO("GPU kernel result: " << h_result);
+    REQUIRE(h_result == 0);  // GPU kernel succeeded
+
+    // Get the FutureShm pointer from GPU
+    hipc::ShmPtr<chi::FutureShm> h_future_shm_ptr;
+    hshm::GpuApi::Memcpy(&h_future_shm_ptr, d_future_shm_ptr, sizeof(hipc::ShmPtr<chi::FutureShm>));
+
+    REQUIRE(!h_future_shm_ptr.IsNull());
+
+    // NOW ON CPU: Convert ShmPtr to raw pointer
+    // GpuShmMmap uses flat addressing, so we can convert the offset directly
+    // The offset is relative to the backend's base address
+    chi::FutureShm *future_shm_ptr = reinterpret_cast<chi::FutureShm*>(
+        reinterpret_cast<char*>(gpu_backend.data_) + h_future_shm_ptr.off_.load());
+    REQUIRE(future_shm_ptr != nullptr);
+
+    // Check that data was serialized
+    size_t input_size = future_shm_ptr->input_size_.load();
+    INFO("Serialized size: " << input_size);
+    REQUIRE(input_size > 0);
+
+    // Deserialize on CPU - copy to vector first (LocalLoadTaskArchive(char*, size) doesn't work on host!)
+    std::vector<char> cpu_buffer(future_shm_ptr->copy_space, future_shm_ptr->copy_space + input_size);
+    chi::LocalLoadTaskArchive load_ar(cpu_buffer);
+    chimaera::MOD_NAME::GpuSubmitTask deserialized_task;
+    deserialized_task.SerializeIn(load_ar);  // Use SerializeIn like the passing test
+
+    // Verify values
+    INFO("Deserialized: gpu_id=" << deserialized_task.gpu_id_ << ", test_value=" << deserialized_task.test_value_);
+    REQUIRE(deserialized_task.gpu_id_ == 42);
+    REQUIRE(deserialized_task.test_value_ == 99999);
+
+    INFO("SUCCESS: GPU MakeCopyFuture -> CPU Deserialize works!");
+
+    // Cleanup
+    hshm::GpuApi::Free(d_future_shm_ptr);
+    hshm::GpuApi::Free(d_result);
+  }
 }
 
 // TODO: Fix per-thread allocations test
@@ -696,8 +823,8 @@ TEST_CASE("GPU IPC AllocateBuffer basic functionality", "[gpu][ipc][allocate_buf
   hipc::MemoryBackendId backend_id(3, 0);
   size_t gpu_memory_size = 50 * 1024 * 1024;  // 50MB for more threads
 
-  hipc::GpuMalloc gpu_backend;
-  REQUIRE(gpu_backend.shm_init(backend_id, gpu_memory_size, "gpu_test_mt", 0));
+  hipc::GpuShmMmap gpu_backend;
+  REQUIRE(gpu_backend.shm_init(backend_id, gpu_memory_size, "/gpu_test_mt", 0));
 
   SECTION("GPU kernel with 64 threads") {
     int block_size = 64;

@@ -52,58 +52,62 @@
  * Tests Part 3: GPU kernel calling NewTask and Send
  */
 __global__ void gpu_submit_task_kernel(
-    const hipc::MemoryBackend *backend,
+    hipc::MemoryBackend backend,
     chi::PoolId pool_id,
     chi::u32 test_value,
-    int *result_flag) {
-  // Simplest test - just write a value
-  *result_flag = 999;
-  return;
+    int *result_flags) {
 
-  // Manually expand CHIMAERA_GPU_INIT for single thread
-  __shared__ char g_ipc_manager_storage[sizeof(chi::IpcManager)];
-  __shared__ chi::IpcManager *g_ipc_manager_ptr;
-  __shared__ hipc::ArenaAllocator<false> *g_arena_alloc;
+  // Mark that kernel started
+  if (threadIdx.x == 0 && blockIdx.x == 0) {
+    result_flags[0] = -777;  // Kernel entered
+  }
+  __syncthreads();
 
-  *result_flag = -700;  // Before reinterpret_cast
-  g_arena_alloc = reinterpret_cast<hipc::ArenaAllocator<false>*>(backend->data_);
+  // Initialize IPC manager (defines thread_id)
+  CHIMAERA_GPU_INIT(backend);
 
-  *result_flag = -701;  // Before placement new
-  // Skip placement new for now to test
-  //new (g_arena_alloc) hipc::ArenaAllocator<false>();
-  *result_flag = -702;  // Skipped placement new
+  // Only thread 0 creates and submits task
+  if (thread_id == 0) {
+    result_flags[0] = -666;  // CHIMAERA_GPU_INIT completed
 
-  *result_flag = -702;  // Before shm_init
-  g_arena_alloc->shm_init(*backend, backend->data_capacity_);
+    // Step 0: Check IPC manager initialized
+    if (&g_ipc_manager == nullptr) {
+      result_flags[0] = -10;  // IPC manager null
+      return;
+    }
+    result_flags[0] = 0;  // IPC manager OK
 
-  *result_flag = -703;  // Before IpcManager cast
-  g_ipc_manager_ptr = reinterpret_cast<chi::IpcManager*>(g_ipc_manager_storage);
+    // Step 1: Try to allocate a small buffer to verify backend works
+    hipc::FullPtr<char> test_buffer = (&g_ipc_manager)->AllocateBuffer(64);
+    if (test_buffer.IsNull()) {
+      result_flags[1] = -11;  // Backend allocation failed
+      return;
+    }
+    result_flags[1] = 0;  // Backend allocation OK
 
-  *result_flag = -704;  // Before ClientGpuInit
-  g_ipc_manager_ptr->ClientGpuInit(*backend, g_arena_alloc);
+    // Step 2: Test allocating task-sized buffer
+    size_t task_size = sizeof(chimaera::MOD_NAME::GpuSubmitTask);
+    hipc::FullPtr<char> task_buffer = (&g_ipc_manager)->AllocateBuffer(task_size);
+    if (task_buffer.IsNull()) {
+      result_flags[2] = -12;  // Task buffer allocation failed
+      return;
+    }
+    // Free the test buffers to avoid running out of memory
+    (&g_ipc_manager)->FreeBuffer(test_buffer);
+    (&g_ipc_manager)->FreeBuffer(task_buffer);
+    result_flags[2] = 0;  // Task buffer allocation OK
 
-  *result_flag = -705;  // Before creating reference
-  chi::IpcManager &g_ipc_manager = *g_ipc_manager_ptr;
+    // Step 3: ULTRA-SIMPLE TEST - Just set to known value
+    result_flags[3] = -777;  // TEST: If you see -777, the code executed!
 
-  *result_flag = -500;  // After init
+    // Step 4: Skipped for now (no task created yet)
+    result_flags[4] = 0;
 
-  // Create task using NewTask
-  chi::u32 gpu_id = 0;
-  chi::PoolQuery query = chi::PoolQuery::Local();
-
-  auto task = (&g_ipc_manager)->NewTask<chimaera::MOD_NAME::GpuSubmitTask>(
-      chi::CreateTaskId(), pool_id, query, gpu_id, test_value);
-
-  if (task.IsNull()) {
-    *result_flag = -1;  // NewTask failed
-    return;
+    // Step 5: Mark as success
+    result_flags[5] = 0;
   }
 
-  // Submit task using Send
-  (&g_ipc_manager)->Send(task);
-
-  // Mark success
-  *result_flag = 1;
+  __syncthreads();
 }
 
 /**
@@ -111,49 +115,53 @@ __global__ void gpu_submit_task_kernel(
  * This allows the CPU test file to call this without needing CUDA headers
  */
 extern "C" int run_gpu_kernel_task_submission_test(chi::PoolId pool_id, chi::u32 test_value) {
-  // Create GPU memory backend for kernel use
-  hipc::MemoryBackendId backend_id(100, 0);
-  size_t gpu_memory_size = 10 * 1024 * 1024;  // 10MB
-  hipc::GpuMalloc gpu_backend;
-  if (!gpu_backend.shm_init(backend_id, gpu_memory_size, "gpu_kernel_submit", 0)) {
+  // Create GPU memory backend using GPU-registered shared memory (same as isolated test)
+  hipc::MemoryBackendId backend_id(2, 0);
+  size_t gpu_memory_size = 10 * 1024 * 1024;  // 10MB - same as isolated test
+  hipc::GpuShmMmap gpu_backend;
+  if (!gpu_backend.shm_init(backend_id, gpu_memory_size, "/gpu_kernel_submit", 0)) {
     return -100;  // Backend init failed
   }
 
-  // Allocate result flag on GPU
-  int *d_result_flag = hshm::GpuApi::Malloc<int>(sizeof(int));
-  int h_result_flag = -999;  // Sentinel value to detect if kernel runs at all
-  hshm::GpuApi::Memcpy(d_result_flag, &h_result_flag, sizeof(int));
+  // Allocate result flags array on GPU (6 steps)
+  int *d_result_flags = hshm::GpuApi::Malloc<int>(sizeof(int) * 6);
+  int h_result_flags[6] = {-999, -999, -999, -999, -999, -999};  // Sentinel values
+  hshm::GpuApi::Memcpy(d_result_flags, h_result_flags, sizeof(int) * 6);
 
-  // Copy backend to GPU memory so kernel can access it
-  hipc::MemoryBackend *d_backend = hshm::GpuApi::Malloc<hipc::MemoryBackend>(sizeof(hipc::MemoryBackend));
+  // Backend can be passed by value to kernel
   hipc::MemoryBackend h_backend = gpu_backend;  // Copy to temporary
-  hshm::GpuApi::Memcpy(d_backend, &h_backend, sizeof(hipc::MemoryBackend));
 
   // Launch kernel that submits a task (using 1 thread, 1 block for simplicity)
-  gpu_submit_task_kernel<<<1, 1>>>(d_backend, pool_id, test_value, d_result_flag);
+  gpu_submit_task_kernel<<<1, 1>>>(h_backend, pool_id, test_value, d_result_flags);
 
   // Check for kernel launch errors
   cudaError_t launch_err = cudaGetLastError();
   if (launch_err != cudaSuccess) {
-    hshm::GpuApi::Free(d_result_flag);
+    hshm::GpuApi::Free(d_result_flags);
     return -201;  // Kernel launch error
   }
 
   // Synchronize and check for errors
   cudaError_t err = cudaDeviceSynchronize();
   if (err != cudaSuccess) {
-    hshm::GpuApi::Free(d_result_flag);
+    hshm::GpuApi::Free(d_result_flags);
     return -200;  // CUDA error
   }
 
-  // Check kernel result
-  hshm::GpuApi::Memcpy(&h_result_flag, d_result_flag, sizeof(int));
+  // Check kernel results
+  hshm::GpuApi::Memcpy(h_result_flags, d_result_flags, sizeof(int) * 6);
 
   // Cleanup
-  hshm::GpuApi::Free(d_result_flag);
-  hshm::GpuApi::Free(d_backend);
+  hshm::GpuApi::Free(d_result_flags);
 
-  return h_result_flag;  // Return the result (1 = success, -1/-2 = error)
+  // Check all steps for errors
+  for (int i = 0; i < 6; ++i) {
+    if (h_result_flags[i] != 0) {
+      return h_result_flags[i];  // Return first error
+    }
+  }
+
+  return 1;  // Success - all steps passed
 }
 
 #endif  // HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM

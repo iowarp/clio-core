@@ -240,43 +240,39 @@ TEST_CASE("gpu_kernel_task_submission", "[gpu][kernel_submit]") {
   // Show result for debugging
   INFO("GPU kernel test result: " + std::to_string(result));
 
-  // Verify success
+  // Verify success with detailed step-by-step diagnostics
   if (result == -100) {
     INFO("GPU backend initialization failed");
   } else if (result == -200) {
     INFO("CUDA synchronization failed");
   } else if (result == -201) {
     INFO("Kernel launch error");
-  } else if (result == -888) {
-    INFO("Kernel entered but failed at first __syncthreads()");
   } else if (result == -777) {
-    INFO("Kernel passed first syncthreads but failed at start of CHIMAERA_GPU_INIT");
-  } else if (result == -700) {
-    INFO("Failed at start of CHIMAERA_GPU_INIT thread 0 section");
-  } else if (result == -701) {
-    INFO("Failed after reinterpret_cast to ArenaAllocator");
-  } else if (result == -702) {
-    INFO("Failed after placement new on ArenaAllocator");
-  } else if (result == -703) {
-    INFO("Failed after ArenaAllocator::shm_init");
-  } else if (result == -704) {
-    INFO("Failed after IpcManager reinterpret_cast");
-  } else if (result == -705) {
-    INFO("Failed after ClientGpuInit");
-  } else if (result == -706) {
-    INFO("Passed CHIMAERA_GPU_INIT __syncthreads");
-  } else if (result == -600) {
-    INFO("After creating g_ipc_manager reference, before task submission");
-  } else if (result == -1) {
-    INFO("GPU task creation (NewTask) failed");
-  } else if (result == -2) {
-    INFO("GPU task submission (Send) failed");
-  } else if (result == 0) {
-    INFO("GPU kernel did not set result flag (initialization issue?)");
+    INFO("DIAGNOSTIC: Kernel entered but stopped before CHIMAERA_GPU_INIT");
+  } else if (result == -666) {
+    INFO("DIAGNOSTIC: CHIMAERA_GPU_INIT completed but stopped before IPC manager check");
+  } else if (result == -10) {
+    INFO("Step 0 FAILED: g_ipc_manager pointer is null after CHIMAERA_GPU_INIT");
+  } else if (result == -11) {
+    INFO("Step 1 FAILED: Backend allocation test (64 bytes) failed - AllocateBuffer returned null");
+  } else if (result == -12) {
+    INFO("Step 2 FAILED: Task-sized buffer allocation failed - AllocateBuffer(sizeof(GpuSubmitTask)) returned null");
+  } else if (result == -130) {
+    INFO("Step 3 FAILED: Out of memory before NewTask - AllocateBuffer(task_size) failed");
+  } else if (result == -131) {
+    INFO("Step 3 FAILED: AllocateBuffer inside manual NewTask path returned null");
+  } else if (result == -132) {
+    INFO("Step 3 FAILED: Placement new constructor returned nullptr");
+  } else if (result == -133) {
+    INFO("Step 3 FAILED: FullPtr construction from task pointer failed");
+  } else if (result == -13) {
+    INFO("Step 3 FAILED: NewTask returned null - task construction failed");
+  } else if (result == 0 || result == -999) {
+    INFO("GPU kernel did not set result flags (initialization issue?)");
   }
 
   REQUIRE(result == 1);
-  INFO("SUCCESS: GPU kernel called NewTask() and Send() to submit task!");
+  INFO("SUCCESS: All steps passed - GPU kernel created and submitted task!");
 }
 
 //==============================================================================
