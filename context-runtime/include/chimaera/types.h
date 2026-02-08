@@ -125,7 +125,7 @@ struct UniqueId {
   bool IsNull() const { return major_ == 0 && minor_ == 0; }
 
   // Serialization support
-  template <typename Ar> void serialize(Ar &ar) { ar(major_, minor_); }
+  template <typename Ar> HSHM_CROSS_FUN void serialize(Ar &ar) { ar(major_, minor_); }
 };
 
 /**
@@ -182,7 +182,7 @@ struct TaskId {
   }
 
   // Serialization support
-  template <typename Ar> void serialize(Ar &ar) {
+  template <typename Ar> HSHM_CROSS_FUN void serialize(Ar &ar) {
     ar(pid_, tid_, major_, replica_id_, unique_, node_id_, net_key_);
   }
 };
@@ -329,7 +329,21 @@ struct TaskCounter {
  * @return TaskId with pid, tid, major, replica_id_, unique, and node_id
  * populated
  */
-TaskId CreateTaskId();
+#if HSHM_IS_HOST
+TaskId CreateTaskId();  // Host implementation in chimaera_manager.cc
+#else
+// GPU inline implementation - simplified version
+inline HSHM_CROSS_FUN TaskId CreateTaskId() {
+  TaskId id;
+  id.pid_ = 0;
+  id.tid_ = 0;
+  id.major_ = 1;
+  id.replica_id_ = 0;
+  id.unique_ = 1;
+  id.node_id_ = 0;
+  return id;
+}
+#endif
 
 // Template aliases for full pointers using HSHM
 template <typename T> using FullPtr = hipc::FullPtr<T>;

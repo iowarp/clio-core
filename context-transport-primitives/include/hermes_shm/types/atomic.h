@@ -39,10 +39,10 @@
 
 #include "hermes_shm/constants/macros.h"
 #include "numbers.h"
-#if HSHM_ENABLE_CUDA
+#if HSHM_ENABLE_CUDA && defined(__CUDACC__)
 #include <cuda/atomic>
 #endif
-#if HSHM_ENABLE_ROCM
+#if HSHM_ENABLE_ROCM && defined(__HIP_PLATFORM_AMD__)
 #include <hip/hip_runtime.h>
 #endif
 
@@ -55,7 +55,7 @@ struct nonatomic {
 
   /** Serialization */
   template <typename Ar>
-  void serialize(Ar &ar) {
+  HSHM_CROSS_FUN void serialize(Ar &ar) {
     ar(x);
   }
 
@@ -497,7 +497,7 @@ struct rocm_atomic {
 
   /** Serialization */
   template <typename Ar>
-  void serialize(Ar &ar) {
+  HSHM_CROSS_FUN void serialize(Ar &ar) {
     ar(x);
   }
 };

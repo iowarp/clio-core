@@ -292,6 +292,20 @@ class Worker {
    */
   TaskLane *GetLane() const;
 
+#if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
+  /**
+   * Set GPU lanes for this worker to process
+   * @param lanes Vector of TaskLane pointers for GPU queues
+   */
+  void SetGpuLanes(const std::vector<TaskLane *> &lanes);
+
+  /**
+   * Get the worker's assigned GPU lanes
+   * @return Reference to vector of GPU TaskLanes
+   */
+  const std::vector<TaskLane *> &GetGpuLanes() const;
+#endif
+
   /**
    * Route a task by calling ResolvePoolQuery and determining local vs global
    * scheduling
@@ -449,6 +463,14 @@ class Worker {
   u32 ProcessNewTasks();
 
   /**
+   * Process a single task from a given lane
+   * Handles task retrieval, deserialization, routing, and execution
+   * @param lane The TaskLane to pop a task from
+   * @return true if a task was processed, false if lane was empty
+   */
+  bool ProcessNewTask(TaskLane *lane);
+
+  /**
    * Ensure IPC allocator is registered for a Future
    * Handles lazy registration of client memory allocators
    * @param future_shm_full FullPtr to FutureShm to check allocator for
@@ -525,6 +547,11 @@ class Worker {
 
   // Single lane assigned to this worker (one lane per worker)
   TaskLane *assigned_lane_;
+
+#if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
+  // GPU lanes assigned to this worker (one lane per GPU)
+  std::vector<TaskLane *> gpu_lanes_;
+#endif
 
   // Note: RunContext cache removed - RunContext is now embedded in Task
 

@@ -105,7 +105,9 @@ class Task {
   IN MethodId method_;      /**< Method identifier for task type */
   IN ibitfield task_flags_; /**< Task properties and flags */
   IN double period_ns_;     /**< Period in nanoseconds for periodic tasks */
-  IN std::unique_ptr<RunContext> run_ctx_; /**< Runtime context owned by task (RAII) */
+#if HSHM_IS_HOST
+  IN std::unique_ptr<RunContext> run_ctx_; /**< Runtime context owned by task (RAII) - Host only */
+#endif
   OUT hipc::atomic<u32>
       return_code_; /**< Task return code (0=success, non-zero=error) */
   OUT hipc::atomic<ContainerId>
@@ -129,7 +131,9 @@ class Task {
     task_flags_.SetBits(0);
     pool_query_ = pool_query;
     period_ns_ = 0.0;
+#if HSHM_IS_HOST
     // run_ctx_ is initialized by its default constructor
+#endif
     return_code_.store(0);  // Initialize as success
     completer_.store(0);    // Initialize as null (0 is invalid container ID)
   }
@@ -166,7 +170,9 @@ class Task {
     method_ = 0;
     task_flags_.Clear();
     period_ns_ = 0.0;
+#if HSHM_IS_HOST
     run_ctx_.reset();  // Reset the unique_ptr (destroys RunContext if allocated)
+#endif
     return_code_.store(0);  // Initialize as success
     completer_.store(0);    // Initialize as null (0 is invalid container ID)
     stat_.io_size_ = 0;
@@ -275,7 +281,7 @@ class Task {
    * @param ar Archive to serialize to
    */
   template <typename Archive>
-  void SerializeIn(Archive& ar) {
+  HSHM_CROSS_FUN void SerializeIn(Archive& ar) {
     // Serialize base Task fields (IN and INOUT parameters)
     ar(pool_id_, task_id_, pool_query_, method_, task_flags_, period_ns_,
        return_code_);
@@ -292,7 +298,7 @@ class Task {
    * @param ar Archive to serialize to
    */
   template <typename Archive>
-  void SerializeOut(Archive& ar) {
+  HSHM_CROSS_FUN void SerializeOut(Archive& ar) {
     // Serialize base Task OUT fields only
     // Only serialize OUT fields - do NOT re-serialize IN fields
     // (pool_id_, task_id_, pool_query_, method_, task_flags_, period_ns_ are
@@ -537,7 +543,7 @@ class Future {
   /**
    * Destructor - destroys the task if this Future owns it
    */
-  ~Future() {
+  HSHM_CROSS_FUN ~Future() {
     if (is_owner_) {
       Destroy();
     }
@@ -547,7 +553,7 @@ class Future {
    * Destroy the task using CHI_IPC->DelTask if not null
    * Sets the task pointer to null afterwards
    */
-  void Destroy();
+  HSHM_CROSS_FUN void Destroy();
 
   /**
    * Copy constructor - does not transfer ownership

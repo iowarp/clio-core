@@ -411,6 +411,71 @@ struct TestLargeOutputTask : public chi::Task {
 };
 
 /**
+ * GpuSubmitTask - GPU-compatible task for testing Part 3
+ * This task can be created and submitted from GPU kernels
+ */
+struct GpuSubmitTask : public chi::Task {
+  IN chi::u32 gpu_id_;          // GPU ID that submitted the task
+  IN chi::u32 test_value_;      // Test value to verify correct execution
+  INOUT chi::u32 result_value_; // Result computed by the task
+
+  /** SHM default constructor */
+  HSHM_CROSS_FUN GpuSubmitTask()
+      : chi::Task(), gpu_id_(0), test_value_(0), result_value_(0) {}
+
+  /** Emplace constructor */
+  HSHM_CROSS_FUN explicit GpuSubmitTask(
+      const chi::TaskId &task_node,
+      const chi::PoolId &pool_id,
+      const chi::PoolQuery &pool_query,
+      chi::u32 gpu_id,
+      chi::u32 test_value)
+      : chi::Task(task_node, pool_id, pool_query, 25),
+        gpu_id_(gpu_id), test_value_(test_value), result_value_(0) {
+    // Initialize task
+    task_id_ = task_node;
+    pool_id_ = pool_id;
+    method_ = Method::kGpuSubmit;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  template<typename Archive>
+  HSHM_CROSS_FUN void SerializeIn(Archive& ar) {
+    Task::SerializeIn(ar);
+    ar(gpu_id_, test_value_, result_value_);
+  }
+
+  template<typename Archive>
+  HSHM_CROSS_FUN void SerializeOut(Archive& ar) {
+    Task::SerializeOut(ar);
+    ar(result_value_);  // Return the computed result
+  }
+
+  /**
+   * Copy from another GpuSubmitTask (assumes this task is already constructed)
+   * @param other Pointer to the source task to copy from
+   */
+  HSHM_CROSS_FUN void Copy(const hipc::FullPtr<GpuSubmitTask> &other) {
+    // Copy base Task fields
+    Task::Copy(other.template Cast<Task>());
+    // Copy GpuSubmitTask-specific fields
+    gpu_id_ = other->gpu_id_;
+    test_value_ = other->test_value_;
+    result_value_ = other->result_value_;
+  }
+
+  /**
+   * Aggregate replica results into this task
+   * @param other Pointer to the replica task to aggregate from
+   */
+  HSHM_CROSS_FUN void Aggregate(const hipc::FullPtr<GpuSubmitTask> &other) {
+    Task::Aggregate(other.template Cast<Task>());
+    Copy(other);
+  }
+};
+
+/**
  * Standard DestroyTask for MOD_NAME
  * All ChiMods should use the same DestroyTask structure from admin
  */

@@ -41,48 +41,11 @@
 
 namespace chi {
 
-PoolQuery::PoolQuery()
-    : routing_mode_(RoutingMode::Local), hash_value_(0), container_id_(0),
-      range_offset_(0), range_count_(0), node_id_(0), ret_node_(0) {}
-
-PoolQuery::PoolQuery(const PoolQuery& other)
-    : routing_mode_(other.routing_mode_),
-      hash_value_(other.hash_value_),
-      container_id_(other.container_id_),
-      range_offset_(other.range_offset_),
-      range_count_(other.range_count_),
-      node_id_(other.node_id_),
-      ret_node_(other.ret_node_) {}
-
-PoolQuery& PoolQuery::operator=(const PoolQuery& other) {
-  if (this != &other) {
-    routing_mode_ = other.routing_mode_;
-    hash_value_ = other.hash_value_;
-    container_id_ = other.container_id_;
-    range_offset_ = other.range_offset_;
-    range_count_ = other.range_count_;
-    node_id_ = other.node_id_;
-    ret_node_ = other.ret_node_;
-  }
-  return *this;
-}
-
-PoolQuery::~PoolQuery() {
-  // Stub destructor
-}
+// Constructor, copy constructor, assignment operator, and destructor
+// are now inline in pool_query.h for GPU compatibility
 
 // Static factory methods
-
-PoolQuery PoolQuery::Local() {
-  PoolQuery query;
-  query.routing_mode_ = RoutingMode::Local;
-  query.hash_value_ = 0;
-  query.container_id_ = 0;
-  query.range_offset_ = 0;
-  query.range_count_ = 0;
-  query.node_id_ = 0;
-  return query;
-}
+// Note: PoolQuery::Local() is now inline in pool_query.h for GPU compatibility
 
 PoolQuery PoolQuery::DirectId(ContainerId container_id) {
   PoolQuery query;
@@ -165,54 +128,6 @@ PoolQuery PoolQuery::FromString(const std::string& str) {
   }
 }
 
-// Getter methods
-
-u32 PoolQuery::GetHash() const { return hash_value_; }
-
-ContainerId PoolQuery::GetContainerId() const { return container_id_; }
-
-u32 PoolQuery::GetRangeOffset() const { return range_offset_; }
-
-u32 PoolQuery::GetRangeCount() const { return range_count_; }
-
-u32 PoolQuery::GetNodeId() const { return node_id_; }
-
-RoutingMode PoolQuery::GetRoutingMode() const { return routing_mode_; }
-
-bool PoolQuery::IsLocalMode() const {
-  return routing_mode_ == RoutingMode::Local;
-}
-
-bool PoolQuery::IsDirectIdMode() const {
-  return routing_mode_ == RoutingMode::DirectId;
-}
-
-bool PoolQuery::IsDirectHashMode() const {
-  return routing_mode_ == RoutingMode::DirectHash;
-}
-
-bool PoolQuery::IsRangeMode() const {
-  return routing_mode_ == RoutingMode::Range;
-}
-
-bool PoolQuery::IsBroadcastMode() const {
-  return routing_mode_ == RoutingMode::Broadcast;
-}
-
-bool PoolQuery::IsPhysicalMode() const {
-  return routing_mode_ == RoutingMode::Physical;
-}
-
-bool PoolQuery::IsDynamicMode() const {
-  return routing_mode_ == RoutingMode::Dynamic;
-}
-
-void PoolQuery::SetReturnNode(u32 ret_node) {
-  ret_node_ = ret_node;
-}
-
-u32 PoolQuery::GetReturnNode() const {
-  return ret_node_;
-}
+// Getter methods are now inline in pool_query.h for GPU compatibility
 
 }  // namespace chi

@@ -19,3 +19,4 @@ kCoMutexTest: 20        # CoMutex synchronization testing method
 kCoRwLockTest: 21       # CoRwLock reader-writer synchronization testing method
 kWaitTest: 23           # Wait test method
 kTestLargeOutput: 24    # Test large output streaming (1MB)
+kGpuSubmit: 25          # GPU task submission test (Part 3)

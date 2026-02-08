@@ -237,6 +237,21 @@ chi::TaskResume Runtime::TestLargeOutput(hipc::FullPtr<TestLargeOutputTask> task
   co_return;
 }
 
+chi::TaskResume Runtime::GpuSubmit(hipc::FullPtr<GpuSubmitTask> task,
+                                   chi::RunContext &rctx) {
+  HLOG(kDebug, "MOD_NAME: Executing GpuSubmit task from GPU {}, test_value={}",
+       task->gpu_id_, task->test_value_);
+
+  // Simple computation to verify task executed correctly
+  // Result = test_value * 2 + gpu_id
+  task->result_value_ = (task->test_value_ * 2) + task->gpu_id_;
+
+  HLOG(kDebug, "MOD_NAME: GpuSubmit completed, result_value={}",
+       task->result_value_);
+  (void)rctx;
+  co_return;
+}
+
 // Static member definitions
 chi::CoMutex Runtime::test_comutex_;
 chi::CoRwLock Runtime::test_corwlock_;

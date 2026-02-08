@@ -25,6 +25,15 @@ set(STREAMING_TEST_SOURCES
   test_streaming.cc
 )
 
+# GPU Submission test executable (Part 3)
+set(GPU_SUBMISSION_TEST_TARGET chimaera_gpu_submission_tests)
+set(GPU_SUBMISSION_TEST_CPU_SOURCES
+  test_gpu_submission_cpu.cc
+)
+set(GPU_SUBMISSION_TEST_GPU_SOURCES
+  test_gpu_submission_gpu.cc
+)
+
 # Create flush correctness test executable
 add_executable(${FLUSH_TEST_TARGET} ${FLUSH_TEST_SOURCES})
 
@@ -490,8 +499,115 @@ add_custom_target(test_streaming_concurrent
   COMMENT "Running Chimaera concurrent streaming tests"
 )
 
+# Create GPU Submission test executable
+# Configure for CUDA if available, otherwise build CPU-only version
+if(HSHM_ENABLE_CUDA OR HSHM_ENABLE_ROCM)
+  # Create object library for GPU kernels (compiled as CUDA)
+  set(GPU_SUBMISSION_TEST_CUDA_SOURCE ${CMAKE_CURRENT_BINARY_DIR}/cuda/${GPU_SUBMISSION_TEST_GPU_SOURCES})
+  configure_file(${GPU_SUBMISSION_TEST_GPU_SOURCES} ${GPU_SUBMISSION_TEST_CUDA_SOURCE} COPYONLY)
+  set_source_files_properties(${GPU_SUBMISSION_TEST_CUDA_SOURCE} PROPERTIES LANGUAGE CUDA)
+
+  add_library(${GPU_SUBMISSION_TEST_TARGET}_gpu_kernels OBJECT ${GPU_SUBMISSION_TEST_CUDA_SOURCE})
+  target_include_directories(${GPU_SUBMISSION_TEST_TARGET}_gpu_kernels PRIVATE
+    ${CHIMAERA_ROOT}/include
+    ${CHIMAERA_ROOT}/modules/admin/include
+    ${CHIMAERA_ROOT}/modules/MOD_NAME/include
+  )
+  target_link_libraries(${GPU_SUBMISSION_TEST_TARGET}_gpu_kernels PRIVATE hshm::cuda_cxx)
+  set_target_properties(${GPU_SUBMISSION_TEST_TARGET}_gpu_kernels PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    POSITION_INDEPENDENT_CODE ON
+    CUDA_STANDARD 17
+  )
+  target_compile_options(${GPU_SUBMISSION_TEST_TARGET}_gpu_kernels PUBLIC
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+  )
+
+  # Create main executable with CPU sources (compiled as C++)
+  add_executable(${GPU_SUBMISSION_TEST_TARGET}
+    ${GPU_SUBMISSION_TEST_CPU_SOURCES}
+    $<TARGET_OBJECTS:${GPU_SUBMISSION_TEST_TARGET}_gpu_kernels>
+  )
+
+  # Disable CUDA for CPU source to avoid needing CUDA headers
+  set_source_files_properties(${GPU_SUBMISSION_TEST_CPU_SOURCES} PROPERTIES
+    COMPILE_DEFINITIONS "HSHM_ENABLE_CUDA=0"
+  )
+
+  target_include_directories(${GPU_SUBMISSION_TEST_TARGET} PRIVATE
+    ${CHIMAERA_ROOT}/include
+    ${CHIMAERA_ROOT}/test  # For simple_test.h
+    ${CHIMAERA_ROOT}/modules/admin/include  # For admin tasks
+    ${CHIMAERA_ROOT}/modules/MOD_NAME/include  # For MOD_NAME tasks and client
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For accessing original source directory
+  )
+
+  target_link_libraries(${GPU_SUBMISSION_TEST_TARGET}
+    chimaera_admin_runtime          # Admin module runtime
+    chimaera_admin_client           # Admin module client
+    chimaera_MOD_NAME_runtime       # MOD_NAME module runtime for GpuSubmit tasks
+    chimaera_MOD_NAME_client        # MOD_NAME module client
+    hshm::cxx                       # HermesShm library (CPU-only for main executable)
+    hshm::cuda_cxx                  # HermesShm CUDA library (for GPU kernels via object library)
+    ${CMAKE_THREAD_LIBS_INIT}       # Threading support
+  )
+
+  set_target_properties(${GPU_SUBMISSION_TEST_TARGET} PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+    CUDA_STANDARD 17
+    CUDA_STANDARD_REQUIRED ON
+    POSITION_INDEPENDENT_CODE ON
+    CUDA_SEPARABLE_COMPILATION ON
+    LINKER_LANGUAGE CUDA
+  )
+
+  set_target_properties(${GPU_SUBMISSION_TEST_TARGET} PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+
+  message(STATUS "Building GPU submission tests with CUDA support")
+else()
+  # CPU-only version (just the CPU test file, GPU kernels won't be compiled)
+  add_executable(${GPU_SUBMISSION_TEST_TARGET} ${GPU_SUBMISSION_TEST_CPU_SOURCES})
+
+  target_include_directories(${GPU_SUBMISSION_TEST_TARGET} PRIVATE
+    ${CHIMAERA_ROOT}/include
+    ${CHIMAERA_ROOT}/test  # For simple_test.h
+    ${CHIMAERA_ROOT}/modules/admin/include  # For admin tasks
+    ${CHIMAERA_ROOT}/modules/MOD_NAME/include  # For MOD_NAME tasks and client
+  )
+
+  target_link_libraries(${GPU_SUBMISSION_TEST_TARGET}
+    chimaera_admin_runtime          # Admin module runtime
+    chimaera_admin_client           # Admin module client
+    chimaera_MOD_NAME_runtime       # MOD_NAME module runtime for GpuSubmit tasks
+    chimaera_MOD_NAME_client        # MOD_NAME module client
+    hshm::cxx                       # HermesShm library
+    ${CMAKE_THREAD_LIBS_INIT}       # Threading support
+  )
+
+  set_target_properties(${GPU_SUBMISSION_TEST_TARGET} PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+  )
+
+  set_target_properties(${GPU_SUBMISSION_TEST_TARGET} PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+
+  message(STATUS "Building GPU submission tests without CUDA support (CPU-only)")
+endif()
+
+add_custom_target(test_gpu_submission
+  COMMAND ${GPU_SUBMISSION_TEST_TARGET}
+  DEPENDS ${GPU_SUBMISSION_TEST_TARGET}
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  COMMENT "Running Chimaera Part 3 GPU submission tests"
+)
+
 # Install test executables
-install(TARGETS ${FLUSH_TEST_TARGET} ${COMUTEX_TEST_TARGET} ${WAIT_FUNCTIONALITY_TEST_TARGET} ${STREAMING_TEST_TARGET}
+install(TARGETS ${FLUSH_TEST_TARGET} ${COMUTEX_TEST_TARGET} ${WAIT_FUNCTIONALITY_TEST_TARGET} ${STREAMING_TEST_TARGET} ${GPU_SUBMISSION_TEST_TARGET}
   RUNTIME DESTINATION bin
 )
 
@@ -500,3 +616,4 @@ message(STATUS "  Flush test target: ${FLUSH_TEST_TARGET}")
 message(STATUS "  CoMutex test target: ${COMUTEX_TEST_TARGET}")
 message(STATUS "  Wait Functionality test target: ${WAIT_FUNCTIONALITY_TEST_TARGET}")
 message(STATUS "  Streaming test target: ${STREAMING_TEST_TARGET}")
+message(STATUS "  GPU Submission test target: ${GPU_SUBMISSION_TEST_TARGET}")

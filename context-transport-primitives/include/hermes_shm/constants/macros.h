@@ -100,11 +100,11 @@
 #endif
 
 /** Includes for CUDA and ROCm */
-#if HSHM_ENABLE_CUDA
+#if HSHM_ENABLE_CUDA && defined(__CUDACC__)
 #include <cuda_runtime.h>
 #endif
 
-#if HSHM_ENABLE_ROCM
+#if HSHM_ENABLE_ROCM && defined(__HIP_PLATFORM_AMD__)
 #include <hip/hip_runtime.h>
 #endif
 

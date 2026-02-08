@@ -355,6 +355,7 @@ if(HSHM_ENABLE_CUDA OR HSHM_ENABLE_ROCM)
     ${CHIMAERA_ROOT}/include
     ${CHIMAERA_ROOT}/test  # For test utilities
     ${CMAKE_CURRENT_SOURCE_DIR}  # For accessing original source directory
+    ${CHIMAERA_ROOT}/modules/MOD_NAME/include  # For MOD_NAME tasks
   )
 
   target_link_libraries(${IPC_ALLOCATE_BUFFER_GPU_TEST_TARGET}

@@ -459,6 +459,7 @@ u32 Worker::ProcessNewTasks() {
     // Pop Future<Task> from assigned lane
     if (assigned_lane_->Pop(future)) {
       tasks_processed++;
+      HLOG(kInfo, "Worker {}: Popped future from lane, processing task {}", worker_id_, tasks_processed);
       SetCurrentRunContext(nullptr);
 
       // IMPORTANT: Register allocator BEFORE calling GetFutureShm()
@@ -519,16 +520,31 @@ u32 Worker::ProcessNewTasks() {
       FullPtr<Task> task_full_ptr =
           GetOrCopyTaskFromFuture(future, container, method_id);
 
+      // Check if task deserialization failed
+      if (task_full_ptr.IsNull()) {
+        HLOG(kError, "Worker {}: Failed to deserialize task for pool_id={}, method={}",
+             worker_id_, pool_id, method_id);
+        // Mark as complete with error so client doesn't hang
+        future_shm->flags_.SetBits(1 | FutureShm::FUTURE_COMPLETE);
+        continue;
+      }
+
+      HLOG(kInfo, "Worker {}: Task deserialized successfully, task_ptr={}, checking if routed",
+           worker_id_, (void*)task_full_ptr.ptr_);
+
       // Allocate stack and RunContext before routing
       if (!task_full_ptr->IsRouted()) {
+        HLOG(kInfo, "Worker {}: Task not routed, calling BeginTask", worker_id_);
         BeginTask(future, container, assigned_lane_);
       }
 
       // Route task using consolidated routing function
       if (RouteTask(future, assigned_lane_, container)) {
         // Routing successful, execute the task
+#if HSHM_IS_HOST
         RunContext *run_ctx = task_full_ptr->run_ctx_.get();
         ExecTask(task_full_ptr, run_ctx, false);
+#endif
       }
       // Note: RouteTask returning false doesn't always indicate an error
       // Real errors are handled within RouteTask itself
@@ -1136,6 +1152,7 @@ void Worker::BeginTask(Future<Task> &future, Container *container,
     return;
   }
 
+#if HSHM_IS_HOST
   // Initialize or reset the task's owned RunContext
   task_ptr->run_ctx_ = std::make_unique<RunContext>();
   RunContext *run_ctx = task_ptr->run_ctx_.get();
@@ -1164,6 +1181,7 @@ void Worker::BeginTask(Future<Task> &future, Container *container,
 
   // Set current run context
   SetCurrentRunContext(run_ctx);
+#endif
 }
 
 void Worker::StartCoroutine(const FullPtr<Task> &task_ptr,

@@ -115,7 +115,7 @@ struct bitfield {
 
   /** Serialization */
   template <typename Ar>
-  void serialize(Ar &ar) {
+  HSHM_CROSS_FUN void serialize(Ar &ar) {
     ar & bits_;
   }
 };

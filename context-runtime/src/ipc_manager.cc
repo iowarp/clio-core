@@ -160,6 +160,13 @@ bool IpcManager::ServerInit() {
     return false;
   }
 
+#if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
+  // Initialize GPU queues (one ring buffer per GPU)
+  if (!ServerInitGpuQueues()) {
+    return false;
+  }
+#endif
+
   // Identify this host and store node ID in shared header
   if (!IdentifyThisHost()) {
     HLOG(kError, "Warning: Could not identify host, using default node ID");
@@ -438,6 +445,83 @@ bool IpcManager::ServerInitQueues() {
     return false;
   }
 }
+
+#if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
+bool IpcManager::ServerInitGpuQueues() {
+  // Get number of GPUs on the system
+  int num_gpus = hshm::GpuApi::GetDeviceCount();
+  if (num_gpus == 0) {
+    HLOG(kDebug, "No GPUs detected, skipping GPU queue initialization");
+    return true;  // Not an error - just no GPUs available
+  }
+
+  HLOG(kInfo, "Initializing {} GPU queue(s) with pinned host memory", num_gpus);
+
+  try {
+    // Get configured queue depth
+    ConfigManager *config = CHI_CONFIG_MANAGER;
+    u32 queue_depth = config->GetQueueDepth();
+
+    // Get configured GPU segment size (default to 64MB per GPU)
+    size_t gpu_segment_size = config && config->IsValid()
+        ? config->GetMemorySegmentSize("gpu_segment")
+        : hshm::Unit<size_t>::Megabytes(64);
+
+    // Reserve space for GPU backends and queues
+    gpu_backends_.reserve(num_gpus);
+    gpu_queues_.reserve(num_gpus);
+
+    // Create one segment and ring buffer per GPU
+    for (int gpu_id = 0; gpu_id < num_gpus; ++gpu_id) {
+      // Create unique URL for this GPU's shared memory
+      std::string gpu_url = "/chi_gpu_queue_" + std::to_string(gpu_id);
+
+      // Create GPU backend ID
+      hipc::MemoryBackendId backend_id(1000 + gpu_id, 0);  // Use high IDs for GPU backends
+
+      // Create GpuShmMmap backend (pinned host memory, GPU-accessible)
+      auto gpu_backend = std::make_unique<hipc::GpuShmMmap>();
+      if (!gpu_backend->shm_init(backend_id, gpu_segment_size, gpu_url, gpu_id)) {
+        HLOG(kError, "Failed to initialize GPU backend for GPU {}", gpu_id);
+        return false;
+      }
+
+      // Create allocator for this GPU segment
+      auto *gpu_allocator = gpu_backend->template MakeAlloc<CHI_MAIN_ALLOC_T>(
+          gpu_backend->data_capacity_);
+      if (!gpu_allocator) {
+        HLOG(kError, "Failed to create allocator for GPU {}", gpu_id);
+        return false;
+      }
+
+      // Create TaskQueue in GPU segment (one ring buffer)
+      // Single lane for now, 2 priorities (normal and resumed)
+      hipc::FullPtr<TaskQueue> gpu_queue = gpu_allocator->template NewObj<TaskQueue>(
+          gpu_allocator,
+          1,             // num_lanes: single lane per GPU
+          2,             // num_priorities: normal and resumed
+          queue_depth);  // configured depth
+
+      if (gpu_queue.IsNull()) {
+        HLOG(kError, "Failed to create TaskQueue for GPU {}", gpu_id);
+        return false;
+      }
+
+      HLOG(kInfo, "GPU {} queue initialized: segment_size={}, queue_depth={}",
+           gpu_id, gpu_segment_size, queue_depth);
+
+      // Store backend and queue
+      gpu_backends_.push_back(std::move(gpu_backend));
+      gpu_queues_.push_back(gpu_queue);
+    }
+
+    return true;
+  } catch (const std::exception &e) {
+    HLOG(kError, "Exception during GPU queue initialization: {}", e.what());
+    return false;
+  }
+}
+#endif
 
 bool IpcManager::ClientInitQueues() {
   if (!main_allocator_) {

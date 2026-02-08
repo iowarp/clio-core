@@ -25,7 +25,6 @@ GLOBAL_CONST chi::u32 kHeartbeat = 16;
 GLOBAL_CONST chi::u32 kMonitor = 17;
 GLOBAL_CONST chi::u32 kSubmitBatch = 18;
 GLOBAL_CONST chi::u32 kWreapDeadIpcs = 19;
-GLOBAL_CONST chi::u32 kRegisterAcceleratorMemory = 20;
 }  // namespace Method
 
 }  // namespace chimaera::admin

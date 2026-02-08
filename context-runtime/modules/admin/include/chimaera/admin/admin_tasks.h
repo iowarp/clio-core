@@ -1069,83 +1069,84 @@ struct SubmitBatchTask : public chi::Task {
  * with the Chimaera runtime. The runtime can then use this memory for
  * allocations within GPU kernels.
  */
-struct RegisterAcceleratorMemoryTask : public chi::Task {
-  // Backend information for GPU memory
-  IN chi::u64 backend_id_;           ///< Backend ID
-  IN chi::u64 data_capacity_;        ///< GPU memory capacity in bytes
-  IN chi::u32 gpu_id_;               ///< GPU device ID
-
-  // Results
-  OUT chi::priv::string error_message_;  ///< Error description if registration failed
-
-  /** SHM default constructor */
-  RegisterAcceleratorMemoryTask()
-      : chi::Task(),
-        backend_id_(0),
-        data_capacity_(0),
-        gpu_id_(0),
-        error_message_(HSHM_MALLOC) {}
-
-  /** Emplace constructor */
-  explicit RegisterAcceleratorMemoryTask(const chi::TaskId &task_node,
-                                         const chi::PoolId &pool_id,
-                                         const chi::PoolQuery &pool_query,
-                                         chi::u64 backend_id,
-                                         chi::u64 data_capacity,
-                                         chi::u32 gpu_id)
-      : chi::Task(task_node, pool_id, pool_query, Method::kRegisterAcceleratorMemory),
-        backend_id_(backend_id),
-        data_capacity_(data_capacity),
-        gpu_id_(gpu_id),
-        error_message_(HSHM_MALLOC) {
-    // Initialize task
-    task_id_ = task_node;
-    pool_id_ = pool_id;
-    method_ = Method::kRegisterAcceleratorMemory;
-    task_flags_.Clear();
-    pool_query_ = pool_query;
-  }
-
-  /**
-   * Serialize IN and INOUT parameters for network transfer
-   * This includes: backend_id_, data_capacity_, gpu_id_
-   */
-  template <typename Archive>
-  void SerializeIn(Archive &ar) {
-    Task::SerializeIn(ar);
-    ar(backend_id_, data_capacity_, gpu_id_);
-  }
-
-  /**
-   * Serialize OUT and INOUT parameters for network transfer
-   * This includes: error_message_
-   */
-  template <typename Archive>
-  void SerializeOut(Archive &ar) {
-    Task::SerializeOut(ar);
-    ar(error_message_);
-  }
-
-  /**
-   * Copy from another RegisterAcceleratorMemoryTask
-   * @param other Pointer to the source task to copy from
-   */
-  void Copy(const hipc::FullPtr<RegisterAcceleratorMemoryTask> &other) {
-    // Copy base Task fields
-    Task::Copy(other.template Cast<Task>());
-    // Copy RegisterAcceleratorMemoryTask-specific fields
-    backend_id_ = other->backend_id_;
-    data_capacity_ = other->data_capacity_;
-    gpu_id_ = other->gpu_id_;
-    error_message_ = other->error_message_;
-  }
-
-  /** Aggregate replica results into this task */
-  void Aggregate(const hipc::FullPtr<RegisterAcceleratorMemoryTask> &other) {
-    Task::Aggregate(other.template Cast<Task>());
-    Copy(other);
-  }
-};
+// TODO: RegisterAcceleratorMemoryTask - incomplete, needs Method::kRegisterAcceleratorMemory defined
+// struct RegisterAcceleratorMemoryTask : public chi::Task {
+//   // Backend information for GPU memory
+//   IN chi::u64 backend_id_;           ///< Backend ID
+//   IN chi::u64 data_capacity_;        ///< GPU memory capacity in bytes
+//   IN chi::u32 gpu_id_;               ///< GPU device ID
+//
+//   // Results
+//   OUT chi::priv::string error_message_;  ///< Error description if registration failed
+//
+//   /** SHM default constructor */
+//   RegisterAcceleratorMemoryTask()
+//       : chi::Task(),
+//         backend_id_(0),
+//         data_capacity_(0),
+//         gpu_id_(0),
+//         error_message_(HSHM_MALLOC) {}
+//
+//   /** Emplace constructor */
+//   explicit RegisterAcceleratorMemoryTask(const chi::TaskId &task_node,
+//                                          const chi::PoolId &pool_id,
+//                                          const chi::PoolQuery &pool_query,
+//                                          chi::u64 backend_id,
+//                                          chi::u64 data_capacity,
+//                                          chi::u32 gpu_id)
+//       : chi::Task(task_node, pool_id, pool_query, Method::kRegisterAcceleratorMemory),
+//         backend_id_(backend_id),
+//         data_capacity_(data_capacity),
+//         gpu_id_(gpu_id),
+//         error_message_(HSHM_MALLOC) {
+//     // Initialize task
+//     task_id_ = task_node;
+//     pool_id_ = pool_id;
+//     method_ = Method::kRegisterAcceleratorMemory;
+//     task_flags_.Clear();
+//     pool_query_ = pool_query;
+//   }
+//
+//   /**
+//    * Serialize IN and INOUT parameters for network transfer
+//    * This includes: backend_id_, data_capacity_, gpu_id_
+//    */
+//   template <typename Archive>
+//   void SerializeIn(Archive &ar) {
+//     Task::SerializeIn(ar);
+//     ar(backend_id_, data_capacity_, gpu_id_);
+//   }
+//
+//   /**
+//    * Serialize OUT and INOUT parameters for network transfer
+//    * This includes: error_message_
+//    */
+//   template <typename Archive>
+//   void SerializeOut(Archive &ar) {
+//     Task::SerializeOut(ar);
+//     ar(error_message_);
+//   }
+//
+//   /**
+//    * Copy from another RegisterAcceleratorMemoryTask
+//    * @param other Pointer to the source task to copy from
+//    */
+//   void Copy(const hipc::FullPtr<RegisterAcceleratorMemoryTask> &other) {
+//     // Copy base Task fields
+//     Task::Copy(other.template Cast<Task>());
+//     // Copy RegisterAcceleratorMemoryTask-specific fields
+//     backend_id_ = other->backend_id_;
+//     data_capacity_ = other->data_capacity_;
+//     gpu_id_ = other->gpu_id_;
+//     error_message_ = other->error_message_;
+//   }
+//
+//   /** Aggregate replica results into this task */
+//   void Aggregate(const hipc::FullPtr<RegisterAcceleratorMemoryTask> &other) {
+//     Task::Aggregate(other.template Cast<Task>());
+//     Copy(other);
+//   }
+// };
 
 }  // namespace chimaera::admin
 

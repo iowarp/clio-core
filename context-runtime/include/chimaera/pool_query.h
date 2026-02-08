@@ -64,22 +64,42 @@ class PoolQuery {
   /**
    * Default constructor
    */
-  PoolQuery();
+  HSHM_CROSS_FUN PoolQuery()
+      : routing_mode_(RoutingMode::Local), hash_value_(0), container_id_(0),
+        range_offset_(0), range_count_(0), node_id_(0), ret_node_(0) {}
 
   /**
    * Copy constructor
    */
-  PoolQuery(const PoolQuery& other);
+  HSHM_CROSS_FUN PoolQuery(const PoolQuery& other)
+      : routing_mode_(other.routing_mode_),
+        hash_value_(other.hash_value_),
+        container_id_(other.container_id_),
+        range_offset_(other.range_offset_),
+        range_count_(other.range_count_),
+        node_id_(other.node_id_),
+        ret_node_(other.ret_node_) {}
 
   /**
    * Assignment operator
    */
-  PoolQuery& operator=(const PoolQuery& other);
+  HSHM_CROSS_FUN PoolQuery& operator=(const PoolQuery& other) {
+    if (this != &other) {
+      routing_mode_ = other.routing_mode_;
+      hash_value_ = other.hash_value_;
+      container_id_ = other.container_id_;
+      range_offset_ = other.range_offset_;
+      range_count_ = other.range_count_;
+      node_id_ = other.node_id_;
+      ret_node_ = other.ret_node_;
+    }
+    return *this;
+  }
 
   /**
    * Destructor
    */
-  ~PoolQuery();
+  HSHM_CROSS_FUN ~PoolQuery() {}
 
   // Static factory methods to create different types of PoolQuery
 
@@ -87,7 +107,14 @@ class PoolQuery {
    * Create a local routing pool query
    * @return PoolQuery configured for local container routing
    */
-  static PoolQuery Local();
+  static HSHM_CROSS_FUN PoolQuery Local() {
+    PoolQuery query;
+    query.routing_mode_ = RoutingMode::Local;
+    query.hash_value_ = 0;
+    query.container_id_ = 0;
+    query.range_offset_ = 0;
+    return query;
+  }
 
   /**
    * Create a direct ID routing pool query
@@ -144,98 +171,116 @@ class PoolQuery {
    * Get the hash value for hash-based routing modes
    * @return Hash value used for container routing
    */
-  u32 GetHash() const;
+  HSHM_CROSS_FUN u32 GetHash() const { return hash_value_; }
 
   /**
    * Get the container ID for direct ID routing mode
    * @return Container ID for direct routing
    */
-  ContainerId GetContainerId() const;
+  HSHM_CROSS_FUN ContainerId GetContainerId() const { return container_id_; }
 
   /**
    * Get the range offset for range routing mode
    * @return Starting offset in the container range
    */
-  u32 GetRangeOffset() const;
+  HSHM_CROSS_FUN u32 GetRangeOffset() const { return range_offset_; }
 
   /**
    * Get the range count for range routing mode
    * @return Number of containers in the range
    */
-  u32 GetRangeCount() const;
+  HSHM_CROSS_FUN u32 GetRangeCount() const { return range_count_; }
 
   /**
    * Get the node ID for physical routing mode
    * @return Node ID for physical routing
    */
-  u32 GetNodeId() const;
+  HSHM_CROSS_FUN u32 GetNodeId() const { return node_id_; }
 
   /**
    * Determine the routing mode of this pool query
    * @return RoutingMode enum indicating how this query should be routed
    */
-  RoutingMode GetRoutingMode() const;
+  HSHM_CROSS_FUN RoutingMode GetRoutingMode() const { return routing_mode_; }
 
   /**
    * Check if pool query is in Local routing mode
    * @return true if routing mode is Local
    */
-  bool IsLocalMode() const;
+  HSHM_CROSS_FUN bool IsLocalMode() const {
+    return routing_mode_ == RoutingMode::Local;
+  }
 
   /**
    * Check if pool query is in DirectId routing mode
    * @return true if routing mode is DirectId
    */
-  bool IsDirectIdMode() const;
+  HSHM_CROSS_FUN bool IsDirectIdMode() const {
+    return routing_mode_ == RoutingMode::DirectId;
+  }
 
   /**
    * Check if pool query is in DirectHash routing mode
    * @return true if routing mode is DirectHash
    */
-  bool IsDirectHashMode() const;
+  HSHM_CROSS_FUN bool IsDirectHashMode() const {
+    return routing_mode_ == RoutingMode::DirectHash;
+  }
 
   /**
    * Check if pool query is in Range routing mode
    * @return true if routing mode is Range
    */
-  bool IsRangeMode() const;
+  HSHM_CROSS_FUN bool IsRangeMode() const {
+    return routing_mode_ == RoutingMode::Range;
+  }
 
   /**
    * Check if pool query is in Broadcast routing mode
    * @return true if routing mode is Broadcast
    */
-  bool IsBroadcastMode() const;
+  HSHM_CROSS_FUN bool IsBroadcastMode() const {
+    return routing_mode_ == RoutingMode::Broadcast;
+  }
 
   /**
    * Check if pool query is in Physical routing mode
    * @return true if routing mode is Physical
    */
-  bool IsPhysicalMode() const;
+  HSHM_CROSS_FUN bool IsPhysicalMode() const {
+    return routing_mode_ == RoutingMode::Physical;
+  }
 
   /**
    * Check if pool query is in Dynamic routing mode
    * @return true if routing mode is Dynamic
    */
-  bool IsDynamicMode() const;
+  HSHM_CROSS_FUN bool IsDynamicMode() const {
+    return routing_mode_ == RoutingMode::Dynamic;
+  }
 
   /**
    * Set the return node ID for distributed task responses
    * @param ret_node Node ID where task results should be returned
    */
-  void SetReturnNode(u32 ret_node);
+  HSHM_CROSS_FUN void SetReturnNode(u32 ret_node) {
+    ret_node_ = ret_node;
+  }
 
   /**
    * Get the return node ID for distributed task responses
    * @return Node ID where task results should be returned
    */
-  u32 GetReturnNode() const;
+  HSHM_CROSS_FUN u32 GetReturnNode() const {
+    return ret_node_;
+  }
 
   /**
    * Cereal serialization support
    * @param ar Archive for serialization
    */
   template <class Archive>
-  void serialize(Archive& ar) {
+  HSHM_CROSS_FUN void serialize(Archive& ar) {
     ar(routing_mode_, hash_value_, container_id_, range_offset_, range_count_, node_id_, ret_node_);
   }
 

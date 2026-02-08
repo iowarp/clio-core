@@ -20,6 +20,7 @@ GLOBAL_CONST chi::u32 kCoMutexTest = 20;
 GLOBAL_CONST chi::u32 kCoRwLockTest = 21;
 GLOBAL_CONST chi::u32 kWaitTest = 23;
 GLOBAL_CONST chi::u32 kTestLargeOutput = 24;
+GLOBAL_CONST chi::u32 kGpuSubmit = 25;
 }  // namespace Method
 
 }  // namespace chimaera::MOD_NAME

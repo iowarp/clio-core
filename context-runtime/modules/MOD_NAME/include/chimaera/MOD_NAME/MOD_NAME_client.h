@@ -172,6 +172,25 @@ class Client : public chi::ContainerClient {
 
     return ipc_manager->Send(task);
   }
+
+  /**
+   * Submit GpuSubmit task (asynchronous)
+   * Tests GPU task submission functionality (Part 3)
+   * @param pool_query Pool routing information
+   * @param gpu_id GPU ID that submitted the task
+   * @param test_value Test value to verify correct execution
+   * @return Future for the GpuSubmitTask
+   */
+  chi::Future<GpuSubmitTask> AsyncGpuSubmit(const chi::PoolQuery& pool_query,
+                                            chi::u32 gpu_id,
+                                            chi::u32 test_value) {
+    auto* ipc_manager = CHI_IPC;
+
+    auto task = ipc_manager->NewTask<GpuSubmitTask>(
+        chi::CreateTaskId(), pool_id_, pool_query, gpu_id, test_value);
+
+    return ipc_manager->Send(task);
+  }
 };
 
 }  // namespace chimaera::MOD_NAME
