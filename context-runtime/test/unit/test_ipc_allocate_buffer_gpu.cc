@@ -165,7 +165,7 @@ __global__ void test_gpu_init_only_kernel(
     int *results)                              ///< Output: test results (0=pass, non-zero=fail)
 {
   // Initialize IPC manager using the macro
-  CHIMAERA_GPU_INIT(backend);
+  CHIMAERA_GPU_INIT(backend, nullptr);
 
   // Just report success if initialization didn't crash
   results[thread_id] = 0;
@@ -183,7 +183,7 @@ __global__ void test_gpu_allocate_buffer_kernel(
     char **allocated_ptrs)                     ///< Output: pointers allocated per thread
 {
   // Initialize IPC manager using the macro
-  CHIMAERA_GPU_INIT(backend);
+  CHIMAERA_GPU_INIT(backend, nullptr);
 
   // Each thread allocates a small buffer (64 bytes)
   size_t alloc_size = 64;
@@ -229,7 +229,7 @@ __global__ void test_gpu_to_full_ptr_kernel(
     int *results)  ///< Output: test results (0=pass, non-zero=fail)
 {
   // Initialize IPC manager in shared memory
-  CHIMAERA_GPU_INIT(backend);
+  CHIMAERA_GPU_INIT(backend, nullptr);
 
   // Allocate a buffer
   size_t alloc_size = 512;
@@ -278,7 +278,7 @@ __global__ void test_gpu_multiple_allocs_kernel(
     int *results)  ///< Output: test results (0=pass, non-zero=fail)
 {
   // Initialize IPC manager in shared memory
-  CHIMAERA_GPU_INIT(backend);
+  CHIMAERA_GPU_INIT(backend, nullptr);
 
   const int num_allocs = 4;
   size_t alloc_sizes[] = {256, 512, 1024, 2048};
@@ -327,7 +327,7 @@ __global__ void test_gpu_new_task_kernel(
     int *results)
 {
   // Initialize IPC manager (defines thread_id)
-  CHIMAERA_GPU_INIT(backend);
+  CHIMAERA_GPU_INIT(backend, nullptr);
 
   // Only thread 0 creates task
   if (thread_id == 0) {
@@ -366,7 +366,7 @@ __global__ void test_gpu_serialize_deserialize_kernel(
     int *results)
 {
   // Initialize IPC manager (defines thread_id)
-  CHIMAERA_GPU_INIT(backend);
+  CHIMAERA_GPU_INIT(backend, nullptr);
 
   // Only thread 0 tests serialization
   if (thread_id == 0) {
@@ -438,7 +438,7 @@ __global__ void test_gpu_serialize_for_cpu_kernel(
     int *results)
 {
   // Initialize IPC manager (defines thread_id)
-  CHIMAERA_GPU_INIT(backend);
+  CHIMAERA_GPU_INIT(backend, nullptr);
 
   // Only thread 0 serializes
   if (thread_id == 0) {
@@ -479,7 +479,7 @@ __global__ void test_gpu_make_copy_future_for_cpu_kernel(
     hipc::ShmPtr<chi::FutureShm> *d_future_shm_out,
     int *d_result)
 {
-  CHIMAERA_GPU_INIT(backend);
+  CHIMAERA_GPU_INIT(backend, nullptr);
 
   if (thread_id == 0) {
     *d_result = 1;  // Kernel started

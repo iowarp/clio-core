@@ -40,17 +40,17 @@
             "binaryDir": "${sourceDir}/build",
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Debug",
-                "WRP_CORE_ENABLE_RUNTIME": "OFF",
-                "WRP_CORE_ENABLE_CTE": "OFF",
+                "WRP_CORE_ENABLE_RUNTIME": "ON",
+                "WRP_CORE_ENABLE_CTE": "ON",
                 "WRP_CORE_ENABLE_CAE": "OFF",
                 "WRP_CORE_ENABLE_CEE": "OFF",
                 "WRP_CORE_ENABLE_TESTS": "ON",
                 "WRP_CORE_ENABLE_BENCHMARKS": "ON",
-                "WRP_CORE_ENABLE_ELF": "ON",
+                "WRP_CORE_ENABLE_ELF": "OFF",
                 "WRP_CORE_ENABLE_CUDA": "ON",
                 "CMAKE_CUDA_ARCHITECTURES": "86",
                 "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
-                "WRP_CORE_ENABLE_ASAN": "ON"
+                "WRP_CORE_ENABLE_ASAN": "OFF"
             }
         },
         {

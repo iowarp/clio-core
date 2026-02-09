@@ -113,7 +113,6 @@ option(WRP_CORE_ENABLE_JARVIS "Enable Jarvis CI infrastructure installation" OFF
 #------------------------------------------------------------------------------
 # HermesShm (context-transport-primitives) Options
 #------------------------------------------------------------------------------
-option(HSHM_ENABLE_TESTS "Enable tests for HermesShm" ON)
 option(HSHM_ENABLE_PTHREADS "Support spawning pthreads" OFF)
 option(HSHM_ENABLE_WINDOWS_THREADS "Support spawning windows threads" OFF)
 option(HSHM_DEBUG_LOCK "Used for debugging locks" OFF)
@@ -123,7 +122,6 @@ set(HSHM_LOG_LEVEL "1" CACHE STRING "Log level threshold (0=Debug, 1=Info, 2=War
 #------------------------------------------------------------------------------
 # Chimaera (context-runtime) Options
 #------------------------------------------------------------------------------
-option(CHIMAERA_ENABLE_TESTS "Enable tests for Chimaera runtime" ON)
 
 #------------------------------------------------------------------------------
 # CTE (context-transfer-engine) Options
@@ -155,11 +153,7 @@ option(WRP_CORE_ENABLE_GRAY_SCOTT "Enable Gray-Scott ADIOS2 example (requires AD
 # If WRP_CORE_ENABLE_BENCHMARKS is OFF, force all component benchmarks OFF
 # Otherwise, use individual component values
 
-# Apply master test switch
-if(NOT WRP_CORE_ENABLE_TESTS)
-    set(HSHM_ENABLE_TESTS OFF)
-    set(CHIMAERA_ENABLE_TESTS OFF)
-endif()
+# Apply master test switch (no-op, WRP_CORE_ENABLE_TESTS used directly)
 
 # Set HSHM_ENABLE_* aliases for backward compatibility
 # These allow component code to continue using HSHM_ENABLE_* while we transition

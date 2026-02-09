@@ -40,7 +40,7 @@ set_target_properties(${BDEV_TEST_TARGET} PROPERTIES
 )
 
 # Enable CTest integration if testing is enabled
-if(CHIMAERA_ENABLE_TESTS)
+if(WRP_CORE_ENABLE_TESTS)
   # Bdev ChiMod Tests
   add_test(
     NAME cr_bdev_container_creation_tests

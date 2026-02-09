@@ -240,41 +240,25 @@ TEST_CASE("gpu_kernel_task_submission", "[gpu][kernel_submit]") {
   // Show result for debugging
   INFO("GPU kernel test result: " + std::to_string(result));
 
-  // Verify success with detailed step-by-step diagnostics
+  // Verify success with simple error codes
   if (result == -100) {
     INFO("GPU backend initialization failed");
+  } else if (result == -101) {
+    INFO("IPC manager not initialized - CHIMAERA_INIT must be called first");
+  } else if (result == -102) {
+    INFO("GPU queue not available - ServerInitGpuQueues may not have been called");
   } else if (result == -200) {
     INFO("CUDA synchronization failed");
   } else if (result == -201) {
     INFO("Kernel launch error");
-  } else if (result == -777) {
-    INFO("DIAGNOSTIC: Kernel entered but stopped before CHIMAERA_GPU_INIT");
-  } else if (result == -666) {
-    INFO("DIAGNOSTIC: CHIMAERA_GPU_INIT completed but stopped before IPC manager check");
-  } else if (result == -10) {
-    INFO("Step 0 FAILED: g_ipc_manager pointer is null after CHIMAERA_GPU_INIT");
-  } else if (result == -11) {
-    INFO("Step 1 FAILED: Backend allocation test (64 bytes) failed - AllocateBuffer returned null");
-  } else if (result == -12) {
-    INFO("Step 2 FAILED: Task-sized buffer allocation failed - AllocateBuffer(sizeof(GpuSubmitTask)) returned null");
-  } else if (result == -130) {
-    INFO("Step 3 FAILED: Out of memory before NewTask - AllocateBuffer(task_size) failed");
-  } else if (result == -131) {
-    INFO("Step 3 FAILED: AllocateBuffer inside manual NewTask path returned null");
-  } else if (result == -132) {
-    INFO("Step 3 FAILED: Placement new constructor returned nullptr");
-  } else if (result == -133) {
-    INFO("Step 3 FAILED: FullPtr construction from task pointer failed");
-  } else if (result == -13) {
-    INFO("Step 3 FAILED: NewTask returned null - task construction failed");
-  } else if (result == -14) {
-    INFO("Step 4 FAILED: MakeCopyFutureGpu returned null - task serialization failed");
-  } else if (result == 0 || result == -999) {
-    INFO("GPU kernel did not set result flags (initialization issue?)");
+  } else if (result == -1) {
+    INFO("NewTask failed - returned null pointer");
+  } else if (result == -2) {
+    INFO("Send failed - returned null future");
   }
 
   REQUIRE(result == 1);
-  INFO("SUCCESS: All steps passed - GPU kernel created and submitted task!");
+  INFO("SUCCESS: GPU kernel submitted task using NewTask and Send!");
 }
 
 //==============================================================================

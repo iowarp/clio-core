@@ -150,7 +150,7 @@ set_target_properties(${STREAMING_TEST_TARGET} PROPERTIES
 )
 
 # Enable CTest integration if testing is enabled
-if(CHIMAERA_ENABLE_TESTS)
+if(WRP_CORE_ENABLE_TESTS)
   # Flush Correctness Tests
   add_test(
     NAME cr_flush_basic_tests

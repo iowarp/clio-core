@@ -514,12 +514,26 @@ class Future {
    * @param task_ptr FullPtr to the task (wraps private memory with null
    * allocator)
    */
-  HSHM_CROSS_FUN Future(hipc::ShmPtr<FutureT> future_shm, hipc::FullPtr<TaskT> task_ptr)
-      : task_ptr_(task_ptr),
-        future_shm_(future_shm),
+  HSHM_CROSS_FUN Future(hipc::ShmPtr<FutureT> future_shm, const hipc::FullPtr<TaskT> &task_ptr)
+      : future_shm_(future_shm),
         parent_task_(nullptr),
         is_owner_(false) {
-    // No need to copy pool_id - FutureShm already has it
+#if HSHM_IS_GPU
+    printf("Future constructor ENTRY\n");
+#endif
+    // Manually initialize task_ptr_ to avoid FullPtr copy constructor bug on GPU
+    // Copy shm_ directly, then reconstruct ptr_ from it
+#if HSHM_IS_GPU
+    printf("Future constructor: copying shm_\n");
+#endif
+    task_ptr_.shm_ = task_ptr.shm_;
+#if HSHM_IS_GPU
+    printf("Future constructor: copying ptr_\n");
+#endif
+    task_ptr_.ptr_ = task_ptr.ptr_;
+#if HSHM_IS_GPU
+    printf("Future constructor: copies complete\n");
+#endif
   }
 
   /**
@@ -560,10 +574,13 @@ class Future {
    * @param other Future to copy from
    */
   Future(const Future& other)
-      : task_ptr_(other.task_ptr_),
-        future_shm_(other.future_shm_),
+      : future_shm_(other.future_shm_),
         parent_task_(other.parent_task_),
-        is_owner_(false) {}  // Copy does not transfer ownership
+        is_owner_(false) {  // Copy does not transfer ownership
+    // Manually copy task_ptr_ to avoid FullPtr copy constructor bug on GPU
+    task_ptr_.shm_ = other.task_ptr_.shm_;
+    task_ptr_.ptr_ = other.task_ptr_.ptr_;
+  }
 
   /**
    * Copy assignment operator - does not transfer ownership
@@ -576,7 +593,9 @@ class Future {
       if (is_owner_) {
         Destroy();
       }
-      task_ptr_ = other.task_ptr_;
+      // Manually copy task_ptr_ to avoid FullPtr copy assignment bug on GPU
+      task_ptr_.shm_ = other.task_ptr_.shm_;
+      task_ptr_.ptr_ = other.task_ptr_.ptr_;
       future_shm_ = other.future_shm_;
       parent_task_ = other.parent_task_;
       is_owner_ = false;  // Copy does not transfer ownership
@@ -589,10 +608,12 @@ class Future {
    * @param other Future to move from
    */
   Future(Future&& other) noexcept
-      : task_ptr_(std::move(other.task_ptr_)),
-        future_shm_(std::move(other.future_shm_)),
+      : future_shm_(std::move(other.future_shm_)),
         parent_task_(other.parent_task_),
         is_owner_(other.is_owner_) {  // Transfer ownership
+    // Manually move task_ptr_ to avoid FullPtr move constructor bug on GPU
+    task_ptr_.shm_ = other.task_ptr_.shm_;
+    task_ptr_.ptr_ = other.task_ptr_.ptr_;
     other.parent_task_ = nullptr;
     other.is_owner_ = false;  // Source no longer owns
   }
@@ -608,7 +629,9 @@ class Future {
       if (is_owner_) {
         Destroy();
       }
-      task_ptr_ = std::move(other.task_ptr_);
+      // Manually move task_ptr_ to avoid FullPtr move assignment bug on GPU
+      task_ptr_.shm_ = other.task_ptr_.shm_;
+      task_ptr_.ptr_ = other.task_ptr_.ptr_;
       future_shm_ = std::move(other.future_shm_);
       parent_task_ = other.parent_task_;
       is_owner_ = other.is_owner_;  // Transfer ownership
@@ -665,9 +688,10 @@ class Future {
 
   /**
    * Wait for task completion (blocking)
-   * Calls IpcManager::Recv() to handle task completion and deserialization
+   * GPU: Simple polling on FUTURE_COMPLETE flag
+   * CPU: Calls IpcManager::Recv() to handle task completion and deserialization
    */
-  void Wait();
+  HSHM_CROSS_FUN void Wait();
 
   /**
    * Mark the task as complete

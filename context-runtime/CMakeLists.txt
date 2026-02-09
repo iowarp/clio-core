@@ -73,8 +73,8 @@ if(WRP_CORE_ENABLE_BENCHMARKS)
 endif()
 
 # Add test subdirectory if testing is enabled
-# CHIMAERA_ENABLE_TESTS is set by root CMakeLists.txt
-if(CHIMAERA_ENABLE_TESTS)
+# WRP_CORE_ENABLE_TESTS is set by root CMakeLists.txt
+if(WRP_CORE_ENABLE_TESTS)
   # enable_testing() is handled by root CMakeLists.txt
   add_subdirectory(test)
   message(STATUS "Unit tests enabled - added test subdirectory")

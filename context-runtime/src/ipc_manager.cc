@@ -989,7 +989,7 @@ FullPtr<char> IpcManager::AllocateBuffer(size_t size) {
        size);
   return FullPtr<char>::GetNull();
 #else
-  // GPU PATH: Handled by inline __device__ implementation in ipc_manager.h
+  // GPU PATH: Implementation is in ipc_manager.h as inline function
   return FullPtr<char>::GetNull();
 #endif  // HSHM_IS_HOST
 }
@@ -1028,7 +1028,7 @@ void IpcManager::FreeBuffer(FullPtr<char> buffer_ptr) {
   HLOG(kWarning, "FreeBuffer: Could not find allocator for alloc_id ({}.{})",
        buffer_ptr.shm_.alloc_id_.major_, buffer_ptr.shm_.alloc_id_.minor_);
 #else
-  // GPU PATH: Handled by inline __device__ implementation in ipc_manager.h
+  // GPU PATH: Implementation is in ipc_manager.h as inline function
 #endif  // HSHM_IS_HOST
 }
 

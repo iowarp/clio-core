@@ -20,7 +20,7 @@ add_compile_definitions(_CRT_SECURE_NO_DEPRECATE)
 # All HSHM_ENABLE_* options are now set by root CMakeLists.txt from WRP_CORE_* parameters
 # CMAKE_EXPORT_COMPILE_COMMANDS is set by root CMakeLists.txt
 # BUILD_SHARED_LIBS is set by root CMakeLists.txt
-# HSHM_ENABLE_TESTS is set by root CMakeLists.txt
+# WRP_CORE_ENABLE_TESTS is set by root CMakeLists.txt
 # Benchmarks are controlled by WRP_CORE_ENABLE_BENCHMARKS
 # HSHM_ENABLE_WINDOWS_THREADS, HSHM_ENABLE_PTHREADS, HSHM_DEBUG_LOCK, and HSHM_NO_COMPILE are set by root CMakeLists.txt
 
@@ -344,7 +344,7 @@ endif()
 set(TEST_MAIN ${HSHM_ROOT}/test/unit)
 # enable_testing() is handled by root CMakeLists.txt
 
-if(HSHM_ENABLE_TESTS)
+if(WRP_CORE_ENABLE_TESTS)
     message("Building HSHM unit tests")
     add_subdirectory(test)
 endif()

@@ -15,6 +15,6 @@ add_chimod_runtime(
 )
 
 # Add unit tests subdirectory
-if(CHIMAERA_ENABLE_TESTS)
+if(WRP_CORE_ENABLE_TESTS)
   add_subdirectory(test)
 endif()
