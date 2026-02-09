@@ -199,7 +199,7 @@ class IpcManager {
   HSHM_CROSS_FUN
   void ClientGpuInit(const hipc::MemoryBackend &backend,
                      hipc::ArenaAllocator<false> *allocator,
-                     TaskQueue *worker_queue = nullptr) {
+                     GpuTaskQueue *worker_queue = nullptr) {
     gpu_backend_ = backend;
     gpu_backend_initialized_ = true;
     gpu_thread_allocator_ = allocator;
@@ -412,100 +412,55 @@ class IpcManager {
    */
 #if defined(__CUDACC__) || defined(__HIP__)
   template <typename TaskT>
-  HSHM_GPU_FUN Future<TaskT> MakeCopyFutureGpu(const hipc::FullPtr<TaskT> &task_ptr) {
-    printf("MakeCopyFutureGpu: task_ptr.ptr_=%p task_ptr.shm_.off_=%lu\n",
-           task_ptr.ptr_, task_ptr.shm_.off_.load());
-
-    // WORKAROUND for FullPtr copy constructor bug on GPU:
-    // ptr_ can be null even when shm_ is valid due to copy corruption
-    // Check shm_ instead of IsNull() which checks ptr_
+  HSHM_GPU_FUN Future<TaskT> MakeCopyFutureGpu(
+      const hipc::FullPtr<TaskT> &task_ptr) {
+    // Check shm_ instead of IsNull() - workaround for FullPtr copy bug on GPU
     if (task_ptr.shm_.IsNull()) {
-      printf("MakeCopyFutureGpu: shm_ is null, returning empty future\n");
       return Future<TaskT>();
     }
 
-    printf("MakeCopyFutureGpu: ptr_ is valid, proceeding\n");
-
-    // Allocate temporary buffer for serialization (like the passing test)
+    // Serialize task inputs into a temporary buffer
     size_t temp_buffer_size = 4096;
-    printf("MakeCopyFutureGpu: allocating temp buffer\n");
     hipc::FullPtr<char> temp_buffer = AllocateBuffer(temp_buffer_size);
     if (temp_buffer.IsNull()) {
-      printf("MakeCopyFutureGpu: temp buffer allocation failed\n");
       return Future<TaskT>();
     }
-
-    printf("MakeCopyFutureGpu: creating save archive\n");
-    // Create LocalSaveTaskArchive with buffer (exactly like the passing test)
     LocalSaveTaskArchive save_ar(LocalMsgType::kSerializeIn, temp_buffer.ptr_,
                                  temp_buffer_size);
-
-    printf("MakeCopyFutureGpu: calling SerializeIn\n");
-    // Serialize using SerializeIn() directly (like the passing test)
     task_ptr->SerializeIn(save_ar);
-
-    printf("MakeCopyFutureGpu: getting serialized size\n");
-    // Get serialized size
     size_t serialized_size = save_ar.GetSize();
 
-    // Get recommended copy space size from task, but use actual size if larger
+    // Allocate FutureShm with copy_space large enough for serialized data
     size_t recommended_size = task_ptr->GetCopySpaceSize();
     size_t copy_space_size = (recommended_size > serialized_size)
                                  ? recommended_size
                                  : serialized_size;
-
-    printf("MakeCopyFutureGpu: allocating FutureShm buffer, size=%lu\n", sizeof(FutureShm) + copy_space_size);
-    // Allocate and construct FutureShm with appropriately sized copy_space
     size_t alloc_size = sizeof(FutureShm) + copy_space_size;
     hipc::FullPtr<char> buffer = AllocateBuffer(alloc_size);
     if (buffer.IsNull()) {
-      printf("MakeCopyFutureGpu: FutureShm buffer allocation failed\n");
       return Future<TaskT>();
     }
 
-    printf("MakeCopyFutureGpu: constructing FutureShm\n");
-    // Construct FutureShm in-place using placement new
+    // Construct FutureShm in-place and populate fields
     FutureShm *future_shm_ptr = new (buffer.ptr_) FutureShm();
-
-    printf("MakeCopyFutureGpu: FutureShm constructed, initializing fields\n");
-    // Initialize FutureShm fields
     future_shm_ptr->pool_id_ = task_ptr->pool_id_;
     future_shm_ptr->method_id_ = task_ptr->method_;
     future_shm_ptr->capacity_.store(copy_space_size);
 
-    printf("MakeCopyFutureGpu: about to memcpy %lu bytes from %p to %p\n",
-           serialized_size, temp_buffer.ptr_, future_shm_ptr->copy_space);
-    // Copy serialized data to copy_space (use temp_buffer.ptr_ where data was
-    // written)
+    // Copy serialized data into copy_space
     memcpy(future_shm_ptr->copy_space, temp_buffer.ptr_, serialized_size);
-    printf("MakeCopyFutureGpu: memcpy complete, storing input_size\n");
     future_shm_ptr->input_size_.store(serialized_size,
                                       std::memory_order_release);
-    printf("MakeCopyFutureGpu: input_size stored\n");
 
-    // Memory fence: Ensure copy_space and input_size_ writes are visible before
-    // flag
-#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
-    __threadfence();  // GPU fence
-#else
-    std::atomic_thread_fence(std::memory_order_release);  // CPU fence
-#endif
-    printf("MakeCopyFutureGpu: thread fence complete\n");
+    // Memory fence before setting flag
+    hipc::threadfence();
 
-    // Set FUTURE_COPY_FROM_CLIENT flag - worker will deserialize from
-    // copy_space
-    printf("MakeCopyFutureGpu: setting flags\n");
+    // Signal that copy_space contains serialized input data
     future_shm_ptr->flags_.SetBits(FutureShm::FUTURE_COPY_FROM_CLIENT);
-    printf("MakeCopyFutureGpu: flags set\n");
 
-    // Create ShmPtr to FutureShm
-    printf("MakeCopyFutureGpu: creating ShmPtr\n");
+    // Build Future from ShmPtr and original task pointer
     hipc::ShmPtr<FutureShm> future_shm_shmptr =
         buffer.shm_.template Cast<FutureShm>();
-    printf("MakeCopyFutureGpu: ShmPtr created\n");
-
-    // Return Future preserving the original task_ptr
-    printf("MakeCopyFutureGpu: creating Future\n");
     return Future<TaskT>(future_shm_shmptr, task_ptr);
   }
 #endif  // defined(__CUDACC__) || defined(__HIP__)
@@ -1274,7 +1229,7 @@ class IpcManager {
   hipc::ArenaAllocator<false> *gpu_thread_allocator_ = nullptr;
 
   /** Pointer to GPU worker queue for task submission (GPU kernel only) */
-  TaskQueue *gpu_worker_queue_ = nullptr;
+  GpuTaskQueue *gpu_worker_queue_ = nullptr;
 
   /** Flag indicating if GPU backend is initialized */
   bool gpu_backend_initialized_ = false;
@@ -1319,16 +1274,17 @@ HSHM_DEFINE_GLOBAL_PTR_VAR_H(chi::IpcManager, g_ipc_manager);
 #define CHI_IPC HSHM_GET_GLOBAL_PTR_VAR(::chi::IpcManager, g_ipc_manager)
 #else
    // CUDA/HIP compilation
-// Declare both host singleton and device __shared__ pointer
+// Declare both host singleton and device-global IPC manager pointer
 HSHM_DEFINE_GLOBAL_PTR_VAR_H(chi::IpcManager, g_ipc_manager);
-extern __shared__ chi::IpcManager *g_ipc_manager_ptr;
+// __device__ variable set by CHIMAERA_GPU_INIT for use from device functions
+__device__ chi::IpcManager *g_ipc_manager_dev_ptr = nullptr;
 
 // Helper function that returns correct pointer based on context
 namespace chi {
 HSHM_CROSS_FUN inline IpcManager *GetIpcManager() {
 #if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
-  // Device code - use __shared__ pointer from CHIMAERA_GPU_INIT
-  return g_ipc_manager_ptr;
+  // Device code - use __device__ pointer set by CHIMAERA_GPU_INIT
+  return g_ipc_manager_dev_ptr;
 #else
   // Host code - use singleton
   return HSHM_GET_GLOBAL_PTR_VAR(::chi::IpcManager, g_ipc_manager);
@@ -1367,6 +1323,8 @@ HSHM_CROSS_FUN inline IpcManager *GetIpcManager() {
      * on GPU */                                                             \
     g_ipc_manager_ptr =                                                      \
         reinterpret_cast<chi::IpcManager *>(g_ipc_manager_storage);          \
+    /* Set device-global pointer for use from __device__ functions */        \
+    g_ipc_manager_dev_ptr = g_ipc_manager_ptr;                               \
     /* Initialize GPU-specific fields including worker queue pointer */      \
     g_ipc_manager_ptr->ClientGpuInit(backend, g_arena_alloc, worker_queue);  \
   }                                                                          \

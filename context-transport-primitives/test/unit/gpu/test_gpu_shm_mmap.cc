@@ -48,6 +48,23 @@ using hshm::ipc::MemoryBackendId;
 using hshm::ipc::mpsc_ring_buffer;
 
 /**
+ * Simple POD struct for testing struct transfer through ring buffer
+ * from GPU to CPU.
+ */
+struct TestTransferStruct {
+  hshm::u64 id_;
+  char data_[64];
+
+  HSHM_INLINE_CROSS_FUN TestTransferStruct() : id_(0) {
+    memset(data_, 0, sizeof(data_));
+  }
+
+  HSHM_INLINE_CROSS_FUN TestTransferStruct(hshm::u64 id) : id_(id) {
+    memset(data_, 9, sizeof(data_));
+  }
+};
+
+/**
  * Custom struct with serialization support for GPU testing
  */
 template <typename AllocT>
@@ -94,6 +111,23 @@ __global__ void PushElementsKernel(mpsc_ring_buffer<T, AllocT> *ring, T *values,
                                    size_t count) {
   for (size_t i = 0; i < count; ++i) {
     ring->Emplace(values[i]);
+  }
+}
+
+/**
+ * GPU kernel to push TestTransferStruct elements onto ring buffer.
+ * Each element gets id=i and data_ memset to 9.
+ *
+ * @tparam AllocT The allocator type
+ * @param ring Pointer to the ring buffer
+ * @param count Number of elements to push
+ */
+template <typename AllocT>
+__global__ void PushStructsKernel(
+    mpsc_ring_buffer<TestTransferStruct, AllocT> *ring, size_t count) {
+  for (size_t i = 0; i < count; ++i) {
+    TestTransferStruct s(static_cast<hshm::u64>(i));
+    ring->Emplace(s);
   }
 }
 
@@ -286,5 +320,79 @@ TEST_CASE("GpuShmMmap", "[gpu][backend]") {
     REQUIRE(result_value == 8192.0f);
 
     // Cleanup handled automatically by destructor
+  }
+
+  SECTION("StructRingBufferGpuToCpu") {
+    // Create a GpuShmMmap backend
+    GpuShmMmap backend;
+    MemoryBackendId backend_id(0, 2);
+    bool init_success =
+        backend.shm_init(backend_id, kBackendSize, kUrl + "_struct_rb", kGpuId);
+    REQUIRE(init_success);
+
+    // Create allocator on backend
+    using AllocT = hipc::BuddyAllocator;
+    AllocT *alloc_ptr = backend.MakeAlloc<AllocT>();
+    REQUIRE(alloc_ptr != nullptr);
+
+    // Allocate ring buffer for TestTransferStruct
+    using RingBuffer = mpsc_ring_buffer<TestTransferStruct, AllocT>;
+    RingBuffer *ring_ptr =
+        alloc_ptr->NewObj<RingBuffer>(alloc_ptr, kNumElements).ptr_;
+    REQUIRE(ring_ptr != nullptr);
+
+    // Launch kernel to push structs
+    PushStructsKernel<AllocT><<<1, 1>>>(ring_ptr, kNumElements);
+    cudaDeviceSynchronize();
+
+    // CPU pops and verifies
+    for (size_t i = 0; i < kNumElements; ++i) {
+      TestTransferStruct value;
+      bool popped = ring_ptr->Pop(value);
+      REQUIRE(popped);
+      REQUIRE(value.id_ == static_cast<hshm::u64>(i));
+      for (size_t j = 0; j < 64; ++j) {
+        REQUIRE(value.data_[j] == 9);
+      }
+    }
+  }
+
+  SECTION("StructRingBufferGpuToCpuAsync") {
+    // Same as above but CPU polls without cudaDeviceSynchronize,
+    // popping elements as soon as they become available.
+    GpuShmMmap backend;
+    MemoryBackendId backend_id(0, 3);
+    bool init_success =
+        backend.shm_init(backend_id, kBackendSize, kUrl + "_async_rb", kGpuId);
+    REQUIRE(init_success);
+
+    using AllocT = hipc::BuddyAllocator;
+    AllocT *alloc_ptr = backend.MakeAlloc<AllocT>();
+    REQUIRE(alloc_ptr != nullptr);
+
+    using RingBuffer = mpsc_ring_buffer<TestTransferStruct, AllocT>;
+    RingBuffer *ring_ptr =
+        alloc_ptr->NewObj<RingBuffer>(alloc_ptr, kNumElements).ptr_;
+    REQUIRE(ring_ptr != nullptr);
+
+    // Launch kernel (no sync -- CPU polls immediately)
+    PushStructsKernel<AllocT><<<1, 1>>>(ring_ptr, kNumElements);
+
+    // Poll the ring buffer until all elements are popped
+    size_t popped_count = 0;
+    while (popped_count < kNumElements) {
+      TestTransferStruct value;
+      if (!ring_ptr->Pop(value)) {
+        continue;  // Not ready yet, keep polling
+      }
+      REQUIRE(value.id_ == static_cast<hshm::u64>(popped_count));
+      for (size_t j = 0; j < 64; ++j) {
+        REQUIRE(value.data_[j] == 9);
+      }
+      ++popped_count;
+    }
+
+    // Sync to ensure kernel finishes cleanly before backend teardown
+    cudaDeviceSynchronize();
   }
 }

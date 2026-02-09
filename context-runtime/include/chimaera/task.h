@@ -573,7 +573,7 @@ class Future {
    * Copy constructor - does not transfer ownership
    * @param other Future to copy from
    */
-  Future(const Future& other)
+  HSHM_CROSS_FUN Future(const Future& other)
       : future_shm_(other.future_shm_),
         parent_task_(other.parent_task_),
         is_owner_(false) {  // Copy does not transfer ownership
@@ -587,12 +587,14 @@ class Future {
    * @param other Future to copy from
    * @return Reference to this future
    */
-  Future& operator=(const Future& other) {
+  HSHM_CROSS_FUN Future& operator=(const Future& other) {
     if (this != &other) {
-      // Destroy existing task if we own it
+#if HSHM_IS_HOST
+      // Destroy existing task if we own it (host only - GPU never owns)
       if (is_owner_) {
         Destroy();
       }
+#endif
       // Manually copy task_ptr_ to avoid FullPtr copy assignment bug on GPU
       task_ptr_.shm_ = other.task_ptr_.shm_;
       task_ptr_.ptr_ = other.task_ptr_.ptr_;
@@ -607,7 +609,7 @@ class Future {
    * Move constructor - transfers ownership
    * @param other Future to move from
    */
-  Future(Future&& other) noexcept
+  HSHM_CROSS_FUN Future(Future&& other) noexcept
       : future_shm_(std::move(other.future_shm_)),
         parent_task_(other.parent_task_),
         is_owner_(other.is_owner_) {  // Transfer ownership
@@ -623,12 +625,14 @@ class Future {
    * @param other Future to move from
    * @return Reference to this future
    */
-  Future& operator=(Future&& other) noexcept {
+  HSHM_CROSS_FUN Future& operator=(Future&& other) noexcept {
     if (this != &other) {
-      // Destroy existing task if we own it
+#if HSHM_IS_HOST
+      // Destroy existing task if we own it (host only - GPU never owns)
       if (is_owner_) {
         Destroy();
       }
+#endif
       // Manually move task_ptr_ to avoid FullPtr move assignment bug on GPU
       task_ptr_.shm_ = other.task_ptr_.shm_;
       task_ptr_.ptr_ = other.task_ptr_.ptr_;
@@ -908,6 +912,11 @@ using TaskLane =
  * interface.
  */
 typedef hipc::multi_mpsc_ring_buffer<Future<Task>, CHI_MAIN_ALLOC_T> TaskQueue;
+
+// GPU-specific queue types using ArenaAllocator (simpler, works from GPU kernels)
+using GpuTaskQueue =
+    hipc::multi_mpsc_ring_buffer<Future<Task>, hipc::ArenaAllocator<false>>;
+using GpuTaskLane = GpuTaskQueue::ring_buffer_type;
 
 // ============================================================================
 // RunContext (uses Future<Task> and TaskLane* - both must be complete above)
