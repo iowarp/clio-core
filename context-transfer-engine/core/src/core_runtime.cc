@@ -241,20 +241,24 @@ chi::TaskResume Runtime::Create(hipc::FullPtr<CreateTask> task,
        "CTE Core container created and initialized for pool: {} (ID: {})",
        pool_name_, task->new_pool_id_);
 
-  HLOG(kInfo, "Configuration: neighborhood={}, poll_period_ms={}, stat_targets_period_ms={}",
+  HLOG(kInfo,
+       "Configuration: neighborhood={}, poll_period_ms={}, "
+       "stat_targets_period_ms={}",
        config_.targets_.neighborhood_, config_.targets_.poll_period_ms_,
        config_.performance_.stat_targets_period_ms_);
 
   // Start periodic StatTargets task to keep target stats updated
   chi::u32 stat_period_ms = config_.performance_.stat_targets_period_ms_;
   if (stat_period_ms > 0) {
-    HLOG(kInfo, "Starting periodic StatTargets task with period {} ms", stat_period_ms);
+    HLOG(kInfo, "Starting periodic StatTargets task with period {} ms",
+         stat_period_ms);
     client_.AsyncStatTargets(chi::PoolQuery::Local(), stat_period_ms);
   }
   co_return;
 }
 
-chi::TaskResume Runtime::Destroy(hipc::FullPtr<DestroyTask> task, chi::RunContext &ctx) {
+chi::TaskResume Runtime::Destroy(hipc::FullPtr<DestroyTask> task,
+                                 chi::RunContext &ctx) {
   try {
     // Clear all registered targets and their associated data
     registered_targets_.clear();
@@ -423,8 +427,8 @@ chi::TaskResume Runtime::RegisterTarget(hipc::FullPtr<RegisterTargetTask> task,
   co_return;
 }
 
-chi::TaskResume Runtime::UnregisterTarget(hipc::FullPtr<UnregisterTargetTask> task,
-                               chi::RunContext &ctx) {
+chi::TaskResume Runtime::UnregisterTarget(
+    hipc::FullPtr<UnregisterTargetTask> task, chi::RunContext &ctx) {
   // Dynamic scheduling phase - determine routing
   if (ctx.exec_mode_ == chi::ExecMode::kDynamicSchedule) {
     task->pool_query_ = chi::PoolQuery::Local();
@@ -466,7 +470,7 @@ chi::TaskResume Runtime::UnregisterTarget(hipc::FullPtr<UnregisterTargetTask> ta
 }
 
 chi::TaskResume Runtime::ListTargets(hipc::FullPtr<ListTargetsTask> task,
-                          chi::RunContext &ctx) {
+                                     chi::RunContext &ctx) {
   // Dynamic scheduling phase - determine routing
   if (ctx.exec_mode_ == chi::ExecMode::kDynamicSchedule) {
     task->pool_query_ = chi::PoolQuery::Local();
@@ -498,7 +502,7 @@ chi::TaskResume Runtime::ListTargets(hipc::FullPtr<ListTargetsTask> task,
 }
 
 chi::TaskResume Runtime::StatTargets(hipc::FullPtr<StatTargetsTask> task,
-                          chi::RunContext &ctx) {
+                                     chi::RunContext &ctx) {
   // Dynamic scheduling phase - determine routing
   if (ctx.exec_mode_ == chi::ExecMode::kDynamicSchedule) {
     task->pool_query_ = chi::PoolQuery::Local();
@@ -615,7 +619,7 @@ chi::TaskResume Runtime::GetOrCreateTag(
 }
 
 chi::TaskResume Runtime::GetTargetInfo(hipc::FullPtr<GetTargetInfoTask> task,
-                            chi::RunContext &ctx) {
+                                       chi::RunContext &ctx) {
   // Dynamic scheduling phase - determine routing
   if (ctx.exec_mode_ == chi::ExecMode::kDynamicSchedule) {
     task->pool_query_ = chi::PoolQuery::Local();
@@ -720,13 +724,15 @@ chi::TaskResume Runtime::PutBlob(hipc::FullPtr<PutBlobTask> task,
     chi::u64 old_blob_size = 0;
     if (blob_found && blob_score >= 0.0f && blob_score <= 1.0f) {
       chi::u64 current_blob_size = blob_info_ptr->GetTotalSize();
-      bool is_entire_blob_replacement = (offset == 0 && size >= current_blob_size);
+      bool is_entire_blob_replacement =
+          (offset == 0 && size >= current_blob_size);
 
       if (is_entire_blob_replacement && current_blob_size > 0) {
         // Check if score is actually changing to a different tier
         float current_score = blob_info_ptr->score_;
         const Config &config = GetConfig();
-        float score_diff_threshold = config.performance_.score_difference_threshold_;
+        float score_diff_threshold =
+            config.performance_.score_difference_threshold_;
 
         if (std::abs(blob_score - current_score) >= score_diff_threshold) {
           HLOG(kDebug,
@@ -1237,7 +1243,7 @@ chi::TaskResume Runtime::DelTag(hipc::FullPtr<DelTagTask> task,
 }
 
 chi::TaskResume Runtime::GetTagSize(hipc::FullPtr<GetTagSizeTask> task,
-                         chi::RunContext &ctx) {
+                                    chi::RunContext &ctx) {
   // Dynamic scheduling phase - determine routing
   if (ctx.exec_mode_ == chi::ExecMode::kDynamicSchedule) {
     task->pool_query_ = chi::PoolQuery::Broadcast();
@@ -1335,19 +1341,23 @@ float Runtime::GetManualScoreForTarget(const std::string &target_name) {
     // Check if target name matches:
     // 1. Exact match with "storage_device_N"
     // 2. Exact match with device path
-    // 3. Starts with device path (to handle "_nodeX" suffix added during registration)
-    if (target_name == expected_target_name ||
-        target_name == device.path_ ||
+    // 3. Starts with device path (to handle "_nodeX" suffix added during
+    // registration)
+    if (target_name == expected_target_name || target_name == device.path_ ||
         (target_name.rfind(device.path_, 0) == 0 &&
          (target_name.size() == device.path_.size() ||
           target_name[device.path_.size()] == '_'))) {
-      HLOG(kDebug, "GetManualScoreForTarget: target '{}' matched device path '{}', score={}",
+      HLOG(kDebug,
+           "GetManualScoreForTarget: target '{}' matched device path '{}', "
+           "score={}",
            target_name, device.path_, device.score_);
       return device.score_;  // Return configured score (-1.0f if not set)
     }
   }
 
-  HLOG(kDebug, "GetManualScoreForTarget: target '{}' has no manual score configured", target_name);
+  HLOG(kDebug,
+       "GetManualScoreForTarget: target '{}' has no manual score configured",
+       target_name);
   return -1.0f;  // No manual score configured for this target
 }
 
@@ -2028,8 +2038,8 @@ size_t Runtime::GetTelemetryEntries(std::vector<CteTelemetry> &entries,
   return entries.size();
 }
 
-chi::TaskResume Runtime::PollTelemetryLog(hipc::FullPtr<PollTelemetryLogTask> task,
-                               chi::RunContext &ctx) {
+chi::TaskResume Runtime::PollTelemetryLog(
+    hipc::FullPtr<PollTelemetryLogTask> task, chi::RunContext &ctx) {
   try {
     std::uint64_t minimum_logical_time = task->minimum_logical_time_;
 
@@ -2061,7 +2071,7 @@ chi::TaskResume Runtime::PollTelemetryLog(hipc::FullPtr<PollTelemetryLogTask> ta
 }
 
 chi::TaskResume Runtime::GetBlobScore(hipc::FullPtr<GetBlobScoreTask> task,
-                           chi::RunContext &ctx) {
+                                      chi::RunContext &ctx) {
   // Dynamic scheduling phase - determine routing
   if (ctx.exec_mode_ == chi::ExecMode::kDynamicSchedule) {
     task->pool_query_ =
@@ -2112,7 +2122,7 @@ chi::TaskResume Runtime::GetBlobScore(hipc::FullPtr<GetBlobScoreTask> task,
 }
 
 chi::TaskResume Runtime::GetBlobSize(hipc::FullPtr<GetBlobSizeTask> task,
-                          chi::RunContext &ctx) {
+                                     chi::RunContext &ctx) {
   // Dynamic scheduling phase - determine routing
   if (ctx.exec_mode_ == chi::ExecMode::kDynamicSchedule) {
     task->pool_query_ =
@@ -2209,7 +2219,8 @@ chi::TaskResume Runtime::GetBlobInfo(hipc::FullPtr<GetBlobInfoTask> task,
 
     // Success
     task->return_code_ = 0;
-    HLOG(kDebug, "GetBlobInfo successful: name={}, score={}, size={}, blocks={}",
+    HLOG(kDebug,
+         "GetBlobInfo successful: name={}, score={}, size={}, blocks={}",
          blob_name, task->score_, task->total_size_, task->blocks_.size());
 
   } catch (const std::exception &e) {
@@ -2219,8 +2230,8 @@ chi::TaskResume Runtime::GetBlobInfo(hipc::FullPtr<GetBlobInfoTask> task,
   co_return;
 }
 
-chi::TaskResume Runtime::GetContainedBlobs(hipc::FullPtr<GetContainedBlobsTask> task,
-                                chi::RunContext &ctx) {
+chi::TaskResume Runtime::GetContainedBlobs(
+    hipc::FullPtr<GetContainedBlobsTask> task, chi::RunContext &ctx) {
   // Dynamic scheduling phase - determine routing
   if (ctx.exec_mode_ == chi::ExecMode::kDynamicSchedule) {
     task->pool_query_ = chi::PoolQuery::Broadcast();
@@ -2275,7 +2286,8 @@ chi::TaskResume Runtime::GetContainedBlobs(hipc::FullPtr<GetContainedBlobsTask> 
   co_return;
 }
 
-chi::TaskResume Runtime::TagQuery(hipc::FullPtr<TagQueryTask> task, chi::RunContext &ctx) {
+chi::TaskResume Runtime::TagQuery(hipc::FullPtr<TagQueryTask> task,
+                                  chi::RunContext &ctx) {
   // Dynamic scheduling phase - determine routing
   if (ctx.exec_mode_ == chi::ExecMode::kDynamicSchedule) {
     task->pool_query_ = chi::PoolQuery::Broadcast();
@@ -2325,7 +2337,7 @@ chi::TaskResume Runtime::TagQuery(hipc::FullPtr<TagQueryTask> task, chi::RunCont
 }
 
 chi::TaskResume Runtime::BlobQuery(hipc::FullPtr<BlobQueryTask> task,
-                        chi::RunContext &ctx) {
+                                   chi::RunContext &ctx) {
   // Dynamic scheduling phase - determine routing
   if (ctx.exec_mode_ == chi::ExecMode::kDynamicSchedule) {
     task->pool_query_ = chi::PoolQuery::Broadcast();
@@ -2424,10 +2436,3 @@ chi::PoolQuery Runtime::HashBlobToContainer(const TagId &tag_id,
 
 // Define ChiMod entry points using CHI_TASK_CC macro
 CHI_TASK_CC(wrp_cte::core::Runtime)
-
-// Explicit template instantiation to force generation of
-// Future::await_suspend_impl This is needed because the C++20 coroutine
-// machinery may not be instantiating the template method automatically
-template bool
-chi::Future<chimaera::bdev::AllocateBlocksTask, CHI_MAIN_ALLOC_T>::
-    await_suspend_impl(std::coroutine_handle<> handle) noexcept;
