@@ -53,12 +53,11 @@
  */
 __global__ void gpu_submit_task_kernel(hipc::MemoryBackend backend,
                                        chi::PoolId pool_id, chi::u32 test_value,
-                                       int *result,
-                                       chi::TaskQueue *worker_queue) {
+                                       int *result) {
   *result = 100;  // Kernel started
 
-  // Step 1: Initialize IPC manager
-  CHIMAERA_GPU_INIT(backend, worker_queue);
+  // Step 1: Initialize IPC manager (no queue needed for NewTask-only test)
+  CHIMAERA_GPU_INIT(backend, nullptr);
 
   *result = 200;  // After CHIMAERA_GPU_INIT
 
@@ -98,18 +97,6 @@ __global__ void gpu_submit_task_kernel(hipc::MemoryBackend backend,
  */
 extern "C" int run_gpu_kernel_task_submission_test(chi::PoolId pool_id,
                                                    chi::u32 test_value) {
-  // Get the IPC manager (runtime should already be initialized)
-  auto *ipc = CHI_IPC;
-  if (!ipc) {
-    return -101;  // IPC manager not initialized
-  }
-
-  // Get GPU queue for device 0 from the runtime
-  chi::TaskQueue *gpu_queue = ipc->GetGpuQueue(0);
-  if (!gpu_queue) {
-    return -102;  // GPU queue not available
-  }
-
   // Create GPU memory backend using GPU-registered shared memory
   hipc::MemoryBackendId backend_id(2, 0);
   size_t gpu_memory_size = 10 * 1024 * 1024;  // 10MB
@@ -128,8 +115,7 @@ extern "C" int run_gpu_kernel_task_submission_test(chi::PoolId pool_id,
   hipc::MemoryBackend h_backend = gpu_backend;
 
   // Launch kernel with 1 thread, 1 block
-  gpu_submit_task_kernel<<<1, 1>>>(h_backend, pool_id, test_value, d_result,
-                                   gpu_queue);
+  gpu_submit_task_kernel<<<1, 1>>>(h_backend, pool_id, test_value, d_result);
 
   // Check for kernel launch errors
   cudaError_t launch_err = cudaGetLastError();

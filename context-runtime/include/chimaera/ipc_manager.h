@@ -223,7 +223,8 @@ class IpcManager {
 #else
     // GPU path: allocate from shared memory buffer and construct task
     auto result = NewObj<TaskT>(std::forward<Args>(args)...);
-    printf("NewTask: result.ptr_=%p result.shm_.off_=%lu\n", result.ptr_, result.shm_.off_.load());
+    printf("NewTask: result.ptr_=%p result.shm_.off_=%lu\n", result.ptr_,
+           result.shm_.off_.load());
     printf("NewTask: &result=%p sizeof(result)=%lu\n", &result, sizeof(result));
     printf("NewTask: about to return\n");
     return result;
@@ -293,7 +294,8 @@ class IpcManager {
     // Allocate buffer for the object
     printf("NewObj: about to call AllocateBuffer(sizeof(T)=%lu)\n", sizeof(T));
     hipc::FullPtr<char> buffer = AllocateBuffer(sizeof(T));
-    printf("NewObj: buffer ptr=%p offset=%lu\n", buffer.ptr_, buffer.shm_.off_.load());
+    printf("NewObj: buffer ptr=%p offset=%lu\n", buffer.ptr_,
+           buffer.shm_.off_.load());
     if (buffer.IsNull()) {
       printf("NewObj: buffer IsNull, returning null\n");
       return hipc::FullPtr<T>();
@@ -513,7 +515,8 @@ class IpcManager {
   Future<TaskT> MakeFuture(const hipc::FullPtr<TaskT> &task_ptr) {
 #if HSHM_IS_GPU
     printf("MakeFuture GPU ENTRY\n");
-    printf("MakeFuture GPU: task_ptr.ptr_=%p off=%lu\n", task_ptr.ptr_, task_ptr.shm_.off_.load());
+    printf("MakeFuture GPU: task_ptr.ptr_=%p off=%lu\n", task_ptr.ptr_,
+           task_ptr.shm_.off_.load());
 #endif
 
     // Check task_ptr validity
@@ -521,7 +524,8 @@ class IpcManager {
 #if HSHM_IS_HOST
       HLOG(kError, "MakeFuture: called with null task_ptr");
 #else
-      printf("MakeFuture GPU: task_ptr.IsNull() returned true, returning empty\n");
+      printf(
+          "MakeFuture GPU: task_ptr.IsNull() returned true, returning empty\n");
 #endif
       return Future<TaskT>();
     }
@@ -566,7 +570,8 @@ class IpcManager {
   HSHM_CROSS_FUN Future<TaskT> Send(const hipc::FullPtr<TaskT> &task_ptr,
                                     bool awake_event = true) {
 #if HSHM_IS_GPU
-    printf("Send GPU ENTRY: task_ptr.ptr_=%p off=%lu\n", task_ptr.ptr_, task_ptr.shm_.off_.load());
+    printf("Send GPU ENTRY: task_ptr.ptr_=%p off=%lu\n", task_ptr.ptr_,
+           task_ptr.shm_.off_.load());
 
     // GPU PATH: Return directly from MakeCopyFutureGpu
     printf("Send GPU: Calling MakeCopyFutureGpu\n");
@@ -575,7 +580,8 @@ class IpcManager {
       return Future<TaskT>();
     }
 
-    // Create future but don't use it yet - will handle queue submission differently
+    // Create future but don't use it yet - will handle queue submission
+    // differently
     return MakeCopyFutureGpu(task_ptr);
 #else  // HOST PATH
     // 1. Create Future using MakeFuture (handles client/runtime paths)
@@ -1336,9 +1342,11 @@ HSHM_CROSS_FUN inline IpcManager *GetIpcManager() {
 // This avoids circular dependency issues between task.h and ipc_manager.h
 namespace chi {
 
-// Unified AllocateBuffer implementation for GPU (host version is in ipc_manager.cc)
+// Unified AllocateBuffer implementation for GPU (host version is in
+// ipc_manager.cc)
 #if !HSHM_IS_HOST
-inline HSHM_CROSS_FUN hipc::FullPtr<char> IpcManager::AllocateBuffer(size_t size) {
+inline HSHM_CROSS_FUN hipc::FullPtr<char> IpcManager::AllocateBuffer(
+    size_t size) {
   // GPU PATH: Use per-warp ArenaAllocator
   printf("AllocateBuffer called: init=%d, allocator=%p\n",
          (int)gpu_backend_initialized_, gpu_thread_allocator_);
@@ -1390,6 +1398,7 @@ void Future<TaskT, AllocT>::Wait() {
   while (!future_shm->flags_.Any(FutureT::FUTURE_COMPLETE)) {
     // Yield to other threads on GPU
     __threadfence();
+    __nanosleep(5);
   }
 #else
   // Mark this Future as owner of the task (will be destroyed on Future

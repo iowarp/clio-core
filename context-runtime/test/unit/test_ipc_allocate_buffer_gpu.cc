@@ -45,11 +45,8 @@
 #include <hermes_shm/memory/backend/gpu_malloc.h>
 #include <hermes_shm/util/gpu_api.h>
 
-#include <chrono>
 #include <cstring>
-#include <immintrin.h>
 #include <memory>
-#include <thread>
 #include <vector>
 
 #include "../simple_test.h"
@@ -478,7 +475,8 @@ __global__ void test_gpu_serialize_for_cpu_kernel(
  * MakeCopyFutureGpu, and returns the FutureShm ShmPtr for CPU deserialization.
  *
  * @param backend GPU memory backend for IPC allocation
- * @param d_future_shm_out Output: ShmPtr to FutureShm containing serialized task
+ * @param d_future_shm_out Output: ShmPtr to FutureShm containing serialized
+ * task
  * @param d_result Output: 0 on success, negative on error
  */
 __global__ void test_gpu_make_copy_future_for_cpu_kernel(
@@ -523,24 +521,23 @@ __global__ void test_gpu_make_copy_future_for_cpu_kernel(
 }
 
 /**
- * GPU kernel that creates a task, serializes into FutureShm via
- * MakeCopyFutureGpu, and enqueues the Future into the worker queue.
- * Returns immediately (no wait) so CPU can cudaDeviceSynchronize.
+ * GPU kernel that reimplements IpcManager::Send on the GPU.
+ * Creates a task, serializes it into FutureShm via MakeCopyFutureGpu,
+ * enqueues the Future into the worker queue, and then blocks in
+ * Future::Wait until the CPU sets FUTURE_COMPLETE.
  *
  * @param backend GPU memory backend for IPC allocation
- * @param worker_queue TaskQueue for enqueuing futures
- * @param d_future_shm_out Output: ShmPtr to FutureShm for the wait kernel
+ * @param worker_queue GpuTaskQueue for enqueuing futures
  * @param d_result Output: 0 on success, negative on error
  */
-__global__ void test_gpu_send_no_wait_kernel(
+__global__ void test_gpu_send_queue_wait_kernel(
     const hipc::MemoryBackend backend,
     chi::GpuTaskQueue *worker_queue,
-    hipc::ShmPtr<chi::FutureShm> *d_future_shm_out,
     int *d_result) {
   CHIMAERA_GPU_INIT(backend, worker_queue);
 
   if (thread_id == 0) {
-    *d_result = 1;
+    printf("GPU send_queue_wait: creating task\n");
 
     // 1. Create task on GPU
     chi::TaskId task_id = chi::CreateTaskId();
@@ -553,61 +550,39 @@ __global__ void test_gpu_send_no_wait_kernel(
                     ->NewTask<chimaera::MOD_NAME::GpuSubmitTask>(
                         task_id, pool_id, query, gpu_id, test_value);
     if (task.IsNull()) {
+      printf("GPU send_queue_wait: NewTask failed\n");
       *d_result = -1;
       return;
     }
 
-    *d_result = 2;
+    printf("GPU send_queue_wait: serializing into FutureShm\n");
 
     // 2. Serialize task into FutureShm via MakeCopyFutureGpu
     auto future = (&g_ipc_manager)->MakeCopyFutureGpu(task);
     if (future.IsNull()) {
+      printf("GPU send_queue_wait: MakeCopyFutureGpu failed\n");
       *d_result = -2;
       return;
     }
 
-    // Save FutureShm ptr so the wait kernel can poll it
-    *d_future_shm_out = future.GetFutureShmPtr();
-
-    *d_result = 3;
+    printf("GPU send_queue_wait: pushing to queue\n");
 
     // 3. Enqueue Future into worker queue lane 0
     auto &lane = worker_queue->GetLane(0, 0);
     chi::Future<chi::Task> task_future(future.GetFutureShmPtr());
-    bool pushed = lane.Push(task_future);
-    if (!pushed) {
+    if (!lane.Push(task_future)) {
+      printf("GPU send_queue_wait: Push failed\n");
       *d_result = -3;
       return;
     }
 
-    *d_result = 0;  // Success - kernel returns without waiting
-  }
+    printf("GPU send_queue_wait: waiting for FUTURE_COMPLETE\n");
 
-  __syncthreads();
-}
-
-/**
- * GPU kernel that polls Future::Wait for FUTURE_COMPLETE.
- * Launched after the CPU has read the FutureShm and set FUTURE_COMPLETE.
- *
- * @param backend GPU memory backend for IPC allocation
- * @param d_future_shm_ptr ShmPtr to FutureShm to wait on
- * @param d_result Output: 0 on success
- */
-__global__ void test_gpu_wait_kernel(
-    const hipc::MemoryBackend backend,
-    hipc::ShmPtr<chi::FutureShm> *d_future_shm_ptr,
-    int *d_result) {
-  CHIMAERA_GPU_INIT(backend, nullptr);
-
-  if (thread_id == 0) {
-    *d_result = 1;
-
-    // Construct Future from ShmPtr and wait for completion
-    chi::Future<chi::Task> future(*d_future_shm_ptr);
+    // 4. Block until CPU sets FUTURE_COMPLETE
     future.Wait();
 
-    *d_result = 0;  // FUTURE_COMPLETE was seen
+    printf("GPU send_queue_wait: done\n");
+    *d_result = 0;
   }
 
   __syncthreads();
@@ -842,12 +817,13 @@ TEST_CASE("GPU IPC AllocateBuffer basic functionality",
   // }
 
   SECTION("GPU MakeCopyFuture -> CPU Deserialize") {
-    INFO("Testing GPU task serialization into FutureShm, then CPU deserialization");
+    INFO(
+        "Testing GPU task serialization into FutureShm, then CPU "
+        "deserialization");
 
     // Allocate GPU output buffers
-    auto *d_future_shm_ptr =
-        hshm::GpuApi::Malloc<hipc::ShmPtr<chi::FutureShm>>(
-            sizeof(hipc::ShmPtr<chi::FutureShm>));
+    auto *d_future_shm_ptr = hshm::GpuApi::Malloc<hipc::ShmPtr<chi::FutureShm>>(
+        sizeof(hipc::ShmPtr<chi::FutureShm>));
     int *d_result = hshm::GpuApi::Malloc<int>(sizeof(int));
 
     // Initialize output buffers
@@ -892,8 +868,7 @@ TEST_CASE("GPU IPC AllocateBuffer basic functionality",
     size_t input_size = future_shm->input_size_.load();
     INFO("Serialized size: " << input_size << " bytes");
     REQUIRE(input_size > 0);
-    REQUIRE(future_shm->flags_.Any(
-            chi::FutureShm::FUTURE_COPY_FROM_CLIENT));
+    REQUIRE(future_shm->flags_.Any(chi::FutureShm::FUTURE_COPY_FROM_CLIENT));
 
     // Deserialize on CPU from FutureShm copy_space
     std::vector<char> cpu_buffer(future_shm->copy_space,
@@ -903,7 +878,8 @@ TEST_CASE("GPU IPC AllocateBuffer basic functionality",
     deserialized_task.SerializeIn(load_ar);
 
     // Verify deserialized task matches original values
-    INFO("Deserialized: gpu_id=" << deserialized_task.gpu_id_
+    INFO("Deserialized: gpu_id="
+         << deserialized_task.gpu_id_
          << ", test_value=" << deserialized_task.test_value_
          << ", result_value=" << deserialized_task.result_value_);
     REQUIRE(deserialized_task.gpu_id_ == 42);
@@ -918,14 +894,12 @@ TEST_CASE("GPU IPC AllocateBuffer basic functionality",
   SECTION("GPU Send -> Queue -> Wait") {
     INFO("Testing GPU task creation, queue enqueue, and Future::Wait");
 
-    // Create queue backend (GPU-accessible host memory for GpuTaskQueue)
-    // Uses ArenaAllocator (same as data backend) for GPU compatibility
+    // Create queue backend (GPU-accessible host memory)
     hipc::MemoryBackendId queue_backend_id(3, 0);
-    size_t queue_memory_size = 64 * 1024 * 1024;  // 64MB for queue
+    size_t queue_memory_size = 64 * 1024 * 1024;
     hipc::GpuShmMmap queue_backend;
     REQUIRE(queue_backend.shm_init(queue_backend_id, queue_memory_size,
                                    "/gpu_queue_test", 0));
-    INFO("Queue backend data_capacity: " << queue_backend.data_capacity_);
 
     // Create ArenaAllocator on queue backend
     auto *queue_allocator = reinterpret_cast<hipc::ArenaAllocator<false> *>(
@@ -933,12 +907,9 @@ TEST_CASE("GPU IPC AllocateBuffer basic functionality",
     new (queue_allocator) hipc::ArenaAllocator<false>();
     queue_allocator->shm_init(queue_backend, queue_backend.data_capacity_);
 
-    // Create GpuTaskQueue (1 lane, 1 priority, depth 256)
-    INFO("sizeof(GpuTaskQueue)=" << sizeof(chi::GpuTaskQueue));
+    // Create GpuTaskQueue (1 group, 1 lane per group, depth 256)
     auto gpu_queue = queue_allocator->template NewObj<chi::GpuTaskQueue>(
         queue_allocator, 1, 1, 256);
-    INFO("gpu_queue IsNull: " << gpu_queue.IsNull()
-         << " ptr: " << (void*)gpu_queue.ptr_);
     REQUIRE(!gpu_queue.IsNull());
 
     // Allocate GPU result buffer
@@ -946,92 +917,34 @@ TEST_CASE("GPU IPC AllocateBuffer basic functionality",
     int h_result_init = -999;
     hshm::GpuApi::Memcpy(d_result, &h_result_init, sizeof(int));
 
-    // MakeCopyFutureGpu needs extra stack for serialization
+    // Extra stack for serialization
     cudaDeviceSetLimit(cudaLimitStackSize, 8192);
 
-    // Launch kernel ASYNCHRONOUSLY (kernel will block in Future::Wait)
-    test_gpu_send_kernel<<<1, 1>>>(gpu_backend, gpu_queue.ptr_, d_result);
+    // Launch kernel async (kernel will block in Future::Wait)
+    test_gpu_send_queue_wait_kernel<<<1, 1>>>(
+        gpu_backend, gpu_queue.ptr_, d_result);
 
-    // CPU side: poll queue until future is available
-    // Also check kernel progress via d_result
+    // CPU polls queue until a Future is available (no cudaDeviceSynchronize)
     auto &lane = gpu_queue.ptr_->GetLane(0, 0);
     chi::Future<chi::Task> popped_future;
-    int poll_count = 0;
     while (!lane.Pop(popped_future)) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(10));
-      poll_count++;
-      if (poll_count % 100 == 0) {
-        // Check kernel progress
-        int h_progress = -999;
-        cudaMemcpy(&h_progress, d_result, sizeof(int), cudaMemcpyDeviceToHost);
-        INFO("Poll " << poll_count << ": kernel progress=" << h_progress);
-        // Also check for kernel errors
-        cudaError_t peek = cudaPeekAtLastError();
-        if (peek != cudaSuccess) {
-          INFO("CUDA error detected: " << cudaGetErrorString(peek));
-        }
-      }
-      if (poll_count >= 500) {  // 5 second timeout
-        int h_progress = -999;
-        cudaMemcpy(&h_progress, d_result, sizeof(int), cudaMemcpyDeviceToHost);
-        INFO("Timeout! Kernel progress=" << h_progress);
-        cudaError_t peek = cudaPeekAtLastError();
-        INFO("CUDA status: " << cudaGetErrorString(peek));
-        REQUIRE(false);  // Fail with timeout
-      }
+      // Spin until GPU pushes the future
     }
-    INFO("Popped future from queue after " << poll_count << " polls");
+    INFO("Popped future from queue");
 
-    // Verify the popped future has valid FutureShm
+    // Resolve FutureShm pointer using data backend base address
     hipc::ShmPtr<chi::FutureShm> future_shm_ptr =
         popped_future.GetFutureShmPtr();
     REQUIRE(!future_shm_ptr.IsNull());
-
-    // Resolve FutureShm pointer using IPC backend base address
     chi::FutureShm *future_shm = reinterpret_cast<chi::FutureShm *>(
         reinterpret_cast<char *>(gpu_backend.data_) +
         future_shm_ptr.off_.load());
-    REQUIRE(future_shm != nullptr);
 
-    // Small delay to allow GPU writes to propagate through PCIe
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
-    // Flush CPU cache lines covering FutureShm to force re-read from memory
-    for (size_t i = 0; i < sizeof(chi::FutureShm) + 64; i += 64) {
-      _mm_clflush(reinterpret_cast<char *>(future_shm) + i);
-    }
-    _mm_mfence();
-
-    // Verify serialized data exists in copy_space
+    // Verify FUTURE_COPY_FROM_CLIENT flag and serialized data
+    REQUIRE(future_shm->flags_.Any(chi::FutureShm::FUTURE_COPY_FROM_CLIENT));
     size_t input_size = future_shm->input_size_.load();
     INFO("Serialized size: " << input_size << " bytes");
     REQUIRE(input_size > 0);
-
-    // Debug: dump raw bytes around the flags offset
-    {
-      volatile unsigned char *base = reinterpret_cast<volatile unsigned char *>(future_shm);
-      std::stringstream ss;
-      ss << "Raw bytes [offset 40..55]: ";
-      for (int i = 40; i < 56; i++) {
-        ss << std::hex << (int)base[i] << " ";
-      }
-      INFO(ss.str());
-    }
-    uint32_t raw_flags = future_shm->flags_.Any(0xFFFFFFFF);
-    INFO("Raw flags value: " << raw_flags
-         << " (FUTURE_COPY_FROM_CLIENT=" << chi::FutureShm::FUTURE_COPY_FROM_CLIENT << ")");
-    INFO("FutureShm ptr: " << (void*)future_shm
-         << " flags_ offset: " << offsetof(chi::FutureShm, flags_)
-         << " capacity_: " << future_shm->capacity_.load());
-
-    // Also try reading via cudaMemcpy to bypass UVA
-    uint32_t flags_via_memcpy = 0xDEAD;
-    cudaMemcpy(&flags_via_memcpy,
-               reinterpret_cast<char *>(future_shm) + offsetof(chi::FutureShm, flags_),
-               sizeof(uint32_t), cudaMemcpyDefault);
-    INFO("Flags via cudaMemcpy: " << flags_via_memcpy);
-
-    REQUIRE(future_shm->flags_.Any(chi::FutureShm::FUTURE_COPY_FROM_CLIENT));
 
     // Deserialize on CPU and verify task values
     std::vector<char> cpu_buffer(future_shm->copy_space,
@@ -1050,7 +963,7 @@ TEST_CASE("GPU IPC AllocateBuffer basic functionality",
     // Set FUTURE_COMPLETE to unblock the GPU kernel's Future::Wait
     future_shm->flags_.SetBits(chi::FutureShm::FUTURE_COMPLETE);
 
-    // Sync with kernel (should now complete since FUTURE_COMPLETE is set)
+    // Wait for kernel to finish
     cudaError_t err = cudaDeviceSynchronize();
     if (err != cudaSuccess) {
       INFO("CUDA error: " << cudaGetErrorString(err));
