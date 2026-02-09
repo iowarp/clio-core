@@ -459,7 +459,8 @@ u32 Worker::ProcessNewTasks() {
     // Pop Future<Task> from assigned lane
     if (assigned_lane_->Pop(future)) {
       tasks_processed++;
-      HLOG(kInfo, "Worker {}: Popped future from lane, processing task {}", worker_id_, tasks_processed);
+      HLOG(kInfo, "Worker {}: Popped future from lane, processing task {}",
+           worker_id_, tasks_processed);
       SetCurrentRunContext(nullptr);
 
       // IMPORTANT: Register allocator BEFORE calling GetFutureShm()
@@ -494,7 +495,8 @@ u32 Worker::ProcessNewTasks() {
 
       // Ensure IPC allocator is registered for this Future (double-check)
       if (!EnsureIpcRegistered(future_shm)) {
-        // Registration failed - mark task as error and complete so client doesn't hang
+        // Registration failed - mark task as error and complete so client
+        // doesn't hang
         future_shm->flags_.SetBits(1 | FutureShm::FUTURE_COMPLETE);
         continue;
       }
@@ -522,19 +524,23 @@ u32 Worker::ProcessNewTasks() {
 
       // Check if task deserialization failed
       if (task_full_ptr.IsNull()) {
-        HLOG(kError, "Worker {}: Failed to deserialize task for pool_id={}, method={}",
+        HLOG(kError,
+             "Worker {}: Failed to deserialize task for pool_id={}, method={}",
              worker_id_, pool_id, method_id);
         // Mark as complete with error so client doesn't hang
         future_shm->flags_.SetBits(1 | FutureShm::FUTURE_COMPLETE);
         continue;
       }
 
-      HLOG(kInfo, "Worker {}: Task deserialized successfully, task_ptr={}, checking if routed",
-           worker_id_, (void*)task_full_ptr.ptr_);
+      HLOG(kInfo,
+           "Worker {}: Task deserialized successfully, task_ptr={}, checking "
+           "if routed",
+           worker_id_, (void *)task_full_ptr.ptr_);
 
       // Allocate stack and RunContext before routing
       if (!task_full_ptr->IsRouted()) {
-        HLOG(kInfo, "Worker {}: Task not routed, calling BeginTask", worker_id_);
+        HLOG(kInfo, "Worker {}: Task not routed, calling BeginTask",
+             worker_id_);
         BeginTask(future, container, assigned_lane_);
       }
 
@@ -731,9 +737,6 @@ bool Worker::RouteTask(Future<Task> &future, TaskLane *lane,
     return false;
   }
 
-  HLOG(kDebug, "Worker {}: RouteTask called for task method={}, pool_id={}, routing_mode={}",
-       worker_id_, task_ptr->method_, task_ptr->pool_id_, static_cast<int>(task_ptr->pool_query_.GetRoutingMode()));
-
   // Check if task has already been routed - if so, return true immediately
   if (task_ptr->IsRouted()) {
     auto *pool_manager = CHI_POOL_MANAGER;
@@ -833,9 +836,6 @@ bool Worker::RouteLocal(Future<Task> &future, TaskLane *lane,
   // Get task pointer from future
   FullPtr<Task> task_ptr = future.GetTaskPtr();
 
-  HLOG(kDebug, "Worker {}: RouteLocal called for task method={}, pool_id={}",
-       worker_id_, task_ptr->method_, task_ptr->pool_id_);
-
   // Use scheduler to determine target worker for this task
   u32 target_worker_id = worker_id_;  // Default to current worker
   if (scheduler_ != nullptr) {
@@ -851,9 +851,6 @@ bool Worker::RouteLocal(Future<Task> &future, TaskLane *lane,
       // Get the target worker's assigned lane and push the task
       TaskLane *target_lane = target_worker->GetLane();
       target_lane->Push(future);
-
-      HLOG(kDebug, "Worker {}: Routed task to worker {} via scheduler",
-           worker_id_, target_worker_id);
       return false;  // Task routed to another worker, don't execute here
     } else {
       // Fallback: execute locally if target worker not available
@@ -873,8 +870,6 @@ bool Worker::RouteLocal(Future<Task> &future, TaskLane *lane,
          worker_id_, task_ptr->pool_id_);
     return false;
   }
-  HLOG(kDebug, "Worker {}: RouteLocal - found container for pool_id={}",
-       worker_id_, task_ptr->pool_id_);
 
   // Set the completer_ field to track which container will execute this task
   task_ptr->SetCompleter(container->container_id_);
@@ -899,10 +894,12 @@ bool Worker::RouteGlobal(Future<Task> &future,
 
   // Log the global routing for debugging
   if (!pool_queries.empty()) {
-    const auto& query = pool_queries[0];
-    HLOG(kInfo, "Worker {}: RouteGlobal - routing task method={}, pool_id={} to node {} (routing_mode={})",
-         worker_id_, task_ptr->method_, task_ptr->pool_id_,
-         query.GetNodeId(), static_cast<int>(query.GetRoutingMode()));
+    const auto &query = pool_queries[0];
+    HLOG(kInfo,
+         "Worker {}: RouteGlobal - routing task method={}, pool_id={} to node "
+         "{} (routing_mode={})",
+         worker_id_, task_ptr->method_, task_ptr->pool_id_, query.GetNodeId(),
+         static_cast<int>(query.GetRoutingMode()));
   }
 
   // Store pool_queries in task's RunContext for SendIn to access
@@ -917,7 +914,8 @@ bool Worker::RouteGlobal(Future<Task> &future,
   // Set TASK_ROUTED flag on original task
   task_ptr->SetFlags(TASK_ROUTED);
 
-  HLOG(kInfo, "Worker {}: RouteGlobal - task enqueued to net_queue", worker_id_);
+  HLOG(kInfo, "Worker {}: RouteGlobal - task enqueued to net_queue",
+       worker_id_);
 
   // Always return true (never fail)
   return true;

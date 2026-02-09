@@ -59,10 +59,6 @@ struct CreateParams {
   // Default constructor
   CreateParams() = default;
 
-  // Constructor with allocator
-  explicit CreateParams(AllocT* alloc) {
-    (void)alloc;  // Simple mod doesn't need allocator-based initialization
-  }
 
   // Serialization support for cereal
   template <class Archive>

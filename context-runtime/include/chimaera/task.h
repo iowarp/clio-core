@@ -913,11 +913,6 @@ using TaskLane =
  */
 typedef hipc::multi_mpsc_ring_buffer<Future<Task>, CHI_MAIN_ALLOC_T> TaskQueue;
 
-// GPU-specific queue types using ArenaAllocator (simpler, works from GPU kernels)
-using GpuTaskQueue =
-    hipc::multi_mpsc_ring_buffer<Future<Task>, hipc::ArenaAllocator<false>>;
-using GpuTaskLane = GpuTaskQueue::ring_buffer_type;
-
 // ============================================================================
 // RunContext (uses Future<Task> and TaskLane* - both must be complete above)
 // ============================================================================

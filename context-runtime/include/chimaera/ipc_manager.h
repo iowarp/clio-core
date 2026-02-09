@@ -199,7 +199,7 @@ class IpcManager {
   HSHM_CROSS_FUN
   void ClientGpuInit(const hipc::MemoryBackend &backend,
                      hipc::ArenaAllocator<false> *allocator,
-                     GpuTaskQueue *worker_queue = nullptr) {
+                     TaskQueue *worker_queue = nullptr) {
     gpu_backend_ = backend;
     gpu_backend_initialized_ = true;
     gpu_thread_allocator_ = allocator;
@@ -1235,7 +1235,7 @@ class IpcManager {
   hipc::ArenaAllocator<false> *gpu_thread_allocator_ = nullptr;
 
   /** Pointer to GPU worker queue for task submission (GPU kernel only) */
-  GpuTaskQueue *gpu_worker_queue_ = nullptr;
+  TaskQueue *gpu_worker_queue_ = nullptr;
 
   /** Flag indicating if GPU backend is initialized */
   bool gpu_backend_initialized_ = false;

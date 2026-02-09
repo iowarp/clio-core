@@ -75,27 +75,17 @@ struct CreateParams {
   // Default constructor
   CreateParams() {}
 
-  // Constructor with allocator and parameters
-  CreateParams(CHI_MAIN_ALLOC_T *alloc)
-      : config_() {
-    (void)alloc; // Suppress unused parameter warning
-  }
-
-  // Copy constructor with allocator (required for task creation)
-  CreateParams(CHI_MAIN_ALLOC_T *alloc,
-               const CreateParams &other)
+  // Copy constructor (required for task creation)
+  CreateParams(const CreateParams &other)
       : config_(other.config_) {
-    (void)alloc; // Suppress unused parameter warning
   }
 
-  // Constructor with allocator, pool_id, and CreateParams (required for admin
+  // Constructor with pool_id and CreateParams (required for admin
   // task creation)
-  CreateParams(CHI_MAIN_ALLOC_T *alloc,
-               const chi::PoolId &pool_id, const CreateParams &other)
+  CreateParams(const chi::PoolId &pool_id, const CreateParams &other)
       : config_(other.config_) {
     // pool_id is used by the admin task framework, but we don't need to store it
     (void)pool_id; // Suppress unused parameter warning
-    (void)alloc; // Suppress unused parameter warning
   }
 
   // Serialization support for cereal
@@ -161,11 +151,9 @@ struct TargetInfo {
 
   TargetInfo() = default;
 
-  explicit TargetInfo(CHI_MAIN_ALLOC_T *alloc)
+  explicit TargetInfo(int /*unused*/)
       : bytes_read_(0), bytes_written_(0), ops_read_(0), ops_written_(0),
         target_score_(0.0f), remaining_space_(0) {
-    // std::string doesn't need allocator, chi::u64 and float are POD types
-    (void)alloc; // Suppress unused parameter warning
   }
 };
 
@@ -530,19 +518,10 @@ struct TagInfo {
         last_modified_(std::chrono::steady_clock::now()),
         last_read_(std::chrono::steady_clock::now()) {}
 
-  explicit TagInfo(CHI_MAIN_ALLOC_T *alloc)
-      : tag_name_(), tag_id_(TagId::GetNull()), total_size_(0),
-        last_modified_(std::chrono::steady_clock::now()),
-        last_read_(std::chrono::steady_clock::now()) {
-    (void)alloc; // Suppress unused parameter warning
-  }
-
-  TagInfo(CHI_MAIN_ALLOC_T *alloc,
-          const std::string &tag_name, const TagId &tag_id)
+  TagInfo(const std::string &tag_name, const TagId &tag_id)
       : tag_name_(tag_name), tag_id_(tag_id), total_size_(0),
         last_modified_(std::chrono::steady_clock::now()),
         last_read_(std::chrono::steady_clock::now()) {
-    (void)alloc; // Suppress unused parameter warning
   }
 
   // Copy constructor
@@ -603,21 +582,11 @@ struct BlobInfo {
         last_read_(std::chrono::steady_clock::now()),
         compress_lib_(0), compress_preset_(2), trace_key_(0) {}
 
-  explicit BlobInfo(CHI_MAIN_ALLOC_T *alloc)
-      : blob_name_(), blocks_(), score_(0.0f),
-        last_modified_(std::chrono::steady_clock::now()),
-        last_read_(std::chrono::steady_clock::now()),
-        compress_lib_(0), compress_preset_(2), trace_key_(0) {
-    (void)alloc; // Suppress unused parameter warning
-  }
-
-  BlobInfo(CHI_MAIN_ALLOC_T *alloc,
-           const std::string &blob_name, float score)
+  BlobInfo(const std::string &blob_name, float score)
       : blob_name_(blob_name), blocks_(), score_(score),
         last_modified_(std::chrono::steady_clock::now()),
         last_read_(std::chrono::steady_clock::now()),
         compress_lib_(0), compress_preset_(2), trace_key_(0) {
-    (void)alloc; // Suppress unused parameter warning
   }
 
   /**
@@ -665,16 +634,6 @@ struct Context {
         actual_compression_ratio_(1.0), actual_compress_time_ms_(0.0),
         actual_psnr_db_(0.0) {}
 
-  explicit Context(CHI_MAIN_ALLOC_T *alloc)
-      : dynamic_compress_(0), compress_lib_(0), compress_preset_(2),
-        target_psnr_(0), psnr_chance_(100), max_performance_(false),
-        consumer_node_(-1), data_type_(0), trace_(false),
-        trace_key_(0), trace_node_(-1),
-        actual_original_size_(0), actual_compressed_size_(0),
-        actual_compression_ratio_(1.0), actual_compress_time_ms_(0.0),
-        actual_psnr_db_(0.0) {
-    (void)alloc;
-  }
 
   // Serialization support for cereal
   template <class Archive> void serialize(Archive &ar) {

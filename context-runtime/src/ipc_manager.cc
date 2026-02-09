@@ -337,12 +337,6 @@ bool IpcManager::ServerInitShm() {
       return false;
     }
 
-    // Add main allocator to alloc_map_ for ToFullPtr lookup
-    u64 alloc_key = (static_cast<u64>(main_allocator_id_.major_) << 32) |
-                    static_cast<u64>(main_allocator_id_.minor_);
-    alloc_map_[alloc_key] =
-        reinterpret_cast<hipc::MultiProcessAllocator *>(main_allocator_);
-
     return true;
   } catch (const std::exception &e) {
     return false;
@@ -370,12 +364,6 @@ bool IpcManager::ClientInitShm() {
     if (!main_allocator_) {
       return false;
     }
-
-    // Add main allocator to alloc_map_ for ToFullPtr lookup
-    u64 alloc_key = (static_cast<u64>(main_allocator_id_.major_) << 32) |
-                    static_cast<u64>(main_allocator_id_.minor_);
-    alloc_map_[alloc_key] =
-        reinterpret_cast<hipc::MultiProcessAllocator *>(main_allocator_);
 
     return true;
   } catch (const std::exception &e) {

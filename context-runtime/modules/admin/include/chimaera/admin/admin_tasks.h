@@ -192,12 +192,12 @@ struct BaseCreateTask : public chi::Task {
    * Does nothing if do_compose_ is true (compose mode)
    */
   template <typename... Args>
-  void SetParams(AllocT *alloc, Args &&...args) {
+  void SetParams(Args &&...args) {
     if (do_compose_) {
       return;  // Skip SetParams in compose mode
     }
     CreateParamsT params(std::forward<Args>(args)...);
-    chi::Task::Serialize(alloc, chimod_params_, params);
+    chi::Task::Serialize(HSHM_MALLOC, chimod_params_, params);
   }
 
   /**

@@ -116,10 +116,14 @@ class _ArenaAllocator : public Allocator {
 
   /**
    * Attach an existing allocator from shared memory
+   *
+   * ArenaAllocator state (heap_, total_alloc_, heap_begin_, heap_max_) is
+   * fully in shared memory. The base class GetBackendData() reconstructs
+   * pointers from the this_ offset, so no per-process setup is needed.
    */
   HSHM_CROSS_FUN
   void shm_attach(MemoryBackend backend) {
-    HSHM_THROW_ERROR(NOT_IMPLEMENTED, "_ArenaAllocator::shm_attach");
+    (void)backend;
   }
 
   /**
