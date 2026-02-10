@@ -58,8 +58,13 @@ using namespace std::chrono_literals;
 #include <chimaera/MOD_NAME/MOD_NAME_tasks.h>
 
 // Forward declare the C++ wrapper function from GPU file
-// This function is always available when linking with GPU object library
+#if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
 extern "C" int run_gpu_kernel_task_submission_test(chi::PoolId pool_id, chi::u32 test_value);
+#else
+extern "C" inline int run_gpu_kernel_task_submission_test(chi::PoolId, chi::u32) {
+  return -200;  // No GPU support compiled
+}
+#endif
 
 // Global initialization state
 static bool g_initialized = false;

@@ -53,15 +53,17 @@ class Brotli : public Compressor {
       return false;
     }
 
-    const size_t bufferSize = BrotliEncoderMaxCompressedSize(input_size);
+    const ::size_t bufferSize = BrotliEncoderMaxCompressedSize(input_size);
     if (bufferSize > output_size) {
       HLOG(kError,
             "Output buffer is probably too small for Brotli compression.");
     }
+    ::size_t out_sz = output_size;
     int ret = BrotliEncoderCompress(
         BROTLI_PARAM_QUALITY, BROTLI_OPERATION_FINISH, BROTLI_DEFAULT_MODE,
-        input_size, reinterpret_cast<uint8_t *>(input), &output_size,
+        input_size, reinterpret_cast<uint8_t *>(input), &out_sz,
         reinterpret_cast<uint8_t *>(output));
+    output_size = out_sz;
     BrotliEncoderDestroyInstance(state);
     return ret != 0;
   }
@@ -73,9 +75,11 @@ class Brotli : public Compressor {
     if (state == nullptr) {
       return false;
     }
+    ::size_t out_sz = output_size;
     int ret = BrotliDecoderDecompress(
-        input_size, reinterpret_cast<const uint8_t *>(input), &output_size,
+        input_size, reinterpret_cast<const uint8_t *>(input), &out_sz,
         reinterpret_cast<uint8_t *>(output));
+    output_size = out_sz;
     BrotliDecoderDestroyInstance(state);
     return ret != 0;
   }

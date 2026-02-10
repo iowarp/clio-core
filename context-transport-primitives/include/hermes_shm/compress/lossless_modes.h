@@ -366,7 +366,7 @@ class BrotliWithModes : public Compressor {
 
   bool Compress(void *output, size_t &output_size, void *input,
                 size_t input_size) override {
-    size_t encoded_size = output_size;
+    ::size_t encoded_size = output_size;
     int result = BrotliEncoderCompress(
         quality_, BROTLI_DEFAULT_WINDOW, BROTLI_DEFAULT_MODE,
         input_size, (const uint8_t *)input, &encoded_size, (uint8_t *)output);
@@ -380,7 +380,7 @@ class BrotliWithModes : public Compressor {
 
   bool Decompress(void *output, size_t &output_size, void *input,
                   size_t input_size) override {
-    size_t decoded_size = output_size;
+    ::size_t decoded_size = output_size;
     BrotliDecoderResult result = BrotliDecoderDecompress(
         input_size, (const uint8_t *)input, &decoded_size, (uint8_t *)output);
 

@@ -47,9 +47,11 @@ class Snappy : public Compressor {
  public:
   bool Compress(void *output, size_t &output_size, void *input,
                 size_t input_size) override {
+    ::size_t out_sz = output_size;
     snappy::RawCompress((char *)input, input_size, (char *)output,
-                        &output_size);
-    bool ret = snappy::IsValidCompressedBuffer((char *)output, output_size);
+                        &out_sz);
+    output_size = out_sz;
+    bool ret = snappy::IsValidCompressedBuffer((char *)output, out_sz);
     return ret;
   }
 

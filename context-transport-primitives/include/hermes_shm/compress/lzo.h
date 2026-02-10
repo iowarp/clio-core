@@ -51,17 +51,21 @@ class Lzo : public Compressor {
  public:
   bool Compress(void *output, size_t &output_size, void *input,
                 size_t input_size) override {
+    lzo_uint out_sz = output_size;
     int ret = lzo1x_1_15_compress(
         reinterpret_cast<const lzo_bytep>(input), input_size,
-        reinterpret_cast<lzo_bytep>(output), &output_size, work_mem_);
+        reinterpret_cast<lzo_bytep>(output), &out_sz, work_mem_);
+    output_size = out_sz;
     return ret == 0;  // LZO returns 0 (LZO_E_OK) on success
   }
 
   bool Decompress(void *output, size_t &output_size, void *input,
                   size_t input_size) override {
+    lzo_uint out_sz = output_size;
     int ret = lzo1x_decompress(reinterpret_cast<const lzo_bytep>(input),
                                input_size, reinterpret_cast<lzo_bytep>(output),
-                               &output_size, nullptr);
+                               &out_sz, nullptr);
+    output_size = out_sz;
     return ret == 0;  // LZO returns 0 (LZO_E_OK) on success
   }
 };

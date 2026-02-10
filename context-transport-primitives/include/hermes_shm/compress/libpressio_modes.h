@@ -246,12 +246,12 @@ class LibPressioWithModes : public Compressor {
 
     struct pressio_data* input_data = nullptr;
     if (is_float_array) {
-      size_t num_floats = input_size / sizeof(float);
-      size_t dims[1] = {num_floats};
+      ::size_t num_floats = input_size / sizeof(float);
+      ::size_t dims[1] = {num_floats};
       input_data = pressio_data_new_nonowning(
           pressio_float_dtype, input, 1, dims);
     } else {
-      size_t dims[1] = {input_size};
+      ::size_t dims[1] = {(::size_t)input_size};
       input_data = pressio_data_new_nonowning(
           pressio_uint8_dtype, input, 1, dims);
     }
@@ -295,7 +295,7 @@ class LibPressioWithModes : public Compressor {
       return false;
     }
 
-    size_t dims[1] = {input_size};
+    ::size_t dims[1] = {(::size_t)input_size};
     struct pressio_data* input_data = pressio_data_new_nonowning(
         pressio_uint8_dtype, input, 1, dims);
     if (input_data == nullptr) {
@@ -306,12 +306,12 @@ class LibPressioWithModes : public Compressor {
 
     struct pressio_data* output_data = nullptr;
     if (is_float_array) {
-      size_t num_floats = output_size / sizeof(float);
-      size_t out_dims[1] = {num_floats};
+      ::size_t num_floats = output_size / sizeof(float);
+      ::size_t out_dims[1] = {num_floats};
       output_data = pressio_data_new_owning(
           pressio_float_dtype, 1, out_dims);
     } else {
-      size_t out_dims[1] = {output_size};
+      ::size_t out_dims[1] = {(::size_t)output_size};
       output_data = pressio_data_new_owning(
           pressio_uint8_dtype, 1, out_dims);
     }
