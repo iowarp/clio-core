@@ -1136,9 +1136,8 @@ chi::TaskResume Runtime::ClientSend(hipc::FullPtr<ClientSendTask> task,
         continue;
       }
 
-      // Serialize task outputs (with inline bulk for TCP/IPC transport)
+      // Serialize task outputs
       chi::LocalSaveTaskArchive archive(chi::LocalMsgType::kSerializeOut);
-      archive.SetInlineBulk(true);
       container->LocalSaveTask(origin_task->method_, archive, origin_task);
 
       size_t output_size = archive.GetSize();

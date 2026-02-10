@@ -689,9 +689,8 @@ class IpcManager {
       return Future<TaskT>();
     }
 
-    // Serialize the task inputs (with inline bulk for TCP/IPC transport)
+    // Serialize the task inputs
     LocalSaveTaskArchive archive(LocalMsgType::kSerializeIn);
-    archive.SetInlineBulk(true);
     archive << (*task_ptr.ptr_);
 
     size_t serialized_size = archive.GetSize();
