@@ -197,12 +197,12 @@ class IpcManager {
    * @param worker_queue Pointer to worker queue for task submission
    */
   HSHM_CROSS_FUN
-  void ClientGpuInit(const hipc::MemoryBackend &backend,
-                     hipc::ArenaAllocator<false> *allocator,
+  void ClientGpuInit(hipc::MemoryBackend &backend,
                      TaskQueue *worker_queue = nullptr) {
     gpu_backend_ = backend;
     gpu_backend_initialized_ = true;
-    gpu_thread_allocator_ = allocator;
+    gpu_thread_allocator_ =
+        backend.MakeAlloc<hipc::ArenaAllocator<false>>(backend.data_capacity_);
     gpu_worker_queue_ = worker_queue;
   }
 
@@ -466,6 +466,21 @@ class IpcManager {
     return Future<TaskT>(future_shm_shmptr, task_ptr);
   }
 #endif  // defined(__CUDACC__) || defined(__HIP__)
+
+#if defined(__CUDACC__) || defined(__HIPCC__)
+  /**
+   * Per-block IpcManager singleton in __shared__ memory.
+   * __noinline__ ensures a single __shared__ variable instance per block,
+   * making this a per-block singleton accessible from any device function.
+   * The object is NOT constructed — use ClientGpuInit to set up fields.
+   * @return Pointer to the per-block IpcManager
+   */
+  static HSHM_GPU_FUN __noinline__
+  IpcManager* GetBlockIpcManager() {
+    __shared__ IpcManager s_ipc;
+    return &s_ipc;
+  }
+#endif  // defined(__CUDACC__) || defined(__HIPCC__)
 
   /**
    * Create Future by wrapping task pointer (runtime-only, no serialization)
@@ -1274,30 +1289,21 @@ class IpcManager {
 }  // namespace chi
 
 // Global pointer variable declaration for IPC manager singleton
-#if !defined(__CUDACC__) && !defined(__HIPCC__)
-   // Pure C++ - use singleton pointer
 HSHM_DEFINE_GLOBAL_PTR_VAR_H(chi::IpcManager, g_ipc_manager);
-#define CHI_IPC HSHM_GET_GLOBAL_PTR_VAR(::chi::IpcManager, g_ipc_manager)
-#else
-   // CUDA/HIP compilation
-// Declare both host singleton and device-global IPC manager pointer
-HSHM_DEFINE_GLOBAL_PTR_VAR_H(chi::IpcManager, g_ipc_manager);
-// __device__ variable set by CHIMAERA_GPU_INIT for use from device functions
-__device__ chi::IpcManager *g_ipc_manager_dev_ptr = nullptr;
 
-// Helper function that returns correct pointer based on context
+#if defined(__CUDACC__) || defined(__HIPCC__)
 namespace chi {
 HSHM_CROSS_FUN inline IpcManager *GetIpcManager() {
 #if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
-  // Device code - use __device__ pointer set by CHIMAERA_GPU_INIT
-  return g_ipc_manager_dev_ptr;
+  return IpcManager::GetBlockIpcManager();
 #else
-  // Host code - use singleton
   return HSHM_GET_GLOBAL_PTR_VAR(::chi::IpcManager, g_ipc_manager);
 #endif
 }
 }  // namespace chi
 #define CHI_IPC ::chi::GetIpcManager()
+#else
+#define CHI_IPC HSHM_GET_GLOBAL_PTR_VAR(::chi::IpcManager, g_ipc_manager)
 #endif
 
 // GPU kernel initialization macro
@@ -1312,27 +1318,14 @@ HSHM_CROSS_FUN inline IpcManager *GetIpcManager() {
 //   }
 #if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
 #define CHIMAERA_GPU_INIT(backend, worker_queue)                             \
-  __shared__ char g_ipc_manager_storage[sizeof(chi::IpcManager)];            \
-  __shared__ chi::IpcManager *g_ipc_manager_ptr;                             \
-  __shared__ hipc::ArenaAllocator<false> *g_arena_alloc;                     \
+  chi::IpcManager *g_ipc_manager_ptr =                                       \
+      chi::IpcManager::GetBlockIpcManager();                                 \
   /* Compute linear thread ID for 1D/2D/3D blocks */                         \
   int thread_id = threadIdx.x + threadIdx.y * blockDim.x +                   \
                   threadIdx.z * blockDim.x * blockDim.y;                     \
   if (thread_id == 0) {                                                      \
-    /* Place ArenaAllocator at the beginning of backend's data region */     \
-    g_arena_alloc =                                                          \
-        reinterpret_cast<hipc::ArenaAllocator<false> *>(backend.data_);      \
-    new (g_arena_alloc) hipc::ArenaAllocator<false>();                       \
-    g_arena_alloc->shm_init(backend, backend.data_capacity_);                \
-    /* Point to IpcManager storage without calling constructor */            \
-    /* Do NOT use placement new - IpcManager has STL members that can't init \
-     * on GPU */                                                             \
-    g_ipc_manager_ptr =                                                      \
-        reinterpret_cast<chi::IpcManager *>(g_ipc_manager_storage);          \
-    /* Set device-global pointer for use from __device__ functions */        \
-    g_ipc_manager_dev_ptr = g_ipc_manager_ptr;                               \
-    /* Initialize GPU-specific fields including worker queue pointer */      \
-    g_ipc_manager_ptr->ClientGpuInit(backend, g_arena_alloc, worker_queue);  \
+    hipc::MemoryBackend g_backend_ = backend;                                \
+    g_ipc_manager_ptr->ClientGpuInit(g_backend_, worker_queue);              \
   }                                                                          \
   __syncthreads();                                                           \
   chi::IpcManager &g_ipc_manager = *g_ipc_manager_ptr

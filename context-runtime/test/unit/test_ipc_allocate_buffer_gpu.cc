@@ -137,22 +137,15 @@ __global__ void test_gpu_alloc_no_ipc_kernel(const hipc::MemoryBackend backend,
 }
 
 /**
- * Test just IpcManager construction
- * DISABLED: IpcManager has STL members that can't be constructed on GPU
+ * Test just IpcManager construction in __shared__ memory
  */
-/*
 __global__ void test_gpu_ipc_construct_kernel(int *results) {
-  __shared__ chi::IpcManager g_ipc_manager;
+  chi::IpcManager *ipc = chi::IpcManager::GetBlockIpcManager();
   int thread_id = threadIdx.x;
-
-  if (thread_id == 0) {
-    new (&g_ipc_manager) chi::IpcManager();
-  }
   __syncthreads();
 
-  results[thread_id] = 0;  // Success
+  results[thread_id] = (ipc != nullptr) ? 0 : 1;
 }
-*/
 
 /**
  * Simple GPU kernel for testing CHIMAERA_GPU_INIT without allocation
@@ -187,7 +180,7 @@ __global__ void test_gpu_allocate_buffer_kernel(
   size_t alloc_size = 64;
 
   // Allocate buffer using GPU path
-  hipc::FullPtr<char> buffer = (&g_ipc_manager)->AllocateBuffer(alloc_size);
+  hipc::FullPtr<char> buffer = CHI_IPC->AllocateBuffer(alloc_size);
 
   // Store results
   if (buffer.IsNull()) {
@@ -231,7 +224,7 @@ __global__ void test_gpu_to_full_ptr_kernel(
 
   // Allocate a buffer
   size_t alloc_size = 512;
-  hipc::FullPtr<char> buffer = (&g_ipc_manager)->AllocateBuffer(alloc_size);
+  hipc::FullPtr<char> buffer = CHI_IPC->AllocateBuffer(alloc_size);
 
   if (buffer.IsNull()) {
     results[thread_id] = 1;  // Allocation failed
@@ -247,8 +240,8 @@ __global__ void test_gpu_to_full_ptr_kernel(
   // Get a ShmPtr and convert back to FullPtr
   hipc::ShmPtr<char> shm_ptr = buffer.shm_;
 
-  // Convert back using ToFullPtr (use &g_ipc_manager directly in GPU kernels)
-  hipc::FullPtr<char> recovered = (&g_ipc_manager)->ToFullPtr(shm_ptr);
+  // Convert back using ToFullPtr
+  hipc::FullPtr<char> recovered = CHI_IPC->ToFullPtr(shm_ptr);
 
   if (recovered.IsNull()) {
     results[thread_id] = 3;  // ToFullPtr failed
@@ -287,7 +280,7 @@ __global__ void test_gpu_multiple_allocs_kernel(
   // Allocate multiple buffers
   for (int i = 0; i < num_allocs; ++i) {
     hipc::FullPtr<char> buffer =
-        (&g_ipc_manager)->AllocateBuffer(alloc_sizes[i]);
+        CHI_IPC->AllocateBuffer(alloc_sizes[i]);
 
     if (buffer.IsNull()) {
       results[thread_id] = 10 + i;  // Allocation i failed
@@ -335,8 +328,7 @@ __global__ void test_gpu_new_task_kernel(const hipc::MemoryBackend backend,
     chi::u32 gpu_id = 0;
     chi::u32 test_value = 123;
 
-    auto task = (&g_ipc_manager)
-                    ->NewTask<chimaera::MOD_NAME::GpuSubmitTask>(
+    auto task = CHI_IPC->NewTask<chimaera::MOD_NAME::GpuSubmitTask>(
                         task_id, pool_id, query, gpu_id, test_value);
 
     if (task.IsNull()) {
@@ -373,9 +365,8 @@ __global__ void test_gpu_serialize_deserialize_kernel(
     chi::u32 gpu_id = 7;
     chi::u32 test_value = 456;
 
-    auto original_task = (&g_ipc_manager)
-                             ->NewTask<chimaera::MOD_NAME::GpuSubmitTask>(
-                                 task_id, pool_id, query, gpu_id, test_value);
+    auto original_task = CHI_IPC->NewTask<chimaera::MOD_NAME::GpuSubmitTask>(
+        task_id, pool_id, query, gpu_id, test_value);
 
     if (original_task.IsNull()) {
       results[0] = 1;  // NewTask failed
@@ -385,7 +376,7 @@ __global__ void test_gpu_serialize_deserialize_kernel(
 
     // Allocate buffer for serialization
     size_t buffer_size = 1024;
-    auto buffer_ptr = (&g_ipc_manager)->AllocateBuffer(buffer_size);
+    auto buffer_ptr = CHI_IPC->AllocateBuffer(buffer_size);
 
     if (buffer_ptr.IsNull()) {
       results[0] = 2;  // Buffer allocation failed
@@ -401,7 +392,7 @@ __global__ void test_gpu_serialize_deserialize_kernel(
 
     // Create a new task to deserialize into
     auto loaded_task =
-        (&g_ipc_manager)->NewTask<chimaera::MOD_NAME::GpuSubmitTask>();
+        CHI_IPC->NewTask<chimaera::MOD_NAME::GpuSubmitTask>();
 
     if (loaded_task.IsNull()) {
       results[0] = 4;  // Second NewTask failed
@@ -446,8 +437,7 @@ __global__ void test_gpu_serialize_for_cpu_kernel(
     chi::u32 gpu_id = 42;
     chi::u32 test_value = 99999;
 
-    auto task = (&g_ipc_manager)
-                    ->NewTask<chimaera::MOD_NAME::GpuSubmitTask>(
+    auto task = CHI_IPC->NewTask<chimaera::MOD_NAME::GpuSubmitTask>(
                         task_id, pool_id, query, gpu_id, test_value);
 
     if (task.IsNull()) {
@@ -492,8 +482,7 @@ __global__ void test_gpu_make_copy_future_for_cpu_kernel(
     chi::u32 gpu_id = 42;
     chi::u32 test_value = 99999;
 
-    auto task = (&g_ipc_manager)
-                    ->NewTask<chimaera::MOD_NAME::GpuSubmitTask>(
+    auto task = CHI_IPC->NewTask<chimaera::MOD_NAME::GpuSubmitTask>(
                         task_id, pool_id, query, gpu_id, test_value);
     if (task.IsNull()) {
       *d_result = -1;  // NewTask failed
@@ -501,7 +490,7 @@ __global__ void test_gpu_make_copy_future_for_cpu_kernel(
     }
 
     // Serialize task into FutureShm via MakeCopyFutureGpu
-    auto future = (&g_ipc_manager)->MakeCopyFutureGpu(task);
+    auto future = CHI_IPC->MakeCopyFutureGpu(task);
     if (future.IsNull()) {
       *d_result = -2;  // MakeCopyFutureGpu failed
       return;
@@ -546,8 +535,7 @@ __global__ void test_gpu_send_queue_wait_kernel(
     chi::u32 gpu_id = 42;
     chi::u32 test_value = 77777;
 
-    auto task = (&g_ipc_manager)
-                    ->NewTask<chimaera::MOD_NAME::GpuSubmitTask>(
+    auto task = CHI_IPC->NewTask<chimaera::MOD_NAME::GpuSubmitTask>(
                         task_id, pool_id, query, gpu_id, test_value);
     if (task.IsNull()) {
       printf("GPU send_queue_wait: NewTask failed\n");
@@ -558,7 +546,7 @@ __global__ void test_gpu_send_queue_wait_kernel(
     printf("GPU send_queue_wait: serializing into FutureShm\n");
 
     // 2. Serialize task into FutureShm via MakeCopyFutureGpu
-    auto future = (&g_ipc_manager)->MakeCopyFutureGpu(task);
+    auto future = CHI_IPC->MakeCopyFutureGpu(task);
     if (future.IsNull()) {
       printf("GPU send_queue_wait: MakeCopyFutureGpu failed\n");
       *d_result = -2;
@@ -615,8 +603,8 @@ bool run_gpu_kernel_test(const std::string &kernel_name,
     test_gpu_shm_init_kernel<<<1, block_size>>>(backend, d_results);
   } else if (kernel_name == "alloc_no_ipc") {
     test_gpu_alloc_no_ipc_kernel<<<1, block_size>>>(backend, d_results);
-    /*} else if (kernel_name == "ipc_construct") {
-      test_gpu_ipc_construct_kernel<<<1, block_size>>>(d_results);*/
+  } else if (kernel_name == "ipc_construct") {
+    test_gpu_ipc_construct_kernel<<<1, block_size>>>(d_results);
   } else if (kernel_name == "init_only") {
     test_gpu_init_only_kernel<<<1, block_size>>>(backend, d_results);
   } else if (kernel_name == "allocate_buffer") {
@@ -713,11 +701,10 @@ TEST_CASE("GPU IPC AllocateBuffer basic functionality",
     REQUIRE(run_gpu_kernel_test("alloc_no_ipc", gpu_backend, block_size));
   }
 
-  // Skip this test - uses placement new which doesn't work
-  // SECTION("GPU kernel IpcManager construct") {
-  //   int block_size = 32;
-  //   REQUIRE(run_gpu_kernel_test("ipc_construct", gpu_backend, block_size));
-  // }
+  SECTION("GPU kernel IpcManager construct") {
+    int block_size = 32;
+    REQUIRE(run_gpu_kernel_test("ipc_construct", gpu_backend, block_size));
+  }
 
   SECTION("GPU kernel init only") {
     int block_size = 32;  // Warp size

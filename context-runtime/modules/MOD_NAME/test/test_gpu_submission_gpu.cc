@@ -67,7 +67,7 @@ __global__ void gpu_submit_task_kernel(hipc::MemoryBackend backend,
 
   *result = 300;  // Before NewTask
   hipc::FullPtr<chimaera::MOD_NAME::GpuSubmitTask> task;
-  task = (&g_ipc_manager)->NewTask<chimaera::MOD_NAME::GpuSubmitTask>(
+  task = CHI_IPC->NewTask<chimaera::MOD_NAME::GpuSubmitTask>(
                       task_id, pool_id, query, 0, test_value);
 
   // Immediately copy ptr to separate variable for comparison
