@@ -33,6 +33,8 @@
 
 #pragma once
 #include "lightbeam.h"
+#include "shm_transport.h"
+#include "socket_transport.h"
 #if HSHM_ENABLE_ZMQ
 #include "zmq_transport.h"
 #endif
@@ -45,6 +47,56 @@
 
 namespace hshm::lbm {
 
+// --- Base Class Template Dispatch ---
+template <typename MetaT>
+int Client::Send(MetaT& meta, const LbmContext& ctx) {
+  switch (type_) {
+#if HSHM_ENABLE_ZMQ
+    case Transport::kZeroMq:
+      return static_cast<ZeroMqClient*>(this)->Send(meta, ctx);
+#endif
+    case Transport::kSocket:
+      return static_cast<SocketClient*>(this)->Send(meta, ctx);
+    case Transport::kShm:
+      return static_cast<ShmClient*>(this)->Send(meta, ctx);
+    default:
+      return -1;
+  }
+}
+
+template <typename MetaT>
+int Server::RecvMetadata(MetaT& meta) {
+  switch (type_) {
+#if HSHM_ENABLE_ZMQ
+    case Transport::kZeroMq:
+      return static_cast<ZeroMqServer*>(this)->RecvMetadata(meta);
+#endif
+    case Transport::kSocket:
+      return static_cast<SocketServer*>(this)->RecvMetadata(meta);
+    case Transport::kShm:
+      return static_cast<ShmServer*>(this)->RecvMetadata(meta);
+    default:
+      return -1;
+  }
+}
+
+template <typename MetaT>
+int Server::RecvBulks(MetaT& meta) {
+  switch (type_) {
+#if HSHM_ENABLE_ZMQ
+    case Transport::kZeroMq:
+      return static_cast<ZeroMqServer*>(this)->RecvBulks(meta);
+#endif
+    case Transport::kSocket:
+      return static_cast<SocketServer*>(this)->RecvBulks(meta);
+    case Transport::kShm:
+      return static_cast<ShmServer*>(this)->RecvBulks(meta);
+    default:
+      return -1;
+  }
+}
+
+// --- TransportFactory Implementations ---
 inline std::unique_ptr<Client> TransportFactory::GetClient(
     const std::string& addr, Transport t, const std::string& protocol,
     int port) {
@@ -54,6 +106,11 @@ inline std::unique_ptr<Client> TransportFactory::GetClient(
       return std::make_unique<ZeroMqClient>(
           addr, protocol.empty() ? "tcp" : protocol, port == 0 ? 8192 : port);
 #endif
+    case Transport::kSocket:
+      return std::make_unique<SocketClient>(
+          addr, protocol.empty() ? "tcp" : protocol, port == 0 ? 8193 : port);
+    case Transport::kShm:
+      return std::make_unique<ShmClient>();
 #if HSHM_ENABLE_THALLIUM
     case Transport::kThallium:
       return std::make_unique<ThalliumClient>(
@@ -79,6 +136,11 @@ inline std::unique_ptr<Client> TransportFactory::GetClient(
       return std::make_unique<ZeroMqClient>(
           addr, protocol.empty() ? "tcp" : protocol, port == 0 ? 8192 : port);
 #endif
+    case Transport::kSocket:
+      return std::make_unique<SocketClient>(
+          addr, protocol.empty() ? "tcp" : protocol, port == 0 ? 8193 : port);
+    case Transport::kShm:
+      return std::make_unique<ShmClient>();
 #if HSHM_ENABLE_THALLIUM
     case Transport::kThallium:
       return std::make_unique<ThalliumClient>(
@@ -104,6 +166,11 @@ inline std::unique_ptr<Server> TransportFactory::GetServer(
       return std::make_unique<ZeroMqServer>(
           addr, protocol.empty() ? "tcp" : protocol, port == 0 ? 8192 : port);
 #endif
+    case Transport::kSocket:
+      return std::make_unique<SocketServer>(
+          addr, protocol.empty() ? "tcp" : protocol, port == 0 ? 8193 : port);
+    case Transport::kShm:
+      return std::make_unique<ShmServer>();
 #if HSHM_ENABLE_THALLIUM
     case Transport::kThallium:
       return std::make_unique<ThalliumServer>(
@@ -129,6 +196,11 @@ inline std::unique_ptr<Server> TransportFactory::GetServer(
       return std::make_unique<ZeroMqServer>(
           addr, protocol.empty() ? "tcp" : protocol, port == 0 ? 8192 : port);
 #endif
+    case Transport::kSocket:
+      return std::make_unique<SocketServer>(
+          addr, protocol.empty() ? "tcp" : protocol, port == 0 ? 8193 : port);
+    case Transport::kShm:
+      return std::make_unique<ShmServer>();
 #if HSHM_ENABLE_THALLIUM
     case Transport::kThallium:
       return std::make_unique<ThalliumServer>(

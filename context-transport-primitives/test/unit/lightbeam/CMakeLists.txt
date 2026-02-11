@@ -18,6 +18,22 @@ if(WRP_CORE_ENABLE_ZMQ)
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
 endif()
 
+add_executable(socket_transport_test socket_transport_test.cc)
+target_link_libraries(socket_transport_test hermes_shm_host hshm::lightbeam hshm::serialize)
+add_test(NAME ctp_socket_transport COMMAND socket_transport_test)
+install(TARGETS socket_transport_test
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+
+add_executable(shm_transport_test shm_transport_test.cc)
+target_link_libraries(shm_transport_test hermes_shm_host hshm::lightbeam hshm::serialize)
+add_test(NAME ctp_shm_transport COMMAND shm_transport_test)
+install(TARGETS shm_transport_test
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+
 # distributed_lightbeam_test requires MPI
 if(WRP_CORE_ENABLE_MPI AND WRP_CORE_ENABLE_ZMQ)
     add_executable(distributed_lightbeam_test distributed_lightbeam_test.cc)
