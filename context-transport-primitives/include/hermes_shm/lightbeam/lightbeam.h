@@ -51,6 +51,9 @@
 
 namespace hshm::lbm {
 
+// Forward declaration — full definition in shm_transport.h
+struct ShmTransferInfo;
+
 // --- Bulk Flags ---
 #define BULK_EXPOSE \
   BIT_OPT(hshm::u32, 0)                  // Bulk metadata sent, no data transfer
@@ -63,6 +66,11 @@ struct Bulk {
   hshm::bitfield32_t flags;  // BULK_EXPOSE or BULK_XFER
   void* desc = nullptr;      // For RDMA memory registration
   void* mr = nullptr;        // For RDMA memory region handle (fid_mr*)
+
+  template <typename Ar>
+  void serialize(Ar& ar) {
+    ar(size, flags);
+  }
 };
 
 // --- Metadata Base Class ---
@@ -74,24 +82,12 @@ class LbmMeta {
       recv;  // Receiver's bulk descriptors (copy of send with local pointers)
   size_t send_bulks = 0;  // Count of BULK_XFER entries in send vector
   size_t recv_bulks = 0;  // Count of BULK_XFER entries in recv vector
+
+  template <typename Ar>
+  void serialize(Ar& ar) {
+    ar(send, recv, send_bulks, recv_bulks);
+  }
 };
-
-}  // namespace hshm::lbm
-
-// --- Cereal serialization for Bulk and LbmMeta (transport-agnostic) ---
-namespace cereal {
-template <class Archive>
-void serialize(Archive& ar, hshm::lbm::Bulk& bulk) {
-  ar(bulk.size, bulk.flags);
-}
-
-template <class Archive>
-void serialize(Archive& ar, hshm::lbm::LbmMeta& meta) {
-  ar(meta.send, meta.recv, meta.send_bulks, meta.recv_bulks);
-}
-}  // namespace cereal
-
-namespace hshm::lbm {
 
 // --- LbmContext ---
 constexpr uint32_t LBM_SYNC =
@@ -101,9 +97,7 @@ struct LbmContext {
   uint32_t flags;      /**< Combination of LBM_* flags */
   int timeout_ms;      /**< Timeout in milliseconds (0 = no timeout) */
   char* copy_space = nullptr;                      /**< Shared buffer for chunked transfer */
-  size_t copy_space_size = 0;                      /**< Size of copy_space buffer */
-  hshm::abitfield32_t* copy_flags_ = nullptr;      /**< Atomic flags for synchronization */
-  hipc::atomic<size_t>* transfer_size_ = nullptr;   /**< Current chunk size */
+  ShmTransferInfo* shm_info_ = nullptr;            /**< Transfer info in shared memory */
 
   LbmContext() : flags(0), timeout_ms(0) {}
 
@@ -127,7 +121,6 @@ struct ClientInfo {
 class Client {
  public:
   Transport type_;
-  LbmContext ctx_;
 
   virtual ~Client() = default;
 
@@ -155,7 +148,6 @@ class Client {
 class Server {
  public:
   Transport type_;
-  LbmContext ctx_;
 
   virtual ~Server() = default;
 
@@ -177,10 +169,10 @@ class Server {
   virtual void PollWait(int timeout_ms = 10) { (void)timeout_ms; }
 
   template <typename MetaT>
-  int RecvMetadata(MetaT& meta);
+  int RecvMetadata(MetaT& meta, const LbmContext& ctx = LbmContext());
 
   template <typename MetaT>
-  int RecvBulks(MetaT& meta);
+  int RecvBulks(MetaT& meta, const LbmContext& ctx = LbmContext());
 
   virtual std::string GetAddress() const = 0;
 

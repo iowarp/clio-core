@@ -47,15 +47,13 @@ class TestMeta : public LbmMeta {
  public:
   int request_id;
   std::string operation;
-};
 
-// Cereal serialization for TestMeta
-namespace cereal {
-template <class Archive>
-void serialize(Archive& ar, TestMeta& meta) {
-  ar(meta.send, meta.recv, meta.request_id, meta.operation);
-}
-}  // namespace cereal
+  template <typename Ar>
+  void serialize(Ar& ar) {
+    LbmMeta::serialize(ar);
+    ar(request_id, operation);
+  }
+};
 
 void TestBasicTransfer() {
   std::cout << "\n==== Testing Basic Transfer with New API ====\n";

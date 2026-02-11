@@ -347,90 +347,33 @@ class IpcManager {
    */
   template <typename TaskT>
   HSHM_CROSS_FUN Future<TaskT> MakeCopyFuture(hipc::FullPtr<TaskT> task_ptr) {
-    // Check task_ptr validity
     if (task_ptr.IsNull()) {
       return Future<TaskT>();
     }
 
-    // Serialize the task (different constructors on CPU vs GPU)
-#if HSHM_IS_HOST
-    LocalSaveTaskArchive archive(LocalMsgType::kSerializeIn);
-    archive << (*task_ptr.ptr_);
-
-    // Get serialized data
-    size_t serialized_size = archive.GetSize();
-    const std::vector<char> &serialized = archive.GetData();
-    const char *serialized_ptr = serialized.data();
-#else
-    // GPU: Need to allocate temporary buffer for serialization
-    size_t temp_buffer_size = 4096;  // Should be enough for most tasks
-    hipc::FullPtr<char> temp_buffer = AllocateBuffer(temp_buffer_size);
-    if (temp_buffer.IsNull()) {
-      return Future<TaskT>();
-    }
-
-    LocalSaveTaskArchive archive(LocalMsgType::kSerializeIn, temp_buffer.ptr_,
-                                 temp_buffer_size);
-    archive << (*task_ptr.ptr_);
-
-    // Get serialized data - use temp_buffer directly since that's where data
-    // was written
-    size_t serialized_size = archive.GetSize();
-    const char *serialized_ptr = temp_buffer.ptr_;
-#endif
-
-    // Get recommended copy space size from task, but use actual size if larger
-    size_t recommended_size = task_ptr->GetCopySpaceSize();
-    size_t copy_space_size = (recommended_size > serialized_size)
-                                 ? recommended_size
-                                 : serialized_size;
-
-    // Allocate and construct FutureShm with appropriately sized copy_space
+    // Allocate FutureShm with copy_space (lightbeam handles the data transfer)
+    size_t copy_space_size = task_ptr->GetCopySpaceSize();
+    if (copy_space_size == 0) copy_space_size = KILOBYTES(4);
     size_t alloc_size = sizeof(FutureShm) + copy_space_size;
     hipc::FullPtr<char> buffer = AllocateBuffer(alloc_size);
     if (buffer.IsNull()) {
       return Future<TaskT>();
     }
 
-    // Construct FutureShm in-place using placement new
+    // Construct FutureShm in-place
     FutureShm *future_shm_ptr = new (buffer.ptr_) FutureShm();
-
-    // Initialize FutureShm fields
     future_shm_ptr->pool_id_ = task_ptr->pool_id_;
     future_shm_ptr->method_id_ = task_ptr->method_;
     future_shm_ptr->origin_ = FutureShm::FUTURE_CLIENT_SHM;
     future_shm_ptr->client_task_vaddr_ =
         reinterpret_cast<uintptr_t>(task_ptr.ptr_);
-    future_shm_ptr->capacity_.store(copy_space_size);
-
-    // Copy serialized data to copy_space
-    memcpy(future_shm_ptr->copy_space, serialized_ptr, serialized_size);
-    future_shm_ptr->input_size_.store(serialized_size,
-                                      std::memory_order_release);
-
-    // Memory fence: Ensure copy_space and input_size_ writes are visible before
-    // flag
-    std::atomic_thread_fence(std::memory_order_release);
-
-    // Set FUTURE_COPY_FROM_CLIENT flag - worker will deserialize from
-    // copy_space
+    future_shm_ptr->input_.copy_space_size_ = copy_space_size;
     future_shm_ptr->flags_.SetBits(FutureShm::FUTURE_COPY_FROM_CLIENT);
 
-    // Create ShmPtr to FutureShm
+    // Create and return Future
     hipc::ShmPtr<FutureShm> future_shm_shmptr =
         buffer.shm_.template Cast<FutureShm>();
-
-    // Return Future preserving the original task_ptr
-    Future<TaskT> future(future_shm_shmptr, task_ptr);
-
-#if HSHM_IS_GPU
-    // GPU: Note that we don't free temp_buffer here because FreeBuffer is not
-    // available in device code. The buffer will be freed when the GPU backend
-    // is destroyed. For production use, we may need to implement a
-    // GPU-compatible FreeBuffer or use a different memory management strategy.
-#endif
-
-    return future;
+    return Future<TaskT>(future_shm_shmptr, task_ptr);
   }
 
   /**
@@ -480,17 +423,17 @@ class IpcManager {
     future_shm_ptr->method_id_ = task_ptr->method_;
     future_shm_ptr->origin_ = FutureShm::FUTURE_CLIENT_SHM;
     future_shm_ptr->client_task_vaddr_ = 0;
-    future_shm_ptr->capacity_.store(copy_space_size);
+    future_shm_ptr->input_.copy_space_size_ = copy_space_size;
 
     // Copy serialized data into copy_space
     memcpy(future_shm_ptr->copy_space, temp_buffer.ptr_, serialized_size);
-    future_shm_ptr->input_size_.store(serialized_size,
-                                      std::memory_order_release);
+    future_shm_ptr->input_.total_written_.store(serialized_size,
+                                                std::memory_order_release);
 
     // Memory fence before setting flag
     hipc::threadfence();
 
-    // Signal that copy_space contains serialized input data
+    // Set FUTURE_COPY_FROM_CLIENT
     future_shm_ptr->flags_.SetBits(FutureShm::FUTURE_COPY_FROM_CLIENT);
 
     // Build Future from ShmPtr and original task pointer
@@ -540,7 +483,7 @@ class IpcManager {
     future_shm.ptr_->method_id_ = task_ptr->method_;
     future_shm.ptr_->origin_ = FutureShm::FUTURE_CLIENT_SHM;
     future_shm.ptr_->client_task_vaddr_ = 0;
-    future_shm.ptr_->capacity_.store(0);  // No copy_space in runtime path
+    // No copy_space in runtime path — ShmTransferInfo defaults are fine
 
     // Create Future with ShmPtr and task_ptr (no serialization)
     Future<TaskT> future(future_shm.shm_, task_ptr);
@@ -562,23 +505,6 @@ class IpcManager {
    */
   template <typename TaskT>
   Future<TaskT> MakeFuture(const hipc::FullPtr<TaskT> &task_ptr) {
-#if HSHM_IS_GPU
-    printf("MakeFuture GPU ENTRY\n");
-    printf("MakeFuture GPU: task_ptr.ptr_=%p off=%lu\n", task_ptr.ptr_,
-           task_ptr.shm_.off_.load());
-#endif
-
-    // Check task_ptr validity
-    if (task_ptr.IsNull()) {
-#if HSHM_IS_HOST
-      HLOG(kError, "MakeFuture: called with null task_ptr");
-#else
-      printf(
-          "MakeFuture GPU: task_ptr.IsNull() returned true, returning empty\n");
-#endif
-      return Future<TaskT>();
-    }
-
 #if HSHM_IS_GPU
     // GPU PATH: Always use MakeCopyFutureGpu to serialize the task
     printf("MakeFuture GPU: calling MakeCopyFutureGpu\n");
@@ -643,11 +569,15 @@ class IpcManager {
       return SendZmq(task_ptr, ipc_mode_);
     }
 
-    // SHM path (client or runtime): original logic
-    // 1. Create Future using MakeFuture (handles client/runtime paths)
-    Future<TaskT> future = MakeFuture(task_ptr);
+    // Client SHM path: use SendShm (lightbeam transport)
+    if (!is_runtime) {
+      return SendShm(task_ptr);
+    }
 
-    // 3. Set parent task RunContext from current worker (runtime only)
+    // Runtime SHM path: pointer future (no serialization, same address space)
+    Future<TaskT> future = MakePointerFuture(task_ptr);
+
+    // Set parent task RunContext from current worker (runtime only)
     if (use_runtime_path) {
       RunContext *run_ctx = worker->GetCurrentRunContext();
       if (run_ctx != nullptr) {
@@ -675,6 +605,55 @@ class IpcManager {
     // 7. Return the same Future (no separate user_future/queue_future)
     return future;
 #endif
+  }
+
+  /**
+   * Send a task via SHM lightbeam transport
+   * Allocates FutureShm with copy_space, enqueues to worker lane,
+   * then streams task data through shared memory using lightbeam protocol
+   * @param task_ptr Task to send
+   * @return Future for polling completion
+   */
+  template <typename TaskT>
+  Future<TaskT> SendShm(const hipc::FullPtr<TaskT> &task_ptr) {
+    if (task_ptr.IsNull()) return Future<TaskT>();
+
+    // Allocate FutureShm with copy_space
+    size_t copy_space_size = task_ptr->GetCopySpaceSize();
+    if (copy_space_size == 0) copy_space_size = KILOBYTES(4);
+    size_t alloc_size = sizeof(FutureShm) + copy_space_size;
+    auto buffer = AllocateBuffer(alloc_size);
+    if (buffer.IsNull()) return Future<TaskT>();
+
+    FutureShm *future_shm = new (buffer.ptr_) FutureShm();
+    future_shm->pool_id_ = task_ptr->pool_id_;
+    future_shm->method_id_ = task_ptr->method_;
+    future_shm->origin_ = FutureShm::FUTURE_CLIENT_SHM;
+    future_shm->client_task_vaddr_ = reinterpret_cast<uintptr_t>(task_ptr.ptr_);
+    future_shm->input_.copy_space_size_ = copy_space_size;
+    future_shm->flags_.SetBits(FutureShm::FUTURE_COPY_FROM_CLIENT);
+
+    // Create Future
+    auto future_shm_shmptr = buffer.shm_.template Cast<FutureShm>();
+    Future<TaskT> future(future_shm_shmptr, task_ptr);
+
+    // Build SHM context for transfer
+    hshm::lbm::LbmContext ctx;
+    ctx.copy_space = future_shm->copy_space;
+    ctx.shm_info_ = &future_shm->input_;
+
+    // Enqueue BEFORE sending (worker must start RecvMetadata concurrently)
+    LaneId lane_id =
+        scheduler_->ClientMapTask(this, future.template Cast<Task>());
+    auto &lane = worker_queues_->GetLane(lane_id, 0);
+    lane.Push(future.template Cast<Task>());
+    AwakenWorker(&lane);
+
+    SaveTaskArchive archive(MsgType::kSerializeIn, shm_client_.get());
+    archive << (*task_ptr.ptr_);
+    shm_client_->Send(archive, ctx);
+
+    return future;
   }
 
   /**
@@ -716,7 +695,7 @@ class IpcManager {
                               ? FutureShm::FUTURE_CLIENT_TCP
                               : FutureShm::FUTURE_CLIENT_IPC;
     future_shm->client_task_vaddr_ = net_key;
-    future_shm->capacity_.store(0);
+    // No copy_space for ZMQ path — ShmTransferInfo defaults are fine
 
     // Register in pending futures map keyed by net_key
     {
@@ -752,12 +731,8 @@ class IpcManager {
   template <typename TaskT>
   void Recv(Future<TaskT> &future) {
     bool is_runtime = CHI_CHIMAERA_MANAGER->IsRuntime();
-    Worker *worker = CHI_CUR_WORKER;
 
-    // Runtime path requires BOTH IsRuntime AND worker to be non-null
-    bool use_runtime_path = is_runtime && worker != nullptr;
-
-    if (!use_runtime_path) {
+    if (!is_runtime) {
       auto future_shm = future.GetFutureShm();
       TaskT *task_ptr = future.get();
       u32 origin = future_shm->origin_;
@@ -789,36 +764,37 @@ class IpcManager {
           }
         }
       } else {
-        // SHM PATH: Original logic using LocalTransfer
+        // SHM PATH: Use lightbeam transport
 
-        // Wait for first data to be available (signaled by FUTURE_NEW_DATA or
-        // FUTURE_COMPLETE)
+        // Build SHM context for transfer
+        hshm::lbm::LbmContext ctx;
+        ctx.copy_space = future_shm->copy_space;
+        ctx.shm_info_ = &future_shm->output_;
+
+        // Receive via SHM transport (blocking - spins until worker sends)
+        LoadTaskArchive archive;
+        shm_server_->RecvMetadata(archive, ctx);
+
+        // Set up recv entries from send descriptors
+        for (const auto &send_bulk : archive.send) {
+          hshm::lbm::Bulk bulk;
+          bulk.size = send_bulk.size;
+          bulk.flags = send_bulk.flags;
+          bulk.data.ptr_ = nullptr;
+          archive.recv.push_back(bulk);
+        }
+
+        shm_server_->RecvBulks(archive, ctx);
+
+        // Wait for FUTURE_COMPLETE (worker sets after Send returns)
         hshm::abitfield32_t &flags = future_shm->flags_;
-        while (!flags.Any(FutureShm::FUTURE_NEW_DATA) &&
-               !flags.Any(FutureShm::FUTURE_COMPLETE)) {
-          HSHM_THREAD_MODEL->Yield();
-        }
-
-        // Memory fence
-        std::atomic_thread_fence(std::memory_order_acquire);
-
-        size_t output_size = future_shm->output_size_.load();
-
-        // Use LocalTransfer to receive all data
-        LocalTransfer receiver(future_shm, output_size);
-
-        bool recv_complete = receiver.Recv();
-        if (!recv_complete) {
-          HLOG(kError, "Recv: LocalTransfer failed - received {}/{} bytes",
-               receiver.GetBytesTransferred(), output_size);
-        }
-
         while (!flags.Any(FutureShm::FUTURE_COMPLETE)) {
           HSHM_THREAD_MODEL->Yield();
         }
 
-        LocalLoadTaskArchive archive(receiver.GetData());
-        archive.SetMsgType(LocalMsgType::kSerializeOut);
+        // Deserialize outputs
+        archive.ResetBulkIndex();
+        archive.msg_type_ = MsgType::kSerializeOut;
         archive >> (*task_ptr);
       }
     }
@@ -1345,6 +1321,10 @@ class IpcManager {
   // IPC transport mode (TCP default, configurable via CHI_IPC_MODE)
   IpcMode ipc_mode_ = IpcMode::kTcp;
 
+  // SHM lightbeam transport (client-side, for SendShm / RecvShm)
+  std::unique_ptr<hshm::lbm::Client> shm_client_;
+  std::unique_ptr<hshm::lbm::Server> shm_server_;
+
   // Client-side: lightbeam PUSH client for sending tasks to server
   std::unique_ptr<hshm::lbm::Client> zmq_client_;
   std::mutex zmq_client_send_mutex_;
@@ -1589,19 +1569,16 @@ void Future<TaskT, AllocT>::Wait() {
 
     // Determine path: client vs runtime
     bool is_runtime = CHI_CHIMAERA_MANAGER->IsRuntime();
-    Worker *worker = CHI_CUR_WORKER;
-    bool use_runtime_path = is_runtime && worker != nullptr;
 
-    if (use_runtime_path) {
-      // RUNTIME PATH: Wait for FUTURE_COMPLETE first (task outputs are direct)
-      // No deserialization needed, just wait for completion signal
+    if (is_runtime) {
+      // RUNTIME PATH: Wait for FUTURE_COMPLETE (task outputs are direct,
+      // no deserialization needed). Covers both worker threads and main thread.
       hshm::abitfield32_t &flags = future_full->flags_;
       while (!flags.Any(FutureShm::FUTURE_COMPLETE)) {
         HSHM_THREAD_MODEL->Yield();
       }
     } else {
-      // CLIENT PATH: Call Recv() first to handle streaming
-      // Recv() uses LocalTransfer which will consume chunks as they arrive
+      // CLIENT PATH: Call Recv() to handle SHM lightbeam or ZMQ streaming
       // FUTURE_COMPLETE will be set by worker after all data is sent
       // Don't wait for FUTURE_COMPLETE first - that causes deadlock for
       // streaming
@@ -1624,9 +1601,8 @@ void Future<TaskT, AllocT>::Destroy() {
   // Clean up zero-copy response archive (frees zmq_msg_t handles)
   if (!future_shm_.IsNull()) {
     hipc::FullPtr<FutureShm> fs = CHI_IPC->ToFullPtr(future_shm_);
-    if (!fs.IsNull() &&
-        (fs->origin_ == FutureShm::FUTURE_CLIENT_TCP ||
-         fs->origin_ == FutureShm::FUTURE_CLIENT_IPC)) {
+    if (!fs.IsNull() && (fs->origin_ == FutureShm::FUTURE_CLIENT_TCP ||
+                         fs->origin_ == FutureShm::FUTURE_CLIENT_IPC)) {
       CHI_IPC->CleanupResponseArchive(fs->client_task_vaddr_);
     }
   }

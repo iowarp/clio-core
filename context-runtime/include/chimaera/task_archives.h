@@ -309,6 +309,20 @@ public:
   void SetLbmClient(hshm::lbm::Client *lbm_client) { lbm_client_ = lbm_client; }
 
   /**
+   * Serialize for LocalSerialize (SHM transport).
+   * Shadows LbmMeta::serialize so that the cereal stream data
+   * and task_infos_ are included when sending through the ring buffer.
+   */
+  template <typename Ar>
+  void serialize(Ar &ar) {
+    ar(send, recv, send_bulks, recv_bulks);
+    ar(task_infos_, msg_type_);
+    archive_.reset();
+    std::string stream_data = stream_.str();
+    ar(stream_data);
+  }
+
+  /**
    * Cereal save function - serializes archive contents
    * @param ar The cereal archive
    */
@@ -525,6 +539,22 @@ public:
    * @return Reference to the cereal archive
    */
   cereal::BinaryInputArchive &GetArchive() { return *archive_; }
+
+  /**
+   * Deserialize for LocalDeserialize (SHM transport).
+   * Shadows LbmMeta::serialize so that the cereal stream data
+   * and task_infos_ are recovered from the ring buffer.
+   */
+  template <typename Ar>
+  void serialize(Ar &ar) {
+    ar(send, recv, send_bulks, recv_bulks);
+    ar(task_infos_, msg_type_);
+    std::string stream_data;
+    ar(stream_data);
+    data_ = std::move(stream_data);
+    stream_ = std::make_unique<std::istringstream>(data_);
+    archive_ = std::make_unique<cereal::BinaryInputArchive>(*stream_);
+  }
 
   /**
    * Cereal save function - not applicable for input archive

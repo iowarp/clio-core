@@ -47,6 +47,7 @@
 #include "hermes_shm/data_structures/ipc/shm_container.h"
 #include "hermes_shm/data_structures/ipc/vector.h"
 #include "hermes_shm/memory/allocator/allocator.h"
+#include "hermes_shm/lightbeam/shm_transport.h"
 #include "hermes_shm/util/logging.h"
 
 // Include cereal for serialization
@@ -447,17 +448,11 @@ struct FutureShm {
   /** Virtual address of client's task (for ZMQ response routing) */
   uintptr_t client_task_vaddr_;
 
-  /** Size of input data in copy_space (client → worker direction) */
-  hipc::atomic<size_t> input_size_;
+  /** SHM transfer info for input direction (client → worker) */
+  hshm::lbm::ShmTransferInfo input_;
 
-  /** Total size of output data (worker → client direction) */
-  hipc::atomic<size_t> output_size_;
-
-  /** Current chunk size in copy_space for streaming output */
-  hipc::atomic<size_t> current_chunk_size_;
-
-  /** Total capacity of copy_space buffer */
-  hipc::atomic<size_t> capacity_;
+  /** SHM transfer info for output direction (worker → client) */
+  hshm::lbm::ShmTransferInfo output_;
 
   /** Atomic bitfield for completion and data availability flags */
   hshm::abitfield32_t flags_;
@@ -474,10 +469,6 @@ struct FutureShm {
     method_id_ = 0;
     origin_ = FUTURE_CLIENT_SHM;
     client_task_vaddr_ = 0;
-    input_size_.store(0);
-    output_size_.store(0);
-    current_chunk_size_.store(0);
-    capacity_.store(0);
     flags_.SetBits(0);
   }
 };

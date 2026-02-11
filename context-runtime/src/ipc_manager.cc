@@ -125,6 +125,12 @@ bool IpcManager::ClientInit() {
            "IpcManager::ClientInit: Failed to create per-process shared memory");
       return false;
     }
+
+    // Create SHM lightbeam client/server for client-side transport
+    shm_client_ = hshm::lbm::TransportFactory::GetClient(
+        "", hshm::lbm::Transport::kShm);
+    shm_server_ = hshm::lbm::TransportFactory::GetServer(
+        "", hshm::lbm::Transport::kShm);
   }
 
   // TCP/IPC modes: Create lightbeam client/server and spawn recv thread

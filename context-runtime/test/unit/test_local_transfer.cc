@@ -63,7 +63,8 @@ static FutureShm* CreateFutureShm(size_t copy_space_size) {
 
   // Construct FutureShm in-place
   FutureShm* future_shm = new (buffer) FutureShm();
-  future_shm->capacity_.store(copy_space_size, std::memory_order_release);
+  future_shm->input_.copy_space_size_ = copy_space_size;
+  future_shm->output_.copy_space_size_ = copy_space_size;
 
   return future_shm;
 }
@@ -128,7 +129,7 @@ TEST_CASE("LocalTransfer - Sender Construction", "[local_transfer][construct]") 
   REQUIRE(transfer.GetBytesTransferred() == 0);
 
   // Verify output_size was set in FutureShm
-  REQUIRE(future_shm->output_size_.load() == 1000);
+  REQUIRE(future_shm->output_.total_written_.load() == 1000);
 
   DestroyFutureShm(future_shm);
   INFO("Sender construction test passed");

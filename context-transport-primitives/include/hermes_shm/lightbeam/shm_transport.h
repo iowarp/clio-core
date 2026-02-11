@@ -35,13 +35,27 @@
 
 #include <atomic>
 #include <cstring>
-#include <thread>
 
+#include "hermes_shm/data_structures/serialization/local_serialize.h"
 #include "lightbeam.h"
 
 namespace hshm::lbm {
 
-static constexpr u32 SHM_DATA_READY = BIT_OPT(u32, 1);
+// --- ShmTransferInfo ---
+// SPSC ring buffer metadata for shared memory transport.
+// The copy space is treated as a ring buffer indexed by total_written_ and
+// total_read_ modulo copy_space_size_.
+struct ShmTransferInfo {
+  hipc::atomic<size_t> total_written_;  // Total bytes written by producer
+  hipc::atomic<size_t> total_read_;     // Total bytes read by consumer
+  size_t copy_space_size_;              // Ring buffer capacity
+
+  HSHM_CROSS_FUN ShmTransferInfo() {
+    total_written_.store(0);
+    total_read_.store(0);
+    copy_space_size_ = 0;
+  }
+};
 
 class ShmClient : public Client {
  public:
@@ -60,54 +74,52 @@ class ShmClient : public Client {
 
   template <typename MetaT>
   int Send(MetaT& meta, const LbmContext& ctx = LbmContext()) {
-    (void)ctx;
-    // 1. Serialize metadata via cereal
-    std::ostringstream oss(std::ios::binary);
-    {
-      cereal::BinaryOutputArchive ar(oss);
-      ar(meta);
-    }
-    std::string meta_str = oss.str();
+    // 1. Serialize metadata using LocalSerialize
+    std::vector<char> meta_buf;
+    meta_buf.reserve(ctx.shm_info_->copy_space_size_);
+    hshm::ipc::LocalSerialize<> ar(meta_buf);
+    ar(meta);
 
-    // 2. Send 4-byte size prefix then metadata
-    uint32_t meta_len = static_cast<uint32_t>(meta_str.size());
-    Transfer(reinterpret_cast<const char*>(&meta_len), sizeof(meta_len));
-    Transfer(meta_str.data(), meta_str.size());
+    // 2. Transfer serialized size then metadata
+    uint32_t meta_len = static_cast<uint32_t>(meta_buf.size());
+    Transfer(reinterpret_cast<const char*>(&meta_len), sizeof(meta_len), ctx);
+    Transfer(meta_buf.data(), meta_buf.size(), ctx);
 
     // 3. Send each bulk with BULK_XFER flag
     for (size_t i = 0; i < meta.send.size(); ++i) {
       if (!meta.send[i].flags.Any(BULK_XFER)) continue;
-      if (!meta.send[i].data.shm_.alloc_id_.IsNull()) {
-        // Data lives in shared memory — send ShmPtr only
-        uint8_t mode = 1;
-        Transfer(reinterpret_cast<const char*>(&mode), sizeof(mode));
-        Transfer(reinterpret_cast<const char*>(&meta.send[i].data.shm_),
-                 sizeof(meta.send[i].data.shm_));
-      } else {
-        // Private memory — full data copy
-        uint8_t mode = 0;
-        Transfer(reinterpret_cast<const char*>(&mode), sizeof(mode));
-        Transfer(meta.send[i].data.ptr_, meta.send[i].size);
+      // Always send ShmPtr first — receiver inspects alloc_id_ to decide
+      Transfer(reinterpret_cast<const char*>(&meta.send[i].data.shm_),
+               sizeof(meta.send[i].data.shm_), ctx);
+      if (meta.send[i].data.shm_.alloc_id_.IsNull()) {
+        // Private memory — also send full data bytes
+        Transfer(meta.send[i].data.ptr_, meta.send[i].size, ctx);
       }
     }
     return 0;
   }
 
  private:
-  void Transfer(const char* data, size_t size) {
+  // SPSC ring buffer write
+  static void Transfer(const char* data, size_t size, const LbmContext& ctx) {
     size_t offset = 0;
+    size_t total_written = ctx.shm_info_->total_written_.load();
     while (offset < size) {
-      // Wait until server consumed previous chunk
-      while (ctx_.copy_flags_->Any(SHM_DATA_READY)) {
-        std::this_thread::yield();
+      size_t total_read = ctx.shm_info_->total_read_.load();
+      size_t space =
+          ctx.shm_info_->copy_space_size_ - (total_written - total_read);
+      if (space == 0) {
+        // std::this_thread::yield();
+        continue;
       }
-
-      size_t chunk_size = std::min(size - offset, ctx_.copy_space_size);
-      std::memcpy(ctx_.copy_space, data + offset, chunk_size);
-      ctx_.transfer_size_->store(chunk_size);
-      std::atomic_thread_fence(std::memory_order_release);
-      ctx_.copy_flags_->SetBits(SHM_DATA_READY);
-      offset += chunk_size;
+      size_t write_pos = total_written % ctx.shm_info_->copy_space_size_;
+      size_t contig = ctx.shm_info_->copy_space_size_ - write_pos;
+      size_t chunk = std::min({size - offset, space, contig});
+      std::memcpy(ctx.copy_space + write_pos, data + offset, chunk);
+      offset += chunk;
+      total_written += chunk;
+      ctx.shm_info_->total_written_.store(total_written,
+                                          std::memory_order_release);
     }
   }
 };
@@ -130,39 +142,36 @@ class ShmServer : public Server {
   std::string GetAddress() const override { return "shm"; }
 
   template <typename MetaT>
-  int RecvMetadata(MetaT& meta) {
+  int RecvMetadata(MetaT& meta, const LbmContext& ctx = LbmContext()) {
     // 1. Receive 4-byte size prefix
     uint32_t meta_len = 0;
-    Transfer(reinterpret_cast<char*>(&meta_len), sizeof(meta_len));
+    Transfer(reinterpret_cast<char*>(&meta_len), sizeof(meta_len), ctx);
 
     // 2. Receive metadata bytes
-    std::string meta_str(meta_len, '\0');
-    Transfer(&meta_str[0], meta_len);
+    std::vector<char> meta_buf(meta_len);
+    Transfer(meta_buf.data(), meta_len, ctx);
 
-    // 3. Deserialize
-    std::istringstream iss(meta_str, std::ios::binary);
-    cereal::BinaryInputArchive ar(iss);
+    // 3. Deserialize using LocalDeserialize
+    hshm::ipc::LocalDeserialize<> ar(meta_buf);
     ar(meta);
     return 0;
   }
 
   template <typename MetaT>
-  int RecvBulks(MetaT& meta) {
+  int RecvBulks(MetaT& meta, const LbmContext& ctx = LbmContext()) {
     for (size_t i = 0; i < meta.recv.size(); ++i) {
       if (!meta.recv[i].flags.Any(BULK_XFER)) continue;
 
-      // Read transfer mode: 0 = full data copy, 1 = ShmPtr only
-      uint8_t mode = 0;
-      Transfer(reinterpret_cast<char*>(&mode), sizeof(mode));
+      // Always read ShmPtr first
+      hipc::ShmPtr<char> shm;
+      Transfer(reinterpret_cast<char*>(&shm), sizeof(shm), ctx);
 
-      if (mode == 1) {
-        // ShmPtr-only transfer — read the ShmPtr, leave ptr_ null
-        hipc::ShmPtr<char> shm;
-        Transfer(reinterpret_cast<char*>(&shm), sizeof(shm));
+      if (!shm.alloc_id_.IsNull()) {
+        // Shared memory — ShmPtr passthrough, no data transfer
         meta.recv[i].data.shm_ = shm;
         meta.recv[i].data.ptr_ = nullptr;
       } else {
-        // Full data copy
+        // Private memory — read full data bytes
         char* buf = meta.recv[i].data.ptr_;
         bool allocated = false;
         if (!buf) {
@@ -170,7 +179,7 @@ class ShmServer : public Server {
           allocated = true;
         }
 
-        Transfer(buf, meta.recv[i].size);
+        Transfer(buf, meta.recv[i].size, ctx);
 
         if (allocated) {
           meta.recv[i].data.ptr_ = buf;
@@ -183,19 +192,24 @@ class ShmServer : public Server {
   }
 
  private:
-  void Transfer(char* buf, size_t size) {
+  // SPSC ring buffer read
+  static void Transfer(char* buf, size_t size, const LbmContext& ctx) {
     size_t offset = 0;
+    size_t total_read = ctx.shm_info_->total_read_.load();
     while (offset < size) {
-      // Wait until client wrote a chunk
-      while (!ctx_.copy_flags_->Any(SHM_DATA_READY)) {
-        std::this_thread::yield();
+      size_t total_written = ctx.shm_info_->total_written_.load();
+      size_t avail = total_written - total_read;
+      if (avail == 0) {
+        // std::this_thread::yield();
+        continue;
       }
-
-      std::atomic_thread_fence(std::memory_order_acquire);
-      size_t chunk_size = ctx_.transfer_size_->load();
-      std::memcpy(buf + offset, ctx_.copy_space, chunk_size);
-      ctx_.copy_flags_->UnsetBits(SHM_DATA_READY);
-      offset += chunk_size;
+      size_t read_pos = total_read % ctx.shm_info_->copy_space_size_;
+      size_t contig = ctx.shm_info_->copy_space_size_ - read_pos;
+      size_t chunk = std::min({size - offset, avail, contig});
+      std::memcpy(buf + offset, ctx.copy_space + read_pos, chunk);
+      offset += chunk;
+      total_read += chunk;
+      ctx.shm_info_->total_read_.store(total_read, std::memory_order_release);
     }
   }
 };

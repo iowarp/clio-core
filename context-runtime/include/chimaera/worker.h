@@ -52,6 +52,7 @@
 #include "chimaera/task_queue.h"
 #include "chimaera/types.h"
 #include "chimaera/scheduler/scheduler.h"
+#include "hermes_shm/lightbeam/transport_factory_impl.h"
 #include "hermes_shm/memory/allocator/malloc_allocator.h"
 
 namespace chi {
@@ -422,7 +423,7 @@ class Worker {
    * @param run_ctx Runtime context
    * @param container Container for serialization
    */
-  void EndTaskClientTransfer(const FullPtr<Task> &task_ptr,
+  void EndTaskShmTransfer(const FullPtr<Task> &task_ptr,
                              RunContext *run_ctx, Container *container);
 
   /**
@@ -608,6 +609,10 @@ class Worker {
 
   // Client copy queue - LocalTransfer objects streaming output data to clients
   std::queue<LocalTransfer> client_copy_;
+
+  // SHM lightbeam transport (worker-side)
+  std::unique_ptr<hshm::lbm::Client> shm_client_;  // For EndTaskShmTransfer
+  std::unique_ptr<hshm::lbm::Server> shm_server_;  // For ProcessNewTask
 
   // Scheduler pointer (owned by IpcManager, not Worker)
   Scheduler *scheduler_;

@@ -56,9 +56,9 @@ LocalTransfer::LocalTransfer(std::vector<char>&& data,
       total_size_(data_.size()),
       is_sender_(true),
       is_initialized_(true) {
-  // Set the output_size in FutureShm so receiver knows total size
+  // Set the output total_size_ in FutureShm so receiver knows total size
   if (!future_shm_.IsNull()) {
-    future_shm_->output_size_.store(total_size_, std::memory_order_release);
+    future_shm_->output_.total_written_.store(total_size_, std::memory_order_release);
   }
 }
 
@@ -132,7 +132,7 @@ bool LocalTransfer::Send(u32 max_xfer_time_us) {
   }
 
   // Get copy space capacity
-  size_t capacity = future_shm_->capacity_.load();
+  size_t capacity = future_shm_->output_.copy_space_size_;
   if (capacity == 0) {
     HLOG(kError, "LocalTransfer::Send: copy_space capacity is 0");
     return false;
@@ -187,10 +187,6 @@ bool LocalTransfer::Send(u32 max_xfer_time_us) {
     std::memcpy(future_shm_->copy_space, data_.data() + bytes_transferred_,
                 chunk_size);
 
-    // Update chunk size in FutureShm
-    future_shm_->current_chunk_size_.store(chunk_size,
-                                           std::memory_order_release);
-
     // Memory fence: Ensure copy_space writes are visible before flag
     std::atomic_thread_fence(std::memory_order_release);
 
@@ -219,7 +215,7 @@ bool LocalTransfer::Recv() {
   }
 
   // Get copy space capacity
-  size_t capacity = future_shm_->capacity_.load();
+  size_t capacity = future_shm_->output_.copy_space_size_;
   if (capacity == 0) {
     HLOG(kError, "LocalTransfer::Recv: copy_space capacity is 0");
     return false;
@@ -234,28 +230,15 @@ bool LocalTransfer::Recv() {
     // Memory fence: Ensure we see all worker writes to copy_space
     std::atomic_thread_fence(std::memory_order_acquire);
 
-    // Get chunk size
-    size_t chunk_size = future_shm_->current_chunk_size_.load();
-
-    // Sanity check chunk size
-    if (chunk_size == 0 || chunk_size > capacity) {
-      HLOG(kWarning,
-           "LocalTransfer::Recv: Invalid chunk_size {} "
-           "(capacity={}), skipping",
-           chunk_size, capacity);
-      future_shm_->flags_.UnsetBits(FutureShm::FUTURE_NEW_DATA);
-      continue;
-    }
-
-    // Calculate how much to copy (don't exceed expected total)
+    // Compute chunk size mathematically
     size_t remaining = total_size_ - bytes_transferred_;
-    size_t bytes_to_copy = std::min(chunk_size, remaining);
+    size_t chunk_size = std::min(remaining, capacity);
 
     // Copy data from copy_space to our buffer
     data_.insert(data_.end(), future_shm_->copy_space,
-                 future_shm_->copy_space + bytes_to_copy);
+                 future_shm_->copy_space + chunk_size);
 
-    bytes_transferred_ += bytes_to_copy;
+    bytes_transferred_ += chunk_size;
 
     // Memory fence: Ensure our reads complete before unsetting flag
     std::atomic_thread_fence(std::memory_order_release);

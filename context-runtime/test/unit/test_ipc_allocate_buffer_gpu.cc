@@ -852,7 +852,7 @@ TEST_CASE("GPU IPC AllocateBuffer basic functionality",
     REQUIRE(future_shm != nullptr);
 
     // Verify serialized data exists in copy_space
-    size_t input_size = future_shm->input_size_.load();
+    size_t input_size = future_shm->input_.total_written_.load();
     INFO("Serialized size: " << input_size << " bytes");
     REQUIRE(input_size > 0);
     REQUIRE(future_shm->flags_.Any(chi::FutureShm::FUTURE_COPY_FROM_CLIENT));
@@ -929,7 +929,7 @@ TEST_CASE("GPU IPC AllocateBuffer basic functionality",
 
     // Verify FUTURE_COPY_FROM_CLIENT flag and serialized data
     REQUIRE(future_shm->flags_.Any(chi::FutureShm::FUTURE_COPY_FROM_CLIENT));
-    size_t input_size = future_shm->input_size_.load();
+    size_t input_size = future_shm->input_.total_written_.load();
     INFO("Serialized size: " << input_size << " bytes");
     REQUIRE(input_size > 0);
 

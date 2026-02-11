@@ -65,32 +65,32 @@ int Client::Send(MetaT& meta, const LbmContext& ctx) {
 }
 
 template <typename MetaT>
-int Server::RecvMetadata(MetaT& meta) {
+int Server::RecvMetadata(MetaT& meta, const LbmContext& ctx) {
   switch (type_) {
 #if HSHM_ENABLE_ZMQ
     case Transport::kZeroMq:
-      return static_cast<ZeroMqServer*>(this)->RecvMetadata(meta);
+      return static_cast<ZeroMqServer*>(this)->RecvMetadata(meta, ctx);
 #endif
     case Transport::kSocket:
-      return static_cast<SocketServer*>(this)->RecvMetadata(meta);
+      return static_cast<SocketServer*>(this)->RecvMetadata(meta, ctx);
     case Transport::kShm:
-      return static_cast<ShmServer*>(this)->RecvMetadata(meta);
+      return static_cast<ShmServer*>(this)->RecvMetadata(meta, ctx);
     default:
       return -1;
   }
 }
 
 template <typename MetaT>
-int Server::RecvBulks(MetaT& meta) {
+int Server::RecvBulks(MetaT& meta, const LbmContext& ctx) {
   switch (type_) {
 #if HSHM_ENABLE_ZMQ
     case Transport::kZeroMq:
-      return static_cast<ZeroMqServer*>(this)->RecvBulks(meta);
+      return static_cast<ZeroMqServer*>(this)->RecvBulks(meta, ctx);
 #endif
     case Transport::kSocket:
-      return static_cast<SocketServer*>(this)->RecvBulks(meta);
+      return static_cast<SocketServer*>(this)->RecvBulks(meta, ctx);
     case Transport::kShm:
-      return static_cast<ShmServer*>(this)->RecvBulks(meta);
+      return static_cast<ShmServer*>(this)->RecvBulks(meta, ctx);
     default:
       return -1;
   }

@@ -125,6 +125,12 @@ bool Worker::Init() {
   scheduler_ = CHI_IPC->GetScheduler();
   HLOG(kDebug, "Worker {}: Using scheduler from IpcManager", worker_id_);
 
+  // Create SHM lightbeam client/server for worker-side transport
+  shm_client_ = hshm::lbm::TransportFactory::GetClient(
+      "", hshm::lbm::Transport::kShm);
+  shm_server_ = hshm::lbm::TransportFactory::GetServer(
+      "", hshm::lbm::Transport::kShm);
+
   is_initialized_ = true;
   return true;
 }
@@ -442,15 +448,28 @@ hipc::FullPtr<Task> Worker::GetOrCopyTaskFromFuture(Future<Task> &future,
     // CLIENT PATH: Load task from serialized data in FutureShm copy_space
     // Only copy if not already copied (FUTURE_WAS_COPIED not set)
 
-    // Memory fence: Ensure we see all client writes to copy_space and
-    // input_size_
-    std::atomic_thread_fence(std::memory_order_acquire);
+    // Build SHM context for transfer
+    hshm::lbm::LbmContext ctx;
+    ctx.copy_space = future_shm->copy_space;
+    ctx.shm_info_ = &future_shm->input_;
 
-    size_t input_size = future_shm->input_size_.load();
-    std::vector<char> serialized_data(future_shm->copy_space,
-                                      future_shm->copy_space + input_size);
-    LocalLoadTaskArchive archive(serialized_data);
-    task_full_ptr = container->LocalAllocLoadTask(method_id, archive);
+    // Receive via SHM transport (blocking - spins until client sends)
+    LoadTaskArchive archive;
+    shm_server_->RecvMetadata(archive, ctx);
+
+    // Set up recv entries from send descriptors
+    for (const auto &send_bulk : archive.send) {
+      hshm::lbm::Bulk bulk;
+      bulk.size = send_bulk.size;
+      bulk.flags = send_bulk.flags;
+      bulk.data.ptr_ = nullptr;
+      archive.recv.push_back(bulk);
+    }
+
+    shm_server_->RecvBulks(archive, ctx);
+
+    // Allocate and deserialize task
+    task_full_ptr = container->AllocLoadTask(method_id, archive);
 
     // Update the Future's task pointer
     future.GetTaskPtr() = task_full_ptr;
@@ -1379,31 +1398,27 @@ void Worker::ExecTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
   EndTask(task_ptr, run_ctx, true);
 }
 
-void Worker::EndTaskClientTransfer(const FullPtr<Task> &task_ptr,
-                                   RunContext *run_ctx,
-                                   Container *container) {
+void Worker::EndTaskShmTransfer(const FullPtr<Task> &task_ptr,
+                                RunContext *run_ctx,
+                                Container *container) {
   auto future_shm = run_ctx->future_.GetFutureShm();
 
-  // Serialize task outputs
-  LocalSaveTaskArchive archive(LocalMsgType::kSerializeOut);
-  container->LocalSaveTask(task_ptr->method_, archive, task_ptr);
+  // Build SHM context for transfer (output reuses same copy_space)
+  future_shm->output_.copy_space_size_ = future_shm->input_.copy_space_size_;
+  hshm::lbm::LbmContext ctx;
+  ctx.copy_space = future_shm->copy_space;
+  ctx.shm_info_ = &future_shm->output_;
 
-  // Create LocalTransfer sender (sets output_size_ in FutureShm)
-  // Move serialized data directly into LocalTransfer
-  // Pass container info so LocalTransfer can delete task on completion
-  LocalTransfer transfer(archive.MoveData(), future_shm, task_ptr,
-                         task_ptr->method_, container);
+  // Serialize outputs
+  SaveTaskArchive archive(MsgType::kSerializeOut, shm_client_.get());
+  container->SaveTask(task_ptr->method_, archive, task_ptr);
 
-  // Try initial send with 50 microsecond budget
-  bool complete = transfer.Send(50);
+  // Send via SHM transport (blocking)
+  shm_client_->Send(archive, ctx);
 
-  if (complete) {
-    // Transfer completed in first call
-    return;
-  }
-
-  // Queue for continued streaming via CopyTaskOutputToClient
-  client_copy_.push(std::move(transfer));
+  // Set FUTURE_COMPLETE and clean up task
+  future_shm->flags_.SetBits(FutureShm::FUTURE_COMPLETE);
+  container->DelTask(task_ptr->method_, task_ptr);
 }
 
 void Worker::EndTaskSignalParent(RunContext *parent_task) {
@@ -1474,7 +1489,7 @@ void Worker::EndTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
     u32 origin = future_shm->origin_;
     switch (origin) {
       case FutureShm::FUTURE_CLIENT_SHM:
-        EndTaskClientTransfer(task_ptr, run_ctx, container);
+        EndTaskShmTransfer(task_ptr, run_ctx, container);
         break;
       case FutureShm::FUTURE_CLIENT_TCP:
         CHI_IPC->EnqueueNetTask(run_ctx->future_, NetQueuePriority::kClientSendTcp);
@@ -1483,7 +1498,7 @@ void Worker::EndTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
         CHI_IPC->EnqueueNetTask(run_ctx->future_, NetQueuePriority::kClientSendIpc);
         break;
       default:
-        EndTaskClientTransfer(task_ptr, run_ctx, container);
+        EndTaskShmTransfer(task_ptr, run_ctx, container);
         break;
     }
   } else {

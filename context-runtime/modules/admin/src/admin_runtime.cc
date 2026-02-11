@@ -1071,7 +1071,7 @@ chi::TaskResume Runtime::ClientRecv(hipc::FullPtr<ClientRecvTask> task,
                                  ? chi::FutureShm::FUTURE_CLIENT_TCP
                                  : chi::FutureShm::FUTURE_CLIENT_IPC;
       future_shm->client_task_vaddr_ = info.task_id_.net_key_;
-      future_shm->capacity_.store(0);
+      // No copy_space for ZMQ path — ShmTransferInfo defaults are fine
       // Mark as copied so the worker routes the completed task back via lightbeam
       // rather than treating it as a runtime-internal task
       future_shm->flags_.SetBits(chi::FutureShm::FUTURE_WAS_COPIED);

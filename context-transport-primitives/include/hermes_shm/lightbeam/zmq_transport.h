@@ -264,7 +264,8 @@ class ZeroMqServer : public Server {
   }
 
   template <typename MetaT>
-  int RecvMetadata(MetaT& meta) {
+  int RecvMetadata(MetaT& meta, const LbmContext& ctx = LbmContext()) {
+    (void)ctx;
     zmq_msg_t msg;
     zmq_msg_init(&msg);
     int rc = zmq_msg_recv(&msg, socket_, ZMQ_DONTWAIT);
@@ -293,7 +294,8 @@ class ZeroMqServer : public Server {
   }
 
   template <typename MetaT>
-  int RecvBulks(MetaT& meta) {
+  int RecvBulks(MetaT& meta, const LbmContext& ctx = LbmContext()) {
+    (void)ctx;
     size_t recv_count = 0;
     for (size_t i = 0; i < meta.recv.size(); ++i) {
       if (!meta.recv[i].flags.Any(BULK_XFER)) {

@@ -297,7 +297,8 @@ class SocketServer : public Server {
   }
 
   template <typename MetaT>
-  int RecvMetadata(MetaT& meta) {
+  int RecvMetadata(MetaT& meta, const LbmContext& ctx = LbmContext()) {
+    (void)ctx;
     // Accept any pending connections (needed for standalone unit tests)
     AcceptPending();
 
@@ -349,7 +350,8 @@ class SocketServer : public Server {
   }
 
   template <typename MetaT>
-  int RecvBulks(MetaT& meta) {
+  int RecvBulks(MetaT& meta, const LbmContext& ctx = LbmContext()) {
+    (void)ctx;
     for (size_t i = 0; i < meta.recv.size(); ++i) {
       if (!meta.recv[i].flags.Any(BULK_XFER)) continue;
 

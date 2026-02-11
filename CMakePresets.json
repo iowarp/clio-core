@@ -91,6 +91,7 @@
                 "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
                 "WRP_CORE_ENABLE_ASAN": "OFF",
                 "WRP_CORE_ENABLE_PYTHON": "ON",
+                "WRP_CORE_ENABLE_COVERAGE": "OFF",
                 "HSHM_LOG_LEVEL": "1"
             }
         },
