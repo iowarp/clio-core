@@ -96,10 +96,9 @@ void LoadTaskArchive::bulk(hipc::ShmPtr<> &ptr, size_t size, uint32_t flags) {
     }
   } else if (msg_type_ == MsgType::kSerializeOut) {
     if (current_bulk_index_ < recv.size()) {
-      // Post-receive: data already in recv buffers — copy to task's pointer
+      // Post-receive: point task's ShmPtr directly at recv buffer (zero-copy)
       if (recv[current_bulk_index_].flags.Any(BULK_XFER)) {
-        hipc::FullPtr<char> dst = CHI_IPC->ToFullPtr(ptr).template Cast<char>();
-        memcpy(dst.ptr_, recv[current_bulk_index_].data.ptr_, size);
+        ptr = recv[current_bulk_index_].data.shm_.template Cast<void>();
       }
       current_bulk_index_++;
     } else if (lbm_server_) {

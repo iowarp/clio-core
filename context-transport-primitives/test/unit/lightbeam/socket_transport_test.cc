@@ -31,7 +31,8 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include <hermes_shm/lightbeam/zmq_transport.h>
+#include <hermes_shm/lightbeam/socket_transport.h>
+#include <hermes_shm/lightbeam/transport_factory_impl.h>
 
 #include <cassert>
 #include <chrono>
@@ -53,28 +54,23 @@ class TestMeta : public LbmMeta {
 namespace cereal {
 template <class Archive>
 void serialize(Archive& ar, TestMeta& meta) {
-  ar(meta.send, meta.recv, meta.request_id, meta.operation);
+  ar(meta.send, meta.recv, meta.send_bulks, meta.recv_bulks,
+     meta.request_id, meta.operation);
 }
 }  // namespace cereal
 
-void TestBasicTransfer() {
-  std::cout << "\n==== Testing Basic Transfer with New API ====\n";
+void TestBasicTcpTransfer() {
+  std::cout << "\n==== Testing Socket Basic TCP Transfer ====\n";
 
-#ifdef HSHM_ENABLE_ZMQ
-  // Create server
   std::string addr = "127.0.0.1";
-  std::string protocol = "tcp";
-  int port = 8195;
+  int port = 8193;
 
-  auto server = std::make_unique<ZeroMqServer>(addr, protocol, port);
-  auto client = std::make_unique<ZeroMqClient>(addr, protocol, port);
+  auto server = std::make_unique<SocketServer>(addr, "tcp", port);
+  auto client = std::make_unique<SocketClient>(addr, "tcp", port);
 
-  // Give ZMQ time to connect
-  std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
-  // Prepare data on client side
+  // Prepare data
   const char* data1 = "Hello, World!";
-  const char* data2 = "Testing Lightbeam";
+  const char* data2 = "Testing Socket Transport";
   size_t size1 = strlen(data1);
   size_t size2 = strlen(data2);
 
@@ -83,21 +79,23 @@ void TestBasicTransfer() {
   send_meta.request_id = 42;
   send_meta.operation = "test_op";
 
-  Bulk bulk1 = client->Expose(
-      hipc::FullPtr<char>(const_cast<char*>(data1)), size1, BULK_XFER);
-  Bulk bulk2 = client->Expose(
-      hipc::FullPtr<char>(const_cast<char*>(data2)), size2, BULK_XFER);
+  Bulk bulk1 = client->Expose(hipc::FullPtr<char>(const_cast<char*>(data1)),
+                              size1, BULK_XFER);
+  Bulk bulk2 = client->Expose(hipc::FullPtr<char>(const_cast<char*>(data2)),
+                              size2, BULK_XFER);
 
   send_meta.send.push_back(bulk1);
   send_meta.send.push_back(bulk2);
+  send_meta.send_bulks = 2;
 
-  // Send metadata and bulks
+  // Send metadata + bulks
   int rc = client->Send(send_meta);
   assert(rc == 0);
   std::cout << "Client sent data successfully\n";
 
   // Server receives metadata
   TestMeta recv_meta;
+  int attempts = 0;
   while (true) {
     rc = server->RecvMetadata(recv_meta);
     if (rc == 0) break;
@@ -106,6 +104,10 @@ void TestBasicTransfer() {
       return;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    if (++attempts > 5000) {
+      std::cerr << "RecvMetadata timed out\n";
+      return;
+    }
   }
   std::cout << "Server received metadata: request_id=" << recv_meta.request_id
             << ", operation=" << recv_meta.operation << "\n";
@@ -113,7 +115,7 @@ void TestBasicTransfer() {
   assert(recv_meta.operation == "test_op");
   assert(recv_meta.send.size() == 2);
 
-  // Allocate buffers for receiving bulks and copy flags from send
+  // Allocate buffers for receiving bulks
   std::vector<char> recv_buf1(recv_meta.send[0].size);
   std::vector<char> recv_buf2(recv_meta.send[1].size);
 
@@ -132,54 +134,43 @@ void TestBasicTransfer() {
   }
   std::cout << "Server received bulk data successfully\n";
 
-  // Verify received data
+  // Verify
   std::string received1(recv_buf1.begin(), recv_buf1.end());
   std::string received2(recv_buf2.begin(), recv_buf2.end());
-
   std::cout << "Bulk 1: " << received1 << "\n";
   std::cout << "Bulk 2: " << received2 << "\n";
-
   assert(received1 == data1);
   assert(received2 == data2);
 
-  std::cout << "[New API] Test passed!\n";
-#else
-  std::cout << "ZMQ not enabled, skipping test\n";
-#endif
+  std::cout << "[Socket TCP Basic] Test passed!\n";
 }
 
 void TestMultipleBulks() {
-  std::cout << "\n==== Testing Multiple Bulks Transfer ====\n";
+  std::cout << "\n==== Testing Socket Multiple Bulks ====\n";
 
-#ifdef HSHM_ENABLE_ZMQ
   std::string addr = "127.0.0.1";
-  std::string protocol = "tcp";
-  int port = 8196;
+  int port = 8194;
 
-  auto server = std::make_unique<ZeroMqServer>(addr, protocol, port);
-  auto client = std::make_unique<ZeroMqClient>(addr, protocol, port);
+  auto server = std::make_unique<SocketServer>(addr, "tcp", port);
+  auto client = std::make_unique<SocketClient>(addr, "tcp", port);
 
-  std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
-  // Prepare multiple data chunks
   std::vector<std::string> data_chunks = {"Chunk 1", "Chunk 2 is longer",
                                           "Chunk 3", "Final chunk 4"};
 
-  // Create metadata
   LbmMeta send_meta;
   for (const auto& chunk : data_chunks) {
     Bulk bulk = client->Expose(
         hipc::FullPtr<char>(const_cast<char*>(chunk.data())),
         chunk.size(), BULK_XFER);
     send_meta.send.push_back(bulk);
+    send_meta.send_bulks++;
   }
 
-  // Send
   int rc = client->Send(send_meta);
   assert(rc == 0);
 
-  // Receive metadata
   LbmMeta recv_meta;
+  int attempts = 0;
   while (true) {
     rc = server->RecvMetadata(recv_meta);
     if (rc == 0) break;
@@ -188,10 +179,13 @@ void TestMultipleBulks() {
       return;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    if (++attempts > 5000) {
+      std::cerr << "RecvMetadata timed out\n";
+      return;
+    }
   }
   assert(recv_meta.send.size() == data_chunks.size());
 
-  // Allocate buffers and receive bulks
   std::vector<std::vector<char>> recv_buffers;
   for (size_t i = 0; i < recv_meta.send.size(); ++i) {
     recv_buffers.emplace_back(recv_meta.send[i].size);
@@ -207,22 +201,116 @@ void TestMultipleBulks() {
     return;
   }
 
-  // Verify all chunks
   for (size_t i = 0; i < data_chunks.size(); ++i) {
     std::string received(recv_buffers[i].begin(), recv_buffers[i].end());
     std::cout << "Chunk " << i << ": " << received << "\n";
     assert(received == data_chunks[i]);
   }
 
-  std::cout << "[Multiple Bulks] Test passed!\n";
-#else
-  std::cout << "ZMQ not enabled, skipping test\n";
-#endif
+  std::cout << "[Socket Multiple Bulks] Test passed!\n";
+}
+
+void TestUnixDomainSocket() {
+  std::cout << "\n==== Testing Socket IPC (Unix Domain Socket) ====\n";
+
+  std::string sock_path = "/tmp/lightbeam_test.sock";
+
+  auto server = std::make_unique<SocketServer>(sock_path, "ipc", 0);
+  auto client = std::make_unique<SocketClient>(sock_path, "ipc", 0);
+
+  const char* data = "IPC test data over Unix socket";
+  size_t size = strlen(data);
+
+  TestMeta send_meta;
+  send_meta.request_id = 99;
+  send_meta.operation = "ipc_test";
+
+  Bulk bulk = client->Expose(hipc::FullPtr<char>(const_cast<char*>(data)),
+                             size, BULK_XFER);
+  send_meta.send.push_back(bulk);
+  send_meta.send_bulks = 1;
+
+  int rc = client->Send(send_meta);
+  assert(rc == 0);
+  std::cout << "Client sent IPC data\n";
+
+  TestMeta recv_meta;
+  int attempts = 0;
+  while (true) {
+    rc = server->RecvMetadata(recv_meta);
+    if (rc == 0) break;
+    if (rc != EAGAIN) {
+      std::cerr << "RecvMetadata failed: " << rc << "\n";
+      return;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    if (++attempts > 5000) {
+      std::cerr << "RecvMetadata timed out\n";
+      return;
+    }
+  }
+  assert(recv_meta.request_id == 99);
+  assert(recv_meta.operation == "ipc_test");
+
+  std::vector<char> recv_buf(recv_meta.send[0].size);
+  recv_meta.recv.push_back(server->Expose(
+      hipc::FullPtr<char>(recv_buf.data()), recv_buf.size(),
+      recv_meta.send[0].flags.bits_));
+
+  rc = server->RecvBulks(recv_meta);
+  assert(rc == 0);
+
+  std::string received(recv_buf.begin(), recv_buf.end());
+  std::cout << "Received: " << received << "\n";
+  assert(received == data);
+
+  std::cout << "[Socket IPC] Test passed!\n";
+}
+
+void TestMetadataOnly() {
+  std::cout << "\n==== Testing Socket Metadata Only (No Bulks) ====\n";
+
+  std::string addr = "127.0.0.1";
+  int port = 8195;
+
+  auto server = std::make_unique<SocketServer>(addr, "tcp", port);
+  auto client = std::make_unique<SocketClient>(addr, "tcp", port);
+
+  TestMeta send_meta;
+  send_meta.request_id = 7;
+  send_meta.operation = "ping";
+  send_meta.send_bulks = 0;
+
+  int rc = client->Send(send_meta);
+  assert(rc == 0);
+
+  TestMeta recv_meta;
+  int attempts = 0;
+  while (true) {
+    rc = server->RecvMetadata(recv_meta);
+    if (rc == 0) break;
+    if (rc != EAGAIN) {
+      std::cerr << "RecvMetadata failed: " << rc << "\n";
+      return;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    if (++attempts > 5000) {
+      std::cerr << "RecvMetadata timed out\n";
+      return;
+    }
+  }
+  assert(recv_meta.request_id == 7);
+  assert(recv_meta.operation == "ping");
+  assert(recv_meta.send.empty());
+
+  std::cout << "[Socket Metadata Only] Test passed!\n";
 }
 
 int main() {
-  TestBasicTransfer();
+  TestBasicTcpTransfer();
   TestMultipleBulks();
-  std::cout << "\nAll new API tests passed!" << std::endl;
+  TestUnixDomainSocket();
+  TestMetadataOnly();
+  std::cout << "\nAll socket transport tests passed!" << std::endl;
   return 0;
 }

@@ -59,7 +59,9 @@ void TestZeroMQ() {
 
   // Client creates metadata and sends
   LbmMeta send_meta;
-  Bulk send_bulk = client->Expose(magic.data(), magic.size(), BULK_XFER);
+  Bulk send_bulk = client->Expose(
+      hipc::FullPtr<char>(const_cast<char*>(magic.data())),
+      magic.size(), BULK_XFER);
   send_meta.send.push_back(send_bulk);
 
   int rc = client->Send(send_meta);
@@ -81,8 +83,9 @@ void TestZeroMQ() {
 
   // Allocate buffer and receive bulks
   std::vector<char> recv_buf(recv_meta.send[0].size);
-  recv_meta.recv.push_back(server->Expose(recv_buf.data(), recv_buf.size(),
-                                          recv_meta.send[0].flags.bits_));
+  recv_meta.recv.push_back(server->Expose(
+      hipc::FullPtr<char>(recv_buf.data()), recv_buf.size(),
+      recv_meta.send[0].flags.bits_));
 
   rc = server->RecvBulks(recv_meta);
   if (rc != 0) {

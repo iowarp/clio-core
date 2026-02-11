@@ -1708,13 +1708,13 @@ void Worker::ContinueBlockedTasks(bool force) {
     }
 
     // Process periodic queues with different checking frequencies
-    // periodic_queues_[0] (<=50us) every 16 iterations
-    if (iteration_count_ % 16 == 0) {
+    // periodic_queues_[0] (<=50us) every 4 iterations
+    if (iteration_count_ % 4 == 0) {
       ProcessPeriodicQueue(periodic_queues_[0], 0);
     }
 
-    // periodic_queues_[1] (<=200us) every 32 iterations
-    if (iteration_count_ % 32 == 0) {
+    // periodic_queues_[1] (<=200us) every 8 iterations
+    if (iteration_count_ % 8 == 0) {
       ProcessPeriodicQueue(periodic_queues_[1], 1);
     }
 

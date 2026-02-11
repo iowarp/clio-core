@@ -49,15 +49,15 @@
 #include "chimaera/corwlock.h"
 #include "chimaera/local_task_archives.h"
 #include "chimaera/local_transfer.h"
-#include "hermes_shm/data_structures/serialization/serialize_common.h"
-#include "chimaera/task_archives.h"
 #include "chimaera/scheduler/scheduler.h"
 #include "chimaera/task.h"
+#include "chimaera/task_archives.h"
 #include "chimaera/task_queue.h"
 #include "chimaera/types.h"
 #include "chimaera/worker.h"
+#include "hermes_shm/data_structures/serialization/serialize_common.h"
+#include "hermes_shm/lightbeam/transport_factory_impl.h"
 #include "hermes_shm/memory/backend/posix_shm_mmap.h"
-#include "hermes_shm/lightbeam/zmq_transport.h"
 
 #if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
 #include "hermes_shm/memory/allocator/buddy_allocator.h"
@@ -80,8 +80,8 @@ enum class IpcMode : u32 {
  * Network queue priority levels for send operations
  */
 enum class NetQueuePriority : u32 {
-  kSendIn = 0,         ///< Priority 0: SendIn operations (sending task inputs)
-  kSendOut = 1,        ///< Priority 1: SendOut operations (sending task outputs)
+  kSendIn = 0,   ///< Priority 0: SendIn operations (sending task inputs)
+  kSendOut = 1,  ///< Priority 1: SendOut operations (sending task outputs)
   kClientSendTcp = 2,  ///< Priority 2: Client response via TCP
   kClientSendIpc = 3,  ///< Priority 3: Client response via IPC
 };
@@ -399,7 +399,8 @@ class IpcManager {
     future_shm_ptr->pool_id_ = task_ptr->pool_id_;
     future_shm_ptr->method_id_ = task_ptr->method_;
     future_shm_ptr->origin_ = FutureShm::FUTURE_CLIENT_SHM;
-    future_shm_ptr->client_task_vaddr_ = reinterpret_cast<uintptr_t>(task_ptr.ptr_);
+    future_shm_ptr->client_task_vaddr_ =
+        reinterpret_cast<uintptr_t>(task_ptr.ptr_);
     future_shm_ptr->capacity_.store(copy_space_size);
 
     // Copy serialized data to copy_space
@@ -507,8 +508,7 @@ class IpcManager {
    * The object is NOT constructed — use ClientGpuInit to set up fields.
    * @return Pointer to the per-block IpcManager
    */
-  static HSHM_GPU_FUN __noinline__
-  IpcManager* GetBlockIpcManager() {
+  static HSHM_GPU_FUN __noinline__ IpcManager *GetBlockIpcManager() {
     __shared__ IpcManager s_ipc;
     return &s_ipc;
   }
@@ -703,7 +703,8 @@ class IpcManager {
     size_t alloc_size = sizeof(FutureShm);
     hipc::FullPtr<char> buffer = HSHM_MALLOC->AllocateObjs<char>(alloc_size);
     if (buffer.IsNull()) {
-      HLOG(kError, "SendZmq: Failed to allocate FutureShm ({} bytes)", alloc_size);
+      HLOG(kError, "SendZmq: Failed to allocate FutureShm ({} bytes)",
+           alloc_size);
       return Future<TaskT>();
     }
     FutureShm *future_shm = new (buffer.ptr_) FutureShm();
@@ -712,8 +713,8 @@ class IpcManager {
     future_shm->pool_id_ = task_ptr->pool_id_;
     future_shm->method_id_ = task_ptr->method_;
     future_shm->origin_ = (mode == IpcMode::kTcp)
-                               ? FutureShm::FUTURE_CLIENT_TCP
-                               : FutureShm::FUTURE_CLIENT_IPC;
+                              ? FutureShm::FUTURE_CLIENT_TCP
+                              : FutureShm::FUTURE_CLIENT_IPC;
     future_shm->client_task_vaddr_ = net_key;
     future_shm->capacity_.store(0);
 
@@ -772,29 +773,19 @@ class IpcManager {
         // Memory fence
         std::atomic_thread_fence(std::memory_order_acquire);
 
-        // Look up stored LoadTaskArchive from pending_response_archives_
+        // Borrow LoadTaskArchive from pending_response_archives_ (don't erase).
+        // The archive holds zmq_msg_t handles in recv[].desc that keep
+        // zero-copy buffers alive. It stays in the map until
+        // Future::Destroy() calls CleanupResponseArchive().
         size_t net_key = future_shm->client_task_vaddr_;
-        std::unique_ptr<LoadTaskArchive> archive;
         {
           std::lock_guard<std::mutex> lock(pending_futures_mutex_);
           auto it = pending_response_archives_.find(net_key);
           if (it != pending_response_archives_.end()) {
-            archive = std::move(it->second);
-            pending_response_archives_.erase(it);
-          }
-        }
-
-        if (archive) {
-          // Deserialize task outputs using post-receive bulk path
-          archive->ResetBulkIndex();
-          archive->msg_type_ = MsgType::kSerializeOut;
-          *archive >> (*task_ptr);
-
-          // Free temp bulk buffers allocated by RecvZmqClientThread
-          for (auto &bulk : archive->recv) {
-            if (bulk.flags.Any(BULK_XFER) && bulk.data.ptr_) {
-              FreeBuffer(bulk.data);
-            }
+            LoadTaskArchive *archive = it->second.get();
+            archive->ResetBulkIndex();
+            archive->msg_type_ = MsgType::kSerializeOut;
+            *archive >> (*task_ptr);
           }
         }
       } else {
@@ -993,6 +984,13 @@ class IpcManager {
    * Client-side thread that receives completed task outputs via lightbeam
    */
   void RecvZmqClientThread();
+
+  /**
+   * Clean up a response archive and its zmq_msg_t handles
+   * Called from Future::Destroy() to free zero-copy recv buffers
+   * @param net_key Net key (client_task_vaddr_) used as map key
+   */
+  void CleanupResponseArchive(size_t net_key);
 
   /**
    * Start local ZeroMQ server
@@ -1368,11 +1366,14 @@ class IpcManager {
   std::atomic<bool> zmq_recv_running_{false};
 
   // Pending futures (client-side, keyed by net_key)
-  std::unordered_map<size_t, FutureShm*> pending_zmq_futures_;
+  std::unordered_map<size_t, FutureShm *> pending_zmq_futures_;
   std::mutex pending_futures_mutex_;
 
   // Pending response archives (client-side, keyed by net_key)
-  std::unordered_map<size_t, std::unique_ptr<LoadTaskArchive>> pending_response_archives_;
+  // Archives stay alive after Recv() deserialization so that zmq zero-copy
+  // buffers (stored in recv[].desc) remain valid until Future::Destroy().
+  std::unordered_map<size_t, std::unique_ptr<LoadTaskArchive>>
+      pending_response_archives_;
 
   // Hostfile management
   std::unordered_map<u64, Host> hostfile_map_;  // Map node_id -> Host
@@ -1498,17 +1499,16 @@ HSHM_CROSS_FUN inline IpcManager *GetIpcManager() {
 //     // Now CHI_IPC->AllocateBuffer() works for this thread
 //   }
 #if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
-#define CHIMAERA_GPU_INIT(backend, worker_queue)                             \
-  chi::IpcManager *g_ipc_manager_ptr =                                       \
-      chi::IpcManager::GetBlockIpcManager();                                 \
-  /* Compute linear thread ID for 1D/2D/3D blocks */                         \
-  int thread_id = threadIdx.x + threadIdx.y * blockDim.x +                   \
-                  threadIdx.z * blockDim.x * blockDim.y;                     \
-  if (thread_id == 0) {                                                      \
-    hipc::MemoryBackend g_backend_ = backend;                                \
-    g_ipc_manager_ptr->ClientGpuInit(g_backend_, worker_queue);              \
-  }                                                                          \
-  __syncthreads();                                                           \
+#define CHIMAERA_GPU_INIT(backend, worker_queue)                              \
+  chi::IpcManager *g_ipc_manager_ptr = chi::IpcManager::GetBlockIpcManager(); \
+  /* Compute linear thread ID for 1D/2D/3D blocks */                          \
+  int thread_id = threadIdx.x + threadIdx.y * blockDim.x +                    \
+                  threadIdx.z * blockDim.x * blockDim.y;                      \
+  if (thread_id == 0) {                                                       \
+    hipc::MemoryBackend g_backend_ = backend;                                 \
+    g_ipc_manager_ptr->ClientGpuInit(g_backend_, worker_queue);               \
+  }                                                                           \
+  __syncthreads();                                                            \
   chi::IpcManager &g_ipc_manager = *g_ipc_manager_ptr
 #endif
 
@@ -1621,6 +1621,15 @@ template <typename TaskT, typename AllocT>
 void Future<TaskT, AllocT>::Destroy() {
 #if HSHM_IS_HOST
   // Host path: use CHI_IPC thread-local
+  // Clean up zero-copy response archive (frees zmq_msg_t handles)
+  if (!future_shm_.IsNull()) {
+    hipc::FullPtr<FutureShm> fs = CHI_IPC->ToFullPtr(future_shm_);
+    if (!fs.IsNull() &&
+        (fs->origin_ == FutureShm::FUTURE_CLIENT_TCP ||
+         fs->origin_ == FutureShm::FUTURE_CLIENT_IPC)) {
+      CHI_IPC->CleanupResponseArchive(fs->client_task_vaddr_);
+    }
+  }
   // Destroy the task using CHI_IPC->DelTask if not null
   if (!task_ptr_.IsNull()) {
     CHI_IPC->DelTask(task_ptr_);

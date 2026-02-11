@@ -37,6 +37,8 @@ if(WRP_CORE_ENABLE_CUDA OR WRP_CORE_ENABLE_ROCM)
   )
   add_test(NAME test_local_transfer_gpu COMMAND test_local_transfer_gpu)
 
+  add_subdirectory(runtime)
+
 else()
   message(STATUS "GPU tests disabled (WRP_CORE_ENABLE_CUDA and WRP_CORE_ENABLE_ROCM are both OFF)")
 endif()

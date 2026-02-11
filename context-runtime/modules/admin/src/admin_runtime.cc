@@ -45,7 +45,7 @@
 #include <chimaera/pool_manager.h>
 #include <chimaera/task_archives.h>
 #include <chimaera/worker.h>
-#include <hermes_shm/lightbeam/zmq_transport.h>
+#include <hermes_shm/lightbeam/transport_factory_impl.h>
 
 #include <chrono>
 #include <memory>
@@ -98,28 +98,21 @@ chi::TaskResume Runtime::Create(hipc::FullPtr<CreateTask> task,
   // Spawn periodic ClientSend task for client response sending via lightbeam
   client_.AsyncClientSend(chi::PoolQuery::Local(), 100);
 
-  // Register client server FDs with worker epoll for event-driven wakeup
+  // Register client server FDs with worker epoll via PollConnect
   {
     auto *worker = CHI_CUR_WORKER;
     auto *ipc_manager = CHI_IPC;
     if (worker && ipc_manager) {
+      int epoll_fd = worker->GetEpollFd();
       auto *tcp_server = ipc_manager->GetClientServer(chi::IpcMode::kTcp);
       if (tcp_server) {
-        int fd = tcp_server->GetFd();
-        if (fd >= 0) {
-          worker->RegisterEpollFd(fd, EPOLLIN, nullptr);
-          HLOG(kDebug, "Admin: Registered TCP client server fd={} with epoll",
-               fd);
-        }
+        tcp_server->PollConnect(epoll_fd);
+        HLOG(kDebug, "Admin: TCP server PollConnect to worker epoll");
       }
       auto *ipc_server = ipc_manager->GetClientServer(chi::IpcMode::kIpc);
       if (ipc_server) {
-        int fd = ipc_server->GetFd();
-        if (fd >= 0) {
-          worker->RegisterEpollFd(fd, EPOLLIN, nullptr);
-          HLOG(kDebug, "Admin: Registered IPC client server fd={} with epoll",
-               fd);
-        }
+        ipc_server->PollConnect(epoll_fd);
+        HLOG(kDebug, "Admin: IPC server PollConnect to worker epoll");
       }
     }
   }
@@ -515,6 +508,13 @@ void Runtime::SendOut(hipc::FullPtr<chi::Task> origin_task) {
   auto *ipc_manager = CHI_IPC;
   auto *pool_manager = CHI_POOL_MANAGER;
 
+  // Flush deferred deletes from previous invocation (zero-copy send safety)
+  static std::vector<hipc::FullPtr<chi::Task>> deferred_deletes;
+  for (auto &t : deferred_deletes) {
+    ipc_manager->DelTask(t);
+  }
+  deferred_deletes.clear();
+
   // Validate origin_task
   if (origin_task.IsNull()) {
     HLOG(kError, "SendOut: origin_task is null");
@@ -585,8 +585,8 @@ void Runtime::SendOut(hipc::FullPtr<chi::Task> origin_task) {
 
   HLOG(kDebug, "[SendOut] Task {}", origin_task->task_id_);
 
-  // Delete the task after sending outputs
-  ipc_manager->DelTask(origin_task);
+  // Defer task deletion to next invocation for zero-copy send safety
+  deferred_deletes.push_back(origin_task);
 }
 
 /**
@@ -1004,87 +1004,92 @@ chi::TaskResume Runtime::ClientRecv(hipc::FullPtr<ClientRecvTask> task,
     hshm::lbm::Server *server = ipc_manager->GetClientServer(mode);
     if (!server) continue;
 
-    // Non-blocking receive via lightbeam into LoadTaskArchive
-    chi::LoadTaskArchive archive;
-    int rc = server->RecvMetadata(archive);
-    if (rc == EAGAIN) continue;
-    if (rc != 0) {
-      HLOG(kError, "ClientRecv: RecvMetadata failed: {}", rc);
-      continue;
-    }
+    // Accept new socket clients (auto-registered with epoll by PollConnect)
+    server->AcceptNewClients();
 
-    const auto &task_infos = archive.GetTaskInfos();
-    if (task_infos.empty()) {
-      HLOG(kError, "ClientRecv: No task_infos in received message");
-      continue;
-    }
-
-    const auto &info = task_infos[0];
-    chi::PoolId pool_id = info.pool_id_;
-    chi::u32 method_id = info.method_id_;
-
-    // Get container for deserialization
-    chi::Container *container = pool_manager->GetContainer(pool_id);
-    if (!container) {
-      HLOG(kError, "ClientRecv: Container not found for pool_id {}", pool_id);
-      continue;
-    }
-
-    // Allocate recv buffers for each bulk entry
-    for (const auto &send_bulk : archive.send) {
-      hipc::FullPtr<char> buffer = ipc_manager->AllocateBuffer(send_bulk.size);
-      archive.recv.push_back(
-          server->Expose(buffer, send_bulk.size, send_bulk.flags.bits_));
-    }
-
-    // Receive all bulk data
-    rc = server->RecvBulks(archive);
-    if (rc != 0) {
-      HLOG(kError, "ClientRecv: RecvBulks failed: {}", rc);
-      for (auto &bulk : archive.recv) {
-        if (bulk.flags.Any(BULK_XFER) && bulk.data.ptr_) {
-          ipc_manager->FreeBuffer(bulk.data);
-        }
+    // Drain all pending messages from this server
+    while (true) {
+      chi::LoadTaskArchive archive;
+      int rc = server->RecvMetadata(archive);
+      if (rc == EAGAIN) break;
+      if (rc != 0) {
+        HLOG(kError, "ClientRecv: RecvMetadata failed: {}", rc);
+        break;
       }
-      continue;
+
+      const auto &task_infos = archive.GetTaskInfos();
+      if (task_infos.empty()) {
+        HLOG(kError, "ClientRecv: No task_infos in received message");
+        continue;
+      }
+
+      const auto &info = task_infos[0];
+      chi::PoolId pool_id = info.pool_id_;
+      chi::u32 method_id = info.method_id_;
+
+      // Get container for deserialization
+      chi::Container *container = pool_manager->GetContainer(pool_id);
+      if (!container) {
+        HLOG(kError, "ClientRecv: Container not found for pool_id {}", pool_id);
+        continue;
+      }
+
+      // Allocate recv buffers for each bulk entry
+      for (const auto &send_bulk : archive.send) {
+        hipc::FullPtr<char> buffer = ipc_manager->AllocateBuffer(send_bulk.size);
+        archive.recv.push_back(
+            server->Expose(buffer, send_bulk.size, send_bulk.flags.bits_));
+      }
+
+      // Receive all bulk data
+      rc = server->RecvBulks(archive);
+      if (rc != 0) {
+        HLOG(kError, "ClientRecv: RecvBulks failed: {}", rc);
+        for (auto &bulk : archive.recv) {
+          if (bulk.flags.Any(BULK_XFER) && bulk.data.ptr_) {
+            ipc_manager->FreeBuffer(bulk.data);
+          }
+        }
+        continue;
+      }
+
+      // Allocate and deserialize the task
+      hipc::FullPtr<chi::Task> task_ptr =
+          container->AllocLoadTask(method_id, archive);
+
+      if (task_ptr.IsNull()) {
+        HLOG(kError, "ClientRecv: Failed to deserialize task");
+        continue;
+      }
+
+      // Create FutureShm for the task (server-side)
+      hipc::FullPtr<chi::FutureShm> future_shm =
+          ipc_manager->NewObj<chi::FutureShm>();
+      future_shm->pool_id_ = pool_id;
+      future_shm->method_id_ = method_id;
+      future_shm->origin_ = (mode == chi::IpcMode::kTcp)
+                                 ? chi::FutureShm::FUTURE_CLIENT_TCP
+                                 : chi::FutureShm::FUTURE_CLIENT_IPC;
+      future_shm->client_task_vaddr_ = info.task_id_.net_key_;
+      future_shm->capacity_.store(0);
+      // Mark as copied so the worker routes the completed task back via lightbeam
+      // rather than treating it as a runtime-internal task
+      future_shm->flags_.SetBits(chi::FutureShm::FUTURE_WAS_COPIED);
+
+      // Create Future and enqueue to worker
+      chi::Future<chi::Task> future(future_shm.shm_, task_ptr);
+
+      // Map task to lane using scheduler
+      chi::LaneId lane_id =
+          ipc_manager->GetScheduler()->ClientMapTask(ipc_manager, future);
+      auto *worker_queues = ipc_manager->GetTaskQueue();
+      auto &lane_ref = worker_queues->GetLane(lane_id, 0);
+      lane_ref.Push(future);
+      ipc_manager->AwakenWorker(&lane_ref);
+
+      did_work = true;
+      task->tasks_received_++;
     }
-
-    // Allocate and deserialize the task
-    hipc::FullPtr<chi::Task> task_ptr =
-        container->AllocLoadTask(method_id, archive);
-
-    if (task_ptr.IsNull()) {
-      HLOG(kError, "ClientRecv: Failed to deserialize task");
-      continue;
-    }
-
-    // Create FutureShm for the task (server-side)
-    hipc::FullPtr<chi::FutureShm> future_shm =
-        ipc_manager->NewObj<chi::FutureShm>();
-    future_shm->pool_id_ = pool_id;
-    future_shm->method_id_ = method_id;
-    future_shm->origin_ = (mode == chi::IpcMode::kTcp)
-                               ? chi::FutureShm::FUTURE_CLIENT_TCP
-                               : chi::FutureShm::FUTURE_CLIENT_IPC;
-    future_shm->client_task_vaddr_ = info.task_id_.net_key_;
-    future_shm->capacity_.store(0);
-    // Mark as copied so the worker routes the completed task back via lightbeam
-    // rather than treating it as a runtime-internal task
-    future_shm->flags_.SetBits(chi::FutureShm::FUTURE_WAS_COPIED);
-
-    // Create Future and enqueue to worker
-    chi::Future<chi::Task> future(future_shm.shm_, task_ptr);
-
-    // Map task to lane using scheduler
-    chi::LaneId lane_id =
-        ipc_manager->GetScheduler()->ClientMapTask(ipc_manager, future);
-    auto *worker_queues = ipc_manager->GetTaskQueue();
-    auto &lane_ref = worker_queues->GetLane(lane_id, 0);
-    lane_ref.Push(future);
-    ipc_manager->AwakenWorker(&lane_ref);
-
-    did_work = true;
-    task->tasks_received_++;
   }
 
   rctx.did_work_ = did_work;
@@ -1102,6 +1107,16 @@ chi::TaskResume Runtime::ClientSend(hipc::FullPtr<ClientSendTask> task,
   auto *pool_manager = CHI_POOL_MANAGER;
   bool did_work = false;
   task->tasks_sent_ = 0;
+
+  // Flush deferred deletes from previous invocation.
+  // Zero-copy send (zmq_msg_init_data) lets ZMQ's IO thread read from the
+  // task buffer after zmq_msg_send returns. Deferring DelTask by one
+  // invocation guarantees the IO thread has flushed the message.
+  static std::vector<hipc::FullPtr<chi::Task>> deferred_deletes;
+  for (auto &t : deferred_deletes) {
+    ipc_manager->DelTask(t);
+  }
+  deferred_deletes.clear();
 
   // Process both TCP and IPC queues
   for (int mode_idx = 0; mode_idx < 2; ++mode_idx) {
@@ -1150,8 +1165,8 @@ chi::TaskResume Runtime::ClientSend(hipc::FullPtr<ClientSendTask> task,
         HLOG(kError, "ClientSend: lightbeam Send failed: {}", rc);
       }
 
-      // Delete the task copy and free FutureShm
-      ipc_manager->DelTask(origin_task);
+      // Defer task deletion to next invocation for zero-copy send safety
+      deferred_deletes.push_back(origin_task);
 
       did_work = true;
       task->tasks_sent_++;

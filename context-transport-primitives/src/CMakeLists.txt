@@ -9,6 +9,7 @@ set(HSHM_LIBS "")
 set(SRC_FILES
     system_info.cc
     malloc_allocator.cc
+    posix_socket.cc
     # memory_manager.cc  # NOTE: Deleted during hard refactoring
 )
 

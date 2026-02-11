@@ -32,7 +32,7 @@
  */
 
 #include <arpa/inet.h>
-#include <hermes_shm/lightbeam/zmq_transport.h>
+#include <hermes_shm/lightbeam/transport_factory_impl.h>
 #include <ifaddrs.h>
 #include <mpi.h>
 #include <net/if.h>

@@ -30,6 +30,8 @@ USER root
 # Install system packages not provided by conda
 RUN apt-get update && apt-get install -y \
     libelf-dev \
+    redis-server \
+    redis-tools \
     && rm -rf /var/lib/apt/lists/*
 
 # Install MPI (openmpi) - not available via conda in our setup

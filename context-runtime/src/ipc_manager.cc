@@ -42,12 +42,14 @@
 #include <endian.h>
 #include <netdb.h>
 #include <signal.h>
+#include <sys/epoll.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <unistd.h>
 #include <zmq.h>
+#include <hermes_shm/lightbeam/transport_factory_impl.h>
 
 #include <cerrno>
 #include <cstdlib>
@@ -151,13 +153,13 @@ bool IpcManager::ClientInit() {
 
         // PUSH client to send tasks to server's PULL on IPC path
         zmq_client_ = hshm::lbm::TransportFactory::GetClient(
-            ipc_path, hshm::lbm::Transport::kZeroMq, "ipc", 0);
+            ipc_path, hshm::lbm::Transport::kSocket, "ipc", 0);
         HLOG(kInfo, "IpcManager: IPC lightbeam client connected to {}",
              ipc_path);
 
         // PULL server to receive responses from server on IPC response path
         zmq_response_server_ = hshm::lbm::TransportFactory::GetServer(
-            ipc_response_path, hshm::lbm::Transport::kZeroMq, "ipc", 0);
+            ipc_response_path, hshm::lbm::Transport::kSocket, "ipc", 0);
         HLOG(kInfo, "IpcManager: IPC response server bound on {}",
              ipc_response_path);
       }
@@ -290,7 +292,7 @@ bool IpcManager::ServerInit() {
       std::string ipc_path =
           "/tmp/chimaera_" + std::to_string(port) + ".ipc";
       client_ipc_server_ = hshm::lbm::TransportFactory::GetServer(
-          ipc_path, hshm::lbm::Transport::kZeroMq, "ipc", 0);
+          ipc_path, hshm::lbm::Transport::kSocket, "ipc", 0);
       HLOG(kInfo, "IpcManager: IPC lightbeam server bound on {}", ipc_path);
     } catch (const std::exception &e) {
       HLOG(kError, "IpcManager::ServerInit: Failed to bind IPC server: {}",
@@ -1029,6 +1031,16 @@ hshm::lbm::Server *IpcManager::GetClientServer(IpcMode mode) const {
 }
 
 hshm::lbm::Client *IpcManager::GetClientResponseClient(IpcMode mode) {
+  // Fast path: check if already initialized without taking the lock
+  if (mode == IpcMode::kTcp) {
+    if (client_tcp_response_) return client_tcp_response_.get();
+  } else if (mode == IpcMode::kIpc) {
+    if (client_ipc_response_) return client_ipc_response_.get();
+  } else {
+    return nullptr;
+  }
+
+  // Slow path: take lock and initialize
   std::lock_guard<std::mutex> lock(client_response_mutex_);
   auto *config = CHI_CONFIG_MANAGER;
   u32 port = config->GetPort();
@@ -1053,7 +1065,7 @@ hshm::lbm::Client *IpcManager::GetClientResponseClient(IpcMode mode) {
         std::string ipc_response_path =
             "/tmp/chimaera_" + std::to_string(port) + "_response.ipc";
         client_ipc_response_ = hshm::lbm::TransportFactory::GetClient(
-            ipc_response_path, hshm::lbm::Transport::kZeroMq, "ipc", 0);
+            ipc_response_path, hshm::lbm::Transport::kSocket, "ipc", 0);
         HLOG(kInfo, "IpcManager: Created IPC response client to {}",
              ipc_response_path);
       } catch (const std::exception &e) {
@@ -1715,75 +1727,93 @@ void IpcManager::RecvZmqClientThread() {
     return;
   }
 
+  // Set up epoll via transport's PollConnect
+  int epoll_fd = epoll_create1(0);
+  zmq_response_server_->PollConnect(epoll_fd);
+
   while (zmq_recv_running_.load()) {
-    // Non-blocking receive via lightbeam into LoadTaskArchive
-    auto archive = std::make_unique<LoadTaskArchive>();
-    int rc = zmq_response_server_->RecvMetadata(*archive);
-    if (rc == EAGAIN) {
-      // No message available - sleep briefly to avoid busy-spinning
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
-      continue;
-    }
-    if (rc != 0) {
-      HLOG(kError, "RecvZmqClientThread: RecvMetadata failed: {}", rc);
-      continue;
-    }
+    // Accept new clients (auto-registered with epoll by PollConnect)
+    zmq_response_server_->AcceptNewClients();
 
-    // Allocate temp buffers for each bulk entry with BULK_XFER
-    for (const auto &send_bulk : archive->send) {
-      hipc::FullPtr<char> buffer = AllocateBuffer(send_bulk.size);
-      archive->recv.push_back(
-          zmq_response_server_->Expose(buffer, send_bulk.size, send_bulk.flags.bits_));
-    }
-
-    // Receive all bulk data
-    rc = zmq_response_server_->RecvBulks(*archive);
-    if (rc != 0) {
-      HLOG(kError, "RecvZmqClientThread: RecvBulks failed: {}", rc);
-      // Free allocated buffers on error
-      for (auto &bulk : archive->recv) {
-        if (bulk.flags.Any(BULK_XFER) && bulk.data.ptr_) {
-          FreeBuffer(bulk.data);
-        }
+    // Drain all available messages first
+    bool drained_any = false;
+    bool got_message = true;
+    while (got_message) {
+      got_message = false;
+      auto archive = std::make_unique<LoadTaskArchive>();
+      int rc = zmq_response_server_->RecvMetadata(*archive);
+      if (rc == EAGAIN) break;
+      if (rc != 0) {
+        HLOG(kError, "RecvZmqClientThread: RecvMetadata failed: {}", rc);
+        continue;
       }
-      continue;
-    }
+      got_message = true;
+      drained_any = true;
 
-    // Look up pending future by net_key from task_infos
-    if (archive->task_infos_.empty()) {
-      HLOG(kError, "RecvZmqClientThread: No task_infos in response");
-      continue;
-    }
-    size_t net_key = archive->task_infos_[0].task_id_.net_key_;
-
-    std::lock_guard<std::mutex> lock(pending_futures_mutex_);
-    auto it = pending_zmq_futures_.find(net_key);
-    if (it == pending_zmq_futures_.end()) {
-      HLOG(kError, "RecvZmqClientThread: No pending future for net_key {}",
-           net_key);
-      // Free allocated buffers
-      for (auto &bulk : archive->recv) {
-        if (bulk.flags.Any(BULK_XFER) && bulk.data.ptr_) {
-          FreeBuffer(bulk.data);
-        }
+      // Set up recv entries with null data.ptr_ for zero-copy recv
+      for (const auto &send_bulk : archive->send) {
+        hshm::lbm::Bulk bulk;
+        bulk.size = send_bulk.size;
+        bulk.flags = send_bulk.flags;
+        bulk.data.ptr_ = nullptr;  // Null triggers zero-copy in RecvBulks
+        archive->recv.push_back(bulk);
       }
-      continue;
+
+      // Receive all bulk data (zero-copy: zmq owns the buffers)
+      rc = zmq_response_server_->RecvBulks(*archive);
+      if (rc != 0) {
+        HLOG(kError, "RecvZmqClientThread: RecvBulks failed: {}", rc);
+        zmq_response_server_->ClearRecvHandles(*archive);
+        continue;
+      }
+
+      // Look up pending future by net_key from task_infos
+      if (archive->task_infos_.empty()) {
+        HLOG(kError, "RecvZmqClientThread: No task_infos in response");
+        continue;
+      }
+      size_t net_key = archive->task_infos_[0].task_id_.net_key_;
+
+      std::lock_guard<std::mutex> lock(pending_futures_mutex_);
+      auto it = pending_zmq_futures_.find(net_key);
+      if (it == pending_zmq_futures_.end()) {
+        HLOG(kError, "RecvZmqClientThread: No pending future for net_key {}",
+             net_key);
+        zmq_response_server_->ClearRecvHandles(*archive);
+        continue;
+      }
+
+      FutureShm *future_shm = it->second;
+
+      // Store the archive for Recv() to pick up
+      pending_response_archives_[net_key] = std::move(archive);
+
+      // Memory fence before setting complete
+      std::atomic_thread_fence(std::memory_order_release);
+
+      // Signal completion
+      future_shm->flags_.SetBits(FutureShm::FUTURE_NEW_DATA |
+                                  FutureShm::FUTURE_COMPLETE);
+
+      // Remove from pending futures map
+      pending_zmq_futures_.erase(it);
     }
 
-    FutureShm *future_shm = it->second;
+    // Only block on epoll when the drain loop found nothing;
+    // if we just processed messages, loop back immediately.
+    if (!drained_any) {
+      zmq_response_server_->PollWait(10);
+    }
+  }
+  close(epoll_fd);
+}
 
-    // Store the archive for Recv() to pick up
-    pending_response_archives_[net_key] = std::move(archive);
-
-    // Memory fence before setting complete
-    std::atomic_thread_fence(std::memory_order_release);
-
-    // Signal completion
-    future_shm->flags_.SetBits(FutureShm::FUTURE_NEW_DATA |
-                                FutureShm::FUTURE_COMPLETE);
-
-    // Remove from pending futures map
-    pending_zmq_futures_.erase(it);
+void IpcManager::CleanupResponseArchive(size_t net_key) {
+  std::lock_guard<std::mutex> lock(pending_futures_mutex_);
+  auto it = pending_response_archives_.find(net_key);
+  if (it != pending_response_archives_.end()) {
+    zmq_response_server_->ClearRecvHandles(*(it->second));
+    pending_response_archives_.erase(it);
   }
 }
 

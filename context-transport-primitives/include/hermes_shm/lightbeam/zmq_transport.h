@@ -36,64 +36,37 @@
 #include <unistd.h>
 #include <zmq.h>
 
-#include <cereal/archives/binary.hpp>
-#include <cereal/types/string.hpp>
-#include <cereal/types/vector.hpp>
 #include <chrono>
 #include <cstring>
 #include <memory>
 #include <mutex>
-#include <sstream>
 #include <thread>
 
 #include "hermes_shm/util/logging.h"
 #include "lightbeam.h"
 
-// Cereal serialization for Bulk
-// Note: data is transferred separately via bulk transfer mechanism, not
-// serialized here
-namespace cereal {
-template <class Archive>
-void serialize(Archive& ar, hshm::lbm::Bulk& bulk) {
-  ar(bulk.size, bulk.flags);
-}
-
-template <class Archive>
-void serialize(Archive& ar, hshm::lbm::LbmMeta& meta) {
-  ar(meta.send, meta.recv, meta.send_bulks, meta.recv_bulks);
-}
-}  // namespace cereal
-
 namespace hshm::lbm {
 
-// Lightbeam context flags for Send operations
-constexpr uint32_t LBM_SYNC =
-    0x1; /**< Synchronous send (wait for completion) */
+/** No-op free callback for zmq_msg_init_data zero-copy sends */
+static inline void zmq_noop_free(void *data, void *hint) {
+  (void)data;
+  (void)hint;
+}
 
-/**
- * Context for lightbeam operations
- * Controls behavior (sync vs async, timeouts)
- */
-struct LbmContext {
-  uint32_t flags;      /**< Combination of LBM_* flags */
-  int timeout_ms;      /**< Timeout in milliseconds (0 = no timeout) */
-
-  LbmContext() : flags(0), timeout_ms(0) {}
-
-  explicit LbmContext(uint32_t f) : flags(f), timeout_ms(0) {}
-
-  LbmContext(uint32_t f, int timeout) : flags(f), timeout_ms(timeout) {}
-
-  bool IsSync() const { return (flags & LBM_SYNC) != 0; }
-  bool HasTimeout() const { return timeout_ms > 0; }
-};
+/** Free zmq_msg_t handles stored in Bulk::desc from zero-copy recv */
+static inline void ClearZmqRecvHandles(LbmMeta &meta) {
+  for (auto &bulk : meta.recv) {
+    if (bulk.desc) {
+      zmq_msg_t *msg = static_cast<zmq_msg_t*>(bulk.desc);
+      zmq_msg_close(msg);
+      delete msg;
+      bulk.desc = nullptr;
+    }
+  }
+}
 
 class ZeroMqClient : public Client {
  private:
-  /**
-   * Get or create the shared ZeroMQ context for all clients
-   * Uses a static local variable for thread-safe singleton initialization
-   */
   static void* GetSharedContext() {
     static void* shared_ctx = nullptr;
     static std::mutex ctx_mutex;
@@ -101,7 +74,6 @@ class ZeroMqClient : public Client {
     std::lock_guard<std::mutex> lock(ctx_mutex);
     if (!shared_ctx) {
       shared_ctx = zmq_ctx_new();
-      // Set I/O threads to 2 for better throughput
       zmq_ctx_set(shared_ctx, ZMQ_IO_THREADS, 2);
       HLOG(kInfo, "[ZeroMqClient] Created shared context with 2 I/O threads");
     }
@@ -117,6 +89,7 @@ class ZeroMqClient : public Client {
         ctx_(GetSharedContext()),
         owns_ctx_(false),
         socket_(zmq_socket(ctx_, ZMQ_PUSH)) {
+    type_ = Transport::kZeroMq;
     std::string full_url;
     if (protocol_ == "ipc") {
       full_url = "ipc://" + addr_;
@@ -125,15 +98,14 @@ class ZeroMqClient : public Client {
     }
     HLOG(kDebug, "ZeroMqClient connecting to URL: {}", full_url);
 
-    // Disable ZMQ_IMMEDIATE - let messages queue until connection is
-    // established With ZMQ_IMMEDIATE=1, messages may be dropped if no peer is
-    // immediately available
     int immediate = 0;
     zmq_setsockopt(socket_, ZMQ_IMMEDIATE, &immediate, sizeof(immediate));
 
-    // Set a reasonable send timeout (5 seconds)
     int timeout = 5000;
     zmq_setsockopt(socket_, ZMQ_SNDTIMEO, &timeout, sizeof(timeout));
+
+    int sndbuf = 4 * 1024 * 1024;
+    zmq_setsockopt(socket_, ZMQ_SNDBUF, &sndbuf, sizeof(sndbuf));
 
     int rc = zmq_connect(socket_, full_url.c_str());
     if (rc == -1) {
@@ -143,10 +115,8 @@ class ZeroMqClient : public Client {
       throw std::runtime_error(err);
     }
 
-    // Wait for socket to become writable (connection established)
-    // zmq_connect is asynchronous, so we use poll to verify readiness
     zmq_pollitem_t poll_item = {socket_, 0, ZMQ_POLLOUT, 0};
-    int poll_timeout_ms = 5000;  // 5 second timeout for connection
+    int poll_timeout_ms = 5000;
     int poll_rc = zmq_poll(&poll_item, 1, poll_timeout_ms);
 
     if (poll_rc < 0) {
@@ -168,16 +138,13 @@ class ZeroMqClient : public Client {
     HLOG(kDebug, "ZeroMqClient destructor - closing socket to {}:{}", addr_,
          port_);
 
-    // Set linger to ensure any remaining messages are sent
     int linger = 5000;
     zmq_setsockopt(socket_, ZMQ_LINGER, &linger, sizeof(linger));
 
     zmq_close(socket_);
-    // Don't destroy the shared context - it's shared across all clients
     HLOG(kDebug, "ZeroMqClient destructor - socket closed");
   }
 
-  // Base Expose implementation - accepts hipc::FullPtr
   Bulk Expose(const hipc::FullPtr<char>& ptr, size_t data_size,
               u32 flags) override {
     Bulk bulk;
@@ -189,7 +156,6 @@ class ZeroMqClient : public Client {
 
   template <typename MetaT>
   int Send(MetaT& meta, const LbmContext& ctx = LbmContext()) {
-    // Serialize metadata (includes both send and recv vectors)
     std::ostringstream oss(std::ios::binary);
     {
       cereal::BinaryOutputArchive ar(oss);
@@ -197,15 +163,10 @@ class ZeroMqClient : public Client {
     }
     std::string meta_str = oss.str();
 
-    // Use pre-computed send_bulks count for ZMQ_SNDMORE handling
     size_t write_bulk_count = meta.send_bulks;
 
-    // IMPORTANT: Always use blocking send for distributed messaging
-    // ZMQ_DONTWAIT with newly-created connections causes messages to be lost
-    // because the connection may not be established when send is called
-    int base_flags = 0;  // Use blocking sends
+    int base_flags = 0;
 
-    // Send metadata - use ZMQ_SNDMORE only if there are WRITE bulks to follow
     int flags = base_flags;
     if (write_bulk_count > 0) {
       flags |= ZMQ_SNDMORE;
@@ -218,11 +179,10 @@ class ZeroMqClient : public Client {
       return zmq_errno();
     }
 
-    // Send only bulks marked with BULK_XFER
     size_t sent_count = 0;
     for (size_t i = 0; i < meta.send.size(); ++i) {
       if (!meta.send[i].flags.Any(BULK_XFER)) {
-        continue;  // Skip bulks not marked for WRITE
+        continue;
       }
 
       flags = base_flags;
@@ -231,14 +191,18 @@ class ZeroMqClient : public Client {
         flags |= ZMQ_SNDMORE;
       }
 
-      rc = zmq_send(socket_, meta.send[i].data.ptr_, meta.send[i].size, flags);
+      zmq_msg_t msg;
+      zmq_msg_init_data(&msg, meta.send[i].data.ptr_, meta.send[i].size,
+                         zmq_noop_free, nullptr);
+      rc = zmq_msg_send(&msg, socket_, flags);
       if (rc == -1) {
         HLOG(kError, "ZeroMqClient::Send - bulk {} FAILED: {}", i,
              zmq_strerror(zmq_errno()));
+        zmq_msg_close(&msg);
         return zmq_errno();
       }
     }
-    return 0;  // Success
+    return 0;
   }
 
  private:
@@ -246,8 +210,7 @@ class ZeroMqClient : public Client {
   std::string protocol_;
   int port_;
   void* ctx_;
-  bool owns_ctx_;  // Whether this client owns the context (should destroy on
-                   // cleanup)
+  bool owns_ctx_;
   void* socket_;
 };
 
@@ -259,7 +222,14 @@ class ZeroMqServer : public Server {
         protocol_(protocol),
         port_(port),
         ctx_(zmq_ctx_new()),
-        socket_(zmq_socket(ctx_, ZMQ_PULL)) {
+        socket_(nullptr) {
+    type_ = Transport::kZeroMq;
+    zmq_ctx_set(ctx_, ZMQ_IO_THREADS, 2);
+    socket_ = zmq_socket(ctx_, ZMQ_PULL);
+
+    int rcvbuf = 4 * 1024 * 1024;
+    zmq_setsockopt(socket_, ZMQ_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+
     std::string full_url;
     if (protocol_ == "ipc") {
       full_url = "ipc://" + addr_;
@@ -284,7 +254,6 @@ class ZeroMqServer : public Server {
     zmq_ctx_destroy(ctx_);
   }
 
-  // Base Expose implementation - accepts hipc::FullPtr
   Bulk Expose(const hipc::FullPtr<char>& ptr, size_t data_size,
               u32 flags) override {
     Bulk bulk;
@@ -294,14 +263,8 @@ class ZeroMqServer : public Server {
     return bulk;
   }
 
-  /**
-   * Receive and deserialize metadata from the network
-   * @param meta The metadata structure to populate
-   * @return 0 on success, EAGAIN if no message, -1 on deserialization error
-   */
   template <typename MetaT>
   int RecvMetadata(MetaT& meta) {
-    // Receive metadata message (non-blocking)
     zmq_msg_t msg;
     zmq_msg_init(&msg);
     int rc = zmq_msg_recv(&msg, socket_, ZMQ_DONTWAIT);
@@ -312,7 +275,6 @@ class ZeroMqServer : public Server {
       return err;
     }
 
-    // Deserialize metadata
     size_t msg_size = zmq_msg_size(&msg);
     try {
       std::string meta_str(static_cast<char*>(zmq_msg_data(&msg)), msg_size);
@@ -324,18 +286,12 @@ class ZeroMqServer : public Server {
            "ZeroMQ RecvMetadata: Deserialization failed - {} (msg_size={})",
            e.what(), msg_size);
       zmq_msg_close(&msg);
-      return -1;  // Deserialization error
+      return -1;
     }
     zmq_msg_close(&msg);
-    return 0;  // Success
+    return 0;
   }
 
-  /**
-   * Receive bulk data into pre-allocated buffers
-   * Uses meta.send_bulks (from sender's metadata) to know exact count
-   * @param meta The metadata with recv buffers already populated
-   * @return 0 on success, errno on failure
-   */
   template <typename MetaT>
   int RecvBulks(MetaT& meta) {
     size_t recv_count = 0;
@@ -344,23 +300,46 @@ class ZeroMqServer : public Server {
         continue;
       }
       recv_count++;
-      // Use ZMQ_RCVMORE if more bulks remain
       int flags = (recv_count < meta.send_bulks) ? ZMQ_RCVMORE : 0;
-      int rc = zmq_recv(socket_, meta.recv[i].data.ptr_, meta.recv[i].size, flags);
-      if (rc == -1) {
-        return zmq_errno();
+
+      if (meta.recv[i].data.ptr_) {
+        zmq_msg_t zmq_msg;
+        zmq_msg_init(&zmq_msg);
+        int rc = zmq_msg_recv(&zmq_msg, socket_, flags);
+        if (rc == -1) {
+          int err = zmq_errno();
+          zmq_msg_close(&zmq_msg);
+          return err;
+        }
+        memcpy(meta.recv[i].data.ptr_,
+               zmq_msg_data(&zmq_msg), meta.recv[i].size);
+        zmq_msg_close(&zmq_msg);
+      } else {
+        zmq_msg_t *zmq_msg = new zmq_msg_t;
+        zmq_msg_init(zmq_msg);
+        int rc = zmq_msg_recv(zmq_msg, socket_, flags);
+        if (rc == -1) {
+          int err = zmq_errno();
+          zmq_msg_close(zmq_msg);
+          delete zmq_msg;
+          return err;
+        }
+        char *zmq_data = static_cast<char*>(zmq_msg_data(zmq_msg));
+        meta.recv[i].data.ptr_ = zmq_data;
+        meta.recv[i].data.shm_.alloc_id_ = hipc::AllocatorId::GetNull();
+        meta.recv[i].data.shm_.off_ = reinterpret_cast<size_t>(zmq_data);
+        meta.recv[i].desc = zmq_msg;
       }
     }
-    return 0;  // Success
+    return 0;
+  }
+
+  void ClearRecvHandles(LbmMeta& meta) override {
+    ClearZmqRecvHandles(meta);
   }
 
   std::string GetAddress() const override { return addr_; }
 
-  /**
-   * Get the file descriptor for the ZeroMQ socket
-   * Can be used with epoll for efficient event-driven I/O
-   * @return File descriptor for the socket
-   */
   int GetFd() const override {
     int fd;
     size_t fd_size = sizeof(fd);
@@ -375,61 +354,6 @@ class ZeroMqServer : public Server {
   void* ctx_;
   void* socket_;
 };
-
-// --- Base Class Template Implementations ---
-// These delegate to the derived class implementations
-template <typename MetaT>
-int Client::Send(MetaT& meta, const LbmContext& ctx) {
-  // Forward to ZeroMqClient implementation with provided context
-  return static_cast<ZeroMqClient*>(this)->Send(meta, ctx);
-}
-
-template <typename MetaT>
-int Server::RecvMetadata(MetaT& meta) {
-  return static_cast<ZeroMqServer*>(this)->RecvMetadata(meta);
-}
-
-template <typename MetaT>
-int Server::RecvBulks(MetaT& meta) {
-  return static_cast<ZeroMqServer*>(this)->RecvBulks(meta);
-}
-
-// --- TransportFactory Implementations ---
-inline std::unique_ptr<Client> TransportFactory::GetClient(
-    const std::string& addr, Transport t, const std::string& protocol,
-    int port) {
-  if (t == Transport::kZeroMq) {
-    return std::make_unique<ZeroMqClient>(addr, protocol, port);
-  }
-  throw std::runtime_error("Unsupported transport type");
-}
-
-inline std::unique_ptr<Client> TransportFactory::GetClient(
-    const std::string& addr, Transport t, const std::string& protocol, int port,
-    const std::string& domain) {
-  if (t == Transport::kZeroMq) {
-    return std::make_unique<ZeroMqClient>(addr, protocol, port);
-  }
-  throw std::runtime_error("Unsupported transport type");
-}
-
-inline std::unique_ptr<Server> TransportFactory::GetServer(
-    const std::string& addr, Transport t, const std::string& protocol,
-    int port) {
-  if (t == Transport::kZeroMq) {
-    return std::make_unique<ZeroMqServer>(addr, protocol, port);
-  }
-  throw std::runtime_error("Unsupported transport type");
-}
-
-inline std::unique_ptr<Server> TransportFactory::GetServer(
-    const std::string& addr, Transport t, const std::string& protocol, int port,
-    const std::string& domain) {
-  if (t == Transport::kZeroMq) {
-    return std::make_unique<ZeroMqServer>(addr, protocol, port);
-  }
-  throw std::runtime_error("Unsupported transport type");
-}
 
 }  // namespace hshm::lbm
 
