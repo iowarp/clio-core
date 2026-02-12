@@ -957,8 +957,6 @@ chi::TaskResume Runtime::GetBlob(hipc::FullPtr<GetBlobTask> task,
                  blob_info_ptr->last_modified_, now);
 
     task->return_code_ = 0;
-    HLOG(kDebug, "GetBlob successful: name={}, offset={}, size={}, blocks={}",
-         blob_name, offset, size, num_blocks);
 
   } catch (const std::exception &e) {
     task->return_code_ = 1;

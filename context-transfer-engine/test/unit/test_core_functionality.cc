@@ -325,7 +325,7 @@ class CTECoreFunctionalTestFixture {
    * Helper method to wait for task completion with timeout
    */
   template <typename TaskType>
-  bool WaitForTaskCompletion(chi::Future<TaskType> task,
+  bool WaitForTaskCompletion(chi::Future<TaskType> &task,
                              int timeout_ms = 5000) {
     (void)timeout_ms;  // Parameter kept for API consistency
     task.Wait();
@@ -2407,15 +2407,7 @@ TEST_CASE("FUNCTIONAL - Distributed Execution Validation",
         tag_id, blob_name, 0, blob_size, 0, get_blob_data_ptr);
 
     REQUIRE(!get_task.IsNull());
-    printf("TEST: GetBlob task_ptr=%p, blob_data_.off_=%lu BEFORE Wait\n",
-           (void*)get_task.get(), get_task->blob_data_.off_.load());
-    fflush(stdout);
-
     REQUIRE(fixture->WaitForTaskCompletion(get_task, 10000));
-
-    printf("TEST: GetBlob task_ptr=%p, blob_data_.off_=%lu AFTER Wait\n",
-           (void*)get_task.get(), get_task->blob_data_.off_.load());
-    fflush(stdout);
 
     REQUIRE(get_task->return_code_ == 0);
 

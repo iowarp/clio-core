@@ -46,6 +46,9 @@
 #include <vector>
 #include <chrono>
 #include <thread>
+#include <sys/wait.h>
+#include <signal.h>
+#include <fcntl.h>
 
 #include "../simple_test.h"
 
@@ -55,6 +58,66 @@ bool initialize_chimaera() {
   return chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
 }
 
+/**
+ * Start a Chimaera server in a forked child process
+ * @return Server process PID
+ */
+pid_t StartServerProcess() {
+  pid_t server_pid = fork();
+  if (server_pid == 0) {
+    // Redirect child output to prevent log flooding
+    freopen("/dev/null", "w", stdout);  // NOLINT
+    freopen("/dev/null", "w", stderr);  // NOLINT
+    setenv("CHIMAERA_WITH_RUNTIME", "1", 1);
+    bool success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kServer, true);
+    if (!success) {
+      _exit(1);
+    }
+    sleep(300);
+    _exit(0);
+  }
+  return server_pid;
+}
+
+/**
+ * Wait for the server's shared memory segment to become available
+ * @param max_attempts Maximum polling attempts
+ * @return True if server is ready
+ */
+bool WaitForServer(int max_attempts = 50) {
+  const char *user = std::getenv("USER");
+  std::string memfd_path =
+      std::string("/tmp/chimaera_memfd/chi_main_segment_") +
+      (user ? user : "");
+  for (int i = 0; i < max_attempts; ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    int fd = open(memfd_path.c_str(), O_RDONLY);
+    if (fd >= 0) {
+      close(fd);
+      std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Kill the server process and clean up shared memory
+ * @param server_pid PID of the server process
+ */
+void CleanupServer(pid_t server_pid) {
+  if (server_pid > 0) {
+    kill(server_pid, SIGTERM);
+    int status;
+    waitpid(server_pid, &status, 0);
+    const char *user = std::getenv("USER");
+    std::string memfd_path =
+        std::string("/tmp/chimaera_memfd/chi_main_segment_") +
+        (user ? user : "");
+    unlink(memfd_path.c_str());
+  }
+}
+
 // Constants for testing
 constexpr size_t k1MB = 1ULL * 1024 * 1024;
 constexpr size_t k100MB = 100ULL * 1024 * 1024;
@@ -62,6 +125,54 @@ constexpr size_t k500MB = 500ULL * 1024 * 1024;
 constexpr size_t k1GB = 1ULL * 1024 * 1024 * 1024;
 constexpr size_t k1_5GB = 1536ULL * 1024 * 1024;  // 1.5 GB
 }  // namespace
+
+// This test MUST be first: it forks server+client processes and requires
+// that no runtime has been initialized in the parent yet.
+TEST_CASE("Per-process shared memory GetClientShmInfo",
+          "[ipc][per_process_shm][shm_info][fork]") {
+  // Fork a server, then fork a client child to test GetClientShmInfo.
+  // Both children start with clean process state (no prior CHIMAERA_INIT).
+  pid_t server_pid = StartServerProcess();
+  REQUIRE(server_pid > 0);
+  REQUIRE(WaitForServer());
+
+  // Fork a client child to test GetClientShmInfo
+  pid_t client_pid = fork();
+  if (client_pid == 0) {
+    freopen("/dev/null", "w", stdout);  // NOLINT
+    freopen("/dev/null", "w", stderr);  // NOLINT
+    setenv("CHIMAERA_WITH_RUNTIME", "0", 1);
+    setenv("CHI_IPC_MODE", "SHM", 1);
+    if (!chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, false)) {
+      _exit(1);
+    }
+    auto *client_ipc = CHI_IPC;
+    if (!client_ipc) _exit(2);
+
+    auto buffer = client_ipc->AllocateBuffer(k1MB);
+    if (buffer.IsNull()) _exit(3);
+
+    chi::ClientShmInfo info = client_ipc->GetClientShmInfo(0);
+    if (info.owner_pid != getpid()) _exit(4);
+    if (info.shm_index != 0) _exit(5);
+    if (info.size == 0) _exit(6);
+
+    std::string expected_prefix =
+        "chimaera_" + std::to_string(getpid()) + "_";
+    if (info.shm_name.find(expected_prefix) != 0) _exit(7);
+
+    _exit(0);  // Success
+  }
+
+  // Parent: wait for client child
+  int status = 0;
+  waitpid(client_pid, &status, 0);
+  int exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+  INFO("Client child exit code: " << exit_code);
+  REQUIRE(exit_code == 0);
+
+  CleanupServer(server_pid);
+}
 
 TEST_CASE("Per-process shared memory AllocateBuffer medium sizes",
           "[ipc][per_process_shm][allocate][medium]") {
@@ -387,27 +498,6 @@ TEST_CASE("Per-process shared memory ClientShmInfo",
     REQUIRE(info.size == k100MB);
 
     INFO("ClientShmInfo struct test passed");
-  }
-
-  SECTION("GetClientShmInfo retrieves correct info") {
-    // First ensure we have at least one segment by allocating
-    auto buffer = ipc_manager->AllocateBuffer(k1MB);
-    REQUIRE_FALSE(buffer.IsNull());
-
-    // Get info for segment 0
-    chi::ClientShmInfo info = ipc_manager->GetClientShmInfo(0);
-
-    // Verify basic properties
-    REQUIRE(info.owner_pid == getpid());
-    REQUIRE(info.shm_index == 0);
-    REQUIRE(info.size > 0);
-
-    // Name should follow format chimaera_{pid}_{index}
-    std::string expected_prefix = "chimaera_" + std::to_string(getpid()) + "_";
-    REQUIRE(info.shm_name.find(expected_prefix) == 0);
-
-    INFO("Shared memory name: " << info.shm_name);
-    INFO("GetClientShmInfo test passed");
   }
 }
 
