@@ -32,6 +32,7 @@
  */
 
 #pragma once
+#if HSHM_ENABLE_LIGHTBEAM
 #include "lightbeam.h"
 #include "shm_transport.h"
 #include "socket_transport.h"
@@ -218,3 +219,4 @@ inline std::unique_ptr<Server> TransportFactory::GetServer(
 }
 
 }  // namespace hshm::lbm
+#endif  // HSHM_ENABLE_LIGHTBEAM
