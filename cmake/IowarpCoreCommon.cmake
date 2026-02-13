@@ -46,6 +46,7 @@ macro(wrp_core_enable_cuda CXX_STANDARD)
 
     message(STATUS "USING CUDA ARCH: ${CMAKE_CUDA_ARCHITECTURES}")
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --forward-unknown-to-host-compiler -diag-suppress=177,20014,20011,20012")
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler=-Wno-format,-Wno-pedantic,-Wno-sign-compare,-Wno-unused-but-set-variable")
     enable_language(CUDA)
 
     set(CMAKE_CUDA_USE_RESPONSE_FILE_FOR_INCLUDES 0)

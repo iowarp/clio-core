@@ -639,8 +639,11 @@ endif()
 # Add compiler flags following Google C++ style guide
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -pedantic")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC")
-# Disable some problematic warnings for external dependencies
+# Disable warnings that are false positives or from external dependencies
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-unused-parameter -Wno-unused-variable -Wno-reorder")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-pedantic -Wno-sign-compare -Wno-missing-field-initializers")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-unused-but-set-variable -Wno-unused-function -Wno-cast-function-type")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-self-move -Wno-format")
 
 # Debug configuration
 set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g -O0 -DDEBUG")

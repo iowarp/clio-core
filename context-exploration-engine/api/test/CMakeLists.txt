@@ -156,8 +156,9 @@ if(TARGET wrp_cee)
   )
 
   set_tests_properties(test_context_retrieve_roundtrip_python PROPERTIES
-    LABELS "cee;api;python;retrieve;regression"
+    LABELS "cee;api;python;retrieve;regression;manual"
     TIMEOUT 120
+    DISABLED TRUE  # Requires externally running IOWarp runtime
   )
 
   install(FILES test_context_retrieve_roundtrip.py

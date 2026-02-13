@@ -529,9 +529,11 @@ if(HSHM_ENABLE_CUDA OR HSHM_ENABLE_ROCM)
     $<TARGET_OBJECTS:${GPU_SUBMISSION_TEST_TARGET}_gpu_kernels>
   )
 
-  # Disable CUDA for CPU source to avoid needing CUDA headers
+  # CPU sources need CUDA disabled to avoid __device__ errors from CXX compiler.
+  # -U first removes the target-level HSHM_ENABLE_CUDA=1 from hshm::cuda_cxx
+  # to avoid a redefinition warning.
   set_source_files_properties(${GPU_SUBMISSION_TEST_CPU_SOURCES} PROPERTIES
-    COMPILE_DEFINITIONS "HSHM_ENABLE_CUDA=0"
+    COMPILE_OPTIONS "-UHSHM_ENABLE_CUDA;-DHSHM_ENABLE_CUDA=0"
   )
 
   target_include_directories(${GPU_SUBMISSION_TEST_TARGET} PRIVATE
