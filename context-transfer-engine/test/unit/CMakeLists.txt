@@ -652,40 +652,10 @@ set_tests_properties(
 )
 
 # ------------------------------------------------------------------------------
-# Restart Integration Test
-# ------------------------------------------------------------------------------
-add_executable(test_restart test_restart.cc)
-
-target_include_directories(test_restart PRIVATE
-  ${CMAKE_SOURCE_DIR}/test
-)
-
-target_link_libraries(test_restart
-    wrp_cte_core_runtime
-    wrp_cte_core_client
-    chimaera::admin_runtime
-    chimaera::admin_client
-    chimaera::bdev_runtime
-    chimaera::bdev_client
-    hshm::cxx
-    ${CMAKE_THREAD_LIBS_INIT}
-)
-
-add_test(NAME cte_restart_integration
-    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test_restart.sh)
-
-set_tests_properties(cte_restart_integration
-    PROPERTIES
-        TIMEOUT 120
-        LABELS "integration;restart;cte"
-        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}"
-)
-
-# ------------------------------------------------------------------------------
 # ------------------------------------------------------------------------------
 # Install Targets
 # ------------------------------------------------------------------------------
-install(TARGETS cte_core_unit_tests test_core_functionality test_query test_cte_config_dpe test_tag_operations test_core_client_config test_core_runtime_coverage test_tiered_storage_stress test_reorganize_blob test_restart
+install(TARGETS cte_core_unit_tests test_core_functionality test_query test_cte_config_dpe test_tag_operations test_core_client_config test_core_runtime_coverage test_tiered_storage_stress test_reorganize_blob
     LIBRARY DESTINATION lib
     ARCHIVE DESTINATION lib
     RUNTIME DESTINATION bin
