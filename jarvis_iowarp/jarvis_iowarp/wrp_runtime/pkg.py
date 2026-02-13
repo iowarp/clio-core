@@ -61,6 +61,13 @@ class WrpRuntime(Service):
                 'default': 5555
             },
             {
+                'name': 'ipc_mode',
+                'msg': 'IPC transport mode for client-server communication',
+                'type': str,
+                'choices': ['tcp', 'ipc', 'shm'],
+                'default': 'tcp'
+            },
+            {
                 'name': 'log_level',
                 'msg': 'Logging level',
                 'type': str,
@@ -111,6 +118,9 @@ class WrpRuntime(Service):
         # Set HSHM_LOG_LEVEL for debug logging
         self.setenv('HSHM_LOG_LEVEL', self.config['log_level'])
 
+        # Set CHI_IPC_MODE for client-server transport
+        self.setenv('CHI_IPC_MODE', self.config['ipc_mode'].upper())
+
         # Generate chimaera configuration
         self._generate_config()
 
@@ -118,6 +128,7 @@ class WrpRuntime(Service):
         self.log(f"  Config file: {self.config_file}")
         self.log(f"  CHI_SERVER_CONF: {self.config_file}")
         self.log(f"  HSHM_LOG_LEVEL: {self.config['log_level']}")
+        self.log(f"  CHI_IPC_MODE: {self.config['ipc_mode'].upper()}")
 
     def _generate_config(self):
         """Generate Chimaera runtime configuration file"""
