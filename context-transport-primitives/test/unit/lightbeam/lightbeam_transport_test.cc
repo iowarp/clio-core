@@ -49,8 +49,8 @@ void TestZeroMQ() {
   std::string protocol = "tcp";
   int port = 8192;
 
-  auto server = std::make_unique<ZeroMqServer>(addr, protocol, port);
-  auto client = std::make_unique<ZeroMqClient>(addr, protocol, port);
+  auto server = std::make_unique<ZeroMqTransport>(TransportMode::kServer, addr, protocol, port);
+  auto client = std::make_unique<ZeroMqTransport>(TransportMode::kClient, addr, protocol, port);
 
   // Give ZMQ time to connect
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -68,32 +68,22 @@ void TestZeroMQ() {
   assert(rc == 0);
   std::cout << "Client sent data successfully\n";
 
-  // Server receives metadata
+  // Recv with retry loop (does everything - metadata + bulks)
   LbmMeta recv_meta;
   while (true) {
-    rc = server->RecvMetadata(recv_meta);
+    auto info = server->Recv(recv_meta);
+    rc = info.rc;
     if (rc == 0) break;
     if (rc != EAGAIN) {
-      std::cerr << "RecvMetadata failed with error: " << rc << "\n";
+      std::cerr << "Recv failed with error: " << rc << "\n";
       return;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
   assert(recv_meta.send.size() == 1);
 
-  // Allocate buffer and receive bulks
-  std::vector<char> recv_buf(recv_meta.send[0].size);
-  recv_meta.recv.push_back(server->Expose(
-      hipc::FullPtr<char>(recv_buf.data()), recv_buf.size(),
-      recv_meta.send[0].flags.bits_));
-
-  rc = server->RecvBulks(recv_meta);
-  if (rc != 0) {
-    std::cerr << "RecvBulks failed with error: " << rc << "\n";
-    return;
-  }
-
-  std::string received(recv_buf.begin(), recv_buf.end());
+  std::string received(recv_meta.recv[0].data.ptr_,
+                       recv_meta.recv[0].data.ptr_ + recv_meta.recv[0].size);
   std::cout << "Received: " << received << std::endl;
   assert(received == magic);
 

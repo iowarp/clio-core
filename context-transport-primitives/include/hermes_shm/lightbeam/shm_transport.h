@@ -59,11 +59,13 @@ struct ShmTransferInfo {
   }
 };
 
-class ShmClient : public Client {
+class ShmTransport : public Transport {
  public:
-  ShmClient() { type_ = Transport::kShm; }
+  explicit ShmTransport(TransportMode mode) : Transport(mode) {
+    type_ = TransportType::kShm;
+  }
 
-  ~ShmClient() override = default;
+  ~ShmTransport() override = default;
 
   Bulk Expose(const hipc::FullPtr<char>& ptr, size_t data_size,
               u32 flags) override {
@@ -73,6 +75,8 @@ class ShmClient : public Client {
     bulk.flags = hshm::bitfield32_t(flags);
     return bulk;
   }
+
+  std::string GetAddress() const override { return "shm"; }
 
   template <typename MetaT>
   int Send(MetaT& meta, const LbmContext& ctx = LbmContext()) {
@@ -84,22 +88,96 @@ class ShmClient : public Client {
 
     // 2. Transfer serialized size then metadata
     uint32_t meta_len = static_cast<uint32_t>(meta_buf.size());
-    Transfer(reinterpret_cast<const char*>(&meta_len), sizeof(meta_len), ctx);
-    Transfer(meta_buf.data(), meta_buf.size(), ctx);
+    WriteTransfer(reinterpret_cast<const char*>(&meta_len), sizeof(meta_len), ctx);
+    WriteTransfer(meta_buf.data(), meta_buf.size(), ctx);
 
     // 3. Send each bulk with BULK_XFER or BULK_EXPOSE flag
     for (size_t i = 0; i < meta.send.size(); ++i) {
       if (meta.send[i].flags.Any(BULK_EXPOSE)) {
         // BULK_EXPOSE: Send only the ShmPtr (no data transfer)
-        Transfer(reinterpret_cast<const char*>(&meta.send[i].data.shm_),
+        WriteTransfer(reinterpret_cast<const char*>(&meta.send[i].data.shm_),
                  sizeof(meta.send[i].data.shm_), ctx);
       } else if (meta.send[i].flags.Any(BULK_XFER)) {
         // BULK_XFER: Send ShmPtr first, then data if private memory
-        Transfer(reinterpret_cast<const char*>(&meta.send[i].data.shm_),
+        WriteTransfer(reinterpret_cast<const char*>(&meta.send[i].data.shm_),
                  sizeof(meta.send[i].data.shm_), ctx);
         if (meta.send[i].data.shm_.alloc_id_.IsNull()) {
           // Private memory — also send full data bytes
-          Transfer(meta.send[i].data.ptr_, meta.send[i].size, ctx);
+          WriteTransfer(meta.send[i].data.ptr_, meta.send[i].size, ctx);
+        }
+      }
+    }
+    return 0;
+  }
+
+  template <typename MetaT>
+  ClientInfo Recv(MetaT& meta, const LbmContext& ctx = LbmContext()) {
+    ClientInfo info;
+    info.rc = RecvMetadata(meta, ctx);
+    if (info.rc != 0) return info;
+    // Set up recv entries from send descriptors
+    for (const auto& send_bulk : meta.send) {
+      Bulk recv_bulk;
+      recv_bulk.size = send_bulk.size;
+      recv_bulk.flags = send_bulk.flags;
+      recv_bulk.data = hipc::FullPtr<char>::GetNull();
+      meta.recv.push_back(recv_bulk);
+    }
+    info.rc = RecvBulks(meta, ctx);
+    return info;
+  }
+
+ private:
+  template <typename MetaT>
+  int RecvMetadata(MetaT& meta, const LbmContext& ctx = LbmContext()) {
+    // 1. Receive 4-byte size prefix
+    uint32_t meta_len = 0;
+    ReadTransfer(reinterpret_cast<char*>(&meta_len), sizeof(meta_len), ctx);
+
+    // 2. Receive metadata bytes
+    std::vector<char> meta_buf(meta_len);
+    ReadTransfer(meta_buf.data(), meta_len, ctx);
+
+    // 3. Deserialize using LocalDeserialize
+    hshm::ipc::LocalDeserialize<> ar(meta_buf);
+    ar(meta);
+    return 0;
+  }
+
+  template <typename MetaT>
+  int RecvBulks(MetaT& meta, const LbmContext& ctx = LbmContext()) {
+    for (size_t i = 0; i < meta.recv.size(); ++i) {
+      if (meta.recv[i].flags.Any(BULK_EXPOSE)) {
+        // BULK_EXPOSE: Read only the ShmPtr (no data transfer)
+        hipc::ShmPtr<char> shm;
+        ReadTransfer(reinterpret_cast<char*>(&shm), sizeof(shm), ctx);
+        meta.recv[i].data.shm_ = shm;
+        meta.recv[i].data.ptr_ = nullptr;
+      } else if (meta.recv[i].flags.Any(BULK_XFER)) {
+        // BULK_XFER: Read ShmPtr first, then data if private memory
+        hipc::ShmPtr<char> shm;
+        ReadTransfer(reinterpret_cast<char*>(&shm), sizeof(shm), ctx);
+
+        if (!shm.alloc_id_.IsNull()) {
+          // Shared memory — ShmPtr passthrough, no data transfer
+          meta.recv[i].data.shm_ = shm;
+          meta.recv[i].data.ptr_ = nullptr;
+        } else {
+          // Private memory — read full data bytes
+          char* buf = meta.recv[i].data.ptr_;
+          bool allocated = false;
+          if (!buf) {
+            buf = static_cast<char*>(std::malloc(meta.recv[i].size));
+            allocated = true;
+          }
+
+          ReadTransfer(buf, meta.recv[i].size, ctx);
+
+          if (allocated) {
+            meta.recv[i].data.ptr_ = buf;
+            meta.recv[i].data.shm_.alloc_id_ = hipc::AllocatorId::GetNull();
+            meta.recv[i].data.shm_.off_ = reinterpret_cast<size_t>(buf);
+          }
         }
       }
     }
@@ -108,7 +186,7 @@ class ShmClient : public Client {
 
  private:
   // SPSC ring buffer write
-  static void Transfer(const char* data, size_t size, const LbmContext& ctx) {
+  static void WriteTransfer(const char* data, size_t size, const LbmContext& ctx) {
     size_t offset = 0;
     size_t total_written = ctx.shm_info_->total_written_.load();
     while (offset < size) {
@@ -129,84 +207,9 @@ class ShmClient : public Client {
                                           std::memory_order_release);
     }
   }
-};
 
-class ShmServer : public Server {
- public:
-  ShmServer() { type_ = Transport::kShm; }
-
-  ~ShmServer() override = default;
-
-  Bulk Expose(const hipc::FullPtr<char>& ptr, size_t data_size,
-              u32 flags) override {
-    Bulk bulk;
-    bulk.data = ptr;
-    bulk.size = data_size;
-    bulk.flags = hshm::bitfield32_t(flags);
-    return bulk;
-  }
-
-  std::string GetAddress() const override { return "shm"; }
-
-  template <typename MetaT>
-  int RecvMetadata(MetaT& meta, const LbmContext& ctx = LbmContext()) {
-    // 1. Receive 4-byte size prefix
-    uint32_t meta_len = 0;
-    Transfer(reinterpret_cast<char*>(&meta_len), sizeof(meta_len), ctx);
-
-    // 2. Receive metadata bytes
-    std::vector<char> meta_buf(meta_len);
-    Transfer(meta_buf.data(), meta_len, ctx);
-
-    // 3. Deserialize using LocalDeserialize
-    hshm::ipc::LocalDeserialize<> ar(meta_buf);
-    ar(meta);
-    return 0;
-  }
-
-  template <typename MetaT>
-  int RecvBulks(MetaT& meta, const LbmContext& ctx = LbmContext()) {
-    for (size_t i = 0; i < meta.recv.size(); ++i) {
-      if (meta.recv[i].flags.Any(BULK_EXPOSE)) {
-        // BULK_EXPOSE: Read only the ShmPtr (no data transfer)
-        hipc::ShmPtr<char> shm;
-        Transfer(reinterpret_cast<char*>(&shm), sizeof(shm), ctx);
-        meta.recv[i].data.shm_ = shm;
-        meta.recv[i].data.ptr_ = nullptr;
-      } else if (meta.recv[i].flags.Any(BULK_XFER)) {
-        // BULK_XFER: Read ShmPtr first, then data if private memory
-        hipc::ShmPtr<char> shm;
-        Transfer(reinterpret_cast<char*>(&shm), sizeof(shm), ctx);
-
-        if (!shm.alloc_id_.IsNull()) {
-          // Shared memory — ShmPtr passthrough, no data transfer
-          meta.recv[i].data.shm_ = shm;
-          meta.recv[i].data.ptr_ = nullptr;
-        } else {
-          // Private memory — read full data bytes
-          char* buf = meta.recv[i].data.ptr_;
-          bool allocated = false;
-          if (!buf) {
-            buf = static_cast<char*>(std::malloc(meta.recv[i].size));
-            allocated = true;
-          }
-
-          Transfer(buf, meta.recv[i].size, ctx);
-
-          if (allocated) {
-            meta.recv[i].data.ptr_ = buf;
-            meta.recv[i].data.shm_.alloc_id_ = hipc::AllocatorId::GetNull();
-            meta.recv[i].data.shm_.off_ = reinterpret_cast<size_t>(buf);
-          }
-        }
-      }
-    }
-    return 0;
-  }
-
- private:
   // SPSC ring buffer read
-  static void Transfer(char* buf, size_t size, const LbmContext& ctx) {
+  static void ReadTransfer(char* buf, size_t size, const LbmContext& ctx) {
     size_t offset = 0;
     size_t total_read = ctx.shm_info_->total_read_.load();
     while (offset < size) {

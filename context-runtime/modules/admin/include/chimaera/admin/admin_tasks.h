@@ -680,7 +680,7 @@ struct RecvTask : public chi::Task {
 
 /**
  * ClientConnectTask - Client connection handshake
- * Polls for ZMQ heartbeat requests and responds (was HeartbeatTask)
+ * Received via lightbeam transport and responds with success
  * Returns 0 on success to indicate runtime is healthy
  */
 struct ClientConnectTask : public chi::Task {

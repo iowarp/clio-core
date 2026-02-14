@@ -186,19 +186,19 @@ private:
 
   std::ostringstream stream_;
   std::unique_ptr<cereal::BinaryOutputArchive> archive_;
-  hshm::lbm::Client *lbm_client_; /**< Lightbeam client for Expose calls */
+  hshm::lbm::Transport *lbm_transport_; /**< Lightbeam transport for Expose calls */
 
 public:
   /**
    * Constructor with message type and optional Lightbeam client
    * @param msg_type The type of message (SerializeIn, SerializeOut, Heartbeat)
-   * @param lbm_client Optional Lightbeam client for bulk transfer Expose calls
+   * @param lbm_transport Optional Lightbeam transport for bulk transfer Expose calls
    */
   explicit SaveTaskArchive(MsgType msg_type,
-                           hshm::lbm::Client *lbm_client = nullptr)
+                           hshm::lbm::Transport *lbm_transport = nullptr)
       : NetTaskArchive(msg_type),
         archive_(std::make_unique<cereal::BinaryOutputArchive>(stream_)),
-        lbm_client_(lbm_client) {}
+        lbm_transport_(lbm_transport) {}
 
   /**
    * Move constructor
@@ -207,8 +207,8 @@ public:
       : NetTaskArchive(std::move(other)),
         stream_(std::move(other.stream_)),
         archive_(std::move(other.archive_)),
-        lbm_client_(other.lbm_client_) {
-    other.lbm_client_ = nullptr;
+        lbm_transport_(other.lbm_transport_) {
+    other.lbm_transport_ = nullptr;
   }
 
   /**
@@ -219,8 +219,8 @@ public:
       NetTaskArchive::operator=(std::move(other));
       stream_ = std::move(other.stream_);
       archive_ = std::move(other.archive_);
-      lbm_client_ = other.lbm_client_;
-      other.lbm_client_ = nullptr;
+      lbm_transport_ = other.lbm_transport_;
+      other.lbm_transport_ = nullptr;
     }
     return *this;
   }
@@ -306,7 +306,7 @@ public:
    * Set the Lightbeam client for bulk transfers
    * @param lbm_client Pointer to the Lightbeam client
    */
-  void SetLbmClient(hshm::lbm::Client *lbm_client) { lbm_client_ = lbm_client; }
+  void SetTransport(hshm::lbm::Transport *lbm_transport) { lbm_transport_ = lbm_transport; }
 
   /**
    * Serialize for LocalSerialize (SHM transport).
@@ -355,7 +355,7 @@ private:
   std::unique_ptr<cereal::BinaryInputArchive> archive_;
   size_t current_task_index_;   /**< Index of current task being deserialized */
   size_t current_bulk_index_;   /**< Index of current bulk transfer in recv vector */
-  hshm::lbm::Server *lbm_server_; /**< Lightbeam server for output mode bulk transfers */
+  hshm::lbm::Transport *lbm_transport_; /**< Lightbeam transport for output mode bulk transfers */
 
 public:
   /**
@@ -367,7 +367,7 @@ public:
         archive_(std::make_unique<cereal::BinaryInputArchive>(*stream_)),
         current_task_index_(0),
         current_bulk_index_(0),
-        lbm_server_(nullptr) {}
+        lbm_transport_(nullptr) {}
 
   /**
    * Constructor from serialized data
@@ -380,7 +380,7 @@ public:
         archive_(std::make_unique<cereal::BinaryInputArchive>(*stream_)),
         current_task_index_(0),
         current_bulk_index_(0),
-        lbm_server_(nullptr) {}
+        lbm_transport_(nullptr) {}
 
   /**
    * Constructor from const char* and size
@@ -394,7 +394,7 @@ public:
         archive_(std::make_unique<cereal::BinaryInputArchive>(*stream_)),
         current_task_index_(0),
         current_bulk_index_(0),
-        lbm_server_(nullptr) {}
+        lbm_transport_(nullptr) {}
 
   /**
    * Move constructor
@@ -406,8 +406,8 @@ public:
         archive_(std::move(other.archive_)),
         current_task_index_(other.current_task_index_),
         current_bulk_index_(other.current_bulk_index_),
-        lbm_server_(other.lbm_server_) {
-    other.lbm_server_ = nullptr;
+        lbm_transport_(other.lbm_transport_) {
+    other.lbm_transport_ = nullptr;
   }
 
   /**
@@ -421,8 +421,8 @@ public:
       archive_ = std::move(other.archive_);
       current_task_index_ = other.current_task_index_;
       current_bulk_index_ = other.current_bulk_index_;
-      lbm_server_ = other.lbm_server_;
-      other.lbm_server_ = nullptr;
+      lbm_transport_ = other.lbm_transport_;
+      other.lbm_transport_ = nullptr;
     }
     return *this;
   }
@@ -532,7 +532,7 @@ public:
    * Set Lightbeam server for output mode bulk transfers
    * @param lbm_server Pointer to the Lightbeam server
    */
-  void SetLbmServer(hshm::lbm::Server *lbm_server) { lbm_server_ = lbm_server; }
+  void SetTransport(hshm::lbm::Transport *lbm_transport) { lbm_transport_ = lbm_transport; }
 
   /**
    * Access underlying cereal archive

@@ -40,9 +40,6 @@
 
 #include "chimaera/worker.h"
 
-#include <signal.h>
-#include <sys/epoll.h>
-#include <sys/signalfd.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -80,8 +77,7 @@ Worker::Worker(u32 worker_id)
       iteration_count_(0),
       idle_iterations_(0),
       current_sleep_us_(0),
-      sleep_count_(0),
-      epoll_fd_(-1) {
+      sleep_count_(0) {
   // std::queue is initialized with default constructors in member
   // initialization No pre-allocation of capacity is needed or possible with
   // std::queue
@@ -113,23 +109,17 @@ bool Worker::Init() {
                          HSHM_MALLOC, EVENT_QUEUE_DEPTH)
                      .ptr_;
 
-  // Create epoll file descriptor for efficient worker suspension
-  epoll_fd_ = epoll_create1(0);
-  if (epoll_fd_ == -1) {
-    HLOG(kError, "Worker {}: Failed to create epoll file descriptor",
-         worker_id_);
-    return false;
-  }
-
   // Get scheduler from IpcManager (IpcManager is the single owner)
   scheduler_ = CHI_IPC->GetScheduler();
   HLOG(kDebug, "Worker {}: Using scheduler from IpcManager", worker_id_);
 
-  // Create SHM lightbeam client/server for worker-side transport
-  shm_client_ = hshm::lbm::TransportFactory::GetClient(
-      "", hshm::lbm::Transport::kShm);
-  shm_server_ = hshm::lbm::TransportFactory::GetServer(
-      "", hshm::lbm::Transport::kShm);
+  // Create SHM lightbeam transports for worker-side transport
+  shm_send_transport_ = hshm::lbm::TransportFactory::Get(
+      "", hshm::lbm::TransportType::kShm,
+      hshm::lbm::TransportMode::kClient);
+  shm_recv_transport_ = hshm::lbm::TransportFactory::Get(
+      "", hshm::lbm::TransportType::kShm,
+      hshm::lbm::TransportMode::kServer);
 
   is_initialized_ = true;
   return true;
@@ -179,60 +169,7 @@ WorkerStats Worker::GetWorkerStats() const {
   return stats;
 }
 
-int Worker::GetEpollFd() const { return epoll_fd_; }
-
-bool Worker::RegisterEpollFd(int fd, u32 events, void *user_data) {
-  if (epoll_fd_ == -1 || fd < 0) {
-    return false;
-  }
-
-  struct epoll_event ev;
-  ev.events = events;
-  ev.data.ptr = user_data;
-
-  // Lock to protect epoll_ctl from concurrent access
-  hshm::ScopedMutex lock(epoll_mutex_, 0);
-  if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &ev) == -1) {
-    HLOG(kWarning, "Failed to register fd {} with worker {} epoll: {}", fd,
-         worker_id_, strerror(errno));
-    return false;
-  }
-  return true;
-}
-
-bool Worker::UnregisterEpollFd(int fd) {
-  if (epoll_fd_ == -1 || fd < 0) {
-    return false;
-  }
-
-  // Lock to protect epoll_ctl from concurrent access
-  hshm::ScopedMutex lock(epoll_mutex_, 0);
-  if (epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr) == -1) {
-    HLOG(kWarning, "Failed to unregister fd {} from worker {} epoll: {}", fd,
-         worker_id_, strerror(errno));
-    return false;
-  }
-  return true;
-}
-
-bool Worker::ModifyEpollFd(int fd, u32 events, void *user_data) {
-  if (epoll_fd_ == -1 || fd < 0) {
-    return false;
-  }
-
-  struct epoll_event ev;
-  ev.events = events;
-  ev.data.ptr = user_data;
-
-  // Lock to protect epoll_ctl from concurrent access
-  hshm::ScopedMutex lock(epoll_mutex_, 0);
-  if (epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, fd, &ev) == -1) {
-    HLOG(kWarning, "Failed to modify fd {} in worker {} epoll: {}", fd,
-         worker_id_, strerror(errno));
-    return false;
-  }
-  return true;
-}
+hshm::lbm::EventManager& Worker::GetEventManager() { return event_manager_; }
 
 void Worker::Finalize() {
   if (!is_initialized_) {
@@ -257,12 +194,6 @@ void Worker::Finalize() {
   // Clear assigned lane reference (don't delete - it's in shared memory)
   assigned_lane_ = nullptr;
 
-  // Close epoll file descriptor
-  if (epoll_fd_ != -1) {
-    close(epoll_fd_);
-    epoll_fd_ = -1;
-  }
-
   is_initialized_ = false;
 }
 
@@ -276,62 +207,14 @@ void Worker::Run() {
   SetAsCurrentWorker();
   is_running_ = true;
 
-  // Set up signalfd and store in TaskLane
-  // Get current thread ID
+  // Set up thread ID and signal event via EventManager
   pid_t tid = static_cast<pid_t>(syscall(SYS_gettid));
   if (assigned_lane_) {
     assigned_lane_->SetTid(tid);
   }
-
-  // Create signal mask for custom user signal (SIGUSR1)
-  sigset_t mask;
-  sigemptyset(&mask);
-  sigaddset(&mask, SIGUSR1);
-
-  // Block the signal so it's handled by signalfd instead of default handler
-  if (pthread_sigmask(SIG_BLOCK, &mask, nullptr) != 0) {
-    HLOG(kError, "Worker {}: Failed to block SIGUSR1 signal", worker_id_);
-    is_running_ = false;
-    return;
-  }
-
-  // Create signalfd
-  int signal_fd = signalfd(-1, &mask, SFD_NONBLOCK | SFD_CLOEXEC);
-  if (signal_fd == -1) {
-    HLOG(kError, "Worker {}: Failed to create signalfd - errno={}", worker_id_,
-         errno);
-    is_running_ = false;
-    return;
-  }
-  HLOG(kInfo, "Worker {}: Created signalfd={}, tid={}", worker_id_, signal_fd,
+  event_manager_.AddSignalEvent(nullptr);
+  HLOG(kInfo, "Worker {}: EventManager signal event added, tid={}", worker_id_,
        tid);
-
-  // Store signal_fd in TaskLane
-  if (assigned_lane_) {
-    assigned_lane_->SetSignalFd(signal_fd);
-  }
-
-  // Add signal_fd to epoll
-  struct epoll_event ev;
-  ev.events = EPOLLIN;
-  ev.data.fd = signal_fd;
-  if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, signal_fd, &ev) == -1) {
-    HLOG(kError,
-         "Worker {}: Failed to add signal_fd={} to epoll_fd={} - errno={}",
-         worker_id_, signal_fd, epoll_fd_, errno);
-    close(signal_fd);
-    if (assigned_lane_) {
-      assigned_lane_->SetSignalFd(-1);
-    }
-    is_running_ = false;
-    return;
-  }
-  HLOG(kInfo, "Worker {}: Added signalfd={} to epoll_fd={} successfully",
-       worker_id_, signal_fd, epoll_fd_);
-
-  // Note: ZMQ socket FD registration is not needed
-  // Workers with periodic tasks (Heartbeat, Recv, etc.) use timeout_ms=0
-  // when tasks are overdue, ensuring they wake up to service network I/O
 
   // Main worker loop - process tasks from assigned lane
   while (is_running_) {
@@ -377,14 +260,7 @@ void Worker::Run() {
     }
   }
 
-  // Cleanup signalfd when worker exits
-  if (assigned_lane_) {
-    int cleanup_signal_fd = assigned_lane_->GetSignalFd();
-    if (cleanup_signal_fd != -1) {
-      close(cleanup_signal_fd);
-      assigned_lane_->SetSignalFd(-1);
-    }
-  }
+  // EventManager destructor handles signalfd and epoll cleanup
 }
 
 void Worker::Stop() { is_running_ = false; }
@@ -429,18 +305,8 @@ hipc::FullPtr<Task> Worker::GetOrCopyTaskFromFuture(Future<Task> &future,
 
     // Receive via SHM transport (blocking - spins until client sends)
     LoadTaskArchive archive;
-    shm_server_->RecvMetadata(archive, ctx);
-
-    // Set up recv entries from send descriptors
-    for (const auto &send_bulk : archive.send) {
-      hshm::lbm::Bulk bulk;
-      bulk.size = send_bulk.size;
-      bulk.flags = send_bulk.flags;
-      bulk.data.ptr_ = nullptr;
-      archive.recv.push_back(bulk);
-    }
-
-    shm_server_->RecvBulks(archive, ctx);
+    auto info = shm_recv_transport_->Recv(archive, ctx);
+    (void)info;
 
     // Allocate and deserialize task
     task_full_ptr = container->AllocLoadTask(method_id, archive);
@@ -632,45 +498,21 @@ void Worker::SuspendMe() {
       assigned_lane_->SetActive(false);
     }
 
-    // Calculate epoll timeout from periodic tasks
-    // -1 = no periodic tasks, wait indefinitely
-    // >0 = maximum yield_time (polling period) from periodic tasks
+    // Calculate timeout from periodic tasks
     double suspend_period_us = GetSuspendPeriod();
-    int timeout_ms;
-    if (suspend_period_us < 0) {
-      // No periodic tasks - wait indefinitely (-1)
-      timeout_ms = -1;
-    } else {
-      // Have periodic tasks - use the maximum yield_time as timeout
-      // Round UP to avoid premature wakeups due to ms/us precision mismatch
-      timeout_ms = static_cast<int>((suspend_period_us + 999) / 1000);
-      if (timeout_ms < 1) {
-        timeout_ms = 1;  // Minimum 1ms to avoid busy-polling
-      }
-    }
+    int timeout_us = (suspend_period_us < 0) ? -1
+        : static_cast<int>(suspend_period_us);
 
-    // Wait for signal using epoll_wait
-    int nfds =
-        epoll_wait(epoll_fd_, epoll_events_, MAX_EPOLL_EVENTS, timeout_ms);
+    // Wait for signal using EventManager
+    int nfds = event_manager_.Wait(timeout_us);
 
     // Mark worker as active again
     if (assigned_lane_) {
       assigned_lane_->SetActive(true);
     }
 
-    if (nfds > 0) {
-      // Events received - should be SIGUSR1 signal on signalfd
-      // Read and discard the signal info from signalfd
-      int signal_fd = assigned_lane_->GetSignalFd();
-      struct signalfd_siginfo si;
-      ssize_t bytes_read = read(signal_fd, &si, sizeof(si));
-      (void)bytes_read;  // Suppress unused variable warning
-    } else if (nfds == 0) {
-      // Timeout occurred
+    if (nfds == 0) {
       sleep_count_++;
-    } else {
-      // Error occurred
-      HLOG(kError, "Worker {}: epoll_wait error: errno={}", worker_id_, errno);
     }
 
     // Force immediate rescan of all periodic tasks after waking
@@ -1332,11 +1174,11 @@ void Worker::EndTaskShmTransfer(const FullPtr<Task> &task_ptr,
   ctx.shm_info_ = &future_shm->output_;
 
   // Serialize outputs
-  SaveTaskArchive archive(MsgType::kSerializeOut, shm_client_.get());
+  SaveTaskArchive archive(MsgType::kSerializeOut, shm_send_transport_.get());
   container->SaveTask(task_ptr->method_, archive, task_ptr);
 
   // Send via SHM transport (blocking)
-  shm_client_->Send(archive, ctx);
+  shm_send_transport_->Send(archive, ctx);
 
   // Set FUTURE_COMPLETE and clean up task
   future_shm->flags_.SetBits(FutureShm::FUTURE_COMPLETE);

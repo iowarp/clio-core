@@ -60,12 +60,12 @@ std::vector<std::string> ReadHosts(const std::string& hostfile) {
   return hosts;
 }
 
-Transport ParseTransport(const std::string& s) {
-  if (s == "zeromq") return Transport::kZeroMq;
+TransportType ParseTransport(const std::string& s) {
+  if (s == "zeromq") return TransportType::kZeroMq;
   throw std::runtime_error("Unknown transport type: " + s);
 }
 
-void Clients(std::vector<std::unique_ptr<ZeroMqClient>>& clients,
+void Clients(std::vector<std::unique_ptr<ZeroMqTransport>>& clients,
              const std::string& magic) {
   int my_rank = 0;
   MPI_Comm_rank(MPI_COMM_WORLD, &my_rank);
@@ -77,7 +77,9 @@ void Clients(std::vector<std::unique_ptr<ZeroMqClient>>& clients,
     std::cout << "[Rank " << my_rank << "] [Clients] Sending to server " << i
               << std::endl;
     LbmMeta meta;
-    Bulk bulk = clients[i]->Expose(magic.data(), magic.size(), BULK_XFER);
+    Bulk bulk = clients[i]->Expose(
+        hipc::FullPtr<char>(const_cast<char*>(magic.data())),
+        magic.size(), BULK_XFER);
     meta.send.push_back(bulk);
     int rc = clients[i]->Send(meta);
     std::cout << "[Rank " << my_rank << "] [Clients] Sent to server " << i
@@ -86,7 +88,7 @@ void Clients(std::vector<std::unique_ptr<ZeroMqClient>>& clients,
   }
 }
 
-void ServerThread(Server& server, size_t num_clients,
+void ServerThread(Transport& server, size_t num_clients,
                   const std::string& magic) {
   std::ostringstream oss;
   oss << std::this_thread::get_id();
@@ -94,33 +96,24 @@ void ServerThread(Server& server, size_t num_clients,
   for (size_t i = 0; i < num_clients; ++i) {
     std::cout << "[Server] Waiting for message " << i << std::endl;
 
-    // Receive metadata
+    // Recv with retry loop (does everything - metadata + bulks)
     LbmMeta meta;
     int rc;
     while (true) {
-      rc = server.RecvMetadata(meta);
+      auto info = server.Recv(meta);
+      rc = info.rc;
       if (rc == 0) break;
       if (rc != EAGAIN) {
-        std::cerr << "[Server] RecvMetadata failed with error: " << rc << "\n";
+        std::cerr << "[Server] Recv failed with error: " << rc << "\n";
         return;
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
-
-    // Allocate buffer and receive bulks
-    std::vector<char> y(meta.send[0].size);
-    meta.recv.push_back(
-        server.Expose(y.data(), y.size(), meta.send[0].flags.bits_));
-
-    rc = server.RecvBulks(meta);
-    if (rc != 0) {
-      std::cerr << "[Server] RecvBulks failed with error: " << rc << "\n";
-      return;
-    }
     std::cout << "[Server] Received message " << i << ", rc=" << rc
               << std::endl;
 
-    std::string received(y.begin(), y.end());
+    std::string received(meta.recv[0].data.ptr_,
+                         meta.recv[0].data.ptr_ + meta.recv[0].size);
     std::cout << "[Server] Received: " << received << std::endl;
     assert(received == magic);
   }
@@ -201,7 +194,7 @@ int main(int argc, char** argv) {
   int port = std::stoi(argv[5]);
   std::string magic(msg_size, 'x');
 
-  Transport transport = ParseTransport(transport_str);
+  TransportType transport = ParseTransport(transport_str);
   std::vector<std::string> hosts = ReadHosts(hostfile);
   if ((int)hosts.size() != world_size) {
     std::cerr << "Error: Number of MPI processes (" << world_size
@@ -214,8 +207,9 @@ int main(int argc, char** argv) {
   int my_port = port + my_rank;
   std::string bind_addr = GetPrimaryIp();
   std::string domain_arg = domain;
-  auto server_ptr = TransportFactory::GetServer(bind_addr, transport, protocol,
-                                                my_port, domain_arg);
+  auto server_ptr = TransportFactory::Get(bind_addr, transport,
+                                          TransportMode::kServer, protocol,
+                                          my_port, domain_arg);
   std::string actual_addr = server_ptr->GetAddress();
   std::cout << "[Rank " << my_rank << "] Server address: " << actual_addr
             << ", port: " << my_port << std::endl;
@@ -230,29 +224,19 @@ int main(int argc, char** argv) {
     for (int i = 0; i < num_msgs * world_size; ++i) {
       auto recv_time = std::chrono::high_resolution_clock::now();
 
-      // Receive metadata
+      // Recv with retry loop (does everything - metadata + bulks)
       LbmMeta meta;
       int rc;
       while (true) {
-        rc = server_ptr->RecvMetadata(meta);
+        auto info = server_ptr->Recv(meta);
+        rc = info.rc;
         if (rc == 0) break;
         if (rc != EAGAIN) {
-          std::cerr << "[Server] RecvMetadata failed with error: " << rc
+          std::cerr << "[Server] Recv failed with error: " << rc
                     << "\n";
           return;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
-      }
-
-      // Allocate buffer and receive bulks
-      std::vector<char> y(msg_size);
-      meta.recv.push_back(
-          server_ptr->Expose(y.data(), y.size(), meta.send[0].flags.bits_));
-
-      rc = server_ptr->RecvBulks(meta);
-      if (rc != 0) {
-        std::cerr << "[Server] RecvBulks failed with error: " << rc << "\n";
-        return;
       }
       received++;
 
@@ -281,10 +265,10 @@ int main(int argc, char** argv) {
   for (int i = 0; i < world_size; ++i) {
     server_addrs.emplace_back(&all_addrs[i * addr_len]);
   }
-  std::vector<std::unique_ptr<ZeroMqClient>> clients;
+  std::vector<std::unique_ptr<ZeroMqTransport>> clients;
   for (int i = 0; i < world_size; ++i) {
     int target_port = port + i;
-    auto client_ptr = std::make_unique<ZeroMqClient>(server_addrs[i], protocol, target_port);
+    auto client_ptr = std::make_unique<ZeroMqTransport>(TransportMode::kClient, server_addrs[i], protocol, target_port);
     clients.emplace_back(std::move(client_ptr));
   }
   int sent = 0;
@@ -292,7 +276,9 @@ int main(int argc, char** argv) {
     for (size_t i = 0; i < clients.size(); ++i) {
       auto send_time = std::chrono::high_resolution_clock::now();
       LbmMeta meta;
-      Bulk bulk = clients[i]->Expose(magic.data(), magic.size(), BULK_XFER);
+      Bulk bulk = clients[i]->Expose(
+          hipc::FullPtr<char>(const_cast<char*>(magic.data())),
+          magic.size(), BULK_XFER);
       meta.send.push_back(bulk);
       int rc = clients[i]->Send(meta);
       assert(rc == 0);

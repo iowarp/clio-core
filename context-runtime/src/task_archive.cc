@@ -57,8 +57,8 @@ void SaveTaskArchive::bulk(hipc::ShmPtr<> ptr, size_t size, uint32_t flags) {
   bulk.flags.bits_ = flags;
 
   // If lbm_client is provided, automatically call Expose for RDMA registration
-  if (lbm_client_) {
-    bulk = lbm_client_->Expose(bulk.data, bulk.size, bulk.flags.bits_);
+  if (lbm_transport_) {
+    bulk = lbm_transport_->Expose(bulk.data, bulk.size, bulk.flags.bits_);
   }
 
   send.push_back(bulk);
@@ -82,8 +82,17 @@ void LoadTaskArchive::bulk(hipc::ShmPtr<> &ptr, size_t size, uint32_t flags) {
     // The task itself doesn't have a valid pointer during deserialization,
     // so we look into the recv vector and use the FullPtr at the current index
     if (current_bulk_index_ < recv.size()) {
-      // Cast FullPtr<char>'s shm_ to ShmPtr<>
-      ptr = recv[current_bulk_index_].data.shm_.template Cast<void>();
+      if (!recv[current_bulk_index_].data.shm_.IsNull()) {
+        // Valid ShmPtr: either SHM transport (data in shared memory) or
+        // ZMQ/socket transport (data received into buffer)
+        ptr = recv[current_bulk_index_].data.shm_.template Cast<void>();
+      } else {
+        // Null ShmPtr: BULK_EXPOSE via ZMQ/socket where no data was sent.
+        // Allocate a buffer for the receiver to fill (e.g., ReadTask).
+        hipc::FullPtr<char> buf = CHI_IPC->AllocateBuffer(size);
+        ptr = buf.shm_.template Cast<void>();
+        recv[current_bulk_index_].data = buf;
+      }
       current_bulk_index_++;
     } else {
       // Error: not enough bulk transfers in recv vector
@@ -113,10 +122,10 @@ void LoadTaskArchive::bulk(hipc::ShmPtr<> &ptr, size_t size, uint32_t flags) {
         }
       }
       current_bulk_index_++;
-    } else if (lbm_server_) {
+    } else if (lbm_transport_) {
       // Pre-receive: expose task's buffer for RecvBulks (existing RecvOut pattern)
       hipc::FullPtr<char> buffer = CHI_IPC->ToFullPtr(ptr).template Cast<char>();
-      hshm::lbm::Bulk bulk = lbm_server_->Expose(buffer, size, flags);
+      hshm::lbm::Bulk bulk = lbm_transport_->Expose(buffer, size, flags);
       recv.push_back(bulk);
       if (flags & BULK_XFER) {
         recv_bulks++;

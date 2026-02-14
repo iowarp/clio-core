@@ -448,11 +448,20 @@ struct FutureShm {
   /** Virtual address of client's task (for ZMQ response routing) */
   uintptr_t client_task_vaddr_;
 
+  /** Client PID for per-client response routing */
+  u32 client_pid_;
+
   /** SHM transfer info for input direction (client → worker) */
   hshm::lbm::ShmTransferInfo input_;
 
   /** SHM transfer info for output direction (worker → client) */
   hshm::lbm::ShmTransferInfo output_;
+
+  /** Transport to use for sending response back to client */
+  hshm::lbm::Transport* response_transport_;
+
+  /** Socket fd for routing response (IPC mode) */
+  int response_fd_;
 
   /** Atomic bitfield for completion and data availability flags */
   hshm::abitfield32_t flags_;
@@ -469,6 +478,9 @@ struct FutureShm {
     method_id_ = 0;
     origin_ = FUTURE_CLIENT_SHM;
     client_task_vaddr_ = 0;
+    client_pid_ = 0;
+    response_transport_ = nullptr;
+    response_fd_ = -1;
     flags_.SetBits(0);
   }
 };
@@ -683,11 +695,13 @@ class Future {
   }
 
   /**
-   * Wait for task completion (blocking)
+   * Wait for task completion (blocking with optional timeout)
    * GPU: Simple polling on FUTURE_COMPLETE flag
    * CPU: Calls IpcManager::Recv() to handle task completion and deserialization
+   * @param max_sec Maximum seconds to wait (0 = wait indefinitely)
+   * @return true if task completed, false if timed out
    */
-  HSHM_CROSS_FUN void Wait();
+  HSHM_CROSS_FUN bool Wait(float max_sec = 0);
 
   /**
    * Mark the task as complete

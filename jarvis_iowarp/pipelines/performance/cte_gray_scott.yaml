@@ -10,6 +10,7 @@ pkgs:
     do_dbg: false
     dbg_port: 4000
     log_level: "info"
+    ipc_mode: "tcp"
 
   - pkg_type: jarvis_iowarp.wrp_cte
     pkg_name: cte_core
@@ -23,7 +24,7 @@ pkgs:
     default_target_timeout_ms: 30000     # Target timeout (ms)
     poll_period_ms: 5000                 # Period to rescan targets for statistics (capacity, bandwidth, etc.) (ms)
 
-  - pkg_type: builtin.adios2_gray_scott
+  - pkg_type: jarvis_iowarp.adios2_gray_scott
     pkg_name: gsbench
     nprocs: 8                           # Number of MPI processes
     ppn: 8                               # Processes per node

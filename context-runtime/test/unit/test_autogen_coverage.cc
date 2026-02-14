@@ -12115,9 +12115,9 @@ TEST_CASE("Autogen - IpcManager basic accessors", "[autogen][ipcmanager][basic]"
     INFO("Num hosts: " + std::to_string(num));
   }
 
-  SECTION("GetMainServer") {
-    auto* server = ipc->GetMainServer();
-    INFO("MainServer ptr: " + std::to_string((uintptr_t)server));
+  SECTION("GetMainTransport") {
+    auto* transport = ipc->GetMainTransport();
+    INFO("MainTransport ptr: " + std::to_string((uintptr_t)transport));
   }
 }
 
@@ -13588,11 +13588,12 @@ TEST_CASE("Autogen - Worker extended accessors", "[autogen][worker][extended]") 
     }
   }
 
-  SECTION("Worker GetEpollFd") {
+  SECTION("Worker GetEventManager") {
     auto* worker = work_orch->GetWorker(0);
     if (worker) {
-      int fd = worker->GetEpollFd();
-      INFO("Worker 0 epoll fd: " + std::to_string(fd));
+      auto &em = worker->GetEventManager();
+      int fd = em.GetEpollFd();
+      INFO("Worker 0 EventManager epoll fd: " + std::to_string(fd));
     }
   }
 

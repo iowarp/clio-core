@@ -129,6 +129,7 @@ void SubmitTasksForMode(const std::string &mode_name) {
   std::vector<hshm::u8> read_data(actual_read);
   memcpy(read_data.data(), data_ptr.ptr_, actual_read);
   size_t verify_size = std::min(actual_written, actual_read);
+
   for (size_t i = 0; i < verify_size; ++i) {
     REQUIRE(read_data[i] == write_data[i]);
   }

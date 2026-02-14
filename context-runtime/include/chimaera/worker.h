@@ -34,8 +34,6 @@
 #ifndef CHIMAERA_INCLUDE_CHIMAERA_WORKERS_WORKER_H_
 #define CHIMAERA_INCLUDE_CHIMAERA_WORKERS_WORKER_H_
 
-#include <sys/epoll.h>
-
 #include <chrono>
 #include <coroutine>
 #include <functional>
@@ -52,6 +50,7 @@
 #include "chimaera/task_queue.h"
 #include "chimaera/types.h"
 #include "chimaera/scheduler/scheduler.h"
+#include "hermes_shm/lightbeam/event_manager.h"
 #include "hermes_shm/lightbeam/transport_factory_impl.h"
 #include "hermes_shm/memory/allocator/malloc_allocator.h"
 
@@ -229,38 +228,10 @@ class Worker {
   WorkerStats GetWorkerStats() const;
 
   /**
-   * Get the epoll file descriptor for this worker
-   * @return Epoll file descriptor
+   * Get the EventManager for this worker
+   * @return Reference to this worker's EventManager
    */
-  int GetEpollFd() const;
-
-  /**
-   * Register a file descriptor with this worker's epoll for monitoring
-   * Thread-safe: can be called from any thread
-   * @param fd File descriptor to register
-   * @param events Epoll events to monitor (e.g., EPOLLIN, EPOLLOUT)
-   * @param user_data User data to associate with the fd (returned in epoll_event.data.ptr)
-   * @return true if registration successful, false otherwise
-   */
-  bool RegisterEpollFd(int fd, u32 events, void *user_data);
-
-  /**
-   * Unregister a file descriptor from this worker's epoll
-   * Thread-safe: can be called from any thread
-   * @param fd File descriptor to unregister
-   * @return true if unregistration successful, false otherwise
-   */
-  bool UnregisterEpollFd(int fd);
-
-  /**
-   * Modify epoll events for an already registered file descriptor
-   * Thread-safe: can be called from any thread
-   * @param fd File descriptor to modify
-   * @param events New epoll events to monitor
-   * @param user_data New user data to associate with the fd
-   * @return true if modification successful, false otherwise
-   */
-  bool ModifyEpollFd(int fd, u32 events, void *user_data);
+  hshm::lbm::EventManager& GetEventManager();
 
   /**
    * Add run context to blocked queue based on block count
@@ -583,21 +554,15 @@ class Worker {
   u64 sleep_count_;  // Number of times sleep was called in current idle period
   hshm::Timepoint idle_start_;  // Time when worker became idle
 
-  // Epoll file descriptor and events buffer for efficient worker suspension
-  int epoll_fd_;
-  static constexpr u32 MAX_EPOLL_EVENTS = 256;
-  struct epoll_event epoll_events_[MAX_EPOLL_EVENTS];
-
-  // Mutex to protect epoll_ctl operations from multiple threads
-  // Used when external code (e.g., bdev) registers FDs with this worker's epoll
-  hshm::Mutex epoll_mutex_;
+  // EventManager for efficient worker suspension and event monitoring
+  hshm::lbm::EventManager event_manager_;
 
   // Client copy queue - LocalTransfer objects streaming output data to clients
   std::queue<LocalTransfer> client_copy_;
 
   // SHM lightbeam transport (worker-side)
-  std::unique_ptr<hshm::lbm::Client> shm_client_;  // For EndTaskShmTransfer
-  std::unique_ptr<hshm::lbm::Server> shm_server_;  // For ProcessNewTask
+  std::unique_ptr<hshm::lbm::Transport> shm_send_transport_;  // For EndTaskShmTransfer
+  std::unique_ptr<hshm::lbm::Transport> shm_recv_transport_;  // For ProcessNewTask
 
   // Scheduler pointer (owned by IpcManager, not Worker)
   Scheduler *scheduler_;

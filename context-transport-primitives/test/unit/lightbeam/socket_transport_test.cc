@@ -62,8 +62,8 @@ void TestBasicTcpTransfer() {
   std::string addr = "127.0.0.1";
   int port = 8193;
 
-  auto server = std::make_unique<SocketServer>(addr, "tcp", port);
-  auto client = std::make_unique<SocketClient>(addr, "tcp", port);
+  auto server = std::make_unique<SocketTransport>(TransportMode::kServer, addr, "tcp", port);
+  auto client = std::make_unique<SocketTransport>(TransportMode::kClient, addr, "tcp", port);
 
   // Prepare data
   const char* data1 = "Hello, World!";
@@ -90,19 +90,20 @@ void TestBasicTcpTransfer() {
   assert(rc == 0);
   std::cout << "Client sent data successfully\n";
 
-  // Server receives metadata
+  // Recv with retry loop (does everything - metadata + bulks)
   TestMeta recv_meta;
   int attempts = 0;
   while (true) {
-    rc = server->RecvMetadata(recv_meta);
+    auto info = server->Recv(recv_meta);
+    rc = info.rc;
     if (rc == 0) break;
     if (rc != EAGAIN) {
-      std::cerr << "RecvMetadata failed with error: " << rc << "\n";
+      std::cerr << "Recv failed with error: " << rc << "\n";
       return;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
     if (++attempts > 5000) {
-      std::cerr << "RecvMetadata timed out\n";
+      std::cerr << "Recv timed out\n";
       return;
     }
   }
@@ -111,29 +112,13 @@ void TestBasicTcpTransfer() {
   assert(recv_meta.request_id == 42);
   assert(recv_meta.operation == "test_op");
   assert(recv_meta.send.size() == 2);
-
-  // Allocate buffers for receiving bulks
-  std::vector<char> recv_buf1(recv_meta.send[0].size);
-  std::vector<char> recv_buf2(recv_meta.send[1].size);
-
-  recv_meta.recv.push_back(server->Expose(
-      hipc::FullPtr<char>(recv_buf1.data()), recv_buf1.size(),
-      recv_meta.send[0].flags.bits_));
-  recv_meta.recv.push_back(server->Expose(
-      hipc::FullPtr<char>(recv_buf2.data()), recv_buf2.size(),
-      recv_meta.send[1].flags.bits_));
-
-  // Receive bulks
-  rc = server->RecvBulks(recv_meta);
-  if (rc != 0) {
-    std::cerr << "RecvBulks failed with error: " << rc << "\n";
-    return;
-  }
   std::cout << "Server received bulk data successfully\n";
 
-  // Verify
-  std::string received1(recv_buf1.begin(), recv_buf1.end());
-  std::string received2(recv_buf2.begin(), recv_buf2.end());
+  // Verify data from transport-allocated recv buffers
+  std::string received1(recv_meta.recv[0].data.ptr_,
+                         recv_meta.recv[0].data.ptr_ + recv_meta.recv[0].size);
+  std::string received2(recv_meta.recv[1].data.ptr_,
+                         recv_meta.recv[1].data.ptr_ + recv_meta.recv[1].size);
   std::cout << "Bulk 1: " << received1 << "\n";
   std::cout << "Bulk 2: " << received2 << "\n";
   assert(received1 == data1);
@@ -148,8 +133,8 @@ void TestMultipleBulks() {
   std::string addr = "127.0.0.1";
   int port = 8194;
 
-  auto server = std::make_unique<SocketServer>(addr, "tcp", port);
-  auto client = std::make_unique<SocketClient>(addr, "tcp", port);
+  auto server = std::make_unique<SocketTransport>(TransportMode::kServer, addr, "tcp", port);
+  auto client = std::make_unique<SocketTransport>(TransportMode::kClient, addr, "tcp", port);
 
   std::vector<std::string> data_chunks = {"Chunk 1", "Chunk 2 is longer",
                                           "Chunk 3", "Final chunk 4"};
@@ -169,37 +154,24 @@ void TestMultipleBulks() {
   LbmMeta recv_meta;
   int attempts = 0;
   while (true) {
-    rc = server->RecvMetadata(recv_meta);
+    auto info = server->Recv(recv_meta);
+    rc = info.rc;
     if (rc == 0) break;
     if (rc != EAGAIN) {
-      std::cerr << "RecvMetadata failed with error: " << rc << "\n";
+      std::cerr << "Recv failed with error: " << rc << "\n";
       return;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
     if (++attempts > 5000) {
-      std::cerr << "RecvMetadata timed out\n";
+      std::cerr << "Recv timed out\n";
       return;
     }
   }
   assert(recv_meta.send.size() == data_chunks.size());
 
-  std::vector<std::vector<char>> recv_buffers;
-  for (size_t i = 0; i < recv_meta.send.size(); ++i) {
-    recv_buffers.emplace_back(recv_meta.send[i].size);
-    recv_meta.recv.push_back(server->Expose(
-        hipc::FullPtr<char>(recv_buffers[i].data()),
-        recv_buffers[i].size(),
-        recv_meta.send[i].flags.bits_));
-  }
-
-  rc = server->RecvBulks(recv_meta);
-  if (rc != 0) {
-    std::cerr << "RecvBulks failed with error: " << rc << "\n";
-    return;
-  }
-
   for (size_t i = 0; i < data_chunks.size(); ++i) {
-    std::string received(recv_buffers[i].begin(), recv_buffers[i].end());
+    std::string received(recv_meta.recv[i].data.ptr_,
+                         recv_meta.recv[i].data.ptr_ + recv_meta.recv[i].size);
     std::cout << "Chunk " << i << ": " << received << "\n";
     assert(received == data_chunks[i]);
   }
@@ -212,8 +184,8 @@ void TestUnixDomainSocket() {
 
   std::string sock_path = "/tmp/lightbeam_test.sock";
 
-  auto server = std::make_unique<SocketServer>(sock_path, "ipc", 0);
-  auto client = std::make_unique<SocketClient>(sock_path, "ipc", 0);
+  auto server = std::make_unique<SocketTransport>(TransportMode::kServer, sock_path, "ipc", 0);
+  auto client = std::make_unique<SocketTransport>(TransportMode::kClient, sock_path, "ipc", 0);
 
   const char* data = "IPC test data over Unix socket";
   size_t size = strlen(data);
@@ -234,30 +206,24 @@ void TestUnixDomainSocket() {
   TestMeta recv_meta;
   int attempts = 0;
   while (true) {
-    rc = server->RecvMetadata(recv_meta);
+    auto info = server->Recv(recv_meta);
+    rc = info.rc;
     if (rc == 0) break;
     if (rc != EAGAIN) {
-      std::cerr << "RecvMetadata failed: " << rc << "\n";
+      std::cerr << "Recv failed: " << rc << "\n";
       return;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
     if (++attempts > 5000) {
-      std::cerr << "RecvMetadata timed out\n";
+      std::cerr << "Recv timed out\n";
       return;
     }
   }
   assert(recv_meta.request_id == 99);
   assert(recv_meta.operation == "ipc_test");
 
-  std::vector<char> recv_buf(recv_meta.send[0].size);
-  recv_meta.recv.push_back(server->Expose(
-      hipc::FullPtr<char>(recv_buf.data()), recv_buf.size(),
-      recv_meta.send[0].flags.bits_));
-
-  rc = server->RecvBulks(recv_meta);
-  assert(rc == 0);
-
-  std::string received(recv_buf.begin(), recv_buf.end());
+  std::string received(recv_meta.recv[0].data.ptr_,
+                       recv_meta.recv[0].data.ptr_ + recv_meta.recv[0].size);
   std::cout << "Received: " << received << "\n";
   assert(received == data);
 
@@ -270,8 +236,8 @@ void TestMetadataOnly() {
   std::string addr = "127.0.0.1";
   int port = 8195;
 
-  auto server = std::make_unique<SocketServer>(addr, "tcp", port);
-  auto client = std::make_unique<SocketClient>(addr, "tcp", port);
+  auto server = std::make_unique<SocketTransport>(TransportMode::kServer, addr, "tcp", port);
+  auto client = std::make_unique<SocketTransport>(TransportMode::kClient, addr, "tcp", port);
 
   TestMeta send_meta;
   send_meta.request_id = 7;
@@ -284,15 +250,16 @@ void TestMetadataOnly() {
   TestMeta recv_meta;
   int attempts = 0;
   while (true) {
-    rc = server->RecvMetadata(recv_meta);
+    auto info = server->Recv(recv_meta);
+    rc = info.rc;
     if (rc == 0) break;
     if (rc != EAGAIN) {
-      std::cerr << "RecvMetadata failed: " << rc << "\n";
+      std::cerr << "Recv failed: " << rc << "\n";
       return;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
     if (++attempts > 5000) {
-      std::cerr << "RecvMetadata timed out\n";
+      std::cerr << "Recv timed out\n";
       return;
     }
   }

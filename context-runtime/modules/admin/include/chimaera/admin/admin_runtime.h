@@ -247,12 +247,12 @@ public:
   /**
    * Helper: Receive task inputs from remote node
    */
-  void RecvIn(hipc::FullPtr<RecvTask> task, chi::LoadTaskArchive& archive, hshm::lbm::Server* lbm_server);
+  void RecvIn(hipc::FullPtr<RecvTask> task, chi::LoadTaskArchive& archive, hshm::lbm::Transport* lbm_transport);
 
   /**
    * Helper: Receive task outputs from remote node
    */
-  void RecvOut(hipc::FullPtr<RecvTask> task, chi::LoadTaskArchive& archive, hshm::lbm::Server* lbm_server);
+  void RecvOut(hipc::FullPtr<RecvTask> task, chi::LoadTaskArchive& archive, hshm::lbm::Transport* lbm_transport);
 
   /**
    * Get remaining work count for this admin container

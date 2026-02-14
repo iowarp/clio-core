@@ -98,66 +98,54 @@ bool IpcManager::ClientInit() {
        ipc_mode_ == IpcMode::kShm ? "SHM" :
        ipc_mode_ == IpcMode::kIpc ? "IPC" : "TCP");
 
-  // Wait for local server to become available - critical for client
-  // functionality TestLocalServer sends heartbeat to verify connectivity
-  if (!WaitForLocalServer()) {
-    HLOG(kError, "CRITICAL ERROR: Cannot connect to local server.");
-    HLOG(kError, "Client initialization failed. Exiting.");
-    return false;
-  }
-
-  // Always create TCP lightbeam client/server and recv thread.
-  // Even in SHM mode, control-plane ops (e.g. RegisterMemory) use TCP.
+  // Create lightbeam transport for client-server communication
   {
     auto *config = CHI_CONFIG_MANAGER;
     u32 port = config->GetPort();
 
-    try {
-      zmq_client_ = hshm::lbm::TransportFactory::GetClient(
-          "127.0.0.1", hshm::lbm::Transport::kZeroMq, "tcp", port + 3);
-      HLOG(kInfo, "IpcManager: TCP lightbeam client connected to port {}",
-           port + 3);
-
-      zmq_response_server_ = hshm::lbm::TransportFactory::GetServer(
-          "127.0.0.1", hshm::lbm::Transport::kZeroMq, "tcp", port + 4);
-      HLOG(kInfo, "IpcManager: TCP response server bound on port {}",
-           port + 4);
-    } catch (const std::exception &e) {
-      HLOG(kError,
-           "IpcManager::ClientInit: Failed to create TCP lightbeam transport: {}",
-           e.what());
-      return false;
+    if (ipc_mode_ == IpcMode::kIpc) {
+      // IPC mode: Unix domain socket transport
+      std::string ipc_path =
+          "/tmp/chimaera_" + std::to_string(port) + ".ipc";
+      try {
+        zmq_transport_ = hshm::lbm::TransportFactory::Get(
+            ipc_path, hshm::lbm::TransportType::kSocket,
+            hshm::lbm::TransportMode::kClient, "ipc", 0);
+        HLOG(kInfo, "IpcManager: IPC transport connected to {}", ipc_path);
+      } catch (const std::exception &e) {
+        HLOG(kError,
+             "IpcManager::ClientInit: Failed to create IPC transport: {}",
+             e.what());
+        return false;
+      }
+    } else {
+      // TCP mode: ZMQ DEALER transport
+      try {
+        zmq_transport_ = hshm::lbm::TransportFactory::Get(
+            "127.0.0.1", hshm::lbm::TransportType::kZeroMq,
+            hshm::lbm::TransportMode::kClient, "tcp", port + 3);
+        HLOG(kInfo, "IpcManager: DEALER transport connected to port {}",
+             port + 3);
+      } catch (const std::exception &e) {
+        HLOG(kError,
+             "IpcManager::ClientInit: Failed to create DEALER transport: {}",
+             e.what());
+        return false;
+      }
     }
 
     zmq_recv_running_.store(true);
     zmq_recv_thread_ = std::thread([this]() { RecvZmqClientThread(); });
   }
 
-  // IPC mode: Override zmq_client_/zmq_response_server_ with UDS transport
-  if (ipc_mode_ == IpcMode::kIpc) {
-    auto *config = CHI_CONFIG_MANAGER;
-    u32 port = config->GetPort();
-    std::string ipc_path =
-        "/tmp/chimaera_" + std::to_string(port) + ".ipc";
-    std::string ipc_response_path =
-        "/tmp/chimaera_" + std::to_string(port) + "_response.ipc";
-
-    try {
-      zmq_client_ = hshm::lbm::TransportFactory::GetClient(
-          ipc_path, hshm::lbm::Transport::kSocket, "ipc", 0);
-      HLOG(kInfo, "IpcManager: IPC lightbeam client connected to {}",
-           ipc_path);
-
-      zmq_response_server_ = hshm::lbm::TransportFactory::GetServer(
-          ipc_response_path, hshm::lbm::Transport::kSocket, "ipc", 0);
-      HLOG(kInfo, "IpcManager: IPC response server bound on {}",
-           ipc_response_path);
-    } catch (const std::exception &e) {
-      HLOG(kError,
-           "IpcManager::ClientInit: Failed to create IPC lightbeam transport: {}",
-           e.what());
-      return false;
-    }
+  // Wait for local server using lightbeam transport
+  if (!WaitForLocalServer()) {
+    HLOG(kError, "CRITICAL ERROR: Cannot connect to local server.");
+    HLOG(kError, "Client initialization failed. Exiting.");
+    zmq_recv_running_.store(false);
+    if (zmq_recv_thread_.joinable()) zmq_recv_thread_.join();
+    zmq_transport_.reset();
+    return false;
   }
 
   // SHM mode: Attach to main SHM segment and initialize queues
@@ -181,11 +169,13 @@ bool IpcManager::ClientInit() {
       return false;
     }
 
-    // Create SHM lightbeam client/server for client-side transport
-    shm_client_ = hshm::lbm::TransportFactory::GetClient(
-        "", hshm::lbm::Transport::kShm);
-    shm_server_ = hshm::lbm::TransportFactory::GetServer(
-        "", hshm::lbm::Transport::kShm);
+    // Create SHM lightbeam transports for client-side transport
+    shm_send_transport_ = hshm::lbm::TransportFactory::Get(
+        "", hshm::lbm::TransportType::kShm,
+        hshm::lbm::TransportMode::kClient);
+    shm_recv_transport_ = hshm::lbm::TransportFactory::Get(
+        "", hshm::lbm::TransportType::kShm,
+        hshm::lbm::TransportMode::kServer);
   }
 
   // Retrieve node ID from shared header and store in this_host_
@@ -274,26 +264,28 @@ bool IpcManager::ServerInit() {
     HLOG(kDebug, "Scheduler initialized: {}", sched_name);
   }
 
-  // Create lightbeam PULL servers for client task reception
+  // Create lightbeam transports for client task reception
   {
     u32 port = config->GetPort();
 
     try {
-      // TCP PULL server on port+3
-      client_tcp_server_ = hshm::lbm::TransportFactory::GetServer(
-          "0.0.0.0", hshm::lbm::Transport::kZeroMq, "tcp", port + 3);
-      HLOG(kInfo, "IpcManager: TCP lightbeam server bound on port {}", port + 3);
+      // TCP ROUTER server on port+3
+      client_tcp_transport_ = hshm::lbm::TransportFactory::Get(
+          "0.0.0.0", hshm::lbm::TransportType::kZeroMq,
+          hshm::lbm::TransportMode::kServer, "tcp", port + 3);
+      HLOG(kInfo, "IpcManager: TCP ROUTER transport bound on port {}", port + 3);
     } catch (const std::exception &e) {
       HLOG(kError, "IpcManager::ServerInit: Failed to bind TCP server: {}",
            e.what());
     }
 
     try {
-      // IPC PULL server on Unix domain socket
+      // IPC server on Unix domain socket
       std::string ipc_path =
           "/tmp/chimaera_" + std::to_string(port) + ".ipc";
-      client_ipc_server_ = hshm::lbm::TransportFactory::GetServer(
-          ipc_path, hshm::lbm::Transport::kSocket, "ipc", 0);
+      client_ipc_transport_ = hshm::lbm::TransportFactory::Get(
+          ipc_path, hshm::lbm::TransportType::kSocket,
+          hshm::lbm::TransportMode::kServer, "ipc", 0);
       HLOG(kInfo, "IpcManager: IPC lightbeam server bound on {}", ipc_path);
     } catch (const std::exception &e) {
       HLOG(kError, "IpcManager::ServerInit: Failed to bind IPC server: {}",
@@ -324,8 +316,7 @@ void IpcManager::ClientFinalize() {
   }
 
   // Clean up lightbeam transport objects
-  zmq_client_.reset();
-  zmq_response_server_.reset();
+  zmq_transport_.reset();
 
   // Clients should not destroy shared resources
 }
@@ -336,14 +327,12 @@ void IpcManager::ServerFinalize() {
   }
 
   // Cleanup servers
-  local_server_.reset();
-  main_server_.reset();
+  local_transport_.reset();
+  main_transport_.reset();
 
   // Clean up lightbeam client transport objects
-  client_tcp_server_.reset();
-  client_ipc_server_.reset();
-  client_tcp_response_.reset();
-  client_ipc_response_.reset();
+  client_tcp_transport_.reset();
+  client_ipc_transport_.reset();
 
   // Cleanup task queue in shared header (queue handles cleanup automatically)
   // Only the last process to detach will actually destroy shared data
@@ -402,7 +391,7 @@ void IpcManager::AwakenWorker(TaskLane *lane) {
     pid_t runtime_pid = shared_header_ ? shared_header_->runtime_pid : getpid();
 
     // Send SIGUSR1 to the worker thread in the runtime process
-    int result = syscall(SYS_tgkill, runtime_pid, tid, SIGUSR1);
+    int result = hshm::lbm::EventManager::Signal(runtime_pid, tid);
     if (result == 0) {
       HLOG(kDebug,
            "AwakenWorker: Sent SIGUSR1 to runtime_pid={}, tid={} (active={}) - "
@@ -656,10 +645,11 @@ bool IpcManager::StartLocalServer() {
     std::string protocol = "tcp";
     u32 port = config->GetPort() + 1;  // Use ZMQ port + 1 for local server
 
-    local_server_ = hshm::lbm::TransportFactory::GetServer(
-        addr, hshm::lbm::Transport::kZeroMq, protocol, port);
+    local_transport_ = hshm::lbm::TransportFactory::Get(
+        addr, hshm::lbm::TransportType::kZeroMq,
+        hshm::lbm::TransportMode::kServer, protocol, port);
 
-    if (local_server_ != nullptr) {
+    if (local_transport_ != nullptr) {
       HLOG(kInfo, "Successfully started local server at {}:{}", addr, port);
       return true;
     }
@@ -673,96 +663,37 @@ bool IpcManager::StartLocalServer() {
 }
 
 bool IpcManager::WaitForLocalServer() {
-  ConfigManager *config = CHI_CONFIG_MANAGER;
-
   // Read environment variables for wait configuration
   const char *wait_env = std::getenv("CHI_WAIT_SERVER");
   if (wait_env != nullptr) {
     wait_server_timeout_ = static_cast<u32>(std::atoi(wait_env));
   }
 
-  // Heartbeat server runs on port+2 (main server on port, PULL on port+1)
-  u32 heartbeat_port = config->GetPort() + 2;
-  HLOG(kInfo, "Waiting for runtime heartbeat on 127.0.0.1:{} (timeout={}s)",
-       heartbeat_port, wait_server_timeout_);
+  HLOG(kInfo, "Waiting for runtime via lightbeam (timeout={}s)",
+       wait_server_timeout_);
 
-  // Create ZeroMQ REQ socket for heartbeat request/response
-  void *hb_ctx = zmq_ctx_new();
-  if (hb_ctx == nullptr) {
-    HLOG(kError, "Failed to create ZMQ context");
-    return false;
-  }
+  // Send a ClientConnectTask via the lightbeam transport
+  auto task = NewTask<chimaera::admin::ClientConnectTask>(
+      CreateTaskId(), kAdminPoolId, PoolQuery::Local());
+  auto future = SendZmq(task, ipc_mode_);
 
-  void *hb_socket = zmq_socket(hb_ctx, ZMQ_REQ);
-  if (hb_socket == nullptr) {
-    HLOG(kError, "Failed to create ZMQ REQ socket");
-    zmq_ctx_destroy(hb_ctx);
-    return false;
-  }
-
-  // Set linger to 0 so close doesn't block
-  int linger = 0;
-  zmq_setsockopt(hb_socket, ZMQ_LINGER, &linger, sizeof(linger));
-
-  // Set receive timeout in milliseconds
-  int timeout_ms = static_cast<int>(wait_server_timeout_ * 1000);
-  zmq_setsockopt(hb_socket, ZMQ_RCVTIMEO, &timeout_ms, sizeof(timeout_ms));
-
-  // Connect to heartbeat server
-  std::string url = "tcp://127.0.0.1:" + std::to_string(heartbeat_port);
-  int rc = zmq_connect(hb_socket, url.c_str());
-  if (rc == -1) {
-    HLOG(kError, "Failed to connect to heartbeat server at {}: {}", url,
-         zmq_strerror(zmq_errno()));
-    zmq_close(hb_socket);
-    zmq_ctx_destroy(hb_ctx);
-    return false;
-  }
-
-  // Send heartbeat request (value 1)
-  int32_t request = 1;
-  rc = zmq_send(hb_socket, &request, sizeof(request), 0);
-  if (rc == -1) {
-    HLOG(kError, "Failed to send heartbeat request: {}",
-         zmq_strerror(zmq_errno()));
-    zmq_close(hb_socket);
-    zmq_ctx_destroy(hb_ctx);
-    return false;
-  }
-  HLOG(kDebug, "Sent heartbeat request, waiting for response...");
-
-  // RECEIVE heartbeat response (blocking with timeout)
-  int32_t response = -1;
-  rc = zmq_recv(hb_socket, &response, sizeof(response), 0);
-  if (rc == -1) {
-    int err = zmq_errno();
-    if (err == EAGAIN) {
-      HLOG(kError, "Timeout waiting for runtime after {} seconds",
-           wait_server_timeout_);
-    } else {
-      HLOG(kError, "Failed to receive heartbeat response: {}",
-           zmq_strerror(err));
-    }
+  // Wait for response with timeout
+  if (!future.Wait(static_cast<float>(wait_server_timeout_))) {
+    HLOG(kError, "Timeout waiting for runtime after {} seconds",
+         wait_server_timeout_);
     HLOG(kError, "This usually means:");
     HLOG(kError, "1. Chimaera runtime is not running");
-    HLOG(kError, "2. Runtime failed to start heartbeat server");
+    HLOG(kError, "2. Runtime failed to start");
     HLOG(kError, "3. Network connectivity issues");
-    zmq_close(hb_socket);
-    zmq_ctx_destroy(hb_ctx);
     return false;
   }
 
-  // Check response value (0 = success)
-  HLOG(kInfo, "Received heartbeat response: {}", response);
-  zmq_close(hb_socket);
-  zmq_ctx_destroy(hb_ctx);
-
-  if (response == 0) {
-    HLOG(kInfo, "Successfully connected to runtime (heartbeat received)");
+  if (task->response_ == 0) {
+    HLOG(kInfo, "Successfully connected to runtime");
     return true;
   }
 
-  HLOG(kError, "Runtime responded with error code: {}", response);
+  HLOG(kError, "Runtime responded with error code: {}", task->response_);
   return false;
 }
 
@@ -977,10 +908,11 @@ bool IpcManager::TryStartMainServer(const std::string &hostname) {
 
     HLOG(kDebug, "Attempting to start main server on {}:{}", hostname, port);
 
-    main_server_ = hshm::lbm::TransportFactory::GetServer(
-        hostname, hshm::lbm::Transport::kZeroMq, protocol, port);
+    main_transport_ = hshm::lbm::TransportFactory::Get(
+        hostname, hshm::lbm::TransportType::kZeroMq,
+        hshm::lbm::TransportMode::kServer, protocol, port);
 
-    if (!main_server_) {
+    if (!main_transport_) {
       HLOG(kDebug,
            "Failed to create main server on {}:{} - server creation returned "
            "null",
@@ -989,44 +921,6 @@ bool IpcManager::TryStartMainServer(const std::string &hostname) {
     }
 
     HLOG(kDebug, "Main server successfully bound to {}:{}", hostname, port);
-
-    // Create heartbeat server on port+2 for client connection verification
-    // Heartbeat server binds to loopback (127.0.0.1) since it's only used
-    // for local client verification, not distributed communication
-    u32 heartbeat_port = port + 2;
-    std::string heartbeat_host = "127.0.0.1";
-    HLOG(kDebug, "Starting heartbeat server on {}:{}", heartbeat_host,
-         heartbeat_port);
-
-    // Create raw ZMQ context and REP socket for heartbeat
-    connect_ctx_ = zmq_ctx_new();
-    if (connect_ctx_ == nullptr) {
-      HLOG(kError, "Failed to create ZMQ context for heartbeat server");
-      return false;
-    }
-
-    connect_socket_ = zmq_socket(connect_ctx_, ZMQ_REP);
-    if (connect_socket_ == nullptr) {
-      HLOG(kError, "Failed to create ZMQ REP socket for heartbeat server");
-      zmq_ctx_destroy(connect_ctx_);
-      connect_ctx_ = nullptr;
-      return false;
-    }
-
-    std::string heartbeat_url = protocol + "://" + heartbeat_host + ":" +
-                                std::to_string(heartbeat_port);
-    int rc = zmq_bind(connect_socket_, heartbeat_url.c_str());
-    if (rc == -1) {
-      HLOG(kError, "Failed to bind heartbeat server to {}: {}", heartbeat_url,
-           zmq_strerror(zmq_errno()));
-      zmq_close(connect_socket_);
-      zmq_ctx_destroy(connect_ctx_);
-      connect_socket_ = nullptr;
-      connect_ctx_ = nullptr;
-      return false;
-    }
-
-    HLOG(kInfo, "Heartbeat server started on {}", heartbeat_url);
 
     return true;
 
@@ -1041,66 +935,16 @@ bool IpcManager::TryStartMainServer(const std::string &hostname) {
   }
 }
 
-hshm::lbm::Server *IpcManager::GetMainServer() const {
-  return main_server_.get();
+hshm::lbm::Transport *IpcManager::GetMainTransport() const {
+  return main_transport_.get();
 }
 
-void *IpcManager::GetClientConnectSocket() const { return connect_socket_; }
-
-hshm::lbm::Server *IpcManager::GetClientServer(IpcMode mode) const {
-  if (mode == IpcMode::kTcp) return client_tcp_server_.get();
-  if (mode == IpcMode::kIpc) return client_ipc_server_.get();
+hshm::lbm::Transport *IpcManager::GetClientTransport(IpcMode mode) const {
+  if (mode == IpcMode::kTcp) return client_tcp_transport_.get();
+  if (mode == IpcMode::kIpc) return client_ipc_transport_.get();
   return nullptr;
 }
 
-hshm::lbm::Client *IpcManager::GetClientResponseClient(IpcMode mode) {
-  // Fast path: check if already initialized without taking the lock
-  if (mode == IpcMode::kTcp) {
-    if (client_tcp_response_) return client_tcp_response_.get();
-  } else if (mode == IpcMode::kIpc) {
-    if (client_ipc_response_) return client_ipc_response_.get();
-  } else {
-    return nullptr;
-  }
-
-  // Slow path: take lock and initialize
-  std::lock_guard<std::mutex> lock(client_response_mutex_);
-  auto *config = CHI_CONFIG_MANAGER;
-  u32 port = config->GetPort();
-
-  if (mode == IpcMode::kTcp) {
-    if (!client_tcp_response_) {
-      try {
-        client_tcp_response_ = hshm::lbm::TransportFactory::GetClient(
-            "127.0.0.1", hshm::lbm::Transport::kZeroMq, "tcp", port + 4);
-        HLOG(kInfo, "IpcManager: Created TCP response client to port {}",
-             port + 4);
-      } catch (const std::exception &e) {
-        HLOG(kError, "IpcManager: Failed to create TCP response client: {}",
-             e.what());
-        return nullptr;
-      }
-    }
-    return client_tcp_response_.get();
-  } else if (mode == IpcMode::kIpc) {
-    if (!client_ipc_response_) {
-      try {
-        std::string ipc_response_path =
-            "/tmp/chimaera_" + std::to_string(port) + "_response.ipc";
-        client_ipc_response_ = hshm::lbm::TransportFactory::GetClient(
-            ipc_response_path, hshm::lbm::Transport::kSocket, "ipc", 0);
-        HLOG(kInfo, "IpcManager: Created IPC response client to {}",
-             ipc_response_path);
-      } catch (const std::exception &e) {
-        HLOG(kError, "IpcManager: Failed to create IPC response client: {}",
-             e.what());
-        return nullptr;
-      }
-    }
-    return client_ipc_response_.get();
-  }
-  return nullptr;
-}
 
 const Host &IpcManager::GetThisHost() const { return this_host_; }
 
@@ -1218,8 +1062,8 @@ void IpcManager::FreeBuffer(FullPtr<char> buffer_ptr) {
 #endif  // HSHM_IS_HOST
 }
 
-hshm::lbm::Client *IpcManager::GetOrCreateClient(const std::string &addr,
-                                                 int port) {
+hshm::lbm::Transport *IpcManager::GetOrCreateClient(const std::string &addr,
+                                                     int port) {
   // Create key for the pool map
   std::string key = addr + ":" + std::to_string(port);
 
@@ -1235,17 +1079,18 @@ hshm::lbm::Client *IpcManager::GetOrCreateClient(const std::string &addr,
 
   // Create new persistent client connection
   HLOG(kInfo, "[ClientPool] Creating new persistent connection to {}", key);
-  auto client = hshm::lbm::TransportFactory::GetClient(
-      addr, hshm::lbm::Transport::kZeroMq, "tcp", port);
+  auto transport = hshm::lbm::TransportFactory::Get(
+      addr, hshm::lbm::TransportType::kZeroMq,
+      hshm::lbm::TransportMode::kClient, "tcp", port);
 
-  if (!client) {
+  if (!transport) {
     HLOG(kError, "[ClientPool] Failed to create client for {}", key);
     return nullptr;
   }
 
   // Store in pool and return raw pointer
-  hshm::lbm::Client *raw_ptr = client.get();
-  client_pool_[key] = std::move(client);
+  hshm::lbm::Transport *raw_ptr = transport.get();
+  client_pool_[key] = std::move(transport);
 
   HLOG(kInfo, "[ClientPool] Connection established to {}", key);
   return raw_ptr;
@@ -1750,50 +1595,33 @@ bool IpcManager::GetIsClientThread() const {
 
 void IpcManager::RecvZmqClientThread() {
   // Client-side thread: polls for completed task responses from the server
-  if (!zmq_response_server_) {
-    HLOG(kError, "RecvZmqClientThread: No response server");
+  // DEALER transport receives responses on the same socket used for sending
+  if (!zmq_transport_) {
+    HLOG(kError, "RecvZmqClientThread: No DEALER transport");
     return;
   }
 
-  // Set up epoll via transport's PollConnect
-  int epoll_fd = epoll_create1(0);
-  zmq_response_server_->PollConnect(epoll_fd);
+  // Set up EventManager for ZMQ transport polling
+  hshm::lbm::EventManager em;
+  zmq_transport_->RegisterEventManager(em);
 
   while (zmq_recv_running_.load()) {
-    // Accept new clients (auto-registered with epoll by PollConnect)
-    zmq_response_server_->AcceptNewClients();
-
     // Drain all available messages first
     bool drained_any = false;
     bool got_message = true;
     while (got_message) {
       got_message = false;
       auto archive = std::make_unique<LoadTaskArchive>();
-      int rc = zmq_response_server_->RecvMetadata(*archive);
+      auto info = zmq_transport_->Recv(*archive);
+      int rc = info.rc;
       if (rc == EAGAIN) break;
       if (rc != 0) {
-        HLOG(kError, "RecvZmqClientThread: RecvMetadata failed: {}", rc);
+        HLOG(kError, "RecvZmqClientThread: Recv failed: {}", rc);
+        zmq_transport_->ClearRecvHandles(*archive);
         continue;
       }
       got_message = true;
       drained_any = true;
-
-      // Set up recv entries with null data.ptr_ for zero-copy recv
-      for (const auto &send_bulk : archive->send) {
-        hshm::lbm::Bulk bulk;
-        bulk.size = send_bulk.size;
-        bulk.flags = send_bulk.flags;
-        bulk.data.ptr_ = nullptr;  // Null triggers zero-copy in RecvBulks
-        archive->recv.push_back(bulk);
-      }
-
-      // Receive all bulk data (zero-copy: zmq owns the buffers)
-      rc = zmq_response_server_->RecvBulks(*archive);
-      if (rc != 0) {
-        HLOG(kError, "RecvZmqClientThread: RecvBulks failed: {}", rc);
-        zmq_response_server_->ClearRecvHandles(*archive);
-        continue;
-      }
 
       // Look up pending future by net_key from task_infos
       if (archive->task_infos_.empty()) {
@@ -1807,7 +1635,7 @@ void IpcManager::RecvZmqClientThread() {
       if (it == pending_zmq_futures_.end()) {
         HLOG(kError, "RecvZmqClientThread: No pending future for net_key {}",
              net_key);
-        zmq_response_server_->ClearRecvHandles(*archive);
+        zmq_transport_->ClearRecvHandles(*archive);
         continue;
       }
 
@@ -1830,17 +1658,16 @@ void IpcManager::RecvZmqClientThread() {
     // Only block on epoll when the drain loop found nothing;
     // if we just processed messages, loop back immediately.
     if (!drained_any) {
-      zmq_response_server_->PollWait(10);
+      em.Wait(10000);  // 10ms in microseconds
     }
   }
-  close(epoll_fd);
 }
 
 void IpcManager::CleanupResponseArchive(size_t net_key) {
   std::lock_guard<std::mutex> lock(pending_futures_mutex_);
   auto it = pending_response_archives_.find(net_key);
   if (it != pending_response_archives_.end()) {
-    zmq_response_server_->ClearRecvHandles(*(it->second));
+    zmq_transport_->ClearRecvHandles(*(it->second));
     pending_response_archives_.erase(it);
   }
 }

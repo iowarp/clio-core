@@ -360,12 +360,13 @@ WorkerIOContext *Runtime::GetWorkerIOContext(size_t worker_id) {
     chi::Worker *worker = CHI_CUR_WORKER;
     if (worker != nullptr && ctx->event_fd_ >= 0) {
       // Store context pointer as user data for epoll event handling
-      if (!worker->RegisterEpollFd(ctx->event_fd_, EPOLLIN, ctx)) {
-        HLOG(kWarning, "Failed to register eventfd with worker {} epoll",
+      auto &em = worker->GetEventManager();
+      if (em.AddEvent(ctx->event_fd_, EPOLLIN) < 0) {
+        HLOG(kWarning, "Failed to register eventfd with worker {} EventManager",
              worker_id);
         // Continue anyway - we can fall back to polling
       } else {
-        HLOG(kDebug, "Registered eventfd {} with worker {} epoll",
+        HLOG(kDebug, "Registered eventfd {} with worker {} EventManager",
              ctx->event_fd_, worker_id);
       }
     }

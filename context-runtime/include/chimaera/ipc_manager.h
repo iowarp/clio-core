@@ -622,9 +622,9 @@ class IpcManager {
       AwakenWorker(&lane);
     }
 
-    SaveTaskArchive archive(MsgType::kSerializeIn, shm_client_.get());
+    SaveTaskArchive archive(MsgType::kSerializeIn, shm_send_transport_.get());
     archive << (*task_ptr.ptr_);
-    shm_client_->Send(archive, ctx);
+    shm_send_transport_->Send(archive, ctx);
 
     return future;
   }
@@ -648,7 +648,7 @@ class IpcManager {
     task_ptr->task_id_.net_key_ = net_key;
 
     // Serialize the task inputs using network archive
-    SaveTaskArchive archive(MsgType::kSerializeIn, zmq_client_.get());
+    SaveTaskArchive archive(MsgType::kSerializeIn, zmq_transport_.get());
     archive << (*task_ptr.ptr_);
 
     // Allocate FutureShm via HSHM_MALLOC (no copy_space needed)
@@ -679,7 +679,7 @@ class IpcManager {
     // Send via lightbeam PUSH client
     {
       std::lock_guard<std::mutex> lock(zmq_client_send_mutex_);
-      zmq_client_->Send(archive, hshm::lbm::LbmContext());
+      zmq_transport_->Send(archive, hshm::lbm::LbmContext());
     }
 
     // Create Future wrapping the HSHM_MALLOC-allocated FutureShm
@@ -702,7 +702,7 @@ class IpcManager {
    * @param future Future containing completed task
    */
   template <typename TaskT>
-  void Recv(Future<TaskT> &future) {
+  bool Recv(Future<TaskT> &future, float max_sec = 0) {
     bool is_runtime = CHI_CHIMAERA_MANAGER->IsRuntime();
 
     if (!is_runtime) {
@@ -714,8 +714,15 @@ class IpcManager {
           origin == FutureShm::FUTURE_CLIENT_IPC) {
         // ZMQ PATH: Wait for RecvZmqClientThread to set FUTURE_COMPLETE
         hshm::abitfield32_t &flags = future_shm->flags_;
+        auto start = std::chrono::steady_clock::now();
         while (!flags.Any(FutureShm::FUTURE_COMPLETE)) {
           HSHM_THREAD_MODEL->Yield();
+          if (max_sec > 0) {
+            float elapsed = std::chrono::duration<float>(
+                                std::chrono::steady_clock::now() - start)
+                                .count();
+            if (elapsed >= max_sec) return false;
+          }
         }
 
         // Memory fence
@@ -745,18 +752,8 @@ class IpcManager {
 
         // Receive via SHM transport (blocking - spins until worker sends)
         LoadTaskArchive archive;
-        shm_server_->RecvMetadata(archive, ctx);
-
-        // Set up recv entries from send descriptors
-        for (const auto &send_bulk : archive.send) {
-          hshm::lbm::Bulk bulk;
-          bulk.size = send_bulk.size;
-          bulk.flags = send_bulk.flags;
-          bulk.data.ptr_ = nullptr;
-          archive.recv.push_back(bulk);
-        }
-
-        shm_server_->RecvBulks(archive, ctx);
+        auto info = shm_recv_transport_->Recv(archive, ctx);
+        (void)info;
 
         // Wait for FUTURE_COMPLETE (worker sets after Send returns)
         hshm::abitfield32_t &flags = future_shm->flags_;
@@ -771,6 +768,7 @@ class IpcManager {
       }
     }
     // RUNTIME PATH: No deserialization needed
+    return true;
   }
 
   /**
@@ -884,7 +882,7 @@ class IpcManager {
    * @param port Port of the new node's runtime
    * @return Assigned node ID for the new node
    */
-  u64 AddNode(const std::string& ip_address, u32 port);
+  u64 AddNode(const std::string &ip_address, u32 port);
 
   /**
    * Identify current host from hostfile by attempting TCP server binding
@@ -907,13 +905,7 @@ class IpcManager {
    * Get the main ZeroMQ server for network communication
    * @return Pointer to main server or nullptr if not initialized
    */
-  hshm::lbm::Server *GetMainServer() const;
-
-  /**
-   * Get the client connect socket for polling connect requests
-   * @return Raw ZMQ REP socket pointer, or nullptr if not initialized
-   */
-  void *GetClientConnectSocket() const;
+  hshm::lbm::Transport *GetMainTransport() const;
 
   /**
    * Get this host identified during host identification
@@ -926,15 +918,7 @@ class IpcManager {
    * @param mode IPC mode (kTcp or kIpc)
    * @return Lightbeam Server pointer, or nullptr
    */
-  hshm::lbm::Server *GetClientServer(IpcMode mode) const;
-
-  /**
-   * Get or create the lightbeam client for sending responses to clients
-   * Lazy-initialized on first call
-   * @param mode IPC mode (kTcp or kIpc)
-   * @return Lightbeam Client pointer, or nullptr
-   */
-  hshm::lbm::Client *GetClientResponseClient(IpcMode mode);
+  hshm::lbm::Transport *GetClientTransport(IpcMode mode) const;
 
   /**
    * Client-side thread that receives completed task outputs via lightbeam
@@ -1073,7 +1057,7 @@ class IpcManager {
    * @param port Port number to connect to
    * @return Pointer to the ZeroMQ client (owned by the pool)
    */
-  hshm::lbm::Client *GetOrCreateClient(const std::string &addr, int port);
+  hshm::lbm::Transport *GetOrCreateClient(const std::string &addr, int port);
 
   /**
    * Clear all cached client connections
@@ -1129,7 +1113,6 @@ class IpcManager {
    * @return Pointer to the scheduler or nullptr if not initialized
    */
   Scheduler *GetScheduler() { return scheduler_.get(); }
-
 
   /**
    * Register an existing shared memory segment into the IpcManager
@@ -1235,17 +1218,17 @@ class IpcManager {
   bool ClientInitQueues();
 
   /**
-   * Wait for local server to become available using heartbeat mechanism
-   * Sends ZMQ_REQ heartbeat and waits for ZMQ_REP response with timeout
+   * Wait for local server to become available via lightbeam transport
+   * Sends a ClientConnectTask and waits for response with timeout
    * Uses CHI_WAIT_SERVER environment variable for timeout (default 30s)
-   * @return true if heartbeat response received, false on timeout
+   * @return true if server responded, false on timeout
    */
   bool WaitForLocalServer();
 
   /**
    * Try to start main server on given hostname
    * Helper method for host identification
-   * Uses ZMQ port from ConfigManager and sets main_server_
+   * Uses ZMQ port from ConfigManager and sets main_transport_
    * @param hostname Hostname to bind to
    * @return true if server started successfully, false otherwise
    */
@@ -1280,38 +1263,28 @@ class IpcManager {
   std::vector<hipc::FullPtr<TaskQueue>> gpu_queues_;
 #endif
 
-  // Local ZeroMQ server (using lightbeam)
-  std::unique_ptr<hshm::lbm::Server> local_server_;
+  // Local ZeroMQ transport (server mode, using lightbeam)
+  std::unique_ptr<hshm::lbm::Transport> local_transport_;
 
-  // Main ZeroMQ server for distributed communication
-  std::unique_ptr<hshm::lbm::Server> main_server_;
-
-  // Client connect server for connection verification (ZMQ_REP)
-  void *connect_ctx_;     ///< ZMQ context for client connect server
-  void *connect_socket_;  ///< ZMQ REP socket for client connect server
+  // Main ZeroMQ transport (server mode) for distributed communication
+  std::unique_ptr<hshm::lbm::Transport> main_transport_;
 
   // IPC transport mode (TCP default, configurable via CHI_IPC_MODE)
   IpcMode ipc_mode_ = IpcMode::kTcp;
 
-  // SHM lightbeam transport (client-side, for SendShm / RecvShm)
-  std::unique_ptr<hshm::lbm::Client> shm_client_;
-  std::unique_ptr<hshm::lbm::Server> shm_server_;
+  // SHM lightbeam transport (for SendShm / RecvShm)
+  std::unique_ptr<hshm::lbm::Transport> shm_send_transport_;
+  std::unique_ptr<hshm::lbm::Transport> shm_recv_transport_;
 
-  // Client-side: lightbeam PUSH client for sending tasks to server
-  std::unique_ptr<hshm::lbm::Client> zmq_client_;
+  // Client-side: DEALER transport for sending tasks and receiving responses
+  std::unique_ptr<hshm::lbm::Transport> zmq_transport_;
   std::mutex zmq_client_send_mutex_;
 
-  // Client-side: lightbeam PULL server for receiving responses from server
-  std::unique_ptr<hshm::lbm::Server> zmq_response_server_;
-
-  // Server-side: lightbeam PULL servers for receiving client tasks
-  std::unique_ptr<hshm::lbm::Server> client_tcp_server_;
-  std::unique_ptr<hshm::lbm::Server> client_ipc_server_;
-
-  // Server-side: lightbeam PUSH clients for sending responses to clients
-  std::unique_ptr<hshm::lbm::Client> client_tcp_response_;
-  std::unique_ptr<hshm::lbm::Client> client_ipc_response_;
-  std::mutex client_response_mutex_;
+  // Server-side: ROUTER transport for receiving client tasks and sending
+  // responses
+  std::unique_ptr<hshm::lbm::Transport> client_tcp_transport_;
+  // Server-side: Socket transport for IPC client communication
+  std::unique_ptr<hshm::lbm::Transport> client_ipc_transport_;
 
   // Client recv thread (receives completed task outputs via lightbeam)
   std::thread zmq_recv_thread_;
@@ -1340,9 +1313,9 @@ class IpcManager {
   u32 poll_server_interval_ =
       1;  // CHI_POLL_SERVER: poll interval in seconds (default 1)
 
-  // Persistent ZeroMQ client connection pool
+  // Persistent ZeroMQ transport connection pool
   // Key format: "ip_address:port"
-  std::unordered_map<std::string, std::unique_ptr<hshm::lbm::Client>>
+  std::unordered_map<std::string, std::unique_ptr<hshm::lbm::Transport>>
       client_pool_;
   mutable std::mutex client_pool_mutex_;  // Mutex for thread-safe pool access
 
@@ -1392,8 +1365,9 @@ class IpcManager {
  private:
 #if HSHM_IS_HOST
   /**
-   * Create a new per-process shared memory segment and register it with the runtime
-   * Client-only: sends Admin::RegisterMemory and waits for the server to attach
+   * Create a new per-process shared memory segment and register it with the
+   * runtime Client-only: sends Admin::RegisterMemory and waits for the server
+   * to attach
    * @param size Size in bytes to allocate (32MB will be added for metadata)
    * @return true if successful, false otherwise
    */
@@ -1503,7 +1477,8 @@ inline HSHM_CROSS_FUN void IpcManager::FreeBuffer(FullPtr<char> buffer_ptr) {
 }
 #endif  // !HSHM_IS_HOST
 
-// ~Future() implementation - frees resources if consumed (via Wait/await_resume)
+// ~Future() implementation - frees resources if consumed (via
+// Wait/await_resume)
 template <typename TaskT, typename AllocT>
 HSHM_CROSS_FUN Future<TaskT, AllocT>::~Future() {
 #if HSHM_IS_HOST
@@ -1523,11 +1498,6 @@ HSHM_CROSS_FUN Future<TaskT, AllocT>::~Future() {
       CHI_IPC->FreeBuffer(buffer_shm);
       future_shm_.SetNull();
     }
-    // Free the task
-    if (!task_ptr_.IsNull()) {
-      CHI_IPC->DelTask(task_ptr_);
-      task_ptr_.SetNull();
-    }
   }
 #endif
 }
@@ -1544,17 +1514,17 @@ Future<TaskT, AllocT>::GetFutureShm() const {
 }
 
 template <typename TaskT, typename AllocT>
-void Future<TaskT, AllocT>::Wait() {
+bool Future<TaskT, AllocT>::Wait(float max_sec) {
 #if HSHM_IS_GPU
   // GPU PATH: Simple polling loop checking FUTURE_COMPLETE flag
   if (future_shm_.IsNull()) {
-    return;  // Nothing to wait for
+    return true;  // Nothing to wait for
   }
 
   // Poll the complete flag until task finishes
   auto future_shm = GetFutureShm();
   if (future_shm.IsNull()) {
-    return;
+    return true;
   }
 
   // Busy-wait polling the complete flag
@@ -1563,13 +1533,14 @@ void Future<TaskT, AllocT>::Wait() {
     __threadfence();
     __nanosleep(5);
   }
+  return true;
 #else
   if (!task_ptr_.IsNull() && !future_shm_.IsNull()) {
     // Convert ShmPtr to FullPtr to access flags_
     hipc::FullPtr<FutureShm> future_full = CHI_IPC->ToFullPtr(future_shm_);
     if (future_full.IsNull()) {
       HLOG(kError, "Future::Wait: ToFullPtr returned null for future_shm_");
-      return;
+      return false;
     }
 
     // Determine path: client vs runtime
@@ -1579,20 +1550,30 @@ void Future<TaskT, AllocT>::Wait() {
       // RUNTIME PATH: Wait for FUTURE_COMPLETE (task outputs are direct,
       // no deserialization needed). Covers both worker threads and main thread.
       hshm::abitfield32_t &flags = future_full->flags_;
+      auto start = std::chrono::steady_clock::now();
       while (!flags.Any(FutureShm::FUTURE_COMPLETE)) {
         HSHM_THREAD_MODEL->Yield();
+        if (max_sec > 0) {
+          float elapsed = std::chrono::duration<float>(
+                              std::chrono::steady_clock::now() - start)
+                              .count();
+          if (elapsed >= max_sec) return false;
+        }
       }
     } else {
       // CLIENT PATH: Call Recv() to handle SHM lightbeam or ZMQ streaming
       // FUTURE_COMPLETE will be set by worker after all data is sent
       // Don't wait for FUTURE_COMPLETE first - that causes deadlock for
       // streaming
-      CHI_IPC->Recv(*this);
+      if (!CHI_IPC->Recv(*this, max_sec)) {
+        return false;
+      }
     }
 
     // PostWait + free FutureShm; task freed by ~Future()
     Destroy(true);
   }
+  return true;
 #endif
 }
 

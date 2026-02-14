@@ -48,6 +48,7 @@
 #include <cereal/types/vector.hpp>
 #endif
 
+#include "hermes_shm/lightbeam/event_manager.h"
 #include "hermes_shm/memory/allocator/allocator.h"
 #include "hermes_shm/types/bitfield.h"
 
@@ -77,6 +78,13 @@ struct Bulk {
 #endif
 };
 
+// --- Client Info (returned by Recv, used by Send for routing) ---
+struct ClientInfo {
+  int rc = 0;               // Return code (0 = success, EAGAIN = no data, etc.)
+  int fd_ = -1;             // Socket fd (SocketTransport server mode)
+  std::string identity_;    // ZMQ identity (ZeroMqTransport server mode)
+};
+
 // --- Metadata Base Class ---
 class LbmMeta {
  public:
@@ -86,6 +94,7 @@ class LbmMeta {
       recv;  // Receiver's bulk descriptors (copy of send with local pointers)
   size_t send_bulks = 0;  // Count of BULK_XFER entries in send vector
   size_t recv_bulks = 0;  // Count of BULK_XFER entries in recv vector
+  ClientInfo client_info_;  // Client routing info (not serialized)
 
 #if HSHM_ENABLE_CEREAL
   template <typename Ar>
@@ -115,81 +124,37 @@ struct LbmContext {
   bool HasTimeout() const { return timeout_ms > 0; }
 };
 
-// --- Transport Enum ---
-enum class Transport { kZeroMq, kSocket, kShm };
+// --- Transport Type Enum ---
+enum class TransportType { kZeroMq, kSocket, kShm };
 
-// --- Client connection info returned by AcceptNewClients ---
-struct ClientInfo {
-  int fd;  /**< Client socket file descriptor */
-};
+// --- Transport Mode Enum ---
+enum class TransportMode { kClient, kServer };
 
-// --- Interfaces ---
-class Client {
+// --- Unified Transport Interface ---
+class Transport {
  public:
-  Transport type_;
+  TransportType type_;
+  TransportMode mode_;
 
-  virtual ~Client() = default;
+  Transport(TransportMode mode) : mode_(mode) {}
+  virtual ~Transport() = default;
 
-  /**
-   * @brief Register transport FDs with an external epoll instance.
-   * Stores the epoll_fd and adds the client socket FD to it.
-   * @param epoll_fd The external epoll file descriptor to register with.
-   */
-  virtual void PollConnect(int epoll_fd) { (void)epoll_fd; }
+  bool IsServer() const { return mode_ == TransportMode::kServer; }
+  bool IsClient() const { return mode_ == TransportMode::kClient; }
 
-  /**
-   * @brief Block on the stored epoll until data is available.
-   * @param timeout_ms Maximum wait time in milliseconds (default 10ms).
-   */
-  virtual void PollWait(int timeout_ms = 10) { (void)timeout_ms; }
-
-  // Expose from hipc::FullPtr
+  // Shared APIs (both client and server)
   virtual Bulk Expose(const hipc::FullPtr<char>& ptr, size_t data_size,
                       u32 flags) = 0;
 
   template <typename MetaT>
   int Send(MetaT& meta, const LbmContext& ctx = LbmContext());
-};
-
-class Server {
- public:
-  Transport type_;
-
-  virtual ~Server() = default;
-
-  // Expose from hipc::FullPtr
-  virtual Bulk Expose(const hipc::FullPtr<char>& ptr, size_t data_size,
-                      u32 flags) = 0;
-
-  /**
-   * @brief Register transport FDs with an external epoll instance.
-   * Stores the epoll_fd and adds the listen socket FD to it.
-   * @param epoll_fd The external epoll file descriptor to register with.
-   */
-  virtual void PollConnect(int epoll_fd) { (void)epoll_fd; }
-
-  /**
-   * @brief Block on the stored epoll until data is available.
-   * @param timeout_ms Maximum wait time in milliseconds (default 10ms).
-   */
-  virtual void PollWait(int timeout_ms = 10) { (void)timeout_ms; }
 
   template <typename MetaT>
-  int RecvMetadata(MetaT& meta, const LbmContext& ctx = LbmContext());
+  ClientInfo Recv(MetaT& meta, const LbmContext& ctx = LbmContext());
 
-  template <typename MetaT>
-  int RecvBulks(MetaT& meta, const LbmContext& ctx = LbmContext());
-
-  virtual std::string GetAddress() const = 0;
-
+  // Server-only APIs (no-op defaults for client mode)
+  virtual std::string GetAddress() const { return ""; }
   virtual int GetFd() const { return -1; }
-
-  /**
-   * @brief Accept pending client connections.
-   * New client FDs are also registered with the internal epoll.
-   * @return Vector of ClientInfo for each newly accepted client.
-   */
-  virtual std::vector<ClientInfo> AcceptNewClients() { return {}; }
 
   virtual void ClearRecvHandles(LbmMeta& meta) {
     for (auto& bulk : meta.recv) {
@@ -199,23 +164,22 @@ class Server {
       }
     }
   }
+
+  // Event registration API
+  virtual void RegisterEventManager(EventManager &em) { (void)em; }
 };
 
 // --- Factory ---
 class TransportFactory {
  public:
-  static std::unique_ptr<Client> GetClient(const std::string& addr, Transport t,
-                                           const std::string& protocol = "",
-                                           int port = 0);
-  static std::unique_ptr<Client> GetClient(const std::string& addr, Transport t,
-                                           const std::string& protocol,
-                                           int port, const std::string& domain);
-  static std::unique_ptr<Server> GetServer(const std::string& addr, Transport t,
-                                           const std::string& protocol = "",
-                                           int port = 0);
-  static std::unique_ptr<Server> GetServer(const std::string& addr, Transport t,
-                                           const std::string& protocol,
-                                           int port, const std::string& domain);
+  static std::unique_ptr<Transport> Get(const std::string& addr,
+                                        TransportType t, TransportMode mode,
+                                        const std::string& protocol = "",
+                                        int port = 0);
+  static std::unique_ptr<Transport> Get(const std::string& addr,
+                                        TransportType t, TransportMode mode,
+                                        const std::string& protocol, int port,
+                                        const std::string& domain);
 };
 
 }  // namespace hshm::lbm

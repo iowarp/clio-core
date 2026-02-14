@@ -5,7 +5,7 @@
 config:
   name: gray_scott_scaling
   pkgs:
-    - pkg_type: builtin.adios2_gray_scott
+    - pkg_type: jarvis_iowarp.adios2_gray_scott
       pkg_name: gsbench
       nprocs: 4
       ppn: 4

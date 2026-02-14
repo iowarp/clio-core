@@ -79,8 +79,8 @@ void TestBasicShmTransfer() {
   std::cout << "\n==== Testing SHM Basic Transfer ====\n";
 
   ShmTestContext shared;
-  ShmClient client;
-  ShmServer server;
+  ShmTransport client(TransportMode::kClient);
+  ShmTransport server(TransportMode::kServer);
   LbmContext ctx = MakeCtx(shared);
 
   const char* data1 = "Hello, World!";
@@ -107,7 +107,8 @@ void TestBasicShmTransfer() {
   });
 
   TestMeta recv_meta;
-  int rc = server.RecvMetadata(recv_meta, ctx);
+  auto info = server.Recv(recv_meta, ctx);
+  int rc = info.rc;
   assert(rc == 0);
   std::cout << "Server received metadata: request_id=" << recv_meta.request_id
             << ", operation=" << recv_meta.operation << "\n";
@@ -115,24 +116,13 @@ void TestBasicShmTransfer() {
   assert(recv_meta.operation == "shm_test");
   assert(recv_meta.send.size() == 2);
 
-  // Allocate receive buffers
-  std::vector<char> recv_buf1(recv_meta.send[0].size);
-  std::vector<char> recv_buf2(recv_meta.send[1].size);
-  recv_meta.recv.push_back(server.Expose(
-      hipc::FullPtr<char>(recv_buf1.data()), recv_buf1.size(),
-      recv_meta.send[0].flags.bits_));
-  recv_meta.recv.push_back(server.Expose(
-      hipc::FullPtr<char>(recv_buf2.data()), recv_buf2.size(),
-      recv_meta.send[1].flags.bits_));
-
-  rc = server.RecvBulks(recv_meta, ctx);
-  assert(rc == 0);
-
   sender.join();
   assert(send_rc == 0);
 
-  std::string received1(recv_buf1.begin(), recv_buf1.end());
-  std::string received2(recv_buf2.begin(), recv_buf2.end());
+  std::string received1(recv_meta.recv[0].data.ptr_,
+                         recv_meta.recv[0].data.ptr_ + recv_meta.recv[0].size);
+  std::string received2(recv_meta.recv[1].data.ptr_,
+                         recv_meta.recv[1].data.ptr_ + recv_meta.recv[1].size);
   std::cout << "Bulk 1: " << received1 << "\n";
   std::cout << "Bulk 2: " << received2 << "\n";
   assert(received1 == data1);
@@ -145,8 +135,8 @@ void TestMultipleBulks() {
   std::cout << "\n==== Testing SHM Multiple Bulks ====\n";
 
   ShmTestContext shared;
-  ShmClient client;
-  ShmServer server;
+  ShmTransport client(TransportMode::kClient);
+  ShmTransport server(TransportMode::kServer);
   LbmContext ctx = MakeCtx(shared);
 
   std::vector<std::string> data_chunks = {"Chunk 1", "Chunk 2 is longer",
@@ -167,27 +157,17 @@ void TestMultipleBulks() {
   });
 
   LbmMeta recv_meta;
-  int rc = server.RecvMetadata(recv_meta, ctx);
+  auto info = server.Recv(recv_meta, ctx);
+  int rc = info.rc;
   assert(rc == 0);
   assert(recv_meta.send.size() == data_chunks.size());
-
-  std::vector<std::vector<char>> recv_buffers;
-  for (size_t i = 0; i < recv_meta.send.size(); ++i) {
-    recv_buffers.emplace_back(recv_meta.send[i].size);
-    recv_meta.recv.push_back(server.Expose(
-        hipc::FullPtr<char>(recv_buffers[i].data()),
-        recv_buffers[i].size(),
-        recv_meta.send[i].flags.bits_));
-  }
-
-  rc = server.RecvBulks(recv_meta, ctx);
-  assert(rc == 0);
 
   sender.join();
   assert(send_rc == 0);
 
   for (size_t i = 0; i < data_chunks.size(); ++i) {
-    std::string received(recv_buffers[i].begin(), recv_buffers[i].end());
+    std::string received(recv_meta.recv[i].data.ptr_,
+                         recv_meta.recv[i].data.ptr_ + recv_meta.recv[i].size);
     std::cout << "Chunk " << i << ": " << received << "\n";
     assert(received == data_chunks[i]);
   }
@@ -199,8 +179,8 @@ void TestMetadataOnly() {
   std::cout << "\n==== Testing SHM Metadata Only (No Bulks) ====\n";
 
   ShmTestContext shared;
-  ShmClient client;
-  ShmServer server;
+  ShmTransport client(TransportMode::kClient);
+  ShmTransport server(TransportMode::kServer);
   LbmContext ctx = MakeCtx(shared);
 
   TestMeta send_meta;
@@ -214,7 +194,8 @@ void TestMetadataOnly() {
   });
 
   TestMeta recv_meta;
-  int rc = server.RecvMetadata(recv_meta, ctx);
+  auto info = server.Recv(recv_meta, ctx);
+  int rc = info.rc;
   assert(rc == 0);
 
   sender.join();
@@ -231,8 +212,8 @@ void TestLargeTransfer() {
   std::cout << "\n==== Testing SHM Large Transfer (multi-chunk) ====\n";
 
   ShmTestContext shared;
-  ShmClient client;
-  ShmServer server;
+  ShmTransport client(TransportMode::kClient);
+  ShmTransport server(TransportMode::kServer);
   LbmContext ctx = MakeCtx(shared);
 
   // Create data larger than copy_space_size to force chunking
@@ -254,17 +235,10 @@ void TestLargeTransfer() {
   });
 
   LbmMeta recv_meta;
-  int rc = server.RecvMetadata(recv_meta, ctx);
+  auto info = server.Recv(recv_meta, ctx);
+  int rc = info.rc;
   assert(rc == 0);
   assert(recv_meta.send.size() == 1);
-
-  // Use server-allocated buffer (nullptr -> malloc)
-  recv_meta.recv.push_back(server.Expose(
-      hipc::FullPtr<char>(nullptr), recv_meta.send[0].size,
-      recv_meta.send[0].flags.bits_));
-
-  rc = server.RecvBulks(recv_meta, ctx);
-  assert(rc == 0);
 
   sender.join();
   assert(send_rc == 0);
@@ -285,8 +259,8 @@ void TestShmPtrPassthrough() {
   std::cout << "\n==== Testing SHM Pointer Passthrough (no data copy) ====\n";
 
   ShmTestContext shared;
-  ShmClient client;
-  ShmServer server;
+  ShmTransport client(TransportMode::kClient);
+  ShmTransport server(TransportMode::kServer);
   LbmContext ctx = MakeCtx(shared);
 
   // Simulate a bulk whose data lives in shared memory (non-null alloc_id)
@@ -309,16 +283,8 @@ void TestShmPtrPassthrough() {
   });
 
   LbmMeta recv_meta;
-  int rc = server.RecvMetadata(recv_meta, ctx);
-  assert(rc == 0);
-
-  // Provide a recv entry — ptr_ and shm_ will be overwritten by RecvBulks
-  Bulk recv_bulk;
-  recv_bulk.size = recv_meta.send[0].size;
-  recv_bulk.flags = recv_meta.send[0].flags;
-  recv_meta.recv.push_back(recv_bulk);
-
-  rc = server.RecvBulks(recv_meta, ctx);
+  auto info = server.Recv(recv_meta, ctx);
+  int rc = info.rc;
   assert(rc == 0);
 
   sender.join();
@@ -341,8 +307,8 @@ void TestMixedBulks() {
   std::cout << "\n==== Testing SHM Mixed Bulks (data copy + ShmPtr) ====\n";
 
   ShmTestContext shared;
-  ShmClient client;
-  ShmServer server;
+  ShmTransport client(TransportMode::kClient);
+  ShmTransport server(TransportMode::kServer);
   LbmContext ctx = MakeCtx(shared);
 
   // Bulk 0: private memory (full copy)
@@ -375,29 +341,17 @@ void TestMixedBulks() {
   });
 
   LbmMeta recv_meta;
-  int rc = server.RecvMetadata(recv_meta, ctx);
+  auto info = server.Recv(recv_meta, ctx);
+  int rc = info.rc;
   assert(rc == 0);
   assert(recv_meta.send.size() == 2);
-
-  // Recv bulk 0: pre-allocated buffer for data copy
-  std::vector<char> recv_buf0(recv_meta.send[0].size);
-  recv_meta.recv.push_back(server.Expose(
-      hipc::FullPtr<char>(recv_buf0.data()), recv_buf0.size(),
-      recv_meta.send[0].flags.bits_));
-  // Recv bulk 1: empty entry for ShmPtr
-  Bulk recv_bulk1;
-  recv_bulk1.size = recv_meta.send[1].size;
-  recv_bulk1.flags = recv_meta.send[1].flags;
-  recv_meta.recv.push_back(recv_bulk1);
-
-  rc = server.RecvBulks(recv_meta, ctx);
-  assert(rc == 0);
 
   sender.join();
   assert(send_rc == 0);
 
   // Verify bulk 0: full data copy
-  std::string received0(recv_buf0.begin(), recv_buf0.end());
+  std::string received0(recv_meta.recv[0].data.ptr_,
+                         recv_meta.recv[0].data.ptr_ + recv_meta.recv[0].size);
   assert(received0 == private_data);
   std::cout << "Bulk 0 (data copy): " << received0 << "\n";
 
@@ -417,8 +371,8 @@ void TestMixedBulks() {
 void TestFactory() {
   std::cout << "\n==== Testing SHM via TransportFactory ====\n";
 
-  auto client = TransportFactory::GetClient("", Transport::kShm);
-  auto server = TransportFactory::GetServer("", Transport::kShm);
+  auto client = TransportFactory::Get("", TransportType::kShm, TransportMode::kClient);
+  auto server = TransportFactory::Get("", TransportType::kShm, TransportMode::kServer);
   assert(client != nullptr);
   assert(server != nullptr);
   assert(server->GetAddress() == "shm");
@@ -443,23 +397,17 @@ void TestFactory() {
   });
 
   TestMeta recv_meta;
-  int rc = server->RecvMetadata(recv_meta, ctx);
+  auto info = server->Recv(recv_meta, ctx);
+  int rc = info.rc;
   assert(rc == 0);
   assert(recv_meta.request_id == 100);
   assert(recv_meta.operation == "factory");
 
-  std::vector<char> recv_buf(recv_meta.send[0].size);
-  recv_meta.recv.push_back(server->Expose(
-      hipc::FullPtr<char>(recv_buf.data()), recv_buf.size(),
-      recv_meta.send[0].flags.bits_));
-
-  rc = server->RecvBulks(recv_meta, ctx);
-  assert(rc == 0);
-
   sender.join();
   assert(send_rc == 0);
 
-  std::string received(recv_buf.begin(), recv_buf.end());
+  std::string received(recv_meta.recv[0].data.ptr_,
+                       recv_meta.recv[0].data.ptr_ + recv_meta.recv[0].size);
   std::cout << "Received: " << received << "\n";
   assert(received == data);
 

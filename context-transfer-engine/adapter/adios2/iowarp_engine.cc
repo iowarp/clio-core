@@ -63,7 +63,10 @@ IowarpEngine::IowarpEngine(adios2::core::IO &io, const std::string &name,
   // Initialize CTE client - assumes Chimaera runtime is already running
   std::cerr << "[IowarpEngine] DEBUG: About to call WRP_CTE_CLIENT_INIT" << std::endl;
   std::cerr.flush();
-  wrp_cte::core::WRP_CTE_CLIENT_INIT("", chi::PoolQuery::Local());
+  if (!wrp_cte::core::WRP_CTE_CLIENT_INIT("", chi::PoolQuery::Local())) {
+    throw std::runtime_error(
+        "IowarpEngine: WRP_CTE_CLIENT_INIT failed - is Chimaera runtime running?");
+  }
   std::cerr << "[IowarpEngine] DEBUG: WRP_CTE_CLIENT_INIT completed" << std::endl;
   std::cerr.flush();
 
