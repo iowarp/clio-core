@@ -50,9 +50,17 @@ bool ContextInterface::EnsureInitialized() {
     return true;
   }
 
+  // Cache initialization failure to avoid repeatedly creating/destroying
+  // ZMQ contexts, which corrupts mimalloc's internal state in Python 3.13
+  static bool init_failed = false;
+  if (init_failed) {
+    return false;
+  }
+
   // Initialize Chimaera as a client for the context interface
   if (!chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, false)) {
     std::cerr << "Error: Failed to initialize Chimaera client" << std::endl;
+    init_failed = true;
     return false;
   }
 

@@ -14,6 +14,9 @@ import sys
 import os
 import tempfile
 
+# Start an embedded runtime so API calls don't timeout waiting for a server
+os.environ['CHI_WITH_RUNTIME'] = '1'
+
 # Add build directory to path for module import
 sys.path.insert(0, os.path.join(os.getcwd(), 'bin'))
 
@@ -445,4 +448,9 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    rc = main()
+    # Use os._exit to skip atexit handlers. ZMQ I/O threads allocate
+    # memory via Python 3.13's mimalloc; after the threads are joined,
+    # mimalloc's mi_process_done atexit handler crashes trying to
+    # collect their abandoned memory segments.
+    os._exit(rc)

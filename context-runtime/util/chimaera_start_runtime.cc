@@ -36,10 +36,14 @@
  */
 
 #include <chrono>
+#include <cstring>
 #include <iostream>
+#include <string>
 #include <thread>
 
 #include "chimaera/chimaera.h"
+#include "chimaera/config_manager.h"
+#include "chimaera/admin/admin_client.h"
 #include "chimaera/singletons.h"
 #include "chimaera/types.h"
 
@@ -122,9 +126,59 @@ void ShutdownAdminChiMod() {
   HLOG(kDebug, "Admin ChiMod shutdown complete");
 }
 
+/**
+ * Induct this node into an existing cluster by broadcasting AsyncAddNode.
+ * The new node's own IP and port are used so all existing nodes register it.
+ * @return true on success, false on failure
+ */
+bool InductNode() {
+  auto* ipc_manager = CHI_IPC;
+  auto* config = CHI_CONFIG_MANAGER;
+  auto* admin_client = CHI_ADMIN;
+
+  std::string my_ip = ipc_manager->GetCurrentHostname();
+  chi::u32 my_port = config->GetPort();
+
+  HLOG(kInfo, "Inducting this node ({}:{}) into the cluster...", my_ip, my_port);
+
+  auto task = admin_client->AsyncAddNode(
+      chi::PoolQuery::Broadcast(), my_ip, my_port);
+  task.Wait();
+
+  if (task->GetReturnCode() != 0) {
+    HLOG(kError, "Failed to induct node: {}", task->error_message_.str());
+    return false;
+  }
+
+  HLOG(kInfo, "Node inducted successfully as node_id={}", task->new_node_id_);
+  return true;
+}
+
+void PrintUsage(const char* program_name) {
+  std::cout << "Usage: " << program_name << " [--induct]\n";
+  std::cout << "  Starts the Chimaera runtime server\n";
+  std::cout << "  --induct: Register this node with all existing cluster nodes\n";
+}
+
 }  // namespace
 
 int main(int argc, char* argv[]) {
+  // Parse arguments
+  bool induct = false;
+  for (int i = 1; i < argc; ++i) {
+    if (std::strcmp(argv[i], "--induct") == 0) {
+      induct = true;
+    } else if (std::strcmp(argv[i], "--help") == 0 ||
+               std::strcmp(argv[i], "-h") == 0) {
+      PrintUsage(argv[0]);
+      return 0;
+    } else {
+      std::cerr << "Unknown argument: " << argv[i] << "\n";
+      PrintUsage(argv[0]);
+      return 1;
+    }
+  }
+
   HLOG(kDebug, "Starting Chimaera runtime...");
 
   // Initialize Chimaera runtime
@@ -142,6 +196,14 @@ int main(int argc, char* argv[]) {
   }
 
   HLOG(kDebug, "Admin ChiMod initialized successfully with pool ID {}", chi::kAdminPoolId);
+
+  // Induct this node into the cluster if requested
+  if (induct) {
+    if (!InductNode()) {
+      HLOG(kError, "FATAL ERROR: Failed to induct node into cluster");
+      return 1;
+    }
+  }
 
   // Main runtime loop
   while (g_keep_running) {

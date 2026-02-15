@@ -10,6 +10,7 @@ add_executable(chimaera_start_runtime
 # Removed CHIMAERA_RUNTIME compile definition - using runtime IsRuntime() checks instead
 target_link_libraries(chimaera_start_runtime
   PUBLIC chimaera_cxx
+  PUBLIC chimaera_admin_client
 )
 # Include directories are now inherited from chimaera_cxx target
 

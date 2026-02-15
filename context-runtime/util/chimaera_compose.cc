@@ -48,10 +48,9 @@
 #include <chimaera/admin/admin_client.h>
 
 void PrintUsage(const char* program_name) {
-  std::cout << "Usage: " << program_name << " [--unregister] [--node-ip <ip>] <compose_config.yaml>\n";
+  std::cout << "Usage: " << program_name << " [--unregister] <compose_config.yaml>\n";
   std::cout << "  Loads compose configuration and creates/destroys specified pools\n";
   std::cout << "  --unregister: Destroy pools instead of creating them\n";
-  std::cout << "  --node-ip <ip>: Register a new node with the cluster before compose\n";
   std::cout << "  Requires runtime to be already initialized\n";
 }
 
@@ -63,7 +62,6 @@ int main(int argc, char** argv) {
 
   bool unregister = false;
   std::string config_path;
-  std::string node_ip;
 
   // Parse arguments
   int i = 1;
@@ -72,14 +70,6 @@ int main(int argc, char** argv) {
     if (arg == "--unregister") {
       unregister = true;
       ++i;
-    } else if (arg == "--node-ip") {
-      if (i + 1 >= argc) {
-        std::cerr << "--node-ip requires an IP address argument\n";
-        PrintUsage(argv[0]);
-        return 1;
-      }
-      node_ip = argv[i + 1];
-      i += 2;
     } else {
       config_path = arg;
       ++i;
@@ -96,24 +86,6 @@ int main(int argc, char** argv) {
   if (!chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, false)) {
     std::cerr << "Failed to initialize Chimaera client\n";
     return 1;
-  }
-
-  // If --node-ip provided, broadcast AddNode to all existing nodes
-  if (!node_ip.empty()) {
-    auto* admin_client = CHI_ADMIN;
-    auto* config = CHI_CONFIG_MANAGER;
-    chi::u32 port = config->GetPort();
-
-    std::cout << "Registering new node " << node_ip << " with cluster\n";
-    auto task = admin_client->AsyncAddNode(
-        chi::PoolQuery::Broadcast(), node_ip, port);
-    task.Wait();
-
-    if (task->GetReturnCode() != 0) {
-      std::cerr << "Failed to register node: " << task->error_message_.str() << "\n";
-      return 1;
-    }
-    std::cout << "Node registered as node_id=" << task->new_node_id_ << "\n";
   }
 
   // Load configuration
