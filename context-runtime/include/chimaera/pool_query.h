@@ -63,7 +63,8 @@ class PoolQuery {
    * Default constructor
    */
   HSHM_CROSS_FUN PoolQuery()
-      : routing_mode_(RoutingMode::Local), hash_value_(0), container_id_(0),
+      : routing_mode_(RoutingMode::Local), hash_value_(0),
+        container_id_(kInvalidContainerId),
         range_offset_(0), range_count_(0), node_id_(0), ret_node_(0) {}
 
   /**
@@ -109,7 +110,7 @@ class PoolQuery {
     PoolQuery query;
     query.routing_mode_ = RoutingMode::Local;
     query.hash_value_ = 0;
-    query.container_id_ = 0;
+    query.container_id_ = kInvalidContainerId;
     query.range_offset_ = 0;
     return query;
   }
@@ -176,6 +177,14 @@ class PoolQuery {
    * @return Container ID for direct routing
    */
   HSHM_CROSS_FUN ContainerId GetContainerId() const { return container_id_; }
+
+  /**
+   * Check if a specific container ID has been set
+   * @return true if container_id is not kInvalidContainerId
+   */
+  HSHM_CROSS_FUN bool HasContainerId() const {
+    return container_id_ != kInvalidContainerId;
+  }
 
   /**
    * Get the range offset for range routing mode

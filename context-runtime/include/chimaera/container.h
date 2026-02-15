@@ -174,6 +174,16 @@ class Container {
   }
 
   /**
+   * Migrate this container's data to a destination node
+   * Called during container migration. Override to serialize and transfer state.
+   * Default implementation is a no-op.
+   * @param dest_node_id The node ID to migrate to
+   */
+  virtual void Migrate(u32 dest_node_id) {
+    (void)dest_node_id;
+  }
+
+  /**
    * Serialize task parameters for network transfer (unified method)
    * Must be implemented by derived classes
    * Uses switch-case structure based on method ID to dispatch to appropriate serialization

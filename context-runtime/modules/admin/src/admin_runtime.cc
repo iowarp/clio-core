@@ -47,6 +47,8 @@
 #include <chimaera/worker.h>
 #include <hermes_shm/lightbeam/transport_factory_impl.h>
 
+#include <cereal/archives/binary.hpp>
+#include <cereal/types/vector.hpp>
 #include <chrono>
 #include <memory>
 #include <sstream>
@@ -371,7 +373,7 @@ void Runtime::SendIn(hipc::FullPtr<chi::Task> origin_task,
   }
 
   // Get the container associated with the origin_task
-  chi::Container *container = pool_manager->GetContainer(origin_task->pool_id_);
+  chi::Container *container = pool_manager->GetStaticContainer(origin_task->pool_id_);
   if (container == nullptr) {
     HLOG(kError, "SendIn: container not found for pool_id {}",
          origin_task->pool_id_);
@@ -519,7 +521,7 @@ void Runtime::SendOut(hipc::FullPtr<chi::Task> origin_task) {
   }
 
   // Get the container associated with the origin_task
-  chi::Container *container = pool_manager->GetContainer(origin_task->pool_id_);
+  chi::Container *container = pool_manager->GetStaticContainer(origin_task->pool_id_);
   if (container == nullptr) {
     HLOG(kError, "SendOut: container not found for pool_id {}",
          origin_task->pool_id_);
@@ -668,7 +670,7 @@ void Runtime::RecvIn(hipc::FullPtr<RecvTask> task,
     const auto &task_info = task_infos[task_idx];
 
     // Get container associated with PoolId
-    chi::Container *container = pool_manager->GetContainer(task_info.pool_id_);
+    chi::Container *container = pool_manager->GetStaticContainer(task_info.pool_id_);
     if (!container) {
       HLOG(kError, "Admin: Container not found for pool_id {}",
            task_info.pool_id_);
@@ -773,7 +775,7 @@ void Runtime::RecvOut(hipc::FullPtr<RecvTask> task,
 
     // Get the container associated with the origin task
     chi::Container *container =
-        pool_manager->GetContainer(origin_task->pool_id_);
+        pool_manager->GetStaticContainer(origin_task->pool_id_);
     if (!container) {
       HLOG(kError, "Admin: Container not found for pool_id {}",
            origin_task->pool_id_);
@@ -818,7 +820,7 @@ void Runtime::RecvOut(hipc::FullPtr<RecvTask> task,
 
     // Get the container associated with the origin task
     chi::Container *container =
-        pool_manager->GetContainer(origin_task->pool_id_);
+        pool_manager->GetStaticContainer(origin_task->pool_id_);
     if (!container) {
       HLOG(kError, "Admin: Container not found for pool_id {}",
            origin_task->pool_id_);
@@ -839,7 +841,7 @@ void Runtime::RecvOut(hipc::FullPtr<RecvTask> task,
       // Get pool manager to access container
       auto *pool_manager = CHI_POOL_MANAGER;
       chi::Container *container =
-          pool_manager->GetContainer(origin_task->pool_id_);
+          pool_manager->GetStaticContainer(origin_task->pool_id_);
 
       // Unmark TASK_DATA_OWNER before deleting replicas to avoid freeing the
       // same data pointers twice Delete all origin_task replicas using
@@ -985,7 +987,7 @@ chi::TaskResume Runtime::ClientRecv(hipc::FullPtr<ClientRecvTask> task,
       chi::u32 method_id = info.method_id_;
 
       // Get container for deserialization
-      chi::Container *container = pool_manager->GetContainer(pool_id);
+      chi::Container *container = pool_manager->GetStaticContainer(pool_id);
       if (!container) {
         HLOG(kError, "ClientRecv: Container not found for pool_id {}", pool_id);
         continue;
@@ -1091,7 +1093,7 @@ chi::TaskResume Runtime::ClientSend(hipc::FullPtr<ClientSendTask> task,
 
       // Get container to serialize outputs
       chi::Container *container =
-          pool_manager->GetContainer(origin_task->pool_id_);
+          pool_manager->GetStaticContainer(origin_task->pool_id_);
       if (!container) {
         HLOG(kError, "ClientSend: Container not found for pool_id {}",
              origin_task->pool_id_);
@@ -1228,7 +1230,7 @@ chi::TaskResume Runtime::SubmitBatch(hipc::FullPtr<SubmitBatchTask> task,
 
       // Get the container for this task's pool
       chi::Container *container =
-          pool_manager->GetContainer(task_info.pool_id_);
+          pool_manager->GetStaticContainer(task_info.pool_id_);
       if (!container) {
         HLOG(kError, "SubmitBatch: Container not found for pool_id {}",
              task_info.pool_id_);
@@ -1364,7 +1366,7 @@ chi::TaskResume Runtime::AddNode(
   chi::Host new_host(task->new_node_ip_.str(), new_node_id);
   std::vector<chi::PoolId> pool_ids = pool_manager->GetAllPoolIds();
   for (const auto &pool_id : pool_ids) {
-    chi::Container *container = pool_manager->GetContainer(pool_id);
+    chi::Container *container = pool_manager->GetLocalContainer(pool_id);
     if (container) {
       container->Expand(new_host);
     }
@@ -1393,6 +1395,92 @@ chi::TaskResume Runtime::WreapDeadIpcs(hipc::FullPtr<WreapDeadIpcsTask> task,
   }
 
   task->SetReturnCode(0);
+  co_return;
+}
+
+chi::TaskResume Runtime::ChangeAddressTable(
+    hipc::FullPtr<ChangeAddressTableTask> task, chi::RunContext &rctx) {
+  (void)rctx;
+  auto *pool_manager = CHI_POOL_MANAGER;
+
+  chi::PoolId target_pool_id = task->target_pool_id_;
+  chi::ContainerId container_id = task->container_id_;
+  chi::u32 new_node_id = task->new_node_id_;
+
+  // Get old node for WAL
+  chi::u32 old_node_id =
+      pool_manager->GetContainerNodeId(target_pool_id, container_id);
+
+  // Write WAL entry before applying change
+  pool_manager->WriteAddressTableWAL(target_pool_id, container_id,
+                                      old_node_id, new_node_id);
+
+  // Update the address table mapping
+  if (pool_manager->UpdateContainerNodeMapping(target_pool_id, container_id,
+                                                new_node_id)) {
+    HLOG(kInfo,
+         "Admin: ChangeAddressTable pool {} container {} -> node {}",
+         target_pool_id, container_id, new_node_id);
+    task->SetReturnCode(0);
+  } else {
+    task->error_message_ = chi::priv::string(
+        HSHM_MALLOC, "Failed to update container node mapping");
+    task->SetReturnCode(1);
+  }
+  co_return;
+}
+
+chi::TaskResume Runtime::MigrateContainers(
+    hipc::FullPtr<MigrateContainersTask> task, chi::RunContext &rctx) {
+  (void)rctx;
+  HLOG(kInfo, "Admin: Executing MigrateContainers task");
+
+  auto *pool_manager = CHI_POOL_MANAGER;
+  task->num_migrated_ = 0;
+  task->error_message_ = "";
+
+  // Deserialize migrations from cereal binary
+  std::string data = task->migrations_json_.str();
+  std::vector<chi::MigrateInfo> migrations;
+  {
+    std::istringstream is(data);
+    cereal::BinaryInputArchive ar(is);
+    ar(migrations);
+  }
+
+  for (const auto &info : migrations) {
+    // Look up source node
+    chi::u32 src_node =
+        pool_manager->GetContainerNodeId(info.pool_id_, info.container_id_);
+
+    // Get the specific Container on this node and call Migrate
+    chi::Container *container = pool_manager->GetContainer(info.pool_id_, info.container_id_);
+    if (container) {
+      container->Migrate(info.dest_);
+    }
+
+    // Broadcast ChangeAddressTable to all nodes
+    auto change_task = client_.AsyncChangeAddressTable(
+        chi::PoolQuery::Broadcast(), info.pool_id_, info.container_id_,
+        info.dest_);
+    co_await change_task;
+
+    if (change_task->GetReturnCode() != 0) {
+      HLOG(kError,
+           "Admin: Failed to change address table for pool {} container {}",
+           info.pool_id_, info.container_id_);
+      continue;
+    }
+
+    task->num_migrated_++;
+    HLOG(kInfo,
+         "Admin: Migrated pool {} container {} from node {} to node {}",
+         info.pool_id_, info.container_id_, src_node, info.dest_);
+  }
+
+  task->SetReturnCode(0);
+  HLOG(kInfo, "Admin: MigrateContainers completed, {} migrated",
+       task->num_migrated_);
   co_return;
 }
 

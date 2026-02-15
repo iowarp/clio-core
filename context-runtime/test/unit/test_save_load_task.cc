@@ -125,7 +125,7 @@ TEST_CASE("SaveTask and LoadTask - Admin CreateTask full flow",
 
   // Get container for SaveTask/LoadTask
   auto *pool_manager = CHI_POOL_MANAGER;
-  auto *container = pool_manager->GetContainer(chi::kAdminPoolId);
+  auto *container = pool_manager->GetStaticContainer(chi::kAdminPoolId);
   REQUIRE(container != nullptr);
 
   // Step 1: Create original task with input parameters
@@ -244,7 +244,7 @@ TEST_CASE("SaveTask and LoadTask - Admin FlushTask full flow",
 
   // Get container
   auto *pool_manager = CHI_POOL_MANAGER;
-  auto *container = pool_manager->GetContainer(chi::kAdminPoolId);
+  auto *container = pool_manager->GetStaticContainer(chi::kAdminPoolId);
   REQUIRE(container != nullptr);
 
   // Step 1: Create original task
@@ -323,7 +323,7 @@ TEST_CASE("SaveTask and LoadTask - Admin SendTask full flow",
 
   // Get container
   auto *pool_manager = CHI_POOL_MANAGER;
-  auto *container = pool_manager->GetContainer(chi::kAdminPoolId);
+  auto *container = pool_manager->GetStaticContainer(chi::kAdminPoolId);
   REQUIRE(container != nullptr);
 
   // Step 1: Create original SendTask (simplified - only transfer_flags parameter)
@@ -404,7 +404,7 @@ TEST_CASE("SaveTask and LoadTask - Admin DestroyPoolTask full flow",
 
   // Get container
   auto *pool_manager = CHI_POOL_MANAGER;
-  auto *container = pool_manager->GetContainer(chi::kAdminPoolId);
+  auto *container = pool_manager->GetStaticContainer(chi::kAdminPoolId);
   REQUIRE(container != nullptr);
 
   // Step 1: Create original task with IN parameters

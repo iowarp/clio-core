@@ -364,9 +364,9 @@ bool Worker::ProcessNewTask(TaskLane *lane) {
   PoolId pool_id = future_shm->pool_id_;
   u32 method_id = future_shm->method_id_;
 
-  // Get container for routing
+  // Get static container for task deserialization (stateless operation)
   auto *pool_manager = CHI_POOL_MANAGER;
-  Container *container = pool_manager->GetContainer(pool_id);
+  Container *container = pool_manager->GetStaticContainer(pool_id);
 
   if (!container) {
     // Container not found - mark as complete with error
@@ -675,22 +675,35 @@ bool Worker::RouteLocal(Future<Task> &future, TaskLane *lane,
   FullPtr<Task> task_ptr = future.GetTaskPtr();
 
   // Mark as routed so the task is not re-routed on subsequent passes.
-  // Tasks are already placed on the correct worker's lane by
-  // ClientMapTask/Send, so we always execute locally here.
   task_ptr->SetFlags(TASK_ROUTED);
 
-  // Execute task locally (container is provided by caller)
-  if (!container) {
+  // Resolve the actual execution container
+  auto *pool_manager = CHI_POOL_MANAGER;
+  Container *exec_container = nullptr;
+  ContainerId container_id = task_ptr->pool_query_.GetContainerId();
+
+  if (container_id != kInvalidContainerId) {
+    // Specific container requested
+    exec_container = pool_manager->GetContainer(task_ptr->pool_id_, container_id);
+  }
+  if (!exec_container) {
+    // Fall back to local container
+    exec_container = pool_manager->GetLocalContainer(task_ptr->pool_id_);
+  }
+
+  if (!exec_container) {
     HLOG(kError, "Worker {}: RouteLocal - container not found for pool_id={}",
          worker_id_, task_ptr->pool_id_);
     return false;
   }
 
   // Set the completer_ field to track which container will execute this task
-  task_ptr->SetCompleter(container->container_id_);
+  task_ptr->SetCompleter(exec_container->container_id_);
 
-  auto *ipc_manager = CHI_IPC;
-  u32 node_id = ipc_manager->GetNodeId();
+  // Update RunContext to use the resolved execution container
+  if (task_ptr->run_ctx_) {
+    task_ptr->run_ctx_->container_ = exec_container;
+  }
 
   // Routing successful - caller should execute the task locally
   return true;

@@ -1391,6 +1391,126 @@ struct AddNodeTask : public chi::Task {
   }
 };
 
+/**
+ * ChangeAddressTableTask - Update ContainerId->NodeId mapping on a node
+ * Broadcasts to all nodes to update their address table for a pool
+ */
+struct ChangeAddressTableTask : public chi::Task {
+  IN chi::PoolId target_pool_id_;
+  IN chi::ContainerId container_id_;
+  IN chi::u32 new_node_id_;
+  OUT chi::priv::string error_message_;
+
+  /** SHM default constructor */
+  ChangeAddressTableTask()
+      : chi::Task(),
+        target_pool_id_(),
+        container_id_(0),
+        new_node_id_(0),
+        error_message_(HSHM_MALLOC) {}
+
+  /** Emplace constructor */
+  explicit ChangeAddressTableTask(const chi::TaskId &task_node,
+                                   const chi::PoolId &pool_id,
+                                   const chi::PoolQuery &pool_query,
+                                   const chi::PoolId &target_pool_id,
+                                   chi::ContainerId container_id,
+                                   chi::u32 new_node_id)
+      : chi::Task(task_node, pool_id, pool_query, Method::kChangeAddressTable),
+        target_pool_id_(target_pool_id),
+        container_id_(container_id),
+        new_node_id_(new_node_id),
+        error_message_(HSHM_MALLOC) {
+    task_id_ = task_node;
+    pool_id_ = pool_id;
+    method_ = Method::kChangeAddressTable;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  template <typename Archive>
+  void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+    ar(target_pool_id_, container_id_, new_node_id_);
+  }
+
+  template <typename Archive>
+  void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+    ar(error_message_);
+  }
+
+  void Copy(const hipc::FullPtr<ChangeAddressTableTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+    target_pool_id_ = other->target_pool_id_;
+    container_id_ = other->container_id_;
+    new_node_id_ = other->new_node_id_;
+    error_message_ = other->error_message_;
+  }
+
+  void Aggregate(const hipc::FullPtr<ChangeAddressTableTask> &other) {
+    Task::Aggregate(other.template Cast<Task>());
+    Copy(other);
+  }
+};
+
+/**
+ * MigrateContainersTask - Orchestrate container migration
+ * Processes a list of MigrateInfo entries to move containers between nodes
+ */
+struct MigrateContainersTask : public chi::Task {
+  IN chi::priv::string migrations_json_;
+  OUT chi::u32 num_migrated_;
+  OUT chi::priv::string error_message_;
+
+  /** SHM default constructor */
+  MigrateContainersTask()
+      : chi::Task(),
+        migrations_json_(HSHM_MALLOC),
+        num_migrated_(0),
+        error_message_(HSHM_MALLOC) {}
+
+  /** Emplace constructor */
+  explicit MigrateContainersTask(const chi::TaskId &task_node,
+                                  const chi::PoolId &pool_id,
+                                  const chi::PoolQuery &pool_query,
+                                  const std::string &migrations_json)
+      : chi::Task(task_node, pool_id, pool_query, Method::kMigrateContainers),
+        migrations_json_(HSHM_MALLOC, migrations_json),
+        num_migrated_(0),
+        error_message_(HSHM_MALLOC) {
+    task_id_ = task_node;
+    pool_id_ = pool_id;
+    method_ = Method::kMigrateContainers;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  template <typename Archive>
+  void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+    ar(migrations_json_);
+  }
+
+  template <typename Archive>
+  void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+    ar(num_migrated_, error_message_);
+  }
+
+  void Copy(const hipc::FullPtr<MigrateContainersTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+    migrations_json_ = other->migrations_json_;
+    num_migrated_ = other->num_migrated_;
+    error_message_ = other->error_message_;
+  }
+
+  void Aggregate(const hipc::FullPtr<MigrateContainersTask> &other) {
+    Task::Aggregate(other.template Cast<Task>());
+    Copy(other);
+  }
+};
+
 }  // namespace chimaera::admin
 
 #endif  // ADMIN_TASKS_H_

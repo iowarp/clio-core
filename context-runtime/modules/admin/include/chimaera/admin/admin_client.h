@@ -36,6 +36,10 @@
 
 #include <chimaera/chimaera.h>
 
+#include <cereal/archives/binary.hpp>
+#include <cereal/types/vector.hpp>
+#include <sstream>
+
 #include "admin_tasks.h"
 
 /**
@@ -389,6 +393,47 @@ class Client : public chi::ContainerClient {
     auto task = ipc_manager->NewTask<AddNodeTask>(
         chi::CreateTaskId(), pool_id_, pool_query,
         new_node_ip, new_node_port);
+    return ipc_manager->Send(task);
+  }
+
+  /**
+   * ChangeAddressTable - Update ContainerId->NodeId mapping on nodes
+   * @param pool_query Pool routing (use Broadcast to reach all nodes)
+   * @param target_pool_id Pool whose address table to update
+   * @param container_id Container being remapped
+   * @param new_node_id New node ID for the container
+   * @return Future for the ChangeAddressTable task
+   */
+  chi::Future<ChangeAddressTableTask> AsyncChangeAddressTable(
+      const chi::PoolQuery& pool_query,
+      const chi::PoolId& target_pool_id,
+      chi::ContainerId container_id,
+      chi::u32 new_node_id) {
+    auto* ipc_manager = CHI_IPC;
+    auto task = ipc_manager->NewTask<ChangeAddressTableTask>(
+        chi::CreateTaskId(), pool_id_, pool_query,
+        target_pool_id, container_id, new_node_id);
+    return ipc_manager->Send(task);
+  }
+
+  /**
+   * MigrateContainers - Orchestrate container migration
+   * @param pool_query Pool routing
+   * @param migrations Vector of MigrateInfo describing migrations to perform
+   * @return Future for the MigrateContainers task
+   */
+  chi::Future<MigrateContainersTask> AsyncMigrateContainers(
+      const chi::PoolQuery& pool_query,
+      const std::vector<chi::MigrateInfo>& migrations) {
+    auto* ipc_manager = CHI_IPC;
+    // Serialize migrations using cereal binary archive
+    std::ostringstream os;
+    {
+      cereal::BinaryOutputArchive ar(os);
+      ar(migrations);
+    }
+    auto task = ipc_manager->NewTask<MigrateContainersTask>(
+        chi::CreateTaskId(), pool_id_, pool_query, os.str());
     return ipc_manager->Send(task);
   }
 };

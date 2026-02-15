@@ -251,6 +251,7 @@ using MethodId = u32;
 using WorkerId = u32;
 using LaneId = u32;
 using ContainerId = u32;
+static constexpr ContainerId kInvalidContainerId = static_cast<ContainerId>(-1);
 using MinorId = u32;
 
 // Container addressing system types
@@ -399,6 +400,24 @@ inline HSHM_CROSS_FUN TaskId CreateTaskId() {
 // Template aliases for full pointers using HSHM
 template <typename T>
 using FullPtr = hipc::FullPtr<T>;
+
+/**
+ * Migration descriptor for container migration between nodes
+ */
+struct MigrateInfo {
+  PoolId pool_id_;
+  ContainerId container_id_;
+  u32 dest_;  // destination node ID
+
+  MigrateInfo() : pool_id_(), container_id_(0), dest_(0) {}
+  MigrateInfo(PoolId pool_id, ContainerId container_id, u32 dest)
+      : pool_id_(pool_id), container_id_(container_id), dest_(dest) {}
+
+  template <typename Ar>
+  void serialize(Ar &ar) {
+    ar(pool_id_, container_id_, dest_);
+  }
+};
 
 }  // namespace chi
 

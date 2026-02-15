@@ -245,6 +245,18 @@ public:
   chi::TaskResume SubmitBatch(hipc::FullPtr<SubmitBatchTask> task, chi::RunContext &rctx);
 
   /**
+   * Handle ChangeAddressTable - Update ContainerId->NodeId mapping
+   * Writes WAL entry and updates pool manager's address table
+   */
+  chi::TaskResume ChangeAddressTable(hipc::FullPtr<ChangeAddressTableTask> task, chi::RunContext &rctx);
+
+  /**
+   * Handle MigrateContainers - Orchestrate container migration
+   * Processes each MigrateInfo entry and broadcasts address table changes
+   */
+  chi::TaskResume MigrateContainers(hipc::FullPtr<MigrateContainersTask> task, chi::RunContext &rctx);
+
+  /**
    * Helper: Receive task inputs from remote node
    */
   void RecvIn(hipc::FullPtr<RecvTask> task, chi::LoadTaskArchive& archive, hshm::lbm::Transport* lbm_transport);

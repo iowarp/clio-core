@@ -482,7 +482,7 @@ class WrpCte(Service):
             return False
 
         # Build the chimaera_compose command
-        cmd = f'chimaera_compose {self.compose_config_path}'
+        cmd = f'chimaera compose {self.compose_config_path}'
 
         self.log(f"Running: {cmd}")
         self.log(f"  Config: {self.compose_config_path}")
