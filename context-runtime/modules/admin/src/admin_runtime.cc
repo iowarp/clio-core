@@ -528,18 +528,20 @@ void Runtime::SendOut(hipc::FullPtr<chi::Task> origin_task) {
     return;
   }
 
-  // Remove task from recv_map as we're completing it (use net_key for lookup)
+  // Remove task from recv_map as we're completing it
+  // Key must match RecvIn: combines net_key and replica_id
   // Note: No lock needed - single net worker processes all Send/Recv tasks
-  size_t net_key = origin_task->task_id_.net_key_;
-  auto *it = recv_map_.find(net_key);
+  size_t recv_key = origin_task->task_id_.net_key_ ^
+      (static_cast<size_t>(origin_task->task_id_.replica_id_) * 0x9e3779b97f4a7c15ULL);
+  auto *it = recv_map_.find(recv_key);
   if (it == nullptr) {
     HLOG(kError,
          "[SendOut] Task {} FAILED: Not found in recv_map (size: {}) with "
-         "net_key {}",
-         origin_task->task_id_, recv_map_.size(), net_key);
+         "recv_key {}",
+         origin_task->task_id_, recv_map_.size(), recv_key);
     return;
   }
-  recv_map_.erase(net_key);
+  recv_map_.erase(recv_key);
 
   // Get return node from pool_query
   chi::u64 target_node_id = origin_task->pool_query_.GetReturnNode();
@@ -693,10 +695,13 @@ void Runtime::RecvIn(hipc::FullPtr<RecvTask> task,
     task_ptr->ClearFlags(TASK_PERIODIC | TASK_FORCE_NET | TASK_ROUTED |
                          TASK_RUN_CTX_EXISTS | TASK_STARTED);
 
-    // Add task to recv_map for later lookup (use net_key from task_id)
+    // Add task to recv_map for later lookup
+    // Key combines net_key and replica_id so multiple replicas targeting the
+    // same node (e.g., after container migration) get distinct entries.
     // Note: No lock needed - single net worker processes all Send/Recv tasks
-    size_t net_key = task_ptr->task_id_.net_key_;
-    recv_map_[net_key] = task_ptr;
+    size_t recv_key = task_ptr->task_id_.net_key_ ^
+        (static_cast<size_t>(task_ptr->task_id_.replica_id_) * 0x9e3779b97f4a7c15ULL);
+    recv_map_[recv_key] = task_ptr;
 
     HLOG(kDebug, "[RecvIn] Task {}", task_ptr->task_id_);
 

@@ -180,12 +180,8 @@ bool PoolManager::UnregisterContainer(PoolId pool_id, ContainerId container_id) 
   Container *removed = cit->second;
   info.containers_.erase(cit);
 
-  // Never null out static_container_ — it is needed for task deserialization
-  // (e.g., ClientRecv) even after migration removes the execution container.
-  // Only reassign if another container is available.
-  if (info.static_container_ == removed && !info.containers_.empty()) {
-    info.static_container_ = info.containers_.begin()->second;
-  }
+  // static_container_ is never modified after pool creation — it is a
+  // persistent reference used for stateless operations (task deserialization).
   if (info.local_container_ == removed) {
     info.RecalculateLocalContainer();
   }
