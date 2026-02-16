@@ -16,3 +16,6 @@
 [submodule "external/graphiti"]
 	path = external/graphiti
 	url = https://github.com/getzep/graphiti.git
+[submodule "context-transfer-engine/benchmark/memorybench"]
+	path = context-transfer-engine/benchmark/memorybench
+	url = git@github.com:iowarp/memorybench.git
