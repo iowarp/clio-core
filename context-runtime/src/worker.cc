@@ -872,6 +872,16 @@ std::vector<PoolQuery> Worker::ResolveDirectHashQuery(
     return {PoolQuery::Local()};
   }
 
+  // Check if the address_map_ points this container to the local node.
+  // After migration, the container may be mapped here but not yet in
+  // containers_ (e.g., forwarded tasks arriving at the destination).
+  // Returning Local() prevents an infinite forwarding loop.
+  u32 mapped_node = pool_manager->GetContainerNodeId(pool_id, container_id);
+  auto *ipc_manager = CHI_IPC;
+  if (mapped_node == ipc_manager->GetNodeId()) {
+    return {PoolQuery::Local()};
+  }
+
   // Resolve to DirectId so SendIn can dynamically look up the current
   // node via GetContainerNodeId.  This preserves the container_id through
   // the routing chain, which is required for retry-after-recovery: if the
@@ -911,6 +921,12 @@ std::vector<PoolQuery> Worker::ResolveRangeQuery(
     ContainerId container_id = range_offset;
     if (pool_manager->HasContainer(pool_id, container_id)) {
       // Container is local, resolve to Local query
+      return {PoolQuery::Local()};
+    }
+    // Check if address_map_ maps this container to the local node
+    u32 mapped_node = pool_manager->GetContainerNodeId(pool_id, container_id);
+    auto *ipc_manager = CHI_IPC;
+    if (mapped_node == ipc_manager->GetNodeId()) {
       return {PoolQuery::Local()};
     }
     // Resolve to DirectId to preserve container info for retry-after-recovery
