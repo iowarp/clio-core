@@ -1366,7 +1366,9 @@ chi::TaskResume Runtime::AddNode(
   chi::Host new_host(task->new_node_ip_.str(), new_node_id);
   std::vector<chi::PoolId> pool_ids = pool_manager->GetAllPoolIds();
   for (const auto &pool_id : pool_ids) {
-    chi::Container *container = pool_manager->GetLocalContainer(pool_id);
+    bool is_plugged = false;
+    chi::Container *container = pool_manager->GetContainer(
+        pool_id, chi::kInvalidContainerId, is_plugged);
     if (container) {
       container->Expand(new_host);
     }
@@ -1453,8 +1455,13 @@ chi::TaskResume Runtime::MigrateContainers(
     chi::u32 src_node =
         pool_manager->GetContainerNodeId(info.pool_id_, info.container_id_);
 
+    // Plug the container to stop new tasks and wait for work to complete
+    pool_manager->PlugContainer(info.pool_id_, info.container_id_);
+
     // Get the specific Container on this node and call Migrate
-    chi::Container *container = pool_manager->GetContainer(info.pool_id_, info.container_id_);
+    bool is_plugged = false;
+    chi::Container *container = pool_manager->GetContainer(
+        info.pool_id_, info.container_id_, is_plugged);
     if (container) {
       container->Migrate(info.dest_);
     }
@@ -1471,6 +1478,11 @@ chi::TaskResume Runtime::MigrateContainers(
            info.pool_id_, info.container_id_);
       continue;
     }
+
+    // Unregister the container on source node so HasContainer() returns false.
+    // This causes ResolveDirectHashQuery to fall through to address_map_ lookup.
+    // Note: UnregisterContainer preserves static_container_ for deserialization.
+    pool_manager->UnregisterContainer(info.pool_id_, info.container_id_);
 
     task->num_migrated_++;
     HLOG(kInfo,

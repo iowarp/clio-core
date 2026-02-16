@@ -135,12 +135,22 @@ class PoolManager {
   void UnregisterAllContainers(PoolId pool_id);
 
   /**
-   * Get Container by PoolId and ContainerId
+   * Plug a container: mark CONTAINER_PLUG and wait for all work to complete
    * @param pool_id Pool identifier
    * @param container_id Container identifier
+   */
+  void PlugContainer(PoolId pool_id, ContainerId container_id);
+
+  /**
+   * Get Container by PoolId and ContainerId, with plug state
+   * If container_id is kInvalidContainerId, falls back to local container.
+   * @param pool_id Pool identifier
+   * @param container_id Container identifier
+   * @param is_plugged Output: true if the container is plugged
    * @return Pointer to Container or nullptr if not found
    */
-  Container* GetContainer(PoolId pool_id, ContainerId container_id) const;
+  Container* GetContainer(PoolId pool_id, ContainerId container_id,
+                           bool &is_plugged) const;
 
   /**
    * Get the static container for a pool (for stateless ops: alloc, serialize, etc.)
@@ -148,13 +158,6 @@ class PoolManager {
    * @return Pointer to static Container or nullptr if not found
    */
   Container* GetStaticContainer(PoolId pool_id) const;
-
-  /**
-   * Get the local (default) container for a pool on this node
-   * @param pool_id Pool identifier
-   * @return Pointer to local Container or nullptr if not found
-   */
-  Container* GetLocalContainer(PoolId pool_id) const;
 
   /**
    * Check if pool exists on this node
@@ -284,7 +287,13 @@ class PoolManager {
   void WriteAddressTableWAL(PoolId pool_id, ContainerId container_id, u32 old_node, u32 new_node);
 
  private:
-
+  /**
+   * Internal: Get Container by PoolId and ContainerId (no plug check)
+   * @param pool_id Pool identifier
+   * @param container_id Container identifier
+   * @return Pointer to Container or nullptr if not found
+   */
+  Container* GetContainerRaw(PoolId pool_id, ContainerId container_id) const;
 
   bool is_initialized_ = false;
 

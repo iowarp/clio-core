@@ -180,10 +180,11 @@ bool PoolManager::UnregisterContainer(PoolId pool_id, ContainerId container_id) 
   Container *removed = cit->second;
   info.containers_.erase(cit);
 
-  // Recalculate static/local if the removed container was either
-  if (info.static_container_ == removed) {
-    info.static_container_ = info.containers_.empty()
-        ? nullptr : info.containers_.begin()->second;
+  // Never null out static_container_ — it is needed for task deserialization
+  // (e.g., ClientRecv) even after migration removes the execution container.
+  // Only reassign if another container is available.
+  if (info.static_container_ == removed && !info.containers_.empty()) {
+    info.static_container_ = info.containers_.begin()->second;
   }
   if (info.local_container_ == removed) {
     info.RecalculateLocalContainer();
@@ -208,7 +209,36 @@ void PoolManager::UnregisterAllContainers(PoolId pool_id) {
   info.local_container_ = nullptr;
 }
 
-Container* PoolManager::GetContainer(PoolId pool_id, ContainerId container_id) const {
+Container* PoolManager::GetContainer(PoolId pool_id, ContainerId container_id,
+                                      bool &is_plugged) const {
+  is_plugged = false;
+  if (!is_initialized_) {
+    return nullptr;
+  }
+
+  auto it = pool_metadata_.find(pool_id);
+  if (it == pool_metadata_.end()) {
+    return nullptr;
+  }
+
+  const PoolInfo &info = it->second;
+  Container *container = nullptr;
+  if (container_id != kInvalidContainerId) {
+    auto cit = info.containers_.find(container_id);
+    if (cit != info.containers_.end()) {
+      container = cit->second;
+    }
+  }
+  if (!container) {
+    container = info.local_container_;
+  }
+  if (container) {
+    is_plugged = container->IsPlugged();
+  }
+  return container;
+}
+
+Container* PoolManager::GetContainerRaw(PoolId pool_id, ContainerId container_id) const {
   if (!is_initialized_) {
     return nullptr;
   }
@@ -236,17 +266,15 @@ Container* PoolManager::GetStaticContainer(PoolId pool_id) const {
   return it->second.static_container_;
 }
 
-Container* PoolManager::GetLocalContainer(PoolId pool_id) const {
-  if (!is_initialized_) {
-    return nullptr;
+void PoolManager::PlugContainer(PoolId pool_id, ContainerId container_id) {
+  Container *container = GetContainerRaw(pool_id, container_id);
+  if (!container) {
+    return;
   }
-
-  auto it = pool_metadata_.find(pool_id);
-  if (it == pool_metadata_.end()) {
-    return nullptr;
+  container->SetPlugged();
+  while (container->GetWorkRemaining() > 0) {
+    HSHM_THREAD_MODEL->Yield();
   }
-
-  return it->second.local_container_;
 }
 
 bool PoolManager::HasPool(PoolId pool_id) const {

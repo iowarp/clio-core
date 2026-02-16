@@ -157,6 +157,9 @@ WorkerStats Worker::GetWorkerStats() const {
     stats.num_periodic_tasks_ += periodic_queues_[i].size();
   }
 
+  // Count retry tasks
+  stats.num_retry_tasks_ = retry_queue_.size();
+
   // Get suspend period (time until next periodic task or 0 if none)
   double suspend_period = GetSuspendPeriod();
   stats.suspend_period_us_ =
@@ -180,7 +183,7 @@ void Worker::Finalize() {
 
   // Note: Context cache cleanup removed - RunContext is now embedded in Task
 
-  // Clean up all blocked queues (2 queues)
+  // Clean up all blocked queues
   for (u32 i = 0; i < NUM_BLOCKED_QUEUES; ++i) {
     while (!blocked_queues_[i].empty()) {
       RunContext *run_ctx = blocked_queues_[i].front();
@@ -189,6 +192,11 @@ void Worker::Finalize() {
       // They will be cleaned up when the tasks complete or by stack cache
       (void)run_ctx;  // Suppress unused variable warning
     }
+  }
+
+  // Clean up retry queue
+  while (!retry_queue_.empty()) {
+    retry_queue_.pop();
   }
 
   // Clear assigned lane reference (don't delete - it's in shared memory)
@@ -679,21 +687,21 @@ bool Worker::RouteLocal(Future<Task> &future, TaskLane *lane,
 
   // Resolve the actual execution container
   auto *pool_manager = CHI_POOL_MANAGER;
-  Container *exec_container = nullptr;
+  bool is_plugged = false;
   ContainerId container_id = task_ptr->pool_query_.GetContainerId();
+  Container *exec_container = pool_manager->GetContainer(
+      task_ptr->pool_id_, container_id, is_plugged);
 
-  if (container_id != kInvalidContainerId) {
-    // Specific container requested
-    exec_container = pool_manager->GetContainer(task_ptr->pool_id_, container_id);
-  }
-  if (!exec_container) {
-    // Fall back to local container
-    exec_container = pool_manager->GetLocalContainer(task_ptr->pool_id_);
-  }
-
-  if (!exec_container) {
-    HLOG(kError, "Worker {}: RouteLocal - container not found for pool_id={}",
-         worker_id_, task_ptr->pool_id_);
+  if (!exec_container || is_plugged) {
+    // Container is migrating or gone — add to retry queue
+    if (task_ptr->run_ctx_) {
+      HLOG(kDebug,
+           "Worker {}: RouteLocal - container {} for pool_id={}, "
+           "adding to retry queue",
+           worker_id_, is_plugged ? "is plugged" : "not found",
+           task_ptr->pool_id_);
+      AddToRetryQueue(task_ptr->run_ctx_.get());
+    }
     return false;
   }
 
@@ -904,6 +912,9 @@ std::vector<PoolQuery> Worker::ResolveRangeQuery(
       // Container is local, resolve to Local query
       return {PoolQuery::Local()};
     }
+    // Container is not local — route to the node that owns it
+    u32 node_id = pool_manager->GetContainerNodeId(pool_id, container_id);
+    return {PoolQuery::Physical(node_id)};
   }
 
   std::vector<PoolQuery> result_queries;
@@ -1133,6 +1144,16 @@ void Worker::ExecTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
   // Check if task is null or run context is null
   if (task_ptr.IsNull() || !run_ctx) {
     return;  // Consider null tasks as completed
+  }
+
+  // Resolve the container fresh each time (may change during migration)
+  auto *pool_manager = CHI_POOL_MANAGER;
+  bool is_plugged = false;
+  ContainerId container_id = task_ptr->pool_query_.GetContainerId();
+  Container *exec_container = pool_manager->GetContainer(
+      task_ptr->pool_id_, container_id, is_plugged);
+  if (exec_container && !is_plugged) {
+    run_ctx->container_ = exec_container;
   }
 
   // Call appropriate coroutine function based on task state
@@ -1458,6 +1479,11 @@ void Worker::ContinueBlockedTasks(bool force) {
   // Process event queue to wake up tasks waiting for subtask completion
   ProcessEventQueue();
 
+  // Process retry queue every 32 iterations (or on force)
+  if (force || iteration_count_ % 32 == 0) {
+    ProcessRetryQueue();
+  }
+
   if (force) {
     // Force mode: process all blocked queues regardless of iteration count
     for (u32 i = 0; i < NUM_BLOCKED_QUEUES; ++i) {
@@ -1578,6 +1604,53 @@ void Worker::AddToBlockedQueue(RunContext *run_ctx, bool wait_for_task) {
 
     // Add to the appropriate periodic queue
     periodic_queues_[queue_idx].push(run_ctx);
+  }
+}
+
+void Worker::AddToRetryQueue(RunContext *run_ctx_ptr) {
+  retry_queue_.push(run_ctx_ptr);
+}
+
+void Worker::ProcessRetryQueue() {
+  size_t count = retry_queue_.size();
+  for (size_t i = 0; i < count; ++i) {
+    RunContext *run_ctx = retry_queue_.front();
+    retry_queue_.pop();
+
+    FullPtr<Task> task_ptr = run_ctx->task_;
+    if (task_ptr.IsNull()) {
+      continue;  // Skip invalid entries
+    }
+
+    // Re-resolve the pool query for this task
+    std::vector<PoolQuery> pool_queries =
+        ResolvePoolQuery(task_ptr->pool_query_, task_ptr->pool_id_, task_ptr);
+
+    bool is_local = IsTaskLocal(task_ptr, pool_queries);
+    if (is_local) {
+      // Container is back / available locally — check plug state
+      auto *pool_manager = CHI_POOL_MANAGER;
+      bool is_plugged = false;
+      ContainerId container_id = task_ptr->pool_query_.GetContainerId();
+      Container *exec_container = pool_manager->GetContainer(
+          task_ptr->pool_id_, container_id, is_plugged);
+
+      if (is_plugged) {
+        // Still plugged, put back in retry queue
+        retry_queue_.push(run_ctx);
+      } else if (exec_container) {
+        // Container available — execute locally
+        run_ctx->container_ = exec_container;
+        task_ptr->SetCompleter(exec_container->container_id_);
+        ExecTask(task_ptr, run_ctx, false);
+      } else {
+        // Container gone but resolved as local — shouldn't happen, retry
+        retry_queue_.push(run_ctx);
+      }
+    } else {
+      // Container migrated away — route globally
+      RouteGlobal(run_ctx->future_, pool_queries);
+    }
   }
 }
 
