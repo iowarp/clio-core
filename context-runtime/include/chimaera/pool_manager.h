@@ -50,112 +50,7 @@ struct RunContext;
 class TaskResume;
 
 /**
- * Address mapping table for pool management
- * 
- * Contains two unordered_maps for address translation:
- * - Local to Global address mapping
- * - Global to Physical address mapping
- */
-struct AddressTable {
-  // Local to global: Maps local addresses to global addresses
-  std::unordered_map<Address, Address, AddressHash> local_to_global_map_;
-  
-  // Global to physical: Maps global addresses to physical addresses
-  std::unordered_map<Address, Address, AddressHash> global_to_physical_map_;
-  
-  /**
-   * Add local to global mapping
-   */
-  void AddLocalToGlobalMapping(const Address& local_addr, const Address& global_addr) {
-    local_to_global_map_[local_addr] = global_addr;
-  }
-  
-  /**
-   * Add global to physical mapping
-   */
-  void AddGlobalToPhysicalMapping(const Address& global_addr, const Address& physical_addr) {
-    global_to_physical_map_[global_addr] = physical_addr;
-  }
-  
-  /**
-   * Convert local address to global address
-   */
-  bool LocalToGlobal(const Address& local_addr, Address& global_addr) const {
-    auto it = local_to_global_map_.find(local_addr);
-    if (it != local_to_global_map_.end()) {
-      global_addr = it->second;
-      return true;
-    }
-    return false;
-  }
-  
-  /**
-   * Convert global address to physical address
-   */
-  bool GlobalToPhysical(const Address& global_addr, Address& physical_addr) const {
-    auto it = global_to_physical_map_.find(global_addr);
-    if (it != global_to_physical_map_.end()) {
-      physical_addr = it->second;
-      return true;
-    }
-    return false;
-  }
-  
-  /**
-   * Remove local to global mapping
-   */
-  void RemoveLocalToGlobalMapping(const Address& local_addr) {
-    local_to_global_map_.erase(local_addr);
-  }
-  
-  /**
-   * Remove global to physical mapping
-   */
-  void RemoveGlobalToPhysicalMapping(const Address& global_addr) {
-    global_to_physical_map_.erase(global_addr);
-  }
-  
-  /**
-   * Clear all mappings
-   */
-  void Clear() {
-    local_to_global_map_.clear();
-    global_to_physical_map_.clear();
-  }
-
-  /**
-   * Get global address for a container ID
-   * @param container_id Container identifier
-   * @return Global address for the container
-   */
-  Address GetGlobalAddress(u32 container_id) const {
-    // For now, assume container_id maps to global address with same minor_id
-    // This could be made more sophisticated based on addressing scheme
-    if (!global_to_physical_map_.empty()) {
-      auto it = global_to_physical_map_.begin();
-      PoolId pool_id = it->first.pool_id_;
-      return Address(pool_id, Group::kGlobal, container_id);
-    }
-    return Address();
-  }
-
-  /**
-   * Get physical nodes for a global address
-   * @param global_address Global address to look up
-   * @return Vector of physical node IDs
-   */
-  std::vector<u32> GetPhysicalNodes(const Address& global_address) const {
-    std::vector<u32> nodes;
-    Address physical_address;
-    if (GlobalToPhysical(global_address, physical_address)) {
-      nodes.push_back(physical_address.minor_id_);
-    }
-    return nodes;
-  }
-};
-
-/**
- * Pool metadata containing domain tables and configuration
+ * Pool metadata containing container references and address mappings
  */
 struct PoolInfo {
   PoolId pool_id_;
@@ -163,16 +58,34 @@ struct PoolInfo {
   std::string chimod_name_;
   std::string chimod_params_;
   u32 num_containers_;
-  AddressTable address_table_;
   bool is_active_;
-  
+
+  /** Containers on THIS node (ContainerId -> Container*) */
+  std::unordered_map<ContainerId, Container*> containers_;
+  /** ALL container address mappings across cluster (ContainerId -> NodeId) */
+  std::unordered_map<ContainerId, u32> address_map_;
+  /** Static container for stateless APIs (alloc, serialize, deserialize tasks) */
+  Container* static_container_ = nullptr;
+  /** Local (default) container for this node. Initially static_container_.
+      When migrated away, another from containers_ is chosen. If none, falls back to static. */
+  Container* local_container_ = nullptr;
+
   PoolInfo() : pool_id_(), num_containers_(0), is_active_(false) {}
-  
-  PoolInfo(PoolId pool_id, const std::string& pool_name, 
+
+  PoolInfo(PoolId pool_id, const std::string& pool_name,
            const std::string& chimod_name, const std::string& chimod_params,
            u32 num_containers)
       : pool_id_(pool_id), pool_name_(pool_name), chimod_name_(chimod_name),
         chimod_params_(chimod_params), num_containers_(num_containers), is_active_(true) {}
+
+  /** Select a new local_container_ after migration/removal */
+  void RecalculateLocalContainer() {
+    if (!containers_.empty()) {
+      local_container_ = containers_.begin()->second;
+    } else {
+      local_container_ = static_container_;
+    }
+  }
 };
 
 /**
@@ -197,26 +110,54 @@ class PoolManager {
   void Finalize();
 
   /**
-   * Register a Container with a specific PoolId
+   * Register a Container with a specific PoolId and ContainerId
    * @param pool_id Pool identifier
+   * @param container_id Container identifier
    * @param container Pointer to Container
+   * @param is_static Whether this is the static container for the pool
    * @return true if registration successful, false otherwise
    */
-  bool RegisterContainer(PoolId pool_id, Container* container);
+  bool RegisterContainer(PoolId pool_id, ContainerId container_id,
+                          Container* container, bool is_static = false);
 
   /**
-   * Unregister a Container
+   * Unregister a specific Container
    * @param pool_id Pool identifier
+   * @param container_id Container identifier
    * @return true if unregistration successful, false otherwise
    */
-  bool UnregisterContainer(PoolId pool_id);
+  bool UnregisterContainer(PoolId pool_id, ContainerId container_id);
 
   /**
-   * Get Container by PoolId
+   * Unregister all containers for a pool
    * @param pool_id Pool identifier
+   */
+  void UnregisterAllContainers(PoolId pool_id);
+
+  /**
+   * Plug a container: mark CONTAINER_PLUG and wait for all work to complete
+   * @param pool_id Pool identifier
+   * @param container_id Container identifier
+   */
+  void PlugContainer(PoolId pool_id, ContainerId container_id);
+
+  /**
+   * Get Container by PoolId and ContainerId, with plug state
+   * If container_id is kInvalidContainerId, falls back to local container.
+   * @param pool_id Pool identifier
+   * @param container_id Container identifier
+   * @param is_plugged Output: true if the container is plugged
    * @return Pointer to Container or nullptr if not found
    */
-  Container* GetContainer(PoolId pool_id) const;
+  Container* GetContainer(PoolId pool_id, ContainerId container_id,
+                           bool &is_plugged) const;
+
+  /**
+   * Get the static container for a pool (for stateless ops: alloc, serialize, etc.)
+   * @param pool_id Pool identifier
+   * @return Pointer to static Container or nullptr if not found
+   */
+  Container* GetStaticContainer(PoolId pool_id) const;
 
   /**
    * Check if pool exists on this node
@@ -267,12 +208,11 @@ class PoolManager {
   bool ValidatePoolParams(const std::string& chimod_name, const std::string& pool_name);
 
   /**
-   * Create address table for a pool
+   * Initialize address map for a pool (ContainerId -> NodeId)
    * @param pool_id Pool identifier
    * @param num_containers Number of containers in the pool
-   * @return Address table for the pool
    */
-  AddressTable CreateAddressTable(PoolId pool_id, u32 num_containers);
+  void InitAddressMap(PoolId pool_id, u32 num_containers);
 
   /**
    * Create or get a complete pool with get-or-create semantics
@@ -328,15 +268,36 @@ class PoolManager {
    */
   u32 GetContainerNodeId(PoolId pool_id, ContainerId container_id) const;
 
- private:
+  /**
+   * Update the global->physical mapping for a container in a pool's address table
+   * @param pool_id Pool identifier
+   * @param container_id Container identifier
+   * @param new_node_id New physical node ID for the container
+   * @return true if mapping was updated, false if pool not found
+   */
+  bool UpdateContainerNodeMapping(PoolId pool_id, ContainerId container_id, u32 new_node_id);
 
+  /**
+   * Write a WAL entry for an address table change
+   * @param pool_id Pool identifier
+   * @param container_id Container identifier
+   * @param old_node Previous node ID
+   * @param new_node New node ID
+   */
+  void WriteAddressTableWAL(PoolId pool_id, ContainerId container_id, u32 old_node, u32 new_node);
+
+ private:
+  /**
+   * Internal: Get Container by PoolId and ContainerId (no plug check)
+   * @param pool_id Pool identifier
+   * @param container_id Container identifier
+   * @return Pointer to Container or nullptr if not found
+   */
+  Container* GetContainerRaw(PoolId pool_id, ContainerId container_id) const;
 
   bool is_initialized_ = false;
-  
-  // Map PoolId to Containers on this node
-  std::unordered_map<PoolId, Container*> pool_container_map_;
-  
-  // Map PoolId to pool metadata
+
+  // Map PoolId to pool metadata (contains containers, address map, etc.)
   std::unordered_map<PoolId, PoolInfo> pool_metadata_;
   
   // Pool ID counter for generating unique IDs (used as minor number)

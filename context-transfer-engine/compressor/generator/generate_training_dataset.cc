@@ -60,6 +60,7 @@
 #include <algorithm>
 
 #include "wrp_cte/compressor/models/data_stats.h"
+#include <hermes_shm/util/logging.h>
 
 // Compression libraries
 #ifdef HSHM_ENABLE_COMPRESS
@@ -132,13 +133,13 @@ struct Config {
 };
 
 void PrintUsage(const char* prog) {
-  std::cerr << "Usage: " << prog << " [options]\n"
-            << "Options:\n"
-            << "  --threads <n>        Number of threads [default: 1]\n"
-            << "  --samples <n>        Samples per compressor config [default: 50]\n"
-            << "  --output <path>      Output CSV path\n"
-            << "  --skip-compression   Skip compression tests, only calculate statistics\n"
-            << "  --verbose            Print progress\n";
+  HLOG(kError, "Usage: {} [options]", prog);
+  HLOG(kError, "Options:");
+  HLOG(kError, "  --threads <n>        Number of threads [default: 1]");
+  HLOG(kError, "  --samples <n>        Samples per compressor config [default: 50]");
+  HLOG(kError, "  --output <path>      Output CSV path");
+  HLOG(kError, "  --skip-compression   Skip compression tests, only calculate statistics");
+  HLOG(kError, "  --verbose            Print progress");
 }
 
 Config ParseArgs(int argc, char** argv) {
@@ -914,11 +915,11 @@ BenchmarkResult BenchmarkSampleTyped(const std::string& type_name, size_t data_s
 int main(int argc, char** argv) {
   Config config = ParseArgs(argc, argv);
 
-  std::cout << "=== Comprehensive Compression Benchmark ===" << std::endl;
-  std::cout << "Threads: " << config.num_threads << std::endl;
-  std::cout << "Samples per config: " << config.samples_per_config << std::endl;
-  std::cout << "Output: " << config.output_path << std::endl;
-  std::cout << "Mode: " << (config.skip_compression ? "Statistics Only" : "Full Compression") << std::endl;
+  HLOG(kInfo, "=== Comprehensive Compression Benchmark ===");
+  HLOG(kInfo, "Threads: {}", config.num_threads);
+  HLOG(kInfo, "Samples per config: {}", config.samples_per_config);
+  HLOG(kInfo, "Output: {}", config.output_path);
+  HLOG(kInfo, "Mode: {}", config.skip_compression ? "Statistics Only" : "Full Compression");
 
   // Initialize
   auto compressor_configs = InitializeCompressors();
@@ -928,15 +929,15 @@ int main(int argc, char** argv) {
   std::vector<std::string> data_types = {"char", "int", "float"};
 
   if (config.skip_compression) {
-    std::cout << "Distributions: " << distributions.size()
-              << " (7 palettes × 7 widths × 8 perturbations × 5 fill modes)" << std::endl;
-    std::cout << "Size bins: " << size_bins.size() << " (128KB + 1MB)" << std::endl;
+    HLOG(kInfo, "Distributions: {} (7 palettes × 7 widths × 8 perturbations × 5 fill modes)",
+         distributions.size());
+    HLOG(kInfo, "Size bins: {} (128KB + 1MB)", size_bins.size());
   } else {
-    std::cout << "Compressor configs: " << compressor_configs.size() << std::endl;
-    std::cout << "Distributions: " << distributions.size() << " palettes" << std::endl;
-    std::cout << "Size bins: " << size_bins.size() << " (1KB-128KB + 1MB + 4MB)" << std::endl;
+    HLOG(kInfo, "Compressor configs: {}", compressor_configs.size());
+    HLOG(kInfo, "Distributions: {} palettes", distributions.size());
+    HLOG(kInfo, "Size bins: {} (1KB-128KB + 1MB + 4MB)", size_bins.size());
   }
-  std::cout << "Data types: " << data_types.size() << " (char, int, float)" << std::endl;
+  HLOG(kInfo, "Data types: {} (char, int, float)", data_types.size());
 
   size_t total_samples;
   if (config.skip_compression) {
@@ -946,13 +947,13 @@ int main(int argc, char** argv) {
     // In compression mode: compressor_configs × samples_per_config
     total_samples = compressor_configs.size() * config.samples_per_config;
   }
-  std::cout << "Total samples: " << total_samples << std::endl;
-  std::cout << "===========================================" << std::endl;
+  HLOG(kInfo, "Total samples: {}", total_samples);
+  HLOG(kInfo, "===========================================");
 
   // Open output file
   std::ofstream out(config.output_path);
   if (!out) {
-    std::cerr << "ERROR: Cannot open " << config.output_path << std::endl;
+      HLOG(kError, "Cannot open {}", config.output_path);
     return 1;
   }
 
@@ -1063,14 +1064,12 @@ int main(int argc, char** argv) {
             double rate = count / (elapsed / 60.0 + 0.001);
             double eta_min = (total_samples - count) / rate;
 
-            std::cout << "\r[Progress] " << count << "/" << total_samples
-                      << " (" << std::fixed << std::setprecision(1) << percent << "%) | "
-                      << "Rate: " << std::fixed << std::setprecision(0) << rate << " samples/min | "
-                      << "ETA: " << std::fixed << std::setprecision(0) << eta_min << " min   "
-                      << std::flush;
+            HIPRINT("\r[Progress] {}/{} ({}%) | Rate: {} samples/min | ETA: {} min   ",
+                    count, total_samples, static_cast<int>(percent),
+                    static_cast<int>(rate), static_cast<int>(eta_min));
 
             if (count == total_samples) {
-              std::cout << std::endl;
+              HIPRINT("\n");
             }
           }
         }
@@ -1145,14 +1144,12 @@ int main(int argc, char** argv) {
               double rate = count / (elapsed / 60.0 + 0.001);
               double eta_min = (total_samples - count) / rate;
 
-              std::cout << "\r[Progress] " << count << "/" << total_samples
-                        << " (" << std::fixed << std::setprecision(1) << percent << "%) | "
-                        << "Rate: " << std::fixed << std::setprecision(0) << rate << " samples/min | "
-                        << "ETA: " << std::fixed << std::setprecision(0) << eta_min << " min   "
-                        << std::flush;
+              HIPRINT("\r[Progress] {}/{} ({}%) | Rate: {} samples/min | ETA: {} min   ",
+                      count, total_samples, static_cast<int>(percent),
+                      static_cast<int>(rate), static_cast<int>(eta_min));
 
               if (count == total_samples) {
-                std::cout << std::endl;
+                HIPRINT("\n");
               }
             }
           }
@@ -1177,10 +1174,11 @@ int main(int argc, char** argv) {
   auto end_time = std::chrono::steady_clock::now();
   auto total_time = std::chrono::duration_cast<std::chrono::seconds>(end_time - start_time).count();
 
-  std::cout << "\n=== Complete ===" << std::endl;
-  std::cout << "Total samples: " << completed << std::endl;
-  std::cout << "Time: " << total_time << "s" << std::endl;
-  std::cout << "Saved to: " << config.output_path << std::endl;
+  HLOG(kInfo, "");
+  HLOG(kInfo, "=== Complete ===");
+  HLOG(kInfo, "Total samples: {}", completed);
+  HLOG(kInfo, "Time: {}s", total_time);
+  HLOG(kInfo, "Saved to: {}", config.output_path);
 
   return 0;
 }

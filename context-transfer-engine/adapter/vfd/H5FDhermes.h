@@ -44,6 +44,8 @@
 #include <hdf5.h>
 #include <stdio.h>
 
+#include <hermes_shm/util/logging.h>
+
 #define H5FD_WRP_CTE_NAME  "hdf5_hermes_vfd"
 #define H5FD_WRP_CTE_VALUE ((H5FD_class_value_t)(3200))
 
@@ -55,7 +57,7 @@
   if (!(real_##func_##_)) {                                                 \
     real_##func_##_ = (real_t_##func_##_)dlsym(RTLD_NEXT, #func_);          \
     if (!(real_##func_##_)) {                                               \
-      fprintf(stderr, "HERMES Adapter failed to map symbol: %s\n", #func_); \
+      HLOG(kError, "HERMES Adapter failed to map symbol: {}", #func_);      \
       exit(1);                                                              \
     }                                                                       \
   }

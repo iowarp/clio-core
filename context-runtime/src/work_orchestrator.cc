@@ -42,6 +42,7 @@
 #include <iostream>
 
 #include "chimaera/container.h"
+#include "chimaera/pool_manager.h"
 #include "chimaera/singletons.h"
 #include "chimaera/ipc_manager.h"
 
@@ -355,14 +356,16 @@ bool WorkOrchestrator::HasWorkRemaining(u64 &total_work_remaining) const {
     return false; // No pool manager means no work
   }
 
-  // Get all container pool IDs from the pool manager
+  // Get all pool IDs from the pool manager
   std::vector<PoolId> all_pool_ids = pool_manager->GetAllPoolIds();
 
   for (const auto &pool_id : all_pool_ids) {
-    // Get container for each pool
-    Container *container = pool_manager->GetContainer(pool_id);
-    if (container) {
-      total_work_remaining += container->GetWorkRemaining();
+    const PoolInfo *info = pool_manager->GetPoolInfo(pool_id);
+    if (!info) continue;
+    for (const auto &pair : info->containers_) {
+      if (pair.second) {
+        total_work_remaining += pair.second->GetWorkRemaining();
+      }
     }
   }
 

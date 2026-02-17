@@ -276,6 +276,14 @@ RUN cd /tmp \
 # Switch back to iowarp user
 USER iowarp
 
+# Install Rust toolchain (needed for CTE Rust wrapper / cdylib builds)
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/home/iowarp/.cargo/bin:${PATH}"
+
+# Install Bun JavaScript runtime (needed for CTE memorybench TypeScript benchmarks)
+RUN curl -fsSL https://bun.sh/install | bash
+ENV PATH="/home/iowarp/.bun/bin:${PATH}"
+
 # Install libaio for Linux AIO support (required by bdev ChiMod)
 SHELL ["/bin/bash", "-c"]
 RUN source /home/iowarp/miniconda3/etc/profile.d/conda.sh \
@@ -342,6 +350,12 @@ RUN ARCH=$(uname -m) && \
     && echo '# Create custom environments if needed: conda create -n myenv' >> /home/iowarp/.bashrc \
     && echo 'eval "$(/home/iowarp/miniconda3/bin/conda shell.bash hook)"' >> /home/iowarp/.bashrc \
     && echo '# <<< conda initialize <<<' >> /home/iowarp/.bashrc \
+    && echo '' >> /home/iowarp/.bashrc \
+    && echo '# Rust toolchain' >> /home/iowarp/.bashrc \
+    && echo 'export PATH="/home/iowarp/.cargo/bin:$PATH"' >> /home/iowarp/.bashrc \
+    && echo '' >> /home/iowarp/.bashrc \
+    && echo '# Bun JavaScript runtime' >> /home/iowarp/.bashrc \
+    && echo 'export PATH="/home/iowarp/.bun/bin:$PATH"' >> /home/iowarp/.bashrc \
     && echo '' >> /home/iowarp/.bashrc
 
 WORKDIR /workspace

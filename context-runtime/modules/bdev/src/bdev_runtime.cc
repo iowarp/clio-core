@@ -1012,9 +1012,8 @@ void Runtime::WriteToRam(hipc::FullPtr<WriteTask> task) {
 
   ++ram_write_count;
   if (ram_write_count % 100 == 0) {
-    fprintf(stderr,
-            "[WriteToRam] ops=%zu resolve=%.3f ms memcpy=%.3f ms\n",
-            ram_write_count, t_resolve_ms, t_memcpy_ms);
+    HLOG(kDebug, "[WriteToRam] ops={} resolve={} ms memcpy={} ms",
+         ram_write_count, t_resolve_ms, t_memcpy_ms);
     t_resolve_ms = t_memcpy_ms = 0;
   }
 }

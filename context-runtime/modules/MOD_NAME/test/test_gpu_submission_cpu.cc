@@ -43,6 +43,7 @@
 #include "simple_test.h"
 #include <chrono>
 #include <thread>
+#include <hermes_shm/util/logging.h>
 
 using namespace std::chrono_literals;
 
@@ -112,7 +113,7 @@ TEST_CASE("gpu_queue_initialization", "[gpu][infrastructure][.skip]") {
  * Test: CPU-side task submission and execution
  */
 TEST_CASE("gpu_task_cpu_submission", "[gpu][cpu_submission]") {
-  std::cout << "[TEST START] gpu_task_cpu_submission" << std::endl;
+  HLOG(kInfo, "[TEST START] gpu_task_cpu_submission");
 
   // Initialize if not already done
   if (!g_initialized) {
@@ -124,9 +125,9 @@ TEST_CASE("gpu_task_cpu_submission", "[gpu][cpu_submission]") {
 
   // Create unique pool ID for this test
   g_test_counter++;
-  std::cout << "[TEST] Creating pool_id" << std::endl;
+  HLOG(kInfo, "[TEST] Creating pool_id");
   chi::PoolId pool_id(10000, g_test_counter);
-  std::cout << "[TEST] pool_id created: " << pool_id.ToU64() << std::endl;
+  HLOG(kInfo, "[TEST] pool_id created: {}", pool_id.ToU64());
 
   // Create MOD_NAME container
   INFO("Creating MOD_NAME client");

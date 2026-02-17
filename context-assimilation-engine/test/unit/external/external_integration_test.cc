@@ -19,6 +19,9 @@
 // HSHM includes
 #include <hermes_shm/util/singleton.h>
 
+// Logging
+#include <hermes_shm/util/logging.h>
+
 class ExternalCaeTest {
 private:
     std::unique_ptr<wrp_cae::core::Client> cae_client_;
@@ -32,53 +35,53 @@ public:
     }
 
     bool Initialize() {
-        std::cout << "=== External CAE Core Integration Test ===" << std::endl;
-        std::cout << "Initializing CAE Core system..." << std::endl;
+        HLOG(kInfo, "=== External CAE Core Integration Test ===");
+        HLOG(kInfo, "Initializing CAE Core system...");
 
         try {
             // Step 1: Initialize Chimaera (runtime + client)
-            std::cout << "1. Initializing Chimaera..." << std::endl;
+            HLOG(kInfo, "1. Initializing Chimaera...");
             bool chimaera_init = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
             if (!chimaera_init) {
-                std::cerr << "Failed to initialize Chimaera" << std::endl;
+                HLOG(kError, "Failed to initialize Chimaera");
                 return false;
             }
 
             // Step 2: Create CAE client instance
-            std::cout << "2. Creating CAE client instance..." << std::endl;
+            HLOG(kInfo, "2. Creating CAE client instance...");
             cae_client_ = std::make_unique<wrp_cae::core::Client>();
 
             // Step 3: Create CAE container
-            std::cout << "3. Creating CAE container..." << std::endl;
+            HLOG(kInfo, "3. Creating CAE container...");
             wrp_cae::core::CreateParams create_params;
 
             try {
                 cae_client_->Create(hipc::MemContext(), chi::PoolQuery::Dynamic(),
                                    "cae_test_pool",
                                    wrp_cae::core::kCaePoolId, create_params);
-                std::cout << "   CAE container created successfully" << std::endl;
+                HLOG(kSuccess, "CAE container created successfully");
             } catch (const std::exception& e) {
-                std::cerr << "Failed to create CAE container: " << e.what() << std::endl;
+                HLOG(kError, "Failed to create CAE container: {}", e.what());
                 return false;
             }
 
             initialized_ = true;
-            std::cout << "CAE Core initialization completed successfully!" << std::endl;
+            HLOG(kSuccess, "CAE Core initialization completed successfully!");
             return true;
 
         } catch (const std::exception& e) {
-            std::cerr << "Exception during initialization: " << e.what() << std::endl;
+            HLOG(kError, "Exception during initialization: {}", e.what());
             return false;
         }
     }
 
     bool RunTests() {
         if (!initialized_) {
-            std::cerr << "Cannot run tests - system not initialized" << std::endl;
+            HLOG(kError, "Cannot run tests - system not initialized");
             return false;
         }
 
-        std::cout << "\n=== Running CAE Core API Tests ===" << std::endl;
+        HLOG(kInfo, "=== Running CAE Core API Tests ===");
 
         bool all_tests_passed = true;
 
@@ -86,9 +89,9 @@ public:
         all_tests_passed &= TestBasicFunctionality();
 
         if (all_tests_passed) {
-            std::cout << "\n✅ All tests passed!" << std::endl;
+            HLOG(kSuccess, "All tests passed!");
         } else {
-            std::cout << "\n❌ Some tests failed!" << std::endl;
+            HLOG(kError, "Some tests failed!");
         }
 
         return all_tests_passed;
@@ -96,33 +99,33 @@ public:
 
 private:
     bool TestBasicFunctionality() {
-        std::cout << "\n--- Test 1: Basic CAE Client Functionality ---" << std::endl;
+        HLOG(kInfo, "--- Test 1: Basic CAE Client Functionality ---");
 
         try {
             // Verify client exists and is usable
             if (cae_client_) {
-                std::cout << "✅ CAE client is functional" << std::endl;
+                HLOG(kSuccess, "CAE client is functional");
                 return true;
             } else {
-                std::cout << "❌ CAE client is not available" << std::endl;
+                HLOG(kError, "CAE client is not available");
                 return false;
             }
         } catch (const std::exception& e) {
-            std::cout << "❌ Exception in TestBasicFunctionality: " << e.what() << std::endl;
+            HLOG(kError, "Exception in TestBasicFunctionality: {}", e.what());
             return false;
         }
     }
 
     void Cleanup() {
         if (initialized_) {
-            std::cout << "\n=== Cleanup ===" << std::endl;
-            std::cout << "Cleaning up CAE Core resources..." << std::endl;
+            HLOG(kInfo, "=== Cleanup ===");
+            HLOG(kInfo, "Cleaning up CAE Core resources...");
 
             // CAE and Chimaera cleanup would happen automatically
             // through destructors and singleton cleanup
 
             initialized_ = false;
-            std::cout << "Cleanup completed." << std::endl;
+            HLOG(kSuccess, "Cleanup completed.");
         }
     }
 };
@@ -137,7 +140,7 @@ int main(int argc, char* argv[]) {
 
     // Initialize the system
     if (!test.Initialize()) {
-        std::cerr << "Failed to initialize CAE Core system" << std::endl;
+        HLOG(kError, "Failed to initialize CAE Core system");
         return 1;
     }
 
@@ -145,14 +148,14 @@ int main(int argc, char* argv[]) {
     bool success = test.RunTests();
 
     // Print final result
-    std::cout << "\n=== Test Results ===" << std::endl;
+    HLOG(kInfo, "=== Test Results ===");
     if (success) {
-        std::cout << "🎉 External CAE Core integration test PASSED!" << std::endl;
-        std::cout << "The CAE Core library is properly linkable and functional." << std::endl;
+        HLOG(kSuccess, "External CAE Core integration test PASSED!");
+        HLOG(kSuccess, "The CAE Core library is properly linkable and functional.");
         return 0;
     } else {
-        std::cout << "💥 External CAE Core integration test FAILED!" << std::endl;
-        std::cout << "Check the error messages above for details." << std::endl;
+        HLOG(kError, "External CAE Core integration test FAILED!");
+        HLOG(kError, "Check the error messages above for details.");
         return 1;
     }
 }

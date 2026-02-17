@@ -46,41 +46,42 @@
 #include <atomic>
 #include <mutex>
 #include <cassert>
+#include <hermes_shm/util/logging.h>
 
 #include "chimaera/unordered_map_ll.h"
 
 // Simple test helper macros
 #define EXPECT_EQ(a, b) do { \
   if ((a) != (b)) { \
-    std::cerr << "FAIL: Expected " << (a) << " == " << (b) << " at line " << __LINE__ << std::endl; \
+    HLOG(kError, "FAIL: Expected {} == {} at line {}", (a), (b), __LINE__); \
     return 1; \
   } \
 } while(0)
 
 #define EXPECT_NE(a, b) do { \
   if ((a) == (b)) { \
-    std::cerr << "FAIL: Expected " << (a) << " != " << (b) << " at line " << __LINE__ << std::endl; \
+    HLOG(kError, "FAIL: Expected {} != {} at line {}", (a), (b), __LINE__); \
     return 1; \
   } \
 } while(0)
 
 #define EXPECT_TRUE(a) do { \
   if (!(a)) { \
-    std::cerr << "FAIL: Expected true at line " << __LINE__ << std::endl; \
+    HLOG(kError, "FAIL: Expected true at line {}", __LINE__); \
     return 1; \
   } \
 } while(0)
 
 #define EXPECT_FALSE(a) do { \
   if ((a)) { \
-    std::cerr << "FAIL: Expected false at line " << __LINE__ << std::endl; \
+    HLOG(kError, "FAIL: Expected false at line {}", __LINE__); \
     return 1; \
   } \
 } while(0)
 
 #define EXPECT_GT(a, b) do { \
   if ((a) <= (b)) { \
-    std::cerr << "FAIL: Expected " << (a) << " > " << (b) << " at line " << __LINE__ << std::endl; \
+    HLOG(kError, "FAIL: Expected {} > {} at line {}", (a), (b), __LINE__); \
     return 1; \
   } \
 } while(0)
@@ -88,7 +89,7 @@
 #define EXPECT_THROW(expr, exc_type) do { \
   try { \
     expr; \
-    std::cerr << "FAIL: Expected exception at line " << __LINE__ << std::endl; \
+    HLOG(kError, "FAIL: Expected exception at line {}", __LINE__); \
     return 1; \
   } catch (const exc_type&) { \
   } \
@@ -487,12 +488,12 @@ int main() {
 
   #define RUN_TEST(suite, name) do { \
     total++; \
-    std::cout << "Running " #suite "." #name "..." << std::endl; \
+    HIPRINT("Running " #suite "." #name "..."); \
     if (test_##suite##_##name() != 0) { \
-      std::cerr << "FAILED: " #suite "." #name << std::endl; \
+      HLOG(kError, "FAILED: " #suite "." #name); \
       failed++; \
     } else { \
-      std::cout << "PASSED: " #suite "." #name << std::endl; \
+      HLOG(kInfo, "PASSED: " #suite "." #name); \
     } \
   } while(0)
 
@@ -510,6 +511,6 @@ int main() {
   RUN_TEST(UnorderedMapLLTest, ConcurrentMixedOperations);
   RUN_TEST(UnorderedMapLLTest, BucketDistribution);
 
-  std::cout << "\n" << (total - failed) << "/" << total << " tests passed" << std::endl;
+  HIPRINT("{}/{} tests passed", (total - failed), total);
   return failed > 0 ? 1 : 0;
 }

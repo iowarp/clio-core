@@ -1,4 +1,5 @@
 #include <iostream>
+#include <hermes_shm/util/logging.h>
 #include <chimaera/chimaera.h>
 #include <chimaera/admin/admin_client.h>
 
@@ -9,33 +10,33 @@
  * 3. Basic functionality works through the installed packages
  */
 int main() {
-  std::cout << "Testing external ChiMod integration..." << std::endl;
-  
+  HIPRINT("Testing external ChiMod integration...");
+
   try {
     // Initialize Chimaera client
     if (!chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true)) {
-      std::cerr << "Failed to initialize Chimaera client" << std::endl;
+      HLOG(kError, "Failed to initialize Chimaera client");
       return 1;
     }
-    std::cout << "✓ Chimaera client initialized successfully" << std::endl;
+    HIPRINT("Chimaera client initialized successfully");
 
     // Create admin client
     chimaera::admin::Client admin_client(chi::kAdminPoolId);
-    std::cout << "✓ Admin client created successfully" << std::endl;
-    
+    HIPRINT("Admin client created successfully");
+
     // Test that we can call basic methods (without actually creating containers)
     // This tests that the linking and symbol resolution is working
     auto pool_query = chi::PoolQuery::Local();
-    std::cout << "✓ Pool query created successfully" << std::endl;
-    
-    std::cout << "All external ChiMod integration tests passed!" << std::endl;
+    HIPRINT("Pool query created successfully");
+
+    HIPRINT("All external ChiMod integration tests passed!");
     return 0;
-    
+
   } catch (const std::exception& e) {
-    std::cerr << "Error during external ChiMod test: " << e.what() << std::endl;
+    HLOG(kError, "Error during external ChiMod test: {}", e.what());
     return 1;
   } catch (...) {
-    std::cerr << "Unknown error during external ChiMod test" << std::endl;
+    HLOG(kError, "Unknown error during external ChiMod test");
     return 1;
   }
 }

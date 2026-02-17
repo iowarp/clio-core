@@ -877,6 +877,76 @@ class IpcManager {
   size_t GetNumHosts() const;
 
   /**
+   * Check if a node is believed to be alive
+   * @param node_id Node to check
+   * @return true if alive, false if dead or unknown
+   */
+  bool IsAlive(u64 node_id) const;
+
+  /**
+   * Mark a node as dead and record it for retry tracking
+   * Removes cached client connections for the dead node
+   * @param node_id Node to mark as dead
+   */
+  void SetDead(u64 node_id);
+
+  /**
+   * Mark a node as alive and remove it from dead-node tracking
+   * @param node_id Node to mark as alive
+   */
+  void SetAlive(u64 node_id);
+
+  /**
+   * Get the SWIM node state for a node
+   * @param node_id Node to query
+   * @return NodeState (kDead for unknown nodes)
+   */
+  NodeState GetNodeState(u64 node_id) const;
+
+  /**
+   * Set the SWIM node state and update state_changed_at timestamp
+   * @param node_id Node to update
+   * @param new_state New state to set
+   */
+  void SetNodeState(u64 node_id, NodeState new_state);
+
+  /**
+   * Set self-fenced status (partition detection)
+   * @param fenced true if this node should fence itself
+   */
+  void SetSelfFenced(bool fenced);
+
+  /**
+   * Check if this node is self-fenced
+   * @return true if self-fenced
+   */
+  bool IsSelfFenced() const { return self_fenced_; }
+
+  /**
+   * Get the leader node ID (lowest alive node_id)
+   * All nodes compute the same leader deterministically from local state
+   */
+  u64 GetLeaderNodeId() const;
+
+  /**
+   * Check if this node is the current leader
+   */
+  bool IsLeader() const;
+
+  struct DeadNodeEntry {
+    u64 node_id;
+    std::chrono::steady_clock::time_point detected_at;
+  };
+
+  /**
+   * Get the list of dead nodes for retry queue scanning
+   * @return Const reference to dead_nodes_ vector
+   */
+  const std::vector<DeadNodeEntry>& GetDeadNodes() const {
+    return dead_nodes_;
+  }
+
+  /**
    * Add a new node to the internal hostfile
    * @param ip_address IP address of the new node
    * @param port Port of the new node's runtime
@@ -1299,6 +1369,12 @@ class IpcManager {
   // buffers (stored in recv[].desc) remain valid until Future::Destroy().
   std::unordered_map<size_t, std::unique_ptr<LoadTaskArchive>>
       pending_response_archives_;
+
+  // Dead node tracking for failure detection
+  std::vector<DeadNodeEntry> dead_nodes_;
+
+  // Self-fencing flag for partition detection (SWIM protocol)
+  bool self_fenced_ = false;
 
   // Hostfile management
   std::unordered_map<u64, Host> hostfile_map_;  // Map node_id -> Host

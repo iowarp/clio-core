@@ -38,6 +38,7 @@
 
 #include "wrp_cte/compressor/models/qtable_predictor.h"
 #include "../../../context-runtime/test/simple_test.h"
+#include "hermes_shm/util/logging.h"
 #include <iostream>
 #include <chrono>
 #include <vector>
@@ -45,7 +46,8 @@
 using namespace wrp_cte::compressor;
 
 TEST_CASE("QTablePredictor - Train and Predict", "[compression][qtable][basic]") {
-  std::cout << "\n=== Testing Q-Table Training and Inference ===\n";
+  HLOG(kInfo, "");
+  HLOG(kInfo, "=== Testing Q-Table Training and Inference ===");
 
   // Create synthetic training data
   std::vector<CompressionFeatures> train_features;
@@ -76,7 +78,7 @@ TEST_CASE("QTablePredictor - Train and Predict", "[compression][qtable][basic]")
     train_labels.push_back(label);
   }
 
-  std::cout << "Generated " << train_features.size() << " training samples\n";
+  HLOG(kInfo, "Generated {} training samples", train_features.size());
 
   // Create and train Q-table predictor
   QTableConfig config;
@@ -92,11 +94,12 @@ TEST_CASE("QTablePredictor - Train and Predict", "[compression][qtable][basic]")
 
   REQUIRE(train_success);
   REQUIRE(predictor.IsReady());
-  std::cout << "Training completed in " << train_time_ms << " ms\n";
-  std::cout << predictor.GetStatistics();
+  HLOG(kInfo, "Training completed in {} ms", train_time_ms);
+  HIPRINT("{}", predictor.GetStatistics());
 
   // Test predictions
-  std::cout << "\nTesting predictions:\n";
+  HLOG(kInfo, "");
+  HLOG(kInfo, "Testing predictions:");
 
   // Low entropy test
   CompressionFeatures low_entropy;
@@ -110,8 +113,8 @@ TEST_CASE("QTablePredictor - Train and Predict", "[compression][qtable][basic]")
   low_entropy.data_type_float = 1;
 
   auto result_low = predictor.Predict(low_entropy);
-  std::cout << "  Low entropy (2.0):  ratio = " << result_low.compression_ratio
-            << ", inference = " << result_low.inference_time_ms << " ms\n";
+  HLOG(kInfo, "  Low entropy (2.0):  ratio = {}, inference = {} ms",
+       result_low.compression_ratio, result_low.inference_time_ms);
   REQUIRE(result_low.compression_ratio > 0.0);
 
   // High entropy test
@@ -126,23 +129,24 @@ TEST_CASE("QTablePredictor - Train and Predict", "[compression][qtable][basic]")
   high_entropy.data_type_float = 1;
 
   auto result_high = predictor.Predict(high_entropy);
-  std::cout << "  High entropy (5.5): ratio = " << result_high.compression_ratio
-            << ", inference = " << result_high.inference_time_ms << " ms\n";
+  HLOG(kInfo, "  High entropy (5.5): ratio = {}, inference = {} ms",
+       result_high.compression_ratio, result_high.inference_time_ms);
   REQUIRE(result_high.compression_ratio > 0.0);
 
   // Check pattern
-  std::cout << "\nPattern check: ";
+  HIPRINT("\nPattern check: ");
   if (result_low.compression_ratio > result_high.compression_ratio) {
-    std::cout << "CORRECT (low entropy -> higher ratio)\n";
+    HIPRINT("CORRECT (low entropy -> higher ratio)\n");
   } else {
-    std::cout << "May need more training samples\n";
+    HIPRINT("May need more training samples\n");
   }
 
-  std::cout << "=== Q-Table Training Test Complete ===\n";
+  HLOG(kInfo, "=== Q-Table Training Test Complete ===");
 }
 
 TEST_CASE("QTablePredictor - Save and Load", "[compression][qtable][persistence]") {
-  std::cout << "\n=== Testing Q-Table Save/Load ===\n";
+  HLOG(kInfo, "");
+  HLOG(kInfo, "=== Testing Q-Table Save/Load ===");
 
   // Create and train a simple Q-table
   std::vector<CompressionFeatures> train_features;
@@ -186,34 +190,35 @@ TEST_CASE("QTablePredictor - Save and Load", "[compression][qtable][persistence]
   test_features.data_type_float = 1;
 
   auto result1 = predictor1.Predict(test_features);
-  std::cout << "Original model prediction: " << result1.compression_ratio << "\n";
+  HLOG(kInfo, "Original model prediction: {}", result1.compression_ratio);
 
   // Save the model
   std::string model_dir = "/tmp/test_qtable_model";
   bool saved = predictor1.Save(model_dir);
   REQUIRE(saved);
-  std::cout << "Model saved to: " << model_dir << "\n";
+  HLOG(kInfo, "Model saved to: {}", model_dir);
 
   // Load into a new predictor
   QTablePredictor predictor2;
   bool loaded = predictor2.Load(model_dir);
   REQUIRE(loaded);
-  std::cout << "Model loaded from: " << model_dir << "\n";
+  HLOG(kInfo, "Model loaded from: {}", model_dir);
 
   // Compare predictions
   auto result2 = predictor2.Predict(test_features);
-  std::cout << "Loaded model prediction: " << result2.compression_ratio << "\n";
+  HLOG(kInfo, "Loaded model prediction: {}", result2.compression_ratio);
 
   // Predictions should be identical
   double diff = std::abs(result1.compression_ratio - result2.compression_ratio);
-  std::cout << "Prediction difference: " << diff << "\n";
+  HLOG(kInfo, "Prediction difference: {}", diff);
   REQUIRE(diff < 0.0001);
 
-  std::cout << "=== Save/Load Test Complete ===\n";
+  HLOG(kInfo, "=== Save/Load Test Complete ===");
 }
 
 TEST_CASE("QTablePredictor - Batch Prediction Performance", "[compression][qtable][benchmark]") {
-  std::cout << "\n=== Testing Q-Table Batch Prediction Performance ===\n";
+  HLOG(kInfo, "");
+  HLOG(kInfo, "=== Testing Q-Table Batch Prediction Performance ===");
 
   // Create and train a Q-table
   std::vector<CompressionFeatures> train_features;
@@ -272,21 +277,22 @@ TEST_CASE("QTablePredictor - Batch Prediction Performance", "[compression][qtabl
   REQUIRE(results.size() == test_batch.size());
 
   double throughput = (test_batch.size() / total_time_ms) * 1000.0;
-  std::cout << "Batch size: " << test_batch.size() << " samples\n";
-  std::cout << "Total time: " << total_time_ms << " ms\n";
-  std::cout << "Time per sample: " << (total_time_ms / test_batch.size()) << " ms\n";
-  std::cout << "Throughput: " << throughput << " predictions/sec\n";
-  std::cout << "Unknown states: " << predictor.GetUnknownCount()
-            << " (" << (100.0 * predictor.GetUnknownCount() / test_batch.size()) << "%)\n";
+  HLOG(kInfo, "Batch size: {} samples", test_batch.size());
+  HLOG(kInfo, "Total time: {} ms", total_time_ms);
+  HLOG(kInfo, "Time per sample: {} ms", total_time_ms / test_batch.size());
+  HLOG(kInfo, "Throughput: {} predictions/sec", throughput);
+  HLOG(kInfo, "Unknown states: {} ({}%)", predictor.GetUnknownCount(),
+       100.0 * predictor.GetUnknownCount() / test_batch.size());
 
   // Should be very fast (target: > 100k predictions/sec)
   REQUIRE(throughput > 10000.0);
 
-  std::cout << "=== Batch Performance Test Complete ===\n";
+  HLOG(kInfo, "=== Batch Performance Test Complete ===");
 }
 
 TEST_CASE("QTablePredictor - Nearest Neighbor Fallback", "[compression][qtable][nn]") {
-  std::cout << "\n=== Testing Q-Table with Nearest Neighbor Fallback ===\n";
+  HLOG(kInfo, "");
+  HLOG(kInfo, "=== Testing Q-Table with Nearest Neighbor Fallback ===");
 
   // Create sparse training data
   std::vector<CompressionFeatures> train_features;
@@ -327,8 +333,8 @@ TEST_CASE("QTablePredictor - Nearest Neighbor Fallback", "[compression][qtable][
   REQUIRE(predictor_no_nn.Train(train_features, train_labels));
   REQUIRE(predictor_with_nn.Train(train_features, train_labels));
 
-  std::cout << "Without NN:\n" << predictor_no_nn.GetStatistics();
-  std::cout << "With NN:\n" << predictor_with_nn.GetStatistics();
+  HIPRINT("Without NN:\n{}", predictor_no_nn.GetStatistics());
+  HIPRINT("With NN:\n{}", predictor_with_nn.GetStatistics());
 
   // Test on unknown state (entropy = 3.5, between 2.0 and 4.0)
   CompressionFeatures unknown_state;
@@ -344,9 +350,10 @@ TEST_CASE("QTablePredictor - Nearest Neighbor Fallback", "[compression][qtable][
   auto result_no_nn = predictor_no_nn.Predict(unknown_state);
   auto result_with_nn = predictor_with_nn.Predict(unknown_state);
 
-  std::cout << "\nUnknown state prediction (entropy=3.5):\n";
-  std::cout << "  Without NN: ratio = " << result_no_nn.compression_ratio << "\n";
-  std::cout << "  With NN:    ratio = " << result_with_nn.compression_ratio << "\n";
+  HLOG(kInfo, "");
+  HLOG(kInfo, "Unknown state prediction (entropy=3.5):");
+  HLOG(kInfo, "  Without NN: ratio = {}", result_no_nn.compression_ratio);
+  HLOG(kInfo, "  With NN:    ratio = {}", result_with_nn.compression_ratio);
 
   REQUIRE(result_no_nn.compression_ratio > 0.0);
   REQUIRE(result_with_nn.compression_ratio > 0.0);
@@ -354,11 +361,12 @@ TEST_CASE("QTablePredictor - Nearest Neighbor Fallback", "[compression][qtable][
   // NN should ideally give interpolated value between neighbors
   // Without NN uses global average
 
-  std::cout << "=== Nearest Neighbor Test Complete ===\n";
+  HLOG(kInfo, "=== Nearest Neighbor Test Complete ===");
 }
 
 TEST_CASE("QTablePredictor - Inference Performance Benchmark", "[compression][qtable][benchmark]") {
-  std::cout << "\n=== Q-Table Inference Performance Benchmark ===\n";
+  HLOG(kInfo, "");
+  HLOG(kInfo, "=== Q-Table Inference Performance Benchmark ===");
 
   // Train a realistic Q-table
   std::vector<CompressionFeatures> train_features;
@@ -425,12 +433,12 @@ TEST_CASE("QTablePredictor - Inference Performance Benchmark", "[compression][qt
     double avg_time_ms = total_time_ms / num_iterations;
     double throughput = (batch_size / avg_time_ms) * 1000.0;
 
-    std::cout << "Batch size " << batch_size << ":\n";
-    std::cout << "  Avg batch time: " << avg_time_ms << " ms\n";
-    std::cout << "  Throughput: " << throughput << " predictions/sec\n";
+    HLOG(kInfo, "Batch size {}:", batch_size);
+    HLOG(kInfo, "  Avg batch time: {} ms", avg_time_ms);
+    HLOG(kInfo, "  Throughput: {} predictions/sec", throughput);
   }
 
-  std::cout << "=== Benchmark Complete ===\n";
+  HLOG(kInfo, "=== Benchmark Complete ===");
 }
 
 SIMPLE_TEST_MAIN()

@@ -74,6 +74,9 @@
 // CTE headers
 #include <wrp_cte/core/core_client.h>
 
+// Logging
+#include <hermes_shm/util/logging.h>
+
 // Test configuration
 const std::string kTestFileName = "/tmp/test_hdf5_assim_file.h5";
 const std::string kTestTagBase = "test_hdf5_tag";
@@ -83,12 +86,12 @@ const std::string kTestTagBase = "test_hdf5_tag";
  * This creates a file with various data types and dimensions
  */
 bool GenerateTestHDF5File(const std::string& file_path) {
-  std::cout << "Generating test HDF5 file: " << file_path << std::endl;
+  HLOG(kInfo, "Generating test HDF5 file: {}", file_path);
 
   // Create HDF5 file
   hid_t file_id = H5Fcreate(file_path.c_str(), H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT);
   if (file_id < 0) {
-    std::cerr << "ERROR: Failed to create HDF5 file: " << file_path << std::endl;
+    HLOG(kError, "Failed to create HDF5 file: {}", file_path);
     return false;
   }
 
@@ -107,7 +110,7 @@ bool GenerateTestHDF5File(const std::string& file_path) {
 
     H5Dclose(dataset_id);
     H5Sclose(dataspace_id);
-    std::cout << "  Created /int_dataset: 1D array of 100 integers" << std::endl;
+    HLOG(kInfo, "Created /int_dataset: 1D array of 100 integers");
   }
 
   // Dataset 2: /double_dataset - 2D array (10x20) of doubles
@@ -125,7 +128,7 @@ bool GenerateTestHDF5File(const std::string& file_path) {
 
     H5Dclose(dataset_id);
     H5Sclose(dataspace_id);
-    std::cout << "  Created /double_dataset: 2D array (10x20) of doubles" << std::endl;
+    HLOG(kInfo, "Created /double_dataset: 2D array (10x20) of doubles");
   }
 
   // Dataset 3: /float_dataset - 1D array of 50 floats
@@ -143,7 +146,7 @@ bool GenerateTestHDF5File(const std::string& file_path) {
 
     H5Dclose(dataset_id);
     H5Sclose(dataspace_id);
-    std::cout << "  Created /float_dataset: 1D array of 50 floats" << std::endl;
+    HLOG(kInfo, "Created /float_dataset: 1D array of 50 floats");
   }
 
   // Dataset 4: /group/nested_dataset - Nested dataset to test hierarchical discovery
@@ -165,11 +168,11 @@ bool GenerateTestHDF5File(const std::string& file_path) {
     H5Dclose(dataset_id);
     H5Sclose(dataspace_id);
     H5Gclose(group_id);
-    std::cout << "  Created /group/nested_dataset: nested 1D array of 30 integers" << std::endl;
+    HLOG(kInfo, "Created /group/nested_dataset: nested 1D array of 30 integers");
   }
 
   H5Fclose(file_id);
-  std::cout << "Test HDF5 file generated successfully" << std::endl;
+  HLOG(kSuccess, "Test HDF5 file generated successfully");
   return true;
 }
 
@@ -186,18 +189,18 @@ bool VerifyDatasetData(const std::string& file_path,
                        const std::string& dataset_path,
                        const std::string& tag_name,
                        wrp_cte::core::Client* cte_client) {
-  std::cout << "  Verifying data for dataset: " << dataset_path << std::endl;
+  HLOG(kInfo, "Verifying data for dataset: {}", dataset_path);
 
   // Open HDF5 file and dataset
   hid_t file_id = H5Fopen(file_path.c_str(), H5F_ACC_RDONLY, H5P_DEFAULT);
   if (file_id < 0) {
-    std::cerr << "    ERROR: Failed to open HDF5 file: " << file_path << std::endl;
+    HLOG(kError, "Failed to open HDF5 file: {}", file_path);
     return false;
   }
 
   hid_t dataset_id = H5Dopen2(file_id, dataset_path.c_str(), H5P_DEFAULT);
   if (dataset_id < 0) {
-    std::cerr << "    ERROR: Failed to open dataset: " << dataset_path << std::endl;
+    HLOG(kError, "Failed to open dataset: {}", dataset_path);
     H5Fclose(file_id);
     return false;
   }
@@ -208,7 +211,7 @@ bool VerifyDatasetData(const std::string& file_path,
 
   hssize_t num_elements = H5Sget_simple_extent_npoints(dataspace_id);
   if (num_elements < 0) {
-    std::cerr << "    ERROR: Failed to get number of elements" << std::endl;
+    HLOG(kError, "Failed to get number of elements");
     H5Tclose(datatype_id);
     H5Sclose(dataspace_id);
     H5Dclose(dataset_id);
@@ -219,9 +222,8 @@ bool VerifyDatasetData(const std::string& file_path,
   size_t element_size = H5Tget_size(datatype_id);
   size_t total_size = num_elements * element_size;
 
-  std::cout << "    Dataset info: " << num_elements << " elements, "
-            << element_size << " bytes per element, "
-            << total_size << " total bytes" << std::endl;
+  HLOG(kInfo, "Dataset info: {} elements, {} bytes per element, {} total bytes",
+       num_elements, element_size, total_size);
 
   // Allocate buffer for HDF5 data
   std::vector<char> hdf5_data(total_size);
@@ -229,7 +231,7 @@ bool VerifyDatasetData(const std::string& file_path,
   // Read data from HDF5
   herr_t status = H5Dread(dataset_id, datatype_id, H5S_ALL, H5S_ALL, H5P_DEFAULT, hdf5_data.data());
   if (status < 0) {
-    std::cerr << "    ERROR: Failed to read data from HDF5 dataset" << std::endl;
+    HLOG(kError, "Failed to read data from HDF5 dataset");
     H5Tclose(datatype_id);
     H5Sclose(dataspace_id);
     H5Dclose(dataset_id);
@@ -242,7 +244,7 @@ bool VerifyDatasetData(const std::string& file_path,
   tag_task.Wait();
   wrp_cte::core::TagId tag_id = tag_task->tag_id_;
   if (tag_id.IsNull()) {
-    std::cerr << "    ERROR: Tag not found in CTE: " << tag_name << std::endl;
+    HLOG(kError, "Tag not found in CTE: {}", tag_name);
     H5Tclose(datatype_id);
     H5Sclose(dataspace_id);
     H5Dclose(dataset_id);
@@ -256,7 +258,7 @@ bool VerifyDatasetData(const std::string& file_path,
   auto blobs_task = cte_client->AsyncGetContainedBlobs(tag_id);
   blobs_task.Wait();
   std::vector<std::string> blob_names = blobs_task->blob_names_;
-  std::cout << "    Found " << blob_names.size() << " blobs in tag" << std::endl;
+  HLOG(kInfo, "Found {} blobs in tag", blob_names.size());
 
   // Filter out the "description" blob and get only chunk blobs
   std::vector<std::string> chunk_blobs;
@@ -274,7 +276,7 @@ bool VerifyDatasetData(const std::string& file_path,
     return a_num < b_num;
   });
 
-  std::cout << "    Found " << chunk_blobs.size() << " data chunks" << std::endl;
+  HLOG(kInfo, "Found {} data chunks", chunk_blobs.size());
 
   // Calculate total chunk data size (excludes metadata blobs like "description")
   size_t total_chunk_size = 0;
@@ -283,12 +285,12 @@ bool VerifyDatasetData(const std::string& file_path,
     blob_size_task.Wait();
     total_chunk_size += blob_size_task->size_;
   }
-  std::cout << "    Total chunk data size: " << total_chunk_size << " bytes" << std::endl;
+  HLOG(kInfo, "Total chunk data size: {} bytes", total_chunk_size);
 
   // Check if chunk data sizes match (ignoring metadata blobs)
   if (total_chunk_size != total_size) {
-    std::cerr << "    ERROR: Size mismatch - HDF5: " << total_size
-              << " bytes, CTE chunks: " << total_chunk_size << " bytes" << std::endl;
+    HLOG(kError, "Size mismatch - HDF5: {} bytes, CTE chunks: {} bytes",
+         total_size, total_chunk_size);
     H5Tclose(datatype_id);
     H5Sclose(dataspace_id);
     H5Dclose(dataset_id);
@@ -306,10 +308,10 @@ bool VerifyDatasetData(const std::string& file_path,
     auto blob_size_task = cte_client->AsyncGetBlobSize(tag_id, blob_name);
     blob_size_task.Wait();
     chi::u64 blob_size = blob_size_task->size_;
-    std::cout << "    Reading blob '" << blob_name << "' (size: " << blob_size << " bytes)" << std::endl;
+    HLOG(kInfo, "Reading blob '{}' (size: {} bytes)", blob_name, blob_size);
 
     if (bytes_read + blob_size > total_size) {
-      std::cerr << "    ERROR: Total blob size exceeds expected size" << std::endl;
+      HLOG(kError, "Total blob size exceeds expected size");
       H5Tclose(datatype_id);
       H5Sclose(dataspace_id);
       H5Dclose(dataset_id);
@@ -326,7 +328,7 @@ bool VerifyDatasetData(const std::string& file_path,
     get_blob_task.Wait();
     bool success = (get_blob_task->GetReturnCode() == 0);
     if (!success) {
-      std::cerr << "    ERROR: Failed to read blob '" << blob_name << "'" << std::endl;
+      HLOG(kError, "Failed to read blob '{}'", blob_name);
       CHI_IPC->FreeBuffer(blob_buffer);
       H5Tclose(datatype_id);
       H5Sclose(dataspace_id);
@@ -345,8 +347,8 @@ bool VerifyDatasetData(const std::string& file_path,
   }
 
   if (bytes_read != total_size) {
-    std::cerr << "    ERROR: Failed to read complete data from CTE - expected "
-              << total_size << " bytes, got " << bytes_read << " bytes" << std::endl;
+    HLOG(kError, "Failed to read complete data from CTE - expected {} bytes, got {} bytes",
+         total_size, bytes_read);
     H5Tclose(datatype_id);
     H5Sclose(dataspace_id);
     H5Dclose(dataset_id);
@@ -354,7 +356,7 @@ bool VerifyDatasetData(const std::string& file_path,
     return false;
   }
 
-  std::cout << "    Successfully read " << bytes_read << " bytes from CTE" << std::endl;
+  HLOG(kSuccess, "Successfully read {} bytes from CTE", bytes_read);
 
   // Determine data type for comparison
   H5T_class_t type_class = H5Tget_class(datatype_id);
@@ -363,13 +365,12 @@ bool VerifyDatasetData(const std::string& file_path,
 
   if (type_class == H5T_INTEGER) {
     // Integer comparison - byte-by-byte
-    std::cout << "    Comparing integer data..." << std::endl;
+    HLOG(kInfo, "Comparing integer data...");
     for (size_t i = 0; i < total_size; ++i) {
       if (hdf5_data[i] != cte_data[i]) {
         if (mismatch_count == 0) {
-          std::cerr << "    First mismatch at byte " << i << ": HDF5="
-                    << static_cast<int>(hdf5_data[i]) << ", CTE="
-                    << static_cast<int>(cte_data[i]) << std::endl;
+          HLOG(kError, "First mismatch at byte {}: HDF5={}, CTE={}",
+               i, static_cast<int>(hdf5_data[i]), static_cast<int>(cte_data[i]));
         }
         mismatch_count++;
         data_matches = false;
@@ -378,7 +379,7 @@ bool VerifyDatasetData(const std::string& file_path,
   } else if (type_class == H5T_FLOAT) {
     // Floating-point comparison with epsilon
     if (element_size == sizeof(double)) {
-      std::cout << "    Comparing double data (epsilon=1e-10)..." << std::endl;
+      HLOG(kInfo, "Comparing double data (epsilon=1e-10)...");
       const double* hdf5_doubles = reinterpret_cast<const double*>(hdf5_data.data());
       const double* cte_doubles = reinterpret_cast<const double*>(cte_data.data());
       const double epsilon = 1e-10;
@@ -387,16 +388,15 @@ bool VerifyDatasetData(const std::string& file_path,
         double diff = std::abs(hdf5_doubles[i] - cte_doubles[i]);
         if (diff > epsilon) {
           if (mismatch_count == 0) {
-            std::cerr << "    First mismatch at element " << i << ": HDF5="
-                      << hdf5_doubles[i] << ", CTE=" << cte_doubles[i]
-                      << ", diff=" << diff << std::endl;
+            HLOG(kError, "First mismatch at element {}: HDF5={}, CTE={}, diff={}",
+                 i, hdf5_doubles[i], cte_doubles[i], diff);
           }
           mismatch_count++;
           data_matches = false;
         }
       }
     } else if (element_size == sizeof(float)) {
-      std::cout << "    Comparing float data (epsilon=1e-6)..." << std::endl;
+      HLOG(kInfo, "Comparing float data (epsilon=1e-6)...");
       const float* hdf5_floats = reinterpret_cast<const float*>(hdf5_data.data());
       const float* cte_floats = reinterpret_cast<const float*>(cte_data.data());
       const float epsilon = 1e-6f;
@@ -405,16 +405,15 @@ bool VerifyDatasetData(const std::string& file_path,
         float diff = std::abs(hdf5_floats[i] - cte_floats[i]);
         if (diff > epsilon) {
           if (mismatch_count == 0) {
-            std::cerr << "    First mismatch at element " << i << ": HDF5="
-                      << hdf5_floats[i] << ", CTE=" << cte_floats[i]
-                      << ", diff=" << diff << std::endl;
+            HLOG(kError, "First mismatch at element {}: HDF5={}, CTE={}, diff={}",
+                 i, hdf5_floats[i], cte_floats[i], diff);
           }
           mismatch_count++;
           data_matches = false;
         }
       }
     } else {
-      std::cerr << "    WARNING: Unsupported float size: " << element_size << " bytes" << std::endl;
+      HLOG(kWarning, "Unsupported float size: {} bytes", element_size);
       // Fall back to byte-by-byte comparison
       for (size_t i = 0; i < total_size; ++i) {
         if (hdf5_data[i] != cte_data[i]) {
@@ -425,13 +424,12 @@ bool VerifyDatasetData(const std::string& file_path,
     }
   } else {
     // Unknown type - byte-by-byte comparison
-    std::cout << "    Comparing as raw bytes..." << std::endl;
+    HLOG(kInfo, "Comparing as raw bytes...");
     for (size_t i = 0; i < total_size; ++i) {
       if (hdf5_data[i] != cte_data[i]) {
         if (mismatch_count == 0) {
-          std::cerr << "    First mismatch at byte " << i << ": HDF5="
-                    << static_cast<int>(hdf5_data[i]) << ", CTE="
-                    << static_cast<int>(cte_data[i]) << std::endl;
+          HLOG(kError, "First mismatch at byte {}: HDF5={}, CTE={}",
+               i, static_cast<int>(hdf5_data[i]), static_cast<int>(cte_data[i]));
         }
         mismatch_count++;
         data_matches = false;
@@ -447,10 +445,10 @@ bool VerifyDatasetData(const std::string& file_path,
 
   // Print comparison results
   if (data_matches) {
-    std::cout << "    SUCCESS: Data verification passed - all values match" << std::endl;
+    HLOG(kSuccess, "Data verification passed - all values match");
   } else {
-    std::cerr << "    FAILURE: Data verification failed - " << mismatch_count
-              << " mismatches out of " << total_size << " bytes" << std::endl;
+    HLOG(kError, "Data verification failed - {} mismatches out of {} bytes",
+         mismatch_count, total_size);
   }
 
   return data_matches;
@@ -461,9 +459,9 @@ bool VerifyDatasetData(const std::string& file_path,
  */
 void CleanupTestFile(const std::string& file_path) {
   if (std::remove(file_path.c_str()) == 0) {
-    std::cout << "Test file cleaned up: " << file_path << std::endl;
+    HLOG(kInfo, "Test file cleaned up: {}", file_path);
   } else {
-    std::cerr << "WARNING: Failed to remove test file: " << file_path << std::endl;
+    HLOG(kWarning, "Failed to remove test file: {}", file_path);
   }
 }
 
@@ -471,48 +469,48 @@ void CleanupTestFile(const std::string& file_path) {
  * Main test function
  */
 int main(int argc, char* argv[]) {
-  std::cout << "======================================" << std::endl;
-  std::cout << "HDF5 Assimilation ParseOmni Unit Test" << std::endl;
-  std::cout << "======================================" << std::endl;
+  HLOG(kInfo, "======================================");
+  HLOG(kInfo, "HDF5 Assimilation ParseOmni Unit Test");
+  HLOG(kInfo, "======================================");
 
   int exit_code = 0;
 
   try {
     // Initialize Chimaera runtime (CHIMAERA_WITH_RUNTIME controls behavior)
-    std::cout << "Initializing Chimaera..." << std::endl;
+    HLOG(kInfo, "Initializing Chimaera...");
     bool success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
     if (!success) {
-      std::cerr << "ERROR: Failed to initialize Chimaera" << std::endl;
+      HLOG(kError, "Failed to initialize Chimaera");
       return 1;
     }
-    std::cout << "Chimaera initialized successfully" << std::endl;
+    HLOG(kSuccess, "Chimaera initialized successfully");
 
     // Verify Chimaera IPC is available
     auto* ipc_manager = CHI_IPC;
     if (!ipc_manager) {
-      std::cerr << "ERROR: Chimaera IPC not initialized" << std::endl;
+      HLOG(kError, "Chimaera IPC not initialized");
       return 1;
     }
-    std::cout << "Chimaera IPC verified" << std::endl;
+    HLOG(kSuccess, "Chimaera IPC verified");
 
     // Step 1: Generate test HDF5 file
-    std::cout << "\n[STEP 1] Generating test HDF5 file..." << std::endl;
+    HLOG(kInfo, "[STEP 1] Generating test HDF5 file...");
     if (!GenerateTestHDF5File(kTestFileName)) {
       return 1;
     }
 
     // Step 2: Connect to CTE
-    std::cout << "\n[STEP 2] Connecting to CTE..." << std::endl;
+    HLOG(kInfo, "[STEP 2] Connecting to CTE...");
     wrp_cte::core::WRP_CTE_CLIENT_INIT();
-    std::cout << "CTE client initialized" << std::endl;
+    HLOG(kSuccess, "CTE client initialized");
 
     // Step 2.5: Initialize CAE client
-    std::cout << "\n[STEP 2.5] Initializing CAE client..." << std::endl;
+    HLOG(kInfo, "[STEP 2.5] Initializing CAE client...");
     WRP_CAE_CLIENT_INIT();
-    std::cout << "CAE client initialized" << std::endl;
+    HLOG(kSuccess, "CAE client initialized");
 
     // Step 3: Create CAE pool
-    std::cout << "\n[STEP 3] Creating CAE pool..." << std::endl;
+    HLOG(kInfo, "[STEP 3] Creating CAE pool...");
     wrp_cae::core::Client cae_client;
     wrp_cae::core::CreateParams params;
 
@@ -523,10 +521,10 @@ int main(int argc, char* argv[]) {
         params);
     create_task.Wait();
 
-    std::cout << "CAE pool created with ID: " << cae_client.pool_id_ << std::endl;
+    HLOG(kSuccess, "CAE pool created with ID: {}", cae_client.pool_id_);
 
     // Step 4: Create AssimilationCtx for HDF5
-    std::cout << "\n[STEP 4] Creating AssimilationCtx for HDF5..." << std::endl;
+    HLOG(kInfo, "[STEP 4] Creating AssimilationCtx for HDF5...");
     wrp_cae::core::AssimilationCtx ctx;
     ctx.src = "hdf5::" + kTestFileName;
     ctx.dst = "iowarp::" + kTestTagBase;
@@ -535,38 +533,38 @@ int main(int argc, char* argv[]) {
     ctx.range_off = 0;
     ctx.range_size = 0;  // 0 means process entire file
 
-    std::cout << "AssimilationCtx created:" << std::endl;
-    std::cout << "  src: " << ctx.src << std::endl;
-    std::cout << "  dst: " << ctx.dst << std::endl;
-    std::cout << "  format: " << ctx.format << std::endl;
+    HLOG(kInfo, "AssimilationCtx created:");
+    HLOG(kInfo, "  src: {}", ctx.src);
+    HLOG(kInfo, "  dst: {}", ctx.dst);
+    HLOG(kInfo, "  format: {}", ctx.format);
 
     // Step 5: Call ParseOmni with vector containing single context
-    std::cout << "\n[STEP 5] Calling ParseOmni..." << std::endl;
+    HLOG(kInfo, "[STEP 5] Calling ParseOmni...");
     std::vector<wrp_cae::core::AssimilationCtx> contexts = {ctx};
     auto parse_task = cae_client.AsyncParseOmni(contexts);
     parse_task.Wait();
     chi::u32 result_code = parse_task->GetReturnCode();
     chi::u32 num_tasks_scheduled = parse_task->num_tasks_scheduled_;
 
-    std::cout << "ParseOmni completed:" << std::endl;
-    std::cout << "  result_code: " << result_code << std::endl;
-    std::cout << "  num_tasks_scheduled: " << num_tasks_scheduled << std::endl;
+    HLOG(kInfo, "ParseOmni completed:");
+    HLOG(kInfo, "  result_code: {}", result_code);
+    HLOG(kInfo, "  num_tasks_scheduled: {}", num_tasks_scheduled);
 
     // Step 6: Validate results
-    std::cout << "\n[STEP 6] Validating results..." << std::endl;
+    HLOG(kInfo, "[STEP 6] Validating results...");
 
     if (result_code != 0) {
-      std::cerr << "ERROR: ParseOmni failed with result_code: " << result_code << std::endl;
+      HLOG(kError, "ParseOmni failed with result_code: {}", result_code);
       exit_code = 1;
     } else if (num_tasks_scheduled == 0) {
-      std::cerr << "ERROR: ParseOmni returned 0 tasks scheduled" << std::endl;
+      HLOG(kError, "ParseOmni returned 0 tasks scheduled");
       exit_code = 1;
     } else {
-      std::cout << "SUCCESS: ParseOmni executed successfully" << std::endl;
+      HLOG(kSuccess, "ParseOmni executed successfully");
     }
 
     // Step 7: Verify datasets in CTE
-    std::cout << "\n[STEP 7] Verifying datasets in CTE..." << std::endl;
+    HLOG(kInfo, "[STEP 7] Verifying datasets in CTE...");
 
     // Get CTE client
     auto cte_client = WRP_CTE_CLIENT;
@@ -579,36 +577,36 @@ int main(int argc, char* argv[]) {
       "group/nested_dataset"
     };
 
-    std::cout << "Expected " << expected_datasets.size() << " datasets to be created" << std::endl;
+    HLOG(kInfo, "Expected {} datasets to be created", expected_datasets.size());
 
     size_t datasets_found = 0;
     size_t datasets_verified = 0;
     for (const auto& dataset_name : expected_datasets) {
       std::string full_tag_name = kTestTagBase + "/" + dataset_name;
       std::string dataset_path = "/" + dataset_name;
-      std::cout << "\nChecking dataset: " << dataset_name << std::endl;
-      std::cout << "  Full tag name: " << full_tag_name << std::endl;
+      HLOG(kInfo, "Checking dataset: {}", dataset_name);
+      HLOG(kInfo, "  Full tag name: {}", full_tag_name);
 
       // Check if tag exists
       auto tag_task = cte_client->AsyncGetOrCreateTag(full_tag_name);
       tag_task.Wait();
       wrp_cte::core::TagId tag_id = tag_task->tag_id_;
       if (tag_id.IsNull()) {
-        std::cerr << "  WARNING: Tag not found in CTE: " << full_tag_name << std::endl;
+        HLOG(kWarning, "Tag not found in CTE: {}", full_tag_name);
         continue;
       }
 
       datasets_found++;
-      std::cout << "  Tag found (ID: " << tag_id << ")" << std::endl;
+      HLOG(kSuccess, "Tag found (ID: {})", tag_id);
 
       // Get tag size
       auto size_task = cte_client->AsyncGetTagSize(tag_id);
       size_task.Wait();
       size_t tag_size = size_task->tag_size_;
-      std::cout << "  Tag size: " << tag_size << " bytes" << std::endl;
+      HLOG(kInfo, "  Tag size: {} bytes", tag_size);
 
       if (tag_size == 0) {
-        std::cerr << "  WARNING: Tag size is 0, no data transferred" << std::endl;
+        HLOG(kWarning, "Tag size is 0, no data transferred");
         continue;
       }
 
@@ -617,49 +615,49 @@ int main(int argc, char* argv[]) {
       if (data_verified) {
         datasets_verified++;
       } else {
-        std::cerr << "  ERROR: Data verification failed for dataset: " << dataset_name << std::endl;
+        HLOG(kError, "Data verification failed for dataset: {}", dataset_name);
         exit_code = 1;
       }
     }
 
-    std::cout << "\nDataset verification summary:" << std::endl;
-    std::cout << "  Expected datasets: " << expected_datasets.size() << std::endl;
-    std::cout << "  Found datasets: " << datasets_found << std::endl;
-    std::cout << "  Verified datasets: " << datasets_verified << std::endl;
+    HLOG(kInfo, "Dataset verification summary:");
+    HLOG(kInfo, "  Expected datasets: {}", expected_datasets.size());
+    HLOG(kInfo, "  Found datasets: {}", datasets_found);
+    HLOG(kInfo, "  Verified datasets: {}", datasets_verified);
 
     if (datasets_found == 0) {
-      std::cerr << "ERROR: No datasets found in CTE" << std::endl;
-      std::cerr << "NOTE: HDF5 assimilator may not yet be fully implemented" << std::endl;
+      HLOG(kError, "No datasets found in CTE");
+      HLOG(kInfo, "NOTE: HDF5 assimilator may not yet be fully implemented");
       exit_code = 1;
     } else if (datasets_found < expected_datasets.size()) {
-      std::cerr << "WARNING: Not all datasets were found (" << datasets_found
-                << "/" << expected_datasets.size() << ")" << std::endl;
+      HLOG(kWarning, "Not all datasets were found ({}/{})", datasets_found,
+           expected_datasets.size());
       // Not a hard failure - HDF5 assimilator may be under development
     } else if (datasets_verified < datasets_found) {
-      std::cerr << "ERROR: Not all datasets passed data verification (" << datasets_verified
-                << "/" << datasets_found << ")" << std::endl;
+      HLOG(kError, "Not all datasets passed data verification ({}/{})",
+           datasets_verified, datasets_found);
       exit_code = 1;
     } else {
-      std::cout << "SUCCESS: All expected datasets found and verified in CTE" << std::endl;
+      HLOG(kSuccess, "All expected datasets found and verified in CTE");
     }
 
     // Step 8: Cleanup
-    std::cout << "\n[STEP 8] Cleaning up..." << std::endl;
+    HLOG(kInfo, "[STEP 8] Cleaning up...");
     CleanupTestFile(kTestFileName);
 
   } catch (const std::exception& e) {
-    std::cerr << "ERROR: Exception caught: " << e.what() << std::endl;
+    HLOG(kError, "Exception caught: {}", e.what());
     exit_code = 1;
   }
 
   // Print final result
-  std::cout << "\n========================================" << std::endl;
+  HLOG(kInfo, "========================================");
   if (exit_code == 0) {
-    std::cout << "TEST PASSED" << std::endl;
+    HLOG(kSuccess, "TEST PASSED");
   } else {
-    std::cout << "TEST FAILED" << std::endl;
+    HLOG(kError, "TEST FAILED");
   }
-  std::cout << "========================================" << std::endl;
+  HLOG(kInfo, "========================================");
 
   return exit_code;
 }

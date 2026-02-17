@@ -68,7 +68,7 @@ void Runtime::Init(const chi::PoolId &pool_id, const std::string &pool_name) {
 
 void Runtime::Create(hipc::FullPtr<CreateTask> task, chi::RunContext &rctx) {
   // Simple mod container creation logic
-  std::cout << "SimpleMod: Initializing simple_mod container" << std::endl;
+  HLOG(kInfo, "SimpleMod: Initializing simple_mod container");
 
   // Initialize the Simple Mod container with pool information from the task
   // Note: CreateLocalQueue has been removed in favor of unified scheduling
@@ -80,14 +80,12 @@ void Runtime::Create(hipc::FullPtr<CreateTask> task, chi::RunContext &rctx) {
   task->return_code_ = 0;
   task->error_message_ = "";
 
-  std::cout << "SimpleMod: Container created and initialized for pool: "
-            << pool_name_ << " (ID: " << task->pool_id_
-            << ", count: " << create_count_ << ")" << std::endl;
+  HLOG(kSuccess, "SimpleMod: Container created and initialized for pool: {} (ID: {}, count: {})",
+       pool_name_, task->pool_id_, create_count_);
 }
 
 void Runtime::Destroy(hipc::FullPtr<DestroyTask> task, chi::RunContext &rctx) {
-  std::cout << "SimpleMod: Executing Destroy task - Pool ID: "
-            << task->target_pool_id_ << std::endl;
+  HLOG(kInfo, "SimpleMod: Executing Destroy task - Pool ID: {}", task->target_pool_id_);
 
   // Initialize output values
   task->return_code_ = 0;
@@ -95,8 +93,7 @@ void Runtime::Destroy(hipc::FullPtr<DestroyTask> task, chi::RunContext &rctx) {
 
   try {
     // Simple destruction logic - just log that we're destroyed
-    std::cout << "SimpleMod: Container destroyed successfully - ID: "
-              << task->target_pool_id_ << std::endl;
+    HLOG(kSuccess, "SimpleMod: Container destroyed successfully - ID: {}", task->target_pool_id_);
 
     // Set success result
     task->return_code_ = 0;
@@ -106,20 +103,18 @@ void Runtime::Destroy(hipc::FullPtr<DestroyTask> task, chi::RunContext &rctx) {
     task->error_message_ = chi::priv::string(
         HSHM_MALLOC,
         std::string("Exception during simple_mod destruction: ") + e.what());
-    std::cerr << "SimpleMod: Destruction failed with exception: " << e.what()
-              << std::endl;
+    HLOG(kError, "SimpleMod: Destruction failed with exception: {}", e.what());
   }
 }
 
 void Runtime::Flush(hipc::FullPtr<FlushTask> task, chi::RunContext &rctx) {
-  std::cout << "SimpleMod: Executing Flush task" << std::endl;
+  HLOG(kInfo, "SimpleMod: Executing Flush task");
 
   // Simple flush implementation - just report no work remaining
   task->return_code_ = 0;
   task->total_work_done_ = GetWorkRemaining();
 
-  std::cout << "SimpleMod: Flush completed - work done: "
-            << task->total_work_done_ << std::endl;
+  HLOG(kSuccess, "SimpleMod: Flush completed - work done: {}", task->total_work_done_);
 }
 
 chi::u64 Runtime::GetWorkRemaining() const {

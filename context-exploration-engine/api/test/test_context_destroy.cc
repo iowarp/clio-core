@@ -48,12 +48,13 @@
 #include <iostream>
 #include <cassert>
 #include <cstring>
+#include <hermes_shm/util/logging.h>
 
 /**
  * Test that context_destroy can handle empty context list
  */
 void test_empty_context_list() {
-  std::cout << "TEST: Empty context list" << std::endl;
+  HLOG(kInfo, "TEST: Empty context list");
 
   iowarp::ContextInterface ctx_interface;
   std::vector<std::string> empty_list;
@@ -62,14 +63,14 @@ void test_empty_context_list() {
   int result = ctx_interface.ContextDestroy(empty_list);
   assert(result == 0 && "Empty context list should return success");
 
-  std::cout << "  PASSED: Empty context list test" << std::endl;
+  HLOG(kSuccess, "PASSED: Empty context list test");
 }
 
 /**
  * Test that context_destroy handles non-existent contexts gracefully
  */
 void test_nonexistent_context() {
-  std::cout << "TEST: Non-existent context" << std::endl;
+  HLOG(kInfo, "TEST: Non-existent context");
 
   iowarp::ContextInterface ctx_interface;
   std::vector<std::string> contexts;
@@ -80,15 +81,15 @@ void test_nonexistent_context() {
 
   // Result could be 0 or non-zero depending on CTE behavior
   // Just verify the function completes without crashing
-  std::cout << "  Destroy returned code: " << result << std::endl;
-  std::cout << "  PASSED: Non-existent context test" << std::endl;
+  HLOG(kInfo, "Destroy returned code: {}", result);
+  HLOG(kSuccess, "PASSED: Non-existent context test");
 }
 
 /**
  * Test that context_destroy handles special characters
  */
 void test_special_characters() {
-  std::cout << "TEST: Special characters" << std::endl;
+  HLOG(kInfo, "TEST: Special characters");
 
   iowarp::ContextInterface ctx_interface;
   std::vector<std::string> contexts;
@@ -97,50 +98,47 @@ void test_special_characters() {
   int result = ctx_interface.ContextDestroy(contexts);
 
   // Should handle special characters without crashing
-  std::cout << "  Destroy returned code: " << result << std::endl;
-  std::cout << "  PASSED: Special characters test" << std::endl;
+  HLOG(kInfo, "Destroy returned code: {}", result);
+  HLOG(kSuccess, "PASSED: Special characters test");
 }
 
 int main(int argc, char** argv) {
   (void)argc;  // Suppress unused parameter warning
   (void)argv;  // Suppress unused parameter warning
 
-  std::cout << "========================================" << std::endl;
-  std::cout << "ContextInterface::ContextDestroy Tests" << std::endl;
-  std::cout << "========================================" << std::endl;
+  HLOG(kInfo, "========================================");
+  HLOG(kInfo, "ContextInterface::ContextDestroy Tests");
+  HLOG(kInfo, "========================================");
 
   try {
     // Initialize Chimaera runtime if requested (for unit tests)
     const char* init_chimaera = std::getenv("INIT_CHIMAERA");
     if (init_chimaera && std::strcmp(init_chimaera, "1") == 0) {
-      std::cout << "Initializing Chimaera (INIT_CHIMAERA=1)..." << std::endl;
+      HLOG(kInfo, "Initializing Chimaera (INIT_CHIMAERA=1)...");
       chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
-      std::cout << "Chimaera initialized" << std::endl;
+      HLOG(kSuccess, "Chimaera initialized");
     }
 
     // Verify Chimaera IPC is available
     auto* ipc_manager = CHI_IPC;
     if (!ipc_manager) {
-      std::cerr << "ERROR: Chimaera IPC not initialized. Is the runtime running?" << std::endl;
-      std::cerr << "HINT: Set INIT_CHIMAERA=1 to initialize runtime or start runtime externally" << std::endl;
+      HLOG(kError, "Chimaera IPC not initialized. Is the runtime running?");
+      HLOG(kInfo, "HINT: Set INIT_CHIMAERA=1 to initialize runtime or start runtime externally");
       return 1;
     }
-    std::cout << "Chimaera IPC verified\n" << std::endl;
+    HLOG(kSuccess, "Chimaera IPC verified");
 
     // Run all tests
     test_empty_context_list();
-    std::cout << std::endl;
 
     test_nonexistent_context();
-    std::cout << std::endl;
 
     test_special_characters();
-    std::cout << std::endl;
 
-    std::cout << "All tests PASSED!" << std::endl;
+    HLOG(kSuccess, "All tests PASSED!");
     return 0;
   } catch (const std::exception& e) {
-    std::cerr << "\nTest FAILED with exception: " << e.what() << std::endl;
+    HLOG(kError, "Test FAILED with exception: {}", e.what());
     return 1;
   }
 }

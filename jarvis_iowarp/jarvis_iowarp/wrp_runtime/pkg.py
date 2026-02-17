@@ -19,8 +19,7 @@ class WrpRuntime(Service):
     Manages the Chimaera runtime deployment across distributed nodes,
     including configuration generation and runtime lifecycle management.
 
-    Assumes chimaera_start_runtime and chimaera_stop_runtime are installed
-    and available in PATH.
+    Assumes chimaera binary is installed and available in PATH.
     """
 
     def _init(self):
@@ -184,8 +183,8 @@ class WrpRuntime(Service):
         self.log(f"  Config (CHI_SERVER_CONF): {self.config_file}")
         self.log(f"  Nodes: {len(self.jarvis.hostfile)}")
 
-        # The chimaera_start_runtime binary will read CHI_SERVER_CONF from environment
-        cmd = 'chimaera_start_runtime'
+        # The chimaera binary will read CHI_SERVER_CONF from environment
+        cmd = 'chimaera runtime start'
 
         # Execute with or without debugging
         if self.config.get('do_dbg', False):
@@ -210,9 +209,9 @@ class WrpRuntime(Service):
         """Stop the IOWarp runtime service on all nodes"""
         self.log("Stopping IOWarp runtime on all nodes")
 
-        # Use chimaera_stop_runtime to gracefully shutdown
-        # The stop binary will also read CHI_SERVER_CONF from environment
-        cmd = 'chimaera_stop_runtime'
+        # Use chimaera runtime stop to gracefully shutdown
+        # The chimaera binary will also read CHI_SERVER_CONF from environment
+        cmd = 'chimaera runtime stop'
 
         Exec(cmd, LocalExecInfo(
             env=self.env,
@@ -225,7 +224,7 @@ class WrpRuntime(Service):
         """Forcibly terminate the IOWarp runtime on all nodes"""
         self.log("Forcibly killing IOWarp runtime on all nodes")
 
-        Kill('chimaera_start_runtime', PsshExecInfo(
+        Kill('chimaera', PsshExecInfo(
             hostfile=self.jarvis.hostfile
         )).run()
 

@@ -1,0 +1,108 @@
+# Expand/Induction Integration Tests for Chimaera Runtime
+# Tests dynamic node induction: nodes 1-2 form initial cluster,
+# node 3 joins via --induct flag.
+#
+# Usage:
+#   docker compose up -d
+#   # Check logs for induction success
+#   docker logs iowarp-expand-node3
+
+services:
+  # Node 1 - Initial cluster member
+  iowarp-node1:
+    image: iowarp/deps-cpu:latest
+    container_name: iowarp-expand-node1
+    hostname: iowarp-node1
+    networks:
+      iowarp-expand-cluster:
+        ipv4_address: 172.28.0.10
+    volumes:
+      - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-/workspace}}:/workspace:rw
+    environment:
+      - NODE_ID=1
+      - NODE_IP=172.28.0.10
+      - WRP_RUNTIME_CONF=/workspace/context-runtime/test/integration/expand/wrp_conf.yaml
+      - CONTAINER_HOSTFILE=/workspace/context-runtime/test/integration/expand/hostfile_initial
+      - CHIMAERA_WITH_RUNTIME=0
+      - PATH=/workspace/build/bin:/usr/local/bin:/usr/bin:/bin
+      - LD_LIBRARY_PATH=/workspace/build/bin:$LD_LIBRARY_PATH
+    shm_size: '16gb'
+    mem_limit: 16g
+    working_dir: /workspace
+    entrypoint: [ "/bin/bash", "-c" ]
+    command: >
+      "
+        echo 'Node 1: Starting runtime...' &&
+        /workspace/build/bin/chimaera_start_runtime &
+        RUNTIME_PID=\$! &&
+        echo 'Node 1: Runtime started (PID \$RUNTIME_PID)' &&
+        wait \$RUNTIME_PID
+      "
+
+  # Node 2 - Initial cluster member
+  iowarp-node2:
+    image: iowarp/deps-cpu:latest
+    container_name: iowarp-expand-node2
+    hostname: iowarp-node2
+    networks:
+      iowarp-expand-cluster:
+        ipv4_address: 172.28.0.11
+    volumes:
+      - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-/workspace}}:/workspace:rw
+    environment:
+      - NODE_ID=2
+      - NODE_IP=172.28.0.11
+      - WRP_RUNTIME_CONF=/workspace/context-runtime/test/integration/expand/wrp_conf.yaml
+      - CONTAINER_HOSTFILE=/workspace/context-runtime/test/integration/expand/hostfile_initial
+      - CHIMAERA_WITH_RUNTIME=0
+      - PATH=/workspace/build/bin:/usr/local/bin:/usr/bin:/bin
+      - LD_LIBRARY_PATH=/workspace/build/bin:$LD_LIBRARY_PATH
+    shm_size: '16gb'
+    mem_limit: 16g
+    working_dir: /workspace
+    entrypoint: [ "/bin/bash", "-c" ]
+    command: >
+      "
+        echo 'Node 2: Starting runtime...' &&
+        /workspace/build/bin/chimaera_start_runtime
+      "
+
+  # Node 3 - Inducted node (joins after cluster is up)
+  iowarp-node3:
+    image: iowarp/deps-cpu:latest
+    container_name: iowarp-expand-node3
+    hostname: iowarp-node3
+    depends_on:
+      - iowarp-node1
+      - iowarp-node2
+    networks:
+      iowarp-expand-cluster:
+        ipv4_address: 172.28.0.12
+    volumes:
+      - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-/workspace}}:/workspace:rw
+    environment:
+      - NODE_ID=3
+      - NODE_IP=172.28.0.12
+      - WRP_RUNTIME_CONF=/workspace/context-runtime/test/integration/expand/wrp_conf.yaml
+      - CONTAINER_HOSTFILE=/workspace/context-runtime/test/integration/expand/hostfile_full
+      - CHIMAERA_WITH_RUNTIME=0
+      - PATH=/workspace/build/bin:/usr/local/bin:/usr/bin:/bin
+      - LD_LIBRARY_PATH=/workspace/build/bin:$LD_LIBRARY_PATH
+    shm_size: '16gb'
+    mem_limit: 16g
+    working_dir: /workspace
+    entrypoint: [ "/bin/bash", "-c" ]
+    command: >
+      "
+        echo 'Node 3: Waiting 15s for initial cluster to start...' &&
+        sleep 15 &&
+        echo 'Node 3: Starting runtime with --induct...' &&
+        /workspace/build/bin/chimaera_start_runtime --induct
+      "
+
+networks:
+  iowarp-expand-cluster:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16

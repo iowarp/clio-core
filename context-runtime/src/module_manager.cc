@@ -240,9 +240,9 @@ std::vector<std::string> ModuleManager::GetScanDirectories() const {
   directories.push_back("/usr/local/lib");
 
   // Print all scan directories
-  HLOG(kInfo, "ChiMod scan directories:");
+  HLOG(kDebug, "ChiMod scan directories:");
   for (const auto &dir : directories) {
-    HLOG(kInfo, "  {}", dir);
+    HLOG(kDebug, "  {}", dir);
   }
 
   return directories;

@@ -82,7 +82,7 @@ TEST_CASE("Autogen - Admin MonitorTask SaveTask/LoadTask", "[autogen][admin][mon
 
   auto* ipc_manager = CHI_IPC;
   auto* pool_manager = CHI_POOL_MANAGER;
-  auto* container = pool_manager->GetContainer(chi::kAdminPoolId);
+  auto* container = pool_manager->GetStaticContainer(chi::kAdminPoolId);
 
   if (container == nullptr) {
     INFO("Admin container not available - skipping test");
@@ -127,7 +127,7 @@ TEST_CASE("Autogen - Admin FlushTask SaveTask/LoadTask", "[autogen][admin][flush
 
   auto* ipc_manager = CHI_IPC;
   auto* pool_manager = CHI_POOL_MANAGER;
-  auto* container = pool_manager->GetContainer(chi::kAdminPoolId);
+  auto* container = pool_manager->GetStaticContainer(chi::kAdminPoolId);
 
   if (container == nullptr) {
     INFO("Admin container not available - skipping test");
@@ -168,7 +168,7 @@ TEST_CASE("Autogen - Admin ClientConnectTask SaveTask/LoadTask", "[autogen][admi
 
   auto* ipc_manager = CHI_IPC;
   auto* pool_manager = CHI_POOL_MANAGER;
-  auto* container = pool_manager->GetContainer(chi::kAdminPoolId);
+  auto* container = pool_manager->GetStaticContainer(chi::kAdminPoolId);
 
   if (container == nullptr) {
     INFO("Admin container not available - skipping test");
@@ -209,7 +209,7 @@ TEST_CASE("Autogen - Admin NewTask for all methods", "[autogen][admin][newtask]"
 
   auto* ipc_manager = CHI_IPC;
   auto* pool_manager = CHI_POOL_MANAGER;
-  auto* container = pool_manager->GetContainer(chi::kAdminPoolId);
+  auto* container = pool_manager->GetStaticContainer(chi::kAdminPoolId);
 
   if (container == nullptr) {
     INFO("Admin container not available - skipping test");
@@ -244,7 +244,7 @@ TEST_CASE("Autogen - Admin NewCopyTask", "[autogen][admin][copytask]") {
 
   auto* ipc_manager = CHI_IPC;
   auto* pool_manager = CHI_POOL_MANAGER;
-  auto* container = pool_manager->GetContainer(chi::kAdminPoolId);
+  auto* container = pool_manager->GetStaticContainer(chi::kAdminPoolId);
 
   if (container == nullptr) {
     INFO("Admin container not available - skipping test");
@@ -317,7 +317,7 @@ TEST_CASE("Autogen - Admin Aggregate", "[autogen][admin][aggregate]") {
 
   auto* ipc_manager = CHI_IPC;
   auto* pool_manager = CHI_POOL_MANAGER;
-  auto* container = pool_manager->GetContainer(chi::kAdminPoolId);
+  auto* container = pool_manager->GetStaticContainer(chi::kAdminPoolId);
 
   if (container == nullptr) {
     INFO("Admin container not available - skipping test");
@@ -374,7 +374,7 @@ TEST_CASE("Autogen - Admin LocalSaveTask/LocalLoadTask", "[autogen][admin][local
 
   auto* ipc_manager = CHI_IPC;
   auto* pool_manager = CHI_POOL_MANAGER;
-  auto* container = pool_manager->GetContainer(chi::kAdminPoolId);
+  auto* container = pool_manager->GetStaticContainer(chi::kAdminPoolId);
 
   if (container == nullptr) {
     INFO("Admin container not available - skipping test");
@@ -467,7 +467,7 @@ TEST_CASE("Autogen - Admin DelTask for all methods", "[autogen][admin][deltask]"
 
   auto* ipc_manager = CHI_IPC;
   auto* pool_manager = CHI_POOL_MANAGER;
-  auto* container = pool_manager->GetContainer(chi::kAdminPoolId);
+  auto* container = pool_manager->GetStaticContainer(chi::kAdminPoolId);
 
   if (container == nullptr) {
     INFO("Admin container not available - skipping test");
@@ -678,7 +678,7 @@ TEST_CASE("Autogen - Admin StopRuntimeTask coverage", "[autogen][admin][stoprunt
 
   auto* ipc_manager = CHI_IPC;
   auto* pool_manager = CHI_POOL_MANAGER;
-  auto* container = pool_manager->GetContainer(chi::kAdminPoolId);
+  auto* container = pool_manager->GetStaticContainer(chi::kAdminPoolId);
 
   if (container == nullptr) {
     INFO("Admin container not available - skipping test");
@@ -715,7 +715,7 @@ TEST_CASE("Autogen - Admin DestroyPoolTask coverage", "[autogen][admin][destroyp
 
   auto* ipc_manager = CHI_IPC;
   auto* pool_manager = CHI_POOL_MANAGER;
-  auto* container = pool_manager->GetContainer(chi::kAdminPoolId);
+  auto* container = pool_manager->GetStaticContainer(chi::kAdminPoolId);
 
   if (container == nullptr) {
     INFO("Admin container not available - skipping test");
@@ -767,7 +767,7 @@ TEST_CASE("Autogen - Admin SubmitBatchTask coverage", "[autogen][admin][submitba
 
   auto* ipc_manager = CHI_IPC;
   auto* pool_manager = CHI_POOL_MANAGER;
-  auto* container = pool_manager->GetContainer(chi::kAdminPoolId);
+  auto* container = pool_manager->GetStaticContainer(chi::kAdminPoolId);
 
   if (container == nullptr) {
     INFO("Admin container not available - skipping test");
@@ -804,7 +804,7 @@ TEST_CASE("Autogen - Admin CreateTask and DestroyTask coverage", "[autogen][admi
 
   auto* ipc_manager = CHI_IPC;
   auto* pool_manager = CHI_POOL_MANAGER;
-  auto* container = pool_manager->GetContainer(chi::kAdminPoolId);
+  auto* container = pool_manager->GetStaticContainer(chi::kAdminPoolId);
 
   if (container == nullptr) {
     INFO("Admin container not available - skipping test");
@@ -865,7 +865,7 @@ TEST_CASE("Autogen - Admin GetOrCreatePoolTask coverage", "[autogen][admin][geto
 
   auto* ipc_manager = CHI_IPC;
   auto* pool_manager = CHI_POOL_MANAGER;
-  auto* container = pool_manager->GetContainer(chi::kAdminPoolId);
+  auto* container = pool_manager->GetStaticContainer(chi::kAdminPoolId);
 
   if (container == nullptr) {
     INFO("Admin container not available - skipping test");
@@ -902,7 +902,7 @@ TEST_CASE("Autogen - Admin SendTask and RecvTask coverage", "[autogen][admin][se
 
   auto* ipc_manager = CHI_IPC;
   auto* pool_manager = CHI_POOL_MANAGER;
-  auto* container = pool_manager->GetContainer(chi::kAdminPoolId);
+  auto* container = pool_manager->GetStaticContainer(chi::kAdminPoolId);
 
   if (container == nullptr) {
     INFO("Admin container not available - skipping test");
@@ -1718,7 +1718,7 @@ TEST_CASE("Autogen - Admin Container SaveTask/LoadTask all methods", "[autogen][
 
   auto* ipc_manager = CHI_IPC;
   auto* pool_manager = CHI_POOL_MANAGER;
-  auto* container = pool_manager->GetContainer(chi::kAdminPoolId);
+  auto* container = pool_manager->GetStaticContainer(chi::kAdminPoolId);
 
   if (container == nullptr) {
     INFO("Admin container not available - skipping test");
@@ -2847,7 +2847,7 @@ TEST_CASE("Autogen - Admin Container advanced operations", "[autogen][admin][con
 
   auto* ipc_manager = CHI_IPC;
   auto* pool_manager = CHI_POOL_MANAGER;
-  auto* admin_container = pool_manager->GetContainer(chi::kAdminPoolId);
+  auto* admin_container = pool_manager->GetStaticContainer(chi::kAdminPoolId);
 
   if (admin_container == nullptr) {
     INFO("Admin container not available - skipping test");
@@ -3662,7 +3662,7 @@ TEST_CASE("Autogen - Admin Container DelTask coverage", "[autogen][admin][contai
 
   auto* ipc_manager = CHI_IPC;
   auto* pool_manager = CHI_POOL_MANAGER;
-  auto* admin_container = pool_manager->GetContainer(chi::kAdminPoolId);
+  auto* admin_container = pool_manager->GetStaticContainer(chi::kAdminPoolId);
 
   if (admin_container == nullptr) {
     INFO("Admin container not available - skipping test");
@@ -4064,7 +4064,7 @@ TEST_CASE("Autogen - Admin NewCopyTask comprehensive", "[autogen][admin][newcopy
 
   auto* ipc_manager = CHI_IPC;
   auto* pool_manager = CHI_POOL_MANAGER;
-  auto* admin_container = pool_manager->GetContainer(chi::kAdminPoolId);
+  auto* admin_container = pool_manager->GetStaticContainer(chi::kAdminPoolId);
 
   if (admin_container == nullptr) {
     INFO("Admin container not available - skipping test");
@@ -4189,7 +4189,7 @@ TEST_CASE("Autogen - Admin Aggregate comprehensive", "[autogen][admin][aggregate
 
   auto* ipc_manager = CHI_IPC;
   auto* pool_manager = CHI_POOL_MANAGER;
-  auto* admin_container = pool_manager->GetContainer(chi::kAdminPoolId);
+  auto* admin_container = pool_manager->GetStaticContainer(chi::kAdminPoolId);
 
   if (admin_container == nullptr) {
     INFO("Admin container not available - skipping test");
@@ -4305,7 +4305,7 @@ TEST_CASE("Autogen - Admin SaveTask/LoadTask comprehensive", "[autogen][admin][s
 
   auto* ipc_manager = CHI_IPC;
   auto* pool_manager = CHI_POOL_MANAGER;
-  auto* admin_container = pool_manager->GetContainer(chi::kAdminPoolId);
+  auto* admin_container = pool_manager->GetStaticContainer(chi::kAdminPoolId);
 
   if (admin_container == nullptr) {
     INFO("Admin container not available - skipping test");
@@ -8155,7 +8155,7 @@ TEST_CASE("Autogen - CTE Runtime AllocLoadTask coverage", "[autogen][cte][runtim
 
   auto* ipc_manager = CHI_IPC;
   auto* pool_manager = CHI_POOL_MANAGER;
-  auto* container = pool_manager->GetContainer(wrp_cte::core::kCtePoolId);
+  auto* container = pool_manager->GetStaticContainer(wrp_cte::core::kCtePoolId);
 
   if (container == nullptr) {
     INFO("CTE container not available - skipping test");
@@ -8231,7 +8231,7 @@ TEST_CASE("Autogen - Admin Runtime AllocLoadTask coverage", "[autogen][admin][ru
 
   auto* ipc_manager = CHI_IPC;
   auto* pool_manager = CHI_POOL_MANAGER;
-  auto* container = pool_manager->GetContainer(chi::kAdminPoolId);
+  auto* container = pool_manager->GetStaticContainer(chi::kAdminPoolId);
 
   if (container == nullptr) {
     INFO("Admin container not available - skipping test");
@@ -8715,7 +8715,7 @@ TEST_CASE("Autogen - Bdev Container NewCopyTask coverage", "[autogen][bdev][cont
   // Look for any bdev pool
   for (chi::u32 major = 200; major < 210; ++major) {
     bdev_pool_id = chi::PoolId(major, 0);
-    auto* container = pool_manager->GetContainer(bdev_pool_id);
+    auto* container = pool_manager->GetStaticContainer(bdev_pool_id);
     if (container != nullptr) {
       found_bdev = true;
       break;
@@ -8727,7 +8727,7 @@ TEST_CASE("Autogen - Bdev Container NewCopyTask coverage", "[autogen][bdev][cont
     return;
   }
 
-  auto* container = pool_manager->GetContainer(bdev_pool_id);
+  auto* container = pool_manager->GetStaticContainer(bdev_pool_id);
 
   SECTION("NewCopyTask for WriteTask") {
     auto orig_task = container->NewTask(chimaera::bdev::Method::kWrite);
@@ -8774,7 +8774,7 @@ TEST_CASE("Autogen - Admin Container NewCopyTask coverage", "[autogen][admin][co
 
   auto* ipc_manager = CHI_IPC;
   auto* pool_manager = CHI_POOL_MANAGER;
-  auto* container = pool_manager->GetContainer(chi::kAdminPoolId);
+  auto* container = pool_manager->GetStaticContainer(chi::kAdminPoolId);
 
   if (container == nullptr) {
     INFO("Admin container not available - skipping test");
@@ -8837,7 +8837,7 @@ TEST_CASE("Autogen - CTE Container NewCopyTask coverage", "[autogen][cte][contai
 
   auto* ipc_manager = CHI_IPC;
   auto* pool_manager = CHI_POOL_MANAGER;
-  auto* container = pool_manager->GetContainer(wrp_cte::core::kCtePoolId);
+  auto* container = pool_manager->GetStaticContainer(wrp_cte::core::kCtePoolId);
 
   if (container == nullptr) {
     INFO("CTE container not available - skipping test");
@@ -8909,7 +8909,7 @@ TEST_CASE("Autogen - Admin Container SaveTask SerializeOut coverage", "[autogen]
 
   auto* ipc_manager = CHI_IPC;
   auto* pool_manager = CHI_POOL_MANAGER;
-  auto* container = pool_manager->GetContainer(chi::kAdminPoolId);
+  auto* container = pool_manager->GetStaticContainer(chi::kAdminPoolId);
 
   if (container == nullptr) {
     INFO("Admin container not available - skipping test");
@@ -9006,7 +9006,7 @@ TEST_CASE("Autogen - CTE Container SaveTask SerializeOut coverage", "[autogen][c
 
   auto* ipc_manager = CHI_IPC;
   auto* pool_manager = CHI_POOL_MANAGER;
-  auto* container = pool_manager->GetContainer(wrp_cte::core::kCtePoolId);
+  auto* container = pool_manager->GetStaticContainer(wrp_cte::core::kCtePoolId);
 
   if (container == nullptr) {
     INFO("CTE container not available - skipping test");
@@ -9093,7 +9093,7 @@ TEST_CASE("Autogen - Admin Container AllocLoadTask full coverage", "[autogen][ad
 
   auto* ipc_manager = CHI_IPC;
   auto* pool_manager = CHI_POOL_MANAGER;
-  auto* container = pool_manager->GetContainer(chi::kAdminPoolId);
+  auto* container = pool_manager->GetStaticContainer(chi::kAdminPoolId);
 
   if (container == nullptr) {
     INFO("Admin container not available - skipping test");
@@ -9248,7 +9248,7 @@ TEST_CASE("Autogen - CAE Container NewTask coverage", "[autogen][cae][container]
 
   // Use the well-known CAE pool ID
   chi::PoolId cae_pool_id = wrp_cae::core::kCaePoolId;
-  auto* container = pool_manager->GetContainer(cae_pool_id);
+  auto* container = pool_manager->GetStaticContainer(cae_pool_id);
 
   if (container == nullptr) {
     INFO("No CAE container found - skipping test");
@@ -9296,7 +9296,7 @@ TEST_CASE("Autogen - CAE Container NewCopyTask coverage", "[autogen][cae][contai
 
   // Use the well-known CAE pool ID
   chi::PoolId cae_pool_id = wrp_cae::core::kCaePoolId;
-  auto* container = pool_manager->GetContainer(cae_pool_id);
+  auto* container = pool_manager->GetStaticContainer(cae_pool_id);
 
   if (container == nullptr) {
     INFO("No CAE container found - skipping test");
@@ -9348,7 +9348,7 @@ TEST_CASE("Autogen - CAE Container Aggregate coverage", "[autogen][cae][containe
 
   // Use the well-known CAE pool ID
   chi::PoolId cae_pool_id = wrp_cae::core::kCaePoolId;
-  auto* container = pool_manager->GetContainer(cae_pool_id);
+  auto* container = pool_manager->GetStaticContainer(cae_pool_id);
 
   if (container == nullptr) {
     INFO("No CAE container found - skipping test");
@@ -9397,7 +9397,7 @@ TEST_CASE("Autogen - CAE Container SaveTask coverage", "[autogen][cae][container
 
   // Use the well-known CAE pool ID
   chi::PoolId cae_pool_id = wrp_cae::core::kCaePoolId;
-  auto* container = pool_manager->GetContainer(cae_pool_id);
+  auto* container = pool_manager->GetStaticContainer(cae_pool_id);
 
   if (container == nullptr) {
     INFO("No CAE container found - skipping test");
@@ -9473,7 +9473,7 @@ TEST_CASE("Autogen - CAE Container AllocLoadTask coverage", "[autogen][cae][cont
 
   // Use the well-known CAE pool ID
   chi::PoolId cae_pool_id = wrp_cae::core::kCaePoolId;
-  auto* container = pool_manager->GetContainer(cae_pool_id);
+  auto* container = pool_manager->GetStaticContainer(cae_pool_id);
 
   if (container == nullptr) {
     INFO("No CAE container found - skipping test");
@@ -9546,7 +9546,7 @@ TEST_CASE("Autogen - CAE Container DelTask coverage", "[autogen][cae][container]
 
   // Use the well-known CAE pool ID
   chi::PoolId cae_pool_id = wrp_cae::core::kCaePoolId;
-  auto* container = pool_manager->GetContainer(cae_pool_id);
+  auto* container = pool_manager->GetStaticContainer(cae_pool_id);
 
   if (container == nullptr) {
     INFO("No CAE container found - skipping test");
@@ -9595,7 +9595,7 @@ TEST_CASE("Autogen - Admin WreapDeadIpcs Container Methods", "[autogen][admin][w
 
   auto* ipc_manager = CHI_IPC;
   auto* pool_manager = CHI_POOL_MANAGER;
-  auto* container = pool_manager->GetContainer(chi::kAdminPoolId);
+  auto* container = pool_manager->GetStaticContainer(chi::kAdminPoolId);
 
   if (container == nullptr) {
     INFO("Admin container not available - skipping test");
@@ -9702,7 +9702,7 @@ TEST_CASE("Autogen - Admin LocalAllocLoadTask Additional Methods", "[autogen][ad
 
   auto* ipc_manager = CHI_IPC;
   auto* pool_manager = CHI_POOL_MANAGER;
-  auto* container = pool_manager->GetContainer(chi::kAdminPoolId);
+  auto* container = pool_manager->GetStaticContainer(chi::kAdminPoolId);
 
   if (container == nullptr) {
     INFO("Admin container not available - skipping test");
@@ -10167,7 +10167,7 @@ TEST_CASE("Autogen - Admin Default Case Coverage", "[autogen][admin][default]") 
 
   auto* ipc_manager = CHI_IPC;
   auto* pool_manager = CHI_POOL_MANAGER;
-  auto* container = pool_manager->GetContainer(chi::kAdminPoolId);
+  auto* container = pool_manager->GetStaticContainer(chi::kAdminPoolId);
 
   if (container == nullptr) {
     INFO("Admin container not available - skipping test");
@@ -10913,7 +10913,7 @@ TEST_CASE("Autogen - Admin Container StopRuntime", "[autogen][admin][container][
 
   auto* ipc_manager = CHI_IPC;
   auto* pool_manager = CHI_POOL_MANAGER;
-  auto* container = pool_manager->GetContainer(chi::kAdminPoolId);
+  auto* container = pool_manager->GetStaticContainer(chi::kAdminPoolId);
   if (!container) {
     INFO("Admin container not available - skipping");
     return;
@@ -11952,7 +11952,8 @@ TEST_CASE("Autogen - PoolQuery factory methods", "[autogen][poolquery][factory]"
     REQUIRE(!q.IsDynamicMode());
     REQUIRE(q.GetRoutingMode() == chi::RoutingMode::Local);
     REQUIRE(q.GetHash() == 0);
-    REQUIRE(q.GetContainerId() == 0);
+    REQUIRE(q.GetContainerId() == chi::kInvalidContainerId);
+    REQUIRE(!q.HasContainerId());
     REQUIRE(q.GetRangeOffset() == 0);
     REQUIRE(q.GetRangeCount() == 0);
     REQUIRE(q.GetNodeId() == 0);
@@ -12317,7 +12318,7 @@ TEST_CASE("Autogen - CTE Container NewTask/DelTask", "[autogen][cte][container][
   EnsureInitialized();
   auto* pool_manager = CHI_POOL_MANAGER;
 
-  auto* container = pool_manager->GetContainer(wrp_cte::core::kCtePoolId);
+  auto* container = pool_manager->GetStaticContainer(wrp_cte::core::kCtePoolId);
   if (!container) {
     INFO("CTE container not available - skipping");
     return;
@@ -12359,7 +12360,7 @@ TEST_CASE("Autogen - CTE Container NewTask/DelTask", "[autogen][cte][container][
 TEST_CASE("Autogen - CTE Container NewCopyTask dispatch", "[autogen][cte][container][newcopy]") {
   EnsureInitialized();
   auto* pool_manager = CHI_POOL_MANAGER;
-  auto* container = pool_manager->GetContainer(wrp_cte::core::kCtePoolId);
+  auto* container = pool_manager->GetStaticContainer(wrp_cte::core::kCtePoolId);
   if (!container) {
     INFO("CTE container not available - skipping");
     return;
@@ -12498,11 +12499,11 @@ TEST_CASE("Autogen - PoolManager operations", "[autogen][poolmanager][ops]") {
   }
 
   SECTION("GetContainer") {
-    auto* admin_container = pool_manager->GetContainer(chi::kAdminPoolId);
+    auto* admin_container = pool_manager->GetStaticContainer(chi::kAdminPoolId);
     REQUIRE(admin_container != nullptr);
     // Non-existent container
     chi::PoolId fake_id(9999, 9999);
-    auto* fake_container = pool_manager->GetContainer(fake_id);
+    auto* fake_container = pool_manager->GetStaticContainer(fake_id);
     REQUIRE(fake_container == nullptr);
     INFO("GetContainer tests completed");
   }
@@ -12580,15 +12581,12 @@ TEST_CASE("Autogen - PoolManager operations", "[autogen][poolmanager][ops]") {
     INFO("Container node ID for fake pool: " + std::to_string(fake_node));
   }
 
-  SECTION("CreateAddressTable") {
+  SECTION("InitAddressMap") {
+    // InitAddressMap requires pool to exist in metadata
+    // Just verify the method doesn't crash on non-existent pool
     chi::PoolId test_id(100, 200);
-    auto addr_table = pool_manager->CreateAddressTable(test_id, 2);
-    // Verify the table has mappings
-    chi::Address global(test_id, chi::Group::kGlobal, 0);
-    chi::Address physical;
-    bool found = addr_table.GlobalToPhysical(global, physical);
-    REQUIRE(found == true);
-    INFO("CreateAddressTable completed");
+    pool_manager->InitAddressMap(test_id, 2);
+    INFO("InitAddressMap completed");
   }
 }
 
@@ -12817,80 +12815,36 @@ compression:
 }
 
 // ==========================================================================
-// AddressTable tests
+// PoolInfo address_map_ tests (replaces old AddressTable tests)
 // ==========================================================================
-TEST_CASE("Autogen - AddressTable operations", "[autogen][addresstable]") {
+TEST_CASE("Autogen - PoolInfo address_map operations", "[autogen][addressmap]") {
   EnsureInitialized();
 
-  SECTION("Basic address table operations") {
-    chi::AddressTable table;
-    chi::PoolId pid(100, 200);
+  SECTION("Basic address map operations") {
+    chi::PoolInfo info;
+    info.address_map_[0] = 10;
+    info.address_map_[1] = 20;
 
-    // Add mappings
-    chi::Address local(pid, chi::Group::kLocal, 0);
-    chi::Address global(pid, chi::Group::kGlobal, 0);
-    chi::Address physical(pid, chi::Group::kPhysical, 0);
-
-    table.AddLocalToGlobalMapping(local, global);
-    table.AddGlobalToPhysicalMapping(global, physical);
-
-    // Lookup
-    chi::Address result;
-    REQUIRE(table.LocalToGlobal(local, result) == true);
-    REQUIRE(table.GlobalToPhysical(global, result) == true);
+    REQUIRE(info.address_map_.find(0) != info.address_map_.end());
+    REQUIRE(info.address_map_[0] == 10);
+    REQUIRE(info.address_map_[1] == 20);
 
     // Not found
-    chi::Address bad(pid, chi::Group::kLocal, 99);
-    REQUIRE(table.LocalToGlobal(bad, result) == false);
-    REQUIRE(table.GlobalToPhysical(bad, result) == false);
-    INFO("Basic address table operations completed");
+    REQUIRE(info.address_map_.find(99) == info.address_map_.end());
+    INFO("Basic address map operations completed");
   }
 
-  SECTION("Remove mappings") {
-    chi::AddressTable table;
-    chi::PoolId pid(10, 20);
-    chi::Address local(pid, chi::Group::kLocal, 0);
-    chi::Address global(pid, chi::Group::kGlobal, 0);
-    chi::Address physical(pid, chi::Group::kPhysical, 0);
+  SECTION("Remove and clear") {
+    chi::PoolInfo info;
+    info.address_map_[0] = 10;
+    info.address_map_[1] = 20;
 
-    table.AddLocalToGlobalMapping(local, global);
-    table.AddGlobalToPhysicalMapping(global, physical);
+    info.address_map_.erase(0);
+    REQUIRE(info.address_map_.find(0) == info.address_map_.end());
 
-    table.RemoveLocalToGlobalMapping(local);
-    table.RemoveGlobalToPhysicalMapping(global);
-
-    chi::Address result;
-    REQUIRE(table.LocalToGlobal(local, result) == false);
-    REQUIRE(table.GlobalToPhysical(global, result) == false);
-    INFO("Remove mappings completed");
-  }
-
-  SECTION("Clear") {
-    chi::AddressTable table;
-    chi::PoolId pid(10, 20);
-    chi::Address local(pid, chi::Group::kLocal, 0);
-    chi::Address global(pid, chi::Group::kGlobal, 0);
-    table.AddLocalToGlobalMapping(local, global);
-    table.Clear();
-    chi::Address result;
-    REQUIRE(table.LocalToGlobal(local, result) == false);
-    INFO("Clear completed");
-  }
-
-  SECTION("GetGlobalAddress and GetPhysicalNodes") {
-    chi::AddressTable table;
-    chi::PoolId pid(10, 20);
-    chi::Address global(pid, chi::Group::kGlobal, 0);
-    chi::Address physical(pid, chi::Group::kPhysical, 5);
-    table.AddGlobalToPhysicalMapping(global, physical);
-
-    chi::Address ga = table.GetGlobalAddress(0);
-    INFO("GetGlobalAddress: pool=" + std::to_string(ga.pool_id_.major_));
-
-    auto nodes = table.GetPhysicalNodes(global);
-    REQUIRE(!nodes.empty());
-    REQUIRE(nodes[0] == 5);
-    INFO("GetPhysicalNodes completed");
+    info.address_map_.clear();
+    REQUIRE(info.address_map_.empty());
+    INFO("Remove and clear completed");
   }
 }
 
@@ -12923,7 +12877,7 @@ TEST_CASE("Autogen - PoolInfo struct", "[autogen][poolinfo]") {
 TEST_CASE("Autogen - CTE Container LocalSave/Load dispatch extended", "[autogen][cte][container][localdispatch]") {
   EnsureInitialized();
   auto* pool_manager = CHI_POOL_MANAGER;
-  auto* container = pool_manager->GetContainer(wrp_cte::core::kCtePoolId);
+  auto* container = pool_manager->GetStaticContainer(wrp_cte::core::kCtePoolId);
   if (!container) {
     INFO("CTE container not available - skipping");
     return;

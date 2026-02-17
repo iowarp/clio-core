@@ -77,6 +77,7 @@
 #include <chimaera/chimaera.h>
 #include <wrp_cte/core/core_client.h>
 #include <wrp_cte/core/core_tasks.h>
+#include <hermes_shm/util/logging.h>
 
 using namespace std::chrono;
 
@@ -196,7 +197,7 @@ chi::u64 ParseSize(const std::string &size_str) {
   }
 
   if (num_str.empty()) {
-    std::cerr << "Error: Invalid size format: " << size_str << std::endl;
+    HLOG(kError, "Invalid size format: {}", size_str);
     return 0;
   }
 
@@ -401,8 +402,7 @@ DataGenerator::DataType ParseDataType(const std::string &type_str) {
   if (lower == "float") return DataGenerator::DataType::kFloat;
   if (lower == "double") return DataGenerator::DataType::kDouble;
 
-  std::cerr << "Warning: Unknown data type '" << type_str << "', using float"
-            << std::endl;
+  HLOG(kWarning, "Unknown data type '{}', using float", type_str);
   return DataGenerator::DataType::kFloat;
 }
 
@@ -418,8 +418,7 @@ DataGenerator::Distribution ParseDistribution(const std::string &dist_str) {
   if (lower == "exponential") return DataGenerator::Distribution::kExponential;
   if (lower == "uniform") return DataGenerator::Distribution::kUniform;
 
-  std::cerr << "Warning: Unknown distribution '" << dist_str << "', using normal"
-            << std::endl;
+  HLOG(kWarning, "Unknown distribution '{}', using normal", dist_str);
   return DataGenerator::Distribution::kNormal;
 }
 
@@ -434,8 +433,7 @@ DataGenerator::Compressibility ParseCompressibility(const std::string &comp_str)
   if (lower == "medium") return DataGenerator::Compressibility::kMedium;
   if (lower == "high") return DataGenerator::Compressibility::kHigh;
 
-  std::cerr << "Warning: Unknown compressibility '" << comp_str << "', using medium"
-            << std::endl;
+  HLOG(kWarning, "Unknown compressibility '{}', using medium", comp_str);
   return DataGenerator::Compressibility::kMedium;
 }
 
@@ -522,31 +520,28 @@ class CTECompressBenchmark {
     } else if (lower_case == "putget") {
       RunPutGetBenchmark();
     } else {
-      std::cerr << "Error: Unknown test case: " << test_case_ << std::endl;
-      std::cerr << "Valid options: put, get, putget" << std::endl;
+      HLOG(kError, "Unknown test case: {}", test_case_);
+      HLOG(kError, "Valid options: put, get, putget");
     }
   }
 
  private:
   void PrintBenchmarkInfo() {
-    std::cout << "=== CTE Compression Benchmark ===" << std::endl;
-    std::cout << "Compression: " << GetCompressionName(dynamic_compress_, compress_lib_)
-              << std::endl;
-    std::cout << "Worker threads: " << num_threads_ << std::endl;
-    std::cout << "Data per thread: " << FormatSize(data_per_thread_) << std::endl;
-    std::cout << "Transfer size: " << FormatSize(transfer_size_) << std::endl;
-    std::cout << "Transfers per thread: " << transfers_per_thread_ << std::endl;
-    std::cout << "Data type: " << GetDataTypeName(data_type_) << std::endl;
-    std::cout << "Distribution: " << GetDistributionName(distribution_) << std::endl;
-    std::cout << "Compressibility: " << GetCompressibilityName(compressibility_)
-              << std::endl;
-    std::cout << "Test case: " << test_case_ << std::endl;
-    std::cout << "Compute phase: " << compute_phase_sec_ << " seconds" << std::endl;
-    std::cout << "Checkpoint interval: " << checkpoint_interval_ << " phases"
-              << std::endl;
-    std::cout << "Total data (all threads): "
-              << FormatSize(data_per_thread_ * num_threads_) << std::endl;
-    std::cout << "===================================" << std::endl << std::endl;
+    HLOG(kInfo, "=== CTE Compression Benchmark ===");
+    HLOG(kInfo, "Compression: {}", GetCompressionName(dynamic_compress_, compress_lib_));
+    HLOG(kInfo, "Worker threads: {}", num_threads_);
+    HLOG(kInfo, "Data per thread: {}", FormatSize(data_per_thread_));
+    HLOG(kInfo, "Transfer size: {}", FormatSize(transfer_size_));
+    HLOG(kInfo, "Transfers per thread: {}", transfers_per_thread_);
+    HLOG(kInfo, "Data type: {}", GetDataTypeName(data_type_));
+    HLOG(kInfo, "Distribution: {}", GetDistributionName(distribution_));
+    HLOG(kInfo, "Compressibility: {}", GetCompressibilityName(compressibility_));
+    HLOG(kInfo, "Test case: {}", test_case_);
+    HLOG(kInfo, "Compute phase: {} seconds", compute_phase_sec_);
+    HLOG(kInfo, "Checkpoint interval: {} phases", checkpoint_interval_);
+    HLOG(kInfo, "Total data (all threads): {}",
+         FormatSize(data_per_thread_ * num_threads_));
+    HLOG(kInfo, "===================================");
   }
 
   /**
@@ -568,8 +563,7 @@ class CTECompressBenchmark {
                        std::vector<double> &compression_ratios) {
     // Pin thread to core
     if (!PinThreadToCore(static_cast<int>(thread_id))) {
-      std::cerr << "Warning: Failed to pin thread " << thread_id << " to core"
-                << std::endl;
+      HLOG(kWarning, "Failed to pin thread {} to core", thread_id);
     }
 
     // Create data generator with thread-specific seed
@@ -582,8 +576,7 @@ class CTECompressBenchmark {
     // Allocate shared memory buffer
     auto shm_buffer = CHI_IPC->AllocateBuffer(transfer_size_);
     if (shm_buffer.IsNull()) {
-      std::cerr << "Error: Failed to allocate shared memory for thread "
-                << thread_id << std::endl;
+      HLOG(kError, "Failed to allocate shared memory for thread {}", thread_id);
       error_flag.store(true);
       return;
     }
@@ -682,8 +675,7 @@ class CTECompressBenchmark {
                        std::vector<double> &compression_ratios) {
     // Pin thread to core
     if (!PinThreadToCore(static_cast<int>(thread_id))) {
-      std::cerr << "Warning: Failed to pin thread " << thread_id << " to core"
-                << std::endl;
+      HLOG(kWarning, "Failed to pin thread {} to core", thread_id);
     }
 
     // Create data generator
@@ -698,8 +690,7 @@ class CTECompressBenchmark {
     wrp_cte::core::Context ctx = CreateCompressionContext();
 
     // First, populate data with Put operations
-    std::cout << "Thread " << thread_id << ": Populating data for Get benchmark..."
-              << std::endl;
+    HLOG(kInfo, "Thread {}: Populating data for Get benchmark...", thread_id);
 
     for (size_t i = 0; i < transfers_per_thread_; ++i) {
       generator.FillBuffer(put_data.data(), transfer_size_);
@@ -738,7 +729,7 @@ class CTECompressBenchmark {
   }
 
   void RunGetBenchmark() {
-    std::cout << "Populating data for Get benchmark..." << std::endl;
+    HLOG(kInfo, "Populating data for Get benchmark...");
 
     std::vector<std::thread> threads;
     std::vector<long long> thread_times(num_threads_);
@@ -768,8 +759,7 @@ class CTECompressBenchmark {
                           std::vector<double> &compression_ratios) {
     // Pin thread to core
     if (!PinThreadToCore(static_cast<int>(thread_id))) {
-      std::cerr << "Warning: Failed to pin thread " << thread_id << " to core"
-                << std::endl;
+      HLOG(kWarning, "Failed to pin thread {} to core", thread_id);
     }
 
     // Create data generator
@@ -783,8 +773,7 @@ class CTECompressBenchmark {
     // Allocate shared memory buffer
     auto shm_buffer = CHI_IPC->AllocateBuffer(transfer_size_);
     if (shm_buffer.IsNull()) {
-      std::cerr << "Error: Failed to allocate shared memory for thread "
-                << thread_id << std::endl;
+      HLOG(kError, "Failed to allocate shared memory for thread {}", thread_id);
       error_flag.store(true);
       return;
     }
@@ -899,21 +888,19 @@ class CTECompressBenchmark {
     double avg_bw = CalcBandwidth(total_bytes, avg_time);
     double agg_bw = CalcBandwidth(aggregate_bytes, avg_time);
 
-    std::cout << std::endl;
-    std::cout << "=== " << operation << " Compression Benchmark Results ===" << std::endl;
-    std::cout << std::fixed << std::setprecision(3);
-    std::cout << "Time (min): " << (min_time / 1000.0) << " ms" << std::endl;
-    std::cout << "Time (max): " << (max_time / 1000.0) << " ms" << std::endl;
-    std::cout << "Time (avg): " << (avg_time / 1000.0) << " ms" << std::endl;
-    std::cout << std::endl;
-    std::cout << std::fixed << std::setprecision(2);
-    std::cout << "Bandwidth per thread (min): " << min_bw << " MB/s" << std::endl;
-    std::cout << "Bandwidth per thread (max): " << max_bw << " MB/s" << std::endl;
-    std::cout << "Bandwidth per thread (avg): " << avg_bw << " MB/s" << std::endl;
-    std::cout << "Aggregate bandwidth: " << agg_bw << " MB/s" << std::endl;
-    std::cout << std::endl;
-    std::cout << "Compression ratio (avg): " << avg_ratio << ":1" << std::endl;
-    std::cout << "=============================================" << std::endl;
+    HLOG(kInfo, "");
+    HLOG(kInfo, "=== {} Compression Benchmark Results ===", operation);
+    HLOG(kInfo, "Time (min): {} ms", min_time / 1000.0);
+    HLOG(kInfo, "Time (max): {} ms", max_time / 1000.0);
+    HLOG(kInfo, "Time (avg): {} ms", avg_time / 1000.0);
+    HLOG(kInfo, "");
+    HLOG(kInfo, "Bandwidth per thread (min): {} MB/s", min_bw);
+    HLOG(kInfo, "Bandwidth per thread (max): {} MB/s", max_bw);
+    HLOG(kInfo, "Bandwidth per thread (avg): {} MB/s", avg_bw);
+    HLOG(kInfo, "Aggregate bandwidth: {} MB/s", agg_bw);
+    HLOG(kInfo, "");
+    HLOG(kInfo, "Compression ratio (avg): {}:1", avg_ratio);
+    HLOG(kInfo, "=============================================");
   }
 
   int dynamic_compress_;
@@ -931,34 +918,24 @@ class CTECompressBenchmark {
 };
 
 void PrintUsage(const char *program) {
-  std::cerr << "Usage: " << program << " <compress_type> <num_threads> "
-            << "<data_per_thread> <transfer_size> <data_type> <distribution> "
-            << "<compressibility> <test_case> <compute_phase_sec> "
-            << "<checkpoint_interval>" << std::endl;
-  std::cerr << std::endl;
-  std::cerr << "Parameters:" << std::endl;
-  std::cerr << "  compress_type: Compression algorithm" << std::endl;
-  std::cerr << "                 (dynamic, zstd, lz4, zlib, snappy, brotli, "
-            << "blosc2, bzip2, lzma, none)" << std::endl;
-  std::cerr << "  num_threads: Number of worker threads (e.g., 4)" << std::endl;
-  std::cerr << "  data_per_thread: Total data per thread (e.g., 1g, 100m)"
-            << std::endl;
-  std::cerr << "  transfer_size: Size of each transfer (e.g., 1m, 4k)"
-            << std::endl;
-  std::cerr << "  data_type: Data element type (char, int, float, double)"
-            << std::endl;
-  std::cerr << "  distribution: Data distribution (normal, gamma, exponential, "
-            << "uniform)" << std::endl;
-  std::cerr << "  compressibility: Target compressibility (low, medium, high)"
-            << std::endl;
-  std::cerr << "  test_case: Benchmark to run (put, get, putget)" << std::endl;
-  std::cerr << "  compute_phase_sec: Seconds to busy-wait per compute phase"
-            << std::endl;
-  std::cerr << "  checkpoint_interval: Phases between checkpoints" << std::endl;
-  std::cerr << std::endl;
-  std::cerr << "Example:" << std::endl;
-  std::cerr << "  " << program << " zstd 4 1g 1m float normal medium put 0.1 10"
-            << std::endl;
+  HLOG(kError, "Usage: {} <compress_type> <num_threads> <data_per_thread> <transfer_size> <data_type> <distribution> <compressibility> <test_case> <compute_phase_sec> <checkpoint_interval>",
+       program);
+  HLOG(kError, "");
+  HLOG(kError, "Parameters:");
+  HLOG(kError, "  compress_type: Compression algorithm");
+  HLOG(kError, "                 (dynamic, zstd, lz4, zlib, snappy, brotli, blosc2, bzip2, lzma, none)");
+  HLOG(kError, "  num_threads: Number of worker threads (e.g., 4)");
+  HLOG(kError, "  data_per_thread: Total data per thread (e.g., 1g, 100m)");
+  HLOG(kError, "  transfer_size: Size of each transfer (e.g., 1m, 4k)");
+  HLOG(kError, "  data_type: Data element type (char, int, float, double)");
+  HLOG(kError, "  distribution: Data distribution (normal, gamma, exponential, uniform)");
+  HLOG(kError, "  compressibility: Target compressibility (low, medium, high)");
+  HLOG(kError, "  test_case: Benchmark to run (put, get, putget)");
+  HLOG(kError, "  compute_phase_sec: Seconds to busy-wait per compute phase");
+  HLOG(kError, "  checkpoint_interval: Phases between checkpoints");
+  HLOG(kError, "");
+  HLOG(kError, "Example:");
+  HLOG(kError, "  {} zstd 4 1g 1m float normal medium put 0.1 10", program);
 }
 
 int main(int argc, char **argv) {
@@ -970,7 +947,7 @@ int main(int argc, char **argv) {
   // Parse compression type
   int dynamic_compress, compress_lib;
   if (!ParseCompressionType(argv[1], dynamic_compress, compress_lib)) {
-    std::cerr << "Error: Invalid compression type: " << argv[1] << std::endl;
+    HLOG(kError, "Invalid compression type: {}", argv[1]);
     PrintUsage(argv[0]);
     return 1;
   }
@@ -989,19 +966,19 @@ int main(int argc, char **argv) {
   // Validate parameters
   if (num_threads == 0 || data_per_thread == 0 || transfer_size == 0 ||
       checkpoint_interval <= 0) {
-    std::cerr << "Error: Invalid parameters" << std::endl;
-    std::cerr << "  num_threads must be > 0" << std::endl;
-    std::cerr << "  data_per_thread must be > 0" << std::endl;
-    std::cerr << "  transfer_size must be > 0" << std::endl;
-    std::cerr << "  checkpoint_interval must be > 0" << std::endl;
+    HLOG(kError, "Invalid parameters");
+    HLOG(kError, "  num_threads must be > 0");
+    HLOG(kError, "  data_per_thread must be > 0");
+    HLOG(kError, "  transfer_size must be > 0");
+    HLOG(kError, "  checkpoint_interval must be > 0");
     return 1;
   }
 
   // Initialize Chimaera runtime
-  std::cout << "Initializing Chimaera runtime..." << std::endl;
+  HLOG(kInfo, "Initializing Chimaera runtime...");
 
   if (!chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true)) {
-    std::cerr << "Error: Failed to initialize Chimaera runtime" << std::endl;
+    HLOG(kError, "Failed to initialize Chimaera runtime");
     return 1;
   }
 
@@ -1009,11 +986,11 @@ int main(int argc, char **argv) {
 
   // Initialize CTE client
   if (!wrp_cte::core::WRP_CTE_CLIENT_INIT()) {
-    std::cerr << "Error: Failed to initialize CTE client" << std::endl;
+    HLOG(kError, "Failed to initialize CTE client");
     return 1;
   }
 
-  std::cout << "Runtime and client initialized successfully" << std::endl;
+  HLOG(kInfo, "Runtime and client initialized successfully");
   std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
   // Run benchmark

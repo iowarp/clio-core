@@ -47,6 +47,7 @@
 
 #include <iostream>
 #include <memory>
+#include <hermes_shm/util/logging.h>
 #include <chimaera/chimaera.h>
 #include <chimaera/simple_mod/simple_mod_client.h>
 #include <chimaera/admin/admin_client.h>
@@ -56,78 +57,78 @@ constexpr chi::PoolId kExternalTestPoolId = chi::PoolId(7001, 0);
 }
 
 int main() {
-  std::cout << "=== External ChiMod Development Test ===" << std::endl;
-  std::cout << "Testing external_test::simple_mod with custom namespace and CMake linking." << std::endl;
-  
+  HIPRINT("=== External ChiMod Development Test ===");
+  HIPRINT("Testing external_test::simple_mod with custom namespace and CMake linking.");
+
   try {
     // Step 1: Initialize Chimaera client
-    std::cout << "\n1. Initializing Chimaera client..." << std::endl;
+    HLOG(kInfo, "\n1. Initializing Chimaera client...");
     bool client_init_success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
 
     if (!client_init_success) {
-      std::cout << "NOTICE: Chimaera client initialization failed." << std::endl;
-      std::cout << "This is expected when no runtime is active." << std::endl;
-      std::cout << "In a production environment, ensure chimaera_start_runtime is running." << std::endl;
+      HLOG(kInfo, "NOTICE: Chimaera client initialization failed.");
+      HLOG(kInfo, "This is expected when no runtime is active.");
+      HLOG(kInfo, "In a production environment, ensure chimaera_start_runtime is running.");
     } else {
-      std::cout << "SUCCESS: Chimaera client initialized!" << std::endl;
+      HLOG(kSuccess, "SUCCESS: Chimaera client initialized!");
     }
-    
+
     // Step 2: Create admin client (required for pool management)
-    std::cout << "\n2. Creating admin client..." << std::endl;
+    HLOG(kInfo, "\n2. Creating admin client...");
     chimaera::admin::Client admin_client(chi::kAdminPoolId);
-    std::cout << "Admin client created with pool ID: " << chi::kAdminPoolId << std::endl;
-    
+    HLOG(kInfo, "Admin client created with pool ID: {}", chi::kAdminPoolId);
+
     // Step 3: Create simple_mod client (from external_test namespace)
-    std::cout << "\n3. Creating external_test::simple_mod client..." << std::endl;
+    HLOG(kInfo, "\n3. Creating external_test::simple_mod client...");
     external_test::simple_mod::Client simple_mod_client(kExternalTestPoolId);
-    std::cout << "Simple mod client created with pool ID: " << kExternalTestPoolId << std::endl;
-    std::cout << "Successfully using external namespace: external_test::simple_mod" << std::endl;
-    
+    HLOG(kInfo, "Simple mod client created with pool ID: {}", kExternalTestPoolId);
+    HLOG(kInfo, "Successfully using external namespace: external_test::simple_mod");
+
     // Step 4: Create simple_mod container
-    std::cout << "\n4. Creating simple_mod container..." << std::endl;
-    
+    HLOG(kInfo, "\n4. Creating simple_mod container...");
+
     // Use local pool query (recommended default)
     auto pool_query = chi::PoolQuery::Local();
-    
+
     try {
       // This will create the pool if it doesn't exist
       simple_mod_client.Create(pool_query);
-      std::cout << "SUCCESS: Simple mod container created!" << std::endl;
-      
+      HLOG(kSuccess, "SUCCESS: Simple mod container created!");
+
       // Step 5: Demonstrate flush operation
-      std::cout << "\n5. Testing simple_mod flush operation..." << std::endl;
-      
+      HLOG(kInfo, "\n5. Testing simple_mod flush operation...");
+
       simple_mod_client.Flush(pool_query);
-      std::cout << "SUCCESS: Flush operation completed!" << std::endl;
-      
+      HLOG(kSuccess, "SUCCESS: Flush operation completed!");
+
       // Step 6: Destroy container for cleanup
-      std::cout << "\n6. Destroying simple_mod container..." << std::endl;
+      HLOG(kInfo, "\n6. Destroying simple_mod container...");
       simple_mod_client.Destroy(pool_query);
-      std::cout << "SUCCESS: Container destroyed!" << std::endl;
-      
-      std::cout << "\n=== External ChiMod Development Test completed successfully! ===" << std::endl;
-      
+      HLOG(kSuccess, "SUCCESS: Container destroyed!");
+
+      HLOG(kSuccess, "\n=== External ChiMod Development Test completed successfully! ===");
+
     } catch (const std::exception& e) {
-      std::cout << "NOTICE: Container operations failed: " << e.what() << std::endl;
-      std::cout << "This is expected when no runtime is active." << std::endl;
+      HLOG(kInfo, "NOTICE: Container operations failed: {}", e.what());
+      HLOG(kInfo, "This is expected when no runtime is active.");
     }
-    
+
   } catch (const std::exception& e) {
-    std::cout << "ERROR: Exception occurred: " << e.what() << std::endl;
+    HLOG(kError, "ERROR: Exception occurred: {}", e.what());
     return 1;
   }
-  
-  std::cout << "\n=== Key External ChiMod Features Demonstrated ===" << std::endl;
-  std::cout << "✓ Custom namespace (external_test vs chimaera)" << std::endl;
-  std::cout << "✓ External chimaera_repo.yaml configuration" << std::endl;
-  std::cout << "✓ add_chimod_client()/add_chimod_runtime() CMake functions" << std::endl;
-  std::cout << "✓ install_chimod() CMake function usage" << std::endl;
-  std::cout << "✓ find_package(chimaera::core) linking" << std::endl;
-  std::cout << "✓ External module directory structure" << std::endl;
-  std::cout << "✓ CHI_TASK_CC macro with external library name" << std::endl;
-  
-  std::cout << "\nNOTE: This test demonstrates successful external ChiMod development patterns." << std::endl;
-  std::cout << "For full functionality, run chimaera_start_runtime in another terminal." << std::endl;
-  
+
+  HIPRINT("\n=== Key External ChiMod Features Demonstrated ===");
+  HIPRINT("Custom namespace (external_test vs chimaera)");
+  HIPRINT("External chimaera_repo.yaml configuration");
+  HIPRINT("add_chimod_client()/add_chimod_runtime() CMake functions");
+  HIPRINT("install_chimod() CMake function usage");
+  HIPRINT("find_package(chimaera::core) linking");
+  HIPRINT("External module directory structure");
+  HIPRINT("CHI_TASK_CC macro with external library name");
+
+  HIPRINT("\nNOTE: This test demonstrates successful external ChiMod development patterns.");
+  HIPRINT("For full functionality, run chimaera_start_runtime in another terminal.");
+
   return 0;
 }

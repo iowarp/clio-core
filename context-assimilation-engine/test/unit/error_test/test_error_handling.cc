@@ -66,6 +66,9 @@
 // CTE headers
 #include <wrp_cte/core/core_client.h>
 
+// Logging
+#include <hermes_shm/util/logging.h>
+
 // Bdev headers for storage target registration
 #include <chimaera/bdev/bdev_client.h>
 #include <chimaera/bdev/bdev_tasks.h>
@@ -106,7 +109,7 @@ bool TestErrorCase(wrp_cae::core::Client& cae_client,
                    const std::string& test_name,
                    const wrp_cae::core::AssimilationCtx& ctx,
                    bool should_fail = true) {
-  std::cout << "\n--- Testing: " << test_name << " ---" << std::endl;
+  HLOG(kInfo, "--- Testing: {} ---", test_name);
 
   // Call ParseOmni with vector containing single context
   std::vector<wrp_cae::core::AssimilationCtx> contexts = {ctx};
@@ -116,28 +119,25 @@ bool TestErrorCase(wrp_cae::core::Client& cae_client,
   chi::u32 result_code = parse_task->result_code_;
   chi::u32 num_tasks_scheduled = parse_task->num_tasks_scheduled_;
 
-  std::cout << "ParseOmni result: result_code=" << result_code
-            << ", num_tasks=" << num_tasks_scheduled << std::endl;
+  HLOG(kInfo, "ParseOmni result: result_code={}, num_tasks={}", result_code, num_tasks_scheduled);
 
   // Validate
   if (should_fail) {
     // We expect this to fail
     if (result_code != 0) {
-      std::cout << "SUCCESS: " << test_name << " failed as expected (error code: "
-                << result_code << ")" << std::endl;
+      HLOG(kSuccess, "{} failed as expected (error code: {})", test_name, result_code);
       return true;
     } else {
-      std::cerr << "ERROR: " << test_name << " should have failed but succeeded" << std::endl;
+      HLOG(kError, "{} should have failed but succeeded", test_name);
       return false;
     }
   } else {
     // We expect this to succeed
     if (result_code == 0) {
-      std::cout << "SUCCESS: " << test_name << " succeeded as expected" << std::endl;
+      HLOG(kSuccess, "{} succeeded as expected", test_name);
       return true;
     } else {
-      std::cerr << "ERROR: " << test_name << " should have succeeded but failed (error code: "
-                << result_code << ")" << std::endl;
+      HLOG(kError, "{} should have succeeded but failed (error code: {})", test_name, result_code);
       return false;
     }
   }
@@ -153,9 +153,9 @@ bool TestErrorCase(wrp_cae::core::Client& cae_client,
  * Main test function
  */
 int main(int argc, char* argv[]) {
-  std::cout << "========================================" << std::endl;
-  std::cout << "Error Handling ParseOmni Unit Test" << std::endl;
-  std::cout << "========================================" << std::endl;
+  HLOG(kInfo, "========================================");
+  HLOG(kInfo, "Error Handling ParseOmni Unit Test");
+  HLOG(kInfo, "========================================");
 
   int exit_code = 0;
   int tests_passed = 0;
@@ -163,36 +163,36 @@ int main(int argc, char* argv[]) {
 
   try {
     // Initialize Chimaera runtime (CHIMAERA_WITH_RUNTIME controls behavior)
-    std::cout << "Initializing Chimaera..." << std::endl;
+    HLOG(kInfo, "Initializing Chimaera...");
     bool success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
     if (!success) {
-      std::cerr << "ERROR: Failed to initialize Chimaera" << std::endl;
+      HLOG(kError, "Failed to initialize Chimaera");
       return 1;
     }
-    std::cout << "Chimaera initialized successfully" << std::endl;
+    HLOG(kSuccess, "Chimaera initialized successfully");
 
     // Verify Chimaera IPC
     auto* ipc_manager = CHI_IPC;
     if (!ipc_manager) {
-      std::cerr << "ERROR: Chimaera IPC not initialized" << std::endl;
+      HLOG(kError, "Chimaera IPC not initialized");
       return 1;
     }
-    std::cout << "Chimaera IPC verified" << std::endl;
+    HLOG(kSuccess, "Chimaera IPC verified");
 
     // Generate test file (1MB)
-    std::cout << "\n[SETUP] Generating test file..." << std::endl;
+    HLOG(kInfo, "[SETUP] Generating test file...");
     const size_t file_size = 1024 * 1024;
     if (!GenerateTestFile(kTestFileName, file_size)) {
-      std::cerr << "ERROR: Failed to generate test file" << std::endl;
+      HLOG(kError, "Failed to generate test file");
       return 1;
     }
 
     // Connect to CTE
-    std::cout << "\n[SETUP] Connecting to CTE..." << std::endl;
+    HLOG(kInfo, "[SETUP] Connecting to CTE...");
     wrp_cte::core::WRP_CTE_CLIENT_INIT();
 
     // Set up storage target for CTE
-    std::cout << "\n[SETUP] Registering storage target..." << std::endl;
+    HLOG(kInfo, "[SETUP] Registering storage target...");
 
     // Clean up any existing test storage file
     if (fs::exists(kTestStoragePath)) {
@@ -214,14 +214,14 @@ int main(int argc, char* argv[]) {
                                                      kTestTargetSize, chi::PoolQuery::Local(), bdev_pool_id);
     reg_task.Wait();
     std::this_thread::sleep_for(100ms);
-    std::cout << "Storage target registered: " << kTestStoragePath << std::endl;
+    HLOG(kSuccess, "Storage target registered: {}", kTestStoragePath);
 
     // Initialize CAE client
-    std::cout << "\n[SETUP] Initializing CAE client..." << std::endl;
+    HLOG(kInfo, "[SETUP] Initializing CAE client...");
     WRP_CAE_CLIENT_INIT();
 
     // Create CAE pool
-    std::cout << "\n[SETUP] Creating CAE pool..." << std::endl;
+    HLOG(kInfo, "[SETUP] Creating CAE pool...");
     wrp_cae::core::Client cae_client;
     wrp_cae::core::CreateParams params;
 
@@ -232,7 +232,7 @@ int main(int argc, char* argv[]) {
         params);
     create_task.Wait();
 
-    std::cout << "CAE pool created" << std::endl;
+    HLOG(kSuccess, "CAE pool created");
 
     // Test 1: Non-existent source file
     tests_total++;
@@ -311,29 +311,29 @@ int main(int argc, char* argv[]) {
     }
 
     // Cleanup
-    std::cout << "\n[CLEANUP] Removing test files..." << std::endl;
+    HLOG(kInfo, "[CLEANUP] Removing test files...");
     std::remove(kTestFileName.c_str());
     if (fs::exists(kTestStoragePath)) {
       fs::remove(kTestStoragePath);
     }
 
   } catch (const std::exception& e) {
-    std::cerr << "ERROR: Exception caught: " << e.what() << std::endl;
+    HLOG(kError, "Exception caught: {}", e.what());
     exit_code = 1;
   }
 
   // Print final results
-  std::cout << "\n========================================" << std::endl;
-  std::cout << "Tests passed: " << tests_passed << "/" << tests_total << std::endl;
+  HLOG(kInfo, "========================================");
+  HLOG(kInfo, "Tests passed: {}/{}", tests_passed, tests_total);
 
   if (tests_passed == tests_total && tests_total > 0) {
-    std::cout << "TEST SUITE PASSED" << std::endl;
+    HLOG(kSuccess, "TEST SUITE PASSED");
     exit_code = 0;
   } else {
-    std::cout << "TEST SUITE FAILED" << std::endl;
+    HLOG(kError, "TEST SUITE FAILED");
     exit_code = 1;
   }
-  std::cout << "========================================" << std::endl;
+  HLOG(kInfo, "========================================");
 
   return exit_code;
 }

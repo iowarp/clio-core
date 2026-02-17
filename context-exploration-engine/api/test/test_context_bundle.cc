@@ -63,6 +63,7 @@
 #include <cstring>
 #include <thread>
 #include <chrono>
+#include <hermes_shm/util/logging.h>
 
 // Test configuration
 const std::string kTestFileName = "/tmp/test_cee_bundle_file.bin";
@@ -74,11 +75,11 @@ const size_t kTestFileSize = 1024 * 1024;  // 1 MB test file
  * Pattern: Each 4-byte block contains the block index (little endian)
  */
 bool GenerateTestFile(const std::string& file_path, size_t size_bytes) {
-  std::cout << "  Generating test file: " << file_path << " (" << size_bytes << " bytes)" << std::endl;
+  HLOG(kInfo, "Generating test file: {} ({} bytes)", file_path, size_bytes);
 
   std::ofstream file(file_path, std::ios::binary);
   if (!file.is_open()) {
-    std::cerr << "  ERROR: Failed to create test file: " << file_path << std::endl;
+    HLOG(kError, "Failed to create test file: {}", file_path);
     return false;
   }
 
@@ -91,14 +92,14 @@ bool GenerateTestFile(const std::string& file_path, size_t size_bytes) {
     file.write(reinterpret_cast<const char*>(&value), block_size);
 
     if (!file.good()) {
-      std::cerr << "  ERROR: Failed to write to test file at block " << i << std::endl;
+      HLOG(kError, "Failed to write to test file at block {}", i);
       file.close();
       return false;
     }
   }
 
   file.close();
-  std::cout << "  Test file generated successfully (" << num_blocks << " blocks)" << std::endl;
+  HLOG(kSuccess, "Test file generated successfully ({} blocks)", num_blocks);
   return true;
 }
 
@@ -106,7 +107,7 @@ bool GenerateTestFile(const std::string& file_path, size_t size_bytes) {
  * Test that context_bundle can handle empty bundles
  */
 void test_empty_bundle() {
-  std::cout << "TEST: Empty bundle" << std::endl;
+  HLOG(kInfo, "TEST: Empty bundle");
 
   iowarp::ContextInterface ctx_interface;
   std::vector<wrp_cae::core::AssimilationCtx> empty_bundle;
@@ -115,14 +116,14 @@ void test_empty_bundle() {
   int result = ctx_interface.ContextBundle(empty_bundle);
   assert(result == 0 && "Empty bundle should return success");
 
-  std::cout << "  PASSED: Empty bundle test" << std::endl;
+  HLOG(kSuccess, "PASSED: Empty bundle test");
 }
 
 /**
  * Test AssimilationCtx constructor with all parameters
  */
 void test_assimilation_ctx_constructor() {
-  std::cout << "TEST: AssimilationCtx constructor" << std::endl;
+  HLOG(kInfo, "TEST: AssimilationCtx constructor");
 
   wrp_cae::core::AssimilationCtx ctx(
       "file::/path/to/source.dat",
@@ -143,7 +144,7 @@ void test_assimilation_ctx_constructor() {
   assert(ctx.src_token == "src_access_token");
   assert(ctx.dst_token == "dst_access_token");
 
-  std::cout << "  PASSED: AssimilationCtx constructor test" << std::endl;
+  HLOG(kSuccess, "PASSED: AssimilationCtx constructor test");
 }
 
 /**
@@ -154,20 +155,20 @@ void test_assimilation_ctx_constructor() {
  * 3. Query operation (verification)
  */
 void test_bundle_and_retrieve_workflow() {
-  std::cout << "TEST: Bundle-and-retrieve workflow" << std::endl;
+  HLOG(kInfo, "TEST: Bundle-and-retrieve workflow");
 
   // Step 1: Generate test file
-  std::cout << "  [STEP 1] Generating test file..." << std::endl;
+  HLOG(kInfo, "[STEP 1] Generating test file...");
   if (!GenerateTestFile(kTestFileName, kTestFileSize)) {
     assert(false && "Failed to generate test file");
   }
 
   // Step 2: Initialize CTE client
-  std::cout << "  [STEP 2] Initializing CTE client..." << std::endl;
+  HLOG(kInfo, "[STEP 2] Initializing CTE client...");
   wrp_cte::core::WRP_CTE_CLIENT_INIT();
 
   // Step 2.5: Register a RAM storage target with CTE
-  std::cout << "  [STEP 2.5] Registering RAM storage target with CTE..." << std::endl;
+  HLOG(kInfo, "[STEP 2.5] Registering RAM storage target with CTE...");
   auto* cte_client = WRP_CTE_CLIENT;
   auto register_task = cte_client->AsyncRegisterTarget(
       "ram::cee_test_storage",  // Target name (RAM storage)
@@ -178,10 +179,10 @@ void test_bundle_and_retrieve_workflow() {
   register_task.Wait();
   chi::u32 register_result = register_task->return_code_;
   assert(register_result == 0 && "Failed to register storage target");
-  std::cout << "  Storage target registered successfully" << std::endl;
+  HLOG(kSuccess, "Storage target registered successfully");
 
   // Step 3: Create CAE pool
-  std::cout << "  [STEP 3] Creating CAE pool..." << std::endl;
+  HLOG(kInfo, "[STEP 3] Creating CAE pool...");
   wrp_cae::core::Client cae_client;
   wrp_cae::core::CreateParams params;
 
@@ -192,10 +193,10 @@ void test_bundle_and_retrieve_workflow() {
       params);
   create_task.Wait();
 
-  std::cout << "  CAE pool created with ID: " << cae_client.pool_id_ << std::endl;
+  HLOG(kSuccess, "CAE pool created with ID: {}", cae_client.pool_id_);
 
   // Step 4: Bundle the test file using ContextInterface
-  std::cout << "  [STEP 4] Bundling test file..." << std::endl;
+  HLOG(kInfo, "[STEP 4] Bundling test file...");
   iowarp::ContextInterface ctx_interface;
 
   std::vector<wrp_cae::core::AssimilationCtx> bundle;
@@ -212,25 +213,25 @@ void test_bundle_and_retrieve_workflow() {
 
   int bundle_result = ctx_interface.ContextBundle(bundle);
   assert(bundle_result == 0 && "ContextBundle should return success");
-  std::cout << "  Bundle operation completed successfully" << std::endl;
+  HLOG(kSuccess, "Bundle operation completed successfully");
 
   // Step 5: Wait for assimilation to complete
-  std::cout << "  [STEP 5] Waiting for assimilation to complete..." << std::endl;
+  HLOG(kInfo, "[STEP 5] Waiting for assimilation to complete...");
   std::this_thread::sleep_for(std::chrono::seconds(2));
 
   // Step 6: Query to verify the data was ingested
-  std::cout << "  [STEP 6] Querying for bundled data..." << std::endl;
+  HLOG(kInfo, "[STEP 6] Querying for bundled data...");
   std::vector<std::string> query_results = ctx_interface.ContextQuery(
       kTestTagName,  // Exact tag name
       ".*");         // Match all blobs
 
-  std::cout << "  Query returned " << query_results.size() << " results" << std::endl;
+  HLOG(kInfo, "Query returned {} results", query_results.size());
 
   // Verify we got at least one result
   if (query_results.size() > 0) {
-    std::cout << "  Found blobs in tag '" << kTestTagName << "':" << std::endl;
+    HLOG(kInfo, "Found blobs in tag '{}':", kTestTagName);
     for (const auto& blob : query_results) {
-      std::cout << "    - " << blob << std::endl;
+      HLOG(kInfo, "  - {}", blob);
     }
   }
 
@@ -239,57 +240,54 @@ void test_bundle_and_retrieve_workflow() {
   assert(query_results.size() > 0 && "Query should find at least one blob after bundling");
 
   // Step 7: Cleanup - destroy the context
-  std::cout << "  [STEP 7] Cleaning up test context..." << std::endl;
+  HLOG(kInfo, "[STEP 7] Cleaning up test context...");
   std::vector<std::string> contexts_to_delete = {kTestTagName};
   int destroy_result = ctx_interface.ContextDestroy(contexts_to_delete);
-  std::cout << "  Destroy returned code: " << destroy_result << std::endl;
+  HLOG(kInfo, "Destroy returned code: {}", destroy_result);
 
   // Step 8: Delete test file
   std::remove(kTestFileName.c_str());
 
-  std::cout << "  PASSED: Bundle-and-retrieve workflow test" << std::endl;
+  HLOG(kSuccess, "PASSED: Bundle-and-retrieve workflow test");
 }
 
 int main(int argc, char** argv) {
   (void)argc;  // Suppress unused parameter warning
   (void)argv;  // Suppress unused parameter warning
 
-  std::cout << "========================================" << std::endl;
-  std::cout << "ContextInterface::ContextBundle Tests" << std::endl;
-  std::cout << "========================================" << std::endl;
+  HLOG(kInfo, "========================================");
+  HLOG(kInfo, "ContextInterface::ContextBundle Tests");
+  HLOG(kInfo, "========================================");
 
   try {
     // Initialize Chimaera runtime if requested (for unit tests)
     const char* init_chimaera = std::getenv("INIT_CHIMAERA");
     if (init_chimaera && std::strcmp(init_chimaera, "1") == 0) {
-      std::cout << "Initializing Chimaera (INIT_CHIMAERA=1)..." << std::endl;
+      HLOG(kInfo, "Initializing Chimaera (INIT_CHIMAERA=1)...");
       chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
-      std::cout << "Chimaera initialized" << std::endl;
+      HLOG(kSuccess, "Chimaera initialized");
     }
 
     // Verify Chimaera IPC is available
     auto* ipc_manager = CHI_IPC;
     if (!ipc_manager) {
-      std::cerr << "ERROR: Chimaera IPC not initialized. Is the runtime running?" << std::endl;
-      std::cerr << "HINT: Set INIT_CHIMAERA=1 to initialize runtime or start runtime externally" << std::endl;
+      HLOG(kError, "Chimaera IPC not initialized. Is the runtime running?");
+      HLOG(kInfo, "HINT: Set INIT_CHIMAERA=1 to initialize runtime or start runtime externally");
       return 1;
     }
-    std::cout << "Chimaera IPC verified\n" << std::endl;
+    HLOG(kSuccess, "Chimaera IPC verified");
 
     // Run all tests
     test_empty_bundle();
-    std::cout << std::endl;
 
     test_assimilation_ctx_constructor();
-    std::cout << std::endl;
 
     test_bundle_and_retrieve_workflow();
-    std::cout << std::endl;
 
-    std::cout << "All tests PASSED!" << std::endl;
+    HLOG(kSuccess, "All tests PASSED!");
     return 0;
   } catch (const std::exception& e) {
-    std::cerr << "\nTest FAILED with exception: " << e.what() << std::endl;
+    HLOG(kError, "Test FAILED with exception: {}", e.what());
     return 1;
   }
 }

@@ -66,6 +66,8 @@
 #include <cmath>
 #include <memory>
 
+#include <hermes_shm/util/logging.h>
+
 // Compression headers (from hermes_shm)
 #include "hermes_shm/compress/compress.h"
 #include "hermes_shm/compress/lossless_modes.h"
@@ -271,15 +273,15 @@ int main(int argc, char* argv[]) {
     output_path = argv[2];
   }
 
-  std::cout << "Gray-Scott ADIOS2 Compression Analysis\n";
-  std::cout << "======================================\n";
-  std::cout << "Input:  " << input_path << "\n";
-  std::cout << "Output: " << output_path << "\n\n";
+  HLOG(kInfo, "Gray-Scott ADIOS2 Compression Analysis");
+  HLOG(kInfo, "======================================");
+  HLOG(kInfo, "Input:  {}", input_path);
+  HLOG(kInfo, "Output: {}", output_path);
 
   // Open output CSV file
   std::ofstream csv_file(output_path);
   if (!csv_file.is_open()) {
-    std::cerr << "ERROR: Could not open output file: " << output_path << std::endl;
+    HLOG(kError, "Could not open output file: {}", output_path);
     return 1;
   }
   WriteCSVHeader(csv_file);
@@ -293,25 +295,24 @@ int main(int argc, char* argv[]) {
 
   // Need to BeginStep first before InquireVariable
   if (reader.BeginStep() != adios2::StepStatus::OK) {
-    std::cerr << "ERROR: Could not begin first step\n";
+    HLOG(kError, "Could not begin first step");
     return 1;
   }
 
   // Get available variables
   auto variables = io.AvailableVariables();
 
-  std::cout << "Available variables:\n";
+  HLOG(kInfo, "Available variables:");
   for (const auto& var : variables) {
-    std::cout << "  - " << var.first << "\n";
+    HLOG(kInfo, "  - {}", var.first);
   }
-  std::cout << "\n";
 
   // Get U and V variables
   adios2::Variable<double> varU = io.InquireVariable<double>("U");
   adios2::Variable<double> varV = io.InquireVariable<double>("V");
 
   if (!varU || !varV) {
-    std::cerr << "ERROR: Could not find U and V variables in ADIOS2 file\n";
+    HLOG(kError, "Could not find U and V variables in ADIOS2 file");
     return 1;
   }
 
@@ -328,7 +329,7 @@ int main(int argc, char* argv[]) {
   std::vector<CompressorConfig> compressors;
 
   // Lossless compressors
-  std::cout << "Initializing compression libraries...\n";
+  HLOG(kInfo, "Initializing compression libraries...");
 
   // ZSTD (3 modes)
   compressors.push_back({"zstd", "fast",
@@ -388,7 +389,7 @@ int main(int argc, char* argv[]) {
 
 #if HSHM_ENABLE_COMPRESS && HSHM_ENABLE_LIBPRESSIO
   // Lossy compressors (LibPressio)
-  std::cout << "Adding lossy compressors (LibPressio enabled)...\n";
+  HLOG(kInfo, "Adding lossy compressors (LibPressio enabled)...");
 
   // ZFP (3 modes)
   compressors.push_back({"zfp", "fast",
@@ -414,10 +415,10 @@ int main(int argc, char* argv[]) {
   compressors.push_back({"fpzip", "best",
                          std::make_unique<hshm::LibPressioWithModes>("fpzip", hshm::CompressionMode::BEST)});
 #else
-  std::cout << "Lossy compressors disabled (LibPressio not available)\n";
+  HLOG(kInfo, "Lossy compressors disabled (LibPressio not available)");
 #endif
 
-  std::cout << "Total compressors: " << compressors.size() << "\n\n";
+  HLOG(kInfo, "Total compressors: {}", compressors.size());
 
   // Process each timestep
   size_t total_chunks = 0;
@@ -425,14 +426,14 @@ int main(int argc, char* argv[]) {
 
   while (reader.BeginStep() == adios2::StepStatus::OK) {
     size_t current_step = reader.CurrentStep();
-    std::cout << "Processing step " << current_step << "...\n";
+    HLOG(kInfo, "Processing step {}...", current_step);
 
     // Read U field
     std::vector<double> dataU;
     reader.Get(varU, dataU, adios2::Mode::Sync);
     size_t sizeU_bytes = dataU.size() * sizeof(double);
 
-    std::cout << "  U field: " << dataU.size() << " elements (" << sizeU_bytes << " bytes)\n";
+    HLOG(kInfo, "  U field: {} elements ({} bytes)", dataU.size(), sizeU_bytes);
 
     // Benchmark all compressors on U
     for (const auto& config : compressors) {
@@ -450,7 +451,7 @@ int main(int argc, char* argv[]) {
     reader.Get(varV, dataV, adios2::Mode::Sync);
     size_t sizeV_bytes = dataV.size() * sizeof(double);
 
-    std::cout << "  V field: " << dataV.size() << " elements (" << sizeV_bytes << " bytes)\n";
+    HLOG(kInfo, "  V field: {} elements ({} bytes)", dataV.size(), sizeV_bytes);
 
     // Benchmark all compressors on V
     for (const auto& config : compressors) {
@@ -470,11 +471,11 @@ int main(int argc, char* argv[]) {
   reader.Close();
   csv_file.close();
 
-  std::cout << "\n======================================\n";
-  std::cout << "Analysis complete!\n";
-  std::cout << "Total chunks processed: " << total_chunks << "\n";
-  std::cout << "Total results written: " << total_results << "\n";
-  std::cout << "Output: " << output_path << "\n";
+  HLOG(kInfo, "======================================");
+  HLOG(kInfo, "Analysis complete!");
+  HLOG(kInfo, "Total chunks processed: {}", total_chunks);
+  HLOG(kInfo, "Total results written: {}", total_results);
+  HLOG(kInfo, "Output: {}", output_path);
 
   return 0;
 }

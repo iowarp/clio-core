@@ -32,6 +32,7 @@
  */
 
 #include <chimaera/chimaera.h>
+#include <hermes_shm/util/logging.h>
 #include <wrp_cae/core/factory/globus_file_assimilator.h>
 
 #include <chrono>
@@ -102,7 +103,6 @@ int GlobusFileAssimilator::Schedule(const AssimilationCtx& ctx) {
   } else {
     const char* access_token_env = std::getenv("GLOBUS_ACCESS_TOKEN");
     if (!access_token_env || std::strlen(access_token_env) == 0) {
-      std::cerr << "ERROR: No access token provided" << std::endl;
       HLOG(kError,
            "GlobusFileAssimilator: No access token provided. Set src_token in "
            "OMNI file or GLOBUS_ACCESS_TOKEN environment variable");
@@ -142,40 +142,34 @@ int GlobusFileAssimilator::Schedule(const AssimilationCtx& ctx) {
   // Handle different destination types
   if (dst_protocol == "file") {
     // Globus to local filesystem
-    std::cout << std::endl;
-    std::cout << "=========================================" << std::endl;
-    std::cout << "Globus to Local Filesystem Transfer" << std::endl;
-    std::cout << "=========================================" << std::endl;
+    HLOG(kInfo, "=========================================");
+    HLOG(kInfo, "Globus to Local Filesystem Transfer");
+    HLOG(kInfo, "=========================================");
     HLOG(kDebug,
          "GlobusFileAssimilator: Transferring from Globus to local filesystem");
 
     std::string dst_path = GetUrlPath(ctx.dst);
     if (dst_path.empty()) {
-      std::cerr << "ERROR: Invalid destination URL, no file path found"
-                << std::endl;
       HLOG(
           kError,
           "GlobusFileAssimilator: Invalid destination URL, no file path found");
       return -5;
     }
 
-    std::cout << "Source:       " << ctx.src << std::endl;
-    std::cout << "Destination:  " << ctx.dst << std::endl;
-    std::cout << std::endl;
+    HLOG(kInfo, "Source:       {}", ctx.src);
+    HLOG(kInfo, "Destination:  {}", ctx.dst);
 
     // Download file from Globus to local filesystem
     int download_result =
         DownloadFile(src_endpoint, src_path, dst_path, access_token);
     if (download_result != 0) {
-      std::cerr << "ERROR: Failed to download file from Globus (error code: "
-                << download_result << ")" << std::endl;
       HLOG(kError,
-           "GlobusFileAssimilator: Failed to download file from Globus");
+           "GlobusFileAssimilator: Failed to download file from Globus (error code: {})",
+           download_result);
       return download_result;
     }
 
-    std::cout << "Transfer completed successfully!" << std::endl;
-    std::cout << std::endl;
+    HLOG(kInfo, "Transfer completed successfully!");
     HLOG(kDebug,
          "GlobusFileAssimilator: Successfully downloaded file to local "
          "filesystem");
@@ -659,13 +653,12 @@ int GlobusFileAssimilator::DownloadFile(const std::string& endpoint_id,
                                         const std::string& remote_path,
                                         const std::string& local_path,
                                         const std::string& access_token) {
-  std::cout << "==========================================" << std::endl;
-  std::cout << "Globus File Download Starting" << std::endl;
-  std::cout << "==========================================" << std::endl;
-  std::cout << "Endpoint ID:  " << endpoint_id << std::endl;
-  std::cout << "Remote path:  " << remote_path << std::endl;
-  std::cout << "Local path:   " << local_path << std::endl;
-  std::cout << std::endl;
+  HLOG(kInfo, "==========================================");
+  HLOG(kInfo, "Globus File Download Starting");
+  HLOG(kInfo, "==========================================");
+  HLOG(kInfo, "Endpoint ID:  {}", endpoint_id);
+  HLOG(kInfo, "Remote path:  {}", remote_path);
+  HLOG(kInfo, "Local path:   {}", local_path);
 
   HLOG(kDebug, "GlobusFileAssimilator: Downloading file from Globus endpoint");
   HLOG(kDebug,
@@ -674,23 +667,20 @@ int GlobusFileAssimilator::DownloadFile(const std::string& endpoint_id,
 
   try {
     // Get endpoint details to find the HTTPS server
-    std::cout << "[Step 1/4] Querying Globus endpoint details..." << std::endl;
+    HLOG(kInfo, "[Step 1/4] Querying Globus endpoint details...");
     std::string endpoint_url =
         "https://transfer.api.globus.org/v0.10/endpoint/" + endpoint_id;
-    std::cout << "  API URL: " << endpoint_url << std::endl;
+    HLOG(kInfo, "  API URL: {}", endpoint_url);
     std::string endpoint_response = HttpGet(endpoint_url, access_token);
 
     if (endpoint_response.empty()) {
-      std::cerr << "ERROR: Failed to get endpoint details from Globus API"
-                << std::endl;
-      HLOG(kError, "GlobusFileAssimilator: Failed to get endpoint details");
+      HLOG(kError, "GlobusFileAssimilator: Failed to get endpoint details from Globus API");
       return -11;
     }
-    std::cout << "  Endpoint details retrieved successfully" << std::endl;
-    std::cout << std::endl;
+    HLOG(kInfo, "  Endpoint details retrieved successfully");
 
     // Parse endpoint response to get HTTPS server
-    std::cout << "[Step 2/4] Parsing endpoint configuration..." << std::endl;
+    HLOG(kInfo, "[Step 2/4] Parsing endpoint configuration...");
     nlohmann::json endpoint_json = nlohmann::json::parse(endpoint_response);
 
     std::string https_server;
@@ -698,11 +688,6 @@ int GlobusFileAssimilator::DownloadFile(const std::string& endpoint_id,
         !endpoint_json["https_server"].is_null()) {
       https_server = endpoint_json["https_server"];
     } else {
-      std::cerr << "ERROR: Endpoint does not have HTTPS server enabled"
-                << std::endl;
-      std::cerr << "       Endpoint must have HTTPS access enabled for local "
-                   "downloads"
-                << std::endl;
       HLOG(
           kError,
           "GlobusFileAssimilator: Endpoint does not have HTTPS server enabled");
@@ -712,15 +697,12 @@ int GlobusFileAssimilator::DownloadFile(const std::string& endpoint_id,
       return -12;
     }
 
-    std::cout << "  HTTPS server: " << https_server << std::endl;
-    std::cout << std::endl;
-    HLOG(kDebug, "GlobusFileAssimilator: HTTPS server: {}", https_server);
+    HLOG(kInfo, "  HTTPS server: {}", https_server);
 
     // Construct the download URL
-    std::cout << "[Step 3/4] Initiating HTTPS download..." << std::endl;
+    HLOG(kInfo, "[Step 3/4] Initiating HTTPS download...");
     std::string download_url = "https://" + https_server + remote_path;
-    std::cout << "  Download URL: " << download_url << std::endl;
-    HLOG(kDebug, "GlobusFileAssimilator: Download URL: {}", download_url);
+    HLOG(kInfo, "  Download URL: {}", download_url);
 
     // Download the file using HTTPS
     Poco::URI uri(download_url);
@@ -749,7 +731,7 @@ int GlobusFileAssimilator::DownloadFile(const std::string& endpoint_id,
     request.set("User-Agent", "CAE-Globus-Client/1.0");
 
     // Send the request
-    std::cout << "  Sending HTTPS request..." << std::endl;
+    HLOG(kInfo, "  Sending HTTPS request...");
     session.sendRequest(request);
 
     // Get the response
@@ -757,55 +739,45 @@ int GlobusFileAssimilator::DownloadFile(const std::string& endpoint_id,
     std::istream& rs = session.receiveResponse(response);
 
     if (response.getStatus() != Poco::Net::HTTPResponse::HTTP_OK) {
-      std::cerr << "ERROR: HTTP GET failed with status " << response.getStatus()
-                << " " << response.getReason() << std::endl;
       HLOG(kError, "GlobusFileAssimilator: HTTP GET failed with status {} {}",
            response.getStatus(), response.getReason());
       return -13;
     }
-    std::cout << "  HTTP Status: " << response.getStatus() << " "
-              << response.getReason() << std::endl;
+    HLOG(kInfo, "  HTTP Status: {} {}", response.getStatus(),
+         response.getReason());
     if (response.has("Content-Length")) {
-      std::cout << "  Content-Length: " << response.get("Content-Length")
-                << " bytes" << std::endl;
+      HLOG(kInfo, "  Content-Length: {} bytes", response.get("Content-Length"));
     }
-    std::cout << std::endl;
 
     // Open output file
-    std::cout << "[Step 4/4] Writing file to local filesystem..." << std::endl;
-    std::cout << "  Output path: " << local_path << std::endl;
+    HLOG(kInfo, "[Step 4/4] Writing file to local filesystem...");
+    HLOG(kInfo, "  Output path: {}", local_path);
     std::ofstream output_file(local_path, std::ios::binary);
     if (!output_file) {
-      std::cerr << "ERROR: Failed to open output file: " << local_path
-                << std::endl;
       HLOG(kError, "GlobusFileAssimilator: Failed to open output file: {}",
            local_path);
       return -14;
     }
 
     // Copy the response stream to the output file
-    std::cout << "  Downloading and writing file..." << std::endl;
+    HLOG(kInfo, "  Downloading and writing file...");
     HLOG(kDebug, "GlobusFileAssimilator: Writing file to {}", local_path);
     Poco::StreamCopier::copyStream(rs, output_file);
     output_file.close();
 
-    std::cout << "  File written successfully" << std::endl;
-    std::cout << std::endl;
-    std::cout << "==========================================" << std::endl;
-    std::cout << "Download Complete!" << std::endl;
-    std::cout << "==========================================" << std::endl;
-    std::cout << std::endl;
+    HLOG(kInfo, "  File written successfully");
+    HLOG(kInfo, "==========================================");
+    HLOG(kInfo, "Download Complete!");
+    HLOG(kInfo, "==========================================");
 
     HLOG(kDebug, "GlobusFileAssimilator: File downloaded successfully");
     return 0;
 
   } catch (Poco::Exception& e) {
-    std::cerr << "ERROR: POCO exception - " << e.displayText() << std::endl;
     HLOG(kError, "GlobusFileAssimilator: POCO exception in DownloadFile: {}",
          e.displayText());
     return -15;
   } catch (const std::exception& e) {
-    std::cerr << "ERROR: Exception - " << e.what() << std::endl;
     HLOG(kError, "GlobusFileAssimilator: Exception in DownloadFile: {}",
          e.what());
     return -15;

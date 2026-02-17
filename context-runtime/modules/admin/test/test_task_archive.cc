@@ -48,6 +48,7 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <hermes_shm/util/logging.h>
 
 // Include Chimaera headers
 #include <chimaera/chimaera.h>
@@ -935,7 +936,7 @@ int main(int argc, char *argv[]) {
   // Initialize Chimaera runtime for memory management
   bool runtime_success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
   if (!runtime_success) {
-    std::cerr << "Failed to initialize Chimaera runtime" << std::endl;
+    HLOG(kError, "Failed to initialize Chimaera runtime");
     return 1;
   }
 

@@ -61,6 +61,7 @@
 #include <chimaera/chimaera.h>
 #include <mpi.h>
 #include <wrp_cte/core/core_client.h>
+#include <hermes_shm/util/logging.h>
 
 #include <algorithm>
 #include <chrono>
@@ -245,44 +246,39 @@ class CTEScoreBenchmark {
     MPI_Barrier(MPI_COMM_WORLD);
 
     if (rank_ == 0) {
-      std::cout << "Benchmark complete." << std::endl;
+      HLOG(kInfo, "Benchmark complete.");
     }
   }
 
  private:
   void PrintBenchmarkInfo() {
-    std::cout << "=== CTE Score/Demotion Benchmark ===" << std::endl;
-    std::cout << "MPI processes: " << num_procs_ << std::endl;
-    std::cout << "Data per rank per step: " << FormatSize(data_per_rank_step_)
-              << std::endl;
-    std::cout << "Blob size: " << FormatSize(kBlobSize) << std::endl;
-    std::cout << "Blobs per step per rank: " << blobs_per_step_ << std::endl;
-    std::cout << "Busy wait per step: " << busy_wait_sec_ << " seconds"
-              << std::endl;
-    std::cout << "Number of steps: " << num_steps_ << std::endl;
-    std::cout << "Demotion percentage: " << demotion_pct_ << "%" << std::endl;
-    std::cout << "Total data per rank: "
-              << FormatSize(data_per_rank_step_ * num_steps_) << std::endl;
-    std::cout << "Total data (all ranks): "
-              << FormatSize(data_per_rank_step_ * num_steps_ * num_procs_)
-              << std::endl;
-    std::cout << "Fast tier score: " << kFastTierScore << " (RAM)"
-              << std::endl;
-    std::cout << "Slow tier score: " << kSlowTierScore << " (NVMe)"
-              << std::endl;
-    std::cout << "=====================================" << std::endl;
+    HLOG(kInfo, "=== CTE Score/Demotion Benchmark ===");
+    HLOG(kInfo, "MPI processes: {}", num_procs_);
+    HLOG(kInfo, "Data per rank per step: {}", FormatSize(data_per_rank_step_));
+    HLOG(kInfo, "Blob size: {}", FormatSize(kBlobSize));
+    HLOG(kInfo, "Blobs per step per rank: {}", blobs_per_step_);
+    HLOG(kInfo, "Busy wait per step: {} seconds", busy_wait_sec_);
+    HLOG(kInfo, "Number of steps: {}", num_steps_);
+    HLOG(kInfo, "Demotion percentage: {}%", demotion_pct_);
+    HLOG(kInfo, "Total data per rank: {}",
+         FormatSize(data_per_rank_step_ * num_steps_));
+    HLOG(kInfo, "Total data (all ranks): {}",
+         FormatSize(data_per_rank_step_ * num_steps_ * num_procs_));
+    HLOG(kInfo, "Fast tier score: {} (RAM)", kFastTierScore);
+    HLOG(kInfo, "Slow tier score: {} (NVMe)", kSlowTierScore);
+    HLOG(kInfo, "=====================================");
   }
 
   void PrintResult(const BenchmarkResult &r) {
-    std::cout << "\n========== BENCHMARK RESULTS ==========" << std::endl;
-    std::cout << std::fixed << std::setprecision(2);
-    std::cout << "Demotion: " << r.demotion_pct << "%" << std::endl;
-    std::cout << "Put time: " << r.put_time_ms << " ms" << std::endl;
-    std::cout << "Demotion wait time: " << r.demotion_time_ms << " ms" << std::endl;
-    std::cout << "Total time: " << r.total_time_ms << " ms" << std::endl;
-    std::cout << "Put bandwidth: " << r.put_bw_mbs << " MB/s" << std::endl;
-    std::cout << "Total bandwidth: " << r.total_bw_mbs << " MB/s" << std::endl;
-    std::cout << "=========================================" << std::endl;
+    HLOG(kInfo, "");
+    HLOG(kInfo, "========== BENCHMARK RESULTS ==========");
+    HLOG(kInfo, "Demotion: {}%", r.demotion_pct);
+    HLOG(kInfo, "Put time: {} ms", r.put_time_ms);
+    HLOG(kInfo, "Demotion wait time: {} ms", r.demotion_time_ms);
+    HLOG(kInfo, "Total time: {} ms", r.total_time_ms);
+    HLOG(kInfo, "Put bandwidth: {} MB/s", r.put_bw_mbs);
+    HLOG(kInfo, "Total bandwidth: {} MB/s", r.total_bw_mbs);
+    HLOG(kInfo, "=========================================");
   }
 
   /**
@@ -408,7 +404,7 @@ class CTEScoreBenchmark {
     auto *cte_client = WRP_CTE_CLIENT;
 
     if (rank_ == 0) {
-      std::cout << "  Cleaning up blobs..." << std::endl;
+      HLOG(kInfo, "  Cleaning up blobs...");
     }
 
     // First, delete all blobs explicitly
@@ -443,7 +439,7 @@ class CTEScoreBenchmark {
     }
 
     if (rank_ == 0) {
-      std::cout << "  Cleanup complete." << std::endl;
+      HLOG(kInfo, "  Cleanup complete.");
     }
   }
 
@@ -466,25 +462,19 @@ int main(int argc, char **argv) {
   // Check arguments
   if (argc != 5) {
     if (rank == 0) {
-      std::cerr << "Usage: " << argv[0]
-                << " <data_per_rank_step> <busy_wait_sec> <num_steps> <demotion_pct>"
-                << std::endl;
-      std::cerr << "  data_per_rank_step: Amount of data per rank per step "
-                   "(e.g., 100m, 1g)"
-                << std::endl;
-      std::cerr << "  busy_wait_sec: Busy wait time per step in seconds (e.g., "
-                   "0.5)"
-                << std::endl;
-      std::cerr << "  num_steps: Number of steps to run" << std::endl;
-      std::cerr << "  demotion_pct: Percentage of blobs to demote (0-100)"
-                << std::endl;
-      std::cerr << std::endl;
-      std::cerr << "Example:" << std::endl;
-      std::cerr << "  mpirun -n 4 wrp_cte_score_bench 100m 0.5 10 50" << std::endl;
-      std::cerr << std::endl;
-      std::cerr << "Environment variables:" << std::endl;
-      std::cerr << "  WRP_RUNTIME_CONF: Path to chimaera configuration file"
-                << std::endl;
+      HLOG(kError, "Usage: {} <data_per_rank_step> <busy_wait_sec> <num_steps> <demotion_pct>",
+           argv[0]);
+      HLOG(kError,
+           "  data_per_rank_step: Amount of data per rank per step (e.g., 100m, 1g)");
+      HLOG(kError, "  busy_wait_sec: Busy wait time per step in seconds (e.g., 0.5)");
+      HLOG(kError, "  num_steps: Number of steps to run");
+      HLOG(kError, "  demotion_pct: Percentage of blobs to demote (0-100)");
+      HLOG(kError, "");
+      HLOG(kError, "Example:");
+      HLOG(kError, "  mpirun -n 4 wrp_cte_score_bench 100m 0.5 10 50");
+      HLOG(kError, "");
+      HLOG(kError, "Environment variables:");
+      HLOG(kError, "  WRP_RUNTIME_CONF: Path to chimaera configuration file");
     }
     MPI_Finalize();
     return 1;
@@ -498,10 +488,10 @@ int main(int argc, char **argv) {
   // Validate parameters
   if (data_per_rank_step == 0 || num_steps <= 0 || demotion_pct < 0 || demotion_pct > 100) {
     if (rank == 0) {
-      std::cerr << "Error: Invalid parameters" << std::endl;
-      std::cerr << "  data_per_rank_step must be > 0" << std::endl;
-      std::cerr << "  num_steps must be > 0" << std::endl;
-      std::cerr << "  demotion_pct must be 0-100" << std::endl;
+      HLOG(kError, "Invalid parameters");
+      HLOG(kError, "  data_per_rank_step must be > 0");
+      HLOG(kError, "  num_steps must be > 0");
+      HLOG(kError, "  demotion_pct must be 0-100");
     }
     MPI_Finalize();
     return 1;
@@ -509,14 +499,14 @@ int main(int argc, char **argv) {
 
   // Initialize Chimaera runtime
   if (rank == 0) {
-    std::cout << "Initializing Chimaera runtime..." << std::endl;
+    HLOG(kInfo, "Initializing Chimaera runtime...");
   }
 
   MPI_Barrier(MPI_COMM_WORLD);
 
   if (!chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true)) {
     if (rank == 0) {
-      std::cerr << "Error: Failed to initialize Chimaera runtime" << std::endl;
+      HLOG(kError, "Failed to initialize Chimaera runtime");
     }
     MPI_Finalize();
     return 1;
@@ -527,14 +517,14 @@ int main(int argc, char **argv) {
   // Initialize CTE client
   if (!wrp_cte::core::WRP_CTE_CLIENT_INIT()) {
     if (rank == 0) {
-      std::cerr << "Error: Failed to initialize CTE client" << std::endl;
+      HLOG(kError, "Failed to initialize CTE client");
     }
     MPI_Finalize();
     return 1;
   }
 
   if (rank == 0) {
-    std::cout << "Runtime and client initialized successfully" << std::endl;
+    HLOG(kInfo, "Runtime and client initialized successfully");
   }
 
   MPI_Barrier(MPI_COMM_WORLD);

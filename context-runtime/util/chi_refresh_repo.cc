@@ -55,6 +55,7 @@
 #include <vector>
 
 #include <yaml-cpp/yaml.h>
+#include <hermes_shm/util/logging.h>
 
 namespace fs = std::filesystem;
 
@@ -542,14 +543,14 @@ class ChiModGenerator {
    * Generate autogen files for a single ChiMod
    */
   void GenerateChiModFiles(const std::string& chimod_name) {
-    std::cout << "Generating files for ChiMod: " << chimod_name << std::endl;
+    HIPRINT("Generating files for ChiMod: {}", chimod_name);
 
     // Load ChiMod configuration
     YAML::Node config;
     try {
       config = LoadChiModConfig(chimod_name);
     } catch (const std::runtime_error& e) {
-      std::cout << "Warning: " << e.what() << std::endl;
+      HLOG(kWarning, "{}", e.what());
       return;
     }
 
@@ -572,7 +573,7 @@ class ChiModGenerator {
     }
     methods_stream << methods_content;
     methods_stream.close();
-    std::cout << "  Generated: " << methods_file << std::endl;
+    HIPRINT("  Generated: {}", methods_file.string());
 
     // Generate lib_exec source file
     std::string lib_exec_content = GenerateLibExecSource(chimod_name, config, repo_namespace_);
@@ -583,7 +584,7 @@ class ChiModGenerator {
     }
     lib_exec_stream << lib_exec_content;
     lib_exec_stream.close();
-    std::cout << "  Generated: " << lib_exec_file << std::endl;
+    HIPRINT("  Generated: {}", lib_exec_file.string());
   }
 
   /**
@@ -601,31 +602,32 @@ class ChiModGenerator {
       modules.push_back(module.as<std::string>());
     }
 
-    std::cout << "Refreshing ChiMod repository: " << repo_path_ << std::endl;
-    std::cout << "Found " << modules.size() << " modules: ";
+    HIPRINT("Refreshing ChiMod repository: {}", repo_path_.string());
+    std::string module_list;
     for (size_t i = 0; i < modules.size(); ++i) {
-      if (i > 0) std::cout << ", ";
-      std::cout << modules[i];
+      if (i > 0) module_list += ", ";
+      module_list += modules[i];
     }
-    std::cout << std::endl << std::endl;
+    HIPRINT("Found {} modules: {}", modules.size(), module_list);
+    HIPRINT("");
 
     for (const auto& chimod_name : modules) {
       GenerateChiModFiles(chimod_name);
-      std::cout << std::endl;
+      HIPRINT("");
     }
 
-    std::cout << "Repository refresh complete!" << std::endl;
+    HIPRINT("Repository refresh complete!");
   }
 };
 
 void PrintUsage(const char* program_name) {
-  std::cout << "Usage: " << program_name << " <chimod_repo_path>" << std::endl;
-  std::cout << std::endl;
-  std::cout << "Autogenerate ChiMod libexec and methods files" << std::endl;
-  std::cout << std::endl;
-  std::cout << "Examples:" << std::endl;
-  std::cout << "  " << program_name << " /path/to/chimods" << std::endl;
-  std::cout << "  " << program_name << " ." << std::endl;
+  HIPRINT("Usage: {} <chimod_repo_path>", program_name);
+  HIPRINT("");
+  HIPRINT("Autogenerate ChiMod libexec and methods files");
+  HIPRINT("");
+  HIPRINT("Examples:");
+  HIPRINT("  {} /path/to/chimods", program_name);
+  HIPRINT("  {} .", program_name);
 }
 
 int main(int argc, char* argv[]) {
@@ -641,7 +643,7 @@ int main(int argc, char* argv[]) {
     generator.RefreshRepo();
     return 0;
   } catch (const std::exception& e) {
-    std::cerr << "Error: " << e.what() << std::endl;
+    HLOG(kError, "{}", e.what());
     return 1;
   }
 }

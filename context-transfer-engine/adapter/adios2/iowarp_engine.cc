@@ -39,6 +39,8 @@
 #include <stdexcept>
 #include <string>
 
+#include <hermes_shm/util/logging.h>
+
 namespace coeus {
 
 /**
@@ -56,28 +58,23 @@ IowarpEngine::IowarpEngine(adios2::core::IO &io, const std::string &name,
       rank_(m_Comm.Rank()),
       open_(false),
       total_io_time_ms_(0.0) {
-  std::cerr << "[IowarpEngine] DEBUG: Constructor entered, rank=" << rank_
-            << ", name=" << name << std::endl;
-  std::cerr.flush();
+  HLOG(kDebug, "[IowarpEngine] Constructor entered, rank={}, name={}", rank_, name);
 
   // Initialize CTE client - assumes Chimaera runtime is already running
-  std::cerr << "[IowarpEngine] DEBUG: About to call WRP_CTE_CLIENT_INIT" << std::endl;
-  std::cerr.flush();
+  HLOG(kDebug, "[IowarpEngine] About to call WRP_CTE_CLIENT_INIT");
   if (!wrp_cte::core::WRP_CTE_CLIENT_INIT("", chi::PoolQuery::Local())) {
     throw std::runtime_error(
         "IowarpEngine: WRP_CTE_CLIENT_INIT failed - is Chimaera runtime running?");
   }
-  std::cerr << "[IowarpEngine] DEBUG: WRP_CTE_CLIENT_INIT completed" << std::endl;
-  std::cerr.flush();
+  HLOG(kDebug, "[IowarpEngine] WRP_CTE_CLIENT_INIT completed");
 
   // Start wall clock timer
   wall_clock_start_ = std::chrono::high_resolution_clock::now();
 
-  std::cerr << "[IowarpEngine] DEBUG: Constructor completed, starting timing measurement" << std::endl;
-  std::cerr.flush();
+  HLOG(kDebug, "[IowarpEngine] Constructor completed, starting timing measurement");
 
   if (rank_ == 0) {
-    std::cerr << "[IowarpEngine] Starting timing measurement" << std::endl;
+    HLOG(kInfo, "[IowarpEngine] Starting timing measurement");
   }
 }
 
@@ -96,15 +93,17 @@ IowarpEngine::~IowarpEngine() {
   double compute_time_ms = total_wall_time_ms - total_io_time_ms_;
 
   if (rank_ == 0) {
-    std::cerr << "\n========================================" << std::endl;
-    std::cerr << "[IowarpEngine] Timing Summary" << std::endl;
-    std::cerr << "========================================" << std::endl;
-    std::cerr << "Total wall time:  " << total_wall_time_ms << " ms" << std::endl;
-    std::cerr << "Total I/O time:   " << total_io_time_ms_ << " ms" << std::endl;
-    std::cerr << "Compute time:     " << compute_time_ms << " ms" << std::endl;
-    std::cerr << "I/O percentage:   " << (total_io_time_ms_ / total_wall_time_ms * 100.0) << "%" << std::endl;
-    std::cerr << "Compute percentage: " << (compute_time_ms / total_wall_time_ms * 100.0) << "%" << std::endl;
-    std::cerr << "========================================\n" << std::endl;
+    HLOG(kInfo, "");
+    HLOG(kInfo, "========================================");
+    HLOG(kInfo, "[IowarpEngine] Timing Summary");
+    HLOG(kInfo, "========================================");
+    HLOG(kInfo, "Total wall time:  {} ms", total_wall_time_ms);
+    HLOG(kInfo, "Total I/O time:   {} ms", total_io_time_ms_);
+    HLOG(kInfo, "Compute time:     {} ms", compute_time_ms);
+    HLOG(kInfo, "I/O percentage:   {}%", (total_io_time_ms_ / total_wall_time_ms * 100.0));
+    HLOG(kInfo, "Compute percentage: {}%", (compute_time_ms / total_wall_time_ms * 100.0));
+    HLOG(kInfo, "========================================");
+    HLOG(kInfo, "");
   }
 }
 
@@ -112,8 +111,7 @@ IowarpEngine::~IowarpEngine() {
  * Initialize the engine
  */
 void IowarpEngine::Init_() {
-  std::cerr << "[IowarpEngine] DEBUG: Init_() entered, open_=" << open_ << std::endl;
-  std::cerr.flush();
+  HLOG(kDebug, "[IowarpEngine] Init_() entered, open_={}", open_);
 
   if (open_) {
     throw std::runtime_error("IowarpEngine::Init_: Engine already initialized");
@@ -122,22 +120,18 @@ void IowarpEngine::Init_() {
   // Create or get tag for this ADIOS file/session
   // Use the engine name as the tag name
   try {
-    std::cerr << "[IowarpEngine] DEBUG: About to create Tag with name=" << m_Name << std::endl;
-    std::cerr.flush();
+    HLOG(kDebug, "[IowarpEngine] About to create Tag with name={}", m_Name);
     current_tag_ = std::make_unique<wrp_cte::core::Tag>(m_Name);
-    std::cerr << "[IowarpEngine] DEBUG: Tag created successfully" << std::endl;
-    std::cerr.flush();
+    HLOG(kDebug, "[IowarpEngine] Tag created successfully");
     open_ = true;
   } catch (const std::exception &e) {
-    std::cerr << "[IowarpEngine] DEBUG: Tag creation failed: " << e.what() << std::endl;
-    std::cerr.flush();
+    HLOG(kDebug, "[IowarpEngine] Tag creation failed: {}", e.what());
     throw std::runtime_error(
         std::string("IowarpEngine::Init_: Failed to create/get tag: ") +
         e.what());
   }
 
-  std::cerr << "[IowarpEngine] DEBUG: Init_() completed" << std::endl;
-  std::cerr.flush();
+  HLOG(kDebug, "[IowarpEngine] Init_() completed");
 }
 
 /**
@@ -148,25 +142,21 @@ void IowarpEngine::Init_() {
  */
 adios2::StepStatus IowarpEngine::BeginStep(adios2::StepMode mode,
                                            const float timeoutSeconds) {
-  std::cerr << "[IowarpEngine] DEBUG: BeginStep() entered, open_=" << open_ << std::endl;
-  std::cerr.flush();
+  HLOG(kDebug, "[IowarpEngine] BeginStep() entered, open_={}", open_);
 
   (void)mode;            // Suppress unused parameter warning
   (void)timeoutSeconds;  // Suppress unused parameter warning
 
   // Lazy initialization if not already initialized
   if (!open_) {
-    std::cerr << "[IowarpEngine] DEBUG: BeginStep() calling Init_()" << std::endl;
-    std::cerr.flush();
+    HLOG(kDebug, "[IowarpEngine] BeginStep() calling Init_()");
     Init_();
-    std::cerr << "[IowarpEngine] DEBUG: BeginStep() Init_() returned" << std::endl;
-    std::cerr.flush();
+    HLOG(kDebug, "[IowarpEngine] BeginStep() Init_() returned");
   }
 
   // Increment step counter
   IncrementCurrentStep();
-  std::cerr << "[IowarpEngine] DEBUG: BeginStep() completed, step=" << current_step_ << std::endl;
-  std::cerr.flush();
+  HLOG(kDebug, "[IowarpEngine] BeginStep() completed, step={}", current_step_);
 
   return adios2::StepStatus::OK;
 }
@@ -206,9 +196,8 @@ void IowarpEngine::EndStep() {
 
   // Log per-step I/O time
   if (rank_ == 0) {
-    std::cerr << "[IowarpEngine] Step " << current_step_
-              << " I/O time: " << io_time_ms << " ms"
-              << " (Total I/O: " << total_io_time_ms_ << " ms)" << std::endl;
+    HLOG(kInfo, "[IowarpEngine] Step {} I/O time: {} ms (Total I/O: {} ms)",
+         current_step_, io_time_ms, total_io_time_ms_);
   }
 }
 

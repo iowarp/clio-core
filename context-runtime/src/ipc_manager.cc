@@ -51,6 +51,7 @@
 #include <zmq.h>
 #include <hermes_shm/lightbeam/transport_factory_impl.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
@@ -650,7 +651,7 @@ bool IpcManager::StartLocalServer() {
         hshm::lbm::TransportMode::kServer, protocol, port);
 
     if (local_transport_ != nullptr) {
-      HLOG(kInfo, "Successfully started local server at {}:{}", addr, port);
+      HLOG(kSuccess, "Successfully started local server at {}:{}", addr, port);
       return true;
     }
 
@@ -798,6 +799,89 @@ const std::vector<Host> &IpcManager::GetAllHosts() const {
 }
 
 size_t IpcManager::GetNumHosts() const { return hostfile_map_.size(); }
+
+bool IpcManager::IsAlive(u64 node_id) const {
+  auto it = hostfile_map_.find(node_id);
+  if (it == hostfile_map_.end()) return false;
+  return it->second.state == NodeState::kAlive;
+}
+
+void IpcManager::SetDead(u64 node_id) {
+  auto it = hostfile_map_.find(node_id);
+  if (it == hostfile_map_.end()) return;
+  if (it->second.state == NodeState::kDead) return;  // Already dead
+
+  SetNodeState(node_id, NodeState::kDead);
+
+  // Record dead-node entry for retry tracking
+  DeadNodeEntry entry;
+  entry.node_id = node_id;
+  entry.detected_at = std::chrono::steady_clock::now();
+  dead_nodes_.push_back(entry);
+
+  // Remove cached client connections to the dead node
+  {
+    std::lock_guard<std::mutex> lock(client_pool_mutex_);
+    auto *config_manager = CHI_CONFIG_MANAGER;
+    int port = static_cast<int>(config_manager->GetPort());
+    std::string key = it->second.ip_address + ":" + std::to_string(port);
+    client_pool_.erase(key);
+  }
+
+  HLOG(kWarning, "IpcManager: Node {} ({}) marked as DEAD",
+       node_id, it->second.ip_address);
+}
+
+void IpcManager::SetAlive(u64 node_id) {
+  auto it = hostfile_map_.find(node_id);
+  if (it == hostfile_map_.end()) return;
+  if (it->second.state == NodeState::kAlive) return;  // Already alive
+
+  SetNodeState(node_id, NodeState::kAlive);
+
+  // Remove from dead_nodes_ list
+  dead_nodes_.erase(
+      std::remove_if(dead_nodes_.begin(), dead_nodes_.end(),
+                     [node_id](const DeadNodeEntry &e) {
+                       return e.node_id == node_id;
+                     }),
+      dead_nodes_.end());
+
+  HLOG(kInfo, "IpcManager: Node {} ({}) marked as ALIVE",
+       node_id, it->second.ip_address);
+}
+
+NodeState IpcManager::GetNodeState(u64 node_id) const {
+  auto it = hostfile_map_.find(node_id);
+  if (it == hostfile_map_.end()) return NodeState::kDead;
+  return it->second.state;
+}
+
+void IpcManager::SetNodeState(u64 node_id, NodeState new_state) {
+  auto it = hostfile_map_.find(node_id);
+  if (it == hostfile_map_.end()) return;
+  it->second.state = new_state;
+  it->second.state_changed_at = std::chrono::steady_clock::now();
+  hosts_cache_valid_ = false;
+}
+
+void IpcManager::SetSelfFenced(bool fenced) {
+  self_fenced_ = fenced;
+}
+
+u64 IpcManager::GetLeaderNodeId() const {
+  u64 leader = std::numeric_limits<u64>::max();
+  for (const auto& [id, host] : hostfile_map_) {
+    if (host.state == NodeState::kAlive && host.node_id < leader) {
+      leader = host.node_id;
+    }
+  }
+  return (leader == std::numeric_limits<u64>::max()) ? 0 : leader;
+}
+
+bool IpcManager::IsLeader() const {
+  return GetNodeId() == GetLeaderNodeId();
+}
 
 u64 IpcManager::AddNode(const std::string& ip_address, u32 port) {
   (void)port;  // Port stored elsewhere (ConfigManager) for now

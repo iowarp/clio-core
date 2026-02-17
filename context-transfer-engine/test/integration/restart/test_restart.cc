@@ -49,6 +49,7 @@
 #include <iostream>
 #include <string>
 
+#include <hermes_shm/util/logging.h>
 #include <chimaera/chimaera.h>
 #include <chimaera/admin/admin_client.h>
 #include <wrp_cte/core/core_client.h>
@@ -64,7 +65,7 @@ static const char* kTagName = "restart_test_tag";
 int PutBlobs() {
   // Connect to external runtime as client
   if (!chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, false)) {
-    std::cerr << "Phase 1: Failed to init client\n";
+    HLOG(kError, "Phase 1: Failed to init client");
     return 1;
   }
 
@@ -75,7 +76,7 @@ int PutBlobs() {
   auto tag_task = cte_client.AsyncGetOrCreateTag(kTagName);
   tag_task.Wait();
   wrp_cte::core::TagId tag_id = tag_task->tag_id_;
-  std::cout << "Phase 1: Created tag '" << kTagName << "'\n";
+  HLOG(kInfo, "Phase 1: Created tag '{}'", kTagName);
 
   // Put kNumBlobs blobs with distinct data patterns
   for (int i = 0; i < kNumBlobs; ++i) {
@@ -84,7 +85,7 @@ int PutBlobs() {
     // Allocate SHM buffer
     hipc::FullPtr<char> buf = CHI_IPC->AllocateBuffer(kBlobSize);
     if (buf.IsNull()) {
-      std::cerr << "Phase 1: Failed to allocate SHM buffer for blob " << i << "\n";
+      HLOG(kError, "Phase 1: Failed to allocate SHM buffer for blob {}", i);
       return 1;
     }
 
@@ -101,27 +102,26 @@ int PutBlobs() {
     put_task.Wait();
 
     if (put_task->GetReturnCode() != 0) {
-      std::cerr << "Phase 1: PutBlob failed for blob " << i
-                << " rc=" << put_task->GetReturnCode() << "\n";
+      HLOG(kError, "Phase 1: PutBlob failed for blob {} rc={}", i,
+           put_task->GetReturnCode());
       return 1;
     }
-    std::cout << "Phase 1: Put blob '" << blob_name
-              << "' pattern='" << pattern << "'\n";
+    HLOG(kInfo, "Phase 1: Put blob '{}' pattern='{}'", blob_name, pattern);
   }
 
   // Flush metadata (one-shot)
-  std::cout << "Phase 1: Flushing metadata...\n";
+  HLOG(kInfo, "Phase 1: Flushing metadata...");
   auto flush_meta = cte_client.AsyncFlushMetadata(chi::PoolQuery::Local(), 0);
   flush_meta.Wait();
-  std::cout << "Phase 1: Metadata flush complete\n";
+  HLOG(kInfo, "Phase 1: Metadata flush complete");
 
   // Flush data (one-shot, persistence level 0 for RAM target)
-  std::cout << "Phase 1: Flushing data...\n";
+  HLOG(kInfo, "Phase 1: Flushing data...");
   auto flush_data = cte_client.AsyncFlushData(chi::PoolQuery::Local(), 0, 0);
   flush_data.Wait();
-  std::cout << "Phase 1: Data flush complete\n";
+  HLOG(kInfo, "Phase 1: Data flush complete");
 
-  std::cout << "Phase 1: SUCCESS - " << kNumBlobs << " blobs stored and flushed\n";
+  HLOG(kSuccess, "Phase 1: SUCCESS - {} blobs stored and flushed", kNumBlobs);
   return 0;
 }
 
@@ -131,29 +131,29 @@ int PutBlobs() {
 int VerifyBlobs() {
   // Connect to external runtime as client
   if (!chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, false)) {
-    std::cerr << "Phase 2: Failed to init client\n";
+    HLOG(kError, "Phase 2: Failed to init client");
     return 1;
   }
 
   // Call RestartContainers via admin client
-  std::cout << "Phase 2: Calling RestartContainers...\n";
+  HLOG(kInfo, "Phase 2: Calling RestartContainers...");
   chimaera::admin::Client admin_client(chi::kAdminPoolId);
   auto restart_task = admin_client.AsyncRestartContainers(chi::PoolQuery::Local());
   restart_task.Wait();
 
   chi::u32 rc = restart_task->GetReturnCode();
   chi::u32 restarted = restart_task->containers_restarted_;
-  std::cout << "Phase 2: RestartContainers complete, rc=" << rc
-            << ", containers_restarted=" << restarted << "\n";
+  HLOG(kInfo, "Phase 2: RestartContainers complete, rc={}, containers_restarted={}",
+       rc, restarted);
 
   // Verify RestartContainers succeeded
   if (rc != 0) {
-    std::cerr << "Phase 2: FAILED - RestartContainers returned error rc=" << rc << "\n";
+    HLOG(kError, "Phase 2: FAILED - RestartContainers returned error rc={}", rc);
     return 1;
   }
   if (restarted == 0) {
-    std::cerr << "Phase 2: FAILED - No containers were restarted "
-              << "(restart config missing or unreadable)\n";
+    HLOG(kError, "Phase 2: FAILED - No containers were restarted "
+                  "(restart config missing or unreadable)");
     return 1;
   }
 
@@ -164,17 +164,17 @@ int VerifyBlobs() {
   auto tag_task = cte_client.AsyncGetOrCreateTag(kTagName);
   tag_task.Wait();
   if (tag_task->GetReturnCode() != 0) {
-    std::cerr << "Phase 2: FAILED - Could not create tag on restarted pool, rc="
-              << tag_task->GetReturnCode() << "\n";
+    HLOG(kError, "Phase 2: FAILED - Could not create tag on restarted pool, rc={}",
+         tag_task->GetReturnCode());
     return 1;
   }
   wrp_cte::core::TagId tag_id = tag_task->tag_id_;
-  std::cout << "Phase 2: Tag '" << kTagName << "' accessible on restarted pool\n";
+  HLOG(kInfo, "Phase 2: Tag '{}' accessible on restarted pool", kTagName);
 
   // Verify targets were re-registered by listing them
   auto targets_task = cte_client.AsyncListTargets(chi::PoolQuery::Local());
   targets_task.Wait();
-  std::cout << "Phase 2: ListTargets rc=" << targets_task->GetReturnCode() << "\n";
+  HLOG(kInfo, "Phase 2: ListTargets rc={}", targets_task->GetReturnCode());
 
   // Attempt blob recovery (informational - data persistence is WIP)
   int recovered = 0;
@@ -211,26 +211,26 @@ int VerifyBlobs() {
 
     if (data_ok) {
       ++recovered;
-      std::cout << "Phase 2: Blob '" << blob_name << "' data recovered OK\n";
+      HLOG(kInfo, "Phase 2: Blob '{}' data recovered OK", blob_name);
     } else {
       ++failed;
     }
   }
 
-  std::cout << "Phase 2: Blob recovery: " << recovered << "/" << kNumBlobs
-            << " recovered, " << failed << "/" << kNumBlobs << " pending implementation\n";
+  HLOG(kInfo, "Phase 2: Blob recovery: {}/{} recovered, {}/{} pending implementation",
+       recovered, kNumBlobs, failed, kNumBlobs);
 
   // The test passes if RestartContainers worked and the pool is functional.
   // Full blob data recovery requires completing FlushData and metadata
   // recovery implementation.
-  std::cout << "Phase 2: SUCCESS - Pool restart verified ("
-            << restarted << " containers restarted)\n";
+  HLOG(kSuccess, "Phase 2: SUCCESS - Pool restart verified ({} containers restarted)",
+       restarted);
   return 0;
 }
 
 int main(int argc, char* argv[]) {
   if (argc != 2) {
-    std::cerr << "Usage: " << argv[0] << " [--put-blobs|--verify-blobs]\n";
+    HLOG(kError, "Usage: {} [--put-blobs|--verify-blobs]", argv[0]);
     return 1;
   }
 
@@ -240,8 +240,8 @@ int main(int argc, char* argv[]) {
   } else if (mode == "--verify-blobs") {
     return VerifyBlobs();
   } else {
-    std::cerr << "Unknown mode: " << mode << "\n";
-    std::cerr << "Usage: " << argv[0] << " [--put-blobs|--verify-blobs]\n";
+    HLOG(kError, "Unknown mode: {}", mode);
+    HLOG(kInfo, "Usage: {} [--put-blobs|--verify-blobs]", argv[0]);
     return 1;
   }
 }

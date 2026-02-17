@@ -47,6 +47,7 @@
 #include <iostream>
 #include <thread>
 #include <vector>
+#include <hermes_shm/util/logging.h>
 
 #include "chimaera/MOD_NAME/MOD_NAME_client.h"
 #include "chimaera/admin/admin_client.h"
@@ -108,8 +109,7 @@ bool ParseArgs(int argc, char **argv, BenchmarkConfig &config) {
 
     if (arg == "--test-case" && i + 1 < argc) {
       if (!ParseTestCase(argv[++i], config.test_case)) {
-        std::cerr << "ERROR: Invalid test case. Valid options: bdev_io, "
-                     "bdev_allocation, bdev_task_alloc, latency\n";
+        HLOG(kError, "ERROR: Invalid test case. Valid options: bdev_io, bdev_allocation, bdev_task_alloc, latency");
         return false;
       }
     } else if (arg == "--threads" && i + 1 < argc) {
@@ -127,35 +127,26 @@ bool ParseArgs(int argc, char **argv, BenchmarkConfig &config) {
     } else if (arg == "--verbose" || arg == "-v") {
       config.verbose = true;
     } else if (arg == "--help" || arg == "-h") {
-      std::cout
-          << "Usage: " << argv[0] << " [options]\n"
-          << "Options:\n"
-          << "  --test-case <case>      Test case: bdev_io, bdev_allocation, "
-             "bdev_task_alloc, latency (default: bdev_io)\n"
-          << "  --threads <N>           Number of client threads (default: 4)\n"
-          << "  --duration <seconds>    Duration to run benchmark in seconds "
-             "(default: 10.0)\n"
-          << "  --max-file-size <size>  Maximum file size with suffix: k, m, g "
-             "(default: 1g)\n"
-          << "  --io-size <size>        I/O size per operation with suffix: k, "
-             "m, g (default: 4k)\n"
-          << "  --lane-policy <P>       Lane policy: map_by_pid_tid, "
-             "round_robin, random (default: from config)\n"
-          << "  --output-dir <dir>      Output directory for benchmark files "
-             "(default: /tmp/wrp_benchmark)\n"
-          << "  --verbose, -v           Verbose output\n"
-          << "  --help, -h              Show this help\n\n"
-          << "Test Cases:\n"
-          << "  bdev_io          - BDev I/O throughput (Allocate -> Write -> "
-             "Free)\n"
-          << "  bdev_allocation  - BDev allocation throughput (Allocate -> "
-             "Free)\n"
-          << "  bdev_task_alloc  - BDev task allocation (NewTask -> DelTask)\n"
-          << "  latency          - Round-trip task latency using MOD_NAME "
-             "Custom\n";
+      HIPRINT("Usage: {} [options]", argv[0]);
+      HIPRINT("Options:");
+      HIPRINT("  --test-case <case>      Test case: bdev_io, bdev_allocation, bdev_task_alloc, latency (default: bdev_io)");
+      HIPRINT("  --threads <N>           Number of client threads (default: 4)");
+      HIPRINT("  --duration <seconds>    Duration to run benchmark in seconds (default: 10.0)");
+      HIPRINT("  --max-file-size <size>  Maximum file size with suffix: k, m, g (default: 1g)");
+      HIPRINT("  --io-size <size>        I/O size per operation with suffix: k, m, g (default: 4k)");
+      HIPRINT("  --lane-policy <P>       Lane policy: map_by_pid_tid, round_robin, random (default: from config)");
+      HIPRINT("  --output-dir <dir>      Output directory for benchmark files (default: /tmp/wrp_benchmark)");
+      HIPRINT("  --verbose, -v           Verbose output");
+      HIPRINT("  --help, -h              Show this help");
+      HIPRINT("");
+      HIPRINT("Test Cases:");
+      HIPRINT("  bdev_io          - BDev I/O throughput (Allocate -> Write -> Free)");
+      HIPRINT("  bdev_allocation  - BDev allocation throughput (Allocate -> Free)");
+      HIPRINT("  bdev_task_alloc  - BDev task allocation (NewTask -> DelTask)");
+      HIPRINT("  latency          - Round-trip task latency using MOD_NAME Custom");
       return false;
     } else {
-      std::cerr << "Unknown argument: " << arg << "\n";
+      HLOG(kError, "Unknown argument: {}", arg);
       return false;
     }
   }
@@ -215,11 +206,8 @@ void AllocationWorkerThread(size_t thread_id, const BenchmarkConfig &config,
   if (config.verbose) {
     double thread_throughput = (local_ops * 1e9) / elapsed_time.count();
     double avg_latency_us = elapsed_time.count() / (local_ops * 1e3);
-    std::cout << "Thread " << thread_id << ": " << local_ops
-              << " alloc/free ops in " << std::fixed << std::setprecision(3)
-              << (elapsed_time.count() / 1e6) << " ms, " << std::setprecision(0)
-              << thread_throughput << " ops/sec, " << std::setprecision(3)
-              << avg_latency_us << " us/op\n";
+    HIPRINT("Thread {}: {} alloc/free ops in {} ms, {} ops/sec, {} us/op",
+            thread_id, local_ops, (elapsed_time.count() / 1e6), thread_throughput, avg_latency_us);
   }
 }
 
@@ -281,10 +269,8 @@ void TaskAllocationWorkerThread(size_t thread_id, const BenchmarkConfig &config,
   if (config.verbose) {
     double thread_throughput = (local_ops * 1e9) / elapsed_time.count();
     double avg_latency_us = elapsed_time.count() / (local_ops * 1e3);
-    std::cout << "Thread " << thread_id << ": " << local_ops << " task allocs, "
-              << std::setprecision(2) << (elapsed_time.count() / 1e6) << " ms, "
-              << std::setprecision(0) << thread_throughput << " ops/sec, "
-              << std::setprecision(3) << avg_latency_us << " us/op\n";
+    HIPRINT("Thread {}: {} task allocs, {} ms, {} ops/sec, {} us/op",
+            thread_id, local_ops, (elapsed_time.count() / 1e6), thread_throughput, avg_latency_us);
   }
 }
 
@@ -336,8 +322,7 @@ void IOWorkerThread(size_t thread_id, const BenchmarkConfig &config,
       write_task.Wait();
       chi::u64 ret = write_task->bytes_written_;
       if (ret != bytes_to_write) {
-        std::cerr << "ERROR: Thread " << thread_id
-                  << " failed to write data to block " << block_idx << "\n";
+        HLOG(kError, "ERROR: Thread {} failed to write data to block {}", thread_id, block_idx);
         stop_flag.store(true, std::memory_order_relaxed);
         return;
       }
@@ -372,11 +357,8 @@ void IOWorkerThread(size_t thread_id, const BenchmarkConfig &config,
     double thread_throughput = (local_ops * 1e9) / elapsed_time.count();
     double bandwidth_mbps =
         (local_bytes * 1e9) / (elapsed_time.count() * 1024 * 1024);
-    std::cout << "Thread " << thread_id << ": " << local_ops << " I/O ops in "
-              << std::fixed << std::setprecision(3)
-              << (elapsed_time.count() / 1e6) << " ms, " << std::setprecision(0)
-              << thread_throughput << " ops/sec, " << std::setprecision(2)
-              << bandwidth_mbps << " MB/s\n";
+    HIPRINT("Thread {}: {} I/O ops in {} ms, {} ops/sec, {} MB/s",
+            thread_id, local_ops, (elapsed_time.count() / 1e6), thread_throughput, bandwidth_mbps);
   }
 }
 
@@ -406,8 +388,7 @@ void LatencyWorkerThread(size_t thread_id, const BenchmarkConfig &config,
 
     // Verify result (should echo back input_data)
     if (result != 0) {
-      std::cerr << "ERROR: Thread " << thread_id
-                << " received unexpected result: " << result << "\n";
+      HLOG(kError, "ERROR: Thread {} received unexpected result: {}", thread_id, result);
       stop_flag.store(true, std::memory_order_relaxed);
       return;
     }
@@ -430,11 +411,8 @@ void LatencyWorkerThread(size_t thread_id, const BenchmarkConfig &config,
   if (config.verbose) {
     double thread_throughput = (local_ops * 1e9) / elapsed_time.count();
     double avg_latency_us = elapsed_time.count() / (local_ops * 1e3);
-    std::cout << "Thread " << thread_id << ": " << local_ops
-              << " Custom ops in " << std::fixed << std::setprecision(3)
-              << (elapsed_time.count() / 1e6) << " ms, " << std::setprecision(0)
-              << thread_throughput << " ops/sec, " << std::setprecision(3)
-              << avg_latency_us << " us/op\n";
+    HIPRINT("Thread {}: {} Custom ops in {} ms, {} ops/sec, {} us/op",
+            thread_id, local_ops, (elapsed_time.count() / 1e6), thread_throughput, avg_latency_us);
   }
 }
 
@@ -447,39 +425,38 @@ int main(int argc, char **argv) {
   }
 
   // Print benchmark header
-  std::cout << "=== Chimaera Task Throughput Benchmark ===\n";
+  HIPRINT("=== Chimaera Task Throughput Benchmark ===");
   switch (config.test_case) {
   case TestCase::kBDevIO:
-    std::cout << "Test case: BDev I/O (Allocate -> Write -> Free)\n";
-    std::cout << "I/O size per operation: " << config.io_size << " bytes\n";
+    HIPRINT("Test case: BDev I/O (Allocate -> Write -> Free)");
+    HIPRINT("I/O size per operation: {} bytes", config.io_size);
     break;
   case TestCase::kBDevAllocation:
-    std::cout << "Test case: BDev Allocation (Allocate -> Free)\n";
-    std::cout << "Allocation size per operation: " << config.io_size
-              << " bytes\n";
+    HIPRINT("Test case: BDev Allocation (Allocate -> Free)");
+    HIPRINT("Allocation size per operation: {} bytes", config.io_size);
     break;
   case TestCase::kBDevTaskAlloc:
-    std::cout << "Test case: BDev Task Allocation (NewTask -> DelTask)\n";
-    std::cout << "Task size: AllocateBlocksTask + FreeBlocksTask\n";
+    HIPRINT("Test case: BDev Task Allocation (NewTask -> DelTask)");
+    HIPRINT("Task size: AllocateBlocksTask + FreeBlocksTask");
     break;
   case TestCase::kLatency:
-    std::cout << "Test case: Round-trip Latency (MOD_NAME Custom)\n";
+    HIPRINT("Test case: Round-trip Latency (MOD_NAME Custom)");
     break;
   }
-  std::cout << "Threads: " << config.num_threads << "\n";
-  std::cout << "Duration: " << config.duration_seconds << " seconds\n";
+  HIPRINT("Threads: {}", config.num_threads);
+  HIPRINT("Duration: {} seconds", config.duration_seconds);
   if (config.test_case != TestCase::kLatency) {
-    std::cout << "Max file size: " << config.max_file_size << " bytes\n";
+    HIPRINT("Max file size: {} bytes", config.max_file_size);
   }
 
   // Initialize Chimaera client
   if (!chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, false)) {
-    std::cerr << "ERROR: Failed to initialize Chimaera client\n";
+    HLOG(kError, "ERROR: Failed to initialize Chimaera client");
     return 1;
   }
 
   // Lane mapping always uses PID+TID hash
-  std::cout << "Lane policy: map_by_pid_tid (default)\n";
+  HIPRINT("Lane policy: map_by_pid_tid (default)");
 
   // Create pool based on test case
   chi::PoolId test_pool_id;
@@ -493,8 +470,8 @@ int main(int argc, char **argv) {
     mod_client.pool_id_ = create_task->new_pool_id_;
     mod_client.return_code_ = create_task->return_code_;
     if (create_task->GetReturnCode() != 0) {
-      std::cerr << "ERROR: Failed to create MOD_NAME container (return code: "
-                << create_task->GetReturnCode() << ")\n";
+      HLOG(kError, "ERROR: Failed to create MOD_NAME container (return code: {})",
+           create_task->GetReturnCode());
       return 1;
     }
   } else {
@@ -521,12 +498,12 @@ int main(int argc, char **argv) {
       // Use RAM-based BDev
       bdev_type = chimaera::bdev::BdevType::kRam;
       pool_name = "benchmark_ram_bdev";
-      std::cout << "Using RAM-based BDev\n";
+      HIPRINT("Using RAM-based BDev");
     } else {
       // Use file-based BDev
       bdev_type = chimaera::bdev::BdevType::kFile;
       pool_name = config.output_dir + "/benchmark_bdev.dat";
-      std::cout << "Using file-based BDev: " << pool_name << "\n";
+      HIPRINT("Using file-based BDev: {}", pool_name);
     }
 
     auto create_task = bdev_client.AsyncCreate(chi::PoolQuery::Broadcast(), pool_name,
@@ -538,13 +515,13 @@ int main(int argc, char **argv) {
     bdev_client.return_code_ = create_task->return_code_;
 
     if (create_task->GetReturnCode() != 0) {
-      std::cerr << "ERROR: Failed to create BDev container (return code: "
-                << create_task->GetReturnCode() << ")\n";
+      HLOG(kError, "ERROR: Failed to create BDev container (return code: {})",
+           create_task->GetReturnCode());
       return 1;
     }
   }
 
-  std::cout << "\nStarting benchmark...\n";
+  HIPRINT("\nStarting benchmark...");
 
   // Atomic counters and control flag
   std::atomic<bool> stop_flag{false};
@@ -631,52 +608,39 @@ int main(int argc, char **argv) {
   avg_thread_time /= config.num_threads;
 
   // Print results
-  std::cout << "\n=== Results ===\n";
-  std::cout << "Total operations: " << final_ops << "\n";
-  std::cout << std::fixed << std::setprecision(3);
-  std::cout << "Total time: " << total_seconds << " seconds\n";
-  std::cout << "Avg thread time: " << (avg_thread_time.count() / 1e9)
-            << " seconds\n";
+  HIPRINT("\n=== Results ===");
+  HIPRINT("Total operations: {}", final_ops);
+  HIPRINT("Total time: {} seconds", total_seconds);
+  HIPRINT("Avg thread time: {} seconds", (avg_thread_time.count() / 1e9));
 
   switch (config.test_case) {
   case TestCase::kBDevAllocation:
     // Allocation-only mode results
-    std::cout << std::setprecision(0);
-    std::cout << "Throughput: " << throughput << " alloc/free ops/sec\n";
-    std::cout << std::setprecision(3);
-    std::cout << "Avg latency: " << avg_latency_us << " us/op\n";
+    HIPRINT("Throughput: {} alloc/free ops/sec", throughput);
+    HIPRINT("Avg latency: {} us/op", avg_latency_us);
     break;
 
   case TestCase::kBDevTaskAlloc:
     // Task allocation mode results
-    std::cout << std::setprecision(0);
-    std::cout << "Throughput: " << throughput << " task allocs/sec\n";
-    std::cout << std::setprecision(3);
-    std::cout << "Avg latency: " << avg_latency_us << " us/task\n";
+    HIPRINT("Throughput: {} task allocs/sec", throughput);
+    HIPRINT("Avg latency: {} us/task", avg_latency_us);
     break;
 
   case TestCase::kBDevIO:
     // I/O mode results
     {
       double bandwidth_mbps = (final_bytes / total_seconds) / (1024 * 1024);
-      std::cout << "Total bytes written: " << final_bytes << " ("
-                << std::setprecision(2) << (final_bytes / (1024.0 * 1024.0))
-                << " MB)\n";
-      std::cout << std::setprecision(0);
-      std::cout << "IOPS: " << throughput << " ops/sec\n";
-      std::cout << std::setprecision(2);
-      std::cout << "Bandwidth: " << bandwidth_mbps << " MB/s\n";
-      std::cout << std::setprecision(3);
-      std::cout << "Avg latency: " << avg_latency_us << " us/op\n";
+      HIPRINT("Total bytes written: {} ({} MB)", final_bytes, (final_bytes / (1024.0 * 1024.0)));
+      HIPRINT("IOPS: {} ops/sec", throughput);
+      HIPRINT("Bandwidth: {} MB/s", bandwidth_mbps);
+      HIPRINT("Avg latency: {} us/op", avg_latency_us);
     }
     break;
 
   case TestCase::kLatency:
     // Latency mode results
-    std::cout << std::setprecision(0);
-    std::cout << "Throughput: " << throughput << " Custom ops/sec\n";
-    std::cout << std::setprecision(3);
-    std::cout << "Avg round-trip latency: " << avg_latency_us << " us/op\n";
+    HIPRINT("Throughput: {} Custom ops/sec", throughput);
+    HIPRINT("Avg round-trip latency: {} us/op", avg_latency_us);
     break;
   }
 

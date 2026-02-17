@@ -57,6 +57,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <hermes_shm/util/logging.h>
 
 #include "chimaera/chimaera.h"
 #include "chimaera/ipc_manager.h"
@@ -118,8 +119,7 @@ bool RunBdevIoTest(int rank, const std::string& mode_name, size_t io_size) {
       chimaera::bdev::BdevType::kRam, kRamSize);
   create_task.Wait();
   if (create_task->return_code_ != 0) {
-    std::cerr << "[Rank " << rank << "] Create pool failed: "
-              << create_task->return_code_ << std::endl;
+    HLOG(kError, "[Rank {}] Create pool failed: {}", rank, create_task->return_code_);
     return false;
   }
   client.pool_id_ = create_task->new_pool_id_;
@@ -129,7 +129,7 @@ bool RunBdevIoTest(int rank, const std::string& mode_name, size_t io_size) {
       chi::PoolQuery::Local(), kBlockSize);
   alloc_task.Wait();
   if (alloc_task->return_code_ != 0 || alloc_task->blocks_.size() == 0) {
-    std::cerr << "[Rank " << rank << "] AllocateBlocks failed" << std::endl;
+    HLOG(kError, "[Rank {}] AllocateBlocks failed", rank);
     return false;
   }
   chimaera::bdev::Block block = alloc_task->blocks_[0];
@@ -143,7 +143,7 @@ bool RunBdevIoTest(int rank, const std::string& mode_name, size_t io_size) {
   // Write
   auto write_buffer = CHI_IPC->AllocateBuffer(write_data.size());
   if (write_buffer.IsNull()) {
-    std::cerr << "[Rank " << rank << "] AllocateBuffer for write failed" << std::endl;
+    HLOG(kError, "[Rank {}] AllocateBuffer for write failed", rank);
     return false;
   }
   memcpy(write_buffer.ptr_, write_data.data(), write_data.size());
@@ -153,8 +153,7 @@ bool RunBdevIoTest(int rank, const std::string& mode_name, size_t io_size) {
       write_data.size());
   write_task.Wait();
   if (write_task->return_code_ != 0) {
-    std::cerr << "[Rank " << rank << "] Write failed: "
-              << write_task->return_code_ << std::endl;
+    HLOG(kError, "[Rank {}] Write failed: {}", rank, write_task->return_code_);
     CHI_IPC->FreeBuffer(write_buffer);
     return false;
   }
@@ -163,7 +162,7 @@ bool RunBdevIoTest(int rank, const std::string& mode_name, size_t io_size) {
   // Read
   auto read_buffer = CHI_IPC->AllocateBuffer(io_size);
   if (read_buffer.IsNull()) {
-    std::cerr << "[Rank " << rank << "] AllocateBuffer for read failed" << std::endl;
+    HLOG(kError, "[Rank {}] AllocateBuffer for read failed", rank);
     CHI_IPC->FreeBuffer(write_buffer);
     return false;
   }
@@ -173,8 +172,7 @@ bool RunBdevIoTest(int rank, const std::string& mode_name, size_t io_size) {
       io_size);
   read_task.Wait();
   if (read_task->return_code_ != 0) {
-    std::cerr << "[Rank " << rank << "] Read failed: "
-              << read_task->return_code_ << std::endl;
+    HLOG(kError, "[Rank {}] Read failed: {}", rank, read_task->return_code_);
     CHI_IPC->FreeBuffer(write_buffer);
     CHI_IPC->FreeBuffer(read_buffer);
     return false;
@@ -184,7 +182,7 @@ bool RunBdevIoTest(int rank, const std::string& mode_name, size_t io_size) {
   hipc::FullPtr<char> data_ptr =
       CHI_IPC->ToFullPtr(read_task->data_.template Cast<char>());
   if (data_ptr.IsNull()) {
-    std::cerr << "[Rank " << rank << "] Read data pointer is null" << std::endl;
+    HLOG(kError, "[Rank {}] Read data pointer is null", rank);
     CHI_IPC->FreeBuffer(write_buffer);
     CHI_IPC->FreeBuffer(read_buffer);
     return false;
@@ -197,9 +195,8 @@ bool RunBdevIoTest(int rank, const std::string& mode_name, size_t io_size) {
     if (static_cast<hshm::u8>(data_ptr.ptr_[i]) != write_data[i]) {
       mismatches++;
       if (mismatches <= 3) {
-        std::cerr << "[Rank " << rank << "] Mismatch at byte " << i
-                  << ": got " << (int)(hshm::u8)data_ptr.ptr_[i]
-                  << " expected " << (int)write_data[i] << std::endl;
+        HLOG(kError, "[Rank {}] Mismatch at byte {}: got {} expected {}", rank, i,
+             (int)(hshm::u8)data_ptr.ptr_[i], (int)write_data[i]);
       }
     }
   }
@@ -208,13 +205,11 @@ bool RunBdevIoTest(int rank, const std::string& mode_name, size_t io_size) {
   CHI_IPC->FreeBuffer(read_buffer);
 
   if (mismatches > 0) {
-    std::cerr << "[Rank " << rank << "] " << mismatches
-              << " mismatches in " << verify_size << " bytes" << std::endl;
+    HLOG(kError, "[Rank {}] {} mismatches in {} bytes", rank, mismatches, verify_size);
     return false;
   }
 
-  std::cout << "[Rank " << rank << "] " << mode_name << " I/O test passed ("
-            << io_size << " bytes)" << std::endl;
+  HLOG(kInfo, "[Rank {}] {} I/O test passed ({} bytes)", rank, mode_name, io_size);
   return true;
 }
 
@@ -227,7 +222,7 @@ int main(int argc, char* argv[]) {
 
   if (size < 2) {
     if (rank == 0) {
-      std::cerr << "Need at least 2 MPI ranks (got " << size << ")" << std::endl;
+      HLOG(kError, "Need at least 2 MPI ranks (got {})", size);
     }
     MPI_Finalize();
     return 1;
@@ -254,7 +249,7 @@ int main(int argc, char* argv[]) {
 
   if (rank == 0) {
     // --- Server rank ---
-    std::cout << "[Rank 0] Starting Chimaera server..." << std::endl;
+    HLOG(kInfo, "[Rank 0] Starting Chimaera server...");
 
     // Cleanup stale shared memory
     CleanupSharedMemory();
@@ -262,11 +257,11 @@ int main(int argc, char* argv[]) {
     setenv("CHIMAERA_WITH_RUNTIME", "1", 1);
     bool success = CHIMAERA_INIT(ChimaeraMode::kServer, true);
     if (!success) {
-      std::cerr << "[Rank 0] CHIMAERA_INIT(kServer) failed!" << std::endl;
+      HLOG(kError, "[Rank 0] CHIMAERA_INIT(kServer) failed!");
       MPI_Abort(MPI_COMM_WORLD, 1);
       return 1;
     }
-    std::cout << "[Rank 0] Server started." << std::endl;
+    HLOG(kInfo, "[Rank 0] Server started.");
 
     // Signal clients that server is ready
     MPI_Barrier(MPI_COMM_WORLD);
@@ -283,9 +278,9 @@ int main(int argc, char* argv[]) {
                0, MPI_COMM_WORLD);
 
     if (global_pass == 1) {
-      std::cout << "\n=== ALL MPI BDev TRANSPORT TESTS PASSED ===" << std::endl;
+      HLOG(kSuccess, "\n=== ALL MPI BDev TRANSPORT TESTS PASSED ===");
     } else {
-      std::cerr << "\n=== SOME MPI BDev TRANSPORT TESTS FAILED ===" << std::endl;
+      HLOG(kError, "\n=== SOME MPI BDev TRANSPORT TESTS FAILED ===");
     }
 
     // Cleanup
@@ -301,7 +296,7 @@ int main(int argc, char* argv[]) {
     // Wait for server to fully start
     bool server_ready = WaitForServer();
     if (!server_ready) {
-      std::cerr << "[Rank " << rank << "] Server not ready!" << std::endl;
+      HLOG(kError, "[Rank {}] Server not ready!", rank);
       MPI_Abort(MPI_COMM_WORLD, 1);
       return 1;
     }
@@ -310,16 +305,15 @@ int main(int argc, char* argv[]) {
     setenv("CHI_IPC_MODE", mode_name.c_str(), 1);
     setenv("CHIMAERA_WITH_RUNTIME", "0", 1);
 
-    std::cout << "[Rank " << rank << "] Connecting as " << mode_name
-              << " client..." << std::endl;
+    HLOG(kInfo, "[Rank {}] Connecting as {} client...", rank, mode_name);
 
     bool success = CHIMAERA_INIT(ChimaeraMode::kClient, false);
     if (!success) {
-      std::cerr << "[Rank " << rank << "] CHIMAERA_INIT(kClient) failed!" << std::endl;
+      HLOG(kError, "[Rank {}] CHIMAERA_INIT(kClient) failed!", rank);
       MPI_Abort(MPI_COMM_WORLD, 1);
       return 1;
     }
-    std::cout << "[Rank " << rank << "] Connected as " << mode_name << "." << std::endl;
+    HLOG(kInfo, "[Rank {}] Connected as {}.", rank, mode_name);
 
     // Signal all clients connected
     MPI_Barrier(MPI_COMM_WORLD);
@@ -329,8 +323,8 @@ int main(int argc, char* argv[]) {
     bool pass_1m = RunBdevIoTest(rank, mode_name, 1024 * 1024);
 
     local_pass = (pass_4k && pass_1m) ? 1 : 0;
-    if (!pass_4k) std::cerr << "[Rank " << rank << "] 4KB I/O FAILED" << std::endl;
-    if (!pass_1m) std::cerr << "[Rank " << rank << "] 1MB I/O FAILED" << std::endl;
+    if (!pass_4k) HLOG(kError, "[Rank {}] 4KB I/O FAILED", rank);
+    if (!pass_1m) HLOG(kError, "[Rank {}] 1MB I/O FAILED", rank);
 
     // Signal I/O complete
     MPI_Barrier(MPI_COMM_WORLD);

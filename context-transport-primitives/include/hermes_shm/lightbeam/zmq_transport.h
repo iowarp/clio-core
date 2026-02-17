@@ -127,6 +127,14 @@ class ZeroMqTransport : public Transport {
       int rcvbuf = 4 * 1024 * 1024;
       zmq_setsockopt(socket_, ZMQ_RCVBUF, &rcvbuf, sizeof(rcvbuf));
 
+      // ZMTP heartbeat: detect dead connections within seconds
+      int hb_ivl = 1000;    // Send ZMTP PING every 1 second
+      zmq_setsockopt(socket_, ZMQ_HEARTBEAT_IVL, &hb_ivl, sizeof(hb_ivl));
+      int hb_timeout = 3000; // Consider dead after 3s of no traffic
+      zmq_setsockopt(socket_, ZMQ_HEARTBEAT_TIMEOUT, &hb_timeout, sizeof(hb_timeout));
+      int hb_ttl = 3000;     // Tell remote peer: drop me if no traffic for 3s
+      zmq_setsockopt(socket_, ZMQ_HEARTBEAT_TTL, &hb_ttl, sizeof(hb_ttl));
+
       int rc = zmq_connect(socket_, full_url.c_str());
       if (rc == -1) {
         std::string err = "ZeroMqTransport(DEALER) failed to connect to URL '" +
@@ -165,6 +173,14 @@ class ZeroMqTransport : public Transport {
 
       int sndbuf = 4 * 1024 * 1024;
       zmq_setsockopt(socket_, ZMQ_SNDBUF, &sndbuf, sizeof(sndbuf));
+
+      // ZMTP heartbeat: detect dead client connections
+      int hb_ivl = 1000;
+      zmq_setsockopt(socket_, ZMQ_HEARTBEAT_IVL, &hb_ivl, sizeof(hb_ivl));
+      int hb_timeout = 3000;
+      zmq_setsockopt(socket_, ZMQ_HEARTBEAT_TIMEOUT, &hb_timeout, sizeof(hb_timeout));
+      int hb_ttl = 3000;
+      zmq_setsockopt(socket_, ZMQ_HEARTBEAT_TTL, &hb_ttl, sizeof(hb_ttl));
 
       HLOG(kDebug, "ZeroMqTransport(ROUTER) binding to URL: {}", full_url);
       int rc = zmq_bind(socket_, full_url.c_str());

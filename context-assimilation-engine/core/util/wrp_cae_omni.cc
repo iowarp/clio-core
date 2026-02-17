@@ -39,12 +39,12 @@
  */
 
 #include <hermes_shm/util/config_parse.h>
+#include <hermes_shm/util/logging.h>
 #include <wrp_cae/core/constants.h>
 #include <wrp_cae/core/core_client.h>
 #include <wrp_cae/core/factory/assimilation_ctx.h>
 #include <yaml-cpp/yaml.h>
 
-#include <iostream>
 #include <string>
 #include <vector>
 
@@ -53,7 +53,7 @@
  */
 std::vector<wrp_cae::core::AssimilationCtx> LoadOmni(
     const std::string& omni_path) {
-  std::cout << "Loading OMNI file: " << omni_path << std::endl;
+  HLOG(kInfo, "Loading OMNI file: {}", omni_path);
 
   YAML::Node config;
   try {
@@ -142,44 +142,43 @@ std::vector<wrp_cae::core::AssimilationCtx> LoadOmni(
 
     contexts.push_back(ctx);
 
-    std::cout << "  Loaded transfer " << (i + 1) << "/" << transfers.size()
-              << ":" << std::endl;
-    std::cout << "    src: " << ctx.src << std::endl;
-    std::cout << "    dst: " << ctx.dst << std::endl;
-    std::cout << "    format: " << ctx.format << std::endl;
+    HLOG(kInfo, "  Loaded transfer {}/{}: ", (i + 1), transfers.size());
+    HLOG(kInfo, "    src: {}", ctx.src);
+    HLOG(kInfo, "    dst: {}", ctx.dst);
+    HLOG(kInfo, "    format: {}", ctx.format);
     if (!ctx.src_token.empty()) {
-      std::cout << "    src_token: <set>" << std::endl;
+      HLOG(kInfo, "    src_token: <set>");
     }
     if (!ctx.dst_token.empty()) {
-      std::cout << "    dst_token: <set>" << std::endl;
+      HLOG(kInfo, "    dst_token: <set>");
     }
     if (!ctx.include_patterns.empty()) {
-      std::cout << "    dataset_filter.include_patterns: [";
+      std::string patterns_str = "    dataset_filter.include_patterns: [";
       for (size_t j = 0; j < ctx.include_patterns.size(); ++j) {
-        if (j > 0) std::cout << ", ";
-        std::cout << "\"" << ctx.include_patterns[j] << "\"";
+        if (j > 0) patterns_str += ", ";
+        patterns_str += "\"" + ctx.include_patterns[j] + "\"";
       }
-      std::cout << "]" << std::endl;
+      patterns_str += "]";
+      HIPRINT("{}", patterns_str);
     }
     if (!ctx.exclude_patterns.empty()) {
-      std::cout << "    dataset_filter.exclude_patterns: [";
+      std::string patterns_str = "    dataset_filter.exclude_patterns: [";
       for (size_t j = 0; j < ctx.exclude_patterns.size(); ++j) {
-        if (j > 0) std::cout << ", ";
-        std::cout << "\"" << ctx.exclude_patterns[j] << "\"";
+        if (j > 0) patterns_str += ", ";
+        patterns_str += "\"" + ctx.exclude_patterns[j] + "\"";
       }
-      std::cout << "]" << std::endl;
+      patterns_str += "]";
+      HIPRINT("{}", patterns_str);
     }
   }
 
-  std::cout << "Successfully loaded " << contexts.size()
-            << " transfer(s) from OMNI file" << std::endl;
+  HLOG(kSuccess, "Successfully loaded {} transfer(s) from OMNI file", contexts.size());
   return contexts;
 }
 
 void PrintUsage(const char* program_name) {
-  std::cerr << "Usage: " << program_name << " <omni_file_path>" << std::endl;
-  std::cerr << "  omni_file_path - Path to the OMNI YAML file to ingest"
-            << std::endl;
+  HIPRINT("Usage: {} <omni_file_path>", program_name);
+  HIPRINT("  omni_file_path - Path to the OMNI YAML file to ingest");
 }
 
 int main(int argc, char* argv[]) {
@@ -193,16 +192,14 @@ int main(int argc, char* argv[]) {
   try {
     // Initialize Chimaera client
     if (!chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, false)) {
-      std::cerr << "Error: Failed to initialize Chimaera client" << std::endl;
+      HLOG(kError, "Error: Failed to initialize Chimaera client");
       return 1;
     }
 
     // Verify Chimaera IPC is available
     auto* ipc_manager = CHI_IPC;
     if (!ipc_manager) {
-      std::cerr
-          << "Error: Chimaera IPC not initialized. Is the runtime running?"
-          << std::endl;
+      HLOG(kError, "Error: Chimaera IPC not initialized. Is the runtime running?");
       return 1;
     }
 
@@ -213,8 +210,7 @@ int main(int argc, char* argv[]) {
     // Connect to CAE core container using the standard pool ID
     wrp_cae::core::Client client(wrp_cae::core::kCaePoolId);
 
-    std::cout << "Calling ParseOmni..." << std::endl;
-    std::cout.flush();
+    HLOG(kInfo, "Calling ParseOmni...");
 
     // Call ParseOmni with vector of contexts
     auto parse_task = client.AsyncParseOmni(contexts);
@@ -223,18 +219,17 @@ int main(int argc, char* argv[]) {
     chi::u32 num_tasks_scheduled = parse_task->num_tasks_scheduled_;
 
     if (result != 0) {
-      std::cerr << "Error: ParseOmni failed with result code " << result
-                << std::endl;
+      HLOG(kError, "Error: ParseOmni failed with result code {}", result);
       return 1;
     }
 
-    std::cout << "ParseOmni completed successfully!" << std::endl;
-    std::cout << "  Tasks scheduled: " << num_tasks_scheduled << std::endl;
+    HLOG(kSuccess, "ParseOmni completed successfully!");
+    HLOG(kInfo, "  Tasks scheduled: {}", num_tasks_scheduled);
 
     return 0;
 
   } catch (const std::exception& e) {
-    std::cerr << "Error: " << e.what() << std::endl;
+    HLOG(kError, "Error: {}", e.what());
     return 1;
   }
 }

@@ -50,6 +50,7 @@
 
 #include <chimaera/chimaera.h>
 #include <wrp_cte/core/core_client.h>
+#include <hermes_shm/util/logging.h>
 
 #include <algorithm>
 #include <atomic>
@@ -89,7 +90,7 @@ chi::u64 ParseSize(const std::string &size_str) {
   }
 
   if (num_str.empty()) {
-    std::cerr << "Error: Invalid size format: " << size_str << std::endl;
+    HLOG(kError, "Invalid size format: {}", size_str);
     return 0;
   }
 
@@ -181,24 +182,23 @@ class CTEBenchmark {
     } else if (test_case_ == "PutGet") {
       RunPutGetBenchmark();
     } else {
-      std::cerr << "Error: Unknown test case: " << test_case_ << std::endl;
-      std::cerr << "Valid options: Put, Get, PutGet" << std::endl;
+      HLOG(kError, "Unknown test case: {}", test_case_);
+      HLOG(kError, "Valid options: Put, Get, PutGet");
     }
   }
 
  private:
   void PrintBenchmarkInfo() {
-    std::cout << "=== CTE Core Benchmark ===" << std::endl;
-    std::cout << "Test case: " << test_case_ << std::endl;
-    std::cout << "Worker threads: " << num_threads_ << std::endl;
-    std::cout << "Async depth per thread: " << depth_ << std::endl;
-    std::cout << "I/O size: " << FormatSize(io_size_) << std::endl;
-    std::cout << "I/O count per thread: " << io_count_ << std::endl;
-    std::cout << "Total I/O per thread: " << FormatSize(io_size_ * io_count_)
-              << std::endl;
-    std::cout << "Total I/O (all threads): "
-              << FormatSize(io_size_ * io_count_ * num_threads_) << std::endl;
-    std::cout << "===========================" << std::endl << std::endl;
+    HLOG(kInfo, "=== CTE Core Benchmark ===");
+    HLOG(kInfo, "Test case: {}", test_case_);
+    HLOG(kInfo, "Worker threads: {}", num_threads_);
+    HLOG(kInfo, "Async depth per thread: {}", depth_);
+    HLOG(kInfo, "I/O size: {}", FormatSize(io_size_));
+    HLOG(kInfo, "I/O count per thread: {}", io_count_);
+    HLOG(kInfo, "Total I/O per thread: {}", FormatSize(io_size_ * io_count_));
+    HLOG(kInfo, "Total I/O (all threads): {}",
+         FormatSize(io_size_ * io_count_ * num_threads_));
+    HLOG(kInfo, "===========================");
   }
 
   /**
@@ -322,7 +322,7 @@ class CTEBenchmark {
   }
 
   void RunGetBenchmark() {
-    std::cout << "Populating data for Get benchmark..." << std::endl;
+    HLOG(kInfo, "Populating data for Get benchmark...");
 
     std::vector<std::thread> threads;
     std::vector<long long> thread_times(num_threads_);
@@ -458,26 +458,21 @@ class CTEBenchmark {
             ? (static_cast<double>(aggregate_bytes) / (avg_time / 1000000.0))
             : 0.0;
 
-    std::cout << std::endl;
-    std::cout << "=== " << operation << " Benchmark Results ===" << std::endl;
-    std::cout << std::fixed << std::setprecision(3);
-    std::cout << "Time (min): " << min_time << " us (" << (min_time / 1000.0)
-              << " ms)" << std::endl;
-    std::cout << "Time (max): " << max_time << " us (" << (max_time / 1000.0)
-              << " ms)" << std::endl;
-    std::cout << "Time (avg): " << avg_time << " us (" << (avg_time / 1000.0)
-              << " ms)" << std::endl;
-    std::cout << std::endl;
-    std::cout << std::fixed << std::setprecision(2);
-    std::cout << "Bandwidth per thread (min): " << min_bw << " MB/s ("
-              << min_bw_bytes << " bytes/s)" << std::endl;
-    std::cout << "Bandwidth per thread (max): " << max_bw << " MB/s ("
-              << max_bw_bytes << " bytes/s)" << std::endl;
-    std::cout << "Bandwidth per thread (avg): " << avg_bw << " MB/s ("
-              << avg_bw_bytes << " bytes/s)" << std::endl;
-    std::cout << "Aggregate bandwidth: " << agg_bw << " MB/s (" << agg_bw_bytes
-              << " bytes/s)" << std::endl;
-    std::cout << "===========================" << std::endl;
+    HLOG(kInfo, "");
+    HLOG(kInfo, "=== {} Benchmark Results ===", operation);
+    HLOG(kInfo, "Time (min): {} us ({} ms)", min_time, min_time / 1000.0);
+    HLOG(kInfo, "Time (max): {} us ({} ms)", max_time, max_time / 1000.0);
+    HLOG(kInfo, "Time (avg): {} us ({} ms)", avg_time, avg_time / 1000.0);
+    HLOG(kInfo, "");
+    HLOG(kInfo, "Bandwidth per thread (min): {} MB/s ({} bytes/s)", min_bw,
+         min_bw_bytes);
+    HLOG(kInfo, "Bandwidth per thread (max): {} MB/s ({} bytes/s)", max_bw,
+         max_bw_bytes);
+    HLOG(kInfo, "Bandwidth per thread (avg): {} MB/s ({} bytes/s)", avg_bw,
+         avg_bw_bytes);
+    HLOG(kInfo, "Aggregate bandwidth: {} MB/s ({} bytes/s)", agg_bw,
+         agg_bw_bytes);
+    HLOG(kInfo, "===========================");
   }
 
   size_t num_threads_;
@@ -490,36 +485,28 @@ class CTEBenchmark {
 int main(int argc, char **argv) {
   // Check arguments
   if (argc != 6) {
-    std::cerr << "Usage: " << argv[0]
-              << " <test_case> <num_threads> <depth> <io_size> <io_count>"
-              << std::endl;
-    std::cerr << "  test_case: Put, Get, or PutGet" << std::endl;
-    std::cerr << "  num_threads: Number of worker threads (e.g., 4)"
-              << std::endl;
-    std::cerr << "  depth: Number of async requests per thread (e.g., 4)"
-              << std::endl;
-    std::cerr << "  io_size: Size of I/O operations (e.g., 1m, 4k, 1g)"
-              << std::endl;
-    std::cerr << "  io_count: Number of I/O operations per thread (e.g., 100)"
-              << std::endl;
-    std::cerr << std::endl;
-    std::cerr << "Environment variables:" << std::endl;
-    std::cerr
-        << "  CHIMAERA_WITH_RUNTIME: Set to '1', 'true', 'yes', or 'on' to "
-           "initialize runtime"
-        << std::endl;
-    std::cerr << "                         Default: assumes runtime already "
-                 "initialized"
-              << std::endl;
+    HLOG(kError, "Usage: {} <test_case> <num_threads> <depth> <io_size> <io_count>",
+         argv[0]);
+    HLOG(kError, "  test_case: Put, Get, or PutGet");
+    HLOG(kError, "  num_threads: Number of worker threads (e.g., 4)");
+    HLOG(kError, "  depth: Number of async requests per thread (e.g., 4)");
+    HLOG(kError, "  io_size: Size of I/O operations (e.g., 1m, 4k, 1g)");
+    HLOG(kError, "  io_count: Number of I/O operations per thread (e.g., 100)");
+    HLOG(kError, "");
+    HLOG(kError, "Environment variables:");
+    HLOG(kError,
+         "  CHIMAERA_WITH_RUNTIME: Set to '1', 'true', 'yes', or 'on' to "
+         "initialize runtime");
+    HLOG(kError, "                         Default: assumes runtime already initialized");
     return 1;
   }
 
   // Initialize Chimaera runtime and client
-  std::cout << "Initializing Chimaera runtime..." << std::endl;
+  HLOG(kInfo, "Initializing Chimaera runtime...");
 
   // Initialize Chimaera (client with embedded runtime)
   if (!chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, false)) {
-    std::cerr << "Error: Failed to initialize Chimaera runtime" << std::endl;
+    HLOG(kError, "Failed to initialize Chimaera runtime");
     return 1;
   }
 
@@ -527,11 +514,11 @@ int main(int argc, char **argv) {
 
   // Initialize CTE client
   if (!wrp_cte::core::WRP_CTE_CLIENT_INIT()) {
-    std::cerr << "Error: Failed to initialize CTE client" << std::endl;
+    HLOG(kError, "Failed to initialize CTE client");
     return 1;
   }
 
-  std::cout << "Runtime and client initialized successfully" << std::endl;
+  HLOG(kInfo, "Runtime and client initialized successfully");
 
   // Small delay to ensure initialization is complete
   std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -544,11 +531,11 @@ int main(int argc, char **argv) {
 
   // Validate parameters
   if (num_threads == 0 || depth <= 0 || io_size == 0 || io_count <= 0) {
-    std::cerr << "Error: Invalid parameters" << std::endl;
-    std::cerr << "  num_threads must be > 0" << std::endl;
-    std::cerr << "  depth must be > 0" << std::endl;
-    std::cerr << "  io_size must be > 0" << std::endl;
-    std::cerr << "  io_count must be > 0" << std::endl;
+    HLOG(kError, "Invalid parameters");
+    HLOG(kError, "  num_threads must be > 0");
+    HLOG(kError, "  depth must be > 0");
+    HLOG(kError, "  io_size must be > 0");
+    HLOG(kError, "  io_count must be > 0");
     return 1;
   }
 

@@ -75,6 +75,7 @@
 #include <ctime>
 
 #include <chimaera/chimaera.h>
+#include <hermes_shm/util/logging.h>
 #include <hermes_shm/util/config_parse.h>
 #include <wrp_cte/core/core_client.h>
 #include <wrp_cte/compressor/compressor_client.h>
@@ -133,22 +134,25 @@ int GetCompressLibId(const std::string& name) {
 }
 
 void PrintUsage(const char* prog) {
-  std::cerr << "Usage: mpirun -n <nprocs> " << prog << " [options]\n"
-            << "\nOptions:\n"
-            << "  --io-size <size>        I/O size per rank (e.g., \"1MB\") [default: 1MB]\n"
-            << "  --transfer-size <size>  Transfer chunk size (e.g., \"64KB\") [default: 64KB]\n"
-            << "  --compute-time <ms>     Compute time per iteration [default: 100]\n"
-            << "  --iterations <n>        Number of iterations [default: 10]\n"
-            << "  --pattern <spec>        Pattern: <name>:<pct>,... [default: grayscott:100]\n"
-            << "  --compress <option>     none, dynamic, zstd, lz4, etc. [default: dynamic]\n"
-            << "  --output <path>         Output file path [default: synthetic_output.bp]\n"
-            << "  --trace                 Enable compression tracing\n"
-            << "  --help                  Show this help message\n"
-            << "\nPatterns: uniform, gaussian, constant, gradient, sinusoidal,\n"
-            << "          repeating, grayscott, bimodal, exponential\n"
-            << "\nExample:\n"
-            << "  mpirun -n 4 " << prog << " --io-size 4MB --compute-time 200 "
-            << "--pattern grayscott:70,gaussian:30 --compress dynamic\n";
+  HLOG(kError, "Usage: mpirun -n <nprocs> {} [options]", prog);
+  HLOG(kError, "");
+  HLOG(kError, "Options:");
+  HLOG(kError, "  --io-size <size>        I/O size per rank (e.g., \"1MB\") [default: 1MB]");
+  HLOG(kError, "  --transfer-size <size>  Transfer chunk size (e.g., \"64KB\") [default: 64KB]");
+  HLOG(kError, "  --compute-time <ms>     Compute time per iteration [default: 100]");
+  HLOG(kError, "  --iterations <n>        Number of iterations [default: 10]");
+  HLOG(kError, "  --pattern <spec>        Pattern: <name>:<pct>,... [default: grayscott:100]");
+  HLOG(kError, "  --compress <option>     none, dynamic, zstd, lz4, etc. [default: dynamic]");
+  HLOG(kError, "  --output <path>         Output file path [default: synthetic_output.bp]");
+  HLOG(kError, "  --trace                 Enable compression tracing");
+  HLOG(kError, "  --help                  Show this help message");
+  HLOG(kError, "");
+  HLOG(kError, "Patterns: uniform, gaussian, constant, gradient, sinusoidal,");
+  HLOG(kError, "          repeating, grayscott, bimodal, exponential");
+  HLOG(kError, "");
+  HLOG(kError, "Example:");
+  HLOG(kError, "  mpirun -n 4 {} --io-size 4MB --compute-time 200 --pattern grayscott:70,gaussian:30 --compress dynamic",
+       prog);
 }
 
 WorkloadConfig ParseArgs(int argc, char** argv) {
@@ -241,27 +245,27 @@ int main(int argc, char** argv) {
 
   // Print configuration on rank 0
   if (rank == 0) {
-    std::cout << "=== Synthetic Workload Generator ===" << std::endl;
-    std::cout << "MPI ranks: " << nprocs << std::endl;
-    std::cout << "I/O size per rank: " << config.io_size_per_rank << " bytes" << std::endl;
-    std::cout << "Transfer size: " << config.transfer_size << " bytes" << std::endl;
-    std::cout << "Compute time: " << config.compute_time_ms << " ms" << std::endl;
-    std::cout << "Iterations: " << config.iterations << std::endl;
-    std::cout << "Compression: " << config.compress_option << std::endl;
-    std::cout << "Output: " << config.output_path << std::endl;
-    std::cout << "Trace: " << (config.trace_enabled ? "enabled" : "disabled") << std::endl;
-    std::cout << "Patterns: ";
+    HLOG(kInfo, "=== Synthetic Workload Generator ===");
+    HLOG(kInfo, "MPI ranks: {}", nprocs);
+    HLOG(kInfo, "I/O size per rank: {} bytes", config.io_size_per_rank);
+    HLOG(kInfo, "Transfer size: {} bytes", config.transfer_size);
+    HLOG(kInfo, "Compute time: {} ms", config.compute_time_ms);
+    HLOG(kInfo, "Iterations: {}", config.iterations);
+    HLOG(kInfo, "Compression: {}", config.compress_option);
+    HLOG(kInfo, "Output: {}", config.output_path);
+    HLOG(kInfo, "Trace: {}", config.trace_enabled ? "enabled" : "disabled");
+    HIPRINT("Patterns: ");
     for (const auto& p : config.patterns) {
-      std::cout << static_cast<int>(p.type) << ":" << (p.percentage * 100) << "% ";
+      HIPRINT("{}:{}% ", static_cast<int>(p.type), p.percentage * 100);
     }
-    std::cout << std::endl;
-    std::cout << "======================================" << std::endl;
+    HIPRINT("\n");
+    HLOG(kInfo, "======================================");
   }
 
   // Initialize CTE client (assumes Chimaera runtime is already running)
   if (!wrp_cte::core::WRP_CTE_CLIENT_INIT("", chi::PoolQuery::Local())) {
     if (rank == 0) {
-      std::cerr << "Error: Failed to initialize CTE client. Make sure chimaera runtime is started." << std::endl;
+      HLOG(kError, "Failed to initialize CTE client. Make sure chimaera runtime is started.");
     }
     MPI_Finalize();
     return 1;
@@ -282,10 +286,10 @@ int main(int argc, char** argv) {
     create_task.Wait();
     if (create_task->GetReturnCode() == 0) {
       if (rank == 0) {
-        std::cout << "Compressor client initialized" << std::endl;
+        HLOG(kInfo, "Compressor client initialized");
       }
     } else if (rank == 0) {
-      std::cerr << "Warning: Failed to create compressor pool, using no compression" << std::endl;
+      HLOG(kWarning, "Failed to create compressor pool, using no compression");
     }
   }
 
@@ -399,9 +403,8 @@ int main(int argc, char** argv) {
 
     // Progress report
     if (rank == 0 && (iter + 1) % std::max(1, config.iterations / 10) == 0) {
-      std::cout << "Iteration " << (iter + 1) << "/" << config.iterations
-                << " - Compute: " << std::fixed << std::setprecision(1) << compute_ms
-                << "ms, I/O submit: " << io_ms << "ms, Total: " << total_ms << "ms" << std::endl;
+      HLOG(kInfo, "Iteration {}/{} - Compute: {}ms, I/O submit: {}ms, Total: {}ms",
+           iter + 1, config.iterations, compute_ms, io_ms, total_ms);
     }
   }
 
@@ -445,22 +448,22 @@ int main(int argc, char** argv) {
 
   // Print final statistics
   if (rank == 0) {
-    std::cout << "\n=== Final Statistics ===" << std::endl;
-    std::cout << "Average compute time (CPU): " << std::fixed << std::setprecision(2)
-              << global_avg_compute << " ms" << std::endl;
-    std::cout << "Average I/O submit time: " << global_avg_io << " ms" << std::endl;
-    std::cout << "Average iteration time: " << global_avg_total << " ms" << std::endl;
-    std::cout << std::endl;
-    std::cout << "End-to-end wall clock time: " << global_max_e2e_time << " ms ("
-              << (global_max_e2e_time / 1000.0) << " s)" << std::endl;
+    HLOG(kInfo, "");
+    HLOG(kInfo, "=== Final Statistics ===");
+    HLOG(kInfo, "Average compute time (CPU): {} ms", global_avg_compute);
+    HLOG(kInfo, "Average I/O submit time: {} ms", global_avg_io);
+    HLOG(kInfo, "Average iteration time: {} ms", global_avg_total);
+    HLOG(kInfo, "");
+    HLOG(kInfo, "End-to-end wall clock time: {} ms ({} s)", global_max_e2e_time,
+         global_max_e2e_time / 1000.0);
 
     double total_data_mb = (config.io_size_per_rank * nprocs * config.iterations) / (1024.0 * 1024.0);
     double e2e_time_s = global_max_e2e_time / 1000.0;
     double throughput_mb_s = total_data_mb / e2e_time_s;
 
-    std::cout << "Total data: " << total_data_mb << " MB" << std::endl;
-    std::cout << "End-to-end throughput: " << throughput_mb_s << " MB/s" << std::endl;
-    std::cout << "=========================" << std::endl;
+    HLOG(kInfo, "Total data: {} MB", total_data_mb);
+    HLOG(kInfo, "End-to-end throughput: {} MB/s", throughput_mb_s);
+    HLOG(kInfo, "=========================");
   }
 
   MPI_Finalize();

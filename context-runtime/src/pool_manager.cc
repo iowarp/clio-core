@@ -38,8 +38,13 @@
 #include "chimaera/pool_manager.h"
 
 #include "chimaera/admin/admin_tasks.h"
+#include "chimaera/config_manager.h"
 #include "chimaera/container.h"
 #include "chimaera/task.h"
+
+#include <chrono>
+#include <filesystem>
+#include <fstream>
 
 // Global pointer variable definition for Pool manager singleton
 HSHM_DEFINE_GLOBAL_PTR_VAR_CC(chi::PoolManager, g_pool_manager);
@@ -53,8 +58,7 @@ bool PoolManager::ServerInit() {
     return true;
   }
 
-  // Initialize pool container map and metadata
-  pool_container_map_.clear();
+  // Initialize pool metadata
   pool_metadata_.clear();
 
   is_initialized_ = true;
@@ -122,41 +126,151 @@ void PoolManager::Finalize() {
     return;
   }
 
-  // Clear pool container mappings
-  pool_container_map_.clear();
+  // Clear all containers in each PoolInfo, then clear metadata
+  for (auto &pair : pool_metadata_) {
+    pair.second.containers_.clear();
+    pair.second.static_container_ = nullptr;
+    pair.second.local_container_ = nullptr;
+  }
+  pool_metadata_.clear();
 
   is_initialized_ = false;
 }
 
-bool PoolManager::RegisterContainer(PoolId pool_id, Container* container) {
+bool PoolManager::RegisterContainer(PoolId pool_id, ContainerId container_id,
+                                     Container* container, bool is_static) {
   if (!is_initialized_ || container == nullptr) {
     return false;
   }
 
-  pool_container_map_[pool_id] = container;
+  auto it = pool_metadata_.find(pool_id);
+  if (it == pool_metadata_.end()) {
+    return false;
+  }
+
+  PoolInfo &info = it->second;
+  info.containers_[container_id] = container;
+
+  if (is_static || info.static_container_ == nullptr) {
+    info.static_container_ = container;
+  }
+  if (info.local_container_ == nullptr) {
+    info.local_container_ = container;
+  }
+
   return true;
 }
 
-bool PoolManager::UnregisterContainer(PoolId pool_id) {
+bool PoolManager::UnregisterContainer(PoolId pool_id, ContainerId container_id) {
   if (!is_initialized_) {
     return false;
   }
 
-  auto it = pool_container_map_.find(pool_id);
-  if (it != pool_container_map_.end()) {
-    pool_container_map_.erase(it);
-    return true;
+  auto it = pool_metadata_.find(pool_id);
+  if (it == pool_metadata_.end()) {
+    return false;
   }
-  return false;
+
+  PoolInfo &info = it->second;
+  auto cit = info.containers_.find(container_id);
+  if (cit == info.containers_.end()) {
+    return false;
+  }
+
+  Container *removed = cit->second;
+  info.containers_.erase(cit);
+
+  // static_container_ is never modified after pool creation — it is a
+  // persistent reference used for stateless operations (task deserialization).
+  if (info.local_container_ == removed) {
+    info.RecalculateLocalContainer();
+  }
+
+  return true;
 }
 
-Container* PoolManager::GetContainer(PoolId pool_id) const {
+void PoolManager::UnregisterAllContainers(PoolId pool_id) {
+  if (!is_initialized_) {
+    return;
+  }
+
+  auto it = pool_metadata_.find(pool_id);
+  if (it == pool_metadata_.end()) {
+    return;
+  }
+
+  PoolInfo &info = it->second;
+  info.containers_.clear();
+  info.static_container_ = nullptr;
+  info.local_container_ = nullptr;
+}
+
+Container* PoolManager::GetContainer(PoolId pool_id, ContainerId container_id,
+                                      bool &is_plugged) const {
+  is_plugged = false;
   if (!is_initialized_) {
     return nullptr;
   }
 
-  auto it = pool_container_map_.find(pool_id);
-  return (it != pool_container_map_.end()) ? it->second : nullptr;
+  auto it = pool_metadata_.find(pool_id);
+  if (it == pool_metadata_.end()) {
+    return nullptr;
+  }
+
+  const PoolInfo &info = it->second;
+  Container *container = nullptr;
+  if (container_id != kInvalidContainerId) {
+    auto cit = info.containers_.find(container_id);
+    if (cit != info.containers_.end()) {
+      container = cit->second;
+    }
+  }
+  if (!container) {
+    container = info.local_container_;
+  }
+  if (container) {
+    is_plugged = container->IsPlugged();
+  }
+  return container;
+}
+
+Container* PoolManager::GetContainerRaw(PoolId pool_id, ContainerId container_id) const {
+  if (!is_initialized_) {
+    return nullptr;
+  }
+
+  auto it = pool_metadata_.find(pool_id);
+  if (it == pool_metadata_.end()) {
+    return nullptr;
+  }
+
+  const PoolInfo &info = it->second;
+  auto cit = info.containers_.find(container_id);
+  return (cit != info.containers_.end()) ? cit->second : nullptr;
+}
+
+Container* PoolManager::GetStaticContainer(PoolId pool_id) const {
+  if (!is_initialized_) {
+    return nullptr;
+  }
+
+  auto it = pool_metadata_.find(pool_id);
+  if (it == pool_metadata_.end()) {
+    return nullptr;
+  }
+
+  return it->second.static_container_;
+}
+
+void PoolManager::PlugContainer(PoolId pool_id, ContainerId container_id) {
+  Container *container = GetContainerRaw(pool_id, container_id);
+  if (!container) {
+    return;
+  }
+  container->SetPlugged();
+  while (container->GetWorkRemaining() > 0) {
+    HSHM_THREAD_MODEL->Yield();
+  }
 }
 
 bool PoolManager::HasPool(PoolId pool_id) const {
@@ -164,7 +278,7 @@ bool PoolManager::HasPool(PoolId pool_id) const {
     return false;
   }
 
-  return pool_container_map_.find(pool_id) != pool_container_map_.end();
+  return pool_metadata_.find(pool_id) != pool_metadata_.end();
 }
 
 bool PoolManager::HasContainer(PoolId pool_id, ContainerId container_id) const {
@@ -172,19 +286,12 @@ bool PoolManager::HasContainer(PoolId pool_id, ContainerId container_id) const {
     return false;
   }
 
-  // Check if pool exists on this node
-  if (!HasPool(pool_id)) {
+  auto it = pool_metadata_.find(pool_id);
+  if (it == pool_metadata_.end()) {
     return false;
   }
 
-  // Get this node's ID
-  auto* ipc_manager = CHI_IPC;
-  u32 node_id = ipc_manager->GetNodeId();
-
-  // Container exists locally if container_id matches this node's ID
-  // This follows the pattern where container_id == node_id for locally owned
-  // containers
-  return container_id == node_id;
+  return it->second.containers_.find(container_id) != it->second.containers_.end();
 }
 
 PoolId PoolManager::FindPoolByName(const std::string& pool_name) const {
@@ -204,7 +311,7 @@ PoolId PoolManager::FindPoolByName(const std::string& pool_name) const {
 }
 
 size_t PoolManager::GetPoolCount() const {
-  return is_initialized_ ? pool_container_map_.size() : 0;
+  return is_initialized_ ? pool_metadata_.size() : 0;
 }
 
 std::vector<PoolId> PoolManager::GetAllPoolIds() const {
@@ -213,8 +320,8 @@ std::vector<PoolId> PoolManager::GetAllPoolIds() const {
     return pool_ids;
   }
 
-  pool_ids.reserve(pool_container_map_.size());
-  for (const auto& pair : pool_container_map_) {
+  pool_ids.reserve(pool_metadata_.size());
+  for (const auto& pair : pool_metadata_) {
     pool_ids.push_back(pair.first);
   }
   return pool_ids;
@@ -234,32 +341,9 @@ bool PoolManager::DestroyLocalPool(PoolId pool_id) {
     return false;
   }
 
-  // Get the container before unregistering
-  auto* container = GetContainer(pool_id);
-  if (!container) {
-    HLOG(kError, "PoolManager: Container for pool {} is null", pool_id);
-    return false;
-  }
-
-  // Get module manager to destroy the container
-  auto* module_manager = CHI_MODULE_MANAGER;
-  if (!module_manager) {
-    HLOG(kError, "PoolManager: Module manager not available");
-    return false;
-  }
-
   try {
-    // Unregister first
-    if (!UnregisterContainer(pool_id)) {
-      HLOG(kError, "PoolManager: Failed to unregister container for pool {}",
-           pool_id);
-      return false;
-    }
-
-    // TODO: Determine ChiMod name for destruction - for now assume it's stored
-    // in container This would require extending ChiContainer interface to store
-    // chimod_name For now, we'll skip the destruction call and rely on
-    // container cleanup
+    // Unregister all containers for this pool
+    UnregisterAllContainers(pool_id);
 
     HLOG(kInfo, "PoolManager: Destroyed local pool {}", pool_id);
     return true;
@@ -311,47 +395,30 @@ bool PoolManager::ValidatePoolParams(const std::string& chimod_name,
   return true;
 }
 
-AddressTable PoolManager::CreateAddressTable(PoolId pool_id,
-                                             u32 num_containers) {
-  AddressTable address_table;
-
+void PoolManager::InitAddressMap(PoolId pool_id, u32 num_containers) {
   if (!is_initialized_) {
-    return address_table;
+    return;
   }
 
-  HLOG(kDebug, "=== Address Table Mapping for Pool {} ===", pool_id);
-  HLOG(kDebug, "Creating address table with {} containers", num_containers);
+  auto it = pool_metadata_.find(pool_id);
+  if (it == pool_metadata_.end()) {
+    return;
+  }
 
-  // Create one address per container in the global table
+  PoolInfo &info = it->second;
+  info.address_map_.clear();
+
+  HLOG(kDebug, "=== Address Map for Pool {} ===", pool_id);
+  HLOG(kDebug, "Creating address map with {} containers", num_containers);
+
+  // Initially ContainerId == NodeId (one container per node)
   for (u32 container_idx = 0; container_idx < num_containers; ++container_idx) {
-    Address global_address(pool_id, Group::kGlobal, container_idx);
-    Address physical_address(pool_id, Group::kPhysical, container_idx);
-
-    // Map each global address to its corresponding physical address
-    address_table.AddGlobalToPhysicalMapping(global_address, physical_address);
-
-    HLOG(kDebug, "  Global[{}] -> Physical[{}] (pool: {})", container_idx,
+    info.address_map_[container_idx] = container_idx;
+    HLOG(kDebug, "  Container[{}] -> Node[{}] (pool: {})", container_idx,
          container_idx, pool_id);
   }
 
-  // Create exactly one local address that maps to the global address of the
-  // container on this node. Use this node's ID to determine which global
-  // container this node owns.
-  auto* ipc_manager = CHI_IPC;
-  u32 node_id = ipc_manager->GetNodeId();
-
-  Address local_address(pool_id, Group::kLocal,
-                        0);  // One local address for this node
-  Address global_address(pool_id, Group::kGlobal,
-                         node_id);  // Maps to this node's global container
-
-  // Map the single local address to its global counterpart
-  address_table.AddLocalToGlobalMapping(local_address, global_address);
-
-  HLOG(kDebug, "  Local[0] -> Global[{}] (pool: {})", node_id, pool_id);
-  HLOG(kDebug, "=== Address Table Complete ===");
-
-  return address_table;
+  HLOG(kDebug, "=== Address Map Complete ===");
 }
 
 TaskResume PoolManager::CreatePool(FullPtr<Task> task, RunContext* run_ctx) {
@@ -426,17 +493,15 @@ TaskResume PoolManager::CreatePool(FullPtr<Task> task, RunContext* run_ctx) {
     co_return;
   }
 
-  // Create address table for the pool
-  AddressTable address_table =
-      CreateAddressTable(target_pool_id, num_containers);
-
   // Create pool metadata
   PoolInfo pool_info(target_pool_id, pool_name, chimod_name, chimod_params,
                      num_containers);
-  pool_info.address_table_ = address_table;
 
-  // Store pool metadata
+  // Store pool metadata first so InitAddressMap can find it
   UpdatePoolMetadata(target_pool_id, pool_info);
+
+  // Initialize address map for the pool (ContainerId -> NodeId)
+  InitAddressMap(target_pool_id, num_containers);
 
   // Create local pool with containers (merged from CreateLocalPool)
   // Get module manager to create containers
@@ -448,6 +513,8 @@ TaskResume PoolManager::CreatePool(FullPtr<Task> task, RunContext* run_ctx) {
   }
 
   Container* container = nullptr;
+  auto* ipc_manager2 = CHI_IPC;
+  u32 node_id = ipc_manager2->GetNodeId();
   try {
     // Create container
     container =
@@ -459,9 +526,7 @@ TaskResume PoolManager::CreatePool(FullPtr<Task> task, RunContext* run_ctx) {
       co_return;
     }
 
-    // Get this node's ID to use as the container ID
-    auto* ipc_manager = CHI_IPC;
-    u32 node_id = ipc_manager->GetNodeId();
+    // node_id already obtained above try block
     HLOG(kInfo,
          "Creating container for pool {} on node {} with container_id={}",
          target_pool_id, node_id, node_id);
@@ -488,7 +553,7 @@ TaskResume PoolManager::CreatePool(FullPtr<Task> task, RunContext* run_ctx) {
 
     // Register the container BEFORE running Create method
     // This allows Create to spawn tasks that can find this container in the map
-    if (!RegisterContainer(target_pool_id, container)) {
+    if (!RegisterContainer(target_pool_id, node_id, container, /*is_static=*/true)) {
       HLOG(kError, "PoolManager: Failed to register container");
       module_manager->DestroyContainer(chimod_name, container);
       pool_metadata_.erase(target_pool_id);
@@ -506,7 +571,7 @@ TaskResume PoolManager::CreatePool(FullPtr<Task> task, RunContext* run_ctx) {
       HLOG(kError, "PoolManager: Failed to create container for ChiMod: {}",
            chimod_name);
       // Unregister the container since Create failed
-      UnregisterContainer(target_pool_id);
+      UnregisterContainer(target_pool_id, node_id);
       module_manager->DestroyContainer(chimod_name, container);
       pool_metadata_.erase(target_pool_id);
       co_return;
@@ -516,7 +581,7 @@ TaskResume PoolManager::CreatePool(FullPtr<Task> task, RunContext* run_ctx) {
     HLOG(kError, "PoolManager: Exception during pool creation: {}", e.what());
     if (container) {
       // Unregister if it was registered before the exception
-      UnregisterContainer(target_pool_id);
+      UnregisterContainer(target_pool_id, node_id);
       module_manager->DestroyContainer(chimod_name, container);
     }
     pool_metadata_.erase(target_pool_id);
@@ -599,23 +664,86 @@ u32 PoolManager::GetContainerNodeId(PoolId pool_id,
   HLOG(kDebug, "GetContainerNodeId - pool has {} containers",
        pool_info->num_containers_);
 
-  // Create global address for the container
-  Address global_address(pool_id, Group::kGlobal, container_id);
-
-  // Look up physical address from the address table
-  Address physical_address;
-  if (pool_info->address_table_.GlobalToPhysical(global_address,
-                                                 physical_address)) {
-    // Return the minor_id which represents the node ID
+  // Look up node ID from the address map
+  auto it = pool_info->address_map_.find(container_id);
+  if (it != pool_info->address_map_.end()) {
     HLOG(kDebug,
          "GetContainerNodeId - found mapping: container_id={} -> node_id={}",
-         container_id, physical_address.minor_id_);
-    return physical_address.minor_id_;
+         container_id, it->second);
+    return it->second;
   }
 
   HLOG(kDebug, "GetContainerNodeId - mapping not found, returning 0");
   // Default to local node if mapping not found
   return 0;
+}
+
+bool PoolManager::UpdateContainerNodeMapping(PoolId pool_id,
+                                              ContainerId container_id,
+                                              u32 new_node_id) {
+  if (!is_initialized_) {
+    HLOG(kError, "PoolManager: Not initialized for mapping update");
+    return false;
+  }
+
+  auto it = pool_metadata_.find(pool_id);
+  if (it == pool_metadata_.end()) {
+    HLOG(kError, "PoolManager: Pool {} not found for mapping update", pool_id);
+    return false;
+  }
+
+  PoolInfo &pool_info = it->second;
+  pool_info.address_map_[container_id] = new_node_id;
+
+  HLOG(kInfo,
+       "PoolManager: Updated mapping for pool {} container {} -> node {}",
+       pool_id, container_id, new_node_id);
+  return true;
+}
+
+void PoolManager::WriteAddressTableWAL(PoolId pool_id,
+                                        ContainerId container_id,
+                                        u32 old_node, u32 new_node) {
+  auto *config_manager = CHI_CONFIG_MANAGER;
+  if (!config_manager) {
+    HLOG(kError, "PoolManager: ConfigManager not available for WAL write");
+    return;
+  }
+
+  // Create WAL directory
+  std::string wal_dir = config_manager->GetConfDir() + "/wal";
+  std::filesystem::create_directories(wal_dir);
+
+  // Determine this node's ID for the WAL filename
+  auto *ipc_manager = CHI_IPC;
+  u32 node_id = ipc_manager->GetNodeId();
+
+  std::string wal_path = wal_dir + "/domain_table." +
+                          std::to_string(pool_id.major_) + "." +
+                          std::to_string(pool_id.minor_) + "." +
+                          std::to_string(node_id) + ".bin";
+
+  // Append WAL entry: [timestamp:u64][pool_id:PoolId][container_id:u32][old_node:u32][new_node:u32]
+  std::ofstream ofs(wal_path, std::ios::binary | std::ios::app);
+  if (!ofs.is_open()) {
+    HLOG(kError, "PoolManager: Failed to open WAL file: {}", wal_path);
+    return;
+  }
+
+  auto now = std::chrono::system_clock::now();
+  u64 timestamp = static_cast<u64>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          now.time_since_epoch())
+          .count());
+
+  ofs.write(reinterpret_cast<const char *>(&timestamp), sizeof(timestamp));
+  ofs.write(reinterpret_cast<const char *>(&pool_id), sizeof(pool_id));
+  ofs.write(reinterpret_cast<const char *>(&container_id),
+            sizeof(container_id));
+  ofs.write(reinterpret_cast<const char *>(&old_node), sizeof(old_node));
+  ofs.write(reinterpret_cast<const char *>(&new_node), sizeof(new_node));
+
+  HLOG(kDebug, "PoolManager: WAL entry written to {}", wal_path);
 }
 
 }  // namespace chi

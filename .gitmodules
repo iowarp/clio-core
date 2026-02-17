@@ -10,3 +10,12 @@
 	path = external/cereal
 	url = https://github.com/USCiLab/cereal.git
 	branch = v1.3.2
+[submodule "external/hindsight"]
+	path = external/hindsight
+	url = https://github.com/vectorize-io/hindsight.git
+[submodule "external/graphiti"]
+	path = external/graphiti
+	url = https://github.com/getzep/graphiti.git
+[submodule "context-transfer-engine/benchmark/memorybench"]
+	path = context-transfer-engine/benchmark/memorybench
+	url = git@github.com:iowarp/memorybench.git

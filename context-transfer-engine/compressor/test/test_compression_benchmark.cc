@@ -79,6 +79,7 @@
 #include "hermes_shm/compress/data_stats.h"
 #include "wrp_cte/compressor/models/distribution_classifier.h"
 #include "hermes_shm/util/config_parse.h"
+#include "hermes_shm/util/logging.h"
 #include <iostream>
 #include <iomanip>
 #include <vector>
@@ -910,16 +911,16 @@ BenchmarkResult BenchmarkCompressor(
   bool is_lossless_compressor = !is_lossy_compressor;
 
   if (is_lossy_compressor && !has_differences) {
-    std::cerr << "  [WARNING] Lossy compressor " << lib_name << " [" << configuration
-              << "] produced EXACT reconstruction (expected some error)!" << std::endl;
-    std::cerr << "    Data type: " << data_type << ", Size: " << data_size << std::endl;
+    HLOG(kWarning, "Lossy compressor {} [{}] produced EXACT reconstruction (expected some error)!",
+         lib_name, configuration);
+    HLOG(kWarning, "    Data type: {}, Size: {}", data_type, data_size);
   }
 
   if (is_lossless_compressor && has_differences) {
-    std::cerr << "  [ERROR] Lossless compressor " << lib_name << " [" << configuration
-              << "] produced LOSSY reconstruction (data corruption)!" << std::endl;
-    std::cerr << "    Mismatched bytes: " << num_different_bytes << "/" << data_size << std::endl;
-    std::cerr << "    Mismatched elements: " << num_different_elements << "/" << num_elements << std::endl;
+    HLOG(kError, "Lossless compressor {} [{}] produced LOSSY reconstruction (data corruption)!",
+         lib_name, configuration);
+    HLOG(kError, "    Mismatched bytes: {}/{}", num_different_bytes, data_size);
+    HLOG(kError, "    Mismatched elements: {}/{}", num_different_elements, num_elements);
   }
 
   // Calculate PSNR (quality metric for both lossless and lossy compression)
@@ -937,24 +938,23 @@ BenchmarkResult BenchmarkCompressor(
     double mse = hshm::DataStatisticsFactory::CalculateMSE(
         input_data.data(), decompressed_data.data(), num_elements, dtype);
 
-    std::cerr << "  [DIAGNOSTIC] " << lib_name << " " << configuration
-              << " on float data has PSNR=0.0!" << std::endl;
-    std::cerr << "    MSE: " << mse << std::endl;
-    std::cerr << "    First 5 input:  ";
+    HLOG(kInfo, "  [DIAGNOSTIC] {} {} on float data has PSNR=0.0!", lib_name, configuration);
+    HLOG(kInfo, "    MSE: {}", mse);
+    HIPRINT("    First 5 input:  ");
     for (int i = 0; i < std::min(5, (int)num_elements); i++) {
-      std::cerr << input_floats[i] << " ";
+      HIPRINT("{} ", input_floats[i]);
     }
-    std::cerr << std::endl;
-    std::cerr << "    First 5 output: ";
+    HIPRINT("\n");
+    HIPRINT("    First 5 output: ");
     for (int i = 0; i < std::min(5, (int)num_elements); i++) {
-      std::cerr << output_floats[i] << " ";
+      HIPRINT("{} ", output_floats[i]);
     }
-    std::cerr << std::endl;
-    std::cerr << "    First 5 diffs: ";
+    HIPRINT("\n");
+    HIPRINT("    First 5 diffs: ");
     for (int i = 0; i < std::min(5, (int)num_elements); i++) {
-      std::cerr << (input_floats[i] - output_floats[i]) << " ";
+      HIPRINT("{} ", input_floats[i] - output_floats[i]);
     }
-    std::cerr << std::endl;
+    HIPRINT("\n");
   }
 
   return result;
@@ -1006,9 +1006,9 @@ TEST_CASE("Unified Compression Benchmark") {
   if (max_size_env) {
     try {
       max_size = hshm::ConfigParse::ParseSize(max_size_env);
-      std::cerr << "Using MAX_SIZE=" << max_size_env << " (" << max_size << " bytes)" << std::endl;
+      HLOG(kInfo, "Using MAX_SIZE={} ({} bytes)", max_size_env, max_size);
     } catch (...) {
-      std::cerr << "Warning: Invalid MAX_SIZE value '" << max_size_env << "', using default 16MB" << std::endl;
+      HLOG(kWarning, "Invalid MAX_SIZE value '{}', using default 16MB", max_size_env);
     }
   }
 
@@ -1018,9 +1018,9 @@ TEST_CASE("Unified Compression Benchmark") {
       num_bins = std::stoul(num_bins_env);
       if (num_bins < 1) num_bins = 1;
       if (num_bins > 256) num_bins = 256;
-      std::cerr << "Using NUM_BINS=" << num_bins << std::endl;
+      HLOG(kInfo, "Using NUM_BINS={}", num_bins);
     } catch (...) {
-      std::cerr << "Warning: Invalid NUM_BINS value, using default 64" << std::endl;
+      HLOG(kWarning, "Invalid NUM_BINS value, using default 64");
     }
   }
 
@@ -1044,8 +1044,8 @@ TEST_CASE("Unified Compression Benchmark") {
     }
   }
 
-  std::cerr << "Data sizes: " << data_sizes.size() << " bins from "
-            << data_sizes.front() << " to " << data_sizes.back() << " bytes" << std::endl;
+  HLOG(kInfo, "Data sizes: {} bins from {} to {} bytes", data_sizes.size(),
+       data_sizes.front(), data_sizes.back());
 
   // Generate binned distribution configurations
   // Environment variables to control distribution generation:
@@ -1065,9 +1065,9 @@ TEST_CASE("Unified Compression Benchmark") {
     try {
       n_dist_bins = std::stoul(dist_bins_env);
       if (n_dist_bins < 2) n_dist_bins = 2;
-      std::cerr << "Using DIST_BINS=" << n_dist_bins << std::endl;
+      HLOG(kInfo, "Using DIST_BINS={}", n_dist_bins);
     } catch (...) {
-      std::cerr << "Warning: Invalid DIST_BINS, using default 16" << std::endl;
+      HLOG(kWarning, "Invalid DIST_BINS, using default 16");
     }
   }
 
@@ -1083,7 +1083,7 @@ TEST_CASE("Unified Compression Benchmark") {
       } catch (...) {}
     }
     if (bin_widths.empty()) bin_widths = {1.0, 64.0, 256.0};
-    std::cerr << "Using DIST_WIDTHS with " << bin_widths.size() << " values" << std::endl;
+    HLOG(kInfo, "Using DIST_WIDTHS with {} values", bin_widths.size());
   }
 
   // Parse DIST_PERTURBATIONS (comma-separated)
@@ -1098,7 +1098,7 @@ TEST_CASE("Unified Compression Benchmark") {
       } catch (...) {}
     }
     if (perturbations.empty()) perturbations = {0.0, 0.25, 0.5};
-    std::cerr << "Using DIST_PERTURBATIONS with " << perturbations.size() << " values" << std::endl;
+    HLOG(kInfo, "Using DIST_PERTURBATIONS with {} values", perturbations.size());
   }
 
   // Parse DIST_TYPES (comma-separated)
@@ -1114,7 +1114,7 @@ TEST_CASE("Unified Compression Benchmark") {
       }
     }
     if (dist_type_names.empty()) dist_type_names = {"uniform", "normal", "gamma", "exponential", "bimodal", "grayscott"};
-    std::cerr << "Using DIST_TYPES with " << dist_type_names.size() << " types" << std::endl;
+    HLOG(kInfo, "Using DIST_TYPES with {} types", dist_type_names.size());
   }
 
   // Pre-compute percentage distributions
@@ -1160,9 +1160,9 @@ TEST_CASE("Unified Compression Benchmark") {
     }
   }
 
-  std::cerr << "Generated " << distributions.size() << " binned distribution configurations ("
-            << dist_types.size() << " types × " << bin_widths.size() << " widths × "
-            << perturbations.size() << " perturbations)" << std::endl;
+  HLOG(kInfo,
+       "Generated {} binned distribution configurations ({} types × {} widths × {} perturbations)",
+       distributions.size(), dist_types.size(), bin_widths.size(), perturbations.size());
 
   const std::vector<std::pair<std::string, hshm::DataType>> data_types = {
       {"char", hshm::DataType::UINT8},
@@ -1179,7 +1179,7 @@ TEST_CASE("Unified Compression Benchmark") {
         num_threads = requested;
       }
     } catch (...) {
-      std::cerr << "Warning: Invalid NUM_THREADS value, defaulting to 1 thread" << std::endl;
+      HLOG(kWarning, "Invalid NUM_THREADS value, defaulting to 1 thread");
     }
   }
 
@@ -1189,16 +1189,16 @@ TEST_CASE("Unified Compression Benchmark") {
   const char* output_env = std::getenv("OUTPUT_FILE");
   if (output_env) {
     output_path = output_env;
-    std::cerr << "Using OUTPUT_FILE=" << output_path << std::endl;
+    HLOG(kInfo, "Using OUTPUT_FILE={}", output_path);
   }
 
   std::ofstream outfile(output_path);
   if (!outfile.is_open()) {
-    std::cerr << "ERROR: Could not open output file: " << output_path << std::endl;
-    std::cerr << "Note: Make sure the directory exists.\n";
+    HLOG(kError, "Could not open output file: {}", output_path);
+    HLOG(kError, "Note: Make sure the directory exists.");
     return;
   }
-  std::cerr << "Writing results to: " << output_path << std::endl;
+  HLOG(kInfo, "Writing results to: {}", output_path);
 
   // Print header to file only
   PrintCSVHeader(outfile);
@@ -1223,13 +1223,13 @@ TEST_CASE("Unified Compression Benchmark") {
   bool lossy_only = lossy_only_env && (std::string(lossy_only_env) == "1" || std::string(lossy_only_env) == "true");
 
   // Add lossless compressors (unless in lossy-only mode)
-  std::cerr << "=== Compression Benchmark Configuration ===" << std::endl;
+  HLOG(kInfo, "=== Compression Benchmark Configuration ===");
   if (lossy_only) {
-    std::cerr << "Mode: LOSSY ONLY (lossless libraries disabled)" << std::endl;
+    HLOG(kInfo, "Mode: LOSSY ONLY (lossless libraries disabled)");
   } else {
-    std::cerr << "Lossless libraries: BZIP2, ZSTD, LZ4, ZLIB, LZMA, BROTLI (with compression levels)" << std::endl;
-    std::cerr << "Lossless libraries (single mode): SNAPPY, Blosc2" << std::endl;
-    std::cerr << "Compression modes: FAST, BALANCED, BEST" << std::endl;
+    HLOG(kInfo, "Lossless libraries: BZIP2, ZSTD, LZ4, ZLIB, LZMA, BROTLI (with compression levels)");
+    HLOG(kInfo, "Lossless libraries (single mode): SNAPPY, Blosc2");
+    HLOG(kInfo, "Compression modes: FAST, BALANCED, BEST");
 
     // BZIP2 - compression levels 1, 6, 9
     compressors.push_back({"BZIP2", "fast", std::make_unique<hshm::Bzip2WithModes>(hshm::LosslessMode::FAST)});
@@ -1265,13 +1265,13 @@ TEST_CASE("Unified Compression Benchmark") {
     compressors.push_back({"SNAPPY", "default", std::make_unique<hshm::Snappy>()});
     compressors.push_back({"Blosc2", "default", std::make_unique<hshm::Blosc>()});
   }
-  std::cerr << "Distribution variants: " << distributions.size() << " (varying compressibility)" << std::endl;
-  std::cerr << "Data sizes: " << data_sizes.size() << " bins" << std::endl;
+  HLOG(kInfo, "Distribution variants: {} (varying compressibility)", distributions.size());
+  HLOG(kInfo, "Data sizes: {} bins", data_sizes.size());
 
 #if HSHM_ENABLE_COMPRESS && HSHM_ENABLE_LIBPRESSIO
   // Add lossy compressors via LibPressio with multiple compression modes
-  std::cerr << "Lossy libraries: ZFP, SZ3, FPZIP (LibPressio enabled)" << std::endl;
-  std::cerr << "Compression modes: FAST, BALANCED, BEST" << std::endl;
+  HLOG(kInfo, "Lossy libraries: ZFP, SZ3, FPZIP (LibPressio enabled)");
+  HLOG(kInfo, "Compression modes: FAST, BALANCED, BEST");
 
   // ZFP - block transform compressor (best for floating-point data)
   compressors.push_back({"ZFP", "fast", std::make_unique<hshm::LibPressioWithModes>("zfp", hshm::CompressionMode::FAST)});
@@ -1288,15 +1288,15 @@ TEST_CASE("Unified Compression Benchmark") {
   compressors.push_back({"FPZIP", "balanced", std::make_unique<hshm::LibPressioWithModes>("fpzip", hshm::CompressionMode::BALANCED)});
   compressors.push_back({"FPZIP", "best", std::make_unique<hshm::LibPressioWithModes>("fpzip", hshm::CompressionMode::BEST)});
 #else
-  std::cerr << "Lossy libraries: DISABLED (LibPressio not available)" << std::endl;
-  std::cerr << "  To enable lossy compression: install LibPressio and rebuild" << std::endl;
+  HLOG(kInfo, "Lossy libraries: DISABLED (LibPressio not available)");
+  HLOG(kInfo, "  To enable lossy compression: install LibPressio and rebuild");
 #endif
 
-  std::cerr << "Total compressor configurations: " << compressors.size() << std::endl;
+  HLOG(kInfo, "Total compressor configurations: {}", compressors.size());
   if (num_threads > 1) {
-    std::cerr << "Parallel execution: " << num_threads << " threads" << std::endl;
+    HLOG(kInfo, "Parallel execution: {} threads", num_threads);
   }
-  std::cerr << "========================================" << std::endl << std::endl;
+  HLOG(kInfo, "========================================");
 
   // Thread-safe output and progress tracking
   std::mutex csv_mutex;
@@ -1310,7 +1310,7 @@ TEST_CASE("Unified Compression Benchmark") {
     size_t num_types = is_lossy ? 1 : 3;  // Lossy only works on float
     total_samples += num_types * distributions.size() * data_sizes.size();
   }
-  std::cerr << "Total samples to process: " << total_samples << std::endl << std::endl;
+  HLOG(kInfo, "Total samples to process: {}", total_samples);
 
   // Process compressors (in parallel if num_threads > 1)
   if (num_threads == 1) {
@@ -1359,29 +1359,26 @@ TEST_CASE("Unified Compression Benchmark") {
                 double rate = seq_completed / (elapsed / 60.0 + 0.001);
                 double eta_min = (total_samples - seq_completed) / rate;
 
-                std::cerr << "\r[Progress] " << seq_completed << " / " << total_samples
-                          << " (" << std::fixed << std::setprecision(1) << percent << "%) | "
-                          << "Rate: " << std::fixed << std::setprecision(0) << rate << " samples/min | "
-                          << "ETA: " << std::fixed << std::setprecision(0) << eta_min << " min   "
-                          << std::flush;
+                HIPRINT("\r[Progress] {} / {} ({}%) | Rate: {} samples/min | ETA: {} min   ",
+                        seq_completed, total_samples, static_cast<int>(percent),
+                        static_cast<int>(rate), static_cast<int>(eta_min));
 
                 if (seq_completed == total_samples) {
-                  std::cerr << std::endl;
+                  HIPRINT("\n");
                 }
               }
             }
           }
         }
       } catch (const std::exception& e) {
-        std::cerr << "\nError benchmarking " << lib_name << " [" << config_name << "]: " << e.what()
-                  << std::endl;
+        HLOG(kError, "\nError benchmarking {} [{}]: {}", lib_name, config_name, e.what());
         continue;
       } catch (...) {
-        std::cerr << "\nUnknown error benchmarking " << lib_name << " [" << config_name << "]" << std::endl;
+        HLOG(kError, "\nUnknown error benchmarking {} [{}]", lib_name, config_name);
         continue;
       }
     }
-    std::cerr << "\nSequential execution completed!" << std::endl;
+    HLOG(kInfo, "Sequential execution completed!");
   } else {
     // Parallel execution with work stealing
     std::vector<std::thread> workers;
@@ -1395,7 +1392,7 @@ TEST_CASE("Unified Compression Benchmark") {
       work_queue.push(i);
     }
 
-    std::cerr << "Work queue initialized with " << compressors.size() << " compressor configs" << std::endl;
+    HLOG(kInfo, "Work queue initialized with {} compressor configs", compressors.size());
 
     // Spawn worker threads
     for (size_t t = 0; t < num_threads; ++t) {
@@ -1453,14 +1450,12 @@ TEST_CASE("Unified Compression Benchmark") {
                       double rate = completed / (elapsed / 60.0 + 0.001);
                       double eta_min = (total_samples - completed) / rate;
 
-                      std::cerr << "\r[Progress] " << completed << " / " << total_samples
-                                << " (" << std::fixed << std::setprecision(1) << percent << "%) | "
-                                << "Rate: " << std::fixed << std::setprecision(0) << rate << " samples/min | "
-                                << "ETA: " << std::fixed << std::setprecision(0) << eta_min << " min   "
-                                << std::flush;
+                      HIPRINT("\r[Progress] {} / {} ({}%) | Rate: {} samples/min | ETA: {} min   ",
+                              completed, total_samples, static_cast<int>(percent),
+                              static_cast<int>(rate), static_cast<int>(eta_min));
 
                       if (completed == total_samples) {
-                        std::cerr << std::endl;
+                        HIPRINT("\n");
                       }
                     }
                   }
@@ -1469,12 +1464,10 @@ TEST_CASE("Unified Compression Benchmark") {
             }
           } catch (const std::exception& e) {
             std::lock_guard<std::mutex> lock(csv_mutex);
-            std::cerr << "\nError benchmarking " << lib_name << " [" << config_name << "]: "
-                      << e.what() << std::endl;
+            HLOG(kError, "\nError benchmarking {} [{}]: {}", lib_name, config_name, e.what());
           } catch (...) {
             std::lock_guard<std::mutex> lock(csv_mutex);
-            std::cerr << "\nUnknown error benchmarking " << lib_name << " [" << config_name << "]"
-                      << std::endl;
+            HLOG(kError, "\nUnknown error benchmarking {} [{}]", lib_name, config_name);
           }
         }
       });
@@ -1485,11 +1478,11 @@ TEST_CASE("Unified Compression Benchmark") {
       worker.join();
     }
 
-    std::cerr << "\nAll threads completed!" << std::endl;
+    HLOG(kInfo, "All threads completed!");
   }
 
   if (outfile.is_open()) {
     outfile.close();
-    std::cerr << "\nResults saved to: results/compression_benchmark_results.csv" << std::endl;
+    HLOG(kInfo, "Results saved to: results/compression_benchmark_results.csv");
   }
 }

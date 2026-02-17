@@ -34,6 +34,7 @@
 #ifndef CHIMAERA_INCLUDE_CHIMAERA_TYPES_H_
 #define CHIMAERA_INCLUDE_CHIMAERA_TYPES_H_
 
+#include <chrono>
 #include <cstdint>
 #include <iostream>
 #include <memory>
@@ -55,6 +56,14 @@ using u32 = hshm::u32;
 using u64 = hshm::u64;
 using i64 = hshm::i64;
 using ibitfield = hshm::ibitfield;
+
+// Node state for SWIM-inspired failure detection
+enum class NodeState : u32 {
+  kAlive = 0,
+  kProbeFailed = 1,  // Direct probe failed, indirect probing in progress
+  kSuspected = 2,    // All indirect probes failed, likely dead
+  kDead = 3          // Confirmed dead after suspicion timeout
+};
 
 // Time unit constants for period conversions (divisors from nanoseconds)
 constexpr double kNano = 1.0;           // 1 nanosecond
@@ -82,11 +91,14 @@ class Chimaera;
 struct Host {
   std::string ip_address;  // IP address as string (IPv4 or IPv6)
   u64 node_id;             // 64-bit representation of IP address
+  NodeState state;         // SWIM failure detection state
+  std::chrono::steady_clock::time_point state_changed_at;
 
   /**
    * Default constructor
    */
-  Host() : node_id(0) {}
+  Host() : node_id(0), state(NodeState::kAlive),
+           state_changed_at(std::chrono::steady_clock::now()) {}
 
   /**
    * Constructor with IP address and node ID (required)
@@ -94,7 +106,11 @@ struct Host {
    * @param ip IP address string
    * @param id Node ID (typically offset in hostfile)
    */
-  Host(const std::string &ip, u64 id) : ip_address(ip), node_id(id) {}
+  Host(const std::string &ip, u64 id)
+      : ip_address(ip), node_id(id), state(NodeState::kAlive),
+        state_changed_at(std::chrono::steady_clock::now()) {}
+
+  bool IsAlive() const { return state == NodeState::kAlive; }
 
   /**
    * Stream output operator for Host
@@ -103,7 +119,15 @@ struct Host {
    * @return Reference to output stream
    */
   friend std::ostream &operator<<(std::ostream &os, const Host &host) {
-    os << "Host(ip=" << host.ip_address << ", node_id=" << host.node_id << ")";
+    const char *state_name = "unknown";
+    switch (host.state) {
+      case NodeState::kAlive: state_name = "alive"; break;
+      case NodeState::kProbeFailed: state_name = "probe_failed"; break;
+      case NodeState::kSuspected: state_name = "suspected"; break;
+      case NodeState::kDead: state_name = "dead"; break;
+    }
+    os << "Host(ip=" << host.ip_address << ", node_id=" << host.node_id
+       << ", state=" << state_name << ")";
     return os;
   }
 };
@@ -251,6 +275,7 @@ using MethodId = u32;
 using WorkerId = u32;
 using LaneId = u32;
 using ContainerId = u32;
+static constexpr ContainerId kInvalidContainerId = static_cast<ContainerId>(-1);
 using MinorId = u32;
 
 // Container addressing system types
@@ -399,6 +424,46 @@ inline HSHM_CROSS_FUN TaskId CreateTaskId() {
 // Template aliases for full pointers using HSHM
 template <typename T>
 using FullPtr = hipc::FullPtr<T>;
+
+/**
+ * Migration descriptor for container migration between nodes
+ */
+struct MigrateInfo {
+  PoolId pool_id_;
+  ContainerId container_id_;
+  u32 dest_;  // destination node ID
+
+  MigrateInfo() : pool_id_(), container_id_(0), dest_(0) {}
+  MigrateInfo(PoolId pool_id, ContainerId container_id, u32 dest)
+      : pool_id_(pool_id), container_id_(container_id), dest_(dest) {}
+
+  template <typename Ar>
+  void serialize(Ar &ar) {
+    ar(pool_id_, container_id_, dest_);
+  }
+};
+
+/**
+ * Recovery descriptor for recreating containers from dead nodes
+ */
+struct RecoveryAssignment {
+  PoolId pool_id_;
+  std::string chimod_name_;
+  std::string pool_name_;
+  std::string chimod_params_;
+  ContainerId container_id_;
+  u32 dest_node_id_;
+  u32 dead_node_id_;
+
+  RecoveryAssignment()
+      : container_id_(0), dest_node_id_(0), dead_node_id_(0) {}
+
+  template <typename Ar>
+  void serialize(Ar &ar) {
+    ar(pool_id_, chimod_name_, pool_name_, chimod_params_,
+       container_id_, dest_node_id_, dead_node_id_);
+  }
+};
 
 }  // namespace chi
 

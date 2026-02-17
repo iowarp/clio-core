@@ -40,6 +40,7 @@
 #include <chimaera/admin/admin_client.h>
 #include <chimaera/bdev/bdev_client.h>
 #include <fstream>
+#include <hermes_shm/util/logging.h>
 
 #include "simple_test.h"
 
@@ -89,7 +90,7 @@ TEST_CASE("PoolId::FromString parsing", "[compose]") {
   REQUIRE(pool_id2.major_ == 123);
   REQUIRE(pool_id2.minor_ == 456);
 
-  std::cout << "PoolId::FromString tests passed\n";
+  HIPRINT("PoolId::FromString tests passed");
 }
 
 /**
@@ -111,7 +112,7 @@ TEST_CASE("PoolQuery::FromString parsing", "[compose]") {
   chi::PoolQuery query4 = chi::PoolQuery::FromString("Dynamic");
   REQUIRE(query4.IsDynamicMode());
 
-  std::cout << "PoolQuery::FromString tests passed\n";
+  HIPRINT("PoolQuery::FromString tests passed");
 }
 
 /**
@@ -149,7 +150,7 @@ TEST_CASE("Parse compose configuration", "[compose]") {
   }
   REQUIRE(found_test_pool);
 
-  std::cout << "Parse compose config test passed\n";
+  HIPRINT("Parse compose config test passed");
 }
 
 /**
@@ -197,7 +198,7 @@ TEST_CASE("Admin client Compose method", "[compose]") {
 
   REQUIRE(blocks.size() > 0);
 
-  std::cout << "Admin client Compose test passed\n";
+  HIPRINT("Admin client Compose test passed");
 }
 
 int main(int argc, char **argv) {
@@ -205,9 +206,9 @@ int main(int argc, char **argv) {
   (void)argv;
 
   // Initialize runtime
-  std::cout << "Initializing Chimaera runtime...\n";
+  HIPRINT("Initializing Chimaera runtime...");
   if (!chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true)) {
-    std::cerr << "Failed to initialize Chimaera runtime\n";
+    HLOG(kError, "Failed to initialize Chimaera runtime");
     return 1;
   }
 

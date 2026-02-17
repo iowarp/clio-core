@@ -1,0 +1,144 @@
+# Recovery Integration Tests for Chimaera Runtime
+# Tests node failure detection and container recovery:
+# 1. Start 4-node cluster
+# 2. Create MOD_NAME pool with 4 containers
+# 3. Kill node 4 (simulating node failure)
+# 4. Wait for SWIM detection + automatic recovery
+# 5. Verify tasks targeting dead node's container are re-routed
+#
+# Usage:
+#   docker compose up -d
+#   # Run pre-failure test from node1
+#   docker exec iowarp-recovery-node1 bash -c "chimaera_recovery_tests '[recovery][pre_failure]'"
+#   # Kill node 4
+#   docker stop iowarp-recovery-node4
+#   # Wait 30s for SWIM detection + recovery
+#   # Run post-failure test from node1
+#   docker exec iowarp-recovery-node1 bash -c "chimaera_recovery_tests '[recovery][post_failure]'"
+
+services:
+  # Node 1 - Test coordinator
+  iowarp-node1:
+    image: iowarp/deps-cpu:latest
+    container_name: iowarp-recovery-node1
+    hostname: iowarp-node1
+    networks:
+      iowarp-recovery-cluster:
+        ipv4_address: 172.27.0.10
+    volumes:
+      - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-/workspace}}:/workspace:rw
+    environment:
+      - NODE_ID=1
+      - NODE_IP=172.27.0.10
+      - WRP_RUNTIME_CONF=/workspace/context-runtime/test/integration/recovery/wrp_conf.yaml
+      - CONTAINER_HOSTFILE=/workspace/context-runtime/test/integration/recovery/hostfile
+      - CHIMAERA_WITH_RUNTIME=0
+      - CHI_NUM_CONTAINERS=4
+      - PATH=/workspace/build/bin:/usr/local/bin:/usr/bin:/bin
+      - LD_LIBRARY_PATH=/workspace/build/bin:$LD_LIBRARY_PATH
+    shm_size: '16gb'
+    mem_limit: 16g
+    working_dir: /workspace
+    entrypoint: [ "/bin/bash", "-c" ]
+    command: >
+      "
+        echo 'Node 1: Starting runtime...' &&
+        /workspace/build/bin/chimaera_start_runtime &
+        RUNTIME_PID=\$! &&
+        echo 'Node 1: Runtime started (PID \$RUNTIME_PID). Waiting for test runner...' &&
+        wait \$RUNTIME_PID
+      "
+
+  # Node 2
+  iowarp-node2:
+    image: iowarp/deps-cpu:latest
+    container_name: iowarp-recovery-node2
+    hostname: iowarp-node2
+    networks:
+      iowarp-recovery-cluster:
+        ipv4_address: 172.27.0.11
+    volumes:
+      - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-/workspace}}:/workspace:rw
+    environment:
+      - NODE_ID=2
+      - NODE_IP=172.27.0.11
+      - WRP_RUNTIME_CONF=/workspace/context-runtime/test/integration/recovery/wrp_conf.yaml
+      - CONTAINER_HOSTFILE=/workspace/context-runtime/test/integration/recovery/hostfile
+      - CHIMAERA_WITH_RUNTIME=0
+      - CHI_NUM_CONTAINERS=4
+      - PATH=/workspace/build/bin:/usr/local/bin:/usr/bin:/bin
+      - LD_LIBRARY_PATH=/workspace/build/bin:$LD_LIBRARY_PATH
+    shm_size: '16gb'
+    mem_limit: 16g
+    working_dir: /workspace
+    entrypoint: [ "/bin/bash", "-c" ]
+    command: >
+      "
+        echo 'Node 2: Starting runtime...' &&
+        /workspace/build/bin/chimaera_start_runtime
+      "
+
+  # Node 3
+  iowarp-node3:
+    image: iowarp/deps-cpu:latest
+    container_name: iowarp-recovery-node3
+    hostname: iowarp-node3
+    networks:
+      iowarp-recovery-cluster:
+        ipv4_address: 172.27.0.12
+    volumes:
+      - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-/workspace}}:/workspace:rw
+    environment:
+      - NODE_ID=3
+      - NODE_IP=172.27.0.12
+      - WRP_RUNTIME_CONF=/workspace/context-runtime/test/integration/recovery/wrp_conf.yaml
+      - CONTAINER_HOSTFILE=/workspace/context-runtime/test/integration/recovery/hostfile
+      - CHIMAERA_WITH_RUNTIME=0
+      - CHI_NUM_CONTAINERS=4
+      - PATH=/workspace/build/bin:/usr/local/bin:/usr/bin:/bin
+      - LD_LIBRARY_PATH=/workspace/build/bin:$LD_LIBRARY_PATH
+    shm_size: '16gb'
+    mem_limit: 16g
+    working_dir: /workspace
+    entrypoint: [ "/bin/bash", "-c" ]
+    command: >
+      "
+        echo 'Node 3: Starting runtime...' &&
+        /workspace/build/bin/chimaera_start_runtime
+      "
+
+  # Node 4 - Will be killed to simulate failure
+  iowarp-node4:
+    image: iowarp/deps-cpu:latest
+    container_name: iowarp-recovery-node4
+    hostname: iowarp-node4
+    networks:
+      iowarp-recovery-cluster:
+        ipv4_address: 172.27.0.13
+    volumes:
+      - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-/workspace}}:/workspace:rw
+    environment:
+      - NODE_ID=4
+      - NODE_IP=172.27.0.13
+      - WRP_RUNTIME_CONF=/workspace/context-runtime/test/integration/recovery/wrp_conf.yaml
+      - CONTAINER_HOSTFILE=/workspace/context-runtime/test/integration/recovery/hostfile
+      - CHIMAERA_WITH_RUNTIME=0
+      - CHI_NUM_CONTAINERS=4
+      - PATH=/workspace/build/bin:/usr/local/bin:/usr/bin:/bin
+      - LD_LIBRARY_PATH=/workspace/build/bin:$LD_LIBRARY_PATH
+    shm_size: '16gb'
+    mem_limit: 16g
+    working_dir: /workspace
+    entrypoint: [ "/bin/bash", "-c" ]
+    command: >
+      "
+        echo 'Node 4: Starting runtime...' &&
+        /workspace/build/bin/chimaera_start_runtime
+      "
+
+networks:
+  iowarp-recovery-cluster:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.27.0.0/16

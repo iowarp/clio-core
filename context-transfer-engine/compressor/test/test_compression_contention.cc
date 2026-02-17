@@ -68,6 +68,7 @@
 #include <sys/times.h>
 
 #include <hermes_shm/compress/compress_factory.h>
+#include <hermes_shm/util/logging.h>
 
 using namespace std::chrono;
 
@@ -439,17 +440,17 @@ BenchmarkResult RunBenchmark(const std::string& lib_name,
 // ============================================================================
 
 int main(int argc, char* argv[]) {
-  std::cout << "============================================================\n";
-  std::cout << "COMPRESSION CONTENTION BENCHMARK\n";
-  std::cout << "============================================================\n";
-  std::cout << "Configuration:\n";
-  std::cout << "  Simulation threads: " << NUM_SIM_THREADS << "\n";
-  std::cout << "  Compression threads: " << NUM_COMPRESS_THREADS << "\n";
-  std::cout << "  Chunk size: " << CHUNK_SIZE_KB << " KB\n";
-  std::cout << "  Queue depth: " << QUEUE_DEPTH << "\n";
-  std::cout << "  Busy time: " << BUSY_TIME_SECONDS << " seconds\n";
-  std::cout << "  Outputs: " << NUM_OUTPUTS << "\n";
-  std::cout << "============================================================\n\n";
+  HIPRINT("============================================================\n");
+  HIPRINT("COMPRESSION CONTENTION BENCHMARK\n");
+  HIPRINT("============================================================\n");
+  HIPRINT("Configuration:\n");
+  HIPRINT("  Simulation threads: {}\n", NUM_SIM_THREADS);
+  HIPRINT("  Compression threads: {}\n", NUM_COMPRESS_THREADS);
+  HIPRINT("  Chunk size: {} KB\n", CHUNK_SIZE_KB);
+  HIPRINT("  Queue depth: {}\n", QUEUE_DEPTH);
+  HIPRINT("  Busy time: {} seconds\n", BUSY_TIME_SECONDS);
+  HIPRINT("  Outputs: {}\n", NUM_OUTPUTS);
+  HIPRINT("============================================================\n\n");
 
   // Define libraries to test
   std::vector<std::string> libraries = {
@@ -473,12 +474,11 @@ int main(int argc, char* argv[]) {
   std::vector<BenchmarkResult> results;
 
   for (const auto& name : libraries) {
-    std::cout << "Testing " << name << "... " << std::flush;
+    HIPRINT("Testing {}... ", name);
     auto result = RunBenchmark(name, "best");
     results.push_back(result);
-    std::cout << "done (wall=" << std::fixed << std::setprecision(2)
-              << result.wall_clock_sec << "s, slowdown="
-              << result.sim_slowdown_pct << "%)\n";
+    HIPRINT("done (wall={}s, slowdown={}%)\n", result.wall_clock_sec,
+            result.sim_slowdown_pct);
   }
 
   // Write results to CSV
@@ -512,23 +512,18 @@ int main(int argc, char* argv[]) {
   }
 
   csv.close();
-  std::cout << "\nResults saved to: " << output_file << "\n";
+  HIPRINT("\nResults saved to: {}\n", output_file);
 
   // Print summary
-  std::cout << "\n============================================================\n";
-  std::cout << "SUMMARY\n";
-  std::cout << "============================================================\n";
-  std::cout << std::setw(12) << "Library"
-            << std::setw(15) << "Wall Time"
-            << std::setw(15) << "Slowdown %"
-            << std::setw(15) << "Ratio\n";
-  std::cout << std::string(57, '-') << "\n";
+  HIPRINT("\n============================================================\n");
+  HIPRINT("SUMMARY\n");
+  HIPRINT("============================================================\n");
+  HIPRINT("{:<12}{:<15}{:<15}{:<15}\n", "Library", "Wall Time", "Slowdown %", "Ratio");
+  HIPRINT("{}\n", std::string(57, '-'));
 
   for (const auto& r : results) {
-    std::cout << std::setw(12) << r.library_name
-              << std::setw(15) << std::fixed << std::setprecision(2) << r.wall_clock_sec
-              << std::setw(15) << r.sim_slowdown_pct
-              << std::setw(15) << r.compression_ratio << "\n";
+    HIPRINT("{:<12}{:<15.2f}{:<15.2f}{:<15.2f}\n", r.library_name,
+            r.wall_clock_sec, r.sim_slowdown_pct, r.compression_ratio);
   }
 
   return 0;

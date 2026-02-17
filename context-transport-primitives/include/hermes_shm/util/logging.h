@@ -53,14 +53,17 @@
 #ifndef kInfo
 #define kInfo 1     /**< Useful information the user should know */
 #endif
+#ifndef kSuccess
+#define kSuccess 2  /**< Operation completed successfully */
+#endif
 #ifndef kWarning
-#define kWarning 2  /**< Something might be wrong */
+#define kWarning 3  /**< Something might be wrong */
 #endif
 #ifndef kError
-#define kError 3    /**< A non-fatal error has occurred */
+#define kError 4    /**< A non-fatal error has occurred */
 #endif
 #ifndef kFatal
-#define kFatal 4    /**< A fatal error has occurred */
+#define kFatal 5    /**< A fatal error has occurred */
 #endif
 
 /**
@@ -127,11 +130,13 @@ class Logger {
         runtime_log_level_ = kDebug;
       } else if (level_env == "info" || level_env == "INFO" || level_env == "1") {
         runtime_log_level_ = kInfo;
-      } else if (level_env == "warning" || level_env == "WARNING" || level_env == "2") {
+      } else if (level_env == "success" || level_env == "SUCCESS" || level_env == "2") {
+        runtime_log_level_ = kSuccess;
+      } else if (level_env == "warning" || level_env == "WARNING" || level_env == "3") {
         runtime_log_level_ = kWarning;
-      } else if (level_env == "error" || level_env == "ERROR" || level_env == "3") {
+      } else if (level_env == "error" || level_env == "ERROR" || level_env == "4") {
         runtime_log_level_ = kError;
-      } else if (level_env == "fatal" || level_env == "FATAL" || level_env == "4") {
+      } else if (level_env == "fatal" || level_env == "FATAL" || level_env == "5") {
         runtime_log_level_ = kFatal;
       } else {
         // Try to parse as integer
@@ -162,10 +167,29 @@ class Logger {
     switch (level) {
       case kDebug: return "DEBUG";
       case kInfo: return "INFO";
+      case kSuccess: return "SUCCESS";
       case kWarning: return "WARNING";
       case kError: return "ERROR";
       case kFatal: return "FATAL";
       default: return "UNKNOWN";
+    }
+  }
+
+  /**
+   * Get the ANSI color code for a log level
+   * @param level The log level
+   * @return ANSI escape sequence for the log level color
+   */
+  HSHM_CROSS_FUN
+  static const char* GetLevelColor(int level) {
+    switch (level) {
+      case kDebug: return "\033[90m";    // Dark Grey
+      case kInfo: return "\033[97m";     // White
+      case kSuccess: return "\033[32m";  // Green
+      case kWarning: return "\033[33m";  // Yellow
+      case kError: return "\033[31m";    // Red
+      case kFatal: return "\033[31m";    // Red
+      default: return "\033[0m";         // Reset
     }
   }
 
@@ -201,14 +225,17 @@ class Logger {
     }
 
     const char* level = GetLevelString(LOG_CODE);
+    const char* color = GetLevelColor(LOG_CODE);
+    const char* reset = "\033[0m";
     std::string msg = hshm::Formatter::format(fmt, std::forward<Args>(args)...);
     int tid = SystemInfo::GetTid();
-    std::string out = hshm::Formatter::format("{}:{} {} {} {} {}\n", path, line,
-                                              level, tid, func, msg);
+    std::string out = hshm::Formatter::format(
+        "{}{}:{} {} {} {} {}{}\n",
+        color, path, line, level, tid, func, msg, reset);
 
     // Route to appropriate output stream
-    // Debug and Info go to stdout, Warning/Error/Fatal go to stderr
-    if (LOG_CODE <= kInfo) {
+    // Debug, Info, and Success go to stdout; Warning/Error/Fatal go to stderr
+    if (LOG_CODE <= kSuccess) {
       std::cout << out;
       fflush(stdout);
     } else {
@@ -216,9 +243,11 @@ class Logger {
       fflush(stderr);
     }
 
-    // Also write to file if configured
+    // Write to file without color codes
     if (fout_) {
-      fwrite(out.data(), 1, out.size(), fout_);
+      std::string file_out = hshm::Formatter::format(
+          "{}:{} {} {} {} {}\n", path, line, level, tid, func, msg);
+      fwrite(file_out.data(), 1, file_out.size(), fout_);
       fflush(fout_);
     }
 

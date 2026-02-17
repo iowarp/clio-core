@@ -1,0 +1,25 @@
+services:
+  hindsight:
+    image: ghcr.io/vectorize-io/hindsight:latest
+    ports:
+      - "8888:8888" # API
+      - "9999:9999" # Control Plane UI
+    environment:
+      HINDSIGHT_API_LLM_PROVIDER: ${HINDSIGHT_LLM_PROVIDER:-anthropic}
+      HINDSIGHT_API_LLM_API_KEY: ${HINDSIGHT_LLM_API_KEY:-${ANTHROPIC_API_KEY}}
+      HINDSIGHT_API_LLM_MODEL: ${HINDSIGHT_LLM_MODEL:-claude-sonnet-4-5-20250929}
+      HINDSIGHT_API_HOST: 0.0.0.0
+      HINDSIGHT_API_PORT: 8888
+      HINDSIGHT_API_LOG_LEVEL: info
+      HINDSIGHT_CP_DATAPLANE_API_URL: http://localhost:8888
+    volumes:
+      - hindsight_data:/app/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8888/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+volumes:
+  hindsight_data:

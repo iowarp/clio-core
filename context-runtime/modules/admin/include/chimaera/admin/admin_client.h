@@ -36,6 +36,10 @@
 
 #include <chimaera/chimaera.h>
 
+#include <cereal/archives/binary.hpp>
+#include <cereal/types/vector.hpp>
+#include <sstream>
+
 #include "admin_tasks.h"
 
 /**
@@ -389,6 +393,117 @@ class Client : public chi::ContainerClient {
     auto task = ipc_manager->NewTask<AddNodeTask>(
         chi::CreateTaskId(), pool_id_, pool_query,
         new_node_ip, new_node_port);
+    return ipc_manager->Send(task);
+  }
+
+  /**
+   * ChangeAddressTable - Update ContainerId->NodeId mapping on nodes
+   * @param pool_query Pool routing (use Broadcast to reach all nodes)
+   * @param target_pool_id Pool whose address table to update
+   * @param container_id Container being remapped
+   * @param new_node_id New node ID for the container
+   * @return Future for the ChangeAddressTable task
+   */
+  chi::Future<ChangeAddressTableTask> AsyncChangeAddressTable(
+      const chi::PoolQuery& pool_query,
+      const chi::PoolId& target_pool_id,
+      chi::ContainerId container_id,
+      chi::u32 new_node_id) {
+    auto* ipc_manager = CHI_IPC;
+    auto task = ipc_manager->NewTask<ChangeAddressTableTask>(
+        chi::CreateTaskId(), pool_id_, pool_query,
+        target_pool_id, container_id, new_node_id);
+    return ipc_manager->Send(task);
+  }
+
+  /**
+   * Heartbeat - Liveness probe to a specific node
+   * @param pool_query Pool routing (use Physical(node_id) to target a node)
+   * @return Future for the HeartbeatTask
+   */
+  chi::Future<HeartbeatTask> AsyncHeartbeat(const chi::PoolQuery& pool_query) {
+    auto* ipc_manager = CHI_IPC;
+    auto task = ipc_manager->NewTask<HeartbeatTask>(
+        chi::CreateTaskId(), pool_id_, pool_query);
+    return ipc_manager->Send(task);
+  }
+
+  /**
+   * HeartbeatProbe - Periodic SWIM failure detector
+   * @param pool_query Pool routing (use Local())
+   * @param period_us Period in microseconds (default 2000000us = 2s)
+   * @return Future for the HeartbeatProbeTask
+   */
+  chi::Future<HeartbeatProbeTask> AsyncHeartbeatProbe(
+      const chi::PoolQuery& pool_query, double period_us = 2000000) {
+    auto* ipc_manager = CHI_IPC;
+
+    auto task = ipc_manager->NewTask<HeartbeatProbeTask>(
+        chi::CreateTaskId(), pool_id_, pool_query);
+
+    if (period_us > 0) {
+      task->SetPeriod(period_us, chi::kMicro);
+      task->SetFlags(TASK_PERIODIC);
+    }
+
+    return ipc_manager->Send(task);
+  }
+
+  /**
+   * ProbeRequest - Ask a helper node to probe a target on our behalf
+   * @param pool_query Pool routing (use Physical(helper_node_id))
+   * @param target_node_id Node to probe
+   * @return Future for the ProbeRequestTask
+   */
+  chi::Future<ProbeRequestTask> AsyncProbeRequest(
+      const chi::PoolQuery& pool_query, chi::u64 target_node_id) {
+    auto* ipc_manager = CHI_IPC;
+
+    auto task = ipc_manager->NewTask<ProbeRequestTask>(
+        chi::CreateTaskId(), pool_id_, pool_query, target_node_id);
+
+    return ipc_manager->Send(task);
+  }
+
+  /**
+   * MigrateContainers - Orchestrate container migration
+   * @param pool_query Pool routing
+   * @param migrations Vector of MigrateInfo describing migrations to perform
+   * @return Future for the MigrateContainers task
+   */
+  chi::Future<MigrateContainersTask> AsyncMigrateContainers(
+      const chi::PoolQuery& pool_query,
+      const std::vector<chi::MigrateInfo>& migrations) {
+    auto* ipc_manager = CHI_IPC;
+    // Serialize migrations using cereal binary archive
+    std::ostringstream os;
+    {
+      cereal::BinaryOutputArchive ar(os);
+      ar(migrations);
+    }
+    auto task = ipc_manager->NewTask<MigrateContainersTask>(
+        chi::CreateTaskId(), pool_id_, pool_query, os.str());
+    return ipc_manager->Send(task);
+  }
+  /**
+   * RecoverContainers - Broadcast recovery plan to all surviving nodes
+   * @param pool_query Pool routing (typically Broadcast)
+   * @param assignments Recovery assignments computed by leader
+   * @param dead_node_id ID of the dead node being recovered
+   * @return Future for the RecoverContainers task
+   */
+  chi::Future<RecoverContainersTask> AsyncRecoverContainers(
+      const chi::PoolQuery& pool_query,
+      const std::vector<chi::RecoveryAssignment>& assignments,
+      chi::u64 dead_node_id) {
+    auto* ipc_manager = CHI_IPC;
+    std::ostringstream os;
+    {
+      cereal::BinaryOutputArchive ar(os);
+      ar(assignments);
+    }
+    auto task = ipc_manager->NewTask<RecoverContainersTask>(
+        chi::CreateTaskId(), pool_id_, pool_query, os.str(), dead_node_id);
     return ipc_manager->Send(task);
   }
 };

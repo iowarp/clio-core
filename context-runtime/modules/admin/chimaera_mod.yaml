@@ -32,3 +32,9 @@ kClientSend: 21          # Send task outputs to ZMQ clients
 kRegisterMemory: 22      # Register client shared memory with runtime
 kRestartContainers: 23   # Restart containers from saved compose configs
 kAddNode: 24             # Register a new node with all existing nodes
+kChangeAddressTable: 25  # Update ContainerId->NodeId mapping on a node
+kMigrateContainers: 26   # Orchestrate container migration
+kHeartbeat: 27           # Liveness probe - just returns success
+kHeartbeatProbe: 28      # Periodic SWIM failure detector
+kProbeRequest: 29        # Indirect probe request to helper node
+kRecoverContainers: 30   # Leader broadcasts recovery plan to surviving nodes

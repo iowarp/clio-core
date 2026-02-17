@@ -59,6 +59,7 @@
 #include "H5PLextern.h"
 #include "adapter/posix/posix_fs_api.h"
 #include "wrp_cte/core/core_client.h"
+#include <hermes_shm/util/logging.h>
 
 /**
  * Make this adapter use Hermes.

@@ -87,9 +87,12 @@ using QueueId = u32;
  */
 class Container {
  public:
+  static constexpr u32 CONTAINER_PLUG = BIT_OPT(u32, 0);
+
   PoolId pool_id_;         ///< The unique ID of this pool
   std::string pool_name_;  ///< The semantic name of this pool
   u32 container_id_;       ///< The logical ID of this container instance
+  hshm::abitfield32_t flags_;  ///< Atomic bitfield for container state
 
  protected:
   PoolQuery pool_query_;
@@ -114,8 +117,15 @@ class Container {
     pool_id_ = pool_id;
     pool_name_ = pool_name;
     container_id_ = container_id;
+    flags_.Clear();
     pool_query_ = PoolQuery();  // Default pool query
   }
+
+  /** Mark container as plugged (no new tasks accepted) */
+  void SetPlugged() { flags_.SetBits(CONTAINER_PLUG); }
+
+  /** Check if container is plugged */
+  bool IsPlugged() const { return flags_.Any(CONTAINER_PLUG) != 0; }
 
   /**
    * Execute a method on a task - must be implemented by derived classes
@@ -171,6 +181,16 @@ class Container {
    */
   virtual void Expand(const Host& new_host) {
     (void)new_host;
+  }
+
+  /**
+   * Migrate this container's data to a destination node
+   * Called during container migration. Override to serialize and transfer state.
+   * Default implementation is a no-op.
+   * @param dest_node_id The node ID to migrate to
+   */
+  virtual void Migrate(u32 dest_node_id) {
+    (void)dest_node_id;
   }
 
   /**

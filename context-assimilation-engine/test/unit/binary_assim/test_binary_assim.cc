@@ -70,6 +70,9 @@
 // YAML parsing
 #include <yaml-cpp/yaml.h>
 
+// Logging
+#include <hermes_shm/util/logging.h>
+
 // Test configuration
 constexpr size_t kDefaultFileSizeMB = 256;
 constexpr size_t kMB = 1024 * 1024;
@@ -81,11 +84,11 @@ const std::string kTestTagName = "test_binary_assim_tag";
  * Pattern: Each 4-byte block contains the block index (little endian)
  */
 bool GenerateTestFile(const std::string& file_path, size_t size_bytes) {
-  std::cout << "Generating test file: " << file_path << " (" << size_bytes << " bytes)" << std::endl;
+  HLOG(kInfo, "Generating test file: {} ({} bytes)", file_path, size_bytes);
 
   std::ofstream file(file_path, std::ios::binary);
   if (!file.is_open()) {
-    std::cerr << "ERROR: Failed to create test file: " << file_path << std::endl;
+    HLOG(kError, "Failed to create test file: {}", file_path);
     return false;
   }
 
@@ -98,14 +101,14 @@ bool GenerateTestFile(const std::string& file_path, size_t size_bytes) {
     file.write(reinterpret_cast<const char*>(&value), block_size);
 
     if (!file.good()) {
-      std::cerr << "ERROR: Failed to write to test file at block " << i << std::endl;
+      HLOG(kError, "Failed to write to test file at block {}", i);
       file.close();
       return false;
     }
   }
 
   file.close();
-  std::cout << "Test file generated successfully (" << num_blocks << " blocks)" << std::endl;
+  HLOG(kSuccess, "Test file generated successfully ({} blocks)", num_blocks);
   return true;
 }
 
@@ -127,7 +130,7 @@ bool GenerateTestFile(const std::string& file_path, size_t size_bytes) {
  *       range_size: <size> (optional, default: 0 for full file)
  */
 std::vector<wrp_cae::core::AssimilationCtx> LoadOmni(const std::string& omni_path) {
-  std::cout << "Loading OMNI file: " << omni_path << std::endl;
+  HLOG(kInfo, "Loading OMNI file: {}", omni_path);
 
   YAML::Node config;
   try {
@@ -174,19 +177,19 @@ std::vector<wrp_cae::core::AssimilationCtx> LoadOmni(const std::string& omni_pat
 
     contexts.push_back(ctx);
 
-    std::cout << "  Loaded transfer " << (i + 1) << "/" << transfers.size() << ":" << std::endl;
-    std::cout << "    src: " << ctx.src << std::endl;
-    std::cout << "    dst: " << ctx.dst << std::endl;
-    std::cout << "    format: " << ctx.format << std::endl;
+    HLOG(kInfo, "Loaded transfer {}/{}", (i + 1), transfers.size());
+    HLOG(kInfo, "  src: {}", ctx.src);
+    HLOG(kInfo, "  dst: {}", ctx.dst);
+    HLOG(kInfo, "  format: {}", ctx.format);
     if (!ctx.depends_on.empty()) {
-      std::cout << "    depends_on: " << ctx.depends_on << std::endl;
+      HLOG(kInfo, "  depends_on: {}", ctx.depends_on);
     }
     if (ctx.range_off != 0 || ctx.range_size != 0) {
-      std::cout << "    range: [" << ctx.range_off << ", " << ctx.range_size << "]" << std::endl;
+      HLOG(kInfo, "  range: [{}, {}]", ctx.range_off, ctx.range_size);
     }
   }
 
-  std::cout << "Successfully loaded " << contexts.size() << " transfer(s) from OMNI file" << std::endl;
+  HLOG(kSuccess, "Successfully loaded {} transfer(s) from OMNI file", contexts.size());
   return contexts;
 }
 
@@ -195,9 +198,9 @@ std::vector<wrp_cae::core::AssimilationCtx> LoadOmni(const std::string& omni_pat
  */
 void CleanupTestFile(const std::string& file_path) {
   if (std::remove(file_path.c_str()) == 0) {
-    std::cout << "Test file cleaned up: " << file_path << std::endl;
+    HLOG(kInfo, "Test file cleaned up: {}", file_path);
   } else {
-    std::cerr << "WARNING: Failed to remove test file: " << file_path << std::endl;
+    HLOG(kWarning, "Failed to remove test file: {}", file_path);
   }
 }
 
@@ -205,29 +208,29 @@ void CleanupTestFile(const std::string& file_path) {
  * Main test function
  */
 int main(int argc, char* argv[]) {
-  std::cout << "========================================" << std::endl;
-  std::cout << "Binary Assimilation ParseOmni Unit Test" << std::endl;
-  std::cout << "========================================" << std::endl;
+  HLOG(kInfo, "========================================");
+  HLOG(kInfo, "Binary Assimilation ParseOmni Unit Test");
+  HLOG(kInfo, "========================================");
 
   int exit_code = 0;
 
   try {
     // Initialize Chimaera runtime (CHIMAERA_WITH_RUNTIME controls behavior)
-    std::cout << "Initializing Chimaera..." << std::endl;
+    HLOG(kInfo, "Initializing Chimaera...");
     bool success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
     if (!success) {
-      std::cerr << "ERROR: Failed to initialize Chimaera" << std::endl;
+      HLOG(kError, "Failed to initialize Chimaera");
       return 1;
     }
-    std::cout << "Chimaera initialized successfully" << std::endl;
+    HLOG(kSuccess, "Chimaera initialized successfully");
 
     // Verify Chimaera IPC is available
     auto* ipc_manager = CHI_IPC;
     if (!ipc_manager) {
-      std::cerr << "ERROR: Chimaera IPC not initialized" << std::endl;
+      HLOG(kError, "Chimaera IPC not initialized");
       return 1;
     }
-    std::cout << "Chimaera IPC verified" << std::endl;
+    HLOG(kSuccess, "Chimaera IPC verified");
 
     // Get test file size from environment or use default
     size_t file_size_mb = kDefaultFileSizeMB;
@@ -238,23 +241,23 @@ int main(int argc, char* argv[]) {
     const size_t file_size_bytes = file_size_mb * kMB;
 
     // Step 1: Generate test file
-    std::cout << "\n[STEP 1] Generating test file..." << std::endl;
+    HLOG(kInfo, "[STEP 1] Generating test file...");
     if (!GenerateTestFile(kTestFileName, file_size_bytes)) {
       return 1;
     }
 
     // Step 2: Connect to CTE
-    std::cout << "\n[STEP 2] Connecting to CTE..." << std::endl;
+    HLOG(kInfo, "[STEP 2] Connecting to CTE...");
     wrp_cte::core::WRP_CTE_CLIENT_INIT();
-    std::cout << "CTE client initialized" << std::endl;
+    HLOG(kSuccess, "CTE client initialized");
 
     // Step 2.5: Initialize CAE client
-    std::cout << "\n[STEP 2.5] Initializing CAE client..." << std::endl;
+    HLOG(kInfo, "[STEP 2.5] Initializing CAE client...");
     WRP_CAE_CLIENT_INIT();
-    std::cout << "CAE client initialized" << std::endl;
+    HLOG(kSuccess, "CAE client initialized");
 
     // Step 3: Create CAE pool
-    std::cout << "\n[STEP 3] Creating CAE pool..." << std::endl;
+    HLOG(kInfo, "[STEP 3] Creating CAE pool...");
     wrp_cae::core::Client cae_client;
     wrp_cae::core::CreateParams params;
 
@@ -265,10 +268,10 @@ int main(int argc, char* argv[]) {
         params);
     create_task.Wait();
 
-    std::cout << "CAE pool created with ID: " << cae_client.pool_id_ << std::endl;
+    HLOG(kSuccess, "CAE pool created with ID: {}", cae_client.pool_id_);
 
     // Step 4: Load OMNI configuration file
-    std::cout << "\n[STEP 4] Loading OMNI configuration..." << std::endl;
+    HLOG(kInfo, "[STEP 4] Loading OMNI configuration...");
     const std::string source_path = __FILE__;  // Get current source file path
     const std::string omni_file = source_path.substr(0, source_path.find_last_of('/')) + "/binary_assim_omni.yaml";
 
@@ -276,36 +279,36 @@ int main(int argc, char* argv[]) {
     try {
       contexts = LoadOmni(omni_file);
     } catch (const std::exception& e) {
-      std::cerr << "ERROR: Failed to load OMNI file: " << e.what() << std::endl;
+      HLOG(kError, "Failed to load OMNI file: {}", e.what());
       return 1;
     }
 
     // Step 5: Call ParseOmni (serialization happens transparently in ParseOmniTask)
-    std::cout << "\n[STEP 5] Calling ParseOmni..." << std::endl;
+    HLOG(kInfo, "[STEP 5] Calling ParseOmni...");
     auto parse_task = cae_client.AsyncParseOmni(contexts);
     parse_task.Wait();
     chi::u32 result_code = parse_task->GetReturnCode();
     chi::u32 num_tasks_scheduled = parse_task->num_tasks_scheduled_;
 
-    std::cout << "ParseOmni completed:" << std::endl;
-    std::cout << "  result_code: " << result_code << std::endl;
-    std::cout << "  num_tasks_scheduled: " << num_tasks_scheduled << std::endl;
+    HLOG(kInfo, "ParseOmni completed:");
+    HLOG(kInfo, "  result_code: {}", result_code);
+    HLOG(kInfo, "  num_tasks_scheduled: {}", num_tasks_scheduled);
 
     // Step 6: Validate results
-    std::cout << "\n[STEP 6] Validating results..." << std::endl;
+    HLOG(kInfo, "[STEP 6] Validating results...");
 
     if (result_code != 0) {
-      std::cerr << "ERROR: ParseOmni failed with result_code: " << result_code << std::endl;
+      HLOG(kError, "ParseOmni failed with result_code: {}", result_code);
       exit_code = 1;
     } else if (num_tasks_scheduled == 0) {
-      std::cerr << "ERROR: ParseOmni returned 0 tasks scheduled" << std::endl;
+      HLOG(kError, "ParseOmni returned 0 tasks scheduled");
       exit_code = 1;
     } else {
-      std::cout << "SUCCESS: ParseOmni executed successfully" << std::endl;
+      HLOG(kSuccess, "ParseOmni executed successfully");
     }
 
     // Step 8: Verify data in CTE
-    std::cout << "\n[STEP 8] Verifying data in CTE..." << std::endl;
+    HLOG(kInfo, "[STEP 8] Verifying data in CTE...");
 
     // Get CTE client
     auto cte_client = WRP_CTE_CLIENT;
@@ -315,47 +318,47 @@ int main(int argc, char* argv[]) {
     tag_task.Wait();
     wrp_cte::core::TagId tag_id = tag_task->tag_id_;
     if (tag_id.IsNull()) {
-      std::cerr << "ERROR: Tag not found in CTE: " << kTestTagName << std::endl;
+      HLOG(kError, "Tag not found in CTE: {}", kTestTagName);
       exit_code = 1;
     } else {
-      std::cout << "Tag found in CTE: " << kTestTagName << " (ID: " << tag_id << ")" << std::endl;
+      HLOG(kSuccess, "Tag found in CTE: {} (ID: {})", kTestTagName, tag_id);
 
       // Get tag size to verify data was transferred
       auto size_task = cte_client->AsyncGetTagSize(tag_id);
       size_task.Wait();
       size_t tag_size = size_task->tag_size_;
-      std::cout << "Tag size in CTE: " << tag_size << " bytes" << std::endl;
-      std::cout << "Original file size: " << file_size_bytes << " bytes" << std::endl;
+      HLOG(kInfo, "Tag size in CTE: {} bytes", tag_size);
+      HLOG(kInfo, "Original file size: {} bytes", file_size_bytes);
 
       if (tag_size == 0) {
-        std::cerr << "ERROR: Tag size is 0, no data transferred" << std::endl;
+        HLOG(kError, "Tag size is 0, no data transferred");
         exit_code = 1;
       } else if (tag_size != file_size_bytes) {
-        std::cerr << "WARNING: Tag size (" << tag_size << ") does not match file size ("
-                  << file_size_bytes << ")" << std::endl;
+        HLOG(kWarning, "Tag size ({}) does not match file size ({})",
+             tag_size, file_size_bytes);
         // Note: This is a warning, not an error - don't set exit_code
       } else {
-        std::cout << "SUCCESS: Tag size matches file size - data verified in CTE" << std::endl;
+        HLOG(kSuccess, "Tag size matches file size - data verified in CTE");
       }
     }
 
     // Step 9: Cleanup
-    std::cout << "\n[STEP 9] Cleaning up..." << std::endl;
+    HLOG(kInfo, "[STEP 9] Cleaning up...");
     CleanupTestFile(kTestFileName);
 
   } catch (const std::exception& e) {
-    std::cerr << "ERROR: Exception caught: " << e.what() << std::endl;
+    HLOG(kError, "Exception caught: {}", e.what());
     exit_code = 1;
   }
 
   // Print final result
-  std::cout << "\n========================================" << std::endl;
+  HLOG(kInfo, "========================================");
   if (exit_code == 0) {
-    std::cout << "TEST PASSED" << std::endl;
+    HLOG(kSuccess, "TEST PASSED");
   } else {
-    std::cout << "TEST FAILED" << std::endl;
+    HLOG(kError, "TEST FAILED");
   }
-  std::cout << "========================================" << std::endl;
+  HLOG(kInfo, "========================================");
 
   return exit_code;
 }
