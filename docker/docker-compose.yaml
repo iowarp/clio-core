@@ -1,0 +1,92 @@
+# IOWarp Chimaera Runtime - Docker Compose
+#
+# Starts a multi-node Chimaera runtime cluster using deploy-cpu containers.
+#
+# Usage:
+#   # Start a 3-node cluster
+#   docker compose up
+#
+#   # Start in background
+#   docker compose up -d
+#
+#   # Scale to different number of nodes: edit this file or override
+#   docker compose up -d iowarp-node1
+#
+#   # View logs
+#   docker compose logs -f
+#
+#   # Stop cluster
+#   docker compose down
+
+services:
+  iowarp-node1:
+    image: iowarp/deploy-cpu:latest
+    container_name: iowarp-node1
+    hostname: iowarp-node1
+    networks:
+      iowarp-cluster:
+        ipv4_address: 172.30.0.10
+    volumes:
+      - ./hostfile:/etc/iowarp/hostfile:ro
+    environment:
+      - NODE_ID=1
+      - NODE_IP=172.30.0.10
+      - WRP_RUNTIME_CONF=/etc/iowarp/wrp_conf.yaml
+      - CONTAINER_HOSTFILE=/etc/iowarp/hostfile
+    ports:
+      - "5555:5555"
+    shm_size: '8gb'
+    mem_limit: 8g
+    entrypoint: ["/bin/bash", "-c"]
+    command: >
+      "chimaera_start_runtime"
+    restart: unless-stopped
+
+  iowarp-node2:
+    image: iowarp/deploy-cpu:latest
+    container_name: iowarp-node2
+    hostname: iowarp-node2
+    networks:
+      iowarp-cluster:
+        ipv4_address: 172.30.0.11
+    volumes:
+      - ./hostfile:/etc/iowarp/hostfile:ro
+    environment:
+      - NODE_ID=2
+      - NODE_IP=172.30.0.11
+      - WRP_RUNTIME_CONF=/etc/iowarp/wrp_conf.yaml
+      - CONTAINER_HOSTFILE=/etc/iowarp/hostfile
+    shm_size: '8gb'
+    mem_limit: 8g
+    entrypoint: ["/bin/bash", "-c"]
+    command: >
+      "chimaera_start_runtime"
+    restart: unless-stopped
+
+  iowarp-node3:
+    image: iowarp/deploy-cpu:latest
+    container_name: iowarp-node3
+    hostname: iowarp-node3
+    networks:
+      iowarp-cluster:
+        ipv4_address: 172.30.0.12
+    volumes:
+      - ./hostfile:/etc/iowarp/hostfile:ro
+    environment:
+      - NODE_ID=3
+      - NODE_IP=172.30.0.12
+      - WRP_RUNTIME_CONF=/etc/iowarp/wrp_conf.yaml
+      - CONTAINER_HOSTFILE=/etc/iowarp/hostfile
+    shm_size: '8gb'
+    mem_limit: 8g
+    entrypoint: ["/bin/bash", "-c"]
+    command: >
+      "chimaera_start_runtime"
+    restart: unless-stopped
+
+networks:
+  iowarp-cluster:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/16

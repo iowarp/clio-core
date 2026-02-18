@@ -294,15 +294,15 @@ RUN source /home/iowarp/miniconda3/etc/profile.d/conda.sh \
 USER root
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
     apt-get install -y --no-install-recommends nodejs && \
-    rm -rf /var/lib/apt/lists/*
+    rm -rf /var/lib/apt/lists/* && \
+    chown -R iowarp:iowarp /home/iowarp/.npm || true
 USER iowarp
 
 # Install docs site (Docusaurus) dependencies
 # Try SSH clone first, fall back to HTTPS if SSH is unavailable
 RUN cd /home/iowarp \
     && (git clone -b iowarp-dev git@github.com:iowarp/docs.git 2>/dev/null || \
-        git clone -b iowarp-dev https://github.com/iowarp/docs.git) \
-    && cd docs && npm install
+        git clone -b iowarp-dev https://github.com/iowarp/docs.git)
 
 # Configure Spack to use conda packages
 RUN mkdir -p ~/.spack && \

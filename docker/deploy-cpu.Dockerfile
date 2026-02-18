@@ -57,10 +57,9 @@ RUN sudo chown -R $(whoami):$(whoami) /workspace && \
     cmake --preset build-cpu-release ../ && \
     sudo make -j$(nproc) install
 
-# Create runtime configuration files
+# Install default runtime configuration
 RUN sudo mkdir -p /etc/iowarp && \
-    sudo touch /etc/iowarp/wrp_conf.yaml && \
-    sudo touch /etc/iowarp/wrp_config.yaml && \
+    sudo cp /workspace/context-runtime/config/chimaera_default.yaml /etc/iowarp/wrp_conf.yaml && \
     sudo touch /etc/iowarp/hostfile
 
 #------------------------------------------------------------
