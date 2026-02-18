@@ -122,10 +122,23 @@ bool ModuleManager::LoadChiMod(const std::string &lib_path) {
   // Get ChiMod name
   if (chimod_info->name_func) {
     chimod_info->name = chimod_info->name_func();
-    HLOG(kInfo, "Loaded ChiMod: {} from {}", chimod_info->name, lib_path);
   } else {
     return false;
   }
+
+  // First-wins policy: skip if this module name is already loaded.
+  // This prevents duplicate directories (e.g. same path via different NFS
+  // mount points or LD_LIBRARY_PATH entries) or stale spack installations
+  // from overwriting a freshly-built module.
+  auto existing = chimods_.find(chimod_info->name);
+  if (existing != chimods_.end()) {
+    HLOG(kDebug,
+         "Skipping duplicate ChiMod: {} from {} (already loaded from {})",
+         chimod_info->name, lib_path, existing->second->lib_path);
+    return false;
+  }
+
+  HLOG(kInfo, "Loaded ChiMod: {} from {}", chimod_info->name, lib_path);
 
   // Store in map
   chimods_[chimod_info->name] = std::move(chimod_info);

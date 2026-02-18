@@ -686,6 +686,27 @@ endforeach()
 if(WRP_CORE_ENABLE_TESTS)
     enable_testing()
     include(CTest)
+
+    # -----------------------------------------------------------------------
+    # Pre-test cleanup fixture
+    # Kills any orphaned Chimaera server processes and removes leftover shared
+    # state (IPC socket files, shared memory, memfd) that a previous crashed
+    # test run may have left behind.  Runs once before any other CTest test.
+    # -----------------------------------------------------------------------
+    add_test(
+        NAME chimaera_pre_test_cleanup
+        COMMAND bash -c
+            "fuser -k 5555/tcp 5556/tcp 5558/tcp 2>/dev/null; \
+             rm -f /tmp/chimaera_*.ipc 2>/dev/null; \
+             rm -f /tmp/chimaera_server_timing.log 2>/dev/null; \
+             rm -rf /tmp/chimaera_memfd 2>/dev/null; \
+             rm -f /dev/shm/sm_segment.* 2>/dev/null; \
+             exit 0"
+    )
+    set_tests_properties(chimaera_pre_test_cleanup PROPERTIES
+        TIMEOUT 30
+        FIXTURES_SETUP chimaera_pre_test_cleanup_fixture
+    )
 endif()
 
 #------------------------------------------------------------------------------
