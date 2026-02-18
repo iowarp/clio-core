@@ -986,6 +986,7 @@ chi::TaskResume Runtime::Recv(hipc::FullPtr<RecvTask> task,
 chi::TaskResume Runtime::ClientConnect(hipc::FullPtr<ClientConnectTask> task,
                                        chi::RunContext &rctx) {
   task->response_ = 0;
+  task->server_generation_ = CHI_IPC->GetServerGeneration();
   task->SetReturnCode(0);
   rctx.did_work_ = true;
   co_return;

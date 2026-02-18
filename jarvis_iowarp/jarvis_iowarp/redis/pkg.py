@@ -2,7 +2,9 @@
 This module provides classes and methods to launch Redis.
 Redis cluster is used if the hostfile has many hosts
 """
-from jarvis_cd.core.pkg import Application, Color
+import time
+from jarvis_cd.core.pkg import Application
+from jarvis_cd.util.logger import Color
 from jarvis_cd.shell import Exec, LocalExecInfo, PsshExecInfo
 from jarvis_cd.shell.process import Kill
 
@@ -116,10 +118,17 @@ class Redis(Application):
 
         :return: None
         """
-        for i in range(3):
-            Kill('redis-server',
-                 PsshExecInfo(env=self.env,
-                              hostfile=self.hostfile)).run()
+        # Gracefully shutdown redis on each host via redis-cli
+        Exec(f'redis-cli -p {self.config["port"]} shutdown nosave',
+             PsshExecInfo(env=self.env,
+                          hostfile=self.hostfile)).run()
+        # Fallback: force kill any remaining redis-server processes
+        # Use partial=False to avoid pkill -f matching its own shell process
+        Kill('redis-server',
+             PsshExecInfo(env=self.env,
+                          hostfile=self.hostfile),
+             partial=False).run()
+        time.sleep(1)
 
     def clean(self):
         """

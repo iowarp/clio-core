@@ -99,6 +99,14 @@ bool IpcManager::ClientInit() {
        ipc_mode_ == IpcMode::kShm ? "SHM" :
        ipc_mode_ == IpcMode::kIpc ? "IPC" : "TCP");
 
+  // Parse retry timeout environment variable
+  const char *retry_env = std::getenv("CHI_CLIENT_RETRY_TIMEOUT");
+  if (retry_env) {
+    client_retry_timeout_ = static_cast<float>(std::atof(retry_env));
+  }
+  HLOG(kInfo, "IpcManager::ClientInit: retry_timeout = {}s",
+       client_retry_timeout_);
+
   // Create lightbeam transport for client-server communication
   {
     auto *config = CHI_CONFIG_MANAGER;
@@ -490,6 +498,10 @@ bool IpcManager::ServerInitQueues() {
     shared_header_->node_id = 0;  // Will be set after host identification
     shared_header_->runtime_pid =
         getpid();  // Store runtime's PID for client tgkill
+    shared_header_->server_generation.store(
+        static_cast<u64>(
+            std::chrono::steady_clock::now().time_since_epoch().count()),
+        std::memory_order_release);
 
     // Get worker counts from ConfigManager
     ConfigManager *config = CHI_CONFIG_MANAGER;
@@ -690,7 +702,9 @@ bool IpcManager::WaitForLocalServer() {
   }
 
   if (task->response_ == 0) {
-    HLOG(kInfo, "Successfully connected to runtime");
+    client_generation_ = task->server_generation_;
+    HLOG(kInfo, "Successfully connected to runtime (generation={})",
+         client_generation_);
     return true;
   }
 
@@ -1672,6 +1686,75 @@ bool IpcManager::GetIsClientThread() const {
 //==============================================================================
 // GPU Memory Management
 //==============================================================================
+
+//==============================================================================
+// Client Retry / Reconnect Methods
+//==============================================================================
+
+bool IpcManager::IsServerAlive() const {
+  // SHM mode: check runtime PID is still running
+  if (ipc_mode_ == IpcMode::kShm && shared_header_) {
+    pid_t pid = shared_header_->runtime_pid;
+    if (kill(pid, 0) == -1 && errno == ESRCH) return false;
+  }
+  // For ZMQ modes, assume alive until proven otherwise by timeout
+  return true;
+}
+
+bool IpcManager::ClientReconnect() {
+  HLOG(kInfo, "ClientReconnect: Attempting to reconnect to restarted server");
+
+  if (ipc_mode_ == IpcMode::kShm) {
+    // Detach old shared memory (don't destroy — server owns it)
+    main_allocator_ = nullptr;
+    shared_header_ = nullptr;
+    worker_queues_ = hipc::FullPtr<TaskQueue>();
+    main_backend_ = hipc::PosixShmMmap();
+
+    // Re-attach to new shared memory
+    if (!ClientInitShm()) return false;
+    if (!ClientInitQueues()) return false;
+
+    // Re-create SHM lightbeam transports
+    shm_send_transport_ = hshm::lbm::TransportFactory::Get(
+        "", hshm::lbm::TransportType::kShm,
+        hshm::lbm::TransportMode::kClient);
+    shm_recv_transport_ = hshm::lbm::TransportFactory::Get(
+        "", hshm::lbm::TransportType::kShm,
+        hshm::lbm::TransportMode::kServer);
+
+    // Re-register per-process shared memory segments with new server
+    for (auto *alloc : alloc_vector_) {
+      auto alloc_id = alloc->GetId();
+      auto reg_task = NewTask<chimaera::admin::RegisterMemoryTask>(
+          chi::CreateTaskId(), chi::kAdminPoolId,
+          chi::PoolQuery::Local(), alloc_id);
+      SendZmq(reg_task, IpcMode::kTcp).Wait();
+    }
+  }
+
+  // Re-verify server via ClientConnectTask (updates client_generation_)
+  if (!WaitForLocalServer()) return false;
+
+  HLOG(kInfo, "ClientReconnect: Reconnected, new generation={}",
+       client_generation_);
+  return true;
+}
+
+bool IpcManager::WaitForServerAndReconnect(
+    std::chrono::steady_clock::time_point start) {
+  while (true) {
+    float elapsed = std::chrono::duration<float>(
+                        std::chrono::steady_clock::now() - start)
+                        .count();
+    if (client_retry_timeout_ > 0 && elapsed >= client_retry_timeout_) {
+      HLOG(kError, "WaitForServerAndReconnect: Timed out after {}s", elapsed);
+      return false;
+    }
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+    if (ClientReconnect()) return true;
+  }
+}
 
 //==============================================================================
 // ZMQ Transport Methods

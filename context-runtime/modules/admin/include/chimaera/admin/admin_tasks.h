@@ -686,16 +686,18 @@ struct RecvTask : public chi::Task {
 struct ClientConnectTask : public chi::Task {
   // Connect response
   OUT int32_t response_;  ///< 0 = success, non-zero = error
+  OUT chi::u64 server_generation_;  ///< Server's generation counter for restart detection
 
   /** SHM default constructor */
-  ClientConnectTask() : chi::Task(), response_(-1) {}
+  ClientConnectTask() : chi::Task(), response_(-1), server_generation_(0) {}
 
   /** Emplace constructor */
   explicit ClientConnectTask(const chi::TaskId &task_node,
                              const chi::PoolId &pool_id,
                              const chi::PoolQuery &pool_query)
       : chi::Task(task_node, pool_id, pool_query, Method::kClientConnect),
-        response_(-1) {
+        response_(-1),
+        server_generation_(0) {
     task_id_ = task_node;
     pool_id_ = pool_id;
     method_ = Method::kClientConnect;
@@ -711,12 +713,13 @@ struct ClientConnectTask : public chi::Task {
   template <typename Archive>
   void SerializeOut(Archive &ar) {
     Task::SerializeOut(ar);
-    ar(response_);
+    ar(response_, server_generation_);
   }
 
   void Copy(const hipc::FullPtr<ClientConnectTask> &other) {
     Task::Copy(other.template Cast<Task>());
     response_ = other->response_;
+    server_generation_ = other->server_generation_;
   }
 
   void Aggregate(const hipc::FullPtr<ClientConnectTask> &other) {

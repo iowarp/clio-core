@@ -815,3 +815,94 @@ t=18s+  Retry queues re-resolve: RerouteRetryEntry finds new node
 With `heartbeat_interval: 500` (500ms probe interval), detection is faster
 because probes are sent more frequently, reducing the time between node death
 and the first failed probe.
+
+---
+
+## 12  Client Task Retry on Runtime Restart
+
+When a runtime server shuts down (crash or intentional restart) while a client
+has in-flight tasks, the tasks previously hung forever.  The client retry
+mechanism transparently resubmits tasks when the runtime restarts.
+
+### 12.1  Server Generation Counter
+
+Each server writes a monotonic generation counter to shared memory during
+`ServerInitQueues`:
+
+```
+shared_header_->server_generation = steady_clock::now().time_since_epoch().count()
+```
+
+The `ClientConnectTask` response includes `server_generation_`.  Clients cache
+this value in `client_generation_` during `WaitForLocalServer`.  A change in
+generation indicates the server has restarted.
+
+### 12.2  Client Liveness Detection
+
+**SHM mode**: `IsServerAlive()` checks `kill(runtime_pid, 0)`.  If the process
+is gone (`ESRCH`), the server is dead.
+
+**TCP/IPC mode**: The client relies on timeout-based detection.  If no response
+arrives within `client_retry_timeout_` seconds, the client assumes failure.
+
+### 12.3  Retry Flow (ZMQ Path)
+
+The `Recv()` spin loop checks server liveness every 5 seconds:
+
+```
+while !FUTURE_COMPLETE:
+  yield()
+  elapsed = now - start
+
+  if elapsed >= max_sec: return false          // user timeout
+  if elapsed >= client_retry_timeout_: return false  // overall timeout
+
+  if elapsed - last_probe >= 5.0:
+    if !IsServerAlive():
+      WaitForServerAndReconnect(start)
+      ResendZmqTask(future)
+      reset timer
+```
+
+`ResendZmqTask` cleans up the old pending future, re-serializes the task, and
+re-sends it via the same ZMQ DEALER socket (which auto-reconnects).
+
+### 12.4  Retry Flow (SHM Path)
+
+If `IsServerAlive()` returns false before the blocking SHM recv:
+
+1. Call `WaitForServerAndReconnect` (polls with 1-second intervals).
+2. `ClientReconnect` detaches old shared memory, re-attaches to the new
+   server's segment, re-creates SHM transports, and re-registers client
+   shared memory.
+3. Since the old FutureShm lived in destroyed shared memory, fall back to
+   ZMQ path for the re-send (`ResendZmqTask`).
+
+### 12.5  ClientReconnect
+
+Handles all transport modes:
+
+```
+ClientReconnect():
+  if SHM mode:
+    detach old shared memory (don't destroy — server owns it)
+    re-attach to new main segment
+    re-init queues
+    re-create SHM lightbeam transports
+    re-register per-process shared memory with new server
+
+  WaitForLocalServer()  // verifies connectivity, caches new generation
+```
+
+### 12.6  Configuration
+
+| Environment Variable | Default | Description |
+|---------------------|---------|-------------|
+| `CHI_CLIENT_RETRY_TIMEOUT` | 60.0 | Max seconds to wait for server restart before giving up |
+| `CHI_WAIT_SERVER` | 30 | Initial connection timeout (also used during reconnect) |
+
+### 12.7  Duplicate Submissions
+
+If a task was fully processed but the response was lost, the retry resubmits
+it.  Most tasks are idempotent.  A future enhancement could add task UUIDs for
+server-side dedup (out of scope for now).

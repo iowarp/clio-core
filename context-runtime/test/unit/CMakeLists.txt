@@ -88,6 +88,12 @@ set(IPC_TRANSPORT_MODES_TEST_SOURCES
   test_ipc_transport_modes.cc
 )
 
+# Client Retry test executable
+set(CLIENT_RETRY_TEST_TARGET chimaera_client_retry_tests)
+set(CLIENT_RETRY_TEST_SOURCES
+  test_client_retry.cc
+)
+
 # GPU IPC AllocateBuffer test executable (only if CUDA or HIP is enabled)
 set(IPC_ALLOCATE_BUFFER_GPU_TEST_TARGET test_ipc_allocate_buffer_gpu)
 set(IPC_ALLOCATE_BUFFER_GPU_TEST_SOURCES
@@ -414,6 +420,33 @@ set_target_properties(${IPC_TRANSPORT_MODES_TEST_TARGET} PROPERTIES
 )
 
 set_target_properties(${IPC_TRANSPORT_MODES_TEST_TARGET} PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+
+# Create Client Retry test executable
+add_executable(${CLIENT_RETRY_TEST_TARGET} ${CLIENT_RETRY_TEST_SOURCES})
+
+target_include_directories(${CLIENT_RETRY_TEST_TARGET} PRIVATE
+  ${CHIMAERA_ROOT}/include
+  ${CHIMAERA_ROOT}/test  # For simple_test.h
+  ${CHIMAERA_ROOT}/modules/bdev/include
+  ${CHIMAERA_ROOT}/modules/admin/include
+)
+
+target_link_libraries(${CLIENT_RETRY_TEST_TARGET}
+  chimaera_cxx               # Main Chimaera library
+  chimaera_bdev_client        # Bdev module client
+  chimaera_admin_client       # Admin module client
+  hshm::cxx                  # HermesShm library
+  ${CMAKE_THREAD_LIBS_INIT}  # Threading support
+)
+
+set_target_properties(${CLIENT_RETRY_TEST_TARGET} PROPERTIES
+  CXX_STANDARD 17
+  CXX_STANDARD_REQUIRED ON
+)
+
+set_target_properties(${CLIENT_RETRY_TEST_TARGET} PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 
@@ -914,6 +947,69 @@ if(WRP_CORE_ENABLE_TESTS)
     TIMEOUT 120
   )
 
+  # Client Retry Tests
+  # NOTE: Each test case must run in its own process because CHIMAERA_INIT has
+  # a static guard that prevents re-initialization.
+  add_test(
+    NAME cr_client_retry_server_restart_tcp
+    COMMAND ${CLIENT_RETRY_TEST_TARGET} "ClientRetry - Server Restart TCP"
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_client_retry_server_restart_tcp PROPERTIES
+    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin"
+    TIMEOUT 120
+  )
+
+  add_test(
+    NAME cr_client_retry_server_restart_ipc
+    COMMAND ${CLIENT_RETRY_TEST_TARGET} "ClientRetry - Server Restart IPC"
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_client_retry_server_restart_ipc PROPERTIES
+    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin"
+    TIMEOUT 120
+  )
+
+  add_test(
+    NAME cr_client_retry_server_restart_shm
+    COMMAND ${CLIENT_RETRY_TEST_TARGET} "ClientRetry - Server Restart SHM"
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_client_retry_server_restart_shm PROPERTIES
+    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin"
+    TIMEOUT 120
+  )
+
+  add_test(
+    NAME cr_client_retry_client_death_tcp
+    COMMAND ${CLIENT_RETRY_TEST_TARGET} "ClientRetry - Client Death TCP"
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_client_retry_client_death_tcp PROPERTIES
+    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin"
+    TIMEOUT 120
+  )
+
+  add_test(
+    NAME cr_client_retry_client_death_ipc
+    COMMAND ${CLIENT_RETRY_TEST_TARGET} "ClientRetry - Client Death IPC"
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_client_retry_client_death_ipc PROPERTIES
+    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin"
+    TIMEOUT 120
+  )
+
+  add_test(
+    NAME cr_client_retry_client_death_shm
+    COMMAND ${CLIENT_RETRY_TEST_TARGET} "ClientRetry - Client Death SHM"
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_client_retry_client_death_shm PROPERTIES
+    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin"
+    TIMEOUT 120
+  )
+
   # Set test properties for timeout and environment
   set_tests_properties(
     cr_runtime_initialization_tests
@@ -1022,6 +1118,7 @@ install(TARGETS
   ${RUNTIME_CLEANUP_TEST_TARGET}
   ${IPC_ERRORS_TEST_TARGET}
   ${IPC_TRANSPORT_MODES_TEST_TARGET}
+  ${CLIENT_RETRY_TEST_TARGET}
   RUNTIME DESTINATION bin
 )
 

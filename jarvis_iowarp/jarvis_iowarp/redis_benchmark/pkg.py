@@ -3,6 +3,7 @@ This module provides classes and methods to launch the Redis benchmark tool.
 Redis cluster is used if the hostfile has many hosts
 """
 from jarvis_cd.core.pkg import Application
+from jarvis_cd.util.logger import Color
 from jarvis_cd.shell import Exec, LocalExecInfo
 
 

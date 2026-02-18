@@ -18,10 +18,14 @@ ARG DEBIAN_FRONTEND=noninteractive
 # Install minimal runtime dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    git \
+    openssh-client \
     libgomp1 \
     libelf1 \
     openmpi-bin \
     libopenmpi3t64 \
+    python3 \
+    python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
 # Create iowarp user
@@ -70,6 +74,16 @@ ENV WRP_RUNTIME_CONF=/etc/iowarp/wrp_conf.yaml
 
 # Update library cache
 RUN ldconfig
+
+# Install runtime-deployment (jarvis_cd)
+# Try SSH clone first, fall back to HTTPS if SSH is unavailable
+ARG RUNTIME_DEPLOY_REPO_SSH=git@github.com:iowarp/runtime-deployment.git
+ARG RUNTIME_DEPLOY_REPO_HTTPS=https://github.com/iowarp/runtime-deployment.git
+RUN mkdir -p /tmp/runtime-deployment && \
+    (git clone ${RUNTIME_DEPLOY_REPO_SSH} /tmp/runtime-deployment 2>/dev/null || \
+     git clone ${RUNTIME_DEPLOY_REPO_HTTPS} /tmp/runtime-deployment) && \
+    pip install --break-system-packages /tmp/runtime-deployment && \
+    rm -rf /tmp/runtime-deployment
 
 # Set ownership for iowarp user
 RUN chown -R iowarp:iowarp /home/iowarp
