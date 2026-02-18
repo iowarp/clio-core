@@ -9,8 +9,8 @@ class WrpCte(Service):
     """
     Content Transfer Engine (CTE) configuration service for IoWarp.
 
-    This service configures the CTE core module by generating a chimaera_compose
-    compatible YAML configuration file. The start() method uses chimaera_compose
+    This service configures the CTE core module by generating a chimaera compose
+    compatible YAML configuration file. The start() method uses chimaera compose
     with PsshExecInfo to deploy the CTE across all nodes.
     """
 
@@ -127,7 +127,7 @@ class WrpCte(Service):
         """
         Configure the CTE service with provided keyword arguments.
 
-        This method generates a chimaera_compose compatible YAML configuration
+        This method generates a chimaera compose compatible YAML configuration
         file that will be used by the start() method to deploy CTE.
 
         Args:
@@ -148,7 +148,7 @@ class WrpCte(Service):
             # Validate and convert device tuples
             devices = self._validate_and_convert_devices(devices)
 
-        # Build chimaera_compose compatible configuration
+        # Build chimaera compose compatible configuration
         compose_config = self._build_compose_config(devices)
 
         try:
@@ -392,13 +392,13 @@ class WrpCte(Service):
 
     def _build_compose_config(self, devices):
         """
-        Build a chimaera_compose compatible configuration dictionary.
+        Build a chimaera compose compatible configuration dictionary.
 
         Args:
             devices (List[Tuple]): List of device tuples (path, capacity, score).
 
         Returns:
-            dict: Complete chimaera_compose compatible configuration.
+            dict: Complete chimaera compose compatible configuration.
         """
         # Convert devices to storage configuration format
         storage_config = []
@@ -463,15 +463,15 @@ class WrpCte(Service):
 
     def start(self):
         """
-        Start the WrpCte service by launching CTE using chimaera_compose.
+        Start the WrpCte service by launching CTE using chimaera compose.
 
-        This method executes the chimaera_compose utility with PsshExecInfo
+        This method executes the chimaera compose utility with PsshExecInfo
         to deploy the Content Transfer Engine across all nodes.
 
         Returns:
-            bool: True if chimaera_compose executed successfully, False otherwise.
+            bool: True if chimaera compose executed successfully, False otherwise.
         """
-        self.log("Starting Content Transfer Engine using chimaera_compose...")
+        self.log("Starting Content Transfer Engine using chimaera compose...")
 
         if not self.compose_config_path:
             self.log("Error: CTE not configured. Run configure first.")
@@ -481,7 +481,7 @@ class WrpCte(Service):
             self.log(f"Error: Compose config file not found: {self.compose_config_path}")
             return False
 
-        # Build the chimaera_compose command
+        # Build the chimaera compose command
         cmd = f'chimaera compose {self.compose_config_path}'
 
         self.log(f"Running: {cmd}")
@@ -499,7 +499,7 @@ class WrpCte(Service):
         self.log(f"  Compression environment: IOWARP_COMPRESS={iowarp_compress}, IOWARP_COMPRESS_TRACE={iowarp_compress_trace}")
 
         try:
-            # Execute chimaera_compose on all nodes using PsshExecInfo
+            # Execute chimaera compose on all nodes using PsshExecInfo
             Exec(cmd, PsshExecInfo(
                 env=env,
                 hostfile=self.jarvis.hostfile

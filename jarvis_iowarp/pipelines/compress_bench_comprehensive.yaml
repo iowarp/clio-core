@@ -1,6 +1,6 @@
 # CTE Compression Benchmark - Comprehensive Pipeline
 # Purpose: Compare compression performance across different data patterns and compression options
-# Requirements: chimaera_start_runtime in PATH, synthetic_workload_exec in PATH
+# Requirements: chimaera runtime start in PATH, synthetic_workload_exec in PATH
 #
 # This pipeline runs multiple benchmarks to compare:
 # 1. Different data patterns (grayscott, mixed, gaussian)

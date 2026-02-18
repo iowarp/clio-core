@@ -9,10 +9,9 @@ services:
     # Use host network so both containers can communicate via 127.0.0.1
     network_mode: host
     environment:
-      - WRP_RUNTIME_CONF=/etc/iowarp/wrp_conf.yaml
+      - CHI_SERVER_CONF=/etc/iowarp/wrp_conf.yaml
     # Share IPC namespace so CAE can connect to runtime
     ipc: host
-    shm_size: '16gb'
     mem_limit: 16g
     working_dir: /workspace
     entrypoint: [ "/bin/bash", "-c" ]
@@ -20,7 +19,7 @@ services:
       "
         echo 'Runtime: Starting...' &&
         export PATH=/usr/local/bin:$PATH &&
-        chimaera_start_runtime &
+        chimaera runtime start &
         RUNTIME_PID=\$! &&
         echo \"Runtime: Started (PID \$RUNTIME_PID). Waiting...\" &&
         tail -f /dev/null
@@ -34,12 +33,11 @@ services:
       dockerfile: /workspace/docker/test_external/cae.Dockerfile
     container_name: cae-external
     environment:
-      - WRP_RUNTIME_CONF=/etc/iowarp/wrp_conf.yaml
+      - CHI_SERVER_CONF=/etc/iowarp/wrp_conf.yaml
     # Share IPC namespace with host for Chimaera communication
     ipc: host
     # Use host network so both containers can communicate via 127.0.0.1
     network_mode: host
-    shm_size: '16gb'
     mem_limit: 16g
     working_dir: /workspace
     depends_on:

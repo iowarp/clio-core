@@ -37,14 +37,14 @@ compose:
   - `dynamic`: Let the runtime decide based on existing pools
 - **pool_id**: Must be `"400.0"` to match the constant defined in code
 
-## Usage with chimaera_compose
+## Usage with chimaera compose
 
 ```bash
 # Start the Chimaera runtime
-chimaera_start_runtime
+chimaera runtime start
 
 # Deploy CAE using the configuration file
-chimaera_compose /path/to/wrp_config_example.yaml
+chimaera compose /path/to/wrp_config_example.yaml
 
 # Now CAE is available for use
 wrp_cae_omni /path/to/omni_file.yaml
@@ -71,11 +71,11 @@ See `wrp_config_example.yaml` for a complete configuration showing both ChiMods 
 
 ```bash
 # 1. Start runtime
-export WRP_RUNTIME_CONF=/path/to/wrp_config_example.yaml
-chimaera_start_runtime &
+export CHI_SERVER_CONF=/path/to/wrp_config_example.yaml
+chimaera runtime start &
 
 # 2. Deploy CTE and CAE
-chimaera_compose $WRP_RUNTIME_CONF
+chimaera compose $CHI_SERVER_CONF
 
 # 3. Use CAE to ingest data
 wrp_cae_omni /path/to/my_data_transfer.yaml

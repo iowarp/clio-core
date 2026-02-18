@@ -62,7 +62,7 @@ echo ""
 
 # Start Chimaera runtime in the background
 echo "Starting Chimaera runtime..."
-chimaera_start_runtime &
+chimaera runtime start &
 CHIMAERA_PID=$!
 echo "Chimaera runtime started (PID: ${CHIMAERA_PID})"
 echo ""

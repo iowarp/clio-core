@@ -1,11 +1,6 @@
 # Chimaera Configuration for Distributed Testing
 # This configuration is used by the distributed unit test Docker cluster
 
-# Memory segment configuration
-memory:
-  main_segment_size: auto            # Auto-calculated from queue_depth and num_threads
-  client_data_segment_size: 2147483648 # 2GB
-
 # Network configuration
 networking:
   port: 5555
@@ -17,17 +12,9 @@ logging:
   level: "info"
   file: "/tmp/chimaera.log"
 
-# Runtime configuration (includes worker threads, scheduling, and performance parameters)
+# Runtime configuration
 runtime:
-  # Worker thread configuration
-  num_threads: 8             # Worker threads for task execution (4 sched + 4 slow = 8)
-  process_reaper_threads: 1  # Process reaper threads
-
-  # Task execution configuration
-  queue_depth: 1024          # Task queue depth per worker
-  local_sched: "default"     # Local task scheduler
-  heartbeat_interval: 1000   # Heartbeat interval in milliseconds
-
-  # Worker sleep configuration (all values in microseconds)
-  first_busy_wait: 50        # Busy wait before sleeping when idle (50us)
-  max_sleep: 50000           # Maximum sleep duration (50ms)
+  num_threads: 8
+  queue_depth: 1024
+  local_sched: "default"
+  first_busy_wait: 50

@@ -155,10 +155,10 @@ Before running our code, start the Chimaera runtime:
 ```bash
 # Start with custom configuration
 export CHI_SERVER_CONF=/workspace/docker/wrp_cte_bench/cte_config.yaml
-chimaera_start_runtime
+chimaera runtime start
 
 # Run in background
-chimaera_start_runtime &
+chimaera runtime start &
 ```
 
 **Environment Variables:**

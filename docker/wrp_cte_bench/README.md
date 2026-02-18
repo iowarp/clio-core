@@ -79,7 +79,7 @@ All benchmark parameters can be configured via environment variables:
 | `IO_SIZE` | Size of each I/O operation | `1m` | 4k, 1m, 16m |
 | `IO_COUNT` | Number of operations to perform | `100` | 100, 1000, 100000 |
 | `CHIMAERA_WITH_RUNTIME` | Initialize CTE runtime in benchmark | `0` | 0 (runtime service), 1 (self-init) |
-| `WRP_RUNTIME_CONF` | Path to CTE configuration file | `/etc/iowarp/cte_config.yaml` | Custom path |
+| `CHI_SERVER_CONF` | Path to CTE configuration file | `/etc/iowarp/cte_config.yaml` | Custom path |
 
 ### I/O Size Format
 
@@ -179,7 +179,6 @@ TEST_CASE=PutGet NUM_PROCS=4 DEPTH=4 docker-compose up wrp-cte-bench
 ## Resource Configuration
 
 The default configuration allocates:
-- **Shared memory**: 8GB (critical for CTE operations)
 - **Memory limit**: 8GB
 - **ZeroMQ port**: 5555 (for runtime-client communication)
 
@@ -190,11 +189,9 @@ For larger workloads, increase resource limits in docker-compose.yml:
 ```yaml
 services:
   iowarp-runtime:
-    shm_size: 16g
     mem_limit: 16g
 
   wrp-cte-bench:
-    shm_size: 16g
     mem_limit: 16g
 ```
 
@@ -278,7 +275,7 @@ docker-compose ps iowarp-runtime
 
 ### Out of Memory Errors
 
-1. Increase shared memory and memory limits in docker-compose.yml
+1. Increase memory limits in docker-compose.yml
 2. Reduce IO_SIZE or IO_COUNT
 3. Reduce NUM_PROCS or DEPTH
 4. Monitor with `docker stats`
@@ -373,7 +370,7 @@ storage:
 ## Notes
 
 - Runtime service must be healthy before benchmarks can run
-- Shared memory is critical for CTE operations
+- IOWarp uses memfd_create() for shared memory (no /dev/shm dependency)
 - All data is RAM-based by default (no persistence)
 - ZeroMQ port 5555 used for client-runtime communication
 - Container network sharing allows benchmark to access runtime

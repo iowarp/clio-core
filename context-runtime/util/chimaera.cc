@@ -14,6 +14,7 @@ void PrintUsage() {
             << "  migrate         Migrate a container to a different node\n"
             << "  monitor         Monitor worker statistics\n"
             << "  compose         Create/destroy pools from compose config\n"
+            << "  repo refresh    Autogenerate ChiMod method files\n"
             << "\n"
             << "Run 'chimaera <command> --help' for more information on a command.\n";
 }
@@ -51,6 +52,27 @@ int main(int argc, char* argv[]) {
     } else {
       std::cerr << "Unknown runtime subcommand: " << subcmd << "\n";
       std::cerr << "Usage: chimaera runtime <start|stop> [options]\n";
+      return 1;
+    }
+  }
+
+  // Handle "repo refresh" subcommand
+  if (cmd == "repo") {
+    if (argc < 3) {
+      std::cerr << "Usage: chimaera repo <refresh> [options]\n";
+      return 1;
+    }
+
+    std::string subcmd = argv[2];
+    // Strip "chimaera repo <subcmd>" from argv
+    int new_argc = argc - 3;
+    char** new_argv = argv + 3;
+
+    if (subcmd == "refresh") {
+      return RefreshRepo(new_argc, new_argv);
+    } else {
+      std::cerr << "Unknown repo subcommand: " << subcmd << "\n";
+      std::cerr << "Usage: chimaera repo <refresh> [options]\n";
       return 1;
     }
   }

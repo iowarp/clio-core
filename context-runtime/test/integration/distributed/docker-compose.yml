@@ -26,20 +26,19 @@ services:
     environment:
       - NODE_ID=1
       - NODE_IP=172.25.0.10
-      - WRP_RUNTIME_CONF=/workspace/context-runtime/test/integration/distributed/wrp_conf.yaml
+      - CHI_SERVER_CONF=/workspace/context-runtime/test/integration/distributed/wrp_conf.yaml
       - CONTAINER_HOSTFILE=/workspace/context-runtime/test/integration/distributed/hostfile
       - CHIMAERA_WITH_RUNTIME=0
       - CHI_NUM_CONTAINERS=4
       - PATH=/workspace/build/bin:/usr/local/bin:/usr/bin:/bin
       - LD_LIBRARY_PATH=/workspace/build/bin:$LD_LIBRARY_PATH
-    shm_size: '16gb'
     mem_limit: 16g
     working_dir: /workspace
     entrypoint: [ "/bin/bash", "-c" ]
     command: >
       "
         echo 'Node 1: Starting runtime...' &&
-        /workspace/build/bin/chimaera_start_runtime &
+        /workspace/build/bin/chimaera runtime start &
         RUNTIME_PID=\$! &&
         echo 'Node 1: Runtime started (PID \$RUNTIME_PID). Waiting for test runner...' &&
         wait \$RUNTIME_PID
@@ -58,20 +57,19 @@ services:
     environment:
       - NODE_ID=2
       - NODE_IP=172.25.0.11
-      - WRP_RUNTIME_CONF=/workspace/context-runtime/test/integration/distributed/wrp_conf.yaml
+      - CHI_SERVER_CONF=/workspace/context-runtime/test/integration/distributed/wrp_conf.yaml
       - CONTAINER_HOSTFILE=/workspace/context-runtime/test/integration/distributed/hostfile
       - CHIMAERA_WITH_RUNTIME=0
       - CHI_NUM_CONTAINERS=4
       - PATH=/workspace/build/bin:/usr/local/bin:/usr/bin:/bin
       - LD_LIBRARY_PATH=/workspace/build/bin:$LD_LIBRARY_PATH
-    shm_size: '16gb'
     mem_limit: 16g
     working_dir: /workspace
     entrypoint: [ "/bin/bash", "-c" ]
     command: >
       "
         echo 'Node 2: Starting runtime...' &&
-        /workspace/build/bin/chimaera_start_runtime
+        /workspace/build/bin/chimaera runtime start
       "
 
   # Node 3
@@ -87,20 +85,19 @@ services:
     environment:
       - NODE_ID=3
       - NODE_IP=172.25.0.12
-      - WRP_RUNTIME_CONF=/workspace/context-runtime/test/integration/distributed/wrp_conf.yaml
+      - CHI_SERVER_CONF=/workspace/context-runtime/test/integration/distributed/wrp_conf.yaml
       - CONTAINER_HOSTFILE=/workspace/context-runtime/test/integration/distributed/hostfile
       - CHIMAERA_WITH_RUNTIME=0
       - CHI_NUM_CONTAINERS=4
       - PATH=/workspace/build/bin:/usr/local/bin:/usr/bin:/bin
       - LD_LIBRARY_PATH=/workspace/build/bin:$LD_LIBRARY_PATH
-    shm_size: '16gb'
     mem_limit: 16g
     working_dir: /workspace
     entrypoint: [ "/bin/bash", "-c" ]
     command: >
       "
         echo 'Node 3: Starting runtime...' &&
-        /workspace/build/bin/chimaera_start_runtime
+        /workspace/build/bin/chimaera runtime start
       "
 
   # Node 4
@@ -116,20 +113,19 @@ services:
     environment:
       - NODE_ID=4
       - NODE_IP=172.25.0.13
-      - WRP_RUNTIME_CONF=/workspace/context-runtime/test/integration/distributed/wrp_conf.yaml
+      - CHI_SERVER_CONF=/workspace/context-runtime/test/integration/distributed/wrp_conf.yaml
       - CONTAINER_HOSTFILE=/workspace/context-runtime/test/integration/distributed/hostfile
       - CHIMAERA_WITH_RUNTIME=0
       - CHI_NUM_CONTAINERS=4
       - PATH=/workspace/build/bin:/usr/local/bin:/usr/bin:/bin
       - LD_LIBRARY_PATH=/workspace/build/bin:$LD_LIBRARY_PATH
-    shm_size: '16gb'
     mem_limit: 16g
     working_dir: /workspace
     entrypoint: [ "/bin/bash", "-c" ]
     command: >
       "
         echo 'Node 4: Starting runtime...' &&
-        /workspace/build/bin/chimaera_start_runtime
+        /workspace/build/bin/chimaera runtime start
       "
 
 networks:

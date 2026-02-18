@@ -33,7 +33,7 @@ services:
     environment:
       - NODE_ID=1
       - NODE_IP=172.26.0.10
-      - WRP_RUNTIME_CONF=/workspace/context-transfer-engine/test/integration/distributed/wrp_config.yaml
+      - CHI_SERVER_CONF=/workspace/context-transfer-engine/test/integration/distributed/wrp_config.yaml
       - CONTAINER_HOSTFILE=/workspace/context-transfer-engine/test/integration/distributed/hostfile
       - TEST_FILTER=${TEST_FILTER:-}
       - SECTION_FILTER=${SECTION_FILTER:-}
@@ -41,7 +41,6 @@ services:
       - CHIMAERA_WITH_RUNTIME=0
       - PATH=/workspace/build/bin:/usr/local/bin:/usr/bin:/bin
       - LD_LIBRARY_PATH=/workspace/build/bin:$LD_LIBRARY_PATH
-    shm_size: '16gb'
     mem_limit: 16g
     working_dir: /workspace
     entrypoint: [ "/bin/bash", "-c" ]
@@ -58,7 +57,7 @@ services:
         echo '========================================' &&
         echo 'Node 1: Starting Chimaera runtime in background' &&
         echo '========================================' &&
-        /workspace/build/bin/chimaera_start_runtime &
+        /workspace/build/bin/chimaera runtime start &
         RUNTIME_PID=$$! &&
         echo \"Node 1: Runtime started (PID $$RUNTIME_PID)\" &&
         sleep 3 &&
@@ -95,12 +94,11 @@ services:
     environment:
       - NODE_ID=2
       - NODE_IP=172.26.0.11
-      - WRP_RUNTIME_CONF=/workspace/context-transfer-engine/test/integration/distributed/wrp_config.yaml
+      - CHI_SERVER_CONF=/workspace/context-transfer-engine/test/integration/distributed/wrp_config.yaml
       - CONTAINER_HOSTFILE=/workspace/context-transfer-engine/test/integration/distributed/hostfile
       - CTE_NUM_NODES=4
       - PATH=/workspace/build/bin:/usr/local/bin:/usr/bin:/bin
       - LD_LIBRARY_PATH=/workspace/build/bin:$LD_LIBRARY_PATH
-    shm_size: '16gb'
     mem_limit: 16g
     working_dir: /workspace
     entrypoint: [ "/bin/bash", "-c" ]
@@ -115,7 +113,7 @@ services:
         echo '========================================' &&
         echo 'Node 2: Starting Chimaera runtime in foreground' &&
         echo '========================================' &&
-        /workspace/build/bin/chimaera_start_runtime
+        /workspace/build/bin/chimaera runtime start
       "
 
   # Node 3 - Secondary node
@@ -132,12 +130,11 @@ services:
     environment:
       - NODE_ID=3
       - NODE_IP=172.26.0.12
-      - WRP_RUNTIME_CONF=/workspace/context-transfer-engine/test/integration/distributed/wrp_config.yaml
+      - CHI_SERVER_CONF=/workspace/context-transfer-engine/test/integration/distributed/wrp_config.yaml
       - CONTAINER_HOSTFILE=/workspace/context-transfer-engine/test/integration/distributed/hostfile
       - CTE_NUM_NODES=4
       - PATH=/workspace/build/bin:/usr/local/bin:/usr/bin:/bin
       - LD_LIBRARY_PATH=/workspace/build/bin:$LD_LIBRARY_PATH
-    shm_size: '16gb'
     mem_limit: 16g
     working_dir: /workspace
     entrypoint: [ "/bin/bash", "-c" ]
@@ -152,7 +149,7 @@ services:
         echo '========================================' &&
         echo 'Node 3: Starting Chimaera runtime in foreground' &&
         echo '========================================' &&
-        /workspace/build/bin/chimaera_start_runtime
+        /workspace/build/bin/chimaera runtime start
       "
 
   # Node 4 - Secondary node
@@ -169,12 +166,11 @@ services:
     environment:
       - NODE_ID=4
       - NODE_IP=172.26.0.13
-      - WRP_RUNTIME_CONF=/workspace/context-transfer-engine/test/integration/distributed/wrp_config.yaml
+      - CHI_SERVER_CONF=/workspace/context-transfer-engine/test/integration/distributed/wrp_config.yaml
       - CONTAINER_HOSTFILE=/workspace/context-transfer-engine/test/integration/distributed/hostfile
       - CTE_NUM_NODES=4
       - PATH=/workspace/build/bin:/usr/local/bin:/usr/bin:/bin
       - LD_LIBRARY_PATH=/workspace/build/bin:$LD_LIBRARY_PATH
-    shm_size: '16gb'
     mem_limit: 16g
     working_dir: /workspace
     entrypoint: [ "/bin/bash", "-c" ]
@@ -189,7 +185,7 @@ services:
         echo '========================================' &&
         echo 'Node 4: Starting Chimaera runtime in foreground' &&
         echo '========================================' &&
-        /workspace/build/bin/chimaera_start_runtime
+        /workspace/build/bin/chimaera runtime start
       "
 
 volumes:

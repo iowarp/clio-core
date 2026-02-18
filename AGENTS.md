@@ -7,6 +7,13 @@ This repository contains the unified IOWarp Core framework, integrating multiple
 - **context-assimilation-engine**: Context assimilation engine
 - **context-exploration-engine**: Context exploration engine
 
+## Documentation Updates
+Whenever you modify the configurations for context-runtime, context-transfer-engine, context-assimilation-engine, or bdev, we should update our documentation accordingly.
+First, we should update context-runtime/config/chimaera_default.yaml to have the default parameters -- even just as comments. We should document the parameter options here as well.
+
+After this, we need to update the following doc:
+docs/docs/deployment/configuration.md
+
 ## Testing Updates
 
 Never ever re-run tasks without installing your chanages first.
@@ -17,7 +24,7 @@ We use rpaths for libraries. This stuff does not get overriden by LD_LIBRARY_PAT
 
 When building chimods, make sure to edit chimaera_mod.yaml and chimaera_repo.yaml.
 
-If you add new methods to a chimod, please edit chimaera_mod.yaml and use the chi_refresh_repo binary to autogenerate the relevant autogen files.
+If you add new methods to a chimod, please edit chimaera_mod.yaml and use the chimaera repo refresh binary to autogenerate the relevant autogen files.
 
 
 ## ⚠️ CRITICAL BUILD RULE ⚠️
@@ -860,7 +867,7 @@ python -m build --wheel
 **What Gets Bundled:**
 - All IOWarp libraries (libchimaera_cxx.so, libhermes_shm_host.so, ChiMod libraries)
 - Dependencies from install.sh (Boost, HDF5, ZeroMQ, yaml-cpp, etc.)
-- Command-line tools (wrp_cte, wrp_cae_omni, chimaera_start_runtime, etc.)
+- Command-line tools (wrp_cte, wrp_cae_omni, chimaera, etc.)
 - Headers and CMake configuration files
 - Conda dependencies (if building in a Conda environment)
 

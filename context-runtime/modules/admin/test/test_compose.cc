@@ -52,13 +52,8 @@ std::string CreateComposeConfig() {
     std::ofstream config_file(config_path);
 
     config_file << "# Test compose configuration\n";
-    config_file << "workers:\n";
-    config_file << "  sched_threads: 2\n";
-    config_file << "  slow_threads: 2\n";
-    config_file << "\n";
-    config_file << "memory:\n";
-    config_file << "  main_segment_size: 1GB\n";
-    config_file << "  client_data_segment_size: 256MB\n";
+    config_file << "runtime:\n";
+    config_file << "  num_threads: 4\n";
     config_file << "\n";
     config_file << "networking:\n";
     config_file << "  port: 5555\n";

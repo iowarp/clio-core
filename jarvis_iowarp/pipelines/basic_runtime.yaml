@@ -1,6 +1,6 @@
 # IOWarp Runtime Basic Deployment Pipeline
 # Purpose: Deploy the IOWarp (Chimaera) runtime on distributed nodes
-# Requirements: chimaera_start_runtime and chimaera_stop_runtime installed in PATH
+# Requirements: chimaera runtime start and chimaera runtime stop installed in PATH
 
 name: iowarp_basic_runtime
 

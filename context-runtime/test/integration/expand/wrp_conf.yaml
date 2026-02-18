@@ -2,11 +2,6 @@
 # Nodes 1-2 start with hostfile_initial, node 3 starts with hostfile_full
 # The hostfile path is set per-container via CONTAINER_HOSTFILE env var
 
-# Memory segment configuration
-memory:
-  main_segment_size: auto
-  client_data_segment_size: 2147483648 # 2GB
-
 # Network configuration
 networking:
   port: 5556
@@ -21,9 +16,6 @@ logging:
 # Runtime configuration
 runtime:
   num_threads: 8
-  process_reaper_threads: 1
   queue_depth: 1024
   local_sched: "default"
-  heartbeat_interval: 1000
   first_busy_wait: 50
-  max_sleep: 50000

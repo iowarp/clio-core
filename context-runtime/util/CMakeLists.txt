@@ -12,6 +12,7 @@ add_library(chimaera_commands STATIC
   ${CMAKE_CURRENT_SOURCE_DIR}/chimaera_cmd_monitor.cc
   ${CMAKE_CURRENT_SOURCE_DIR}/chimaera_cmd_compose.cc
   ${CMAKE_CURRENT_SOURCE_DIR}/chimaera_cmd_migrate.cc
+  ${CMAKE_CURRENT_SOURCE_DIR}/chimaera_cmd_refresh_repo.cc
 )
 target_link_libraries(chimaera_commands
   PUBLIC chimaera_cxx
@@ -31,55 +32,7 @@ target_link_libraries(chimaera
   PUBLIC chimaera_commands
 )
 
-#==============================================================================
-# Legacy binaries (thin wrappers for backward compatibility)
-#==============================================================================
-
-# Build chimaera_start_runtime
-add_executable(chimaera_start_runtime
-  ${CMAKE_CURRENT_SOURCE_DIR}/chimaera_start_runtime.cc
-)
-target_link_libraries(chimaera_start_runtime
-  PUBLIC chimaera_commands
-)
-
-# Build chimaera_stop_runtime
-add_executable(chimaera_stop_runtime
-  ${CMAKE_CURRENT_SOURCE_DIR}/chimaera_stop_runtime.cc
-)
-target_link_libraries(chimaera_stop_runtime
-  PUBLIC chimaera_commands
-)
-
-# Build chimaera_compose
-add_executable(chimaera_compose
-  ${CMAKE_CURRENT_SOURCE_DIR}/chimaera_compose.cc
-)
-target_link_libraries(chimaera_compose
-  PUBLIC chimaera_commands
-)
-
-# Build chimaera_monitor
-add_executable(chimaera_monitor
-  ${CMAKE_CURRENT_SOURCE_DIR}/chimaera_monitor.cc
-)
-target_link_libraries(chimaera_monitor
-  PUBLIC chimaera_commands
-)
-
-#==============================================================================
-# Standalone utilities (not part of unified binary)
-#==============================================================================
-
-# Build chi_refresh_repo
-add_executable(chi_refresh_repo
-  ${CMAKE_CURRENT_SOURCE_DIR}/chi_refresh_repo.cc
-)
-target_link_libraries(chi_refresh_repo
-  PUBLIC hshm::cxx
-)
-
 # Install utilities
-install(TARGETS chimaera chimaera_start_runtime chimaera_stop_runtime chi_refresh_repo chimaera_compose chimaera_monitor
+install(TARGETS chimaera
   RUNTIME DESTINATION bin
 )

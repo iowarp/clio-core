@@ -14,7 +14,7 @@
       "WebFetch(domain:github.com)",
       "Bash(ninja:*)",
       "Bash(make:*)",
-      "Bash(./build/bin/chi_refresh_repo:*)",
+      "Bash(./build/bin/chimaera repo refresh:*)",
       "Bash(./build/bin/chimaera_unit_tests:*)",
       "Bash(./build/bin/chimaera_bdev_chimod_tests:*)",
       "Bash(timeout 30 ./build/bin/chimaera_comutex_tests:*)",

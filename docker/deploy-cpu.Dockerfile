@@ -25,9 +25,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Create iowarp user
-RUN useradd -m -s /bin/bash iowarp && \
-    mkdir -p /etc/iowarp && \
-    chown -R iowarp:iowarp /etc/iowarp
+RUN useradd -m -s /bin/bash iowarp
 
 # MPI environment
 ENV OMPI_ALLOW_RUN_AS_ROOT=1
@@ -57,10 +55,10 @@ RUN sudo chown -R $(whoami):$(whoami) /workspace && \
     cmake --preset build-cpu-release ../ && \
     sudo make -j$(nproc) install
 
-# Install default runtime configuration
-RUN sudo mkdir -p /etc/iowarp && \
-    sudo cp /workspace/context-runtime/config/chimaera_default.yaml /etc/iowarp/wrp_conf.yaml && \
-    sudo touch /etc/iowarp/hostfile
+# Seed default config at ~/.chimaera/chimaera.yaml (picked up automatically by runtime)
+RUN mkdir -p /home/iowarp/.chimaera && \
+    cp /workspace/context-runtime/config/chimaera_default.yaml \
+       /home/iowarp/.chimaera/chimaera.yaml
 
 # Strip build-only artifacts to minimize final image size
 RUN sudo rm -rf /home/iowarp/miniconda3/pkgs \
@@ -83,17 +81,14 @@ COPY --from=builder /usr/local/lib /usr/local/lib
 COPY --from=builder /usr/local/bin /usr/local/bin
 COPY --from=builder /usr/local/share /usr/local/share
 
-# Copy IOWarp runtime configuration
-COPY --from=builder /etc/iowarp /etc/iowarp
+# Copy default config for runtime auto-discovery
+COPY --from=builder --chown=iowarp:iowarp /home/iowarp/.chimaera /home/iowarp/.chimaera
 
 # Set up library paths
 ENV LD_LIBRARY_PATH=/usr/local/lib:/home/iowarp/miniconda3/lib:/usr/lib/x86_64-linux-gnu
 ENV PATH=/usr/local/bin:/home/iowarp/miniconda3/bin:${PATH}
 ENV CONDA_PREFIX=/home/iowarp/miniconda3
 ENV CMAKE_PREFIX_PATH=/home/iowarp/miniconda3
-
-# Set runtime configuration environment variable
-ENV WRP_RUNTIME_CONF=/etc/iowarp/wrp_conf.yaml
 
 # Update library cache
 RUN ldconfig

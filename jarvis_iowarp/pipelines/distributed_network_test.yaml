@@ -2,7 +2,7 @@
 # Purpose: Deploy the IOWarp runtime on two nodes to test Send/Recv networking
 # Requirements:
 #   - Two nodes accessible via hostfile
-#   - chimaera_start_runtime and chimaera_stop_runtime in PATH
+#   - chimaera runtime start and chimaera runtime stop in PATH
 #   - Hostfile at $JARVIS_SHARED/hostfile
 
 name: iowarp_distributed_network_test

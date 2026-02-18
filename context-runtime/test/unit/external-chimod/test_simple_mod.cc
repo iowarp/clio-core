@@ -68,7 +68,7 @@ int main() {
     if (!client_init_success) {
       HLOG(kInfo, "NOTICE: Chimaera client initialization failed.");
       HLOG(kInfo, "This is expected when no runtime is active.");
-      HLOG(kInfo, "In a production environment, ensure chimaera_start_runtime is running.");
+      HLOG(kInfo, "In a production environment, ensure chimaera runtime start is running.");
     } else {
       HLOG(kSuccess, "SUCCESS: Chimaera client initialized!");
     }
@@ -128,7 +128,7 @@ int main() {
   HIPRINT("CHI_TASK_CC macro with external library name");
 
   HIPRINT("\nNOTE: This test demonstrates successful external ChiMod development patterns.");
-  HIPRINT("For full functionality, run chimaera_start_runtime in another terminal.");
+  HIPRINT("For full functionality, run chimaera runtime start in another terminal.");
 
   return 0;
 }

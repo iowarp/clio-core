@@ -236,7 +236,7 @@ cmake --build build --target test_context_bundle test_context_query test_context
 cd build
 LD_LIBRARY_PATH=/workspace/build/bin:$LD_LIBRARY_PATH \
 WRP_CTE_CONF=/workspace/context-assimilation-engine/test/unit/wrp_config.yaml \
-./bin/chimaera_start_runtime
+./bin/chimaera runtime start
 
 # Wait for message: "Successfully started local server at 127.0.0.1:9129"
 ```
@@ -259,7 +259,7 @@ LD_LIBRARY_PATH=/workspace/build/bin:$LD_LIBRARY_PATH ./bin/test_context_destroy
 ```bash
 # When done testing
 cd build
-./bin/chimaera_stop_runtime
+./bin/chimaera runtime stop
 ```
 
 ## Unit Tests

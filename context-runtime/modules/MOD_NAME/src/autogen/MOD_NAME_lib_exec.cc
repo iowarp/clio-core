@@ -244,50 +244,50 @@ void Runtime::LocalLoadTask(chi::u32 method, chi::LocalLoadTaskArchive& archive,
   switch (method) {
     case Method::kCreate: {
       auto typed_task = task_ptr.template Cast<CreateTask>();
-      // Call SerializeIn - task will call Task::SerializeIn for base fields
-      typed_task.ptr_->SerializeIn(archive);
+      // Use archive operator which respects msg_type
+      archive >> *typed_task.ptr_;
       break;
     }
     case Method::kDestroy: {
       auto typed_task = task_ptr.template Cast<DestroyTask>();
-      // Call SerializeIn - task will call Task::SerializeIn for base fields
-      typed_task.ptr_->SerializeIn(archive);
+      // Use archive operator which respects msg_type
+      archive >> *typed_task.ptr_;
       break;
     }
     case Method::kCustom: {
       auto typed_task = task_ptr.template Cast<CustomTask>();
-      // Call SerializeIn - task will call Task::SerializeIn for base fields
-      typed_task.ptr_->SerializeIn(archive);
+      // Use archive operator which respects msg_type
+      archive >> *typed_task.ptr_;
       break;
     }
     case Method::kCoMutexTest: {
       auto typed_task = task_ptr.template Cast<CoMutexTestTask>();
-      // Call SerializeIn - task will call Task::SerializeIn for base fields
-      typed_task.ptr_->SerializeIn(archive);
+      // Use archive operator which respects msg_type
+      archive >> *typed_task.ptr_;
       break;
     }
     case Method::kCoRwLockTest: {
       auto typed_task = task_ptr.template Cast<CoRwLockTestTask>();
-      // Call SerializeIn - task will call Task::SerializeIn for base fields
-      typed_task.ptr_->SerializeIn(archive);
+      // Use archive operator which respects msg_type
+      archive >> *typed_task.ptr_;
       break;
     }
     case Method::kWaitTest: {
       auto typed_task = task_ptr.template Cast<WaitTestTask>();
-      // Call SerializeIn - task will call Task::SerializeIn for base fields
-      typed_task.ptr_->SerializeIn(archive);
+      // Use archive operator which respects msg_type
+      archive >> *typed_task.ptr_;
       break;
     }
     case Method::kTestLargeOutput: {
       auto typed_task = task_ptr.template Cast<TestLargeOutputTask>();
-      // Call SerializeIn - task will call Task::SerializeIn for base fields
-      typed_task.ptr_->SerializeIn(archive);
+      // Use archive operator which respects msg_type
+      archive >> *typed_task.ptr_;
       break;
     }
     case Method::kGpuSubmit: {
       auto typed_task = task_ptr.template Cast<GpuSubmitTask>();
-      // Call SerializeIn - task will call Task::SerializeIn for base fields
-      typed_task.ptr_->SerializeIn(archive);
+      // Use archive operator which respects msg_type
+      archive >> *typed_task.ptr_;
       break;
     }
     default: {
@@ -310,50 +310,50 @@ void Runtime::LocalSaveTask(chi::u32 method, chi::LocalSaveTaskArchive& archive,
   switch (method) {
     case Method::kCreate: {
       auto typed_task = task_ptr.template Cast<CreateTask>();
-      // Call SerializeOut - task will call Task::SerializeOut for base fields
-      typed_task.ptr_->SerializeOut(archive);
+      // Use archive operator which respects msg_type
+      archive << *typed_task.ptr_;
       break;
     }
     case Method::kDestroy: {
       auto typed_task = task_ptr.template Cast<DestroyTask>();
-      // Call SerializeOut - task will call Task::SerializeOut for base fields
-      typed_task.ptr_->SerializeOut(archive);
+      // Use archive operator which respects msg_type
+      archive << *typed_task.ptr_;
       break;
     }
     case Method::kCustom: {
       auto typed_task = task_ptr.template Cast<CustomTask>();
-      // Call SerializeOut - task will call Task::SerializeOut for base fields
-      typed_task.ptr_->SerializeOut(archive);
+      // Use archive operator which respects msg_type
+      archive << *typed_task.ptr_;
       break;
     }
     case Method::kCoMutexTest: {
       auto typed_task = task_ptr.template Cast<CoMutexTestTask>();
-      // Call SerializeOut - task will call Task::SerializeOut for base fields
-      typed_task.ptr_->SerializeOut(archive);
+      // Use archive operator which respects msg_type
+      archive << *typed_task.ptr_;
       break;
     }
     case Method::kCoRwLockTest: {
       auto typed_task = task_ptr.template Cast<CoRwLockTestTask>();
-      // Call SerializeOut - task will call Task::SerializeOut for base fields
-      typed_task.ptr_->SerializeOut(archive);
+      // Use archive operator which respects msg_type
+      archive << *typed_task.ptr_;
       break;
     }
     case Method::kWaitTest: {
       auto typed_task = task_ptr.template Cast<WaitTestTask>();
-      // Call SerializeOut - task will call Task::SerializeOut for base fields
-      typed_task.ptr_->SerializeOut(archive);
+      // Use archive operator which respects msg_type
+      archive << *typed_task.ptr_;
       break;
     }
     case Method::kTestLargeOutput: {
       auto typed_task = task_ptr.template Cast<TestLargeOutputTask>();
-      // Call SerializeOut - task will call Task::SerializeOut for base fields
-      typed_task.ptr_->SerializeOut(archive);
+      // Use archive operator which respects msg_type
+      archive << *typed_task.ptr_;
       break;
     }
     case Method::kGpuSubmit: {
       auto typed_task = task_ptr.template Cast<GpuSubmitTask>();
-      // Call SerializeOut - task will call Task::SerializeOut for base fields
-      typed_task.ptr_->SerializeOut(archive);
+      // Use archive operator which respects msg_type
+      archive << *typed_task.ptr_;
       break;
     }
     default: {

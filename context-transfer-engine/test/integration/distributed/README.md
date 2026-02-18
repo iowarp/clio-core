@@ -111,7 +111,7 @@ The `test_core_functionality` executable uses the `CHIMAERA_WITH_RUNTIME` enviro
 - **CHIMAERA_WITH_RUNTIME=0**: Runtime initialization is skipped (distributed mode)
 - **CHIMAERA_WITH_RUNTIME=1**: Runtime is initialized by the test executable (same as default)
 
-In distributed tests, the runtime is already initialized by `chimaera_start_runtime` before tests run, so `CHIMAERA_WITH_RUNTIME=0` is set in the docker-compose.yaml configuration.
+In distributed tests, the runtime is already initialized by `chimaera runtime start` before tests run, so `CHIMAERA_WITH_RUNTIME=0` is set in the docker-compose.yaml configuration.
 
 For local standalone testing:
 ```bash

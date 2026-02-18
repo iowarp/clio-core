@@ -87,8 +87,8 @@ struct ComposeConfig {
  * Configuration manager singleton
  *
  * Inherits from hshm BaseConfig and manages YAML configuration parsing.
- * Reads configuration from CHI_SERVER_CONF or WRP_RUNTIME_CONF environment variables.
- * CHI_SERVER_CONF is checked first; WRP_RUNTIME_CONF is used as fallback.
+ * Config lookup: CHI_SERVER_CONF env -> WRP_RUNTIME_CONF env ->
+ * ~/.chimaera/chimaera.yaml -> bare minimum defaults.
  * Uses HSHM global cross pointer variable singleton pattern.
  */
 class ConfigManager : public hshm::BaseConfig {
@@ -122,9 +122,13 @@ class ConfigManager : public hshm::BaseConfig {
   bool LoadYaml(const std::string& config_path);
 
   /**
-   * Get server configuration file path from environment
-   * Checks CHI_SERVER_CONF first, then falls back to WRP_RUNTIME_CONF
-   * @return Configuration file path or empty string if neither is set
+   * Get server configuration file path
+   * Lookup order:
+   *   1. CHI_SERVER_CONF env var
+   *   2. WRP_RUNTIME_CONF env var
+   *   3. ~/.chimaera/chimaera.yaml (if it exists)
+   *   4. Empty string (bare minimum defaults, no compose)
+   * @return Configuration file path or empty string if no config found
    */
   std::string GetServerConfigPath() const;
 
@@ -243,7 +247,6 @@ class ConfigManager : public hshm::BaseConfig {
   // Configuration parameters
   u32 num_threads_ = 4;
   u32 queue_depth_ = 1024;
-  u32 process_reaper_workers_ = 1;
 
   size_t main_segment_size_ = hshm::Unit<size_t>::Gigabytes(1);
   size_t client_data_segment_size_ = hshm::Unit<size_t>::Megabytes(256);

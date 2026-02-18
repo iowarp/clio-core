@@ -1,6 +1,6 @@
 # CTE Gray-Scott Compression Pipeline
 # Purpose: Run Gray-Scott simulation with CTE and dynamic compression
-# Requirements: chimaera_start_runtime in PATH, gray-scott executable, iowarp_engine plugin
+# Requirements: chimaera runtime start in PATH, gray-scott executable, iowarp_engine plugin
 
 name: cte_gray_scott_compress
 

@@ -984,10 +984,10 @@ bool IpcManager::IdentifyThisHost() {
   HLOG(kError, "           sudo lsof -nP -iTCP:{} | grep LISTEN", port);
   HLOG(kError, "");
   HLOG(kError, "To stop the Chimaera runtime, run:");
-  HLOG(kError, "  chimaera_stop_runtime");
+  HLOG(kError, "  chimaera runtime stop");
   HLOG(kError, "");
   HLOG(kError, "Or kill the process directly:");
-  HLOG(kError, "  pkill -9 chimaera_start_runtime");
+  HLOG(kError, "  pkill -9 chimaera");
   HLOG(kFatal, "  kill -9 <PID>");
   return false;
 }

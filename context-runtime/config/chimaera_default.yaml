@@ -1,35 +1,107 @@
-# Default Chimaera Configuration
-# This file contains the default configuration for the Chimaera distributed task execution framework
+# =============================================================================
+# IOWarp Default Configuration
+# =============================================================================
+# Canonical reference for all configurable parameters across:
+#   - Chimaera Runtime (context-runtime)
+#   - Context Transfer Engine / CTE (context-transfer-engine)
+#   - Context Assimilation Engine / CAE (context-assimilation-engine)
+#
+# Config lookup order:
+#   1. CHI_SERVER_CONF environment variable
+#   2. WRP_RUNTIME_CONF environment variable
+#   3. ~/.chimaera/chimaera.yaml
+#
+# Size values accept: B, KB, MB, GB, TB (case-insensitive)
+# =============================================================================
 
-# Memory segment configuration
-memory:
-  main_segment_size: auto            # Auto-calculated from queue_depth and num_threads
-                                     # Or specify explicitly (e.g., "1GB" or 1073741824)
-  client_data_segment_size: 536870912 # 512MB
-
-# Network configuration
+# -- Networking ---------------------------------------------------------------
 networking:
-  port: 5555
-  neighborhood_size: 32  # Maximum number of queries when splitting range queries
-  wait_for_restart: 30   # Seconds to wait for remote connection during system boot (default: 30)
-  wait_for_restart_poll_period: 1  # Seconds between retry attempts (default: 1)
+  port: 5555                           # RPC listener port
+  neighborhood_size: 32                # Max nodes queried when splitting range queries
+  # hostfile: "/path/to/hostfile"      # One hostname per line for distributed mode
+  wait_for_restart: 30                 # Seconds to wait for peer nodes on startup
+  wait_for_restart_poll_period: 1      # Seconds between connection retries
 
-# Logging configuration
+# -- Logging ------------------------------------------------------------------
 logging:
-  level: "info"
+  level: "info"                        # trace, debug, info, warning, error, fatal
   file: "/tmp/chimaera.log"
 
-# Runtime configuration (includes worker threads, scheduling, and performance parameters)
+# -- Runtime ------------------------------------------------------------------
 runtime:
-  # Worker thread configuration
-  num_threads: 4             # Worker threads for task execution (replaces sched_threads + slow_threads)
-  process_reaper_threads: 1  # Process reaper threads
+  num_threads: 4                       # Worker threads for task execution
+  queue_depth: 1024                    # Task queue depth per worker
+  local_sched: "default"               # Local task scheduler algorithm
+  first_busy_wait: 10000               # Microseconds to busy-wait before sleeping (10ms)
 
-  # Task execution configuration
-  queue_depth: 1024          # Task queue depth per worker (now actually configurable)
-  local_sched: "default"     # Local task scheduler
-  heartbeat_interval: 1000   # Heartbeat interval in milliseconds
+# -- Compose ------------------------------------------------------------------
+# Modules started automatically with the runtime.
+# Only chimaera_bdev is required. CTE (wrp_cte_core) and CAE (wrp_cae_core)
+# are optional — remove their entries if you do not need them.
+compose:
 
-  # Worker sleep configuration (all values in microseconds)
-  first_busy_wait: 10000     # Busy wait before sleeping when idle (10ms)
-  max_sleep: 50000           # Maximum sleep duration (50ms)
+  # === Block Device (DRAM) ===
+  # Required: provides the shared memory allocator used by other modules.
+  - mod_name: chimaera_bdev
+    pool_name: "ram::chi_default_bdev"
+    pool_query: local
+    pool_id: "301.0"
+    bdev_type: ram                       # "ram" for DRAM-backed block device
+    capacity: "512MB"
+
+  # === Block Device (File) ===
+  # Uncomment to add a file-backed block device (e.g., for NVMe or HDD storage).
+  # - mod_name: chimaera_bdev
+  #   pool_name: "/mnt/nvme/chi_bdev"
+  #   pool_query: local
+  #   pool_id: "302.0"
+  #   bdev_type: file                    # "file" for filesystem-backed block device
+  #   capacity: "100GB"
+
+  # === Context Transfer Engine (CTE) — optional ===
+  # High-performance data buffering and transfer engine.
+  # Remove this section if CTE is not needed.
+  - mod_name: wrp_cte_core
+    pool_name: cte_main
+    pool_query: local
+    pool_id: "512.0"
+
+    # Storage tiers ---------------------------------------------------------
+    # Each entry creates a block device for CTE to buffer data onto.
+    # score: 0.0 = slowest/cheapest, 1.0 = fastest/most expensive
+    #        -1.0 = automatic scoring
+    storage:
+      - path: "ram::cte_ram_tier1"       # "ram::<name>" for DRAM, filesystem path for disk
+        bdev_type: "ram"                 # "ram" or "file"
+        capacity_limit: "512MB"
+        score: 1.0                       # DRAM = highest-performance tier
+
+    # Data Placement Engine ------------------------------------------------
+    dpe:
+      dpe_type: "max_bw"                # "max_bw", "round_robin", or "random"
+
+    # Target management ----------------------------------------------------
+    targets:
+      neighborhood: 1                   # Storage nodes CTE can buffer to
+      default_target_timeout_ms: 30000   # Timeout for target operations (ms)
+      poll_period_ms: 5000               # Target statistics re-scan interval (ms)
+
+    # Performance tuning ---------------------------------------------------
+    # Uncomment to override defaults:
+    # performance:
+    #   stat_targets_period_ms: 50       # Periodic StatTargets interval (ms)
+    #   max_concurrent_operations: 64    # Max concurrent I/O operations
+    #   score_threshold: 0.7             # Score above which blobs are reorganized
+    #   score_difference_threshold: 0.05 # Min score delta to trigger reorganization
+    #   flush_metadata_period_ms: 5000   # Metadata flush interval (ms)
+    #   flush_data_period_ms: 10000      # Data flush interval (ms)
+    #   flush_data_min_persistence: 1    # Min persistence level (1=temp-nonvolatile)
+    #   transaction_log_capacity: "32MB" # Write-ahead log capacity
+
+  # === Context Assimilation Engine (CAE) — optional ===
+  # Data ingestion and assimilation engine.
+  # Remove this section if CAE is not needed.
+  - mod_name: wrp_cae_core
+    pool_name: wrp_cae_core_pool
+    pool_query: local
+    pool_id: "400.0"

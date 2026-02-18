@@ -60,7 +60,7 @@ public:
 
   /**
    * Initialize client components
-   * Configuration is now provided via chimaera_compose using WRP_RUNTIME_CONF
+   * Configuration is now provided via chimaera compose using WRP_RUNTIME_CONF
    * @param pool_query Pool query type for CTE container creation
    * @return true if initialization successful, false otherwise
    */

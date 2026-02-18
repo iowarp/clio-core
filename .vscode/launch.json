@@ -5,8 +5,8 @@
             "name": "Debug ChiMod Runtime",
             "type": "cppdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/build/bin/chimaera_start_runtime",
-            "args": [],
+            "program": "${workspaceFolder}/build/bin/chimaera",
+            "args": ["runtime", "start"],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}",
             "environment": [],
@@ -398,11 +398,11 @@
             "preLaunchTask": "cmake-build-debug"
         },
         {
-            "name": "Debug chimaera_stop_runtime",
+            "name": "Debug chimaera runtime stop",
             "type": "cppdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/build/bin/chimaera_stop_runtime",
-            "args": [],
+            "program": "${workspaceFolder}/build/bin/chimaera",
+            "args": ["runtime", "stop"],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}/build",
             "environment": [],
@@ -566,7 +566,7 @@
             "name": "debug_runtime",
             "type": "cppdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/build/bin/chimaera_start_runtime",
+            "program": "${workspaceFolder}/build/bin/chimaera",
             "cwd": "${workspaceFolder}",
             "MIMode": "gdb",
             "miDebuggerServerAddress": "localhost:4000",
@@ -587,7 +587,7 @@
             "name": "debug_client",
             "type": "cppdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/build/bin/chimaera_start_runtime",
+            "program": "${workspaceFolder}/build/bin/chimaera",
             "cwd": "${workspaceFolder}",
             "MIMode": "gdb",
             "miDebuggerServerAddress": "localhost:4001",
@@ -605,11 +605,12 @@
             ]
         },
         {
-            "name": "Debug chimaera_monitor",
+            "name": "Debug chimaera monitor",
             "type": "cppdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/build/bin/chimaera_monitor",
+            "program": "${workspaceFolder}/build/bin/chimaera",
             "args": [
+                "monitor",
                 "-o",
                 "-v"
             ],

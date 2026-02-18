@@ -1,5 +1,5 @@
 #!/bin/bash
-# Test script for chimaera_compose utility
+# Test script for chimaera compose utility
 # Tests that the compose utility can successfully create pools from a YAML configuration
 
 set -e  # Exit on error
@@ -14,36 +14,26 @@ NC='\033[0m' # No Color
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="${SCRIPT_DIR}/../../build"
 BIN_DIR="${BUILD_DIR}/bin"
-TEST_CONFIG="/tmp/test_chimaera_compose_config.yaml"
+TEST_CONFIG="/tmp/test_chimaera compose_config.yaml"
 
 # Executables
-CHIMAERA_START_RUNTIME="${BIN_DIR}/chimaera_start_runtime"
-CHIMAERA_COMPOSE="${BIN_DIR}/chimaera_compose"
+CHIMAERA_START_RUNTIME="${BIN_DIR}/chimaera runtime start"
+CHIMAERA_COMPOSE="${BIN_DIR}/chimaera compose"
 
 echo -e "${YELLOW}=== Chimaera Compose Utility Test ===${NC}"
 
 # Check if executables exist
-if [ ! -f "${CHIMAERA_START_RUNTIME}" ]; then
-    echo -e "${RED}Error: chimaera_start_runtime not found at ${CHIMAERA_START_RUNTIME}${NC}"
-    exit 1
-fi
-
-if [ ! -f "${CHIMAERA_COMPOSE}" ]; then
-    echo -e "${RED}Error: chimaera_compose not found at ${CHIMAERA_COMPOSE}${NC}"
+if [ ! -f "${BIN_DIR}/chimaera" ]; then
+    echo -e "${RED}Error: chimaera not found at ${BIN_DIR}/chimaera${NC}"
     exit 1
 fi
 
 # Create test configuration file
 echo -e "${YELLOW}Creating test configuration file...${NC}"
 cat > "${TEST_CONFIG}" << 'EOF'
-# Test compose configuration for chimaera_compose utility
-workers:
-  sched_threads: 2
-  slow_threads: 2
-
-memory:
-  main_segment_size: 1GB
-  client_data_segment_size: 256MB
+# Test compose configuration for chimaera compose utility
+runtime:
+  num_threads: 4
 
 networking:
   port: 5555
@@ -69,8 +59,8 @@ export CHI_SERVER_CONF="${TEST_CONFIG}"
 cleanup() {
     echo -e "${YELLOW}Cleaning up...${NC}"
     # Kill all chimaera processes
-    pkill -9 -f "chimaera_start_runtime" 2>/dev/null || true
-    pkill -9 -f "chimaera_compose" 2>/dev/null || true
+    pkill -9 -f "chimaera runtime start" 2>/dev/null || true
+    pkill -9 -f "chimaera compose" 2>/dev/null || true
 
     # Clean up test files
     rm -f "${TEST_CONFIG}" 2>/dev/null || true
@@ -103,12 +93,12 @@ fi
 
 echo -e "${GREEN}Runtime started successfully (PID: ${RUNTIME_PID})${NC}"
 
-# Run chimaera_compose utility
-echo -e "${YELLOW}Running chimaera_compose utility...${NC}"
+# Run chimaera compose utility
+echo -e "${YELLOW}Running chimaera compose utility...${NC}"
 if "${CHIMAERA_COMPOSE}" "${TEST_CONFIG}"; then
-    echo -e "${GREEN}chimaera_compose completed successfully${NC}"
+    echo -e "${GREEN}chimaera compose completed successfully${NC}"
 else
-    echo -e "${RED}Error: chimaera_compose failed${NC}"
+    echo -e "${RED}Error: chimaera compose failed${NC}"
     exit 1
 fi
 

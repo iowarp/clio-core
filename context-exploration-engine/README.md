@@ -75,7 +75,7 @@ Tests support two modes:
 **1. With External Runtime:**
 ```bash
 # Start runtime in separate terminal
-cd build && ./bin/chimaera_start_runtime
+cd build && ./bin/chimaera runtime start
 
 # Run tests
 ./bin/test_context_bundle

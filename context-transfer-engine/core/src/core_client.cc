@@ -54,7 +54,7 @@ bool WRP_CTE_CLIENT_INIT(const std::string &config_path,
     g_cte_client = new wrp_cte::core::Client();
   }
 
-  // config_path is no longer used - configuration now provided via chimaera_compose
+  // config_path is no longer used - configuration now provided via chimaera compose
   (void)config_path; // Suppress unused parameter warning
   auto *cte_manager = CTE_MANAGER;
   bool result = cte_manager->ClientInit(pool_query);

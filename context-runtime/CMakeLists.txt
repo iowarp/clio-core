@@ -56,7 +56,7 @@ read_repo_namespace(CHIMAERA_NAMESPACE "${CHIMAERA_ROOT}")
 set(CHIMAERA_NAMESPACE "${CHIMAERA_NAMESPACE}" CACHE STRING "Project namespace for chimod targets")
 message(STATUS "Chimaera namespace: ${CHIMAERA_NAMESPACE}")
 
-# Add utilities subdirectory FIRST so chi_refresh_repo builds before everything else
+# Add utilities subdirectory FIRST so chimaera repo refresh builds before everything else
 add_subdirectory(util)
 
 # Add source subdirectory to build main library
@@ -122,6 +122,41 @@ install(DIRECTORY config/
   DESTINATION etc/chimaera
   FILES_MATCHING PATTERN "*"
 )
+
+# Seed ~/.chimaera/chimaera.yaml for the real user (handles sudo)
+# Only creates the file if it doesn't already exist
+install(CODE "
+  # Determine real user's home directory
+  set(_HOME \"\")
+  if(DEFINED ENV{SUDO_USER})
+    set(_SUDO_USER \"\$ENV{SUDO_USER}\")
+    execute_process(
+      COMMAND bash -c \"eval echo ~\${_SUDO_USER}\"
+      OUTPUT_VARIABLE _HOME
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+    )
+  endif()
+  if(_HOME STREQUAL \"\")
+    set(_HOME \"\$ENV{HOME}\")
+  endif()
+
+  set(_DEST \"\${_HOME}/.chimaera\")
+  set(_FILE \"\${_DEST}/chimaera.yaml\")
+  if(NOT EXISTS \"\${_FILE}\")
+    file(MAKE_DIRECTORY \"\${_DEST}\")
+    file(COPY_FILE
+      \"\${CMAKE_INSTALL_PREFIX}/etc/chimaera/chimaera_default.yaml\"
+      \"\${_FILE}\"
+    )
+    message(STATUS \"Seeded default config: \${_FILE}\")
+    # Fix ownership when running under sudo
+    if(DEFINED ENV{SUDO_USER})
+      execute_process(COMMAND chown -R \"\$ENV{SUDO_USER}:\$ENV{SUDO_USER}\" \"\${_DEST}\")
+    endif()
+  else()
+    message(STATUS \"User config already exists: \${_FILE} (not overwriting)\")
+  endif()
+")
 
 # Export targets file for main library
 install(EXPORT ${MAIN_EXPORT_NAME}

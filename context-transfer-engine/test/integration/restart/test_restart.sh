@@ -11,10 +11,10 @@ echo "=== CTE Restart Integration Test ==="
 echo "BIN_DIR: $BIN_DIR"
 echo "COMPOSE_CONFIG: $COMPOSE_CONFIG"
 
-# Stop runtime helper: try chimaera_stop_runtime, fall back to kill
+# Stop runtime helper: try chimaera runtime stop, fall back to kill
 stop_runtime() {
     if [ -n "$RUNTIME_PID" ] && kill -0 $RUNTIME_PID 2>/dev/null; then
-        $BIN_DIR/chimaera_stop_runtime 2>/dev/null || true
+        $BIN_DIR/chimaera runtime stop 2>/dev/null || true
         # Give graceful shutdown a chance
         sleep 2
         # Force kill if still running
@@ -46,12 +46,12 @@ echo ""
 echo "=== Phase 1: Start runtime and store blobs ==="
 
 export CHI_SERVER_CONF="$COMPOSE_CONFIG"
-$BIN_DIR/chimaera_start_runtime &
+$BIN_DIR/chimaera runtime start &
 RUNTIME_PID=$!
 sleep 3
 
 echo "Runtime started (PID=$RUNTIME_PID), composing pools..."
-$BIN_DIR/chimaera_compose "$COMPOSE_CONFIG"
+$BIN_DIR/chimaera compose "$COMPOSE_CONFIG"
 
 echo "Putting blobs and flushing..."
 $BIN_DIR/test_restart --put-blobs
@@ -71,7 +71,7 @@ echo ""
 echo "=== Phase 2: Restart runtime and verify blobs ==="
 
 # Start runtime again with same conf_dir so it can find restart configs
-$BIN_DIR/chimaera_start_runtime &
+$BIN_DIR/chimaera runtime start &
 RUNTIME_PID=$!
 sleep 3
 

@@ -51,12 +51,6 @@ storage:
 
 dpe:
   dpe_type: max_bw
-
-compression:
-  monitor_interval_ms: 5
-  dnn_model_weights_path: /tmp/model.json
-  dnn_samples_before_reinforce: 1000
-  trace_folder_path: /tmp/traces
 )";
 
   std::ofstream file(temp_file);
@@ -90,8 +84,6 @@ compression:
           config.storage_.devices_[1].score_ < 0.81f);
 
   REQUIRE(config.dpe_.dpe_type_ == "max_bw");
-
-  REQUIRE(config.compression_.monitor_interval_ms_ == 5);
 
   CleanupTempFile(temp_file);
 }
@@ -141,9 +133,6 @@ storage:
 
 dpe:
   dpe_type: round_robin
-
-compression:
-  monitor_interval_ms: 10
 )";
 
   Config config;
@@ -185,7 +174,6 @@ TEST_CASE("Config SaveToFile - Round Trip", "[cte][config]") {
       StorageDeviceConfig("/tmp/dev2", "file", 4096ULL * 1024 * 1024, 0.5f));
 
   config.dpe_.dpe_type_ = "random";
-  config.compression_.monitor_interval_ms_ = 15;
 
   // Save to file
   REQUIRE(config.SaveToFile(temp_file));
@@ -295,30 +283,6 @@ TEST_CASE("Config GetParameterString - poll_period_ms", "[cte][config]") {
   REQUIRE(config.GetParameterString("poll_period_ms") == "3000");
 }
 
-TEST_CASE("Config GetParameterString - monitor_interval_ms", "[cte][config]") {
-  Config config;
-  config.compression_.monitor_interval_ms_ = 20;
-  REQUIRE(config.GetParameterString("monitor_interval_ms") == "20");
-}
-
-TEST_CASE("Config GetParameterString - dnn_model_weights_path", "[cte][config]") {
-  Config config;
-  config.compression_.dnn_model_weights_path_ = "/path/to/model.json";
-  REQUIRE(config.GetParameterString("dnn_model_weights_path") == "/path/to/model.json");
-}
-
-TEST_CASE("Config GetParameterString - dnn_samples_before_reinforce", "[cte][config]") {
-  Config config;
-  config.compression_.dnn_samples_before_reinforce_ = 5000;
-  REQUIRE(config.GetParameterString("dnn_samples_before_reinforce") == "5000");
-}
-
-TEST_CASE("Config GetParameterString - trace_folder_path", "[cte][config]") {
-  Config config;
-  config.compression_.trace_folder_path_ = "/tmp/traces";
-  REQUIRE(config.GetParameterString("trace_folder_path") == "/tmp/traces");
-}
-
 TEST_CASE("Config GetParameterString - Unknown Parameter", "[cte][config]") {
   Config config;
   REQUIRE(config.GetParameterString("unknown_parameter") == "");
@@ -349,18 +313,6 @@ TEST_CASE("Config SetParameterFromString - neighborhood", "[cte][config]") {
   REQUIRE(config.targets_.neighborhood_ == 20);
 }
 
-TEST_CASE("Config SetParameterFromString - monitor_interval_ms", "[cte][config]") {
-  Config config;
-  REQUIRE(config.SetParameterFromString("monitor_interval_ms", "25"));
-  REQUIRE(config.compression_.monitor_interval_ms_ == 25);
-}
-
-TEST_CASE("Config SetParameterFromString - dnn_model_weights_path", "[cte][config]") {
-  Config config;
-  REQUIRE(config.SetParameterFromString("dnn_model_weights_path", "/new/path.json"));
-  REQUIRE(config.compression_.dnn_model_weights_path_ == "/new/path.json");
-}
-
 TEST_CASE("Config SetParameterFromString - Invalid Value", "[cte][config]") {
   Config config;
   REQUIRE_FALSE(config.SetParameterFromString("target_stat_interval_ms", "not_a_number"));
@@ -369,23 +321,6 @@ TEST_CASE("Config SetParameterFromString - Invalid Value", "[cte][config]") {
 TEST_CASE("Config SetParameterFromString - Unknown Parameter", "[cte][config]") {
   Config config;
   REQUIRE_FALSE(config.SetParameterFromString("nonexistent", "123"));
-}
-
-TEST_CASE("Config ParseCompressionConfig - With All Fields", "[cte][config]") {
-  std::string yaml_string = R"(
-compression:
-  monitor_interval_ms: 8
-  qtable_model_path: /tmp/qtable
-  qtable_learning_rate: 0.5
-  dnn_model_weights_path: /path/to/dnn.json
-  dnn_samples_before_reinforce: 2000
-  trace_folder_path: /tmp/cte_traces
-)";
-
-  Config config;
-  REQUIRE(config.LoadFromString(yaml_string));
-  REQUIRE(config.compression_.monitor_interval_ms_ == 8);
-  REQUIRE(config.compression_.dnn_samples_before_reinforce_ == 2000);
 }
 
 TEST_CASE("Config EmitYaml - Valid Roundtrip", "[cte][config]") {

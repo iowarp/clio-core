@@ -65,7 +65,7 @@ requirements:
 
 tests:
   - script:
-      # Just verify the library files exist (chimaera_start_runtime is a daemon)
+      # Just verify the library files exist (chimaera runtime start is a daemon)
       - test -f $PREFIX/lib/libchimaera_cxx.so || test -f $PREFIX/lib/libchimaera_cxx.dylib
 
 about:

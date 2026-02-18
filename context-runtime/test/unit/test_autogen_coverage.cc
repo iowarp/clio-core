@@ -12713,14 +12713,6 @@ compression:
     REQUIRE(!val.empty());
     val = config.GetParameterString("poll_period_ms");
     REQUIRE(!val.empty());
-    val = config.GetParameterString("monitor_interval_ms");
-    REQUIRE(!val.empty());
-    val = config.GetParameterString("dnn_model_weights_path");
-    // Can be empty string but should not crash
-    val = config.GetParameterString("dnn_samples_before_reinforce");
-    REQUIRE(!val.empty());
-    val = config.GetParameterString("trace_folder_path");
-    // Can be empty string
     val = config.GetParameterString("nonexistent_param");
     REQUIRE(val.empty());
     INFO("GetParameterString tests completed");
@@ -12736,10 +12728,6 @@ compression:
     REQUIRE(config.SetParameterFromString("neighborhood", "8") == true);
     REQUIRE(config.SetParameterFromString("default_target_timeout_ms", "60000") == true);
     REQUIRE(config.SetParameterFromString("poll_period_ms", "3000") == true);
-    REQUIRE(config.SetParameterFromString("monitor_interval_ms", "20") == true);
-    REQUIRE(config.SetParameterFromString("dnn_model_weights_path", "/tmp/test.json") == true);
-    REQUIRE(config.SetParameterFromString("dnn_samples_before_reinforce", "2000") == true);
-    REQUIRE(config.SetParameterFromString("trace_folder_path", "/tmp/traces") == true);
     REQUIRE(config.SetParameterFromString("nonexistent_param", "123") == false);
     INFO("SetParameterFromString tests completed");
   }
@@ -12797,21 +12785,6 @@ storage:
     INFO("ParseDpeConfig tests completed");
   }
 
-  SECTION("Config ParseCompressionConfig") {
-    wrp_cte::core::Config config;
-    std::string yaml = R"(
-compression:
-  monitor_interval_ms: 10
-  qtable_model_path: /tmp/qtable
-  qtable_learning_rate: 0.5
-  dnn_model_weights_path: /tmp/weights.json
-  dnn_samples_before_reinforce: 500
-  trace_folder_path: /tmp/traces
-)";
-    bool loaded = config.LoadFromString(yaml);
-    REQUIRE(loaded == true);
-    INFO("ParseCompressionConfig completed");
-  }
 }
 
 // ==========================================================================
@@ -13092,16 +13065,6 @@ TEST_CASE("Autogen - CTE TargetConfig struct", "[autogen][cte][targetconfig]") {
     REQUIRE(tc.default_target_timeout_ms_ == 30000);
     REQUIRE(tc.poll_period_ms_ == 5000);
     INFO("TargetConfig defaults verified");
-  }
-}
-
-TEST_CASE("Autogen - CTE CompressionConfig struct", "[autogen][cte][compressconfig]") {
-  SECTION("Default values") {
-    wrp_cte::core::CompressionConfig cc;
-    REQUIRE(cc.monitor_interval_ms_ == 5);
-    REQUIRE(cc.dnn_samples_before_reinforce_ == 1000);
-    REQUIRE(cc.qtable_learning_rate_ > 0.0f);
-    INFO("CompressionConfig defaults verified");
   }
 }
 

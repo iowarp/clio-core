@@ -1,6 +1,6 @@
 # CTE Benchmark Example Pipeline
 # Purpose: Demonstrate CTE core functionality with the CTE benchmark application
-# Requirements: chimaera_start_runtime and chimaera_stop_runtime in PATH, wrp_cte_bench executable in PATH
+# Requirements: chimaera runtime start and chimaera runtime stop in PATH, wrp_cte_bench executable in PATH
 
 name: cte_benchmark_example
 

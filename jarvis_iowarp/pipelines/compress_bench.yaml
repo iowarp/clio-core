@@ -1,6 +1,6 @@
 # CTE Compression Benchmark Pipeline
 # Purpose: Run synthetic workloads with configurable data patterns to benchmark compression
-# Requirements: chimaera_start_runtime in PATH, synthetic_workload_exec in PATH
+# Requirements: chimaera runtime start in PATH, synthetic_workload_exec in PATH
 
 name: cte_compress_benchmark
 
