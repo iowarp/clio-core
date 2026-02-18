@@ -31,8 +31,8 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#ifndef CHIMAERA_INCLUDE_CHIMAERA_UNORDERED_MAP_LL_H_
-#define CHIMAERA_INCLUDE_CHIMAERA_UNORDERED_MAP_LL_H_
+#ifndef HSHM_DATA_STRUCTURES_PRIV_UNORDERED_MAP_LL_H_
+#define HSHM_DATA_STRUCTURES_PRIV_UNORDERED_MAP_LL_H_
 
 #include <vector>
 #include <list>
@@ -40,7 +40,7 @@
 #include <utility>
 #include <algorithm>
 
-namespace chi {
+namespace hshm::priv {
 
 /**
  * Unordered map implementation using vector of lists
@@ -382,6 +382,6 @@ public:
   }
 };
 
-}  // namespace chi
+}  // namespace hshm::priv
 
-#endif  // CHIMAERA_INCLUDE_CHIMAERA_UNORDERED_MAP_LL_H_
+#endif  // HSHM_DATA_STRUCTURES_PRIV_UNORDERED_MAP_LL_H_

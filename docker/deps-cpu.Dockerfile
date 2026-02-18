@@ -1,13 +1,21 @@
 # IOWarp CPU Dependencies Container
 # Base container with all CPU-only dependencies for building IOWarp
 #
+# All dependencies are installed via apt or built from source.
+# Core IOWarp deps (yaml-cpp, zeromq, libsodium, cereal, libaio) are built
+# from source with both shared and static libraries (-fPIC) so that
+# WRP_CORE_STATIC_DEPS=ON works for self-contained pip wheels.
+#
+# Source-built libraries install to /usr/local (shared+static with -fPIC).
+# Apt libraries install to /usr (shared+static, static without -fPIC).
+#
 # Usage:
 #   docker build -t iowarp/deps-cpu:latest -f docker/deps-cpu.Dockerfile .
 #
 FROM iowarp/iowarp-base:latest
 LABEL maintainer="llogan@hawk.iit.edu"
-LABEL version="1.0"
-LABEL description="IOWarp CPU dependencies Docker image"
+LABEL version="2.0"
+LABEL description="IOWarp CPU dependencies Docker image (apt + source builds)"
 
 # Disable prompt during packages installation.
 ARG DEBIAN_FRONTEND=noninteractive
@@ -22,26 +30,72 @@ RUN cd ${HOME}/grc-repo && \
     git pull origin main
 
 #------------------------------------------------------------
-# System Dependencies (not available via conda)
+# System Dependencies (apt)
 #------------------------------------------------------------
 
 USER root
 
-# Install system packages not provided by conda
+# Build tools
+RUN apt-get update && apt-get install -y \
+    cmake \
+    ninja-build \
+    pkg-config \
+    g++ \
+    patchelf \
+    && rm -rf /var/lib/apt/lists/*
+
+# Python
+RUN apt-get update && apt-get install -y \
+    python3-dev \
+    python3-pip \
+    python3-venv \
+    python3-pytest \
+    && rm -rf /var/lib/apt/lists/*
+
+# System libraries and services
 RUN apt-get update && apt-get install -y \
     libelf-dev \
+    libaio-dev \
     redis-server \
     redis-tools \
     && rm -rf /var/lib/apt/lists/*
 
-# Install MPI (openmpi) - not available via conda in our setup
+# MPI
 RUN apt-get update && apt-get install -y \
     openmpi-bin \
     libopenmpi-dev \
     mpi-default-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Docker CLI and Docker-in-Docker dependencies
+# Core libraries (apt provides shared + static, static without -fPIC)
+# These are used for normal shared-library builds. For static linking into
+# shared objects (pip wheels), the source-built versions in /usr/local take
+# precedence via CMAKE_PREFIX_PATH ordering.
+RUN apt-get update && apt-get install -y \
+    libboost-all-dev \
+    libhdf5-dev \
+    catch2 \
+    libcurl4-openssl-dev \
+    libssl-dev \
+    nlohmann-json3-dev \
+    libpoco-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Compression libraries
+RUN apt-get update && apt-get install -y \
+    zlib1g-dev \
+    libbz2-dev \
+    liblzo2-dev \
+    libzstd-dev \
+    liblz4-dev \
+    liblzma-dev \
+    libbrotli-dev \
+    libsnappy-dev \
+    libblosc2-dev \
+    libzfp-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Docker CLI and Docker-in-Docker dependencies
 # Also install network diagnostic tools (netstat, lsof, ss, etc.)
 RUN apt-get update && apt-get install -y \
     ca-certificates \
@@ -92,86 +146,103 @@ ENV OMPI_ALLOW_RUN_AS_ROOT=1
 ENV OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
 
 #------------------------------------------------------------
-# Conda Dependencies
+# Build Core IOWarp Dependencies from Source
 #------------------------------------------------------------
+# These are built with BOTH shared and static libraries, with -fPIC
+# on static archives so they can be linked into IOWarp's shared objects
+# when WRP_CORE_STATIC_DEPS=ON (for pip wheels).
+#
+# Install prefix: /usr/local (takes precedence over /usr in default search)
 
-# Switch to iowarp user for conda setup
-USER iowarp
-WORKDIR /home/iowarp
+# yaml-cpp 0.8.0 (shared + static with -fPIC)
+RUN cd /tmp \
+    && curl -sL https://github.com/jbeder/yaml-cpp/archive/refs/tags/0.8.0.tar.gz | tar xz \
+    && cmake -S yaml-cpp-0.8.0 -B yaml-cpp-build \
+       -DCMAKE_INSTALL_PREFIX=/usr/local \
+       -DCMAKE_BUILD_TYPE=Release \
+       -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+       -DBUILD_SHARED_LIBS=ON \
+       -DYAML_CPP_BUILD_TESTS=OFF \
+       -DYAML_CPP_BUILD_TOOLS=OFF \
+    && cmake --build yaml-cpp-build -j$(nproc) \
+    && cmake --install yaml-cpp-build \
+    && cmake -S yaml-cpp-0.8.0 -B yaml-cpp-build-static \
+       -DCMAKE_INSTALL_PREFIX=/usr/local \
+       -DCMAKE_BUILD_TYPE=Release \
+       -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+       -DBUILD_SHARED_LIBS=OFF \
+       -DYAML_CPP_BUILD_TESTS=OFF \
+       -DYAML_CPP_BUILD_TOOLS=OFF \
+    && cmake --build yaml-cpp-build-static -j$(nproc) \
+    && cmake --install yaml-cpp-build-static \
+    && ldconfig \
+    && rm -rf /tmp/yaml-cpp-*
 
-# Install Miniconda (skip if already installed in base image)
-# Detect architecture and download appropriate installer (x86_64 or aarch64)
-RUN if [ ! -d "/home/iowarp/miniconda3" ]; then \
-    ARCH=$(uname -m) && \
-    if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then \
-    MINICONDA_URL="https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-aarch64.sh"; \
-    else \
-    MINICONDA_URL="https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh"; \
-    fi && \
-    wget "$MINICONDA_URL" -O /tmp/miniconda.sh \
-    && bash /tmp/miniconda.sh -b -p /home/iowarp/miniconda3 \
-    && rm /tmp/miniconda.sh; \
-    fi
+# cereal 1.3.2 (header-only — just installs headers and cmake config)
+RUN cd /tmp \
+    && curl -sL https://github.com/USCiLab/cereal/archive/refs/tags/v1.3.2.tar.gz | tar xz \
+    && cmake -S cereal-1.3.2 -B cereal-build \
+       -DCMAKE_INSTALL_PREFIX=/usr/local \
+       -DSKIP_PERFORMANCE_COMPARISON=ON \
+       -DBUILD_TESTS=OFF \
+       -DBUILD_SANDBOX=OFF \
+       -DBUILD_DOC=OFF \
+    && cmake --build cereal-build -j$(nproc) \
+    && cmake --install cereal-build \
+    && rm -rf /tmp/cereal-*
 
-# Initialize conda for bash
-RUN /home/iowarp/miniconda3/bin/conda init bash \
-    && /home/iowarp/miniconda3/bin/conda config --add channels conda-forge \
-    && /home/iowarp/miniconda3/bin/conda config --set channel_priority strict
+# cppzmq (header-only — C++ bindings for ZeroMQ)
+RUN cd /tmp \
+    && curl -sL https://github.com/zeromq/cppzmq/archive/refs/tags/v4.10.0.tar.gz | tar xz \
+    && cmake -S cppzmq-4.10.0 -B cppzmq-build \
+       -DCMAKE_INSTALL_PREFIX=/usr/local \
+       -DCPPZMQ_BUILD_TESTS=OFF \
+    && cmake --install cppzmq-build \
+    && rm -rf /tmp/cppzmq-*
 
-# Accept Anaconda Terms of Service and install all development dependencies via conda
-# This avoids library conflicts between system packages and conda packages
-# Dependencies installed:
-#   - Build tools: cmake, ninja, conda-build, pkg-config
-#   - Core libraries: boost, hdf5, yaml-cpp, zeromq, cppzmq, cereal
-#   - Testing: catch2, pytest
-#   - Network: libcurl, openssl
-#   - Compression libraries: zlib, bzip2, lzo, zstd, lz4, xz (lzma), brotli, snappy, c-blosc2
-#   - Lossy compression: zfp (scientific compressor, available via conda)
-#   - Optional: poco (for Globus support), nlohmann_json
-RUN /home/iowarp/miniconda3/bin/conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main \
-    && /home/iowarp/miniconda3/bin/conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r \
-    && /home/iowarp/miniconda3/bin/conda install -y \
-    conda-build \
-    cmake \
-    ninja \
-    pkg-config \
-    boost \
-    hdf5 \
-    yaml-cpp \
-    zeromq \
-    cppzmq \
-    cereal \
-    catch2 \
-    libcurl \
-    openssl \
-    zlib \
-    bzip2 \
-    lzo \
-    zstd \
-    lz4-c \
-    xz \
-    brotli \
-    snappy \
-    c-blosc2 \
-    zfp \
-    poco \
-    nlohmann_json \
-    pytest \
-    && /home/iowarp/miniconda3/bin/conda clean -ya
+# libsodium 1.0.20 (shared + static with -fPIC, required by zeromq)
+RUN cd /tmp \
+    && curl -sL https://github.com/jedisct1/libsodium/releases/download/1.0.20-RELEASE/libsodium-1.0.20.tar.gz | tar xz \
+    && cd libsodium-1.0.20 \
+    && ./configure --prefix=/usr/local --with-pic \
+    && make -j$(nproc) \
+    && make install \
+    && ldconfig \
+    && rm -rf /tmp/libsodium-*
 
-# Set conda environment variables for CMake to find packages
-ENV CONDA_PREFIX=/home/iowarp/miniconda3
-ENV PKG_CONFIG_PATH=/home/iowarp/miniconda3/lib/pkgconfig
-ENV CMAKE_PREFIX_PATH=/home/iowarp/miniconda3
+# zeromq 4.3.5 (shared + static with -fPIC)
+RUN cd /tmp \
+    && curl -sL https://github.com/zeromq/libzmq/releases/download/v4.3.5/zeromq-4.3.5.tar.gz | tar xz \
+    && cmake -S zeromq-4.3.5 -B zmq-build \
+       -DCMAKE_INSTALL_PREFIX=/usr/local \
+       -DCMAKE_BUILD_TYPE=Release \
+       -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+       -DBUILD_SHARED=ON \
+       -DBUILD_STATIC=ON \
+       -DBUILD_TESTS=OFF \
+       -DWITH_LIBSODIUM=ON \
+       -DWITH_DOCS=OFF \
+       -DCMAKE_PREFIX_PATH=/usr/local \
+    && cmake --build zmq-build -j$(nproc) \
+    && cmake --install zmq-build \
+    && ldconfig \
+    && rm -rf /tmp/zeromq-* /tmp/zmq-build
+
+# libaio 0.3.113 (shared + static with -fPIC)
+# Strip .symver asm directives so the static archive can be linked into
+# shared objects without "version node not found" errors.
+RUN cd /tmp \
+    && curl -sL https://pagure.io/libaio/archive/libaio-0.3.113/libaio-libaio-0.3.113.tar.gz | tar xz \
+    && cd libaio-libaio-0.3.113 \
+    && sed -i 's/__asm__(".symver.*;//g' src/syscall.h \
+    && make prefix=/usr/local CFLAGS="-fPIC -O2" \
+    && make prefix=/usr/local install \
+    && ldconfig \
+    && rm -rf /tmp/libaio-*
 
 #------------------------------------------------------------
 # Build Lossy Compression Libraries from Source
 #------------------------------------------------------------
-
-# Switch to root to install lossy compression libraries from source
-# Add conda's cmake to PATH for root user
-USER root
-ENV PATH="/home/iowarp/miniconda3/bin:${PATH}"
 
 # Install FPZIP (fast floating-point compressor)
 RUN cd /tmp \
@@ -224,7 +295,6 @@ RUN cd /tmp \
     && git clone https://github.com/robertu94/libpressio.git libpressio_src \
     && cd libpressio_src \
     && mkdir -p ~/builds/libpressio && cd ~/builds/libpressio \
-    && export CMAKE_PREFIX_PATH="/usr/local:/home/iowarp/miniconda3:${CMAKE_PREFIX_PATH}" \
     && cmake /tmp/libpressio_src \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX=/usr/local \
@@ -243,7 +313,6 @@ RUN cd /tmp \
 #------------------------------------------------------------
 
 # Install ADIOS2 from source with HDF5 and ZeroMQ support
-# Uses conda's HDF5 and ZeroMQ libraries (CMAKE_PREFIX_PATH points to conda)
 # NOTE: Updated to v2.11.0 for C++20 compatibility and ARM64 support
 # NOTE: SST is disabled because the DILL library has ARM64 Linux compatibility issues
 #       (sys_icache_invalidate is an Apple-specific function not available on ARM64 Linux)
@@ -263,7 +332,6 @@ RUN cd /tmp \
     -DADIOS2_USE_SST=OFF \
     -DADIOS2_USE_Fortran=OFF \
     -DCMAKE_CXX_STANDARD=17 \
-    -DCMAKE_PREFIX_PATH="/home/iowarp/miniconda3" \
     && make -j$(nproc) \
     && make install \
     && ldconfig \
@@ -283,12 +351,6 @@ ENV PATH="/home/iowarp/.cargo/bin:${PATH}"
 # Install Bun JavaScript runtime (needed for CTE memorybench TypeScript benchmarks)
 RUN curl -fsSL https://bun.sh/install | bash
 ENV PATH="/home/iowarp/.bun/bin:${PATH}"
-
-# Install libaio for Linux AIO support (required by bdev ChiMod)
-SHELL ["/bin/bash", "-c"]
-RUN source /home/iowarp/miniconda3/etc/profile.d/conda.sh \
-    && conda activate base \
-    && conda install -y libaio -c conda-forge
 
 # Install Node.js 22 LTS (required by Docusaurus docs site, needs >= 20)
 USER root
@@ -311,18 +373,21 @@ RUN cd /home/iowarp \
     && (git clone -b iowarp-dev git@github.com:iowarp/docs.git 2>/dev/null || \
         git clone -b iowarp-dev https://github.com/iowarp/docs.git)
 
-# Configure Spack to use conda packages
+# Install Python build tools (scikit-build-core, nanobind for pip wheel builds)
+RUN pip3 install --break-system-packages scikit-build-core nanobind
+
+# Configure Spack to use system packages
 RUN mkdir -p ~/.spack && \
     echo "packages:" > ~/.spack/packages.yaml && \
     echo "  cmake:" >> ~/.spack/packages.yaml && \
     echo "    externals:" >> ~/.spack/packages.yaml && \
     echo "    - spec: cmake" >> ~/.spack/packages.yaml && \
-    echo "      prefix: /home/iowarp/miniconda3" >> ~/.spack/packages.yaml && \
+    echo "      prefix: /usr" >> ~/.spack/packages.yaml && \
     echo "    buildable: false" >> ~/.spack/packages.yaml && \
     echo "  boost:" >> ~/.spack/packages.yaml && \
     echo "    externals:" >> ~/.spack/packages.yaml && \
     echo "    - spec: boost" >> ~/.spack/packages.yaml && \
-    echo "      prefix: /home/iowarp/miniconda3" >> ~/.spack/packages.yaml && \
+    echo "      prefix: /usr" >> ~/.spack/packages.yaml && \
     echo "    buildable: false" >> ~/.spack/packages.yaml && \
     echo "  openmpi:" >> ~/.spack/packages.yaml && \
     echo "    externals:" >> ~/.spack/packages.yaml && \
@@ -332,7 +397,7 @@ RUN mkdir -p ~/.spack && \
     echo "  hdf5:" >> ~/.spack/packages.yaml && \
     echo "    externals:" >> ~/.spack/packages.yaml && \
     echo "    - spec: hdf5" >> ~/.spack/packages.yaml && \
-    echo "      prefix: /home/iowarp/miniconda3" >> ~/.spack/packages.yaml && \
+    echo "      prefix: /usr" >> ~/.spack/packages.yaml && \
     echo "    buildable: false" >> ~/.spack/packages.yaml && \
     echo "  python:" >> ~/.spack/packages.yaml && \
     echo "    externals:" >> ~/.spack/packages.yaml && \
@@ -340,7 +405,7 @@ RUN mkdir -p ~/.spack && \
     echo "      prefix: /usr" >> ~/.spack/packages.yaml && \
     echo "    buildable: false" >> ~/.spack/packages.yaml
 
-# Add conda activation and LD_LIBRARY_PATH to bashrc
+# Set up environment
 # Use architecture-aware library path (x86_64 or aarch64)
 RUN ARCH=$(uname -m) && \
     if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then \
@@ -349,17 +414,12 @@ RUN ARCH=$(uname -m) && \
     LIB_ARCH="x86_64-linux-gnu"; \
     fi && \
     echo '' >> /home/iowarp/.bashrc \
-    && echo "export LD_LIBRARY_PATH=/usr/local/lib:/home/iowarp/miniconda3/lib:/usr/lib/${LIB_ARCH}:\$LD_LIBRARY_PATH" >> /home/iowarp/.bashrc \
+    && echo "export LD_LIBRARY_PATH=/usr/local/lib:/usr/lib/${LIB_ARCH}:\$LD_LIBRARY_PATH" >> /home/iowarp/.bashrc \
+    && echo "export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/lib/${LIB_ARCH}/pkgconfig:\$PKG_CONFIG_PATH" >> /home/iowarp/.bashrc \
     && echo '' >> /home/iowarp/.bashrc \
-    && echo '# >>> conda initialize >>>' >> /home/iowarp/.bashrc \
-    && echo '# Conda base environment is auto-activated with all dev dependencies' >> /home/iowarp/.bashrc \
-    && echo '# This includes: boost, hdf5, yaml-cpp, zeromq, cereal, catch2, pytest, etc.' >> /home/iowarp/.bashrc \
-    && echo '# Compression libraries: zlib, bzip2, lzo, zstd, lz4, xz, brotli, snappy, c-blosc2 (via conda)' >> /home/iowarp/.bashrc \
-    && echo '# Lossy compression: ZFP (via conda), SZ3, FPZIP, LibPressio (built from source)' >> /home/iowarp/.bashrc \
-    && echo '# ADIOS2: Built from source (installed in /usr/local)' >> /home/iowarp/.bashrc \
-    && echo '# Create custom environments if needed: conda create -n myenv' >> /home/iowarp/.bashrc \
-    && echo 'eval "$(/home/iowarp/miniconda3/bin/conda shell.bash hook)"' >> /home/iowarp/.bashrc \
-    && echo '# <<< conda initialize <<<' >> /home/iowarp/.bashrc \
+    && echo '# Source-built libraries (yaml-cpp, zmq, sodium, cereal, libaio) in /usr/local' >> /home/iowarp/.bashrc \
+    && echo '# Apt libraries (boost, hdf5, compression, etc.) in /usr' >> /home/iowarp/.bashrc \
+    && echo '# Lossy compression (FPZIP, SZ3, LibPressio) + ADIOS2 in /usr/local' >> /home/iowarp/.bashrc \
     && echo '' >> /home/iowarp/.bashrc \
     && echo '# Rust toolchain' >> /home/iowarp/.bashrc \
     && echo 'export PATH="/home/iowarp/.cargo/bin:$PATH"' >> /home/iowarp/.bashrc \

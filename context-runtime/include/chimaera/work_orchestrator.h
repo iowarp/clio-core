@@ -38,7 +38,7 @@
 #include <memory>
 #include <vector>
 
-#include "chimaera/task_queue.h"
+#include "chimaera/task.h"
 #include "chimaera/types.h"
 #include "chimaera/worker.h"
 #include "chimaera/scheduler/scheduler.h"

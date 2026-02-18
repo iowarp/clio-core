@@ -1,7 +1,11 @@
 cmake_minimum_required(VERSION 3.10)
 
 # Find libaio for Linux AIO support in per-worker I/O contexts
-find_library(LIBAIO_LIBRARY NAMES aio libaio)
+if(WRP_CORE_STATIC_DEPS)
+    find_library(LIBAIO_LIBRARY NAMES libaio.a)
+else()
+    find_library(LIBAIO_LIBRARY NAMES aio libaio)
+endif()
 find_path(LIBAIO_INCLUDE_DIR NAMES libaio.h)
 
 if(NOT LIBAIO_LIBRARY OR NOT LIBAIO_INCLUDE_DIR)

@@ -38,7 +38,7 @@
 #include <chimaera/chimaera.h>
 #include <chimaera/comutex.h>
 #include <chimaera/corwlock.h>
-#include <chimaera/unordered_map_ll.h>
+#include <hermes_shm/data_structures/priv/unordered_map_ll.h>
 #include <hermes_shm/data_structures/ipc/ring_buffer.h>
 #include <hermes_shm/memory/allocator/malloc_allocator.h>
 #include <wrp_cte/core/core_client.h>
@@ -187,18 +187,18 @@ private:
   // Client for this ChiMod
   Client client_;
 
-  // Target management data structures (using chi::unordered_map_ll for
+  // Target management data structures (using hshm::priv::unordered_map_ll for
   // thread-safe concurrent access)
-  chi::unordered_map_ll<chi::PoolId, TargetInfo> registered_targets_;
-  chi::unordered_map_ll<std::string, chi::PoolId>
+  hshm::priv::unordered_map_ll<chi::PoolId, TargetInfo> registered_targets_;
+  hshm::priv::unordered_map_ll<std::string, chi::PoolId>
       target_name_to_id_; // reverse lookup: target_name -> target_id
 
-  // Tag management data structures (using chi::unordered_map_ll for thread-safe
+  // Tag management data structures (using hshm::priv::unordered_map_ll for thread-safe
   // concurrent access)
-  chi::unordered_map_ll<std::string, TagId>
+  hshm::priv::unordered_map_ll<std::string, TagId>
       tag_name_to_id_;                                   // tag_name -> tag_id
-  chi::unordered_map_ll<TagId, TagInfo> tag_id_to_info_; // tag_id -> TagInfo
-  chi::unordered_map_ll<std::string, BlobInfo>
+  hshm::priv::unordered_map_ll<TagId, TagInfo> tag_id_to_info_; // tag_id -> TagInfo
+  hshm::priv::unordered_map_ll<std::string, BlobInfo>
       tag_blob_name_to_info_; // "tag_id.blob_name" -> BlobInfo
 
   // Atomic counters for thread-safe ID generation

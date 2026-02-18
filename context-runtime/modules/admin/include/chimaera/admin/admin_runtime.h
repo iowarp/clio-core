@@ -39,7 +39,7 @@
 #include <chimaera/chimaera.h>
 #include <chimaera/container.h>
 #include <chimaera/pool_manager.h>
-#include <chimaera/unordered_map_ll.h>
+#include <hermes_shm/data_structures/priv/unordered_map_ll.h>
 
 #include <deque>
 #include <random>
@@ -101,8 +101,8 @@ private:
   // Using lock-free unordered_map_ll with 1024 buckets for high concurrency
   // Thread safety: All Send/Recv tasks are routed to a single dedicated net worker
   static constexpr size_t kNumMapBuckets = 1024;
-  chi::unordered_map_ll<size_t, hipc::FullPtr<chi::Task>> send_map_{kNumMapBuckets};  // Tasks sent to remote nodes
-  chi::unordered_map_ll<size_t, hipc::FullPtr<chi::Task>> recv_map_{kNumMapBuckets};  // Tasks received from remote nodes
+  hshm::priv::unordered_map_ll<size_t, hipc::FullPtr<chi::Task>> send_map_{kNumMapBuckets};  // Tasks sent to remote nodes
+  hshm::priv::unordered_map_ll<size_t, hipc::FullPtr<chi::Task>> recv_map_{kNumMapBuckets};  // Tasks received from remote nodes
 
 public:
   /**

@@ -64,7 +64,6 @@
 #include "chimaera/chimaera_manager.h"
 #include "chimaera/config_manager.h"
 #include "chimaera/scheduler/scheduler_factory.h"
-#include "chimaera/task_queue.h"
 
 // Global pointer variable definition for IPC manager singleton
 HSHM_DEFINE_GLOBAL_PTR_VAR_CC(chi::IpcManager, g_ipc_manager);

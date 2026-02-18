@@ -1,0 +1,57 @@
+[build-system]
+requires = ["scikit-build-core>=0.10", "nanobind>=2.0"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "iowarp-core"
+version = "1.0.0"
+description = "IOWarp Context Management Platform"
+readme = "README.md"
+license = {text = "BSD-3-Clause"}
+requires-python = ">=3.10"
+authors = [{name = "IOWarp Team", email = "grc@illinoistech.edu"}]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: C++",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: System :: Distributed Computing",
+]
+
+[project.scripts]
+chimaera = "iowarp_core._cli:main"
+
+[project.urls]
+Homepage = "https://iowarp.ai"
+Repository = "https://github.com/iowarp/iowarp-core"
+Documentation = "https://docs.iowarp.ai"
+
+[tool.scikit-build]
+cmake.source-dir = "../.."
+cmake.build-type = "Release"
+install.components = ["pip_package"]
+wheel.packages = ["iowarp_core"]
+build-dir = "build/{wheel_tag}"
+
+[tool.scikit-build.cmake.define]
+BUILD_SHARED_LIBS = "ON"
+WRP_CORE_STATIC_DEPS = "ON"
+WRP_CORE_ENABLE_RUNTIME = "ON"
+WRP_CORE_ENABLE_CTE = "ON"
+WRP_CORE_ENABLE_CAE = "ON"
+WRP_CORE_ENABLE_CEE = "ON"
+WRP_CORE_ENABLE_PYTHON = "ON"
+WRP_CORE_ENABLE_TESTS = "OFF"
+WRP_CORE_ENABLE_BENCHMARKS = "OFF"
+WRP_CORE_ENABLE_RPATH = "OFF"
+WRP_CORE_ENABLE_ZMQ = "ON"
+WRP_CORE_ENABLE_CEREAL = "ON"
+WRP_CORE_ENABLE_MPI = "OFF"
+WRP_CORE_ENABLE_HDF5 = "OFF"
+WRP_CORE_ENABLE_ELF = "OFF"
+WRP_CTE_ENABLE_COMPRESS = "OFF"
+WRP_CORE_ENABLE_ENCRYPT = "OFF"
+WRP_CORE_ENABLE_CUDA = "OFF"
+WRP_CORE_ENABLE_ROCM = "OFF"
+WRP_CORE_ENABLE_OPENMP = "OFF"
+HSHM_LOG_LEVEL = "1"

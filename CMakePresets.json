@@ -120,6 +120,36 @@
                 "WRP_CORE_ENABLE_CEREAL": "ON",
                 "HSHM_LOG_LEVEL": "1"
             }
+        },
+        {
+            "name": "pip-release",
+            "displayName": "Pip Release (Minimal, Static Deps)",
+            "description": "Minimal release build for pip wheels with statically-linked external deps",
+            "generator": "Unix Makefiles",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "BUILD_SHARED_LIBS": "ON",
+                "WRP_CORE_STATIC_DEPS": "ON",
+                "WRP_CORE_ENABLE_RUNTIME": "ON",
+                "WRP_CORE_ENABLE_CTE": "ON",
+                "WRP_CORE_ENABLE_CAE": "ON",
+                "WRP_CORE_ENABLE_CEE": "ON",
+                "WRP_CORE_ENABLE_PYTHON": "ON",
+                "WRP_CORE_ENABLE_TESTS": "OFF",
+                "WRP_CORE_ENABLE_BENCHMARKS": "OFF",
+                "WRP_CORE_ENABLE_RPATH": "OFF",
+                "WRP_CORE_ENABLE_ZMQ": "ON",
+                "WRP_CORE_ENABLE_CEREAL": "ON",
+                "WRP_CORE_ENABLE_MPI": "OFF",
+                "WRP_CORE_ENABLE_HDF5": "OFF",
+                "WRP_CORE_ENABLE_ELF": "OFF",
+                "WRP_CTE_ENABLE_COMPRESS": "OFF",
+                "WRP_CORE_ENABLE_ENCRYPT": "OFF",
+                "WRP_CORE_ENABLE_CUDA": "OFF",
+                "WRP_CORE_ENABLE_ROCM": "OFF",
+                "WRP_CORE_ENABLE_OPENMP": "OFF",
+                "HSHM_LOG_LEVEL": "1"
+            }
         }
     ]
 }

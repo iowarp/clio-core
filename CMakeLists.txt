@@ -33,6 +33,7 @@ option(WRP_CORE_ENABLE_CPACK "Enable CPack for package generation" OFF)
 option(WRP_CORE_ENABLE_CONDA "Enable Conda environment configuration (adds Conda paths to include/link directories)" OFF)
 option(WRP_CORE_ENABLE_DOCKER_CI "Enable Docker-based integration tests (requires Docker)" OFF)
 option(BUILD_SHARED_LIBS "Build shared libraries (.dll/.so) instead of static ones (.lib/.a)" ON)
+option(WRP_CORE_STATIC_DEPS "Link external dependencies statically (for self-contained wheels)" OFF)
 
 # Installation Prefix Configuration
 # - For Conda builds: Set CMAKE_INSTALL_PREFIX via -DCMAKE_INSTALL_PREFIX=$CONDA_PREFIX
@@ -200,6 +201,11 @@ include(IowarpCoreCommon)
 # 2. System packages via pkg-config
 # 3. CMake find_package() in standard locations
 
+# Static dependency linking (for self-contained pip wheels)
+if(WRP_CORE_STATIC_DEPS)
+    message(STATUS "Static dependency linking enabled")
+endif()
+
 # Pkg-Config
 find_package(PkgConfig REQUIRED)
 if(PkgConfig_FOUND)
@@ -223,6 +229,20 @@ find_package(yaml-cpp REQUIRED)
 if(yaml-cpp_FOUND)
     message(STATUS "found yaml-cpp at ${yaml-cpp_DIR}")
     resolve_yaml_cpp_target()
+endif()
+
+# When static deps are enabled, override yaml-cpp target to use the .a file
+# find_package creates an imported target pointing to the .so, so we must
+# replace it with the static archive for self-contained wheels.
+if(WRP_CORE_STATIC_DEPS)
+    find_library(YAML_CPP_STATIC_LIB NAMES libyaml-cpp.a REQUIRED)
+    if(YAML_CPP_STATIC_LIB)
+        message(STATUS "Static yaml-cpp: ${YAML_CPP_STATIC_LIB}")
+        set_target_properties(yaml-cpp::yaml-cpp PROPERTIES
+            IMPORTED_LOCATION "${YAML_CPP_STATIC_LIB}"
+            IMPORTED_LOCATION_NONE "${YAML_CPP_STATIC_LIB}")
+        set_property(TARGET yaml-cpp::yaml-cpp PROPERTY IMPORTED_SONAME_NONE "")
+    endif()
 endif()
 
 # Cereal - find from system or install.sh installation
@@ -444,9 +464,30 @@ if(WRP_CORE_ENABLE_ZMQ)
     pkg_check_modules(ZeroMQ QUIET libzmq)
     if(ZeroMQ_FOUND)
         message(STATUS "found zmq.h at ${ZeroMQ_INCLUDE_DIRS}")
-        set(ZMQ_LIBS ${ZeroMQ_LIBRARIES})
+        if(WRP_CORE_STATIC_DEPS)
+            # Find static .a archives directly — pkg-config _STATIC_LIBRARIES
+            # still returns -l flags that the linker resolves to shared libs.
+            find_library(ZMQ_STATIC_LIB NAMES libzmq.a REQUIRED)
+            set(ZMQ_LIBS ${ZMQ_STATIC_LIB})
+            # Pull in zmq's transitive static deps (libsodium, pthreads, etc.)
+            foreach(_dep ${ZeroMQ_STATIC_LIBRARIES})
+                if(NOT _dep STREQUAL "zmq")
+                    find_library(_dep_path NAMES lib${_dep}.a ${_dep})
+                    if(_dep_path)
+                        list(APPEND ZMQ_LIBS ${_dep_path})
+                    else()
+                        list(APPEND ZMQ_LIBS ${_dep})
+                    endif()
+                    unset(_dep_path CACHE)
+                endif()
+            endforeach()
+            set(ZMQ_LIB_DIRS "")
+            message(STATUS "Static zmq libs: ${ZMQ_LIBS}")
+        else()
+            set(ZMQ_LIBS ${ZeroMQ_LIBRARIES})
+            set(ZMQ_LIB_DIRS ${ZeroMQ_LIBRARY_DIRS})
+        endif()
         set(ZMQ_INCLUDES ${ZeroMQ_INCLUDE_DIRS})
-        set(ZMQ_LIB_DIRS ${ZeroMQ_LIBRARY_DIRS})
     else()
         message(FATAL_ERROR "ZeroMQ not found. Please install ZeroMQ or run install.sh to build from submodules.")
     endif()
@@ -836,6 +877,64 @@ message(STATUS "    AddressSanitizer:           ${WRP_CORE_ENABLE_ASAN}")
 message(STATUS "    Code Coverage:              ${WRP_CORE_ENABLE_COVERAGE}")
 message(STATUS "")
 
+
+#------------------------------------------------------------------------------
+# Pip Package Component
+#------------------------------------------------------------------------------
+set(PIP_PKG_DIR "iowarp_core")
+
+# Shared libraries -> iowarp_core/lib/
+set(PIP_LIB_TARGETS hermes_shm_host chimaera_cxx)
+if(TARGET chimaera_admin_client)
+  list(APPEND PIP_LIB_TARGETS chimaera_admin_client chimaera_admin_runtime)
+endif()
+if(TARGET chimaera_bdev_client)
+  list(APPEND PIP_LIB_TARGETS chimaera_bdev_client chimaera_bdev_runtime)
+endif()
+if(WRP_CORE_ENABLE_CTE AND TARGET wrp_cte_core_client)
+  list(APPEND PIP_LIB_TARGETS wrp_cte_core_client wrp_cte_core_runtime)
+  if(TARGET wrp_cte_cae_config)
+    list(APPEND PIP_LIB_TARGETS wrp_cte_cae_config)
+  endif()
+endif()
+if(WRP_CORE_ENABLE_CAE AND TARGET wrp_cae_core_client)
+  list(APPEND PIP_LIB_TARGETS wrp_cae_core_client wrp_cae_core_runtime)
+endif()
+if(WRP_CORE_ENABLE_CEE AND TARGET wrp_cee_api)
+  list(APPEND PIP_LIB_TARGETS wrp_cee_api)
+endif()
+
+install(TARGETS ${PIP_LIB_TARGETS}
+  COMPONENT pip_package
+  LIBRARY DESTINATION ${PIP_PKG_DIR}/lib
+  ARCHIVE DESTINATION ${PIP_PKG_DIR}/lib
+  RUNTIME DESTINATION ${PIP_PKG_DIR}/bin)
+
+# CLI binary -> iowarp_core/bin/
+if(TARGET chimaera)
+  install(TARGETS chimaera
+    COMPONENT pip_package
+    RUNTIME DESTINATION ${PIP_PKG_DIR}/bin)
+endif()
+
+# Python extensions -> iowarp_core/ext/
+if(WRP_CORE_ENABLE_PYTHON)
+  if(TARGET wrp_cte_core_ext)
+    install(TARGETS wrp_cte_core_ext
+      COMPONENT pip_package
+      LIBRARY DESTINATION ${PIP_PKG_DIR}/ext)
+  endif()
+  if(TARGET wrp_cee)
+    install(TARGETS wrp_cee
+      COMPONENT pip_package
+      LIBRARY DESTINATION ${PIP_PKG_DIR}/ext)
+  endif()
+endif()
+
+# Default config -> iowarp_core/data/
+install(FILES context-runtime/config/chimaera_default.yaml
+  COMPONENT pip_package
+  DESTINATION ${PIP_PKG_DIR}/data)
 
 #------------------------------------------------------------------------------
 # CPack Configuration

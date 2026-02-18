@@ -46,7 +46,6 @@
 #include "chimaera/task.h"
 #include "chimaera/task_archives.h"
 #include "chimaera/local_task_archives.h"
-#include "chimaera/task_queue.h"
 #include "chimaera/types.h"
 
 // Forward declarations to avoid circular dependencies
