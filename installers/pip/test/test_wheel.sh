@@ -155,8 +155,8 @@ for DISTRO in "${DISTROS[@]}"; do
             python3 -m venv /tmp/test-venv
             source /tmp/test-venv/bin/activate
 
-            # Install wheel (grab the matching one, or first available)
-            if ! pip install --quiet /wheels/*.whl 2>&1; then
+            # Install the wheel matching this Python version
+            if ! pip install --quiet --no-index --find-links /wheels iowarp-core 2>&1; then
                 echo "SKIP: No compatible wheel for this Python version"
                 exit 99
             fi

@@ -151,9 +151,8 @@ jobs:
             python3 -m venv /tmp/test-venv
             source /tmp/test-venv/bin/activate
 
-            # Install wheel (grab the cp312 one, or whatever matches)
-            pip install --quiet /wheels/*.whl 2>/dev/null || \
-              pip install --quiet $(ls /wheels/*.whl | head -1)
+            # Install the wheel matching this Python version
+            pip install --quiet --no-index --find-links /wheels iowarp-core
 
             echo "=== Import test ==="
             python -c "import iowarp_core; print(\"Version:\", iowarp_core.get_version())"
