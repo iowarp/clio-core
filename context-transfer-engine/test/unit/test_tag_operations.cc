@@ -272,11 +272,11 @@ TEST_CASE("Tag - PutBlob with Custom Score", "[cte][tag][putblob]") {
   auto data = fixture.CreateTestData(fixture.kSmallDataSize, 'S');
 
   // Put blob with custom score
-  tag.PutBlob("scored_blob", data.data(), data.size(), 0, 5.0f);
+  tag.PutBlob("scored_blob", data.data(), data.size(), 0, 0.9f);
 
   // Verify score was set
   float score = tag.GetBlobScore("scored_blob");
-  REQUIRE(score == 5.0f);
+  REQUIRE(score == 0.9f);
 }
 
 TEST_CASE("Tag - PutBlob with Context", "[cte][tag][putblob]") {
@@ -485,7 +485,7 @@ TEST_CASE("Tag - GetBlobScore", "[cte][tag][metadata]") {
 
   wrp_cte::core::Tag tag("metadata_score");
   auto data = fixture.CreateTestData(fixture.kSmallDataSize, 'Y');
-  float expected_score = 7.5f;
+  float expected_score = 0.75f;
   tag.PutBlob("score_blob", data.data(), data.size(), 0, expected_score);
 
   float actual_score = tag.GetBlobScore("score_blob");
