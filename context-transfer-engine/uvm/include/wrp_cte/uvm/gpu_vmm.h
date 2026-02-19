@@ -39,9 +39,15 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 #include <vector>
+
+#ifdef WRP_CTE_AVAILABLE
+#include <wrp_cte/core/core_client.h>
+#endif
 
 namespace wrp_cte::uvm {
 
@@ -52,6 +58,8 @@ struct GpuVmmConfig {
   int fill_value = 5;                                   // Default fill value
   int device = 0;                                       // CUDA device ordinal
   size_t prefetch_window = 4;                           // Pages to prefetch ahead on touch
+  bool use_cte = false;                                  // Use CTE blob store instead of host RAM
+  std::string cte_tag_name = "gpu_vmm_pages";            // CTE tag name for page blobs
 };
 
 /**
@@ -61,9 +69,10 @@ struct GpuVmmConfig {
  * (cuMemAddressReserve). Physical memory is NOT allocated upfront. Instead,
  * pages are backed on-demand when explicitly accessed through touchPage().
  *
- * Evicted pages are saved to pinned host RAM and restored on re-touch,
- * preserving data across eviction cycles. Async variants and prefetching
- * allow overlapping data transfer with GPU compute.
+ * Evicted pages are saved to pinned host RAM (default) or to CTE blob
+ * store (when use_cte=true) and restored on re-touch, preserving data
+ * across eviction cycles. Async variants and prefetching allow overlapping
+ * data transfer with GPU compute.
  *
  * This runs entirely in userspace with no root privileges required.
  */
@@ -174,6 +183,12 @@ class GpuVirtualMemoryManager {
   // CUDA streams for async overlap
   cudaStream_t transfer_stream_ = nullptr;
   cudaStream_t compute_stream_ = nullptr;
+
+  // CTE backing store (optional, compile-time gated)
+  bool use_cte_ = false;
+#ifdef WRP_CTE_AVAILABLE
+  std::unique_ptr<wrp_cte::core::Tag> cte_tag_;
+#endif
 
   /** Allocate physical memory, map into VA, set access (no fill) */
   CUresult mapAndBackPage_(size_t page_index);
