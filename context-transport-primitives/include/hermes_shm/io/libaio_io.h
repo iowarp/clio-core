@@ -34,7 +34,7 @@
 #ifndef HSHM_SHM_INCLUDE_HSHM_SHM_IO_LIBAIO_IO_H_
 #define HSHM_SHM_INCLUDE_HSHM_SHM_IO_LIBAIO_IO_H_
 
-#ifdef __linux__
+#if HSHM_ENABLE_LIBAIO
 
 #include "async_io.h"
 #include <libaio.h>
@@ -260,6 +260,6 @@ class LinuxAioAsyncIO : public AsyncIO {
 
 }  // namespace hshm
 
-#endif  // __linux__
+#endif  // HSHM_ENABLE_LIBAIO
 
 #endif  // HSHM_SHM_INCLUDE_HSHM_SHM_IO_LIBAIO_IO_H_

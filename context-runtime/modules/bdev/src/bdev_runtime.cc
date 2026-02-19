@@ -603,17 +603,16 @@ chi::TaskResume Runtime::Write(hipc::FullPtr<WriteTask> task,
                                chi::RunContext &ctx) {
   switch (bdev_type_) {
     case BdevType::kFile:
-      WriteToFile(task, ctx);
+      co_await WriteToFile(task, ctx);
       break;
     case BdevType::kRam:
       WriteToRam(task);
       break;
     default:
-      task->return_code_ = 1;  // Unknown backend type
+      task->return_code_ = 1;
       task->bytes_written_ = 0;
       break;
   }
-  (void)ctx;
   co_return;
 }
 
@@ -621,17 +620,142 @@ chi::TaskResume Runtime::Read(hipc::FullPtr<ReadTask> task,
                               chi::RunContext &ctx) {
   switch (bdev_type_) {
     case BdevType::kFile:
-      ReadFromFile(task, ctx);
+      co_await ReadFromFile(task, ctx);
       break;
     case BdevType::kRam:
       ReadFromRam(task);
       break;
     default:
-      task->return_code_ = 1;  // Unknown backend type
+      task->return_code_ = 1;
       task->bytes_read_ = 0;
       break;
   }
-  (void)ctx;
+  co_return;
+}
+
+chi::TaskResume Runtime::WriteToFile(hipc::FullPtr<WriteTask> task,
+                                     chi::RunContext &ctx) {
+  size_t worker_id = GetWorkerID(ctx);
+  WorkerIOContext *io_ctx = GetWorkerIOContext(worker_id);
+
+  auto *ipc_mgr = CHI_IPC;
+  hipc::FullPtr<char> data_ptr = ipc_mgr->ToFullPtr(task->data_).Cast<char>();
+
+  chi::u64 total_bytes_written = 0;
+  chi::u64 data_offset = 0;
+
+  for (size_t i = 0; i < task->blocks_.size(); ++i) {
+    const Block &block = task->blocks_[i];
+
+    chi::u64 remaining = task->length_ - total_bytes_written;
+    if (remaining == 0) break;
+    chi::u64 block_write_size = std::min(remaining, block.size_);
+
+    void *block_data = data_ptr.ptr_ + data_offset;
+
+    if (io_ctx == nullptr || !io_ctx->is_initialized_ || !io_ctx->async_io_) {
+      HLOG(kError, "WriteToFile called with invalid I/O context");
+      task->return_code_ = 1;
+      task->bytes_written_ = total_bytes_written;
+      co_return;
+    }
+
+    hshm::IoToken token = io_ctx->async_io_->Write(
+        block_data, static_cast<size_t>(block_write_size),
+        static_cast<off_t>(block.offset_));
+    if (token == hshm::kInvalidIoToken) {
+      HLOG(kError, "Failed to submit async write: offset={}, size={}",
+           block.offset_, block_write_size);
+      task->return_code_ = 2;
+      task->bytes_written_ = total_bytes_written;
+      co_return;
+    }
+
+    hshm::IoResult result;
+    while (!io_ctx->async_io_->IsComplete(token, result)) {
+      co_await chi::yield();
+    }
+
+    if (result.error_code != 0) {
+      HLOG(kError, "Async write failed: error_code={}", result.error_code);
+      task->return_code_ = 4;
+      task->bytes_written_ = total_bytes_written;
+      co_return;
+    }
+
+    chi::u64 actual_bytes = std::min(
+        static_cast<chi::u64>(result.bytes_transferred), block_write_size);
+    total_bytes_written += actual_bytes;
+    data_offset += actual_bytes;
+  }
+
+  task->return_code_ = 0;
+  task->bytes_written_ = total_bytes_written;
+  total_writes_.fetch_add(1);
+  total_bytes_written_.fetch_add(task->bytes_written_);
+  co_return;
+}
+
+chi::TaskResume Runtime::ReadFromFile(hipc::FullPtr<ReadTask> task,
+                                      chi::RunContext &ctx) {
+  size_t worker_id = GetWorkerID(ctx);
+  WorkerIOContext *io_ctx = GetWorkerIOContext(worker_id);
+
+  auto *ipc_mgr = CHI_IPC;
+  hipc::FullPtr<char> data_ptr = ipc_mgr->ToFullPtr(task->data_).Cast<char>();
+
+  chi::u64 total_bytes_read = 0;
+  chi::u64 data_offset = 0;
+
+  for (size_t i = 0; i < task->blocks_.size(); ++i) {
+    const Block &block = task->blocks_[i];
+
+    chi::u64 remaining = task->length_ - total_bytes_read;
+    if (remaining == 0) break;
+    chi::u64 block_read_size = std::min(remaining, block.size_);
+
+    void *block_data = data_ptr.ptr_ + data_offset;
+
+    if (io_ctx == nullptr || !io_ctx->is_initialized_ || !io_ctx->async_io_) {
+      HLOG(kError, "ReadFromFile called with invalid I/O context");
+      task->return_code_ = 1;
+      task->bytes_read_ = total_bytes_read;
+      co_return;
+    }
+
+    hshm::IoToken token = io_ctx->async_io_->Read(
+        block_data, static_cast<size_t>(block_read_size),
+        static_cast<off_t>(block.offset_));
+    if (token == hshm::kInvalidIoToken) {
+      HLOG(kError, "Failed to submit async read: offset={}, size={}",
+           block.offset_, block_read_size);
+      task->return_code_ = 2;
+      task->bytes_read_ = total_bytes_read;
+      co_return;
+    }
+
+    hshm::IoResult result;
+    while (!io_ctx->async_io_->IsComplete(token, result)) {
+      co_await chi::yield();
+    }
+
+    if (result.error_code != 0) {
+      HLOG(kError, "Async read failed: error_code={}", result.error_code);
+      task->return_code_ = 4;
+      task->bytes_read_ = total_bytes_read;
+      co_return;
+    }
+
+    chi::u64 actual_bytes = std::min(
+        static_cast<chi::u64>(result.bytes_transferred), block_read_size);
+    total_bytes_read += actual_bytes;
+    data_offset += actual_bytes;
+  }
+
+  task->return_code_ = 0;
+  task->bytes_read_ = total_bytes_read;
+  total_reads_.fetch_add(1);
+  total_bytes_read_.fetch_add(total_bytes_read);
   co_return;
 }
 
@@ -707,99 +831,6 @@ void Runtime::CleanupAsyncIO() {
   // No cleanup needed for POSIX AIO fallback
 }
 
-chi::u32 Runtime::PerformAsyncIO(WorkerIOContext *io_ctx, bool is_write,
-                                 chi::u64 offset, void *buffer, chi::u64 size,
-                                 chi::u64 &bytes_transferred,
-                                 hipc::FullPtr<chi::Task> task) {
-  if (io_ctx == nullptr || !io_ctx->is_initialized_ || !io_ctx->async_io_) {
-    HLOG(kError, "PerformAsyncIO called with invalid I/O context");
-    return 1;
-  }
-
-  // Submit the I/O operation — AsyncIO handles fd selection based on alignment
-  hshm::IoToken token;
-  if (is_write) {
-    token = io_ctx->async_io_->Write(buffer, static_cast<size_t>(size),
-                                     static_cast<off_t>(offset));
-  } else {
-    token = io_ctx->async_io_->Read(buffer, static_cast<size_t>(size),
-                                    static_cast<off_t>(offset));
-  }
-
-  if (token == hshm::kInvalidIoToken) {
-    HLOG(kError, "Failed to submit async I/O: is_write={}, offset={}, size={}",
-         is_write, offset, size);
-    return 2;
-  }
-
-  // Non-blocking completion check with yield
-  hshm::IoResult result;
-  while (!io_ctx->async_io_->IsComplete(token, result)) {
-    HSHM_THREAD_MODEL->Yield();
-  }
-
-  if (result.error_code != 0) {
-    HLOG(kError, "Async I/O failed: error_code={}", result.error_code);
-    return 4;
-  }
-  bytes_transferred = static_cast<chi::u64>(result.bytes_transferred);
-  return 0;  // Success
-}
-
-// Backend-specific write operations
-void Runtime::WriteToFile(hipc::FullPtr<WriteTask> task, chi::RunContext &ctx) {
-  // Get per-worker I/O context for parallel file access
-  size_t worker_id = GetWorkerID(ctx);
-  WorkerIOContext *io_ctx = GetWorkerIOContext(worker_id);
-
-  // Convert hipc::ShmPtr<> to hipc::FullPtr<char> for data access
-  auto *ipc_mgr = CHI_IPC;
-  hipc::FullPtr<char> data_ptr = ipc_mgr->ToFullPtr(task->data_).Cast<char>();
-
-  chi::u64 total_bytes_written = 0;
-  chi::u64 data_offset = 0;
-
-  // Iterate over all blocks
-  for (size_t i = 0; i < task->blocks_.size(); ++i) {
-    const Block &block = task->blocks_[i];
-
-    // Calculate how much data to write to this block
-    chi::u64 remaining = task->length_ - total_bytes_written;
-    if (remaining == 0) {
-      break;  // All data has been written
-    }
-    chi::u64 block_write_size = std::min(remaining, block.size_);
-
-    // Get data pointer offset for this block
-    void *block_data = data_ptr.ptr_ + data_offset;
-
-    // AsyncIO handles O_DIRECT vs regular fd selection based on alignment
-    chi::u64 bytes_written;
-    chi::u32 result =
-        PerformAsyncIO(io_ctx, true, block.offset_, block_data, block_write_size,
-                       bytes_written, task.Cast<chi::Task>());
-
-    if (result != 0) {
-      task->return_code_ = result;
-      task->bytes_written_ = total_bytes_written;
-      return;
-    }
-
-    // Update counters
-    chi::u64 actual_bytes = std::min(bytes_written, block_write_size);
-    total_bytes_written += actual_bytes;
-    data_offset += actual_bytes;
-  }
-
-  // Update task results
-  task->return_code_ = 0;
-  task->bytes_written_ = total_bytes_written;
-
-  // Update performance metrics
-  total_writes_.fetch_add(1);
-  total_bytes_written_.fetch_add(task->bytes_written_);
-}
-
 void Runtime::WriteToRam(hipc::FullPtr<WriteTask> task) {
   static thread_local size_t ram_write_count = 0;
   static thread_local double t_resolve_ms = 0, t_memcpy_ms = 0;
@@ -864,59 +895,6 @@ void Runtime::WriteToRam(hipc::FullPtr<WriteTask> task) {
          ram_write_count, t_resolve_ms, t_memcpy_ms);
     t_resolve_ms = t_memcpy_ms = 0;
   }
-}
-
-// Backend-specific read operations
-void Runtime::ReadFromFile(hipc::FullPtr<ReadTask> task, chi::RunContext &ctx) {
-  // Get per-worker I/O context for parallel file access
-  size_t worker_id = GetWorkerID(ctx);
-  WorkerIOContext *io_ctx = GetWorkerIOContext(worker_id);
-
-  // Convert hipc::ShmPtr<> to hipc::FullPtr<char> for data access
-  auto *ipc_mgr = CHI_IPC;
-  hipc::FullPtr<char> data_ptr = ipc_mgr->ToFullPtr(task->data_).Cast<char>();
-
-  chi::u64 total_bytes_read = 0;
-  chi::u64 data_offset = 0;
-
-  // Iterate over all blocks
-  for (size_t i = 0; i < task->blocks_.size(); ++i) {
-    const Block &block = task->blocks_[i];
-
-    // Calculate how much data to read from this block
-    chi::u64 remaining = task->length_ - total_bytes_read;
-    if (remaining == 0) {
-      break;  // All data has been read
-    }
-    chi::u64 block_read_size = std::min(remaining, block.size_);
-
-    // Get data pointer offset for this block
-    void *block_data = data_ptr.ptr_ + data_offset;
-
-    // AsyncIO handles O_DIRECT vs regular fd selection based on alignment
-    chi::u64 bytes_read;
-    chi::u32 result =
-        PerformAsyncIO(io_ctx, false, block.offset_, block_data,
-                       block_read_size, bytes_read, task.Cast<chi::Task>());
-
-    if (result != 0) {
-      task->return_code_ = result;
-      task->bytes_read_ = total_bytes_read;
-      return;
-    }
-
-    // Update counters
-    chi::u64 actual_bytes = std::min(bytes_read, block_read_size);
-    total_bytes_read += actual_bytes;
-    data_offset += actual_bytes;
-  }
-
-  task->return_code_ = 0;
-  task->bytes_read_ = total_bytes_read;
-
-  // Update performance metrics
-  total_reads_.fetch_add(1);
-  total_bytes_read_.fetch_add(total_bytes_read);
 }
 
 void Runtime::ReadFromRam(hipc::FullPtr<ReadTask> task) {

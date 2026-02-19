@@ -184,7 +184,7 @@ TEST_CASE("TestAsyncIO") {
     REQUIRE(ok);
   }
 
-#ifdef __linux__
+#if HSHM_ENABLE_LIBAIO
   PAGE_DIVIDE("LinuxAio") {
     bool ok = RunAlignedWriteReadTest(hshm::AsyncIoBackend::kLinuxAio);
     REQUIRE(ok);

@@ -432,42 +432,26 @@ class Runtime : public chi::Container {
   void CleanupWorkerIOContexts();
 
   /**
-   * Perform async I/O operation using per-worker context
-   * @param io_ctx Worker's I/O context
-   * @param is_write true for write, false for read
-   * @param offset File offset
-   * @param buffer Data buffer
-   * @param size Size of I/O operation
-   * @param bytes_transferred Output: bytes actually transferred
-   * @param task Task pointer for context
-   * @return 0 on success, non-zero error code on failure
-   */
-  chi::u32 PerformAsyncIO(WorkerIOContext *io_ctx, bool is_write,
-                          chi::u64 offset, void *buffer, chi::u64 size,
-                          chi::u64 &bytes_transferred,
-                          hipc::FullPtr<chi::Task> task);
-
-  /**
    * Align size to required boundary
    */
   chi::u64 AlignSize(chi::u64 size);
-  
-  /**
-   * Backend-specific write operations
-   */
-  void WriteToFile(hipc::FullPtr<WriteTask> task, chi::RunContext &ctx);
-  void WriteToRam(hipc::FullPtr<WriteTask> task);
 
   /**
-   * Backend-specific read operations
+   * Backend-specific file operations (coroutines that yield on I/O)
    */
-  void ReadFromFile(hipc::FullPtr<ReadTask> task, chi::RunContext &ctx);
+  chi::TaskResume WriteToFile(hipc::FullPtr<WriteTask> task, chi::RunContext &ctx);
+  chi::TaskResume ReadFromFile(hipc::FullPtr<ReadTask> task, chi::RunContext &ctx);
+
+  /**
+   * Backend-specific RAM operations (synchronous, no coroutine needed)
+   */
+  void WriteToRam(hipc::FullPtr<WriteTask> task);
   void ReadFromRam(hipc::FullPtr<ReadTask> task);
-  
+
   /**
    * Update performance metrics
    */
-  void UpdatePerformanceMetrics(bool is_write, chi::u64 bytes, 
+  void UpdatePerformanceMetrics(bool is_write, chi::u64 bytes,
                                 double duration_us);
 };
 

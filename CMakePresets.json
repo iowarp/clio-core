@@ -31,7 +31,8 @@
                 "WRP_CORE_ENABLE_ZMQ": "ON",
                 "WRP_CORE_ENABLE_CEREAL": "ON",
                 "HSHM_LOG_LEVEL": "0",
-                "WRP_CORE_ENABLE_DOCKER_CI": "ON"
+                "WRP_CORE_ENABLE_DOCKER_CI": "ON",
+                "WRP_CORE_ENABLE_IO_URING": "ON"
             }
         },
         {
@@ -51,7 +52,8 @@
                 "WRP_CORE_ENABLE_CUDA": "ON",
                 "CMAKE_CUDA_ARCHITECTURES": "86",
                 "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
-                "WRP_CORE_ENABLE_ASAN": "OFF"
+                "WRP_CORE_ENABLE_ASAN": "OFF",
+                "WRP_CORE_ENABLE_IO_URING": "ON"
             }
         },
         {
@@ -70,7 +72,8 @@
                 "WRP_CORE_ENABLE_ELF": "ON",
                 "WRP_CORE_ENABLE_ROCM": "ON",
                 "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
-                "WRP_CORE_ENABLE_ASAN": "ON"
+                "WRP_CORE_ENABLE_ASAN": "ON",
+                "WRP_CORE_ENABLE_IO_URING": "ON"
             }
         },
         {
@@ -93,7 +96,8 @@
                 "WRP_CORE_ENABLE_ASAN": "OFF",
                 "WRP_CORE_ENABLE_PYTHON": "ON",
                 "WRP_CORE_ENABLE_COVERAGE": "OFF",
-                "HSHM_LOG_LEVEL": "1"
+                "HSHM_LOG_LEVEL": "1",
+                "WRP_CORE_ENABLE_IO_URING": "ON"
             }
         },
         {
@@ -120,7 +124,8 @@
                 "WRP_CORE_ENABLE_CEREAL": "ON",
                 "WRP_CORE_ENABLE_HDF5": "ON",
                 "WRP_CORE_ENABLE_MPI": "ON",
-                "HSHM_LOG_LEVEL": "1"
+                "HSHM_LOG_LEVEL": "1",
+                "WRP_CORE_ENABLE_IO_URING": "ON"
             }
         },
         {
@@ -150,7 +155,8 @@
                 "WRP_CORE_ENABLE_CUDA": "OFF",
                 "WRP_CORE_ENABLE_ROCM": "OFF",
                 "WRP_CORE_ENABLE_OPENMP": "OFF",
-                "HSHM_LOG_LEVEL": "1"
+                "HSHM_LOG_LEVEL": "1",
+                "WRP_CORE_ENABLE_IO_URING": "ON"
             }
         }
     ]

@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Repack a wheel directory into a .whl file, preserving Unix permissions."""
 import os
-import stat
 import sys
 import zipfile
 

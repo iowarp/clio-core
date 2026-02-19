@@ -37,7 +37,7 @@
 #include <memory>
 #include "async_io.h"
 
-#ifdef __linux__
+#if HSHM_ENABLE_LIBAIO
 #include "libaio_io.h"
 #endif
 
@@ -73,7 +73,7 @@ class AsyncIoFactory {
     }
 
     switch (backend) {
-#ifdef __linux__
+#if HSHM_ENABLE_LIBAIO
       case AsyncIoBackend::kLinuxAio:
         return std::make_unique<LinuxAioAsyncIO>(io_depth);
 #endif
@@ -102,7 +102,7 @@ class AsyncIoFactory {
   static AsyncIoBackend GetDefaultBackend() {
 #if HSHM_ENABLE_IO_URING
     return AsyncIoBackend::kIoUring;
-#elif defined(__linux__)
+#elif HSHM_ENABLE_LIBAIO
     return AsyncIoBackend::kLinuxAio;
 #elif defined(_WIN32)
     return AsyncIoBackend::kIocp;

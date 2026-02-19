@@ -53,7 +53,7 @@ jobs:
         CIBW_MANYLINUX_X86_64_IMAGE: ${{ matrix.cibw_image }}
         CIBW_MANYLINUX_AARCH64_IMAGE: ${{ matrix.cibw_image }}
         CIBW_BEFORE_ALL: >
-          yum install -y curl patchelf libaio-devel &&
+          yum install -y curl patchelf &&
           bash {project}/installers/pip/build_deps_manylinux.sh
         CIBW_ENVIRONMENT: >
           CMAKE_PREFIX_PATH=/usr/local

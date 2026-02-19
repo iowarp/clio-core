@@ -103,9 +103,15 @@ cmake -S cppzmq-4.10.0 -B cppzmq-build \
 cmake --install cppzmq-build
 rm -rf /tmp/cppzmq-*
 
-# libaio: headers and shared library provided by yum libaio-devel (installed in
-# CIBW_BEFORE_ALL). libchimaera_bdev_runtime.so links dynamically against libaio.
-cd /tmp && rm -rf libaio-*
+# liburing 2.5 (static + shared, for io_uring async I/O backend)
+echo "--- liburing 2.5 ---"
+cd /tmp
+curl -sL https://github.com/axboe/liburing/archive/refs/tags/liburing-2.5.tar.gz | tar xz
+cd liburing-liburing-2.5
+./configure --prefix=$PREFIX
+make -j$NPROC CFLAGS="${CFLAGS} -fPIC"
+make install
+cd /tmp && rm -rf liburing-*
 
 ldconfig
 echo "=== All dependencies built successfully ==="

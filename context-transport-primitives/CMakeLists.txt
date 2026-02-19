@@ -294,18 +294,29 @@ add_library(hshm::compress ALIAS compress)
 
 # hshm::aio - Async I/O support
 add_library(aio INTERFACE)
+set(HSHM_ENABLE_LIBAIO OFF)
 if(HSHM_ENABLE_IO_URING)
-    target_link_libraries(aio INTERFACE uring)
+    if(WRP_CORE_STATIC_DEPS)
+        find_library(URING_STATIC_LIB NAMES liburing.a REQUIRED)
+        message(STATUS "Static liburing: ${URING_STATIC_LIB}")
+        target_link_libraries(aio INTERFACE ${URING_STATIC_LIB})
+    else()
+        target_link_libraries(aio INTERFACE uring)
+    endif()
 endif()
 if(NOT WIN32)
-    find_library(LIBAIO_LIBRARY NAMES aio libaio)
-    if(LIBAIO_LIBRARY)
-        target_link_libraries(aio INTERFACE ${LIBAIO_LIBRARY})
+    if(NOT HSHM_ENABLE_IO_URING)
+        find_library(LIBAIO_LIBRARY NAMES aio libaio)
+        if(LIBAIO_LIBRARY)
+            target_link_libraries(aio INTERFACE ${LIBAIO_LIBRARY})
+            set(HSHM_ENABLE_LIBAIO ON)
+        endif()
     endif()
     target_link_libraries(aio INTERFACE rt)
 endif()
 target_compile_definitions(aio INTERFACE
     HSHM_ENABLE_IO_URING=$<BOOL:${HSHM_ENABLE_IO_URING}>
+    HSHM_ENABLE_LIBAIO=$<BOOL:${HSHM_ENABLE_LIBAIO}>
 )
 add_library(hshm::aio ALIAS aio)
 
