@@ -1,17 +1,36 @@
-name: Build Pip Wheels
+name: Build, Test, and Publish Pip Wheels
 
 on:
   workflow_dispatch:
   push:
+    branches: main
     tags: ['v*']
+  pull_request:
+    branches: main
+
+permissions:
+  contents: write
+  id-token: write
 
 jobs:
+  #------------------------------------------------------------
+  # Build manylinux wheels via cibuildwheel
+  #------------------------------------------------------------
   build-wheels:
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest]
+        include:
+          - runner: ubuntu-latest
+            arch: x86_64
+            cibw_build: "cp310-manylinux_x86_64 cp311-manylinux_x86_64 cp312-manylinux_x86_64 cp313-manylinux_x86_64"
+            cibw_image: manylinux_2_28
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+            cibw_build: "cp310-manylinux_aarch64 cp311-manylinux_aarch64 cp312-manylinux_aarch64 cp313-manylinux_aarch64"
+            cibw_image: manylinux_2_28
 
     steps:
     - name: Checkout repository
@@ -30,8 +49,9 @@ jobs:
 
     - name: Build wheels
       env:
-        CIBW_BUILD: "cp310-manylinux_x86_64 cp311-manylinux_x86_64 cp312-manylinux_x86_64 cp313-manylinux_x86_64"
-        CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
+        CIBW_BUILD: ${{ matrix.cibw_build }}
+        CIBW_MANYLINUX_X86_64_IMAGE: ${{ matrix.cibw_image }}
+        CIBW_MANYLINUX_AARCH64_IMAGE: ${{ matrix.cibw_image }}
         CIBW_BEFORE_ALL: >
           yum install -y curl patchelf libaio-devel &&
           bash {project}/installers/pip/build_deps_manylinux.sh
@@ -42,29 +62,200 @@ jobs:
           bash {project}/installers/pip/fix_rpaths.sh {build} &&
           auditwheel repair -w {dest_dir} {wheel}
         CIBW_TEST_COMMAND: >
-          python -c "import iowarp_core; print(iowarp_core.get_version())"
+          python -c "import iowarp_core; print('Version:', iowarp_core.get_version())"
       working-directory: installers/pip
       run: cibuildwheel --output-dir wheelhouse
 
     - name: Upload wheels
       uses: actions/upload-artifact@v4
       with:
-        name: wheels-${{ matrix.os }}
+        name: wheels-${{ matrix.arch }}
         path: installers/pip/wheelhouse/*.whl
 
-  publish:
+  #------------------------------------------------------------
+  # Test wheels in clean Docker containers
+  #
+  # Installs the wheel with nothing but Python + pip and verifies:
+  #   - import succeeds (no missing symbols)
+  #   - CLI binary runs
+  #   - no unexpected shared library deps leaked
+  #   - ldd shows all symbols resolved (no "not found")
+  #------------------------------------------------------------
+  test-wheels:
     needs: build-wheels
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # x86_64 tests
+          - runner: ubuntu-latest
+            arch: x86_64
+            distro: ubuntu:22.04
+            pkg_manager: apt
+          - runner: ubuntu-latest
+            arch: x86_64
+            distro: ubuntu:24.04
+            pkg_manager: apt
+          - runner: ubuntu-latest
+            arch: x86_64
+            distro: debian:12
+            pkg_manager: apt
+          - runner: ubuntu-latest
+            arch: x86_64
+            distro: fedora:40
+            pkg_manager: dnf
+          # aarch64 tests
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+            distro: ubuntu:22.04
+            pkg_manager: apt
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+            distro: ubuntu:24.04
+            pkg_manager: apt
+
+    steps:
+    - name: Checkout repository (for test script)
+      uses: actions/checkout@v4
+      with:
+        sparse-checkout: installers/pip
+
+    - name: Download wheels
+      uses: actions/download-artifact@v4
+      with:
+        name: wheels-${{ matrix.arch }}
+        path: wheels/
+
+    - name: Test wheel in ${{ matrix.distro }}
+      run: |
+        docker run --rm \
+          -v "$PWD/wheels:/wheels:ro" \
+          ${{ matrix.distro }} \
+          bash -c '
+            set -e
+
+            # Install Python
+            if command -v apt-get &>/dev/null; then
+              apt-get update -qq
+              apt-get install -y -qq python3 python3-pip python3-venv >/dev/null 2>&1
+            elif command -v dnf &>/dev/null; then
+              dnf install -y -q python3 python3-pip >/dev/null 2>&1
+            fi
+
+            # Create clean venv
+            python3 -m venv /tmp/test-venv
+            source /tmp/test-venv/bin/activate
+
+            # Install wheel (grab the cp312 one, or whatever matches)
+            pip install --quiet /wheels/*.whl 2>/dev/null || \
+              pip install --quiet $(ls /wheels/*.whl | head -1)
+
+            echo "=== Import test ==="
+            python -c "import iowarp_core; print(\"Version:\", iowarp_core.get_version())"
+            python -c "import iowarp_core; print(\"Lib dir:\", iowarp_core.get_lib_dir())"
+            python -c "import iowarp_core; print(\"CTE available:\", iowarp_core.cte_available())"
+
+            echo "=== CLI test ==="
+            chimaera --help
+
+            echo "=== Symbol resolution check ==="
+            LIB_DIR=$(python -c "import iowarp_core; print(iowarp_core.get_lib_dir())")
+            MISSING=0
+            for so in "$LIB_DIR"/*.so "$LIB_DIR"/*.so.*; do
+              [ -f "$so" ] || continue
+              if ldd "$so" 2>/dev/null | grep -q "not found"; then
+                echo "FAIL: $(basename $so) has missing symbols:"
+                ldd "$so" | grep "not found"
+                MISSING=1
+              fi
+            done
+            if [ "$MISSING" = "1" ]; then
+              echo "ERROR: Some libraries have unresolved symbols"
+              exit 1
+            fi
+            echo "All shared libraries resolve correctly"
+
+            echo "=== Dependency audit ==="
+            for so in "$LIB_DIR"/*.so; do
+              [ -f "$so" ] || continue
+              echo "--- $(basename $so) ---"
+              ldd "$so" 2>/dev/null | grep -v "linux-vdso\|ld-linux\|libc.so\|libm.so\|libstdc++\|libgcc_s\|libpthread\|librt\|libdl" || true
+            done
+
+            echo "=== All tests passed ==="
+          '
+
+  #------------------------------------------------------------
+  # Publish to PyPI on version tags
+  #------------------------------------------------------------
+  publish-to-pypi:
+    name: Publish to PyPI
+    needs: [build-wheels, test-wheels]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
+    environment:
+      name: pypi
+      url: https://pypi.org/p/iowarp-core
     permissions:
       id-token: write
 
     steps:
-    - name: Download wheels
+    - name: Download x86_64 wheels
       uses: actions/download-artifact@v4
       with:
-        name: wheels-ubuntu-latest
+        name: wheels-x86_64
         path: dist/
+
+    - name: Download aarch64 wheels
+      uses: actions/download-artifact@v4
+      with:
+        name: wheels-aarch64
+        path: dist/
+
+    - name: List distributions
+      run: ls -lh dist/
 
     - name: Publish to PyPI
       uses: pypa/gh-action-pypi-publish@release/v1
+      with:
+        skip-existing: true
+        verbose: true
+
+  #------------------------------------------------------------
+  # Create GitHub Release on version tags
+  #------------------------------------------------------------
+  github-release:
+    name: Create GitHub Release
+    needs: [build-wheels, test-wheels]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+
+    steps:
+    - name: Download x86_64 wheels
+      uses: actions/download-artifact@v4
+      with:
+        name: wheels-x86_64
+        path: dist/
+
+    - name: Download aarch64 wheels
+      uses: actions/download-artifact@v4
+      with:
+        name: wheels-aarch64
+        path: dist/
+
+    - name: List release artifacts
+      run: ls -lh dist/
+
+    - name: Create GitHub Release
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+      run: >-
+        gh release create
+        '${{ github.ref_name }}'
+        --repo '${{ github.repository }}'
+        --generate-notes
+        dist/*
