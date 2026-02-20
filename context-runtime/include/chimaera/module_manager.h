@@ -217,7 +217,7 @@ class ModuleManager {
 }  // namespace chi
 
 // Global pointer variable declaration for Module manager singleton
-HSHM_DEFINE_GLOBAL_PTR_VAR_H(chi::ModuleManager, g_module_manager);
+HSHM_DEFINE_GLOBAL_PTR_VAR_H_DLL(CHI_DLL, chi::ModuleManager, g_module_manager);
 
 // Macro for accessing the Module manager singleton using global pointer variable
 #define CHI_MODULE_MANAGER HSHM_GET_GLOBAL_PTR_VAR(::chi::ModuleManager, g_module_manager)

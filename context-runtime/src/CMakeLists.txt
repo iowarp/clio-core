@@ -49,6 +49,7 @@ set_target_properties(${CHIMAERA_LIB_NAME} PROPERTIES
   SOVERSION 1
   PUBLIC_HEADER "${CHIMAERA_ROOT}/include/chimaera/chimaera.h"
   OUTPUT_NAME "${CHIMAERA_NAMESPACE}_cxx"
+  WINDOWS_EXPORT_ALL_SYMBOLS ON
 )
 
 # Export target for parent scope

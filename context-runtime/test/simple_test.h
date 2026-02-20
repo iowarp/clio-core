@@ -240,13 +240,17 @@ inline int run_all_tests(const std::string& filter = "") {
 // Helper macro to generate unique function names
 #define CONCAT_IMPL(x, y) x##y
 #define CONCAT(x, y) CONCAT_IMPL(x, y)
-#define UNIQUE_NAME(base) CONCAT(base, __LINE__)
+// Avoid UNIQUE_NAME which clashes with Windows nb30.h
+#ifdef UNIQUE_NAME
+#undef UNIQUE_NAME
+#endif
+#define CHI_UNIQUE_NAME(base) CONCAT(base, __LINE__)
 
 // Main TEST_CASE macro that works with string names
 #define TEST_CASE(test_name, tags) \
-    void UNIQUE_NAME(test_func_)(); \
-    static SimpleTest::TestRegistrar UNIQUE_NAME(test_reg_)(std::string(test_name) + " " + std::string(tags), UNIQUE_NAME(test_func_)); \
-    void UNIQUE_NAME(test_func_)()
+    void CHI_UNIQUE_NAME(test_func_)(); \
+    static SimpleTest::TestRegistrar CHI_UNIQUE_NAME(test_reg_)(std::string(test_name) + " " + std::string(tags), CHI_UNIQUE_NAME(test_func_)); \
+    void CHI_UNIQUE_NAME(test_func_)()
 
 // Main function for test executable
 #define SIMPLE_TEST_MAIN() \

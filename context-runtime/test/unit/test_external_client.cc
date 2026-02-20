@@ -39,6 +39,12 @@
  * integrated server+client mode.
  */
 
+#ifdef _WIN32
+// These tests require POSIX process management (fork, kill, waitpid)
+#include "../simple_test.h"
+SIMPLE_TEST_MAIN()
+#else
+
 #include "../simple_test.h"
 
 #ifndef _WIN32
@@ -277,3 +283,5 @@ TEST_CASE("ExternalClient - Client Operations", "[external_client][ipc]") {
 }
 
 SIMPLE_TEST_MAIN()
+
+#endif  // _WIN32

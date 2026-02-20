@@ -42,6 +42,16 @@
 #ifndef _WIN32
 #include <sys/stat.h>
 #include <unistd.h>
+#else
+#include <io.h>
+#include <stdio.h>
+#include <stdlib.h>
+#define access(path, mode) _access(path, mode)
+#define unlink(path) _unlink(path)
+#define setenv(name, value, overwrite) _putenv_s(name, value)
+#ifndef F_OK
+#define F_OK 0
+#endif
 #endif
 
 #include <chrono>

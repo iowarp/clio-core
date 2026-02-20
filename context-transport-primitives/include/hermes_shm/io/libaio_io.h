@@ -101,7 +101,7 @@ class LinuxAioAsyncIO : public AsyncIO {
     return true;
   }
 
-  ssize_t GetFileSize() const override {
+  ssize_t GetAsyncFileSize() const override {
     int fd = regular_fd_ >= 0 ? regular_fd_ : direct_fd_;
     if (fd < 0) return -1;
     struct stat st;

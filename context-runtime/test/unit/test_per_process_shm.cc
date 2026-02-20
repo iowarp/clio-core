@@ -39,6 +39,12 @@
  * - Multiple segment creation and allocation fallback strategies
  */
 
+#ifdef _WIN32
+// These tests require POSIX process management (fork, kill, waitpid)
+#include "../simple_test.h"
+SIMPLE_TEST_MAIN()
+#else
+
 #include <chimaera/chimaera.h>
 
 #include <cstring>
@@ -505,3 +511,5 @@ TEST_CASE("Per-process shared memory ClientShmInfo",
 
 // Main function to run all tests
 SIMPLE_TEST_MAIN()
+
+#endif  // _WIN32

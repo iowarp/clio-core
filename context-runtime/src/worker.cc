@@ -217,7 +217,7 @@ void Worker::Run() {
   is_running_ = true;
 
   // Set up thread ID and signal event via EventManager
-  pid_t tid = static_cast<pid_t>(syscall(SYS_gettid));
+  pid_t tid = static_cast<pid_t>(hshm::SystemInfo::GetTid());
   if (assigned_lane_) {
     assigned_lane_->SetTid(tid);
   }

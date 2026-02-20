@@ -194,7 +194,7 @@ class WorkOrchestrator {
 }  // namespace chi
 
 // Global pointer variable declaration for Work Orchestrator singleton
-HSHM_DEFINE_GLOBAL_PTR_VAR_H(chi::WorkOrchestrator, g_work_orchestrator);
+HSHM_DEFINE_GLOBAL_PTR_VAR_H_DLL(CHI_DLL, chi::WorkOrchestrator, g_work_orchestrator);
 
 // Macro for accessing the Work Orchestrator singleton using global pointer variable
 #define CHI_WORK_ORCHESTRATOR HSHM_GET_GLOBAL_PTR_VAR(::chi::WorkOrchestrator, g_work_orchestrator)

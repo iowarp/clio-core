@@ -43,7 +43,6 @@
 #include <endian.h>
 #include <netdb.h>
 #include <signal.h>
-#include <sys/epoll.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
@@ -1448,8 +1447,7 @@ size_t IpcManager::WreapDeadIpcs() {
     }
 
     // Check if the owning process is still alive
-    // kill(pid, 0) returns 0 if process exists, -1 with ESRCH if not
-    if (kill(owner_pid, 0) == -1 && errno == ESRCH) {
+    if (!hshm::SystemInfo::IsProcessAlive(owner_pid)) {
       // Process is dead - mark for removal
       HLOG(kInfo,
            "WreapDeadIpcs: Process {} is dead, marking allocator ({}.{}) for "
@@ -1608,6 +1606,7 @@ size_t IpcManager::WreapAllIpcs() {
 }
 
 size_t IpcManager::ClearUserIpcs() {
+#ifndef _WIN32
   size_t removed_count = 0;
   const char *memfd_dir = "/tmp/chimaera_memfd";
   const char *prefix = "chimaera_";
@@ -1656,6 +1655,10 @@ size_t IpcManager::ClearUserIpcs() {
   }
 
   return removed_count;
+#else
+  // memfd symlinks are Linux-only
+  return 0;
+#endif
 }
 
 void IpcManager::SetIsClientThread(bool is_client_thread) {
@@ -1691,7 +1694,7 @@ bool IpcManager::IsServerAlive() const {
   // SHM mode: check runtime PID is still running
   if (ipc_mode_ == IpcMode::kShm && shared_header_) {
     pid_t pid = shared_header_->runtime_pid;
-    if (kill(pid, 0) == -1 && errno == ESRCH) return false;
+    if (!hshm::SystemInfo::IsProcessAlive(pid)) return false;
   }
   // For ZMQ modes, assume alive until proven otherwise by timeout
   return true;

@@ -1631,7 +1631,7 @@ class IpcManager {
 }  // namespace chi
 
 // Global pointer variable declaration for IPC manager singleton
-HSHM_DEFINE_GLOBAL_PTR_VAR_H(chi::IpcManager, g_ipc_manager);
+HSHM_DEFINE_GLOBAL_PTR_VAR_H_DLL(CHI_DLL, chi::IpcManager, g_ipc_manager);
 
 #if defined(__CUDACC__) || defined(__HIPCC__)
 namespace chi {

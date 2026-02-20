@@ -128,7 +128,7 @@ class Chimaera {
 }  // namespace chi
 
 // Global pointer variable declaration for Chimaera manager singleton
-HSHM_DEFINE_GLOBAL_PTR_VAR_H(chi::Chimaera, g_chimaera_manager);
+HSHM_DEFINE_GLOBAL_PTR_VAR_H_DLL(CHI_DLL, chi::Chimaera, g_chimaera_manager);
 
 // Macro for accessing the Chimaera manager singleton using global pointer variable
 #define CHI_CHIMAERA_MANAGER HSHM_GET_GLOBAL_PTR_VAR(::chi::Chimaera, g_chimaera_manager)

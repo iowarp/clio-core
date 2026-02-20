@@ -38,6 +38,12 @@
  * across all three IPC transport modes (TCP, IPC, SHM).
  */
 
+#ifdef _WIN32
+// These tests require POSIX process management (fork, kill, waitpid, execl)
+#include "../simple_test.h"
+SIMPLE_TEST_MAIN()
+#else
+
 #include "../simple_test.h"
 
 #include <fcntl.h>
@@ -350,3 +356,5 @@ int main(int argc, char* argv[]) {
   }
   return SimpleTest::run_all_tests(filter);
 }
+
+#endif  // _WIN32

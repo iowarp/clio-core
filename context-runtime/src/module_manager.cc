@@ -264,23 +264,7 @@ std::vector<std::string> ModuleManager::GetScanDirectories() const {
 }
 
 std::string ModuleManager::GetModuleDirectory() const {
-  Dl_info dl_info;
-  // Use address of a function in this shared object to identify it
-  void *symbol_addr = GetSymbolForDlAddr();
-
-  if (dladdr(symbol_addr, &dl_info) == 0) {
-    return "";
-  }
-
-  char resolved_path[PATH_MAX];
-  if (realpath(dl_info.dli_fname, resolved_path) == nullptr) {
-    return "";
-  }
-
-  char path_copy[PATH_MAX];
-  strncpy(path_copy, resolved_path, PATH_MAX);
-  path_copy[PATH_MAX - 1] = '\0';  // Ensure null termination
-  return std::string(dirname(path_copy));
+  return hshm::SystemInfo::GetModuleDirectory();
 }
 
 bool ModuleManager::IsSharedLibrary(const std::string &file_path) const {

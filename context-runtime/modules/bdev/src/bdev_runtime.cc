@@ -376,7 +376,7 @@ chi::TaskResume Runtime::Create(hipc::FullPtr<CreateTask> task,
     }
 
     // Get file size
-    ssize_t current_size = setup_io->GetFileSize();
+    ssize_t current_size = setup_io->GetAsyncFileSize();
     if (current_size < 0) {
       task->return_code_ = 2;
       setup_io->Close();

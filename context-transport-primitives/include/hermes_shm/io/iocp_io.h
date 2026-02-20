@@ -59,7 +59,7 @@ class IocpAsyncIO : public AsyncIO {
     return false;
   }
 
-  ssize_t GetFileSize() const override {
+  ssize_t GetAsyncFileSize() const override {
     // TODO: GetFileSizeEx
     return -1;
   }

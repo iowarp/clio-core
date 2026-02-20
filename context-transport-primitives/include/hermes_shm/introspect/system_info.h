@@ -40,6 +40,18 @@
 #include <sys/sysinfo.h>
 #endif
 #include <unistd.h>
+#include <sys/types.h>
+#endif
+
+#ifdef _WIN32
+#include <BaseTsd.h>
+#include <sys/types.h>
+#ifndef _SSIZE_T_DEFINED
+#define _SSIZE_T_DEFINED
+using ssize_t = SSIZE_T;
+#endif
+using pid_t = int;
+using mode_t = unsigned int;
 #endif
 
 #include <fstream>
@@ -207,6 +219,16 @@ class SystemInfo {
                               int overwrite);
 
   HSHM_DLL static void Unsetenv(const char *name);
+
+  HSHM_DLL static bool IsProcessAlive(int pid);
+
+  HSHM_DLL static std::string GetModuleDirectory();
+
+  HSHM_DLL static std::string GetLibrarySearchPathVar();
+
+  HSHM_DLL static char GetPathListSeparator();
+
+  HSHM_DLL static std::string GetSharedLibExtension();
 };
 
 }  // namespace hshm

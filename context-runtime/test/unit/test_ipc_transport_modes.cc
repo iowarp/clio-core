@@ -39,6 +39,12 @@
  * server, sets CHI_IPC_MODE, connects as client, and verifies mode state.
  */
 
+#ifdef _WIN32
+// These tests require POSIX process management (fork, kill, waitpid)
+#include "../simple_test.h"
+SIMPLE_TEST_MAIN()
+#else
+
 #include "../simple_test.h"
 
 #ifndef _WIN32
@@ -342,3 +348,5 @@ TEST_CASE("IpcTransportMode - Default Mode Is TCP",
 }
 
 SIMPLE_TEST_MAIN()
+
+#endif  // _WIN32

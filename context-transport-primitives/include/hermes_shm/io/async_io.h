@@ -36,8 +36,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <fcntl.h>
 #include <string>
-#include <sys/types.h>
+
+#include "hermes_shm/introspect/system_info.h"
 
 namespace hshm {
 
@@ -63,7 +65,7 @@ class AsyncIO {
   virtual bool Open(const std::string &path, int flags, mode_t mode) = 0;
 
   /** Get file size. Returns -1 on error. */
-  virtual ssize_t GetFileSize() const = 0;
+  virtual ssize_t GetAsyncFileSize() const = 0;
 
   /** Truncate/extend file. Returns true on success. */
   virtual bool Truncate(size_t size) = 0;

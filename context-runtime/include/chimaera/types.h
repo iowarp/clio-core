@@ -46,6 +46,21 @@
 #include <hermes_shm/memory/allocator/malloc_allocator.h>
 
 /**
+ * DLL import/export for chimaera_cxx shared library.
+ * CMake auto-defines chimaera_cxx_EXPORTS when building the DLL.
+ * Consumers see __declspec(dllimport) so data symbols resolve correctly.
+ */
+#ifdef _MSC_VER
+  #ifdef chimaera_cxx_EXPORTS
+    #define CHI_DLL __declspec(dllexport)
+  #else
+    #define CHI_DLL __declspec(dllimport)
+  #endif
+#else
+  #define CHI_DLL
+#endif
+
+/**
  * Core type definitions for Chimaera distributed task execution framework
  */
 
@@ -381,9 +396,9 @@ enum MemorySegment { kMainSegment = 0, kClientDataSegment = 1 };
 #define TEMP
 
 // HSHM Thread-local storage keys
-extern hshm::ThreadLocalKey chi_cur_worker_key_;
-extern hshm::ThreadLocalKey chi_task_counter_key_;
-extern hshm::ThreadLocalKey chi_is_client_thread_key_;
+extern CHI_DLL hshm::ThreadLocalKey chi_cur_worker_key_;
+extern CHI_DLL hshm::ThreadLocalKey chi_task_counter_key_;
+extern CHI_DLL hshm::ThreadLocalKey chi_is_client_thread_key_;
 
 /**
  * Thread-local task counter for generating unique TaskId major and unique

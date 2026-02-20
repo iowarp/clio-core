@@ -68,7 +68,6 @@ using ssize_t = SSIZE_T;
 #include <unistd.h>
 #include <poll.h>
 #include <fcntl.h>
-#include <sys/epoll.h>
 #endif
 
 namespace hshm::lbm::sock {
@@ -116,21 +115,5 @@ HSHM_DLL int PollReadMulti(const socket_t* fds, int count, int timeout_ms);
 
 /** Remove a file path (unlink on POSIX, DeleteFileA on Windows) */
 HSHM_DLL void UnlinkPath(const char* path);
-
-#ifndef _WIN32
-/** Create an epoll file descriptor. Returns epoll fd or -1 on error. */
-int EpollCreate();
-
-/** Add a socket fd to an epoll instance for EPOLLIN events. Returns 0 on success. */
-int EpollAdd(int epoll_fd, socket_t fd);
-
-/** Wait on an epoll instance. Returns number of ready events. */
-int EpollWait(int epoll_fd, struct epoll_event* events, int max_events,
-              int timeout_ms);
-
-/** Close an epoll file descriptor. */
-void EpollClose(int epoll_fd);
-#endif
-
 
 }  // namespace hshm::lbm::sock

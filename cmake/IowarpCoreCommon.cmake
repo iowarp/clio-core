@@ -314,7 +314,16 @@ function(read_repo_namespace output_var start_path)
   set(namespace "chimaera")  # Default fallback
 
   # Search up the directory tree for chimaera_repo.yaml
-  while(NOT "${current_path}" STREQUAL "/" AND NOT "${current_path}" STREQUAL "")
+  while(TRUE)
+    if("${current_path}" STREQUAL "" OR "${current_path}" STREQUAL "/")
+      break()
+    endif()
+    # On Windows, stop at drive root (e.g. "C:/")
+    string(REGEX MATCH "^[A-Za-z]:/?$" _is_drive_root "${current_path}")
+    if(_is_drive_root)
+      break()
+    endif()
+
     set(repo_file "${current_path}/chimaera_repo.yaml")
     if(EXISTS "${repo_file}")
       # Read and parse the YAML file
@@ -328,7 +337,11 @@ function(read_repo_namespace output_var start_path)
     endif()
 
     # Move up one directory
-    get_filename_component(current_path "${current_path}" DIRECTORY)
+    get_filename_component(parent_path "${current_path}" DIRECTORY)
+    if("${parent_path}" STREQUAL "${current_path}")
+      break()
+    endif()
+    set(current_path "${parent_path}")
   endwhile()
 
   set(${output_var} "${namespace}" PARENT_SCOPE)
@@ -410,7 +423,7 @@ function(add_chimod_client)
   add_library(${TARGET_NAME} SHARED ${ARG_SOURCES})
 
   # Set C++ standard
-  set(CHIMAERA_CXX_STANDARD 17)
+  set(CHIMAERA_CXX_STANDARD 20)
   target_compile_features(${TARGET_NAME} PUBLIC cxx_std_${CHIMAERA_CXX_STANDARD})
 
   # Common compile definitions
@@ -485,6 +498,7 @@ function(add_chimod_client)
   set_target_properties(${TARGET_NAME} PROPERTIES
     EXPORT_NAME "${CHIMAERA_MODULE_NAME}_client"
     OUTPUT_NAME "${CHIMAERA_NAMESPACE}_${CHIMAERA_MODULE_NAME}_client"
+    WINDOWS_EXPORT_ALL_SYMBOLS ON
   )
 
   # Install the client library
@@ -552,7 +566,7 @@ function(add_chimod_runtime)
   add_library(${TARGET_NAME} SHARED ${ARG_SOURCES})
 
   # Set C++ standard
-  set(CHIMAERA_CXX_STANDARD 17)
+  set(CHIMAERA_CXX_STANDARD 20)
   target_compile_features(${TARGET_NAME} PUBLIC cxx_std_${CHIMAERA_CXX_STANDARD})
 
   # Common compile definitions
@@ -633,8 +647,8 @@ function(add_chimod_runtime)
 
   target_link_libraries(${TARGET_NAME}
     PUBLIC
-      ${RUNTIME_LINK_LIBS} 
-      rt  # POSIX real-time library for async I/O
+      ${RUNTIME_LINK_LIBS}
+      $<$<NOT:$<PLATFORM_ID:Windows>>:rt>  # POSIX real-time library for async I/O
   )
 
   # Create alias for external use
@@ -644,6 +658,7 @@ function(add_chimod_runtime)
   set_target_properties(${TARGET_NAME} PROPERTIES
     EXPORT_NAME "${CHIMAERA_MODULE_NAME}_runtime"
     OUTPUT_NAME "${CHIMAERA_NAMESPACE}_${CHIMAERA_MODULE_NAME}_runtime"
+    WINDOWS_EXPORT_ALL_SYMBOLS ON
   )
 
   # Use cmake_language(DEFER) to link to client after all targets are processed

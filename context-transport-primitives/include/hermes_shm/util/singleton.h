@@ -203,6 +203,8 @@ HSHM_CROSS_FUN static inline T *GetGlobalCrossVar(T &instance) {
  * C-style pointer singleton with global variables
  */
 #define HSHM_DEFINE_GLOBAL_PTR_VAR_H(T, NAME) extern __TU(T) * NAME;
+#define HSHM_DEFINE_GLOBAL_PTR_VAR_H_DLL(DLL_ATTR, T, NAME) \
+  extern DLL_ATTR __TU(T) * NAME;
 #define HSHM_DEFINE_GLOBAL_PTR_VAR_CC(T, NAME) __TU(T) *NAME = nullptr;
 #define HSHM_GET_GLOBAL_PTR_VAR(T, NAME) hshm::GetGlobalPtrVar<__TU(T)>(NAME)
 template <typename T>

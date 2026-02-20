@@ -50,7 +50,7 @@ class Client;
 }
 
 // Global pointer variable declaration for Admin singleton
-HSHM_DEFINE_GLOBAL_PTR_VAR_H(chimaera::admin::Client, g_admin);
+HSHM_DEFINE_GLOBAL_PTR_VAR_H_DLL(CHI_DLL, chimaera::admin::Client, g_admin);
 
 // Macro for accessing the Admin singleton using global pointer variable
 #define CHI_ADMIN HSHM_GET_GLOBAL_PTR_VAR(::chimaera::admin::Client, g_admin)

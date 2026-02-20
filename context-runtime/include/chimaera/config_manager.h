@@ -282,7 +282,7 @@ class ConfigManager : public hshm::BaseConfig {
 }  // namespace chi
 
 // Global pointer variable declaration for Configuration manager singleton
-HSHM_DEFINE_GLOBAL_PTR_VAR_H(chi::ConfigManager, g_config_manager);
+HSHM_DEFINE_GLOBAL_PTR_VAR_H_DLL(CHI_DLL, chi::ConfigManager, g_config_manager);
 
 // Macro for accessing the Configuration manager singleton using global pointer variable
 #define CHI_CONFIG_MANAGER HSHM_GET_GLOBAL_PTR_VAR(::chi::ConfigManager, g_config_manager)
