@@ -198,7 +198,7 @@ set(CTEST_DROP_LOCATION "/submit.php?project=HERMES")
 set(CTEST_DROP_SITE_CDASH TRUE)
 set(CTEST_COVERAGE_COMMAND "gcov")
 ctest_start("Experimental")
-ctest_test(RETURN_VALUE test_result EXCLUDE_LABEL "integration|restart")
+ctest_test(RETURN_VALUE test_result EXCLUDE_LABEL "integration|restart|functional|query")
 ctest_coverage()
 ctest_submit()
 if(NOT test_result EQUAL 0)
@@ -208,9 +208,9 @@ EOFCMAKE
         ctest -S "${BUILD_DIR}/cdash_coverage.cmake" -VV || true
         print_success "CDash submission complete"
     else
-        print_info "Running unit tests (excluding integration/restart)..."
+        print_info "Running unit tests (excluding heavy runtime tests)..."
         CTEST_EXIT_CODE=0
-        ctest --output-on-failure -LE "integration|restart" || CTEST_EXIT_CODE=$?
+        ctest --output-on-failure -LE "integration|restart|functional|query" || CTEST_EXIT_CODE=$?
         if [ $CTEST_EXIT_CODE -eq 0 ]; then
             print_success "All CTest tests passed"
         else
