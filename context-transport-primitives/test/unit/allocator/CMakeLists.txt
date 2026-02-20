@@ -51,9 +51,9 @@ target_link_libraries(test_buddy_allocator_multiprocess_exec_2
 #------------------------------------------------------------------------------
 
 add_test(NAME ctp_sub_alloc COMMAND
-        ${CMAKE_BINARY_DIR}/bin/test_sub_alloc_exec)
+        ${CMAKE_BINARY_DIR}/bin/test_sub_alloc_exec "~[nested]")
 add_test(NAME ctp_sub_alloc_nested COMMAND
-        ${CMAKE_BINARY_DIR}/bin/test_sub_alloc_exec)
+        ${CMAKE_BINARY_DIR}/bin/test_sub_alloc_exec "[nested]")
 
 add_test(NAME ctp_arena_alloc COMMAND
         ${CMAKE_BINARY_DIR}/bin/test_arena_alloc_exec)
@@ -62,9 +62,9 @@ add_test(NAME ctp_buddy_allocator COMMAND
         ${CMAKE_BINARY_DIR}/bin/test_buddy_allocator_exec)
 
 add_test(NAME ctp_mp_allocator COMMAND
-        ${CMAKE_BINARY_DIR}/bin/test_mp_allocator_exec)
+        ${CMAKE_BINARY_DIR}/bin/test_mp_allocator_exec "~[multithread]")
 add_test(NAME ctp_mp_allocator_multithread COMMAND
-        ${CMAKE_BINARY_DIR}/bin/test_mp_allocator_exec)
+        ${CMAKE_BINARY_DIR}/bin/test_mp_allocator_exec "[multithread]")
 
 add_test(NAME ctp_hshm_malloc COMMAND
         ${CMAKE_BINARY_DIR}/bin/test_hshm_malloc_exec)

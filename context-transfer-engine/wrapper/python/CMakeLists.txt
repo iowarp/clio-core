@@ -1,7 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-# Find Python for nanobind
-find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
+# Python and nanobind are configured by root CMakeLists.txt via add_subdirectory(external/nanobind)
 
 # Create the Python module
 nanobind_add_module(
