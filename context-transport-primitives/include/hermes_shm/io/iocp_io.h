@@ -121,11 +121,10 @@ class IocpAsyncIO : public AsyncIO {
 
   bool Truncate(size_t size) override {
     if (file_handle_ == INVALID_HANDLE_VALUE) return false;
-    LARGE_INTEGER li;
-    li.QuadPart = static_cast<LONGLONG>(size);
-    if (!SetFilePointerEx(file_handle_, li, nullptr, FILE_BEGIN)) return false;
-    if (!SetEndOfFile(file_handle_)) return false;
-    return true;
+    FILE_END_OF_FILE_INFO eofi;
+    eofi.EndOfFile.QuadPart = static_cast<LONGLONG>(size);
+    return ::SetFileInformationByHandle(
+        file_handle_, FileEndOfFileInfo, &eofi, sizeof(eofi)) != 0;
   }
 
   IoToken Write(void *buffer, size_t size, off_t offset) override {

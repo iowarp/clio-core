@@ -4,7 +4,6 @@
   "description": "IOWarp Context Management Platform - AI-accelerated scientific workflow orchestration",
   "homepage": "https://www.iowarp.ai",
   "license": "BSD-3-Clause",
-  "supports": "!windows",
   "dependencies": [
     {
       "name": "vcpkg-cmake",

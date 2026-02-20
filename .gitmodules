@@ -26,7 +26,3 @@
 	path = docs
 	url = git@github.com:iowarp/docs.git
 	branch = iowarp-dev
-[submodule "installers/iowarp"]
-	path = installers/iowarp
-	url = https://github.com/iowarp/iowarp
-	branch = core
