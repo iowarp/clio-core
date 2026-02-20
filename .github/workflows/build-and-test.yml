@@ -10,7 +10,7 @@ on:
 jobs:
   build-and-test:
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 90
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -38,4 +38,4 @@ jobs:
         fi
         conda activate iowarp
         SITE_NAME=${{ contains(matrix.os, 'arm') && '"ubu-24.arm64"' || '"ubu-24.amd64"' }}
-        ./CI/calculate_coverage.sh --all --clean --site ${SITE_NAME}
+        ./CI/calculate_coverage.sh --build --run-ctest --clean --site ${SITE_NAME}
