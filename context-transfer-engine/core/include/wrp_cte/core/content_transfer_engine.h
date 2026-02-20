@@ -37,6 +37,17 @@
 #include "hermes_shm/util/singleton.h"
 #include <chimaera/chimaera.h>
 
+/** DLL import/export for wrp_cte_core_client shared library */
+#ifdef _MSC_VER
+  #ifdef wrp_cte_core_client_EXPORTS
+    #define CTE_DLL __declspec(dllexport)
+  #else
+    #define CTE_DLL __declspec(dllimport)
+  #endif
+#else
+  #define CTE_DLL
+#endif
+
 namespace wrp_cte::core {
 
 /**
@@ -114,7 +125,7 @@ private:
 }  // namespace wrp_cte::core
 
 // Global pointer variable declaration for ContentTransferEngine singleton (outside namespace)
-HSHM_DEFINE_GLOBAL_PTR_VAR_H(wrp_cte::core::ContentTransferEngine, g_cte_manager);
+HSHM_DEFINE_GLOBAL_PTR_VAR_H_DLL(CTE_DLL, wrp_cte::core::ContentTransferEngine, g_cte_manager);
 
 // Macro for accessing the ContentTransferEngine singleton using global pointer variable
 #define CTE_MANAGER (HSHM_GET_GLOBAL_PTR_VAR(wrp_cte::core::ContentTransferEngine, g_cte_manager))
