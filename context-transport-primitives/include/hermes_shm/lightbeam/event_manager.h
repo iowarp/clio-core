@@ -94,7 +94,7 @@ class EventManager {
              strerror(errno));
         return -1;
       }
-      it->second.action = action;
+      it->second.action_ = action;
       return it->second.event_id;
     }
     int event_id = next_event_id_++;
