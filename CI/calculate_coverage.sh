@@ -159,6 +159,13 @@ fi
 if [ "$DO_BUILD" = true ]; then
     print_header "Step 1: Building with Coverage Instrumentation"
 
+    # Ensure conda environment paths are visible to cmake/pkg-config
+    if [ -n "$CONDA_PREFIX" ]; then
+        export CMAKE_PREFIX_PATH="${CONDA_PREFIX}${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
+        export PKG_CONFIG_PATH="${CONDA_PREFIX}/lib/pkgconfig:${CONDA_PREFIX}/share/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+        print_info "Using conda prefix: $CONDA_PREFIX"
+    fi
+
     print_info "Configuring build with coverage enabled..."
     cmake --preset=debug \
         -DWRP_CORE_ENABLE_COVERAGE=ON \
