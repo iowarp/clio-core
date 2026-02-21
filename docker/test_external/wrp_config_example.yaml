@@ -9,7 +9,7 @@ memory:
 
 # Network configuration
 networking:
-  port: 5555
+  port: 9413
   neighborhood_size: 32
 
 # Logging configuration

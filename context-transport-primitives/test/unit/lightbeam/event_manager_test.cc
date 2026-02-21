@@ -41,7 +41,9 @@
 #include <iostream>
 #include <thread>
 #include <atomic>
+#ifndef _WIN32
 #include <unistd.h>
+#endif
 
 using namespace hshm::lbm;
 
@@ -70,6 +72,7 @@ class RecordAction : public EventAction {
   }
 };
 
+#ifndef _WIN32
 void TestConstruction() {
   std::cout << "\n==== Testing EventManager Construction ====\n";
 
@@ -90,7 +93,7 @@ void TestAddEventBasic() {
   int rc = pipe(pipefd);
   assert(rc == 0);
 
-  int event_id = em.AddEvent(pipefd[0], EPOLLIN);
+  int event_id = em.AddEvent(pipefd[0], kDefaultReadEvent);
   assert(event_id >= 0);
 
   // Write to pipe to trigger event
@@ -118,7 +121,7 @@ void TestAddEventWithAction() {
   int rc = pipe(pipefd);
   assert(rc == 0);
 
-  int event_id = em.AddEvent(pipefd[0], EPOLLIN, &action);
+  int event_id = em.AddEvent(pipefd[0], kDefaultReadEvent, &action);
   assert(event_id >= 0);
 
   // Write to trigger
@@ -131,7 +134,7 @@ void TestAddEventWithAction() {
   assert(action.call_count.load() == 1);
   assert(action.last_event.trigger_.fd_ == pipefd[0]);
   assert(action.last_event.trigger_.event_id_ == event_id);
-  assert((action.last_event.epoll_events_ & EPOLLIN) != 0);
+  assert((action.last_event.events_ & kDefaultReadEvent) != 0);
 
   close(pipefd[0]);
   close(pipefd[1]);
@@ -191,7 +194,7 @@ void TestWaitTimeout() {
   int rc = pipe(pipefd);
   assert(rc == 0);
 
-  em.AddEvent(pipefd[0], EPOLLIN);
+  em.AddEvent(pipefd[0], kDefaultReadEvent);
 
   // Don't write anything - should timeout
   auto start = std::chrono::steady_clock::now();
@@ -215,19 +218,19 @@ void TestMultipleEvents() {
 
   EventManager em;
 
-  int pipe1[2], pipe2[2], pipe3[2];
+  int pipe1[2] = {}, pipe2[2] = {}, pipe3[2] = {};
   assert(pipe(pipe1) == 0);
   assert(pipe(pipe2) == 0);
   assert(pipe(pipe3) == 0);
 
-  em.AddEvent(pipe1[0], EPOLLIN);
-  em.AddEvent(pipe2[0], EPOLLIN);
-  em.AddEvent(pipe3[0], EPOLLIN);
+  em.AddEvent(pipe1[0], kDefaultReadEvent);
+  em.AddEvent(pipe2[0], kDefaultReadEvent);
+  em.AddEvent(pipe3[0], kDefaultReadEvent);
 
   // Trigger 2 out of 3 pipes
   char buf = 'a';
-  write(pipe1[1], &buf, 1);
-  write(pipe3[1], &buf, 1);
+  (void)write(pipe1[1], &buf, 1);
+  (void)write(pipe3[1], &buf, 1);
 
   // Give a moment for epoll to see events
   std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -241,6 +244,7 @@ void TestMultipleEvents() {
 
   std::cout << "[EventManager Multiple Events] Test passed!\n";
 }
+#endif  // !_WIN32
 
 void TestSocketTransportWithEM() {
   std::cout << "\n==== Testing SocketTransport With EventManager ====\n";
@@ -365,6 +369,7 @@ void TestZmqTransportWithEM() {
 #endif
 
 int main() {
+#ifndef _WIN32
   TestConstruction();
   TestAddEventBasic();
   TestAddEventWithAction();
@@ -372,6 +377,7 @@ int main() {
   TestSignalEventWithAction();
   TestWaitTimeout();
   TestMultipleEvents();
+#endif
   TestSocketTransportWithEM();
 
 #ifdef HSHM_ENABLE_ZMQ

@@ -136,6 +136,21 @@ Interactive tools and interfaces for exploring scientific data contents and meta
 
 ## Installation
 
+### Cloning the Repository
+
+IOWarp Core uses git submodules for several dependencies. Always clone with `--recurse-submodules`:
+
+```bash
+git clone --recurse-submodules https://github.com/iowarp/iowarp-core.git
+cd iowarp-core
+```
+
+If you already cloned without submodules, initialize them with:
+
+```bash
+git submodule update --init --recursive
+```
+
 ### Native
 
 The following command will install conda, rattler-build, and iowarp in a single script.
@@ -180,7 +195,7 @@ memory:
 
 # Network configuration
 networking:
-  port: 5555                              # ZeroMQ port
+  port: 9413                              # ZeroMQ port
   neighborhood_size: 32                   # Max nodes for range queries
 
 # Runtime configuration

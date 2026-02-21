@@ -34,7 +34,6 @@
 #ifndef HSHM_INCLUDE_MEMORY_BACKEND_POSIX_SHM_MMAP_H
 #define HSHM_INCLUDE_MEMORY_BACKEND_POSIX_SHM_MMAP_H
 
-#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -42,6 +41,9 @@
 #include <string>
 
 #include "hermes_shm/constants/macros.h"
+#ifndef _WIN32
+#include <fcntl.h>
+#endif
 #include "hermes_shm/introspect/system_info.h"
 #include "hermes_shm/util/errors.h"
 #include "hermes_shm/util/logging.h"
@@ -57,7 +59,7 @@ class PosixShmMmap : public MemoryBackend, public UrlMemoryBackend {
  public:
   /** Constructor */
   HSHM_CROSS_FUN
-  PosixShmMmap() {}
+  PosixShmMmap() : fd_{} {}
 
   /** Destructor */
   HSHM_CROSS_FUN

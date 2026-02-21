@@ -32,7 +32,7 @@ services:
       - NODE_IP=172.27.0.10
       - CHI_SERVER_CONF=/workspace/context-runtime/test/integration/recovery/wrp_conf.yaml
       - CONTAINER_HOSTFILE=/workspace/context-runtime/test/integration/recovery/hostfile
-      - CHIMAERA_WITH_RUNTIME=0
+      - CHI_WITH_RUNTIME=0
       - CHI_NUM_CONTAINERS=4
       - PATH=/workspace/build/bin:/usr/local/bin:/usr/bin:/bin
       - LD_LIBRARY_PATH=/workspace/build/bin:$LD_LIBRARY_PATH
@@ -63,7 +63,7 @@ services:
       - NODE_IP=172.27.0.11
       - CHI_SERVER_CONF=/workspace/context-runtime/test/integration/recovery/wrp_conf.yaml
       - CONTAINER_HOSTFILE=/workspace/context-runtime/test/integration/recovery/hostfile
-      - CHIMAERA_WITH_RUNTIME=0
+      - CHI_WITH_RUNTIME=0
       - CHI_NUM_CONTAINERS=4
       - PATH=/workspace/build/bin:/usr/local/bin:/usr/bin:/bin
       - LD_LIBRARY_PATH=/workspace/build/bin:$LD_LIBRARY_PATH
@@ -91,7 +91,7 @@ services:
       - NODE_IP=172.27.0.12
       - CHI_SERVER_CONF=/workspace/context-runtime/test/integration/recovery/wrp_conf.yaml
       - CONTAINER_HOSTFILE=/workspace/context-runtime/test/integration/recovery/hostfile
-      - CHIMAERA_WITH_RUNTIME=0
+      - CHI_WITH_RUNTIME=0
       - CHI_NUM_CONTAINERS=4
       - PATH=/workspace/build/bin:/usr/local/bin:/usr/bin:/bin
       - LD_LIBRARY_PATH=/workspace/build/bin:$LD_LIBRARY_PATH
@@ -119,7 +119,7 @@ services:
       - NODE_IP=172.27.0.13
       - CHI_SERVER_CONF=/workspace/context-runtime/test/integration/recovery/wrp_conf.yaml
       - CONTAINER_HOSTFILE=/workspace/context-runtime/test/integration/recovery/hostfile
-      - CHIMAERA_WITH_RUNTIME=0
+      - CHI_WITH_RUNTIME=0
       - CHI_NUM_CONTAINERS=4
       - PATH=/workspace/build/bin:/usr/local/bin:/usr/bin:/bin
       - LD_LIBRARY_PATH=/workspace/build/bin:$LD_LIBRARY_PATH

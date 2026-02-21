@@ -8,7 +8,7 @@ USER root
 RUN userdel -r ubuntu || true
 
 # The deps-nvidia image already includes (inherited from deps-cpu):
-# - All conda dependencies (boost, hdf5, yaml-cpp, zeromq, cereal, etc.)
+# - All apt + source-built dependencies (boost, hdf5, yaml-cpp, zeromq, cereal, etc.)
 # - Compression libraries (zlib, bzip2, lzo, zstd, lz4, xz, brotli, snappy, c-blosc2)
 # - Lossy compression (ZFP, SZ3, FPZIP, LibPressio)
 # - ADIOS2 with HDF5 and ZeroMQ support

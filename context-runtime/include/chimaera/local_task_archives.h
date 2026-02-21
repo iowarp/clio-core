@@ -171,7 +171,7 @@ public:
   HSHM_GPU_FUN explicit LocalSaveTaskArchive(LocalMsgType msg_type);  // Not implemented for GPU
 #endif
 
-#if defined(__CUDACC__) || defined(__HIP__)
+#if HSHM_IS_GPU_COMPILER
   /**
    * Constructor with message type and buffer (GPU - uses raw buffer)
    *
@@ -519,7 +519,7 @@ public:
   HSHM_GPU_FUN explicit LocalLoadTaskArchive(const std::vector<char> &data);  // Not implemented for GPU
 #endif
 
-#if defined(__CUDACC__) || defined(__HIP__)
+#if HSHM_IS_GPU_COMPILER
   /**
    * Constructor from raw buffer (GPU - uses raw buffer)
    *
@@ -675,7 +675,7 @@ public:
   template <typename T>
   void bulk(hipc::ShmPtr<T> &ptr, size_t size, uint32_t flags) {
     (void)flags;
-    uint8_t mode;
+    uint8_t mode = 0;
     deserializer_ >> mode;
     if (mode == 1) {
       // Inline data mode: allocate buffer and read data
@@ -690,8 +690,8 @@ public:
       ptr.alloc_id_ = buf.shm_.alloc_id_;
     } else {
       // Pointer mode: deserialize the ShmPtr value
-      size_t off;
-      u32 major, minor;
+      size_t off = 0;
+      u32 major = 0, minor = 0;
       deserializer_ >> off >> major >> minor;
       ptr.off_ = off;
       ptr.alloc_id_ = hipc::AllocatorId(major, minor);
@@ -709,7 +709,7 @@ public:
   template <typename T>
   void bulk(hipc::FullPtr<T> &ptr, size_t size, uint32_t flags) {
     (void)flags;
-    uint8_t mode;
+    uint8_t mode = 0;
     deserializer_ >> mode;
     if (mode == 1) {
       // Inline data mode: allocate buffer and read data
@@ -726,8 +726,8 @@ public:
       ptr.ptr_ = reinterpret_cast<T *>(buf.ptr_);
     } else {
       // Pointer mode: deserialize only the ShmPtr part
-      size_t off;
-      u32 major, minor;
+      size_t off = 0;
+      u32 major = 0, minor = 0;
       deserializer_ >> off >> major >> minor;
       ptr.shm_.off_ = off;
       ptr.shm_.alloc_id_ = hipc::AllocatorId(major, minor);

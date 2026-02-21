@@ -23,7 +23,7 @@ add_executable(test_cte_config_dpe
 )
 
 # Create single version of test_core_functionality that uses environment variable
-# CHIMAERA_WITH_RUNTIME to control whether runtime is initialized (default: yes)
+# CHI_WITH_RUNTIME to control whether runtime is initialized (default: yes)
 add_executable(test_core_functionality
     test_core_functionality.cc
 )

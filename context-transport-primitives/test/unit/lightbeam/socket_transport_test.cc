@@ -273,7 +273,11 @@ void TestMetadataOnly() {
 int main() {
   TestBasicTcpTransfer();
   TestMultipleBulks();
+#ifndef _WIN32
   TestUnixDomainSocket();
+#else
+  std::cout << "\n[Skipped] Unix Domain Socket (not supported on Windows)\n";
+#endif
   TestMetadataOnly();
   std::cout << "\nAll socket transport tests passed!" << std::endl;
   return 0;

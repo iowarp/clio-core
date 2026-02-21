@@ -105,13 +105,13 @@ This makes it easier to spot issues in distributed test runs while still seeing 
 
 ### Runtime Initialization Control
 
-The `test_core_functionality` executable uses the `CHIMAERA_WITH_RUNTIME` environment variable to control whether the Chimaera runtime should be initialized:
+The `test_core_functionality` executable uses the `CHI_WITH_RUNTIME` environment variable to control whether the Chimaera runtime should be initialized:
 
 - **Default (unset)**: Runtime is initialized by the test executable (standalone mode)
-- **CHIMAERA_WITH_RUNTIME=0**: Runtime initialization is skipped (distributed mode)
-- **CHIMAERA_WITH_RUNTIME=1**: Runtime is initialized by the test executable (same as default)
+- **CHI_WITH_RUNTIME=0**: Runtime initialization is skipped (distributed mode)
+- **CHI_WITH_RUNTIME=1**: Runtime is initialized by the test executable (same as default)
 
-In distributed tests, the runtime is already initialized by `chimaera runtime start` before tests run, so `CHIMAERA_WITH_RUNTIME=0` is set in the docker-compose.yaml configuration.
+In distributed tests, the runtime is already initialized by `chimaera runtime start` before tests run, so `CHI_WITH_RUNTIME=0` is set in the docker-compose.yaml configuration.
 
 For local standalone testing:
 ```bash
@@ -119,7 +119,7 @@ For local standalone testing:
 ./test_core_functionality
 
 # Distributed mode (runtime must be initialized externally)
-export CHIMAERA_WITH_RUNTIME=0
+export CHI_WITH_RUNTIME=0
 ./test_core_functionality
 ```
 

@@ -21,7 +21,7 @@ pkgs:
     process_reaper_workers: 1
     main_segment_size: "auto"
     client_data_segment_size: "512M"
-    port: 5555
+    port: 9413
     log_level: "info"
     queue_depth: 1024
     local_sched: "default"

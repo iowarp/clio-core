@@ -34,6 +34,8 @@
 #ifndef HSHM_SHM_AFFINITY_H
 #define HSHM_SHM_AFFINITY_H
 
+#ifndef _WIN32
+
 // Reference:
 // https://stackoverflow.com/questions/63372288/getting-list-of-pids-from-proc-in-linux
 
@@ -188,5 +190,7 @@ class ProcessAffiner {
 };
 
 }  // namespace hshm
+
+#endif  // _WIN32
 
 #endif  // HSHM_SHM_AFFINITY_H

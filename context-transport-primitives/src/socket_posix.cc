@@ -31,12 +31,22 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
+#ifndef _WIN32
+
 #include "hermes_shm/lightbeam/posix_socket.h"
 
 #include <cerrno>
 #include <cstring>
 
 namespace hshm::lbm::sock {
+
+void InitSocketLib() {
+  // No-op on POSIX
+}
+
+void CleanupSocketLib() {
+  // No-op on POSIX
+}
 
 void Close(socket_t fd) {
   if (fd != kInvalidSocket) {
@@ -46,6 +56,10 @@ void Close(socket_t fd) {
 
 int GetError() {
   return errno;
+}
+
+std::string GetErrorString() {
+  return std::string(strerror(errno));
 }
 
 void SetNonBlocking(socket_t fd, bool enable) {
@@ -75,27 +89,32 @@ void SetRecvBuf(socket_t fd, int size) {
   ::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &size, sizeof(size));
 }
 
-ssize_t SendV(socket_t fd, const struct iovec* iov, int count) {
+void UnlinkPath(const char* path) {
+  ::unlink(path);
+}
+
+ssize_t SendV(socket_t fd, const IoBuffer* iov, int count) {
   ssize_t total = 0;
-  // Compute total expected bytes
   for (int i = 0; i < count; ++i) {
-    total += static_cast<ssize_t>(iov[i].iov_len);
+    total += static_cast<ssize_t>(iov[i].len);
   }
 
-  // Use writev for scatter-gather (single syscall, no copies)
-  ssize_t sent = 0;
-  int iov_idx = 0;
-  // We need a mutable copy because we may need to adjust after partial writes
+  // Convert IoBuffer to iovec for writev
   struct iovec local_iov[64];
   int local_count = count < 64 ? count : 64;
-  std::memcpy(local_iov, iov, local_count * sizeof(struct iovec));
+  for (int i = 0; i < local_count; ++i) {
+    local_iov[i].iov_base = iov[i].base;
+    local_iov[i].iov_len = iov[i].len;
+  }
+
+  ssize_t sent = 0;
+  int iov_idx = 0;
 
   while (sent < total) {
     ssize_t n = ::writev(fd, local_iov + iov_idx, local_count - iov_idx);
     if (n < 0) {
       if (errno == EINTR) continue;
       if (errno == EAGAIN || errno == EWOULDBLOCK) {
-        // Non-blocking socket: poll for writability and retry
         struct pollfd pfd;
         pfd.fd = fd;
         pfd.events = POLLOUT;
@@ -107,12 +126,10 @@ ssize_t SendV(socket_t fd, const struct iovec* iov, int count) {
       return -1;
     }
     sent += n;
-    // Advance iov past fully-sent entries
     while (iov_idx < local_count && n >= static_cast<ssize_t>(local_iov[iov_idx].iov_len)) {
       n -= static_cast<ssize_t>(local_iov[iov_idx].iov_len);
       iov_idx++;
     }
-    // Adjust partially-sent entry
     if (iov_idx < local_count && n > 0) {
       local_iov[iov_idx].iov_base =
           static_cast<char*>(local_iov[iov_idx].iov_base) + n;
@@ -130,14 +147,12 @@ int RecvExact(socket_t fd, char* buf, size_t len) {
       if (errno == EINTR) continue;
       if (errno == EAGAIN || errno == EWOULDBLOCK) {
         if (received == 0) return EAGAIN;
-        // Partial read — wait for rest
         if (PollRead(fd, 1000) <= 0) return -1;
         continue;
       }
       return -1;
     }
     if (n == 0) {
-      // Connection closed
       return -1;
     }
     received += static_cast<size_t>(n);
@@ -172,3 +187,5 @@ int PollReadMulti(const socket_t* fds, int count, int timeout_ms) {
 }
 
 }  // namespace hshm::lbm::sock
+
+#endif  // !_WIN32

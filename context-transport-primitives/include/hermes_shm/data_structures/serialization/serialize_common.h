@@ -154,7 +154,7 @@ HSHM_CROSS_FUN void save_string(Ar &ar, const StringT &text) {
 /** Deserialize a generic string. */
 template <typename Ar, typename StringT>
 HSHM_CROSS_FUN void load_string(Ar &ar, StringT &text) {
-  size_t size;
+  size_t size = 0;
   ar >> size;
   text.resize(size);
   read_binary(ar, text.data(), text.size());
@@ -175,7 +175,7 @@ HSHM_CROSS_FUN void save_vec(Ar &ar, const ContainerT &obj) {
 /** Deserialize a generic vector */
 template <typename Ar, typename ContainerT, typename T>
 HSHM_CROSS_FUN void load_vec(Ar &ar, ContainerT &obj) {
-  size_t size;
+  size_t size = 0;
   ar >> size;
   obj.resize(size);
   if constexpr (std::is_arithmetic_v<T>) {
@@ -198,7 +198,7 @@ HSHM_CROSS_FUN void save_list(Ar &ar, const ContainerT &obj) {
 /** Deserialize a generic list */
 template <typename Ar, typename ContainerT, typename T>
 HSHM_CROSS_FUN void load_list(Ar &ar, ContainerT &obj) {
-  size_t size;
+  size_t size = 0;
   ar >> size;
   for (size_t i = 0; i < size; ++i) {
     obj.emplace_back();
@@ -219,11 +219,11 @@ HSHM_CROSS_FUN void save_map(Ar &ar, const ContainerT &obj) {
 /** Deserialize a generic list */
 template <typename Ar, typename ContainerT, typename KeyT, typename T>
 HSHM_CROSS_FUN void load_map(Ar &ar, ContainerT &obj) {
-  size_t size;
+  size_t size = 0;
   ar >> size;
   for (size_t i = 0; i < size; ++i) {
-    KeyT key;
-    T val;
+    KeyT key{};
+    T val{};
     ar >> key;
     ar >> val;
     obj[key] = val;

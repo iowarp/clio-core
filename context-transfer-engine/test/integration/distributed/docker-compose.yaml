@@ -38,7 +38,7 @@ services:
       - TEST_FILTER=${TEST_FILTER:-}
       - SECTION_FILTER=${SECTION_FILTER:-}
       - CTE_NUM_NODES=4
-      - CHIMAERA_WITH_RUNTIME=0
+      - CHI_WITH_RUNTIME=0
       - PATH=/workspace/build/bin:/usr/local/bin:/usr/bin:/bin
       - LD_LIBRARY_PATH=/workspace/build/bin:$LD_LIBRARY_PATH
     mem_limit: 16g

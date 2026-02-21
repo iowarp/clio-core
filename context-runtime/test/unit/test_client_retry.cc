@@ -81,11 +81,11 @@ pid_t StartServerProcess() {
     // Become process group leader so we can kill all children
     setpgid(0, 0);
 
-    freopen("/dev/null", "w", stdout);
-    freopen("/tmp/chimaera_server_retry_test.log", "w", stderr);
+    (void)freopen("/dev/null", "w", stdout);
+    (void)freopen("/tmp/chimaera_server_retry_test.log", "w", stderr);
 
     // Use exec to get a clean process with no static guard state
-    setenv("CHIMAERA_WITH_RUNTIME", "1", 1);
+    setenv("CHI_WITH_RUNTIME", "1", 1);
     setenv("CHI_RETRY_TEST_SERVER_MODE", "1", 1);
     execl("/proc/self/exe", "chimaera_client_retry_tests",
           "--server-mode", nullptr);
@@ -133,9 +133,9 @@ void KillServerHard(pid_t server_pid) {
   // Clean up shared memory and sockets
   CleanupSharedMemory();
   // Remove unix domain socket
-  unlink("/tmp/chimaera_5555.ipc");
+  unlink("/tmp/chimaera_9413.ipc");
   // Remove any /dev/shm artifacts
-  system("rm -f /dev/shm/chimaera_* 2>/dev/null");
+  (void)system("rm -f /dev/shm/chimaera_* 2>/dev/null");
 
   // Brief pause to let OS reclaim ports
   std::this_thread::sleep_for(std::chrono::milliseconds(1000));
@@ -150,8 +150,8 @@ void CleanupServer(pid_t server_pid) {
     int status;
     waitpid(server_pid, &status, 0);
     CleanupSharedMemory();
-    unlink("/tmp/chimaera_5555.ipc");
-    system("rm -f /dev/shm/chimaera_* 2>/dev/null");
+    unlink("/tmp/chimaera_9413.ipc");
+    (void)system("rm -f /dev/shm/chimaera_* 2>/dev/null");
   }
 }
 
@@ -170,7 +170,7 @@ void TestServerRestart(const std::string &mode) {
 
   // 2. Client connects
   setenv("CHI_IPC_MODE", mode.c_str(), 1);
-  setenv("CHIMAERA_WITH_RUNTIME", "0", 1);
+  setenv("CHI_WITH_RUNTIME", "0", 1);
   bool success = CHIMAERA_INIT(ChimaeraMode::kClient, false);
   REQUIRE(success);
   REQUIRE(CHI_IPC != nullptr);
@@ -240,7 +240,7 @@ void TestClientDeath(const std::string &mode) {
   if (client_child == 0) {
     // Child process: connect as client, submit task, exit immediately
     setenv("CHI_IPC_MODE", mode.c_str(), 1);
-    setenv("CHIMAERA_WITH_RUNTIME", "0", 1);
+    setenv("CHI_WITH_RUNTIME", "0", 1);
     bool success = CHIMAERA_INIT(ChimaeraMode::kClient, false);
     if (!success) {
       _exit(1);
@@ -272,7 +272,7 @@ void TestClientDeath(const std::string &mode) {
   // 4. Parent connects as a new client (CHIMAERA_INIT static guard is clean
   //    because the child called it in a forked process)
   setenv("CHI_IPC_MODE", mode.c_str(), 1);
-  setenv("CHIMAERA_WITH_RUNTIME", "0", 1);
+  setenv("CHI_WITH_RUNTIME", "0", 1);
   bool success = CHIMAERA_INIT(ChimaeraMode::kClient, false);
   REQUIRE(success);
   REQUIRE(CHI_IPC != nullptr);

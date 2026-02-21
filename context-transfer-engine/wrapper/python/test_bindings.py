@@ -21,7 +21,7 @@ Usage:
     python3 test_bindings.py
 
     # Run without runtime initialization
-    CHIMAERA_WITH_RUNTIME=0 python3 test_bindings.py
+    CHI_WITH_RUNTIME=0 python3 test_bindings.py
 
 Example Usage in Your Code:
 ---------------------------
@@ -47,7 +47,7 @@ Example Usage in Your Code:
 
 Environment Variables:
 ---------------------
-    CHIMAERA_WITH_RUNTIME: Set to "0" or "false" to skip runtime initialization
+    CHI_WITH_RUNTIME: Set to "0" or "false" to skip runtime initialization
     CHI_SERVER_CONF: Path to Chimaera server configuration file
     CHI_REPO_PATH: Path to ChiMod repository (for finding shared libraries)
     LD_LIBRARY_PATH: Library path for runtime dependencies
@@ -72,12 +72,12 @@ _initialization_attempted = False
 def should_initialize_runtime():
     """Check if runtime should be initialized
 
-    Reads CHIMAERA_WITH_RUNTIME environment variable:
+    Reads CHI_WITH_RUNTIME environment variable:
     - Not set or "1"/"true"/"yes"/"on": Initialize runtime (default: true)
     - "0"/"false"/"no"/"off": Skip initialization (runtime already initialized externally)
     """
     # Check unified flag
-    env_val = os.getenv("CHIMAERA_WITH_RUNTIME")
+    env_val = os.getenv("CHI_WITH_RUNTIME")
     if env_val is None:
         return True  # Default: initialize runtime
 
@@ -890,7 +890,7 @@ def main():
     # Runtime initialization happens at the very beginning if enabled
     runtime_ok = False
     if should_initialize_runtime():
-        print("📋 Initializing Runtime (CHIMAERA_WITH_RUNTIME enabled)...")
+        print("📋 Initializing Runtime (CHI_WITH_RUNTIME enabled)...")
         print("   Note: Runtime initialization happens FIRST before any client code")
 
         # Import module first (needed for runtime init)
@@ -910,9 +910,9 @@ def main():
         runtime_ok = initialize_runtime_early(cte)
         print()
     else:
-        cte_flag = os.getenv("CHIMAERA_WITH_RUNTIME")
+        cte_flag = os.getenv("CHI_WITH_RUNTIME")
         if cte_flag:
-            print(f"📋 Skipping Runtime Initialization (CHIMAERA_WITH_RUNTIME={cte_flag})")
+            print(f"📋 Skipping Runtime Initialization (CHI_WITH_RUNTIME={cte_flag})")
         else:
             print("📋 Skipping Runtime Initialization")
         print("   Runtime should already be initialized externally")

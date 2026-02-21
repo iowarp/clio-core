@@ -118,6 +118,9 @@ MANIFEST
 /src/nanobind/ext
 /src/nanobind/src
 
+# CTest temporary output
+Testing/Temporary/
+
 # Test files
 tests/main.cpp
 

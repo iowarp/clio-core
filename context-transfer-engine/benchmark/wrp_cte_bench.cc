@@ -495,7 +495,7 @@ int main(int argc, char **argv) {
     HLOG(kError, "");
     HLOG(kError, "Environment variables:");
     HLOG(kError,
-         "  CHIMAERA_WITH_RUNTIME: Set to '1', 'true', 'yes', or 'on' to "
+         "  CHI_WITH_RUNTIME: Set to '1', 'true', 'yes', or 'on' to "
          "initialize runtime");
     HLOG(kError, "                         Default: assumes runtime already initialized");
     return 1;

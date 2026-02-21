@@ -158,6 +158,39 @@
                 "HSHM_LOG_LEVEL": "1",
                 "WRP_CORE_ENABLE_IO_URING": "ON"
             }
+        },
+        {
+            "name": "windows-pip",
+            "hidden": false,
+            "generator": "Visual Studio 17 2022",
+            "architecture": {
+                "value": "x64",
+                "strategy": "set"
+            },
+            "binaryDir": "${sourceDir}/build",
+            "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "WRP_CORE_ENABLE_RUNTIME": "OFF",
+                "WRP_CORE_ENABLE_CTE": "OFF",
+                "WRP_CORE_ENABLE_CAE": "OFF",
+                "WRP_CORE_ENABLE_CEE": "OFF",
+                "WRP_CORE_ENABLE_TESTS": "OFF",
+                "WRP_CORE_ENABLE_PYTHON": "OFF",
+                "WRP_CORE_ENABLE_ZMQ": "ON",
+                "WRP_CORE_ENABLE_CEREAL": "ON",
+                "WRP_CORE_ENABLE_CONDA": "OFF",
+                "WRP_CORE_ENABLE_ELF": "OFF",
+                "WRP_CORE_ENABLE_RPATH": "OFF",
+                "WRP_CORE_ENABLE_HDF5": "OFF",
+                "WRP_CORE_ENABLE_BENCHMARKS": "OFF",
+                "HSHM_LOG_LEVEL": "1"
+            },
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Windows"
+            }
         }
     ]
 }

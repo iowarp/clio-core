@@ -20,7 +20,7 @@ services:
         #    - ./wrp_conf.yaml:/etc/iowarp/wrp_conf.yaml:ro
 
         # Note: ports section not needed with network_mode: host
-        # The container uses the host's network directly, so ports 5555 and 5556
+        # The container uses the host's network directly, so ports 9413 and 9414
         # are automatically accessible from the host
 
         # Resource limits

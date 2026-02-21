@@ -17,7 +17,7 @@ services:
     environment:
       - CHI_SERVER_CONF=/etc/iowarp/chimaera.yaml
     ports:
-      - "5555:5555"
+      - "9413:9413"
     mem_limit: 8g
     command: ["chimaera", "runtime", "start"]
     restart: unless-stopped

@@ -56,7 +56,7 @@ std::string CreateComposeConfig() {
     config_file << "  num_threads: 4\n";
     config_file << "\n";
     config_file << "networking:\n";
-    config_file << "  port: 5555\n";
+    config_file << "  port: 9413\n";
     config_file << "\n";
     config_file << "compose:\n";
     config_file << "- mod_name: chimaera_bdev\n";

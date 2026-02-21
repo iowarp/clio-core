@@ -53,8 +53,10 @@
  * - Follow Google C++ style guide
  */
 
+ #ifndef _WIN32
  #include <sys/stat.h>
  #include <unistd.h>
+ #endif
 
  #include <cstdlib>
  #include <filesystem>

@@ -70,7 +70,7 @@ int main(int argc, char* argv[]) {
     std::string url;
     
     if (protocol == "zmq" || protocol == "tcp") {
-        url = "tcp://" + ip_address + ":5555";
+        url = "tcp://" + ip_address + ":9413";
     } else if (protocol == "thallium") {
         url = "tcp://" + ip_address + ":5557";
     } else {

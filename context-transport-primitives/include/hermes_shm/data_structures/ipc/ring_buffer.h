@@ -34,7 +34,11 @@
 #ifndef HSHM_DATA_STRUCTURES_IPC_RING_BUFFER_H_
 #define HSHM_DATA_STRUCTURES_IPC_RING_BUFFER_H_
 
+#ifdef _WIN32
+using pid_t = int;
+#else
 #include <sys/types.h>
+#endif
 
 #include "hermes_shm/constants/macros.h"
 #include "hermes_shm/data_structures/ipc/shm_container.h"

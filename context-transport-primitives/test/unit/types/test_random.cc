@@ -36,7 +36,9 @@
 //
 #include <hermes_shm/util/logging.h>
 #include <hermes_shm/util/random.h>
+#ifndef _WIN32
 #include <unistd.h>
+#endif
 
 #include "basic_test.h"
 

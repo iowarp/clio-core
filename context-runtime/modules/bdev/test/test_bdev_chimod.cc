@@ -39,8 +39,10 @@
  * Uses simple custom test framework for testing.
  */
 
+#ifndef _WIN32
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 #include <chrono>
 #include <fstream>

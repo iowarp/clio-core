@@ -26,7 +26,7 @@ pkgs:
     client_data_segment_size: "256M"
 
     # Networking configuration
-    port: 5555
+    port: 9413
 
     # Logging - use debug for detailed networking logs
     log_level: "debug"

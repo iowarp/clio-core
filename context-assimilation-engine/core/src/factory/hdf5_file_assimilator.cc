@@ -33,8 +33,10 @@
 
 #include <chimaera/chimaera.h>
 #include <chimaera/ipc_manager.h>
+#ifndef _WIN32
 #include <fnmatch.h>
 #include <sys/stat.h>
+#endif
 #include <wrp_cae/core/constants.h>  // For kCaePoolId
 #include <wrp_cae/core/core_client.h>
 #include <wrp_cae/core/core_tasks.h>

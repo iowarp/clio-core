@@ -41,9 +41,11 @@
 
 #include "../simple_test.h"
 
+#ifndef _WIN32
 #include <fcntl.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#endif
 
 #include <chrono>
 #include <cstdlib>
@@ -64,11 +66,11 @@ pid_t StartServerProcess() {
   if (server_pid == 0) {
     // Redirect child's stdout/stderr to /dev/null to prevent massive
     // worker log output from flooding shared pipes and blocking parent
-    freopen("/dev/null", "w", stdout);
-    freopen("/dev/null", "w", stderr);
+    (void)freopen("/dev/null", "w", stdout);
+    (void)freopen("/dev/null", "w", stderr);
 
     // Child process: Start runtime server
-    setenv("CHIMAERA_WITH_RUNTIME", "1", 1);
+    setenv("CHI_WITH_RUNTIME", "1", 1);
     bool success = CHIMAERA_INIT(ChimaeraMode::kServer, true);
     if (!success) {
       _exit(1);
@@ -142,7 +144,7 @@ TEST_CASE("ExternalClient - Basic Connection", "[external_client][ipc]") {
   REQUIRE(server_ready);
 
   // Now connect as EXTERNAL CLIENT (not integrated server+client)
-  setenv("CHIMAERA_WITH_RUNTIME", "0", 1);  // Force client-only mode
+  setenv("CHI_WITH_RUNTIME", "0", 1);  // Force client-only mode
   bool success = CHIMAERA_INIT(ChimaeraMode::kClient, false);
   REQUIRE(success);
 
@@ -186,11 +188,11 @@ TEST_CASE("ExternalClient - Multiple Clients", "[external_client][ipc]") {
     client_pids[i] = fork();
     if (client_pids[i] == 0) {
       // Suppress child output to prevent log flood
-      freopen("/dev/null", "w", stdout);
-      freopen("/dev/null", "w", stderr);
+      (void)freopen("/dev/null", "w", stdout);
+      (void)freopen("/dev/null", "w", stderr);
 
       // Child process: Connect as client
-      setenv("CHIMAERA_WITH_RUNTIME", "0", 1);
+      setenv("CHI_WITH_RUNTIME", "0", 1);
       bool success = CHIMAERA_INIT(ChimaeraMode::kClient, false);
       if (!success) {
         _exit(1);
@@ -234,7 +236,7 @@ TEST_CASE("ExternalClient - Connection Without Server",
   std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
   // Try to connect as client when NO server exists
-  setenv("CHIMAERA_WITH_RUNTIME", "0", 1);
+  setenv("CHI_WITH_RUNTIME", "0", 1);
 
   // This should fail gracefully (not crash)
   // Note: May succeed if a stale server from another test is still running
@@ -252,7 +254,7 @@ TEST_CASE("ExternalClient - Client Operations", "[external_client][ipc]") {
   REQUIRE(server_ready);
 
   // Connect as client
-  setenv("CHIMAERA_WITH_RUNTIME", "0", 1);
+  setenv("CHI_WITH_RUNTIME", "0", 1);
   bool success = CHIMAERA_INIT(ChimaeraMode::kClient, false);
   REQUIRE(success);
 

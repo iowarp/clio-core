@@ -22,7 +22,7 @@ Example-driven test suite demonstrating MCP (Model Context Protocol) integration
 python3 test_bindings.py
 
 # Run without runtime initialization (external runtime)
-CHIMAERA_WITH_RUNTIME=0 python3 test_bindings.py
+CHI_WITH_RUNTIME=0 python3 test_bindings.py
 ```
 
 ### 2. `test_cte_telemetry.py`
@@ -38,7 +38,7 @@ Focused unit test suite for telemetry functionality.
 **Usage with pytest**:
 ```bash
 # Set environment variables
-export CHIMAERA_WITH_RUNTIME=1
+export CHI_WITH_RUNTIME=1
 export WRP_RUNTIME_CONF=/path/to/cte_config.yaml
 
 # Run all tests
@@ -53,7 +53,7 @@ pytest test_cte_telemetry.py -v -s
 
 **Usage as standalone script**:
 ```bash
-CHIMAERA_WITH_RUNTIME=1 WRP_RUNTIME_CONF=/path/to/cte_config.yaml python3 test_cte_telemetry.py
+CHI_WITH_RUNTIME=1 WRP_RUNTIME_CONF=/path/to/cte_config.yaml python3 test_cte_telemetry.py
 ```
 
 ## PollTelemetryLog Test Details
@@ -106,7 +106,7 @@ for entry in entries:
 
 ### Required for Runtime Initialization
 
-- `CHIMAERA_WITH_RUNTIME`: Set to `1` to enable runtime initialization (default: `1`)
+- `CHI_WITH_RUNTIME`: Set to `1` to enable runtime initialization (default: `1`)
 - `WRP_RUNTIME_CONF`: Path to CTE configuration YAML file
 
 ### Optional
@@ -241,7 +241,7 @@ To integrate these tests in CI/CD:
 # Example GitHub Actions workflow step
 - name: Run CTE Python Tests
   env:
-    CHIMAERA_WITH_RUNTIME: 1
+    CHI_WITH_RUNTIME: 1
     WRP_RUNTIME_CONF: /path/to/test_config.yaml
     LD_LIBRARY_PATH: ${{ github.workspace }}/build/bin
     PYTHONPATH: ${{ github.workspace }}/build/bin

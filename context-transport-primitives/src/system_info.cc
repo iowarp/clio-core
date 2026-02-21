@@ -36,12 +36,13 @@
 
 #include "hermes_shm/introspect/system_info.h"
 
-#include <dlfcn.h>
-
 #include <cstdlib>
+#include <filesystem>
 
 #include "hermes_shm/constants/macros.h"
 #if HSHM_ENABLE_PROCFS_SYSINFO
+#include <dlfcn.h>
+#include <signal.h>
 // LINUX
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -538,6 +539,67 @@ void *SystemInfo::AlignedAlloc(size_t alignment, size_t size) {
 #endif
 }
 
+bool SystemInfo::IsProcessAlive(int pid) {
+#if HSHM_ENABLE_PROCFS_SYSINFO
+  return kill(pid, 0) != -1 || errno != ESRCH;
+#elif HSHM_ENABLE_WINDOWS_SYSINFO
+  HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE,
+                         static_cast<DWORD>(pid));
+  if (h == NULL) return false;
+  CloseHandle(h);
+  return true;
+#endif
+}
+
+std::string SystemInfo::GetModuleDirectory() {
+#if HSHM_ENABLE_PROCFS_SYSINFO
+  Dl_info dl_info;
+  void *addr = reinterpret_cast<void *>(&SystemInfo::GetModuleDirectory);
+  if (dladdr(addr, &dl_info) == 0) return "";
+  char resolved[PATH_MAX];
+  if (realpath(dl_info.dli_fname, resolved) == nullptr) return "";
+  return std::filesystem::path(resolved).parent_path().string();
+#elif HSHM_ENABLE_WINDOWS_SYSINFO
+  HMODULE hModule = nullptr;
+  if (!GetModuleHandleExA(
+          GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+              GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+          reinterpret_cast<LPCSTR>(&SystemInfo::GetModuleDirectory),
+          &hModule)) {
+    return "";
+  }
+  char path[MAX_PATH];
+  if (GetModuleFileNameA(hModule, path, MAX_PATH) == 0) return "";
+  return std::filesystem::path(path).parent_path().string();
+#endif
+}
+
+std::string SystemInfo::GetLibrarySearchPathVar() {
+#if HSHM_ENABLE_PROCFS_SYSINFO
+  return "LD_LIBRARY_PATH";
+#elif HSHM_ENABLE_WINDOWS_SYSINFO
+  return "PATH";
+#endif
+}
+
+char SystemInfo::GetPathListSeparator() {
+#if HSHM_ENABLE_PROCFS_SYSINFO
+  return ':';
+#elif HSHM_ENABLE_WINDOWS_SYSINFO
+  return ';';
+#endif
+}
+
+std::string SystemInfo::GetSharedLibExtension() {
+#if HSHM_ENABLE_WINDOWS_SYSINFO
+  return ".dll";
+#elif __APPLE__
+  return ".dylib";
+#else
+  return ".so";
+#endif
+}
+
 std::string SystemInfo::Getenv(const char *name, size_t max_size) {
 #if HSHM_ENABLE_PROCFS_SYSINFO
   char *var = getenv(name);
@@ -548,7 +610,12 @@ std::string SystemInfo::Getenv(const char *name, size_t max_size) {
 #elif HSHM_ENABLE_WINDOWS_SYSINFO
   std::string var;
   var.resize(max_size);
-  GetEnvironmentVariable(name, var.data(), var.size());
+  DWORD len = GetEnvironmentVariable(name, var.data(),
+                                     static_cast<DWORD>(var.size()));
+  if (len == 0) {
+    return "";
+  }
+  var.resize(len);
   return var;
 #endif
   std::cout << "undefined" << std::endl;

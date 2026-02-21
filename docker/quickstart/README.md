@@ -29,7 +29,7 @@ Edit `chimaera.yaml` to customize the runtime. Key settings:
 
 | Section | What it controls |
 |---------|-----------------|
-| `networking.port` | RPC listener port (default 5555) |
+| `networking.port` | RPC listener port (default 9413) |
 | `runtime.num_threads` | Worker threads (default 4) |
 | `compose` | Modules loaded at startup |
 

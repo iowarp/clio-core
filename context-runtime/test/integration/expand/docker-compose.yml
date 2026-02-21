@@ -23,7 +23,7 @@ services:
       - NODE_IP=172.28.0.10
       - CHI_SERVER_CONF=/workspace/context-runtime/test/integration/expand/wrp_conf.yaml
       - CONTAINER_HOSTFILE=/workspace/context-runtime/test/integration/expand/hostfile_initial
-      - CHIMAERA_WITH_RUNTIME=0
+      - CHI_WITH_RUNTIME=0
       - PATH=/workspace/build/bin:/usr/local/bin:/usr/bin:/bin
       - LD_LIBRARY_PATH=/workspace/build/bin:$LD_LIBRARY_PATH
     mem_limit: 16g
@@ -53,7 +53,7 @@ services:
       - NODE_IP=172.28.0.11
       - CHI_SERVER_CONF=/workspace/context-runtime/test/integration/expand/wrp_conf.yaml
       - CONTAINER_HOSTFILE=/workspace/context-runtime/test/integration/expand/hostfile_initial
-      - CHIMAERA_WITH_RUNTIME=0
+      - CHI_WITH_RUNTIME=0
       - PATH=/workspace/build/bin:/usr/local/bin:/usr/bin:/bin
       - LD_LIBRARY_PATH=/workspace/build/bin:$LD_LIBRARY_PATH
     mem_limit: 16g
@@ -83,7 +83,7 @@ services:
       - NODE_IP=172.28.0.12
       - CHI_SERVER_CONF=/workspace/context-runtime/test/integration/expand/wrp_conf.yaml
       - CONTAINER_HOSTFILE=/workspace/context-runtime/test/integration/expand/hostfile_full
-      - CHIMAERA_WITH_RUNTIME=0
+      - CHI_WITH_RUNTIME=0
       - PATH=/workspace/build/bin:/usr/local/bin:/usr/bin:/bin
       - LD_LIBRARY_PATH=/workspace/build/bin:$LD_LIBRARY_PATH
     mem_limit: 16g

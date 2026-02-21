@@ -66,6 +66,18 @@ bool ConfigManager::ClientInit() {
     }
   }
 
+  // Check CHI_PORT env var (overrides YAML and default)
+  std::string port_env = hshm::SystemInfo::Getenv("CHI_PORT");
+  if (!port_env.empty()) {
+    port_ = std::stoul(port_env);
+  }
+
+  // Check CHI_SERVER_ADDR env var (overrides default 127.0.0.1)
+  std::string addr_env = hshm::SystemInfo::Getenv("CHI_SERVER_ADDR");
+  if (!addr_env.empty()) {
+    server_addr_ = addr_env;
+  }
+
   is_initialized_ = true;
   return true;
 }
@@ -121,6 +133,8 @@ size_t ConfigManager::GetMemorySegmentSize(MemorySegment segment) const {
 
 u32 ConfigManager::GetPort() const { return port_; }
 
+std::string ConfigManager::GetServerAddr() const { return server_addr_; }
+
 u32 ConfigManager::GetNeighborhoodSize() const { return neighborhood_size_; }
 
 std::string
@@ -161,7 +175,7 @@ void ConfigManager::LoadDefault() {
   main_segment_size_ = 0;                         // 0 means auto-calculate
   client_data_segment_size_ = 512 * 1024 * 1024;  // 512MB
 
-  port_ = 5555;
+  port_ = 9413;
   neighborhood_size_ = 32;
 
   // Set default shared memory segment names with environment variables

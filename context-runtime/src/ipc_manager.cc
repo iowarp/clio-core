@@ -37,6 +37,7 @@
 
 #include "chimaera/ipc_manager.h"
 
+#ifndef _WIN32
 #include <arpa/inet.h>
 #include <dirent.h>
 #include <endian.h>
@@ -48,6 +49,7 @@
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <unistd.h>
+#endif
 #include <zmq.h>
 #include <hermes_shm/lightbeam/transport_factory_impl.h>
 
@@ -130,7 +132,7 @@ bool IpcManager::ClientInit() {
       // TCP mode: ZMQ DEALER transport
       try {
         zmq_transport_ = hshm::lbm::TransportFactory::Get(
-            "127.0.0.1", hshm::lbm::TransportType::kZeroMq,
+            config->GetServerAddr(), hshm::lbm::TransportType::kZeroMq,
             hshm::lbm::TransportMode::kClient, "tcp", port + 3);
         HLOG(kInfo, "IpcManager: DEALER transport connected to port {}",
              port + 3);
@@ -733,7 +735,7 @@ bool IpcManager::LoadHostfile() {
   if (hostfile_path.empty()) {
     // No hostfile configured - assume localhost as node 0
     HLOG(kDebug, "No hostfile configured, using localhost as node 0");
-    Host host("127.0.0.1", 0);
+    Host host(config->GetServerAddr(), 0);
     hostfile_map_[0] = host;
     return true;
   }

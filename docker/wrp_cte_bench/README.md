@@ -32,7 +32,7 @@ docker-compose down
 │  wrp-cte-bench      │  Benchmark client
 │  (connects to       │  - Runs test workloads
 │   runtime via       │  - Reports performance
-│   ZeroMQ port 5555) │
+│   ZeroMQ port 9413) │
 └──────────┬──────────┘
            │
            │ ZeroMQ
@@ -78,7 +78,7 @@ All benchmark parameters can be configured via environment variables:
 | `DEPTH` | Queue depth (concurrent operations) | `4` | 4, 8, 16, 32 |
 | `IO_SIZE` | Size of each I/O operation | `1m` | 4k, 1m, 16m |
 | `IO_COUNT` | Number of operations to perform | `100` | 100, 1000, 100000 |
-| `CHIMAERA_WITH_RUNTIME` | Initialize CTE runtime in benchmark | `0` | 0 (runtime service), 1 (self-init) |
+| `CHI_WITH_RUNTIME` | Initialize CTE runtime in benchmark | `0` | 0 (runtime service), 1 (self-init) |
 | `CHI_SERVER_CONF` | Path to CTE configuration file | `/etc/iowarp/cte_config.yaml` | Custom path |
 
 ### I/O Size Format
@@ -180,7 +180,7 @@ TEST_CASE=PutGet NUM_PROCS=4 DEPTH=4 docker-compose up wrp-cte-bench
 
 The default configuration allocates:
 - **Memory limit**: 8GB
-- **ZeroMQ port**: 5555 (for runtime-client communication)
+- **ZeroMQ port**: 9413 (for runtime-client communication)
 
 ### Adjusting Resources
 
@@ -241,9 +241,9 @@ docker-compose ps iowarp-runtime
 
 ### Runtime Service Won't Start
 
-1. Check if port 5555 is available:
+1. Check if port 9413 is available:
    ```bash
-   netstat -an | grep 5555
+   netstat -an | grep 9413
    ```
 
 2. Check runtime logs:
@@ -270,7 +270,7 @@ docker-compose ps iowarp-runtime
 
 3. Verify runtime is listening:
    ```bash
-   docker-compose exec iowarp-runtime netstat -an | grep 5555
+   docker-compose exec iowarp-runtime netstat -an | grep 9413
    ```
 
 ### Out of Memory Errors
@@ -372,6 +372,6 @@ storage:
 - Runtime service must be healthy before benchmarks can run
 - IOWarp uses memfd_create() for shared memory (no /dev/shm dependency)
 - All data is RAM-based by default (no persistence)
-- ZeroMQ port 5555 used for client-runtime communication
+- ZeroMQ port 9413 used for client-runtime communication
 - Container network sharing allows benchmark to access runtime
 - Benchmark containers auto-remove after completion (restart: "no")

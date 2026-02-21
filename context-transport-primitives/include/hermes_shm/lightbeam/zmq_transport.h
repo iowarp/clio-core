@@ -33,7 +33,9 @@
 
 #pragma once
 #if HSHM_ENABLE_ZMQ
+#ifndef _WIN32
 #include <unistd.h>
+#endif
 #include <zmq.h>
 
 #include <chrono>
@@ -42,8 +44,10 @@
 #include <mutex>
 #include <thread>
 
+#include "hermes_shm/introspect/system_info.h"
 #include "hermes_shm/util/logging.h"
 #include "lightbeam.h"
+#include "posix_socket.h"
 
 namespace hshm::lbm {
 
@@ -88,6 +92,7 @@ class ZeroMqTransport : public Transport {
         protocol_(protocol),
         port_(port) {
     type_ = TransportType::kZeroMq;
+    sock::InitSocketLib();
 
     std::string full_url;
     if (protocol_ == "ipc") {
@@ -107,7 +112,7 @@ class ZeroMqTransport : public Transport {
       // (where multiple processes may have the same PID in different namespaces)
       char hostname_buf[64] = {};
       gethostname(hostname_buf, sizeof(hostname_buf) - 1);
-      uint32_t pid = static_cast<uint32_t>(getpid());
+      uint32_t pid = static_cast<uint32_t>(hshm::SystemInfo::GetPid());
       std::string identity = std::string(hostname_buf) + ":" +
                               std::to_string(pid);
       zmq_setsockopt(socket_, ZMQ_IDENTITY, identity.data(),
@@ -444,7 +449,7 @@ class ZeroMqTransport : public Transport {
     size_t fd_size = sizeof(fd);
     zmq_getsockopt(socket_, ZMQ_FD, &fd, reinterpret_cast<::size_t *>(&fd_size));
     if (fd >= 0) {
-      em.AddEvent(fd, EPOLLIN);
+      em.AddEvent(fd, kDefaultReadEvent);
     }
   }
 

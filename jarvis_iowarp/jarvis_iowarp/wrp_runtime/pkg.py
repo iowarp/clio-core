@@ -57,7 +57,7 @@ class WrpRuntime(Service):
                 'name': 'port',
                 'msg': 'ZeroMQ port for networking',
                 'type': int,
-                'default': 5555
+                'default': 9413
             },
             {
                 'name': 'ipc_mode',

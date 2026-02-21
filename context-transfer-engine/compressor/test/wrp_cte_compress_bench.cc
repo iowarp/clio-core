@@ -69,7 +69,9 @@
 #include <iostream>
 #include <mutex>
 #include <random>
+#ifndef _WIN32
 #include <sched.h>
+#endif
 #include <string>
 #include <thread>
 #include <vector>

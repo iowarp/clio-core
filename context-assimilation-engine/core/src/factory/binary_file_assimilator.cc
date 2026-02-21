@@ -32,7 +32,9 @@
  */
 
 #include <chimaera/chimaera.h>
+#ifndef _WIN32
 #include <sys/stat.h>
+#endif
 #include <wrp_cae/core/factory/binary_file_assimilator.h>
 
 #include <algorithm>

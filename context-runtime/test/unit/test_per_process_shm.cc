@@ -46,9 +46,11 @@
 #include <vector>
 #include <chrono>
 #include <thread>
+#ifndef _WIN32
 #include <sys/wait.h>
 #include <signal.h>
 #include <fcntl.h>
+#endif
 
 #include "../simple_test.h"
 
@@ -66,9 +68,9 @@ pid_t StartServerProcess() {
   pid_t server_pid = fork();
   if (server_pid == 0) {
     // Redirect child output to prevent log flooding
-    freopen("/dev/null", "w", stdout);  // NOLINT
-    freopen("/dev/null", "w", stderr);  // NOLINT
-    setenv("CHIMAERA_WITH_RUNTIME", "1", 1);
+    (void)freopen("/dev/null", "w", stdout);
+    (void)freopen("/dev/null", "w", stderr);
+    setenv("CHI_WITH_RUNTIME", "1", 1);
     bool success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kServer, true);
     if (!success) {
       _exit(1);
@@ -139,9 +141,9 @@ TEST_CASE("Per-process shared memory GetClientShmInfo",
   // Fork a client child to test GetClientShmInfo
   pid_t client_pid = fork();
   if (client_pid == 0) {
-    freopen("/dev/null", "w", stdout);  // NOLINT
-    freopen("/dev/null", "w", stderr);  // NOLINT
-    setenv("CHIMAERA_WITH_RUNTIME", "0", 1);
+    (void)freopen("/dev/null", "w", stdout);
+    (void)freopen("/dev/null", "w", stderr);
+    setenv("CHI_WITH_RUNTIME", "0", 1);
     setenv("CHI_IPC_MODE", "SHM", 1);
     if (!chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, false)) {
       _exit(1);

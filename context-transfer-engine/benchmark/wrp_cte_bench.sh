@@ -154,14 +154,14 @@ main() {
     echo ""
 
     # Set environment variables
-    export CHIMAERA_WITH_RUNTIME=1
+    export CHI_WITH_RUNTIME=1
     export WRP_RUNTIME_CONF="$CONFIG_FILE"
 
     # Run benchmark with mpirun
     echo -e "${GREEN}Starting benchmark...${NC}"
     echo ""
 
-    mpirun -x WRP_RUNTIME_CONF -x CHIMAERA_WITH_RUNTIME -n $num_procs "$BENCHMARK_EXE" "$test_case" "$depth" "$io_size_str" "$io_count"
+    mpirun -x WRP_RUNTIME_CONF -x CHI_WITH_RUNTIME -n $num_procs "$BENCHMARK_EXE" "$test_case" "$depth" "$io_size_str" "$io_count"
 
     local exit_code=$?
 

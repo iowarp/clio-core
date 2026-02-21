@@ -352,7 +352,7 @@ class IpcManager {
    * @param task_ptr Task to serialize into Future
    * @return Future<TaskT> with serialized task data
    */
-#if defined(__CUDACC__) || defined(__HIP__)
+#if HSHM_IS_GPU_COMPILER
   template <typename TaskT>
   HSHM_GPU_FUN Future<TaskT> MakeCopyFutureGpu(
       const hipc::FullPtr<TaskT> &task_ptr) {
@@ -407,9 +407,9 @@ class IpcManager {
         buffer.shm_.template Cast<FutureShm>();
     return Future<TaskT>(future_shm_shmptr, task_ptr);
   }
-#endif  // defined(__CUDACC__) || defined(__HIP__)
+#endif  // HSHM_IS_GPU_COMPILER
 
-#if defined(__CUDACC__) || defined(__HIPCC__)
+#if HSHM_IS_GPU_COMPILER
   /**
    * Per-block IpcManager singleton in __shared__ memory.
    * __noinline__ ensures a single __shared__ variable instance per block,
@@ -421,7 +421,7 @@ class IpcManager {
     __shared__ IpcManager s_ipc;
     return &s_ipc;
   }
-#endif  // defined(__CUDACC__) || defined(__HIPCC__)
+#endif  // HSHM_IS_GPU_COMPILER
 
   /**
    * Create Future by wrapping task pointer (runtime-only, no serialization)
@@ -1633,10 +1633,10 @@ class IpcManager {
 // Global pointer variable declaration for IPC manager singleton
 HSHM_DEFINE_GLOBAL_PTR_VAR_H(chi::IpcManager, g_ipc_manager);
 
-#if defined(__CUDACC__) || defined(__HIPCC__)
+#if HSHM_IS_GPU_COMPILER
 namespace chi {
 HSHM_CROSS_FUN inline IpcManager *GetIpcManager() {
-#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
+#if HSHM_IS_GPU
   return IpcManager::GetBlockIpcManager();
 #else
   return HSHM_GET_GLOBAL_PTR_VAR(::chi::IpcManager, g_ipc_manager);

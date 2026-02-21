@@ -7,16 +7,16 @@ functionality of the CTE Python bindings.
 
 Requirements:
 - wrp_cte_core_ext module (Python bindings)
-- Chimaera runtime initialized with CHIMAERA_WITH_RUNTIME=1
+- Chimaera runtime initialized with CHI_WITH_RUNTIME=1
 - WRP_RUNTIME_CONF environment variable set to config file
 - pytest (optional, for test framework mode)
 
 Usage:
     # Run with pytest (if available)
-    CHIMAERA_WITH_RUNTIME=1 WRP_RUNTIME_CONF=/path/to/config.yaml pytest test_cte_telemetry.py -v
+    CHI_WITH_RUNTIME=1 WRP_RUNTIME_CONF=/path/to/config.yaml pytest test_cte_telemetry.py -v
 
     # Run as standalone script (no pytest required)
-    CHIMAERA_WITH_RUNTIME=1 WRP_RUNTIME_CONF=/path/to/config.yaml python3 test_cte_telemetry.py
+    CHI_WITH_RUNTIME=1 WRP_RUNTIME_CONF=/path/to/config.yaml python3 test_cte_telemetry.py
 """
 
 import sys
@@ -70,12 +70,12 @@ def runtime_initialized(cte_module):
     """Fixture to initialize Chimaera runtime once per module
 
     This follows the pattern from test_bindings.py for runtime initialization.
-    Requires CHIMAERA_WITH_RUNTIME=1 environment variable.
+    Requires CHI_WITH_RUNTIME=1 environment variable.
     """
     # Check if runtime should be initialized
-    env_val = os.getenv("CHIMAERA_WITH_RUNTIME")
+    env_val = os.getenv("CHI_WITH_RUNTIME")
     if env_val and str(env_val).lower() in ("0", "false", "no", "off"):
-        pytest.skip("Runtime initialization disabled (CHIMAERA_WITH_RUNTIME=0)")
+        pytest.skip("Runtime initialization disabled (CHI_WITH_RUNTIME=0)")
 
     # Check for config file
     config_path = os.getenv("WRP_RUNTIME_CONF")

@@ -213,7 +213,11 @@ if(WRP_CORE_STATIC_DEPS)
 endif()
 
 # Pkg-Config
-find_package(PkgConfig REQUIRED)
+if(NOT WIN32)
+    find_package(PkgConfig REQUIRED)
+else()
+    find_package(PkgConfig QUIET)
+endif()
 if(PkgConfig_FOUND)
     message(STATUS "found pkg-config")
     if(IN_CONDA_BUILD)
@@ -453,34 +457,51 @@ endif()
 
 # ZeroMQ (conditional) - try system first, fall back to submodule
 if(WRP_CORE_ENABLE_ZMQ)
-    pkg_check_modules(ZeroMQ QUIET libzmq)
-    if(ZeroMQ_FOUND)
-        message(STATUS "found zmq.h at ${ZeroMQ_INCLUDE_DIRS}")
-        if(WRP_CORE_STATIC_DEPS)
-            # Find static .a archives directly — pkg-config _STATIC_LIBRARIES
-            # still returns -l flags that the linker resolves to shared libs.
-            find_library(ZMQ_STATIC_LIB NAMES libzmq.a REQUIRED)
-            set(ZMQ_LIBS ${ZMQ_STATIC_LIB})
-            # Pull in zmq's transitive static deps (libsodium, pthreads, etc.)
-            foreach(_dep ${ZeroMQ_STATIC_LIBRARIES})
-                if(NOT _dep STREQUAL "zmq")
-                    find_library(_dep_path NAMES lib${_dep}.a ${_dep})
-                    if(_dep_path)
-                        list(APPEND ZMQ_LIBS ${_dep_path})
-                    else()
-                        list(APPEND ZMQ_LIBS ${_dep})
+    set(_ZMQ_FOUND FALSE)
+    # Try pkg-config first (Linux/macOS)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(ZeroMQ QUIET libzmq)
+        if(ZeroMQ_FOUND)
+            message(STATUS "found zmq.h at ${ZeroMQ_INCLUDE_DIRS}")
+            if(WRP_CORE_STATIC_DEPS)
+                # Find static .a archives directly — pkg-config _STATIC_LIBRARIES
+                # still returns -l flags that the linker resolves to shared libs.
+                find_library(ZMQ_STATIC_LIB NAMES libzmq.a REQUIRED)
+                set(ZMQ_LIBS ${ZMQ_STATIC_LIB})
+                # Pull in zmq's transitive static deps (libsodium, pthreads, etc.)
+                foreach(_dep ${ZeroMQ_STATIC_LIBRARIES})
+                    if(NOT _dep STREQUAL "zmq")
+                        find_library(_dep_path NAMES lib${_dep}.a ${_dep})
+                        if(_dep_path)
+                            list(APPEND ZMQ_LIBS ${_dep_path})
+                        else()
+                            list(APPEND ZMQ_LIBS ${_dep})
+                        endif()
+                        unset(_dep_path CACHE)
                     endif()
-                    unset(_dep_path CACHE)
-                endif()
-            endforeach()
-            set(ZMQ_LIB_DIRS "")
-            message(STATUS "Static zmq libs: ${ZMQ_LIBS}")
-        else()
-            set(ZMQ_LIBS ${ZeroMQ_LIBRARIES})
-            set(ZMQ_LIB_DIRS ${ZeroMQ_LIBRARY_DIRS})
+                endforeach()
+                set(ZMQ_LIB_DIRS "")
+                message(STATUS "Static zmq libs: ${ZMQ_LIBS}")
+            else()
+                set(ZMQ_LIBS ${ZeroMQ_LIBRARIES})
+                set(ZMQ_LIB_DIRS ${ZeroMQ_LIBRARY_DIRS})
+            endif()
+            set(ZMQ_INCLUDES ${ZeroMQ_INCLUDE_DIRS})
+            set(_ZMQ_FOUND TRUE)
         endif()
-        set(ZMQ_INCLUDES ${ZeroMQ_INCLUDE_DIRS})
-    else()
+    endif()
+    # Fall back to CMake config mode (vcpkg on Windows)
+    if(NOT _ZMQ_FOUND)
+        find_package(ZeroMQ CONFIG QUIET)
+        if(ZeroMQ_FOUND)
+            message(STATUS "found ZeroMQ via CMake config")
+            set(ZMQ_LIBS libzmq)
+            set(ZMQ_INCLUDES "")
+            set(ZMQ_LIB_DIRS "")
+            set(_ZMQ_FOUND TRUE)
+        endif()
+    endif()
+    if(NOT _ZMQ_FOUND)
         message(FATAL_ERROR "ZeroMQ not found. Please install ZeroMQ or run install.sh to build from submodules.")
     endif()
 endif()
@@ -625,33 +646,43 @@ endif()
 #------------------------------------------------------------------------------
 # Compiler Flags
 #------------------------------------------------------------------------------
-# Add compiler flags following Google C++ style guide
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -pedantic")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC")
-# Disable warnings that are false positives or from external dependencies
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-unused-parameter -Wno-unused-variable -Wno-reorder")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-pedantic -Wno-sign-compare -Wno-missing-field-initializers")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-unused-but-set-variable -Wno-unused-function -Wno-cast-function-type")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-self-move -Wno-format")
+if(NOT MSVC)
+    # Add compiler flags following Google C++ style guide
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -pedantic")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC")
+    # Disable warnings that are false positives or from external dependencies
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-unused-parameter -Wno-unused-variable -Wno-reorder")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-pedantic -Wno-sign-compare -Wno-missing-field-initializers")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-unused-but-set-variable -Wno-unused-function -Wno-cast-function-type")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-self-move -Wno-format")
+    # Suppress GCC false positives in template-heavy shared memory code (Release -O3)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-array-bounds -Wno-stringop-overflow")
+    # Suppress unused-result warnings (freopen/system in test code)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-unused-result")
 
-# Debug configuration
-set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g -O0 -DDEBUG")
+    # Debug configuration
+    set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g -O0 -DDEBUG")
 
-# Release configuration
-set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -DNDEBUG")
+    # Release configuration
+    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -DNDEBUG")
 
-# AddressSanitizer configuration
-if(WRP_CORE_ENABLE_ASAN)
-    message(STATUS "AddressSanitizer (ASAN) enabled for iowarp-core")
-    add_compile_options(-fsanitize=address -fno-omit-frame-pointer)
-    add_link_options(-fsanitize=address)
-endif()
+    # AddressSanitizer configuration
+    if(WRP_CORE_ENABLE_ASAN)
+        message(STATUS "AddressSanitizer (ASAN) enabled for iowarp-core")
+        add_compile_options(-fsanitize=address -fno-omit-frame-pointer)
+        add_link_options(-fsanitize=address)
+    endif()
 
-# Code Coverage configuration
-if(WRP_CORE_ENABLE_COVERAGE)
-    message(STATUS "Code coverage instrumentation enabled for iowarp-core")
-    add_compile_options(--coverage -fprofile-arcs -ftest-coverage)
-    add_link_options(--coverage)
+    # Code Coverage configuration
+    if(WRP_CORE_ENABLE_COVERAGE)
+        message(STATUS "Code coverage instrumentation enabled for iowarp-core")
+        add_compile_options(--coverage -fprofile-arcs -ftest-coverage)
+        add_link_options(--coverage)
+    endif()
+else()
+    # MSVC compiler flags
+    set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} /Zi /Od /DDEBUG")
+    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /O2 /DNDEBUG")
 endif()
 
 # When building for Python wheels on x86_64, restrict to baseline x86_64 ISA
@@ -694,7 +725,7 @@ if(WRP_CORE_ENABLE_TESTS)
     add_test(
         NAME chimaera_pre_test_cleanup
         COMMAND bash -c
-            "fuser -k 5555/tcp 5556/tcp 5558/tcp 2>/dev/null; \
+            "fuser -k 9413/tcp 9414/tcp 9416/tcp 2>/dev/null; \
              rm -f /tmp/chimaera_*.ipc 2>/dev/null; \
              rm -f /tmp/chimaera_server_timing.log 2>/dev/null; \
              rm -rf /tmp/chimaera_memfd 2>/dev/null; \

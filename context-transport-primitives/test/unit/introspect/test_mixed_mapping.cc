@@ -42,9 +42,11 @@
 
 #include <iostream>
 #include <cstring>
+#ifndef _WIN32
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/mman.h>
+#endif
 #include "hermes_shm/introspect/system_info.h"
 
 using namespace hshm;

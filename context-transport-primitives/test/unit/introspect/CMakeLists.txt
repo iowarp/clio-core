@@ -1,5 +1,6 @@
 # Introspect tests
 
+if(NOT WIN32)
 # Test for MapMixedMemory functionality
 add_executable(test_mixed_mapping test_mixed_mapping.cc)
 target_link_libraries(test_mixed_mapping hshm::cxx)
@@ -20,3 +21,4 @@ set_tests_properties(
   ctp_mixed_mapping
   PROPERTIES TIMEOUT 15
 )
+endif()

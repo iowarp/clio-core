@@ -34,7 +34,11 @@
 #ifndef CHIMAERA_INCLUDE_CHIMAERA_TASK_H_
 #define CHIMAERA_INCLUDE_CHIMAERA_TASK_H_
 
+#ifdef _WIN32
+using pid_t = int;
+#else
 #include <sys/types.h>
+#endif
 
 #include <atomic>
 #include <coroutine>

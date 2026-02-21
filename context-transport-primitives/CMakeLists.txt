@@ -97,6 +97,7 @@ elseif(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
     endif()
 
     set(HSHM_COMPILER_MSVC "ON")
+    set(REAL_TIME_FLAGS "ws2_32")
 else()
     message(FATAL_ERROR "Unsupported compiler ${CMAKE_CXX_COMPILER_ID}")
 endif()
@@ -164,6 +165,9 @@ if(WRP_CORE_ENABLE_LIBFABRIC)
 endif()
 if(WRP_CORE_ENABLE_THALLIUM)
     # Thallium dependencies would go here
+endif()
+if(WIN32)
+    target_link_libraries(lightbeam INTERFACE ws2_32)
 endif()
 target_compile_definitions(lightbeam INTERFACE
     HSHM_ENABLE_LIGHTBEAM=1

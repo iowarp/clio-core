@@ -33,12 +33,14 @@
 
 #include <arpa/inet.h>
 #include <hermes_shm/lightbeam/transport_factory_impl.h>
+#ifndef _WIN32
 #include <ifaddrs.h>
-#include <mpi.h>
 #include <net/if.h>
 #include <netdb.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
+#include <mpi.h>
 
 #include <cassert>
 #include <chrono>

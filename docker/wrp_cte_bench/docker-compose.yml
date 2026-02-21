@@ -20,7 +20,7 @@
 #   IO_SIZE              - Size of each I/O operation (default: 1m)
 #                          Supports: b (bytes), k (KB), m (MB), g (GB)
 #   IO_COUNT             - Number of operations to perform (default: 100)
-#   CHIMAERA_WITH_RUNTIME - Initialize CTE runtime in benchmark (default: 0, runtime handled by iowarp service)
+#   CHI_WITH_RUNTIME - Initialize CTE runtime in benchmark (default: 0, runtime handled by iowarp service)
 #   CHI_SERVER_CONF     - Path to CTE configuration file (default: /etc/iowarp/cte_config.yaml)
 
 services:
@@ -40,7 +40,7 @@ services:
 
     # Expose ZeroMQ port for client connections
     ports:
-      - "5555:5555"
+      - "9413:9413"
 
     # Resource limits
     mem_limit: 8g
@@ -63,7 +63,7 @@ services:
     environment:
       # CTE Runtime Configuration
       # Do NOT initialize runtime in benchmark (runtime service handles this)
-      - CHIMAERA_WITH_RUNTIME=${CHIMAERA_WITH_RUNTIME:-0}
+      - CHI_WITH_RUNTIME=${CHI_WITH_RUNTIME:-0}
 
       # Benchmark Test Parameters
       # Test case selection: Put (write), Get (read), PutGet (mixed)
@@ -107,7 +107,7 @@ services:
   #   volumes:
   #     - ./cte_config.yaml:/etc/iowarp/cte_config.yaml:ro
   #   environment:
-  #     - CHIMAERA_WITH_RUNTIME=0
+  #     - CHI_WITH_RUNTIME=0
   #     - CHI_SERVER_CONF=/etc/iowarp/cte_config.yaml
   #     - TEST_CASE=Put
   #     - NUM_PROCS=4
@@ -129,7 +129,7 @@ services:
   #   volumes:
   #     - ./cte_config.yaml:/etc/iowarp/cte_config.yaml:ro
   #   environment:
-  #     - CHIMAERA_WITH_RUNTIME=0
+  #     - CHI_WITH_RUNTIME=0
   #     - CHI_SERVER_CONF=/etc/iowarp/cte_config.yaml
   #     - TEST_CASE=Get
   #     - NUM_PROCS=4
@@ -151,7 +151,7 @@ services:
   #   volumes:
   #     - ./cte_config.yaml:/etc/iowarp/cte_config.yaml:ro
   #   environment:
-  #     - CHIMAERA_WITH_RUNTIME=0
+  #     - CHI_WITH_RUNTIME=0
   #     - CHI_SERVER_CONF=/etc/iowarp/cte_config.yaml
   #     - TEST_CASE=PutGet
   #     - NUM_PROCS=4
@@ -173,7 +173,7 @@ services:
   #   volumes:
   #     - ./cte_config.yaml:/etc/iowarp/cte_config.yaml:ro
   #   environment:
-  #     - CHIMAERA_WITH_RUNTIME=0
+  #     - CHI_WITH_RUNTIME=0
   #     - CHI_SERVER_CONF=/etc/iowarp/cte_config.yaml
   #     - TEST_CASE=Put
   #     - NUM_PROCS=1
@@ -195,7 +195,7 @@ services:
   #   volumes:
   #     - ./cte_config.yaml:/etc/iowarp/cte_config.yaml:ro
   #   environment:
-  #     - CHIMAERA_WITH_RUNTIME=0
+  #     - CHI_WITH_RUNTIME=0
   #     - CHI_SERVER_CONF=/etc/iowarp/cte_config.yaml
   #     - TEST_CASE=Put
   #     - NUM_PROCS=16

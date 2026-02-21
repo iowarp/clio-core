@@ -36,6 +36,5 @@ fi
 # Start SSH service
 sudo service ssh start
 
-# Initialize conda
-eval "$("${HOME_DIR}/miniconda3/bin/conda" shell.bash hook)"
-echo "Conda initialized. Use: conda activate <env>"
+# Activate Python virtual environment
+echo "Python venv available at ${HOME_DIR}/venv (auto-activated in new shells)"

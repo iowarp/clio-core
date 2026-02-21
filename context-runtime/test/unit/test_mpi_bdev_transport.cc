@@ -47,8 +47,10 @@
 
 #include <mpi.h>
 
+#ifndef _WIN32
 #include <fcntl.h>
 #include <unistd.h>
+#endif
 
 #include <chrono>
 #include <cstdlib>
@@ -254,7 +256,7 @@ int main(int argc, char* argv[]) {
     // Cleanup stale shared memory
     CleanupSharedMemory();
 
-    setenv("CHIMAERA_WITH_RUNTIME", "1", 1);
+    setenv("CHI_WITH_RUNTIME", "1", 1);
     bool success = CHIMAERA_INIT(ChimaeraMode::kServer, true);
     if (!success) {
       HLOG(kError, "[Rank 0] CHIMAERA_INIT(kServer) failed!");
@@ -303,7 +305,7 @@ int main(int argc, char* argv[]) {
 
     // Set transport mode
     setenv("CHI_IPC_MODE", mode_name.c_str(), 1);
-    setenv("CHIMAERA_WITH_RUNTIME", "0", 1);
+    setenv("CHI_WITH_RUNTIME", "0", 1);
 
     HLOG(kInfo, "[Rank {}] Connecting as {} client...", rank, mode_name);
 

@@ -207,6 +207,16 @@ class SystemInfo {
                               int overwrite);
 
   HSHM_DLL static void Unsetenv(const char *name);
+
+  HSHM_DLL static bool IsProcessAlive(int pid);
+
+  HSHM_DLL static std::string GetModuleDirectory();
+
+  HSHM_DLL static std::string GetLibrarySearchPathVar();
+
+  HSHM_DLL static char GetPathListSeparator();
+
+  HSHM_DLL static std::string GetSharedLibExtension();
 };
 
 }  // namespace hshm

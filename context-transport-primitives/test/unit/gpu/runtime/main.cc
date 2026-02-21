@@ -32,7 +32,9 @@
  */
 
 #include <cuda_runtime.h>
+#ifndef _WIN32
 #include <dlfcn.h>
+#endif
 #include <cstdio>
 #include <cstdlib>
 #include "container.h"

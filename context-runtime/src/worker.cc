@@ -40,8 +40,10 @@
 
 #include "chimaera/worker.h"
 
+#ifndef _WIN32
 #include <sys/syscall.h>
 #include <unistd.h>
+#endif
 
 #include <coroutine>
 #include <cstdlib>

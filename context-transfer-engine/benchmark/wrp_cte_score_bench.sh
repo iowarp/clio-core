@@ -85,7 +85,7 @@ echo ""
 
 # Set environment variables
 export WRP_RUNTIME_CONF="$CONFIG_FILE"
-export CHIMAERA_WITH_RUNTIME=1
+export CHI_WITH_RUNTIME=1
 
 # Run the benchmark
 echo -e "${GREEN}Running benchmark...${NC}"
@@ -93,7 +93,7 @@ echo ""
 
 mpirun --allow-run-as-root \
     -x WRP_RUNTIME_CONF \
-    -x CHIMAERA_WITH_RUNTIME \
+    -x CHI_WITH_RUNTIME \
     -n "$NUM_PROCS" \
     "$BENCHMARK_EXE" "$DATA_PER_RANK_STEP" "$BUSY_WAIT_SEC" "$NUM_STEPS"
 

@@ -16,7 +16,7 @@
 
 # -- Networking ---------------------------------------------------------------
 networking:
-  port: 5555                           # RPC listener port
+  port: 9413                           # RPC listener port
   neighborhood_size: 32                # Max nodes queried when splitting range queries
   # hostfile: "/path/to/hostfile"      # One hostname per line for distributed mode
   wait_for_restart: 30                 # Seconds to wait for peer nodes on startup

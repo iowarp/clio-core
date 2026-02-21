@@ -605,7 +605,7 @@ void TestAcceptNewClient() {
   std::cout << "\n==== Testing Socket AcceptNewClient ====\n";
 
   std::string addr = "127.0.0.1";
-  int port = 9115;
+  int port = 9200;
 
   auto server = std::make_unique<SocketTransport>(
       TransportMode::kServer, addr, "tcp", port);
@@ -628,7 +628,21 @@ void TestAcceptNewClient() {
 
   // First Recv triggers accept internally
   TestMeta recv_meta;
-  auto info = RecvWithRetry(server.get(), recv_meta);
+  int attempts = 0;
+  ClientInfo info;
+  while (true) {
+    info = server->Recv(recv_meta);
+    if (info.rc == 0) break;
+    if (info.rc != EAGAIN) {
+      std::cerr << "Recv failed: " << info.rc << "\n";
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    if (++attempts > 5000) {
+      std::cerr << "Recv timed out after 5000 attempts\n";
+      break;
+    }
+  }
   assert(info.rc == 0);
   assert(recv_meta.request_id == 77);
   // The fd should be a valid accepted client fd
@@ -641,7 +655,11 @@ void TestAcceptNewClient() {
 int main() {
   TestTcpBasic();
   TestMultipleBulks();
+#ifndef _WIN32
   TestUnixDomain();
+#else
+  std::cout << "\n[Skipped] Unix Domain (not supported on Windows)\n";
+#endif
   TestMetadataOnly();
   TestBulkExpose();
   TestLargeTransfer();
@@ -651,7 +669,11 @@ int main() {
   TestMultiClient();
   TestMultiClientWithEM();
   TestFactoryTcp();
+#ifndef _WIN32
   TestFactoryIpc();
+#else
+  std::cout << "\n[Skipped] Factory IPC (not supported on Windows)\n";
+#endif
   TestFactoryDefault();
   TestFactoryWithDomain();
   TestIsServerIsClient();

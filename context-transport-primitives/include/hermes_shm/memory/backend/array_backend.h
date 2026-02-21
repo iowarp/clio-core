@@ -34,7 +34,6 @@
 #ifndef HSHM_INCLUDE_HSHM_MEMORY_BACKEND_ARRAY_BACKEND_H_
 #define HSHM_INCLUDE_HSHM_MEMORY_BACKEND_ARRAY_BACKEND_H_
 
-#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

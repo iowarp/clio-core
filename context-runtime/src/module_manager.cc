@@ -37,8 +37,10 @@
 
 #include "chimaera/module_manager.h"
 
+#ifndef _WIN32
 #include <dlfcn.h>
 #include <libgen.h>
+#endif
 #include <limits.h>
 
 #include <cstring>

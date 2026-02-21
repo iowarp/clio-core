@@ -384,8 +384,19 @@ RUN cd /home/iowarp \
     && (git clone -b iowarp-dev git@github.com:iowarp/docs.git 2>/dev/null || \
         git clone -b iowarp-dev https://github.com/iowarp/docs.git)
 
-# Install Python build tools (scikit-build-core, nanobind for pip wheel builds)
-RUN pip3 install --break-system-packages scikit-build-core nanobind
+# Create Python virtual environment and install build tools
+RUN python3 -m venv /home/iowarp/venv && \
+    /home/iowarp/venv/bin/pip install --upgrade pip && \
+    /home/iowarp/venv/bin/pip install scikit-build-core nanobind
+ENV VIRTUAL_ENV="/home/iowarp/venv"
+ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
+
+# Install Jarvis-CD (deployment and pipeline management)
+RUN cd /home/iowarp \
+    && git clone https://github.com/iowarp/runtime-deployment.git jarvis-cd \
+    && cd jarvis-cd \
+    && pip install -r requirements.txt \
+    && pip install -e .
 
 # Configure Spack to use system packages
 RUN mkdir -p ~/.spack && \
@@ -437,6 +448,9 @@ RUN ARCH=$(uname -m) && \
     && echo '' >> /home/iowarp/.bashrc \
     && echo '# Bun JavaScript runtime' >> /home/iowarp/.bashrc \
     && echo 'export PATH="/home/iowarp/.bun/bin:$PATH"' >> /home/iowarp/.bashrc \
+    && echo '' >> /home/iowarp/.bashrc \
+    && echo '# Python virtual environment' >> /home/iowarp/.bashrc \
+    && echo 'source /home/iowarp/venv/bin/activate' >> /home/iowarp/.bashrc \
     && echo '' >> /home/iowarp/.bashrc
 
 WORKDIR /workspace

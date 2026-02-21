@@ -185,7 +185,7 @@
                     "value": "${workspaceFolder}/build/bin"
                 },
                 {
-                    "name": "CHIMAERA_WITH_RUNTIME",
+                    "name": "CHI_WITH_RUNTIME",
                     "value": "1"
                 },
                 {
@@ -235,7 +235,7 @@
             "cwd": "${workspaceFolder}/build",
             "environment": [
                 {
-                    "name": "CHIMAERA_WITH_RUNTIME",
+                    "name": "CHI_WITH_RUNTIME",
                     "value": "1"
                 },
                 {
@@ -495,7 +495,7 @@
             "cwd": "${workspaceFolder}/build",
             "environment": [
                 {
-                    "name": "CHIMAERA_WITH_RUNTIME",
+                    "name": "CHI_WITH_RUNTIME",
                     "value": "1"
                 }
             ],
@@ -520,7 +520,7 @@
             "cwd": "${workspaceFolder}/build",
             "environment": [
                 {
-                    "name": "CHIMAERA_WITH_RUNTIME",
+                    "name": "CHI_WITH_RUNTIME",
                     "value": "1"
                 }
             ],
@@ -547,7 +547,7 @@
             "cwd": "${workspaceFolder}/build",
             "environment": [
                 {
-                    "name": "CHIMAERA_WITH_RUNTIME",
+                    "name": "CHI_WITH_RUNTIME",
                     "value": "0"
                 }
             ],

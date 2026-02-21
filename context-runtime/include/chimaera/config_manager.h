@@ -164,6 +164,12 @@ class ConfigManager : public hshm::BaseConfig {
   u32 GetPort() const;
 
   /**
+   * Get server address for client connections
+   * @return Server address (default: "127.0.0.1", overridden by CHI_SERVER_ADDR)
+   */
+  std::string GetServerAddr() const;
+
+  /**
    * Get neighborhood size for range query splitting
    * @return Maximum number of queries when splitting range queries
    */
@@ -251,7 +257,8 @@ class ConfigManager : public hshm::BaseConfig {
   size_t main_segment_size_ = hshm::Unit<size_t>::Gigabytes(1);
   size_t client_data_segment_size_ = hshm::Unit<size_t>::Megabytes(256);
 
-  u32 port_ = 5555;
+  u32 port_ = 9413;
+  std::string server_addr_ = "127.0.0.1";
   u32 neighborhood_size_ = 32;
 
   // Shared memory segment names with environment variable support

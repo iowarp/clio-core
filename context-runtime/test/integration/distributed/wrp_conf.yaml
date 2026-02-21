@@ -3,7 +3,7 @@
 
 # Network configuration
 networking:
-  port: 5555
+  port: 9413
   neighborhood_size: 4  # Stress test with small neighborhood size for range/broadcast queries
   hostfile: "/workspace/context-runtime/test/integration/distributed/hostfile"
 

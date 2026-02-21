@@ -61,9 +61,6 @@
 #define HSHM_ERROR_IS(err, check) (err->get_code() == check.get_code())
 
 #if HSHM_IS_HOST
-#if __HIP_DEVICE_COMPILE__
-#error "Why??"
-#endif
 #define HSHM_THROW_ERROR(CODE, ...) throw CODE.format(__VA_ARGS__)
 #define HSHM_THROW_STD_ERROR(...) throw std::runtime_error(__VA_ARGS__);
 #endif

@@ -36,7 +36,7 @@ RUN sudo chmod +x /benchmarks/wrp_cte_bench.sh
 WORKDIR /benchmarks
 
 # Set default environment variables for CTE runtime
-ENV CHIMAERA_WITH_RUNTIME=0
+ENV CHI_WITH_RUNTIME=0
 ENV CHI_SERVER_CONF=/benchmarks/cte_config.yaml
 
 # Default benchmark parameters (can be overridden with environment variables)

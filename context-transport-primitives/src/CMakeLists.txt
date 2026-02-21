@@ -6,12 +6,19 @@ project(hermes_shm)
 set(HSHM_LIBS "")
 
 # BUILD HSHM FOR HOST ONLY
-set(SRC_FILES
-    system_info.cc
-    malloc_allocator.cc
-    posix_socket.cc
-    # memory_manager.cc  # NOTE: Deleted during hard refactoring
-)
+if(WIN32)
+    set(SRC_FILES
+        system_info.cc
+        malloc_allocator.cc
+        socket_win.cc
+    )
+else()
+    set(SRC_FILES
+        system_info.cc
+        malloc_allocator.cc
+        socket_posix.cc
+    )
+endif()
 
 # Create library with system_info.cc
 add_library(hermes_shm_host ${SRC_FILES})
@@ -26,6 +33,9 @@ target_link_libraries(hermes_shm_host PUBLIC
     configure
     thread_all
 )
+if(WIN32)
+    target_link_libraries(hermes_shm_host PUBLIC ws2_32)
+endif()
 target_include_directories(hermes_shm_host PUBLIC
     $<BUILD_INTERFACE:${HSHM_ROOT}/include>
     $<BUILD_INTERFACE:${PROJECT_BINARY_DIR}/include>

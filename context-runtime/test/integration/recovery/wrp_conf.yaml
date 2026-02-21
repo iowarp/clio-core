@@ -4,7 +4,7 @@
 
 # Network configuration
 networking:
-  port: 5555
+  port: 9413
   neighborhood_size: 4
   hostfile: "/workspace/context-runtime/test/integration/recovery/hostfile"
 

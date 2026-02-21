@@ -52,12 +52,9 @@ bool CHIMAERA_INIT(ChimaeraMode mode, bool default_with_runtime) {
 
   auto* chimaera_manager = CHI_CHIMAERA_MANAGER;
 
-  // Check environment variable CHI_WITH_RUNTIME (or legacy CHIMAERA_WITH_RUNTIME)
+  // Check environment variable CHI_WITH_RUNTIME
   bool with_runtime = default_with_runtime;
   const char* env_val = std::getenv("CHI_WITH_RUNTIME");
-  if (!env_val) {
-    env_val = std::getenv("CHIMAERA_WITH_RUNTIME");
-  }
   if (env_val != nullptr) {
     with_runtime = (std::strcmp(env_val, "1") == 0 ||
                    std::strcmp(env_val, "true") == 0 ||

@@ -215,7 +215,7 @@ int main(int argc, char* argv[]) {
   int exit_code = 0;
 
   try {
-    // Initialize Chimaera runtime (CHIMAERA_WITH_RUNTIME controls behavior)
+    // Initialize Chimaera runtime (CHI_WITH_RUNTIME controls behavior)
     HLOG(kInfo, "Initializing Chimaera...");
     bool success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
     if (!success) {

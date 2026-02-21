@@ -36,6 +36,22 @@
 
 #include <fstream>
 #include <cstdlib>
+#include <filesystem>
+
+#ifdef _WIN32
+#include <process.h>
+inline int setenv(const char *name, const char *value, int) {
+  return _putenv_s(name, value);
+}
+inline int unsetenv(const char *name) {
+  return _putenv_s(name, "");
+}
+inline int getpid() { return _getpid(); }
+#endif
+
+static std::string GetTempDir() {
+  return std::filesystem::temp_directory_path().string();
+}
 
 using hshm::ConfigParse;
 
@@ -308,12 +324,21 @@ TEST_CASE("ExpandPath - Multiple environment variables") {
 }
 
 TEST_CASE("ExpandPath - HOME variable expansion") {
+#ifdef _WIN32
+  const char* home = getenv("USERPROFILE");
+  if (home != nullptr) {
+    std::string result = ConfigParse::ExpandPath("${USERPROFILE}/data");
+    std::string expected = std::string(home) + "/data";
+    REQUIRE(result == expected);
+  }
+#else
   const char* home = getenv("HOME");
   if (home != nullptr) {
     std::string result = ConfigParse::ExpandPath("${HOME}/data");
     std::string expected = std::string(home) + "/data";
     REQUIRE(result == expected);
   }
+#endif
 }
 
 //------------------------------------------------------------------------------
@@ -322,7 +347,7 @@ TEST_CASE("ExpandPath - HOME variable expansion") {
 
 TEST_CASE("ParseHostfile - Read hosts from file") {
   // Create a temporary hostfile
-  std::string tmpfile = "/tmp/test_hostfile_" + std::to_string(getpid()) + ".txt";
+  std::string tmpfile = GetTempDir() + "/test_hostfile_" + std::to_string(getpid()) + ".txt";
   {
     std::ofstream file(tmpfile);
     file << "node01\n";
@@ -349,7 +374,7 @@ TEST_CASE("ParseHostfile - Non-existent file") {
 }
 
 TEST_CASE("ParseHostfile - Empty file") {
-  std::string tmpfile = "/tmp/test_hostfile_empty_" + std::to_string(getpid()) + ".txt";
+  std::string tmpfile = GetTempDir() + "/test_hostfile_empty_" + std::to_string(getpid()) + ".txt";
   {
     std::ofstream file(tmpfile);
     file.close();

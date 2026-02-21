@@ -263,9 +263,9 @@ NB_MODULE(wrp_cte_core_ext, m) {
         "Args:\n"
         "    mode: ChimaeraMode.kClient or ChimaeraMode.kServer/kRuntime\n"
         "    default_with_runtime: If True, starts runtime in addition to client (default: False)\n\n"
-        "Environment variable CHIMAERA_WITH_RUNTIME overrides default_with_runtime:\n"
-        "    CHIMAERA_WITH_RUNTIME=1 - Start runtime regardless of mode\n"
-        "    CHIMAERA_WITH_RUNTIME=0 - Don't start runtime (client only)\n\n"
+        "Environment variable CHI_WITH_RUNTIME overrides default_with_runtime:\n"
+        "    CHI_WITH_RUNTIME=1 - Start runtime regardless of mode\n"
+        "    CHI_WITH_RUNTIME=0 - Don't start runtime (client only)\n\n"
         "Returns:\n"
         "    bool: True if initialization successful, False otherwise");
 

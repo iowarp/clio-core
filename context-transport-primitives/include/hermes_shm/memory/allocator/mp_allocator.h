@@ -39,8 +39,10 @@
 #include "hermes_shm/data_structures/ipc/slist_pre.h"
 #include "hermes_shm/thread/lock/mutex.h"
 #include "hermes_shm/thread/thread_model_manager.h"
+#ifndef _WIN32
 #include <sys/types.h>
 #include <unistd.h>
+#endif
 
 namespace hshm::ipc {
 

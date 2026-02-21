@@ -34,7 +34,6 @@
 #ifndef HSHM_INCLUDE_MEMORY_BACKEND_POSIX_MMAP_H
 #define HSHM_INCLUDE_MEMORY_BACKEND_POSIX_MMAP_H
 
-#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -43,6 +42,7 @@
 
 #include "hermes_shm/constants/macros.h"
 #if HSHM_ENABLE_PROCFS_SYSINFO
+#include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/shm.h>
 #include <sys/stat.h>

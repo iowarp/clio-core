@@ -36,7 +36,7 @@ runtime:
   num_threads: 4
 
 networking:
-  port: 5555
+  port: 9413
 
 compose:
 - mod_name: chimaera_bdev

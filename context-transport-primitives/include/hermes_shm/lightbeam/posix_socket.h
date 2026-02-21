@@ -33,6 +33,32 @@
 
 #pragma once
 
+#include <cerrno>
+#include <cstddef>
+#include <cstdint>
+#include <string>
+
+#include "hermes_shm/constants/macros.h"
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <afunix.h>
+#include <BaseTsd.h>
+#ifdef Yield
+#undef Yield
+#endif
+#ifdef min
+#undef min
+#endif
+#ifdef max
+#undef max
+#endif
+using ssize_t = SSIZE_T;
+#else
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <sys/un.h>
@@ -42,33 +68,68 @@
 #include <unistd.h>
 #include <poll.h>
 #include <fcntl.h>
-#include <cerrno>
-#include <cstddef>
-#include <cstdint>
+#include <sys/epoll.h>
+#endif
 
 namespace hshm::lbm::sock {
 
+#ifdef _WIN32
+using socket_t = SOCKET;
+constexpr socket_t kInvalidSocket = INVALID_SOCKET;
+#else
 using socket_t = int;
 constexpr socket_t kInvalidSocket = -1;
+#endif
 
-void Close(socket_t fd);
-int GetError();
-void SetNonBlocking(socket_t fd, bool enable);
-void SetTcpNoDelay(socket_t fd);
-void SetReuseAddr(socket_t fd);
-void SetSendBuf(socket_t fd, int size);
-void SetRecvBuf(socket_t fd, int size);
+/** Platform-neutral scatter-gather buffer (replaces struct iovec) */
+struct IoBuffer {
+  void* base;
+  size_t len;
+};
 
-/** Scatter-gather send via writev(). Returns total bytes sent or -1 on error. */
-ssize_t SendV(socket_t fd, const struct iovec* iov, int count);
+HSHM_DLL void Close(socket_t fd);
+HSHM_DLL int GetError();
+HSHM_DLL std::string GetErrorString();
+HSHM_DLL void SetNonBlocking(socket_t fd, bool enable);
+HSHM_DLL void SetTcpNoDelay(socket_t fd);
+HSHM_DLL void SetReuseAddr(socket_t fd);
+HSHM_DLL void SetSendBuf(socket_t fd, int size);
+HSHM_DLL void SetRecvBuf(socket_t fd, int size);
+
+/** Initialize platform socket library (WSAStartup on Windows, no-op on POSIX) */
+HSHM_DLL void InitSocketLib();
+
+/** Cleanup platform socket library (WSACleanup on Windows, no-op on POSIX) */
+HSHM_DLL void CleanupSocketLib();
+
+/** Scatter-gather send. Returns total bytes sent or -1 on error. */
+HSHM_DLL ssize_t SendV(socket_t fd, const IoBuffer* iov, int count);
 
 /** Receive exactly len bytes. Returns 0 on success, -1 on error/short read. */
-int RecvExact(socket_t fd, char* buf, size_t len);
+HSHM_DLL int RecvExact(socket_t fd, char* buf, size_t len);
 
 /** Poll a single fd for readability. Returns >0 if ready, 0 on timeout, -1 on error. */
-int PollRead(socket_t fd, int timeout_ms);
+HSHM_DLL int PollRead(socket_t fd, int timeout_ms);
 
 /** Poll multiple fds for readability. Returns index of first ready fd, -1 if none/error. */
-int PollReadMulti(const socket_t* fds, int count, int timeout_ms);
+HSHM_DLL int PollReadMulti(const socket_t* fds, int count, int timeout_ms);
+
+/** Remove a file path (unlink on POSIX, DeleteFileA on Windows) */
+HSHM_DLL void UnlinkPath(const char* path);
+
+#ifndef _WIN32
+/** Create an epoll file descriptor. Returns epoll fd or -1 on error. */
+int EpollCreate();
+
+/** Add a socket fd to an epoll instance for EPOLLIN events. Returns 0 on success. */
+int EpollAdd(int epoll_fd, socket_t fd);
+
+/** Wait on an epoll instance. Returns number of ready events. */
+int EpollWait(int epoll_fd, struct epoll_event* events, int max_events,
+              int timeout_ms);
+
+/** Close an epoll file descriptor. */
+void EpollClose(int epoll_fd);
+#endif
 
 }  // namespace hshm::lbm::sock

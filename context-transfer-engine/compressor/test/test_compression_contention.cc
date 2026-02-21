@@ -64,8 +64,10 @@
 #include <memory>
 #include <queue>
 #include <condition_variable>
+#ifndef _WIN32
 #include <sys/resource.h>
 #include <sys/times.h>
+#endif
 
 #include <hermes_shm/compress/compress_factory.h>
 #include <hermes_shm/util/logging.h>
