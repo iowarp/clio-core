@@ -17,7 +17,7 @@ RUN sudo chown -R $(whoami):$(whoami) /workspace && \
     git submodule update --init --recursive && \
     mkdir -p build && \
     cd build && \
-    cmake --preset build-cpu-release ../ && \
+    cmake --preset build-cpu-release -DWRP_CORE_ENABLE_CONDA=OFF ../ && \
     sudo make -j$(nproc) install && \
     sudo rm -rf /workspace
 
