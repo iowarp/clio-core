@@ -388,7 +388,15 @@ RUN cd /home/iowarp \
 RUN python3 -m venv /home/iowarp/venv && \
     /home/iowarp/venv/bin/pip install --upgrade pip && \
     /home/iowarp/venv/bin/pip install scikit-build-core nanobind
-ENV PATH="/home/iowarp/venv/bin:${PATH}"
+ENV VIRTUAL_ENV="/home/iowarp/venv"
+ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
+
+# Install Jarvis-CD (deployment and pipeline management)
+RUN cd /home/iowarp \
+    && git clone https://github.com/iowarp/runtime-deployment.git jarvis-cd \
+    && cd jarvis-cd \
+    && pip install -r requirements.txt \
+    && pip install -e .
 
 # Configure Spack to use system packages
 RUN mkdir -p ~/.spack && \
