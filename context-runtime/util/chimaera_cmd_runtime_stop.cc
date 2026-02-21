@@ -19,6 +19,18 @@ int RuntimeStop(int argc, char* argv[]) {
       return 1;
     }
 
+    // RAII guard: call ClientFinalize() on every return path so the background
+    // ZMQ receive thread is joined and the DEALER socket is closed before the
+    // ZMQ shared-context static destructor runs.
+    struct ClientFinalizeGuard {
+      ~ClientFinalizeGuard() {
+        auto* mgr = CHI_CHIMAERA_MANAGER;
+        if (mgr) {
+          mgr->ClientFinalize();
+        }
+      }
+    } finalize_guard;
+
     HLOG(kDebug, "Creating admin client connection...");
     chimaera::admin::Client admin_client(chi::kAdminPoolId);
 
@@ -28,22 +40,25 @@ int RuntimeStop(int argc, char* argv[]) {
       return 1;
     }
 
+    // Note: TaskQueue is only accessible in SHM mode. In TCP mode (used for
+    // distributed/Docker deployments), the task queue is not mapped into the
+    // client process. Skip the task queue validation in that case and rely on
+    // the ZMQ transport to deliver the stop task to the runtime.
     auto* task_queue = ipc_manager->GetTaskQueue();
-    if (!task_queue) {
-      HLOG(kError, "TaskQueue not available - runtime may not be properly initialized");
-      return 1;
-    }
-
-    try {
-      chi::u32 num_lanes = task_queue->GetNumLanes();
-      if (num_lanes == 0) {
-        HLOG(kError, "TaskQueue has no lanes configured - runtime initialization incomplete");
+    if (task_queue) {
+      try {
+        chi::u32 num_lanes = task_queue->GetNumLanes();
+        if (num_lanes == 0) {
+          HLOG(kError, "TaskQueue has no lanes configured - runtime initialization incomplete");
+          return 1;
+        }
+        HLOG(kDebug, "TaskQueue validated with {} lanes", num_lanes);
+      } catch (const std::exception& e) {
+        HLOG(kError, "TaskQueue validation failed: {}", e.what());
         return 1;
       }
-      HLOG(kDebug, "TaskQueue validated with {} lanes", num_lanes);
-    } catch (const std::exception& e) {
-      HLOG(kError, "TaskQueue validation failed: {}", e.what());
-      return 1;
+    } else {
+      HLOG(kDebug, "TaskQueue not in shared memory (TCP mode) - sending stop via ZMQ transport");
     }
 
     chi::PoolQuery pool_query;

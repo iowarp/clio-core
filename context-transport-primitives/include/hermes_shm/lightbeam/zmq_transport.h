@@ -79,6 +79,14 @@ class ZeroMqTransport : public Transport {
       std::mutex mtx;
       ~CtxOwner() {
         if (ctx) {
+          // zmq_ctx_shutdown() causes all blocking ZMQ calls on open sockets
+          // to return immediately with ETERM.  This unblocks any background
+          // receive threads (e.g. RecvZmqClientThread) that are polling the
+          // socket, allowing them to exit cleanly.  zmq_ctx_destroy() would
+          // otherwise block forever if a socket is still open (because the
+          // Chimaera singleton is heap-allocated and its destructor -- which
+          // calls ClientFinalize / closes the socket -- is never invoked).
+          zmq_ctx_shutdown(ctx);
           zmq_ctx_destroy(ctx);
           ctx = nullptr;
         }

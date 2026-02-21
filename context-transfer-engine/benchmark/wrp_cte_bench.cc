@@ -510,6 +510,18 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  // RAII guard: call ClientFinalize() on every return path so the background
+  // ZMQ receive thread is joined and the DEALER socket is closed before the
+  // ZMQ shared-context static destructor runs.
+  struct ClientFinalizeGuard {
+    ~ClientFinalizeGuard() {
+      auto* mgr = CHI_CHIMAERA_MANAGER;
+      if (mgr) {
+        mgr->ClientFinalize();
+      }
+    }
+  } finalize_guard;
+
   std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
   // Initialize CTE client

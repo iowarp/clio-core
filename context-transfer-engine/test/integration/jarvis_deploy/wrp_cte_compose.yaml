@@ -1,0 +1,25 @@
+---
+# WRP CTE Compose Configuration for Jarvis Deployment Test
+# Separate CTE compose config (matches Jarvis WrpCte output)
+# Applied via `chimaera compose` after runtime is started
+
+compose:
+  - mod_name: wrp_cte_core
+    pool_name: wrp_cte
+    pool_query: local
+    pool_id: "512.0"
+    targets:
+      neighborhood: 2
+      default_target_timeout_ms: 30000
+      poll_period_ms: 5000
+    storage:
+      - path: "ram::cte_ram_tier1"
+        bdev_type: "ram"
+        capacity_limit: "8GB"
+        score: 1.0
+      - path: "ram::cte_ram_tier2"
+        bdev_type: "ram"
+        capacity_limit: "8GB"
+        score: 1.0
+    dpe:
+      dpe_type: "max_bw"
