@@ -36,6 +36,6 @@ pkgs:
     depth: 1
     io_size: "1m"
     io_count: 10
-    nprocs: 4
-    ppn: 1
+    nprocs: 64
+    ppn: 16
     init_runtime: false
