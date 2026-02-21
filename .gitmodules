@@ -31,4 +31,5 @@
 	url = https://github.com/iowarp/iowarp
 	branch = core
 [submodule "external/yaml-cpp"]
-	url = https://github.com/jbeder/yaml-cpp.git
+        path = external/yaml-cpp
+        url = https://github.com/jbeder/yaml-cpp.git
