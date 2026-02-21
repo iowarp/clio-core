@@ -62,6 +62,17 @@ You should store the pointer returned by the singleton GetInstance method. Avoid
 
 Whenever you build a new function, always create a docstring for it. It should document what the parameters mean and the point of the function. It should be something easily parsed by doxygen.
 
+### GPU Compiler Macro Rule
+
+**NEVER** use raw GPU compiler-detection macros (`__CUDACC__`, `__HIPCC__`, `__HIP__`, `__CUDA_ARCH__`, `__HIP_DEVICE_COMPILE__`) anywhere except `context-transport-primitives/include/hermes_shm/constants/macros.h`. We do not want code paths to compile just because a GPU compiler is being used — we need the explicit CMake build flags (`HSHM_ENABLE_CUDA`, `HSHM_ENABLE_ROCM`) to be set as well.
+
+**Use these macros instead:**
+- `HSHM_IS_GPU` — true when compiling device code (replaces `__CUDA_ARCH__` / `__HIP_DEVICE_COMPILE__`)
+- `HSHM_IS_HOST` — true when compiling host code
+- `HSHM_IS_GPU_COMPILER` — true when compiled by nvcc or hipcc AND the build flag is set (replaces `__CUDACC__` / `__HIPCC__`)
+- `HSHM_IS_CUDA_COMPILER` — CUDA-specific compiler check (replaces `HSHM_ENABLE_CUDA && __CUDACC__`)
+- `HSHM_IS_ROCM_COMPILER` — ROCm-specific compiler check (replaces `HSHM_ENABLE_ROCM && __HIPCC__`)
+
 ## File Headers
 
 All C/C++ source files (.h, .hpp, .cc, .cpp) MUST include the IOWarp BSD 3-Clause license header at the top of the file.
@@ -161,28 +172,23 @@ NEVER DO MOCK CODE OR STUB CODE UNLESS SPECIFICALLY STATED OTHERWISE. ALWAYS IMP
 
 ### Dependency Management Strategy
 
-**IMPORTANT**: IOWarp Core uses **conda for all major dependencies** to avoid library conflicts.
-
-**Why Conda?**
-- Prevents version conflicts between system and conda libraries (e.g., system HDF5 with conda libcurl)
-- Ensures reproducible builds across different systems
-- All dependencies are installed in the devcontainer: boost, hdf5, yaml-cpp, zeromq, cereal, catch2, poco, nlohmann_json, etc.
-- No need to install system development packages via apt
+**IMPORTANT**: The Docker devcontainer uses **apt + source builds** for all dependencies. Conda is reserved for CI-only installer paths (`installers/conda/`).
 
 **In the Devcontainer:**
-- The conda base environment is auto-activated with all dependencies
-- CMake will automatically find conda packages via `CMAKE_PREFIX_PATH`
-- Do NOT install development libraries via apt (libboost-dev, libhdf5-dev, etc.) - use conda instead
+- All dependencies are installed via apt or built from source in `deps-cpu.Dockerfile`
+- A Python virtual environment is auto-activated at `/home/iowarp/venv`
+- CMake finds packages via standard `/usr/local` and `/usr` paths
+- Do NOT use conda in the devcontainer — it is not configured there
 
 **Outside the Devcontainer:**
-- Option 1 (Recommended): Use conda to install dependencies: `conda install boost hdf5 yaml-cpp zeromq cereal catch2 poco nlohmann_json`
-- Option 2: Run `install.sh` to build dependencies from source
-- Option 3: Use system packages at your own risk (may cause library conflicts)
+- Option 1 (Recommended): Run `install.sh` to build dependencies from source
+- Option 2: Use system packages via apt
+- Option 3: Use conda via `installers/conda/` recipes
 
-**ADIOS2 Exception:**
-- ADIOS2 is built from source (not from conda) to ensure C++20 compatibility
+**ADIOS2:**
+- ADIOS2 is built from source to ensure C++20 compatibility
 - Uses ADIOS2 v2.11.0 which supports both x86_64 and ARM64 architectures
-- Built with MPI, HDF5, and ZeroMQ support (using conda's HDF5 and ZeroMQ libraries)
+- Built with MPI, HDF5, and ZeroMQ support
 - SST is disabled due to ARM64 Linux compatibility issues in the DILL library
 
 ### Component Build Options

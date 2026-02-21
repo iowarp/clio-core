@@ -52,7 +52,7 @@ class MallocBackend : public MemoryBackend {
   HSHM_CROSS_FUN
   MallocBackend() = default;
 
-  ~MallocBackend() {}
+  ~MallocBackend() { _Destroy(); }
 
   HSHM_CROSS_FUN
   bool shm_init(const MemoryBackendId &backend_id, size_t backend_size) {

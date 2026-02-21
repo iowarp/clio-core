@@ -19,8 +19,8 @@
 [submodule "context-transfer-engine/benchmark/memorybench"]
 	path = context-transfer-engine/benchmark/memorybench
 	url = git@github.com:iowarp/memorybench.git
-[submodule "external/runtime-deployment"]
-	path = external/runtime-deployment
+[submodule "external/jarvis-cd"]
+	path = external/jarvis-cd
 	url = https://github.com/iowarp/runtime-deployment.git
 [submodule "docs"]
 	path = docs

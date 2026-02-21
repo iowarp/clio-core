@@ -101,6 +101,86 @@
             }
         },
         {
+            "name": "asan",
+            "hidden": false,
+            "generator": "Unix Makefiles",
+            "binaryDir": "${sourceDir}/build-asan",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug",
+                "WRP_CORE_ENABLE_RUNTIME": "ON",
+                "WRP_CORE_ENABLE_CTE": "ON",
+                "WRP_CORE_ENABLE_CAE": "ON",
+                "WRP_CORE_ENABLE_CEE": "ON",
+                "WRP_CORE_ENABLE_TESTS": "ON",
+                "WRP_CORE_ENABLE_ELF": "OFF",
+                "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+                "WRP_CORE_ENABLE_ASAN": "ON",
+                "WRP_CORE_ENABLE_UBSAN": "OFF",
+                "WRP_CORE_ENABLE_MSAN": "OFF",
+                "HSHM_LOG_LEVEL": "0"
+            }
+        },
+        {
+            "name": "ubsan",
+            "hidden": false,
+            "generator": "Unix Makefiles",
+            "binaryDir": "${sourceDir}/build-ubsan",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug",
+                "WRP_CORE_ENABLE_RUNTIME": "ON",
+                "WRP_CORE_ENABLE_CTE": "ON",
+                "WRP_CORE_ENABLE_CAE": "ON",
+                "WRP_CORE_ENABLE_CEE": "ON",
+                "WRP_CORE_ENABLE_TESTS": "ON",
+                "WRP_CORE_ENABLE_ELF": "OFF",
+                "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+                "WRP_CORE_ENABLE_ASAN": "OFF",
+                "WRP_CORE_ENABLE_UBSAN": "ON",
+                "WRP_CORE_ENABLE_MSAN": "OFF",
+                "HSHM_LOG_LEVEL": "0"
+            }
+        },
+        {
+            "name": "msan",
+            "hidden": false,
+            "generator": "Unix Makefiles",
+            "binaryDir": "${sourceDir}/build-msan",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug",
+                "WRP_CORE_ENABLE_RUNTIME": "ON",
+                "WRP_CORE_ENABLE_CTE": "ON",
+                "WRP_CORE_ENABLE_CAE": "ON",
+                "WRP_CORE_ENABLE_CEE": "ON",
+                "WRP_CORE_ENABLE_TESTS": "ON",
+                "WRP_CORE_ENABLE_ELF": "OFF",
+                "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+                "WRP_CORE_ENABLE_ASAN": "OFF",
+                "WRP_CORE_ENABLE_UBSAN": "OFF",
+                "WRP_CORE_ENABLE_MSAN": "ON",
+                "HSHM_LOG_LEVEL": "0"
+            }
+        },
+        {
+            "name": "sanitize",
+            "hidden": false,
+            "generator": "Unix Makefiles",
+            "binaryDir": "${sourceDir}/build-sanitize",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Debug",
+                "WRP_CORE_ENABLE_RUNTIME": "ON",
+                "WRP_CORE_ENABLE_CTE": "ON",
+                "WRP_CORE_ENABLE_CAE": "ON",
+                "WRP_CORE_ENABLE_CEE": "ON",
+                "WRP_CORE_ENABLE_TESTS": "ON",
+                "WRP_CORE_ENABLE_ELF": "OFF",
+                "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+                "WRP_CORE_ENABLE_ASAN": "ON",
+                "WRP_CORE_ENABLE_UBSAN": "ON",
+                "WRP_CORE_ENABLE_MSAN": "OFF",
+                "HSHM_LOG_LEVEL": "0"
+            }
+        },
+        {
             "name": "build-cpu-release",
             "hidden": false,
             "generator": "Unix Makefiles",
@@ -116,6 +196,7 @@
                 "WRP_CTE_ENABLE_COMPRESS": "ON",
                 "WRP_CTE_ENABLE_ADIOS2_ADAPTER": "ON",
                 "WRP_CORE_ENABLE_GRAY_SCOTT": "ON",
+                "WRP_CORE_ENABLE_CONDA": "ON",
                 "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
                 "WRP_CORE_ENABLE_ASAN": "OFF",
                 "WRP_CORE_ENABLE_RPATH": "ON",

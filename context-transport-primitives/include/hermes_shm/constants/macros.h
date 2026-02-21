@@ -99,23 +99,45 @@
 #define HSHM_ENABLE_CUDA_OR_ROCM 1
 #endif
 
-/** Includes for CUDA and ROCm */
+/** Detect GPU compilers.
+ * These combine the CMake build flag (HSHM_ENABLE_CUDA / HSHM_ENABLE_ROCM)
+ * with the actual compiler detection (__CUDACC__ / __HIPCC__) so that GPU
+ * code paths are only compiled when BOTH the build was configured for the
+ * GPU backend AND the file is being compiled by the GPU compiler.
+ * All other files MUST use these macros instead of raw __CUDACC__ etc. */
 #if HSHM_ENABLE_CUDA && defined(__CUDACC__)
-#include <cuda_runtime.h>
+#define HSHM_IS_CUDA_COMPILER 1
+#else
+#define HSHM_IS_CUDA_COMPILER 0
 #endif
 
 #if HSHM_ENABLE_ROCM && defined(__HIPCC__)
+#define HSHM_IS_ROCM_COMPILER 1
+#else
+#define HSHM_IS_ROCM_COMPILER 0
+#endif
+
+#if HSHM_IS_CUDA_COMPILER || HSHM_IS_ROCM_COMPILER
+#define HSHM_IS_GPU_COMPILER 1
+#else
+#define HSHM_IS_GPU_COMPILER 0
+#endif
+
+/** Includes for CUDA and ROCm */
+#if HSHM_IS_CUDA_COMPILER
+#include <cuda_runtime.h>
+#endif
+
+#if HSHM_IS_ROCM_COMPILER
 #include <hip/hip_runtime.h>
 #endif
 
 /** Macros for CUDA functions.
  * CUDA/ROCm keywords (__host__, __device__, etc.) are compiler built-ins
- * that only exist when compiling with nvcc (__CUDACC__) or hipcc
- * (__HIPCC__).  Defining them unconditionally when HSHM_ENABLE_CUDA=1 is set
- * causes errors when the same header is included in files compiled with a
- * plain C++ compiler (g++/clang++). */
-#if (HSHM_ENABLE_CUDA && defined(__CUDACC__)) || \
-    (HSHM_ENABLE_ROCM && defined(__HIPCC__))
+ * that only exist when compiling with nvcc or hipcc.  Defining them
+ * unconditionally causes errors when the same header is included in files
+ * compiled with a plain C++ compiler (g++/clang++). */
+#if HSHM_IS_GPU_COMPILER
 #define ROCM_HOST __host__
 #define ROCM_DEVICE __device__
 #define ROCM_HOST_DEVICE __device__ __host__

@@ -15,11 +15,8 @@
     "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached",
     "containerEnv": {
         "IOWARP_CORE_ROOT": "${localWorkspaceFolder}",
-        "CONDA_DEFAULT_ENV": "base",
-        "CONDA_AUTO_ACTIVATE_BASE": "true",
-        "CONDA_PREFIX": "/home/iowarp/miniconda3",
         "CUDA_HOME": "/usr/local/cuda-12.6",
-        "LD_LIBRARY_PATH": "/home/iowarp/miniconda3/lib:/usr/local/cuda-12.6/lib64:/usr/local/cuda-12.6/lib64/stubs:/usr/lib/x86_64-linux-gnu",
+        "LD_LIBRARY_PATH": "/usr/local/lib:/usr/local/cuda-12.6/lib64:/usr/local/cuda-12.6/lib64/stubs:/usr/lib/x86_64-linux-gnu",
         "NVIDIA_VISIBLE_DEVICES": "all",
         "NVIDIA_DRIVER_CAPABILITIES": "compute,utility",
         "ASAN_OPTIONS": "protect_shadow_gap=0"
@@ -59,10 +56,9 @@
             ],
             "settings": {
                 "cmake.configureOnOpen": false,
-                "python.defaultInterpreterPath": "/home/iowarp/miniconda3/bin/python",
+                "python.defaultInterpreterPath": "/home/iowarp/venv/bin/python",
                 "python.terminal.activateEnvironment": true,
                 "python.venvPath": "/home/iowarp",
-                "python.condaPath": "/home/iowarp/miniconda3/bin/conda",
                 "python.formatting.provider": "black",
                 "python.linting.enabled": true,
                 "python.linting.pylintEnabled": false,

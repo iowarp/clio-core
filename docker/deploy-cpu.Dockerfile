@@ -40,19 +40,21 @@ FROM iowarp/deps-cpu:latest AS builder
 WORKDIR /workspace
 COPY . /workspace/
 
-ENV PATH="/home/iowarp/.local/bin:${PATH}"
+ENV VIRTUAL_ENV="/home/iowarp/venv"
+ENV PATH="${VIRTUAL_ENV}/bin:/home/iowarp/.local/bin:${PATH}"
 
 RUN sudo chown -R $(whoami):$(whoami) /workspace && \
     git submodule update --init --recursive && \
-    cd /workspace/external/runtime-deployment && \
-    pip3 install --break-system-packages -e . -r requirements.txt && \
+    cd /workspace/external/jarvis-cd && \
+    pip install -r requirements.txt && \
+    pip install -e . && \
     jarvis init && \
     jarvis rg build && \
     jarvis repo add /workspace/jarvis_iowarp && \
     cd /workspace && \
     mkdir -p build && \
     cd build && \
-    cmake --preset build-cpu-release ../ && \
+    cmake --preset build-cpu-release -DWRP_CORE_ENABLE_CONDA=OFF ../ && \
     sudo make -j$(nproc) install
 
 # Seed default config at ~/.chimaera/chimaera.yaml (picked up automatically by runtime)

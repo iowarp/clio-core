@@ -39,10 +39,10 @@
 
 #include "hermes_shm/constants/macros.h"
 #include "numbers.h"
-#if HSHM_ENABLE_CUDA && defined(__CUDACC__)
+#if HSHM_IS_CUDA_COMPILER
 #include <cuda/atomic>
 #endif
-#if HSHM_ENABLE_ROCM && defined(__HIPCC__)
+#if HSHM_IS_ROCM_COMPILER
 #include <hip/hip_runtime.h>
 #endif
 
@@ -381,7 +381,7 @@ struct rocm_atomic {
   /** System-scope atomic store (visible to CPU from GPU) */
   template <typename U>
   HSHM_INLINE_CROSS_FUN void store_system(U count) {
-#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
+#if HSHM_IS_GPU
     if constexpr (sizeof(T) == 8) {
       atomicExch_system(reinterpret_cast<unsigned long long*>(&x),
                         static_cast<unsigned long long>(count));
@@ -398,7 +398,7 @@ struct rocm_atomic {
    * Uses volatile read since HostNativeAtomicSupported=0 on many GPUs
    * means atomicAdd_system(ptr,0) won't see CPU-side writes. */
   HSHM_INLINE_CROSS_FUN T load_system() const {
-#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
+#if HSHM_IS_GPU
     return *reinterpret_cast<const volatile T*>(&x);
 #else
     return x;
@@ -532,7 +532,7 @@ struct rocm_atomic {
   /** System-scope bitwise or assign (visible to CPU from GPU) */
   template <typename U>
   HSHM_INLINE_CROSS_FUN rocm_atomic &or_system(U other) {
-#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
+#if HSHM_IS_GPU
     atomicOr_system(reinterpret_cast<unsigned int*>(&x),
                     static_cast<unsigned int>(other));
 #else
@@ -801,9 +801,7 @@ using opt_atomic =
 
 /** Device-scope memory fence */
 HSHM_INLINE_CROSS_FUN static void threadfence() {
-#if defined(__CUDA_ARCH__)
-  __threadfence();
-#elif defined(__HIP_DEVICE_COMPILE__)
+#if HSHM_IS_GPU
   __threadfence();
 #else
   std::atomic_thread_fence(std::memory_order_release);
@@ -812,9 +810,7 @@ HSHM_INLINE_CROSS_FUN static void threadfence() {
 
 /** System-scope memory fence (ensures GPU writes are visible to CPU) */
 HSHM_INLINE_CROSS_FUN static void threadfence_system() {
-#if defined(__CUDA_ARCH__)
-  __threadfence_system();
-#elif defined(__HIP_DEVICE_COMPILE__)
+#if HSHM_IS_GPU
   __threadfence_system();
 #else
   std::atomic_thread_fence(std::memory_order_seq_cst);

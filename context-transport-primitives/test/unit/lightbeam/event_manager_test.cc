@@ -218,7 +218,7 @@ void TestMultipleEvents() {
 
   EventManager em;
 
-  int pipe1[2], pipe2[2], pipe3[2];
+  int pipe1[2] = {}, pipe2[2] = {}, pipe3[2] = {};
   assert(pipe(pipe1) == 0);
   assert(pipe(pipe2) == 0);
   assert(pipe(pipe3) == 0);
@@ -229,8 +229,8 @@ void TestMultipleEvents() {
 
   // Trigger 2 out of 3 pipes
   char buf = 'a';
-  write(pipe1[1], &buf, 1);
-  write(pipe3[1], &buf, 1);
+  (void)write(pipe1[1], &buf, 1);
+  (void)write(pipe3[1], &buf, 1);
 
   // Give a moment for epoll to see events
   std::this_thread::sleep_for(std::chrono::milliseconds(10));

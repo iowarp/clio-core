@@ -72,7 +72,7 @@ class GpuShmMmap : public MemoryBackend, public UrlMemoryBackend {
  public:
   /** Constructor */
   HSHM_CROSS_FUN
-  GpuShmMmap() {}
+  GpuShmMmap() : fd_{} {}
 
   /** Destructor */
   HSHM_CROSS_FUN

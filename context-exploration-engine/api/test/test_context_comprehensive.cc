@@ -141,7 +141,7 @@ public:
 
   void SetupTestData() {
     // Create test data directory
-    system(("mkdir -p " + test_data_dir_).c_str());
+    (void)system(("mkdir -p " + test_data_dir_).c_str());
 
     // Generate small binary test file
     GenerateBinaryFile(test_binary_file_, kSmallFileSize);

@@ -63,10 +63,21 @@ class EventManager {
 
   int AddEvent(int fd, uint32_t events = EPOLLIN,
                EventAction *action = nullptr) {
-    int event_id = next_event_id_++;
     struct epoll_event ev;
     ev.events = events;
     ev.data.fd = fd;
+    auto it = fd_to_reg_.find(fd);
+    if (it != fd_to_reg_.end()) {
+      if (epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, fd, &ev) == -1) {
+        HLOG(kError,
+             "EventManager::AddEvent: epoll_ctl MOD failed for fd={}: {}", fd,
+             strerror(errno));
+        return -1;
+      }
+      it->second.action_ = action;
+      return it->second.event_id_;
+    }
+    int event_id = next_event_id_++;
     if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &ev) == -1) {
       HLOG(kError, "EventManager::AddEvent: epoll_ctl ADD failed for fd={}: {}",
            fd, strerror(errno));

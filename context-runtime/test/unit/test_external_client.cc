@@ -72,8 +72,8 @@ pid_t StartServerProcess() {
   if (server_pid == 0) {
     // Redirect child's stdout/stderr to /dev/null to prevent massive
     // worker log output from flooding shared pipes and blocking parent
-    freopen("/dev/null", "w", stdout);
-    freopen("/dev/null", "w", stderr);
+    (void)freopen("/dev/null", "w", stdout);
+    (void)freopen("/dev/null", "w", stderr);
 
     // Child process: Start runtime server
     setenv("CHI_WITH_RUNTIME", "1", 1);
@@ -194,8 +194,8 @@ TEST_CASE("ExternalClient - Multiple Clients", "[external_client][ipc]") {
     client_pids[i] = fork();
     if (client_pids[i] == 0) {
       // Suppress child output to prevent log flood
-      freopen("/dev/null", "w", stdout);
-      freopen("/dev/null", "w", stderr);
+      (void)freopen("/dev/null", "w", stdout);
+      (void)freopen("/dev/null", "w", stderr);
 
       // Child process: Connect as client
       setenv("CHI_WITH_RUNTIME", "0", 1);

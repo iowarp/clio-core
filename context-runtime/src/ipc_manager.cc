@@ -1784,6 +1784,9 @@ void IpcManager::RecvZmqClientThread() {
       if (rc != 0) {
         zmq_transport_->ClearRecvHandles(*archive);
         if (!zmq_recv_running_.load()) break;
+        // ETERM means the ZMQ context is being shut down (zmq_ctx_shutdown was
+        // called).  Exit immediately so the context destructor is not blocked.
+        if (rc == ETERM) return;
         HLOG(kDebug, "RecvZmqClientThread: Recv returned: {}", rc);
         continue;
       }

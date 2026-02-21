@@ -87,8 +87,8 @@ pid_t StartServerProcess() {
     // Become process group leader so we can kill all children
     setpgid(0, 0);
 
-    freopen("/dev/null", "w", stdout);
-    freopen("/tmp/chimaera_server_retry_test.log", "w", stderr);
+    (void)freopen("/dev/null", "w", stdout);
+    (void)freopen("/tmp/chimaera_server_retry_test.log", "w", stderr);
 
     // Use exec to get a clean process with no static guard state
     setenv("CHI_WITH_RUNTIME", "1", 1);
@@ -141,7 +141,7 @@ void KillServerHard(pid_t server_pid) {
   // Remove unix domain socket
   unlink("/tmp/chimaera_9413.ipc");
   // Remove any /dev/shm artifacts
-  system("rm -f /dev/shm/chimaera_* 2>/dev/null");
+  (void)system("rm -f /dev/shm/chimaera_* 2>/dev/null");
 
   // Brief pause to let OS reclaim ports
   std::this_thread::sleep_for(std::chrono::milliseconds(1000));
@@ -157,7 +157,7 @@ void CleanupServer(pid_t server_pid) {
     waitpid(server_pid, &status, 0);
     CleanupSharedMemory();
     unlink("/tmp/chimaera_9413.ipc");
-    system("rm -f /dev/shm/chimaera_* 2>/dev/null");
+    (void)system("rm -f /dev/shm/chimaera_* 2>/dev/null");
   }
 }
 

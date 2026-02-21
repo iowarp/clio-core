@@ -87,6 +87,9 @@ void TestZeroMQ() {
   std::cout << "Received: " << received << std::endl;
   assert(received == magic);
 
+  // Free the zmq_msg_t handles stored in bulk.desc by zero-copy recv
+  server->ClearRecvHandles(recv_meta);
+
   std::cout << "[ZeroMQ] Test passed!\n";
 #else
   std::cout << "ZeroMQ not enabled, skipping test\n";

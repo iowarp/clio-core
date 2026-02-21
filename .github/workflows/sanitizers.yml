@@ -1,0 +1,44 @@
+name: Sanitizers
+
+on:
+  push:
+    branches: main
+  pull_request:
+    branches: main
+  workflow_dispatch:
+
+jobs:
+  sanitizers:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [asan, ubsan, msan]
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v5
+      with:
+        submodules: recursive
+
+    - name: Install sanitizer runtime libraries
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libasan8 libubsan1
+
+    - name: Build and test with ${{ matrix.sanitizer }}
+      run: |
+        chmod +x install.sh CI/run_sanitizers.sh
+        ./install.sh
+        if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
+          source "$HOME/miniconda3/etc/profile.d/conda.sh"
+        elif [ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]; then
+          source "$HOME/anaconda3/etc/profile.d/conda.sh"
+        elif command -v conda &>/dev/null; then
+          eval "$(conda shell.bash hook)"
+        fi
+        conda activate iowarp
+        ./CI/run_sanitizers.sh \
+          --${{ matrix.sanitizer }} \
+          --build \
+          --site "ubu-24.amd64-${{ matrix.sanitizer }}"

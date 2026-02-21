@@ -72,16 +72,34 @@ static inline void ClearZmqRecvHandles(LbmMeta<> &meta) {
 class ZeroMqTransport : public Transport {
  private:
   static void* GetSharedContext() {
-    static void* shared_ctx = nullptr;
-    static std::mutex ctx_mutex;
-
-    std::lock_guard<std::mutex> lock(ctx_mutex);
-    if (!shared_ctx) {
-      shared_ctx = zmq_ctx_new();
-      zmq_ctx_set(shared_ctx, ZMQ_IO_THREADS, 2);
+    // CtxOwner holds the shared ZMQ context and destroys it at program exit,
+    // ensuring libzmq releases its internal resources and LeakSanitizer is clean.
+    struct CtxOwner {
+      void* ctx = nullptr;
+      std::mutex mtx;
+      ~CtxOwner() {
+        if (ctx) {
+          // zmq_ctx_shutdown() causes all blocking ZMQ calls on open sockets
+          // to return immediately with ETERM.  This unblocks any background
+          // receive threads (e.g. RecvZmqClientThread) that are polling the
+          // socket, allowing them to exit cleanly.  zmq_ctx_destroy() would
+          // otherwise block forever if a socket is still open (because the
+          // Chimaera singleton is heap-allocated and its destructor -- which
+          // calls ClientFinalize / closes the socket -- is never invoked).
+          zmq_ctx_shutdown(ctx);
+          zmq_ctx_destroy(ctx);
+          ctx = nullptr;
+        }
+      }
+    };
+    static CtxOwner owner;
+    std::lock_guard<std::mutex> lock(owner.mtx);
+    if (!owner.ctx) {
+      owner.ctx = zmq_ctx_new();
+      zmq_ctx_set(owner.ctx, ZMQ_IO_THREADS, 2);
       HLOG(kInfo, "[ZeroMqTransport] Created shared context with 2 I/O threads");
     }
-    return shared_ctx;
+    return owner.ctx;
   }
 
  public:

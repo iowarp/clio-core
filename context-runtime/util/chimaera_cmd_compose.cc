@@ -53,6 +53,20 @@ int Compose(int argc, char** argv) {
     return 1;
   }
 
+  // RAII guard: call ClientFinalize() on every return path so the background
+  // ZMQ receive thread is joined and the DEALER socket is closed before the
+  // ZMQ shared-context static destructor runs.  Without this, zmq_ctx_destroy
+  // blocks forever because the singleton Chimaera object is heap-allocated
+  // (via GetGlobalPtrVar) and its destructor is never invoked by the runtime.
+  struct ClientFinalizeGuard {
+    ~ClientFinalizeGuard() {
+      auto* mgr = CHI_CHIMAERA_MANAGER;
+      if (mgr) {
+        mgr->ClientFinalize();
+      }
+    }
+  } finalize_guard;
+
   auto* config_manager = CHI_CONFIG_MANAGER;
   if (!config_manager->LoadYaml(config_path)) {
     HLOG(kError, "Failed to load configuration from {}", config_path);

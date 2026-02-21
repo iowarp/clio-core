@@ -56,7 +56,7 @@ struct EventInfo;
 class EventAction {
  public:
   virtual ~EventAction() = default;
-  virtual void Run(const EventInfo &event) = 0;
+  virtual void Run(const EventInfo& event) = 0;
 };
 
 struct EventInfo {

@@ -155,8 +155,8 @@ pid_t StartServerProcess() {
   pid_t server_pid = fork();
   if (server_pid == 0) {
     // Redirect child's stdout to /dev/null but stderr to temp file for timing
-    freopen("/dev/null", "w", stdout);
-    freopen("/tmp/chimaera_server_timing.log", "w", stderr);
+    (void)freopen("/dev/null", "w", stdout);
+    (void)freopen("/tmp/chimaera_server_timing.log", "w", stderr);
 
     // Child process: Start runtime server
     setenv("CHI_WITH_RUNTIME", "1", 1);

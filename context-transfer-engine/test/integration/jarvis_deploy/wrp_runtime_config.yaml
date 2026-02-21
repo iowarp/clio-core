@@ -1,0 +1,29 @@
+---
+# WRP Runtime Configuration for Jarvis Deployment Test
+# Runtime-only config (no compose section) - matches Jarvis WrpRuntime output
+# CTE compose is a separate step via `chimaera compose`
+
+# Memory segment configuration
+memory:
+  main_segment_size: auto
+  client_data_segment_size: 2GB
+  runtime_data_segment_size: 2GB
+
+# Network configuration
+networking:
+  port: 9413
+  neighborhood_size: 2
+  # Hostfile path inside Docker container (mounted workspace)
+  hostfile: /workspace/context-transfer-engine/test/integration/jarvis_deploy/hostfile
+
+# Logging configuration
+logging:
+  level: info
+  file: /tmp/chimaera.log
+
+# Runtime configuration
+runtime:
+  num_threads: 8
+  queue_depth: 1024
+  local_sched: "default"
+  heartbeat_interval: 1000
