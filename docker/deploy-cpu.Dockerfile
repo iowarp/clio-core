@@ -54,7 +54,7 @@ RUN sudo chown -R $(whoami):$(whoami) /workspace && \
     cd /workspace && \
     mkdir -p build && \
     cd build && \
-    cmake --preset build-cpu-release ../ && \
+    cmake --preset build-cpu-release -DWRP_CORE_ENABLE_CONDA=OFF ../ && \
     sudo make -j$(nproc) install
 
 # Seed default config at ~/.chimaera/chimaera.yaml (picked up automatically by runtime)
