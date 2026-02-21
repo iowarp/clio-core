@@ -194,7 +194,7 @@ bool IpcManager::ClientInit() {
     HLOG(kDebug, "Retrieved node ID from shared memory: 0x{:x}",
          this_host_.node_id);
   } else {
-    HLOG(kError, "Warning: Could not access shared header during ClientInit");
+    HLOG(kWarning, "Warning: Could not access shared header during ClientInit");
     this_host_ = Host();  // Default constructor gives node_id = 0
   }
 
@@ -746,15 +746,15 @@ bool IpcManager::LoadHostfile() {
         hshm::ConfigParse::ParseHostfile(hostfile_path);
 
     // Create Host structs and populate map using linear offset-based node IDs
-    HLOG(kInfo, "=== Container to Node ID Mapping (Linear Offset) ===");
+    HLOG(kDebug, "=== Container to Node ID Mapping (Linear Offset) ===");
     for (size_t offset = 0; offset < host_ips.size(); ++offset) {
       u64 node_id = static_cast<u64>(offset);
       Host host(host_ips[offset], node_id);
       hostfile_map_[node_id] = host;
-      HLOG(kInfo, "  Hostfile[{}]: {} -> Node ID: {}", offset, host_ips[offset],
+      HLOG(kDebug, "  Hostfile[{}]: {} -> Node ID: {}", offset, host_ips[offset],
            node_id);
     }
-    HLOG(kInfo, "=== Total hosts loaded: {} ===", hostfile_map_.size());
+    HLOG(kDebug, "=== Total hosts loaded: {} ===", hostfile_map_.size());
     if (hostfile_map_.empty()) {
       HLOG(kFatal, "There were no hosts in the hostfile {}", hostfile_path);
     }

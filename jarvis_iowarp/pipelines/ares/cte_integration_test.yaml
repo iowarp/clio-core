@@ -1,0 +1,41 @@
+# CTE Integration Test Pipeline (Ares cluster)
+# Tests the IOWarp runtime + CTE deployment via Jarvis on 4 Ares nodes.
+#
+# Usage:
+#   jarvis hostfile set ~/hostfile.txt
+#   jarvis ppl run yaml
+
+name: cte_integration_test
+
+pkgs:
+  # Stage 1: Launch IOWarp runtime on all nodes in the hostfile (via parallel SSH)
+  - pkg_type: jarvis_iowarp.wrp_runtime
+    pkg_name: runtime
+    num_threads: 4
+    client_data_segment_size: "2G"
+    port: 9413
+    ipc_mode: "tcp"
+    log_level: "info"
+    sleep: 8
+
+  # Stage 2: Deploy CTE pools on all nodes (via parallel SSH + chimaera compose)
+  - pkg_type: jarvis_iowarp.wrp_cte
+    pkg_name: cte_core
+    devices:
+      - ["ram::cte_ram_tier1", "4GB", 1.0]
+    dpe_type: "max_bw"
+    neighborhood: 2
+    default_target_timeout_ms: 30000
+    poll_period_ms: 5000
+
+  # Stage 3: Run CTE benchmark (4 procs, 1 per node)
+  - pkg_type: jarvis_iowarp.wrp_cte_bench
+    pkg_name: cte_bench
+    test_case: "PutGet"
+    num_threads: 1
+    depth: 1
+    io_size: "1m"
+    io_count: 1
+    nprocs: 4
+    ppn: 1
+    init_runtime: false

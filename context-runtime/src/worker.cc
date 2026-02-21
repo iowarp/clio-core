@@ -712,7 +712,7 @@ bool Worker::RouteGlobal(Future<Task> &future,
   // Log the global routing for debugging
   if (!pool_queries.empty()) {
     const auto &query = pool_queries[0];
-    HLOG(kInfo,
+    HLOG(kDebug,
          "Worker {}: RouteGlobal - routing task method={}, pool_id={} to node "
          "{} (routing_mode={})",
          worker_id_, task_ptr->method_, task_ptr->pool_id_, query.GetNodeId(),
@@ -731,7 +731,7 @@ bool Worker::RouteGlobal(Future<Task> &future,
   // Set TASK_ROUTED flag on original task
   task_ptr->SetFlags(TASK_ROUTED);
 
-  HLOG(kInfo, "Worker {}: RouteGlobal - task enqueued to net_queue",
+  HLOG(kDebug, "Worker {}: RouteGlobal - task enqueued to net_queue",
        worker_id_);
 
   // Always return true (never fail)

@@ -647,7 +647,7 @@ chi::TaskResume Runtime::Send(hipc::FullPtr<SendTask> task,
     // Get the original task from the Future
     auto origin_task = queued_future.GetTaskPtr();
     if (!origin_task.IsNull()) {
-      HLOG(kInfo, "[Send] Processing SendIn task method={}, pool_id={}",
+      HLOG(kDebug, "[Send] Processing SendIn task method={}, pool_id={}",
            origin_task->method_, origin_task->pool_id_);
       SendIn(origin_task, rctx);
       did_send = true;
@@ -656,7 +656,7 @@ chi::TaskResume Runtime::Send(hipc::FullPtr<SendTask> task,
   }
 
   if (send_in_count > 0) {
-    HLOG(kInfo, "[Send] Processed {} SendIn tasks", send_in_count);
+    HLOG(kDebug, "[Send] Processed {} SendIn tasks", send_in_count);
   }
 
   // Poll priority 1 (SendOut) queue - tasks with outputs to send back
@@ -666,7 +666,7 @@ chi::TaskResume Runtime::Send(hipc::FullPtr<SendTask> task,
     // Get the original task from the Future
     auto origin_task = queued_future.GetTaskPtr();
     if (!origin_task.IsNull()) {
-      HLOG(kInfo, "[Send] Processing SendOut task method={}, pool_id={}",
+      HLOG(kDebug, "[Send] Processing SendOut task method={}, pool_id={}",
            origin_task->method_, origin_task->pool_id_);
       SendOut(origin_task);
       did_send = true;
@@ -675,7 +675,7 @@ chi::TaskResume Runtime::Send(hipc::FullPtr<SendTask> task,
   }
 
   if (send_out_count > 0) {
-    HLOG(kInfo, "[Send] Processed {} SendOut tasks", send_out_count);
+    HLOG(kDebug, "[Send] Processed {} SendOut tasks", send_out_count);
   }
 
   // Track whether this execution did actual work
