@@ -94,6 +94,14 @@ const chi::u64 k1MB = 1048576;
 bool g_initialized = false;
 int g_test_counter = 0;
 
+void ChimaeraFinalizeAtExit() {
+  auto* mgr = CHI_CHIMAERA_MANAGER;
+  if (mgr) {
+    mgr->ServerFinalize();
+    mgr->ClientFinalize();
+  }
+}
+
 /**
  * Helper function to wrap a single block in a chi::priv::vector
  * @param block Single block to wrap
@@ -1796,4 +1804,12 @@ TEST_CASE("bdev_force_net_flag", "[bdev][network][force_net]") {
 // MAIN TEST RUNNER
 //==============================================================================
 
-SIMPLE_TEST_MAIN()
+int main(int argc, char* argv[]) {
+    std::string filter = "";
+    if (argc > 1) {
+        filter = argv[1];
+    }
+    int result = SimpleTest::run_all_tests(filter);
+    ChimaeraFinalizeAtExit();
+    _exit(result);
+}

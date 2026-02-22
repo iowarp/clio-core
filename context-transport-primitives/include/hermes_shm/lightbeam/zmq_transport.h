@@ -222,7 +222,7 @@ class ZeroMqTransport : public Transport {
     HLOG(kDebug, "ZeroMqTransport destructor - closing socket to {}:{}", addr_,
          port_);
 
-    int linger = 5000;
+    int linger = 0;
     zmq_setsockopt(socket_, ZMQ_LINGER, &linger, sizeof(linger));
 
     zmq_close(socket_);

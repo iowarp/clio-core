@@ -158,10 +158,19 @@ void WorkOrchestrator::StopWorkers() {
 
   HLOG(kDebug, "Stopping {} worker threads...", all_workers_.size());
 
-  // Stop all workers
+  // Stop all workers and wake them from epoll_wait
+  pid_t runtime_pid = getpid();
   for (auto *worker : all_workers_) {
     if (worker) {
       worker->Stop();
+      // Wake worker from epoll_wait so it can observe is_running_ == false
+      TaskLane *lane = worker->GetLane();
+      if (lane) {
+        pid_t tid = lane->GetTid();
+        if (tid > 0) {
+          hshm::lbm::EventManager::Signal(runtime_pid, tid);
+        }
+      }
     }
   }
 
