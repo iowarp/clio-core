@@ -786,7 +786,9 @@ if(WRP_CORE_ENABLE_LLAMA)
     # CMake's CUDA platform variables.  Add it LAST so it cannot corrupt the
     # IOWarp CUDA targets already defined above.
     if(WRP_CORE_ENABLE_LLAMA_SERVER)
-        set(GGML_CUDA OFF CACHE BOOL "Disabled: IOWarp handles GPU storage via CTE" FORCE)
+        # GGML_CUDA controls llama.cpp's own GPU inference backend independently
+        # from WRP_CORE_ENABLE_CUDA (IOWarp's own CUDA targets).
+        # Pass -DGGML_CUDA=ON on the command line to enable GPU inference.
         add_subdirectory(external/llama.cpp)
         message(STATUS "llama.cpp server integration enabled")
 
