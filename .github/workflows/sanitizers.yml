@@ -33,7 +33,7 @@ jobs:
         sudo apt-get update
         # clang ships with compiler-rt which includes the MSan runtime;
         # llvm provides llvm-symbolizer for human-readable MSan reports.
-        sudo apt-get install -y clang llvm
+        sudo apt-get install -y clang llvm libhdf5-dev
 
     - name: Build and test with ${{ matrix.sanitizer }}
       run: |
