@@ -33,6 +33,9 @@ set(IOWARP_ENGINE_SRCS
 
 # New CTE-based Iowarp Engine
 add_library(iowarp_engine ${IOWARP_ENGINE_SRCS})
+# ADIOS2 2.10.2 headers use Variable<T>() constructor syntax that is
+# incompatible with C++20 on GCC 11 (triggers parsing error in Variable.h).
+set_target_properties(iowarp_engine PROPERTIES CXX_STANDARD 17)
 target_include_directories(iowarp_engine PUBLIC
   ${CMAKE_SOURCE_DIR}/include
   ${ADIOS2_INCLUDE_DIR}
