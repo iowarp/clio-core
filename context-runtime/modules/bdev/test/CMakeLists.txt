@@ -30,7 +30,7 @@ target_link_libraries(${BDEV_TEST_TARGET}
 
 # Set C++ standard for bdev tests
 set_target_properties(${BDEV_TEST_TARGET} PROPERTIES
-  CXX_STANDARD 17
+  CXX_STANDARD 20
   CXX_STANDARD_REQUIRED ON
 )
 

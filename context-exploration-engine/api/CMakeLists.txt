@@ -33,7 +33,7 @@ target_link_libraries(wrp_cee_api
 set_target_properties(wrp_cee_api PROPERTIES
   VERSION ${PROJECT_VERSION}
   SOVERSION 1
-  CXX_STANDARD 17
+  CXX_STANDARD 20
   CXX_STANDARD_REQUIRED ON
 )
 

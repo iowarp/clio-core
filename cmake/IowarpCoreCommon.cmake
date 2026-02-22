@@ -410,7 +410,7 @@ function(add_chimod_client)
   add_library(${TARGET_NAME} SHARED ${ARG_SOURCES})
 
   # Set C++ standard
-  set(CHIMAERA_CXX_STANDARD 17)
+  set(CHIMAERA_CXX_STANDARD 20)
   target_compile_features(${TARGET_NAME} PUBLIC cxx_std_${CHIMAERA_CXX_STANDARD})
 
   # Common compile definitions
@@ -552,7 +552,7 @@ function(add_chimod_runtime)
   add_library(${TARGET_NAME} SHARED ${ARG_SOURCES})
 
   # Set C++ standard
-  set(CHIMAERA_CXX_STANDARD 17)
+  set(CHIMAERA_CXX_STANDARD 20)
   target_compile_features(${TARGET_NAME} PUBLIC cxx_std_${CHIMAERA_CXX_STANDARD})
 
   # Common compile definitions

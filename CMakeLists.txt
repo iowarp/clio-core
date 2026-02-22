@@ -616,8 +616,12 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   add_compile_options(-fcoroutines)
   message(STATUS "GCC detected - enabling coroutines with -fcoroutines")
 elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-  # Clang 14+ supports coroutines in C++20 mode natively
-  message(STATUS "Clang detected - coroutines enabled via C++20 mode")
+  # GCC's libstdc++ <coroutine> header (the default C++ runtime on Linux)
+  # guards itself with __cpp_impl_coroutine, which GCC sets via -fcoroutines.
+  # Clang does not pass that flag automatically, so we add it explicitly so
+  # the libstdc++ header compiles cleanly under Clang.
+  add_compile_options(-fcoroutines)
+  message(STATUS "Clang detected - enabling coroutines with -fcoroutines (libstdc++ compat)")
 endif()
 
 # Export compile commands for IDE integration - Applied to all subdirectories
