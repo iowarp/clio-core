@@ -180,7 +180,7 @@ class WrpRuntime(Service):
         # Launch runtime on all nodes using PsshExecInfo
         # IMPORTANT: Use env (shared environment), not mod_env
         self.log(f"Starting IOWarp runtime on all nodes")
-        self.log(f"  Config (CHI_SERVER_CONF): {self.config_file}")
+        self.log(f"  Config (CHI_SERVER_CONF from env): {self.env.get('CHI_SERVER_CONF', 'NOT SET')}")
         self.log(f"  Nodes: {len(self.jarvis.hostfile)}")
 
         # The chimaera binary will read CHI_SERVER_CONF from environment

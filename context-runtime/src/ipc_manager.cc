@@ -1928,14 +1928,18 @@ bool IpcManager::RouteTask(Future<Task> &future, bool force_enqueue) {
     return true;
   }
 
-  // Call ScheduleTask on the static container to resolve Dynamic pool queries.
-  // The static container's ScheduleTask can inspect the task and return an
-  // updated PoolQuery (e.g., Local, Broadcast, DirectHash).
+  // Only call ScheduleTask for Dynamic pool queries.
+  // ScheduleTask resolves Dynamic routing into concrete modes (e.g.,
+  // Broadcast, DirectHash, Local). Concrete routing modes (Range, Physical,
+  // Local, Broadcast, etc.) were set by a previous routing step and must
+  // not be overridden — doing so would cause infinite re-broadcast loops
+  // when tasks arrive at remote nodes (e.g., GetOrCreatePool returns
+  // Broadcast on every node since the pool doesn't exist yet).
   auto *pool_manager = CHI_POOL_MANAGER;
   Container *static_container =
       pool_manager->GetStaticContainer(task_ptr->pool_id_);
   PoolQuery resolved_query = task_ptr->pool_query_;
-  if (static_container) {
+  if (static_container && resolved_query.IsDynamicMode()) {
     resolved_query = static_container->ScheduleTask(task_ptr);
     task_ptr->pool_query_ = resolved_query;
   }
