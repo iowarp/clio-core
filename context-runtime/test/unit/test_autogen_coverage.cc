@@ -13776,7 +13776,7 @@ TEST_CASE("Autogen - DefaultScheduler AdjustPolling", "[autogen][scheduler][adju
   SECTION("RuntimeMapTask with null worker") {
     chi::DefaultScheduler sched;
     chi::Future<chi::Task> f;
-    chi::u32 result = sched.RuntimeMapTask(nullptr, f);
+    chi::u32 result = sched.RuntimeMapTask(nullptr, f, nullptr);
     REQUIRE(result == 0);
     INFO("RuntimeMapTask(nullptr) returned 0");
   }

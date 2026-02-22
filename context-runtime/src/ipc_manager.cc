@@ -65,6 +65,7 @@
 #include "chimaera/admin/admin_client.h"
 #include "chimaera/chimaera_manager.h"
 #include "chimaera/config_manager.h"
+#include "chimaera/pool_manager.h"
 #include "chimaera/scheduler/scheduler_factory.h"
 
 // Global pointer variable definition for IPC manager singleton
@@ -1858,6 +1859,74 @@ bool IpcManager::RegisterAcceleratorMemory(const hipc::MemoryBackend &backend) {
 
   return true;
 #endif
+}
+
+Future<Task> IpcManager::SendRuntime(const hipc::FullPtr<Task> &task_ptr) {
+  Worker *worker = CHI_CUR_WORKER;
+
+  // Only mark as routed when called from a worker thread (RouteLocal path).
+  // Tasks from the main/client thread still need the full RouteTask pipeline
+  // on the worker (pool query resolution, Monitor, container derivation).
+  Container *container = nullptr;
+  if (worker != nullptr) {
+    task_ptr->SetFlags(TASK_ROUTED);
+
+    // Derive the execution container from the task's pool_id / pool_query.
+    // Try the exact container first; fall back to the static container so that
+    // the result is never nullptr (static containers always exist for a pool).
+    auto *pool_manager = CHI_POOL_MANAGER;
+    if (pool_manager != nullptr) {
+      bool is_plugged = false;
+      ContainerId container_id = task_ptr->pool_query_.GetContainerId();
+      container = pool_manager->GetContainer(task_ptr->pool_id_, container_id,
+                                             is_plugged);
+      if (container == nullptr || is_plugged) {
+        container = pool_manager->GetStaticContainer(task_ptr->pool_id_);
+      }
+    }
+
+    // Set task completer and attach container to run-context.
+    if (container != nullptr) {
+      task_ptr->SetCompleter(container->container_id_);
+      if (task_ptr->run_ctx_) {
+        task_ptr->run_ctx_->container_ = container;
+      }
+    }
+  }
+
+  // Wrap the task in a pointer Future (no serialization — runtime path).
+  Future<Task> future = MakePointerFuture(task_ptr);
+
+  // Set parent task RunContext from current worker so that EndTask can
+  // enqueue a completion event back to the parent's event queue.  Without
+  // this, coroutines that co_await child tasks will never be resumed.
+  if (worker != nullptr) {
+    RunContext *run_ctx = worker->GetCurrentRunContext();
+    if (run_ctx != nullptr) {
+      future.SetParentTask(run_ctx);
+    }
+  }
+
+  // Pick the target worker lane via RuntimeMapTask (or ClientMapTask when
+  // there is no current worker context, e.g. from the main thread).
+  u32 lane_id = 0;
+  if (worker != nullptr && scheduler_ != nullptr) {
+    lane_id = scheduler_->RuntimeMapTask(worker, future, container);
+  } else if (scheduler_ != nullptr) {
+    lane_id = scheduler_->ClientMapTask(this, future);
+  }
+
+  // Enqueue the future and awaken the target worker if it was idle.
+  if (!worker_queues_.IsNull()) {
+    auto &lane = worker_queues_->GetLane(lane_id, 0);
+    bool was_empty = lane.Empty();
+    lane.Push(future);
+    if (was_empty) {
+      AwakenWorker(&lane);
+    }
+  }
+
+  return future;
 }
 
 }  // namespace chi

@@ -82,8 +82,33 @@ class Worker;
 RunContext* GetCurrentRunContextFromWorker();
 
 /**
+ * TaskGroup - Identifies a scheduling affinity group
+ *
+ * Tasks in the same group are pinned to the same worker once routed.
+ * A null TaskGroup (id_ == -1) means no affinity group.
+ */
+struct TaskGroup {
+  int64_t id_{-1}; /**< Group identifier; -1 = null (no group) */
+
+  /** Default constructor - null group */
+  HSHM_CROSS_FUN TaskGroup() : id_(-1) {}
+
+  /** Construct with explicit group ID */
+  HSHM_CROSS_FUN explicit TaskGroup(int64_t id) : id_(id) {}
+
+  /** Check if this group is null (unassigned) */
+  HSHM_CROSS_FUN bool IsNull() const { return id_ == -1; }
+
+  /** Equality operators */
+  HSHM_CROSS_FUN bool operator==(const TaskGroup& o) const { return id_ == o.id_; }
+  HSHM_CROSS_FUN bool operator!=(const TaskGroup& o) const { return id_ != o.id_; }
+};
+
+/**
  * Task statistics for I/O and compute time tracking
- * Used to route tasks to appropriate worker groups
+ * Represents group-level properties: when a task belongs to a TaskGroup,
+ * these stats describe the characteristics of the entire group (not just
+ * the individual task) and are used to route all group tasks consistently.
  */
 struct TaskStat {
   size_t io_size_{0}; /**< I/O size in bytes */
@@ -117,7 +142,8 @@ class Task {
       return_code_; /**< Task return code (0=success, non-zero=error) */
   OUT hipc::atomic<ContainerId>
       completer_; /**< Container ID that completed this task */
-  TaskStat stat_; /**< Task statistics for I/O and compute tracking */
+  TaskStat stat_;        /**< Task statistics for I/O and compute tracking */
+  TaskGroup task_group_; /**< Scheduling affinity group (null = no affinity) */
 
   /**
    * Default constructor
@@ -163,6 +189,7 @@ class Task {
     return_code_.store(other->return_code_.load());
     completer_.store(other->completer_.load());
     stat_ = other->stat_;
+    task_group_ = other->task_group_;
   }
 
   /**
@@ -182,6 +209,7 @@ class Task {
     completer_.store(0);    // Initialize as null (0 is invalid container ID)
     stat_.io_size_ = 0;
     stat_.compute_ = 0;
+    task_group_ = TaskGroup();  // null group
   }
 
   /**

@@ -107,28 +107,64 @@ u32 LocalScheduler::ClientMapTask(IpcManager *ipc_manager,
   return lane;
 }
 
-u32 LocalScheduler::RuntimeMapTask(Worker *worker, const Future<Task> &task) {
+u32 LocalScheduler::RuntimeMapTask(Worker *worker, const Future<Task> &task,
+                                    Container *container) {
   Task *task_ptr = task.get();
+
+  // ---- Task group affinity: return early if group already pinned ----
+  // Use the caller-supplied container directly (no static container lookup).
+  Container *grp_container =
+      (container != nullptr && task_ptr != nullptr &&
+       !task_ptr->task_group_.IsNull())
+          ? container
+          : nullptr;
+  if (grp_container != nullptr) {
+    int64_t group_id = task_ptr->task_group_.id_;
+    ScopedCoRwReadLock read_lock(grp_container->task_group_lock_);
+    auto it = grp_container->task_group_map_.find(group_id);
+    if (it != grp_container->task_group_map_.end() && it->second != nullptr) {
+      return it->second->GetId();
+    }
+  }
+
+  // ---- Normal routing: determine selected worker ----
+  Worker *selected = nullptr;
+
+  // Periodic Send/Recv → network worker
   if (task_ptr != nullptr && task_ptr->IsPeriodic()) {
     if (task_ptr->pool_id_ == chi::kAdminPoolId) {
       u32 method_id = task_ptr->method_;
-      if (method_id == 14 || method_id == 15) {
-        if (net_worker_ != nullptr) {
-          return net_worker_->GetId();
-        }
+      if ((method_id == 14 || method_id == 15) && net_worker_ != nullptr) {
+        selected = net_worker_;
       }
     }
   }
 
-  if (gpu_worker_ != nullptr && worker == gpu_worker_ &&
+  // GPU worker tasks → delegate to a scheduler worker
+  if (selected == nullptr && gpu_worker_ != nullptr && worker == gpu_worker_ &&
       !scheduler_workers_.empty()) {
-    u32 idx = next_sched_idx_.fetch_add(1, std::memory_order_relaxed)
-              % scheduler_workers_.size();
-    return scheduler_workers_[idx]->GetId();
+    u32 idx = next_sched_idx_.fetch_add(1, std::memory_order_relaxed) %
+              scheduler_workers_.size();
+    selected = scheduler_workers_[idx];
   }
 
-  if (worker != nullptr) {
-    return worker->GetId();
+  // Fallback: stay on current worker
+  if (selected == nullptr) {
+    selected = worker;
+  }
+
+  // ---- Update group map after routing decision ----
+  if (grp_container != nullptr && task_ptr != nullptr && selected != nullptr) {
+    int64_t group_id = task_ptr->task_group_.id_;
+    ScopedCoRwWriteLock write_lock(grp_container->task_group_lock_);
+    auto it = grp_container->task_group_map_.find(group_id);
+    if (it == grp_container->task_group_map_.end() || it->second == nullptr) {
+      grp_container->task_group_map_[group_id] = selected;
+    }
+  }
+
+  if (selected != nullptr) {
+    return selected->GetId();
   }
   return 0;
 }

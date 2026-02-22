@@ -123,7 +123,8 @@ struct IpcSharedHeader {
   u32 num_sched_queues;     // Number of scheduling queues for task distribution
   u64 node_id;        // 64-bit hash of the hostname for node identification
   pid_t runtime_pid;  // PID of the runtime process (for tgkill)
-  std::atomic<u64> server_generation;  // Monotonic counter, set from epoch nanos at init
+  std::atomic<u64>
+      server_generation;  // Monotonic counter, set from epoch nanos at init
 };
 
 /**
@@ -527,7 +528,6 @@ class IpcManager {
 #else  // HOST PATH
     bool is_runtime = CHI_CHIMAERA_MANAGER->IsRuntime();
     Worker *worker = CHI_CUR_WORKER;
-    bool use_runtime_path = is_runtime && worker != nullptr;
 
     // Client TCP/IPC path: serialize and send via ZMQ
     // Runtime always uses SHM path internally, even from the main thread
@@ -540,41 +540,33 @@ class IpcManager {
       return SendShm(task_ptr);
     }
 
-    // Runtime SHM path: pointer future (no serialization, same address space)
-    Future<TaskT> future = MakePointerFuture(task_ptr);
-
-    // Set parent task RunContext from current worker (runtime only)
-    if (use_runtime_path) {
-      RunContext *run_ctx = worker->GetCurrentRunContext();
-      if (run_ctx != nullptr) {
-        future.SetParentTask(run_ctx);
-      }
-    }
-
-    // 4. Map task to lane using scheduler
-    LaneId lane_id;
-    Future<Task> task_future_for_sched = future.template Cast<Task>();
-    if (use_runtime_path) {
-      lane_id = scheduler_->RuntimeMapTask(worker, task_future_for_sched);
-    } else {
-      lane_id = scheduler_->ClientMapTask(this, task_future_for_sched);
-    }
-
-    // 5. Enqueue the Future object to the worker queue
-    auto &lane_ref = worker_queues_->GetLane(lane_id, 0);
-    bool was_empty = lane_ref.Empty();
-    Future<Task> task_future_for_queue = future.template Cast<Task>();
-    lane_ref.Push(task_future_for_queue);
-
-    // 6. Awaken worker for this lane (only if it was idle)
-    if (was_empty) {
-      AwakenWorker(&lane_ref);
-    }
-
-    // 7. Return the same Future (no separate user_future/queue_future)
-    return future;
+    // Runtime SHM path: delegate to SendRuntime.
+    // Cast to base Task so SendRuntime can be a non-template method in the .cc.
+    // The returned Future<Task> is re-cast to the concrete type before
+    // returning.
+    Future<Task> base_future = SendRuntime(task_ptr.template Cast<Task>());
+    return base_future.Cast<TaskT>();
 #endif
   }
+
+  /**
+   * Send a task from the runtime, routing it to the correct worker lane.
+   *
+   * Non-template entry point (implemented in ipc_manager.cc) that:
+   *  1. Derives the execution container from the task's pool_id / pool_query.
+   *  2. Sets the task's completer and run-context container fields.
+   *  3. Wraps the task in a pointer Future (no serialization).
+   *  4. Calls RuntimeMapTask (passing the resolved container) to pick a lane.
+   *  5. Enqueues the Future and awakens the target worker.
+   *
+   * Callers:
+   *  - IpcManager::Send  — casts the typed future back after return
+   *  - Worker::RouteLocal — task_ptr is already FullPtr<Task>
+   *
+   * @param task_ptr Base-typed task to route and enqueue
+   * @return Future<Task> wrapping the enqueued task
+   */
+  Future<Task> SendRuntime(const hipc::FullPtr<Task> &task_ptr);
 
   /**
    * Send a task via SHM lightbeam transport
@@ -726,8 +718,7 @@ class IpcManager {
           if (max_sec > 0 && elapsed >= max_sec) return false;
 
           // Overall retry timeout
-          if (client_retry_timeout_ > 0 &&
-              elapsed >= client_retry_timeout_) {
+          if (client_retry_timeout_ > 0 && elapsed >= client_retry_timeout_) {
             HLOG(kError, "Recv: Timed out after {}s waiting for response",
                  elapsed);
             return false;
@@ -788,8 +779,7 @@ class IpcManager {
             float el = std::chrono::duration<float>(
                            std::chrono::steady_clock::now() - zmq_start)
                            .count();
-            if (client_retry_timeout_ > 0 &&
-                el >= client_retry_timeout_)
+            if (client_retry_timeout_ > 0 && el >= client_retry_timeout_)
               return false;
           }
           std::atomic_thread_fence(std::memory_order_acquire);
@@ -918,10 +908,9 @@ class IpcManager {
    * @return Server generation value, 0 if not available
    */
   u64 GetServerGeneration() const {
-    return shared_header_
-               ? shared_header_->server_generation.load(
-                     std::memory_order_acquire)
-               : 0;
+    return shared_header_ ? shared_header_->server_generation.load(
+                                std::memory_order_acquire)
+                          : 0;
   }
 
   /**
@@ -945,8 +934,7 @@ class IpcManager {
    * @param start Time point when the wait started (for overall timeout)
    * @return true if reconnection succeeded within timeout
    */
-  bool WaitForServerAndReconnect(
-      std::chrono::steady_clock::time_point start);
+  bool WaitForServerAndReconnect(std::chrono::steady_clock::time_point start);
 
   /**
    * Get number of workers from shared memory header
@@ -1088,9 +1076,7 @@ class IpcManager {
    * Get the list of dead nodes for retry queue scanning
    * @return Const reference to dead_nodes_ vector
    */
-  const std::vector<DeadNodeEntry>& GetDeadNodes() const {
-    return dead_nodes_;
-  }
+  const std::vector<DeadNodeEntry> &GetDeadNodes() const { return dead_nodes_; }
 
   /**
    * Add a new node to the internal hostfile
@@ -1536,13 +1522,13 @@ class IpcManager {
       1;  // CHI_POLL_SERVER: poll interval in seconds (default 1)
 
   // Client-side retry configuration
-  u64 client_generation_ = 0;           // Cached server generation at connect time
-  float client_retry_timeout_ = 60.0f;  // CHI_CLIENT_RETRY_TIMEOUT (default 60s)
+  u64 client_generation_ = 0;  // Cached server generation at connect time
+  float client_retry_timeout_ =
+      60.0f;  // CHI_CLIENT_RETRY_TIMEOUT (default 60s)
 
   // Persistent ZeroMQ transport connection pool
   // Key format: "ip_address:port"
-  std::unordered_map<std::string, hshm::lbm::TransportPtr>
-      client_pool_;
+  std::unordered_map<std::string, hshm::lbm::TransportPtr> client_pool_;
   mutable std::mutex client_pool_mutex_;  // Mutex for thread-safe pool access
 
   // Scheduler for task routing
