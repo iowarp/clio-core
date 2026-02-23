@@ -46,6 +46,47 @@ for bin in "$WORK_DIR"/unpack/iowarp_core/bin/*; do
     patchelf --set-rpath '$ORIGIN/../lib' "$bin" 2>/dev/null || true
 done
 
+# Regenerate RECORD with correct hashes after patchelf modified binaries
+echo "Regenerating RECORD..."
+python3 -c "
+import hashlib, base64, os, sys, csv, io
+
+base = sys.argv[1]
+# Find the RECORD file
+record_path = None
+for root, dirs, files in os.walk(base):
+    for f in files:
+        if f == 'RECORD' and '.dist-info' in root:
+            record_path = os.path.join(root, f)
+            break
+
+if not record_path:
+    print('WARNING: No RECORD file found, skipping regeneration')
+    sys.exit(0)
+
+dist_info = os.path.dirname(record_path)
+record_relpath = os.path.relpath(record_path, base)
+rows = []
+for root, dirs, files in os.walk(base):
+    for f in sorted(files):
+        full = os.path.join(root, f)
+        arc = os.path.relpath(full, base)
+        if arc == record_relpath:
+            continue  # RECORD itself has no hash
+        with open(full, 'rb') as fh:
+            data = fh.read()
+        digest = hashlib.sha256(data).digest()
+        h = 'sha256=' + base64.urlsafe_b64encode(digest).rstrip(b'=').decode('ascii')
+        rows.append((arc, h, str(len(data))))
+
+# Write RECORD
+with open(record_path, 'w', newline='') as rf:
+    writer = csv.writer(rf)
+    for row in rows:
+        writer.writerow(row)
+    writer.writerow((record_relpath, '', ''))
+" "$WORK_DIR/unpack"
+
 # Repack preserving permissions into a temp location
 WHEEL_NAME=$(basename "$WHEEL")
 REPACK_DIR="$WORK_DIR/repacked"
