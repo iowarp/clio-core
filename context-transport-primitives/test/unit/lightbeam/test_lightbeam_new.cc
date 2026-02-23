@@ -125,6 +125,7 @@ void TestBasicTransfer() {
   assert(received1 == data1);
   assert(received2 == data2);
 
+  server->ClearRecvHandles(recv_meta);
   std::cout << "[New API] Test passed!\n";
 #else
   std::cout << "ZMQ not enabled, skipping test\n";
@@ -183,6 +184,7 @@ void TestMultipleBulks() {
     assert(received == data_chunks[i]);
   }
 
+  server->ClearRecvHandles(recv_meta);
   std::cout << "[Multiple Bulks] Test passed!\n";
 #else
   std::cout << "ZMQ not enabled, skipping test\n";

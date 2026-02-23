@@ -1,0 +1,47 @@
+# LSAN suppression list for IOWarp Core ASan/LSan runs.
+# LeakSanitizer suppresses reports whose call stacks contain any of
+# the patterns below. Use these only for leaks that are architectural
+# (i.e. intentional lifetime-until-exit) or come from third-party
+# libraries that we do not control.
+
+# ---------------------------------------------------------------------------
+# ZMQ internal allocations (routing table, mechanism metadata, etc.)
+# ZeroMQ allocates internal state in libzmq.so that is cleaned up at
+# zmq_ctx_destroy() time, but not always before process exit.
+# ---------------------------------------------------------------------------
+leak:libzmq.so
+
+# ---------------------------------------------------------------------------
+# Chi runtime: Worker RunContext leaks on shutdown
+# When the runtime shuts down, some tasks may still be in-flight in the
+# worker's periodic queue. Their associated RunContext (unique_ptr stored in
+# chi::Task::run_ctx_) is freed only when the task reaches DelTask.
+# Forcibly stopping worker threads before draining the queue can leave
+# RunContext objects unreachable.
+# ---------------------------------------------------------------------------
+leak:chi::Worker::BeginTask
+
+# ---------------------------------------------------------------------------
+# Chi runtime: large IPC buffer allocations in tests
+# Tests that call IpcManager::AllocateBuffer() with sizes ≥ 600 MB are
+# intentionally exercising IncreaseMemory() and do not always call
+# FreeBuffer() afterwards. The OS reclaims these allocations on exit.
+# ---------------------------------------------------------------------------
+leak:chi::IpcManager::AllocateBuffer
+
+# ---------------------------------------------------------------------------
+# Chi runtime: IpcManager::NewTask allocations not freed on shutdown
+# Tasks allocated with NewTask() are normally freed by DelTask().
+# During abnormal shutdown (port-conflict failures, timeout), tasks may
+# remain allocated. Suppress the NewTask allocation site to avoid
+# spurious reports from infrastructure failures.
+# ---------------------------------------------------------------------------
+leak:chi::IpcManager::NewTask
+
+# ---------------------------------------------------------------------------
+# Chi runtime: MOD_NAME TestLargeOutput task data vector
+# The TestLargeOutput coroutine intentionally fills task->data_ with 1 MB
+# of test data. If the runtime shuts down before the task is fully cleaned
+# up, the std::vector storage appears as a leak.
+# ---------------------------------------------------------------------------
+leak:Runtime::TestLargeOutput

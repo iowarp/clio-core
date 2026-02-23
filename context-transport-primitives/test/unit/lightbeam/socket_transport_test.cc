@@ -124,6 +124,7 @@ void TestBasicTcpTransfer() {
   assert(received1 == data1);
   assert(received2 == data2);
 
+  server->ClearRecvHandles(recv_meta);
   std::cout << "[Socket TCP Basic] Test passed!\n";
 }
 
@@ -176,6 +177,7 @@ void TestMultipleBulks() {
     assert(received == data_chunks[i]);
   }
 
+  server->ClearRecvHandles(recv_meta);
   std::cout << "[Socket Multiple Bulks] Test passed!\n";
 }
 
@@ -227,6 +229,7 @@ void TestUnixDomainSocket() {
   std::cout << "Received: " << received << "\n";
   assert(received == data);
 
+  server->ClearRecvHandles(recv_meta);
   std::cout << "[Socket IPC] Test passed!\n";
 }
 

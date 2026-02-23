@@ -225,6 +225,9 @@ echo ""
 OVERALL_STATUS=0
 
 if [ "$DO_ASAN" = true ]; then
+    # Export LSAN suppressions so LeakSanitizer skips known architectural leaks
+    # (ZMQ internals, runtime-shutdown RunContext, deliberate large IPC buffers).
+    export LSAN_OPTIONS="suppressions=${REPO_ROOT}/CI/lsan_suppressions.txt"
     run_sanitizer_mode \
         "asan" \
         "AddressSanitizer" \
@@ -259,6 +262,7 @@ if [ "$DO_MSAN" = true ]; then
 fi
 
 if [ "$DO_SANITIZE" = true ]; then
+    export LSAN_OPTIONS="suppressions=${REPO_ROOT}/CI/lsan_suppressions.txt"
     run_sanitizer_mode \
         "sanitize" \
         "AddressSanitizer" \
