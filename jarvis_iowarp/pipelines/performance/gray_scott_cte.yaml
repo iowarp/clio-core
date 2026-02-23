@@ -1,0 +1,51 @@
+# CTE Benchmark Example Pipeline
+# Purpose: Demonstrate CTE core functionality with the CTE benchmark application
+# Requirements: chimaera runtime start and chimaera runtime stop in PATH, wrp_cte_bench executable in PATH
+
+  config:
+  name: cte_benchmark_example
+
+  pkgs:
+    - pkg_type: jarvis_iowarp.wrp_runtime
+      pkg_name: runtime
+      do_dbg: false
+      dbg_port: 4000
+      log_level: "info"
+      ipc_mode: "tcp"
+
+    - pkg_type: jarvis_iowarp.wrp_cte
+      pkg_name: cte_core
+      devices:
+        - ["${HOME}/cte_benchmark/storage1.bin", "500MB", 0.8]
+        - ["${HOME}/cte_benchmark/storage2.bin", "500MB", 0.7]
+
+      # CTE Configuration Parameters
+      dpe_type: "max_bw"                   # Data placement engine: random, round_robin, max_bw
+      neighborhood: 4                      # Number of targets (nodes CTE can buffer to)
+      default_target_timeout_ms: 30000     # Target timeout (ms)
+      poll_period_ms: 5000                 # Period to rescan targets for statistics (capacity, bandwidth, etc.) (ms)
+
+    - pkg_type: jarvis_iowarp.adios2_gray_scott
+      pkg_name: gsbench
+      nprocs: 8                           # Number of MPI processes
+      ppn: 8                               # Processes per node
+      out_file: "/home/iowarp/gsbench.bp"
+      engine: "iowarp"
+
+  # Environment configuration (optional)
+  # env:
+  #   WRP_CTE_LOG_LEVEL: "info"
+  #   CTE_DEBUG: "0"
+vars:
+  gsbench.L: [64, 128]
+  gsbench.nprocs: [4]
+  gsbench.ppn: [4]
+
+loop:
+  - [gsbench.L]
+  - [gsbench.nprocs]
+  - [gsbench.ppn]
+  
+repeat: 1
+
+output: "${HOME}/gray_scott_results"

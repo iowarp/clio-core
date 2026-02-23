@@ -35,6 +35,7 @@ config:
 
 vars:
   cte_bench.io_size: ["4k", "16k", "1m"]
+  cte_bench.ipc_mode: ["tcp", "ipc", "shm"]
 
 loop:
   - [cte_bench.io_size]

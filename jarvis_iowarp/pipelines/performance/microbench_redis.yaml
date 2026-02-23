@@ -24,6 +24,6 @@ vars:
 loop:
   - [redis_bench.req_size]
 
-repeat: 3
+repeat: 1
 
 output: "${HOME}/redis_bench_results"
