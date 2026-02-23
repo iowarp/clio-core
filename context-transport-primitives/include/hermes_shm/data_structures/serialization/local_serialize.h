@@ -179,7 +179,9 @@ class LocalSerialize {
   LocalSerialize &write_binary(const char *data, size_t size) {
     size_t off = data_.size();
     data_.resize(off + size);
-    memcpy(data_.data() + off, data, size);
+    if (size > 0) {
+      memcpy(data_.data() + off, data, size);
+    }
     return *this;
   }
 };
@@ -254,7 +256,9 @@ class LocalDeserialize {
 #endif
       return *this;
     }
-    memcpy(data, data_.data() + cur_off_, size);
+    if (size > 0) {
+      memcpy(data, data_.data() + cur_off_, size);
+    }
     cur_off_ += size;
     return *this;
   }

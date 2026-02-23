@@ -1,0 +1,66 @@
+# MSan ignorelist: suppress false positives from uninstrumented stdlib/third-party code.
+# Clang MSan cannot track memory initialized by uninstrumented libraries; these entries
+# prevent spurious "use-of-uninitialized-value" reports that originate entirely within
+# code we cannot instrument (libstdc++, Catch2, cereal, yaml-cpp).
+
+# std::string internal SBO methods (triggered by Catch2 / cereal untracked string allocations)
+# Note: patterns with 'std::' prefix + wildcard don't work in Clang SCL; use leading wildcard instead
+fun:*basic_string*_M_data*
+fun:*basic_string*_M_is_local*
+fun:*basic_string*_M_local_data*
+fun:*basic_string*_M_capacity*
+fun:*basic_string*_M_length*
+fun:*basic_string*_M_set_length*
+fun:*basic_string*_M_append*
+fun:*basic_string*_M_assign*
+fun:*basic_string*_M_replace*
+fun:*basic_string*_M_create*
+fun:*basic_string*_M_mutate*
+# Accessor methods that read untracked internal state after Catch2/cereal init
+fun:*basic_string*length*
+fun:*basic_string*size*
+fun:*basic_string*reserve*
+fun:*basic_string*c_str*
+fun:*basic_string*data*
+
+# std::regex internals use locale facets from uninstrumented libstdc++
+fun:*_Scanner*
+fun:*_Compiler*
+fun:*basic_regex*
+
+# std::list node allocation/iterator comparison through uninstrumented allocator
+fun:*_List_iterator*
+fun:*_List_node*
+fun:*_List_base*
+
+# std::filesystem::path internal _List and unique_ptr
+fun:*filesystem*
+
+# std::ostream / std::streambuf / std::stringbuf / std::stringstream / std::ifstream
+# These are from uninstrumented libstdc++; reads of internal state trigger false positives
+fun:*basic_streambuf*
+fun:*basic_stringbuf*
+fun:*basic_ostringstream*
+fun:*basic_stringstream*
+fun:*basic_istringstream*
+fun:*basic_istream*
+fun:*basic_ostream*
+fun:*basic_ifstream*
+fun:*basic_ofstream*
+fun:*basic_ios*
+
+# std::shared_ptr reference count - copy-constructed from Catch2 uninstrumented objects
+fun:*__shared_count*
+fun:*__shared_ptr*
+fun:*shared_ptr*
+
+# Catch2 test framework (not instrumented)
+fun:*Catch*
+# Catch2 Clara header-only command line parser - shared_ptr internals
+src:/home/hyoklee/miniconda3/envs/iowarp/include/catch2/internal/catch_clara.hpp
+
+# cereal binary archive (not instrumented)
+fun:*cereal*
+
+# yaml-cpp (not instrumented)
+src:/home/hyoklee/miniconda3/envs/iowarp/include/yaml-cpp/*

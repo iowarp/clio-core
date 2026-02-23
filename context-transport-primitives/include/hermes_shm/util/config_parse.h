@@ -115,7 +115,7 @@ class ConfigParse {
         // Divide the range by '-'
         auto dash = range_str.find_first_of('-');
         if (dash != std::string::npos) {
-          int min, max;
+          int min = 0, max = 0;
           // Get the minimum and maximum value
           std::string min_str = range_str.substr(0, dash);
           std::string max_str = range_str.substr(dash + 1);
@@ -131,7 +131,7 @@ class ConfigParse {
           // Place the range with width
           ranges.emplace_back(min, max, num_width);
         } else if (range_str.size()) {
-          int val;
+          int val = 0;
           std::stringstream(range_str) >> val;
           ranges.emplace_back(val, val, range_str.size());
         }
@@ -180,7 +180,7 @@ class ConfigParse {
   /** parse the number of \a num_text NUMBER text */
   template <typename T>
   static T ParseNumber(const std::string &num_text) {
-    T size;
+    T size = {};
     if (num_text == "inf") {
       return std::numeric_limits<T>::max();
     }

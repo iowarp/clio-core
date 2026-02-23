@@ -699,8 +699,9 @@ if(NOT MSVC)
         endif()
         message(STATUS "MemorySanitizer (MSan) enabled for iowarp-core")
         message(WARNING "MSan requires all dependencies to be built with -fsanitize=memory; false-positives are expected from uninstrumented libs")
-        add_compile_options(-fsanitize=memory -fno-omit-frame-pointer -fno-sanitize-recover=memory
-                            -fsanitize-memory-track-origins=2)
+        add_compile_options(-fsanitize=memory -fno-omit-frame-pointer -fsanitize-recover=memory
+                            -fsanitize-memory-track-origins=2
+                            -fsanitize-ignorelist=${CMAKE_SOURCE_DIR}/CI/msan_ignorelist.txt)
         add_link_options(-fsanitize=memory)
     endif()
 

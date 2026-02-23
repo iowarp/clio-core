@@ -201,6 +201,9 @@ class _BuddyAllocator : public Allocator {
     if (requested_size < kMinSize) {
       requested_size = kMinSize;
     }
+    // Round up to BuddyPage alignment so every heap bump stays aligned
+    constexpr size_t kAlign = alignof(BuddyPage);
+    requested_size = (requested_size + kAlign - 1) & ~(kAlign - 1);
 
     OffsetPtr<> ptr;
     if (requested_size <= kSmallThreshold) {
