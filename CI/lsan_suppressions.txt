@@ -45,3 +45,13 @@ leak:chi::IpcManager::NewTask
 # up, the std::vector storage appears as a leak.
 # ---------------------------------------------------------------------------
 leak:Runtime::TestLargeOutput
+
+# ---------------------------------------------------------------------------
+# Chi runtime: per-thread TaskCounter in CreateTaskId()
+# chi::CreateTaskId() allocates a 4-byte TaskCounter via new and stores it
+# in thread-local storage using HSHM_THREAD_MODEL->SetTls(). Worker threads
+# created with std::thread may not invoke the TLS destructor on exit, leaving
+# the counter unreachable. This is an architectural TLS lifetime pattern;
+# the OS reclaims the allocation on process exit.
+# ---------------------------------------------------------------------------
+leak:chi::CreateTaskId

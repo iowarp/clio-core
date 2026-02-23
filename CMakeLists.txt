@@ -850,6 +850,60 @@ else()
 endif()
 
 #------------------------------------------------------------------------------
+# Serialize Chimaera runtime tests to prevent port 9413 conflicts
+#------------------------------------------------------------------------------
+# All tests that start a Chimaera server compete for the same default port
+# (9413). Under parallel ctest execution (e.g. ctest -j4) this causes
+# "Address already in use" failures. RESOURCE_LOCK ensures only one such
+# test runs at a time. CTP tests (context-transport-primitives) use different
+# ports or no server, so they are intentionally excluded here.
+#
+# get_directory_property(TESTS) only returns tests from the exact directory
+# scope, not from nested subdirectories. We therefore recurse through the
+# full SUBDIRECTORIES tree of each component to apply the lock.
+if(WRP_CORE_ENABLE_TESTS)
+    # Build the LSAN_OPTIONS value when ASan or combined sanitize is enabled,
+    # so that ctest (run standalone or via run_sanitizers.sh) always finds the
+    # suppressions file and does not falsely fail on known architectural leaks.
+    set(_lsan_opts "")
+    if(WRP_CORE_ENABLE_ASAN AND NOT WRP_CORE_ENABLE_MSAN)
+        set(_lsan_opts
+            "detect_leaks=1:halt_on_error=0:print_stacktrace=1:symbolize=1:suppressions=${CMAKE_SOURCE_DIR}/CI/lsan_suppressions.txt")
+    endif()
+
+    function(_chimaera_lock_tests_recursive dir lsan_opts)
+        get_directory_property(_tests DIRECTORY "${dir}" TESTS)
+        if(_tests)
+            set_tests_properties(${_tests}
+                DIRECTORY "${dir}"
+                PROPERTIES RESOURCE_LOCK "chimaera_runtime_port")
+            if(lsan_opts)
+                set_tests_properties(${_tests}
+                    DIRECTORY "${dir}"
+                    PROPERTIES ENVIRONMENT_MODIFICATION
+                        "LSAN_OPTIONS=set:${lsan_opts}")
+            endif()
+        endif()
+        get_directory_property(_subdirs DIRECTORY "${dir}" SUBDIRECTORIES)
+        foreach(_sub ${_subdirs})
+            _chimaera_lock_tests_recursive("${_sub}" "${lsan_opts}")
+        endforeach()
+    endfunction()
+
+    foreach(_component_dir
+            context-runtime
+            context-transfer-engine
+            context-assimilation-engine
+            context-exploration-engine)
+        if(IS_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/${_component_dir}")
+            _chimaera_lock_tests_recursive(
+                "${CMAKE_CURRENT_SOURCE_DIR}/${_component_dir}"
+                "${_lsan_opts}")
+        endif()
+    endforeach()
+endif()
+
+#------------------------------------------------------------------------------
 # Unified IOWarp Core Package Configuration
 #------------------------------------------------------------------------------
 # Generate and install the unified IowarpCore package configuration
