@@ -244,8 +244,13 @@ class IpcManager {
     // new-delete-type-mismatch check when TaskT is a base class but the
     // actual allocation was for a larger derived type. Unsized ::operator delete
     // avoids the size validation while still freeing the correct allocation.
+    // IMPORTANT: cast to void* first so the compiler cannot infer the type size
+    // and generate a C++14 globally-sized deallocation call (operator delete
+    // (void*, size_t)) — which would still trigger the ASan mismatch when the
+    // object is a larger derived type.
     task_ptr.ptr_->~TaskT();
-    ::operator delete(task_ptr.ptr_);
+    void* raw = static_cast<void*>(task_ptr.ptr_);
+    ::operator delete(raw);
 #else
     // GPU path: call destructor and free buffer
     task_ptr.ptr_->~TaskT();

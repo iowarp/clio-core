@@ -148,6 +148,13 @@ bool IpcManager::ClientInit() {
     zmq_recv_thread_ = std::thread([this]() { RecvZmqClientThread(); });
   }
 
+  // Initialize HSHM TLS key for task counter before calling WaitForLocalServer,
+  // which calls CreateTaskId(). Without the key registered first, GetTls() on
+  // the zero-initialized key may return a stale/freed pointer → crash.
+  HSHM_THREAD_MODEL->CreateTls<TaskCounter>(chi_task_counter_key_, nullptr);
+  auto *tls_counter = new TaskCounter();
+  HSHM_THREAD_MODEL->SetTls(chi_task_counter_key_, tls_counter);
+
   // Wait for local server using lightbeam transport
   if (!WaitForLocalServer()) {
     HLOG(kError, "CRITICAL ERROR: Cannot connect to local server.");
@@ -197,13 +204,6 @@ bool IpcManager::ClientInit() {
     HLOG(kError, "Warning: Could not access shared header during ClientInit");
     this_host_ = Host();  // Default constructor gives node_id = 0
   }
-
-  // Initialize HSHM TLS key for task counter
-  HSHM_THREAD_MODEL->CreateTls<TaskCounter>(chi_task_counter_key_, nullptr);
-
-  // Initialize thread-local task counter for this client thread
-  auto *counter = new TaskCounter();
-  HSHM_THREAD_MODEL->SetTls(chi_task_counter_key_, counter);
 
   // Set current worker to null for client-only mode
   HSHM_THREAD_MODEL->SetTls(chi_cur_worker_key_,
@@ -694,6 +694,7 @@ bool IpcManager::WaitForLocalServer() {
     HLOG(kError, "1. Chimaera runtime is not running");
     HLOG(kError, "2. Runtime failed to start");
     HLOG(kError, "3. Network connectivity issues");
+    DelTask(task);
     return false;
   }
 
@@ -701,10 +702,12 @@ bool IpcManager::WaitForLocalServer() {
     client_generation_ = task->server_generation_;
     HLOG(kInfo, "Successfully connected to runtime (generation={})",
          client_generation_);
+    DelTask(task);
     return true;
   }
 
   HLOG(kError, "Runtime responded with error code: {}", task->response_);
+  DelTask(task);
   return false;
 }
 

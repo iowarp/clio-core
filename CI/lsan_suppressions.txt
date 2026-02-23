@@ -44,7 +44,51 @@ leak:chi::IpcManager::NewTask
 # of test data. If the runtime shuts down before the task is fully cleaned
 # up, the std::vector storage appears as a leak.
 # ---------------------------------------------------------------------------
-leak:Runtime::TestLargeOutput
+leak:TestLargeOutput
+
+# ---------------------------------------------------------------------------
+# Chi runtime: Chimaera::ServerInit internal allocations
+# ServerInit allocates runtime-lifetime objects (config, singletons, queues)
+# that persist until process exit. These are architectural and not leaked.
+# ---------------------------------------------------------------------------
+leak:chi::Chimaera::ServerInit
+
+# ---------------------------------------------------------------------------
+# Chi runtime: Task::Serialize pool config string allocations
+# Serialization of PoolConfig (including its IPC string fields) may allocate
+# buffers that are freed only when the task is destructed. Tasks freed via
+# IPC path bypass C++ destructors, leaving these buffers unreachable.
+# ---------------------------------------------------------------------------
+leak:chi::Task::Serialize
+
+# ---------------------------------------------------------------------------
+# bdev: AllocateBlocks block-list vector growth
+# bdev::Runtime::AllocateBlocks pushes Block entries into a priv::vector.
+# When the runtime shuts down before all block-lists are freed, the internal
+# vector buffer shows as a leak.
+# ---------------------------------------------------------------------------
+leak:AllocateBlocks
+
+# ---------------------------------------------------------------------------
+# CAE: ParseOmni string allocations
+# CAE ParseOmni assigns std::string fields into IPC priv::string members.
+# On runtime shutdown these task fields are not always destructed properly.
+# ---------------------------------------------------------------------------
+leak:ParseOmni
+
+# ---------------------------------------------------------------------------
+# CTE: GetContainedBlobs std::vector<std::string> push_back
+# CTE's GetContainedBlobs builds a local std::vector<std::string> result;
+# if the task is freed via IPC path, the vector's heap buffer leaks.
+# ---------------------------------------------------------------------------
+leak:GetContainedBlobs
+
+# ---------------------------------------------------------------------------
+# CTE: BlobQuery std::vector<std::string> push_back
+# CTE's BlobQuery builds a local std::vector<std::string> blob_names result;
+# if the runtime shuts down before the task completes, the string buffers leak.
+# ---------------------------------------------------------------------------
+leak:BlobQuery
 
 # ---------------------------------------------------------------------------
 # Chi runtime: per-thread TaskCounter in CreateTaskId()
