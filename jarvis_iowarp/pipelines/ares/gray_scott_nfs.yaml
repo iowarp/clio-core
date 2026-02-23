@@ -1,0 +1,32 @@
+# CTE Benchmark Example Pipeline
+# Purpose: Demonstrate CTE core functionality with the CTE benchmark application
+# Requirements: chimaera runtime start and chimaera runtime stop in PATH, wrp_cte_bench executable in PATH
+
+config:
+  name: gray_scott_nfs
+
+  env:
+    OMPI_MCA_btl_tcp_if_include: enp47s0np0
+  pkgs:
+    - pkg_type: jarvis_iowarp.adios2_gray_scott
+      pkg_name: gsbench
+      L: 512
+      nprocs: 64                           # Number of MPI processes
+      ppn: 16                               # Processes per node
+      out_file: "${HOME}/cte_gs/gsbench.bp"
+      engine: "bp5"
+
+  # Environment configuration (optional)
+  # env:
+  #   WRP_CTE_LOG_LEVEL: "info"
+  #   CTE_DEBUG: "0"
+
+vars:
+  gsbench.L: [512]
+
+loop:
+  - [gsbench.L]
+
+repeat: 3
+
+output: "${HOME}/gray_scott_nfs"
