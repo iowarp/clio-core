@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(iowarp-core VERSION 1.0.2 LANGUAGES C CXX)
+project(iowarp-core VERSION 1.0.3 LANGUAGES C CXX)
 
 #------------------------------------------------------------------------------
 # Project Options
@@ -973,6 +973,12 @@ endif()
 install(FILES context-runtime/config/chimaera_default.yaml
   COMPONENT pip_package
   DESTINATION ${PIP_PKG_DIR}/data)
+
+# .pth file at site-packages root so "import wrp_cee" works without
+# explicitly importing iowarp_core first (triggers _setup() at startup).
+install(FILES installers/pip/iowarp_core.pth
+  COMPONENT pip_package
+  DESTINATION .)
 
 #------------------------------------------------------------------------------
 # CPack Configuration
