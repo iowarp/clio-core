@@ -18,7 +18,7 @@
 	url = https://github.com/getzep/graphiti.git
 [submodule "context-transfer-engine/benchmark/memorybench"]
 	path = context-transfer-engine/benchmark/memorybench
-	url = git@github.com:iowarp/memorybench.git
+	url = https://github.com/iowarp/memorybench.git
 [submodule "external/yaml-cpp"]
 	path = external/yaml-cpp
 	url = https://github.com/jbeder/yaml-cpp.git
@@ -27,7 +27,7 @@
 	url = https://github.com/iowarp/runtime-deployment.git
 [submodule "docs"]
 	path = docs
-	url = git@github.com:iowarp/docs.git
+	url = https://github.com/iowarp/docs.git
 	branch = iowarp-dev
 [submodule "installers/iowarp"]
 	path = installers/iowarp
