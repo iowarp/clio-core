@@ -6,6 +6,7 @@ extensions can be loaded without system-wide installation.
 
 import ctypes
 import os
+import shutil
 import sys
 
 try:
@@ -46,6 +47,18 @@ def _setup():
     # Add ext/ to sys.path so 'import wrp_cte_core_ext' works
     if os.path.isdir(_EXT_DIR) and _EXT_DIR not in sys.path:
         sys.path.insert(0, _EXT_DIR)
+
+    # Seed ~/.chimaera/chimaera.yaml from the bundled default if missing.
+    # The C++ runtime looks for this file when no env var override is set.
+    _user_conf_dir = os.path.expanduser("~/.chimaera")
+    _user_conf = os.path.join(_user_conf_dir, "chimaera.yaml")
+    _bundled_default = os.path.join(_DATA_DIR, "chimaera_default.yaml")
+    if not os.path.exists(_user_conf) and os.path.exists(_bundled_default):
+        try:
+            os.makedirs(_user_conf_dir, exist_ok=True)
+            shutil.copy2(_bundled_default, _user_conf)
+        except OSError:
+            pass  # read-only home, containerised, etc.
 
 
 _setup()
