@@ -26,8 +26,9 @@ pkgs:
 
   - pkg_type: jarvis_iowarp.adios2_gray_scott
     pkg_name: gsbench
-    nprocs: 8                           # Number of MPI processes
-    ppn: 8                               # Processes per node
+    L: 256
+    nprocs: 32                           # Number of MPI processes
+    ppn: 16                               # Processes per node
     out_file: "${HOME}/cte_gs/gsbench.bp"
     engine: "iowarp"
 
