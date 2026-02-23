@@ -8,7 +8,11 @@ import ctypes
 import os
 import sys
 
-__version__ = "1.0.0"
+try:
+    from importlib.metadata import version as _pkg_version
+    __version__ = _pkg_version("iowarp-core")
+except Exception:
+    __version__ = "0.0.0-dev"
 
 _PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
 _LIB_DIR = os.path.join(_PACKAGE_DIR, "lib")

@@ -4,7 +4,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "iowarp-core"
-version = "1.0.0"
+dynamic = ["version"]
 description = "IOWarp Context Management Platform"
 readme = "README.md"
 license = {text = "BSD-3-Clause"}
@@ -56,3 +56,7 @@ WRP_CORE_ENABLE_ROCM = "OFF"
 WRP_CORE_ENABLE_OPENMP = "OFF"
 WRP_CORE_ENABLE_IO_URING = "ON"
 HSHM_LOG_LEVEL = "1"
+
+[tool.scikit-build.metadata]
+version.provider = "scikit_build_core.metadata.cmake"
+version.provider-path = "."
