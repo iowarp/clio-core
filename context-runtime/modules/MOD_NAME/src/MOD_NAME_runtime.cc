@@ -40,7 +40,7 @@
 #include "../include/chimaera/MOD_NAME/MOD_NAME_runtime.h"
 
 #include <chrono>
-#include <msgpack.hpp>
+#include <hermes_shm/serialize/msgpack_wrapper.h>
 
 namespace chimaera::MOD_NAME {
 

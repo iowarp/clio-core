@@ -5,7 +5,7 @@
 #include <thread>
 #include <iomanip>
 
-#include <msgpack.hpp>
+#include <hermes_shm/serialize/msgpack_wrapper.h>
 
 #include "chimaera/chimaera.h"
 #include "chimaera/singletons.h"

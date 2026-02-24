@@ -34,7 +34,7 @@
 // Copyright 2024 IOWarp contributors
 #include <wrp_cte/compressor/compressor_runtime.h>
 
-#include <msgpack.hpp>
+#include <hermes_shm/serialize/msgpack_wrapper.h>
 #include <algorithm>
 #include <chrono>
 #include <cmath>

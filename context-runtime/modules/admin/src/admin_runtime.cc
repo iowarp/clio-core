@@ -49,7 +49,7 @@
 
 #include <cereal/archives/binary.hpp>
 #include <cereal/types/vector.hpp>
-#include <msgpack.hpp>
+#include <hermes_shm/serialize/msgpack_wrapper.h>
 #include <chrono>
 #include <memory>
 #include <sstream>

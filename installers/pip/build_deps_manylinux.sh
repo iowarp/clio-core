@@ -66,15 +66,14 @@ cmake --build cereal-build -j$NPROC
 cmake --install cereal-build
 rm -rf /tmp/cereal-*
 
-# msgpack-cxx 6.1.1 (header-only)
-echo "--- msgpack-cxx 6.1.1 ---"
+# msgpack-c 6.1.0 (pure C library — no Boost dependency)
+echo "--- msgpack-c 6.1.0 ---"
 cd /tmp
-curl -sL https://github.com/msgpack/msgpack-c/archive/refs/tags/cpp-6.1.1.tar.gz | tar xz
-cmake -S msgpack-c-cpp-6.1.1 -B msgpack-build \
+curl -sL https://github.com/msgpack/msgpack-c/archive/refs/tags/c-6.1.0.tar.gz | tar xz
+cmake -S msgpack-c-c-6.1.0 -B msgpack-build \
     -DCMAKE_INSTALL_PREFIX=$PREFIX \
     -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
-    -DMSGPACK_CXX20=ON \
-    -DMSGPACK_USE_BOOST=OFF \
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
     -DMSGPACK_BUILD_TESTS=OFF \
     -DMSGPACK_BUILD_EXAMPLES=OFF
 cmake --build msgpack-build -j$NPROC

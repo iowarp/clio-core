@@ -51,8 +51,7 @@ requirements:
     - zeromq
     - yaml-cpp
     - cereal
-    - msgpack-cxx
-    - boost-cpp
+    - msgpack-c
     - hdf5
     - catch2
     - libaio
@@ -62,8 +61,7 @@ requirements:
     - zeromq
     - yaml-cpp
     - cereal
-    - msgpack-cxx
-    - boost-cpp
+    - msgpack-c
     - hdf5
     - catch2
     - libaio
