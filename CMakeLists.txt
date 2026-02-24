@@ -275,8 +275,21 @@ endif()
 
 # MessagePack C library (pure C, no Boost dependency)
 # Prefer static linkage so pip wheels don't need libmsgpack-c.so at runtime.
-find_package(msgpack-c REQUIRED CONFIG)
-message(STATUS "found msgpack-c at ${msgpack-c_DIR}")
+# Try msgpack-c first (v6+, post C/C++ split), then msgpack (v3.x, pre-split).
+find_package(msgpack-c CONFIG QUIET)
+if(NOT msgpack-c_FOUND)
+  find_package(msgpack REQUIRED CONFIG)
+  message(STATUS "found msgpack (legacy v3.x) at ${msgpack_DIR}")
+  # Create alias targets matching the msgpack-c v6+ naming convention
+  if(TARGET msgpackc-static AND NOT TARGET msgpack-c-static)
+    add_library(msgpack-c-static ALIAS msgpackc-static)
+  endif()
+  if(TARGET msgpackc AND NOT TARGET msgpack-c)
+    add_library(msgpack-c ALIAS msgpackc)
+  endif()
+else()
+  message(STATUS "found msgpack-c at ${msgpack-c_DIR}")
+endif()
 if(TARGET msgpack-c-static)
   set(MSGPACK_TARGET msgpack-c-static)
   message(STATUS "  using static msgpack-c")

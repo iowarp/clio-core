@@ -39,3 +39,10 @@ jobs:
         conda activate iowarp
         SITE_NAME=${{ contains(matrix.os, 'arm') && '"ubu-24.arm64"' || '"ubu-24.amd64"' }}
         ./CI/calculate_coverage.sh --build --run-ctest --clean --site ${SITE_NAME}
+    - name: Upload coverage to Codecov
+      if: always()
+      uses: codecov/codecov-action@v5
+      with:
+        files: build/coverage_filtered.info
+        flags: ${{ contains(matrix.os, 'arm') && 'arm64' || 'amd64' }}
+        token: ${{ secrets.CODECOV_TOKEN }}

@@ -17,6 +17,7 @@
 [![License](https://img.shields.io/badge/License-BSD%203--Clause-yellow.svg)](LICENSE)
 [![IoWarp](https://img.shields.io/badge/IoWarp-GitHub-blue.svg)](http://github.com/iowarp)
 [![GRC](https://img.shields.io/badge/GRC-Website-blue.svg)](https://grc.iit.edu/)
+[![codecov](https://codecov.io/gh/iowarp/clio-core/graph/badge.svg)](https://codecov.io/gh/iowarp/clio-core)
 
 ## Overview
 
