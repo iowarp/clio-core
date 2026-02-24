@@ -18,9 +18,16 @@ on:
       - 'context-transport-primitives/**'
 
 jobs:
+  # Rebuild deps-cpu image first when its Dockerfile changed in this push.
+  # Uses workflow_call so the core builds below wait for the fresh base image.
+  rebuild-deps:
+    name: Rebuild dependency containers
+    uses: ./.github/workflows/build-dep-containers.yaml
+    secrets: inherit
   # Deploy containers - AMD64
   deploy-cpu-amd64:
     name: Build Deploy Container (AMD64)
+    needs: rebuild-deps
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -52,6 +59,7 @@ jobs:
   # Deploy containers - ARM64
   deploy-cpu-arm64:
     name: Build Deploy Container (ARM64)
+    needs: rebuild-deps
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
     steps:
@@ -102,6 +110,7 @@ jobs:
   # Benchmark containers - AMD64
   build-benchmarks-amd64:
     name: Build Benchmarks (AMD64)
+    needs: rebuild-deps
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -140,6 +149,7 @@ jobs:
   # Benchmark containers - ARM64
   build-benchmarks-arm64:
     name: Build Benchmarks (ARM64)
+    needs: rebuild-deps
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
     steps:

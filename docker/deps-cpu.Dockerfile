@@ -405,7 +405,7 @@ ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
 
 # Install Jarvis-CD (deployment and pipeline management)
 RUN cd /home/iowarp \
-    && git clone https://github.com/iowarp/runtime-deployment.git jarvis-cd \
+    && git clone https://github.com/grc-iit/jarvis-cd.git jarvis-cd \
     && cd jarvis-cd \
     && pip install -r requirements.txt \
     && pip install -e .
