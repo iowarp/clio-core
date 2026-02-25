@@ -621,8 +621,14 @@ if(WRP_CORE_ENABLE_PYTHON)
   # Find Python for nanobind
   find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
 
-  # Add nanobind as subdirectory (git submodule)
-  add_subdirectory(external/nanobind)
+  # Fetch nanobind (no submodule needed)
+  include(FetchContent)
+  FetchContent_Declare(nanobind
+      GIT_REPOSITORY https://github.com/wjakob/nanobind.git
+      GIT_TAG        v2.9.2
+      GIT_SHALLOW    ON
+  )
+  FetchContent_MakeAvailable(nanobind)
 
   message(STATUS "Python bindings enabled:")
   message(STATUS "  Install prefix:     ${CMAKE_INSTALL_PREFIX}")
