@@ -46,3 +46,4 @@ jobs:
         files: build/coverage_filtered.info
         flags: ${{ contains(matrix.os, 'arm') && 'arm64' || 'amd64' }}
         token: ${{ secrets.CODECOV_TOKEN }}
+        slug: iowarp/clio-core
