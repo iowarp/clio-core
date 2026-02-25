@@ -18,6 +18,18 @@ classifiers = [
     "Topic :: System :: Distributed Computing",
 ]
 
+dependencies = [
+    "pyyaml",
+    "msgpack",
+]
+
+[project.optional-dependencies]
+visualizer = [
+    "flask>=2.0",
+    "pyyaml",
+    "msgpack",
+]
+
 [project.scripts]
 chimaera = "iowarp_core._cli:main"
 

@@ -66,6 +66,9 @@ requirements:
     - catch2
     - libaio
     - liburing
+    - pyyaml
+    - msgpack-python
+    - flask
 
 tests:
   - script:

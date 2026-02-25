@@ -61,13 +61,11 @@ if(WRP_CORE_ENABLE_PYTHON)
         wrp_cee_api
     )
 
-    # Install Python module to site-packages within CMAKE_INSTALL_PREFIX
-    # For conda: This will be ${CMAKE_INSTALL_PREFIX}/lib/pythonX.Y/site-packages
-    set(PYTHON_SITE_PACKAGES "lib/python${Python_VERSION_MAJOR}.${Python_VERSION_MINOR}/site-packages")
+    # Install Python module to site-packages (PYTHON_SITE_PACKAGES set by root CMakeLists.txt)
     install(TARGETS wrp_cee
       LIBRARY DESTINATION "${PYTHON_SITE_PACKAGES}"
     )
-    message(STATUS "CEE Python wrapper will be installed to: ${CMAKE_INSTALL_PREFIX}/${PYTHON_SITE_PACKAGES}")
+    message(STATUS "CEE Python wrapper will be installed to: ${PYTHON_SITE_PACKAGES}")
   endif()
 else()
   message(STATUS "Python bindings disabled - set WRP_CORE_ENABLE_PYTHON=ON to enable")

@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}Chimaera Dashboard{% endblock %}</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+    {% block head %}{% endblock %}
+</head>
+<body>
+    <nav class="navbar">
+        <div class="nav-brand">Chimaera Visualizer</div>
+        <ul class="nav-links">
+            <li><a href="/" class="{% if request.path == '/' %}active{% endif %}">Dashboard</a></li>
+            <li><a href="/workers" class="{% if request.path == '/workers' %}active{% endif %}">Workers</a></li>
+            <li><a href="/pools" class="{% if request.path == '/pools' %}active{% endif %}">Pools</a></li>
+            <li><a href="/config" class="{% if request.path == '/config' %}active{% endif %}">Config</a></li>
+        </ul>
+        <div class="nav-status" id="conn-status">Connecting...</div>
+    </nav>
+    <main class="content">
+        {% block content %}{% endblock %}
+    </main>
+    {% block scripts %}{% endblock %}
+</body>
+</html>
