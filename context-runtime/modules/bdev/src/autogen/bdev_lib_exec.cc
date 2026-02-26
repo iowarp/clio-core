@@ -474,4 +474,97 @@ hipc::FullPtr<chi::Task> Runtime::NewTask(chi::u32 method) {
   }
 }
 
+void Runtime::Aggregate(chi::u32 method, hipc::FullPtr<chi::Task> orig_task,
+                        const hipc::FullPtr<chi::Task>& replica_task) {
+  switch (method) {
+    case Method::kCreate: {
+      auto typed_task = orig_task.template Cast<CreateTask>();
+      typed_task->Aggregate(replica_task);
+      break;
+    }
+    case Method::kDestroy: {
+      auto typed_task = orig_task.template Cast<DestroyTask>();
+      typed_task->Aggregate(replica_task);
+      break;
+    }
+    case Method::kMonitor: {
+      auto typed_task = orig_task.template Cast<MonitorTask>();
+      typed_task->Aggregate(replica_task);
+      break;
+    }
+    case Method::kAllocateBlocks: {
+      auto typed_task = orig_task.template Cast<AllocateBlocksTask>();
+      typed_task->Aggregate(replica_task);
+      break;
+    }
+    case Method::kFreeBlocks: {
+      auto typed_task = orig_task.template Cast<FreeBlocksTask>();
+      typed_task->Aggregate(replica_task);
+      break;
+    }
+    case Method::kWrite: {
+      auto typed_task = orig_task.template Cast<WriteTask>();
+      typed_task->Aggregate(replica_task);
+      break;
+    }
+    case Method::kRead: {
+      auto typed_task = orig_task.template Cast<ReadTask>();
+      typed_task->Aggregate(replica_task);
+      break;
+    }
+    case Method::kGetStats: {
+      auto typed_task = orig_task.template Cast<GetStatsTask>();
+      typed_task->Aggregate(replica_task);
+      break;
+    }
+    default: {
+      orig_task->Aggregate(replica_task);
+      break;
+    }
+  }
+}
+
+void Runtime::DelTask(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr) {
+  auto* ipc_manager = CHI_IPC;
+  if (!ipc_manager) return;
+  switch (method) {
+    case Method::kCreate: {
+      ipc_manager->DelTask(task_ptr.template Cast<CreateTask>());
+      break;
+    }
+    case Method::kDestroy: {
+      ipc_manager->DelTask(task_ptr.template Cast<DestroyTask>());
+      break;
+    }
+    case Method::kMonitor: {
+      ipc_manager->DelTask(task_ptr.template Cast<MonitorTask>());
+      break;
+    }
+    case Method::kAllocateBlocks: {
+      ipc_manager->DelTask(task_ptr.template Cast<AllocateBlocksTask>());
+      break;
+    }
+    case Method::kFreeBlocks: {
+      ipc_manager->DelTask(task_ptr.template Cast<FreeBlocksTask>());
+      break;
+    }
+    case Method::kWrite: {
+      ipc_manager->DelTask(task_ptr.template Cast<WriteTask>());
+      break;
+    }
+    case Method::kRead: {
+      ipc_manager->DelTask(task_ptr.template Cast<ReadTask>());
+      break;
+    }
+    case Method::kGetStats: {
+      ipc_manager->DelTask(task_ptr.template Cast<GetStatsTask>());
+      break;
+    }
+    default: {
+      ipc_manager->DelTask(task_ptr);
+      break;
+    }
+  }
+}
+
 } // namespace chimaera::bdev

@@ -240,10 +240,10 @@ class IpcManager {
   HSHM_CROSS_FUN void DelTask(hipc::FullPtr<TaskT> task_ptr) {
     if (task_ptr.IsNull()) return;
 #if HSHM_IS_HOST
-    // Host path: use standard delete (virtual destructor handles derived types)
+    // Host path: use standard delete (typed pointer ensures correct destructor)
     delete task_ptr.ptr_;
 #else
-    // GPU path: call virtual destructor and free buffer
+    // GPU path: call destructor and free buffer
     task_ptr.ptr_->~TaskT();
     FreeBuffer(hipc::FullPtr<char>(reinterpret_cast<char *>(task_ptr.ptr_)));
 #endif

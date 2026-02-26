@@ -130,4 +130,25 @@ hipc::FullPtr<chi::Task> Runtime::NewTask(chi::u32 method) {
   }
 }
 
+void Runtime::Aggregate(chi::u32 method, hipc::FullPtr<chi::Task> orig_task,
+                        const hipc::FullPtr<chi::Task>& replica_task) {
+  switch (method) {
+    default: {
+      orig_task->Aggregate(replica_task);
+      break;
+    }
+  }
+}
+
+void Runtime::DelTask(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr) {
+  auto* ipc_manager = CHI_IPC;
+  if (!ipc_manager) return;
+  switch (method) {
+    default: {
+      ipc_manager->DelTask(task_ptr);
+      break;
+    }
+  }
+}
+
 } // namespace external_test::simple_mod

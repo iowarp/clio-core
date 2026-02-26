@@ -388,4 +388,79 @@ hipc::FullPtr<chi::Task> Runtime::NewTask(chi::u32 method) {
   }
 }
 
+void Runtime::Aggregate(chi::u32 method, hipc::FullPtr<chi::Task> orig_task,
+                        const hipc::FullPtr<chi::Task>& replica_task) {
+  switch (method) {
+    case Method::kCreate: {
+      auto typed_task = orig_task.template Cast<CreateTask>();
+      typed_task->Aggregate(replica_task);
+      break;
+    }
+    case Method::kDestroy: {
+      auto typed_task = orig_task.template Cast<DestroyTask>();
+      typed_task->Aggregate(replica_task);
+      break;
+    }
+    case Method::kMonitor: {
+      auto typed_task = orig_task.template Cast<MonitorTask>();
+      typed_task->Aggregate(replica_task);
+      break;
+    }
+    case Method::kDynamicSchedule: {
+      auto typed_task = orig_task.template Cast<DynamicScheduleTask>();
+      typed_task->Aggregate(replica_task);
+      break;
+    }
+    case Method::kCompress: {
+      auto typed_task = orig_task.template Cast<CompressTask>();
+      typed_task->Aggregate(replica_task);
+      break;
+    }
+    case Method::kDecompress: {
+      auto typed_task = orig_task.template Cast<DecompressTask>();
+      typed_task->Aggregate(replica_task);
+      break;
+    }
+    default: {
+      orig_task->Aggregate(replica_task);
+      break;
+    }
+  }
+}
+
+void Runtime::DelTask(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr) {
+  auto* ipc_manager = CHI_IPC;
+  if (!ipc_manager) return;
+  switch (method) {
+    case Method::kCreate: {
+      ipc_manager->DelTask(task_ptr.template Cast<CreateTask>());
+      break;
+    }
+    case Method::kDestroy: {
+      ipc_manager->DelTask(task_ptr.template Cast<DestroyTask>());
+      break;
+    }
+    case Method::kMonitor: {
+      ipc_manager->DelTask(task_ptr.template Cast<MonitorTask>());
+      break;
+    }
+    case Method::kDynamicSchedule: {
+      ipc_manager->DelTask(task_ptr.template Cast<DynamicScheduleTask>());
+      break;
+    }
+    case Method::kCompress: {
+      ipc_manager->DelTask(task_ptr.template Cast<CompressTask>());
+      break;
+    }
+    case Method::kDecompress: {
+      ipc_manager->DelTask(task_ptr.template Cast<DecompressTask>());
+      break;
+    }
+    default: {
+      ipc_manager->DelTask(task_ptr);
+      break;
+    }
+  }
+}
+
 } // namespace wrp_cte::compressor

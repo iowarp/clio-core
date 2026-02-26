@@ -616,6 +616,20 @@ public:
     (void)archive;
     (void)task_ptr;
   }
+
+  void Aggregate(chi::u32 method, hipc::FullPtr<chi::Task> orig_task,
+                 const hipc::FullPtr<chi::Task>& replica_task) override {
+    (void)method;
+    orig_task->Aggregate(replica_task);
+  }
+
+  void DelTask(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr) override {
+    (void)method;
+    auto *ipc_manager = CHI_IPC;
+    if (ipc_manager) {
+      ipc_manager->DelTask(task_ptr);
+    }
+  }
 };
 
 TEST_CASE("Container Serialization Methods", "[task_archive][container]") {

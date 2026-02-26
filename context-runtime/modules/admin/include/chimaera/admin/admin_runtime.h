@@ -239,8 +239,23 @@ public:
    * Handle Monitor - Unified monitor query for admin chimod
    * Supported queries:
    *   "worker_stats" - collect worker statistics (msgpack-encoded)
+   *   "pool_stats://<pool_id>:<routing>:<selector>" - delegate to a pool
+   *   "system_stats[:<min_event_id>]" - system resource utilization
+   *   "bdev_stats" - block device statistics
    */
   chi::TaskResume Monitor(hipc::FullPtr<MonitorTask> task, chi::RunContext &rctx);
+
+  /** Monitor sub-handler: collect per-worker statistics. */
+  void MonitorWorkerStats(hipc::FullPtr<MonitorTask> task);
+
+  /** Monitor sub-handler: delegate query to a specific pool. */
+  chi::TaskResume MonitorPoolStats(hipc::FullPtr<MonitorTask> task);
+
+  /** Monitor sub-handler: return system_stats ring buffer entries. */
+  void MonitorSystemStats(hipc::FullPtr<MonitorTask> task);
+
+  /** Monitor sub-handler: collect bdev pool statistics. */
+  chi::TaskResume MonitorBdevStats(hipc::FullPtr<MonitorTask> task);
 
   /**
    * Handle RegisterMemory - Register client shared memory with runtime
@@ -375,6 +390,9 @@ public:
    * Create a new task of the specified method type
    */
   hipc::FullPtr<chi::Task> NewTask(chi::u32 method) override;
+  void Aggregate(chi::u32 method, hipc::FullPtr<chi::Task> orig_task,
+                 const hipc::FullPtr<chi::Task>& replica_task) override;
+  void DelTask(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr) override;
 
   /**
    * Attempt to send a retried task to the given node

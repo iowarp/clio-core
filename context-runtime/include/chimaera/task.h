@@ -146,9 +146,10 @@ class Task {
   TaskGroup task_group_; /**< Scheduling affinity group (null = no affinity) */
 
   /**
-   * Virtual destructor enables delete via base pointer
+   * Non-virtual destructor - tasks are deleted via Container::DelTask
+   * which dispatches through typed pointers, not vtable
    */
-  virtual ~Task() = default;
+  ~Task() = default;
 
   /**
    * Default constructor
@@ -393,7 +394,7 @@ class Task {
    *
    * @param replica_task The replica task to aggregate from
    */
-  virtual void Aggregate(const hipc::FullPtr<Task>& replica_task) {
+  void Aggregate(const hipc::FullPtr<Task>& replica_task) {
     // Propagate return code from replica to this task
     if (!replica_task.IsNull() && replica_task->GetReturnCode() != 0) {
       SetReturnCode(replica_task->GetReturnCode());

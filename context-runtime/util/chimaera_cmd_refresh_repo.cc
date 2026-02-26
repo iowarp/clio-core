@@ -505,6 +505,49 @@ class ChiModGenerator {
     oss << "  }\n";
     oss << "}\n";
     oss << "\n";
+    // Generate Aggregate method - dispatches to typed task's Aggregate
+    oss << "void Runtime::Aggregate(chi::u32 method, hipc::FullPtr<chi::Task> orig_task,\n";
+    oss << "                        const hipc::FullPtr<chi::Task>& replica_task) {\n";
+    oss << "  switch (method) {\n";
+
+    for (const auto& method : methods) {
+      std::string task_type = GetTaskTypeName(method.method_name, chimod_name);
+      oss << "    case Method::" << method.constant_name << ": {\n";
+      oss << "      auto typed_task = orig_task.template Cast<" << task_type << ">();\n";
+      oss << "      typed_task->Aggregate(replica_task);\n";
+      oss << "      break;\n";
+      oss << "    }\n";
+    }
+
+    oss << "    default: {\n";
+    oss << "      orig_task->Aggregate(replica_task);\n";
+    oss << "      break;\n";
+    oss << "    }\n";
+    oss << "  }\n";
+    oss << "}\n";
+    oss << "\n";
+
+    // Generate DelTask method - dispatches to typed task deletion
+    oss << "void Runtime::DelTask(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr) {\n";
+    oss << "  auto* ipc_manager = CHI_IPC;\n";
+    oss << "  if (!ipc_manager) return;\n";
+    oss << "  switch (method) {\n";
+
+    for (const auto& method : methods) {
+      std::string task_type = GetTaskTypeName(method.method_name, chimod_name);
+      oss << "    case Method::" << method.constant_name << ": {\n";
+      oss << "      ipc_manager->DelTask(task_ptr.template Cast<" << task_type << ">());\n";
+      oss << "      break;\n";
+      oss << "    }\n";
+    }
+
+    oss << "    default: {\n";
+    oss << "      ipc_manager->DelTask(task_ptr);\n";
+    oss << "      break;\n";
+    oss << "    }\n";
+    oss << "  }\n";
+    oss << "}\n";
+    oss << "\n";
     oss << "} // namespace " << namespace_name << "::" << chimod_name << "\n";
 
     return oss.str();

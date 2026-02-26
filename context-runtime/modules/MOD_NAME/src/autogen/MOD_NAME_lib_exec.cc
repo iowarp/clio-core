@@ -517,4 +517,106 @@ hipc::FullPtr<chi::Task> Runtime::NewTask(chi::u32 method) {
   }
 }
 
+void Runtime::Aggregate(chi::u32 method, hipc::FullPtr<chi::Task> orig_task,
+                        const hipc::FullPtr<chi::Task>& replica_task) {
+  switch (method) {
+    case Method::kCreate: {
+      auto typed_task = orig_task.template Cast<CreateTask>();
+      typed_task->Aggregate(replica_task);
+      break;
+    }
+    case Method::kDestroy: {
+      auto typed_task = orig_task.template Cast<DestroyTask>();
+      typed_task->Aggregate(replica_task);
+      break;
+    }
+    case Method::kMonitor: {
+      auto typed_task = orig_task.template Cast<MonitorTask>();
+      typed_task->Aggregate(replica_task);
+      break;
+    }
+    case Method::kCustom: {
+      auto typed_task = orig_task.template Cast<CustomTask>();
+      typed_task->Aggregate(replica_task);
+      break;
+    }
+    case Method::kCoMutexTest: {
+      auto typed_task = orig_task.template Cast<CoMutexTestTask>();
+      typed_task->Aggregate(replica_task);
+      break;
+    }
+    case Method::kCoRwLockTest: {
+      auto typed_task = orig_task.template Cast<CoRwLockTestTask>();
+      typed_task->Aggregate(replica_task);
+      break;
+    }
+    case Method::kWaitTest: {
+      auto typed_task = orig_task.template Cast<WaitTestTask>();
+      typed_task->Aggregate(replica_task);
+      break;
+    }
+    case Method::kTestLargeOutput: {
+      auto typed_task = orig_task.template Cast<TestLargeOutputTask>();
+      typed_task->Aggregate(replica_task);
+      break;
+    }
+    case Method::kGpuSubmit: {
+      auto typed_task = orig_task.template Cast<GpuSubmitTask>();
+      typed_task->Aggregate(replica_task);
+      break;
+    }
+    default: {
+      orig_task->Aggregate(replica_task);
+      break;
+    }
+  }
+}
+
+void Runtime::DelTask(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr) {
+  auto* ipc_manager = CHI_IPC;
+  if (!ipc_manager) return;
+  switch (method) {
+    case Method::kCreate: {
+      ipc_manager->DelTask(task_ptr.template Cast<CreateTask>());
+      break;
+    }
+    case Method::kDestroy: {
+      ipc_manager->DelTask(task_ptr.template Cast<DestroyTask>());
+      break;
+    }
+    case Method::kMonitor: {
+      ipc_manager->DelTask(task_ptr.template Cast<MonitorTask>());
+      break;
+    }
+    case Method::kCustom: {
+      ipc_manager->DelTask(task_ptr.template Cast<CustomTask>());
+      break;
+    }
+    case Method::kCoMutexTest: {
+      ipc_manager->DelTask(task_ptr.template Cast<CoMutexTestTask>());
+      break;
+    }
+    case Method::kCoRwLockTest: {
+      ipc_manager->DelTask(task_ptr.template Cast<CoRwLockTestTask>());
+      break;
+    }
+    case Method::kWaitTest: {
+      ipc_manager->DelTask(task_ptr.template Cast<WaitTestTask>());
+      break;
+    }
+    case Method::kTestLargeOutput: {
+      ipc_manager->DelTask(task_ptr.template Cast<TestLargeOutputTask>());
+      break;
+    }
+    case Method::kGpuSubmit: {
+      ipc_manager->DelTask(task_ptr.template Cast<GpuSubmitTask>());
+      break;
+    }
+    default: {
+      ipc_manager->DelTask(task_ptr);
+      break;
+    }
+  }
+}
+
 } // namespace chimaera::MOD_NAME

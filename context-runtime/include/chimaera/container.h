@@ -322,6 +322,24 @@ class Container {
    */
   HSHM_DLL virtual hipc::FullPtr<Task> NewTask(u32 method) = 0;
 
+  /**
+   * Aggregate replica results into origin task via Container dispatch
+   * Replaces virtual Task::Aggregate to avoid vtable on Task
+   * @param method The method ID for proper task type casting
+   * @param orig_task The origin task to aggregate into
+   * @param replica_task The replica task to aggregate from
+   */
+  virtual void Aggregate(u32 method, hipc::FullPtr<Task> orig_task,
+                          const hipc::FullPtr<Task>& replica_task) = 0;
+
+  /**
+   * Delete a task via Container dispatch with proper type casting
+   * Replaces direct CHI_IPC->DelTask(base_ptr) to ensure correct destructor
+   * @param method The method ID for proper task type casting
+   * @param task_ptr The task to delete
+   */
+  virtual void DelTask(u32 method, hipc::FullPtr<Task> task_ptr) = 0;
+
 };
 
 /**
