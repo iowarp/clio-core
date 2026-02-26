@@ -1,0 +1,96 @@
+{% extends "base.html" %}
+{% block title %}Node {{ node_id }} -- Chimaera Visualizer{% endblock %}
+
+{% block content %}
+<h1 id="nodeHeader">Node {{ node_id }}</h1>
+
+<!-- Summary cards -->
+<div class="card-grid" id="summaryCards">
+    <div class="card">
+        <div class="card-label">CPU</div>
+        <div class="card-value" id="card-cpu">--</div>
+    </div>
+    <div class="card">
+        <div class="card-label">RAM</div>
+        <div class="card-value" id="card-ram">--</div>
+    </div>
+    <div class="card">
+        <div class="card-label">Workers</div>
+        <div class="card-value" id="card-workers">--</div>
+    </div>
+    <div class="card">
+        <div class="card-label">Queued</div>
+        <div class="card-value" id="card-queued">--</div>
+    </div>
+    <div class="card">
+        <div class="card-label">Blocked</div>
+        <div class="card-value" id="card-blocked">--</div>
+    </div>
+    <div class="card">
+        <div class="card-label">Processed</div>
+        <div class="card-value" id="card-processed">--</div>
+    </div>
+    <div class="card gpu-section" id="card-gpu-wrap" style="display:none">
+        <div class="card-label">GPU</div>
+        <div class="card-value" id="card-gpu">--</div>
+    </div>
+    <div class="card gpu-section" id="card-hbm-wrap" style="display:none">
+        <div class="card-label">HBM</div>
+        <div class="card-value" id="card-hbm">--</div>
+    </div>
+</div>
+
+<!-- Worker charts -->
+<div class="chart-container">
+    <h2>Workers -- Processed</h2>
+    <canvas id="processedChart"></canvas>
+</div>
+<div class="chart-container">
+    <h2>Workers -- Queue Depth</h2>
+    <canvas id="queueChart"></canvas>
+</div>
+
+<!-- Worker details table -->
+<div class="table-container">
+    <h2>Worker Details</h2>
+    <table id="workerTable">
+        <thead>
+            <tr>
+                <th>Worker</th>
+                <th>Queued</th>
+                <th>Blocked</th>
+                <th>Processed</th>
+            </tr>
+        </thead>
+        <tbody></tbody>
+    </table>
+</div>
+
+<!-- System stats time-series -->
+<div class="chart-container">
+    <h2>CPU Utilization Over Time</h2>
+    <canvas id="cpuChart"></canvas>
+</div>
+<div class="chart-container">
+    <h2>DRAM Utilization Over Time</h2>
+    <canvas id="ramChart"></canvas>
+</div>
+<div class="chart-container gpu-section" id="gpuChartWrap" style="display:none">
+    <h2>GPU Utilization Over Time</h2>
+    <canvas id="gpuChart"></canvas>
+</div>
+<div class="chart-container gpu-section" id="hbmChartWrap" style="display:none">
+    <h2>HBM Utilization Over Time</h2>
+    <canvas id="hbmChart"></canvas>
+</div>
+
+<!-- Storage devices -->
+<h2>Storage Devices</h2>
+<div class="bdev-grid" id="bdevGrid">
+    <!-- Populated by JS -->
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/node.js') }}"></script>
+{% endblock %}
