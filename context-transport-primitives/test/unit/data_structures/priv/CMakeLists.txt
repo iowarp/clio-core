@@ -62,6 +62,20 @@ set_tests_properties(
   PROPERTIES LABELS "msan_skip"
 )
 
+# Skip ctp_priv_vector* under MSan: hshm priv::vector uses mmap-backed shared
+# memory regions that MSan cannot instrument (no instrumented allocator backing),
+# and cereal serialization leaves restored bytes with uninitialized MSan shadow.
+set_tests_properties(
+  ctp_priv_vector
+  ctp_priv_vector_pod
+  ctp_priv_vector_complex
+  ctp_priv_vector_edge
+  ctp_priv_vector_stress
+  ctp_priv_vector_serialization
+  ctp_priv_vector_local_serialize
+  PROPERTIES LABELS "msan_skip"
+)
+
 #------------------------------------------------------------------------------
 # Install Targets
 #------------------------------------------------------------------------------

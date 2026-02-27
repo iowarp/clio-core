@@ -124,17 +124,16 @@ run_sanitizer_mode() {
 
     print_header "Sanitizer mode: ${MODE} (${MEMCHECK_TYPE})"
 
-    # Strip conda env lib dirs from LD_LIBRARY_PATH to prevent OpenSSL conflicts.
-    # 'conda activate' prepends its lib dir (e.g. /envs/iowarp/lib) which contains
-    # libssl/libcurl that conflict with system HDF5 (system HDF5 → conda libcurl →
-    # conda libssl → needs OPENSSL_3.3+ symbols missing from system libcrypto).
-    # Stripping before cmake configure ensures the cleaned path is baked into
-    # test ENVIRONMENT properties, fixing tests that launch HDF5-linked binaries.
-    local STRIPPED_LD_PATH
-    STRIPPED_LD_PATH=$(echo "${LD_LIBRARY_PATH:-}" | tr ':' '\n' \
-        | grep -Ev 'miniconda.*envs|conda.*envs' | tr '\n' ':' | sed 's/:$//')
-    export LD_LIBRARY_PATH="${BUILD_DIR}/bin${STRIPPED_LD_PATH:+:${STRIPPED_LD_PATH}}"
-    print_info "LD_LIBRARY_PATH (conda-stripped): ${LD_LIBRARY_PATH}"
+    # Prepend the build's bin dir and system lib dirs to LD_LIBRARY_PATH.
+    # 'conda activate' prepends its lib dir which contains libssl/libcurl/libcrypto
+    # built against a newer OpenSSL (3.3+) than what Ubuntu 24.04 ships (3.0.x).
+    # When conda's libcurl is loaded first, it pulls conda's libssl, which then
+    # requires OPENSSL_3.3.0 symbols absent from the system libcrypto → crash.
+    # Prepending the system lib dirs ensures the Ubuntu-native libcurl/libssl/
+    # libcrypto trio is found first (compatible with each other), while conda's
+    # other libraries (zeromq, libaio, yaml-cpp) remain available as fallback.
+    export LD_LIBRARY_PATH="${BUILD_DIR}/bin:/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}"
+    print_info "LD_LIBRARY_PATH (system-prefixed): ${LD_LIBRARY_PATH}"
 
     # --- Clean ---
     if [ "$CLEAN_BUILD" = true ] && [ -d "${BUILD_DIR}" ]; then
