@@ -49,8 +49,10 @@
 // Precompiled yaml-cpp.so propagates "uninitialized" bytes (from uninstrumented
 // libstdc++) through our instrumented _M_assign into Node scalar strings;
 // __msan_unpoison fixes the false-positive use-of-uninitialized-value reports.
-#if defined(__has_feature) && __has_feature(memory_sanitizer)
+#if defined(__has_feature)
+#if __has_feature(memory_sanitizer)
 #include <sanitizer/msan_interface.h>
+#endif
 #endif
 
 #include "formatter.h"
@@ -276,7 +278,8 @@ class ConfigParse {
     return hosts;
   }
 
-#if defined(__has_feature) && __has_feature(memory_sanitizer)
+#if defined(__has_feature)
+#if __has_feature(memory_sanitizer)
   /**
    * Traverse a fully-loaded YAML tree and mark all scalar string bytes as
    * initialized in MSan's shadow memory.
@@ -307,6 +310,7 @@ class ConfigParse {
     }
   }
 #endif
+#endif
 };
 
 /**
@@ -323,8 +327,10 @@ class BaseConfig {
       return;
     }
     YAML::Node yaml_conf = YAML::Load(config_string);
-#if defined(__has_feature) && __has_feature(memory_sanitizer)
+#if defined(__has_feature)
+#if __has_feature(memory_sanitizer)
     hshm::ConfigParse::MsanUnpoisonYamlNode(yaml_conf);
+#endif
 #endif
     ParseYAML(yaml_conf);
   }
@@ -340,8 +346,10 @@ class BaseConfig {
     auto real_path = hshm::ConfigParse::ExpandPath(path);
     try {
       YAML::Node yaml_conf = YAML::LoadFile(real_path);
-#if defined(__has_feature) && __has_feature(memory_sanitizer)
+#if defined(__has_feature)
+#if __has_feature(memory_sanitizer)
       hshm::ConfigParse::MsanUnpoisonYamlNode(yaml_conf);
+#endif
 #endif
       ParseYAML(yaml_conf);
     } catch (std::exception &e) {

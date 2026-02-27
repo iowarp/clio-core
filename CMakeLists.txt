@@ -805,10 +805,11 @@ if(WRP_CORE_ENABLE_TESTS)
     add_test(
         NAME chimaera_pre_test_cleanup
         COMMAND bash -c
-            "fuser -k 9413/tcp 9414/tcp 9416/tcp 2>/dev/null; \
+            "fuser -k 5555/tcp 5558/tcp 9413/tcp 9414/tcp 9416/tcp 2>/dev/null; \
              rm -f /tmp/chimaera_*.ipc 2>/dev/null; \
              rm -f /tmp/chimaera_server_timing.log 2>/dev/null; \
              rm -rf /tmp/chimaera_memfd 2>/dev/null; \
+             rm -rf /tmp/chimaera_${USER} 2>/dev/null; \
              rm -f /dev/shm/sm_segment.* 2>/dev/null; \
              exit 0"
     )

@@ -41,9 +41,13 @@
 
 #include "hermes_shm/constants/macros.h"
 // MSan: inform sanitizer that mmap-backed memory is initialized by the kernel
-#if defined(__has_feature) && __has_feature(memory_sanitizer)
+#if defined(__has_feature)
+#if __has_feature(memory_sanitizer)
 #include <sanitizer/msan_interface.h>
 #define HSHM_MSAN_UNPOISON(ptr, size) __msan_unpoison((ptr), (size))
+#else
+#define HSHM_MSAN_UNPOISON(ptr, size) ((void)0)
+#endif
 #else
 #define HSHM_MSAN_UNPOISON(ptr, size) ((void)0)
 #endif

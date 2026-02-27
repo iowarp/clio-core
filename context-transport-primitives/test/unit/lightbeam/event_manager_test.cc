@@ -42,6 +42,7 @@
 #include <thread>
 #include <atomic>
 #ifndef _WIN32
+#include <signal.h>
 #include <unistd.h>
 #endif
 
@@ -370,6 +371,7 @@ void TestZmqTransportWithEM() {
 
 int main() {
 #ifndef _WIN32
+  signal(SIGPIPE, SIG_IGN);  // Prevent SIGPIPE from terminating process
   TestConstruction();
   TestAddEventBasic();
   TestAddEventWithAction();

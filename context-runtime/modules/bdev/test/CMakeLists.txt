@@ -87,15 +87,10 @@ if(WRP_CORE_ENABLE_TESTS)
 
   # Set test properties
   set_tests_properties(
-    cr_bdev_container_creation_tests
-    cr_bdev_block_allocation_tests
-    cr_bdev_io_operations_tests
-    cr_bdev_async_operations_tests
-    cr_bdev_free_management_tests
-    cr_bdev_performance_tests
-    cr_bdev_error_handling_tests
-    cr_bdev_cleanup_tests
     cr_all_bdev_tests
+    cr_bdev_explicit_backend_shm
+    cr_bdev_explicit_backend_tcp
+    cr_bdev_explicit_backend_ipc
     PROPERTIES
       TIMEOUT 180
       LABELS "msan_skip"

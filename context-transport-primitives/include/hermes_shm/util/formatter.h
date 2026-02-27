@@ -45,10 +45,14 @@
 #include "hermes_shm/types/argpack.h"
 
 // MSan: unpoison strings produced by uninstrumented libstdc++ stringstream
-#if defined(__has_feature) && __has_feature(memory_sanitizer)
+#if defined(__has_feature)
+#if __has_feature(memory_sanitizer)
 #include <sanitizer/msan_interface.h>
 #define HSHM_MSAN_UNPOISON_STRING(s) \
   __msan_unpoison((s).data(), (s).size())
+#else
+#define HSHM_MSAN_UNPOISON_STRING(s) ((void)0)
+#endif
 #else
 #define HSHM_MSAN_UNPOISON_STRING(s) ((void)0)
 #endif

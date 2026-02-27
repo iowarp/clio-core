@@ -16,10 +16,14 @@ add_test(
   WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
 )
 
-# Set timeout for mixed mapping test (multi-process, needs more time)
+# Set timeout and LD_LIBRARY_PATH for mixed mapping test (multi-process)
+# LD_LIBRARY_PATH ensures subprocesses load the freshly built library.
+# CMAKE_BINARY_DIR is passed so the shell script finds the test binary.
 set_tests_properties(
   ctp_mixed_mapping
-  PROPERTIES TIMEOUT 15
+  PROPERTIES
+    TIMEOUT 15
+    ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CMAKE_BINARY_DIR=${CMAKE_BINARY_DIR}"
 )
 
 # Skip under MSan: multi-process test; MSan shadow doesn't propagate across fork.

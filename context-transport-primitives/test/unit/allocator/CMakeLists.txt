@@ -79,11 +79,15 @@ add_test(NAME ctp_mp_allocator_multiprocess
 add_test(NAME ctp_buddy_allocator_multiprocess COMMAND
         ${CMAKE_BINARY_DIR}/bin/test_buddy_allocator_multiprocess_exec_2 0 5)
 
-# Set timeouts for multiprocess tests (they need more than 1 second)
+# Set timeouts and LD_LIBRARY_PATH for multiprocess tests
+# LD_LIBRARY_PATH ensures subprocesses load the freshly built library,
+# not the stale spack-installed one (which may lack newer symbols).
 set_tests_properties(
   ctp_mp_allocator_multiprocess
   ctp_buddy_allocator_multiprocess
-  PROPERTIES TIMEOUT 15
+  PROPERTIES
+    TIMEOUT 15
+    ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}"
 )
 
 # Skip under MSan: Catch2 is precompiled without MSan instrumentation,
