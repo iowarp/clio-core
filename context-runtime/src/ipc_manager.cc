@@ -1879,28 +1879,34 @@ bool IpcManager::WaitForServerAndReconnect(
   reconnecting_.store(true, std::memory_order_release);
 
   // Phase 1: Try reconnecting to the original server
+  // Skip entirely when client_retry_timeout_==0 (go straight to Phase 2).
   // Use a short WaitForLocalServer timeout so each attempt doesn't
   // block for the full 30s default.
   float saved_timeout = wait_server_timeout_;
-  float per_attempt_timeout = std::min(wait_server_timeout_, 3.0f);
-  wait_server_timeout_ = per_attempt_timeout;
-  while (true) {
-    float elapsed =
-        std::chrono::duration<float>(std::chrono::steady_clock::now() - start)
-            .count();
-    if (client_retry_timeout_ >= 0 && elapsed >= client_retry_timeout_) {
-      HLOG(kWarning, "WaitForServerAndReconnect: Original server timed out "
-           "after {:.1f}s", elapsed);
-      break;
+  if (client_retry_timeout_ != 0) {
+    float per_attempt_timeout = std::min(wait_server_timeout_, 3.0f);
+    wait_server_timeout_ = per_attempt_timeout;
+    while (true) {
+      float elapsed =
+          std::chrono::duration<float>(std::chrono::steady_clock::now() - start)
+              .count();
+      if (client_retry_timeout_ >= 0 && elapsed >= client_retry_timeout_) {
+        HLOG(kWarning, "WaitForServerAndReconnect: Original server timed out "
+             "after {:.1f}s", elapsed);
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::seconds(1));
+      if (ReconnectToOriginalHost()) {
+        wait_server_timeout_ = saved_timeout;
+        reconnecting_.store(false, std::memory_order_release);
+        return true;
+      }
     }
-    std::this_thread::sleep_for(std::chrono::seconds(1));
-    if (ReconnectToOriginalHost()) {
-      wait_server_timeout_ = saved_timeout;
-      reconnecting_.store(false, std::memory_order_release);
-      return true;
-    }
+    wait_server_timeout_ = saved_timeout;
+  } else {
+    HLOG(kInfo, "WaitForServerAndReconnect: retry_timeout=0, "
+         "skipping Phase 1, going straight to Phase 2");
   }
-  wait_server_timeout_ = saved_timeout;
 
   // Phase 2: Try random hosts from the hostfile
   if (client_try_new_servers_ <= 0 || hostfile_map_.empty()) {

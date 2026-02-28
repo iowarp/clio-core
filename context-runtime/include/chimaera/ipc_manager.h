@@ -775,8 +775,8 @@ class IpcManager {
       // Skip if already inside a reconnect attempt (prevents recursion from
       // WaitForLocalServer → Recv → WaitForServerAndReconnect)
       if (!server_alive_.load() && !reconnecting_.load()) {
-        if (client_retry_timeout_ == 0) {
-          HLOG(kError, "Recv: Server dead, retry_timeout=0, failing");
+        if (client_retry_timeout_ == 0 && client_try_new_servers_ <= 0) {
+          HLOG(kError, "Recv: Server dead, retry_timeout=0, no failover configured, failing");
           return false;
         }
         HLOG(kWarning, "Recv: Server unreachable, reconnecting...");

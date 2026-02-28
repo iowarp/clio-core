@@ -261,13 +261,15 @@ def shutdown_node(ip_address, grace_period_ms=5000):
         pass
 
     # Step 2: Graceful stop failed or timed out — force kill
+    # Use -x (exact name match) to avoid killing the container's main bash
+    # process, which also has 'chimaera runtime start' in its command line.
     kill_cmd = [
-        "ssh",
+        "ssh", "-T", "-n",
         "-o", "StrictHostKeyChecking=no",
         "-o", "ConnectTimeout=5",
         ip_address,
-        "pkill -9 -f 'chimaera runtime start' 2>/dev/null; sleep 0.5; "
-        "! pgrep -f 'chimaera runtime start' >/dev/null 2>&1",
+        "pkill -9 -x chimaera 2>/dev/null; sleep 0.5; "
+        "! pgrep -x chimaera >/dev/null 2>&1",
     ]
     try:
         kill_result = subprocess.run(
@@ -306,12 +308,14 @@ def restart_node(ip_address, port=9413, wait_timeout=10):
 
     # Step 1: Kill any existing runtime process to free the port.
     # Uses SIGKILL to avoid the graceful stop hanging for 30s.
+    # Use -x (exact name match) to avoid killing the container's main bash
+    # process, which also has 'chimaera runtime start' in its command line.
     kill_cmd = [
-        "ssh",
+        "ssh", "-T", "-n",
         "-o", "StrictHostKeyChecking=no",
         "-o", "ConnectTimeout=5",
         ip_address,
-        "pkill -9 -f 'chimaera runtime start' 2>/dev/null; sleep 1",
+        "pkill -9 -x chimaera 2>/dev/null; sleep 1",
     ]
     print(f"[restart_node] Step 1: Killing existing runtime via SSH: {' '.join(kill_cmd)}", flush=True)
     try:
@@ -336,13 +340,15 @@ def restart_node(ip_address, port=9413, wait_timeout=10):
     log_file = "/tmp/chimaera_restart.log"
     # setsid creates a new session so the process is fully detached from SSH.
     # nohup prevents SIGHUP when SSH disconnects.
+    # disown + exit 0 ensure bash releases the job and SSH closes cleanly.
+    # -T -n on SSH disable PTY and redirect stdin to prevent hangs.
     remote_cmd = (
         f"{env_str} && "
         f"nohup setsid /workspace/build/bin/chimaera runtime start "
-        f"</dev/null >{log_file} 2>&1 &"
+        f"</dev/null >{log_file} 2>&1 & disown; exit 0"
     )
     cmd = [
-        "ssh",
+        "ssh", "-T", "-n",
         "-o", "StrictHostKeyChecking=no",
         "-o", "ConnectTimeout=5",
         ip_address,
@@ -397,7 +403,8 @@ def restart_node(ip_address, port=9413, wait_timeout=10):
     log_output = ""
     try:
         log_cmd = [
-            "ssh", "-o", "StrictHostKeyChecking=no",
+            "ssh", "-T", "-n",
+            "-o", "StrictHostKeyChecking=no",
             "-o", "ConnectTimeout=5",
             ip_address,
             f"tail -30 {log_file} 2>/dev/null",
