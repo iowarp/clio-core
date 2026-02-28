@@ -3,21 +3,34 @@
 #
 # Usage: rattler-build build --recipe recipe/ --variant-config variants/mpi.yaml
 
-preset: custom
+preset:
+  - custom
 
-build_type: Release
+build_type:
+  - Release
 
-cuda_enabled: "OFF"
-rocm_enabled: "OFF"
+cuda_enabled:
+  - "OFF"
+rocm_enabled:
+  - "OFF"
 
-mpi_enabled: "ON"
-mpi_impl: openmpi  # Change to mpich or msmpi as needed
+mpi_enabled:
+  - "ON"
+mpi_impl:
+  - openmpi  # Change to mpich or msmpi as needed
 
-runtime_enabled: "ON"
-cte_enabled: "ON"
-cae_enabled: "ON"
-cee_enabled: "ON"
+runtime_enabled:
+  - "ON"
+cte_enabled:
+  - "ON"
+cae_enabled:
+  - "ON"
+cee_enabled:
+  - "ON"
 
-zmq_enabled: "ON"
-hdf5_enabled: "ON"
-elf_enabled: "OFF"
+zmq_enabled:
+  - "ON"
+hdf5_enabled:
+  - "ON"
+elf_enabled:
+  - "OFF"

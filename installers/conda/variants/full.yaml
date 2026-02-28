@@ -3,25 +3,38 @@
 #
 # Usage: rattler-build build --recipe recipe/ --variant-config variants/full.yaml
 
-preset: custom
+preset:
+  - custom
 
-build_type: Release
+build_type:
+  - Release
 
 # Enable CUDA (Linux only)
-cuda_enabled: "ON"
-rocm_enabled: "OFF"
+cuda_enabled:
+  - "ON"
+rocm_enabled:
+  - "OFF"
 
 # Enable MPI
-mpi_enabled: "ON"
-mpi_impl: openmpi
+mpi_enabled:
+  - "ON"
+mpi_impl:
+  - openmpi
 
 # All core components
-runtime_enabled: "ON"
-cte_enabled: "ON"
-cae_enabled: "ON"
-cee_enabled: "ON"
+runtime_enabled:
+  - "ON"
+cte_enabled:
+  - "ON"
+cae_enabled:
+  - "ON"
+cee_enabled:
+  - "ON"
 
 # All optional features
-zmq_enabled: "ON"
-hdf5_enabled: "ON"
-elf_enabled: "ON"
+zmq_enabled:
+  - "ON"
+hdf5_enabled:
+  - "ON"
+elf_enabled:
+  - "ON"
