@@ -290,94 +290,151 @@ def shutdown_node(ip_address, grace_period_ms=5000):
         }
 
 
-def restart_node(ip_address, port=9413, wait_timeout=10):
-    """Restart a remote node via SSH.
+def restart_node(ip_address, port=9413, wait_timeout=15):
+    """Restart a node's Chimaera runtime.
 
-    1. Kills any existing runtime process (force kill to avoid hangs).
-    2. Forwards runtime environment variables (CHI_SERVER_CONF, etc.).
-    3. Starts the runtime in the background via nohup + setsid.
-    4. Polls the node's TCP port to verify the runtime came up.
+    Detects whether the target is the local node (by comparing against
+    NODE_IP env var) and uses a direct subprocess.Popen for local restarts
+    instead of SSH, which avoids SSH session hangs during leader init.
 
-    Returns success only when the node is actually accepting connections.
+    Uses ``chimaera runtime restart`` (WAL replay) so the node rejoins the
+    existing cluster rather than trying to bootstrap a new one.
+
+    Steps:
+      1. Kill any existing runtime (pkill -x chimaera).
+      2. Launch ``chimaera runtime restart`` in the background.
+      3. Poll the TCP port until the runtime is accepting connections.
     """
     import os
     import time
     import subprocess
 
-    print(f"[restart_node] Starting restart for {ip_address}:{port}", flush=True)
-
-    # Step 1: Kill any existing runtime process to free the port.
-    # Uses SIGKILL to avoid the graceful stop hanging for 30s.
-    # Use -x (exact name match) to avoid killing the container's main bash
-    # process, which also has 'chimaera runtime start' in its command line.
-    kill_cmd = [
-        "ssh", "-T", "-n",
-        "-o", "StrictHostKeyChecking=no",
-        "-o", "ConnectTimeout=5",
-        ip_address,
-        "pkill -9 -x chimaera 2>/dev/null; sleep 1",
-    ]
-    print(f"[restart_node] Step 1: Killing existing runtime via SSH: {' '.join(kill_cmd)}", flush=True)
-    try:
-        kill_result = subprocess.run(kill_cmd, capture_output=True, text=True, timeout=10)
-        print(f"[restart_node] Step 1: Kill rc={kill_result.returncode} "
-              f"stdout={kill_result.stdout!r} stderr={kill_result.stderr!r}", flush=True)
-    except Exception as exc:
-        print(f"[restart_node] Step 1: Kill exception (OK): {exc}", flush=True)
-
-    # Step 2: Build the environment and start the runtime.
-    env_parts = [
-        "export PATH=/workspace/build/bin:$PATH",
-        "LD_LIBRARY_PATH=/workspace/build/bin:$LD_LIBRARY_PATH",
-    ]
-    for var in ("CHI_SERVER_CONF", "CHI_NUM_CONTAINERS",
-                "CONTAINER_HOSTFILE"):
-        val = os.environ.get(var)
-        if val:
-            env_parts.append(f"{var}={val}")
-        print(f"[restart_node] env {var}={val!r}", flush=True)
-    env_str = " ".join(env_parts)
     log_file = "/tmp/chimaera_restart.log"
-    # setsid creates a new session so the process is fully detached from SSH.
-    # nohup prevents SIGHUP when SSH disconnects.
-    # disown + exit 0 ensure bash releases the job and SSH closes cleanly.
-    # -T -n on SSH disable PTY and redirect stdin to prevent hangs.
-    remote_cmd = (
-        f"{env_str} && "
-        f"nohup setsid /workspace/build/bin/chimaera runtime start "
-        f"</dev/null >{log_file} 2>&1 & disown; exit 0"
-    )
-    cmd = [
-        "ssh", "-T", "-n",
-        "-o", "StrictHostKeyChecking=no",
-        "-o", "ConnectTimeout=5",
-        ip_address,
-        remote_cmd,
-    ]
-    print(f"[restart_node] Step 2: Starting runtime via SSH: {' '.join(cmd)}", flush=True)
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-    except Exception as exc:
-        print(f"[restart_node] Step 2: SSH exception: {exc}", flush=True)
-        return {
-            "success": False,
-            "returncode": -1,
-            "stdout": "",
-            "stderr": f"SSH start command failed: {exc}",
-        }
-    print(f"[restart_node] Step 2: SSH rc={result.returncode} "
-          f"stdout={result.stdout!r} stderr={result.stderr!r}", flush=True)
-    if result.returncode != 0:
-        print(f"[restart_node] Step 2: FAILED — SSH returned non-zero", flush=True)
-        return {
-            "success": False,
-            "returncode": result.returncode,
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-        }
+    local_ip = os.environ.get("NODE_IP", "")
+    is_local = (ip_address == local_ip)
 
-    # Step 3: Poll the node's main port to verify the runtime started.
-    print(f"[restart_node] Step 3: Polling {ip_address}:{port} for up to {wait_timeout}s", flush=True)
+    print(f"[restart_node] Starting restart for {ip_address}:{port} "
+          f"(local={is_local})", flush=True)
+
+    # ------------------------------------------------------------------
+    # Step 1: Kill any existing runtime process to free the port.
+    # Use -x (exact executable name) to avoid killing the container's
+    # main bash process whose command line also contains 'chimaera'.
+    # ------------------------------------------------------------------
+    if is_local:
+        print("[restart_node] Step 1: Killing local runtime", flush=True)
+        try:
+            kill_result = subprocess.run(
+                ["pkill", "-9", "-x", "chimaera"],
+                capture_output=True, text=True, timeout=5)
+            print(f"[restart_node] Step 1: Kill rc={kill_result.returncode}",
+                  flush=True)
+        except Exception as exc:
+            print(f"[restart_node] Step 1: Kill exception (OK): {exc}",
+                  flush=True)
+        time.sleep(1)
+    else:
+        kill_cmd = [
+            "ssh", "-T", "-n",
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "ConnectTimeout=5",
+            ip_address,
+            "pkill -9 -x chimaera 2>/dev/null; sleep 1",
+        ]
+        print(f"[restart_node] Step 1: Killing via SSH: "
+              f"{' '.join(kill_cmd)}", flush=True)
+        try:
+            kill_result = subprocess.run(
+                kill_cmd, capture_output=True, text=True, timeout=10)
+            print(f"[restart_node] Step 1: Kill rc={kill_result.returncode}",
+                  flush=True)
+        except Exception as exc:
+            print(f"[restart_node] Step 1: Kill exception (OK): {exc}",
+                  flush=True)
+
+    # ------------------------------------------------------------------
+    # Step 2: Launch the runtime in the background.
+    # ------------------------------------------------------------------
+    if is_local:
+        # Local node: launch directly via subprocess.Popen.
+        # start_new_session=True fully detaches from the dashboard process.
+        env = os.environ.copy()
+        env["PATH"] = f"/workspace/build/bin:{env.get('PATH', '')}"
+        env["LD_LIBRARY_PATH"] = (
+            f"/workspace/build/bin:{env.get('LD_LIBRARY_PATH', '')}")
+        print("[restart_node] Step 2: Launching local runtime via Popen",
+              flush=True)
+        try:
+            with open(log_file, "w") as log_f:
+                subprocess.Popen(
+                    ["/workspace/build/bin/chimaera", "runtime", "restart"],
+                    stdin=subprocess.DEVNULL,
+                    stdout=log_f,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                    env=env,
+                )
+        except Exception as exc:
+            print(f"[restart_node] Step 2: Popen failed: {exc}", flush=True)
+            return {
+                "success": False,
+                "returncode": -1,
+                "stdout": "",
+                "stderr": f"Failed to launch runtime: {exc}",
+            }
+    else:
+        # Remote node: launch via SSH.
+        env_parts = [
+            "export PATH=/workspace/build/bin:$PATH",
+            "LD_LIBRARY_PATH=/workspace/build/bin:$LD_LIBRARY_PATH",
+        ]
+        for var in ("CHI_SERVER_CONF", "CHI_NUM_CONTAINERS",
+                    "CONTAINER_HOSTFILE"):
+            val = os.environ.get(var)
+            if val:
+                env_parts.append(f"{var}={val}")
+            print(f"[restart_node] env {var}={val!r}", flush=True)
+        env_str = " ".join(env_parts)
+        remote_cmd = (
+            f"{env_str} && "
+            f"nohup setsid /workspace/build/bin/chimaera runtime restart "
+            f"</dev/null >{log_file} 2>&1 & disown; exit 0"
+        )
+        cmd = [
+            "ssh", "-T", "-n",
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "ConnectTimeout=5",
+            ip_address,
+            remote_cmd,
+        ]
+        print(f"[restart_node] Step 2: Starting via SSH: "
+              f"{' '.join(cmd)}", flush=True)
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=15)
+        except Exception as exc:
+            print(f"[restart_node] Step 2: SSH exception: {exc}", flush=True)
+            return {
+                "success": False,
+                "returncode": -1,
+                "stdout": "",
+                "stderr": f"SSH start command failed: {exc}",
+            }
+        if result.returncode != 0:
+            print(f"[restart_node] Step 2: SSH rc={result.returncode}",
+                  flush=True)
+            return {
+                "success": False,
+                "returncode": result.returncode,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+            }
+
+    # ------------------------------------------------------------------
+    # Step 3: Poll the node's TCP port to verify the runtime started.
+    # ------------------------------------------------------------------
+    print(f"[restart_node] Step 3: Polling {ip_address}:{port} "
+          f"for up to {wait_timeout}s", flush=True)
     deadline = time.monotonic() + wait_timeout
     attempt = 0
     while time.monotonic() < deadline:
@@ -387,7 +444,8 @@ def restart_node(ip_address, port=9413, wait_timeout=10):
             s.settimeout(1)
             s.connect((ip_address, port))
             s.close()
-            print(f"[restart_node] Step 3: Connected on attempt {attempt} — runtime is up!", flush=True)
+            print(f"[restart_node] Step 3: Connected on attempt {attempt} "
+                  f"— runtime is up!", flush=True)
             return {
                 "success": True,
                 "returncode": 0,
@@ -395,26 +453,33 @@ def restart_node(ip_address, port=9413, wait_timeout=10):
                 "stderr": "",
             }
         except Exception as exc:
-            print(f"[restart_node] Step 3: Attempt {attempt} failed: {exc}", flush=True)
+            if attempt <= 3 or attempt % 5 == 0:
+                print(f"[restart_node] Step 3: Attempt {attempt} failed: "
+                      f"{exc}", flush=True)
         time.sleep(1)
 
     # Node didn't come up — fetch the log file for diagnostics.
-    print(f"[restart_node] Step 3: TIMEOUT — runtime did not come up after {wait_timeout}s", flush=True)
+    print(f"[restart_node] Step 3: TIMEOUT — runtime did not come up "
+          f"after {wait_timeout}s", flush=True)
     log_output = ""
     try:
-        log_cmd = [
-            "ssh", "-T", "-n",
-            "-o", "StrictHostKeyChecking=no",
-            "-o", "ConnectTimeout=5",
-            ip_address,
-            f"tail -30 {log_file} 2>/dev/null",
-        ]
-        log_result = subprocess.run(
-            log_cmd, capture_output=True, text=True, timeout=10)
-        log_output = log_result.stdout
+        if is_local:
+            with open(log_file) as f:
+                log_output = "".join(f.readlines()[-30:])
+        else:
+            log_cmd = [
+                "ssh", "-T", "-n",
+                "-o", "StrictHostKeyChecking=no",
+                "-o", "ConnectTimeout=5",
+                ip_address,
+                f"tail -30 {log_file} 2>/dev/null",
+            ]
+            log_result = subprocess.run(
+                log_cmd, capture_output=True, text=True, timeout=10)
+            log_output = log_result.stdout
         print(f"[restart_node] Remote log:\n{log_output}", flush=True)
     except Exception as exc:
-        print(f"[restart_node] Failed to fetch remote log: {exc}", flush=True)
+        print(f"[restart_node] Failed to fetch log: {exc}", flush=True)
 
     return {
         "success": False,
