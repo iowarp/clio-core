@@ -338,9 +338,9 @@ struct AllocateBlocksTask : public chi::Task {
   }
 
   /** Aggregate replica results into this task */
-  void Aggregate(const hipc::FullPtr<AllocateBlocksTask> &other) {
-    Task::Aggregate(other.template Cast<Task>());
-    Copy(other);
+  void Aggregate(const hipc::FullPtr<chi::Task> &other_base) {
+    Task::Aggregate(other_base);
+    Copy(other_base.template Cast<AllocateBlocksTask>());
   }
 };
 
@@ -399,9 +399,9 @@ struct FreeBlocksTask : public chi::Task {
   }
 
   /** Aggregate replica results into this task */
-  void Aggregate(const hipc::FullPtr<FreeBlocksTask> &other) {
-    Task::Aggregate(other.template Cast<Task>());
-    Copy(other);
+  void Aggregate(const hipc::FullPtr<chi::Task> &other_base) {
+    Task::Aggregate(other_base);
+    Copy(other_base.template Cast<FreeBlocksTask>());
   }
 };
 
@@ -465,9 +465,9 @@ struct WriteTask : public chi::Task {
   }
 
   /** Aggregate */
-  void Aggregate(const hipc::FullPtr<WriteTask> &other) {
-    Task::Aggregate(other.template Cast<Task>());
-    Copy(other);
+  void Aggregate(const hipc::FullPtr<chi::Task> &other_base) {
+    Task::Aggregate(other_base);
+    Copy(other_base.template Cast<WriteTask>());
   }
 
   /**
@@ -547,9 +547,9 @@ struct ReadTask : public chi::Task {
   }
 
   /** Aggregate */
-  void Aggregate(const hipc::FullPtr<ReadTask> &other) {
-    Task::Aggregate(other.template Cast<Task>());
-    Copy(other);
+  void Aggregate(const hipc::FullPtr<chi::Task> &other_base) {
+    Task::Aggregate(other_base);
+    Copy(other_base.template Cast<ReadTask>());
   }
 
   /**
@@ -618,9 +618,9 @@ struct GetStatsTask : public chi::Task {
   }
 
   /** Aggregate replica results into this task */
-  void Aggregate(const hipc::FullPtr<GetStatsTask> &other) {
-    Task::Aggregate(other.template Cast<Task>());
-    Copy(other);
+  void Aggregate(const hipc::FullPtr<chi::Task> &other_base) {
+    Task::Aggregate(other_base);
+    Copy(other_base.template Cast<GetStatsTask>());
   }
 };
 

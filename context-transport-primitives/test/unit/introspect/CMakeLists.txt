@@ -16,9 +16,11 @@ add_test(
   WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
 )
 
-# Set timeout for mixed mapping test (multi-process, needs more time)
+# Set timeout and pass build dir so the script finds the binary in any preset
 set_tests_properties(
   ctp_mixed_mapping
-  PROPERTIES TIMEOUT 15
+  PROPERTIES
+    TIMEOUT 15
+    ENVIRONMENT "CMAKE_BINARY_DIR=${CMAKE_BINARY_DIR}"
 )
 endif()

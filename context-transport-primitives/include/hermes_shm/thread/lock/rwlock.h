@@ -39,7 +39,6 @@
 #include "hermes_shm/thread/thread_model_manager.h"
 #include "hermes_shm/types/atomic.h"
 #include "hermes_shm/types/numbers.h"
-#include "hermes_shm/util/logging.h"
 
 namespace hshm {
 
@@ -58,10 +57,6 @@ struct RwLock {
   ipc::atomic<hshm::reg_uint> writers_;
   ipc::atomic<hshm::reg_uint> cur_writer_;
   ipc::atomic<hshm::big_uint> ticket_;
-#ifdef HSHM_DEBUG_LOCK
-  uint32_t owner_;
-#endif
-
   /** Default constructor */
   HSHM_CROSS_FUN
   RwLock()
@@ -124,10 +119,6 @@ struct RwLock {
       if (mode == RwLockMode::kNone) {
         bool ret = mode_.compare_exchange_weak(mode, RwLockMode::kRead);
         if (ret) {
-#ifdef HSHM_DEBUG_LOCK
-          owner_ = owner;
-          HLOG(kDebug, "Acquired read lock for {}", owner);
-#endif
           return;
         }
       }
@@ -159,10 +150,6 @@ struct RwLock {
       if (mode == RwLockMode::kWrite) {
         cur_writer = cur_writer_.load();
         if (cur_writer == tkt) {
-#ifdef HSHM_DEBUG_LOCK
-          owner_ = owner;
-          HLOG(kDebug, "Acquired write lock for {}", owner);
-#endif
           return;
         }
       }

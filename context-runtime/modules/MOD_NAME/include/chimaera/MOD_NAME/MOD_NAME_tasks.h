@@ -155,9 +155,9 @@ struct CustomTask : public chi::Task {
    * Aggregate replica results into this task
    * @param other Pointer to the replica task to aggregate from
    */
-  void Aggregate(const hipc::FullPtr<CustomTask> &other) {
-    Task::Aggregate(other.template Cast<Task>());
-    Copy(other);
+  void Aggregate(const hipc::FullPtr<chi::Task> &other_base) {
+    Task::Aggregate(other_base);
+    Copy(other_base.template Cast<CustomTask>());
   }
 };
 
@@ -217,9 +217,9 @@ struct CoMutexTestTask : public chi::Task {
    * Aggregate replica results into this task
    * @param other Pointer to the replica task to aggregate from
    */
-  void Aggregate(const hipc::FullPtr<CoMutexTestTask> &other) {
-    Task::Aggregate(other.template Cast<Task>());
-    Copy(other);
+  void Aggregate(const hipc::FullPtr<chi::Task> &other_base) {
+    Task::Aggregate(other_base);
+    Copy(other_base.template Cast<CoMutexTestTask>());
   }
 };
 
@@ -282,9 +282,9 @@ struct CoRwLockTestTask : public chi::Task {
    * Aggregate replica results into this task
    * @param other Pointer to the replica task to aggregate from
    */
-  void Aggregate(const hipc::FullPtr<CoRwLockTestTask> &other) {
-    Task::Aggregate(other.template Cast<Task>());
-    Copy(other);
+  void Aggregate(const hipc::FullPtr<chi::Task> &other_base) {
+    Task::Aggregate(other_base);
+    Copy(other_base.template Cast<CoRwLockTestTask>());
   }
 };
 
@@ -347,9 +347,9 @@ struct WaitTestTask : public chi::Task {
    * Aggregate replica results into this task
    * @param other Pointer to the replica task to aggregate from
    */
-  void Aggregate(const hipc::FullPtr<WaitTestTask> &other) {
-    Task::Aggregate(other.template Cast<Task>());
-    Copy(other);
+  void Aggregate(const hipc::FullPtr<chi::Task> &other_base) {
+    Task::Aggregate(other_base);
+    Copy(other_base.template Cast<WaitTestTask>());
   }
 };
 
@@ -406,9 +406,9 @@ struct TestLargeOutputTask : public chi::Task {
    * Aggregate replica results into this task
    * @param other Pointer to the replica task to aggregate from
    */
-  void Aggregate(const hipc::FullPtr<TestLargeOutputTask> &other) {
-    Task::Aggregate(other.template Cast<Task>());
-    Copy(other);
+  void Aggregate(const hipc::FullPtr<chi::Task> &other_base) {
+    Task::Aggregate(other_base);
+    Copy(other_base.template Cast<TestLargeOutputTask>());
   }
 };
 
@@ -471,9 +471,9 @@ struct GpuSubmitTask : public chi::Task {
    * Aggregate replica results into this task
    * @param other Pointer to the replica task to aggregate from
    */
-  HSHM_CROSS_FUN void Aggregate(const hipc::FullPtr<GpuSubmitTask> &other) {
-    Task::Aggregate(other.template Cast<Task>());
-    Copy(other);
+  HSHM_CROSS_FUN void Aggregate(const hipc::FullPtr<chi::Task> &other_base) {
+    Task::Aggregate(other_base);
+    Copy(other_base.template Cast<GpuSubmitTask>());
   }
 };
 

@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block title %}Config -- Chimaera Visualizer{% endblock %}
+
+{% block content %}
+<h1>Runtime Configuration</h1>
+
+<div id="config-error" class="error-banner" style="display:none;"></div>
+<pre id="config-display" class="config-pre">Loading...</pre>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/config.js') }}"></script>
+{% endblock %}

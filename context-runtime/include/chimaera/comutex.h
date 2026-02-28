@@ -35,27 +35,67 @@
 #define CHIMAERA_INCLUDE_CHIMAERA_COMUTEX_H_
 
 #include <hermes_shm/thread/lock/mutex.h>
+#include "chimaera/types.h"
 
 namespace chi {
 
 /**
- * CoMutex - Simple wrapper around hshm::Mutex
+ * CoMutex - Reentrant cooperative mutex for coroutine-based task execution.
+ * When a parent task holds the lock and spawns a subtask on the same worker,
+ * the subtask can reacquire the lock without deadlocking.
  */
-using CoMutex = hshm::Mutex;
+class CoMutex {
+ public:
+  hshm::Mutex lock_;
+  LockOwnerId holder_;
+  u32 depth_;
+
+  CoMutex() : depth_(0) {}
+
+  /** Copy constructor reinitializes to unlocked (needed for std::vector) */
+  CoMutex(const CoMutex &other) : depth_(0) { (void)other; }
+
+  void Lock() {
+    LockOwnerId cur = GetCurrentLockOwnerId();
+    if (cur == holder_) {
+      ++depth_;
+      return;
+    }
+    lock_.Lock(0);
+    holder_ = cur;
+    depth_ = 1;
+  }
+
+  bool TryLock() {
+    LockOwnerId cur = GetCurrentLockOwnerId();
+    if (cur == holder_) {
+      ++depth_;
+      return true;
+    }
+    if (!lock_.TryLock(0)) return false;
+    holder_ = cur;
+    depth_ = 1;
+    return true;
+  }
+
+  void Unlock() {
+    --depth_;
+    if (depth_ == 0) {
+      holder_.Clear();
+      lock_.Unlock();
+    }
+  }
+};
 
 /**
- * ScopedCoMutex - RAII mutex wrapper with default owner
- * Wraps hshm::ScopedMutex with a default owner value of 0
+ * ScopedCoMutex - RAII mutex wrapper for CoMutex
  */
 struct ScopedCoMutex {
-  hshm::ScopedMutex scoped_mutex_;
+  CoMutex &lock_;
 
-  /** Acquire the mutex with default owner */
-  explicit ScopedCoMutex(CoMutex& lock)
-      : scoped_mutex_(lock, 0) {}
+  explicit ScopedCoMutex(CoMutex &lock) : lock_(lock) { lock_.Lock(); }
 
-  /** Release handled by scoped_mutex_ destructor */
-  ~ScopedCoMutex() = default;
+  ~ScopedCoMutex() { lock_.Unlock(); }
 };
 
 }  // namespace chi

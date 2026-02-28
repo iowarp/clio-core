@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block title %}Topology -- Chimaera Visualizer{% endblock %}
+
+{% block content %}
+<h1>Cluster Topology</h1>
+
+<div class="search-bar">
+    <input type="text" id="nodeSearch" placeholder="Filter nodes: e.g. 1-20, 3,5,7, or hostname..." />
+</div>
+
+<div class="node-grid" id="nodeGrid">
+    <!-- Node cards populated by JS -->
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/topology.js') }}"></script>
+{% endblock %}

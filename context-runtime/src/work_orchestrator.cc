@@ -63,7 +63,10 @@ bool WorkOrchestrator::Init() {
   }
 
   // Initialize HSHM TLS key for workers
-  HSHM_THREAD_MODEL->CreateTls<class Worker>(chi_cur_worker_key_, nullptr);
+  if (!chi_cur_worker_key_created_) {
+    HSHM_THREAD_MODEL->CreateTls<class Worker>(chi_cur_worker_key_, nullptr);
+    chi_cur_worker_key_created_ = true;
+  }
 
   // Initialize scheduling state
   next_worker_index_for_scheduling_.store(0);

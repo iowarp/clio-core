@@ -38,3 +38,5 @@ kHeartbeat: 27           # Liveness probe - just returns success
 kHeartbeatProbe: 28      # Periodic SWIM failure detector
 kProbeRequest: 29        # Indirect probe request to helper node
 kRecoverContainers: 30   # Leader broadcasts recovery plan to surviving nodes
+kSystemMonitor: 31       # Periodic system resource utilization monitor
+kAnnounceShutdown: 32    # Broadcast shutdown announcement to all nodes

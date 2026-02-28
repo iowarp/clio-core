@@ -1,0 +1,17 @@
+# Chimaera Configuration for Interactive Dashboard Cluster
+# 4-node cluster for manual exploration via the dashboard
+
+networking:
+  port: 9413
+  neighborhood_size: 4
+  hostfile: "/workspace/context-runtime/test/integration/interactive/hostfile"
+
+logging:
+  level: "info"
+  file: "/tmp/chimaera.log"
+
+runtime:
+  num_threads: 4
+  queue_depth: 1024
+  local_sched: "default"
+  first_busy_wait: 50

@@ -47,7 +47,7 @@ namespace chi {
 // Static factory methods
 // Note: PoolQuery::Local() is now inline in pool_query.h for GPU compatibility
 
-PoolQuery PoolQuery::DirectId(ContainerId container_id) {
+PoolQuery PoolQuery::DirectId(ContainerId container_id, float net_timeout) {
   PoolQuery query;
   query.routing_mode_ = RoutingMode::DirectId;
   query.hash_value_ = 0;
@@ -55,10 +55,11 @@ PoolQuery PoolQuery::DirectId(ContainerId container_id) {
   query.range_offset_ = 0;
   query.range_count_ = 0;
   query.node_id_ = 0;
+  query.net_timeout_ = net_timeout;
   return query;
 }
 
-PoolQuery PoolQuery::DirectHash(u32 hash) {
+PoolQuery PoolQuery::DirectHash(u32 hash, float net_timeout) {
   PoolQuery query;
   query.routing_mode_ = RoutingMode::DirectHash;
   query.hash_value_ = hash;
@@ -66,10 +67,11 @@ PoolQuery PoolQuery::DirectHash(u32 hash) {
   query.range_offset_ = 0;
   query.range_count_ = 0;
   query.node_id_ = 0;
+  query.net_timeout_ = net_timeout;
   return query;
 }
 
-PoolQuery PoolQuery::Range(u32 offset, u32 count) {
+PoolQuery PoolQuery::Range(u32 offset, u32 count, float net_timeout) {
   PoolQuery query;
   query.routing_mode_ = RoutingMode::Range;
   query.hash_value_ = 0;
@@ -77,10 +79,11 @@ PoolQuery PoolQuery::Range(u32 offset, u32 count) {
   query.range_offset_ = offset;
   query.range_count_ = count;
   query.node_id_ = 0;
+  query.net_timeout_ = net_timeout;
   return query;
 }
 
-PoolQuery PoolQuery::Broadcast() {
+PoolQuery PoolQuery::Broadcast(float net_timeout) {
   PoolQuery query;
   query.routing_mode_ = RoutingMode::Broadcast;
   query.hash_value_ = 0;
@@ -88,10 +91,11 @@ PoolQuery PoolQuery::Broadcast() {
   query.range_offset_ = 0;
   query.range_count_ = 0;
   query.node_id_ = 0;
+  query.net_timeout_ = net_timeout;
   return query;
 }
 
-PoolQuery PoolQuery::Physical(u32 node_id) {
+PoolQuery PoolQuery::Physical(u32 node_id, float net_timeout) {
   PoolQuery query;
   query.routing_mode_ = RoutingMode::Physical;
   query.hash_value_ = 0;
@@ -99,10 +103,11 @@ PoolQuery PoolQuery::Physical(u32 node_id) {
   query.range_offset_ = 0;
   query.range_count_ = 0;
   query.node_id_ = node_id;
+  query.net_timeout_ = net_timeout;
   return query;
 }
 
-PoolQuery PoolQuery::Dynamic() {
+PoolQuery PoolQuery::Dynamic(float net_timeout) {
   PoolQuery query;
   query.routing_mode_ = RoutingMode::Dynamic;
   query.hash_value_ = 0;
@@ -110,6 +115,7 @@ PoolQuery PoolQuery::Dynamic() {
   query.range_offset_ = 0;
   query.range_count_ = 0;
   query.node_id_ = 0;
+  query.net_timeout_ = net_timeout;
   return query;
 }
 

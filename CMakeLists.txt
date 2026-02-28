@@ -41,7 +41,7 @@ option(WRP_CORE_STATIC_DEPS "Link external dependencies statically (for self-con
 # - For Conda builds: Set CMAKE_INSTALL_PREFIX via -DCMAKE_INSTALL_PREFIX=$CONDA_PREFIX
 # - For custom installs: Set CMAKE_INSTALL_PREFIX to desired root directory
 # Libraries install to ${CMAKE_INSTALL_PREFIX}/lib
-# Python bindings install to ${CMAKE_INSTALL_PREFIX}/lib/pythonX.Y/site-packages
+# Python bindings install to the detected Python's site-packages (venv, conda, or system)
 
 #------------------------------------------------------------------------------
 # Conda Environment Configuration (Explicit)
@@ -630,10 +630,21 @@ if(WRP_CORE_ENABLE_PYTHON)
   )
   FetchContent_MakeAvailable(nanobind)
 
+  # Determine the real site-packages directory for the detected Python.
+  # Python_SITEARCH is an absolute path (works for venv, conda, and system Python).
+  # Fall back to a relative path under CMAKE_INSTALL_PREFIX if unavailable.
+  if(Python_SITEARCH)
+      set(PYTHON_SITE_PACKAGES "${Python_SITEARCH}" CACHE PATH
+          "Python site-packages directory (absolute)")
+  else()
+      set(PYTHON_SITE_PACKAGES
+          "${CMAKE_INSTALL_PREFIX}/lib/python${Python_VERSION_MAJOR}.${Python_VERSION_MINOR}/site-packages"
+          CACHE PATH "Python site-packages directory (fallback)")
+  endif()
+
   message(STATUS "Python bindings enabled:")
   message(STATUS "  Install prefix:     ${CMAKE_INSTALL_PREFIX}")
-  message(STATUS "  Python bindings:    ${CMAKE_INSTALL_PREFIX}/lib/python${Python_VERSION_MAJOR}.${Python_VERSION_MINOR}/site-packages")
-  message(STATUS "  Python_SITEARCH:    ${Python_SITEARCH} (for reference only)")
+  message(STATUS "  Site-packages:      ${PYTHON_SITE_PACKAGES}")
 else()
   message(STATUS "Python bindings disabled")
 endif()
@@ -885,6 +896,14 @@ else()
     message(STATUS "Context-exploration-engine component disabled")
 endif()
 
+# Context Visualizer (pure Python web dashboard)
+if(WRP_CORE_ENABLE_PYTHON)
+    message(STATUS "Building context-visualizer component (Python)")
+    add_subdirectory(context-visualizer)
+else()
+    message(STATUS "Context-visualizer component disabled (requires WRP_CORE_ENABLE_PYTHON)")
+endif()
+
 # Gray-Scott Example Application
 if(WRP_CORE_ENABLE_GRAY_SCOTT)
     message(STATUS "Building Gray-Scott ADIOS2 example")
@@ -1056,6 +1075,13 @@ if(TARGET chimaera)
   install(TARGETS chimaera
     COMPONENT pip_package
     RUNTIME DESTINATION ${PIP_PKG_DIR}/bin)
+  # Also install to PYTHON_SITE_PACKAGES/iowarp_core/bin/ so that
+  # `sudo make install` keeps the binary in sync with the Python package,
+  # matching how chimaera_runtime_ext.so is installed directly to site-packages.
+  if(WRP_CORE_ENABLE_PYTHON AND PYTHON_SITE_PACKAGES)
+    install(TARGETS chimaera
+      RUNTIME DESTINATION "${PYTHON_SITE_PACKAGES}/iowarp_core/bin")
+  endif()
 endif()
 
 # Python extensions -> iowarp_core/ext/
@@ -1070,6 +1096,15 @@ if(WRP_CORE_ENABLE_PYTHON)
       COMPONENT pip_package
       LIBRARY DESTINATION ${PIP_PKG_DIR}/ext)
   endif()
+  # Context Visualizer -> iowarp_core/visualizer/
+  install(DIRECTORY context-visualizer/context_visualizer/
+    COMPONENT pip_package
+    DESTINATION ${PIP_PKG_DIR}/visualizer
+    FILES_MATCHING
+      PATTERN "*.py"
+      PATTERN "*.html"
+      PATTERN "*.css"
+      PATTERN "*.js")
 endif()
 
 # Default config -> iowarp_core/data/

@@ -137,10 +137,6 @@ cleanup() {
 start_environment() {
     print_header "Starting 2-Node Jarvis Deployment Test Environment"
 
-    # Pass host UID/GID so container processes match host file ownership
-    export HOST_UID=$(id -u)
-    export HOST_GID=$(id -g)
-
     print_msg "$BLUE" "Starting containers..."
     docker compose up -d
 

@@ -725,141 +725,106 @@ class IpcManager {
   template <typename TaskT>
   bool Recv(Future<TaskT> &future, float max_sec = 0) {
     bool is_runtime = CHI_CHIMAERA_MANAGER->IsRuntime();
+    if (is_runtime) return true;
 
-    if (!is_runtime) {
-      auto future_shm = future.GetFutureShm();
-      TaskT *task_ptr = future.get();
-      u32 origin = future_shm->origin_;
+    auto future_shm = future.GetFutureShm();
+    TaskT *task_ptr = future.get();
+    u32 origin = future_shm->origin_;
 
-      if (origin == FutureShm::FUTURE_CLIENT_TCP ||
-          origin == FutureShm::FUTURE_CLIENT_IPC) {
-        // ZMQ PATH: Wait for RecvZmqClientThread to set FUTURE_COMPLETE
-        // with retry-aware loop that detects server restart
-        hshm::abitfield32_t &flags = future_shm->flags_;
-        auto start = std::chrono::steady_clock::now();
-        float last_probe_time = 0;
-        while (!flags.Any(FutureShm::FUTURE_COMPLETE)) {
-          HSHM_THREAD_MODEL->Yield();
-          float elapsed = std::chrono::duration<float>(
-                              std::chrono::steady_clock::now() - start)
-                              .count();
+    // === SHM path: server must be alive to use ring buffer ===
+    if (origin == FutureShm::FUTURE_CLIENT_SHM && server_alive_.load()) {
+      // Normal SHM path: server is alive, use ring buffer recv
+      hshm::lbm::LbmContext ctx;
+      ctx.copy_space = future_shm->copy_space;
+      ctx.shm_info_ = &future_shm->output_;
 
-          // User-specified max timeout (e.g. from Future::Wait)
-          if (max_sec > 0 && elapsed >= max_sec) return false;
+      LoadTaskArchive archive;
+      auto info = shm_recv_transport_->Recv(archive, ctx);
+      (void)info;
 
-          // Overall retry timeout
-          if (client_retry_timeout_ > 0 && elapsed >= client_retry_timeout_) {
-            HLOG(kError, "Recv: Timed out after {}s waiting for response",
-                 elapsed);
-            return false;
-          }
+      // Wait for FUTURE_COMPLETE
+      hshm::abitfield32_t &flags = future_shm->flags_;
+      while (!flags.Any(FutureShm::FUTURE_COMPLETE)) {
+        HSHM_THREAD_MODEL->Yield();
+      }
 
-          // Periodic server liveness check (every 5 seconds)
-          if (elapsed - last_probe_time >= 5.0f) {
-            last_probe_time = elapsed;
-            if (!IsServerAlive()) {
-              HLOG(kWarning,
-                   "Recv: Server unreachable, waiting for restart...");
-              if (!WaitForServerAndReconnect(start)) return false;
-              // Re-send the task after reconnection
-              ResendZmqTask(future);
-              start = std::chrono::steady_clock::now();
-              last_probe_time = 0;
-              continue;
-            }
-          }
+      // Deserialize outputs
+      archive.ResetBulkIndex();
+      archive.msg_type_ = MsgType::kSerializeOut;
+      archive >> (*task_ptr);
+      return true;
+    }
+
+    // === ZMQ path: covers TCP, IPC, and SHM-with-dead-server ===
+    // If origin was SHM but server is dead, reconnect and resend via ZMQ
+    if (origin == FutureShm::FUTURE_CLIENT_SHM) {
+      if (client_retry_timeout_ == 0) {
+        HLOG(kError, "Recv(SHM): Server dead, retry_timeout=0, failing");
+        return false;
+      }
+      HLOG(kWarning, "Recv(SHM): Server dead, attempting reconnect...");
+      auto start = std::chrono::steady_clock::now();
+      if (!WaitForServerAndReconnect(start)) return false;
+      ResendTask(future);
+      // Refresh future_shm after resend (origin now TCP/IPC)
+      future_shm = future.GetFutureShm();
+    }
+
+    // ZMQ wait loop: spin until FUTURE_COMPLETE
+    auto start = std::chrono::steady_clock::now();
+    while (!future_shm->flags_.Any(FutureShm::FUTURE_COMPLETE)) {
+      HSHM_THREAD_MODEL->Yield();
+      float elapsed = std::chrono::duration<float>(
+                          std::chrono::steady_clock::now() - start)
+                          .count();
+
+      // User-specified max timeout
+      if (max_sec > 0 && elapsed >= max_sec) return false;
+
+      // Check heartbeat-cached server liveness
+      // Skip if already inside a reconnect attempt (prevents recursion from
+      // WaitForLocalServer → Recv → WaitForServerAndReconnect)
+      if (!server_alive_.load() && !reconnecting_.load()) {
+        if (client_retry_timeout_ == 0 && client_try_new_servers_ <= 0) {
+          HLOG(kError, "Recv: Server dead, retry_timeout=0, no failover configured, failing");
+          return false;
         }
-
-        // Memory fence
-        std::atomic_thread_fence(std::memory_order_acquire);
-
-        // Borrow LoadTaskArchive from pending_response_archives_ (don't erase).
-        // The archive holds zmq_msg_t handles in recv[].desc that keep
-        // zero-copy buffers alive. It stays in the map until
-        // Future::Destroy() calls CleanupResponseArchive().
-        size_t net_key = future_shm->client_task_vaddr_;
-        {
-          std::lock_guard<std::mutex> lock(pending_futures_mutex_);
-          auto it = pending_response_archives_.find(net_key);
-          if (it != pending_response_archives_.end()) {
-            LoadTaskArchive *archive = it->second.get();
-            archive->ResetBulkIndex();
-            archive->msg_type_ = MsgType::kSerializeOut;
-            *archive >> (*task_ptr);
-          }
-        }
-      } else {
-        // SHM PATH: Use lightbeam transport with liveness checking
-        // Check server is alive before blocking on SHM recv
-        if (!IsServerAlive()) {
-          HLOG(kWarning,
-               "Recv(SHM): Server died before recv, attempting reconnect...");
-          auto shm_start = std::chrono::steady_clock::now();
-          if (!WaitForServerAndReconnect(shm_start)) return false;
-          // After reconnect, the old FutureShm is in destroyed shared memory.
-          // We cannot re-send via SHM since the queue is gone.
-          // Fall back to ZMQ re-send.
-          ResendZmqTask(future);
-          // Switch origin so the wait loop below uses ZMQ polling
-          future_shm = future.GetFutureShm();
-          hshm::abitfield32_t &flags = future_shm->flags_;
-          auto zmq_start = std::chrono::steady_clock::now();
-          while (!flags.Any(FutureShm::FUTURE_COMPLETE)) {
-            HSHM_THREAD_MODEL->Yield();
-            float el = std::chrono::duration<float>(
-                           std::chrono::steady_clock::now() - zmq_start)
-                           .count();
-            if (client_retry_timeout_ > 0 && el >= client_retry_timeout_)
-              return false;
-          }
-          std::atomic_thread_fence(std::memory_order_acquire);
-          size_t net_key = future_shm->client_task_vaddr_;
-          {
-            std::lock_guard<std::mutex> lock(pending_futures_mutex_);
-            auto it2 = pending_response_archives_.find(net_key);
-            if (it2 != pending_response_archives_.end()) {
-              LoadTaskArchive *archive2 = it2->second.get();
-              archive2->ResetBulkIndex();
-              archive2->msg_type_ = MsgType::kSerializeOut;
-              *archive2 >> (*task_ptr);
-            }
-          }
-        } else {
-          // Normal SHM path: server is alive
-          // Build SHM context for transfer
-          hshm::lbm::LbmContext ctx;
-          ctx.copy_space = future_shm->copy_space;
-          ctx.shm_info_ = &future_shm->output_;
-
-          // Receive via SHM transport (blocking - spins until worker sends)
-          LoadTaskArchive archive;
-          auto info = shm_recv_transport_->Recv(archive, ctx);
-          (void)info;
-
-          // Wait for FUTURE_COMPLETE (worker sets after Send returns)
-          hshm::abitfield32_t &flags = future_shm->flags_;
-          while (!flags.Any(FutureShm::FUTURE_COMPLETE)) {
-            HSHM_THREAD_MODEL->Yield();
-          }
-
-          // Deserialize outputs
-          archive.ResetBulkIndex();
-          archive.msg_type_ = MsgType::kSerializeOut;
-          archive >> (*task_ptr);
-        }
+        HLOG(kWarning, "Recv: Server unreachable, reconnecting...");
+        if (!WaitForServerAndReconnect(start)) return false;
+        ResendTask(future);
+        future_shm = future.GetFutureShm();
+        start = std::chrono::steady_clock::now();
+        continue;
       }
     }
-    // RUNTIME PATH: No deserialization needed
+
+    // Memory fence
+    std::atomic_thread_fence(std::memory_order_acquire);
+
+    // Deserialize from pending_response_archives_
+    size_t net_key = future_shm->client_task_vaddr_;
+    {
+      std::lock_guard<std::mutex> lock(pending_futures_mutex_);
+      auto it = pending_response_archives_.find(net_key);
+      if (it != pending_response_archives_.end()) {
+        LoadTaskArchive *archive = it->second.get();
+        archive->ResetBulkIndex();
+        archive->msg_type_ = MsgType::kSerializeOut;
+        *archive >> (*task_ptr);
+      }
+    }
     return true;
   }
 
   /**
    * Re-send a task via ZMQ after server restart
-   * Cleans up old pending state and re-serializes/re-sends the task
+   * Works for all origin types (TCP, IPC, SHM)
+   * After reconnect, always uses ZMQ transport
+   * Updates FutureShm origin to match current ipc_mode_
    * @param future Future containing the task to re-send
    */
   template <typename TaskT>
-  void ResendZmqTask(Future<TaskT> &future) {
+  void ResendTask(Future<TaskT> &future) {
     auto future_shm = future.GetFutureShm();
     TaskT *task_ptr = future.get();
     size_t old_net_key = future_shm->client_task_vaddr_;
@@ -875,7 +840,7 @@ class IpcManager {
       }
     }
 
-    // Use same net_key (task pointer address unchanged)
+    // Use task pointer address as net_key
     size_t net_key = reinterpret_cast<size_t>(task_ptr);
     task_ptr->task_id_.net_key_ = net_key;
 
@@ -885,6 +850,11 @@ class IpcManager {
 
     // Clear completion flag
     future_shm->flags_.UnsetBits(FutureShm::FUTURE_COMPLETE);
+
+    // Update origin to current IPC mode (SHM falls back to TCP/IPC)
+    future_shm->origin_ = (ipc_mode_ == IpcMode::kIpc)
+                               ? FutureShm::FUTURE_CLIENT_IPC
+                               : FutureShm::FUTURE_CLIENT_TCP;
 
     // Update client_task_vaddr_ for response routing
     future_shm->client_task_vaddr_ = net_key;
@@ -951,12 +921,18 @@ class IpcManager {
    */
   bool IsServerAlive() const;
 
+  /** Check cached server liveness (set by heartbeat thread) */
+  bool IsServerAliveCache() const { return server_alive_.load(std::memory_order_acquire); }
+
+  /** Background heartbeat thread function */
+  void HeartbeatThread();
+
   /**
    * Reconnect to a restarted server (all transports)
    * Re-attaches SHM, re-verifies server via ClientConnectTask
    * @return true if reconnection succeeded
    */
-  bool ClientReconnect();
+  bool ReconnectToOriginalHost();
 
   /**
    * Wait for server to come back and reconnect
@@ -965,6 +941,16 @@ class IpcManager {
    * @return true if reconnection succeeded within timeout
    */
   bool WaitForServerAndReconnect(std::chrono::steady_clock::time_point start);
+
+  /**
+   * Reconnect the ZMQ transport to a different host.
+   * Stops recv thread, destroys old transport, creates new TCP transport
+   * to new_addr, restarts recv thread, verifies connectivity.
+   * Forces ipc_mode_ to kTcp (SHM/IPC are same-machine only).
+   * @param new_addr IP address of the new host
+   * @return true if successfully connected to the new host
+   */
+  bool ReconnectToNewHost(const std::string &new_addr);
 
   /**
    * Get number of workers from shared memory header
@@ -1211,7 +1197,7 @@ class IpcManager {
 
     // Case 3: Check per-process shared memory allocators via alloc_map_
     // Acquire reader lock for thread-safe access to allocator_map_
-    allocator_map_lock_.ReadLock(0);
+    allocator_map_lock_.ReadLock();
 
     // Convert AllocatorId to lookup key (combine major and minor)
     u64 alloc_key = (static_cast<u64>(shm_ptr.alloc_id_.major_) << 32) |
@@ -1261,7 +1247,7 @@ class IpcManager {
 
     // Check per-process shared memory allocators
     // Acquire reader lock for thread-safe access
-    allocator_map_lock_.ReadLock(0);
+    allocator_map_lock_.ReadLock();
 
     hipc::FullPtr<T> result;
     for (auto *alloc : alloc_vector_) {
@@ -1548,6 +1534,11 @@ class IpcManager {
   std::thread zmq_recv_thread_;
   std::atomic<bool> zmq_recv_running_{false};
 
+  // Background heartbeat thread for server liveness detection
+  std::thread heartbeat_thread_;
+  std::atomic<bool> heartbeat_running_{false};
+  std::atomic<bool> server_alive_{true};
+
   // Pending futures (client-side, keyed by net_key)
   std::unordered_map<size_t, FutureShm *> pending_zmq_futures_;
   std::mutex pending_futures_mutex_;
@@ -1572,15 +1563,19 @@ class IpcManager {
   Host this_host_;                          // Identified host for this node
 
   // Client-side server waiting configuration (from environment variables)
-  u32 wait_server_timeout_ =
-      30;  // CHI_WAIT_SERVER: timeout in seconds (default 30)
+  // Semantics: 0 = fail immediately, -1 = wait forever, >0 = timeout in seconds
+  float wait_server_timeout_ =
+      30.0f;  // CHI_WAIT_SERVER: timeout in seconds (default 30)
   u32 poll_server_interval_ =
       1;  // CHI_POLL_SERVER: poll interval in seconds (default 1)
 
   // Client-side retry configuration
+  // Semantics: 0 = fail immediately, -1 = wait forever, >0 = timeout in seconds
   u64 client_generation_ = 0;  // Cached server generation at connect time
   float client_retry_timeout_ =
       60.0f;  // CHI_CLIENT_RETRY_TIMEOUT (default 60s)
+  int client_try_new_servers_ = 0;  // CHI_CLIENT_TRY_NEW_SERVERS (default 0)
+  std::atomic<bool> reconnecting_{false};  // Guards against recursive reconnect
 
   // Persistent ZeroMQ transport connection pool
   // Key format: "ip_address:port"
@@ -1775,6 +1770,9 @@ HSHM_CROSS_FUN Future<TaskT, AllocT>::~Future() {
       CHI_IPC->FreeBuffer(buffer_shm);
       future_shm_.SetNull();
     }
+    // Auto-free the task (only when consumed to avoid double-free
+    // from runtime-internal Future copies in event queues / RunContext)
+    DelTask();
   }
 #endif
 }
@@ -1813,6 +1811,14 @@ bool Future<TaskT, AllocT>::Wait(float max_sec) {
   return true;
 #else
   if (!task_ptr_.IsNull() && !future_shm_.IsNull()) {
+    // Fire-and-forget: return immediately without waiting.
+    // Detach so ~Future() won't free the in-flight task.
+    if (task_ptr_->task_flags_.Any(TASK_FIRE_AND_FORGET)) {
+      task_ptr_.SetNull();
+      future_shm_.SetNull();
+      return true;
+    }
+
     // Convert ShmPtr to FullPtr to access flags_
     hipc::FullPtr<FutureShm> future_full = CHI_IPC->ToFullPtr(future_shm_);
     if (future_full.IsNull()) {
@@ -1843,6 +1849,7 @@ bool Future<TaskT, AllocT>::Wait(float max_sec) {
       // Don't wait for FUTURE_COMPLETE first - that causes deadlock for
       // streaming
       if (!CHI_IPC->Recv(*this, max_sec)) {
+        task_ptr_->SetReturnCode(static_cast<u32>(-1));
         return false;
       }
     }

@@ -169,7 +169,6 @@ public:
   chi::u64 GetWorkRemaining() const override;
 
   // Container virtual method implementations (defined in autogen/core_lib_exec.cc)
-  void DelTask(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr) override;
   void SaveTask(chi::u32 method, chi::SaveTaskArchive &archive,
                 hipc::FullPtr<chi::Task> task_ptr) override;
   void LoadTask(chi::u32 method, chi::LoadTaskArchive &archive,
@@ -178,14 +177,15 @@ public:
   hipc::FullPtr<chi::Task> NewCopyTask(chi::u32 method, hipc::FullPtr<chi::Task> orig_task_ptr,
                                         bool deep) override;
   hipc::FullPtr<chi::Task> NewTask(chi::u32 method) override;
+  void Aggregate(chi::u32 method, hipc::FullPtr<chi::Task> orig_task,
+                 const hipc::FullPtr<chi::Task>& replica_task) override;
+  void DelTask(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr) override;
   void LocalLoadTask(chi::u32 method, chi::LocalLoadTaskArchive &archive,
                      hipc::FullPtr<chi::Task> task_ptr) override;
   hipc::FullPtr<chi::Task> LocalAllocLoadTask(chi::u32 method,
                                                chi::LocalLoadTaskArchive &archive) override;
   void LocalSaveTask(chi::u32 method, chi::LocalSaveTaskArchive &archive,
                      hipc::FullPtr<chi::Task> task_ptr) override;
-  void Aggregate(chi::u32 method, hipc::FullPtr<chi::Task> origin_task_ptr,
-                 hipc::FullPtr<chi::Task> replica_task_ptr) override;
 
 private:
   // Queue ID constants (REQUIRED: Use semantic names, not raw integers)
@@ -220,13 +220,17 @@ private:
   static const size_t kTagMapSize = 100000;    // 100K tags
 
   // Synchronization primitives for thread-safe access to data structures
+  // Single lock per data structure ensures all operations synchronize correctly
+  chi::CoRwLock target_lock_;  // For registered_targets_ + target_name_to_id_
+  chi::CoRwLock tag_map_lock_;  // For tag_name_to_id_ + tag_id_to_info_
+  chi::CoRwLock blob_map_lock_;  // For tag_blob_name_to_info_
   // Use a set of locks based on maximum number of lanes for better concurrency
   static const size_t kMaxLocks =
       64; // Maximum number of locks (matches max lanes)
   std::vector<std::unique_ptr<chi::CoRwLock>>
-      target_locks_; // For registered_targets_
+      target_locks_; // For registered_targets_ (DEPRECATED - use target_lock_)
   std::vector<std::unique_ptr<chi::CoRwLock>>
-      tag_locks_; // For tag management structures
+      tag_locks_; // For tag management structures (DEPRECATED - use tag_map_lock_ / blob_map_lock_)
 
   // Storage configuration (parsed from config file)
   std::vector<StorageDeviceConfig> storage_devices_;
@@ -251,12 +255,6 @@ private:
    * Get access to configuration manager
    */
   const Config &GetConfig() const;
-
-  /**
-   * Helper function to update target performance statistics
-   * Returns TaskResume for coroutine-based async operations
-   */
-  chi::TaskResume UpdateTargetStats(const chi::PoolId &target_id, TargetInfo &target_info);
 
   /**
    * Helper function to get manual score for a target from storage device config

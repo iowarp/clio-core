@@ -750,6 +750,9 @@ void Worker::EndTaskShmTransfer(const FullPtr<Task> &task_ptr,
 
   // Set FUTURE_COMPLETE and clean up task
   future_shm->flags_.SetBits(FutureShm::FUTURE_COMPLETE);
+  // Clear TASK_DATA_OWNER before deletion so the destructor
+  // doesn't try to FreeBuffer on transport-allocated data
+  task_ptr->ClearFlags(TASK_DATA_OWNER);
   container->DelTask(task_ptr->method_, task_ptr);
 }
 
@@ -775,6 +778,13 @@ void Worker::EndTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
   // Decrement work remaining for non-periodic tasks
   if (!is_periodic) {
     container->UpdateWork(task_ptr, *run_ctx, -1);
+  }
+
+  // Fire-and-forget: skip all response paths, just delete the task
+  if (task_ptr->task_flags_.Any(TASK_FIRE_AND_FORGET)) {
+    task_ptr->ClearFlags(TASK_DATA_OWNER);
+    container->DelTask(task_ptr->method_, task_ptr);
+    return;
   }
 
   // If task is remote, enqueue to net_queue_ for SendOut

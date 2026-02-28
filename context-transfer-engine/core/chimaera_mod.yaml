@@ -6,8 +6,9 @@ version: 1.0.0
 # Inherited Methods (fixed IDs)
 kCreate: 0        # Container creation (required)
 kDestroy: 1       # Container destruction (required)
+kRestart: 2       # Container restart (lifecycle method, sets is_restart_ before Init)
 kNodeFailure: -1  # Not implemented (-1 means disabled)
-kRecover: -1      # Not implemented 
+kRecover: -1      # Not implemented
 kMigrate: -1      # Not implemented
 kUpgrade: -1      # Not implemented
 kMonitor: 9       # 9 - Monitor container state

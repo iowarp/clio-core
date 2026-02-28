@@ -36,6 +36,7 @@
  */
 
 #include "chimaera/types.h"
+#include "chimaera/worker.h"
 #include <sstream>
 #include <stdexcept>
 
@@ -59,6 +60,20 @@ UniqueId UniqueId::FromString(const std::string& str) {
 
 std::string UniqueId::ToString() const {
   return std::to_string(major_) + "." + std::to_string(minor_);
+}
+
+LockOwnerId GetCurrentLockOwnerId() {
+  LockOwnerId id;
+  Worker *worker = CHI_CUR_WORKER;
+  if (!worker) return id;
+  FullPtr<Task> task = worker->GetCurrentTask();
+  if (task.ptr_ == nullptr) return id;
+  id.worker_id_ = worker->GetId();
+  id.pid_ = task->task_id_.pid_;
+  id.tid_ = task->task_id_.tid_;
+  id.major_ = task->task_id_.major_;
+  id.node_id_ = task->task_id_.node_id_;
+  return id;
 }
 
 }  // namespace chi

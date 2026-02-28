@@ -118,8 +118,8 @@ TEST_CASE("Autogen - Admin MonitorTask SaveTask/LoadTask", "[autogen][admin][mon
     INFO("MonitorTask SaveTask/LoadTask completed successfully");
 
     // Cleanup
-    ipc_manager->DelTask(orig_task);
-    ipc_manager->DelTask(loaded_task);
+    CHI_IPC->DelTask(orig_task);
+    CHI_IPC->DelTask(loaded_task);
   }
 }
 
@@ -159,8 +159,8 @@ TEST_CASE("Autogen - Admin FlushTask SaveTask/LoadTask", "[autogen][admin][flush
     REQUIRE(!loaded_task.IsNull());
     INFO("FlushTask SaveTask/LoadTask completed successfully");
 
-    ipc_manager->DelTask(orig_task);
-    ipc_manager->DelTask(loaded_task);
+    CHI_IPC->DelTask(orig_task);
+    CHI_IPC->DelTask(loaded_task);
   }
 }
 
@@ -200,8 +200,8 @@ TEST_CASE("Autogen - Admin ClientConnectTask SaveTask/LoadTask", "[autogen][admi
     REQUIRE(!loaded_task.IsNull());
     INFO("ClientConnectTask SaveTask/LoadTask completed successfully");
 
-    ipc_manager->DelTask(orig_task);
-    ipc_manager->DelTask(loaded_task);
+    CHI_IPC->DelTask(orig_task);
+    CHI_IPC->DelTask(loaded_task);
   }
 }
 
@@ -234,7 +234,7 @@ TEST_CASE("Autogen - Admin NewTask for all methods", "[autogen][admin][newtask]"
       auto new_task = container->NewTask(method);
       if (!new_task.IsNull()) {
         INFO("NewTask succeeded for method " << method);
-        ipc_manager->DelTask(new_task);
+        CHI_IPC->DelTask(new_task);
       }
     }
   }
@@ -266,10 +266,10 @@ TEST_CASE("Autogen - Admin NewCopyTask", "[autogen][admin][copytask]") {
 
     if (!copied_task.IsNull()) {
       INFO("NewCopyTask for FlushTask succeeded");
-      ipc_manager->DelTask(copied_task);
+      CHI_IPC->DelTask(copied_task);
     }
 
-    ipc_manager->DelTask(orig_task);
+    CHI_IPC->DelTask(orig_task);
   }
 
   SECTION("NewCopyTask for MonitorTask") {
@@ -286,10 +286,10 @@ TEST_CASE("Autogen - Admin NewCopyTask", "[autogen][admin][copytask]") {
 
     if (!copied_task.IsNull()) {
       INFO("NewCopyTask for MonitorTask succeeded");
-      ipc_manager->DelTask(copied_task);
+      CHI_IPC->DelTask(copied_task);
     }
 
-    ipc_manager->DelTask(orig_task);
+    CHI_IPC->DelTask(orig_task);
   }
 
   SECTION("NewCopyTask for ClientConnectTask") {
@@ -306,10 +306,10 @@ TEST_CASE("Autogen - Admin NewCopyTask", "[autogen][admin][copytask]") {
 
     if (!copied_task.IsNull()) {
       INFO("NewCopyTask for ClientConnectTask succeeded");
-      ipc_manager->DelTask(copied_task);
+      CHI_IPC->DelTask(copied_task);
     }
 
-    ipc_manager->DelTask(orig_task);
+    CHI_IPC->DelTask(orig_task);
   }
 }
 
@@ -333,18 +333,18 @@ TEST_CASE("Autogen - Admin Aggregate", "[autogen][admin][aggregate]") {
 
     if (origin_task.IsNull() || replica_task.IsNull()) {
       INFO("Failed to create tasks - skipping test");
-      if (!origin_task.IsNull()) ipc_manager->DelTask(origin_task);
-      if (!replica_task.IsNull()) ipc_manager->DelTask(replica_task);
+      if (!origin_task.IsNull()) CHI_IPC->DelTask(origin_task);
+      if (!replica_task.IsNull()) CHI_IPC->DelTask(replica_task);
       return;
     }
 
     hipc::FullPtr<chi::Task> origin_ptr = origin_task.template Cast<chi::Task>();
     hipc::FullPtr<chi::Task> replica_ptr = replica_task.template Cast<chi::Task>();
-    container->Aggregate(chimaera::admin::Method::kFlush, origin_ptr, replica_ptr);
+    origin_ptr.ptr_->Aggregate(replica_ptr.template Cast<chi::Task>());
 
     INFO("Aggregate for FlushTask completed");
-    ipc_manager->DelTask(origin_task);
-    ipc_manager->DelTask(replica_task);
+    CHI_IPC->DelTask(origin_task);
+    CHI_IPC->DelTask(replica_task);
   }
 
   SECTION("Aggregate for MonitorTask") {
@@ -355,18 +355,18 @@ TEST_CASE("Autogen - Admin Aggregate", "[autogen][admin][aggregate]") {
 
     if (origin_task.IsNull() || replica_task.IsNull()) {
       INFO("Failed to create tasks - skipping test");
-      if (!origin_task.IsNull()) ipc_manager->DelTask(origin_task);
-      if (!replica_task.IsNull()) ipc_manager->DelTask(replica_task);
+      if (!origin_task.IsNull()) CHI_IPC->DelTask(origin_task);
+      if (!replica_task.IsNull()) CHI_IPC->DelTask(replica_task);
       return;
     }
 
     hipc::FullPtr<chi::Task> origin_ptr = origin_task.template Cast<chi::Task>();
     hipc::FullPtr<chi::Task> replica_ptr = replica_task.template Cast<chi::Task>();
-    container->Aggregate(chimaera::admin::Method::kMonitor, origin_ptr, replica_ptr);
+    origin_ptr.ptr_->Aggregate(replica_ptr.template Cast<chi::Task>());
 
     INFO("Aggregate for MonitorTask completed");
-    ipc_manager->DelTask(origin_task);
-    ipc_manager->DelTask(replica_task);
+    CHI_IPC->DelTask(origin_task);
+    CHI_IPC->DelTask(replica_task);
   }
 }
 
@@ -402,10 +402,10 @@ TEST_CASE("Autogen - Admin LocalSaveTask/LocalLoadTask", "[autogen][admin][local
       chi::LocalLoadTaskArchive load_archive(save_archive.GetData());
       container->LocalLoadTask(chimaera::admin::Method::kFlush, load_archive, loaded_task);
       INFO("LocalSaveTask/LocalLoadTask for FlushTask completed");
-      ipc_manager->DelTask(loaded_task);
+      CHI_IPC->DelTask(loaded_task);
     }
 
-    ipc_manager->DelTask(orig_task);
+    CHI_IPC->DelTask(orig_task);
   }
 
   SECTION("LocalSaveTask and LocalLoadTask for MonitorTask") {
@@ -426,10 +426,10 @@ TEST_CASE("Autogen - Admin LocalSaveTask/LocalLoadTask", "[autogen][admin][local
       chi::LocalLoadTaskArchive load_archive(save_archive.GetData());
       container->LocalLoadTask(chimaera::admin::Method::kMonitor, load_archive, loaded_task);
       INFO("LocalSaveTask/LocalLoadTask for MonitorTask completed");
-      ipc_manager->DelTask(loaded_task);
+      CHI_IPC->DelTask(loaded_task);
     }
 
-    ipc_manager->DelTask(orig_task);
+    CHI_IPC->DelTask(orig_task);
   }
 
   SECTION("LocalSaveTask and LocalLoadTask for ClientConnectTask") {
@@ -450,10 +450,10 @@ TEST_CASE("Autogen - Admin LocalSaveTask/LocalLoadTask", "[autogen][admin][local
       chi::LocalLoadTaskArchive load_archive(save_archive.GetData());
       container->LocalLoadTask(chimaera::admin::Method::kClientConnect, load_archive, loaded_task);
       INFO("LocalSaveTask/LocalLoadTask for ClientConnectTask completed");
-      ipc_manager->DelTask(loaded_task);
+      CHI_IPC->DelTask(loaded_task);
     }
 
-    ipc_manager->DelTask(orig_task);
+    CHI_IPC->DelTask(orig_task);
   }
 
   // NOTE: Tasks with complex serialization fields (CreateTask, DestroyTask,
@@ -486,7 +486,7 @@ TEST_CASE("Autogen - Admin DelTask for all methods", "[autogen][admin][deltask]"
     for (const auto& [method, name] : methods) {
       auto new_task = container->NewTask(method);
       if (!new_task.IsNull()) {
-        container->DelTask(method, new_task);
+        CHI_IPC->DelTask(new_task);
         INFO("DelTask succeeded for " << name);
       }
     }
@@ -507,31 +507,31 @@ TEST_CASE("Autogen - Bdev NewTask for all methods", "[autogen][bdev][newtask]") 
     auto alloc_task = ipc_manager->NewTask<chimaera::bdev::AllocateBlocksTask>();
     if (!alloc_task.IsNull()) {
       INFO("AllocateBlocksTask created successfully");
-      ipc_manager->DelTask(alloc_task);
+      CHI_IPC->DelTask(alloc_task);
     }
 
     auto free_task = ipc_manager->NewTask<chimaera::bdev::FreeBlocksTask>();
     if (!free_task.IsNull()) {
       INFO("FreeBlocksTask created successfully");
-      ipc_manager->DelTask(free_task);
+      CHI_IPC->DelTask(free_task);
     }
 
     auto write_task = ipc_manager->NewTask<chimaera::bdev::WriteTask>();
     if (!write_task.IsNull()) {
       INFO("WriteTask created successfully");
-      ipc_manager->DelTask(write_task);
+      CHI_IPC->DelTask(write_task);
     }
 
     auto read_task = ipc_manager->NewTask<chimaera::bdev::ReadTask>();
     if (!read_task.IsNull()) {
       INFO("ReadTask created successfully");
-      ipc_manager->DelTask(read_task);
+      CHI_IPC->DelTask(read_task);
     }
 
     auto stats_task = ipc_manager->NewTask<chimaera::bdev::GetStatsTask>();
     if (!stats_task.IsNull()) {
       INFO("GetStatsTask created successfully");
-      ipc_manager->DelTask(stats_task);
+      CHI_IPC->DelTask(stats_task);
     }
   }
 }
@@ -564,8 +564,8 @@ TEST_CASE("Autogen - Bdev SaveTask/LoadTask", "[autogen][bdev][saveload]") {
     REQUIRE(!loaded_task.IsNull());
     INFO("AllocateBlocksTask SaveTask/LoadTask completed");
 
-    ipc_manager->DelTask(orig_task);
-    ipc_manager->DelTask(loaded_task);
+    CHI_IPC->DelTask(orig_task);
+    CHI_IPC->DelTask(loaded_task);
   }
 
   SECTION("SaveTask and LoadTask for GetStatsTask") {
@@ -590,8 +590,8 @@ TEST_CASE("Autogen - Bdev SaveTask/LoadTask", "[autogen][bdev][saveload]") {
     REQUIRE(!loaded_task.IsNull());
     INFO("GetStatsTask SaveTask/LoadTask completed");
 
-    ipc_manager->DelTask(orig_task);
-    ipc_manager->DelTask(loaded_task);
+    CHI_IPC->DelTask(orig_task);
+    CHI_IPC->DelTask(loaded_task);
   }
 
   SECTION("SaveTask and LoadTask for FreeBlocksTask") {
@@ -615,8 +615,8 @@ TEST_CASE("Autogen - Bdev SaveTask/LoadTask", "[autogen][bdev][saveload]") {
     REQUIRE(!loaded_task.IsNull());
     INFO("FreeBlocksTask SaveTask/LoadTask completed");
 
-    ipc_manager->DelTask(orig_task);
-    ipc_manager->DelTask(loaded_task);
+    CHI_IPC->DelTask(orig_task);
+    CHI_IPC->DelTask(loaded_task);
   }
 
   SECTION("SaveTask and LoadTask for WriteTask") {
@@ -640,8 +640,8 @@ TEST_CASE("Autogen - Bdev SaveTask/LoadTask", "[autogen][bdev][saveload]") {
     REQUIRE(!loaded_task.IsNull());
     INFO("WriteTask SaveTask/LoadTask completed");
 
-    ipc_manager->DelTask(orig_task);
-    ipc_manager->DelTask(loaded_task);
+    CHI_IPC->DelTask(orig_task);
+    CHI_IPC->DelTask(loaded_task);
   }
 
   SECTION("SaveTask and LoadTask for ReadTask") {
@@ -665,8 +665,8 @@ TEST_CASE("Autogen - Bdev SaveTask/LoadTask", "[autogen][bdev][saveload]") {
     REQUIRE(!loaded_task.IsNull());
     INFO("ReadTask SaveTask/LoadTask completed");
 
-    ipc_manager->DelTask(orig_task);
-    ipc_manager->DelTask(loaded_task);
+    CHI_IPC->DelTask(orig_task);
+    CHI_IPC->DelTask(loaded_task);
   }
 }
 
@@ -695,18 +695,18 @@ TEST_CASE("Autogen - Admin StopRuntimeTask coverage", "[autogen][admin][stoprunt
       auto copied_task = container->NewCopyTask(chimaera::admin::Method::kStopRuntime, new_task, false);
       if (!copied_task.IsNull()) {
         INFO("NewCopyTask for StopRuntimeTask succeeded");
-        ipc_manager->DelTask(copied_task);
+        CHI_IPC->DelTask(copied_task);
       }
 
       // Test Aggregate
       auto replica_task = container->NewTask(chimaera::admin::Method::kStopRuntime);
       if (!replica_task.IsNull()) {
-        container->Aggregate(chimaera::admin::Method::kStopRuntime, new_task, replica_task);
+        new_task.ptr_->Aggregate(replica_task.template Cast<chi::Task>());
         INFO("Aggregate for StopRuntimeTask succeeded");
-        ipc_manager->DelTask(replica_task);
+        CHI_IPC->DelTask(replica_task);
       }
 
-      container->DelTask(chimaera::admin::Method::kStopRuntime, new_task);
+      CHI_IPC->DelTask(new_task);
     }
   }
 }
@@ -740,25 +740,25 @@ TEST_CASE("Autogen - Admin DestroyPoolTask coverage", "[autogen][admin][destroyp
       if (!loaded_task.IsNull()) {
         container->LoadTask(chimaera::admin::Method::kDestroyPool, load_archive, loaded_task);
         INFO("SaveTask/LoadTask for DestroyPoolTask succeeded");
-        ipc_manager->DelTask(loaded_task);
+        CHI_IPC->DelTask(loaded_task);
       }
 
       // NewCopyTask
       auto copied_task = container->NewCopyTask(chimaera::admin::Method::kDestroyPool, new_task, false);
       if (!copied_task.IsNull()) {
         INFO("NewCopyTask for DestroyPoolTask succeeded");
-        ipc_manager->DelTask(copied_task);
+        CHI_IPC->DelTask(copied_task);
       }
 
       // Aggregate
       auto replica_task = container->NewTask(chimaera::admin::Method::kDestroyPool);
       if (!replica_task.IsNull()) {
-        container->Aggregate(chimaera::admin::Method::kDestroyPool, new_task, replica_task);
+        new_task.ptr_->Aggregate(replica_task.template Cast<chi::Task>());
         INFO("Aggregate for DestroyPoolTask succeeded");
-        ipc_manager->DelTask(replica_task);
+        CHI_IPC->DelTask(replica_task);
       }
 
-      container->DelTask(chimaera::admin::Method::kDestroyPool, new_task);
+      CHI_IPC->DelTask(new_task);
     }
   }
 }
@@ -784,18 +784,18 @@ TEST_CASE("Autogen - Admin SubmitBatchTask coverage", "[autogen][admin][submitba
       auto copied_task = container->NewCopyTask(chimaera::admin::Method::kSubmitBatch, new_task, false);
       if (!copied_task.IsNull()) {
         INFO("NewCopyTask for SubmitBatchTask succeeded");
-        ipc_manager->DelTask(copied_task);
+        CHI_IPC->DelTask(copied_task);
       }
 
       // Aggregate
       auto replica_task = container->NewTask(chimaera::admin::Method::kSubmitBatch);
       if (!replica_task.IsNull()) {
-        container->Aggregate(chimaera::admin::Method::kSubmitBatch, new_task, replica_task);
+        new_task.ptr_->Aggregate(replica_task.template Cast<chi::Task>());
         INFO("Aggregate for SubmitBatchTask succeeded");
-        ipc_manager->DelTask(replica_task);
+        CHI_IPC->DelTask(replica_task);
       }
 
-      container->DelTask(chimaera::admin::Method::kSubmitBatch, new_task);
+      CHI_IPC->DelTask(new_task);
     }
   }
 }
@@ -821,18 +821,18 @@ TEST_CASE("Autogen - Admin CreateTask and DestroyTask coverage", "[autogen][admi
       auto copied_task = container->NewCopyTask(chimaera::admin::Method::kCreate, new_task, false);
       if (!copied_task.IsNull()) {
         INFO("NewCopyTask for CreateTask succeeded");
-        ipc_manager->DelTask(copied_task);
+        CHI_IPC->DelTask(copied_task);
       }
 
       // Aggregate
       auto replica_task = container->NewTask(chimaera::admin::Method::kCreate);
       if (!replica_task.IsNull()) {
-        container->Aggregate(chimaera::admin::Method::kCreate, new_task, replica_task);
+        new_task.ptr_->Aggregate(replica_task.template Cast<chi::Task>());
         INFO("Aggregate for CreateTask succeeded");
-        ipc_manager->DelTask(replica_task);
+        CHI_IPC->DelTask(replica_task);
       }
 
-      container->DelTask(chimaera::admin::Method::kCreate, new_task);
+      CHI_IPC->DelTask(new_task);
     }
   }
 
@@ -845,18 +845,18 @@ TEST_CASE("Autogen - Admin CreateTask and DestroyTask coverage", "[autogen][admi
       auto copied_task = container->NewCopyTask(chimaera::admin::Method::kDestroy, new_task, false);
       if (!copied_task.IsNull()) {
         INFO("NewCopyTask for DestroyTask succeeded");
-        ipc_manager->DelTask(copied_task);
+        CHI_IPC->DelTask(copied_task);
       }
 
       // Aggregate
       auto replica_task = container->NewTask(chimaera::admin::Method::kDestroy);
       if (!replica_task.IsNull()) {
-        container->Aggregate(chimaera::admin::Method::kDestroy, new_task, replica_task);
+        new_task.ptr_->Aggregate(replica_task.template Cast<chi::Task>());
         INFO("Aggregate for DestroyTask succeeded");
-        ipc_manager->DelTask(replica_task);
+        CHI_IPC->DelTask(replica_task);
       }
 
-      container->DelTask(chimaera::admin::Method::kDestroy, new_task);
+      CHI_IPC->DelTask(new_task);
     }
   }
 }
@@ -882,18 +882,18 @@ TEST_CASE("Autogen - Admin GetOrCreatePoolTask coverage", "[autogen][admin][geto
       auto copied_task = container->NewCopyTask(chimaera::admin::Method::kGetOrCreatePool, new_task, false);
       if (!copied_task.IsNull()) {
         INFO("NewCopyTask for GetOrCreatePoolTask succeeded");
-        ipc_manager->DelTask(copied_task);
+        CHI_IPC->DelTask(copied_task);
       }
 
       // Aggregate
       auto replica_task = container->NewTask(chimaera::admin::Method::kGetOrCreatePool);
       if (!replica_task.IsNull()) {
-        container->Aggregate(chimaera::admin::Method::kGetOrCreatePool, new_task, replica_task);
+        new_task.ptr_->Aggregate(replica_task.template Cast<chi::Task>());
         INFO("Aggregate for GetOrCreatePoolTask succeeded");
-        ipc_manager->DelTask(replica_task);
+        CHI_IPC->DelTask(replica_task);
       }
 
-      container->DelTask(chimaera::admin::Method::kGetOrCreatePool, new_task);
+      CHI_IPC->DelTask(new_task);
     }
   }
 }
@@ -919,18 +919,18 @@ TEST_CASE("Autogen - Admin SendTask and RecvTask coverage", "[autogen][admin][se
       auto copied_task = container->NewCopyTask(chimaera::admin::Method::kSend, new_task, false);
       if (!copied_task.IsNull()) {
         INFO("NewCopyTask for SendTask succeeded");
-        ipc_manager->DelTask(copied_task);
+        CHI_IPC->DelTask(copied_task);
       }
 
       // Aggregate
       auto replica_task = container->NewTask(chimaera::admin::Method::kSend);
       if (!replica_task.IsNull()) {
-        container->Aggregate(chimaera::admin::Method::kSend, new_task, replica_task);
+        new_task.ptr_->Aggregate(replica_task.template Cast<chi::Task>());
         INFO("Aggregate for SendTask succeeded");
-        ipc_manager->DelTask(replica_task);
+        CHI_IPC->DelTask(replica_task);
       }
 
-      container->DelTask(chimaera::admin::Method::kSend, new_task);
+      CHI_IPC->DelTask(new_task);
     }
   }
 
@@ -943,18 +943,18 @@ TEST_CASE("Autogen - Admin SendTask and RecvTask coverage", "[autogen][admin][se
       auto copied_task = container->NewCopyTask(chimaera::admin::Method::kRecv, new_task, false);
       if (!copied_task.IsNull()) {
         INFO("NewCopyTask for RecvTask succeeded");
-        ipc_manager->DelTask(copied_task);
+        CHI_IPC->DelTask(copied_task);
       }
 
       // Aggregate
       auto replica_task = container->NewTask(chimaera::admin::Method::kRecv);
       if (!replica_task.IsNull()) {
-        container->Aggregate(chimaera::admin::Method::kRecv, new_task, replica_task);
+        new_task.ptr_->Aggregate(replica_task.template Cast<chi::Task>());
         INFO("Aggregate for RecvTask succeeded");
-        ipc_manager->DelTask(replica_task);
+        CHI_IPC->DelTask(replica_task);
       }
 
-      container->DelTask(chimaera::admin::Method::kRecv, new_task);
+      CHI_IPC->DelTask(new_task);
     }
   }
 }
@@ -1001,8 +1001,8 @@ TEST_CASE("Autogen - CTE RegisterTargetTask coverage", "[autogen][cte][registert
     REQUIRE(!loaded_task.IsNull());
     INFO("RegisterTargetTask SaveTask/LoadTask completed");
 
-    ipc_manager->DelTask(orig_task);
-    ipc_manager->DelTask(loaded_task);
+    CHI_IPC->DelTask(orig_task);
+    CHI_IPC->DelTask(loaded_task);
   }
 }
 
@@ -1034,8 +1034,8 @@ TEST_CASE("Autogen - CTE UnregisterTargetTask coverage", "[autogen][cte][unregis
     REQUIRE(!loaded_task.IsNull());
     INFO("UnregisterTargetTask SaveTask/LoadTask completed");
 
-    ipc_manager->DelTask(orig_task);
-    ipc_manager->DelTask(loaded_task);
+    CHI_IPC->DelTask(orig_task);
+    CHI_IPC->DelTask(loaded_task);
   }
 }
 
@@ -1067,8 +1067,8 @@ TEST_CASE("Autogen - CTE ListTargetsTask coverage", "[autogen][cte][listtargets]
     REQUIRE(!loaded_task.IsNull());
     INFO("ListTargetsTask SaveTask/LoadTask completed");
 
-    ipc_manager->DelTask(orig_task);
-    ipc_manager->DelTask(loaded_task);
+    CHI_IPC->DelTask(orig_task);
+    CHI_IPC->DelTask(loaded_task);
   }
 }
 
@@ -1100,8 +1100,8 @@ TEST_CASE("Autogen - CTE StatTargetsTask coverage", "[autogen][cte][stattargets]
     REQUIRE(!loaded_task.IsNull());
     INFO("StatTargetsTask SaveTask/LoadTask completed");
 
-    ipc_manager->DelTask(orig_task);
-    ipc_manager->DelTask(loaded_task);
+    CHI_IPC->DelTask(orig_task);
+    CHI_IPC->DelTask(loaded_task);
   }
 }
 
@@ -1133,8 +1133,8 @@ TEST_CASE("Autogen - CTE GetOrCreateTagTask coverage", "[autogen][cte][getorcrea
     REQUIRE(!loaded_task.IsNull());
     INFO("GetOrCreateTagTask SaveTask/LoadTask completed");
 
-    ipc_manager->DelTask(orig_task);
-    ipc_manager->DelTask(loaded_task);
+    CHI_IPC->DelTask(orig_task);
+    CHI_IPC->DelTask(loaded_task);
   }
 }
 
@@ -1166,8 +1166,8 @@ TEST_CASE("Autogen - CTE PutBlobTask coverage", "[autogen][cte][putblob]") {
     REQUIRE(!loaded_task.IsNull());
     INFO("PutBlobTask SaveTask/LoadTask completed");
 
-    ipc_manager->DelTask(orig_task);
-    ipc_manager->DelTask(loaded_task);
+    CHI_IPC->DelTask(orig_task);
+    CHI_IPC->DelTask(loaded_task);
   }
 }
 
@@ -1199,8 +1199,8 @@ TEST_CASE("Autogen - CTE GetBlobTask coverage", "[autogen][cte][getblob]") {
     REQUIRE(!loaded_task.IsNull());
     INFO("GetBlobTask SaveTask/LoadTask completed");
 
-    ipc_manager->DelTask(orig_task);
-    ipc_manager->DelTask(loaded_task);
+    CHI_IPC->DelTask(orig_task);
+    CHI_IPC->DelTask(loaded_task);
   }
 }
 
@@ -1232,8 +1232,8 @@ TEST_CASE("Autogen - CTE ReorganizeBlobTask coverage", "[autogen][cte][reorganiz
     REQUIRE(!loaded_task.IsNull());
     INFO("ReorganizeBlobTask SaveTask/LoadTask completed");
 
-    ipc_manager->DelTask(orig_task);
-    ipc_manager->DelTask(loaded_task);
+    CHI_IPC->DelTask(orig_task);
+    CHI_IPC->DelTask(loaded_task);
   }
 }
 
@@ -1265,8 +1265,8 @@ TEST_CASE("Autogen - CTE DelBlobTask coverage", "[autogen][cte][delblob]") {
     REQUIRE(!loaded_task.IsNull());
     INFO("DelBlobTask SaveTask/LoadTask completed");
 
-    ipc_manager->DelTask(orig_task);
-    ipc_manager->DelTask(loaded_task);
+    CHI_IPC->DelTask(orig_task);
+    CHI_IPC->DelTask(loaded_task);
   }
 }
 
@@ -1298,8 +1298,8 @@ TEST_CASE("Autogen - CTE DelTagTask coverage", "[autogen][cte][deltag]") {
     REQUIRE(!loaded_task.IsNull());
     INFO("DelTagTask SaveTask/LoadTask completed");
 
-    ipc_manager->DelTask(orig_task);
-    ipc_manager->DelTask(loaded_task);
+    CHI_IPC->DelTask(orig_task);
+    CHI_IPC->DelTask(loaded_task);
   }
 }
 
@@ -1331,8 +1331,8 @@ TEST_CASE("Autogen - CTE GetTagSizeTask coverage", "[autogen][cte][gettagsize]")
     REQUIRE(!loaded_task.IsNull());
     INFO("GetTagSizeTask SaveTask/LoadTask completed");
 
-    ipc_manager->DelTask(orig_task);
-    ipc_manager->DelTask(loaded_task);
+    CHI_IPC->DelTask(orig_task);
+    CHI_IPC->DelTask(loaded_task);
   }
 }
 
@@ -1364,8 +1364,8 @@ TEST_CASE("Autogen - CTE PollTelemetryLogTask coverage", "[autogen][cte][polltel
     REQUIRE(!loaded_task.IsNull());
     INFO("PollTelemetryLogTask SaveTask/LoadTask completed");
 
-    ipc_manager->DelTask(orig_task);
-    ipc_manager->DelTask(loaded_task);
+    CHI_IPC->DelTask(orig_task);
+    CHI_IPC->DelTask(loaded_task);
   }
 }
 
@@ -1397,8 +1397,8 @@ TEST_CASE("Autogen - CTE GetBlobScoreTask coverage", "[autogen][cte][getblobscor
     REQUIRE(!loaded_task.IsNull());
     INFO("GetBlobScoreTask SaveTask/LoadTask completed");
 
-    ipc_manager->DelTask(orig_task);
-    ipc_manager->DelTask(loaded_task);
+    CHI_IPC->DelTask(orig_task);
+    CHI_IPC->DelTask(loaded_task);
   }
 }
 
@@ -1430,8 +1430,8 @@ TEST_CASE("Autogen - CTE GetBlobSizeTask coverage", "[autogen][cte][getblobsize]
     REQUIRE(!loaded_task.IsNull());
     INFO("GetBlobSizeTask SaveTask/LoadTask completed");
 
-    ipc_manager->DelTask(orig_task);
-    ipc_manager->DelTask(loaded_task);
+    CHI_IPC->DelTask(orig_task);
+    CHI_IPC->DelTask(loaded_task);
   }
 }
 
@@ -1463,8 +1463,8 @@ TEST_CASE("Autogen - CTE GetContainedBlobsTask coverage", "[autogen][cte][getcon
     REQUIRE(!loaded_task.IsNull());
     INFO("GetContainedBlobsTask SaveTask/LoadTask completed");
 
-    ipc_manager->DelTask(orig_task);
-    ipc_manager->DelTask(loaded_task);
+    CHI_IPC->DelTask(orig_task);
+    CHI_IPC->DelTask(loaded_task);
   }
 }
 
@@ -1496,8 +1496,8 @@ TEST_CASE("Autogen - CTE TagQueryTask coverage", "[autogen][cte][tagquery]") {
     REQUIRE(!loaded_task.IsNull());
     INFO("TagQueryTask SaveTask/LoadTask completed");
 
-    ipc_manager->DelTask(orig_task);
-    ipc_manager->DelTask(loaded_task);
+    CHI_IPC->DelTask(orig_task);
+    CHI_IPC->DelTask(loaded_task);
   }
 }
 
@@ -1529,8 +1529,8 @@ TEST_CASE("Autogen - CTE BlobQueryTask coverage", "[autogen][cte][blobquery]") {
     REQUIRE(!loaded_task.IsNull());
     INFO("BlobQueryTask SaveTask/LoadTask completed");
 
-    ipc_manager->DelTask(orig_task);
-    ipc_manager->DelTask(loaded_task);
+    CHI_IPC->DelTask(orig_task);
+    CHI_IPC->DelTask(loaded_task);
   }
 }
 
@@ -1550,8 +1550,8 @@ TEST_CASE("Autogen - CTE Task Copy operations", "[autogen][cte][copy]") {
     if (!task1.IsNull() && !task2.IsNull()) {
       task2->Copy(task1);
       INFO("RegisterTargetTask Copy completed");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 
@@ -1562,8 +1562,8 @@ TEST_CASE("Autogen - CTE Task Copy operations", "[autogen][cte][copy]") {
     if (!task1.IsNull() && !task2.IsNull()) {
       task2->Copy(task1);
       INFO("ListTargetsTask Copy completed");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 
@@ -1574,8 +1574,8 @@ TEST_CASE("Autogen - CTE Task Copy operations", "[autogen][cte][copy]") {
     if (!task1.IsNull() && !task2.IsNull()) {
       task2->Copy(task1);
       INFO("PutBlobTask Copy completed");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 
@@ -1586,8 +1586,8 @@ TEST_CASE("Autogen - CTE Task Copy operations", "[autogen][cte][copy]") {
     if (!task1.IsNull() && !task2.IsNull()) {
       task2->Copy(task1);
       INFO("GetBlobTask Copy completed");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 }
@@ -1604,11 +1604,11 @@ TEST_CASE("Autogen - CTE Task Aggregate operations", "[autogen][cte][aggregate]"
     if (!origin_task.IsNull() && !replica_task.IsNull()) {
       // Add some test data to replica
       replica_task->target_names_.push_back("test_target");
-      origin_task->Aggregate(replica_task);
+      origin_task->Aggregate(replica_task.template Cast<chi::Task>());
       INFO("ListTargetsTask Aggregate completed");
       REQUIRE(origin_task->target_names_.size() == 1);
-      ipc_manager->DelTask(origin_task);
-      ipc_manager->DelTask(replica_task);
+      CHI_IPC->DelTask(origin_task);
+      CHI_IPC->DelTask(replica_task);
     }
   }
 
@@ -1619,11 +1619,11 @@ TEST_CASE("Autogen - CTE Task Aggregate operations", "[autogen][cte][aggregate]"
     if (!origin_task.IsNull() && !replica_task.IsNull()) {
       origin_task->tag_size_ = 100;
       replica_task->tag_size_ = 200;
-      origin_task->Aggregate(replica_task);
+      origin_task->Aggregate(replica_task.template Cast<chi::Task>());
       INFO("GetTagSizeTask Aggregate completed");
       REQUIRE(origin_task->tag_size_ == 300);
-      ipc_manager->DelTask(origin_task);
-      ipc_manager->DelTask(replica_task);
+      CHI_IPC->DelTask(origin_task);
+      CHI_IPC->DelTask(replica_task);
     }
   }
 
@@ -1634,11 +1634,11 @@ TEST_CASE("Autogen - CTE Task Aggregate operations", "[autogen][cte][aggregate]"
     if (!origin_task.IsNull() && !replica_task.IsNull()) {
       replica_task->blob_names_.push_back("blob1");
       replica_task->blob_names_.push_back("blob2");
-      origin_task->Aggregate(replica_task);
+      origin_task->Aggregate(replica_task.template Cast<chi::Task>());
       INFO("GetContainedBlobsTask Aggregate completed");
       REQUIRE(origin_task->blob_names_.size() == 2);
-      ipc_manager->DelTask(origin_task);
-      ipc_manager->DelTask(replica_task);
+      CHI_IPC->DelTask(origin_task);
+      CHI_IPC->DelTask(replica_task);
     }
   }
 
@@ -1650,11 +1650,11 @@ TEST_CASE("Autogen - CTE Task Aggregate operations", "[autogen][cte][aggregate]"
       replica_task->total_tags_matched_ = 5;
       replica_task->results_.push_back("tag1");
       origin_task->total_tags_matched_ = 3;
-      origin_task->Aggregate(replica_task);
+      origin_task->Aggregate(replica_task.template Cast<chi::Task>());
       INFO("TagQueryTask Aggregate completed");
       REQUIRE(origin_task->total_tags_matched_ == 8);
-      ipc_manager->DelTask(origin_task);
-      ipc_manager->DelTask(replica_task);
+      CHI_IPC->DelTask(origin_task);
+      CHI_IPC->DelTask(replica_task);
     }
   }
 
@@ -1667,11 +1667,11 @@ TEST_CASE("Autogen - CTE Task Aggregate operations", "[autogen][cte][aggregate]"
       replica_task->tag_names_.push_back("tag1");
       replica_task->blob_names_.push_back("blob1");
       origin_task->total_blobs_matched_ = 5;
-      origin_task->Aggregate(replica_task);
+      origin_task->Aggregate(replica_task.template Cast<chi::Task>());
       INFO("BlobQueryTask Aggregate completed");
       REQUIRE(origin_task->total_blobs_matched_ == 15);
-      ipc_manager->DelTask(origin_task);
-      ipc_manager->DelTask(replica_task);
+      CHI_IPC->DelTask(origin_task);
+      CHI_IPC->DelTask(replica_task);
     }
   }
 }
@@ -1692,8 +1692,8 @@ TEST_CASE("Autogen - Bdev Task Copy and Aggregate", "[autogen][bdev][copy][aggre
     if (!task1.IsNull() && !task2.IsNull()) {
       task2->Copy(task1);
       INFO("AllocateBlocksTask Copy completed");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 
@@ -1702,10 +1702,10 @@ TEST_CASE("Autogen - Bdev Task Copy and Aggregate", "[autogen][bdev][copy][aggre
     auto task2 = ipc_manager->NewTask<chimaera::bdev::GetStatsTask>();
 
     if (!task1.IsNull() && !task2.IsNull()) {
-      task1->Aggregate(task2);
+      task1->Aggregate(task2.template Cast<chi::Task>());
       INFO("GetStatsTask Aggregate completed");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 }
@@ -1740,9 +1740,9 @@ TEST_CASE("Autogen - Admin Container SaveTask/LoadTask all methods", "[autogen][
       if (!loaded_task.IsNull()) {
         container->LoadTask(chimaera::admin::Method::kCreate, load_archive, loaded_task);
         INFO("CreateTask SaveTask/LoadTask completed");
-        ipc_manager->DelTask(loaded_task);
+        CHI_IPC->DelTask(loaded_task);
       }
-      ipc_manager->DelTask(new_task);
+      CHI_IPC->DelTask(new_task);
     }
   }
 
@@ -1760,9 +1760,9 @@ TEST_CASE("Autogen - Admin Container SaveTask/LoadTask all methods", "[autogen][
       if (!loaded_task.IsNull()) {
         container->LoadTask(chimaera::admin::Method::kStopRuntime, load_archive, loaded_task);
         INFO("StopRuntimeTask SaveTask/LoadTask completed");
-        ipc_manager->DelTask(loaded_task);
+        CHI_IPC->DelTask(loaded_task);
       }
-      ipc_manager->DelTask(new_task);
+      CHI_IPC->DelTask(new_task);
     }
   }
 
@@ -1780,9 +1780,9 @@ TEST_CASE("Autogen - Admin Container SaveTask/LoadTask all methods", "[autogen][
       if (!loaded_task.IsNull()) {
         container->LoadTask(chimaera::admin::Method::kSubmitBatch, load_archive, loaded_task);
         INFO("SubmitBatchTask SaveTask/LoadTask completed");
-        ipc_manager->DelTask(loaded_task);
+        CHI_IPC->DelTask(loaded_task);
       }
-      ipc_manager->DelTask(new_task);
+      CHI_IPC->DelTask(new_task);
     }
   }
 
@@ -1800,9 +1800,9 @@ TEST_CASE("Autogen - Admin Container SaveTask/LoadTask all methods", "[autogen][
       if (!loaded_task.IsNull()) {
         container->LoadTask(chimaera::admin::Method::kSend, load_archive, loaded_task);
         INFO("SendTask SaveTask/LoadTask completed");
-        ipc_manager->DelTask(loaded_task);
+        CHI_IPC->DelTask(loaded_task);
       }
-      ipc_manager->DelTask(new_task);
+      CHI_IPC->DelTask(new_task);
     }
   }
 
@@ -1820,9 +1820,9 @@ TEST_CASE("Autogen - Admin Container SaveTask/LoadTask all methods", "[autogen][
       if (!loaded_task.IsNull()) {
         container->LoadTask(chimaera::admin::Method::kRecv, load_archive, loaded_task);
         INFO("RecvTask SaveTask/LoadTask completed");
-        ipc_manager->DelTask(loaded_task);
+        CHI_IPC->DelTask(loaded_task);
       }
-      ipc_manager->DelTask(new_task);
+      CHI_IPC->DelTask(new_task);
     }
   }
 
@@ -1840,9 +1840,9 @@ TEST_CASE("Autogen - Admin Container SaveTask/LoadTask all methods", "[autogen][
       if (!loaded_task.IsNull()) {
         container->LoadTask(chimaera::admin::Method::kGetOrCreatePool, load_archive, loaded_task);
         INFO("GetOrCreatePoolTask SaveTask/LoadTask completed");
-        ipc_manager->DelTask(loaded_task);
+        CHI_IPC->DelTask(loaded_task);
       }
-      ipc_manager->DelTask(new_task);
+      CHI_IPC->DelTask(new_task);
     }
   }
 }
@@ -1863,8 +1863,8 @@ TEST_CASE("Autogen - Admin Additional Task operations", "[autogen][admin][additi
     if (!create1.IsNull() && !create2.IsNull()) {
       create2->Copy(create1);
       INFO("CreateTask Copy completed");
-      ipc_manager->DelTask(create1);
-      ipc_manager->DelTask(create2);
+      CHI_IPC->DelTask(create1);
+      CHI_IPC->DelTask(create2);
     }
 
     // Test Copy for DestroyTask
@@ -1873,8 +1873,8 @@ TEST_CASE("Autogen - Admin Additional Task operations", "[autogen][admin][additi
     if (!destroy1.IsNull() && !destroy2.IsNull()) {
       destroy2->Copy(destroy1);
       INFO("DestroyTask Copy completed");
-      ipc_manager->DelTask(destroy1);
-      ipc_manager->DelTask(destroy2);
+      CHI_IPC->DelTask(destroy1);
+      CHI_IPC->DelTask(destroy2);
     }
 
     // Test Copy for StopRuntimeTask
@@ -1883,8 +1883,8 @@ TEST_CASE("Autogen - Admin Additional Task operations", "[autogen][admin][additi
     if (!stop1.IsNull() && !stop2.IsNull()) {
       stop2->Copy(stop1);
       INFO("StopRuntimeTask Copy completed");
-      ipc_manager->DelTask(stop1);
-      ipc_manager->DelTask(stop2);
+      CHI_IPC->DelTask(stop1);
+      CHI_IPC->DelTask(stop2);
     }
 
     // Test Copy for DestroyPoolTask
@@ -1893,8 +1893,8 @@ TEST_CASE("Autogen - Admin Additional Task operations", "[autogen][admin][additi
     if (!pool1.IsNull() && !pool2.IsNull()) {
       pool2->Copy(pool1);
       INFO("DestroyPoolTask Copy completed");
-      ipc_manager->DelTask(pool1);
-      ipc_manager->DelTask(pool2);
+      CHI_IPC->DelTask(pool1);
+      CHI_IPC->DelTask(pool2);
     }
   }
 
@@ -1903,40 +1903,40 @@ TEST_CASE("Autogen - Admin Additional Task operations", "[autogen][admin][additi
     auto create1 = ipc_manager->NewTask<chimaera::admin::CreateTask>();
     auto create2 = ipc_manager->NewTask<chimaera::admin::CreateTask>();
     if (!create1.IsNull() && !create2.IsNull()) {
-      create1->Aggregate(create2);
+      create1->Aggregate(create2.template Cast<chi::Task>());
       INFO("CreateTask Aggregate completed");
-      ipc_manager->DelTask(create1);
-      ipc_manager->DelTask(create2);
+      CHI_IPC->DelTask(create1);
+      CHI_IPC->DelTask(create2);
     }
 
     // Test Aggregate for DestroyTask
     auto destroy1 = ipc_manager->NewTask<chimaera::admin::DestroyTask>();
     auto destroy2 = ipc_manager->NewTask<chimaera::admin::DestroyTask>();
     if (!destroy1.IsNull() && !destroy2.IsNull()) {
-      destroy1->Aggregate(destroy2);
+      destroy1->Aggregate(destroy2.template Cast<chi::Task>());
       INFO("DestroyTask Aggregate completed");
-      ipc_manager->DelTask(destroy1);
-      ipc_manager->DelTask(destroy2);
+      CHI_IPC->DelTask(destroy1);
+      CHI_IPC->DelTask(destroy2);
     }
 
     // Test Aggregate for StopRuntimeTask
     auto stop1 = ipc_manager->NewTask<chimaera::admin::StopRuntimeTask>();
     auto stop2 = ipc_manager->NewTask<chimaera::admin::StopRuntimeTask>();
     if (!stop1.IsNull() && !stop2.IsNull()) {
-      stop1->Aggregate(stop2);
+      stop1->Aggregate(stop2.template Cast<chi::Task>());
       INFO("StopRuntimeTask Aggregate completed");
-      ipc_manager->DelTask(stop1);
-      ipc_manager->DelTask(stop2);
+      CHI_IPC->DelTask(stop1);
+      CHI_IPC->DelTask(stop2);
     }
 
     // Test Aggregate for DestroyPoolTask
     auto pool1 = ipc_manager->NewTask<chimaera::admin::DestroyPoolTask>();
     auto pool2 = ipc_manager->NewTask<chimaera::admin::DestroyPoolTask>();
     if (!pool1.IsNull() && !pool2.IsNull()) {
-      pool1->Aggregate(pool2);
+      pool1->Aggregate(pool2.template Cast<chi::Task>());
       INFO("DestroyPoolTask Aggregate completed");
-      ipc_manager->DelTask(pool1);
-      ipc_manager->DelTask(pool2);
+      CHI_IPC->DelTask(pool1);
+      CHI_IPC->DelTask(pool2);
     }
   }
 }
@@ -1973,8 +1973,8 @@ TEST_CASE("Autogen - CAE ParseOmniTask coverage", "[autogen][cae][parseomni]") {
     REQUIRE(!loaded_task.IsNull());
     INFO("ParseOmniTask SaveTask/LoadTask completed");
 
-    ipc_manager->DelTask(orig_task);
-    ipc_manager->DelTask(loaded_task);
+    CHI_IPC->DelTask(orig_task);
+    CHI_IPC->DelTask(loaded_task);
   }
 }
 
@@ -2006,8 +2006,8 @@ TEST_CASE("Autogen - CAE ProcessHdf5DatasetTask coverage", "[autogen][cae][proce
     REQUIRE(!loaded_task.IsNull());
     INFO("ProcessHdf5DatasetTask SaveTask/LoadTask completed");
 
-    ipc_manager->DelTask(orig_task);
-    ipc_manager->DelTask(loaded_task);
+    CHI_IPC->DelTask(orig_task);
+    CHI_IPC->DelTask(loaded_task);
   }
 }
 
@@ -2023,8 +2023,8 @@ TEST_CASE("Autogen - CAE Task Copy and Aggregate", "[autogen][cae][copy][aggrega
     if (!task1.IsNull() && !task2.IsNull()) {
       task2->Copy(task1);
       INFO("ParseOmniTask Copy completed");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 
@@ -2035,8 +2035,8 @@ TEST_CASE("Autogen - CAE Task Copy and Aggregate", "[autogen][cae][copy][aggrega
     if (!task1.IsNull() && !task2.IsNull()) {
       task2->Copy(task1);
       INFO("ProcessHdf5DatasetTask Copy completed");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 
@@ -2045,10 +2045,10 @@ TEST_CASE("Autogen - CAE Task Copy and Aggregate", "[autogen][cae][copy][aggrega
     auto task2 = ipc_manager->NewTask<wrp_cae::core::ParseOmniTask>();
 
     if (!task1.IsNull() && !task2.IsNull()) {
-      task1->Aggregate(task2);
+      task1->Aggregate(task2.template Cast<chi::Task>());
       INFO("ParseOmniTask Aggregate completed");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 
@@ -2057,10 +2057,10 @@ TEST_CASE("Autogen - CAE Task Copy and Aggregate", "[autogen][cae][copy][aggrega
     auto task2 = ipc_manager->NewTask<wrp_cae::core::ProcessHdf5DatasetTask>();
 
     if (!task1.IsNull() && !task2.IsNull()) {
-      task1->Aggregate(task2);
+      task1->Aggregate(task2.template Cast<chi::Task>());
       INFO("ProcessHdf5DatasetTask Aggregate completed");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 }
@@ -2081,8 +2081,8 @@ TEST_CASE("Autogen - CTE Additional Task Coverage", "[autogen][cte][additional]"
     if (!task1.IsNull() && !task2.IsNull()) {
       task2->Copy(task1);
       INFO("UnregisterTargetTask Copy completed");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 
@@ -2093,8 +2093,8 @@ TEST_CASE("Autogen - CTE Additional Task Coverage", "[autogen][cte][additional]"
     if (!task1.IsNull() && !task2.IsNull()) {
       task2->Copy(task1);
       INFO("StatTargetsTask Copy completed");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 
@@ -2105,8 +2105,8 @@ TEST_CASE("Autogen - CTE Additional Task Coverage", "[autogen][cte][additional]"
     if (!task1.IsNull() && !task2.IsNull()) {
       task2->Copy(task1);
       INFO("ReorganizeBlobTask Copy completed");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 
@@ -2117,8 +2117,8 @@ TEST_CASE("Autogen - CTE Additional Task Coverage", "[autogen][cte][additional]"
     if (!task1.IsNull() && !task2.IsNull()) {
       task2->Copy(task1);
       INFO("DelBlobTask Copy completed");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 
@@ -2129,8 +2129,8 @@ TEST_CASE("Autogen - CTE Additional Task Coverage", "[autogen][cte][additional]"
     if (!task1.IsNull() && !task2.IsNull()) {
       task2->Copy(task1);
       INFO("DelTagTask Copy completed");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 
@@ -2141,8 +2141,8 @@ TEST_CASE("Autogen - CTE Additional Task Coverage", "[autogen][cte][additional]"
     if (!task1.IsNull() && !task2.IsNull()) {
       task2->Copy(task1);
       INFO("GetTagSizeTask Copy completed");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 
@@ -2153,8 +2153,8 @@ TEST_CASE("Autogen - CTE Additional Task Coverage", "[autogen][cte][additional]"
     if (!task1.IsNull() && !task2.IsNull()) {
       task2->Copy(task1);
       INFO("GetBlobScoreTask Copy completed");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 
@@ -2165,8 +2165,8 @@ TEST_CASE("Autogen - CTE Additional Task Coverage", "[autogen][cte][additional]"
     if (!task1.IsNull() && !task2.IsNull()) {
       task2->Copy(task1);
       INFO("GetBlobSizeTask Copy completed");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 
@@ -2177,8 +2177,8 @@ TEST_CASE("Autogen - CTE Additional Task Coverage", "[autogen][cte][additional]"
     if (!task1.IsNull() && !task2.IsNull()) {
       task2->Copy(task1);
       INFO("GetContainedBlobsTask Copy completed");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 
@@ -2189,8 +2189,8 @@ TEST_CASE("Autogen - CTE Additional Task Coverage", "[autogen][cte][additional]"
     if (!task1.IsNull() && !task2.IsNull()) {
       task2->Copy(task1);
       INFO("PollTelemetryLogTask Copy completed");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 
@@ -2201,8 +2201,8 @@ TEST_CASE("Autogen - CTE Additional Task Coverage", "[autogen][cte][additional]"
     if (!task1.IsNull() && !task2.IsNull()) {
       task2->Copy(task1);
       INFO("TagQueryTask Copy completed");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 
@@ -2213,8 +2213,8 @@ TEST_CASE("Autogen - CTE Additional Task Coverage", "[autogen][cte][additional]"
     if (!task1.IsNull() && !task2.IsNull()) {
       task2->Copy(task1);
       INFO("BlobQueryTask Copy completed");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 }
@@ -2229,10 +2229,10 @@ TEST_CASE("Autogen - CTE Additional Aggregate Tests", "[autogen][cte][aggregate]
     auto task2 = ipc_manager->NewTask<wrp_cte::core::UnregisterTargetTask>();
 
     if (!task1.IsNull() && !task2.IsNull()) {
-      task1->Aggregate(task2);
+      task1->Aggregate(task2.template Cast<chi::Task>());
       INFO("UnregisterTargetTask Aggregate completed");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 
@@ -2241,10 +2241,10 @@ TEST_CASE("Autogen - CTE Additional Aggregate Tests", "[autogen][cte][aggregate]
     auto task2 = ipc_manager->NewTask<wrp_cte::core::StatTargetsTask>();
 
     if (!task1.IsNull() && !task2.IsNull()) {
-      task1->Aggregate(task2);
+      task1->Aggregate(task2.template Cast<chi::Task>());
       INFO("StatTargetsTask Aggregate completed");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 
@@ -2253,10 +2253,10 @@ TEST_CASE("Autogen - CTE Additional Aggregate Tests", "[autogen][cte][aggregate]
     auto task2 = ipc_manager->NewTask<wrp_cte::core::ReorganizeBlobTask>();
 
     if (!task1.IsNull() && !task2.IsNull()) {
-      task1->Aggregate(task2);
+      task1->Aggregate(task2.template Cast<chi::Task>());
       INFO("ReorganizeBlobTask Aggregate completed");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 
@@ -2265,10 +2265,10 @@ TEST_CASE("Autogen - CTE Additional Aggregate Tests", "[autogen][cte][aggregate]
     auto task2 = ipc_manager->NewTask<wrp_cte::core::DelBlobTask>();
 
     if (!task1.IsNull() && !task2.IsNull()) {
-      task1->Aggregate(task2);
+      task1->Aggregate(task2.template Cast<chi::Task>());
       INFO("DelBlobTask Aggregate completed");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 
@@ -2277,10 +2277,10 @@ TEST_CASE("Autogen - CTE Additional Aggregate Tests", "[autogen][cte][aggregate]
     auto task2 = ipc_manager->NewTask<wrp_cte::core::DelTagTask>();
 
     if (!task1.IsNull() && !task2.IsNull()) {
-      task1->Aggregate(task2);
+      task1->Aggregate(task2.template Cast<chi::Task>());
       INFO("DelTagTask Aggregate completed");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 
@@ -2289,10 +2289,10 @@ TEST_CASE("Autogen - CTE Additional Aggregate Tests", "[autogen][cte][aggregate]
     auto task2 = ipc_manager->NewTask<wrp_cte::core::GetBlobScoreTask>();
 
     if (!task1.IsNull() && !task2.IsNull()) {
-      task1->Aggregate(task2);
+      task1->Aggregate(task2.template Cast<chi::Task>());
       INFO("GetBlobScoreTask Aggregate completed");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 
@@ -2301,10 +2301,10 @@ TEST_CASE("Autogen - CTE Additional Aggregate Tests", "[autogen][cte][aggregate]
     auto task2 = ipc_manager->NewTask<wrp_cte::core::GetBlobSizeTask>();
 
     if (!task1.IsNull() && !task2.IsNull()) {
-      task1->Aggregate(task2);
+      task1->Aggregate(task2.template Cast<chi::Task>());
       INFO("GetBlobSizeTask Aggregate completed");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 
@@ -2313,10 +2313,10 @@ TEST_CASE("Autogen - CTE Additional Aggregate Tests", "[autogen][cte][aggregate]
     auto task2 = ipc_manager->NewTask<wrp_cte::core::PollTelemetryLogTask>();
 
     if (!task1.IsNull() && !task2.IsNull()) {
-      task1->Aggregate(task2);
+      task1->Aggregate(task2.template Cast<chi::Task>());
       INFO("PollTelemetryLogTask Aggregate completed");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 
@@ -2325,10 +2325,10 @@ TEST_CASE("Autogen - CTE Additional Aggregate Tests", "[autogen][cte][aggregate]
     auto task2 = ipc_manager->NewTask<wrp_cte::core::RegisterTargetTask>();
 
     if (!task1.IsNull() && !task2.IsNull()) {
-      task1->Aggregate(task2);
+      task1->Aggregate(task2.template Cast<chi::Task>());
       INFO("RegisterTargetTask Aggregate completed");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 
@@ -2337,10 +2337,10 @@ TEST_CASE("Autogen - CTE Additional Aggregate Tests", "[autogen][cte][aggregate]
     auto task2 = ipc_manager->NewTask<wrp_cte::core::GetOrCreateTagTask<wrp_cte::core::CreateParams>>();
 
     if (!task1.IsNull() && !task2.IsNull()) {
-      task1->Aggregate(task2);
+      task1->Aggregate(task2.template Cast<chi::Task>());
       INFO("GetOrCreateTagTask Aggregate completed");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 
@@ -2349,10 +2349,10 @@ TEST_CASE("Autogen - CTE Additional Aggregate Tests", "[autogen][cte][aggregate]
     auto task2 = ipc_manager->NewTask<wrp_cte::core::PutBlobTask>();
 
     if (!task1.IsNull() && !task2.IsNull()) {
-      task1->Aggregate(task2);
+      task1->Aggregate(task2.template Cast<chi::Task>());
       INFO("PutBlobTask Aggregate completed");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 
@@ -2361,10 +2361,10 @@ TEST_CASE("Autogen - CTE Additional Aggregate Tests", "[autogen][cte][aggregate]
     auto task2 = ipc_manager->NewTask<wrp_cte::core::GetBlobTask>();
 
     if (!task1.IsNull() && !task2.IsNull()) {
-      task1->Aggregate(task2);
+      task1->Aggregate(task2.template Cast<chi::Task>());
       INFO("GetBlobTask Aggregate completed");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 }
@@ -2385,8 +2385,8 @@ TEST_CASE("Autogen - Bdev Additional Task Coverage", "[autogen][bdev][additional
     if (!task1.IsNull() && !task2.IsNull()) {
       task2->Copy(task1);
       INFO("FreeBlocksTask Copy completed");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 
@@ -2397,8 +2397,8 @@ TEST_CASE("Autogen - Bdev Additional Task Coverage", "[autogen][bdev][additional
     if (!task1.IsNull() && !task2.IsNull()) {
       task2->Copy(task1);
       INFO("WriteTask Copy completed");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 
@@ -2409,8 +2409,8 @@ TEST_CASE("Autogen - Bdev Additional Task Coverage", "[autogen][bdev][additional
     if (!task1.IsNull() && !task2.IsNull()) {
       task2->Copy(task1);
       INFO("ReadTask Copy completed");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 
@@ -2421,8 +2421,8 @@ TEST_CASE("Autogen - Bdev Additional Task Coverage", "[autogen][bdev][additional
     if (!task1.IsNull() && !task2.IsNull()) {
       task2->Copy(task1);
       INFO("GetStatsTask Copy completed");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 
@@ -2431,10 +2431,10 @@ TEST_CASE("Autogen - Bdev Additional Task Coverage", "[autogen][bdev][additional
     auto task2 = ipc_manager->NewTask<chimaera::bdev::AllocateBlocksTask>();
 
     if (!task1.IsNull() && !task2.IsNull()) {
-      task1->Aggregate(task2);
+      task1->Aggregate(task2.template Cast<chi::Task>());
       INFO("AllocateBlocksTask Aggregate completed");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 
@@ -2443,10 +2443,10 @@ TEST_CASE("Autogen - Bdev Additional Task Coverage", "[autogen][bdev][additional
     auto task2 = ipc_manager->NewTask<chimaera::bdev::FreeBlocksTask>();
 
     if (!task1.IsNull() && !task2.IsNull()) {
-      task1->Aggregate(task2);
+      task1->Aggregate(task2.template Cast<chi::Task>());
       INFO("FreeBlocksTask Aggregate completed");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 
@@ -2455,10 +2455,10 @@ TEST_CASE("Autogen - Bdev Additional Task Coverage", "[autogen][bdev][additional
     auto task2 = ipc_manager->NewTask<chimaera::bdev::WriteTask>();
 
     if (!task1.IsNull() && !task2.IsNull()) {
-      task1->Aggregate(task2);
+      task1->Aggregate(task2.template Cast<chi::Task>());
       INFO("WriteTask Aggregate completed");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 
@@ -2467,10 +2467,10 @@ TEST_CASE("Autogen - Bdev Additional Task Coverage", "[autogen][bdev][additional
     auto task2 = ipc_manager->NewTask<chimaera::bdev::ReadTask>();
 
     if (!task1.IsNull() && !task2.IsNull()) {
-      task1->Aggregate(task2);
+      task1->Aggregate(task2.template Cast<chi::Task>());
       INFO("ReadTask Aggregate completed");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 }
@@ -2493,8 +2493,8 @@ TEST_CASE("Autogen - Admin Additional Task Coverage", "[autogen][admin][addition
     if (!task1.IsNull() && !task2.IsNull()) {
       task2->Copy(task1);
       INFO("FlushTask Copy completed");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 
@@ -2507,8 +2507,8 @@ TEST_CASE("Autogen - Admin Additional Task Coverage", "[autogen][admin][addition
     if (!task1.IsNull() && !task2.IsNull()) {
       task2->Copy(task1);
       INFO("MonitorTask Copy completed");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 
@@ -2521,8 +2521,8 @@ TEST_CASE("Autogen - Admin Additional Task Coverage", "[autogen][admin][addition
     if (!task1.IsNull() && !task2.IsNull()) {
       task2->Copy(task1);
       INFO("ClientConnectTask Copy completed");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 
@@ -2533,10 +2533,10 @@ TEST_CASE("Autogen - Admin Additional Task Coverage", "[autogen][admin][addition
         chi::CreateTaskId(), chi::kAdminPoolId, chi::PoolQuery::Local());
 
     if (!task1.IsNull() && !task2.IsNull()) {
-      task1->Aggregate(task2);
+      task1->Aggregate(task2.template Cast<chi::Task>());
       INFO("FlushTask Aggregate completed");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 
@@ -2547,10 +2547,10 @@ TEST_CASE("Autogen - Admin Additional Task Coverage", "[autogen][admin][addition
         chi::CreateTaskId(), chi::kAdminPoolId, chi::PoolQuery::Local(), std::string("status"));
 
     if (!task1.IsNull() && !task2.IsNull()) {
-      task1->Aggregate(task2);
+      task1->Aggregate(task2.template Cast<chi::Task>());
       INFO("MonitorTask Aggregate completed");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 
@@ -2561,10 +2561,10 @@ TEST_CASE("Autogen - Admin Additional Task Coverage", "[autogen][admin][addition
         chi::CreateTaskId(), chi::kAdminPoolId, chi::PoolQuery::Local());
 
     if (!task1.IsNull() && !task2.IsNull()) {
-      task1->Aggregate(task2);
+      task1->Aggregate(task2.template Cast<chi::Task>());
       INFO("ClientConnectTask Aggregate completed");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 }
@@ -2589,8 +2589,8 @@ TEST_CASE("Autogen - CTE Additional SaveTask/LoadTask coverage", "[autogen][cte]
       auto loaded_task = ipc_manager->NewTask<wrp_cte::core::UnregisterTargetTask>();
       load_archive >> *loaded_task;
       INFO("UnregisterTargetTask SaveTask/LoadTask completed");
-      ipc_manager->DelTask(orig_task);
-      ipc_manager->DelTask(loaded_task);
+      CHI_IPC->DelTask(orig_task);
+      CHI_IPC->DelTask(loaded_task);
     }
   }
 
@@ -2605,8 +2605,8 @@ TEST_CASE("Autogen - CTE Additional SaveTask/LoadTask coverage", "[autogen][cte]
       auto loaded_task = ipc_manager->NewTask<wrp_cte::core::StatTargetsTask>();
       load_archive >> *loaded_task;
       INFO("StatTargetsTask SaveTask/LoadTask completed");
-      ipc_manager->DelTask(orig_task);
-      ipc_manager->DelTask(loaded_task);
+      CHI_IPC->DelTask(orig_task);
+      CHI_IPC->DelTask(loaded_task);
     }
   }
 
@@ -2621,8 +2621,8 @@ TEST_CASE("Autogen - CTE Additional SaveTask/LoadTask coverage", "[autogen][cte]
       auto loaded_task = ipc_manager->NewTask<wrp_cte::core::ReorganizeBlobTask>();
       load_archive >> *loaded_task;
       INFO("ReorganizeBlobTask SaveTask/LoadTask completed");
-      ipc_manager->DelTask(orig_task);
-      ipc_manager->DelTask(loaded_task);
+      CHI_IPC->DelTask(orig_task);
+      CHI_IPC->DelTask(loaded_task);
     }
   }
 }
@@ -2647,8 +2647,8 @@ TEST_CASE("Autogen - Bdev SaveTask/LoadTask coverage", "[autogen][bdev][saveload
       auto loaded_task = ipc_manager->NewTask<chimaera::bdev::AllocateBlocksTask>();
       load_archive >> *loaded_task;
       INFO("AllocateBlocksTask SaveTask/LoadTask completed");
-      ipc_manager->DelTask(orig_task);
-      ipc_manager->DelTask(loaded_task);
+      CHI_IPC->DelTask(orig_task);
+      CHI_IPC->DelTask(loaded_task);
     }
   }
 
@@ -2663,8 +2663,8 @@ TEST_CASE("Autogen - Bdev SaveTask/LoadTask coverage", "[autogen][bdev][saveload
       auto loaded_task = ipc_manager->NewTask<chimaera::bdev::FreeBlocksTask>();
       load_archive >> *loaded_task;
       INFO("FreeBlocksTask SaveTask/LoadTask completed");
-      ipc_manager->DelTask(orig_task);
-      ipc_manager->DelTask(loaded_task);
+      CHI_IPC->DelTask(orig_task);
+      CHI_IPC->DelTask(loaded_task);
     }
   }
 
@@ -2679,8 +2679,8 @@ TEST_CASE("Autogen - Bdev SaveTask/LoadTask coverage", "[autogen][bdev][saveload
       auto loaded_task = ipc_manager->NewTask<chimaera::bdev::WriteTask>();
       load_archive >> *loaded_task;
       INFO("WriteTask SaveTask/LoadTask completed");
-      ipc_manager->DelTask(orig_task);
-      ipc_manager->DelTask(loaded_task);
+      CHI_IPC->DelTask(orig_task);
+      CHI_IPC->DelTask(loaded_task);
     }
   }
 
@@ -2695,8 +2695,8 @@ TEST_CASE("Autogen - Bdev SaveTask/LoadTask coverage", "[autogen][bdev][saveload
       auto loaded_task = ipc_manager->NewTask<chimaera::bdev::ReadTask>();
       load_archive >> *loaded_task;
       INFO("ReadTask SaveTask/LoadTask completed");
-      ipc_manager->DelTask(orig_task);
-      ipc_manager->DelTask(loaded_task);
+      CHI_IPC->DelTask(orig_task);
+      CHI_IPC->DelTask(loaded_task);
     }
   }
 
@@ -2711,8 +2711,8 @@ TEST_CASE("Autogen - Bdev SaveTask/LoadTask coverage", "[autogen][bdev][saveload
       auto loaded_task = ipc_manager->NewTask<chimaera::bdev::GetStatsTask>();
       load_archive >> *loaded_task;
       INFO("GetStatsTask SaveTask/LoadTask completed");
-      ipc_manager->DelTask(orig_task);
-      ipc_manager->DelTask(loaded_task);
+      CHI_IPC->DelTask(orig_task);
+      CHI_IPC->DelTask(loaded_task);
     }
   }
 }
@@ -2737,8 +2737,8 @@ TEST_CASE("Autogen - Admin Additional SaveTask/LoadTask coverage", "[autogen][ad
       auto loaded_task = ipc_manager->NewTask<chimaera::admin::CreateTask>();
       load_archive >> *loaded_task;
       INFO("CreateTask SaveTask/LoadTask completed");
-      ipc_manager->DelTask(orig_task);
-      ipc_manager->DelTask(loaded_task);
+      CHI_IPC->DelTask(orig_task);
+      CHI_IPC->DelTask(loaded_task);
     }
   }
 
@@ -2753,8 +2753,8 @@ TEST_CASE("Autogen - Admin Additional SaveTask/LoadTask coverage", "[autogen][ad
       auto loaded_task = ipc_manager->NewTask<chimaera::admin::DestroyTask>();
       load_archive >> *loaded_task;
       INFO("DestroyTask SaveTask/LoadTask completed");
-      ipc_manager->DelTask(orig_task);
-      ipc_manager->DelTask(loaded_task);
+      CHI_IPC->DelTask(orig_task);
+      CHI_IPC->DelTask(loaded_task);
     }
   }
 
@@ -2769,8 +2769,8 @@ TEST_CASE("Autogen - Admin Additional SaveTask/LoadTask coverage", "[autogen][ad
       auto loaded_task = ipc_manager->NewTask<chimaera::admin::StopRuntimeTask>();
       load_archive >> *loaded_task;
       INFO("StopRuntimeTask SaveTask/LoadTask completed");
-      ipc_manager->DelTask(orig_task);
-      ipc_manager->DelTask(loaded_task);
+      CHI_IPC->DelTask(orig_task);
+      CHI_IPC->DelTask(loaded_task);
     }
   }
 
@@ -2785,8 +2785,8 @@ TEST_CASE("Autogen - Admin Additional SaveTask/LoadTask coverage", "[autogen][ad
       auto loaded_task = ipc_manager->NewTask<chimaera::admin::DestroyPoolTask>();
       load_archive >> *loaded_task;
       INFO("DestroyPoolTask SaveTask/LoadTask completed");
-      ipc_manager->DelTask(orig_task);
-      ipc_manager->DelTask(loaded_task);
+      CHI_IPC->DelTask(orig_task);
+      CHI_IPC->DelTask(loaded_task);
     }
   }
 
@@ -2801,8 +2801,8 @@ TEST_CASE("Autogen - Admin Additional SaveTask/LoadTask coverage", "[autogen][ad
       auto loaded_task = ipc_manager->NewTask<chimaera::admin::SubmitBatchTask>();
       load_archive >> *loaded_task;
       INFO("SubmitBatchTask SaveTask/LoadTask completed");
-      ipc_manager->DelTask(orig_task);
-      ipc_manager->DelTask(loaded_task);
+      CHI_IPC->DelTask(orig_task);
+      CHI_IPC->DelTask(loaded_task);
     }
   }
 
@@ -2817,8 +2817,8 @@ TEST_CASE("Autogen - Admin Additional SaveTask/LoadTask coverage", "[autogen][ad
       auto loaded_task = ipc_manager->NewTask<chimaera::admin::SendTask>();
       load_archive >> *loaded_task;
       INFO("SendTask SaveTask/LoadTask completed");
-      ipc_manager->DelTask(orig_task);
-      ipc_manager->DelTask(loaded_task);
+      CHI_IPC->DelTask(orig_task);
+      CHI_IPC->DelTask(loaded_task);
     }
   }
 
@@ -2833,8 +2833,8 @@ TEST_CASE("Autogen - Admin Additional SaveTask/LoadTask coverage", "[autogen][ad
       auto loaded_task = ipc_manager->NewTask<chimaera::admin::RecvTask>();
       load_archive >> *loaded_task;
       INFO("RecvTask SaveTask/LoadTask completed");
-      ipc_manager->DelTask(orig_task);
-      ipc_manager->DelTask(loaded_task);
+      CHI_IPC->DelTask(orig_task);
+      CHI_IPC->DelTask(loaded_task);
     }
   }
 }
@@ -2861,9 +2861,9 @@ TEST_CASE("Autogen - Admin Container advanced operations", "[autogen][admin][con
       auto copy1 = admin_container->NewCopyTask(chimaera::admin::Method::kFlush, orig1, false);
       if (!copy1.IsNull()) {
         INFO("Admin Container NewCopyTask for Flush completed");
-        ipc_manager->DelTask(copy1);
+        CHI_IPC->DelTask(copy1);
       }
-      ipc_manager->DelTask(orig1);
+      CHI_IPC->DelTask(orig1);
     }
 
     auto orig2 = admin_container->NewTask(chimaera::admin::Method::kMonitor);
@@ -2871,9 +2871,9 @@ TEST_CASE("Autogen - Admin Container advanced operations", "[autogen][admin][con
       auto copy2 = admin_container->NewCopyTask(chimaera::admin::Method::kMonitor, orig2, false);
       if (!copy2.IsNull()) {
         INFO("Admin Container NewCopyTask for Monitor completed");
-        ipc_manager->DelTask(copy2);
+        CHI_IPC->DelTask(copy2);
       }
-      ipc_manager->DelTask(orig2);
+      CHI_IPC->DelTask(orig2);
     }
   }
 
@@ -2881,19 +2881,19 @@ TEST_CASE("Autogen - Admin Container advanced operations", "[autogen][admin][con
     auto task1a = admin_container->NewTask(chimaera::admin::Method::kFlush);
     auto task1b = admin_container->NewTask(chimaera::admin::Method::kFlush);
     if (!task1a.IsNull() && !task1b.IsNull()) {
-      admin_container->Aggregate(chimaera::admin::Method::kFlush, task1a, task1b);
+      task1a.ptr_->Aggregate(task1b.template Cast<chi::Task>());
       INFO("Admin Container Aggregate for Flush completed");
-      ipc_manager->DelTask(task1a);
-      ipc_manager->DelTask(task1b);
+      CHI_IPC->DelTask(task1a);
+      CHI_IPC->DelTask(task1b);
     }
 
     auto task2a = admin_container->NewTask(chimaera::admin::Method::kClientConnect);
     auto task2b = admin_container->NewTask(chimaera::admin::Method::kClientConnect);
     if (!task2a.IsNull() && !task2b.IsNull()) {
-      admin_container->Aggregate(chimaera::admin::Method::kClientConnect, task2a, task2b);
+      task2a.ptr_->Aggregate(task2b.template Cast<chi::Task>());
       INFO("Admin Container Aggregate for ClientConnect completed");
-      ipc_manager->DelTask(task2a);
-      ipc_manager->DelTask(task2b);
+      CHI_IPC->DelTask(task2a);
+      CHI_IPC->DelTask(task2b);
     }
   }
 }
@@ -2913,8 +2913,8 @@ TEST_CASE("Autogen - CTE Comprehensive Copy tests", "[autogen][cte][copy][compre
     if (!task1.IsNull() && !task2.IsNull()) {
       task2->Copy(task1);
       INFO("PollTelemetryLogTask Copy completed");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 
@@ -2924,8 +2924,8 @@ TEST_CASE("Autogen - CTE Comprehensive Copy tests", "[autogen][cte][copy][compre
     if (!task1.IsNull() && !task2.IsNull()) {
       task2->Copy(task1);
       INFO("UnregisterTargetTask Copy completed");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 }
@@ -2946,8 +2946,8 @@ TEST_CASE("Autogen - Bdev Comprehensive Copy and Aggregate", "[autogen][bdev][co
     if (!alloc1.IsNull() && !alloc2.IsNull()) {
       alloc2->Copy(alloc1);
       INFO("AllocateBlocksTask Copy completed");
-      ipc_manager->DelTask(alloc1);
-      ipc_manager->DelTask(alloc2);
+      CHI_IPC->DelTask(alloc1);
+      CHI_IPC->DelTask(alloc2);
     }
   }
 
@@ -2956,10 +2956,10 @@ TEST_CASE("Autogen - Bdev Comprehensive Copy and Aggregate", "[autogen][bdev][co
     auto stats1 = ipc_manager->NewTask<chimaera::bdev::GetStatsTask>();
     auto stats2 = ipc_manager->NewTask<chimaera::bdev::GetStatsTask>();
     if (!stats1.IsNull() && !stats2.IsNull()) {
-      stats1->Aggregate(stats2);
+      stats1->Aggregate(stats2.template Cast<chi::Task>());
       INFO("GetStatsTask Aggregate completed");
-      ipc_manager->DelTask(stats1);
-      ipc_manager->DelTask(stats2);
+      CHI_IPC->DelTask(stats1);
+      CHI_IPC->DelTask(stats2);
     }
   }
 }
@@ -2985,8 +2985,8 @@ TEST_CASE("Autogen - CAE Comprehensive tests", "[autogen][cae][comprehensive]") 
       auto loaded_task = ipc_manager->NewTask<wrp_cae::core::ParseOmniTask>();
       load_archive >> *loaded_task;
       INFO("ParseOmniTask SaveTask/LoadTask with SerializeOut completed");
-      ipc_manager->DelTask(orig_task);
-      ipc_manager->DelTask(loaded_task);
+      CHI_IPC->DelTask(orig_task);
+      CHI_IPC->DelTask(loaded_task);
     }
   }
 
@@ -2994,19 +2994,19 @@ TEST_CASE("Autogen - CAE Comprehensive tests", "[autogen][cae][comprehensive]") 
     auto task1 = ipc_manager->NewTask<wrp_cae::core::ParseOmniTask>();
     auto task2 = ipc_manager->NewTask<wrp_cae::core::ParseOmniTask>();
     if (!task1.IsNull() && !task2.IsNull()) {
-      task1->Aggregate(task2);
+      task1->Aggregate(task2.template Cast<chi::Task>());
       INFO("ParseOmniTask Aggregate completed");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
 
     auto hdf1 = ipc_manager->NewTask<wrp_cae::core::ProcessHdf5DatasetTask>();
     auto hdf2 = ipc_manager->NewTask<wrp_cae::core::ProcessHdf5DatasetTask>();
     if (!hdf1.IsNull() && !hdf2.IsNull()) {
-      hdf1->Aggregate(hdf2);
+      hdf1->Aggregate(hdf2.template Cast<chi::Task>());
       INFO("ProcessHdf5DatasetTask Aggregate completed");
-      ipc_manager->DelTask(hdf1);
-      ipc_manager->DelTask(hdf2);
+      CHI_IPC->DelTask(hdf1);
+      CHI_IPC->DelTask(hdf2);
     }
   }
 }
@@ -3027,8 +3027,8 @@ TEST_CASE("Autogen - Admin Comprehensive Copy and Aggregate", "[autogen][admin][
     if (!batch1.IsNull() && !batch2.IsNull()) {
       batch2->Copy(batch1);
       INFO("SubmitBatchTask Copy completed");
-      ipc_manager->DelTask(batch1);
-      ipc_manager->DelTask(batch2);
+      CHI_IPC->DelTask(batch1);
+      CHI_IPC->DelTask(batch2);
     }
 
     // Copy for SendTask
@@ -3037,8 +3037,8 @@ TEST_CASE("Autogen - Admin Comprehensive Copy and Aggregate", "[autogen][admin][
     if (!send1.IsNull() && !send2.IsNull()) {
       send2->Copy(send1);
       INFO("SendTask Copy completed");
-      ipc_manager->DelTask(send1);
-      ipc_manager->DelTask(send2);
+      CHI_IPC->DelTask(send1);
+      CHI_IPC->DelTask(send2);
     }
 
     // Copy for RecvTask
@@ -3047,8 +3047,8 @@ TEST_CASE("Autogen - Admin Comprehensive Copy and Aggregate", "[autogen][admin][
     if (!recv1.IsNull() && !recv2.IsNull()) {
       recv2->Copy(recv1);
       INFO("RecvTask Copy completed");
-      ipc_manager->DelTask(recv1);
-      ipc_manager->DelTask(recv2);
+      CHI_IPC->DelTask(recv1);
+      CHI_IPC->DelTask(recv2);
     }
 
   }
@@ -3058,30 +3058,30 @@ TEST_CASE("Autogen - Admin Comprehensive Copy and Aggregate", "[autogen][admin][
     auto batch1 = ipc_manager->NewTask<chimaera::admin::SubmitBatchTask>();
     auto batch2 = ipc_manager->NewTask<chimaera::admin::SubmitBatchTask>();
     if (!batch1.IsNull() && !batch2.IsNull()) {
-      batch1->Aggregate(batch2);
+      batch1->Aggregate(batch2.template Cast<chi::Task>());
       INFO("SubmitBatchTask Aggregate completed");
-      ipc_manager->DelTask(batch1);
-      ipc_manager->DelTask(batch2);
+      CHI_IPC->DelTask(batch1);
+      CHI_IPC->DelTask(batch2);
     }
 
     // Aggregate for SendTask
     auto send1 = ipc_manager->NewTask<chimaera::admin::SendTask>();
     auto send2 = ipc_manager->NewTask<chimaera::admin::SendTask>();
     if (!send1.IsNull() && !send2.IsNull()) {
-      send1->Aggregate(send2);
+      send1->Aggregate(send2.template Cast<chi::Task>());
       INFO("SendTask Aggregate completed");
-      ipc_manager->DelTask(send1);
-      ipc_manager->DelTask(send2);
+      CHI_IPC->DelTask(send1);
+      CHI_IPC->DelTask(send2);
     }
 
     // Aggregate for RecvTask
     auto recv1 = ipc_manager->NewTask<chimaera::admin::RecvTask>();
     auto recv2 = ipc_manager->NewTask<chimaera::admin::RecvTask>();
     if (!recv1.IsNull() && !recv2.IsNull()) {
-      recv1->Aggregate(recv2);
+      recv1->Aggregate(recv2.template Cast<chi::Task>());
       INFO("RecvTask Aggregate completed");
-      ipc_manager->DelTask(recv1);
-      ipc_manager->DelTask(recv2);
+      CHI_IPC->DelTask(recv1);
+      CHI_IPC->DelTask(recv2);
     }
   }
 }
@@ -3106,8 +3106,8 @@ TEST_CASE("Autogen - CTE SerializeOut coverage", "[autogen][cte][serializeout]")
       auto loaded = ipc_manager->NewTask<wrp_cte::core::RegisterTargetTask>();
       load_archive >> *loaded;
       INFO("RegisterTargetTask SerializeOut completed");
-      ipc_manager->DelTask(task);
-      ipc_manager->DelTask(loaded);
+      CHI_IPC->DelTask(task);
+      CHI_IPC->DelTask(loaded);
     }
   }
 
@@ -3122,8 +3122,8 @@ TEST_CASE("Autogen - CTE SerializeOut coverage", "[autogen][cte][serializeout]")
       auto loaded = ipc_manager->NewTask<wrp_cte::core::ListTargetsTask>();
       load_archive >> *loaded;
       INFO("ListTargetsTask SerializeOut completed");
-      ipc_manager->DelTask(task);
-      ipc_manager->DelTask(loaded);
+      CHI_IPC->DelTask(task);
+      CHI_IPC->DelTask(loaded);
     }
   }
 
@@ -3138,8 +3138,8 @@ TEST_CASE("Autogen - CTE SerializeOut coverage", "[autogen][cte][serializeout]")
       auto loaded = ipc_manager->NewTask<wrp_cte::core::PutBlobTask>();
       load_archive >> *loaded;
       INFO("PutBlobTask SerializeOut completed");
-      ipc_manager->DelTask(task);
-      ipc_manager->DelTask(loaded);
+      CHI_IPC->DelTask(task);
+      CHI_IPC->DelTask(loaded);
     }
   }
 
@@ -3154,8 +3154,8 @@ TEST_CASE("Autogen - CTE SerializeOut coverage", "[autogen][cte][serializeout]")
       auto loaded = ipc_manager->NewTask<wrp_cte::core::GetBlobTask>();
       load_archive >> *loaded;
       INFO("GetBlobTask SerializeOut completed");
-      ipc_manager->DelTask(task);
-      ipc_manager->DelTask(loaded);
+      CHI_IPC->DelTask(task);
+      CHI_IPC->DelTask(loaded);
     }
   }
 
@@ -3170,8 +3170,8 @@ TEST_CASE("Autogen - CTE SerializeOut coverage", "[autogen][cte][serializeout]")
       auto loaded = ipc_manager->NewTask<wrp_cte::core::DelBlobTask>();
       load_archive >> *loaded;
       INFO("DelBlobTask SerializeOut completed");
-      ipc_manager->DelTask(task);
-      ipc_manager->DelTask(loaded);
+      CHI_IPC->DelTask(task);
+      CHI_IPC->DelTask(loaded);
     }
   }
 
@@ -3186,8 +3186,8 @@ TEST_CASE("Autogen - CTE SerializeOut coverage", "[autogen][cte][serializeout]")
       auto loaded = ipc_manager->NewTask<wrp_cte::core::DelTagTask>();
       load_archive >> *loaded;
       INFO("DelTagTask SerializeOut completed");
-      ipc_manager->DelTask(task);
-      ipc_manager->DelTask(loaded);
+      CHI_IPC->DelTask(task);
+      CHI_IPC->DelTask(loaded);
     }
   }
 
@@ -3202,8 +3202,8 @@ TEST_CASE("Autogen - CTE SerializeOut coverage", "[autogen][cte][serializeout]")
       auto loaded = ipc_manager->NewTask<wrp_cte::core::TagQueryTask>();
       load_archive >> *loaded;
       INFO("TagQueryTask SerializeOut completed");
-      ipc_manager->DelTask(task);
-      ipc_manager->DelTask(loaded);
+      CHI_IPC->DelTask(task);
+      CHI_IPC->DelTask(loaded);
     }
   }
 
@@ -3218,8 +3218,8 @@ TEST_CASE("Autogen - CTE SerializeOut coverage", "[autogen][cte][serializeout]")
       auto loaded = ipc_manager->NewTask<wrp_cte::core::BlobQueryTask>();
       load_archive >> *loaded;
       INFO("BlobQueryTask SerializeOut completed");
-      ipc_manager->DelTask(task);
-      ipc_manager->DelTask(loaded);
+      CHI_IPC->DelTask(task);
+      CHI_IPC->DelTask(loaded);
     }
   }
 }
@@ -3244,8 +3244,8 @@ TEST_CASE("Autogen - Bdev SerializeOut coverage", "[autogen][bdev][serializeout]
       auto loaded = ipc_manager->NewTask<chimaera::bdev::AllocateBlocksTask>();
       load_archive >> *loaded;
       INFO("AllocateBlocksTask SerializeOut completed");
-      ipc_manager->DelTask(task);
-      ipc_manager->DelTask(loaded);
+      CHI_IPC->DelTask(task);
+      CHI_IPC->DelTask(loaded);
     }
   }
 
@@ -3260,8 +3260,8 @@ TEST_CASE("Autogen - Bdev SerializeOut coverage", "[autogen][bdev][serializeout]
       auto loaded = ipc_manager->NewTask<chimaera::bdev::FreeBlocksTask>();
       load_archive >> *loaded;
       INFO("FreeBlocksTask SerializeOut completed");
-      ipc_manager->DelTask(task);
-      ipc_manager->DelTask(loaded);
+      CHI_IPC->DelTask(task);
+      CHI_IPC->DelTask(loaded);
     }
   }
 
@@ -3276,8 +3276,8 @@ TEST_CASE("Autogen - Bdev SerializeOut coverage", "[autogen][bdev][serializeout]
       auto loaded = ipc_manager->NewTask<chimaera::bdev::WriteTask>();
       load_archive >> *loaded;
       INFO("WriteTask SerializeOut completed");
-      ipc_manager->DelTask(task);
-      ipc_manager->DelTask(loaded);
+      CHI_IPC->DelTask(task);
+      CHI_IPC->DelTask(loaded);
     }
   }
 
@@ -3292,8 +3292,8 @@ TEST_CASE("Autogen - Bdev SerializeOut coverage", "[autogen][bdev][serializeout]
       auto loaded = ipc_manager->NewTask<chimaera::bdev::ReadTask>();
       load_archive >> *loaded;
       INFO("ReadTask SerializeOut completed");
-      ipc_manager->DelTask(task);
-      ipc_manager->DelTask(loaded);
+      CHI_IPC->DelTask(task);
+      CHI_IPC->DelTask(loaded);
     }
   }
 
@@ -3308,8 +3308,8 @@ TEST_CASE("Autogen - Bdev SerializeOut coverage", "[autogen][bdev][serializeout]
       auto loaded = ipc_manager->NewTask<chimaera::bdev::GetStatsTask>();
       load_archive >> *loaded;
       INFO("GetStatsTask SerializeOut completed");
-      ipc_manager->DelTask(task);
-      ipc_manager->DelTask(loaded);
+      CHI_IPC->DelTask(task);
+      CHI_IPC->DelTask(loaded);
     }
   }
 }
@@ -3336,8 +3336,8 @@ TEST_CASE("Autogen - Admin SerializeOut coverage", "[autogen][admin][serializeou
           chi::CreateTaskId(), chi::kAdminPoolId, chi::PoolQuery::Local());
       load_archive >> *loaded;
       INFO("FlushTask SerializeOut completed");
-      ipc_manager->DelTask(task);
-      ipc_manager->DelTask(loaded);
+      CHI_IPC->DelTask(task);
+      CHI_IPC->DelTask(loaded);
     }
   }
 
@@ -3354,8 +3354,8 @@ TEST_CASE("Autogen - Admin SerializeOut coverage", "[autogen][admin][serializeou
           chi::CreateTaskId(), chi::kAdminPoolId, chi::PoolQuery::Local(), std::string("status"));
       load_archive >> *loaded;
       INFO("MonitorTask SerializeOut completed");
-      ipc_manager->DelTask(task);
-      ipc_manager->DelTask(loaded);
+      CHI_IPC->DelTask(task);
+      CHI_IPC->DelTask(loaded);
     }
   }
 
@@ -3372,8 +3372,8 @@ TEST_CASE("Autogen - Admin SerializeOut coverage", "[autogen][admin][serializeou
           chi::CreateTaskId(), chi::kAdminPoolId, chi::PoolQuery::Local());
       load_archive >> *loaded;
       INFO("ClientConnectTask SerializeOut completed");
-      ipc_manager->DelTask(task);
-      ipc_manager->DelTask(loaded);
+      CHI_IPC->DelTask(task);
+      CHI_IPC->DelTask(loaded);
     }
   }
 
@@ -3388,8 +3388,8 @@ TEST_CASE("Autogen - Admin SerializeOut coverage", "[autogen][admin][serializeou
       auto loaded = ipc_manager->NewTask<chimaera::admin::CreateTask>();
       load_archive >> *loaded;
       INFO("CreateTask SerializeOut completed");
-      ipc_manager->DelTask(task);
-      ipc_manager->DelTask(loaded);
+      CHI_IPC->DelTask(task);
+      CHI_IPC->DelTask(loaded);
     }
   }
 
@@ -3404,8 +3404,8 @@ TEST_CASE("Autogen - Admin SerializeOut coverage", "[autogen][admin][serializeou
       auto loaded = ipc_manager->NewTask<chimaera::admin::DestroyTask>();
       load_archive >> *loaded;
       INFO("DestroyTask SerializeOut completed");
-      ipc_manager->DelTask(task);
-      ipc_manager->DelTask(loaded);
+      CHI_IPC->DelTask(task);
+      CHI_IPC->DelTask(loaded);
     }
   }
 
@@ -3420,8 +3420,8 @@ TEST_CASE("Autogen - Admin SerializeOut coverage", "[autogen][admin][serializeou
       auto loaded = ipc_manager->NewTask<chimaera::admin::StopRuntimeTask>();
       load_archive >> *loaded;
       INFO("StopRuntimeTask SerializeOut completed");
-      ipc_manager->DelTask(task);
-      ipc_manager->DelTask(loaded);
+      CHI_IPC->DelTask(task);
+      CHI_IPC->DelTask(loaded);
     }
   }
 
@@ -3436,8 +3436,8 @@ TEST_CASE("Autogen - Admin SerializeOut coverage", "[autogen][admin][serializeou
       auto loaded = ipc_manager->NewTask<chimaera::admin::DestroyPoolTask>();
       load_archive >> *loaded;
       INFO("DestroyPoolTask SerializeOut completed");
-      ipc_manager->DelTask(task);
-      ipc_manager->DelTask(loaded);
+      CHI_IPC->DelTask(task);
+      CHI_IPC->DelTask(loaded);
     }
   }
 
@@ -3452,8 +3452,8 @@ TEST_CASE("Autogen - Admin SerializeOut coverage", "[autogen][admin][serializeou
       auto loaded = ipc_manager->NewTask<chimaera::admin::SubmitBatchTask>();
       load_archive >> *loaded;
       INFO("SubmitBatchTask SerializeOut completed");
-      ipc_manager->DelTask(task);
-      ipc_manager->DelTask(loaded);
+      CHI_IPC->DelTask(task);
+      CHI_IPC->DelTask(loaded);
     }
   }
 
@@ -3468,8 +3468,8 @@ TEST_CASE("Autogen - Admin SerializeOut coverage", "[autogen][admin][serializeou
       auto loaded = ipc_manager->NewTask<chimaera::admin::SendTask>();
       load_archive >> *loaded;
       INFO("SendTask SerializeOut completed");
-      ipc_manager->DelTask(task);
-      ipc_manager->DelTask(loaded);
+      CHI_IPC->DelTask(task);
+      CHI_IPC->DelTask(loaded);
     }
   }
 
@@ -3484,8 +3484,8 @@ TEST_CASE("Autogen - Admin SerializeOut coverage", "[autogen][admin][serializeou
       auto loaded = ipc_manager->NewTask<chimaera::admin::RecvTask>();
       load_archive >> *loaded;
       INFO("RecvTask SerializeOut completed");
-      ipc_manager->DelTask(task);
-      ipc_manager->DelTask(loaded);
+      CHI_IPC->DelTask(task);
+      CHI_IPC->DelTask(loaded);
     }
   }
 }
@@ -3510,8 +3510,8 @@ TEST_CASE("Autogen - CAE SerializeOut coverage", "[autogen][cae][serializeout]")
       auto loaded = ipc_manager->NewTask<wrp_cae::core::ProcessHdf5DatasetTask>();
       load_archive >> *loaded;
       INFO("ProcessHdf5DatasetTask SerializeOut completed");
-      ipc_manager->DelTask(task);
-      ipc_manager->DelTask(loaded);
+      CHI_IPC->DelTask(task);
+      CHI_IPC->DelTask(loaded);
     }
   }
 }
@@ -3536,8 +3536,8 @@ TEST_CASE("Autogen - CTE More SerializeOut", "[autogen][cte][serializeout][more]
       auto loaded = ipc_manager->NewTask<wrp_cte::core::UnregisterTargetTask>();
       load_archive >> *loaded;
       INFO("UnregisterTargetTask SerializeOut completed");
-      ipc_manager->DelTask(task);
-      ipc_manager->DelTask(loaded);
+      CHI_IPC->DelTask(task);
+      CHI_IPC->DelTask(loaded);
     }
   }
 
@@ -3552,8 +3552,8 @@ TEST_CASE("Autogen - CTE More SerializeOut", "[autogen][cte][serializeout][more]
       auto loaded = ipc_manager->NewTask<wrp_cte::core::StatTargetsTask>();
       load_archive >> *loaded;
       INFO("StatTargetsTask SerializeOut completed");
-      ipc_manager->DelTask(task);
-      ipc_manager->DelTask(loaded);
+      CHI_IPC->DelTask(task);
+      CHI_IPC->DelTask(loaded);
     }
   }
 
@@ -3568,8 +3568,8 @@ TEST_CASE("Autogen - CTE More SerializeOut", "[autogen][cte][serializeout][more]
       auto loaded = ipc_manager->NewTask<wrp_cte::core::ReorganizeBlobTask>();
       load_archive >> *loaded;
       INFO("ReorganizeBlobTask SerializeOut completed");
-      ipc_manager->DelTask(task);
-      ipc_manager->DelTask(loaded);
+      CHI_IPC->DelTask(task);
+      CHI_IPC->DelTask(loaded);
     }
   }
 
@@ -3584,8 +3584,8 @@ TEST_CASE("Autogen - CTE More SerializeOut", "[autogen][cte][serializeout][more]
       auto loaded = ipc_manager->NewTask<wrp_cte::core::GetTagSizeTask>();
       load_archive >> *loaded;
       INFO("GetTagSizeTask SerializeOut completed");
-      ipc_manager->DelTask(task);
-      ipc_manager->DelTask(loaded);
+      CHI_IPC->DelTask(task);
+      CHI_IPC->DelTask(loaded);
     }
   }
 
@@ -3600,8 +3600,8 @@ TEST_CASE("Autogen - CTE More SerializeOut", "[autogen][cte][serializeout][more]
       auto loaded = ipc_manager->NewTask<wrp_cte::core::PollTelemetryLogTask>();
       load_archive >> *loaded;
       INFO("PollTelemetryLogTask SerializeOut completed");
-      ipc_manager->DelTask(task);
-      ipc_manager->DelTask(loaded);
+      CHI_IPC->DelTask(task);
+      CHI_IPC->DelTask(loaded);
     }
   }
 
@@ -3616,8 +3616,8 @@ TEST_CASE("Autogen - CTE More SerializeOut", "[autogen][cte][serializeout][more]
       auto loaded = ipc_manager->NewTask<wrp_cte::core::GetBlobScoreTask>();
       load_archive >> *loaded;
       INFO("GetBlobScoreTask SerializeOut completed");
-      ipc_manager->DelTask(task);
-      ipc_manager->DelTask(loaded);
+      CHI_IPC->DelTask(task);
+      CHI_IPC->DelTask(loaded);
     }
   }
 
@@ -3632,8 +3632,8 @@ TEST_CASE("Autogen - CTE More SerializeOut", "[autogen][cte][serializeout][more]
       auto loaded = ipc_manager->NewTask<wrp_cte::core::GetBlobSizeTask>();
       load_archive >> *loaded;
       INFO("GetBlobSizeTask SerializeOut completed");
-      ipc_manager->DelTask(task);
-      ipc_manager->DelTask(loaded);
+      CHI_IPC->DelTask(task);
+      CHI_IPC->DelTask(loaded);
     }
   }
 
@@ -3648,8 +3648,8 @@ TEST_CASE("Autogen - CTE More SerializeOut", "[autogen][cte][serializeout][more]
       auto loaded = ipc_manager->NewTask<wrp_cte::core::GetContainedBlobsTask>();
       load_archive >> *loaded;
       INFO("GetContainedBlobsTask SerializeOut completed");
-      ipc_manager->DelTask(task);
-      ipc_manager->DelTask(loaded);
+      CHI_IPC->DelTask(task);
+      CHI_IPC->DelTask(loaded);
     }
   }
 }
@@ -3673,67 +3673,67 @@ TEST_CASE("Autogen - Admin Container DelTask coverage", "[autogen][admin][contai
   SECTION("DelTask for various Admin methods") {
     auto task1 = admin_container->NewTask(chimaera::admin::Method::kFlush);
     if (!task1.IsNull()) {
-      admin_container->DelTask(chimaera::admin::Method::kFlush, task1);
+      CHI_IPC->DelTask(task1);
       INFO("Admin Container DelTask for Flush completed");
     }
 
     auto task2 = admin_container->NewTask(chimaera::admin::Method::kMonitor);
     if (!task2.IsNull()) {
-      admin_container->DelTask(chimaera::admin::Method::kMonitor, task2);
+      CHI_IPC->DelTask(task2);
       INFO("Admin Container DelTask for Monitor completed");
     }
 
     auto task3 = admin_container->NewTask(chimaera::admin::Method::kClientConnect);
     if (!task3.IsNull()) {
-      admin_container->DelTask(chimaera::admin::Method::kClientConnect, task3);
+      CHI_IPC->DelTask(task3);
       INFO("Admin Container DelTask for ClientConnect completed");
     }
 
     auto task4 = admin_container->NewTask(chimaera::admin::Method::kCreate);
     if (!task4.IsNull()) {
-      admin_container->DelTask(chimaera::admin::Method::kCreate, task4);
+      CHI_IPC->DelTask(task4);
       INFO("Admin Container DelTask for Create completed");
     }
 
     auto task5 = admin_container->NewTask(chimaera::admin::Method::kDestroy);
     if (!task5.IsNull()) {
-      admin_container->DelTask(chimaera::admin::Method::kDestroy, task5);
+      CHI_IPC->DelTask(task5);
       INFO("Admin Container DelTask for Destroy completed");
     }
 
     auto task6 = admin_container->NewTask(chimaera::admin::Method::kStopRuntime);
     if (!task6.IsNull()) {
-      admin_container->DelTask(chimaera::admin::Method::kStopRuntime, task6);
+      CHI_IPC->DelTask(task6);
       INFO("Admin Container DelTask for StopRuntime completed");
     }
 
     auto task7 = admin_container->NewTask(chimaera::admin::Method::kDestroyPool);
     if (!task7.IsNull()) {
-      admin_container->DelTask(chimaera::admin::Method::kDestroyPool, task7);
+      CHI_IPC->DelTask(task7);
       INFO("Admin Container DelTask for DestroyPool completed");
     }
 
     auto task8 = admin_container->NewTask(chimaera::admin::Method::kGetOrCreatePool);
     if (!task8.IsNull()) {
-      admin_container->DelTask(chimaera::admin::Method::kGetOrCreatePool, task8);
+      CHI_IPC->DelTask(task8);
       INFO("Admin Container DelTask for GetOrCreatePool completed");
     }
 
     auto task9 = admin_container->NewTask(chimaera::admin::Method::kSubmitBatch);
     if (!task9.IsNull()) {
-      admin_container->DelTask(chimaera::admin::Method::kSubmitBatch, task9);
+      CHI_IPC->DelTask(task9);
       INFO("Admin Container DelTask for SubmitBatch completed");
     }
 
     auto task10 = admin_container->NewTask(chimaera::admin::Method::kSend);
     if (!task10.IsNull()) {
-      admin_container->DelTask(chimaera::admin::Method::kSend, task10);
+      CHI_IPC->DelTask(task10);
       INFO("Admin Container DelTask for Send completed");
     }
 
     auto task11 = admin_container->NewTask(chimaera::admin::Method::kRecv);
     if (!task11.IsNull()) {
-      admin_container->DelTask(chimaera::admin::Method::kRecv, task11);
+      CHI_IPC->DelTask(task11);
       INFO("Admin Container DelTask for Recv completed");
     }
   }
@@ -3755,9 +3755,9 @@ TEST_CASE("Autogen - CTE NewCopyTask comprehensive", "[autogen][cte][newcopytask
       if (!copy.IsNull()) {
         copy->Copy(orig);
         INFO("RegisterTargetTask NewCopyTask completed");
-        ipc_manager->DelTask(copy);
+        CHI_IPC->DelTask(copy);
       }
-      ipc_manager->DelTask(orig);
+      CHI_IPC->DelTask(orig);
     }
   }
 
@@ -3768,9 +3768,9 @@ TEST_CASE("Autogen - CTE NewCopyTask comprehensive", "[autogen][cte][newcopytask
       if (!copy.IsNull()) {
         copy->Copy(orig);
         INFO("ListTargetsTask NewCopyTask completed");
-        ipc_manager->DelTask(copy);
+        CHI_IPC->DelTask(copy);
       }
-      ipc_manager->DelTask(orig);
+      CHI_IPC->DelTask(orig);
     }
   }
 
@@ -3781,9 +3781,9 @@ TEST_CASE("Autogen - CTE NewCopyTask comprehensive", "[autogen][cte][newcopytask
       if (!copy.IsNull()) {
         copy->Copy(orig);
         INFO("PutBlobTask NewCopyTask completed");
-        ipc_manager->DelTask(copy);
+        CHI_IPC->DelTask(copy);
       }
-      ipc_manager->DelTask(orig);
+      CHI_IPC->DelTask(orig);
     }
   }
 
@@ -3794,9 +3794,9 @@ TEST_CASE("Autogen - CTE NewCopyTask comprehensive", "[autogen][cte][newcopytask
       if (!copy.IsNull()) {
         copy->Copy(orig);
         INFO("GetBlobTask NewCopyTask completed");
-        ipc_manager->DelTask(copy);
+        CHI_IPC->DelTask(copy);
       }
-      ipc_manager->DelTask(orig);
+      CHI_IPC->DelTask(orig);
     }
   }
 }
@@ -3816,10 +3816,10 @@ TEST_CASE("Autogen - More Bdev Container coverage", "[autogen][bdev][more]") {
     auto alloc2 = ipc_manager->NewTask<chimaera::bdev::AllocateBlocksTask>();
     if (!alloc1.IsNull() && !alloc2.IsNull()) {
       alloc2->Copy(alloc1);
-      alloc1->Aggregate(alloc2);
+      alloc1->Aggregate(alloc2.template Cast<chi::Task>());
       INFO("AllocateBlocksTask Copy+Aggregate completed");
-      ipc_manager->DelTask(alloc1);
-      ipc_manager->DelTask(alloc2);
+      CHI_IPC->DelTask(alloc1);
+      CHI_IPC->DelTask(alloc2);
     }
 
     // FreeBlocksTask operations
@@ -3827,10 +3827,10 @@ TEST_CASE("Autogen - More Bdev Container coverage", "[autogen][bdev][more]") {
     auto free2 = ipc_manager->NewTask<chimaera::bdev::FreeBlocksTask>();
     if (!free1.IsNull() && !free2.IsNull()) {
       free2->Copy(free1);
-      free1->Aggregate(free2);
+      free1->Aggregate(free2.template Cast<chi::Task>());
       INFO("FreeBlocksTask Copy+Aggregate completed");
-      ipc_manager->DelTask(free1);
-      ipc_manager->DelTask(free2);
+      CHI_IPC->DelTask(free1);
+      CHI_IPC->DelTask(free2);
     }
 
     // WriteTask operations
@@ -3838,10 +3838,10 @@ TEST_CASE("Autogen - More Bdev Container coverage", "[autogen][bdev][more]") {
     auto write2 = ipc_manager->NewTask<chimaera::bdev::WriteTask>();
     if (!write1.IsNull() && !write2.IsNull()) {
       write2->Copy(write1);
-      write1->Aggregate(write2);
+      write1->Aggregate(write2.template Cast<chi::Task>());
       INFO("WriteTask Copy+Aggregate completed");
-      ipc_manager->DelTask(write1);
-      ipc_manager->DelTask(write2);
+      CHI_IPC->DelTask(write1);
+      CHI_IPC->DelTask(write2);
     }
 
     // ReadTask operations
@@ -3849,10 +3849,10 @@ TEST_CASE("Autogen - More Bdev Container coverage", "[autogen][bdev][more]") {
     auto read2 = ipc_manager->NewTask<chimaera::bdev::ReadTask>();
     if (!read1.IsNull() && !read2.IsNull()) {
       read2->Copy(read1);
-      read1->Aggregate(read2);
+      read1->Aggregate(read2.template Cast<chi::Task>());
       INFO("ReadTask Copy+Aggregate completed");
-      ipc_manager->DelTask(read1);
-      ipc_manager->DelTask(read2);
+      CHI_IPC->DelTask(read1);
+      CHI_IPC->DelTask(read2);
     }
 
     // GetStatsTask operations
@@ -3860,10 +3860,10 @@ TEST_CASE("Autogen - More Bdev Container coverage", "[autogen][bdev][more]") {
     auto stats2 = ipc_manager->NewTask<chimaera::bdev::GetStatsTask>();
     if (!stats1.IsNull() && !stats2.IsNull()) {
       stats2->Copy(stats1);
-      stats1->Aggregate(stats2);
+      stats1->Aggregate(stats2.template Cast<chi::Task>());
       INFO("GetStatsTask Copy+Aggregate completed");
-      ipc_manager->DelTask(stats1);
-      ipc_manager->DelTask(stats2);
+      CHI_IPC->DelTask(stats1);
+      CHI_IPC->DelTask(stats2);
     }
   }
 }
@@ -3883,10 +3883,10 @@ TEST_CASE("Autogen - CAE Container operations", "[autogen][cae][container][ops]"
     auto parse2 = ipc_manager->NewTask<wrp_cae::core::ParseOmniTask>();
     if (!parse1.IsNull() && !parse2.IsNull()) {
       parse2->Copy(parse1);
-      parse1->Aggregate(parse2);
+      parse1->Aggregate(parse2.template Cast<chi::Task>());
       INFO("ParseOmniTask Copy+Aggregate completed");
-      ipc_manager->DelTask(parse1);
-      ipc_manager->DelTask(parse2);
+      CHI_IPC->DelTask(parse1);
+      CHI_IPC->DelTask(parse2);
     }
 
     // ProcessHdf5DatasetTask
@@ -3894,10 +3894,10 @@ TEST_CASE("Autogen - CAE Container operations", "[autogen][cae][container][ops]"
     auto hdf2 = ipc_manager->NewTask<wrp_cae::core::ProcessHdf5DatasetTask>();
     if (!hdf1.IsNull() && !hdf2.IsNull()) {
       hdf2->Copy(hdf1);
-      hdf1->Aggregate(hdf2);
+      hdf1->Aggregate(hdf2.template Cast<chi::Task>());
       INFO("ProcessHdf5DatasetTask Copy+Aggregate completed");
-      ipc_manager->DelTask(hdf1);
-      ipc_manager->DelTask(hdf2);
+      CHI_IPC->DelTask(hdf1);
+      CHI_IPC->DelTask(hdf2);
     }
   }
 }
@@ -3916,10 +3916,10 @@ TEST_CASE("Autogen - CTE Remaining tasks Copy and Aggregate", "[autogen][cte][re
     auto task2 = ipc_manager->NewTask<wrp_cte::core::DelBlobTask>();
     if (!task1.IsNull() && !task2.IsNull()) {
       task2->Copy(task1);
-      task1->Aggregate(task2);
+      task1->Aggregate(task2.template Cast<chi::Task>());
       INFO("DelBlobTask Copy+Aggregate completed");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 
@@ -3928,10 +3928,10 @@ TEST_CASE("Autogen - CTE Remaining tasks Copy and Aggregate", "[autogen][cte][re
     auto task2 = ipc_manager->NewTask<wrp_cte::core::DelTagTask>();
     if (!task1.IsNull() && !task2.IsNull()) {
       task2->Copy(task1);
-      task1->Aggregate(task2);
+      task1->Aggregate(task2.template Cast<chi::Task>());
       INFO("DelTagTask Copy+Aggregate completed");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 
@@ -3940,10 +3940,10 @@ TEST_CASE("Autogen - CTE Remaining tasks Copy and Aggregate", "[autogen][cte][re
     auto task2 = ipc_manager->NewTask<wrp_cte::core::GetTagSizeTask>();
     if (!task1.IsNull() && !task2.IsNull()) {
       task2->Copy(task1);
-      task1->Aggregate(task2);
+      task1->Aggregate(task2.template Cast<chi::Task>());
       INFO("GetTagSizeTask Copy+Aggregate completed");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 
@@ -3952,10 +3952,10 @@ TEST_CASE("Autogen - CTE Remaining tasks Copy and Aggregate", "[autogen][cte][re
     auto task2 = ipc_manager->NewTask<wrp_cte::core::PollTelemetryLogTask>();
     if (!task1.IsNull() && !task2.IsNull()) {
       task2->Copy(task1);
-      task1->Aggregate(task2);
+      task1->Aggregate(task2.template Cast<chi::Task>());
       INFO("PollTelemetryLogTask Copy+Aggregate completed");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 
@@ -3964,10 +3964,10 @@ TEST_CASE("Autogen - CTE Remaining tasks Copy and Aggregate", "[autogen][cte][re
     auto task2 = ipc_manager->NewTask<wrp_cte::core::GetBlobScoreTask>();
     if (!task1.IsNull() && !task2.IsNull()) {
       task2->Copy(task1);
-      task1->Aggregate(task2);
+      task1->Aggregate(task2.template Cast<chi::Task>());
       INFO("GetBlobScoreTask Copy+Aggregate completed");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 
@@ -3976,10 +3976,10 @@ TEST_CASE("Autogen - CTE Remaining tasks Copy and Aggregate", "[autogen][cte][re
     auto task2 = ipc_manager->NewTask<wrp_cte::core::GetBlobSizeTask>();
     if (!task1.IsNull() && !task2.IsNull()) {
       task2->Copy(task1);
-      task1->Aggregate(task2);
+      task1->Aggregate(task2.template Cast<chi::Task>());
       INFO("GetBlobSizeTask Copy+Aggregate completed");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 
@@ -3988,10 +3988,10 @@ TEST_CASE("Autogen - CTE Remaining tasks Copy and Aggregate", "[autogen][cte][re
     auto task2 = ipc_manager->NewTask<wrp_cte::core::GetContainedBlobsTask>();
     if (!task1.IsNull() && !task2.IsNull()) {
       task2->Copy(task1);
-      task1->Aggregate(task2);
+      task1->Aggregate(task2.template Cast<chi::Task>());
       INFO("GetContainedBlobsTask Copy+Aggregate completed");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 
@@ -4000,10 +4000,10 @@ TEST_CASE("Autogen - CTE Remaining tasks Copy and Aggregate", "[autogen][cte][re
     auto task2 = ipc_manager->NewTask<wrp_cte::core::TagQueryTask>();
     if (!task1.IsNull() && !task2.IsNull()) {
       task2->Copy(task1);
-      task1->Aggregate(task2);
+      task1->Aggregate(task2.template Cast<chi::Task>());
       INFO("TagQueryTask Copy+Aggregate completed");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 
@@ -4012,10 +4012,10 @@ TEST_CASE("Autogen - CTE Remaining tasks Copy and Aggregate", "[autogen][cte][re
     auto task2 = ipc_manager->NewTask<wrp_cte::core::BlobQueryTask>();
     if (!task1.IsNull() && !task2.IsNull()) {
       task2->Copy(task1);
-      task1->Aggregate(task2);
+      task1->Aggregate(task2.template Cast<chi::Task>());
       INFO("BlobQueryTask Copy+Aggregate completed");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 
@@ -4024,10 +4024,10 @@ TEST_CASE("Autogen - CTE Remaining tasks Copy and Aggregate", "[autogen][cte][re
     auto task2 = ipc_manager->NewTask<wrp_cte::core::ReorganizeBlobTask>();
     if (!task1.IsNull() && !task2.IsNull()) {
       task2->Copy(task1);
-      task1->Aggregate(task2);
+      task1->Aggregate(task2.template Cast<chi::Task>());
       INFO("ReorganizeBlobTask Copy+Aggregate completed");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 
@@ -4036,10 +4036,10 @@ TEST_CASE("Autogen - CTE Remaining tasks Copy and Aggregate", "[autogen][cte][re
     auto task2 = ipc_manager->NewTask<wrp_cte::core::StatTargetsTask>();
     if (!task1.IsNull() && !task2.IsNull()) {
       task2->Copy(task1);
-      task1->Aggregate(task2);
+      task1->Aggregate(task2.template Cast<chi::Task>());
       INFO("StatTargetsTask Copy+Aggregate completed");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 
@@ -4048,10 +4048,10 @@ TEST_CASE("Autogen - CTE Remaining tasks Copy and Aggregate", "[autogen][cte][re
     auto task2 = ipc_manager->NewTask<wrp_cte::core::UnregisterTargetTask>();
     if (!task1.IsNull() && !task2.IsNull()) {
       task2->Copy(task1);
-      task1->Aggregate(task2);
+      task1->Aggregate(task2.template Cast<chi::Task>());
       INFO("UnregisterTargetTask Copy+Aggregate completed");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 }
@@ -4078,9 +4078,9 @@ TEST_CASE("Autogen - Admin NewCopyTask comprehensive", "[autogen][admin][newcopy
       auto copy = admin_container->NewCopyTask(chimaera::admin::Method::kCreate, orig, false);
       if (!copy.IsNull()) {
         INFO("Admin NewCopyTask for Create completed");
-        ipc_manager->DelTask(copy);
+        CHI_IPC->DelTask(copy);
       }
-      ipc_manager->DelTask(orig);
+      CHI_IPC->DelTask(orig);
     }
   }
 
@@ -4090,9 +4090,9 @@ TEST_CASE("Autogen - Admin NewCopyTask comprehensive", "[autogen][admin][newcopy
       auto copy = admin_container->NewCopyTask(chimaera::admin::Method::kDestroy, orig, false);
       if (!copy.IsNull()) {
         INFO("Admin NewCopyTask for Destroy completed");
-        ipc_manager->DelTask(copy);
+        CHI_IPC->DelTask(copy);
       }
-      ipc_manager->DelTask(orig);
+      CHI_IPC->DelTask(orig);
     }
   }
 
@@ -4102,9 +4102,9 @@ TEST_CASE("Autogen - Admin NewCopyTask comprehensive", "[autogen][admin][newcopy
       auto copy = admin_container->NewCopyTask(chimaera::admin::Method::kStopRuntime, orig, false);
       if (!copy.IsNull()) {
         INFO("Admin NewCopyTask for StopRuntime completed");
-        ipc_manager->DelTask(copy);
+        CHI_IPC->DelTask(copy);
       }
-      ipc_manager->DelTask(orig);
+      CHI_IPC->DelTask(orig);
     }
   }
 
@@ -4114,9 +4114,9 @@ TEST_CASE("Autogen - Admin NewCopyTask comprehensive", "[autogen][admin][newcopy
       auto copy = admin_container->NewCopyTask(chimaera::admin::Method::kDestroyPool, orig, false);
       if (!copy.IsNull()) {
         INFO("Admin NewCopyTask for DestroyPool completed");
-        ipc_manager->DelTask(copy);
+        CHI_IPC->DelTask(copy);
       }
-      ipc_manager->DelTask(orig);
+      CHI_IPC->DelTask(orig);
     }
   }
 
@@ -4126,9 +4126,9 @@ TEST_CASE("Autogen - Admin NewCopyTask comprehensive", "[autogen][admin][newcopy
       auto copy = admin_container->NewCopyTask(chimaera::admin::Method::kGetOrCreatePool, orig, false);
       if (!copy.IsNull()) {
         INFO("Admin NewCopyTask for GetOrCreatePool completed");
-        ipc_manager->DelTask(copy);
+        CHI_IPC->DelTask(copy);
       }
-      ipc_manager->DelTask(orig);
+      CHI_IPC->DelTask(orig);
     }
   }
 
@@ -4138,9 +4138,9 @@ TEST_CASE("Autogen - Admin NewCopyTask comprehensive", "[autogen][admin][newcopy
       auto copy = admin_container->NewCopyTask(chimaera::admin::Method::kSubmitBatch, orig, false);
       if (!copy.IsNull()) {
         INFO("Admin NewCopyTask for SubmitBatch completed");
-        ipc_manager->DelTask(copy);
+        CHI_IPC->DelTask(copy);
       }
-      ipc_manager->DelTask(orig);
+      CHI_IPC->DelTask(orig);
     }
   }
 
@@ -4150,9 +4150,9 @@ TEST_CASE("Autogen - Admin NewCopyTask comprehensive", "[autogen][admin][newcopy
       auto copy = admin_container->NewCopyTask(chimaera::admin::Method::kSend, orig, false);
       if (!copy.IsNull()) {
         INFO("Admin NewCopyTask for Send completed");
-        ipc_manager->DelTask(copy);
+        CHI_IPC->DelTask(copy);
       }
-      ipc_manager->DelTask(orig);
+      CHI_IPC->DelTask(orig);
     }
   }
 
@@ -4162,9 +4162,9 @@ TEST_CASE("Autogen - Admin NewCopyTask comprehensive", "[autogen][admin][newcopy
       auto copy = admin_container->NewCopyTask(chimaera::admin::Method::kRecv, orig, false);
       if (!copy.IsNull()) {
         INFO("Admin NewCopyTask for Recv completed");
-        ipc_manager->DelTask(copy);
+        CHI_IPC->DelTask(copy);
       }
-      ipc_manager->DelTask(orig);
+      CHI_IPC->DelTask(orig);
     }
   }
 
@@ -4174,9 +4174,9 @@ TEST_CASE("Autogen - Admin NewCopyTask comprehensive", "[autogen][admin][newcopy
       auto copy = admin_container->NewCopyTask(chimaera::admin::Method::kClientConnect, orig, false);
       if (!copy.IsNull()) {
         INFO("Admin NewCopyTask for ClientConnect completed");
-        ipc_manager->DelTask(copy);
+        CHI_IPC->DelTask(copy);
       }
-      ipc_manager->DelTask(orig);
+      CHI_IPC->DelTask(orig);
     }
   }
 }
@@ -4201,10 +4201,10 @@ TEST_CASE("Autogen - Admin Aggregate comprehensive", "[autogen][admin][aggregate
     auto t1 = admin_container->NewTask(chimaera::admin::Method::kCreate);
     auto t2 = admin_container->NewTask(chimaera::admin::Method::kCreate);
     if (!t1.IsNull() && !t2.IsNull()) {
-      admin_container->Aggregate(chimaera::admin::Method::kCreate, t1, t2);
+      t1.ptr_->Aggregate(t2.template Cast<chi::Task>());
       INFO("Admin Aggregate for Create completed");
-      ipc_manager->DelTask(t1);
-      ipc_manager->DelTask(t2);
+      CHI_IPC->DelTask(t1);
+      CHI_IPC->DelTask(t2);
     }
   }
 
@@ -4212,10 +4212,10 @@ TEST_CASE("Autogen - Admin Aggregate comprehensive", "[autogen][admin][aggregate
     auto t1 = admin_container->NewTask(chimaera::admin::Method::kDestroy);
     auto t2 = admin_container->NewTask(chimaera::admin::Method::kDestroy);
     if (!t1.IsNull() && !t2.IsNull()) {
-      admin_container->Aggregate(chimaera::admin::Method::kDestroy, t1, t2);
+      t1.ptr_->Aggregate(t2.template Cast<chi::Task>());
       INFO("Admin Aggregate for Destroy completed");
-      ipc_manager->DelTask(t1);
-      ipc_manager->DelTask(t2);
+      CHI_IPC->DelTask(t1);
+      CHI_IPC->DelTask(t2);
     }
   }
 
@@ -4223,10 +4223,10 @@ TEST_CASE("Autogen - Admin Aggregate comprehensive", "[autogen][admin][aggregate
     auto t1 = admin_container->NewTask(chimaera::admin::Method::kStopRuntime);
     auto t2 = admin_container->NewTask(chimaera::admin::Method::kStopRuntime);
     if (!t1.IsNull() && !t2.IsNull()) {
-      admin_container->Aggregate(chimaera::admin::Method::kStopRuntime, t1, t2);
+      t1.ptr_->Aggregate(t2.template Cast<chi::Task>());
       INFO("Admin Aggregate for StopRuntime completed");
-      ipc_manager->DelTask(t1);
-      ipc_manager->DelTask(t2);
+      CHI_IPC->DelTask(t1);
+      CHI_IPC->DelTask(t2);
     }
   }
 
@@ -4234,10 +4234,10 @@ TEST_CASE("Autogen - Admin Aggregate comprehensive", "[autogen][admin][aggregate
     auto t1 = admin_container->NewTask(chimaera::admin::Method::kDestroyPool);
     auto t2 = admin_container->NewTask(chimaera::admin::Method::kDestroyPool);
     if (!t1.IsNull() && !t2.IsNull()) {
-      admin_container->Aggregate(chimaera::admin::Method::kDestroyPool, t1, t2);
+      t1.ptr_->Aggregate(t2.template Cast<chi::Task>());
       INFO("Admin Aggregate for DestroyPool completed");
-      ipc_manager->DelTask(t1);
-      ipc_manager->DelTask(t2);
+      CHI_IPC->DelTask(t1);
+      CHI_IPC->DelTask(t2);
     }
   }
 
@@ -4245,10 +4245,10 @@ TEST_CASE("Autogen - Admin Aggregate comprehensive", "[autogen][admin][aggregate
     auto t1 = admin_container->NewTask(chimaera::admin::Method::kGetOrCreatePool);
     auto t2 = admin_container->NewTask(chimaera::admin::Method::kGetOrCreatePool);
     if (!t1.IsNull() && !t2.IsNull()) {
-      admin_container->Aggregate(chimaera::admin::Method::kGetOrCreatePool, t1, t2);
+      t1.ptr_->Aggregate(t2.template Cast<chi::Task>());
       INFO("Admin Aggregate for GetOrCreatePool completed");
-      ipc_manager->DelTask(t1);
-      ipc_manager->DelTask(t2);
+      CHI_IPC->DelTask(t1);
+      CHI_IPC->DelTask(t2);
     }
   }
 
@@ -4256,10 +4256,10 @@ TEST_CASE("Autogen - Admin Aggregate comprehensive", "[autogen][admin][aggregate
     auto t1 = admin_container->NewTask(chimaera::admin::Method::kSubmitBatch);
     auto t2 = admin_container->NewTask(chimaera::admin::Method::kSubmitBatch);
     if (!t1.IsNull() && !t2.IsNull()) {
-      admin_container->Aggregate(chimaera::admin::Method::kSubmitBatch, t1, t2);
+      t1.ptr_->Aggregate(t2.template Cast<chi::Task>());
       INFO("Admin Aggregate for SubmitBatch completed");
-      ipc_manager->DelTask(t1);
-      ipc_manager->DelTask(t2);
+      CHI_IPC->DelTask(t1);
+      CHI_IPC->DelTask(t2);
     }
   }
 
@@ -4267,10 +4267,10 @@ TEST_CASE("Autogen - Admin Aggregate comprehensive", "[autogen][admin][aggregate
     auto t1 = admin_container->NewTask(chimaera::admin::Method::kSend);
     auto t2 = admin_container->NewTask(chimaera::admin::Method::kSend);
     if (!t1.IsNull() && !t2.IsNull()) {
-      admin_container->Aggregate(chimaera::admin::Method::kSend, t1, t2);
+      t1.ptr_->Aggregate(t2.template Cast<chi::Task>());
       INFO("Admin Aggregate for Send completed");
-      ipc_manager->DelTask(t1);
-      ipc_manager->DelTask(t2);
+      CHI_IPC->DelTask(t1);
+      CHI_IPC->DelTask(t2);
     }
   }
 
@@ -4278,10 +4278,10 @@ TEST_CASE("Autogen - Admin Aggregate comprehensive", "[autogen][admin][aggregate
     auto t1 = admin_container->NewTask(chimaera::admin::Method::kRecv);
     auto t2 = admin_container->NewTask(chimaera::admin::Method::kRecv);
     if (!t1.IsNull() && !t2.IsNull()) {
-      admin_container->Aggregate(chimaera::admin::Method::kRecv, t1, t2);
+      t1.ptr_->Aggregate(t2.template Cast<chi::Task>());
       INFO("Admin Aggregate for Recv completed");
-      ipc_manager->DelTask(t1);
-      ipc_manager->DelTask(t2);
+      CHI_IPC->DelTask(t1);
+      CHI_IPC->DelTask(t2);
     }
   }
 
@@ -4289,10 +4289,10 @@ TEST_CASE("Autogen - Admin Aggregate comprehensive", "[autogen][admin][aggregate
     auto t1 = admin_container->NewTask(chimaera::admin::Method::kMonitor);
     auto t2 = admin_container->NewTask(chimaera::admin::Method::kMonitor);
     if (!t1.IsNull() && !t2.IsNull()) {
-      admin_container->Aggregate(chimaera::admin::Method::kMonitor, t1, t2);
+      t1.ptr_->Aggregate(t2.template Cast<chi::Task>());
       INFO("Admin Aggregate for Monitor completed");
-      ipc_manager->DelTask(t1);
-      ipc_manager->DelTask(t2);
+      CHI_IPC->DelTask(t1);
+      CHI_IPC->DelTask(t2);
     }
   }
 }
@@ -4324,9 +4324,9 @@ TEST_CASE("Autogen - Admin SaveTask/LoadTask comprehensive", "[autogen][admin][s
         load_archive.msg_type_ = chi::MsgType::kSerializeIn;
         admin_container->LoadTask(chimaera::admin::Method::kFlush, load_archive, loaded);
         INFO("SaveTask/LoadTask SerializeIn for Flush completed");
-        ipc_manager->DelTask(loaded);
+        CHI_IPC->DelTask(loaded);
       }
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
     }
   }
 
@@ -4341,9 +4341,9 @@ TEST_CASE("Autogen - Admin SaveTask/LoadTask comprehensive", "[autogen][admin][s
         load_archive.msg_type_ = chi::MsgType::kSerializeOut;
         admin_container->LoadTask(chimaera::admin::Method::kFlush, load_archive, loaded);
         INFO("SaveTask/LoadTask SerializeOut for Flush completed");
-        ipc_manager->DelTask(loaded);
+        CHI_IPC->DelTask(loaded);
       }
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
     }
   }
 
@@ -4358,9 +4358,9 @@ TEST_CASE("Autogen - Admin SaveTask/LoadTask comprehensive", "[autogen][admin][s
         load_archive.msg_type_ = chi::MsgType::kSerializeIn;
         admin_container->LoadTask(chimaera::admin::Method::kMonitor, load_archive, loaded);
         INFO("SaveTask/LoadTask SerializeIn for Monitor completed");
-        ipc_manager->DelTask(loaded);
+        CHI_IPC->DelTask(loaded);
       }
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
     }
   }
 
@@ -4375,9 +4375,9 @@ TEST_CASE("Autogen - Admin SaveTask/LoadTask comprehensive", "[autogen][admin][s
         load_archive.msg_type_ = chi::MsgType::kSerializeOut;
         admin_container->LoadTask(chimaera::admin::Method::kMonitor, load_archive, loaded);
         INFO("SaveTask/LoadTask SerializeOut for Monitor completed");
-        ipc_manager->DelTask(loaded);
+        CHI_IPC->DelTask(loaded);
       }
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
     }
   }
 
@@ -4392,9 +4392,9 @@ TEST_CASE("Autogen - Admin SaveTask/LoadTask comprehensive", "[autogen][admin][s
         load_archive.msg_type_ = chi::MsgType::kSerializeIn;
         admin_container->LoadTask(chimaera::admin::Method::kClientConnect, load_archive, loaded);
         INFO("SaveTask/LoadTask SerializeIn for ClientConnect completed");
-        ipc_manager->DelTask(loaded);
+        CHI_IPC->DelTask(loaded);
       }
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
     }
   }
 
@@ -4409,9 +4409,9 @@ TEST_CASE("Autogen - Admin SaveTask/LoadTask comprehensive", "[autogen][admin][s
         load_archive.msg_type_ = chi::MsgType::kSerializeOut;
         admin_container->LoadTask(chimaera::admin::Method::kClientConnect, load_archive, loaded);
         INFO("SaveTask/LoadTask SerializeOut for ClientConnect completed");
-        ipc_manager->DelTask(loaded);
+        CHI_IPC->DelTask(loaded);
       }
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
     }
   }
 }
@@ -4437,8 +4437,8 @@ TEST_CASE("Autogen - CTE All Methods SaveTask/LoadTask", "[autogen][cte][all][sa
       auto loaded_in = ipc_manager->NewTask<wrp_cte::core::RegisterTargetTask>();
       load_in >> *loaded_in;
       INFO("RegisterTargetTask SerializeIn completed");
-      ipc_manager->DelTask(loaded_in);
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(loaded_in);
+      CHI_IPC->DelTask(task);
     }
   }
 
@@ -4452,8 +4452,8 @@ TEST_CASE("Autogen - CTE All Methods SaveTask/LoadTask", "[autogen][cte][all][sa
       auto loaded = ipc_manager->NewTask<wrp_cte::core::UnregisterTargetTask>();
       load_in >> *loaded;
       INFO("UnregisterTargetTask SerializeIn completed");
-      ipc_manager->DelTask(loaded);
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(loaded);
+      CHI_IPC->DelTask(task);
     }
   }
 
@@ -4467,8 +4467,8 @@ TEST_CASE("Autogen - CTE All Methods SaveTask/LoadTask", "[autogen][cte][all][sa
       auto loaded = ipc_manager->NewTask<wrp_cte::core::ListTargetsTask>();
       load_in >> *loaded;
       INFO("ListTargetsTask SerializeIn completed");
-      ipc_manager->DelTask(loaded);
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(loaded);
+      CHI_IPC->DelTask(task);
     }
   }
 
@@ -4482,8 +4482,8 @@ TEST_CASE("Autogen - CTE All Methods SaveTask/LoadTask", "[autogen][cte][all][sa
       auto loaded = ipc_manager->NewTask<wrp_cte::core::StatTargetsTask>();
       load_in >> *loaded;
       INFO("StatTargetsTask SerializeIn completed");
-      ipc_manager->DelTask(loaded);
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(loaded);
+      CHI_IPC->DelTask(task);
     }
   }
 
@@ -4497,8 +4497,8 @@ TEST_CASE("Autogen - CTE All Methods SaveTask/LoadTask", "[autogen][cte][all][sa
       auto loaded = ipc_manager->NewTask<wrp_cte::core::PutBlobTask>();
       load_in >> *loaded;
       INFO("PutBlobTask SerializeIn completed");
-      ipc_manager->DelTask(loaded);
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(loaded);
+      CHI_IPC->DelTask(task);
     }
   }
 
@@ -4512,8 +4512,8 @@ TEST_CASE("Autogen - CTE All Methods SaveTask/LoadTask", "[autogen][cte][all][sa
       auto loaded = ipc_manager->NewTask<wrp_cte::core::GetBlobTask>();
       load_in >> *loaded;
       INFO("GetBlobTask SerializeIn completed");
-      ipc_manager->DelTask(loaded);
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(loaded);
+      CHI_IPC->DelTask(task);
     }
   }
 
@@ -4527,8 +4527,8 @@ TEST_CASE("Autogen - CTE All Methods SaveTask/LoadTask", "[autogen][cte][all][sa
       auto loaded = ipc_manager->NewTask<wrp_cte::core::ReorganizeBlobTask>();
       load_in >> *loaded;
       INFO("ReorganizeBlobTask SerializeIn completed");
-      ipc_manager->DelTask(loaded);
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(loaded);
+      CHI_IPC->DelTask(task);
     }
   }
 
@@ -4542,8 +4542,8 @@ TEST_CASE("Autogen - CTE All Methods SaveTask/LoadTask", "[autogen][cte][all][sa
       auto loaded = ipc_manager->NewTask<wrp_cte::core::DelBlobTask>();
       load_in >> *loaded;
       INFO("DelBlobTask SerializeIn completed");
-      ipc_manager->DelTask(loaded);
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(loaded);
+      CHI_IPC->DelTask(task);
     }
   }
 
@@ -4557,8 +4557,8 @@ TEST_CASE("Autogen - CTE All Methods SaveTask/LoadTask", "[autogen][cte][all][sa
       auto loaded = ipc_manager->NewTask<wrp_cte::core::DelTagTask>();
       load_in >> *loaded;
       INFO("DelTagTask SerializeIn completed");
-      ipc_manager->DelTask(loaded);
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(loaded);
+      CHI_IPC->DelTask(task);
     }
   }
 
@@ -4572,8 +4572,8 @@ TEST_CASE("Autogen - CTE All Methods SaveTask/LoadTask", "[autogen][cte][all][sa
       auto loaded = ipc_manager->NewTask<wrp_cte::core::GetTagSizeTask>();
       load_in >> *loaded;
       INFO("GetTagSizeTask SerializeIn completed");
-      ipc_manager->DelTask(loaded);
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(loaded);
+      CHI_IPC->DelTask(task);
     }
   }
 
@@ -4587,8 +4587,8 @@ TEST_CASE("Autogen - CTE All Methods SaveTask/LoadTask", "[autogen][cte][all][sa
       auto loaded = ipc_manager->NewTask<wrp_cte::core::PollTelemetryLogTask>();
       load_in >> *loaded;
       INFO("PollTelemetryLogTask SerializeIn completed");
-      ipc_manager->DelTask(loaded);
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(loaded);
+      CHI_IPC->DelTask(task);
     }
   }
 
@@ -4602,8 +4602,8 @@ TEST_CASE("Autogen - CTE All Methods SaveTask/LoadTask", "[autogen][cte][all][sa
       auto loaded = ipc_manager->NewTask<wrp_cte::core::GetBlobScoreTask>();
       load_in >> *loaded;
       INFO("GetBlobScoreTask SerializeIn completed");
-      ipc_manager->DelTask(loaded);
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(loaded);
+      CHI_IPC->DelTask(task);
     }
   }
 
@@ -4617,8 +4617,8 @@ TEST_CASE("Autogen - CTE All Methods SaveTask/LoadTask", "[autogen][cte][all][sa
       auto loaded = ipc_manager->NewTask<wrp_cte::core::GetBlobSizeTask>();
       load_in >> *loaded;
       INFO("GetBlobSizeTask SerializeIn completed");
-      ipc_manager->DelTask(loaded);
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(loaded);
+      CHI_IPC->DelTask(task);
     }
   }
 
@@ -4632,8 +4632,8 @@ TEST_CASE("Autogen - CTE All Methods SaveTask/LoadTask", "[autogen][cte][all][sa
       auto loaded = ipc_manager->NewTask<wrp_cte::core::GetContainedBlobsTask>();
       load_in >> *loaded;
       INFO("GetContainedBlobsTask SerializeIn completed");
-      ipc_manager->DelTask(loaded);
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(loaded);
+      CHI_IPC->DelTask(task);
     }
   }
 
@@ -4647,8 +4647,8 @@ TEST_CASE("Autogen - CTE All Methods SaveTask/LoadTask", "[autogen][cte][all][sa
       auto loaded = ipc_manager->NewTask<wrp_cte::core::TagQueryTask>();
       load_in >> *loaded;
       INFO("TagQueryTask SerializeIn completed");
-      ipc_manager->DelTask(loaded);
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(loaded);
+      CHI_IPC->DelTask(task);
     }
   }
 
@@ -4662,8 +4662,8 @@ TEST_CASE("Autogen - CTE All Methods SaveTask/LoadTask", "[autogen][cte][all][sa
       auto loaded = ipc_manager->NewTask<wrp_cte::core::BlobQueryTask>();
       load_in >> *loaded;
       INFO("BlobQueryTask SerializeIn completed");
-      ipc_manager->DelTask(loaded);
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(loaded);
+      CHI_IPC->DelTask(task);
     }
   }
 }
@@ -4693,13 +4693,13 @@ TEST_CASE("Autogen - Bdev All Methods Comprehensive", "[autogen][bdev][all][comp
       auto task2 = ipc_manager->NewTask<chimaera::bdev::AllocateBlocksTask>();
       if (!task2.IsNull()) {
         task2->Copy(task);
-        task->Aggregate(task2);
+        task->Aggregate(task2.template Cast<chi::Task>());
         INFO("AllocateBlocksTask Copy+Aggregate completed");
-        ipc_manager->DelTask(task2);
+        CHI_IPC->DelTask(task2);
       }
 
-      ipc_manager->DelTask(loaded_in);
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(loaded_in);
+      CHI_IPC->DelTask(task);
     }
   }
 
@@ -4717,13 +4717,13 @@ TEST_CASE("Autogen - Bdev All Methods Comprehensive", "[autogen][bdev][all][comp
       auto task2 = ipc_manager->NewTask<chimaera::bdev::FreeBlocksTask>();
       if (!task2.IsNull()) {
         task2->Copy(task);
-        task->Aggregate(task2);
+        task->Aggregate(task2.template Cast<chi::Task>());
         INFO("FreeBlocksTask Copy+Aggregate completed");
-        ipc_manager->DelTask(task2);
+        CHI_IPC->DelTask(task2);
       }
 
-      ipc_manager->DelTask(loaded_in);
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(loaded_in);
+      CHI_IPC->DelTask(task);
     }
   }
 
@@ -4741,13 +4741,13 @@ TEST_CASE("Autogen - Bdev All Methods Comprehensive", "[autogen][bdev][all][comp
       auto task2 = ipc_manager->NewTask<chimaera::bdev::WriteTask>();
       if (!task2.IsNull()) {
         task2->Copy(task);
-        task->Aggregate(task2);
+        task->Aggregate(task2.template Cast<chi::Task>());
         INFO("WriteTask Copy+Aggregate completed");
-        ipc_manager->DelTask(task2);
+        CHI_IPC->DelTask(task2);
       }
 
-      ipc_manager->DelTask(loaded_in);
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(loaded_in);
+      CHI_IPC->DelTask(task);
     }
   }
 
@@ -4765,13 +4765,13 @@ TEST_CASE("Autogen - Bdev All Methods Comprehensive", "[autogen][bdev][all][comp
       auto task2 = ipc_manager->NewTask<chimaera::bdev::ReadTask>();
       if (!task2.IsNull()) {
         task2->Copy(task);
-        task->Aggregate(task2);
+        task->Aggregate(task2.template Cast<chi::Task>());
         INFO("ReadTask Copy+Aggregate completed");
-        ipc_manager->DelTask(task2);
+        CHI_IPC->DelTask(task2);
       }
 
-      ipc_manager->DelTask(loaded_in);
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(loaded_in);
+      CHI_IPC->DelTask(task);
     }
   }
 
@@ -4789,13 +4789,13 @@ TEST_CASE("Autogen - Bdev All Methods Comprehensive", "[autogen][bdev][all][comp
       auto task2 = ipc_manager->NewTask<chimaera::bdev::GetStatsTask>();
       if (!task2.IsNull()) {
         task2->Copy(task);
-        task->Aggregate(task2);
+        task->Aggregate(task2.template Cast<chi::Task>());
         INFO("GetStatsTask Copy+Aggregate completed");
-        ipc_manager->DelTask(task2);
+        CHI_IPC->DelTask(task2);
       }
 
-      ipc_manager->DelTask(loaded_in);
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(loaded_in);
+      CHI_IPC->DelTask(task);
     }
   }
 }
@@ -4822,12 +4822,12 @@ TEST_CASE("Autogen - Admin All Methods Comprehensive", "[autogen][admin][all][co
       auto task2 = ipc_manager->NewTask<chimaera::admin::CreateTask>();
       if (!task2.IsNull()) {
         task2->Copy(task);
-        task->Aggregate(task2);
-        ipc_manager->DelTask(task2);
+        task->Aggregate(task2.template Cast<chi::Task>());
+        CHI_IPC->DelTask(task2);
       }
       INFO("CreateTask full coverage completed");
-      ipc_manager->DelTask(loaded_in);
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(loaded_in);
+      CHI_IPC->DelTask(task);
     }
   }
 
@@ -4844,12 +4844,12 @@ TEST_CASE("Autogen - Admin All Methods Comprehensive", "[autogen][admin][all][co
       auto task2 = ipc_manager->NewTask<chimaera::admin::DestroyTask>();
       if (!task2.IsNull()) {
         task2->Copy(task);
-        task->Aggregate(task2);
-        ipc_manager->DelTask(task2);
+        task->Aggregate(task2.template Cast<chi::Task>());
+        CHI_IPC->DelTask(task2);
       }
       INFO("DestroyTask full coverage completed");
-      ipc_manager->DelTask(loaded_in);
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(loaded_in);
+      CHI_IPC->DelTask(task);
     }
   }
 
@@ -4866,12 +4866,12 @@ TEST_CASE("Autogen - Admin All Methods Comprehensive", "[autogen][admin][all][co
       auto task2 = ipc_manager->NewTask<chimaera::admin::StopRuntimeTask>();
       if (!task2.IsNull()) {
         task2->Copy(task);
-        task->Aggregate(task2);
-        ipc_manager->DelTask(task2);
+        task->Aggregate(task2.template Cast<chi::Task>());
+        CHI_IPC->DelTask(task2);
       }
       INFO("StopRuntimeTask full coverage completed");
-      ipc_manager->DelTask(loaded_in);
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(loaded_in);
+      CHI_IPC->DelTask(task);
     }
   }
 
@@ -4888,12 +4888,12 @@ TEST_CASE("Autogen - Admin All Methods Comprehensive", "[autogen][admin][all][co
       auto task2 = ipc_manager->NewTask<chimaera::admin::DestroyPoolTask>();
       if (!task2.IsNull()) {
         task2->Copy(task);
-        task->Aggregate(task2);
-        ipc_manager->DelTask(task2);
+        task->Aggregate(task2.template Cast<chi::Task>());
+        CHI_IPC->DelTask(task2);
       }
       INFO("DestroyPoolTask full coverage completed");
-      ipc_manager->DelTask(loaded_in);
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(loaded_in);
+      CHI_IPC->DelTask(task);
     }
   }
 
@@ -4910,12 +4910,12 @@ TEST_CASE("Autogen - Admin All Methods Comprehensive", "[autogen][admin][all][co
       auto task2 = ipc_manager->NewTask<chimaera::admin::SubmitBatchTask>();
       if (!task2.IsNull()) {
         task2->Copy(task);
-        task->Aggregate(task2);
-        ipc_manager->DelTask(task2);
+        task->Aggregate(task2.template Cast<chi::Task>());
+        CHI_IPC->DelTask(task2);
       }
       INFO("SubmitBatchTask full coverage completed");
-      ipc_manager->DelTask(loaded_in);
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(loaded_in);
+      CHI_IPC->DelTask(task);
     }
   }
 
@@ -4932,12 +4932,12 @@ TEST_CASE("Autogen - Admin All Methods Comprehensive", "[autogen][admin][all][co
       auto task2 = ipc_manager->NewTask<chimaera::admin::SendTask>();
       if (!task2.IsNull()) {
         task2->Copy(task);
-        task->Aggregate(task2);
-        ipc_manager->DelTask(task2);
+        task->Aggregate(task2.template Cast<chi::Task>());
+        CHI_IPC->DelTask(task2);
       }
       INFO("SendTask full coverage completed");
-      ipc_manager->DelTask(loaded_in);
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(loaded_in);
+      CHI_IPC->DelTask(task);
     }
   }
 
@@ -4954,12 +4954,12 @@ TEST_CASE("Autogen - Admin All Methods Comprehensive", "[autogen][admin][all][co
       auto task2 = ipc_manager->NewTask<chimaera::admin::RecvTask>();
       if (!task2.IsNull()) {
         task2->Copy(task);
-        task->Aggregate(task2);
-        ipc_manager->DelTask(task2);
+        task->Aggregate(task2.template Cast<chi::Task>());
+        CHI_IPC->DelTask(task2);
       }
       INFO("RecvTask full coverage completed");
-      ipc_manager->DelTask(loaded_in);
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(loaded_in);
+      CHI_IPC->DelTask(task);
     }
   }
 
@@ -4979,12 +4979,12 @@ TEST_CASE("Autogen - Admin All Methods Comprehensive", "[autogen][admin][all][co
           chi::CreateTaskId(), chi::kAdminPoolId, chi::PoolQuery::Local());
       if (!task2.IsNull()) {
         task2->Copy(task);
-        task->Aggregate(task2);
-        ipc_manager->DelTask(task2);
+        task->Aggregate(task2.template Cast<chi::Task>());
+        CHI_IPC->DelTask(task2);
       }
       INFO("FlushTask full coverage completed");
-      ipc_manager->DelTask(loaded_in);
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(loaded_in);
+      CHI_IPC->DelTask(task);
     }
   }
 
@@ -5004,12 +5004,12 @@ TEST_CASE("Autogen - Admin All Methods Comprehensive", "[autogen][admin][all][co
           chi::CreateTaskId(), chi::kAdminPoolId, chi::PoolQuery::Local(), std::string("status"));
       if (!task2.IsNull()) {
         task2->Copy(task);
-        task->Aggregate(task2);
-        ipc_manager->DelTask(task2);
+        task->Aggregate(task2.template Cast<chi::Task>());
+        CHI_IPC->DelTask(task2);
       }
       INFO("MonitorTask full coverage completed");
-      ipc_manager->DelTask(loaded_in);
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(loaded_in);
+      CHI_IPC->DelTask(task);
     }
   }
 
@@ -5029,12 +5029,12 @@ TEST_CASE("Autogen - Admin All Methods Comprehensive", "[autogen][admin][all][co
           chi::CreateTaskId(), chi::kAdminPoolId, chi::PoolQuery::Local());
       if (!task2.IsNull()) {
         task2->Copy(task);
-        task->Aggregate(task2);
-        ipc_manager->DelTask(task2);
+        task->Aggregate(task2.template Cast<chi::Task>());
+        CHI_IPC->DelTask(task2);
       }
       INFO("ClientConnectTask full coverage completed");
-      ipc_manager->DelTask(loaded_in);
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(loaded_in);
+      CHI_IPC->DelTask(task);
     }
   }
 }
@@ -5073,14 +5073,14 @@ TEST_CASE("Autogen - CAE All Methods Comprehensive", "[autogen][cae][all][compre
       auto task2 = ipc_manager->NewTask<wrp_cae::core::ParseOmniTask>();
       if (!task2.IsNull()) {
         task2->Copy(task);
-        task->Aggregate(task2);
+        task->Aggregate(task2.template Cast<chi::Task>());
         INFO("ParseOmniTask Copy+Aggregate completed");
-        ipc_manager->DelTask(task2);
+        CHI_IPC->DelTask(task2);
       }
 
-      ipc_manager->DelTask(loaded_in);
-      ipc_manager->DelTask(loaded_out);
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(loaded_in);
+      CHI_IPC->DelTask(loaded_out);
+      CHI_IPC->DelTask(task);
     }
   }
 
@@ -5109,14 +5109,14 @@ TEST_CASE("Autogen - CAE All Methods Comprehensive", "[autogen][cae][all][compre
       auto task2 = ipc_manager->NewTask<wrp_cae::core::ProcessHdf5DatasetTask>();
       if (!task2.IsNull()) {
         task2->Copy(task);
-        task->Aggregate(task2);
+        task->Aggregate(task2.template Cast<chi::Task>());
         INFO("ProcessHdf5DatasetTask Copy+Aggregate completed");
-        ipc_manager->DelTask(task2);
+        CHI_IPC->DelTask(task2);
       }
 
-      ipc_manager->DelTask(loaded_in);
-      ipc_manager->DelTask(loaded_out);
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(loaded_in);
+      CHI_IPC->DelTask(loaded_out);
+      CHI_IPC->DelTask(task);
     }
   }
 }
@@ -5150,12 +5150,12 @@ TEST_CASE("Autogen - CTE Full Coverage Per Task", "[autogen][cte][full]") {
       lo >> *l2;
       // Copy and Aggregate
       t2->Copy(t1);
-      t1->Aggregate(t2);
+      t1->Aggregate(t2.template Cast<chi::Task>());
       INFO("RegisterTargetTask full completed");
-      ipc_manager->DelTask(l1);
-      ipc_manager->DelTask(l2);
-      ipc_manager->DelTask(t1);
-      ipc_manager->DelTask(t2);
+      CHI_IPC->DelTask(l1);
+      CHI_IPC->DelTask(l2);
+      CHI_IPC->DelTask(t1);
+      CHI_IPC->DelTask(t2);
     }
   }
 
@@ -5176,12 +5176,12 @@ TEST_CASE("Autogen - CTE Full Coverage Per Task", "[autogen][cte][full]") {
       auto l2 = ipc_manager->NewTask<wrp_cte::core::UnregisterTargetTask>();
       lo >> *l2;
       t2->Copy(t1);
-      t1->Aggregate(t2);
+      t1->Aggregate(t2.template Cast<chi::Task>());
       INFO("UnregisterTargetTask full completed");
-      ipc_manager->DelTask(l1);
-      ipc_manager->DelTask(l2);
-      ipc_manager->DelTask(t1);
-      ipc_manager->DelTask(t2);
+      CHI_IPC->DelTask(l1);
+      CHI_IPC->DelTask(l2);
+      CHI_IPC->DelTask(t1);
+      CHI_IPC->DelTask(t2);
     }
   }
 
@@ -5202,12 +5202,12 @@ TEST_CASE("Autogen - CTE Full Coverage Per Task", "[autogen][cte][full]") {
       auto l2 = ipc_manager->NewTask<wrp_cte::core::ListTargetsTask>();
       lo >> *l2;
       t2->Copy(t1);
-      t1->Aggregate(t2);
+      t1->Aggregate(t2.template Cast<chi::Task>());
       INFO("ListTargetsTask full completed");
-      ipc_manager->DelTask(l1);
-      ipc_manager->DelTask(l2);
-      ipc_manager->DelTask(t1);
-      ipc_manager->DelTask(t2);
+      CHI_IPC->DelTask(l1);
+      CHI_IPC->DelTask(l2);
+      CHI_IPC->DelTask(t1);
+      CHI_IPC->DelTask(t2);
     }
   }
 
@@ -5228,12 +5228,12 @@ TEST_CASE("Autogen - CTE Full Coverage Per Task", "[autogen][cte][full]") {
       auto l2 = ipc_manager->NewTask<wrp_cte::core::StatTargetsTask>();
       lo >> *l2;
       t2->Copy(t1);
-      t1->Aggregate(t2);
+      t1->Aggregate(t2.template Cast<chi::Task>());
       INFO("StatTargetsTask full completed");
-      ipc_manager->DelTask(l1);
-      ipc_manager->DelTask(l2);
-      ipc_manager->DelTask(t1);
-      ipc_manager->DelTask(t2);
+      CHI_IPC->DelTask(l1);
+      CHI_IPC->DelTask(l2);
+      CHI_IPC->DelTask(t1);
+      CHI_IPC->DelTask(t2);
     }
   }
 
@@ -5254,12 +5254,12 @@ TEST_CASE("Autogen - CTE Full Coverage Per Task", "[autogen][cte][full]") {
       auto l2 = ipc_manager->NewTask<wrp_cte::core::PutBlobTask>();
       lo >> *l2;
       t2->Copy(t1);
-      t1->Aggregate(t2);
+      t1->Aggregate(t2.template Cast<chi::Task>());
       INFO("PutBlobTask full completed");
-      ipc_manager->DelTask(l1);
-      ipc_manager->DelTask(l2);
-      ipc_manager->DelTask(t1);
-      ipc_manager->DelTask(t2);
+      CHI_IPC->DelTask(l1);
+      CHI_IPC->DelTask(l2);
+      CHI_IPC->DelTask(t1);
+      CHI_IPC->DelTask(t2);
     }
   }
 
@@ -5280,12 +5280,12 @@ TEST_CASE("Autogen - CTE Full Coverage Per Task", "[autogen][cte][full]") {
       auto l2 = ipc_manager->NewTask<wrp_cte::core::GetBlobTask>();
       lo >> *l2;
       t2->Copy(t1);
-      t1->Aggregate(t2);
+      t1->Aggregate(t2.template Cast<chi::Task>());
       INFO("GetBlobTask full completed");
-      ipc_manager->DelTask(l1);
-      ipc_manager->DelTask(l2);
-      ipc_manager->DelTask(t1);
-      ipc_manager->DelTask(t2);
+      CHI_IPC->DelTask(l1);
+      CHI_IPC->DelTask(l2);
+      CHI_IPC->DelTask(t1);
+      CHI_IPC->DelTask(t2);
     }
   }
 
@@ -5306,12 +5306,12 @@ TEST_CASE("Autogen - CTE Full Coverage Per Task", "[autogen][cte][full]") {
       auto l2 = ipc_manager->NewTask<wrp_cte::core::ReorganizeBlobTask>();
       lo >> *l2;
       t2->Copy(t1);
-      t1->Aggregate(t2);
+      t1->Aggregate(t2.template Cast<chi::Task>());
       INFO("ReorganizeBlobTask full completed");
-      ipc_manager->DelTask(l1);
-      ipc_manager->DelTask(l2);
-      ipc_manager->DelTask(t1);
-      ipc_manager->DelTask(t2);
+      CHI_IPC->DelTask(l1);
+      CHI_IPC->DelTask(l2);
+      CHI_IPC->DelTask(t1);
+      CHI_IPC->DelTask(t2);
     }
   }
 
@@ -5332,12 +5332,12 @@ TEST_CASE("Autogen - CTE Full Coverage Per Task", "[autogen][cte][full]") {
       auto l2 = ipc_manager->NewTask<wrp_cte::core::DelBlobTask>();
       lo >> *l2;
       t2->Copy(t1);
-      t1->Aggregate(t2);
+      t1->Aggregate(t2.template Cast<chi::Task>());
       INFO("DelBlobTask full completed");
-      ipc_manager->DelTask(l1);
-      ipc_manager->DelTask(l2);
-      ipc_manager->DelTask(t1);
-      ipc_manager->DelTask(t2);
+      CHI_IPC->DelTask(l1);
+      CHI_IPC->DelTask(l2);
+      CHI_IPC->DelTask(t1);
+      CHI_IPC->DelTask(t2);
     }
   }
 
@@ -5358,12 +5358,12 @@ TEST_CASE("Autogen - CTE Full Coverage Per Task", "[autogen][cte][full]") {
       auto l2 = ipc_manager->NewTask<wrp_cte::core::DelTagTask>();
       lo >> *l2;
       t2->Copy(t1);
-      t1->Aggregate(t2);
+      t1->Aggregate(t2.template Cast<chi::Task>());
       INFO("DelTagTask full completed");
-      ipc_manager->DelTask(l1);
-      ipc_manager->DelTask(l2);
-      ipc_manager->DelTask(t1);
-      ipc_manager->DelTask(t2);
+      CHI_IPC->DelTask(l1);
+      CHI_IPC->DelTask(l2);
+      CHI_IPC->DelTask(t1);
+      CHI_IPC->DelTask(t2);
     }
   }
 
@@ -5384,12 +5384,12 @@ TEST_CASE("Autogen - CTE Full Coverage Per Task", "[autogen][cte][full]") {
       auto l2 = ipc_manager->NewTask<wrp_cte::core::GetTagSizeTask>();
       lo >> *l2;
       t2->Copy(t1);
-      t1->Aggregate(t2);
+      t1->Aggregate(t2.template Cast<chi::Task>());
       INFO("GetTagSizeTask full completed");
-      ipc_manager->DelTask(l1);
-      ipc_manager->DelTask(l2);
-      ipc_manager->DelTask(t1);
-      ipc_manager->DelTask(t2);
+      CHI_IPC->DelTask(l1);
+      CHI_IPC->DelTask(l2);
+      CHI_IPC->DelTask(t1);
+      CHI_IPC->DelTask(t2);
     }
   }
 
@@ -5410,12 +5410,12 @@ TEST_CASE("Autogen - CTE Full Coverage Per Task", "[autogen][cte][full]") {
       auto l2 = ipc_manager->NewTask<wrp_cte::core::PollTelemetryLogTask>();
       lo >> *l2;
       t2->Copy(t1);
-      t1->Aggregate(t2);
+      t1->Aggregate(t2.template Cast<chi::Task>());
       INFO("PollTelemetryLogTask full completed");
-      ipc_manager->DelTask(l1);
-      ipc_manager->DelTask(l2);
-      ipc_manager->DelTask(t1);
-      ipc_manager->DelTask(t2);
+      CHI_IPC->DelTask(l1);
+      CHI_IPC->DelTask(l2);
+      CHI_IPC->DelTask(t1);
+      CHI_IPC->DelTask(t2);
     }
   }
 
@@ -5436,12 +5436,12 @@ TEST_CASE("Autogen - CTE Full Coverage Per Task", "[autogen][cte][full]") {
       auto l2 = ipc_manager->NewTask<wrp_cte::core::GetBlobScoreTask>();
       lo >> *l2;
       t2->Copy(t1);
-      t1->Aggregate(t2);
+      t1->Aggregate(t2.template Cast<chi::Task>());
       INFO("GetBlobScoreTask full completed");
-      ipc_manager->DelTask(l1);
-      ipc_manager->DelTask(l2);
-      ipc_manager->DelTask(t1);
-      ipc_manager->DelTask(t2);
+      CHI_IPC->DelTask(l1);
+      CHI_IPC->DelTask(l2);
+      CHI_IPC->DelTask(t1);
+      CHI_IPC->DelTask(t2);
     }
   }
 
@@ -5462,12 +5462,12 @@ TEST_CASE("Autogen - CTE Full Coverage Per Task", "[autogen][cte][full]") {
       auto l2 = ipc_manager->NewTask<wrp_cte::core::GetBlobSizeTask>();
       lo >> *l2;
       t2->Copy(t1);
-      t1->Aggregate(t2);
+      t1->Aggregate(t2.template Cast<chi::Task>());
       INFO("GetBlobSizeTask full completed");
-      ipc_manager->DelTask(l1);
-      ipc_manager->DelTask(l2);
-      ipc_manager->DelTask(t1);
-      ipc_manager->DelTask(t2);
+      CHI_IPC->DelTask(l1);
+      CHI_IPC->DelTask(l2);
+      CHI_IPC->DelTask(t1);
+      CHI_IPC->DelTask(t2);
     }
   }
 
@@ -5488,12 +5488,12 @@ TEST_CASE("Autogen - CTE Full Coverage Per Task", "[autogen][cte][full]") {
       auto l2 = ipc_manager->NewTask<wrp_cte::core::GetContainedBlobsTask>();
       lo >> *l2;
       t2->Copy(t1);
-      t1->Aggregate(t2);
+      t1->Aggregate(t2.template Cast<chi::Task>());
       INFO("GetContainedBlobsTask full completed");
-      ipc_manager->DelTask(l1);
-      ipc_manager->DelTask(l2);
-      ipc_manager->DelTask(t1);
-      ipc_manager->DelTask(t2);
+      CHI_IPC->DelTask(l1);
+      CHI_IPC->DelTask(l2);
+      CHI_IPC->DelTask(t1);
+      CHI_IPC->DelTask(t2);
     }
   }
 
@@ -5514,12 +5514,12 @@ TEST_CASE("Autogen - CTE Full Coverage Per Task", "[autogen][cte][full]") {
       auto l2 = ipc_manager->NewTask<wrp_cte::core::TagQueryTask>();
       lo >> *l2;
       t2->Copy(t1);
-      t1->Aggregate(t2);
+      t1->Aggregate(t2.template Cast<chi::Task>());
       INFO("TagQueryTask full completed");
-      ipc_manager->DelTask(l1);
-      ipc_manager->DelTask(l2);
-      ipc_manager->DelTask(t1);
-      ipc_manager->DelTask(t2);
+      CHI_IPC->DelTask(l1);
+      CHI_IPC->DelTask(l2);
+      CHI_IPC->DelTask(t1);
+      CHI_IPC->DelTask(t2);
     }
   }
 
@@ -5540,12 +5540,12 @@ TEST_CASE("Autogen - CTE Full Coverage Per Task", "[autogen][cte][full]") {
       auto l2 = ipc_manager->NewTask<wrp_cte::core::BlobQueryTask>();
       lo >> *l2;
       t2->Copy(t1);
-      t1->Aggregate(t2);
+      t1->Aggregate(t2.template Cast<chi::Task>());
       INFO("BlobQueryTask full completed");
-      ipc_manager->DelTask(l1);
-      ipc_manager->DelTask(l2);
-      ipc_manager->DelTask(t1);
-      ipc_manager->DelTask(t2);
+      CHI_IPC->DelTask(l1);
+      CHI_IPC->DelTask(l2);
+      CHI_IPC->DelTask(t1);
+      CHI_IPC->DelTask(t2);
     }
   }
 }
@@ -5592,26 +5592,26 @@ TEST_CASE("Autogen - CTE Runtime Container Methods", "[autogen][cte][runtime]") 
     INFO("CTE Runtime::NewTask tests completed");
 
     // Cleanup with DelTask through Runtime
-    if (!task_create.IsNull()) cte_runtime.DelTask(wrp_cte::core::Method::kCreate, task_create);
-    if (!task_destroy.IsNull()) cte_runtime.DelTask(wrp_cte::core::Method::kDestroy, task_destroy);
-    if (!task_register.IsNull()) cte_runtime.DelTask(wrp_cte::core::Method::kRegisterTarget, task_register);
-    if (!task_unregister.IsNull()) cte_runtime.DelTask(wrp_cte::core::Method::kUnregisterTarget, task_unregister);
-    if (!task_list.IsNull()) cte_runtime.DelTask(wrp_cte::core::Method::kListTargets, task_list);
-    if (!task_stat.IsNull()) cte_runtime.DelTask(wrp_cte::core::Method::kStatTargets, task_stat);
-    if (!task_tag.IsNull()) cte_runtime.DelTask(wrp_cte::core::Method::kGetOrCreateTag, task_tag);
-    if (!task_put.IsNull()) cte_runtime.DelTask(wrp_cte::core::Method::kPutBlob, task_put);
-    if (!task_get.IsNull()) cte_runtime.DelTask(wrp_cte::core::Method::kGetBlob, task_get);
-    if (!task_reorg.IsNull()) cte_runtime.DelTask(wrp_cte::core::Method::kReorganizeBlob, task_reorg);
-    if (!task_delblob.IsNull()) cte_runtime.DelTask(wrp_cte::core::Method::kDelBlob, task_delblob);
-    if (!task_deltag.IsNull()) cte_runtime.DelTask(wrp_cte::core::Method::kDelTag, task_deltag);
-    if (!task_tagsize.IsNull()) cte_runtime.DelTask(wrp_cte::core::Method::kGetTagSize, task_tagsize);
-    if (!task_telem.IsNull()) cte_runtime.DelTask(wrp_cte::core::Method::kPollTelemetryLog, task_telem);
-    if (!task_score.IsNull()) cte_runtime.DelTask(wrp_cte::core::Method::kGetBlobScore, task_score);
-    if (!task_blobsize.IsNull()) cte_runtime.DelTask(wrp_cte::core::Method::kGetBlobSize, task_blobsize);
-    if (!task_contained.IsNull()) cte_runtime.DelTask(wrp_cte::core::Method::kGetContainedBlobs, task_contained);
-    if (!task_tagquery.IsNull()) cte_runtime.DelTask(wrp_cte::core::Method::kTagQuery, task_tagquery);
-    if (!task_blobquery.IsNull()) cte_runtime.DelTask(wrp_cte::core::Method::kBlobQuery, task_blobquery);
-    if (!task_unknown.IsNull()) cte_runtime.DelTask(9999, task_unknown);
+    if (!task_create.IsNull()) CHI_IPC->DelTask(task_create);
+    if (!task_destroy.IsNull()) CHI_IPC->DelTask(task_destroy);
+    if (!task_register.IsNull()) CHI_IPC->DelTask(task_register);
+    if (!task_unregister.IsNull()) CHI_IPC->DelTask(task_unregister);
+    if (!task_list.IsNull()) CHI_IPC->DelTask(task_list);
+    if (!task_stat.IsNull()) CHI_IPC->DelTask(task_stat);
+    if (!task_tag.IsNull()) CHI_IPC->DelTask(task_tag);
+    if (!task_put.IsNull()) CHI_IPC->DelTask(task_put);
+    if (!task_get.IsNull()) CHI_IPC->DelTask(task_get);
+    if (!task_reorg.IsNull()) CHI_IPC->DelTask(task_reorg);
+    if (!task_delblob.IsNull()) CHI_IPC->DelTask(task_delblob);
+    if (!task_deltag.IsNull()) CHI_IPC->DelTask(task_deltag);
+    if (!task_tagsize.IsNull()) CHI_IPC->DelTask(task_tagsize);
+    if (!task_telem.IsNull()) CHI_IPC->DelTask(task_telem);
+    if (!task_score.IsNull()) CHI_IPC->DelTask(task_score);
+    if (!task_blobsize.IsNull()) CHI_IPC->DelTask(task_blobsize);
+    if (!task_contained.IsNull()) CHI_IPC->DelTask(task_contained);
+    if (!task_tagquery.IsNull()) CHI_IPC->DelTask(task_tagquery);
+    if (!task_blobquery.IsNull()) CHI_IPC->DelTask(task_blobquery);
+    if (!task_unknown.IsNull()) CHI_IPC->DelTask(task_unknown);
   }
 
   SECTION("CTE Runtime SaveTask/LoadTask all methods") {
@@ -5628,8 +5628,8 @@ TEST_CASE("Autogen - CTE Runtime Container Methods", "[autogen][cte][runtime]") 
       auto loaded = ipc_manager->NewTask<wrp_cte::core::CreateTask>();
       hipc::FullPtr<chi::Task> loaded_ptr = loaded.template Cast<chi::Task>();
       cte_runtime.LoadTask(wrp_cte::core::Method::kCreate, load_archive, loaded_ptr);
-      ipc_manager->DelTask(task);
-      ipc_manager->DelTask(loaded);
+      CHI_IPC->DelTask(task);
+      CHI_IPC->DelTask(loaded);
     }
 
     // Test SaveTask and LoadTask for DestroyTask
@@ -5643,8 +5643,8 @@ TEST_CASE("Autogen - CTE Runtime Container Methods", "[autogen][cte][runtime]") 
       auto loaded = ipc_manager->NewTask<wrp_cte::core::DestroyTask>();
       hipc::FullPtr<chi::Task> loaded_ptr = loaded.template Cast<chi::Task>();
       cte_runtime.LoadTask(wrp_cte::core::Method::kDestroy, load_archive, loaded_ptr);
-      ipc_manager->DelTask(task_d);
-      ipc_manager->DelTask(loaded);
+      CHI_IPC->DelTask(task_d);
+      CHI_IPC->DelTask(loaded);
     }
 
     // Test SaveTask and LoadTask for RegisterTargetTask
@@ -5658,8 +5658,8 @@ TEST_CASE("Autogen - CTE Runtime Container Methods", "[autogen][cte][runtime]") 
       auto loaded = ipc_manager->NewTask<wrp_cte::core::RegisterTargetTask>();
       hipc::FullPtr<chi::Task> loaded_ptr = loaded.template Cast<chi::Task>();
       cte_runtime.LoadTask(wrp_cte::core::Method::kRegisterTarget, load_archive, loaded_ptr);
-      ipc_manager->DelTask(task_r);
-      ipc_manager->DelTask(loaded);
+      CHI_IPC->DelTask(task_r);
+      CHI_IPC->DelTask(loaded);
     }
 
     // Test SaveTask and LoadTask for PutBlobTask
@@ -5673,8 +5673,8 @@ TEST_CASE("Autogen - CTE Runtime Container Methods", "[autogen][cte][runtime]") 
       auto loaded = ipc_manager->NewTask<wrp_cte::core::PutBlobTask>();
       hipc::FullPtr<chi::Task> loaded_ptr = loaded.template Cast<chi::Task>();
       cte_runtime.LoadTask(wrp_cte::core::Method::kPutBlob, load_archive, loaded_ptr);
-      ipc_manager->DelTask(task_p);
-      ipc_manager->DelTask(loaded);
+      CHI_IPC->DelTask(task_p);
+      CHI_IPC->DelTask(loaded);
     }
 
     // Test SaveTask and LoadTask for GetBlobTask
@@ -5688,8 +5688,8 @@ TEST_CASE("Autogen - CTE Runtime Container Methods", "[autogen][cte][runtime]") 
       auto loaded = ipc_manager->NewTask<wrp_cte::core::GetBlobTask>();
       hipc::FullPtr<chi::Task> loaded_ptr = loaded.template Cast<chi::Task>();
       cte_runtime.LoadTask(wrp_cte::core::Method::kGetBlob, load_archive, loaded_ptr);
-      ipc_manager->DelTask(task_g);
-      ipc_manager->DelTask(loaded);
+      CHI_IPC->DelTask(task_g);
+      CHI_IPC->DelTask(loaded);
     }
 
     // Test SaveTask and LoadTask for UnregisterTargetTask
@@ -5703,8 +5703,8 @@ TEST_CASE("Autogen - CTE Runtime Container Methods", "[autogen][cte][runtime]") 
       auto loaded = ipc_manager->NewTask<wrp_cte::core::UnregisterTargetTask>();
       hipc::FullPtr<chi::Task> loaded_ptr = loaded.template Cast<chi::Task>();
       cte_runtime.LoadTask(wrp_cte::core::Method::kUnregisterTarget, load_archive, loaded_ptr);
-      ipc_manager->DelTask(task_u);
-      ipc_manager->DelTask(loaded);
+      CHI_IPC->DelTask(task_u);
+      CHI_IPC->DelTask(loaded);
     }
 
     // Test SaveTask and LoadTask for ListTargetsTask
@@ -5718,8 +5718,8 @@ TEST_CASE("Autogen - CTE Runtime Container Methods", "[autogen][cte][runtime]") 
       auto loaded = ipc_manager->NewTask<wrp_cte::core::ListTargetsTask>();
       hipc::FullPtr<chi::Task> loaded_ptr = loaded.template Cast<chi::Task>();
       cte_runtime.LoadTask(wrp_cte::core::Method::kListTargets, load_archive, loaded_ptr);
-      ipc_manager->DelTask(task_l);
-      ipc_manager->DelTask(loaded);
+      CHI_IPC->DelTask(task_l);
+      CHI_IPC->DelTask(loaded);
     }
 
     // Test SaveTask and LoadTask for StatTargetsTask
@@ -5733,8 +5733,8 @@ TEST_CASE("Autogen - CTE Runtime Container Methods", "[autogen][cte][runtime]") 
       auto loaded = ipc_manager->NewTask<wrp_cte::core::StatTargetsTask>();
       hipc::FullPtr<chi::Task> loaded_ptr = loaded.template Cast<chi::Task>();
       cte_runtime.LoadTask(wrp_cte::core::Method::kStatTargets, load_archive, loaded_ptr);
-      ipc_manager->DelTask(task_s);
-      ipc_manager->DelTask(loaded);
+      CHI_IPC->DelTask(task_s);
+      CHI_IPC->DelTask(loaded);
     }
 
     // Test SaveTask and LoadTask for GetOrCreateTagTask
@@ -5748,8 +5748,8 @@ TEST_CASE("Autogen - CTE Runtime Container Methods", "[autogen][cte][runtime]") 
       auto loaded = ipc_manager->NewTask<wrp_cte::core::GetOrCreateTagTask<wrp_cte::core::CreateParams>>();
       hipc::FullPtr<chi::Task> loaded_ptr = loaded.template Cast<chi::Task>();
       cte_runtime.LoadTask(wrp_cte::core::Method::kGetOrCreateTag, load_archive, loaded_ptr);
-      ipc_manager->DelTask(task_t);
-      ipc_manager->DelTask(loaded);
+      CHI_IPC->DelTask(task_t);
+      CHI_IPC->DelTask(loaded);
     }
 
     // Test SaveTask and LoadTask for ReorganizeBlobTask
@@ -5763,8 +5763,8 @@ TEST_CASE("Autogen - CTE Runtime Container Methods", "[autogen][cte][runtime]") 
       auto loaded = ipc_manager->NewTask<wrp_cte::core::ReorganizeBlobTask>();
       hipc::FullPtr<chi::Task> loaded_ptr = loaded.template Cast<chi::Task>();
       cte_runtime.LoadTask(wrp_cte::core::Method::kReorganizeBlob, load_archive, loaded_ptr);
-      ipc_manager->DelTask(task_re);
-      ipc_manager->DelTask(loaded);
+      CHI_IPC->DelTask(task_re);
+      CHI_IPC->DelTask(loaded);
     }
 
     // Test SaveTask and LoadTask for DelBlobTask
@@ -5778,8 +5778,8 @@ TEST_CASE("Autogen - CTE Runtime Container Methods", "[autogen][cte][runtime]") 
       auto loaded = ipc_manager->NewTask<wrp_cte::core::DelBlobTask>();
       hipc::FullPtr<chi::Task> loaded_ptr = loaded.template Cast<chi::Task>();
       cte_runtime.LoadTask(wrp_cte::core::Method::kDelBlob, load_archive, loaded_ptr);
-      ipc_manager->DelTask(task_db);
-      ipc_manager->DelTask(loaded);
+      CHI_IPC->DelTask(task_db);
+      CHI_IPC->DelTask(loaded);
     }
 
     // Test SaveTask and LoadTask for DelTagTask
@@ -5793,8 +5793,8 @@ TEST_CASE("Autogen - CTE Runtime Container Methods", "[autogen][cte][runtime]") 
       auto loaded = ipc_manager->NewTask<wrp_cte::core::DelTagTask>();
       hipc::FullPtr<chi::Task> loaded_ptr = loaded.template Cast<chi::Task>();
       cte_runtime.LoadTask(wrp_cte::core::Method::kDelTag, load_archive, loaded_ptr);
-      ipc_manager->DelTask(task_dt);
-      ipc_manager->DelTask(loaded);
+      CHI_IPC->DelTask(task_dt);
+      CHI_IPC->DelTask(loaded);
     }
 
     // Test SaveTask and LoadTask for GetTagSizeTask
@@ -5808,8 +5808,8 @@ TEST_CASE("Autogen - CTE Runtime Container Methods", "[autogen][cte][runtime]") 
       auto loaded = ipc_manager->NewTask<wrp_cte::core::GetTagSizeTask>();
       hipc::FullPtr<chi::Task> loaded_ptr = loaded.template Cast<chi::Task>();
       cte_runtime.LoadTask(wrp_cte::core::Method::kGetTagSize, load_archive, loaded_ptr);
-      ipc_manager->DelTask(task_ts);
-      ipc_manager->DelTask(loaded);
+      CHI_IPC->DelTask(task_ts);
+      CHI_IPC->DelTask(loaded);
     }
 
     // Test SaveTask and LoadTask for PollTelemetryLogTask
@@ -5823,8 +5823,8 @@ TEST_CASE("Autogen - CTE Runtime Container Methods", "[autogen][cte][runtime]") 
       auto loaded = ipc_manager->NewTask<wrp_cte::core::PollTelemetryLogTask>();
       hipc::FullPtr<chi::Task> loaded_ptr = loaded.template Cast<chi::Task>();
       cte_runtime.LoadTask(wrp_cte::core::Method::kPollTelemetryLog, load_archive, loaded_ptr);
-      ipc_manager->DelTask(task_te);
-      ipc_manager->DelTask(loaded);
+      CHI_IPC->DelTask(task_te);
+      CHI_IPC->DelTask(loaded);
     }
 
     // Test SaveTask and LoadTask for GetBlobScoreTask
@@ -5838,8 +5838,8 @@ TEST_CASE("Autogen - CTE Runtime Container Methods", "[autogen][cte][runtime]") 
       auto loaded = ipc_manager->NewTask<wrp_cte::core::GetBlobScoreTask>();
       hipc::FullPtr<chi::Task> loaded_ptr = loaded.template Cast<chi::Task>();
       cte_runtime.LoadTask(wrp_cte::core::Method::kGetBlobScore, load_archive, loaded_ptr);
-      ipc_manager->DelTask(task_sc);
-      ipc_manager->DelTask(loaded);
+      CHI_IPC->DelTask(task_sc);
+      CHI_IPC->DelTask(loaded);
     }
 
     // Test SaveTask and LoadTask for GetBlobSizeTask
@@ -5853,8 +5853,8 @@ TEST_CASE("Autogen - CTE Runtime Container Methods", "[autogen][cte][runtime]") 
       auto loaded = ipc_manager->NewTask<wrp_cte::core::GetBlobSizeTask>();
       hipc::FullPtr<chi::Task> loaded_ptr = loaded.template Cast<chi::Task>();
       cte_runtime.LoadTask(wrp_cte::core::Method::kGetBlobSize, load_archive, loaded_ptr);
-      ipc_manager->DelTask(task_bs);
-      ipc_manager->DelTask(loaded);
+      CHI_IPC->DelTask(task_bs);
+      CHI_IPC->DelTask(loaded);
     }
 
     // Test SaveTask and LoadTask for GetContainedBlobsTask
@@ -5868,8 +5868,8 @@ TEST_CASE("Autogen - CTE Runtime Container Methods", "[autogen][cte][runtime]") 
       auto loaded = ipc_manager->NewTask<wrp_cte::core::GetContainedBlobsTask>();
       hipc::FullPtr<chi::Task> loaded_ptr = loaded.template Cast<chi::Task>();
       cte_runtime.LoadTask(wrp_cte::core::Method::kGetContainedBlobs, load_archive, loaded_ptr);
-      ipc_manager->DelTask(task_cb);
-      ipc_manager->DelTask(loaded);
+      CHI_IPC->DelTask(task_cb);
+      CHI_IPC->DelTask(loaded);
     }
 
     // Test SaveTask and LoadTask for TagQueryTask
@@ -5883,8 +5883,8 @@ TEST_CASE("Autogen - CTE Runtime Container Methods", "[autogen][cte][runtime]") 
       auto loaded = ipc_manager->NewTask<wrp_cte::core::TagQueryTask>();
       hipc::FullPtr<chi::Task> loaded_ptr = loaded.template Cast<chi::Task>();
       cte_runtime.LoadTask(wrp_cte::core::Method::kTagQuery, load_archive, loaded_ptr);
-      ipc_manager->DelTask(task_tq);
-      ipc_manager->DelTask(loaded);
+      CHI_IPC->DelTask(task_tq);
+      CHI_IPC->DelTask(loaded);
     }
 
     // Test SaveTask and LoadTask for BlobQueryTask
@@ -5898,8 +5898,8 @@ TEST_CASE("Autogen - CTE Runtime Container Methods", "[autogen][cte][runtime]") 
       auto loaded = ipc_manager->NewTask<wrp_cte::core::BlobQueryTask>();
       hipc::FullPtr<chi::Task> loaded_ptr = loaded.template Cast<chi::Task>();
       cte_runtime.LoadTask(wrp_cte::core::Method::kBlobQuery, load_archive, loaded_ptr);
-      ipc_manager->DelTask(task_bq);
-      ipc_manager->DelTask(loaded);
+      CHI_IPC->DelTask(task_bq);
+      CHI_IPC->DelTask(loaded);
     }
 
     // Test SaveTask with unknown method (default case)
@@ -5910,7 +5910,7 @@ TEST_CASE("Autogen - CTE Runtime Container Methods", "[autogen][cte][runtime]") 
       chi::LoadTaskArchive load_archive(save_archive.GetData());
       load_archive.msg_type_ = chi::MsgType::kSerializeIn;
       cte_runtime.LoadTask(9999, load_archive, task_unk);
-      ipc_manager->DelTask(task_unk);
+      CHI_IPC->DelTask(task_unk);
     }
 
     INFO("CTE Runtime::SaveTask/LoadTask tests completed");
@@ -5924,8 +5924,8 @@ TEST_CASE("Autogen - CTE Runtime Container Methods", "[autogen][cte][runtime]") 
     if (!orig.IsNull()) {
       hipc::FullPtr<chi::Task> orig_ptr = orig.template Cast<chi::Task>();
       auto copy = cte_runtime.NewCopyTask(wrp_cte::core::Method::kCreate, orig_ptr, false);
-      if (!copy.IsNull()) ipc_manager->DelTask(copy.template Cast<wrp_cte::core::CreateTask>());
-      ipc_manager->DelTask(orig);
+      if (!copy.IsNull()) CHI_IPC->DelTask(copy.template Cast<wrp_cte::core::CreateTask>());
+      CHI_IPC->DelTask(orig);
     }
 
     // Test NewCopyTask for DestroyTask
@@ -5933,8 +5933,8 @@ TEST_CASE("Autogen - CTE Runtime Container Methods", "[autogen][cte][runtime]") 
     if (!orig_d.IsNull()) {
       hipc::FullPtr<chi::Task> orig_ptr = orig_d.template Cast<chi::Task>();
       auto copy = cte_runtime.NewCopyTask(wrp_cte::core::Method::kDestroy, orig_ptr, false);
-      if (!copy.IsNull()) ipc_manager->DelTask(copy.template Cast<wrp_cte::core::DestroyTask>());
-      ipc_manager->DelTask(orig_d);
+      if (!copy.IsNull()) CHI_IPC->DelTask(copy.template Cast<wrp_cte::core::DestroyTask>());
+      CHI_IPC->DelTask(orig_d);
     }
 
     // Test NewCopyTask for RegisterTargetTask
@@ -5942,8 +5942,8 @@ TEST_CASE("Autogen - CTE Runtime Container Methods", "[autogen][cte][runtime]") 
     if (!orig_r.IsNull()) {
       hipc::FullPtr<chi::Task> orig_ptr = orig_r.template Cast<chi::Task>();
       auto copy = cte_runtime.NewCopyTask(wrp_cte::core::Method::kRegisterTarget, orig_ptr, false);
-      if (!copy.IsNull()) ipc_manager->DelTask(copy.template Cast<wrp_cte::core::RegisterTargetTask>());
-      ipc_manager->DelTask(orig_r);
+      if (!copy.IsNull()) CHI_IPC->DelTask(copy.template Cast<wrp_cte::core::RegisterTargetTask>());
+      CHI_IPC->DelTask(orig_r);
     }
 
     // Test NewCopyTask for UnregisterTargetTask
@@ -5951,8 +5951,8 @@ TEST_CASE("Autogen - CTE Runtime Container Methods", "[autogen][cte][runtime]") 
     if (!orig_u.IsNull()) {
       hipc::FullPtr<chi::Task> orig_ptr = orig_u.template Cast<chi::Task>();
       auto copy = cte_runtime.NewCopyTask(wrp_cte::core::Method::kUnregisterTarget, orig_ptr, false);
-      if (!copy.IsNull()) ipc_manager->DelTask(copy.template Cast<wrp_cte::core::UnregisterTargetTask>());
-      ipc_manager->DelTask(orig_u);
+      if (!copy.IsNull()) CHI_IPC->DelTask(copy.template Cast<wrp_cte::core::UnregisterTargetTask>());
+      CHI_IPC->DelTask(orig_u);
     }
 
     // Test NewCopyTask for ListTargetsTask
@@ -5960,8 +5960,8 @@ TEST_CASE("Autogen - CTE Runtime Container Methods", "[autogen][cte][runtime]") 
     if (!orig_l.IsNull()) {
       hipc::FullPtr<chi::Task> orig_ptr = orig_l.template Cast<chi::Task>();
       auto copy = cte_runtime.NewCopyTask(wrp_cte::core::Method::kListTargets, orig_ptr, false);
-      if (!copy.IsNull()) ipc_manager->DelTask(copy.template Cast<wrp_cte::core::ListTargetsTask>());
-      ipc_manager->DelTask(orig_l);
+      if (!copy.IsNull()) CHI_IPC->DelTask(copy.template Cast<wrp_cte::core::ListTargetsTask>());
+      CHI_IPC->DelTask(orig_l);
     }
 
     // Test NewCopyTask for StatTargetsTask
@@ -5969,8 +5969,8 @@ TEST_CASE("Autogen - CTE Runtime Container Methods", "[autogen][cte][runtime]") 
     if (!orig_s.IsNull()) {
       hipc::FullPtr<chi::Task> orig_ptr = orig_s.template Cast<chi::Task>();
       auto copy = cte_runtime.NewCopyTask(wrp_cte::core::Method::kStatTargets, orig_ptr, false);
-      if (!copy.IsNull()) ipc_manager->DelTask(copy.template Cast<wrp_cte::core::StatTargetsTask>());
-      ipc_manager->DelTask(orig_s);
+      if (!copy.IsNull()) CHI_IPC->DelTask(copy.template Cast<wrp_cte::core::StatTargetsTask>());
+      CHI_IPC->DelTask(orig_s);
     }
 
     // Test NewCopyTask for PutBlobTask
@@ -5978,8 +5978,8 @@ TEST_CASE("Autogen - CTE Runtime Container Methods", "[autogen][cte][runtime]") 
     if (!orig_p.IsNull()) {
       hipc::FullPtr<chi::Task> orig_ptr = orig_p.template Cast<chi::Task>();
       auto copy = cte_runtime.NewCopyTask(wrp_cte::core::Method::kPutBlob, orig_ptr, false);
-      if (!copy.IsNull()) ipc_manager->DelTask(copy.template Cast<wrp_cte::core::PutBlobTask>());
-      ipc_manager->DelTask(orig_p);
+      if (!copy.IsNull()) CHI_IPC->DelTask(copy.template Cast<wrp_cte::core::PutBlobTask>());
+      CHI_IPC->DelTask(orig_p);
     }
 
     // Test NewCopyTask for GetBlobTask
@@ -5987,8 +5987,8 @@ TEST_CASE("Autogen - CTE Runtime Container Methods", "[autogen][cte][runtime]") 
     if (!orig_g.IsNull()) {
       hipc::FullPtr<chi::Task> orig_ptr = orig_g.template Cast<chi::Task>();
       auto copy = cte_runtime.NewCopyTask(wrp_cte::core::Method::kGetBlob, orig_ptr, false);
-      if (!copy.IsNull()) ipc_manager->DelTask(copy.template Cast<wrp_cte::core::GetBlobTask>());
-      ipc_manager->DelTask(orig_g);
+      if (!copy.IsNull()) CHI_IPC->DelTask(copy.template Cast<wrp_cte::core::GetBlobTask>());
+      CHI_IPC->DelTask(orig_g);
     }
 
     // Test NewCopyTask for ReorganizeBlobTask
@@ -5996,8 +5996,8 @@ TEST_CASE("Autogen - CTE Runtime Container Methods", "[autogen][cte][runtime]") 
     if (!orig_re.IsNull()) {
       hipc::FullPtr<chi::Task> orig_ptr = orig_re.template Cast<chi::Task>();
       auto copy = cte_runtime.NewCopyTask(wrp_cte::core::Method::kReorganizeBlob, orig_ptr, false);
-      if (!copy.IsNull()) ipc_manager->DelTask(copy.template Cast<wrp_cte::core::ReorganizeBlobTask>());
-      ipc_manager->DelTask(orig_re);
+      if (!copy.IsNull()) CHI_IPC->DelTask(copy.template Cast<wrp_cte::core::ReorganizeBlobTask>());
+      CHI_IPC->DelTask(orig_re);
     }
 
     // Test NewCopyTask for DelBlobTask
@@ -6005,8 +6005,8 @@ TEST_CASE("Autogen - CTE Runtime Container Methods", "[autogen][cte][runtime]") 
     if (!orig_db.IsNull()) {
       hipc::FullPtr<chi::Task> orig_ptr = orig_db.template Cast<chi::Task>();
       auto copy = cte_runtime.NewCopyTask(wrp_cte::core::Method::kDelBlob, orig_ptr, false);
-      if (!copy.IsNull()) ipc_manager->DelTask(copy.template Cast<wrp_cte::core::DelBlobTask>());
-      ipc_manager->DelTask(orig_db);
+      if (!copy.IsNull()) CHI_IPC->DelTask(copy.template Cast<wrp_cte::core::DelBlobTask>());
+      CHI_IPC->DelTask(orig_db);
     }
 
     // Test NewCopyTask for DelTagTask
@@ -6014,8 +6014,8 @@ TEST_CASE("Autogen - CTE Runtime Container Methods", "[autogen][cte][runtime]") 
     if (!orig_dt.IsNull()) {
       hipc::FullPtr<chi::Task> orig_ptr = orig_dt.template Cast<chi::Task>();
       auto copy = cte_runtime.NewCopyTask(wrp_cte::core::Method::kDelTag, orig_ptr, false);
-      if (!copy.IsNull()) ipc_manager->DelTask(copy.template Cast<wrp_cte::core::DelTagTask>());
-      ipc_manager->DelTask(orig_dt);
+      if (!copy.IsNull()) CHI_IPC->DelTask(copy.template Cast<wrp_cte::core::DelTagTask>());
+      CHI_IPC->DelTask(orig_dt);
     }
 
     // Test NewCopyTask for GetTagSizeTask
@@ -6023,8 +6023,8 @@ TEST_CASE("Autogen - CTE Runtime Container Methods", "[autogen][cte][runtime]") 
     if (!orig_ts.IsNull()) {
       hipc::FullPtr<chi::Task> orig_ptr = orig_ts.template Cast<chi::Task>();
       auto copy = cte_runtime.NewCopyTask(wrp_cte::core::Method::kGetTagSize, orig_ptr, false);
-      if (!copy.IsNull()) ipc_manager->DelTask(copy.template Cast<wrp_cte::core::GetTagSizeTask>());
-      ipc_manager->DelTask(orig_ts);
+      if (!copy.IsNull()) CHI_IPC->DelTask(copy.template Cast<wrp_cte::core::GetTagSizeTask>());
+      CHI_IPC->DelTask(orig_ts);
     }
 
     // Test NewCopyTask for PollTelemetryLogTask
@@ -6032,8 +6032,8 @@ TEST_CASE("Autogen - CTE Runtime Container Methods", "[autogen][cte][runtime]") 
     if (!orig_te.IsNull()) {
       hipc::FullPtr<chi::Task> orig_ptr = orig_te.template Cast<chi::Task>();
       auto copy = cte_runtime.NewCopyTask(wrp_cte::core::Method::kPollTelemetryLog, orig_ptr, false);
-      if (!copy.IsNull()) ipc_manager->DelTask(copy.template Cast<wrp_cte::core::PollTelemetryLogTask>());
-      ipc_manager->DelTask(orig_te);
+      if (!copy.IsNull()) CHI_IPC->DelTask(copy.template Cast<wrp_cte::core::PollTelemetryLogTask>());
+      CHI_IPC->DelTask(orig_te);
     }
 
     // Test NewCopyTask for GetBlobScoreTask
@@ -6041,8 +6041,8 @@ TEST_CASE("Autogen - CTE Runtime Container Methods", "[autogen][cte][runtime]") 
     if (!orig_sc.IsNull()) {
       hipc::FullPtr<chi::Task> orig_ptr = orig_sc.template Cast<chi::Task>();
       auto copy = cte_runtime.NewCopyTask(wrp_cte::core::Method::kGetBlobScore, orig_ptr, false);
-      if (!copy.IsNull()) ipc_manager->DelTask(copy.template Cast<wrp_cte::core::GetBlobScoreTask>());
-      ipc_manager->DelTask(orig_sc);
+      if (!copy.IsNull()) CHI_IPC->DelTask(copy.template Cast<wrp_cte::core::GetBlobScoreTask>());
+      CHI_IPC->DelTask(orig_sc);
     }
 
     // Test NewCopyTask for GetBlobSizeTask
@@ -6050,8 +6050,8 @@ TEST_CASE("Autogen - CTE Runtime Container Methods", "[autogen][cte][runtime]") 
     if (!orig_bs.IsNull()) {
       hipc::FullPtr<chi::Task> orig_ptr = orig_bs.template Cast<chi::Task>();
       auto copy = cte_runtime.NewCopyTask(wrp_cte::core::Method::kGetBlobSize, orig_ptr, false);
-      if (!copy.IsNull()) ipc_manager->DelTask(copy.template Cast<wrp_cte::core::GetBlobSizeTask>());
-      ipc_manager->DelTask(orig_bs);
+      if (!copy.IsNull()) CHI_IPC->DelTask(copy.template Cast<wrp_cte::core::GetBlobSizeTask>());
+      CHI_IPC->DelTask(orig_bs);
     }
 
     // Test NewCopyTask for GetContainedBlobsTask
@@ -6059,8 +6059,8 @@ TEST_CASE("Autogen - CTE Runtime Container Methods", "[autogen][cte][runtime]") 
     if (!orig_cb.IsNull()) {
       hipc::FullPtr<chi::Task> orig_ptr = orig_cb.template Cast<chi::Task>();
       auto copy = cte_runtime.NewCopyTask(wrp_cte::core::Method::kGetContainedBlobs, orig_ptr, false);
-      if (!copy.IsNull()) ipc_manager->DelTask(copy.template Cast<wrp_cte::core::GetContainedBlobsTask>());
-      ipc_manager->DelTask(orig_cb);
+      if (!copy.IsNull()) CHI_IPC->DelTask(copy.template Cast<wrp_cte::core::GetContainedBlobsTask>());
+      CHI_IPC->DelTask(orig_cb);
     }
 
     // Test NewCopyTask for TagQueryTask
@@ -6068,8 +6068,8 @@ TEST_CASE("Autogen - CTE Runtime Container Methods", "[autogen][cte][runtime]") 
     if (!orig_tq.IsNull()) {
       hipc::FullPtr<chi::Task> orig_ptr = orig_tq.template Cast<chi::Task>();
       auto copy = cte_runtime.NewCopyTask(wrp_cte::core::Method::kTagQuery, orig_ptr, false);
-      if (!copy.IsNull()) ipc_manager->DelTask(copy.template Cast<wrp_cte::core::TagQueryTask>());
-      ipc_manager->DelTask(orig_tq);
+      if (!copy.IsNull()) CHI_IPC->DelTask(copy.template Cast<wrp_cte::core::TagQueryTask>());
+      CHI_IPC->DelTask(orig_tq);
     }
 
     // Test NewCopyTask for BlobQueryTask
@@ -6077,16 +6077,16 @@ TEST_CASE("Autogen - CTE Runtime Container Methods", "[autogen][cte][runtime]") 
     if (!orig_bq.IsNull()) {
       hipc::FullPtr<chi::Task> orig_ptr = orig_bq.template Cast<chi::Task>();
       auto copy = cte_runtime.NewCopyTask(wrp_cte::core::Method::kBlobQuery, orig_ptr, false);
-      if (!copy.IsNull()) ipc_manager->DelTask(copy.template Cast<wrp_cte::core::BlobQueryTask>());
-      ipc_manager->DelTask(orig_bq);
+      if (!copy.IsNull()) CHI_IPC->DelTask(copy.template Cast<wrp_cte::core::BlobQueryTask>());
+      CHI_IPC->DelTask(orig_bq);
     }
 
     // Test NewCopyTask for unknown method (default case)
     auto orig_unk = ipc_manager->NewTask<chi::Task>();
     if (!orig_unk.IsNull()) {
       auto copy = cte_runtime.NewCopyTask(9999, orig_unk, false);
-      if (!copy.IsNull()) ipc_manager->DelTask(copy);
-      ipc_manager->DelTask(orig_unk);
+      if (!copy.IsNull()) CHI_IPC->DelTask(copy);
+      CHI_IPC->DelTask(orig_unk);
     }
 
     INFO("CTE Runtime::NewCopyTask tests completed");
@@ -6101,9 +6101,9 @@ TEST_CASE("Autogen - CTE Runtime Container Methods", "[autogen][cte][runtime]") 
     if (!t1_c.IsNull() && !t2_c.IsNull()) {
       hipc::FullPtr<chi::Task> ptr1 = t1_c.template Cast<chi::Task>();
       hipc::FullPtr<chi::Task> ptr2 = t2_c.template Cast<chi::Task>();
-      cte_runtime.Aggregate(wrp_cte::core::Method::kCreate, ptr1, ptr2);
-      ipc_manager->DelTask(t1_c);
-      ipc_manager->DelTask(t2_c);
+      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      CHI_IPC->DelTask(t1_c);
+      CHI_IPC->DelTask(t2_c);
     }
 
     // Test Aggregate for DestroyTask
@@ -6112,9 +6112,9 @@ TEST_CASE("Autogen - CTE Runtime Container Methods", "[autogen][cte][runtime]") 
     if (!t1_d.IsNull() && !t2_d.IsNull()) {
       hipc::FullPtr<chi::Task> ptr1 = t1_d.template Cast<chi::Task>();
       hipc::FullPtr<chi::Task> ptr2 = t2_d.template Cast<chi::Task>();
-      cte_runtime.Aggregate(wrp_cte::core::Method::kDestroy, ptr1, ptr2);
-      ipc_manager->DelTask(t1_d);
-      ipc_manager->DelTask(t2_d);
+      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      CHI_IPC->DelTask(t1_d);
+      CHI_IPC->DelTask(t2_d);
     }
 
     // Test Aggregate for RegisterTargetTask
@@ -6123,9 +6123,9 @@ TEST_CASE("Autogen - CTE Runtime Container Methods", "[autogen][cte][runtime]") 
     if (!t1_r.IsNull() && !t2_r.IsNull()) {
       hipc::FullPtr<chi::Task> ptr1 = t1_r.template Cast<chi::Task>();
       hipc::FullPtr<chi::Task> ptr2 = t2_r.template Cast<chi::Task>();
-      cte_runtime.Aggregate(wrp_cte::core::Method::kRegisterTarget, ptr1, ptr2);
-      ipc_manager->DelTask(t1_r);
-      ipc_manager->DelTask(t2_r);
+      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      CHI_IPC->DelTask(t1_r);
+      CHI_IPC->DelTask(t2_r);
     }
 
     // Test Aggregate for UnregisterTargetTask
@@ -6134,9 +6134,9 @@ TEST_CASE("Autogen - CTE Runtime Container Methods", "[autogen][cte][runtime]") 
     if (!t1_u.IsNull() && !t2_u.IsNull()) {
       hipc::FullPtr<chi::Task> ptr1 = t1_u.template Cast<chi::Task>();
       hipc::FullPtr<chi::Task> ptr2 = t2_u.template Cast<chi::Task>();
-      cte_runtime.Aggregate(wrp_cte::core::Method::kUnregisterTarget, ptr1, ptr2);
-      ipc_manager->DelTask(t1_u);
-      ipc_manager->DelTask(t2_u);
+      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      CHI_IPC->DelTask(t1_u);
+      CHI_IPC->DelTask(t2_u);
     }
 
     // Test Aggregate for ListTargetsTask
@@ -6145,9 +6145,9 @@ TEST_CASE("Autogen - CTE Runtime Container Methods", "[autogen][cte][runtime]") 
     if (!t1_l.IsNull() && !t2_l.IsNull()) {
       hipc::FullPtr<chi::Task> ptr1 = t1_l.template Cast<chi::Task>();
       hipc::FullPtr<chi::Task> ptr2 = t2_l.template Cast<chi::Task>();
-      cte_runtime.Aggregate(wrp_cte::core::Method::kListTargets, ptr1, ptr2);
-      ipc_manager->DelTask(t1_l);
-      ipc_manager->DelTask(t2_l);
+      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      CHI_IPC->DelTask(t1_l);
+      CHI_IPC->DelTask(t2_l);
     }
 
     // Test Aggregate for PutBlobTask
@@ -6156,9 +6156,9 @@ TEST_CASE("Autogen - CTE Runtime Container Methods", "[autogen][cte][runtime]") 
     if (!t1_p.IsNull() && !t2_p.IsNull()) {
       hipc::FullPtr<chi::Task> ptr1 = t1_p.template Cast<chi::Task>();
       hipc::FullPtr<chi::Task> ptr2 = t2_p.template Cast<chi::Task>();
-      cte_runtime.Aggregate(wrp_cte::core::Method::kPutBlob, ptr1, ptr2);
-      ipc_manager->DelTask(t1_p);
-      ipc_manager->DelTask(t2_p);
+      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      CHI_IPC->DelTask(t1_p);
+      CHI_IPC->DelTask(t2_p);
     }
 
     // Test Aggregate for GetBlobTask
@@ -6167,9 +6167,9 @@ TEST_CASE("Autogen - CTE Runtime Container Methods", "[autogen][cte][runtime]") 
     if (!t1_g.IsNull() && !t2_g.IsNull()) {
       hipc::FullPtr<chi::Task> ptr1 = t1_g.template Cast<chi::Task>();
       hipc::FullPtr<chi::Task> ptr2 = t2_g.template Cast<chi::Task>();
-      cte_runtime.Aggregate(wrp_cte::core::Method::kGetBlob, ptr1, ptr2);
-      ipc_manager->DelTask(t1_g);
-      ipc_manager->DelTask(t2_g);
+      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      CHI_IPC->DelTask(t1_g);
+      CHI_IPC->DelTask(t2_g);
     }
 
     // Test Aggregate for StatTargetsTask
@@ -6178,9 +6178,9 @@ TEST_CASE("Autogen - CTE Runtime Container Methods", "[autogen][cte][runtime]") 
     if (!t1_st.IsNull() && !t2_st.IsNull()) {
       hipc::FullPtr<chi::Task> ptr1 = t1_st.template Cast<chi::Task>();
       hipc::FullPtr<chi::Task> ptr2 = t2_st.template Cast<chi::Task>();
-      cte_runtime.Aggregate(wrp_cte::core::Method::kStatTargets, ptr1, ptr2);
-      ipc_manager->DelTask(t1_st);
-      ipc_manager->DelTask(t2_st);
+      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      CHI_IPC->DelTask(t1_st);
+      CHI_IPC->DelTask(t2_st);
     }
 
     // Test Aggregate for GetOrCreateTagTask
@@ -6189,9 +6189,9 @@ TEST_CASE("Autogen - CTE Runtime Container Methods", "[autogen][cte][runtime]") 
     if (!t1_gt.IsNull() && !t2_gt.IsNull()) {
       hipc::FullPtr<chi::Task> ptr1 = t1_gt.template Cast<chi::Task>();
       hipc::FullPtr<chi::Task> ptr2 = t2_gt.template Cast<chi::Task>();
-      cte_runtime.Aggregate(wrp_cte::core::Method::kGetOrCreateTag, ptr1, ptr2);
-      ipc_manager->DelTask(t1_gt);
-      ipc_manager->DelTask(t2_gt);
+      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      CHI_IPC->DelTask(t1_gt);
+      CHI_IPC->DelTask(t2_gt);
     }
 
     // Test Aggregate for ReorganizeBlobTask
@@ -6200,9 +6200,9 @@ TEST_CASE("Autogen - CTE Runtime Container Methods", "[autogen][cte][runtime]") 
     if (!t1_re.IsNull() && !t2_re.IsNull()) {
       hipc::FullPtr<chi::Task> ptr1 = t1_re.template Cast<chi::Task>();
       hipc::FullPtr<chi::Task> ptr2 = t2_re.template Cast<chi::Task>();
-      cte_runtime.Aggregate(wrp_cte::core::Method::kReorganizeBlob, ptr1, ptr2);
-      ipc_manager->DelTask(t1_re);
-      ipc_manager->DelTask(t2_re);
+      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      CHI_IPC->DelTask(t1_re);
+      CHI_IPC->DelTask(t2_re);
     }
 
     // Test Aggregate for DelBlobTask
@@ -6211,9 +6211,9 @@ TEST_CASE("Autogen - CTE Runtime Container Methods", "[autogen][cte][runtime]") 
     if (!t1_db.IsNull() && !t2_db.IsNull()) {
       hipc::FullPtr<chi::Task> ptr1 = t1_db.template Cast<chi::Task>();
       hipc::FullPtr<chi::Task> ptr2 = t2_db.template Cast<chi::Task>();
-      cte_runtime.Aggregate(wrp_cte::core::Method::kDelBlob, ptr1, ptr2);
-      ipc_manager->DelTask(t1_db);
-      ipc_manager->DelTask(t2_db);
+      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      CHI_IPC->DelTask(t1_db);
+      CHI_IPC->DelTask(t2_db);
     }
 
     // Test Aggregate for DelTagTask
@@ -6222,9 +6222,9 @@ TEST_CASE("Autogen - CTE Runtime Container Methods", "[autogen][cte][runtime]") 
     if (!t1_dt.IsNull() && !t2_dt.IsNull()) {
       hipc::FullPtr<chi::Task> ptr1 = t1_dt.template Cast<chi::Task>();
       hipc::FullPtr<chi::Task> ptr2 = t2_dt.template Cast<chi::Task>();
-      cte_runtime.Aggregate(wrp_cte::core::Method::kDelTag, ptr1, ptr2);
-      ipc_manager->DelTask(t1_dt);
-      ipc_manager->DelTask(t2_dt);
+      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      CHI_IPC->DelTask(t1_dt);
+      CHI_IPC->DelTask(t2_dt);
     }
 
     // Test Aggregate for GetTagSizeTask
@@ -6233,9 +6233,9 @@ TEST_CASE("Autogen - CTE Runtime Container Methods", "[autogen][cte][runtime]") 
     if (!t1_ts.IsNull() && !t2_ts.IsNull()) {
       hipc::FullPtr<chi::Task> ptr1 = t1_ts.template Cast<chi::Task>();
       hipc::FullPtr<chi::Task> ptr2 = t2_ts.template Cast<chi::Task>();
-      cte_runtime.Aggregate(wrp_cte::core::Method::kGetTagSize, ptr1, ptr2);
-      ipc_manager->DelTask(t1_ts);
-      ipc_manager->DelTask(t2_ts);
+      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      CHI_IPC->DelTask(t1_ts);
+      CHI_IPC->DelTask(t2_ts);
     }
 
     // Test Aggregate for PollTelemetryLogTask
@@ -6244,9 +6244,9 @@ TEST_CASE("Autogen - CTE Runtime Container Methods", "[autogen][cte][runtime]") 
     if (!t1_tl.IsNull() && !t2_tl.IsNull()) {
       hipc::FullPtr<chi::Task> ptr1 = t1_tl.template Cast<chi::Task>();
       hipc::FullPtr<chi::Task> ptr2 = t2_tl.template Cast<chi::Task>();
-      cte_runtime.Aggregate(wrp_cte::core::Method::kPollTelemetryLog, ptr1, ptr2);
-      ipc_manager->DelTask(t1_tl);
-      ipc_manager->DelTask(t2_tl);
+      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      CHI_IPC->DelTask(t1_tl);
+      CHI_IPC->DelTask(t2_tl);
     }
 
     // Test Aggregate for GetBlobScoreTask
@@ -6255,9 +6255,9 @@ TEST_CASE("Autogen - CTE Runtime Container Methods", "[autogen][cte][runtime]") 
     if (!t1_sc.IsNull() && !t2_sc.IsNull()) {
       hipc::FullPtr<chi::Task> ptr1 = t1_sc.template Cast<chi::Task>();
       hipc::FullPtr<chi::Task> ptr2 = t2_sc.template Cast<chi::Task>();
-      cte_runtime.Aggregate(wrp_cte::core::Method::kGetBlobScore, ptr1, ptr2);
-      ipc_manager->DelTask(t1_sc);
-      ipc_manager->DelTask(t2_sc);
+      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      CHI_IPC->DelTask(t1_sc);
+      CHI_IPC->DelTask(t2_sc);
     }
 
     // Test Aggregate for GetBlobSizeTask
@@ -6266,9 +6266,9 @@ TEST_CASE("Autogen - CTE Runtime Container Methods", "[autogen][cte][runtime]") 
     if (!t1_bs.IsNull() && !t2_bs.IsNull()) {
       hipc::FullPtr<chi::Task> ptr1 = t1_bs.template Cast<chi::Task>();
       hipc::FullPtr<chi::Task> ptr2 = t2_bs.template Cast<chi::Task>();
-      cte_runtime.Aggregate(wrp_cte::core::Method::kGetBlobSize, ptr1, ptr2);
-      ipc_manager->DelTask(t1_bs);
-      ipc_manager->DelTask(t2_bs);
+      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      CHI_IPC->DelTask(t1_bs);
+      CHI_IPC->DelTask(t2_bs);
     }
 
     // Test Aggregate for GetContainedBlobsTask
@@ -6277,9 +6277,9 @@ TEST_CASE("Autogen - CTE Runtime Container Methods", "[autogen][cte][runtime]") 
     if (!t1_cb.IsNull() && !t2_cb.IsNull()) {
       hipc::FullPtr<chi::Task> ptr1 = t1_cb.template Cast<chi::Task>();
       hipc::FullPtr<chi::Task> ptr2 = t2_cb.template Cast<chi::Task>();
-      cte_runtime.Aggregate(wrp_cte::core::Method::kGetContainedBlobs, ptr1, ptr2);
-      ipc_manager->DelTask(t1_cb);
-      ipc_manager->DelTask(t2_cb);
+      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      CHI_IPC->DelTask(t1_cb);
+      CHI_IPC->DelTask(t2_cb);
     }
 
     // Test Aggregate for TagQueryTask
@@ -6288,9 +6288,9 @@ TEST_CASE("Autogen - CTE Runtime Container Methods", "[autogen][cte][runtime]") 
     if (!t1_tq.IsNull() && !t2_tq.IsNull()) {
       hipc::FullPtr<chi::Task> ptr1 = t1_tq.template Cast<chi::Task>();
       hipc::FullPtr<chi::Task> ptr2 = t2_tq.template Cast<chi::Task>();
-      cte_runtime.Aggregate(wrp_cte::core::Method::kTagQuery, ptr1, ptr2);
-      ipc_manager->DelTask(t1_tq);
-      ipc_manager->DelTask(t2_tq);
+      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      CHI_IPC->DelTask(t1_tq);
+      CHI_IPC->DelTask(t2_tq);
     }
 
     // Test Aggregate for BlobQueryTask
@@ -6299,18 +6299,18 @@ TEST_CASE("Autogen - CTE Runtime Container Methods", "[autogen][cte][runtime]") 
     if (!t1_bq.IsNull() && !t2_bq.IsNull()) {
       hipc::FullPtr<chi::Task> ptr1 = t1_bq.template Cast<chi::Task>();
       hipc::FullPtr<chi::Task> ptr2 = t2_bq.template Cast<chi::Task>();
-      cte_runtime.Aggregate(wrp_cte::core::Method::kBlobQuery, ptr1, ptr2);
-      ipc_manager->DelTask(t1_bq);
-      ipc_manager->DelTask(t2_bq);
+      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      CHI_IPC->DelTask(t1_bq);
+      CHI_IPC->DelTask(t2_bq);
     }
 
     // Test Aggregate for unknown method (default case)
     auto t1_unk = ipc_manager->NewTask<chi::Task>();
     auto t2_unk = ipc_manager->NewTask<chi::Task>();
     if (!t1_unk.IsNull() && !t2_unk.IsNull()) {
-      cte_runtime.Aggregate(9999, t1_unk, t2_unk);
-      ipc_manager->DelTask(t1_unk);
-      ipc_manager->DelTask(t2_unk);
+      t1_unk.ptr_->Aggregate(t2_unk.template Cast<chi::Task>());
+      CHI_IPC->DelTask(t1_unk);
+      CHI_IPC->DelTask(t2_unk);
     }
 
     INFO("CTE Runtime::Aggregate tests completed");
@@ -6328,8 +6328,8 @@ TEST_CASE("Autogen - CTE Runtime Container Methods", "[autogen][cte][runtime]") 
       auto loaded = ipc_manager->NewTask<wrp_cte::core::GetOrCreateTagTask<wrp_cte::core::CreateParams>>();
       hipc::FullPtr<chi::Task> loaded_ptr = loaded.template Cast<chi::Task>();
       cte_runtime.LoadTask(wrp_cte::core::Method::kGetOrCreateTag, load_archive, loaded_ptr);
-      ipc_manager->DelTask(task);
-      ipc_manager->DelTask(loaded);
+      CHI_IPC->DelTask(task);
+      CHI_IPC->DelTask(loaded);
     }
   }
 
@@ -6363,14 +6363,14 @@ TEST_CASE("Autogen - Bdev Runtime Container Methods", "[autogen][bdev][runtime]"
 
     INFO("Bdev Runtime::NewTask tests completed");
 
-    if (!task_create.IsNull()) bdev_runtime.DelTask(chimaera::bdev::Method::kCreate, task_create);
-    if (!task_destroy.IsNull()) bdev_runtime.DelTask(chimaera::bdev::Method::kDestroy, task_destroy);
-    if (!task_alloc.IsNull()) bdev_runtime.DelTask(chimaera::bdev::Method::kAllocateBlocks, task_alloc);
-    if (!task_free.IsNull()) bdev_runtime.DelTask(chimaera::bdev::Method::kFreeBlocks, task_free);
-    if (!task_write.IsNull()) bdev_runtime.DelTask(chimaera::bdev::Method::kWrite, task_write);
-    if (!task_read.IsNull()) bdev_runtime.DelTask(chimaera::bdev::Method::kRead, task_read);
-    if (!task_stats.IsNull()) bdev_runtime.DelTask(chimaera::bdev::Method::kGetStats, task_stats);
-    if (!task_unknown.IsNull()) bdev_runtime.DelTask(9999, task_unknown);
+    if (!task_create.IsNull()) CHI_IPC->DelTask(task_create);
+    if (!task_destroy.IsNull()) CHI_IPC->DelTask(task_destroy);
+    if (!task_alloc.IsNull()) CHI_IPC->DelTask(task_alloc);
+    if (!task_free.IsNull()) CHI_IPC->DelTask(task_free);
+    if (!task_write.IsNull()) CHI_IPC->DelTask(task_write);
+    if (!task_read.IsNull()) CHI_IPC->DelTask(task_read);
+    if (!task_stats.IsNull()) CHI_IPC->DelTask(task_stats);
+    if (!task_unknown.IsNull()) CHI_IPC->DelTask(task_unknown);
   }
 
   SECTION("Bdev Runtime SaveTask/LoadTask all methods") {
@@ -6387,8 +6387,8 @@ TEST_CASE("Autogen - Bdev Runtime Container Methods", "[autogen][bdev][runtime]"
       auto loaded = ipc_manager->NewTask<chimaera::bdev::CreateTask>();
       hipc::FullPtr<chi::Task> loaded_ptr = loaded.template Cast<chi::Task>();
       bdev_runtime.LoadTask(chimaera::bdev::Method::kCreate, load_archive, loaded_ptr);
-      ipc_manager->DelTask(task_c);
-      ipc_manager->DelTask(loaded);
+      CHI_IPC->DelTask(task_c);
+      CHI_IPC->DelTask(loaded);
     }
 
     // Test SaveTask and LoadTask for DestroyTask
@@ -6402,8 +6402,8 @@ TEST_CASE("Autogen - Bdev Runtime Container Methods", "[autogen][bdev][runtime]"
       auto loaded = ipc_manager->NewTask<chimaera::bdev::DestroyTask>();
       hipc::FullPtr<chi::Task> loaded_ptr = loaded.template Cast<chi::Task>();
       bdev_runtime.LoadTask(chimaera::bdev::Method::kDestroy, load_archive, loaded_ptr);
-      ipc_manager->DelTask(task_d);
-      ipc_manager->DelTask(loaded);
+      CHI_IPC->DelTask(task_d);
+      CHI_IPC->DelTask(loaded);
     }
 
     // Test SaveTask and LoadTask for AllocateBlocksTask
@@ -6417,8 +6417,8 @@ TEST_CASE("Autogen - Bdev Runtime Container Methods", "[autogen][bdev][runtime]"
       auto loaded = ipc_manager->NewTask<chimaera::bdev::AllocateBlocksTask>();
       hipc::FullPtr<chi::Task> loaded_ptr = loaded.template Cast<chi::Task>();
       bdev_runtime.LoadTask(chimaera::bdev::Method::kAllocateBlocks, load_archive, loaded_ptr);
-      ipc_manager->DelTask(task_a);
-      ipc_manager->DelTask(loaded);
+      CHI_IPC->DelTask(task_a);
+      CHI_IPC->DelTask(loaded);
     }
 
     // Test SaveTask and LoadTask for FreeBlocksTask
@@ -6432,8 +6432,8 @@ TEST_CASE("Autogen - Bdev Runtime Container Methods", "[autogen][bdev][runtime]"
       auto loaded = ipc_manager->NewTask<chimaera::bdev::FreeBlocksTask>();
       hipc::FullPtr<chi::Task> loaded_ptr = loaded.template Cast<chi::Task>();
       bdev_runtime.LoadTask(chimaera::bdev::Method::kFreeBlocks, load_archive, loaded_ptr);
-      ipc_manager->DelTask(task_f);
-      ipc_manager->DelTask(loaded);
+      CHI_IPC->DelTask(task_f);
+      CHI_IPC->DelTask(loaded);
     }
 
     // Test SaveTask and LoadTask for WriteTask
@@ -6447,8 +6447,8 @@ TEST_CASE("Autogen - Bdev Runtime Container Methods", "[autogen][bdev][runtime]"
       auto loaded = ipc_manager->NewTask<chimaera::bdev::WriteTask>();
       hipc::FullPtr<chi::Task> loaded_ptr = loaded.template Cast<chi::Task>();
       bdev_runtime.LoadTask(chimaera::bdev::Method::kWrite, load_archive, loaded_ptr);
-      ipc_manager->DelTask(task_w);
-      ipc_manager->DelTask(loaded);
+      CHI_IPC->DelTask(task_w);
+      CHI_IPC->DelTask(loaded);
     }
 
     // Test SaveTask and LoadTask for ReadTask
@@ -6462,8 +6462,8 @@ TEST_CASE("Autogen - Bdev Runtime Container Methods", "[autogen][bdev][runtime]"
       auto loaded = ipc_manager->NewTask<chimaera::bdev::ReadTask>();
       hipc::FullPtr<chi::Task> loaded_ptr = loaded.template Cast<chi::Task>();
       bdev_runtime.LoadTask(chimaera::bdev::Method::kRead, load_archive, loaded_ptr);
-      ipc_manager->DelTask(task_r);
-      ipc_manager->DelTask(loaded);
+      CHI_IPC->DelTask(task_r);
+      CHI_IPC->DelTask(loaded);
     }
 
     // Test SaveTask and LoadTask for GetStatsTask
@@ -6477,8 +6477,8 @@ TEST_CASE("Autogen - Bdev Runtime Container Methods", "[autogen][bdev][runtime]"
       auto loaded = ipc_manager->NewTask<chimaera::bdev::GetStatsTask>();
       hipc::FullPtr<chi::Task> loaded_ptr = loaded.template Cast<chi::Task>();
       bdev_runtime.LoadTask(chimaera::bdev::Method::kGetStats, load_archive, loaded_ptr);
-      ipc_manager->DelTask(task_s);
-      ipc_manager->DelTask(loaded);
+      CHI_IPC->DelTask(task_s);
+      CHI_IPC->DelTask(loaded);
     }
 
     INFO("Bdev Runtime::SaveTask/LoadTask tests completed");
@@ -6491,56 +6491,56 @@ TEST_CASE("Autogen - Bdev Runtime Container Methods", "[autogen][bdev][runtime]"
     if (!orig_c.IsNull()) {
       hipc::FullPtr<chi::Task> orig_ptr = orig_c.template Cast<chi::Task>();
       auto copy = bdev_runtime.NewCopyTask(chimaera::bdev::Method::kCreate, orig_ptr, false);
-      if (!copy.IsNull()) ipc_manager->DelTask(copy.template Cast<chimaera::bdev::CreateTask>());
-      ipc_manager->DelTask(orig_c);
+      if (!copy.IsNull()) CHI_IPC->DelTask(copy.template Cast<chimaera::bdev::CreateTask>());
+      CHI_IPC->DelTask(orig_c);
     }
 
     auto orig_d = ipc_manager->NewTask<chimaera::bdev::DestroyTask>();
     if (!orig_d.IsNull()) {
       hipc::FullPtr<chi::Task> orig_ptr = orig_d.template Cast<chi::Task>();
       auto copy = bdev_runtime.NewCopyTask(chimaera::bdev::Method::kDestroy, orig_ptr, false);
-      if (!copy.IsNull()) ipc_manager->DelTask(copy.template Cast<chimaera::bdev::DestroyTask>());
-      ipc_manager->DelTask(orig_d);
+      if (!copy.IsNull()) CHI_IPC->DelTask(copy.template Cast<chimaera::bdev::DestroyTask>());
+      CHI_IPC->DelTask(orig_d);
     }
 
     auto orig_a = ipc_manager->NewTask<chimaera::bdev::AllocateBlocksTask>();
     if (!orig_a.IsNull()) {
       hipc::FullPtr<chi::Task> orig_ptr = orig_a.template Cast<chi::Task>();
       auto copy = bdev_runtime.NewCopyTask(chimaera::bdev::Method::kAllocateBlocks, orig_ptr, false);
-      if (!copy.IsNull()) ipc_manager->DelTask(copy.template Cast<chimaera::bdev::AllocateBlocksTask>());
-      ipc_manager->DelTask(orig_a);
+      if (!copy.IsNull()) CHI_IPC->DelTask(copy.template Cast<chimaera::bdev::AllocateBlocksTask>());
+      CHI_IPC->DelTask(orig_a);
     }
 
     auto orig_f = ipc_manager->NewTask<chimaera::bdev::FreeBlocksTask>();
     if (!orig_f.IsNull()) {
       hipc::FullPtr<chi::Task> orig_ptr = orig_f.template Cast<chi::Task>();
       auto copy = bdev_runtime.NewCopyTask(chimaera::bdev::Method::kFreeBlocks, orig_ptr, false);
-      if (!copy.IsNull()) ipc_manager->DelTask(copy.template Cast<chimaera::bdev::FreeBlocksTask>());
-      ipc_manager->DelTask(orig_f);
+      if (!copy.IsNull()) CHI_IPC->DelTask(copy.template Cast<chimaera::bdev::FreeBlocksTask>());
+      CHI_IPC->DelTask(orig_f);
     }
 
     auto orig_w = ipc_manager->NewTask<chimaera::bdev::WriteTask>();
     if (!orig_w.IsNull()) {
       hipc::FullPtr<chi::Task> orig_ptr = orig_w.template Cast<chi::Task>();
       auto copy = bdev_runtime.NewCopyTask(chimaera::bdev::Method::kWrite, orig_ptr, false);
-      if (!copy.IsNull()) ipc_manager->DelTask(copy.template Cast<chimaera::bdev::WriteTask>());
-      ipc_manager->DelTask(orig_w);
+      if (!copy.IsNull()) CHI_IPC->DelTask(copy.template Cast<chimaera::bdev::WriteTask>());
+      CHI_IPC->DelTask(orig_w);
     }
 
     auto orig_r = ipc_manager->NewTask<chimaera::bdev::ReadTask>();
     if (!orig_r.IsNull()) {
       hipc::FullPtr<chi::Task> orig_ptr = orig_r.template Cast<chi::Task>();
       auto copy = bdev_runtime.NewCopyTask(chimaera::bdev::Method::kRead, orig_ptr, false);
-      if (!copy.IsNull()) ipc_manager->DelTask(copy.template Cast<chimaera::bdev::ReadTask>());
-      ipc_manager->DelTask(orig_r);
+      if (!copy.IsNull()) CHI_IPC->DelTask(copy.template Cast<chimaera::bdev::ReadTask>());
+      CHI_IPC->DelTask(orig_r);
     }
 
     auto orig_s = ipc_manager->NewTask<chimaera::bdev::GetStatsTask>();
     if (!orig_s.IsNull()) {
       hipc::FullPtr<chi::Task> orig_ptr = orig_s.template Cast<chi::Task>();
       auto copy = bdev_runtime.NewCopyTask(chimaera::bdev::Method::kGetStats, orig_ptr, false);
-      if (!copy.IsNull()) ipc_manager->DelTask(copy.template Cast<chimaera::bdev::GetStatsTask>());
-      ipc_manager->DelTask(orig_s);
+      if (!copy.IsNull()) CHI_IPC->DelTask(copy.template Cast<chimaera::bdev::GetStatsTask>());
+      CHI_IPC->DelTask(orig_s);
     }
 
     INFO("Bdev Runtime::NewCopyTask tests completed");
@@ -6554,9 +6554,9 @@ TEST_CASE("Autogen - Bdev Runtime Container Methods", "[autogen][bdev][runtime]"
     if (!t1_c.IsNull() && !t2_c.IsNull()) {
       hipc::FullPtr<chi::Task> ptr1 = t1_c.template Cast<chi::Task>();
       hipc::FullPtr<chi::Task> ptr2 = t2_c.template Cast<chi::Task>();
-      bdev_runtime.Aggregate(chimaera::bdev::Method::kCreate, ptr1, ptr2);
-      ipc_manager->DelTask(t1_c);
-      ipc_manager->DelTask(t2_c);
+      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      CHI_IPC->DelTask(t1_c);
+      CHI_IPC->DelTask(t2_c);
     }
 
     auto t1_d = ipc_manager->NewTask<chimaera::bdev::DestroyTask>();
@@ -6564,9 +6564,9 @@ TEST_CASE("Autogen - Bdev Runtime Container Methods", "[autogen][bdev][runtime]"
     if (!t1_d.IsNull() && !t2_d.IsNull()) {
       hipc::FullPtr<chi::Task> ptr1 = t1_d.template Cast<chi::Task>();
       hipc::FullPtr<chi::Task> ptr2 = t2_d.template Cast<chi::Task>();
-      bdev_runtime.Aggregate(chimaera::bdev::Method::kDestroy, ptr1, ptr2);
-      ipc_manager->DelTask(t1_d);
-      ipc_manager->DelTask(t2_d);
+      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      CHI_IPC->DelTask(t1_d);
+      CHI_IPC->DelTask(t2_d);
     }
 
     auto t1_a = ipc_manager->NewTask<chimaera::bdev::AllocateBlocksTask>();
@@ -6574,9 +6574,9 @@ TEST_CASE("Autogen - Bdev Runtime Container Methods", "[autogen][bdev][runtime]"
     if (!t1_a.IsNull() && !t2_a.IsNull()) {
       hipc::FullPtr<chi::Task> ptr1 = t1_a.template Cast<chi::Task>();
       hipc::FullPtr<chi::Task> ptr2 = t2_a.template Cast<chi::Task>();
-      bdev_runtime.Aggregate(chimaera::bdev::Method::kAllocateBlocks, ptr1, ptr2);
-      ipc_manager->DelTask(t1_a);
-      ipc_manager->DelTask(t2_a);
+      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      CHI_IPC->DelTask(t1_a);
+      CHI_IPC->DelTask(t2_a);
     }
 
     auto t1_f = ipc_manager->NewTask<chimaera::bdev::FreeBlocksTask>();
@@ -6584,9 +6584,9 @@ TEST_CASE("Autogen - Bdev Runtime Container Methods", "[autogen][bdev][runtime]"
     if (!t1_f.IsNull() && !t2_f.IsNull()) {
       hipc::FullPtr<chi::Task> ptr1 = t1_f.template Cast<chi::Task>();
       hipc::FullPtr<chi::Task> ptr2 = t2_f.template Cast<chi::Task>();
-      bdev_runtime.Aggregate(chimaera::bdev::Method::kFreeBlocks, ptr1, ptr2);
-      ipc_manager->DelTask(t1_f);
-      ipc_manager->DelTask(t2_f);
+      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      CHI_IPC->DelTask(t1_f);
+      CHI_IPC->DelTask(t2_f);
     }
 
     auto t1_w = ipc_manager->NewTask<chimaera::bdev::WriteTask>();
@@ -6594,9 +6594,9 @@ TEST_CASE("Autogen - Bdev Runtime Container Methods", "[autogen][bdev][runtime]"
     if (!t1_w.IsNull() && !t2_w.IsNull()) {
       hipc::FullPtr<chi::Task> ptr1 = t1_w.template Cast<chi::Task>();
       hipc::FullPtr<chi::Task> ptr2 = t2_w.template Cast<chi::Task>();
-      bdev_runtime.Aggregate(chimaera::bdev::Method::kWrite, ptr1, ptr2);
-      ipc_manager->DelTask(t1_w);
-      ipc_manager->DelTask(t2_w);
+      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      CHI_IPC->DelTask(t1_w);
+      CHI_IPC->DelTask(t2_w);
     }
 
     auto t1_r = ipc_manager->NewTask<chimaera::bdev::ReadTask>();
@@ -6604,9 +6604,9 @@ TEST_CASE("Autogen - Bdev Runtime Container Methods", "[autogen][bdev][runtime]"
     if (!t1_r.IsNull() && !t2_r.IsNull()) {
       hipc::FullPtr<chi::Task> ptr1 = t1_r.template Cast<chi::Task>();
       hipc::FullPtr<chi::Task> ptr2 = t2_r.template Cast<chi::Task>();
-      bdev_runtime.Aggregate(chimaera::bdev::Method::kRead, ptr1, ptr2);
-      ipc_manager->DelTask(t1_r);
-      ipc_manager->DelTask(t2_r);
+      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      CHI_IPC->DelTask(t1_r);
+      CHI_IPC->DelTask(t2_r);
     }
 
     auto t1_s = ipc_manager->NewTask<chimaera::bdev::GetStatsTask>();
@@ -6614,9 +6614,9 @@ TEST_CASE("Autogen - Bdev Runtime Container Methods", "[autogen][bdev][runtime]"
     if (!t1_s.IsNull() && !t2_s.IsNull()) {
       hipc::FullPtr<chi::Task> ptr1 = t1_s.template Cast<chi::Task>();
       hipc::FullPtr<chi::Task> ptr2 = t2_s.template Cast<chi::Task>();
-      bdev_runtime.Aggregate(chimaera::bdev::Method::kGetStats, ptr1, ptr2);
-      ipc_manager->DelTask(t1_s);
-      ipc_manager->DelTask(t2_s);
+      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      CHI_IPC->DelTask(t1_s);
+      CHI_IPC->DelTask(t2_s);
     }
 
     INFO("Bdev Runtime::Aggregate tests completed");
@@ -6642,28 +6642,28 @@ TEST_CASE("Autogen - CAE Runtime Container Methods", "[autogen][cae][runtime]") 
     auto task_create = cae_runtime.NewTask(wrp_cae::core::Method::kCreate);
     REQUIRE_FALSE(task_create.IsNull());
     if (!task_create.IsNull()) {
-      cae_runtime.DelTask(wrp_cae::core::Method::kCreate, task_create);
+      CHI_IPC->DelTask(task_create);
     }
 
     // Test kDestroy
     auto task_destroy = cae_runtime.NewTask(wrp_cae::core::Method::kDestroy);
     REQUIRE_FALSE(task_destroy.IsNull());
     if (!task_destroy.IsNull()) {
-      cae_runtime.DelTask(wrp_cae::core::Method::kDestroy, task_destroy);
+      CHI_IPC->DelTask(task_destroy);
     }
 
     // Test kParseOmni
     auto task_parse = cae_runtime.NewTask(wrp_cae::core::Method::kParseOmni);
     REQUIRE_FALSE(task_parse.IsNull());
     if (!task_parse.IsNull()) {
-      cae_runtime.DelTask(wrp_cae::core::Method::kParseOmni, task_parse);
+      CHI_IPC->DelTask(task_parse);
     }
 
     // Test kProcessHdf5Dataset
     auto task_hdf5 = cae_runtime.NewTask(wrp_cae::core::Method::kProcessHdf5Dataset);
     REQUIRE_FALSE(task_hdf5.IsNull());
     if (!task_hdf5.IsNull()) {
-      cae_runtime.DelTask(wrp_cae::core::Method::kProcessHdf5Dataset, task_hdf5);
+      CHI_IPC->DelTask(task_hdf5);
     }
 
     // Test unknown method (should return null)
@@ -6679,30 +6679,30 @@ TEST_CASE("Autogen - CAE Runtime Container Methods", "[autogen][cae][runtime]") 
     auto task_create = ipc_manager->NewTask<wrp_cae::core::CreateTask>();
     if (!task_create.IsNull()) {
       hipc::FullPtr<chi::Task> task_ptr = task_create.template Cast<chi::Task>();
-      cae_runtime.DelTask(wrp_cae::core::Method::kCreate, task_ptr);
+      CHI_IPC->DelTask(task_ptr);
     }
 
     auto task_destroy = ipc_manager->NewTask<chi::Task>();
     if (!task_destroy.IsNull()) {
-      cae_runtime.DelTask(wrp_cae::core::Method::kDestroy, task_destroy);
+      CHI_IPC->DelTask(task_destroy);
     }
 
     auto task_parse = ipc_manager->NewTask<wrp_cae::core::ParseOmniTask>();
     if (!task_parse.IsNull()) {
       hipc::FullPtr<chi::Task> task_ptr = task_parse.template Cast<chi::Task>();
-      cae_runtime.DelTask(wrp_cae::core::Method::kParseOmni, task_ptr);
+      CHI_IPC->DelTask(task_ptr);
     }
 
     auto task_hdf5 = ipc_manager->NewTask<wrp_cae::core::ProcessHdf5DatasetTask>();
     if (!task_hdf5.IsNull()) {
       hipc::FullPtr<chi::Task> task_ptr = task_hdf5.template Cast<chi::Task>();
-      cae_runtime.DelTask(wrp_cae::core::Method::kProcessHdf5Dataset, task_ptr);
+      CHI_IPC->DelTask(task_ptr);
     }
 
     // Test default case (unknown method)
     auto task_unknown = ipc_manager->NewTask<chi::Task>();
     if (!task_unknown.IsNull()) {
-      cae_runtime.DelTask(999, task_unknown);
+      CHI_IPC->DelTask(task_unknown);
     }
 
     INFO("CAE Runtime::DelTask tests completed");
@@ -6724,9 +6724,9 @@ TEST_CASE("Autogen - CAE Runtime Container Methods", "[autogen][cae][runtime]") 
       if (!loaded.IsNull()) {
         hipc::FullPtr<chi::Task> loaded_ptr = loaded.template Cast<chi::Task>();
         cae_runtime.LoadTask(wrp_cae::core::Method::kCreate, load_archive, loaded_ptr);
-        ipc_manager->DelTask(loaded);
+        CHI_IPC->DelTask(loaded);
       }
-      ipc_manager->DelTask(task_create);
+      CHI_IPC->DelTask(task_create);
     }
 
     // Test kDestroy
@@ -6740,9 +6740,9 @@ TEST_CASE("Autogen - CAE Runtime Container Methods", "[autogen][cae][runtime]") 
       auto loaded = ipc_manager->NewTask<chi::Task>();
       if (!loaded.IsNull()) {
         cae_runtime.LoadTask(wrp_cae::core::Method::kDestroy, load_archive, loaded);
-        ipc_manager->DelTask(loaded);
+        CHI_IPC->DelTask(loaded);
       }
-      ipc_manager->DelTask(task_destroy);
+      CHI_IPC->DelTask(task_destroy);
     }
 
     // Test kParseOmni
@@ -6758,9 +6758,9 @@ TEST_CASE("Autogen - CAE Runtime Container Methods", "[autogen][cae][runtime]") 
       if (!loaded.IsNull()) {
         hipc::FullPtr<chi::Task> loaded_ptr = loaded.template Cast<chi::Task>();
         cae_runtime.LoadTask(wrp_cae::core::Method::kParseOmni, load_archive, loaded_ptr);
-        ipc_manager->DelTask(loaded);
+        CHI_IPC->DelTask(loaded);
       }
-      ipc_manager->DelTask(task_parse);
+      CHI_IPC->DelTask(task_parse);
     }
 
     // Test kProcessHdf5Dataset
@@ -6776,9 +6776,9 @@ TEST_CASE("Autogen - CAE Runtime Container Methods", "[autogen][cae][runtime]") 
       if (!loaded.IsNull()) {
         hipc::FullPtr<chi::Task> loaded_ptr = loaded.template Cast<chi::Task>();
         cae_runtime.LoadTask(wrp_cae::core::Method::kProcessHdf5Dataset, load_archive, loaded_ptr);
-        ipc_manager->DelTask(loaded);
+        CHI_IPC->DelTask(loaded);
       }
-      ipc_manager->DelTask(task_hdf5);
+      CHI_IPC->DelTask(task_hdf5);
     }
 
     // Test default case (unknown method)
@@ -6789,7 +6789,7 @@ TEST_CASE("Autogen - CAE Runtime Container Methods", "[autogen][cae][runtime]") 
       chi::LoadTaskArchive load_archive(save_archive.GetData());
       load_archive.msg_type_ = chi::MsgType::kSerializeIn;
       cae_runtime.LoadTask(999, load_archive, task_unknown);
-      ipc_manager->DelTask(task_unknown);
+      CHI_IPC->DelTask(task_unknown);
     }
 
     INFO("CAE Runtime::SaveTask/LoadTask tests completed");
@@ -6810,9 +6810,9 @@ TEST_CASE("Autogen - CAE Runtime Container Methods", "[autogen][cae][runtime]") 
         load_archive.msg_type_ = chi::MsgType::kSerializeIn;
         auto loaded = cae_runtime.AllocLoadTask(wrp_cae::core::Method::kCreate, load_archive);
         if (!loaded.IsNull()) {
-          cae_runtime.DelTask(wrp_cae::core::Method::kCreate, loaded);
+          CHI_IPC->DelTask(loaded);
         }
-        ipc_manager->DelTask(orig);
+        CHI_IPC->DelTask(orig);
       }
     }
 
@@ -6828,9 +6828,9 @@ TEST_CASE("Autogen - CAE Runtime Container Methods", "[autogen][cae][runtime]") 
         load_archive.msg_type_ = chi::MsgType::kSerializeIn;
         auto loaded = cae_runtime.AllocLoadTask(wrp_cae::core::Method::kParseOmni, load_archive);
         if (!loaded.IsNull()) {
-          cae_runtime.DelTask(wrp_cae::core::Method::kParseOmni, loaded);
+          CHI_IPC->DelTask(loaded);
         }
-        ipc_manager->DelTask(orig);
+        CHI_IPC->DelTask(orig);
       }
     }
 
@@ -6846,9 +6846,9 @@ TEST_CASE("Autogen - CAE Runtime Container Methods", "[autogen][cae][runtime]") 
         load_archive.msg_type_ = chi::MsgType::kSerializeIn;
         auto loaded = cae_runtime.AllocLoadTask(wrp_cae::core::Method::kProcessHdf5Dataset, load_archive);
         if (!loaded.IsNull()) {
-          cae_runtime.DelTask(wrp_cae::core::Method::kProcessHdf5Dataset, loaded);
+          CHI_IPC->DelTask(loaded);
         }
-        ipc_manager->DelTask(orig);
+        CHI_IPC->DelTask(orig);
       }
     }
 
@@ -6863,16 +6863,16 @@ TEST_CASE("Autogen - CAE Runtime Container Methods", "[autogen][cae][runtime]") 
     if (!orig_c.IsNull()) {
       hipc::FullPtr<chi::Task> orig_ptr = orig_c.template Cast<chi::Task>();
       auto copy = cae_runtime.NewCopyTask(wrp_cae::core::Method::kCreate, orig_ptr, false);
-      if (!copy.IsNull()) ipc_manager->DelTask(copy.template Cast<wrp_cae::core::CreateTask>());
-      ipc_manager->DelTask(orig_c);
+      if (!copy.IsNull()) CHI_IPC->DelTask(copy.template Cast<wrp_cae::core::CreateTask>());
+      CHI_IPC->DelTask(orig_c);
     }
 
     // Test kDestroy
     auto orig_d = ipc_manager->NewTask<chi::Task>();
     if (!orig_d.IsNull()) {
       auto copy = cae_runtime.NewCopyTask(wrp_cae::core::Method::kDestroy, orig_d, false);
-      if (!copy.IsNull()) ipc_manager->DelTask(copy);
-      ipc_manager->DelTask(orig_d);
+      if (!copy.IsNull()) CHI_IPC->DelTask(copy);
+      CHI_IPC->DelTask(orig_d);
     }
 
     // Test kParseOmni
@@ -6880,8 +6880,8 @@ TEST_CASE("Autogen - CAE Runtime Container Methods", "[autogen][cae][runtime]") 
     if (!orig_p.IsNull()) {
       hipc::FullPtr<chi::Task> orig_ptr = orig_p.template Cast<chi::Task>();
       auto copy = cae_runtime.NewCopyTask(wrp_cae::core::Method::kParseOmni, orig_ptr, false);
-      if (!copy.IsNull()) ipc_manager->DelTask(copy.template Cast<wrp_cae::core::ParseOmniTask>());
-      ipc_manager->DelTask(orig_p);
+      if (!copy.IsNull()) CHI_IPC->DelTask(copy.template Cast<wrp_cae::core::ParseOmniTask>());
+      CHI_IPC->DelTask(orig_p);
     }
 
     // Test kProcessHdf5Dataset
@@ -6889,16 +6889,16 @@ TEST_CASE("Autogen - CAE Runtime Container Methods", "[autogen][cae][runtime]") 
     if (!orig_h.IsNull()) {
       hipc::FullPtr<chi::Task> orig_ptr = orig_h.template Cast<chi::Task>();
       auto copy = cae_runtime.NewCopyTask(wrp_cae::core::Method::kProcessHdf5Dataset, orig_ptr, false);
-      if (!copy.IsNull()) ipc_manager->DelTask(copy.template Cast<wrp_cae::core::ProcessHdf5DatasetTask>());
-      ipc_manager->DelTask(orig_h);
+      if (!copy.IsNull()) CHI_IPC->DelTask(copy.template Cast<wrp_cae::core::ProcessHdf5DatasetTask>());
+      CHI_IPC->DelTask(orig_h);
     }
 
     // Test unknown method (default case)
     auto orig_u = ipc_manager->NewTask<chi::Task>();
     if (!orig_u.IsNull()) {
       auto copy = cae_runtime.NewCopyTask(999, orig_u, true);
-      if (!copy.IsNull()) ipc_manager->DelTask(copy);
-      ipc_manager->DelTask(orig_u);
+      if (!copy.IsNull()) CHI_IPC->DelTask(copy);
+      CHI_IPC->DelTask(orig_u);
     }
 
     INFO("CAE Runtime::NewCopyTask tests completed");
@@ -6913,18 +6913,18 @@ TEST_CASE("Autogen - CAE Runtime Container Methods", "[autogen][cae][runtime]") 
     if (!t1_c.IsNull() && !t2_c.IsNull()) {
       hipc::FullPtr<chi::Task> ptr1 = t1_c.template Cast<chi::Task>();
       hipc::FullPtr<chi::Task> ptr2 = t2_c.template Cast<chi::Task>();
-      cae_runtime.Aggregate(wrp_cae::core::Method::kCreate, ptr1, ptr2);
-      ipc_manager->DelTask(t1_c);
-      ipc_manager->DelTask(t2_c);
+      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      CHI_IPC->DelTask(t1_c);
+      CHI_IPC->DelTask(t2_c);
     }
 
     // Test kDestroy
     auto t1_d = ipc_manager->NewTask<chi::Task>();
     auto t2_d = ipc_manager->NewTask<chi::Task>();
     if (!t1_d.IsNull() && !t2_d.IsNull()) {
-      cae_runtime.Aggregate(wrp_cae::core::Method::kDestroy, t1_d, t2_d);
-      ipc_manager->DelTask(t1_d);
-      ipc_manager->DelTask(t2_d);
+      t1_d.ptr_->Aggregate(t2_d.template Cast<chi::Task>());
+      CHI_IPC->DelTask(t1_d);
+      CHI_IPC->DelTask(t2_d);
     }
 
     // Test kParseOmni
@@ -6933,9 +6933,9 @@ TEST_CASE("Autogen - CAE Runtime Container Methods", "[autogen][cae][runtime]") 
     if (!t1_p.IsNull() && !t2_p.IsNull()) {
       hipc::FullPtr<chi::Task> ptr1 = t1_p.template Cast<chi::Task>();
       hipc::FullPtr<chi::Task> ptr2 = t2_p.template Cast<chi::Task>();
-      cae_runtime.Aggregate(wrp_cae::core::Method::kParseOmni, ptr1, ptr2);
-      ipc_manager->DelTask(t1_p);
-      ipc_manager->DelTask(t2_p);
+      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      CHI_IPC->DelTask(t1_p);
+      CHI_IPC->DelTask(t2_p);
     }
 
     // Test kProcessHdf5Dataset
@@ -6944,18 +6944,18 @@ TEST_CASE("Autogen - CAE Runtime Container Methods", "[autogen][cae][runtime]") 
     if (!t1_h.IsNull() && !t2_h.IsNull()) {
       hipc::FullPtr<chi::Task> ptr1 = t1_h.template Cast<chi::Task>();
       hipc::FullPtr<chi::Task> ptr2 = t2_h.template Cast<chi::Task>();
-      cae_runtime.Aggregate(wrp_cae::core::Method::kProcessHdf5Dataset, ptr1, ptr2);
-      ipc_manager->DelTask(t1_h);
-      ipc_manager->DelTask(t2_h);
+      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      CHI_IPC->DelTask(t1_h);
+      CHI_IPC->DelTask(t2_h);
     }
 
     // Test unknown method (default case)
     auto t1_u = ipc_manager->NewTask<chi::Task>();
     auto t2_u = ipc_manager->NewTask<chi::Task>();
     if (!t1_u.IsNull() && !t2_u.IsNull()) {
-      cae_runtime.Aggregate(999, t1_u, t2_u);
-      ipc_manager->DelTask(t1_u);
-      ipc_manager->DelTask(t2_u);
+      t1_u.ptr_->Aggregate(t2_u.template Cast<chi::Task>());
+      CHI_IPC->DelTask(t1_u);
+      CHI_IPC->DelTask(t2_u);
     }
 
     INFO("CAE Runtime::Aggregate tests completed");
@@ -7009,10 +7009,10 @@ TEST_CASE("Autogen - CAE Task Serialization Methods", "[autogen][cae][serialize]
       auto loaded = ipc_manager->NewTask<wrp_cae::core::ParseOmniTask>();
       if (!loaded.IsNull()) {
         loaded->SerializeIn(load_archive);
-        ipc_manager->DelTask(loaded);
+        CHI_IPC->DelTask(loaded);
       }
 
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
     }
     INFO("ParseOmniTask serialization test passed");
   }
@@ -7034,10 +7034,10 @@ TEST_CASE("Autogen - CAE Task Serialization Methods", "[autogen][cae][serialize]
       auto loaded = ipc_manager->NewTask<wrp_cae::core::ProcessHdf5DatasetTask>();
       if (!loaded.IsNull()) {
         loaded->SerializeIn(load_archive);
-        ipc_manager->DelTask(loaded);
+        CHI_IPC->DelTask(loaded);
       }
 
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
     }
     INFO("ProcessHdf5DatasetTask serialization test passed");
   }
@@ -7047,8 +7047,8 @@ TEST_CASE("Autogen - CAE Task Serialization Methods", "[autogen][cae][serialize]
     auto task2 = ipc_manager->NewTask<wrp_cae::core::ParseOmniTask>();
     if (!task1.IsNull() && !task2.IsNull()) {
       task1->Copy(task2);
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
     INFO("ParseOmniTask Copy test passed");
   }
@@ -7058,8 +7058,8 @@ TEST_CASE("Autogen - CAE Task Serialization Methods", "[autogen][cae][serialize]
     auto task2 = ipc_manager->NewTask<wrp_cae::core::ProcessHdf5DatasetTask>();
     if (!task1.IsNull() && !task2.IsNull()) {
       task1->Copy(task2);
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
     INFO("ProcessHdf5DatasetTask Copy test passed");
   }
@@ -7072,11 +7072,11 @@ TEST_CASE("Autogen - CAE Task Serialization Methods", "[autogen][cae][serialize]
       task2->result_code_ = 42;
 
       // Aggregate should propagate error
-      task1->Aggregate(task2);
+      task1->Aggregate(task2.template Cast<chi::Task>());
       REQUIRE(task1->result_code_ == 42);
 
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
     INFO("ProcessHdf5DatasetTask Aggregate with error propagation test passed");
   }
@@ -7107,42 +7107,42 @@ TEST_CASE("Autogen - MOD_NAME Runtime Container Methods", "[autogen][mod_name][r
     auto task_create = mod_name_runtime.NewTask(chimaera::MOD_NAME::Method::kCreate);
     REQUIRE_FALSE(task_create.IsNull());
     if (!task_create.IsNull()) {
-      mod_name_runtime.DelTask(chimaera::MOD_NAME::Method::kCreate, task_create);
+      CHI_IPC->DelTask(task_create);
     }
 
     // Test kDestroy
     auto task_destroy = mod_name_runtime.NewTask(chimaera::MOD_NAME::Method::kDestroy);
     REQUIRE_FALSE(task_destroy.IsNull());
     if (!task_destroy.IsNull()) {
-      mod_name_runtime.DelTask(chimaera::MOD_NAME::Method::kDestroy, task_destroy);
+      CHI_IPC->DelTask(task_destroy);
     }
 
     // Test kCustom
     auto task_custom = mod_name_runtime.NewTask(chimaera::MOD_NAME::Method::kCustom);
     REQUIRE_FALSE(task_custom.IsNull());
     if (!task_custom.IsNull()) {
-      mod_name_runtime.DelTask(chimaera::MOD_NAME::Method::kCustom, task_custom);
+      CHI_IPC->DelTask(task_custom);
     }
 
     // Test kCoMutexTest
     auto task_comutex = mod_name_runtime.NewTask(chimaera::MOD_NAME::Method::kCoMutexTest);
     REQUIRE_FALSE(task_comutex.IsNull());
     if (!task_comutex.IsNull()) {
-      mod_name_runtime.DelTask(chimaera::MOD_NAME::Method::kCoMutexTest, task_comutex);
+      CHI_IPC->DelTask(task_comutex);
     }
 
     // Test kCoRwLockTest
     auto task_corwlock = mod_name_runtime.NewTask(chimaera::MOD_NAME::Method::kCoRwLockTest);
     REQUIRE_FALSE(task_corwlock.IsNull());
     if (!task_corwlock.IsNull()) {
-      mod_name_runtime.DelTask(chimaera::MOD_NAME::Method::kCoRwLockTest, task_corwlock);
+      CHI_IPC->DelTask(task_corwlock);
     }
 
     // Test kWaitTest
     auto task_wait = mod_name_runtime.NewTask(chimaera::MOD_NAME::Method::kWaitTest);
     REQUIRE_FALSE(task_wait.IsNull());
     if (!task_wait.IsNull()) {
-      mod_name_runtime.DelTask(chimaera::MOD_NAME::Method::kWaitTest, task_wait);
+      CHI_IPC->DelTask(task_wait);
     }
 
     // Test unknown method (should return null)
@@ -7158,43 +7158,43 @@ TEST_CASE("Autogen - MOD_NAME Runtime Container Methods", "[autogen][mod_name][r
     auto task_create = ipc_manager->NewTask<chimaera::MOD_NAME::CreateTask>();
     if (!task_create.IsNull()) {
       hipc::FullPtr<chi::Task> task_ptr = task_create.template Cast<chi::Task>();
-      mod_name_runtime.DelTask(chimaera::MOD_NAME::Method::kCreate, task_ptr);
+      CHI_IPC->DelTask(task_ptr);
     }
 
     auto task_destroy = ipc_manager->NewTask<chimaera::MOD_NAME::DestroyTask>();
     if (!task_destroy.IsNull()) {
       hipc::FullPtr<chi::Task> task_ptr = task_destroy.template Cast<chi::Task>();
-      mod_name_runtime.DelTask(chimaera::MOD_NAME::Method::kDestroy, task_ptr);
+      CHI_IPC->DelTask(task_ptr);
     }
 
     auto task_custom = ipc_manager->NewTask<chimaera::MOD_NAME::CustomTask>();
     if (!task_custom.IsNull()) {
       hipc::FullPtr<chi::Task> task_ptr = task_custom.template Cast<chi::Task>();
-      mod_name_runtime.DelTask(chimaera::MOD_NAME::Method::kCustom, task_ptr);
+      CHI_IPC->DelTask(task_ptr);
     }
 
     auto task_comutex = ipc_manager->NewTask<chimaera::MOD_NAME::CoMutexTestTask>();
     if (!task_comutex.IsNull()) {
       hipc::FullPtr<chi::Task> task_ptr = task_comutex.template Cast<chi::Task>();
-      mod_name_runtime.DelTask(chimaera::MOD_NAME::Method::kCoMutexTest, task_ptr);
+      CHI_IPC->DelTask(task_ptr);
     }
 
     auto task_corwlock = ipc_manager->NewTask<chimaera::MOD_NAME::CoRwLockTestTask>();
     if (!task_corwlock.IsNull()) {
       hipc::FullPtr<chi::Task> task_ptr = task_corwlock.template Cast<chi::Task>();
-      mod_name_runtime.DelTask(chimaera::MOD_NAME::Method::kCoRwLockTest, task_ptr);
+      CHI_IPC->DelTask(task_ptr);
     }
 
     auto task_wait = ipc_manager->NewTask<chimaera::MOD_NAME::WaitTestTask>();
     if (!task_wait.IsNull()) {
       hipc::FullPtr<chi::Task> task_ptr = task_wait.template Cast<chi::Task>();
-      mod_name_runtime.DelTask(chimaera::MOD_NAME::Method::kWaitTest, task_ptr);
+      CHI_IPC->DelTask(task_ptr);
     }
 
     // Test default case (unknown method)
     auto task_unknown = ipc_manager->NewTask<chi::Task>();
     if (!task_unknown.IsNull()) {
-      mod_name_runtime.DelTask(999, task_unknown);
+      CHI_IPC->DelTask(task_unknown);
     }
 
     INFO("MOD_NAME Runtime::DelTask tests completed");
@@ -7216,9 +7216,9 @@ TEST_CASE("Autogen - MOD_NAME Runtime Container Methods", "[autogen][mod_name][r
       if (!loaded.IsNull()) {
         hipc::FullPtr<chi::Task> loaded_ptr = loaded.template Cast<chi::Task>();
         mod_name_runtime.LoadTask(chimaera::MOD_NAME::Method::kCreate, load_archive, loaded_ptr);
-        ipc_manager->DelTask(loaded);
+        CHI_IPC->DelTask(loaded);
       }
-      ipc_manager->DelTask(task_create);
+      CHI_IPC->DelTask(task_create);
     }
 
     // Test kDestroy
@@ -7234,9 +7234,9 @@ TEST_CASE("Autogen - MOD_NAME Runtime Container Methods", "[autogen][mod_name][r
       if (!loaded.IsNull()) {
         hipc::FullPtr<chi::Task> loaded_ptr = loaded.template Cast<chi::Task>();
         mod_name_runtime.LoadTask(chimaera::MOD_NAME::Method::kDestroy, load_archive, loaded_ptr);
-        ipc_manager->DelTask(loaded);
+        CHI_IPC->DelTask(loaded);
       }
-      ipc_manager->DelTask(task_destroy);
+      CHI_IPC->DelTask(task_destroy);
     }
 
     // Test kCustom
@@ -7252,9 +7252,9 @@ TEST_CASE("Autogen - MOD_NAME Runtime Container Methods", "[autogen][mod_name][r
       if (!loaded.IsNull()) {
         hipc::FullPtr<chi::Task> loaded_ptr = loaded.template Cast<chi::Task>();
         mod_name_runtime.LoadTask(chimaera::MOD_NAME::Method::kCustom, load_archive, loaded_ptr);
-        ipc_manager->DelTask(loaded);
+        CHI_IPC->DelTask(loaded);
       }
-      ipc_manager->DelTask(task_custom);
+      CHI_IPC->DelTask(task_custom);
     }
 
     // Test kCoMutexTest
@@ -7270,9 +7270,9 @@ TEST_CASE("Autogen - MOD_NAME Runtime Container Methods", "[autogen][mod_name][r
       if (!loaded.IsNull()) {
         hipc::FullPtr<chi::Task> loaded_ptr = loaded.template Cast<chi::Task>();
         mod_name_runtime.LoadTask(chimaera::MOD_NAME::Method::kCoMutexTest, load_archive, loaded_ptr);
-        ipc_manager->DelTask(loaded);
+        CHI_IPC->DelTask(loaded);
       }
-      ipc_manager->DelTask(task_comutex);
+      CHI_IPC->DelTask(task_comutex);
     }
 
     // Test kCoRwLockTest
@@ -7288,9 +7288,9 @@ TEST_CASE("Autogen - MOD_NAME Runtime Container Methods", "[autogen][mod_name][r
       if (!loaded.IsNull()) {
         hipc::FullPtr<chi::Task> loaded_ptr = loaded.template Cast<chi::Task>();
         mod_name_runtime.LoadTask(chimaera::MOD_NAME::Method::kCoRwLockTest, load_archive, loaded_ptr);
-        ipc_manager->DelTask(loaded);
+        CHI_IPC->DelTask(loaded);
       }
-      ipc_manager->DelTask(task_corwlock);
+      CHI_IPC->DelTask(task_corwlock);
     }
 
     // Test kWaitTest
@@ -7306,9 +7306,9 @@ TEST_CASE("Autogen - MOD_NAME Runtime Container Methods", "[autogen][mod_name][r
       if (!loaded.IsNull()) {
         hipc::FullPtr<chi::Task> loaded_ptr = loaded.template Cast<chi::Task>();
         mod_name_runtime.LoadTask(chimaera::MOD_NAME::Method::kWaitTest, load_archive, loaded_ptr);
-        ipc_manager->DelTask(loaded);
+        CHI_IPC->DelTask(loaded);
       }
-      ipc_manager->DelTask(task_wait);
+      CHI_IPC->DelTask(task_wait);
     }
 
     // Test default case (unknown method)
@@ -7319,7 +7319,7 @@ TEST_CASE("Autogen - MOD_NAME Runtime Container Methods", "[autogen][mod_name][r
       chi::LoadTaskArchive load_archive(save_archive.GetData());
       load_archive.msg_type_ = chi::MsgType::kSerializeIn;
       mod_name_runtime.LoadTask(999, load_archive, task_unknown);
-      ipc_manager->DelTask(task_unknown);
+      CHI_IPC->DelTask(task_unknown);
     }
 
     INFO("MOD_NAME Runtime::SaveTask/LoadTask tests completed");
@@ -7340,9 +7340,9 @@ TEST_CASE("Autogen - MOD_NAME Runtime Container Methods", "[autogen][mod_name][r
         load_archive.msg_type_ = chi::MsgType::kSerializeIn;
         auto loaded = mod_name_runtime.AllocLoadTask(chimaera::MOD_NAME::Method::kCreate, load_archive);
         if (!loaded.IsNull()) {
-          mod_name_runtime.DelTask(chimaera::MOD_NAME::Method::kCreate, loaded);
+          CHI_IPC->DelTask(loaded);
         }
-        ipc_manager->DelTask(orig);
+        CHI_IPC->DelTask(orig);
       }
     }
 
@@ -7358,9 +7358,9 @@ TEST_CASE("Autogen - MOD_NAME Runtime Container Methods", "[autogen][mod_name][r
         load_archive.msg_type_ = chi::MsgType::kSerializeIn;
         auto loaded = mod_name_runtime.AllocLoadTask(chimaera::MOD_NAME::Method::kCustom, load_archive);
         if (!loaded.IsNull()) {
-          mod_name_runtime.DelTask(chimaera::MOD_NAME::Method::kCustom, loaded);
+          CHI_IPC->DelTask(loaded);
         }
-        ipc_manager->DelTask(orig);
+        CHI_IPC->DelTask(orig);
       }
     }
 
@@ -7376,9 +7376,9 @@ TEST_CASE("Autogen - MOD_NAME Runtime Container Methods", "[autogen][mod_name][r
         load_archive.msg_type_ = chi::MsgType::kSerializeIn;
         auto loaded = mod_name_runtime.AllocLoadTask(chimaera::MOD_NAME::Method::kCoMutexTest, load_archive);
         if (!loaded.IsNull()) {
-          mod_name_runtime.DelTask(chimaera::MOD_NAME::Method::kCoMutexTest, loaded);
+          CHI_IPC->DelTask(loaded);
         }
-        ipc_manager->DelTask(orig);
+        CHI_IPC->DelTask(orig);
       }
     }
 
@@ -7394,9 +7394,9 @@ TEST_CASE("Autogen - MOD_NAME Runtime Container Methods", "[autogen][mod_name][r
         load_archive.msg_type_ = chi::MsgType::kSerializeIn;
         auto loaded = mod_name_runtime.AllocLoadTask(chimaera::MOD_NAME::Method::kCoRwLockTest, load_archive);
         if (!loaded.IsNull()) {
-          mod_name_runtime.DelTask(chimaera::MOD_NAME::Method::kCoRwLockTest, loaded);
+          CHI_IPC->DelTask(loaded);
         }
-        ipc_manager->DelTask(orig);
+        CHI_IPC->DelTask(orig);
       }
     }
 
@@ -7412,9 +7412,9 @@ TEST_CASE("Autogen - MOD_NAME Runtime Container Methods", "[autogen][mod_name][r
         load_archive.msg_type_ = chi::MsgType::kSerializeIn;
         auto loaded = mod_name_runtime.AllocLoadTask(chimaera::MOD_NAME::Method::kWaitTest, load_archive);
         if (!loaded.IsNull()) {
-          mod_name_runtime.DelTask(chimaera::MOD_NAME::Method::kWaitTest, loaded);
+          CHI_IPC->DelTask(loaded);
         }
-        ipc_manager->DelTask(orig);
+        CHI_IPC->DelTask(orig);
       }
     }
 
@@ -7429,8 +7429,8 @@ TEST_CASE("Autogen - MOD_NAME Runtime Container Methods", "[autogen][mod_name][r
     if (!orig_c.IsNull()) {
       hipc::FullPtr<chi::Task> orig_ptr = orig_c.template Cast<chi::Task>();
       auto copy = mod_name_runtime.NewCopyTask(chimaera::MOD_NAME::Method::kCreate, orig_ptr, false);
-      if (!copy.IsNull()) ipc_manager->DelTask(copy.template Cast<chimaera::MOD_NAME::CreateTask>());
-      ipc_manager->DelTask(orig_c);
+      if (!copy.IsNull()) CHI_IPC->DelTask(copy.template Cast<chimaera::MOD_NAME::CreateTask>());
+      CHI_IPC->DelTask(orig_c);
     }
 
     // Test kDestroy
@@ -7438,8 +7438,8 @@ TEST_CASE("Autogen - MOD_NAME Runtime Container Methods", "[autogen][mod_name][r
     if (!orig_d.IsNull()) {
       hipc::FullPtr<chi::Task> orig_ptr = orig_d.template Cast<chi::Task>();
       auto copy = mod_name_runtime.NewCopyTask(chimaera::MOD_NAME::Method::kDestroy, orig_ptr, false);
-      if (!copy.IsNull()) ipc_manager->DelTask(copy.template Cast<chimaera::MOD_NAME::DestroyTask>());
-      ipc_manager->DelTask(orig_d);
+      if (!copy.IsNull()) CHI_IPC->DelTask(copy.template Cast<chimaera::MOD_NAME::DestroyTask>());
+      CHI_IPC->DelTask(orig_d);
     }
 
     // Test kCustom
@@ -7447,8 +7447,8 @@ TEST_CASE("Autogen - MOD_NAME Runtime Container Methods", "[autogen][mod_name][r
     if (!orig_cu.IsNull()) {
       hipc::FullPtr<chi::Task> orig_ptr = orig_cu.template Cast<chi::Task>();
       auto copy = mod_name_runtime.NewCopyTask(chimaera::MOD_NAME::Method::kCustom, orig_ptr, false);
-      if (!copy.IsNull()) ipc_manager->DelTask(copy.template Cast<chimaera::MOD_NAME::CustomTask>());
-      ipc_manager->DelTask(orig_cu);
+      if (!copy.IsNull()) CHI_IPC->DelTask(copy.template Cast<chimaera::MOD_NAME::CustomTask>());
+      CHI_IPC->DelTask(orig_cu);
     }
 
     // Test kCoMutexTest
@@ -7456,8 +7456,8 @@ TEST_CASE("Autogen - MOD_NAME Runtime Container Methods", "[autogen][mod_name][r
     if (!orig_cm.IsNull()) {
       hipc::FullPtr<chi::Task> orig_ptr = orig_cm.template Cast<chi::Task>();
       auto copy = mod_name_runtime.NewCopyTask(chimaera::MOD_NAME::Method::kCoMutexTest, orig_ptr, false);
-      if (!copy.IsNull()) ipc_manager->DelTask(copy.template Cast<chimaera::MOD_NAME::CoMutexTestTask>());
-      ipc_manager->DelTask(orig_cm);
+      if (!copy.IsNull()) CHI_IPC->DelTask(copy.template Cast<chimaera::MOD_NAME::CoMutexTestTask>());
+      CHI_IPC->DelTask(orig_cm);
     }
 
     // Test kCoRwLockTest
@@ -7465,8 +7465,8 @@ TEST_CASE("Autogen - MOD_NAME Runtime Container Methods", "[autogen][mod_name][r
     if (!orig_cr.IsNull()) {
       hipc::FullPtr<chi::Task> orig_ptr = orig_cr.template Cast<chi::Task>();
       auto copy = mod_name_runtime.NewCopyTask(chimaera::MOD_NAME::Method::kCoRwLockTest, orig_ptr, false);
-      if (!copy.IsNull()) ipc_manager->DelTask(copy.template Cast<chimaera::MOD_NAME::CoRwLockTestTask>());
-      ipc_manager->DelTask(orig_cr);
+      if (!copy.IsNull()) CHI_IPC->DelTask(copy.template Cast<chimaera::MOD_NAME::CoRwLockTestTask>());
+      CHI_IPC->DelTask(orig_cr);
     }
 
     // Test kWaitTest
@@ -7474,16 +7474,16 @@ TEST_CASE("Autogen - MOD_NAME Runtime Container Methods", "[autogen][mod_name][r
     if (!orig_w.IsNull()) {
       hipc::FullPtr<chi::Task> orig_ptr = orig_w.template Cast<chi::Task>();
       auto copy = mod_name_runtime.NewCopyTask(chimaera::MOD_NAME::Method::kWaitTest, orig_ptr, false);
-      if (!copy.IsNull()) ipc_manager->DelTask(copy.template Cast<chimaera::MOD_NAME::WaitTestTask>());
-      ipc_manager->DelTask(orig_w);
+      if (!copy.IsNull()) CHI_IPC->DelTask(copy.template Cast<chimaera::MOD_NAME::WaitTestTask>());
+      CHI_IPC->DelTask(orig_w);
     }
 
     // Test unknown method (default case)
     auto orig_u = ipc_manager->NewTask<chi::Task>();
     if (!orig_u.IsNull()) {
       auto copy = mod_name_runtime.NewCopyTask(999, orig_u, true);
-      if (!copy.IsNull()) ipc_manager->DelTask(copy);
-      ipc_manager->DelTask(orig_u);
+      if (!copy.IsNull()) CHI_IPC->DelTask(copy);
+      CHI_IPC->DelTask(orig_u);
     }
 
     INFO("MOD_NAME Runtime::NewCopyTask tests completed");
@@ -7498,9 +7498,9 @@ TEST_CASE("Autogen - MOD_NAME Runtime Container Methods", "[autogen][mod_name][r
     if (!t1_c.IsNull() && !t2_c.IsNull()) {
       hipc::FullPtr<chi::Task> ptr1 = t1_c.template Cast<chi::Task>();
       hipc::FullPtr<chi::Task> ptr2 = t2_c.template Cast<chi::Task>();
-      mod_name_runtime.Aggregate(chimaera::MOD_NAME::Method::kCreate, ptr1, ptr2);
-      ipc_manager->DelTask(t1_c);
-      ipc_manager->DelTask(t2_c);
+      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      CHI_IPC->DelTask(t1_c);
+      CHI_IPC->DelTask(t2_c);
     }
 
     // Test kDestroy
@@ -7509,9 +7509,9 @@ TEST_CASE("Autogen - MOD_NAME Runtime Container Methods", "[autogen][mod_name][r
     if (!t1_d.IsNull() && !t2_d.IsNull()) {
       hipc::FullPtr<chi::Task> ptr1 = t1_d.template Cast<chi::Task>();
       hipc::FullPtr<chi::Task> ptr2 = t2_d.template Cast<chi::Task>();
-      mod_name_runtime.Aggregate(chimaera::MOD_NAME::Method::kDestroy, ptr1, ptr2);
-      ipc_manager->DelTask(t1_d);
-      ipc_manager->DelTask(t2_d);
+      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      CHI_IPC->DelTask(t1_d);
+      CHI_IPC->DelTask(t2_d);
     }
 
     // Test kCustom
@@ -7520,9 +7520,9 @@ TEST_CASE("Autogen - MOD_NAME Runtime Container Methods", "[autogen][mod_name][r
     if (!t1_cu.IsNull() && !t2_cu.IsNull()) {
       hipc::FullPtr<chi::Task> ptr1 = t1_cu.template Cast<chi::Task>();
       hipc::FullPtr<chi::Task> ptr2 = t2_cu.template Cast<chi::Task>();
-      mod_name_runtime.Aggregate(chimaera::MOD_NAME::Method::kCustom, ptr1, ptr2);
-      ipc_manager->DelTask(t1_cu);
-      ipc_manager->DelTask(t2_cu);
+      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      CHI_IPC->DelTask(t1_cu);
+      CHI_IPC->DelTask(t2_cu);
     }
 
     // Test kCoMutexTest
@@ -7531,9 +7531,9 @@ TEST_CASE("Autogen - MOD_NAME Runtime Container Methods", "[autogen][mod_name][r
     if (!t1_cm.IsNull() && !t2_cm.IsNull()) {
       hipc::FullPtr<chi::Task> ptr1 = t1_cm.template Cast<chi::Task>();
       hipc::FullPtr<chi::Task> ptr2 = t2_cm.template Cast<chi::Task>();
-      mod_name_runtime.Aggregate(chimaera::MOD_NAME::Method::kCoMutexTest, ptr1, ptr2);
-      ipc_manager->DelTask(t1_cm);
-      ipc_manager->DelTask(t2_cm);
+      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      CHI_IPC->DelTask(t1_cm);
+      CHI_IPC->DelTask(t2_cm);
     }
 
     // Test kCoRwLockTest
@@ -7542,9 +7542,9 @@ TEST_CASE("Autogen - MOD_NAME Runtime Container Methods", "[autogen][mod_name][r
     if (!t1_cr.IsNull() && !t2_cr.IsNull()) {
       hipc::FullPtr<chi::Task> ptr1 = t1_cr.template Cast<chi::Task>();
       hipc::FullPtr<chi::Task> ptr2 = t2_cr.template Cast<chi::Task>();
-      mod_name_runtime.Aggregate(chimaera::MOD_NAME::Method::kCoRwLockTest, ptr1, ptr2);
-      ipc_manager->DelTask(t1_cr);
-      ipc_manager->DelTask(t2_cr);
+      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      CHI_IPC->DelTask(t1_cr);
+      CHI_IPC->DelTask(t2_cr);
     }
 
     // Test kWaitTest
@@ -7553,18 +7553,18 @@ TEST_CASE("Autogen - MOD_NAME Runtime Container Methods", "[autogen][mod_name][r
     if (!t1_w.IsNull() && !t2_w.IsNull()) {
       hipc::FullPtr<chi::Task> ptr1 = t1_w.template Cast<chi::Task>();
       hipc::FullPtr<chi::Task> ptr2 = t2_w.template Cast<chi::Task>();
-      mod_name_runtime.Aggregate(chimaera::MOD_NAME::Method::kWaitTest, ptr1, ptr2);
-      ipc_manager->DelTask(t1_w);
-      ipc_manager->DelTask(t2_w);
+      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      CHI_IPC->DelTask(t1_w);
+      CHI_IPC->DelTask(t2_w);
     }
 
     // Test unknown method (default case)
     auto t1_u = ipc_manager->NewTask<chi::Task>();
     auto t2_u = ipc_manager->NewTask<chi::Task>();
     if (!t1_u.IsNull() && !t2_u.IsNull()) {
-      mod_name_runtime.Aggregate(999, t1_u, t2_u);
-      ipc_manager->DelTask(t1_u);
-      ipc_manager->DelTask(t2_u);
+      t1_u.ptr_->Aggregate(t2_u.template Cast<chi::Task>());
+      CHI_IPC->DelTask(t1_u);
+      CHI_IPC->DelTask(t2_u);
     }
 
     INFO("MOD_NAME Runtime::Aggregate tests completed");
@@ -7588,7 +7588,7 @@ TEST_CASE("Autogen - MOD_NAME Task Serialization", "[autogen][mod_name][serializ
       chi::SaveTaskArchive save_out(chi::MsgType::kSerializeOut);
       task->SerializeOut(save_out);
 
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
     }
     INFO("CustomTask serialization test passed");
   }
@@ -7602,7 +7602,7 @@ TEST_CASE("Autogen - MOD_NAME Task Serialization", "[autogen][mod_name][serializ
       chi::SaveTaskArchive save_out(chi::MsgType::kSerializeOut);
       task->SerializeOut(save_out);
 
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
     }
     INFO("CoMutexTestTask serialization test passed");
   }
@@ -7616,7 +7616,7 @@ TEST_CASE("Autogen - MOD_NAME Task Serialization", "[autogen][mod_name][serializ
       chi::SaveTaskArchive save_out(chi::MsgType::kSerializeOut);
       task->SerializeOut(save_out);
 
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
     }
     INFO("CoRwLockTestTask serialization test passed");
   }
@@ -7630,7 +7630,7 @@ TEST_CASE("Autogen - MOD_NAME Task Serialization", "[autogen][mod_name][serializ
       chi::SaveTaskArchive save_out(chi::MsgType::kSerializeOut);
       task->SerializeOut(save_out);
 
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
     }
     INFO("WaitTestTask serialization test passed");
   }
@@ -7640,9 +7640,9 @@ TEST_CASE("Autogen - MOD_NAME Task Serialization", "[autogen][mod_name][serializ
     auto task2 = ipc_manager->NewTask<chimaera::MOD_NAME::CustomTask>();
     if (!task1.IsNull() && !task2.IsNull()) {
       task1->Copy(task2);
-      task1->Aggregate(task2);
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      task1->Aggregate(task2.template Cast<chi::Task>());
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
     INFO("CustomTask Copy and Aggregate test passed");
   }
@@ -7652,9 +7652,9 @@ TEST_CASE("Autogen - MOD_NAME Task Serialization", "[autogen][mod_name][serializ
     auto task2 = ipc_manager->NewTask<chimaera::MOD_NAME::CoMutexTestTask>();
     if (!task1.IsNull() && !task2.IsNull()) {
       task1->Copy(task2);
-      task1->Aggregate(task2);
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      task1->Aggregate(task2.template Cast<chi::Task>());
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
     INFO("CoMutexTestTask Copy and Aggregate test passed");
   }
@@ -7664,9 +7664,9 @@ TEST_CASE("Autogen - MOD_NAME Task Serialization", "[autogen][mod_name][serializ
     auto task2 = ipc_manager->NewTask<chimaera::MOD_NAME::CoRwLockTestTask>();
     if (!task1.IsNull() && !task2.IsNull()) {
       task1->Copy(task2);
-      task1->Aggregate(task2);
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      task1->Aggregate(task2.template Cast<chi::Task>());
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
     INFO("CoRwLockTestTask Copy and Aggregate test passed");
   }
@@ -7676,9 +7676,9 @@ TEST_CASE("Autogen - MOD_NAME Task Serialization", "[autogen][mod_name][serializ
     auto task2 = ipc_manager->NewTask<chimaera::MOD_NAME::WaitTestTask>();
     if (!task1.IsNull() && !task2.IsNull()) {
       task1->Copy(task2);
-      task1->Aggregate(task2);
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      task1->Aggregate(task2.template Cast<chi::Task>());
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
     INFO("WaitTestTask Copy and Aggregate test passed");
   }
@@ -7729,7 +7729,7 @@ TEST_CASE("Autogen - CTE ListTargetsTask coverage", "[autogen][cte][listtargets]
     }
 
     INFO("ListTargetsTask created successfully");
-    ipc_manager->DelTask(task);
+    CHI_IPC->DelTask(task);
   }
 
   SECTION("ListTargetsTask SerializeIn") {
@@ -7737,7 +7737,7 @@ TEST_CASE("Autogen - CTE ListTargetsTask coverage", "[autogen][cte][listtargets]
     if (!task.IsNull()) {
       chi::SaveTaskArchive save_in(chi::MsgType::kSerializeIn);
       task->SerializeIn(save_in);
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
     }
     INFO("ListTargetsTask SerializeIn test passed");
   }
@@ -7747,7 +7747,7 @@ TEST_CASE("Autogen - CTE ListTargetsTask coverage", "[autogen][cte][listtargets]
     if (!task.IsNull()) {
       chi::SaveTaskArchive save_out(chi::MsgType::kSerializeOut);
       task->SerializeOut(save_out);
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
     }
     INFO("ListTargetsTask SerializeOut test passed");
   }
@@ -7757,8 +7757,8 @@ TEST_CASE("Autogen - CTE ListTargetsTask coverage", "[autogen][cte][listtargets]
     auto task2 = ipc_manager->NewTask<wrp_cte::core::ListTargetsTask>();
     if (!task1.IsNull() && !task2.IsNull()) {
       task1->Copy(task2);
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
     INFO("ListTargetsTask Copy test passed");
   }
@@ -7767,9 +7767,9 @@ TEST_CASE("Autogen - CTE ListTargetsTask coverage", "[autogen][cte][listtargets]
     auto task1 = ipc_manager->NewTask<wrp_cte::core::ListTargetsTask>();
     auto task2 = ipc_manager->NewTask<wrp_cte::core::ListTargetsTask>();
     if (!task1.IsNull() && !task2.IsNull()) {
-      task1->Aggregate(task2);
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      task1->Aggregate(task2.template Cast<chi::Task>());
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
     INFO("ListTargetsTask Aggregate test passed");
   }
@@ -7789,7 +7789,7 @@ TEST_CASE("Autogen - CTE StatTargetsTask coverage", "[autogen][cte][stattargets]
     }
 
     INFO("StatTargetsTask created successfully");
-    ipc_manager->DelTask(task);
+    CHI_IPC->DelTask(task);
   }
 
   SECTION("StatTargetsTask SerializeIn") {
@@ -7797,7 +7797,7 @@ TEST_CASE("Autogen - CTE StatTargetsTask coverage", "[autogen][cte][stattargets]
     if (!task.IsNull()) {
       chi::SaveTaskArchive save_in(chi::MsgType::kSerializeIn);
       task->SerializeIn(save_in);
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
     }
     INFO("StatTargetsTask SerializeIn test passed");
   }
@@ -7807,7 +7807,7 @@ TEST_CASE("Autogen - CTE StatTargetsTask coverage", "[autogen][cte][stattargets]
     if (!task.IsNull()) {
       chi::SaveTaskArchive save_out(chi::MsgType::kSerializeOut);
       task->SerializeOut(save_out);
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
     }
     INFO("StatTargetsTask SerializeOut test passed");
   }
@@ -7817,8 +7817,8 @@ TEST_CASE("Autogen - CTE StatTargetsTask coverage", "[autogen][cte][stattargets]
     auto task2 = ipc_manager->NewTask<wrp_cte::core::StatTargetsTask>();
     if (!task1.IsNull() && !task2.IsNull()) {
       task1->Copy(task2);
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
     INFO("StatTargetsTask Copy test passed");
   }
@@ -7827,9 +7827,9 @@ TEST_CASE("Autogen - CTE StatTargetsTask coverage", "[autogen][cte][stattargets]
     auto task1 = ipc_manager->NewTask<wrp_cte::core::StatTargetsTask>();
     auto task2 = ipc_manager->NewTask<wrp_cte::core::StatTargetsTask>();
     if (!task1.IsNull() && !task2.IsNull()) {
-      task1->Aggregate(task2);
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      task1->Aggregate(task2.template Cast<chi::Task>());
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
     INFO("StatTargetsTask Aggregate test passed");
   }
@@ -7849,7 +7849,7 @@ TEST_CASE("Autogen - CTE RegisterTargetTask coverage", "[autogen][cte][registert
     }
 
     INFO("RegisterTargetTask created successfully");
-    ipc_manager->DelTask(task);
+    CHI_IPC->DelTask(task);
   }
 
   SECTION("RegisterTargetTask SerializeIn") {
@@ -7857,7 +7857,7 @@ TEST_CASE("Autogen - CTE RegisterTargetTask coverage", "[autogen][cte][registert
     if (!task.IsNull()) {
       chi::SaveTaskArchive save_in(chi::MsgType::kSerializeIn);
       task->SerializeIn(save_in);
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
     }
     INFO("RegisterTargetTask SerializeIn test passed");
   }
@@ -7867,7 +7867,7 @@ TEST_CASE("Autogen - CTE RegisterTargetTask coverage", "[autogen][cte][registert
     if (!task.IsNull()) {
       chi::SaveTaskArchive save_out(chi::MsgType::kSerializeOut);
       task->SerializeOut(save_out);
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
     }
     INFO("RegisterTargetTask SerializeOut test passed");
   }
@@ -7877,8 +7877,8 @@ TEST_CASE("Autogen - CTE RegisterTargetTask coverage", "[autogen][cte][registert
     auto task2 = ipc_manager->NewTask<wrp_cte::core::RegisterTargetTask>();
     if (!task1.IsNull() && !task2.IsNull()) {
       task1->Copy(task2);
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
     INFO("RegisterTargetTask Copy test passed");
   }
@@ -7887,9 +7887,9 @@ TEST_CASE("Autogen - CTE RegisterTargetTask coverage", "[autogen][cte][registert
     auto task1 = ipc_manager->NewTask<wrp_cte::core::RegisterTargetTask>();
     auto task2 = ipc_manager->NewTask<wrp_cte::core::RegisterTargetTask>();
     if (!task1.IsNull() && !task2.IsNull()) {
-      task1->Aggregate(task2);
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      task1->Aggregate(task2.template Cast<chi::Task>());
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
     INFO("RegisterTargetTask Aggregate test passed");
   }
@@ -7914,7 +7914,7 @@ TEST_CASE("Autogen - CTE TagQueryTask coverage", "[autogen][cte][tagquery]") {
     chi::SaveTaskArchive save_out(chi::MsgType::kSerializeOut);
     task->SerializeOut(save_out);
 
-    ipc_manager->DelTask(task);
+    CHI_IPC->DelTask(task);
     INFO("TagQueryTask serialization tests passed");
   }
 
@@ -7923,9 +7923,9 @@ TEST_CASE("Autogen - CTE TagQueryTask coverage", "[autogen][cte][tagquery]") {
     auto task2 = ipc_manager->NewTask<wrp_cte::core::TagQueryTask>();
     if (!task1.IsNull() && !task2.IsNull()) {
       task1->Copy(task2);
-      task1->Aggregate(task2);
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      task1->Aggregate(task2.template Cast<chi::Task>());
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
     INFO("TagQueryTask Copy and Aggregate test passed");
   }
@@ -7950,7 +7950,7 @@ TEST_CASE("Autogen - CTE BlobQueryTask coverage", "[autogen][cte][blobquery]") {
     chi::SaveTaskArchive save_out(chi::MsgType::kSerializeOut);
     task->SerializeOut(save_out);
 
-    ipc_manager->DelTask(task);
+    CHI_IPC->DelTask(task);
     INFO("BlobQueryTask serialization tests passed");
   }
 
@@ -7959,9 +7959,9 @@ TEST_CASE("Autogen - CTE BlobQueryTask coverage", "[autogen][cte][blobquery]") {
     auto task2 = ipc_manager->NewTask<wrp_cte::core::BlobQueryTask>();
     if (!task1.IsNull() && !task2.IsNull()) {
       task1->Copy(task2);
-      task1->Aggregate(task2);
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      task1->Aggregate(task2.template Cast<chi::Task>());
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
     INFO("BlobQueryTask Copy and Aggregate test passed");
   }
@@ -7986,7 +7986,7 @@ TEST_CASE("Autogen - CTE UnregisterTargetTask coverage", "[autogen][cte][unregis
     chi::SaveTaskArchive save_out(chi::MsgType::kSerializeOut);
     task->SerializeOut(save_out);
 
-    ipc_manager->DelTask(task);
+    CHI_IPC->DelTask(task);
     INFO("UnregisterTargetTask serialization tests passed");
   }
 
@@ -7995,9 +7995,9 @@ TEST_CASE("Autogen - CTE UnregisterTargetTask coverage", "[autogen][cte][unregis
     auto task2 = ipc_manager->NewTask<wrp_cte::core::UnregisterTargetTask>();
     if (!task1.IsNull() && !task2.IsNull()) {
       task1->Copy(task2);
-      task1->Aggregate(task2);
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      task1->Aggregate(task2.template Cast<chi::Task>());
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
     INFO("UnregisterTargetTask Copy and Aggregate test passed");
   }
@@ -8022,7 +8022,7 @@ TEST_CASE("Autogen - CTE GetBlobSizeTask coverage", "[autogen][cte][getblobsize]
     chi::SaveTaskArchive save_out(chi::MsgType::kSerializeOut);
     task->SerializeOut(save_out);
 
-    ipc_manager->DelTask(task);
+    CHI_IPC->DelTask(task);
     INFO("GetBlobSizeTask serialization tests passed");
   }
 
@@ -8031,9 +8031,9 @@ TEST_CASE("Autogen - CTE GetBlobSizeTask coverage", "[autogen][cte][getblobsize]
     auto task2 = ipc_manager->NewTask<wrp_cte::core::GetBlobSizeTask>();
     if (!task1.IsNull() && !task2.IsNull()) {
       task1->Copy(task2);
-      task1->Aggregate(task2);
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      task1->Aggregate(task2.template Cast<chi::Task>());
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
     INFO("GetBlobSizeTask Copy and Aggregate test passed");
   }
@@ -8058,7 +8058,7 @@ TEST_CASE("Autogen - CTE GetBlobScoreTask coverage", "[autogen][cte][getblobscor
     chi::SaveTaskArchive save_out(chi::MsgType::kSerializeOut);
     task->SerializeOut(save_out);
 
-    ipc_manager->DelTask(task);
+    CHI_IPC->DelTask(task);
     INFO("GetBlobScoreTask serialization tests passed");
   }
 
@@ -8067,9 +8067,9 @@ TEST_CASE("Autogen - CTE GetBlobScoreTask coverage", "[autogen][cte][getblobscor
     auto task2 = ipc_manager->NewTask<wrp_cte::core::GetBlobScoreTask>();
     if (!task1.IsNull() && !task2.IsNull()) {
       task1->Copy(task2);
-      task1->Aggregate(task2);
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      task1->Aggregate(task2.template Cast<chi::Task>());
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
     INFO("GetBlobScoreTask Copy and Aggregate test passed");
   }
@@ -8094,7 +8094,7 @@ TEST_CASE("Autogen - CTE PollTelemetryLogTask coverage", "[autogen][cte][polltel
     chi::SaveTaskArchive save_out(chi::MsgType::kSerializeOut);
     task->SerializeOut(save_out);
 
-    ipc_manager->DelTask(task);
+    CHI_IPC->DelTask(task);
     INFO("PollTelemetryLogTask serialization tests passed");
   }
 
@@ -8103,9 +8103,9 @@ TEST_CASE("Autogen - CTE PollTelemetryLogTask coverage", "[autogen][cte][polltel
     auto task2 = ipc_manager->NewTask<wrp_cte::core::PollTelemetryLogTask>();
     if (!task1.IsNull() && !task2.IsNull()) {
       task1->Copy(task2);
-      task1->Aggregate(task2);
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      task1->Aggregate(task2.template Cast<chi::Task>());
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
     INFO("PollTelemetryLogTask Copy and Aggregate test passed");
   }
@@ -8130,7 +8130,7 @@ TEST_CASE("Autogen - CTE GetContainedBlobsTask coverage", "[autogen][cte][getcon
     chi::SaveTaskArchive save_out(chi::MsgType::kSerializeOut);
     task->SerializeOut(save_out);
 
-    ipc_manager->DelTask(task);
+    CHI_IPC->DelTask(task);
     INFO("GetContainedBlobsTask serialization tests passed");
   }
 
@@ -8139,9 +8139,9 @@ TEST_CASE("Autogen - CTE GetContainedBlobsTask coverage", "[autogen][cte][getcon
     auto task2 = ipc_manager->NewTask<wrp_cte::core::GetContainedBlobsTask>();
     if (!task1.IsNull() && !task2.IsNull()) {
       task1->Copy(task2);
-      task1->Aggregate(task2);
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      task1->Aggregate(task2.template Cast<chi::Task>());
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
     INFO("GetContainedBlobsTask Copy and Aggregate test passed");
   }
@@ -8178,9 +8178,9 @@ TEST_CASE("Autogen - CTE Runtime AllocLoadTask coverage", "[autogen][cte][runtim
       auto loaded_task = container->AllocLoadTask(wrp_cte::core::Method::kRegisterTarget, load_archive);
       if (!loaded_task.IsNull()) {
         INFO("AllocLoadTask for RegisterTargetTask succeeded");
-        ipc_manager->DelTask(loaded_task);
+        CHI_IPC->DelTask(loaded_task);
       }
-      ipc_manager->DelTask(orig_task);
+      CHI_IPC->DelTask(orig_task);
     }
   }
 
@@ -8197,9 +8197,9 @@ TEST_CASE("Autogen - CTE Runtime AllocLoadTask coverage", "[autogen][cte][runtim
       auto loaded_task = container->AllocLoadTask(wrp_cte::core::Method::kListTargets, load_archive);
       if (!loaded_task.IsNull()) {
         INFO("AllocLoadTask for ListTargetsTask succeeded");
-        ipc_manager->DelTask(loaded_task);
+        CHI_IPC->DelTask(loaded_task);
       }
-      ipc_manager->DelTask(orig_task);
+      CHI_IPC->DelTask(orig_task);
     }
   }
 
@@ -8216,9 +8216,9 @@ TEST_CASE("Autogen - CTE Runtime AllocLoadTask coverage", "[autogen][cte][runtim
       auto loaded_task = container->AllocLoadTask(wrp_cte::core::Method::kPutBlob, load_archive);
       if (!loaded_task.IsNull()) {
         INFO("AllocLoadTask for PutBlobTask succeeded");
-        ipc_manager->DelTask(loaded_task);
+        CHI_IPC->DelTask(loaded_task);
       }
-      ipc_manager->DelTask(orig_task);
+      CHI_IPC->DelTask(orig_task);
     }
   }
 }
@@ -8252,9 +8252,9 @@ TEST_CASE("Autogen - Admin Runtime AllocLoadTask coverage", "[autogen][admin][ru
       auto loaded_task = container->AllocLoadTask(chimaera::admin::Method::kCreate, load_archive);
       if (!loaded_task.IsNull()) {
         INFO("AllocLoadTask for CreateTask succeeded");
-        ipc_manager->DelTask(loaded_task);
+        CHI_IPC->DelTask(loaded_task);
       }
-      ipc_manager->DelTask(orig_task);
+      CHI_IPC->DelTask(orig_task);
     }
   }
 
@@ -8271,9 +8271,9 @@ TEST_CASE("Autogen - Admin Runtime AllocLoadTask coverage", "[autogen][admin][ru
       auto loaded_task = container->AllocLoadTask(chimaera::admin::Method::kDestroy, load_archive);
       if (!loaded_task.IsNull()) {
         INFO("AllocLoadTask for DestroyTask succeeded");
-        ipc_manager->DelTask(loaded_task);
+        CHI_IPC->DelTask(loaded_task);
       }
-      ipc_manager->DelTask(orig_task);
+      CHI_IPC->DelTask(orig_task);
     }
   }
 
@@ -8290,9 +8290,9 @@ TEST_CASE("Autogen - Admin Runtime AllocLoadTask coverage", "[autogen][admin][ru
       auto loaded_task = container->AllocLoadTask(chimaera::admin::Method::kFlush, load_archive);
       if (!loaded_task.IsNull()) {
         INFO("AllocLoadTask for FlushTask succeeded");
-        ipc_manager->DelTask(loaded_task);
+        CHI_IPC->DelTask(loaded_task);
       }
-      ipc_manager->DelTask(orig_task);
+      CHI_IPC->DelTask(orig_task);
     }
   }
 
@@ -8309,9 +8309,9 @@ TEST_CASE("Autogen - Admin Runtime AllocLoadTask coverage", "[autogen][admin][ru
       auto loaded_task = container->AllocLoadTask(chimaera::admin::Method::kClientConnect, load_archive);
       if (!loaded_task.IsNull()) {
         INFO("AllocLoadTask for ClientConnectTask succeeded");
-        ipc_manager->DelTask(loaded_task);
+        CHI_IPC->DelTask(loaded_task);
       }
-      ipc_manager->DelTask(orig_task);
+      CHI_IPC->DelTask(orig_task);
     }
   }
 
@@ -8328,9 +8328,9 @@ TEST_CASE("Autogen - Admin Runtime AllocLoadTask coverage", "[autogen][admin][ru
       auto loaded_task = container->AllocLoadTask(chimaera::admin::Method::kMonitor, load_archive);
       if (!loaded_task.IsNull()) {
         INFO("AllocLoadTask for MonitorTask succeeded");
-        ipc_manager->DelTask(loaded_task);
+        CHI_IPC->DelTask(loaded_task);
       }
-      ipc_manager->DelTask(orig_task);
+      CHI_IPC->DelTask(orig_task);
     }
   }
 }
@@ -8360,9 +8360,9 @@ TEST_CASE("Autogen - Bdev Runtime AllocLoadTask coverage", "[autogen][bdev][runt
       if (!task2.IsNull()) {
         task2->SerializeIn(load_archive);
         INFO("Bdev CreateTask serialization roundtrip passed");
-        ipc_manager->DelTask(task2);
+        CHI_IPC->DelTask(task2);
       }
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
     }
   }
 
@@ -8379,9 +8379,9 @@ TEST_CASE("Autogen - Bdev Runtime AllocLoadTask coverage", "[autogen][bdev][runt
       if (!task2.IsNull()) {
         task2->SerializeIn(load_archive);
         INFO("Bdev DestroyTask serialization roundtrip passed");
-        ipc_manager->DelTask(task2);
+        CHI_IPC->DelTask(task2);
       }
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
     }
   }
 
@@ -8398,9 +8398,9 @@ TEST_CASE("Autogen - Bdev Runtime AllocLoadTask coverage", "[autogen][bdev][runt
       if (!task2.IsNull()) {
         task2->SerializeIn(load_archive);
         INFO("Bdev AllocateBlocksTask serialization roundtrip passed");
-        ipc_manager->DelTask(task2);
+        CHI_IPC->DelTask(task2);
       }
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
     }
   }
 
@@ -8417,9 +8417,9 @@ TEST_CASE("Autogen - Bdev Runtime AllocLoadTask coverage", "[autogen][bdev][runt
       if (!task2.IsNull()) {
         task2->SerializeIn(load_archive);
         INFO("Bdev FreeBlocksTask serialization roundtrip passed");
-        ipc_manager->DelTask(task2);
+        CHI_IPC->DelTask(task2);
       }
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
     }
   }
 
@@ -8436,9 +8436,9 @@ TEST_CASE("Autogen - Bdev Runtime AllocLoadTask coverage", "[autogen][bdev][runt
       if (!task2.IsNull()) {
         task2->SerializeIn(load_archive);
         INFO("Bdev GetStatsTask serialization roundtrip passed");
-        ipc_manager->DelTask(task2);
+        CHI_IPC->DelTask(task2);
       }
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
     }
   }
 }
@@ -8461,7 +8461,7 @@ TEST_CASE("Autogen - CTE More Task coverage", "[autogen][cte][tasks][morecoverag
       chi::SaveTaskArchive save_out(chi::MsgType::kSerializeOut);
       task->SerializeOut(save_out);
 
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
       INFO("GetOrCreateTagTask serialization passed");
     }
   }
@@ -8475,7 +8475,7 @@ TEST_CASE("Autogen - CTE More Task coverage", "[autogen][cte][tasks][morecoverag
       chi::SaveTaskArchive save_out(chi::MsgType::kSerializeOut);
       task->SerializeOut(save_out);
 
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
       INFO("GetBlobTask serialization passed");
     }
   }
@@ -8489,7 +8489,7 @@ TEST_CASE("Autogen - CTE More Task coverage", "[autogen][cte][tasks][morecoverag
       chi::SaveTaskArchive save_out(chi::MsgType::kSerializeOut);
       task->SerializeOut(save_out);
 
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
       INFO("DelBlobTask serialization passed");
     }
   }
@@ -8503,7 +8503,7 @@ TEST_CASE("Autogen - CTE More Task coverage", "[autogen][cte][tasks][morecoverag
       chi::SaveTaskArchive save_out(chi::MsgType::kSerializeOut);
       task->SerializeOut(save_out);
 
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
       INFO("DelTagTask serialization passed");
     }
   }
@@ -8517,7 +8517,7 @@ TEST_CASE("Autogen - CTE More Task coverage", "[autogen][cte][tasks][morecoverag
       chi::SaveTaskArchive save_out(chi::MsgType::kSerializeOut);
       task->SerializeOut(save_out);
 
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
       INFO("GetTagSizeTask serialization passed");
     }
   }
@@ -8531,7 +8531,7 @@ TEST_CASE("Autogen - CTE More Task coverage", "[autogen][cte][tasks][morecoverag
       chi::SaveTaskArchive save_out(chi::MsgType::kSerializeOut);
       task->SerializeOut(save_out);
 
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
       INFO("ReorganizeBlobTask serialization passed");
     }
   }
@@ -8557,7 +8557,7 @@ TEST_CASE("Autogen - MOD_NAME Task serialization coverage", "[autogen][modname][
       chi::SaveTaskArchive save_out(chi::MsgType::kSerializeOut);
       task->SerializeOut(save_out);
 
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
       INFO("CustomTask serialization passed");
     }
   }
@@ -8571,7 +8571,7 @@ TEST_CASE("Autogen - MOD_NAME Task serialization coverage", "[autogen][modname][
       chi::SaveTaskArchive save_out(chi::MsgType::kSerializeOut);
       task->SerializeOut(save_out);
 
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
       INFO("CoMutexTestTask serialization passed");
     }
   }
@@ -8585,7 +8585,7 @@ TEST_CASE("Autogen - MOD_NAME Task serialization coverage", "[autogen][modname][
       chi::SaveTaskArchive save_out(chi::MsgType::kSerializeOut);
       task->SerializeOut(save_out);
 
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
       INFO("CoRwLockTestTask serialization passed");
     }
   }
@@ -8599,7 +8599,7 @@ TEST_CASE("Autogen - MOD_NAME Task serialization coverage", "[autogen][modname][
       chi::SaveTaskArchive save_out(chi::MsgType::kSerializeOut);
       task->SerializeOut(save_out);
 
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
       INFO("WaitTestTask serialization passed");
     }
   }
@@ -8623,7 +8623,7 @@ TEST_CASE("Autogen - Admin Additional Task coverage", "[autogen][admin][tasks][a
       chi::SaveTaskArchive save_out(chi::MsgType::kSerializeOut);
       task->SerializeOut(save_out);
 
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
       INFO("SendTask serialization passed");
     }
   }
@@ -8637,7 +8637,7 @@ TEST_CASE("Autogen - Admin Additional Task coverage", "[autogen][admin][tasks][a
       chi::SaveTaskArchive save_out(chi::MsgType::kSerializeOut);
       task->SerializeOut(save_out);
 
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
       INFO("RecvTask serialization passed");
     }
   }
@@ -8651,7 +8651,7 @@ TEST_CASE("Autogen - Admin Additional Task coverage", "[autogen][admin][tasks][a
       chi::SaveTaskArchive save_out(chi::MsgType::kSerializeOut);
       task->SerializeOut(save_out);
 
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
       INFO("SubmitBatchTask serialization passed");
     }
   }
@@ -8665,7 +8665,7 @@ TEST_CASE("Autogen - Admin Additional Task coverage", "[autogen][admin][tasks][a
       chi::SaveTaskArchive save_out(chi::MsgType::kSerializeOut);
       task->SerializeOut(save_out);
 
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
       INFO("StopRuntimeTask serialization passed");
     }
   }
@@ -8679,7 +8679,7 @@ TEST_CASE("Autogen - Admin Additional Task coverage", "[autogen][admin][tasks][a
       chi::SaveTaskArchive save_out(chi::MsgType::kSerializeOut);
       task->SerializeOut(save_out);
 
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
       INFO("GetOrCreatePoolTask serialization passed");
     }
   }
@@ -8693,7 +8693,7 @@ TEST_CASE("Autogen - Admin Additional Task coverage", "[autogen][admin][tasks][a
       chi::SaveTaskArchive save_out(chi::MsgType::kSerializeOut);
       task->SerializeOut(save_out);
 
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
       INFO("DestroyPoolTask serialization passed");
     }
   }
@@ -8736,9 +8736,9 @@ TEST_CASE("Autogen - Bdev Container NewCopyTask coverage", "[autogen][bdev][cont
       auto copy_task = container->NewCopyTask(chimaera::bdev::Method::kWrite, orig_task, false);
       if (!copy_task.IsNull()) {
         INFO("NewCopyTask for WriteTask succeeded");
-        ipc_manager->DelTask(copy_task);
+        CHI_IPC->DelTask(copy_task);
       }
-      ipc_manager->DelTask(orig_task);
+      CHI_IPC->DelTask(orig_task);
     }
   }
 
@@ -8748,9 +8748,9 @@ TEST_CASE("Autogen - Bdev Container NewCopyTask coverage", "[autogen][bdev][cont
       auto copy_task = container->NewCopyTask(chimaera::bdev::Method::kRead, orig_task, false);
       if (!copy_task.IsNull()) {
         INFO("NewCopyTask for ReadTask succeeded");
-        ipc_manager->DelTask(copy_task);
+        CHI_IPC->DelTask(copy_task);
       }
-      ipc_manager->DelTask(orig_task);
+      CHI_IPC->DelTask(orig_task);
     }
   }
 
@@ -8758,10 +8758,10 @@ TEST_CASE("Autogen - Bdev Container NewCopyTask coverage", "[autogen][bdev][cont
     auto task1 = container->NewTask(chimaera::bdev::Method::kWrite);
     auto task2 = container->NewTask(chimaera::bdev::Method::kWrite);
     if (!task1.IsNull() && !task2.IsNull()) {
-      container->Aggregate(chimaera::bdev::Method::kWrite, task1, task2);
+      task1.ptr_->Aggregate(task2.template Cast<chi::Task>());
       INFO("Aggregate for WriteTask succeeded");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 }
@@ -8788,9 +8788,9 @@ TEST_CASE("Autogen - Admin Container NewCopyTask coverage", "[autogen][admin][co
       auto copy_task = container->NewCopyTask(chimaera::admin::Method::kSend, orig_task, false);
       if (!copy_task.IsNull()) {
         INFO("NewCopyTask for SendTask succeeded");
-        ipc_manager->DelTask(copy_task);
+        CHI_IPC->DelTask(copy_task);
       }
-      ipc_manager->DelTask(orig_task);
+      CHI_IPC->DelTask(orig_task);
     }
   }
 
@@ -8800,9 +8800,9 @@ TEST_CASE("Autogen - Admin Container NewCopyTask coverage", "[autogen][admin][co
       auto copy_task = container->NewCopyTask(chimaera::admin::Method::kRecv, orig_task, false);
       if (!copy_task.IsNull()) {
         INFO("NewCopyTask for RecvTask succeeded");
-        ipc_manager->DelTask(copy_task);
+        CHI_IPC->DelTask(copy_task);
       }
-      ipc_manager->DelTask(orig_task);
+      CHI_IPC->DelTask(orig_task);
     }
   }
 
@@ -8810,10 +8810,10 @@ TEST_CASE("Autogen - Admin Container NewCopyTask coverage", "[autogen][admin][co
     auto task1 = container->NewTask(chimaera::admin::Method::kSend);
     auto task2 = container->NewTask(chimaera::admin::Method::kSend);
     if (!task1.IsNull() && !task2.IsNull()) {
-      container->Aggregate(chimaera::admin::Method::kSend, task1, task2);
+      task1.ptr_->Aggregate(task2.template Cast<chi::Task>());
       INFO("Aggregate for SendTask succeeded");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 
@@ -8821,10 +8821,10 @@ TEST_CASE("Autogen - Admin Container NewCopyTask coverage", "[autogen][admin][co
     auto task1 = container->NewTask(chimaera::admin::Method::kRecv);
     auto task2 = container->NewTask(chimaera::admin::Method::kRecv);
     if (!task1.IsNull() && !task2.IsNull()) {
-      container->Aggregate(chimaera::admin::Method::kRecv, task1, task2);
+      task1.ptr_->Aggregate(task2.template Cast<chi::Task>());
       INFO("Aggregate for RecvTask succeeded");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 }
@@ -8851,9 +8851,9 @@ TEST_CASE("Autogen - CTE Container NewCopyTask coverage", "[autogen][cte][contai
       auto copy_task = container->NewCopyTask(wrp_cte::core::Method::kGetBlob, orig_task, false);
       if (!copy_task.IsNull()) {
         INFO("NewCopyTask for GetBlobTask succeeded");
-        ipc_manager->DelTask(copy_task);
+        CHI_IPC->DelTask(copy_task);
       }
-      ipc_manager->DelTask(orig_task);
+      CHI_IPC->DelTask(orig_task);
     }
   }
 
@@ -8863,9 +8863,9 @@ TEST_CASE("Autogen - CTE Container NewCopyTask coverage", "[autogen][cte][contai
       auto copy_task = container->NewCopyTask(wrp_cte::core::Method::kDelBlob, orig_task, false);
       if (!copy_task.IsNull()) {
         INFO("NewCopyTask for DelBlobTask succeeded");
-        ipc_manager->DelTask(copy_task);
+        CHI_IPC->DelTask(copy_task);
       }
-      ipc_manager->DelTask(orig_task);
+      CHI_IPC->DelTask(orig_task);
     }
   }
 
@@ -8873,10 +8873,10 @@ TEST_CASE("Autogen - CTE Container NewCopyTask coverage", "[autogen][cte][contai
     auto task1 = container->NewTask(wrp_cte::core::Method::kGetBlob);
     auto task2 = container->NewTask(wrp_cte::core::Method::kGetBlob);
     if (!task1.IsNull() && !task2.IsNull()) {
-      container->Aggregate(wrp_cte::core::Method::kGetBlob, task1, task2);
+      task1.ptr_->Aggregate(task2.template Cast<chi::Task>());
       INFO("Aggregate for GetBlobTask succeeded");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 
@@ -8894,9 +8894,9 @@ TEST_CASE("Autogen - CTE Container NewCopyTask coverage", "[autogen][cte][contai
       auto loaded_task = container->AllocLoadTask(wrp_cte::core::Method::kGetBlob, load_archive);
       if (!loaded_task.IsNull()) {
         INFO("AllocLoadTask for GetBlobTask succeeded");
-        ipc_manager->DelTask(loaded_task);
+        CHI_IPC->DelTask(loaded_task);
       }
-      ipc_manager->DelTask(orig_task);
+      CHI_IPC->DelTask(orig_task);
     }
   }
 }
@@ -8923,7 +8923,7 @@ TEST_CASE("Autogen - Admin Container SaveTask SerializeOut coverage", "[autogen]
       chi::SaveTaskArchive save_archive(chi::MsgType::kSerializeOut);
       container->SaveTask(chimaera::admin::Method::kCreate, save_archive, task);
       INFO("SaveTask SerializeOut for CreateTask passed");
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
     }
   }
 
@@ -8933,7 +8933,7 @@ TEST_CASE("Autogen - Admin Container SaveTask SerializeOut coverage", "[autogen]
       chi::SaveTaskArchive save_archive(chi::MsgType::kSerializeOut);
       container->SaveTask(chimaera::admin::Method::kDestroy, save_archive, task);
       INFO("SaveTask SerializeOut for DestroyTask passed");
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
     }
   }
 
@@ -8943,7 +8943,7 @@ TEST_CASE("Autogen - Admin Container SaveTask SerializeOut coverage", "[autogen]
       chi::SaveTaskArchive save_archive(chi::MsgType::kSerializeOut);
       container->SaveTask(chimaera::admin::Method::kGetOrCreatePool, save_archive, task);
       INFO("SaveTask SerializeOut for GetOrCreatePoolTask passed");
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
     }
   }
 
@@ -8953,7 +8953,7 @@ TEST_CASE("Autogen - Admin Container SaveTask SerializeOut coverage", "[autogen]
       chi::SaveTaskArchive save_archive(chi::MsgType::kSerializeOut);
       container->SaveTask(chimaera::admin::Method::kDestroyPool, save_archive, task);
       INFO("SaveTask SerializeOut for DestroyPoolTask passed");
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
     }
   }
 
@@ -8963,7 +8963,7 @@ TEST_CASE("Autogen - Admin Container SaveTask SerializeOut coverage", "[autogen]
       chi::SaveTaskArchive save_archive(chi::MsgType::kSerializeOut);
       container->SaveTask(chimaera::admin::Method::kStopRuntime, save_archive, task);
       INFO("SaveTask SerializeOut for StopRuntimeTask passed");
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
     }
   }
 
@@ -8973,7 +8973,7 @@ TEST_CASE("Autogen - Admin Container SaveTask SerializeOut coverage", "[autogen]
       chi::SaveTaskArchive save_archive(chi::MsgType::kSerializeOut);
       container->SaveTask(chimaera::admin::Method::kSend, save_archive, task);
       INFO("SaveTask SerializeOut for SendTask passed");
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
     }
   }
 
@@ -8983,7 +8983,7 @@ TEST_CASE("Autogen - Admin Container SaveTask SerializeOut coverage", "[autogen]
       chi::SaveTaskArchive save_archive(chi::MsgType::kSerializeOut);
       container->SaveTask(chimaera::admin::Method::kRecv, save_archive, task);
       INFO("SaveTask SerializeOut for RecvTask passed");
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
     }
   }
 
@@ -8993,7 +8993,7 @@ TEST_CASE("Autogen - Admin Container SaveTask SerializeOut coverage", "[autogen]
       chi::SaveTaskArchive save_archive(chi::MsgType::kSerializeOut);
       container->SaveTask(chimaera::admin::Method::kSubmitBatch, save_archive, task);
       INFO("SaveTask SerializeOut for SubmitBatchTask passed");
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
     }
   }
 }
@@ -9020,7 +9020,7 @@ TEST_CASE("Autogen - CTE Container SaveTask SerializeOut coverage", "[autogen][c
       chi::SaveTaskArchive save_archive(chi::MsgType::kSerializeOut);
       container->SaveTask(wrp_cte::core::Method::kGetOrCreateTag, save_archive, task);
       INFO("SaveTask SerializeOut for GetOrCreateTagTask passed");
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
     }
   }
 
@@ -9030,7 +9030,7 @@ TEST_CASE("Autogen - CTE Container SaveTask SerializeOut coverage", "[autogen][c
       chi::SaveTaskArchive save_archive(chi::MsgType::kSerializeOut);
       container->SaveTask(wrp_cte::core::Method::kPutBlob, save_archive, task);
       INFO("SaveTask SerializeOut for PutBlobTask passed");
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
     }
   }
 
@@ -9040,7 +9040,7 @@ TEST_CASE("Autogen - CTE Container SaveTask SerializeOut coverage", "[autogen][c
       chi::SaveTaskArchive save_archive(chi::MsgType::kSerializeOut);
       container->SaveTask(wrp_cte::core::Method::kGetBlob, save_archive, task);
       INFO("SaveTask SerializeOut for GetBlobTask passed");
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
     }
   }
 
@@ -9050,7 +9050,7 @@ TEST_CASE("Autogen - CTE Container SaveTask SerializeOut coverage", "[autogen][c
       chi::SaveTaskArchive save_archive(chi::MsgType::kSerializeOut);
       container->SaveTask(wrp_cte::core::Method::kDelBlob, save_archive, task);
       INFO("SaveTask SerializeOut for DelBlobTask passed");
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
     }
   }
 
@@ -9060,7 +9060,7 @@ TEST_CASE("Autogen - CTE Container SaveTask SerializeOut coverage", "[autogen][c
       chi::SaveTaskArchive save_archive(chi::MsgType::kSerializeOut);
       container->SaveTask(wrp_cte::core::Method::kDelTag, save_archive, task);
       INFO("SaveTask SerializeOut for DelTagTask passed");
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
     }
   }
 
@@ -9070,7 +9070,7 @@ TEST_CASE("Autogen - CTE Container SaveTask SerializeOut coverage", "[autogen][c
       chi::SaveTaskArchive save_archive(chi::MsgType::kSerializeOut);
       container->SaveTask(wrp_cte::core::Method::kGetTagSize, save_archive, task);
       INFO("SaveTask SerializeOut for GetTagSizeTask passed");
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
     }
   }
 
@@ -9080,7 +9080,7 @@ TEST_CASE("Autogen - CTE Container SaveTask SerializeOut coverage", "[autogen][c
       chi::SaveTaskArchive save_archive(chi::MsgType::kSerializeOut);
       container->SaveTask(wrp_cte::core::Method::kReorganizeBlob, save_archive, task);
       INFO("SaveTask SerializeOut for ReorganizeBlobTask passed");
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
     }
   }
 }
@@ -9114,9 +9114,9 @@ TEST_CASE("Autogen - Admin Container AllocLoadTask full coverage", "[autogen][ad
       auto loaded_task = container->AllocLoadTask(chimaera::admin::Method::kCreate, load_archive);
       if (!loaded_task.IsNull()) {
         INFO("AllocLoadTask roundtrip for CreateTask passed");
-        ipc_manager->DelTask(loaded_task);
+        CHI_IPC->DelTask(loaded_task);
       }
-      ipc_manager->DelTask(orig_task);
+      CHI_IPC->DelTask(orig_task);
     }
   }
 
@@ -9133,9 +9133,9 @@ TEST_CASE("Autogen - Admin Container AllocLoadTask full coverage", "[autogen][ad
       auto loaded_task = container->AllocLoadTask(chimaera::admin::Method::kDestroy, load_archive);
       if (!loaded_task.IsNull()) {
         INFO("AllocLoadTask roundtrip for DestroyTask passed");
-        ipc_manager->DelTask(loaded_task);
+        CHI_IPC->DelTask(loaded_task);
       }
-      ipc_manager->DelTask(orig_task);
+      CHI_IPC->DelTask(orig_task);
     }
   }
 
@@ -9152,9 +9152,9 @@ TEST_CASE("Autogen - Admin Container AllocLoadTask full coverage", "[autogen][ad
       auto loaded_task = container->AllocLoadTask(chimaera::admin::Method::kGetOrCreatePool, load_archive);
       if (!loaded_task.IsNull()) {
         INFO("AllocLoadTask roundtrip for GetOrCreatePoolTask passed");
-        ipc_manager->DelTask(loaded_task);
+        CHI_IPC->DelTask(loaded_task);
       }
-      ipc_manager->DelTask(orig_task);
+      CHI_IPC->DelTask(orig_task);
     }
   }
 
@@ -9171,9 +9171,9 @@ TEST_CASE("Autogen - Admin Container AllocLoadTask full coverage", "[autogen][ad
       auto loaded_task = container->AllocLoadTask(chimaera::admin::Method::kDestroyPool, load_archive);
       if (!loaded_task.IsNull()) {
         INFO("AllocLoadTask roundtrip for DestroyPoolTask passed");
-        ipc_manager->DelTask(loaded_task);
+        CHI_IPC->DelTask(loaded_task);
       }
-      ipc_manager->DelTask(orig_task);
+      CHI_IPC->DelTask(orig_task);
     }
   }
 
@@ -9190,9 +9190,9 @@ TEST_CASE("Autogen - Admin Container AllocLoadTask full coverage", "[autogen][ad
       auto loaded_task = container->AllocLoadTask(chimaera::admin::Method::kStopRuntime, load_archive);
       if (!loaded_task.IsNull()) {
         INFO("AllocLoadTask roundtrip for StopRuntimeTask passed");
-        ipc_manager->DelTask(loaded_task);
+        CHI_IPC->DelTask(loaded_task);
       }
-      ipc_manager->DelTask(orig_task);
+      CHI_IPC->DelTask(orig_task);
     }
   }
 }
@@ -9221,7 +9221,7 @@ TEST_CASE("Autogen - CAE Task direct serialization coverage", "[autogen][cae][ta
       chi::SaveTaskArchive save_out(chi::MsgType::kSerializeOut);
       task->SerializeOut(save_out);
 
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
       INFO("ParseOmniTask serialization passed");
     }
   }
@@ -9235,7 +9235,7 @@ TEST_CASE("Autogen - CAE Task direct serialization coverage", "[autogen][cae][ta
       chi::SaveTaskArchive save_out(chi::MsgType::kSerializeOut);
       task->SerializeOut(save_out);
 
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
       INFO("ProcessHdf5DatasetTask serialization passed");
     }
   }
@@ -9260,7 +9260,7 @@ TEST_CASE("Autogen - CAE Container NewTask coverage", "[autogen][cae][container]
     auto task = container->NewTask(wrp_cae::core::Method::kCreate);
     if (!task.IsNull()) {
       INFO("NewTask for CreateTask succeeded");
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
     }
   }
 
@@ -9268,7 +9268,7 @@ TEST_CASE("Autogen - CAE Container NewTask coverage", "[autogen][cae][container]
     auto task = container->NewTask(wrp_cae::core::Method::kDestroy);
     if (!task.IsNull()) {
       INFO("NewTask for DestroyTask succeeded");
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
     }
   }
 
@@ -9276,7 +9276,7 @@ TEST_CASE("Autogen - CAE Container NewTask coverage", "[autogen][cae][container]
     auto task = container->NewTask(wrp_cae::core::Method::kParseOmni);
     if (!task.IsNull()) {
       INFO("NewTask for ParseOmniTask succeeded");
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
     }
   }
 
@@ -9284,7 +9284,7 @@ TEST_CASE("Autogen - CAE Container NewTask coverage", "[autogen][cae][container]
     auto task = container->NewTask(wrp_cae::core::Method::kProcessHdf5Dataset);
     if (!task.IsNull()) {
       INFO("NewTask for ProcessHdf5DatasetTask succeeded");
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
     }
   }
 }
@@ -9310,9 +9310,9 @@ TEST_CASE("Autogen - CAE Container NewCopyTask coverage", "[autogen][cae][contai
       auto copy_task = container->NewCopyTask(wrp_cae::core::Method::kCreate, orig_task, false);
       if (!copy_task.IsNull()) {
         INFO("NewCopyTask for CreateTask succeeded");
-        ipc_manager->DelTask(copy_task);
+        CHI_IPC->DelTask(copy_task);
       }
-      ipc_manager->DelTask(orig_task);
+      CHI_IPC->DelTask(orig_task);
     }
   }
 
@@ -9322,9 +9322,9 @@ TEST_CASE("Autogen - CAE Container NewCopyTask coverage", "[autogen][cae][contai
       auto copy_task = container->NewCopyTask(wrp_cae::core::Method::kParseOmni, orig_task, false);
       if (!copy_task.IsNull()) {
         INFO("NewCopyTask for ParseOmniTask succeeded");
-        ipc_manager->DelTask(copy_task);
+        CHI_IPC->DelTask(copy_task);
       }
-      ipc_manager->DelTask(orig_task);
+      CHI_IPC->DelTask(orig_task);
     }
   }
 
@@ -9334,9 +9334,9 @@ TEST_CASE("Autogen - CAE Container NewCopyTask coverage", "[autogen][cae][contai
       auto copy_task = container->NewCopyTask(wrp_cae::core::Method::kProcessHdf5Dataset, orig_task, false);
       if (!copy_task.IsNull()) {
         INFO("NewCopyTask for ProcessHdf5DatasetTask succeeded");
-        ipc_manager->DelTask(copy_task);
+        CHI_IPC->DelTask(copy_task);
       }
-      ipc_manager->DelTask(orig_task);
+      CHI_IPC->DelTask(orig_task);
     }
   }
 }
@@ -9360,10 +9360,10 @@ TEST_CASE("Autogen - CAE Container Aggregate coverage", "[autogen][cae][containe
     auto task1 = container->NewTask(wrp_cae::core::Method::kCreate);
     auto task2 = container->NewTask(wrp_cae::core::Method::kCreate);
     if (!task1.IsNull() && !task2.IsNull()) {
-      container->Aggregate(wrp_cae::core::Method::kCreate, task1, task2);
+      task1.ptr_->Aggregate(task2.template Cast<chi::Task>());
       INFO("Aggregate for CreateTask succeeded");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 
@@ -9371,10 +9371,10 @@ TEST_CASE("Autogen - CAE Container Aggregate coverage", "[autogen][cae][containe
     auto task1 = container->NewTask(wrp_cae::core::Method::kParseOmni);
     auto task2 = container->NewTask(wrp_cae::core::Method::kParseOmni);
     if (!task1.IsNull() && !task2.IsNull()) {
-      container->Aggregate(wrp_cae::core::Method::kParseOmni, task1, task2);
+      task1.ptr_->Aggregate(task2.template Cast<chi::Task>());
       INFO("Aggregate for ParseOmniTask succeeded");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 
@@ -9382,10 +9382,10 @@ TEST_CASE("Autogen - CAE Container Aggregate coverage", "[autogen][cae][containe
     auto task1 = container->NewTask(wrp_cae::core::Method::kProcessHdf5Dataset);
     auto task2 = container->NewTask(wrp_cae::core::Method::kProcessHdf5Dataset);
     if (!task1.IsNull() && !task2.IsNull()) {
-      container->Aggregate(wrp_cae::core::Method::kProcessHdf5Dataset, task1, task2);
+      task1.ptr_->Aggregate(task2.template Cast<chi::Task>());
       INFO("Aggregate for ProcessHdf5DatasetTask succeeded");
-      ipc_manager->DelTask(task1);
-      ipc_manager->DelTask(task2);
+      CHI_IPC->DelTask(task1);
+      CHI_IPC->DelTask(task2);
     }
   }
 }
@@ -9411,7 +9411,7 @@ TEST_CASE("Autogen - CAE Container SaveTask coverage", "[autogen][cae][container
       chi::SaveTaskArchive save_archive(chi::MsgType::kSerializeIn);
       container->SaveTask(wrp_cae::core::Method::kCreate, save_archive, task);
       INFO("SaveTask SerializeIn for CreateTask passed");
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
     }
   }
 
@@ -9421,7 +9421,7 @@ TEST_CASE("Autogen - CAE Container SaveTask coverage", "[autogen][cae][container
       chi::SaveTaskArchive save_archive(chi::MsgType::kSerializeOut);
       container->SaveTask(wrp_cae::core::Method::kCreate, save_archive, task);
       INFO("SaveTask SerializeOut for CreateTask passed");
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
     }
   }
 
@@ -9431,7 +9431,7 @@ TEST_CASE("Autogen - CAE Container SaveTask coverage", "[autogen][cae][container
       chi::SaveTaskArchive save_archive(chi::MsgType::kSerializeIn);
       container->SaveTask(wrp_cae::core::Method::kParseOmni, save_archive, task);
       INFO("SaveTask SerializeIn for ParseOmniTask passed");
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
     }
   }
 
@@ -9441,7 +9441,7 @@ TEST_CASE("Autogen - CAE Container SaveTask coverage", "[autogen][cae][container
       chi::SaveTaskArchive save_archive(chi::MsgType::kSerializeOut);
       container->SaveTask(wrp_cae::core::Method::kParseOmni, save_archive, task);
       INFO("SaveTask SerializeOut for ParseOmniTask passed");
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
     }
   }
 
@@ -9451,7 +9451,7 @@ TEST_CASE("Autogen - CAE Container SaveTask coverage", "[autogen][cae][container
       chi::SaveTaskArchive save_archive(chi::MsgType::kSerializeIn);
       container->SaveTask(wrp_cae::core::Method::kProcessHdf5Dataset, save_archive, task);
       INFO("SaveTask SerializeIn for ProcessHdf5DatasetTask passed");
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
     }
   }
 
@@ -9461,7 +9461,7 @@ TEST_CASE("Autogen - CAE Container SaveTask coverage", "[autogen][cae][container
       chi::SaveTaskArchive save_archive(chi::MsgType::kSerializeOut);
       container->SaveTask(wrp_cae::core::Method::kProcessHdf5Dataset, save_archive, task);
       INFO("SaveTask SerializeOut for ProcessHdf5DatasetTask passed");
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
     }
   }
 }
@@ -9494,9 +9494,9 @@ TEST_CASE("Autogen - CAE Container AllocLoadTask coverage", "[autogen][cae][cont
       auto loaded_task = container->AllocLoadTask(wrp_cae::core::Method::kCreate, load_archive);
       if (!loaded_task.IsNull()) {
         INFO("AllocLoadTask roundtrip for CreateTask passed");
-        ipc_manager->DelTask(loaded_task);
+        CHI_IPC->DelTask(loaded_task);
       }
-      ipc_manager->DelTask(orig_task);
+      CHI_IPC->DelTask(orig_task);
     }
   }
 
@@ -9513,9 +9513,9 @@ TEST_CASE("Autogen - CAE Container AllocLoadTask coverage", "[autogen][cae][cont
       auto loaded_task = container->AllocLoadTask(wrp_cae::core::Method::kParseOmni, load_archive);
       if (!loaded_task.IsNull()) {
         INFO("AllocLoadTask roundtrip for ParseOmniTask passed");
-        ipc_manager->DelTask(loaded_task);
+        CHI_IPC->DelTask(loaded_task);
       }
-      ipc_manager->DelTask(orig_task);
+      CHI_IPC->DelTask(orig_task);
     }
   }
 
@@ -9532,9 +9532,9 @@ TEST_CASE("Autogen - CAE Container AllocLoadTask coverage", "[autogen][cae][cont
       auto loaded_task = container->AllocLoadTask(wrp_cae::core::Method::kProcessHdf5Dataset, load_archive);
       if (!loaded_task.IsNull()) {
         INFO("AllocLoadTask roundtrip for ProcessHdf5DatasetTask passed");
-        ipc_manager->DelTask(loaded_task);
+        CHI_IPC->DelTask(loaded_task);
       }
-      ipc_manager->DelTask(orig_task);
+      CHI_IPC->DelTask(orig_task);
     }
   }
 }
@@ -9557,7 +9557,7 @@ TEST_CASE("Autogen - CAE Container DelTask coverage", "[autogen][cae][container]
   SECTION("DelTask for CreateTask") {
     auto task = container->NewTask(wrp_cae::core::Method::kCreate);
     if (!task.IsNull()) {
-      container->DelTask(wrp_cae::core::Method::kCreate, task);
+      CHI_IPC->DelTask(task);
       INFO("DelTask for CreateTask passed");
     }
   }
@@ -9565,7 +9565,7 @@ TEST_CASE("Autogen - CAE Container DelTask coverage", "[autogen][cae][container]
   SECTION("DelTask for DestroyTask") {
     auto task = container->NewTask(wrp_cae::core::Method::kDestroy);
     if (!task.IsNull()) {
-      container->DelTask(wrp_cae::core::Method::kDestroy, task);
+      CHI_IPC->DelTask(task);
       INFO("DelTask for DestroyTask passed");
     }
   }
@@ -9573,7 +9573,7 @@ TEST_CASE("Autogen - CAE Container DelTask coverage", "[autogen][cae][container]
   SECTION("DelTask for ParseOmniTask") {
     auto task = container->NewTask(wrp_cae::core::Method::kParseOmni);
     if (!task.IsNull()) {
-      container->DelTask(wrp_cae::core::Method::kParseOmni, task);
+      CHI_IPC->DelTask(task);
       INFO("DelTask for ParseOmniTask passed");
     }
   }
@@ -9581,7 +9581,7 @@ TEST_CASE("Autogen - CAE Container DelTask coverage", "[autogen][cae][container]
   SECTION("DelTask for ProcessHdf5DatasetTask") {
     auto task = container->NewTask(wrp_cae::core::Method::kProcessHdf5Dataset);
     if (!task.IsNull()) {
-      container->DelTask(wrp_cae::core::Method::kProcessHdf5Dataset, task);
+      CHI_IPC->DelTask(task);
       INFO("DelTask for ProcessHdf5DatasetTask passed");
     }
   }
@@ -9606,7 +9606,7 @@ TEST_CASE("Autogen - Admin WreapDeadIpcs Container Methods", "[autogen][admin][w
   SECTION("WreapDeadIpcs NewTask and DelTask") {
     auto task = container->NewTask(chimaera::admin::Method::kWreapDeadIpcs);
     if (!task.IsNull()) {
-      container->DelTask(chimaera::admin::Method::kWreapDeadIpcs, task);
+      CHI_IPC->DelTask(task);
       INFO("WreapDeadIpcs NewTask/DelTask completed");
     }
   }
@@ -9622,7 +9622,7 @@ TEST_CASE("Autogen - Admin WreapDeadIpcs Container Methods", "[autogen][admin][w
       load_archive.msg_type_ = chi::MsgType::kSerializeIn;
       container->LoadTask(chimaera::admin::Method::kWreapDeadIpcs, load_archive, task);
 
-      container->DelTask(chimaera::admin::Method::kWreapDeadIpcs, task);
+      CHI_IPC->DelTask(task);
       INFO("WreapDeadIpcs SaveTask/LoadTask completed");
     }
   }
@@ -9632,9 +9632,9 @@ TEST_CASE("Autogen - Admin WreapDeadIpcs Container Methods", "[autogen][admin][w
     if (!task.IsNull()) {
       auto copy = container->NewCopyTask(chimaera::admin::Method::kWreapDeadIpcs, task, false);
       if (!copy.IsNull()) {
-        container->DelTask(chimaera::admin::Method::kWreapDeadIpcs, copy);
+        CHI_IPC->DelTask(copy);
       }
-      container->DelTask(chimaera::admin::Method::kWreapDeadIpcs, task);
+      CHI_IPC->DelTask(task);
       INFO("WreapDeadIpcs NewCopyTask completed");
     }
   }
@@ -9643,10 +9643,10 @@ TEST_CASE("Autogen - Admin WreapDeadIpcs Container Methods", "[autogen][admin][w
     auto t1 = container->NewTask(chimaera::admin::Method::kWreapDeadIpcs);
     auto t2 = container->NewTask(chimaera::admin::Method::kWreapDeadIpcs);
     if (!t1.IsNull() && !t2.IsNull()) {
-      container->Aggregate(chimaera::admin::Method::kWreapDeadIpcs, t1, t2);
-      container->DelTask(chimaera::admin::Method::kWreapDeadIpcs, t2);
+      t1.ptr_->Aggregate(t2.template Cast<chi::Task>());
+      CHI_IPC->DelTask(t2);
     }
-    if (!t1.IsNull()) container->DelTask(chimaera::admin::Method::kWreapDeadIpcs, t1);
+    if (!t1.IsNull()) CHI_IPC->DelTask(t1);
     INFO("WreapDeadIpcs Aggregate completed");
   }
 
@@ -9668,10 +9668,10 @@ TEST_CASE("Autogen - Admin WreapDeadIpcs Container Methods", "[autogen][admin][w
       chi::LocalLoadTaskArchive load_archive(save_archive.GetData());
       container->LocalLoadTask(chimaera::admin::Method::kWreapDeadIpcs, load_archive, loaded_task);
       INFO("WreapDeadIpcs LocalSaveTask/LocalLoadTask completed");
-      ipc_manager->DelTask(loaded_task);
+      CHI_IPC->DelTask(loaded_task);
     }
 
-    ipc_manager->DelTask(orig_task);
+    CHI_IPC->DelTask(orig_task);
   }
 
   SECTION("WreapDeadIpcs LocalAllocLoadTask") {
@@ -9691,10 +9691,10 @@ TEST_CASE("Autogen - Admin WreapDeadIpcs Container Methods", "[autogen][admin][w
     auto loaded = container->LocalAllocLoadTask(chimaera::admin::Method::kWreapDeadIpcs, load_archive);
     if (!loaded.IsNull()) {
       INFO("WreapDeadIpcs LocalAllocLoadTask completed");
-      ipc_manager->DelTask(loaded);
+      CHI_IPC->DelTask(loaded);
     }
 
-    ipc_manager->DelTask(orig_task);
+    CHI_IPC->DelTask(orig_task);
   }
 }
 
@@ -9723,9 +9723,9 @@ TEST_CASE("Autogen - Admin LocalAllocLoadTask Additional Methods", "[autogen][ad
       auto loaded = container->LocalAllocLoadTask(chimaera::admin::Method::kFlush, load_archive);
       if (!loaded.IsNull()) {
         INFO("Flush LocalAllocLoadTask completed");
-        ipc_manager->DelTask(loaded);
+        CHI_IPC->DelTask(loaded);
       }
-      ipc_manager->DelTask(orig_task);
+      CHI_IPC->DelTask(orig_task);
     }
   }
 
@@ -9742,9 +9742,9 @@ TEST_CASE("Autogen - Admin LocalAllocLoadTask Additional Methods", "[autogen][ad
       auto loaded = container->LocalAllocLoadTask(chimaera::admin::Method::kMonitor, load_archive);
       if (!loaded.IsNull()) {
         INFO("Monitor LocalAllocLoadTask completed");
-        ipc_manager->DelTask(loaded);
+        CHI_IPC->DelTask(loaded);
       }
-      ipc_manager->DelTask(orig_task);
+      CHI_IPC->DelTask(orig_task);
     }
   }
 
@@ -9761,9 +9761,9 @@ TEST_CASE("Autogen - Admin LocalAllocLoadTask Additional Methods", "[autogen][ad
       auto loaded = container->LocalAllocLoadTask(chimaera::admin::Method::kClientConnect, load_archive);
       if (!loaded.IsNull()) {
         INFO("ClientConnect LocalAllocLoadTask completed");
-        ipc_manager->DelTask(loaded);
+        CHI_IPC->DelTask(loaded);
       }
-      ipc_manager->DelTask(orig_task);
+      CHI_IPC->DelTask(orig_task);
     }
   }
 }
@@ -9791,9 +9791,9 @@ TEST_CASE("Autogen - MOD_NAME LocalSaveTask/LocalLoadTask Safe Methods", "[autog
       if (!loaded.IsNull()) {
         chi::LocalLoadTaskArchive load_archive(save_archive.GetData());
         mod_name_runtime.LocalLoadTask(chimaera::MOD_NAME::Method::kCoMutexTest, load_archive, loaded);
-        mod_name_runtime.DelTask(chimaera::MOD_NAME::Method::kCoMutexTest, loaded);
+        CHI_IPC->DelTask(loaded);
       }
-      mod_name_runtime.DelTask(chimaera::MOD_NAME::Method::kCoMutexTest, task);
+      CHI_IPC->DelTask(task);
       INFO("MOD_NAME CoMutexTest LocalSaveTask/LocalLoadTask completed");
     }
   }
@@ -9809,9 +9809,9 @@ TEST_CASE("Autogen - MOD_NAME LocalSaveTask/LocalLoadTask Safe Methods", "[autog
       if (!loaded.IsNull()) {
         chi::LocalLoadTaskArchive load_archive(save_archive.GetData());
         mod_name_runtime.LocalLoadTask(chimaera::MOD_NAME::Method::kCoRwLockTest, load_archive, loaded);
-        mod_name_runtime.DelTask(chimaera::MOD_NAME::Method::kCoRwLockTest, loaded);
+        CHI_IPC->DelTask(loaded);
       }
-      mod_name_runtime.DelTask(chimaera::MOD_NAME::Method::kCoRwLockTest, task);
+      CHI_IPC->DelTask(task);
       INFO("MOD_NAME CoRwLockTest LocalSaveTask/LocalLoadTask completed");
     }
   }
@@ -9827,9 +9827,9 @@ TEST_CASE("Autogen - MOD_NAME LocalSaveTask/LocalLoadTask Safe Methods", "[autog
       if (!loaded.IsNull()) {
         chi::LocalLoadTaskArchive load_archive(save_archive.GetData());
         mod_name_runtime.LocalLoadTask(chimaera::MOD_NAME::Method::kWaitTest, load_archive, loaded);
-        mod_name_runtime.DelTask(chimaera::MOD_NAME::Method::kWaitTest, loaded);
+        CHI_IPC->DelTask(loaded);
       }
-      mod_name_runtime.DelTask(chimaera::MOD_NAME::Method::kWaitTest, task);
+      CHI_IPC->DelTask(task);
       INFO("MOD_NAME WaitTest LocalSaveTask/LocalLoadTask completed");
     }
   }
@@ -9850,9 +9850,9 @@ TEST_CASE("Autogen - MOD_NAME LocalAllocLoadTask Safe Methods", "[autogen][mod_n
       chi::LocalLoadTaskArchive load_archive(save_archive.GetData());
       auto loaded = mod_name_runtime.LocalAllocLoadTask(chimaera::MOD_NAME::Method::kCoMutexTest, load_archive);
       if (!loaded.IsNull()) {
-        mod_name_runtime.DelTask(chimaera::MOD_NAME::Method::kCoMutexTest, loaded);
+        CHI_IPC->DelTask(loaded);
       }
-      mod_name_runtime.DelTask(chimaera::MOD_NAME::Method::kCoMutexTest, task);
+      CHI_IPC->DelTask(task);
       INFO("MOD_NAME CoMutexTest LocalAllocLoadTask completed");
     }
   }
@@ -9866,9 +9866,9 @@ TEST_CASE("Autogen - MOD_NAME LocalAllocLoadTask Safe Methods", "[autogen][mod_n
       chi::LocalLoadTaskArchive load_archive(save_archive.GetData());
       auto loaded = mod_name_runtime.LocalAllocLoadTask(chimaera::MOD_NAME::Method::kCoRwLockTest, load_archive);
       if (!loaded.IsNull()) {
-        mod_name_runtime.DelTask(chimaera::MOD_NAME::Method::kCoRwLockTest, loaded);
+        CHI_IPC->DelTask(loaded);
       }
-      mod_name_runtime.DelTask(chimaera::MOD_NAME::Method::kCoRwLockTest, task);
+      CHI_IPC->DelTask(task);
       INFO("MOD_NAME CoRwLockTest LocalAllocLoadTask completed");
     }
   }
@@ -9882,9 +9882,9 @@ TEST_CASE("Autogen - MOD_NAME LocalAllocLoadTask Safe Methods", "[autogen][mod_n
       chi::LocalLoadTaskArchive load_archive(save_archive.GetData());
       auto loaded = mod_name_runtime.LocalAllocLoadTask(chimaera::MOD_NAME::Method::kWaitTest, load_archive);
       if (!loaded.IsNull()) {
-        mod_name_runtime.DelTask(chimaera::MOD_NAME::Method::kWaitTest, loaded);
+        CHI_IPC->DelTask(loaded);
       }
-      mod_name_runtime.DelTask(chimaera::MOD_NAME::Method::kWaitTest, task);
+      CHI_IPC->DelTask(task);
       INFO("MOD_NAME WaitTest LocalAllocLoadTask completed");
     }
   }
@@ -9908,9 +9908,9 @@ TEST_CASE("Autogen - Bdev LocalSaveTask/LocalLoadTask Safe Methods", "[autogen][
       if (!loaded.IsNull()) {
         chi::LocalLoadTaskArchive load_archive(save_archive.GetData());
         bdev_runtime.LocalLoadTask(chimaera::bdev::Method::kGetStats, load_archive, loaded);
-        bdev_runtime.DelTask(chimaera::bdev::Method::kGetStats, loaded);
+        CHI_IPC->DelTask(loaded);
       }
-      bdev_runtime.DelTask(chimaera::bdev::Method::kGetStats, task);
+      CHI_IPC->DelTask(task);
       INFO("Bdev GetStats LocalSaveTask/LocalLoadTask completed");
     }
   }
@@ -9921,7 +9921,7 @@ TEST_CASE("Autogen - Bdev LocalSaveTask/LocalLoadTask Safe Methods", "[autogen][
     if (!task.IsNull()) {
       chi::LocalSaveTaskArchive save_archive(chi::LocalMsgType::kSerializeOut);
       bdev_runtime.LocalSaveTask(chimaera::bdev::Method::kFreeBlocks, save_archive, task);
-      bdev_runtime.DelTask(chimaera::bdev::Method::kFreeBlocks, task);
+      CHI_IPC->DelTask(task);
       INFO("Bdev FreeBlocks LocalSaveTask completed");
     }
   }
@@ -9932,7 +9932,7 @@ TEST_CASE("Autogen - Bdev LocalSaveTask/LocalLoadTask Safe Methods", "[autogen][
     if (!task.IsNull()) {
       chi::LocalSaveTaskArchive save_archive(chi::LocalMsgType::kSerializeOut);
       bdev_runtime.LocalSaveTask(chimaera::bdev::Method::kWrite, save_archive, task);
-      bdev_runtime.DelTask(chimaera::bdev::Method::kWrite, task);
+      CHI_IPC->DelTask(task);
       INFO("Bdev Write LocalSaveTask completed");
     }
   }
@@ -9950,9 +9950,9 @@ TEST_CASE("Autogen - Bdev LocalSaveTask/LocalLoadTask Safe Methods", "[autogen][
       if (!loaded.IsNull()) {
         chi::LocalLoadTaskArchive load_archive(save_archive.GetData());
         bdev_runtime.LocalLoadTask(chimaera::bdev::Method::kAllocateBlocks, load_archive, loaded);
-        bdev_runtime.DelTask(chimaera::bdev::Method::kAllocateBlocks, loaded);
+        CHI_IPC->DelTask(loaded);
       }
-      bdev_runtime.DelTask(chimaera::bdev::Method::kAllocateBlocks, task);
+      CHI_IPC->DelTask(task);
       INFO("Bdev AllocateBlocks LocalLoadTask completed");
     }
   }
@@ -9973,9 +9973,9 @@ TEST_CASE("Autogen - Bdev LocalAllocLoadTask Safe Methods", "[autogen][bdev][loc
       chi::LocalLoadTaskArchive load_archive(save_archive.GetData());
       auto loaded = bdev_runtime.LocalAllocLoadTask(chimaera::bdev::Method::kGetStats, load_archive);
       if (!loaded.IsNull()) {
-        bdev_runtime.DelTask(chimaera::bdev::Method::kGetStats, loaded);
+        CHI_IPC->DelTask(loaded);
       }
-      bdev_runtime.DelTask(chimaera::bdev::Method::kGetStats, task);
+      CHI_IPC->DelTask(task);
       INFO("Bdev GetStats LocalAllocLoadTask completed");
     }
   }
@@ -9990,7 +9990,7 @@ TEST_CASE("Autogen - CTE GetTargetInfo Container Methods", "[autogen][cte][getta
   SECTION("GetTargetInfo NewTask and DelTask") {
     auto task = cte_runtime.NewTask(wrp_cte::core::Method::kGetTargetInfo);
     if (!task.IsNull()) {
-      cte_runtime.DelTask(wrp_cte::core::Method::kGetTargetInfo, task);
+      CHI_IPC->DelTask(task);
       INFO("CTE GetTargetInfo NewTask/DelTask completed");
     }
   }
@@ -10007,7 +10007,7 @@ TEST_CASE("Autogen - CTE GetTargetInfo Container Methods", "[autogen][cte][getta
       load_archive.msg_type_ = chi::MsgType::kSerializeIn;
       cte_runtime.LoadTask(wrp_cte::core::Method::kGetTargetInfo, load_archive, task_ptr);
 
-      cte_runtime.DelTask(wrp_cte::core::Method::kGetTargetInfo, task);
+      CHI_IPC->DelTask(task);
       INFO("CTE GetTargetInfo SaveTask/LoadTask completed");
     }
   }
@@ -10017,9 +10017,9 @@ TEST_CASE("Autogen - CTE GetTargetInfo Container Methods", "[autogen][cte][getta
     if (!task.IsNull()) {
       auto copy = cte_runtime.NewCopyTask(wrp_cte::core::Method::kGetTargetInfo, task, false);
       if (!copy.IsNull()) {
-        cte_runtime.DelTask(wrp_cte::core::Method::kGetTargetInfo, copy);
+        CHI_IPC->DelTask(copy);
       }
-      cte_runtime.DelTask(wrp_cte::core::Method::kGetTargetInfo, task);
+      CHI_IPC->DelTask(task);
       INFO("CTE GetTargetInfo NewCopyTask completed");
     }
   }
@@ -10028,10 +10028,10 @@ TEST_CASE("Autogen - CTE GetTargetInfo Container Methods", "[autogen][cte][getta
     auto t1 = cte_runtime.NewTask(wrp_cte::core::Method::kGetTargetInfo);
     auto t2 = cte_runtime.NewTask(wrp_cte::core::Method::kGetTargetInfo);
     if (!t1.IsNull() && !t2.IsNull()) {
-      cte_runtime.Aggregate(wrp_cte::core::Method::kGetTargetInfo, t1, t2);
-      cte_runtime.DelTask(wrp_cte::core::Method::kGetTargetInfo, t2);
+      t1.ptr_->Aggregate(t2.template Cast<chi::Task>());
+      CHI_IPC->DelTask(t2);
     }
-    if (!t1.IsNull()) cte_runtime.DelTask(wrp_cte::core::Method::kGetTargetInfo, t1);
+    if (!t1.IsNull()) CHI_IPC->DelTask(t1);
     INFO("CTE GetTargetInfo Aggregate completed");
   }
 }
@@ -10057,9 +10057,9 @@ TEST_CASE("Autogen - CTE Core LocalSaveTask/LocalLoadTask Safe Methods", "[autog
       if (!loaded.IsNull()) {
         chi::LocalLoadTaskArchive load_archive(save_archive.GetData());
         cte_runtime.LocalLoadTask(wrp_cte::core::Method::kStatTargets, load_archive, loaded);
-        cte_runtime.DelTask(wrp_cte::core::Method::kStatTargets, loaded);
+        CHI_IPC->DelTask(loaded);
       }
-      cte_runtime.DelTask(wrp_cte::core::Method::kStatTargets, task);
+      CHI_IPC->DelTask(task);
       INFO("CTE StatTargets LocalSaveTask/LocalLoadTask completed");
     }
   }
@@ -10074,9 +10074,9 @@ TEST_CASE("Autogen - CTE Core LocalSaveTask/LocalLoadTask Safe Methods", "[autog
       if (!loaded.IsNull()) {
         chi::LocalLoadTaskArchive load_archive(save_archive.GetData());
         cte_runtime.LocalLoadTask(wrp_cte::core::Method::kGetTagSize, load_archive, loaded);
-        cte_runtime.DelTask(wrp_cte::core::Method::kGetTagSize, loaded);
+        CHI_IPC->DelTask(loaded);
       }
-      cte_runtime.DelTask(wrp_cte::core::Method::kGetTagSize, task);
+      CHI_IPC->DelTask(task);
       INFO("CTE GetTagSize LocalSaveTask/LocalLoadTask completed");
     }
   }
@@ -10093,9 +10093,9 @@ TEST_CASE("Autogen - CTE Core LocalSaveTask/LocalLoadTask Safe Methods", "[autog
       if (!loaded.IsNull()) {
         chi::LocalLoadTaskArchive load_archive(save_archive.GetData());
         cte_runtime.LocalLoadTask(wrp_cte::core::Method::kGetContainedBlobs, load_archive, loaded);
-        cte_runtime.DelTask(wrp_cte::core::Method::kGetContainedBlobs, loaded);
+        CHI_IPC->DelTask(loaded);
       }
-      cte_runtime.DelTask(wrp_cte::core::Method::kGetContainedBlobs, task);
+      CHI_IPC->DelTask(task);
       INFO("CTE GetContainedBlobs LocalLoadTask completed");
     }
   }
@@ -10111,9 +10111,9 @@ TEST_CASE("Autogen - CTE Core LocalSaveTask/LocalLoadTask Safe Methods", "[autog
       if (!loaded.IsNull()) {
         chi::LocalLoadTaskArchive load_archive(save_archive.GetData());
         cte_runtime.LocalLoadTask(wrp_cte::core::Method::kPollTelemetryLog, load_archive, loaded);
-        cte_runtime.DelTask(wrp_cte::core::Method::kPollTelemetryLog, loaded);
+        CHI_IPC->DelTask(loaded);
       }
-      cte_runtime.DelTask(wrp_cte::core::Method::kPollTelemetryLog, task);
+      CHI_IPC->DelTask(task);
       INFO("CTE PollTelemetryLog LocalLoadTask completed");
     }
   }
@@ -10134,9 +10134,9 @@ TEST_CASE("Autogen - CTE Core LocalAllocLoadTask Safe Methods", "[autogen][cte][
       chi::LocalLoadTaskArchive load_archive(save_archive.GetData());
       auto loaded = cte_runtime.LocalAllocLoadTask(wrp_cte::core::Method::kStatTargets, load_archive);
       if (!loaded.IsNull()) {
-        cte_runtime.DelTask(wrp_cte::core::Method::kStatTargets, loaded);
+        CHI_IPC->DelTask(loaded);
       }
-      cte_runtime.DelTask(wrp_cte::core::Method::kStatTargets, task);
+      CHI_IPC->DelTask(task);
       INFO("CTE StatTargets LocalAllocLoadTask completed");
     }
   }
@@ -10150,9 +10150,9 @@ TEST_CASE("Autogen - CTE Core LocalAllocLoadTask Safe Methods", "[autogen][cte][
       chi::LocalLoadTaskArchive load_archive(save_archive.GetData());
       auto loaded = cte_runtime.LocalAllocLoadTask(wrp_cte::core::Method::kGetTagSize, load_archive);
       if (!loaded.IsNull()) {
-        cte_runtime.DelTask(wrp_cte::core::Method::kGetTagSize, loaded);
+        CHI_IPC->DelTask(loaded);
       }
-      cte_runtime.DelTask(wrp_cte::core::Method::kGetTagSize, task);
+      CHI_IPC->DelTask(task);
       INFO("CTE GetTagSize LocalAllocLoadTask completed");
     }
   }
@@ -10180,7 +10180,7 @@ TEST_CASE("Autogen - Admin Default Case Coverage", "[autogen][admin][default]") 
   SECTION("Default DelTask") {
     auto task = container->NewTask(chimaera::admin::Method::kFlush);
     if (!task.IsNull()) {
-      container->DelTask(invalid_method, task);
+      CHI_IPC->DelTask(task);
       INFO("Admin default DelTask completed");
     }
   }
@@ -10190,7 +10190,7 @@ TEST_CASE("Autogen - Admin Default Case Coverage", "[autogen][admin][default]") 
     if (!task.IsNull()) {
       chi::SaveTaskArchive save_archive(chi::MsgType::kSerializeIn);
       container->SaveTask(invalid_method, save_archive, task);
-      container->DelTask(chimaera::admin::Method::kFlush, task);
+      CHI_IPC->DelTask(task);
       INFO("Admin default SaveTask completed");
     }
   }
@@ -10204,7 +10204,7 @@ TEST_CASE("Autogen - Admin Default Case Coverage", "[autogen][admin][default]") 
       chi::LoadTaskArchive load_archive(save_data);
       load_archive.msg_type_ = chi::MsgType::kSerializeIn;
       container->LoadTask(invalid_method, load_archive, task);
-      container->DelTask(chimaera::admin::Method::kFlush, task);
+      CHI_IPC->DelTask(task);
       INFO("Admin default LoadTask completed");
     }
   }
@@ -10216,7 +10216,7 @@ TEST_CASE("Autogen - Admin Default Case Coverage", "[autogen][admin][default]") 
       container->LocalSaveTask(chimaera::admin::Method::kFlush, save_archive, task);
       chi::LocalLoadTaskArchive load_archive(save_archive.GetData());
       container->LocalLoadTask(invalid_method, load_archive, task);
-      container->DelTask(chimaera::admin::Method::kFlush, task);
+      CHI_IPC->DelTask(task);
       INFO("Admin default LocalLoadTask completed");
     }
   }
@@ -10226,7 +10226,7 @@ TEST_CASE("Autogen - Admin Default Case Coverage", "[autogen][admin][default]") 
     if (!task.IsNull()) {
       chi::LocalSaveTaskArchive save_archive(chi::LocalMsgType::kSerializeOut);
       container->LocalSaveTask(invalid_method, save_archive, task);
-      container->DelTask(chimaera::admin::Method::kFlush, task);
+      CHI_IPC->DelTask(task);
       INFO("Admin default LocalSaveTask completed");
     }
   }
@@ -10236,9 +10236,9 @@ TEST_CASE("Autogen - Admin Default Case Coverage", "[autogen][admin][default]") 
     if (!task.IsNull()) {
       auto copy = container->NewCopyTask(invalid_method, task, false);
       if (!copy.IsNull()) {
-        ipc_manager->DelTask(copy);
+        CHI_IPC->DelTask(copy);
       }
-      container->DelTask(chimaera::admin::Method::kFlush, task);
+      CHI_IPC->DelTask(task);
       INFO("Admin default NewCopyTask completed");
     }
   }
@@ -10246,7 +10246,7 @@ TEST_CASE("Autogen - Admin Default Case Coverage", "[autogen][admin][default]") 
   SECTION("Default NewTask") {
     auto task = container->NewTask(invalid_method);
     if (!task.IsNull()) {
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
     }
     INFO("Admin default NewTask completed");
   }
@@ -10255,10 +10255,10 @@ TEST_CASE("Autogen - Admin Default Case Coverage", "[autogen][admin][default]") 
     auto t1 = container->NewTask(chimaera::admin::Method::kFlush);
     auto t2 = container->NewTask(chimaera::admin::Method::kFlush);
     if (!t1.IsNull() && !t2.IsNull()) {
-      container->Aggregate(invalid_method, t1, t2);
-      container->DelTask(chimaera::admin::Method::kFlush, t2);
+      t1.ptr_->Aggregate(t2.template Cast<chi::Task>());
+      CHI_IPC->DelTask(t2);
     }
-    if (!t1.IsNull()) container->DelTask(chimaera::admin::Method::kFlush, t1);
+    if (!t1.IsNull()) CHI_IPC->DelTask(t1);
     INFO("Admin default Aggregate completed");
   }
 }
@@ -10274,7 +10274,7 @@ TEST_CASE("Autogen - Bdev Default Case Coverage", "[autogen][bdev][default]") {
   SECTION("Default DelTask") {
     auto task = bdev_runtime.NewTask(chimaera::bdev::Method::kGetStats);
     if (!task.IsNull()) {
-      bdev_runtime.DelTask(invalid_method, task);
+      CHI_IPC->DelTask(task);
       INFO("Bdev default DelTask completed");
     }
   }
@@ -10284,7 +10284,7 @@ TEST_CASE("Autogen - Bdev Default Case Coverage", "[autogen][bdev][default]") {
     if (!task.IsNull()) {
       chi::SaveTaskArchive save_archive(chi::MsgType::kSerializeIn);
       bdev_runtime.SaveTask(invalid_method, save_archive, task);
-      bdev_runtime.DelTask(chimaera::bdev::Method::kGetStats, task);
+      CHI_IPC->DelTask(task);
       INFO("Bdev default SaveTask completed");
     }
   }
@@ -10298,7 +10298,7 @@ TEST_CASE("Autogen - Bdev Default Case Coverage", "[autogen][bdev][default]") {
       chi::LoadTaskArchive load_archive(save_data);
       load_archive.msg_type_ = chi::MsgType::kSerializeIn;
       bdev_runtime.LoadTask(invalid_method, load_archive, task);
-      bdev_runtime.DelTask(chimaera::bdev::Method::kGetStats, task);
+      CHI_IPC->DelTask(task);
       INFO("Bdev default LoadTask completed");
     }
   }
@@ -10308,7 +10308,7 @@ TEST_CASE("Autogen - Bdev Default Case Coverage", "[autogen][bdev][default]") {
     if (!task.IsNull()) {
       chi::LocalSaveTaskArchive save_archive(chi::LocalMsgType::kSerializeOut);
       bdev_runtime.LocalSaveTask(invalid_method, save_archive, task);
-      bdev_runtime.DelTask(chimaera::bdev::Method::kGetStats, task);
+      CHI_IPC->DelTask(task);
       INFO("Bdev default LocalSaveTask completed");
     }
   }
@@ -10320,7 +10320,7 @@ TEST_CASE("Autogen - Bdev Default Case Coverage", "[autogen][bdev][default]") {
       bdev_runtime.LocalSaveTask(chimaera::bdev::Method::kGetStats, save_archive, task);
       chi::LocalLoadTaskArchive load_archive(save_archive.GetData());
       bdev_runtime.LocalLoadTask(invalid_method, load_archive, task);
-      bdev_runtime.DelTask(chimaera::bdev::Method::kGetStats, task);
+      CHI_IPC->DelTask(task);
       INFO("Bdev default LocalLoadTask completed");
     }
   }
@@ -10330,9 +10330,9 @@ TEST_CASE("Autogen - Bdev Default Case Coverage", "[autogen][bdev][default]") {
     if (!task.IsNull()) {
       auto copy = bdev_runtime.NewCopyTask(invalid_method, task, false);
       if (!copy.IsNull()) {
-        ipc_manager->DelTask(copy);
+        CHI_IPC->DelTask(copy);
       }
-      bdev_runtime.DelTask(chimaera::bdev::Method::kGetStats, task);
+      CHI_IPC->DelTask(task);
       INFO("Bdev default NewCopyTask completed");
     }
   }
@@ -10340,7 +10340,7 @@ TEST_CASE("Autogen - Bdev Default Case Coverage", "[autogen][bdev][default]") {
   SECTION("Default NewTask") {
     auto task = bdev_runtime.NewTask(invalid_method);
     if (!task.IsNull()) {
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
     }
     INFO("Bdev default NewTask completed");
   }
@@ -10349,10 +10349,10 @@ TEST_CASE("Autogen - Bdev Default Case Coverage", "[autogen][bdev][default]") {
     auto t1 = bdev_runtime.NewTask(chimaera::bdev::Method::kGetStats);
     auto t2 = bdev_runtime.NewTask(chimaera::bdev::Method::kGetStats);
     if (!t1.IsNull() && !t2.IsNull()) {
-      bdev_runtime.Aggregate(invalid_method, t1, t2);
-      bdev_runtime.DelTask(chimaera::bdev::Method::kGetStats, t2);
+      t1.ptr_->Aggregate(t2.template Cast<chi::Task>());
+      CHI_IPC->DelTask(t2);
     }
-    if (!t1.IsNull()) bdev_runtime.DelTask(chimaera::bdev::Method::kGetStats, t1);
+    if (!t1.IsNull()) CHI_IPC->DelTask(t1);
     INFO("Bdev default Aggregate completed");
   }
 }
@@ -10370,7 +10370,7 @@ TEST_CASE("Autogen - MOD_NAME Default Case Coverage", "[autogen][mod_name][defau
     if (!task.IsNull()) {
       chi::LocalSaveTaskArchive save_archive(chi::LocalMsgType::kSerializeOut);
       mod_name_runtime.LocalSaveTask(invalid_method, save_archive, task);
-      mod_name_runtime.DelTask(chimaera::MOD_NAME::Method::kCoMutexTest, task);
+      CHI_IPC->DelTask(task);
       INFO("MOD_NAME default LocalSaveTask completed");
     }
   }
@@ -10382,7 +10382,7 @@ TEST_CASE("Autogen - MOD_NAME Default Case Coverage", "[autogen][mod_name][defau
       mod_name_runtime.LocalSaveTask(chimaera::MOD_NAME::Method::kCoMutexTest, save_archive, task);
       chi::LocalLoadTaskArchive load_archive(save_archive.GetData());
       mod_name_runtime.LocalLoadTask(invalid_method, load_archive, task);
-      mod_name_runtime.DelTask(chimaera::MOD_NAME::Method::kCoMutexTest, task);
+      CHI_IPC->DelTask(task);
       INFO("MOD_NAME default LocalLoadTask completed");
     }
   }
@@ -10399,7 +10399,7 @@ TEST_CASE("Autogen - CTE Default Case Coverage", "[autogen][cte][default]") {
   SECTION("Default DelTask") {
     auto task = cte_runtime.NewTask(wrp_cte::core::Method::kGetTagSize);
     if (!task.IsNull()) {
-      cte_runtime.DelTask(invalid_method, task);
+      CHI_IPC->DelTask(task);
       INFO("CTE default DelTask completed");
     }
   }
@@ -10409,7 +10409,7 @@ TEST_CASE("Autogen - CTE Default Case Coverage", "[autogen][cte][default]") {
     if (!task.IsNull()) {
       chi::SaveTaskArchive save_archive(chi::MsgType::kSerializeIn);
       cte_runtime.SaveTask(invalid_method, save_archive, task);
-      cte_runtime.DelTask(wrp_cte::core::Method::kGetTagSize, task);
+      CHI_IPC->DelTask(task);
       INFO("CTE default SaveTask completed");
     }
   }
@@ -10423,7 +10423,7 @@ TEST_CASE("Autogen - CTE Default Case Coverage", "[autogen][cte][default]") {
       chi::LoadTaskArchive load_archive(save_data);
       load_archive.msg_type_ = chi::MsgType::kSerializeIn;
       cte_runtime.LoadTask(invalid_method, load_archive, task);
-      cte_runtime.DelTask(wrp_cte::core::Method::kGetTagSize, task);
+      CHI_IPC->DelTask(task);
       INFO("CTE default LoadTask completed");
     }
   }
@@ -10433,7 +10433,7 @@ TEST_CASE("Autogen - CTE Default Case Coverage", "[autogen][cte][default]") {
     if (!task.IsNull()) {
       chi::LocalSaveTaskArchive save_archive(chi::LocalMsgType::kSerializeOut);
       cte_runtime.LocalSaveTask(invalid_method, save_archive, task);
-      cte_runtime.DelTask(wrp_cte::core::Method::kGetTagSize, task);
+      CHI_IPC->DelTask(task);
       INFO("CTE default LocalSaveTask completed");
     }
   }
@@ -10445,7 +10445,7 @@ TEST_CASE("Autogen - CTE Default Case Coverage", "[autogen][cte][default]") {
       cte_runtime.LocalSaveTask(wrp_cte::core::Method::kGetTagSize, save_archive, task);
       chi::LocalLoadTaskArchive load_archive(save_archive.GetData());
       cte_runtime.LocalLoadTask(invalid_method, load_archive, task);
-      cte_runtime.DelTask(wrp_cte::core::Method::kGetTagSize, task);
+      CHI_IPC->DelTask(task);
       INFO("CTE default LocalLoadTask completed");
     }
   }
@@ -10455,9 +10455,9 @@ TEST_CASE("Autogen - CTE Default Case Coverage", "[autogen][cte][default]") {
     if (!task.IsNull()) {
       auto copy = cte_runtime.NewCopyTask(invalid_method, task, false);
       if (!copy.IsNull()) {
-        ipc_manager->DelTask(copy);
+        CHI_IPC->DelTask(copy);
       }
-      cte_runtime.DelTask(wrp_cte::core::Method::kGetTagSize, task);
+      CHI_IPC->DelTask(task);
       INFO("CTE default NewCopyTask completed");
     }
   }
@@ -10465,7 +10465,7 @@ TEST_CASE("Autogen - CTE Default Case Coverage", "[autogen][cte][default]") {
   SECTION("Default NewTask") {
     auto task = cte_runtime.NewTask(invalid_method);
     if (!task.IsNull()) {
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
     }
     INFO("CTE default NewTask completed");
   }
@@ -10474,10 +10474,10 @@ TEST_CASE("Autogen - CTE Default Case Coverage", "[autogen][cte][default]") {
     auto t1 = cte_runtime.NewTask(wrp_cte::core::Method::kGetTagSize);
     auto t2 = cte_runtime.NewTask(wrp_cte::core::Method::kGetTagSize);
     if (!t1.IsNull() && !t2.IsNull()) {
-      cte_runtime.Aggregate(invalid_method, t1, t2);
-      cte_runtime.DelTask(wrp_cte::core::Method::kGetTagSize, t2);
+      t1.ptr_->Aggregate(t2.template Cast<chi::Task>());
+      CHI_IPC->DelTask(t2);
     }
-    if (!t1.IsNull()) cte_runtime.DelTask(wrp_cte::core::Method::kGetTagSize, t1);
+    if (!t1.IsNull()) CHI_IPC->DelTask(t1);
     INFO("CTE default Aggregate completed");
   }
 }
@@ -10720,18 +10720,18 @@ TEST_CASE("Autogen - Admin StopRuntimeTask full coverage", "[autogen][admin][sto
           chi::CreateTaskId(), chi::kAdminPoolId, chi::PoolQuery::Local());
       if (!copy.IsNull()) {
         copy->Copy(task.template Cast<chimaera::admin::StopRuntimeTask>());
-        ipc_manager->DelTask(copy);
+        CHI_IPC->DelTask(copy);
       }
 
       // Test Aggregate
       auto agg = ipc_manager->NewTask<chimaera::admin::StopRuntimeTask>(
           chi::CreateTaskId(), chi::kAdminPoolId, chi::PoolQuery::Local());
       if (!agg.IsNull()) {
-        agg->Aggregate(task.template Cast<chimaera::admin::StopRuntimeTask>());
-        ipc_manager->DelTask(agg);
+        agg->Aggregate(task.template Cast<chi::Task>());
+        CHI_IPC->DelTask(agg);
       }
 
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
       INFO("StopRuntimeTask full coverage completed");
     }
   }
@@ -10766,18 +10766,18 @@ TEST_CASE("Autogen - Admin SendTask full coverage", "[autogen][admin][sendtask][
           chi::CreateTaskId(), chi::kAdminPoolId, chi::PoolQuery::Local());
       if (!copy.IsNull()) {
         copy->Copy(task.template Cast<chimaera::admin::SendTask>());
-        ipc_manager->DelTask(copy);
+        CHI_IPC->DelTask(copy);
       }
 
       // Test Aggregate
       auto agg = ipc_manager->NewTask<chimaera::admin::SendTask>(
           chi::CreateTaskId(), chi::kAdminPoolId, chi::PoolQuery::Local());
       if (!agg.IsNull()) {
-        agg->Aggregate(task.template Cast<chimaera::admin::SendTask>());
-        ipc_manager->DelTask(agg);
+        agg->Aggregate(task.template Cast<chi::Task>());
+        CHI_IPC->DelTask(agg);
       }
 
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
       INFO("SendTask full coverage completed");
     }
   }
@@ -10812,10 +10812,10 @@ TEST_CASE("Autogen - Admin RecvTask full coverage", "[autogen][admin][recvtask][
           chi::CreateTaskId(), chi::kAdminPoolId, chi::PoolQuery::Local());
       if (!copy.IsNull()) {
         copy->Copy(task.template Cast<chimaera::admin::RecvTask>());
-        ipc_manager->DelTask(copy);
+        CHI_IPC->DelTask(copy);
       }
 
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
       INFO("RecvTask full coverage completed");
     }
   }
@@ -10850,18 +10850,18 @@ TEST_CASE("Autogen - Admin WreapDeadIpcsTask full coverage", "[autogen][admin][w
           chi::CreateTaskId(), chi::kAdminPoolId, chi::PoolQuery::Local());
       if (!copy.IsNull()) {
         copy->Copy(task.template Cast<chimaera::admin::WreapDeadIpcsTask>());
-        ipc_manager->DelTask(copy);
+        CHI_IPC->DelTask(copy);
       }
 
       // Test Aggregate
       auto agg = ipc_manager->NewTask<chimaera::admin::WreapDeadIpcsTask>(
           chi::CreateTaskId(), chi::kAdminPoolId, chi::PoolQuery::Local());
       if (!agg.IsNull()) {
-        agg->Aggregate(task.template Cast<chimaera::admin::WreapDeadIpcsTask>());
-        ipc_manager->DelTask(agg);
+        agg->Aggregate(task.template Cast<chi::Task>());
+        CHI_IPC->DelTask(agg);
       }
 
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
       INFO("WreapDeadIpcsTask full coverage completed");
     }
   }
@@ -10896,10 +10896,10 @@ TEST_CASE("Autogen - Admin SubmitBatchTask full coverage", "[autogen][admin][sub
           chi::CreateTaskId(), chi::kAdminPoolId, chi::PoolQuery::Local());
       if (!copy.IsNull()) {
         copy->Copy(task.template Cast<chimaera::admin::SubmitBatchTask>());
-        ipc_manager->DelTask(copy);
+        CHI_IPC->DelTask(copy);
       }
 
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
       INFO("SubmitBatchTask full coverage completed");
     }
   }
@@ -10933,9 +10933,9 @@ TEST_CASE("Autogen - Admin Container StopRuntime", "[autogen][admin][container][
       if (!load_task.IsNull()) {
         chi::LoadTaskArchive load_ar(save_ar.GetData());
         admin_runtime.LoadTask(chimaera::admin::Method::kStopRuntime, load_ar, load_task);
-        admin_runtime.DelTask(chimaera::admin::Method::kStopRuntime, load_task);
+        CHI_IPC->DelTask(load_task);
       }
-      admin_runtime.DelTask(chimaera::admin::Method::kStopRuntime, task);
+      CHI_IPC->DelTask(task);
       INFO("Admin kStopRuntime SaveTask/LoadTask completed");
     }
   }
@@ -10950,9 +10950,9 @@ TEST_CASE("Autogen - Admin Container StopRuntime", "[autogen][admin][container][
       if (!load_task.IsNull()) {
         chi::LoadTaskArchive load_ar(save_ar.GetData());
         admin_runtime.LoadTask(chimaera::admin::Method::kSend, load_ar, load_task);
-        admin_runtime.DelTask(chimaera::admin::Method::kSend, load_task);
+        CHI_IPC->DelTask(load_task);
       }
-      admin_runtime.DelTask(chimaera::admin::Method::kSend, task);
+      CHI_IPC->DelTask(task);
       INFO("Admin kSend SaveTask/LoadTask completed");
     }
   }
@@ -10967,9 +10967,9 @@ TEST_CASE("Autogen - Admin Container StopRuntime", "[autogen][admin][container][
       if (!load_task.IsNull()) {
         chi::LoadTaskArchive load_ar(save_ar.GetData());
         admin_runtime.LoadTask(chimaera::admin::Method::kRecv, load_ar, load_task);
-        admin_runtime.DelTask(chimaera::admin::Method::kRecv, load_task);
+        CHI_IPC->DelTask(load_task);
       }
-      admin_runtime.DelTask(chimaera::admin::Method::kRecv, task);
+      CHI_IPC->DelTask(task);
       INFO("Admin kRecv SaveTask/LoadTask completed");
     }
   }
@@ -10984,9 +10984,9 @@ TEST_CASE("Autogen - Admin Container StopRuntime", "[autogen][admin][container][
       if (!load_task.IsNull()) {
         chi::LoadTaskArchive load_ar(save_ar.GetData());
         admin_runtime.LoadTask(chimaera::admin::Method::kWreapDeadIpcs, load_ar, load_task);
-        admin_runtime.DelTask(chimaera::admin::Method::kWreapDeadIpcs, load_task);
+        CHI_IPC->DelTask(load_task);
       }
-      admin_runtime.DelTask(chimaera::admin::Method::kWreapDeadIpcs, task);
+      CHI_IPC->DelTask(task);
       INFO("Admin kWreapDeadIpcs SaveTask/LoadTask completed");
     }
   }
@@ -11001,9 +11001,9 @@ TEST_CASE("Autogen - Admin Container StopRuntime", "[autogen][admin][container][
       if (!load_task.IsNull()) {
         chi::LoadTaskArchive load_ar(save_ar.GetData());
         admin_runtime.LoadTask(chimaera::admin::Method::kSubmitBatch, load_ar, load_task);
-        admin_runtime.DelTask(chimaera::admin::Method::kSubmitBatch, load_task);
+        CHI_IPC->DelTask(load_task);
       }
-      admin_runtime.DelTask(chimaera::admin::Method::kSubmitBatch, task);
+      CHI_IPC->DelTask(task);
       INFO("Admin kSubmitBatch SaveTask/LoadTask completed");
     }
   }
@@ -11013,9 +11013,9 @@ TEST_CASE("Autogen - Admin Container StopRuntime", "[autogen][admin][container][
     if (!task.IsNull()) {
       auto copy = admin_runtime.NewCopyTask(chimaera::admin::Method::kStopRuntime, task, false);
       if (!copy.IsNull()) {
-        ipc_manager->DelTask(copy);
+        CHI_IPC->DelTask(copy);
       }
-      admin_runtime.DelTask(chimaera::admin::Method::kStopRuntime, task);
+      CHI_IPC->DelTask(task);
       INFO("Admin kStopRuntime NewCopyTask completed");
     }
   }
@@ -11025,9 +11025,9 @@ TEST_CASE("Autogen - Admin Container StopRuntime", "[autogen][admin][container][
     if (!task.IsNull()) {
       auto copy = admin_runtime.NewCopyTask(chimaera::admin::Method::kSend, task, false);
       if (!copy.IsNull()) {
-        ipc_manager->DelTask(copy);
+        CHI_IPC->DelTask(copy);
       }
-      admin_runtime.DelTask(chimaera::admin::Method::kSend, task);
+      CHI_IPC->DelTask(task);
       INFO("Admin kSend NewCopyTask completed");
     }
   }
@@ -11037,9 +11037,9 @@ TEST_CASE("Autogen - Admin Container StopRuntime", "[autogen][admin][container][
     if (!task.IsNull()) {
       auto copy = admin_runtime.NewCopyTask(chimaera::admin::Method::kRecv, task, false);
       if (!copy.IsNull()) {
-        ipc_manager->DelTask(copy);
+        CHI_IPC->DelTask(copy);
       }
-      admin_runtime.DelTask(chimaera::admin::Method::kRecv, task);
+      CHI_IPC->DelTask(task);
       INFO("Admin kRecv NewCopyTask completed");
     }
   }
@@ -11049,9 +11049,9 @@ TEST_CASE("Autogen - Admin Container StopRuntime", "[autogen][admin][container][
     if (!task.IsNull()) {
       auto copy = admin_runtime.NewCopyTask(chimaera::admin::Method::kWreapDeadIpcs, task, false);
       if (!copy.IsNull()) {
-        ipc_manager->DelTask(copy);
+        CHI_IPC->DelTask(copy);
       }
-      admin_runtime.DelTask(chimaera::admin::Method::kWreapDeadIpcs, task);
+      CHI_IPC->DelTask(task);
       INFO("Admin kWreapDeadIpcs NewCopyTask completed");
     }
   }
@@ -11060,10 +11060,10 @@ TEST_CASE("Autogen - Admin Container StopRuntime", "[autogen][admin][container][
     auto t1 = admin_runtime.NewTask(chimaera::admin::Method::kStopRuntime);
     auto t2 = admin_runtime.NewTask(chimaera::admin::Method::kStopRuntime);
     if (!t1.IsNull() && !t2.IsNull()) {
-      admin_runtime.Aggregate(chimaera::admin::Method::kStopRuntime, t1, t2);
-      admin_runtime.DelTask(chimaera::admin::Method::kStopRuntime, t2);
+      t1.ptr_->Aggregate(t2.template Cast<chi::Task>());
+      CHI_IPC->DelTask(t2);
     }
-    if (!t1.IsNull()) admin_runtime.DelTask(chimaera::admin::Method::kStopRuntime, t1);
+    if (!t1.IsNull()) CHI_IPC->DelTask(t1);
     INFO("Admin kStopRuntime Aggregate completed");
   }
 
@@ -11071,10 +11071,10 @@ TEST_CASE("Autogen - Admin Container StopRuntime", "[autogen][admin][container][
     auto t1 = admin_runtime.NewTask(chimaera::admin::Method::kSend);
     auto t2 = admin_runtime.NewTask(chimaera::admin::Method::kSend);
     if (!t1.IsNull() && !t2.IsNull()) {
-      admin_runtime.Aggregate(chimaera::admin::Method::kSend, t1, t2);
-      admin_runtime.DelTask(chimaera::admin::Method::kSend, t2);
+      t1.ptr_->Aggregate(t2.template Cast<chi::Task>());
+      CHI_IPC->DelTask(t2);
     }
-    if (!t1.IsNull()) admin_runtime.DelTask(chimaera::admin::Method::kSend, t1);
+    if (!t1.IsNull()) CHI_IPC->DelTask(t1);
     INFO("Admin kSend Aggregate completed");
   }
 
@@ -11082,10 +11082,10 @@ TEST_CASE("Autogen - Admin Container StopRuntime", "[autogen][admin][container][
     auto t1 = admin_runtime.NewTask(chimaera::admin::Method::kRecv);
     auto t2 = admin_runtime.NewTask(chimaera::admin::Method::kRecv);
     if (!t1.IsNull() && !t2.IsNull()) {
-      admin_runtime.Aggregate(chimaera::admin::Method::kRecv, t1, t2);
-      admin_runtime.DelTask(chimaera::admin::Method::kRecv, t2);
+      t1.ptr_->Aggregate(t2.template Cast<chi::Task>());
+      CHI_IPC->DelTask(t2);
     }
-    if (!t1.IsNull()) admin_runtime.DelTask(chimaera::admin::Method::kRecv, t1);
+    if (!t1.IsNull()) CHI_IPC->DelTask(t1);
     INFO("Admin kRecv Aggregate completed");
   }
 
@@ -11093,10 +11093,10 @@ TEST_CASE("Autogen - Admin Container StopRuntime", "[autogen][admin][container][
     auto t1 = admin_runtime.NewTask(chimaera::admin::Method::kWreapDeadIpcs);
     auto t2 = admin_runtime.NewTask(chimaera::admin::Method::kWreapDeadIpcs);
     if (!t1.IsNull() && !t2.IsNull()) {
-      admin_runtime.Aggregate(chimaera::admin::Method::kWreapDeadIpcs, t1, t2);
-      admin_runtime.DelTask(chimaera::admin::Method::kWreapDeadIpcs, t2);
+      t1.ptr_->Aggregate(t2.template Cast<chi::Task>());
+      CHI_IPC->DelTask(t2);
     }
-    if (!t1.IsNull()) admin_runtime.DelTask(chimaera::admin::Method::kWreapDeadIpcs, t1);
+    if (!t1.IsNull()) CHI_IPC->DelTask(t1);
     INFO("Admin kWreapDeadIpcs Aggregate completed");
   }
 
@@ -11110,9 +11110,9 @@ TEST_CASE("Autogen - Admin Container StopRuntime", "[autogen][admin][container][
       if (!load_task.IsNull()) {
         chi::LocalLoadTaskArchive load_archive(save_archive.GetData());
         admin_runtime.LocalLoadTask(chimaera::admin::Method::kStopRuntime, load_archive, load_task);
-        admin_runtime.DelTask(chimaera::admin::Method::kStopRuntime, load_task);
+        CHI_IPC->DelTask(load_task);
       }
-      admin_runtime.DelTask(chimaera::admin::Method::kStopRuntime, task);
+      CHI_IPC->DelTask(task);
       INFO("Admin kStopRuntime LocalSave/LocalLoad completed");
     }
   }
@@ -11127,9 +11127,9 @@ TEST_CASE("Autogen - Admin Container StopRuntime", "[autogen][admin][container][
       if (!load_task.IsNull()) {
         chi::LocalLoadTaskArchive load_archive(save_archive.GetData());
         admin_runtime.LocalLoadTask(chimaera::admin::Method::kSend, load_archive, load_task);
-        admin_runtime.DelTask(chimaera::admin::Method::kSend, load_task);
+        CHI_IPC->DelTask(load_task);
       }
-      admin_runtime.DelTask(chimaera::admin::Method::kSend, task);
+      CHI_IPC->DelTask(task);
       INFO("Admin kSend LocalSave/LocalLoad completed");
     }
   }
@@ -11144,9 +11144,9 @@ TEST_CASE("Autogen - Admin Container StopRuntime", "[autogen][admin][container][
       if (!load_task.IsNull()) {
         chi::LocalLoadTaskArchive load_archive(save_archive.GetData());
         admin_runtime.LocalLoadTask(chimaera::admin::Method::kRecv, load_archive, load_task);
-        admin_runtime.DelTask(chimaera::admin::Method::kRecv, load_task);
+        CHI_IPC->DelTask(load_task);
       }
-      admin_runtime.DelTask(chimaera::admin::Method::kRecv, task);
+      CHI_IPC->DelTask(task);
       INFO("Admin kRecv LocalSave/LocalLoad completed");
     }
   }
@@ -11161,9 +11161,9 @@ TEST_CASE("Autogen - Admin Container StopRuntime", "[autogen][admin][container][
       if (!load_task.IsNull()) {
         chi::LocalLoadTaskArchive load_archive(save_archive.GetData());
         admin_runtime.LocalLoadTask(chimaera::admin::Method::kWreapDeadIpcs, load_archive, load_task);
-        admin_runtime.DelTask(chimaera::admin::Method::kWreapDeadIpcs, load_task);
+        CHI_IPC->DelTask(load_task);
       }
-      admin_runtime.DelTask(chimaera::admin::Method::kWreapDeadIpcs, task);
+      CHI_IPC->DelTask(task);
       INFO("Admin kWreapDeadIpcs LocalSave/LocalLoad completed");
     }
   }
@@ -11182,9 +11182,9 @@ TEST_CASE("Autogen - Admin Container StopRuntime", "[autogen][admin][container][
       auto alloc_task = admin_runtime.LocalAllocLoadTask(
           chimaera::admin::Method::kStopRuntime, load_archive);
       if (!alloc_task.IsNull()) {
-        admin_runtime.DelTask(chimaera::admin::Method::kStopRuntime, alloc_task);
+        CHI_IPC->DelTask(alloc_task);
       }
-      admin_runtime.DelTask(chimaera::admin::Method::kStopRuntime, task);
+      CHI_IPC->DelTask(task);
       INFO("Admin kStopRuntime LocalAllocLoadTask completed");
     }
   }
@@ -11199,9 +11199,9 @@ TEST_CASE("Autogen - Admin Container StopRuntime", "[autogen][admin][container][
       auto alloc_task = admin_runtime.LocalAllocLoadTask(
           chimaera::admin::Method::kSend, load_archive);
       if (!alloc_task.IsNull()) {
-        admin_runtime.DelTask(chimaera::admin::Method::kSend, alloc_task);
+        CHI_IPC->DelTask(alloc_task);
       }
-      admin_runtime.DelTask(chimaera::admin::Method::kSend, task);
+      CHI_IPC->DelTask(task);
       INFO("Admin kSend LocalAllocLoadTask completed");
     }
   }
@@ -11216,9 +11216,9 @@ TEST_CASE("Autogen - Admin Container StopRuntime", "[autogen][admin][container][
       auto alloc_task = admin_runtime.LocalAllocLoadTask(
           chimaera::admin::Method::kRecv, load_archive);
       if (!alloc_task.IsNull()) {
-        admin_runtime.DelTask(chimaera::admin::Method::kRecv, alloc_task);
+        CHI_IPC->DelTask(alloc_task);
       }
-      admin_runtime.DelTask(chimaera::admin::Method::kRecv, task);
+      CHI_IPC->DelTask(task);
       INFO("Admin kRecv LocalAllocLoadTask completed");
     }
   }
@@ -11233,9 +11233,9 @@ TEST_CASE("Autogen - Admin Container StopRuntime", "[autogen][admin][container][
       auto alloc_task = admin_runtime.LocalAllocLoadTask(
           chimaera::admin::Method::kWreapDeadIpcs, load_archive);
       if (!alloc_task.IsNull()) {
-        admin_runtime.DelTask(chimaera::admin::Method::kWreapDeadIpcs, alloc_task);
+        CHI_IPC->DelTask(alloc_task);
       }
-      admin_runtime.DelTask(chimaera::admin::Method::kWreapDeadIpcs, task);
+      CHI_IPC->DelTask(task);
       INFO("Admin kWreapDeadIpcs LocalAllocLoadTask completed");
     }
   }
@@ -11258,7 +11258,7 @@ TEST_CASE("Autogen - CTE " task_label " methods", "[autogen][cte][methods][" tas
       chi::LocalSaveTaskArchive save_ar(chi::LocalMsgType::kSerializeIn); \
       task->SerializeIn(save_ar); \
       INFO(task_label " SerializeIn completed"); \
-      ipc_manager->DelTask(task); \
+      CHI_IPC->DelTask(task); \
     } \
   } \
   \
@@ -11268,7 +11268,7 @@ TEST_CASE("Autogen - CTE " task_label " methods", "[autogen][cte][methods][" tas
       chi::LocalSaveTaskArchive save_ar(chi::LocalMsgType::kSerializeOut); \
       task->SerializeOut(save_ar); \
       INFO(task_label " SerializeOut completed"); \
-      ipc_manager->DelTask(task); \
+      CHI_IPC->DelTask(task); \
     } \
   } \
   \
@@ -11279,19 +11279,19 @@ TEST_CASE("Autogen - CTE " task_label " methods", "[autogen][cte][methods][" tas
       t1->Copy(t2); \
       INFO(task_label " Copy completed"); \
     } \
-    if (!t1.IsNull()) ipc_manager->DelTask(t1); \
-    if (!t2.IsNull()) ipc_manager->DelTask(t2); \
+    if (!t1.IsNull()) CHI_IPC->DelTask(t1); \
+    if (!t2.IsNull()) CHI_IPC->DelTask(t2); \
   } \
   \
   SECTION("Aggregate") { \
     auto t1 = ipc_manager->NewTask<TaskType>(); \
     auto t2 = ipc_manager->NewTask<TaskType>(); \
     if (!t1.IsNull() && !t2.IsNull()) { \
-      t1->Aggregate(t2); \
+      t1->Aggregate(t2.template Cast<chi::Task>()); \
       INFO(task_label " Aggregate completed"); \
     } \
-    if (!t1.IsNull()) ipc_manager->DelTask(t1); \
-    if (!t2.IsNull()) ipc_manager->DelTask(t2); \
+    if (!t1.IsNull()) CHI_IPC->DelTask(t1); \
+    if (!t2.IsNull()) CHI_IPC->DelTask(t2); \
   } \
 }
 
@@ -11325,7 +11325,7 @@ TEST_CASE("Autogen - CTE GetOrCreateTagTask methods", "[autogen][cte][methods][G
       chi::LocalSaveTaskArchive save_ar(chi::LocalMsgType::kSerializeIn);
       task->SerializeIn(save_ar);
       INFO("GetOrCreateTagTask SerializeIn completed");
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
     }
   }
 
@@ -11335,7 +11335,7 @@ TEST_CASE("Autogen - CTE GetOrCreateTagTask methods", "[autogen][cte][methods][G
       chi::LocalSaveTaskArchive save_ar(chi::LocalMsgType::kSerializeOut);
       task->SerializeOut(save_ar);
       INFO("GetOrCreateTagTask SerializeOut completed");
-      ipc_manager->DelTask(task);
+      CHI_IPC->DelTask(task);
     }
   }
 
@@ -11346,19 +11346,19 @@ TEST_CASE("Autogen - CTE GetOrCreateTagTask methods", "[autogen][cte][methods][G
       t1->Copy(t2);
       INFO("GetOrCreateTagTask Copy completed");
     }
-    if (!t1.IsNull()) ipc_manager->DelTask(t1);
-    if (!t2.IsNull()) ipc_manager->DelTask(t2);
+    if (!t1.IsNull()) CHI_IPC->DelTask(t1);
+    if (!t2.IsNull()) CHI_IPC->DelTask(t2);
   }
 
   SECTION("Aggregate") {
     auto t1 = ipc_manager->NewTask<TagCreateTask>();
     auto t2 = ipc_manager->NewTask<TagCreateTask>();
     if (!t1.IsNull() && !t2.IsNull()) {
-      t1->Aggregate(t2);
+      t1->Aggregate(t2.template Cast<chi::Task>());
       INFO("GetOrCreateTagTask Aggregate completed");
     }
-    if (!t1.IsNull()) ipc_manager->DelTask(t1);
-    if (!t2.IsNull()) ipc_manager->DelTask(t2);
+    if (!t1.IsNull()) CHI_IPC->DelTask(t1);
+    if (!t2.IsNull()) CHI_IPC->DelTask(t2);
   }
 }
 
@@ -11895,9 +11895,9 @@ TEST_CASE("Autogen - CTE " task_label " serialize roundtrip", "[autogen][cte][ro
       if (!loaded.IsNull()) { \
         chi::LocalLoadTaskArchive load_ar(save_ar.GetData()); \
         loaded->SerializeIn(load_ar); \
-        ipc_manager->DelTask(loaded); \
+        CHI_IPC->DelTask(loaded); \
       } \
-      ipc_manager->DelTask(orig); \
+      CHI_IPC->DelTask(orig); \
       INFO(task_label " SerializeIn roundtrip completed"); \
     } \
   } \
@@ -11911,9 +11911,9 @@ TEST_CASE("Autogen - CTE " task_label " serialize roundtrip", "[autogen][cte][ro
       if (!loaded.IsNull()) { \
         chi::LocalLoadTaskArchive load_ar(save_ar.GetData()); \
         loaded->SerializeOut(load_ar); \
-        ipc_manager->DelTask(loaded); \
+        CHI_IPC->DelTask(loaded); \
       } \
-      ipc_manager->DelTask(orig); \
+      CHI_IPC->DelTask(orig); \
       INFO(task_label " SerializeOut roundtrip completed"); \
     } \
   } \
@@ -12347,7 +12347,7 @@ TEST_CASE("Autogen - CTE Container NewTask/DelTask", "[autogen][cte][container][
     for (auto method : methods) {
       auto task = cte_runtime.NewTask(method);
       if (!task.IsNull()) {
-        cte_runtime.DelTask(method, task);
+        CHI_IPC->DelTask(task);
       }
     }
     INFO("CTE NewTask/DelTask for all methods completed");
@@ -12374,9 +12374,9 @@ TEST_CASE("Autogen - CTE Container NewCopyTask dispatch", "[autogen][cte][contai
     if (!orig.IsNull()) {
       auto copy = cte_runtime.NewCopyTask(wrp_cte::core::Method::kGetOrCreateTag, orig, false);
       if (!copy.IsNull()) {
-        cte_runtime.DelTask(wrp_cte::core::Method::kGetOrCreateTag, copy);
+        CHI_IPC->DelTask(copy);
       }
-      cte_runtime.DelTask(wrp_cte::core::Method::kGetOrCreateTag, orig);
+      CHI_IPC->DelTask(orig);
       INFO("CTE kGetOrCreateTag NewCopyTask completed");
     }
   }
@@ -12403,11 +12403,11 @@ TEST_CASE("Autogen - CTE Container NewCopyTask dispatch", "[autogen][cte][contai
       auto t1 = cte_runtime.NewTask(method);
       auto t2 = cte_runtime.NewTask(method);
       if (!t1.IsNull() && !t2.IsNull()) {
-        cte_runtime.Aggregate(method, t1, t2);
-        cte_runtime.DelTask(method, t2);
+        t1.ptr_->Aggregate(t2.template Cast<chi::Task>());
+        CHI_IPC->DelTask(t2);
       }
       if (!t1.IsNull()) {
-        cte_runtime.DelTask(method, t1);
+        CHI_IPC->DelTask(t1);
       }
     }
     INFO("CTE Aggregate dispatch for all methods completed");
@@ -12869,9 +12869,9 @@ TEST_CASE("Autogen - CTE Container LocalSave/Load dispatch extended", "[autogen]
       if (!load_task.IsNull()) {
         chi::LocalLoadTaskArchive load_ar(save_ar.GetData());
         cte_runtime.LocalLoadTask(wrp_cte::core::Method::kListTargets, load_ar, load_task);
-        cte_runtime.DelTask(wrp_cte::core::Method::kListTargets, load_task);
+        CHI_IPC->DelTask(load_task);
       }
-      cte_runtime.DelTask(wrp_cte::core::Method::kListTargets, task);
+      CHI_IPC->DelTask(task);
       INFO("CTE kListTargets LocalSaveTask/LocalLoadTask completed");
     }
   }
@@ -12887,9 +12887,9 @@ TEST_CASE("Autogen - CTE Container LocalSave/Load dispatch extended", "[autogen]
       if (!load_task.IsNull()) {
         chi::LocalLoadTaskArchive load_ar(save_ar.GetData());
         cte_runtime.LocalLoadTask(wrp_cte::core::Method::kGetContainedBlobs, load_ar, load_task);
-        cte_runtime.DelTask(wrp_cte::core::Method::kGetContainedBlobs, load_task);
+        CHI_IPC->DelTask(load_task);
       }
-      cte_runtime.DelTask(wrp_cte::core::Method::kGetContainedBlobs, task);
+      CHI_IPC->DelTask(task);
       INFO("CTE kGetContainedBlobs LocalSaveTask/LocalLoadTask completed");
     }
   }
@@ -12906,9 +12906,9 @@ TEST_CASE("Autogen - CTE Container LocalSave/Load dispatch extended", "[autogen]
       if (!load_task.IsNull()) {
         chi::LocalLoadTaskArchive load_ar(save_ar.GetData());
         cte_runtime.LocalLoadTask(wrp_cte::core::Method::kStatTargets, load_ar, load_task);
-        cte_runtime.DelTask(wrp_cte::core::Method::kStatTargets, load_task);
+        CHI_IPC->DelTask(load_task);
       }
-      cte_runtime.DelTask(wrp_cte::core::Method::kStatTargets, task);
+      CHI_IPC->DelTask(task);
       INFO("CTE kStatTargets LocalSaveTask/LocalLoadTask completed");
     }
   }
@@ -12922,9 +12922,9 @@ TEST_CASE("Autogen - CTE Container LocalSave/Load dispatch extended", "[autogen]
       if (!load_task.IsNull()) {
         chi::LocalLoadTaskArchive load_ar(save_ar.GetData());
         cte_runtime.LocalLoadTask(wrp_cte::core::Method::kGetTagSize, load_ar, load_task);
-        cte_runtime.DelTask(wrp_cte::core::Method::kGetTagSize, load_task);
+        CHI_IPC->DelTask(load_task);
       }
-      cte_runtime.DelTask(wrp_cte::core::Method::kGetTagSize, task);
+      CHI_IPC->DelTask(task);
       INFO("CTE kGetTagSize LocalSaveTask/LocalLoadTask completed");
     }
   }
@@ -14231,7 +14231,7 @@ TEST_CASE("Autogen - ChimaeraManager extended", "[autogen][chimgr][extended]") {
     if (!task.IsNull()) { \
       chi::LocalSaveTaskArchive save_archive(chi::LocalMsgType::kSerializeOut); \
       runtime.LocalSaveTask(method_enum, save_archive, task); \
-      runtime.DelTask(method_enum, task); \
+      CHI_IPC->DelTask(task); \
       INFO(label " LocalSaveTask completed"); \
     } \
   }
@@ -14248,7 +14248,7 @@ TEST_CASE("Autogen - ChimaeraManager extended", "[autogen][chimgr][extended]") {
       /* Actually LocalSaveTask calls SerializeOut, not SerializeIn. */ \
       /* So let's just test LocalLoadTask with an empty archive - the */ \
       /* goal is to hit the switch case, not validate serialization. */ \
-      runtime.DelTask(method_enum, src_task); \
+      CHI_IPC->DelTask(src_task); \
       INFO(label " LocalLoadTask completed"); \
     } \
   }
@@ -14356,9 +14356,9 @@ TEST_CASE("Autogen - CAE LocalSaveTask all methods", "[autogen][cae][localsave][
             /* Expected for tasks with mismatched In/Out fields */ \
           } \
         } \
-        runtime.DelTask(method_enum, loaded); \
+        CHI_IPC->DelTask(loaded); \
       } \
-      runtime.DelTask(method_enum, task); \
+      CHI_IPC->DelTask(task); \
       INFO(label " LocalLoadTask completed"); \
     } \
   }
@@ -14386,9 +14386,9 @@ TEST_CASE("Autogen - MOD_NAME LocalLoadTask remaining methods", "[autogen][mod_n
       if (!loaded.IsNull()) {
         chi::LocalLoadTaskArchive load_archive(save_archive.GetData());
         rt.LocalLoadTask(chimaera::MOD_NAME::Method::kCustom, load_archive, loaded);
-        rt.DelTask(chimaera::MOD_NAME::Method::kCustom, loaded);
+        CHI_IPC->DelTask(loaded);
       }
-      rt.DelTask(chimaera::MOD_NAME::Method::kCustom, task);
+      CHI_IPC->DelTask(task);
       INFO("MOD_NAME Custom LocalLoadTask completed");
     }
   }
@@ -14404,9 +14404,9 @@ TEST_CASE("Autogen - MOD_NAME LocalLoadTask remaining methods", "[autogen][mod_n
       if (!loaded.IsNull()) {
         chi::LocalLoadTaskArchive load_archive(save_archive.GetData());
         rt.LocalLoadTask(chimaera::MOD_NAME::Method::kCreate, load_archive, loaded);
-        rt.DelTask(chimaera::MOD_NAME::Method::kCreate, loaded);
+        CHI_IPC->DelTask(loaded);
       }
-      rt.DelTask(chimaera::MOD_NAME::Method::kCreate, task);
+      CHI_IPC->DelTask(task);
       INFO("MOD_NAME Create LocalLoadTask completed");
     }
   }
@@ -14422,9 +14422,9 @@ TEST_CASE("Autogen - MOD_NAME LocalLoadTask remaining methods", "[autogen][mod_n
       if (!loaded.IsNull()) {
         chi::LocalLoadTaskArchive load_archive(save_archive.GetData());
         rt.LocalLoadTask(chimaera::MOD_NAME::Method::kDestroy, load_archive, loaded);
-        rt.DelTask(chimaera::MOD_NAME::Method::kDestroy, loaded);
+        CHI_IPC->DelTask(loaded);
       }
-      rt.DelTask(chimaera::MOD_NAME::Method::kDestroy, task);
+      CHI_IPC->DelTask(task);
       INFO("MOD_NAME Destroy LocalLoadTask completed");
     }
   }
@@ -14447,9 +14447,9 @@ TEST_CASE("Autogen - Admin LocalLoadTask remaining methods", "[autogen][admin][l
       if (!loaded.IsNull()) {
         chi::LocalLoadTaskArchive load_archive(save_archive.GetData());
         rt.LocalLoadTask(chimaera::admin::Method::kCreate, load_archive, loaded);
-        rt.DelTask(chimaera::admin::Method::kCreate, loaded);
+        CHI_IPC->DelTask(loaded);
       }
-      rt.DelTask(chimaera::admin::Method::kCreate, task);
+      CHI_IPC->DelTask(task);
       INFO("Admin Create LocalLoadTask completed");
     }
   }
@@ -14465,9 +14465,9 @@ TEST_CASE("Autogen - Admin LocalLoadTask remaining methods", "[autogen][admin][l
       if (!loaded.IsNull()) {
         chi::LocalLoadTaskArchive load_archive(save_archive.GetData());
         rt.LocalLoadTask(chimaera::admin::Method::kDestroy, load_archive, loaded);
-        rt.DelTask(chimaera::admin::Method::kDestroy, loaded);
+        CHI_IPC->DelTask(loaded);
       }
-      rt.DelTask(chimaera::admin::Method::kDestroy, task);
+      CHI_IPC->DelTask(task);
       INFO("Admin Destroy LocalLoadTask completed");
     }
   }
@@ -14483,9 +14483,9 @@ TEST_CASE("Autogen - Admin LocalLoadTask remaining methods", "[autogen][admin][l
       if (!loaded.IsNull()) {
         chi::LocalLoadTaskArchive load_archive(save_archive.GetData());
         rt.LocalLoadTask(chimaera::admin::Method::kGetOrCreatePool, load_archive, loaded);
-        rt.DelTask(chimaera::admin::Method::kGetOrCreatePool, loaded);
+        CHI_IPC->DelTask(loaded);
       }
-      rt.DelTask(chimaera::admin::Method::kGetOrCreatePool, task);
+      CHI_IPC->DelTask(task);
       INFO("Admin GetOrCreatePool LocalLoadTask completed");
     }
   }
@@ -14501,9 +14501,9 @@ TEST_CASE("Autogen - Admin LocalLoadTask remaining methods", "[autogen][admin][l
       if (!loaded.IsNull()) {
         chi::LocalLoadTaskArchive load_archive(save_archive.GetData());
         rt.LocalLoadTask(chimaera::admin::Method::kDestroyPool, load_archive, loaded);
-        rt.DelTask(chimaera::admin::Method::kDestroyPool, loaded);
+        CHI_IPC->DelTask(loaded);
       }
-      rt.DelTask(chimaera::admin::Method::kDestroyPool, task);
+      CHI_IPC->DelTask(task);
       INFO("Admin DestroyPool LocalLoadTask completed");
     }
   }
@@ -14519,9 +14519,9 @@ TEST_CASE("Autogen - Admin LocalLoadTask remaining methods", "[autogen][admin][l
       if (!loaded.IsNull()) {
         chi::LocalLoadTaskArchive load_archive(save_archive.GetData());
         rt.LocalLoadTask(chimaera::admin::Method::kSubmitBatch, load_archive, loaded);
-        rt.DelTask(chimaera::admin::Method::kSubmitBatch, loaded);
+        CHI_IPC->DelTask(loaded);
       }
-      rt.DelTask(chimaera::admin::Method::kSubmitBatch, task);
+      CHI_IPC->DelTask(task);
       INFO("Admin SubmitBatch LocalLoadTask completed");
     }
   }
@@ -14544,9 +14544,9 @@ TEST_CASE("Autogen - Bdev LocalLoadTask remaining methods", "[autogen][bdev][loc
       if (!loaded.IsNull()) {
         chi::LocalLoadTaskArchive load_archive(save_archive.GetData());
         rt.LocalLoadTask(chimaera::bdev::Method::kCreate, load_archive, loaded);
-        rt.DelTask(chimaera::bdev::Method::kCreate, loaded);
+        CHI_IPC->DelTask(loaded);
       }
-      rt.DelTask(chimaera::bdev::Method::kCreate, task);
+      CHI_IPC->DelTask(task);
       INFO("Bdev Create LocalLoadTask completed");
     }
   }
@@ -14562,9 +14562,9 @@ TEST_CASE("Autogen - Bdev LocalLoadTask remaining methods", "[autogen][bdev][loc
       if (!loaded.IsNull()) {
         chi::LocalLoadTaskArchive load_archive(save_archive.GetData());
         rt.LocalLoadTask(chimaera::bdev::Method::kDestroy, load_archive, loaded);
-        rt.DelTask(chimaera::bdev::Method::kDestroy, loaded);
+        CHI_IPC->DelTask(loaded);
       }
-      rt.DelTask(chimaera::bdev::Method::kDestroy, task);
+      CHI_IPC->DelTask(task);
       INFO("Bdev Destroy LocalLoadTask completed");
     }
   }
@@ -14580,9 +14580,9 @@ TEST_CASE("Autogen - Bdev LocalLoadTask remaining methods", "[autogen][bdev][loc
       if (!loaded.IsNull()) {
         chi::LocalLoadTaskArchive load_archive(save_archive.GetData());
         rt.LocalLoadTask(chimaera::bdev::Method::kFreeBlocks, load_archive, loaded);
-        rt.DelTask(chimaera::bdev::Method::kFreeBlocks, loaded);
+        CHI_IPC->DelTask(loaded);
       }
-      rt.DelTask(chimaera::bdev::Method::kFreeBlocks, task);
+      CHI_IPC->DelTask(task);
       INFO("Bdev FreeBlocks LocalLoadTask completed");
     }
   }
@@ -14598,9 +14598,9 @@ TEST_CASE("Autogen - Bdev LocalLoadTask remaining methods", "[autogen][bdev][loc
       if (!loaded.IsNull()) {
         chi::LocalLoadTaskArchive load_archive(save_archive.GetData());
         rt.LocalLoadTask(chimaera::bdev::Method::kWrite, load_archive, loaded);
-        rt.DelTask(chimaera::bdev::Method::kWrite, loaded);
+        CHI_IPC->DelTask(loaded);
       }
-      rt.DelTask(chimaera::bdev::Method::kWrite, task);
+      CHI_IPC->DelTask(task);
       INFO("Bdev Write LocalLoadTask completed");
     }
   }
@@ -14616,9 +14616,9 @@ TEST_CASE("Autogen - Bdev LocalLoadTask remaining methods", "[autogen][bdev][loc
       if (!loaded.IsNull()) {
         chi::LocalLoadTaskArchive load_archive(save_archive.GetData());
         rt.LocalLoadTask(chimaera::bdev::Method::kRead, load_archive, loaded);
-        rt.DelTask(chimaera::bdev::Method::kRead, loaded);
+        CHI_IPC->DelTask(loaded);
       }
-      rt.DelTask(chimaera::bdev::Method::kRead, task);
+      CHI_IPC->DelTask(task);
       INFO("Bdev Read LocalLoadTask completed");
     }
   }
@@ -14637,9 +14637,9 @@ TEST_CASE("Autogen - Bdev LocalLoadTask remaining methods", "[autogen][bdev][loc
       if (!loaded.IsNull()) { \
         chi::LocalLoadTaskArchive load_archive(save_archive.GetData()); \
         cte_rt.LocalLoadTask(method_enum, load_archive, loaded); \
-        cte_rt.DelTask(method_enum, loaded); \
+        CHI_IPC->DelTask(loaded); \
       } \
-      cte_rt.DelTask(method_enum, task); \
+      CHI_IPC->DelTask(task); \
       INFO(label " LocalLoadTask completed"); \
     } \
   }
@@ -14664,9 +14664,9 @@ TEST_CASE("Autogen - CTE LocalLoadTask remaining methods", "[autogen][cte][local
       if (!loaded.IsNull()) {
         chi::LocalLoadTaskArchive load_archive(save_archive.GetData());
         cte_rt.LocalLoadTask(wrp_cte::core::Method::kGetOrCreateTag, load_archive, loaded);
-        cte_rt.DelTask(wrp_cte::core::Method::kGetOrCreateTag, loaded);
+        CHI_IPC->DelTask(loaded);
       }
-      cte_rt.DelTask(wrp_cte::core::Method::kGetOrCreateTag, task);
+      CHI_IPC->DelTask(task);
       INFO("CTE GetOrCreateTag LocalLoadTask completed");
     }
   }
@@ -14699,9 +14699,9 @@ TEST_CASE("Autogen - CAE LocalLoadTask all methods", "[autogen][cae][localload][
       if (!loaded.IsNull()) {
         chi::LocalLoadTaskArchive load_archive(save_archive.GetData());
         rt.LocalLoadTask(wrp_cae::core::Method::kCreate, load_archive, loaded);
-        rt.DelTask(wrp_cae::core::Method::kCreate, loaded);
+        CHI_IPC->DelTask(loaded);
       }
-      rt.DelTask(wrp_cae::core::Method::kCreate, task);
+      CHI_IPC->DelTask(task);
       INFO("CAE Create LocalLoadTask completed");
     }
   }
@@ -14716,9 +14716,9 @@ TEST_CASE("Autogen - CAE LocalLoadTask all methods", "[autogen][cae][localload][
       if (!loaded.IsNull()) {
         chi::LocalLoadTaskArchive load_archive(save_archive.GetData());
         rt.LocalLoadTask(wrp_cae::core::Method::kDestroy, load_archive, loaded);
-        rt.DelTask(wrp_cae::core::Method::kDestroy, loaded);
+        CHI_IPC->DelTask(loaded);
       }
-      rt.DelTask(wrp_cae::core::Method::kDestroy, task);
+      CHI_IPC->DelTask(task);
       INFO("CAE Destroy LocalLoadTask completed");
     }
   }
@@ -14733,9 +14733,9 @@ TEST_CASE("Autogen - CAE LocalLoadTask all methods", "[autogen][cae][localload][
       if (!loaded.IsNull()) {
         chi::LocalLoadTaskArchive load_archive(save_archive.GetData());
         rt.LocalLoadTask(wrp_cae::core::Method::kParseOmni, load_archive, loaded);
-        rt.DelTask(wrp_cae::core::Method::kParseOmni, loaded);
+        CHI_IPC->DelTask(loaded);
       }
-      rt.DelTask(wrp_cae::core::Method::kParseOmni, task);
+      CHI_IPC->DelTask(task);
       INFO("CAE ParseOmni LocalLoadTask completed");
     }
   }
@@ -14750,9 +14750,9 @@ TEST_CASE("Autogen - CAE LocalLoadTask all methods", "[autogen][cae][localload][
       if (!loaded.IsNull()) {
         chi::LocalLoadTaskArchive load_archive(save_archive.GetData());
         rt.LocalLoadTask(wrp_cae::core::Method::kProcessHdf5Dataset, load_archive, loaded);
-        rt.DelTask(wrp_cae::core::Method::kProcessHdf5Dataset, loaded);
+        CHI_IPC->DelTask(loaded);
       }
-      rt.DelTask(wrp_cae::core::Method::kProcessHdf5Dataset, task);
+      CHI_IPC->DelTask(task);
       INFO("CAE ProcessHdf5Dataset LocalLoadTask completed");
     }
   }
@@ -14775,9 +14775,9 @@ TEST_CASE("Autogen - CAE LocalAllocLoadTask all methods", "[autogen][cae][locala
       chi::LocalLoadTaskArchive load_archive(save_archive.GetData());
       auto loaded = rt.LocalAllocLoadTask(wrp_cae::core::Method::kCreate, load_archive);
       if (!loaded.IsNull()) {
-        rt.DelTask(wrp_cae::core::Method::kCreate, loaded);
+        CHI_IPC->DelTask(loaded);
       }
-      rt.DelTask(wrp_cae::core::Method::kCreate, task);
+      CHI_IPC->DelTask(task);
       INFO("CAE Create LocalAllocLoadTask completed");
     }
   }
@@ -14791,9 +14791,9 @@ TEST_CASE("Autogen - CAE LocalAllocLoadTask all methods", "[autogen][cae][locala
       chi::LocalLoadTaskArchive load_archive(save_archive.GetData());
       auto loaded = rt.LocalAllocLoadTask(wrp_cae::core::Method::kDestroy, load_archive);
       if (!loaded.IsNull()) {
-        rt.DelTask(wrp_cae::core::Method::kDestroy, loaded);
+        CHI_IPC->DelTask(loaded);
       }
-      rt.DelTask(wrp_cae::core::Method::kDestroy, task);
+      CHI_IPC->DelTask(task);
       INFO("CAE Destroy LocalAllocLoadTask completed");
     }
   }
@@ -14807,9 +14807,9 @@ TEST_CASE("Autogen - CAE LocalAllocLoadTask all methods", "[autogen][cae][locala
       chi::LocalLoadTaskArchive load_archive(save_archive.GetData());
       auto loaded = rt.LocalAllocLoadTask(wrp_cae::core::Method::kParseOmni, load_archive);
       if (!loaded.IsNull()) {
-        rt.DelTask(wrp_cae::core::Method::kParseOmni, loaded);
+        CHI_IPC->DelTask(loaded);
       }
-      rt.DelTask(wrp_cae::core::Method::kParseOmni, task);
+      CHI_IPC->DelTask(task);
       INFO("CAE ParseOmni LocalAllocLoadTask completed");
     }
   }
@@ -14823,9 +14823,9 @@ TEST_CASE("Autogen - CAE LocalAllocLoadTask all methods", "[autogen][cae][locala
       chi::LocalLoadTaskArchive load_archive(save_archive.GetData());
       auto loaded = rt.LocalAllocLoadTask(wrp_cae::core::Method::kProcessHdf5Dataset, load_archive);
       if (!loaded.IsNull()) {
-        rt.DelTask(wrp_cae::core::Method::kProcessHdf5Dataset, loaded);
+        CHI_IPC->DelTask(loaded);
       }
-      rt.DelTask(wrp_cae::core::Method::kProcessHdf5Dataset, task);
+      CHI_IPC->DelTask(task);
       INFO("CAE ProcessHdf5Dataset LocalAllocLoadTask completed");
     }
   }

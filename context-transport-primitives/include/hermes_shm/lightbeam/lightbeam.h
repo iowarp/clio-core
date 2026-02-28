@@ -158,6 +158,7 @@ struct LbmContext {
   int timeout_ms;      /**< Timeout in milliseconds (0 = no timeout) */
   char* copy_space = nullptr;                      /**< Shared buffer for chunked transfer */
   ShmTransferInfo* shm_info_ = nullptr;            /**< Transfer info in shared memory */
+  int server_pid_ = 0;                             /**< Server PID for SHM liveness check */
 
   HSHM_CROSS_FUN LbmContext() : flags(0), timeout_ms(0) {}
 
@@ -203,6 +204,9 @@ class Transport {
 
   // Event registration API
   void RegisterEventManager(EventManager &em);
+
+  // Liveness check
+  bool IsServerAlive(const LbmContext& ctx = LbmContext()) const;
 };
 
 // --- Transport custom deleter (dispatches via type_ instead of vtable) ---

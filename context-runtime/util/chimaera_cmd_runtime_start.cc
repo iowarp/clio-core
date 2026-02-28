@@ -1,4 +1,5 @@
 #include <chrono>
+#include <csignal>
 #include <cstring>
 #include <iostream>
 #include <string>
@@ -12,7 +13,11 @@
 #include "chimaera_commands.h"
 
 namespace {
-volatile bool g_keep_running = true;
+volatile sig_atomic_t g_keep_running = 1;
+
+void SignalHandler(int /*sig*/) {
+  g_keep_running = 0;
+}
 
 bool InitializeAdminChiMod() {
   HLOG(kDebug, "Initializing admin ChiMod...");
@@ -125,6 +130,9 @@ int RuntimeStart(int argc, char* argv[]) {
     }
   }
 
+  std::signal(SIGTERM, SignalHandler);
+  std::signal(SIGINT, SignalHandler);
+
   HLOG(kDebug, "Starting Chimaera runtime...");
 
   if (!chi::CHIMAERA_INIT(chi::ChimaeraMode::kRuntime, true)) {
@@ -173,6 +181,9 @@ int RuntimeRestart(int argc, char* argv[]) {
       return 1;
     }
   }
+
+  std::signal(SIGTERM, SignalHandler);
+  std::signal(SIGINT, SignalHandler);
 
   HLOG(kInfo, "Restarting Chimaera runtime (WAL replay enabled)...");
 

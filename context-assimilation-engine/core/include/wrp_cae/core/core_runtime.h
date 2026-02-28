@@ -56,7 +56,6 @@ class Runtime : public chi::Container {
 
   // Virtual methods implemented in autogen/core_lib_exec.cc
   chi::TaskResume Run(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr, chi::RunContext& rctx) override;
-  void DelTask(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr) override;
   chi::u64 GetWorkRemaining() const override;
   void SaveTask(chi::u32 method, chi::SaveTaskArchive& archive, hipc::FullPtr<chi::Task> task_ptr) override;
   void LoadTask(chi::u32 method, chi::LoadTaskArchive& archive,
@@ -68,8 +67,9 @@ class Runtime : public chi::Container {
   void LocalSaveTask(chi::u32 method, chi::LocalSaveTaskArchive& archive, hipc::FullPtr<chi::Task> task_ptr) override;
   hipc::FullPtr<chi::Task> NewCopyTask(chi::u32 method, hipc::FullPtr<chi::Task> orig_task_ptr, bool deep) override;
   hipc::FullPtr<chi::Task> NewTask(chi::u32 method) override;
-  void Aggregate(chi::u32 method, hipc::FullPtr<chi::Task> origin_task_ptr, hipc::FullPtr<chi::Task> replica_task_ptr) override;
-
+  void Aggregate(chi::u32 method, hipc::FullPtr<chi::Task> orig_task,
+                 const hipc::FullPtr<chi::Task>& replica_task) override;
+  void DelTask(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr) override;
   /**
    * Initialize container with pool information (REQUIRED)
    * This is called by the framework before Create is called
@@ -88,14 +88,15 @@ class Runtime : public chi::Container {
    * This method creates queues and sets up container resources
    * NOTE: Container is already initialized via Init() before Create is called
    */
-  void Create(hipc::FullPtr<CreateTask> task, chi::RunContext& ctx);
+  chi::TaskResume Create(hipc::FullPtr<CreateTask> task, chi::RunContext& ctx);
 
   /**
    * Destroy the container (Method::kDestroy)
    */
-  void Destroy(hipc::FullPtr<chi::Task> task, chi::RunContext& ctx) {
+  chi::TaskResume Destroy(hipc::FullPtr<DestroyTask> task, chi::RunContext& ctx) {
     HLOG(kInfo, "Core container destroyed for pool: {} (ID: {})",
           pool_name_, pool_id_);
+    co_return;
   }
 
   /**

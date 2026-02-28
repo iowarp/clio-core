@@ -1,0 +1,20 @@
+# Chimaera Configuration for Reconnect Integration Testing
+# 4-node cluster testing client failover to new hosts after server death
+
+# Network configuration
+networking:
+  port: 9413
+  neighborhood_size: 4
+  hostfile: "/workspace/context-runtime/test/integration/reconnect/hostfile"
+
+# Logging configuration
+logging:
+  level: "info"
+  file: "/tmp/chimaera.log"
+
+# Runtime configuration
+runtime:
+  num_threads: 8
+  queue_depth: 1024
+  local_sched: "default"
+  first_busy_wait: 50

@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=65"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "context-visualizer"
+version = "0.1.0"
+dependencies = ["flask>=2.0", "pyyaml", "msgpack"]
+
+[tool.setuptools.packages.find]
+include = ["context_visualizer*"]
+
+[tool.setuptools.package-data]
+context_visualizer = ["templates/*.html", "static/**/*"]

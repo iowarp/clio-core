@@ -293,6 +293,48 @@ size_t SystemInfo::GetRamCapacity() {
 #endif
 }
 
+size_t SystemInfo::GetRamAvailable() {
+#if HSHM_ENABLE_PROCFS_SYSINFO
+#ifdef __linux__
+  std::ifstream meminfo("/proc/meminfo");
+  if (!meminfo.is_open()) return 0;
+  std::string line;
+  while (std::getline(meminfo, line)) {
+    if (line.rfind("MemAvailable:", 0) == 0) {
+      size_t kb = 0;
+      std::sscanf(line.c_str(), "MemAvailable: %zu", &kb);
+      return kb * 1024;  // convert kB to bytes
+    }
+  }
+  return 0;
+#else
+  return 0;
+#endif
+#elif HSHM_ENABLE_WINDOWS_SYSINFO
+  MEMORYSTATUSEX mem_info;
+  mem_info.dwLength = sizeof(mem_info);
+  GlobalMemoryStatusEx(&mem_info);
+  return static_cast<size_t>(mem_info.ullAvailPhys);
+#else
+  return 0;
+#endif
+}
+
+CpuTimes SystemInfo::GetCpuTimes() {
+  CpuTimes ct = {};
+#if HSHM_ENABLE_PROCFS_SYSINFO
+#ifdef __linux__
+  std::ifstream stat("/proc/stat");
+  if (stat.is_open()) {
+    std::string cpu_label;
+    stat >> cpu_label >> ct.user >> ct.nice >> ct.system >> ct.idle
+         >> ct.iowait >> ct.irq >> ct.softirq >> ct.steal;
+  }
+#endif
+#endif
+  return ct;
+}
+
 void SystemInfo::YieldThread() {
 #if HSHM_ENABLE_PROCFS_SYSINFO
   sched_yield();

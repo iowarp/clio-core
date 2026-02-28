@@ -88,6 +88,7 @@ set(CLIENT_RETRY_TEST_SOURCES
   test_client_retry.cc
 )
 
+
 # GPU IPC AllocateBuffer test executable (only if CUDA or HIP is enabled)
 set(IPC_ALLOCATE_BUFFER_GPU_TEST_TARGET test_ipc_allocate_buffer_gpu)
 set(IPC_ALLOCATE_BUFFER_GPU_TEST_SOURCES
@@ -420,6 +421,7 @@ set_target_properties(${CLIENT_RETRY_TEST_TARGET} PROPERTIES
 set_target_properties(${CLIENT_RETRY_TEST_TARGET} PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
+
 
 # Create GPU IPC AllocateBuffer test executable (only if CUDA or HIP is enabled)
 if(WRP_CORE_ENABLE_CUDA OR WRP_CORE_ENABLE_ROCM)

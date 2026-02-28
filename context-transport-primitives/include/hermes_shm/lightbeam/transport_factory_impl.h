@@ -136,6 +136,21 @@ inline void Transport::RegisterEventManager(EventManager &em) {
       break;
   }
 }
+
+inline bool Transport::IsServerAlive(const LbmContext& ctx) const {
+  switch (type_) {
+#if HSHM_ENABLE_ZMQ
+    case TransportType::kZeroMq:
+      return static_cast<const ZeroMqTransport*>(this)->IsServerAlive(ctx);
+#endif
+    case TransportType::kSocket:
+      return static_cast<const SocketTransport*>(this)->IsServerAlive(ctx);
+    case TransportType::kShm:
+      return static_cast<const ShmTransport*>(this)->IsServerAlive(ctx);
+    default:
+      return false;
+  }
+}
 #endif  // HSHM_IS_HOST
 
 #if HSHM_IS_HOST

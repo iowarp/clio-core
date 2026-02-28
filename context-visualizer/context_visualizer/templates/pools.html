@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+{% block title %}Pools -- Chimaera Visualizer{% endblock %}
+
+{% block content %}
+<h1>Pool Configuration</h1>
+
+<div id="pools-error" class="error-banner" style="display:none;"></div>
+
+<div class="table-container">
+    <table id="poolTable">
+        <thead>
+            <tr>
+                <th>Module</th>
+                <th>Pool Name</th>
+                <th>Pool ID</th>
+                <th>Query</th>
+            </tr>
+        </thead>
+        <tbody></tbody>
+    </table>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+    fetch("/api/pools")
+        .then(r => r.json())
+        .then(data => {
+            if (data.error) {
+                document.getElementById("pools-error").textContent = data.error;
+                document.getElementById("pools-error").style.display = "block";
+                return;
+            }
+            const tbody = document.querySelector("#poolTable tbody");
+            tbody.innerHTML = "";
+            (data.pools || []).forEach(p => {
+                const tr = document.createElement("tr");
+                tr.innerHTML =
+                    "<td>" + (p.mod_name || "") + "</td>" +
+                    "<td>" + (p.pool_name || "") + "</td>" +
+                    "<td><code>" + (p.pool_id || "") + "</code></td>" +
+                    "<td>" + (p.pool_query || "") + "</td>";
+                tbody.appendChild(tr);
+            });
+        })
+        .catch(err => {
+            document.getElementById("pools-error").textContent = "Failed to load pools: " + err;
+            document.getElementById("pools-error").style.display = "block";
+        });
+});
+</script>
+{% endblock %}
