@@ -152,7 +152,8 @@ jobs:
             source /tmp/test-venv/bin/activate
 
             # Install the wheel matching this Python version
-            pip install --quiet --no-index --find-links /wheels iowarp-core
+            # Use --find-links for the local wheel, but allow PyPI for dependencies
+            pip install --quiet --find-links /wheels --no-cache-dir iowarp-core
 
             echo "=== Import test ==="
             python -c "import iowarp_core; print(\"Version:\", iowarp_core.get_version())"

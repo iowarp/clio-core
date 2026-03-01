@@ -636,6 +636,9 @@ class basic_string {
           storage_.vec_->push_back(storage_.buffer_[i]);
         }
         using_sso_ = false;
+      } else {
+        // Already in vector mode: ensure capacity for data + null terminator
+        storage_.vec_->reserve(size_ + len + 1);
       }
       for (size_type i = 0; i < len; ++i) {
         storage_.vec_->push_back(s[i]);
@@ -685,6 +688,7 @@ class basic_string {
         size_ = len;
       } else {
         storage_.vec_ = new vector<T, AllocT>(alloc_);
+        storage_.vec_->reserve(len + 1);
         for (size_type i = 0; i < len; ++i) {
           storage_.vec_->push_back(s[i]);
         }
@@ -724,6 +728,7 @@ class basic_string {
       size_ = count;
     } else {
       storage_.vec_ = new vector<T, AllocT>(alloc_);
+      storage_.vec_->reserve(count + 1);
       for (size_type i = 0; i < count; ++i) {
         storage_.vec_->push_back(c);
       }
@@ -757,6 +762,7 @@ class basic_string {
       size_ = copy_count;
     } else {
       storage_.vec_ = new vector<T, AllocT>(alloc_);
+      storage_.vec_->reserve(copy_count + 1);
       for (size_type i = 0; i < copy_count; ++i) {
         storage_.vec_->push_back(other_data[pos + i]);
       }
@@ -780,6 +786,7 @@ class basic_string {
       size_ = other.size_;
     } else {
       storage_.vec_ = new vector<T, AllocT>(alloc_);
+      storage_.vec_->reserve(other.size_ + 1);
       for (size_type i = 0; i < other.size_; ++i) {
         storage_.vec_->push_back(other_data[i]);
       }
@@ -826,6 +833,7 @@ class basic_string {
       size_ = init.size();
     } else {
       storage_.vec_ = new vector<T, AllocT>(alloc_);
+      storage_.vec_->reserve(init.size() + 1);
       for (const T& c : init) {
         storage_.vec_->push_back(c);
       }
@@ -852,6 +860,7 @@ class basic_string {
       size_ = len;
     } else {
       storage_.vec_ = new vector<T, AllocT>(alloc_);
+      storage_.vec_->reserve(len + 1);
       for (size_type i = 0; i < len; ++i) {
         storage_.vec_->push_back(str[i]);
       }
@@ -884,6 +893,7 @@ class basic_string {
         size_ = other.size_;
       } else {
         storage_.vec_ = new vector<T, AllocT>(alloc_);
+        storage_.vec_->reserve(other.size_ + 1);
         for (size_type i = 0; i < other.size_; ++i) {
           storage_.vec_->push_back(other_data[i]);
         }
@@ -954,6 +964,7 @@ class basic_string {
       size_ = len;
     } else {
       storage_.vec_ = new vector<T, AllocT>(alloc_);
+      storage_.vec_->reserve(len + 1);
       for (size_type i = 0; i < len; ++i) {
         storage_.vec_->push_back(s[i]);
       }
@@ -986,6 +997,7 @@ class basic_string {
       size_ = init.size();
     } else {
       storage_.vec_ = new vector<T, AllocT>(alloc_);
+      storage_.vec_->reserve(init.size() + 1);
       for (const T& c : init) {
         storage_.vec_->push_back(c);
       }
@@ -1018,6 +1030,7 @@ class basic_string {
       size_ = len;
     } else {
       storage_.vec_ = new vector<T, AllocT>(alloc_);
+      storage_.vec_->reserve(len + 1);
       for (size_type i = 0; i < len; ++i) {
         storage_.vec_->push_back(str[i]);
       }
@@ -1152,6 +1165,9 @@ class basic_string {
    */
   HSHM_CROSS_FUN
   const T* c_str() const {
+    if (!UsingSso() && storage_.vec_->capacity() <= size_) {
+      storage_.vec_->reserve(size_ + 1);
+    }
     T* ptr = const_cast<T*>(GetData());
     ptr[size_] = T();
     return ptr;

@@ -275,6 +275,56 @@ inline std::ostream &operator<<(std::ostream &os, const TaskId &task_id) {
   return os;
 }
 
+/**
+ * Identity for cooperative lock ownership tracking.
+ * Subtasks share [pid, tid, major, node_id] with their parent,
+ * so reentrancy is detected when all fields match.
+ */
+struct LockOwnerId {
+  u32 worker_id_;
+  u32 pid_;
+  u32 tid_;
+  u32 major_;
+  u64 node_id_;
+
+  HSHM_CROSS_FUN LockOwnerId()
+      : worker_id_(0), pid_(0), tid_(0), major_(0), node_id_(0) {}
+
+  HSHM_CROSS_FUN LockOwnerId(u32 worker_id, u32 pid, u32 tid, u32 major,
+                              u64 node_id)
+      : worker_id_(worker_id),
+        pid_(pid),
+        tid_(tid),
+        major_(major),
+        node_id_(node_id) {}
+
+  HSHM_CROSS_FUN bool IsNull() const {
+    return worker_id_ == 0 && pid_ == 0 && tid_ == 0 && major_ == 0 &&
+           node_id_ == 0;
+  }
+
+  HSHM_CROSS_FUN bool operator==(const LockOwnerId &other) const {
+    if (IsNull() || other.IsNull()) return false;
+    return worker_id_ == other.worker_id_ && pid_ == other.pid_ &&
+           tid_ == other.tid_ && major_ == other.major_ &&
+           node_id_ == other.node_id_;
+  }
+
+  HSHM_CROSS_FUN bool operator!=(const LockOwnerId &other) const {
+    return !(*this == other);
+  }
+
+  HSHM_CROSS_FUN void Clear() {
+    worker_id_ = 0;
+    pid_ = 0;
+    tid_ = 0;
+    major_ = 0;
+    node_id_ = 0;
+  }
+};
+
+LockOwnerId GetCurrentLockOwnerId();
+
 using MethodId = u32;
 
 // Worker and Lane identifiers
@@ -355,6 +405,10 @@ struct AddressHash {
   BIT_OPT(chi::u32, 6)  ///< RunContext has been allocated for this task (set in
                         ///< BeginTask, prevents duplicate BeginTask calls when
                         ///< task is forwarded between workers)
+#define TASK_FIRE_AND_FORGET \
+  BIT_OPT(chi::u32, 7)  ///< Task does not need a response. Wait/co_await return
+                        ///< instantly; SendOut, ClientSend, and
+                        ///< EndTaskShmTransfer are skipped.
 
 // Bulk transfer flags are defined in hermes_shm/lightbeam/lightbeam.h:
 // - BULK_EXPOSE: Bulk is exposed (sender exposes for reading)
@@ -388,6 +442,7 @@ enum MemorySegment { kMainSegment = 0, kClientDataSegment = 1 };
 
 // HSHM Thread-local storage keys
 extern hshm::ThreadLocalKey chi_cur_worker_key_;
+extern bool chi_cur_worker_key_created_;
 extern hshm::ThreadLocalKey chi_task_counter_key_;
 extern hshm::ThreadLocalKey chi_is_client_thread_key_;
 

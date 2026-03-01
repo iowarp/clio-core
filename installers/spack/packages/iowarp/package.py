@@ -60,6 +60,9 @@ class Iowarp(CMakePackage):
     depends_on('python')
     depends_on('py-pip')
     depends_on('py-setuptools')
+    depends_on('py-pyyaml', when='+python')
+    depends_on('py-msgpack', when='+python')
+    depends_on('py-flask', when='+python')
 
     # Conditional core dependencies
     depends_on('libelf', when='+elf')

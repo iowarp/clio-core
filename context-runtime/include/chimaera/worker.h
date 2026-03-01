@@ -472,6 +472,9 @@ class Worker {
   u64 last_long_queue_check_;   // Last time (in 10us units) long queue was
                                 // processed
 
+  // Task completion counter (incremented in EndTask)
+  u64 num_tasks_processed_;  // Total tasks completed by this worker
+
   // Iteration counter for periodic blocked queue checks
   u64 iteration_count_;  // Number of iterations completed
 

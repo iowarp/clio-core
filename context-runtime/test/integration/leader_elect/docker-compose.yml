@@ -1,0 +1,144 @@
+# Leader Election Integration Tests for Chimaera Runtime
+# Tests leader shutdown, client failover, and leader restart:
+# Phase 1: Client on node 1 shuts down local runtime, fails over to another node
+# Phase 2: Node 1 runtime restarted, client re-initializes, verifies system health
+#
+# Usage:
+#   ./run_tests.sh all
+
+services:
+  # Node 1 - Test coordinator / leader (runtime will be shut down and restarted)
+  iowarp-node1:
+    image: iowarp/deps-cpu:latest
+    security_opt:
+      - seccomp:unconfined
+    container_name: iowarp-leader-elect-node1
+    hostname: iowarp-node1
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    networks:
+      iowarp-leader-elect-cluster:
+        ipv4_address: 172.30.0.10
+    volumes:
+      - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-/workspace}}:/workspace:rw
+    environment:
+      - NODE_ID=1
+      - NODE_IP=172.30.0.10
+      - CHI_SERVER_CONF=/workspace/context-runtime/test/integration/leader_elect/wrp_conf.yaml
+      - CONTAINER_HOSTFILE=/workspace/context-runtime/test/integration/leader_elect/hostfile
+      - CHI_WITH_RUNTIME=0
+      - CHI_NUM_CONTAINERS=4
+      - CHI_CLIENT_RETRY_TIMEOUT=5
+      - CHI_CLIENT_TRY_NEW_SERVERS=16
+      - PATH=/workspace/build/bin:/usr/local/bin:/usr/bin:/bin
+      - LD_LIBRARY_PATH=/workspace/build/bin:$LD_LIBRARY_PATH
+    mem_limit: 16g
+    working_dir: /workspace
+    entrypoint: [ "/bin/bash", "-c" ]
+    command: >
+      "
+        echo 'Node 1: Starting runtime in background...' &&
+        /workspace/build/bin/chimaera runtime start &
+        RUNTIME_PID=\$! &&
+        echo 'Node 1: Runtime started (PID \$RUNTIME_PID). Container stays alive for test runner.' &&
+        sleep infinity
+      "
+
+  # Node 2
+  iowarp-node2:
+    image: iowarp/deps-cpu:latest
+    security_opt:
+      - seccomp:unconfined
+    container_name: iowarp-leader-elect-node2
+    hostname: iowarp-node2
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    networks:
+      iowarp-leader-elect-cluster:
+        ipv4_address: 172.30.0.11
+    volumes:
+      - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-/workspace}}:/workspace:rw
+    environment:
+      - NODE_ID=2
+      - NODE_IP=172.30.0.11
+      - CHI_SERVER_CONF=/workspace/context-runtime/test/integration/leader_elect/wrp_conf.yaml
+      - CONTAINER_HOSTFILE=/workspace/context-runtime/test/integration/leader_elect/hostfile
+      - CHI_WITH_RUNTIME=0
+      - CHI_NUM_CONTAINERS=4
+      - PATH=/workspace/build/bin:/usr/local/bin:/usr/bin:/bin
+      - LD_LIBRARY_PATH=/workspace/build/bin:$LD_LIBRARY_PATH
+    mem_limit: 16g
+    working_dir: /workspace
+    entrypoint: [ "/bin/bash", "-c" ]
+    command: >
+      "
+        echo 'Node 2: Starting runtime...' &&
+        /workspace/build/bin/chimaera runtime start
+      "
+
+  # Node 3
+  iowarp-node3:
+    image: iowarp/deps-cpu:latest
+    security_opt:
+      - seccomp:unconfined
+    container_name: iowarp-leader-elect-node3
+    hostname: iowarp-node3
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    networks:
+      iowarp-leader-elect-cluster:
+        ipv4_address: 172.30.0.12
+    volumes:
+      - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-/workspace}}:/workspace:rw
+    environment:
+      - NODE_ID=3
+      - NODE_IP=172.30.0.12
+      - CHI_SERVER_CONF=/workspace/context-runtime/test/integration/leader_elect/wrp_conf.yaml
+      - CONTAINER_HOSTFILE=/workspace/context-runtime/test/integration/leader_elect/hostfile
+      - CHI_WITH_RUNTIME=0
+      - CHI_NUM_CONTAINERS=4
+      - PATH=/workspace/build/bin:/usr/local/bin:/usr/bin:/bin
+      - LD_LIBRARY_PATH=/workspace/build/bin:$LD_LIBRARY_PATH
+    mem_limit: 16g
+    working_dir: /workspace
+    entrypoint: [ "/bin/bash", "-c" ]
+    command: >
+      "
+        echo 'Node 3: Starting runtime...' &&
+        /workspace/build/bin/chimaera runtime start
+      "
+
+  # Node 4
+  iowarp-node4:
+    image: iowarp/deps-cpu:latest
+    security_opt:
+      - seccomp:unconfined
+    container_name: iowarp-leader-elect-node4
+    hostname: iowarp-node4
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    networks:
+      iowarp-leader-elect-cluster:
+        ipv4_address: 172.30.0.13
+    volumes:
+      - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-/workspace}}:/workspace:rw
+    environment:
+      - NODE_ID=4
+      - NODE_IP=172.30.0.13
+      - CHI_SERVER_CONF=/workspace/context-runtime/test/integration/leader_elect/wrp_conf.yaml
+      - CONTAINER_HOSTFILE=/workspace/context-runtime/test/integration/leader_elect/hostfile
+      - CHI_WITH_RUNTIME=0
+      - CHI_NUM_CONTAINERS=4
+      - PATH=/workspace/build/bin:/usr/local/bin:/usr/bin:/bin
+      - LD_LIBRARY_PATH=/workspace/build/bin:$LD_LIBRARY_PATH
+    mem_limit: 16g
+    working_dir: /workspace
+    entrypoint: [ "/bin/bash", "-c" ]
+    command: >
+      "
+        echo 'Node 4: Starting runtime...' &&
+        /workspace/build/bin/chimaera runtime start
+      "
+
+networks:
+  iowarp-leader-elect-cluster:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/16

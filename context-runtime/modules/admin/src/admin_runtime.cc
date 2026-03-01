@@ -46,17 +46,16 @@
 #include <chimaera/task_archives.h>
 #include <chimaera/worker.h>
 #include <hermes_shm/lightbeam/transport_factory_impl.h>
+#include <hermes_shm/serialize/msgpack_wrapper.h>
 
 #include <cereal/archives/binary.hpp>
 #include <cereal/types/vector.hpp>
-#include <hermes_shm/serialize/msgpack_wrapper.h>
 #include <chrono>
+#include <filesystem>
 #include <memory>
 #include <sstream>
-#include <thread>
 #include <unordered_map>
 #include <unordered_set>
-#include <filesystem>
 #include <vector>
 
 namespace chimaera::admin {
@@ -109,17 +108,20 @@ chi::TaskResume Runtime::Create(hipc::FullPtr<CreateTask> task,
       auto *tcp_transport = ipc_manager->GetClientTransport(chi::IpcMode::kTcp);
       if (tcp_transport) {
         tcp_transport->RegisterEventManager(em);
-        HLOG(kDebug, "Admin: TCP transport registered with net worker EventManager");
+        HLOG(kDebug,
+             "Admin: TCP transport registered with net worker EventManager");
       }
       auto *ipc_transport = ipc_manager->GetClientTransport(chi::IpcMode::kIpc);
       if (ipc_transport) {
         ipc_transport->RegisterEventManager(em);
-        HLOG(kDebug, "Admin: IPC transport registered with net worker EventManager");
+        HLOG(kDebug,
+             "Admin: IPC transport registered with net worker EventManager");
       }
       auto *main_transport = ipc_manager->GetMainTransport();
       if (main_transport) {
         main_transport->RegisterEventManager(em);
-        HLOG(kDebug, "Admin: Main transport registered with net worker EventManager");
+        HLOG(kDebug,
+             "Admin: Main transport registered with net worker EventManager");
       }
     }
   }
@@ -131,11 +133,20 @@ chi::TaskResume Runtime::Create(hipc::FullPtr<CreateTask> task,
   // Spawn periodic HeartbeatProbe task (SWIM failure detector, 2s period)
   client_.AsyncHeartbeatProbe(chi::PoolQuery::Local(), 2000000);
 
+  // Initialize system stats ring buffer and spawn periodic monitor task
+  system_stats_ring_ = std::make_unique<
+      hipc::circular_mpsc_ring_buffer<SystemStats, hipc::MallocAllocator>>(
+      HSHM_MALLOC, kSystemStatsRingSize);
+  prev_cpu_times_ = hshm::SystemInfo::GetCpuTimes();
+  client_.AsyncSystemMonitor(chi::PoolQuery::Local(), 1000000);  // 1s
+
   HLOG(kDebug,
        "Admin: Container created and initialized for pool: {} (ID: {}, count: "
        "{})",
        pool_name_, task->new_pool_id_, create_count_);
-  HLOG(kDebug, "Admin: Spawned periodic Recv, Send, ClientConnect, ClientRecv, ClientSend tasks");
+  HLOG(kDebug,
+       "Admin: Spawned periodic Recv, Send, ClientConnect, ClientRecv, "
+       "ClientSend tasks");
   (void)rctx;
   co_return;
 }
@@ -144,8 +155,7 @@ chi::PoolQuery Runtime::ScheduleTask(const hipc::FullPtr<chi::Task> &task) {
   using namespace chimaera::admin;
   switch (task->method_) {
     case Method::kGetOrCreatePool: {
-      auto typed = task.template Cast<
-          GetOrCreatePoolTask<CreateParams>>();
+      auto typed = task.template Cast<GetOrCreatePoolTask<CreateParams>>();
       auto *pool_manager = CHI_POOL_MANAGER;
       std::string pool_name = typed->pool_name_.str();
       chi::PoolId existing_pool_id = pool_manager->FindPoolByName(pool_name);
@@ -270,25 +280,10 @@ chi::TaskResume Runtime::StopRuntime(hipc::FullPtr<StopRuntimeTask> task,
   task->return_code_ = 0;
   task->error_message_ = "";
 
-  try {
-    // Set shutdown flag
-    is_shutdown_requested_ = true;
-
-    // Initiate graceful shutdown
-    InitiateShutdown(task->grace_period_ms_);
-
-    // Set success results
-    task->return_code_ = 0;
-
-    HLOG(kDebug, "Admin: Runtime shutdown initiated successfully");
-
-  } catch (const std::exception &e) {
-    task->return_code_ = 99;
-    std::string error_msg =
-        std::string("Exception during runtime shutdown: ") + e.what();
-    task->error_message_ = chi::priv::string(HSHM_MALLOC, error_msg);
-    HLOG(kError, "Admin: Runtime shutdown failed with exception: {}", e.what());
-  }
+  // Die immediately. SWIM will detect the death and trigger recovery.
+  is_shutdown_requested_ = true;
+  HLOG(kInfo, "Admin: Runtime shutdown initiated successfully");
+  InitiateShutdown(task->grace_period_ms_);
   (void)rctx;
   co_return;
 }
@@ -376,7 +371,8 @@ void Runtime::SendIn(hipc::FullPtr<chi::Task> origin_task,
   }
 
   // Get the container associated with the origin_task
-  chi::Container *container = pool_manager->GetStaticContainer(origin_task->pool_id_);
+  chi::Container *container =
+      pool_manager->GetStaticContainer(origin_task->pool_id_);
   if (container == nullptr) {
     HLOG(kError, "SendIn: container not found for pool_id {}",
          origin_task->pool_id_);
@@ -471,10 +467,20 @@ void Runtime::SendIn(hipc::FullPtr<chi::Task> origin_task,
 
     // Check aliveness before sending
     if (!ipc_manager->IsAlive(target_node_id)) {
-      HLOG(kWarning, "[SendIn] Task {} target node {} is dead, queuing for retry",
+      float net_timeout = origin_task->pool_query_.GetNetTimeout();
+      if (net_timeout >= 0 && net_timeout < 0.001f) {
+        // net_timeout=0: fail immediately for dead nodes, skip this replica
+        HLOG(kWarning,
+             "[SendIn] Task {} target node {} is dead, net_timeout=0 -> skip",
+             origin_task->task_id_, target_node_id);
+        origin_task_rctx->completed_replicas_++;
+        continue;
+      }
+      HLOG(kWarning,
+           "[SendIn] Task {} target node {} is dead, queuing for retry",
            origin_task->task_id_, target_node_id);
-      send_in_retry_.push_back({task_copy, target_node_id,
-                                std::chrono::steady_clock::now()});
+      send_in_retry_.push_back(
+          {task_copy, target_node_id, std::chrono::steady_clock::now()});
       continue;
     }
 
@@ -488,8 +494,8 @@ void Runtime::SendIn(hipc::FullPtr<chi::Task> origin_task,
       HLOG(kError, "[SendIn] Task {} FAILED: Could not get client for {}:{}",
            origin_task->task_id_, target_host->ip_address, port);
       ipc_manager->SetDead(target_node_id);
-      send_in_retry_.push_back({task_copy, target_node_id,
-                                std::chrono::steady_clock::now()});
+      send_in_retry_.push_back(
+          {task_copy, target_node_id, std::chrono::steady_clock::now()});
       continue;
     }
 
@@ -506,16 +512,16 @@ void Runtime::SendIn(hipc::FullPtr<chi::Task> origin_task,
     HLOG(kDebug, "[SendIn] Task {} sending to node {} via lightbeam",
          origin_task->task_id_, target_node_id);
     int rc = lbm_transport->Send(archive, ctx);
-    HLOG(kDebug, "[SendIn] Task {} lightbeam Send rc={}",
-         origin_task->task_id_, rc);
+    HLOG(kDebug, "[SendIn] Task {} lightbeam Send rc={}", origin_task->task_id_,
+         rc);
 
     if (rc != 0) {
       HLOG(kError,
            "[SendIn] Task {} Lightbeam async Send FAILED with error code {}",
            origin_task->task_id_, rc);
       ipc_manager->SetDead(target_node_id);
-      send_in_retry_.push_back({task_copy, target_node_id,
-                                std::chrono::steady_clock::now()});
+      send_in_retry_.push_back(
+          {task_copy, target_node_id, std::chrono::steady_clock::now()});
       continue;
     }
   }
@@ -532,7 +538,10 @@ void Runtime::SendOut(hipc::FullPtr<chi::Task> origin_task) {
   // Flush deferred deletes from previous invocation (zero-copy send safety)
   static std::vector<hipc::FullPtr<chi::Task>> deferred_deletes;
   for (auto &t : deferred_deletes) {
-    ipc_manager->DelTask(t);
+    auto *del_container = pool_manager->GetStaticContainer(t->pool_id_);
+    if (del_container) {
+      del_container->DelTask(t->method_, t);
+    }
   }
   deferred_deletes.clear();
 
@@ -543,7 +552,8 @@ void Runtime::SendOut(hipc::FullPtr<chi::Task> origin_task) {
   }
 
   // Get the container associated with the origin_task
-  chi::Container *container = pool_manager->GetStaticContainer(origin_task->pool_id_);
+  chi::Container *container =
+      pool_manager->GetStaticContainer(origin_task->pool_id_);
   if (container == nullptr) {
     HLOG(kError, "SendOut: container not found for pool_id {}",
          origin_task->pool_id_);
@@ -554,7 +564,8 @@ void Runtime::SendOut(hipc::FullPtr<chi::Task> origin_task) {
   // Key must match RecvIn: combines net_key and replica_id
   // Note: No lock needed - single net worker processes all Send/Recv tasks
   size_t recv_key = origin_task->task_id_.net_key_ ^
-      (static_cast<size_t>(origin_task->task_id_.replica_id_) * 0x9e3779b97f4a7c15ULL);
+                    (static_cast<size_t>(origin_task->task_id_.replica_id_) *
+                     0x9e3779b97f4a7c15ULL);
   auto *it = recv_map_.find(recv_key);
   if (it == nullptr) {
     HLOG(kError,
@@ -570,10 +581,11 @@ void Runtime::SendOut(hipc::FullPtr<chi::Task> origin_task) {
 
   // Check aliveness before sending output back
   if (!ipc_manager->IsAlive(target_node_id)) {
-    HLOG(kWarning, "[SendOut] Task {} return node {} is dead, queuing for retry",
+    HLOG(kWarning,
+         "[SendOut] Task {} return node {} is dead, queuing for retry",
          origin_task->task_id_, target_node_id);
-    send_out_retry_.push_back({origin_task, target_node_id,
-                               std::chrono::steady_clock::now()});
+    send_out_retry_.push_back(
+        {origin_task, target_node_id, std::chrono::steady_clock::now()});
     return;
   }
 
@@ -595,8 +607,8 @@ void Runtime::SendOut(hipc::FullPtr<chi::Task> origin_task) {
     HLOG(kError, "[SendOut] Task {} FAILED: Could not get client for {}:{}",
          origin_task->task_id_, target_host->ip_address, port);
     ipc_manager->SetDead(target_node_id);
-    send_out_retry_.push_back({origin_task, target_node_id,
-                               std::chrono::steady_clock::now()});
+    send_out_retry_.push_back(
+        {origin_task, target_node_id, std::chrono::steady_clock::now()});
     return;
   }
 
@@ -616,12 +628,16 @@ void Runtime::SendOut(hipc::FullPtr<chi::Task> origin_task) {
     HLOG(kError, "[SendOut] Task {} Lightbeam Send FAILED with error code {}",
          origin_task->task_id_, rc);
     ipc_manager->SetDead(target_node_id);
-    send_out_retry_.push_back({origin_task, target_node_id,
-                               std::chrono::steady_clock::now()});
+    send_out_retry_.push_back(
+        {origin_task, target_node_id, std::chrono::steady_clock::now()});
     return;
   }
 
   HLOG(kDebug, "[SendOut] Task {}", origin_task->task_id_);
+
+  // Clear TASK_DATA_OWNER before deferred deletion so the destructor
+  // doesn't try to FreeBuffer on transport-allocated data
+  origin_task->ClearFlags(TASK_DATA_OWNER);
 
   // Defer task deletion to next invocation for zero-copy send safety
   deferred_deletes.push_back(origin_task);
@@ -715,7 +731,8 @@ void Runtime::RecvIn(hipc::FullPtr<RecvTask> task,
     const auto &task_info = task_infos[task_idx];
 
     // Get container associated with PoolId
-    chi::Container *container = pool_manager->GetStaticContainer(task_info.pool_id_);
+    chi::Container *container =
+        pool_manager->GetStaticContainer(task_info.pool_id_);
     if (!container) {
       HLOG(kError, "Admin: Container not found for pool_id {}",
            task_info.pool_id_);
@@ -731,6 +748,22 @@ void Runtime::RecvIn(hipc::FullPtr<RecvTask> task,
       continue;
     }
 
+    // If the sender is a node we marked kDead, mark it alive.
+    // This handles restarted nodes: their SWIM probes reach us here,
+    // letting us rediscover them without requiring --induct.
+    // Only trigger on kDead (not kProbeFailed/kSuspected) to avoid
+    // flip-flopping during normal SWIM failure detection.
+    chi::u64 sender_node = task_ptr->pool_query_.GetReturnNode();
+    if (sender_node != ipc_manager->GetNodeId() &&
+        ipc_manager->GetNodeState(sender_node) == chi::NodeState::kDead) {
+      HLOG(kInfo, "[RecvIn] Received task from dead node {}, marking alive",
+           sender_node);
+      // Flush stale retry entries BEFORE marking alive so
+      // ProcessRetryQueues doesn't resend old tasks to the fresh runtime.
+      FlushStaleStateForNode(sender_node);
+      ipc_manager->SetAlive(sender_node);
+    }
+
     // Mark task as remote, set as data owner, clear sender-side flags
     // TASK_RUN_CTX_EXISTS and TASK_STARTED must be cleared so the receiving
     // worker allocates a fresh RunContext via BeginTask
@@ -743,7 +776,8 @@ void Runtime::RecvIn(hipc::FullPtr<RecvTask> task,
     // same node (e.g., after container migration) get distinct entries.
     // Note: No lock needed - single net worker processes all Send/Recv tasks
     size_t recv_key = task_ptr->task_id_.net_key_ ^
-        (static_cast<size_t>(task_ptr->task_id_.replica_id_) * 0x9e3779b97f4a7c15ULL);
+                      (static_cast<size_t>(task_ptr->task_id_.replica_id_) *
+                       0x9e3779b97f4a7c15ULL);
     recv_map_[recv_key] = task_ptr;
 
     HLOG(kDebug, "[RecvIn] Task {} method={} pool_id={} dispatching to workers",
@@ -876,7 +910,7 @@ void Runtime::RecvOut(hipc::FullPtr<RecvTask> task,
       continue;
     }
 
-    // Aggregate replica results into origin task
+    // Aggregate replica results into origin task via container dispatch
     container->Aggregate(origin_task->method_, origin_task, replica);
 
     HLOG(kDebug, "[RecvOut] Task {}", origin_task->task_id_);
@@ -893,13 +927,11 @@ void Runtime::RecvOut(hipc::FullPtr<RecvTask> task,
           pool_manager->GetStaticContainer(origin_task->pool_id_);
 
       // Unmark TASK_DATA_OWNER before deleting replicas to avoid freeing the
-      // same data pointers twice Delete all origin_task replicas using
+      // same data pointers twice. Delete all origin_task replicas using
       // container->DelTask() to avoid memory leak
-      if (container) {
-        for (const auto &origin_task_ptr : origin_rctx->subtasks_) {
-          origin_task_ptr->ClearFlags(TASK_DATA_OWNER);
-          container->DelTask(origin_task_ptr->method_, origin_task_ptr);
-        }
+      for (const auto &origin_task_ptr : origin_rctx->subtasks_) {
+        origin_task_ptr->ClearFlags(TASK_DATA_OWNER);
+        container->DelTask(origin_task->method_, origin_task_ptr);
       }
 
       // Clear subtasks vector after deleting tasks
@@ -953,8 +985,7 @@ chi::TaskResume Runtime::Recv(hipc::FullPtr<RecvTask> task,
 
   if (rc != 0) {
     if (rc != -1) {
-      HLOG(kError, "Admin: Lightbeam Recv failed with error code {}",
-           rc);
+      HLOG(kError, "Admin: Lightbeam Recv failed with error code {}", rc);
     }
     task->SetReturnCode(2);
     rctx.did_work_ = false;
@@ -1018,8 +1049,8 @@ chi::TaskResume Runtime::ClientRecv(hipc::FullPtr<ClientRecvTask> task,
 
   // Process both TCP and IPC servers
   for (int mode_idx = 0; mode_idx < 2; ++mode_idx) {
-    chi::IpcMode mode = (mode_idx == 0) ? chi::IpcMode::kTcp
-                                         : chi::IpcMode::kIpc;
+    chi::IpcMode mode =
+        (mode_idx == 0) ? chi::IpcMode::kTcp : chi::IpcMode::kIpc;
     hshm::lbm::Transport *transport = ipc_manager->GetClientTransport(mode);
     if (!transport) continue;
 
@@ -1067,8 +1098,8 @@ chi::TaskResume Runtime::ClientRecv(hipc::FullPtr<ClientRecvTask> task,
       future_shm->pool_id_ = pool_id;
       future_shm->method_id_ = method_id;
       future_shm->origin_ = (mode == chi::IpcMode::kTcp)
-                                 ? chi::FutureShm::FUTURE_CLIENT_TCP
-                                 : chi::FutureShm::FUTURE_CLIENT_IPC;
+                                ? chi::FutureShm::FUTURE_CLIENT_TCP
+                                : chi::FutureShm::FUTURE_CLIENT_IPC;
       future_shm->client_task_vaddr_ = info.task_id_.net_key_;
       future_shm->client_pid_ = info.task_id_.pid_;
       // Store transport and routing info for response
@@ -1076,16 +1107,16 @@ chi::TaskResume Runtime::ClientRecv(hipc::FullPtr<ClientRecvTask> task,
       future_shm->response_fd_ = recv_info.fd_;
       // Store ZMQ identity from recv frame for response routing
       if (!recv_info.identity_.empty() &&
-          recv_info.identity_.size() <= sizeof(future_shm->response_identity_)) {
-        std::memcpy(future_shm->response_identity_,
-                    recv_info.identity_.data(),
+          recv_info.identity_.size() <=
+              sizeof(future_shm->response_identity_)) {
+        std::memcpy(future_shm->response_identity_, recv_info.identity_.data(),
                     recv_info.identity_.size());
         future_shm->response_identity_len_ =
             static_cast<chi::u32>(recv_info.identity_.size());
       }
       // No copy_space for ZMQ path — ShmTransferInfo defaults are fine
-      // Mark as copied so the worker routes the completed task back via lightbeam
-      // rather than treating it as a runtime-internal task
+      // Mark as copied so the worker routes the completed task back via
+      // lightbeam rather than treating it as a runtime-internal task
       future_shm->flags_.SetBits(chi::FutureShm::FUTURE_WAS_COPIED);
 
       // Create Future and enqueue to worker
@@ -1131,7 +1162,10 @@ chi::TaskResume Runtime::ClientSend(hipc::FullPtr<ClientSendTask> task,
   // invocation guarantees the IO thread has flushed the message.
   static std::vector<hipc::FullPtr<chi::Task>> deferred_deletes;
   for (auto &t : deferred_deletes) {
-    ipc_manager->DelTask(t);
+    auto *del_container = pool_manager->GetStaticContainer(t->pool_id_);
+    if (del_container) {
+      del_container->DelTask(t->method_, t);
+    }
   }
   deferred_deletes.clear();
 
@@ -1174,7 +1208,8 @@ chi::TaskResume Runtime::ClientSend(hipc::FullPtr<ClientSendTask> task,
       origin_task->task_id_.net_key_ = future_shm->client_task_vaddr_;
 
       // Serialize task outputs using network archive
-      chi::SaveTaskArchive archive(chi::MsgType::kSerializeOut, response_transport);
+      chi::SaveTaskArchive archive(chi::MsgType::kSerializeOut,
+                                   response_transport);
       container->SaveTask(origin_task->method_, archive, origin_task);
 
       // Set routing info for the response
@@ -1182,15 +1217,14 @@ chi::TaskResume Runtime::ClientSend(hipc::FullPtr<ClientSendTask> task,
         // TCP (ZMQ ROUTER): identity-based routing
         // Use the actual ZMQ identity from the recv frame
         if (future_shm->response_identity_len_ > 0) {
-          archive.client_info_.identity_ = std::string(
-              future_shm->response_identity_,
-              future_shm->response_identity_len_);
+          archive.client_info_.identity_ =
+              std::string(future_shm->response_identity_,
+                          future_shm->response_identity_len_);
         } else {
           // Fallback: construct from PID (legacy 4-byte identity)
           chi::u32 client_pid = future_shm->client_pid_;
           archive.client_info_.identity_ = std::string(
-              reinterpret_cast<const char *>(&client_pid),
-              sizeof(client_pid));
+              reinterpret_cast<const char *>(&client_pid), sizeof(client_pid));
         }
       } else if (mode == chi::IpcMode::kIpc) {
         // IPC (Socket): fd-based routing on accepted connection
@@ -1202,6 +1236,10 @@ chi::TaskResume Runtime::ClientSend(hipc::FullPtr<ClientSendTask> task,
       if (rc != 0) {
         HLOG(kError, "ClientSend: lightbeam Send failed: {}", rc);
       }
+
+      // Clear TASK_DATA_OWNER before deferred deletion so the destructor
+      // doesn't try to FreeBuffer on transport-allocated data
+      origin_task->ClearFlags(TASK_DATA_OWNER);
 
       // Defer task deletion to next invocation for zero-copy send safety
       deferred_deletes.push_back(origin_task);
@@ -1219,165 +1257,344 @@ chi::TaskResume Runtime::ClientSend(hipc::FullPtr<ClientSendTask> task,
 chi::TaskResume Runtime::Monitor(hipc::FullPtr<MonitorTask> task,
                                  chi::RunContext &rctx) {
   if (task->query_ == "worker_stats") {
-    auto *work_orchestrator = CHI_WORK_ORCHESTRATOR;
-    if (!work_orchestrator) {
-      task->SetReturnCode(1);
-      HLOG(kError, "Monitor(worker_stats): WorkOrchestrator not available");
-      (void)rctx;
-      co_return;
-    }
-
-    size_t num_workers = work_orchestrator->GetWorkerCount();
-
-    msgpack::sbuffer sbuf;
-    msgpack::packer<msgpack::sbuffer> pk(sbuf);
-    pk.pack_array(num_workers);
-
-    for (size_t i = 0; i < num_workers; ++i) {
-      chi::Worker *worker =
-          work_orchestrator->GetWorker(static_cast<chi::u32>(i));
-      if (!worker) {
-        pk.pack_map(0);
-        continue;
-      }
-      chi::WorkerStats stats = worker->GetWorkerStats();
-      pk.pack_map(10);
-      pk.pack("worker_id");           pk.pack(stats.worker_id_);
-      pk.pack("is_running");          pk.pack(stats.is_running_);
-      pk.pack("is_active");           pk.pack(stats.is_active_);
-      pk.pack("idle_iterations");     pk.pack(stats.idle_iterations_);
-      pk.pack("num_queued_tasks");    pk.pack(stats.num_queued_tasks_);
-      pk.pack("num_blocked_tasks");   pk.pack(stats.num_blocked_tasks_);
-      pk.pack("num_periodic_tasks");  pk.pack(stats.num_periodic_tasks_);
-      pk.pack("num_retry_tasks");     pk.pack(stats.num_retry_tasks_);
-      pk.pack("suspend_period_us");   pk.pack(stats.suspend_period_us_);
-      pk.pack("num_tasks_processed"); pk.pack(stats.num_tasks_processed_);
-    }
-
-    task->results_[container_id_] = std::string(sbuf.data(), sbuf.size());
+    MonitorWorkerStats(task);
   } else if (task->query_.rfind("pool_stats://", 0) == 0) {
-    // Parse pool_stats://PoolId:PoolQuery:selector
-    // Format: pool_stats://<major.minor>:<routing_mode[:params...]>:<selector>
-    std::string uri_body = task->query_.substr(13);  // skip "pool_stats://"
+    co_await MonitorPoolStats(task);
+  } else if (task->query_.rfind("system_stats", 0) == 0) {
+    MonitorSystemStats(task);
+  } else if (task->query_ == "bdev_stats") {
+    co_await MonitorBdevStats(task);
+  } else if (task->query_ == "get_host_info") {
+    MonitorGetHostInfo(task);
+  } else {
+    // Unknown queries get empty results (forward-compatible)
+    task->SetReturnCode(0);
+  }
+  (void)rctx;
+  co_return;
+}
 
-    // 1. Extract PoolId (everything before first ':')
-    size_t first_colon = uri_body.find(':');
-    if (first_colon == std::string::npos) {
+void Runtime::MonitorWorkerStats(hipc::FullPtr<MonitorTask> task) {
+  auto *work_orchestrator = CHI_WORK_ORCHESTRATOR;
+  if (!work_orchestrator) {
+    task->SetReturnCode(1);
+    HLOG(kError, "Monitor(worker_stats): WorkOrchestrator not available");
+    return;
+  }
+
+  size_t num_workers = work_orchestrator->GetWorkerCount();
+
+  msgpack::sbuffer sbuf;
+  msgpack::packer<msgpack::sbuffer> pk(sbuf);
+  pk.pack_array(num_workers);
+
+  for (size_t i = 0; i < num_workers; ++i) {
+    chi::Worker *worker =
+        work_orchestrator->GetWorker(static_cast<chi::u32>(i));
+    if (!worker) {
+      pk.pack_map(0);
+      continue;
+    }
+    chi::WorkerStats stats = worker->GetWorkerStats();
+    pk.pack_map(10);
+    pk.pack("worker_id");
+    pk.pack(stats.worker_id_);
+    pk.pack("is_running");
+    pk.pack(stats.is_running_);
+    pk.pack("is_active");
+    pk.pack(stats.is_active_);
+    pk.pack("idle_iterations");
+    pk.pack(stats.idle_iterations_);
+    pk.pack("num_queued_tasks");
+    pk.pack(stats.num_queued_tasks_);
+    pk.pack("num_blocked_tasks");
+    pk.pack(stats.num_blocked_tasks_);
+    pk.pack("num_periodic_tasks");
+    pk.pack(stats.num_periodic_tasks_);
+    pk.pack("num_retry_tasks");
+    pk.pack(stats.num_retry_tasks_);
+    pk.pack("suspend_period_us");
+    pk.pack(stats.suspend_period_us_);
+    pk.pack("num_tasks_processed");
+    pk.pack(stats.num_tasks_processed_);
+  }
+
+  task->results_[container_id_] = std::string(sbuf.data(), sbuf.size());
+}
+
+chi::TaskResume Runtime::MonitorPoolStats(hipc::FullPtr<MonitorTask> task) {
+  // Parse pool_stats://PoolId:PoolQuery:selector
+  // Format: pool_stats://<major.minor>:<routing_mode[:params...]>:<selector>
+  std::string uri_body = task->query_.substr(13);  // skip "pool_stats://"
+
+  // 1. Extract PoolId (everything before first ':')
+  size_t first_colon = uri_body.find(':');
+  if (first_colon == std::string::npos) {
+    task->SetReturnCode(2);
+    HLOG(kError, "Monitor(pool_stats): missing ':' after PoolId in '{}'",
+         task->query_);
+    co_return;
+  }
+  std::string pool_id_str = uri_body.substr(0, first_colon);
+  chi::PoolId target_pool_id;
+  try {
+    target_pool_id = chi::PoolId::FromString(pool_id_str);
+  } catch (const std::exception &e) {
+    task->SetReturnCode(2);
+    HLOG(kError, "Monitor(pool_stats): invalid PoolId '{}': {}", pool_id_str,
+         e.what());
+    co_return;
+  }
+
+  // 2. Token-based parse of routing mode and its parameters
+  //    Tokens after PoolId: routing_mode[:extra1[:extra2]]:selector
+  //    local/broadcast/dynamic = 0 extra tokens
+  //    direct_id/direct_hash/physical = 1 extra token
+  //    range = 2 extra tokens
+  std::string remainder = uri_body.substr(first_colon + 1);
+  size_t colon_pos = remainder.find(':');
+  std::string routing_token = (colon_pos != std::string::npos)
+                                  ? remainder.substr(0, colon_pos)
+                                  : remainder;
+  // Lowercase for comparison
+  std::string routing_lower = routing_token;
+  std::transform(routing_lower.begin(), routing_lower.end(),
+                 routing_lower.begin(),
+                 [](unsigned char c) { return std::tolower(c); });
+
+  // Determine how many extra colon-separated tokens the mode consumes
+  int extra_tokens = 0;
+  if (routing_lower == "direct_id" || routing_lower == "direct_hash" ||
+      routing_lower == "physical") {
+    extra_tokens = 1;
+  } else if (routing_lower == "range") {
+    extra_tokens = 2;
+  }
+
+  // Consume routing_token + extra tokens to build PoolQuery string
+  std::string pool_query_str = routing_token;
+  size_t parse_pos =
+      (colon_pos != std::string::npos) ? colon_pos + 1 : remainder.size();
+  for (int i = 0; i < extra_tokens; ++i) {
+    if (parse_pos >= remainder.size()) {
       task->SetReturnCode(2);
-      HLOG(kError, "Monitor(pool_stats): missing ':' after PoolId in '{}'",
-           task->query_);
+      HLOG(kError,
+           "Monitor(pool_stats): not enough tokens for routing mode '{}' "
+           "in '{}'",
+           routing_token, task->query_);
       co_return;
     }
-    std::string pool_id_str = uri_body.substr(0, first_colon);
-    chi::PoolId target_pool_id;
+    size_t next_colon = remainder.find(':', parse_pos);
+    std::string token =
+        (next_colon != std::string::npos)
+            ? remainder.substr(parse_pos, next_colon - parse_pos)
+            : remainder.substr(parse_pos);
+    pool_query_str += ":" + token;
+    parse_pos =
+        (next_colon != std::string::npos) ? next_colon + 1 : remainder.size();
+  }
+
+  // Everything remaining is the selector
+  std::string selector;
+  if (parse_pos < remainder.size()) {
+    selector = remainder.substr(parse_pos);
+  }
+
+  // 3. Build PoolQuery from string
+  chi::PoolQuery target_pool_query;
+  try {
+    target_pool_query = chi::PoolQuery::FromString(pool_query_str);
+  } catch (const std::exception &e) {
+    task->SetReturnCode(2);
+    HLOG(kError, "Monitor(pool_stats): invalid PoolQuery '{}': {}",
+         pool_query_str, e.what());
+    co_return;
+  }
+
+  // 4. Verify the target pool exists
+  auto *pool_manager = CHI_POOL_MANAGER;
+  chi::Container *container = pool_manager->GetStaticContainer(target_pool_id);
+  if (!container) {
+    task->SetReturnCode(3);
+    HLOG(kError, "Monitor(pool_stats): pool {} not found", target_pool_id);
+    co_return;
+  }
+
+  // 5. Create sub-MonitorTask targeting the pool and dispatch it
+  auto *ipc_manager = CHI_IPC;
+  auto sub_task = ipc_manager->NewTask<MonitorTask>(
+      chi::CreateTaskId(), target_pool_id, target_pool_query, selector);
+  chi::Future<MonitorTask> sub_future = ipc_manager->Send(sub_task);
+  co_await sub_future;
+
+  // 6. Copy results from sub-task into this task
+  if (sub_future->GetReturnCode() != 0) {
+    task->SetReturnCode(sub_future->GetReturnCode());
+    HLOG(kError, "Monitor(pool_stats): sub-task failed with rc={}",
+         sub_future->GetReturnCode());
+  } else {
+    task->results_ = sub_future->results_;
+    task->SetReturnCode(0);
+  }
+  co_return;
+}
+
+void Runtime::MonitorSystemStats(hipc::FullPtr<MonitorTask> task) {
+  // system_stats or system_stats:<min_event_id>
+  uint64_t min_event_id = 0;
+  if (task->query_.size() > 13 && task->query_[12] == ':') {
     try {
-      target_pool_id = chi::PoolId::FromString(pool_id_str);
-    } catch (const std::exception &e) {
-      task->SetReturnCode(2);
-      HLOG(kError, "Monitor(pool_stats): invalid PoolId '{}': {}",
-           pool_id_str, e.what());
-      co_return;
+      min_event_id = std::stoull(task->query_.substr(13));
+    } catch (...) {
+      // ignore parse errors, default to 0
     }
+  }
 
-    // 2. Token-based parse of routing mode and its parameters
-    //    Tokens after PoolId: routing_mode[:extra1[:extra2]]:selector
-    //    local/broadcast/dynamic = 0 extra tokens
-    //    direct_id/direct_hash/physical = 1 extra token
-    //    range = 2 extra tokens
-    std::string remainder = uri_body.substr(first_colon + 1);
-    size_t colon_pos = remainder.find(':');
-    std::string routing_token = (colon_pos != std::string::npos)
-                                    ? remainder.substr(0, colon_pos)
-                                    : remainder;
-    // Lowercase for comparison
-    std::string routing_lower = routing_token;
-    std::transform(routing_lower.begin(), routing_lower.end(),
-                   routing_lower.begin(),
-                   [](unsigned char c) { return std::tolower(c); });
+  if (!system_stats_ring_) {
+    task->SetReturnCode(1);
+    return;
+  }
 
-    // Determine how many extra colon-separated tokens the mode consumes
-    int extra_tokens = 0;
-    if (routing_lower == "direct_id" || routing_lower == "direct_hash" ||
-        routing_lower == "physical") {
-      extra_tokens = 1;
-    } else if (routing_lower == "range") {
-      extra_tokens = 2;
+  chi::u64 head = system_stats_ring_->GetHead();
+  chi::u64 tail = system_stats_ring_->GetTail();
+  chi::u64 start = (min_event_id > head) ? min_event_id : head;
+
+  msgpack::sbuffer sbuf;
+  msgpack::packer<msgpack::sbuffer> pk(sbuf);
+
+  // Count entries first
+  uint64_t count = (tail > start) ? (tail - start) : 0;
+  pk.pack_array(static_cast<uint32_t>(count));
+
+  for (chi::u64 idx = start; idx < tail; ++idx) {
+    SystemStats s;
+    if (system_stats_ring_->Peek(idx, s)) {
+      pk.pack_map(16);
+      pk.pack("event_id");
+      pk.pack(idx);
+      pk.pack("timestamp_ns");
+      pk.pack(s.timestamp_ns_);
+      pk.pack("wall_time_ns");
+      pk.pack(s.wall_time_ns_);
+      pk.pack("ram_total_bytes");
+      pk.pack(s.ram_total_bytes_);
+      pk.pack("ram_available_bytes");
+      pk.pack(s.ram_available_bytes_);
+      pk.pack("ram_usage_pct");
+      pk.pack(s.ram_usage_pct_);
+      pk.pack("cpu_usage_pct");
+      pk.pack(s.cpu_usage_pct_);
+      pk.pack("gpu_count");
+      pk.pack(s.gpu_count_);
+      pk.pack("gpu_usage_pct");
+      pk.pack(s.gpu_usage_pct_);
+      pk.pack("hbm_usage_pct");
+      pk.pack(s.hbm_usage_pct_);
+      pk.pack("hbm_used_bytes");
+      pk.pack(s.hbm_used_bytes_);
+      pk.pack("hbm_total_bytes");
+      pk.pack(s.hbm_total_bytes_);
+      pk.pack("hostname");
+      pk.pack(CHI_IPC->GetCurrentHostname());
+      pk.pack("ip_address");
+      pk.pack(CHI_IPC->GetThisHost().ip_address);
+      pk.pack("node_id");
+      pk.pack(CHI_IPC->GetNodeId());
+      pk.pack("is_leader");
+      pk.pack(CHI_IPC->IsLeader());
+    } else {
+      pk.pack_map(0);
     }
+  }
 
-    // Consume routing_token + extra tokens to build PoolQuery string
-    std::string pool_query_str = routing_token;
-    size_t parse_pos = (colon_pos != std::string::npos)
-                           ? colon_pos + 1
-                           : remainder.size();
-    for (int i = 0; i < extra_tokens; ++i) {
-      if (parse_pos >= remainder.size()) {
-        task->SetReturnCode(2);
-        HLOG(kError,
-             "Monitor(pool_stats): not enough tokens for routing mode '{}' "
-             "in '{}'",
-             routing_token, task->query_);
-        co_return;
-      }
-      size_t next_colon = remainder.find(':', parse_pos);
-      std::string token = (next_colon != std::string::npos)
-                              ? remainder.substr(parse_pos, next_colon - parse_pos)
-                              : remainder.substr(parse_pos);
-      pool_query_str += ":" + token;
-      parse_pos = (next_colon != std::string::npos)
-                      ? next_colon + 1
-                      : remainder.size();
+  task->results_[container_id_] = std::string(sbuf.data(), sbuf.size());
+  task->SetReturnCode(0);
+}
+
+void Runtime::MonitorGetHostInfo(hipc::FullPtr<MonitorTask> task) {
+  msgpack::sbuffer sbuf;
+  msgpack::packer<msgpack::sbuffer> pk(sbuf);
+  pk.pack_map(3);
+  pk.pack("hostname");
+  pk.pack(CHI_IPC->GetCurrentHostname());
+  pk.pack("ip_address");
+  pk.pack(CHI_IPC->GetThisHost().ip_address);
+  pk.pack("node_id");
+  pk.pack(CHI_IPC->GetNodeId());
+  task->results_[container_id_] = std::string(sbuf.data(), sbuf.size());
+  task->SetReturnCode(0);
+}
+
+chi::TaskResume Runtime::AnnounceShutdown(
+    hipc::FullPtr<AnnounceShutdownTask> task, chi::RunContext &rctx) {
+  chi::u64 dead_node_id = task->shutting_down_node_id_;
+  auto *ipc_manager = CHI_IPC;
+
+  HLOG(kInfo, "Admin: Received shutdown announcement for node {}",
+       dead_node_id);
+
+  // Mark the node as dead immediately — skips the SWIM detection delay
+  ipc_manager->SetDead(dead_node_id);
+
+  // If we are the new leader, trigger recovery for the departing node
+  if (ipc_manager->IsLeader()) {
+    co_await TriggerRecovery(dead_node_id);
+  }
+
+  task->SetReturnCode(0);
+  (void)rctx;
+  co_return;
+}
+
+chi::TaskResume Runtime::MonitorBdevStats(hipc::FullPtr<MonitorTask> task) {
+  // Collect stats from all bdev pools on this node
+  auto *pool_manager = CHI_POOL_MANAGER;
+  auto *ipc_manager = CHI_IPC;
+  auto all_pool_ids = pool_manager->GetAllPoolIds();
+  msgpack::sbuffer sbuf;
+  msgpack::packer<msgpack::sbuffer> pk(sbuf);
+
+  // Collect bdev pool ids first
+  std::vector<chi::PoolId> bdev_pools;
+  for (const auto &pid : all_pool_ids) {
+    const auto *info = pool_manager->GetPoolInfo(pid);
+    if (info && info->chimod_name_ == "chimaera_bdev") {
+      bdev_pools.push_back(pid);
     }
+  }
 
-    // Everything remaining is the selector
-    std::string selector;
-    if (parse_pos < remainder.size()) {
-      selector = remainder.substr(parse_pos);
-    }
+  pk.pack_array(static_cast<uint32_t>(bdev_pools.size()));
 
-    // 3. Build PoolQuery from string
-    chi::PoolQuery target_pool_query;
-    try {
-      target_pool_query = chi::PoolQuery::FromString(pool_query_str);
-    } catch (const std::exception &e) {
-      task->SetReturnCode(2);
-      HLOG(kError, "Monitor(pool_stats): invalid PoolQuery '{}': {}",
-           pool_query_str, e.what());
-      co_return;
-    }
-
-    // 4. Verify the target pool exists
-    auto *pool_manager = CHI_POOL_MANAGER;
-    chi::Container *container =
-        pool_manager->GetStaticContainer(target_pool_id);
-    if (!container) {
-      task->SetReturnCode(3);
-      HLOG(kError, "Monitor(pool_stats): pool {} not found",
-           target_pool_id);
-      co_return;
-    }
-
-    // 5. Create sub-MonitorTask targeting the pool and dispatch it
-    auto *ipc_manager = CHI_IPC;
-    auto sub_task = ipc_manager->NewTask<MonitorTask>(
-        chi::CreateTaskId(), target_pool_id, target_pool_query, selector);
+  for (size_t i = 0; i < bdev_pools.size(); ++i) {
+    const auto &pid = bdev_pools[i];
+    const auto *info = pool_manager->GetPoolInfo(pid);
+    // Create sub-MonitorTask targeting this bdev pool (local routing)
+    chi::PoolQuery bdev_query;  // default = Local routing
+    auto sub_task = ipc_manager->NewTask<MonitorTask>(chi::CreateTaskId(), pid,
+                                                      bdev_query, "stats");
     chi::Future<MonitorTask> sub_future = ipc_manager->Send(sub_task);
     co_await sub_future;
 
-    // 6. Copy results from sub-task into this task
-    if (sub_future->GetReturnCode() != 0) {
-      task->SetReturnCode(sub_future->GetReturnCode());
-      HLOG(kError, "Monitor(pool_stats): sub-task failed with rc={}",
-           sub_future->GetReturnCode());
+    if (sub_future->GetReturnCode() == 0 && !sub_future->results_.empty()) {
+      // Wrap bdev stats with pool_id metadata
+      const auto &bdev_result = sub_future->results_.begin()->second;
+      pk.pack_map(2);
+      pk.pack("pool_id");
+      pk.pack(pid.ToString());
+      pk.pack("stats");
+      pk.pack_raw_msgpack(bdev_result);
     } else {
-      task->results_ = sub_future->results_;
-      task->SetReturnCode(0);
+      // Pack an empty entry on failure
+      pk.pack_map(2);
+      pk.pack("pool_id");
+      pk.pack(info ? info->pool_name_ : "unknown");
+      pk.pack("stats");
+      pk.pack_nil();
     }
-    sub_future.DelTask();
-    co_return;
   }
-  // Unknown queries get empty results (forward-compatible)
+
+  task->results_[container_id_] = std::string(sbuf.data(), sbuf.size());
   task->SetReturnCode(0);
-  (void)rctx;
   co_return;
 }
 
@@ -1539,18 +1756,18 @@ chi::TaskResume Runtime::RestartContainers(
   co_return;
 }
 
-chi::TaskResume Runtime::AddNode(
-    hipc::FullPtr<AddNodeTask> task, chi::RunContext &rctx) {
+chi::TaskResume Runtime::AddNode(hipc::FullPtr<AddNodeTask> task,
+                                 chi::RunContext &rctx) {
   (void)rctx;
-  HLOG(kInfo, "Admin: Executing AddNode for {}:{}",
-       task->new_node_ip_.str(), task->new_node_port_);
+  HLOG(kInfo, "Admin: Executing AddNode for {}:{}", task->new_node_ip_.str(),
+       task->new_node_port_);
 
   auto *ipc_manager = CHI_IPC;
   auto *pool_manager = CHI_POOL_MANAGER;
 
   // Add the new node to the IpcManager's hostfile
-  chi::u64 new_node_id = ipc_manager->AddNode(
-      task->new_node_ip_.str(), task->new_node_port_);
+  chi::u64 new_node_id =
+      ipc_manager->AddNode(task->new_node_ip_.str(), task->new_node_port_);
   task->new_node_id_ = new_node_id;
 
   // Notify all containers about the new node
@@ -1605,14 +1822,13 @@ chi::TaskResume Runtime::ChangeAddressTable(
       pool_manager->GetContainerNodeId(target_pool_id, container_id);
 
   // Write WAL entry before applying change
-  pool_manager->WriteAddressTableWAL(target_pool_id, container_id,
-                                      old_node_id, new_node_id);
+  pool_manager->WriteAddressTableWAL(target_pool_id, container_id, old_node_id,
+                                     new_node_id);
 
   // Update the address table mapping
   if (pool_manager->UpdateContainerNodeMapping(target_pool_id, container_id,
-                                                new_node_id)) {
-    HLOG(kInfo,
-         "Admin: ChangeAddressTable pool {} container {} -> node {}",
+                                               new_node_id)) {
+    HLOG(kInfo, "Admin: ChangeAddressTable pool {} container {} -> node {}",
          target_pool_id, container_id, new_node_id);
     task->SetReturnCode(0);
   } else {
@@ -1671,13 +1887,13 @@ chi::TaskResume Runtime::MigrateContainers(
     }
 
     // Unregister the container on source node so HasContainer() returns false.
-    // This causes ResolveDirectHashQuery to fall through to address_map_ lookup.
-    // Note: UnregisterContainer preserves static_container_ for deserialization.
+    // This causes ResolveDirectHashQuery to fall through to address_map_
+    // lookup. Note: UnregisterContainer preserves static_container_ for
+    // deserialization.
     pool_manager->UnregisterContainer(info.pool_id_, info.container_id_);
 
     task->num_migrated_++;
-    HLOG(kInfo,
-         "Admin: Migrated pool {} container {} from node {} to node {}",
+    HLOG(kInfo, "Admin: Migrated pool {} container {} from node {} to node {}",
          info.pool_id_, info.container_id_, src_node, info.dest_);
   }
 
@@ -1733,16 +1949,16 @@ chi::u64 Runtime::RerouteRetryEntry(RetryEntry &entry) {
 
   if (query.IsDirectIdMode()) {
     chi::ContainerId container_id = query.GetContainerId();
-    chi::u32 new_node = pool_manager->GetContainerNodeId(
-        entry.task->pool_id_, container_id);
+    chi::u32 new_node =
+        pool_manager->GetContainerNodeId(entry.task->pool_id_, container_id);
     if (new_node != 0 && new_node != entry.target_node_id) {
       return new_node;
     }
   } else if (query.IsRangeMode()) {
     chi::u32 offset = query.GetRangeOffset();
     chi::ContainerId container_id(offset);
-    chi::u32 new_node = pool_manager->GetContainerNodeId(
-        entry.task->pool_id_, container_id);
+    chi::u32 new_node =
+        pool_manager->GetContainerNodeId(entry.task->pool_id_, container_id);
     if (new_node != 0 && new_node != entry.target_node_id) {
       return new_node;
     }
@@ -1758,7 +1974,12 @@ void Runtime::ProcessRetryQueues() {
   auto it = send_in_retry_.begin();
   while (it != send_in_retry_.end()) {
     float elapsed = std::chrono::duration<float>(now - it->enqueued_at).count();
-    if (elapsed >= kRetryTimeoutSec) {
+    float task_timeout = kRetryTimeoutSec;
+    float task_net_timeout = it->task->pool_query_.GetNetTimeout();
+    if (task_net_timeout >= 0) {
+      task_timeout = task_net_timeout;
+    }
+    if (elapsed >= task_timeout) {
       // Timeout: mark task as failed
       HLOG(kError, "[RetryQueue] SendIn task timed out after {}s for node {}",
            elapsed, it->target_node_id);
@@ -1778,12 +1999,16 @@ void Runtime::ProcessRetryQueues() {
       // Original node still dead — try re-routing via updated address_map
       chi::u64 new_node = RerouteRetryEntry(*it);
       if (new_node != 0 && ipc_manager->IsAlive(new_node)) {
-        HLOG(kInfo, "[RetryQueue] Re-routing task from dead node {} to "
-             "recovered node {}", it->target_node_id, new_node);
+        HLOG(kInfo,
+             "[RetryQueue] Re-routing task from dead node {} to "
+             "recovered node {}",
+             it->target_node_id, new_node);
         it->target_node_id = new_node;
         if (RetrySendToNode(*it, new_node)) {
-          HLOG(kInfo, "[RetryQueue] SendIn re-routed retry succeeded "
-               "for node {}", new_node);
+          HLOG(kInfo,
+               "[RetryQueue] SendIn re-routed retry succeeded "
+               "for node {}",
+               new_node);
           it = send_in_retry_.erase(it);
           continue;
         }
@@ -1796,7 +2021,12 @@ void Runtime::ProcessRetryQueues() {
   it = send_out_retry_.begin();
   while (it != send_out_retry_.end()) {
     float elapsed = std::chrono::duration<float>(now - it->enqueued_at).count();
-    if (elapsed >= kRetryTimeoutSec) {
+    float out_task_timeout = kRetryTimeoutSec;
+    float out_task_net_timeout = it->task->pool_query_.GetNetTimeout();
+    if (out_task_net_timeout >= 0) {
+      out_task_timeout = out_task_net_timeout;
+    }
+    if (elapsed >= out_task_timeout) {
       HLOG(kError, "[RetryQueue] SendOut task timed out after {}s for node {}",
            elapsed, it->target_node_id);
       // For send_out, the result is lost; origin will timeout
@@ -1819,48 +2049,94 @@ void Runtime::ScanSendMapTimeouts() {
   const auto &dead_nodes = ipc_manager->GetDeadNodes();
   if (dead_nodes.empty()) return;
 
-  // Build set of dead node IDs for fast lookup
-  std::unordered_set<chi::u64> dead_set;
+  // Build map of dead node IDs to their detected_at times for per-task checks
+  std::unordered_map<chi::u64, std::chrono::steady_clock::time_point> dead_map;
   for (const auto &entry : dead_nodes) {
-    // Only timeout entries that have been dead long enough
-    float dead_elapsed = std::chrono::duration<float>(
-        now - entry.detected_at).count();
-    if (dead_elapsed >= kRetryTimeoutSec) {
-      dead_set.insert(entry.node_id);
-    }
+    dead_map[entry.node_id] = entry.detected_at;
   }
-
-  if (dead_set.empty()) return;
 
   // Scan send_map_ for tasks targeting dead nodes using for_each
   std::vector<size_t> keys_to_remove;
-  send_map_.for_each([&](const size_t &key,
-                         hipc::FullPtr<chi::Task> &origin_task) {
-    if (origin_task.IsNull() || !origin_task->run_ctx_) return;
+  send_map_.for_each(
+      [&](const size_t &key, hipc::FullPtr<chi::Task> &origin_task) {
+        if (origin_task.IsNull() || !origin_task->run_ctx_) return;
 
-    chi::RunContext *rctx = origin_task->run_ctx_.get();
-    // Check if any replica targets a dead node
-    bool any_dead = false;
-    for (const auto &pq : rctx->pool_queries_) {
-      if (pq.IsPhysicalMode() && dead_set.count(pq.GetNodeId())) {
-        any_dead = true;
-        break;
-      }
-    }
+        chi::RunContext *rctx = origin_task->run_ctx_.get();
+        // Use per-task timeout if set, otherwise kRetryTimeoutSec
+        float task_timeout = kRetryTimeoutSec;
+        float task_net_timeout = origin_task->pool_query_.GetNetTimeout();
+        if (task_net_timeout >= 0) {
+          task_timeout = task_net_timeout;
+        }
 
-    if (any_dead) {
-      HLOG(kError, "[ScanSendMapTimeouts] Task {} timed out waiting for dead node",
-           origin_task->task_id_);
-      origin_task->SetReturnCode(kNetworkTimeoutRC);
-      // Complete the task as failed
-      auto *worker = CHI_CUR_WORKER;
-      worker->EndTask(origin_task, rctx, true);
-      keys_to_remove.push_back(key);
-    }
-  });
+        // Check if any replica targets a dead node that has exceeded the
+        // timeout
+        bool any_timed_out = false;
+        for (const auto &pq : rctx->pool_queries_) {
+          if (pq.IsPhysicalMode()) {
+            auto dit = dead_map.find(pq.GetNodeId());
+            if (dit != dead_map.end()) {
+              float dead_elapsed =
+                  std::chrono::duration<float>(now - dit->second).count();
+              if (dead_elapsed >= task_timeout) {
+                any_timed_out = true;
+                break;
+              }
+            }
+          }
+        }
+
+        if (any_timed_out) {
+          HLOG(kError,
+               "[ScanSendMapTimeouts] Task {} timed out waiting for dead node",
+               origin_task->task_id_);
+          origin_task->SetReturnCode(kNetworkTimeoutRC);
+          // Complete the task as failed
+          auto *worker = CHI_CUR_WORKER;
+          worker->EndTask(origin_task, rctx, true);
+          keys_to_remove.push_back(key);
+        }
+      });
 
   for (size_t key : keys_to_remove) {
     send_map_.erase(key);
+  }
+}
+
+void Runtime::FlushStaleStateForNode(chi::u64 node_id) {
+  // 1. Discard send_in retry entries targeting this node.
+  //    For each discarded entry, increment the origin task's
+  //    completed_replicas so broadcast origins can still complete.
+  for (auto it = send_in_retry_.begin(); it != send_in_retry_.end();) {
+    if (it->target_node_id == node_id) {
+      size_t net_key = it->task->task_id_.net_key_;
+      auto send_it = send_map_.find(net_key);
+      if (send_it != nullptr) {
+        auto &origin = *send_it;
+        if (origin->run_ctx_) {
+          origin->run_ctx_->completed_replicas_++;
+        }
+      }
+      HLOG(kInfo,
+           "[FlushStale] Discarding SendIn retry for restarted node {}",
+           node_id);
+      it = send_in_retry_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+
+  // 2. Discard send_out retry entries targeting this node.
+  //    These are responses destined for the old incarnation; drop them.
+  for (auto it = send_out_retry_.begin(); it != send_out_retry_.end();) {
+    if (it->target_node_id == node_id) {
+      HLOG(kInfo,
+           "[FlushStale] Discarding SendOut retry for restarted node {}",
+           node_id);
+      it = send_out_retry_.erase(it);
+    } else {
+      ++it;
+    }
   }
 }
 
@@ -1887,32 +2163,30 @@ chi::TaskResume Runtime::HeartbeatProbe(hipc::FullPtr<HeartbeatProbeTask> task,
       it = pending_direct_probes_.erase(it);
       did_work = true;
     } else {
-      float elapsed =
-          std::chrono::duration<float>(now - it->sent_at).count();
+      float elapsed = std::chrono::duration<float>(now - it->sent_at).count();
       if (elapsed > kDirectProbeTimeoutSec) {
         // Direct probe timed out - escalate to indirect probing
         ipc_manager->SetNodeState(it->target_node_id,
                                   chi::NodeState::kProbeFailed);
-        HLOG(kWarning,
-             "SWIM: Direct probe to node {} timed out, starting indirect probes",
-             it->target_node_id);
+        HLOG(
+            kWarning,
+            "SWIM: Direct probe to node {} timed out, starting indirect probes",
+            it->target_node_id);
 
         // Select k random alive helpers (excluding self and target)
         const auto &hosts = ipc_manager->GetAllHosts();
         std::vector<chi::u64> candidates;
         for (const auto &h : hosts) {
-          if (h.node_id != self_node_id &&
-              h.node_id != it->target_node_id && h.IsAlive()) {
+          if (h.node_id != self_node_id && h.node_id != it->target_node_id &&
+              h.IsAlive()) {
             candidates.push_back(h.node_id);
           }
         }
         std::shuffle(candidates.begin(), candidates.end(), probe_rng_);
-        size_t num_helpers =
-            std::min(kIndirectProbeHelpers, candidates.size());
+        size_t num_helpers = std::min(kIndirectProbeHelpers, candidates.size());
         for (size_t i = 0; i < num_helpers; ++i) {
           auto future = client_.AsyncProbeRequest(
-              chi::PoolQuery::Physical(candidates[i]),
-              it->target_node_id);
+              chi::PoolQuery::Physical(candidates[i]), it->target_node_id);
           pending_indirect_probes_.push_back(
               {std::move(future), it->target_node_id, candidates[i],
                std::chrono::steady_clock::now()});
@@ -1933,10 +2207,8 @@ chi::TaskResume Runtime::HeartbeatProbe(hipc::FullPtr<HeartbeatProbeTask> task,
       it->future.Wait(0);  // Finalize
       if (it->future->probe_result_ == 0) {
         // Indirect probe succeeded - node is alive
-        ipc_manager->SetNodeState(it->target_node_id,
-                                  chi::NodeState::kAlive);
-        HLOG(kInfo,
-             "SWIM: Indirect probe via node {} confirmed node {} alive",
+        ipc_manager->SetNodeState(it->target_node_id, chi::NodeState::kAlive);
+        HLOG(kInfo, "SWIM: Indirect probe via node {} confirmed node {} alive",
              it->helper_node_id, it->target_node_id);
         // Remove all pending indirects for this target
         chi::u64 alive_target = it->target_node_id;
@@ -1950,12 +2222,28 @@ chi::TaskResume Runtime::HeartbeatProbe(hipc::FullPtr<HeartbeatProbeTask> task,
         did_work = true;
         break;  // Iterator invalidated, restart on next invocation
       } else {
+        chi::u64 target = it->target_node_id;
         it = pending_indirect_probes_.erase(it);
         did_work = true;
+        // If no more pending indirects for this target, move to suspected
+        bool has_more = false;
+        for (const auto &p : pending_indirect_probes_) {
+          if (p.target_node_id == target) {
+            has_more = true;
+            break;
+          }
+        }
+        if (!has_more &&
+            ipc_manager->GetNodeState(target) == chi::NodeState::kProbeFailed) {
+          ipc_manager->SetNodeState(target, chi::NodeState::kSuspected);
+          HLOG(
+              kWarning,
+              "SWIM: All indirect probes for node {} failed, marking suspected",
+              target);
+        }
       }
     } else {
-      float elapsed =
-          std::chrono::duration<float>(now - it->sent_at).count();
+      float elapsed = std::chrono::duration<float>(now - it->sent_at).count();
       if (elapsed > kIndirectProbeTimeoutSec) {
         chi::u64 target = it->target_node_id;
         it = pending_indirect_probes_.erase(it);
@@ -1969,12 +2257,12 @@ chi::TaskResume Runtime::HeartbeatProbe(hipc::FullPtr<HeartbeatProbeTask> task,
           }
         }
         if (!has_more &&
-            ipc_manager->GetNodeState(target) ==
-                chi::NodeState::kProbeFailed) {
+            ipc_manager->GetNodeState(target) == chi::NodeState::kProbeFailed) {
           ipc_manager->SetNodeState(target, chi::NodeState::kSuspected);
-          HLOG(kWarning,
-               "SWIM: All indirect probes for node {} failed, marking suspected",
-               target);
+          HLOG(
+              kWarning,
+              "SWIM: All indirect probes for node {} failed, marking suspected",
+              target);
         }
       } else {
         ++it;
@@ -1994,7 +2282,7 @@ chi::TaskResume Runtime::HeartbeatProbe(hipc::FullPtr<HeartbeatProbeTask> task,
                h.node_id);
           ipc_manager->SetDead(h.node_id);
           did_work = true;
-          TriggerRecovery(h.node_id);
+          co_await TriggerRecovery(h.node_id);
         }
       }
     }
@@ -2054,11 +2342,10 @@ chi::TaskResume Runtime::HeartbeatProbe(hipc::FullPtr<HeartbeatProbeTask> task,
         if (already_probing) continue;
 
         // Send direct probe
-        auto future = client_.AsyncHeartbeat(
-            chi::PoolQuery::Physical(h.node_id));
+        auto future =
+            client_.AsyncHeartbeat(chi::PoolQuery::Physical(h.node_id));
         pending_direct_probes_.push_back(
-            {std::move(future), h.node_id,
-             std::chrono::steady_clock::now()});
+            {std::move(future), h.node_id, std::chrono::steady_clock::now()});
         probe_round_robin_idx_ = (idx + 1) % hosts.size();
         did_work = true;
         break;  // One probe per invocation
@@ -2074,19 +2361,20 @@ chi::TaskResume Runtime::HeartbeatProbe(hipc::FullPtr<HeartbeatProbeTask> task,
 chi::TaskResume Runtime::ProbeRequest(hipc::FullPtr<ProbeRequestTask> task,
                                       chi::RunContext &rctx) {
   // Probe the target node on behalf of the requester using cooperative yield
-  auto future = client_.AsyncHeartbeat(
-      chi::PoolQuery::Physical(task->target_node_id_));
+  auto future =
+      client_.AsyncHeartbeat(chi::PoolQuery::Physical(task->target_node_id_));
   auto start = std::chrono::steady_clock::now();
 
   while (!future.IsComplete()) {
-    float elapsed = std::chrono::duration<float>(
-        std::chrono::steady_clock::now() - start).count();
+    float elapsed =
+        std::chrono::duration<float>(std::chrono::steady_clock::now() - start)
+            .count();
     if (elapsed >= kIndirectProbeTimeoutSec) break;
     co_await chi::yield(1000.0);
   }
 
   if (future.IsComplete()) {
-    future.Wait(0);  // Finalize (already complete)
+    future.Wait(0);           // Finalize (already complete)
     task->probe_result_ = 0;  // alive
   } else {
     task->probe_result_ = -1;  // unreachable
@@ -2138,8 +2426,8 @@ std::vector<chi::RecoveryAssignment> Runtime::ComputeRecoveryPlan(
           dest = info->local_container_->ScheduleRecover();
         }
         if (dest == static_cast<chi::u32>(-1)) {
-          dest = static_cast<chi::u32>(
-              alive_nodes[rr_idx % alive_nodes.size()]);
+          dest =
+              static_cast<chi::u32>(alive_nodes[rr_idx % alive_nodes.size()]);
           rr_idx++;
         }
         ra.dest_node_id_ = dest;
@@ -2150,15 +2438,15 @@ std::vector<chi::RecoveryAssignment> Runtime::ComputeRecoveryPlan(
   return assignments;
 }
 
-void Runtime::TriggerRecovery(chi::u64 dead_node_id) {
+chi::TaskResume Runtime::TriggerRecovery(chi::u64 dead_node_id) {
   auto *ipc_manager = CHI_IPC;
-  if (!ipc_manager->IsLeader()) return;
-  if (recovery_initiated_.count(dead_node_id)) return;
+  if (!ipc_manager->IsLeader()) co_return;
+  if (recovery_initiated_.count(dead_node_id)) co_return;
   recovery_initiated_.insert(dead_node_id);
   if (ipc_manager->IsSelfFenced()) {
     HLOG(kWarning, "Recovery: Skipping for node {} - self-fenced",
          dead_node_id);
-    return;
+    co_return;
   }
 
   HLOG(kInfo, "Recovery: Leader initiating for dead node {}", dead_node_id);
@@ -2166,13 +2454,13 @@ void Runtime::TriggerRecovery(chi::u64 dead_node_id) {
   if (assignments.empty()) {
     HLOG(kInfo, "Recovery: No containers to recover from node {}",
          dead_node_id);
-    return;
+    co_return;
   }
 
   HLOG(kInfo, "Recovery: {} containers to redistribute from node {}",
        assignments.size(), dead_node_id);
-  client_.AsyncRecoverContainers(
-      chi::PoolQuery::Broadcast(), assignments, dead_node_id);
+  co_await client_.AsyncRecoverContainers(chi::PoolQuery::Broadcast(0),
+                                          assignments, dead_node_id);
 }
 
 chi::TaskResume Runtime::RecoverContainers(
@@ -2193,10 +2481,10 @@ chi::TaskResume Runtime::RecoverContainers(
 
   for (const auto &ra : assignments) {
     // ALL nodes update address_map_
-    pool_manager->UpdateContainerNodeMapping(
-        ra.pool_id_, ra.container_id_, ra.dest_node_id_);
-    pool_manager->WriteAddressTableWAL(
-        ra.pool_id_, ra.container_id_, ra.dead_node_id_, ra.dest_node_id_);
+    pool_manager->UpdateContainerNodeMapping(ra.pool_id_, ra.container_id_,
+                                             ra.dest_node_id_);
+    pool_manager->WriteAddressTableWAL(ra.pool_id_, ra.container_id_,
+                                       ra.dead_node_id_, ra.dest_node_id_);
 
     // Only dest node creates the container
     if (static_cast<chi::u64>(ra.dest_node_id_) != self_node_id) continue;
@@ -2211,13 +2499,61 @@ chi::TaskResume Runtime::RecoverContainers(
       continue;
     }
     container->Recover(ra.pool_id_, ra.pool_name_, ra.container_id_);
-    pool_manager->RegisterContainer(
-        ra.pool_id_, ra.container_id_, container, false);
+    pool_manager->RegisterContainer(ra.pool_id_, ra.container_id_, container,
+                                    false);
     task->num_recovered_++;
   }
 
   task->SetReturnCode(0);
   rctx.did_work_ = true;
+  co_return;
+}
+
+//===========================================================================
+// System Monitor
+//===========================================================================
+
+chi::TaskResume Runtime::SystemMonitor(hipc::FullPtr<SystemMonitorTask> task,
+                                       chi::RunContext &rctx) {
+  SystemStats stats;
+
+  // Timestamps
+  auto mono_now = std::chrono::steady_clock::now();
+  auto wall_now = std::chrono::system_clock::now();
+  stats.timestamp_ns_ = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          mono_now.time_since_epoch())
+          .count());
+  stats.wall_time_ns_ = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          wall_now.time_since_epoch())
+          .count());
+
+  // DRAM
+  stats.ram_total_bytes_ = HSHM_SYSTEM_INFO->ram_size_;
+  stats.ram_available_bytes_ = hshm::SystemInfo::GetRamAvailable();
+  if (stats.ram_total_bytes_ > 0) {
+    stats.ram_usage_pct_ =
+        (1.0f - static_cast<float>(stats.ram_available_bytes_) /
+                    static_cast<float>(stats.ram_total_bytes_)) *
+        100.0f;
+  }
+
+  // CPU
+  hshm::CpuTimes cur = hshm::SystemInfo::GetCpuTimes();
+  stats.cpu_usage_pct_ =
+      hshm::SystemInfo::ComputeCpuUtilization(prev_cpu_times_, cur);
+  prev_cpu_times_ = cur;
+
+  // GPU/HBM — stub (zeroed by default constructor)
+
+  // Push into ring buffer
+  if (system_stats_ring_) {
+    system_stats_ring_->Push(stats);
+  }
+
+  rctx.did_work_ = true;
+  (void)task;
   co_return;
 }
 

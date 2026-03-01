@@ -621,6 +621,8 @@ The chimaera runtime provides two simplified coroutine-aware synchronization pri
 - Supports multiple concurrent readers or a single writer
 - Tasks that cannot acquire the lock call `Yield()` to be placed in the blocked queue
 
+**CRITICAL**: Do NOT add any print, log, or HLOG statements in lock acquire or release paths (Lock, Unlock, ReadLock, ReadUnlock, WriteLock, WriteUnlock). Logging in lock paths causes severe performance degradation and can introduce deadlocks when the logging system itself acquires locks.
+
 ### Task Wait Functionality
 
 **Critical Fix for Infinite Loops**

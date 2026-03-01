@@ -51,7 +51,7 @@ services:
         echo '========================================' &&
         echo 'Node 1: Starting Chimaera runtime in background' &&
         echo '========================================' &&
-        /workspace/build/bin/chimaera runtime start &
+        gdb -batch -ex 'set confirm off' -ex run -ex 'thread apply all bt' -ex quit --args /workspace/build/bin/chimaera runtime start &
         RUNTIME_PID=$$! &&
         echo \"Node 1: Runtime started (PID $$RUNTIME_PID)\" &&
         sleep 3 &&

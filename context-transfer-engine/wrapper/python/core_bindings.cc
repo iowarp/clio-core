@@ -93,8 +93,10 @@ NB_MODULE(wrp_cte_core_ext, m) {
   nb::class_<chi::PoolQuery>(m, "PoolQuery")
       .def(nb::init<>())
       .def_static("Broadcast", &chi::PoolQuery::Broadcast,
+                  "net_timeout"_a = -1.0f,
                   "Create a Broadcast pool query (routes to all nodes)")
       .def_static("Dynamic", &chi::PoolQuery::Dynamic,
+                  "net_timeout"_a = -1.0f,
                   "Create a Dynamic pool query (automatic routing optimization)")
       .def_static("Local", &chi::PoolQuery::Local,
                   "Create a Local pool query (routes to local node only)");

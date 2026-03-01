@@ -39,7 +39,10 @@
 #include <chimaera/chimaera.h>
 #include <chimaera/container.h>
 #include <chimaera/pool_manager.h>
+#include <hermes_shm/data_structures/ipc/ring_buffer.h>
 #include <hermes_shm/data_structures/priv/unordered_map_ll.h>
+#include <hermes_shm/introspect/system_info.h>
+#include <hermes_shm/memory/allocator/malloc_allocator.h>
 
 #include <deque>
 #include <random>
@@ -97,6 +100,12 @@ private:
   // Client for making calls to this ChiMod
   Client client_;
 
+  // System monitor ring buffer and CPU state
+  static inline constexpr size_t kSystemStatsRingSize = 1024;
+  std::unique_ptr<hipc::circular_mpsc_ring_buffer<SystemStats, hipc::MallocAllocator>>
+      system_stats_ring_;
+  hshm::CpuTimes prev_cpu_times_;
+
   // Network task tracking maps (keyed by net_key for efficient lookup)
   // Using lock-free unordered_map_ll with 1024 buckets for high concurrency
   // Thread safety: All Send/Recv tasks are routed to a single dedicated net worker
@@ -131,11 +140,6 @@ public:
    */
   chi::TaskResume Run(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr,
                       chi::RunContext &rctx) override;
-
-  /**
-   * Delete/cleanup a task
-   */
-  void DelTask(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr) override;
 
   //===========================================================================
   // Method implementations
@@ -235,8 +239,33 @@ public:
    * Handle Monitor - Unified monitor query for admin chimod
    * Supported queries:
    *   "worker_stats" - collect worker statistics (msgpack-encoded)
+   *   "pool_stats://<pool_id>:<routing>:<selector>" - delegate to a pool
+   *   "system_stats[:<min_event_id>]" - system resource utilization
+   *   "bdev_stats" - block device statistics
    */
   chi::TaskResume Monitor(hipc::FullPtr<MonitorTask> task, chi::RunContext &rctx);
+
+  /** Monitor sub-handler: collect per-worker statistics. */
+  void MonitorWorkerStats(hipc::FullPtr<MonitorTask> task);
+
+  /** Monitor sub-handler: delegate query to a specific pool. */
+  chi::TaskResume MonitorPoolStats(hipc::FullPtr<MonitorTask> task);
+
+  /** Monitor sub-handler: return system_stats ring buffer entries. */
+  void MonitorSystemStats(hipc::FullPtr<MonitorTask> task);
+
+  /** Monitor sub-handler: collect bdev pool statistics. */
+  chi::TaskResume MonitorBdevStats(hipc::FullPtr<MonitorTask> task);
+
+  /** Monitor sub-handler: return host info (hostname, IP, node_id). */
+  void MonitorGetHostInfo(hipc::FullPtr<MonitorTask> task);
+
+  /**
+   * Handle AnnounceShutdown - Mark a departing node as dead immediately
+   * and trigger recovery if this node is the new leader.
+   */
+  chi::TaskResume AnnounceShutdown(hipc::FullPtr<AnnounceShutdownTask> task,
+                                    chi::RunContext &rctx);
 
   /**
    * Handle RegisterMemory - Register client shared memory with runtime
@@ -302,6 +331,12 @@ public:
   chi::TaskResume RecoverContainers(hipc::FullPtr<RecoverContainersTask> task, chi::RunContext &rctx);
 
   /**
+   * Handle SystemMonitor - Periodic system resource utilization sampling
+   * Samples DRAM, CPU, and (optionally) GPU/HBM utilization into ring buffer
+   */
+  chi::TaskResume SystemMonitor(hipc::FullPtr<SystemMonitorTask> task, chi::RunContext &rctx);
+
+  /**
    * Helper: Receive task inputs from remote node
    */
   void RecvIn(hipc::FullPtr<RecvTask> task, chi::LoadTaskArchive& archive, hshm::lbm::Transport* lbm_transport);
@@ -365,13 +400,9 @@ public:
    * Create a new task of the specified method type
    */
   hipc::FullPtr<chi::Task> NewTask(chi::u32 method) override;
-
-  /**
-   * Aggregate a replica task into the origin task (for merging replica results)
-   */
-  void Aggregate(chi::u32 method,
-                 hipc::FullPtr<chi::Task> origin_task_ptr,
-                 hipc::FullPtr<chi::Task> replica_task_ptr) override;
+  void Aggregate(chi::u32 method, hipc::FullPtr<chi::Task> orig_task,
+                 const hipc::FullPtr<chi::Task>& replica_task) override;
+  void DelTask(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr) override;
 
   /**
    * Attempt to send a retried task to the given node
@@ -400,6 +431,13 @@ public:
    * Scan send_map_ for tasks waiting on dead nodes and time them out
    */
   void ScanSendMapTimeouts();
+
+  /**
+   * Flush stale retry-queue entries and send_map origins targeting a node
+   * that is about to be marked alive (restarted). Old tasks from the
+   * previous incarnation must not be resent to a fresh runtime.
+   */
+  void FlushStaleStateForNode(chi::u64 node_id);
 
 private:
   /**
@@ -436,7 +474,7 @@ private:
 
   // Recovery state
   std::vector<chi::RecoveryAssignment> ComputeRecoveryPlan(chi::u64 dead_node_id);
-  void TriggerRecovery(chi::u64 dead_node_id);
+  chi::TaskResume TriggerRecovery(chi::u64 dead_node_id);
   std::unordered_set<chi::u64> recovery_initiated_;
 };
 

@@ -27,7 +27,6 @@ services:
       - seccomp:unconfined
     container_name: cte-jarvis-node1
     hostname: iowarp-jarvis-node1
-    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
     networks:
       jarvis-cluster:
         ipv4_address: 172.27.0.10
@@ -53,7 +52,6 @@ services:
       - seccomp:unconfined
     container_name: cte-jarvis-node2
     hostname: iowarp-jarvis-node2
-    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
     networks:
       jarvis-cluster:
         ipv4_address: 172.27.0.11

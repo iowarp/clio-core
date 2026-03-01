@@ -55,7 +55,7 @@ target_link_libraries(${FLUSH_TEST_TARGET}
 )
 
 set_target_properties(${FLUSH_TEST_TARGET} PROPERTIES
-  CXX_STANDARD 17
+  CXX_STANDARD 20
   CXX_STANDARD_REQUIRED ON
 )
 
@@ -85,7 +85,7 @@ target_link_libraries(${COMUTEX_TEST_TARGET}
 )
 
 set_target_properties(${COMUTEX_TEST_TARGET} PROPERTIES
-  CXX_STANDARD 17
+  CXX_STANDARD 20
   CXX_STANDARD_REQUIRED ON
 )
 
@@ -113,7 +113,7 @@ target_link_libraries(${WAIT_FUNCTIONALITY_TEST_TARGET}
 )
 
 set_target_properties(${WAIT_FUNCTIONALITY_TEST_TARGET} PROPERTIES
-  CXX_STANDARD 17
+  CXX_STANDARD 20
   CXX_STANDARD_REQUIRED ON
 )
 
@@ -141,7 +141,7 @@ target_link_libraries(${STREAMING_TEST_TARGET}
 )
 
 set_target_properties(${STREAMING_TEST_TARGET} PROPERTIES
-  CXX_STANDARD 17
+  CXX_STANDARD 20
   CXX_STANDARD_REQUIRED ON
 )
 
@@ -555,7 +555,7 @@ if(HSHM_ENABLE_CUDA OR HSHM_ENABLE_ROCM)
   )
 
   set_target_properties(${GPU_SUBMISSION_TEST_TARGET} PROPERTIES
-    CXX_STANDARD 17
+    CXX_STANDARD 20
     CXX_STANDARD_REQUIRED ON
     CUDA_STANDARD 17
     CUDA_STANDARD_REQUIRED ON
@@ -590,7 +590,7 @@ else()
   )
 
   set_target_properties(${GPU_SUBMISSION_TEST_TARGET} PROPERTIES
-    CXX_STANDARD 17
+    CXX_STANDARD 20
     CXX_STANDARD_REQUIRED ON
   )
 
@@ -633,7 +633,7 @@ target_link_libraries(${MIGRATE_TEST_TARGET}
 )
 
 set_target_properties(${MIGRATE_TEST_TARGET} PROPERTIES
-  CXX_STANDARD 17
+  CXX_STANDARD 20
   CXX_STANDARD_REQUIRED ON
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
@@ -663,13 +663,43 @@ target_link_libraries(${RECOVERY_TEST_TARGET}
 )
 
 set_target_properties(${RECOVERY_TEST_TARGET} PROPERTIES
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED ON
+  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+
+# Reconnect test executable (integration test binary for client failover)
+set(RECONNECT_TEST_TARGET chimaera_reconnect_tests)
+set(RECONNECT_TEST_SOURCES
+  ${CHIMAERA_ROOT}/test/integration/reconnect/test_reconnect.cc
+)
+
+add_executable(${RECONNECT_TEST_TARGET} ${RECONNECT_TEST_SOURCES})
+
+target_include_directories(${RECONNECT_TEST_TARGET} PRIVATE
+  ${CHIMAERA_ROOT}/include
+  ${CHIMAERA_ROOT}/test  # For simple_test.h
+  ${CHIMAERA_ROOT}/modules/admin/include
+  ${CHIMAERA_ROOT}/modules/MOD_NAME/include
+)
+
+target_link_libraries(${RECONNECT_TEST_TARGET}
+  chimaera_admin_runtime
+  chimaera_admin_client
+  chimaera_MOD_NAME_runtime
+  chimaera_MOD_NAME_client
+  hshm::cxx
+  ${CMAKE_THREAD_LIBS_INIT}
+)
+
+set_target_properties(${RECONNECT_TEST_TARGET} PROPERTIES
   CXX_STANDARD 17
   CXX_STANDARD_REQUIRED ON
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 
 # Install test executables
-install(TARGETS ${FLUSH_TEST_TARGET} ${COMUTEX_TEST_TARGET} ${WAIT_FUNCTIONALITY_TEST_TARGET} ${STREAMING_TEST_TARGET} ${GPU_SUBMISSION_TEST_TARGET} ${MIGRATE_TEST_TARGET} ${RECOVERY_TEST_TARGET}
+install(TARGETS ${FLUSH_TEST_TARGET} ${COMUTEX_TEST_TARGET} ${WAIT_FUNCTIONALITY_TEST_TARGET} ${STREAMING_TEST_TARGET} ${GPU_SUBMISSION_TEST_TARGET} ${MIGRATE_TEST_TARGET} ${RECOVERY_TEST_TARGET} ${RECONNECT_TEST_TARGET}
   RUNTIME DESTINATION bin
 )
 
@@ -681,3 +711,4 @@ message(STATUS "  Streaming test target: ${STREAMING_TEST_TARGET}")
 message(STATUS "  GPU Submission test target: ${GPU_SUBMISSION_TEST_TARGET}")
 message(STATUS "  Migrate test target: ${MIGRATE_TEST_TARGET}")
 message(STATUS "  Recovery test target: ${RECOVERY_TEST_TARGET}")
+message(STATUS "  Reconnect test target: ${RECONNECT_TEST_TARGET}")

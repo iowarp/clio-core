@@ -327,6 +327,13 @@ class packer {
     msgpack_pack_str_body(&pk_, v, len);
   }
 
+  void pack_raw_msgpack(const char* data, size_t len) {
+    pk_.callback(pk_.data, data, len);
+  }
+  void pack_raw_msgpack(const std::string& data) {
+    pack_raw_msgpack(data.data(), data.size());
+  }
+
  private:
   Buffer& buf_;
   msgpack_packer pk_;

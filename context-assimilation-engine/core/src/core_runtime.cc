@@ -61,7 +61,7 @@ chi::TaskResume Runtime::Monitor(hipc::FullPtr<MonitorTask> task,
   co_return;
 }
 
-void Runtime::Create(hipc::FullPtr<CreateTask> task, chi::RunContext& ctx) {
+chi::TaskResume Runtime::Create(hipc::FullPtr<CreateTask> task, chi::RunContext& ctx) {
   // Container is already initialized via Init() before Create is called
   // Do NOT call Init() here
 
@@ -72,6 +72,7 @@ void Runtime::Create(hipc::FullPtr<CreateTask> task, chi::RunContext& ctx) {
   // Additional container-specific initialization logic here
   HLOG(kInfo, "Core container created and initialized for pool: {} (ID: {})",
        pool_name_, pool_id_);
+  co_return;
 }
 
 chi::u64 Runtime::GetWorkRemaining() const {

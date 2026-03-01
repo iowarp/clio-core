@@ -225,6 +225,9 @@ echo ""
 OVERALL_STATUS=0
 
 if [ "$DO_ASAN" = true ]; then
+    # Export LSAN suppressions so LeakSanitizer skips known architectural leaks
+    # (ZMQ internals, runtime-shutdown RunContext, deliberate large IPC buffers).
+    export LSAN_OPTIONS="suppressions=${REPO_ROOT}/CI/lsan_suppressions.txt"
     run_sanitizer_mode \
         "asan" \
         "AddressSanitizer" \
@@ -242,6 +245,15 @@ fi
 
 if [ "$DO_MSAN" = true ]; then
     print_warning "MSan note: false-positives are expected from uninstrumented third-party libraries."
+    # Point MSan at llvm-symbolizer so stack traces are human-readable.
+    # Check plain name first, then fall back to versioned names (e.g. llvm-symbolizer-18).
+    LLVM_SYMBOLIZER=$(command -v llvm-symbolizer 2>/dev/null \
+        || ls /usr/bin/llvm-symbolizer-* 2>/dev/null | sort -V | tail -1 \
+        || true)
+    if [ -n "${LLVM_SYMBOLIZER}" ]; then
+        export MSAN_SYMBOLIZER_PATH="${LLVM_SYMBOLIZER}"
+        print_info "Using symbolizer: ${LLVM_SYMBOLIZER}"
+    fi
     run_sanitizer_mode \
         "msan" \
         "MemorySanitizer" \
@@ -250,6 +262,7 @@ if [ "$DO_MSAN" = true ]; then
 fi
 
 if [ "$DO_SANITIZE" = true ]; then
+    export LSAN_OPTIONS="suppressions=${REPO_ROOT}/CI/lsan_suppressions.txt"
     run_sanitizer_mode \
         "sanitize" \
         "AddressSanitizer" \

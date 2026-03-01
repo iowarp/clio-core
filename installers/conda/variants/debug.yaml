@@ -3,9 +3,14 @@
 #
 # Usage: rattler-build build --recipe recipe/ --variant-config variants/debug.yaml
 
-preset: debug
+preset:
+  - debug
 
-cuda_enabled: "OFF"
-rocm_enabled: "OFF"
-mpi_enabled: "OFF"
-mpi_impl: nompi
+cuda_enabled:
+  - "OFF"
+rocm_enabled:
+  - "OFF"
+mpi_enabled:
+  - "OFF"
+mpi_impl:
+  - nompi

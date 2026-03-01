@@ -7,6 +7,7 @@ cmake-build-*/
 /bench
 context-transfer-engine/compressor/test/results
 context-transfer-engine/compressor/results
+.claude/worktrees/
 
 # CMake generated files (only in build directories)
 # Build directories already ignored above, but add specific patterns for safety

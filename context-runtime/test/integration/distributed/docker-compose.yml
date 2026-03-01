@@ -15,6 +15,8 @@ services:
   # Node 1 - Test coordinator that runs the test binary
   iowarp-node1:
     image: iowarp/deps-cpu:latest
+    init: true
+    stop_grace_period: 5s
     security_opt:
       - seccomp:unconfined
     container_name: iowarp-distributed-node1
@@ -50,6 +52,8 @@ services:
   # Node 2
   iowarp-node2:
     image: iowarp/deps-cpu:latest
+    init: true
+    stop_grace_period: 5s
     security_opt:
       - seccomp:unconfined
     container_name: iowarp-distributed-node2
@@ -81,6 +85,8 @@ services:
   # Node 3
   iowarp-node3:
     image: iowarp/deps-cpu:latest
+    init: true
+    stop_grace_period: 5s
     security_opt:
       - seccomp:unconfined
     container_name: iowarp-distributed-node3
@@ -112,6 +118,8 @@ services:
   # Node 4
   iowarp-node4:
     image: iowarp/deps-cpu:latest
+    init: true
+    stop_grace_period: 5s
     security_opt:
       - seccomp:unconfined
     container_name: iowarp-distributed-node4

@@ -21,10 +21,19 @@ jobs:
       with:
         submodules: recursive
 
-    - name: Install sanitizer runtime libraries
+    - name: Install sanitizer runtime libraries (ASan/UBSan)
+      if: matrix.sanitizer != 'msan'
       run: |
         sudo apt-get update
-        sudo apt-get install -y libasan8 libubsan1
+        sudo apt-get install -y libasan8 libubsan1 libhdf5-dev
+
+    - name: Install Clang for MSan
+      if: matrix.sanitizer == 'msan'
+      run: |
+        sudo apt-get update
+        # clang ships with compiler-rt which includes the MSan runtime;
+        # llvm provides llvm-symbolizer for human-readable MSan reports.
+        sudo apt-get install -y clang llvm libhdf5-dev
 
     - name: Build and test with ${{ matrix.sanitizer }}
       run: |

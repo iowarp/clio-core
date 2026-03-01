@@ -43,6 +43,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <filesystem>
 #include <iomanip>
 #include <iostream>
 #include <thread>
@@ -179,6 +180,12 @@ void AllocationWorkerThread(size_t thread_id, const BenchmarkConfig &config,
     auto alloc_task = bdev_client.AsyncAllocateBlocks(chi::PoolQuery::Local(),
                                                        alloc_size);
     alloc_task.Wait();
+    if (alloc_task->GetReturnCode() != 0 || alloc_task->blocks_.empty()) {
+      HLOG(kError, "Thread {}: AllocateBlocks failed (rc={}, blocks={})",
+           thread_id, alloc_task->GetReturnCode(), alloc_task->blocks_.size());
+      stop_flag.store(true, std::memory_order_relaxed);
+      return;
+    }
     std::vector<chimaera::bdev::Block> blocks;
     for (size_t i = 0; i < alloc_task->blocks_.size(); ++i) {
       blocks.push_back(alloc_task->blocks_[i]);
@@ -302,6 +309,13 @@ void IOWorkerThread(size_t thread_id, const BenchmarkConfig &config,
     auto alloc_task = bdev_client.AsyncAllocateBlocks(chi::PoolQuery::Local(),
                                                        config.io_size);
     alloc_task.Wait();
+    if (alloc_task->GetReturnCode() != 0 || alloc_task->blocks_.empty()) {
+      HLOG(kError, "Thread {}: AllocateBlocks failed (rc={}, blocks={})",
+           thread_id, alloc_task->GetReturnCode(), alloc_task->blocks_.size());
+      stop_flag.store(true, std::memory_order_relaxed);
+      CHI_IPC->FreeBuffer(write_buffer);
+      return;
+    }
     std::vector<chimaera::bdev::Block> blocks;
     for (size_t i = 0; i < alloc_task->blocks_.size(); ++i) {
       blocks.push_back(alloc_task->blocks_[i]);
@@ -502,6 +516,7 @@ int main(int argc, char **argv) {
     } else {
       // Use file-based BDev
       bdev_type = chimaera::bdev::BdevType::kFile;
+      std::filesystem::create_directories(config.output_dir);
       pool_name = config.output_dir + "/benchmark_bdev.dat";
       HIPRINT("Using file-based BDev: {}", pool_name);
     }

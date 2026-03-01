@@ -77,6 +77,7 @@ target_link_libraries(gray_scott_analysis PRIVATE
     hshm::compress
     hshm::cxx
     ${CMAKE_THREAD_LIBS_INIT}
+    curl
 )
 
 # Enable compression support

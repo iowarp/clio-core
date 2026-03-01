@@ -1,99 +1,94 @@
+/*
+ * Copyright (c) 2024, Gnosis Research Center, Illinois Institute of Technology
+ * All rights reserved.
+ *
+ * This file is part of IOWarp Core.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice,
+ *    this list of conditions and the following disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * 3. Neither the name of the copyright holder nor the names of its
+ *    contributors may be used to endorse or promote products derived from
+ *    this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/string.h>
-#include <nanobind/stl/unordered_map.h>
 
-#include <chimaera/admin/admin_client.h>
-#include <chimaera/admin/admin_tasks.h>
-#include <chimaera/chimaera.h>
+#include "py_wrapper.h"
 
 namespace nb = nanobind;
 using namespace nb::literals;
 
+/**
+ * Convert C++ results map to Python dict {int: bytes}.
+ *
+ * Values are returned as bytes because monitor results may contain
+ * binary-serialized data (e.g. msgpack blobs).
+ */
+static nb::dict results_to_dict(
+    const std::unordered_map<chi::ContainerId, std::string>& results) {
+  nb::dict d;
+  for (const auto& [k, v] : results) {
+    d[nb::int_(k)] = nb::bytes(v.data(), v.size());
+  }
+  return d;
+}
+
 NB_MODULE(chimaera_runtime_ext, m) {
   m.doc() = "Python bindings for Chimaera runtime monitoring";
 
-  // Bind ChimaeraMode enum
-  nb::enum_<chi::ChimaeraMode>(m, "ChimaeraMode")
-      .value("kClient", chi::ChimaeraMode::kClient)
-      .value("kServer", chi::ChimaeraMode::kServer)
-      .value("kRuntime", chi::ChimaeraMode::kRuntime);
+  m.def("chimaera_init", &py_chimaera_init, "mode"_a,
+        "Initialize the Chimaera runtime. mode: 0=kClient.");
 
-  // Bind PoolQuery for routing queries
-  nb::class_<chi::PoolQuery>(m, "PoolQuery")
-      .def(nb::init<>())
-      .def_static("Broadcast", &chi::PoolQuery::Broadcast)
-      .def_static("Dynamic", &chi::PoolQuery::Dynamic)
-      .def_static("Local", &chi::PoolQuery::Local)
-      .def_static("DirectId", &chi::PoolQuery::DirectId, "container_id"_a)
-      .def_static("DirectHash", &chi::PoolQuery::DirectHash, "hash"_a)
-      .def_static("Range", &chi::PoolQuery::Range, "offset"_a, "count"_a)
-      .def_static("Physical", &chi::PoolQuery::Physical, "node_id"_a)
-      .def_static("FromString", &chi::PoolQuery::FromString, "str"_a)
-      .def("ToString", &chi::PoolQuery::ToString);
+  m.def("chimaera_finalize", &py_chimaera_finalize,
+        "Finalize the Chimaera runtime.");
 
-  // Bind MonitorTask (read-only access to results)
-  nb::class_<chimaera::admin::MonitorTask>(m, "MonitorTask")
-      .def_ro("query_", &chimaera::admin::MonitorTask::query_)
-      .def_ro("results_", &chimaera::admin::MonitorTask::results_);
+  nb::class_<PyMonitorTask>(m, "MonitorTask")
+      .def("wait", [](PyMonitorTask& self, float max_sec) -> nb::dict {
+        // Release the GIL so Flask / timeout threads can run while
+        // the C++ Wait() blocks on ZMQ Recv().
+        std::unordered_map<chi::ContainerId, std::string> results;
+        {
+          nb::gil_scoped_release release;
+          results = self.wait(max_sec);
+        }
+        return results_to_dict(results);
+      }, "max_sec"_a = 0.0f,
+      "Block until result is ready, return {container_id: bytes} dict.")
+      .def("is_complete", &PyMonitorTask::is_complete,
+           "Non-blocking check if the task has completed.")
+      .def("get_return_code", &PyMonitorTask::get_return_code,
+           "Get task return code. Call after wait(). 0=success, non-zero=error.");
 
-  // Bind Future<MonitorTask>
-  using MonitorFuture = chi::Future<chimaera::admin::MonitorTask>;
-  nb::class_<MonitorFuture>(m, "MonitorFuture")
-      .def("wait", &MonitorFuture::Wait, "Block until the task completes")
-      .def(
-          "get",
-          [](MonitorFuture &self) -> chimaera::admin::MonitorTask & {
-            return *self;
-          },
-          nb::rv_policy::reference,
-          "Get the underlying MonitorTask (call after wait)")
-      .def("del_task", &MonitorFuture::DelTask,
-           "Explicitly free the task memory");
+  m.def("async_monitor", &py_async_monitor,
+        "pool_query"_a, "query"_a,
+        "Submit async monitor query. Returns MonitorTask.");
 
-  // Bind admin::Client with monitor method
-  nb::class_<chimaera::admin::Client>(m, "AdminClient")
-      .def(nb::init<>())
-      .def(nb::init<const chi::PoolId &>(), "pool_id"_a)
-      .def(
-          "async_monitor",
-          [](chimaera::admin::Client &self, const chi::PoolQuery &pool_query,
-             const std::string &query) {
-            return self.AsyncMonitor(pool_query, query);
-          },
-          "pool_query"_a, "query"_a,
-          "Submit a unified monitor query. Returns MonitorFuture.")
-      .def(
-          "monitor",
-          [](chimaera::admin::Client &self, const chi::PoolQuery &pool_query,
-             const std::string &query)
-              -> std::unordered_map<chi::ContainerId, std::string> {
-            auto future = self.AsyncMonitor(pool_query, query);
-            future.Wait();
-            // Copy results out before future goes out of scope
-            std::unordered_map<chi::ContainerId, std::string> results =
-                future->results_;
-            future.DelTask();
-            return results;
-          },
-          "pool_query"_a, "query"_a,
-          "Synchronous monitor query. Returns dict[ContainerId, bytes].");
+  m.def("stop_runtime", [](const std::string& pool_query_str,
+                            uint32_t grace_period_ms) {
+    nb::gil_scoped_release release;
+    py_stop_runtime(pool_query_str, grace_period_ms);
+  }, "pool_query"_a, "grace_period_ms"_a = 5000,
+     "Send stop-runtime command to a node. Fire-and-forget.");
 
-  // Bind PoolId (UniqueId)
-  nb::class_<chi::PoolId>(m, "PoolId")
-      .def(nb::init<>())
-      .def(nb::init<chi::u32, chi::u32>(), "major"_a, "minor"_a)
-      .def_static("GetNull", &chi::PoolId::GetNull)
-      .def_static("FromString", &chi::PoolId::FromString, "str"_a)
-      .def("ToString", &chi::PoolId::ToString)
-      .def("IsNull", &chi::PoolId::IsNull)
-      .def_rw("major_", &chi::PoolId::major_)
-      .def_rw("minor_", &chi::PoolId::minor_);
-
-  // Chimaera init/finalize
-  m.def("chimaera_init", &chi::CHIMAERA_INIT, "mode"_a,
-        "default_with_runtime"_a = false, "is_restart"_a = false,
-        "Initialize Chimaera with specified mode");
-
-  m.def("chimaera_finalize", &chi::CHIMAERA_FINALIZE,
-        "Finalize Chimaera and release all resources");
 }

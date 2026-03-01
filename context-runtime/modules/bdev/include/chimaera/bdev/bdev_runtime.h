@@ -293,11 +293,6 @@ class Runtime : public chi::Container {
                       chi::RunContext& rctx) override;
 
   /**
-   * Delete/cleanup a task - using autogen dispatcher
-   */
-  void DelTask(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr) override;
-
-  /**
    * Get remaining work count for this container
    */
   chi::u64 GetWorkRemaining() const override;
@@ -346,13 +341,9 @@ class Runtime : public chi::Container {
    * Create a new task of the specified method type
    */
   hipc::FullPtr<chi::Task> NewTask(chi::u32 method) override;
-
-  /**
-   * Aggregate a replica task into the origin task (for merging replica results)
-   */
-  void Aggregate(chi::u32 method,
-                 hipc::FullPtr<chi::Task> origin_task_ptr,
-                 hipc::FullPtr<chi::Task> replica_task_ptr) override;
+  void Aggregate(chi::u32 method, hipc::FullPtr<chi::Task> orig_task,
+                 const hipc::FullPtr<chi::Task>& replica_task) override;
+  void DelTask(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr) override;
 
  private:
   // Client for making calls to this ChiMod

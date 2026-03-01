@@ -44,10 +44,6 @@ struct Mutex {
   ipc::atomic<hshm::min_u64> lock_;
   ipc::atomic<hshm::min_u64> head_;
   ipc::atomic<hshm::min_u32> try_lock_;
-#ifdef HSHM_DEBUG_LOCK
-  u32 owner_;
-#endif
-
   /** Default constructor */
   HSHM_INLINE_CROSS_FUN
   Mutex() : lock_(0), head_(0), try_lock_(0) {}
@@ -91,9 +87,6 @@ struct Mutex {
   /** Unlock */
   HSHM_INLINE_CROSS_FUN
   void Unlock() {
-#ifdef HSHM_DEBUG_LOCK
-    owner_ = 0;
-#endif
     head_.fetch_add(1);
   }
 };

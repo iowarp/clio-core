@@ -75,6 +75,7 @@ Worker::Worker(u32 worker_id)
       assigned_lane_(nullptr),
       event_queue_(nullptr),
       last_long_queue_check_(0),
+      num_tasks_processed_(0),
       iteration_count_(0),
       idle_iterations_(0),
       current_sleep_us_(0),
@@ -166,9 +167,7 @@ WorkerStats Worker::GetWorkerStats() const {
   stats.suspend_period_us_ =
       (suspend_period < 0) ? 0 : static_cast<u32>(suspend_period);
 
-  // Note: num_tasks_processed_ would require adding a counter to the worker
-  // For now, set to 0 - can be added later if needed
-  stats.num_tasks_processed_ = 0;
+  stats.num_tasks_processed_ = num_tasks_processed_;
 
   return stats;
 }
@@ -750,6 +749,9 @@ void Worker::EndTaskShmTransfer(const FullPtr<Task> &task_ptr,
 
   // Set FUTURE_COMPLETE and clean up task
   future_shm->flags_.SetBits(FutureShm::FUTURE_COMPLETE);
+  // Clear TASK_DATA_OWNER before deletion so the destructor
+  // doesn't try to FreeBuffer on transport-allocated data
+  task_ptr->ClearFlags(TASK_DATA_OWNER);
   container->DelTask(task_ptr->method_, task_ptr);
 }
 
@@ -761,6 +763,9 @@ void Worker::EndTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
     HLOG(kError, "EndTask: container is null");
     return;
   }
+
+  // Track completed tasks
+  ++num_tasks_processed_;
 
   // Get task properties at the start
   bool is_remote = task_ptr->IsRemote();
@@ -775,6 +780,13 @@ void Worker::EndTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
   // Decrement work remaining for non-periodic tasks
   if (!is_periodic) {
     container->UpdateWork(task_ptr, *run_ctx, -1);
+  }
+
+  // Fire-and-forget: skip all response paths, just delete the task
+  if (task_ptr->task_flags_.Any(TASK_FIRE_AND_FORGET)) {
+    task_ptr->ClearFlags(TASK_DATA_OWNER);
+    container->DelTask(task_ptr->method_, task_ptr);
+    return;
   }
 
   // If task is remote, enqueue to net_queue_ for SendOut

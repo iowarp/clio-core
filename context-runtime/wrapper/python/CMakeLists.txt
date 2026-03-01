@@ -19,13 +19,12 @@ target_include_directories(chimaera_runtime_ext PRIVATE
 # Ensure C++17 standard
 target_compile_features(chimaera_runtime_ext PRIVATE cxx_std_17)
 
-# Install Python module to site-packages within CMAKE_INSTALL_PREFIX
-set(PYTHON_SITE_PACKAGES "lib/python${Python_VERSION_MAJOR}.${Python_VERSION_MINOR}/site-packages")
+# Install Python module to site-packages (PYTHON_SITE_PACKAGES set by root CMakeLists.txt)
 install(
     TARGETS chimaera_runtime_ext
     LIBRARY DESTINATION "${PYTHON_SITE_PACKAGES}"
 )
-message(STATUS "Chimaera runtime Python wrapper will be installed to: ${CMAKE_INSTALL_PREFIX}/${PYTHON_SITE_PACKAGES}")
+message(STATUS "Chimaera runtime Python wrapper will be installed to: ${PYTHON_SITE_PACKAGES}")
 
 # Add Python bindings tests
 if(BUILD_TESTING)

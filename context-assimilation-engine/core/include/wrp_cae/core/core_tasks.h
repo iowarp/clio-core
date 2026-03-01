@@ -157,9 +157,9 @@ struct ParseOmniTask : public chi::Task {
    * Aggregate replica results into this task
    * @param other Pointer to the replica task to aggregate from
    */
-  void Aggregate(const hipc::FullPtr<ParseOmniTask> &other) {
-    Task::Aggregate(other.template Cast<Task>());
-    Copy(other);
+  void Aggregate(const hipc::FullPtr<chi::Task> &other_base) {
+    Task::Aggregate(other_base);
+    Copy(other_base.template Cast<ParseOmniTask>());
   }
 };
 
@@ -235,8 +235,9 @@ struct ProcessHdf5DatasetTask : public chi::Task {
   /**
    * Aggregate replica results into this task
    */
-  void Aggregate(const hipc::FullPtr<ProcessHdf5DatasetTask> &other) {
-    Task::Aggregate(other.template Cast<Task>());
+  void Aggregate(const hipc::FullPtr<chi::Task> &other_base) {
+    Task::Aggregate(other_base);
+    auto other = other_base.template Cast<ProcessHdf5DatasetTask>();
     // Keep the first error if any
     if (result_code_ == 0 && other->result_code_ != 0) {
       result_code_ = other->result_code_;

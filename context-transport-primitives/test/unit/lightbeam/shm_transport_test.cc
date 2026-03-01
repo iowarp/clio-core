@@ -128,6 +128,7 @@ void TestBasicShmTransfer() {
   assert(received1 == data1);
   assert(received2 == data2);
 
+  server.ClearRecvHandles(recv_meta);
   std::cout << "[SHM Basic] Test passed!\n";
 }
 
@@ -172,6 +173,7 @@ void TestMultipleBulks() {
     assert(received == data_chunks[i]);
   }
 
+  server.ClearRecvHandles(recv_meta);
   std::cout << "[SHM Multiple Bulks] Test passed!\n";
 }
 
@@ -365,6 +367,7 @@ void TestMixedBulks() {
             << std::hex << recv_meta.recv[1].data.shm_.off_.load()
             << std::dec << "\n";
 
+  server.ClearRecvHandles(recv_meta);
   std::cout << "[SHM Mixed Bulks] Test passed!\n";
 }
 
@@ -411,6 +414,7 @@ void TestFactory() {
   std::cout << "Received: " << received << "\n";
   assert(received == data);
 
+  server->ClearRecvHandles(recv_meta);
   std::cout << "[SHM Factory] Test passed!\n";
 }
 

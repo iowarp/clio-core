@@ -365,8 +365,12 @@ chi::PoolQuery Runtime::ScheduleTask(const hipc::FullPtr<chi::Task> &task) {
     case Method::kGetOrCreateTag: {
       auto typed = task.template Cast<GetOrCreateTagTask<CreateParams>>();
       std::string tag_name = typed->tag_name_.str();
-      TagId *existing_tag_id = tag_name_to_id_.find(tag_name);
-      if (existing_tag_id != nullptr) {
+      bool tag_exists = false;
+      {
+        chi::ScopedCoRwReadLock lock(tag_map_lock_);
+        tag_exists = (tag_name_to_id_.find(tag_name) != nullptr);
+      }
+      if (tag_exists) {
         return chi::PoolQuery::Local();
       }
       std::hash<std::string> string_hasher;
@@ -468,9 +472,8 @@ chi::TaskResume Runtime::RegisterTarget(hipc::FullPtr<RegisterTargetTask> task,
     chi::PoolId target_id = bdev_client.pool_id_;
 
     // Check if target is already registered using TargetId
-    size_t lock_index = GetTargetLockIndex(target_id);
     {
-      chi::ScopedCoRwReadLock read_lock(*target_locks_[lock_index]);
+      chi::ScopedCoRwReadLock read_lock(target_lock_);
       TargetInfo *existing_target = registered_targets_.find(target_id);
       if (existing_target != nullptr) {
         co_return;
@@ -522,7 +525,7 @@ chi::TaskResume Runtime::RegisterTarget(hipc::FullPtr<RegisterTargetTask> task,
 
     // Register the target using TargetId as key
     {
-      chi::ScopedCoRwWriteLock write_lock(*target_locks_[lock_index]);
+      chi::ScopedCoRwWriteLock write_lock(target_lock_);
       registered_targets_.insert_or_assign(target_id, target_info);
       target_name_to_id_.insert_or_assign(
           target_name,
@@ -556,19 +559,18 @@ chi::TaskResume Runtime::UnregisterTarget(
   try {
     std::string target_name = task->target_name_.str();
 
-    // Look up TargetId from target_name
-    chi::PoolId *target_id_ptr = target_name_to_id_.find(target_name);
-    if (target_id_ptr == nullptr) {
-      task->return_code_ = 1;
-      co_return;
-    }
-
-    const chi::PoolId &target_id = *target_id_ptr;
-
     // Check if target exists and remove it (don't destroy bdev container)
-    size_t lock_index = GetTargetLockIndex(target_id);
     {
-      chi::ScopedCoRwWriteLock write_lock(*target_locks_[lock_index]);
+      chi::ScopedCoRwWriteLock write_lock(target_lock_);
+
+      // Look up TargetId from target_name (under lock)
+      chi::PoolId *target_id_ptr = target_name_to_id_.find(target_name);
+      if (target_id_ptr == nullptr) {
+        task->return_code_ = 1;
+        co_return;
+      }
+
+      const chi::PoolId &target_id = *target_id_ptr;
       if (!registered_targets_.contains(target_id)) {
         task->return_code_ = 1;
         co_return;
@@ -593,10 +595,7 @@ chi::TaskResume Runtime::ListTargets(hipc::FullPtr<ListTargetsTask> task,
     // Clear the output vector and populate with current target names
     task->target_names_.clear();
 
-    // Use a single lock based on hash of operation type for listing
-    size_t lock_index =
-        std::hash<std::string>{}("list_targets") % target_locks_.size();
-    chi::ScopedCoRwReadLock read_lock(*target_locks_[lock_index]);
+    chi::ScopedCoRwReadLock read_lock(target_lock_);
 
     // Populate target name list while lock is held
     task->target_names_.reserve(registered_targets_.size());
@@ -616,25 +615,64 @@ chi::TaskResume Runtime::ListTargets(hipc::FullPtr<ListTargetsTask> task,
 chi::TaskResume Runtime::StatTargets(hipc::FullPtr<StatTargetsTask> task,
                                      chi::RunContext &ctx) {
   try {
-    // Update performance stats for all registered targets
-    // Use a single lock based on hash of operation type for stats
-    size_t lock_index =
-        std::hash<std::string>{}("stat_targets") % target_locks_.size();
-    chi::ScopedCoRwReadLock read_lock(*target_locks_[lock_index]);
-
-    // Collect all target IDs first (can't co_await inside for_each lambda)
+    // Collect all target IDs under read lock (can't co_await inside lambda)
     std::vector<chi::PoolId> target_ids;
-    registered_targets_.for_each(
-        [&target_ids](const chi::PoolId &target_id, TargetInfo &target_info) {
-          (void)target_info;
-          target_ids.push_back(target_id);
-        });
+    {
+      chi::ScopedCoRwReadLock read_lock(target_lock_);
+      registered_targets_.for_each(
+          [&target_ids](const chi::PoolId &target_id, TargetInfo &target_info) {
+            (void)target_info;
+            target_ids.push_back(target_id);
+          });
+    }
 
     // Now iterate and co_await each UpdateTargetStats call
+    // Cannot hold lock across co_await, so acquire/release per-target
     for (const auto &target_id : target_ids) {
-      TargetInfo *target_info = registered_targets_.find(target_id);
-      if (target_info != nullptr) {
-        co_await UpdateTargetStats(target_id, *target_info);
+      // Copy bdev_client under read lock for the async call
+      chimaera::bdev::Client bdev_client_copy;
+      bool found = false;
+      {
+        chi::ScopedCoRwReadLock read_lock(target_lock_);
+        TargetInfo *target_info = registered_targets_.find(target_id);
+        if (target_info != nullptr) {
+          bdev_client_copy = target_info->bdev_client_;
+          found = true;
+        }
+      }
+      if (!found) continue;
+
+      // Perform async stats query WITHOUT holding lock
+      chi::u64 remaining_size;
+      auto stats_task = bdev_client_copy.AsyncGetStats();
+      co_await stats_task;
+      chimaera::bdev::PerfMetrics perf_metrics = stats_task->metrics_;
+      remaining_size = stats_task->remaining_size_;
+
+      // Re-acquire write lock to update target info
+      {
+        chi::ScopedCoRwWriteLock write_lock(target_lock_);
+        TargetInfo *target_info = registered_targets_.find(target_id);
+        if (target_info != nullptr) {
+          target_info->perf_metrics_ = perf_metrics;
+          target_info->remaining_space_ = remaining_size;
+
+          float manual_score = GetManualScoreForTarget(target_info->target_name_);
+          if (manual_score >= 0.0f) {
+            target_info->target_score_ = manual_score;
+          } else {
+            double max_bandwidth =
+                std::max(target_info->perf_metrics_.read_bandwidth_mbps_,
+                         target_info->perf_metrics_.write_bandwidth_mbps_);
+            if (max_bandwidth > 0.0) {
+              double global_max_bandwidth = 1000.0;
+              target_info->target_score_ = static_cast<float>(
+                  std::log(max_bandwidth + 1.0) / std::log(global_max_bandwidth + 1.0));
+              target_info->target_score_ =
+                  std::max(0.0f, std::min(1.0f, target_info->target_score_));
+            }
+          }
+        }
       }
     }
 
@@ -664,8 +702,7 @@ chi::TaskResume Runtime::GetOrCreateTag(
 
     if (is_remote_tag) {
       // Non-canonical node: Only cache the name→TagId mapping
-      size_t tag_lock_index = GetTagLockIndex(tag_name);
-      chi::ScopedCoRwWriteLock write_lock(*tag_locks_[tag_lock_index]);
+      chi::ScopedCoRwWriteLock write_lock(tag_map_lock_);
 
       // Check if already cached
       TagId *existing_tag_id_ptr = tag_name_to_id_.find(tag_name);
@@ -684,10 +721,9 @@ chi::TaskResume Runtime::GetOrCreateTag(
     task->tag_id_ = tag_id;
 
     // Update timestamp and log telemetry
-    size_t tag_lock_index = GetTagLockIndex(tag_name);
     auto now = std::chrono::steady_clock::now();
     {
-      chi::ScopedCoRwReadLock read_lock(*tag_locks_[tag_lock_index]);
+      chi::ScopedCoRwWriteLock write_lock(tag_map_lock_);
       TagInfo *tag_info_ptr = tag_id_to_info_.find(tag_id);
       if (tag_info_ptr != nullptr) {
         // Update read timestamp
@@ -712,7 +748,8 @@ chi::TaskResume Runtime::GetTargetInfo(hipc::FullPtr<GetTargetInfoTask> task,
   try {
     std::string target_name = task->target_name_.str();
 
-    // Look up target by name
+    // Look up target by name (under lock for concurrent safety)
+    chi::ScopedCoRwReadLock read_lock(target_lock_);
     chi::PoolId *target_id_ptr = target_name_to_id_.find(target_name);
     if (target_id_ptr == nullptr) {
       task->return_code_ = 1;  // Target not found
@@ -720,8 +757,6 @@ chi::TaskResume Runtime::GetTargetInfo(hipc::FullPtr<GetTargetInfoTask> task,
     }
 
     chi::PoolId target_id = *target_id_ptr;
-    size_t lock_index = GetTargetLockIndex(target_id);
-    chi::ScopedCoRwReadLock read_lock(*target_locks_[lock_index]);
 
     // Find target in registered_targets_
     auto target_ptr = registered_targets_.find(target_id);
@@ -863,8 +898,7 @@ chi::TaskResume Runtime::PutBlob(hipc::FullPtr<PutBlobTask> task,
     blob_info_ptr->last_modified_ = now;
     blob_info_ptr->score_ = blob_score;
     {
-      size_t tag_lock_index = GetTagLockIndex(tag_id);
-      chi::ScopedCoRwReadLock tag_lock(*tag_locks_[tag_lock_index]);
+      chi::ScopedCoRwReadLock lock(tag_map_lock_);
       TagInfo *tag_info_ptr = tag_id_to_info_.find(tag_id);
       if (tag_info_ptr) {
         tag_info_ptr->last_modified_ = now;
@@ -1102,20 +1136,25 @@ chi::TaskResume Runtime::DelBlob(hipc::FullPtr<DelBlobTask> task,
     }
 
     // Step 3: Update tag's total_size_
-    TagInfo *tag_info_ptr = tag_id_to_info_.find(tag_id);
-    if (tag_info_ptr != nullptr) {
-      // Step 4: Decrement tag's total_size_
-      if (blob_size <= tag_info_ptr->total_size_) {
-        tag_info_ptr->total_size_ -= blob_size;
-      } else {
-        tag_info_ptr->total_size_ = 0;  // Clamp to 0 if we would underflow
+    {
+      chi::ScopedCoRwWriteLock lock(tag_map_lock_);
+      TagInfo *tag_info_ptr = tag_id_to_info_.find(tag_id);
+      if (tag_info_ptr != nullptr) {
+        if (blob_size <= tag_info_ptr->total_size_) {
+          tag_info_ptr->total_size_ -= blob_size;
+        } else {
+          tag_info_ptr->total_size_ = 0;
+        }
       }
     }
 
     // Step 5: Remove blob from tag_blob_name_to_info_ map
-    std::string compound_key = std::to_string(tag_id.major_) + "." +
-                               std::to_string(tag_id.minor_) + "." + blob_name;
-    tag_blob_name_to_info_.erase(compound_key);
+    {
+      chi::ScopedCoRwWriteLock lock(blob_map_lock_);
+      std::string compound_key = std::to_string(tag_id.major_) + "." +
+                                 std::to_string(tag_id.minor_) + "." + blob_name;
+      tag_blob_name_to_info_.erase(compound_key);
+    }
 
     // Step 6: Log telemetry for DelBlob operation
     auto now = std::chrono::steady_clock::now();
@@ -1151,39 +1190,45 @@ chi::TaskResume Runtime::DelTag(hipc::FullPtr<DelTagTask> task,
 
     // Step 1: Resolve tag ID if tag name was provided instead
     if (tag_id.IsNull() && !tag_name.empty()) {
-      // Look up tag ID by name
+      chi::ScopedCoRwReadLock lock(tag_map_lock_);
       TagId *found_tag_id_ptr = tag_name_to_id_.find(tag_name);
       if (found_tag_id_ptr == nullptr) {
         task->return_code_ = 1;  // Tag not found by name
         co_return;
       }
       tag_id = *found_tag_id_ptr;
-      task->tag_id_ = tag_id;  // Update task with resolved tag ID
+      task->tag_id_ = tag_id;
     } else if (tag_id.IsNull() && tag_name.empty()) {
-      task->return_code_ = 1;  // Neither tag ID nor tag name provided
+      task->return_code_ = 1;
       co_return;
     }
 
     // Step 2: Find the tag by ID
-    TagInfo *tag_info_ptr = tag_id_to_info_.find(tag_id);
-    if (tag_info_ptr == nullptr) {
-      task->return_code_ = 1;  // Tag not found by ID
-      co_return;
+    std::string cached_tag_name;
+    {
+      chi::ScopedCoRwReadLock lock(tag_map_lock_);
+      TagInfo *tag_info_ptr = tag_id_to_info_.find(tag_id);
+      if (tag_info_ptr == nullptr) {
+        task->return_code_ = 1;  // Tag not found by ID
+        co_return;
+      }
+      cached_tag_name = tag_info_ptr->tag_name_;
     }
 
-    // Step 3: Delete all blobs in this tag using client AsyncDelBlob to
-    // properly clean up blocks
-    // Collect all blob names first by scanning tag_blob_name_to_info_
+    // Step 3: Collect blob names under read lock, then delete
     std::string tag_prefix = std::to_string(tag_id.major_) + "." +
                              std::to_string(tag_id.minor_) + ".";
     std::vector<std::string> blob_names_to_delete;
-    tag_blob_name_to_info_.for_each(
-        [&tag_prefix, &blob_names_to_delete](const std::string &compound_key,
-                                             const BlobInfo &blob_info) {
-          if (compound_key.compare(0, tag_prefix.length(), tag_prefix) == 0) {
-            blob_names_to_delete.push_back(blob_info.blob_name_);
-          }
-        });
+    {
+      chi::ScopedCoRwReadLock lock(blob_map_lock_);
+      tag_blob_name_to_info_.for_each(
+          [&tag_prefix, &blob_names_to_delete](const std::string &compound_key,
+                                               const BlobInfo &blob_info) {
+            if (compound_key.compare(0, tag_prefix.length(), tag_prefix) == 0) {
+              blob_names_to_delete.push_back(blob_info.blob_name_);
+            }
+          });
+    }
 
     // Process blobs in batches to limit concurrent async tasks
     constexpr size_t kMaxConcurrentDelBlobTasks = 32;
@@ -1221,28 +1266,35 @@ chi::TaskResume Runtime::DelTag(hipc::FullPtr<DelTagTask> task,
       }
     }
 
-    // Step 4: Remove all blob name mappings for this tag (DelBlob should have
-    // removed them, but ensure cleanup)
-    std::vector<std::string> keys_to_erase;
-    tag_blob_name_to_info_.for_each(
-        [&tag_prefix, &keys_to_erase](const std::string &compound_key,
-                                      const BlobInfo &blob_info) {
-          if (compound_key.compare(0, tag_prefix.length(), tag_prefix) == 0) {
-            keys_to_erase.push_back(compound_key);
-          }
-        });
-    for (const auto &key : keys_to_erase) {
-      tag_blob_name_to_info_.erase(key);
+    // Step 4: Remove all blob name mappings for this tag
+    {
+      chi::ScopedCoRwWriteLock lock(blob_map_lock_);
+      std::vector<std::string> keys_to_erase;
+      tag_blob_name_to_info_.for_each(
+          [&tag_prefix, &keys_to_erase](const std::string &compound_key,
+                                        const BlobInfo &blob_info) {
+            if (compound_key.compare(0, tag_prefix.length(), tag_prefix) == 0) {
+              keys_to_erase.push_back(compound_key);
+            }
+          });
+      for (const auto &key : keys_to_erase) {
+        tag_blob_name_to_info_.erase(key);
+      }
     }
 
-    // Step 5: Remove tag name mapping if it exists
-    if (!tag_info_ptr->tag_name_.empty()) {
-      tag_name_to_id_.erase(tag_info_ptr->tag_name_);
-    }
-
-    // Step 6: Log telemetry and remove tag from tag_id_to_info_ map
+    // Step 5: Remove tag name and tag info mappings
     size_t blob_count = processed_blobs;
-    size_t total_size = tag_info_ptr->total_size_;
+    size_t total_size = 0;
+    {
+      chi::ScopedCoRwWriteLock lock(tag_map_lock_);
+      TagInfo *tag_info_ptr = tag_id_to_info_.find(tag_id);
+      if (tag_info_ptr != nullptr) {
+        total_size = tag_info_ptr->total_size_;
+        if (!tag_info_ptr->tag_name_.empty()) {
+          tag_name_to_id_.erase(tag_info_ptr->tag_name_);
+        }
+      }
+    }
 
     // Log telemetry for DelTag operation
     auto now = std::chrono::steady_clock::now();
@@ -1252,13 +1304,16 @@ chi::TaskResume Runtime::DelTag(hipc::FullPtr<DelTagTask> task,
     if (!tag_txn_logs_.empty()) {
       chi::u32 wid = CHI_CUR_WORKER->GetWorkerStats().worker_id_;
       TxnDelTag txn;
-      txn.tag_name_ = tag_info_ptr->tag_name_;
+      txn.tag_name_ = cached_tag_name;
       txn.tag_major_ = tag_id.major_;
       txn.tag_minor_ = tag_id.minor_;
       tag_txn_logs_[wid % tag_txn_logs_.size()]->Log(TxnType::kDelTag, txn);
     }
 
-    tag_id_to_info_.erase(tag_id);
+    {
+      chi::ScopedCoRwWriteLock lock(tag_map_lock_);
+      tag_id_to_info_.erase(tag_id);
+    }
 
     // Success
     task->return_code_ = 0;
@@ -1278,6 +1333,7 @@ chi::TaskResume Runtime::GetTagSize(hipc::FullPtr<GetTagSizeTask> task,
     TagId tag_id = task->tag_id_;
 
     // Find the tag
+    chi::ScopedCoRwWriteLock lock(tag_map_lock_);
     TagInfo *tag_info_ptr = tag_id_to_info_.find(tag_id);
     if (tag_info_ptr == nullptr) {
       task->return_code_ = 1;  // Tag not found
@@ -1308,50 +1364,6 @@ chi::TaskResume Runtime::GetTagSize(hipc::FullPtr<GetTagSizeTask> task,
 
 // Private helper methods
 const Config &Runtime::GetConfig() const { return config_; }
-
-chi::TaskResume Runtime::UpdateTargetStats(const chi::PoolId &target_id,
-                                           TargetInfo &target_info) {
-  // Get actual statistics from bdev using the AsyncGetStats method
-  chi::u64 remaining_size;
-  auto stats_task = target_info.bdev_client_.AsyncGetStats();
-  co_await stats_task;
-  chimaera::bdev::PerfMetrics perf_metrics = stats_task->metrics_;
-  remaining_size = stats_task->remaining_size_;
-
-  // Update target info with real performance metrics from bdev
-  target_info.perf_metrics_ = perf_metrics;
-  target_info.remaining_space_ = remaining_size;
-
-  // Check if this target has a manually configured score - if so, don't
-  // overwrite it
-  float manual_score = GetManualScoreForTarget(target_info.target_name_);
-  if (manual_score >= 0.0f) {
-    // Keep the manually configured score, don't auto-calculate
-    target_info.target_score_ = manual_score;
-  } else {
-    // Auto-calculate target score using normalized log bandwidth
-    double max_bandwidth =
-        std::max(target_info.perf_metrics_.read_bandwidth_mbps_,
-                 target_info.perf_metrics_.write_bandwidth_mbps_);
-    if (max_bandwidth > 0.0) {
-      // Find the maximum bandwidth across all targets for normalization
-      double global_max_bandwidth =
-          1000.0;  // TODO: Calculate actual max from all targets
-
-      // Use logarithmic scaling for target score: log(bandwidth_i) /
-      // log(bandwidth_MAX)
-      target_info.target_score_ = static_cast<float>(
-          std::log(max_bandwidth + 1.0) / std::log(global_max_bandwidth + 1.0));
-
-      // Clamp to [0, 1] range
-      target_info.target_score_ =
-          std::max(0.0f, std::min(1.0f, target_info.target_score_));
-    } else {
-      target_info.target_score_ = 0.0f;  // No bandwidth, lowest score
-    }
-  }
-  co_return;
-}
 
 float Runtime::GetManualScoreForTarget(const std::string &target_name) {
   // Check if the target name matches a configured storage device with manual
@@ -1401,8 +1413,7 @@ chimaera::bdev::PersistenceLevel Runtime::GetPersistenceLevelForTarget(
 
 TagId Runtime::GetOrAssignTagId(const std::string &tag_name,
                                 const TagId &preferred_id) {
-  size_t tag_lock_index = GetTagLockIndex(tag_name);
-  chi::ScopedCoRwWriteLock write_lock(*tag_locks_[tag_lock_index]);
+  chi::ScopedCoRwWriteLock write_lock(tag_map_lock_);
 
   // Check if tag already exists
   TagId *existing_tag_id_ptr = tag_name_to_id_.find(tag_name);
@@ -1568,12 +1579,15 @@ chi::TaskResume Runtime::FlushData(hipc::FullPtr<FlushDataTask> task,
 
   // Find non-volatile targets that meet the persistence level requirement
   std::vector<chi::PoolId> nonvolatile_targets;
-  registered_targets_.for_each(
-      [&](const chi::PoolId &id, const TargetInfo &info) {
-        if (static_cast<int>(info.persistence_level_) >= target_level) {
-          nonvolatile_targets.push_back(id);
-        }
-      });
+  {
+    chi::ScopedCoRwReadLock read_lock(target_lock_);
+    registered_targets_.for_each(
+        [&](const chi::PoolId &id, const TargetInfo &info) {
+          if (static_cast<int>(info.persistence_level_) >= target_level) {
+            nonvolatile_targets.push_back(id);
+          }
+        });
+  }
 
   if (nonvolatile_targets.empty()) {
     HLOG(kDebug, "FlushData: No non-volatile targets available at level >= {}",
@@ -1593,40 +1607,43 @@ chi::TaskResume Runtime::FlushData(hipc::FullPtr<FlushDataTask> task,
   };
   std::vector<FlushEntry> blobs_to_flush;
 
-  tag_blob_name_to_info_.for_each([&](const std::string &key,
-                                      const BlobInfo &blob_info) {
-    if (blob_info.blocks_.empty()) return;
+  {
+    chi::ScopedCoRwReadLock read_lock(target_lock_);
+    tag_blob_name_to_info_.for_each([&](const std::string &key,
+                                        const BlobInfo &blob_info) {
+      if (blob_info.blocks_.empty()) return;
 
-    bool has_volatile_blocks = false;
-    for (const auto &block : blob_info.blocks_) {
-      chi::PoolId pool_id = block.bdev_client_.pool_id_;
-      TargetInfo *tinfo = registered_targets_.find(pool_id);
-      if (tinfo && static_cast<int>(tinfo->persistence_level_) < target_level) {
-        has_volatile_blocks = true;
-        break;
-      }
-    }
-
-    if (has_volatile_blocks) {
-      FlushEntry entry;
-      entry.composite_key = key;
-      entry.blob_name = blob_info.blob_name_;
-      entry.total_size = blob_info.GetTotalSize();
-      entry.score = blob_info.score_;
-
-      // Parse tag_id from composite key: "major.minor.blob_name"
-      size_t first_dot = key.find('.');
-      size_t second_dot = key.find('.', first_dot + 1);
-      if (first_dot != std::string::npos && second_dot != std::string::npos) {
-        entry.tag_id.major_ =
-            static_cast<chi::u32>(std::stoul(key.substr(0, first_dot)));
-        entry.tag_id.minor_ = static_cast<chi::u32>(
-            std::stoul(key.substr(first_dot + 1, second_dot - first_dot - 1)));
+      bool has_volatile_blocks = false;
+      for (const auto &block : blob_info.blocks_) {
+        chi::PoolId pool_id = block.bdev_client_.pool_id_;
+        TargetInfo *tinfo = registered_targets_.find(pool_id);
+        if (tinfo && static_cast<int>(tinfo->persistence_level_) < target_level) {
+          has_volatile_blocks = true;
+          break;
+        }
       }
 
-      blobs_to_flush.push_back(std::move(entry));
-    }
-  });
+      if (has_volatile_blocks) {
+        FlushEntry entry;
+        entry.composite_key = key;
+        entry.blob_name = blob_info.blob_name_;
+        entry.total_size = blob_info.GetTotalSize();
+        entry.score = blob_info.score_;
+
+        // Parse tag_id from composite key: "major.minor.blob_name"
+        size_t first_dot = key.find('.');
+        size_t second_dot = key.find('.', first_dot + 1);
+        if (first_dot != std::string::npos && second_dot != std::string::npos) {
+          entry.tag_id.major_ =
+              static_cast<chi::u32>(std::stoul(key.substr(0, first_dot)));
+          entry.tag_id.minor_ = static_cast<chi::u32>(
+              std::stoul(key.substr(first_dot + 1, second_dot - first_dot - 1)));
+        }
+
+        blobs_to_flush.push_back(std::move(entry));
+      }
+    });
+  }
 
   HLOG(kDebug, "FlushData: Found {} blobs with volatile blocks to flush",
        blobs_to_flush.size());
@@ -1667,24 +1684,27 @@ chi::TaskResume Runtime::FlushData(hipc::FullPtr<FlushDataTask> task,
         std::pair<chi::PoolQuery, std::vector<chimaera::bdev::Block>>>
         volatile_blocks_by_pool;
 
-    for (const auto &block : blob_info_ptr->blocks_) {
-      chi::PoolId pool_id = block.bdev_client_.pool_id_;
-      TargetInfo *tinfo = registered_targets_.find(pool_id);
-      if (tinfo && static_cast<int>(tinfo->persistence_level_) < target_level) {
-        // Volatile block - collect for freeing
-        chimaera::bdev::Block bdev_block;
-        bdev_block.offset_ = block.target_offset_;
-        bdev_block.size_ = block.size_;
-        bdev_block.block_type_ = 0;
-        if (volatile_blocks_by_pool.find(pool_id) ==
-            volatile_blocks_by_pool.end()) {
-          volatile_blocks_by_pool[pool_id] = std::make_pair(
-              block.target_query_, std::vector<chimaera::bdev::Block>());
+    {
+      chi::ScopedCoRwReadLock read_lock(target_lock_);
+      for (const auto &block : blob_info_ptr->blocks_) {
+        chi::PoolId pool_id = block.bdev_client_.pool_id_;
+        TargetInfo *tinfo = registered_targets_.find(pool_id);
+        if (tinfo && static_cast<int>(tinfo->persistence_level_) < target_level) {
+          // Volatile block - collect for freeing
+          chimaera::bdev::Block bdev_block;
+          bdev_block.offset_ = block.target_offset_;
+          bdev_block.size_ = block.size_;
+          bdev_block.block_type_ = 0;
+          if (volatile_blocks_by_pool.find(pool_id) ==
+              volatile_blocks_by_pool.end()) {
+            volatile_blocks_by_pool[pool_id] = std::make_pair(
+                block.target_query_, std::vector<chimaera::bdev::Block>());
+          }
+          volatile_blocks_by_pool[pool_id].second.push_back(bdev_block);
+        } else {
+          // Nonvolatile block - keep
+          nonvolatile_blocks.push_back(block);
         }
-        volatile_blocks_by_pool[pool_id].second.push_back(bdev_block);
-      } else {
-        // Nonvolatile block - keep
-        nonvolatile_blocks.push_back(block);
       }
     }
 
@@ -1704,6 +1724,7 @@ chi::TaskResume Runtime::FlushData(hipc::FullPtr<FlushDataTask> task,
       auto free_task = bdev_client.AsyncFreeBlocks(target_query, blocks);
       co_await free_task;
       if (free_task->GetReturnCode() == 0) {
+        chi::ScopedCoRwWriteLock write_lock(target_lock_);
         TargetInfo *target_info = registered_targets_.find(pool_id);
         if (target_info) {
           target_info->remaining_space_ += bytes_freed;
@@ -1845,9 +1866,16 @@ void Runtime::RestoreMetadataFromLog() {
 
         // Filter by persistence level: skip volatile blocks
         chi::PoolId bdev_pool_id(bdev_major, bdev_minor);
-        TargetInfo *tinfo = registered_targets_.find(bdev_pool_id);
-        if (tinfo && tinfo->persistence_level_ ==
-                         chimaera::bdev::PersistenceLevel::kVolatile) {
+        bool is_volatile = false;
+        {
+          chi::ScopedCoRwReadLock read_lock(target_lock_);
+          TargetInfo *tinfo = registered_targets_.find(bdev_pool_id);
+          if (tinfo && tinfo->persistence_level_ ==
+                           chimaera::bdev::PersistenceLevel::kVolatile) {
+            is_volatile = true;
+          }
+        }
+        if (is_volatile) {
           continue;  // Volatile data is lost on restart
         }
 
@@ -1968,10 +1996,17 @@ void Runtime::ReplayTransactionLogs() {
           for (const auto &tb : txn.new_blocks_) {
             chi::PoolId bdev_pool_id(tb.bdev_major_, tb.bdev_minor_);
             // Filter volatile targets (matching RestoreMetadataFromLog)
-            TargetInfo *tinfo = registered_targets_.find(bdev_pool_id);
-            if (tinfo &&
-                tinfo->persistence_level_ ==
-                    chimaera::bdev::PersistenceLevel::kVolatile) {
+            bool is_volatile = false;
+            {
+              chi::ScopedCoRwReadLock read_lock(target_lock_);
+              TargetInfo *tinfo = registered_targets_.find(bdev_pool_id);
+              if (tinfo &&
+                  tinfo->persistence_level_ ==
+                      chimaera::bdev::PersistenceLevel::kVolatile) {
+                is_volatile = true;
+              }
+            }
+            if (is_volatile) {
               continue;
             }
             chimaera::bdev::Client bdev_client(bdev_pool_id);
@@ -2088,9 +2123,8 @@ BlobInfo *Runtime::CheckBlobExists(const std::string &blob_name,
   std::string composite_key = std::to_string(tag_id.major_) + "." +
                               std::to_string(tag_id.minor_) + "." + blob_name;
 
-  // Acquire read lock ONLY for map lookup
-  size_t tag_lock_index = GetTagLockIndex(tag_id);
-  chi::ScopedCoRwReadLock tag_lock(*tag_locks_[tag_lock_index]);
+  // Acquire read lock for map lookup (single lock for map-wide safety)
+  chi::ScopedCoRwReadLock lock(blob_map_lock_);
 
   // Search by composite key in tag_blob_name_to_info_
   BlobInfo *blob_info_ptr = tag_blob_name_to_info_.find(composite_key);
@@ -2116,11 +2150,10 @@ BlobInfo *Runtime::CreateNewBlob(const std::string &blob_name,
   std::string composite_key = std::to_string(tag_id.major_) + "." +
                               std::to_string(tag_id.minor_) + "." + blob_name;
 
-  // Acquire write lock ONLY for map insertion
-  size_t tag_lock_index = GetTagLockIndex(tag_id);
+  // Acquire write lock for map insertion (single lock for map-wide safety)
   BlobInfo *blob_info_ptr = nullptr;
   {
-    chi::ScopedCoRwWriteLock tag_lock(*tag_locks_[tag_lock_index]);
+    chi::ScopedCoRwWriteLock lock(blob_map_lock_);
 
     // Store blob info directly in tag_blob_name_to_info_
     auto insert_result =
@@ -2161,13 +2194,16 @@ chi::TaskResume Runtime::ExtendBlob(BlobInfo &blob_info, chi::u64 offset,
 
   // Get ALL available targets for data placement (no pre-filtering)
   std::vector<TargetInfo> available_targets;
-  available_targets.reserve(registered_targets_.size());
-  registered_targets_.for_each(
-      [&available_targets](const chi::PoolId &target_id,
-                           const TargetInfo &target_info) {
-        (void)target_id;
-        available_targets.push_back(target_info);
-      });
+  {
+    chi::ScopedCoRwReadLock read_lock(target_lock_);
+    available_targets.reserve(registered_targets_.size());
+    registered_targets_.for_each(
+        [&available_targets](const chi::PoolId &target_id,
+                             const TargetInfo &target_info) {
+          (void)target_id;
+          available_targets.push_back(target_info);
+        });
+  }
   if (available_targets.empty()) {
     error_code = 1;
     co_return;
@@ -2207,15 +2243,24 @@ chi::TaskResume Runtime::ExtendBlob(BlobInfo &blob_info, chi::u64 offset,
 
     chi::PoolId selected_target_id = selected_target_info.bdev_client_.pool_id_;
 
-    // Find the selected target info for allocation using TargetId
-    TargetInfo *target_info = registered_targets_.find(selected_target_id);
-    if (target_info == nullptr) {
+    // Copy target info under lock (can't hold lock across co_await)
+    TargetInfo target_info_copy;
+    bool found = false;
+    {
+      chi::ScopedCoRwReadLock read_lock(target_lock_);
+      TargetInfo *target_info = registered_targets_.find(selected_target_id);
+      if (target_info != nullptr) {
+        target_info_copy = *target_info;
+        found = true;
+      }
+    }
+    if (!found) {
       continue;
     }
 
     // Calculate how much we can allocate from this target
     chi::u64 allocate_size =
-        std::min(remaining_to_allocate, target_info->remaining_space_);
+        std::min(remaining_to_allocate, target_info_copy.remaining_space_);
 
     if (allocate_size == 0) {
       continue;
@@ -2224,7 +2269,7 @@ chi::TaskResume Runtime::ExtendBlob(BlobInfo &blob_info, chi::u64 offset,
     // Allocate space using bdev client
     chi::u64 allocated_offset;
     bool alloc_success = false;
-    co_await AllocateFromTarget(*target_info, allocate_size, allocated_offset,
+    co_await AllocateFromTarget(target_info_copy, allocate_size, allocated_offset,
                                 alloc_success);
     if (!alloc_success) {
       // Allocation failed, try next target
@@ -2232,7 +2277,7 @@ chi::TaskResume Runtime::ExtendBlob(BlobInfo &blob_info, chi::u64 offset,
     }
 
     // Create new block for the allocated space
-    BlobBlock new_block(target_info->bdev_client_, target_info->target_query_,
+    BlobBlock new_block(target_info_copy.bdev_client_, target_info_copy.target_query_,
                         allocated_offset, allocate_size);
     blob_info.blocks_.emplace_back(new_block);
 
@@ -2616,10 +2661,7 @@ chi::TaskResume Runtime::FreeAllBlobBlocks(BlobInfo &blob_info,
       HLOG(kWarning, "Failed to free blocks from pool {}", pool_id.major_);
     } else {
       // Successfully freed blocks - update target's remaining_space_
-      size_t lock_index =
-          std::hash<std::string>{}("free_blocks") % target_locks_.size();
-      chi::ScopedCoRwWriteLock write_lock(*target_locks_[lock_index]);
-
+      chi::ScopedCoRwWriteLock write_lock(target_lock_);
       TargetInfo *target_info = registered_targets_.find(pool_id);
       if (target_info != nullptr) {
         target_info->remaining_space_ += bytes_freed;

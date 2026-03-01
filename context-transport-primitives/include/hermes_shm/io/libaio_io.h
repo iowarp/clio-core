@@ -222,6 +222,7 @@ class LinuxAioAsyncIO : public AsyncIO {
     // Called with mutex_ held
     const int kMaxEvents = 32;
     struct io_event events[kMaxEvents];
+    memset(events, 0, sizeof(events));  // Ensure MSan tracks kernel-written data
     struct timespec timeout = {0, 0};  // Non-blocking
 
     int completed = io_getevents(aio_ctx_, 0, kMaxEvents, events, &timeout);

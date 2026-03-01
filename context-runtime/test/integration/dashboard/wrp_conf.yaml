@@ -1,0 +1,20 @@
+# Chimaera Configuration for Dashboard Integration Testing
+# 4-node cluster with dashboard on node 1
+
+# Network configuration
+networking:
+  port: 9413
+  neighborhood_size: 4
+  hostfile: "/workspace/context-runtime/test/integration/dashboard/hostfile"
+
+# Logging configuration
+logging:
+  level: "info"
+  file: "/tmp/chimaera.log"
+
+# Runtime configuration
+runtime:
+  num_threads: 4
+  queue_depth: 1024
+  local_sched: "default"
+  first_busy_wait: 50

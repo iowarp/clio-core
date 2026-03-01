@@ -200,10 +200,10 @@ void TestServerRestart(const std::string &mode) {
   REQUIRE(ready);
   INFO("New server started");
 
-  // 7. ClientReconnect to re-attach to new server
-  bool reconnected = CHI_IPC->ClientReconnect();
+  // 7. ReconnectToOriginalHost to re-attach to new server
+  bool reconnected = CHI_IPC->ReconnectToOriginalHost();
   REQUIRE(reconnected);
-  INFO("ClientReconnect succeeded for mode " + mode);
+  INFO("ReconnectToOriginalHost succeeded for mode " + mode);
 
   // 8. Submit a second task with different pool name/ID
   {
@@ -306,7 +306,7 @@ TEST_CASE("ClientRetry - Server Restart TCP", "[client_retry][tcp]") {
 
 TEST_CASE("ClientRetry - Server Restart IPC", "[client_retry][ipc]") {
   // IPC (Unix domain socket) transport does not auto-reconnect after server
-  // death. ClientReconnect needs socket transport reconnection support.
+  // death. ReconnectToOriginalHost needs socket transport reconnection support.
   INFO("SKIPPED: IPC socket transport reconnection not yet implemented");
 }
 

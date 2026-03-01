@@ -60,6 +60,7 @@
 #include <functional>
 #include <iostream>
 #include <memory>
+#include <random>
 
 #include "chimaera/admin.h"
 #include "chimaera/admin/admin_client.h"
@@ -103,12 +104,32 @@ bool IpcManager::ClientInit() {
                                     : "TCP");
 
   // Parse retry timeout environment variable
+  // Semantics: 0 = fail immediately, -1 = wait forever, >0 = timeout in seconds
   const char *retry_env = std::getenv("CHI_CLIENT_RETRY_TIMEOUT");
   if (retry_env) {
     client_retry_timeout_ = static_cast<float>(std::atof(retry_env));
   }
   HLOG(kInfo, "IpcManager::ClientInit: retry_timeout = {}s",
        client_retry_timeout_);
+
+  // Parse CHI_CLIENT_TRY_NEW_SERVERS environment variable
+  const char *try_new_env = std::getenv("CHI_CLIENT_TRY_NEW_SERVERS");
+  if (try_new_env) {
+    client_try_new_servers_ = std::atoi(try_new_env);
+  }
+  HLOG(kInfo, "IpcManager::ClientInit: try_new_servers = {}",
+       client_try_new_servers_);
+
+  // Load hostfile so Phase 2 failover has hosts to try
+  if (client_try_new_servers_ > 0) {
+    if (LoadHostfile()) {
+      HLOG(kInfo, "IpcManager::ClientInit: Loaded {} hosts from hostfile",
+           hostfile_map_.size());
+    } else {
+      HLOG(kWarning, "IpcManager::ClientInit: Failed to load hostfile, "
+           "Phase 2 failover will be disabled");
+    }
+  }
 
   // Create lightbeam transport for client-server communication
   {
@@ -150,6 +171,13 @@ bool IpcManager::ClientInit() {
     zmq_recv_thread_ = std::thread([this]() { RecvZmqClientThread(); });
   }
 
+  // Initialize HSHM TLS key for task counter before calling WaitForLocalServer,
+  // which calls CreateTaskId(). Without the key registered first, GetTls() on
+  // the zero-initialized key may return a stale/freed pointer → crash.
+  HSHM_THREAD_MODEL->CreateTls<TaskCounter>(chi_task_counter_key_, nullptr);
+  auto *tls_counter = new TaskCounter();
+  HSHM_THREAD_MODEL->SetTls(chi_task_counter_key_, tls_counter);
+
   // Wait for local server using lightbeam transport
   if (!WaitForLocalServer()) {
     HLOG(kError, "CRITICAL ERROR: Cannot connect to local server.");
@@ -159,6 +187,21 @@ bool IpcManager::ClientInit() {
     zmq_transport_.reset();
     return false;
   }
+
+  // Start heartbeat thread for server liveness detection
+  server_alive_.store(true);
+  heartbeat_running_.store(true);
+  heartbeat_thread_ = std::thread([this]() { HeartbeatThread(); });
+
+  // Create TLS key for current worker if not already created.
+  // Must happen before any CoRwLock/CoMutex operations (e.g. IncreaseClientShm).
+  // Server mode creates it earlier in WorkOrchestrator::Init.
+  if (!chi_cur_worker_key_created_) {
+    HSHM_THREAD_MODEL->CreateTls<Worker>(chi_cur_worker_key_, nullptr);
+    chi_cur_worker_key_created_ = true;
+  }
+  HSHM_THREAD_MODEL->SetTls(chi_cur_worker_key_,
+                            static_cast<Worker *>(nullptr));
 
   // SHM mode: Attach to main SHM segment and initialize queues
   if (ipc_mode_ == IpcMode::kShm) {
@@ -192,16 +235,9 @@ bool IpcManager::ClientInit() {
   // Default host until identified
   this_host_ = Host();
 
-  // Initialize HSHM TLS key for task counter
-  HSHM_THREAD_MODEL->CreateTls<TaskCounter>(chi_task_counter_key_, nullptr);
-
-  // Initialize thread-local task counter for this client thread
-  auto *counter = new TaskCounter();
-  HSHM_THREAD_MODEL->SetTls(chi_task_counter_key_, counter);
-
-  // Set current worker to null for client-only mode
-  HSHM_THREAD_MODEL->SetTls(chi_cur_worker_key_,
-                            static_cast<Worker *>(nullptr));
+  // Task counter TLS key was already created before WaitForLocalServer (above).
+  // Do NOT create it again here — doing so leaks the previous pthread key and
+  // causes all TLS operations to collide on key 0.
 
   // Create scheduler using factory
   auto *config = CHI_CONFIG_MANAGER;
@@ -302,6 +338,14 @@ void IpcManager::ClientFinalize() {
     delete counter;
     HSHM_THREAD_MODEL->SetTls(chi_task_counter_key_,
                               static_cast<TaskCounter *>(nullptr));
+  }
+
+  // Stop heartbeat thread
+  if (heartbeat_running_.load()) {
+    heartbeat_running_.store(false);
+    if (heartbeat_thread_.joinable()) {
+      heartbeat_thread_.join();
+    }
   }
 
   // Stop recv thread
@@ -627,27 +671,36 @@ bool IpcManager::StartLocalServer() {
 
 bool IpcManager::WaitForLocalServer() {
   // Read environment variables for wait configuration
+  // Semantics: 0 = fail immediately, -1 = wait forever, >0 = timeout in seconds
   const char *wait_env = std::getenv("CHI_WAIT_SERVER");
   if (wait_env != nullptr) {
-    wait_server_timeout_ = static_cast<u32>(std::atoi(wait_env));
+    wait_server_timeout_ = static_cast<float>(std::atof(wait_env));
   }
 
   HLOG(kInfo, "Waiting for runtime via lightbeam (timeout={}s)",
        wait_server_timeout_);
+
+  // 0 = don't wait at all
+  if (wait_server_timeout_ == 0) {
+    HLOG(kError, "CHI_WAIT_SERVER=0: not waiting for runtime");
+    return false;
+  }
 
   // Send a ClientConnectTask via the lightbeam transport
   auto task = NewTask<chimaera::admin::ClientConnectTask>(
       CreateTaskId(), kAdminPoolId, PoolQuery::Local());
   auto future = SendZmq(task, ipc_mode_);
 
-  // Wait for response with timeout
-  if (!future.Wait(static_cast<float>(wait_server_timeout_))) {
+  // Wait for response with timeout (-1 → pass 0 to Wait which means no limit)
+  float effective_timeout = wait_server_timeout_ > 0 ? wait_server_timeout_ : 0;
+  if (!future.Wait(effective_timeout)) {
     HLOG(kError, "Timeout waiting for runtime after {} seconds",
          wait_server_timeout_);
     HLOG(kError, "This usually means:");
     HLOG(kError, "1. Chimaera runtime is not running");
     HLOG(kError, "2. Runtime failed to start");
     HLOG(kError, "3. Network connectivity issues");
+    DelTask(task);
     return false;
   }
 
@@ -655,15 +708,25 @@ bool IpcManager::WaitForLocalServer() {
     client_generation_ = task->server_generation_;
     HLOG(kInfo, "Successfully connected to runtime (generation={})",
          client_generation_);
+    // Task cleanup is handled by ~Future() since Wait() marked it consumed.
     return true;
   }
 
   HLOG(kError, "Runtime responded with error code: {}", task->response_);
+  // Task cleanup is handled by ~Future() since Wait() marked it consumed.
   return false;
 }
 
 bool IpcManager::WaitForLocalRuntimeStop(u32 timeout_sec) {
   HLOG(kInfo, "Waiting for runtime to stop (timeout={}s)", timeout_sec);
+
+  // Temporarily disable reconnection so that Recv() returns false
+  // immediately when the heartbeat detects the server is dead, instead
+  // of blocking in WaitForServerAndReconnect for up to 60 seconds.
+  float saved_retry = client_retry_timeout_;
+  int saved_try_new = client_try_new_servers_;
+  client_retry_timeout_ = 0;
+  client_try_new_servers_ = 0;
 
   for (u32 elapsed = 0; elapsed < timeout_sec; ++elapsed) {
     // Send a ClientConnectTask with a 1-second timeout
@@ -672,7 +735,9 @@ bool IpcManager::WaitForLocalRuntimeStop(u32 timeout_sec) {
     auto future = SendZmq(task, ipc_mode_);
 
     if (!future.Wait(1.0f)) {
-      // Timeout: runtime is no longer responding
+      // Timeout or server dead: runtime is no longer responding
+      client_retry_timeout_ = saved_retry;
+      client_try_new_servers_ = saved_try_new;
       HLOG(kInfo, "Runtime stopped (no response after {}s)", elapsed + 1);
       return true;
     }
@@ -681,6 +746,8 @@ bool IpcManager::WaitForLocalRuntimeStop(u32 timeout_sec) {
     HLOG(kDebug, "Runtime still alive after {}s, retrying...", elapsed + 1);
   }
 
+  client_retry_timeout_ = saved_retry;
+  client_try_new_servers_ = saved_try_new;
   HLOG(kError, "Runtime still running after {}s timeout", timeout_sec);
   return false;
 }
@@ -866,6 +933,7 @@ u64 IpcManager::AddNode(const std::string &ip_address, u32 port) {
     if (pair.second.ip_address == ip_address) {
       HLOG(kInfo, "AddNode: Node {} already registered as node_id={}",
            ip_address, pair.first);
+      SetAlive(pair.first);
       return pair.first;
     }
   }
@@ -1212,7 +1280,7 @@ bool IpcManager::IncreaseClientShm(size_t size) {
   std::lock_guard<std::mutex> lock(shm_mutex_);
   // Acquire writer lock on allocator_map_lock_ during memory increase
   // This ensures exclusive access to the allocator_map_ structures
-  allocator_map_lock_.WriteLock(0);
+  allocator_map_lock_.WriteLock();
 
   pid_t pid = getpid();
   u32 index = shm_count_.fetch_add(1, std::memory_order_relaxed);
@@ -1300,7 +1368,7 @@ bool IpcManager::RegisterMemory(const hipc::AllocatorId &alloc_id) {
        alloc_id.minor_);
   std::lock_guard<std::mutex> lock(shm_mutex_);
   // Acquire writer lock on allocator_map_lock_ during memory registration
-  allocator_map_lock_.WriteLock(0);
+  allocator_map_lock_.WriteLock();
 
   // Derive shm_name from alloc_id: chimaera_{pid}_{index}
   pid_t owner_pid = static_cast<pid_t>(alloc_id.major_);
@@ -1394,7 +1462,7 @@ size_t IpcManager::WreapDeadIpcs() {
   HLOG(kDebug, "WreapDeadIpcs CALLED");
   std::lock_guard<std::mutex> lock(shm_mutex_);
   // Acquire writer lock on allocator_map_lock_ during reaping
-  allocator_map_lock_.WriteLock(0);
+  allocator_map_lock_.WriteLock();
 
   pid_t current_pid = getpid();
   size_t reaped_count = 0;
@@ -1496,7 +1564,7 @@ size_t IpcManager::WreapAllIpcs() {
   HLOG(kDebug, "WreapAllIpcs CALLED");
   std::lock_guard<std::mutex> lock(shm_mutex_);
   // Acquire writer lock on allocator_map_lock_ during cleanup
-  allocator_map_lock_.WriteLock(0);
+  allocator_map_lock_.WriteLock();
 
   size_t reaped_count = 0;
 
@@ -1652,16 +1720,16 @@ bool IpcManager::GetIsClientThread() const {
 //==============================================================================
 
 bool IpcManager::IsServerAlive() const {
-  // SHM mode: check runtime PID is still running
-  if (ipc_mode_ == IpcMode::kShm && runtime_pid_ > 0) {
-    if (kill(runtime_pid_, 0) == -1 && errno == ESRCH) return false;
+  if (!zmq_transport_) return false;
+  hshm::lbm::LbmContext ctx;
+  if (ipc_mode_ == IpcMode::kShm && shared_header_) {
+    ctx.server_pid_ = static_cast<int>(shared_header_->runtime_pid);
   }
-  // For ZMQ modes, assume alive until proven otherwise by timeout
-  return true;
+  return zmq_transport_->IsServerAlive(ctx);
 }
 
-bool IpcManager::ClientReconnect() {
-  HLOG(kInfo, "ClientReconnect: Attempting to reconnect to restarted server");
+bool IpcManager::ReconnectToOriginalHost() {
+  HLOG(kInfo, "ReconnectToOriginalHost: Attempting to reconnect to restarted server");
 
   if (ipc_mode_ == IpcMode::kShm) {
     // Detach old shared memory (don't destroy — server owns it)
@@ -1692,24 +1760,143 @@ bool IpcManager::ClientReconnect() {
   // Re-verify server via ClientConnectTask (updates client_generation_)
   if (!WaitForLocalServer()) return false;
 
-  HLOG(kInfo, "ClientReconnect: Reconnected, new generation={}",
+  server_alive_.store(true, std::memory_order_release);
+  HLOG(kInfo, "ReconnectToOriginalHost: Reconnected, new generation={}",
        client_generation_);
+  return true;
+}
+
+bool IpcManager::ReconnectToNewHost(const std::string &new_addr) {
+  HLOG(kInfo, "ReconnectToNewHost: Switching to {}", new_addr);
+  auto *config = CHI_CONFIG_MANAGER;
+  u32 port = config->GetPort();
+
+  // Stop recv thread
+  if (zmq_recv_running_.load()) {
+    zmq_recv_running_.store(false);
+    if (zmq_recv_thread_.joinable()) {
+      zmq_recv_thread_.join();
+    }
+  }
+
+  // Destroy old transport
+  zmq_transport_.reset();
+
+  // Clear orphaned pending state
+  {
+    std::lock_guard<std::mutex> lock(pending_futures_mutex_);
+    pending_zmq_futures_.clear();
+    pending_response_archives_.clear();
+  }
+
+  // Disable SHM/IPC — remote hosts require TCP
+  ipc_mode_ = IpcMode::kTcp;
+  shm_send_transport_.reset();
+  shm_recv_transport_.reset();
+  main_allocator_ = nullptr;
+  shared_header_ = nullptr;
+
+  // Create new ZMQ DEALER transport
+  try {
+    zmq_transport_ = hshm::lbm::TransportFactory::Get(
+        new_addr, hshm::lbm::TransportType::kZeroMq,
+        hshm::lbm::TransportMode::kClient, "tcp", port + 3);
+  } catch (const std::exception &e) {
+    HLOG(kError, "ReconnectToNewHost: Transport to {} failed: {}",
+         new_addr, e.what());
+    return false;
+  }
+
+  // Restart recv thread
+  zmq_recv_running_.store(true);
+  zmq_recv_thread_ = std::thread([this]() { RecvZmqClientThread(); });
+
+  // Verify connectivity — the server should respond almost instantly
+  // if it's alive.  No long timer; just a quick round-trip check.
+  float saved_timeout = wait_server_timeout_;
+  wait_server_timeout_ = 0.5f;
+  bool ok = WaitForLocalServer();
+  wait_server_timeout_ = saved_timeout;
+  if (!ok) {
+    HLOG(kWarning, "ReconnectToNewHost: {} not responding", new_addr);
+    return false;
+  }
+
+  server_alive_.store(true, std::memory_order_release);
+  HLOG(kInfo, "ReconnectToNewHost: Connected to {} (generation={})",
+       new_addr, client_generation_);
   return true;
 }
 
 bool IpcManager::WaitForServerAndReconnect(
     std::chrono::steady_clock::time_point start) {
-  while (true) {
-    float elapsed =
-        std::chrono::duration<float>(std::chrono::steady_clock::now() - start)
-            .count();
-    if (client_retry_timeout_ > 0 && elapsed >= client_retry_timeout_) {
-      HLOG(kError, "WaitForServerAndReconnect: Timed out after {}s", elapsed);
-      return false;
+  // Guard against recursive re-entry (WaitForLocalServer → Recv → here)
+  reconnecting_.store(true, std::memory_order_release);
+
+  // Phase 1: Try reconnecting to the original server
+  // Skip entirely when client_retry_timeout_==0 (go straight to Phase 2).
+  // Use a short WaitForLocalServer timeout so each attempt doesn't
+  // block for the full 30s default.
+  float saved_timeout = wait_server_timeout_;
+  if (client_retry_timeout_ != 0) {
+    float per_attempt_timeout = std::min(wait_server_timeout_, 3.0f);
+    wait_server_timeout_ = per_attempt_timeout;
+    while (true) {
+      float elapsed =
+          std::chrono::duration<float>(std::chrono::steady_clock::now() - start)
+              .count();
+      if (client_retry_timeout_ >= 0 && elapsed >= client_retry_timeout_) {
+        HLOG(kWarning, "WaitForServerAndReconnect: Original server timed out "
+             "after {:.1f}s", elapsed);
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::seconds(1));
+      if (ReconnectToOriginalHost()) {
+        wait_server_timeout_ = saved_timeout;
+        reconnecting_.store(false, std::memory_order_release);
+        return true;
+      }
     }
-    std::this_thread::sleep_for(std::chrono::seconds(1));
-    if (ClientReconnect()) return true;
+    wait_server_timeout_ = saved_timeout;
+  } else {
+    HLOG(kInfo, "WaitForServerAndReconnect: retry_timeout=0, "
+         "skipping Phase 1, going straight to Phase 2");
   }
+
+  // Phase 2: Try random hosts from the hostfile
+  if (client_try_new_servers_ <= 0 || hostfile_map_.empty()) {
+    reconnecting_.store(false, std::memory_order_release);
+    return false;
+  }
+
+  const auto &hosts = GetAllHosts();
+  if (hosts.empty()) {
+    HLOG(kWarning, "WaitForServerAndReconnect: No hosts in hostfile");
+    reconnecting_.store(false, std::memory_order_release);
+    return false;
+  }
+
+  // Pick random hosts and try each (may retry same host — that's fine)
+  std::mt19937 rng(std::random_device{}());
+  std::uniform_int_distribution<size_t> dist(0, hosts.size() - 1);
+
+  HLOG(kInfo, "WaitForServerAndReconnect: Trying {} random hosts",
+       client_try_new_servers_);
+  for (int i = 0; i < client_try_new_servers_; ++i) {
+    size_t idx = dist(rng);
+    const std::string &addr = hosts[idx].ip_address;
+    HLOG(kInfo, "WaitForServerAndReconnect: Trying {}/{}: {}",
+         i + 1, client_try_new_servers_, addr);
+    if (ReconnectToNewHost(addr)) {
+      reconnecting_.store(false, std::memory_order_release);
+      return true;
+    }
+  }
+
+  HLOG(kError, "WaitForServerAndReconnect: All {} random hosts failed",
+       client_try_new_servers_);
+  reconnecting_.store(false, std::memory_order_release);
+  return false;
 }
 
 //==============================================================================
@@ -1787,6 +1974,14 @@ void IpcManager::RecvZmqClientThread() {
     if (!drained_any) {
       em.Wait(100);  // 100μs (precise with epoll_pwait2)
     }
+  }
+}
+
+void IpcManager::HeartbeatThread() {
+  while (heartbeat_running_.load()) {
+    bool alive = IsServerAlive();
+    server_alive_.store(alive, std::memory_order_release);
+    std::this_thread::sleep_for(std::chrono::seconds(1));
   }
 }
 

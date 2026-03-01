@@ -3,10 +3,15 @@
 #
 # Usage: rattler-build build --recipe recipe/ --variant-config variants/release.yaml
 
-preset: release
+preset:
+  - release
 
 # These are automatically derived from the preset
-cuda_enabled: "OFF"
-rocm_enabled: "OFF"
-mpi_enabled: "OFF"
-mpi_impl: nompi
+cuda_enabled:
+  - "OFF"
+rocm_enabled:
+  - "OFF"
+mpi_enabled:
+  - "OFF"
+mpi_impl:
+  - nompi

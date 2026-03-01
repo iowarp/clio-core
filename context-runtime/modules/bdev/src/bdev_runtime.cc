@@ -36,6 +36,8 @@
 #include <chimaera/work_orchestrator.h>
 #include <chimaera/worker.h>
 
+#include <hermes_shm/serialize/msgpack_wrapper.h>
+
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -949,8 +951,29 @@ chi::u64 Runtime::GetWorkRemaining() const { return 0; }
 
 chi::TaskResume Runtime::Monitor(hipc::FullPtr<MonitorTask> task,
                                  chi::RunContext &rctx) {
-  task->SetReturnCode(0);
   (void)rctx;
+  if (task->query_ == "stats") {
+    msgpack::sbuffer sbuf;
+    msgpack::packer<msgpack::sbuffer> pk(sbuf);
+
+    pk.pack_map(13);
+    pk.pack("pool_name");              pk.pack(pool_name_);
+    pk.pack("bdev_type");              pk.pack(static_cast<chi::u32>(bdev_type_));
+    pk.pack("total_capacity");         pk.pack(file_size_);
+    pk.pack("remaining_capacity");     pk.pack(heap_.GetRemainingSize());
+    pk.pack("read_bandwidth_mbps");    pk.pack(perf_metrics_.read_bandwidth_mbps_);
+    pk.pack("write_bandwidth_mbps");   pk.pack(perf_metrics_.write_bandwidth_mbps_);
+    pk.pack("read_latency_us");        pk.pack(perf_metrics_.read_latency_us_);
+    pk.pack("write_latency_us");       pk.pack(perf_metrics_.write_latency_us_);
+    pk.pack("iops");                   pk.pack(perf_metrics_.iops_);
+    pk.pack("total_reads");            pk.pack(total_reads_.load());
+    pk.pack("total_writes");           pk.pack(total_writes_.load());
+    pk.pack("total_bytes_read");       pk.pack(total_bytes_read_.load());
+    pk.pack("total_bytes_written");    pk.pack(total_bytes_written_.load());
+
+    task->results_[container_id_] = std::string(sbuf.data(), sbuf.size());
+  }
+  task->SetReturnCode(0);
   co_return;
 }
 

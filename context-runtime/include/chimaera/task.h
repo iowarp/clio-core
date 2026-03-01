@@ -146,6 +146,12 @@ class Task {
   TaskGroup task_group_; /**< Scheduling affinity group (null = no affinity) */
 
   /**
+   * Non-virtual destructor - tasks are deleted via Container::DelTask
+   * which dispatches through typed pointers, not vtable
+   */
+  ~Task() = default;
+
+  /**
    * Default constructor
    */
   HSHM_CROSS_FUN Task() { SetNull(); }
@@ -388,17 +394,14 @@ class Task {
    *
    * @param replica_task The replica task to aggregate from
    */
-  template <typename TaskT>
-  HSHM_CROSS_FUN void Aggregate(const hipc::FullPtr<TaskT>& replica_task) {
-    // Cast to base Task for aggregation
-    auto base_replica = replica_task.template Cast<Task>();
+  void Aggregate(const hipc::FullPtr<Task>& replica_task) {
     // Propagate return code from replica to this task
-    if (!base_replica.IsNull() && base_replica->GetReturnCode() != 0) {
-      SetReturnCode(base_replica->GetReturnCode());
+    if (!replica_task.IsNull() && replica_task->GetReturnCode() != 0) {
+      SetReturnCode(replica_task->GetReturnCode());
     }
     // Copy the completer from the replica task
-    if (!base_replica.IsNull()) {
-      SetCompleter(base_replica->GetCompleter());
+    if (!replica_task.IsNull()) {
+      SetCompleter(replica_task->GetCompleter());
     }
     HLOG(kDebug, "[COMPLETER] Aggregated task {} with completer {}", task_id_,
          GetCompleter());
@@ -854,7 +857,12 @@ class Future {
    * @return True if task is complete, false if coroutine should suspend
    */
   bool await_ready() const noexcept {
-    return IsComplete();
+    if (IsComplete()) return true;
+    if (!task_ptr_.IsNull() &&
+        task_ptr_->task_flags_.Any(TASK_FIRE_AND_FORGET)) {
+      return true;
+    }
+    return false;
   }
 
   /**
@@ -886,6 +894,14 @@ class Future {
    * case). Calls PostWait() on the task for post-completion actions.
    */
   void await_resume() noexcept {
+    if (!task_ptr_.IsNull() &&
+        task_ptr_->task_flags_.Any(TASK_FIRE_AND_FORGET)) {
+      // Fire-and-forget: detach without destroying. The task is still
+      // in-flight on the network; the remote EndTask will clean it up.
+      task_ptr_.SetNull();
+      future_shm_.SetNull();
+      return;
+    }
     Destroy(true);
   }
 };
@@ -1479,34 +1495,6 @@ inline YieldAwaiter yield(double us = 0.0) { return YieldAwaiter(us); }
 // Cleanup macros
 #undef CLASS_NAME
 #undef CLASS_NEW_ARGS
-
-/**
- * SFINAE-based compile-time detection and invocation for Aggregate method
- * Usage: CHI_AGGREGATE_OR_COPY(origin_ptr, replica_ptr)
- */
-namespace detail {
-// Primary template - assumes no Aggregate method, calls Copy
-template <typename T, typename = void>
-struct aggregate_or_copy {
-  static void call(hipc::FullPtr<T> origin, hipc::FullPtr<T> replica) {
-    origin->Copy(replica);
-  }
-};
-
-// Specialization for types with Aggregate method - calls Aggregate
-template <typename T>
-struct aggregate_or_copy<T, std::void_t<decltype(std::declval<T*>()->Aggregate(
-                                std::declval<hipc::FullPtr<T>>()))>> {
-  static void call(hipc::FullPtr<T> origin, hipc::FullPtr<T> replica) {
-    origin->Aggregate(replica);
-  }
-};
-}  // namespace detail
-
-// Macro for convenient usage - automatically dispatches to Aggregate or Copy
-#define CHI_AGGREGATE_OR_COPY(origin_ptr, replica_ptr)         \
-  chi::detail::aggregate_or_copy<typename std::remove_pointer< \
-      decltype((origin_ptr).ptr_)>::type>::call((origin_ptr), (replica_ptr))
 
 }  // namespace chi
 

@@ -79,11 +79,13 @@ void SystemInfo::RefreshCpuFreqKhz() {
 size_t SystemInfo::GetCpuFreqKhz(int cpu) {
 #if HSHM_IS_HOST
 #if HSHM_ENABLE_PROCFS_SYSINFO
-  // Read /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_cur_freq
-  std::string cpu_str = hshm::Formatter::format(
-      "/sys/devices/system/cpu/cpu{}/cpufreq/cpuinfo_cur_freq", cpu);
-  std::ifstream cpu_file(cpu_str);
-  size_t freq_khz;
+  // Read /sys/devices/system/cpu/cpuN/cpufreq/cpuinfo_cur_freq
+  // Use snprintf to build the path so MSan can track the buffer as initialized
+  char cpu_path[256];
+  snprintf(cpu_path, sizeof(cpu_path),
+           "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_cur_freq", cpu);
+  std::ifstream cpu_file(cpu_path);
+  size_t freq_khz = 0;
   cpu_file >> freq_khz;
   return freq_khz;
 #elif HSHM_ENABLE_WINDOWS_SYSINFO
@@ -97,11 +99,12 @@ size_t SystemInfo::GetCpuFreqKhz(int cpu) {
 size_t SystemInfo::GetCpuMaxFreqKhz(int cpu) {
 #if HSHM_IS_HOST
 #if HSHM_ENABLE_PROCFS_SYSINFO
-  // Read /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_cur_freq
-  std::string cpu_str = hshm::Formatter::format(
-      "/sys/devices/system/cpu/cpu{}/cpufreq/cpuinfo_max_freq", cpu);
-  std::ifstream cpu_file(cpu_str);
-  size_t freq_khz;
+  // Read /sys/devices/system/cpu/cpuN/cpufreq/cpuinfo_max_freq
+  char cpu_path[256];
+  snprintf(cpu_path, sizeof(cpu_path),
+           "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", cpu);
+  std::ifstream cpu_file(cpu_path);
+  size_t freq_khz = 0;
   cpu_file >> freq_khz;
   return freq_khz;
 #elif HSHM_ENABLE_WINDOWS_SYSINFO
@@ -290,6 +293,48 @@ size_t SystemInfo::GetRamCapacity() {
 #endif
 }
 
+size_t SystemInfo::GetRamAvailable() {
+#if HSHM_ENABLE_PROCFS_SYSINFO
+#ifdef __linux__
+  std::ifstream meminfo("/proc/meminfo");
+  if (!meminfo.is_open()) return 0;
+  std::string line;
+  while (std::getline(meminfo, line)) {
+    if (line.rfind("MemAvailable:", 0) == 0) {
+      size_t kb = 0;
+      std::sscanf(line.c_str(), "MemAvailable: %zu", &kb);
+      return kb * 1024;  // convert kB to bytes
+    }
+  }
+  return 0;
+#else
+  return 0;
+#endif
+#elif HSHM_ENABLE_WINDOWS_SYSINFO
+  MEMORYSTATUSEX mem_info;
+  mem_info.dwLength = sizeof(mem_info);
+  GlobalMemoryStatusEx(&mem_info);
+  return static_cast<size_t>(mem_info.ullAvailPhys);
+#else
+  return 0;
+#endif
+}
+
+CpuTimes SystemInfo::GetCpuTimes() {
+  CpuTimes ct = {};
+#if HSHM_ENABLE_PROCFS_SYSINFO
+#ifdef __linux__
+  std::ifstream stat("/proc/stat");
+  if (stat.is_open()) {
+    std::string cpu_label;
+    stat >> cpu_label >> ct.user >> ct.nice >> ct.system >> ct.idle
+         >> ct.iowait >> ct.irq >> ct.softirq >> ct.steal;
+  }
+#endif
+#endif
+  return ct;
+}
+
 void SystemInfo::YieldThread() {
 #if HSHM_ENABLE_PROCFS_SYSINFO
   sched_yield();
@@ -300,8 +345,11 @@ void SystemInfo::YieldThread() {
 
 bool SystemInfo::CreateTls(ThreadLocalKey &key, void *data) {
 #if HSHM_ENABLE_PROCFS_SYSINFO
-  key.pthread_key_ = pthread_key_create(&key.pthread_key_, nullptr);
-  return key.pthread_key_ == 0;
+  int ret = pthread_key_create(&key.pthread_key_, nullptr);
+  if (ret != 0) {
+    return false;
+  }
+  return SetTls(key, data);
 #elif HSHM_ENABLE_WINDOWS_SYSINFO
   key.windows_key_ = TlsAlloc();
   if (key.windows_key_ == TLS_OUT_OF_INDEXES) {

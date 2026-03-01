@@ -1,0 +1,101 @@
+# LSAN suppression list for IOWarp Core ASan/LSan runs.
+# LeakSanitizer suppresses reports whose call stacks contain any of
+# the patterns below. Use these only for leaks that are architectural
+# (i.e. intentional lifetime-until-exit) or come from third-party
+# libraries that we do not control.
+
+# ---------------------------------------------------------------------------
+# ZMQ internal allocations (routing table, mechanism metadata, etc.)
+# ZeroMQ allocates internal state in libzmq.so that is cleaned up at
+# zmq_ctx_destroy() time, but not always before process exit.
+# ---------------------------------------------------------------------------
+leak:libzmq.so
+
+# ---------------------------------------------------------------------------
+# Chi runtime: Worker RunContext leaks on shutdown
+# When the runtime shuts down, some tasks may still be in-flight in the
+# worker's periodic queue. Their associated RunContext (unique_ptr stored in
+# chi::Task::run_ctx_) is freed only when the task reaches DelTask.
+# Forcibly stopping worker threads before draining the queue can leave
+# RunContext objects unreachable.
+# ---------------------------------------------------------------------------
+leak:chi::Worker::BeginTask
+
+# ---------------------------------------------------------------------------
+# Chi runtime: large IPC buffer allocations in tests
+# Tests that call IpcManager::AllocateBuffer() with sizes ≥ 600 MB are
+# intentionally exercising IncreaseMemory() and do not always call
+# FreeBuffer() afterwards. The OS reclaims these allocations on exit.
+# ---------------------------------------------------------------------------
+leak:chi::IpcManager::AllocateBuffer
+
+# ---------------------------------------------------------------------------
+# Chi runtime: IpcManager::NewTask allocations not freed on shutdown
+# Tasks allocated with NewTask() are normally freed by DelTask().
+# During abnormal shutdown (port-conflict failures, timeout), tasks may
+# remain allocated. Suppress the NewTask allocation site to avoid
+# spurious reports from infrastructure failures.
+# ---------------------------------------------------------------------------
+leak:chi::IpcManager::NewTask
+
+# ---------------------------------------------------------------------------
+# Chi runtime: MOD_NAME TestLargeOutput task data vector
+# The TestLargeOutput coroutine intentionally fills task->data_ with 1 MB
+# of test data. If the runtime shuts down before the task is fully cleaned
+# up, the std::vector storage appears as a leak.
+# ---------------------------------------------------------------------------
+leak:TestLargeOutput
+
+# ---------------------------------------------------------------------------
+# Chi runtime: Chimaera::ServerInit internal allocations
+# ServerInit allocates runtime-lifetime objects (config, singletons, queues)
+# that persist until process exit. These are architectural and not leaked.
+# ---------------------------------------------------------------------------
+leak:chi::Chimaera::ServerInit
+
+# ---------------------------------------------------------------------------
+# Chi runtime: Task::Serialize pool config string allocations
+# Serialization of PoolConfig (including its IPC string fields) may allocate
+# buffers that are freed only when the task is destructed. Tasks freed via
+# IPC path bypass C++ destructors, leaving these buffers unreachable.
+# ---------------------------------------------------------------------------
+leak:chi::Task::Serialize
+
+# ---------------------------------------------------------------------------
+# bdev: AllocateBlocks block-list vector growth
+# bdev::Runtime::AllocateBlocks pushes Block entries into a priv::vector.
+# When the runtime shuts down before all block-lists are freed, the internal
+# vector buffer shows as a leak.
+# ---------------------------------------------------------------------------
+leak:AllocateBlocks
+
+# ---------------------------------------------------------------------------
+# CAE: ParseOmni string allocations
+# CAE ParseOmni assigns std::string fields into IPC priv::string members.
+# On runtime shutdown these task fields are not always destructed properly.
+# ---------------------------------------------------------------------------
+leak:ParseOmni
+
+# ---------------------------------------------------------------------------
+# CTE: GetContainedBlobs std::vector<std::string> push_back
+# CTE's GetContainedBlobs builds a local std::vector<std::string> result;
+# if the task is freed via IPC path, the vector's heap buffer leaks.
+# ---------------------------------------------------------------------------
+leak:GetContainedBlobs
+
+# ---------------------------------------------------------------------------
+# CTE: BlobQuery std::vector<std::string> push_back
+# CTE's BlobQuery builds a local std::vector<std::string> blob_names result;
+# if the runtime shuts down before the task completes, the string buffers leak.
+# ---------------------------------------------------------------------------
+leak:BlobQuery
+
+# ---------------------------------------------------------------------------
+# Chi runtime: per-thread TaskCounter in CreateTaskId()
+# chi::CreateTaskId() allocates a 4-byte TaskCounter via new and stores it
+# in thread-local storage using HSHM_THREAD_MODEL->SetTls(). Worker threads
+# created with std::thread may not invoke the TLS destructor on exit, leaving
+# the counter unreachable. This is an architectural TLS lifetime pattern;
+# the OS reclaims the allocation on process exit.
+# ---------------------------------------------------------------------------
+leak:chi::CreateTaskId

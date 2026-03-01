@@ -241,7 +241,7 @@ std::vector<TargetInfo> MaxBwDpe::SelectTargets(const std::vector<TargetInfo>& t
   // (when falling back to higher tiers, prefer lower-performing ones first)
   std::sort(high_score_targets.begin(), high_score_targets.end(),
             [&perf_comparator](const TargetInfo& a, const TargetInfo& b) {
-              return !perf_comparator(a, b);  // Reverse the comparison
+              return perf_comparator(b, a);  // Reverse by swapping arguments
             });
 
   // Build result: low_score targets first (preferred), then high_score (fallback)
