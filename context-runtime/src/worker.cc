@@ -797,6 +797,9 @@ void Worker::EndTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
 
   // Handle periodic task rescheduling
   if (is_periodic && can_resched) {
+    // Reset timer and prediction for next period
+    run_ctx->cpu_timer_.time_ns_ = 0;
+    run_ctx->predicted_load_ = 0;
     ReschedulePeriodicTask(run_ctx, task_ptr);
     return;
   }
