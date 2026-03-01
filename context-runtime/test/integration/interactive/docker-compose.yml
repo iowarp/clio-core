@@ -79,18 +79,18 @@ services:
 
         echo 'Node 1: Starting runtime in background...' &&
         /workspace/build/bin/chimaera runtime start &
-        RUNTIME_PID=\$! &&
-        sleep 10 &&
-
-        echo 'Node 1: Starting benchmark (200s, 16 threads)...' &&
-        /workspace/build/bin/wrp_run_thrpt_benchmark --test-case bdev_io --duration 200 --threads 16 --output-dir ram --verbose &
-        BENCH_PID=\$! &&
+        RUNTIME_PID=\$!;
+        sleep 5;
 
         echo 'Node 1: Starting dashboard on port 5000...' &&
         python3 -m context_visualizer --host 0.0.0.0 --port 5000 &
-        DASH_PID=\$! &&
+        DASH_PID=\$!;
 
-        echo 'Node 1: Runtime PID='\$RUNTIME_PID' Benchmark PID='\$BENCH_PID' Dashboard PID='\$DASH_PID &&
+        echo 'Node 1: Starting benchmark (200s, 16 threads)...' &&
+        /workspace/build/bin/wrp_run_thrpt_benchmark --test-case bdev_io --duration 200 --threads 16 --output-dir ram >/dev/null 2>&1 &
+        BENCH_PID=\$!;
+
+        echo 'Node 1: Runtime PID='\$RUNTIME_PID' Dashboard PID='\$DASH_PID' Benchmark PID='\$BENCH_PID;
         wait \$DASH_PID
       "
 
