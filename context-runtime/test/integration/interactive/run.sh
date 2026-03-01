@@ -1,7 +1,7 @@
 #!/bin/bash
 # Interactive Dashboard Cluster
 #
-# Starts a 4-node Chimaera runtime cluster in Docker with the dashboard
+# Starts a 8-node Chimaera runtime cluster in Docker with the dashboard
 # running on node 1. A local port-forward (socat) makes port 5000
 # available on this devcontainer so VS Code auto-forwards it to the host.
 #
@@ -126,7 +126,7 @@ stop_all() {
 
 case "${1:-foreground}" in
     start)
-        echo "Starting 4-node runtime cluster with dashboard..."
+        echo "Starting 8-node runtime cluster with dashboard..."
         docker compose up -d
 
         echo "Waiting for cluster to initialize..."
@@ -153,7 +153,7 @@ case "${1:-foreground}" in
         ;;
 
     foreground)
-        echo "Starting 4-node runtime cluster with dashboard..."
+        echo "Starting 8-node runtime cluster with dashboard..."
         docker compose up -d
 
         echo "Waiting for cluster to initialize..."

@@ -4,7 +4,7 @@
 # -- Networking ---------------------------------------------------------------
 networking:
   port: 9413
-  neighborhood_size: 32
+  neighborhood_size: 8
   hostfile: "/workspace/context-runtime/test/integration/interactive/hostfile"
   wait_for_restart: 30
   wait_for_restart_poll_period: 1

@@ -1,4 +1,4 @@
-# Interactive Dashboard Cluster -- 4-node Chimaera runtime cluster
+# Interactive Dashboard Cluster -- 8-node Chimaera runtime cluster
 #
 # The dashboard runs inside node 1 alongside the runtime.
 # run.sh forwards port 5000 from this devcontainer into the container
@@ -6,14 +6,48 @@
 #
 # Usage:  bash run.sh
 
+x-common-env: &common-env
+  CHI_SERVER_CONF: /workspace/context-runtime/test/integration/interactive/wrp_conf.yaml
+  CONTAINER_HOSTFILE: /workspace/context-runtime/test/integration/interactive/hostfile
+  CHI_WITH_RUNTIME: "0"
+  CHI_NUM_CONTAINERS: "8"
+  CHI_CLIENT_TRY_NEW_SERVERS: "16"
+  PATH: /home/iowarp/venv/bin:/workspace/build/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+  LD_LIBRARY_PATH: /workspace/build/bin
+
+x-common-node: &common-node
+  image: iowarp/deps-cpu:latest
+  init: true
+  stop_grace_period: 5s
+  security_opt:
+    - seccomp:unconfined
+  volumes:
+    - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-/workspace}}:/workspace:rw
+    - ssh-keys:/shared-ssh:ro
+  mem_limit: 16g
+  working_dir: /workspace
+
+x-worker-command: &worker-command >
+  "
+    echo \"Node $${NODE_ID}: Configuring SSH...\" &&
+    sudo mkdir -p /run/sshd &&
+    sudo ssh-keygen -A 2>/dev/null;
+    mkdir -p ~/.ssh &&
+    echo \"Node $${NODE_ID}: Waiting for node 1 SSH key...\" &&
+    while [ ! -f /shared-ssh/node1.pub ]; do sleep 0.5; done &&
+    cat /shared-ssh/node1.pub >> ~/.ssh/authorized_keys &&
+    chmod 600 ~/.ssh/authorized_keys &&
+    sudo /usr/sbin/sshd;
+
+    echo \"Node $${NODE_ID}: Starting runtime...\" &&
+    /workspace/build/bin/chimaera runtime start &
+    sleep infinity
+  "
+
 services:
-  # Node 1 - Runtime + dashboard + sshd
+  # Node 1 - Runtime + dashboard + benchmark + sshd
   iowarp-node1:
-    image: iowarp/deps-cpu:latest
-    init: true
-    stop_grace_period: 5s
-    security_opt:
-      - seccomp:unconfined
+    <<: *common-node
     container_name: iowarp-interactive-node1
     hostname: iowarp-node1
     networks:
@@ -23,18 +57,10 @@ services:
       - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-/workspace}}:/workspace:rw
       - ssh-keys:/shared-ssh:rw
     environment:
-      - NODE_ID=1
-      - NODE_IP=172.28.0.10
-      - CHI_SERVER_CONF=/workspace/context-runtime/test/integration/interactive/wrp_conf.yaml
-      - CONTAINER_HOSTFILE=/workspace/context-runtime/test/integration/interactive/hostfile
-      - CHI_WITH_RUNTIME=0
-      - CHI_NUM_CONTAINERS=4
-      - CHI_CLIENT_TRY_NEW_SERVERS=16
-      - PATH=/home/iowarp/venv/bin:/workspace/build/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-      - LD_LIBRARY_PATH=/workspace/build/bin
-      - PYTHONPATH=/workspace/build/bin:/workspace/context-visualizer
-    mem_limit: 16g
-    working_dir: /workspace
+      <<: *common-env
+      NODE_ID: "1"
+      NODE_IP: 172.28.0.10
+      PYTHONPATH: /workspace/build/bin:/workspace/context-visualizer
     entrypoint: ["/bin/bash", "-c"]
     command: >
       "
@@ -54,147 +80,126 @@ services:
         echo 'Node 1: Starting runtime in background...' &&
         /workspace/build/bin/chimaera runtime start &
         RUNTIME_PID=\$! &&
-        sleep 5 &&
+        sleep 10 &&
+
+        echo 'Node 1: Starting benchmark (200s, 16 threads)...' &&
+        /workspace/build/bin/wrp_run_thrpt_benchmark \
+          --test-case bdev_io --duration 200 --threads 16 \
+          --output-dir ram --verbose &
+        BENCH_PID=\$! &&
 
         echo 'Node 1: Starting dashboard on port 5000...' &&
         python3 -m context_visualizer --host 0.0.0.0 --port 5000 &
         DASH_PID=\$! &&
 
-        echo 'Node 1: Runtime PID='\$RUNTIME_PID' Dashboard PID='\$DASH_PID &&
+        echo 'Node 1: Runtime PID='\$RUNTIME_PID' Benchmark PID='\$BENCH_PID' Dashboard PID='\$DASH_PID &&
         wait \$DASH_PID
       "
 
-  # Node 2 - Runtime + sshd
+  # Node 2
   iowarp-node2:
-    image: iowarp/deps-cpu:latest
-    init: true
-    stop_grace_period: 5s
-    security_opt:
-      - seccomp:unconfined
+    <<: *common-node
     container_name: iowarp-interactive-node2
     hostname: iowarp-node2
     networks:
       interactive-cluster:
         ipv4_address: 172.28.0.11
-    volumes:
-      - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-/workspace}}:/workspace:rw
-      - ssh-keys:/shared-ssh:ro
     environment:
-      - NODE_ID=2
-      - NODE_IP=172.28.0.11
-      - CHI_SERVER_CONF=/workspace/context-runtime/test/integration/interactive/wrp_conf.yaml
-      - CONTAINER_HOSTFILE=/workspace/context-runtime/test/integration/interactive/hostfile
-      - CHI_WITH_RUNTIME=0
-      - CHI_NUM_CONTAINERS=4
-      - PATH=/home/iowarp/venv/bin:/workspace/build/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-      - LD_LIBRARY_PATH=/workspace/build/bin
-    mem_limit: 16g
-    working_dir: /workspace
+      <<: *common-env
+      NODE_ID: "2"
+      NODE_IP: 172.28.0.11
     entrypoint: ["/bin/bash", "-c"]
-    command: >
-      "
-        echo 'Node 2: Configuring SSH...' &&
-        sudo mkdir -p /run/sshd &&
-        sudo ssh-keygen -A 2>/dev/null;
-        mkdir -p ~/.ssh &&
-        echo 'Node 2: Waiting for node 1 SSH key...' &&
-        while [ ! -f /shared-ssh/node1.pub ]; do sleep 0.5; done &&
-        cat /shared-ssh/node1.pub >> ~/.ssh/authorized_keys &&
-        chmod 600 ~/.ssh/authorized_keys &&
-        sudo /usr/sbin/sshd;
+    command: *worker-command
 
-        echo 'Node 2: Starting runtime...' &&
-        /workspace/build/bin/chimaera runtime start &
-        sleep infinity
-      "
-
-  # Node 3 - Runtime + sshd
+  # Node 3
   iowarp-node3:
-    image: iowarp/deps-cpu:latest
-    init: true
-    stop_grace_period: 5s
-    security_opt:
-      - seccomp:unconfined
+    <<: *common-node
     container_name: iowarp-interactive-node3
     hostname: iowarp-node3
     networks:
       interactive-cluster:
         ipv4_address: 172.28.0.12
-    volumes:
-      - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-/workspace}}:/workspace:rw
-      - ssh-keys:/shared-ssh:ro
     environment:
-      - NODE_ID=3
-      - NODE_IP=172.28.0.12
-      - CHI_SERVER_CONF=/workspace/context-runtime/test/integration/interactive/wrp_conf.yaml
-      - CONTAINER_HOSTFILE=/workspace/context-runtime/test/integration/interactive/hostfile
-      - CHI_WITH_RUNTIME=0
-      - CHI_NUM_CONTAINERS=4
-      - PATH=/home/iowarp/venv/bin:/workspace/build/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-      - LD_LIBRARY_PATH=/workspace/build/bin
-    mem_limit: 16g
-    working_dir: /workspace
+      <<: *common-env
+      NODE_ID: "3"
+      NODE_IP: 172.28.0.12
     entrypoint: ["/bin/bash", "-c"]
-    command: >
-      "
-        echo 'Node 3: Configuring SSH...' &&
-        sudo mkdir -p /run/sshd &&
-        sudo ssh-keygen -A 2>/dev/null;
-        mkdir -p ~/.ssh &&
-        echo 'Node 3: Waiting for node 1 SSH key...' &&
-        while [ ! -f /shared-ssh/node1.pub ]; do sleep 0.5; done &&
-        cat /shared-ssh/node1.pub >> ~/.ssh/authorized_keys &&
-        chmod 600 ~/.ssh/authorized_keys &&
-        sudo /usr/sbin/sshd;
+    command: *worker-command
 
-        echo 'Node 3: Starting runtime...' &&
-        /workspace/build/bin/chimaera runtime start &
-        sleep infinity
-      "
-
-  # Node 4 - Runtime + sshd
+  # Node 4
   iowarp-node4:
-    image: iowarp/deps-cpu:latest
-    init: true
-    stop_grace_period: 5s
-    security_opt:
-      - seccomp:unconfined
+    <<: *common-node
     container_name: iowarp-interactive-node4
     hostname: iowarp-node4
     networks:
       interactive-cluster:
         ipv4_address: 172.28.0.13
-    volumes:
-      - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-/workspace}}:/workspace:rw
-      - ssh-keys:/shared-ssh:ro
     environment:
-      - NODE_ID=4
-      - NODE_IP=172.28.0.13
-      - CHI_SERVER_CONF=/workspace/context-runtime/test/integration/interactive/wrp_conf.yaml
-      - CONTAINER_HOSTFILE=/workspace/context-runtime/test/integration/interactive/hostfile
-      - CHI_WITH_RUNTIME=0
-      - CHI_NUM_CONTAINERS=4
-      - PATH=/home/iowarp/venv/bin:/workspace/build/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-      - LD_LIBRARY_PATH=/workspace/build/bin
-    mem_limit: 16g
-    working_dir: /workspace
+      <<: *common-env
+      NODE_ID: "4"
+      NODE_IP: 172.28.0.13
     entrypoint: ["/bin/bash", "-c"]
-    command: >
-      "
-        echo 'Node 4: Configuring SSH...' &&
-        sudo mkdir -p /run/sshd &&
-        sudo ssh-keygen -A 2>/dev/null;
-        mkdir -p ~/.ssh &&
-        echo 'Node 4: Waiting for node 1 SSH key...' &&
-        while [ ! -f /shared-ssh/node1.pub ]; do sleep 0.5; done &&
-        cat /shared-ssh/node1.pub >> ~/.ssh/authorized_keys &&
-        chmod 600 ~/.ssh/authorized_keys &&
-        sudo /usr/sbin/sshd;
+    command: *worker-command
 
-        echo 'Node 4: Starting runtime...' &&
-        /workspace/build/bin/chimaera runtime start &
-        sleep infinity
-      "
+  # Node 5
+  iowarp-node5:
+    <<: *common-node
+    container_name: iowarp-interactive-node5
+    hostname: iowarp-node5
+    networks:
+      interactive-cluster:
+        ipv4_address: 172.28.0.14
+    environment:
+      <<: *common-env
+      NODE_ID: "5"
+      NODE_IP: 172.28.0.14
+    entrypoint: ["/bin/bash", "-c"]
+    command: *worker-command
+
+  # Node 6
+  iowarp-node6:
+    <<: *common-node
+    container_name: iowarp-interactive-node6
+    hostname: iowarp-node6
+    networks:
+      interactive-cluster:
+        ipv4_address: 172.28.0.15
+    environment:
+      <<: *common-env
+      NODE_ID: "6"
+      NODE_IP: 172.28.0.15
+    entrypoint: ["/bin/bash", "-c"]
+    command: *worker-command
+
+  # Node 7
+  iowarp-node7:
+    <<: *common-node
+    container_name: iowarp-interactive-node7
+    hostname: iowarp-node7
+    networks:
+      interactive-cluster:
+        ipv4_address: 172.28.0.16
+    environment:
+      <<: *common-env
+      NODE_ID: "7"
+      NODE_IP: 172.28.0.16
+    entrypoint: ["/bin/bash", "-c"]
+    command: *worker-command
+
+  # Node 8
+  iowarp-node8:
+    <<: *common-node
+    container_name: iowarp-interactive-node8
+    hostname: iowarp-node8
+    networks:
+      interactive-cluster:
+        ipv4_address: 172.28.0.17
+    environment:
+      <<: *common-env
+      NODE_ID: "8"
+      NODE_IP: 172.28.0.17
+    entrypoint: ["/bin/bash", "-c"]
+    command: *worker-command
 
 volumes:
   ssh-keys:
