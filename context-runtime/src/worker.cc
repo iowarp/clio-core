@@ -69,6 +69,7 @@ Worker::Worker(u32 worker_id)
     : worker_id_(worker_id),
       is_running_(false),
       is_initialized_(false),
+      load_(0),
       did_work_(false),
       task_did_work_(false),
       current_run_context_(nullptr),
@@ -168,6 +169,7 @@ WorkerStats Worker::GetWorkerStats() const {
       (suspend_period < 0) ? 0 : static_cast<u32>(suspend_period);
 
   stats.num_tasks_processed_ = num_tasks_processed_;
+  stats.load_ = load_;
 
   return stats;
 }
@@ -691,13 +693,26 @@ void Worker::ExecTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
     run_ctx->container_ = exec_container;
   }
 
+  // Start CPU timer before execution
+  run_ctx->cpu_timer_.Resume();
+
   // Call appropriate coroutine function based on task state
   if (is_started) {
     ResumeCoroutine(task_ptr, run_ctx);
   } else {
     StartCoroutine(task_ptr, run_ctx);
     task_ptr->SetFlags(TASK_STARTED);
+
+    // Predict load for new tasks
+    if (run_ctx->container_) {
+      run_ctx->predicted_load_ = run_ctx->container_->InferModel(
+          task_ptr->method_, task_ptr.ptr_);
+      load_ += run_ctx->predicted_load_;
+    }
   }
+
+  // Pause CPU timer after execution
+  run_ctx->cpu_timer_.Pause();
 
   // For periodic tasks, only set task_did_work_ if the task reported
   // actual work done (e.g., received data, sent data). This prevents
@@ -766,6 +781,15 @@ void Worker::EndTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
 
   // Track completed tasks
   ++num_tasks_processed_;
+
+  // Subtract predicted load from worker
+  load_ -= run_ctx->predicted_load_;
+
+  // Reinforce model with actual CPU time
+  float actual_cpu_us = static_cast<float>(run_ctx->cpu_timer_.GetUsec());
+  container->ReinforceModel(
+      task_ptr->method_, run_ctx->predicted_load_, actual_cpu_us,
+      task_ptr->stat_.compute_);
 
   // Get task properties at the start
   bool is_remote = task_ptr->IsRemote();

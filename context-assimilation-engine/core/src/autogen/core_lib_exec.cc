@@ -25,6 +25,9 @@ void Runtime::Init(const chi::PoolId &pool_id, const std::string &pool_name,
 
   // Initialize the client for this ChiMod
   client_ = Client(pool_id);
+
+  // Initialize per-method load prediction model
+  DefineModel(Method::kMaxMethodId);
 }
 
 chi::TaskResume Runtime::Run(chi::u32 method, hipc::FullPtr<chi::Task> task_ptr, chi::RunContext& rctx) {

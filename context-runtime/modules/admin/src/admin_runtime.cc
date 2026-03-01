@@ -1264,6 +1264,8 @@ chi::TaskResume Runtime::Monitor(hipc::FullPtr<MonitorTask> task,
     MonitorSystemStats(task);
   } else if (task->query_ == "bdev_stats") {
     co_await MonitorBdevStats(task);
+  } else if (task->query_ == "container_stats") {
+    MonitorContainerStats(task);
   } else if (task->query_ == "get_host_info") {
     MonitorGetHostInfo(task);
   } else {
@@ -1296,7 +1298,7 @@ void Runtime::MonitorWorkerStats(hipc::FullPtr<MonitorTask> task) {
       continue;
     }
     chi::WorkerStats stats = worker->GetWorkerStats();
-    pk.pack_map(10);
+    pk.pack_map(11);
     pk.pack("worker_id");
     pk.pack(stats.worker_id_);
     pk.pack("is_running");
@@ -1317,6 +1319,75 @@ void Runtime::MonitorWorkerStats(hipc::FullPtr<MonitorTask> task) {
     pk.pack(stats.suspend_period_us_);
     pk.pack("num_tasks_processed");
     pk.pack(stats.num_tasks_processed_);
+    pk.pack("load");
+    pk.pack(stats.load_);
+  }
+
+  task->results_[container_id_] = std::string(sbuf.data(), sbuf.size());
+}
+
+void Runtime::MonitorContainerStats(hipc::FullPtr<MonitorTask> task) {
+  auto *pool_manager = CHI_POOL_MANAGER;
+  if (!pool_manager) {
+    task->SetReturnCode(1);
+    return;
+  }
+
+  msgpack::sbuffer sbuf;
+  msgpack::packer<msgpack::sbuffer> pk(sbuf);
+
+  auto pool_ids = pool_manager->GetAllPoolIds();
+  pk.pack_array(pool_ids.size());
+
+  for (const auto &pid : pool_ids) {
+    const auto *info = pool_manager->GetPoolInfo(pid);
+    if (!info) continue;
+
+    // Get the static container for model data
+    chi::Container *container = pool_manager->GetStaticContainer(pid);
+
+    pk.pack_map(6);
+
+    pk.pack("pool_id");
+    pk.pack(pid.ToString());
+
+    pk.pack("pool_name");
+    pk.pack(info->pool_name_);
+
+    pk.pack("chimod_name");
+    pk.pack(info->chimod_name_);
+
+    pk.pack("container_id");
+    pk.pack(container ? container->container_id_ : 0u);
+
+    // Model data: array of per-method entries
+    if (container) {
+      const auto &model = container->GetMethodModel();
+      const auto &mape = container->GetMethodMapeVec();
+      const auto &names = container->GetMethodNames();
+
+      pk.pack("methods");
+      pk.pack_array(model.size());
+      for (size_t i = 0; i < model.size(); ++i) {
+        pk.pack_map(4);
+        pk.pack("id");
+        pk.pack(static_cast<uint32_t>(i));
+        pk.pack("name");
+        pk.pack(i < names.size() ? names[i] : std::string());
+        pk.pack("coefficient");
+        pk.pack(model[i]);
+        pk.pack("mape");
+        pk.pack(i < mape.size() ? mape[i] : 0.0f);
+      }
+
+      pk.pack("learning_rate");
+      pk.pack(container->GetLearningRate());
+    } else {
+      pk.pack("methods");
+      pk.pack_array(0);
+      pk.pack("learning_rate");
+      pk.pack(0.0f);
+    }
   }
 
   task->results_[container_id_] = std::string(sbuf.data(), sbuf.size());

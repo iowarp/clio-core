@@ -77,6 +77,7 @@ struct WorkerStats {
   bool is_running_;          /**< Whether the worker is currently running */
   bool is_active_;           /**< Whether the worker's lane is currently active (processing tasks) */
   u32 worker_id_;            /**< Worker identifier */
+  float load_;               /**< Current estimated load in microseconds */
 
   /** Default constructor */
   WorkerStats()
@@ -89,20 +90,21 @@ struct WorkerStats {
         idle_iterations_(0),
         is_running_(false),
         is_active_(false),
-        worker_id_(0) {}
+        worker_id_(0),
+        load_(0) {}
 
   template <typename Archive>
   void save(Archive& ar) const {
     ar(num_tasks_processed_, num_queued_tasks_, num_blocked_tasks_,
        num_periodic_tasks_, num_retry_tasks_, suspend_period_us_,
-       idle_iterations_, is_running_, is_active_, worker_id_);
+       idle_iterations_, is_running_, is_active_, worker_id_, load_);
   }
 
   template <typename Archive>
   void load(Archive& ar) {
     ar(num_tasks_processed_, num_queued_tasks_, num_blocked_tasks_,
        num_periodic_tasks_, num_retry_tasks_, suspend_period_us_,
-       idle_iterations_, is_running_, is_active_, worker_id_);
+       idle_iterations_, is_running_, is_active_, worker_id_, load_);
   }
 };
 
@@ -415,6 +417,7 @@ class Worker {
   u32 worker_id_;
   bool is_running_;
   bool is_initialized_;
+  float load_;          // Estimated total CPU time (us) of active tasks
   bool did_work_;       // Tracks if any work was done in current loop iteration
   bool task_did_work_;  // Tracks if current task did actual work (set by tasks
                         // via CHI_CUR_WORKER)

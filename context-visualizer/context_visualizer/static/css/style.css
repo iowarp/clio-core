@@ -311,6 +311,79 @@ tr.row-idle { background: rgba(76, 175, 80, 0.08); }
     text-align: right;
 }
 
+/* Container cards */
+.container-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+    gap: 1rem;
+    margin-bottom: 1.5rem;
+}
+.container-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1.25rem;
+    cursor: pointer;
+    transition: border-color 0.2s;
+}
+.container-card:hover {
+    border-color: var(--accent-secondary);
+}
+.container-card.expanded {
+    border-color: var(--accent-secondary);
+}
+.container-card-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 0.5rem;
+}
+.container-pool-name {
+    font-weight: 700;
+    font-size: 0.95rem;
+}
+.container-chimod-badge {
+    display: inline-block;
+    padding: 0.15rem 0.5rem;
+    border-radius: 12px;
+    font-size: 0.7rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    background: rgba(83, 216, 251, 0.2);
+    color: var(--accent-secondary);
+}
+.container-meta {
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    margin-bottom: 0.5rem;
+}
+.container-detail {
+    display: none;
+    margin-top: 0.75rem;
+    padding-top: 0.75rem;
+    border-top: 1px solid var(--border);
+}
+.container-card.expanded .container-detail {
+    display: block;
+}
+.method-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.8rem;
+}
+.method-table th {
+    font-size: 0.7rem;
+    padding: 0.4rem 0.6rem;
+}
+.method-table td {
+    padding: 0.35rem 0.6rem;
+    border-bottom: 1px solid rgba(255,255,255,0.05);
+}
+.method-table tr:hover {
+    background: rgba(255,255,255,0.03);
+}
+
 /* BDev cards */
 .bdev-grid {
     display: grid;

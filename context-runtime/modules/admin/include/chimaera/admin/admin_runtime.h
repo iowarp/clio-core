@@ -248,6 +248,9 @@ public:
   /** Monitor sub-handler: collect per-worker statistics. */
   void MonitorWorkerStats(hipc::FullPtr<MonitorTask> task);
 
+  /** Monitor sub-handler: return per-container model statistics. */
+  void MonitorContainerStats(hipc::FullPtr<MonitorTask> task);
+
   /** Monitor sub-handler: delegate query to a specific pool. */
   chi::TaskResume MonitorPoolStats(hipc::FullPtr<MonitorTask> task);
 

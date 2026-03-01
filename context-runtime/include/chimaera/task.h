@@ -993,6 +993,8 @@ struct RunContext {
                                      queue additions */
   double true_period_ns_;       /**< Original period from task->period_ns_ */
   bool did_work_;               /**< Whether task did work in last execution */
+  hshm::CpuTimer cpu_timer_;   /**< Accumulates thread CPU time across yields */
+  float predicted_load_ = 0;   /**< Predicted CPU time from InferModel (us) */
 
   RunContext()
       : coro_handle_(nullptr),
@@ -1029,7 +1031,9 @@ struct RunContext {
         future_(std::move(other.future_)),
         is_notified_(other.is_notified_.load()),
         true_period_ns_(other.true_period_ns_),
-        did_work_(other.did_work_) {
+        did_work_(other.did_work_),
+        cpu_timer_(other.cpu_timer_),
+        predicted_load_(other.predicted_load_) {
     other.coro_handle_ = nullptr;
     other.event_queue_ = nullptr;
   }
@@ -1056,6 +1060,8 @@ struct RunContext {
       is_notified_.store(other.is_notified_.load());
       true_period_ns_ = other.true_period_ns_;
       did_work_ = other.did_work_;
+      cpu_timer_ = other.cpu_timer_;
+      predicted_load_ = other.predicted_load_;
       other.coro_handle_ = nullptr;
       other.event_queue_ = nullptr;
     }
@@ -1080,6 +1086,8 @@ struct RunContext {
     is_notified_.store(false);
     true_period_ns_ = 0.0;
     did_work_ = false;
+    cpu_timer_.time_ns_ = 0;
+    predicted_load_ = 0;
   }
 };
 
