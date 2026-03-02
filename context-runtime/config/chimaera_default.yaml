@@ -33,6 +33,7 @@ runtime:
   queue_depth: 1024                    # Task queue depth per worker
   local_sched: "default"               # Local task scheduler algorithm
   first_busy_wait: 10000               # Microseconds to busy-wait before sleeping (10ms)
+  learning_rate: 0.2                   # SGD learning rate for task load prediction model
 
 # -- Compose ------------------------------------------------------------------
 # Modules started automatically with the runtime.

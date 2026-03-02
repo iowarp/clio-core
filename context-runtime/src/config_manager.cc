@@ -192,6 +192,9 @@ void ConfigManager::LoadDefault() {
   // Set default worker sleep configuration (in microseconds)
   first_busy_wait_ = 50;               // 50us busy wait
   max_sleep_ = 50000;                  // 50000us (50ms) maximum sleep
+
+  // Set default task load prediction model learning rate
+  learning_rate_ = 0.2f;
 }
 
 void ConfigManager::ParseYAML(YAML::Node &yaml_conf) {
@@ -223,6 +226,11 @@ void ConfigManager::ParseYAML(YAML::Node &yaml_conf) {
     // Configuration directory for persistent runtime config
     if (runtime["conf_dir"]) {
       conf_dir_ = runtime["conf_dir"].as<std::string>();
+    }
+
+    // Task load prediction model learning rate
+    if (runtime["learning_rate"]) {
+      learning_rate_ = runtime["learning_rate"].as<float>();
     }
 
     // Note: stack_size parameter removed (was never used)

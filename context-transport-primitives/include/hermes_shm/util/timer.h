@@ -34,6 +34,8 @@
 #ifndef HSHM_TIMER_H
 #define HSHM_TIMER_H
 
+#include <time.h>
+
 #include <chrono>
 #include <functional>
 #include <vector>
@@ -152,6 +154,29 @@ typedef HighResMonotonicTimer Timer;
 typedef TimepointBase<std::chrono::high_resolution_clock> HighResCpuTimepoint;
 typedef TimepointBase<std::chrono::steady_clock> HighResMonotonicTimepoint;
 typedef HighResMonotonicTimepoint Timepoint;
+
+/** Timer that measures actual CPU time for the calling thread */
+class CpuTimer {
+ public:
+  double time_ns_ = 0;
+  struct timespec start_{0, 0};
+
+  HSHM_INLINE_CROSS_FUN void Resume() {
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &start_);
+  }
+  HSHM_INLINE_CROSS_FUN double Pause() {
+    struct timespec end;
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &end);
+    time_ns_ += (end.tv_sec - start_.tv_sec) * 1e9
+              + (end.tv_nsec - start_.tv_nsec);
+    return time_ns_;
+  }
+  HSHM_INLINE_CROSS_FUN void Reset() { time_ns_ = 0; Resume(); }
+  HSHM_INLINE_CROSS_FUN double GetNsec() const { return time_ns_; }
+  HSHM_INLINE_CROSS_FUN double GetUsec() const { return time_ns_ / 1000; }
+  HSHM_INLINE_CROSS_FUN double GetMsec() const { return time_ns_ / 1e6; }
+  HSHM_INLINE_CROSS_FUN double GetSec() const { return time_ns_ / 1e9; }
+};
 
 template <int IDX>
 class PeriodicRun {

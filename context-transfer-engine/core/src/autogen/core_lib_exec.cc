@@ -25,6 +25,10 @@ void Runtime::Init(const chi::PoolId &pool_id, const std::string &pool_name,
 
   // Initialize the client for this ChiMod
   client_ = Client(pool_id);
+
+  // Initialize per-method load prediction model
+  DefineModel(Method::kMaxMethodId);
+  SetMethodNames(Method::GetMethodNames());
 }
 
 void Runtime::Restart(const chi::PoolId &pool_id, const std::string &pool_name,

@@ -573,7 +573,6 @@ struct SendTask : public chi::Task {
     method_ = Method::kSend;
     task_flags_.Clear();
     pool_query_ = pool_query;
-    stat_.io_size_ = 1024 * 1024;  // 1MB
     task_group_ = chi::TaskGroup(0);  // Network tasks in affinity group 0
   }
 
@@ -643,7 +642,6 @@ struct RecvTask : public chi::Task {
     method_ = Method::kRecv;
     task_flags_.Clear();
     pool_query_ = pool_query;
-    stat_.io_size_ = 1024 * 1024;  // 1MB
     task_group_ = chi::TaskGroup(0);  // Network tasks in affinity group 0
   }
 

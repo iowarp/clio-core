@@ -236,6 +236,12 @@ class ConfigManager : public hshm::BaseConfig {
    */
   u32 GetMaxSleep() const { return max_sleep_; }
 
+  /**
+   * Get SGD learning rate for task load prediction model
+   * @return Learning rate (default: 0.2)
+   */
+  float GetLearningRate() const { return learning_rate_; }
+
  private:
   /**
    * Set default configuration values (implements hshm::BaseConfig)
@@ -278,6 +284,9 @@ class ConfigManager : public hshm::BaseConfig {
   // Worker sleep configuration (in microseconds)
   u32 first_busy_wait_ = 10000;              // Default: 10000us (10ms) busy wait
   u32 max_sleep_ = 50000;                    // Default: 50000us (50ms) maximum sleep
+
+  // Task load prediction model
+  float learning_rate_ = 0.2f;               // Default: 0.2 SGD learning rate
 
   // Compose configuration
   ComposeConfig compose_config_;

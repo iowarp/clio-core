@@ -217,6 +217,16 @@ def get_bdev_stats_for_node(node_id):
     return _monitor(f"physical:{node_id}", "bdev_stats")
 
 
+def get_container_stats(pool_query="local"):
+    """Query container_stats from the admin pool."""
+    return _monitor(pool_query, "container_stats")
+
+
+def get_container_stats_for_node(node_id):
+    """Query container_stats for a specific node."""
+    return _monitor(f"physical:{node_id}", "container_stats")
+
+
 def get_host_info(node_id):
     """Query host info (hostname, ip_address, node_id) for a specific node."""
     decoded = _monitor(f"physical:{node_id}", "get_host_info")
