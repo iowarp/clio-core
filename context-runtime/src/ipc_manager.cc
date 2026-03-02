@@ -1722,8 +1722,8 @@ bool IpcManager::GetIsClientThread() const {
 bool IpcManager::IsServerAlive() const {
   if (!zmq_transport_) return false;
   hshm::lbm::LbmContext ctx;
-  if (ipc_mode_ == IpcMode::kShm && shared_header_) {
-    ctx.server_pid_ = static_cast<int>(shared_header_->runtime_pid);
+  if (ipc_mode_ == IpcMode::kShm) {
+    ctx.server_pid_ = static_cast<int>(runtime_pid_);
   }
   return zmq_transport_->IsServerAlive(ctx);
 }
@@ -1794,7 +1794,7 @@ bool IpcManager::ReconnectToNewHost(const std::string &new_addr) {
   shm_send_transport_.reset();
   shm_recv_transport_.reset();
   main_allocator_ = nullptr;
-  shared_header_ = nullptr;
+  runtime_pid_ = 0;
 
   // Create new ZMQ DEALER transport
   try {

@@ -124,8 +124,6 @@ typedef u32 min_u32;
 typedef u64 min_u64;
 #endif
 
-/** A custom definition of size_t compatible with cuda */
-typedef std::conditional<sizeof(size_t) == 8, min_u64, min_u32>::type size_t;
 
 template <typename T>
 class Unit {

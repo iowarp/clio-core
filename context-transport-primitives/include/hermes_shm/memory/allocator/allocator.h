@@ -74,7 +74,7 @@ struct ShmPtrBase;
  * Allocators inherit from this.
  * */
 struct AllocatorHeader {
-  hipc::atomic<hshm::size_t> total_alloc_;
+  hipc::atomic<hshm::big_uint> total_alloc_;
 
   AllocatorHeader() = default;
 
@@ -82,21 +82,21 @@ struct AllocatorHeader {
   void Configure() { total_alloc_ = 0; }
 
   HSHM_INLINE_CROSS_FUN
-  void AddSize(hshm::size_t size) {
+  void AddSize(hshm::big_uint size) {
 #ifdef HSHM_ALLOC_TRACK_SIZE
     total_alloc_ += size;
 #endif
   }
 
   HSHM_INLINE_CROSS_FUN
-  void SubSize(hshm::size_t size) {
+  void SubSize(hshm::big_uint size) {
 #ifdef HSHM_ALLOC_TRACK_SIZE
     total_alloc_ -= size;
 #endif
   }
 
   HSHM_INLINE_CROSS_FUN
-  hshm::size_t GetCurrentlyAllocatedSize() { return total_alloc_.load(); }
+  hshm::big_uint GetCurrentlyAllocatedSize() { return total_alloc_.load(); }
 };
 
 /** The allocator information struct */
@@ -368,7 +368,7 @@ class Allocator {
  * */
 template <typename T, bool ATOMIC>
 struct OffsetPtrBase : public ShmPointer {
-  hipc::opt_atomic<hshm::size_t, ATOMIC>
+  hipc::opt_atomic<hshm::big_uint, ATOMIC>
       off_; /**< Offset within the allocator's slot */
 
   /** Serialize an hipc::OffsetPtrBase */
@@ -391,7 +391,7 @@ struct OffsetPtrBase : public ShmPointer {
 
   /** Full constructor */
   HSHM_INLINE_CROSS_FUN explicit OffsetPtrBase(
-      hipc::opt_atomic<hshm::size_t, ATOMIC> off)
+      hipc::opt_atomic<hshm::big_uint, ATOMIC> off)
       : off_(off.load()) {}
 
   /** Copy constructor from different type */

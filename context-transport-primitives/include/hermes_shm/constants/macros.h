@@ -150,22 +150,21 @@
 #endif
 
 /** Error checking for ROCM */
-#define HIP_ERROR_CHECK(X)                                                  \
-  do {                                                                      \
-    if (X != hipSuccess) {                                                  \
-      hipError_t hipErr = hipGetLastError();                                \
+#define HIP_ERROR_CHECK(X)                                                 \
+  do {                                                                     \
+    if (X != hipSuccess) {                                                 \
+      hipError_t hipErr = hipGetLastError();                               \
       HLOG(kFatal, "HIP Error {}: {}", hipErr, hipGetErrorString(hipErr)); \
-    }                                                                       \
+    }                                                                      \
   } while (false)
 
 /** Error checking for CUDA */
-#define CUDA_ERROR_CHECK(X)                       \
-  do {                                            \
-    if (X != cudaSuccess) {                       \
-      cudaError_t cudaErr = cudaGetLastError();   \
-      HLOG(kFatal, "CUDA Error {}: {}", cudaErr, \
-            cudaGetErrorString(cudaErr));         \
-    }                                             \
+#define CUDA_ERROR_CHECK(X)                                                    \
+  do {                                                                         \
+    if (X != cudaSuccess) {                                                    \
+      cudaError_t cudaErr = cudaGetLastError();                                \
+      HLOG(kFatal, "CUDA Error {}: {}", cudaErr, cudaGetErrorString(cudaErr)); \
+    }                                                                          \
   } while (false)
 
 /**
