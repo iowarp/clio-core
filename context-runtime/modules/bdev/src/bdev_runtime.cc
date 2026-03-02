@@ -341,6 +341,21 @@ WorkerIOContext *Runtime::GetWorkerIOContext(size_t worker_id) {
   return ctx;
 }
 
+chi::TaskStat Runtime::GetTaskStats(chi::u32 method_id) const {
+  switch (method_id) {
+    case Method::kWrite:
+    case Method::kRead: {
+      chi::TaskStat stat;
+      stat.io_size_ = 1024 * 1024;
+      // wall_time = aligned pages / 500 MB/s
+      size_t aligned = ((stat.io_size_ + 4095) / 4096) * 4096;
+      stat.wall_time_ = static_cast<float>(aligned) / 500.0f;
+      return stat;
+    }
+    default: return chi::TaskStat();
+  }
+}
+
 chi::TaskResume Runtime::Create(hipc::FullPtr<CreateTask> task,
                                 chi::RunContext &ctx) {
   // Get the creation parameters
@@ -763,8 +778,20 @@ chi::TaskResume Runtime::ReadFromFile(hipc::FullPtr<ReadTask> task,
 
 chi::TaskResume Runtime::GetStats(hipc::FullPtr<GetStatsTask> task,
                                   chi::RunContext &ctx) {
-  // Return the user-provided performance characteristics
-  task->metrics_ = perf_metrics_;
+  // Predict wall time from learned model
+  chi::TaskStat read_stat = GetTaskStats(Method::kRead);
+  chi::TaskStat write_stat = GetTaskStats(Method::kWrite);
+  float read_wall_us = InferWallClockTime(Method::kRead, read_stat);
+  float write_wall_us = InferWallClockTime(Method::kWrite, write_stat);
+  double read_size_mb = static_cast<double>(read_stat.io_size_) / (1024.0 * 1024.0);
+  double write_size_mb = static_cast<double>(write_stat.io_size_) / (1024.0 * 1024.0);
+  task->metrics_.read_bandwidth_mbps_ = (read_wall_us > 0)
+      ? read_size_mb / (read_wall_us * 1e-6) : perf_metrics_.read_bandwidth_mbps_;
+  task->metrics_.write_bandwidth_mbps_ = (write_wall_us > 0)
+      ? write_size_mb / (write_wall_us * 1e-6) : perf_metrics_.write_bandwidth_mbps_;
+  task->metrics_.read_latency_us_ = read_wall_us;
+  task->metrics_.write_latency_us_ = write_wall_us;
+  task->metrics_.iops_ = perf_metrics_.iops_;
   // Get remaining size from heap allocator
   chi::u64 remaining = heap_.GetRemainingSize();
   task->remaining_size_ = remaining;
@@ -953,6 +980,18 @@ chi::TaskResume Runtime::Monitor(hipc::FullPtr<MonitorTask> task,
                                  chi::RunContext &rctx) {
   (void)rctx;
   if (task->query_ == "stats") {
+    // Predict wall time from learned model
+    chi::TaskStat read_stat = GetTaskStats(Method::kRead);
+    chi::TaskStat write_stat = GetTaskStats(Method::kWrite);
+    float read_wall_us = InferWallClockTime(Method::kRead, read_stat);
+    float write_wall_us = InferWallClockTime(Method::kWrite, write_stat);
+    double read_size_mb = static_cast<double>(read_stat.io_size_) / (1024.0 * 1024.0);
+    double write_size_mb = static_cast<double>(write_stat.io_size_) / (1024.0 * 1024.0);
+    double read_bw = (read_wall_us > 0)
+        ? read_size_mb / (read_wall_us * 1e-6) : perf_metrics_.read_bandwidth_mbps_;
+    double write_bw = (write_wall_us > 0)
+        ? write_size_mb / (write_wall_us * 1e-6) : perf_metrics_.write_bandwidth_mbps_;
+
     msgpack::sbuffer sbuf;
     msgpack::packer<msgpack::sbuffer> pk(sbuf);
 
@@ -961,10 +1000,10 @@ chi::TaskResume Runtime::Monitor(hipc::FullPtr<MonitorTask> task,
     pk.pack("bdev_type");              pk.pack(static_cast<chi::u32>(bdev_type_));
     pk.pack("total_capacity");         pk.pack(file_size_);
     pk.pack("remaining_capacity");     pk.pack(heap_.GetRemainingSize());
-    pk.pack("read_bandwidth_mbps");    pk.pack(perf_metrics_.read_bandwidth_mbps_);
-    pk.pack("write_bandwidth_mbps");   pk.pack(perf_metrics_.write_bandwidth_mbps_);
-    pk.pack("read_latency_us");        pk.pack(perf_metrics_.read_latency_us_);
-    pk.pack("write_latency_us");       pk.pack(perf_metrics_.write_latency_us_);
+    pk.pack("read_bandwidth_mbps");    pk.pack(read_bw);
+    pk.pack("write_bandwidth_mbps");   pk.pack(write_bw);
+    pk.pack("read_latency_us");        pk.pack(static_cast<double>(read_wall_us));
+    pk.pack("write_latency_us");       pk.pack(static_cast<double>(write_wall_us));
     pk.pack("iops");                   pk.pack(perf_metrics_.iops_);
     pk.pack("total_reads");            pk.pack(total_reads_.load());
     pk.pack("total_writes");           pk.pack(total_writes_.load());

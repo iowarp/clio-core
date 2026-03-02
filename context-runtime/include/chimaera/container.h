@@ -103,8 +103,10 @@ class Container {
 
  protected:
   PoolQuery pool_query_;
-  std::vector<float> method_model_;  ///< Per-method coefficient: predicted_us = a * compute
-  std::vector<float> method_mape_;   ///< Per-method MAPE (exponential moving average)
+  std::vector<float> method_model_;  ///< Per-method CPU coefficient: predicted_us = a * compute
+  std::vector<float> method_mape_;   ///< Per-method CPU MAPE (exponential moving average)
+  std::vector<float> method_model_wall_;  ///< Per-method wall clock coefficient "b"
+  std::vector<float> method_mape_wall_;   ///< Per-method wall clock MAPE
   std::vector<std::string> method_names_;  ///< Per-method human-readable names
   float learning_rate_ = 0.2f;      ///< SGD learning rate for model updates
 
@@ -142,6 +144,8 @@ class Container {
   virtual void DefineModel(u32 max_method_id) {
     method_model_.resize(max_method_id, 1.0f);
     method_mape_.resize(max_method_id, 0.0f);
+    method_model_wall_.resize(max_method_id, 1.0f);
+    method_mape_wall_.resize(max_method_id, 0.0f);
     auto *config = CHI_CONFIG_MANAGER;
     if (config) {
       learning_rate_ = config->GetLearningRate();
@@ -158,15 +162,25 @@ class Container {
   }
 
   /**
-   * Predict CPU time for a task using the linear model.
-   * Formula: predicted_us = a * (compute + 1).
-   * The +1 ensures non-zero predictions even when compute is unset.
+   * Get live task statistics for a method.
+   * Override in modules to provide dynamic stats (e.g., queue depth).
+   * Default returns zeros.
+   * @param method_id Method to query
+   * @return TaskStat with current compute/io_size values
+   */
+  virtual TaskStat GetTaskStats(u32 method_id) const {
+    (void)method_id;
+    return TaskStat();
+  }
+
+  /**
+   * Predict CPU time: a * (compute + 1).
    * @param method_id Method being executed
-   * @param task Task with stat_.compute_ set
+   * @param stat Task statistics from GetTaskStats()
    * @return Predicted CPU time in microseconds
    */
-  float InferModel(u32 method_id, const Task* task) const {
-    float x = static_cast<float>(task->stat_.compute_) + 1.0f;
+  float InferCpuTime(u32 method_id, const TaskStat &stat) {
+    float x = static_cast<float>(stat.compute_) + 1.0f;
     if (method_id < method_model_.size()) {
       return method_model_[method_id] * x;
     }
@@ -174,25 +188,50 @@ class Container {
   }
 
   /**
-   * Update model coefficient and MAPE after task completion.
-   * Uses x = compute + 1 to match InferModel formula.
-   * Coefficient SGD: a' <- a - LR * (e / x), where e = predicted - real.
-   * MAPE EMA: mape' <- (1 - LR) * mape + LR * |predicted - real| / real.
-   * @param method_id Method that was executed
-   * @param predicted Predicted CPU time from InferModel
-   * @param real Actual CPU time measured by CpuTimer
-   * @param compute Task's stat_.compute_ value
+   * Predict wall clock time: b * (wall_time + 1).
+   * @param method_id Method being executed
+   * @param stat Task statistics from GetTaskStats()
+   * @return Predicted wall clock time in microseconds
    */
-  void ReinforceModel(u32 method_id, float predicted, float real, size_t compute) {
+  float InferWallClockTime(u32 method_id, const TaskStat &stat) {
+    float x = stat.wall_time_ + 1.0f;
+    if (method_id < method_model_wall_.size()) {
+      return method_model_wall_[method_id] * x;
+    }
+    return x;
+  }
+
+  /**
+   * Update CPU model coefficient after task completion.
+   * SGD: a' <- a - LR * (e / x), where e = predicted - real.
+   */
+  void ReinforceCpuModel(u32 method_id, float pred_cpu, float real_cpu,
+                         const TaskStat &stat) {
     if (method_id >= method_model_.size()) return;
-    float x = static_cast<float>(compute) + 1.0f;
-    float e = predicted - real;
+    float x = static_cast<float>(stat.compute_) + 1.0f;
+    float e = pred_cpu - real_cpu;
     method_model_[method_id] -= learning_rate_ * (e / x);
-    // Update MAPE with exponential moving average
-    if (real > 0) {
-      float ape = std::abs(e) / real;
+    if (real_cpu > 0) {
+      float ape = std::abs(e) / real_cpu;
       method_mape_[method_id] = (1.0f - learning_rate_) * method_mape_[method_id]
                                + learning_rate_ * ape;
+    }
+  }
+
+  /**
+   * Update wall clock model coefficient after task completion.
+   * SGD: b' <- b - LR * (e / x), where e = predicted - real.
+   */
+  void ReinforceWallModel(u32 method_id, float pred_wall, float real_wall,
+                          const TaskStat &stat) {
+    if (method_id >= method_model_wall_.size()) return;
+    float x = stat.wall_time_ + 1.0f;
+    float e = pred_wall - real_wall;
+    method_model_wall_[method_id] -= learning_rate_ * (e / x);
+    if (real_wall > 0) {
+      float ape = std::abs(e) / real_wall;
+      method_mape_wall_[method_id] = (1.0f - learning_rate_) * method_mape_wall_[method_id]
+                                    + learning_rate_ * ape;
     }
   }
 
@@ -210,6 +249,8 @@ class Container {
 
   const std::vector<float>& GetMethodModel() const { return method_model_; }
   const std::vector<float>& GetMethodMapeVec() const { return method_mape_; }
+  const std::vector<float>& GetMethodModelWall() const { return method_model_wall_; }
+  const std::vector<float>& GetMethodMapeWallVec() const { return method_mape_wall_; }
   const std::vector<std::string>& GetMethodNames() const { return method_names_; }
   float GetLearningRate() const { return learning_rate_; }
 

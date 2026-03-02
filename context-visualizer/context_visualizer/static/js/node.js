@@ -138,7 +138,7 @@
 
     function formatBytes(bytes) {
         if (bytes === 0) return "0 B";
-        var units = ["B", "KB", "MB", "GB", "TB"];
+        var units = ["B", "K", "M", "G", "T"];
         var i = Math.floor(Math.log(bytes) / Math.log(1024));
         return (bytes / Math.pow(1024, i)).toFixed(1) + " " + units[i];
     }
@@ -328,6 +328,7 @@
 
     // ---- Poll Container Stats ----
     var expandedContainers = {};  // track which containers are expanded by pool_id
+    var modelMode = "cpu";  // "cpu" or "wall"
 
     function pollContainerStats() {
         fetch("/api/node/" + NODE_ID + "/container_stats")
@@ -374,18 +375,22 @@
                     // Build method table
                     var tableHtml = '<div class="container-detail">';
                     if (activeMethods.length > 0) {
+                        var coeffLabel = modelMode === "wall" ? "Wall Coeff" : "CPU Coeff";
+                        var mapeLabel = modelMode === "wall" ? "Wall MAPE" : "CPU MAPE";
                         tableHtml += '<table class="method-table"><thead><tr>' +
-                            '<th>ID</th><th>Method</th><th>Coefficient</th><th>MAPE</th>' +
+                            '<th>ID</th><th>Method</th><th>' + coeffLabel + '</th><th>' + mapeLabel + '</th>' +
                             '</tr></thead><tbody>';
                         activeMethods.forEach(function (m) {
-                            var mapeColor = (m.mape || 0) > 0.5 ? "var(--accent)" :
-                                            (m.mape || 0) > 0.2 ? "var(--warning)" : "var(--success)";
+                            var coeff = modelMode === "wall" ? (m.wall_coefficient || 0) : (m.coefficient || 0);
+                            var mape = modelMode === "wall" ? (m.wall_mape || 0) : (m.mape || 0);
+                            var mapeColor = mape > 0.5 ? "var(--accent)" :
+                                            mape > 0.2 ? "var(--warning)" : "var(--success)";
                             tableHtml += '<tr>' +
                                 '<td>' + m.id + '</td>' +
                                 '<td>' + (m.name || "?") + '</td>' +
-                                '<td>' + (m.coefficient || 0).toFixed(4) + '</td>' +
+                                '<td>' + coeff.toFixed(4) + '</td>' +
                                 '<td style="color:' + mapeColor + '">' +
-                                    ((m.mape || 0) * 100).toFixed(1) + '%</td>' +
+                                    (mape * 100).toFixed(1) + '%</td>' +
                                 '</tr>';
                         });
                         tableHtml += '</tbody></table>';
@@ -427,6 +432,22 @@
         ramChart = makeChart("ramChart");
         gpuChart = makeChart("gpuChart");
         hbmChart = makeChart("hbmChart");
+
+        // Wire up CPU / Wall toggle buttons
+        var toggleGroup = document.getElementById("modelToggle");
+        if (toggleGroup) {
+            toggleGroup.addEventListener("click", function (e) {
+                var btn = e.target.closest(".toggle-btn");
+                if (!btn) return;
+                var mode = btn.getAttribute("data-mode");
+                if (mode === modelMode) return;
+                modelMode = mode;
+                toggleGroup.querySelectorAll(".toggle-btn").forEach(function (b) {
+                    b.classList.toggle("active", b === btn);
+                });
+                pollContainerStats();
+            });
+        }
 
         pollAll();
         setInterval(pollAll, POLL_MS);

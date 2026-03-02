@@ -350,6 +350,12 @@ public:
   void RecvOut(hipc::FullPtr<RecvTask> task, chi::LoadTaskArchive& archive, hshm::lbm::Transport* lbm_transport);
 
   /**
+   * Get live task statistics per method.
+   * For network methods, compute = total queue depth across priorities.
+   */
+  chi::TaskStat GetTaskStats(chi::u32 method_id) const override;
+
+  /**
    * Get remaining work count for this admin container
    * Admin container typically has no pending work, returns 0
    */

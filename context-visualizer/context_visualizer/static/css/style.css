@@ -504,6 +504,42 @@ tr.row-idle { background: rgba(76, 175, 80, 0.08); }
     font-size: 0.95rem;
 }
 
+/* Section header with inline toggle */
+.section-header {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    margin-bottom: 0.75rem;
+}
+.section-header h2 {
+    margin-bottom: 0;
+}
+.toggle-group {
+    display: flex;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    overflow: hidden;
+}
+.toggle-btn {
+    padding: 0.25rem 0.7rem;
+    font-size: 0.7rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    background: transparent;
+    color: var(--text-muted);
+    border: none;
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s;
+}
+.toggle-btn + .toggle-btn {
+    border-left: 1px solid var(--border);
+}
+.toggle-btn.active {
+    background: var(--accent-secondary);
+    color: var(--bg);
+}
+
 /* GPU sections (shown/hidden via JS) */
 .gpu-section {
     /* Just a marker class for JS toggle; no special style needed */

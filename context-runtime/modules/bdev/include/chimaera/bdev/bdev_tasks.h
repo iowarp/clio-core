@@ -434,7 +434,6 @@ struct WriteTask : public chi::Task {
     method_ = Method::kWrite;
     task_flags_.Clear();
     pool_query_ = pool_query;
-    stat_.io_size_ = length;
   }
 
   /** Destructor - free buffer if TASK_DATA_OWNER is set */
@@ -515,7 +514,6 @@ struct ReadTask : public chi::Task {
     method_ = Method::kRead;
     task_flags_.Clear();
     pool_query_ = pool_query;
-    stat_.io_size_ = length;
   }
 
   /** Destructor - free buffer if TASK_DATA_OWNER is set */

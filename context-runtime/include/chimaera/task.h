@@ -111,8 +111,9 @@ struct TaskGroup {
  * the individual task) and are used to route all group tasks consistently.
  */
 struct TaskStat {
-  size_t io_size_{0}; /**< I/O size in bytes */
-  size_t compute_{0}; /**< Normalized compute time in microseconds */
+  size_t io_size_{0};    /**< I/O size in bytes */
+  size_t compute_{0};    /**< Normalized compute time in microseconds */
+  float wall_time_{0};   /**< Normalized wall time input for InferWallClockTime */
 };
 
 // Define macros for container template
@@ -142,7 +143,6 @@ class Task {
       return_code_; /**< Task return code (0=success, non-zero=error) */
   OUT hipc::atomic<ContainerId>
       completer_; /**< Container ID that completed this task */
-  TaskStat stat_;        /**< Task statistics for I/O and compute tracking */
   TaskGroup task_group_; /**< Scheduling affinity group (null = no affinity) */
 
   /**
@@ -194,7 +194,6 @@ class Task {
     // The RunContext will be initialized when the task is executed
     return_code_.store(other->return_code_.load());
     completer_.store(other->completer_.load());
-    stat_ = other->stat_;
     task_group_ = other->task_group_;
   }
 
@@ -213,8 +212,6 @@ class Task {
 #endif
     return_code_.store(0);  // Initialize as success
     completer_.store(0);    // Initialize as null (0 is invalid container ID)
-    stat_.io_size_ = 0;
-    stat_.compute_ = 0;
     task_group_ = TaskGroup();  // null group
   }
 
@@ -406,13 +403,6 @@ class Task {
     HLOG(kDebug, "[COMPLETER] Aggregated task {} with completer {}", task_id_,
          GetCompleter());
   }
-
-  /**
-   * Estimate CPU time for this task based on I/O size and compute time
-   * Formula: (io_size / 4GBps) + compute + 5us
-   * @return Estimated CPU time in microseconds
-   */
-  HSHM_CROSS_FUN size_t EstCpuTime() const;
 
   /**
    * Get the copy space size for serialized task output
@@ -995,6 +985,9 @@ struct RunContext {
   bool did_work_;               /**< Whether task did work in last execution */
   hshm::CpuTimer cpu_timer_;   /**< Accumulates thread CPU time across yields */
   float predicted_load_ = 0;   /**< Predicted CPU time from InferModel (us) */
+  hshm::HighResMonotonicTimer wall_timer_;  /**< Wall clock time across yields */
+  float predicted_wall_us_ = 0;  /**< Predicted wall time from InferWallClockTime */
+  TaskStat predicted_stat_;      /**< TaskStat used for prediction (for reinforcement) */
 
   RunContext()
       : coro_handle_(nullptr),
@@ -1033,7 +1026,10 @@ struct RunContext {
         true_period_ns_(other.true_period_ns_),
         did_work_(other.did_work_),
         cpu_timer_(other.cpu_timer_),
-        predicted_load_(other.predicted_load_) {
+        predicted_load_(other.predicted_load_),
+        wall_timer_(other.wall_timer_),
+        predicted_wall_us_(other.predicted_wall_us_),
+        predicted_stat_(other.predicted_stat_) {
     other.coro_handle_ = nullptr;
     other.event_queue_ = nullptr;
   }
@@ -1062,6 +1058,9 @@ struct RunContext {
       did_work_ = other.did_work_;
       cpu_timer_ = other.cpu_timer_;
       predicted_load_ = other.predicted_load_;
+      wall_timer_ = other.wall_timer_;
+      predicted_wall_us_ = other.predicted_wall_us_;
+      predicted_stat_ = other.predicted_stat_;
       other.coro_handle_ = nullptr;
       other.event_queue_ = nullptr;
     }
@@ -1088,6 +1087,9 @@ struct RunContext {
     did_work_ = false;
     cpu_timer_.time_ns_ = 0;
     predicted_load_ = 0;
+    wall_timer_.time_ns_ = 0;
+    predicted_wall_us_ = 0;
+    predicted_stat_ = TaskStat();
   }
 };
 

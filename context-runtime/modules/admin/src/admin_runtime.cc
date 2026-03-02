@@ -713,9 +713,6 @@ chi::TaskResume Runtime::Send(hipc::FullPtr<SendTask> task,
 void Runtime::RecvIn(hipc::FullPtr<RecvTask> task,
                      chi::LoadTaskArchive &archive,
                      hshm::lbm::Transport *lbm_transport) {
-  // Set I/O size to 1MB to ensure routing to slow workers
-  task->stat_.io_size_ = 1024 * 1024;  // 1MB
-
   auto *ipc_manager = CHI_IPC;
   auto *pool_manager = CHI_POOL_MANAGER;
 
@@ -802,9 +799,6 @@ void Runtime::RecvIn(hipc::FullPtr<RecvTask> task,
 void Runtime::RecvOut(hipc::FullPtr<RecvTask> task,
                       chi::LoadTaskArchive &archive,
                       hshm::lbm::Transport *lbm_transport) {
-  // Set I/O size to 1MB to ensure routing to slow workers
-  task->stat_.io_size_ = 1024 * 1024;  // 1MB
-
   auto *pool_manager = CHI_POOL_MANAGER;
 
   const auto &task_infos = archive.GetTaskInfos();
@@ -1364,12 +1358,14 @@ void Runtime::MonitorContainerStats(hipc::FullPtr<MonitorTask> task) {
     if (container) {
       const auto &model = container->GetMethodModel();
       const auto &mape = container->GetMethodMapeVec();
+      const auto &model_wall = container->GetMethodModelWall();
+      const auto &mape_wall = container->GetMethodMapeWallVec();
       const auto &names = container->GetMethodNames();
 
       pk.pack("methods");
       pk.pack_array(model.size());
       for (size_t i = 0; i < model.size(); ++i) {
-        pk.pack_map(4);
+        pk.pack_map(6);
         pk.pack("id");
         pk.pack(static_cast<uint32_t>(i));
         pk.pack("name");
@@ -1378,6 +1374,10 @@ void Runtime::MonitorContainerStats(hipc::FullPtr<MonitorTask> task) {
         pk.pack(model[i]);
         pk.pack("mape");
         pk.pack(i < mape.size() ? mape[i] : 0.0f);
+        pk.pack("wall_coefficient");
+        pk.pack(i < model_wall.size() ? model_wall[i] : 0.0f);
+        pk.pack("wall_mape");
+        pk.pack(i < mape_wall.size() ? mape_wall[i] : 0.0f);
       }
 
       pk.pack("learning_rate");
@@ -2454,6 +2454,27 @@ chi::TaskResume Runtime::ProbeRequest(hipc::FullPtr<ProbeRequestTask> task,
   task->SetReturnCode(0);
   rctx.did_work_ = true;
   co_return;
+}
+
+chi::TaskStat Runtime::GetTaskStats(chi::u32 method_id) const {
+  switch (method_id) {
+    case Method::kSend:
+    case Method::kRecv:
+    case Method::kClientRecv:
+    case Method::kClientSend: {
+      chi::TaskStat stat;
+      auto *net_queue = CHI_IPC->GetNetQueue();
+      size_t total = 0;
+      if (net_queue) {
+        for (chi::u32 p = 0; p < 4; ++p)
+          total += net_queue->GetLane(0, p).Size();
+      }
+      stat.compute_ = total;
+      stat.io_size_ = 1024 * 1024;
+      return stat;
+    }
+    default: return chi::TaskStat();
+  }
 }
 
 chi::u64 Runtime::GetWorkRemaining() const {

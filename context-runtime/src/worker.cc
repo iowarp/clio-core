@@ -693,8 +693,9 @@ void Worker::ExecTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
     run_ctx->container_ = exec_container;
   }
 
-  // Start CPU timer before execution
+  // Start CPU and wall timers before execution
   run_ctx->cpu_timer_.Resume();
+  run_ctx->wall_timer_.Resume();
 
   // Call appropriate coroutine function based on task state
   if (is_started) {
@@ -705,14 +706,16 @@ void Worker::ExecTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
 
     // Predict load for new tasks
     if (run_ctx->container_) {
-      run_ctx->predicted_load_ = run_ctx->container_->InferModel(
-          task_ptr->method_, task_ptr.ptr_);
+      run_ctx->predicted_stat_ = run_ctx->container_->GetTaskStats(task_ptr->method_);
+      run_ctx->predicted_load_ = run_ctx->container_->InferCpuTime(task_ptr->method_, run_ctx->predicted_stat_);
+      run_ctx->predicted_wall_us_ = run_ctx->container_->InferWallClockTime(task_ptr->method_, run_ctx->predicted_stat_);
       load_ += run_ctx->predicted_load_;
     }
   }
 
-  // Pause CPU timer after execution
+  // Pause CPU and wall timers after execution
   run_ctx->cpu_timer_.Pause();
+  run_ctx->wall_timer_.Pause();
 
   // For periodic tasks, only set task_did_work_ if the task reported
   // actual work done (e.g., received data, sent data). This prevents
@@ -785,11 +788,15 @@ void Worker::EndTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
   // Subtract predicted load from worker
   load_ -= run_ctx->predicted_load_;
 
-  // Reinforce model with actual CPU time
+  // Reinforce model with actual CPU and wall time
   float actual_cpu_us = static_cast<float>(run_ctx->cpu_timer_.GetUsec());
-  container->ReinforceModel(
+  float actual_wall_us = static_cast<float>(run_ctx->wall_timer_.GetUsec());
+  container->ReinforceCpuModel(
       task_ptr->method_, run_ctx->predicted_load_, actual_cpu_us,
-      task_ptr->stat_.compute_);
+      run_ctx->predicted_stat_);
+  container->ReinforceWallModel(
+      task_ptr->method_, run_ctx->predicted_wall_us_, actual_wall_us,
+      run_ctx->predicted_stat_);
 
   // Get task properties at the start
   bool is_remote = task_ptr->IsRemote();
@@ -797,9 +804,6 @@ void Worker::EndTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
 
   // Handle periodic task rescheduling
   if (is_periodic && can_resched) {
-    // Reset timer and prediction for next period
-    run_ctx->cpu_timer_.time_ns_ = 0;
-    run_ctx->predicted_load_ = 0;
     ReschedulePeriodicTask(run_ctx, task_ptr);
     return;
   }
@@ -1208,6 +1212,13 @@ void Worker::ReschedulePeriodicTask(RunContext *run_ctx,
   if (!run_ctx || task_ptr.IsNull() || !task_ptr->IsPeriodic()) {
     return;
   }
+
+  // Reset timers and predictions for next period
+  run_ctx->cpu_timer_.time_ns_ = 0;
+  run_ctx->wall_timer_.time_ns_ = 0;
+  run_ctx->predicted_load_ = 0;
+  run_ctx->predicted_wall_us_ = 0;
+  run_ctx->predicted_stat_ = TaskStat();
 
   // Get the lane from the run context
   TaskLane *lane = run_ctx->lane_;
