@@ -1,0 +1,38 @@
+{
+  "name": "iowarp-clio",
+  "owner": {
+    "name": "Gnosis Research Center",
+    "email": "grc@iit.edu"
+  },
+  "metadata": {
+    "description": "Official IOWarp plugin marketplace for the Clio ecosystem — dev environment setup, contributing guidelines, and team workflow consistency.",
+    "version": "1.0.0",
+    "pluginRoot": "./plugins"
+  },
+  "plugins": [
+    {
+      "name": "iowarp-dev-setup",
+      "source": "./plugins/iowarp-dev-setup",
+      "description": "Complete development environment setup for IOWarp Core — Docker devcontainers, builds, debugging, and IDE configuration. Gets any team member from zero to a running dev environment.",
+      "version": "1.0.0",
+      "author": {
+        "name": "Gnosis Research Center"
+      },
+      "category": "development",
+      "tags": ["devcontainer", "docker", "setup", "build", "debugging", "ide"],
+      "keywords": ["iowarp", "clio-core", "devcontainer", "docker", "cmake", "development-environment"]
+    },
+    {
+      "name": "iowarp-contributing",
+      "source": "./plugins/iowarp-contributing",
+      "description": "Uniform contributing guidelines for the IOWarp/Clio ecosystem — git etiquette, code style, project architecture awareness, and development workflow standards.",
+      "version": "1.0.0",
+      "author": {
+        "name": "Gnosis Research Center"
+      },
+      "category": "workflow",
+      "tags": ["contributing", "git", "codestyle", "workflow", "architecture"],
+      "keywords": ["iowarp", "clio", "contributing", "git-workflow", "code-standards", "architecture"]
+    }
+  ]
+}

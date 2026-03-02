@@ -1,0 +1,14 @@
+{
+  "extraKnownMarketplaces": {
+    "iowarp-clio": {
+      "source": {
+        "source": "github",
+        "repo": "iowarp/clio-core"
+      }
+    }
+  },
+  "enabledPlugins": {
+    "iowarp-dev-setup@iowarp-clio": true,
+    "iowarp-contributing@iowarp-clio": true
+  }
+}

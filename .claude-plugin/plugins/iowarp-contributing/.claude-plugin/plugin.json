@@ -1,0 +1,8 @@
+{
+  "name": "iowarp-contributing",
+  "description": "Uniform contributing guidelines for the IOWarp/Clio ecosystem — git etiquette, code style, project architecture, and workflow standards.",
+  "version": "1.0.0",
+  "author": {
+    "name": "Gnosis Research Center"
+  }
+}
