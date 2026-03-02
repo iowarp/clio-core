@@ -200,6 +200,8 @@ class ChiModGenerator {
     oss << "#define " << namespace_upper << "_" << chimod_upper << "_AUTOGEN_METHODS_H_\n";
     oss << "\n";
     oss << "#include <chimaera/chimaera.h>\n";
+    oss << "#include <string>\n";
+    oss << "#include <vector>\n";
     oss << "\n";
     oss << "/**\n";
     oss << " * Auto-generated method definitions for " << module_name << "\n";
@@ -233,6 +235,25 @@ class ChiModGenerator {
         oss << "GLOBAL_CONST chi::u32 " << method.constant_name << " = " << method.method_id << ";\n";
       }
     }
+
+    // Emit kMaxMethodId (one past the highest method ID)
+    if (!methods.empty()) {
+      oss << "\nGLOBAL_CONST chi::u32 kMaxMethodId = " << (methods.back().method_id + 1) << ";\n";
+    } else {
+      oss << "\nGLOBAL_CONST chi::u32 kMaxMethodId = 0;\n";
+    }
+
+    // Emit GetMethodNames() function returning names indexed by method ID
+    oss << "\ninline const std::vector<std::string>& GetMethodNames() {\n";
+    oss << "  static const std::vector<std::string> names = [] {\n";
+    oss << "    std::vector<std::string> v(kMaxMethodId);\n";
+    for (const auto& method : methods) {
+      oss << "    v[" << method.method_id << "] = \"" << method.method_name << "\";\n";
+    }
+    oss << "    return v;\n";
+    oss << "  }();\n";
+    oss << "  return names;\n";
+    oss << "}\n";
 
     oss << "}  // namespace Method\n";
     oss << "\n";
@@ -300,6 +321,10 @@ class ChiModGenerator {
     oss << "\n";
     oss << "  // Initialize the client for this ChiMod\n";
     oss << "  client_ = Client(pool_id);\n";
+    oss << "\n";
+    oss << "  // Initialize per-method load prediction model\n";
+    oss << "  DefineModel(Method::kMaxMethodId);\n";
+    oss << "  SetMethodNames(Method::GetMethodNames());\n";
     oss << "}\n";
     oss << "\n";
 

@@ -248,6 +248,9 @@ public:
   /** Monitor sub-handler: collect per-worker statistics. */
   void MonitorWorkerStats(hipc::FullPtr<MonitorTask> task);
 
+  /** Monitor sub-handler: return per-container model statistics. */
+  void MonitorContainerStats(hipc::FullPtr<MonitorTask> task);
+
   /** Monitor sub-handler: delegate query to a specific pool. */
   chi::TaskResume MonitorPoolStats(hipc::FullPtr<MonitorTask> task);
 
@@ -345,6 +348,12 @@ public:
    * Helper: Receive task outputs from remote node
    */
   void RecvOut(hipc::FullPtr<RecvTask> task, chi::LoadTaskArchive& archive, hshm::lbm::Transport* lbm_transport);
+
+  /**
+   * Get live task statistics per method.
+   * For network methods, compute = total queue depth across priorities.
+   */
+  chi::TaskStat GetTaskStats(chi::u32 method_id) const override;
 
   /**
    * Get remaining work count for this admin container

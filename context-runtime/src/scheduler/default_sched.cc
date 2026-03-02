@@ -35,7 +35,9 @@
 #include "chimaera/scheduler/default_sched.h"
 
 #include "chimaera/config_manager.h"
+#include "chimaera/container.h"
 #include "chimaera/ipc_manager.h"
+#include "chimaera/pool_manager.h"
 #include "chimaera/work_orchestrator.h"
 #include "chimaera/worker.h"
 
@@ -148,7 +150,13 @@ u32 DefaultScheduler::RuntimeMapTask(Worker *worker, const Future<Task> &task,
 
   // Route large I/O to dedicated I/O workers (round-robin)
   if (selected == nullptr && task_ptr != nullptr && !io_workers_.empty()) {
-    size_t io_size = task_ptr->stat_.io_size_;
+    size_t io_size = 0;
+    bool is_plugged = false;
+    Container *container = CHI_POOL_MANAGER->GetContainer(
+        task_ptr->pool_id_, task_ptr->pool_query_.GetContainerId(), is_plugged);
+    if (container) {
+      io_size = container->GetTaskStats(task_ptr->method_).io_size_;
+    }
     if (io_size >= kLargeIOThreshold) {
       u32 idx = next_io_idx_.fetch_add(1, std::memory_order_relaxed) %
                 static_cast<u32>(io_workers_.size());

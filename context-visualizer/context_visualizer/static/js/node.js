@@ -138,7 +138,7 @@
 
     function formatBytes(bytes) {
         if (bytes === 0) return "0 B";
-        var units = ["B", "KB", "MB", "GB", "TB"];
+        var units = ["B", "K", "M", "G", "T"];
         var i = Math.floor(Math.log(bytes) / Math.log(1024));
         return (bytes / Math.pow(1024, i)).toFixed(1) + " " + units[i];
     }
@@ -326,10 +326,103 @@
             .catch(function () { /* ignore */ });
     }
 
+    // ---- Poll Container Stats ----
+    var expandedContainers = {};  // track which containers are expanded by pool_id
+    var modelMode = "cpu";  // "cpu" or "wall"
+
+    function pollContainerStats() {
+        fetch("/api/node/" + NODE_ID + "/container_stats")
+            .then(function (r) { return r.json(); })
+            .then(function (data) {
+                if (data.error) return;
+
+                var containers = data.containers || [];
+                var grid = document.getElementById("containerGrid");
+                grid.innerHTML = "";
+
+                if (containers.length === 0) {
+                    grid.innerHTML = '<div class="empty-state">No containers</div>';
+                    return;
+                }
+
+                containers.forEach(function (c) {
+                    var poolId = c.pool_id || "";
+                    var poolName = c.pool_name || poolId;
+                    var chimod = c.chimod_name || "";
+                    var containerId = c.container_id || 0;
+                    var methods = c.methods || [];
+                    var lr = c.learning_rate || 0;
+
+                    var card = document.createElement("div");
+                    card.className = "container-card";
+                    if (expandedContainers[poolId]) card.className += " expanded";
+
+                    // Filter to methods with non-empty names
+                    var activeMethods = methods.filter(function (m) {
+                        return m.name && m.name.length > 0;
+                    });
+
+                    var headerHtml =
+                        '<div class="container-card-header">' +
+                        '<span class="container-pool-name">' + poolName + '</span>' +
+                        '<span class="container-chimod-badge">' + chimod + '</span>' +
+                        '</div>' +
+                        '<div class="container-meta">Pool: ' + poolId +
+                        ' &middot; Container: ' + containerId +
+                        ' &middot; Methods: ' + activeMethods.length +
+                        ' &middot; LR: ' + lr.toFixed(3) + '</div>';
+
+                    // Build method table
+                    var tableHtml = '<div class="container-detail">';
+                    if (activeMethods.length > 0) {
+                        var coeffLabel = modelMode === "wall" ? "Wall Coeff" : "CPU Coeff";
+                        var mapeLabel = modelMode === "wall" ? "Wall MAPE" : "CPU MAPE";
+                        tableHtml += '<table class="method-table"><thead><tr>' +
+                            '<th>ID</th><th>Method</th><th>' + coeffLabel + '</th><th>' + mapeLabel + '</th>' +
+                            '</tr></thead><tbody>';
+                        activeMethods.forEach(function (m) {
+                            var coeff = modelMode === "wall" ? (m.wall_coefficient || 0) : (m.coefficient || 0);
+                            var mape = modelMode === "wall" ? (m.wall_mape || 0) : (m.mape || 0);
+                            var mapeColor = mape > 0.5 ? "var(--accent)" :
+                                            mape > 0.2 ? "var(--warning)" : "var(--success)";
+                            tableHtml += '<tr>' +
+                                '<td>' + m.id + '</td>' +
+                                '<td>' + (m.name || "?") + '</td>' +
+                                '<td>' + coeff.toFixed(4) + '</td>' +
+                                '<td style="color:' + mapeColor + '">' +
+                                    (mape * 100).toFixed(1) + '%</td>' +
+                                '</tr>';
+                        });
+                        tableHtml += '</tbody></table>';
+                    } else {
+                        tableHtml += '<div class="empty-state">No active methods</div>';
+                    }
+                    tableHtml += '</div>';
+
+                    card.innerHTML = headerHtml + tableHtml;
+
+                    card.addEventListener("click", function () {
+                        var isExpanded = card.classList.contains("expanded");
+                        if (isExpanded) {
+                            card.classList.remove("expanded");
+                            delete expandedContainers[poolId];
+                        } else {
+                            card.classList.add("expanded");
+                            expandedContainers[poolId] = true;
+                        }
+                    });
+
+                    grid.appendChild(card);
+                });
+            })
+            .catch(function () { /* ignore */ });
+    }
+
     function pollAll() {
         pollWorkers();
         pollSystemStats();
         pollBdevStats();
+        pollContainerStats();
     }
 
     document.addEventListener("DOMContentLoaded", function () {
@@ -339,6 +432,22 @@
         ramChart = makeChart("ramChart");
         gpuChart = makeChart("gpuChart");
         hbmChart = makeChart("hbmChart");
+
+        // Wire up CPU / Wall toggle buttons
+        var toggleGroup = document.getElementById("modelToggle");
+        if (toggleGroup) {
+            toggleGroup.addEventListener("click", function (e) {
+                var btn = e.target.closest(".toggle-btn");
+                if (!btn) return;
+                var mode = btn.getAttribute("data-mode");
+                if (mode === modelMode) return;
+                modelMode = mode;
+                toggleGroup.querySelectorAll(".toggle-btn").forEach(function (b) {
+                    b.classList.toggle("active", b === btn);
+                });
+                pollContainerStats();
+            });
+        }
 
         pollAll();
         setInterval(pollAll, POLL_MS);
