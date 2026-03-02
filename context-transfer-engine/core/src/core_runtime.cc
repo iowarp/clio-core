@@ -2603,9 +2603,9 @@ chi::TaskResume Runtime::ClearBlob(BlobInfo &blob_info, float blob_score,
   if (blob_score < 0.0f || blob_score > 1.0f) {
     co_return;
   }
-  // Must be full-blob replacement
+  // Full-blob replacement: offset 0 means replace entire blob (allow smaller new size)
   chi::u64 current_size = blob_info.GetTotalSize();
-  if (offset != 0 || size < current_size || current_size == 0) {
+  if (offset != 0 || current_size == 0) {
     co_return;
   }
   // Free all existing blocks
