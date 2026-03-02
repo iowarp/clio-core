@@ -102,7 +102,7 @@ struct ParseOmniTask : public chi::Task {
 
   // Emplace constructor - accepts vector of AssimilationCtx and serializes
   // internally
-  explicit ParseOmniTask(
+  HSHM_CROSS_FUN explicit ParseOmniTask(
       const chi::TaskId &task_node, const chi::PoolId &pool_id,
       const chi::PoolQuery &pool_query,
       const std::vector<wrp_cae::core::AssimilationCtx> &contexts)
@@ -129,7 +129,7 @@ struct ParseOmniTask : public chi::Task {
    * Serialize IN and INOUT parameters
    */
   template <typename Archive>
-  void SerializeIn(Archive &ar) {
+  HSHM_CROSS_FUN void SerializeIn(Archive &ar) {
     Task::SerializeIn(ar);
     ar(serialized_ctx_);
   }
@@ -138,7 +138,7 @@ struct ParseOmniTask : public chi::Task {
    * Serialize OUT and INOUT parameters
    */
   template <typename Archive>
-  void SerializeOut(Archive &ar) {
+  HSHM_CROSS_FUN void SerializeOut(Archive &ar) {
     Task::SerializeOut(ar);
     ar(num_tasks_scheduled_, result_code_, error_message_);
   }
@@ -186,7 +186,7 @@ struct ProcessHdf5DatasetTask : public chi::Task {
         error_message_(HSHM_MALLOC) {}
 
   // Emplace constructor
-  explicit ProcessHdf5DatasetTask(const chi::TaskId &task_node,
+  HSHM_CROSS_FUN explicit ProcessHdf5DatasetTask(const chi::TaskId &task_node,
                                   const chi::PoolId &pool_id,
                                   const chi::PoolQuery &pool_query,
                                   const std::string &file_path,
@@ -208,7 +208,7 @@ struct ProcessHdf5DatasetTask : public chi::Task {
    * Serialize IN and INOUT parameters
    */
   template <typename Archive>
-  void SerializeIn(Archive &ar) {
+  HSHM_CROSS_FUN void SerializeIn(Archive &ar) {
     Task::SerializeIn(ar);
     ar(file_path_, dataset_path_, tag_prefix_);
   }
@@ -217,7 +217,7 @@ struct ProcessHdf5DatasetTask : public chi::Task {
    * Serialize OUT and INOUT parameters
    */
   template <typename Archive>
-  void SerializeOut(Archive &ar) {
+  HSHM_CROSS_FUN void SerializeOut(Archive &ar) {
     Task::SerializeOut(ar);
     ar(result_code_, error_message_);
   }

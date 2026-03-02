@@ -795,6 +795,15 @@ template <typename T>
 using atomic = rocm_atomic<T>;
 #endif
 
+#if HSHM_IS_GPU && !HSHM_ENABLE_CUDA_OR_ROCM
+// Fallback for nvcc's device-compilation pass when HSHM_ENABLE_CUDA=0.
+// HSHM_IS_GPU=1 (via __CUDA_ARCH__) but no GPU atomic backend is configured.
+// nonatomic<T> is HSHM_CROSS_FUN-safe and prevents "atomic is not a template"
+// cascade errors in downstream lock/allocator headers.
+template <typename T>
+using atomic = nonatomic<T>;
+#endif
+
 template <typename T, bool is_atomic>
 using opt_atomic =
     typename std::conditional<is_atomic, atomic<T>, nonatomic<T>>::type;

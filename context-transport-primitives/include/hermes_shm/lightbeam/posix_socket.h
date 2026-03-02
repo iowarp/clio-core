@@ -39,6 +39,7 @@
 #include <string>
 
 #include "hermes_shm/constants/macros.h"
+#include "hermes_shm/types/numbers.h"
 
 #ifdef _WIN32
 #ifndef NOMINMAX
