@@ -36,7 +36,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#if HSHM_IS_HOST
 #include <iostream>
+#endif
 #include <limits>
 
 #include "hermes_shm/constants/macros.h"
@@ -99,11 +101,12 @@ struct ThreadId {
   HSHM_INLINE_CROSS_FUN
   bool operator>=(const ThreadId &other) const { return tid_ >= other.tid_; }
 
-  HSHM_INLINE_CROSS_FUN
+#if HSHM_IS_HOST
   friend std::ostream &operator<<(std::ostream &os, const ThreadId &tid) {
     os << tid.tid_;
     return os;
   }
+#endif
 };
 
 #if HSHM_ENABLE_CUDA or HSHM_ENABLE_ROCM
@@ -124,6 +127,46 @@ typedef u32 min_u32;
 typedef u64 min_u64;
 #endif
 
+
+/**
+ * Compute the number of bits needed to represent a value.
+ * Equivalent to std::bit_width (C++20). Compilers optimize this to BSR.
+ *
+ * @param x The value to compute bit width for
+ * @return Number of bits needed (0 for x == 0, floor(log2(x)) + 1 otherwise)
+ */
+HSHM_INLINE_CROSS_FUN
+static size_t BitWidth(size_t x) {
+  size_t width = 0;
+  while (x > 0) {
+    x >>= 1;
+    ++width;
+  }
+  return width;
+}
+
+/**
+ * Compute floor(log2(x)) using bit manipulation (no floating point).
+ *
+ * @param x The value (must be > 0 for valid result)
+ * @return floor(log2(x))
+ */
+HSHM_INLINE_CROSS_FUN
+static size_t FloorLog2(size_t x) {
+  return BitWidth(x) - 1;
+}
+
+/**
+ * Compute ceil(log2(x)) using bit manipulation (no floating point).
+ *
+ * @param x The value (must be > 0 for valid result)
+ * @return ceil(log2(x)), or 0 if x <= 1
+ */
+HSHM_INLINE_CROSS_FUN
+static size_t CeilLog2(size_t x) {
+  if (x <= 1) return 0;
+  return BitWidth(x - 1);
+}
 
 template <typename T>
 class Unit {

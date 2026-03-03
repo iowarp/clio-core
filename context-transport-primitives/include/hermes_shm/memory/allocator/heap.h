@@ -104,7 +104,7 @@ class Heap {
 
     // Check if allocation would exceed maximum offset
     if (end_off > max_offset_) {
-      max_offset_ = end_off;
+      heap_.fetch_sub(size);
       return 0;  // Return 0 to indicate failure (out of memory)
     }
 
