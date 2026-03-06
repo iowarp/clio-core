@@ -88,6 +88,17 @@ set(CLIENT_RETRY_TEST_SOURCES
   test_client_retry.cc
 )
 
+# Future task cleanup regression test
+set(FUTURE_TASK_CLEANUP_TEST_TARGET chimaera_future_task_cleanup_tests)
+set(FUTURE_TASK_CLEANUP_TEST_SOURCES
+  test_future_task_cleanup.cc
+)
+
+# BULK_EXPOSE buffer cleanup regression test
+set(BULK_EXPOSE_CLEANUP_TEST_TARGET chimaera_bulk_expose_cleanup_tests)
+set(BULK_EXPOSE_CLEANUP_TEST_SOURCES
+  test_bulk_expose_cleanup.cc
+)
 
 # GPU IPC AllocateBuffer test executable (only if CUDA or HIP is enabled)
 set(IPC_ALLOCATE_BUFFER_GPU_TEST_TARGET test_ipc_allocate_buffer_gpu)
@@ -296,6 +307,56 @@ set_target_properties(${STREAMING_TEST_TARGET} PROPERTIES
 )
 
 set_target_properties(${STREAMING_TEST_TARGET} PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+
+# Create Future task cleanup regression test executable
+add_executable(${FUTURE_TASK_CLEANUP_TEST_TARGET} ${FUTURE_TASK_CLEANUP_TEST_SOURCES})
+
+target_include_directories(${FUTURE_TASK_CLEANUP_TEST_TARGET} PRIVATE
+  ${CHIMAERA_ROOT}/include
+  ${CHIMAERA_ROOT}/test  # For simple_test.h
+  ${CHIMAERA_ROOT}/modules/MOD_NAME/include  # For MOD_NAME client and tasks
+)
+
+target_link_libraries(${FUTURE_TASK_CLEANUP_TEST_TARGET}
+  chimaera_cxx               # Main Chimaera library
+  chimaera_MOD_NAME_client   # MOD_NAME client
+  chimaera_MOD_NAME_runtime  # MOD_NAME runtime
+  hshm::cxx                  # HermesShm library
+  ${CMAKE_THREAD_LIBS_INIT}  # Threading support
+)
+
+set_target_properties(${FUTURE_TASK_CLEANUP_TEST_TARGET} PROPERTIES
+  CXX_STANDARD 17
+  CXX_STANDARD_REQUIRED ON
+)
+
+set_target_properties(${FUTURE_TASK_CLEANUP_TEST_TARGET} PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+
+# Create BULK_EXPOSE cleanup regression test executable
+add_executable(${BULK_EXPOSE_CLEANUP_TEST_TARGET} ${BULK_EXPOSE_CLEANUP_TEST_SOURCES})
+
+target_include_directories(${BULK_EXPOSE_CLEANUP_TEST_TARGET} PRIVATE
+  ${CHIMAERA_ROOT}/include
+  ${CHIMAERA_ROOT}/test  # For simple_test.h
+  ${CHIMAERA_ROOT}/modules/bdev/include
+  ${CHIMAERA_ROOT}/modules/admin/include
+)
+
+target_link_libraries(${BULK_EXPOSE_CLEANUP_TEST_TARGET}
+  chimaera_cxx               # Main Chimaera library
+  chimaera_bdev_client        # Bdev module client
+  chimaera_admin_client       # Admin module client
+  hshm::cxx                  # HermesShm library
+  ${CMAKE_THREAD_LIBS_INIT}  # Threading support
+)
+
+set_target_properties(${BULK_EXPOSE_CLEANUP_TEST_TARGET} PROPERTIES
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED ON
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 
@@ -754,6 +815,30 @@ if(WRP_CORE_ENABLE_TESTS)
     TIMEOUT 180
   )
 
+  # Future task cleanup regression tests
+  add_test(
+    NAME cr_future_task_cleanup_tests
+    COMMAND ${FUTURE_TASK_CLEANUP_TEST_TARGET}
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_future_task_cleanup_tests PROPERTIES
+    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+    LABELS "regression;memory"
+  )
+
+  # BULK_EXPOSE cleanup regression tests
+  add_test(
+    NAME cr_bulk_expose_cleanup_tests
+    COMMAND ${BULK_EXPOSE_CLEANUP_TEST_TARGET}
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_bulk_expose_cleanup_tests PROPERTIES
+    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}"
+    TIMEOUT 120
+    LABELS "regression;memory"
+  )
+
   # External Client Tests
   # NOTE: Each test case must run in its own process because CHIMAERA_INIT has
   # a static guard that prevents re-initialization. Running all tests in one
@@ -1083,6 +1168,8 @@ install(TARGETS
   ${AUTOGEN_COVERAGE_TEST_TARGET}
   ${STREAMING_TEST_TARGET}
   ${EXTERNAL_CLIENT_TEST_TARGET}
+  ${FUTURE_TASK_CLEANUP_TEST_TARGET}
+  ${BULK_EXPOSE_CLEANUP_TEST_TARGET}
   ${RUNTIME_CLEANUP_TEST_TARGET}
   ${IPC_ERRORS_TEST_TARGET}
   ${IPC_TRANSPORT_MODES_TEST_TARGET}
