@@ -725,27 +725,6 @@ bool IpcManager::ServerInitGpuQueues() {
   }
 }
 
-bool IpcManager::LaunchMegakernel() {
-  int num_gpus = hshm::GpuApi::GetDeviceCount();
-  if (num_gpus == 0) {
-    return true;  // No GPUs, nothing to do
-  }
-
-  ConfigManager *config = CHI_CONFIG_MANAGER;
-  u32 blocks = config->GetGpuBlocks();
-  u32 threads_per_block = config->GetGpuThreadsPerBlock();
-
-  auto *launcher = new MegakernelLauncher();
-  if (!launcher->Launch(gpu_megakernel_info_, blocks, threads_per_block)) {
-    HLOG(kError, "Failed to launch megakernel");
-    delete launcher;
-    return false;
-  }
-
-  megakernel_launcher_ = launcher;
-  return true;
-}
-
 void IpcManager::FinalizeMegakernel() {
   if (megakernel_launcher_) {
     auto *launcher = static_cast<MegakernelLauncher *>(megakernel_launcher_);
@@ -777,6 +756,29 @@ void IpcManager::RegisterMegakernelContainer(const PoolId &pool_id,
 }
 
 #endif
+
+bool IpcManager::LaunchMegakernel() {
+#if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
+  int num_gpus = hshm::GpuApi::GetDeviceCount();
+  if (num_gpus == 0) {
+    return true;  // No GPUs, nothing to do
+  }
+
+  ConfigManager *config = CHI_CONFIG_MANAGER;
+  u32 blocks = config->GetGpuBlocks();
+  u32 threads_per_block = config->GetGpuThreadsPerBlock();
+
+  auto *launcher = new MegakernelLauncher();
+  if (!launcher->Launch(gpu_megakernel_info_, blocks, threads_per_block)) {
+    HLOG(kError, "Failed to launch megakernel");
+    delete launcher;
+    return false;
+  }
+
+  megakernel_launcher_ = launcher;
+#endif
+  return true;
+}
 
 void IpcManager::PauseMegakernel() {
 #if HSHM_ENABLE_CUDA || HSHM_ENABLE_ROCM
