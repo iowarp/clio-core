@@ -22,6 +22,12 @@ add_dependencies(test_buddy_allocator_exec hermes_shm_host)
 target_link_libraries(test_buddy_allocator_exec
         hermes_shm_host Catch2::Catch2WithMain)
 
+add_executable(test_buddy_compaction_exec
+        test_compaction.cc)
+add_dependencies(test_buddy_compaction_exec hermes_shm_host)
+target_link_libraries(test_buddy_compaction_exec
+        hermes_shm_host Catch2::Catch2WithMain)
+
 add_executable(test_hshm_malloc_exec
         test_hshm_malloc.cc)
 add_dependencies(test_hshm_malloc_exec hermes_shm_host)
@@ -63,6 +69,9 @@ add_test(NAME ctp_arena_alloc COMMAND
 add_test(NAME ctp_buddy_allocator COMMAND
         ${CMAKE_BINARY_DIR}/bin/test_buddy_allocator_exec)
 
+add_test(NAME ctp_buddy_compaction COMMAND
+        ${CMAKE_BINARY_DIR}/bin/test_buddy_compaction_exec)
+
 add_test(NAME ctp_hshm_malloc COMMAND
         ${CMAKE_BINARY_DIR}/bin/test_hshm_malloc_exec)
 
@@ -70,6 +79,7 @@ add_test(NAME ctp_hshm_malloc COMMAND
 # regions that MSan cannot instrument (no instrumented allocator backing).
 set_tests_properties(
   ctp_buddy_allocator
+  ctp_buddy_compaction
   ctp_hshm_malloc
   PROPERTIES LABELS "msan_skip"
 )
@@ -118,6 +128,7 @@ install(TARGETS
         test_sub_alloc_exec
         test_arena_alloc_exec
         test_buddy_allocator_exec
+        test_buddy_compaction_exec
         test_hshm_malloc_exec
         LIBRARY DESTINATION lib
         ARCHIVE DESTINATION lib

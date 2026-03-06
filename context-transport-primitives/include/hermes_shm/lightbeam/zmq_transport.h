@@ -240,7 +240,8 @@ class ZeroMqTransport : public Transport {
     HLOG(kDebug, "ZeroMqTransport destructor - closing socket to {}:{}", addr_,
          port_);
 
-    int linger = 0;
+    int linger = 0;  // Close immediately; don't wait for unsent messages
+
     zmq_setsockopt(socket_, ZMQ_LINGER, &linger, sizeof(linger));
 
     zmq_close(socket_);

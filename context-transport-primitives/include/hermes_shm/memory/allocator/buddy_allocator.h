@@ -39,6 +39,7 @@
 #include "hermes_shm/data_structures/ipc/slist_pre.h"
 #include "hermes_shm/data_structures/ipc/rb_tree_pre.h"
 #include <cmath>
+#include <vector>
 
 namespace hshm::ipc {
 
@@ -49,12 +50,23 @@ namespace hshm::ipc {
  * When allocated: next_ is unused, size_ holds the data size (excluding header)
  * When free: next_ links to next free page in slist, size_ holds data size (excluding header)
  * This structure is 16 bytes to accommodate slist_node requirements.
+ *
+ * Bit 63 of size_ is the free flag (kFreeMask). All size reads must use
+ * GetSize() to mask out this bit.
  */
 struct BuddyPage : public pre::slist_node {
-  size_t size_;  /**< Size of data portion (always excludes BuddyPage header) */
+  size_t size_;  /**< Size of data portion (always excludes BuddyPage header).
+                  *   Bit 63 is the free flag (kFreeMask). */
+
+  static constexpr size_t kFreeMask = (size_t)1 << (sizeof(size_t) * 8 - 1);
 
   BuddyPage() : pre::slist_node(), size_(0) {}
   explicit BuddyPage(size_t size) : pre::slist_node(), size_(size) {}
+
+  inline void MarkFree()      { size_ |=  kFreeMask; }
+  inline void MarkAllocated() { size_ &= ~kFreeMask; }
+  inline bool IsFree()  const { return (size_ & kFreeMask) != 0; }
+  inline size_t GetSize() const { return size_ & ~kFreeMask; }
 };
 
 /**
@@ -90,6 +102,54 @@ struct CoalesceBuddyPage : public pre::rb_node {
   bool operator==(const CoalesceBuddyPage &other) const {
     return key_.load() == other.key_.load();
   }
+};
+
+/**
+ * Maps old user-data offsets to new offsets after compaction.
+ *
+ * Entries are recorded in ascending old_off order (left-to-right heap scan),
+ * so Resolve() uses binary search.
+ *
+ * Usage:
+ *   ForwardingTable table = alloc->Compact();
+ *   my_ptr = table.Resolve(my_ptr);   // update every stored OffsetPtr
+ */
+class ForwardingTable {
+ public:
+  struct Entry {
+    size_t old_off;
+    size_t new_off;
+  };
+
+ private:
+  std::vector<Entry> entries_;
+
+ public:
+  void Record(size_t old_off, size_t new_off) {
+    entries_.push_back({old_off, new_off});
+  }
+
+  /** Resolve a raw offset. Returns old_off unchanged if not found. */
+  size_t Resolve(size_t old_off) const {
+    size_t lo = 0, hi = entries_.size();
+    while (lo < hi) {
+      size_t mid = (lo + hi) / 2;
+      if (entries_[mid].old_off == old_off) return entries_[mid].new_off;
+      if (entries_[mid].old_off < old_off) lo = mid + 1;
+      else hi = mid;
+    }
+    return old_off;
+  }
+
+  /** Resolve a typed OffsetPtr. Null pointers are returned unchanged. */
+  template <typename T>
+  OffsetPtr<T> Resolve(OffsetPtr<T> ptr) const {
+    if (ptr.IsNull()) return ptr;
+    return OffsetPtr<T>(Resolve(ptr.load()));
+  }
+
+  bool   Empty() const { return entries_.empty(); }
+  size_t Size()  const { return entries_.size(); }
 };
 
 /**
@@ -231,7 +291,7 @@ class _BuddyAllocator : public Allocator {
     // Get the BuddyPage header (offset points after header)
     size_t page_offset = offset.load() - sizeof(BuddyPage);
     hipc::FullPtr<BuddyPage> page(this, OffsetPtr<BuddyPage>(page_offset));
-    size_t old_size = page.ptr_->size_;  // Size without header
+    size_t old_size = page.ptr_->GetSize();  // Size without header
 
     // If new size fits in existing allocation, reuse it
     if (new_size <= old_size) {
@@ -276,7 +336,8 @@ class _BuddyAllocator : public Allocator {
     // Get the BuddyPage header (offset points after header)
     size_t page_offset = offset.load() - sizeof(BuddyPage);
     hipc::FullPtr<BuddyPage> page(this, OffsetPtr<BuddyPage>(page_offset));
-    size_t data_size = page.ptr_->size_;  // Size without header
+    size_t data_size = page.ptr_->GetSize();  // Size without header
+    page.ptr_->MarkFree();
 
     // Determine which free list to add to based on data size
     if (data_size <= kSmallThreshold) {
@@ -286,7 +347,7 @@ class _BuddyAllocator : public Allocator {
       // Initialize BuddyPage as a free list node
       hipc::FullPtr<BuddyPage> free_page(this, OffsetPtr<BuddyPage>(page_offset));
       free_page.ptr_->next_ = OffsetPtr<>::GetNull();  // Initialize slist_node
-      // size_ already contains data_size from the allocation, keep it as-is
+      // size_ already contains data_size|kFreeMask, keep it as-is
 
       // Add to free list - BuddyPage inherits from slist_node
       FullPtr<BuddyPage> node_ptr(this, OffsetPtr<BuddyPage>(page_offset));
@@ -298,7 +359,7 @@ class _BuddyAllocator : public Allocator {
       // Initialize BuddyPage as a free list node
       hipc::FullPtr<BuddyPage> free_page(this, OffsetPtr<BuddyPage>(page_offset));
       free_page.ptr_->next_ = OffsetPtr<>::GetNull();  // Initialize slist_node
-      // size_ already contains data_size from the allocation, keep it as-is
+      // size_ already contains data_size|kFreeMask, keep it as-is
 
       // Add to free list - BuddyPage inherits from slist_node
       FullPtr<BuddyPage> node_ptr(this, OffsetPtr<BuddyPage>(page_offset));
@@ -315,7 +376,7 @@ class _BuddyAllocator : public Allocator {
    * @param region Offset pointer to the new region
    * @param region_size Size of the new region in bytes
    */
-  void Expand(OffsetPtr<> region, size_t region_size) { 
+  void Expand(OffsetPtr<> region, size_t region_size) {
     if (region.IsNull() || region_size == 0) {
       return;
     }
@@ -326,7 +387,80 @@ class _BuddyAllocator : public Allocator {
     region_size -= sizeof(BuddyPage);
     DivideArenaIntoPages(big_heap_);
     big_heap_.Init(region.load(),
-                                        region.load() + region_size);
+                   region.load() + region_size);
+  }
+
+  /**
+   * Compact the heap by physically moving all live allocations to the low end.
+   *
+   * Algorithm:
+   *   Phase 1 – Linear scan from heap start to big_heap_.GetOffset():
+   *             For each live (non-free) BuddyPage block, memmove it to
+   *             write_pos and record {old_user_off → new_user_off} in the table.
+   *   Phase 2 – Reset all free lists and set big_heap_ to start at write_pos,
+   *             reclaiming the formerly-fragmented space.
+   *
+   * Preconditions:
+   *   - Caller must ensure exclusive access (no concurrent alloc/free).
+   *   - Only supports single-region allocators (one Expand() call).
+   *
+   * Returns a ForwardingTable. Caller MUST update every stored OffsetPtr via
+   *   new_ptr = table.Resolve(old_ptr);
+   *
+   * @return ForwardingTable mapping old user-data offsets to new offsets.
+   */
+  ForwardingTable Compact() {
+    char   *base       = GetBackendData();
+    // Scan from just after the regions_ node that Expand() placed at data_start
+    size_t  scan_start = GetAllocatorDataOff() + sizeof(BuddyPage);
+    size_t  scan_end   = big_heap_.GetOffset();
+
+    // Unallocated tail of small_arena_: raw bump space with no BuddyPage headers
+    size_t  arena_tail_start = small_arena_.GetOffset();
+    size_t  arena_tail_end   = small_arena_.GetMaxOffset();
+
+    ForwardingTable table;
+    size_t cursor    = scan_start;
+    size_t write_pos = scan_start;
+
+    while (cursor < scan_end) {
+      // Skip the small_arena_ unallocated tail (no BuddyPage headers here)
+      if (cursor == arena_tail_start && arena_tail_start < arena_tail_end) {
+        cursor = arena_tail_end;
+        continue;
+      }
+
+      BuddyPage *page      = reinterpret_cast<BuddyPage *>(base + cursor);
+      size_t     data_size = page->GetSize();
+      size_t     blk_size  = sizeof(BuddyPage) + data_size;
+
+      if (!page->IsFree()) {
+        // Live block: pack it towards write_pos
+        size_t old_user_off = cursor    + sizeof(BuddyPage);
+        size_t new_user_off = write_pos + sizeof(BuddyPage);
+
+        if (write_pos != cursor) {
+          memmove(base + write_pos, base + cursor, blk_size);
+        }
+        // Ensure the (possibly moved) header has allocated state
+        reinterpret_cast<BuddyPage *>(base + write_pos)->MarkAllocated();
+        table.Record(old_user_off, new_user_off);
+        write_pos += blk_size;
+      }
+      cursor += blk_size;
+    }
+
+    // Reset free lists — all free blocks have been reclaimed
+    for (size_t i = 0; i < kMaxSmallPages; ++i) small_pages_[i].Init();
+    for (size_t i = 0; i < kMaxLargePages; ++i) large_pages_[i].Init();
+
+    // Reset small_arena_ (empty)
+    small_arena_.Init(0, 0);
+
+    // Reclaim fragmented space: reset big_heap_ bump pointer to write_pos
+    big_heap_.Init(write_pos, big_heap_.GetMaxOffset());
+
+    return table;
   }
 
  private:
@@ -391,7 +525,7 @@ class _BuddyAllocator : public Allocator {
         size_t found_offset = FindFirstFit(list_idx, total_size);
         if (found_offset != 0) {
         hipc::FullPtr<FreeLargeBuddyPage> free_page(this, OffsetPtr<FreeLargeBuddyPage>(found_offset));
-        size_t page_data_size = free_page.ptr_->size_;
+        size_t page_data_size = free_page.ptr_->GetSize();
         size_t page_total_size = page_data_size + sizeof(BuddyPage);
 
         // If there's remainder, add it back to appropriate list using exact size
@@ -402,7 +536,7 @@ class _BuddyAllocator : public Allocator {
         return FinalizeAllocation(found_offset, size);
         }
     }
-    
+
     // Step 4: Try allocating from heap
     size_t heap_offset = big_heap_.Allocate(total_size);
     if (heap_offset != 0) {
@@ -435,7 +569,7 @@ class _BuddyAllocator : public Allocator {
           this, OffsetPtr<FreeLargeBuddyPage>(it.GetCurrent().load()));
 
       // Check if this page size (including header) is large enough
-      size_t page_total_size = free_page.ptr_->size_ + sizeof(BuddyPage);
+      size_t page_total_size = free_page.ptr_->GetSize() + sizeof(BuddyPage);
       if (page_total_size >= required_size) {
         // Found a fit - capture offset before removing from list
         size_t offset = it.GetCurrent().load();
@@ -517,6 +651,7 @@ class _BuddyAllocator : public Allocator {
         }
         free_page.ptr_->next_ = OffsetPtr<>::GetNull();  // Initialize slist_node
         free_page.ptr_->size_ = page_data_size;  // Data size excluding header
+        free_page.ptr_->MarkFree();
 
         // Add to free list
         FullPtr<BuddyPage> node_ptr(this, OffsetPtr<BuddyPage>(remaining_offset));
@@ -549,6 +684,7 @@ class _BuddyAllocator : public Allocator {
       hipc::FullPtr<BuddyPage> remainder(this, OffsetPtr<BuddyPage>(page_offset));
       remainder.ptr_->next_ = OffsetPtr<>::GetNull();  // Initialize slist_node
       remainder.ptr_->size_ = data_size;  // Data size excluding header
+      remainder.ptr_->MarkFree();
 
       FullPtr<BuddyPage> rem_node(this, OffsetPtr<BuddyPage>(page_offset));
       small_pages_[rem_list_idx].emplace(this, rem_node);
@@ -559,6 +695,7 @@ class _BuddyAllocator : public Allocator {
       hipc::FullPtr<BuddyPage> remainder(this, OffsetPtr<BuddyPage>(page_offset));
       remainder.ptr_->next_ = OffsetPtr<>::GetNull();  // Initialize slist_node
       remainder.ptr_->size_ = data_size;  // Data size excluding header
+      remainder.ptr_->MarkFree();
 
       FullPtr<BuddyPage> rem_node(this, OffsetPtr<BuddyPage>(page_offset));
       large_pages_[rem_list_idx].emplace(this, rem_node);
@@ -574,7 +711,8 @@ class _BuddyAllocator : public Allocator {
    */
   OffsetPtr<> FinalizeAllocation(size_t page_offset, size_t user_size) {
     hipc::FullPtr<BuddyPage> page(this, OffsetPtr<BuddyPage>(page_offset));
-    page.ptr_->size_ = user_size;  // Store size without header
+    page.ptr_->size_ = user_size;   // Store size without header
+    page.ptr_->MarkAllocated();     // Clear free bit
 
     size_t result_offset = page_offset + sizeof(BuddyPage);
     return OffsetPtr<>(result_offset);

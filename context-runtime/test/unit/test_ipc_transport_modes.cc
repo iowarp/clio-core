@@ -209,6 +209,17 @@ void CleanupSharedMemory() {
 void CleanupServer(pid_t server_pid) {
   if (server_pid > 0) {
     kill(server_pid, SIGTERM);
+    // Wait up to 5 seconds for graceful shutdown
+    for (int i = 0; i < 50; ++i) {
+      int status;
+      if (waitpid(server_pid, &status, WNOHANG) != 0) {
+        CleanupSharedMemory();
+        return;
+      }
+      usleep(100000);  // 100ms
+    }
+    // Force kill if still alive
+    kill(server_pid, SIGKILL);
     int status;
     waitpid(server_pid, &status, 0);
     CleanupSharedMemory();
