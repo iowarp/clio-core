@@ -176,6 +176,13 @@ class _MallocAllocator : public Allocator {
     MallocPage *page = reinterpret_cast<MallocPage*>(
         reinterpret_cast<char*>(user_ptr) - sizeof(MallocPage));
 
+    // Safety guard: only free if this is our allocation.
+    // Non-HSHM pointers (e.g. ZMQ zero-copy recv buffers) won't have the
+    // magic header, so we skip them rather than corrupting the heap.
+    if (page->magic_ != MallocPage::MAGIC) {
+      return;
+    }
+
 #ifdef HSHM_ALLOC_TRACK_SIZE
     size_t size = page->page_size_ - sizeof(MallocPage);
     total_alloc_ -= size;
