@@ -800,6 +800,14 @@ void IpcManager::ResumeMegakernel() {
 #endif
 }
 
+void IpcManager::PauseGpuOrchestrator() {
+  PauseMegakernel();
+}
+
+void IpcManager::ResumeGpuOrchestrator() {
+  ResumeMegakernel();
+}
+
 bool IpcManager::ClientInitQueues() {
   if (!main_allocator_) {
     return false;
