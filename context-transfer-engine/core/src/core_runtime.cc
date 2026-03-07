@@ -1257,7 +1257,7 @@ chi::TaskResume Runtime::DelTag(hipc::FullPtr<DelTagTask> task,
       }
 
       // Wait for all async DelBlob operations in this batch to complete
-      for (auto task : async_tasks) {
+      for (auto &task : async_tasks) {
         co_await task;
 
         // Check if DelBlob succeeded
