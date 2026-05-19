@@ -66,7 +66,14 @@ jobs:
         env:
           ANACONDA_TOKEN: ${{ secrets.ANACONDA_TOKEN }}
         run: |
+          # setup-miniconda activates the "test" env, but anaconda-client
+          # is installed into "base" (see "Install conda-build" step), so
+          # bare `anaconda` is not on PATH here -> exit 127. Run it
+          # explicitly from the base env. (The build step gets away with
+          # bare `conda build` because that's a `conda` subcommand;
+          # `anaconda` is a separate entry-point binary.)
           for pkg in build/conda-output/**/*.conda build/conda-output/**/*.tar.bz2; do
             [ -f "$pkg" ] || continue
-            anaconda -t "$ANACONDA_TOKEN" upload --user iowarp --force "$pkg"
+            conda run -n base --no-capture-output \
+              anaconda -t "$ANACONDA_TOKEN" upload --user iowarp --force "$pkg"
           done
