@@ -1,9 +1,16 @@
-{# Version is driven by PKG_VERSION which the workflow exports from
+{# Version is driven by IOWARP_PKG_VERSION which the workflow exports from
    CMakeLists.txt's `project(iowarp-core VERSION ...)` before invoking
    `conda build` (so the conda package version tracks the same single
    source of truth as the pip wheel). The "1.0.0" fallback keeps local
-   `conda build installers/conda/` working without setup. #}
-{% set version = environ.get('PKG_VERSION', '1.0.0') %}
+   `conda build installers/conda/` working without setup.
+   NOTE: do NOT name this PKG_VERSION — conda-build reserves PKG_VERSION
+   in its meta.yaml environ (environ.py:595 `d["PKG_VERSION"] = meta.version()`)
+   and overrides whatever os.environ has with the *unrendered* meta.version
+   (which resolves to Python None), so `environ.get('PKG_VERSION', '1.0.0')`
+   returns None (key present, default ignored) and the recipe renders as
+   `iowarp-core-None-...conda`. Same collision risk for PKG_NAME, PKG_HASH,
+   PKG_BUILDNUM, PKG_BUILD_STRING, RECIPE_DIR, GIT_*, HG_*, SHLIB_EXT, PATH. #}
+{% set version = environ.get('IOWARP_PKG_VERSION') or '1.0.0' %}
 {% set preset = environ.get('IOWARP_PRESET', 'release') %}
 
 package:
