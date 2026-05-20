@@ -193,6 +193,30 @@ jobs:
             echo "=== CLI test ==="
             chimaera --help
 
+            echo "=== Benchmark binaries: --help smoke test ==="
+            # These executables exec real ELF binaries shipped in
+            # iowarp_core/bin/.  Running --help catches load-time crashes
+            # (missing NEEDED libs, ABI mismatches, RPATH bugs from
+            # repair_wheel.sh) that the import / ldd checks above don't.
+            # See issue #429 for the regression this guards against.
+            #
+            # wrp_cte_bench's --help is emitted via its logging framework at
+            # ERROR level, which exits non-zero — accept that explicitly.
+            # wrp_run_thrpt_benchmark prints to stdout and exits 1, which we
+            # also accept as long as it doesn't crash.  The point of this
+            # block is to fail the job on SIGSEGV / exit ≥ 128, not on the
+            # benchmarks' own --help exit codes.
+            for bench in wrp_cte_bench wrp_run_thrpt_benchmark; do
+              echo "--- $bench --help ---"
+              "$bench" --help || rc=$?
+              rc=${rc:-0}
+              if [ "$rc" -ge 128 ]; then
+                echo "FAIL: $bench --help died with signal (exit $rc)"
+                exit 1
+              fi
+              unset rc
+            done
+
             echo "=== Symbol resolution check ==="
             LIB_DIR=$(python -c "import iowarp_core; print(iowarp_core.get_lib_dir())")
             export LD_LIBRARY_PATH="$LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"

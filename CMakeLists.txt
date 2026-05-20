@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(iowarp-core VERSION 1.5.6 LANGUAGES C CXX)
+project(iowarp-core VERSION 1.5.7 LANGUAGES C CXX)
 
 #------------------------------------------------------------------------------
 # Project Options
@@ -1287,6 +1287,14 @@ if(TARGET chimaera_admin_client)
 endif()
 if(TARGET chimaera_bdev_client)
   list(APPEND PIP_LIB_TARGETS chimaera_bdev_client chimaera_bdev_runtime)
+endif()
+# Template chimod (used by wrp_run_thrpt_benchmark's "latency" test case via
+# chimaera::MOD_NAME_client).  Without this the benchmark binary's NEEDED list
+# references libchimaera_MOD_NAME_client.so but the wheel doesn't contain it,
+# and the dynamic linker segfaults at load time on glibc/patchelf combinations
+# instead of failing cleanly.  See #429.
+if(TARGET chimaera_MOD_NAME_client)
+  list(APPEND PIP_LIB_TARGETS chimaera_MOD_NAME_client chimaera_MOD_NAME_runtime)
 endif()
 if(WRP_CORE_ENABLE_CTE AND TARGET wrp_cte_core_client)
   list(APPEND PIP_LIB_TARGETS wrp_cte_core_client wrp_cte_core_runtime)
