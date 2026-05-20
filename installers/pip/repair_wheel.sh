@@ -40,11 +40,25 @@ for so in "$WORK_DIR"/unpack/iowarp_core/ext/*.so*; do
     patchelf --set-rpath '$ORIGIN/../lib' "$so" 2>/dev/null || true
 done
 
-# CLI binaries: find libs via $ORIGIN/../lib
-for bin in "$WORK_DIR"/unpack/iowarp_core/bin/*; do
-    [ -f "$bin" ] || continue
-    patchelf --set-rpath '$ORIGIN/../lib' "$bin" 2>/dev/null || true
-done
+# NOTE: Deliberately do NOT patchelf executables in iowarp_core/bin/.
+#
+# The manylinux container ships patchelf 0.15 from yum, which has a known
+# bug where rewriting the dynamic section on certain manylinux-gcc-built
+# binaries inserts a malformed extra RW PT_LOAD segment.  The ELF loader
+# then crashes inside dl_main with SEGV_ACCERR before main() runs (see
+# iowarp/clio-core#429).  The bug is reproducible against
+# wrp_run_thrpt_benchmark but not against the smaller binaries — likely a
+# corner of patchelf 0.15 triggered by binaries with more NEEDED entries.
+#
+# Patching executables is also unnecessary for our use case: every binary
+# in iowarp_core/bin/ is invoked through a [project.scripts] entry point
+# whose Python wrapper (iowarp_core._cli._exec_iowarp_bin) sets
+# LD_LIBRARY_PATH to <pkg>/lib before exec'ing the binary.  So $ORIGIN-
+# relative RPATH would be redundant.
+#
+# Shared libraries (lib/, ext/) are still patched above because Python
+# loads .so files directly without going through our wrapper, so they
+# need RPATH to find their sibling .so dependencies.
 
 # Regenerate RECORD with correct hashes after patchelf modified binaries
 echo "Regenerating RECORD..."
