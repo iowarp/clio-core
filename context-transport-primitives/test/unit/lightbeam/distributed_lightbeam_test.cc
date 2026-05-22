@@ -473,20 +473,7 @@ int main(int argc, char** argv) {
             << "] Overall runtime (first send to last receive): "
             << global_elapsed << " s" << std::endl;
 
-  // Per-phase Send/Recv breakdown (no-op unless CHI_LBM_ZMQ_STATS=1).
-  // Rank-0-only dump keeps the log readable; counters are process-wide
-  // (one process per rank), and the workload is symmetric, so rank 0
-  // is representative of any single daemon.
-  if (my_rank == 0) {
-    ZmqStats::DumpStats("rank0");
-  }
-  // Barrier to make sure the dump appears before MPI tears down.
   MPI_Barrier(MPI_COMM_WORLD);
-  if (my_rank != 0) {
-    // Also dump from rank 1 for cross-validation that the timings are
-    // symmetric (rank 0 is the spurious-skew suspect if anything).
-    if (my_rank == 1) ZmqStats::DumpStats("rank1");
-  }
   MPI_Finalize();
   return 0;
 }
