@@ -43,17 +43,25 @@ install(TARGETS clio_run
 
 # Install `chimaera` as a symlink to `clio_run` (Windows: copy fallback).
 # Done at install time so it lands at ${CMAKE_INSTALL_PREFIX}/bin regardless
-# of CPACK/DESTDIR.
-install(CODE "
-  set(_src \"\${CMAKE_INSTALL_PREFIX}/bin/clio_run\")
-  set(_dst \"\${CMAKE_INSTALL_PREFIX}/bin/chimaera\")
-  if(EXISTS \"\${_src}\")
-    if(WIN32)
+# of CPACK/DESTDIR. On Windows the installed binary is `clio_run.exe`; the
+# EXISTS check must include that suffix or the legacy alias is silently
+# skipped at install time and `chimaera.exe` never lands in the wheel.
+if(WIN32)
+  install(CODE "
+    set(_src \"\${CMAKE_INSTALL_PREFIX}/bin/clio_run.exe\")
+    if(EXISTS \"\${_src}\")
       file(INSTALL \"\${_src}\" DESTINATION \"\${CMAKE_INSTALL_PREFIX}/bin\"
            RENAME chimaera.exe)
-    else()
-      execute_process(COMMAND \${CMAKE_COMMAND} -E create_symlink clio_run \"\${_dst}\")
+      message(STATUS \"Installed chimaera.exe -> clio_run.exe legacy copy\")
     endif()
-    message(STATUS \"Installed chimaera -> clio_run legacy symlink at \${_dst}\")
-  endif()
-")
+  ")
+else()
+  install(CODE "
+    set(_src \"\${CMAKE_INSTALL_PREFIX}/bin/clio_run\")
+    set(_dst \"\${CMAKE_INSTALL_PREFIX}/bin/chimaera\")
+    if(EXISTS \"\${_src}\")
+      execute_process(COMMAND \${CMAKE_COMMAND} -E create_symlink clio_run \"\${_dst}\")
+      message(STATUS \"Installed chimaera -> clio_run legacy symlink at \${_dst}\")
+    endif()
+  ")
+endif()

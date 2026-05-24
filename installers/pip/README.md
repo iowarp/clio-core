@@ -35,6 +35,33 @@ python -c "import iowarp_core; print(iowarp_core.get_version())"
 chimaera --help
 ```
 
+### Windows-specific install notes
+
+On Windows the wheel builds against vcpkg-provided dependencies. Build it with:
+
+```powershell
+pip wheel . --no-deps --wheel-dir dist `
+  --config-settings=cmake.define.CMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
+  --config-settings=cmake.define.VCPKG_MANIFEST_DIR="$(Resolve-Path installers/vcpkg)" `
+  --config-settings=cmake.define.VCPKG_TARGET_TRIPLET=x64-windows `
+  --config-settings=cmake.define.CLIO_CORE_STATIC_DEPS=OFF `
+  --config-settings=cmake.define.CLIO_CORE_ENABLE_IO_URING=OFF
+pip install --force-reinstall --no-deps dist/iowarp_core-*-win_amd64.whl
+```
+
+If pip emits a warning that scripts (`chimaera.exe`, `clio_cte_bench.exe`, …)
+were installed into a directory that is not on `PATH`, you need to add that
+directory yourself — pip refuses to do it for you. This is especially common
+with the Windows Store distribution of Python, which forces `--user` installs
+into `%LOCALAPPDATA%\Packages\PythonSoftwareFoundation.Python.3.X_…\LocalCache\local-packages\Python3XX\Scripts`.
+
+Either:
+
+1. Add the warned-about Scripts directory to your user `PATH` once
+   (`setx PATH "%PATH%;<scripts-dir>"`), open a new shell, and re-run.
+2. Or invoke the entry points via `python -m`:
+   `python -c "from iowarp_core._cli import main; main()" --help`.
+
 ## CI / Wheel Building
 
 The GitHub Actions workflow `.github/workflows/build-pip.yml` uses

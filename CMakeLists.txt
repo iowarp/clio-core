@@ -1414,34 +1414,49 @@ if(TARGET clio_run)
   install(TARGETS clio_run
     COMPONENT pip_package
     RUNTIME DESTINATION bin)
-  install(CODE "
-    set(_pip_dst \"\${CMAKE_INSTALL_PREFIX}/bin/chimaera\")
-    if(EXISTS \"\${CMAKE_INSTALL_PREFIX}/bin/clio_run\" AND NOT EXISTS \"\${_pip_dst}\")
-      if(WIN32)
-        file(INSTALL \"\${CMAKE_INSTALL_PREFIX}/bin/clio_run\"
+  # Legacy `chimaera` alias. On Windows the installed binary is `clio_run.exe`,
+  # so the EXISTS check must include the suffix or the alias gets silently
+  # skipped at install time and `chimaera.exe` never lands in the wheel.
+  if(WIN32)
+    install(CODE "
+      set(_src \"\${CMAKE_INSTALL_PREFIX}/bin/clio_run.exe\")
+      set(_dst \"\${CMAKE_INSTALL_PREFIX}/bin/chimaera.exe\")
+      if(EXISTS \"\${_src}\" AND NOT EXISTS \"\${_dst}\")
+        file(INSTALL \"\${_src}\"
              DESTINATION \"\${CMAKE_INSTALL_PREFIX}/bin\" RENAME chimaera.exe)
-      else()
+      endif()
+    " COMPONENT pip_package)
+  else()
+    install(CODE "
+      set(_pip_dst \"\${CMAKE_INSTALL_PREFIX}/bin/chimaera\")
+      if(EXISTS \"\${CMAKE_INSTALL_PREFIX}/bin/clio_run\" AND NOT EXISTS \"\${_pip_dst}\")
         execute_process(COMMAND \${CMAKE_COMMAND} -E create_symlink clio_run \"\${_pip_dst}\")
       endif()
-    endif()
-  " COMPONENT pip_package)
+    " COMPONENT pip_package)
+  endif()
   # Also install to PYTHON_SITE_PACKAGES/iowarp_core/bin/ so that
   # `sudo make install` keeps the binary in sync with the Python package,
   # matching how chimaera_runtime_ext.so is installed directly to site-packages.
   if(CLIO_CORE_ENABLE_PYTHON AND PYTHON_SITE_PACKAGES)
     install(TARGETS clio_run
       RUNTIME DESTINATION "${PYTHON_SITE_PACKAGES}/iowarp_core/bin")
-    install(CODE "
-      set(_py_dst \"${PYTHON_SITE_PACKAGES}/iowarp_core/bin/chimaera\")
-      if(EXISTS \"${PYTHON_SITE_PACKAGES}/iowarp_core/bin/clio_run\" AND NOT EXISTS \"\${_py_dst}\")
-        if(WIN32)
-          file(INSTALL \"${PYTHON_SITE_PACKAGES}/iowarp_core/bin/clio_run\"
+    if(WIN32)
+      install(CODE "
+        set(_py_src \"${PYTHON_SITE_PACKAGES}/iowarp_core/bin/clio_run.exe\")
+        set(_py_dst \"${PYTHON_SITE_PACKAGES}/iowarp_core/bin/chimaera.exe\")
+        if(EXISTS \"\${_py_src}\" AND NOT EXISTS \"\${_py_dst}\")
+          file(INSTALL \"\${_py_src}\"
                DESTINATION \"${PYTHON_SITE_PACKAGES}/iowarp_core/bin\" RENAME chimaera.exe)
-        else()
+        endif()
+      ")
+    else()
+      install(CODE "
+        set(_py_dst \"${PYTHON_SITE_PACKAGES}/iowarp_core/bin/chimaera\")
+        if(EXISTS \"${PYTHON_SITE_PACKAGES}/iowarp_core/bin/clio_run\" AND NOT EXISTS \"\${_py_dst}\")
           execute_process(COMMAND \${CMAKE_COMMAND} -E create_symlink clio_run \"\${_py_dst}\")
         endif()
-      endif()
-    ")
+      ")
+    endif()
   endif()
 endif()
 
@@ -1495,6 +1510,24 @@ install(FILES context-runtime/config/chimaera_default.yaml
 install(FILES installers/pip/iowarp_core.pth
   COMPONENT pip_package
   DESTINATION ..)
+
+# On Windows, bundle vcpkg runtime DLLs into bin/ so the installed .exe
+# binaries and the .pyd extensions can find their dependencies. vcpkg's
+# build-tree VCPKG_APPLOCAL_DEPS handles the .exe-adjacent copies during
+# build, but the install tree only contains our own DLLs unless we copy
+# the third-party ones ourselves. Without this step, every clio_cte_bench
+# invocation fails with "libzmq-mt-*.dll: cannot open shared object file".
+if(WIN32 AND DEFINED VCPKG_INSTALLED_DIR AND DEFINED VCPKG_TARGET_TRIPLET)
+  set(_vcpkg_bin "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}/bin")
+  if(IS_DIRECTORY "${_vcpkg_bin}")
+    file(GLOB _vcpkg_dlls "${_vcpkg_bin}/*.dll")
+    if(_vcpkg_dlls)
+      install(FILES ${_vcpkg_dlls}
+        COMPONENT pip_package
+        DESTINATION bin)
+    endif()
+  endif()
+endif()
 
 #------------------------------------------------------------------------------
 # CPack Configuration
