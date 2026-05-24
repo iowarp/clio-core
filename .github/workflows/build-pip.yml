@@ -332,7 +332,7 @@ jobs:
             python -c "import iowarp_core; print(\"CTE available:\", iowarp_core.cte_available())"
 
             echo "=== CLI test ==="
-            chimaera --help
+            clio_run --help
 
             echo "=== Benchmark binaries: --help smoke test ==="
             # NOTE: This entire docker invocation is wrapped in bash -c
@@ -440,7 +440,7 @@ jobs:
         python -c "import iowarp_core; print('CTE available:', iowarp_core.cte_available())"
 
         echo "=== CLI test ==="
-        chimaera --help
+        clio_run --help
 
         echo "=== Benchmark binaries: --help smoke test ==="
         # Catch SIGSEGV / abort at load time. Bench --help exit codes
@@ -477,9 +477,9 @@ jobs:
 
   #------------------------------------------------------------
   # Test Windows wheels natively (Linux Docker doesn't run on Windows
-  # runners). v1.9.0 shipped a Windows wheel where `chimaera --help`
-  # failed because chimaera.exe was missing from the wheel and the
-  # Python CLI wrapper assumed LD_LIBRARY_PATH semantics — exactly the
+  # runners). v1.9.0 shipped a Windows wheel where `clio_run --help`
+  # failed because clio_run.exe couldn't load its DLLs and the Python
+  # CLI wrapper assumed LD_LIBRARY_PATH semantics — exactly the
   # class of thing this job is meant to catch. Same shape as the macOS
   # native test: pip install into a clean venv, run import + CLI +
   # benchmark smoke tests.
@@ -520,14 +520,14 @@ jobs:
         if ($LASTEXITCODE -ne 0) { throw "cte_available failed" }
 
         Write-Host "=== CLI test ==="
-        chimaera --help
-        # chimaera --help typically exits non-zero (printing usage),
+        clio_run --help
+        # clio_run --help typically exits non-zero (printing usage),
         # which is fine. Only fail on missing-binary / DLL-load errors,
         # which surface as Windows error 0xC0000135 (-1073741515) or
         # similar load-time codes. Treat any negative exit code as a
         # crash; positive small codes are app-level "I printed usage".
         if ($LASTEXITCODE -lt 0 -or $LASTEXITCODE -gt 100) {
-          throw "chimaera --help died with exit code $LASTEXITCODE (likely missing DLL or binary)"
+          throw "clio_run --help died with exit code $LASTEXITCODE (likely missing DLL or binary)"
         }
 
         Write-Host "=== Benchmark binaries: --help smoke test ==="

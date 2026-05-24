@@ -82,8 +82,18 @@ def _exec_iowarp_bin(name):
     os.execve(bin_path, [bin_path] + sys.argv[1:], env)
 
 
+def clio_run_main():
+    """Entry point for the ``clio_run`` console script (canonical)."""
+    _exec_iowarp_bin("clio_run")
+
+
 def main():
-    """Entry point for the ``chimaera`` console script."""
+    """Entry point for the deprecated ``chimaera`` console script.
+
+    Kept as a backward-compat shim. New code should call ``clio_run``;
+    this dispatches to the chimaera.exe alias so existing pipelines
+    keep working until the alias is removed in a future release.
+    """
     _exec_iowarp_bin("chimaera")
 
 

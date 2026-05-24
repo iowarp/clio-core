@@ -32,7 +32,7 @@ pip install -v .
 
 ```bash
 python -c "import iowarp_core; print(iowarp_core.get_version())"
-chimaera --help
+clio_run --help
 ```
 
 ### Windows-specific install notes
@@ -49,7 +49,7 @@ pip wheel . --no-deps --wheel-dir dist `
 pip install --force-reinstall --no-deps dist/iowarp_core-*-win_amd64.whl
 ```
 
-If pip emits a warning that scripts (`chimaera.exe`, `clio_cte_bench.exe`, …)
+If pip emits a warning that scripts (`clio_run.exe`, `clio_cte_bench.exe`, …)
 were installed into a directory that is not on `PATH`, you need to add that
 directory yourself — pip refuses to do it for you. This is especially common
 with the Windows Store distribution of Python, which forces `--user` installs
@@ -59,8 +59,8 @@ Either:
 
 1. Add the warned-about Scripts directory to your user `PATH` once
    (`setx PATH "%PATH%;<scripts-dir>"`), open a new shell, and re-run.
-2. Or invoke the entry points via `python -m`:
-   `python -c "from iowarp_core._cli import main; main()" --help`.
+2. Or invoke the entry points via `python -c`:
+   `python -c "from iowarp_core._cli import clio_run_main; clio_run_main()" --help`.
 
 ## CI / Wheel Building
 
@@ -96,7 +96,7 @@ bash fix_rpaths.sh /path/to/site-packages
 ```
 iowarp_core/
   __init__.py        # Library path setup
-  _cli.py            # chimaera CLI entry point
+  _cli.py            # clio_run / benchmark CLI entry points
   _config.py         # Config file resolution
   lib/               # IOWarp shared libraries (static deps baked in)
   ext/               # Python extension modules

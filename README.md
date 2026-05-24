@@ -76,7 +76,7 @@ linked. No system installs are required beyond glibc and Python 3.10+.
 pip install iowarp-core
 ```
 
-The wheel includes the Clio runtime, the `chimaera` CLI, the CTE,
+The wheel includes the Clio runtime, the `clio_run` CLI, the CTE,
 CAE, and CEE engines, and the `clio_cee` Python bindings. A default
 configuration is seeded at `~/.clio/clio.yaml` (legacy: `~/.chimaera/chimaera.yaml`) on first import.
 

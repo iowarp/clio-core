@@ -31,10 +31,12 @@ visualizer = [
 ]
 
 [project.scripts]
-chimaera = "iowarp_core._cli:main"
+clio_run = "iowarp_core._cli:clio_run_main"
 clio_cte_bench = "iowarp_core._cli:cte_bench_main"
 clio_run_thrpt_bench = "iowarp_core._cli:run_thrpt_main"
 context-visualizer = "context_visualizer.__main__:main"
+# Deprecated alias kept for backward compatibility; prefer `clio_run`.
+chimaera = "iowarp_core._cli:main"
 
 [project.urls]
 Homepage = "https://iowarp.ai"

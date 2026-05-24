@@ -167,7 +167,7 @@ for DISTRO in "${DISTROS[@]}"; do
             python -c "import iowarp_core; print(\"CTE available:\", iowarp_core.cte_available())"
 
             echo "=== CLI test ==="
-            chimaera --help
+            clio_run --help
 
             echo "=== Symbol resolution check ==="
             LIB_DIR=$(python -c "import iowarp_core; print(iowarp_core.get_lib_dir())")
