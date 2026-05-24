@@ -152,23 +152,26 @@ install(TARGETS clio_run_cxx ${_GPU_TARGET} ${_CEREAL_TARGET}
   INCLUDES DESTINATION include
 )
 
-# Install libchimaera_cxx.so / libchimaera_cxx_gpu.so symlinks alongside
-# the canonical libclio_run_cxx.so* and libclio_run_cxx_gpu.so* so any
-# external binary that loaded the historical name via LD_LIBRARY_PATH or
-# RPATH (dlopen / direct -lchimaera_cxx{,_gpu} link) keeps resolving.
+# Install libchimaera_cxx.{so,dylib} / libchimaera_cxx_gpu.{so,dylib}
+# symlinks alongside the canonical libclio_run_cxx{,_gpu}.{so,dylib}* so
+# any external binary that loaded the historical name via LD_LIBRARY_PATH
+# or RPATH (dlopen / direct -lchimaera_cxx{,_gpu} link) keeps resolving.
 install(CODE "
   if(WIN32)
     return()
   endif()
   set(_libdir \"\${CMAKE_INSTALL_PREFIX}/lib\")
-  # SHARED libs land as e.g. libclio_run_cxx.so.1.5.7 with
-  # libclio_run_cxx.so.1 and libclio_run_cxx.so symlinks.
-  # The wildcard `libclio_run_cxx*.so*` catches both the host lib AND
-  # the GPU twin (libclio_run_cxx_gpu.so*) so the legacy symlink trio
-  # is created for both — verified by the gpu-tests CI step which
-  # tests for libchimaera_cxx_gpu.so.
+  # SHARED libs land as e.g. libclio_run_cxx.so.1.5.7 on Linux with
+  # libclio_run_cxx.so.1 and libclio_run_cxx.so symlinks; on macOS as
+  # libclio_run_cxx.1.5.7.dylib with libclio_run_cxx.1.dylib and
+  # libclio_run_cxx.dylib symlinks.
+  # The wildcards catch both the host lib AND the GPU twin
+  # (libclio_run_cxx_gpu) so the legacy symlink trio is created for
+  # both — verified by the gpu-tests CI step which tests for
+  # libchimaera_cxx_gpu.so.
   file(GLOB _real_files RELATIVE \"\${_libdir}\"
-       \"\${_libdir}/libclio_run_cxx*.so*\")
+       \"\${_libdir}/libclio_run_cxx*.so*\"
+       \"\${_libdir}/libclio_run_cxx*.dylib\")
   foreach(_real_name \${_real_files})
     string(REPLACE \"libclio_run_cxx\" \"libchimaera_cxx\"
            _link_name \"\${_real_name}\")
@@ -218,7 +221,14 @@ install(CODE "
     set(_HOME \"\$ENV{HOME}\")
   endif()
 
+  # During CPack packaging, CMAKE_INSTALL_PREFIX points to /usr (or similar)
+  # but files are actually staged under DESTDIR. If the source yaml does not
+  # exist at the bare prefix path, this is a packaging install — skip seeding.
   set(_DEFAULT_SRC \"\${CMAKE_INSTALL_PREFIX}/etc/chimaera/chimaera_default.yaml\")
+  if(NOT EXISTS \"\${_DEFAULT_SRC}\")
+    message(STATUS \"Skipping user config seed (packaging install): \${_DEFAULT_SRC} not present\")
+    return()
+  endif()
 
   # Per-destination seeding helper: directory + filename + optional chown
   foreach(_entry

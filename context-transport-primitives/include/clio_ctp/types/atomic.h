@@ -1063,6 +1063,98 @@ template <typename T>
 using atomic = std_atomic<T>;
 #endif
 
+#if CTP_IS_HOST
+/**
+ * Portable equivalent of std::atomic_ref<T>: lock-free atomic ops on
+ * existing non-atomic storage (no need to change the field type).
+ *
+ * Why not just use std::atomic_ref directly:
+ *   - libstdc++ (Linux) has it from C++20.
+ *   - MSVC's STL has it since VS 2019 16.7.
+ *   - Apple's libc++ shipped with the macOS 14 SDK does NOT have it
+ *     (added in libc++ ~17, which only lands on macOS 15+).
+ *
+ * Dispatch:
+ *   - On MSVC, delegate to std::atomic_ref.
+ *   - On GCC/Clang/AppleClang, use the `__atomic_*` builtins. These
+ *     are always available, compile to the same lock-free instructions
+ *     std::atomic_ref would, and impose no libc++ version requirement.
+ *
+ * Memory-order conversion: GCC's `__ATOMIC_*` macro values are
+ * deliberately equal to the integer values of std::memory_order, so a
+ * static_cast<int>(order) round-trips correctly on both paths.
+ */
+template <typename T>
+class atomic_ref {
+#if defined(_MSC_VER)
+  std::atomic_ref<T> inner_;
+ public:
+  CTP_INLINE explicit atomic_ref(T &value) noexcept : inner_(value) {}
+  CTP_INLINE T load(
+      std::memory_order o = std::memory_order_seq_cst) const noexcept {
+    return inner_.load(o);
+  }
+  CTP_INLINE void store(
+      T v, std::memory_order o = std::memory_order_seq_cst) noexcept {
+    inner_.store(v, o);
+  }
+  CTP_INLINE T fetch_add(
+      T v, std::memory_order o = std::memory_order_seq_cst) noexcept {
+    return inner_.fetch_add(v, o);
+  }
+  CTP_INLINE T fetch_sub(
+      T v, std::memory_order o = std::memory_order_seq_cst) noexcept {
+    return inner_.fetch_sub(v, o);
+  }
+  CTP_INLINE bool compare_exchange_weak(
+      T &expected, T desired,
+      std::memory_order o = std::memory_order_seq_cst) noexcept {
+    return inner_.compare_exchange_weak(expected, desired, o);
+  }
+  CTP_INLINE bool compare_exchange_strong(
+      T &expected, T desired,
+      std::memory_order o = std::memory_order_seq_cst) noexcept {
+    return inner_.compare_exchange_strong(expected, desired, o);
+  }
+#else
+  T *ptr_;
+  static constexpr int mo(std::memory_order o) noexcept {
+    return static_cast<int>(o);
+  }
+ public:
+  CTP_INLINE explicit atomic_ref(T &value) noexcept : ptr_(&value) {}
+  CTP_INLINE T load(
+      std::memory_order o = std::memory_order_seq_cst) const noexcept {
+    return __atomic_load_n(ptr_, mo(o));
+  }
+  CTP_INLINE void store(
+      T v, std::memory_order o = std::memory_order_seq_cst) noexcept {
+    __atomic_store_n(ptr_, v, mo(o));
+  }
+  CTP_INLINE T fetch_add(
+      T v, std::memory_order o = std::memory_order_seq_cst) noexcept {
+    return __atomic_fetch_add(ptr_, v, mo(o));
+  }
+  CTP_INLINE T fetch_sub(
+      T v, std::memory_order o = std::memory_order_seq_cst) noexcept {
+    return __atomic_fetch_sub(ptr_, v, mo(o));
+  }
+  CTP_INLINE bool compare_exchange_weak(
+      T &expected, T desired,
+      std::memory_order o = std::memory_order_seq_cst) noexcept {
+    return __atomic_compare_exchange_n(ptr_, &expected, desired,
+                                       /*weak=*/true, mo(o), mo(o));
+  }
+  CTP_INLINE bool compare_exchange_strong(
+      T &expected, T desired,
+      std::memory_order o = std::memory_order_seq_cst) noexcept {
+    return __atomic_compare_exchange_n(ptr_, &expected, desired,
+                                       /*weak=*/false, mo(o), mo(o));
+  }
+#endif
+};
+#endif  // CTP_IS_HOST
+
 #if CTP_IS_GPU && CTP_ENABLE_CUDA_OR_ROCM
 template <typename T>
 using atomic = rocm_atomic<T>;

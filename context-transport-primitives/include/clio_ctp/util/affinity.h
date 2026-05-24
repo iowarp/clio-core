@@ -34,7 +34,12 @@
 #ifndef CTP_SHM_AFFINITY_H
 #define CTP_SHM_AFFINITY_H
 
-#ifndef _WIN32
+// ProcessAffiner is built on glibc-only primitives (sched_setaffinity,
+// cpu_set_t, get_nprocs_conf, /proc walking), so it is Linux-only.
+// macOS exposes no equivalent in libpthread; Windows uses a different
+// API entirely. Both compile this class out — no current call site
+// needs it on those platforms.
+#ifdef __linux__
 
 // Reference:
 // https://stackoverflow.com/questions/63372288/getting-list-of-pids-from-proc-in-linux
@@ -191,6 +196,6 @@ class ProcessAffiner {
 
 }  // namespace ctp
 
-#endif  // _WIN32
+#endif  // __linux__
 
 #endif  // CTP_SHM_AFFINITY_H

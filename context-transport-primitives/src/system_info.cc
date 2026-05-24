@@ -86,6 +86,9 @@
 #if __linux__
 #include <linux/memfd.h>
 #endif
+#if __APPLE__
+#include <pthread.h>
+#endif
 // WINDOWS
 #elif CTP_ENABLE_WINDOWS_SYSINFO
 #include <winsock2.h>
@@ -264,14 +267,13 @@ int SystemInfo::GetPageSize() {
 
 int SystemInfo::GetTid() {
 #if CTP_ENABLE_PROCFS_SYSINFO
-#ifdef SYS_gettid
 #ifdef __linux__
   return (pid_t)syscall(SYS_gettid);
+#elif __APPLE__
+  uint64_t tid = 0;
+  pthread_threadid_np(nullptr, &tid);
+  return static_cast<int>(tid);
 #else
-  return GetPid();
-#endif
-#else
-#warning "GetTid is not defined"
   return GetPid();
 #endif
 #elif CTP_ENABLE_WINDOWS_SYSINFO
@@ -575,8 +577,13 @@ void *SystemInfo::MapPrivateMemory(size_t size) {
 
 void *SystemInfo::MapSharedMemory(const File &fd, size_t size, i64 off) {
 #if CTP_ENABLE_PROCFS_SYSINFO
+#if __APPLE__ || __OpenBSD__
+  void *ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED,
+                   fd.posix_fd_, static_cast<off_t>(off));
+#else
   void *ptr = mmap64(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED,
                      fd.posix_fd_, off);
+#endif
   if (ptr == MAP_FAILED) {
     perror("mmap");
     return nullptr;

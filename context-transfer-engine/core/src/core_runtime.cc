@@ -43,6 +43,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+
+#include "clio_ctp/types/atomic.h"  // ctp::ipc::atomic_ref
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -2605,13 +2607,13 @@ chi::TaskResume Runtime::ExtendBlob(BlobInfo &blob_info, chi::u64 offset,
     // (only RegisterTarget inserts, at setup), so a shared READ lock is
     // sufficient to traverse/find it — no exclusive write lock for a
     // plain integer update. The counter is mutated lock-free via
-    // std::atomic_ref with a CAS loop that saturates at 0 instead of
-    // underflowing the unsigned value.
+    // ctp::ipc::atomic_ref with a CAS loop that saturates at 0 instead
+    // of underflowing the unsigned value.
     {
       chi::ScopedCoRwReadLock read_lock(target_lock_);
       TargetInfo *ti = registered_targets_.find(selected_target_id);
       if (ti != nullptr) {
-        std::atomic_ref<chi::u64> rs(ti->remaining_space_);
+        ctp::ipc::atomic_ref<chi::u64> rs(ti->remaining_space_);
         chi::u64 cur = rs.load(std::memory_order_relaxed);
         while (!rs.compare_exchange_weak(
             cur, (cur > allocate_size) ? cur - allocate_size : 0,
@@ -3035,14 +3037,14 @@ chi::TaskResume Runtime::FreeAllBlobBlocks(BlobInfo &blob_info,
       // Successfully freed blocks - credit target's remaining_space_.
       // Shared READ lock only: registered_targets_ is structurally
       // stationary on the data path; the counter is bumped lock-free
-      // via std::atomic_ref (no exclusive lock for an integer add).
+      // via ctp::ipc::atomic_ref (no exclusive lock for an integer add).
       chi::ScopedCoRwReadLock read_lock(target_lock_);
       TargetInfo *target_info = registered_targets_.find(pool_id);
       if (target_info != nullptr) {
-        chi::u64 now = std::atomic_ref<chi::u64>(target_info->remaining_space_)
-                           .fetch_add(bytes_freed,
-                                      std::memory_order_relaxed) +
-                       bytes_freed;
+        chi::u64 now =
+            ctp::ipc::atomic_ref<chi::u64>(target_info->remaining_space_)
+                .fetch_add(bytes_freed, std::memory_order_relaxed) +
+            bytes_freed;
         HLOG(kDebug, "Updated target {} remaining_space_ by +{} bytes (now {})",
              pool_id.major_, bytes_freed, now);
       }

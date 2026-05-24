@@ -31,6 +31,7 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include <clio_ctp/introspect/system_info.h>
 #include <clio_ctp/lightbeam/event_manager.h>
 #include <clio_ctp/lightbeam/socket_transport.h>
 #include <clio_ctp/lightbeam/transport_factory_impl.h>
@@ -154,7 +155,7 @@ void TestAddSignalEvent() {
 
   // Signal the current thread
   pid_t pid = getpid();
-  pid_t tid = static_cast<pid_t>(syscall(SYS_gettid));
+  pid_t tid = static_cast<pid_t>(ctp::SystemInfo::GetTid());
   int rc = EventManager::Signal(pid, tid);
   assert(rc == 0);
 
@@ -174,7 +175,7 @@ void TestSignalEventWithAction() {
   assert(event_id >= 0);
 
   pid_t pid = getpid();
-  pid_t tid = static_cast<pid_t>(syscall(SYS_gettid));
+  pid_t tid = static_cast<pid_t>(ctp::SystemInfo::GetTid());
   int rc = EventManager::Signal(pid, tid);
   assert(rc == 0);
 

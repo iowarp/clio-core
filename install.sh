@@ -249,7 +249,9 @@ export IOWARP_PRESET="$PRESET"
 # `libmambapy.bindings.specs.ParseError: invalid version predicate in "None"`.
 # Mirrors the same extraction step in .github/workflows/install-conda.yml.
 if [ -z "${PKG_VERSION:-}" ]; then
-    PKG_VERSION="$(grep -oP 'project\(iowarp-core VERSION \K[\d.]+' "$SCRIPT_DIR/CMakeLists.txt" || true)"
+    # Portable extraction (BSD sed on macOS lacks PCRE `\K`, so don't use `grep -oP`).
+    PKG_VERSION="$(sed -nE 's/.*project\(iowarp-core VERSION ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' \
+        "$SCRIPT_DIR/CMakeLists.txt" | head -1)"
     if [ -z "$PKG_VERSION" ]; then
         PKG_VERSION="1.0.0"
     fi
@@ -269,7 +271,11 @@ echo -e "${BLUE}Target Python version: $PYVER (from conda_build_config.yaml)${NC
 if [ "$ONLY_DEPS" = true ]; then
     echo -e "${BLUE}>>> --only-deps: installing iowarp-core dependencies (no build)${NC}"
     echo ""
-    RENDERED="$(mktemp --suffix=.yaml)"
+    # `mktemp --suffix=` is GNU-only; on BSD/macOS we get the name first
+    # then rename to add the .yaml suffix (some tools key off the extension).
+    RENDERED_BASE="$(mktemp -t iowarp-render.XXXXXX)"
+    RENDERED="${RENDERED_BASE}.yaml"
+    mv "$RENDERED_BASE" "$RENDERED"
     # -f writes the rendered YAML to FILE without the "Hash contents:"
     # / "meta.yaml:" prelude that `conda render` would otherwise emit
     # on stdout (which is not parseable as pure YAML).
@@ -286,17 +292,20 @@ if [ "$ONLY_DEPS" = true ]; then
 
     # Parse rendered meta.yaml with python+yaml (conda-build pulls in
     # pyyaml into base, so $CONDA_BIN's python has it).
-    DEPS="$("$CONDA_BASE/bin/python" - "$RENDERED" <<'PY'
+    # NOTE: a heredoc inside `$(...)` triggers a parser bug in bash 3.2
+    # (the version macOS ships at /bin/bash), so we write the script to
+    # a temp file and run it instead. `conda render` resolves each dep
+    # to "name version build" with the exact transitive build hash; for
+    # a dev "install deps" flow we want the loosest practical pin so the
+    # solver can fit them into the user's active env. Strip to just the
+    # package name (drop version and build hash). Users who need strict
+    # pinning should `conda build` the full package.
+    DEPS_SCRIPT="$(mktemp -t iowarp-deps.XXXXXX)"
+    cat >"$DEPS_SCRIPT" <<'PY'
 import sys, yaml
 with open(sys.argv[1]) as f:
     data = yaml.safe_load(f)
 reqs = (data or {}).get("requirements", {}) or {}
-# `conda render` resolves each dep to "name version build" with the
-# exact transitive build hash; for a dev "install deps" flow we want
-# the loosest practical pin so the solver can fit them into the user's
-# active env. Strip to just the package name (drop version and build
-# hash). Users who need strict pinning should `conda build` the full
-# package, which already encodes them.
 seen_names = set()
 ordered = []
 for section in ("build", "host", "run"):
@@ -310,8 +319,8 @@ for section in ("build", "host", "run"):
         ordered.append(name)
 print(" ".join(ordered))
 PY
-)"
-    rm -f "$RENDERED"
+    DEPS="$("$CONDA_BASE/bin/python" "$DEPS_SCRIPT" "$RENDERED")"
+    rm -f "$DEPS_SCRIPT" "$RENDERED"
 
     if [ -z "$DEPS" ]; then
         echo -e "${RED}No dependencies extracted from recipe.${NC}"

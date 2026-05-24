@@ -69,6 +69,8 @@ struct EventInfo {
 
 #ifdef _WIN32
 #include "clio_ctp/lightbeam/event_manager_win.h"
+#elif __APPLE__
+#include "clio_ctp/lightbeam/event_manager_macos.h"
 #else
 #include "clio_ctp/lightbeam/event_manager_linux.h"
 #endif

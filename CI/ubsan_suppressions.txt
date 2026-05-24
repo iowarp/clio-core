@@ -1,0 +1,4 @@
+# GCC 13 false positive: mt19937::operator() accesses _M_x[624] which is valid
+# for the 624-element state array but UBSan incorrectly flags the internal
+# bounds check in random.tcc:462 as "index 624 out of bounds".
+bounds:/usr/include/c++/13/bits/random.tcc

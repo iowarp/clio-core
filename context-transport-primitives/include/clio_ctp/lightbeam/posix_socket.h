@@ -69,7 +69,9 @@ using ssize_t = SSIZE_T;
 #include <unistd.h>
 #include <poll.h>
 #include <fcntl.h>
+#ifdef __linux__
 #include <sys/epoll.h>
+#endif
 #endif
 
 namespace ctp::lbm::sock {
@@ -118,7 +120,7 @@ CTP_DLL int PollReadMulti(const socket_t* fds, int count, int timeout_ms);
 /** Remove a file path (unlink on POSIX, DeleteFileA on Windows) */
 CTP_DLL void UnlinkPath(const char* path);
 
-#ifndef _WIN32
+#ifdef __linux__
 /** Create an epoll file descriptor. Returns epoll fd or -1 on error. */
 int EpollCreate();
 

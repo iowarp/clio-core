@@ -42,6 +42,10 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
+# Snapshot LD_LIBRARY_PATH before any sanitizer run mutates it so each mode
+# starts from a clean base (prevents build-asan/bin from leaking into ubsan).
+_ORIG_LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"
+
 # Default options
 DO_ASAN=false
 DO_UBSAN=false
@@ -132,7 +136,7 @@ run_sanitizer_mode() {
     # Prepending the system lib dirs ensures the Ubuntu-native libcurl/libssl/
     # libcrypto trio is found first (compatible with each other), while conda's
     # other libraries (zeromq, libaio, yaml-cpp) remain available as fallback.
-    export LD_LIBRARY_PATH="${BUILD_DIR}/bin:/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}"
+    export LD_LIBRARY_PATH="${BUILD_DIR}/bin:/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu:${_ORIG_LD_LIBRARY_PATH}"
     print_info "LD_LIBRARY_PATH (system-prefixed): ${LD_LIBRARY_PATH}"
 
     # --- Clean ---
@@ -258,11 +262,13 @@ if [ "$DO_ASAN" = true ]; then
 fi
 
 if [ "$DO_UBSAN" = true ]; then
+    export UBSAN_OPTIONS="suppressions=${REPO_ROOT}/CI/ubsan_suppressions.txt"
     run_sanitizer_mode \
         "ubsan" \
         "UndefinedBehaviorSanitizer" \
         "print_stacktrace=1:halt_on_error=0" \
         || OVERALL_STATUS=$?
+    unset UBSAN_OPTIONS
 fi
 
 if [ "$DO_MSAN" = true ]; then

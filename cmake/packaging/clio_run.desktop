@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=IOWarp Core Runtime
+Exec=clio_run
+Icon=clio_run
+Categories=System;
+Terminal=true

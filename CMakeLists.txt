@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(iowarp-core VERSION 1.5.8 LANGUAGES C CXX)
+project(iowarp-core VERSION 1.9.1 LANGUAGES C CXX)
 
 #------------------------------------------------------------------------------
 # Project Options
@@ -32,6 +32,9 @@ option(CLIO_CORE_ENABLE_COVERAGE "Enable code coverage instrumentation for all c
 option(CLIO_CORE_ENABLE_DOXYGEN "Check how well the code is documented" OFF)
 option(CLIO_CORE_ENABLE_RPATH "Enable RPATH configuration with relative ($ORIGIN) paths" ON)
 option(CLIO_CORE_ENABLE_CPACK "Enable CPack for package generation" OFF)
+option(CLIO_CORE_ENABLE_DEB_PACKAGE "Build Debian .deb package via CPack" OFF)
+option(CLIO_CORE_ENABLE_RPM_PACKAGE "Build RPM .rpm package via CPack" OFF)
+option(CLIO_CORE_ENABLE_APPIMAGE "Build portable AppImage via appimagetool" OFF)
 option(CLIO_CORE_ENABLE_CONDA "Enable Conda environment configuration (adds Conda paths to include/link directories)" OFF)
 option(CLIO_CORE_ENABLE_DOCKER_CI "Enable Docker-based integration tests (requires Docker)" OFF)
 option(BUILD_SHARED_LIBS "Build shared libraries (.dll/.so) instead of static ones (.lib/.a)" ON)
@@ -259,7 +262,11 @@ endif()
 # (IMPORTED_LOCATION_RELEASE, IMPORTED_SONAME_RELEASE) take precedence
 # over the generic IMPORTED_LOCATION.  We must override every config that
 # was registered so the linker always picks the static archive.
-if(CLIO_CORE_STATIC_DEPS)
+# On Windows, vcpkg manages static vs shared via the triplet; skip the override.
+# On macOS, Homebrew ships only .dylib (no .a). delocate then bundles the
+# shared lib into the wheel — the wheel still self-contains, just via a
+# bundled dylib instead of a static archive.
+if(CLIO_CORE_STATIC_DEPS AND NOT WIN32 AND NOT APPLE)
     find_library(YAML_CPP_STATIC_LIB NAMES libyaml-cpp.a REQUIRED)
     if(YAML_CPP_STATIC_LIB)
         message(STATUS "Static yaml-cpp: ${YAML_CPP_STATIC_LIB}")
@@ -531,9 +538,11 @@ if(CLIO_CORE_ENABLE_ZMQ)
         pkg_check_modules(ZeroMQ QUIET libzmq)
         if(ZeroMQ_FOUND)
             message(STATUS "found zmq.h at ${ZeroMQ_INCLUDE_DIRS}")
-            if(CLIO_CORE_STATIC_DEPS)
+            if(CLIO_CORE_STATIC_DEPS AND NOT WIN32 AND NOT APPLE)
                 # Find static .a archives directly — pkg-config _STATIC_LIBRARIES
                 # still returns -l flags that the linker resolves to shared libs.
+                # Skipped on Windows (vcpkg manages static/shared via triplet)
+                # and macOS (Homebrew ships .dylib only; delocate bundles it).
                 find_library(ZMQ_STATIC_LIB NAMES libzmq.a REQUIRED)
                 set(ZMQ_LIBS ${ZMQ_STATIC_LIB})
                 # Pull in zmq's transitive static deps (libsodium, pthreads, etc.)
@@ -1414,49 +1423,46 @@ if(TARGET clio_run)
   install(TARGETS clio_run
     COMPONENT pip_package
     RUNTIME DESTINATION bin)
-  # Legacy `chimaera` alias. On Windows the installed binary is `clio_run.exe`,
-  # so the EXISTS check must include the suffix or the alias gets silently
-  # skipped at install time and `chimaera.exe` never lands in the wheel.
-  if(WIN32)
-    install(CODE "
-      set(_src \"\${CMAKE_INSTALL_PREFIX}/bin/clio_run.exe\")
-      set(_dst \"\${CMAKE_INSTALL_PREFIX}/bin/chimaera.exe\")
-      if(EXISTS \"\${_src}\" AND NOT EXISTS \"\${_dst}\")
-        file(INSTALL \"\${_src}\"
-             DESTINATION \"\${CMAKE_INSTALL_PREFIX}/bin\" RENAME chimaera.exe)
-      endif()
-    " COMPONENT pip_package)
-  else()
-    install(CODE "
+  install(CODE "
+    if(WIN32)
+      set(_pip_src \"\${CMAKE_INSTALL_PREFIX}/bin/clio_run.exe\")
+      set(_pip_dst \"\${CMAKE_INSTALL_PREFIX}/bin/chimaera.exe\")
+    else()
+      set(_pip_src \"\${CMAKE_INSTALL_PREFIX}/bin/clio_run\")
       set(_pip_dst \"\${CMAKE_INSTALL_PREFIX}/bin/chimaera\")
-      if(EXISTS \"\${CMAKE_INSTALL_PREFIX}/bin/clio_run\" AND NOT EXISTS \"\${_pip_dst}\")
+    endif()
+    if(EXISTS \"\${_pip_src}\" AND NOT EXISTS \"\${_pip_dst}\")
+      if(WIN32)
+        file(INSTALL \"\${_pip_src}\"
+             DESTINATION \"\${CMAKE_INSTALL_PREFIX}/bin\" RENAME chimaera.exe)
+      else()
         execute_process(COMMAND \${CMAKE_COMMAND} -E create_symlink clio_run \"\${_pip_dst}\")
       endif()
-    " COMPONENT pip_package)
-  endif()
+    endif()
+  " COMPONENT pip_package)
   # Also install to PYTHON_SITE_PACKAGES/iowarp_core/bin/ so that
   # `sudo make install` keeps the binary in sync with the Python package,
   # matching how chimaera_runtime_ext.so is installed directly to site-packages.
   if(CLIO_CORE_ENABLE_PYTHON AND PYTHON_SITE_PACKAGES)
     install(TARGETS clio_run
       RUNTIME DESTINATION "${PYTHON_SITE_PACKAGES}/iowarp_core/bin")
-    if(WIN32)
-      install(CODE "
+    install(CODE "
+      if(WIN32)
         set(_py_src \"${PYTHON_SITE_PACKAGES}/iowarp_core/bin/clio_run.exe\")
         set(_py_dst \"${PYTHON_SITE_PACKAGES}/iowarp_core/bin/chimaera.exe\")
-        if(EXISTS \"\${_py_src}\" AND NOT EXISTS \"\${_py_dst}\")
+      else()
+        set(_py_src \"${PYTHON_SITE_PACKAGES}/iowarp_core/bin/clio_run\")
+        set(_py_dst \"${PYTHON_SITE_PACKAGES}/iowarp_core/bin/chimaera\")
+      endif()
+      if(EXISTS \"\${_py_src}\" AND NOT EXISTS \"\${_py_dst}\")
+        if(WIN32)
           file(INSTALL \"\${_py_src}\"
                DESTINATION \"${PYTHON_SITE_PACKAGES}/iowarp_core/bin\" RENAME chimaera.exe)
-        endif()
-      ")
-    else()
-      install(CODE "
-        set(_py_dst \"${PYTHON_SITE_PACKAGES}/iowarp_core/bin/chimaera\")
-        if(EXISTS \"${PYTHON_SITE_PACKAGES}/iowarp_core/bin/clio_run\" AND NOT EXISTS \"\${_py_dst}\")
+        else()
           execute_process(COMMAND \${CMAKE_COMMAND} -E create_symlink clio_run \"\${_py_dst}\")
         endif()
-      ")
-    endif()
+      endif()
+    ")
   endif()
 endif()
 
@@ -1532,34 +1538,14 @@ endif()
 #------------------------------------------------------------------------------
 # CPack Configuration
 #------------------------------------------------------------------------------
-if(CLIO_CORE_ENABLE_CPACK)
-    set(CPACK_PACKAGE_NAME "iowarp-core")
-    set(CPACK_PACKAGE_VENDOR "IOWarp Team")
-    set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "IOWarp Core: High-performance distributed I/O and task execution runtime")
-    set(CPACK_PACKAGE_VERSION_MAJOR ${PROJECT_VERSION_MAJOR})
-    set(CPACK_PACKAGE_VERSION_MINOR ${PROJECT_VERSION_MINOR})
-    set(CPACK_PACKAGE_VERSION_PATCH ${PROJECT_VERSION_PATCH})
-    set(CPACK_PACKAGE_VERSION ${PROJECT_VERSION})
-    set(CPACK_PACKAGE_CONTACT "grc@illinoistech.edu")
-    set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE")
-    set(CPACK_RESOURCE_FILE_README "${CMAKE_CURRENT_SOURCE_DIR}/README.md")
+# Delegates to cmake/packaging/CPackConfig.cmake for centralized
+# package generation control (DEB, RPM, TGZ)
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/packaging/CPackConfig.cmake)
 
-    # Package generators
-    set(CPACK_GENERATOR "TGZ;DEB")
-
-    # DEB-specific settings
-    set(CPACK_DEBIAN_PACKAGE_MAINTAINER "IOWarp Team <grc@illinoistech.edu>")
-    set(CPACK_DEBIAN_PACKAGE_SECTION "devel")
-    set(CPACK_DEBIAN_PACKAGE_PRIORITY "optional")
-    set(CPACK_DEBIAN_PACKAGE_DEPENDS "libzmq3-dev, libyaml-cpp-dev")
-
-    # Component installation
-    set(CPACK_COMPONENTS_ALL libraries headers cmake)
-    set(CPACK_COMPONENT_LIBRARIES_DISPLAY_NAME "Runtime Libraries")
-    set(CPACK_COMPONENT_HEADERS_DISPLAY_NAME "C++ Headers")
-    set(CPACK_COMPONENT_CMAKE_DISPLAY_NAME "CMake Configuration Files")
-
-    include(CPack)
-
-    message(STATUS "CPack enabled - package generation available")
+#------------------------------------------------------------------------------
+# AppImage Configuration
+#------------------------------------------------------------------------------
+# Only include AppImage support if explicitly enabled
+if(CLIO_CORE_ENABLE_APPIMAGE)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/packaging/AppImage.cmake)
 endif()

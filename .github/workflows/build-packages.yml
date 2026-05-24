@@ -1,0 +1,193 @@
+name: Build and Publish Binary Packages
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  #-----------------------------------------------------------------------
+  # Guard: tag must match CMakeLists.txt version (same check as build-pip.yml)
+  #-----------------------------------------------------------------------
+  check-version:
+    name: Check tag matches version
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Verify tag == CMakeLists.txt version
+      run: |
+        set -e
+        TAG="${GITHUB_REF_NAME#v}"
+        CMAKE_VERSION=$(grep -oP 'project\(iowarp-core VERSION \K[\d.]+' CMakeLists.txt)
+        echo "Git tag version:        $TAG"
+        echo "CMakeLists.txt version: $CMAKE_VERSION"
+        if [ "$TAG" != "$CMAKE_VERSION" ]; then
+          echo "::error::Tag '$GITHUB_REF_NAME' does not match CMakeLists.txt version '$CMAKE_VERSION'."
+          echo "::error::Bump 'project(iowarp-core VERSION ...)' in CMakeLists.txt to $TAG and re-tag."
+          exit 1
+        fi
+        echo "Version check passed."
+
+  #-----------------------------------------------------------------------
+  # Build .deb on Ubuntu (devcontainer has all build dependencies)
+  #-----------------------------------------------------------------------
+  build-deb:
+    name: Build Debian package
+    runs-on: ubuntu-latest
+    container: iowarp/clio-core-devcontainer:latest
+    needs: [check-version]
+    if: always() && (needs.check-version.result == 'success' || needs.check-version.result == 'skipped')
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+        fetch-depth: 0
+
+    - name: Configure with CMake
+      run: |
+        cmake -B build-deb \
+          -DCLIO_CORE_ENABLE_DEB_PACKAGE=ON \
+          -DCLIO_CORE_ENABLE_TESTS=OFF \
+          -DCLIO_CORE_ENABLE_PYTHON=OFF \
+          -G Ninja
+
+    - name: Build with CMake
+      run: cmake --build build-deb -j$(nproc)
+
+    - name: Create DEB package
+      run: |
+        cd build-deb
+        cpack -G DEB
+
+    - name: Upload DEB artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: deb-package
+        path: build-deb/*.deb
+
+  #-----------------------------------------------------------------------
+  # Build .rpm on Fedora (in a container)
+  #-----------------------------------------------------------------------
+  build-rpm:
+    name: Build RPM package
+    runs-on: ubuntu-latest
+    container: fedora:40
+    needs: [check-version]
+    if: always() && (needs.check-version.result == 'success' || needs.check-version.result == 'skipped')
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+        fetch-depth: 0
+
+    - name: Install dependencies
+      run: |
+        dnf install -y cmake ninja-build gcc-c++ zeromq-devel yaml-cpp-devel cereal-devel msgpack-devel rpm-build
+
+    - name: Configure with CMake
+      run: |
+        cmake -B build-rpm \
+          -DCLIO_CORE_ENABLE_RPM_PACKAGE=ON \
+          -DCLIO_CORE_ENABLE_TESTS=OFF \
+          -DCLIO_CORE_ENABLE_PYTHON=OFF \
+          -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+          -G Ninja
+
+    - name: Build with CMake
+      run: cmake --build build-rpm -j$(nproc)
+
+    - name: Create RPM package
+      run: |
+        cd build-rpm
+        cpack -G RPM
+
+    - name: Upload RPM artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: rpm-package
+        path: build-rpm/*.rpm
+
+  #-----------------------------------------------------------------------
+  # Build AppImage on Ubuntu (devcontainer has all build dependencies)
+  # appimagetool is downloaded at build time; APPIMAGE_EXTRACT_AND_RUN=1
+  # lets it run without a FUSE mount (no --privileged needed).
+  #-----------------------------------------------------------------------
+  build-appimage:
+    name: Build AppImage
+    runs-on: ubuntu-latest
+    container: iowarp/clio-core-devcontainer:latest
+    needs: [check-version]
+    if: always() && (needs.check-version.result == 'success' || needs.check-version.result == 'skipped')
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+        fetch-depth: 0
+
+    - name: Configure with CMake
+      run: |
+        cmake -B build-appimage \
+          -DCLIO_CORE_ENABLE_APPIMAGE=ON \
+          -DCLIO_CORE_ENABLE_TESTS=OFF \
+          -DCLIO_CORE_ENABLE_PYTHON=OFF \
+          -G Ninja
+
+    - name: Build with CMake
+      run: cmake --build build-appimage -j$(nproc)
+
+    - name: Build AppImage target
+      run: cmake --build build-appimage --target appimage
+
+    - name: Upload AppImage artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: appimage
+        path: build-appimage/*.AppImage
+
+  #-----------------------------------------------------------------------
+  # Publish all artifacts to GitHub Release on tag
+  #-----------------------------------------------------------------------
+  publish-release:
+    name: Publish to GitHub Release
+    needs: [build-deb, build-rpm, build-appimage]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+    - name: Download DEB package
+      uses: actions/download-artifact@v4
+      with:
+        name: deb-package
+        path: packages/
+
+    - name: Download RPM package
+      uses: actions/download-artifact@v4
+      with:
+        name: rpm-package
+        path: packages/
+
+    - name: Download AppImage
+      uses: actions/download-artifact@v4
+      with:
+        name: appimage
+        path: packages/
+
+    - name: List packages
+      run: ls -lh packages/
+
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: packages/*
+      env:
+        GITHUB_TOKEN: ${{ github.token }}

@@ -43,25 +43,25 @@ install(TARGETS clio_run
 
 # Install `chimaera` as a symlink to `clio_run` (Windows: copy fallback).
 # Done at install time so it lands at ${CMAKE_INSTALL_PREFIX}/bin regardless
-# of CPACK/DESTDIR. On Windows the installed binary is `clio_run.exe`; the
-# EXISTS check must include that suffix or the legacy alias is silently
-# skipped at install time and `chimaera.exe` never lands in the wheel.
-if(WIN32)
-  install(CODE "
+# of CPACK/DESTDIR. The Windows source path needs the `.exe` suffix — the
+# bare-name check silently skipped on Windows wheels and shipped without
+# chimaera.exe, breaking `pip install iowarp-core` users' first-touch
+# experience.
+install(CODE "
+  if(WIN32)
     set(_src \"\${CMAKE_INSTALL_PREFIX}/bin/clio_run.exe\")
-    if(EXISTS \"\${_src}\")
-      file(INSTALL \"\${_src}\" DESTINATION \"\${CMAKE_INSTALL_PREFIX}/bin\"
-           RENAME chimaera.exe)
-      message(STATUS \"Installed chimaera.exe -> clio_run.exe legacy copy\")
-    endif()
-  ")
-else()
-  install(CODE "
+    set(_dst \"\${CMAKE_INSTALL_PREFIX}/bin/chimaera.exe\")
+  else()
     set(_src \"\${CMAKE_INSTALL_PREFIX}/bin/clio_run\")
     set(_dst \"\${CMAKE_INSTALL_PREFIX}/bin/chimaera\")
-    if(EXISTS \"\${_src}\")
+  endif()
+  if(EXISTS \"\${_src}\")
+    if(WIN32)
+      file(INSTALL \"\${_src}\" DESTINATION \"\${CMAKE_INSTALL_PREFIX}/bin\"
+           RENAME chimaera.exe)
+    else()
       execute_process(COMMAND \${CMAKE_COMMAND} -E create_symlink clio_run \"\${_dst}\")
-      message(STATUS \"Installed chimaera -> clio_run legacy symlink at \${_dst}\")
     endif()
-  ")
-endif()
+    message(STATUS \"Installed chimaera -> clio_run legacy symlink at \${_dst}\")
+  endif()
+")

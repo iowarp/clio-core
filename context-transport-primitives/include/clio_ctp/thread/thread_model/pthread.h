@@ -38,6 +38,8 @@
 
 #include <errno.h>
 #ifdef __APPLE__
+#include <signal.h>
+#include <time.h>
 #include <unistd.h>
 #endif
 
@@ -202,7 +204,33 @@ class Pthread : public ThreadModel {
     ts.tv_sec  += nsec / 1000000000ull;
     ts.tv_nsec += nsec % 1000000000ull;
     if (ts.tv_nsec >= 1000000000LL) { ts.tv_sec++; ts.tv_nsec -= 1000000000LL; }
+#ifdef __APPLE__
+    // pthread_timedjoin_np is a glibc extension and is not available on
+    // Darwin. Poll with pthread_kill(thread, 0): returns 0 while alive,
+    // ESRCH once the thread has exited, at which point we can join it
+    // without blocking. Safe here because thread.pthread_thread_ is
+    // cleared after join/detach, so we never poll a stale handle.
+    int r = ETIMEDOUT;
+    uint64_t deadline_ns =
+        static_cast<uint64_t>(ts.tv_sec) * 1000000000ull +
+        static_cast<uint64_t>(ts.tv_nsec);
+    while (true) {
+      if (pthread_kill(thread.pthread_thread_, 0) == ESRCH) {
+        r = pthread_join(thread.pthread_thread_, nullptr);
+        break;
+      }
+      struct timespec now;
+      clock_gettime(CLOCK_REALTIME, &now);
+      uint64_t now_ns =
+          static_cast<uint64_t>(now.tv_sec) * 1000000000ull +
+          static_cast<uint64_t>(now.tv_nsec);
+      if (now_ns >= deadline_ns) { r = ETIMEDOUT; break; }
+      struct timespec sleep_ts = {0, 1000000};  // 1ms poll interval
+      nanosleep(&sleep_ts, nullptr);
+    }
+#else
     int r = pthread_timedjoin_np(thread.pthread_thread_, nullptr, &ts);
+#endif
     if (r == 0) {
       thread.pthread_thread_ = 0;
       return true;

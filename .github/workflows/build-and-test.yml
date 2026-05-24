@@ -14,19 +14,36 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: ['ubuntu-24.04', 'ubuntu-24.04-arm']
+        include:
+          - os: ubuntu-24.04
+            coverage: true
+            site: ubu-24.amd64
+            flags: amd64
+          - os: ubuntu-24.04-arm
+            coverage: true
+            site: ubu-24.arm64
+            flags: arm64
+          - os: macos-latest
+            coverage: false
+            site: ''
+            flags: ''
     steps:
     - name: Checkout repository
       uses: actions/checkout@v5
       with:
         submodules: recursive
-    - name: Install lcov
+    - name: Install lcov (Linux)
+      if: runner.os == 'Linux'
       run: sudo apt-get update && sudo apt-get install -y lcov
+    - name: Install lcov (macOS)
+      if: runner.os == 'macOS'
+      run: brew install lcov
     - name: Build and test using install.sh
       run: |
         chmod +x install.sh
         ./install.sh
     - name: Calculate coverage
+      if: matrix.coverage
       run: |
         # Activate conda from wherever install.sh set it up
         if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
@@ -37,13 +54,12 @@ jobs:
           eval "$(conda shell.bash hook)"
         fi
         conda activate iowarp
-        SITE_NAME=${{ contains(matrix.os, 'arm') && '"ubu-24.arm64"' || '"ubu-24.amd64"' }}
-        ./CI/calculate_coverage.sh --build --run-ctest --clean --site ${SITE_NAME}
+        ./CI/calculate_coverage.sh --build --run-ctest --clean --site ${{ matrix.site }}
     - name: Upload coverage to Codecov
-      if: always()
+      if: matrix.coverage && always()
       uses: codecov/codecov-action@v5
       with:
         files: build/coverage_filtered.info
-        flags: ${{ contains(matrix.os, 'arm') && 'arm64' || 'amd64' }}
+        flags: ${{ matrix.flags }}
         token: ${{ secrets.CODECOV_TOKEN }}
         slug: iowarp/clio-core

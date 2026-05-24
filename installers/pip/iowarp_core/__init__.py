@@ -32,66 +32,75 @@ _DATA_DIR = os.path.join(_PACKAGE_DIR, "data")
 _EXT_MODULES = {"clio_cee", "clio_cte_core_ext", "chimaera_runtime_ext"}
 
 
-_IS_WINDOWS = sys.platform == "win32"
-
-
-def _setup_windows_dll_path():
-    """Make IOWarp + vcpkg DLLs discoverable to the extension loader.
-
-    On Windows the .pyd extensions in ext/ are linked against IOWarp DLLs that
-    install to bin/ (alongside the .exe binaries — the Windows convention), and
-    against vcpkg-provided runtime DLLs that get copied there too. The Python
-    loader doesn't look in arbitrary package directories, so we register them
-    with os.add_dll_directory (the Win32-correct replacement for LD_LIBRARY_PATH;
-    PATH is not consulted by default since Python 3.8 secure DLL search).
-    """
-    for _d in (_BIN_DIR, _LIB_DIR):
-        if os.path.isdir(_d):
-            os.add_dll_directory(_d)
-
-
-def _setup_posix_lib_path():
-    """LD_LIBRARY_PATH + RTLD_GLOBAL preload chain (Linux/macOS only)."""
-    if not os.path.isdir(_LIB_DIR):
-        return
-    ld_path = os.environ.get("LD_LIBRARY_PATH", "")
-    if _LIB_DIR not in ld_path:
-        os.environ["LD_LIBRARY_PATH"] = (
-            _LIB_DIR + ":" + ld_path if ld_path else _LIB_DIR
-        )
-
-    # Pre-load ALL shared libraries in dependency order with RTLD_GLOBAL
-    # so symbols are globally visible to subsequently loaded extensions.
-    # LD_LIBRARY_PATH changes above only affect child processes, so we
-    # must explicitly load each library for the current process.
-    # Python loads extension modules with RTLD_LOCAL by default, which
-    # hides symbols from transitive dependencies and breaks nanobind
-    # modules like clio_cee that depend on multiple IOWarp libraries.
-    for _lib_name in [
-        "libclio_ctp_host.so",
-        "libchimaera_cxx.so",
-        "libclio_admin_client.so",
-        "libclio_admin_runtime.so",
-        "libchimaera_bdev_client.so",
-        "libchimaera_bdev_runtime.so",
-        "libclio_cte_core_client.so",
-        "libclio_cte_core_runtime.so",
-        "libclio_cte_cae_config.so",
-        "libclio_cae_core_client.so",
-        "libclio_cae_core_runtime.so",
-        "libclio_cee_api.so",
-    ]:
-        _lib_path = os.path.join(_LIB_DIR, _lib_name)
-        if os.path.exists(_lib_path):
-            ctypes.CDLL(_lib_path, mode=ctypes.RTLD_GLOBAL)
-
-
 def _setup():
-    """Configure library and extension paths at import time."""
-    if _IS_WINDOWS:
-        _setup_windows_dll_path()
-    else:
-        _setup_posix_lib_path()
+    """Configure library and extension paths at import time.
+
+    Per-platform shape:
+      - Linux: prepend lib/ to LD_LIBRARY_PATH (for child procs), then
+        dlopen each lib in dependency order with RTLD_GLOBAL so nanobind
+        extension modules find transitive symbols. Python loads .so
+        extensions with RTLD_LOCAL by default, which hides transitive
+        deps and breaks clio_cee on Linux.
+      - macOS: skip the explicit preload — every dylib in the wheel
+        carries @loader_path/../lib rpaths set at link time, so dlopen()
+        resolves transitively without help. Still prepend
+        DYLD_LIBRARY_PATH for child procs (SIP may strip it for system
+        binaries; harmless for our spawned children).
+      - Windows: DLLs live alongside .pyd files in bin/ (CMake's Windows
+        convention). Python 3.8+ restricts LoadLibraryEx to the .pyd's
+        own dir + system32 by default — register bin/ and lib/ via
+        os.add_dll_directory so .pyd extensions find clio_*.dll deps.
+        Also prepend PATH for child procs spawned by the chimaera
+        wrapper.
+    """
+    if sys.platform == "win32":
+        # Register DLL search directories for in-process LoadLibrary
+        # (Python extension loads).
+        for _d in (_BIN_DIR, _LIB_DIR):
+            if os.path.isdir(_d):
+                try:
+                    os.add_dll_directory(_d)
+                except (OSError, AttributeError):
+                    pass  # add_dll_directory is Py3.8+ and Windows-only.
+        # Prepend bin/ + lib/ to PATH so child processes (the wrapped
+        # chimaera/clio_*_bench) inherit a search path that finds the
+        # same DLLs.
+        _paths = [d for d in (_BIN_DIR, _LIB_DIR) if os.path.isdir(d)]
+        if _paths:
+            existing = os.environ.get("PATH", "")
+            os.environ["PATH"] = os.pathsep.join(
+                _paths + ([existing] if existing else [])
+            )
+    elif os.path.isdir(_LIB_DIR):
+        # POSIX (Linux + macOS).
+        _env_var = "DYLD_LIBRARY_PATH" if sys.platform == "darwin" else "LD_LIBRARY_PATH"
+        ld_path = os.environ.get(_env_var, "")
+        if _LIB_DIR not in ld_path:
+            os.environ[_env_var] = (
+                _LIB_DIR + os.pathsep + ld_path if ld_path else _LIB_DIR
+            )
+
+        # Linux-only: explicit RTLD_GLOBAL preload so nanobind extensions
+        # see transitive symbols. macOS resolves these via @loader_path
+        # rpaths baked into each dylib at link time.
+        if sys.platform.startswith("linux"):
+            for _lib_name in [
+                "libclio_ctp_host.so",
+                "libchimaera_cxx.so",
+                "libclio_admin_client.so",
+                "libclio_admin_runtime.so",
+                "libchimaera_bdev_client.so",
+                "libchimaera_bdev_runtime.so",
+                "libclio_cte_core_client.so",
+                "libclio_cte_core_runtime.so",
+                "libclio_cte_cae_config.so",
+                "libclio_cae_core_client.so",
+                "libclio_cae_core_runtime.so",
+                "libclio_cee_api.so",
+            ]:
+                _lib_path = os.path.join(_LIB_DIR, _lib_name)
+                if os.path.exists(_lib_path):
+                    ctypes.CDLL(_lib_path, mode=ctypes.RTLD_GLOBAL)
 
     # Add ext/ to sys.path so extension modules can be found by import
     if os.path.isdir(_EXT_DIR) and _EXT_DIR not in sys.path:
@@ -151,23 +160,22 @@ def get_data_dir():
     return _DATA_DIR
 
 
-_EXT_SUFFIX = ".pyd" if _IS_WINDOWS else ".so"
-
-
-def _ext_present(prefix):
-    if not os.path.isdir(_EXT_DIR):
-        return False
-    return any(
-        f.startswith(prefix) and f.endswith(_EXT_SUFFIX)
-        for f in os.listdir(_EXT_DIR)
-    )
+_EXT_SUFFIXES = (".so", ".pyd")  # POSIX (.so on Linux + macOS), Windows (.pyd)
 
 
 def cte_available():
     """Check if the Context Transfer Engine extension is available."""
-    return _ext_present("clio_cte_core_ext")
+    if os.path.isdir(_EXT_DIR):
+        for f in os.listdir(_EXT_DIR):
+            if f.startswith("clio_cte_core_ext") and f.endswith(_EXT_SUFFIXES):
+                return True
+    return False
 
 
 def cee_available():
     """Check if the Context Exploration Engine extension is available."""
-    return _ext_present("clio_cee")
+    if os.path.isdir(_EXT_DIR):
+        for f in os.listdir(_EXT_DIR):
+            if f.startswith("clio_cee") and f.endswith(_EXT_SUFFIXES):
+                return True
+    return False

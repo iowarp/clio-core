@@ -1,0 +1,21 @@
+#!/bin/bash
+set -e
+
+APPIMAGETOOL=''
+if [ -x '@CMAKE_BINARY_DIR@/appimagetool-x86_64.AppImage' ]; then
+    APPIMAGETOOL='@CMAKE_BINARY_DIR@/appimagetool-x86_64.AppImage'
+elif command -v appimagetool > /dev/null; then
+    APPIMAGETOOL='appimagetool'
+else
+    echo 'appimagetool not found, downloading...'
+    wget -q -O '@CMAKE_BINARY_DIR@/appimagetool-x86_64.AppImage' \
+        'https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage'
+    chmod +x '@CMAKE_BINARY_DIR@/appimagetool-x86_64.AppImage'
+    APPIMAGETOOL='@CMAKE_BINARY_DIR@/appimagetool-x86_64.AppImage'
+fi
+
+export ARCH=x86_64
+# APPIMAGE_EXTRACT_AND_RUN lets the tool run without a FUSE mount
+# (needed in CI containers and Docker without --privileged + fuse).
+export APPIMAGE_EXTRACT_AND_RUN=1
+"$APPIMAGETOOL" '@APPIMAGE_STAGING_DIR@' '@CMAKE_BINARY_DIR@/iowarp-core-@PROJECT_VERSION@-x86_64.AppImage'

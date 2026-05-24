@@ -316,6 +316,26 @@ class packer {
   void pack(float v)    { msgpack_pack_float(&pk_, v); }
   void pack(double v)   { msgpack_pack_double(&pk_, v); }
 
+  // `size_t`/`ssize_t` are typedef'd to `unsigned long`/`long` on most
+  // POSIX systems. On Linux x86_64 with glibc, `unsigned long` is the
+  // same type as `uint64_t`, so the existing overload above already
+  // covers it. On macOS arm64 (LP64 like Linux, but `uint64_t` is
+  // `unsigned long long`), and on 64-bit Windows (LLP64, `long` is 32
+  // bits), `unsigned long`/`long` are distinct from every uintN_t
+  // typedef — without these overloads, calls like `pack(size_t)` are
+  // ambiguous across all the integer overloads above. Dispatch by size
+  // so both LP64 and LLP64 work correctly.
+#if defined(__APPLE__) || defined(_WIN32)
+  void pack(unsigned long v) {
+    if constexpr (sizeof(v) == 8) msgpack_pack_uint64(&pk_, v);
+    else                          msgpack_pack_uint32(&pk_, v);
+  }
+  void pack(long v) {
+    if constexpr (sizeof(v) == 8) msgpack_pack_int64(&pk_, v);
+    else                          msgpack_pack_int32(&pk_, v);
+  }
+#endif
+
   void pack(const std::string& v) {
     msgpack_pack_str(&pk_, v.size());
     msgpack_pack_str_body(&pk_, v.data(), v.size());

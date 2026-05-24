@@ -362,7 +362,11 @@ if(NOT WIN32)
             set(CLIO_CTP_ENABLE_LIBAIO ON)
         endif()
     endif()
-    target_link_libraries(aio INTERFACE rt)
+    # librt holds POSIX realtime (aio_*, shm_*, clock_gettime) on Linux/BSD,
+    # but on macOS these live in libSystem and `-lrt` resolves to nothing.
+    if(NOT APPLE)
+        target_link_libraries(aio INTERFACE rt)
+    endif()
 endif()
 target_compile_definitions(aio INTERFACE
     CTP_ENABLE_IO_URING=$<BOOL:${CLIO_CTP_ENABLE_IO_URING}>

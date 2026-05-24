@@ -48,6 +48,16 @@
 #include <unordered_map>
 #include <memory>
 
+// O_DIRECT is a Linux extension; Darwin has no equivalent open flag and
+// instead exposes uncached I/O through fcntl(F_NOCACHE) post-open. Define
+// it as 0 so the `flags & ~O_DIRECT` / `flags | O_DIRECT` bitops still
+// compile and the "direct" open path degrades gracefully into a second
+// regular fd. Tests that exercise the aligned-buffer path still pass
+// because aligned reads/writes work fine through the page cache.
+#ifndef O_DIRECT
+#define O_DIRECT 0
+#endif
+
 namespace ctp {
 
 class PosixAsyncIO : public AsyncIO {
