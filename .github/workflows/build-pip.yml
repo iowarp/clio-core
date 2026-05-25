@@ -150,6 +150,19 @@ jobs:
           CLIO_CORE_ENABLE_BENCHMARKS=OFF
         CIBW_BUILD_FRONTEND: "build"
         CIBW_PROJECT_REQUIRES_PYTHON: ">=3.10"
+        # Without this, cibuildwheel skips wheel repair on Windows entirely
+        # and the wheel ships with dangling imports to vcpkg DLLs (yaml-cpp,
+        # libzmq, libsodium, msgpack). delvewheel walks the wheel's PE
+        # import table, copies missing DLLs into iowarp_core.libs/, and
+        # rewrites loads via os.add_dll_directory at import time.
+        # --add-path points it at vcpkg's installed DLL dir so it can
+        # find the runtime libs corresponding to the .lib files cmake
+        # linked against. --no-mangle keeps the original DLL filenames
+        # so dependent loads (chimaera.exe → yaml-cpp.dll) still resolve.
+        CIBW_REPAIR_WHEEL_COMMAND_WINDOWS: >-
+          delvewheel repair -w {dest_dir} -v {wheel}
+          --add-path C:/vcpkg/installed/x64-windows/bin
+          --no-mangle-all
       run: cibuildwheel --output-dir installers/pip/wheelhouse
 
     - name: Upload Windows wheels

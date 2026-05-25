@@ -55,14 +55,25 @@ def _exec_iowarp_bin(name):
 
     env = os.environ.copy()
     if sys.platform == "win32":
-        # CMake places .dll files in bin/ next to .exe files on
-        # Windows, so the standard DLL search (which checks the
-        # .exe's own dir first) handles the common case. Prepending
-        # bin/ + lib/ to PATH is belt-and-braces for cases where the
-        # spawned binary itself spawns a child that isn't co-located
-        # with its DLLs.
-        env["PATH"] = (
-            bin_dir + os.pathsep + lib_dir + os.pathsep + env.get("PATH", "")
+        # CMake places .dll files in bin/ next to .exe files on Windows,
+        # so the standard DLL search (which checks the .exe's own dir
+        # first) handles the IOWarp-owned DLLs. Third-party vcpkg DLLs
+        # (yaml-cpp, libzmq, libsodium, msgpack) get bundled by
+        # delvewheel into a sibling `iowarp_core.libs/` directory at
+        # site-packages root — find it and prepend to PATH so the
+        # spawned chimaera.exe / *_bench.exe can resolve those imports
+        # too. (Python imports of .pyd modules use the os.add_dll_directory
+        # registration that delvewheel installs into __init__.py, which
+        # doesn't propagate to subprocess children.)
+        search_dirs = [bin_dir, lib_dir]
+        pkg_dir = os.path.dirname(bin_dir)  # site-packages/iowarp_core
+        sp_root = os.path.dirname(pkg_dir)  # site-packages
+        delvewheel_libs = os.path.join(sp_root, "iowarp_core.libs")
+        if os.path.isdir(delvewheel_libs):
+            search_dirs.append(delvewheel_libs)
+        existing = env.get("PATH", "")
+        env["PATH"] = os.pathsep.join(
+            search_dirs + [existing] if existing else search_dirs
         )
         # os.execve has odd Windows semantics: cmd.exe doesn't really
         # see the replaced process, argv quoting goes through MSVCRT,
