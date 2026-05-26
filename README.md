@@ -131,10 +131,10 @@ clio_run start          # foreground
 clio_run start &        # background
 ```
 
-To override the configuration, point `CLIO_X` at your own YAML file:
+To override the configuration, point `CLIO_SERVER_CONF` at your own YAML file:
 
 ```bash
-export CLIO_X=/path/to/my_config.yaml
+export CLIO_SERVER_CONF=/path/to/my_config.yaml
 clio_run start
 ```
 
