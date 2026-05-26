@@ -14,7 +14,10 @@ add_library(clio_cee_api SHARED
   src/context_interface.cc
 )
 
-add_library(clio_cee::api ALIAS clio_cee_api)
+# Canonical alias matches the project's clio::<engine>:: scheme. The
+# install(EXPORT ...) block below pins the exported name to `api` so
+# downstream consumers see `clio::cee::api` after find_package().
+add_library(clio::cee::api ALIAS clio_cee_api)
 
 target_include_directories(clio_cee_api
   PUBLIC
@@ -35,6 +38,9 @@ set_target_properties(clio_cee_api PROPERTIES
   SOVERSION 1
   CXX_STANDARD 20
   CXX_STANDARD_REQUIRED ON
+  # Drives the install-time exported name: combined with NAMESPACE clio::cee::
+  # in install(EXPORT ...) it yields `clio::cee::api`.
+  EXPORT_NAME api
   # Auto-export non-static symbols on Windows so the test binaries can
   # link against clio_cee_api.lib without each public function needing
   # an explicit __declspec(dllexport). Mirrors the same property on
@@ -126,7 +132,7 @@ write_basic_package_version_file(
 
 install(EXPORT clio_cee_api_targets
   FILE clio_cee_api_targets.cmake
-  NAMESPACE clio_cee::
+  NAMESPACE clio::cee::
   DESTINATION lib/cmake/clio_cee_api
 )
 

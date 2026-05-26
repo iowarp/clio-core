@@ -1,0 +1,8 @@
+# Context Exploration Engine (CEE) Repository Configuration
+namespace: clio::cee
+version: 1.0.0
+description: "Context Exploration Engine - high-level API for bundling, querying, and retrieving IOWarp data contexts"
+
+# CEE is not a ChiMod repository (no ChiMods inside); it exposes a higher-level
+# C++ library (`clio::cee::api`) and a Python module (`clio_cee`).
+modules: []

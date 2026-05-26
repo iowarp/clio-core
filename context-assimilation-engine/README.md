@@ -1,15 +1,17 @@
 # Context Assimilation Engine (CAE)
 
-A Chimaera module (Module) for high-performance data ingestion into the IOWarp
-ecosystem. CAE assimilates data from external sources — local binary files,
-HDF5 datasets, and Globus endpoints — into the Context Transfer Engine (CTE)
-for distributed storage and retrieval.
+A CLIO ChiMod for high-performance data ingestion into the IOWarp ecosystem.
+CAE assimilates data from external sources — local binary files, HDF5
+datasets, and Globus endpoints — into the [Context Transfer
+Engine](../context-transfer-engine) (CTE) for distributed storage and
+retrieval.
 
 ## Overview
 
-CAE runs as a pool inside the Clio runtime alongside CTE. Clients submit
-OMNI YAML files to describe data transfers; CAE parses them and dispatches
-assimilation tasks to the appropriate backend (binary, HDF5, or Globus).
+CAE runs as a pool inside the [CLIO runtime](../context-runtime) alongside
+CTE. Clients submit OMNI YAML files to describe data transfers; CAE parses
+them and dispatches assimilation tasks to the appropriate backend (binary,
+HDF5, or Globus).
 
 ```
 External Source          CAE Module              CTE Module
@@ -20,32 +22,37 @@ External Source          CAE Module              CTE Module
 
 ## Building
 
-CAE is built as part of the IOWarp Core monorepo:
+CAE is built as part of CLIO Core; it is enabled by default
+(`CLIO_CORE_ENABLE_CAE=ON`):
 
 ```bash
-git clone https://github.com/iowarp/clio-core.git
+git clone --recurse-submodules https://github.com/iowarp/clio-core.git
 cd clio-core
-mkdir build && cd build
-cmake -DCMAKE_BUILD_TYPE=Release ..
-make -j$(nproc)
+cmake --preset release
+cmake --build build/release -j$(nproc)
 ```
 
-To enable HDF5 support:
+HDF5 ingestion is opt-in (the CMake flag also turns on CTE's HDF5 adapters):
+
 ```bash
-cmake -DCMAKE_BUILD_TYPE=Release -DWRP_CORE_ENABLE_HDF5=ON ..
+cmake --preset release -DCLIO_CORE_ENABLE_HDF5=ON
 ```
+
+Globus ingestion is opt-in via `-DCAE_ENABLE_GLOBUS=ON` and requires the
+Globus toolkit on `PATH`.
 
 ## Running
 
-### 1. Start the Clio runtime with CTE and CAE
+### 1. Start the CLIO runtime with CTE and CAE composed
 
 ```bash
 export CLIO_X=/path/to/clio_config.yaml
-clio_run runtime start
+clio_run start
 ```
 
-An example configuration deploying both CTE and CAE is provided in
-`config/clio_config_example.yaml`:
+The example configuration at
+[`config/clio_config_example.yaml`](config/clio_config_example.yaml)
+deploys both CTE and CAE via the runtime's declarative `compose` section:
 
 ```yaml
 compose:
@@ -83,6 +90,7 @@ transfers:
 ```
 
 **HDF5 with dataset filtering:**
+
 ```yaml
 transfers:
   - src: file::/data/experiment.h5
@@ -96,6 +104,7 @@ transfers:
 ```
 
 **Key fields:**
+
 | Field | Description |
 |---|---|
 | `src` | Source URL (`file::`, `globus::`) |
@@ -105,35 +114,49 @@ transfers:
 | `src_token` / `dst_token` | Auth tokens; environment variables are expanded |
 | `dataset_filter` | HDF5 dataset include/exclude glob patterns |
 
+## Linking from C++
+
+CAE is exported through the unified `clio-core` CMake package:
+
+```cmake
+find_package(clio-core CONFIG REQUIRED)
+
+target_link_libraries(my_app
+  clio::cae::core_client
+  clio::cte::core_client
+)
+```
+
+For the higher-level Python/C++ ingestion façade that drives CAE under the
+hood, see the [Context Exploration Engine](../context-exploration-engine).
+
 ## Project Structure
 
 ```
-config/      - Example runtime configuration files
-core/        - Module implementation
-  include/   - Public headers (tasks, assimilation context, factory)
-  src/        - Runtime and client implementation
-  util/       - clio_cae command-line tool
-data/        - Sample datasets for testing (HDF5, CSV, Parquet)
+config/      Example runtime configuration files
+core/        ChiMod implementation
+  include/   Public headers (tasks, assimilation context, factory)
+  src/       Runtime and client implementation
+  util/      clio_cae command-line tool
+data/        Sample datasets for testing (HDF5, CSV, Parquet)
 test/
-  unit/      - Unit tests (binary, HDF5, range, error handling)
-  integration/globus_matsci/ - Globus integration test
+  unit/                       Unit tests (binary, HDF5, range, error handling)
+  integration/globus_matsci/  Globus integration test
 ```
 
 ## Pool ID Reference
 
-| Component | Pool ID | Module Name    |
-|-----------|---------|----------------|
-| Admin     | 1.0     | chimaera_admin |
-| CTE Core  | 512.0   | clio_cte_core   |
-| CAE Core  | 400.0   | clio_cae_core   |
+| Component | Pool ID | mod_name        |
+|-----------|---------|-----------------|
+| Admin     | 1.0     | (auto-created)  |
+| CTE Core  | 512.0   | `clio_cte_core` |
+| CAE Core  | 400.0   | `clio_cae_core` |
 
 ## License
 
-This project is licensed under the BSD-3-Clause License - see the [LICENSE](LICENSE) file for details.
-
-**Copyright (c) 2024, Gnosis Research Center, Illinois Institute of Technology**
+BSD-3-Clause. See [LICENSE](../LICENSE).
 
 ## Links
 
-- **IOWarp Organization**: [https://github.com/iowarp](https://github.com/iowarp)
-- **Issues**: [https://github.com/iowarp/clio-core/issues](https://github.com/iowarp/clio-core/issues)
+- **IOWarp Organization:** [https://github.com/iowarp](https://github.com/iowarp)
+- **Issues:** [https://github.com/iowarp/clio-core/issues](https://github.com/iowarp/clio-core/issues)

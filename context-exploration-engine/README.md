@@ -1,175 +1,146 @@
 # Context Exploration Engine (CEE)
 
-High-level C++ and Python API for exploring, querying, and managing IOWarp scientific data contexts.
+[![License](https://img.shields.io/badge/License-BSD%203--Clause-yellow.svg)](../LICENSE)
 
-[![License](https://img.shields.io/badge/License-BSD%203--Clause-yellow.svg)](LICENSE)
+The high-level C++ and Python API for exploring, querying, and managing
+IOWarp scientific data contexts. CEE is the user-facing facade that drives
+the [Context Transfer Engine](../context-transfer-engine) (CTE) and [Context
+Assimilation Engine](../context-assimilation-engine) (CAE) under the hood.
 
-## Overview
+## What it provides
 
-The Context Exploration Engine provides a unified interface for:
-- **Bundling**: Assimilating data files into the IOWarp storage system
-- **Querying**: Discovering and retrieving stored data by tag and blob patterns
-- **Managing**: Creating, destroying, and organizing data contexts
-
-CEE integrates with the Context Transfer Engine (CTE) and Context Assimilation Engine (CAE) to provide seamless data management capabilities.
+- **Bundling** — assimilate one or more data files into the IOWarp storage
+  system through CAE.
+- **Querying** — discover stored data by tag/blob regex.
+- **Retrieval** — pull blob payloads back out of CTE.
+- **Lifecycle** — create and destroy named contexts.
 
 ## Components
 
-### ContextInterface API
-High-level C++ API for context management operations:
-- `ContextBundle()` - Bundle and assimilate files into CTE storage
-- `ContextQuery()` - Query for data using regex patterns
-- `ContextDestroy()` - Remove contexts by name
-- `ContextRetrieve()` - Retrieve data and metadata (planned)
-- `ContextSplice()` - Split/splice contexts (planned)
-
-### Python Bindings
-Python interface to ContextInterface with snake_case methods:
-- `context_bundle()` - Bundle data files
-- `context_query()` - Query stored data
-- `context_destroy()` - Remove contexts
-
-### Legacy Components
-- **mcp-hdf-demo**: HDF5 Model Context Protocol server and client demo
-- **hdf-compass**: wxPython-4 based HDF Compass viewer
+- **`ContextInterface`** — the canonical C++ API
+  ([`api/include/clio_cee/api/context_interface.h`](api/include/clio_cee/api/context_interface.h)),
+  in the `iowarp::` namespace.
+- **`clio_cee` Python module** — wraps `ContextInterface` with `snake_case`
+  methods and a Pythonic `AssimilationCtx` dataclass.
+- **`iowarp-cei-mcp`** — an MCP server exposing CEE operations for AI agents
+  (see [`iowarp-cei-mcp/README.md`](iowarp-cei-mcp/README.md)).
 
 ## Building
 
-CEE is built as part of the IOWarp Core unified build system:
+CEE is enabled by default in CLIO Core (`CLIO_CORE_ENABLE_CEE=ON`):
 
 ```bash
-# Configure with debug preset
-cmake --preset=debug -DWRP_CORE_ENABLE_CEE=ON
-
-# Build CEE API and tests
-cmake --build build --target clio_cee_api -j$(nproc)
-cmake --build build --target test_context_bundle -j$(nproc)
+git clone --recurse-submodules https://github.com/iowarp/clio-core.git
+cd clio-core
+cmake --preset release
+cmake --build build/release -j$(nproc)
 ```
 
-## Testing
+To build a debug variant with CEE explicitly:
 
-### Unit Tests
-
-CEE includes comprehensive unit tests demonstrating the complete workflow:
-
-**Bundle-and-Retrieve Test** ([api/test/test_context_bundle.cc](api/test/test_context_bundle.cc)):
-- Generates 1MB test file with patterned data
-- Registers RAM storage target with CTE
-- Creates CAE pool dynamically
-- Bundles file using ContextBundle API
-- Queries to verify data storage
-- Cleans up test context
-
-**Query Test** ([api/test/test_context_query.cc](api/test/test_context_query.cc)):
-- Tests basic query operations
-- Validates regex pattern matching
-
-**Destroy Test** ([api/test/test_context_destroy.cc](api/test/test_context_destroy.cc)):
-- Tests context deletion
-- Validates error handling
-
-### Running Tests
-
-Tests support two modes:
-
-**1. With External Runtime:**
 ```bash
-# Start runtime in separate terminal
-cd build && ./bin/clio_run runtime start
-
-# Run tests
-./bin/test_context_bundle
-./bin/test_context_query
-./bin/test_context_destroy
+cmake --preset debug -DCLIO_CORE_ENABLE_CEE=ON
+cmake --build build/debug -j$(nproc)
 ```
 
-**2. With Embedded Runtime:**
-```bash
-# Tests initialize runtime automatically
-INIT_CHIMAERA=1 ./bin/test_context_bundle
-INIT_CHIMAERA=1 ./bin/test_context_query
-INIT_CHIMAERA=1 ./bin/test_context_destroy
-```
-
-### Test Configuration
-
-Tests use [api/test/clio_config.yaml](api/test/clio_config.yaml) for runtime configuration:
-- 4 worker threads (sched + slow)
-- 2GB main segment, 1GB client/runtime segments
-- RAM-based storage (4GB capacity)
-- Single-node configuration for unit testing
-
-## Usage Example
-
-### C++ API
+## C++ Usage
 
 ```cpp
 #include <clio_cee/api/context_interface.h>
 #include <clio_cae/core/factory/assimilation_ctx.h>
 
-// Initialize
-iowarp::ContextInterface ctx_interface;
+int main() {
+  // ContextInterface handles runtime initialization internally.
+  iowarp::ContextInterface ctx_interface;
 
-// Bundle a file
-std::vector<clio_cae::core::AssimilationCtx> bundle;
-clio_cae::core::AssimilationCtx ctx;
-ctx.src = "file::/path/to/data.bin";
-ctx.dst = "iowarp::my_dataset";
-ctx.format = "binary";
-bundle.push_back(ctx);
+  // 1. Bundle a file into IOWarp storage.
+  std::vector<clio::cae::core::AssimilationCtx> bundle;
+  clio::cae::core::AssimilationCtx ctx;
+  ctx.src    = "file::/path/to/data.bin";
+  ctx.dst    = "iowarp::my_dataset";
+  ctx.format = "binary";
+  bundle.push_back(ctx);
+  int rc = ctx_interface.ContextBundle(bundle);
 
-int result = ctx_interface.ContextBundle(bundle);
+  // 2. Query for matching blobs.
+  auto blobs = ctx_interface.ContextQuery(
+      "my_dataset",   // tag regex
+      ".*");          // blob regex
 
-// Query for data
-std::vector<std::string> blobs = ctx_interface.ContextQuery(
-    "my_dataset",  // Tag pattern
-    ".*");         // Blob pattern (all blobs)
-
-// Cleanup
-std::vector<std::string> contexts = {"my_dataset"};
-ctx_interface.ContextDestroy(contexts);
+  // 3. Clean up.
+  ctx_interface.ContextDestroy({"my_dataset"});
+  return 0;
+}
 ```
 
-### Python API
+Link with the unified CMake package:
+
+```cmake
+find_package(clio-core CONFIG REQUIRED)
+target_link_libraries(my_app
+  clio::cee::api
+  clio::cae::core_client
+  clio::cte::core_client
+)
+```
+
+## Python Usage
 
 ```python
-from clio_cee import ContextInterface, AssimilationCtx
+import clio_cee as cee
 
-# Initialize
-ctx = ContextInterface()
+# Construct (initializes the runtime internally on first use).
+ctx_interface = cee.ContextInterface()
 
-# Bundle a file
-bundle = [AssimilationCtx(
+# Bundle a file.
+ctx = cee.AssimilationCtx(
     src="file::/path/to/data.bin",
     dst="iowarp::my_dataset",
-    format="binary"
-)]
-result = ctx.context_bundle(bundle)
+    format="binary",
+)
+ctx_interface.context_bundle([ctx])
 
-# Query for data
-blobs = ctx.context_query("my_dataset", ".*")
+# Query for blob names matching a regex.
+blobs = ctx_interface.context_query("my_dataset", ".*", 0)
 
-# Cleanup
-ctx.context_destroy(["my_dataset"])
+# Retrieve blob payloads.
+data = ctx_interface.context_retrieve("my_dataset", ".*", 0)
+
+# Clean up.
+ctx_interface.context_destroy(["my_dataset"])
 ```
 
-## Quick Start (Legacy)
+## Testing
 
-### MCP HDF5 Demo
 ```bash
-cd mcp-hdf-demo
-pip install -r requirements.txt
-# Start the MCP server and client
+ctest --test-dir build/release -R context
 ```
 
-### HDF Compass
+The tests under [`api/test/`](api/test/) demonstrate the full
+bundle / query / retrieve / destroy workflow against an embedded runtime.
+They use [`api/test/clio_config.yaml`](api/test/clio_config.yaml), which
+provisions a 4-worker single-node runtime with a 4 GB RAM-backed CTE target.
+
+Tests can run in two modes:
+
 ```bash
-cd hdf-compass
-# Follow installation instructions in hdf-compass/README.md
+# Against an externally-started runtime:
+clio_run start &
+./build/release/bin/test_context_bundle
+
+# With an embedded runtime (auto-spawned by the test):
+INIT_CHIMAERA=1 ./build/release/bin/test_context_bundle
+```
+
+## Project structure
+
+```
+api/             C++ ContextInterface, Python bindings, tests, demos
+iowarp-cei-mcp/  MCP server exposing CEE operations
+hdf-compass/     Legacy wxPython HDF Compass viewer (pre-CEE)
+mcp-hdf-demo/    Legacy HDF5 MCP demo
 ```
 
 ## License
 
-BSD-3-Clause License - see [LICENSE](LICENSE) file for details.
-
-**Copyright (c) 2024, Gnosis Research Center, Illinois Institute of Technology**
+BSD-3-Clause. See [LICENSE](../LICENSE).
