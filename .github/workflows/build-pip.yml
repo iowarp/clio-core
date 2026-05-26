@@ -648,12 +648,21 @@ jobs:
     - name: List release artifacts
       run: ls -lh dist/
 
-    - name: Create GitHub Release
+    - name: Create or update GitHub Release
       env:
         GITHUB_TOKEN: ${{ github.token }}
-      run: >-
-        gh release create
-        '${{ github.ref_name }}'
-        --repo '${{ github.repository }}'
-        --generate-notes
-        dist/*
+        TAG: ${{ github.ref_name }}
+        REPO: ${{ github.repository }}
+      # build-packages.yml may publish to the same tag's release first
+      # (six native packages); the bare `gh release create` errored
+      # "a release with the same tag name already exists" and the wheel
+      # assets never got attached. Create the release if it doesn't
+      # exist yet, otherwise append wheels to the existing one.
+      run: |
+        if gh release view "$TAG" --repo "$REPO" > /dev/null 2>&1; then
+          echo "Release $TAG exists — uploading wheels."
+          gh release upload "$TAG" --repo "$REPO" --clobber dist/*
+        else
+          echo "Release $TAG does not exist — creating."
+          gh release create "$TAG" --repo "$REPO" --generate-notes dist/*
+        fi
