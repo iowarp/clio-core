@@ -33,7 +33,7 @@ COPY --from=builder /usr/local/lib     /usr/local/lib
 COPY --from=builder /usr/local/bin     /usr/local/bin
 COPY --from=builder /usr/local/share   /usr/local/share
 COPY --from=builder /usr/local/include /usr/local/include
-COPY --from=builder /root/.chimaera    /root/.chimaera
+COPY --from=builder /root/.clio        /root/.clio
 
 # Set up library paths and update cache
 ENV LD_LIBRARY_PATH=/usr/local/lib:/usr/lib/x86_64-linux-gnu

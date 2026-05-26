@@ -22,7 +22,7 @@ services:
     image: iowarp/deploy-cpu:latest
     command: >
       bash -c "
-        clio_run runtime start --config /etc/iowarp/chimaera.yaml &
+        clio_run runtime start --config /etc/iowarp/clio.yaml &
         sleep 3 &&
         clio_cte_bench Put 2 4 1m 20 &&
         clio_run runtime stop
@@ -33,16 +33,16 @@ services:
         condition: none
     environment:
       - NODE_ID=1
-      - CLIO_SERVER_CONF=/etc/iowarp/chimaera.yaml
+      - CLIO_SERVER_CONF=/etc/iowarp/clio.yaml
     configs:
       - source: cte_config
-        target: /etc/iowarp/chimaera.yaml
+        target: /etc/iowarp/clio.yaml
 
   node2:
     image: iowarp/deploy-cpu:latest
     command: >
       bash -c "
-        clio_run runtime start --config /etc/iowarp/chimaera.yaml &
+        clio_run runtime start --config /etc/iowarp/clio.yaml &
         sleep 3 &&
         clio_cte_bench Put 2 4 1m 20 &&
         clio_run runtime stop
@@ -53,10 +53,10 @@ services:
         condition: none
     environment:
       - NODE_ID=2
-      - CLIO_SERVER_CONF=/etc/iowarp/chimaera.yaml
+      - CLIO_SERVER_CONF=/etc/iowarp/clio.yaml
     configs:
       - source: cte_config
-        target: /etc/iowarp/chimaera.yaml
+        target: /etc/iowarp/clio.yaml
 
 configs:
   cte_config:

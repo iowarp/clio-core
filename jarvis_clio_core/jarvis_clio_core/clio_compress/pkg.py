@@ -225,9 +225,10 @@ class ClioCompress(Service):
         # ``KEY=VAL`` env vars to the command string; bash only attaches
         # those to a *simple* command, so a wrapping ``for ... do ...
         # done`` retry loop strips the env (notably CLIO_SERVER_CONF) and
-        # the clio_run compose client falls back to ~/.chimaera, picking
-        # up unrelated compose entries that occupy our target pool ID.
-        # Keep this a single command so the env prefix reaches chimaera.
+        # the clio_run compose client falls back to ~/.clio/clio.yaml,
+        # picking up unrelated compose entries that occupy our target
+        # pool ID. Keep this a single command so the env prefix reaches
+        # clio_run.
         cmd = f'clio_run compose {self.compose_config_path}'
 
         Exec(cmd, PsshExecInfo(

@@ -135,7 +135,9 @@ cmake --build build -j"$(nproc)"
 cmake --install build
 ldconfig
 
-# --- Seed default chimaera config ------------------------------------------
-mkdir -p /root/.chimaera
+# --- Seed default clio config ----------------------------------------------
+# ~/.clio/clio.yaml is the canonical user-config location the runtime
+# checks first; Dockerfile.deploy COPYs this dir from the builder.
+mkdir -p /root/.clio
 cp /opt/iowarp/context-runtime/config/chimaera_default.yaml \
-   /root/.chimaera/chimaera.yaml
+   /root/.clio/clio.yaml

@@ -106,23 +106,22 @@ def _setup():
     if os.path.isdir(_EXT_DIR) and _EXT_DIR not in sys.path:
         sys.path.insert(0, _EXT_DIR)
 
-    # Seed the per-user default config from the bundled default if missing.
-    # Both ~/.clio/clio.yaml (preferred) AND ~/.chimaera/chimaera.yaml
-    # (legacy) are seeded so the runtime's lookup hits a file regardless of
-    # which layout the user has migrated to. The C++ runtime checks the new
-    # path first; see ConfigManager::GetServerConfigPath.
+    # Seed the per-user default config at ~/.clio/clio.yaml if missing.
+    # This is the canonical user-config path the C++ runtime checks
+    # first; see ConfigManager::GetServerConfigPath. Legacy
+    # ~/.chimaera/chimaera.yaml is still honored at read time as a
+    # fallback for users with pre-existing configs, but we no longer
+    # seed it on install.
     _bundled_default = os.path.join(_DATA_DIR, "chimaera_default.yaml")
     if os.path.exists(_bundled_default):
-        for _dir, _name in (("~/.clio", "clio.yaml"),
-                            ("~/.chimaera", "chimaera.yaml")):
-            _user_conf_dir = os.path.expanduser(_dir)
-            _user_conf = os.path.join(_user_conf_dir, _name)
-            if not os.path.exists(_user_conf):
-                try:
-                    os.makedirs(_user_conf_dir, exist_ok=True)
-                    shutil.copy2(_bundled_default, _user_conf)
-                except OSError:
-                    pass  # read-only home, containerised, etc.
+        _user_conf_dir = os.path.expanduser("~/.clio")
+        _user_conf = os.path.join(_user_conf_dir, "clio.yaml")
+        if not os.path.exists(_user_conf):
+            try:
+                os.makedirs(_user_conf_dir, exist_ok=True)
+                shutil.copy2(_bundled_default, _user_conf)
+            except OSError:
+                pass  # read-only home, containerised, etc.
 
 
 _setup()

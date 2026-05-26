@@ -59,10 +59,11 @@ RUN sudo chown -R $(whoami):$(whoami) /workspace && \
     cmake --preset build-cpu-release -DCLIO_CORE_ENABLE_CONDA=OFF ../ && \
     sudo make -j$(nproc) install
 
-# Seed default config at ~/.chimaera/chimaera.yaml (picked up automatically by runtime)
-RUN mkdir -p /home/iowarp/.chimaera && \
+# Seed default config at ~/.clio/clio.yaml (the canonical user-config
+# location the runtime checks first; see ConfigManager::GetServerConfigPath).
+RUN mkdir -p /home/iowarp/.clio && \
     cp /workspace/context-runtime/config/chimaera_default.yaml \
-       /home/iowarp/.chimaera/chimaera.yaml
+       /home/iowarp/.clio/clio.yaml
 
 #------------------------------------------------------------
 # Final Deploy Image
@@ -84,7 +85,7 @@ COPY --from=builder /usr/local/bin /usr/local/bin
 COPY --from=builder /usr/local/share /usr/local/share
 
 # Copy default config for runtime auto-discovery
-COPY --from=builder --chown=iowarp:iowarp /home/iowarp/.chimaera /home/iowarp/.chimaera
+COPY --from=builder --chown=iowarp:iowarp /home/iowarp/.clio /home/iowarp/.clio
 
 # Copy Jarvis-CD and jarvis_clio_core from builder
 COPY --from=builder /workspace/external/jarvis-cd /opt/jarvis-cd

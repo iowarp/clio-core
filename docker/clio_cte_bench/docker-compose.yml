@@ -32,11 +32,11 @@ services:
 
     # Mount shared CTE configuration
     volumes:
-      - ./cte_config.yaml:/etc/iowarp/chimaera.yaml:ro
+      - ./cte_config.yaml:/etc/iowarp/clio.yaml:ro
 
     # Config lookup: CLIO_SERVER_CONF is checked first by the runtime
     environment:
-      - CLIO_SERVER_CONF=/etc/iowarp/chimaera.yaml
+      - CLIO_SERVER_CONF=/etc/iowarp/clio.yaml
 
     # Expose ZeroMQ port for client connections
     ports:

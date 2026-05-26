@@ -6,10 +6,12 @@
 #   - Context Transfer Engine / CTE (context-transfer-engine)
 #   - Context Assimilation Engine / CAE (context-assimilation-engine)
 #
-# Config lookup order:
-#   1. CLIO_SERVER_CONF environment variable
-#   2. CLIO_SERVER_CONF environment variable
-#   3. ~/.chimaera/chimaera.yaml
+# Config lookup order (canonical first, legacy paths kept for back-compat):
+#   1. $CLIO_SERVER_CONF (or legacy $CHI_SERVER_CONF) environment variable
+#   2. ~/.clio/clio.yaml
+#   3. ~/.clio/chimaera.yaml
+#   4. ~/.chimaera/clio.yaml
+#   5. ~/.chimaera/chimaera.yaml         (legacy)
 #
 # Size values accept: B, KB, MB, GB, TB (case-insensitive)
 # =============================================================================

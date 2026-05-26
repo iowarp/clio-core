@@ -25,7 +25,7 @@ docker compose down
 
 ## Configuration
 
-Edit `chimaera.yaml` to customize the runtime. Key settings:
+Edit `clio.yaml` to customize the runtime. Key settings:
 
 | Section | What it controls |
 |---------|-----------------|

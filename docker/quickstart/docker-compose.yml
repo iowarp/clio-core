@@ -13,11 +13,11 @@ services:
     container_name: iowarp-quickstart
     hostname: iowarp
     volumes:
-      - ./chimaera.yaml:/etc/iowarp/chimaera.yaml:ro
+      - ./clio.yaml:/etc/iowarp/clio.yaml:ro
     environment:
-      - CLIO_SERVER_CONF=/etc/iowarp/chimaera.yaml
+      - CLIO_SERVER_CONF=/etc/iowarp/clio.yaml
     ports:
       - "9413:9413"
     mem_limit: 8g
-    command: ["chimaera", "runtime", "start"]
+    command: ["clio_run", "start"]
     restart: unless-stopped

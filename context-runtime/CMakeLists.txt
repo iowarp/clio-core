@@ -201,11 +201,13 @@ install(DIRECTORY config/
   FILES_MATCHING PATTERN "*"
 )
 
-# Seed the user's default config — both ~/.clio/clio.yaml (preferred) and
-# ~/.chimaera/chimaera.yaml (legacy) so either location continues to work
-# in the wild. Runtime lookup order is documented in
-# ConfigManager::GetServerConfigPath; the new ~/.clio takes priority.
-# Existing files are never overwritten.
+# Seed the user's default config at ~/.clio/clio.yaml — the canonical
+# user-config location the runtime checks first
+# (ConfigManager::GetServerConfigPath). Existing files are never
+# overwritten. Legacy ~/.chimaera/chimaera.yaml is still HONORED at
+# read time as a fallback for users with pre-existing configs, but we
+# no longer seed it on install — that path is documented as legacy
+# in docs/deprecation-notes.md and will eventually be removed.
 install(CODE "
   # Determine real user's home directory (handles sudo install)
   set(_HOME \"\")
@@ -232,8 +234,7 @@ install(CODE "
 
   # Per-destination seeding helper: directory + filename + optional chown
   foreach(_entry
-      \"\${_HOME}/.clio|clio.yaml\"       # new canonical location
-      \"\${_HOME}/.chimaera|chimaera.yaml\")  # legacy location, kept seeded
+      \"\${_HOME}/.clio|clio.yaml\")  # canonical user-config location
     string(REPLACE \"|\" \";\" _parts \"\${_entry}\")
     list(GET _parts 0 _DEST)
     list(GET _parts 1 _NAME)

@@ -35,12 +35,17 @@ jobs:
         echo "Version check passed."
 
   #-----------------------------------------------------------------------
-  # Build .deb on Ubuntu (devcontainer has all build dependencies)
+  # Build .deb on Ubuntu
+  #
+  # Previously ran inside `iowarp/clio-core-devcontainer:latest`, which is
+  # not pulled into a public registry the GHA runner can access (Docker
+  # pull failed with "access denied" at v1.9.0). Run natively on
+  # ubuntu-latest and `apt-get install` deps inline — same shape the RPM
+  # job already uses for Fedora.
   #-----------------------------------------------------------------------
   build-deb:
     name: Build Debian package
     runs-on: ubuntu-latest
-    container: iowarp/clio-core-devcontainer:latest
     needs: [check-version]
     if: always() && (needs.check-version.result == 'success' || needs.check-version.result == 'skipped')
     steps:
@@ -49,6 +54,14 @@ jobs:
       with:
         submodules: recursive
         fetch-depth: 0
+
+    - name: Install build dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          cmake ninja-build build-essential pkg-config \
+          libzmq3-dev libyaml-cpp-dev libcereal-dev libmsgpack-dev \
+          libsodium-dev
 
     - name: Configure with CMake
       run: |
@@ -74,6 +87,10 @@ jobs:
 
   #-----------------------------------------------------------------------
   # Build .rpm on Fedora (in a container)
+  #
+  # fedora:40 ships without git in the base image, so actions/checkout@v4
+  # falls back to the REST API which doesn't support submodules. Install
+  # git BEFORE the checkout step so it can use the native git path.
   #-----------------------------------------------------------------------
   build-rpm:
     name: Build RPM package
@@ -82,15 +99,20 @@ jobs:
     needs: [check-version]
     if: always() && (needs.check-version.result == 'success' || needs.check-version.result == 'skipped')
     steps:
+    - name: Install git (required for actions/checkout submodule mode)
+      run: dnf install -y git
+
     - name: Checkout repository
       uses: actions/checkout@v4
       with:
         submodules: recursive
         fetch-depth: 0
 
-    - name: Install dependencies
+    - name: Install build dependencies
       run: |
-        dnf install -y cmake ninja-build gcc-c++ zeromq-devel yaml-cpp-devel cereal-devel msgpack-devel rpm-build
+        dnf install -y cmake ninja-build gcc-c++ pkgconf-pkg-config \
+          zeromq-devel yaml-cpp-devel cereal-devel msgpack-devel \
+          libsodium-devel rpm-build
 
     - name: Configure with CMake
       run: |
@@ -116,14 +138,16 @@ jobs:
         path: build-rpm/*.rpm
 
   #-----------------------------------------------------------------------
-  # Build AppImage on Ubuntu (devcontainer has all build dependencies)
+  # Build AppImage on Ubuntu
   # appimagetool is downloaded at build time; APPIMAGE_EXTRACT_AND_RUN=1
   # lets it run without a FUSE mount (no --privileged needed).
+  #
+  # Same devcontainer-image fix as build-deb: run natively on
+  # ubuntu-latest with deps installed inline.
   #-----------------------------------------------------------------------
   build-appimage:
     name: Build AppImage
     runs-on: ubuntu-latest
-    container: iowarp/clio-core-devcontainer:latest
     needs: [check-version]
     if: always() && (needs.check-version.result == 'success' || needs.check-version.result == 'skipped')
     steps:
@@ -132,6 +156,14 @@ jobs:
       with:
         submodules: recursive
         fetch-depth: 0
+
+    - name: Install build dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          cmake ninja-build build-essential pkg-config wget file \
+          libzmq3-dev libyaml-cpp-dev libcereal-dev libmsgpack-dev \
+          libsodium-dev
 
     - name: Configure with CMake
       run: |
@@ -155,6 +187,12 @@ jobs:
 
   #-----------------------------------------------------------------------
   # Publish all artifacts to GitHub Release on tag
+  #
+  # softprops/action-gh-release appends to an existing release when one
+  # exists (created by build-pip.yml's github-release job), or creates a
+  # new one if not. fail_on_unmatched_files=true so a missing artifact
+  # is surfaced as a job failure instead of silently shipping a partial
+  # release.
   #-----------------------------------------------------------------------
   publish-release:
     name: Publish to GitHub Release
@@ -185,9 +223,10 @@ jobs:
     - name: List packages
       run: ls -lh packages/
 
-    - name: Create GitHub Release
+    - name: Attach packages to GitHub Release
       uses: softprops/action-gh-release@v1
       with:
         files: packages/*
+        fail_on_unmatched_files: true
       env:
         GITHUB_TOKEN: ${{ github.token }}
