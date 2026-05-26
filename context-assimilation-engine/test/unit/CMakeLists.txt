@@ -168,33 +168,33 @@ target_link_libraries(test_cae_comprehensive
 install(TARGETS test_cae_comprehensive DESTINATION bin)
 
 # Register individual test cases with CTest
-add_test(NAME CAE_ClientInit COMMAND test_cae_comprehensive "[cae][core][init]")
-add_test(NAME CAE_AssimilationCtx_Default COMMAND test_cae_comprehensive "[cae][ctx]")
-add_test(NAME CAE_AssimilationCtx_Full COMMAND test_cae_comprehensive "[cae][ctx]")
-add_test(NAME CAE_AssimilationCtx_Patterns COMMAND test_cae_comprehensive "[cae][ctx]")
-add_test(NAME CAE_ParseOmni_Binary COMMAND test_cae_comprehensive "[cae][parseomni][binary]")
-add_test(NAME CAE_ParseOmni_BinaryRange COMMAND test_cae_comprehensive "[cae][parseomni][binary][range]")
-add_test(NAME CAE_ParseOmni_Multi COMMAND test_cae_comprehensive "[cae][parseomni][multi]")
-add_test(NAME CAE_ParseOmni_Empty COMMAND test_cae_comprehensive "[cae][parseomni][error]")
-add_test(NAME CAE_ProcessHdf5_Basic COMMAND test_cae_comprehensive "[cae][hdf5]")
-add_test(NAME CAE_ProcessHdf5_NonExistent COMMAND test_cae_comprehensive "[cae][hdf5][error]")
-add_test(NAME CAE_ProcessHdf5_EmptyPath COMMAND test_cae_comprehensive "[cae][hdf5][error]")
-add_test(NAME CAE_Serialization COMMAND test_cae_comprehensive "[cae][ctx][serialization]")
-add_test(NAME CAE_VerifyBinaryData COMMAND test_cae_comprehensive "[cae][integration][binary]")
-add_test(NAME CAE_FileURL COMMAND test_cae_comprehensive "[cae][url]")
-add_test(NAME CAE_IOWarpURL COMMAND test_cae_comprehensive "[cae][url]")
-add_test(NAME CAE_BinaryFormat COMMAND test_cae_comprehensive "[cae][format]")
-add_test(NAME CAE_HDF5Format COMMAND test_cae_comprehensive "[cae][format]")
-add_test(NAME CAE_UnknownFormat COMMAND test_cae_comprehensive "[cae][format]")
+add_test(NAME cae_clientinit COMMAND test_cae_comprehensive "[cae][core][init]")
+add_test(NAME cae_assimilationctx_default COMMAND test_cae_comprehensive "[cae][ctx]")
+add_test(NAME cae_assimilationctx_full COMMAND test_cae_comprehensive "[cae][ctx]")
+add_test(NAME cae_assimilationctx_patterns COMMAND test_cae_comprehensive "[cae][ctx]")
+add_test(NAME cae_parseomni_binary COMMAND test_cae_comprehensive "[cae][parseomni][binary]")
+add_test(NAME cae_parseomni_binaryrange COMMAND test_cae_comprehensive "[cae][parseomni][binary][range]")
+add_test(NAME cae_parseomni_multi COMMAND test_cae_comprehensive "[cae][parseomni][multi]")
+add_test(NAME cae_parseomni_empty COMMAND test_cae_comprehensive "[cae][parseomni][error]")
+add_test(NAME cae_processhdf5_basic COMMAND test_cae_comprehensive "[cae][hdf5]")
+add_test(NAME cae_processhdf5_nonexistent COMMAND test_cae_comprehensive "[cae][hdf5][error]")
+add_test(NAME cae_processhdf5_emptypath COMMAND test_cae_comprehensive "[cae][hdf5][error]")
+add_test(NAME cae_serialization COMMAND test_cae_comprehensive "[cae][ctx][serialization]")
+add_test(NAME cae_verifybinarydata COMMAND test_cae_comprehensive "[cae][integration][binary]")
+add_test(NAME cae_fileurl COMMAND test_cae_comprehensive "[cae][url]")
+add_test(NAME cae_iowarpurl COMMAND test_cae_comprehensive "[cae][url]")
+add_test(NAME cae_binaryformat COMMAND test_cae_comprehensive "[cae][format]")
+add_test(NAME cae_hdf5format COMMAND test_cae_comprehensive "[cae][format]")
+add_test(NAME cae_unknownformat COMMAND test_cae_comprehensive "[cae][format]")
 
 # Set test properties
 set_tests_properties(
-  CAE_ClientInit CAE_AssimilationCtx_Default CAE_AssimilationCtx_Full
-  CAE_AssimilationCtx_Patterns CAE_ParseOmni_Binary CAE_ParseOmni_BinaryRange
-  CAE_ParseOmni_Multi CAE_ParseOmni_Empty CAE_ProcessHdf5_Basic
-  CAE_ProcessHdf5_NonExistent CAE_ProcessHdf5_EmptyPath CAE_Serialization
-  CAE_VerifyBinaryData CAE_FileURL CAE_IOWarpURL CAE_BinaryFormat
-  CAE_HDF5Format CAE_UnknownFormat
+  cae_clientinit cae_assimilationctx_default cae_assimilationctx_full
+  cae_assimilationctx_patterns cae_parseomni_binary cae_parseomni_binaryrange
+  cae_parseomni_multi cae_parseomni_empty cae_processhdf5_basic
+  cae_processhdf5_nonexistent cae_processhdf5_emptypath cae_serialization
+  cae_verifybinarydata cae_fileurl cae_iowarpurl cae_binaryformat
+  cae_hdf5format cae_unknownformat
   PROPERTIES
     TIMEOUT 120
     LABELS "coverage;comprehensive;msan_skip"
@@ -285,14 +285,14 @@ install(TARGETS test_export_data DESTINATION bin)
 # Register as two CTest targets: task struct tests and runtime integration tests.
 # Each target runs all its test cases in a single process (one runtime startup),
 # avoiding port 9413 TIME_WAIT conflicts that arise from repeated restarts.
-add_test(NAME CAE_ExportData_Task
+add_test(NAME cae_exportdata_task
   COMMAND test_export_data "[cae][export][task]")
-add_test(NAME CAE_ExportData_Runtime
+add_test(NAME cae_exportdata_runtime
   COMMAND test_export_data "[cae][export][runtime]")
 
 set_tests_properties(
-  CAE_ExportData_Task
-  CAE_ExportData_Runtime
+  cae_exportdata_task
+  cae_exportdata_runtime
   PROPERTIES
     TIMEOUT 300
     LABELS "coverage;export;msan_skip"

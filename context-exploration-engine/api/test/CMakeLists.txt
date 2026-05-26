@@ -53,28 +53,28 @@ target_link_libraries(test_context_comprehensive
 install(TARGETS test_context_comprehensive DESTINATION bin/tests)
 
 # Register individual test cases with CTest
-add_test(NAME CEE_Init COMMAND test_context_comprehensive "[cee][init]")
-add_test(NAME CEE_Retrieve_Basic COMMAND test_context_comprehensive "[cee][retrieve][basic]")
-add_test(NAME CEE_Retrieve_Empty COMMAND test_context_comprehensive "[cee][retrieve][empty]")
-add_test(NAME CEE_Retrieve_SmallBuffer COMMAND test_context_comprehensive "[cee][retrieve][buffer]")
-add_test(NAME CEE_Retrieve_CustomBatch COMMAND test_context_comprehensive "[cee][retrieve][batch]")
-add_test(NAME CEE_Retrieve_MaxResults COMMAND test_context_comprehensive "[cee][retrieve][limit]")
-add_test(NAME CEE_Bundle_Multi COMMAND test_context_comprehensive "[cee][bundle][multi]")
-add_test(NAME CEE_Bundle_Range COMMAND test_context_comprehensive "[cee][bundle][range]")
-add_test(NAME CEE_Bundle_Invalid COMMAND test_context_comprehensive "[cee][bundle][error]")
-add_test(NAME CEE_Query_Regex COMMAND test_context_comprehensive "[cee][query][regex]")
-add_test(NAME CEE_Query_Limit COMMAND test_context_comprehensive "[cee][query][limit]")
-add_test(NAME CEE_Destroy_Multi COMMAND test_context_comprehensive "[cee][destroy][multi]")
-add_test(NAME CEE_Destroy_Partial COMMAND test_context_comprehensive "[cee][destroy][partial]")
-add_test(NAME CEE_Splice_Stub COMMAND test_context_comprehensive "[cee][splice][stub]")
-add_test(NAME CEE_Integration COMMAND test_context_comprehensive "[cee][integration]")
+add_test(NAME cee_init COMMAND test_context_comprehensive "[cee][init]")
+add_test(NAME cee_retrieve_basic COMMAND test_context_comprehensive "[cee][retrieve][basic]")
+add_test(NAME cee_retrieve_empty COMMAND test_context_comprehensive "[cee][retrieve][empty]")
+add_test(NAME cee_retrieve_smallbuffer COMMAND test_context_comprehensive "[cee][retrieve][buffer]")
+add_test(NAME cee_retrieve_custombatch COMMAND test_context_comprehensive "[cee][retrieve][batch]")
+add_test(NAME cee_retrieve_maxresults COMMAND test_context_comprehensive "[cee][retrieve][limit]")
+add_test(NAME cee_bundle_multi COMMAND test_context_comprehensive "[cee][bundle][multi]")
+add_test(NAME cee_bundle_range COMMAND test_context_comprehensive "[cee][bundle][range]")
+add_test(NAME cee_bundle_invalid COMMAND test_context_comprehensive "[cee][bundle][error]")
+add_test(NAME cee_query_regex COMMAND test_context_comprehensive "[cee][query][regex]")
+add_test(NAME cee_query_limit COMMAND test_context_comprehensive "[cee][query][limit]")
+add_test(NAME cee_destroy_multi COMMAND test_context_comprehensive "[cee][destroy][multi]")
+add_test(NAME cee_destroy_partial COMMAND test_context_comprehensive "[cee][destroy][partial]")
+add_test(NAME cee_splice_stub COMMAND test_context_comprehensive "[cee][splice][stub]")
+add_test(NAME cee_integration COMMAND test_context_comprehensive "[cee][integration]")
 
 # Set test properties for comprehensive tests
 set_tests_properties(
-  CEE_Init CEE_Retrieve_Basic CEE_Retrieve_Empty CEE_Retrieve_SmallBuffer
-  CEE_Retrieve_CustomBatch CEE_Retrieve_MaxResults CEE_Bundle_Multi
-  CEE_Bundle_Range CEE_Bundle_Invalid CEE_Query_Regex CEE_Query_Limit
-  CEE_Destroy_Multi CEE_Destroy_Partial CEE_Splice_Stub CEE_Integration
+  cee_init cee_retrieve_basic cee_retrieve_empty cee_retrieve_smallbuffer
+  cee_retrieve_custombatch cee_retrieve_maxresults cee_bundle_multi
+  cee_bundle_range cee_bundle_invalid cee_query_regex cee_query_limit
+  cee_destroy_multi cee_destroy_partial cee_splice_stub cee_integration
   PROPERTIES
     TIMEOUT 180
     LABELS "cee;comprehensive;coverage;msan_skip"
@@ -95,13 +95,13 @@ if(TARGET clio_cee)
 
   # Add Python test to CTest
   add_test(
-    NAME test_context_interface_python
+    NAME cee_python_interface
     COMMAND ${Python_EXECUTABLE} ${CMAKE_CURRENT_BINARY_DIR}/test_context_interface.py
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
   )
 
   # Set test properties
-  set_tests_properties(test_context_interface_python PROPERTIES
+  set_tests_properties(cee_python_interface PROPERTIES
     LABELS "cee;api;python;interface"
     TIMEOUT 600  # 10 minute timeout for Python tests
   )
@@ -121,13 +121,13 @@ if(TARGET clio_cee)
 
   # Add enhanced Python test to CTest
   add_test(
-    NAME test_context_interface_enhanced_python
+    NAME cee_python_interface_enhanced
     COMMAND ${Python_EXECUTABLE} ${CMAKE_CURRENT_BINARY_DIR}/test_context_interface_enhanced.py
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
   )
 
   # Set test properties
-  set_tests_properties(test_context_interface_enhanced_python PROPERTIES
+  set_tests_properties(cee_python_interface_enhanced PROPERTIES
     LABELS "cee;api;python;enhanced;coverage"
     TIMEOUT 600  # 10 minute timeout for Python tests
   )
@@ -147,12 +147,12 @@ if(TARGET clio_cee)
 
   # Add retrieve roundtrip test to CTest
   add_test(
-    NAME test_context_retrieve_roundtrip_python
+    NAME cee_python_retrieve_roundtrip
     COMMAND ${Python_EXECUTABLE} ${CMAKE_CURRENT_BINARY_DIR}/test_context_retrieve_roundtrip.py
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
   )
 
-  set_tests_properties(test_context_retrieve_roundtrip_python PROPERTIES
+  set_tests_properties(cee_python_retrieve_roundtrip PROPERTIES
     LABELS "cee;api;python;retrieve;regression;manual"
     TIMEOUT 120
     DISABLED TRUE  # Requires externally running IOWarp runtime

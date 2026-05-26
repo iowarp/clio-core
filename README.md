@@ -354,9 +354,10 @@ ctest -VV
 
 # Run specific component tests
 ctest -R context_transport  # Transport primitives tests
-ctest -R runtime            # CLIO Runtime tests
-ctest -R cte                # Context transfer engine tests
-ctest -R omni               # Context assimilation engine tests
+ctest -R cr                 # CLIO Runtime tests
+ctest -R cte                # Context Transfer Engine tests
+ctest -R cae                # Context Assimilation Engine tests
+ctest -R cee                # Context Exploration Engine tests
 ```
 
 ## Benchmarking
