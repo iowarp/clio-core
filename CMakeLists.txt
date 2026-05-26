@@ -910,19 +910,19 @@ if(CLIO_CORE_ENABLE_TESTS)
 
     if(UNIX)
       add_test(
-          NAME chimaera_pre_test_cleanup
+          NAME cr_pre_test_cleanup
           COMMAND bash -c "${_chimaera_cleanup_cmd}"
       )
-      set_tests_properties(chimaera_pre_test_cleanup PROPERTIES
+      set_tests_properties(cr_pre_test_cleanup PROPERTIES
           TIMEOUT 30
           FIXTURES_SETUP chimaera_test_cleanup_fixture
       )
 
       add_test(
-          NAME chimaera_post_test_cleanup
+          NAME cr_post_test_cleanup
           COMMAND bash -c "${_chimaera_cleanup_cmd}"
       )
-      set_tests_properties(chimaera_post_test_cleanup PROPERTIES
+      set_tests_properties(cr_post_test_cleanup PROPERTIES
           TIMEOUT 30
           FIXTURES_CLEANUP chimaera_test_cleanup_fixture
       )
@@ -948,19 +948,19 @@ if(CLIO_CORE_ENABLE_TESTS)
            exit 0")
 
       add_test(
-          NAME chimaera_pre_test_cleanup
+          NAME cr_pre_test_cleanup
           COMMAND powershell -NoProfile -ExecutionPolicy Bypass -Command "${_chimaera_cleanup_cmd_win}"
       )
-      set_tests_properties(chimaera_pre_test_cleanup PROPERTIES
+      set_tests_properties(cr_pre_test_cleanup PROPERTIES
           TIMEOUT 30
           FIXTURES_SETUP chimaera_test_cleanup_fixture
       )
 
       add_test(
-          NAME chimaera_post_test_cleanup
+          NAME cr_post_test_cleanup
           COMMAND powershell -NoProfile -ExecutionPolicy Bypass -Command "${_chimaera_cleanup_cmd_win}"
       )
-      set_tests_properties(chimaera_post_test_cleanup PROPERTIES
+      set_tests_properties(cr_post_test_cleanup PROPERTIES
           TIMEOUT 30
           FIXTURES_CLEANUP chimaera_test_cleanup_fixture
       )
@@ -1147,14 +1147,14 @@ if(CLIO_CORE_ENABLE_TESTS)
 
     # -----------------------------------------------------------------------
     # Apply the cleanup fixture to every component test so that the
-    # chimaera_post_test_cleanup hook runs after the whole suite, even when
+    # cr_post_test_cleanup hook runs after the whole suite, even when
     # individual tests fail. Excludes the cleanup fixtures themselves.
     # -----------------------------------------------------------------------
     function(_chimaera_require_cleanup_fixture_recursive dir)
         get_directory_property(_tests DIRECTORY "${dir}" TESTS)
         foreach(_t ${_tests})
-            if(NOT _t STREQUAL "chimaera_pre_test_cleanup" AND
-               NOT _t STREQUAL "chimaera_post_test_cleanup")
+            if(NOT _t STREQUAL "cr_pre_test_cleanup" AND
+               NOT _t STREQUAL "cr_post_test_cleanup")
                 set_property(TEST ${_t} DIRECTORY "${dir}" APPEND PROPERTY
                     FIXTURES_REQUIRED chimaera_test_cleanup_fixture)
             endif()

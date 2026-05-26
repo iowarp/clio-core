@@ -578,11 +578,11 @@ if(CLIO_CORE_ENABLE_TESTS)
   # Previously 8 redundant entries each invoked the full unfiltered binary, which
   # serialized via RESOURCE_LOCK but multiplied chimaera shutdown ZMQ-race exposure.
   add_test(
-    NAME cr_chimaera_unit_tests
+    NAME cr_unit_tests
     COMMAND ${TEST_TARGET}
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
-  set_tests_properties(cr_chimaera_unit_tests PROPERTIES
+  set_tests_properties(cr_unit_tests PROPERTIES
     ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;CHIMAERA_TEST_MODE=1;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500"
     TIMEOUT 600
   )
@@ -921,7 +921,7 @@ if(CLIO_CORE_ENABLE_TESTS)
   # Mark all CR runtime tests as msan_skip (they use ZMQ which is uninstrumented).
   # The fork-based tests are excluded on Windows (not built there).
   set(_msan_skip_tests
-    cr_chimaera_unit_tests
+    cr_unit_tests
     cr_ipc_allocate_buffer_basic_tests
     cr_ipc_allocate_buffer_types_tests
     cr_ipc_allocate_buffer_sizes_tests
