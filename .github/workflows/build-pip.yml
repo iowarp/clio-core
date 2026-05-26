@@ -540,6 +540,12 @@ jobs:
         }
 
         Write-Host "=== All Windows tests passed ==="
+        # The bench --help calls above leave $LASTEXITCODE = 1 (they print
+        # usage and exit non-zero, which we treat as success here). pwsh
+        # propagates that as the script's exit code unless we override it,
+        # which makes GitHub Actions mark the step as failed even though
+        # every check above passed. Force success explicitly.
+        exit 0
 
   #------------------------------------------------------------
   # Publish to PyPI on version tags
