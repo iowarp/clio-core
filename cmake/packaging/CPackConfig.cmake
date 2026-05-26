@@ -68,6 +68,12 @@ if(CLIO_CORE_ENABLE_DEB_PACKAGE OR CLIO_CORE_ENABLE_CPACK)
     set(CPACK_DEBIAN_PACKAGE_DEPENDS
         "libzmq3-dev, libyaml-cpp-dev, libmsgpack-dev, libsodium-dev")
 
+    # Use Debian-standard filename: <pkg>_<ver>-<rel>_<arch>.deb. Without this,
+    # CPack defaults to "iowarp-core-<ver>-Linux.deb" with no arch suffix, so
+    # the amd64 and arm64 builds both produce the same filename and the second
+    # release upload overwrites the first.
+    set(CPACK_DEBIAN_FILE_NAME "DEB-DEFAULT")
+
     message(STATUS "CPack: DEB generator enabled (arch=${CPACK_DEBIAN_PACKAGE_ARCHITECTURE})")
 endif()
 
@@ -117,6 +123,11 @@ if(CLIO_CORE_ENABLE_RPM_PACKAGE OR CLIO_CORE_ENABLE_CPACK)
     # install layout the .deb already uses (which Debian's policy doesn't
     # touch), so both packages now resolve their internal libs identically.
     set(CPACK_RPM_SPEC_MORE_DEFINE "%define __brp_check_rpaths %{nil}")
+
+    # Use RPM-standard filename: <pkg>-<ver>-<rel>.<arch>.rpm. Same rationale
+    # as CPACK_DEBIAN_FILE_NAME above — the default "iowarp-core-<ver>-Linux.rpm"
+    # has no arch suffix and collides when uploading both amd64 and arm64 RPMs.
+    set(CPACK_RPM_FILE_NAME "RPM-DEFAULT")
 
     message(STATUS "CPack: RPM generator enabled")
 endif()

@@ -218,7 +218,10 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: appimage-${{ matrix.arch }}
-        path: build-appimage/*.AppImage
+        # Narrow to our package — the build dir also contains a downloaded
+        # appimagetool-*.AppImage (the tool that produces the AppImage), and
+        # a bare *.AppImage glob would ship that as a release asset too.
+        path: build-appimage/iowarp-core-*.AppImage
 
   #-----------------------------------------------------------------------
   # Install-and-smoke-test each native package on a clean container.
