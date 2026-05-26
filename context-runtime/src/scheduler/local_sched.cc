@@ -66,6 +66,11 @@ void LocalScheduler::DivideWorkers(WorkOrchestrator *work_orch) {
 
   if (total_workers > 2) {
     gpu_worker_ = work_orch->GetWorker(total_workers - 2);
+  } else {
+    // No headroom for a dedicated GPU worker — alias onto worker 0 so the
+    // gpu2cpu_queue still gets drained. Worker::Run() calls
+    // ProcessNewTasksGpu() each iteration regardless of role. See #448.
+    gpu_worker_ = work_orch->GetWorker(0);
   }
 
   u32 num_sched_workers = (total_workers == 1) ? 1 : (total_workers - 1);

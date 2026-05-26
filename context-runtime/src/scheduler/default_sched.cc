@@ -81,10 +81,16 @@ void DefaultScheduler::DivideWorkers(WorkOrchestrator *work_orch) {
 
   // GPU worker: needs its own worker so kGpuRecv polling doesn't fight with
   // periodic net tasks. Carve it out from before the net pair (N-3) when
-  // we have headroom; otherwise leave gpu_worker_ null (callers must
-  // tolerate this — none of the CPU-only paths exercised below need it).
+  // we have headroom. Below that, alias onto the scheduler worker — the
+  // GPU lane drain is cheap (a single Pop per iteration that returns
+  // immediately when empty), and Worker::Run() already calls
+  // ProcessNewTasksGpu() every loop iteration regardless of role. Leaving
+  // gpu_worker_ null at small N hangs any kernel that calls future.Wait()
+  // because nothing drains gpu2cpu_queue — see issue #448.
   if (total_workers >= 5) {
     gpu_worker_ = work_orch->GetWorker(total_workers - 3);
+  } else {
+    gpu_worker_ = scheduler_worker_;
   }
 
   // I/O workers live between the scheduler and the GPU/net block. With the
