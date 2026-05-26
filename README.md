@@ -52,7 +52,7 @@ CLIO Core follows a layered architecture integrating five core components:
         └─────────────────────┼─────────────────────┘
                               │
                     ┌─────────────────┐
-                    │  Chimaera       │
+                    │  CLIO           │
                     │  Runtime        │
                     │  (Module System)│
                     └─────────────────┘
@@ -76,9 +76,9 @@ linked. No system installs are required beyond glibc and Python 3.10+.
 pip install iowarp-core
 ```
 
-The wheel includes the Clio runtime, the `clio_run` CLI, the CTE,
+The wheel includes the CLIO runtime, the `clio_run` CLI, the CTE,
 CAE, and CEE engines, and the `clio_cee` Python bindings. A default
-configuration is seeded at `~/.clio/clio.yaml` (legacy: `~/.chimaera/chimaera.yaml`) on first import.
+configuration is seeded at `~/.clio/clio.yaml` on first import.
 
 Newer extensions and advanced/accelerated features are not in the
 portable wheel — switch to a source build below if you need any of:
@@ -109,6 +109,10 @@ If you already cloned without submodules, initialize them with:
 ```bash
 git submodule update --init --recursive
 ```
+
+For a full **bare-metal source build** (without Conda) with the
+per-feature apt/dnf dependency list and a checklist of every
+`CLIO_*_ENABLE_*` flag, see [INSTALL.md](INSTALL.md).
 
 Other source-install methods (Docker, Spack) are documented in
 [docs/getting-started/installation](docs/docs/getting-started/installation.mdx).
@@ -189,7 +193,7 @@ Interactive tools and interfaces for exploring scientific data contents and meta
 
 ### Starting the Runtime
 
-Installation seeds a default configuration at `~/.clio/clio.yaml` (legacy: `~/.chimaera/chimaera.yaml`), so
+Installation seeds a default configuration at `~/.clio/clio.yaml`, so
 the runtime works out of the box:
 
 ```bash
@@ -337,7 +341,7 @@ target_link_libraries(my_app
 - `clio::cte::core_client`, `clio::cte::core_runtime` (Context Transfer Engine)
 - `clio::cae::core_client`, `clio::cae::core_runtime` (Context Assimilation Engine)
 
-The pre-`::` waypoint spellings (`clio_run::*`, `clio_cte::*`, `clio_cae::*`) and the historical install-time names (`chimaera::*`, `wrp_cte::*`, `wrp_cae::*`) remain available as backward-compat ALIAS targets.
+The pre-`::` waypoint spellings (`clio_run::*`, `clio_cte::*`, `clio_cae::*`) remain available as backward-compat ALIAS targets; the historical install-time aliases are catalogued in [Deprecation Notes](https://iowarp.readthedocs.io/en/latest/deprecation-notes/).
 
 ## Testing
 
@@ -350,7 +354,7 @@ ctest -VV
 
 # Run specific component tests
 ctest -R context_transport  # Transport primitives tests
-ctest -R chimaera           # Runtime tests
+ctest -R runtime            # CLIO Runtime tests
 ctest -R cte                # Context transfer engine tests
 ctest -R omni               # Context assimilation engine tests
 ```
