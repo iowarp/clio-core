@@ -29,12 +29,24 @@ if [ ! -x "$LINUXDEPLOY" ]; then
     chmod +x "$LINUXDEPLOY"
 fi
 
-# linuxdeploy validates the icon as a real image — the appimage-stage
-# CMake target currently writes a zero-byte placeholder, which trips
-# "could not be read as image". Replace it with a 1x1 transparent PNG
-# (67 bytes, decoded from base64) at the two places it lives in AppDir.
-echo "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkAAIAAAoAAv/lxKUAAAAASUVORK5CYII=" \
-    | base64 -d > '@APPIMAGE_STAGING_DIR@/clio_run.png'
+# linuxdeploy validates the icon as a real image AND only accepts
+# standard hicolor sizes (8x8 up to 512x512). The appimage-stage CMake
+# target writes a zero-byte placeholder, so we replace it here with a
+# valid 256x256 transparent PNG synthesized from stdlib python3 (so we
+# don't need imagemagick or libpng-bin on the runner).
+python3 - <<'PYEOF' > '@APPIMAGE_STAGING_DIR@/clio_run.png'
+import struct, zlib, sys
+def chunk(n, d):
+    return struct.pack(">I", len(d)) + n + d + struct.pack(">I", zlib.crc32(n + d))
+w = h = 256
+ihdr = struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0)  # 8-bit RGBA
+raw = b"".join(b"\x00" + b"\x00\x00\x00\x00" * w for _ in range(h))
+png = (b"\x89PNG\r\n\x1a\n"
+       + chunk(b"IHDR", ihdr)
+       + chunk(b"IDAT", zlib.compress(raw))
+       + chunk(b"IEND", b""))
+sys.stdout.buffer.write(png)
+PYEOF
 cp '@APPIMAGE_STAGING_DIR@/clio_run.png' \
     '@APPIMAGE_STAGING_DIR@/usr/share/icons/hicolor/256x256/apps/clio_run.png'
 
