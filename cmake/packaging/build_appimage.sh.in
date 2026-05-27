@@ -62,16 +62,19 @@ echo "Bundling runtime libs into AppDir..."
     || { echo "linuxdeploy failed"; exit 1; }
 
 # ---- appimagetool ----
-APPIMAGETOOL="appimagetool-${AT_ARCH}.AppImage"
-if [ ! -x "$APPIMAGETOOL" ]; then
-    if command -v appimagetool > /dev/null; then
-        APPIMAGETOOL=$(command -v appimagetool)
-    else
-        echo "Downloading $APPIMAGETOOL..."
-        wget -q -O "$APPIMAGETOOL" \
-            "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-${AT_ARCH}.AppImage"
-        chmod +x "$APPIMAGETOOL"
-    fi
+# Resolve to an absolute or ./-prefixed path so we don't have to rely on
+# cwd being in PATH when we exec it.
+APPIMAGETOOL=""
+if [ -x "./appimagetool-${AT_ARCH}.AppImage" ]; then
+    APPIMAGETOOL="./appimagetool-${AT_ARCH}.AppImage"
+elif command -v appimagetool > /dev/null; then
+    APPIMAGETOOL=$(command -v appimagetool)
+else
+    echo "Downloading appimagetool-${AT_ARCH}.AppImage..."
+    wget -q -O "appimagetool-${AT_ARCH}.AppImage" \
+        "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-${AT_ARCH}.AppImage"
+    chmod +x "appimagetool-${AT_ARCH}.AppImage"
+    APPIMAGETOOL="./appimagetool-${AT_ARCH}.AppImage"
 fi
 
 export ARCH="$IMG_ARCH"
