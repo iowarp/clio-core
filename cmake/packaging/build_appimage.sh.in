@@ -1,32 +1,68 @@
 #!/bin/bash
 set -e
 
-# Detect host arch -> matching appimagetool binary + AppImage name.
-# AppImageKit publishes:
-#   appimagetool-x86_64.AppImage
-#   appimagetool-aarch64.AppImage   (for arm64)
+# Detect host arch -> matching tool binaries + AppImage name.
 HOST_ARCH=$(uname -m)
 case "$HOST_ARCH" in
-    x86_64)  AT_ARCH=x86_64;  IMG_ARCH=x86_64  ;;
+    x86_64)        AT_ARCH=x86_64;  IMG_ARCH=x86_64  ;;
     aarch64|arm64) AT_ARCH=aarch64; IMG_ARCH=aarch64 ;;
     *) echo "unsupported host arch for AppImage build: $HOST_ARCH" >&2; exit 1 ;;
 esac
 
-APPIMAGETOOL=''
-if [ -x "@CMAKE_BINARY_DIR@/appimagetool-${AT_ARCH}.AppImage" ]; then
-    APPIMAGETOOL="@CMAKE_BINARY_DIR@/appimagetool-${AT_ARCH}.AppImage"
-elif command -v appimagetool > /dev/null; then
-    APPIMAGETOOL='appimagetool'
-else
-    echo "appimagetool not found, downloading appimagetool-${AT_ARCH}.AppImage..."
-    wget -q -O "@CMAKE_BINARY_DIR@/appimagetool-${AT_ARCH}.AppImage" \
-        "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-${AT_ARCH}.AppImage"
-    chmod +x "@CMAKE_BINARY_DIR@/appimagetool-${AT_ARCH}.AppImage"
-    APPIMAGETOOL="@CMAKE_BINARY_DIR@/appimagetool-${AT_ARCH}.AppImage"
+cd "@CMAKE_BINARY_DIR@"
+
+# APPIMAGE_EXTRACT_AND_RUN lets the tools run without a FUSE mount
+# (needed in CI containers and Docker without --privileged + fuse).
+export APPIMAGE_EXTRACT_AND_RUN=1
+
+# ---- linuxdeploy ----
+# linuxdeploy walks the staged AppDir, copies every NEEDED .so dep into
+# AppDir/usr/lib/, patches rpaths, and writes a generic AppRun. Without
+# this the AppImage is just a tarball — it fails on any host missing our
+# runtime deps (libyaml-cpp.so.0.8, libzmq.so.5, libmsgpack-c.so.2,
+# libsodium.so.23). This is what makes the .AppImage actually portable.
+LINUXDEPLOY="linuxdeploy-${AT_ARCH}.AppImage"
+if [ ! -x "$LINUXDEPLOY" ]; then
+    echo "Downloading $LINUXDEPLOY..."
+    wget -q -O "$LINUXDEPLOY" \
+        "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/$LINUXDEPLOY"
+    chmod +x "$LINUXDEPLOY"
+fi
+
+# linuxdeploy validates the icon as a real image — the appimage-stage
+# CMake target currently writes a zero-byte placeholder, which trips
+# "could not be read as image". Replace it with a 1x1 transparent PNG
+# (67 bytes, decoded from base64) at the two places it lives in AppDir.
+echo "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkAAIAAAoAAv/lxKUAAAAASUVORK5CYII=" \
+    | base64 -d > '@APPIMAGE_STAGING_DIR@/clio_run.png'
+cp '@APPIMAGE_STAGING_DIR@/clio_run.png' \
+    '@APPIMAGE_STAGING_DIR@/usr/share/icons/hicolor/256x256/apps/clio_run.png'
+
+# Run linuxdeploy with --output none so it only bundles libs; we hand the
+# final AppImage assembly to appimagetool below so we control the output
+# filename (iowarp-core-<ver>-<arch>.AppImage to match our release naming).
+echo "Bundling runtime libs into AppDir..."
+"./$LINUXDEPLOY" \
+    --appdir '@APPIMAGE_STAGING_DIR@' \
+    --executable '@APPIMAGE_STAGING_DIR@/usr/bin/clio_run' \
+    --desktop-file '@APPIMAGE_STAGING_DIR@/clio_run.desktop' \
+    --icon-file '@APPIMAGE_STAGING_DIR@/clio_run.png' \
+    || { echo "linuxdeploy failed"; exit 1; }
+
+# ---- appimagetool ----
+APPIMAGETOOL="appimagetool-${AT_ARCH}.AppImage"
+if [ ! -x "$APPIMAGETOOL" ]; then
+    if command -v appimagetool > /dev/null; then
+        APPIMAGETOOL=$(command -v appimagetool)
+    else
+        echo "Downloading $APPIMAGETOOL..."
+        wget -q -O "$APPIMAGETOOL" \
+            "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-${AT_ARCH}.AppImage"
+        chmod +x "$APPIMAGETOOL"
+    fi
 fi
 
 export ARCH="$IMG_ARCH"
-# APPIMAGE_EXTRACT_AND_RUN lets the tool run without a FUSE mount
-# (needed in CI containers and Docker without --privileged + fuse).
-export APPIMAGE_EXTRACT_AND_RUN=1
-"$APPIMAGETOOL" '@APPIMAGE_STAGING_DIR@' "@CMAKE_BINARY_DIR@/iowarp-core-@PROJECT_VERSION@-${IMG_ARCH}.AppImage"
+OUT="@CMAKE_BINARY_DIR@/iowarp-core-@PROJECT_VERSION@-${IMG_ARCH}.AppImage"
+echo "Assembling $OUT..."
+"$APPIMAGETOOL" '@APPIMAGE_STAGING_DIR@' "$OUT"
