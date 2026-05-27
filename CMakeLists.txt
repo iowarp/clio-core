@@ -76,7 +76,7 @@ if(CLIO_CORE_ENABLE_CONDA)
     message(STATUS "  CMAKE_PREFIX_PATH:  ${CMAKE_PREFIX_PATH}")
 else()
     set(IN_CONDA_BUILD FALSE)
-    message(STATUS "Conda environment support disabled (use -DWRP_CORE_ENABLE_CONDA=ON to enable)")
+    message(STATUS "Conda environment support disabled (use -DCLIO_CORE_ENABLE_CONDA=ON to enable)")
 endif()
 
 # Print build system summary
