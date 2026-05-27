@@ -375,9 +375,14 @@ print_info "Capturing final coverage data with lcov..."
 # --ignore-errors list so that stale .gcda files, missing sources, or
 # version mismatches do not abort the capture.
 if [ "${LCOV_MAJOR}" -ge 2 ] 2>/dev/null; then
-    LCOV_IGNORE_OPTS=(--ignore-errors source,graph,mismatch,empty,unused,negative,count,inconsistent)
+    # 'gcov' covers the case where a single .gcda is corrupted (partial
+    # flush after a crashed/timeout'd test invocation, or a race between
+    # two writers on the same .gcda). Without it, lcov fails the entire
+    # capture run on one bad file. We'd rather drop that file from the
+    # report than fail the whole Build and Test job.
+    LCOV_IGNORE_OPTS=(--ignore-errors source,graph,mismatch,empty,unused,negative,count,inconsistent,gcov)
 else
-    LCOV_IGNORE_OPTS=(--ignore-errors source,graph)
+    LCOV_IGNORE_OPTS=(--ignore-errors source,graph,gcov)
 fi
 
 lcov --capture \
