@@ -39,8 +39,18 @@ runtime:
 
 # -- Compose ------------------------------------------------------------------
 # Modules started automatically with the runtime.
-# Only clio_bdev is required. CTE (clio_cte_core) and CAE (clio_cae_core)
-# are optional — remove their entries if you do not need them.
+#
+# Default layout puts CAE (clio_cae_core) at pool 512.0 — the address
+# every CTE client targets via clio::cte::core::kCtePoolId — and the
+# CTE core (clio_cte_core) behind it at pool 513.0. CAE forwards
+# GetOrCreateTag / PutBlob / GetBlob through to CTE so the data path
+# is unchanged, but every PutBlob now passes through CAE first. That
+# gives us a single interception point for transparent labeling /
+# indexing / discovery work without any client-side changes.
+#
+# Only clio_bdev is strictly required. Drop either the CAE or CTE
+# entry if you don't need it (if you drop CAE, change CTE's pool_id
+# back to 512.0 so existing clients continue to resolve).
 compose:
 
   # === Block Device (DRAM) ===
@@ -61,13 +71,41 @@ compose:
   #   bdev_type: file                    # Options: file, ram, hbm, pinned, noop
   #   capacity: "100GB"
 
-  # === Context Transfer Engine (CTE) — optional ===
-  # High-performance data buffering and transfer engine.
-  # Remove this section if CTE is not needed.
+  # === Context Assimilation Engine (CAE) — CTE interceptor ===
+  # Sits at the canonical CTE entrypoint (512.0) and forwards data-path
+  # tasks to the CTE core at 513.0. Forwarding is transparent —
+  # standard CTE clients (CLIO_CTE_CLIENT, FUSE adapter, etc.) work
+  # without modification.
+  - mod_name: clio_cae_core
+    pool_name: cae_main
+    pool_query: local
+    pool_id: "512.0"
+    next_pool_id: "513.0"               # CTE core pool — see entry below
+
+    # Transparent LLM labeling — optional. When enabled, PutBlob calls
+    # `model` on `label_endpoint` for every blob whose tag+name matches
+    # a rule, and stores the response as `{blob_name}_label` in the
+    # same tag. Leave commented out for a pure-passthrough CAE.
+    #
+    # label_endpoint: "http://127.0.0.1:11434"   # Ollama-compatible server
+    # label_prompts:
+    #   summarize: "Summarize the following text in one short sentence."
+    # label_matches:
+    #   - tag_re: ".*\\.txt$"                    # only label .txt blobs
+    #     blob_re: ".*"
+    #     model: "gemma3:1b"
+    #     prompt: "summarize"
+    #     context_length: 4096                  # tokens (Ollama num_ctx)
+
+  # === Context Transfer Engine (CTE) ===
+  # High-performance data buffering and transfer engine. Sits behind
+  # CAE at 513.0 so CAE can intercept the data path. Remove this and
+  # the CAE entry above (or change CAE's pool_id to 513.0 and skip
+  # this) if you do not need CTE.
   - mod_name: clio_cte_core
     pool_name: cte_main
     pool_query: local
-    pool_id: "512.0"
+    pool_id: "513.0"
 
     # Storage tiers ---------------------------------------------------------
     # Each entry creates a block device for CTE to buffer data onto.
@@ -100,11 +138,3 @@ compose:
     #   flush_data_period_ms: 10000      # Data flush interval (ms)
     #   flush_data_min_persistence: 1    # Min persistence level (1=temp-nonvolatile)
     #   transaction_log_capacity: "32MB" # Write-ahead log capacity
-
-  # === Context Assimilation Engine (CAE) — optional ===
-  # Data ingestion and assimilation engine.
-  # Remove this section if CAE is not needed.
-  - mod_name: clio_cae_core
-    pool_name: clio_cae_core_pool
-    pool_query: local
-    pool_id: "400.0"

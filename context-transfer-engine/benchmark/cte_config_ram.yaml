@@ -1,5 +1,19 @@
-# Content Transfer Engine (CTE) Configuration File
-# RAM-only storage configuration for benchmark testing
+# Content Transfer Engine (CTE) Benchmark Configuration
+# RAM-only storage configuration for benchmark testing.
+#
+# Default layout puts CAE (clio_cae_core) at the CTE entrypoint pool
+# (512.0) and CTE core behind it at 513.0. Every clio_cte_bench
+# PutBlob/GetBlob therefore flows through CAE's interceptor handler
+# before landing in CTE — that's the standard data path in this repo
+# now, so the bench measures it directly.
+
+# Shared memory budget. Bumped above the 1 GB default so the benchmark
+# can stage multiple in-flight 1 GB blob buffers without spilling.
+memory:
+  main_segment_size: "16GB"
+  client_data_segment_size: "4GB"
+  runtime_data_segment_size: "4GB"
+
 runtime:
   num_threads: 4             # Worker threads for task execution
   queue_depth: 1024          # Task queue depth per worker
@@ -9,11 +23,33 @@ runtime:
   max_sleep: 50000           # Maximum sleep duration (50ms)
 
 compose:
-  # Compose parameters
+  # CAE interceptor at the CTE entrypoint (512.0) — forwards data-path
+  # tasks to CTE core at 513.0.
+  - mod_name: clio_cae_core
+    pool_name: cae_main
+    pool_query: local
+    pool_id: "512.0"
+    next_pool_id: "513.0"
+
+    # Transparent LLM labeling — disabled here (the benchmark is a
+    # data-path microbench). To exercise labeling, uncomment and point
+    # `label_endpoint` at a running Ollama instance.
+    #
+    # label_endpoint: "http://127.0.0.1:11434"
+    # label_prompts:
+    #   summarize: "Summarize the following text in one short sentence."
+    # label_matches:
+    #   - tag_re: ".*\\.txt$"
+    #     blob_re: ".*"
+    #     model: "gemma3:1b"
+    #     prompt: "summarize"
+    #     context_length: 4096
+
+  # CTE core sits behind CAE at 513.0.
   - mod_name: clio_cte_core
     pool_name: clio_cte
     pool_query: local
-    pool_id: 512.0
+    pool_id: "513.0"
 
     # Target management settings
     targets:
