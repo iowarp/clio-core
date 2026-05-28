@@ -46,6 +46,12 @@ add_dependencies(test_ring_buffer_mpsc_exec clio_ctp_host)
 target_link_libraries(test_ring_buffer_mpsc_exec
         clio_ctp_host)
 
+add_executable(test_ring_buffer_mpmc_exec
+        test_ring_buffer_mpmc.cc)
+add_dependencies(test_ring_buffer_mpmc_exec clio_ctp_host)
+target_link_libraries(test_ring_buffer_mpmc_exec
+        clio_ctp_host)
+
 add_executable(test_multi_ring_buffer_exec
         test_multi_ring_buffer.cc)
 add_dependencies(test_multi_ring_buffer_exec clio_ctp_host)
@@ -85,6 +91,8 @@ add_test(NAME ctp_ring_buffer_ext COMMAND
         ${CMAKE_BINARY_DIR}/bin/test_ring_buffer_ext_exec)
 add_test(NAME ctp_ring_buffer_mpsc COMMAND
         ${CMAKE_BINARY_DIR}/bin/test_ring_buffer_mpsc_exec)
+add_test(NAME ctp_ring_buffer_mpmc COMMAND
+        ${CMAKE_BINARY_DIR}/bin/test_ring_buffer_mpmc_exec)
 
 add_test(NAME ctp_multi_ring_buffer COMMAND
         ${CMAKE_BINARY_DIR}/bin/test_multi_ring_buffer_exec)
@@ -93,6 +101,12 @@ add_test(NAME ctp_multi_ring_buffer COMMAND
 set_tests_properties(
   ctp_ring_buffer_mpsc
   PROPERTIES TIMEOUT 15
+)
+
+# MPMC pop-stress test is heavier (more threads / more items) than MPSC.
+set_tests_properties(
+  ctp_ring_buffer_mpmc
+  PROPERTIES TIMEOUT 30
 )
 
 # Skip under MSan: slist/rb_tree tests use precompiled Catch2 which
@@ -117,6 +131,7 @@ set_tests_properties(
   ctp_ring_buffer_spsc
   ctp_ring_buffer_ext
   ctp_ring_buffer_mpsc
+  ctp_ring_buffer_mpmc
   ctp_multi_ring_buffer
   PROPERTIES LABELS "msan_skip"
 )
@@ -132,6 +147,7 @@ install(TARGETS
         test_ring_buffer_spsc_exec
         test_ring_buffer_ext_exec
         test_ring_buffer_mpsc_exec
+        test_ring_buffer_mpmc_exec
         test_multi_ring_buffer_exec
         LIBRARY DESTINATION lib
         ARCHIVE DESTINATION lib

@@ -44,6 +44,7 @@ using pid_t = int;
 #include "clio_ctp/data_structures/ipc/shm_container.h"
 #include "clio_ctp/data_structures/ipc/vector.h"
 #include "clio_ctp/memory/allocator/allocator.h"
+#include "clio_ctp/thread/lock/mutex.h"
 #include "clio_ctp/types/atomic.h"
 #include "clio_ctp/types/bitfield.h"
 
@@ -65,7 +66,9 @@ enum RingQueueFlag : uint32_t {
   /** Dynamic size (resize buffer when full) */
   RING_BUFFER_DYNAMIC_SIZE = 0x10,
   /** Fixed-size buffer (no dynamic resizing) */
-  RING_BUFFER_FIXED_SIZE = 0x20
+  RING_BUFFER_FIXED_SIZE = 0x20,
+  /** Serialize Pop() with a ctp::Mutex (enables multi-consumer / MPMC) */
+  RING_BUFFER_LOCK_POP = 0x40
 };
 
 /**
@@ -204,6 +207,7 @@ class ring_buffer : public ShmContainer<AllocT> {
   static constexpr bool ErrorOnNoSpace =
       (FLAGS & RING_BUFFER_ERROR_ON_NO_SPACE) != 0;
   static constexpr bool DynamicSize = (FLAGS & RING_BUFFER_DYNAMIC_SIZE) != 0;
+  static constexpr bool LockPop = (FLAGS & RING_BUFFER_LOCK_POP) != 0;
   static constexpr bool IsAtomic = IsMPSC;
 
   using entry_vector = vector<entry_type, AllocT>;
@@ -221,6 +225,8 @@ class ring_buffer : public ShmContainer<AllocT> {
   ctp::ipc::opt_atomic<bool, IsAtomic>
       active_; /**< Whether worker is accepting tasks (true) or blocked in
                   epoll_wait (false) */
+  ctp::ipc::Mutex pop_lock_; /**< Used by Pop() when RING_BUFFER_LOCK_POP is
+                                  set; otherwise unused. */
 
  public:
   /**
@@ -545,6 +551,27 @@ class ring_buffer : public ShmContainer<AllocT> {
    */
   CTP_CROSS_FUN
   bool Pop(T& val) {
+    // When RING_BUFFER_LOCK_POP is set, serialize all of Pop() with a
+    // ctp::Mutex. This turns an MPSC ring buffer into a correct MPMC one:
+    // the CAS in the lock-free path already prevents duplicate delivery,
+    // but multiple consumers contending on the same head slot waste cycles
+    // and produce unfair scheduling. The lock removes that contention and
+    // gives callers a single, simple Pop() entry point.
+    if constexpr (LockPop) {
+      ctp::ipc::ScopedMutex guard(pop_lock_, 0);
+      return PopUnlocked(val);
+    } else {
+      return PopUnlocked(val);
+    }
+  }
+
+ private:
+  /**
+   * Lock-free body of Pop(). When RING_BUFFER_LOCK_POP is not set this is
+   * the only path; when it is set, Pop() wraps this in a ScopedMutex.
+   */
+  CTP_CROSS_FUN
+  bool PopUnlocked(T& val) {
     // Use system-scope loads to bypass GPU L2 cache so that GPU consumers
     // observe CPU-written tail/entry updates in pinned host memory.
     u64 head = head_.load_system();
@@ -575,6 +602,8 @@ class ring_buffer : public ShmContainer<AllocT> {
     head_.store_system(head + 1);
     return true;
   }
+
+ public:
 
   /**
    * Pop with device-scope atomics for GPU→GPU communication.
@@ -736,6 +765,20 @@ using mpsc_ring_buffer =
 template <typename T, typename AllocT = ctp::ipc::Allocator>
 using circular_mpsc_ring_buffer =
     ring_buffer<T, AllocT, (RING_BUFFER_MPSC_FLAGS | RING_BUFFER_FIXED_SIZE)>;
+
+/**
+ * Typedef for fixed-size MPMC (Multiple Producer Multiple Consumer) ring
+ * buffer.
+ *
+ * Identical to mpsc_ring_buffer except Pop() is serialized with a
+ * ctp::Mutex via RING_BUFFER_LOCK_POP, so multiple concurrent consumers
+ * can call Pop() safely without busy-CAS contention on the head slot.
+ */
+template <typename T, typename AllocT = ctp::ipc::Allocator>
+using mpmc_ring_buffer =
+    ring_buffer<T, AllocT,
+                (RING_BUFFER_MPSC_FLAGS | RING_BUFFER_FIXED_SIZE |
+                 RING_BUFFER_WAIT_FOR_SPACE | RING_BUFFER_LOCK_POP)>;
 
 }  // namespace ctp::ipc
 
