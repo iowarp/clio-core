@@ -38,6 +38,7 @@ bool OllamaGenerate(const std::string &endpoint_base,
                     const std::string &model,
                     const std::string &prompt,
                     int context_length,
+                    int num_predict,
                     std::string &out_response) {
   out_response.clear();
   EnsureCurlInit();
@@ -58,11 +59,16 @@ bool OllamaGenerate(const std::string &endpoint_base,
       {"prompt", prompt},
       {"stream", false},
   };
-  // num_ctx in options widens Ollama's prompt+response budget. Ollama's
-  // default (~2048) silently truncates anything larger, which manifests
-  // as a label that only describes the *tail* of the blob.
-  if (context_length > 0) {
-    body["options"] = {{"num_ctx", context_length}};
+  // num_ctx widens Ollama's prompt+response budget. Its default (~2048)
+  // silently truncates anything larger, which manifests as a label that
+  // only describes the *tail* of the blob. num_predict hard-caps the
+  // *output* length, useful for benchmarks where summary length is the
+  // controlled variable.
+  if (context_length > 0 || num_predict > 0) {
+    nlohmann::json opts = nlohmann::json::object();
+    if (context_length > 0) opts["num_ctx"] = context_length;
+    if (num_predict > 0) opts["num_predict"] = num_predict;
+    body["options"] = std::move(opts);
   }
   std::string body_str = body.dump();
 

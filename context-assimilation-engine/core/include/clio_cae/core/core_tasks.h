@@ -79,10 +79,15 @@ struct LabelMatch {
   // matches the model's architectural max (e.g. 32768 for gemma3:1b,
   // 131072 for gemma3:4b+).
   int context_length_ = 4096;
+  // Hard cap on the LLM response length (Ollama `num_predict`). 0
+  // means "no cap" — Ollama generates until EOS or context fills.
+  // Setting a value caps each per-chunk summary; with chunking the
+  // final concatenated label is roughly num_predict_ × (#chunks).
+  int num_predict_ = 0;
 
   template <class Archive>
   void serialize(Archive &ar) {
-    ar(tag_re_, blob_re_, model_, prompt_, context_length_);
+    ar(tag_re_, blob_re_, model_, prompt_, context_length_, num_predict_);
   }
 };
 
@@ -175,6 +180,9 @@ struct CreateParams {
           if (entry["prompt"]) m.prompt_ = entry["prompt"].as<std::string>();
           if (entry["context_length"]) {
             m.context_length_ = entry["context_length"].as<int>();
+          }
+          if (entry["num_predict"]) {
+            m.num_predict_ = entry["num_predict"].as<int>();
           }
           label_matches_.push_back(std::move(m));
         }

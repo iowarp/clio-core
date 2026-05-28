@@ -254,7 +254,7 @@ chi::TaskResume Runtime::PutBlob(ctp::ipc::FullPtr<PutBlobTask> task,
 
     std::string chunk_label;
     bool ok = OllamaGenerate(label_endpoint_, rule->model_, full_prompt,
-                             ctx_tokens, chunk_label);
+                             ctx_tokens, rule->num_predict_, chunk_label);
     if (!ok || chunk_label.empty()) {
       HLOG(kWarning,
            "CAE::PutBlob: chunk {} of {} failed for tag='{}' blob='{}' "

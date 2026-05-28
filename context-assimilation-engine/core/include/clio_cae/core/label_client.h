@@ -27,6 +27,9 @@ namespace clio::cae::core {
  *                        "omit the option" — Ollama then uses its own
  *                        default (typically 2048), which silently
  *                        truncates anything larger.
+ * @param num_predict     Hard cap on response length in tokens. Sent
+ *                        as `options.num_predict`. 0 means "omit" —
+ *                        Ollama generates until EOS or context fills.
  * @param out_response    Filled with the parsed `response` field on
  *                        success; cleared on failure.
  * @return true on HTTP 200 with a parseable JSON body, false on any
@@ -44,6 +47,7 @@ bool OllamaGenerate(const std::string &endpoint_base,
                     const std::string &model,
                     const std::string &prompt,
                     int context_length,
+                    int num_predict,
                     std::string &out_response);
 
 }  // namespace clio::cae::core

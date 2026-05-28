@@ -69,9 +69,10 @@ add_subdirectory(core)
 # -----------------------------------------------------------------------------
 # Build Benchmarks
 # -----------------------------------------------------------------------------
-# Add benchmarks if enabled (currently CAE has no benchmark directory)
-# Benchmarks are controlled by CLIO_CORE_ENABLE_BENCHMARKS
-# if(CLIO_CORE_ENABLE_BENCHMARKS)
-#   add_subdirectory(benchmark)
-#   message(STATUS "CAE benchmarks enabled - added benchmark subdirectory")
-# endif()
+# Benchmarks are controlled by CLIO_CORE_ENABLE_BENCHMARKS (set in root
+# CMakeLists.txt, default ON). Currently provides clio_cae_label_bench
+# which stresses the transparent-labeling PutBlob path.
+if(CLIO_CORE_ENABLE_BENCHMARKS)
+  add_subdirectory(benchmark)
+  message(STATUS "CAE benchmarks enabled - added benchmark subdirectory")
+endif()
