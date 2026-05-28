@@ -38,9 +38,11 @@
 #include <clio_runtime/clio_runtime.h>
 #include <clio_cae/core/autogen/core_methods.h>
 #include <clio_cae/core/factory/assimilation_ctx.h>
+#include <clio_cte/core/core_tasks.h>
 
 #include "clio_ctp/data_structures/serialization/global_serialize.h"
 #include <vector>
+#include <yaml-cpp/yaml.h>
 
 namespace clio::cae::core {
 
@@ -54,16 +56,51 @@ struct CreateParams {
   // Required: chimod library name for module manager
   static constexpr const char *chimod_lib_name = "clio_cae_core";
 
+  // Optional: pool ID of the next module in the pipeline (e.g., CTE core at
+  // 513.0) when CAE is configured as a transparent interceptor in front of
+  // CTE. When null, the CAE forwarding handlers fall back to the global CTE
+  // pool ID (kCtePoolId). Mirrors compressor's CompressorConfig::next_pool_id_.
+  chi::PoolId next_pool_id_;
+
   // Default constructor
-  CreateParams() {}
+  CreateParams() : next_pool_id_(chi::PoolId::GetNull()) {}
 
   // Copy constructor (for BaseCreateTask)
-  CreateParams(const CreateParams &other) {}
+  CreateParams(const CreateParams &other)
+      : next_pool_id_(other.next_pool_id_) {}
+
+  // Compose pool-id ctor (matches compressor pattern)
+  CreateParams(const chi::PoolId &pool_id, const CreateParams &other)
+      : next_pool_id_(other.next_pool_id_) {
+    (void)pool_id;
+  }
 
   // Serialization support
   template <class Archive>
   void serialize(Archive &ar) {
-    // No members to serialize
+    ar(next_pool_id_);
+  }
+
+  /**
+   * Load configuration from compose YAML. Parses `next_pool_id` ("major.minor")
+   * out of the pool's compose config.
+   */
+  void LoadConfig(const chi::PoolConfig &pool_config) {
+    if (pool_config.config_.empty()) return;
+    try {
+      YAML::Node node = YAML::Load(pool_config.config_);
+      if (node["next_pool_id"]) {
+        std::string next_str = node["next_pool_id"].as<std::string>();
+        auto dot = next_str.find('.');
+        if (dot != std::string::npos) {
+          chi::u32 major = std::stoul(next_str.substr(0, dot));
+          chi::u32 minor = std::stoul(next_str.substr(dot + 1));
+          next_pool_id_ = chi::PoolId(major, minor);
+        }
+      }
+    } catch (...) {
+      // best-effort
+    }
   }
 };
 
@@ -314,6 +351,30 @@ struct ExportDataTask : public chi::Task {
     Copy(other_base.template Cast<ExportDataTask>());
   }
 };
+
+// ---------------------------------------------------------------------------
+// CTE interceptor task typedefs. CAE forwards these tasks transparently to
+// the configured `next_pool_id` CTE core. The struct layout AND the
+// dispatching method id are inherited from clio::cte::core — see
+// autogen/core_methods.h for the matching kPutBlob / kGetBlob /
+// kGetOrCreateTag constants. The static_asserts below guard the
+// invariant that lets a CTE-built task dispatch to a CAE handler.
+// ---------------------------------------------------------------------------
+using PutBlobTask = clio::cte::core::PutBlobTask;
+using GetBlobTask = clio::cte::core::GetBlobTask;
+using GetOrCreateTagTask =
+    clio::cte::core::GetOrCreateTagTask<clio::cte::core::CreateParams>;
+
+static_assert(Method::kPutBlob == clio::cte::core::Method::kPutBlob,
+              "CAE kPutBlob must match clio::cte::core::Method::kPutBlob "
+              "for transparent CTE→CAE task dispatch");
+static_assert(Method::kGetBlob == clio::cte::core::Method::kGetBlob,
+              "CAE kGetBlob must match clio::cte::core::Method::kGetBlob "
+              "for transparent CTE→CAE task dispatch");
+static_assert(
+    Method::kGetOrCreateTag == clio::cte::core::Method::kGetOrCreateTag,
+    "CAE kGetOrCreateTag must match clio::cte::core::Method::kGetOrCreateTag "
+    "for transparent CTE→CAE task dispatch");
 
 }  // namespace clio::cae::core
 

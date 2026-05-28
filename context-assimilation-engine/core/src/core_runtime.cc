@@ -72,13 +72,105 @@ chi::TaskResume Runtime::Create(ctp::ipc::FullPtr<CreateTask> task, chi::RunCont
   // Container is already initialized via Init() before Create is called
   // Do NOT call Init() here
 
-  // Initialize CTE client using the CTE pool ID
-  cte_client_ =
-      std::make_shared<clio::cte::core::Client>(clio::cte::core::kCtePoolId);
+  // Load create-time configuration. In compose mode this materializes the
+  // PoolConfig stored on the task into a CreateParams via LoadConfig.
+  CreateParams params = task->GetParams();
+  next_pool_id_ = params.next_pool_id_;
 
-  // Additional container-specific initialization logic here
-  HLOG(kInfo, "Core container created and initialized for pool: {} (ID: {})",
-       pool_name_, pool_id_);
+  // Initialize CTE client. When CAE is wired as a transparent interceptor
+  // (compose YAML sets next_pool_id), forward to that pool instead of the
+  // hard-coded kCtePoolId; otherwise fall back to the legacy default so
+  // existing CAE deployments keep working.
+  chi::PoolId cte_pool = !next_pool_id_.IsNull()
+                            ? next_pool_id_
+                            : clio::cte::core::kCtePoolId;
+  cte_client_ = std::make_shared<clio::cte::core::Client>(cte_pool);
+
+  HLOG(kInfo,
+       "Core container created and initialized for pool: {} (ID: {}), "
+       "CTE next_pool_id={}",
+       pool_name_, pool_id_, cte_pool);
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+chi::PoolId Runtime::ResolveNextPoolId() const {
+  if (!next_pool_id_.IsNull()) return next_pool_id_;
+  return clio::cte::core::kCtePoolId;
+}
+
+chi::PoolQuery Runtime::ScheduleTask(
+    const ctp::ipc::FullPtr<chi::Task> &task) {
+  // Interceptor methods always run locally — they immediately forward
+  // synchronously to the configured CTE core pool, so there is no value
+  // in bouncing the task across nodes. Mirrors compressor_runtime.cc
+  // which routes non-Compress Dynamic methods to Local.
+  switch (task->method_) {
+    case Method::kPutBlob:
+    case Method::kGetBlob:
+    case Method::kGetOrCreateTag:
+      return chi::PoolQuery::Local();
+    default:
+      return chi::PoolQuery::Local();
+  }
+}
+
+chi::TaskResume Runtime::PutBlob(ctp::ipc::FullPtr<PutBlobTask> task,
+                                 chi::RunContext &ctx) {
+#ifndef __NVCOMPILER
+  (void)ctx;
+#endif
+  CLIO_TASK_BODY_BEGIN
+  if (!cte_client_) {
+    cte_client_ = std::make_shared<clio::cte::core::Client>(ResolveNextPoolId());
+  }
+  auto fwd = cte_client_->AsyncPutBlob(
+      task->tag_id_, task->blob_name_.str(), task->offset_, task->size_,
+      task->blob_data_, task->score_, task->context_, task->flags_,
+      chi::PoolQuery::Local());
+  // CO_AWAIT yields the worker while the downstream CTE task runs — Wait()
+  // would block this worker and deadlock when only a single worker is
+  // available (or when this and the downstream task happen to land on the
+  // same worker).
+  CLIO_CO_AWAIT(fwd);
+  task->context_ = fwd->context_;
+  task->SetReturnCode(fwd->GetReturnCode());
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+chi::TaskResume Runtime::GetBlob(ctp::ipc::FullPtr<GetBlobTask> task,
+                                 chi::RunContext &ctx) {
+#ifndef __NVCOMPILER
+  (void)ctx;
+#endif
+  CLIO_TASK_BODY_BEGIN
+  if (!cte_client_) {
+    cte_client_ = std::make_shared<clio::cte::core::Client>(ResolveNextPoolId());
+  }
+  auto fwd = cte_client_->AsyncGetBlob(
+      task->tag_id_, task->blob_name_.str(), task->offset_, task->size_,
+      task->flags_, task->blob_data_, chi::PoolQuery::Local());
+  CLIO_CO_AWAIT(fwd);
+  task->SetReturnCode(fwd->GetReturnCode());
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+chi::TaskResume Runtime::GetOrCreateTag(
+    ctp::ipc::FullPtr<GetOrCreateTagTask> task, chi::RunContext &ctx) {
+#ifndef __NVCOMPILER
+  (void)ctx;
+#endif
+  CLIO_TASK_BODY_BEGIN
+  if (!cte_client_) {
+    cte_client_ = std::make_shared<clio::cte::core::Client>(ResolveNextPoolId());
+  }
+  auto fwd = cte_client_->AsyncGetOrCreateTag(
+      task->tag_name_.str(), task->tag_id_, chi::PoolQuery::Local());
+  CLIO_CO_AWAIT(fwd);
+  task->tag_id_ = fwd->tag_id_;
+  task->SetReturnCode(fwd->GetReturnCode());
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }

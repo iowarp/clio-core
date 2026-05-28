@@ -70,6 +70,21 @@ chi::TaskResume Runtime::Run(chi::u32 method, ctp::ipc::FullPtr<chi::Task> task_
       CLIO_CO_AWAIT(ExportData(typed_task, rctx));
       break;
     }
+    case Method::kPutBlob: {
+      ctp::ipc::FullPtr<PutBlobTask> typed_task = task_ptr.template Cast<PutBlobTask>();
+      CLIO_CO_AWAIT(PutBlob(typed_task, rctx));
+      break;
+    }
+    case Method::kGetBlob: {
+      ctp::ipc::FullPtr<GetBlobTask> typed_task = task_ptr.template Cast<GetBlobTask>();
+      CLIO_CO_AWAIT(GetBlob(typed_task, rctx));
+      break;
+    }
+    case Method::kGetOrCreateTag: {
+      ctp::ipc::FullPtr<GetOrCreateTagTask> typed_task = task_ptr.template Cast<GetOrCreateTagTask>();
+      CLIO_CO_AWAIT(GetOrCreateTag(typed_task, rctx));
+      break;
+    }
     default: {
       // Unknown method - do nothing
       break;
@@ -112,6 +127,21 @@ void Runtime::SaveTask(chi::u32 method, chi::SaveTaskArchive& archive,
       archive << *typed_task.ptr_;
       break;
     }
+    case Method::kPutBlob: {
+      auto typed_task = task_ptr.template Cast<PutBlobTask>();
+      archive << *typed_task.ptr_;
+      break;
+    }
+    case Method::kGetBlob: {
+      auto typed_task = task_ptr.template Cast<GetBlobTask>();
+      archive << *typed_task.ptr_;
+      break;
+    }
+    case Method::kGetOrCreateTag: {
+      auto typed_task = task_ptr.template Cast<GetOrCreateTagTask>();
+      archive << *typed_task.ptr_;
+      break;
+    }
     default: {
       // Unknown method - do nothing
       break;
@@ -149,6 +179,21 @@ void Runtime::LoadTask(chi::u32 method, chi::LoadTaskArchive& archive,
     }
     case Method::kExportData: {
       auto typed_task = task_ptr.template Cast<ExportDataTask>();
+      archive >> *typed_task.ptr_;
+      break;
+    }
+    case Method::kPutBlob: {
+      auto typed_task = task_ptr.template Cast<PutBlobTask>();
+      archive >> *typed_task.ptr_;
+      break;
+    }
+    case Method::kGetBlob: {
+      auto typed_task = task_ptr.template Cast<GetBlobTask>();
+      archive >> *typed_task.ptr_;
+      break;
+    }
+    case Method::kGetOrCreateTag: {
+      auto typed_task = task_ptr.template Cast<GetOrCreateTagTask>();
       archive >> *typed_task.ptr_;
       break;
     }
@@ -206,6 +251,21 @@ void Runtime::LocalLoadTask(chi::u32 method, chi::DefaultLoadArchive& archive,
       archive >> *typed_task.ptr_;
       break;
     }
+    case Method::kPutBlob: {
+      auto typed_task = task_ptr.template Cast<PutBlobTask>();
+      archive >> *typed_task.ptr_;
+      break;
+    }
+    case Method::kGetBlob: {
+      auto typed_task = task_ptr.template Cast<GetBlobTask>();
+      archive >> *typed_task.ptr_;
+      break;
+    }
+    case Method::kGetOrCreateTag: {
+      auto typed_task = task_ptr.template Cast<GetOrCreateTagTask>();
+      archive >> *typed_task.ptr_;
+      break;
+    }
     default: {
       // Unknown method - do nothing
       break;
@@ -257,6 +317,21 @@ void Runtime::LocalSaveTask(chi::u32 method, chi::DefaultSaveArchive& archive,
     case Method::kExportData: {
       auto typed_task = task_ptr.template Cast<ExportDataTask>();
       // Use archive operator which respects msg_type
+      archive << *typed_task.ptr_;
+      break;
+    }
+    case Method::kPutBlob: {
+      auto typed_task = task_ptr.template Cast<PutBlobTask>();
+      archive << *typed_task.ptr_;
+      break;
+    }
+    case Method::kGetBlob: {
+      auto typed_task = task_ptr.template Cast<GetBlobTask>();
+      archive << *typed_task.ptr_;
+      break;
+    }
+    case Method::kGetOrCreateTag: {
+      auto typed_task = task_ptr.template Cast<GetOrCreateTagTask>();
       archive << *typed_task.ptr_;
       break;
     }
@@ -340,6 +415,33 @@ ctp::ipc::FullPtr<chi::Task> Runtime::NewCopyTask(chi::u32 method, ctp::ipc::Ful
       }
       break;
     }
+    case Method::kPutBlob: {
+      auto new_task_ptr = ipc_manager->NewTask<PutBlobTask>();
+      if (!new_task_ptr.IsNull()) {
+        auto task_typed = orig_task_ptr.template Cast<PutBlobTask>();
+        new_task_ptr->Copy(task_typed);
+        return new_task_ptr.template Cast<chi::Task>();
+      }
+      break;
+    }
+    case Method::kGetBlob: {
+      auto new_task_ptr = ipc_manager->NewTask<GetBlobTask>();
+      if (!new_task_ptr.IsNull()) {
+        auto task_typed = orig_task_ptr.template Cast<GetBlobTask>();
+        new_task_ptr->Copy(task_typed);
+        return new_task_ptr.template Cast<chi::Task>();
+      }
+      break;
+    }
+    case Method::kGetOrCreateTag: {
+      auto new_task_ptr = ipc_manager->NewTask<GetOrCreateTagTask>();
+      if (!new_task_ptr.IsNull()) {
+        auto task_typed = orig_task_ptr.template Cast<GetOrCreateTagTask>();
+        new_task_ptr->Copy(task_typed);
+        return new_task_ptr.template Cast<chi::Task>();
+      }
+      break;
+    }
     default: {
       // For unknown methods, create base Task copy
       auto new_task_ptr = ipc_manager->NewTask<chi::Task>();
@@ -386,6 +488,18 @@ ctp::ipc::FullPtr<chi::Task> Runtime::NewTask(chi::u32 method) {
       auto new_task_ptr = ipc_manager->NewTask<ExportDataTask>();
       return new_task_ptr.template Cast<chi::Task>();
     }
+    case Method::kPutBlob: {
+      auto new_task_ptr = ipc_manager->NewTask<PutBlobTask>();
+      return new_task_ptr.template Cast<chi::Task>();
+    }
+    case Method::kGetBlob: {
+      auto new_task_ptr = ipc_manager->NewTask<GetBlobTask>();
+      return new_task_ptr.template Cast<chi::Task>();
+    }
+    case Method::kGetOrCreateTag: {
+      auto new_task_ptr = ipc_manager->NewTask<GetOrCreateTagTask>();
+      return new_task_ptr.template Cast<chi::Task>();
+    }
     default: {
       // For unknown methods, return null pointer
       return ctp::ipc::FullPtr<chi::Task>();
@@ -426,6 +540,21 @@ void Runtime::Aggregate(chi::u32 method, ctp::ipc::FullPtr<chi::Task> orig_task,
       typed_task->Aggregate(replica_task);
       break;
     }
+    case Method::kPutBlob: {
+      auto typed_task = orig_task.template Cast<PutBlobTask>();
+      typed_task->Aggregate(replica_task);
+      break;
+    }
+    case Method::kGetBlob: {
+      auto typed_task = orig_task.template Cast<GetBlobTask>();
+      typed_task->Aggregate(replica_task);
+      break;
+    }
+    case Method::kGetOrCreateTag: {
+      auto typed_task = orig_task.template Cast<GetOrCreateTagTask>();
+      typed_task->Aggregate(replica_task);
+      break;
+    }
     default: {
       orig_task->Aggregate(replica_task);
       break;
@@ -459,6 +588,18 @@ void Runtime::DelTask(chi::u32 method, ctp::ipc::FullPtr<chi::Task> task_ptr) {
     }
     case Method::kExportData: {
       ipc_manager->DelTask(task_ptr.template Cast<ExportDataTask>());
+      break;
+    }
+    case Method::kPutBlob: {
+      ipc_manager->DelTask(task_ptr.template Cast<PutBlobTask>());
+      break;
+    }
+    case Method::kGetBlob: {
+      ipc_manager->DelTask(task_ptr.template Cast<GetBlobTask>());
+      break;
+    }
+    case Method::kGetOrCreateTag: {
+      ipc_manager->DelTask(task_ptr.template Cast<GetOrCreateTagTask>());
       break;
     }
     default: {

@@ -22,7 +22,15 @@ GLOBAL_CROSS_CONST chi::u32 kParseOmni = 10;
 GLOBAL_CROSS_CONST chi::u32 kProcessHdf5Dataset = 11;
 GLOBAL_CROSS_CONST chi::u32 kExportData = 12;
 
-GLOBAL_CROSS_CONST chi::u32 kMaxMethodId = 13;
+// CTE interceptor methods. IDs MUST match clio::cte::core::Method::k*
+// so that a CTE-built task (whose constructor stamps the CTE method id)
+// dispatches to the matching CAE handler when routed to a CAE pool.
+// Keep these in sync with context-transfer-engine/core/clio_mod.yaml.
+GLOBAL_CROSS_CONST chi::u32 kGetOrCreateTag = 14;
+GLOBAL_CROSS_CONST chi::u32 kPutBlob = 15;
+GLOBAL_CROSS_CONST chi::u32 kGetBlob = 16;
+
+GLOBAL_CROSS_CONST chi::u32 kMaxMethodId = 17;
 
 inline const std::vector<std::string>& GetMethodNames() {
   static const std::vector<std::string> names = [] {
@@ -33,6 +41,9 @@ inline const std::vector<std::string>& GetMethodNames() {
     v[10] = "ParseOmni";
     v[11] = "ProcessHdf5Dataset";
     v[12] = "ExportData";
+    v[14] = "GetOrCreateTag";
+    v[15] = "PutBlob";
+    v[16] = "GetBlob";
     return v;
   }();
   return names;

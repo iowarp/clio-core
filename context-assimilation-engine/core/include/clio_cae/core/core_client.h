@@ -157,6 +157,77 @@ class Client : public chi::ContainerClient {
     return ipc_manager->Send(task);
   }
 
+  // --------------------------------------------------------------------
+  // CTE interceptor passthroughs.
+  //
+  // These mirror clio::cte::core::Client::AsyncPutBlob / AsyncGetBlob /
+  // AsyncGetOrCreateTag and target the CAE pool. The CAE runtime forwards
+  // each task to its configured next_pool_id (the real CTE core), enabling
+  // a CTE client pointed at the CAE pool to transparently flow data
+  // through CAE first. Analogous to clio::cte::compressor::Client.
+  //
+  // The typedef'd task structs (PutBlobTask etc.) inherit their method id
+  // from clio::cte::core::Method, so we re-stamp method_ after NewTask so
+  // dispatch at CAE lands in the right Run case.
+  // --------------------------------------------------------------------
+  chi::Future<PutBlobTask> AsyncPutBlob(
+      const clio::cte::core::TagId &tag_id, const char *blob_name,
+      chi::u64 offset, chi::u64 size, ctp::ipc::ShmPtr<> blob_data,
+      float score = -1.0f,
+      const clio::cte::core::Context &context = clio::cte::core::Context(),
+      chi::u32 flags = 0,
+      const chi::PoolQuery &pool_query = chi::PoolQuery::Dynamic()) {
+    auto *ipc_manager = CLIO_IPC;
+    auto task = ipc_manager->NewTask<PutBlobTask>(
+        chi::CreateTaskId(), pool_id_, pool_query, tag_id, blob_name,
+        offset, size, blob_data, score, context, flags);
+    task->method_ = Method::kPutBlob;
+    return ipc_manager->Send(task);
+  }
+
+  chi::Future<PutBlobTask> AsyncPutBlob(
+      const clio::cte::core::TagId &tag_id, const std::string &blob_name,
+      chi::u64 offset, chi::u64 size, ctp::ipc::ShmPtr<> blob_data,
+      float score = -1.0f,
+      const clio::cte::core::Context &context = clio::cte::core::Context(),
+      chi::u32 flags = 0,
+      const chi::PoolQuery &pool_query = chi::PoolQuery::Dynamic()) {
+    return AsyncPutBlob(tag_id, blob_name.c_str(), offset, size, blob_data,
+                        score, context, flags, pool_query);
+  }
+
+  chi::Future<GetBlobTask> AsyncGetBlob(
+      const clio::cte::core::TagId &tag_id, const char *blob_name,
+      chi::u64 offset, chi::u64 size, chi::u32 flags,
+      ctp::ipc::ShmPtr<> blob_data,
+      const chi::PoolQuery &pool_query = chi::PoolQuery::Dynamic()) {
+    auto *ipc_manager = CLIO_IPC;
+    auto task = ipc_manager->NewTask<GetBlobTask>(
+        chi::CreateTaskId(), pool_id_, pool_query, tag_id, blob_name,
+        offset, size, flags, blob_data);
+    task->method_ = Method::kGetBlob;
+    return ipc_manager->Send(task);
+  }
+
+  chi::Future<GetBlobTask> AsyncGetBlob(
+      const clio::cte::core::TagId &tag_id, const std::string &blob_name,
+      chi::u64 offset, chi::u64 size, chi::u32 flags,
+      ctp::ipc::ShmPtr<> blob_data,
+      const chi::PoolQuery &pool_query = chi::PoolQuery::Dynamic()) {
+    return AsyncGetBlob(tag_id, blob_name.c_str(), offset, size, flags,
+                        blob_data, pool_query);
+  }
+
+  chi::Future<GetOrCreateTagTask> AsyncGetOrCreateTag(
+      const std::string &tag_name,
+      const clio::cte::core::TagId &tag_id = clio::cte::core::TagId::GetNull(),
+      const chi::PoolQuery &pool_query = chi::PoolQuery::Dynamic()) {
+    auto *ipc_manager = CLIO_IPC;
+    auto task = ipc_manager->NewTask<GetOrCreateTagTask>(
+        chi::CreateTaskId(), pool_id_, pool_query, tag_name, tag_id);
+    task->method_ = Method::kGetOrCreateTag;
+    return ipc_manager->Send(task);
+  }
 };
 
 }  // namespace clio::cae::core

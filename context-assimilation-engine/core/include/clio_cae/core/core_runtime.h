@@ -125,9 +125,33 @@ class Runtime : public chi::Container {
    */
   chi::TaskResume ExportData(ctp::ipc::FullPtr<ExportDataTask> task, chi::RunContext& ctx);
 
+  /**
+   * CTE interceptor handlers (Method::kPutBlob / kGetBlob / kGetOrCreateTag).
+   * Each forwards the inbound task to the configured next CTE pool. No
+   * labeling/intelligence yet — just passthrough so a client pointed at
+   * the CAE pool transparently lands data in CTE behind it.
+   */
+  chi::TaskResume PutBlob(ctp::ipc::FullPtr<PutBlobTask> task,
+                          chi::RunContext &ctx);
+  chi::TaskResume GetBlob(ctp::ipc::FullPtr<GetBlobTask> task,
+                          chi::RunContext &ctx);
+  chi::TaskResume GetOrCreateTag(ctp::ipc::FullPtr<GetOrCreateTagTask> task,
+                                 chi::RunContext &ctx);
+
+  /**
+   * Resolve PoolQuery::Dynamic() → PoolQuery::Local() for the interceptor
+   * methods so they run on the receiving container without re-routing.
+   */
+  chi::PoolQuery ScheduleTask(
+      const ctp::ipc::FullPtr<chi::Task> &task) override;
+
  private:
+  /** Resolve the next pool ID (CTE core) we should forward to. */
+  chi::PoolId ResolveNextPoolId() const;
+
   Client client_;
   std::shared_ptr<clio::cte::core::Client> cte_client_;
+  chi::PoolId next_pool_id_;  // CTE core pool when CAE is the interceptor
 };
 
 }  // namespace clio::cae::core

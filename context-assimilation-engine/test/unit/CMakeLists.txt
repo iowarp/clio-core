@@ -300,6 +300,60 @@ set_tests_properties(
 )
 
 #------------------------------------------------------------------------------
+# Test 7: CAE -> CTE Interceptor Integration Test
+#------------------------------------------------------------------------------
+# Brings up CAE at pool 512.0 (CTE entrypoint) with next_pool_id 513.0,
+# CTE core at 513.0. Validates that CLIO_CTE_CLIENT->{GetOrCreateTag,
+# PutBlob, GetBlob} flow through the CAE interceptor and round-trip
+# correctly. See GitHub issue #467.
+#------------------------------------------------------------------------------
+add_executable(test_cae_cte_interceptor
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_cae_cte_interceptor.cc
+)
+
+target_include_directories(test_cae_cte_interceptor
+  PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/context-runtime/test
+)
+
+target_link_libraries(test_cae_cte_interceptor
+  PRIVATE
+    clio_cae_core_client
+    clio_cae_core_runtime
+    clio_cte_core_client
+    clio_cte_core_runtime
+    chimaera::admin_runtime
+    chimaera::admin_client
+    chimaera::bdev_runtime
+    chimaera::bdev_client
+    chimaera::cxx
+    ctp::cxx
+    ctp::configure
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+
+# Copy compose config next to binary so the test can find it via __FILE__.
+add_custom_command(TARGET test_cae_cte_interceptor POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_cae_cte_interceptor_config.yaml
+    ${CMAKE_CURRENT_BINARY_DIR}/test_cae_cte_interceptor_config.yaml
+)
+
+install(TARGETS test_cae_cte_interceptor DESTINATION bin)
+
+add_test(NAME cae_interceptor_roundtrip
+    COMMAND test_cae_cte_interceptor)
+
+set_tests_properties(
+    cae_interceptor_roundtrip
+    PROPERTIES
+        TIMEOUT 180
+        LABELS "cae;interceptor;integration;msan_skip"
+        RESOURCE_LOCK "chimaera_runtime"
+)
+
+#------------------------------------------------------------------------------
 # Test Summary Target
 #------------------------------------------------------------------------------
 # Custom target to run all tests with verbose output

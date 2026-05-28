@@ -16,3 +16,11 @@ kMonitor: 9       # 9 - Monitor container state
 kParseOmni: 10               # Parse OMNI YAML file and schedule assimilation tasks
 kProcessHdf5Dataset: 11      # Process HDF5 dataset
 kExportData: 12              # Export all blobs in a CTE tag to a file
+
+# CTE Interceptor Methods (forward to next_pool_id CTE core).
+# These IDs MUST match clio::cte::core::Method::k* (see
+# context-transfer-engine/core/clio_mod.yaml) so a task constructed by the
+# CTE client dispatches to the CAE handler when routed to a CAE pool.
+kGetOrCreateTag: 14          # Forward GetOrCreateTag to CTE core
+kPutBlob: 15                 # Forward PutBlob to CTE core
+kGetBlob: 16                 # Forward GetBlob to CTE core
