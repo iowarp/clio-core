@@ -41,12 +41,38 @@
 #include <clio_cte/core/core_tasks.h>
 
 #include "clio_ctp/data_structures/serialization/global_serialize.h"
+#include <string>
+#include <unordered_map>
 #include <vector>
 #include <yaml-cpp/yaml.h>
 
 namespace clio::cae::core {
 
 using MonitorTask = clio::run::admin::MonitorTask;
+
+/**
+ * One labeling rule from compose YAML.
+ *
+ * When CAE intercepts a PutBlob and the inbound tag name matches `tag_re`
+ * AND the blob name matches `blob_re`, CAE sends the blob payload to
+ * `model` on the configured `label_endpoint` (see LabelingConfig) using
+ * the prompt template registered in label_prompts_[prompt]. The LLM
+ * response is stored alongside the original blob as `{blob_name}_label`.
+ *
+ * Regexes are matched with std::regex_search (so `.*` matches everything;
+ * `.*\\.txt` matches a .txt suffix). Globs are not converted.
+ */
+struct LabelMatch {
+  std::string tag_re_;
+  std::string blob_re_;
+  std::string model_;
+  std::string prompt_;  // key into label_prompts_
+
+  template <class Archive>
+  void serialize(Archive &ar) {
+    ar(tag_re_, blob_re_, model_, prompt_);
+  }
+};
 
 /**
  * CreateParams for core chimod
@@ -62,28 +88,49 @@ struct CreateParams {
   // pool ID (kCtePoolId). Mirrors compressor's CompressorConfig::next_pool_id_.
   chi::PoolId next_pool_id_;
 
+  // Transparent labeling configuration (all optional).
+  // label_matches_ is empty by default — CAE behaves as a pure passthrough.
+  // When entries are present, PutBlob fires a labeling RPC per matching
+  // rule. See LabelMatch above for matching semantics.
+  std::vector<LabelMatch> label_matches_;
+  // Named prompt templates referenced by LabelMatch::prompt_. The full LLM
+  // input becomes "{prompt}\n\n{blob_text}".
+  std::unordered_map<std::string, std::string> label_prompts_;
+  // HTTP(S) endpoint of the inference server (Ollama-compatible). The
+  // labeling handler POSTs to "{label_endpoint_}/api/generate".
+  std::string label_endpoint_;
+
   // Default constructor
   CreateParams() : next_pool_id_(chi::PoolId::GetNull()) {}
 
   // Copy constructor (for BaseCreateTask)
   CreateParams(const CreateParams &other)
-      : next_pool_id_(other.next_pool_id_) {}
+      : next_pool_id_(other.next_pool_id_),
+        label_matches_(other.label_matches_),
+        label_prompts_(other.label_prompts_),
+        label_endpoint_(other.label_endpoint_) {}
 
   // Compose pool-id ctor (matches compressor pattern)
   CreateParams(const chi::PoolId &pool_id, const CreateParams &other)
-      : next_pool_id_(other.next_pool_id_) {
+      : next_pool_id_(other.next_pool_id_),
+        label_matches_(other.label_matches_),
+        label_prompts_(other.label_prompts_),
+        label_endpoint_(other.label_endpoint_) {
     (void)pool_id;
   }
 
   // Serialization support
   template <class Archive>
   void serialize(Archive &ar) {
-    ar(next_pool_id_);
+    ar(next_pool_id_, label_matches_, label_prompts_, label_endpoint_);
   }
 
   /**
-   * Load configuration from compose YAML. Parses `next_pool_id` ("major.minor")
-   * out of the pool's compose config.
+   * Load configuration from compose YAML. Parses:
+   *   - `next_pool_id`        ("major.minor")
+   *   - `label_matches`       (list of {tag_re, blob_re, model, prompt})
+   *   - `label_prompts`       (map of prompt-name → prompt template)
+   *   - `label_endpoint`      (LLM HTTP endpoint base URL)
    */
   void LoadConfig(const chi::PoolConfig &pool_config) {
     if (pool_config.config_.empty()) return;
@@ -96,6 +143,25 @@ struct CreateParams {
           chi::u32 major = std::stoul(next_str.substr(0, dot));
           chi::u32 minor = std::stoul(next_str.substr(dot + 1));
           next_pool_id_ = chi::PoolId(major, minor);
+        }
+      }
+      if (node["label_endpoint"]) {
+        label_endpoint_ = node["label_endpoint"].as<std::string>();
+      }
+      if (node["label_prompts"] && node["label_prompts"].IsMap()) {
+        for (const auto &kv : node["label_prompts"]) {
+          label_prompts_[kv.first.as<std::string>()] =
+              kv.second.as<std::string>();
+        }
+      }
+      if (node["label_matches"] && node["label_matches"].IsSequence()) {
+        for (const auto &entry : node["label_matches"]) {
+          LabelMatch m;
+          if (entry["tag_re"]) m.tag_re_ = entry["tag_re"].as<std::string>();
+          if (entry["blob_re"]) m.blob_re_ = entry["blob_re"].as<std::string>();
+          if (entry["model"]) m.model_ = entry["model"].as<std::string>();
+          if (entry["prompt"]) m.prompt_ = entry["prompt"].as<std::string>();
+          label_matches_.push_back(std::move(m));
         }
       }
     } catch (...) {

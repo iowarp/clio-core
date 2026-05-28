@@ -354,6 +354,63 @@ set_tests_properties(
 )
 
 #------------------------------------------------------------------------------
+# Test 8: CAE Transparent Labeling Integration Test (uses local Ollama)
+#------------------------------------------------------------------------------
+# Brings up CAE with label_matches pointing at a local Ollama instance
+# (127.0.0.1:11434, gemma3:1b). Verifies that a PutBlob whose tag+blob
+# name matches the rule produces a `{name}_label` blob with non-empty
+# contents. CAE_LABEL_TEST_SKIP=1 short-circuits the test for environments
+# without Ollama.
+#------------------------------------------------------------------------------
+add_executable(test_cae_labeling
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_cae_labeling.cc
+)
+
+target_include_directories(test_cae_labeling
+  PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/context-runtime/test
+)
+
+target_link_libraries(test_cae_labeling
+  PRIVATE
+    clio_cae_core_client
+    clio_cae_core_runtime
+    clio_cte_core_client
+    clio_cte_core_runtime
+    chimaera::admin_runtime
+    chimaera::admin_client
+    chimaera::bdev_runtime
+    chimaera::bdev_client
+    chimaera::cxx
+    ctp::cxx
+    ctp::configure
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+
+add_custom_command(TARGET test_cae_labeling POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_cae_labeling_config.yaml
+    ${CMAKE_CURRENT_BINARY_DIR}/test_cae_labeling_config.yaml
+)
+
+install(TARGETS test_cae_labeling DESTINATION bin)
+
+add_test(NAME cae_labeling_ollama
+    COMMAND test_cae_labeling)
+
+# 5-min timeout — gemma3:1b on CPU is usually under 10s but cold-start
+# weights can take longer. msan_skip because libcurl/openssl aren't
+# instrumented and we don't run a real LLM under MSan anyway.
+set_tests_properties(
+    cae_labeling_ollama
+    PROPERTIES
+        TIMEOUT 300
+        LABELS "cae;labeling;ollama;integration;msan_skip"
+        RESOURCE_LOCK "chimaera_runtime"
+)
+
+#------------------------------------------------------------------------------
 # Test Summary Target
 #------------------------------------------------------------------------------
 # Custom target to run all tests with verbose output
