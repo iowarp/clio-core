@@ -39,8 +39,9 @@ GLOBAL_CROSS_CONST chi::u32 kBlobQuery = 31;
 GLOBAL_CROSS_CONST chi::u32 kGetTargetInfo = 32;
 GLOBAL_CROSS_CONST chi::u32 kFlushMetadata = 33;
 GLOBAL_CROSS_CONST chi::u32 kFlushData = 34;
+GLOBAL_CROSS_CONST chi::u32 kSemanticSearch = 35;
 
-GLOBAL_CROSS_CONST chi::u32 kMaxMethodId = 35;
+GLOBAL_CROSS_CONST chi::u32 kMaxMethodId = 36;
 
 inline const std::vector<std::string>& GetMethodNames() {
   static const std::vector<std::string> names = [] {
@@ -69,6 +70,7 @@ inline const std::vector<std::string>& GetMethodNames() {
     v[32] = "GetTargetInfo";
     v[33] = "FlushMetadata";
     v[34] = "FlushData";
+    v[35] = "SemanticSearch";
     return v;
   }();
   return names;

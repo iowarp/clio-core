@@ -525,6 +525,27 @@ class Client : public chi::ContainerClient {
 
     return ipc_manager->Send(task);
   }
+
+  /**
+   * Asynchronous semantic search — BM25 keyword scoring over blob bytes.
+   * @param tag_regex   Full-string match against tag names (std::regex_match)
+   * @param blob_regex  Full-string match against blob names within matching tags
+   * @param query_text  Natural-language query; tokenized and scored vs blobs
+   * @param k           Maximum number of results returned, ordered by
+   *                    descending BM25 score. 0 means "no cap".
+   * @param pool_query  Default Broadcast — same as BlobQuery — so the
+   *                    search runs across every tag-owning container.
+   */
+  chi::Future<SemanticSearchTask> AsyncSemanticSearch(
+      const std::string &tag_regex, const std::string &blob_regex,
+      const std::string &query_text, chi::u32 k = 10,
+      const chi::PoolQuery &pool_query = chi::PoolQuery::Broadcast()) {
+    auto *ipc_manager = CLIO_CPU_IPC;
+    auto task = ipc_manager->NewTask<SemanticSearchTask>(
+        chi::CreateTaskId(), pool_id_, pool_query, tag_regex, blob_regex,
+        query_text, k);
+    return ipc_manager->Send(task);
+  }
   /**
    * Asynchronous flush metadata - returns immediately
    * @param pool_query Pool query for task routing (default: Local)

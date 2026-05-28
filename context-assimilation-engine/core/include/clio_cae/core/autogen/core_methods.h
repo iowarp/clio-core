@@ -29,8 +29,9 @@ GLOBAL_CROSS_CONST chi::u32 kExportData = 12;
 GLOBAL_CROSS_CONST chi::u32 kGetOrCreateTag = 14;
 GLOBAL_CROSS_CONST chi::u32 kPutBlob = 15;
 GLOBAL_CROSS_CONST chi::u32 kGetBlob = 16;
+GLOBAL_CROSS_CONST chi::u32 kSemanticSearch = 35;
 
-GLOBAL_CROSS_CONST chi::u32 kMaxMethodId = 17;
+GLOBAL_CROSS_CONST chi::u32 kMaxMethodId = 36;
 
 inline const std::vector<std::string>& GetMethodNames() {
   static const std::vector<std::string> names = [] {
@@ -44,6 +45,7 @@ inline const std::vector<std::string>& GetMethodNames() {
     v[14] = "GetOrCreateTag";
     v[15] = "PutBlob";
     v[16] = "GetBlob";
+    v[35] = "SemanticSearch";
     return v;
   }();
   return names;

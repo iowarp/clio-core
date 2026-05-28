@@ -228,6 +228,24 @@ class Client : public chi::ContainerClient {
     task->method_ = Method::kGetOrCreateTag;
     return ipc_manager->Send(task);
   }
+
+  /**
+   * Forward SemanticSearch (BM25 keyword search) to the CTE core
+   * behind the CAE interceptor. Same signature/semantics as
+   * clio::cte::core::Client::AsyncSemanticSearch — see that for the
+   * matching/scoring rules.
+   */
+  chi::Future<SemanticSearchTask> AsyncSemanticSearch(
+      const std::string &tag_regex, const std::string &blob_regex,
+      const std::string &query_text, chi::u32 k = 10,
+      const chi::PoolQuery &pool_query = chi::PoolQuery::Local()) {
+    auto *ipc_manager = CLIO_IPC;
+    auto task = ipc_manager->NewTask<SemanticSearchTask>(
+        chi::CreateTaskId(), pool_id_, pool_query, tag_regex, blob_regex,
+        query_text, k);
+    task->method_ = Method::kSemanticSearch;
+    return ipc_manager->Send(task);
+  }
 };
 
 }  // namespace clio::cae::core

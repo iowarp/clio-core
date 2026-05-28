@@ -411,6 +411,61 @@ set_tests_properties(
 )
 
 #------------------------------------------------------------------------------
+# Test 9: CAE labels 10 docs; CTE SemanticSearch returns top-5
+#------------------------------------------------------------------------------
+# Puts 10 short documents through CAE (auto-labels via local Ollama),
+# then exercises the new CTE/CAE SemanticSearch API: BM25-ranked top-5
+# results for a natural-language query. Validates the full
+# transparent-labeling → keyword-search pipeline.
+#------------------------------------------------------------------------------
+add_executable(test_cae_semantic_search
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_cae_semantic_search.cc
+)
+
+target_include_directories(test_cae_semantic_search
+  PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/context-runtime/test
+)
+
+target_link_libraries(test_cae_semantic_search
+  PRIVATE
+    clio_cae_core_client
+    clio_cae_core_runtime
+    clio_cte_core_client
+    clio_cte_core_runtime
+    chimaera::admin_runtime
+    chimaera::admin_client
+    chimaera::bdev_runtime
+    chimaera::bdev_client
+    chimaera::cxx
+    ctp::cxx
+    ctp::configure
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+
+add_custom_command(TARGET test_cae_semantic_search POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_cae_semantic_search_config.yaml
+    ${CMAKE_CURRENT_BINARY_DIR}/test_cae_semantic_search_config.yaml
+)
+
+install(TARGETS test_cae_semantic_search DESTINATION bin)
+
+add_test(NAME cae_semantic_search
+    COMMAND test_cae_semantic_search)
+
+# 10 sequential Ollama inferences + a server-side BM25 sweep — give
+# this enough wall budget for cold-start model load on slower CI.
+set_tests_properties(
+    cae_semantic_search
+    PROPERTIES
+        TIMEOUT 600
+        LABELS "cae;cte;bm25;semantic-search;ollama;integration;msan_skip"
+        RESOURCE_LOCK "chimaera_runtime"
+)
+
+#------------------------------------------------------------------------------
 # Test Summary Target
 #------------------------------------------------------------------------------
 # Custom target to run all tests with verbose output

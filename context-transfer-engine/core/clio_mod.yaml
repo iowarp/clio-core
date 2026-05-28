@@ -37,3 +37,4 @@ kBlobQuery: 31         # Query blobs by tag and blob regex patterns
 kGetTargetInfo: 32     # Get target information (score, capacity, perf metrics)
 kFlushMetadata: 33     # Periodic task to flush tag/blob metadata to durable storage
 kFlushData: 34         # Periodic task to flush data from volatile to non-volatile targets
+kSemanticSearch: 35    # BM25 keyword search over blob contents (tag+blob regex filter, top-k)

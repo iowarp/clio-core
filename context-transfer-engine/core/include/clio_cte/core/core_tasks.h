@@ -2323,6 +2323,106 @@ struct FlushDataTask : public chi::Task {
   }
 };
 
+/**
+ * One row in a SemanticSearchTask result vector. blob_name_ acts as
+ * the "BlobId" within tag_id_ — CTE doesn't have a separate BlobId
+ * type, blobs are addressed by (TagId, name).
+ */
+struct SemanticSearchResult {
+  TagId tag_id_;
+  std::string blob_name_;
+  double score_;  // BM25; higher = better
+
+  SemanticSearchResult() : tag_id_(TagId::GetNull()), score_(0.0) {}
+  SemanticSearchResult(const TagId &t, std::string n, double s)
+      : tag_id_(t), blob_name_(std::move(n)), score_(s) {}
+
+  template <typename Archive>
+  void serialize(Archive &ar) {
+    ar(tag_id_, blob_name_, score_);
+  }
+};
+
+/**
+ * SemanticSearchTask — keyword search over blob contents with BM25.
+ *
+ * Step 1: tag_regex_ AND blob_regex_ filter the candidate (tag, blob)
+ *         pairs, exactly like BlobQuery.
+ * Step 2: every candidate blob's bytes are tokenized into lowercase
+ *         alphanumeric terms and BM25-scored against the same
+ *         tokenization of query_text_.
+ * Step 3: results are sorted descending by score and trimmed to k_.
+ *
+ * BM25 corpus statistics (avgdl, df) are computed over the matched
+ * working set rather than the whole CTE — the query is "find the
+ * best matches *within this regex slice*", not "rank against
+ * everything CTE has ever seen".
+ *
+ * Regexes use std::regex_match (full-string) for parity with
+ * BlobQueryTask. Use ".*pattern.*" for substring matching.
+ */
+struct SemanticSearchTask : public chi::Task {
+  IN chi::priv::string tag_regex_;
+  IN chi::priv::string blob_regex_;
+  IN chi::priv::string query_text_;
+  IN chi::u32 k_;
+  OUT std::vector<SemanticSearchResult> results_;
+
+  // SHM constructor
+  SemanticSearchTask()
+      : chi::Task(),
+        tag_regex_(CLIO_PRIV_ALLOC),
+        blob_regex_(CLIO_PRIV_ALLOC),
+        query_text_(CLIO_PRIV_ALLOC),
+        k_(10) {}
+
+  // Emplace constructor
+  CTP_CROSS_FUN explicit SemanticSearchTask(const chi::TaskId &task_id,
+                                             const chi::PoolId &pool_id,
+                                             const chi::PoolQuery &pool_query,
+                                             const std::string &tag_regex,
+                                             const std::string &blob_regex,
+                                             const std::string &query_text,
+                                             chi::u32 k)
+      : chi::Task(task_id, pool_id, pool_query, Method::kSemanticSearch),
+        tag_regex_(CLIO_PRIV_ALLOC, tag_regex),
+        blob_regex_(CLIO_PRIV_ALLOC, blob_regex),
+        query_text_(CLIO_PRIV_ALLOC, query_text),
+        k_(k) {
+    task_id_ = task_id;
+    pool_id_ = pool_id;
+    method_ = Method::kSemanticSearch;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+    ar(tag_regex_, blob_regex_, query_text_, k_);
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+    ar(results_);
+  }
+
+  void Copy(const ctp::ipc::FullPtr<SemanticSearchTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+    tag_regex_ = other->tag_regex_;
+    blob_regex_ = other->blob_regex_;
+    query_text_ = other->query_text_;
+    k_ = other->k_;
+    results_ = other->results_;
+  }
+
+  void Aggregate(const ctp::ipc::FullPtr<chi::Task> &other_base) {
+    Task::Aggregate(other_base);
+    Copy(other_base.template Cast<SemanticSearchTask>());
+  }
+};
+
 }  // namespace clio::cte::core
 
 #endif  // WRPCTE_CORE_TASKS_H_

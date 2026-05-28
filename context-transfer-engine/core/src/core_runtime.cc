@@ -55,6 +55,7 @@
 #include <string>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "clio_runtime/worker.h"
@@ -3486,6 +3487,206 @@ chi::TaskResume Runtime::BlobQuery(ctp::ipc::FullPtr<BlobQueryTask> task,
     task->return_code_ = 1;
     HLOG(kError, "BlobQuery failed: {}", e.what());
   }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+// ==============================================================================
+// SemanticSearch — BM25 over blob contents
+// ==============================================================================
+
+namespace {
+
+// Tokenize raw bytes as lowercase alphanumeric runs of length >= 2.
+// Anything else (whitespace, punctuation, non-ASCII) splits a token.
+// Deliberately simple; good enough for English-ish text from labels.
+std::vector<std::string> SemSearchTokenize(const char *data, size_t size) {
+  std::vector<std::string> tokens;
+  std::string cur;
+  cur.reserve(16);
+  for (size_t i = 0; i < size; ++i) {
+    unsigned char c = static_cast<unsigned char>(data[i]);
+    if (std::isalnum(c)) {
+      cur.push_back(static_cast<char>(std::tolower(c)));
+    } else {
+      if (cur.size() >= 2) tokens.push_back(std::move(cur));
+      cur.clear();
+    }
+  }
+  if (cur.size() >= 2) tokens.push_back(std::move(cur));
+  return tokens;
+}
+
+struct SemSearchDoc {
+  TagId tag_id;
+  std::string blob_name;
+  std::unordered_map<std::string, int> tf;
+  size_t length;
+};
+
+}  // namespace
+
+chi::TaskResume Runtime::SemanticSearch(
+    ctp::ipc::FullPtr<SemanticSearchTask> task, chi::RunContext &ctx) {
+#ifdef __NVCOMPILER
+  chi::RunContext &rctx = ctx;
+#else
+  (void)ctx;
+#endif
+  CLIO_TASK_BODY_BEGIN
+  task->results_.clear();
+  task->return_code_ = 0;
+
+  std::string tag_regex_str = task->tag_regex_.str();
+  std::string blob_regex_str = task->blob_regex_.str();
+  std::string query_text = task->query_text_.str();
+  chi::u32 k = task->k_;
+
+  std::regex tag_pattern;
+  std::regex blob_pattern;
+  try {
+    tag_pattern = std::regex(tag_regex_str);
+    blob_pattern = std::regex(blob_regex_str);
+  } catch (const std::regex_error &e) {
+    HLOG(kError, "SemanticSearch: bad regex (tag='{}' blob='{}'): {}",
+         tag_regex_str, blob_regex_str, e.what());
+    task->return_code_ = 1;
+    CLIO_CO_RETURN;
+  }
+
+  // Step 1: pick matching (tag_name, tag_id) pairs from tag metadata
+  // (same iteration as BlobQuery).
+  std::vector<std::pair<std::string, TagId>> matching_tags;
+  tag_name_to_id_.for_each(
+      [&tag_pattern, &matching_tags](const std::string &tag_name,
+                                     const TagId &tag_id) {
+        if (std::regex_match(tag_name, tag_pattern)) {
+          matching_tags.emplace_back(tag_name, tag_id);
+        }
+      });
+
+  // Step 2: walk the tag-blob metadata and collect (tag_id, blob_name)
+  // pairs whose blob_name matches blob_regex_. We collect names first
+  // and read bytes afterward — keeping the metadata iteration short
+  // means the for_each lambda doesn't block on bdev I/O.
+  std::vector<std::pair<TagId, std::string>> candidates;
+  for (const auto &tn : matching_tags) {
+    const TagId &tag_id = tn.second;
+    std::string prefix = std::to_string(tag_id.major_) + "." +
+                         std::to_string(tag_id.minor_) + ".";
+    tag_blob_name_to_info_.for_each(
+        [&prefix, &blob_pattern, &tag_id, &candidates](
+            const std::string &composite_key, const BlobInfo &blob_info) {
+          (void)blob_info;
+          if (composite_key.rfind(prefix, 0) != 0) return;
+          std::string blob_name = composite_key.substr(prefix.length());
+          if (std::regex_match(blob_name, blob_pattern)) {
+            candidates.emplace_back(tag_id, blob_name);
+          }
+        });
+  }
+  if (candidates.empty()) {
+    HLOG(kDebug,
+         "SemanticSearch: no candidates for tag='{}' blob='{}'",
+         tag_regex_str, blob_regex_str);
+    CLIO_CO_RETURN;
+  }
+
+  // Step 3: read each candidate's bytes, tokenize, and accumulate
+  // BM25 corpus statistics (tf per doc, doc length, df, avgdl).
+  auto *ipc_manager = CLIO_IPC;
+  std::vector<SemSearchDoc> docs;
+  docs.reserve(candidates.size());
+  for (auto &cand : candidates) {
+    BlobInfo *info = CheckBlobExists(cand.second, cand.first);
+    if (info == nullptr) continue;
+    chi::u64 total = info->GetTotalSize();
+    if (total == 0) continue;
+
+    ctp::ipc::FullPtr<char> buf = ipc_manager->AllocateBuffer(total);
+    if (buf.IsNull()) {
+      HLOG(kWarning,
+           "SemanticSearch: AllocateBuffer({}) failed for blob '{}'; "
+           "skipping",
+           total, cand.second);
+      continue;
+    }
+    ctp::ipc::ShmPtr<> shm(buf.shm_);
+    chi::u32 read_rc = 0;
+    CLIO_CO_AWAIT(ReadData(info->blocks_, shm, total, 0, read_rc));
+    if (read_rc != 0) {
+      HLOG(kWarning,
+           "SemanticSearch: ReadData failed for blob '{}' (rc={}); "
+           "skipping",
+           cand.second, read_rc);
+      ipc_manager->FreeBuffer(buf);
+      continue;
+    }
+
+    auto tokens = SemSearchTokenize(buf.ptr_, total);
+    ipc_manager->FreeBuffer(buf);
+
+    SemSearchDoc doc;
+    doc.tag_id = cand.first;
+    doc.blob_name = std::move(cand.second);
+    doc.length = tokens.size();
+    for (auto &t : tokens) ++doc.tf[t];
+    docs.push_back(std::move(doc));
+  }
+  if (docs.empty()) {
+    CLIO_CO_RETURN;
+  }
+
+  // Step 4: BM25. Corpus stats are computed over the working set
+  // (the matched slice), not over all CTE blobs — this is "rank
+  // within this regex" semantics. k1=1.5 / b=0.75 are the standard
+  // Okapi defaults.
+  constexpr double kK1 = 1.5;
+  constexpr double kB = 0.75;
+  std::unordered_map<std::string, int> df;
+  double total_len = 0.0;
+  for (auto &d : docs) {
+    total_len += static_cast<double>(d.length);
+    for (auto &kv : d.tf) df[kv.first]++;
+  }
+  double avgdl = (docs.empty() ? 1.0 : total_len / docs.size());
+  if (avgdl <= 0.0) avgdl = 1.0;
+  const size_t N = docs.size();
+
+  auto qtokens = SemSearchTokenize(query_text.data(), query_text.size());
+  std::unordered_set<std::string> uniq_q(qtokens.begin(), qtokens.end());
+
+  std::vector<SemanticSearchResult> scored;
+  scored.reserve(docs.size());
+  for (auto &d : docs) {
+    double score = 0.0;
+    for (auto &q : uniq_q) {
+      auto df_it = df.find(q);
+      if (df_it == df.end()) continue;
+      auto tf_it = d.tf.find(q);
+      if (tf_it == d.tf.end()) continue;
+      double df_q = static_cast<double>(df_it->second);
+      double idf = std::log((static_cast<double>(N) - df_q + 0.5) /
+                                (df_q + 0.5) +
+                            1.0);
+      double tf_q = static_cast<double>(tf_it->second);
+      double norm =
+          1.0 - kB + kB * (static_cast<double>(d.length) / avgdl);
+      score += idf * (tf_q * (kK1 + 1.0)) / (tf_q + kK1 * norm);
+    }
+    scored.emplace_back(d.tag_id, d.blob_name, score);
+  }
+
+  std::sort(scored.begin(), scored.end(),
+            [](const SemanticSearchResult &a,
+               const SemanticSearchResult &b) { return a.score_ > b.score_; });
+  if (k > 0 && scored.size() > k) scored.resize(k);
+  task->results_ = std::move(scored);
+  HLOG(kDebug,
+       "SemanticSearch: tag='{}' blob='{}' query='{}' -> {} results "
+       "(from {} candidates)",
+       tag_regex_str, blob_regex_str, query_text, task->results_.size(),
+       candidates.size());
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }

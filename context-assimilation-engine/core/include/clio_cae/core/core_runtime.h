@@ -140,6 +140,8 @@ class Runtime : public chi::Container {
                           chi::RunContext &ctx);
   chi::TaskResume GetOrCreateTag(ctp::ipc::FullPtr<GetOrCreateTagTask> task,
                                  chi::RunContext &ctx);
+  chi::TaskResume SemanticSearch(ctp::ipc::FullPtr<SemanticSearchTask> task,
+                                 chi::RunContext &ctx);
 
   /**
    * Resolve PoolQuery::Dynamic() → PoolQuery::Local() for the interceptor

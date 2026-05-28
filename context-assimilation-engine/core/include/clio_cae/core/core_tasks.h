@@ -453,6 +453,7 @@ using PutBlobTask = clio::cte::core::PutBlobTask;
 using GetBlobTask = clio::cte::core::GetBlobTask;
 using GetOrCreateTagTask =
     clio::cte::core::GetOrCreateTagTask<clio::cte::core::CreateParams>;
+using SemanticSearchTask = clio::cte::core::SemanticSearchTask;
 
 static_assert(Method::kPutBlob == clio::cte::core::Method::kPutBlob,
               "CAE kPutBlob must match clio::cte::core::Method::kPutBlob "
@@ -463,6 +464,10 @@ static_assert(Method::kGetBlob == clio::cte::core::Method::kGetBlob,
 static_assert(
     Method::kGetOrCreateTag == clio::cte::core::Method::kGetOrCreateTag,
     "CAE kGetOrCreateTag must match clio::cte::core::Method::kGetOrCreateTag "
+    "for transparent CTE→CAE task dispatch");
+static_assert(
+    Method::kSemanticSearch == clio::cte::core::Method::kSemanticSearch,
+    "CAE kSemanticSearch must match clio::cte::core::Method::kSemanticSearch "
     "for transparent CTE→CAE task dispatch");
 
 }  // namespace clio::cae::core

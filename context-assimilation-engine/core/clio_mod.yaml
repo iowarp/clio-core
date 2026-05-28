@@ -24,3 +24,4 @@ kExportData: 12              # Export all blobs in a CTE tag to a file
 kGetOrCreateTag: 14          # Forward GetOrCreateTag to CTE core
 kPutBlob: 15                 # Forward PutBlob to CTE core
 kGetBlob: 16                 # Forward GetBlob to CTE core
+kSemanticSearch: 35          # Forward SemanticSearch (BM25 keyword search) to CTE core

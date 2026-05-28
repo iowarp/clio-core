@@ -118,6 +118,7 @@ chi::PoolQuery Runtime::ScheduleTask(
     case Method::kPutBlob:
     case Method::kGetBlob:
     case Method::kGetOrCreateTag:
+    case Method::kSemanticSearch:
       return chi::PoolQuery::Local();
     default:
       return chi::PoolQuery::Local();
@@ -342,6 +343,29 @@ chi::TaskResume Runtime::GetOrCreateTag(
     std::lock_guard<std::mutex> lock(tag_names_mu_);
     tag_names_[task->tag_id_] = std::move(tag_name);
   }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+chi::TaskResume Runtime::SemanticSearch(
+    ctp::ipc::FullPtr<SemanticSearchTask> task, chi::RunContext &ctx) {
+#ifndef __NVCOMPILER
+  (void)ctx;
+#endif
+  CLIO_TASK_BODY_BEGIN
+  if (!cte_client_) {
+    cte_client_ = std::make_shared<clio::cte::core::Client>(ResolveNextPoolId());
+  }
+  // Forward verbatim. CAE doesn't add any semantic-search logic on
+  // top of CTE today — the only reason this handler exists is so a
+  // CTE client pointed at the CAE entrypoint pool keeps working
+  // without any client-side rewiring.
+  auto fwd = cte_client_->AsyncSemanticSearch(
+      task->tag_regex_.str(), task->blob_regex_.str(),
+      task->query_text_.str(), task->k_, chi::PoolQuery::Local());
+  CLIO_CO_AWAIT(fwd);
+  task->results_ = fwd->results_;
+  task->SetReturnCode(fwd->GetReturnCode());
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }

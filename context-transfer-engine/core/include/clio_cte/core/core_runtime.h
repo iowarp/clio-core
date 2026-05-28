@@ -570,6 +570,16 @@ private:
   chi::TaskResume BlobQuery(ctp::ipc::FullPtr<BlobQueryTask> task, chi::RunContext &ctx);
 
   /**
+   * BM25 keyword search over blob contents (Method::kSemanticSearch).
+   * Filters by tag+blob regex like BlobQuery, then tokenizes each
+   * candidate blob's bytes and scores them against query_text_ using
+   * Okapi BM25 with corpus stats computed over the matched working
+   * set. Returns top-k results sorted by descending score.
+   */
+  chi::TaskResume SemanticSearch(ctp::ipc::FullPtr<SemanticSearchTask> task,
+                                 chi::RunContext &ctx);
+
+  /**
    * Get comprehensive blob metadata (Method::kGetBlobInfo)
    * Returns score, total size, and block placement information
    * @param task GetBlobInfo task containing blob lookup parameters and results
