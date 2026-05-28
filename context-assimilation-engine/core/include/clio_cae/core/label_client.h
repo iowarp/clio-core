@@ -16,14 +16,19 @@ namespace clio::cae::core {
  * Synchronously call an Ollama-compatible /api/generate endpoint and
  * return the model's response text.
  *
- * @param endpoint_base  Base URL of the inference server, e.g.
- *                       "http://127.0.0.1:11434". The "/api/generate" path
- *                       is appended internally.
- * @param model          Model name (e.g. "gemma3:1b").
- * @param prompt         Full prompt text (template + user data, already
- *                       composed by the caller).
- * @param out_response   Filled with the parsed `response` field on
- *                       success; cleared on failure.
+ * @param endpoint_base   Base URL of the inference server, e.g.
+ *                        "http://127.0.0.1:11434". The "/api/generate"
+ *                        path is appended internally.
+ * @param model           Model name (e.g. "gemma3:1b").
+ * @param prompt          Full prompt text (template + user data, already
+ *                        composed by the caller).
+ * @param context_length  Tokens to allocate for this request. Sent as
+ *                        `options.num_ctx` in the JSON body. 0 means
+ *                        "omit the option" — Ollama then uses its own
+ *                        default (typically 2048), which silently
+ *                        truncates anything larger.
+ * @param out_response    Filled with the parsed `response` field on
+ *                        success; cleared on failure.
  * @return true on HTTP 200 with a parseable JSON body, false on any
  *         transport, server, or parse error. Errors are logged via HLOG
  *         at kWarning so a labeling failure doesn't propagate up and
@@ -38,6 +43,7 @@ namespace clio::cae::core {
 bool OllamaGenerate(const std::string &endpoint_base,
                     const std::string &model,
                     const std::string &prompt,
+                    int context_length,
                     std::string &out_response);
 
 }  // namespace clio::cae::core

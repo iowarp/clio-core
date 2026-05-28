@@ -30,10 +30,20 @@ compose:
     label_prompts:
       summarize: "Summarize the following text in one short sentence."
     label_matches:
+      # Rule 1: small ".txt" blobs — comfortable single-shot context.
       - tag_re: ".*\\.txt$"
         blob_re: ".*"
         model: "gemma3:1b"
         prompt: "summarize"
+        context_length: 4096
+      # Rule 2: ".chunked" tag — deliberately tiny context_length so any
+      # non-trivial blob hits the chunk-and-concatenate path in
+      # CAE::PutBlob. Exercised by test_cae_labeling's chunking test.
+      - tag_re: ".*\\.chunked$"
+        blob_re: ".*"
+        model: "gemma3:1b"
+        prompt: "summarize"
+        context_length: 512
 
   # CTE core behind the CAE.
   - mod_name: clio_cte_core

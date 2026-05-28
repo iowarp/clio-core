@@ -37,6 +37,7 @@ size_t WriteToStringCb(char *ptr, size_t size, size_t nmemb, void *userdata) {
 bool OllamaGenerate(const std::string &endpoint_base,
                     const std::string &model,
                     const std::string &prompt,
+                    int context_length,
                     std::string &out_response) {
   out_response.clear();
   EnsureCurlInit();
@@ -57,6 +58,12 @@ bool OllamaGenerate(const std::string &endpoint_base,
       {"prompt", prompt},
       {"stream", false},
   };
+  // num_ctx in options widens Ollama's prompt+response budget. Ollama's
+  // default (~2048) silently truncates anything larger, which manifests
+  // as a label that only describes the *tail* of the blob.
+  if (context_length > 0) {
+    body["options"] = {{"num_ctx", context_length}};
+  }
   std::string body_str = body.dump();
 
   CURL *curl = curl_easy_init();

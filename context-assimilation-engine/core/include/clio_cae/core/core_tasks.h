@@ -59,6 +59,12 @@ using MonitorTask = clio::run::admin::MonitorTask;
  * the prompt template registered in label_prompts_[prompt]. The LLM
  * response is stored alongside the original blob as `{blob_name}_label`.
  *
+ * `context_length_` is the per-request token budget passed to Ollama as
+ * `options.num_ctx`. It also drives chunking: when the blob payload
+ * exceeds the effective byte budget for one prompt, CAE splits the blob
+ * into chunks each sized to fit, runs the prompt on every chunk, and
+ * concatenates the per-chunk responses into the final label.
+ *
  * Regexes are matched with std::regex_search (so `.*` matches everything;
  * `.*\\.txt` matches a .txt suffix). Globs are not converted.
  */
@@ -67,10 +73,16 @@ struct LabelMatch {
   std::string blob_re_;
   std::string model_;
   std::string prompt_;  // key into label_prompts_
+  // Per-request Ollama context window in tokens. Also drives chunk
+  // sizing — see core_runtime.cc::PutBlob. 0 means "use Ollama default"
+  // (typically 2048) and disables chunking. A safe production value
+  // matches the model's architectural max (e.g. 32768 for gemma3:1b,
+  // 131072 for gemma3:4b+).
+  int context_length_ = 4096;
 
   template <class Archive>
   void serialize(Archive &ar) {
-    ar(tag_re_, blob_re_, model_, prompt_);
+    ar(tag_re_, blob_re_, model_, prompt_, context_length_);
   }
 };
 
@@ -161,6 +173,9 @@ struct CreateParams {
           if (entry["blob_re"]) m.blob_re_ = entry["blob_re"].as<std::string>();
           if (entry["model"]) m.model_ = entry["model"].as<std::string>();
           if (entry["prompt"]) m.prompt_ = entry["prompt"].as<std::string>();
+          if (entry["context_length"]) {
+            m.context_length_ = entry["context_length"].as<int>();
+          }
           label_matches_.push_back(std::move(m));
         }
       }
