@@ -64,6 +64,8 @@ add_test(NAME cee_bundle_range COMMAND test_context_comprehensive "[cee][bundle]
 add_test(NAME cee_bundle_invalid COMMAND test_context_comprehensive "[cee][bundle][error]")
 add_test(NAME cee_query_regex COMMAND test_context_comprehensive "[cee][query][regex]")
 add_test(NAME cee_query_limit COMMAND test_context_comprehensive "[cee][query][limit]")
+add_test(NAME cee_bundle_string COMMAND test_context_comprehensive "[cee][bundle][string]")
+add_test(NAME cee_query_prompt_bm25 COMMAND test_context_comprehensive "[cee][query][prompt][bm25]")
 add_test(NAME cee_destroy_multi COMMAND test_context_comprehensive "[cee][destroy][multi]")
 add_test(NAME cee_destroy_partial COMMAND test_context_comprehensive "[cee][destroy][partial]")
 add_test(NAME cee_splice_stub COMMAND test_context_comprehensive "[cee][splice][stub]")
@@ -74,6 +76,7 @@ set_tests_properties(
   cee_init cee_retrieve_basic cee_retrieve_empty cee_retrieve_smallbuffer
   cee_retrieve_custombatch cee_retrieve_maxresults cee_bundle_multi
   cee_bundle_range cee_bundle_invalid cee_query_regex cee_query_limit
+  cee_bundle_string cee_query_prompt_bm25
   cee_destroy_multi cee_destroy_partial cee_splice_stub cee_integration
   PROPERTIES
     TIMEOUT 180

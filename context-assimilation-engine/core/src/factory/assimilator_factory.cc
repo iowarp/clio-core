@@ -33,6 +33,7 @@
 
 #include <clio_cae/core/factory/assimilator_factory.h>
 #include <clio_cae/core/factory/binary_file_assimilator.h>
+#include <clio_cae/core/factory/string_data_assimilator.h>
 #ifdef CLIO_CAE_ENABLE_HDF5
 #include <clio_cae/core/factory/hdf5_file_assimilator.h>
 #endif
@@ -78,6 +79,12 @@ std::unique_ptr<BaseAssimilator> AssimilatorFactory::Get(
          "protocol");
     // For file protocol, return a BinaryFileAssimilator
     return std::make_unique<BinaryFileAssimilator>(cte_client_);
+  } else if (protocol == "string") {
+    HLOG(kDebug,
+         "AssimilatorFactory: Creating StringDataAssimilator for 'string' "
+         "protocol");
+    // For string protocol, the payload travels in AssimilationCtx::src_data
+    return std::make_unique<StringDataAssimilator>(cte_client_);
   } else if (protocol == "hdf5") {
 #ifdef CLIO_CAE_ENABLE_HDF5
     HLOG(

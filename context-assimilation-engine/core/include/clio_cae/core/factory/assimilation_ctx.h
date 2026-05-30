@@ -45,7 +45,7 @@ namespace clio::cae::core {
  * Contains metadata about the source, destination, format, and range
  */
 struct AssimilationCtx {
-  std::string src;         // Source URL (e.g., file::/path/to/file)
+  std::string src;         // Source URL (e.g., file::/path/to/file, string::blob_name)
   std::string dst;         // Destination URL (e.g., iowarp::tag_name)
   std::string format;      // Data format (e.g., binary, hdf5)
   std::string depends_on;  // Dependency identifier (empty if none)
@@ -53,6 +53,11 @@ struct AssimilationCtx {
   size_t range_size;       // Number of bytes to read
   std::string src_token;   // Authentication token for source (e.g., Globus access token)
   std::string dst_token;   // Authentication token for destination
+
+  // Inline data payload for src="string::..." sources. The bytes here are
+  // stored verbatim as a single blob whose name is the path part of `src`
+  // (everything after "string::"). Unused for file/hdf5/globus sources.
+  std::string src_data;
 
   // Dataset filtering (for HDF5 and other hierarchical formats)
   std::vector<std::string> include_patterns;  // Glob patterns for datasets to include
@@ -84,7 +89,7 @@ struct AssimilationCtx {
   template<class Archive>
   void serialize(Archive& ar) {
     ar(src, dst, format, depends_on, range_off, range_size, src_token, dst_token,
-       include_patterns, exclude_patterns);
+       include_patterns, exclude_patterns, src_data);
   }
 };
 

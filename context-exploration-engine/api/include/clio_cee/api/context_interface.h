@@ -71,19 +71,29 @@ public:
   int ContextBundle(const std::vector<clio::cae::core::AssimilationCtx> &bundle);
 
   /**
-   * Retrieve the identities of objects matching tag and blob patterns
+   * Retrieve the identities of objects matching tag and blob patterns.
    *
-   * Queries the CTE system for blobs matching the specified regex patterns.
-   * This is useful for discovering what objects are available in the system.
+   * Two modes, switched by `prompt`:
+   *   - `prompt` is empty (default): regex-only listing via BlobQuery —
+   *     tag/blob names matching `tag_re` AND `blob_re` are returned.
+   *   - `prompt` is non-empty: BM25 keyword search via SemanticSearch —
+   *     `tag_re`/`blob_re` filter the candidate set and the prompt text
+   *     is scored against the blob payloads; the top `max_results`
+   *     blob names (ordered by descending score) are returned.
    *
-   * @param tag_re Tag regex pattern to match
-   * @param blob_re Blob regex pattern to match
-   * @param max_results Maximum number of results to return (0 = unlimited)
+   * `max_results = 0` means "unlimited" for the regex path and falls back
+   * to a default cap of 10 for the BM25 path (mirrors AsyncSemanticSearch).
+   *
+   * @param tag_re      Tag regex pattern to match
+   * @param blob_re     Blob regex pattern to match
+   * @param max_results Result cap (0 = unlimited for regex; 10 for BM25)
+   * @param prompt      Optional BM25 query text. Empty = regex-only query.
    * @return Vector of matching blob names
    */
   std::vector<std::string> ContextQuery(const std::string &tag_re,
                                          const std::string &blob_re,
-                                         unsigned int max_results = 0);
+                                         unsigned int max_results = 0,
+                                         const std::string &prompt = "");
 
   /**
    * Retrieve the identities and data of objects matching patterns

@@ -69,6 +69,9 @@ NB_MODULE(clio_cee, m) {
             "Authentication token for source")
     .def_rw("dst_token", &clio::cae::core::AssimilationCtx::dst_token,
             "Authentication token for destination")
+    .def_rw("src_data", &clio::cae::core::AssimilationCtx::src_data,
+            "Inline payload bytes for src='string::<blob_name>' sources. "
+            "Stored verbatim as a single blob named <blob_name>.")
     .def("__repr__", [](const clio::cae::core::AssimilationCtx& ctx) {
       return "<AssimilationCtx src='" + ctx.src + "' dst='" + ctx.dst +
              "' format='" + ctx.format + "'>";
@@ -88,12 +91,19 @@ NB_MODULE(clio_cee, m) {
          "Returns:\n"
          "  0 on success, non-zero error code on failure")
     .def("context_query", &iowarp::ContextInterface::ContextQuery,
-         nb::arg("tag_re"), nb::arg("blob_re"), nb::arg("max_results") = 0,
+         nb::arg("tag_re"), nb::arg("blob_re"),
+         nb::arg("max_results") = 0,
+         nb::arg("prompt") = "",
          "Retrieve the identities of objects matching tag and blob patterns\n\n"
+         "When `prompt` is empty (default), runs a regex-only BlobQuery.\n"
+         "When `prompt` is non-empty, runs BM25 keyword search over the\n"
+         "regex-filtered candidate blobs and returns the top `max_results`\n"
+         "blob names ordered by descending score (0 falls back to top-10).\n\n"
          "Parameters:\n"
          "  tag_re: Tag regex pattern to match\n"
          "  blob_re: Blob regex pattern to match\n"
-         "  max_results: Maximum number of results to return (0 = unlimited, default: 0)\n\n"
+         "  max_results: Result cap (0 = unlimited for regex; top-10 for BM25)\n"
+         "  prompt: Optional BM25 query text — empty disables keyword search\n\n"
          "Returns:\n"
          "  List of matching blob names")
     .def("context_retrieve", &iowarp::ContextInterface::ContextRetrieve,

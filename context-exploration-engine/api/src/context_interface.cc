@@ -128,7 +128,8 @@ int ContextInterface::ContextBundle(
 std::vector<std::string> ContextInterface::ContextQuery(
     const std::string &tag_re,
     const std::string &blob_re,
-    unsigned int max_results) {
+    unsigned int max_results,
+    const std::string &prompt) {
   if (!EnsureInitialized()) {
     HLOG(kError, "ContextInterface failed to initialize");
     return std::vector<std::string>();
@@ -140,6 +141,28 @@ std::vector<std::string> ContextInterface::ContextQuery(
     if (!cte_client) {
       HLOG(kError, "CTE client not initialized");
       return std::vector<std::string>();
+    }
+
+    // Branch on prompt: empty = regex-only via BlobQuery; non-empty = BM25
+    // keyword search via SemanticSearch. Both run Broadcast across nodes.
+    if (!prompt.empty()) {
+      // max_results=0 means "unlimited" for the regex path, but BM25 needs
+      // a positive top-k; fall back to the SemanticSearchTask default (10).
+      chi::u32 k = max_results > 0 ? max_results : 10;
+      auto task = cte_client->AsyncSemanticSearch(
+          tag_re,
+          blob_re,
+          prompt,
+          k,
+          chi::PoolQuery::Broadcast());
+      task.Wait();
+
+      std::vector<std::string> results;
+      results.reserve(task->results_.size());
+      for (const auto& r : task->results_) {
+        results.push_back(r.blob_name_);
+      }
+      return results;
     }
 
     // Call AsyncBlobQuery with tag and blob regex patterns

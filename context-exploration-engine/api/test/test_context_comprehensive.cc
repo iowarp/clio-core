@@ -55,6 +55,7 @@
 #include <clio_runtime/clio_runtime.h>
 #include <fstream>
 #include <filesystem>
+#include <set>
 #include <system_error>
 #include <cstdlib>
 
@@ -439,6 +440,107 @@ TEST_CASE("CEE - ContextQuery With Max Results", "[cee][query][limit]") {
 
   INFO("Unlimited: " << results_unlimited.size() << " results");
   INFO("Limited to 1: " << results_limited.size() << " results");
+}
+
+// ============================================================================
+// ContextBundle: string:: protocol with src_data payload
+// ============================================================================
+
+TEST_CASE("CEE - ContextBundle string:: payload (src_data)",
+          "[cee][bundle][string]") {
+  CEEComprehensiveFixture fixture;
+
+  ContextInterface ctx_interface;
+
+  // Three in-memory payloads land as three blobs under the same tag.
+  // Mirrors the agentic-loop flow: caller already has bytes in hand and
+  // hands them off to Clio without going through a file.
+  auto make = [](const std::string& blob, const std::string& tag,
+                 const std::string& data) {
+    clio::cae::core::AssimilationCtx c;
+    c.src = "string::" + blob;
+    c.dst = "iowarp::" + tag;
+    c.format = "string";
+    c.src_data = data;
+    return c;
+  };
+  std::vector<clio::cae::core::AssimilationCtx> bundle{
+      make("step1", "cee_string_tag", "agent step 1 result"),
+      make("step2", "cee_string_tag", "agent step 2 result"),
+      make("step3", "cee_string_tag", "agent step 3 result"),
+  };
+
+  int rc = ctx_interface.ContextBundle(bundle);
+  REQUIRE(rc == 0);
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+  auto names = ctx_interface.ContextQuery("cee_string_tag", ".*");
+  std::set<std::string> got(names.begin(), names.end());
+  INFO("Got " << got.size() << " blobs under cee_string_tag");
+  REQUIRE(got.count("step1") == 1);
+  REQUIRE(got.count("step2") == 1);
+  REQUIRE(got.count("step3") == 1);
+}
+
+// ============================================================================
+// ContextQuery: BM25 prompt path
+// ============================================================================
+
+TEST_CASE("CEE - ContextQuery prompt triggers BM25 semantic search",
+          "[cee][query][prompt][bm25]") {
+  CEEComprehensiveFixture fixture;
+
+  ContextInterface ctx_interface;
+
+  // Three short text blobs with distinct vocabularies. The BM25 path
+  // should rank the spaceflight blob highest for a moon/Apollo query —
+  // not because the model is smart, but because BM25 term-frequency
+  // weighting falls out of the keyword overlap.
+  auto mk = [](const std::string& blob, const std::string& body) {
+    clio::cae::core::AssimilationCtx c;
+    c.src = "string::" + blob;
+    c.dst = "iowarp::cee_bm25_tag";
+    c.format = "string";
+    c.src_data = body;
+    return c;
+  };
+  std::vector<clio::cae::core::AssimilationCtx> bundle{
+      mk("space_doc",
+         "Apollo 11 landed on the Moon in 1969. The lunar surface mission "
+         "with astronauts Armstrong and Aldrin defined human spaceflight."),
+      mk("cooking_doc",
+         "A roux is equal parts butter and flour cooked into a paste, the "
+         "base for many classic French sauces like bechamel and espagnole."),
+      mk("garden_doc",
+         "Tomato plants need full sun, regular watering, and well-drained "
+         "soil with a slightly acidic pH for a healthy fruit set."),
+  };
+  int rc = ctx_interface.ContextBundle(bundle);
+  REQUIRE(rc == 0);
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+  // Sanity: regex-only query (empty prompt) still returns all three.
+  auto regex_only = ctx_interface.ContextQuery("cee_bm25_tag", ".*");
+  REQUIRE(regex_only.size() == 3);
+
+  // BM25 path: prompt about the moon should put space_doc first.
+  auto ranked = ctx_interface.ContextQuery(
+      "cee_bm25_tag", ".*", /*max_results=*/3,
+      /*prompt=*/"apollo moon lunar surface astronaut");
+  INFO("BM25 ranked " << ranked.size() << " results");
+  for (size_t i = 0; i < ranked.size(); ++i) {
+    INFO("  #" << i << "  " << ranked[i]);
+  }
+  REQUIRE(ranked.size() > 0);
+  REQUIRE(ranked.size() <= 3);
+  REQUIRE(ranked[0] == "space_doc");
+
+  // top-k cap: ask for 1, get 1 (and it's the same #0).
+  auto top1 = ctx_interface.ContextQuery(
+      "cee_bm25_tag", ".*", /*max_results=*/1,
+      /*prompt=*/"apollo moon lunar surface astronaut");
+  REQUIRE(top1.size() == 1);
+  REQUIRE(top1[0] == "space_doc");
 }
 
 // ============================================================================
