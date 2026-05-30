@@ -82,24 +82,29 @@ if(BUILD_TESTING)
         DEPENDS clio_cte_core_ext
     )
 
-    # PollTelemetryLog focused test (requires runtime initialization)
-    # This test specifically validates telemetry logging functionality
-    # Requires: CHI_WITH_RUNTIME=1 and CHI_SERVER_CONF set
+    # PollTelemetryLog focused test (requires runtime initialization).
+    # Requires CLIO_WITH_RUNTIME=1 and CLIO_SERVER_CONF set.
+    # NOTE: test reads the CLIO_-prefixed names verbatim (not GetCompat),
+    # so the env vars below MUST use the CLIO_ spelling or the test
+    # will fast-fail with "CLIO_SERVER_CONF not set".
     add_test(
         NAME python_telemetry_test
         COMMAND ${Python_EXECUTABLE} -I ${CMAKE_CURRENT_SOURCE_DIR}/test_cte_telemetry.py
         WORKING_DIRECTORY $<TARGET_FILE_DIR:clio_cte_core_ext>
     )
 
-    # Configure telemetry test with runtime initialization
-    # Uses the same config as ADIOS2 adapter tests
-    # CRITICAL: Put conda libs FIRST in LD_LIBRARY_PATH to avoid OpenSSL version conflicts
+    # Use the same ADIOS2 adapter config (it already has a clio_cte_core
+    # compose entry with a RAM storage tier so PutBlob/GetBlob work).
+    # LD_LIBRARY_PATH is left empty here so the loader falls back to
+    # the .so's rpath ($ORIGIN); previous attempts to pin it to a
+    # conda prefix broke the import outright on systems without that
+    # prefix.
     set_tests_properties(
         python_telemetry_test
         PROPERTIES
         LABELS "python;bindings;telemetry"
         TIMEOUT 180
-        ENVIRONMENT "CHI_WITH_RUNTIME=1;CHI_SERVER_CONF=${CMAKE_SOURCE_DIR}/context-transfer-engine/test/unit/adapters/adios2/cte_config.yaml;LD_LIBRARY_PATH=/home/iowarp/miniconda3/lib;CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500"
+        ENVIRONMENT "CLIO_WITH_RUNTIME=1;CLIO_SERVER_CONF=${CMAKE_SOURCE_DIR}/context-transfer-engine/test/unit/adapters/adios2/cte_config.yaml;CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500"
     )
 
     # Ensure test depends on the built module
