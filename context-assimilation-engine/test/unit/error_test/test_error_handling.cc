@@ -81,12 +81,15 @@ namespace fs = std::filesystem;
 using namespace std::chrono_literals;
 
 // Storage configuration
-const std::string kTestStoragePath = "/tmp/cae_error_test_storage.dat";
+const std::string kTestStoragePath =
+    (fs::temp_directory_path() / "cae_error_test_storage.dat").string();
 const chi::u64 kTestTargetSize = 100 * 1024 * 1024;  // 100MB
 
 // Test configuration
-const std::string kTestFileName = "/tmp/test_error_handling_file.bin";
-const std::string kNonExistentFile = "/tmp/nonexistent_file_12345.bin";
+const std::string kTestFileName =
+    (fs::temp_directory_path() / "test_error_handling_file.bin").string();
+const std::string kNonExistentFile =
+    (fs::temp_directory_path() / "nonexistent_file_12345.bin").string();
 
 /**
  * Generate a small test file

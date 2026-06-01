@@ -68,12 +68,20 @@
 #include <cstring>
 #include <vector>
 #include <cstdio>
+#include <filesystem>
 
 #ifdef CLIO_CAE_ENABLE_HDF5
 #include <hdf5.h>
 #endif
 
 using namespace clio::cae::core;
+
+// Build a writable temp-file path that is valid on all platforms (there is
+// no /tmp on Windows). Used by the runtime-integration export tests that
+// actually open the output file for writing.
+static std::string ExportTmpPath(const std::string &name) {
+  return (std::filesystem::temp_directory_path() / name).string();
+}
 
 // ---------------------------------------------------------------------------
 // Test fixture
@@ -314,7 +322,7 @@ TEST_CASE("ExportData - Empty tag returns success with 0 bytes",
   // Tag does not exist yet; GetOrCreateTag will create it with no blobs.
   clio::cae::core::Client cae(clio::cae::core::kCaePoolId);
   auto fut = cae.AsyncExportData("export_empty_tag_xyz_001",
-                                 "/tmp/cae_export_empty.bin", "binary");
+                                 ExportTmpPath("cae_export_empty.bin"), "binary");
   fut.Wait();
 
   // blob_names will be empty → success, 0 bytes exported
@@ -328,7 +336,7 @@ TEST_CASE("ExportData - Binary export roundtrip", "[cae][export][runtime][binary
   ExportDataFixture f;
 
   const std::string tag_name  = "export_binary_roundtrip_tag";
-  const std::string out_path  = "/tmp/cae_export_binary_roundtrip.bin";
+  const std::string out_path  = ExportTmpPath("cae_export_binary_roundtrip.bin");
 
   // Put two blobs with known data
   std::vector<uint8_t> data_a = {0xDE, 0xAD, 0xBE, 0xEF};
@@ -401,7 +409,7 @@ TEST_CASE("ExportData - HDF5 export roundtrip", "[cae][export][runtime][hdf5]") 
   ExportDataFixture f;
 
   const std::string tag_name = "export_hdf5_roundtrip_tag";
-  const std::string out_path = "/tmp/cae_export_hdf5_roundtrip.h5";
+  const std::string out_path = ExportTmpPath("cae_export_hdf5_roundtrip.h5");
 
   std::vector<uint8_t> data1 = {10, 20, 30, 40};
   std::vector<uint8_t> data2 = {50, 60, 70};
@@ -818,7 +826,7 @@ TEST_CASE("ExportData - Unknown format falls through to binary",
   ExportDataFixture f;
 
   const std::string tag_name = "export_unknown_fmt_tag";
-  const std::string out_path = "/tmp/cae_export_unknown_fmt.bin";
+  const std::string out_path = ExportTmpPath("cae_export_unknown_fmt.bin");
 
   std::vector<uint8_t> data = {0xAA, 0xBB, 0xCC};
   f.PutBlob(tag_name, "blob_unk", data);
@@ -842,7 +850,7 @@ TEST_CASE("ExportData - Binary export with multiple large blobs",
   ExportDataFixture f;
 
   const std::string tag_name = "export_multi_blob_tag";
-  const std::string out_path = "/tmp/cae_export_multi_blob.bin";
+  const std::string out_path = ExportTmpPath("cae_export_multi_blob.bin");
 
   // Three blobs with distinct sizes
   std::vector<uint8_t> d1(64, 0x11);

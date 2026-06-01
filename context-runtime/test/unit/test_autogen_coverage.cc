@@ -17,6 +17,7 @@
 #include <string>
 #include <sstream>
 #include <vector>
+#include <filesystem>
 #include "clio_ctp/data_structures/serialization/global_serialize.h"
 
 // Include CLIO Runtime headers
@@ -12778,7 +12779,10 @@ compression:
     clio::cte::core::Config config;
     config.SetParameterFromString("target_stat_interval_ms", "2500");
     config.SetParameterFromString("neighborhood", "8");
-    std::string path = "/tmp/test_cte_config_roundtrip.yaml";
+    std::string path =
+        (std::filesystem::temp_directory_path() /
+         "test_cte_config_roundtrip.yaml")
+            .string();
     bool saved = config.SaveToFile(path);
     REQUIRE(saved == true);
     clio::cte::core::Config config2;

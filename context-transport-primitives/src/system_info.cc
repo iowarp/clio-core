@@ -441,9 +441,20 @@ std::string SystemInfo::GetMemfdDir() {
   if (override_dir && *override_dir) {
     return std::string(override_dir);
   }
+#if CTP_ENABLE_WINDOWS_SYSINFO
+  // Windows has no /tmp and uses USERNAME (not USER). Anchor the per-user
+  // bookkeeping dir under the system temp directory (%TMP%/%TEMP%).
+  const char *user = getenv("USERNAME");
+  if (!user) user = "unknown";
+  std::error_code ec;
+  std::filesystem::path base = std::filesystem::temp_directory_path(ec);
+  if (ec) base = std::filesystem::path(".");
+  return (base / (std::string("chimaera_") + user)).string();
+#else
   const char *user = getenv("USER");
   if (!user) user = "unknown";
   return std::string("/tmp/chimaera_") + user;
+#endif
 }
 
 std::string SystemInfo::GetMemfdPath(const std::string &name) {
@@ -459,6 +470,9 @@ void SystemInfo::EnsureMemfdDir() {
   std::string dir = GetMemfdDir();
 #if CTP_ENABLE_PROCFS_SYSINFO && __linux__
   mkdir(dir.c_str(), 0700);
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  std::error_code ec;
+  std::filesystem::create_directories(dir, ec);
 #endif
 }
 

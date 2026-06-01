@@ -74,10 +74,14 @@
 // Logging
 #include <clio_ctp/util/logging.h>
 
+#include <filesystem>
+
 // Test configuration
 constexpr size_t kDefaultFileSizeMB = 256;
 constexpr size_t kMB = 1024 * 1024;
-const std::string kTestFileName = "/tmp/test_binary_assim_file.bin";
+const std::string kTestFileName =
+    (std::filesystem::temp_directory_path() / "test_binary_assim_file.bin")
+        .string();
 const std::string kTestTagName = "test_binary_assim_tag";
 
 /**

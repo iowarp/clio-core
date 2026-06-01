@@ -9,8 +9,9 @@ using namespace clio::cte::core;
 
 // Helper function to create a temporary file path
 std::string GetTempFile(const std::string& name) {
-  return "/tmp/" + name + "_" + std::to_string(std::time(nullptr)) + "_" +
-         std::to_string(rand());
+  std::string fname = name + "_" + std::to_string(std::time(nullptr)) + "_" +
+                      std::to_string(rand());
+  return (std::filesystem::temp_directory_path() / fname).string();
 }
 
 // Helper function to clean up temp files

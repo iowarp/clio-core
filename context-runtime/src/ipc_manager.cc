@@ -388,7 +388,10 @@ bool IpcManager::ServerInit() {
     }
 
     try {
-      // IPC server on Unix domain socket
+      // IPC server on Unix domain socket. Ensure the per-user bookkeeping
+      // directory exists first -- on Windows it lives under %TEMP% and is
+      // not created by default, so binding the socket would otherwise fail.
+      ctp::SystemInfo::EnsureMemfdDir();
       std::string ipc_path =
           ctp::SystemInfo::GetMemfdPath("chimaera_" + std::to_string(port) + ".ipc");
       client_ipc_transport_ = ctp::lbm::TransportFactory::Get(
