@@ -19,6 +19,9 @@ jobs:
           - os: windows-2022
             triplet: x64-windows
             arch: x64
+          - os: windows-2025
+            triplet: x64-windows
+            arch: x64
           - os: windows-11-arm
             triplet: arm64-windows
             arch: ARM64
