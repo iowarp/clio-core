@@ -9,14 +9,25 @@ on:
 
 jobs:
   windows-build-and-test:
-    runs-on: windows-latest
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            triplet: x64-windows
+            arch: x64
+          - os: windows-11-arm
+            triplet: arm64-windows
+            arch: ARM64
     env:
-      VCPKG_DEFAULT_TRIPLET: x64-windows
+      VCPKG_DEFAULT_TRIPLET: ${{ matrix.triplet }}
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v5
+      uses: actions/checkout@v6
       with:
         submodules: recursive
 
@@ -28,8 +39,9 @@ jobs:
 
     - name: Configure CMake
       run: |
-        cmake -B build -G "Visual Studio 17 2022" -A x64 `
+        cmake -B build -G "Visual Studio 17 2022" -A ${{ matrix.arch }} `
           -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
+          -DVCPKG_TARGET_TRIPLET="${{ matrix.triplet }}" `
           -DVCPKG_MANIFEST_DIR="${{ github.workspace }}/installers/vcpkg" `
           -DCMAKE_BUILD_TYPE=Debug `
           -DWRP_CORE_ENABLE_RUNTIME=ON `
@@ -53,3 +65,7 @@ jobs:
 
     - name: Run tests
       run: ctest --test-dir build --build-config Debug --output-on-failure --timeout 120
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
