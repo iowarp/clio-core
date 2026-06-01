@@ -5,3 +5,10 @@
 # Python version (inherits from environment)
 python:
   - 3.12
+
+# Bump the macOS x86_64 deployment target. conda-forge's osx-64 default is
+# 10.9, but nanobind uses C++17 aligned new/delete which is only available on
+# macOS 10.13+, so the Intel-mac build fails to compile nanobind. osx-arm64
+# already defaults to 11.0, so it is unaffected and intentionally left alone.
+MACOSX_DEPLOYMENT_TARGET:
+  - '10.13'                # [osx and x86_64]

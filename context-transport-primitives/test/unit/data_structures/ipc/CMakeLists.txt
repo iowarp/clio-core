@@ -103,10 +103,13 @@ set_tests_properties(
   PROPERTIES TIMEOUT 15
 )
 
-# MPMC pop-stress test is heavier (more threads / more items) than MPSC.
+# MPMC pop-stress test is heavier (more threads / more items) than MPSC, and
+# the locked Pop() path is slow under contention on the 2-core windows-2022
+# runner (ran 30.11s there while finishing well under 30s on windows-2025 and
+# windows-11-arm), so give it generous headroom.
 set_tests_properties(
   ctp_ring_buffer_mpmc
-  PROPERTIES TIMEOUT 30
+  PROPERTIES TIMEOUT 120
 )
 
 # Skip under MSan: slist/rb_tree tests use precompiled Catch2 which
