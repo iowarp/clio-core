@@ -47,21 +47,22 @@ jobs:
           -DVCPKG_TARGET_TRIPLET="${{ matrix.triplet }}" `
           -DVCPKG_MANIFEST_DIR="${{ github.workspace }}/installers/vcpkg" `
           -DCMAKE_BUILD_TYPE=Debug `
-          -DWRP_CORE_ENABLE_RUNTIME=ON `
-          -DWRP_CORE_ENABLE_CTE=ON `
-          -DWRP_CORE_ENABLE_CAE=ON `
-          -DWRP_CORE_ENABLE_CEE=OFF `
-          -DWRP_CORE_ENABLE_TESTS=ON `
-          -DWRP_CORE_ENABLE_PYTHON=OFF `
-          -DWRP_CORE_ENABLE_ZMQ=ON `
-          -DWRP_CORE_ENABLE_CEREAL=ON `
-          -DWRP_CORE_ENABLE_CONDA=OFF `
-          -DWRP_CORE_ENABLE_ELF=OFF `
-          -DWRP_CORE_ENABLE_RPATH=OFF `
-          -DWRP_CORE_ENABLE_HDF5=OFF `
-          -DWRP_CORE_ENABLE_BENCHMARKS=OFF `
+          -DCLIO_CORE_ENABLE_RUNTIME=ON `
+          -DCLIO_CORE_ENABLE_CTE=ON `
+          -DCLIO_CORE_ENABLE_CAE=ON `
+          -DCLIO_CORE_ENABLE_CEE=OFF `
+          -DCLIO_CORE_ENABLE_TESTS=ON `
+          -DCLIO_CORE_ENABLE_PYTHON=OFF `
+          -DCLIO_CORE_ENABLE_ZMQ=ON `
+          -DCLIO_CORE_ENABLE_CEREAL=ON `
+          -DCLIO_CORE_ENABLE_CONDA=OFF `
+          -DCLIO_CORE_ENABLE_ELF=OFF `
+          -DCLIO_CORE_ENABLE_RPATH=OFF `
+          -DCLIO_CTE_ENABLE_VFD=OFF `
+          -DCLIO_CTE_ENABLE_HDF5_VOL=OFF `
+          -DCLIO_CORE_ENABLE_BENCHMARKS=OFF `
           -DCMAKE_EXPORT_COMPILE_COMMANDS=ON `
-          -DHSHM_LOG_LEVEL=0
+          -DCLIO_CTP_LOG_LEVEL=0
 
     - name: Build
       run: cmake --build build --config Debug -j $env:NUMBER_OF_PROCESSORS
