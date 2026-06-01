@@ -44,11 +44,24 @@
 
 #include "simple_test.h"
 
+#include <filesystem>
+
+// Portable temp paths -- there is no /tmp on Windows. The bdev pool_name is
+// both written into the YAML and compared against the parsed value, so it
+// must come from a single source of truth.
+static std::string ComposeConfigPath() {
+  return (std::filesystem::temp_directory_path() / "test_compose_config.yaml")
+      .string();
+}
+static std::string ComposeBdevPath() {
+  return (std::filesystem::temp_directory_path() / "test_bdev.dat").string();
+}
+
 /**
  * Create a temporary compose configuration file
  */
 std::string CreateComposeConfig() {
-    std::string config_path = "/tmp/test_compose_config.yaml";
+    std::string config_path = ComposeConfigPath();
     std::ofstream config_file(config_path);
 
     config_file << "# Test compose configuration\n";
@@ -60,7 +73,8 @@ std::string CreateComposeConfig() {
     config_file << "\n";
     config_file << "compose:\n";
     config_file << "- mod_name: clio_bdev\n";
-    config_file << "  pool_name: /tmp/test_bdev.dat\n";
+    // Single-quote so Windows backslashes/drive-colon are taken literally.
+    config_file << "  pool_name: '" << ComposeBdevPath() << "'\n";
     config_file << "  pool_query: dynamic\n";
     config_file << "  pool_id: 200.0\n";
     config_file << "  capacity: 10MB\n";
@@ -130,11 +144,11 @@ TEST_CASE("Parse compose configuration", "[compose]") {
   // (there may be more from server initialization)
   REQUIRE(compose_config.pools_.size() >= 1);
 
-  // Find our test pool configuration (clio_bdev with pool_name /tmp/test_bdev.dat)
+  // Find our test pool configuration (clio_bdev with the temp bdev path)
   bool found_test_pool = false;
   for (const auto& pool_config : compose_config.pools_) {
     if (pool_config.mod_name_ == "clio_bdev" &&
-        pool_config.pool_name_ == "/tmp/test_bdev.dat") {
+        pool_config.pool_name_ == ComposeBdevPath()) {
       // Verify pool configuration
       REQUIRE(pool_config.pool_id_.major_ == 200);
       REQUIRE(pool_config.pool_id_.minor_ == 0);

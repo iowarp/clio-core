@@ -292,6 +292,13 @@ int main(int argc, char* argv[]) {
       return 1;
     }
 
+    // The OMNI file hardcodes a /tmp source path, but the test data file is
+    // generated under the portable temp dir (no /tmp on Windows). Point the
+    // transfer source at the file we actually wrote.
+    for (auto& ctx : contexts) {
+      ctx.src = "file::" + kTestFileName;
+    }
+
     // Step 5: Call ParseOmni (serialization happens transparently in ParseOmniTask)
     HLOG(kInfo, "[STEP 5] Calling ParseOmni...");
     auto parse_task = cae_client.AsyncParseOmni(contexts);
