@@ -46,6 +46,7 @@ jobs:
           -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
           -DVCPKG_TARGET_TRIPLET="${{ matrix.triplet }}" `
           -DVCPKG_MANIFEST_DIR="${{ github.workspace }}/installers/vcpkg" `
+          -DVCPKG_OVERLAY_PORTS="${{ github.workspace }}/installers/vcpkg/overlay-ports" `
           -DCMAKE_BUILD_TYPE=Debug `
           -DCLIO_CORE_ENABLE_RUNTIME=ON `
           -DCLIO_CORE_ENABLE_CTE=ON `
