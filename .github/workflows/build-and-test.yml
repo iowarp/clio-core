@@ -23,7 +23,23 @@ jobs:
             coverage: true
             site: ubu-24.arm64
             flags: arm64
-          - os: macos-latest
+          - os: macos-14
+            coverage: false
+            site: ''
+            flags: ''
+          - os: macos-15
+            coverage: false
+            site: ''
+            flags: ''
+          - os: macos-15-intel
+            coverage: false
+            site: ''
+            flags: ''
+          - os: macos-26
+            coverage: false
+            site: ''
+            flags: ''
+          - os: macos-26-intel
             coverage: false
             site: ''
             flags: ''
