@@ -482,10 +482,15 @@ void TestMultiClientWithEM() {
   std::string addr = "127.0.0.1";
   int port = 9110;
 
+  // em must outlive every transport registered to it: ~SocketTransport
+  // calls em_->RemoveEvent(), touching the manager's fd_to_reg_ map. Declare
+  // it first so reverse-order destruction tears the server down before em.
+  // (Otherwise the server's dtor dereferences a freed EventManager -- benign
+  // on libstdc++ but a hard crash on libc++/macOS.)
+  EventManager em;
   auto server = std::make_unique<SocketTransport>(
       TransportMode::kServer, addr, "tcp", port);
 
-  EventManager em;
   server->RegisterEventManager(em);
 
   auto client1 = std::make_unique<SocketTransport>(
