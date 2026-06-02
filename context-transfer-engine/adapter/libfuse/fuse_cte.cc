@@ -37,7 +37,10 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <cerrno>                 // errno
+#include <cstdio>                 // snprintf, fprintf
 
+#ifndef _WIN32
 #include <fuse3/fuse_lowlevel.h>  // fuse_session_custom_io, struct fuse_custom_io
 #include <dlfcn.h>                // dlsym (resolve fuse_session_custom_io at runtime
                                   // so we can link against system libfuse 3.10.5
@@ -46,11 +49,23 @@
 #include <sys/uio.h>              // struct iovec, writev
 #include <sys/mount.h>            // mount syscall
 #include <unistd.h>               // read, getuid, getgid
-#include <cerrno>                 // errno
-#include <cstdio>                 // snprintf, fprintf
+#endif
 
 #include "clio_runtime/clio_runtime.h"
 #include "clio_cte/core/content_transfer_engine.h"
+
+// Bridge the POSIX type spellings the callbacks use to the concrete types
+// each platform's FUSE layer expects in `struct fuse_operations`. On Linux
+// (libfuse) the high-level API uses the POSIX types directly; on Windows the
+// shim maps them to WinFsp's fuse_* types and supplies getuid/getgid/S_IF*.
+#ifdef _WIN32
+#include "fuse_win_compat.h"
+#else
+using cte_stat_t = struct stat;
+using cte_off_t = off_t;
+using cte_mode_t = mode_t;
+using cte_timespec_t = struct timespec;
+#endif
 
 using namespace clio::cae::fuse;
 
@@ -90,10 +105,10 @@ static void cte_fuse_destroy(void *private_data) {
 // Metadata
 // ============================================================================
 
-static int cte_fuse_getattr(const char *path, struct stat *stbuf,
+static int cte_fuse_getattr(const char *path, cte_stat_t *stbuf,
                             struct fuse_file_info *fi) {
   (void)fi;
-  memset(stbuf, 0, sizeof(struct stat));
+  memset(stbuf, 0, sizeof(*stbuf));
 
   std::string p(path);
 
@@ -125,14 +140,14 @@ static int cte_fuse_getattr(const char *path, struct stat *stbuf,
     stbuf->st_nlink = 1;
     stbuf->st_uid = getuid();
     stbuf->st_gid = getgid();
-    stbuf->st_size = static_cast<off_t>(CteGetTagSize(tag_id));
+    stbuf->st_size = static_cast<cte_off_t>(CteGetTagSize(tag_id));
     return 0;
   }
 
   return -ENOENT;
 }
 
-static int cte_fuse_utimens(const char *path, const struct timespec tv[2],
+static int cte_fuse_utimens(const char *path, const cte_timespec_t tv[2],
                             struct fuse_file_info *fi) {
   (void)path;
   (void)tv;
@@ -146,7 +161,7 @@ static int cte_fuse_utimens(const char *path, const struct timespec tv[2],
 // ============================================================================
 
 static int cte_fuse_readdir(const char *path, void *buf,
-                            fuse_fill_dir_t filler, off_t offset,
+                            fuse_fill_dir_t filler, cte_off_t offset,
                             struct fuse_file_info *fi,
                             enum fuse_readdir_flags flags) {
   (void)offset;
@@ -204,7 +219,7 @@ static int cte_fuse_readdir(const char *path, void *buf,
   return 0;
 }
 
-static int cte_fuse_mkdir(const char *path, mode_t mode) {
+static int cte_fuse_mkdir(const char *path, cte_mode_t mode) {
   (void)mode;
   std::string p(path);
   // Create a sentinel tag with a trailing "/" to mark an explicit directory.
@@ -233,7 +248,7 @@ static int cte_fuse_rmdir(const char *path) {
 // File lifecycle
 // ============================================================================
 
-static int cte_fuse_create(const char *path, mode_t mode,
+static int cte_fuse_create(const char *path, cte_mode_t mode,
                            struct fuse_file_info *fi) {
   (void)mode;
   std::string p(path);
@@ -305,7 +320,7 @@ static int cte_fuse_release(const char *path, struct fuse_file_info *fi) {
 // ============================================================================
 
 static int cte_fuse_read(const char *path, char *buf, size_t size,
-                         off_t offset, struct fuse_file_info *fi) {
+                         cte_off_t offset, struct fuse_file_info *fi) {
   (void)path;
   auto *handle = GetHandle(fi);
 
@@ -345,7 +360,7 @@ static int cte_fuse_read(const char *path, char *buf, size_t size,
 }
 
 static int cte_fuse_write(const char *path, const char *buf, size_t size,
-                          off_t offset, struct fuse_file_info *fi) {
+                          cte_off_t offset, struct fuse_file_info *fi) {
   (void)path;
   auto *handle = GetHandle(fi);
 
@@ -386,7 +401,7 @@ static int cte_fuse_unlink(const char *path) {
   return 0;
 }
 
-static int cte_fuse_truncate(const char *path, off_t size,
+static int cte_fuse_truncate(const char *path, cte_off_t size,
                              struct fuse_file_info *fi) {
   (void)fi;
   (void)size;
@@ -419,6 +434,7 @@ static const struct fuse_operations cte_fuse_ops = {
     .utimens = cte_fuse_utimens,
 };
 
+#ifndef _WIN32
 // custom_io callbacks: when apptainer hands us an already-mounted
 // /dev/fuse fd, we need to drive the FUSE protocol on that fd directly
 // instead of having libfuse mount its own. Plain read/writev syscalls
@@ -431,8 +447,17 @@ static ssize_t cte_custom_read(int fd, void *buf, size_t buf_len,
                                void * /*userdata*/) {
   return read(fd, buf, buf_len);
 }
+#endif  // _WIN32
 
 int main(int argc, char *argv[]) {
+#ifdef _WIN32
+  // Native Windows (WinFsp): there is no Apptainer-style /dev/fuse fd
+  // injection. WinFsp's fuse_main() parses argv (the mountpoint is a
+  // drive letter like "Z:" or a host directory) and drives the FUSE
+  // protocol through winfsp.sys. The 16 callbacks and the entire CTE
+  // data path below them are byte-for-byte identical to the Linux build.
+  return fuse_main(argc, argv, &cte_fuse_ops, nullptr);
+#else
   // Apptainer's --fusemount opens /dev/fuse on the host, performs the
   // kernel mount, and passes the fd to the FUSE binary as the last
   // argv ("/dev/fd/<N>"). libfuse 3's high-level argv parser doesn't
@@ -562,4 +587,5 @@ int main(int argc, char *argv[]) {
   fuse_destroy(fuse);
   fuse_opt_free_args(&args);
   return ret;
+#endif  // _WIN32
 }
