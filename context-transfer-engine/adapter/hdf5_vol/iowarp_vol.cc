@@ -15,6 +15,11 @@
 
 #include "iowarp_vol.h"
 
+#include <H5PLextern.h>     /* H5PLget_plugin_type / H5PLget_plugin_info */
+#ifdef H5_HAVE_PARALLEL
+#include <H5FDmpio.h>       /* H5Pget_dxpl_mpio (collective-IO detection) */
+#endif
+
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -273,6 +278,35 @@ static iowarp_file_t *find_parent_file(void *obj) {
   return static_cast<iowarp_obj_t *>(obj)->parent_file;
 }
 
+/**
+ * Helper: is this a whole-dataset transfer we can represent as linear CTE
+ * chunks? The blob cache is keyed by linear byte offset over the full dataset
+ * extent, so it can only correctly serve transfers covering the entire dataset
+ * contiguously (H5S_ALL on both mem and file spaces). Any hyperslab / point
+ * selection must go to the native VOL.
+ */
+static bool iowarp_is_whole_read(hid_t mem_space_id, hid_t file_space_id) {
+  return mem_space_id == H5S_ALL && file_space_id == H5S_ALL;
+}
+
+/**
+ * Helper: true when the transfer plist requests collective MPI-IO. Collective
+ * transfers must stay on the native VOL — serving some ranks from cache while
+ * others miss would desynchronise the collective call and deadlock.
+ */
+static bool iowarp_is_collective(hid_t dxpl_id) {
+#ifdef H5_HAVE_PARALLEL
+  if (dxpl_id == H5P_DEFAULT) return false;
+  H5FD_mpio_xfer_t xfer = H5FD_MPIO_INDEPENDENT;
+  if (H5Pget_dxpl_mpio(dxpl_id, &xfer) >= 0 && xfer == H5FD_MPIO_COLLECTIVE) {
+    return true;
+  }
+#else
+  (void)dxpl_id;
+#endif
+  return false;
+}
+
 static void *iowarp_dataset_create(void *obj,
                                    const H5VL_loc_params_t *loc_params,
                                    const char *name, hid_t lcpl_id,
@@ -336,10 +370,13 @@ static herr_t iowarp_dataset_write(size_t count, void *dset[],
     auto *dataset = static_cast<iowarp_dataset_t *>(dset[d]);
     if (!dataset || !buf[d]) continue;
 
-    /* If no file reference (opened from group), fall through to native.
-       HDF5 2.x signature: (count, dset[], connector_id, mem_type_id[],
-       mem_space_id[], file_space_id[], plist_id, buf[], req) */
-    if (!dataset->file) {
+    /* Only whole-dataset, independent writes can be represented in the linear
+       CTE chunk cache. For no-file-reference, partial (hyperslab), or
+       collective writes, persist to the native VOL only — caching a partial
+       write under a whole-dataset key would poison a later whole read. */
+    if (!dataset->file ||
+        !iowarp_is_whole_read(mem_space_id[d], file_space_id[d]) ||
+        iowarp_is_collective(dxpl_id)) {
       H5VLdataset_write(1, &dataset->obj.under_object,
                          dataset->obj.under_vol_id,
                          &mem_type_id[d], &mem_space_id[d], &file_space_id[d],
@@ -399,8 +436,16 @@ static herr_t iowarp_dataset_write(size_t count, void *dset[],
 }
 
 /**
- * Dataset read: chunk requests into async GetBlob calls,
- * wait for all, then assemble into output buffer.
+ * Dataset read — CTE read-through cache.
+ *
+ * For whole-dataset, independent reads the data is served from the CTE tier
+ * when present (cache hit). On a miss the read is satisfied by the native VOL
+ * (the source of truth) and the buffer is then staged into the tier so the
+ * next read of the same dataset hits. This is the key correctness fix over the
+ * original connector, which served reads ONLY from CTE blobs — returning
+ * zero-filled buffers for any pre-existing native file whose data was never
+ * written through the connector. All non-whole / collective reads pass through
+ * to the native VOL unchanged.
  */
 static herr_t iowarp_dataset_read(size_t count, void *dset[],
                                   hid_t mem_type_id[],
@@ -414,10 +459,12 @@ static herr_t iowarp_dataset_read(size_t count, void *dset[],
     auto *dataset = static_cast<iowarp_dataset_t *>(dset[d]);
     if (!dataset || !buf[d]) continue;
 
-    /* If no file reference, fall through to native. HDF5 2.x signature:
-       (count, dset[], connector_id, mem_type_id[], mem_space_id[],
-        file_space_id[], plist_id, buf[], req) */
-    if (!dataset->file) {
+    /* Native passthrough when there is no file reference, the selection is
+       partial, or the read is collective. The native VOL always produces
+       correct data; only the whole/independent case is cacheable. */
+    if (!dataset->file ||
+        !iowarp_is_whole_read(mem_space_id[d], file_space_id[d]) ||
+        iowarp_is_collective(dxpl_id)) {
       H5VLdataset_read(1, &dataset->obj.under_object,
                         dataset->obj.under_vol_id,
                         &mem_type_id[d], &mem_space_id[d], &file_space_id[d],
@@ -425,18 +472,23 @@ static herr_t iowarp_dataset_read(size_t count, void *dset[],
       continue;
     }
 
-    /* Compute total data size */
-    hid_t space = mem_space_id[d];
-    if (space == H5S_ALL) {
-      H5VL_dataset_get_args_t get_args;
-      get_args.op_type = H5VL_DATASET_GET_SPACE;
-      get_args.args.get_space.space_id = H5I_INVALID_HID;
-      H5VLdataset_get(dataset->obj.under_object, dataset->obj.under_vol_id,
-                       &get_args, dxpl_id, nullptr);
-      space = get_args.args.get_space.space_id;
+    /* Whole, independent read → size the dataset from its native dataspace. */
+    H5VL_dataset_get_args_t get_args;
+    get_args.op_type = H5VL_DATASET_GET_SPACE;
+    get_args.args.get_space.space_id = H5I_INVALID_HID;
+    H5VLdataset_get(dataset->obj.under_object, dataset->obj.under_vol_id,
+                     &get_args, dxpl_id, nullptr);
+    hid_t space = get_args.args.get_space.space_id;
+    hssize_t nelem = (space >= 0) ? H5Sget_simple_extent_npoints(space) : -1;
+    if (space >= 0) H5Sclose(space);
+    if (nelem <= 0) {
+      /* Can't size it — fall back to native for safety. */
+      H5VLdataset_read(1, &dataset->obj.under_object,
+                        dataset->obj.under_vol_id,
+                        &mem_type_id[d], &mem_space_id[d], &file_space_id[d],
+                        dxpl_id, &buf[d], req);
+      continue;
     }
-    hssize_t nelem = H5Sget_simple_extent_npoints(space);
-    if (nelem <= 0) continue;
 
     size_t type_size = H5Tget_size(mem_type_id[d]);
     size_t total_size = static_cast<size_t>(nelem) * type_size;
@@ -444,35 +496,58 @@ static herr_t iowarp_dataset_read(size_t count, void *dset[],
     size_t num_chunks = (total_size + chunk_size - 1) / chunk_size;
     char *dst = static_cast<char *>(buf[d]);
 
-    /* Submit async GetBlob for each chunk */
-    std::vector<chi::Future<clio::cte::core::GetBlobTask>> futures;
-    std::vector<ctp::ipc::FullPtr<char>> buffers;
-
-    for (size_t i = 0; i < num_chunks; ++i) {
-      size_t offset = i * chunk_size;
-      size_t this_size = std::min(chunk_size, total_size - offset);
-
-      auto buffer = CLIO_IPC->AllocateBuffer(this_size);
-      if (buffer.IsNull()) return -1;
-
-      ctp::ipc::ShmPtr<> blob_data = buffer.shm_.template Cast<void>();
-      std::string blob_name = dataset->dataset_path + "/chunk_" +
-                              std::to_string(i);
-
-      auto future = cte_client->AsyncGetBlob(
-          dataset->file->tag_id, blob_name, offset, this_size,
-          0, blob_data);
-
-      futures.push_back(std::move(future));
-      buffers.push_back(std::move(buffer));
+    /* Hit test: a fully-populated cache always has a non-empty chunk_0. */
+    chi::u64 cached = 0;
+    {
+      auto sz = cte_client->AsyncGetBlobSize(
+          dataset->file->tag_id, dataset->dataset_path + "/chunk_0");
+      sz.Wait();
+      cached = sz->size_;
     }
 
-    /* Wait for all chunks and copy to output */
-    for (size_t i = 0; i < futures.size(); ++i) {
-      futures[i].Wait();
-      size_t offset = i * chunk_size;
-      size_t this_size = std::min(chunk_size, total_size - offset);
-      std::memcpy(dst + offset, buffers[i].ptr_, this_size);
+    if (cached == 0) {
+      /* MISS — native read is the source of truth, then stage into the tier. */
+      herr_t rc = H5VLdataset_read(1, &dataset->obj.under_object,
+                                   dataset->obj.under_vol_id,
+                                   &mem_type_id[d], &mem_space_id[d],
+                                   &file_space_id[d], dxpl_id, &buf[d], req);
+      if (rc < 0) return rc;
+      for (size_t i = 0; i < num_chunks; ++i) {
+        size_t offset = i * chunk_size;
+        size_t this_size = std::min(chunk_size, total_size - offset);
+        auto buffer = CLIO_IPC->AllocateBuffer(this_size);
+        if (buffer.IsNull()) break;            /* caching is best-effort */
+        std::memcpy(buffer.ptr_, dst + offset, this_size);
+        ctp::ipc::ShmPtr<> blob_data = buffer.shm_.template Cast<void>();
+        std::string blob_name = dataset->dataset_path + "/chunk_" +
+                                std::to_string(i);
+        auto fut = cte_client->AsyncPutBlob(
+            dataset->file->tag_id, blob_name, offset, this_size, blob_data,
+            -1.0f, clio::cte::core::Context(), 0);
+        fut.Wait();
+      }
+    } else {
+      /* HIT — serve every chunk from the CTE tier. */
+      std::vector<chi::Future<clio::cte::core::GetBlobTask>> futures;
+      std::vector<ctp::ipc::FullPtr<char>> buffers;
+      for (size_t i = 0; i < num_chunks; ++i) {
+        size_t offset = i * chunk_size;
+        size_t this_size = std::min(chunk_size, total_size - offset);
+        auto buffer = CLIO_IPC->AllocateBuffer(this_size);
+        if (buffer.IsNull()) return -1;
+        ctp::ipc::ShmPtr<> blob_data = buffer.shm_.template Cast<void>();
+        std::string blob_name = dataset->dataset_path + "/chunk_" +
+                                std::to_string(i);
+        futures.push_back(cte_client->AsyncGetBlob(
+            dataset->file->tag_id, blob_name, offset, this_size, 0, blob_data));
+        buffers.push_back(std::move(buffer));
+      }
+      for (size_t i = 0; i < futures.size(); ++i) {
+        futures[i].Wait();
+        size_t offset = i * chunk_size;
+        size_t this_size = std::min(chunk_size, total_size - offset);
+        std::memcpy(dst + offset, buffers[i].ptr_, this_size);
+      }
     }
   }
 
@@ -729,6 +804,64 @@ static herr_t iowarp_object_specific(void *obj,
                               args, dxpl_id, req);
 }
 
+/* Datatype — passthrough. neuroh5/MiV store committed named datatypes under
+   /H5Types (population enums, etc.) and open them with H5Topen; without these
+   callbacks the connector's datatype_cls is all-null and every H5Topen through
+   the VOL fails. Every op delegates to the native VOL. */
+static void *iowarp_datatype_commit(void *obj,
+                                    const H5VL_loc_params_t *loc_params,
+                                    const char *name, hid_t type_id,
+                                    hid_t lcpl_id, hid_t tcpl_id,
+                                    hid_t tapl_id, hid_t dxpl_id, void **req) {
+  auto *o = static_cast<iowarp_obj_t *>(obj);
+  void *under = H5VLdatatype_commit(o->under_object, loc_params, o->under_vol_id,
+                                     name, type_id, lcpl_id, tcpl_id, tapl_id,
+                                     dxpl_id, req);
+  if (!under) return nullptr;
+  auto *dt = new iowarp_obj_t;
+  dt->under_object = under;
+  dt->under_vol_id = o->under_vol_id;
+  dt->parent_file = o->parent_file;
+  return dt;
+}
+
+static void *iowarp_datatype_open(void *obj,
+                                  const H5VL_loc_params_t *loc_params,
+                                  const char *name, hid_t tapl_id,
+                                  hid_t dxpl_id, void **req) {
+  auto *o = static_cast<iowarp_obj_t *>(obj);
+  void *under = H5VLdatatype_open(o->under_object, loc_params, o->under_vol_id,
+                                   name, tapl_id, dxpl_id, req);
+  if (!under) return nullptr;
+  auto *dt = new iowarp_obj_t;
+  dt->under_object = under;
+  dt->under_vol_id = o->under_vol_id;
+  dt->parent_file = o->parent_file;
+  return dt;
+}
+
+static herr_t iowarp_datatype_get(void *obj, H5VL_datatype_get_args_t *args,
+                                  hid_t dxpl_id, void **req) {
+  auto *o = static_cast<iowarp_obj_t *>(obj);
+  return H5VLdatatype_get(o->under_object, o->under_vol_id, args, dxpl_id, req);
+}
+
+static herr_t iowarp_datatype_specific(void *obj,
+                                       H5VL_datatype_specific_args_t *args,
+                                       hid_t dxpl_id, void **req) {
+  auto *o = static_cast<iowarp_obj_t *>(obj);
+  return H5VLdatatype_specific(o->under_object, o->under_vol_id, args, dxpl_id,
+                                req);
+}
+
+static herr_t iowarp_datatype_close(void *obj, hid_t dxpl_id, void **req) {
+  auto *o = static_cast<iowarp_obj_t *>(obj);
+  herr_t ret = H5VLdatatype_close(o->under_object, o->under_vol_id, dxpl_id,
+                                   req);
+  delete o;
+  return ret;
+}
+
 /* Introspect */
 static herr_t iowarp_introspect_get_conn_cls(void *obj,
                                              H5VL_get_conn_lvl_t lvl,
@@ -808,7 +941,12 @@ const H5VL_class_t H5VL_iowarp_cls = {
     },
 
     /* datatype_cls */ {
-        nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+        /* commit   */ iowarp_datatype_commit,
+        /* open     */ iowarp_datatype_open,
+        /* get      */ iowarp_datatype_get,
+        /* specific */ iowarp_datatype_specific,
+        /* optional */ nullptr,
+        /* close    */ iowarp_datatype_close,
     },
 
     /* file_cls */ {
@@ -871,3 +1009,21 @@ const H5VL_class_t H5VL_iowarp_cls = {
 hid_t H5VL_iowarp_register(void) {
   return H5VLregister_connector(&H5VL_iowarp_cls, H5P_DEFAULT);
 }
+
+/* ========================================================================
+ * HDF5 plugin entry points
+ *
+ * These two exports let HDF5 discover and load the connector dynamically via
+ * the standard environment-variable mechanism — no application change needed:
+ *
+ *   export HDF5_PLUGIN_PATH=<dir containing libiowarp_hdf5_vol.so>
+ *   export HDF5_VOL_CONNECTOR="iowarp"
+ *
+ * On the first H5Fopen/H5Fcreate, HDF5 dlopen()s plugins on HDF5_PLUGIN_PATH,
+ * calls H5PLget_plugin_type() (must be H5PL_TYPE_VOL) and H5PLget_plugin_info()
+ * (returns the connector class), and matches by connector name ("iowarp").
+ * Without these the connector could only be installed by an application calling
+ * H5VL_iowarp_register() + H5Pset_vol() itself.
+ * ======================================================================== */
+extern "C" H5PL_type_t H5PLget_plugin_type(void) { return H5PL_TYPE_VOL; }
+extern "C" const void *H5PLget_plugin_info(void) { return &H5VL_iowarp_cls; }

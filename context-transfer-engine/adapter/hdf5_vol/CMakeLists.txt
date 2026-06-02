@@ -1,6 +1,13 @@
 # ------------------------------------------------------------------------------
 # IOWarp HDF5 VOL Connector
-# Requires: CLIO_CTE_ENABLE_HDF5_VOL=ON and HDF5 >= 2.0
+# Requires: CLIO_CTE_ENABLE_HDF5_VOL=ON and HDF5 >= 1.14
+#
+# NOTE: the VOL connector API this source targets (H5VL_VERSION 3, the
+# multi-dataset read/write callback signatures in H5VLconnector.h) is already
+# present and ABI-stable in HDF5 1.14.x. The previous ">= 2.0.0" floor was
+# over-conservative and excluded every HDF5 that ships with the MiV stack
+# (1.14.6 conda). Lowered to 1.14.0 so the connector builds against the same
+# HDF5 that neuroh5/MiV-Simulator link against.
 # ------------------------------------------------------------------------------
 
 if(NOT HDF5_FOUND)
@@ -8,8 +15,8 @@ if(NOT HDF5_FOUND)
   return()
 endif()
 
-if(HDF5_VERSION VERSION_LESS "2.0.0")
-  message(WARNING "HDF5 ${HDF5_VERSION} found but >= 2.0.0 required for VOL connector. "
+if(HDF5_VERSION VERSION_LESS "1.14.0")
+  message(WARNING "HDF5 ${HDF5_VERSION} found but >= 1.14.0 required for VOL connector. "
                   "HDF5 VOL adapter will not be built.")
   return()
 endif()
