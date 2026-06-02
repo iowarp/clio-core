@@ -468,7 +468,11 @@ std::string SystemInfo::GetMemfdPath(const std::string &name) {
 
 void SystemInfo::EnsureMemfdDir() {
   std::string dir = GetMemfdDir();
-#if CTP_ENABLE_PROCFS_SYSINFO && __linux__
+#if CTP_ENABLE_PROCFS_SYSINFO
+  // All POSIX platforms (Linux, macOS, BSD) need this per-user dir to exist:
+  // it holds the file-backed shared-memory segments and the IPC Unix-domain
+  // socket. It was previously Linux-only, so on macOS the IPC socket bind
+  // failed ("failed to bind Unix socket") because the parent dir was absent.
   mkdir(dir.c_str(), 0700);
 #elif CTP_ENABLE_WINDOWS_SYSINFO
   std::error_code ec;
@@ -500,7 +504,18 @@ bool SystemInfo::CreateNewSharedMemory(File &fd, const std::string &name,
   }
   return true;
 #else
-  fd.posix_fd_ = shm_open(name.c_str(), O_CREAT | O_RDWR, 0666);
+  // macOS / BSD: POSIX shm_open() names are capped at PSHMNAMLEN (31 chars
+  // on macOS) and shm objects live in an anonymous namespace with no
+  // filesystem path, so the per-user readiness probes and tooling that
+  // expect /tmp/chimaera_$USER/<name> (mirroring Linux's memfd symlink)
+  // never observe the segment -- WaitForServer() then times out, the test
+  // leaves an orphaned server holding the port, and every later test fails
+  // with "Address already in use". Back the segment with a regular file in
+  // the memfd dir instead: arbitrary-length names, an openable path for
+  // cross-process attach, and MAP_SHARED gives identical semantics.
+  EnsureMemfdDir();
+  std::string shm_path = GetMemfdPath(name);
+  fd.posix_fd_ = open(shm_path.c_str(), O_CREAT | O_RDWR, 0600);
   if (fd.posix_fd_ < 0) {
     return false;
   }
@@ -536,7 +551,10 @@ bool SystemInfo::OpenSharedMemory(File &fd, const std::string &name) {
   fd.posix_fd_ = open(memfd_path.c_str(), O_RDWR);
   return fd.posix_fd_ >= 0;
 #else
-  fd.posix_fd_ = shm_open(name.c_str(), O_RDWR, 0666);
+  // macOS / BSD: attach to the file-backed segment created by
+  // CreateNewSharedMemory (see the rationale there).
+  std::string shm_path = GetMemfdPath(name);
+  fd.posix_fd_ = open(shm_path.c_str(), O_RDWR);
   return fd.posix_fd_ >= 0;
 #endif
 #elif CTP_ENABLE_WINDOWS_SYSINFO
@@ -561,7 +579,9 @@ void SystemInfo::DestroySharedMemory(const std::string &name) {
   std::string memfd_path = GetMemfdPath(name);
   unlink(memfd_path.c_str());
 #else
-  shm_unlink(name.c_str());
+  // macOS / BSD: the segment is a regular file in the memfd dir.
+  std::string shm_path = GetMemfdPath(name);
+  unlink(shm_path.c_str());
 #endif
 #elif CTP_ENABLE_WINDOWS_SYSINFO
 #endif
