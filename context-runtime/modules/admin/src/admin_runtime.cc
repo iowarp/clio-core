@@ -192,11 +192,19 @@ static inline uint64_t HrtNs() {
 // Method implementations
 //===========================================================================
 
-Runtime::~Runtime() {
-  // Signal dedicated recv threads to exit and join them.
+void Runtime::StopRecvThreads() {
+  // Signal dedicated recv threads to exit and join them. The threads cache a
+  // raw pointer to the main transport, so they MUST be joined before
+  // IpcManager::ClearTransports() frees it (see RegisterTransportShutdownHook).
   recv_shutdown_.store(true, std::memory_order_release);
   if (peer_recv_thread_.joinable()) peer_recv_thread_.join();
   if (client_recv_thread_.joinable()) client_recv_thread_.join();
+}
+
+Runtime::~Runtime() {
+  // Backstop: normally the IpcManager transport-shutdown hook already joined
+  // these (while the transport was still alive). Safe to call again.
+  StopRecvThreads();
 }
 
 chi::TaskResume Runtime::Create(ctp::ipc::FullPtr<CreateTask> task,
@@ -322,6 +330,12 @@ chi::TaskResume Runtime::Create(ctp::ipc::FullPtr<CreateTask> task,
     }
     HLOG(kInfo, "[ClientRecvThread] shutting down");
   });
+
+  // Stop these recv threads at the very start of IpcManager::ClearTransports(),
+  // i.e. before the main transport they poll is freed. Without this, on
+  // shutdown the threads keep calling Recv() on a freed transport -- benign on
+  // Linux but a hard crash on macOS (busy-spin on ENOTSOCK over freed memory).
+  CLIO_IPC->RegisterTransportShutdownHook([this]() { StopRecvThreads(); });
 
   // Spawn periodic WreapDeadIpcs task with 1 second period
   // This task reaps shared memory segments from dead processes
