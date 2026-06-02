@@ -25,6 +25,7 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <mutex>
 
 #include <clio_runtime/clio_runtime.h>
 /* transport_factory_impl.h provides the inline definitions of
@@ -65,16 +66,47 @@ struct iowarp_dataset_t {
   iowarp_obj_t obj;
   iowarp_file_t *file;
   std::string dataset_path;
+  /* When false the CTE cache is bypassed and every transfer goes to the native
+     VOL. Set for datasets whose stable path is unknown (opened via the generic
+     object-open / wrap paths), so we never key a blob by an empty/ambiguous
+     name. */
+  bool cacheable;
   /* Pending async writes flushed on close */
   std::vector<chi::Future<clio::cte::core::PutBlobTask>> pending_puts;
   std::vector<ctp::ipc::FullPtr<char>> pending_buffers;
 };
+
+/* Build a dataset wrapper. Centralised so every code path that can produce a
+   dataset object (dataset_open/create, object_open, wrap_object) yields the
+   same fully-formed iowarp_dataset_t — otherwise a dataset returned as a bare
+   iowarp_obj_t would be fatally mis-cast when HDF5 later routes
+   dataset_read/close to it. */
+static iowarp_dataset_t *make_dataset_wrapper(void *under, hid_t under_vol_id,
+                                              iowarp_file_t *parent_file,
+                                              const char *path) {
+  auto *dset = new iowarp_dataset_t;
+  dset->obj.under_object = under;
+  dset->obj.under_vol_id = under_vol_id;
+  dset->file = parent_file;
+  dset->obj.parent_file = parent_file;
+  dset->dataset_path = path ? path : "";
+  dset->cacheable = (parent_file != nullptr) && path && path[0] != '\0';
+  return dset;
+}
 
 /* ========================================================================
  * Helper: Get CTE client
  * ======================================================================== */
 
 static clio::cte::core::Client *get_cte_client() {
+  /* Lazily attach this process to the running chimaera/CTE runtime on first
+     use. When HDF5 dlopen()s the connector via HDF5_VOL_CONNECTOR there is no
+     LD_PRELOAD constructor to do it (the POSIX adapter inits in
+     Filesystem::Filesystem -> CLIO_CTE_CLIENT_INIT()); without this the CTE
+     client singleton is unbound and the first AsyncGetOrCreateTag segfaults.
+     Config comes from CLIO_SERVER_CONF, same as the runtime. */
+  static std::once_flag once;
+  std::call_once(once, []() { clio::cte::core::CLIO_CTE_CLIENT_INIT(); });
   return CLIO_CTE_CLIENT;
 }
 
@@ -117,11 +149,16 @@ static herr_t iowarp_get_wrap_ctx(const void *obj, void **wrap_ctx) {
 
 static void *iowarp_wrap_object(void *under_obj, H5I_type_t obj_type,
                                 void *wrap_ctx) {
-  (void)obj_type; (void)wrap_ctx;
+  (void)wrap_ctx;
   /* For passthrough objects (groups, attributes, etc.). We don't have a
      way to recover the parent file from wrap_ctx (HDF5's wrap context
      is the native VOL's, not ours), so leave parent_file null —
-     anything created from this obj will fall back to native VOL. */
+     anything created from this obj will fall back to native VOL.
+     A wrapped *dataset* must still be a full iowarp_dataset_t (non-cacheable
+     here, since no file/path), or dataset_read/close would mis-cast it. */
+  if (obj_type == H5I_DATASET) {
+    return make_dataset_wrapper(under_obj, H5VL_NATIVE, nullptr, nullptr);
+  }
   auto *o = new iowarp_obj_t;
   o->under_object = under_obj;
   o->under_vol_id = H5VL_NATIVE;
@@ -321,14 +358,8 @@ static void *iowarp_dataset_create(void *obj,
       lcpl_id, type_id, space_id, dcpl_id, dapl_id, dxpl_id, req);
   if (!under_dset) return nullptr;
 
-  auto *dset = new iowarp_dataset_t;
-  dset->obj.under_object = under_dset;
-  dset->obj.under_vol_id = o->under_vol_id;
-  dset->file = find_parent_file(obj);
-  dset->obj.parent_file = dset->file;
-  dset->dataset_path = name ? name : "";
-
-  return dset;
+  return make_dataset_wrapper(under_dset, o->under_vol_id,
+                              find_parent_file(obj), name);
 }
 
 static void *iowarp_dataset_open(void *obj,
@@ -342,14 +373,8 @@ static void *iowarp_dataset_open(void *obj,
       dapl_id, dxpl_id, req);
   if (!under_dset) return nullptr;
 
-  auto *dset = new iowarp_dataset_t;
-  dset->obj.under_object = under_dset;
-  dset->obj.under_vol_id = o->under_vol_id;
-  dset->file = find_parent_file(obj);
-  dset->obj.parent_file = dset->file;
-  dset->dataset_path = name ? name : "";
-
-  return dset;
+  return make_dataset_wrapper(under_dset, o->under_vol_id,
+                              find_parent_file(obj), name);
 }
 
 /**
@@ -374,7 +399,7 @@ static herr_t iowarp_dataset_write(size_t count, void *dset[],
        CTE chunk cache. For no-file-reference, partial (hyperslab), or
        collective writes, persist to the native VOL only — caching a partial
        write under a whole-dataset key would poison a later whole read. */
-    if (!dataset->file ||
+    if (!dataset->file || !dataset->cacheable ||
         !iowarp_is_whole_read(mem_space_id[d], file_space_id[d]) ||
         iowarp_is_collective(dxpl_id)) {
       H5VLdataset_write(1, &dataset->obj.under_object,
@@ -462,7 +487,7 @@ static herr_t iowarp_dataset_read(size_t count, void *dset[],
     /* Native passthrough when there is no file reference, the selection is
        partial, or the read is collective. The native VOL always produces
        correct data; only the whole/independent case is cacheable. */
-    if (!dataset->file ||
+    if (!dataset->file || !dataset->cacheable ||
         !iowarp_is_whole_read(mem_space_id[d], file_space_id[d]) ||
         iowarp_is_collective(dxpl_id)) {
       H5VLdataset_read(1, &dataset->obj.under_object,
@@ -764,6 +789,21 @@ static void *iowarp_object_open(void *obj,
   void *under = H5VLobject_open(o->under_object, loc_params, o->under_vol_id,
                                  opened_type, dxpl_id, req);
   if (!under) return nullptr;
+
+  /* CRITICAL: when the opened object is a dataset, HDF5 will subsequently route
+     the dataset_read/write/close callbacks to this wrapper and cast it to
+     iowarp_dataset_t. h5py opens datasets through H5Oopen, so returning a bare
+     iowarp_obj_t here would be mis-cast and corrupt the heap. Build the right
+     wrapper type. The dataset path is recovered from a by-name location when
+     available; otherwise the dataset is marked non-cacheable. */
+  if (opened_type && *opened_type == H5I_DATASET) {
+    const char *name = nullptr;
+    if (loc_params && loc_params->type == H5VL_OBJECT_BY_NAME) {
+      name = loc_params->loc_data.loc_by_name.name;
+    }
+    return make_dataset_wrapper(under, o->under_vol_id, o->parent_file, name);
+  }
+
   auto *wrapped = new iowarp_obj_t;
   wrapped->under_object = under;
   wrapped->under_vol_id = o->under_vol_id;
