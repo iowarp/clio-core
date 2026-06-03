@@ -220,8 +220,10 @@ class ZeroMqTransport : public Transport {
         uint32_t pid = static_cast<uint32_t>(ctp::SystemInfo::GetPid());
         std::string identity = std::string(hostname_buf) + ":" +
                                 std::to_string(pid);
-        zmq_setsockopt(socket_, ZMQ_IDENTITY, identity.data(),
+        int id_rc = zmq_setsockopt(socket_, ZMQ_IDENTITY, identity.data(),
                         identity.size());
+        HLOG(kError, "[IDDIAG] DEALER set identity='{}' (len={}) setsockopt_rc={}",
+             identity, identity.size(), id_rc);
       }
 
       HLOG(kDebug, "ZeroMqTransport(DEALER) connecting to URL: {}", full_url);
@@ -447,8 +449,12 @@ class ZeroMqTransport : public Transport {
                               meta.client_info_.identity_.size(),
                               ZMQ_SNDMORE);
       if (rc == -1) {
-        HLOG(kError, "ZeroMqTransport::Send(ROUTER) - identity frame FAILED: {}",
-             zmq_strerror(zmq_errno()));
+        static int diag_n = 0;
+        if (diag_n++ < 5) {
+          HLOG(kError, "[IDDIAG] ROUTER send-to identity='{}' (len={}) FAILED: {}",
+               meta.client_info_.identity_, meta.client_info_.identity_.size(),
+               zmq_strerror(zmq_errno()));
+        }
         return zmq_errno();
       }
       rc = zmq_send_eintr(socket_, "", 0, ZMQ_SNDMORE);
@@ -540,6 +546,13 @@ class ZeroMqTransport : public Transport {
       meta.client_info_.identity_ = std::string(
           static_cast<char*>(zmq_msg_data(&identity_msg)),
           zmq_msg_size(&identity_msg));
+      {
+        static int diag_n = 0;
+        if (diag_n++ < 5) {
+          HLOG(kError, "[IDDIAG] ROUTER recv'd identity='{}' (len={})",
+               meta.client_info_.identity_, meta.client_info_.identity_.size());
+        }
+      }
       zmq_msg_close(&identity_msg);
 
       zmq_msg_t delim_msg;

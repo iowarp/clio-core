@@ -104,7 +104,11 @@ jobs:
           echo "=== client (test) output ==="
           ./chimaera_external_client_tests "ExternalClient - Basic Connection" \
             > /tmp/client_diag.log 2>&1 || true
-          grep -viE "GetScanDirectories|ScanForChiMods|Loaded ChiMod" /tmp/client_diag.log | tail -40
+          echo "--- IDDIAG (client) ---"
+          grep -E "\[IDDIAG\]" /tmp/client_diag.log || echo "(no client IDDIAG)"
+          echo "--- IDDIAG (server) ---"
+          grep -E "\[IDDIAG\]" /tmp/clio_run_diag.log || echo "(no server IDDIAG)"
+          grep -viE "GetScanDirectories|ScanForChiMods|Loaded ChiMod" /tmp/client_diag.log | tail -25
           echo "=== server (clio_run) log: routing/identity/Send/Recv lines ==="
           grep -iE "ROUTER|DEALER|identity|Host unreachable|EnqueueNetTask|RuntimeRecv|RuntimeSend|client.*recv|Send\(|rc=|disconnect|connect|bind" \
             /tmp/clio_run_diag.log 2>/dev/null | grep -viE "GetScanDirectories|ScanForChiMods|Loaded ChiMod" | tail -50
