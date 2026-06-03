@@ -173,7 +173,18 @@ if [ -z "$CONDA_PREFIX" ]; then
     if conda env list | grep -q "^$ENV_NAME "; then
         echo -e "${YELLOW}Environment '$ENV_NAME' already exists. Using existing environment.${NC}"
     else
-        conda create -n "$ENV_NAME" -y "python=$PYVER"
+        # Retry up to 3 times: conda-forge CDN occasionally returns 403/502.
+        _created=0
+        for _attempt in 1 2 3; do
+            if conda create -n "$ENV_NAME" -y "python=$PYVER"; then
+                _created=1
+                break
+            fi
+            echo -e "${YELLOW}conda create failed (attempt $_attempt/3), retrying in $((10 * _attempt))s...${NC}"
+            conda env remove -n "$ENV_NAME" -y 2>/dev/null || true
+            sleep $((10 * _attempt))
+        done
+        [ "$_created" -eq 1 ] || { echo -e "${RED}conda create failed after 3 attempts.${NC}"; exit 1; }
         echo -e "${GREEN}Environment created (python=$PYVER)${NC}"
     fi
 
