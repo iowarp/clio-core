@@ -36,6 +36,7 @@
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/core/core_tasks.h>
 #include <clio_cte/core/content_transfer_engine.h>
+#include <clio_ctp/introspect/system_info.h>
 
 namespace fs = std::filesystem;
 using namespace std::chrono_literals;
@@ -44,7 +45,7 @@ TEST_CASE("CLIO_CTE_CLIENT PutBlob writes to CAE interceptor and reads back",
           "[cae][interceptor][putblob][getblob]") {
   fs::path config_path = fs::path(__FILE__).parent_path() /
                           "test_cae_cte_interceptor_config.yaml";
-  setenv("CLIO_SERVER_CONF", config_path.c_str(), 1);
+  ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", config_path.c_str(), 1);
 
   bool success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kServer);
   REQUIRE(success);

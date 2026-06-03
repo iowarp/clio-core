@@ -38,6 +38,7 @@
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/core/core_tasks.h>
 #include <clio_cte/core/content_transfer_engine.h>
+#include <clio_ctp/introspect/system_info.h>
 
 namespace fs = std::filesystem;
 using namespace std::chrono_literals;
@@ -59,7 +60,7 @@ void EnsureChimaera() {
   if (s_initialized) return;
   fs::path config_path = fs::path(__FILE__).parent_path() /
                           "test_cae_labeling_config.yaml";
-  setenv("CLIO_SERVER_CONF", config_path.c_str(), 1);
+  ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", config_path.c_str(), 1);
   bool success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kServer);
   REQUIRE(success);
   SimpleTest::g_test_finalize = chi::CHIMAERA_FINALIZE;

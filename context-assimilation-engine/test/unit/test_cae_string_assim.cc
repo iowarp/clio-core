@@ -41,6 +41,7 @@
 #include <clio_cae/core/factory/assimilation_ctx.h>
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/core/core_tasks.h>
+#include <clio_ctp/introspect/system_info.h>
 
 namespace fs = std::filesystem;
 using namespace std::chrono_literals;
@@ -49,7 +50,7 @@ TEST_CASE("StringDataAssimilator stores ctx.src_data as one named blob",
           "[cae][string-assim][parseomni]") {
   fs::path config_path = fs::path(__FILE__).parent_path() /
                           "test_cae_string_assim_config.yaml";
-  setenv("CLIO_SERVER_CONF", config_path.c_str(), 1);
+  ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", config_path.c_str(), 1);
 
   REQUIRE(chi::CHIMAERA_INIT(chi::ChimaeraMode::kServer));
   SimpleTest::g_test_finalize = chi::CHIMAERA_FINALIZE;

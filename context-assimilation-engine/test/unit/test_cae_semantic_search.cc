@@ -36,6 +36,7 @@
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/core/core_tasks.h>
 #include <clio_cte/core/content_transfer_engine.h>
+#include <clio_ctp/introspect/system_info.h>
 
 namespace fs = std::filesystem;
 using namespace std::chrono_literals;
@@ -93,7 +94,7 @@ TEST_CASE("CAE labels 10 docs; CTE SemanticSearch returns top-5",
           "[cae][cte][bm25][semantic-search][ollama]") {
   fs::path config_path = fs::path(__FILE__).parent_path() /
                           "test_cae_semantic_search_config.yaml";
-  setenv("CLIO_SERVER_CONF", config_path.c_str(), 1);
+  ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", config_path.c_str(), 1);
 
   REQUIRE(chi::CHIMAERA_INIT(chi::ChimaeraMode::kServer));
   SimpleTest::g_test_finalize = chi::CHIMAERA_FINALIZE;
