@@ -232,6 +232,11 @@ target_link_libraries(${PER_PROCESS_SHM_TEST_TARGET}
   ${CMAKE_THREAD_LIBS_INIT}  # Threading support
 )
 
+# RuntimeServer launches clio_run; ensure it is built and discoverable.
+add_dependencies(${PER_PROCESS_SHM_TEST_TARGET} clio_run)
+target_compile_definitions(${PER_PROCESS_SHM_TEST_TARGET} PRIVATE
+  CLIO_RUN_EXE="$<TARGET_FILE:clio_run>")
+
 set_target_properties(${PER_PROCESS_SHM_TEST_TARGET} PROPERTIES
   CXX_STANDARD 20
   CXX_STANDARD_REQUIRED ON
@@ -321,6 +326,11 @@ target_link_libraries(${EXTERNAL_CLIENT_TEST_TARGET}
   ctp::cxx                  # ClioCtp library
   ${CMAKE_THREAD_LIBS_INIT}  # Threading support
 )
+
+# RuntimeServer launches clio_run; ensure it is built and discoverable.
+add_dependencies(${EXTERNAL_CLIENT_TEST_TARGET} clio_run)
+target_compile_definitions(${EXTERNAL_CLIENT_TEST_TARGET} PRIVATE
+  CLIO_RUN_EXE="$<TARGET_FILE:clio_run>")
 
 set_target_properties(${EXTERNAL_CLIENT_TEST_TARGET} PROPERTIES
   CXX_STANDARD 20
@@ -433,6 +443,11 @@ target_link_libraries(${CLIENT_RETRY_TEST_TARGET}
   ctp::cxx                  # ClioCtp library
   ${CMAKE_THREAD_LIBS_INIT}  # Threading support
 )
+
+# RuntimeServer launches clio_run; ensure it is built and discoverable.
+add_dependencies(${CLIENT_RETRY_TEST_TARGET} clio_run)
+target_compile_definitions(${CLIENT_RETRY_TEST_TARGET} PRIVATE
+  CLIO_RUN_EXE="$<TARGET_FILE:clio_run>")
 
 set_target_properties(${CLIENT_RETRY_TEST_TARGET} PROPERTIES
   CXX_STANDARD 20

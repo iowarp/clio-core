@@ -40,6 +40,7 @@
  */
 
 #include "../simple_test.h"
+#include "../runtime_server.h"
 
 #ifndef _WIN32
 #include <fcntl.h>
@@ -57,63 +58,16 @@
 
 using namespace chi;
 
-/**
- * Helper to start server in background process
- * Returns server PID
- */
-pid_t StartServerProcess() {
-  pid_t server_pid = fork();
-  if (server_pid == 0) {
-    // Redirect child's stdout/stderr to /dev/null to prevent massive
-    // worker log output from flooding shared pipes and blocking parent
-    (void)freopen("/dev/null", "w", stdout);
-    (void)freopen("/dev/null", "w", stderr);
-
-    // Child process: Start runtime server
-    setenv("CLIO_WITH_RUNTIME", "1", 1);
-    bool success = CHIMAERA_INIT(ChimaeraMode::kServer, true);
-    if (!success) {
-      _exit(1);
-    }
-
-    // Keep server alive for tests
-    // Server will be killed by parent process
-    sleep(300);  // 5 minutes max
-    _exit(0);
-  }
-  return server_pid;
-}
+// The runtime server is launched out-of-process via chi::test::RuntimeServer
+// (clio_run start) instead of fork()+CHIMAERA_INIT(kServer): fork-without-exec
+// deadlocks on macOS when the child dlopen()s ChiMods (and nondeterministically
+// leaks a port-holding process). The client children below are real fork()s --
+// client mode does not dlopen, so they remain macOS-safe.
 
 /**
- * Helper to wait for server to be ready
- */
-bool WaitForServer(int max_attempts = 50) {
-  // The main shared memory segment name is "chi_main_segment_${USER}"
-  const char *user = std::getenv("USER");
-  std::string memfd_path = std::string("/tmp/chimaera_") +
-                           (user ? user : "unknown") +
-                           "/chi_main_segment_" + (user ? user : "");
-
-  for (int i = 0; i < max_attempts; ++i) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-
-    // Check if memfd symlink exists (indicates server is ready)
-    int fd = open(memfd_path.c_str(), O_RDONLY);
-    if (fd >= 0) {
-      close(fd);
-      // Give it a bit more time to fully initialize
-      std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-      return true;
-    }
-  }
-  return false;
-}
-
-/**
- * Helper to cleanup server process
+ * Helper to cleanup leftover shared-memory segment from a prior run.
  */
 void CleanupSharedMemory() {
-  // Clean up leftover memfd symlinks
   const char *user = std::getenv("USER");
   std::string memfd_path = std::string("/tmp/chimaera_") +
                            (user ? user : "unknown") +
@@ -121,39 +75,15 @@ void CleanupSharedMemory() {
   unlink(memfd_path.c_str());
 }
 
-void CleanupServer(pid_t server_pid) {
-  if (server_pid > 0) {
-    kill(server_pid, SIGTERM);
-    // Wait up to 5 seconds for graceful shutdown
-    for (int i = 0; i < 50; ++i) {
-      int status;
-      if (waitpid(server_pid, &status, WNOHANG) != 0) {
-        CleanupSharedMemory();
-        return;
-      }
-      usleep(100000);  // 100ms
-    }
-    // Force kill if still alive
-    kill(server_pid, SIGKILL);
-    int status;
-    waitpid(server_pid, &status, 0);
-    // Clean up shared memory left behind by the server
-    CleanupSharedMemory();
-  }
-}
-
 // ============================================================================
 // External Client Connection Tests
 // ============================================================================
 
 TEST_CASE("ExternalClient - Basic Connection", "[external_client][ipc]") {
-  // Start server in background
-  pid_t server_pid = StartServerProcess();
-  REQUIRE(server_pid > 0);
-
-  // Wait for server to be ready
-  bool server_ready = WaitForServer();
-  REQUIRE(server_ready);
+  // Start the runtime daemon out-of-process
+  chi::test::RuntimeServer server;
+  REQUIRE(server.Start());
+  REQUIRE(server.WaitForReady());
 
   // Now connect as EXTERNAL CLIENT (not integrated server+client)
   setenv("CLIO_WITH_RUNTIME", "0", 1);  // Force client-only mode
@@ -178,19 +108,14 @@ TEST_CASE("ExternalClient - Basic Connection", "[external_client][ipc]") {
   } else {
     REQUIRE(queue == nullptr);
   }
-
-  // Cleanup
-  CleanupServer(server_pid);
+  // server stopped by RuntimeServer destructor (RAII)
 }
 
 TEST_CASE("ExternalClient - Multiple Clients", "[external_client][ipc]") {
-  // Start server
-  pid_t server_pid = StartServerProcess();
-  REQUIRE(server_pid > 0);
-
-  // Wait for server
-  bool server_ready = WaitForServer();
-  REQUIRE(server_ready);
+  // Start the runtime daemon out-of-process
+  chi::test::RuntimeServer server;
+  REQUIRE(server.Start());
+  REQUIRE(server.WaitForReady());
 
   // Start multiple client processes
   const int num_clients = 3;
@@ -235,9 +160,7 @@ TEST_CASE("ExternalClient - Multiple Clients", "[external_client][ipc]") {
   }
 
   REQUIRE(all_success);
-
-  // Cleanup server
-  CleanupServer(server_pid);
+  // server stopped by RuntimeServer destructor (RAII)
 }
 
 TEST_CASE("ExternalClient - Connection Without Server",
@@ -257,13 +180,10 @@ TEST_CASE("ExternalClient - Connection Without Server",
 }
 
 TEST_CASE("ExternalClient - Client Operations", "[external_client][ipc]") {
-  // Start server
-  pid_t server_pid = StartServerProcess();
-  REQUIRE(server_pid > 0);
-
-  // Wait for server
-  bool server_ready = WaitForServer();
-  REQUIRE(server_ready);
+  // Start the runtime daemon out-of-process
+  chi::test::RuntimeServer server;
+  REQUIRE(server.Start());
+  REQUIRE(server.WaitForReady());
 
   // Connect as client
   setenv("CLIO_WITH_RUNTIME", "0", 1);
@@ -284,8 +204,7 @@ TEST_CASE("ExternalClient - Client Operations", "[external_client][ipc]") {
   // The hostfile_map_ is populated during ServerInit and is NOT shared via
   // shared memory, so external clients cannot access host information.
 
-  // Cleanup
-  CleanupServer(server_pid);
+  // server stopped by RuntimeServer destructor (RAII)
 }
 
 SIMPLE_TEST_MAIN()

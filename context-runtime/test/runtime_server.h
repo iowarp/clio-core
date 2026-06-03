@@ -119,6 +119,13 @@ class RuntimeServer {
     SetEnv("CLIO_PORT", std::to_string(port));
     SetEnv("CLIO_BIND_ADDR", bind_addr);
     const std::string exe = RuntimeExe();
+    // Point the daemon at the directory holding clio_run for ChiMod (.so/.dylib
+    // /.dll) discovery — the modules are built alongside it. Not every test
+    // sets CHI_REPO_PATH in its CTest ENVIRONMENT, so set it unconditionally.
+    {
+      size_t slash = exe.find_last_of("/\\");
+      if (slash != std::string::npos) SetEnv("CHI_REPO_PATH", exe.substr(0, slash));
+    }
     const std::string log = ServerLogPath();
 
 #ifdef _WIN32
