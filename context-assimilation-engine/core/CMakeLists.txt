@@ -106,7 +106,7 @@ set(RUNTIME_LINK_LIBRARIES
 
 if(CAE_LABELING_ENABLED)
   add_compile_definitions(CLIO_CAE_ENABLE_LABELING)
-  list(APPEND RUNTIME_LINK_LIBRARIES CURL::libcurl nlohmann_json::nlohmann_json)
+  list(APPEND RUNTIME_LINK_LIBRARIES CURL::libcurl)
 endif()
 
 # Conditionally add HDF5 assimilator if enabled
@@ -127,6 +127,12 @@ add_clio_module_runtime(
   LINK_LIBRARIES
     ${RUNTIME_LINK_LIBRARIES}
 )
+
+# nlohmann_json is PRIVATE: it may be a FetchContent target (non-imported),
+# and PUBLIC linking would require it to be in the install export set.
+if(CAE_LABELING_ENABLED)
+  target_link_libraries(clio_cae_core_runtime PRIVATE nlohmann_json::nlohmann_json)
+endif()
 
 # Add HDF5 include directories to runtime if enabled
 if(HDF5_ENABLED)
