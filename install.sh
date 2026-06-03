@@ -332,7 +332,18 @@ PY
     echo ""
 
     # shellcheck disable=SC2086  # intentional word-splitting of $DEPS
-    if conda install -y -c conda-forge $DEPS; then
+    # Retry up to 3 times: conda-forge occasionally returns 502/503 on
+    # transient CDN hiccups. A short back-off is enough to recover.
+    _conda_ok=0
+    for _attempt in 1 2 3; do
+        if conda install -y -c conda-forge $DEPS; then
+            _conda_ok=1
+            break
+        fi
+        echo -e "${YELLOW}conda install failed (attempt $_attempt/3), retrying in $((10 * _attempt))s...${NC}"
+        sleep $((10 * _attempt))
+    done
+    if [ "$_conda_ok" -eq 1 ]; then
         echo ""
         echo -e "${GREEN}======================================================================"
         echo -e "Dependencies installed (iowarp-core itself was NOT built/installed)"
@@ -340,7 +351,7 @@ PY
         echo -e "${BLUE}Active env: ${CONDA_PREFIX}${NC}"
         exit 0
     else
-        echo -e "${RED}conda install of dependencies failed.${NC}"
+        echo -e "${RED}conda install of dependencies failed after 3 attempts.${NC}"
         exit 1
     fi
 fi
@@ -385,7 +396,16 @@ if [ "$BUILD_SUCCESS" = true ]; then
     # Install using local output directory as a channel so that conda
     # resolves run dependencies (installing by file path skips dep resolution).
     echo -e "${BLUE}>>> Installing iowarp-core into current environment...${NC}"
-    if conda install -y -c "$OUTPUT_DIR" -c conda-forge iowarp-core; then
+    _conda_ok=0
+    for _attempt in 1 2 3; do
+        if conda install -y -c "$OUTPUT_DIR" -c conda-forge iowarp-core; then
+            _conda_ok=1
+            break
+        fi
+        echo -e "${YELLOW}conda install failed (attempt $_attempt/3), retrying in $((10 * _attempt))s...${NC}"
+        sleep $((10 * _attempt))
+    done
+    if [ "$_conda_ok" -eq 1 ]; then
         echo ""
         echo -e "${GREEN}======================================================================"
         echo -e "IOWarp Core installed successfully!"
@@ -401,7 +421,7 @@ if [ "$BUILD_SUCCESS" = true ]; then
         echo ""
     else
         echo ""
-        echo -e "${RED}Installation failed.${NC}"
+        echo -e "${RED}Installation failed after 3 attempts.${NC}"
         echo ""
         echo -e "${YELLOW}You can try installing manually:${NC}"
         echo "  conda install \"$PACKAGE_PATH\""
