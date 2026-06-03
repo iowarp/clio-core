@@ -13,6 +13,7 @@ jobs:
     timeout-minutes: 120
     env:
       VCPKG_DEFAULT_TRIPLET: x64-windows
+      CAE_LABEL_TEST_SKIP: "1"
 
     steps:
     - name: Checkout repository

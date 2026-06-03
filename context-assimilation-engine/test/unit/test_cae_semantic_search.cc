@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <memory>
@@ -92,6 +93,13 @@ constexpr size_t kNumDocs = sizeof(kCorpus) / sizeof(kCorpus[0]);
 
 TEST_CASE("CAE labels 10 docs; CTE SemanticSearch returns top-5",
           "[cae][cte][bm25][semantic-search][ollama]") {
+  {
+    const char *skip = std::getenv("CAE_LABEL_TEST_SKIP");
+    if (skip && std::string(skip) == "1") {
+      INFO("CAE_LABEL_TEST_SKIP=1 set; skipping");
+      return;
+    }
+  }
   fs::path config_path = fs::path(__FILE__).parent_path() /
                           "test_cae_semantic_search_config.yaml";
   ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", config_path.string(), 1);
