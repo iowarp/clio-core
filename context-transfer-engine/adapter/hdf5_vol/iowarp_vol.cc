@@ -94,6 +94,21 @@ static iowarp_dataset_t *make_dataset_wrapper(void *under, hid_t under_vol_id,
   return dset;
 }
 
+/* VOL object-wrap context. HDF5 uses this during link/object iteration
+   (H5Literate2 / H5Lvisit2 / H5Ovisit2): before invoking the user's operator it
+   saves a wrap context from this connector, then for every iterated object it
+   calls iowarp_wrap_object() to re-wrap the native object back into our VOL so
+   the operator's hid_t routes through this connector. Mirrors the reference
+   pass-through connector (H5VLpassthru). The previous implementation returned
+   the native wrap context directly and had iowarp_wrap_object() skip
+   H5VLwrap_object(), which left the iterated object only half-wrapped and made
+   H5Literate2 abort with "... is not a VOL connector ID" — the deeper blocker
+   that kept neuroh5's group enumeration from completing. */
+struct iowarp_wrap_ctx_t {
+  hid_t under_vol_id;
+  void *under_wrap_ctx;
+};
+
 /* ========================================================================
  * Helper: Get CTE client
  * ======================================================================== */
@@ -144,37 +159,65 @@ static void *iowarp_wrap_get_object(const void *obj) {
 
 static herr_t iowarp_get_wrap_ctx(const void *obj, void **wrap_ctx) {
   auto *o = static_cast<const iowarp_obj_t *>(obj);
-  return H5VLget_wrap_ctx(o->under_object, o->under_vol_id, wrap_ctx);
+  /* Carry the under VOL id alongside its wrap context so iowarp_wrap_object()
+     can call H5VLwrap_object() against the right connector. */
+  auto *ctx = new iowarp_wrap_ctx_t;
+  ctx->under_vol_id = o->under_vol_id;
+  H5Iinc_ref(ctx->under_vol_id);
+  ctx->under_wrap_ctx = nullptr;
+  H5VLget_wrap_ctx(o->under_object, o->under_vol_id, &ctx->under_wrap_ctx);
+  *wrap_ctx = ctx;
+  return 0;
 }
 
 static void *iowarp_wrap_object(void *under_obj, H5I_type_t obj_type,
-                                void *wrap_ctx) {
-  (void)wrap_ctx;
-  /* For passthrough objects (groups, attributes, etc.). We don't have a
-     way to recover the parent file from wrap_ctx (HDF5's wrap context
-     is the native VOL's, not ours), so leave parent_file null —
-     anything created from this obj will fall back to native VOL.
-     A wrapped *dataset* must still be a full iowarp_dataset_t (non-cacheable
-     here, since no file/path), or dataset_read/close would mis-cast it. */
+                                void *_wrap_ctx) {
+  auto *ctx = static_cast<iowarp_wrap_ctx_t *>(_wrap_ctx);
+  hid_t under_vol_id = ctx ? ctx->under_vol_id : H5VL_NATIVE;
+  void *under_wrap_ctx = ctx ? ctx->under_wrap_ctx : nullptr;
+
+  /* Let the underlying (native) VOL wrap the raw iteration object first.
+     Skipping this step — as the old code did — left the object unusable by the
+     native VOL and made link/object iteration abort. */
+  void *under = H5VLwrap_object(under_obj, obj_type, under_vol_id,
+                                under_wrap_ctx);
+  if (!under) return nullptr;
+
+  /* parent_file is unknown during iteration, so everything wrapped here falls
+     back to the native VOL (correct, just uncached). A wrapped *dataset* must
+     still be a full iowarp_dataset_t (non-cacheable), or a later
+     dataset_read/close would mis-cast it. */
   if (obj_type == H5I_DATASET) {
-    return make_dataset_wrapper(under_obj, H5VL_NATIVE, nullptr, nullptr);
+    return make_dataset_wrapper(under, under_vol_id, nullptr, nullptr);
   }
   auto *o = new iowarp_obj_t;
-  o->under_object = under_obj;
-  o->under_vol_id = H5VL_NATIVE;
+  o->under_object = under;
+  o->under_vol_id = under_vol_id;
   o->parent_file = nullptr;
   return o;
 }
 
 static void *iowarp_unwrap_object(void *obj) {
   auto *o = static_cast<iowarp_obj_t *>(obj);
-  void *under = o->under_object;
-  delete o;
+  /* Symmetric with iowarp_wrap_object()'s H5VLwrap_object(): peel the native
+     wrapper back off before discarding our wrapper. */
+  void *under = H5VLunwrap_object(o->under_object, o->under_vol_id);
+  if (under) delete o;
   return under;
 }
 
-static herr_t iowarp_free_wrap_ctx(void *wrap_ctx) {
-  (void)wrap_ctx;
+static herr_t iowarp_free_wrap_ctx(void *_wrap_ctx) {
+  auto *ctx = static_cast<iowarp_wrap_ctx_t *>(_wrap_ctx);
+  if (!ctx) return 0;
+  /* Preserve the active HDF5 error stack across the cleanup calls, per the
+     reference connector. */
+  hid_t err_id = H5Eget_current_stack();
+  if (ctx->under_wrap_ctx) {
+    H5VLfree_wrap_ctx(ctx->under_wrap_ctx, ctx->under_vol_id);
+  }
+  H5Idec_ref(ctx->under_vol_id);
+  H5Eset_current_stack(err_id);
+  delete ctx;
   return 0;
 }
 
