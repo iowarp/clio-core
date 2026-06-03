@@ -249,8 +249,12 @@ chi::TaskResume Runtime::Create(ctp::ipc::FullPtr<CreateTask> task,
   // EnqueueNetTask is invoked from many worker threads anyway.
   client_.AsyncSendPoll(chi::PoolQuery::Local(), 0, 500);
 
-  // Spawn periodic ClientSend task for client response sending via lightbeam
-  client_.AsyncClientSend(chi::PoolQuery::Local(), 100);
+  // Client response sending now happens on client_recv_thread_ (below), which
+  // also owns the client ROUTER/IPC recv -- ZMQ ROUTER/DEALER sockets are not
+  // thread-safe, so recv and send must share one thread (see #473; on macOS a
+  // split caused EHOSTUNREACH on every response). The net_recv_worker
+  // AsyncClientSend periodic is intentionally NOT scheduled.
+  // client_.AsyncClientSend(chi::PoolQuery::Local(), 100);
 
   // Dedicated single peer recv thread: polls the main p2p transport
   // (port 9413 by default) and dispatches inbound task forwards/responses.
@@ -320,10 +324,22 @@ chi::TaskResume Runtime::Create(ctp::ipc::FullPtr<CreateTask> task,
     ctp::SystemInfo::SetCurrentThreadName("chi-client-recv");
     auto *ipc_manager = CLIO_IPC;
     HLOG(kInfo, "[ClientRecvThread] started");
+    // This thread owns BOTH recv and send on the client ROUTER/IPC sockets.
+    // ZMQ ROUTER/DEALER sockets are not thread-safe: the routing-id a ROUTER
+    // learns on the recv thread is not reliably visible to a different thread
+    // that sends (observed on macOS as a persistent EHOSTUNREACH / "Host
+    // unreachable" when routing the response, even though the peer connection
+    // is healthy). Draining the client-send queue here keeps all socket I/O on
+    // one thread. The matching net_recv_worker AsyncClientSend periodic is
+    // disabled so only this thread touches these sockets.
+    std::vector<ctp::ipc::FullPtr<chi::Task>> deferred_deletes;
     while (!recv_shutdown_.load(std::memory_order_acquire)) {
       chi::u32 tasks_received = 0;
       bool did_work = chi::IpcCpu2CpuZmq::RuntimeRecv(ipc_manager,
                                                        tasks_received);
+      chi::u32 tasks_sent = 0;
+      did_work |= chi::IpcCpu2CpuZmq::RuntimeSend(ipc_manager, tasks_sent,
+                                                  deferred_deletes);
       if (!did_work) {
         std::this_thread::sleep_for(std::chrono::microseconds(1));
       }
