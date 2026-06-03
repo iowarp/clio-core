@@ -77,7 +77,7 @@ jobs:
         sudo apt-get install -y --no-install-recommends \
           cmake ninja-build build-essential pkg-config \
           libzmq3-dev libyaml-cpp-dev libcereal-dev libmsgpack-dev \
-          libsodium-dev
+          libsodium-dev libfuse3-dev
 
     - name: Configure with CMake
       run: |
@@ -85,6 +85,7 @@ jobs:
           -DCLIO_CORE_ENABLE_DEB_PACKAGE=ON \
           -DCLIO_CORE_ENABLE_TESTS=OFF \
           -DCLIO_CORE_ENABLE_PYTHON=OFF \
+          -DCLIO_CTE_ENABLE_FUSE_ADAPTER=ON \
           -G Ninja
 
     - name: Build with CMake
@@ -136,7 +137,7 @@ jobs:
       run: |
         dnf install -y cmake ninja-build gcc-c++ pkgconf-pkg-config \
           zeromq-devel yaml-cpp-devel cereal-devel msgpack-devel \
-          libsodium-devel rpm-build
+          libsodium-devel rpm-build fuse3-devel
 
     - name: Configure with CMake
       run: |
@@ -145,6 +146,7 @@ jobs:
           -DCLIO_CORE_ENABLE_TESTS=OFF \
           -DCLIO_CORE_ENABLE_PYTHON=OFF \
           -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+          -DCLIO_CTE_ENABLE_FUSE_ADAPTER=ON \
           -G Ninja
 
     - name: Build with CMake
@@ -198,7 +200,7 @@ jobs:
         sudo apt-get install -y --no-install-recommends \
           cmake ninja-build build-essential pkg-config wget file \
           libzmq3-dev libyaml-cpp-dev libcereal-dev libmsgpack-dev \
-          libsodium-dev
+          libsodium-dev libfuse3-dev
 
     - name: Configure with CMake
       run: |
@@ -206,6 +208,7 @@ jobs:
           -DCLIO_CORE_ENABLE_APPIMAGE=ON \
           -DCLIO_CORE_ENABLE_TESTS=OFF \
           -DCLIO_CORE_ENABLE_PYTHON=OFF \
+          -DCLIO_CTE_ENABLE_FUSE_ADAPTER=ON \
           -G Ninja
 
     - name: Build with CMake
