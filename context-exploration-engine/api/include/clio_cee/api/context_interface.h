@@ -106,24 +106,32 @@ public:
   /**
    * Retrieve the identities and data of objects matching patterns
    *
-   * This method queries for blobs matching the specified patterns and retrieves their
-   * data into a packed binary buffer. Blobs are retrieved in batches for efficiency.
+   * Supports the same three query modes as ContextQuery:
+   *   1. Temporal: any non-zero time_begin/time_end routes through TemporalSearch
+   *   2. Semantic: non-empty prompt routes through BM25 SemanticSearch
+   *   3. Regex (default): BlobQuery on tag_re/blob_re
    *
-   * The retrieved data is packed sequentially into a buffer and returned as a single
-   * packed string. Buffer is automatically allocated and freed.
+   * The matched blobs are then fetched in batches and packed into a single
+   * binary buffer returned as a vector<string> with one element.
    *
-   * @param tag_re Tag regex pattern to match
-   * @param blob_re Blob regex pattern to match
-   * @param max_results Maximum number of blobs to retrieve (0 = unlimited, default: 1024)
+   * @param tag_re           Tag regex pattern to match
+   * @param blob_re          Blob regex pattern to match
+   * @param max_results      Result cap (0 = unlimited for regex/temporal; 10 for BM25; default: 1024)
    * @param max_context_size Maximum total context size in bytes (default: 256MB)
-   * @param batch_size Number of concurrent AsyncGetBlob operations (default: 32)
+   * @param batch_size       Number of concurrent AsyncGetBlob operations (default: 32)
+   * @param prompt           Optional BM25 query text. Empty = not a semantic query.
+   * @param time_begin       Temporal lower bound, epoch nanoseconds (0 = no bound)
+   * @param time_end         Temporal upper bound, epoch nanoseconds (0 = no bound)
    * @return Vector containing one string with packed binary context data (empty if no data)
    */
   std::vector<std::string> ContextRetrieve(const std::string &tag_re,
                                             const std::string &blob_re,
                                             unsigned int max_results = 1024,
                                             size_t max_context_size = 256 * 1024 * 1024,
-                                            unsigned int batch_size = 32);
+                                            unsigned int batch_size = 32,
+                                            const std::string &prompt = "",
+                                            uint64_t time_begin = 0,
+                                            uint64_t time_end = 0);
 
   /**
    * Split/splice objects into a new context

@@ -120,15 +120,24 @@ NB_MODULE(clio_cee, m) {
          nb::arg("max_results") = 1024,
          nb::arg("max_context_size") = 256 * 1024 * 1024,
          nb::arg("batch_size") = 32,
+         nb::arg("prompt") = "",
+         nb::arg("time_begin") = 0,
+         nb::arg("time_end") = 0,
          "Retrieve the identities and data of objects matching patterns\n\n"
-         "Queries for blobs matching patterns and retrieves their data into a\n"
-         "packed binary buffer. Blobs are retrieved in batches for efficiency.\n\n"
+         "Same three query modes as context_query, then fetches and packs the data:\n"
+         "  1. Temporal (time_begin or time_end non-zero): blobs whose last_modified\n"
+         "     falls within [time_begin, time_end] (epoch nanoseconds; 0 = no bound).\n"
+         "  2. Semantic (prompt non-empty): BM25 keyword search; top max_results blobs.\n"
+         "  3. Regex (default): BlobQuery over tag_re/blob_re.\n\n"
          "Parameters:\n"
          "  tag_re: Tag regex pattern to match\n"
          "  blob_re: Blob regex pattern to match\n"
-         "  max_results: Max number of blobs (0=unlimited, default: 1024)\n"
+         "  max_results: Max number of blobs (0=unlimited for regex/temporal; top-10 for BM25; default: 1024)\n"
          "  max_context_size: Max total size in bytes (default: 256MB)\n"
-         "  batch_size: Concurrent AsyncGetBlob operations (default: 32)\n\n"
+         "  batch_size: Concurrent AsyncGetBlob operations (default: 32)\n"
+         "  prompt: Optional BM25 query text — empty disables semantic search\n"
+         "  time_begin: Temporal lower bound, epoch nanoseconds (0 = no bound)\n"
+         "  time_end: Temporal upper bound, epoch nanoseconds (0 = no bound)\n\n"
          "Returns:\n"
          "  List with one string containing packed binary context data (empty if none)")
     .def("context_splice", &iowarp::ContextInterface::ContextSplice,
