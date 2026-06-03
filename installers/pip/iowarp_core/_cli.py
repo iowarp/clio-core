@@ -102,6 +102,15 @@ def cte_bench_main():
     _exec_iowarp_bin("clio_cte_bench")
 
 
+def cte_fuse_main():
+    """Entry point for the ``clio_cte_fuse`` console script.
+
+    Requires libfuse3 to be installed on the system (e.g. ``apt install fuse3``).
+    If libfuse3 is absent the binary will exit with a dynamic-linker error.
+    """
+    _exec_iowarp_bin("clio_cte_fuse")
+
+
 def run_thrpt_main():
     """Entry point for the ``clio_run_thrpt_bench`` console script."""
     _exec_iowarp_bin("clio_run_thrpt_bench")
