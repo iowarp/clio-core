@@ -84,40 +84,31 @@ jobs:
             -E "cr_bdev_|cr_mpi_|cr_per_process_shm_stress" \
             || echo "::warning::ctest reported failures (see log above)"
 
-      - name: Diagnose clio_run daemon standalone
+      - name: Diagnose cross-process client handshake
         if: always()
         run: |
           if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
             source "$HOME/miniconda3/etc/profile.d/conda.sh"
           fi
           conda activate iowarp || true
-          echo "=== leaked runtime processes after ctest ==="
-          pgrep -afl 'clio_run|chimaera' || echo "(none)"
           pkill -9 -f 'clio_run|chimaera' || true
-          echo "=== launch clio_run start standalone on port 10600 ==="
-          cd build/bin
           rm -rf "/tmp/chimaera_${USER}" || true
-          CLIO_PORT=10600 CLIO_BIND_ADDR=127.0.0.1 CHI_REPO_PATH="$PWD" \
-            ./clio_run start > /tmp/clio_run_diag.log 2>&1 &
-          DAEMON=$!
-          echo "clio_run pid=$DAEMON"
-          for i in $(seq 1 30); do
-            sleep 1
-            if ! kill -0 "$DAEMON" 2>/dev/null; then echo "clio_run EXITED early at ${i}s"; break; fi
-            if [ -e "/tmp/chimaera_${USER}/chi_main_segment_${USER}" ]; then
-              echo "main segment appeared after ${i}s"; break
-            fi
-          done
-          echo "=== /tmp/chimaera_${USER} contents ==="
-          ls -la "/tmp/chimaera_${USER}" 2>/dev/null || echo "(dir missing)"
-          echo "=== port 10600/10603 listeners ==="
-          lsof -nP -iTCP:10600 -sTCP:LISTEN 2>/dev/null || echo "(10600 not listening)"
-          lsof -nP -iTCP:10603 -sTCP:LISTEN 2>/dev/null || echo "(10603 not listening)"
-          kill -TERM "$DAEMON" 2>/dev/null || true
-          sleep 2
-          kill -9 "$DAEMON" 2>/dev/null || true
-          echo "=== clio_run_diag.log (first 120 lines) ==="
-          head -120 /tmp/clio_run_diag.log || true
+          cd build/bin
+          # Run ONLY the simple external-client Basic Connection test. The
+          # RuntimeServer helper redirects the spawned clio_run's output to
+          # CLIO_TEST_SERVER_LOG; capture both the client (test) output and the
+          # server log to see why the TCP client handshake (WaitForLocalServer)
+          # fails while the daemon is up.
+          export CLIO_TEST_SERVER_LOG=/tmp/clio_run_diag.log
+          export CHI_REPO_PATH="$PWD"
+          echo "=== client (test) output ==="
+          ./chimaera_external_client_tests "ExternalClient - Basic Connection" \
+            > /tmp/client_diag.log 2>&1 || true
+          grep -viE "GetScanDirectories|ScanForChiMods|Loaded ChiMod" /tmp/client_diag.log | tail -40
+          echo "=== server (clio_run) log: routing/identity/Send/Recv lines ==="
+          grep -iE "ROUTER|DEALER|identity|Host unreachable|EnqueueNetTask|RuntimeRecv|RuntimeSend|client.*recv|Send\(|rc=|disconnect|connect|bind" \
+            /tmp/clio_run_diag.log 2>/dev/null | grep -viE "GetScanDirectories|ScanForChiMods|Loaded ChiMod" | tail -50
+          pkill -9 -f 'clio_run|chimaera' || true
 
       - name: Summarize failed tests
         if: always()
@@ -144,4 +135,5 @@ jobs:
             build/Testing/Temporary/CTestCostData.txt
             /tmp/clio_run_diag.log
             /tmp/clio_run_test_server.log
+            /tmp/client_diag.log
           if-no-files-found: warn
