@@ -389,9 +389,14 @@ set_target_properties(${IPC_ERRORS_TEST_TARGET} PROPERTIES
 )
 
 # Create IPC Transport Modes test executable.
-# Launches the runtime out-of-process via chi::test::RuntimeServer
-# (clio_run start) instead of fork()+CHIMAERA_INIT(kServer), so it is portable
-# to Windows too (no fork-without-exec dependency).
+# Launches the runtime out-of-process via chi::test::RuntimeServer (clio_run
+# start) instead of fork()+CHIMAERA_INIT(kServer). POSIX-only for now: the
+# RuntimeServer helper's Windows path pulls in <windows.h>, which collides with
+# the ctp lightbeam headers' <winsock2.h> and leaks the Yield/min/max macros
+# into widely-included headers (the project deliberately keeps <windows.h> out
+# of shared headers -- see simple_test.h). Making this build on Windows is part
+# of the macOS/Windows transport follow-up (see issue #476).
+if(NOT WIN32)
 add_executable(${IPC_TRANSPORT_MODES_TEST_TARGET} ${IPC_TRANSPORT_MODES_TEST_SOURCES})
 
 target_include_directories(${IPC_TRANSPORT_MODES_TEST_TARGET} PRIVATE
@@ -423,6 +428,7 @@ set_target_properties(${IPC_TRANSPORT_MODES_TEST_TARGET} PROPERTIES
 set_target_properties(${IPC_TRANSPORT_MODES_TEST_TARGET} PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
+endif()
 
 # Create Client Retry test executable.
 # POSIX-only: uses <sys/wait.h> / fork() for parent-child retry orchestration.
