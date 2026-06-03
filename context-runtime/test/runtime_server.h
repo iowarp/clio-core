@@ -75,7 +75,11 @@
 extern char **environ;
 #endif
 
-namespace chi {
+// NOTE: `chi` is a namespace ALIAS (namespace chi = clio::run), so we must not
+// open `namespace chi { ... }` here. Define in clio::run::test; tests reach it
+// as chi::test::RuntimeServer through the alias.
+namespace clio {
+namespace run {
 namespace test {
 
 /** Portable setenv(): tests set CLIO_IPC_MODE / CLIO_WITH_RUNTIME etc., and
@@ -274,6 +278,7 @@ class RuntimeServer {
 };
 
 }  // namespace test
-}  // namespace chi
+}  // namespace run
+}  // namespace clio
 
 #endif  // CLIO_RUNTIME_TEST_RUNTIME_SERVER_H_
