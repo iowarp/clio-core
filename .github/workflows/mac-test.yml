@@ -1,18 +1,25 @@
-name: Mac Test (issue-473)
+name: Mac Test
 
-# Diagnostic workflow for https://github.com/iowarp/clio-core/issues/473
-# ("test(mac): 81 tests fail").
+# macOS unit-test workflow (originally added for
+# https://github.com/iowarp/clio-core/issues/473, "test(mac): 81 tests fail").
 #
-# The regular Build and Test workflow only runs ctest on Linux (the
-# coverage path). On macOS it builds the conda package but never runs the
-# unit tests, so Mac regressions are invisible in CI. This workflow builds
-# a normal dev tree on macOS and runs ctest so the failing tests show up in
-# the GitHub Actions log (no CDash login required).
+# The regular Build and Test workflow only runs ctest on Linux (the coverage
+# path). On macOS it builds the conda package but never runs the unit tests,
+# so Mac regressions are invisible in CI. This workflow builds a normal dev
+# tree on macOS and runs ctest, surfacing failures in the Actions log + step
+# summary + an uploaded LastTest.log artifact (no CDash login required).
+#
+# NON-BLOCKING: ctest failures are reported as warnings, not job failures, so
+# this does not gate merges while the remaining macOS issues are worked
+# (notably the cross-process ZMQ ROUTER bug tracked as a follow-up to #473).
 
 on:
   push:
     branches:
-      - issue-473
+      - main
+  pull_request:
+    branches:
+      - main
   workflow_dispatch:
 
 jobs:
