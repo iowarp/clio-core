@@ -131,4 +131,20 @@ if(BUILD_TESTING)
         ENVIRONMENT "CHI_WITH_RUNTIME=1;CLIO_BIND_ADDR=127.0.0.1"
         DEPENDS clio_cte_core_ext
     )
+
+    # TemporalSearch focused test — puts blobs in three time-stamped groups,
+    # then exercises windows, open bounds, max_entries cap, and regex filtering.
+    add_test(
+        NAME python_temporal_search_test
+        COMMAND ${Python_EXECUTABLE} -I ${CMAKE_CURRENT_SOURCE_DIR}/test_cte_temporal_search.py
+        WORKING_DIRECTORY $<TARGET_FILE_DIR:clio_cte_core_ext>
+    )
+    set_tests_properties(
+        python_temporal_search_test
+        PROPERTIES
+        LABELS "python;bindings;temporal-search"
+        TIMEOUT 120
+        ENVIRONMENT "CHI_WITH_RUNTIME=1;CLIO_BIND_ADDR=127.0.0.1"
+        DEPENDS clio_cte_core_ext
+    )
 endif()

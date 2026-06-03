@@ -580,6 +580,15 @@ private:
                                  chi::RunContext &ctx);
 
   /**
+   * Timestamp-window search over blob metadata (Method::kTemporalSearch).
+   * Pure metadata scan — no blob bytes are read. Filters by tag+blob
+   * regex then returns blobs whose last_modified_ falls within
+   * [time_begin_, time_end_], sorted by ascending last_modified_.
+   */
+  chi::TaskResume TemporalSearch(ctp::ipc::FullPtr<TemporalSearchTask> task,
+                                 chi::RunContext &ctx);
+
+  /**
    * Get comprehensive blob metadata (Method::kGetBlobInfo)
    * Returns score, total size, and block placement information
    * @param task GetBlobInfo task containing blob lookup parameters and results

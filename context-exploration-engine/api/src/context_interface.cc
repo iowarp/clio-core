@@ -129,31 +129,27 @@ std::vector<std::string> ContextInterface::ContextQuery(
     const std::string &tag_re,
     const std::string &blob_re,
     unsigned int max_results,
-    const std::string &prompt) {
+    const std::string &prompt,
+    uint64_t time_begin,
+    uint64_t time_end) {
   if (!EnsureInitialized()) {
     HLOG(kError, "ContextInterface failed to initialize");
     return std::vector<std::string>();
   }
 
   try {
-    // Get the CTE client singleton
     auto* cte_client = CLIO_CTE_CLIENT;
     if (!cte_client) {
       HLOG(kError, "CTE client not initialized");
       return std::vector<std::string>();
     }
 
-    // Branch on prompt: empty = regex-only via BlobQuery; non-empty = BM25
-    // keyword search via SemanticSearch. Both run Broadcast across nodes.
-    if (!prompt.empty()) {
-      // max_results=0 means "unlimited" for the regex path, but BM25 needs
-      // a positive top-k; fall back to the SemanticSearchTask default (10).
-      chi::u32 k = max_results > 0 ? max_results : 10;
-      auto task = cte_client->AsyncSemanticSearch(
-          tag_re,
-          blob_re,
-          prompt,
-          k,
+    // Mode 1: temporal — any non-zero bound routes here.
+    if (time_begin != 0 || time_end != 0) {
+      auto task = cte_client->AsyncTemporalSearch(
+          tag_re, blob_re,
+          time_begin, time_end,
+          static_cast<chi::u32>(max_results),
           chi::PoolQuery::Broadcast());
       task.Wait();
 
@@ -165,21 +161,34 @@ std::vector<std::string> ContextInterface::ContextQuery(
       return results;
     }
 
-    // Call AsyncBlobQuery with tag and blob regex patterns
-    // Use Broadcast to query across all nodes
+    // Mode 2: semantic — BM25 keyword search.
+    if (!prompt.empty()) {
+      // max_results=0 means "unlimited" for the regex path, but BM25 needs
+      // a positive top-k; fall back to the SemanticSearchTask default (10).
+      chi::u32 k = max_results > 0 ? max_results : 10;
+      auto task = cte_client->AsyncSemanticSearch(
+          tag_re, blob_re, prompt, k, chi::PoolQuery::Broadcast());
+      task.Wait();
+
+      std::vector<std::string> results;
+      results.reserve(task->results_.size());
+      for (const auto& r : task->results_) {
+        results.push_back(r.blob_name_);
+      }
+      return results;
+    }
+
+    // Mode 3: regex-only via BlobQuery.
     auto task = cte_client->AsyncBlobQuery(
-        tag_re,
-        blob_re,
-        max_results,  // max_blobs (0 = unlimited)
+        tag_re, blob_re,
+        max_results,
         chi::PoolQuery::Broadcast());
     task.Wait();
 
-    // Extract results from task - blob names only
     std::vector<std::string> results;
     for (size_t i = 0; i < task->blob_names_.size(); ++i) {
       results.push_back(task->blob_names_[i]);
     }
-
     return results;
 
   } catch (const std::exception& e) {

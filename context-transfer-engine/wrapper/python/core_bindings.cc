@@ -120,6 +120,19 @@ NB_MODULE(clio_cte_core_ext, m) {
                r.blob_name_ + "', score=" + std::to_string(r.score_) + ")";
       });
 
+  nb::class_<clio::cte::core::TemporalSearchResult>(m, "TemporalSearchResult")
+      .def(nb::init<>())
+      .def_rw("tag_id", &clio::cte::core::TemporalSearchResult::tag_id_)
+      .def_rw("blob_name", &clio::cte::core::TemporalSearchResult::blob_name_)
+      .def_rw("last_modified", &clio::cte::core::TemporalSearchResult::last_modified_)
+      .def("__repr__", [](const clio::cte::core::TemporalSearchResult &r) {
+        return std::string("TemporalSearchResult(tag_id=(") +
+               std::to_string(r.tag_id_.major_) + "," +
+               std::to_string(r.tag_id_.minor_) + "), blob_name='" +
+               r.blob_name_ + "', last_modified=" +
+               std::to_string(r.last_modified_) + ")";
+      });
+
   // Bind CteTelemetry structure
   nb::class_<clio::cte::core::CteTelemetry>(m, "CteTelemetry")
       .def(nb::init<>())
@@ -216,6 +229,26 @@ NB_MODULE(clio_cte_core_ext, m) {
          "k (int, default 10; 0 = no cap), pool_query (PoolQuery; "
          "use PoolQuery.Broadcast() to search all nodes). "
          "Returns: list[SemanticSearchResult]")
+     .def("TemporalSearch",
+         [](clio::cte::core::Client &self,
+            const std::string &tag_regex, const std::string &blob_regex,
+            uint64_t time_begin, uint64_t time_end, uint32_t max_entries,
+            const chi::PoolQuery &pool_query) {
+           auto task = self.AsyncTemporalSearch(tag_regex, blob_regex,
+                                                time_begin, time_end,
+                                                max_entries, pool_query);
+           task.Wait();
+           return task->results_;
+         },
+         "tag_regex"_a, "blob_regex"_a,
+         "time_begin"_a = uint64_t{0}, "time_end"_a = uint64_t{0},
+         "max_entries"_a = uint32_t{0}, "pool_query"_a,
+         "Find blobs by last-modified timestamp. Filters by tag_regex AND "
+         "blob_regex (full-string std::regex_match), then returns blobs whose "
+         "last_modified metadata falls within [time_begin, time_end] (epoch "
+         "nanoseconds; 0 = no bound). Results are sorted ascending by "
+         "last_modified and capped at max_entries (0 = unlimited). "
+         "Returns: list[TemporalSearchResult]")
      .def("RegisterTarget",
          [](clio::cte::core::Client &self,
             const std::string &target_name, clio::run::bdev::BdevType bdev_type,

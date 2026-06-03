@@ -547,6 +547,27 @@ class Client : public chi::ContainerClient {
     return ipc_manager->Send(task);
   }
   /**
+   * Asynchronous temporal search — filter blobs by last-modified timestamp.
+   * @param tag_regex    Full-string match against tag names (std::regex_match)
+   * @param blob_regex   Full-string match against blob names within matching tags
+   * @param time_begin   Inclusive lower bound, epoch nanoseconds (0 = no lower bound)
+   * @param time_end     Inclusive upper bound, epoch nanoseconds (0 = no upper bound)
+   * @param max_entries  Cap on returned results, sorted ascending by timestamp (0 = unlimited)
+   * @param pool_query   Default Broadcast — search across every tag-owning container.
+   */
+  chi::Future<TemporalSearchTask> AsyncTemporalSearch(
+      const std::string &tag_regex, const std::string &blob_regex,
+      Timestamp time_begin = 0, Timestamp time_end = 0,
+      chi::u32 max_entries = 0,
+      const chi::PoolQuery &pool_query = chi::PoolQuery::Broadcast()) {
+    auto *ipc_manager = CLIO_CPU_IPC;
+    auto task = ipc_manager->NewTask<TemporalSearchTask>(
+        chi::CreateTaskId(), pool_id_, pool_query, tag_regex, blob_regex,
+        time_begin, time_end, max_entries);
+    return ipc_manager->Send(task);
+  }
+
+  /**
    * Asynchronous flush metadata - returns immediately
    * @param pool_query Pool query for task routing (default: Local)
    * @param period_us Period in microseconds (0 = one-shot)

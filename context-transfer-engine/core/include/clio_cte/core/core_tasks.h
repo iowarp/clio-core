@@ -2330,16 +2330,17 @@ struct FlushDataTask : public chi::Task {
  */
 struct SemanticSearchResult {
   TagId tag_id_;
+  std::string tag_name_;
   std::string blob_name_;
   double score_;  // BM25; higher = better
 
   SemanticSearchResult() : tag_id_(TagId::GetNull()), score_(0.0) {}
-  SemanticSearchResult(const TagId &t, std::string n, double s)
-      : tag_id_(t), blob_name_(std::move(n)), score_(s) {}
+  SemanticSearchResult(const TagId &t, std::string tn, std::string n, double s)
+      : tag_id_(t), tag_name_(std::move(tn)), blob_name_(std::move(n)), score_(s) {}
 
   template <typename Archive>
   void serialize(Archive &ar) {
-    ar(tag_id_, blob_name_, score_);
+    ar(tag_id_, tag_name_, blob_name_, score_);
   }
 };
 
@@ -2420,6 +2421,103 @@ struct SemanticSearchTask : public chi::Task {
   void Aggregate(const ctp::ipc::FullPtr<chi::Task> &other_base) {
     Task::Aggregate(other_base);
     Copy(other_base.template Cast<SemanticSearchTask>());
+  }
+};
+
+/**
+ * One row in a TemporalSearchTask result vector.
+ */
+struct TemporalSearchResult {
+  TagId tag_id_;
+  std::string tag_name_;
+  std::string blob_name_;
+  Timestamp last_modified_;  // epoch nanoseconds from blob metadata
+
+  TemporalSearchResult() : tag_id_(TagId::GetNull()), last_modified_(0) {}
+  TemporalSearchResult(const TagId &t, std::string tn, std::string n, Timestamp ts)
+      : tag_id_(t), tag_name_(std::move(tn)), blob_name_(std::move(n)), last_modified_(ts) {}
+
+  template <typename Archive>
+  void serialize(Archive &ar) {
+    ar(tag_id_, tag_name_, blob_name_, last_modified_);
+  }
+};
+
+/**
+ * TemporalSearchTask — find blobs by last-modified timestamp.
+ *
+ * Filters tags by tag_regex_ and blobs by blob_regex_, then returns
+ * every matching blob whose last_modified_ falls within
+ * [time_begin_, time_end_] (inclusive; 0 on either bound means
+ * "no constraint on that side").  Results are sorted by ascending
+ * last_modified_.  max_entries_ caps the output (0 = unlimited).
+ *
+ * This is a pure metadata scan — no blob bytes are read.
+ */
+struct TemporalSearchTask : public chi::Task {
+  IN chi::priv::string tag_regex_;
+  IN chi::priv::string blob_regex_;
+  IN Timestamp time_begin_;
+  IN Timestamp time_end_;
+  IN chi::u32 max_entries_;
+  OUT std::vector<TemporalSearchResult> results_;
+
+  // SHM constructor
+  TemporalSearchTask()
+      : chi::Task(),
+        tag_regex_(CLIO_PRIV_ALLOC),
+        blob_regex_(CLIO_PRIV_ALLOC),
+        time_begin_(0),
+        time_end_(0),
+        max_entries_(0) {}
+
+  // Emplace constructor
+  CTP_CROSS_FUN explicit TemporalSearchTask(const chi::TaskId &task_id,
+                                             const chi::PoolId &pool_id,
+                                             const chi::PoolQuery &pool_query,
+                                             const std::string &tag_regex,
+                                             const std::string &blob_regex,
+                                             Timestamp time_begin,
+                                             Timestamp time_end,
+                                             chi::u32 max_entries)
+      : chi::Task(task_id, pool_id, pool_query, Method::kTemporalSearch),
+        tag_regex_(CLIO_PRIV_ALLOC, tag_regex),
+        blob_regex_(CLIO_PRIV_ALLOC, blob_regex),
+        time_begin_(time_begin),
+        time_end_(time_end),
+        max_entries_(max_entries) {
+    task_id_ = task_id;
+    pool_id_ = pool_id;
+    method_ = Method::kTemporalSearch;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+    ar(tag_regex_, blob_regex_, time_begin_, time_end_, max_entries_);
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+    ar(results_);
+  }
+
+  void Copy(const ctp::ipc::FullPtr<TemporalSearchTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+    tag_regex_ = other->tag_regex_;
+    blob_regex_ = other->blob_regex_;
+    time_begin_ = other->time_begin_;
+    time_end_ = other->time_end_;
+    max_entries_ = other->max_entries_;
+    results_ = other->results_;
+  }
+
+  void Aggregate(const ctp::ipc::FullPtr<chi::Task> &other_base) {
+    Task::Aggregate(other_base);
+    Copy(other_base.template Cast<TemporalSearchTask>());
   }
 };
 

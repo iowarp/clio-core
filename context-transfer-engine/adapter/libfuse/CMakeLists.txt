@@ -1,11 +1,10 @@
 # Find FUSE3
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(FUSE3 QUIET fuse3)
+pkg_check_modules(FUSE3 fuse3)
 
 if(NOT FUSE3_FOUND)
-  message(WARNING "FUSE3 not found. FUSE adapter will not be built.")
-  message(STATUS "To install FUSE3: sudo apt install libfuse3-dev")
-  return()
+  message(FATAL_ERROR "FUSE3 not found but CLIO_CTE_ENABLE_FUSE_ADAPTER=ON. "
+    "Install it with: sudo apt install libfuse3-dev fuse3")
 endif()
 
 message(STATUS "Found FUSE3: ${FUSE3_VERSION}")
@@ -31,4 +30,4 @@ target_link_libraries(clio_cte_fuse
     ctp::cxx)
 
 install(TARGETS clio_cte_fuse
-    RUNTIME DESTINATION ${CLIO_CTE_INSTALL_BIN_DIR})
+    RUNTIME DESTINATION bin)

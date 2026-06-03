@@ -11,7 +11,8 @@ Assimilation Engine](../context-assimilation-engine) (CAE) under the hood.
 
 - **Bundling** — assimilate one or more data files into the IOWarp storage
   system through CAE.
-- **Querying** — discover stored data by tag/blob regex.
+- **Querying** — discover stored data by tag/blob regex, keyword text, or
+  time window (see [Search modes](#search-modes) below).
 - **Retrieval** — pull blob payloads back out of CTE.
 - **Lifecycle** — create and destroy named contexts.
 
@@ -43,6 +44,67 @@ cmake --preset debug -DCLIO_CORE_ENABLE_CEE=ON
 cmake --build build/debug -j$(nproc)
 ```
 
+## Search modes
+
+`ContextQuery` (C++) / `context_query` (Python) supports three mutually
+exclusive modes selected by the parameters you pass:
+
+| Mode | Trigger | Underlying CTE call | Sort order |
+|---|---|---|---|
+| **Regex** | `time_begin == 0 && time_end == 0 && prompt.empty()` | `BlobQuery` | unspecified |
+| **Semantic** | `prompt` is non-empty | `SemanticSearch` (BM25) | descending score |
+| **Temporal** | `time_begin != 0 \|\| time_end != 0` | `TemporalSearch` | ascending `last_modified` |
+
+Temporal takes priority over semantic; semantic takes priority over regex.
+
+### Regex search (default)
+
+Lists every blob whose tag name matches `tag_re` **and** blob name matches
+`blob_re`.  Both are full-string `std::regex_match` patterns — use `.*pattern.*`
+for substring matching.
+
+```cpp
+auto blobs = ctx.ContextQuery("dataset_.*", "chunk_[0-9]+");
+```
+
+```python
+blobs = ctx.context_query("dataset_.*", "chunk_[0-9]+")
+```
+
+### Semantic search (keyword / BM25)
+
+Reads the bytes of every candidate blob, tokenises them, and ranks them against
+`prompt` using Okapi BM25.  Returns the top `max_results` blob names ordered by
+descending relevance score (`max_results = 0` falls back to top 10).
+
+```cpp
+auto blobs = ctx.ContextQuery(".*", ".*", 5, "plasma temperature gradient");
+```
+
+```python
+blobs = ctx.context_query(".*", ".*", max_results=5,
+                           prompt="plasma temperature gradient")
+```
+
+### Temporal search (time-window)
+
+Returns every matching blob whose `last_modified` timestamp (epoch nanoseconds,
+stored in blob metadata) falls within `[time_begin, time_end]`.  Either bound
+can be `0` to leave that side open.  Results are sorted ascending by
+`last_modified` and capped at `max_results` (`0` = unlimited).
+
+```cpp
+uint64_t one_hour_ago = now_ns - 3'600'000'000'000ULL;
+auto blobs = ctx.ContextQuery(".*", ".*", 100, "", one_hour_ago, 0);
+```
+
+```python
+import time
+one_hour_ago = int((time.time() - 3600) * 1e9)
+blobs = ctx.context_query(".*", ".*", max_results=100,
+                           time_begin=one_hour_ago)
+```
+
 ## C++ Usage
 
 ```cpp
@@ -62,10 +124,17 @@ int main() {
   bundle.push_back(ctx);
   int rc = ctx_interface.ContextBundle(bundle);
 
-  // 2. Query for matching blobs.
-  auto blobs = ctx_interface.ContextQuery(
-      "my_dataset",   // tag regex
-      ".*");          // blob regex
+  // 2a. Regex query — list all blobs in the tag.
+  auto blobs = ctx_interface.ContextQuery("my_dataset", ".*");
+
+  // 2b. Semantic query — rank by keyword relevance.
+  auto ranked = ctx_interface.ContextQuery("my_dataset", ".*", 5,
+                                            "temperature anomaly");
+
+  // 2c. Temporal query — blobs written in the last hour.
+  uint64_t one_hour_ago = /* now_ns */ - 3'600'000'000'000ULL;
+  auto recent = ctx_interface.ContextQuery("my_dataset", ".*", 100,
+                                            "", one_hour_ago, 0);
 
   // 3. Clean up.
   ctx_interface.ContextDestroy({"my_dataset"});
@@ -100,8 +169,19 @@ ctx = cee.AssimilationCtx(
 )
 ctx_interface.context_bundle([ctx])
 
-# Query for blob names matching a regex.
-blobs = ctx_interface.context_query("my_dataset", ".*", 0)
+# Regex query — list all blobs.
+blobs = ctx_interface.context_query("my_dataset", ".*")
+
+# Semantic query — top-5 by BM25 relevance.
+ranked = ctx_interface.context_query("my_dataset", ".*",
+                                      max_results=5,
+                                      prompt="temperature anomaly")
+
+# Temporal query — blobs written in the last hour.
+import time
+one_hour_ago = int((time.time() - 3600) * 1e9)
+recent = ctx_interface.context_query("my_dataset", ".*",
+                                      time_begin=one_hour_ago)
 
 # Retrieve blob payloads.
 data = ctx_interface.context_retrieve("my_dataset", ".*", 0)

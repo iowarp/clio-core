@@ -21,13 +21,22 @@ public:
   // Bundle a group of related objects together and assimilate them
   int ContextBundle(const std::vector<clio::cae::core::AssimilationCtx> &bundle);
 
-  // Retrieve the identities of objects matching tag and blob patterns
+  // Retrieve blob names matching tag/blob patterns.
+  // Three modes: regex (default), semantic (prompt non-empty),
+  // temporal (time_begin or time_end non-zero).
   std::vector<std::string> ContextQuery(const std::string &tag_re,
-                                         const std::string &blob_re);
+                                         const std::string &blob_re,
+                                         unsigned int max_results = 0,
+                                         const std::string &prompt = "",
+                                         uint64_t time_begin = 0,
+                                         uint64_t time_end = 0);
 
-  // Retrieve the identities and data of objects (NOT YET IMPLEMENTED)
+  // Retrieve the identities and data of objects
   std::vector<std::string> ContextRetrieve(const std::string &tag_re,
-                                            const std::string &blob_re);
+                                            const std::string &blob_re,
+                                            unsigned int max_results = 1024,
+                                            size_t max_context_size = 256*1024*1024,
+                                            unsigned int batch_size = 32);
 
   // Split/splice objects into a new context (NOT YET IMPLEMENTED)
   int ContextSplice(const std::string &new_ctx,
@@ -76,29 +85,49 @@ if (result == 0) {
 
 ### 2. ContextQuery
 
-**Implementation**: [src/context_interface.cc:66](../src/context_interface.cc#L66)
+**Implementation**: [src/context_interface.cc](src/context_interface.cc)
 
-Queries the CTE system for blobs matching specified regex patterns.
+Queries the CTE system for blobs matching specified patterns. Supports three
+search modes selected by the parameters supplied:
 
-**Underlying API**: `clio::cte::core::Client::BlobQuery()`
+| Mode | Trigger | Underlying CTE call | Sort order |
+|---|---|---|---|
+| **Regex** | `time_begin == 0 && time_end == 0 && prompt.empty()` | `BlobQuery` | unspecified |
+| **Semantic** | `prompt` non-empty | `SemanticSearch` (BM25) | descending score |
+| **Temporal** | `time_begin != 0 \|\| time_end != 0` | `TemporalSearch` | ascending `last_modified` |
+
+Temporal takes priority over semantic; semantic takes priority over regex.
 
 **Parameters**:
-- `tag_re`: Tag regex pattern to match
-- `blob_re`: Blob regex pattern to match
+- `tag_re`: Full-string regex matched against tag names (`std::regex_match`)
+- `blob_re`: Full-string regex matched against blob names within matching tags
+- `max_results`: Result cap — `0` = unlimited for regex/temporal; defaults to 10 for semantic
+- `prompt`: BM25 query text; non-empty selects semantic mode
+- `time_begin`: Temporal lower bound, epoch nanoseconds (`0` = no lower bound)
+- `time_end`: Temporal upper bound, epoch nanoseconds (`0` = no upper bound)
 
-**Returns**:
-- Vector of matching blob names
+**Returns**: Vector of matching blob names
 
-**Example**:
+**Examples**:
+
 ```cpp
 iowarp::ContextInterface ctx;
 
-// Query all blobs in tags starting with "dataset_"
-auto results = ctx.ContextQuery("dataset_.*", ".*");
+// Regex — list all blobs in tags starting with "dataset_"
+auto all = ctx.ContextQuery("dataset_.*", ".*");
 
-for (const auto& blob_name : results) {
-  std::cout << "Found blob: " << blob_name << std::endl;
-}
+// Semantic — top-5 blobs most relevant to a keyword query
+auto ranked = ctx.ContextQuery("dataset_.*", ".*", 5,
+                                "plasma temperature gradient");
+
+// Temporal — blobs written in the last hour
+uint64_t one_hour_ago = now_ns - 3'600'000'000'000ULL;
+auto recent = ctx.ContextQuery("dataset_.*", ".*", 100,
+                                "", one_hour_ago, 0);
+
+// Temporal — blobs from a specific window
+auto window = ctx.ContextQuery(".*", ".*", 0,
+                                "", window_start_ns, window_end_ns);
 ```
 
 ### 3. ContextDestroy

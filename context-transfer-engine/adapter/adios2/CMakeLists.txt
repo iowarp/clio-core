@@ -59,11 +59,8 @@ endif()
 # Add Target(s) to CMake Install
 # -----------------------------------------------------------------------------
 install(
-  TARGETS
-  iowarp_engine
-  EXPORT
-  ${CLIO_CTE_EXPORTED_TARGETS}
-  LIBRARY DESTINATION ${CLIO_CTE_INSTALL_LIB_DIR}
-  ARCHIVE DESTINATION ${CLIO_CTE_INSTALL_LIB_DIR}
-  RUNTIME DESTINATION ${CLIO_CTE_INSTALL_BIN_DIR}
+  TARGETS iowarp_engine
+  LIBRARY DESTINATION lib
+  ARCHIVE DESTINATION lib
+  RUNTIME DESTINATION bin
 )

@@ -3519,6 +3519,7 @@ std::vector<std::string> SemSearchTokenize(const char *data, size_t size) {
 
 struct SemSearchDoc {
   TagId tag_id;
+  std::string tag_name;
   std::string blob_name;
   std::unordered_map<std::string, int> tf;
   size_t length;
@@ -3565,23 +3566,25 @@ chi::TaskResume Runtime::SemanticSearch(
         }
       });
 
-  // Step 2: walk the tag-blob metadata and collect (tag_id, blob_name)
-  // pairs whose blob_name matches blob_regex_. We collect names first
-  // and read bytes afterward — keeping the metadata iteration short
+  // Step 2: walk the tag-blob metadata and collect (tag_id, tag_name,
+  // blob_name) triples whose blob_name matches blob_regex_. We collect names
+  // first and read bytes afterward — keeping the metadata iteration short
   // means the for_each lambda doesn't block on bdev I/O.
-  std::vector<std::pair<TagId, std::string>> candidates;
+  struct Candidate { TagId tag_id; std::string tag_name; std::string blob_name; };
+  std::vector<Candidate> candidates;
   for (const auto &tn : matching_tags) {
+    const std::string &tag_name = tn.first;
     const TagId &tag_id = tn.second;
     std::string prefix = std::to_string(tag_id.major_) + "." +
                          std::to_string(tag_id.minor_) + ".";
     tag_blob_name_to_info_.for_each(
-        [&prefix, &blob_pattern, &tag_id, &candidates](
+        [&prefix, &blob_pattern, &tag_id, &tag_name, &candidates](
             const std::string &composite_key, const BlobInfo &blob_info) {
           (void)blob_info;
           if (composite_key.rfind(prefix, 0) != 0) return;
           std::string blob_name = composite_key.substr(prefix.length());
           if (std::regex_match(blob_name, blob_pattern)) {
-            candidates.emplace_back(tag_id, blob_name);
+            candidates.push_back({tag_id, tag_name, blob_name});
           }
         });
   }
@@ -3598,7 +3601,7 @@ chi::TaskResume Runtime::SemanticSearch(
   std::vector<SemSearchDoc> docs;
   docs.reserve(candidates.size());
   for (auto &cand : candidates) {
-    BlobInfo *info = CheckBlobExists(cand.second, cand.first);
+    BlobInfo *info = CheckBlobExists(cand.blob_name, cand.tag_id);
     if (info == nullptr) continue;
     chi::u64 total = info->GetTotalSize();
     if (total == 0) continue;
@@ -3608,7 +3611,7 @@ chi::TaskResume Runtime::SemanticSearch(
       HLOG(kWarning,
            "SemanticSearch: AllocateBuffer({}) failed for blob '{}'; "
            "skipping",
-           total, cand.second);
+           total, cand.blob_name);
       continue;
     }
     ctp::ipc::ShmPtr<> shm(buf.shm_);
@@ -3618,7 +3621,7 @@ chi::TaskResume Runtime::SemanticSearch(
       HLOG(kWarning,
            "SemanticSearch: ReadData failed for blob '{}' (rc={}); "
            "skipping",
-           cand.second, read_rc);
+           cand.blob_name, read_rc);
       ipc_manager->FreeBuffer(buf);
       continue;
     }
@@ -3627,8 +3630,9 @@ chi::TaskResume Runtime::SemanticSearch(
     ipc_manager->FreeBuffer(buf);
 
     SemSearchDoc doc;
-    doc.tag_id = cand.first;
-    doc.blob_name = std::move(cand.second);
+    doc.tag_id = cand.tag_id;
+    doc.tag_name = std::move(cand.tag_name);
+    doc.blob_name = std::move(cand.blob_name);
     doc.length = tokens.size();
     for (auto &t : tokens) ++doc.tf[t];
     docs.push_back(std::move(doc));
@@ -3674,7 +3678,7 @@ chi::TaskResume Runtime::SemanticSearch(
           1.0 - kB + kB * (static_cast<double>(d.length) / avgdl);
       score += idf * (tf_q * (kK1 + 1.0)) / (tf_q + kK1 * norm);
     }
-    scored.emplace_back(d.tag_id, d.blob_name, score);
+    scored.emplace_back(d.tag_id, d.tag_name, d.blob_name, score);
   }
 
   std::sort(scored.begin(), scored.end(),
@@ -3687,6 +3691,86 @@ chi::TaskResume Runtime::SemanticSearch(
        "(from {} candidates)",
        tag_regex_str, blob_regex_str, query_text, task->results_.size(),
        candidates.size());
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+// ==============================================================================
+// TemporalSearch — timestamp-window scan over blob metadata
+// ==============================================================================
+
+chi::TaskResume Runtime::TemporalSearch(
+    ctp::ipc::FullPtr<TemporalSearchTask> task, chi::RunContext &ctx) {
+#ifdef __NVCOMPILER
+  chi::RunContext &rctx = ctx;
+#else
+  (void)ctx;
+#endif
+  CLIO_TASK_BODY_BEGIN
+  task->results_.clear();
+  task->return_code_ = 0;
+
+  std::string tag_regex_str = task->tag_regex_.str();
+  std::string blob_regex_str = task->blob_regex_.str();
+  Timestamp time_begin = task->time_begin_;
+  Timestamp time_end = task->time_end_;
+  chi::u32 max_entries = task->max_entries_;
+
+  std::regex tag_pattern;
+  std::regex blob_pattern;
+  try {
+    tag_pattern = std::regex(tag_regex_str);
+    blob_pattern = std::regex(blob_regex_str);
+  } catch (const std::regex_error &e) {
+    HLOG(kError, "TemporalSearch: bad regex (tag='{}' blob='{}'): {}",
+         tag_regex_str, blob_regex_str, e.what());
+    task->return_code_ = 1;
+    CLIO_CO_RETURN;
+  }
+
+  // Step 1: collect matching tags (same as BlobQuery / SemanticSearch).
+  std::vector<std::pair<std::string, TagId>> matching_tags;
+  tag_name_to_id_.for_each(
+      [&tag_pattern, &matching_tags](const std::string &tag_name,
+                                     const TagId &tag_id) {
+        if (std::regex_match(tag_name, tag_pattern)) {
+          matching_tags.emplace_back(tag_name, tag_id);
+        }
+      });
+
+  // Step 2: scan blob metadata; filter by blob regex and time window.
+  // last_modified_ == 0 means the blob has never been written and is
+  // excluded from all time-range queries.
+  std::vector<TemporalSearchResult> hits;
+  for (const auto &tn : matching_tags) {
+    const std::string &tag_name = tn.first;
+    const TagId &tag_id = tn.second;
+    std::string prefix = std::to_string(tag_id.major_) + "." +
+                         std::to_string(tag_id.minor_) + ".";
+    tag_blob_name_to_info_.for_each(
+        [&](const std::string &composite_key, const BlobInfo &blob_info) {
+          if (composite_key.rfind(prefix, 0) != 0) return;
+          std::string blob_name = composite_key.substr(prefix.length());
+          if (!std::regex_match(blob_name, blob_pattern)) return;
+          Timestamp ts = blob_info.last_modified_;
+          if (ts == 0) return;
+          if (time_begin != 0 && ts < time_begin) return;
+          if (time_end != 0 && ts > time_end) return;
+          hits.emplace_back(tag_id, tag_name, blob_name, ts);
+        });
+  }
+
+  std::sort(hits.begin(), hits.end(),
+            [](const TemporalSearchResult &a, const TemporalSearchResult &b) {
+              return a.last_modified_ < b.last_modified_;
+            });
+  if (max_entries > 0 && hits.size() > max_entries)
+    hits.resize(max_entries);
+  task->results_ = std::move(hits);
+  HLOG(kDebug,
+       "TemporalSearch: tag='{}' blob='{}' [{}, {}] max={} -> {} results",
+       tag_regex_str, blob_regex_str, time_begin, time_end, max_entries,
+       task->results_.size());
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
