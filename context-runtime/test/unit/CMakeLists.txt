@@ -379,15 +379,14 @@ set_target_properties(${IPC_ERRORS_TEST_TARGET} PROPERTIES
 )
 
 # Create IPC Transport Modes test executable.
-# POSIX-only: uses fork()/waitpid()/setenv() to spawn a runtime + several
-# clients across transport variants. Same Windows limitation as the other
-# fork-based tests.
-if(NOT WIN32)
+# Launches the runtime out-of-process via chi::test::RuntimeServer
+# (clio_run start) instead of fork()+CHIMAERA_INIT(kServer), so it is portable
+# to Windows too (no fork-without-exec dependency).
 add_executable(${IPC_TRANSPORT_MODES_TEST_TARGET} ${IPC_TRANSPORT_MODES_TEST_SOURCES})
 
 target_include_directories(${IPC_TRANSPORT_MODES_TEST_TARGET} PRIVATE
   ${CLIO_RUN_ROOT}/include
-  ${CLIO_RUN_ROOT}/test  # For simple_test.h
+  ${CLIO_RUN_ROOT}/test  # For simple_test.h / runtime_server.h
   ${CLIO_RUN_ROOT}/modules/bdev/include
   ${CLIO_RUN_ROOT}/modules/admin/include
 )
@@ -400,6 +399,12 @@ target_link_libraries(${IPC_TRANSPORT_MODES_TEST_TARGET}
   ${CMAKE_THREAD_LIBS_INIT}  # Threading support
 )
 
+# RuntimeServer launches this binary; ensure it is built and tell the helper
+# where it lives.
+add_dependencies(${IPC_TRANSPORT_MODES_TEST_TARGET} clio_run)
+target_compile_definitions(${IPC_TRANSPORT_MODES_TEST_TARGET} PRIVATE
+  CLIO_RUN_EXE="$<TARGET_FILE:clio_run>")
+
 set_target_properties(${IPC_TRANSPORT_MODES_TEST_TARGET} PROPERTIES
   CXX_STANDARD 20
   CXX_STANDARD_REQUIRED ON
@@ -408,7 +413,6 @@ set_target_properties(${IPC_TRANSPORT_MODES_TEST_TARGET} PROPERTIES
 set_target_properties(${IPC_TRANSPORT_MODES_TEST_TARGET} PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
-endif()
 
 # Create Client Retry test executable.
 # POSIX-only: uses <sys/wait.h> / fork() for parent-child retry orchestration.
