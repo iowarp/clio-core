@@ -39,12 +39,10 @@
 #endif
 #include <zmq.h>
 
-#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
 #include <string>
-#include <thread>
 
 #include "clio_ctp/introspect/system_info.h"
 #include "clio_ctp/util/logging.h"
@@ -356,43 +354,6 @@ class ZeroMqTransport : public Transport {
       HLOG(kDebug, "ZeroMqTransport(ROUTER) bound successfully to {}",
            full_url);
       zmq_fired_action_.socket_ = socket_;
-
-      // Opt-in diagnostic (CLIO_ZMQ_MONITOR): trace ROUTER peer connect /
-      // accept / disconnect / ZMTP-handshake events to debug the macOS
-      // cross-process EHOSTUNREACH (#473). No-op unless the env var is set.
-      if (const char *mon_env = std::getenv("CLIO_ZMQ_MONITOR")) {
-        if (*mon_env) {
-          std::string mon_ep = "inproc://mon-" + std::to_string(port_);
-          if (zmq_socket_monitor(socket_, mon_ep.c_str(), ZMQ_EVENT_ALL) == 0) {
-            void *mctx = ctx_;
-            std::thread([mctx, mon_ep]() {
-              void *mon = zmq_socket(mctx, ZMQ_PAIR);
-              if (!mon || zmq_connect(mon, mon_ep.c_str()) != 0) return;
-              while (true) {
-                zmq_msg_t ev;
-                zmq_msg_init(&ev);
-                if (zmq_msg_recv(&ev, mon, 0) == -1) {
-                  zmq_msg_close(&ev);
-                  break;
-                }
-                uint16_t event = 0;
-                if (zmq_msg_size(&ev) >= sizeof(uint16_t))
-                  event = *static_cast<uint16_t *>(zmq_msg_data(&ev));
-                zmq_msg_close(&ev);
-                std::string addr;
-                zmq_msg_t am;
-                zmq_msg_init(&am);
-                if (zmq_msg_recv(&am, mon, 0) != -1)
-                  addr.assign(static_cast<char *>(zmq_msg_data(&am)),
-                              zmq_msg_size(&am));
-                zmq_msg_close(&am);
-                HLOG(kError, "[ZMQMON] ROUTER event=0x{:x} peer={}", event, addr);
-              }
-              zmq_close(mon);
-            }).detach();
-          }
-        }
-      }
     }
   }
 
