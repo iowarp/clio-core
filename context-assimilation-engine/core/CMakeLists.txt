@@ -70,11 +70,23 @@ add_clio_module_client(
 )
 
 #------------------------------------------------------------------------------
-# Required deps for transparent labeling (libcurl + nlohmann/json).
-# CURL is a system requirement. nlohmann_json is found (or fetched via
-# FetchContent) by the root CMakeLists.txt and is always available.
+# Optional labeling support (libcurl + nlohmann/json → OllamaGenerate).
+# nlohmann_json is always available (found or FetchContent'd by root).
+# CURL is a system package; if missing the label_client compiles as a stub
+# that returns false — assimilation still works, just without auto-labeling.
 #------------------------------------------------------------------------------
-find_package(CURL REQUIRED)
+find_package(CURL QUIET)
+if(CURL_FOUND AND nlohmann_json_FOUND)
+  message(STATUS "CAE labeling support: ENABLED (libcurl + nlohmann_json found)")
+  set(CAE_LABELING_ENABLED TRUE)
+else()
+  if(NOT CURL_FOUND)
+    message(STATUS "CAE labeling support: DISABLED (libcurl not found)")
+  else()
+    message(STATUS "CAE labeling support: DISABLED (nlohmann_json not found)")
+  endif()
+  set(CAE_LABELING_ENABLED FALSE)
+endif()
 
 #------------------------------------------------------------------------------
 # Runtime Library
@@ -90,9 +102,12 @@ set(RUNTIME_SOURCES
 
 set(RUNTIME_LINK_LIBRARIES
   clio_cte_core_client
-  CURL::libcurl
-  nlohmann_json::nlohmann_json
 )
+
+if(CAE_LABELING_ENABLED)
+  add_compile_definitions(CLIO_CAE_ENABLE_LABELING)
+  list(APPEND RUNTIME_LINK_LIBRARIES CURL::libcurl nlohmann_json::nlohmann_json)
+endif()
 
 # Conditionally add HDF5 assimilator if enabled
 if(HDF5_ENABLED)

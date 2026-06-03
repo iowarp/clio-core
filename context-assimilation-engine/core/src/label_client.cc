@@ -7,6 +7,8 @@
 
 #include <clio_cae/core/label_client.h>
 
+#ifdef CLIO_CAE_ENABLE_LABELING
+
 #include <clio_ctp/util/logging.h>
 
 #include <curl/curl.h>
@@ -130,3 +132,17 @@ bool OllamaGenerate(const std::string &endpoint_base,
 }
 
 }  // namespace clio::cae::core
+
+#else  // CLIO_CAE_ENABLE_LABELING
+
+namespace clio::cae::core {
+
+bool OllamaGenerate(const std::string &, const std::string &,
+                    const std::string &, int, int, std::string &out_response) {
+  out_response.clear();
+  return false;
+}
+
+}  // namespace clio::cae::core
+
+#endif  // CLIO_CAE_ENABLE_LABELING
