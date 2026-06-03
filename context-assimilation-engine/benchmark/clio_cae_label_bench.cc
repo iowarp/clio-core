@@ -51,7 +51,6 @@
 #include <sstream>
 #include <string>
 #include <thread>
-#include <unistd.h>
 #include <vector>
 
 #include <clio_runtime/clio_runtime.h>
