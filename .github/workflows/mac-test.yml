@@ -84,36 +84,6 @@ jobs:
             -E "cr_bdev_|cr_mpi_|cr_per_process_shm_stress" \
             || echo "::warning::ctest reported failures (see log above)"
 
-      - name: Diagnose cross-process client handshake
-        if: always()
-        run: |
-          if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
-            source "$HOME/miniconda3/etc/profile.d/conda.sh"
-          fi
-          conda activate iowarp || true
-          pkill -9 -f 'clio_run|chimaera' || true
-          rm -rf "/tmp/chimaera_${USER}" || true
-          cd build/bin
-          # Run ONLY the simple external-client Basic Connection test. The
-          # RuntimeServer helper redirects the spawned clio_run's output to
-          # CLIO_TEST_SERVER_LOG; capture both the client (test) output and the
-          # server log to see why the TCP client handshake (WaitForLocalServer)
-          # fails while the daemon is up.
-          export CLIO_TEST_SERVER_LOG=/tmp/clio_run_diag.log
-          export CHI_REPO_PATH="$PWD"
-          echo "=== client (test) output ==="
-          ./chimaera_external_client_tests "ExternalClient - Basic Connection" \
-            > /tmp/client_diag.log 2>&1 || true
-          echo "--- IDDIAG (client) ---"
-          grep -E "\[IDDIAG\]" /tmp/client_diag.log || echo "(no client IDDIAG)"
-          echo "--- IDDIAG (server) ---"
-          grep -E "\[IDDIAG\]" /tmp/clio_run_diag.log || echo "(no server IDDIAG)"
-          grep -viE "GetScanDirectories|ScanForChiMods|Loaded ChiMod" /tmp/client_diag.log | tail -25
-          echo "=== server (clio_run) log: routing/identity/Send/Recv lines ==="
-          grep -iE "ROUTER|DEALER|identity|Host unreachable|EnqueueNetTask|RuntimeRecv|RuntimeSend|client.*recv|Send\(|rc=|disconnect|connect|bind" \
-            /tmp/clio_run_diag.log 2>/dev/null | grep -viE "GetScanDirectories|ScanForChiMods|Loaded ChiMod" | tail -50
-          pkill -9 -f 'clio_run|chimaera' || true
-
       - name: Summarize failed tests
         if: always()
         run: |
@@ -137,7 +107,4 @@ jobs:
           path: |
             build/Testing/Temporary/LastTest.log
             build/Testing/Temporary/CTestCostData.txt
-            /tmp/clio_run_diag.log
-            /tmp/clio_run_test_server.log
-            /tmp/client_diag.log
           if-no-files-found: warn

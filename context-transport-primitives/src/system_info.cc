@@ -283,15 +283,12 @@ int SystemInfo::GetTid() {
 
 int SystemInfo::GetPid() {
 #if CTP_ENABLE_PROCFS_SYSINFO
-#if defined(__OpenBSD__) || defined(__APPLE__)
-  // macOS: syscall(SYS_getpid) returns a stale/incorrect value (observed
-  // returning a different number than the real pid), which corrupts the
-  // hostname:pid ZMQ DEALER identity -> cross-process ROUTER routing
-  // collisions -> EHOSTUNREACH on every response. Use libc getpid(), which
-  // is correct on Darwin/BSD. OpenBSD already used getpid() for portability.
+#ifdef SYS_getpid
+#ifdef __OpenBSD__
   return (pid_t)getpid();
-#elif defined(SYS_getpid)
+#else
   return (pid_t)syscall(SYS_getpid);
+#endif
 #else
 #warning "GetPid is not defined"
   return 0;
