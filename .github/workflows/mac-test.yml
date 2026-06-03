@@ -84,6 +84,31 @@ jobs:
             -E "cr_bdev_|cr_mpi_|cr_per_process_shm_stress" \
             || echo "::warning::ctest reported failures (see log above)"
 
+      - name: Diagnose ZMQ ROUTER peer lifecycle
+        if: always()
+        run: |
+          if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
+            source "$HOME/miniconda3/etc/profile.d/conda.sh"
+          fi
+          conda activate iowarp || true
+          pkill -9 -f 'clio_run|chimaera' || true
+          rm -rf "/tmp/chimaera_${USER}" || true
+          cd build/bin
+          # Enable the ROUTER socket monitor in BOTH the client (test) and the
+          # spawned clio_run daemon, run the simple cross-process test, and dump
+          # the connect/accept/disconnect/handshake timeline + EHOSTUNREACH.
+          export CLIO_ZMQ_MONITOR=1
+          export CLIO_TEST_SERVER_LOG=/tmp/clio_run_diag.log
+          export CHI_REPO_PATH="$PWD"
+          ./chimaera_external_client_tests "ExternalClient - Basic Connection" \
+            > /tmp/client_diag.log 2>&1 || true
+          echo "=== server ZMQMON + EHOSTUNREACH timeline ==="
+          grep -nE "ZMQMON|Host unreachable|ServerInit IpcManager: TCP ROUTER|EnqueueNetTask" \
+            /tmp/clio_run_diag.log 2>/dev/null | head -40 || echo "(none)"
+          echo "=== client ZMQMON ==="
+          grep -E "ZMQMON" /tmp/client_diag.log 2>/dev/null | head -20 || echo "(none)"
+          pkill -9 -f 'clio_run|chimaera' || true
+
       - name: Summarize failed tests
         if: always()
         run: |
