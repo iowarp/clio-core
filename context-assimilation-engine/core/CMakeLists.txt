@@ -71,13 +71,10 @@ add_clio_module_client(
 
 #------------------------------------------------------------------------------
 # Required deps for transparent labeling (libcurl + nlohmann/json).
-# Both are widely-available system packages on Ubuntu/Debian/Fedora and
-# are part of the IOWarp devcontainer baseline. If you need to disable
-# labeling entirely, gate this with a CMake option and stub
-# label_client.cc — for now labeling is a first-class CAE feature.
+# CURL is a system requirement. nlohmann_json is found (or fetched via
+# FetchContent) by the root CMakeLists.txt and is always available.
 #------------------------------------------------------------------------------
 find_package(CURL REQUIRED)
-find_package(nlohmann_json REQUIRED)
 
 #------------------------------------------------------------------------------
 # Runtime Library

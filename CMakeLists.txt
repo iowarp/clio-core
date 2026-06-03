@@ -632,6 +632,16 @@ endif()
 # Poco and nlohmann_json (optional - for CAE Globus support)
 find_package(Poco COMPONENTS Net NetSSL Crypto JSON QUIET)
 find_package(nlohmann_json QUIET)
+if(NOT nlohmann_json_FOUND)
+  include(FetchContent)
+  FetchContent_Declare(nlohmann_json
+      GIT_REPOSITORY https://github.com/nlohmann/json.git
+      GIT_TAG        v3.11.3
+      GIT_SHALLOW    ON
+  )
+  FetchContent_MakeAvailable(nlohmann_json)
+  set(nlohmann_json_FOUND TRUE)
+endif()
 
 if (CLIO_CTE_ENABLE_ADIOS2_ADAPTER OR CLIO_CORE_ENABLE_GRAY_SCOTT)
     # Find ADIOS2
