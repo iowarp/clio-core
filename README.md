@@ -145,22 +145,42 @@ import clio_cee as cee
 
 ctx_interface = cee.ContextInterface()
 
-# Assimilate a file into IOWarp storage.
-ctx = cee.AssimilationCtx(
-    src="file::/path/to/data.bin",
-    dst="iowarp::my_dataset",
-    format="binary",
-)
-ctx_interface.context_bundle([ctx])
+# Assimilate inline strings into IOWarp storage.
+# src="string::<blob_name>" names the blob; src_data carries the payload.
+docs = [
+    ("climate_report",   "Arctic sea ice extent fell to a record low in 2023."),
+    ("ocean_temps",      "Ocean surface temperatures rose 0.3°C above the 20-year mean."),
+    ("co2_levels",       "Atmospheric CO₂ reached 421 ppm, the highest in 800,000 years."),
+]
+bundle = [
+    cee.AssimilationCtx(
+        src=f"string::{name}",
+        dst="iowarp::climate_docs",
+        format="string",
+        src_data=text,
+    )
+    for name, text in docs
+]
+ctx_interface.context_bundle(bundle)
 
 # Query for blob names matching a regex.
-blobs = ctx_interface.context_query("my_dataset", ".*", 0)
+blobs = ctx_interface.context_query("climate_docs", ".*")
 
-# Retrieve blob payloads.
-data = ctx_interface.context_retrieve("my_dataset", ".*", 0)
+# Query the top-2 most relevant blob names via BM25 semantic search.
+blobs = ctx_interface.context_query("climate_docs", ".*",
+                                    max_results=2,
+                                    prompt="temperature anomaly over Arctic")
+
+# Retrieve blob payloads (regex).
+data = ctx_interface.context_retrieve("climate_docs", ".*")
+
+# Retrieve the top-2 most relevant blobs via BM25 semantic search.
+data = ctx_interface.context_retrieve("climate_docs", ".*",
+                                      max_results=2,
+                                      prompt="temperature anomaly over Arctic")
 
 # Clean up.
-ctx_interface.context_destroy(["my_dataset"])
+ctx_interface.context_destroy(["climate_docs"])
 ```
 
 ### C++ (CTE, direct)

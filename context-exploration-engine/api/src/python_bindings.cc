@@ -53,6 +53,22 @@ NB_MODULE(clio_cee, m) {
          nb::arg("depends_on") = "", nb::arg("range_off") = 0, nb::arg("range_size") = 0,
          nb::arg("src_token") = "", nb::arg("dst_token") = "",
          "Full constructor")
+    .def("__init__",
+         [](clio::cae::core::AssimilationCtx *self,
+            const std::string &src, const std::string &dst,
+            const std::string &format, const std::string &src_data,
+            const std::string &depends_on, size_t range_off, size_t range_size,
+            const std::string &src_token, const std::string &dst_token) {
+           new (self) clio::cae::core::AssimilationCtx(
+               src, dst, format, depends_on, range_off, range_size,
+               src_token, dst_token);
+           self->src_data = src_data;
+         },
+         nb::arg("src"), nb::arg("dst"), nb::arg("format"),
+         nb::arg("src_data"),
+         nb::arg("depends_on") = "", nb::arg("range_off") = 0, nb::arg("range_size") = 0,
+         nb::arg("src_token") = "", nb::arg("dst_token") = "",
+         "Constructor with inline src_data payload (for src='string::<blob_name>')")
     .def_rw("src", &clio::cae::core::AssimilationCtx::src,
             "Source URL (e.g., file::/path/to/file)")
     .def_rw("dst", &clio::cae::core::AssimilationCtx::dst,
