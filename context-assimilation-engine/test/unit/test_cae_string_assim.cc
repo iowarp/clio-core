@@ -50,7 +50,7 @@ TEST_CASE("StringDataAssimilator stores ctx.src_data as one named blob",
           "[cae][string-assim][parseomni]") {
   fs::path config_path = fs::path(__FILE__).parent_path() /
                           "test_cae_string_assim_config.yaml";
-  ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", config_path.c_str(), 1);
+  ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", config_path.string(), 1);
 
   REQUIRE(chi::CHIMAERA_INIT(chi::ChimaeraMode::kServer));
   SimpleTest::g_test_finalize = chi::CHIMAERA_FINALIZE;

@@ -45,7 +45,7 @@ TEST_CASE("CLIO_CTE_CLIENT PutBlob writes to CAE interceptor and reads back",
           "[cae][interceptor][putblob][getblob]") {
   fs::path config_path = fs::path(__FILE__).parent_path() /
                           "test_cae_cte_interceptor_config.yaml";
-  ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", config_path.c_str(), 1);
+  ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", config_path.string(), 1);
 
   bool success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kServer);
   REQUIRE(success);

@@ -60,7 +60,7 @@ void EnsureChimaera() {
   if (s_initialized) return;
   fs::path config_path = fs::path(__FILE__).parent_path() /
                           "test_cae_labeling_config.yaml";
-  ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", config_path.c_str(), 1);
+  ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", config_path.string(), 1);
   bool success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kServer);
   REQUIRE(success);
   SimpleTest::g_test_finalize = chi::CHIMAERA_FINALIZE;
