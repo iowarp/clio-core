@@ -258,13 +258,18 @@ void TestSocketTransportWithEM() {
   std::string addr = "127.0.0.1";
   int port = 8400;
 
+  // The EventManager must outlive every transport registered to it:
+  // ~SocketTransport calls em_->RemoveEvent(), which touches the manager's
+  // fd_to_reg_ map. Declaring em first guarantees it is destroyed last.
+  // (Reverse-order destruction otherwise frees em while server still holds
+  // em_ -> use-after-free; benign on libstdc++ but a hard crash on libc++.)
+  EventManager em;
   auto server = std::make_unique<SocketTransport>(
       TransportMode::kServer, addr, "tcp", port);
   auto client = std::make_unique<SocketTransport>(
       TransportMode::kClient, addr, "tcp", port);
 
   // Register EventManager on server
-  EventManager em;
   server->RegisterEventManager(em);
 
   // Client sends data

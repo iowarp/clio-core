@@ -35,22 +35,16 @@
  * IPC Transport Mode Tests
  *
  * Tests that each IPC transport mode (SHM, TCP, IPC) initializes correctly
- * and that the correct transport path is active. Each test case forks a
- * server, sets CHI_IPC_MODE, connects as client, and verifies mode state.
+ * and that the correct transport path is active. Each test case launches the
+ * runtime daemon out-of-process (chi::test::RuntimeServer -> clio_run start),
+ * sets CHI_IPC_MODE, connects as client, and verifies mode state.
  */
 
 #include "../simple_test.h"
+#include "../runtime_server.h"
 
-#ifndef _WIN32
-#include <fcntl.h>
-#include <sys/wait.h>
-#include <unistd.h>
-#endif
-
-#include <chrono>
 #include <cstdlib>
 #include <string>
-#include <thread>
 
 #include "clio_runtime/clio_runtime.h"
 #include "clio_runtime/ipc_manager.h"
@@ -141,104 +135,11 @@ void SubmitTasksForMode(const std::string &mode_name) {
   CLIO_IPC->FreeBuffer(read_buffer);
 }
 
-/**
- * Helper to start server in background process
- * Returns server PID
- */
-pid_t StartServerProcess() {
-  pid_t server_pid = fork();
-  if (server_pid == 0) {
-    // Redirect child's stdout to /dev/null but stderr to temp file for timing
-    (void)freopen("/dev/null", "w", stdout);
-    (void)freopen("/tmp/chimaera_server_timing.log", "w", stderr);
-
-    // Child process: Start runtime server
-    setenv("CLIO_WITH_RUNTIME", "1", 1);
-    bool success = CHIMAERA_INIT(ChimaeraMode::kServer, true);
-    if (!success) {
-      _exit(1);
-    }
-
-    // Keep server alive for tests
-    // Server will be killed by parent process
-    sleep(300);  // 5 minutes max
-    _exit(0);
-  }
-  return server_pid;
-}
-
-/**
- * Helper to wait for server to be ready
- */
-bool WaitForServer(int max_attempts = 50) {
-  // The main shared memory segment name is "chi_main_segment_${USER}"
-  const char *user = std::getenv("USER");
-  std::string memfd_path = std::string("/tmp/chimaera_") +
-                           (user ? user : "unknown") +
-                           "/chi_main_segment_" + (user ? user : "");
-
-  for (int i = 0; i < max_attempts; ++i) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-
-    // Check if memfd symlink exists (indicates server is ready)
-    int fd = open(memfd_path.c_str(), O_RDONLY);
-    if (fd >= 0) {
-      close(fd);
-      // Give it a bit more time to fully initialize
-      std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-      return true;
-    }
-  }
-  return false;
-}
-
-/**
- * Helper to cleanup shared memory
- */
-void CleanupSharedMemory() {
-  const char *user = std::getenv("USER");
-  std::string memfd_path = std::string("/tmp/chimaera_") +
-                           (user ? user : "unknown") +
-                           "/chi_main_segment_" + (user ? user : "");
-  unlink(memfd_path.c_str());
-}
-
-/**
- * Helper to cleanup server process
- */
-void CleanupServer(pid_t server_pid) {
-  if (server_pid > 0) {
-    kill(server_pid, SIGTERM);
-    // Wait up to 5 seconds for graceful shutdown
-    for (int i = 0; i < 50; ++i) {
-      int status;
-      if (waitpid(server_pid, &status, WNOHANG) != 0) {
-        CleanupSharedMemory();
-        return;
-      }
-      usleep(100000);  // 100ms
-    }
-    // Force kill if still alive
-    kill(server_pid, SIGKILL);
-    int status;
-    waitpid(server_pid, &status, 0);
-    CleanupSharedMemory();
-  }
-}
-
-/**
- * RAII guard that always kills the forked server process, even if a
- * REQUIRE assertion throws and unwinds the stack before the explicit
- * CleanupServer() call.
- */
-struct ServerGuard {
-  pid_t pid;
-  explicit ServerGuard(pid_t p) : pid(p) {}
-  ~ServerGuard() { CleanupServer(pid); }
-  // Non-copyable
-  ServerGuard(const ServerGuard &) = delete;
-  ServerGuard &operator=(const ServerGuard &) = delete;
-};
+// The runtime server is launched out-of-process via chi::test::RuntimeServer
+// (clio_run start), which is portable across Linux, macOS and Windows. The old
+// fork()+CHIMAERA_INIT(kServer) helpers were removed: fork-without-exec is
+// unsupported on macOS (post-fork dlopen of ChiMods deadlocks) and impossible
+// on Windows. See context-runtime/test/runtime_server.h.
 
 // ============================================================================
 // IPC Transport Mode Tests
@@ -246,18 +147,14 @@ struct ServerGuard {
 
 TEST_CASE("IpcTransportMode - SHM Client Connection",
           "[ipc_transport][shm]") {
-  // Start server in background
-  pid_t server_pid = StartServerProcess();
-  REQUIRE(server_pid > 0);
-  ServerGuard guard(server_pid);
-
-  // Wait for server to be ready
-  bool server_ready = WaitForServer();
-  REQUIRE(server_ready);
+  // Start the runtime daemon out-of-process
+  chi::test::RuntimeServer server;
+  REQUIRE(server.Start());
+  REQUIRE(server.WaitForReady());
 
   // Set SHM mode and connect as external client
-  setenv("CLIO_IPC_MODE", "SHM", 1);
-  setenv("CLIO_WITH_RUNTIME", "0", 1);
+  chi::test::SetEnvVar("CLIO_IPC_MODE", "SHM");
+  chi::test::SetEnvVar("CLIO_WITH_RUNTIME", "0");
   bool success = CHIMAERA_INIT(ChimaeraMode::kClient, false);
   REQUIRE(success);
 
@@ -275,18 +172,14 @@ TEST_CASE("IpcTransportMode - SHM Client Connection",
 
 TEST_CASE("IpcTransportMode - TCP Client Connection",
           "[ipc_transport][tcp]") {
-  // Start server in background
-  pid_t server_pid = StartServerProcess();
-  REQUIRE(server_pid > 0);
-  ServerGuard guard(server_pid);
-
-  // Wait for server to be ready
-  bool server_ready = WaitForServer();
-  REQUIRE(server_ready);
+  // Start the runtime daemon out-of-process
+  chi::test::RuntimeServer server;
+  REQUIRE(server.Start());
+  REQUIRE(server.WaitForReady());
 
   // Set TCP mode and connect as external client
-  setenv("CLIO_IPC_MODE", "TCP", 1);
-  setenv("CLIO_WITH_RUNTIME", "0", 1);
+  chi::test::SetEnvVar("CLIO_IPC_MODE", "TCP");
+  chi::test::SetEnvVar("CLIO_WITH_RUNTIME", "0");
   bool success = CHIMAERA_INIT(ChimaeraMode::kClient, false);
   REQUIRE(success);
 
@@ -304,18 +197,14 @@ TEST_CASE("IpcTransportMode - TCP Client Connection",
 
 TEST_CASE("IpcTransportMode - IPC Client Connection",
           "[ipc_transport][ipc]") {
-  // Start server in background
-  pid_t server_pid = StartServerProcess();
-  REQUIRE(server_pid > 0);
-  ServerGuard guard(server_pid);
-
-  // Wait for server to be ready
-  bool server_ready = WaitForServer();
-  REQUIRE(server_ready);
+  // Start the runtime daemon out-of-process
+  chi::test::RuntimeServer server;
+  REQUIRE(server.Start());
+  REQUIRE(server.WaitForReady());
 
   // Set IPC (Unix Domain Socket) mode and connect as external client
-  setenv("CLIO_IPC_MODE", "IPC", 1);
-  setenv("CLIO_WITH_RUNTIME", "0", 1);
+  chi::test::SetEnvVar("CLIO_IPC_MODE", "IPC");
+  chi::test::SetEnvVar("CLIO_WITH_RUNTIME", "0");
   bool success = CHIMAERA_INIT(ChimaeraMode::kClient, false);
   REQUIRE(success);
 
@@ -333,18 +222,14 @@ TEST_CASE("IpcTransportMode - IPC Client Connection",
 
 TEST_CASE("IpcTransportMode - Default Mode Is TCP",
           "[ipc_transport][default]") {
-  // Start server in background
-  pid_t server_pid = StartServerProcess();
-  REQUIRE(server_pid > 0);
-  ServerGuard guard(server_pid);
-
-  // Wait for server to be ready
-  bool server_ready = WaitForServer();
-  REQUIRE(server_ready);
+  // Start the runtime daemon out-of-process
+  chi::test::RuntimeServer server;
+  REQUIRE(server.Start());
+  REQUIRE(server.WaitForReady());
 
   // Unset CHI_IPC_MODE to test default behavior
-  unsetenv("CLIO_IPC_MODE");
-  setenv("CLIO_WITH_RUNTIME", "0", 1);
+  chi::test::UnsetEnvVar("CLIO_IPC_MODE");
+  chi::test::SetEnvVar("CLIO_WITH_RUNTIME", "0");
   bool success = CHIMAERA_INIT(ChimaeraMode::kClient, false);
   REQUIRE(success);
 

@@ -9,15 +9,29 @@ on:
 
 jobs:
   windows-build-and-test:
-    runs-on: windows-latest
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            triplet: x64-windows
+            arch: x64
+          - os: windows-2025
+            triplet: x64-windows
+            arch: x64
+          - os: windows-11-arm
+            triplet: arm64-windows
+            arch: ARM64
     env:
-      VCPKG_DEFAULT_TRIPLET: x64-windows
+      VCPKG_DEFAULT_TRIPLET: ${{ matrix.triplet }}
       CAE_LABEL_TEST_SKIP: "1"
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v5
+      uses: actions/checkout@v6
       with:
         submodules: recursive
 
@@ -29,28 +43,35 @@ jobs:
 
     - name: Configure CMake
       run: |
-        cmake -B build -G "Visual Studio 17 2022" -A x64 `
+        cmake -B build -G "Visual Studio 17 2022" -A ${{ matrix.arch }} `
           -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
+          -DVCPKG_TARGET_TRIPLET="${{ matrix.triplet }}" `
           -DVCPKG_MANIFEST_DIR="${{ github.workspace }}/installers/vcpkg" `
+          -DVCPKG_OVERLAY_PORTS="${{ github.workspace }}/installers/vcpkg/overlay-ports" `
           -DCMAKE_BUILD_TYPE=Debug `
-          -DWRP_CORE_ENABLE_RUNTIME=ON `
-          -DWRP_CORE_ENABLE_CTE=ON `
-          -DWRP_CORE_ENABLE_CAE=ON `
-          -DWRP_CORE_ENABLE_CEE=OFF `
-          -DWRP_CORE_ENABLE_TESTS=ON `
-          -DWRP_CORE_ENABLE_PYTHON=OFF `
-          -DWRP_CORE_ENABLE_ZMQ=ON `
-          -DWRP_CORE_ENABLE_CEREAL=ON `
-          -DWRP_CORE_ENABLE_CONDA=OFF `
-          -DWRP_CORE_ENABLE_ELF=OFF `
-          -DWRP_CORE_ENABLE_RPATH=OFF `
-          -DWRP_CORE_ENABLE_HDF5=OFF `
-          -DWRP_CORE_ENABLE_BENCHMARKS=OFF `
+          -DCLIO_CORE_ENABLE_RUNTIME=ON `
+          -DCLIO_CORE_ENABLE_CTE=ON `
+          -DCLIO_CORE_ENABLE_CAE=ON `
+          -DCLIO_CORE_ENABLE_CEE=OFF `
+          -DCLIO_CORE_ENABLE_TESTS=ON `
+          -DCLIO_CORE_ENABLE_PYTHON=OFF `
+          -DCLIO_CORE_ENABLE_ZMQ=ON `
+          -DCLIO_CORE_ENABLE_CEREAL=ON `
+          -DCLIO_CORE_ENABLE_CONDA=OFF `
+          -DCLIO_CORE_ENABLE_ELF=OFF `
+          -DCLIO_CORE_ENABLE_RPATH=OFF `
+          -DCLIO_CTE_ENABLE_VFD=OFF `
+          -DCLIO_CTE_ENABLE_HDF5_VOL=OFF `
+          -DCLIO_CORE_ENABLE_BENCHMARKS=OFF `
           -DCMAKE_EXPORT_COMPILE_COMMANDS=ON `
-          -DHSHM_LOG_LEVEL=0
+          -DCLIO_CTP_LOG_LEVEL=0
 
     - name: Build
       run: cmake --build build --config Debug -j $env:NUMBER_OF_PROCESSORS
 
     - name: Run tests
       run: ctest --test-dir build --build-config Debug --output-on-failure --timeout 120
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true

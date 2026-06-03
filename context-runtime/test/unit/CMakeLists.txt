@@ -232,6 +232,11 @@ target_link_libraries(${PER_PROCESS_SHM_TEST_TARGET}
   ${CMAKE_THREAD_LIBS_INIT}  # Threading support
 )
 
+# RuntimeServer launches clio_run; ensure it is built and discoverable.
+add_dependencies(${PER_PROCESS_SHM_TEST_TARGET} clio_run)
+target_compile_definitions(${PER_PROCESS_SHM_TEST_TARGET} PRIVATE
+  CLIO_RUN_EXE="$<TARGET_FILE:clio_run>")
+
 set_target_properties(${PER_PROCESS_SHM_TEST_TARGET} PROPERTIES
   CXX_STANDARD 20
   CXX_STANDARD_REQUIRED ON
@@ -322,6 +327,11 @@ target_link_libraries(${EXTERNAL_CLIENT_TEST_TARGET}
   ${CMAKE_THREAD_LIBS_INIT}  # Threading support
 )
 
+# RuntimeServer launches clio_run; ensure it is built and discoverable.
+add_dependencies(${EXTERNAL_CLIENT_TEST_TARGET} clio_run)
+target_compile_definitions(${EXTERNAL_CLIENT_TEST_TARGET} PRIVATE
+  CLIO_RUN_EXE="$<TARGET_FILE:clio_run>")
+
 set_target_properties(${EXTERNAL_CLIENT_TEST_TARGET} PROPERTIES
   CXX_STANDARD 20
   CXX_STANDARD_REQUIRED ON
@@ -379,15 +389,19 @@ set_target_properties(${IPC_ERRORS_TEST_TARGET} PROPERTIES
 )
 
 # Create IPC Transport Modes test executable.
-# POSIX-only: uses fork()/waitpid()/setenv() to spawn a runtime + several
-# clients across transport variants. Same Windows limitation as the other
-# fork-based tests.
+# Launches the runtime out-of-process via chi::test::RuntimeServer (clio_run
+# start) instead of fork()+CHIMAERA_INIT(kServer). POSIX-only for now: the
+# RuntimeServer helper's Windows path pulls in <windows.h>, which collides with
+# the ctp lightbeam headers' <winsock2.h> and leaks the Yield/min/max macros
+# into widely-included headers (the project deliberately keeps <windows.h> out
+# of shared headers -- see simple_test.h). Making this build on Windows is part
+# of the macOS/Windows transport follow-up (see issue #476).
 if(NOT WIN32)
 add_executable(${IPC_TRANSPORT_MODES_TEST_TARGET} ${IPC_TRANSPORT_MODES_TEST_SOURCES})
 
 target_include_directories(${IPC_TRANSPORT_MODES_TEST_TARGET} PRIVATE
   ${CLIO_RUN_ROOT}/include
-  ${CLIO_RUN_ROOT}/test  # For simple_test.h
+  ${CLIO_RUN_ROOT}/test  # For simple_test.h / runtime_server.h
   ${CLIO_RUN_ROOT}/modules/bdev/include
   ${CLIO_RUN_ROOT}/modules/admin/include
 )
@@ -399,6 +413,12 @@ target_link_libraries(${IPC_TRANSPORT_MODES_TEST_TARGET}
   ctp::cxx                  # ClioCtp library
   ${CMAKE_THREAD_LIBS_INIT}  # Threading support
 )
+
+# RuntimeServer launches this binary; ensure it is built and tell the helper
+# where it lives.
+add_dependencies(${IPC_TRANSPORT_MODES_TEST_TARGET} clio_run)
+target_compile_definitions(${IPC_TRANSPORT_MODES_TEST_TARGET} PRIVATE
+  CLIO_RUN_EXE="$<TARGET_FILE:clio_run>")
 
 set_target_properties(${IPC_TRANSPORT_MODES_TEST_TARGET} PROPERTIES
   CXX_STANDARD 20
@@ -429,6 +449,11 @@ target_link_libraries(${CLIENT_RETRY_TEST_TARGET}
   ctp::cxx                  # ClioCtp library
   ${CMAKE_THREAD_LIBS_INIT}  # Threading support
 )
+
+# RuntimeServer launches clio_run; ensure it is built and discoverable.
+add_dependencies(${CLIENT_RETRY_TEST_TARGET} clio_run)
+target_compile_definitions(${CLIENT_RETRY_TEST_TARGET} PRIVATE
+  CLIO_RUN_EXE="$<TARGET_FILE:clio_run>")
 
 set_target_properties(${CLIENT_RETRY_TEST_TARGET} PROPERTIES
   CXX_STANDARD 20

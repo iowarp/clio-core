@@ -388,7 +388,10 @@ bool IpcManager::ServerInit() {
     }
 
     try {
-      // IPC server on Unix domain socket
+      // IPC server on Unix domain socket. Ensure the per-user bookkeeping
+      // directory exists first -- on Windows it lives under %TEMP% and is
+      // not created by default, so binding the socket would otherwise fail.
+      ctp::SystemInfo::EnsureMemfdDir();
       std::string ipc_path =
           ctp::SystemInfo::GetMemfdPath("chimaera_" + std::to_string(port) + ".ipc");
       client_ipc_transport_ = ctp::lbm::TransportFactory::Get(
@@ -437,7 +440,25 @@ void IpcManager::ClientFinalize() {
   // Clients should not destroy shared resources
 }
 
+void IpcManager::RegisterTransportShutdownHook(std::function<void()> hook) {
+  std::lock_guard<std::mutex> lock(transport_shutdown_hooks_mutex_);
+  transport_shutdown_hooks_.push_back(std::move(hook));
+}
+
 void IpcManager::ClearTransports() {
+  // Stop any module-owned threads that hold a raw transport pointer BEFORE we
+  // free the transports below. Hooks run once; move them out under the lock so
+  // a hook that re-enters (or a second ClearTransports call from
+  // ServerFinalize) sees an empty list.
+  std::vector<std::function<void()>> hooks;
+  {
+    std::lock_guard<std::mutex> lock(transport_shutdown_hooks_mutex_);
+    hooks.swap(transport_shutdown_hooks_);
+  }
+  for (auto &hook : hooks) {
+    if (hook) hook();
+  }
+
   local_transport_.reset();
   main_transport_.reset();
   client_tcp_transport_.reset();

@@ -39,6 +39,7 @@
  */
 
 #include "../simple_test.h"
+#include "../runtime_server.h"
 
 #include <fcntl.h>
 #include <signal.h>
@@ -58,102 +59,11 @@
 
 using namespace chi;
 
-/**
- * Helper to cleanup shared memory
- */
-void CleanupSharedMemory() {
-  const char *user = std::getenv("USER");
-  std::string memfd_path =
-      std::string("/tmp/chimaera_") + (user ? user : "unknown") +
-      "/chi_main_segment_" + (user ? user : "");
-  unlink(memfd_path.c_str());
-}
-
-/**
- * Helper to start server in background process via exec
- * Uses exec to avoid inheriting CHIMAERA_INIT static guard state.
- * The test binary itself is used with a special argument.
- * Returns server PID
- */
-pid_t StartServerProcess() {
-  pid_t server_pid = fork();
-  if (server_pid == 0) {
-    // Become process group leader so we can kill all children
-    setpgid(0, 0);
-
-    (void)freopen("/dev/null", "w", stdout);
-    (void)freopen("/tmp/chimaera_server_retry_test.log", "w", stderr);
-
-    // Use exec to get a clean process with no static guard state
-    setenv("CLIO_WITH_RUNTIME", "1", 1);
-    setenv("CHI_RETRY_TEST_SERVER_MODE", "1", 1);
-    execl("/proc/self/exe", "chimaera_client_retry_tests",
-          "--server-mode", nullptr);
-    // If exec fails, fall back to direct init
-    _exit(1);
-  }
-  // Parent also sets pgid to avoid race
-  setpgid(server_pid, server_pid);
-  return server_pid;
-}
-
-/**
- * Helper to wait for server to be ready
- */
-bool WaitForServer(int max_attempts = 50) {
-  const char *user = std::getenv("USER");
-  std::string memfd_path =
-      std::string("/tmp/chimaera_") + (user ? user : "unknown") +
-      "/chi_main_segment_" + (user ? user : "");
-
-  for (int i = 0; i < max_attempts; ++i) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-
-    int fd = open(memfd_path.c_str(), O_RDONLY);
-    if (fd >= 0) {
-      close(fd);
-      std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-      return true;
-    }
-  }
-  return false;
-}
-
-/**
- * Kill server and its entire process group, clean up all resources
- */
-void KillServerHard(pid_t server_pid) {
-  if (server_pid <= 0) return;
-
-  // Kill entire process group
-  kill(-server_pid, SIGKILL);
-  int status;
-  waitpid(server_pid, &status, 0);
-
-  // Clean up shared memory and sockets
-  CleanupSharedMemory();
-  // Remove unix domain socket
-  unlink("/tmp/chimaera_9413.ipc");
-  // Remove any /dev/shm artifacts
-  (void)system("rm -f /dev/shm/chimaera_* 2>/dev/null");
-
-  // Brief pause to let OS reclaim ports
-  std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-}
-
-/**
- * Helper to cleanup server process
- */
-void CleanupServer(pid_t server_pid) {
-  if (server_pid > 0) {
-    kill(-server_pid, SIGKILL);
-    int status;
-    waitpid(server_pid, &status, 0);
-    CleanupSharedMemory();
-    unlink("/tmp/chimaera_9413.ipc");
-    (void)system("rm -f /dev/shm/chimaera_* 2>/dev/null");
-  }
-}
+// The runtime server runs out-of-process via chi::test::RuntimeServer
+// (clio_run start). The previous fork()+execl("/proc/self/exe", "--server-mode")
+// approach was Linux-only: macOS has no /proc/self/exe, so execl failed and the
+// server never started. clio_run is portable. The client-death test still
+// fork()s a client (client mode does not dlopen, so it is macOS-safe).
 
 // ============================================================================
 // Helper: Server Restart test logic parameterized by IPC mode
@@ -162,11 +72,10 @@ void CleanupServer(pid_t server_pid) {
 void TestServerRestart(const std::string &mode) {
   setenv("CLIO_CLIENT_RETRY_TIMEOUT", "30", 1);
 
-  // 1. Fork first server, wait for ready
-  pid_t server1 = StartServerProcess();
-  REQUIRE(server1 > 0);
-  bool ready = WaitForServer();
-  REQUIRE(ready);
+  // 1. Start first server, wait for ready
+  chi::test::RuntimeServer server1;
+  REQUIRE(server1.Start());
+  REQUIRE(server1.WaitForReady());
 
   // 2. Client connects
   setenv("CLIO_IPC_MODE", mode.c_str(), 1);
@@ -189,15 +98,15 @@ void TestServerRestart(const std::string &mode) {
     INFO("Baseline task completed for mode " + mode);
   }
 
-  // 4-5. Kill server hard and clean up all resources
-  KillServerHard(server1);
-  INFO("Server killed and resources cleaned");
+  // 4-5. Stop the server (simulating loss) and let the OS reclaim the port
+  server1.Stop();
+  std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+  INFO("Server stopped and resources cleaned");
 
-  // 6. Fork new server, wait for ready
-  pid_t server2 = StartServerProcess();
-  REQUIRE(server2 > 0);
-  ready = WaitForServer(100);  // More attempts for restart scenario
-  REQUIRE(ready);
+  // 6. Start a new server, wait for ready
+  chi::test::RuntimeServer server2;
+  REQUIRE(server2.Start());
+  REQUIRE(server2.WaitForReady(40000));  // More time for restart scenario
   INFO("New server started");
 
   // 7. ReconnectToOriginalHost to re-attach to new server
@@ -217,9 +126,7 @@ void TestServerRestart(const std::string &mode) {
     REQUIRE(task->return_code_ == 0);
     INFO("Post-restart task completed for mode " + mode);
   }
-
-  // Cleanup
-  CleanupServer(server2);
+  // server2 stopped by RuntimeServer destructor (RAII)
 }
 
 // ============================================================================
@@ -229,11 +136,10 @@ void TestServerRestart(const std::string &mode) {
 void TestClientDeath(const std::string &mode) {
   setenv("CLIO_CLIENT_RETRY_TIMEOUT", "30", 1);
 
-  // 1. Fork server, wait for ready
-  pid_t server_pid = StartServerProcess();
-  REQUIRE(server_pid > 0);
-  bool ready = WaitForServer();
-  REQUIRE(ready);
+  // 1. Start server, wait for ready
+  chi::test::RuntimeServer server;
+  REQUIRE(server.Start());
+  REQUIRE(server.WaitForReady());
 
   // 2. Fork a client child that submits a task then dies immediately
   pid_t client_child = fork();
@@ -291,9 +197,7 @@ void TestClientDeath(const std::string &mode) {
     INFO("Parent task completed — server survived client death for mode " +
          mode);
   }
-
-  // Cleanup
-  CleanupServer(server_pid);
+  // server stopped by RuntimeServer destructor (RAII)
 }
 
 // ============================================================================
@@ -333,17 +237,9 @@ TEST_CASE("ClientRetry - Client Death SHM", "[client_retry][shm]") {
 }
 
 int main(int argc, char* argv[]) {
-  // Server mode: started by StartServerProcess() via exec
-  if (argc > 1 && std::string(argv[1]) == "--server-mode") {
-    bool success = CHIMAERA_INIT(ChimaeraMode::kServer, true);
-    if (!success) {
-      return 1;
-    }
-    sleep(300);  // 5 minutes max, parent will SIGKILL us
-    return 0;
-  }
-
-  // Normal test mode
+  // The runtime server is now launched out-of-process via clio_run
+  // (chi::test::RuntimeServer), so this binary no longer re-execs itself in a
+  // "--server-mode"; it only runs tests.
   std::string filter = "";
   if (argc > 1) {
     filter = argv[1];

@@ -36,6 +36,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -216,6 +217,19 @@ class IpcManager {
    * are owned by Worker objects freed during Finalize().
    */
   void ClearTransports();
+
+  /**
+   * Register a callback to run at the very start of ClearTransports(), while
+   * the transport objects are still alive. Modules that spawn background
+   * threads holding a raw transport pointer (e.g. the admin module's
+   * peer/client recv threads, which cache GetMainTransport()) MUST register a
+   * hook here that stops and joins those threads. Otherwise the threads keep
+   * calling Recv() on a transport that ClearTransports() has freed -- a
+   * use-after-free that is benign on Linux (Recv returns EAGAIN and the thread
+   * sleeps) but a hard crash on macOS (Recv busy-spins on ENOTSOCK over freed
+   * memory). Hooks run once and are then cleared.
+   */
+  void RegisterTransportShutdownHook(std::function<void()> hook);
 
   /**
    * Server finalize - cleanup all IPC resources
@@ -1348,6 +1362,11 @@ class IpcManager {
 
   // Main ZeroMQ transport (server mode) for distributed communication
   ctp::lbm::TransportPtr main_transport_;
+
+  // Callbacks run at the start of ClearTransports() to stop module-owned
+  // threads that hold raw transport pointers. See RegisterTransportShutdownHook.
+  std::mutex transport_shutdown_hooks_mutex_;
+  std::vector<std::function<void()>> transport_shutdown_hooks_;
 
   // IPC transport mode (TCP default, configurable via CHI_IPC_MODE)
   IpcMode ipc_mode_ = IpcMode::kTcp;

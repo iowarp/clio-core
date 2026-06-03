@@ -74,10 +74,14 @@
 // Logging
 #include <clio_ctp/util/logging.h>
 
+#include <filesystem>
+
 // Test configuration
 constexpr size_t kDefaultFileSizeMB = 256;
 constexpr size_t kMB = 1024 * 1024;
-const std::string kTestFileName = "/tmp/test_binary_assim_file.bin";
+const std::string kTestFileName =
+    (std::filesystem::temp_directory_path() / "test_binary_assim_file.bin")
+        .string();
 const std::string kTestTagName = "test_binary_assim_tag";
 
 /**
@@ -286,6 +290,13 @@ int main(int argc, char* argv[]) {
     } catch (const std::exception& e) {
       HLOG(kError, "Failed to load OMNI file: {}", e.what());
       return 1;
+    }
+
+    // The OMNI file hardcodes a /tmp source path, but the test data file is
+    // generated under the portable temp dir (no /tmp on Windows). Point the
+    // transfer source at the file we actually wrote.
+    for (auto& ctx : contexts) {
+      ctx.src = "file::" + kTestFileName;
     }
 
     // Step 5: Call ParseOmni (serialization happens transparently in ParseOmniTask)

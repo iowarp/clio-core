@@ -194,7 +194,25 @@ class ConfigParse {
     if (num_text == "inf") {
       return std::numeric_limits<T>::max();
     }
-    std::stringstream(num_text) >> size;
+    // Parse only the leading numeric run. libc++ (macOS) extracts
+    // floating-point values per the full C99 grammar, so a trailing unit
+    // letter that doubles as float syntax -- 'p'/'P' (hex-float binary
+    // exponent), 'x'/'X', 'e'/'E' -- is consumed as part of the number and
+    // sets failbit when no exponent digits follow. That made ParseSize("1p")
+    // return 0 on macOS while libstdc++ (Linux) stopped at 'p' and returned
+    // 1. Slice off the unit suffix first so only sign, digits and the
+    // decimal point reach the stream.
+    size_t i = 0;
+    if (i < num_text.size() && (num_text[i] == '+' || num_text[i] == '-')) {
+      ++i;
+    }
+    for (; i < num_text.size(); ++i) {
+      char c = num_text[i];
+      if ((c < '0' || c > '9') && c != '.') {
+        break;
+      }
+    }
+    std::stringstream(num_text.substr(0, i)) >> size;
     return size;
   }
 

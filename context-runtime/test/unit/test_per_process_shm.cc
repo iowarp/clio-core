@@ -53,6 +53,7 @@
 #endif
 
 #include "../simple_test.h"
+#include "../runtime_server.h"
 
 namespace {
 // Test setup helper - same pattern as other tests
@@ -60,65 +61,11 @@ bool initialize_chimaera() {
   return chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
 }
 
-/**
- * Start a CLIO Runtime server in a forked child process
- * @return Server process PID
- */
-pid_t StartServerProcess() {
-  pid_t server_pid = fork();
-  if (server_pid == 0) {
-    // Redirect child output to prevent log flooding
-    (void)freopen("/dev/null", "w", stdout);
-    (void)freopen("/dev/null", "w", stderr);
-    setenv("CLIO_WITH_RUNTIME", "1", 1);
-    bool success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kServer, true);
-    if (!success) {
-      _exit(1);
-    }
-    sleep(300);
-    _exit(0);
-  }
-  return server_pid;
-}
-
-/**
- * Wait for the server's shared memory segment to become available
- * @param max_attempts Maximum polling attempts
- * @return True if server is ready
- */
-bool WaitForServer(int max_attempts = 50) {
-  const char *user = std::getenv("USER");
-  std::string memfd_path =
-      std::string("/tmp/chimaera_") + (user ? user : "unknown") +
-      "/chi_main_segment_" + (user ? user : "");
-  for (int i = 0; i < max_attempts; ++i) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    int fd = open(memfd_path.c_str(), O_RDONLY);
-    if (fd >= 0) {
-      close(fd);
-      std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-      return true;
-    }
-  }
-  return false;
-}
-
-/**
- * Kill the server process and clean up shared memory
- * @param server_pid PID of the server process
- */
-void CleanupServer(pid_t server_pid) {
-  if (server_pid > 0) {
-    kill(server_pid, SIGTERM);
-    int status;
-    waitpid(server_pid, &status, 0);
-    const char *user = std::getenv("USER");
-    std::string memfd_path =
-        std::string("/tmp/chimaera_") + (user ? user : "unknown") +
-        "/chi_main_segment_" + (user ? user : "");
-    unlink(memfd_path.c_str());
-  }
-}
+// The runtime server is launched out-of-process via chi::test::RuntimeServer
+// (clio_run start) instead of fork()+CHIMAERA_INIT(kServer): fork-without-exec
+// deadlocks on macOS when the child dlopen()s ChiMods. The client child below
+// is still a real fork() -- client mode does not dlopen, so it is macOS-safe
+// and exercises the per-process shm path this test is about.
 
 // Constants for testing
 constexpr size_t k1MB = 1ULL * 1024 * 1024;
@@ -134,9 +81,9 @@ TEST_CASE("Per-process shared memory GetClientShmInfo",
           "[ipc][per_process_shm][shm_info][fork]") {
   // Fork a server, then fork a client child to test GetClientShmInfo.
   // Both children start with clean process state (no prior CHIMAERA_INIT).
-  pid_t server_pid = StartServerProcess();
-  REQUIRE(server_pid > 0);
-  REQUIRE(WaitForServer());
+  chi::test::RuntimeServer server;
+  REQUIRE(server.Start());
+  REQUIRE(server.WaitForReady());
 
   // Fork a client child to test GetClientShmInfo
   pid_t client_pid = fork();
@@ -172,8 +119,7 @@ TEST_CASE("Per-process shared memory GetClientShmInfo",
   int exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
   INFO("Client child exit code: " << exit_code);
   REQUIRE(exit_code == 0);
-
-  CleanupServer(server_pid);
+  // server stopped by RuntimeServer destructor (RAII)
 }
 
 TEST_CASE("Per-process shared memory AllocateBuffer medium sizes",

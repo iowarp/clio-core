@@ -143,6 +143,14 @@ private:
   std::thread peer_recv_thread_;
   std::thread client_recv_thread_;
 
+  /**
+   * Signal the dedicated recv threads to exit and join them. Idempotent (a
+   * second call is a no-op once the threads are joined). Invoked both from the
+   * IpcManager transport-shutdown hook (so the threads stop while the main
+   * transport is still alive) and from ~Runtime as a backstop.
+   */
+  void StopRecvThreads();
+
 public:
   /**
    * Constructor
