@@ -56,6 +56,8 @@ class Iowarp(CMakePackage):
     depends_on('msgpack-c')
     depends_on('libaio')
     depends_on('libzmq', when='+zmq')
+    depends_on('nlohmann-json')  # CAE label_client JSON parsing
+    depends_on('curl')           # CAE label_client HTTP (libcurl)
 
     # Python dependencies
     depends_on('python')

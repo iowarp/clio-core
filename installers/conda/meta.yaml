@@ -39,6 +39,8 @@ requirements:
     - catch2
     - libaio      # [linux]
     - liburing    # [linux]
+    - nlohmann_json
+    - libcurl
   run:
     - python
     - zeromq
@@ -49,6 +51,8 @@ requirements:
     - catch2
     - libaio      # [linux]
     - liburing    # [linux]
+    - nlohmann_json
+    - libcurl
     - pyyaml
     - msgpack-python
     - flask
