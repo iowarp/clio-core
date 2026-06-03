@@ -32,6 +32,7 @@
 #include <cstring>
 #include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -104,11 +105,11 @@ struct Args {
 
 static void PrintUsage(const char *prog) {
   std::cerr <<
-    "Usage: " << prog << " <tag_re> <blob_re> [options]\n"
+    "Usage: " << prog << " <tag_re> [blob_re] [options]\n"
     "\n"
     "Positional arguments:\n"
     "  tag_re    Full-string regex matched against tag names\n"
-    "  blob_re   Full-string regex matched against blob names\n"
+    "  blob_re   Full-string regex matched against blob names (default: .*)\n"
     "\n"
     "Mode flags (mutually exclusive):\n"
     "  --semantic QUERY     BM25 keyword query text\n"
@@ -124,25 +125,32 @@ static void PrintUsage(const char *prog) {
     "  --help               Show this message\n"
     "\n"
     "Examples:\n"
-    "  " << prog << " '.*' '.*'\n"
-    "  " << prog << " 'exp_.*' '.*'\n"
-    "  " << prog << " '.*' '.*' --semantic 'plasma temperature' --max 5\n"
-    "  " << prog << " '.*' '.*' --since 30m\n"
-    "  " << prog << " '.*' '.*' --tags-only\n";
+    "  " << prog << " '.*'\n"
+    "  " << prog << " 'exp_.*' 'chunk_[0-9]+'\n"
+    "  " << prog << " '/clio-core/.*' --semantic 'plasma temperature' --max 5\n"
+    "  " << prog << " '.*' --since 30m\n"
+    "  " << prog << " '.*' --tags-only\n";
 }
 
 static Args ParseArgs(int argc, char **argv) {
   Args a;
-  if (argc < 3) {
+  if (argc < 2) {
     PrintUsage(argv[0]);
     std::exit(1);
   }
 
   a.tag_re  = argv[1];
-  a.blob_re = argv[2];
+  a.blob_re = ".*";
+
+  // Consume argv[2] as blob_re only if it doesn't start with '-'
+  int first_flag = 2;
+  if (argc >= 3 && argv[2][0] != '-') {
+    a.blob_re = argv[2];
+    first_flag = 3;
+  }
 
   int mode_count = 0;
-  for (int i = 3; i < argc; ++i) {
+  for (int i = first_flag; i < argc; ++i) {
     std::string flag = argv[i];
 
     auto need_next = [&]() -> const char * {
@@ -223,6 +231,12 @@ static void PrintTableRegex(const std::vector<std::string> &tag_names,
 
 using namespace clio::cte::core;
 
+static std::string TagStr(const TagId &id) {
+  std::ostringstream os;
+  os << "(" << id.major_ << "," << id.minor_ << ")";
+  return os.str();
+}
+
 static void PrintTableSemantic(const std::vector<SemanticSearchResult> &results) {
   std::cout << std::left  << std::setw(6)  << "RANK"
             << std::right << std::setw(10) << "SCORE"
@@ -237,7 +251,7 @@ static void PrintTableSemantic(const std::vector<SemanticSearchResult> &results)
               << std::right << std::setw(10) << std::fixed
                             << std::setprecision(6) << r.score_
               << "  "
-              << std::left  << std::setw(30) << r.tag_name_
+              << std::left  << std::setw(30) << TagStr(r.tag_id_)
               << std::left  << std::setw(40) << r.blob_name_
               << "\n";
     ++rank;
@@ -253,7 +267,7 @@ static void PrintTableTemporal(const std::vector<TemporalSearchResult> &results)
   std::cout << std::string(92, '-') << "\n";
   for (const auto &r : results) {
     std::cout << std::left  << std::setw(22) << r.last_modified_
-              << std::left  << std::setw(30) << r.tag_name_
+              << std::left  << std::setw(30) << TagStr(r.tag_id_)
               << std::left  << std::setw(40) << r.blob_name_
               << "\n";
   }
@@ -264,7 +278,7 @@ static void PrintJsonRegex(const std::vector<std::string> &tag_names,
                            const std::vector<std::string> &blob_names) {
   std::cout << "[\n";
   for (size_t i = 0; i < blob_names.size(); ++i) {
-    std::cout << "  {\"tag_name\": \"" << tag_names[i]
+    std::cout << "  {\"tag_id\": \"" << tag_names[i]
               << "\", \"blob_name\": \"" << blob_names[i] << "\"}"
               << (i + 1 < blob_names.size() ? "," : "") << "\n";
   }
@@ -275,7 +289,7 @@ static void PrintJsonSemantic(const std::vector<SemanticSearchResult> &results) 
   std::cout << "[\n";
   for (size_t i = 0; i < results.size(); ++i) {
     const auto &r = results[i];
-    std::cout << "  {\"tag_name\": \"" << r.tag_name_
+    std::cout << "  {\"tag_id\": \"" << TagStr(r.tag_id_)
               << "\", \"blob_name\": \"" << r.blob_name_ << "\", \"score\": "
               << std::fixed << std::setprecision(6) << r.score_ << "}"
               << (i + 1 < results.size() ? "," : "") << "\n";
@@ -287,7 +301,7 @@ static void PrintJsonTemporal(const std::vector<TemporalSearchResult> &results) 
   std::cout << "[\n";
   for (size_t i = 0; i < results.size(); ++i) {
     const auto &r = results[i];
-    std::cout << "  {\"tag_name\": \"" << r.tag_name_
+    std::cout << "  {\"tag_id\": \"" << TagStr(r.tag_id_)
               << "\", \"blob_name\": \"" << r.blob_name_
               << "\", \"last_modified\": " << r.last_modified_ << "}"
               << (i + 1 < results.size() ? "," : "") << "\n";
@@ -330,7 +344,7 @@ static int RunSearch(clio::cte::core::Client *client, const Args &a) {
 
     if (a.tags_only) {
       std::vector<std::string> tag_names;
-      for (const auto &r : task->results_) { tag_names.push_back(r.tag_name_); }
+      for (const auto &r : task->results_) { tag_names.push_back(TagStr(r.tag_id_)); }
       PrintTagsOnly(tag_names);
     } else if (a.format == "json") {
       PrintJsonTemporal(task->results_);
@@ -338,7 +352,7 @@ static int RunSearch(clio::cte::core::Client *client, const Args &a) {
       PrintTableTemporal(task->results_);
     } else {
       for (const auto &r : task->results_) {
-        std::cout << r.tag_name_ << "/" << r.blob_name_ << "\n";
+        std::cout << TagStr(r.tag_id_) << "/" << r.blob_name_ << "\n";
       }
     }
     return 0;
@@ -353,7 +367,7 @@ static int RunSearch(clio::cte::core::Client *client, const Args &a) {
 
     if (a.tags_only) {
       std::vector<std::string> tag_names;
-      for (const auto &r : task->results_) { tag_names.push_back(r.tag_name_); }
+      for (const auto &r : task->results_) { tag_names.push_back(TagStr(r.tag_id_)); }
       PrintTagsOnly(tag_names);
     } else if (a.format == "json") {
       PrintJsonSemantic(task->results_);
@@ -361,7 +375,7 @@ static int RunSearch(clio::cte::core::Client *client, const Args &a) {
       PrintTableSemantic(task->results_);
     } else {
       for (const auto &r : task->results_) {
-        std::cout << r.tag_name_ << "/" << r.blob_name_ << "\n";
+        std::cout << TagStr(r.tag_id_) << "/" << r.blob_name_ << "\n";
       }
     }
     return 0;
