@@ -739,7 +739,15 @@ uint64_t SystemInfo::ThreadCpuTimeNs() {
 
 std::string SystemInfo::GetMathLibraryName() {
 #if CTP_ENABLE_PROCFS_SYSINFO
+#if __APPLE__
+  // macOS ships the math functions in libSystem; /usr/lib/libm.dylib is the
+  // dlopen-able entry (resolved via the dyld shared cache) and exports the
+  // standard symbols (sin/cos/...). "libm.so.6" does not exist on macOS, so
+  // SharedLibrary(GetMathLibraryName()).GetSymbol("sin") returned null there.
+  return "libm.dylib";
+#else
   return "libm.so.6";
+#endif
 #elif CTP_ENABLE_WINDOWS_SYSINFO
   return "ucrtbase.dll";
 #endif

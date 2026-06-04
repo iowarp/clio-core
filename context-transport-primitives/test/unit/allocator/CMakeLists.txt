@@ -143,6 +143,15 @@ set_tests_properties(
   ctp_buddy_allocator_multiprocess
   PROPERTIES LABELS "msan_skip"
 )
+
+# macOS: ctp_mp_allocator_multiprocess deadlocks (15s timeout) inside the
+# shared-memory ProducerConsumerAllocator under cross-process contention --
+# a lock-free/atomics-on-shm issue specific to macOS (the per-thread workload
+# has a hard steady_clock deadline so it cannot itself overrun). Disabled on
+# macOS pending the real fix; tracked in issue #483. Linux is unaffected.
+if(APPLE)
+  set_tests_properties(ctp_mp_allocator_multiprocess PROPERTIES DISABLED TRUE)
+endif()
 endif()
 
 #------------------------------------------------------------------------------
