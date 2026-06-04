@@ -320,6 +320,7 @@ endif()
 target_compile_definitions(compress INTERFACE
     CTP_ENABLE_COMPRESS=$<BOOL:${CLIO_CTE_ENABLE_COMPRESS}>
     CTP_ENABLE_LIBPRESSIO=$<BOOL:${CLIO_CTP_ENABLE_LIBPRESSIO}>
+    CTP_ENABLE_NVCOMP=$<BOOL:${CLIO_CTP_ENABLE_NVCOMP}>
 )
 add_library(ctp::compress ALIAS compress)
 

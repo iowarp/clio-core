@@ -474,6 +474,22 @@ if(CLIO_CTE_ENABLE_COMPRESS)
         endif()
     endif()
 
+    # nvcomp (NVIDIA GPU compression) - optional, requires CUDA.
+    # The redistributable ships nvcomp-config.cmake, so find_package works and
+    # exposes the imported target nvcomp::nvcomp (which pulls in CUDA::cudart).
+    set(CLIO_CTP_ENABLE_NVCOMP OFF)
+    if(CLIO_CORE_ENABLE_CUDA)
+        find_package(nvcomp QUIET)
+        if(nvcomp_FOUND)
+            message(STATUS "found nvcomp ${nvcomp_VERSION} (GPU compression) - target nvcomp::nvcomp")
+            set(CLIO_CTP_ENABLE_NVCOMP ON)
+        else()
+            message(STATUS "nvcomp not found - GPU compression (nvcomp) will be disabled")
+        endif()
+    else()
+        message(STATUS "CLIO_CORE_ENABLE_CUDA is OFF - GPU compression (nvcomp) disabled")
+    endif()
+
     set(COMPRESS_LIBS
         bz2
         ${lzo2_LIBRARIES}
@@ -514,8 +530,15 @@ if(CLIO_CTE_ENABLE_COMPRESS)
         list(APPEND COMPRESS_LIB_DIRS ${libpressio_LIBRARY_DIRS})
     endif()
 
+    # Only add nvcomp if found (imported target carries its own includes)
+    if(CLIO_CTP_ENABLE_NVCOMP)
+        list(APPEND COMPRESS_LIBS nvcomp::nvcomp)
+    endif()
+
     # Make CTP_ENABLE_LIBPRESSIO available to subdirectories (CTP)
     set(CLIO_CTP_ENABLE_LIBPRESSIO ${CLIO_CTP_ENABLE_LIBPRESSIO} CACHE BOOL "Enable LibPressio wrapper (auto-detected)" FORCE)
+    # Make CTP_ENABLE_NVCOMP available to subdirectories (CTP)
+    set(CLIO_CTP_ENABLE_NVCOMP ${CLIO_CTP_ENABLE_NVCOMP} CACHE BOOL "Enable nvcomp GPU compression (auto-detected)" FORCE)
 endif()
 
 # Encryption libraries (conditional)
