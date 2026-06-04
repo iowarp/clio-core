@@ -106,6 +106,36 @@ jobs:
             -LE "integration|restart|functional|query|stress|docker" \
             -E "cr_bdev_|cr_mpi_|cr_per_process_shm_stress"
 
+      - name: Backtrace cte_functional_all crash (diagnostic)
+        if: always()
+        continue-on-error: true
+        run: |
+          if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
+            source "$HOME/miniconda3/etc/profile.d/conda.sh"
+          elif [ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]; then
+            source "$HOME/anaconda3/etc/profile.d/conda.sh"
+          elif command -v conda >/dev/null 2>&1; then
+            eval "$(conda shell.bash hook)"
+          fi
+          conda activate iowarp || true
+
+          # cte_functional_all (test_core_functionality) segfaults
+          # intermittently on macos-26-intel (~2/3). Launch it under lldb a few
+          # times to capture the crash backtrace so the race can be fixed.
+          BIN=build/bin/test_core_functionality
+          if [ ! -x "$BIN" ]; then echo "(binary not found: $BIN)"; exit 0; fi
+          for i in 1 2 3 4 5; do
+            echo "::group::lldb attempt $i"
+            lldb --batch \
+              -o "settings set target.process.stop-on-sharedlibrary-events false" \
+              -o "run" \
+              -o "thread backtrace all" \
+              -o "quit" \
+              -- "$BIN" 2>&1 | tail -n 200
+            echo "::endgroup::"
+          done
+          echo "(lldb diagnostic complete)"
+
       - name: Submit results to CDash
         if: always()
         continue-on-error: true
