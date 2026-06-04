@@ -22,6 +22,20 @@ RUN userdel -r ubuntu || true
 # - NVIDIA Container Toolkit
 # - GPU environment variables (CUDA_HOME, NVIDIA_VISIBLE_DEVICES, etc.)
 
+# Install nvcomp (NVIDIA GPU compression library) for the CUDA 12 toolchain.
+# The redistributable tarball ships include/, lib/ (libnvcomp.so) and CMake
+# package files; installing into /usr/local makes find_package(nvcomp) work.
+ARG NVCOMP_VERSION=4.2.0.11
+RUN set -eux; \
+    cd /tmp; \
+    archive="nvcomp-linux-x86_64-${NVCOMP_VERSION}_cuda12-archive"; \
+    curl -fsSLO "https://developer.download.nvidia.com/compute/nvcomp/redist/nvcomp/linux-x86_64/${archive}.tar.xz"; \
+    tar -xf "${archive}.tar.xz"; \
+    cp -a "${archive}/include/." /usr/local/include/; \
+    cp -a "${archive}/lib/." /usr/local/lib/; \
+    ldconfig; \
+    rm -rf /tmp/nvcomp*
+
 # Remap iowarp user UID/GID to match the host user.
 # This avoids file permission issues with bind-mounted volumes.
 # Override at build time: --build-arg HOST_UID=$(id -u) --build-arg HOST_GID=$(id -g)
