@@ -99,8 +99,10 @@ jobs:
 
           cd build
           # Same exclusions as CI/calculate_coverage.sh so we compare apples
-          # to apples with the CDash "coverage" build.
-          ctest --output-on-failure --timeout 120 \
+          # to apples with the CDash "coverage" build. -T Test writes the
+          # dashboard XML once so the CDash step can submit it without re-running
+          # the whole suite (which would double the macOS CI time).
+          ctest -T Test --output-on-failure --timeout 120 \
             -LE "integration|restart|functional|query|stress|docker" \
             -E "cr_bdev_|cr_mpi_|cr_per_process_shm_stress"
 
@@ -118,12 +120,45 @@ jobs:
           conda activate iowarp || true
 
           cd build
-          # Non-fatal CDash submission (start a fresh Experimental track, run
-          # the same filtered test set, and push it to my.cdash.org/HERMES).
-          ctest -D ExperimentalTest -D ExperimentalSubmit \
-            --timeout 120 \
-            -LE "integration|restart|functional|query|stress|docker" \
-            -E "cr_bdev_|cr_mpi_|cr_per_process_shm_stress" || true
+          # Non-fatal: submit the already-produced Test.xml to
+          # my.cdash.org/HERMES (no re-run of the suite).
+          ctest -T Submit || true
+
+      - name: Diagnose cross-process failures (capture daemon logs)
+        if: always()
+        run: |
+          if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
+            source "$HOME/miniconda3/etc/profile.d/conda.sh"
+          elif [ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]; then
+            source "$HOME/anaconda3/etc/profile.d/conda.sh"
+          elif command -v conda >/dev/null 2>&1; then
+            eval "$(conda shell.bash hook)"
+          fi
+          conda activate iowarp || true
+
+          # The cross-process tests spawn `clio_run start` as a separate daemon
+          # whose stdout is redirected to CLIO_TEST_SERVER_LOG (default
+          # /tmp/clio_run_test_server.log, overwritten per test). Re-run the
+          # representative failing tests one at a time with a per-test daemon
+          # log so we can see the SERVER side (does it crash, receive the
+          # connect task, fail to send the response?) — invisible in the normal
+          # ctest output. Non-fatal: this step is pure diagnostics.
+          mkdir -p "$RUNNER_TEMP/daemon-logs"
+          cd build
+          for t in \
+            cr_external_client_basic_connection \
+            cr_ipc_transport_tcp \
+            cr_ipc_transport_shm \
+            cr_per_process_shm_tests \
+            cr_autogen_coverage_tests; do
+            dlog="$RUNNER_TEMP/daemon-logs/$t.daemon.log"
+            echo "::group::diag $t"
+            CLIO_TEST_SERVER_LOG="$dlog" \
+              ctest -R "^${t}$" -V --timeout 120 --output-on-failure || true
+            echo "----- daemon log: $t -----"
+            tail -n 250 "$dlog" 2>/dev/null || echo "(no daemon log written)"
+            echo "::endgroup::"
+          done
 
       - name: Summarize failed tests
         if: always()
@@ -148,4 +183,6 @@ jobs:
           path: |
             build/Testing/Temporary/LastTest.log
             build/Testing/Temporary/CTestCostData.txt
+            ${{ runner.temp }}/daemon-logs/
+            /tmp/clio_run_test_server.log
           if-no-files-found: warn
