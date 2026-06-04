@@ -704,9 +704,19 @@ endif()
 # already-freed runtime memory, producing non-deterministic heap-use-after-free
 # defects under ASan.  The same uninstrumented-runtime category caused all CTE
 # tests to be msan_skip'd.  Skip the whole functional group under ASan.
+#
+# IMPORTANT: keep the "functional" label here. set_tests_properties(LABELS ...)
+# REPLACES the label list, so this must repeat functional;core;cte (set above)
+# or it clobbers them -- which previously dropped cte_functional_all out of the
+# `ctest -LE functional` filter used by both the coverage gate
+# (CI/calculate_coverage.sh) and the macOS workflow, letting this heavy
+# functional test leak into those runs. On macOS it then SEGFAULTs
+# intermittently via a coroutine_handle use-after-free in the worker
+# (issue #485, the same UAF noted above). Restoring the label filters it out
+# consistently, as originally intended.
 set_tests_properties(
     cte_functional_all
-    PROPERTIES LABELS "msan_skip;asan_skip"
+    PROPERTIES LABELS "functional;core;cte;msan_skip;asan_skip"
 )
 
 # ------------------------------------------------------------------------------
