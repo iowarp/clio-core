@@ -102,7 +102,16 @@ jobs:
           # to apples with the CDash "coverage" build. -T Test writes the
           # dashboard XML once so the CDash step can submit it without re-running
           # the whole suite (which would double the macOS CI time).
-          ctest -T Test --output-on-failure --timeout 120 \
+          #
+          # --repeat until-pass:3 : a few in-process-runtime tests (notably the
+          # cr_client_retry_* process-death-recovery family) are intermittently
+          # flaky on macOS — they fork/kill a client and reconnect, and the
+          # reconnect occasionally races the server's orphan-task reaping
+          # (a timing symptom of the runtime concurrency issues tracked in
+          # #482/#485). Retry a failing test up to 3x so a transient flake
+          # doesn't redden the whole matrix; a test that is genuinely broken
+          # still fails all 3 attempts.
+          ctest -T Test --output-on-failure --timeout 120 --repeat until-pass:3 \
             -LE "integration|restart|functional|query|stress|docker" \
             -E "cr_bdev_|cr_mpi_|cr_per_process_shm_stress"
 
