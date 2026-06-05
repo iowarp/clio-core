@@ -157,9 +157,15 @@ TEST_CASE("CompressorRegistryMappings") {
     REQUIRE(CompressionFactory::NameForWireId(9) == "zlib");
     REQUIRE(CompressionFactory::NameForWireId(10) == "zstd");
     REQUIRE(CompressionFactory::NameForWireId(11) == "nvcomp-lz4");
-    // Out-of-range falls back to the historical default.
+    REQUIRE(CompressionFactory::NameForWireId(12) == "nvcomp-snappy");
+    REQUIRE(CompressionFactory::NameForWireId(13) == "nvcomp-zstd");
+    REQUIRE(CompressionFactory::NameForWireId(14) == "nvcomp-gdeflate");
+    REQUIRE(CompressionFactory::NameForWireId(15) == "nvcomp-deflate");
+    REQUIRE(CompressionFactory::NameForWireId(16) == "nvcomp-ans");
+    // Out-of-range falls back to the historical default. (Registry rows are
+    // build-independent, so the GPU names above resolve even without nvcomp.)
     REQUIRE(CompressionFactory::NameForWireId(-1) == "zstd");
-    REQUIRE(CompressionFactory::NameForWireId(12) == "zstd");
+    REQUIRE(CompressionFactory::NameForWireId(17) == "zstd");
     REQUIRE(CompressionFactory::NameForWireId(9999) == "zstd");
   }
 
@@ -193,11 +199,15 @@ TEST_CASE("CompressorRegistryMappings") {
     // Unknown library -> 0.
     REQUIRE(CompressionFactory::GetLibraryId("does-not-exist", BAL) == 0);
 
-#if CTP_ENABLE_NVCOMP
-    // GPU compressor: single-mode, base_id 13.
+    // GPU compressors: single-mode (preset forced to 2), base_ids 13-19. These
+    // are build-independent -- the registry rows resolve even without nvcomp.
     REQUIRE(CompressionFactory::GetLibraryId("nvcomp-lz4", FAST) == 132);
     REQUIRE(CompressionFactory::GetLibraryId("nvcomp-lz4", BEST) == 132);
-#endif
+    REQUIRE(CompressionFactory::GetLibraryId("nvcomp-snappy", BAL) == 142);
+    REQUIRE(CompressionFactory::GetLibraryId("nvcomp-zstd", BAL) == 152);
+    REQUIRE(CompressionFactory::GetLibraryId("nvcomp-gdeflate", BAL) == 162);
+    REQUIRE(CompressionFactory::GetLibraryId("nvcomp-deflate", BAL) == 172);
+    REQUIRE(CompressionFactory::GetLibraryId("nvcomp-ans", BAL) == 182);
   }
 
   PAGE_DIVIDE("ML library id -> name + preset (reverse)") {
@@ -215,9 +225,13 @@ TEST_CASE("CompressorRegistryMappings") {
     // Unknown ids -> "unknown".
     REQUIRE(CompressionFactory::GetLibraryInfo(0).first == "unknown");
     REQUIRE(CompressionFactory::GetLibraryInfo(999).first == "unknown");
-#if CTP_ENABLE_NVCOMP
+    // GPU compressors (build-independent).
     REQUIRE(CompressionFactory::GetLibraryInfo(132).first == "nvcomp-lz4");
-#endif
+    REQUIRE(CompressionFactory::GetLibraryInfo(142).first == "nvcomp-snappy");
+    REQUIRE(CompressionFactory::GetLibraryInfo(152).first == "nvcomp-zstd");
+    REQUIRE(CompressionFactory::GetLibraryInfo(162).first == "nvcomp-gdeflate");
+    REQUIRE(CompressionFactory::GetLibraryInfo(172).first == "nvcomp-deflate");
+    REQUIRE(CompressionFactory::GetLibraryInfo(182).first == "nvcomp-ans");
   }
 
   PAGE_DIVIDE("GetPreset constructs known CPU compressors (incl. alias)") {
@@ -260,13 +274,27 @@ TEST_CASE("CompressorRegistryMappings") {
       REQUIRE(payload == std::string(dbuf.data(), dsize));
     }
   }
+
+#if CTP_ENABLE_NVCOMP
+  // GPU compressor construction needs no device (NvComp touches the GPU only on
+  // Compress/Decompress). Confirms every nvcomp registry row has a live make().
+  PAGE_DIVIDE("GetPreset constructs GPU compressors (no device needed)") {
+    const char *gpu_libs[] = {"nvcomp-lz4",      "nvcomp-snappy",
+                              "nvcomp-zstd",     "nvcomp-gdeflate",
+                              "nvcomp-deflate",  "nvcomp-ans"};
+    for (const char *lib : gpu_libs) {
+      INFO("nvcomp format: " << lib);
+      REQUIRE(CompressionFactory::GetPreset(lib) != nullptr);
+    }
+  }
+#endif
 }
 
 #if CTP_ENABLE_NVCOMP
 // GPU compression via nvcomp. Mirrors the CPU compressor coverage above (a
 // direct-class Compress/Decompress round-trip) and adds GPU-specific coverage:
-// a factory round-trip (validates the "nvcomp-lz4" registration) and the
-// library-id encoding round-trip.
+// a per-format factory round-trip over every registered nvcomp codec, the
+// device-pointer zero-copy path, and the library-id encoding round-trip.
 TEST_CASE("TestNvCompGpu") {
   // nvcomp needs a real GPU. Skip gracefully where none is present (CI, laptops,
   // Docker without --gpus) so the suite stays green everywhere.
@@ -356,6 +384,39 @@ TEST_CASE("TestNvCompGpu") {
     cudaFree(d_raw);
     cudaFree(d_comp);
     cudaFree(d_decomp);
+  }
+
+  // Every general-purpose nvcomp format must round-trip through the factory on
+  // real GPU data. Same shape as the CPU "factory round-trip" test above.
+  PAGE_DIVIDE("all nvcomp formats (factory round-trip)") {
+    std::string raw;
+    for (int i = 0; i < 4096; ++i) {
+      raw += "The quick brown fox jumps over the lazy dog 0123456789 ";
+    }
+    const char *gpu_libs[] = {"nvcomp-lz4",      "nvcomp-snappy",
+                              "nvcomp-zstd",     "nvcomp-gdeflate",
+                              "nvcomp-deflate",  "nvcomp-ans"};
+    for (const char *lib : gpu_libs) {
+      INFO("nvcomp format: " << lib);
+      auto compressor = ctp::CompressionFactory::GetPreset(lib);
+      REQUIRE(compressor != nullptr);
+
+      std::vector<char> compressed(raw.size() + raw.size() / 20 + 4096);
+      std::vector<char> decompressed(raw.size() + 16);
+
+      size_t cmpr_size = compressed.size();
+      REQUIRE(compressor->Compress(compressed.data(), cmpr_size,
+                                   raw.data(), raw.size()));
+      REQUIRE(cmpr_size > 0);
+      REQUIRE(cmpr_size < raw.size());  // repetitive data must shrink
+
+      auto decompressor = ctp::CompressionFactory::GetPreset(lib);
+      REQUIRE(decompressor != nullptr);
+      size_t raw_size = decompressed.size();
+      REQUIRE(decompressor->Decompress(decompressed.data(), raw_size,
+                                       compressed.data(), cmpr_size));
+      REQUIRE(raw == std::string(decompressed.data(), raw_size));
+    }
   }
 
   PAGE_DIVIDE("NvCompLZ4 library id round-trip") {

@@ -81,6 +81,9 @@ class CompressionFactory {
    *                     Supported: "bzip2", "zstd", "lz4", "zlib", "lzma",
    *                                "brotli", "snappy", "blosc2"
    *                                "zfp", "sz3", "fpzip" (if LibPressio enabled)
+   *                                "nvcomp-lz4", "nvcomp-snappy", "nvcomp-zstd",
+   *                                "nvcomp-gdeflate", "nvcomp-deflate",
+   *                                "nvcomp-ans" (if nvcomp enabled)
    * @param preset Compression preset level (FAST/BALANCED/BEST/DEFAULT)
    * @return Unique pointer to configured compressor instance,
    *         or nullptr if library not found
@@ -251,9 +254,47 @@ class CompressionFactory {
     return nullptr;
 #endif
   }
+  // GPU compressors (nvcomp). Each helper is always defined so its registry row
+  // is valid in every build; it returns nullptr when nvcomp is disabled (the
+  // name/ids still resolve, but GetPreset yields nullptr). All are single-mode.
   static std::unique_ptr<Compressor> MakeNvCompLz4(CompressionPreset) {
 #if CTP_ENABLE_NVCOMP
     return std::make_unique<NvComp>(NvCompAlgo::LZ4);
+#else
+    return nullptr;
+#endif
+  }
+  static std::unique_ptr<Compressor> MakeNvCompSnappy(CompressionPreset) {
+#if CTP_ENABLE_NVCOMP
+    return std::make_unique<NvComp>(NvCompAlgo::SNAPPY);
+#else
+    return nullptr;
+#endif
+  }
+  static std::unique_ptr<Compressor> MakeNvCompZstd(CompressionPreset) {
+#if CTP_ENABLE_NVCOMP
+    return std::make_unique<NvComp>(NvCompAlgo::ZSTD);
+#else
+    return nullptr;
+#endif
+  }
+  static std::unique_ptr<Compressor> MakeNvCompGdeflate(CompressionPreset) {
+#if CTP_ENABLE_NVCOMP
+    return std::make_unique<NvComp>(NvCompAlgo::GDEFLATE);
+#else
+    return nullptr;
+#endif
+  }
+  static std::unique_ptr<Compressor> MakeNvCompDeflate(CompressionPreset) {
+#if CTP_ENABLE_NVCOMP
+    return std::make_unique<NvComp>(NvCompAlgo::DEFLATE);
+#else
+    return nullptr;
+#endif
+  }
+  static std::unique_ptr<Compressor> MakeNvCompAns(CompressionPreset) {
+#if CTP_ENABLE_NVCOMP
+    return std::make_unique<NvComp>(NvCompAlgo::ANS);
 #else
     return nullptr;
 #endif
@@ -280,7 +321,12 @@ class CompressionFactory {
         CompressorInfo{"zfp",         8, 10, false, &MakeZfp},
         CompressorInfo{"zlib",        9,  4, false, &CreateLossless<ZlibWithModes>},
         CompressorInfo{"zstd",       10,  2, false, &CreateLossless<ZstdWithModes>},
-        CompressorInfo{"nvcomp-lz4", 11, 13, true,  &MakeNvCompLz4},
+        CompressorInfo{"nvcomp-lz4",      11, 13, true, &MakeNvCompLz4},
+        CompressorInfo{"nvcomp-snappy",   12, 14, true, &MakeNvCompSnappy},
+        CompressorInfo{"nvcomp-zstd",     13, 15, true, &MakeNvCompZstd},
+        CompressorInfo{"nvcomp-gdeflate", 14, 16, true, &MakeNvCompGdeflate},
+        CompressorInfo{"nvcomp-deflate",  15, 17, true, &MakeNvCompDeflate},
+        CompressorInfo{"nvcomp-ans",      16, 18, true, &MakeNvCompAns},
     };
     return kRegistry;
   }

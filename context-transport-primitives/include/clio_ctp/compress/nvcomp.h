@@ -37,8 +37,13 @@
 #if CTP_ENABLE_COMPRESS && CTP_ENABLE_NVCOMP
 
 #include <cuda_runtime.h>
+#include <nvcomp/ans.hpp>
+#include <nvcomp/deflate.hpp>
+#include <nvcomp/gdeflate.hpp>
 #include <nvcomp/lz4.hpp>
 #include <nvcomp/nvcompManagerFactory.hpp>
+#include <nvcomp/snappy.hpp>
+#include <nvcomp/zstd.hpp>
 
 #include <cstdint>
 #include <memory>
@@ -47,9 +52,20 @@
 
 namespace ctp {
 
-/** Supported nvcomp GPU compression algorithms. */
+/**
+ * Supported nvcomp GPU compression algorithms. All are general-purpose,
+ * byte-oriented lossless codecs that fit the byte-stream Compressor interface;
+ * each is run with nvcomp's default options (no per-algorithm tuning exposed).
+ * (nvcomp's GZIP manager is decompression-only, so it is intentionally absent;
+ * use DEFLATE for GPU-side deflate-stream compression.)
+ */
 enum class NvCompAlgo {
   LZ4,
+  SNAPPY,
+  ZSTD,
+  GDEFLATE,
+  DEFLATE,
+  ANS,
 };
 
 /**
@@ -243,6 +259,21 @@ class NvComp : public Compressor {
       case NvCompAlgo::LZ4:
         return std::make_shared<nvcomp::LZ4Manager>(
             kChunkSize, nvcompBatchedLZ4DefaultOpts, stream);
+      case NvCompAlgo::SNAPPY:
+        return std::make_shared<nvcomp::SnappyManager>(
+            kChunkSize, nvcompBatchedSnappyDefaultOpts, stream);
+      case NvCompAlgo::ZSTD:
+        return std::make_shared<nvcomp::ZstdManager>(
+            kChunkSize, nvcompBatchedZstdDefaultOpts, stream);
+      case NvCompAlgo::GDEFLATE:
+        return std::make_shared<nvcomp::GdeflateManager>(
+            kChunkSize, nvcompBatchedGdeflateDefaultOpts, stream);
+      case NvCompAlgo::DEFLATE:
+        return std::make_shared<nvcomp::DeflateManager>(
+            kChunkSize, nvcompBatchedDeflateDefaultOpts, stream);
+      case NvCompAlgo::ANS:
+        return std::make_shared<nvcomp::ANSManager>(
+            kChunkSize, nvcompBatchedANSDefaultOpts, stream);
     }
     return nullptr;
   }
