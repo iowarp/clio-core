@@ -135,6 +135,133 @@ TEST_CASE("TestCompress") {
   }
 }
 
+// Characterization test for the compressor registry's frozen ID mappings.
+// These values are the on-disk wire protocol and the ML id scheme; renumbering
+// any of them silently breaks stored blobs / trained models. The expected
+// numbers are transcribed from the historical source and must never drift.
+// (No GPU required: these are pure name<->id lookups.)
+TEST_CASE("CompressorRegistryMappings") {
+  using ctp::CompressionFactory;
+  using ctp::CompressionPreset;
+
+  PAGE_DIVIDE("wire id -> name (CompressionHeader.compress_lib_)") {
+    REQUIRE(CompressionFactory::NameForWireId(0) == "brotli");
+    REQUIRE(CompressionFactory::NameForWireId(1) == "bzip2");
+    REQUIRE(CompressionFactory::NameForWireId(2) == "blosc2");
+    REQUIRE(CompressionFactory::NameForWireId(3) == "fpzip");
+    REQUIRE(CompressionFactory::NameForWireId(4) == "lz4");
+    REQUIRE(CompressionFactory::NameForWireId(5) == "lzma");
+    REQUIRE(CompressionFactory::NameForWireId(6) == "snappy");
+    REQUIRE(CompressionFactory::NameForWireId(7) == "sz3");
+    REQUIRE(CompressionFactory::NameForWireId(8) == "zfp");
+    REQUIRE(CompressionFactory::NameForWireId(9) == "zlib");
+    REQUIRE(CompressionFactory::NameForWireId(10) == "zstd");
+    REQUIRE(CompressionFactory::NameForWireId(11) == "nvcomp-lz4");
+    // Out-of-range falls back to the historical default.
+    REQUIRE(CompressionFactory::NameForWireId(-1) == "zstd");
+    REQUIRE(CompressionFactory::NameForWireId(12) == "zstd");
+    REQUIRE(CompressionFactory::NameForWireId(9999) == "zstd");
+  }
+
+  PAGE_DIVIDE("name + preset -> ML library id (base_id*10 + preset)") {
+    const auto FAST = CompressionPreset::FAST;
+    const auto BAL = CompressionPreset::BALANCED;
+    const auto BEST = CompressionPreset::BEST;
+
+    // Multi-mode lossless: id = base_id*10 + {1,2,3}.
+    REQUIRE(CompressionFactory::GetLibraryId("bzip2", FAST) == 11);
+    REQUIRE(CompressionFactory::GetLibraryId("bzip2", BAL) == 12);
+    REQUIRE(CompressionFactory::GetLibraryId("bzip2", BEST) == 13);
+    REQUIRE(CompressionFactory::GetLibraryId("zstd", BAL) == 22);
+    REQUIRE(CompressionFactory::GetLibraryId("lz4", BAL) == 32);
+    REQUIRE(CompressionFactory::GetLibraryId("zlib", BAL) == 42);
+    REQUIRE(CompressionFactory::GetLibraryId("lzma", BAL) == 52);
+    REQUIRE(CompressionFactory::GetLibraryId("brotli", BEST) == 63);
+
+    // Single-mode: preset forced to 2 (BALANCED) regardless of request.
+    REQUIRE(CompressionFactory::GetLibraryId("snappy", FAST) == 72);
+    REQUIRE(CompressionFactory::GetLibraryId("snappy", BEST) == 72);
+    REQUIRE(CompressionFactory::GetLibraryId("blosc2", FAST) == 82);
+    REQUIRE(CompressionFactory::GetLibraryId("blosc", BEST) == 82);  // alias
+
+    // Lossy (base_id known regardless of LibPressio availability).
+    REQUIRE(CompressionFactory::GetLibraryId("zfp", FAST) == 101);
+    REQUIRE(CompressionFactory::GetLibraryId("zfp", BAL) == 102);
+    REQUIRE(CompressionFactory::GetLibraryId("sz3", BAL) == 112);
+    REQUIRE(CompressionFactory::GetLibraryId("fpzip", BEST) == 123);
+
+    // Unknown library -> 0.
+    REQUIRE(CompressionFactory::GetLibraryId("does-not-exist", BAL) == 0);
+
+#if CTP_ENABLE_NVCOMP
+    // GPU compressor: single-mode, base_id 13.
+    REQUIRE(CompressionFactory::GetLibraryId("nvcomp-lz4", FAST) == 132);
+    REQUIRE(CompressionFactory::GetLibraryId("nvcomp-lz4", BEST) == 132);
+#endif
+  }
+
+  PAGE_DIVIDE("ML library id -> name + preset (reverse)") {
+    REQUIRE(CompressionFactory::GetLibraryInfo(11).first == "bzip2");
+    REQUIRE(CompressionFactory::GetLibraryInfo(11).second ==
+            CompressionPreset::FAST);
+    REQUIRE(CompressionFactory::GetLibraryInfo(13).second ==
+            CompressionPreset::BEST);
+    REQUIRE(CompressionFactory::GetLibraryInfo(22).first == "zstd");
+    REQUIRE(CompressionFactory::GetLibraryInfo(72).first == "snappy");
+    REQUIRE(CompressionFactory::GetLibraryInfo(82).first == "blosc2");
+    REQUIRE(CompressionFactory::GetLibraryInfo(102).first == "zfp");
+    REQUIRE(CompressionFactory::GetLibraryInfo(112).first == "sz3");
+    REQUIRE(CompressionFactory::GetLibraryInfo(122).first == "fpzip");
+    // Unknown ids -> "unknown".
+    REQUIRE(CompressionFactory::GetLibraryInfo(0).first == "unknown");
+    REQUIRE(CompressionFactory::GetLibraryInfo(999).first == "unknown");
+#if CTP_ENABLE_NVCOMP
+    REQUIRE(CompressionFactory::GetLibraryInfo(132).first == "nvcomp-lz4");
+#endif
+  }
+
+  PAGE_DIVIDE("GetPreset constructs known CPU compressors (incl. alias)") {
+    REQUIRE(CompressionFactory::GetPreset("bzip2") != nullptr);
+    REQUIRE(CompressionFactory::GetPreset("zstd") != nullptr);
+    REQUIRE(CompressionFactory::GetPreset("lz4") != nullptr);
+    REQUIRE(CompressionFactory::GetPreset("zlib") != nullptr);
+    REQUIRE(CompressionFactory::GetPreset("lzma") != nullptr);
+    REQUIRE(CompressionFactory::GetPreset("brotli") != nullptr);
+    REQUIRE(CompressionFactory::GetPreset("snappy") != nullptr);
+    REQUIRE(CompressionFactory::GetPreset("blosc2") != nullptr);
+    REQUIRE(CompressionFactory::GetPreset("blosc") != nullptr);  // alias
+    REQUIRE(CompressionFactory::GetPreset("does-not-exist") == nullptr);
+  }
+
+  // Functional guard for the registry's make() column: every registered CPU
+  // compressor must construct AND round-trip through the factory. This catches a
+  // future registry row whose make is forgotten/null/throwing (the anti-footgun
+  // goal of the registry). It does NOT prove make identity (a same-family swap
+  // would still round-trip), which is enforced by inspection of the one-line row.
+  PAGE_DIVIDE("factory round-trip over the CPU compressor set") {
+    std::string payload;
+    for (int i = 0; i < 256; ++i) {
+      payload += "registry round-trip payload 0123456789 ";
+    }
+    const char *cpu_libs[] = {"bzip2", "zstd",   "lz4",    "zlib",
+                              "lzma",  "brotli", "snappy", "blosc2"};
+    for (const char *lib : cpu_libs) {
+      auto comp = CompressionFactory::GetPreset(lib);
+      REQUIRE(comp != nullptr);
+      std::vector<char> cbuf(payload.size() * 2 + 4096);
+      std::vector<char> dbuf(payload.size() + 64);
+      size_t csize = cbuf.size();
+      REQUIRE(comp->Compress(cbuf.data(), csize, payload.data(),
+                             payload.size()));
+      auto decomp = CompressionFactory::GetPreset(lib);
+      REQUIRE(decomp != nullptr);
+      size_t dsize = dbuf.size();
+      REQUIRE(decomp->Decompress(dbuf.data(), dsize, cbuf.data(), csize));
+      REQUIRE(payload == std::string(dbuf.data(), dsize));
+    }
+  }
+}
+
 #if CTP_ENABLE_NVCOMP
 // GPU compression via nvcomp. Mirrors the CPU compressor coverage above (a
 // direct-class Compress/Decompress round-trip) and adds GPU-specific coverage:

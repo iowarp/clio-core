@@ -693,20 +693,12 @@ chi::TaskResume Runtime::Compress(ctp::ipc::FullPtr<CompressTask> task,
       CLIO_CO_RETURN;
     }
 
-    // Map compress_lib_ ID to library name. NOTE: this index is the *wire* ID
-    // (the raw array position stored in CompressionHeader.compress_lib_), which
-    // is distinct from CompressionFactory::GetLibraryId's ML scheme
-    // (base_id*10 + preset, e.g. nvcomp-lz4 = 132). Do not feed a factory ML-ID
-    // into this array. Index 11 ("nvcomp-lz4") is a GPU compressor; it is only
-    // constructible when the build has nvcomp enabled, otherwise the factory
-    // returns null below and it is handled as an error.
-    const char* lib_names[] = {"brotli", "bzip2", "blosc2", "fpzip",
-                               "lz4",    "lzma",  "snappy", "sz3",
-                               "zfp",    "zlib",  "zstd",   "nvcomp-lz4"};
+    // Map the wire ID (CompressionHeader.compress_lib_) to a library name via
+    // the shared registry in CompressionFactory (single source of truth; out-of-
+    // range falls back to "zstd"). Note the wire ID is a separate namespace from
+    // GetLibraryId's ML scheme (base_id*10 + preset, e.g. nvcomp-lz4 = 132).
     std::string library_name =
-        (context.compress_lib_ >= 0 && context.compress_lib_ <= 11)
-            ? lib_names[context.compress_lib_]
-            : "zstd";
+        ctp::CompressionFactory::NameForWireId(context.compress_lib_);
 
     // Map preset integer to enum
     ctp::CompressionPreset preset = ctp::CompressionPreset::BALANCED;
@@ -892,14 +884,11 @@ chi::TaskResume Runtime::Decompress(ctp::ipc::FullPtr<DecompressTask> task,
       int compress_preset = static_cast<int>(header->compress_preset_);
       chi::u64 original_size = header->original_size_;
 
-      // Map compress_lib ID to library name. Wire ID (raw array index), NOT the
-      // factory's ML scheme (base_id*10+preset). Index 11 = "nvcomp-lz4" (GPU).
-      const char* lib_names[] = {"brotli", "bzip2", "blosc2", "fpzip",
-                                 "lz4",    "lzma",  "snappy", "sz3",
-                                 "zfp",    "zlib",  "zstd",   "nvcomp-lz4"};
-      std::string library_name = (compress_lib >= 0 && compress_lib <= 11)
-                                     ? lib_names[compress_lib]
-                                     : "zstd";
+      // Map the wire ID to a library name via the shared registry (single
+      // source of truth; out-of-range falls back to "zstd"). Wire ID is a
+      // separate namespace from the factory's ML scheme (base_id*10+preset).
+      std::string library_name =
+          ctp::CompressionFactory::NameForWireId(compress_lib);
 
       // Map preset integer to enum
       ctp::CompressionPreset preset = ctp::CompressionPreset::BALANCED;

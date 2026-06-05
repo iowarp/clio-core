@@ -36,6 +36,8 @@
 
 #if CTP_ENABLE_COMPRESS
 
+#include <array>
+#include <cctype>
 #include <memory>
 #include <string>
 #include "compress.h"
@@ -92,60 +94,14 @@ class CompressionFactory {
   static std::unique_ptr<Compressor> GetPreset(
       const std::string& library_name,
       CompressionPreset preset = CompressionPreset::BALANCED) {
-
-    std::string lib_lower = library_name;
-    for (auto& c : lib_lower) c = std::tolower(c);
-
-    // Lossless compressors with compression level support
-    if (lib_lower == "bzip2") {
-      return CreateLossless<Bzip2WithModes>(preset);
+    const CompressorInfo* info = FindByName(library_name);
+    // info->make is null when the backend is disabled at build time (LibPressio
+    // for lossy, nvcomp for GPU); GetPreset then returns nullptr just as the
+    // old per-name if-chain fell through to "return nullptr".
+    if (info == nullptr || info->make == nullptr) {
+      return nullptr;
     }
-    if (lib_lower == "zstd") {
-      return CreateLossless<ZstdWithModes>(preset);
-    }
-    if (lib_lower == "lz4") {
-      return CreateLossless<Lz4WithModes>(preset);
-    }
-    if (lib_lower == "zlib") {
-      return CreateLossless<ZlibWithModes>(preset);
-    }
-    if (lib_lower == "lzma") {
-      return CreateLossless<LzmaWithModes>(preset);
-    }
-    if (lib_lower == "brotli") {
-      return CreateLossless<BrotliWithModes>(preset);
-    }
-
-    // Lossless compressors without level support (default only)
-    if (lib_lower == "snappy") {
-      return std::make_unique<Snappy>();
-    }
-    if (lib_lower == "blosc" || lib_lower == "blosc2") {
-      return std::make_unique<Blosc>();
-    }
-
-#if CTP_ENABLE_NVCOMP
-    // GPU compressors (nvcomp). Single-mode: preset is ignored (LZ4 has no level).
-    if (lib_lower == "nvcomp-lz4") {
-      return std::make_unique<NvComp>(NvCompAlgo::LZ4);
-    }
-#endif
-
-#if CTP_ENABLE_LIBPRESSIO
-    // Lossy compressors with LibPressio
-    if (lib_lower == "zfp") {
-      return CreateLossy("zfp", preset);
-    }
-    if (lib_lower == "sz3") {
-      return CreateLossy("sz3", preset);
-    }
-    if (lib_lower == "fpzip") {
-      return CreateLossy("fpzip", preset);
-    }
-#endif
-
-    // Unknown library
-    return nullptr;
+    return info->make(preset);
   }
 
   /**
@@ -161,34 +117,12 @@ class CompressionFactory {
    * - Lossy: base_id * 10 + preset (e.g., ZFP_FAST=101, ZFP_BALANCED=102, ZFP_BEST=103)
    */
   static int GetLibraryId(const std::string& library_name, CompressionPreset preset) {
-    std::string lib_lower = library_name;
-    for (auto& c : lib_lower) c = std::tolower(c);
+    const CompressorInfo* info = FindByName(library_name);
+    if (info == nullptr) return 0;  // Unknown library
 
-    int base_id = 0;
-
-    // Lossless base IDs (1-8)
-    if (lib_lower == "bzip2") base_id = 1;
-    else if (lib_lower == "zstd") base_id = 2;
-    else if (lib_lower == "lz4") base_id = 3;
-    else if (lib_lower == "zlib") base_id = 4;
-    else if (lib_lower == "lzma") base_id = 5;
-    else if (lib_lower == "brotli") base_id = 6;
-    else if (lib_lower == "snappy") base_id = 7;
-    else if (lib_lower == "blosc" || lib_lower == "blosc2") base_id = 8;
-    // Lossy base IDs (10+)
-    else if (lib_lower == "zfp") base_id = 10;
-    else if (lib_lower == "sz3") base_id = 11;
-    else if (lib_lower == "fpzip") base_id = 12;
-    // GPU compressors (nvcomp) base IDs (13+)
-#if CTP_ENABLE_NVCOMP
-    else if (lib_lower == "nvcomp-lz4") base_id = 13;
-#endif
-
-    if (base_id == 0) return 0;  // Unknown library
-
-    // For single-mode libraries (SNAPPY, Blosc2, nvcomp), always use preset 2
-    if (base_id == 7 || base_id == 8 || base_id == 13) {
-      return base_id * 10 + 2;
+    // Single-mode libraries (snappy, blosc2, nvcomp) always encode preset 2.
+    if (info->single_mode) {
+      return info->base_id * 10 + 2;
     }
 
     // Encode preset: FAST=1, BALANCED=2, BEST=3, DEFAULT=2
@@ -200,7 +134,7 @@ class CompressionFactory {
       case CompressionPreset::DEFAULT: preset_id = 2; break;
     }
 
-    return base_id * 10 + preset_id;
+    return info->base_id * 10 + preset_id;
   }
 
   /**
@@ -214,23 +148,8 @@ class CompressionFactory {
     int base_id = library_id / 10;
     int preset_id = library_id % 10;
 
-    std::string library_name = "unknown";
-
-    // Lossless libraries
-    if (base_id == 1) library_name = "bzip2";
-    else if (base_id == 2) library_name = "zstd";
-    else if (base_id == 3) library_name = "lz4";
-    else if (base_id == 4) library_name = "zlib";
-    else if (base_id == 5) library_name = "lzma";
-    else if (base_id == 6) library_name = "brotli";
-    else if (base_id == 7) library_name = "snappy";
-    else if (base_id == 8) library_name = "blosc2";
-    // Lossy libraries
-    else if (base_id == 10) library_name = "zfp";
-    else if (base_id == 11) library_name = "sz3";
-    else if (base_id == 12) library_name = "fpzip";
-    // GPU compressors (nvcomp)
-    else if (base_id == 13) library_name = "nvcomp-lz4";
+    const CompressorInfo* info = FindByBaseId(base_id);
+    std::string library_name = info ? info->name : "unknown";
 
     CompressionPreset preset = CompressionPreset::BALANCED;
     if (preset_id == 1) preset = CompressionPreset::FAST;
@@ -238,6 +157,23 @@ class CompressionFactory {
     else if (preset_id == 3) preset = CompressionPreset::BEST;
 
     return {library_name, preset};
+  }
+
+  /**
+   * Map a CTE wire ID to its canonical library name.
+   *
+   * The wire ID is the raw integer stored in CompressionHeader.compress_lib_
+   * (an array index, the on-disk/runtime protocol). It is a SEPARATE, frozen
+   * namespace from GetLibraryId's ML scheme (base_id*10 + preset). Out-of-range
+   * IDs fall back to "zstd" (the historical CTE default). Append-only: never
+   * renumber existing IDs or old compressed blobs become unreadable.
+   *
+   * @param wire_id Integer wire ID (compress_lib_)
+   * @return Canonical library name, or "zstd" if out of range
+   */
+  static std::string NameForWireId(int wire_id) {
+    const CompressorInfo* info = FindByWireId(wire_id);
+    return info ? info->name : "zstd";
   }
 
   /**
@@ -257,6 +193,130 @@ class CompressionFactory {
   }
 
  private:
+  /** Signature of a function that constructs a compressor for a given preset. */
+  using MakeFn = std::unique_ptr<Compressor> (*)(CompressionPreset);
+
+  /**
+   * One row of the compressor registry -- the single source of truth tying a
+   * compressor's canonical name to its two frozen, INDEPENDENT integer
+   * namespaces:
+   *   - wire_id: raw index stored in CompressionHeader.compress_lib_ (the CTE
+   *              on-disk/runtime protocol; resolved by NameForWireId).
+   *   - base_id: ML scheme, encoded as base_id*10 + preset (see GetLibraryId).
+   * Both are append-only: NEVER renumber an existing entry or stored blobs /
+   * trained models break. `make` is nullptr when the backend is unavailable in
+   * this build (LibPressio off for lossy, nvcomp off for GPU); the name and ids
+   * still resolve, but GetPreset then returns nullptr.
+   *
+   * To add a compressor, add ONE row here (plus, for a GPU algorithm, one case
+   * in NvComp::MakeManager). No other edits in this file are needed.
+   */
+  struct CompressorInfo {
+    const char* name;  // canonical lowercase name
+    int wire_id;       // CTE wire/on-disk id (frozen, append-only)
+    int base_id;       // ML scheme base id (frozen, append-only)
+    bool single_mode;  // preset ignored; id always uses preset slot 2
+    MakeFn make;       // constructor, or nullptr if backend disabled
+  };
+
+  // Construction helpers for single-mode and backend-guarded compressors.
+  // (Multi-mode lossless compressors use CreateLossless<T> directly.)
+  static std::unique_ptr<Compressor> MakeSnappy(CompressionPreset) {
+    return std::make_unique<Snappy>();
+  }
+  static std::unique_ptr<Compressor> MakeBlosc(CompressionPreset) {
+    return std::make_unique<Blosc>();
+  }
+  static std::unique_ptr<Compressor> MakeZfp(CompressionPreset preset) {
+#if CTP_ENABLE_LIBPRESSIO
+    return CreateLossy("zfp", preset);
+#else
+    (void)preset;
+    return nullptr;
+#endif
+  }
+  static std::unique_ptr<Compressor> MakeSz3(CompressionPreset preset) {
+#if CTP_ENABLE_LIBPRESSIO
+    return CreateLossy("sz3", preset);
+#else
+    (void)preset;
+    return nullptr;
+#endif
+  }
+  static std::unique_ptr<Compressor> MakeFpzip(CompressionPreset preset) {
+#if CTP_ENABLE_LIBPRESSIO
+    return CreateLossy("fpzip", preset);
+#else
+    (void)preset;
+    return nullptr;
+#endif
+  }
+  static std::unique_ptr<Compressor> MakeNvCompLz4(CompressionPreset) {
+#if CTP_ENABLE_NVCOMP
+    return std::make_unique<NvComp>(NvCompAlgo::LZ4);
+#else
+    return nullptr;
+#endif
+  }
+
+  /**
+   * The compressor registry: the single source of truth (see CompressorInfo).
+   * constexpr std::array -> constant-initialized static data: no heap allocation
+   * and no thread-safe-init guard. The size is deduced (CTAD), so adding a row
+   * stays a one-line change. Iteration over 12 entries is trivial and happens
+   * only once per blob (in the factory setup path), never in the compress loop.
+   */
+  static const auto& Registry() {
+    //                                          name  wire base single  make
+    static constexpr std::array kRegistry = {
+        CompressorInfo{"brotli",      0,  6, false, &CreateLossless<BrotliWithModes>},
+        CompressorInfo{"bzip2",       1,  1, false, &CreateLossless<Bzip2WithModes>},
+        CompressorInfo{"blosc2",      2,  8, true,  &MakeBlosc},
+        CompressorInfo{"fpzip",       3, 12, false, &MakeFpzip},
+        CompressorInfo{"lz4",         4,  3, false, &CreateLossless<Lz4WithModes>},
+        CompressorInfo{"lzma",        5,  5, false, &CreateLossless<LzmaWithModes>},
+        CompressorInfo{"snappy",      6,  7, true,  &MakeSnappy},
+        CompressorInfo{"sz3",         7, 11, false, &MakeSz3},
+        CompressorInfo{"zfp",         8, 10, false, &MakeZfp},
+        CompressorInfo{"zlib",        9,  4, false, &CreateLossless<ZlibWithModes>},
+        CompressorInfo{"zstd",       10,  2, false, &CreateLossless<ZstdWithModes>},
+        CompressorInfo{"nvcomp-lz4", 11, 13, true,  &MakeNvCompLz4},
+    };
+    return kRegistry;
+  }
+
+  /**
+   * Look up a registry entry by (case-insensitive) name; nullptr if unknown.
+   * Accepts the historical "blosc" alias for "blosc2".
+   */
+  static const CompressorInfo* FindByName(const std::string& name) {
+    std::string n = name;
+    for (auto& c : n) {
+      c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    if (n == "blosc") n = "blosc2";  // historical alias
+    for (const auto& e : Registry()) {
+      if (n == e.name) return &e;
+    }
+    return nullptr;
+  }
+
+  /** Look up a registry entry by CTE wire id; nullptr if none. */
+  static const CompressorInfo* FindByWireId(int wire_id) {
+    for (const auto& e : Registry()) {
+      if (e.wire_id == wire_id) return &e;
+    }
+    return nullptr;
+  }
+
+  /** Look up a registry entry by ML base id; nullptr if none. */
+  static const CompressorInfo* FindByBaseId(int base_id) {
+    for (const auto& e : Registry()) {
+      if (e.base_id == base_id) return &e;
+    }
+    return nullptr;
+  }
+
   template<typename CompressorClass>
   static std::unique_ptr<Compressor> CreateLossless(CompressionPreset preset) {
     LosslessMode mode;
