@@ -82,42 +82,52 @@ class NvComp : public Compressor {
     bool free_out = false;
     bool ok = false;
     do {
-      // Input: use directly if already on the GPU, else stage a H2D copy.
-      d_in = ToDeviceInput(input, input_size, stream, &free_in);
-      if (!d_in) break;
+      // The nvcomp Manager API reports errors by throwing (and compress() is
+      // void, so a throw is its only failure signal); make_shared can also
+      // throw std::bad_alloc. Catch everything so no exception escapes (honoring
+      // the bool contract) and the cleanup block below always runs.
+      try {
+        // Input: use directly if already on the GPU, else stage a H2D copy.
+        d_in = ToDeviceInput(input, input_size, stream, &free_in);
+        if (!d_in) break;
 
-      std::shared_ptr<nvcomp::nvcompManagerBase> mgr = MakeManager(stream);
-      if (!mgr) break;
-      nvcomp::CompressionConfig cfg = mgr->configure_compression(input_size);
+        std::shared_ptr<nvcomp::nvcompManagerBase> mgr = MakeManager(stream);
+        if (!mgr) break;
+        nvcomp::CompressionConfig cfg = mgr->configure_compression(input_size);
 
-      // Output: write straight into the caller's buffer only if it is a GPU
-      // buffer large enough for nvcomp's worst case; otherwise use a temp.
-      // (Device-direct requires >= max_compressed_buffer_size, while the temp
-      // path only needs to fit the actual compressed size -- this asymmetry is
-      // intentional; an in-between device buffer just falls back to temp + D2D.)
-      const bool out_is_device = IsDeviceAccessible(output);
-      if (out_is_device && output_size >= cfg.max_compressed_buffer_size) {
-        d_out = static_cast<uint8_t *>(output);
-      } else {
-        if (cudaMalloc(&d_out, cfg.max_compressed_buffer_size) != cudaSuccess) {
-          break;
+        // Output: write straight into the caller's buffer only if it is a GPU
+        // buffer large enough for nvcomp's worst case; otherwise use a temp.
+        // (Device-direct requires >= max_compressed_buffer_size, while the temp
+        // path only needs to fit the actual compressed size -- this asymmetry
+        // is intentional; an in-between device buffer falls back to temp + D2D.)
+        const bool out_is_device = IsDeviceAccessible(output);
+        if (out_is_device && output_size >= cfg.max_compressed_buffer_size) {
+          d_out = static_cast<uint8_t *>(output);
+        } else {
+          if (cudaMalloc(&d_out, cfg.max_compressed_buffer_size) !=
+              cudaSuccess) {
+            break;
+          }
+          free_out = true;
         }
-        free_out = true;
-      }
 
-      mgr->compress(d_in, d_out, cfg);
-      if (cudaStreamSynchronize(stream) != cudaSuccess) break;
-      size_t comp_size = mgr->get_compressed_output_size(d_out);
-      if (comp_size > output_size) break;  // caller buffer too small
+        mgr->compress(d_in, d_out, cfg);
+        if (cudaStreamSynchronize(stream) != cudaSuccess) break;
+        size_t comp_size = mgr->get_compressed_output_size(d_out);
+        if (comp_size > output_size) break;  // caller buffer too small
 
-      // Deliver to the caller's buffer if we compressed into a temp.
-      if (d_out != static_cast<uint8_t *>(output)) {
-        cudaMemcpyKind kind =
-            out_is_device ? cudaMemcpyDeviceToDevice : cudaMemcpyDeviceToHost;
-        if (cudaMemcpy(output, d_out, comp_size, kind) != cudaSuccess) break;
+        // Deliver to the caller's buffer if we compressed into a temp.
+        if (d_out != static_cast<uint8_t *>(output)) {
+          cudaMemcpyKind kind =
+              out_is_device ? cudaMemcpyDeviceToDevice : cudaMemcpyDeviceToHost;
+          if (cudaMemcpy(output, d_out, comp_size, kind) != cudaSuccess) break;
+        }
+        output_size = comp_size;
+        ok = true;
+      } catch (...) {
+        // ok stays false; free_in/free_out (set before any throwing call) make
+        // the cleanup below release exactly what was allocated.
       }
-      output_size = comp_size;
-      ok = true;
     } while (false);
     if (free_in) cudaFree(d_in);
     if (free_out) cudaFree(d_out);
@@ -137,36 +147,44 @@ class NvComp : public Compressor {
     bool free_out = false;
     bool ok = false;
     do {
-      // Input: use directly if already on the GPU, else stage a H2D copy.
-      d_in = ToDeviceInput(input, input_size, stream, &free_in);
-      if (!d_in) break;
+      // The nvcomp Manager API reports errors by throwing (create_manager,
+      // configure_decompression, and the void decompress() included); catch
+      // everything so no exception escapes and the cleanup below always runs.
+      try {
+        // Input: use directly if already on the GPU, else stage a H2D copy.
+        d_in = ToDeviceInput(input, input_size, stream, &free_in);
+        if (!d_in) break;
 
-      // create_manager parses the NVCOMP_NATIVE header and synchronizes stream.
-      std::shared_ptr<nvcomp::nvcompManagerBase> mgr =
-          nvcomp::create_manager(d_in, stream);
-      if (!mgr) break;
-      nvcomp::DecompressionConfig cfg = mgr->configure_decompression(d_in);
-      if (cfg.decomp_data_size > output_size) break;  // caller buffer too small
+        // create_manager parses the NVCOMP_NATIVE header and syncs the stream.
+        std::shared_ptr<nvcomp::nvcompManagerBase> mgr =
+            nvcomp::create_manager(d_in, stream);
+        if (!mgr) break;
+        nvcomp::DecompressionConfig cfg = mgr->configure_decompression(d_in);
+        if (cfg.decomp_data_size > output_size) break;  // caller buffer too small
 
-      const bool out_is_device = IsDeviceAccessible(output);
-      if (out_is_device) {
-        d_out = static_cast<uint8_t *>(output);
-      } else {
-        if (cudaMalloc(&d_out, cfg.decomp_data_size) != cudaSuccess) break;
-        free_out = true;
-      }
-
-      mgr->decompress(d_out, d_in, cfg);
-      if (cudaStreamSynchronize(stream) != cudaSuccess) break;
-
-      if (d_out != static_cast<uint8_t *>(output)) {
-        if (cudaMemcpy(output, d_out, cfg.decomp_data_size,
-                       cudaMemcpyDeviceToHost) != cudaSuccess) {
-          break;
+        const bool out_is_device = IsDeviceAccessible(output);
+        if (out_is_device) {
+          d_out = static_cast<uint8_t *>(output);
+        } else {
+          if (cudaMalloc(&d_out, cfg.decomp_data_size) != cudaSuccess) break;
+          free_out = true;
         }
+
+        mgr->decompress(d_out, d_in, cfg);
+        if (cudaStreamSynchronize(stream) != cudaSuccess) break;
+
+        if (d_out != static_cast<uint8_t *>(output)) {
+          if (cudaMemcpy(output, d_out, cfg.decomp_data_size,
+                         cudaMemcpyDeviceToHost) != cudaSuccess) {
+            break;
+          }
+        }
+        output_size = cfg.decomp_data_size;
+        ok = true;
+      } catch (...) {
+        // ok stays false; free_in/free_out (set before any throwing call) make
+        // the cleanup below release exactly what was allocated.
       }
-      output_size = cfg.decomp_data_size;
-      ok = true;
     } while (false);
     if (free_in) cudaFree(d_in);
     if (free_out) cudaFree(d_out);
