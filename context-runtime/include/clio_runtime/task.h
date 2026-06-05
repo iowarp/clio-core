@@ -612,6 +612,12 @@ struct RunContext {
       future_;                    /**< Future for async completion tracking */
   std::atomic<bool> is_notified_; /**< Atomic flag to prevent duplicate event
                                      queue additions */
+  // Set true by the top-level coroutine's final_suspend when the task
+  // completes. The worker reads THIS instead of coro_handle_.done() to detect
+  // completion, so it never dereferences a coroutine frame that a cross-thread
+  // completion may already have freed — done() on a freed frame GPFLTs (issue
+  // #485). The RunContext outlives the frame, so this read is always valid.
+  std::atomic<bool> coro_completed_;
   double true_period_ns_;         /**< Original period from task->period_ns_ */
   bool did_work_;            /**< Whether task did work in last execution */
   ctp::CpuTimer cpu_timer_; /**< Accumulates thread CPU time across yields */
@@ -634,6 +640,7 @@ struct RunContext {
         completed_replicas_(0),
         yield_count_(0),
         is_notified_(false),
+        coro_completed_(false),
         true_period_ns_(0.0),
         did_work_(false) {}
 
@@ -656,6 +663,7 @@ struct RunContext {
         yield_count_(other.yield_count_),
         future_(std::move(other.future_)),
         is_notified_(other.is_notified_.load()),
+        coro_completed_(other.coro_completed_.load()),
         true_period_ns_(other.true_period_ns_),
         did_work_(other.did_work_),
         cpu_timer_(other.cpu_timer_),
@@ -691,6 +699,7 @@ struct RunContext {
       yield_count_ = other.yield_count_;
       future_ = std::move(other.future_);
       is_notified_.store(other.is_notified_.load());
+      coro_completed_.store(other.coro_completed_.load());
       true_period_ns_ = other.true_period_ns_;
       did_work_ = other.did_work_;
       cpu_timer_ = other.cpu_timer_;
@@ -724,6 +733,7 @@ struct RunContext {
     block_start_ = ctp::Timepoint();
     yield_count_ = 0;
     is_notified_.store(false);
+    coro_completed_.store(false);
     true_period_ns_ = 0.0;
     did_work_ = false;
     cpu_timer_.time_ns_ = 0;
@@ -789,6 +799,15 @@ class TaskResume {
     RunContext* run_ctx_ = nullptr;
     /** Handle to the caller coroutine (for nested coroutine support) */
     std::coroutine_handle<> caller_handle_ = nullptr;
+    /**
+     * True only for the top-level task coroutine the worker starts directly
+     * (set in Worker::StartCoroutine). Nested co_await'd coroutines leave it
+     * false. Used by final_suspend to set run_ctx_->coro_completed_ on the
+     * real task completion only — caller_handle_ is unreliable for this
+     * because a nested coroutine that finishes synchronously still has a null
+     * caller_handle_ at that instant (issue #485).
+     */
+    bool is_top_level_ = false;
 
     /**
      * Create the TaskResume object from this promise
@@ -830,6 +849,20 @@ class TaskResume {
      * @return FinalAwaiter that handles resuming the caller
      */
     FinalAwaiter final_suspend() noexcept {
+      // When the TOP-LEVEL task coroutine reaches final suspend the whole task
+      // is complete, so record it in the RunContext. The worker checks
+      // run_ctx_->coro_completed_ instead of coro_handle_.done(); the coroutine
+      // frame may already be freed by a cross-thread completion, which would
+      // make done() a use-after-free (issue #485), whereas the RunContext
+      // outlives the frame. By the time the top-level final_suspend runs,
+      // await_resume has repointed coro_handle_ back to this (top-level)
+      // handle, so the worker's subsequent destroy() still targets a valid
+      // frame. We gate on is_top_level_ (not caller_handle_): a nested
+      // coroutine that completes synchronously also momentarily has a null
+      // caller_handle_, and must NOT be mistaken for task completion.
+      if (is_top_level_ && run_ctx_ != nullptr) {
+        run_ctx_->coro_completed_.store(true, std::memory_order_release);
+      }
       return FinalAwaiter{caller_handle_};
     }
 

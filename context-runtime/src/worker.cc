@@ -62,6 +62,24 @@
 
 namespace clio::run {
 
+// Detect whether a task's coroutine has run to completion WITHOUT
+// dereferencing the coroutine frame. The top-level coroutine's final_suspend
+// sets run_ctx->coro_completed_ (issue #485); reading that flag is valid even
+// if a cross-thread completion already freed the frame, whereas
+// coro_handle_.done() would be a use-after-free (the GPFLT in
+// coroutine_handle::done() observed on macOS). The NVHPC fiber path has no
+// such flag and is not subject to the same cross-thread free, so it keeps
+// using FiberHandle::done().
+namespace {
+inline bool CoroCompleted(const RunContext *run_ctx) {
+#ifndef __NVCOMPILER
+  return run_ctx->coro_completed_.load(std::memory_order_acquire);
+#else
+  return run_ctx->coro_handle_ && run_ctx->coro_handle_.done();
+#endif
+}
+}  // namespace
+
 // Stack detection is now handled by WorkOrchestrator during initialization
 
 Worker::Worker(u32 worker_id)
@@ -758,14 +776,27 @@ void Worker::StartCoroutine(const FullPtr<Task> &task_ptr,
       auto typed_handle =
           TaskResume::handle_type::from_address(handle.address());
       typed_handle.promise().set_run_context(run_ctx);
+      // Mark this as the top-level task coroutine so its (and only its)
+      // final_suspend raises run_ctx->coro_completed_ on real task completion
+      // (issue #485). Nested co_await'd coroutines are never marked.
+      typed_handle.promise().is_top_level_ = true;
+
+      // Fresh coroutine frame: clear the completion flag the promise's
+      // final_suspend will raise when this task finishes (issue #485).
+      run_ctx->coro_completed_.store(false, std::memory_order_relaxed);
 
       // Resume the coroutine to run until first suspension point or completion
       // initial_suspend returns suspend_always, so we need to resume to start
       // execution
       handle.resume();
 
-      // Check if coroutine completed (no suspension points)
-      if (handle.done()) {
+      // Check if coroutine completed (no suspension points). Read the
+      // RunContext completion flag rather than handle.done(): if the task
+      // completed cross-thread during resume() the frame may already be freed,
+      // and done() on a freed frame is a use-after-free (issue #485). When the
+      // flag is set, await_resume has repointed things so `handle` (the
+      // top-level frame) is still valid to destroy.
+      if (run_ctx->coro_completed_.load(std::memory_order_acquire)) {
         // Coroutine completed - clean up
         handle.destroy();
         run_ctx->coro_handle_ = nullptr;
@@ -832,8 +863,16 @@ void Worker::ResumeCoroutine(const FullPtr<Task> &task_ptr,
   try {
     run_ctx->coro_handle_.resume();
 
-    // Check if coroutine/fiber completed after resumption
-    if (run_ctx->coro_handle_.done()) {
+    // Check if coroutine/fiber completed after resumption. For C++20
+    // coroutines this reads the RunContext completion flag (set by the
+    // top-level coroutine's final_suspend) instead of coro_handle_.done(): the
+    // task may have completed cross-thread during resume() and freed the
+    // coroutine frame, which would make done() a use-after-free of a heap
+    // coro_handle_ (the GPFLT seen on macOS, issue #485). The RunContext
+    // outlives the frame; when the flag is set, await_resume has already
+    // repointed coro_handle_ to the (valid) top-level frame so destroy() is
+    // safe.
+    if (CoroCompleted(run_ctx)) {
       // Completed - clean up
       run_ctx->coro_handle_.destroy();
 #ifndef __NVCOMPILER
@@ -928,8 +967,10 @@ void Worker::ExecTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
     did_work_ = true;
   }
 
-  // Check if coroutine is done or yielded
-  bool coro_done = run_ctx->coro_handle_ && run_ctx->coro_handle_.done();
+  // Check if coroutine is done or yielded. Use the RunContext completion flag
+  // (issue #485) rather than dereferencing the possibly-freed coroutine frame
+  // via coro_handle_.done().
+  bool coro_done = CoroCompleted(run_ctx);
 
   // If coroutine yielded (not done and is_yielded_ set), don't clean up
   if (run_ctx->is_yielded_ && !coro_done) {
@@ -1054,9 +1095,11 @@ void Worker::ProcessBlockedQueue(std::queue<RunContext *> &queue,
     bool is_started = run_ctx->task_->task_flags_.Any(TASK_STARTED);
 
     // Skip if task was started but coroutine already completed
-    // This can happen with orphan events from parallel subtasks
+    // This can happen with orphan events from parallel subtasks. Use the
+    // completion flag instead of coro_handle_.done() to avoid a use-after-free
+    // on a cross-thread-freed coroutine frame (issue #485).
     if (is_started &&
-        (!run_ctx->coro_handle_ || run_ctx->coro_handle_.done())) {
+        (!run_ctx->coro_handle_ || CoroCompleted(run_ctx))) {
       continue;
     }
 
@@ -1164,8 +1207,10 @@ void Worker::ProcessEventQueue() {
       continue;
     }
 
-    // Skip if coroutine handle is null or already completed
-    if (!run_ctx->coro_handle_ || run_ctx->coro_handle_.done()) {
+    // Skip if coroutine handle is null or already completed. Use the
+    // completion flag instead of coro_handle_.done() to avoid dereferencing a
+    // coroutine frame a cross-thread completion may already have freed (#485).
+    if (!run_ctx->coro_handle_ || CoroCompleted(run_ctx)) {
       continue;
     }
 

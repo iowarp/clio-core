@@ -85,6 +85,38 @@ CLIO_RUN_API std::atomic<IsDevicePointerFn> g_is_device_pointer{nullptr};
 
 namespace clio::run {
 
+namespace {
+
+// Issue #482: libzmq's TCP-loopback engine on macOS fails to route ROUTER
+// replies back to a connected DEALER (zmq_send -> EHOSTUNREACH) even though the
+// ZMTP handshake succeeds, which blocks every same-host client that reaches the
+// runtime over the local client ROUTER (the port+3 endpoint). libzmq's ipc://
+// (unix-domain) transport carries the identical ROUTER/DEALER identity routing
+// but over a different engine that is not affected. So run the LOCAL
+// client<->runtime ROUTER/DEALER over ipc:// there. The cross-node ROUTER (the
+// main port) is untouched, so multi-node TCP is unaffected; on Linux/Windows
+// nothing changes. Override the platform default with CLIO_ZMQ_LOCAL_IPC=0/1.
+inline bool UseLocalZmqIpc() {
+  if (const char *env = chi::env::GetCompat("ZMQ_LOCAL_IPC")) {
+    return *env != '\0' && std::strcmp(env, "0") != 0;
+  }
+#ifdef __APPLE__
+  return true;
+#else
+  return false;
+#endif
+}
+
+// Unix-domain socket path for the local ZMQ ROUTER/DEALER. Distinct from the
+// non-ZMQ SocketTransport endpoint (chimaera_<port>.ipc) so the two local
+// servers never collide.
+inline std::string LocalZmqIpcPath(u32 port) {
+  return ctp::SystemInfo::GetMemfdPath(
+      "chimaera_zmq_" + std::to_string(port + 3) + ".ipc");
+}
+
+}  // namespace
+
 // Host struct methods
 
 // IpcManager methods
@@ -159,6 +191,24 @@ bool IpcManager::ClientInit() {
       } catch (const std::exception &e) {
         HLOG(kError,
              "IpcManager::ClientInit: Failed to create IPC transport: {}",
+             e.what());
+        return false;
+      }
+    } else if (UseLocalZmqIpc()) {
+      // macOS (issue #482): keep the ZMQ DEALER but carry it over a local
+      // ipc:// unix socket instead of TCP loopback, which libzmq cannot route
+      // replies over on macOS. Identity routing is unchanged.
+      try {
+        ctp::SystemInfo::EnsureMemfdDir();
+        std::string zmq_ipc = LocalZmqIpcPath(port);
+        zmq_transport_ = ctp::lbm::TransportFactory::Get(
+            zmq_ipc, ctp::lbm::TransportType::kZeroMq,
+            ctp::lbm::TransportMode::kClient, "ipc", 0);
+        HLOG(kInfo, "IpcManager: DEALER transport connected over ipc {}",
+             zmq_ipc);
+      } catch (const std::exception &e) {
+        HLOG(kError,
+             "IpcManager::ClientInit: Failed to create ipc DEALER transport: {}",
              e.what());
         return false;
       }
@@ -377,11 +427,24 @@ bool IpcManager::ServerInit() {
       if (const char *env = chi::env::GetCompat("BIND_ADDR")) {
         if (*env) router_bind = env;
       }
-      client_tcp_transport_ = ctp::lbm::TransportFactory::Get(
-          router_bind, ctp::lbm::TransportType::kZeroMq,
-          ctp::lbm::TransportMode::kServer, "tcp", port + 3);
-      HLOG(kInfo, "IpcManager: TCP ROUTER transport bound on {}:{}",
-           router_bind, port + 3);
+      if (UseLocalZmqIpc()) {
+        // macOS (issue #482): bind the local client ROUTER on an ipc:// unix
+        // socket so replies route reliably; same-host clients connect their
+        // DEALER to the matching path. Cross-node clients are served by the
+        // main net ROUTER, which is unaffected.
+        ctp::SystemInfo::EnsureMemfdDir();
+        std::string zmq_ipc = LocalZmqIpcPath(port);
+        client_tcp_transport_ = ctp::lbm::TransportFactory::Get(
+            zmq_ipc, ctp::lbm::TransportType::kZeroMq,
+            ctp::lbm::TransportMode::kServer, "ipc", 0);
+        HLOG(kInfo, "IpcManager: client ZMQ ROUTER bound on ipc {}", zmq_ipc);
+      } else {
+        client_tcp_transport_ = ctp::lbm::TransportFactory::Get(
+            router_bind, ctp::lbm::TransportType::kZeroMq,
+            ctp::lbm::TransportMode::kServer, "tcp", port + 3);
+        HLOG(kInfo, "IpcManager: TCP ROUTER transport bound on {}:{}",
+             router_bind, port + 3);
+      }
     } catch (const std::exception &e) {
       HLOG(kError, "IpcManager::ServerInit: Failed to bind TCP server: {}",
            e.what());
@@ -845,9 +908,19 @@ retry_attempt:
         pending_response_archives_.clear();
       }
       try {
-        zmq_transport_ = ctp::lbm::TransportFactory::Get(
-            config->GetServerAddr(), ctp::lbm::TransportType::kZeroMq,
-            ctp::lbm::TransportMode::kClient, "tcp", port + 3);
+        if (UseLocalZmqIpc()) {
+          // Mirror ClientInit: recreate the DEALER over the local ipc://
+          // endpoint on macOS (issue #482).
+          ctp::SystemInfo::EnsureMemfdDir();
+          std::string zmq_ipc = LocalZmqIpcPath(port);
+          zmq_transport_ = ctp::lbm::TransportFactory::Get(
+              zmq_ipc, ctp::lbm::TransportType::kZeroMq,
+              ctp::lbm::TransportMode::kClient, "ipc", 0);
+        } else {
+          zmq_transport_ = ctp::lbm::TransportFactory::Get(
+              config->GetServerAddr(), ctp::lbm::TransportType::kZeroMq,
+              ctp::lbm::TransportMode::kClient, "tcp", port + 3);
+        }
       } catch (const std::exception &e) {
         HLOG(kError, "WaitForLocalServer: DEALER recreate failed: {}",
              e.what());
@@ -877,9 +950,30 @@ retry_attempt:
     return true;
   }
 
-  HLOG(kError, "Runtime responded with error code: {}", task->response_);
-  // Task cleanup is handled by ~Future() since Wait() marked it consumed.
-  return false;
+  // A response arrived but carries a non-zero code. The server's
+  // ClientConnect handler ALWAYS sets response_ = 0 (admin_runtime.cc), so a
+  // non-zero value here is not an intentional rejection — it is a transient
+  // artifact (e.g. a stale/mismatched correlation while the daemon is reaping
+  // an abruptly-dead client that left an in-flight response on the wire, the
+  // cr_client_retry_client_death_* reconnect race, issue #486). Treat it like
+  // a timed-out attempt: retry within the remaining wait budget instead of
+  // hard-failing, so the reconnect is deterministic rather than flaky.
+  {
+    float elapsed = std::chrono::duration<float>(
+        std::chrono::steady_clock::now() - attempt_start).count();
+    if (total_timeout > 0 && elapsed >= total_timeout) {
+      HLOG(kError,
+           "Runtime responded with error code {} on every attempt within {}s "
+           "({} attempts)",
+           task->response_, wait_server_timeout_, attempt_idx);
+      // Task cleanup is handled by ~Future() since Wait() marked it consumed.
+      return false;
+    }
+    HLOG(kWarning,
+         "Attempt {} got transient non-zero response {}; retrying connect",
+         attempt_idx, task->response_);
+    goto retry_attempt;
+  }
 }
 
 bool IpcManager::WaitForLocalRuntimeStop(u32 timeout_sec) {
