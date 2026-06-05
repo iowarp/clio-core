@@ -47,6 +47,10 @@
 #include "libpressio_modes.h"
 #endif
 
+#if CTP_ENABLE_NVCOMP
+#include "nvcomp.h"
+#endif
+
 namespace ctp {
 
 /**
@@ -120,6 +124,13 @@ class CompressionFactory {
       return std::make_unique<Blosc>();
     }
 
+#if CTP_ENABLE_NVCOMP
+    // GPU compressors (nvcomp). Single-mode: preset is ignored (LZ4 has no level).
+    if (lib_lower == "nvcomp-lz4") {
+      return std::make_unique<NvComp>(NvCompAlgo::LZ4);
+    }
+#endif
+
 #if CTP_ENABLE_LIBPRESSIO
     // Lossy compressors with LibPressio
     if (lib_lower == "zfp") {
@@ -168,11 +179,15 @@ class CompressionFactory {
     else if (lib_lower == "zfp") base_id = 10;
     else if (lib_lower == "sz3") base_id = 11;
     else if (lib_lower == "fpzip") base_id = 12;
+    // GPU compressors (nvcomp) base IDs (13+)
+#if CTP_ENABLE_NVCOMP
+    else if (lib_lower == "nvcomp-lz4") base_id = 13;
+#endif
 
     if (base_id == 0) return 0;  // Unknown library
 
-    // For single-mode libraries (SNAPPY, Blosc2), always use preset 2 (BALANCED)
-    if (base_id == 7 || base_id == 8) {
+    // For single-mode libraries (SNAPPY, Blosc2, nvcomp), always use preset 2
+    if (base_id == 7 || base_id == 8 || base_id == 13) {
       return base_id * 10 + 2;
     }
 
@@ -214,6 +229,8 @@ class CompressionFactory {
     else if (base_id == 10) library_name = "zfp";
     else if (base_id == 11) library_name = "sz3";
     else if (base_id == 12) library_name = "fpzip";
+    // GPU compressors (nvcomp)
+    else if (base_id == 13) library_name = "nvcomp-lz4";
 
     CompressionPreset preset = CompressionPreset::BALANCED;
     if (preset_id == 1) preset = CompressionPreset::FAST;
