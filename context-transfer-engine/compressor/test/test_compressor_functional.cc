@@ -515,7 +515,8 @@ TEST_CASE("Error Handling - Invalid Parameters", "[compressor][functional][error
 /**
  * Test Case 7: GPU compression via nvcomp (nvcomp-lz4, lib id 11)
  * Validates the compressor chimod can select and round-trip the GPU compressor
- * end-to-end (Compress -> PutBlob -> GetBlob -> Decompress). Skips when no GPU.
+ * end-to-end (Compress -> PutBlob -> GetBlob -> Decompress). Returns early
+ * (passes without a skip marker) when no GPU device is present.
  */
 TEST_CASE("NvComp GPU Round-trip", "[compressor][functional][nvcomp][gpu]") {
   int device_count = 0;
@@ -534,7 +535,7 @@ TEST_CASE("NvComp GPU Round-trip", "[compressor][functional][nvcomp][gpu]") {
   ctp::ipc::ShmPtr<> put_blob_data = put_buffer.shm_.template Cast<void>();
 
   Context context;
-  context.compress_lib_ = CompLib::NVCOMP_LZ4;  // 11
+  context.compress_lib_ = CompLib::NVCOMP_LZ4;
   context.compress_preset_ = 2;
 
   auto compress_task = fixture.compressor_client_.AsyncCompress(
