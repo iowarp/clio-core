@@ -136,8 +136,10 @@ TEST_CASE("TestCompress") {
 }
 
 #if CTP_ENABLE_NVCOMP
-// GPU compression via nvcomp. Exercised through the CompressionFactory so this
-// also validates the factory registration of "nvcomp-lz4".
+// GPU compression via nvcomp. Mirrors the CPU compressor coverage above (a
+// direct-class Compress/Decompress round-trip) and adds GPU-specific coverage:
+// a factory round-trip (validates the "nvcomp-lz4" registration) and the
+// library-id encoding round-trip.
 TEST_CASE("TestNvCompGpu") {
   // nvcomp needs a real GPU. Skip gracefully where none is present (CI, laptops,
   // Docker without --gpus) so the suite stays green everywhere.
@@ -147,13 +149,29 @@ TEST_CASE("TestNvCompGpu") {
     return;
   }
 
-  // Payload larger than nvcomp's chunk/overhead so compression is meaningful.
-  std::string raw;
-  for (int i = 0; i < 4096; ++i) {
-    raw += "The quick brown fox jumps over the lazy dog 0123456789 ";
+  // Parity with the CPU tests: same direct-class round-trip, same small payload
+  // and 1024-byte buffers, same REQUIRE-equality check.
+  PAGE_DIVIDE("NvCompLZ4 (direct class)") {
+    std::string raw = "Hello, World!";
+    std::vector<char> compressed(1024);
+    std::vector<char> decompressed(1024);
+    ctp::NvComp nvcomp(ctp::NvCompAlgo::LZ4);
+    size_t cmpr_size = 1024, raw_size = 1024;
+    REQUIRE(nvcomp.Compress(compressed.data(), cmpr_size,
+                            raw.data(), raw.size()));
+    REQUIRE(nvcomp.Decompress(decompressed.data(), raw_size,
+                              compressed.data(), cmpr_size));
+    REQUIRE(raw == std::string(decompressed.data(), raw_size));
   }
 
+  // Larger, compressible payload exercised through the factory (also proves the
+  // factory dispatches "nvcomp-lz4").
   PAGE_DIVIDE("NvCompLZ4 (via factory)") {
+    std::string raw;
+    for (int i = 0; i < 4096; ++i) {
+      raw += "The quick brown fox jumps over the lazy dog 0123456789 ";
+    }
+
     auto compressor = ctp::CompressionFactory::GetPreset(
         "nvcomp-lz4", ctp::CompressionPreset::BALANCED);
     REQUIRE(compressor != nullptr);
@@ -165,7 +183,7 @@ TEST_CASE("TestNvCompGpu") {
     REQUIRE(compressor->Compress(compressed.data(), cmpr_size,
                                  raw.data(), raw.size()));
     REQUIRE(cmpr_size > 0);
-    REQUIRE(cmpr_size <= compressed.size());
+    REQUIRE(cmpr_size < raw.size());  // large repetitive data must shrink
 
     auto decompressor = ctp::CompressionFactory::GetPreset("nvcomp-lz4");
     REQUIRE(decompressor != nullptr);

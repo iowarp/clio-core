@@ -693,12 +693,14 @@ chi::TaskResume Runtime::Compress(ctp::ipc::FullPtr<CompressTask> task,
       CLIO_CO_RETURN;
     }
 
-    // Map compress_lib_ ID to library name
+    // Map compress_lib_ ID to library name. Index 11 ("nvcomp-lz4") is a GPU
+    // compressor; it is only constructible when the build has nvcomp enabled,
+    // otherwise the factory returns null below and it is handled as an error.
     const char* lib_names[] = {"brotli", "bzip2", "blosc2", "fpzip",
                                "lz4",    "lzma",  "snappy", "sz3",
-                               "zfp",    "zlib",  "zstd"};
+                               "zfp",    "zlib",  "zstd",   "nvcomp-lz4"};
     std::string library_name =
-        (context.compress_lib_ >= 0 && context.compress_lib_ <= 10)
+        (context.compress_lib_ >= 0 && context.compress_lib_ <= 11)
             ? lib_names[context.compress_lib_]
             : "zstd";
 
@@ -886,11 +888,11 @@ chi::TaskResume Runtime::Decompress(ctp::ipc::FullPtr<DecompressTask> task,
       int compress_preset = static_cast<int>(header->compress_preset_);
       chi::u64 original_size = header->original_size_;
 
-      // Map compress_lib ID to library name
+      // Map compress_lib ID to library name (index 11 = "nvcomp-lz4", GPU).
       const char* lib_names[] = {"brotli", "bzip2", "blosc2", "fpzip",
                                  "lz4",    "lzma",  "snappy", "sz3",
-                                 "zfp",    "zlib",  "zstd"};
-      std::string library_name = (compress_lib >= 0 && compress_lib <= 10)
+                                 "zfp",    "zlib",  "zstd",   "nvcomp-lz4"};
+      std::string library_name = (compress_lib >= 0 && compress_lib <= 11)
                                      ? lib_names[compress_lib]
                                      : "zstd";
 

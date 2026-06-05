@@ -59,6 +59,10 @@
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/core/core_tasks.h>
 
+#if CTP_ENABLE_NVCOMP
+#include <cuda_runtime.h>
+#endif
+
 using namespace clio::cte::compressor;
 
 namespace {
@@ -77,6 +81,7 @@ namespace CompLib {
   constexpr int ZFP = 8;
   constexpr int ZLIB = 9;
   constexpr int ZSTD = 10;
+  constexpr int NVCOMP_LZ4 = 11;  // GPU compressor (requires nvcomp build)
 }
 
 /**
@@ -505,6 +510,61 @@ TEST_CASE("Error Handling - Invalid Parameters", "[compressor][functional][error
     CLIO_IPC->FreeBuffer(shm_buffer);
   }
 }
+
+#if CTP_ENABLE_NVCOMP
+/**
+ * Test Case 7: GPU compression via nvcomp (nvcomp-lz4, lib id 11)
+ * Validates the compressor chimod can select and round-trip the GPU compressor
+ * end-to-end (Compress -> PutBlob -> GetBlob -> Decompress). Skips when no GPU.
+ */
+TEST_CASE("NvComp GPU Round-trip", "[compressor][functional][nvcomp][gpu]") {
+  int device_count = 0;
+  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+    INFO("No CUDA device available; skipping nvcomp functional test");
+    return;
+  }
+
+  CTETestFixture fixture;
+
+  auto original_data = GenerateTestData(64 * 1024, "text");
+
+  // Compress + store via the chimod using the GPU compressor.
+  auto put_buffer = fixture.AllocateAndCopyData(original_data);
+  REQUIRE(!put_buffer.IsNull());
+  ctp::ipc::ShmPtr<> put_blob_data = put_buffer.shm_.template Cast<void>();
+
+  Context context;
+  context.compress_lib_ = CompLib::NVCOMP_LZ4;  // 11
+  context.compress_preset_ = 2;
+
+  auto compress_task = fixture.compressor_client_.AsyncCompress(
+      chi::PoolQuery::Local(), fixture.tag_id_, "test_blob_nvcomp", 0,
+      original_data.size(), put_blob_data, 0.5f, context, 0,
+      fixture.core_pool_id_);
+  compress_task.Wait();
+  REQUIRE(compress_task->return_code_ == 0);
+  CLIO_IPC->FreeBuffer(put_buffer);
+
+  // Retrieve + decompress via the chimod and verify integrity.
+  auto get_buffer = CLIO_IPC->AllocateBuffer(original_data.size());
+  REQUIRE(!get_buffer.IsNull());
+  ctp::ipc::ShmPtr<> get_blob_data = get_buffer.shm_.template Cast<void>();
+
+  auto decompress_task = fixture.compressor_client_.AsyncDecompressExplicit(
+      chi::PoolQuery::Local(), fixture.tag_id_, "test_blob_nvcomp", 0,
+      original_data.size(), 0, get_blob_data, fixture.core_pool_id_);
+  decompress_task.Wait();
+  REQUIRE(decompress_task->return_code_ == 0);
+  REQUIRE(decompress_task->output_size_ == original_data.size());
+
+  auto retrieved_data =
+      fixture.ReadFromSharedMemory(get_buffer, original_data.size());
+  REQUIRE(std::memcmp(original_data.data(), retrieved_data.data(),
+                      original_data.size()) == 0);
+  INFO("nvcomp-lz4 GPU round-trip verified");
+  CLIO_IPC->FreeBuffer(get_buffer);
+}
+#endif  // CTP_ENABLE_NVCOMP
 
 // Main function using simple_test.h framework
 SIMPLE_TEST_MAIN()
