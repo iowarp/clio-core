@@ -55,15 +55,16 @@ enum class NvCompAlgo {
 /**
  * GPU compressor backed by NVIDIA nvcomp's high-level Manager API.
  *
- * Implements the synchronous ctp::Compressor interface over host buffers: each
- * call copies the input to the device, runs the nvcomp manager on a private
- * CUDA stream, synchronizes, then copies the result back to the host. The
- * compressed bitstream uses NVCOMP_NATIVE (self-describing) format, so
- * Decompress can reconstruct the manager directly from the compressed bytes.
+ * Implements the synchronous ctp::Compressor interface and runs the nvcomp
+ * manager on a private CUDA stream, synchronizing before returning. Buffers are
+ * handled adaptively: if a pointer already refers to GPU-accessible memory
+ * (device or UVM/managed), it is used in place (zero-copy); otherwise the data
+ * is staged through a temporary device buffer (H2D for inputs, D2H for outputs).
+ * This keeps it correct for host callers while delivering the zero-copy path
+ * automatically whenever the data is already resident on the GPU.
  *
- * Note: this performs its own H2D/D2H copies because the current Compressor
- * contract hands us host pointers. A future device-pointer-aware path could
- * skip the copies when the data is already resident on the GPU.
+ * The compressed bitstream uses NVCOMP_NATIVE (self-describing) format, so
+ * Decompress reconstructs the manager directly from the compressed bytes.
  */
 class NvComp : public Compressor {
  public:
@@ -77,32 +78,49 @@ class NvComp : public Compressor {
     }
     uint8_t *d_in = nullptr;
     uint8_t *d_out = nullptr;
+    bool free_in = false;
+    bool free_out = false;
     bool ok = false;
     do {
-      if (cudaMalloc(&d_in, input_size) != cudaSuccess) break;
-      if (cudaMemcpyAsync(d_in, input, input_size, cudaMemcpyHostToDevice,
-                          stream) != cudaSuccess) {
-        break;
-      }
+      // Input: use directly if already on the GPU, else stage a H2D copy.
+      d_in = ToDeviceInput(input, input_size, stream, &free_in);
+      if (!d_in) break;
+
       std::shared_ptr<nvcomp::nvcompManagerBase> mgr = MakeManager(stream);
       if (!mgr) break;
       nvcomp::CompressionConfig cfg = mgr->configure_compression(input_size);
-      if (cudaMalloc(&d_out, cfg.max_compressed_buffer_size) != cudaSuccess) {
-        break;
+
+      // Output: write straight into the caller's buffer only if it is a GPU
+      // buffer large enough for nvcomp's worst case; otherwise use a temp.
+      // (Device-direct requires >= max_compressed_buffer_size, while the temp
+      // path only needs to fit the actual compressed size -- this asymmetry is
+      // intentional; an in-between device buffer just falls back to temp + D2D.)
+      const bool out_is_device = IsDeviceAccessible(output);
+      if (out_is_device && output_size >= cfg.max_compressed_buffer_size) {
+        d_out = static_cast<uint8_t *>(output);
+      } else {
+        if (cudaMalloc(&d_out, cfg.max_compressed_buffer_size) != cudaSuccess) {
+          break;
+        }
+        free_out = true;
       }
+
       mgr->compress(d_in, d_out, cfg);
       if (cudaStreamSynchronize(stream) != cudaSuccess) break;
       size_t comp_size = mgr->get_compressed_output_size(d_out);
       if (comp_size > output_size) break;  // caller buffer too small
-      if (cudaMemcpy(output, d_out, comp_size, cudaMemcpyDeviceToHost) !=
-          cudaSuccess) {
-        break;
+
+      // Deliver to the caller's buffer if we compressed into a temp.
+      if (d_out != static_cast<uint8_t *>(output)) {
+        cudaMemcpyKind kind =
+            out_is_device ? cudaMemcpyDeviceToDevice : cudaMemcpyDeviceToHost;
+        if (cudaMemcpy(output, d_out, comp_size, kind) != cudaSuccess) break;
       }
       output_size = comp_size;
       ok = true;
     } while (false);
-    if (d_in) cudaFree(d_in);
-    if (d_out) cudaFree(d_out);
+    if (free_in) cudaFree(d_in);
+    if (free_out) cudaFree(d_out);
     cudaStreamDestroy(stream);
     return ok;
   }
@@ -115,31 +133,43 @@ class NvComp : public Compressor {
     }
     uint8_t *d_in = nullptr;
     uint8_t *d_out = nullptr;
+    bool free_in = false;
+    bool free_out = false;
     bool ok = false;
     do {
-      if (cudaMalloc(&d_in, input_size) != cudaSuccess) break;
-      if (cudaMemcpyAsync(d_in, input, input_size, cudaMemcpyHostToDevice,
-                          stream) != cudaSuccess) {
-        break;
-      }
+      // Input: use directly if already on the GPU, else stage a H2D copy.
+      d_in = ToDeviceInput(input, input_size, stream, &free_in);
+      if (!d_in) break;
+
       // create_manager parses the NVCOMP_NATIVE header and synchronizes stream.
       std::shared_ptr<nvcomp::nvcompManagerBase> mgr =
           nvcomp::create_manager(d_in, stream);
       if (!mgr) break;
       nvcomp::DecompressionConfig cfg = mgr->configure_decompression(d_in);
       if (cfg.decomp_data_size > output_size) break;  // caller buffer too small
-      if (cudaMalloc(&d_out, cfg.decomp_data_size) != cudaSuccess) break;
+
+      const bool out_is_device = IsDeviceAccessible(output);
+      if (out_is_device) {
+        d_out = static_cast<uint8_t *>(output);
+      } else {
+        if (cudaMalloc(&d_out, cfg.decomp_data_size) != cudaSuccess) break;
+        free_out = true;
+      }
+
       mgr->decompress(d_out, d_in, cfg);
       if (cudaStreamSynchronize(stream) != cudaSuccess) break;
-      if (cudaMemcpy(output, d_out, cfg.decomp_data_size,
-                     cudaMemcpyDeviceToHost) != cudaSuccess) {
-        break;
+
+      if (d_out != static_cast<uint8_t *>(output)) {
+        if (cudaMemcpy(output, d_out, cfg.decomp_data_size,
+                       cudaMemcpyDeviceToHost) != cudaSuccess) {
+          break;
+        }
       }
       output_size = cfg.decomp_data_size;
       ok = true;
     } while (false);
-    if (d_in) cudaFree(d_in);
-    if (d_out) cudaFree(d_out);
+    if (free_in) cudaFree(d_in);
+    if (free_out) cudaFree(d_out);
     cudaStreamDestroy(stream);
     return ok;
   }
@@ -147,6 +177,47 @@ class NvComp : public Compressor {
  private:
   /** Default per-chunk uncompressed size for nvcomp managers (64 KiB). */
   static constexpr size_t kChunkSize = 1 << 16;
+
+  /**
+   * True if `ptr` can be dereferenced by the GPU directly (device or UVM/
+   * managed memory). Pinned-host and plain-host pointers return false so the
+   * caller stages a copy. A failed query is treated as "not device".
+   */
+  static bool IsDeviceAccessible(const void *ptr) {
+    cudaPointerAttributes attr;
+    cudaError_t err = cudaPointerGetAttributes(&attr, ptr);
+    if (err != cudaSuccess) {
+      cudaGetLastError();  // reset the sticky error from the failed query
+      return false;
+    }
+    return attr.type == cudaMemoryTypeDevice ||
+           attr.type == cudaMemoryTypeManaged;
+  }
+
+  /**
+   * Return a device pointer holding `size` bytes of `input`. If `input` is
+   * already GPU-accessible it is used in place (*owned = false); otherwise a
+   * device buffer is allocated and the data copied H2D on `stream`
+   * (*owned = true). Returns nullptr on failure (*owned = false).
+   */
+  static uint8_t *ToDeviceInput(void *input, size_t size, cudaStream_t stream,
+                                bool *owned) {
+    *owned = false;
+    if (IsDeviceAccessible(input)) {
+      return static_cast<uint8_t *>(input);
+    }
+    uint8_t *d = nullptr;
+    if (cudaMalloc(&d, size) != cudaSuccess) {
+      return nullptr;
+    }
+    if (cudaMemcpyAsync(d, input, size, cudaMemcpyHostToDevice, stream) !=
+        cudaSuccess) {
+      cudaFree(d);
+      return nullptr;
+    }
+    *owned = true;
+    return d;
+  }
 
   /** Construct the nvcomp manager for the configured algorithm. */
   std::shared_ptr<nvcomp::nvcompManagerBase> MakeManager(cudaStream_t stream) {

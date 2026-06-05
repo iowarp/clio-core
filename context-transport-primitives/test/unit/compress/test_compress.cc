@@ -193,6 +193,44 @@ TEST_CASE("TestNvCompGpu") {
     REQUIRE(raw == std::string(decompressed.data(), raw_size));
   }
 
+  // Device-pointer (zero-copy) path: hand NvComp cudaMalloc'd pointers for both
+  // input and output so it must use them in place rather than staging copies.
+  PAGE_DIVIDE("NvCompLZ4 (device pointers, zero-copy)") {
+    std::string raw;
+    for (int i = 0; i < 1024; ++i) {
+      raw += "GPU-resident data exercises the zero-copy path 9876543210 ";
+    }
+
+    void *d_raw = nullptr;
+    REQUIRE(cudaMalloc(&d_raw, raw.size()) == cudaSuccess);
+    REQUIRE(cudaMemcpy(d_raw, raw.data(), raw.size(),
+                       cudaMemcpyHostToDevice) == cudaSuccess);
+
+    size_t cap = raw.size() + raw.size() / 20 + 4096;
+    void *d_comp = nullptr;
+    REQUIRE(cudaMalloc(&d_comp, cap) == cudaSuccess);
+
+    ctp::NvComp nvcomp(ctp::NvCompAlgo::LZ4);
+    size_t comp_size = cap;
+    REQUIRE(nvcomp.Compress(d_comp, comp_size, d_raw, raw.size()));
+    REQUIRE(comp_size < raw.size());
+
+    void *d_decomp = nullptr;
+    REQUIRE(cudaMalloc(&d_decomp, raw.size()) == cudaSuccess);
+    size_t decomp_size = raw.size();
+    REQUIRE(nvcomp.Decompress(d_decomp, decomp_size, d_comp, comp_size));
+    REQUIRE(decomp_size == raw.size());
+
+    std::vector<char> host_out(raw.size());
+    REQUIRE(cudaMemcpy(host_out.data(), d_decomp, raw.size(),
+                       cudaMemcpyDeviceToHost) == cudaSuccess);
+    REQUIRE(raw == std::string(host_out.data(), raw.size()));
+
+    cudaFree(d_raw);
+    cudaFree(d_comp);
+    cudaFree(d_decomp);
+  }
+
   PAGE_DIVIDE("NvCompLZ4 library id round-trip") {
     int id = ctp::CompressionFactory::GetLibraryId(
         "nvcomp-lz4", ctp::CompressionPreset::BALANCED);
