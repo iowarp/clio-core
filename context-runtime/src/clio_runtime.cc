@@ -91,18 +91,18 @@ bool ClioInitImpl(ChimaeraMode mode, bool default_with_runtime,
     }
   }
 
-  // Register atexit handler so CHIMAERA_FINALIZE runs before static
+  // Register atexit handler so CLIO_RUNTIME_FINALIZE runs before static
   // destructors.  The CLIO Runtime singleton is heap-allocated (GetGlobalPtrVar)
   // so its destructor is never called automatically.  Without this the ZMQ
   // DEALER socket stays open and zmq_ctx_destroy blocks forever at exit.
-  std::atexit(CHIMAERA_FINALIZE);
+  std::atexit(CLIO_RUNTIME_FINALIZE);
 
   // Mark as initialized on success
   s_initialized = true;
   return true;
 }
 
-void CHIMAERA_FINALIZE() {
+void CLIO_RUNTIME_FINALIZE() {
   static bool s_finalized = false;
   if (s_finalized) {
     return;

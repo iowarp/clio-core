@@ -91,7 +91,7 @@ bool ClioInitImpl(ChimaeraMode mode, bool default_with_runtime,
 
 /**
  * CLIO_INIT — canonical Clio runtime entry point.  Thin inline wrapper
- * around ClioInitImpl (the heavy lifting lives in chimaera.cc because
+ * around ClioInitImpl (the heavy lifting lives in clio_runtime.cc because
  * it touches the IpcManager / ChimaeraManager singletons whose
  * headers we don't want to drag into clio_runtime.h's transitive
  * include set).  Inline, not a macro, so the call resolves through the
@@ -114,14 +114,17 @@ inline bool CHIMAERA_INIT(ChimaeraMode mode, bool default_with_runtime = false,
 }
 
 /**
- * Finalize CLIO Runtime and release all resources
+ * Finalize CLIO Runtime and release all resources.
  *
- * Calls ClientFinalize on the CLIO Runtime manager to close ZMQ sockets and
- * join background threads. Must be called before process exit to avoid
- * hangs in zmq_ctx_destroy (the CLIO Runtime singleton is heap-allocated so
- * its destructor is never invoked automatically).
+ * Canonical name. Calls ClientFinalize on the CLIO Runtime manager to close
+ * ZMQ sockets and join background threads. Must be called before process exit
+ * to avoid hangs in zmq_ctx_destroy (the CLIO Runtime singleton is
+ * heap-allocated so its destructor is never invoked automatically).
  */
-void CHIMAERA_FINALIZE();
+void CLIO_RUNTIME_FINALIZE();
+
+/** Deprecated alias — calls CLIO_RUNTIME_FINALIZE(). */
+inline void CHIMAERA_FINALIZE() { CLIO_RUNTIME_FINALIZE(); }
 
 }  // namespace clio::run
 
@@ -136,17 +139,7 @@ void CHIMAERA_FINALIZE();
 // CLIO_<X>` backward-compat alias, so legacy code that still uses the
 // CHI_* spelling keeps working unchanged. See rebranding.md for the full
 // migration table.
-//
-// Only one thing needs to live in this umbrella now:
-//   - The finalize macro (its RHS is a function call defined here).
-//     CLIO_INIT / CHIMAERA_INIT are inline functions above (not macros),
-//     so no #define alias is needed for them.
-// The CLIO_RUNTIME_MANAGER macro is canonical (defined in
-// clio_runtime/manager.h) — no alias needed.
 //==============================================================================
-
-// --- Finalize ---
-#define CLIO_RUNTIME_FINALIZE  ::chi::CHIMAERA_FINALIZE
 
 // --- Module namespace alias (chimaera:: -> clio::run::) ---
 // Pulled in last so the alias is visible to every TU that includes this
