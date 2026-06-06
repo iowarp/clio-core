@@ -101,6 +101,19 @@ if(CLIO_CORE_ENABLE_TESTS)
       LABELS "msan_skip"
       ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CHIMAERA_TEST_MODE=1;CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500"
   )
+
+  # Force-net stress test: routes all bdev tasks through the network path
+  # even on a single node, exercising SendIn/RecvIn/SendOut/RecvOut on loopback.
+  add_test(
+    NAME cr_bdev_force_net
+    COMMAND ${BDEV_TEST_TARGET}
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_bdev_force_net PROPERTIES
+    TIMEOUT 300
+    LABELS "msan_skip"
+    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CHIMAERA_TEST_MODE=1;CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500;CLIO_FORCE_NET=1"
+  )
 endif()
 
 # Custom targets for bdev tests

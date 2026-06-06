@@ -175,16 +175,6 @@ public:
   chi::TaskResume Send(ctp::ipc::FullPtr<SendTask> task, chi::RunContext &rctx);
 
   /**
-   * Helper: Send task inputs to remote node
-   */
-  void SendIn(ctp::ipc::FullPtr<chi::Task> origin_task, chi::RunContext &rctx);
-
-  /**
-   * Helper: Send task outputs back to origin node
-   */
-  void SendOut(ctp::ipc::FullPtr<chi::Task> origin_task);
-
-  /**
    * Handle Recv - Receive task inputs or outputs from network
    * Returns TaskResume for consistency with other methods called from Run
    */
@@ -324,16 +314,6 @@ public:
    * The GPU orchestrator's gpu::PoolManager will be updated with the new container
    */
   chi::TaskResume RegisterGpuContainer(ctp::ipc::FullPtr<RegisterGpuContainerTask> task, chi::RunContext &rctx);
-
-  /**
-   * Helper: Receive task inputs from remote node
-   */
-  void RecvIn(ctp::ipc::FullPtr<RecvTask> task, chi::LoadTaskArchive& archive, ctp::lbm::Transport* lbm_transport);
-
-  /**
-   * Helper: Receive task outputs from remote node
-   */
-  void RecvOut(ctp::ipc::FullPtr<RecvTask> task, chi::LoadTaskArchive& archive, ctp::lbm::Transport* lbm_transport);
 
   /**
    * Get live task statistics for this task instance.

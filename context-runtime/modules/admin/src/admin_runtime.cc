@@ -363,21 +363,6 @@ chi::TaskResume Runtime::Flush(ctp::ipc::FullPtr<FlushTask> task,
 //===========================================================================
 
 /**
- * Helper function: Send task inputs to remote node
- */
-void Runtime::SendIn(ctp::ipc::FullPtr<chi::Task> origin_task,
-                     chi::RunContext &rctx) {
-  CLIO_IPC->GetRun2Run()->SendIn(origin_task);
-}
-
-/**
- * Helper function: Send task outputs back to origin node
- */
-void Runtime::SendOut(ctp::ipc::FullPtr<chi::Task> origin_task) {
-  CLIO_IPC->GetRun2Run()->SendOut(origin_task);
-}
-
-/**
  * Main Send periodic — drains cross-node send queues on net_send_worker.
  *
  * Strategy (see NetQueuePriority for the lane definitions):
@@ -432,7 +417,7 @@ chi::TaskResume Runtime::Send(ctp::ipc::FullPtr<SendTask> task,
     }
     auto origin_task = queued_future.GetTaskPtr();
     if (!origin_task.IsNull()) {
-      SendIn(origin_task, rctx);
+      ipc_manager->GetRun2Run()->SendIn(origin_task);
       did_send = true;
     }
   }
@@ -443,7 +428,7 @@ chi::TaskResume Runtime::Send(ctp::ipc::FullPtr<SendTask> task,
     }
     auto origin_task = queued_future.GetTaskPtr();
     if (!origin_task.IsNull()) {
-      SendOut(origin_task);
+      ipc_manager->GetRun2Run()->SendOut(origin_task);
       did_send = true;
     }
   }
@@ -463,7 +448,7 @@ chi::TaskResume Runtime::Send(ctp::ipc::FullPtr<SendTask> task,
         size_t sz = origin_task->GetRunCtx()
                         ? origin_task->GetRunCtx()->predicted_stat_.io_size_
                         : 0;
-        SendIn(origin_task, rctx);
+        ipc_manager->GetRun2Run()->SendIn(origin_task);
         did_send = true;
         io_budget = (sz >= io_budget) ? 0 : (io_budget - sz);
         --io_in_remaining;
@@ -479,7 +464,7 @@ chi::TaskResume Runtime::Send(ctp::ipc::FullPtr<SendTask> task,
         size_t sz = origin_task->GetRunCtx()
                         ? origin_task->GetRunCtx()->predicted_stat_.io_size_
                         : 0;
-        SendOut(origin_task);
+        ipc_manager->GetRun2Run()->SendOut(origin_task);
         did_send = true;
         io_budget = (sz >= io_budget) ? 0 : (io_budget - sz);
         --io_out_remaining;
@@ -490,34 +475,9 @@ chi::TaskResume Runtime::Send(ctp::ipc::FullPtr<SendTask> task,
   }
 
   rctx.did_work_ = did_send;
-  {
-    auto *cfg_ipc = CLIO_IPC;
-    CLIO_IPC->GetRun2Run()->DumpNetStats(cfg_ipc->GetNodeId(),
-                                          cfg_ipc->GetNumHosts());
-  }
   task->SetReturnCode(0);
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
-}
-
-/**
- * Helper function: Receive task inputs from remote node
- */
-void Runtime::RecvIn(ctp::ipc::FullPtr<RecvTask> task,
-                     chi::LoadTaskArchive &archive,
-                     ctp::lbm::Transport *lbm_transport) {
-  CLIO_IPC->GetRun2Run()->RecvIn(archive, lbm_transport);
-  task->SetReturnCode(0);
-}
-
-/**
- * Helper function: Receive task outputs from remote node
- */
-void Runtime::RecvOut(ctp::ipc::FullPtr<RecvTask> task,
-                      chi::LoadTaskArchive &archive,
-                      ctp::lbm::Transport *lbm_transport) {
-  CLIO_IPC->GetRun2Run()->RecvOut(archive, lbm_transport);
-  task->SetReturnCode(0);
 }
 
 /**
@@ -582,11 +542,13 @@ chi::TaskResume Runtime::Recv(ctp::ipc::FullPtr<RecvTask> task,
   switch (msg_type) {
     case chi::MsgType::kSerializeIn:
       HLOG(kDebug, "[Recv] Dispatching to RecvIn");
-      RecvIn(task, archive, lbm_transport);
+      ipc_manager->GetRun2Run()->RecvIn(archive, lbm_transport);
+      task->SetReturnCode(0);
       break;
     case chi::MsgType::kSerializeOut:
       HLOG(kDebug, "[Recv] Dispatching to RecvOut");
-      RecvOut(task, archive, lbm_transport);
+      ipc_manager->GetRun2Run()->RecvOut(archive, lbm_transport);
+      task->SetReturnCode(0);
       break;
     case chi::MsgType::kHeartbeat:
       task->SetReturnCode(0);

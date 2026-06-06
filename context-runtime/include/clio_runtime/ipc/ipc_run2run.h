@@ -53,6 +53,14 @@ namespace clio::run {
 /** Return code set on tasks that fail due to network timeout */
 static constexpr int kRun2RunNetworkTimeoutRC = -1000;
 
+/**
+ * Sentinel for "no target node resolved".  Node id 0 is a valid node (the
+ * first host in the hostfile is node 0), so 0 cannot double as an error
+ * marker — doing so silently drops every task targeting node 0, which under
+ * CLIO_FORCE_NET=1 on a single-node deployment is *every* task.
+ */
+static constexpr chi::u64 kInvalidNodeId = ~chi::u64(0);
+
 /** How long (seconds) to keep a task in the retry queue before failing it */
 static constexpr float kRun2RunRetryTimeoutSec = 30.0f;
 
@@ -130,12 +138,6 @@ class IpcManagerRun2Run {
   void FlushStaleStateForNode(chi::u64 node_id);
 
   /**
-   * Emit per-peer network statistics if the dump interval has elapsed.
-   * Called once per Send periodic tick.
-   */
-  void DumpNetStats(chi::u64 self_node_id, size_t num_peers);
-
-  /**
    * Spawn the dedicated peer-recv and client-recv threads.
    * Must be called once the IpcManager main transport is (or will be) available.
    */
@@ -173,7 +175,7 @@ class IpcManagerRun2Run {
   /**
    * Serialize task_copy and transmit it to target_node_id.
    * On failure marks the node dead (if appropriate) and queues in
-   * send_in_retry_.  Updates per-peer NetStats on success.
+   * send_in_retry_.
    */
   void SendInTransmitReplica(chi::Container *container,
                               chi::IpcManager *ipc_manager,
@@ -187,8 +189,7 @@ class IpcManagerRun2Run {
 
   /**
    * Serialize origin_task (out-direction) and send to target_node_id.
-   * Updates per-peer NetStats on success, queues in send_out_retry_ on
-   * failure.  Returns the Lightbeam rc.
+   * Queues in send_out_retry_ on failure.  Returns the Lightbeam rc.
    */
   int SendOutTransmit(chi::Container *container,
                       chi::IpcManager *ipc_manager,
@@ -279,36 +280,6 @@ class IpcManagerRun2Run {
   mutable std::mutex retry_queues_mutex_;
   std::deque<RetryEntry> send_in_retry_;
   std::deque<RetryEntry> send_out_retry_;
-
-  // -------------------------------------------------------------------------
-  // Per-peer network statistics
-  // -------------------------------------------------------------------------
-  struct NetPeerStats {
-    uint64_t sin_count = 0;   // SendIn message count
-    uint64_t sin_bytes = 0;
-    uint64_t sin_lbm_ns = 0;  // time inside lbm_transport->Send for SendIn
-    uint64_t sin_ser_ns = 0;  // time inside container->SaveTask for SendIn
-    uint64_t sout_count = 0;  // SendOut message count
-    uint64_t sout_bytes = 0;
-    uint64_t sout_lbm_ns = 0;
-    uint64_t sout_ser_ns = 0;
-    uint64_t rin_count = 0;   // RecvIn message count
-    uint64_t rin_bytes = 0;
-    uint64_t rin_des_ns = 0;  // time inside deserialize/dispatch for RecvIn
-    uint64_t rout_count = 0;  // RecvOut message count
-    uint64_t rout_bytes = 0;
-    uint64_t rout_des_ns = 0;
-  };
-
-  static constexpr size_t kMaxNetPeers = 64;
-  static constexpr double kNetStatsDumpIntervalSec = 1.0;
-  NetPeerStats peer_stats_[kMaxNetPeers] = {};
-  std::chrono::steady_clock::time_point net_stats_last_dump_ =
-      std::chrono::steady_clock::now();
-
-  NetPeerStats &NetStats(chi::u64 peer) {
-    return peer_stats_[peer % kMaxNetPeers];
-  }
 };
 
 }  // namespace clio::run

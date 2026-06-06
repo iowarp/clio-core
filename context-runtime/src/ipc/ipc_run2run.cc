@@ -49,12 +49,6 @@
 
 namespace clio::run {
 
-static inline uint64_t HrtNs() {
-  return std::chrono::duration_cast<std::chrono::nanoseconds>(
-             std::chrono::steady_clock::now().time_since_epoch())
-      .count();
-}
-
 // =============================================================================
 // Constructor
 // =============================================================================
@@ -74,6 +68,13 @@ chi::u64 IpcManagerRun2Run::SendInResolveTargetNode(
   if (query.IsLocalMode()) {
     return ipc_manager->GetNodeId();
   }
+  if (query.IsDynamicMode()) {
+    // A Dynamic query that reaches SendIn was never resolved to a concrete
+    // remote target (ScheduleTask/ResolvePoolQuery passed it through), so it
+    // belongs on the local node.  Under CLIO_FORCE_NET=1 this is the common
+    // case: a local Dynamic task is forced through the loopback network path.
+    return ipc_manager->GetNodeId();
+  }
   if (query.IsPhysicalMode()) {
     return query.GetNodeId();
   }
@@ -89,15 +90,15 @@ chi::u64 IpcManagerRun2Run::SendInResolveTargetNode(
   if (query.IsBroadcastMode()) {
     HLOG(kError,
          "Admin: Broadcast mode should be handled by TaskDispatcher, not SendIn");
-    return 0;
+    return kInvalidNodeId;
   }
   if (query.IsDirectHashMode()) {
     HLOG(kError,
          "Admin: DirectHash mode should be handled by TaskDispatcher, not SendIn");
-    return 0;
+    return kInvalidNodeId;
   }
   HLOG(kError, "Admin: Unsupported query type for SendIn");
-  return 0;
+  return kInvalidNodeId;
 }
 
 void IpcManagerRun2Run::SendInTransmitReplica(
@@ -124,17 +125,10 @@ void IpcManagerRun2Run::SendInTransmitReplica(
   }
 
   chi::SaveTaskArchive archive(chi::MsgType::kSerializeIn, lbm_transport);
-  uint64_t ser_t0 = HrtNs();
   container->SaveTask(task_copy->method_, archive, task_copy);
-  uint64_t ser_dt = HrtNs() - ser_t0;
 
   ctp::lbm::LbmContext ctx(ctp::lbm::LBM_SYNC);
-  HLOG(kDebug, "[SendIn] Task {} sending to node {} via lightbeam",
-       origin_task->task_id_, target_node_id);
-  uint64_t lbm_t0 = HrtNs();
   int rc = lbm_transport->Send(archive, ctx);
-  uint64_t lbm_dt = HrtNs() - lbm_t0;
-  HLOG(kDebug, "[SendIn] Task {} lightbeam Send rc={}", origin_task->task_id_, rc);
 
   if (rc != 0) {
     HLOG(kWarning, "[SendIn] Task {} Lightbeam Send rc={} — re-queueing",
@@ -146,19 +140,6 @@ void IpcManagerRun2Run::SendInTransmitReplica(
     send_in_retry_.push_back(
         {task_copy, target_node_id, std::chrono::steady_clock::now()});
     return;
-  }
-
-  auto &st = NetStats(target_node_id);
-  st.sin_count += 1;
-  st.sin_bytes += origin_task->GetRunCtx()
-                      ? origin_task->GetRunCtx()->predicted_stat_.io_size_ : 0;
-  st.sin_lbm_ns += lbm_dt;
-  st.sin_ser_ns += ser_dt;
-
-  static std::atomic<size_t> ctr{0};
-  size_t t = ctr.fetch_add(1, std::memory_order_relaxed) + 1;
-  if ((t & 0xff) == 0) {
-    HLOG(kDebug, "[CountSendIn] sent {} cross-node tasks to peers", t);
   }
 }
 
@@ -207,7 +188,7 @@ void IpcManagerRun2Run::SendIn(ctp::ipc::FullPtr<chi::Task> origin_task) {
 
     chi::u64 target_node_id =
         SendInResolveTargetNode(ipc_manager, pool_manager, origin_task, query);
-    if (target_node_id == 0) {
+    if (target_node_id == kInvalidNodeId) {
       continue;
     }
 
@@ -276,14 +257,10 @@ int IpcManagerRun2Run::SendOutTransmit(
   }
 
   chi::SaveTaskArchive archive(chi::MsgType::kSerializeOut, lbm_transport);
-  uint64_t ser_t0 = HrtNs();
   container->SaveTask(origin_task->method_, archive, origin_task);
-  uint64_t ser_dt = HrtNs() - ser_t0;
 
   ctp::lbm::LbmContext ctx(ctp::lbm::LBM_SYNC);
-  uint64_t lbm_t0 = HrtNs();
   int rc = lbm_transport->Send(archive, ctx);
-  uint64_t lbm_dt = HrtNs() - lbm_t0;
 
   if (rc != 0) {
     HLOG(kWarning, "[SendOut] Task {} Lightbeam Send rc={} — re-queueing",
@@ -295,19 +272,6 @@ int IpcManagerRun2Run::SendOutTransmit(
     send_out_retry_.push_back(
         {origin_task, target_node_id, std::chrono::steady_clock::now()});
     return rc;
-  }
-
-  auto &st = NetStats(target_node_id);
-  st.sout_count += 1;
-  st.sout_bytes += origin_task->GetRunCtx()
-                       ? origin_task->GetRunCtx()->predicted_stat_.io_size_ : 0;
-  st.sout_lbm_ns += lbm_dt;
-  st.sout_ser_ns += ser_dt;
-
-  static std::atomic<size_t> ctr{0};
-  size_t t = ctr.fetch_add(1, std::memory_order_relaxed) + 1;
-  if ((t & 0xff) == 0) {
-    HLOG(kDebug, "[CountSendOut] sent {} cross-node responses back", t);
   }
 
   return 0;
@@ -364,7 +328,7 @@ void IpcManagerRun2Run::SendOut(ctp::ipc::FullPtr<chi::Task> origin_task) {
   int rc = SendOutTransmit(container, ipc_manager, origin_task, target_node_id,
                            target_host);
   if (rc == 0) {
-    ipc_manager->DelTask(origin_task);
+    container->DelTask(origin_task->method_, origin_task);
   }
 }
 
@@ -385,23 +349,12 @@ bool IpcManagerRun2Run::RecvInHandleOne(
     return false;
   }
 
-  uint64_t des_t0 = HrtNs();
   ctp::ipc::FullPtr<chi::Task> task_ptr =
       container->AllocLoadTask(task_info.method_id_, archive);
-  uint64_t des_dt = HrtNs() - des_t0;
 
   if (task_ptr.IsNull()) {
     HLOG(kError, "Admin: Failed to load task");
     return false;
-  }
-
-  {
-    chi::u64 from_node = task_ptr->pool_query_.GetReturnNode();
-    auto &st = NetStats(from_node);
-    st.rin_count += 1;
-    st.rin_bytes += task_ptr->GetRunCtx()
-                        ? task_ptr->GetRunCtx()->predicted_stat_.io_size_ : 0;
-    st.rin_des_ns += des_dt;
   }
 
   chi::u64 sender_node = task_ptr->pool_query_.GetReturnNode();
@@ -439,7 +392,7 @@ bool IpcManagerRun2Run::RecvInHandleOne(
     return false;
   }
   if (!task_ptr->task_flags_.Any(TASK_RUN_CTX_EXISTS)) {
-    ipc_manager->BeginTask(future, nullptr, nullptr);
+    ipc_manager->BeginTask(future, container, nullptr);
   }
   task_ptr->SetFlags(TASK_ROUTED);
 
@@ -524,18 +477,7 @@ int IpcManagerRun2Run::RecvOutDeserialize(
       return 8;
     }
 
-    uint64_t des_t0 = HrtNs();
     container->LoadTask(origin_task->method_, archive, replica);
-    uint64_t des_dt = HrtNs() - des_t0;
-
-    {
-      chi::u64 from_node = task_info.task_id_.node_id_;
-      auto &st = NetStats(from_node);
-      st.rout_count += 1;
-      st.rout_bytes += origin_task->GetRunCtx()
-                           ? origin_task->GetRunCtx()->predicted_stat_.io_size_ : 0;
-      st.rout_des_ns += des_dt;
-    }
   }
 
   return 0;
@@ -593,21 +535,26 @@ void IpcManagerRun2Run::RecvOutCompleteOriginTask(
     chi::RunContext *origin_rctx) {
   auto *ipc_manager = CLIO_IPC;
 
+  chi::Container *container =
+      CLIO_POOL_MANAGER->GetStaticContainer(origin_task->pool_id_);
+  if (container != nullptr) {
+    origin_rctx->container_ = container;
+  }
+
   for (const auto &subtask_ptr : origin_rctx->subtasks_) {
     subtask_ptr->ClearFlags(TASK_DATA_OWNER);
-    ipc_manager->DelTask(subtask_ptr);
+    if (container != nullptr) {
+      container->DelTask(subtask_ptr->method_, subtask_ptr);
+    } else {
+      HLOG(kError, "[RecvOut] Container not found for pool_id {} while deleting subtask",
+           origin_task->pool_id_);
+    }
   }
   origin_rctx->subtasks_.clear();
 
   {
     std::lock_guard<std::mutex> lk(send_map_mutex_);
     send_map_.erase(net_key);
-  }
-
-  chi::Container *container =
-      CLIO_POOL_MANAGER->GetStaticContainer(origin_task->pool_id_);
-  if (container != nullptr) {
-    origin_rctx->container_ = container;
   }
 
   auto *worker = CLIO_CUR_WORKER;
@@ -898,67 +845,6 @@ void IpcManagerRun2Run::FlushStaleStateForNode(chi::u64 node_id) {
          node_id);
     it = send_out_retry_.erase(it);
   }
-}
-
-// =============================================================================
-// DumpNetStats
-// =============================================================================
-
-void IpcManagerRun2Run::DumpNetStats(chi::u64 self_node_id, size_t num_peers) {
-  auto now = std::chrono::steady_clock::now();
-  double since =
-      std::chrono::duration<double>(now - net_stats_last_dump_).count();
-  if (since < kNetStatsDumpIntervalSec) {
-    return;
-  }
-  net_stats_last_dump_ = now;
-
-  uint64_t tot_sin_c = 0, tot_sin_b = 0, tot_sout_c = 0, tot_sout_b = 0;
-  uint64_t tot_rin_c = 0, tot_rin_b = 0, tot_rout_c = 0, tot_rout_b = 0;
-  uint64_t tot_sin_lbm = 0, tot_sout_lbm = 0;
-  uint64_t tot_sin_ser = 0, tot_sout_ser = 0;
-  uint64_t tot_rin_des = 0, tot_rout_des = 0;
-
-  size_t cap = std::min<size_t>(num_peers, kMaxNetPeers);
-  for (size_t p = 0; p < cap; ++p) {
-    if (p == self_node_id) {
-      continue;
-    }
-    const auto &s = peer_stats_[p];
-    if (s.sin_count == 0 && s.sout_count == 0 &&
-        s.rin_count == 0 && s.rout_count == 0) {
-      continue;
-    }
-    HLOG(kDebug,
-         "[NetStats] self={} peer={} sin={}/{}MiB sout={}/{}MiB "
-         "rin={}/{}MiB rout={}/{}MiB "
-         "sin_lbm_ms={:.1f} sout_lbm_ms={:.1f} "
-         "sin_ser_ms={:.1f} sout_ser_ms={:.1f} "
-         "rin_des_ms={:.1f} rout_des_ms={:.1f}",
-         self_node_id, p, s.sin_count, s.sin_bytes >> 20, s.sout_count,
-         s.sout_bytes >> 20, s.rin_count, s.rin_bytes >> 20, s.rout_count,
-         s.rout_bytes >> 20, s.sin_lbm_ns / 1e6, s.sout_lbm_ns / 1e6,
-         s.sin_ser_ns / 1e6, s.sout_ser_ns / 1e6, s.rin_des_ns / 1e6,
-         s.rout_des_ns / 1e6);
-    tot_sin_c += s.sin_count;   tot_sin_b += s.sin_bytes;
-    tot_sout_c += s.sout_count; tot_sout_b += s.sout_bytes;
-    tot_rin_c += s.rin_count;   tot_rin_b += s.rin_bytes;
-    tot_rout_c += s.rout_count; tot_rout_b += s.rout_bytes;
-    tot_sin_lbm += s.sin_lbm_ns;  tot_sout_lbm += s.sout_lbm_ns;
-    tot_sin_ser += s.sin_ser_ns;   tot_sout_ser += s.sout_ser_ns;
-    tot_rin_des += s.rin_des_ns;   tot_rout_des += s.rout_des_ns;
-  }
-  HLOG(kDebug,
-       "[NetStats] self={} TOTAL sin={}/{}MiB sout={}/{}MiB "
-       "rin={}/{}MiB rout={}/{}MiB "
-       "sin_lbm_ms={:.1f} sout_lbm_ms={:.1f} "
-       "sin_ser_ms={:.1f} sout_ser_ms={:.1f} "
-       "rin_des_ms={:.1f} rout_des_ms={:.1f}",
-       self_node_id, tot_sin_c, tot_sin_b >> 20, tot_sout_c,
-       tot_sout_b >> 20, tot_rin_c, tot_rin_b >> 20, tot_rout_c,
-       tot_rout_b >> 20, tot_sin_lbm / 1e6, tot_sout_lbm / 1e6,
-       tot_sin_ser / 1e6, tot_sout_ser / 1e6, tot_rin_des / 1e6,
-       tot_rout_des / 1e6);
 }
 
 // =============================================================================
