@@ -524,7 +524,6 @@ struct TaskQueueHeader {
   WorkerId assigned_worker_id;
   u32 task_count;    // Number of tasks currently in the queue
   bool is_enqueued;  // Whether this queue is currently enqueued in worker
-  int signal_fd_;    // Signal file descriptor for awakening worker
   pid_t tid_;        // Thread ID of the worker owning this lane
   std::atomic<bool> active_;  // Whether worker is accepting tasks (true) or
                               // blocked in epoll_wait (false)
@@ -534,7 +533,6 @@ struct TaskQueueHeader {
         assigned_worker_id(0),
         task_count(0),
         is_enqueued(false),
-        signal_fd_(-1),
         tid_(0) {
     active_.store(true);
   }
@@ -544,7 +542,6 @@ struct TaskQueueHeader {
         assigned_worker_id(wid),
         task_count(0),
         is_enqueued(false),
-        signal_fd_(-1),
         tid_(0) {
     active_.store(true);
   }
@@ -553,17 +550,17 @@ struct TaskQueueHeader {
 // Type alias for individual lanes with per-lane headers (moved outside
 // TaskQueue class) Worker queues store Future<Task> objects directly
 using TaskLane =
-    ctp::ipc::multi_mpsc_ring_buffer<Future<Task>,
+    ctp::ipc::multi_signal_mpmc_queue<Future<Task>,
                                  CLIO_QUEUE_ALLOC_T>::ring_buffer_type;
 
 /**
- * Simple wrapper around ctp::ipc::multi_mpsc_ring_buffer
+ * Simple wrapper around ctp::ipc::multi_signal_mpmc_queue
  *
  * This wrapper adds custom enqueue and dequeue functions while maintaining
- * compatibility with existing code that expects the multi_mpsc_ring_buffer
+ * compatibility with existing code that expects the multi_signal_mpmc_queue
  * interface.
  */
-typedef ctp::ipc::multi_mpsc_ring_buffer<Future<Task>, CLIO_QUEUE_ALLOC_T> TaskQueue;
+typedef ctp::ipc::multi_signal_mpmc_queue<Future<Task>, CLIO_QUEUE_ALLOC_T> TaskQueue;
 
 }  // namespace clio::run
 

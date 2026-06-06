@@ -242,6 +242,7 @@ void Worker::Run() {
   int tid = ctp::SystemInfo::GetTid();
   if (assigned_lane_) {
     assigned_lane_->SetTid(tid);
+    assigned_lane_->SetRuntimePid(ctp::SystemInfo::GetPid());
   }
   event_manager_.AddSignalEvent(nullptr);
 

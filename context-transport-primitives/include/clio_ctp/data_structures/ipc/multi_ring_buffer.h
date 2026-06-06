@@ -258,6 +258,17 @@ using multi_mpsc_ring_buffer =
                       (RING_BUFFER_MPSC_FLAGS | RING_BUFFER_FIXED_SIZE |
                        RING_BUFFER_WAIT_FOR_SPACE)>;
 
+/**
+ * Typedef for multi-lane MPMC ring buffer where each lane signals its
+ * owning worker thread on an empty→non-empty push.
+ */
+template <typename T, typename AllocT = ctp::ipc::Allocator>
+using multi_signal_mpmc_queue =
+    multi_ring_buffer<T, AllocT,
+                      (RING_BUFFER_MPSC_FLAGS | RING_BUFFER_FIXED_SIZE |
+                       RING_BUFFER_WAIT_FOR_SPACE | RING_BUFFER_LOCK_POP |
+                       RING_BUFFER_SIGNAL_ON_0)>;
+
 }  // namespace ctp::ipc
 
 #endif  // CTP_DATA_STRUCTURES_IPC_MULTI_RING_BUFFER_H_

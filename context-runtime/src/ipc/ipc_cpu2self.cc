@@ -63,8 +63,6 @@ Future<Task> IpcCpu2Self::ClientSend(IpcManager *ipc,
       if (!ipc->worker_queues_.IsNull()) {
         auto &dest_lane = ipc->worker_queues_->GetLane(lane_id, 0);
         dest_lane.Push(future);
-        // Always signal — see ipc_cpu2cpu_impl.h for the race.
-        ipc->AwakenWorker(&dest_lane);
       }
     }
   } else {
@@ -110,10 +108,6 @@ void IpcCpu2Self::RuntimeSend(const FullPtr<Task> &task_ptr,
                                                 ctp::ipc::MallocAllocator> *>(
             parent_task->event_queue_);
     parent_event_queue->Emplace(run_ctx->future_);
-    if (parent_task->lane_) {
-      // Always signal — see ipc_cpu2cpu_impl.h for the race.
-      CLIO_IPC->AwakenWorker(parent_task->lane_);
-    }
   } else {
     // Top-level client task: set FUTURE_COMPLETE directly.
     // Use SetBitsSystem for CPU→GPU visibility in UVM.

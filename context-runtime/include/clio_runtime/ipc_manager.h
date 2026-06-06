@@ -729,15 +729,6 @@ class IpcManager {
   void SetNumSchedQueues(u32 num_sched_queues);
 
   /**
-   * Awaken a worker by sending a signal to its thread
-   * Sends SIGUSR1 to the worker's thread ID stored in the TaskLane
-   * Only sends signal if the worker is inactive (blocked in epoll_wait)
-   * @param lane Pointer to the TaskLane containing the worker's tid and active
-   * status
-   */
-  void AwakenWorker(TaskLane *lane);
-
-  /**
    * Set the node ID in the shared memory header
    * @param hostname Hostname string to hash and store
    */

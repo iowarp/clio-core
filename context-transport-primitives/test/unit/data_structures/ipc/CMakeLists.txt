@@ -58,6 +58,12 @@ add_dependencies(test_multi_ring_buffer_exec clio_ctp_host)
 target_link_libraries(test_multi_ring_buffer_exec
         clio_ctp_host)
 
+add_executable(test_ring_buffer_signal_exec
+        test_ring_buffer_signal.cc)
+add_dependencies(test_ring_buffer_signal_exec clio_ctp_host)
+target_link_libraries(test_ring_buffer_signal_exec
+        clio_ctp_host)
+
 #------------------------------------------------------------------------------
 # Test Cases
 #------------------------------------------------------------------------------
@@ -97,6 +103,9 @@ add_test(NAME ctp_ring_buffer_mpmc COMMAND
 add_test(NAME ctp_multi_ring_buffer COMMAND
         ${CMAKE_BINARY_DIR}/bin/test_multi_ring_buffer_exec)
 
+add_test(NAME ctp_ring_buffer_signal COMMAND
+        ${CMAKE_BINARY_DIR}/bin/test_ring_buffer_signal_exec)
+
 # Set timeout for MPSC ring buffer test (multi-threaded, needs more time)
 set_tests_properties(
   ctp_ring_buffer_mpsc
@@ -110,6 +119,12 @@ set_tests_properties(
 set_tests_properties(
   ctp_ring_buffer_mpmc
   PROPERTIES TIMEOUT 120
+)
+
+# Signal ring buffer test has a blocking consumer thread, so needs a reasonable timeout
+set_tests_properties(
+  ctp_ring_buffer_signal
+  PROPERTIES TIMEOUT 30
 )
 
 # Skip under MSan: slist/rb_tree tests use precompiled Catch2 which
@@ -136,6 +151,7 @@ set_tests_properties(
   ctp_ring_buffer_mpsc
   ctp_ring_buffer_mpmc
   ctp_multi_ring_buffer
+  ctp_ring_buffer_signal
   PROPERTIES LABELS "msan_skip"
 )
 
@@ -152,6 +168,7 @@ install(TARGETS
         test_ring_buffer_mpsc_exec
         test_ring_buffer_mpmc_exec
         test_multi_ring_buffer_exec
+        test_ring_buffer_signal_exec
         LIBRARY DESTINATION lib
         ARCHIVE DESTINATION lib
         RUNTIME DESTINATION bin)
