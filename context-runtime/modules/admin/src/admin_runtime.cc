@@ -1184,7 +1184,7 @@ void Runtime::RecvIn(ctp::ipc::FullPtr<RecvTask> task,
     // pool_query_ and may re-broadcast a task that arrived at us because
     // we cleared TASK_ROUTED above. Mirror IpcCpu2Self::ClientSend's worker
     // branch directly: build a pointer-Future, pick a lane via
-    // scheduler->ClientMapTask, push, and AwakenWorker if the lane was empty.
+    // scheduler->ClientMapTask, and push (signal_mpmc_queue wakes the worker).
     // No parent RunContext is set (there is no current run context on a
     // recv thread, and these are top-level remote tasks anyway).
     chi::Future<chi::Task> future =
@@ -1208,8 +1208,6 @@ void Runtime::RecvIn(ctp::ipc::FullPtr<RecvTask> task,
       if (worker_queues) {
         auto &dest_lane = worker_queues->GetLane(lane_id, 0);
         dest_lane.Push(future);
-        // Always signal — see ipc_cpu2cpu_impl.h for the race.
-        ipc_manager->AwakenWorker(&dest_lane);
       }
     }
   }

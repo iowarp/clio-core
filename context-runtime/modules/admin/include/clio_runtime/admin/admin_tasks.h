@@ -782,7 +782,7 @@ struct ClientConnectTask : public chi::Task {
   OUT int32_t response_;            ///< 0 = success, non-zero = error
   OUT chi::u64 server_generation_;  ///< Server's generation counter for restart
                                     ///< detection
-  OUT int32_t server_pid_;          ///< Server process PID (for AwakenWorker SIGUSR1)
+  OUT int32_t server_pid_;          ///< Server process PID (for SIGUSR1 worker wakeup)
 
   // Worker task queue SHM offset (for SHM-mode client attach)
   OUT chi::u64 worker_queues_off_;  ///< SHM offset of worker_queues_ within main allocator

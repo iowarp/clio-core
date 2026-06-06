@@ -41,9 +41,7 @@
 #include <vector>
 #include <algorithm>
 
-#ifndef _WIN32
-#include "clio_ctp/lightbeam/event_manager_linux.h"
-#endif
+#include "clio_ctp/lightbeam/event_manager.h"
 
 using namespace ctp::ipc;
 

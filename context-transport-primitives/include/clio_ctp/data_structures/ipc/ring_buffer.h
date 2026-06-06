@@ -40,9 +40,7 @@ using pid_t = int;
 #include <sys/types.h>
 #endif
 
-#ifndef _WIN32
-#include "clio_ctp/lightbeam/event_manager_linux.h"
-#endif
+#include "clio_ctp/lightbeam/event_manager.h"
 
 #include "clio_ctp/constants/macros.h"
 #include "clio_ctp/data_structures/ipc/shm_container.h"
