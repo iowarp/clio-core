@@ -60,6 +60,7 @@
 #include "clio_runtime/ipc/ipc_cpu2cpu.h"
 #include "clio_runtime/ipc/ipc_cpu2cpu_zmq.h"
 #include "clio_runtime/ipc/ipc_gpu2cpu.h"
+#include "clio_runtime/ipc/ipc_run2run.h"
 #include "clio_ctp/data_structures/serialization/serialize_common.h"
 #include "clio_ctp/lightbeam/transport_factory_impl.h"
 #include "clio_ctp/memory/backend/posix_shm_mmap.h"
@@ -193,6 +194,12 @@ class IpcManager {
 #endif
 
  public:
+  /**
+   * Get the run-to-run IPC manager (cross-node task transfer logic).
+   * @return Pointer to the IpcManagerRun2Run instance owned by this IpcManager.
+   */
+  IpcManagerRun2Run *GetRun2Run() { return &run2run_; }
+
   /**
    * Initialize client components
    * @return true if initialization successful, false otherwise
@@ -1296,6 +1303,10 @@ class IpcManager {
   bool TryStartMainServer(const std::string &hostname);
 
   bool is_initialized_ = false;
+
+  // Run-to-run IPC manager: owns all cross-node task-transfer state
+  // (send/recv maps, retry queues, per-peer net stats, recv threads).
+  IpcManagerRun2Run run2run_;
 
   // CLIO_FORCE_NET: read once at ServerInit (and only on the server
   // path — clients route via the server's IsTaskLocal decision so a

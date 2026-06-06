@@ -39,32 +39,16 @@
 #include <clio_runtime/clio_runtime.h>
 #include <clio_runtime/container.h>
 #include <clio_runtime/pool_manager.h>
+#include <clio_runtime/ipc/ipc_run2run.h>
 #include <clio_ctp/data_structures/ipc/ring_buffer.h>
-#include <clio_ctp/data_structures/priv/unordered_map_ll.h>
-#include <clio_ctp/introspect/system_info.h>
 #include <clio_ctp/memory/allocator/malloc_allocator.h>
+#include <clio_ctp/introspect/system_info.h>
 
-#include <atomic>
-#include <deque>
 #include <mutex>
 #include <random>
-#include <thread>
 #include <unordered_set>
 
 namespace clio::run::admin {
-
-/** Return code set on tasks that fail due to network timeout */
-static constexpr int kNetworkTimeoutRC = -1000;
-
-/** How long (seconds) to keep a task in retry queue before failing it */
-static constexpr float kRetryTimeoutSec = 30.0f;
-
-/** Entry in a retry queue for tasks that couldn't be sent */
-struct RetryEntry {
-  ctp::ipc::FullPtr<chi::Task> task;
-  chi::u64 target_node_id;
-  std::chrono::steady_clock::time_point enqueued_at;
-};
 
 // Admin local queue indices
 enum AdminQueueIndex {
@@ -109,48 +93,6 @@ private:
       system_stats_ring_;
   ctp::CpuTimes prev_cpu_times_;
 
-  // Network task tracking maps (keyed by net_key for efficient lookup)
-  // Using unordered_map_ll with 1024 buckets.
-  //
-  // Concurrency: with the recv/send worker split (DefaultScheduler::DivideWorkers)
-  // these maps are touched from two threads:
-  //   send_map_: SendIn/ProcessRetryQueues on net_send_worker write & erase;
-  //              RecvOut on net_recv_worker reads & erases when responses
-  //              arrive. Guard with send_map_mutex_.
-  //   recv_map_: RecvIn on net_recv_worker writes & erases;
-  //              SendOut on net_send_worker reads & erases when the
-  //              container finishes the task. Guard with recv_map_mutex_.
-  // Contention is low (worst case is one lookup/insert/erase per task per
-  // direction), so std::mutex is cheap relative to the ZMQ cost of the
-  // surrounding Send/Recv.
-  static constexpr size_t kNumMapBuckets = 1024;
-  mutable std::mutex send_map_mutex_;
-  mutable std::mutex recv_map_mutex_;
-  ctp::priv::unordered_map_ll<size_t, ctp::ipc::FullPtr<chi::Task>> send_map_{kNumMapBuckets};  // Tasks sent to remote nodes
-  ctp::priv::unordered_map_ll<size_t, ctp::ipc::FullPtr<chi::Task>> recv_map_{kNumMapBuckets};  // Tasks received from remote nodes
-
-  // Dedicated recv threads — bypass the Worker scheduler for the hot
-  // inbound network path. Single thread per channel:
-  //   - peer_recv_thread_   owns the cross-node ROUTER (port 9413)
-  //   - client_recv_thread_ owns the client TCP+IPC transports
-  // A multi-thread recv pool was tried; the transport's sock_mtx_
-  // serialises the entire multipart Recv (including bulk frames), so
-  // pooling parallelised only the post-Recv LoadTask/Aggregate work
-  // and bought little once contention overhead was paid. 8n read also
-  // hung under the pool, so we're back to single threads here while
-  // we investigate.
-  std::atomic<bool> recv_shutdown_{false};
-  std::thread peer_recv_thread_;
-  std::thread client_recv_thread_;
-
-  /**
-   * Signal the dedicated recv threads to exit and join them. Idempotent (a
-   * second call is a no-op once the threads are joined). Invoked both from the
-   * IpcManager transport-shutdown hook (so the threads stop while the main
-   * transport is still alive) and from ~Runtime as a backstop.
-   */
-  void StopRecvThreads();
-
 public:
   /**
    * Constructor
@@ -158,7 +100,7 @@ public:
   Runtime() = default;
 
   /**
-   * Destructor — joins dedicated recv threads (peer / client).
+   * Destructor.
    */
   virtual ~Runtime();
 
@@ -458,53 +400,11 @@ public:
                  const ctp::ipc::FullPtr<chi::Task>& replica_task) override;
   void DelTask(chi::u32 method, ctp::ipc::FullPtr<chi::Task> task_ptr) override;
 
-  /**
-   * Attempt to send a retried task to the given node
-   * @param entry The retry entry containing the task
-   * @param node_id The node to send to
-   * @return true if send succeeded
-   */
-  bool RetrySendToNode(RetryEntry &entry, chi::u64 node_id);
-
-  /**
-   * Re-resolve target node for a retried task whose original target is dead.
-   * Uses the task's pool_query_ to look up the current container-to-node
-   * mapping from the address_map_, which may have been updated by recovery.
-   * @param entry The retry entry to re-resolve
-   * @return New node ID, or 0 if re-resolution failed
-   */
-  chi::u64 RerouteRetryEntry(RetryEntry &entry);
-
-  /**
-   * Process retry queues: retry sends to revived nodes, re-route via
-   * recovery address map updates, timeout stale entries
-   */
-  void ProcessRetryQueues();
-
-  /**
-   * Scan send_map_ for tasks waiting on dead nodes and time them out
-   */
-  void ScanSendMapTimeouts();
-
-  /**
-   * Flush stale retry-queue entries and send_map origins targeting a node
-   * that is about to be marked alive (restarted). Old tasks from the
-   * previous incarnation must not be resent to a fresh runtime.
-   */
-  void FlushStaleStateForNode(chi::u64 node_id);
-
 private:
   /**
    * Initiate runtime shutdown sequence
    */
   void InitiateShutdown(chi::u32 grace_period_ms);
-
-  // Retry queues for tasks that failed to send due to dead nodes. With
-  // multi-threaded send, the per-sender-thread writes and the
-  // SendPoll-periodic maintenance reads/erases all need to be serialised.
-  mutable std::mutex retry_queues_mutex_;
-  std::deque<RetryEntry> send_in_retry_;
-  std::deque<RetryEntry> send_out_retry_;
 
   // SWIM failure detection state
   struct PendingProbe {
