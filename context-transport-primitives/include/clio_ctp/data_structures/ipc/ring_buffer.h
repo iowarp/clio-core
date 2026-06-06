@@ -504,11 +504,9 @@ class ring_buffer : public ShmContainer<AllocT> {
   template <typename... Args>
   CTP_CROSS_FUN bool Emplace(Args&&... args) {
     bool was_empty = false;
-#ifndef _WIN32
     if constexpr (SignalOnEmpty) {
       was_empty = Empty();
     }
-#endif
 
     // Load head and allocate a slot atomically.
     // fetch_add_system ensures the tail increment is immediately visible to
@@ -552,13 +550,11 @@ class ring_buffer : public ShmContainer<AllocT> {
     ctp::ipc::threadfence();
     entry.SetReady();  // Mark as ready with release semantics
 
-#ifndef _WIN32
     if constexpr (SignalOnEmpty) {
       if (was_empty && tid_ > 0 && runtime_pid_ > 0) {
         ctp::lbm::EventManager::Signal(runtime_pid_, tid_);
       }
     }
-#endif
 
     return true;
   }
