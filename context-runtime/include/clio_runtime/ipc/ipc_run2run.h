@@ -73,6 +73,8 @@ struct RetryEntry {
  */
 class IpcManagerRun2Run {
  public:
+  IpcManagerRun2Run();
+
   /**
    * Send task inputs to remote nodes.
    * Looks up the target node(s) from the task's pool queries, creates a copy
@@ -269,10 +271,8 @@ class IpcManagerRun2Run {
   static constexpr size_t kNumMapBuckets = 1024;
   mutable std::mutex send_map_mutex_;
   mutable std::mutex recv_map_mutex_;
-  ctp::priv::unordered_map_ll<size_t, ctp::ipc::FullPtr<chi::Task>>
-      send_map_{kNumMapBuckets};
-  ctp::priv::unordered_map_ll<size_t, ctp::ipc::FullPtr<chi::Task>>
-      recv_map_{kNumMapBuckets};
+  ctp::priv::unordered_map_ll<size_t, ctp::ipc::FullPtr<chi::Task>> send_map_;
+  ctp::priv::unordered_map_ll<size_t, ctp::ipc::FullPtr<chi::Task>> recv_map_;
 
   // Retry queues for tasks that could not be sent due to dead / unreachable
   // nodes.  Guarded by retry_queues_mutex_.
