@@ -47,15 +47,6 @@ Future<TaskT> IpcCpu2Cpu::ClientSend(IpcManager *ipc,
       ipc->scheduler_->ClientMapTask(ipc, future.template Cast<Task>());
   auto &lane = ipc->worker_queues_->GetLane(lane_id, 0);
   lane.Push(future.template Cast<Task>());
-  // Always signal — the prior `if (was_empty)` gate let producers skip
-  // SIGUSR1 whenever any other producer's task was visible in the lane,
-  // assuming the worker was already processing. Under FUSE-adapter load
-  // (20+ ranks pushing nearly-simultaneous GetTagSize / GetBlob futures)
-  // the assumption fails: the worker is in epoll_pwait2 past its own
-  // recheck, the lane shows non-empty, and nobody sends the wakeup. The
-  // syscall is cheap; correctness wins.
-  ipc->AwakenWorker(&lane);
-
   SaveTaskArchive archive(MsgType::kSerializeIn,
                            ipc->shm_send_transport_.get());
   archive << (*task_ptr.ptr_);

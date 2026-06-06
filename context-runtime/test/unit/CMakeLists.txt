@@ -285,6 +285,12 @@ set_target_properties(${AUTOGEN_COVERAGE_TEST_TARGET} PROPERTIES
 )
 endif()  # CLIO_CORE_ENABLE_CAE
 
+# Delayed Task test executable
+set(DELAYED_TASK_TEST_TARGET chimaera_delayed_task_tests)
+set(DELAYED_TASK_TEST_SOURCES
+  test_delayed_task.cc
+)
+
 # Create Streaming test executable
 add_executable(${STREAMING_TEST_TARGET} ${STREAMING_TEST_SOURCES})
 
@@ -308,6 +314,32 @@ set_target_properties(${STREAMING_TEST_TARGET} PROPERTIES
 )
 
 set_target_properties(${STREAMING_TEST_TARGET} PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+
+# Create Delayed Task test executable
+add_executable(${DELAYED_TASK_TEST_TARGET} ${DELAYED_TASK_TEST_SOURCES})
+
+target_include_directories(${DELAYED_TASK_TEST_TARGET} PRIVATE
+  ${CLIO_RUN_ROOT}/include
+  ${CLIO_RUN_ROOT}/test
+  ${CLIO_RUN_ROOT}/modules/MOD_NAME/include
+)
+
+target_link_libraries(${DELAYED_TASK_TEST_TARGET}
+  chimaera_cxx
+  chimaera_MOD_NAME_client
+  chimaera_MOD_NAME_runtime
+  ctp::cxx
+  ${CMAKE_THREAD_LIBS_INIT}
+)
+
+set_target_properties(${DELAYED_TASK_TEST_TARGET} PROPERTIES
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED ON
+)
+
+set_target_properties(${DELAYED_TASK_TEST_TARGET} PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 
@@ -753,6 +785,18 @@ if(CLIO_CORE_ENABLE_TESTS)
     TIMEOUT 180
   )
 
+  # Delayed Task Tests — runtime starts, idles 3s, then fires a MOD_NAME task
+  add_test(
+    NAME cr_delayed_task_tests
+    COMMAND ${DELAYED_TASK_TEST_TARGET}
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_delayed_task_tests PROPERTIES
+    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500"
+    TIMEOUT 60
+    LABELS "msan_skip"
+  )
+
   # External Client Tests (POSIX fork-based — Linux/macOS only)
   # NOTE: Each test case must run in its own process because CHIMAERA_INIT has
   # a static guard that prevents re-initialization. Running all tests in one
@@ -1088,6 +1132,7 @@ set(_install_test_targets
   ${SAVE_LOAD_TASK_TEST_TARGET}
   ${LOCAL_TASK_ARCHIVE_TEST_TARGET}
   ${STREAMING_TEST_TARGET}
+  ${DELAYED_TASK_TEST_TARGET}
   ${RUNTIME_CLEANUP_TEST_TARGET}
   ${IPC_ERRORS_TEST_TARGET}
 )

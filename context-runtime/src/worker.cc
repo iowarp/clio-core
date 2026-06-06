@@ -242,6 +242,7 @@ void Worker::Run() {
   int tid = ctp::SystemInfo::GetTid();
   if (assigned_lane_) {
     assigned_lane_->SetTid(tid);
+    assigned_lane_->SetRuntimePid(ctp::SystemInfo::GetPid());
   }
   event_manager_.AddSignalEvent(nullptr);
 
@@ -660,14 +661,11 @@ void Worker::SuspendMe() {
     }
 
     // Last-chance recheck: any producer push that landed before we got
-    // here is already visible to a plain Empty() load. Producers now
-    // unconditionally send SIGUSR1 (see IpcManager::AwakenWorker), so we
-    // don't need the active_ park-flag handshake — any push that lands
-    // AFTER this recheck will signal us out of epoll_pwait2 regardless.
-    // The handshake previously here tripped a lost-wakeup race at scale
-    // (4n 256m, multi-tier bdev) where active_=true at the producer's
-    // load suppressed the signal while the worker was already past its
-    // post-store recheck and committed to epoll_pwait2.
+    // here is already visible to a plain Empty() load. signal_mpmc_queue
+    // fires SIGUSR1 automatically on an empty→non-empty push, so any push
+    // that lands AFTER this recheck will signal us out of epoll_pwait2.
+    // The active_ park-flag handshake was removed because it caused a
+    // lost-wakeup race at scale (4n 256m, multi-tier bdev).
     if (assigned_lane_) {
       bool work_pending = !assigned_lane_->Empty();
       if (!work_pending && event_queue_) {

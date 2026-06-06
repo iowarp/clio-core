@@ -450,8 +450,6 @@ bool IpcManagerRun2Run::RecvInHandleOne(
     if (worker_queues) {
       auto &dest_lane = worker_queues->GetLane(lane_id, 0);
       dest_lane.Push(future);
-      // Always signal — see ipc_cpu2cpu_impl.h for the race.
-      ipc_manager->AwakenWorker(&dest_lane);
     }
   }
 

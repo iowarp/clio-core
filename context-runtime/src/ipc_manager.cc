@@ -572,40 +572,6 @@ void IpcManager::SetNumSchedQueues(u32 num_sched_queues) {
   HLOG(kInfo, "IpcManager: Updated num_sched_queues to {}", num_sched_queues);
 }
 
-void IpcManager::AwakenWorker(TaskLane *lane) {
-  if (!lane) {
-    HLOG(kWarning, "AwakenWorker: lane is null");
-    return;
-  }
-
-  // ALWAYS send SIGUSR1, never skip on active_=true. Past attempts to
-  // gate this on the park-flag tripped a lost-wakeup race at scale (4n
-  // 256m FPP) where the producer observed active_=true, skipped the
-  // signal, and the worker then stored active_=false and entered
-  // epoll_pwait2 before noticing the just-pushed task. The
-  // post-store-recheck handshake in Worker::SuspendMe is supposed to
-  // catch this but doesn't fire reliably under heavy multi-tier
-  // scheduling pressure. Skipping the tgkill saved a syscall; the
-  // observed cost was hangs that never recovered. The extra signal is
-  // absorbed harmlessly by signalfd — at worst the worker wakes one
-  // extra time and re-checks its (empty) queue. Worth it.
-
-  int tid = lane->GetTid();
-  if (tid > 0) {
-    int runtime_pid = runtime_pid_ ? runtime_pid_ : ctp::SystemInfo::GetPid();
-
-    // Send SIGUSR1 to the worker thread in the runtime process
-    int result = ctp::lbm::EventManager::Signal(runtime_pid, tid);
-    if (result != 0) {
-      HLOG(kError,
-           "AwakenWorker: Failed to send SIGUSR1 to runtime_pid={}, tid={} "
-           "(active={}) - errno={}",
-           runtime_pid, tid, lane->IsActive(), errno);
-    }
-  } else {
-    HLOG(kWarning, "AwakenWorker: tid={} (invalid), cannot send signal", tid);
-  }
-}
 
 bool IpcManager::ServerInitShm() {
   ConfigManager *config = CLIO_CONFIG_MANAGER;
@@ -1663,9 +1629,6 @@ void IpcManager::EnqueueNetTask(Future<Task> future,
       case NetQueuePriority::kClientSendIpc:
         wake_lane = net_recv_lane_ ? net_recv_lane_ : net_lane_;
         break;
-    }
-    if (wake_lane) {
-      AwakenWorker(wake_lane);
     }
   }
 
@@ -2806,11 +2769,7 @@ RouteResult IpcManager::RouteLocal(Future<Task> &future, bool force_enqueue) {
 
   // Enqueue to the destination worker's lane
   auto &dest_lane = worker_queues_->GetLane(dest_worker_id, 0);
-  bool was_empty = dest_lane.Empty();
   dest_lane.Push(future);
-  if (was_empty) {
-    AwakenWorker(&dest_lane);
-  }
   return RouteResult::Local;
 }
 

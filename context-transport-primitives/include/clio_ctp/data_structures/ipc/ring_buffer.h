@@ -40,6 +40,8 @@ using pid_t = int;
 #include <sys/types.h>
 #endif
 
+#include "clio_ctp/lightbeam/event_manager.h"
+
 #include "clio_ctp/constants/macros.h"
 #include "clio_ctp/data_structures/ipc/shm_container.h"
 #include "clio_ctp/data_structures/ipc/vector.h"
@@ -68,7 +70,9 @@ enum RingQueueFlag : uint32_t {
   /** Fixed-size buffer (no dynamic resizing) */
   RING_BUFFER_FIXED_SIZE = 0x20,
   /** Serialize Pop() with a ctp::Mutex (enables multi-consumer / MPMC) */
-  RING_BUFFER_LOCK_POP = 0x40
+  RING_BUFFER_LOCK_POP = 0x40,
+  /** Signal the owning worker when a push finds the queue was empty */
+  RING_BUFFER_SIGNAL_ON_0 = 0x80
 };
 
 /**
@@ -208,6 +212,7 @@ class ring_buffer : public ShmContainer<AllocT> {
       (FLAGS & RING_BUFFER_ERROR_ON_NO_SPACE) != 0;
   static constexpr bool DynamicSize = (FLAGS & RING_BUFFER_DYNAMIC_SIZE) != 0;
   static constexpr bool LockPop = (FLAGS & RING_BUFFER_LOCK_POP) != 0;
+  static constexpr bool SignalOnEmpty = (FLAGS & RING_BUFFER_SIGNAL_ON_0) != 0;
   static constexpr bool IsAtomic = IsMPSC;
 
   using entry_vector = vector<entry_type, AllocT>;
@@ -220,8 +225,8 @@ class ring_buffer : public ShmContainer<AllocT> {
   tail_type tail_;         /**< Producer tail pointer */
   u32 assigned_worker_id_; /**< Assigned worker ID for this lane (set by
                               orchestrator) */
-  int signal_fd_;          /**< Signal file descriptor for awakening worker */
   pid_t tid_;              /**< Thread ID of the worker owning this lane */
+  pid_t runtime_pid_;      /**< PID of the process that owns the worker thread */
   ctp::ipc::opt_atomic<bool, IsAtomic>
       active_; /**< Whether worker is accepting tasks (true) or blocked in
                   epoll_wait (false) */
@@ -259,8 +264,8 @@ class ring_buffer : public ShmContainer<AllocT> {
         head_(0),
         tail_(0),
         assigned_worker_id_(0),
-        signal_fd_(-1),
         tid_(0),
+        runtime_pid_(0),
         active_(true) {
     // Allocate depth + 1 to account for the one reserved slot
   }
@@ -279,8 +284,8 @@ class ring_buffer : public ShmContainer<AllocT> {
         head_(other.head_),
         tail_(other.tail_),
         assigned_worker_id_(other.assigned_worker_id_),
-        signal_fd_(other.signal_fd_),
         tid_(other.tid_),
+        runtime_pid_(other.runtime_pid_),
         active_(other.active_.load()) {
     // Copy the contents of the queue from other
     for (size_t i = 0; i < other.queue_.size(); ++i) {
@@ -320,22 +325,6 @@ class ring_buffer : public ShmContainer<AllocT> {
   void SetAssignedWorkerId(u32 worker_id) { assigned_worker_id_ = worker_id; }
 
   /**
-   * Get signal file descriptor for this lane
-   *
-   * @return The signal file descriptor
-   */
-  CTP_INLINE_CROSS_FUN
-  int GetSignalFd() const { return signal_fd_; }
-
-  /**
-   * Set signal file descriptor for this lane
-   *
-   * @param signal_fd The signal file descriptor to set
-   */
-  CTP_INLINE_CROSS_FUN
-  void SetSignalFd(int signal_fd) { signal_fd_ = signal_fd; }
-
-  /**
    * Get thread ID of the worker owning this lane
    *
    * @return The thread ID
@@ -350,6 +339,22 @@ class ring_buffer : public ShmContainer<AllocT> {
    */
   CTP_INLINE_CROSS_FUN
   void SetTid(pid_t tid) { tid_ = tid; }
+
+  /**
+   * Get runtime PID of the process that owns the worker thread
+   *
+   * @return The runtime PID
+   */
+  CTP_INLINE_CROSS_FUN
+  pid_t GetRuntimePid() const { return runtime_pid_; }
+
+  /**
+   * Set runtime PID of the process that owns the worker thread
+   *
+   * @param pid The runtime PID to set
+   */
+  CTP_INLINE_CROSS_FUN
+  void SetRuntimePid(pid_t pid) { runtime_pid_ = pid; }
 
   /**
    * Check if worker is active (accepting tasks) or blocked in epoll_wait
@@ -498,6 +503,11 @@ class ring_buffer : public ShmContainer<AllocT> {
    */
   template <typename... Args>
   CTP_CROSS_FUN bool Emplace(Args&&... args) {
+    bool was_empty = false;
+    if constexpr (SignalOnEmpty) {
+      was_empty = Empty();
+    }
+
     // Load head and allocate a slot atomically.
     // fetch_add_system ensures the tail increment is immediately visible to
     // CPU threads polling the ring buffer without cudaDeviceSynchronize.
@@ -539,6 +549,12 @@ class ring_buffer : public ShmContainer<AllocT> {
     // ready flag but read stale data.
     ctp::ipc::threadfence();
     entry.SetReady();  // Mark as ready with release semantics
+
+    if constexpr (SignalOnEmpty) {
+      if (was_empty && tid_ > 0 && runtime_pid_ > 0) {
+        ctp::lbm::EventManager::Signal(runtime_pid_, tid_);
+      }
+    }
 
     return true;
   }
@@ -779,6 +795,20 @@ using mpmc_ring_buffer =
     ring_buffer<T, AllocT,
                 (RING_BUFFER_MPSC_FLAGS | RING_BUFFER_FIXED_SIZE |
                  RING_BUFFER_WAIT_FOR_SPACE | RING_BUFFER_LOCK_POP)>;
+
+/**
+ * Typedef for fixed-size MPMC ring buffer that signals the consumer thread
+ * whenever a push transitions the queue from empty to non-empty.
+ *
+ * Use SetTid() and SetRuntimePid() on each lane after the owning worker
+ * starts so that the in-queue signal knows where to send SIGUSR1.
+ */
+template <typename T, typename AllocT = ctp::ipc::Allocator>
+using signal_mpmc_queue =
+    ring_buffer<T, AllocT,
+                (RING_BUFFER_MPSC_FLAGS | RING_BUFFER_FIXED_SIZE |
+                 RING_BUFFER_WAIT_FOR_SPACE | RING_BUFFER_LOCK_POP |
+                 RING_BUFFER_SIGNAL_ON_0)>;
 
 }  // namespace ctp::ipc
 

@@ -134,8 +134,6 @@ bool IpcCpu2CpuZmq::RuntimeRecv(IpcManager *ipc, u32 &tasks_received) {
       auto *worker_queues = ipc->GetTaskQueue();
       auto &lane_ref = worker_queues->GetLane(lane_id, 0);
       lane_ref.Push(future);
-      // Always signal — see ipc_cpu2cpu_impl.h for the race.
-      ipc->AwakenWorker(&lane_ref);
 
       did_work = true;
       tasks_received++;
