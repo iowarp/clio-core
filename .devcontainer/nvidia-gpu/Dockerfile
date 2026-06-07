@@ -36,6 +36,35 @@ RUN set -eux; \
     ldconfig; \
     rm -rf /tmp/nvcomp*
 
+# Intel oneAPI 2024.2 (SYCL/DPC++) toolchain for the GPU compression factory's
+# SYCL backend (zfp's SYCL execution policy, mirroring how nvcomp backs the CUDA
+# path). Pinned to 2024.2 on purpose: the zfp SYCL port
+# (alpers-git/zfp:sycl/develop) is DPCT-generated and requires the matching
+# dpcpp-ct (DPCT) runtime headers — newer oneAPI runtimes reject its nested
+# device_memory init pattern with "queue::submit cannot be nested".
+#   - compiler-dpcpp-cpp : icx/icpx + the CPU OpenCL runtime, so SYCL code
+#                          builds AND runs without an Intel GPU (CPU SYCL device)
+#   - dpcpp-ct           : DPCT/SYCLomatic helper headers (dpct/dpct.hpp)
+#   - libdpstd-devel     : oneDPL (oneapi/dpl/execution), a port dependency
+RUN set -eux; \
+    curl -fsSL https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \
+      | gpg --dearmor -o /usr/share/keyrings/oneapi-archive-keyring.gpg; \
+    echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" \
+      > /etc/apt/sources.list.d/oneAPI.list; \
+    apt-get update; \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      intel-oneapi-compiler-dpcpp-cpp-2024.2 \
+      intel-oneapi-dpcpp-ct-2024.2 \
+      intel-oneapi-libdpstd-devel-2022.6; \
+    rm -rf /var/lib/apt/lists/*
+
+# Source the oneAPI environment in every shell so cmake/icpx "just work" in the
+# devcontainer terminal without manual `source setvars.sh`.
+RUN printf '. /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1\n' \
+      > /etc/profile.d/zz-oneapi.sh; \
+    chmod +x /etc/profile.d/zz-oneapi.sh; \
+    echo '. /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1' >> /etc/bash.bashrc
+
 # Remap iowarp user UID/GID to match the host user.
 # This avoids file permission issues with bind-mounted volumes.
 # Override at build time: --build-arg HOST_UID=$(id -u) --build-arg HOST_GID=$(id -g)
