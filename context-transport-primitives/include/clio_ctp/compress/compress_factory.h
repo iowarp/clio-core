@@ -53,6 +53,10 @@
 #include "nvcomp.h"
 #endif
 
+#if CTP_ENABLE_ZFP_SYCL
+#include "sycl_zfp.h"
+#endif
+
 namespace ctp {
 
 /**
@@ -84,6 +88,7 @@ class CompressionFactory {
    *                                "nvcomp-lz4", "nvcomp-snappy", "nvcomp-zstd",
    *                                "nvcomp-gdeflate", "nvcomp-deflate",
    *                                "nvcomp-ans" (if nvcomp enabled)
+   *                                "zfp-sycl" (lossy fixed-rate, if SYCL enabled)
    * @param preset Compression preset level (FAST/BALANCED/BEST/DEFAULT)
    * @return Unique pointer to configured compressor instance,
    *         or nullptr if library not found
@@ -299,6 +304,28 @@ class CompressionFactory {
     return nullptr;
 #endif
   }
+  // GPU (SYCL/Intel-XPU) zfp. LOSSY fixed-rate only -- zfp's GPU backends do
+  // not support reversible/precision/accuracy modes -- so, unlike the
+  // single-mode nvcomp lossless codecs, presets map to fixed bit rates
+  // (FAST=8, BALANCED=16, BEST=24 bits per 32-bit value): higher rate ->
+  // higher fidelity, lower compression. Returns nullptr when the SYCL
+  // libzfp is not available in this build.
+  static std::unique_ptr<Compressor> MakeSyclZfp(CompressionPreset preset) {
+#if CTP_ENABLE_ZFP_SYCL
+    double rate;
+    switch (preset) {
+      case CompressionPreset::FAST: rate = 8.0; break;
+      case CompressionPreset::BEST: rate = 24.0; break;
+      case CompressionPreset::BALANCED:
+      case CompressionPreset::DEFAULT:
+      default: rate = 16.0; break;
+    }
+    return std::make_unique<SyclZfp>(rate);
+#else
+    (void)preset;
+    return nullptr;
+#endif
+  }
 
   /**
    * The compressor registry: the single source of truth (see CompressorInfo).
@@ -327,6 +354,7 @@ class CompressionFactory {
         CompressorInfo{"nvcomp-gdeflate", 14, 16, true, &MakeNvCompGdeflate},
         CompressorInfo{"nvcomp-deflate",  15, 17, true, &MakeNvCompDeflate},
         CompressorInfo{"nvcomp-ans",      16, 18, true, &MakeNvCompAns},
+        CompressorInfo{"zfp-sycl",        17, 19, false, &MakeSyclZfp},
     };
     return kRegistry;
   }
