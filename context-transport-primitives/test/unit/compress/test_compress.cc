@@ -39,6 +39,13 @@
 #include <cuda_runtime.h>
 #endif
 
+#if CTP_ENABLE_ZFP_SYCL
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
+#include <vector>
+#endif
+
 TEST_CASE("TestCompress") {
   std::string raw = "Hello, World!";
   std::vector<char> compressed(1024);
@@ -135,6 +142,54 @@ TEST_CASE("TestCompress") {
   }
 }
 
+#if CTP_ENABLE_ZFP_SYCL
+// zfp-sycl is lossy fixed-rate GPU (SYCL) compression. Requires a SYCL device
+// at runtime (e.g. ONEAPI_DEVICE_SELECTOR=opencl:cpu) and a SYCL-enabled libzfp
+// loaded ahead of any stock libzfp on the loader path.
+TEST_CASE("TestSyclZfpRoundTrip") {
+  using ctp::CompressionFactory;
+  using ctp::CompressionPreset;
+
+  // 4096 floats of a smooth, exactly-representable-ish signal.
+  const size_t n = 4096;
+  std::vector<float> orig(n), deco(n, 0.0f);
+  for (size_t i = 0; i < n; ++i) {
+    orig[i] = std::sin(static_cast<float>(i) * 0.01f) * 100.0f;
+  }
+  const size_t raw_bytes = n * sizeof(float);
+  std::vector<char> compressed(raw_bytes + 4096);
+
+  PAGE_DIVIDE("compress (BALANCED) then decompress (FAST) -- self-describing") {
+    auto comp = CompressionFactory::GetPreset("zfp-sycl",
+                                              CompressionPreset::BALANCED);
+    REQUIRE(comp != nullptr);
+    size_t cmpr_size = compressed.size();
+    REQUIRE(comp->Compress(compressed.data(), cmpr_size, orig.data(),
+                           raw_bytes));
+    REQUIRE(cmpr_size > 0);
+    REQUIRE(cmpr_size < raw_bytes);  // fixed-rate 16 bits/value -> ~2x
+
+    // Decompress with a DIFFERENT preset on purpose: the embedded header makes
+    // the stream self-describing, so the rate mismatch must not corrupt output.
+    auto dcmp = CompressionFactory::GetPreset("zfp-sycl",
+                                              CompressionPreset::FAST);
+    REQUIRE(dcmp != nullptr);
+    size_t deco_size = raw_bytes;
+    REQUIRE(dcmp->Decompress(deco.data(), deco_size, compressed.data(),
+                             cmpr_size));
+    REQUIRE(deco_size == raw_bytes);
+
+    // Lossy, but fixed-rate 16 bits/float on a [-100,100] signal stays close.
+    double max_err = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+      max_err = std::max(max_err,
+                         std::abs(static_cast<double>(orig[i] - deco[i])));
+    }
+    REQUIRE(max_err < 1.0);
+  }
+}
+#endif  // CTP_ENABLE_SYCL
+
 // Characterization test for the compressor registry's frozen ID mappings.
 // These values are the on-disk wire protocol and the ML id scheme; renumbering
 // any of them silently breaks stored blobs / trained models. The expected
@@ -162,10 +217,11 @@ TEST_CASE("CompressorRegistryMappings") {
     REQUIRE(CompressionFactory::NameForWireId(14) == "nvcomp-gdeflate");
     REQUIRE(CompressionFactory::NameForWireId(15) == "nvcomp-deflate");
     REQUIRE(CompressionFactory::NameForWireId(16) == "nvcomp-ans");
+    REQUIRE(CompressionFactory::NameForWireId(17) == "zfp-sycl");
     // Out-of-range falls back to the historical default. (Registry rows are
     // build-independent, so the GPU names above resolve even without nvcomp.)
     REQUIRE(CompressionFactory::NameForWireId(-1) == "zstd");
-    REQUIRE(CompressionFactory::NameForWireId(17) == "zstd");
+    REQUIRE(CompressionFactory::NameForWireId(18) == "zstd");
     REQUIRE(CompressionFactory::NameForWireId(9999) == "zstd");
   }
 
@@ -208,6 +264,11 @@ TEST_CASE("CompressorRegistryMappings") {
     REQUIRE(CompressionFactory::GetLibraryId("nvcomp-gdeflate", BAL) == 162);
     REQUIRE(CompressionFactory::GetLibraryId("nvcomp-deflate", BAL) == 172);
     REQUIRE(CompressionFactory::GetLibraryId("nvcomp-ans", BAL) == 182);
+
+    // zfp-sycl: multi-mode lossy GPU (base_id 19), preset varies the bit rate.
+    REQUIRE(CompressionFactory::GetLibraryId("zfp-sycl", FAST) == 191);
+    REQUIRE(CompressionFactory::GetLibraryId("zfp-sycl", BAL) == 192);
+    REQUIRE(CompressionFactory::GetLibraryId("zfp-sycl", BEST) == 193);
   }
 
   PAGE_DIVIDE("ML library id -> name + preset (reverse)") {
@@ -232,6 +293,7 @@ TEST_CASE("CompressorRegistryMappings") {
     REQUIRE(CompressionFactory::GetLibraryInfo(162).first == "nvcomp-gdeflate");
     REQUIRE(CompressionFactory::GetLibraryInfo(172).first == "nvcomp-deflate");
     REQUIRE(CompressionFactory::GetLibraryInfo(182).first == "nvcomp-ans");
+    REQUIRE(CompressionFactory::GetLibraryInfo(192).first == "zfp-sycl");
   }
 
   PAGE_DIVIDE("GetPreset constructs known CPU compressors (incl. alias)") {
