@@ -547,6 +547,41 @@ set_tests_properties(
         ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CHI_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
 )
 
+# ---------------------------------------------------------------------------
+# CLIO_FORCE_NET stress variants (one per CTE task-path test binary)
+# Route every non-Local task through the loopback run-to-run network path so
+# the serialize/send/recv/aggregate path is exercised for all CTE task types
+# (PutBlob/GetBlob/Tag/Query/Reorganize/...) on a single node. GPU-only and
+# pure-stress binaries are intentionally excluded.
+# ---------------------------------------------------------------------------
+set(_cte_fn_env_basic "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1")
+set(_cte_fn_env_data "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CHI_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1")
+clio_add_force_net_test(NAME cte_core_unit_force_net
+    COMMAND cte_core_unit_tests ENVIRONMENT "${_cte_fn_env_basic}")
+clio_add_force_net_test(NAME cte_core_simple_force_net
+    COMMAND cte_core_functionality_simple_tests ENVIRONMENT "${_cte_fn_env_basic}")
+clio_add_force_net_test(NAME cte_functional_force_net
+    COMMAND test_core_functionality ENVIRONMENT "${_cte_fn_env_data}")
+clio_add_force_net_test(NAME cte_tag_force_net
+    COMMAND test_tag_operations ENVIRONMENT "${_cte_fn_env_data}")
+clio_add_force_net_test(NAME cte_query_force_net
+    COMMAND test_query ENVIRONMENT "${_cte_fn_env_data}")
+clio_add_force_net_test(NAME cte_reorganize_force_net
+    COMMAND test_reorganize_blob ENVIRONMENT "${_cte_fn_env_data}")
+# cte_block_reuse_force_net hangs under force_net (Put(1MB)+DelBlob free-path
+# stalls on the loopback run-to-run path). Gated off by default; see the
+# force-net tracking issue (#500).
+if(CLIO_CORE_ENABLE_FORCE_NET_WIP)
+clio_add_force_net_test(NAME cte_block_reuse_force_net
+    COMMAND test_blob_block_reuse ENVIRONMENT "${_cte_fn_env_data}")
+endif()
+clio_add_force_net_test(NAME cte_runtime_coverage_force_net
+    COMMAND test_core_runtime_coverage ENVIRONMENT "${_cte_fn_env_data}" TIMEOUT 600)
+clio_add_force_net_test(NAME cte_client_config_force_net
+    COMMAND test_core_client_config ENVIRONMENT "${_cte_fn_env_basic}" TIMEOUT 600)
+clio_add_force_net_test(NAME cte_config_dpe_force_net
+    COMMAND test_cte_config_dpe ENVIRONMENT "${_cte_fn_env_basic}")
+
 if(CLIO_CORE_ENABLE_CUDA OR CLIO_CORE_ENABLE_ROCM)
 # GPU coroutine subtask tests (gpu2gpu dispatch + coroutine suspend/resume)
 add_test(NAME cte_gpu_coroutine

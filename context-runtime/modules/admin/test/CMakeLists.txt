@@ -262,6 +262,27 @@ if(CLIO_CORE_ENABLE_TESTS)
     cr_submit_batch_tests
     PROPERTIES LABELS "msan_skip"
   )
+
+  # CLIO_FORCE_NET stress variants: route every task through the loopback
+  # run-to-run network path so the serialize/send/recv/aggregate path is
+  # exercised for all compose/batch task types on a single node.
+  # NOTE: no CLIO_PORT here. The compose test writes its own runtime config
+  # (port 9413); forcing CLIO_PORT=10500 made the server bind 10500 while the
+  # composed pools' hosts kept the config port 9413, so under force_net every
+  # reply was sent to a dead port and Wait() hung. Letting the test's config
+  # own the port keeps bind and send consistent.
+  clio_add_force_net_test(
+    NAME cr_compose_force_net
+    COMMAND ${COMPOSE_TEST_TARGET}
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CHIMAERA_TEST_MODE=1;CLIO_BIND_ADDR=127.0.0.1"
+  )
+  clio_add_force_net_test(
+    NAME cr_submit_batch_force_net
+    COMMAND ${SUBMIT_BATCH_TEST_TARGET}
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CHIMAERA_TEST_MODE=1;CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500"
+  )
 endif()
 
 # Custom targets for admin tests

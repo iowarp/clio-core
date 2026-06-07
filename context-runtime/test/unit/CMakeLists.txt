@@ -753,6 +753,24 @@ if(CLIO_CORE_ENABLE_TESTS)
     TIMEOUT 180
   )
 
+  # CLIO_FORCE_NET stress variants: route every task through the loopback
+  # run-to-run network path so the serialize/send/recv/aggregate path is
+  # exercised for all streaming + autogen task types on a single node.
+  clio_add_force_net_test(
+    NAME cr_streaming_force_net
+    COMMAND ${STREAMING_TEST_TARGET}
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500"
+  )
+  if(CLIO_CORE_ENABLE_CAE)
+  clio_add_force_net_test(
+    NAME cr_autogen_coverage_force_net
+    COMMAND ${AUTOGEN_COVERAGE_TEST_TARGET}
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500"
+  )
+  endif()  # CLIO_CORE_ENABLE_CAE
+
   # External Client Tests (POSIX fork-based — Linux/macOS only)
   # NOTE: Each test case must run in its own process because CHIMAERA_INIT has
   # a static guard that prevents re-initialization. Running all tests in one

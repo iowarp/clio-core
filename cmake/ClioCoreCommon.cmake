@@ -1407,3 +1407,49 @@ macro(chimaera_read_module_config _dir)
   set(CHIMAERA_MODULE_NAME           "${CLIO_RUN_MODULE_NAME}"           PARENT_SCOPE)
 endmacro()
 
+
+# ---------------------------------------------------------------------------
+# clio_add_force_net_test
+# ---------------------------------------------------------------------------
+# Register a CLIO_FORCE_NET=1 variant of a runtime test. The whole test binary
+# runs with every non-Local task routed through the loopback run-to-run network
+# path (SendIn/RecvIn/SendOut/RecvOut + serialize/deserialize/aggregate), so the
+# network path is exercised for all task types even on a single node. Mirrors
+# the original cr_bdev_force_net stress test.
+#
+# Such tests are always:
+#   * LABELS "msan_skip"            (libzmq is uninstrumented)
+#   * RESOURCE_LOCK "chimaera_runtime" (one runtime owns the fixed port at a time)
+#   * given CLIO_FORCE_NET=1 appended to the supplied ENVIRONMENT
+#
+# Usage:
+#   clio_add_force_net_test(
+#     NAME <test_name>
+#     COMMAND <exe> [args...]
+#     ENVIRONMENT "<semicolon-separated env without CLIO_FORCE_NET>"
+#     [WORKING_DIRECTORY <dir>]
+#     [TIMEOUT <seconds>])      # defaults to 300
+function(clio_add_force_net_test)
+  cmake_parse_arguments(FN "" "NAME;WORKING_DIRECTORY;TIMEOUT"
+                        "COMMAND;ENVIRONMENT" ${ARGN})
+  if(NOT FN_NAME)
+    message(FATAL_ERROR "clio_add_force_net_test: NAME is required")
+  endif()
+  if(NOT FN_COMMAND)
+    message(FATAL_ERROR "clio_add_force_net_test: COMMAND is required")
+  endif()
+  if(NOT FN_TIMEOUT)
+    set(FN_TIMEOUT 300)
+  endif()
+
+  add_test(NAME ${FN_NAME} COMMAND ${FN_COMMAND})
+  set_tests_properties(${FN_NAME} PROPERTIES
+    TIMEOUT ${FN_TIMEOUT}
+    LABELS "msan_skip"
+    RESOURCE_LOCK "chimaera_runtime"
+    ENVIRONMENT "${FN_ENVIRONMENT};CLIO_FORCE_NET=1")
+  if(FN_WORKING_DIRECTORY)
+    set_tests_properties(${FN_NAME} PROPERTIES
+      WORKING_DIRECTORY "${FN_WORKING_DIRECTORY}")
+  endif()
+endfunction()
