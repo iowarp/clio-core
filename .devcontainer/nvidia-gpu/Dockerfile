@@ -36,6 +36,67 @@ RUN set -eux; \
     ldconfig; \
     rm -rf /tmp/nvcomp*
 
+# Intel oneAPI 2024.2 (SYCL/DPC++) toolchain for the GPU compression factory's
+# SYCL backend (zfp's SYCL execution policy, mirroring how nvcomp backs the CUDA
+# path). Pinned to 2024.2 on purpose: the zfp SYCL port
+# (alpers-git/zfp:sycl/develop) is DPCT-generated and requires the matching
+# dpcpp-ct (DPCT) runtime headers — newer oneAPI runtimes reject its nested
+# device_memory init pattern with "queue::submit cannot be nested".
+#   - compiler-dpcpp-cpp : icx/icpx + the CPU OpenCL runtime, so SYCL code
+#                          builds AND runs without an Intel GPU (CPU SYCL device)
+#   - dpcpp-ct           : DPCT/SYCLomatic helper headers (dpct/dpct.hpp)
+#   - libdpstd-devel     : oneDPL (oneapi/dpl/execution), a port dependency
+RUN set -eux; \
+    curl -fsSL https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \
+      | gpg --dearmor -o /usr/share/keyrings/oneapi-archive-keyring.gpg; \
+    echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" \
+      > /etc/apt/sources.list.d/oneAPI.list; \
+    apt-get update; \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      intel-oneapi-compiler-dpcpp-cpp-2024.2 \
+      intel-oneapi-dpcpp-ct-2024.2 \
+      intel-oneapi-libdpstd-devel-2022.6; \
+    rm -rf /var/lib/apt/lists/*
+
+# Source the oneAPI environment in every shell so cmake/icpx "just work" in the
+# devcontainer terminal without manual `source setvars.sh`.
+RUN printf '. /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1\n' \
+      > /etc/profile.d/zz-oneapi.sh; \
+    chmod +x /etc/profile.d/zz-oneapi.sh; \
+    echo '. /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1' >> /etc/bash.bashrc
+
+# Build the SYCL-enabled libzfp (the codec behind ctp::SyclZfp / the "zfp-sycl"
+# factory entry) and install it to a DEDICATED prefix /opt/zfp-sycl, so it does
+# not shadow the stock CPU libzfp that ADIOS2/LibPressio link against. The root
+# CMake auto-detects it there (CLIO_CTP_ENABLE_ZFP_SYCL). cp -a preserves the
+# libzfp.so.1 SONAME symlink chain (a bare copy makes the loader fall back to
+# the stock non-SYCL libzfp at runtime).
+ARG ZFP_SYCL_REF=sycl/develop
+# Use a bash LOGIN shell so /etc/profile.d/zz-oneapi.sh sources setvars during
+# init (puts icx/icpx on PATH). Sourcing setvars inline under /bin/sh (dash) or
+# non-login bash fails; the login shell is the invocation that works.
+SHELL ["/bin/bash", "-lc"]
+RUN set -eux; \
+    git clone --depth 1 -b "${ZFP_SYCL_REF}" https://github.com/alpers-git/zfp.git /tmp/zfp; \
+    dpct_inc="$(dirname "$(dirname "$(find /opt/intel/oneapi/dpcpp-ct -name dpct.hpp | head -1)")")"; \
+    dpl_inc="$(dirname "$(dirname "$(dirname "$(find /opt/intel/oneapi/dpl -path '*oneapi/dpl/execution' | head -1)")")")"; \
+    cmake -S /tmp/zfp -B /tmp/zfp/build -DCMAKE_BUILD_TYPE=Release -DZFP_WITH_SYCL=1 \
+      -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx \
+      -DCMAKE_CXX_FLAGS="-I${dpct_inc} -I${dpl_inc}" \
+      -DBUILD_TESTING=OFF -DBUILD_UTILITIES=OFF; \
+    cmake --build /tmp/zfp/build --target zfp -j"$(nproc)"; \
+    mkdir -p /opt/zfp-sycl/lib /opt/zfp-sycl/include; \
+    cp -a /tmp/zfp/build/lib/libzfp.so* /opt/zfp-sycl/lib/; \
+    cp -a /tmp/zfp/include/. /opt/zfp-sycl/include/; \
+    rm -rf /tmp/zfp
+
+# Prefer the SYCL libzfp at runtime (must come before /usr/lib's stock libzfp on
+# the loader path; oneAPI libs are already on LD_LIBRARY_PATH via setvars above,
+# which resolves libzfp's libsycl dependency).
+RUN printf 'export LD_LIBRARY_PATH=/opt/zfp-sycl/lib:${LD_LIBRARY_PATH}\n' \
+      >> /etc/profile.d/zz-oneapi.sh; \
+    echo 'export LD_LIBRARY_PATH=/opt/zfp-sycl/lib:${LD_LIBRARY_PATH}' >> /etc/bash.bashrc
+
 # Remap iowarp user UID/GID to match the host user.
 # This avoids file permission issues with bind-mounted volumes.
 # Override at build time: --build-arg HOST_UID=$(id -u) --build-arg HOST_GID=$(id -g)

@@ -490,6 +490,31 @@ if(CLIO_CTE_ENABLE_COMPRESS)
         message(STATUS "CLIO_CORE_ENABLE_CUDA is OFF - GPU compression (nvcomp) disabled")
     endif()
 
+    # zfp-SYCL (Intel-XPU GPU compression) - optional. A SYCL-enabled libzfp
+    # (built with icpx from the zfp SYCL port) installed to a dedicated prefix
+    # (default /opt/zfp-sycl) so it does not shadow the stock CPU libzfp that
+    # ADIOS2/LibPressio link against. The SYCL kernels live inside that libzfp;
+    # the ctp::SyclZfp wrapper only calls zfp's C API, so no SYCL compiler is
+    # needed to build CTP -- we just link this libzfp and its headers.
+    # NOTE: this is DISTINCT from CLIO_CTP_ENABLE_SYCL (the SYCL-language switch,
+    # controlled by CLIO_CORE_ENABLE_SYCL, which triggers <sycl/sycl.hpp> + -fsycl
+    # in macros.h). zfp-sycl needs neither, so it uses its own flag/define.
+    set(CLIO_CTP_ENABLE_ZFP_SYCL OFF)
+    set(CLIO_ZFP_SYCL_ROOT "/opt/zfp-sycl" CACHE PATH
+        "Install prefix of the SYCL-enabled libzfp (for zfp-sycl compressor)")
+    find_library(ZFP_SYCL_LIBRARY NAMES zfp
+        HINTS ${CLIO_ZFP_SYCL_ROOT}/lib ${CLIO_ZFP_SYCL_ROOT}/lib64
+        NO_DEFAULT_PATH)
+    find_path(ZFP_SYCL_INCLUDE_DIR NAMES zfp.h
+        HINTS ${CLIO_ZFP_SYCL_ROOT}/include
+        NO_DEFAULT_PATH)
+    if(ZFP_SYCL_LIBRARY AND ZFP_SYCL_INCLUDE_DIR)
+        message(STATUS "found SYCL libzfp at ${ZFP_SYCL_LIBRARY} (zfp-sycl GPU compression)")
+        set(CLIO_CTP_ENABLE_ZFP_SYCL ON)
+    else()
+        message(STATUS "SYCL libzfp not found under ${CLIO_ZFP_SYCL_ROOT} - zfp-sycl compression disabled")
+    endif()
+
     set(COMPRESS_LIBS
         bz2
         ${lzo2_LIBRARIES}
@@ -535,10 +560,19 @@ if(CLIO_CTE_ENABLE_COMPRESS)
         list(APPEND COMPRESS_LIBS nvcomp::nvcomp)
     endif()
 
+    # Only add the SYCL libzfp if found
+    if(CLIO_CTP_ENABLE_ZFP_SYCL)
+        list(APPEND COMPRESS_LIBS ${ZFP_SYCL_LIBRARY})
+        list(APPEND COMPRESS_INCLUDES ${ZFP_SYCL_INCLUDE_DIR})
+    endif()
+
     # Make CTP_ENABLE_LIBPRESSIO available to subdirectories (CTP)
     set(CLIO_CTP_ENABLE_LIBPRESSIO ${CLIO_CTP_ENABLE_LIBPRESSIO} CACHE BOOL "Enable LibPressio wrapper (auto-detected)" FORCE)
     # Make CTP_ENABLE_NVCOMP available to subdirectories (CTP)
     set(CLIO_CTP_ENABLE_NVCOMP ${CLIO_CTP_ENABLE_NVCOMP} CACHE BOOL "Enable nvcomp GPU compression (auto-detected)" FORCE)
+    # Make CLIO_CTP_ENABLE_ZFP_SYCL available to subdirectories (CTP). Distinct
+    # from CLIO_CTP_ENABLE_SYCL (the SYCL-language switch) -- do not conflate.
+    set(CLIO_CTP_ENABLE_ZFP_SYCL ${CLIO_CTP_ENABLE_ZFP_SYCL} CACHE BOOL "Enable zfp-sycl GPU compression (auto-detected)" FORCE)
 endif()
 
 # Encryption libraries (conditional)
