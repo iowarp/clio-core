@@ -315,6 +315,19 @@ main() {
     print_header "Test Output"
     docker logs cte-distributed-node1 2>&1 | tail -50
 
+    # Diagnostic: pool topology (container count + container->node address map)
+    # from each node's daemon startup. completer==0 for every blob op means the
+    # pool resolved to a single container (num_containers==1) so DirectHash
+    # never distributed — this dump shows how many containers each node saw at
+    # compose time. See issue #502.
+    print_header "Cluster Pool Topology (diagnostic)"
+    for n in 1 2 3 4; do
+        echo "--- node$n ---"
+        docker logs "cte-distributed-node${n}" 2>&1 \
+            | grep -aE "Creating pool|containers \(one per node\)|Address Map|Container\[|Total hosts|hosts loaded|Main server started" \
+            | head -30 || true
+    done
+
     print_header "Test Results"
     if [ "$exit_code" = "0" ]; then
         print_success "All tests passed!"
