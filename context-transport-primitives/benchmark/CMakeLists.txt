@@ -27,6 +27,27 @@ if(CLIO_CORE_ENABLE_ZMQ)
 endif()
 
 #------------------------------------------------------------------------------
+# Build CUDA Stream Create Cost Benchmark
+#------------------------------------------------------------------------------
+
+# Self-contained: depends only on the CUDA runtime (CUDA::cudart), not on
+# nvcomp, since it measures the cudaStreamCreate primitive that ctp::NvComp
+# (clio_ctp/compress/nvcomp.h) calls on every Compress/Decompress.
+if(CLIO_CORE_ENABLE_CUDA)
+  find_package(CUDAToolkit QUIET)
+  if(TARGET CUDA::cudart)
+    add_executable(cuda_stream_create_benchmark
+            cuda_stream_create_benchmark.cc)
+    target_link_libraries(cuda_stream_create_benchmark
+            CUDA::cudart)
+    install(TARGETS cuda_stream_create_benchmark
+            RUNTIME DESTINATION bin)
+  else()
+    message(STATUS "CUDA::cudart not found - cuda_stream_create_benchmark disabled")
+  endif()
+endif()
+
+#------------------------------------------------------------------------------
 # Install Targets
 #------------------------------------------------------------------------------
 install(TARGETS
