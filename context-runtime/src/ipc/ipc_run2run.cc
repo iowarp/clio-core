@@ -519,7 +519,20 @@ int IpcManagerRun2Run::RecvOutAggregate(
     }
 
     ctp::ipc::FullPtr<chi::Task> replica = origin_rctx->subtasks_[replica_id];
-    origin_task->Aggregate(replica);
+
+    // Aggregate via the Container so the concrete task type's Aggregate()
+    // runs (which merges OUT fields like bdev's blocks_). Task::Aggregate is
+    // intentionally non-virtual to keep Task vtable-free, so calling
+    // origin_task->Aggregate(replica) here would slice to the base and drop
+    // every derived OUT field — leaving callers with empty results.
+    chi::Container *container =
+        CLIO_POOL_MANAGER->GetStaticContainer(origin_task->pool_id_);
+    if (!container) {
+      HLOG(kError, "[RecvOut] Container not found for pool_id {}",
+           origin_task->pool_id_);
+      continue;
+    }
+    container->Aggregate(origin_task->method_, origin_task, replica);
 
     HLOG(kDebug, "[RecvOut] Task {}", origin_task->task_id_);
 
