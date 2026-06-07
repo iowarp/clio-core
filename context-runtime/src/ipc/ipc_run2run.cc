@@ -403,6 +403,10 @@ bool IpcManagerRun2Run::RecvInHandleOne(
     if (worker_queues) {
       auto &dest_lane = worker_queues->GetLane(lane_id, 0);
       dest_lane.Push(future);
+      // Always signal — see ipc_cpu2cpu_impl.h for the lost-wakeup race the
+      // unconditional AwakenWorker closes (the RING_BUFFER_SIGNAL_ON_0
+      // was_empty gate dropped wakes under concurrent FUSE-adapter pushes).
+      ipc_manager->AwakenWorker(&dest_lane);
     }
   }
 
