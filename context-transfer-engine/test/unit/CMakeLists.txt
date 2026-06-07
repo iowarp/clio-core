@@ -568,13 +568,13 @@ clio_add_force_net_test(NAME cte_query_force_net
     COMMAND test_query ENVIRONMENT "${_cte_fn_env_data}")
 clio_add_force_net_test(NAME cte_reorganize_force_net
     COMMAND test_reorganize_blob ENVIRONMENT "${_cte_fn_env_data}")
-# cte_block_reuse_force_net hangs under force_net (Put(1MB)+DelBlob free-path
-# stalls on the loopback run-to-run path). Gated off by default; see the
-# force-net tracking issue (#500).
-if(CLIO_CORE_ENABLE_FORCE_NET_WIP)
+# Put(1MB)+DelBlob exercises the 1 MiB-bulk + free-to-partition net round-trip.
+# The full 1024-cycle regression is ~300 ms/cycle over the loopback net path
+# (~5 min), so cap the force-net variant at 64 cycles via BLOCK_REUSE_CYCLES —
+# enough to stress the path without blowing the timeout. Passes.
 clio_add_force_net_test(NAME cte_block_reuse_force_net
-    COMMAND test_blob_block_reuse ENVIRONMENT "${_cte_fn_env_data}")
-endif()
+    COMMAND test_blob_block_reuse
+    ENVIRONMENT "${_cte_fn_env_data};BLOCK_REUSE_CYCLES=64")
 clio_add_force_net_test(NAME cte_runtime_coverage_force_net
     COMMAND test_core_runtime_coverage ENVIRONMENT "${_cte_fn_env_data}" TIMEOUT 600)
 clio_add_force_net_test(NAME cte_client_config_force_net

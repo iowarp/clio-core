@@ -76,7 +76,19 @@ static std::string chi_test_data_dir() {
 
 static constexpr chi::u64 kBlobSize = 1 * 1024 * 1024;  // 1 MiB
 // 1024 cycles * 1 MiB = 1 GiB cumulative, 4x the 256 MiB tier below.
-static constexpr int kCycles = 1024;
+// Overridable via BLOCK_REUSE_CYCLES: the CLIO_FORCE_NET stress variant routes
+// every Put/Del through the loopback network path (≈300 ms/cycle), so 1024
+// cycles would blow past the ctest timeout. Fewer cycles still exercise the
+// free-to-partition net round-trip; the default keeps the tier-exhaustion
+// regression at 4x the tier.
+static int CyclesFromEnv() {
+  if (const char *e = std::getenv("BLOCK_REUSE_CYCLES")) {
+    int n = std::atoi(e);
+    if (n > 0) return n;
+  }
+  return 1024;
+}
+static const int kCycles = CyclesFromEnv();
 
 class BlockReuseFixture {
  public:

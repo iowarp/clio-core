@@ -23,11 +23,6 @@ option(CLIO_CORE_ENABLE_CEE "Enable context-exploration-engine component" ON)
 #------------------------------------------------------------------------------
 option(CLIO_CORE_ENABLE_TESTS "Master switch: Enable testing for all components" OFF)
 option(CLIO_CORE_ENABLE_BENCHMARKS "Master switch: Enable benchmarks for all components" ON)
-# Known-failing CLIO_FORCE_NET stress variants that currently hang on the
-# loopback run-to-run path (cte block-reuse Del/Free; CAE ParseOmni). Kept
-# registerable for reproduction/debugging but OFF by default so they don't
-# break CI. Enable with -DCLIO_CORE_ENABLE_FORCE_NET_WIP=ON. See issue #500.
-option(CLIO_CORE_ENABLE_FORCE_NET_WIP "Register known-failing CLIO_FORCE_NET stress tests" OFF)
 option(CLIO_CORE_ENABLE_PYTHON "Enable Python bindings for all components" OFF)
 option(CLIO_CORE_ENABLE_CMAKE_DOTENV "Enable reading environment variables from .env.cmake" OFF)
 option(CLIO_CORE_ENABLE_ASAN "Enable AddressSanitizer + LeakSanitizer for debugging" OFF)

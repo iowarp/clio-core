@@ -1183,8 +1183,15 @@ struct PutBlobTask : public chi::Task {
   CTP_CROSS_FUN void SerializeOut(Archive &ar) {
     ar.PushPod(blob_name_.UsingSso());
     Task::SerializeOut(ar);
-    ar(tag_id_, blob_name_, offset_, size_, blob_data_,
-       score_, context_, flags_, gpu_page_idx_, submit_ts_ns_);
+    // Only INOUT fields travel back on the OUT path. The IN-only fields —
+    // crucially blob_data_ — must NOT be serialized here: blob_data_ is the
+    // CLIENT's SHM buffer pointer, but the receiver runs with its own
+    // (daemon-allocated) buffer. Echoing the receiver's blob_data_ back would
+    // clobber the origin task's blob_data_ during Aggregate, so a later
+    // FreeBuffer(task->blob_data_) frees a foreign/already-freed buffer and
+    // corrupts the allocator — observed as a hang in CAE assimilators under
+    // CLIO_FORCE_NET (issue #500).
+    ar(blob_name_, context_);
     ar.PopPod();
   }
 

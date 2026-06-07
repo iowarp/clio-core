@@ -525,20 +525,15 @@ set_tests_properties(
 # serialize/send/recv/aggregate path is exercised for all CAE assimilation task
 # types on a single node. Ollama-gated tests (labeling, semantic_search) are
 # excluded because they require a live LLM endpoint.
-# cae_exportdata_force_net passes. cae_comprehensive_force_net and
-# cae_string_assim_force_net hang under force_net (CAE ParseOmni task stalls on
-# the loopback run-to-run path); gated off by default. See issue #500.
 clio_add_force_net_test(NAME cae_exportdata_force_net
     COMMAND test_export_data
     ENVIRONMENT "CHI_WITH_RUNTIME=1;CHI_SERVER_CONF=${CMAKE_CURRENT_SOURCE_DIR}/clio_config.yaml;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500")
-if(CLIO_CORE_ENABLE_FORCE_NET_WIP)
 clio_add_force_net_test(NAME cae_comprehensive_force_net
     COMMAND test_cae_comprehensive
     ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500")
 clio_add_force_net_test(NAME cae_string_assim_force_net
     COMMAND test_cae_string_assim
     ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500")
-endif()
 
 #------------------------------------------------------------------------------
 # Test Summary Target
