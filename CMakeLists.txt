@@ -890,6 +890,11 @@ else()
     # Prevent windows.h from defining min/max macros that conflict with
     # std::numeric_limits<>::max() and similar standard library usage.
     add_compile_definitions(NOMINMAX)
+    # In the CUDA build, nvcc force-includes cuda_runtime.h (which pulls in
+    # windows.h, and thus the legacy winsock.h) before the socket sources can
+    # include winsock2.h, causing 'sockaddr' redefinition (C2011). Keep the
+    # legacy winsock out of windows.h for the CUDA host compile.
+    add_compile_definitions($<$<COMPILE_LANGUAGE:CUDA>:WIN32_LEAN_AND_MEAN>)
     set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} /Zi /Od /DDEBUG")
     set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /O2 /DNDEBUG")
 endif()
