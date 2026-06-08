@@ -24,7 +24,10 @@ find_package(CUDAToolkit REQUIRED)
 # supports.
 add_library(clio_cte_uvm SHARED src/gpu_vmm.cc)
 set_target_properties(clio_cte_uvm PROPERTIES
-    POSITION_INDEPENDENT_CODE ON)
+    POSITION_INDEPENDENT_CODE ON
+    # MSVC exports nothing by default → no import .lib for dependents. gpu_vmm.cc
+    # is host CXX (not nvcc), so auto-export works reliably here. No-op off-Win.
+    WINDOWS_EXPORT_ALL_SYMBOLS ON)
 target_include_directories(clio_cte_uvm PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
@@ -33,7 +36,10 @@ target_link_libraries(clio_cte_uvm
         CUDA::cuda_driver   # cuda.h + libcuda.so (driver API)
         CUDA::cudart        # cuda_runtime.h + libcudart.so (runtime API)
 )
-target_link_options(clio_cte_uvm PRIVATE "-Wl,-soname,libclio_cte_uvm.so")
+# -Wl,-soname is a GNU-ld option; the MSVC linker rejects it.
+if(NOT WIN32)
+  target_link_options(clio_cte_uvm PRIVATE "-Wl,-soname,libclio_cte_uvm.so")
+endif()
 
 install(TARGETS clio_cte_uvm
     LIBRARY DESTINATION lib
@@ -50,7 +56,11 @@ install(DIRECTORY include/clio_cte/uvm
 # Test executable. test_gpu_vmm.cc launches a __global__ kernel and so
 # must be compiled by nvcc — the .cc extension defaults to CXX, so we
 # force LANGUAGE CUDA explicitly.
-if(CLIO_CORE_ENABLE_TESTS)
+#
+# Linux/Polaris-specific: uses GNU-ld link options (-Wl,-rpath) and hardcodes
+# code=[sm_80] SASS (no PTX), so it cannot run on newer GPUs (e.g. sm_120) and
+# does not build cleanly under MSVC. Skip it on Windows.
+if(CLIO_CORE_ENABLE_TESTS AND NOT WIN32)
     set_source_files_properties(test/test_gpu_vmm.cc PROPERTIES LANGUAGE CUDA)
     add_executable(test_gpu_vmm test/test_gpu_vmm.cc)
     # Do NOT use CUDA_SEPARABLE_COMPILATION ON here: that would invoke nvlink,

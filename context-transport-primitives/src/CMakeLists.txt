@@ -87,7 +87,10 @@ if(CLIO_CORE_ENABLE_CUDA)
     hshm_target_compile_definitions(clio_ctp_cuda)
     list(APPEND CLIO_CTP_LIBS clio_ctp_cuda)
     add_library(cudacxx INTERFACE)
-    target_link_libraries(cudacxx INTERFACE clio_ctp_cuda)
+    # cudadevrt: CUDA device runtime, required to device-link relocatable device
+    # code (-rdc=true) / dynamic parallelism. Carried on ctp::cuda_cxx so every
+    # GPU consumer gets it transitively — no per-target CUDA links needed.
+    target_link_libraries(cudacxx INTERFACE clio_ctp_cuda cudadevrt)
     target_include_directories(cudacxx INTERFACE
         $<BUILD_INTERFACE:${CLIO_CTP_ROOT}/include>
         $<BUILD_INTERFACE:${PROJECT_BINARY_DIR}/include>

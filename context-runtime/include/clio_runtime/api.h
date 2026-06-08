@@ -29,6 +29,24 @@
 #  define CLIO_RUN_API
 #endif
 
+/**
+ * Export macro for the GPU companion lib (clio_run_cxx_gpu). Its cross-DLL
+ * entry points (ChiServerBootstrap{Hip,Sycl}Gpu) are defined in the GPU lib and
+ * called from clio_run_cxx. CMake's WINDOWS_EXPORT_ALL_SYMBOLS does not reliably
+ * export symbols from the nvcc-built (separable-compilation) GPU lib, so mark
+ * them explicitly. CMake defines clio_run_cxx_gpu_EXPORTS when building that
+ * target. Non-Windows: expands to nothing (default visibility handles it).
+ */
+#if defined(_WIN32)
+#  ifdef clio_run_cxx_gpu_EXPORTS
+#    define CLIO_RUN_GPU_API __declspec(dllexport)
+#  else
+#    define CLIO_RUN_GPU_API __declspec(dllimport)
+#  endif
+#else
+#  define CLIO_RUN_GPU_API
+#endif
+
 #include "clio_ctp/util/singleton.h"
 
 /** Same as CTP_DEFINE_GLOBAL_PTR_VAR_{H,CC} but with CLIO_RUN_API decoration

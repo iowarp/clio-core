@@ -487,6 +487,10 @@ function(add_cuda_library TARGET SHARED DO_COPY)
             CUDA_SEPARABLE_COMPILATION ON
             POSITION_INDEPENDENT_CODE ON
             CUDA_RUNTIME_LIBRARY Shared
+            # Auto-export symbols on MSVC so the GPU DLL produces an import .lib
+            # that dependents (e.g. clio_run_cxx) can link — MSVC exports
+            # nothing by default. Matches the CPU libraries. No-op off-Windows.
+            WINDOWS_EXPORT_ALL_SYMBOLS ON
         )
     else()
         set_target_properties(${TARGET} PROPERTIES

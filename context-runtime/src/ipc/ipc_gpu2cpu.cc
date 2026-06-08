@@ -76,9 +76,10 @@ void IpcGpu2Cpu::RuntimeSend(
       ctp::DeviceAwareMemcpy(&gpu_fshm->flags_.bits_.x, &new_flags,
                              sizeof(u32));
     } else {
-      volatile u32 *flags_ptr = reinterpret_cast<volatile u32 *>(
-          &gpu_fshm->flags_.bits_.x);
-      __sync_fetch_and_or(flags_ptr, gpu::FutureShm::FUTURE_COMPLETE);
+      // Atomic, system-scope OR of the completion bit. Use the bitfield's
+      // portable helper rather than __sync_fetch_and_or (a GCC builtin that
+      // MSVC does not provide).
+      gpu_fshm->flags_.SetBitsSystem(gpu::FutureShm::FUTURE_COMPLETE);
     }
   }
 

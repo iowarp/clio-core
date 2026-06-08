@@ -155,8 +155,9 @@ void gpu::IpcManager::UnregisterClientBackend(
 // FindClientBackend is now inline in gpu_ipc_manager.h so it's
 // available without linking libchimaera_cxx_gpu (used by ToFullPtr).
 
-bool ChiServerBootstrapHipGpu(IpcManager *self, chi::u32 queue_depth,
-                               std::size_t backend_bytes) {
+CLIO_RUN_GPU_API bool ChiServerBootstrapHipGpu(IpcManager *self,
+                                               chi::u32 queue_depth,
+                                               std::size_t backend_bytes) {
   (void)backend_bytes;  // No host-managed copy_backend in producer-only model.
   if (!self) return false;
   if (!self->gpu_ipc_) {

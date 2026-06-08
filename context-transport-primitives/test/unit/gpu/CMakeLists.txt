@@ -75,21 +75,31 @@ if(CLIO_CORE_ENABLE_CUDA)
   )
   add_test(NAME test_thread_alloc_gpu COMMAND test_thread_alloc_gpu)
 
-  # RoundRobinAllocator CDP test
+  # RoundRobinAllocator CDP test. This is CDP1-only — it launches child kernels
+  # and calls cudaDeviceSynchronize() from device code, and forces CDP1 via
+  # CUDA_FORCE_CDP1_IF_SUPPORTED. CUDA 13 removed CDP1 entirely (CCCL hard-errors
+  # on CUDA_FORCE_CDP1_IF_SUPPORTED, and device-side cudaDeviceSynchronize is
+  # gone), so only build it on CUDA < 13. A CUDA 13+ build would need a CDP2
+  # rewrite (CDP2 has no device-side synchronize).
   find_package(CUDAToolkit QUIET)
-  add_cuda_executable(test_round_robin_alloc_gpu TRUE test_round_robin_alloc_gpu.cc
-    INCLUDE_DIRS ${CLIO_CTP_GPU_INCLUDE_DIRS}
-    DEFS CUDA_FORCE_CDP1_IF_SUPPORTED __CDPRT_SUPPRESS_SYNC_DEPRECATION_WARNING)
-  target_link_libraries(test_round_robin_alloc_gpu
-    ctp::cuda_cxx
-    Catch2::Catch2WithMain
-    cudadevrt
-  )
-  target_compile_options(test_round_robin_alloc_gpu PRIVATE
-    $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda -rdc=true>)
-  add_test(NAME test_round_robin_alloc_gpu COMMAND test_round_robin_alloc_gpu)
-  set_tests_properties(test_round_robin_alloc_gpu PROPERTIES
-    TIMEOUT 60 LABELS "gpu;allocator")
+  if(CUDAToolkit_VERSION VERSION_LESS 13)
+    add_cuda_executable(test_round_robin_alloc_gpu TRUE test_round_robin_alloc_gpu.cc
+      INCLUDE_DIRS ${CLIO_CTP_GPU_INCLUDE_DIRS}
+      DEFS CUDA_FORCE_CDP1_IF_SUPPORTED __CDPRT_SUPPRESS_SYNC_DEPRECATION_WARNING)
+    target_link_libraries(test_round_robin_alloc_gpu
+      ctp::cuda_cxx
+      Catch2::Catch2WithMain
+    )
+    target_compile_options(test_round_robin_alloc_gpu PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda -rdc=true>)
+    add_test(NAME test_round_robin_alloc_gpu COMMAND test_round_robin_alloc_gpu)
+    set_tests_properties(test_round_robin_alloc_gpu PROPERTIES
+      TIMEOUT 60 LABELS "gpu;allocator")
+  else()
+    message(STATUS
+      "Skipping test_round_robin_alloc_gpu: CDP1 was removed in CUDA >= 13 "
+      "(needs a CDP2 rewrite — no device-side cudaDeviceSynchronize)")
+  endif()
 
   add_subdirectory(runtime)
 

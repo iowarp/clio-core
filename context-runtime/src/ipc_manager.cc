@@ -352,8 +352,8 @@ bool IpcManager::ServerInit() {
     ConfigManager *config = CLIO_CONFIG_MANAGER;
     u32 queue_depth = config->GetQueueDepth();
     constexpr size_t kHipClientBackendBytes = 64 * 1024 * 1024;  // 64 MB
-    extern bool ChiServerBootstrapHipGpu(IpcManager *self, u32 queue_depth,
-                                          size_t backend_bytes);
+    extern CLIO_RUN_GPU_API bool ChiServerBootstrapHipGpu(
+        IpcManager *self, u32 queue_depth, size_t backend_bytes);
     if (!ChiServerBootstrapHipGpu(this, queue_depth,
                                    kHipClientBackendBytes)) {
       return false;
@@ -369,8 +369,8 @@ bool IpcManager::ServerInit() {
     ConfigManager *config = CLIO_CONFIG_MANAGER;
     u32 queue_depth = config->GetQueueDepth();
     constexpr size_t kSyclClientBackendBytes = 64 * 1024 * 1024;  // 64 MB
-    extern bool ChiServerBootstrapSyclGpu(IpcManager *self, u32 queue_depth,
-                                           size_t backend_bytes);
+    extern CLIO_RUN_GPU_API bool ChiServerBootstrapSyclGpu(
+        IpcManager *self, u32 queue_depth, size_t backend_bytes);
     if (!ChiServerBootstrapSyclGpu(this, queue_depth,
                                     kSyclClientBackendBytes)) {
       return false;

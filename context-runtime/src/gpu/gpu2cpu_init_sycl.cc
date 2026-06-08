@@ -150,8 +150,9 @@ void gpu::IpcManager::UnregisterClientBackend(
 
 // FindClientBackend is now inline in gpu_ipc_manager.h.
 
-bool ChiServerBootstrapSyclGpu(IpcManager *self, chi::u32 queue_depth,
-                                size_t backend_bytes) {
+CLIO_RUN_GPU_API bool ChiServerBootstrapSyclGpu(IpcManager *self,
+                                                chi::u32 queue_depth,
+                                                size_t backend_bytes) {
   (void)backend_bytes;
   if (!self) return false;
   if (!self->gpu_ipc_) {
