@@ -2547,9 +2547,32 @@ struct TemporalSearchTask : public chi::Task {
     results_ = other->results_;
   }
 
+  /**
+   * Aggregate one replica's results into this (origin) task.
+   *
+   * Like SemanticSearch, TemporalSearch defaults to a Broadcast query: every
+   * tag-owning container returns its own oldest `max_entries_` blobs (sorted
+   * ascending by last-modified timestamp). Aggregate is called once per
+   * replica; it must MERGE those partial sets and keep the global oldest
+   * `max_entries_` — not overwrite (the previous Copy() dropped every replica
+   * but the last). Merge → sort ascending by timestamp → trim to max_entries_
+   * (max_entries_ == 0 means "no cap", keep all).
+   */
   void Aggregate(const ctp::ipc::FullPtr<chi::Task> &other_base) {
     Task::Aggregate(other_base);
-    Copy(other_base.template Cast<TemporalSearchTask>());
+    auto other = other_base.template Cast<TemporalSearchTask>();
+    if (other->results_.empty()) {
+      return;
+    }
+    results_.insert(results_.end(), other->results_.begin(),
+                    other->results_.end());
+    std::sort(results_.begin(), results_.end(),
+              [](const TemporalSearchResult &a, const TemporalSearchResult &b) {
+                return a.last_modified_ < b.last_modified_;
+              });
+    if (max_entries_ > 0 && results_.size() > max_entries_) {
+      results_.resize(max_entries_);
+    }
   }
 };
 
