@@ -215,11 +215,9 @@ class ZeroMqTransport : public Transport {
       // routing prefix.  hostname:pid keeps it debuggable and unique
       // across processes.
       {
-        char hostname_buf[64] = {};
-        gethostname(hostname_buf, sizeof(hostname_buf) - 1);
+        std::string hostname = ctp::SystemInfo::GetHostname();
         uint32_t pid = static_cast<uint32_t>(ctp::SystemInfo::GetPid());
-        std::string identity = std::string(hostname_buf) + ":" +
-                                std::to_string(pid);
+        std::string identity = hostname + ":" + std::to_string(pid);
         zmq_setsockopt(socket_, ZMQ_IDENTITY, identity.data(),
                         identity.size());
       }

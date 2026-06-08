@@ -69,90 +69,24 @@ class SocketTransport : public Transport {
     sock::InitSocketLib();
 
     if (mode == TransportMode::kClient) {
-      // Client mode: connect
-      if (protocol_ == "ipc") {
-        fd_ = ::socket(AF_UNIX, SOCK_STREAM, 0);
-        if (fd_ == sock::kInvalidSocket) {
-          throw std::runtime_error("SocketTransport: failed to create Unix socket");
-        }
-        struct sockaddr_un sun;
-        std::memset(&sun, 0, sizeof(sun));
-        sun.sun_family = AF_UNIX;
-        std::strncpy(sun.sun_path, addr_.c_str(), sizeof(sun.sun_path) - 1);
-        if (::connect(fd_, reinterpret_cast<struct sockaddr*>(&sun),
-                      sizeof(sun)) < 0) {
-          sock::Close(fd_);
-          throw std::runtime_error("SocketTransport: failed to connect to Unix socket " + addr_);
-        }
-      } else {
-        fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
-        if (fd_ == sock::kInvalidSocket) {
-          throw std::runtime_error("SocketTransport: failed to create TCP socket");
-        }
-        sock::SetTcpNoDelay(fd_);
-        sock::SetSendBuf(fd_, 4 * 1024 * 1024);
-
-        struct sockaddr_in sin;
-        std::memset(&sin, 0, sizeof(sin));
-        sin.sin_family = AF_INET;
-        sin.sin_port = htons(static_cast<uint16_t>(port_));
-        if (::inet_pton(AF_INET, addr_.c_str(), &sin.sin_addr) <= 0) {
-          sock::Close(fd_);
-          throw std::runtime_error("SocketTransport: invalid address " + addr_);
-        }
-        if (::connect(fd_, reinterpret_cast<struct sockaddr*>(&sin),
-                      sizeof(sin)) < 0) {
-          sock::Close(fd_);
-          throw std::runtime_error(
-              "SocketTransport: failed to connect to " + addr_ + ":" +
-              std::to_string(port_));
-        }
+      // Client mode: connect. All socket-API use lives in
+      // socket_{win,posix}.cc so this header pulls no platform socket headers.
+      fd_ = sock::Connect(addr_, port_, protocol_);
+      if (fd_ == sock::kInvalidSocket) {
+        throw std::runtime_error(
+            "SocketTransport: failed to connect to " + addr_ + ":" +
+            std::to_string(port_));
       }
       sock::SetNonBlocking(fd_, true);
       HLOG(kDebug, "SocketTransport(client) connected to {}:{}", addr_, port_);
     } else {
-      // Server mode: bind + listen
-      if (protocol_ == "ipc") {
-        sock::UnlinkPath(addr_.c_str());
-        listen_fd_ = ::socket(AF_UNIX, SOCK_STREAM, 0);
-        if (listen_fd_ == sock::kInvalidSocket) {
-          throw std::runtime_error("SocketTransport: failed to create Unix socket");
-        }
-        struct sockaddr_un sun;
-        std::memset(&sun, 0, sizeof(sun));
-        sun.sun_family = AF_UNIX;
-        std::strncpy(sun.sun_path, addr_.c_str(), sizeof(sun.sun_path) - 1);
-        if (::bind(listen_fd_, reinterpret_cast<struct sockaddr*>(&sun),
-                   sizeof(sun)) < 0) {
-          sock::Close(listen_fd_);
-          throw std::runtime_error("SocketTransport: failed to bind Unix socket " + addr_);
-        }
-      } else {
-        listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
-        if (listen_fd_ == sock::kInvalidSocket) {
-          throw std::runtime_error("SocketTransport: failed to create TCP socket");
-        }
-        sock::SetReuseAddr(listen_fd_);
-        sock::SetRecvBuf(listen_fd_, 4 * 1024 * 1024);
-
-        struct sockaddr_in sin;
-        std::memset(&sin, 0, sizeof(sin));
-        sin.sin_family = AF_INET;
-        sin.sin_port = htons(static_cast<uint16_t>(port_));
-        sin.sin_addr.s_addr = INADDR_ANY;
-        if (::bind(listen_fd_, reinterpret_cast<struct sockaddr*>(&sin),
-                   sizeof(sin)) < 0) {
-          sock::Close(listen_fd_);
-          throw std::runtime_error(
-              "SocketTransport: failed to bind to port " + std::to_string(port_));
-        }
+      // Server mode: bind + listen (socket-API use lives in the .cc).
+      listen_fd_ = sock::Listen(addr_, port_, protocol_);
+      if (listen_fd_ == sock::kInvalidSocket) {
+        throw std::runtime_error(
+            "SocketTransport: failed to listen on " + addr_ + ":" +
+            std::to_string(port_));
       }
-
-      if (::listen(listen_fd_, 16) < 0) {
-        sock::Close(listen_fd_);
-        throw std::runtime_error("SocketTransport: listen failed");
-      }
-
       sock::SetNonBlocking(listen_fd_, true);
       HLOG(kDebug, "SocketTransport(server) listening on {}:{}", addr_, port_);
     }
@@ -205,37 +139,11 @@ class SocketTransport : public Transport {
 
   std::string GetAddress() const { return addr_; }
 
-  /** Check if the server is still alive via a TCP connect probe. */
+  /** Check if the server is still alive via a connect probe. The socket API
+   *  lives in socket_{win,posix}.cc (no platform socket headers in this file). */
   bool IsServerAlive(const LbmContext& ctx = LbmContext()) const {
     (void)ctx;
-    if (protocol_ == "ipc") {
-      sock::socket_t fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
-      if (fd == sock::kInvalidSocket) return false;
-      struct sockaddr_un sun;
-      std::memset(&sun, 0, sizeof(sun));
-      sun.sun_family = AF_UNIX;
-      std::strncpy(sun.sun_path, addr_.c_str(), sizeof(sun.sun_path) - 1);
-      int rc = ::connect(fd, reinterpret_cast<struct sockaddr*>(&sun),
-                         sizeof(sun));
-      sock::Close(fd);
-      return rc == 0;
-    }
-    sock::socket_t fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (fd == sock::kInvalidSocket) return false;
-    struct timeval tv;
-    tv.tv_sec = 0;
-    tv.tv_usec = 500000;
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO,
-               reinterpret_cast<const char*>(&tv), sizeof(tv));
-    struct sockaddr_in sa;
-    std::memset(&sa, 0, sizeof(sa));
-    sa.sin_family = AF_INET;
-    sa.sin_port = htons(static_cast<uint16_t>(port_));
-    ::inet_pton(AF_INET, addr_.c_str(), &sa.sin_addr);
-    int rc = ::connect(fd, reinterpret_cast<struct sockaddr*>(&sa),
-                       sizeof(sa));
-    sock::Close(fd);
-    return rc == 0;
+    return sock::IsServerAlive(addr_, port_, protocol_);
   }
 
   void RegisterEventManager(EventManager &em) {
@@ -285,7 +193,7 @@ class SocketTransport : public Transport {
     }
 
     // 2. Build iovec: [4-byte BE length prefix][metadata][bulk0][bulk1]...
-    uint32_t meta_len = htonl(static_cast<uint32_t>(meta_buf.size()));
+    uint32_t meta_len = sock::HostToNet32(static_cast<uint32_t>(meta_buf.size()));
 
     int iov_count = 2;
     for (size_t i = 0; i < meta.send.size(); ++i) {
@@ -414,7 +322,7 @@ class SocketTransport : public Transport {
     if (rc == EAGAIN) return EAGAIN;
     if (rc != 0) return -1;
 
-    uint32_t meta_len = ntohl(net_len);
+    uint32_t meta_len = sock::NetToHost32(net_len);
     // Recv straight into the deserialize buffer — no string intermediate.
     std::vector<char> meta_buf(meta_len);
     rc = sock::RecvExact(fd, meta_buf.data(), meta_len);
@@ -479,7 +387,7 @@ class SocketTransport : public Transport {
   /** Accept a single pending connection (non-blocking, no loop) */
   void AcceptNewClient() {
     if (IsClient()) return;
-    sock::socket_t fd = ::accept(listen_fd_, nullptr, nullptr);
+    sock::socket_t fd = sock::Accept(listen_fd_);
     if (fd == sock::kInvalidSocket) return;
     if (protocol_ != "ipc") {
       sock::SetTcpNoDelay(fd);

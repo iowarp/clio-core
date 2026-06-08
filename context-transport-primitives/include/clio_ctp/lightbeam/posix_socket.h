@@ -118,6 +118,27 @@ CTP_DLL void UnlinkPath(const char* path);
 CTP_DLL bool IsServerAlive(const std::string& addr, int port,
                            const std::string& protocol);
 
+/** Create a socket and connect. protocol == "ipc" uses a Unix-domain socket at
+ *  `addr`; otherwise TCP to addr:port (with TCP_NODELAY + a large send buffer).
+ *  Returns a connected fd, or kInvalidSocket on failure. */
+CTP_DLL socket_t Connect(const std::string& addr, int port,
+                         const std::string& protocol);
+
+/** Create a socket, bind, and listen. protocol == "ipc" uses a Unix-domain
+ *  socket at `addr` (unlinking any stale path first); otherwise TCP on `port`
+ *  (with SO_REUSEADDR + a large recv buffer). Returns a listening fd, or
+ *  kInvalidSocket on failure. */
+CTP_DLL socket_t Listen(const std::string& addr, int port,
+                        const std::string& protocol);
+
+/** Accept one pending connection on a listening fd (non-blocking). Returns the
+ *  accepted fd, or kInvalidSocket if none pending / on error. */
+CTP_DLL socket_t Accept(socket_t listen_fd);
+
+/** Host<->network byte order for the 4-byte framing length prefix. */
+CTP_DLL uint32_t HostToNet32(uint32_t host);
+CTP_DLL uint32_t NetToHost32(uint32_t net);
+
 #ifdef __linux__
 /** Create an epoll file descriptor. Returns epoll fd or -1 on error. */
 int EpollCreate();
