@@ -45,6 +45,7 @@
 
 #include <clio_runtime/clio_runtime.h>
 #include <clio_cte/core/core_client.h>
+#include <clio_ctp/introspect/system_info.h>
 #include <clio_ctp/util/logging.h>
 
 #include <algorithm>
@@ -258,9 +259,7 @@ int main(int argc, char **argv) {
   if (node_id_env && node_id_env[0] != '\0') {
     node_id = node_id_env;
   } else {
-    char hostname[256] = {};
-    gethostname(hostname, sizeof(hostname));
-    node_id = hostname;
+    node_id = ctp::SystemInfo::GetHostname();
   }
 
   CTEBenchmark bench(args, node_id);
