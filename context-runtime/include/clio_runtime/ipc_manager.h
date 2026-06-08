@@ -1730,7 +1730,12 @@ Future<TaskT, AllocT>::GetFutureShm() const {
     return ctp::ipc::FullPtr<FutureT>();
   }
 #if CTP_IS_GPU
-  return CLIO_IPC->ToFullPtr(future_shm_);
+  // On device, ShmPtr::off_ already holds the resolved device-side address of
+  // the FutureShm (the host pre-built the task+FutureShm pair in a registered
+  // backend), so no allocator lookup / ToFullPtr is needed here — that path is
+  // host-only. Mirrors gpu::Future::GetFutureShmPtrRaw().
+  return ctp::ipc::FullPtr<FutureT>(
+      reinterpret_cast<FutureT *>(future_shm_.off_.load()));
 #else
   return CLIO_CPU_IPC->ToFullPtr(future_shm_);
 #endif
