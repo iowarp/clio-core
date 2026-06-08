@@ -160,6 +160,19 @@
 #define CTP_IS_DEVICE_PASS 0
 #endif
 
+/** Throw on host; drop on any device pass. CUDA/ROCm/SYCL device code cannot do
+ *  exception handling, so a bare `throw` in CTP_CROSS_FUN data-structure code
+ *  makes nvcc/hipcc/DPC++ fail with "device code does not support exception
+ *  handling". Use CTP_THROW(expr) instead of `throw expr` in those data
+ *  structures. Always terminate the call with a semicolon: on a device pass it
+ *  expands to an empty statement, keeping `if (cond) CTP_THROW(...);`
+ *  well-formed. */
+#if !CTP_IS_DEVICE_PASS
+#define CTP_THROW(X) throw X
+#else
+#define CTP_THROW(X)
+#endif
+
 /** CTP_IS_GPU_COMPILER stays gated to CUDA/ROCm: blocks guarded by it use
  *  raw __threadfence / atomicOr / __shfl_sync intrinsics that only exist on
  *  nvcc and hipcc. SYCL device-side code paths use CTP_IS_SYCL_COMPILER /

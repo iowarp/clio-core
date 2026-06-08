@@ -877,7 +877,7 @@ class basic_string {
                AllocT* alloc)
     : size_(0), using_sso_(true), alloc_(alloc), data_(storage_.buffer_) {
     if (pos > other.size_) {
-      throw std::out_of_range("Substring position out of range");
+      CTP_THROW(std::out_of_range("Substring position out of range"));
     }
     size_type copy_count = (count == npos) ? (other.size_ - pos) : count;
     copy_count = std::min(copy_count, other.size_ - pos);
@@ -1179,7 +1179,7 @@ class basic_string {
   CTP_CROSS_FUN
   T& at(size_type pos) {
     if (pos >= size_) {
-      throw std::out_of_range("String index out of bounds");
+      CTP_THROW(std::out_of_range("String index out of bounds"));
     }
     return GetData()[pos];
   }
@@ -1194,7 +1194,7 @@ class basic_string {
   CTP_CROSS_FUN
   const T& at(size_type pos) const {
     if (pos >= size_) {
-      throw std::out_of_range("String index out of bounds");
+      CTP_THROW(std::out_of_range("String index out of bounds"));
     }
     return GetData()[pos];
   }
@@ -1618,7 +1618,7 @@ class basic_string {
   basic_string& append(const basic_string& str, size_type pos,
                        size_type count = npos) {
     if (pos > str.size_) {
-      throw std::out_of_range("Append position out of range");
+      CTP_THROW(std::out_of_range("Append position out of range"));
     }
     size_type append_count = (count == npos) ? (str.size_ - pos) : count;
     append_count = std::min(append_count, str.size_ - pos);
@@ -2018,7 +2018,7 @@ class basic_string {
   CTP_CROSS_FUN
   basic_string substr(size_type pos = 0, size_type count = npos) const {
     if (pos > size_) {
-      throw std::out_of_range("Substring position out of range");
+      CTP_THROW(std::out_of_range("Substring position out of range"));
     }
     size_type sub_count = (count == npos) ? (size_ - pos) : count;
     sub_count = std::min(sub_count, size_ - pos);
@@ -2037,7 +2037,7 @@ class basic_string {
   basic_string& replace(size_type pos, size_type count,
                        const basic_string& str) {
     if (pos > size_) {
-      throw std::out_of_range("Replace position out of range");
+      CTP_THROW(std::out_of_range("Replace position out of range"));
     }
     size_type rep_count = std::min(count, size_ - pos);
     size_type new_size = size_ - rep_count + str.size_;
@@ -2099,7 +2099,7 @@ class basic_string {
   CTP_CROSS_FUN
   basic_string& erase(size_type pos = 0, size_type count = npos) {
     if (pos > size_) {
-      throw std::out_of_range("Erase position out of range");
+      CTP_THROW(std::out_of_range("Erase position out of range"));
     }
     size_type erase_count = (count == npos) ? (size_ - pos) : count;
     erase_count = std::min(erase_count, size_ - pos);

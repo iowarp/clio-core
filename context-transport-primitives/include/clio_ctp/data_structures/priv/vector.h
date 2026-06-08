@@ -930,7 +930,7 @@ class vector {
   CTP_INLINE_CROSS_FUN
   T& at(size_type pos) {
     if (pos >= size_) {
-      throw std::out_of_range("Vector index out of bounds");
+      CTP_THROW(std::out_of_range("Vector index out of bounds"));
     }
     return data_.ptr_[pos];
   }
@@ -946,7 +946,7 @@ class vector {
   CTP_INLINE_CROSS_FUN
   const T& at(size_type pos) const {
     if (pos >= size_) {
-      throw std::out_of_range("Vector index out of bounds");
+      CTP_THROW(std::out_of_range("Vector index out of bounds"));
     }
     return data_.ptr_[pos];
   }
