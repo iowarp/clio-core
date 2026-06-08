@@ -34,6 +34,8 @@
 #ifndef WRPCTE_CORE_TASKS_H_
 #define WRPCTE_CORE_TASKS_H_
 
+#include <algorithm>
+
 #include <clio_runtime/clio_runtime.h>
 #include <clio_cte/core/autogen/core_methods.h>
 #include <clio_cte/core/core_config.h>
@@ -2425,9 +2427,32 @@ struct SemanticSearchTask : public chi::Task {
     results_ = other->results_;
   }
 
+  /**
+   * Aggregate one replica's results into this (origin) task.
+   *
+   * SemanticSearch defaults to a Broadcast query, so every tag-owning
+   * container runs BM25 over its own slice and returns its local top-k
+   * (already sorted descending by score). Aggregate is called once per
+   * replica; it must MERGE those partial result sets and keep the global
+   * top-k by score — not overwrite (the previous Copy() dropped every
+   * replica but the last). Merge → sort descending by BM25 score → trim
+   * to k_ (k_ == 0 means "no cap", keep all).
+   */
   void Aggregate(const ctp::ipc::FullPtr<chi::Task> &other_base) {
     Task::Aggregate(other_base);
-    Copy(other_base.template Cast<SemanticSearchTask>());
+    auto other = other_base.template Cast<SemanticSearchTask>();
+    if (other->results_.empty()) {
+      return;
+    }
+    results_.insert(results_.end(), other->results_.begin(),
+                    other->results_.end());
+    std::sort(results_.begin(), results_.end(),
+              [](const SemanticSearchResult &a, const SemanticSearchResult &b) {
+                return a.score_ > b.score_;
+              });
+    if (k_ > 0 && results_.size() > k_) {
+      results_.resize(k_);
+    }
   }
 };
 

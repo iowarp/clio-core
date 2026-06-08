@@ -20,6 +20,20 @@ install(TARGETS clio_cte_bench
   RUNTIME DESTINATION bin
 )
 
+# Create clio_cte_semantic_bench executable — ingests N keyword blobs under a
+# single tag, then runs one broadcast SemanticSearch over them.
+add_executable(clio_cte_semantic_bench
+  clio_cte_semantic_bench.cc
+)
+target_link_libraries(clio_cte_semantic_bench
+  clio::cte::core_client
+  chimaera::cxx
+)
+target_compile_features(clio_cte_semantic_bench PRIVATE cxx_std_17)
+install(TARGETS clio_cte_semantic_bench
+  RUNTIME DESTINATION bin
+)
+
 # Create clio_cte_score_bench executable (MPI-based score/demotion benchmark)
 # Only build if MPI is enabled
 if(CLIO_CORE_ENABLE_MPI)
