@@ -877,8 +877,16 @@ if(NOT MSVC)
     endif()
 else()
     # MSVC compiler flags
-    # /FS enables synchronized PDB writes to avoid C1041 errors with parallel builds
-    add_compile_options(/FS)
+    # /FS enables synchronized PDB writes to avoid C1041 errors with parallel
+    # builds. Scope it per-language: passed directly for C/CXX, but routed
+    # through -Xcompiler for CUDA — nvcc treats a bare "/FS" as a second input
+    # file ("nvcc fatal : A single input file is required ...").
+    add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/FS>)
+    add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/FS>)
+    # CUDA 13.x CCCL headers (cuda/std/*) require MSVC's conformant
+    # preprocessor and #error out on the traditional one. Enable it for the
+    # CUDA host compile only, so the existing CXX build is unaffected.
+    add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>)
     # Prevent windows.h from defining min/max macros that conflict with
     # std::numeric_limits<>::max() and similar standard library usage.
     add_compile_definitions(NOMINMAX)
