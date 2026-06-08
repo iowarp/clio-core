@@ -522,6 +522,16 @@ void IpcManager::ClearTransports() {
     if (hook) hook();
   }
 
+  // Close the persistent outbound DEALER sockets (run-to-run peer clients)
+  // BEFORE destroying the owned server contexts below. On Windows, destroying
+  // the last owned ZMQ context tears Winsock down (WSACleanup); a DEALER
+  // closed afterwards trips libzmq's signaler assertion ("Successful WSASTARTUP
+  // not yet performed", signaler.cpp) -> abort() -> the process wedges until
+  // the ctest timeout. This first ClearTransports() runs while the owned
+  // contexts (and thus Winsock) are still alive, so the DEALERs close cleanly;
+  // the later ClearClientPool() in ServerFinalize is then a harmless no-op.
+  ClearClientPool();
+
   local_transport_.reset();
   main_transport_.reset();
   client_tcp_transport_.reset();
