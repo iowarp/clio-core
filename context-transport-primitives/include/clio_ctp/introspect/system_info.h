@@ -82,10 +82,13 @@ struct SharedLibrary {
   bool IsNull() { return handle_ == nullptr; }
 };
 
-/** File wrapper */
+/** File wrapper.
+ *  windows_fd_ is a Windows HANDLE, but HANDLE is just `void*` — store it as
+ *  void* so this header never needs <windows.h> (which would leak Yield/min/max
+ *  macros). system_info.cc casts to/from HANDLE where it calls the Win32 API. */
 union File {
   int posix_fd_;
-  HANDLE windows_fd_;
+  void* windows_fd_;
 };
 
 /** Aggregate CPU tick counts from /proc/stat */
