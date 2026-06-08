@@ -151,6 +151,10 @@ option(CLIO_CTE_ENABLE_HDF5_VOL "Enable HDF5 VOL connector (requires HDF5 >= 1.1
 # CAE (context-assimilation-engine) Options
 #------------------------------------------------------------------------------
 option(CAE_ENABLE_GLOBUS "Enable Globus transfer support in CAE" OFF)
+# LLM labeling/summary + semantic-search features and their integration tests
+# require a running Ollama service. OFF by default so default builds don't
+# build or run them without Ollama.
+option(CLIO_CAE_ENABLE_SUMMARY "Enable CAE LLM labeling/summary + semantic-search (requires a running Ollama service)" OFF)
 
 #------------------------------------------------------------------------------
 # External Examples and Applications

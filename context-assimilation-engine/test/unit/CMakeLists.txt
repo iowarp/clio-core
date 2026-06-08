@@ -353,6 +353,11 @@ set_tests_properties(
         RESOURCE_LOCK "chimaera_runtime"
 )
 
+# Tests 8 & 9 (LLM labeling + semantic search) require a running Ollama
+# service, so they are gated behind CLIO_CAE_ENABLE_SUMMARY (OFF by default) —
+# otherwise they would always be registered and fail on machines without Ollama.
+if(CLIO_CAE_ENABLE_SUMMARY)
+
 #------------------------------------------------------------------------------
 # Test 8: CAE Transparent Labeling Integration Test (uses local Ollama)
 #------------------------------------------------------------------------------
@@ -464,6 +469,8 @@ set_tests_properties(
         LABELS "cae;cte;bm25;semantic-search;ollama;integration;msan_skip"
         RESOURCE_LOCK "chimaera_runtime"
 )
+
+endif()  # CLIO_CAE_ENABLE_SUMMARY
 
 #------------------------------------------------------------------------------
 # Test 10: StringDataAssimilator (string:: src + src_data payload)
