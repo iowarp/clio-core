@@ -503,7 +503,12 @@ class ZeroMqTransport : public Transport {
     if (info.rc != 0) {
       return info;
     }
+#if !CTP_IS_GPU
+    // identity_ only exists off-device (it's a std::string; ZMQ is host-only).
+    // Guard the use so nvcc's device pass — which still parses this host-only
+    // template body — doesn't trip over the #if !CTP_IS_GPU'd-out member.
     info.identity_ = meta.client_info_.identity_;
+#endif
     // Set up recv entries from send descriptors.
     for (const auto& send_bulk : meta.send) {
       Bulk recv_bulk;
