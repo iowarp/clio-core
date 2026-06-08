@@ -35,6 +35,19 @@
 
 #include "clio_ctp/lightbeam/posix_socket.h"
 
+// Windows socket API headers belong here in the .cc, never in a header — they
+// leak function-like macros (Yield, min, max, ...). posix_socket.h
+// deliberately no longer pulls these in.
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <afunix.h>
+
 #include <cstring>
 
 namespace ctp::lbm::sock {
@@ -230,6 +243,37 @@ int PollReadMulti(const socket_t* fds, int count, int timeout_ms) {
     }
   }
   return -1;
+}
+
+bool IsServerAlive(const std::string& addr, int port,
+                   const std::string& protocol) {
+  if (protocol == "ipc") {
+    socket_t fd = static_cast<socket_t>(::socket(AF_UNIX, SOCK_STREAM, 0));
+    if (fd == kInvalidSocket) return false;
+    struct sockaddr_un sun;
+    std::memset(&sun, 0, sizeof(sun));
+    sun.sun_family = AF_UNIX;
+    std::strncpy(sun.sun_path, addr.c_str(), sizeof(sun.sun_path) - 1);
+    int rc = ::connect(static_cast<SOCKET>(fd),
+                       reinterpret_cast<struct sockaddr*>(&sun), sizeof(sun));
+    Close(fd);
+    return rc == 0;
+  }
+  socket_t fd = static_cast<socket_t>(::socket(AF_INET, SOCK_STREAM, 0));
+  if (fd == kInvalidSocket) return false;
+  // Windows SO_SNDTIMEO is a DWORD of milliseconds (not struct timeval).
+  DWORD timeout_ms = 500;
+  setsockopt(static_cast<SOCKET>(fd), SOL_SOCKET, SO_SNDTIMEO,
+             reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
+  struct sockaddr_in sa;
+  std::memset(&sa, 0, sizeof(sa));
+  sa.sin_family = AF_INET;
+  sa.sin_port = htons(static_cast<uint16_t>(port));
+  ::inet_pton(AF_INET, addr.c_str(), &sa.sin_addr);
+  int rc = ::connect(static_cast<SOCKET>(fd),
+                     reinterpret_cast<struct sockaddr*>(&sa), sizeof(sa));
+  Close(fd);
+  return rc == 0;
 }
 
 }  // namespace ctp::lbm::sock

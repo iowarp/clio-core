@@ -186,6 +186,37 @@ int PollReadMulti(const socket_t* fds, int count, int timeout_ms) {
   return -1;
 }
 
+bool IsServerAlive(const std::string& addr, int port,
+                   const std::string& protocol) {
+  if (protocol == "ipc") {
+    socket_t fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd == kInvalidSocket) return false;
+    struct sockaddr_un sun;
+    std::memset(&sun, 0, sizeof(sun));
+    sun.sun_family = AF_UNIX;
+    std::strncpy(sun.sun_path, addr.c_str(), sizeof(sun.sun_path) - 1);
+    int rc = ::connect(fd, reinterpret_cast<struct sockaddr*>(&sun),
+                       sizeof(sun));
+    Close(fd);
+    return rc == 0;
+  }
+  socket_t fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (fd == kInvalidSocket) return false;
+  struct timeval tv;
+  tv.tv_sec = 0;
+  tv.tv_usec = 500000;
+  setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO,
+             reinterpret_cast<const char*>(&tv), sizeof(tv));
+  struct sockaddr_in sa;
+  std::memset(&sa, 0, sizeof(sa));
+  sa.sin_family = AF_INET;
+  sa.sin_port = htons(static_cast<uint16_t>(port));
+  ::inet_pton(AF_INET, addr.c_str(), &sa.sin_addr);
+  int rc = ::connect(fd, reinterpret_cast<struct sockaddr*>(&sa), sizeof(sa));
+  Close(fd);
+  return rc == 0;
+}
+
 }  // namespace ctp::lbm::sock
 
 #endif  // !_WIN32

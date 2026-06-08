@@ -42,23 +42,14 @@
 #include "clio_ctp/types/numbers.h"
 
 #ifdef _WIN32
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#include <afunix.h>
-#include <BaseTsd.h>
-#ifdef Yield
-#undef Yield
-#endif
-#ifdef min
-#undef min
-#endif
-#ifdef max
-#undef max
-#endif
-using ssize_t = SSIZE_T;
+// IMPORTANT: never include Windows API headers (<winsock2.h>, <windows.h>, ...)
+// from a C++ header. They leak function-like macros (Yield, min, max, ...) into
+// every including translation unit, which breaks e.g. StdThread::Yield() /
+// Cuda::Yield() — and especially the CUDA build, where nvcc force-includes
+// cuda_runtime.h -> windows.h before our headers. The Windows socket API lives
+// entirely in socket_win.cc; here we only need portable mirrors of SOCKET /
+// INVALID_SOCKET / SSIZE_T (a pointer-sized handle, ~0, and a signed size).
+using ssize_t = intptr_t;
 #else
 #include <sys/socket.h>
 #include <sys/uio.h>
@@ -77,8 +68,9 @@ using ssize_t = SSIZE_T;
 namespace ctp::lbm::sock {
 
 #ifdef _WIN32
-using socket_t = SOCKET;
-constexpr socket_t kInvalidSocket = INVALID_SOCKET;
+using socket_t = uintptr_t;  // Windows SOCKET is UINT_PTR
+constexpr socket_t kInvalidSocket =
+    static_cast<socket_t>(~static_cast<uintptr_t>(0));  // INVALID_SOCKET
 #else
 using socket_t = int;
 constexpr socket_t kInvalidSocket = -1;
@@ -119,6 +111,12 @@ CTP_DLL int PollReadMulti(const socket_t* fds, int count, int timeout_ms);
 
 /** Remove a file path (unlink on POSIX, DeleteFileA on Windows) */
 CTP_DLL void UnlinkPath(const char* path);
+
+/** Probe whether a server is accepting connections. protocol == "ipc" uses a
+ *  Unix-domain socket at `addr`; otherwise a TCP connect to addr:port. Returns
+ *  true if connect() succeeds. Keeps all socket-API use out of headers. */
+CTP_DLL bool IsServerAlive(const std::string& addr, int port,
+                           const std::string& protocol);
 
 #ifdef __linux__
 /** Create an epoll file descriptor. Returns epoll fd or -1 on error. */
