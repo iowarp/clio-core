@@ -407,6 +407,47 @@
             }
         },
         {
+            "name": "windows-release-cuda",
+            "displayName": "Windows Release + CUDA GPU extensions (vcpkg)",
+            "generator": "Visual Studio 18 2026",
+            "architecture": {
+                "value": "x64",
+                "strategy": "set"
+            },
+            "binaryDir": "${sourceDir}/build",
+            "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+            "cacheVariables": {
+                "VCPKG_MANIFEST_DIR": "${sourceDir}/installers/vcpkg",
+                "CMAKE_BUILD_TYPE": "Release",
+                "CLIO_CORE_ENABLE_RUNTIME": "ON",
+                "CLIO_CORE_ENABLE_CTE": "ON",
+                "CLIO_CORE_ENABLE_CAE": "ON",
+                "CLIO_CORE_ENABLE_CEE": "OFF",
+                "CLIO_CORE_ENABLE_TESTS": "ON",
+                "CLIO_CORE_ENABLE_PYTHON": "OFF",
+                "CLIO_CORE_ENABLE_ZMQ": "ON",
+                "CLIO_CORE_ENABLE_CEREAL": "ON",
+                "CLIO_CORE_ENABLE_CONDA": "OFF",
+                "CLIO_CORE_ENABLE_ELF": "OFF",
+                "CLIO_CORE_ENABLE_RPATH": "OFF",
+                "CLIO_CORE_ENABLE_CUDA": "ON",
+                "CMAKE_CUDA_ARCHITECTURES": "native",
+                "CLIO_CTE_ENABLE_COMPRESS": "OFF",
+                "CLIO_CTE_ENABLE_ADIOS2_ADAPTER": "OFF",
+                "CLIO_CTE_ENABLE_HDF5_VOL": "OFF",
+                "CLIO_CTE_ENABLE_VFD": "OFF",
+                "CLIO_CORE_ENABLE_GRAY_SCOTT": "OFF",
+                "CLIO_CORE_ENABLE_BENCHMARKS": "OFF",
+                "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+                "CLIO_CTP_LOG_LEVEL": "1"
+            },
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Windows"
+            }
+        },
+        {
             "name": "windows-pip",
             "hidden": false,
             "generator": "Visual Studio 18 2026",
