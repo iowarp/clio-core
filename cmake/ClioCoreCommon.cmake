@@ -45,8 +45,15 @@ macro(wrp_core_enable_cuda CXX_STANDARD)
     endif()
 
     message(STATUS "USING CUDA ARCH: ${CMAKE_CUDA_ARCHITECTURES}")
-    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Wno-unused-variable")
-    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Wno-format -Wno-pedantic -Wno-sign-compare -Wno-unused-but-set-variable")
+    # These GCC/Clang-style warning suppressions are forwarded to the host
+    # compiler by nvcc on GCC/Clang hosts, but nvcc rejects them outright with
+    # the MSVC host ("nvcc fatal : Unknown option '-Wno-unused-variable'"),
+    # which also breaks CMake's CUDA compiler/arch probe on Windows. Only add
+    # them when the host compiler isn't MSVC.
+    if(NOT MSVC)
+        set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Wno-unused-variable")
+        set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Wno-format -Wno-pedantic -Wno-sign-compare -Wno-unused-but-set-variable")
+    endif()
     enable_language(CUDA)
 
     set(CMAKE_CUDA_USE_RESPONSE_FILE_FOR_INCLUDES 0)
@@ -344,8 +351,20 @@ function(set_cuda_sources DO_COPY SRC_FILES CUDA_SOURCE_FILES_VAR)
 
     foreach(SOURCE IN LISTS SRC_FILES)
         if(${DO_COPY})
-            set(CUDA_SOURCE ${CMAKE_CURRENT_BINARY_DIR}/cuda/${SOURCE})
-            configure_file(${SOURCE} ${CUDA_SOURCE} COPYONLY)
+            # Mirror the source under a private cuda/ dir so the same .cc can be
+            # compiled as both CXX (CPU lib) and CUDA (GPU lib) without object
+            # collisions. GLOB_RECURSE yields ABSOLUTE paths; embedding an
+            # absolute Windows path (with its drive colon) under cuda/ makes an
+            # invalid destination ("Fail to copy: Invalid argument"). Use a
+            # path relative to the project root instead (also tidier on Linux,
+            # which otherwise nested the full /abs/path under cuda/).
+            # SRC_FILES may be absolute (file(GLOB_RECURSE)) or relative
+            # (explicit names); normalize to absolute, then derive a dest path
+            # relative to the project root.
+            get_filename_component(_cuda_abs "${SOURCE}" ABSOLUTE)
+            file(RELATIVE_PATH _cuda_rel "${CMAKE_SOURCE_DIR}" "${_cuda_abs}")
+            set(CUDA_SOURCE "${CMAKE_CURRENT_BINARY_DIR}/cuda/${_cuda_rel}")
+            configure_file(${_cuda_abs} ${CUDA_SOURCE} COPYONLY)
         else()
             set(CUDA_SOURCE ${SOURCE})
         endif()
