@@ -710,10 +710,9 @@ set_tests_properties(
 # Install Targets
 # ------------------------------------------------------------------------------
 set(_CTE_TEST_TARGETS cte_core_unit_tests cte_core_functionality_simple_tests test_core_functionality test_query test_cte_config_dpe test_tag_operations test_core_client_config test_core_runtime_coverage test_tiered_storage_stress test_tiered_storage_dram_default test_blob_block_reuse test_reorganize_blob)
-# (Legacy test_cte_gpu_coroutine / test_gpu_core / test_gpu_create were
-# removed along with the GPU runtime — see deletions earlier in this
-# file. The new CUDA test target test_cuda_cte_kernel_putget is added
-# below with its own install rule via add_cuda_executable.)
+# (The legacy test_cte_gpu_coroutine / test_gpu_core / test_gpu_create targets
+# and their ctest registrations were removed along with the GPU runtime. CTE
+# GPU coverage now lives in test_cte_devmem_putget (cte_devmem_putget_cuda).)
 install(TARGETS ${_CTE_TEST_TARGETS}
     LIBRARY DESTINATION lib
     ARCHIVE DESTINATION lib
