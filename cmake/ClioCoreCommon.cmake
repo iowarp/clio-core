@@ -483,14 +483,17 @@ function(add_cuda_library TARGET SHARED DO_COPY)
         CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
 
     if(SHARED STREQUAL "SHARED")
+        # NOTE: do NOT set WINDOWS_EXPORT_ALL_SYMBOLS here. For nvcc
+        # separable-compilation libs it does not reliably export symbols, and
+        # it conflicts with explicit __declspec(dllexport): CMake's generated
+        # .def omits dllexport'd symbols, and the /DEF: link then drops them.
+        # Cross-DLL symbols from GPU libs are exported explicitly instead (e.g.
+        # CLIO_RUN_GPU_API on the ChiServerBootstrap* entry points, CTP_DLL in
+        # clio_ctp_cuda).
         set_target_properties(${TARGET} PROPERTIES
             CUDA_SEPARABLE_COMPILATION ON
             POSITION_INDEPENDENT_CODE ON
             CUDA_RUNTIME_LIBRARY Shared
-            # Auto-export symbols on MSVC so the GPU DLL produces an import .lib
-            # that dependents (e.g. clio_run_cxx) can link — MSVC exports
-            # nothing by default. Matches the CPU libraries. No-op off-Windows.
-            WINDOWS_EXPORT_ALL_SYMBOLS ON
         )
     else()
         set_target_properties(${TARGET} PROPERTIES

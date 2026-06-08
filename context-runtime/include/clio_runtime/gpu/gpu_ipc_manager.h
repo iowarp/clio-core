@@ -34,6 +34,7 @@
 #ifndef CHIMAERA_INCLUDE_CHIMAERA_GPU_IPC_MANAGER_H_
 #define CHIMAERA_INCLUDE_CHIMAERA_GPU_IPC_MANAGER_H_
 
+#include "clio_runtime/api.h"
 #include "clio_runtime/types.h"
 #include "clio_runtime/task.h"
 #include "clio_runtime/gpu/gpu_info.h"
@@ -196,10 +197,10 @@ class IpcManager {
    * @param queue_depth Ring-buffer depth per lane.
    * @return true on success.
    */
-  bool ServerInitGpuQueues(u32 queue_depth);
+  CLIO_RUN_GPU_API bool ServerInitGpuQueues(u32 queue_depth);
 
   /** Free per-device queues. */
-  void FinalizeGpuQueues();
+  CLIO_RUN_GPU_API void FinalizeGpuQueues();
 
   /** Number of registered GPU devices. */
   size_t GetGpuQueueCount() const { return per_gpu_devices_.size(); }
@@ -224,10 +225,11 @@ class IpcManager {
    * RegisterMemory handler on the runtime side; the client side wraps
    * this in IpcManager::AllocateAndRegisterGpuBackend (host helper).
    */
-  bool RegisterClientBackend(const ClientBackend &b);
+  CLIO_RUN_GPU_API bool RegisterClientBackend(const ClientBackend &b);
 
   /** Unregister a client backend. */
-  void UnregisterClientBackend(u32 gpu_id, const ctp::ipc::AllocatorId &alloc_id);
+  CLIO_RUN_GPU_API void UnregisterClientBackend(
+      u32 gpu_id, const ctp::ipc::AllocatorId &alloc_id);
 
   /**
    * Resolve an AllocatorId to its registered ClientBackend record.

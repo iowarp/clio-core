@@ -69,6 +69,19 @@ CLIO_RUN_DEFINE_GLOBAL_PTR_VAR_CC(chi::IpcManager, g_ipc_manager);
 
 namespace clio::run {
 
+// ChiServerBootstrap{Hip,Sycl}Gpu are defined in the GPU companion lib
+// (clio_run_cxx_gpu) and called from ServerInit below. Declare them at
+// namespace scope (not block scope) so MSVC mangles the references as
+// clio::run::ChiServerBootstrap*Gpu to match the GPU lib's exports — a
+// block-scope `extern` declaration binds to the global namespace on MSVC
+// (it binds to the enclosing namespace on GCC, which is why it worked there).
+CLIO_RUN_GPU_API bool ChiServerBootstrapHipGpu(IpcManager *self,
+                                               u32 queue_depth,
+                                               size_t backend_bytes);
+CLIO_RUN_GPU_API bool ChiServerBootstrapSyclGpu(IpcManager *self,
+                                                u32 queue_depth,
+                                                size_t backend_bytes);
+
 namespace {
 
 // Issue #482: libzmq's TCP-loopback engine on macOS fails to route ROUTER
@@ -352,8 +365,6 @@ bool IpcManager::ServerInit() {
     ConfigManager *config = CLIO_CONFIG_MANAGER;
     u32 queue_depth = config->GetQueueDepth();
     constexpr size_t kHipClientBackendBytes = 64 * 1024 * 1024;  // 64 MB
-    extern CLIO_RUN_GPU_API bool ChiServerBootstrapHipGpu(
-        IpcManager *self, u32 queue_depth, size_t backend_bytes);
     if (!ChiServerBootstrapHipGpu(this, queue_depth,
                                    kHipClientBackendBytes)) {
       return false;
@@ -369,8 +380,6 @@ bool IpcManager::ServerInit() {
     ConfigManager *config = CLIO_CONFIG_MANAGER;
     u32 queue_depth = config->GetQueueDepth();
     constexpr size_t kSyclClientBackendBytes = 64 * 1024 * 1024;  // 64 MB
-    extern CLIO_RUN_GPU_API bool ChiServerBootstrapSyclGpu(
-        IpcManager *self, u32 queue_depth, size_t backend_bytes);
     if (!ChiServerBootstrapSyclGpu(this, queue_depth,
                                     kSyclClientBackendBytes)) {
       return false;
