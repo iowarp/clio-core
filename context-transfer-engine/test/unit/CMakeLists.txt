@@ -582,45 +582,6 @@ clio_add_force_net_test(NAME cte_client_config_force_net
 clio_add_force_net_test(NAME cte_config_dpe_force_net
     COMMAND test_cte_config_dpe ENVIRONMENT "${_cte_fn_env_basic}")
 
-if(CLIO_CORE_ENABLE_CUDA OR CLIO_CORE_ENABLE_ROCM)
-# GPU coroutine subtask tests (gpu2gpu dispatch + coroutine suspend/resume)
-add_test(NAME cte_gpu_coroutine
-    COMMAND test_cte_gpu_coroutine)
-
-# GPU core tests run together in one process so Put and Get share the same
-# initialized fixture and the stored blob persists between test cases.
-add_test(NAME cte_gpu_core_all
-    COMMAND test_gpu_core)
-
-# GPU create tests - AsyncCreate from GPU kernel
-add_test(NAME cte_gpu_create
-    COMMAND test_gpu_create)
-
-set_tests_properties(
-    cte_gpu_coroutine
-    PROPERTIES
-        TIMEOUT 120
-        LABELS "gpu;cte;coroutine;msan_skip"
-        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1"
-)
-
-set_tests_properties(
-    cte_gpu_core_all
-    PROPERTIES
-        TIMEOUT 120
-        LABELS "gpu;cte;core;msan_skip"
-        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1"
-)
-
-set_tests_properties(
-    cte_gpu_create
-    PROPERTIES
-        TIMEOUT 120
-        LABELS "gpu;cte;create;msan_skip"
-        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1"
-)
-endif()  # CLIO_CORE_ENABLE_CUDA OR CLIO_CORE_ENABLE_ROCM
-
 # Mark all CTE tests as msan_skip (they use ZMQ via chimaera runtime which is uninstrumented)
 set_tests_properties(
     cte_core_pool_creation
@@ -669,14 +630,6 @@ set_tests_properties(
     cte_reorganize_all
     PROPERTIES LABELS "msan_skip"
 )
-if(CLIO_CORE_ENABLE_CUDA OR CLIO_CORE_ENABLE_ROCM)
-set_tests_properties(
-    cte_gpu_coroutine
-    cte_gpu_core_all
-    cte_gpu_create
-    PROPERTIES LABELS "msan_skip"
-)
-endif()
 
 # Tests that start a full CLIO Runtime runtime share /tmp/chimaera_iowarp SHM
 # segments and TCP/IPC ports, so they must NOT run in parallel. They also
@@ -724,14 +677,6 @@ set_tests_properties(
         # test runs. Until that's fixed upstream, just dodge.
         ENVIRONMENT "CLIO_PORT=10500"
 )
-if(CLIO_CORE_ENABLE_CUDA OR CLIO_CORE_ENABLE_ROCM)
-set_tests_properties(
-    cte_gpu_coroutine
-    cte_gpu_core_all
-    cte_gpu_create
-    PROPERTIES RESOURCE_LOCK "chimaera_runtime"
-)
-endif()
 
 # All cte_functional_* tests run test_core_functionality (9 test cases, each
 # initializing and finalizing the full chimaera runtime).  After multiple
@@ -759,10 +704,9 @@ set_tests_properties(
 # Install Targets
 # ------------------------------------------------------------------------------
 set(_CTE_TEST_TARGETS cte_core_unit_tests cte_core_functionality_simple_tests test_core_functionality test_query test_cte_config_dpe test_tag_operations test_core_client_config test_core_runtime_coverage test_tiered_storage_stress test_tiered_storage_dram_default test_blob_block_reuse test_reorganize_blob)
-# (Legacy test_cte_gpu_coroutine / test_gpu_core / test_gpu_create were
-# removed along with the GPU runtime — see deletions earlier in this
-# file. The new CUDA test target test_cuda_cte_kernel_putget is added
-# below with its own install rule via add_cuda_executable.)
+# (The legacy test_cte_gpu_coroutine / test_gpu_core / test_gpu_create targets
+# and their ctest registrations were removed along with the GPU runtime. CTE
+# GPU coverage now lives in test_cte_devmem_putget (cte_devmem_putget_cuda).)
 install(TARGETS ${_CTE_TEST_TARGETS}
     LIBRARY DESTINATION lib
     ARCHIVE DESTINATION lib
