@@ -21,7 +21,6 @@
 #include "clio_runtime/ipc_manager.h"
 #include "clio_runtime/gpu/gpu_ipc_manager.h"
 #include "clio_runtime/config_manager.h"
-#include "clio_runtime/device_memcpy.h"
 #include "clio_runtime/singletons.h"
 #include "clio_ctp/util/gpu_api.h"
 #include "clio_ctp/util/logging.h"
@@ -118,95 +117,9 @@ bool gpu::IpcManager::ServerInitGpuQueues(u32 queue_depth) {
          kQueueBackendBytes / (1024 * 1024));
   }
 
-  // Install device-aware memcpy + IsDevicePointer hooks (consumed by the
-  // bdev runtime when WriteToRam / ReadFromRam see device USM pointers,
-  // and by the GPU2CPU worker pop path when D2H/H2D-copying POD tasks).
-  //
-  // We MUST use a non-blocking, per-thread stream here. The kernel that
-  // submitted the task is parked on a Wait() spin-loop on its own
-  // (default) stream, polling FUTURE_COMPLETE on the device-side
-  // gpu::FutureShm. If we issued cudaMemcpy on the legacy default
-  // stream it would block until prior default-stream work (the spinning
-  // kernel) drained — classic CUDA deadlock. cudaMemcpyAsync on a
-  // separate non-blocking stream uses an independent DMA engine and
-  // proceeds concurrently with the kernel.
-  chi::g_device_aware_memcpy.store(
-      [](void *dst, const void *src, std::size_t n) {
-        if (n == 0) return;
-#if CTP_ENABLE_CUDA
-        // Fast path: when both pointers are plain host memory, use
-        // std::memcpy. The CUDA host->host path goes through the driver's
-        // generic copy and tops out at ~1.5-3 GB/s on x86; std::memcpy
-        // hits 8-15 GB/s on a single core. Pinned host (cudaMemoryTypeHost)
-        // and unregistered system memory both work with plain memcpy.
-        // Managed (UVM) and Device pointers stay on the cudaMemcpyAsync
-        // path so the driver handles migration / D2H / D2D correctly.
-        auto is_host_kind = [](const void *p) {
-          cudaPointerAttributes a{};
-          cudaError_t rc = cudaPointerGetAttributes(&a, p);
-          if (rc == cudaErrorInvalidValue) {
-            // Older CUDA returned this for unregistered host memory; clear
-            // the sticky error so it doesn't trip the next CUDA call.
-            (void)cudaGetLastError();
-            return true;
-          }
-          if (rc != cudaSuccess) return false;
-          return a.type == cudaMemoryTypeHost ||
-                 a.type == cudaMemoryTypeUnregistered;
-        };
-        if (is_host_kind(dst) && is_host_kind(src)) {
-          std::memcpy(dst, src, n);
-          return;
-        }
-        thread_local cudaStream_t s = nullptr;
-        if (!s) {
-          CUDA_ERROR_CHECK(cudaStreamCreateWithFlags(
-              &s, cudaStreamNonBlocking));
-        }
-        CUDA_ERROR_CHECK(cudaMemcpyAsync(dst, src, n,
-                                          cudaMemcpyDefault, s));
-        CUDA_ERROR_CHECK(cudaStreamSynchronize(s));
-#elif CTP_ENABLE_ROCM
-        auto is_host_kind = [](const void *p) {
-          hipPointerAttribute_t a{};
-          hipError_t rc = hipPointerGetAttributes(&a, p);
-          if (rc == hipErrorInvalidValue) {
-            (void)hipGetLastError();
-            return true;
-          }
-          if (rc != hipSuccess) return false;
-#if HIP_VERSION >= 60000000
-          return a.type == hipMemoryTypeHost ||
-                 a.type == hipMemoryTypeUnregistered;
-#else
-          return a.memoryType == hipMemoryTypeHost ||
-                 a.memoryType == hipMemoryTypeUnregistered;
-#endif
-        };
-        if (is_host_kind(dst) && is_host_kind(src)) {
-          std::memcpy(dst, src, n);
-          return;
-        }
-        thread_local hipStream_t s = nullptr;
-        if (!s) {
-          HIP_ERROR_CHECK(hipStreamCreateWithFlags(
-              &s, hipStreamNonBlocking));
-        }
-        HIP_ERROR_CHECK(hipMemcpyAsync(dst, src, n,
-                                        hipMemcpyDefault, s));
-        HIP_ERROR_CHECK(hipStreamSynchronize(s));
-#else
-        ctp::GpuApi::Memcpy(static_cast<char *>(dst),
-                             static_cast<const char *>(src), n);
-#endif
-      },
-      std::memory_order_release);
-  chi::g_is_device_pointer.store(
-      [](const void *ptr) -> bool {
-        return ctp::GpuApi::IsDevicePointer(const_cast<void *>(ptr));
-      },
-      std::memory_order_release);
-
+  // Device-aware memcpy / device-pointer detection are now plain header
+  // functions (ctp::DeviceAwareMemcpy / ctp::IsDevicePointer in gpu_api.h),
+  // compiled directly into each caller — no runtime hook to install here.
   return true;
 }
 

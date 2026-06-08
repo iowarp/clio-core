@@ -19,7 +19,6 @@
 #include "clio_runtime/ipc_manager.h"
 #include "clio_runtime/gpu/gpu_ipc_manager.h"
 #include "clio_runtime/config_manager.h"
-#include "clio_runtime/device_memcpy.h"
 #include "clio_runtime/singletons.h"
 #include "clio_ctp/util/gpu_api.h"
 #include "clio_ctp/util/logging.h"
@@ -113,19 +112,9 @@ bool gpu::IpcManager::ServerInitGpuQueues(u32 queue_depth) {
          kQueueBackendBytes / (1024 * 1024));
   }
 
-  chi::g_device_aware_memcpy.store(
-      [](void *dst, const void *src, std::size_t n) {
-        if (n == 0) return;
-        ctp::GpuApi::Memcpy(static_cast<char *>(dst),
-                             static_cast<const char *>(src), n);
-      },
-      std::memory_order_release);
-  chi::g_is_device_pointer.store(
-      [](const void *ptr) -> bool {
-        return ctp::GpuApi::IsDevicePointer(const_cast<void *>(ptr));
-      },
-      std::memory_order_release);
-
+  // Device-aware memcpy / device-pointer detection are now plain header
+  // functions (ctp::DeviceAwareMemcpy / ctp::IsDevicePointer in gpu_api.h) —
+  // no runtime hook to install here.
   return true;
 }
 

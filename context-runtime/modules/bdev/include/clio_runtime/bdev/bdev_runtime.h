@@ -486,7 +486,7 @@ class Runtime : public chi::Container {
 
   /**
    * Backend-specific RAM operations (synchronous, no coroutine needed).
-   * Uses chi::DeviceAwareMemcpy so the data ShmPtr may resolve to either
+   * Uses ctp::DeviceAwareMemcpy so the data ShmPtr may resolve to either
    * a host or a device-USM pointer.
    */
   void WriteToRam(ctp::ipc::FullPtr<WriteTask> task);

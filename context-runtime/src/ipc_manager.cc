@@ -67,22 +67,6 @@
 // Global pointer variable definition for IPC manager singleton
 CLIO_RUN_DEFINE_GLOBAL_PTR_VAR_CC(chi::IpcManager, g_ipc_manager);
 
-#include <clio_runtime/device_memcpy.h>
-
-namespace clio::run {
-
-// Definitions of the device-aware memcpy + IsDevicePointer hooks
-// declared in chimaera/device_memcpy.h. ServerInitGpuQueuesSycl (or
-// its CUDA/ROCm equivalent) installs function pointers here at
-// server-init time so the bdev runtime — built without -fsycl — can
-// route memcpys involving device USM through the GPU runtime, and
-// stage through host buffers only when the data is actually on the
-// device.
-CLIO_RUN_API std::atomic<DeviceAwareMemcpyFn> g_device_aware_memcpy{nullptr};
-CLIO_RUN_API std::atomic<IsDevicePointerFn> g_is_device_pointer{nullptr};
-
-}  // namespace clio::run
-
 namespace clio::run {
 
 namespace {
@@ -361,9 +345,9 @@ bool IpcManager::ServerInit() {
   // CUDA / ROCm slim path: GPU is a pure task producer that pushes onto
   // gpu2cpu_queue. The bootstrap mirrors the SYCL one — pinned host
   // gpu2cpu_queue + gpu2cpu_copy_backend, on-device GpuTaskQueue
-  // construction, then install the chi::DeviceAwareMemcpy /
-  // IsDevicePointer hooks. Source lives in src/gpu/gpu2cpu_init_hip.cc
-  // and is compiled by nvcc/hipcc so the kernel launch syntax resolves.
+  // construction. Source lives in src/gpu/gpu2cpu_init_hip.cc and is
+  // compiled by nvcc/hipcc so the kernel launch syntax resolves.
+  // (Device-aware memcpy is now ctp::DeviceAwareMemcpy in gpu_api.h.)
   {
     ConfigManager *config = CLIO_CONFIG_MANAGER;
     u32 queue_depth = config->GetQueueDepth();

@@ -77,7 +77,7 @@ struct DeviceViewBase {
   chi::u32 get_slot_stride;
   /**
    * Allocator ids of the page backends. The bdev runtime resolves
-   * blob_data_ ShmPtrs via chi::g_device_aware_memcpy; pinned-host
+   * blob_data_ ShmPtrs via ctp::DeviceAwareMemcpy; pinned-host
    * pages decode the same way (cudaMemcpyDefault auto-detects).
    */
   ctp::ipc::AllocatorId pages_alloc_id;

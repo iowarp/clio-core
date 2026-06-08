@@ -9,7 +9,7 @@
 
 #if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL
 
-#include "clio_runtime/device_memcpy.h"
+#include "clio_ctp/util/gpu_api.h"
 #include "clio_runtime/gpu/future.h"
 #include "clio_runtime/gpu/gpu_ipc_manager.h"
 #include "clio_runtime/ipc_manager.h"
@@ -55,7 +55,7 @@ void IpcGpu2Cpu::RuntimeSend(
   //    gpu_task_device_ptr_ only when D2H-copy was needed.
   if (future_shm->gpu_task_device_ptr_ && future_shm->gpu_task_size_) {
     void *dst = reinterpret_cast<void *>(future_shm->gpu_task_device_ptr_);
-    chi::DeviceAwareMemcpy(dst, task_ptr.ptr_, future_shm->gpu_task_size_);
+    ctp::DeviceAwareMemcpy(dst, task_ptr.ptr_, future_shm->gpu_task_size_);
   }
 
   // 2) Signal FUTURE_COMPLETE on the device-side gpu::FutureShm. For
@@ -64,10 +64,8 @@ void IpcGpu2Cpu::RuntimeSend(
   if (future_shm->gpu_fshm_device_ptr_) {
     auto *gpu_fshm = reinterpret_cast<gpu::FutureShm *>(
         future_shm->gpu_fshm_device_ptr_);
-    auto is_device_ptr = chi::g_is_device_pointer.load(
-        std::memory_order_acquire);
     bool fshm_on_device =
-        is_device_ptr && is_device_ptr(static_cast<void *>(gpu_fshm));
+        ctp::IsDevicePointer(static_cast<void *>(gpu_fshm));
     if (fshm_on_device) {
       // GPU's volatile read of bits_.x sees the 4-byte write whole.
       // We OR-in the bit by reading then writing rather than racing
@@ -75,7 +73,7 @@ void IpcGpu2Cpu::RuntimeSend(
       // task is in-flight (it only reads), so a plain write of
       // FUTURE_COMPLETE is safe here.
       u32 new_flags = gpu::FutureShm::FUTURE_COMPLETE;
-      chi::DeviceAwareMemcpy(&gpu_fshm->flags_.bits_.x, &new_flags,
+      ctp::DeviceAwareMemcpy(&gpu_fshm->flags_.bits_.x, &new_flags,
                              sizeof(u32));
     } else {
       volatile u32 *flags_ptr = reinterpret_cast<volatile u32 *>(

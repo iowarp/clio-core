@@ -33,7 +33,7 @@
 
 #include <clio_runtime/bdev/bdev_runtime.h>
 #include <clio_runtime/comutex.h>
-#include <clio_runtime/device_memcpy.h>
+#include <clio_ctp/util/gpu_api.h>
 #include <clio_runtime/work_orchestrator.h>
 #include <clio_runtime/worker.h>
 
@@ -312,7 +312,7 @@ Runtime::~Runtime() {
   // Clean up RAM backend (vector of unique_ptr<char[]> handles itself)
 
   // kHbm / kPinned bdev tiers were removed — kRam/kFile handle device
-  // USM source/dest pointers directly via chi::DeviceAwareMemcpy.
+  // USM source/dest pointers directly via ctp::DeviceAwareMemcpy.
 
   // Note: GlobalBlockMap and Heap destructors will clean up automatically
 }
@@ -527,7 +527,7 @@ chi::TaskResume Runtime::Create(ctp::ipc::FullPtr<CreateTask> task,
   // BdevType::kHbm and BdevType::kPinned removed — supported tiers
   // are kFile / kRam / kNoop. PutBlob/GetBlob with HBM-resident
   // ShmPtr data buffers route through kRam (or kFile) and the bdev
-  // staging path uses chi::DeviceAwareMemcpy / IsDevicePointer.
+  // staging path uses ctp::DeviceAwareMemcpy / IsDevicePointer.
   } else if (bdev_type_ == BdevType::kNoop) {
     // Noop backend: no storage buffer, just track allocatable size
     if (params.total_size_ == 0) {
@@ -790,11 +790,11 @@ chi::TaskResume Runtime::WriteToFile(ctp::ipc::FullPtr<WriteTask> task,
   // a host buffer when the data lives on device. The host staging
   // buffer is sized to the largest single-block write — typical CTE
   // PutBlob is one block, but worst-case loop bound is task->length_.
-  bool data_on_device = chi::IsDevicePointer(data_ptr.ptr_);
+  bool data_on_device = ctp::IsDevicePointer(data_ptr.ptr_);
   std::vector<char> staging;
   if (data_on_device) {
     staging.resize(task->length_);
-    chi::DeviceAwareMemcpy(staging.data(), data_ptr.ptr_, task->length_);
+    ctp::DeviceAwareMemcpy(staging.data(), data_ptr.ptr_, task->length_);
   }
 
   chi::u64 total_bytes_written = 0;
@@ -868,7 +868,7 @@ chi::TaskResume Runtime::ReadFromFile(ctp::ipc::FullPtr<ReadTask> task,
   // libaio / POSIX-AIO can't write into device USM. When the dest is
   // device, allocate a host staging buffer, AIO into it, then
   // DeviceAwareMemcpy to the device dest at the end.
-  bool data_on_device = chi::IsDevicePointer(data_ptr.ptr_);
+  bool data_on_device = ctp::IsDevicePointer(data_ptr.ptr_);
   std::vector<char> staging;
   if (data_on_device) {
     staging.resize(task->length_);
@@ -927,7 +927,7 @@ chi::TaskResume Runtime::ReadFromFile(ctp::ipc::FullPtr<ReadTask> task,
   // If we staged through a host buffer, push the freshly-read bytes
   // out to the device-USM destination. (No-op when data is on host.)
   if (data_on_device && total_bytes_read > 0) {
-    chi::DeviceAwareMemcpy(data_ptr.ptr_, staging.data(), total_bytes_read);
+    ctp::DeviceAwareMemcpy(data_ptr.ptr_, staging.data(), total_bytes_read);
   }
 
   task->return_code_ = 0;
@@ -1121,7 +1121,7 @@ void Runtime::WriteToRam(ctp::ipc::FullPtr<WriteTask> task) {
       chi::u64 intra = cur_off % kRamPageSize;
       chi::u64 chunk = std::min<chi::u64>(left, kRamPageSize - intra);
       char* page = EnsureRamPage(page_idx);
-      chi::DeviceAwareMemcpy(page + intra,
+      ctp::DeviceAwareMemcpy(page + intra,
                              data_ptr.ptr_ + data_offset,
                              chunk);
       cur_off += chunk;
@@ -1178,15 +1178,15 @@ void Runtime::ReadFromRam(ctp::ipc::FullPtr<ReadTask> task) {
       char* page = GetRamPage(page_idx);
       char *dst = data_ptr.ptr_ + data_offset;
       if (page) {
-        chi::DeviceAwareMemcpy(dst, page + intra, chunk);
-      } else if (chi::IsDevicePointer(dst)) {
+        ctp::DeviceAwareMemcpy(dst, page + intra, chunk);
+      } else if (ctp::IsDevicePointer(dst)) {
         static const char kZeroScratch[4096] = {};
         chi::u64 z_left = chunk;
         chi::u64 z_off = 0;
         while (z_left > 0) {
           chi::u64 z_chunk =
               std::min<chi::u64>(z_left, sizeof(kZeroScratch));
-          chi::DeviceAwareMemcpy(dst + z_off, kZeroScratch, z_chunk);
+          ctp::DeviceAwareMemcpy(dst + z_off, kZeroScratch, z_chunk);
           z_off += z_chunk;
           z_left -= z_chunk;
         }

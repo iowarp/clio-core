@@ -51,7 +51,7 @@
 // resolution
 #include "clio_runtime/admin/admin_client.h"
 #include "clio_runtime/container.h"
-#include "clio_runtime/device_memcpy.h"
+#include "clio_ctp/util/gpu_api.h"
 #include "clio_runtime/ipc_manager.h"
 #include "clio_runtime/pool_manager.h"
 #include "clio_runtime/singletons.h"
@@ -356,20 +356,16 @@ bool Worker::ProcessNewTaskGpu(GpuTaskLane *gpu_lane) {
   }
 
   // Detect whether the FutureShm / Task structs sit in pure device
-  // memory (host cannot dereference them). g_is_device_pointer is
-  // installed by ServerInitGpuQueues; absent on host-only builds.
-  auto is_device_ptr = chi::g_is_device_pointer.load(
-      std::memory_order_acquire);
-  bool fshm_on_device =
-      is_device_ptr && is_device_ptr(gpu_fshm_raw);
-  bool task_on_device =
-      is_device_ptr && is_device_ptr(gpu_task_raw);
+  // memory (host cannot dereference them). ctp::IsDevicePointer returns
+  // false on host-only builds.
+  bool fshm_on_device = ctp::IsDevicePointer(gpu_fshm_raw);
+  bool task_on_device = ctp::IsDevicePointer(gpu_task_raw);
 
   // Pull gpu::FutureShm contents into a local copy (D2H if needed).
   // task_size_ tells us how many bytes the Task POD occupies.
   alignas(8) char fshm_buf[sizeof(gpu::FutureShm)];
   if (fshm_on_device) {
-    chi::DeviceAwareMemcpy(fshm_buf, gpu_fshm_raw,
+    ctp::DeviceAwareMemcpy(fshm_buf, gpu_fshm_raw,
                            sizeof(gpu::FutureShm));
   } else {
     std::memcpy(fshm_buf, gpu_fshm_raw, sizeof(gpu::FutureShm));
@@ -397,7 +393,7 @@ bool Worker::ProcessNewTaskGpu(GpuTaskLane *gpu_lane) {
   }
   Task *task_raw = nullptr;
   if (task_on_device) {
-    chi::DeviceAwareMemcpy(task_scratch, gpu_task_raw, task_pod_size);
+    ctp::DeviceAwareMemcpy(task_scratch, gpu_task_raw, task_pod_size);
     task_raw = reinterpret_cast<Task *>(task_scratch);
   } else {
     task_raw = static_cast<Task *>(gpu_task_raw);
@@ -448,7 +444,7 @@ bool Worker::ProcessNewTaskGpu(GpuTaskLane *gpu_lane) {
     } else {
       // Best-effort: still flip the device flag via cudaMemcpy.
       u32 v = gpu::FutureShm::FUTURE_COMPLETE;
-      chi::DeviceAwareMemcpy(
+      ctp::DeviceAwareMemcpy(
           &static_cast<gpu::FutureShm *>(gpu_fshm_raw)->flags_.bits_.x,
           &v, sizeof(u32));
     }

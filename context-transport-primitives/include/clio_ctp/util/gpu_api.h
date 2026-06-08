@@ -34,6 +34,8 @@
 #ifndef CTP_UTIL_GPU_API_H
 #define CTP_UTIL_GPU_API_H
 
+#include <cstring>
+
 #include "clio_ctp/constants/macros.h"
 #include "clio_ctp/util/logging.h"
 
@@ -377,6 +379,85 @@ class GpuApi {
   }
 #endif
 };
+
+/**
+ * memcpy that transparently handles host and/or device (USM) pointers. A pure
+ * host<->host copy uses std::memcpy; any copy touching device memory uses an
+ * async copy on a dedicated non-blocking, per-thread stream so it cannot
+ * deadlock against a kernel parked on the default stream. On a non-GPU build
+ * (or for host-only pointers) it is exactly std::memcpy.
+ *
+ * Header-only, CUDA-free-at-the-call-site replacement for the old runtime
+ * g_device_aware_memcpy hook: CPU-only callers (bdev, worker) just call this.
+ */
+inline void DeviceAwareMemcpy(void *dst, const void *src, size_t n) {
+  if (n == 0) return;
+#if CTP_ENABLE_CUDA
+  // Fast path: when both pointers are plain host memory, use std::memcpy. The
+  // CUDA host->host path tops out at ~1.5-3 GB/s; std::memcpy hits 8-15 GB/s.
+  // Managed (UVM)/Device pointers stay on the async path so the driver handles
+  // migration / D2H / D2D correctly.
+  auto is_host_kind = [](const void *p) {
+    cudaPointerAttributes a{};
+    cudaError_t rc = cudaPointerGetAttributes(&a, p);
+    if (rc == cudaErrorInvalidValue) {
+      // Older CUDA returned this for unregistered host memory; clear the
+      // sticky error so it doesn't trip the next CUDA call.
+      (void)cudaGetLastError();
+      return true;
+    }
+    if (rc != cudaSuccess) return false;
+    return a.type == cudaMemoryTypeHost ||
+           a.type == cudaMemoryTypeUnregistered;
+  };
+  if (is_host_kind(dst) && is_host_kind(src)) {
+    std::memcpy(dst, src, n);
+    return;
+  }
+  thread_local cudaStream_t s = nullptr;
+  if (!s) {
+    CUDA_ERROR_CHECK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
+  }
+  CUDA_ERROR_CHECK(cudaMemcpyAsync(dst, src, n, cudaMemcpyDefault, s));
+  CUDA_ERROR_CHECK(cudaStreamSynchronize(s));
+#elif CTP_ENABLE_ROCM
+  auto is_host_kind = [](const void *p) {
+    hipPointerAttribute_t a{};
+    hipError_t rc = hipPointerGetAttributes(&a, p);
+    if (rc == hipErrorInvalidValue) {
+      (void)hipGetLastError();
+      return true;
+    }
+    if (rc != hipSuccess) return false;
+#if defined(HIP_VERSION) && HIP_VERSION >= 60000000
+    return a.type == hipMemoryTypeHost ||
+           a.type == hipMemoryTypeUnregistered;
+#else
+    return a.memoryType == hipMemoryTypeHost ||
+           a.memoryType == hipMemoryTypeUnregistered;
+#endif
+  };
+  if (is_host_kind(dst) && is_host_kind(src)) {
+    std::memcpy(dst, src, n);
+    return;
+  }
+  thread_local hipStream_t s = nullptr;
+  if (!s) {
+    HIP_ERROR_CHECK(hipStreamCreateWithFlags(&s, hipStreamNonBlocking));
+  }
+  HIP_ERROR_CHECK(hipMemcpyAsync(dst, src, n, hipMemcpyDefault, s));
+  HIP_ERROR_CHECK(hipStreamSynchronize(s));
+#else
+  std::memcpy(dst, src, n);
+#endif
+}
+
+/** True if ptr is device (USM) memory the host cannot dereference; false on a
+ *  non-GPU build. Header-only replacement for the old g_is_device_pointer
+ *  hook. */
+inline bool IsDevicePointer(const void *ptr) {
+  return GpuApi::IsDevicePointer(const_cast<void *>(ptr));
+}
 
 }  // namespace ctp
 
