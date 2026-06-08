@@ -89,15 +89,28 @@ if(CLIO_CORE_ENABLE_CUDA)
     add_library(cudacxx INTERFACE)
     # cudadevrt: CUDA device runtime, required to device-link relocatable device
     # code (-rdc=true) / dynamic parallelism. Carried on ctp::cuda_cxx so every
-    # GPU consumer gets it transitively — no per-target CUDA links needed. Use
-    # the imported CUDA::cudadevrt target (which carries the toolkit lib path)
-    # rather than the bare name `cudadevrt`: bare -lcudadevrt isn't on the
-    # default linker search path on Linux (only Windows happened to find it).
+    # GPU consumer gets it transitively — no per-target CUDA links needed.
+    #
+    # Resolve it to a full path rather than the bare name `cudadevrt`: bare
+    # -lcudadevrt isn't on the default linker search path on Linux (only Windows
+    # happened to find it). Prefer the imported CUDA::cudadevrt target when the
+    # toolkit's CMake package defines it; CUDA 13's FindCUDAToolkit no longer
+    # creates that target, so fall back to find_library() against the toolkit
+    # lib dir, and only then to the bare name as a last resort.
     find_package(CUDAToolkit QUIET)
     if(TARGET CUDA::cudadevrt)
         target_link_libraries(cudacxx INTERFACE clio_ctp_cuda CUDA::cudadevrt)
     else()
-        target_link_libraries(cudacxx INTERFACE clio_ctp_cuda cudadevrt)
+        find_library(CLIO_CUDADEVRT_LIB cudadevrt
+            HINTS ${CUDAToolkit_LIBRARY_DIR} ${CUDAToolkit_BIN_DIR}/../lib64
+            PATH_SUFFIXES lib64 lib)
+        if(CLIO_CUDADEVRT_LIB)
+            target_link_libraries(cudacxx INTERFACE clio_ctp_cuda ${CLIO_CUDADEVRT_LIB})
+        else()
+            message(WARNING "cudadevrt not found via find_library; falling back to "
+                            "bare -lcudadevrt (may fail to link on Linux)")
+            target_link_libraries(cudacxx INTERFACE clio_ctp_cuda cudadevrt)
+        endif()
     endif()
     target_include_directories(cudacxx INTERFACE
         $<BUILD_INTERFACE:${CLIO_CTP_ROOT}/include>
