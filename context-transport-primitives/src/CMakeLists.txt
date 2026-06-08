@@ -89,8 +89,16 @@ if(CLIO_CORE_ENABLE_CUDA)
     add_library(cudacxx INTERFACE)
     # cudadevrt: CUDA device runtime, required to device-link relocatable device
     # code (-rdc=true) / dynamic parallelism. Carried on ctp::cuda_cxx so every
-    # GPU consumer gets it transitively — no per-target CUDA links needed.
-    target_link_libraries(cudacxx INTERFACE clio_ctp_cuda cudadevrt)
+    # GPU consumer gets it transitively — no per-target CUDA links needed. Use
+    # the imported CUDA::cudadevrt target (which carries the toolkit lib path)
+    # rather than the bare name `cudadevrt`: bare -lcudadevrt isn't on the
+    # default linker search path on Linux (only Windows happened to find it).
+    find_package(CUDAToolkit QUIET)
+    if(TARGET CUDA::cudadevrt)
+        target_link_libraries(cudacxx INTERFACE clio_ctp_cuda CUDA::cudadevrt)
+    else()
+        target_link_libraries(cudacxx INTERFACE clio_ctp_cuda cudadevrt)
+    endif()
     target_include_directories(cudacxx INTERFACE
         $<BUILD_INTERFACE:${CLIO_CTP_ROOT}/include>
         $<BUILD_INTERFACE:${PROJECT_BINARY_DIR}/include>
