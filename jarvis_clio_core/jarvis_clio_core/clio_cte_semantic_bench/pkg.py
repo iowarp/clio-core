@@ -1,6 +1,7 @@
 from jarvis_cd.core.pkg import Application
 from jarvis_cd.shell import Exec, PsshExecInfo
 import os
+import re
 
 
 class ClioCteSemanticBench(Application):
@@ -45,6 +46,12 @@ class ClioCteSemanticBench(Application):
                 'msg': 'Keyword stored in / searched for in every blob',
                 'type': str,
                 'default': 'needle',
+            },
+            {
+                'name': 'query_iters',
+                'msg': 'Repeat the search N times for a stable latency stat',
+                'type': int,
+                'default': 5,
             },
             {
                 'name': 'nprocs',
@@ -99,19 +106,46 @@ class ClioCteSemanticBench(Application):
             '--size', str(self.config['blob_size']),
             '--results', str(self.config['results']),
             '--keyword', str(self.config['keyword']),
+            '--query-iters', str(self.config['query_iters']),
         ]
         exec_info = PsshExecInfo(
             env=self.mod_env,
             hostfile=self.hostfile,
             nprocs=self.config['nprocs'],
             ppn=self.config['ppn'],
+            collect_output=True,
         )
         cmd_str = ' '.join(cmd)
-        if self.output_file:
-            cmd_str += f' > {self.output_file} 2>&1'
         self.log(f"Executing: {cmd_str}")
-        Exec(cmd_str, exec_info).run()
+        # Run and keep the Exec so _get_stat can parse the [SEM_BENCH] line.
+        self.exec = Exec(cmd_str, exec_info).run()
+        if self.output_file:
+            with open(self.output_file, 'w') as f:
+                for out in self.exec.stdout.values():
+                    f.write(out)
         self.log("SemanticSearch benchmark completed")
+
+    def _get_stat(self, stat_dict):
+        """Parse the benchmark's retrieval-performance summary.
+
+        Pulls the [SEM_BENCH] key=value record (query latency to retrieve the
+        top-k blobs, plus ingest stats) out of the benchmark stdout.
+        """
+        if getattr(self, 'exec', None) is None:
+            return
+        output = '\n'.join(self.exec.stdout.values())
+        # The single machine-readable record: "[SEM_BENCH] k1=v1 k2=v2 ..."
+        line = ''
+        for ln in output.splitlines():
+            if '[SEM_BENCH]' in ln:
+                line = ln
+                break
+        for key in ('query_avg_us', 'query_min_us', 'query_max_us',
+                    'results', 'k', 'blobs', 'blob_size', 'query_iters',
+                    'ingest_s', 'ingest_blobs_per_s'):
+            m = re.search(rf'{key}=([0-9.]+)', line)
+            if m:
+                stat_dict[f'{self.pkg_id}.{key}'] = float(m.group(1))
 
     def stop(self):
         return True

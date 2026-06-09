@@ -43,14 +43,20 @@
  *    SemanticSearchTask::Aggregate then merges those partial sets and keeps
  *    the global top-k by descending BM25 score.
  *
+ * On completion it prints an overall retrieval-performance summary — the
+ * average / min / max latency to query the top-k blobs — plus a single
+ * machine-parseable `[SEM_BENCH] key=value ...` record (consumed by the
+ * jarvis package's _get_stat).
+ *
  * Flags (all optional):
- *   --blobs N      number of blobs to write   (default 1000)
- *   --size  BYTES  size of each blob in bytes  (default 4096)
- *   --results K    number of results to return (default 10; 0 = all)
- *   --keyword W    keyword stored in / searched for (default "needle")
+ *   --blobs N         number of blobs to write   (default 1000)
+ *   --size  BYTES     size of each blob in bytes  (default 4096)
+ *   --results K       number of results to return (default 10; 0 = all)
+ *   --keyword W       keyword stored in / searched for (default "needle")
+ *   --query-iters N   repeat the search N times for a stable latency (default 5)
  *
  * Example:
- *   clio_cte_semantic_bench --blobs 5000 --size 8192 --results 20
+ *   clio_cte_semantic_bench --blobs 5000 --size 8192 --results 20 --query-iters 10
  */
 
 #include <clio_runtime/clio_runtime.h>
@@ -83,6 +89,7 @@ struct Args {
   long size = 4096;
   unsigned results = 10;
   std::string keyword = "needle";
+  int query_iters = 5;
   bool ok = true;
 };
 
@@ -110,6 +117,9 @@ Args ParseArgs(int argc, char **argv) {
     } else if (flag == "--keyword") {
       const char *v = next("--keyword");
       if (v) a.keyword = v;
+    } else if (flag == "--query-iters") {
+      const char *v = next("--query-iters");
+      if (v) a.query_iters = std::atoi(v);
     } else {
       HLOG(kError, "Unknown flag: {}", flag);
       a.ok = false;
@@ -119,6 +129,7 @@ Args ParseArgs(int argc, char **argv) {
     HLOG(kError, "--blobs and --size must be > 0");
     a.ok = false;
   }
+  if (a.query_iters <= 0) a.query_iters = 1;
   return a;
 }
 
@@ -197,27 +208,53 @@ int main(int argc, char **argv) {
   HLOG(kInfo, "Ingest: {} blobs in {}s ({} blobs/s)", a.blobs, F(put_s, 3),
        F(a.blobs / (put_s > 0 ? put_s : 1), 0));
 
-  // --- 2. One broadcast semantic search --------------------------------
-  HLOG(kInfo, "SemanticSearch keyword='{}' k={} (broadcast)...", a.keyword,
-       a.results);
-  auto q_t0 = steady_clock::now();
-  auto search = cte->AsyncSemanticSearch(
-      tag_name, ".*", a.keyword, a.results, chi::PoolQuery::Broadcast());
-  search.Wait();
-  double q_s = duration<double>(steady_clock::now() - q_t0).count();
-
-  if (search->return_code_.load() != 0) {
-    HLOG(kError, "SemanticSearch rc={}", search->return_code_.load());
-    return 1;
+  // --- 2. Broadcast semantic search, repeated for a stable latency -----
+  HLOG(kInfo, "SemanticSearch keyword='{}' k={} (broadcast), {} iters...",
+       a.keyword, a.results, a.query_iters);
+  double q_sum = 0.0, q_min = 1e30, q_max = 0.0;
+  size_t last_count = 0;
+  std::vector<clio::cte::core::SemanticSearchResult> last_results;
+  for (int it = 0; it < a.query_iters; ++it) {
+    auto q_t0 = steady_clock::now();
+    auto search = cte->AsyncSemanticSearch(
+        tag_name, ".*", a.keyword, a.results, chi::PoolQuery::Broadcast());
+    search.Wait();
+    double q_s = duration<double>(steady_clock::now() - q_t0).count();
+    if (search->return_code_.load() != 0) {
+      HLOG(kError, "SemanticSearch rc={}", search->return_code_.load());
+      return 1;
+    }
+    q_sum += q_s;
+    q_min = std::min(q_min, q_s);
+    q_max = std::max(q_max, q_s);
+    last_count = search->results_.size();
+    last_results.assign(search->results_.begin(), search->results_.end());
   }
+  double q_avg_us = (q_sum / a.query_iters) * 1e6;
+  double q_min_us = q_min * 1e6;
+  double q_max_us = q_max * 1e6;
 
-  const auto &results = search->results_;
-  HLOG(kInfo, "SemanticSearch returned {} results in {}s ({} us)",
-       results.size(), F(q_s, 4), F(q_s * 1e6, 0));
-  size_t show = std::min<size_t>(results.size(), 5);
+  // Show a few top hits from the last query.
+  size_t show = std::min<size_t>(last_results.size(), 5);
   for (size_t i = 0; i < show; ++i) {
     HLOG(kInfo, "  [{}] tag='{}' blob='{}' score={}", i,
-         results[i].tag_name_, results[i].blob_name_, F(results[i].score_, 4));
+         last_results[i].tag_name_, last_results[i].blob_name_,
+         F(last_results[i].score_, 4));
   }
+
+  // Overall retrieval-performance summary. The [SEM_BENCH] line is the
+  // machine-parseable record consumed by jarvis _get_stat.
+  HLOG(kInfo,
+       "Retrieval: top-{} query over {} blobs -> {} results; "
+       "latency avg={} us, min={} us, max={} us ({} iters)",
+       a.results, a.blobs, last_count, F(q_avg_us, 1), F(q_min_us, 1),
+       F(q_max_us, 1), a.query_iters);
+  HLOG(kInfo,
+       "[SEM_BENCH] query_avg_us={} query_min_us={} query_max_us={} "
+       "results={} k={} blobs={} blob_size={} query_iters={} "
+       "ingest_s={} ingest_blobs_per_s={}",
+       F(q_avg_us, 1), F(q_min_us, 1), F(q_max_us, 1), last_count, a.results,
+       a.blobs, a.size, a.query_iters, F(put_s, 3),
+       F(a.blobs / (put_s > 0 ? put_s : 1), 0));
   return 0;
 }
