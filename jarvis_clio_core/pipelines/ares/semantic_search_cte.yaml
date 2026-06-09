@@ -1,27 +1,23 @@
-# CTE SemanticSearch pipeline (Ares cluster).
+# CTE SemanticSearch node-scaling test (Ares cluster).
 #
-# Mirrors ior_cte_baseline.yaml but replaces the FUSE mount + IOR with the
-# clio_cte_semantic_bench client: it writes `blobs` keyword-filled blobs under
-# one tag (distributed across the 8-node CTE pool), then issues ONE broadcast
-# SemanticSearch, exercising the broadcast -> SemanticSearchTask::Aggregate
-# (merge-by-score) path across every tag-owning container.
+# Pipeline-test format (config + vars + loop): sweeps the SLURM node count
+# 1 -> 2 -> 4 -> 8 to measure how broadcast SemanticSearch retrieval latency
+# scales with the number of tag-owning CTE containers. A single client
+# ingests `blobs` keyword blobs (distributed across the N-node CTE pool), then
+# issues one broadcast SemanticSearch; the benchmark reports the avg/min/max
+# latency to query the top-k blobs (see clio_cte_semantic_bench --query-iters),
+# captured per run via the package's _get_stat -> results.csv.
 #
-# Run: jarvis ppl submit '<this file>'   (or `jarvis ppl run yaml <this file>`)
-name: semantic_search_cte
+# Mode B (scheduler.nodes is a swept var): each (node-count x repeat) is
+# submitted as its own SLURM job. Run with:
+#   jarvis ppl run yaml '<this file>'
+# (`jarvis ppl submit` is rejected in this mode.)
 
-ssh_cmd: "env -u LD_LIBRARY_PATH ssh"
-
-env:
-  TMPDIR: "/home/llogan/iowarp_prte_tmp"
-  CLIO_MEMFD_DIR: "/home/llogan/iowarp_chimaera_tmp_${HOSTNAME}"
-  # Pin iowarp/lightbeam ZMQ daemon<->daemon traffic to the 40G NIC.
-  LIGHTBEAM_TCP_DEVICE: enp47s0np0
-  CLIO_IPC_MODE: "shm"
-
+# Top-level scheduler = per-iteration template; scheduler.nodes is overridden
+# per combination.
 scheduler:
   name: slurm
   job_name: sem_cte
-  nodes: 8
   ntasks_per_node: 1
   cpus_per_task: 32
   partition: compute
@@ -32,34 +28,60 @@ scheduler:
     - 'source /etc/profile.d/lmod.sh 2>/dev/null || source /etc/profile.d/modules.sh'
     - 'mkdir -p /home/llogan/iowarp_prte_tmp'
 
-pkgs:
-  - pkg_type: jarvis_clio_core.clio_runtime
-    pkg_name: runtime
-    num_threads: 4
-    client_data_segment_size: "2G"
-    port: 9413
-    ipc_mode: "shm"
-    log_level: "debug"
-    sleep: 4
-    install_method: spack
-    install_query: iowarp@main+fuse
+config:
+  name: semantic_search_cte
+  ssh_cmd: "env -u LD_LIBRARY_PATH ssh"
 
-  - pkg_type: jarvis_clio_core.clio_cte
-    pkg_name: cte_core
-    devices:
-      - ["ram::cte_ram_tier1", "2GB", 1.0]
-    dpe_type: "max_bw"
-    neighborhood: 1
-    default_target_timeout_ms: 30000
-    poll_period_ms: 5000
-    pool_query: "local"
+  env:
+    TMPDIR: "/home/llogan/iowarp_prte_tmp"
+    CLIO_MEMFD_DIR: "/home/llogan/iowarp_chimaera_tmp_${HOSTNAME}"
+    # Pin iowarp/lightbeam ZMQ daemon<->daemon traffic to the 40G NIC.
+    LIGHTBEAM_TCP_DEVICE: enp47s0np0
+    CLIO_IPC_MODE: "shm"
 
-  - pkg_type: jarvis_clio_core.clio_cte_semantic_bench
-    pkg_name: semantic_bench
-    blobs: 1000
-    blob_size: 4096
-    results: 10
-    keyword: "needle"
-    nprocs: 1
-    ppn: 1
-    init_runtime: false
+  pkgs:
+    - pkg_type: jarvis_clio_core.clio_runtime
+      pkg_name: runtime
+      num_threads: 4
+      client_data_segment_size: "2G"
+      port: 9413
+      ipc_mode: "shm"
+      log_level: "debug"
+      sleep: 4
+      install_method: spack
+      install_query: iowarp@main+fuse
+
+    - pkg_type: jarvis_clio_core.clio_cte
+      pkg_name: cte_core
+      devices:
+        - ["ram::cte_ram_tier1", "2GB", 1.0]
+      dpe_type: "max_bw"
+      neighborhood: 1
+      default_target_timeout_ms: 30000
+      poll_period_ms: 5000
+      pool_query: "local"
+
+    - pkg_type: jarvis_clio_core.clio_cte_semantic_bench
+      pkg_name: semantic_bench
+      blobs: 1000
+      blob_size: 4096
+      results: 10
+      keyword: "needle"
+      query_iters: 5
+      nprocs: 1
+      ppn: 1
+      init_runtime: false
+
+# Scaling sweep: vary only the node count (1, 2, 4, 8). Blob count is fixed,
+# so this measures strong scaling of the broadcast query as data spreads
+# across more containers.
+vars:
+  scheduler.nodes: [1, 2, 4, 8]
+
+loop:
+  - [scheduler.nodes]
+
+# Repeat each node-count to capture run-to-run variability.
+repeat: 3
+
+output: "${HOME}/semantic_scaling_results"
