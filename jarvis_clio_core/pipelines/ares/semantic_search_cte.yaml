@@ -1,9 +1,9 @@
-# CTE SemanticSearch node-scaling test (Ares cluster).
+# CTE SemanticSearch weak-scaling test (Ares cluster).
 #
 # Pipeline-test format (config + vars + loop): sweeps the SLURM node count
-# 1 -> 2 -> 4 -> 8 to measure how broadcast SemanticSearch retrieval latency
-# scales with the number of tag-owning CTE containers. A single client
-# ingests `blobs` keyword blobs (distributed across the N-node CTE pool), then
+# 1 -> 2 -> 4 -> 8 with the blob count scaled proportionally (1000 blobs/node)
+# so the work PER node is constant -- weak scaling. A single client ingests the
+# blobs (distributed across the N-node CTE pool via Dynamic PutBlob), then
 # issues one broadcast SemanticSearch; the benchmark reports the avg/min/max
 # latency to query the top-k blobs (see clio_cte_semantic_bench --query-iters),
 # captured per run via the package's _get_stat -> results.csv.
@@ -72,16 +72,16 @@ config:
       ppn: 1
       init_runtime: false
 
-# Scaling sweep: vary only the node count (1, 2, 4, 8). Blob count is fixed,
-# so this measures strong scaling of the broadcast query as data spreads
-# across more containers.
+# Weak-scaling sweep: blob count grows with the node count (1000 blobs/node),
+# so the work PER node stays constant while total data scales with N. The two
+# vars are zipped (paired by index) in a single loop group.
 vars:
-  scheduler.nodes: [1, 2, 4, 8]
+  scheduler.nodes:      [1, 2, 4, 8]
+  semantic_bench.blobs: [1000, 2000, 4000, 8000]
 
 loop:
-  - [scheduler.nodes]
+  - [scheduler.nodes, semantic_bench.blobs]
 
-# Repeat each node-count to capture run-to-run variability.
-repeat: 3
+repeat: 1
 
-output: "${HOME}/semantic_scaling_results"
+output: "${HOME}/semantic_weak_scaling_results"
