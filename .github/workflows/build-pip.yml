@@ -150,6 +150,14 @@ jobs:
           CLIO_CORE_ENABLE_BENCHMARKS=OFF
         CIBW_BUILD_FRONTEND: "build"
         CIBW_PROJECT_REQUIRES_PYTHON: ">=3.10"
+        # clio_cee_api.dll is already bundled in the wheel via CMake's
+        # pip_package install rules (bin/ destination), but delvewheel's
+        # default repair pass only searches PATH — not inside the wheel.
+        # --ignore-existing tells delvewheel to treat DLLs already in the
+        # wheel as satisfied, so it can traverse the dep graph without
+        # trying to locate them externally.
+        CIBW_REPAIR_WHEEL_COMMAND_WINDOWS: >-
+          delvewheel repair -w {dest_dir} -v --ignore-existing {wheel}
       run: cibuildwheel --output-dir installers/pip/wheelhouse
 
     - name: Upload Windows wheels
