@@ -119,22 +119,40 @@ class ClioCteSemanticBench(Application):
         self.log(f"Executing: {cmd_str}")
         # Run and keep the Exec so _get_stat can parse the [SEM_BENCH] line.
         self.exec = Exec(cmd_str, exec_info).run()
+        out = '\n'.join(self.exec.stdout.values()) if self.exec.stdout else ''
+        # Persist output to the SHARED dir. In pipeline-test Mode B, start()
+        # runs inside a scheduler job (compute node) but _get_stat is invoked
+        # on a FRESH instance on the head node — which has no self.exec — so
+        # the stats must come from a shared file, not in-process stdout.
+        try:
+            with open(self._stat_file(), 'w') as f:
+                f.write(out)
+        except Exception as e:
+            self.log(f"Could not write stat file: {e}")
         if self.output_file:
             with open(self.output_file, 'w') as f:
-                for out in self.exec.stdout.values():
-                    f.write(out)
+                f.write(out)
         self.log("SemanticSearch benchmark completed")
+
+    def _stat_file(self):
+        return os.path.join(self.shared_dir, 'sem_bench.out')
 
     def _get_stat(self, stat_dict):
         """Parse the benchmark's retrieval-performance summary.
 
         Pulls the [SEM_BENCH] key=value record (query latency to retrieve the
-        top-k blobs, plus ingest stats) out of the benchmark stdout.
+        top-k blobs, plus ingest stats) out of the benchmark output. Reads the
+        shared file written by start() (works in Mode B); falls back to
+        self.exec.stdout for in-process runs.
         """
-        if getattr(self, 'exec', None) is None:
-            return
-        output = '\n'.join(self.exec.stdout.values())
-        # The single machine-readable record: "[SEM_BENCH] k1=v1 k2=v2 ..."
+        output = ''
+        if os.path.exists(self._stat_file()):
+            with open(self._stat_file()) as f:
+                output = f.read()
+        elif getattr(self, 'exec', None) is not None and self.exec.stdout:
+            output = '\n'.join(self.exec.stdout.values())
+        # Strip ANSI color codes the logger emits.
+        output = re.sub(r'\x1b\[[0-9;]*m', '', output)
         line = ''
         for ln in output.splitlines():
             if '[SEM_BENCH]' in ln:
