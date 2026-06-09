@@ -40,17 +40,24 @@ runtime:
 # -- Compose ------------------------------------------------------------------
 # Modules started automatically with the runtime.
 #
-# Default layout puts CAE (clio_cae_core) at pool 512.0 — the address
-# every CTE client targets via clio::cte::core::kCtePoolId — and the
-# CTE core (clio_cte_core) behind it at pool 513.0. CAE forwards
-# GetOrCreateTag / PutBlob / GetBlob through to CTE so the data path
-# is unchanged, but every PutBlob now passes through CAE first. That
-# gives us a single interception point for transparent labeling /
-# indexing / discovery work without any client-side changes.
+# Default layout matches the canonical pool-id constants in the source:
+# CTE core (clio_cte_core) sits at pool 512.0 — the address every CTE
+# client targets via clio::cte::core::kCtePoolId — and CAE
+# (clio_cae_core) sits at its own pool 400.0 (clio::cae::core::kCaePoolId)
+# with next_pool_id pointing at CTE. CAE is the assimilation / discovery
+# entrypoint (CEE -> ParseOmni) and forwards the data path it owns
+# (GetOrCreateTag / PutBlob / GetBlob / SemanticSearch) on to CTE.
 #
-# Only clio_bdev is strictly required. Drop either the CAE or CTE
-# entry if you don't need it (if you drop CAE, change CTE's pool_id
-# back to 512.0 so existing clients continue to resolve).
+# NOTE: do NOT put CAE in front of CTE at 512.0. CAE only mirrors the
+# four data-path method ids above; the rest of its method ids collide
+# with CTE's (e.g. CAE kParseOmni == CTE kRegisterTarget == 10), so a
+# CTE client hitting CAE for RegisterTarget / TagQuery / BlobQuery is
+# dispatched to the wrong handler and crashes. Transparent CTE-client
+# interception therefore lives only in the dedicated interceptor test
+# configs, never in this default.
+#
+# Only clio_bdev is strictly required. Drop the CAE or CTE entry if you
+# don't need it.
 compose:
 
   # === Block Device (DRAM) ===
@@ -71,16 +78,15 @@ compose:
   #   bdev_type: file                    # Options: file, ram, hbm, pinned, noop
   #   capacity: "100GB"
 
-  # === Context Assimilation Engine (CAE) — CTE interceptor ===
-  # Sits at the canonical CTE entrypoint (512.0) and forwards data-path
-  # tasks to the CTE core at 513.0. Forwarding is transparent —
-  # standard CTE clients (CLIO_CTE_CLIENT, FUSE adapter, etc.) work
-  # without modification.
+  # === Context Assimilation Engine (CAE) ===
+  # Assimilation / discovery entrypoint at its own pool 400.0
+  # (clio::cae::core::kCaePoolId). CEE calls ParseOmni here; CAE forwards
+  # the data-path tasks it owns to the CTE core at next_pool_id (512.0).
   - mod_name: clio_cae_core
     pool_name: cae_main
     pool_query: local
-    pool_id: "512.0"
-    next_pool_id: "513.0"               # CTE core pool — see entry below
+    pool_id: "400.0"
+    next_pool_id: "512.0"               # CTE core pool — see entry below
 
     # Transparent LLM labeling — optional. When enabled, PutBlob calls
     # `model` on `label_endpoint` for every blob whose tag+name matches
@@ -98,14 +104,14 @@ compose:
     #     context_length: 4096                  # tokens (Ollama num_ctx)
 
   # === Context Transfer Engine (CTE) ===
-  # High-performance data buffering and transfer engine. Sits behind
-  # CAE at 513.0 so CAE can intercept the data path. Remove this and
-  # the CAE entry above (or change CAE's pool_id to 513.0 and skip
-  # this) if you do not need CTE.
+  # High-performance data buffering and transfer engine. Sits at the
+  # canonical CTE entrypoint 512.0 (clio::cte::core::kCtePoolId) so every
+  # CTE client / FUSE adapter resolves to it directly. Remove this (and
+  # the CAE entry above) if you do not need CTE.
   - mod_name: clio_cte_core
     pool_name: cte_main
     pool_query: local
-    pool_id: "513.0"
+    pool_id: "512.0"
 
     # Storage tiers ---------------------------------------------------------
     # Each entry creates a block device for CTE to buffer data onto.
