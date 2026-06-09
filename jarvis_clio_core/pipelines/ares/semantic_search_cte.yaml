@@ -2,7 +2,7 @@
 #
 # Mirrors ior_cte_baseline.yaml but replaces the FUSE mount + IOR with the
 # clio_cte_semantic_bench client: it writes `blobs` keyword-filled blobs under
-# one tag (distributed across the 4-node CTE pool), then issues ONE broadcast
+# one tag (distributed across the 8-node CTE pool), then issues ONE broadcast
 # SemanticSearch, exercising the broadcast -> SemanticSearchTask::Aggregate
 # (merge-by-score) path across every tag-owning container.
 #
@@ -21,7 +21,7 @@ env:
 scheduler:
   name: slurm
   job_name: sem_cte
-  nodes: 4
+  nodes: 8
   ntasks_per_node: 1
   cpus_per_task: 32
   partition: compute
