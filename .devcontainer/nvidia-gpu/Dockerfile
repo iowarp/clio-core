@@ -36,6 +36,56 @@ RUN set -eux; \
     ldconfig; \
     rm -rf /tmp/nvcomp*
 
+# Scientific-data GPU compressors that back two more entries in the GPU
+# compression factory (ctp::Cusz / ctp::Ndzip), complementing nvcomp's
+# general-purpose byte codecs. Both are built from source against the CUDA 12
+# toolkit and installed into /usr/local so the root CMake auto-detects them
+# (CLIO_CTP_ENABLE_CUSZ / CLIO_CTP_ENABLE_NDZIP):
+#   - cuSZ  (szcompressor/cuSZ)  : error-bounded LOSSY float compression
+#   - ndzip (celerity/ndzip)     : high-throughput LOSSLESS float compression
+# ndzip has no upstream Spack/apt package, so source-building it here is the only
+# option; cuSZ is also a Spack package (see installers/spack) but is source-built
+# here to match the nvcomp/zfp-sycl pattern. Target SM versions are overridable
+# (default spans Volta..Hopper).
+ARG CUDA_ARCHS="70;75;80;86;89;90"
+
+# cuSZ - GPU error-bounded lossy compressor. Pinned to master; the ctp::Cusz
+# wrapper targets cuSZ's psz_* resource-manager C API.
+RUN set -eux; \
+    cd /tmp; \
+    git clone --depth 1 https://github.com/szcompressor/cuSZ.git cusz_src; \
+    cmake -S cusz_src -B cusz_src/build \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX=/usr/local \
+      -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHS}" \
+      -DPSZ_BACKEND=cuda \
+      -DPSZ_BUILD_EXAMPLES=off \
+      -DBUILD_TESTING=off \
+      -DCMAKE_POLICY_VERSION_MINIMUM=3.5; \
+    cmake --build cusz_src/build -j"$(nproc)"; \
+    cmake --install cusz_src/build; \
+    ldconfig; \
+    rm -rf /tmp/cusz_src
+
+# ndzip - GPU high-throughput lossless compressor (CUDA backend).
+# NDZIP_WITH_CUDA=ON builds the ndzip-cuda library the ctp::Ndzip wrapper links.
+RUN set -eux; \
+    cd /tmp; \
+    git clone --depth 1 https://github.com/celerity/ndzip.git ndzip_src; \
+    cmake -S ndzip_src -B ndzip_src/build \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX=/usr/local \
+      -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHS}" \
+      -DNDZIP_WITH_CUDA=ON \
+      -DNDZIP_WITH_MT=OFF \
+      -DNDZIP_BUILD_BENCHMARK=OFF \
+      -DNDZIP_BUILD_TEST=OFF \
+      -DCMAKE_POLICY_VERSION_MINIMUM=3.5; \
+    cmake --build ndzip_src/build -j"$(nproc)"; \
+    cmake --install ndzip_src/build; \
+    ldconfig; \
+    rm -rf /tmp/ndzip_src
+
 # Intel oneAPI 2024.2 (SYCL/DPC++) toolchain for the GPU compression factory's
 # SYCL backend (zfp's SYCL execution policy, mirroring how nvcomp backs the CUDA
 # path). Pinned to 2024.2 on purpose: the zfp SYCL port
