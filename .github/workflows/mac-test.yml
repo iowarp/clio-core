@@ -73,10 +73,12 @@ jobs:
 
           # Mirror the coverage build's option overrides so we exercise the
           # same test set CDash reported failing, minus coverage tooling
-          # (lcov/gcov is Linux-only). SITE/BUILDNAME label the CDash build.
+          # (lcov/gcov is Linux-only). SITE/BUILDNAME label the CDash build:
+          # SITE is the runner, BUILDNAME the standard config label
+          # (cnd = conda deps, d = debug).
           cmake --preset=debug \
             -DSITE="${{ matrix.os }}" \
-            -DBUILDNAME="mac-test-${{ matrix.os }}" \
+            -DBUILDNAME="cnd/d" \
             -DCLIO_CORE_ENABLE_COVERAGE=OFF \
             -DCLIO_CORE_ENABLE_CONDA=ON \
             -DCLIO_CORE_ENABLE_DOCKER_CI=OFF \
