@@ -50,4 +50,4 @@ jobs:
         ./CI/run_sanitizers.sh \
           --${{ matrix.sanitizer }} \
           --build \
-          --site "ubu-24.amd64-${{ matrix.sanitizer }}"
+          --site "ubu-24.amd64"
