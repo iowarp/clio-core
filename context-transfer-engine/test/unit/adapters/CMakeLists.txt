@@ -24,3 +24,10 @@ endif()
 if(CLIO_CTE_ENABLE_FUSE_ADAPTER)
     add_subdirectory(libfuse)
 endif()
+
+# HDF5 VOL connector tests (doesn't require ELF or a running runtime).
+# The TARGET guard skips them when the connector itself was skipped
+# (HDF5 missing or < 1.14).
+if(CLIO_CTE_ENABLE_HDF5_VOL AND TARGET iowarp_hdf5_vol)
+    add_subdirectory(hdf5_vol)
+endif()

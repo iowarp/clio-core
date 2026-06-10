@@ -662,20 +662,39 @@ if(CLIO_CTE_ENABLE_HDF5_VOL)
         find_package(HDF5 COMPONENTS C QUIET)
     endif()
     if(HDF5_FOUND)
-        message(STATUS "found HDF5 at ${HDF5_INCLUDE_DIRS}")
-
         # Ensure HDF5_LIBRARIES is set for both CONFIG and MODULE mode
         if(NOT HDF5_LIBRARIES)
-            # CONFIG mode creates targets but may not set HDF5_LIBRARIES
-            # Prefer shared libraries over static for better compatibility
+            # CONFIG mode creates targets but may not set HDF5_LIBRARIES.
+            # HDF5's own hdf5-config.cmake (used by vcpkg and HDF Group
+            # binary installs) only exports namespaced hdf5::hdf5-{shared,
+            # static} targets, so check those too (issue #518: the VOL
+            # connector DLL linked without hdf5.lib on Windows/vcpkg).
+            # Prefer shared libraries over static for better compatibility.
             if(TARGET HDF5::HDF5)
                 set(HDF5_LIBRARIES HDF5::HDF5)
+            elseif(TARGET hdf5::hdf5-shared)
+                set(HDF5_LIBRARIES hdf5::hdf5-shared)
             elseif(TARGET hdf5-shared)
                 set(HDF5_LIBRARIES hdf5-shared)
+            elseif(TARGET hdf5::hdf5-static)
+                set(HDF5_LIBRARIES hdf5::hdf5-static)
             elseif(TARGET hdf5-static)
                 set(HDF5_LIBRARIES hdf5-static)
             endif()
         endif()
+        if(NOT HDF5_LIBRARIES)
+            message(FATAL_ERROR "HDF5 found but no linkable HDF5 target/"
+                                "library was identified (HDF5_DIR=${HDF5_DIR})")
+        endif()
+
+        # hdf5-config.cmake sets HDF5_INCLUDE_DIR (singular); consumers in
+        # this project use HDF5_INCLUDE_DIRS.
+        if(NOT HDF5_INCLUDE_DIRS AND HDF5_INCLUDE_DIR)
+            set(HDF5_INCLUDE_DIRS ${HDF5_INCLUDE_DIR})
+        endif()
+
+        message(STATUS "found HDF5 ${HDF5_VERSION} at '${HDF5_INCLUDE_DIRS}' "
+                       "(libraries: ${HDF5_LIBRARIES})")
 
         # libhdf5.so (system package) depends on libcurl internally;
         # the linker needs it listed explicitly due to --as-needed.
