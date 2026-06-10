@@ -238,12 +238,17 @@ void Worker::Run() {
   SetAsCurrentWorker();
   is_running_ = true;
 
-  // Set up thread ID and signal event via EventManager
+  // Set up the signal event BEFORE publishing the tid. AwakenWorker
+  // tgkill(SIGUSR1)s any published tid unconditionally; if a producer fires
+  // in the window between SetTid and AddSignalEvent (which blocks SIGUSR1
+  // on this thread), the default disposition kills the whole process
+  // (issue #520). On Windows the same order matters for liveness: Signal()
+  // on a tid without a registered event is a lost wakeup.
   int tid = ctp::SystemInfo::GetTid();
+  event_manager_.AddSignalEvent(nullptr);
   if (assigned_lane_) {
     assigned_lane_->SetTid(tid);
   }
-  event_manager_.AddSignalEvent(nullptr);
 
   // Main worker loop - process tasks from assigned lane
   while (is_running_) {

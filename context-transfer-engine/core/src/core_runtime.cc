@@ -665,7 +665,10 @@ chi::TaskResume Runtime::UnregisterTarget(
         CLIO_CO_RETURN;
       }
 
-      const chi::PoolId &target_id = *target_id_ptr;
+      // Copy by value: target_id_ptr points into the map node that
+      // erase(target_name) below frees, and target_id is still read in the
+      // target_list_ loop after that (ASan heap-use-after-free, issue #520).
+      const chi::PoolId target_id = *target_id_ptr;
       if (!registered_targets_.contains(target_id)) {
         task->return_code_ = 1;
         CLIO_CO_RETURN;
