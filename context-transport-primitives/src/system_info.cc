@@ -284,7 +284,10 @@ int SystemInfo::GetTid() {
 int SystemInfo::GetPid() {
 #if CTP_ENABLE_PROCFS_SYSINFO
 #ifdef SYS_getpid
-#ifdef __OpenBSD__
+#if defined(__OpenBSD__) || defined(__APPLE__)
+  // syscall(2) is deprecated on macOS; getpid() is the supported interface and
+  // is not subject to the fork-caching issue this raw syscall historically
+  // worked around on glibc.
   return (pid_t)getpid();
 #else
   return (pid_t)syscall(SYS_getpid);

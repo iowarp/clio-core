@@ -119,7 +119,7 @@ chi::TaskResume Runtime::Create(ctp::ipc::FullPtr<CreateTask> task,
   // Start dedicated recv threads in IpcManagerRun2Run.
   CLIO_IPC->GetRun2Run()->StartRecvThreads();
   // Stop recv threads before the main transport is freed.
-  CLIO_IPC->RegisterTransportShutdownHook([this]() {
+  CLIO_IPC->RegisterTransportShutdownHook([]() {
     CLIO_IPC->GetRun2Run()->StopRecvThreads();
   });
 

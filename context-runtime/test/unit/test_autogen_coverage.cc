@@ -12070,7 +12070,16 @@ TEST_CASE("Autogen - PoolQuery copy and assignment", "[autogen][poolquery][copy]
 
   SECTION("Self assignment") {
     auto q1 = chi::PoolQuery::Physical(42);
+    // Intentional self-assignment to exercise operator=; silence the
+    // expected -Wself-assign-overloaded diagnostic.
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wself-assign-overloaded"
+#endif
     q1 = q1;
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
     REQUIRE(q1.IsPhysicalMode());
     REQUIRE(q1.GetNodeId() == 42);
     INFO("PoolQuery self assignment completed");

@@ -516,7 +516,7 @@ TEST_F(UnorderedMapLLTest, ConcurrentInsertReadNoExternalLock) {
 
   // Inserter threads: disjoint key ranges, deterministic values.
   for (int t = 0; t < num_inserters; ++t) {
-    threads.emplace_back([&map, t, keys_per_inserter]() {
+    threads.emplace_back([&map, t]() {
       const int begin = t * keys_per_inserter;
       const int end = begin + keys_per_inserter;
       for (int k = begin; k < end; ++k) {

@@ -356,7 +356,15 @@ if(CLIO_CTP_ENABLE_IO_URING)
         endif()
         message(STATUS "io_uring enabled: ${URING_INCLUDE_DIR} / ${URING_LIBRARY}")
     else()
-        message(WARNING "io_uring requested but liburing not found, disabling io_uring")
+        if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+            # On Linux a missing liburing is actionable (install liburing-dev),
+            # so surface it as a warning.
+            message(WARNING "io_uring requested but liburing not found, disabling io_uring")
+        else()
+            # io_uring is a Linux-only kernel interface and can never be present
+            # on macOS/Windows/BSD, so this is expected, not a misconfiguration.
+            message(STATUS "io_uring unavailable on ${CMAKE_SYSTEM_NAME}, disabling io_uring")
+        endif()
         set(CLIO_CTP_ENABLE_IO_URING OFF)
     endif()
 endif()
