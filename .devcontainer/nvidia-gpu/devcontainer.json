@@ -23,9 +23,9 @@
         "ASAN_OPTIONS": "protect_shadow_gap=0"
     },
     "mounts": [
-        "source=${localEnv:HOME}/.ssh,target=/tmp/host-ssh,type=bind,readonly",
-        "source=${localEnv:HOME}/.claude,target=/tmp/host-claude,type=bind,readonly",
-        "source=${localEnv:HOME}/.claude.json,target=/tmp/host-claude.json,type=bind,readonly",
+        "source=${localEnv:USERPROFILE}/.ssh,target=/tmp/host-ssh,type=bind,readonly",
+        "source=${localEnv:USERPROFILE}/.claude,target=/tmp/host-claude,type=bind,readonly",
+        "source=${localEnv:USERPROFILE}/.claude.json,target=/tmp/host-claude.json,type=bind,readonly",
         "source=/var/run/docker.sock,target=/var/run/docker.sock,type=bind"
     ],
     "runArgs": [
@@ -33,7 +33,6 @@
         "--gpus=all"
     ],
     "updateRemoteUserUID": true,
-    "initializeCommand": "bash -c 'umask 077 && mkdir -p ~/.ssh ~/.claude && chmod 700 ~/.ssh && touch ~/.claude.json'",
     // NOTE: If container fails to start with GPU error, run on host:
     //   sudo apt-get install -y nvidia-container-toolkit
     //   sudo nvidia-ctk runtime configure --runtime=docker

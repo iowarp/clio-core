@@ -52,6 +52,8 @@ RUN set -eux; \
     echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" \
       > /etc/apt/sources.list.d/oneAPI.list; \
     apt-get update; \
+    dpkg -P --force-all hipcc hip-dev hip-runtime-amd rocm-llvm hsa-rocr-dev rocm-device-libs || true; \
+    DEBIAN_FRONTEND=noninteractive apt-get --fix-broken install -y; \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       intel-oneapi-compiler-dpcpp-cpp-2024.2 \
       intel-oneapi-dpcpp-ct-2024.2 \
@@ -80,6 +82,7 @@ RUN set -eux; \
     git clone --depth 1 -b "${ZFP_SYCL_REF}" https://github.com/alpers-git/zfp.git /tmp/zfp; \
     dpct_inc="$(dirname "$(dirname "$(find /opt/intel/oneapi/dpcpp-ct -name dpct.hpp | head -1)")")"; \
     dpl_inc="$(dirname "$(dirname "$(dirname "$(find /opt/intel/oneapi/dpl -path '*oneapi/dpl/execution' | head -1)")")")"; \
+    if [ -d /opt/adaptivecpp ]; then mv /opt/adaptivecpp /opt/adaptivecpp_hidden; fi; \
     cmake -S /tmp/zfp -B /tmp/zfp/build -DCMAKE_BUILD_TYPE=Release -DZFP_WITH_SYCL=1 \
       -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx \
       -DCMAKE_CXX_FLAGS="-I${dpct_inc} -I${dpl_inc}" \
@@ -88,7 +91,8 @@ RUN set -eux; \
     mkdir -p /opt/zfp-sycl/lib /opt/zfp-sycl/include; \
     cp -a /tmp/zfp/build/lib/libzfp.so* /opt/zfp-sycl/lib/; \
     cp -a /tmp/zfp/include/. /opt/zfp-sycl/include/; \
-    rm -rf /tmp/zfp
+    rm -rf /tmp/zfp; \
+    if [ -d /opt/adaptivecpp_hidden ]; then mv /opt/adaptivecpp_hidden /opt/adaptivecpp; fi
 
 # Prefer the SYCL libzfp at runtime (must come before /usr/lib's stock libzfp on
 # the loader path; oneAPI libs are already on LD_LIBRARY_PATH via setvars above,
