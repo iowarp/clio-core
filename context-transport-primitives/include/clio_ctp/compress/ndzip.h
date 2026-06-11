@@ -37,12 +37,15 @@
 #if CTP_ENABLE_COMPRESS && CTP_ENABLE_NDZIP
 
 #include <cuda_runtime.h>
+
+// These MUST precede the ndzip headers: ndzip/ndzip.hh uses assert() and
+// unqualified size()/data() (std::) but relies on its includer for them.
+#include <cassert>
+#include <cstdint>
+#include <iterator>
+
 #include <ndzip/cuda.hh>
 #include <ndzip/ndzip.hh>
-
-#include <cassert>   // ndzip/ndzip.hh uses assert() without including <cassert>
-#include <cstdint>
-#include <iterator>  // ndzip/ndzip.hh uses unqualified size()/data() (std::)
 
 #include "compress.h"
 

@@ -69,36 +69,44 @@ RUN set -eux; \
     rm -rf /tmp/cusz_src
 
 # ndzip - GPU high-throughput lossless compressor (CUDA backend).
-# NDZIP_WITH_CUDA=ON builds the ndzip-cuda library the ctp::Ndzip wrapper links.
 #
-# NON-FATAL on purpose. ndzip's CUDA device sources currently fail to compile
-# under this image's CUDA 12.6 + GCC 13 toolchain (an nvcc/libstdc++ '__noinline__'
-# expansion clash in ndzip's own .cu files; verified that minimal CUDA TUs and the
-# cuSZ build above are unaffected, so it is specific to ndzip's source on CUDA 12.6,
-# not a defect in the ctp::Ndzip wrapper, which compiles cleanly against ndzip's
-# headers). Building ndzip is gated behind `|| true` so a failure does NOT abort the
-# image build: the root CMake auto-detects ndzip and simply leaves CLIO_CTP_ENABLE_NDZIP
-# OFF when the library is absent, disabling only the "ndzip" factory entry. To enable
-# ndzip, build this image on a CUDA toolkit that compiles ndzip (e.g. CUDA 12.8, the
-# toolkit already used for sm_120/Blackwell GPUs) and the same step will install it.
-RUN { set -x; \
+# Built with CLANG as the CUDA compiler (clang++ -x cuda), per ndzip's own build
+# docs -- NOT nvcc. nvcc's crt/host_defines.h defines __noinline__ as a macro
+# (__attribute__((noinline))) that nests illegally inside libstdc++'s own
+# __attribute__((__noinline__)) when ndzip's device TUs pull in <memory>/<string>,
+# so the nvcc build fails (ndzip ships a single #undef workaround that is mis-
+# ordered for this toolchain). clang-18 (already installed above for CUDA kernels)
+# does not have that macro and compiles ndzip cleanly. Notes:
+#   - libomp (clang OpenMP) is required by ndzip's CPU codec (cpu_codec.inl).
+#   - -march=native is recommended by ndzip's docs (affects the host/CPU codec; the
+#     CUDA kernels are arch-targeted via CMAKE_CUDA_ARCHITECTURES). Relax it if this
+#     image must run on a different CPU than it was built on.
+#   - ndzip ships no install() rules, so the libs + headers are copied manually.
+#   - clang-18 targets up to sm_90; PTX from the highest arch JITs forward to newer
+#     GPUs (e.g. sm_120 / Blackwell) at runtime.
+RUN set -eux; \
+    apt-get update && apt-get install -y --no-install-recommends libomp-18-dev; \
+    rm -rf /var/lib/apt/lists/*; \
     cd /tmp; \
     git clone --depth 1 --recurse-submodules --shallow-submodules \
-      https://github.com/celerity/ndzip.git ndzip_src && \
+      https://github.com/celerity/ndzip.git ndzip_src; \
     cmake -S ndzip_src -B ndzip_src/build \
       -DCMAKE_BUILD_TYPE=Release \
-      -DCMAKE_INSTALL_PREFIX=/usr/local \
+      -DCMAKE_C_COMPILER=clang-18 -DCMAKE_CXX_COMPILER=clang++-18 \
+      -DCMAKE_CUDA_COMPILER=clang++-18 \
       -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHS}" \
+      -DCMAKE_CXX_FLAGS="-march=native" \
+      -DCMAKE_CUDA_FLAGS="--cuda-path=${CUDA_HOME} -Wno-unknown-cuda-version" \
       -DNDZIP_WITH_CUDA=ON \
       -DNDZIP_WITH_MT=OFF \
       -DNDZIP_BUILD_BENCHMARK=OFF \
       -DNDZIP_BUILD_TEST=OFF \
-      -DCMAKE_POLICY_VERSION_MINIMUM=3.5 && \
-    cmake --build ndzip_src/build -j"$(nproc)" && \
-    cmake --install ndzip_src/build && ldconfig && \
-    echo "ndzip: installed"; \
-  } || echo "WARNING: ndzip build failed (likely the CUDA 12.6 + GCC 13 noinline clash) - ndzip GPU compressor will be DISABLED (auto-detected OFF). See comment above."; \
-  rm -rf /tmp/ndzip_src
+      -DCMAKE_POLICY_VERSION_MINIMUM=3.5; \
+    cmake --build ndzip_src/build -j"$(nproc)"; \
+    cp ndzip_src/build/libndzip.so ndzip_src/build/libndzip-cuda.so /usr/local/lib/; \
+    cp -r ndzip_src/include/ndzip /usr/local/include/; \
+    ldconfig; \
+    rm -rf /tmp/ndzip_src
 
 # Intel oneAPI 2024.2 (SYCL/DPC++) toolchain for the GPU compression factory's
 # SYCL backend (zfp's SYCL execution policy, mirroring how nvcomp backs the CUDA
