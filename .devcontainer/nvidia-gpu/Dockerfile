@@ -70,10 +70,21 @@ RUN set -eux; \
 
 # ndzip - GPU high-throughput lossless compressor (CUDA backend).
 # NDZIP_WITH_CUDA=ON builds the ndzip-cuda library the ctp::Ndzip wrapper links.
-RUN set -eux; \
+#
+# NON-FATAL on purpose. ndzip's CUDA device sources currently fail to compile
+# under this image's CUDA 12.6 + GCC 13 toolchain (an nvcc/libstdc++ '__noinline__'
+# expansion clash in ndzip's own .cu files; verified that minimal CUDA TUs and the
+# cuSZ build above are unaffected, so it is specific to ndzip's source on CUDA 12.6,
+# not a defect in the ctp::Ndzip wrapper, which compiles cleanly against ndzip's
+# headers). Building ndzip is gated behind `|| true` so a failure does NOT abort the
+# image build: the root CMake auto-detects ndzip and simply leaves CLIO_CTP_ENABLE_NDZIP
+# OFF when the library is absent, disabling only the "ndzip" factory entry. To enable
+# ndzip, build this image on a CUDA toolkit that compiles ndzip (e.g. CUDA 12.8, the
+# toolkit already used for sm_120/Blackwell GPUs) and the same step will install it.
+RUN { set -x; \
     cd /tmp; \
     git clone --depth 1 --recurse-submodules --shallow-submodules \
-      https://github.com/celerity/ndzip.git ndzip_src; \
+      https://github.com/celerity/ndzip.git ndzip_src && \
     cmake -S ndzip_src -B ndzip_src/build \
       -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_INSTALL_PREFIX=/usr/local \
@@ -82,11 +93,12 @@ RUN set -eux; \
       -DNDZIP_WITH_MT=OFF \
       -DNDZIP_BUILD_BENCHMARK=OFF \
       -DNDZIP_BUILD_TEST=OFF \
-      -DCMAKE_POLICY_VERSION_MINIMUM=3.5; \
-    cmake --build ndzip_src/build -j"$(nproc)"; \
-    cmake --install ndzip_src/build; \
-    ldconfig; \
-    rm -rf /tmp/ndzip_src
+      -DCMAKE_POLICY_VERSION_MINIMUM=3.5 && \
+    cmake --build ndzip_src/build -j"$(nproc)" && \
+    cmake --install ndzip_src/build && ldconfig && \
+    echo "ndzip: installed"; \
+  } || echo "WARNING: ndzip build failed (likely the CUDA 12.6 + GCC 13 noinline clash) - ndzip GPU compressor will be DISABLED (auto-detected OFF). See comment above."; \
+  rm -rf /tmp/ndzip_src
 
 # Intel oneAPI 2024.2 (SYCL/DPC++) toolchain for the GPU compression factory's
 # SYCL backend (zfp's SYCL execution policy, mirroring how nvcomp backs the CUDA
