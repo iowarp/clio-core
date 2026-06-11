@@ -38,6 +38,13 @@
 #include <cerrno>
 #include <cstring>
 
+// Linux suppresses SIGPIPE per-write via this send() flag; macOS/BSD lack it
+// and use the SO_NOSIGPIPE socket option (see SetNoSigPipe) instead, so define
+// it to 0 there to keep SendV() portable.
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
+
 namespace ctp::lbm::sock {
 
 void InitSocketLib() {
@@ -89,6 +96,19 @@ void SetRecvBuf(socket_t fd, int size) {
   ::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &size, sizeof(size));
 }
 
+void SetNoSigPipe(socket_t fd) {
+#ifdef SO_NOSIGPIPE
+  // macOS / *BSD: make writes on this fd fail with EPIPE rather than raise
+  // SIGPIPE (whose default disposition terminates the process) when the peer
+  // has closed. Linux has no SO_NOSIGPIPE and relies on MSG_NOSIGNAL in
+  // SendV() instead.
+  int on = 1;
+  ::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof(on));
+#else
+  (void)fd;
+#endif
+}
+
 void UnlinkPath(const char* path) {
   ::unlink(path);
 }
@@ -111,7 +131,14 @@ ssize_t SendV(socket_t fd, const IoBuffer* iov, int count) {
   int iov_idx = 0;
 
   while (sent < total) {
-    ssize_t n = ::writev(fd, local_iov + iov_idx, local_count - iov_idx);
+    // sendmsg (vs writev) lets us pass MSG_NOSIGNAL so a write to a peer that
+    // has closed returns EPIPE instead of raising SIGPIPE on Linux; macOS/BSD
+    // get the same guarantee from SO_NOSIGPIPE set in SetNoSigPipe().
+    struct msghdr msg;
+    std::memset(&msg, 0, sizeof(msg));
+    msg.msg_iov = local_iov + iov_idx;
+    msg.msg_iovlen = local_count - iov_idx;
+    ssize_t n = ::sendmsg(fd, &msg, MSG_NOSIGNAL);
     if (n < 0) {
       if (errno == EINTR) continue;
       if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -231,12 +258,14 @@ socket_t Connect(const std::string& addr, int port,
       Close(fd);
       return kInvalidSocket;
     }
+    SetNoSigPipe(fd);
     return fd;
   }
   socket_t fd = ::socket(AF_INET, SOCK_STREAM, 0);
   if (fd == kInvalidSocket) return kInvalidSocket;
   SetTcpNoDelay(fd);
   SetSendBuf(fd, 4 * 1024 * 1024);
+  SetNoSigPipe(fd);
   struct sockaddr_in sin;
   std::memset(&sin, 0, sizeof(sin));
   sin.sin_family = AF_INET;
@@ -291,7 +320,11 @@ socket_t Listen(const std::string& addr, int port,
 }
 
 socket_t Accept(socket_t listen_fd) {
-  return ::accept(listen_fd, nullptr, nullptr);
+  socket_t fd = ::accept(listen_fd, nullptr, nullptr);
+  if (fd != kInvalidSocket) {
+    SetNoSigPipe(fd);
+  }
+  return fd;
 }
 
 uint32_t HostToNet32(uint32_t host) { return htonl(host); }

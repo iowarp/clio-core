@@ -146,6 +146,11 @@ void SetRecvBuf(socket_t fd, int size) {
                reinterpret_cast<const char*>(&size), sizeof(size));
 }
 
+void SetNoSigPipe(socket_t fd) {
+  // Windows has no SIGPIPE; failed sends surface as WSAECONNRESET return codes.
+  (void)fd;
+}
+
 void UnlinkPath(const char* path) {
   DeleteFileA(path);
 }

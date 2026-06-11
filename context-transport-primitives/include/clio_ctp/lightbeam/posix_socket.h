@@ -91,6 +91,14 @@ CTP_DLL void SetReuseAddr(socket_t fd);
 CTP_DLL void SetSendBuf(socket_t fd, int size);
 CTP_DLL void SetRecvBuf(socket_t fd, int size);
 
+/** Prevent writes to this socket from raising SIGPIPE when the peer has
+ *  closed the connection. On macOS/BSD this sets the SO_NOSIGPIPE socket
+ *  option; on Linux SendV() passes MSG_NOSIGNAL per write instead, so this is
+ *  a no-op there (and on Windows, which has no SIGPIPE). Without it, writing
+ *  to a dead peer terminates the process via SIGPIPE's default disposition on
+ *  macOS. */
+CTP_DLL void SetNoSigPipe(socket_t fd);
+
 /** Initialize platform socket library (WSAStartup on Windows, no-op on POSIX) */
 CTP_DLL void InitSocketLib();
 
