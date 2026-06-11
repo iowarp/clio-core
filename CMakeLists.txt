@@ -975,12 +975,20 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
-# For multi-config generators (Visual Studio, Xcode)
+# For multi-config generators (Visual Studio, Xcode), keep runtime artifacts
+# (.exe/.dll) in a flat bin/ for every configuration: tests and the module
+# loader resolve binaries at ${CMAKE_BINARY_DIR}/bin regardless of config.
+# Archives (static libs and DLL import libs) must NOT be flattened: they are
+# link-time-only inputs, and sharing one bin/<name>.lib across configurations
+# lets a Release build clobber the Debug archive (and vice versa), which then
+# fails the next Debug link with LNK2038 runtime-library mismatches (#528).
+# Leaving the per-config archive variables unset makes multi-config
+# generators append a per-configuration subdirectory (bin/Debug, bin/Release)
+# to CMAKE_ARCHIVE_OUTPUT_DIRECTORY automatically.
 foreach(OUTPUTCONFIG ${CMAKE_CONFIGURATION_TYPES})
     string(TOUPPER ${OUTPUTCONFIG} OUTPUTCONFIG)
     set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_${OUTPUTCONFIG} ${CMAKE_BINARY_DIR}/bin)
     set(CMAKE_LIBRARY_OUTPUT_DIRECTORY_${OUTPUTCONFIG} ${CMAKE_BINARY_DIR}/bin)
-    set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY_${OUTPUTCONFIG} ${CMAKE_BINARY_DIR}/bin)
 endforeach()
 
 #------------------------------------------------------------------------------

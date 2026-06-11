@@ -32,6 +32,21 @@ target_link_libraries(clio_run
   PUBLIC clio_run_commands
 )
 
+# Regression test for issue #528: on multi-config generators, static
+# archives must land in per-configuration directories (bin/<CONFIG>) so a
+# Release build cannot clobber the Debug archive and poison the next Debug
+# link, while executables stay in the flat bin/ layout tests depend on.
+if(CLIO_CORE_ENABLE_TESTS AND CMAKE_CONFIGURATION_TYPES)
+  add_test(NAME build_layout_per_config_archives
+    COMMAND ${CMAKE_COMMAND}
+      -DARCHIVE_FILE=$<TARGET_FILE:clio_run_commands>
+      -DEXE_FILE=$<TARGET_FILE:clio_run>
+      -DBIN_DIR=${CMAKE_BINARY_DIR}/bin
+      -DCONFIG=$<CONFIG>
+      -P ${CMAKE_SOURCE_DIR}/cmake/CheckPerConfigArchiveLayout.cmake
+  )
+endif()
+
 # Install the binary under its canonical name `clio_run`. The legacy name
 # `chimaera` (predates the CLIO rebrand) is installed as a symlink in the
 # same bin/ dir so existing pipelines and scripts keep working. The binary
