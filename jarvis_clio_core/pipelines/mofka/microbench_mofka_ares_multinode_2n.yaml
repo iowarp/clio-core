@@ -1,0 +1,55 @@
+# Mofka Benchmark — Ares Multi-Node FULL SWEEP, 2 nodes, TCP (Pattern A: manual sbatch)
+#
+# Topology: 1 bedrock server (batch/head node, LocalExecInfo) + 1 client node
+# (PSSH). The .sbatch sets the jarvis hostfile to both nodes; mofka_bench drops
+# the server host so producer/consumer run only on the client node. Per-host
+# stat fold (mofka_bench._fold_host_stats) SUMs throughput/events/data and
+# MAXes wall time across client hosts (degenerate single client here).
+#
+# Sweep: 5 data sizes x 3 thread counts x 3 repeats = 45 runs.
+# Run the 2n smoke variant first.
+#
+# Pattern A: one 2-node allocation, sweep runs in-process via `jarvis ppl run
+# yaml` (no jarvis scheduler block). See pipelines/mofka/architecture_decisions.md.
+#
+# Submit with: sbatch jarvis_clio_core/pipelines/mofka/run_ares_mofka_multinode_2n.sbatch
+# Output: mofka_bench_2n_<jobid>.log
+#
+# Time budget: 45 runs x ~30s + bedrock startup + PSSH startup variance.
+# 3 h ceiling leaves slack.
+
+config:
+  name: mofka_bench_ares_multinode_2n
+  ssh_cmd: "env -u LD_LIBRARY_PATH ssh"
+  pkgs:
+    - pkg_type: jarvis_clio_core.mofka_server
+      pkg_name: mofka_srv
+      protocol: "tcp"
+      workdir: "${HOME}/mofka-bench-tmp"
+      topic: "benchmark_topic"
+      partition_type: "memory"
+
+    - pkg_type: jarvis_clio_core.mofka_bench
+      pkg_name: mofka_bench
+      mode: "both"
+      num_events: 1000
+      data_size: 1024
+      metadata_size: 64
+      batch_size: 16
+      num_threads: 1
+      data_selectivity: 1.0
+      use_progress_thread: true
+      nprocs: 1
+      ppn: 1
+
+vars:
+  mofka_bench.data_size: [256, 1024, 4096, 16384, 65536]
+  mofka_bench.num_threads: [1, 2, 4]
+
+loop:
+  - [mofka_bench.data_size]
+  - [mofka_bench.num_threads]
+
+repeat: 3
+
+output: "${HOME}/mofka_bench_ares_multinode_2n_results"

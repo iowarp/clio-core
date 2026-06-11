@@ -1,0 +1,51 @@
+# Mofka Benchmark — Ares Single-Node FULL SWEEP (Pattern A: manual sbatch, in-process)
+#
+# 45-run producer/consumer sweep on one Ares compute node, TCP transport,
+# memory partition. Run the smoke variant first to confirm the env is healthy.
+#
+# Sweep: 5 data sizes x 3 thread counts x 3 repeats = 45 runs.
+#
+# Pattern A: one allocation, sweep runs in-process via `jarvis ppl run yaml`
+# (no jarvis scheduler block — that would submit one job per iteration, which
+# fails on Ares). See pipelines/mofka/architecture_decisions.md.
+#
+# Submit with:  sbatch jarvis_clio_core/pipelines/mofka/run_ares_mofka.sbatch
+# Monitor with: squeue -u $USER     Output: mofka_bench_<jobid>.log
+#
+# Time budget: 45 runs x ~30s + per-iteration bedrock startup ≈ 30 min.
+# 2 h ceiling leaves slack for startup variance and outliers.
+
+config:
+  name: mofka_bench_ares
+  pkgs:
+    - pkg_type: jarvis_clio_core.mofka_server
+      pkg_name: mofka_srv
+      protocol: "tcp"
+      workdir: "/mnt/nvme/$USER/mofka-bench"
+      topic: "benchmark_topic"
+      partition_type: "memory"
+
+    - pkg_type: jarvis_clio_core.mofka_bench
+      pkg_name: mofka_bench
+      mode: "both"
+      num_events: 1000
+      data_size: 1024
+      metadata_size: 64
+      batch_size: 16
+      num_threads: 1
+      data_selectivity: 1.0
+      use_progress_thread: true
+      nprocs: 1
+      ppn: 1
+
+vars:
+  mofka_bench.data_size: [256, 1024, 4096, 16384, 65536]
+  mofka_bench.num_threads: [1, 2, 4]
+
+loop:
+  - [mofka_bench.data_size]
+  - [mofka_bench.num_threads]
+
+repeat: 3
+
+output: "${HOME}/mofka_bench_ares_results"
