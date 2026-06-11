@@ -40,7 +40,9 @@
 #include <ndzip/cuda.hh>
 #include <ndzip/ndzip.hh>
 
+#include <cassert>   // ndzip/ndzip.hh uses assert() without including <cassert>
 #include <cstdint>
+#include <iterator>  // ndzip/ndzip.hh uses unqualified size()/data() (std::)
 
 #include "compress.h"
 

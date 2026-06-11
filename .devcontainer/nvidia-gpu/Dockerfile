@@ -53,7 +53,8 @@ ARG CUDA_ARCHS="70;75;80;86;89;90"
 # wrapper targets cuSZ's psz_* resource-manager C API.
 RUN set -eux; \
     cd /tmp; \
-    git clone --depth 1 https://github.com/szcompressor/cuSZ.git cusz_src; \
+    git clone --depth 1 --recurse-submodules --shallow-submodules \
+      https://github.com/szcompressor/cuSZ.git cusz_src; \
     cmake -S cusz_src -B cusz_src/build \
       -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_INSTALL_PREFIX=/usr/local \
@@ -71,7 +72,8 @@ RUN set -eux; \
 # NDZIP_WITH_CUDA=ON builds the ndzip-cuda library the ctp::Ndzip wrapper links.
 RUN set -eux; \
     cd /tmp; \
-    git clone --depth 1 https://github.com/celerity/ndzip.git ndzip_src; \
+    git clone --depth 1 --recurse-submodules --shallow-submodules \
+      https://github.com/celerity/ndzip.git ndzip_src; \
     cmake -S ndzip_src -B ndzip_src/build \
       -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_INSTALL_PREFIX=/usr/local \
