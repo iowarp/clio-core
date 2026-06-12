@@ -1,0 +1,130 @@
+# CMakeLists.txt for clio_run CLI command unit tests
+# Tests the clio_run_commands static library (refresh/monitor/compose/
+# migrate/start/stop) plus the clio_run binary's argument dispatch.
+cmake_minimum_required(VERSION 3.10)
+
+# POSIX-only: the test drives the clio_run binary as a subprocess and
+# inspects exit codes via <sys/wait.h>.
+if(NOT WIN32)
+
+set(CLI_TEST_TARGET chimaera_cli_command_tests)
+
+add_executable(${CLI_TEST_TARGET} test_clio_run_cli.cc)
+
+target_include_directories(${CLI_TEST_TARGET} PRIVATE
+  ${CLIO_RUN_ROOT}/include
+  ${CLIO_RUN_ROOT}/test  # For simple_test.h
+)
+
+target_link_libraries(${CLI_TEST_TARGET}
+  clio_run_commands          # Command entry points (RefreshRepo, ...)
+  chimaera_cxx               # Main CLIO Runtime library
+  ctp::cxx                   # ClioCtp library
+  ${CMAKE_THREAD_LIBS_INIT}  # Threading support
+)
+
+# The test invokes the clio_run binary as a subprocess; ensure it is built
+# and tell the test where it lives.
+add_dependencies(${CLI_TEST_TARGET} clio_run)
+target_compile_definitions(${CLI_TEST_TARGET} PRIVATE
+  CLIO_RUN_EXE="$<TARGET_FILE:clio_run>")
+
+set_target_properties(${CLI_TEST_TARGET} PROPERTIES
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED ON
+  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+
+if(CLIO_CORE_ENABLE_TESTS)
+  # CLIO_WAIT_SERVER=0 makes client-mode commands (stop/monitor/compose/
+  # migrate) fail immediately when no runtime is up, so no daemon is ever
+  # started or waited for. CLIO_PORT is off the default 10500 to avoid
+  # colliding with concurrently running runtime tests.
+  set(_cli_test_env
+    "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_WAIT_SERVER=0;CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10599")
+
+  add_test(
+    NAME cr_cli_refresh_repo_tests
+    COMMAND ${CLI_TEST_TARGET} "RefreshRepo"
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_cli_refresh_repo_tests PROPERTIES
+    ENVIRONMENT "${_cli_test_env}"
+    TIMEOUT 60
+    LABELS "msan_skip"
+  )
+
+  add_test(
+    NAME cr_cli_dispatch_tests
+    COMMAND ${CLI_TEST_TARGET} "CliDispatch"
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_cli_dispatch_tests PROPERTIES
+    ENVIRONMENT "${_cli_test_env}"
+    TIMEOUT 90
+    LABELS "msan_skip"
+  )
+
+  add_test(
+    NAME cr_cli_client_error_tests
+    COMMAND ${CLI_TEST_TARGET} "CliClientError"
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_cli_client_error_tests PROPERTIES
+    ENVIRONMENT "${_cli_test_env}"
+    TIMEOUT 90
+    LABELS "msan_skip"
+  )
+  # Live-runtime variant: spawns its own clio_run daemon on port 10601 via
+  # chi::test::RuntimeServer (always reaped — destructor SIGTERM/SIGKILLs),
+  # then drives monitor/compose/migrate/stop through the binary. The shared
+  # memory segment name is per-user, so serialize with the other tests that
+  # run a runtime.
+  add_test(
+    NAME cr_cli_runtime_command_tests
+    COMMAND ${CLI_TEST_TARGET} "CliRuntime"
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_cli_runtime_command_tests PROPERTIES
+    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1"
+    RESOURCE_LOCK "chimaera_runtime_port"
+    TIMEOUT 110
+    LABELS "msan_skip"
+  )
+  # CTE WAL restart test: full persistence cycle (compose with restart:true,
+  # write WAL, snapshot, daemon restart, replay). Spawns its own daemons on
+  # port 10602 — serialize with the other live-runtime tests.
+  add_executable(chimaera_cte_wal_restart_test test_cte_wal_restart.cc)
+  target_include_directories(chimaera_cte_wal_restart_test PRIVATE
+    ${CLIO_RUN_ROOT}/include
+    ${CLIO_RUN_ROOT}/test
+  )
+  target_link_libraries(chimaera_cte_wal_restart_test
+    clio_cte_core_client
+    clio_admin_client
+    chimaera_cxx
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+  )
+  target_compile_definitions(chimaera_cte_wal_restart_test PRIVATE
+    CLIO_RUN_EXE="$<TARGET_FILE:clio_run>")
+  add_dependencies(chimaera_cte_wal_restart_test clio_run)
+  set_target_properties(chimaera_cte_wal_restart_test PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  add_test(
+    NAME cr_cli_cte_wal_restart
+    COMMAND chimaera_cte_wal_restart_test
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_cli_cte_wal_restart PROPERTIES
+    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1"
+    RESOURCE_LOCK "chimaera_runtime_port"
+    TIMEOUT 110
+    LABELS "msan_skip"
+  )
+endif()  # CLIO_CORE_ENABLE_TESTS
+
+endif()  # NOT WIN32

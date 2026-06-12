@@ -18,9 +18,19 @@ target_link_libraries(test_priv_string_exec
         clio_ctp_host
         ctp::serialize)
 
+add_executable(test_priv_string_ext_exec
+        test_priv_string_ext.cc)
+add_dependencies(test_priv_string_ext_exec clio_ctp_host)
+target_link_libraries(test_priv_string_ext_exec
+        clio_ctp_host
+        ctp::serialize)
+
 #------------------------------------------------------------------------------
 # Test Cases
 #------------------------------------------------------------------------------
+
+add_test(NAME ctp_priv_string_ext COMMAND
+        ${CMAKE_BINARY_DIR}/bin/test_priv_string_ext_exec)
 
 add_test(NAME ctp_priv_vector COMMAND
         ${CMAKE_BINARY_DIR}/bin/test_priv_vector_exec)
@@ -59,6 +69,7 @@ set_tests_properties(
   ctp_priv_string_edge
   ctp_priv_string_serialization
   ctp_priv_string_local_serialize
+  ctp_priv_string_ext
   PROPERTIES LABELS "msan_skip"
 )
 
@@ -82,6 +93,7 @@ set_tests_properties(
 install(TARGETS
         test_priv_vector_exec
         test_priv_string_exec
+        test_priv_string_ext_exec
         LIBRARY DESTINATION lib
         ARCHIVE DESTINATION lib
         RUNTIME DESTINATION bin)

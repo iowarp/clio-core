@@ -423,6 +423,10 @@ lcov --remove coverage_all.info \
      '*/external/*' \
      '*/catch2/*' \
      '*/nanobind/*' \
+     '*/_deps/*' \
+     '*/benchmark/*' \
+     '*/local_sched.cc' \
+     '*/globus_file_assimilator.cc' \
      --output-file coverage_filtered.info \
      "${LCOV_IGNORE_OPTS[@]}" \
      2>&1 | grep -E "Removed|Summary|lines|functions" | tail -5 || true

@@ -11,9 +11,19 @@ target_link_libraries(test_local_serialize_exec
         clio_ctp_host
         ctp::serialize)
 
+add_executable(test_msgpack_wrapper_exec
+        test_msgpack_wrapper.cc)
+add_dependencies(test_msgpack_wrapper_exec clio_ctp_host)
+target_link_libraries(test_msgpack_wrapper_exec
+        clio_ctp_host
+        ctp::serialize)
+
 #------------------------------------------------------------------------------
 # Test Cases
 #------------------------------------------------------------------------------
+
+add_test(NAME ctp_msgpack_wrapper COMMAND
+        ${CMAKE_BINARY_DIR}/bin/test_msgpack_wrapper_exec)
 
 add_test(NAME ctp_local_serialize_basic COMMAND
         ${CMAKE_BINARY_DIR}/bin/test_local_serialize_exec)
@@ -48,6 +58,7 @@ set_tests_properties(
 #------------------------------------------------------------------------------
 install(TARGETS
         test_local_serialize_exec
+        test_msgpack_wrapper_exec
         LIBRARY DESTINATION lib
         ARCHIVE DESTINATION lib
         RUNTIME DESTINATION bin)

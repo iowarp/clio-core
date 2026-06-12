@@ -809,3 +809,89 @@ endif()
 # Add Adapter Unit Tests
 # ------------------------------------------------------------------------------
 add_subdirectory(adapters)
+# ------------------------------------------------------------------------------
+# Transaction log (WAL) unit tests — simple_test.h framework (NOT Catch2)
+# ------------------------------------------------------------------------------
+add_executable(test_cte_transaction_log
+    test_cte_transaction_log.cc
+)
+
+target_link_libraries(test_cte_transaction_log
+    clio_cte_core_runtime         # CTE core runtime library
+    clio_cte_core_client          # CTE core client library
+    chimaera::admin_runtime      # Admin module runtime (required for runtime mode)
+    chimaera::admin_client       # Admin module client
+    chimaera::bdev_runtime       # Bdev module runtime (required for runtime mode)
+    chimaera::bdev_client        # Bdev client for BdevType enum
+    ctp::cxx                    # ClioCtp library
+    ${CMAKE_THREAD_LIBS_INIT}    # Threading support
+)
+
+add_test(NAME cte_transaction_log_all
+    COMMAND test_cte_transaction_log)
+
+set_tests_properties(
+    cte_transaction_log_all
+    PROPERTIES
+        TIMEOUT 120
+        LABELS "unit;core;cte"
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1"
+)
+
+# ------------------------------------------------------------------------------
+# GPU metadata cache unit tests — pure POD header, CPU-testable
+# ------------------------------------------------------------------------------
+add_executable(test_cte_gpu_metadata_cache
+    test_cte_gpu_metadata_cache.cc
+)
+
+target_link_libraries(test_cte_gpu_metadata_cache
+    clio_cte_core_runtime
+    clio_cte_core_client
+    chimaera::admin_runtime
+    chimaera::admin_client
+    chimaera::bdev_runtime
+    chimaera::bdev_client
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+
+add_test(NAME cte_gpu_metadata_cache_all
+    COMMAND test_cte_gpu_metadata_cache)
+
+set_tests_properties(
+    cte_gpu_metadata_cache_all
+    PROPERTIES
+        TIMEOUT 120
+        LABELS "unit;core;cte"
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1"
+)
+
+# ------------------------------------------------------------------------------
+# Config error-path unit tests — simple_test.h framework (NOT Catch2)
+# ------------------------------------------------------------------------------
+add_executable(test_cte_config_errors
+    test_cte_config_errors.cc
+)
+
+target_link_libraries(test_cte_config_errors
+    clio_cte_core_runtime
+    clio_cte_core_client
+    chimaera::admin_runtime
+    chimaera::admin_client
+    chimaera::bdev_runtime
+    chimaera::bdev_client
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+
+add_test(NAME cte_config_errors_all
+    COMMAND test_cte_config_errors)
+
+set_tests_properties(
+    cte_config_errors_all
+    PROPERTIES
+        TIMEOUT 120
+        LABELS "unit;core;cte"
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1"
+)

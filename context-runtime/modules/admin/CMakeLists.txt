@@ -23,6 +23,14 @@ add_clio_module_runtime(
 )
 add_library(chimaera_admin_runtime ALIAS clio_admin_runtime)
 
+# Coverage builds: the daemon dies via std::abort() in InitiateShutdown,
+# which skips the gcov at-exit flush and silently discards all runtime-side
+# coverage from daemon-based tests. Let admin_runtime.cc dump counters
+# explicitly right before aborting.
+if(CLIO_CORE_ENABLE_COVERAGE)
+  target_compile_definitions(clio_admin_runtime PRIVATE CLIO_COVERAGE=1)
+endif()
+
 # Add unit tests subdirectory
 if(CLIO_CORE_ENABLE_TESTS)
   add_subdirectory(test)

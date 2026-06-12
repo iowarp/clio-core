@@ -49,3 +49,26 @@ install(TARGETS
         LIBRARY DESTINATION lib
         ARCHIVE DESTINATION lib
         RUNTIME DESTINATION bin)
+
+add_executable(test_system_info_exec
+        ${TEST_MAIN}/main.cc
+        test_init.cc
+        test_system_info.cc)
+add_dependencies(test_system_info_exec clio_ctp_host)
+target_link_libraries(test_system_info_exec
+        clio_ctp_host
+        Catch2::Catch2)
+
+add_test(NAME ctp_system_info COMMAND
+        ${CMAKE_BINARY_DIR}/bin/test_system_info_exec)
+
+set_tests_properties(
+  ctp_system_info
+  PROPERTIES LABELS "msan_skip"
+)
+
+install(TARGETS
+        test_system_info_exec
+        LIBRARY DESTINATION lib
+        ARCHIVE DESTINATION lib
+        RUNTIME DESTINATION bin)

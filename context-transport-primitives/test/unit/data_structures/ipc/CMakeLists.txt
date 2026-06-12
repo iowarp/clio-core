@@ -16,6 +16,12 @@ add_dependencies(test_rb_tree_pre_exec clio_ctp_host)
 target_link_libraries(test_rb_tree_pre_exec
         clio_ctp_host Catch2::Catch2WithMain)
 
+add_executable(test_rb_tree_pre_ext_exec
+        test_rb_tree_pre_ext.cc)
+add_dependencies(test_rb_tree_pre_ext_exec clio_ctp_host)
+target_link_libraries(test_rb_tree_pre_ext_exec
+        clio_ctp_host Catch2::Catch2WithMain)
+
 add_executable(test_vector_exec
         vector.cc)
 add_dependencies(test_vector_exec clio_ctp_host)
@@ -71,6 +77,8 @@ add_test(NAME ctp_rb_tree_pre COMMAND
         ${CMAKE_BINARY_DIR}/bin/test_rb_tree_pre_exec)
 add_test(NAME ctp_rb_tree_pre_atomic COMMAND
         ${CMAKE_BINARY_DIR}/bin/test_rb_tree_pre_exec)
+add_test(NAME ctp_rb_tree_pre_ext COMMAND
+        ${CMAKE_BINARY_DIR}/bin/test_rb_tree_pre_ext_exec)
 
 add_test(NAME ctp_vector COMMAND
         ${CMAKE_BINARY_DIR}/bin/test_vector_exec)
@@ -119,6 +127,7 @@ set_tests_properties(
   ctp_slist_pre_atomic
   ctp_rb_tree_pre
   ctp_rb_tree_pre_atomic
+  ctp_rb_tree_pre_ext
   PROPERTIES LABELS "msan_skip"
 )
 
@@ -145,6 +154,7 @@ set_tests_properties(
 install(TARGETS
         test_slist_pre_exec
         test_rb_tree_pre_exec
+        test_rb_tree_pre_ext_exec
         test_vector_exec
         test_ring_buffer_exec
         test_ring_buffer_spsc_exec

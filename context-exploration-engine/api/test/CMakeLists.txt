@@ -44,6 +44,9 @@ add_cee_api_unit_test(test_context_query test_context_query.cc)
 # Test for context_destroy
 add_cee_api_unit_test(test_context_destroy test_context_destroy.cc)
 
+# Mode coverage for query/retrieve/bundle/splice/destroy
+add_cee_api_unit_test(test_context_query_modes test_context_query_modes.cc)
+
 # Comprehensive coverage test
 add_executable(test_context_comprehensive test_context_comprehensive.cc)
 target_link_libraries(test_context_comprehensive

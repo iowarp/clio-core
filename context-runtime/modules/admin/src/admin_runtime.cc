@@ -58,6 +58,12 @@
 #include <unordered_set>
 #include <vector>
 
+#ifdef CLIO_COVERAGE
+// abort() in InitiateShutdown skips the gcov at-exit flush; declared here so
+// the shutdown path can dump counters explicitly (see InitiateShutdown).
+extern "C" void __gcov_dump(void);
+#endif
+
 namespace clio::run::admin {
 
 // Method implementations for Runtime class
@@ -312,6 +318,11 @@ void Runtime::InitiateShutdown(chi::u32 grace_period_ms) {
   if (runtime_manager) {
     // runtime_manager->InitiateShutdown(grace_period_ms);
   }
+#ifdef CLIO_COVERAGE
+  // abort() skips the gcov at-exit flush; dump counters explicitly so
+  // daemon-side coverage from runtime tests is not silently discarded.
+  __gcov_dump();
+#endif
   std::abort();
 }
 
