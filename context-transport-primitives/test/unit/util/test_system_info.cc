@@ -68,12 +68,12 @@ TEST_CASE("SystemInfoTls") {
 TEST_CASE("SystemInfoMemfdDir") {
   // CLIO_MEMFD_DIR override takes precedence (GetCompat also accepts the
   // legacy CHI_MEMFD_DIR spelling).
-  setenv("CLIO_MEMFD_DIR", "/tmp/ctp_memfd_test_override", 1);
+  SystemInfo::Setenv("CLIO_MEMFD_DIR", "/tmp/ctp_memfd_test_override", 1);
   std::string dir = SystemInfo::GetMemfdDir();
   REQUIRE(dir == "/tmp/ctp_memfd_test_override");
   std::string path = SystemInfo::GetMemfdPath("unit_test_seg");
   REQUIRE(path.find("unit_test_seg") != std::string::npos);
-  unsetenv("CLIO_MEMFD_DIR");
+  SystemInfo::Unsetenv("CLIO_MEMFD_DIR");
 
   // Default (user-derived) directory.
   std::string default_dir = SystemInfo::GetMemfdDir();

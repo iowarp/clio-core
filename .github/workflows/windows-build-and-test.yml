@@ -43,7 +43,9 @@ jobs:
 
     - name: Configure CMake
       run: |
-        cmake -B build -G "Visual Studio 17 2022" -A ${{ matrix.arch }} `
+        # No explicit -G: let CMake pick the Visual Studio version installed
+        # on the runner image (windows-2025 now ships VS 2026 only).
+        cmake -B build -A ${{ matrix.arch }} `
           -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
           -DVCPKG_TARGET_TRIPLET="${{ matrix.triplet }}" `
           -DVCPKG_MANIFEST_DIR="${{ github.workspace }}/installers/vcpkg" `

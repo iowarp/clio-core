@@ -19,6 +19,7 @@
 #include <string>
 #include <vector>
 
+#include <clio_ctp/introspect/system_info.h>
 #include <clio_runtime/clio_runtime.h>
 #include <clio_runtime/config_manager.h>
 #include <clio_runtime/ipc_manager.h>
@@ -217,11 +218,11 @@ TEST_CASE("IpcInternals - ConfigManager yaml sections and env overrides",
   REQUIRE(config->GetPort() == 10444);
 
   SECTION("Env overrides take precedence on reload");
-  setenv("CLIO_GPU_BLOCKS", "16", 1);
-  setenv("CLIO_GPU_THREADS", "128", 1);
+  ctp::SystemInfo::Setenv("CLIO_GPU_BLOCKS", "16", 1);
+  ctp::SystemInfo::Setenv("CLIO_GPU_THREADS", "128", 1);
   REQUIRE(config->LoadYaml(cfg.string()));
-  unsetenv("CLIO_GPU_BLOCKS");
-  unsetenv("CLIO_GPU_THREADS");
+  ctp::SystemInfo::Unsetenv("CLIO_GPU_BLOCKS");
+  ctp::SystemInfo::Unsetenv("CLIO_GPU_THREADS");
 
   // NOTE: LoadYaml on a missing file is HLOG(kFatal) (process exit), so the
   // not-found path is intentionally not probed here.

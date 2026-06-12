@@ -18,10 +18,23 @@
 
 #include <clio_cae/core/label_client.h>
 
+#ifdef _WIN32
+// Including Windows headers from a .cc is allowed (the no-winsock rule only
+// applies to headers); keep the macro fallout contained anyway.
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#endif
 
 #include <atomic>
 #include <cstring>
@@ -31,6 +44,27 @@
 using clio::cae::core::OllamaGenerate;
 
 namespace {
+
+#ifdef _WIN32
+using sock_t = SOCKET;
+const sock_t kBadSock = INVALID_SOCKET;
+constexpr int kShutBoth = SD_BOTH;
+void CloseSocket(sock_t s) { ::closesocket(s); }
+/** WSAStartup must run before any socket call in the fixture. */
+struct WinsockSession {
+  WinsockSession() {
+    WSADATA d;
+    (void)::WSAStartup(MAKEWORD(2, 2), &d);
+  }
+  ~WinsockSession() { ::WSACleanup(); }
+};
+const WinsockSession kWinsockSession;
+#else
+using sock_t = int;
+constexpr sock_t kBadSock = -1;
+constexpr int kShutBoth = SHUT_RDWR;
+void CloseSocket(sock_t s) { ::close(s); }
+#endif
 
 /**
  * One-shot HTTP server: listens on an ephemeral localhost port and answers
@@ -42,7 +76,8 @@ class OneShotHttpServer {
                              const std::string &body) {
     listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
     int opt = 1;
-    ::setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    ::setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR,
+                 reinterpret_cast<const char *>(&opt), sizeof(opt));
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
@@ -62,16 +97,17 @@ class OneShotHttpServer {
                            body;
     server_ = std::thread([this, response]() {
       while (!stop_.load()) {
-        int conn = ::accept(listen_fd_, nullptr, nullptr);
-        if (conn < 0) {
+        sock_t conn = ::accept(listen_fd_, nullptr, nullptr);
+        if (conn == kBadSock) {
           break;  // listen_fd_ closed by Stop()
         }
         // Drain the request headers+body (best effort, single read is
         // enough for the small POST bodies the client sends).
         char buf[8192];
-        (void)::read(conn, buf, sizeof(buf));
-        (void)::write(conn, response.data(), response.size());
-        ::close(conn);
+        (void)::recv(conn, buf, static_cast<int>(sizeof(buf)), 0);
+        (void)::send(conn, response.data(),
+                     static_cast<int>(response.size()), 0);
+        CloseSocket(conn);
       }
     });
   }
@@ -80,8 +116,8 @@ class OneShotHttpServer {
 
   void Stop() {
     if (!stop_.exchange(true)) {
-      ::shutdown(listen_fd_, SHUT_RDWR);
-      ::close(listen_fd_);
+      ::shutdown(listen_fd_, kShutBoth);
+      CloseSocket(listen_fd_);
       if (server_.joinable()) {
         server_.join();
       }
@@ -93,7 +129,7 @@ class OneShotHttpServer {
   }
 
  private:
-  int listen_fd_ = -1;
+  sock_t listen_fd_ = kBadSock;
   unsigned short port_ = 0;
   std::atomic<bool> stop_{false};
   std::thread server_;

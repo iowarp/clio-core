@@ -589,32 +589,42 @@ endif()
 message(STATUS "")
 
 # ------------------------------------------------------------------------------
-# Label client (Ollama HTTP) unit tests — uses an in-process HTTP fixture
+# Label client (Ollama HTTP) unit tests — uses an in-process HTTP fixture.
+# Without libcurl OllamaGenerate is a stub that always fails, so the success
+# paths can't pass; only build/register the test when labeling is enabled
+# (CAE_LABELING_ENABLED is inherited from core/CMakeLists.txt).
 # ------------------------------------------------------------------------------
-add_executable(test_cae_label_client
-  ${CMAKE_CURRENT_SOURCE_DIR}/test_cae_label_client.cc
-)
+if(CAE_LABELING_ENABLED)
+  add_executable(test_cae_label_client
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_cae_label_client.cc
+  )
 
-target_include_directories(test_cae_label_client
-  PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
-)
+  target_include_directories(test_cae_label_client
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}
+  )
 
-target_link_libraries(test_cae_label_client
-  PRIVATE
-    clio_cae_core_runtime
-    clio_cae_core_client
-    clio_cte_core_client
-    chimaera::admin_runtime
-    chimaera::bdev_runtime
-    ctp::cxx
-    ${CMAKE_THREAD_LIBS_INIT}
-)
+  target_link_libraries(test_cae_label_client
+    PRIVATE
+      clio_cae_core_runtime
+      clio_cae_core_client
+      clio_cte_core_client
+      chimaera::admin_runtime
+      chimaera::bdev_runtime
+      ctp::cxx
+      ${CMAKE_THREAD_LIBS_INIT}
+  )
 
-add_test(NAME cae_label_client_all COMMAND test_cae_label_client)
-set_tests_properties(cae_label_client_all PROPERTIES
-  TIMEOUT 60
-  ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}"
-)
+  if(WIN32)
+    # The in-process HTTP fixture uses Winsock directly.
+    target_link_libraries(test_cae_label_client PRIVATE ws2_32)
+  endif()
 
-install(TARGETS test_cae_label_client DESTINATION bin)
+  add_test(NAME cae_label_client_all COMMAND test_cae_label_client)
+  set_tests_properties(cae_label_client_all PROPERTIES
+    TIMEOUT 60
+    ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}"
+  )
+
+  install(TARGETS test_cae_label_client DESTINATION bin)
+endif()

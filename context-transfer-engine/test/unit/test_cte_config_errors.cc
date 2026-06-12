@@ -17,6 +17,8 @@
 
 #include <clio_cte/core/core_config.h>
 
+#include <clio_ctp/introspect/system_info.h>
+
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -233,7 +235,7 @@ TEST_CASE("ConfigErrors - environment and save round-trip",
           "[cte][config][env]") {
   SECTION("Unset env var falls back to defaults (success)");
   Config config;
-  unsetenv("CTE_CONFIG_ERR_TEST_VAR");
+  ctp::SystemInfo::Unsetenv("CTE_CONFIG_ERR_TEST_VAR");
   // Default env var name is part of the config; unset path returns true.
   REQUIRE(config.LoadFromEnvironment());
 
