@@ -80,13 +80,23 @@ if(CLIO_CORE_ENABLE_TESTS)
   # then drives monitor/compose/migrate/stop through the binary. The shared
   # memory segment name is per-user, so serialize with the other tests that
   # run a runtime.
+  set(_cli_live_env
+    "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1")
+  if(APPLE)
+    # macOS (issue #482): the local ZMQ DEALER->ROUTER control plane does not
+    # deliver ClientConnect replies on the macos-14/15/26 CI runners, so every
+    # live-daemon client command times out. Drive the clients over the
+    # unix-socket IPC transport instead — the path cr_ipc_transport_ipc and
+    # cr_client_retry_*_ipc prove out on those same runners.
+    string(APPEND _cli_live_env ";CLIO_IPC_MODE=ipc")
+  endif()
   add_test(
     NAME cr_cli_runtime_command_tests
     COMMAND ${CLI_TEST_TARGET} "CliRuntime"
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
   set_tests_properties(cr_cli_runtime_command_tests PROPERTIES
-    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1"
+    ENVIRONMENT "${_cli_live_env}"
     RESOURCE_LOCK "chimaera_runtime_port"
     TIMEOUT 110
     LABELS "msan_skip"
@@ -120,7 +130,7 @@ if(CLIO_CORE_ENABLE_TESTS)
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
   set_tests_properties(cr_cli_cte_wal_restart PROPERTIES
-    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1"
+    ENVIRONMENT "${_cli_live_env}"
     RESOURCE_LOCK "chimaera_runtime_port"
     TIMEOUT 110
     LABELS "msan_skip"
