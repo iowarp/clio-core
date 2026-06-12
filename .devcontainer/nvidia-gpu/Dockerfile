@@ -36,17 +36,18 @@ RUN set -eux; \
     ldconfig; \
     rm -rf /tmp/nvcomp*
 
-# Scientific-data GPU compressors that back two more entries in the GPU
-# compression factory (ctp::Cusz / ctp::Ndzip), complementing nvcomp's
-# general-purpose byte codecs. Both are built from source against the CUDA 12
-# toolkit and installed into /usr/local so the root CMake auto-detects them
-# (CLIO_CTP_ENABLE_CUSZ / CLIO_CTP_ENABLE_NDZIP):
+# Scientific-data GPU compressors that back three more entries in the GPU
+# compression factory (ctp::Cusz / ctp::Ndzip / ctp::Cuszp), complementing
+# nvcomp's general-purpose byte codecs. All are built from source against the
+# CUDA 12 toolkit and installed into /usr/local so the root CMake auto-detects
+# them (CLIO_CTP_ENABLE_CUSZ / CLIO_CTP_ENABLE_NDZIP / CLIO_CTP_ENABLE_CUSZP):
 #   - cuSZ  (szcompressor/cuSZ)  : error-bounded LOSSY float compression
 #   - ndzip (celerity/ndzip)     : high-throughput LOSSLESS float compression
-# ndzip has no upstream Spack/apt package, so source-building it here is the only
-# option; cuSZ is also a Spack package (see installers/spack) but is source-built
-# here to match the nvcomp/zfp-sycl pattern. Target SM versions are overridable
-# (default spans Volta..Hopper).
+#   - cuSZp (szcompressor/cuSZp) : ultra-fast single-kernel LOSSY float compression
+# ndzip and cuSZp have no upstream Spack/apt package, so source-building them here
+# is the only option; cuSZ is also a Spack package (see installers/spack) but is
+# source-built here to match the nvcomp/zfp-sycl pattern. Target SM versions are
+# overridable (default spans Volta..Hopper).
 ARG CUDA_ARCHS="70;75;80;86;89;90"
 
 # cuSZ - GPU error-bounded lossy compressor. Pinned to master; the ctp::Cusz
@@ -67,6 +68,24 @@ RUN set -eux; \
     cmake --install cusz_src/build; \
     ldconfig; \
     rm -rf /tmp/cusz_src
+
+# cuSZp - GPU ultra-fast single-kernel error-bounded lossy compressor. Pinned to
+# cuSZp-V3.0.0; the ctp::Cuszp wrapper targets the cuSZp v3 C API
+# (cuSZp_compress / cuSZp_decompress, header <cuSZp.h>, library -lcuSZp).
+RUN set -eux; \
+    cd /tmp; \
+    git clone --depth 1 --branch cuSZp-V3.0.0 \
+      https://github.com/szcompressor/cuSZp.git cuszp_src; \
+    cmake -S cuszp_src -B cuszp_src/build \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX=/usr/local \
+      -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHS}" \
+      -DcuSZp_BUILD_EXAMPLES=off \
+      -DCMAKE_POLICY_VERSION_MINIMUM=3.5; \
+    cmake --build cuszp_src/build -j"$(nproc)"; \
+    cmake --install cuszp_src/build; \
+    ldconfig; \
+    rm -rf /tmp/cuszp_src
 
 # ndzip - GPU high-throughput lossless compressor (CUDA backend).
 #

@@ -576,6 +576,33 @@ if(CLIO_CTE_ENABLE_COMPRESS)
         message(STATUS "CLIO_CORE_ENABLE_CUDA is OFF - ndzip GPU compression disabled")
     endif()
 
+    # cuSZp (https://github.com/szcompressor/cuSZp) - GPU ultra-fast error-bounded
+    # lossy compressor for floating-point data. Optional, requires CUDA. Auto-
+    # detected via its CMake config (cuSZp::cuSZp) with a find_library fallback.
+    set(CLIO_CTP_ENABLE_CUSZP OFF)
+    if(CLIO_CORE_ENABLE_CUDA)
+        find_package(cuSZp QUIET)
+        if(cuSZp_FOUND AND TARGET cuSZp::cuSZp)
+            set(cuszp_LIBRARIES cuSZp::cuSZp)
+            set(cuszp_INCLUDE_DIRS "")
+            set(CLIO_CTP_ENABLE_CUSZP ON)
+            message(STATUS "found cuSZp via CMake config (GPU lossy compression)")
+        else()
+            find_path(cuszp_INCLUDE_DIR cuSZp.h)
+            find_library(cuszp_LIBRARY NAMES cuSZp)
+            if(cuszp_INCLUDE_DIR AND cuszp_LIBRARY)
+                set(cuszp_LIBRARIES ${cuszp_LIBRARY})
+                set(cuszp_INCLUDE_DIRS ${cuszp_INCLUDE_DIR})
+                set(CLIO_CTP_ENABLE_CUSZP ON)
+                message(STATUS "found cuSZp.h at ${cuszp_INCLUDE_DIRS}")
+            else()
+                message(STATUS "cuSZp not found - cuSZp GPU compression disabled")
+            endif()
+        endif()
+    else()
+        message(STATUS "CLIO_CORE_ENABLE_CUDA is OFF - cuSZp GPU compression disabled")
+    endif()
+
     set(COMPRESS_LIBS
         bz2
         ${lzo2_LIBRARIES}
@@ -639,6 +666,12 @@ if(CLIO_CTE_ENABLE_COMPRESS)
         list(APPEND COMPRESS_INCLUDES ${ndzip_INCLUDE_DIRS})
     endif()
 
+    # Only add cuSZp if found
+    if(CLIO_CTP_ENABLE_CUSZP)
+        list(APPEND COMPRESS_LIBS ${cuszp_LIBRARIES})
+        list(APPEND COMPRESS_INCLUDES ${cuszp_INCLUDE_DIRS})
+    endif()
+
     # Make CTP_ENABLE_LIBPRESSIO available to subdirectories (CTP)
     set(CLIO_CTP_ENABLE_LIBPRESSIO ${CLIO_CTP_ENABLE_LIBPRESSIO} CACHE BOOL "Enable LibPressio wrapper (auto-detected)" FORCE)
     # Make CTP_ENABLE_NVCOMP available to subdirectories (CTP)
@@ -649,6 +682,7 @@ if(CLIO_CTE_ENABLE_COMPRESS)
     # Make CLIO_CTP_ENABLE_CUSZ / CLIO_CTP_ENABLE_NDZIP available to subdirs (CTP)
     set(CLIO_CTP_ENABLE_CUSZ ${CLIO_CTP_ENABLE_CUSZ} CACHE BOOL "Enable cuSZ GPU compression (auto-detected)" FORCE)
     set(CLIO_CTP_ENABLE_NDZIP ${CLIO_CTP_ENABLE_NDZIP} CACHE BOOL "Enable ndzip GPU compression (auto-detected)" FORCE)
+    set(CLIO_CTP_ENABLE_CUSZP ${CLIO_CTP_ENABLE_CUSZP} CACHE BOOL "Enable cuSZp GPU compression (auto-detected)" FORCE)
 endif()
 
 # Encryption libraries (conditional)

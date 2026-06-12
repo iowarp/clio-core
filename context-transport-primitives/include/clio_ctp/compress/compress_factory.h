@@ -65,6 +65,10 @@
 #include "ndzip.h"
 #endif
 
+#if CTP_ENABLE_CUSZP
+#include "cuszp.h"
+#endif
+
 namespace ctp {
 
 /**
@@ -99,6 +103,7 @@ class CompressionFactory {
    *                                "zfp-sycl" (lossy fixed-rate, if SYCL enabled)
    *                                "cusz" (GPU lossy float, if cuSZ enabled)
    *                                "ndzip" (GPU lossless float, if ndzip enabled)
+   *                                "cuszp" (GPU lossy float, if cuSZp enabled)
    * @param preset Compression preset level (FAST/BALANCED/BEST/DEFAULT)
    * @return Unique pointer to configured compressor instance,
    *         or nullptr if library not found
@@ -365,6 +370,26 @@ class CompressionFactory {
     return nullptr;
 #endif
   }
+  // cuSZp: GPU ultra-fast error-bounded LOSSY float compressor (single-kernel).
+  // Multi-mode like cusz/the lossy CPU entries -- presets map to ABSOLUTE error
+  // bounds (FAST=1e-2 loose, BALANCED=1e-3, BEST=1e-4 tight). Returns nullptr
+  // when cuSZp is not available in this build.
+  static std::unique_ptr<Compressor> MakeCuszp(CompressionPreset preset) {
+#if CTP_ENABLE_CUSZP
+    float eb;
+    switch (preset) {
+      case CompressionPreset::FAST: eb = 1e-2f; break;
+      case CompressionPreset::BEST: eb = 1e-4f; break;
+      case CompressionPreset::BALANCED:
+      case CompressionPreset::DEFAULT:
+      default: eb = 1e-3f; break;
+    }
+    return std::make_unique<Cuszp>(eb);
+#else
+    (void)preset;
+    return nullptr;
+#endif
+  }
 
   /**
    * The compressor registry: the single source of truth (see CompressorInfo).
@@ -396,6 +421,7 @@ class CompressionFactory {
         CompressorInfo{"zfp-sycl",        17, 19, false, &MakeSyclZfp},
         CompressorInfo{"cusz",            18, 20, false, &MakeCusz},
         CompressorInfo{"ndzip",           19, 21, true,  &MakeNdzip},
+        CompressorInfo{"cuszp",           20, 22, false, &MakeCuszp},
     };
     return kRegistry;
   }
