@@ -2,6 +2,11 @@
 # bdev, and MOD_NAME modules through the full autogen lib_exec dispatch
 # battery (Save/Load/AllocLoad/LocalSave/LocalLoad/LocalAllocLoad/NewCopy/
 # Aggregate).
+# Requires CAE (which implies CTE): the sweep includes and links the CTE and
+# CAE core runtimes, so skip it in CAE-less configs (e.g. the cuda-release
+# preset used for the conda GPU package).
+if(CLIO_CORE_ENABLE_CAE)
+
 set(AUTOGEN_SWEEP_TEST_TARGET chimaera_autogen_sweep_tests)
 
 add_executable(${AUTOGEN_SWEEP_TEST_TARGET}
@@ -50,3 +55,5 @@ if(CLIO_CORE_ENABLE_TESTS)
     LABELS "msan_skip"
   )
 endif()
+
+endif()  # CLIO_CORE_ENABLE_CAE
