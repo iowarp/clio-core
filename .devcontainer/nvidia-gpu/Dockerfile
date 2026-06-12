@@ -81,7 +81,7 @@ SHELL ["/bin/bash", "-lc"]
 RUN set -eux; \
     git clone --depth 1 -b "${ZFP_SYCL_REF}" https://github.com/alpers-git/zfp.git /tmp/zfp; \
     dpct_inc="$(dirname "$(dirname "$(find /opt/intel/oneapi/dpcpp-ct -name dpct.hpp | head -1)")")"; \
-    dpl_inc="$(dirname "$(dirname "$(dirname "$(find /opt/intel/oneapi/dpl -path '*oneapi/dpl/execution' | head -1)")")")"; \
+    dpl_inc="$(dirname "$(dirname "$(dirname "$(find /opt/intel/oneapi/dpl -path '*oneapi/dpl/execution' -not -path '*pstl_offload*' | head -1)")")")"; \
     if [ -d /opt/adaptivecpp ]; then mv /opt/adaptivecpp /opt/adaptivecpp_hidden; fi; \
     cmake -S /tmp/zfp -B /tmp/zfp/build -DCMAKE_BUILD_TYPE=Release -DZFP_WITH_SYCL=1 \
       -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx \
