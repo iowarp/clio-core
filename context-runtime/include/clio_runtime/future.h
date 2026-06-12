@@ -411,16 +411,50 @@ class Future {
   const ctp::ipc::FullPtr<TaskT>& GetTaskPtr() const { return task_ptr_; }
 
   /**
+   * Fail-loud sanity check for the dereference operators below.
+   *
+   * Dereferencing a Future whose task_ptr_ is null is always a bug: a
+   * correctly built runtime never resumes a coroutine into a null awaited
+   * task. A null here means either (a) an ABI/layout mismatch in the runtime
+   * libraries from a mismatched toolchain or dependency stack, or (b) an
+   * unchecked allocation failure -- await_ready() deliberately treats a null
+   * Future as ready so the coroutine resumes instead of hanging, and callers
+   * are expected to check IsNull() before dereferencing. Catch it with a
+   * clear, actionable FATAL message instead of a silent SIGSEGV deep in
+   * coroutine resume. Define CLIO_NO_FUTURE_NULL_CHECK to compile this out on
+   * the hot path for maximum-performance builds.
+   */
+  CTP_CROSS_FUN void CheckDerefNonNull() const {
+#if CTP_IS_HOST && !defined(CLIO_NO_FUTURE_NULL_CHECK)
+    if (task_ptr_.IsNull()) {
+      HLOG(kFatal,
+           "Future: dereferenced (-> or *) a Future whose task_ptr_ is null. "
+           "A correctly built runtime never resumes into a null awaited task; "
+           "this indicates a broken runtime build (ABI/layout mismatch from a "
+           "mismatched toolchain or dependency stack) or an unchecked "
+           "allocation failure. Check IsNull() before dereferencing -- see "
+           "Future::await_ready().");
+    }
+#endif
+  }
+
+  /**
    * Dereference operator - access task members
    * @return Reference to the task object
    */
-  CTP_CROSS_FUN TaskT& operator*() const { return *task_ptr_.ptr_; }
+  CTP_CROSS_FUN TaskT& operator*() const {
+    CheckDerefNonNull();
+    return *task_ptr_.ptr_;
+  }
 
   /**
    * Arrow operator - access task members
    * @return Pointer to the task object
    */
-  CTP_CROSS_FUN TaskT* operator->() const { return task_ptr_.ptr_; }
+  CTP_CROSS_FUN TaskT* operator->() const {
+    CheckDerefNonNull();
+    return task_ptr_.ptr_;
+  }
 
   /** Get the cross-warp range offset */
   CTP_CROSS_FUN u32 RangeOffset() const { return range_.off; }
