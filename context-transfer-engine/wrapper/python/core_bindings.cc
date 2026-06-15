@@ -301,16 +301,20 @@ NB_MODULE(clio_cte_core_ext, m) {
            "Args: blob_name (str), data (bytes), off (int, optional)")
       .def("GetBlob",
            [](clio::cte::core::Tag &self, const std::string &blob_name,
-              size_t data_size, size_t off) -> std::string {
-             // Allocate buffer and retrieve blob data
+              size_t data_size, size_t off) -> nb::bytes {
+             // Retrieve blob data into a buffer, return it as raw bytes.
+             // Must return nb::bytes (not std::string): blobs are arbitrary
+             // binary, and nanobind decodes a returned std::string as UTF-8,
+             // which raises UnicodeDecodeError on any non-text payload. This
+             // also mirrors PutBlob, which already accepts nb::bytes.
              std::string result(data_size, '\0');
              self.GetBlob(blob_name, result.data(), data_size, off);
-             return result;
+             return nb::bytes(result.data(), result.size());
            },
            "blob_name"_a, "data_size"_a, "off"_a = 0,
            "Get blob data. Automatically allocates shared memory and copies data. "
            "Args: blob_name (str), data_size (int), off (int, optional). "
-           "Returns: str/bytes containing blob data")
+           "Returns: bytes containing the raw blob data")
       .def("GetBlobScore", &clio::cte::core::Tag::GetBlobScore,
            "blob_name"_a,
            "Get blob placement score (0.0-1.0). "
