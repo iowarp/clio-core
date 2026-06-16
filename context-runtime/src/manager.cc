@@ -36,6 +36,7 @@
  */
 
 #include <cstdlib>
+#include <filesystem>
 #include <iomanip>
 #include <iostream>
 
@@ -313,7 +314,23 @@ bool RuntimeManager::ServerInit() {
       }
       HLOG(kInfo, "Restart log: replaying {} registered container(s) from {}",
            containers.size(), restart_log.path());
+      bool pruned_any = false;
       for (const auto &container_path : containers) {
+        // A registered compose file can disappear out from under us (deleted,
+        // moved, or on a since-unmounted volume). ConfigManager::LoadYaml is
+        // fatal on a missing/unreadable file, so guard with an existence check
+        // first and self-heal by pruning the dead entry from the WAL. Without
+        // this, one dangling entry would abort every future startup.
+        std::error_code ec;
+        if (!std::filesystem::exists(container_path, ec) || ec) {
+          HLOG(kWarning,
+               "Restart log: registered container '{}' no longer exists; "
+               "unregistering it",
+               container_path);
+          restart_log.AppendRm(container_path);
+          pruned_any = true;
+          continue;
+        }
         chi::ConfigManager file_config;
         if (!file_config.LoadYaml(container_path)) {
           HLOG(kError, "Restart log: failed to load container '{}' (skipping)",
@@ -337,6 +354,10 @@ bool RuntimeManager::ServerInit() {
             // Keep restarting the remaining containers rather than aborting.
           }
         }
+      }
+      // Collapse the appended rm entries so dead paths don't linger in the log.
+      if (pruned_any) {
+        restart_log.Compact();
       }
     }
   }

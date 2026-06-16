@@ -52,7 +52,11 @@ class RestartLog {
   /** Construct over the default ~/.clio/restart_log.bin location. */
   RestartLog() : log_path_(DefaultPath()) {}
 
-  /** Resolve the default log path: $HOME/.clio/restart_log.bin. */
+  /**
+   * Resolve the default log path. Honors the CLIO_RESTART_LOG env var as an
+   * explicit override (used to isolate the WAL in tests); otherwise
+   * $HOME/.clio/restart_log.bin.
+   */
   static std::string DefaultPath();
 
   const std::string& path() const { return log_path_; }

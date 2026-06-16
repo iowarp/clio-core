@@ -127,6 +127,12 @@ TEST_CASE("CteWalRestart - WAL snapshot, replay on daemon restart",
 
   setenv("CLIO_WAIT_SERVER", "15", 1);
   setenv("CLIO_BIND_ADDR", "127.0.0.1", 1);
+  // Isolate the restart-log WAL inside work_dir so `compose` registration does
+  // not pollute the shared ~/.clio/restart_log.bin. Child clio_run processes
+  // (daemons + CLI) inherit this env var, so they all agree on the path, and
+  // it is removed with work_dir at the end of the test.
+  const fs::path restart_log = work_dir / "restart_log.bin";
+  setenv("CLIO_RESTART_LOG", restart_log.string().c_str(), 1);
 
   // --- Phase 1: daemon up, compose the pool, write data through a client.
   clio::run::test::RuntimeServer server;

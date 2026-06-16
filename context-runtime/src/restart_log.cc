@@ -26,6 +26,13 @@ namespace clio::run {
 namespace fs = std::filesystem;
 
 std::string RestartLog::DefaultPath() {
+  // An explicit override wins: lets a test (or an admin) point the WAL at an
+  // isolated location instead of the shared ~/.clio/restart_log.bin. Child
+  // clio_run processes inherit the env var, so daemon + CLI agree on the path.
+  const char* override_path = std::getenv("CLIO_RESTART_LOG");
+  if (override_path != nullptr && override_path[0] != '\0') {
+    return override_path;
+  }
   const char* home = std::getenv("HOME");
   std::string base = (home != nullptr && home[0] != '\0') ? home : ".";
   return base + "/.clio/restart_log.bin";
