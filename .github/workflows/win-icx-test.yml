@@ -68,8 +68,13 @@ jobs:
         shell: cmd
         run: |
           @echo on
-          call "C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
-          call "%ProgramFiles(x86)%\Intel\oneAPI\setvars.bat"
+          rem Locate the Visual Studio install on the runner (edition/version
+          rem agnostic) instead of hard-coding a path -- the hosted windows-2025
+          rem image may differ from the template's custom runner.
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -prerelease -products * -property installationPath`) do set "VSINSTALL=%%i"
+          echo Using Visual Studio at: %VSINSTALL%
+          call "%VSINSTALL%\VC\Auxiliary\Build\vcvarsall.bat" x64 || exit /b 1
+          call "%ProgramFiles(x86)%\Intel\oneAPI\setvars.bat" || exit /b 1
           cmake -B build -G Ninja ^
             -DCMAKE_C_COMPILER=icx ^
             -DCMAKE_CXX_COMPILER=icpx ^
