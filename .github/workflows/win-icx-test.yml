@@ -59,6 +59,15 @@ jobs:
         with:
           submodules: recursive
 
+      # Pin a stable CMake. The hosted image ships CMake 4.x, whose bindexplib
+      # (cmake -E __create_def, used by WINDOWS_EXPORT_ALL_SYMBOLS) fails to
+      # open the just-built object files under Ninja + IntelLLVM (icx),
+      # breaking the clio_ctp_host.dll link. 3.31.x links it cleanly.
+      - name: Install CMake 3.31.6
+        uses: jwlawson/actions-setup-cmake@v2
+        with:
+          cmake-version: "3.31.6"
+
       - name: Bootstrap vcpkg
         shell: pwsh
         run: |
@@ -69,9 +78,11 @@ jobs:
       # Cache the installed oneAPI tree so the ~6 min component install is
       # skipped while the base-toolkit version (encoded in WINDOWS_BASEKIT_URL)
       # is unchanged. A URL or CACHE_NUMBER change invalidates the key.
-      - name: Cache oneAPI install
+      # restore + explicit save (instead of actions/cache) so the cache still
+      # persists when a later build/test step fails during CI iteration.
+      - name: Restore oneAPI cache
         id: cache-oneapi
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ${{ env.ONEAPI_ROOT_DIR }}
           key: oneapi-${{ runner.os }}-${{ env.CACHE_NUMBER }}-${{ env.WINDOWS_BASEKIT_URL }}-${{ env.WINDOWS_CPP_COMPONENTS }}
@@ -83,6 +94,13 @@ jobs:
           git clone --depth=1 https://github.com/oneapi-src/oneapi-ci.git oneapi-ci
           cd oneapi-ci
           scripts\install_windows.bat %WINDOWS_BASEKIT_URL% %WINDOWS_CPP_COMPONENTS%
+
+      - name: Save oneAPI cache
+        if: steps.cache-oneapi.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.ONEAPI_ROOT_DIR }}
+          key: oneapi-${{ runner.os }}-${{ env.CACHE_NUMBER }}-${{ env.WINDOWS_BASEKIT_URL }}-${{ env.WINDOWS_CPP_COMPONENTS }}
 
       - name: Configure and build (icx)
         shell: cmd
