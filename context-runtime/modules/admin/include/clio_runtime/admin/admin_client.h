@@ -366,6 +366,22 @@ class Client : public chi::ContainerClient {
   }
 
   /**
+   * ListContainers - Enumerate active pools/containers in the local daemon.
+   * @param pool_query Pool routing information (use Dynamic/local).
+   * @return Future for the ListContainers task; on completion the task's
+   *         pool_names_ / pool_ids_ vectors hold the active pools.
+   */
+  chi::Future<ListContainersTask> AsyncListContainers(
+      const chi::PoolQuery& pool_query) {
+    auto* ipc_manager = CLIO_IPC;
+
+    auto task = ipc_manager->NewTask<ListContainersTask>(
+        chi::CreateTaskId(), pool_id_, pool_query);
+
+    return ipc_manager->Send(task);
+  }
+
+  /**
    * AddNode - Register a new node with all nodes in the cluster
    * @param pool_query Pool routing (use Broadcast to reach all nodes)
    * @param new_node_ip IP address of the new node

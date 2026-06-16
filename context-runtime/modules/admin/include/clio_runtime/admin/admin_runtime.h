@@ -254,6 +254,12 @@ public:
   chi::TaskResume RestartContainers(ctp::ipc::FullPtr<RestartContainersTask> task, chi::RunContext &rctx);
 
   /**
+   * Handle ListContainers - Enumerate active pools/containers in this daemon.
+   * Fills the task's pool_names_ / pool_ids_ output vectors.
+   */
+  chi::TaskResume ListContainers(ctp::ipc::FullPtr<ListContainersTask> task, chi::RunContext &rctx);
+
+  /**
    * Handle AddNode - Register a new node with this runtime
    * Updates IpcManager's hostfile and calls Expand on all containers
    */

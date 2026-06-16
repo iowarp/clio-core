@@ -135,6 +135,65 @@ if(CLIO_CORE_ENABLE_TESTS)
     TIMEOUT 110
     LABELS "msan_skip"
   )
+  # RestartLog unit test: pure file-level WAL behavior (no daemon).
+  add_executable(chimaera_restart_log_test test_restart_log.cc)
+  target_include_directories(chimaera_restart_log_test PRIVATE
+    ${CLIO_RUN_ROOT}/include
+    ${CLIO_RUN_ROOT}/test
+  )
+  target_link_libraries(chimaera_restart_log_test
+    chimaera_cxx
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+  )
+  set_target_properties(chimaera_restart_log_test PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  add_test(
+    NAME cr_cli_restart_log
+    COMMAND chimaera_restart_log_test
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_cli_restart_log PROPERTIES
+    TIMEOUT 60
+    LABELS "msan_skip"
+  )
+
+  # compose start/stop/rm/list + restart-WAL integration test: drives the
+  # clio_run binary against a live daemon. Spawns daemons on ports 10610-10612
+  # — serialize with the other live-runtime tests.
+  add_executable(chimaera_compose_restart_test test_compose_restart.cc)
+  target_include_directories(chimaera_compose_restart_test PRIVATE
+    ${CLIO_RUN_ROOT}/include
+    ${CLIO_RUN_ROOT}/test
+  )
+  target_link_libraries(chimaera_compose_restart_test
+    clio_admin_client
+    chimaera_cxx
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+  )
+  target_compile_definitions(chimaera_compose_restart_test PRIVATE
+    CLIO_RUN_EXE="$<TARGET_FILE:clio_run>")
+  add_dependencies(chimaera_compose_restart_test clio_run)
+  set_target_properties(chimaera_compose_restart_test PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  add_test(
+    NAME cr_cli_compose_restart
+    COMMAND chimaera_compose_restart_test
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_cli_compose_restart PROPERTIES
+    ENVIRONMENT "${_cli_live_env}"
+    RESOURCE_LOCK "chimaera_runtime_port"
+    TIMEOUT 240
+    LABELS "msan_skip"
+  )
 endif()  # CLIO_CORE_ENABLE_TESTS
 
 endif()  # NOT WIN32

@@ -1460,6 +1460,59 @@ struct RestartContainersTask : public chi::Task {
 };
 
 /**
+ * ListContainersTask - Enumerate the active pools/containers in the local
+ * daemon. Returns parallel vectors of pool names and pool-id strings (one
+ * entry per active pool).
+ */
+struct ListContainersTask : public chi::Task {
+  OUT std::vector<std::string> pool_names_;
+  OUT std::vector<std::string> pool_ids_;
+
+  /** SHM default constructor */
+  ListContainersTask() : chi::Task() {}
+
+  /** Emplace constructor */
+  explicit ListContainersTask(const chi::TaskId &task_node,
+                              const chi::PoolId &pool_id,
+                              const chi::PoolQuery &pool_query)
+      : chi::Task(task_node, pool_id, pool_query, Method::kListContainers) {
+    task_id_ = task_node;
+    pool_id_ = pool_id;
+    method_ = Method::kListContainers;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+    ar(pool_names_, pool_ids_);
+  }
+
+  void Copy(const ctp::ipc::FullPtr<ListContainersTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+    pool_names_ = other->pool_names_;
+    pool_ids_ = other->pool_ids_;
+  }
+
+  void Aggregate(const ctp::ipc::FullPtr<chi::Task> &other_base) {
+    Task::Aggregate(other_base);
+    auto other = other_base.template Cast<ListContainersTask>();
+    for (auto &n : other->pool_names_) {
+      pool_names_.push_back(n);
+    }
+    for (auto &i : other->pool_ids_) {
+      pool_ids_.push_back(i);
+    }
+  }
+};
+
+/**
  * AddNodeTask - Register a new node with all existing nodes in the cluster
  * Broadcasts to all nodes to update their internal hostfile
  */
