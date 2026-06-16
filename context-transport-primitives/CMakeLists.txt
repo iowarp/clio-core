@@ -79,7 +79,11 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID MATCHES "^(Appl
 
     set(CLIO_CTP_COMPILER_GNU "ON")
 
-    if(APPLE)
+    if(WIN32)
+        # Clang/IntelLLVM (icx) targeting Windows: rt/dl are POSIX-only. Use
+        # the Winsock import library like the MSVC branch below.
+        set(REAL_TIME_FLAGS "ws2_32")
+    elseif(APPLE)
         set(REAL_TIME_FLAGS "-ldl")
     elseif(CMAKE_SYSTEM_NAME STREQUAL "OpenBSD")
         set(REAL_TIME_FLAGS "")

@@ -25,6 +25,11 @@ option(CLIO_CORE_ENABLE_TESTS "Master switch: Enable testing for all components"
 option(CLIO_CORE_ENABLE_BENCHMARKS "Master switch: Enable benchmarks for all components" ON)
 option(CLIO_CORE_ENABLE_PYTHON "Enable Python bindings for all components" OFF)
 option(CLIO_CORE_ENABLE_CMAKE_DOTENV "Enable reading environment variables from .env.cmake" OFF)
+# Precompiled headers speed up builds but conflict with WINDOWS_EXPORT_ALL_SYMBOLS
+# under the Ninja generator with non-MSVC Windows compilers (icx/clang-cl): the
+# bindexplib pass (cmake -E __create_def) fails to read the cmake_pch object.
+# Default ON (no change for existing builds); turn OFF for those toolchains.
+option(CLIO_CORE_ENABLE_PCH "Enable precompiled headers for faster builds" ON)
 option(CLIO_CORE_ENABLE_ASAN "Enable AddressSanitizer + LeakSanitizer for debugging" OFF)
 option(CLIO_CORE_ENABLE_UBSAN "Enable UndefinedBehaviorSanitizer for debugging" OFF)
 option(CLIO_CORE_ENABLE_MSAN "Enable MemorySanitizer for debugging (requires instrumented dependencies)" OFF)
