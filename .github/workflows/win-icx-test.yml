@@ -142,6 +142,25 @@ jobs:
             -DCLIO_CTP_LOG_LEVEL=0 || exit /b 1
           cmake --build build --config Debug -j %NUMBER_OF_PROCESSORS% || exit /b 1
 
+      - name: Diagnose export-def failure
+        if: failure()
+        shell: cmd
+        run: |
+          @echo on
+          cd build
+          echo CWD=%CD%
+          cmake --version
+          set DEFDIR=context-transport-primitives\src\CMakeFiles\clio_ctp_host.dir
+          echo ===== exports.def.objs contents =====
+          type "%DEFDIR%\exports.def.objs"
+          echo ===== dir of %DEFDIR% =====
+          dir "%DEFDIR%"
+          echo ===== does system_info.cc.obj exist? =====
+          if exist "%DEFDIR%\system_info.cc.obj" (echo YES exists) else (echo NO missing)
+          echo ===== try __create_def from build root =====
+          cmake -E __create_def diag_exports.def "%DEFDIR%\exports.def.objs"
+          echo create_def-from-buildroot exit=%ERRORLEVEL%
+
       - name: Run ctest
         shell: cmd
         run: |
