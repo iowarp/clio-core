@@ -2,6 +2,22 @@ cmake_minimum_required(VERSION 3.20)
 project(iowarp-core VERSION 2.1.0 LANGUAGES C CXX)
 
 #------------------------------------------------------------------------------
+# MSVC-like front end detection
+#------------------------------------------------------------------------------
+# True for cl.exe (MSVC) and for compilers that drive an MSVC-compatible command
+# line: clang-cl and Intel's icx.exe on Windows. These accept "/"-style flags
+# (e.g. /Zi, /Od, /Fo<obj>) and MUST NOT be given GNU-style flags. Mixing GNU
+# flags (-g -O0 -Wfatal-errors) onto icx.exe flips it into clang driver mode,
+# where it ignores /Fo<obj> and writes <basename>.o into the build root --
+# leaving CMake/ninja's expected .obj absent and breaking the DLL link
+# (WINDOWS_EXPORT_ALL_SYMBOLS / bindexplib). See issue #555.
+if(MSVC OR (WIN32 AND CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC"))
+    set(CLIO_CORE_MSVC_LIKE ON)
+else()
+    set(CLIO_CORE_MSVC_LIKE OFF)
+endif()
+
+#------------------------------------------------------------------------------
 # Project Options
 #==============================================================================
 # BUILD CONFIGURATION OPTIONS
@@ -863,7 +879,9 @@ endif()
 #------------------------------------------------------------------------------
 # Compiler Flags
 #------------------------------------------------------------------------------
-if(NOT MSVC)
+# Use CLIO_CORE_MSVC_LIKE (not just MSVC) so clang-cl / icx.exe on Windows take
+# the MSVC-style flag path; GNU flags break icx's /Fo handling (see issue #555).
+if(NOT CLIO_CORE_MSVC_LIKE)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC")
     if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "NVHPC")
         # Add compiler flags following Google C++ style guide
