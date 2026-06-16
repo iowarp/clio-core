@@ -160,6 +160,12 @@ jobs:
           echo ===== try __create_def from build root =====
           cmake -E __create_def diag_exports.def "%DEFDIR%\exports.def.objs"
           echo create_def-from-buildroot exit=%ERRORLEVEL%
+          echo ===== search whole build tree for system_info objects =====
+          dir /s /b system_info*.obj system_info*.o 2>nul
+          echo ----- total .obj count in build tree -----
+          dir /s /b *.obj 2>nul | find /c ".obj"
+          echo ===== compile command for system_info.cc (compile_commands.json) =====
+          findstr /i "system_info.cc" compile_commands.json
 
       - name: Run ctest
         shell: cmd
