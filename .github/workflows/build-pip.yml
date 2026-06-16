@@ -342,6 +342,12 @@ jobs:
             echo "=== CLI test ==="
             clio_run --help
 
+            echo "=== Context visualizer (standard feature) ==="
+            # flask is a core dependency, so the dashboard works out of the
+            # box. Verify the package imports and the console script runs.
+            python -c "import context_visualizer; print(\"visualizer import OK\")"
+            context-visualizer --help
+
             echo "=== Benchmark binaries: --help smoke test ==="
             # NOTE: This entire docker invocation is wrapped in bash -c
             # (single quotes), so comments here must not contain apostrophes
@@ -450,6 +456,11 @@ jobs:
         echo "=== CLI test ==="
         clio_run --help
 
+        echo "=== Context visualizer (standard feature) ==="
+        # flask is a core dependency, so the dashboard works out of the box.
+        python -c "import context_visualizer; print('visualizer import OK')"
+        context-visualizer --help
+
         echo "=== Benchmark binaries: --help smoke test ==="
         # Catch SIGSEGV / abort at load time. Bench --help exit codes
         # are allowed to be non-zero; only signal-level deaths fail us.
@@ -536,6 +547,15 @@ jobs:
         # crash; positive small codes are app-level "I printed usage".
         if ($LASTEXITCODE -lt 0 -or $LASTEXITCODE -gt 100) {
           throw "clio_run --help died with exit code $LASTEXITCODE (likely missing DLL or binary)"
+        }
+
+        Write-Host "=== Context visualizer (standard feature) ==="
+        # flask is a core dependency, so the dashboard works out of the box.
+        python -c "import context_visualizer; print('visualizer import OK')"
+        if ($LASTEXITCODE -ne 0) { throw "context_visualizer import failed" }
+        context-visualizer --help
+        if ($LASTEXITCODE -lt 0 -or $LASTEXITCODE -gt 100) {
+          throw "context-visualizer --help died with exit code $LASTEXITCODE"
         }
 
         Write-Host "=== Benchmark binaries: --help smoke test ==="
