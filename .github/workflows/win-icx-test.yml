@@ -167,6 +167,18 @@ jobs:
           echo ===== compile command for system_info.cc (compile_commands.json) =====
           findstr /i "system_info.cc" compile_commands.json
 
+      - name: Diagnose compile command (pwsh)
+        if: failure()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          Write-Host "===== CMAKE_CXX_COMPILER_FRONTEND_VARIANT / flags / CLIO_CORE_MSVC_LIKE in cache ====="
+          Select-String -Path build/CMakeCache.txt -Pattern "FRONTEND_VARIANT|CLIO_CORE_MSVC_LIKE|CMAKE_CXX_FLAGS" -SimpleMatch | ForEach-Object { $_.Line }
+          Write-Host "===== exact compile command for context-transport-primitives/src/system_info.cc ====="
+          $cc = Get-Content build/compile_commands.json -Raw | ConvertFrom-Json
+          $e = $cc | Where-Object { $_.file -like '*context-transport-primitives*system_info.cc' -and $_.output -like '*clio_ctp_host*' }
+          $e | ForEach-Object { Write-Host "OUTPUT:" $_.output; Write-Host "COMMAND:" $_.command }
+
       - name: Run ctest
         shell: cmd
         run: |
