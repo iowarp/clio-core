@@ -52,6 +52,17 @@ else()
     message(STATUS "CTE: Compression disabled - skipping compressor chimod (use -DWRP_CTE_ENABLE_COMPRESS=ON to enable)")
 endif()
 
+# Add the filesystem ChiMod (a filesystem interface over the CTE; the I/O
+# interceptors delegate to it). Default OFF while scaffolding (#552) so the
+# in-progress chimod can't break the default build; flip ON to develop it.
+option(CLIO_CTE_ENABLE_FILESYSTEM "Build the filesystem chimod (WIP, #552)" OFF)
+if(CLIO_CTE_ENABLE_FILESYSTEM)
+    message(STATUS "CTE: building filesystem chimod")
+    add_subdirectory(filesystem)
+else()
+    message(STATUS "CTE: filesystem chimod disabled (use -DCLIO_CTE_ENABLE_FILESYSTEM=ON)")
+endif()
+
 # Add the bdev ChiMod (when it exists)
 # add_subdirectory(chimods/bdev)
 

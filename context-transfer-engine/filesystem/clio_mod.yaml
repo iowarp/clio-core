@@ -1,0 +1,28 @@
+# Filesystem ChiMod — a filesystem interface over the CTE, sibling to the
+# compressor chimod. The I/O interceptors (POSIX, STDIO, libfuse, HDF5 VFD,
+# MPI-IO) delegate to this one chimod so filesystem semantics live in one
+# place. Implemented like the libfuse adapter (paths -> CTE tags, offsets ->
+# 1 MiB page-blobs) plus server-side logical-size metadata so truncate /
+# append / getattr are exact. The client inherits clio::cte::core::Client.
+module_name: filesystem
+namespace: clio::cte
+version: 1.0.0
+
+kCreate: 0
+kDestroy: 1
+kMonitor: 9
+
+# Filesystem operations
+kOpen: 10
+kClose: 11
+kRead: 12
+kWrite: 13
+kGetattr: 14
+kTruncate: 15
+kAppend: 16
+kReaddir: 17
+kMkdir: 18
+kRmdir: 19
+kUnlink: 20
+kRename: 21
+kStatSize: 22
