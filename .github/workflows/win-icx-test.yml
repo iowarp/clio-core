@@ -144,43 +144,6 @@ jobs:
             -DCLIO_CTP_LOG_LEVEL=0 || exit /b 1
           cmake --build build --config Debug -j %NUMBER_OF_PROCESSORS% || exit /b 1
 
-      - name: Diagnose export-def failure
-        if: failure()
-        shell: cmd
-        run: |
-          @echo on
-          cd build
-          echo CWD=%CD%
-          cmake --version
-          set DEFDIR=context-transport-primitives\src\CMakeFiles\clio_ctp_host.dir
-          echo ===== exports.def.objs contents =====
-          type "%DEFDIR%\exports.def.objs"
-          echo ===== dir of %DEFDIR% =====
-          dir "%DEFDIR%"
-          echo ===== does system_info.cc.obj exist? =====
-          if exist "%DEFDIR%\system_info.cc.obj" (echo YES exists) else (echo NO missing)
-          echo ===== try __create_def from build root =====
-          cmake -E __create_def diag_exports.def "%DEFDIR%\exports.def.objs"
-          echo create_def-from-buildroot exit=%ERRORLEVEL%
-          echo ===== search whole build tree for system_info objects =====
-          dir /s /b system_info*.obj system_info*.o 2>nul
-          echo ----- total .obj count in build tree -----
-          dir /s /b *.obj 2>nul | find /c ".obj"
-          echo ===== compile command for system_info.cc (compile_commands.json) =====
-          findstr /i "system_info.cc" compile_commands.json
-
-      - name: Diagnose compile command (pwsh)
-        if: failure()
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Continue"
-          Write-Host "===== CMAKE_CXX_COMPILER_FRONTEND_VARIANT / flags / CLIO_CORE_MSVC_LIKE in cache ====="
-          Select-String -Path build/CMakeCache.txt -Pattern "FRONTEND_VARIANT|CLIO_CORE_MSVC_LIKE|CMAKE_CXX_FLAGS" -SimpleMatch | ForEach-Object { $_.Line }
-          Write-Host "===== exact compile command for context-transport-primitives/src/system_info.cc ====="
-          $cc = Get-Content build/compile_commands.json -Raw | ConvertFrom-Json
-          $e = $cc | Where-Object { $_.file -like '*context-transport-primitives*system_info.cc' -and $_.output -like '*clio_ctp_host*' }
-          $e | ForEach-Object { Write-Host "OUTPUT:" $_.output; Write-Host "COMMAND:" $_.command }
-
       - name: Run ctest
         shell: cmd
         run: |
