@@ -104,38 +104,6 @@ jobs:
           path: ${{ env.ONEAPI_ROOT_DIR }}
           key: oneapi-${{ runner.os }}-${{ env.CACHE_NUMBER }}-${{ env.WINDOWS_BASEKIT_URL }}-${{ env.WINDOWS_CPP_COMPONENTS }}
 
-      - name: Probe icx-cl /Fo behavior
-        shell: cmd
-        run: |
-          @echo on
-          setlocal enabledelayedexpansion
-          call "%ProgramFiles(x86)%\Intel\oneAPI\setvars.bat" >nul || exit /b 1
-          if exist probe rmdir /s /q probe
-          mkdir probe & cd probe & mkdir out & mkdir inc
-          echo int foo(){return 0;} > system_info.cc
-          set SRC=%CD%\system_info.cc
-          rem Flag groups mirroring CMake's real icx-cl command line.
-          set BASE=/nologo /TP /DWIN32 /D_WINDOWS /EHsc /Zi /Od /Ob0 /RTC1 -MDd /FS
-          set QSTD=-Qstd:c++20
-          set EXT=-external:I"%CD%\inc" -external:W0
-          call :run D  "%BASE% %QSTD% %EXT%"          "%SRC%"
-          call :run E  "%BASE% %EXT%"                  "%SRC%"
-          call :run F  "%BASE% %QSTD%"                 "%SRC%"
-          call :run G  "%BASE%"                        "%SRC%"
-          call :run H  "%BASE% %QSTD% %EXT%"           "system_info.cc"
-          goto :eof
-          :run
-          set TAG=%~1
-          set FLAGS=%~2
-          set THESRC=%~3
-          del /q out\!TAG!.obj system_info.o 2>nul
-          echo ===== case !TAG!: icx-cl !FLAGS! /Foout\!TAG!.obj -c !THESRC! =====
-          icx-cl !FLAGS! /Foout\!TAG!.obj /Fdout\ -c "!THESRC!"
-          if exist out\!TAG!.obj (echo !TAG!_RESULT: OK obj-at-/Fo) else (echo !TAG!_RESULT: MISSING)
-          if exist system_info.o (echo !TAG!_RESULT: STRAY system_info.o in cwd)
-          del /q out\!TAG!.obj system_info.o 2>nul
-          goto :eof
-
       - name: Configure and build (icx)
         shell: cmd
         run: |
@@ -174,10 +142,7 @@ jobs:
             -DCLIO_CORE_ENABLE_BENCHMARKS=OFF ^
             -DCMAKE_EXPORT_COMPILE_COMMANDS=ON ^
             -DCLIO_CTP_LOG_LEVEL=0 || exit /b 1
-          rem --verbose (temporary): print the exact ninja-invoked compile
-          rem command, including dep flags (-QMD/-QMT/-QMF) that ninja injects
-          rem but compile_commands.json omits -- to see why icx-cl drops /Fo.
-          cmake --build build --config Debug --verbose -j %NUMBER_OF_PROCESSORS% || exit /b 1
+          cmake --build build --config Debug -j %NUMBER_OF_PROCESSORS% || exit /b 1
 
       - name: Diagnose export-def failure
         if: failure()

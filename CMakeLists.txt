@@ -841,12 +841,21 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # Position Independent Code - Applied to all subdirectories
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-# ccache — accelerate rebuilds by caching compiled objects
+# ccache — accelerate rebuilds by caching compiled objects.
+# NOT used for MSVC-like compilers (cl / clang-cl / icx-cl): as a compiler
+# launcher under Ninja, ccache mishandles the cl-style /Fo<obj> output flag and
+# the object is written as <base>.o into the build root instead of the expected
+# path, which breaks WINDOWS_EXPORT_ALL_SYMBOLS / the DLL link. (The Visual
+# Studio generator never applied the launcher, which is why MSVC CI was fine.)
+# See issue #555.
+option(CLIO_CORE_ENABLE_CCACHE "Use ccache as compiler launcher when available" ON)
 find_program(CCACHE_PROGRAM ccache)
-if(CCACHE_PROGRAM)
+if(CCACHE_PROGRAM AND CLIO_CORE_ENABLE_CCACHE AND NOT CLIO_CORE_MSVC_LIKE)
     set(CMAKE_C_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
     set(CMAKE_CXX_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
     message(STATUS "ccache enabled: ${CCACHE_PROGRAM}")
+elseif(CCACHE_PROGRAM)
+    message(STATUS "ccache found but not used (CLIO_CORE_ENABLE_CCACHE=${CLIO_CORE_ENABLE_CCACHE}, CLIO_CORE_MSVC_LIKE=${CLIO_CORE_MSVC_LIKE})")
 else()
     message(STATUS "ccache not found — install ccache for faster rebuilds")
 endif()
