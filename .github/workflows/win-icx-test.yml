@@ -108,24 +108,33 @@ jobs:
         shell: cmd
         run: |
           @echo on
+          setlocal enabledelayedexpansion
           call "%ProgramFiles(x86)%\Intel\oneAPI\setvars.bat" >nul || exit /b 1
           if exist probe rmdir /s /q probe
-          mkdir probe & cd probe & mkdir out
-          echo int foo(){return 0;} > t.cpp
-          echo ===== case A: cl-style "/c /Fo" =====
-          icx-cl /nologo /c /Foout\a.obj t.cpp
-          if exist out\a.obj (echo A_RESULT: obj at out\a.obj) else (echo A_RESULT: MISSING)
-          if exist t.o (echo A_RESULT: stray t.o present)
-          del /q t.o out\a.obj 2>nul
-          echo ===== case B: dash "-c /Fo" =====
-          icx-cl /nologo -c /Foout\b.obj t.cpp
-          if exist out\b.obj (echo B_RESULT: obj at out\b.obj) else (echo B_RESULT: MISSING)
-          if exist t.o (echo B_RESULT: stray t.o present)
-          del /q t.o out\b.obj 2>nul
-          echo ===== case C: dash "-c -o" =====
-          icx-cl /nologo -c -oout\c.obj t.cpp
-          if exist out\c.obj (echo C_RESULT: obj at out\c.obj) else (echo C_RESULT: MISSING)
-          if exist t.o (echo C_RESULT: stray t.o present)
+          mkdir probe & cd probe & mkdir out & mkdir inc
+          echo int foo(){return 0;} > system_info.cc
+          set SRC=%CD%\system_info.cc
+          rem Flag groups mirroring CMake's real icx-cl command line.
+          set BASE=/nologo /TP /DWIN32 /D_WINDOWS /EHsc /Zi /Od /Ob0 /RTC1 -MDd /FS
+          set QSTD=-Qstd:c++20
+          set EXT=-external:I"%CD%\inc" -external:W0
+          call :run D  "%BASE% %QSTD% %EXT%"          "%SRC%"
+          call :run E  "%BASE% %EXT%"                  "%SRC%"
+          call :run F  "%BASE% %QSTD%"                 "%SRC%"
+          call :run G  "%BASE%"                        "%SRC%"
+          call :run H  "%BASE% %QSTD% %EXT%"           "system_info.cc"
+          goto :eof
+          :run
+          set TAG=%~1
+          set FLAGS=%~2
+          set THESRC=%~3
+          del /q out\!TAG!.obj system_info.o 2>nul
+          echo ===== case !TAG!: icx-cl !FLAGS! /Foout\!TAG!.obj -c !THESRC! =====
+          icx-cl !FLAGS! /Foout\!TAG!.obj /Fdout\ -c "!THESRC!"
+          if exist out\!TAG!.obj (echo !TAG!_RESULT: OK obj-at-/Fo) else (echo !TAG!_RESULT: MISSING)
+          if exist system_info.o (echo !TAG!_RESULT: STRAY system_info.o in cwd)
+          del /q out\!TAG!.obj system_info.o 2>nul
+          goto :eof
 
       - name: Configure and build (icx)
         shell: cmd
