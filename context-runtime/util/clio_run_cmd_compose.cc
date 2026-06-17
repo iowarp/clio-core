@@ -1,20 +1,222 @@
-#include <iostream>
-#include <string>
-#include <sstream>
 #include <cstring>
 #include <filesystem>
-#include <fstream>
+#include <iostream>
+#include <string>
+#include <vector>
+
+#include <clio_runtime/admin/admin_client.h>
 #include <clio_runtime/clio_runtime.h>
 #include <clio_runtime/config_manager.h>
-#include <clio_runtime/admin/admin_client.h>
+#include <clio_runtime/restart_log.h>
+
 #include "clio_run_commands.h"
 
 namespace {
+namespace fs = std::filesystem;
+
 void PrintComposeUsage() {
-  HIPRINT("Usage: chimaera compose [--unregister] <compose_config.yaml>");
-  HIPRINT("  Loads compose configuration and creates/destroys specified pools");
-  HIPRINT("  --unregister: Destroy pools instead of creating them");
-  HIPRINT("  Requires runtime to be already initialized");
+  HIPRINT("Usage: clio_run compose <start|stop|rm|list> [options]");
+  HIPRINT("  start <config.yaml>    Create the pools in the compose file.");
+  HIPRINT("                         Pools with 'restart: true' register the");
+  HIPRINT("                         file in the restart log (~/.clio/restart_log.bin)");
+  HIPRINT("                         so it is re-composed on `clio_run start`.");
+  HIPRINT("  stop  <config.yaml>    Destroy the pools listed in the compose file.");
+  HIPRINT("                         Leaves the restart registration intact.");
+  HIPRINT("  rm    <config.yaml>    Stop the pools AND unregister the file from");
+  HIPRINT("                         restart. Does NOT delete the compose file.");
+  HIPRINT("  list  [--restartable]  List active containers in the local daemon.");
+  HIPRINT("                         --restartable: list files registered for restart.");
+}
+
+// Resolve a compose-file path to a stable absolute form so the same file
+// referenced from different working directories maps to one WAL key.
+std::string AbsPath(const std::string& path) {
+  std::error_code ec;
+  fs::path abs = fs::weakly_canonical(fs::absolute(path, ec), ec);
+  if (ec || abs.empty()) {
+    return fs::absolute(path).string();
+  }
+  return abs.string();
+}
+
+// RAII: join the ZMQ recv thread / close the DEALER socket on every return
+// path (the heap-allocated runtime singleton's dtor never runs otherwise, so
+// zmq_ctx_destroy would block forever at exit).
+struct ClientFinalizeGuard {
+  ~ClientFinalizeGuard() {
+    auto* mgr = CLIO_RUNTIME_MANAGER;
+    if (mgr != nullptr) {
+      mgr->ClientFinalize();
+    }
+  }
+};
+
+bool InitClient() {
+  if (!chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, false)) {
+    HLOG(kError, "Failed to initialize Clio runtime client");
+    return false;
+  }
+  return true;
+}
+
+// Load a compose file into a local ConfigManager (avoids clobbering the
+// process-wide singleton) and copy out its pool list.
+bool LoadComposeFile(const std::string& path, chi::ComposeConfig* out) {
+  chi::ConfigManager cfg;
+  if (!cfg.LoadYaml(path)) {
+    HLOG(kError, "Failed to load compose file: {}", path);
+    return false;
+  }
+  *out = cfg.GetComposeConfig();
+  return true;
+}
+
+int ComposeStart(const std::string& path) {
+  if (!InitClient()) {
+    return 1;
+  }
+  ClientFinalizeGuard guard;
+
+  chi::ComposeConfig compose;
+  if (!LoadComposeFile(path, &compose)) {
+    return 1;
+  }
+  if (compose.pools_.empty()) {
+    HLOG(kError, "No compose section found in {}", path);
+    return 1;
+  }
+
+  auto* admin = CLIO_ADMIN;
+  if (admin == nullptr) {
+    HLOG(kError, "Failed to get admin client");
+    return 1;
+  }
+
+  bool any_restart = false;
+  for (const auto& pool_config : compose.pools_) {
+    HLOG(kInfo, "Creating pool {} (module: {})", pool_config.pool_name_,
+         pool_config.mod_name_);
+    auto task = admin->AsyncCompose(pool_config);
+    task.Wait();
+    if (task->GetReturnCode() != 0) {
+      HLOG(kError, "Failed to create pool {} (module: {}), return code: {}",
+           pool_config.pool_name_, pool_config.mod_name_,
+           task->GetReturnCode());
+      return 1;
+    }
+    HLOG(kSuccess, "Successfully created pool {}", pool_config.pool_name_);
+    if (pool_config.restart_) {
+      any_restart = true;
+    }
+  }
+
+  // Register the file for restart iff it declares at least one restartable
+  // pool. The WAL keys on the absolute compose-file path.
+  if (any_restart) {
+    clio::run::RestartLog log;
+    std::string abs = AbsPath(path);
+    if (log.AppendAdd(abs)) {
+      log.Compact();
+      HLOG(kInfo, "Registered '{}' for restart in {}", abs, log.path());
+    } else {
+      HLOG(kWarning, "Failed to register '{}' in restart log", abs);
+    }
+  }
+
+  HLOG(kSuccess, "compose start: all {} pools created", compose.pools_.size());
+  return 0;
+}
+
+// Destroy every pool listed in a compose file. Used by both stop and rm.
+int DestroyComposePools(const std::string& path) {
+  chi::ComposeConfig compose;
+  if (!LoadComposeFile(path, &compose)) {
+    return 1;
+  }
+  auto* admin = CLIO_ADMIN;
+  if (admin == nullptr) {
+    HLOG(kError, "Failed to get admin client");
+    return 1;
+  }
+  for (const auto& pool_config : compose.pools_) {
+    HLOG(kInfo, "Stopping pool {} (module: {})", pool_config.pool_name_,
+         pool_config.mod_name_);
+    auto task =
+        admin->AsyncDestroyPool(chi::PoolQuery::Dynamic(), pool_config.pool_id_);
+    task.Wait();
+    if (task->GetReturnCode() != 0) {
+      HLOG(kWarning, "Failed to stop pool {}, return code: {}",
+           pool_config.pool_name_, task->GetReturnCode());
+    } else {
+      HLOG(kSuccess, "Stopped pool {}", pool_config.pool_name_);
+    }
+  }
+  return 0;
+}
+
+int ComposeStop(const std::string& path) {
+  if (!InitClient()) {
+    return 1;
+  }
+  ClientFinalizeGuard guard;
+  return DestroyComposePools(path);
+}
+
+int ComposeRm(const std::string& path) {
+  if (!InitClient()) {
+    return 1;
+  }
+  ClientFinalizeGuard guard;
+  int rc = DestroyComposePools(path);
+
+  // Unregister from restart regardless of stop result; a dangling rm with no
+  // matching add is dropped by Compact(). The compose file itself is kept.
+  clio::run::RestartLog log;
+  std::string abs = AbsPath(path);
+  if (log.AppendRm(abs)) {
+    log.Compact();
+    HLOG(kInfo, "Unregistered '{}' from restart", abs);
+  } else {
+    HLOG(kWarning, "Failed to unregister '{}' from restart log", abs);
+  }
+  return rc;
+}
+
+int ComposeList(bool restartable) {
+  if (restartable) {
+    // Restartable set comes purely from the WAL — no daemon query needed.
+    clio::run::RestartLog log;
+    std::vector<std::string> live = log.LiveSet();
+    std::cout << "Restartable containers (" << live.size() << "):\n";
+    for (const auto& p : live) {
+      std::cout << "  " << p << "\n";
+    }
+    return 0;
+  }
+
+  if (!InitClient()) {
+    return 1;
+  }
+  ClientFinalizeGuard guard;
+  auto* admin = CLIO_ADMIN;
+  if (admin == nullptr) {
+    HLOG(kError, "Failed to get admin client");
+    return 1;
+  }
+  auto task = admin->AsyncListContainers(chi::PoolQuery::Local());
+  task.Wait();
+  if (task->GetReturnCode() != 0) {
+    HLOG(kError, "ListContainers failed, return code: {}",
+         task->GetReturnCode());
+    return 1;
+  }
+  std::cout << "Active containers (" << task->pool_names_.size() << "):\n";
+  for (size_t i = 0; i < task->pool_names_.size(); ++i) {
+    std::cout << "  " << task->pool_names_[i] << "  (pool_id="
+              << (i < task->pool_ids_.size() ? task->pool_ids_[i] : "?")
+              << ")\n";
+  }
+  return 0;
 }
 }  // namespace
 
@@ -24,146 +226,63 @@ int Compose(int argc, char** argv) {
     return 1;
   }
 
-  bool unregister = false;
-  std::string config_path;
+  std::string sub = argv[0];
+  if (sub == "-h" || sub == "--help") {
+    PrintComposeUsage();
+    return 0;
+  }
 
-  int i = 0;
-  while (i < argc) {
-    std::string arg(argv[i]);
-    if (arg == "--unregister") {
+  std::vector<std::string> rest;
+  rest.reserve(argc);
+  for (int i = 1; i < argc; ++i) {
+    rest.emplace_back(argv[i]);
+  }
+
+  if (sub == "start" || sub == "stop" || sub == "rm") {
+    if (rest.empty()) {
+      HLOG(kError, "compose {} requires a config file path", sub);
+      PrintComposeUsage();
+      return 1;
+    }
+    if (sub == "start") {
+      return ComposeStart(rest[0]);
+    }
+    if (sub == "stop") {
+      return ComposeStop(rest[0]);
+    }
+    return ComposeRm(rest[0]);
+  }
+
+  if (sub == "list") {
+    bool restartable = false;
+    for (const auto& a : rest) {
+      if (a == "--restartable") {
+        restartable = true;
+      }
+    }
+    return ComposeList(restartable);
+  }
+
+  // Backward-compatible fallback: `compose <file>` (== start) and the old
+  // `compose --unregister <file>` (== rm). Emits a deprecation warning.
+  bool unregister = false;
+  std::string path;
+  for (int i = 0; i < argc; ++i) {
+    std::string a = argv[i];
+    if (a == "--unregister") {
       unregister = true;
-      ++i;
-    } else if (arg == "--help" || arg == "-h") {
+    } else if (a == "-h" || a == "--help") {
       PrintComposeUsage();
       return 0;
     } else {
-      config_path = arg;
-      ++i;
+      path = a;
     }
   }
-
-  if (config_path.empty()) {
-    HLOG(kError, "Missing compose config path");
+  if (path.empty()) {
     PrintComposeUsage();
     return 1;
   }
-
-  if (!chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, false)) {
-    HLOG(kError, "Failed to initialize Chimaera client");
-    return 1;
-  }
-
-  // RAII guard: call ClientFinalize() on every return path so the background
-  // ZMQ receive thread is joined and the DEALER socket is closed before the
-  // ZMQ shared-context static destructor runs.  Without this, zmq_ctx_destroy
-  // blocks forever because the singleton CLIO Runtime object is heap-allocated
-  // (via GetGlobalPtrVar) and its destructor is never invoked by the runtime.
-  struct ClientFinalizeGuard {
-    ~ClientFinalizeGuard() {
-      auto* mgr = CLIO_RUNTIME_MANAGER;
-      if (mgr) {
-        mgr->ClientFinalize();
-      }
-    }
-  } finalize_guard;
-
-  auto* config_manager = CLIO_CONFIG_MANAGER;
-  if (!config_manager->LoadYaml(config_path)) {
-    HLOG(kError, "Failed to load configuration from {}", config_path);
-    return 1;
-  }
-
-  const auto& compose_config = config_manager->GetComposeConfig();
-  if (compose_config.pools_.empty()) {
-    HLOG(kError, "No compose section found in configuration");
-    return 1;
-  }
-
-  HLOG(kInfo, "Found {} pools to {}",
-       compose_config.pools_.size(), (unregister ? "destroy" : "create"));
-
-  auto* admin_client = CLIO_ADMIN;
-  if (!admin_client) {
-    HLOG(kError, "Failed to get admin client");
-    return 1;
-  }
-
-  if (unregister) {
-    for (const auto& pool_config : compose_config.pools_) {
-      HLOG(kInfo, "Destroying pool {} (module: {})",
-           pool_config.pool_name_, pool_config.mod_name_);
-
-      auto task = admin_client->AsyncDestroyPool(
-          chi::PoolQuery::Dynamic(), pool_config.pool_id_);
-      task.Wait();
-
-      chi::u32 return_code = task->GetReturnCode();
-      if (return_code != 0) {
-        HLOG(kError, "Failed to destroy pool {}, return code: {}",
-             pool_config.pool_name_, return_code);
-      } else {
-        HLOG(kSuccess, "Successfully destroyed pool {}", pool_config.pool_name_);
-      }
-
-      namespace fs = std::filesystem;
-      std::string restart_file = config_manager->GetConfDir() + "/restart/"
-                                 + pool_config.pool_name_ + ".yaml";
-      if (fs::exists(restart_file)) {
-        fs::remove(restart_file);
-        HLOG(kInfo, "Removed restart file: {}", restart_file);
-      }
-    }
-
-    HLOG(kSuccess, "Unregister completed for {} pools",
-         compose_config.pools_.size());
-  } else {
-    for (const auto& pool_config : compose_config.pools_) {
-      HLOG(kInfo, "Creating pool {} (module: {})",
-           pool_config.pool_name_, pool_config.mod_name_);
-
-      auto task = admin_client->AsyncCompose(pool_config);
-      task.Wait();
-
-      chi::u32 return_code = task->GetReturnCode();
-      if (return_code != 0) {
-        HLOG(kError, "Failed to create pool {} (module: {}), return code: {}",
-             pool_config.pool_name_, pool_config.mod_name_, return_code);
-        return 1;
-      }
-
-      HLOG(kSuccess, "Successfully created pool {}", pool_config.pool_name_);
-
-      if (pool_config.restart_) {
-        namespace fs = std::filesystem;
-        std::string restart_dir = config_manager->GetConfDir() + "/restart";
-        fs::create_directories(restart_dir);
-        std::string restart_file = restart_dir + "/" + pool_config.pool_name_ + ".yaml";
-
-        std::ofstream ofs(restart_file);
-        if (ofs.is_open()) {
-          std::string indented;
-          std::istringstream stream(pool_config.config_);
-          std::string line;
-          bool first = true;
-          while (std::getline(stream, line)) {
-            if (first) {
-              indented += "  - " + line + "\n";
-              first = false;
-            } else {
-              indented += "    " + line + "\n";
-            }
-          }
-          ofs << "compose:\n" << indented;
-          ofs.close();
-          HLOG(kInfo, "Saved restart config: {}", restart_file);
-        } else {
-          HLOG(kWarning, "Failed to save restart config: {}", restart_file);
-        }
-      }
-    }
-
-    HLOG(kSuccess, "Compose processing completed successfully - all {} pools created",
-         compose_config.pools_.size());
-  }
-  return 0;
+  HLOG(kWarning,
+       "`clio_run compose <file>` is deprecated; use `clio_run compose start`");
+  return unregister ? ComposeRm(path) : ComposeStart(path);
 }

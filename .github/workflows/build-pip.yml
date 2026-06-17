@@ -330,9 +330,18 @@ jobs:
             python3 -m venv /tmp/test-venv
             source /tmp/test-venv/bin/activate
 
-            # Install the wheel matching this Python version
-            # Use --find-links for the local wheel, but allow PyPI for dependencies
-            pip install --quiet --find-links /wheels --no-cache-dir iowarp-core
+            # Install the freshly built wheel BY FILE PATH, not by name.
+            # A by-name install (iowarp-core) lets pip consider PyPI, where the
+            # same version may already be published with older metadata, and
+            # use that PyPI metadata instead of this wheel — so a changed
+            # dependency set (e.g. flask promoted to a core dep) would not be
+            # exercised. Selecting the wheel file for this Python tag forces
+            # the local artifact; runtime deps (flask, pyyaml, ...) still
+            # resolve from PyPI via --find-links + the default index.
+            PYTAG=cp$(python -c "import sys; print(str(sys.version_info[0]) + str(sys.version_info[1]))")
+            WHEEL=$(ls /wheels/iowarp_core-*-${PYTAG}-*.whl | head -1)
+            echo "Installing built wheel: $WHEEL"
+            pip install --quiet --find-links /wheels --no-cache-dir "$WHEEL"
 
             echo "=== Import test ==="
             python -c "import iowarp_core; print(\"Version:\", iowarp_core.get_version())"
@@ -341,6 +350,12 @@ jobs:
 
             echo "=== CLI test ==="
             clio_run --help
+
+            echo "=== Context visualizer (standard feature) ==="
+            # flask is a core dependency, so the dashboard works out of the
+            # box. Verify the package imports and the console script runs.
+            python -c "import context_visualizer; print(\"visualizer import OK\")"
+            context-visualizer --help
 
             echo "=== Benchmark binaries: --help smoke test ==="
             # NOTE: This entire docker invocation is wrapped in bash -c
@@ -440,7 +455,12 @@ jobs:
         python -m venv /tmp/test-venv
         source /tmp/test-venv/bin/activate
 
-        pip install --quiet --find-links wheels --no-cache-dir iowarp-core
+        # Install the built wheel by file path (not by name) so pip uses this
+        # wheel's metadata rather than a same-version release already on PyPI.
+        PYTAG=cp$(python -c "import sys; print(str(sys.version_info[0]) + str(sys.version_info[1]))")
+        WHEEL=$(ls wheels/iowarp_core-*-${PYTAG}-*.whl | head -1)
+        echo "Installing built wheel: $WHEEL"
+        pip install --quiet --find-links wheels --no-cache-dir "$WHEEL"
 
         echo "=== Import test ==="
         python -c "import iowarp_core; print('Version:', iowarp_core.get_version())"
@@ -449,6 +469,11 @@ jobs:
 
         echo "=== CLI test ==="
         clio_run --help
+
+        echo "=== Context visualizer (standard feature) ==="
+        # flask is a core dependency, so the dashboard works out of the box.
+        python -c "import context_visualizer; print('visualizer import OK')"
+        context-visualizer --help
 
         echo "=== Benchmark binaries: --help smoke test ==="
         # Catch SIGSEGV / abort at load time. Bench --help exit codes
@@ -516,7 +541,12 @@ jobs:
         python -m venv $env:TEMP\test-venv
         & $env:TEMP\test-venv\Scripts\Activate.ps1
 
-        pip install --quiet --find-links wheels --no-cache-dir iowarp-core
+        # Install the built wheel by file path (not by name) so pip uses this
+        # wheel's metadata rather than a same-version release already on PyPI.
+        $pytag = "cp" + (python -c "import sys; print(str(sys.version_info[0]) + str(sys.version_info[1]))")
+        $wheel = (Get-ChildItem "wheels\iowarp_core-*-$pytag-*.whl" | Select-Object -First 1).FullName
+        Write-Host "Installing built wheel: $wheel"
+        pip install --quiet --find-links wheels --no-cache-dir $wheel
         if ($LASTEXITCODE -ne 0) { throw "pip install failed" }
 
         Write-Host "=== Import test ==="
@@ -536,6 +566,15 @@ jobs:
         # crash; positive small codes are app-level "I printed usage".
         if ($LASTEXITCODE -lt 0 -or $LASTEXITCODE -gt 100) {
           throw "clio_run --help died with exit code $LASTEXITCODE (likely missing DLL or binary)"
+        }
+
+        Write-Host "=== Context visualizer (standard feature) ==="
+        # flask is a core dependency, so the dashboard works out of the box.
+        python -c "import context_visualizer; print('visualizer import OK')"
+        if ($LASTEXITCODE -ne 0) { throw "context_visualizer import failed" }
+        context-visualizer --help
+        if ($LASTEXITCODE -lt 0 -or $LASTEXITCODE -gt 100) {
+          throw "context-visualizer --help died with exit code $LASTEXITCODE"
         }
 
         Write-Host "=== Benchmark binaries: --help smoke test ==="

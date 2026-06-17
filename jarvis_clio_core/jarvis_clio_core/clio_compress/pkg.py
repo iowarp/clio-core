@@ -229,7 +229,7 @@ class ClioCompress(Service):
         # picking up unrelated compose entries that occupy our target
         # pool ID. Keep this a single command so the env prefix reaches
         # clio_run.
-        cmd = f'clio_run compose {self.compose_config_path}'
+        cmd = f'clio_run compose start {self.compose_config_path}'
 
         Exec(cmd, PsshExecInfo(
             env=self.mod_env,

@@ -190,6 +190,12 @@ chi::TaskResume Runtime::Run(chi::u32 method, ctp::ipc::FullPtr<chi::Task> task_
       co_await RegisterGpuContainer(typed_task, rctx);
       break;
     }
+    case Method::kListContainers: {
+      // Cast task FullPtr to specific type
+      ctp::ipc::FullPtr<ListContainersTask> typed_task = task_ptr.template Cast<ListContainersTask>();
+      co_await ListContainers(typed_task, rctx);
+      break;
+    }
     default: {
       // Unknown method - do nothing
       break;
@@ -332,6 +338,11 @@ void Runtime::SaveTask(chi::u32 method, chi::SaveTaskArchive& archive,
       archive << *typed_task.ptr_;
       break;
     }
+    case Method::kListContainers: {
+      auto typed_task = task_ptr.template Cast<ListContainersTask>();
+      archive << *typed_task.ptr_;
+      break;
+    }
     default: {
       // Unknown method - do nothing
       break;
@@ -469,6 +480,11 @@ void Runtime::LoadTask(chi::u32 method, chi::LoadTaskArchive& archive,
     }
     case Method::kRegisterGpuContainer: {
       auto typed_task = task_ptr.template Cast<RegisterGpuContainerTask>();
+      archive >> *typed_task.ptr_;
+      break;
+    }
+    case Method::kListContainers: {
+      auto typed_task = task_ptr.template Cast<ListContainersTask>();
       archive >> *typed_task.ptr_;
       break;
     }
@@ -646,6 +662,12 @@ void Runtime::LocalLoadTask(chi::u32 method, chi::DefaultLoadArchive& archive,
       archive >> *typed_task.ptr_;
       break;
     }
+    case Method::kListContainers: {
+      auto typed_task = task_ptr.template Cast<ListContainersTask>();
+      // Use archive operator which respects msg_type
+      archive >> *typed_task.ptr_;
+      break;
+    }
     default: {
       // Unknown method - do nothing
       break;
@@ -816,6 +838,12 @@ void Runtime::LocalSaveTask(chi::u32 method, chi::DefaultSaveArchive& archive,
     }
     case Method::kRegisterGpuContainer: {
       auto typed_task = task_ptr.template Cast<RegisterGpuContainerTask>();
+      // Use archive operator which respects msg_type
+      archive << *typed_task.ptr_;
+      break;
+    }
+    case Method::kListContainers: {
+      auto typed_task = task_ptr.template Cast<ListContainersTask>();
       // Use archive operator which respects msg_type
       archive << *typed_task.ptr_;
       break;
@@ -1120,6 +1148,17 @@ ctp::ipc::FullPtr<chi::Task> Runtime::NewCopyTask(chi::u32 method, ctp::ipc::Ful
       }
       break;
     }
+    case Method::kListContainers: {
+      // Allocate new task
+      auto new_task_ptr = ipc_manager->NewTask<ListContainersTask>();
+      if (!new_task_ptr.IsNull()) {
+        // Copy task fields (includes base Task fields)
+        auto task_typed = orig_task_ptr.template Cast<ListContainersTask>();
+        new_task_ptr->Copy(task_typed);
+        return new_task_ptr.template Cast<chi::Task>();
+      }
+      break;
+    }
     default: {
       // For unknown methods, create base Task copy
       auto new_task_ptr = ipc_manager->NewTask<chi::Task>();
@@ -1244,6 +1283,10 @@ ctp::ipc::FullPtr<chi::Task> Runtime::NewTask(chi::u32 method) {
     }
     case Method::kRegisterGpuContainer: {
       auto new_task_ptr = ipc_manager->NewTask<RegisterGpuContainerTask>();
+      return new_task_ptr.template Cast<chi::Task>();
+    }
+    case Method::kListContainers: {
+      auto new_task_ptr = ipc_manager->NewTask<ListContainersTask>();
       return new_task_ptr.template Cast<chi::Task>();
     }
     default: {
@@ -1386,6 +1429,11 @@ void Runtime::Aggregate(chi::u32 method, ctp::ipc::FullPtr<chi::Task> orig_task,
       typed_task->Aggregate(replica_task);
       break;
     }
+    case Method::kListContainers: {
+      auto typed_task = orig_task.template Cast<ListContainersTask>();
+      typed_task->Aggregate(replica_task);
+      break;
+    }
     default: {
       orig_task->Aggregate(replica_task);
       break;
@@ -1499,6 +1547,10 @@ void Runtime::DelTask(chi::u32 method, ctp::ipc::FullPtr<chi::Task> task_ptr) {
     }
     case Method::kRegisterGpuContainer: {
       ipc_manager->DelTask(task_ptr.template Cast<RegisterGpuContainerTask>());
+      break;
+    }
+    case Method::kListContainers: {
+      ipc_manager->DelTask(task_ptr.template Cast<ListContainersTask>());
       break;
     }
     default: {

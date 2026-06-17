@@ -61,6 +61,10 @@ test:
   commands:
     - test -f $PREFIX/lib/libchimaera_cxx.so    # [linux]
     - test -f $PREFIX/lib/libchimaera_cxx.dylib  # [osx]
+    # The context visualizer ships as a standard feature: its package must be
+    # importable and the `context-visualizer` launcher must be on PATH.
+    - python -c "import context_visualizer"
+    - context-visualizer --help
 
 about:
   home: https://www.iowarp.ai

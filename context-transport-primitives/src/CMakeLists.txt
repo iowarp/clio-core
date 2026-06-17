@@ -49,10 +49,12 @@ target_include_directories(clio_ctp_host PUBLIC
     $<INSTALL_INTERFACE:include>
 )
 hshm_target_compile_definitions(clio_ctp_host)
-target_precompile_headers(clio_ctp_host PRIVATE
-    <string> <vector> <memory> <unordered_map>
-    <functional> <algorithm> <cstdint> <cstring> <iostream>
-)
+if(CLIO_CORE_ENABLE_PCH)
+    target_precompile_headers(clio_ctp_host PRIVATE
+        <string> <vector> <memory> <unordered_map>
+        <functional> <algorithm> <cstdint> <cstring> <iostream>
+    )
+endif()
 list(APPEND CLIO_CTP_LIBS clio_ctp_host)
 add_library(cxx INTERFACE)
 target_link_libraries(cxx INTERFACE clio_ctp_host)

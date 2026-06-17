@@ -1306,6 +1306,32 @@ chi::TaskResume Runtime::RestartContainers(
   CLIO_TASK_BODY_END
 }
 
+chi::TaskResume Runtime::ListContainers(
+    ctp::ipc::FullPtr<ListContainersTask> task, chi::RunContext &rctx) {
+  CLIO_TASK_BODY_BEGIN
+  HLOG(kDebug, "Admin: Executing ListContainers task");
+
+  task->pool_names_.clear();
+  task->pool_ids_.clear();
+
+  auto *pool_manager = CLIO_POOL_MANAGER;
+  for (const auto &pool_id : pool_manager->GetAllPoolIds()) {
+    const auto *info = pool_manager->GetPoolInfo(pool_id);
+    if (info == nullptr || !info->is_active_) {
+      continue;
+    }
+    task->pool_names_.push_back(info->pool_name_);
+    task->pool_ids_.push_back(pool_id.ToString());
+  }
+
+  task->SetReturnCode(0);
+  HLOG(kDebug, "Admin: ListContainers found {} active pools",
+       task->pool_names_.size());
+  (void)rctx;
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
 chi::TaskResume Runtime::AddNode(ctp::ipc::FullPtr<AddNodeTask> task,
                                  chi::RunContext &rctx) {
   CLIO_TASK_BODY_BEGIN

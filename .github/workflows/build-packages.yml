@@ -75,16 +75,20 @@ jobs:
       run: |
         sudo apt-get update
         sudo apt-get install -y --no-install-recommends \
-          cmake ninja-build build-essential pkg-config \
+          cmake ninja-build build-essential pkg-config python3 \
           libzmq3-dev libyaml-cpp-dev libcereal-dev libmsgpack-dev \
           libsodium-dev libfuse3-dev
 
     - name: Configure with CMake
       run: |
+        # CLIO_CORE_ENABLE_PYTHON stays OFF (no nanobind C++ bindings), but the
+        # pure-Python context visualizer ships as a standard feature via
+        # CLIO_CORE_ENABLE_VISUALIZER (default ON, set explicitly for clarity).
         cmake -B build-deb \
           -DCLIO_CORE_ENABLE_DEB_PACKAGE=ON \
           -DCLIO_CORE_ENABLE_TESTS=OFF \
           -DCLIO_CORE_ENABLE_PYTHON=OFF \
+          -DCLIO_CORE_ENABLE_VISUALIZER=ON \
           -DCLIO_CTE_ENABLE_FUSE_ADAPTER=ON \
           -G Ninja
 
@@ -135,16 +139,20 @@ jobs:
 
     - name: Install build dependencies
       run: |
-        dnf install -y cmake ninja-build gcc-c++ pkgconf-pkg-config \
+        dnf install -y cmake ninja-build gcc-c++ pkgconf-pkg-config python3 \
           zeromq-devel yaml-cpp-devel cereal-devel msgpack-devel \
           libsodium-devel rpm-build fuse3-devel
 
     - name: Configure with CMake
       run: |
+        # CLIO_CORE_ENABLE_PYTHON stays OFF (no nanobind C++ bindings), but the
+        # pure-Python context visualizer ships as a standard feature via
+        # CLIO_CORE_ENABLE_VISUALIZER (default ON, set explicitly for clarity).
         cmake -B build-rpm \
           -DCLIO_CORE_ENABLE_RPM_PACKAGE=ON \
           -DCLIO_CORE_ENABLE_TESTS=OFF \
           -DCLIO_CORE_ENABLE_PYTHON=OFF \
+          -DCLIO_CORE_ENABLE_VISUALIZER=ON \
           -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
           -DCLIO_CTE_ENABLE_FUSE_ADAPTER=ON \
           -G Ninja
@@ -275,6 +283,16 @@ jobs:
           echo "FAIL: clio_run --help died with exit code $rc"
           exit 1
         fi
+        echo "=== context-visualizer (standard feature) ==="
+        # Launcher must be on PATH and the package importable. --help exits 0
+        # via argparse; only a signal-level death indicates a real problem
+        # (e.g. a missing Python runtime dep the package failed to declare).
+        context-visualizer --help; rc=$?
+        if [ "$rc" -ge 128 ] || [ "$rc" -lt 0 ]; then
+          echo "FAIL: context-visualizer --help died with exit code $rc"
+          exit 1
+        fi
+        python3 -c "import context_visualizer; print('context_visualizer import OK')"
         echo "=== dpkg -L iowarp-core (file manifest) ==="
         dpkg -L iowarp-core | head -40
         echo "=== ldd $(command -v clio_run) ==="
@@ -313,6 +331,16 @@ jobs:
           echo "FAIL: clio_run --help died with exit code $rc"
           exit 1
         fi
+        echo "=== context-visualizer (standard feature) ==="
+        # Launcher must be on PATH and the package importable. --help exits 0
+        # via argparse; only a signal-level death indicates a real problem
+        # (e.g. a missing Python runtime dep the package failed to declare).
+        context-visualizer --help; rc=$?
+        if [ "$rc" -ge 128 ] || [ "$rc" -lt 0 ]; then
+          echo "FAIL: context-visualizer --help died with exit code $rc"
+          exit 1
+        fi
+        python3 -c "import context_visualizer; print('context_visualizer import OK')"
         echo "=== rpm -ql iowarp-core (file manifest) ==="
         rpm -ql iowarp-core | head -40
         echo "=== ldd $(command -v clio_run) ==="

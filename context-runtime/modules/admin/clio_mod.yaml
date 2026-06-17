@@ -41,3 +41,4 @@ kRecoverContainers: 30   # Leader broadcasts recovery plan to surviving nodes
 kSystemMonitor: 31       # Periodic system resource utilization monitor
 kAnnounceShutdown: 32    # Broadcast shutdown announcement to all nodes
 kRegisterGpuContainer: 33  # Register a GPU container with the GPU orchestrator
+kListContainers: 34        # List active pools/containers in the local daemon

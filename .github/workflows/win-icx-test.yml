@@ -1,0 +1,187 @@
+name: Windows ICX Test
+
+# Windows oneAPI (icx/icpx) build + test workflow for
+# https://github.com/iowarp/clio-core/issues/555
+# ("ci: add a windows 2025 vs 2026 icx action").
+#
+# The regular "Windows Build and Test" workflow builds clio-core with MSVC
+# (the Visual Studio generator) on windows-2022/2025/11-arm. This workflow
+# instead builds with the Intel oneAPI DPC++/C++ compilers (icx/icpx) on a
+# windows-2025 runner -- which now ships Visual Studio 2026 -- to catch
+# compiler-specific regressions.
+#
+# NOTE: oneAPI ships three Windows C++ drivers. icpx.exe and icx.exe both use a
+# clang/GNU-style command line: icpx rejects the MSVC flags CMake emits for the
+# Ninja generator outright, and icx accepts some "/" flags but quietly ignores
+# /Fo<obj>, writing <base>.o into the build root (which breaks the DLL link via
+# bindexplib). icx-cl.exe is the cl.exe-compatible driver that honors /Fo, /Zi,
+# etc., so CMAKE_C_COMPILER and CMAKE_CXX_COMPILER are both set to icx-cl.
+#
+#   * oneAPI is installed via the oneapi-src/oneapi-ci helper scripts
+#     (template: actions/.github/workflows/win-25_vs-26_icx-2025.3.1.yml).
+#   * The CMake options mirror .github/workflows/windows-build-and-test.yml.
+#   * Results are reported to my.cdash.org (HERMES "core" dashboard) the same
+#     way .github/workflows/mac-test.yml does: -DSITE / -DBUILDNAME cache vars
+#     plus `ctest -T Test` / `ctest -T Submit` against CTestConfig.cmake.
+
+on:
+  push:
+    branches:
+      - main
+      - issue-555-windows-icx
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Intel oneAPI Base Toolkit ships the DPC++/C++ compiler (icx/icpx).
+  WINDOWS_BASEKIT_URL: https://registrationcenter-download.intel.com/akdlm/IRC_NAS/076e961b-2c29-48a8-9203-c96f00e7051b/intel-oneapi-base-toolkit-2025.3.1.35_offline.exe
+  WINDOWS_CPP_COMPONENTS: intel.oneapi.win.cpp-dpcpp-common
+  # Bump CACHE_NUMBER to force a fresh oneAPI install; the cache key also
+  # includes the toolkit URL, so a version change invalidates it automatically.
+  CACHE_NUMBER: "0"
+  ONEAPI_ROOT_DIR: "C:\\Program Files (x86)\\Intel\\oneAPI"
+  VCPKG_DEFAULT_TRIPLET: x64-windows
+  CAE_LABEL_TEST_SKIP: "1"
+
+jobs:
+  win-icx-test:
+    name: windows-2025 (icx)
+    runs-on: windows-2025
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      # Pin a stable CMake. The hosted image ships CMake 4.x, whose bindexplib
+      # (cmake -E __create_def, used by WINDOWS_EXPORT_ALL_SYMBOLS) fails to
+      # open the just-built object files under Ninja + IntelLLVM (icx),
+      # breaking the clio_ctp_host.dll link. 3.31.x links it cleanly.
+      - name: Install CMake 3.31.6
+        uses: jwlawson/actions-setup-cmake@v2
+        with:
+          cmake-version: "3.31.6"
+
+      - name: Bootstrap vcpkg
+        shell: pwsh
+        run: |
+          cd $env:VCPKG_INSTALLATION_ROOT
+          git pull
+          .\bootstrap-vcpkg.bat
+
+      # Cache the installed oneAPI tree so the ~6 min component install is
+      # skipped while the base-toolkit version (encoded in WINDOWS_BASEKIT_URL)
+      # is unchanged. A URL or CACHE_NUMBER change invalidates the key.
+      # restore + explicit save (instead of actions/cache) so the cache still
+      # persists when a later build/test step fails during CI iteration.
+      - name: Restore oneAPI cache
+        id: cache-oneapi
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.ONEAPI_ROOT_DIR }}
+          key: oneapi-${{ runner.os }}-${{ env.CACHE_NUMBER }}-${{ env.WINDOWS_BASEKIT_URL }}-${{ env.WINDOWS_CPP_COMPONENTS }}
+
+      - name: Install oneAPI (icx)
+        if: steps.cache-oneapi.outputs.cache-hit != 'true'
+        shell: cmd
+        run: |
+          git clone --depth=1 https://github.com/oneapi-src/oneapi-ci.git oneapi-ci
+          cd oneapi-ci
+          scripts\install_windows.bat %WINDOWS_BASEKIT_URL% %WINDOWS_CPP_COMPONENTS%
+
+      - name: Save oneAPI cache
+        if: steps.cache-oneapi.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.ONEAPI_ROOT_DIR }}
+          key: oneapi-${{ runner.os }}-${{ env.CACHE_NUMBER }}-${{ env.WINDOWS_BASEKIT_URL }}-${{ env.WINDOWS_CPP_COMPONENTS }}
+
+      - name: Configure and build (icx)
+        shell: cmd
+        run: |
+          @echo on
+          rem Locate the Visual Studio install on the runner (edition/version
+          rem agnostic) instead of hard-coding a path -- the hosted windows-2025
+          rem image may differ from the template's custom runner.
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -prerelease -products * -property installationPath`) do set "VSINSTALL=%%i"
+          echo Using Visual Studio at: %VSINSTALL%
+          call "%VSINSTALL%\VC\Auxiliary\Build\vcvarsall.bat" x64 || exit /b 1
+          call "%ProgramFiles(x86)%\Intel\oneAPI\setvars.bat" || exit /b 1
+          cmake -B build -G Ninja ^
+            -DCMAKE_C_COMPILER=icx-cl ^
+            -DCMAKE_CXX_COMPILER=icx-cl ^
+            -DCMAKE_TOOLCHAIN_FILE="%VCPKG_INSTALLATION_ROOT%\scripts\buildsystems\vcpkg.cmake" ^
+            -DVCPKG_TARGET_TRIPLET=x64-windows ^
+            -DVCPKG_MANIFEST_DIR="%GITHUB_WORKSPACE%\installers\vcpkg" ^
+            -DVCPKG_OVERLAY_PORTS="%GITHUB_WORKSPACE%\installers\vcpkg\overlay-ports" ^
+            -DCMAKE_BUILD_TYPE=Debug ^
+            -DSITE=windows-2025 ^
+            -DBUILDNAME=vs2026/ninja/icx-2025.3 ^
+            -DCLIO_CORE_ENABLE_RUNTIME=ON ^
+            -DCLIO_CORE_ENABLE_CTE=ON ^
+            -DCLIO_CORE_ENABLE_CAE=ON ^
+            -DCLIO_CORE_ENABLE_CEE=OFF ^
+            -DCLIO_CORE_ENABLE_TESTS=ON ^
+            -DCLIO_CORE_ENABLE_PYTHON=OFF ^
+            -DCLIO_CORE_ENABLE_PCH=OFF ^
+            -DCLIO_CORE_ENABLE_ZMQ=ON ^
+            -DCLIO_CORE_ENABLE_CEREAL=ON ^
+            -DCLIO_CORE_ENABLE_CONDA=OFF ^
+            -DCLIO_CORE_ENABLE_ELF=OFF ^
+            -DCLIO_CORE_ENABLE_RPATH=OFF ^
+            -DCLIO_CTE_ENABLE_VFD=OFF ^
+            -DCLIO_CTE_ENABLE_HDF5_VOL=OFF ^
+            -DCLIO_CORE_ENABLE_BENCHMARKS=OFF ^
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON ^
+            -DCLIO_CTP_LOG_LEVEL=0 || exit /b 1
+          cmake --build build --config Debug -j %NUMBER_OF_PROCESSORS% || exit /b 1
+
+      - name: Run ctest
+        shell: cmd
+        run: |
+          @echo on
+          call "%ProgramFiles(x86)%\Intel\oneAPI\setvars.bat"
+          cd build
+          ctest -T Test --build-config Debug --output-on-failure --timeout 120 -LE ollama
+
+      - name: Submit results to CDash
+        if: always()
+        continue-on-error: true
+        shell: cmd
+        run: |
+          cd build
+          ctest -T Submit
+
+      - name: Summarize failed tests
+        if: always()
+        shell: bash
+        run: |
+          LOG="build/Testing/Temporary/LastTest.log"
+          echo "## Windows ICX test summary (windows-2025)" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f "$LOG" ]; then
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            grep -E "Test #|\*\*\*Failed|\*\*\*Exception|Passed|Failed" "$LOG" \
+              | grep -E "Failed|Exception" >> "$GITHUB_STEP_SUMMARY" || \
+              echo "(no failures parsed from LastTest.log)" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "(LastTest.log not found)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: win-icx-test-logs
+          path: |
+            build/Testing/Temporary/LastTest.log
+            build/Testing/Temporary/CTestCostData.txt
+          if-no-files-found: warn

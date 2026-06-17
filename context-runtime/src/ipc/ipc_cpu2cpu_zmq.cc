@@ -290,6 +290,16 @@ bool IpcCpu2CpuZmq::RuntimeSend(
         }
       }
 
+      // Free the server-side FutureShm allocated for this inbound request in
+      // RuntimeRecv (NewObj<FutureShm>()). The queued Future here is never
+      // consumed_, so ~Future() never runs its FutureShm-free path; without
+      // this every cross-process RPC leaks one FutureShm. CleanupResponseArchive
+      // is intentionally not called — that map is client-side only (see
+      // ipc_cpu2cpu_zmq_impl.h RuntimeRecv); on the server it would be a no-op.
+      if (!future_shm.IsNull()) {
+        ipc->FreeBuffer(future_shm.Cast<char>());
+      }
+
       did_work = true;
       tasks_sent++;
       size_t total = send_counter.fetch_add(1, std::memory_order_relaxed) + 1;

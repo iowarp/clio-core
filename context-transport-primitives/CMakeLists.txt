@@ -3,6 +3,17 @@ project(clio_ctp LANGUAGES C CXX)
 include(CTest)
 # CMAKE_CXX_STANDARD is set by root CMakeLists.txt
 
+# Normally inherited from the root project; define a fallback for standalone
+# CTP configures so MSVC-frontend compilers (cl, clang-cl, icx.exe) take the
+# MSVC-style flag path below (see issue #555).
+if(NOT DEFINED CLIO_CORE_MSVC_LIKE)
+    if(MSVC OR (WIN32 AND CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC"))
+        set(CLIO_CORE_MSVC_LIKE ON)
+    else()
+        set(CLIO_CORE_MSVC_LIKE OFF)
+    endif()
+endif()
+
 # ------------------------------------------------------------------------------
 # Global variables
 # ------------------------------------------------------------------------------
@@ -66,7 +77,7 @@ set(CLIO_CTP_EXPORTED_TARGETS "ClioCtp")
 # ------------------------------------------------------------------------------
 
 # CMAKE_POSITION_INDEPENDENT_CODE is set by root CMakeLists.txt
-if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID MATCHES "^(Apple)?Clang$" OR CMAKE_CXX_COMPILER_ID STREQUAL "MinGW" OR CMAKE_CXX_COMPILER_ID MATCHES "^Intel" OR CMAKE_CXX_COMPILER_ID STREQUAL "NVHPC")
+if((CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID MATCHES "^(Apple)?Clang$" OR CMAKE_CXX_COMPILER_ID STREQUAL "MinGW" OR CMAKE_CXX_COMPILER_ID MATCHES "^Intel" OR CMAKE_CXX_COMPILER_ID STREQUAL "NVHPC") AND NOT CLIO_CORE_MSVC_LIKE)
     if(CMAKE_BUILD_TYPE STREQUAL "Debug")
         message("IN DEBUG MODE")
         set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g -O0 -Wfatal-errors")
@@ -79,14 +90,19 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_ID MATCHES "^(Appl
 
     set(CLIO_CTP_COMPILER_GNU "ON")
 
-    if(APPLE)
+    if(WIN32)
+        # Clang/IntelLLVM (icx) targeting Windows: rt/dl are POSIX-only. Use
+        # the Winsock import library like the MSVC branch below.
+        set(REAL_TIME_FLAGS "ws2_32")
+    elseif(APPLE)
         set(REAL_TIME_FLAGS "-ldl")
     elseif(CMAKE_SYSTEM_NAME STREQUAL "OpenBSD")
         set(REAL_TIME_FLAGS "")
     else()
         set(REAL_TIME_FLAGS "-lrt -ldl")
     endif()
-elseif(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+elseif(CLIO_CORE_MSVC_LIKE)
+    # MSVC, clang-cl, or icx.exe on Windows: MSVC-style command line.
     if(CMAKE_BUILD_TYPE STREQUAL "Debug")
         message("IN DEBUG MODE")
         set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /Zi /Od")
