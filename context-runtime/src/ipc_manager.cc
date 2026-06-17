@@ -2183,9 +2183,21 @@ bool IpcManager::ReconnectToOriginalHost() {
       pending_response_archives_.clear();
     }
     try {
-      zmq_transport_ = ctp::lbm::TransportFactory::Get(
-          config->GetServerAddr(), ctp::lbm::TransportType::kZeroMq,
-          ctp::lbm::TransportMode::kClient, "tcp", port + 3);
+      if (UseLocalZmqIpc()) {
+        // macOS (issue #482): the original DEALER was carried over the local
+        // ipc:// endpoint (ClientInit / WaitForLocalServer do the same). A TCP
+        // DEALER here cannot receive the restarted server's ROUTER reply on
+        // macOS, so the reconnect would time out forever. Recreate over ipc://.
+        ctp::SystemInfo::EnsureMemfdDir();
+        std::string zmq_ipc = LocalZmqIpcPath(port);
+        zmq_transport_ = ctp::lbm::TransportFactory::Get(
+            zmq_ipc, ctp::lbm::TransportType::kZeroMq,
+            ctp::lbm::TransportMode::kClient, "ipc", 0);
+      } else {
+        zmq_transport_ = ctp::lbm::TransportFactory::Get(
+            config->GetServerAddr(), ctp::lbm::TransportType::kZeroMq,
+            ctp::lbm::TransportMode::kClient, "tcp", port + 3);
+      }
     } catch (const std::exception &e) {
       HLOG(kError, "ReconnectToOriginalHost: TCP transport recreate failed: {}",
            e.what());
