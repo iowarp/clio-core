@@ -254,6 +254,19 @@ class IpcManager {
     return main_allocator_;
   }
 
+  /**
+   * Bytes currently allocated-but-not-freed from the runtime's private heap
+   * (CTP_MALLOC). In runtime mode AllocateBuffer/NewObj/NewTask draw from this
+   * allocator, so this is the figure a leak test snapshots before/after a
+   * workload: a non-zero steady-state delta means a runtime-internal allocation
+   * was never freed (e.g. the server-side FutureShm leak in #560).
+   *
+   * Only meaningful when built with CLIO_CORE_ENABLE_LEAK_CHECK
+   * (CTP_ALLOC_TRACK_SIZE); returns 0 otherwise. Shared-memory allocator
+   * coverage (main_allocator_, alloc_map_) is a planned follow-up.
+   */
+  size_t GetRuntimeHeapAllocatedBytes() const;
+
   // GetIpcManagerGpuInfo / GetIpcManagerGpu were the orchestrator-info
   // accessors and have been removed. Use
   // GetGpuIpcManager()->GetGpuInfo(gpu_id) to obtain per-device info.

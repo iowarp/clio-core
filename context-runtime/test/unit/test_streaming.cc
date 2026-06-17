@@ -205,4 +205,77 @@ TEST_CASE("FutureShm Bitfield Operations", "[streaming][bitfield]") {
   INFO("Bitfield operations verified successfully");
 }
 
+// Regression guard for runtime-internal allocation leaks (e.g. #560: the
+// server-side FutureShm that leaked once per cross-process RPC). Most valuable
+// under the force-net variant, which routes every RPC through the ZMQ
+// cpu2cpu path that allocates the server-side FutureShm. Only asserts when
+// built with -DCLIO_CORE_ENABLE_LEAK_CHECK=ON (CTP_ALLOC_TRACK_SIZE); otherwise
+// GetRuntimeHeapAllocatedBytes() returns 0 and this is a cheap no-op.
+TEST_CASE("Runtime Heap Leak Check", "[streaming][leak]") {
+  StreamingTestFixture fixture;
+  REQUIRE(g_initialized);
+
+  clio::run::MOD_NAME::Client client(kTestModNamePoolId);
+  chi::PoolQuery pool_query = chi::PoolQuery::Dynamic();
+  std::string pool_name = "streaming_test_leak";
+  auto create_task =
+      client.AsyncCreate(pool_query, pool_name, kTestModNamePoolId);
+  create_task.Wait();
+  client.pool_id_ = create_task->new_pool_id_;
+  REQUIRE(create_task->return_code_ == 0);
+
+#ifdef CTP_ALLOC_TRACK_SIZE
+  auto *ipc = CLIO_IPC;
+  REQUIRE(ipc != nullptr);
+
+  // Submit one Custom RPC and block until the response is received.
+  auto run_rpc = [&](int i) {
+    auto task = client.AsyncCustom(pool_query, "leak probe", i);
+    task.Wait();
+    REQUIRE(task->return_code_ == 0);
+  };
+
+  // The server frees its per-request FutureShm *after* sending the response
+  // (RuntimeSend), so the free can lag the client's Wait(). Poll until the
+  // runtime private-heap usage stops moving before snapshotting.
+  auto stabilized_heap = [&]() -> size_t {
+    size_t prev = ipc->GetRuntimeHeapAllocatedBytes();
+    for (int i = 0; i < 150; ++i) {  // up to ~3s
+      std::this_thread::sleep_for(20ms);
+      size_t cur = ipc->GetRuntimeHeapAllocatedBytes();
+      if (cur == prev) return cur;
+      prev = cur;
+    }
+    return prev;
+  };
+
+  // Warm up: the first RPCs lazily allocate caches/pools that legitimately
+  // persist, so they must not count against the measured window.
+  constexpr int kWarmup = 50;
+  for (int i = 0; i < kWarmup; ++i) run_rpc(i);
+  const size_t baseline = stabilized_heap();
+
+  // Measured window: a per-RPC leak makes the post-drain heap grow ~linearly
+  // with the RPC count.
+  constexpr int kMeasured = 400;
+  for (int i = 0; i < kMeasured; ++i) run_rpc(i);
+  const size_t after = stabilized_heap();
+
+  const size_t delta = (after > baseline) ? (after - baseline) : 0;
+  const double per_rpc = static_cast<double>(delta) / kMeasured;
+  INFO("Runtime heap: baseline=" << baseline << " after=" << after
+       << " delta=" << delta << " B (" << per_rpc << " B/RPC over "
+       << kMeasured << " RPCs)");
+
+  // With #560 fixed, steady-state per-RPC growth is ~0. The leaked FutureShm is
+  // well over 100 B/RPC, so this tolerance cleanly separates pass from
+  // regression while absorbing minor incidental allocations.
+  constexpr double kMaxBytesPerRpc = 16.0;
+  REQUIRE(per_rpc <= kMaxBytesPerRpc);
+#else
+  INFO("Leak check disabled (build with -DCLIO_CORE_ENABLE_LEAK_CHECK=ON)");
+  REQUIRE(true);
+#endif
+}
+
 SIMPLE_TEST_MAIN()

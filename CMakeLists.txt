@@ -50,6 +50,7 @@ option(CLIO_CORE_ENABLE_ASAN "Enable AddressSanitizer + LeakSanitizer for debugg
 option(CLIO_CORE_ENABLE_UBSAN "Enable UndefinedBehaviorSanitizer for debugging" OFF)
 option(CLIO_CORE_ENABLE_MSAN "Enable MemorySanitizer for debugging (requires instrumented dependencies)" OFF)
 option(CLIO_CORE_ENABLE_COVERAGE "Enable code coverage instrumentation for all components" OFF)
+option(CLIO_CORE_ENABLE_LEAK_CHECK "Enable allocator allocation-size tracking (CTP_ALLOC_TRACK_SIZE) so tests can assert no runtime memory is leaked. Adds a small per-allocation atomic; keep OFF in production." OFF)
 option(CLIO_CORE_ENABLE_DOXYGEN "Check how well the code is documented" OFF)
 option(CLIO_CORE_ENABLE_RPATH "Enable RPATH configuration with relative ($ORIGIN) paths" ON)
 option(CLIO_CORE_ENABLE_CPACK "Enable CPack for package generation" OFF)
@@ -814,6 +815,15 @@ endif()
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Allocation-size tracking for leak-detection tests. Compiler-agnostic and
+# applied to every target/subdirectory so allocator headers and the runtime
+# observe the same definition. Off by default to avoid the per-allocation
+# atomic add/sub in production builds.
+if(CLIO_CORE_ENABLE_LEAK_CHECK)
+    message(STATUS "Allocation leak tracking enabled (CTP_ALLOC_TRACK_SIZE)")
+    add_compile_definitions(CTP_ALLOC_TRACK_SIZE)
+endif()
+
 # C++20 Coroutines support
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   add_compile_options(-fcoroutines)
@@ -1503,6 +1513,7 @@ message(STATUS "    AddressSanitizer (ASan):    ${CLIO_CORE_ENABLE_ASAN}")
 message(STATUS "    UndefinedBehaviorSan (UBSan): ${CLIO_CORE_ENABLE_UBSAN}")
 message(STATUS "    MemorySanitizer (MSan):     ${CLIO_CORE_ENABLE_MSAN}")
 message(STATUS "    Code Coverage:              ${CLIO_CORE_ENABLE_COVERAGE}")
+message(STATUS "    Leak tracking (alloc size): ${CLIO_CORE_ENABLE_LEAK_CHECK}")
 message(STATUS "")
 
 
