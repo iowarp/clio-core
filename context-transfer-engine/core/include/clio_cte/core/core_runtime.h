@@ -181,6 +181,14 @@ public:
   chi::TaskResume DelTag(ctp::ipc::FullPtr<DelTagTask> task, chi::RunContext &ctx);
 
   /**
+   * GetTagName (Method::kGetTagName) - resolve a TagId to its full, absolute
+   * tag name by walking the stored relative "$tagid{parent}/leaf" references.
+   * Broadcast op; the container owning the tag's metadata answers.
+   */
+  chi::TaskResume GetTagName(ctp::ipc::FullPtr<GetTagNameTask> task,
+                             chi::RunContext &ctx);
+
+  /**
    * Get tag size operation - returns total size of all blobs in tag
    */
   chi::TaskResume GetTagSize(ctp::ipc::FullPtr<GetTagSizeTask> task, chi::RunContext &ctx);
@@ -391,6 +399,32 @@ private:
    */
   TagId GetOrAssignTagId(const std::string &tag_name,
                          const TagId &preferred_id = TagId::GetNull());
+
+  /**
+   * Get-or-create the chain of tags for an absolute path, returning the id of
+   * the deepest tag. "/a/b/c" creates "/", "/a", "/a/b", "/a/b/c" (each child
+   * stored relative to its parent as "$tagid{parent}/leaf") and returns the id
+   * of "/a/b/c". Non-absolute names are created as a single flat tag.
+   * preferred_id (if set) is applied to the deepest tag only.
+   */
+  TagId GetOrCreateTagChain(const std::string &name,
+                            const TagId &preferred_id = TagId::GetNull());
+
+  /**
+   * Resolve an absolute path to an existing tag id by walking the hierarchy
+   * (no creation). Returns TagId::GetNull() if any component is missing.
+   * Must be called while holding tag_map_lock_.
+   */
+  TagId ResolvePathToIdLocked(const std::string &path);
+
+  /**
+   * Expand a stored (possibly relative "$tagid{parent}/leaf") tag name into its
+   * full absolute name by recursively resolving parent references against
+   * tag_id_to_info_. Flat names and the root "/" resolve to themselves. Lock
+   * free: callers iterate the tag maps with the same discipline used elsewhere.
+   * `depth` guards against pathological/cyclic references.
+   */
+  std::string ResolveTagName(const std::string &stored_name, int depth = 0);
 
   /**
    * Helper function to generate a new TagId using node_id as major and atomic

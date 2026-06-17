@@ -1814,6 +1814,73 @@ struct GetOrCreateTagAliasTask : public chi::Task {
 };
 
 /**
+ * GetTagName task - resolve a TagId to its full (absolute) tag name.
+ *
+ * Tag names are stored RELATIVELY: a hierarchical child holds
+ * "$tagid{major.minor}/leaf" referencing its parent's id, so moving a
+ * directory tag is O(1). This task walks those parent references on the
+ * owning container and returns the fully-resolved name (e.g. "/a/b/c").
+ * Flat (non-path) tags resolve to themselves. Broadcast; the container that
+ * owns the tag's metadata produces the answer.
+ */
+struct GetTagNameTask : public chi::Task {
+  IN TagId tag_id_;                 // Tag ID to resolve
+  OUT chi::priv::string tag_name_;  // Resolved full name (empty if not found)
+  OUT chi::u32 found_;              // 1 if the tag's metadata was located
+
+  GetTagNameTask()
+      : chi::Task(),
+        tag_id_(TagId::GetNull()),
+        tag_name_(CLIO_PRIV_ALLOC),
+        found_(0) {}
+
+  CTP_CROSS_FUN explicit GetTagNameTask(const chi::TaskId &task_id,
+                                        const chi::PoolId &pool_id,
+                                        const chi::PoolQuery &pool_query,
+                                        const TagId &tag_id)
+      : chi::Task(task_id, pool_id, pool_query, Method::kGetTagName),
+        tag_id_(tag_id),
+        tag_name_(CLIO_PRIV_ALLOC),
+        found_(0) {
+    task_id_ = task_id;
+    pool_id_ = pool_id;
+    method_ = Method::kGetTagName;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+    ar(tag_id_);
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+    ar(tag_name_, found_);
+  }
+
+  void Copy(const ctp::ipc::FullPtr<GetTagNameTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+    tag_id_ = other->tag_id_;
+    tag_name_ = other->tag_name_;
+    found_ = other->found_;
+  }
+
+  // Broadcast aggregation: keep the answer from whichever container owns the
+  // tag (the one that set found_ and a non-empty resolved name).
+  void Aggregate(const ctp::ipc::FullPtr<chi::Task> &other_base) {
+    Task::Aggregate(other_base);
+    auto other = other_base.template Cast<GetTagNameTask>();
+    if (other->found_ && !found_) {
+      found_ = 1;
+      tag_name_ = other->tag_name_;
+    }
+  }
+};
+
+/**
  * GetTagSize task - Get the total size of a tag
  */
 struct GetTagSizeTask : public chi::Task {

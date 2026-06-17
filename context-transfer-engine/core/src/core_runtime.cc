@@ -69,6 +69,81 @@ namespace clio::cte::core {
 using chi::chi_cur_worker_key_;
 using chi::Worker;
 
+// ===========================================================================
+// Hierarchical tag-name encoding helpers.
+//
+// Absolute-path tags (names beginning with '/') are stored RELATIVELY so that
+// renaming/moving a directory tag is O(1): a child holds the canonical string
+//     "$tagid{<major>.<minor>}/<leaf>"
+// where <major>.<minor> is its PARENT tag's id and <leaf> is the single path
+// component. The root "/" is stored literally as "/". Flat (non-path) names
+// are stored verbatim. Resolution (ResolveTagName) walks the parent ids to
+// rebuild the full path. Non-path names are unaffected by any of this.
+// ===========================================================================
+namespace {
+
+constexpr const char *kTagRefPrefix = "$tagid{";
+
+// True for absolute-path names that participate in the hierarchy.
+bool IsHierPath(const std::string &name) {
+  return !name.empty() && name[0] == '/';
+}
+
+// Build the relative stored form for a child of `parent` with leaf `leaf`.
+std::string MakeRelativeName(const TagId &parent, const std::string &leaf) {
+  return std::string(kTagRefPrefix) + std::to_string(parent.major_) + "." +
+         std::to_string(parent.minor_) + "}/" + leaf;
+}
+
+// Split "/a/b/c" -> ["a","b","c"]; "/" or "" -> []. Repeated and trailing
+// slashes are collapsed (so "/a/b/" == "/a/b").
+std::vector<std::string> SplitPathComponents(const std::string &path) {
+  std::vector<std::string> out;
+  size_t i = 0;
+  const size_t n = path.size();
+  while (i < n) {
+    while (i < n && path[i] == '/') ++i;
+    size_t j = i;
+    while (j < n && path[j] != '/') ++j;
+    if (j > i) out.push_back(path.substr(i, j - i));
+    i = j;
+  }
+  return out;
+}
+
+// If `stored` is a "$tagid{M.m}/leaf" reference, parse out the parent id and
+// the leaf and return true; otherwise return false (flat name or root).
+bool ParseTagRef(const std::string &stored, TagId &parent_out,
+                 std::string &leaf_out) {
+  const size_t plen = std::char_traits<char>::length(kTagRefPrefix);
+  if (stored.compare(0, plen, kTagRefPrefix) != 0) return false;
+  size_t close = stored.find('}', plen);
+  if (close == std::string::npos) return false;
+  const std::string id_str = stored.substr(plen, close - plen);
+  size_t dot = id_str.find('.');
+  if (dot == std::string::npos) return false;
+  try {
+    parent_out.major_ =
+        static_cast<chi::u32>(std::stoul(id_str.substr(0, dot)));
+    parent_out.minor_ =
+        static_cast<chi::u32>(std::stoul(id_str.substr(dot + 1)));
+  } catch (const std::exception &) {
+    return false;
+  }
+  std::string suffix = stored.substr(close + 1);  // e.g. "/leaf"
+  if (!suffix.empty() && suffix[0] == '/') suffix.erase(0, 1);
+  leaf_out = std::move(suffix);
+  return true;
+}
+
+// Join an already-resolved parent path with a leaf, avoiding "//".
+std::string JoinPath(const std::string &parent_full, const std::string &leaf) {
+  if (parent_full == "/") return "/" + leaf;
+  return parent_full + "/" + leaf;
+}
+
+}  // namespace
+
 // No more static member definitions - using instance-based locking
 
 chi::u64 Runtime::ParseCapacityToBytes(const std::string &capacity_str) {
@@ -849,7 +924,10 @@ chi::TaskResume Runtime::GetOrCreateTag(
       CLIO_CO_RETURN;
     }
 
-    TagId tag_id = GetOrAssignTagId(tag_name, preferred_id);
+    // Absolute paths are created as a hierarchy ("/a/b/c" -> "/", "/a", "/a/b",
+    // "/a/b/c") with each child stored relative to its parent; the returned id
+    // is the deepest tag. Flat names create a single tag (legacy behavior).
+    TagId tag_id = GetOrCreateTagChain(tag_name, preferred_id);
     task->tag_id_ = tag_id;
 
     auto now = GetCurrentTimeNs();
@@ -1575,8 +1653,66 @@ chi::TaskResume Runtime::RenameTag(ctp::ipc::FullPtr<RenameTagTask> task,
     }
 
     // The tag keeps its TagId — only the name changes, so its blobs (keyed by
-    // TagId) are untouched. This runs as a broadcast: each container moves the
-    // name->id binding it happens to hold and refreshes the stored name.
+    // TagId) are untouched, and so are any CHILDREN (they reference this tag's
+    // id, which does not change). That is what makes moving a directory tag
+    // O(1) regardless of how many descendants it has.
+    if (IsHierPath(old_name) && IsHierPath(new_name)) {
+      // ---- Hierarchical move: rebind only the leaf under its new parent. ----
+      // Phase A: resolve the target tag id and its current stored name.
+      std::string old_rel;
+      {
+        chi::ScopedCoRwReadLock lock(tag_map_lock_);
+        if (tag_id.IsNull()) {
+          tag_id = ResolvePathToIdLocked(old_name);
+        }
+        if (tag_id.IsNull()) {
+          task->return_code_ = 1;  // source path not found
+          CLIO_CO_RETURN;
+        }
+        TagInfo *info = tag_id_to_info_.find(tag_id);
+        if (info != nullptr) {
+          old_rel = info->tag_name_.str();
+        }
+      }
+
+      // Split destination into parent path + leaf.
+      std::vector<std::string> comps = SplitPathComponents(new_name);
+      if (comps.empty()) {
+        task->return_code_ = 1;  // cannot rename onto the root
+        CLIO_CO_RETURN;
+      }
+      std::string new_leaf = comps.back();
+      std::string new_parent_path = "/";
+      for (size_t i = 0; i + 1 < comps.size(); ++i) {
+        new_parent_path += (i == 0 ? "" : "/") + comps[i];
+      }
+
+      // Phase B: get-or-create the destination parent chain (no lock held —
+      // GetOrCreateTagChain takes tag_map_lock_ itself). Auto-creates missing
+      // parents (mkdir -p semantics).
+      TagId new_parent_id = GetOrCreateTagChain(new_parent_path);
+      std::string new_rel = MakeRelativeName(new_parent_id, new_leaf);
+
+      // Phase C: atomically move the name binding and refresh the stored name.
+      {
+        chi::ScopedCoRwWriteLock lock(tag_map_lock_);
+        if (!old_rel.empty()) {
+          tag_name_to_id_.erase(old_rel);
+        }
+        tag_name_to_id_.insert_or_assign(new_rel, tag_id);
+        TagInfo *info = tag_id_to_info_.find(tag_id);
+        if (info != nullptr) {
+          info->tag_name_ = chi::priv::string(CLIO_PRIV_ALLOC, new_rel);
+          info->last_modified_ = GetCurrentTimeNs();
+        }
+      }
+      task->tag_id_ = tag_id;
+      task->return_code_ = 0;
+      CLIO_CO_RETURN;
+    }
+
+    // ---- Flat rename (non-path tags): move the verbatim name binding. ----
+    // Broadcast: each container moves the name->id binding it happens to hold.
     chi::ScopedCoRwWriteLock lock(tag_map_lock_);
     TagId *idp = tag_name_to_id_.find(old_name);
     if (idp != nullptr) {
@@ -1680,15 +1816,24 @@ chi::TaskResume Runtime::DelTag(ctp::ipc::FullPtr<DelTagTask> task,
     TagId tag_id = task->tag_id_;
     std::string tag_name = task->tag_name_.str();
 
-    // Step 1: Resolve tag ID if tag name was provided instead
+    // Step 1: Resolve tag ID if tag name was provided instead. Absolute paths
+    // are walked through the hierarchy; if that fails (or the name is flat),
+    // fall back to a verbatim lookup so flat tags and aliases still resolve.
     if (tag_id.IsNull() && !tag_name.empty()) {
       chi::ScopedCoRwReadLock lock(tag_map_lock_);
-      TagId *found_tag_id_ptr = tag_name_to_id_.find(tag_name);
-      if (found_tag_id_ptr == nullptr) {
+      if (IsHierPath(tag_name)) {
+        tag_id = ResolvePathToIdLocked(tag_name);
+      }
+      if (tag_id.IsNull()) {
+        TagId *found_tag_id_ptr = tag_name_to_id_.find(tag_name);
+        if (found_tag_id_ptr != nullptr) {
+          tag_id = *found_tag_id_ptr;
+        }
+      }
+      if (tag_id.IsNull()) {
         task->return_code_ = 1;  // Tag not found by name
         CLIO_CO_RETURN;
       }
-      tag_id = *found_tag_id_ptr;
       task->tag_id_ = tag_id;
     } else if (tag_id.IsNull() && tag_name.empty()) {
       task->return_code_ = 1;
@@ -1713,12 +1858,22 @@ chi::TaskResume Runtime::DelTag(ctp::ipc::FullPtr<DelTagTask> task,
       }
     }
 
-    // If the caller deleted *by name* and that name is an alias (not the
-    // canonical name), this is a hard-link "unlink": drop only that one name
-    // binding and leave the tag, its blobs, and other names intact. Deleting
-    // by id, or by the canonical name, falls through to a full tag delete that
-    // cascades to every alias below.
-    if (!tag_name.empty() && tag_name != cached_tag_name) {
+    // If the caller deleted *by name* and that name is one of the tag's
+    // aliases, this is a hard-link "unlink": drop only that one name binding
+    // and leave the tag, its blobs, and other names intact. Deleting by id, or
+    // by the canonical name/path, falls through to a full tag delete that
+    // cascades to every alias below. Membership in the alias set (not string
+    // inequality with the canonical name) is the test, because a hierarchical
+    // tag's canonical stored name is a relative "$tagid{..}/leaf" form that
+    // never equals the absolute path the caller passed.
+    bool is_alias_unlink = false;
+    if (!tag_name.empty()) {
+      for (const std::string &a : cached_aliases) {
+        if (a == tag_name) { is_alias_unlink = true; break; }
+      }
+    }
+    (void)cached_tag_name;
+    if (is_alias_unlink) {
       chi::ScopedCoRwWriteLock lock(tag_map_lock_);
       tag_name_to_id_.erase(tag_name);
       TagInfo *tag_info_ptr = tag_id_to_info_.find(tag_id);
@@ -1847,6 +2002,42 @@ chi::TaskResume Runtime::DelTag(ctp::ipc::FullPtr<DelTagTask> task,
          tag_id.major_, tag_id.minor_, blob_count, total_size);
 
   } catch (const std::exception &e) {
+    task->return_code_ = 1;
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+chi::TaskResume Runtime::GetTagName(ctp::ipc::FullPtr<GetTagNameTask> task,
+                                    chi::RunContext &ctx) {
+#ifdef __NVCOMPILER
+  chi::RunContext& rctx = ctx;
+#else
+  (void)ctx;
+#endif
+  CLIO_TASK_BODY_BEGIN
+  try {
+    TagId tag_id = task->tag_id_;
+    std::string stored;
+    bool found = false;
+    {
+      chi::ScopedCoRwReadLock lock(tag_map_lock_);
+      TagInfo *info = tag_id_to_info_.find(tag_id);
+      if (info != nullptr) {
+        stored = info->tag_name_.str();
+        found = true;
+      }
+      // ResolveTagName walks parent ids in tag_id_to_info_; keep it under the
+      // same read lock so the hierarchy can't shift mid-resolution.
+      if (found) {
+        std::string full = ResolveTagName(stored);
+        task->tag_name_ = chi::priv::string(CLIO_PRIV_ALLOC, full);
+      }
+    }
+    task->found_ = found ? 1 : 0;
+    task->return_code_ = 0;  // found_ conveys existence; the op itself is fine
+  } catch (const std::exception &e) {
+    HLOG(kError, "GetTagName failed: {}", e.what());
     task->return_code_ = 1;
   }
   CLIO_CO_RETURN;
@@ -1983,6 +2174,69 @@ TagId Runtime::GetOrAssignTagId(const std::string &tag_name,
   }
 
   return tag_id;
+}
+
+std::string Runtime::ResolveTagName(const std::string &stored_name,
+                                    int depth) {
+  // Guard against pathological / cyclic parent references.
+  if (depth > 256) {
+    return stored_name;
+  }
+  TagId parent;
+  std::string leaf;
+  if (!ParseTagRef(stored_name, parent, leaf)) {
+    // Flat name, root "/", or a legacy absolute name stored verbatim.
+    return stored_name;
+  }
+  TagInfo *pinfo = tag_id_to_info_.find(parent);
+  if (pinfo == nullptr) {
+    // Dangling parent (e.g. partially-replayed metadata). Best effort: present
+    // the leaf as a top-level name so the result is still a usable path.
+    return "/" + leaf;
+  }
+  std::string parent_full = ResolveTagName(pinfo->tag_name_.str(), depth + 1);
+  return JoinPath(parent_full, leaf);
+}
+
+TagId Runtime::ResolvePathToIdLocked(const std::string &path) {
+  // Walk from the root, looking up each component's relative key. Returns null
+  // if the root or any intermediate component does not exist.
+  TagId *root = tag_name_to_id_.find(std::string("/"));
+  if (root == nullptr) {
+    return TagId::GetNull();
+  }
+  TagId cur = *root;
+  for (const std::string &comp : SplitPathComponents(path)) {
+    TagId *child = tag_name_to_id_.find(MakeRelativeName(cur, comp));
+    if (child == nullptr) {
+      return TagId::GetNull();
+    }
+    cur = *child;
+  }
+  return cur;
+}
+
+TagId Runtime::GetOrCreateTagChain(const std::string &name,
+                                   const TagId &preferred_id) {
+  if (!IsHierPath(name)) {
+    // Non-path tag: a single flat tag stored verbatim (legacy behavior).
+    return GetOrAssignTagId(name, preferred_id);
+  }
+  // Every absolute path is rooted at the "/" tag (stored literally).
+  TagId parent = GetOrAssignTagId(std::string("/"));
+  std::vector<std::string> comps = SplitPathComponents(name);
+  if (comps.empty()) {
+    // name was "/" (or all slashes): the root tag itself.
+    return parent;
+  }
+  for (size_t i = 0; i < comps.size(); ++i) {
+    const bool is_leaf = (i + 1 == comps.size());
+    // preferred_id (a cross-node hint) only applies to the deepest tag.
+    TagId id = GetOrAssignTagId(MakeRelativeName(parent, comps[i]),
+                                is_leaf ? preferred_id : TagId::GetNull());
+    parent = id;
+  }
+  return parent;
 }
 
 chi::TaskResume Runtime::FlushMetadata(ctp::ipc::FullPtr<FlushMetadataTask> task,
@@ -3742,13 +3996,15 @@ chi::TaskResume Runtime::TagQuery(ctp::ipc::FullPtr<TagQueryTask> task,
     // Create regex pattern
     std::regex pattern(tag_regex);
 
-    // Collect matching tags (name + id)
+    // Collect matching tags (resolved full name + id). Tag names are stored
+    // relatively, so resolve each to its absolute form before matching and
+    // return the resolved name to the caller.
     std::vector<std::pair<std::string, TagId>> matching_tags;
     tag_name_to_id_.for_each(
-        [&pattern, &matching_tags](const std::string &tag_name,
-                                   const TagId &tag_id) {
-          if (std::regex_match(tag_name, pattern)) {
-            matching_tags.emplace_back(tag_name, tag_id);
+        [&](const std::string &stored, const TagId &tag_id) {
+          std::string full = ResolveTagName(stored);
+          if (std::regex_match(full, pattern)) {
+            matching_tags.emplace_back(full, tag_id);
           }
         });
 
@@ -3795,13 +4051,13 @@ chi::TaskResume Runtime::BlobQuery(ctp::ipc::FullPtr<BlobQueryTask> task,
     std::regex tag_pattern(tag_regex);
     std::regex blob_pattern(blob_regex);
 
-    // Find matching tag IDs and names
+    // Find matching tag IDs and resolved names.
     std::vector<std::pair<std::string, TagId>> matching_tags;
     tag_name_to_id_.for_each(
-        [&tag_pattern, &matching_tags](const std::string &tag_name,
-                                       const TagId &tag_id) {
-          if (std::regex_match(tag_name, tag_pattern)) {
-            matching_tags.emplace_back(tag_name, tag_id);
+        [&](const std::string &stored, const TagId &tag_id) {
+          std::string full = ResolveTagName(stored);
+          if (std::regex_match(full, tag_pattern)) {
+            matching_tags.emplace_back(full, tag_id);
           }
         });
 
@@ -3924,10 +4180,10 @@ chi::TaskResume Runtime::SemanticSearch(
   // (same iteration as BlobQuery).
   std::vector<std::pair<std::string, TagId>> matching_tags;
   tag_name_to_id_.for_each(
-      [&tag_pattern, &matching_tags](const std::string &tag_name,
-                                     const TagId &tag_id) {
-        if (std::regex_match(tag_name, tag_pattern)) {
-          matching_tags.emplace_back(tag_name, tag_id);
+      [&](const std::string &stored, const TagId &tag_id) {
+        std::string full = ResolveTagName(stored);
+        if (std::regex_match(full, tag_pattern)) {
+          matching_tags.emplace_back(full, tag_id);
         }
       });
 
@@ -4096,10 +4352,10 @@ chi::TaskResume Runtime::TemporalSearch(
   // Step 1: collect matching tags (same as BlobQuery / SemanticSearch).
   std::vector<std::pair<std::string, TagId>> matching_tags;
   tag_name_to_id_.for_each(
-      [&tag_pattern, &matching_tags](const std::string &tag_name,
-                                     const TagId &tag_id) {
-        if (std::regex_match(tag_name, tag_pattern)) {
-          matching_tags.emplace_back(tag_name, tag_id);
+      [&](const std::string &stored, const TagId &tag_id) {
+        std::string full = ResolveTagName(stored);
+        if (std::regex_match(full, tag_pattern)) {
+          matching_tags.emplace_back(full, tag_id);
         }
       });
 

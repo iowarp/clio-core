@@ -458,6 +458,25 @@ class Client : public chi::ContainerClient {
   }
 
   /**
+   * Resolve a TagId to its full, absolute tag name. Tag names are stored
+   * relatively ("$tagid{parent}/leaf"); this returns the fully-resolved path
+   * (or the verbatim name for a flat tag). Broadcast so the container that
+   * owns the tag's metadata answers; the result is in found_/tag_name_.
+   * @param tag_id Tag ID to resolve
+   * @param pool_query Pool query for task routing (default: Broadcast)
+   */
+  chi::Future<GetTagNameTask> AsyncGetTagName(
+      const TagId &tag_id,
+      const chi::PoolQuery &pool_query = chi::PoolQuery::Broadcast()) {
+    auto *ipc_manager = CLIO_CPU_IPC;
+
+    auto task = ipc_manager->NewTask<GetTagNameTask>(
+        chi::CreateTaskId(), pool_id_, pool_query, tag_id);
+
+    return ipc_manager->Send(task);
+  }
+
+  /**
    * Asynchronous get tag size - returns immediately
    * @param tag_id Tag ID
    * @param pool_query Pool query for task routing (default: Dynamic)

@@ -133,6 +133,11 @@ chi::TaskResume Runtime::Run(chi::u32 method, ctp::ipc::FullPtr<chi::Task> task_
       CLIO_CO_AWAIT(GetOrCreateTagAlias(typed_task, rctx));
       break;
     }
+    case Method::kGetTagName: {
+      ctp::ipc::FullPtr<GetTagNameTask> typed_task = task_ptr.template Cast<GetTagNameTask>();
+      CLIO_CO_AWAIT(GetTagName(typed_task, rctx));
+      break;
+    }
     case Method::kGetTagSize: {
       // Cast task FullPtr to specific type
       ctp::ipc::FullPtr<GetTagSizeTask> typed_task = task_ptr.template Cast<GetTagSizeTask>();
@@ -301,6 +306,11 @@ void Runtime::SaveTask(chi::u32 method, chi::SaveTaskArchive& archive,
       archive << *typed_task.ptr_;
       break;
     }
+    case Method::kGetTagName: {
+      auto typed_task = task_ptr.template Cast<GetTagNameTask>();
+      archive << *typed_task.ptr_;
+      break;
+    }
     case Method::kGetTagSize: {
       auto typed_task = task_ptr.template Cast<GetTagSizeTask>();
       archive << *typed_task.ptr_;
@@ -453,6 +463,11 @@ void Runtime::LoadTask(chi::u32 method, chi::LoadTaskArchive& archive,
     }
     case Method::kGetOrCreateTagAlias: {
       auto typed_task = task_ptr.template Cast<GetOrCreateTagAliasTask>();
+      archive >> *typed_task.ptr_;
+      break;
+    }
+    case Method::kGetTagName: {
+      auto typed_task = task_ptr.template Cast<GetTagNameTask>();
       archive >> *typed_task.ptr_;
       break;
     }
@@ -629,6 +644,12 @@ void Runtime::LocalLoadTask(chi::u32 method, chi::DefaultLoadArchive& archive,
     }
     case Method::kGetOrCreateTagAlias: {
       auto typed_task = task_ptr.template Cast<GetOrCreateTagAliasTask>();
+      archive >> *typed_task.ptr_;
+      break;
+    }
+    case Method::kGetTagName: {
+      auto typed_task = task_ptr.template Cast<GetTagNameTask>();
+      // Use archive operator which respects msg_type
       archive >> *typed_task.ptr_;
       break;
     }
@@ -817,6 +838,12 @@ void Runtime::LocalSaveTask(chi::u32 method, chi::DefaultSaveArchive& archive,
     }
     case Method::kGetOrCreateTagAlias: {
       auto typed_task = task_ptr.template Cast<GetOrCreateTagAliasTask>();
+      archive << *typed_task.ptr_;
+      break;
+    }
+    case Method::kGetTagName: {
+      auto typed_task = task_ptr.template Cast<GetTagNameTask>();
+      // Use archive operator which respects msg_type
       archive << *typed_task.ptr_;
       break;
     }
@@ -1081,6 +1108,15 @@ ctp::ipc::FullPtr<chi::Task> Runtime::NewCopyTask(chi::u32 method, ctp::ipc::Ful
       }
       break;
     }
+    case Method::kGetTagName: {
+      auto new_task_ptr = ipc_manager->NewTask<GetTagNameTask>();
+      if (!new_task_ptr.IsNull()) {
+        auto task_typed = orig_task_ptr.template Cast<GetTagNameTask>();
+        new_task_ptr->Copy(task_typed);
+        return new_task_ptr.template Cast<chi::Task>();
+      }
+      break;
+    }
     case Method::kGetTagSize: {
       // Allocate new task
       auto new_task_ptr = ipc_manager->NewTask<GetTagSizeTask>();
@@ -1306,6 +1342,10 @@ ctp::ipc::FullPtr<chi::Task> Runtime::NewTask(chi::u32 method) {
       auto new_task_ptr = ipc_manager->NewTask<GetOrCreateTagAliasTask>();
       return new_task_ptr.template Cast<chi::Task>();
     }
+    case Method::kGetTagName: {
+      auto new_task_ptr = ipc_manager->NewTask<GetTagNameTask>();
+      return new_task_ptr.template Cast<chi::Task>();
+    }
     case Method::kGetTagSize: {
       auto new_task_ptr = ipc_manager->NewTask<GetTagSizeTask>();
       return new_task_ptr.template Cast<chi::Task>();
@@ -1448,6 +1488,11 @@ void Runtime::Aggregate(chi::u32 method, ctp::ipc::FullPtr<chi::Task> orig_task,
       typed_task->Aggregate(replica_task);
       break;
     }
+    case Method::kGetTagName: {
+      auto typed_task = orig_task.template Cast<GetTagNameTask>();
+      typed_task->Aggregate(replica_task);
+      break;
+    }
     case Method::kGetTagSize: {
       auto typed_task = orig_task.template Cast<GetTagSizeTask>();
       typed_task->Aggregate(replica_task);
@@ -1586,6 +1631,10 @@ void Runtime::DelTask(chi::u32 method, ctp::ipc::FullPtr<chi::Task> task_ptr) {
     }
     case Method::kGetOrCreateTagAlias: {
       ipc_manager->DelTask(task_ptr.template Cast<GetOrCreateTagAliasTask>());
+      break;
+    }
+    case Method::kGetTagName: {
+      ipc_manager->DelTask(task_ptr.template Cast<GetTagNameTask>());
       break;
     }
     case Method::kGetTagSize: {

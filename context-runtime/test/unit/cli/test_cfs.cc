@@ -275,6 +275,80 @@ TEST_CASE("Cfs - filesystem chimod open/write/getattr/read/truncate",
   REQUIRE(gone->GetReturnCode() == 0);
   REQUIRE(!(gone->tag_id_ == orig_id));
 
+  // ---- Hierarchical tag names + O(1) directory move ----
+  using clio::cte::core::TagId;
+  auto resolve = [&](const TagId &id) {
+    auto g = core.AsyncGetTagName(id);
+    g.Wait();
+    REQUIRE(g->GetReturnCode() == 0);
+    REQUIRE(g->found_ == 1);
+    return g->tag_name_.str();
+  };
+
+  // Creating "/a/b/c/d" builds the whole chain; the returned id is the leaf.
+  auto deep = core.AsyncGetOrCreateTag(
+      "/a/b/c/d", TagId::GetNull(), chi::PoolQuery::Local());
+  deep.Wait();
+  REQUIRE(deep->GetReturnCode() == 0);
+  TagId d_id = deep->tag_id_;
+
+  // The intermediate "/a/b" already exists from the chain — same id, no dup.
+  auto mid = core.AsyncGetOrCreateTag(
+      "/a/b", TagId::GetNull(), chi::PoolQuery::Local());
+  mid.Wait();
+  REQUIRE(mid->GetReturnCode() == 0);
+  TagId b_id = mid->tag_id_;
+  REQUIRE(!b_id.IsNull());
+  REQUIRE(!(b_id == d_id));
+
+  // Names resolve to absolute paths.
+  REQUIRE(resolve(d_id) == "/a/b/c/d");
+  REQUIRE(resolve(b_id) == "/a/b");
+
+  // Write a blob under the deepest tag so we can prove data survives the move.
+  const char kDeepMsg[] = "deep-payload";
+  constexpr chi::u64 kDeepN = sizeof(kDeepMsg);
+  ctp::ipc::FullPtr<char> hpb = ipc->AllocateBuffer(kDeepN);
+  REQUIRE(!hpb.IsNull());
+  memcpy(hpb.ptr_, kDeepMsg, kDeepN);
+  auto hp = core.AsyncPutBlob(d_id, "0", 0, kDeepN,
+                              hpb.shm_.template Cast<void>(), -1.0f,
+                              clio::cte::core::Context(), 0u,
+                              chi::PoolQuery::Local());
+  hp.Wait();
+  REQUIRE(hp->GetReturnCode() == 0);
+  ipc->FreeBuffer(hpb);
+
+  // Move the mid-level directory "/a/b" -> "/x/y". This touches ONLY /a/b's
+  // own binding; "/a/b/c" and "/a/b/c/d" reference ids that do not change, so
+  // they must re-resolve under the new parent automatically (the O(1) win).
+  auto mv = core.AsyncRenameTag("/a/b", "/x/y", b_id);
+  mv.Wait();
+  REQUIRE(mv->GetReturnCode() == 0);
+
+  REQUIRE(resolve(b_id) == "/x/y");
+  REQUIRE(resolve(d_id) == "/x/y/c/d");  // deep child re-resolved, never moved
+
+  // The blob under the (unmoved) deep id is still intact.
+  ctp::ipc::FullPtr<char> hgb = ipc->AllocateBuffer(kDeepN);
+  REQUIRE(!hgb.IsNull());
+  memset(hgb.ptr_, 0, kDeepN);
+  auto hg = core.AsyncGetBlob(d_id, "0", 0, kDeepN, 0u,
+                              hgb.shm_.template Cast<void>(),
+                              chi::PoolQuery::Local());
+  hg.Wait();
+  REQUIRE(hg->GetReturnCode() == 0);
+  REQUIRE(memcmp(hgb.ptr_, kDeepMsg, kDeepN) == 0);
+  ipc->FreeBuffer(hgb);
+
+  // The old path "/a/b" is now free: re-creating it mints a NEW id (the old
+  // binding moved away), while "/a" itself still exists as a parent.
+  auto recreate = core.AsyncGetOrCreateTag(
+      "/a/b", TagId::GetNull(), chi::PoolQuery::Local());
+  recreate.Wait();
+  REQUIRE(recreate->GetReturnCode() == 0);
+  REQUIRE(!(recreate->tag_id_ == b_id));
+
   RunCliTimed({"stop", "--grace-period", "2000"}, 90);
   for (int i = 0; i < 200 && server.IsRunning(); ++i) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
