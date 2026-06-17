@@ -43,6 +43,7 @@
 #include <clio_runtime/manager.h>
 #include <clio_runtime/module_manager.h>
 #include <clio_runtime/pool_manager.h>
+#include <clio_runtime/restart_log.h>
 #include <clio_runtime/task_archives.h>
 #include <clio_runtime/worker.h>
 #include <clio_ctp/lightbeam/transport_factory_impl.h>
@@ -1249,29 +1250,40 @@ chi::TaskResume Runtime::RestartContainers(
   task->error_message_ = "";
 
   try {
-    auto *config_manager = CLIO_CONFIG_MANAGER;
-    std::string restart_dir = config_manager->GetConfDir() + "/restart";
-
+    // The restart registry is the RestartLog write-ahead log
+    // (~/.clio/restart_log.bin), the same persistent registry that
+    // manager.cc replays at startup. Each live entry is the absolute path of
+    // a compose file registered via `clio_run compose start`. Re-compose each
+    // pool found there; pools already live (e.g. recovered at server-init
+    // time) come back as the existing pool with rc=0 and are still counted.
     namespace fs = std::filesystem;
-    if (!fs::exists(restart_dir) || !fs::is_directory(restart_dir)) {
-      HLOG(kDebug, "Admin: No restart directory found at {}", restart_dir);
+    clio::run::RestartLog restart_log;
+    std::vector<std::string> containers = restart_log.LiveSet();
+    if (containers.empty()) {
+      HLOG(kDebug, "Admin: No restartable containers registered in {}",
+           restart_log.path());
       task->SetReturnCode(0);
       CLIO_CO_RETURN;
     }
 
-    for (const auto &entry : fs::directory_iterator(restart_dir)) {
-      if (entry.path().extension() != ".yaml") continue;
-
-      // Load pool config from YAML file
-      chi::ConfigManager temp_config;
-      if (!temp_config.LoadYaml(entry.path().string())) {
-        HLOG(kError, "Admin: Failed to load restart config: {}",
-             entry.path().string());
+    for (const auto &container_path : containers) {
+      std::error_code ec;
+      if (!fs::exists(container_path, ec) || ec) {
+        HLOG(kWarning, "Admin: registered container '{}' no longer exists, "
+             "skipping", container_path);
         continue;
       }
 
-      const auto &compose_config = temp_config.GetComposeConfig();
-      for (const auto &pool_config : compose_config.pools_) {
+      // Load pool config from the registered compose file
+      chi::ConfigManager file_config;
+      if (!file_config.LoadYaml(container_path)) {
+        HLOG(kError, "Admin: Failed to load restart config: {}",
+             container_path);
+        continue;
+      }
+
+      for (auto pool_config : file_config.GetComposeConfig().pools_) {
+        pool_config.restart_ = true;
         HLOG(kInfo, "Admin: Restarting pool {} (module: {})",
              pool_config.pool_name_, pool_config.mod_name_);
 
