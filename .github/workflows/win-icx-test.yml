@@ -130,7 +130,7 @@ jobs:
             -DVCPKG_OVERLAY_PORTS="%GITHUB_WORKSPACE%\installers\vcpkg\overlay-ports" ^
             -DCMAKE_BUILD_TYPE=Debug ^
             -DSITE=${{ matrix.os }} ^
-            -DBUILDNAME=vs2026/ninja/icx-2025.3 ^
+            -DBUILDNAME=ninja/icx-2025.3 ^
             -DCLIO_CORE_ENABLE_RUNTIME=ON ^
             -DCLIO_CORE_ENABLE_CTE=ON ^
             -DCLIO_CORE_ENABLE_CAE=ON ^
