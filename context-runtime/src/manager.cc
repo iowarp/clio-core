@@ -35,6 +35,7 @@
  * CLIO Runtime manager implementation
  */
 
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <iomanip>
@@ -406,10 +407,58 @@ void RuntimeManager::ClientFinalize() {
   }
 }
 
+void RuntimeManager::DrainPendingTasks(u64 timeout_ms) {
+  if (!is_initialized_ || !is_runtime_mode_) {
+    return;
+  }
+  auto *work_orchestrator = CLIO_WORK_ORCHESTRATOR;
+  auto *ipc_manager = CLIO_IPC;
+  if (!work_orchestrator || !ipc_manager) {
+    return;
+  }
+
+  // Sum the depth of every cross-node/client net-send queue.
+  auto net_pending = [&]() -> size_t {
+    size_t total = 0;
+    for (u32 p = 0; p < kNetQueueNumPriorities; ++p) {
+      total += ipc_manager->GetNetQueueSize(static_cast<NetQueuePriority>(p));
+    }
+    return total;
+  };
+
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+  u64 work_remaining = 0;
+  while (true) {
+    bool has_work = work_orchestrator->HasWorkRemaining(work_remaining);
+    size_t pending = net_pending();
+    if (!has_work && pending == 0) {
+      HLOG(kDebug, "DrainPendingTasks: drained (no pending work or net tasks)");
+      break;
+    }
+    if (std::chrono::steady_clock::now() >= deadline) {
+      HLOG(kWarning,
+           "DrainPendingTasks: timed out after {} ms (work_remaining={}, "
+           "net_pending={}) — proceeding with shutdown",
+           timeout_ms, work_remaining, pending);
+      break;
+    }
+    // Workers are still running here, so yield to let them finish in-flight
+    // tasks and flush the net queues.
+    CTP_THREAD_MODEL->Yield();
+  }
+}
+
 void RuntimeManager::ServerFinalize() {
   if (!is_initialized_ || !is_runtime_mode_) {
     return;
   }
+
+  // Flush in-flight (non-periodic) tasks and the net queues while the workers
+  // are still running, so client/runtime work completes on its normal path and
+  // its task + Future allocations are reclaimed instead of being abandoned by
+  // the abrupt StopWorkers() below.
+  DrainPendingTasks();
 
   // Stop workers and finalize server components
   auto *work_orchestrator = CLIO_WORK_ORCHESTRATOR;
