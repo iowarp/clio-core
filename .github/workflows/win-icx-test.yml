@@ -10,10 +10,12 @@ name: Windows ICX Test
 # windows-2025 runner -- which now ships Visual Studio 2026 -- to catch
 # compiler-specific regressions.
 #
-# NOTE: on Windows, icx.exe is the MSVC-compatible unified driver (accepts
-# cl-style "/" flags) and compiles both C and C++. icpx.exe uses a GNU/clang
-# command line and rejects the MSVC-style flags CMake emits for the Ninja
-# generator, so both CMAKE_C_COMPILER and CMAKE_CXX_COMPILER are set to icx.
+# NOTE: oneAPI ships three Windows C++ drivers. icpx.exe and icx.exe both use a
+# clang/GNU-style command line: icpx rejects the MSVC flags CMake emits for the
+# Ninja generator outright, and icx accepts some "/" flags but quietly ignores
+# /Fo<obj>, writing <base>.o into the build root (which breaks the DLL link via
+# bindexplib). icx-cl.exe is the cl.exe-compatible driver that honors /Fo, /Zi,
+# etc., so CMAKE_C_COMPILER and CMAKE_CXX_COMPILER are both set to icx-cl.
 #
 #   * oneAPI is installed via the oneapi-src/oneapi-ci helper scripts
 #     (template: actions/.github/workflows/win-25_vs-26_icx-2025.3.1.yml).
@@ -114,8 +116,8 @@ jobs:
           call "%VSINSTALL%\VC\Auxiliary\Build\vcvarsall.bat" x64 || exit /b 1
           call "%ProgramFiles(x86)%\Intel\oneAPI\setvars.bat" || exit /b 1
           cmake -B build -G Ninja ^
-            -DCMAKE_C_COMPILER=icx ^
-            -DCMAKE_CXX_COMPILER=icx ^
+            -DCMAKE_C_COMPILER=icx-cl ^
+            -DCMAKE_CXX_COMPILER=icx-cl ^
             -DCMAKE_TOOLCHAIN_FILE="%VCPKG_INSTALLATION_ROOT%\scripts\buildsystems\vcpkg.cmake" ^
             -DVCPKG_TARGET_TRIPLET=x64-windows ^
             -DVCPKG_MANIFEST_DIR="%GITHUB_WORKSPACE%\installers\vcpkg" ^
