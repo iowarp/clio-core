@@ -14,6 +14,11 @@ if(CLIO_CORE_ENABLE_ELF AND CLIO_CTE_ENABLE_MPIIO_ADAPTER AND CLIO_CORE_ENABLE_M
     add_subdirectory(mpiio)
 endif()
 
+# HDF5 VFD smoke test (requires the VFD target, which requires HDF5 >= 1.14).
+if(CLIO_CTE_ENABLE_VFD AND TARGET clio_cte_hdf5_vfd)
+    add_subdirectory(vfd)
+endif()
+
 # ADIOS2 adapter tests (doesn't require ELF interception)
 # Only add if ADIOS2 adapter is enabled
 if(CLIO_CTE_ENABLE_ADIOS2_ADAPTER)

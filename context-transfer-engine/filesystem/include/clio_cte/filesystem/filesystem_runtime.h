@@ -53,6 +53,7 @@ class Runtime : public chi::Container {
             chi::u32 container_id = 0) override;
   chi::TaskResume Run(chi::u32 method, ctp::ipc::FullPtr<chi::Task> task_ptr,
                       chi::RunContext &rctx) override;
+  chi::u64 GetWorkRemaining() const override;
   void LocalLoadTask(chi::u32 method, chi::DefaultLoadArchive &archive,
                      ctp::ipc::FullPtr<chi::Task> task_ptr) override;
   ctp::ipc::FullPtr<chi::Task> LocalAllocLoadTask(

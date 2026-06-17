@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "clio_runtime/clio_runtime.h"
+#include "clio_runtime/bdev/bdev_client.h"
 #include "clio_cte/core/core_client.h"
 
 namespace stdfs = std::filesystem;
@@ -33,19 +34,29 @@ bool initializeRuntime() {
   if (initialized) return true;
 
   if (!chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true)) {
-    INFO("Chimaera init failed; tests proceed without CTE tracking");
-    initialized = true;
-    return true;
+    INFO("Chimaera init failed");
+    return false;
   }
   if (!clio::cte::core::CLIO_CTE_CLIENT_INIT()) {
-    INFO("CTE init failed; tests proceed without CTE tracking");
-    initialized = true;
-    return true;
+    INFO("CTE init failed");
+    return false;
   }
+  // Give the CTE core pool a file-backed storage target.
   auto *cte_client = CLIO_CTE_CLIENT;
-  cte_client->RegisterTarget(ctp::ipc::MemContext(), kBackend,
-                             clio::run::bdev::BdevType::kFile,
-                             kSmall * 10);
+  chi::PoolId bdev_pool_id(951, 0);
+  clio::run::bdev::Client bdev_client(bdev_pool_id);
+  auto create_task = bdev_client.AsyncCreate(
+      chi::PoolQuery::Dynamic(), kBackend, bdev_pool_id,
+      clio::run::bdev::BdevType::kFile);
+  create_task.Wait();
+  auto reg_task = cte_client->AsyncRegisterTarget(
+      kBackend, clio::run::bdev::BdevType::kFile, kSmall * 64,
+      chi::PoolQuery::Local(), bdev_pool_id);
+  reg_task.Wait();
+  if (reg_task->GetReturnCode() != 0) {
+    INFO("Failed to register target, rc=" << reg_task->GetReturnCode());
+    return false;
+  }
   initialized = true;
   return true;
 }

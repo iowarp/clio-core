@@ -1,173 +1,43 @@
-# CMakeLists files in this project can
-# refer to the root source directory of the project as ${HDF5_HERMES_SOURCE_DIR} and
-# to the root binary directory of the project as ${HDF5_HERMES_BINARY_DIR}.
-
+# HDF5 Virtual File Driver (VFD) backed by the context-filesystem chimod.
+#
+# The driver uses the HDF5 1.14+ multi-version H5FD_class_t API (read_vector /
+# read_selection / H5FD_CLASS_VERSION), so it requires HDF5 >= 1.14. Point the
+# build at a suitable install with -DHDF5_ROOT=<prefix> (or CMAKE_PREFIX_PATH).
 project(HDF5_HERMES_VFD)
 
-# ------------------------------------------------------------------------------
-# Version information
-# ------------------------------------------------------------------------------
-set(HDF5_HERMES_VFD_VERSION_MAJOR ${HERMES_VERSION_MAJOR})
-set(HDF5_HERMES_VFD_VERSION_MINOR ${HERMES_VERSION_MINOR})
-set(HDF5_HERMES_VFD_VERSION_PATCH ${HERMES_VERSION_PATCH})
-set(HDF5_HERMES_VFD_PACKAGE "hdf5_hermes_vfd")
-set(HDF5_HERMES_VFD_PACKAGE_NAME "HDF5_HERMES_VFD")
-set(HDF5_HERMES_VFD_PACKAGE_VERSION "${HDF5_HERMES_VFD_VERSION_MAJOR}.${HDF5_HERMES_VFD_VERSION_MINOR}.${HDF5_HERMES_VFD_VERSION_PATCH}")
-set(HDF5_HERMES_VFD_PACKAGE_VERSION_MAJOR "${HDF5_HERMES_VFD_VERSION_MAJOR}.${HDF5_HERMES_VFD_VERSION_MINOR}")
-set(HDF5_HERMES_VFD_PACKAGE_VERSION_MINOR "${HDF5_HERMES_VFD_VERSION_PATCH}")
-set(HDF5_HERMES_VFD_PACKAGE_STRING "${HDF5_HERMES_VFD_PACKAGE_NAME} ${HDF5_HERMES_VFD_PACKAGE_VERSION}")
-set(HDF5_HERMES_VFD_PACKAGE_TARNAME "${HDF5_HERMES_VFD_PACKAGE}")
+find_package(HDF5 REQUIRED COMPONENTS C)
+if(HDF5_VERSION AND HDF5_VERSION VERSION_LESS "1.14")
+  message(FATAL_ERROR
+    "clio_cte_hdf5_vfd requires HDF5 >= 1.14 (the 1.14+ VFD class API); "
+    "found ${HDF5_VERSION} at ${HDF5_INCLUDE_DIRS}.")
+endif()
+message(STATUS "VFD: building against HDF5 ${HDF5_VERSION} (${HDF5_INCLUDE_DIRS})")
 
-# Dynamically loaded VFDs must be shared libraries
-set(HDF5_HERMES_VFD_LIBTYPE SHARED)
-
-set(HDF5_HERMES_VFD_SRCS
-  ${CMAKE_CURRENT_SOURCE_DIR}/H5FDhermes.h
+# Dynamically loaded VFDs must be shared libraries.
+add_library(clio_cte_hdf5_vfd SHARED
   ${CMAKE_CURRENT_SOURCE_DIR}/H5FDhermes.cc)
+set_target_properties(clio_cte_hdf5_vfd PROPERTIES
+  POSITION_INDEPENDENT_CODE ON)
 
-add_library(clio_cte_hdf5_vfd SHARED ${HDF5_HERMES_VFD_SRCS})
-target_include_directories(clio_cte_hdf5_vfd
-  SYSTEM PUBLIC ${HDF5_HERMES_VFD_EXT_INCLUDE_DEPENDENCIES}
-)
-add_dependencies(clio_cte_hdf5_vfd
-  ${Hermes_CLIENT_DEPS} clio_cte_fs_base)
+target_include_directories(clio_cte_hdf5_vfd SYSTEM PUBLIC ${HDF5_INCLUDE_DIRS})
 target_link_libraries(clio_cte_hdf5_vfd
-  ${Hermes_CLIENT_DEPS} clio_cte_fs_base
-  MPI::MPI_CXX
-  ${HDF5_HERMES_VFD_EXT_LIB_DEPENDENCIES})
-
-set(HDF5_HERMES_VFD_EXPORTED_LIBS clio_cte_hdf5_vfd ${HDF5_HERMES_VFD_EXPORTED_LIBS} PARENT_SCOPE)
-
-# -----------------------------------------------------------------------------
-# Specify project header files to be installed
-# -----------------------------------------------------------------------------
-set(HDF5_HERMES_VFD_HEADERS
-  ${CMAKE_CURRENT_SOURCE_DIR}/H5FDhermes.h)
+  clio_cte_cfs_adapter      # cfs-backed I/O core (context-filesystem chimod)
+  clio_cte_core_client
+  ctp::cxx
+  ctp::interceptor
+  ${HDF5_LIBRARIES})
 
 # -----------------------------------------------------------------------------
-# Add file(s) to CMake Install
+# Install
 # -----------------------------------------------------------------------------
 install(
-  FILES
-  ${HDF5_HERMES_VFD_HEADERS}
-  DESTINATION
-  include
-  COMPONENT
-  headers
-)
-
-# -----------------------------------------------------------------------------
-# Add Target(s) to CMake Install
-# -----------------------------------------------------------------------------
-install(
-  TARGETS
-  clio_cte_hdf5_vfd
-  LIBRARY DESTINATION lib/${HERMES_VFD_DIR_NAME}
-  ARCHIVE DESTINATION lib/${HERMES_VFD_DIR_NAME}
+  TARGETS clio_cte_hdf5_vfd
+  LIBRARY DESTINATION lib
+  ARCHIVE DESTINATION lib
   RUNTIME DESTINATION bin
 )
-
-# ------------------------------------------------------------------------------
-# Set variables for parent scope
-# ------------------------------------------------------------------------------
-
-# Pkg-config configuration
-if(CMAKE_BUILD_TYPE)
-  string(TOLOWER ${CMAKE_BUILD_TYPE} lower_cmake_build_type)
-endif()
-
-# Clio VFD package dependencies
-foreach(pkg_dep ${HDF5_HERMES_VFD_EXT_PKG_DEPENDENCIES})
-  set(HDF5_HERMES_VFD_PKG_DEPENDENCIES ${HDF5_HERMES_VFD_PKG_DEPENDENCIES} ${pkg_dep})
-endforeach()
-
-set(HDF5_HERMES_VFD_PKG_DEPENDENCIES ${HDF5_HERMES_VFD_PKG_DEPENDENCIES} PARENT_SCOPE)
-
-# Clio VFD private library dependencies
-foreach(exported_lib ${HDF5_HERMES_VFD_EXPORTED_LIBS})
-  if(lower_cmake_build_type MATCHES "debug")
-    get_target_property(HDF5_HERMES_VFD_LIBRARY ${exported_lib} DEBUG_OUTPUT_NAME)
-  else()
-    get_target_property(HDF5_HERMES_VFD_LIBRARY ${exported_lib} RELEASE_OUTPUT_NAME)
-  endif()
-
-  set(HDF5_HERMES_VFD_LIBRARIES "${HDF5_HERMES_VFD_LIBRARIES} -l${HDF5_HERMES_VFD_LIBRARY}")
-endforeach()
-
-set(HDF5_HERMES_VFD_LIBRARIES ${HDF5_HERMES_VFD_LIBRARIES} PARENT_SCOPE)
-
-# Clio VFD external library dependencies
-# Need to generate -lib if not already passed
-set(HDF5_HERMES_VFD_EXT_LIB_DEPENDENCIES
-  ${HDF5_HERMES_VFD_EXT_LIB_DEPENDENCIES}
-  ${HDF5_HERMES_VFD_EXT_PKG_LIB_DEPENDENCIES}
-  PARENT_SCOPE
-)
-
-foreach(lib_dep ${HDF5_HERMES_VFD_EXT_LIB_DEPENDENCIES})
-  # get library name
-  get_filename_component(lib_name ${lib_dep} NAME_WE)
-
-  if(lib_name MATCHES "^-l")
-    # lib_name found is -lxxx
-    set(HDF5_HERMES_VFD_EXT_LIB_DEPENDENCIES_LIST ${HDF5_HERMES_VFD_EXT_LIB_DEPENDENCIES_LIST} ${lib_name})
-  else()
-    # lib_name is /path/to/lib so get library path and name
-    get_filename_component(lib_path ${lib_dep} PATH)
-    string(REGEX REPLACE "^lib" "" lib_name ${lib_name})
-    set(HDF5_HERMES_VFD_EXT_LIB_DEPENDENCIES_LIST ${HDF5_HERMES_VFD_EXT_LIB_DEPENDENCIES_LIST} -L${lib_path} -l${lib_name})
-  endif()
-endforeach()
-
-if(HDF5_HERMES_VFD_EXT_LIB_DEPENDENCIES_LIST)
-  list(REMOVE_DUPLICATES HDF5_HERMES_VFD_EXT_LIB_DEPENDENCIES_LIST)
-endif()
-
-foreach(lib_dep ${HDF5_HERMES_VFD_EXT_LIB_DEPENDENCIES_LIST})
-  set(HDF5_HERMES_VFD_LIB_DEPENDENCIES "${HDF5_HERMES_VFD_LIB_DEPENDENCIES} ${lib_dep}")
-endforeach()
-
-set(HDF5_HERMES_VFD_LIB_DEPENDENCIES ${HDF5_HERMES_VFD_LIB_DEPENDENCIES} PARENT_SCOPE)
-
-# External include dependencies
-set(HDF5_HERMES_VFD_EXT_INCLUDE_DEPENDENCIES
-  ${HDF5_HERMES_VFD_EXT_INCLUDE_DEPENDENCIES}
-  ${HDF5_HERMES_VFD_EXT_PKG_INCLUDE_DEPENDENCIES}
-  PARENT_SCOPE
-)
-
-if(HDF5_HERMES_VFD_EXT_INCLUDE_DEPENDENCIES)
-  list(REMOVE_DUPLICATES HDF5_HERMES_VFD_EXT_INCLUDE_DEPENDENCIES)
-endif()
-
-foreach(inc_dep ${HDF5_HERMES_VFD_EXT_INCLUDE_DEPENDENCIES})
-  set(HDF5_HERMES_VFD_INCLUDE_DEPENDENCIES "${HDF5_HERMES_VFD_INCLUDE_DEPENDENCIES} -I${inc_dep}")
-endforeach()
-
-set(HDF5_HERMES_VFD_INCLUDE_DEPENDENCIES ${HDF5_HERMES_VFD_INCLUDE_DEPENDENCIES} PARENT_SCOPE)
-
-set(HDF5_HERMES_VFD_INCLUDES_BUILD_TIME
-  .
-  ${CMAKE_CURRENT_BINARY_DIR}
-  ${HDF5_HERMES_VFD_EXT_INCLUDE_DEPENDENCIES}
-  PARENT_SCOPE
-)
-
-set(HDF5_HERMES_VFD_INCLUDES_INSTALL_TIME
-  .
-  ${CMAKE_CURRENT_BINARY_DIR}
-  ${HDF5_HERMES_VFD_EXT_INCLUDE_DEPENDENCIES}
-  PARENT_SCOPE)
-
-# -----------------------------------------------------------------------------
-# Install headers
-# -----------------------------------------------------------------------------
-file(GLOB_RECURSE CLIO_CTE_HEADERS "*.h")
 install(
-  FILES
-  ${CLIO_CTE_HEADERS}
-  DESTINATION
-  include/adapter/vfd
-  COMPONENT
-  headers
+  FILES ${CMAKE_CURRENT_SOURCE_DIR}/H5FDhermes.h
+  DESTINATION include/adapter/vfd
+  COMPONENT headers
 )

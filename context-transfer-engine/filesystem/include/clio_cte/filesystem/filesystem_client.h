@@ -140,16 +140,17 @@ class Client : public clio::cte::core::Client {
 #endif  // CTP_IS_HOST
 };
 
-}  // namespace clio::cte::filesystem
-
 // Process-wide filesystem client singleton (reuses the clio_cte export macro).
+// Declared inside the namespace so it resolves as
+// clio::cte::filesystem::g_fs_client (matching CLIO_CFS_CLIENT below and the
+// definition in filesystem_client.cc), exactly like core's g_cte_client.
 CLIO_CTE_DEFINE_GLOBAL_PTR_VAR_H(clio::cte::filesystem::Client, g_fs_client);
 
-namespace clio::cte::filesystem {
 /** Initialize the filesystem client singleton (creates/binds the pool). */
 bool CLIO_CFS_CLIENT_INIT(const std::string &config_path = "",
                           const chi::PoolQuery &pool_query =
                               chi::PoolQuery::Dynamic());
+
 }  // namespace clio::cte::filesystem
 
 #define CLIO_CFS_CLIENT                                  \

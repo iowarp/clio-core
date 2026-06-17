@@ -10,8 +10,10 @@
 if(CLIO_CORE_ENABLE_ELF)
     message(STATUS "CTE Adapters: ENABLED (ELF support available)")
 
-    # Core adapters that are built when ELF is enabled
-    add_subdirectory(filesystem)
+    # Shared cfs-backed I/O core the interceptors delegate to (replaces the
+    # old clio_cte_fs_base filesystem layer; backed by the context-filesystem
+    # chimod via clio::cte::filesystem::Client).
+    add_subdirectory(cfs)
 
     # Optional adapters - controlled by root CMakeLists.txt options
     if (CLIO_CTE_ENABLE_POSIX_ADAPTER)

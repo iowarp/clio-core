@@ -48,13 +48,16 @@ else()
         endif()
 endif()
 
-set(INTERCEPTOR_DEPS
-        ${Hermes_CLIENT_DEPS} clio_cte_fs_base)
 add_library(clio_cte_mpiio SHARED
         ${CMAKE_CURRENT_SOURCE_DIR}/mpiio_api.cc)
-add_dependencies(clio_cte_mpiio ${INTERCEPTOR_DEPS})
 target_link_libraries(clio_cte_mpiio
-        MPI::MPI_CXX stdc++fs ${libelf_LIBRARIES} dl ${INTERCEPTOR_DEPS})
+        MPI::MPI_CXX
+        clio_cte_cfs_adapter      # cfs-backed I/O core (context-filesystem chimod)
+        clio_cte_core_client
+        ctp::cxx
+        ctp::interceptor
+        dl)
+set_target_properties(clio_cte_mpiio PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # -----------------------------------------------------------------------------
 # Add Target(s) to CMake Install

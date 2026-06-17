@@ -662,26 +662,32 @@ namespace clio::cte::core {
  * Tag information structure for blob grouping
  */
 struct TagInfo {
-  chi::priv::string tag_name_;
+  chi::priv::string tag_name_;  // Canonical (non-alias) name of this tag
   TagId tag_id_;
   chi::u64
       total_size_;  // Total size of all blobs in this tag (non-atomic for GPU)
   Timestamp last_modified_;
   Timestamp last_read_;
+  // Additional names bound to this tag's id (tag-level hard links). The
+  // canonical name lives in tag_name_; aliases_ holds every extra name. When
+  // the canonical tag is deleted, all of these bindings are removed too.
+  chi::priv::vector<chi::priv::string> aliases_;
 
   CTP_CROSS_FUN TagInfo()
       : tag_name_(CLIO_PRIV_ALLOC),
         tag_id_(TagId::GetNull()),
         total_size_(0),
         last_modified_(0),
-        last_read_(0) {}
+        last_read_(0),
+        aliases_(CLIO_PRIV_ALLOC) {}
 
   CTP_CROSS_FUN TagInfo(const chi::priv::string &tag_name, const TagId &tag_id)
       : tag_name_(tag_name),
         tag_id_(tag_id),
         total_size_(0),
         last_modified_(0),
-        last_read_(0) {}
+        last_read_(0),
+        aliases_(CLIO_PRIV_ALLOC) {}
 
 #if CTP_IS_HOST
   TagInfo(const std::string &tag_name, const TagId &tag_id)
@@ -689,7 +695,8 @@ struct TagInfo {
         tag_id_(tag_id),
         total_size_(0),
         last_modified_(GetCurrentTimeNs()),
-        last_read_(GetCurrentTimeNs()) {}
+        last_read_(GetCurrentTimeNs()),
+        aliases_(CLIO_PRIV_ALLOC) {}
 #endif
 
   CTP_CROSS_FUN TagInfo(const TagInfo &other)
@@ -697,7 +704,8 @@ struct TagInfo {
         tag_id_(other.tag_id_),
         total_size_(other.total_size_),
         last_modified_(other.last_modified_),
-        last_read_(other.last_read_) {}
+        last_read_(other.last_read_),
+        aliases_(other.aliases_) {}
 
   CTP_CROSS_FUN TagInfo &operator=(const TagInfo &other) {
     if (this != &other) {
@@ -706,6 +714,7 @@ struct TagInfo {
       total_size_ = other.total_size_;
       last_modified_ = other.last_modified_;
       last_read_ = other.last_read_;
+      aliases_ = other.aliases_;
     }
     return *this;
   }
@@ -922,6 +931,18 @@ enum class CteOp : chi::u32 {
   kDelTag = 4,
   kGetTagSize = 5
 };
+
+/**
+ * PutBlobTask::flags_ bits.
+ *
+ * By default PutBlob is a partial modify: it writes [offset, offset+size),
+ * growing the blob if needed, and NEVER shrinks/clears it (POSIX write
+ * semantics). kCtePutReplace opts into wholesale replacement: the blob is
+ * resized to exactly offset+size (shrinking if needed) before the write, so a
+ * smaller put truly replaces a larger blob. Both the replace path and the
+ * explicit TruncateBlob op share Runtime::ResizeBlob.
+ */
+GLOBAL_CROSS_CONST chi::u32 kCtePutReplace = 0x1u;
 
 /**
  * CTE Telemetry data structure for performance monitoring
@@ -1525,6 +1546,65 @@ struct DelBlobTask : public chi::Task {
 };
 
 /**
+ * TruncateBlob task - resize a blob to an exact logical size.
+ * Grows (zero-extends) or shrinks (frees trailing blocks). Shares
+ * Runtime::ResizeBlob with PutBlob's replace path.
+ */
+struct TruncateBlobTask : public chi::Task {
+  IN TagId tag_id_;                 // Tag ID for blob lookup
+  IN chi::priv::string blob_name_;  // Blob name (required)
+  IN chi::u64 new_size_;            // Target logical size in bytes
+
+  // SHM constructor
+  TruncateBlobTask()
+      : chi::Task(),
+        tag_id_(TagId::GetNull()),
+        blob_name_(CLIO_PRIV_ALLOC),
+        new_size_(0) {}
+
+  // Emplace constructor
+  CTP_CROSS_FUN explicit TruncateBlobTask(const chi::TaskId &task_id,
+                                          const chi::PoolId &pool_id,
+                                          const chi::PoolQuery &pool_query,
+                                          const TagId &tag_id,
+                                          const std::string &blob_name,
+                                          chi::u64 new_size)
+      : chi::Task(task_id, pool_id, pool_query, Method::kTruncateBlob),
+        tag_id_(tag_id),
+        blob_name_(CLIO_PRIV_ALLOC, blob_name),
+        new_size_(new_size) {
+    task_id_ = task_id;
+    pool_id_ = pool_id;
+    method_ = Method::kTruncateBlob;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+    ar(tag_id_, blob_name_, new_size_);
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+  }
+
+  void Copy(const ctp::ipc::FullPtr<TruncateBlobTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+    tag_id_ = other->tag_id_;
+    blob_name_ = other->blob_name_;
+    new_size_ = other->new_size_;
+  }
+
+  void Aggregate(const ctp::ipc::FullPtr<chi::Task> &other_base) {
+    Task::Aggregate(other_base);
+    Copy(other_base.template Cast<TruncateBlobTask>());
+  }
+};
+
+/**
  * DelTag task - Remove all blobs from tag and remove tag
  * Supports lookup by either tag ID or tag name
  */
@@ -1601,6 +1681,135 @@ struct DelTagTask : public chi::Task {
   void Aggregate(const ctp::ipc::FullPtr<chi::Task> &other_base) {
     Task::Aggregate(other_base);
     Copy(other_base.template Cast<DelTagTask>());
+  }
+};
+
+/**
+ * RenameTag task - change a tag's name, keeping its TagId (and therefore all
+ * of its blobs) intact. Broadcast: each container moves the name->id binding
+ * it holds (old_name_ -> new_name_) and updates the tag's stored name.
+ */
+struct RenameTagTask : public chi::Task {
+  INOUT TagId tag_id_;                 // Tag ID (input, or resolved from name)
+  IN chi::priv::string old_name_;      // Current tag name
+  IN chi::priv::string new_name_;      // Desired tag name
+
+  RenameTagTask()
+      : chi::Task(),
+        tag_id_(TagId::GetNull()),
+        old_name_(CLIO_PRIV_ALLOC),
+        new_name_(CLIO_PRIV_ALLOC) {}
+
+  CTP_CROSS_FUN explicit RenameTagTask(const chi::TaskId &task_id,
+                                       const chi::PoolId &pool_id,
+                                       const chi::PoolQuery &pool_query,
+                                       const TagId &tag_id,
+                                       const std::string &old_name,
+                                       const std::string &new_name)
+      : chi::Task(task_id, pool_id, pool_query, Method::kRenameTag),
+        tag_id_(tag_id),
+        old_name_(CLIO_PRIV_ALLOC, old_name),
+        new_name_(CLIO_PRIV_ALLOC, new_name) {
+    task_id_ = task_id;
+    pool_id_ = pool_id;
+    method_ = Method::kRenameTag;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+    ar(tag_id_, old_name_, new_name_);
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+    ar(tag_id_);
+  }
+
+  void Copy(const ctp::ipc::FullPtr<RenameTagTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+    tag_id_ = other->tag_id_;
+    old_name_ = other->old_name_;
+    new_name_ = other->new_name_;
+  }
+
+  void Aggregate(const ctp::ipc::FullPtr<chi::Task> &other_base) {
+    Task::Aggregate(other_base);
+    Copy(other_base.template Cast<RenameTagTask>());
+  }
+};
+
+/**
+ * GetOrCreateTagAlias task - bind an additional name (alias_name_) to an
+ * EXISTING tag's TagId, so the alias shares the target's id and therefore all
+ * of its blobs (a hard link at the tag level). The target may be given by id
+ * (tag_id_) or by name (existing_name_); if it does not exist, found_ stays 0
+ * and the caller treats it as an error. Idempotent: if alias_name_ is already
+ * bound, its existing id is returned. Broadcast.
+ */
+struct GetOrCreateTagAliasTask : public chi::Task {
+  INOUT TagId tag_id_;              // Target tag id (input, or resolved by name)
+  IN chi::priv::string existing_name_;  // Target tag name (used if tag_id_ null)
+  IN chi::priv::string alias_name_;     // New name to bind to the target id
+  OUT chi::u32 found_;              // 1 if the target tag exists (success)
+
+  GetOrCreateTagAliasTask()
+      : chi::Task(),
+        tag_id_(TagId::GetNull()),
+        existing_name_(CLIO_PRIV_ALLOC),
+        alias_name_(CLIO_PRIV_ALLOC),
+        found_(0) {}
+
+  CTP_CROSS_FUN explicit GetOrCreateTagAliasTask(
+      const chi::TaskId &task_id, const chi::PoolId &pool_id,
+      const chi::PoolQuery &pool_query, const TagId &tag_id,
+      const std::string &existing_name, const std::string &alias_name)
+      : chi::Task(task_id, pool_id, pool_query, Method::kGetOrCreateTagAlias),
+        tag_id_(tag_id),
+        existing_name_(CLIO_PRIV_ALLOC, existing_name),
+        alias_name_(CLIO_PRIV_ALLOC, alias_name),
+        found_(0) {
+    task_id_ = task_id;
+    pool_id_ = pool_id;
+    method_ = Method::kGetOrCreateTagAlias;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+    ar(tag_id_, existing_name_, alias_name_);
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+    ar(tag_id_, found_);
+  }
+
+  void Copy(const ctp::ipc::FullPtr<GetOrCreateTagAliasTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+    tag_id_ = other->tag_id_;
+    existing_name_ = other->existing_name_;
+    alias_name_ = other->alias_name_;
+    found_ = other->found_;
+  }
+
+  // Broadcast aggregation: the alias exists if ANY container confirmed the
+  // target, and the resolved id is whichever non-null id a replica reported.
+  void Aggregate(const ctp::ipc::FullPtr<chi::Task> &other_base) {
+    Task::Aggregate(other_base);
+    auto other = other_base.template Cast<GetOrCreateTagAliasTask>();
+    if (other->found_) {
+      found_ = 1;
+    }
+    if (tag_id_.IsNull() && !other->tag_id_.IsNull()) {
+      tag_id_ = other->tag_id_;
+    }
   }
 };
 

@@ -6,12 +6,14 @@ include_directories(
         .)
 
 # Create the STDIO interceptor
-set(INTERCEPTOR_DEPS
-        ${Hermes_CLIENT_DEPS} clio_cte_fs_base)
 add_library(clio_cte_stdio SHARED
         ${CMAKE_CURRENT_SOURCE_DIR}/stdio_api.cc)
-add_dependencies(clio_cte_stdio ${INTERCEPTOR_DEPS})
-target_link_libraries(clio_cte_stdio MPI::MPI_CXX stdc++fs ${libelf_LIBRARIES} ${INTERCEPTOR_DEPS})
+target_link_libraries(clio_cte_stdio
+        clio_cte_cfs_adapter      # cfs-backed I/O core (context-filesystem chimod)
+        clio_cte_core_client
+        ctp::cxx
+        ctp::interceptor)
+set_target_properties(clio_cte_stdio PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # -----------------------------------------------------------------------------
 # Add Target(s) to CMake Install

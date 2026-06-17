@@ -3,9 +3,15 @@
  * All rights reserved. BSD 3-Clause license.
  *
  * Task definitions for the filesystem chimod — the on-the-wire contract for
- * every filesystem operation the interceptors delegate to. Modeled on the
- * compressor chimod's task style (SerializeStart = IN/INOUT + bulk-in,
- * SerializeEnd = OUT/INOUT).
+ * every filesystem operation the interceptors delegate to.
+ *
+ * Serialization convention (mirrors the CTE core tasks, which is what the
+ * runtime archives actually dispatch to): SerializeIn carries IN/INOUT fields
+ * (plus any bulk-in payload) and MUST call Task::SerializeIn(ar) first;
+ * SerializeOut carries OUT/INOUT fields (plus any bulk-out payload) and MUST
+ * call Task::SerializeOut(ar) first. The archive operators only ever call
+ * SerializeIn/SerializeOut — naming them anything else silently falls back to
+ * the base Task serializer and OUT fields never travel back to the client.
  *
  * Handle model: a file handle is an opaque u64 the runtime assigns at Open;
  * it indexes a server-side table of {CTE tag, logical size}. Paths are mapped
@@ -24,8 +30,20 @@
 
 namespace clio::cte::filesystem {
 
+/** Monitor reuses the admin task type (same as core/compressor chimods). */
+using MonitorTask = clio::run::admin::MonitorTask;
+
 /** 1 MiB page size, matching the libfuse adapter's blob paging. */
 GLOBAL_CROSS_CONST chi::u64 kFsPageSize = 1024 * 1024;
+
+/**
+ * Well-known default pool id/name for the filesystem chimod, used by the
+ * interceptor adapters (libfuse, POSIX, ...) to create-or-bind a single
+ * shared filesystem pool over the default CTE core pool — exactly the way
+ * clio::cte::core uses kCtePoolId/kCtePoolName.
+ */
+static constexpr chi::PoolId kCfsPoolId(560, 0);
+static constexpr const char *kCfsPoolName = "clio_cte_filesystem";
 
 /**
  * Container creation params. next_pool_id_ is the CTE core pool this
@@ -72,8 +90,8 @@ struct DestroyTask : public chi::Task {
                        const chi::PoolQuery &pool_query)
       : chi::Task(task_id, pool_id, pool_query, Method::kDestroy) {}
   void Copy(const ctp::ipc::FullPtr<DestroyTask>& other) { (void)other; }
-  template <typename Ar> void SerializeStart(Ar &ar) { task_serialize<Ar>(ar); }
-  template <typename Ar> void SerializeEnd(Ar &ar) { (void)ar; }
+  template <typename Ar> void SerializeIn(Ar &ar) { Task::SerializeIn(ar); }
+  template <typename Ar> void SerializeOut(Ar &ar) { Task::SerializeOut(ar); }
 };
 
 /** Open: resolve/create a file's tag; returns a handle + current size. */
@@ -98,11 +116,11 @@ struct OpenTask : public chi::Task {
     path_ = o->path_; flags_ = o->flags_; mode_ = o->mode_;
     handle_ = o->handle_; size_ = o->size_; created_ = o->created_;
   }
-  template <typename Ar> void SerializeStart(Ar &ar) {
-    task_serialize<Ar>(ar); ar(path_, flags_, mode_);
+  template <typename Ar> void SerializeIn(Ar &ar) {
+    Task::SerializeIn(ar); ar(path_, flags_, mode_);
   }
-  template <typename Ar> void SerializeEnd(Ar &ar) {
-    ar(handle_, size_, created_);
+  template <typename Ar> void SerializeOut(Ar &ar) {
+    Task::SerializeOut(ar); ar(handle_, size_, created_);
   }
 };
 
@@ -115,10 +133,10 @@ struct CloseTask : public chi::Task {
       : chi::Task(task_id, pool_id, pool_query, Method::kClose),
         handle_(handle) {}
   void Copy(const ctp::ipc::FullPtr<CloseTask>& o) { handle_ = o->handle_; }
-  template <typename Ar> void SerializeStart(Ar &ar) {
-    task_serialize<Ar>(ar); ar(handle_);
+  template <typename Ar> void SerializeIn(Ar &ar) {
+    Task::SerializeIn(ar); ar(handle_);
   }
-  template <typename Ar> void SerializeEnd(Ar &ar) { (void)ar; }
+  template <typename Ar> void SerializeOut(Ar &ar) { Task::SerializeOut(ar); }
 };
 
 /** Read: page-loop GetBlob over [offset, offset+size). */
@@ -141,11 +159,13 @@ struct ReadTask : public chi::Task {
     handle_ = o->handle_; offset_ = o->offset_; size_ = o->size_;
     data_ = o->data_; bytes_read_ = o->bytes_read_;
   }
-  template <typename Ar> void SerializeStart(Ar &ar) {
-    task_serialize<Ar>(ar); ar(handle_, offset_, size_, data_);
+  template <typename Ar> void SerializeIn(Ar &ar) {
+    Task::SerializeIn(ar); ar(handle_, offset_, size_, data_);
+    ar.bulk(data_, size_, BULK_EXPOSE);
   }
-  template <typename Ar> void SerializeEnd(Ar &ar) {
-    ar(bytes_read_); ar.bulk(data_, bytes_read_, BULK_XFER);
+  template <typename Ar> void SerializeOut(Ar &ar) {
+    Task::SerializeOut(ar); ar(bytes_read_);
+    ar.bulk(data_, size_, BULK_XFER);
   }
 };
 
@@ -171,12 +191,12 @@ struct WriteTask : public chi::Task {
     data_ = o->data_; bytes_written_ = o->bytes_written_;
     new_size_ = o->new_size_;
   }
-  template <typename Ar> void SerializeStart(Ar &ar) {
-    task_serialize<Ar>(ar); ar(handle_, offset_, size_, data_);
+  template <typename Ar> void SerializeIn(Ar &ar) {
+    Task::SerializeIn(ar); ar(handle_, offset_, size_, data_);
     ar.bulk(data_, size_, BULK_XFER);
   }
-  template <typename Ar> void SerializeEnd(Ar &ar) {
-    ar(bytes_written_, new_size_);
+  template <typename Ar> void SerializeOut(Ar &ar) {
+    Task::SerializeOut(ar); ar(bytes_written_, new_size_);
   }
 };
 
@@ -203,12 +223,12 @@ struct AppendTask : public chi::Task {
     offset_ = o->offset_; bytes_written_ = o->bytes_written_;
     new_size_ = o->new_size_;
   }
-  template <typename Ar> void SerializeStart(Ar &ar) {
-    task_serialize<Ar>(ar); ar(handle_, size_, data_);
+  template <typename Ar> void SerializeIn(Ar &ar) {
+    Task::SerializeIn(ar); ar(handle_, size_, data_);
     ar.bulk(data_, size_, BULK_XFER);
   }
-  template <typename Ar> void SerializeEnd(Ar &ar) {
-    ar(offset_, bytes_written_, new_size_);
+  template <typename Ar> void SerializeOut(Ar &ar) {
+    Task::SerializeOut(ar); ar(offset_, bytes_written_, new_size_);
   }
 };
 
@@ -228,11 +248,11 @@ struct GetattrTask : public chi::Task {
     path_ = o->path_; exists_ = o->exists_; is_dir_ = o->is_dir_;
     size_ = o->size_;
   }
-  template <typename Ar> void SerializeStart(Ar &ar) {
-    task_serialize<Ar>(ar); ar(path_);
+  template <typename Ar> void SerializeIn(Ar &ar) {
+    Task::SerializeIn(ar); ar(path_);
   }
-  template <typename Ar> void SerializeEnd(Ar &ar) {
-    ar(exists_, is_dir_, size_);
+  template <typename Ar> void SerializeOut(Ar &ar) {
+    Task::SerializeOut(ar); ar(exists_, is_dir_, size_);
   }
 };
 
@@ -249,10 +269,10 @@ struct TruncateTask : public chi::Task {
   void Copy(const ctp::ipc::FullPtr<TruncateTask>& o) {
     path_ = o->path_; new_size_ = o->new_size_;
   }
-  template <typename Ar> void SerializeStart(Ar &ar) {
-    task_serialize<Ar>(ar); ar(path_, new_size_);
+  template <typename Ar> void SerializeIn(Ar &ar) {
+    Task::SerializeIn(ar); ar(path_, new_size_);
   }
-  template <typename Ar> void SerializeEnd(Ar &ar) { (void)ar; }
+  template <typename Ar> void SerializeOut(Ar &ar) { Task::SerializeOut(ar); }
 };
 
 /** A single-path task body shared by unlink/mkdir/rmdir. */
@@ -265,10 +285,10 @@ struct TruncateTask : public chi::Task {
         : chi::Task(task_id, pool_id, pool_query, METHOD),                     \
           path_(CTP_MALLOC, path) {}                                           \
     void Copy(const ctp::ipc::FullPtr<NAME>& o) { path_ = o->path_; }          \
-    template <typename Ar> void SerializeStart(Ar &ar) {                       \
-      task_serialize<Ar>(ar); ar(path_);                                       \
+    template <typename Ar> void SerializeIn(Ar &ar) {                          \
+      Task::SerializeIn(ar); ar(path_);                                        \
     }                                                                          \
-    template <typename Ar> void SerializeEnd(Ar &ar) { (void)ar; }             \
+    template <typename Ar> void SerializeOut(Ar &ar) { Task::SerializeOut(ar); } \
   }
 
 CLIO_FS_PATH_TASK(UnlinkTask, Method::kUnlink);
@@ -289,10 +309,10 @@ struct RenameTask : public chi::Task {
   void Copy(const ctp::ipc::FullPtr<RenameTask>& o) {
     src_ = o->src_; dst_ = o->dst_;
   }
-  template <typename Ar> void SerializeStart(Ar &ar) {
-    task_serialize<Ar>(ar); ar(src_, dst_);
+  template <typename Ar> void SerializeIn(Ar &ar) {
+    Task::SerializeIn(ar); ar(src_, dst_);
   }
-  template <typename Ar> void SerializeEnd(Ar &ar) { (void)ar; }
+  template <typename Ar> void SerializeOut(Ar &ar) { Task::SerializeOut(ar); }
 };
 
 /** Readdir: list direct children of a directory. */
@@ -308,10 +328,12 @@ struct ReaddirTask : public chi::Task {
   void Copy(const ctp::ipc::FullPtr<ReaddirTask>& o) {
     path_ = o->path_; entries_ = o->entries_;
   }
-  template <typename Ar> void SerializeStart(Ar &ar) {
-    task_serialize<Ar>(ar); ar(path_);
+  template <typename Ar> void SerializeIn(Ar &ar) {
+    Task::SerializeIn(ar); ar(path_);
   }
-  template <typename Ar> void SerializeEnd(Ar &ar) { ar(entries_); }
+  template <typename Ar> void SerializeOut(Ar &ar) {
+    Task::SerializeOut(ar); ar(entries_);
+  }
 };
 
 /** StatSize: lightweight logical-size lookup. */
@@ -327,10 +349,12 @@ struct StatSizeTask : public chi::Task {
   void Copy(const ctp::ipc::FullPtr<StatSizeTask>& o) {
     path_ = o->path_; exists_ = o->exists_; size_ = o->size_;
   }
-  template <typename Ar> void SerializeStart(Ar &ar) {
-    task_serialize<Ar>(ar); ar(path_);
+  template <typename Ar> void SerializeIn(Ar &ar) {
+    Task::SerializeIn(ar); ar(path_);
   }
-  template <typename Ar> void SerializeEnd(Ar &ar) { ar(exists_, size_); }
+  template <typename Ar> void SerializeOut(Ar &ar) {
+    Task::SerializeOut(ar); ar(exists_, size_);
+  }
 };
 
 }  // namespace clio::cte::filesystem

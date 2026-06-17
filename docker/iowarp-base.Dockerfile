@@ -30,7 +30,20 @@ RUN apt install -y \
     redis-server redis-tools \
     gnupg \
     net-tools lsof iproute2 \
+    fuse3 libfuse3-dev \
+    uuid-dev libattr1-dev libacl1-dev libaio-dev libgdbm-dev libtool-bin \
+    xfslibs-dev xfsprogs e2fsprogs attr acl quota \
     && rm -rf /var/lib/apt/lists/*
+
+#------------------------------------------------------------
+# xfstests — the filesystem conformance suite used to drive the clio
+# filesystem (FUSE adapter). Cloned + built into /opt/xfstests so every
+# devcontainer has `./check` available.
+#------------------------------------------------------------
+RUN git clone --depth 1 \
+      https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git /opt/xfstests \
+    && make -C /opt/xfstests -j"$(nproc)" \
+    && chmod -R a+rwX /opt/xfstests
 # Commented apt packages now provided by conda:
 #   cmake \
 #   openssl libssl-dev \

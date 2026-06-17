@@ -1029,40 +1029,37 @@ chi::TaskResume Runtime::PutBlob(ctp::ipc::FullPtr<PutBlobTask> task,
       CLIO_CO_RETURN;
     }
 
-    // Step 1: ClearBlob — free blocks if full replacement
+    // Create blob metadata if new; otherwise remember its current size.
     chi::u64 old_blob_size = 0;
-    if (blob_found) {
-      bool cleared = false;
-      CLIO_CO_AWAIT(ClearBlob(*blob_info_ptr, blob_score, offset, size, cleared));
-      if (cleared) {
-        // WAL: log blob clear
-        if (!blob_txn_logs_.empty()) {
-          chi::u32 wid = CLIO_CUR_WORKER->GetWorkerStats().worker_id_;
-          TxnClearBlob txn;
-          txn.tag_major_ = tag_id.major_;
-          txn.tag_minor_ = tag_id.minor_;
-          txn.blob_name_ = blob_name;
-          blob_txn_logs_[wid % blob_txn_logs_.size()]->Log(TxnType::kClearBlob,
-                                                           txn);
-        }
-      } else {
-        old_blob_size = blob_info_ptr->GetTotalSize();
-      }
-    }
-
-    // Create blob metadata if new
     if (!blob_found) {
       blob_info_ptr = CreateNewBlob(blob_name, tag_id, blob_score);
       if (!blob_info_ptr) {
         task->return_code_ = 5;
         CLIO_CO_RETURN;
       }
+    } else {
+      old_blob_size = blob_info_ptr->GetTotalSize();
     }
 
-    // Step 2: ExtendBlob — allocate new blocks if needed
+    // Step 1+2: size the blob to fit the write.
+    //  - default (partial modify): grow to cover [offset, offset+size) but
+    //    NEVER shrink — writing must not truncate the tail (POSIX write
+    //    semantics). This is what makes out-of-order / descending partial
+    //    writes (e.g. HDF5 writing data high, then the superblock at offset 0)
+    //    safe; the old offset==0 "clear the whole blob" heuristic corrupted
+    //    them.
+    //  - kCtePutReplace (wholesale replace): resize to exactly offset+size,
+    //    shrinking if needed, via the shared ResizeBlob helper.
     chi::u32 alloc_result = 0;
-    CLIO_CO_AWAIT(ExtendBlob(*blob_info_ptr, offset, size, blob_score, alloc_result,
-                        task->context_.min_persistence_level_));
+    if (task->flags_ & kCtePutReplace) {
+      CLIO_CO_AWAIT(ResizeBlob(*blob_info_ptr, offset + size, blob_score,
+                          alloc_result,
+                          task->context_.min_persistence_level_));
+    } else {
+      CLIO_CO_AWAIT(ExtendBlob(*blob_info_ptr, offset, size, blob_score,
+                          alloc_result,
+                          task->context_.min_persistence_level_));
+    }
     if (alloc_result != 0) {
       task->return_code_ = 10 + alloc_result;
       CLIO_CO_RETURN;
@@ -1086,6 +1083,32 @@ chi::TaskResume Runtime::PutBlob(ctp::ipc::FullPtr<PutBlobTask> task,
       }
       blob_txn_logs_[wid % blob_txn_logs_.size()]->Log(TxnType::kExtendBlob,
                                                        txn);
+    }
+
+    // Step 2.5: Zero any hole created by writing past the old end-of-blob
+    // (sparse write). Newly allocated space is NOT guaranteed to be zero — the
+    // bdev recycles freed blocks, so a fresh block can hold stale data — and
+    // POSIX requires allocated-but-unwritten bytes to read as zeros. Only the
+    // gap [old_blob_size, offset) needs it; sequential appends (offset ==
+    // old_blob_size) and overwrites (offset < old_blob_size) create no hole.
+    if (offset > old_blob_size) {
+      chi::u64 hole = offset - old_blob_size;
+      auto *ipc_mgr = CLIO_IPC;
+      ctp::ipc::FullPtr<char> zbuf = ipc_mgr->AllocateBuffer(hole);
+      if (zbuf.IsNull()) {
+        task->return_code_ = 6;
+        CLIO_CO_RETURN;
+      }
+      std::memset(zbuf.ptr_, 0, hole);
+      chi::u32 zero_result = 0;
+      CLIO_CO_AWAIT(ModifyExistingData(blob_info_ptr->blocks_,
+                                  zbuf.shm_.template Cast<void>(), hole,
+                                  old_blob_size, zero_result));
+      ipc_mgr->FreeBuffer(zbuf);
+      if (zero_result != 0) {
+        task->return_code_ = 20 + zero_result;
+        CLIO_CO_RETURN;
+      }
     }
 
     // Step 3: ModifyExistingData — write data to blocks
@@ -1447,6 +1470,204 @@ chi::TaskResume Runtime::DelBlob(ctp::ipc::FullPtr<DelBlobTask> task,
   CLIO_TASK_BODY_END
 }
 
+chi::TaskResume Runtime::TruncateBlob(ctp::ipc::FullPtr<TruncateBlobTask> task,
+                                      chi::RunContext &ctx) {
+#ifdef __NVCOMPILER
+  chi::RunContext& rctx = ctx;
+#else
+  (void)ctx;
+#endif
+  CLIO_TASK_BODY_BEGIN
+  try {
+    TagId tag_id = task->tag_id_;
+    std::string blob_name = task->blob_name_.str();
+    chi::u64 new_size = task->new_size_;
+    if (blob_name.empty()) {
+      task->return_code_ = 1;
+      CLIO_CO_RETURN;
+    }
+
+    BlobInfo *blob_info_ptr = CheckBlobExists(blob_name, tag_id);
+    if (blob_info_ptr == nullptr) {
+      // A missing blob is already "empty" — nothing to truncate.
+      task->return_code_ = 0;
+      CLIO_CO_RETURN;
+    }
+    chi::u64 old_size = blob_info_ptr->GetTotalSize();
+    float blob_score = blob_info_ptr->score_;
+
+    // Shared resize helper (also used by PutBlob's replace path).
+    chi::u32 resize_result = 0;
+    CLIO_CO_AWAIT(ResizeBlob(*blob_info_ptr, new_size, blob_score,
+                        resize_result, 0));
+    if (resize_result != 0) {
+      task->return_code_ = 10 + resize_result;
+      CLIO_CO_RETURN;
+    }
+    chi::u64 final_size = blob_info_ptr->GetTotalSize();
+
+    // Update the tag's total_size_ by the delta.
+    {
+      chi::ScopedCoRwWriteLock lock(tag_map_lock_);
+      TagInfo *tag_info_ptr = tag_id_to_info_.find(tag_id);
+      if (tag_info_ptr != nullptr) {
+        if (final_size >= old_size) {
+          tag_info_ptr->total_size_ += (final_size - old_size);
+        } else {
+          chi::u64 d = old_size - final_size;
+          tag_info_ptr->total_size_ =
+              (d <= tag_info_ptr->total_size_) ? tag_info_ptr->total_size_ - d
+                                               : 0;
+        }
+      }
+    }
+
+    // WAL: record the resized block list (full-replacement semantics), so a
+    // restart replays the truncated blob.
+    if (!blob_txn_logs_.empty() && !blob_info_ptr->blocks_.empty()) {
+      chi::u32 wid = CLIO_CUR_WORKER->GetWorkerStats().worker_id_;
+      TxnExtendBlob txn;
+      txn.tag_major_ = tag_id.major_;
+      txn.tag_minor_ = tag_id.minor_;
+      txn.blob_name_ = blob_name;
+      for (const auto &blk : blob_info_ptr->blocks_) {
+        TxnExtendBlobBlock tb;
+        tb.bdev_major_ = blk.bdev_client_.pool_id_.major_;
+        tb.bdev_minor_ = blk.bdev_client_.pool_id_.minor_;
+        tb.target_query_ = blk.target_query_;
+        tb.target_offset_ = blk.target_offset_;
+        tb.size_ = blk.size_;
+        txn.new_blocks_.push_back(tb);
+      }
+      blob_txn_logs_[wid % blob_txn_logs_.size()]->Log(TxnType::kExtendBlob,
+                                                       txn);
+    }
+
+    blob_info_ptr->last_modified_ = GetCurrentTimeNs();
+    task->return_code_ = 0;
+  } catch (const std::exception &e) {
+    HLOG(kError, "TruncateBlob failed: {}", e.what());
+    task->return_code_ = 1;
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+chi::TaskResume Runtime::RenameTag(ctp::ipc::FullPtr<RenameTagTask> task,
+                                   chi::RunContext &ctx) {
+#ifdef __NVCOMPILER
+  chi::RunContext& rctx = ctx;
+#else
+  (void)ctx;
+#endif
+  CLIO_TASK_BODY_BEGIN
+  try {
+    TagId tag_id = task->tag_id_;
+    std::string old_name = task->old_name_.str();
+    std::string new_name = task->new_name_.str();
+    if (old_name.empty() || new_name.empty()) {
+      task->return_code_ = 1;
+      CLIO_CO_RETURN;
+    }
+    if (old_name == new_name) {
+      task->return_code_ = 0;
+      CLIO_CO_RETURN;
+    }
+
+    // The tag keeps its TagId — only the name changes, so its blobs (keyed by
+    // TagId) are untouched. This runs as a broadcast: each container moves the
+    // name->id binding it happens to hold and refreshes the stored name.
+    chi::ScopedCoRwWriteLock lock(tag_map_lock_);
+    TagId *idp = tag_name_to_id_.find(old_name);
+    if (idp != nullptr) {
+      TagId bound = *idp;
+      if (tag_id.IsNull()) {
+        tag_id = bound;
+      }
+      tag_name_to_id_.erase(old_name);
+      tag_name_to_id_.insert_or_assign(new_name, bound);
+    }
+    if (!tag_id.IsNull()) {
+      TagInfo *info = tag_id_to_info_.find(tag_id);
+      if (info != nullptr) {
+        info->tag_name_ = chi::priv::string(CLIO_PRIV_ALLOC, new_name);
+        info->last_modified_ = GetCurrentTimeNs();
+      }
+    }
+    task->tag_id_ = tag_id;
+    task->return_code_ = 0;
+  } catch (const std::exception &e) {
+    HLOG(kError, "RenameTag failed: {}", e.what());
+    task->return_code_ = 1;
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+chi::TaskResume Runtime::GetOrCreateTagAlias(
+    ctp::ipc::FullPtr<GetOrCreateTagAliasTask> task, chi::RunContext &ctx) {
+#ifdef __NVCOMPILER
+  chi::RunContext& rctx = ctx;
+#else
+  (void)ctx;
+#endif
+  CLIO_TASK_BODY_BEGIN
+  try {
+    TagId tag_id = task->tag_id_;
+    std::string existing_name = task->existing_name_.str();
+    std::string alias_name = task->alias_name_.str();
+    if (alias_name.empty()) {
+      task->return_code_ = 1;
+      CLIO_CO_RETURN;
+    }
+
+    chi::ScopedCoRwWriteLock lock(tag_map_lock_);
+    // Resolve the target id from a local name binding if it wasn't supplied.
+    if (tag_id.IsNull() && !existing_name.empty()) {
+      TagId *p = tag_name_to_id_.find(existing_name);
+      if (p != nullptr) {
+        tag_id = *p;
+      }
+    }
+    // The canonical container (the one holding the target's TagInfo) verifies
+    // the target exists and binds the alias name to the SAME id — so the alias
+    // shares all of the target's blobs (a tag-level hard link). GetOrCreate:
+    // if the alias name is already bound, return its existing id unchanged.
+    if (!tag_id.IsNull()) {
+      TagInfo *info = tag_id_to_info_.find(tag_id);
+      if (info != nullptr) {
+        task->found_ = 1;
+        TagId *existing_alias = tag_name_to_id_.find(alias_name);
+        if (existing_alias == nullptr) {
+          tag_name_to_id_.insert_or_assign(alias_name, tag_id);
+          // Record the alias on the tag so DelTag can cascade-remove it. The
+          // canonical name (tag_name_) is never added here. Dedup defensively
+          // even though the name binding above guarantees first-time insert.
+          bool present = (alias_name == info->tag_name_.str());
+          for (size_t i = 0; !present && i < info->aliases_.size(); ++i) {
+            if (info->aliases_[i].str() == alias_name) present = true;
+          }
+          if (!present) {
+            info->aliases_.push_back(chi::priv::string(CLIO_PRIV_ALLOC,
+                                                       alias_name));
+          }
+          info->last_modified_ = GetCurrentTimeNs();
+        } else {
+          tag_id = *existing_alias;
+        }
+      }
+    }
+    task->tag_id_ = tag_id;
+    // found_ conveys whether the target existed; the op itself didn't fail.
+    task->return_code_ = 0;
+  } catch (const std::exception &e) {
+    HLOG(kError, "GetOrCreateTagAlias failed: {}", e.what());
+    task->return_code_ = 1;
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
 chi::TaskResume Runtime::DelTag(ctp::ipc::FullPtr<DelTagTask> task,
                                 chi::RunContext &ctx) {
 #ifdef __NVCOMPILER
@@ -1474,8 +1695,11 @@ chi::TaskResume Runtime::DelTag(ctp::ipc::FullPtr<DelTagTask> task,
       CLIO_CO_RETURN;
     }
 
-    // Step 2: Find the tag by ID
+    // Step 2: Find the tag by ID. Also capture the canonical name and the set
+    // of alias names so we can either (a) unlink just one alias or (b) cascade
+    // and remove every alias when the canonical (non-alias) tag is deleted.
     std::string cached_tag_name;
+    std::vector<std::string> cached_aliases;
     {
       chi::ScopedCoRwReadLock lock(tag_map_lock_);
       TagInfo *tag_info_ptr = tag_id_to_info_.find(tag_id);
@@ -1484,6 +1708,31 @@ chi::TaskResume Runtime::DelTag(ctp::ipc::FullPtr<DelTagTask> task,
         CLIO_CO_RETURN;
       }
       cached_tag_name = tag_info_ptr->tag_name_.str();
+      for (size_t i = 0; i < tag_info_ptr->aliases_.size(); ++i) {
+        cached_aliases.push_back(tag_info_ptr->aliases_[i].str());
+      }
+    }
+
+    // If the caller deleted *by name* and that name is an alias (not the
+    // canonical name), this is a hard-link "unlink": drop only that one name
+    // binding and leave the tag, its blobs, and other names intact. Deleting
+    // by id, or by the canonical name, falls through to a full tag delete that
+    // cascades to every alias below.
+    if (!tag_name.empty() && tag_name != cached_tag_name) {
+      chi::ScopedCoRwWriteLock lock(tag_map_lock_);
+      tag_name_to_id_.erase(tag_name);
+      TagInfo *tag_info_ptr = tag_id_to_info_.find(tag_id);
+      if (tag_info_ptr != nullptr) {
+        for (size_t i = 0; i < tag_info_ptr->aliases_.size(); ++i) {
+          if (tag_info_ptr->aliases_[i].str() == tag_name) {
+            tag_info_ptr->aliases_.erase(tag_info_ptr->aliases_.begin() + i);
+            break;
+          }
+        }
+        tag_info_ptr->last_modified_ = GetCurrentTimeNs();
+      }
+      task->return_code_ = 0;
+      CLIO_CO_RETURN;
     }
 
     // Step 3: Collect blob names under read lock, then delete
@@ -1563,6 +1812,10 @@ chi::TaskResume Runtime::DelTag(ctp::ipc::FullPtr<DelTagTask> task,
         total_size = tag_info_ptr->total_size_;
         if (!tag_info_ptr->tag_name_.empty()) {
           tag_name_to_id_.erase(tag_info_ptr->tag_name_.str());
+        }
+        // Cascade: remove every alias name bound to this tag.
+        for (size_t i = 0; i < tag_info_ptr->aliases_.size(); ++i) {
+          tag_name_to_id_.erase(tag_info_ptr->aliases_[i].str());
         }
       }
     }
@@ -2637,6 +2890,115 @@ chi::TaskResume Runtime::ExtendBlob(BlobInfo &blob_info, chi::u64 offset,
   }
 
   error_code = 0;  // Success
+  CLIO_CO_RETURN;
+}
+
+chi::TaskResume Runtime::ResizeBlob(BlobInfo &blob_info, chi::u64 new_size,
+                                    float blob_score, chi::u32 &error_code,
+                                    int min_persistence_level) {
+#ifdef __NVCOMPILER
+  thread_local chi::RunContext _fb_rctx;
+  chi::RunContext* _fp = chi::GetCurrentRunContextFromWorker();
+  chi::RunContext& rctx = _fp ? *_fp : _fb_rctx;
+#endif
+  error_code = 0;
+  chi::u64 current_size = blob_info.GetTotalSize();
+  if (new_size == current_size) {
+    CLIO_CO_RETURN;
+  }
+  if (new_size > current_size) {
+    // Grow: allocate appended blocks up to new_size (shared with ExtendBlob)...
+    CLIO_CO_AWAIT(ExtendBlob(blob_info, 0, new_size, blob_score, error_code,
+                             min_persistence_level));
+    if (error_code != 0) {
+      CLIO_CO_RETURN;
+    }
+    // ...then zero the grown region. Newly allocated blocks are not zeroed
+    // (the bdev recycles freed blocks), and a resize-grow (e.g. ftruncate up,
+    // or a truncate-down whose target exceeds the blob's physical extent after
+    // sparse writes) must read back as zeros. Unlike PutBlob, no caller data
+    // overwrites this region, so zero all of [current_size, new_size).
+    chi::u64 grow = new_size - current_size;
+    auto *ipc_mgr = CLIO_IPC;
+    ctp::ipc::FullPtr<char> zbuf = ipc_mgr->AllocateBuffer(grow);
+    if (zbuf.IsNull()) {
+      error_code = 4;
+      CLIO_CO_RETURN;
+    }
+    std::memset(zbuf.ptr_, 0, grow);
+    chi::u32 zero_result = 0;
+    CLIO_CO_AWAIT(ModifyExistingData(blob_info.blocks_,
+                                zbuf.shm_.template Cast<void>(), grow,
+                                current_size, zero_result));
+    ipc_mgr->FreeBuffer(zbuf);
+    error_code = zero_result;
+    CLIO_CO_RETURN;
+  }
+
+  // Shrink: keep the blocks covering [0, new_size); free the rest. The block
+  // straddling new_size is trimmed logically (its physical tail stays
+  // allocated within that block and is reclaimed when the block is freed).
+  std::vector<BlobBlock> keep;
+  std::vector<BlobBlock> drop;
+  chi::u64 block_start = 0;
+  for (size_t i = 0; i < blob_info.blocks_.size(); ++i) {
+    BlobBlock blk = blob_info.blocks_[i];
+    chi::u64 block_end = block_start + blk.size_;
+    if (block_start >= new_size) {
+      drop.push_back(blk);  // entirely beyond the new end
+    } else if (block_end > new_size) {
+      blk.size_ = new_size - block_start;  // boundary block: trim
+      keep.push_back(blk);
+    } else {
+      keep.push_back(blk);
+    }
+    block_start = block_end;
+  }
+
+  // Rebuild blocks_ with only the kept blocks.
+  blob_info.blocks_.clear();
+  for (auto &b : keep) {
+    blob_info.blocks_.push_back(b);
+  }
+
+  // Free the dropped blocks, grouped by pool, and credit remaining_space_
+  // (mirrors FreeAllBlobBlocks).
+  std::unordered_map<chi::PoolId, std::pair<chi::PoolQuery,
+                                            std::vector<clio::run::bdev::Block>>>
+      blocks_by_pool;
+  for (const auto &blob_block : drop) {
+    chi::PoolId pool_id = blob_block.bdev_client_.pool_id_;
+    clio::run::bdev::Block block;
+    block.offset_ = blob_block.target_offset_;
+    block.size_ = blob_block.size_;
+    block.block_type_ = 0;
+    if (blocks_by_pool.find(pool_id) == blocks_by_pool.end()) {
+      blocks_by_pool[pool_id] = std::make_pair(
+          blob_block.target_query_, std::vector<clio::run::bdev::Block>());
+    }
+    blocks_by_pool[pool_id].second.push_back(block);
+  }
+  for (const auto &pool_entry : blocks_by_pool) {
+    const chi::PoolId &pool_id = pool_entry.first;
+    const chi::PoolQuery &target_query = pool_entry.second.first;
+    const std::vector<clio::run::bdev::Block> &blocks = pool_entry.second.second;
+    chi::u64 bytes_freed = 0;
+    for (const auto &block : blocks) {
+      bytes_freed += block.size_;
+    }
+    clio::run::bdev::Client bdev_client(pool_id);
+    auto free_task = bdev_client.AsyncFreeBlocks(target_query, blocks);
+    CLIO_CO_AWAIT(free_task);
+    if (free_task->GetReturnCode() == 0) {
+      chi::ScopedCoRwReadLock read_lock(target_lock_);
+      TargetInfo *target_info = registered_targets_.find(pool_id);
+      if (target_info != nullptr) {
+        ctp::ipc::atomic_ref<chi::u64>(target_info->remaining_space_)
+            .fetch_add(bytes_freed, std::memory_order_relaxed);
+      }
+    }
+  }
+  error_code = 0;
   CLIO_CO_RETURN;
 }
 

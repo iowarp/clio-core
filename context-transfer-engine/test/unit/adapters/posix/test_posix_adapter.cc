@@ -51,6 +51,7 @@
 #include <vector>
 
 #include "clio_runtime/clio_runtime.h"
+#include "clio_runtime/bdev/bdev_client.h"
 #include "clio_cte/core/core_client.h"
 
 using namespace std::chrono_literals;
@@ -74,34 +75,38 @@ bool initializeRuntime() {
 
   INFO("Initializing Chimaera runtime...");
   if (!chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true)) {
-    INFO("Chimaera initialization failed - continuing without CTE tracking");
-    initialized = true;
-    return true;
+    INFO("Chimaera initialization failed");
+    return false;
   }
   INFO("✓ Chimaera runtime initialized");
 
   INFO("Initializing CTE runtime...");
   if (!clio::cte::core::CLIO_CTE_CLIENT_INIT()) {
-    INFO("CTE initialization failed - continuing without CTE tracking");
-    initialized = true;
-    return true;
+    INFO("CTE initialization failed");
+    return false;
   }
   INFO("✓ CTE runtime initialized");
 
+  // Give the CTE core pool a file-backed storage target so the chimod has
+  // somewhere to place blobs (mirrors the libfuse adapter test fixture).
   INFO("Registering test target with CTE...");
   auto *cte_client = CLIO_CTE_CLIENT;
-  chi::u32 result = cte_client->RegisterTarget(
-      ctp::ipc::MemContext(),
-      kTestBackendFile,                  // target_name (backend file path)
-      clio::run::bdev::BdevType::kFile,   // bdev_type
-      kTestFileSize * 10                 // total_size
-  );
-  if (result != 0) {
-    INFO("Failed to register target with CTE, result code: "
-         << result << " - continuing without CTE tracking");
-    initialized = true;
-    return true;
+  chi::PoolId bdev_pool_id(950, 0);
+  clio::run::bdev::Client bdev_client(bdev_pool_id);
+  auto create_task = bdev_client.AsyncCreate(
+      chi::PoolQuery::Dynamic(), kTestBackendFile, bdev_pool_id,
+      clio::run::bdev::BdevType::kFile);
+  create_task.Wait();
+  std::this_thread::sleep_for(100ms);
+  auto reg_task = cte_client->AsyncRegisterTarget(
+      kTestBackendFile, clio::run::bdev::BdevType::kFile, kTestFileSize * 10,
+      chi::PoolQuery::Local(), bdev_pool_id);
+  reg_task.Wait();
+  if (reg_task->GetReturnCode() != 0) {
+    INFO("Failed to register target, rc=" << reg_task->GetReturnCode());
+    return false;
   }
+  std::this_thread::sleep_for(100ms);
   INFO("✓ Test target registered successfully");
 
   initialized = true;
@@ -184,10 +189,10 @@ TEST_CASE("POSIX Adapter: Open-Write-Read-Close", "[posix][adapter]") {
     REQUIRE(close_result == 0);
     INFO("✓ File closed successfully");
 
-    // Step 9: Remove test file (via the kernel, on the backend path)
+    // Step 9: Remove the file through the adapter. Data lives in CTE (not a
+    // passthrough file on disk), so removal goes through the chimod, not stdfs.
     INFO("Step 9: Removing test file...");
-    bool removed = stdfs::remove(kTestBackendFile);
-    REQUIRE(removed);
+    REQUIRE(unlink(kTestFile.c_str()) == 0);
     INFO("✓ Test file removed successfully");
   }
 }
@@ -219,13 +224,17 @@ TEST_CASE("POSIX Adapter: File Size Verification", "[posix][adapter]") {
 
     close(fd);
 
-    // Verify file size using filesystem (the backend path is the one
-    // the kernel can stat directly; clio:: is an adapter-level alias).
-    auto file_size = stdfs::file_size(kTestBackendFile);
-    REQUIRE(file_size == test_size);
+    // Verify the logical size through the adapter. Data lives in CTE, so
+    // query the chimod (via fstat) rather than stat-ing a backend file.
+    int rfd = open(kTestFile.c_str(), O_RDONLY);
+    REQUIRE(rfd >= 0);
+    struct stat st;
+    REQUIRE(fstat(rfd, &st) == 0);
+    REQUIRE(st.st_size == static_cast<off_t>(test_size));
+    REQUIRE(close(rfd) == 0);
 
     // Clean up
-    stdfs::remove(kTestBackendFile);
+    REQUIRE(unlink(kTestFile.c_str()) == 0);
   }
 }
 
@@ -272,27 +281,27 @@ TEST_CASE("POSIX Adapter: clio:: prefix opts in interception",
   }
 }
 
-TEST_CASE("POSIX Adapter: clio:: opens write to the bare backend path",
+TEST_CASE("POSIX Adapter: clio:: data round-trips through CTE",
           "[posix][adapter][prefix]") {
   REQUIRE(initializeRuntime());
 
-  // Open via clio::, write, close. After flush the kernel should see a
-  // file at the bare path (proves the prefix was stripped before
-  // RealOpen reached the kernel).
+  // Open via clio::, write, read back through the adapter. Data lives in CTE
+  // (the chimod), so there is no passthrough file on disk — and definitely no
+  // literal "clio::"-named file.
   const std::string backend = "/tmp/clio_cte_strip_test.dat";
   const std::string clio = "clio::" + backend;
-  stdfs::remove(backend);
 
-  int fd = open(clio.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
+  int fd = open(clio.c_str(), O_CREAT | O_RDWR | O_TRUNC, 0644);
   REQUIRE(fd >= 0);
   const char *payload = "clio";
   REQUIRE(write(fd, payload, 4) == 4);
+  REQUIRE(lseek(fd, 0, SEEK_SET) == 0);
+  char rb[4] = {0};
+  REQUIRE(read(fd, rb, 4) == 4);
+  REQUIRE(memcmp(rb, payload, 4) == 0);
   REQUIRE(close(fd) == 0);
 
-  // The backend file must exist on disk — *not* a literal "clio::..." file.
-  REQUIRE(stdfs::exists(backend));
-  REQUIRE_FALSE(stdfs::exists(std::string("/tmp/") + "clio::clio_cte_strip_test.dat"));
-  stdfs::remove(backend);
+  REQUIRE(unlink(clio.c_str()) == 0);
 }
 
 /* ===========================================================================
@@ -425,6 +434,9 @@ TEST_CASE("POSIX Adapter: seek + truncate + sync + unlink",
   REQUIRE(close(fd) == 0);
 
   REQUIRE(unlink(clio.c_str()) == 0);
-  // After unlink, the backend file is gone.
-  REQUIRE_FALSE(stdfs::exists(backend));
+  // After unlink, the file is gone from CTE: stat must report ENOENT.
+  struct stat probe;
+  errno = 0;
+  REQUIRE(stat(clio.c_str(), &probe) == -1);
+  REQUIRE(errno == ENOENT);
 }

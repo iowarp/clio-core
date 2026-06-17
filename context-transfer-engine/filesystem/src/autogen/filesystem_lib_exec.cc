@@ -38,6 +38,8 @@ void Runtime::Init(const chi::PoolId &pool_id, const std::string &pool_name,
   SetMethodNames(Method::GetMethodNames());
 }
 
+chi::u64 Runtime::GetWorkRemaining() const { return 0; }
+
 chi::TaskResume Runtime::Run(chi::u32 method,
                              ctp::ipc::FullPtr<chi::Task> task_ptr,
                              chi::RunContext &rctx) {
