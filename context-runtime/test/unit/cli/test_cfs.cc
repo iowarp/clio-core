@@ -349,6 +349,44 @@ TEST_CASE("Cfs - filesystem chimod open/write/getattr/read/truncate",
   REQUIRE(recreate->GetReturnCode() == 0);
   REQUIRE(!(recreate->tag_id_ == b_id));
 
+  // ---- Recursive DelTag: deleting a directory deletes its whole subtree ----
+  // Current tree under the moved dir: "/x/y" (b_id) -> "/x/y/c" -> "/x/y/c/d"
+  // (d_id, holds a blob). Capture the intermediate id "/x/y/c" too.
+  auto cmid = core.AsyncGetOrCreateTag(
+      "/x/y/c", TagId::GetNull(), chi::PoolQuery::Local());
+  cmid.Wait();
+  REQUIRE(cmid->GetReturnCode() == 0);
+  TagId c_id = cmid->tag_id_;
+
+  auto rmrf = core.AsyncDelTag(std::string("/x/y"), chi::PoolQuery::Local());
+  rmrf.Wait();
+  REQUIRE(rmrf->GetReturnCode() == 0);
+
+  // Every tag in the subtree is gone (GetTagName reports not-found).
+  for (const TagId &gone_id : {b_id, c_id, d_id}) {
+    auto gn = core.AsyncGetTagName(gone_id);
+    gn.Wait();
+    REQUIRE(gn->GetReturnCode() == 0);
+    REQUIRE(gn->found_ == 0);
+  }
+
+  // The descendant's blob is gone too.
+  ctp::ipc::FullPtr<char> rdb = ipc->AllocateBuffer(kDeepN);
+  REQUIRE(!rdb.IsNull());
+  auto rdg = core.AsyncGetBlob(d_id, "0", 0, kDeepN, 0u,
+                               rdb.shm_.template Cast<void>(),
+                               chi::PoolQuery::Local());
+  rdg.Wait();
+  REQUIRE(rdg->GetReturnCode() != 0);
+  ipc->FreeBuffer(rdb);
+
+  // Re-creating the deepest path mints fresh ids (subtree fully removed).
+  auto reborn = core.AsyncGetOrCreateTag(
+      "/x/y/c/d", TagId::GetNull(), chi::PoolQuery::Local());
+  reborn.Wait();
+  REQUIRE(reborn->GetReturnCode() == 0);
+  REQUIRE(!(reborn->tag_id_ == d_id));
+
   RunCliTimed({"stop", "--grace-period", "2000"}, 90);
   for (int i = 0; i < 200 && server.IsRunning(); ++i) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));

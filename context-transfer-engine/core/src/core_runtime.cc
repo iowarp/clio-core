@@ -1890,65 +1890,91 @@ chi::TaskResume Runtime::DelTag(ctp::ipc::FullPtr<DelTagTask> task,
       CLIO_CO_RETURN;
     }
 
-    // Step 3: Collect blob names under read lock, then delete
-    std::string tag_prefix = std::to_string(tag_id.major_) + "." +
-                             std::to_string(tag_id.minor_) + ".";
-    std::vector<std::string> blob_names_to_delete;
+    // Step 3: Determine the full set of tags to delete — the target plus every
+    // transitive hierarchical descendant. A child stores its parent's id in
+    // its name ("$tagid{parent}/leaf"), so build parent->children once and BFS
+    // from the target. A flat or leaf tag has no descendants and deletes only
+    // itself; a directory tag deletes its entire subtree (rm -r semantics).
+    std::vector<TagId> to_delete;
+    std::unordered_map<std::string, TagId> prefix_to_id;  // "M.m." -> id
+    {
+      chi::ScopedCoRwReadLock lock(tag_map_lock_);
+      std::unordered_map<TagId, std::vector<TagId>> children;
+      tag_id_to_info_.for_each([&](const TagId &id, const TagInfo &info) {
+        TagId parent;
+        std::string leaf;
+        if (ParseTagRef(info.tag_name_.str(), parent, leaf)) {
+          children[parent].push_back(id);
+        }
+      });
+      std::vector<TagId> frontier{tag_id};
+      while (!frontier.empty()) {
+        TagId cur = frontier.back();
+        frontier.pop_back();
+        to_delete.push_back(cur);
+        prefix_to_id[std::to_string(cur.major_) + "." +
+                     std::to_string(cur.minor_) + "."] = cur;
+        auto it = children.find(cur);
+        if (it != children.end()) {
+          for (const TagId &c : it->second) frontier.push_back(c);
+        }
+      }
+    }
+
+    // Step 4: collect every blob across all those tags in a single metadata
+    // scan. Keys are "major.minor.blobname"; match by the "major.minor."
+    // prefix against the deletion set.
+    auto compound_prefix = [](const std::string &key) -> std::string {
+      size_t d1 = key.find('.');
+      if (d1 == std::string::npos) return std::string();
+      size_t d2 = key.find('.', d1 + 1);
+      if (d2 == std::string::npos) return std::string();
+      return key.substr(0, d2 + 1);
+    };
+    std::vector<std::pair<TagId, std::string>> blobs_to_delete;
     {
       chi::ScopedCoRwReadLock lock(blob_map_lock_);
       tag_blob_name_to_info_.for_each(
-          [&tag_prefix, &blob_names_to_delete](const std::string &compound_key,
-                                               const BlobInfo &blob_info) {
-            if (compound_key.compare(0, tag_prefix.length(), tag_prefix) == 0) {
-              blob_names_to_delete.push_back(blob_info.blob_name_.str());
+          [&](const std::string &compound_key, const BlobInfo &blob_info) {
+            (void)blob_info;
+            auto it = prefix_to_id.find(compound_prefix(compound_key));
+            if (it != prefix_to_id.end()) {
+              blobs_to_delete.emplace_back(
+                  it->second, compound_key.substr(it->first.size()));
             }
           });
     }
 
-    // Process blobs in batches to limit concurrent async tasks
+    // Step 5: delete blobs in bounded-concurrency batches.
     constexpr size_t kMaxConcurrentDelBlobTasks = 32;
     std::vector<chi::Future<DelBlobTask>> async_tasks;
     size_t processed_blobs = 0;
-
-    for (size_t i = 0; i < blob_names_to_delete.size();
+    for (size_t i = 0; i < blobs_to_delete.size();
          i += kMaxConcurrentDelBlobTasks) {
-      // Create a batch of async tasks (up to kMaxConcurrentDelBlobTasks)
       async_tasks.clear();
       size_t batch_end =
-          std::min(i + kMaxConcurrentDelBlobTasks, blob_names_to_delete.size());
-
+          std::min(i + kMaxConcurrentDelBlobTasks, blobs_to_delete.size());
       for (size_t j = i; j < batch_end; ++j) {
-        const std::string &blob_name = blob_names_to_delete[j];
-
-        // Call AsyncDelBlob from client
-        auto async_task = client_.AsyncDelBlob(tag_id, blob_name);
-        async_tasks.push_back(async_task);
+        async_tasks.push_back(client_.AsyncDelBlob(blobs_to_delete[j].first,
+                                                   blobs_to_delete[j].second));
       }
-
-      // Wait for all async DelBlob operations in this batch to complete
-      for (auto task : async_tasks) {
-        CLIO_CO_AWAIT(task);
-
-        // Check if DelBlob succeeded
-        if (task->return_code_ != 0) {
-          HLOG(kWarning,
-               "DelBlob failed for blob during tag deletion, continuing");
-          // Continue with other blobs even if one fails
+      for (auto t : async_tasks) {
+        CLIO_CO_AWAIT(t);
+        if (t->return_code_ != 0) {
+          HLOG(kWarning, "DelBlob failed during tag deletion, continuing");
         }
-
-        // Clean up the task
         ++processed_blobs;
       }
     }
 
-    // Step 4: Remove all blob name mappings for this tag
+    // Step 6: erase blob-name mappings for all deleted tags.
     {
       chi::ScopedCoRwWriteLock lock(blob_map_lock_);
       std::vector<std::string> keys_to_erase;
       tag_blob_name_to_info_.for_each(
-          [&tag_prefix, &keys_to_erase](const std::string &compound_key,
-                                        const BlobInfo &blob_info) {
-            if (compound_key.compare(0, tag_prefix.length(), tag_prefix) == 0) {
+          [&](const std::string &compound_key, const BlobInfo &blob_info) {
+            (void)blob_info;
+            if (prefix_to_id.count(compound_prefix(compound_key)) != 0) {
               keys_to_erase.push_back(compound_key);
             }
           });
@@ -1957,49 +1983,53 @@ chi::TaskResume Runtime::DelTag(ctp::ipc::FullPtr<DelTagTask> task,
       }
     }
 
-    // Step 5: Remove tag name and tag info mappings
-    size_t blob_count = processed_blobs;
+    // Step 7: erase each tag's name binding(s) + aliases, WAL-log the delete,
+    // and drop the TagInfo.
     size_t total_size = 0;
-    {
-      chi::ScopedCoRwWriteLock lock(tag_map_lock_);
-      TagInfo *tag_info_ptr = tag_id_to_info_.find(tag_id);
-      if (tag_info_ptr != nullptr) {
-        total_size = tag_info_ptr->total_size_;
-        if (!tag_info_ptr->tag_name_.empty()) {
-          tag_name_to_id_.erase(tag_info_ptr->tag_name_.str());
-        }
-        // Cascade: remove every alias name bound to this tag.
-        for (size_t i = 0; i < tag_info_ptr->aliases_.size(); ++i) {
-          tag_name_to_id_.erase(tag_info_ptr->aliases_[i].str());
+    const chi::u32 wid = tag_txn_logs_.empty()
+                             ? 0
+                             : CLIO_CUR_WORKER->GetWorkerStats().worker_id_;
+    for (const TagId &del_id : to_delete) {
+      std::string del_name;
+      {
+        chi::ScopedCoRwWriteLock lock(tag_map_lock_);
+        TagInfo *info = tag_id_to_info_.find(del_id);
+        if (info != nullptr) {
+          total_size += info->total_size_;
+          del_name = info->tag_name_.str();
+          if (!info->tag_name_.empty()) {
+            tag_name_to_id_.erase(info->tag_name_.str());
+          }
+          // Cascade: remove every alias name bound to this tag.
+          for (size_t i = 0; i < info->aliases_.size(); ++i) {
+            tag_name_to_id_.erase(info->aliases_[i].str());
+          }
         }
       }
+      if (!tag_txn_logs_.empty()) {
+        TxnDelTag txn;
+        txn.tag_name_ = del_name;
+        txn.tag_major_ = del_id.major_;
+        txn.tag_minor_ = del_id.minor_;
+        tag_txn_logs_[wid % tag_txn_logs_.size()]->Log(TxnType::kDelTag, txn);
+      }
+      {
+        chi::ScopedCoRwWriteLock lock(tag_map_lock_);
+        tag_id_to_info_.erase(del_id);
+      }
+      GpuCacheOnDelTag(del_id);
     }
 
-    // Log telemetry for DelTag operation
+    // Log telemetry for the DelTag operation (attributed to the target tag).
     auto now = GetCurrentTimeNs();
     LogTelemetry(CteOp::kDelTag, 0, total_size, tag_id, now, now);
 
-    // WAL: log tag deletion
-    if (!tag_txn_logs_.empty()) {
-      chi::u32 wid = CLIO_CUR_WORKER->GetWorkerStats().worker_id_;
-      TxnDelTag txn;
-      txn.tag_name_ = cached_tag_name;
-      txn.tag_major_ = tag_id.major_;
-      txn.tag_minor_ = tag_id.minor_;
-      tag_txn_logs_[wid % tag_txn_logs_.size()]->Log(TxnType::kDelTag, txn);
-    }
-
-    {
-      chi::ScopedCoRwWriteLock lock(tag_map_lock_);
-      tag_id_to_info_.erase(tag_id);
-    }
-
-    // Success
-    GpuCacheOnDelTag(tag_id);
     task->return_code_ = 0;
     HLOG(kDebug,
-         "DelTag successful: tag_id={},{}, removed {} blobs, total_size={}",
-         tag_id.major_, tag_id.minor_, blob_count, total_size);
+         "DelTag successful: tag_id={},{}, removed {} tags, {} blobs, "
+         "total_size={}",
+         tag_id.major_, tag_id.minor_, to_delete.size(), processed_blobs,
+         total_size);
 
   } catch (const std::exception &e) {
     task->return_code_ = 1;
