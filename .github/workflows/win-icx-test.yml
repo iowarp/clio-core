@@ -59,6 +59,7 @@ jobs:
       matrix:
         os:
           - windows-2022
+          - windows-2025
           - windows-2025-vs2026
 
     steps:
