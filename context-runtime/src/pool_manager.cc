@@ -46,11 +46,19 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
+#include <shared_mutex>
 
 // Global pointer variable definition for Pool manager singleton
 CLIO_RUN_DEFINE_GLOBAL_PTR_VAR_CC(chi::PoolManager, g_pool_manager);
 
 namespace clio::run {
+
+// Convenience aliases for the pool_metadata_ reader/writer lock (issue #572).
+// Readers (lookups) take the shared lock; structural and PoolInfo mutators take
+// the exclusive lock.
+using PoolMetaReadLock = std::shared_lock<std::shared_mutex>;
+using PoolMetaWriteLock = std::unique_lock<std::shared_mutex>;
 
 // Constructor and destructor removed - handled by CTP singleton pattern
 
@@ -60,7 +68,10 @@ bool PoolManager::ServerInit() {
   }
 
   // Initialize pool metadata
-  pool_metadata_.clear();
+  {
+    PoolMetaWriteLock lock(pool_metadata_mutex_);
+    pool_metadata_.clear();
+  }
 
   is_initialized_ = true;
 
@@ -128,12 +139,15 @@ void PoolManager::Finalize() {
   }
 
   // Clear all containers in each PoolInfo, then clear metadata
-  for (auto &pair : pool_metadata_) {
-    pair.second.containers_.clear();
-    pair.second.static_container_ = nullptr;
-    pair.second.local_container_ = nullptr;
+  {
+    PoolMetaWriteLock lock(pool_metadata_mutex_);
+    for (auto &pair : pool_metadata_) {
+      pair.second.containers_.clear();
+      pair.second.static_container_ = nullptr;
+      pair.second.local_container_ = nullptr;
+    }
+    pool_metadata_.clear();
   }
-  pool_metadata_.clear();
 
   is_initialized_ = false;
 }
@@ -144,6 +158,7 @@ bool PoolManager::RegisterContainer(PoolId pool_id, ContainerId container_id,
     return false;
   }
 
+  PoolMetaWriteLock lock(pool_metadata_mutex_);
   auto it = pool_metadata_.find(pool_id);
   if (it == pool_metadata_.end()) {
     return false;
@@ -167,6 +182,7 @@ bool PoolManager::UnregisterContainer(PoolId pool_id, ContainerId container_id) 
     return false;
   }
 
+  PoolMetaWriteLock lock(pool_metadata_mutex_);
   auto it = pool_metadata_.find(pool_id);
   if (it == pool_metadata_.end()) {
     return false;
@@ -195,6 +211,7 @@ void PoolManager::UnregisterAllContainers(PoolId pool_id) {
     return;
   }
 
+  PoolMetaWriteLock lock(pool_metadata_mutex_);
   auto it = pool_metadata_.find(pool_id);
   if (it == pool_metadata_.end()) {
     return;
@@ -213,6 +230,7 @@ Container* PoolManager::GetContainer(PoolId pool_id, ContainerId container_id,
     return nullptr;
   }
 
+  PoolMetaReadLock lock(pool_metadata_mutex_);
   auto it = pool_metadata_.find(pool_id);
   if (it == pool_metadata_.end()) {
     return nullptr;
@@ -240,6 +258,7 @@ Container* PoolManager::GetContainerRaw(PoolId pool_id, ContainerId container_id
     return nullptr;
   }
 
+  PoolMetaReadLock lock(pool_metadata_mutex_);
   auto it = pool_metadata_.find(pool_id);
   if (it == pool_metadata_.end()) {
     return nullptr;
@@ -255,6 +274,7 @@ Container* PoolManager::GetStaticContainer(PoolId pool_id) const {
     return nullptr;
   }
 
+  PoolMetaReadLock lock(pool_metadata_mutex_);
   auto it = pool_metadata_.find(pool_id);
   if (it == pool_metadata_.end()) {
     return nullptr;
@@ -279,6 +299,7 @@ bool PoolManager::HasPool(PoolId pool_id) const {
     return false;
   }
 
+  PoolMetaReadLock lock(pool_metadata_mutex_);
   return pool_metadata_.find(pool_id) != pool_metadata_.end();
 }
 
@@ -287,6 +308,7 @@ bool PoolManager::HasContainer(PoolId pool_id, ContainerId container_id) const {
     return false;
   }
 
+  PoolMetaReadLock lock(pool_metadata_mutex_);
   auto it = pool_metadata_.find(pool_id);
   if (it == pool_metadata_.end()) {
     return false;
@@ -300,6 +322,7 @@ PoolId PoolManager::FindPoolByName(const std::string& pool_name) const {
     return PoolId::GetNull();
   }
 
+  PoolMetaReadLock lock(pool_metadata_mutex_);
   // Iterate through pool metadata to find matching pool_name (globally unique)
   for (const auto& pair : pool_metadata_) {
     const PoolInfo& pool_info = pair.second;
@@ -312,7 +335,11 @@ PoolId PoolManager::FindPoolByName(const std::string& pool_name) const {
 }
 
 size_t PoolManager::GetPoolCount() const {
-  return is_initialized_ ? pool_metadata_.size() : 0;
+  if (!is_initialized_) {
+    return 0;
+  }
+  PoolMetaReadLock lock(pool_metadata_mutex_);
+  return pool_metadata_.size();
 }
 
 std::vector<PoolId> PoolManager::GetAllPoolIds() const {
@@ -321,6 +348,7 @@ std::vector<PoolId> PoolManager::GetAllPoolIds() const {
     return pool_ids;
   }
 
+  PoolMetaReadLock lock(pool_metadata_mutex_);
   pool_ids.reserve(pool_metadata_.size());
   for (const auto& pair : pool_metadata_) {
     pool_ids.push_back(pair.first);
@@ -401,6 +429,7 @@ void PoolManager::InitAddressMap(PoolId pool_id, u32 num_containers) {
     return;
   }
 
+  PoolMetaWriteLock lock(pool_metadata_mutex_);
   auto it = pool_metadata_.find(pool_id);
   if (it == pool_metadata_.end()) {
     return;
@@ -515,7 +544,7 @@ TaskResume PoolManager::CreatePool(FullPtr<Task> task, RunContext* run_ctx) {
   auto* module_manager = CLIO_MODULE_MANAGER;
   if (!module_manager) {
     HLOG(kError, "PoolManager: Module manager not available");
-    pool_metadata_.erase(target_pool_id);
+    ErasePoolMetadata(target_pool_id);
     CLIO_CO_RETURN;
   }
 
@@ -529,7 +558,7 @@ TaskResume PoolManager::CreatePool(FullPtr<Task> task, RunContext* run_ctx) {
     if (!container) {
       HLOG(kError, "PoolManager: Failed to create container for ChiMod: {}",
            chimod_name);
-      pool_metadata_.erase(target_pool_id);
+      ErasePoolMetadata(target_pool_id);
       CLIO_CO_RETURN;
     }
 
@@ -563,7 +592,7 @@ TaskResume PoolManager::CreatePool(FullPtr<Task> task, RunContext* run_ctx) {
     if (!RegisterContainer(target_pool_id, node_id, container, /*is_static=*/true)) {
       HLOG(kError, "PoolManager: Failed to register container");
       module_manager->DestroyContainer(chimod_name, container);
-      pool_metadata_.erase(target_pool_id);
+      ErasePoolMetadata(target_pool_id);
       CLIO_CO_RETURN;
     }
 
@@ -582,7 +611,7 @@ TaskResume PoolManager::CreatePool(FullPtr<Task> task, RunContext* run_ctx) {
       // Unregister the container since Create failed
       UnregisterContainer(target_pool_id, node_id);
       module_manager->DestroyContainer(chimod_name, container);
-      pool_metadata_.erase(target_pool_id);
+      ErasePoolMetadata(target_pool_id);
       CLIO_CO_RETURN;
     }
 
@@ -598,7 +627,7 @@ TaskResume PoolManager::CreatePool(FullPtr<Task> task, RunContext* run_ctx) {
       UnregisterContainer(target_pool_id, node_id);
       module_manager->DestroyContainer(chimod_name, container);
     }
-    pool_metadata_.erase(target_pool_id);
+    ErasePoolMetadata(target_pool_id);
     CLIO_CO_RETURN;
   }
 
@@ -628,8 +657,7 @@ TaskResume PoolManager::DestroyPool(PoolId pool_id) {
   }
 
   // Check if pool exists in metadata
-  auto metadata_it = pool_metadata_.find(pool_id);
-  if (metadata_it == pool_metadata_.end()) {
+  if (!HasPool(pool_id)) {
     HLOG(kError, "PoolManager: Pool {} metadata not found", pool_id);
     CLIO_CO_RETURN;
   }
@@ -643,7 +671,7 @@ TaskResume PoolManager::DestroyPool(PoolId pool_id) {
   }
 
   // Remove pool metadata
-  pool_metadata_.erase(metadata_it);
+  ErasePoolMetadata(pool_id);
 
   HLOG(kInfo, "PoolManager: Destroyed complete pool {}", pool_id);
   CLIO_CO_RETURN;
@@ -655,6 +683,7 @@ const PoolInfo* PoolManager::GetPoolInfo(PoolId pool_id) const {
     return nullptr;
   }
 
+  PoolMetaReadLock lock(pool_metadata_mutex_);
   auto it = pool_metadata_.find(pool_id);
   return (it != pool_metadata_.end()) ? &it->second : nullptr;
 }
@@ -664,7 +693,13 @@ void PoolManager::UpdatePoolMetadata(PoolId pool_id, const PoolInfo& info) {
     return;
   }
 
+  PoolMetaWriteLock lock(pool_metadata_mutex_);
   pool_metadata_[pool_id] = info;
+}
+
+void PoolManager::ErasePoolMetadata(PoolId pool_id) {
+  PoolMetaWriteLock lock(pool_metadata_mutex_);
+  pool_metadata_.erase(pool_id);
 }
 
 u32 PoolManager::GetContainerNodeId(PoolId pool_id,
@@ -677,19 +712,23 @@ u32 PoolManager::GetContainerNodeId(PoolId pool_id,
     return 0;  // Default to local node
   }
 
-  // Get pool metadata
-  const PoolInfo* pool_info = GetPoolInfo(pool_id);
-  if (!pool_info) {
+  // Hold the read lock across the address_map_ lookup. Resolving via a
+  // PoolInfo* and reading address_map_ after the lock dropped would race a
+  // concurrent UpdateContainerNodeMapping / pool insert (issue #572).
+  PoolMetaReadLock lock(pool_metadata_mutex_);
+  auto pit = pool_metadata_.find(pool_id);
+  if (pit == pool_metadata_.end()) {
     HLOG(kDebug, "GetContainerNodeId - pool not found, returning 0");
     return 0;  // Pool not found, assume local
   }
+  const PoolInfo &pool_info = pit->second;
 
   HLOG(kDebug, "GetContainerNodeId - pool has {} containers",
-       pool_info->num_containers_);
+       pool_info.num_containers_);
 
   // Look up node ID from the address map
-  auto it = pool_info->address_map_.find(container_id);
-  if (it != pool_info->address_map_.end()) {
+  auto it = pool_info.address_map_.find(container_id);
+  if (it != pool_info.address_map_.end()) {
     HLOG(kDebug,
          "GetContainerNodeId - found mapping: container_id={} -> node_id={}",
          container_id, it->second);
@@ -709,6 +748,7 @@ bool PoolManager::UpdateContainerNodeMapping(PoolId pool_id,
     return false;
   }
 
+  PoolMetaWriteLock lock(pool_metadata_mutex_);
   auto it = pool_metadata_.find(pool_id);
   if (it == pool_metadata_.end()) {
     HLOG(kError, "PoolManager: Pool {} not found for mapping update", pool_id);
