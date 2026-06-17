@@ -67,6 +67,13 @@ if(CLIO_CORE_ENABLE_DEB_PACKAGE OR CLIO_CORE_ENABLE_CPACK)
     # actually validated in CI.
     set(CPACK_DEBIAN_PACKAGE_DEPENDS
         "libzmq3-dev, libyaml-cpp-dev, libmsgpack-dev, libsodium-dev")
+    # The pure-Python context visualizer ships in the package (see
+    # CLIO_CORE_ENABLE_VISUALIZER). Declare its Python runtime deps so
+    # `context-visualizer` works out of the box after `apt install`.
+    if(CLIO_CORE_ENABLE_VISUALIZER)
+        set(CPACK_DEBIAN_PACKAGE_DEPENDS
+            "${CPACK_DEBIAN_PACKAGE_DEPENDS}, python3, python3-flask, python3-yaml, python3-msgpack")
+    endif()
 
     # Use Debian-standard filename: <pkg>_<ver>-<rel>_<arch>.deb. Without this,
     # CPack defaults to "iowarp-core-<ver>-Linux.deb" with no arch suffix, so
@@ -96,6 +103,13 @@ if(CLIO_CORE_ENABLE_RPM_PACKAGE OR CLIO_CORE_ENABLE_CPACK)
     # "nothing provides msgpack-c" on Fedora 40.
     set(CPACK_RPM_PACKAGE_REQUIRES
         "zeromq-devel, yaml-cpp-devel, msgpack-devel, libsodium-devel")
+    # Python runtime deps for the bundled context visualizer (AUTOREQ is off,
+    # so these must be declared explicitly). Fedora names: python3-pyyaml
+    # (vs Debian's python3-yaml) and python3-msgpack.
+    if(CLIO_CORE_ENABLE_VISUALIZER)
+        set(CPACK_RPM_PACKAGE_REQUIRES
+            "${CPACK_RPM_PACKAGE_REQUIRES}, python3, python3-flask, python3-pyyaml, python3-msgpack")
+    endif()
     # Disable auto-generated Requires on internal libraries. With AUTOREQ
     # default-on, rpmbuild scans every installed .so and adds a
     # Requires: lib<x>.so()(64bit) for each one — including our OWN

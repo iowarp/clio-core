@@ -1057,10 +1057,12 @@ function(add_clio_module_client)
   endif()
 
   # Precompiled headers for faster builds
-  target_precompile_headers(${TARGET_NAME} PRIVATE
-      <string> <vector> <memory> <unordered_map>
-      <functional> <algorithm> <cstdint> <cstring> <iostream>
-  )
+  if(CLIO_CORE_ENABLE_PCH)
+    target_precompile_headers(${TARGET_NAME} PRIVATE
+        <string> <vector> <memory> <unordered_map>
+        <functional> <algorithm> <cstdint> <cstring> <iostream>
+    )
+  endif()
 
   # Export module info to parent scope
   set(CLIO_RUN_MODULE_CLIENT_TARGET ${TARGET_NAME} PARENT_SCOPE)
@@ -1391,10 +1393,12 @@ check_required_components(${MODULE_PACKAGE_NAME})
   endif()
 
   # Precompiled headers for faster builds
-  target_precompile_headers(${TARGET_NAME} PRIVATE
-      <string> <vector> <memory> <unordered_map>
-      <functional> <algorithm> <cstdint> <cstring> <iostream>
-  )
+  if(CLIO_CORE_ENABLE_PCH)
+    target_precompile_headers(${TARGET_NAME} PRIVATE
+        <string> <vector> <memory> <unordered_map>
+        <functional> <algorithm> <cstdint> <cstring> <iostream>
+    )
+  endif()
 
   # Export module info to parent scope
   set(CLIO_RUN_MODULE_RUNTIME_TARGET ${TARGET_NAME} PARENT_SCOPE)

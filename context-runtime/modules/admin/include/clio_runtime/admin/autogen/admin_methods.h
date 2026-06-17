@@ -41,8 +41,9 @@ GLOBAL_CROSS_CONST chi::u32 kRecoverContainers = 30;
 GLOBAL_CROSS_CONST chi::u32 kSystemMonitor = 31;
 GLOBAL_CROSS_CONST chi::u32 kAnnounceShutdown = 32;
 GLOBAL_CROSS_CONST chi::u32 kRegisterGpuContainer = 33;
+GLOBAL_CROSS_CONST chi::u32 kListContainers = 34;
 
-GLOBAL_CROSS_CONST chi::u32 kMaxMethodId = 34;
+GLOBAL_CROSS_CONST chi::u32 kMaxMethodId = 35;
 
 inline const std::vector<std::string>& GetMethodNames() {
   static const std::vector<std::string> names = [] {
@@ -73,6 +74,7 @@ inline const std::vector<std::string>& GetMethodNames() {
     v[31] = "SystemMonitor";
     v[32] = "AnnounceShutdown";
     v[33] = "RegisterGpuContainer";
+    v[34] = "ListContainers";
     return v;
   }();
   return names;

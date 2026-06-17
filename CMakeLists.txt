@@ -2,6 +2,22 @@ cmake_minimum_required(VERSION 3.20)
 project(iowarp-core VERSION 2.1.0 LANGUAGES C CXX)
 
 #------------------------------------------------------------------------------
+# MSVC-like front end detection
+#------------------------------------------------------------------------------
+# True for cl.exe (MSVC) and for compilers that drive an MSVC-compatible command
+# line: clang-cl and Intel's icx.exe on Windows. These accept "/"-style flags
+# (e.g. /Zi, /Od, /Fo<obj>) and MUST NOT be given GNU-style flags. Mixing GNU
+# flags (-g -O0 -Wfatal-errors) onto icx.exe flips it into clang driver mode,
+# where it ignores /Fo<obj> and writes <basename>.o into the build root --
+# leaving CMake/ninja's expected .obj absent and breaking the DLL link
+# (WINDOWS_EXPORT_ALL_SYMBOLS / bindexplib). See issue #555.
+if(MSVC OR (WIN32 AND CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC"))
+    set(CLIO_CORE_MSVC_LIKE ON)
+else()
+    set(CLIO_CORE_MSVC_LIKE OFF)
+endif()
+
+#------------------------------------------------------------------------------
 # Project Options
 #==============================================================================
 # BUILD CONFIGURATION OPTIONS
@@ -24,7 +40,17 @@ option(CLIO_CORE_ENABLE_CEE "Enable context-exploration-engine component" ON)
 option(CLIO_CORE_ENABLE_TESTS "Master switch: Enable testing for all components" OFF)
 option(CLIO_CORE_ENABLE_BENCHMARKS "Master switch: Enable benchmarks for all components" ON)
 option(CLIO_CORE_ENABLE_PYTHON "Enable Python bindings for all components" OFF)
+# The context visualizer is pure Python (no compilation), so it ships as a
+# standard feature in every package — independent of the heavyweight nanobind
+# bindings gated by CLIO_CORE_ENABLE_PYTHON. Keep it ON so the .deb/.rpm/conda
+# packages (built with CLIO_CORE_ENABLE_PYTHON=OFF) still include it.
+option(CLIO_CORE_ENABLE_VISUALIZER "Install the pure-Python context visualizer dashboard" ON)
 option(CLIO_CORE_ENABLE_CMAKE_DOTENV "Enable reading environment variables from .env.cmake" OFF)
+# Precompiled headers speed up builds but conflict with WINDOWS_EXPORT_ALL_SYMBOLS
+# under the Ninja generator with non-MSVC Windows compilers (icx/clang-cl): the
+# bindexplib pass (cmake -E __create_def) fails to read the cmake_pch object.
+# Default ON (no change for existing builds); turn OFF for those toolchains.
+option(CLIO_CORE_ENABLE_PCH "Enable precompiled headers for faster builds" ON)
 option(CLIO_CORE_ENABLE_ASAN "Enable AddressSanitizer + LeakSanitizer for debugging" OFF)
 option(CLIO_CORE_ENABLE_UBSAN "Enable UndefinedBehaviorSanitizer for debugging" OFF)
 option(CLIO_CORE_ENABLE_MSAN "Enable MemorySanitizer for debugging (requires instrumented dependencies)" OFF)
@@ -820,12 +846,21 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # Position Independent Code - Applied to all subdirectories
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-# ccache — accelerate rebuilds by caching compiled objects
+# ccache — accelerate rebuilds by caching compiled objects.
+# NOT used for MSVC-like compilers (cl / clang-cl / icx-cl): as a compiler
+# launcher under Ninja, ccache mishandles the cl-style /Fo<obj> output flag and
+# the object is written as <base>.o into the build root instead of the expected
+# path, which breaks WINDOWS_EXPORT_ALL_SYMBOLS / the DLL link. (The Visual
+# Studio generator never applied the launcher, which is why MSVC CI was fine.)
+# See issue #555.
+option(CLIO_CORE_ENABLE_CCACHE "Use ccache as compiler launcher when available" ON)
 find_program(CCACHE_PROGRAM ccache)
-if(CCACHE_PROGRAM)
+if(CCACHE_PROGRAM AND CLIO_CORE_ENABLE_CCACHE AND NOT CLIO_CORE_MSVC_LIKE)
     set(CMAKE_C_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
     set(CMAKE_CXX_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
     message(STATUS "ccache enabled: ${CCACHE_PROGRAM}")
+elseif(CCACHE_PROGRAM)
+    message(STATUS "ccache found but not used (CLIO_CORE_ENABLE_CCACHE=${CLIO_CORE_ENABLE_CCACHE}, CLIO_CORE_MSVC_LIKE=${CLIO_CORE_MSVC_LIKE})")
 else()
     message(STATUS "ccache not found — install ccache for faster rebuilds")
 endif()
@@ -858,7 +893,9 @@ endif()
 #------------------------------------------------------------------------------
 # Compiler Flags
 #------------------------------------------------------------------------------
-if(NOT MSVC)
+# Use CLIO_CORE_MSVC_LIKE (not just MSVC) so clang-cl / icx.exe on Windows take
+# the MSVC-style flag path; GNU flags break icx's /Fo handling (see issue #555).
+if(NOT CLIO_CORE_MSVC_LIKE)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC")
     if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "NVHPC")
         # Add compiler flags following Google C++ style guide
@@ -1184,12 +1221,14 @@ else()
     message(STATUS "Context-exploration-engine component disabled")
 endif()
 
-# Context Visualizer (pure Python web dashboard)
-if(CLIO_CORE_ENABLE_PYTHON)
+# Context Visualizer (pure Python web dashboard). Gated on its own option so
+# it ships in the .deb/.rpm/conda packages even though those set
+# CLIO_CORE_ENABLE_PYTHON=OFF (it needs no compilation, only a Python runtime).
+if(CLIO_CORE_ENABLE_VISUALIZER)
     message(STATUS "Building context-visualizer component (Python)")
     add_subdirectory(context-visualizer)
 else()
-    message(STATUS "Context-visualizer component disabled (requires CLIO_CORE_ENABLE_PYTHON)")
+    message(STATUS "Context-visualizer component disabled (CLIO_CORE_ENABLE_VISUALIZER=OFF)")
 endif()
 
 # Gray-Scott Example Application

@@ -21,9 +21,15 @@ classifiers = [
 dependencies = [
     "pyyaml",
     "msgpack",
+    # flask powers the context visualizer dashboard, which ships as a standard
+    # feature (the `context-visualizer` console script below). Keep it a core
+    # dependency so `pip install iowarp-core` yields a working visualizer.
+    "flask>=2.0",
 ]
 
 [project.optional-dependencies]
+# Retained for backward compatibility; `flask` is now a core dependency, so
+# `pip install iowarp-core[visualizer]` is equivalent to the bare install.
 visualizer = [
     "flask>=2.0",
     "pyyaml",

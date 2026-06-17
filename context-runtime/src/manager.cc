@@ -36,10 +36,12 @@
  */
 
 #include <cstdlib>
+#include <filesystem>
 #include <iomanip>
 #include <iostream>
 
 #include "clio_runtime/admin/admin_client.h"
+#include "clio_runtime/restart_log.h"
 #include "clio_runtime/singletons.h"
 
 // Global pointer variable definition for CLIO Runtime manager singleton
@@ -292,6 +294,71 @@ bool RuntimeManager::ServerInit() {
     if (is_restart_) {
       HLOG(kInfo, "Replaying address table WAL for restart recovery...");
       pool_manager->ReplayAddressTableWAL();
+    }
+  }
+
+  // Replay the restart write-ahead log: re-compose every "container" (compose
+  // file) that was registered for restart via `clio_run compose start`. This
+  // is the persistent-restart registry (~/.clio/restart_log.bin) and runs on
+  // every startup (both `start` and `restart`), independently of whether the
+  // server config had a compose section. On a recovery (`restart`) the pools
+  // take the Restart() path; on a fresh `start` they Init().
+  {
+    clio::run::RestartLog restart_log;
+    std::vector<std::string> containers = restart_log.LiveSet();
+    if (!containers.empty()) {
+      auto *admin_client = CLIO_ADMIN;
+      if (!admin_client) {
+        HLOG(kError, "Failed to get admin client for restart-log replay");
+        return false;
+      }
+      HLOG(kInfo, "Restart log: replaying {} registered container(s) from {}",
+           containers.size(), restart_log.path());
+      bool pruned_any = false;
+      for (const auto &container_path : containers) {
+        // A registered compose file can disappear out from under us (deleted,
+        // moved, or on a since-unmounted volume). ConfigManager::LoadYaml is
+        // fatal on a missing/unreadable file, so guard with an existence check
+        // first and self-heal by pruning the dead entry from the WAL. Without
+        // this, one dangling entry would abort every future startup.
+        std::error_code ec;
+        if (!std::filesystem::exists(container_path, ec) || ec) {
+          HLOG(kWarning,
+               "Restart log: registered container '{}' no longer exists; "
+               "unregistering it",
+               container_path);
+          restart_log.AppendRm(container_path);
+          pruned_any = true;
+          continue;
+        }
+        chi::ConfigManager file_config;
+        if (!file_config.LoadYaml(container_path)) {
+          HLOG(kError, "Restart log: failed to load container '{}' (skipping)",
+               container_path);
+          continue;
+        }
+        for (auto pool_config : file_config.GetComposeConfig().pools_) {
+          // Skip pools already created (e.g. also in the server compose
+          // section) to avoid a double create.
+          if (pool_manager->HasPool(pool_config.pool_id_)) {
+            continue;
+          }
+          pool_config.restart_ = is_restart_;  // Restart() on recovery only.
+          HLOG(kInfo, "Restart log: restarting pool {} (module: {})",
+               pool_config.pool_name_, pool_config.mod_name_);
+          auto task = admin_client->AsyncCompose(pool_config);
+          task.Wait();
+          if (task->GetReturnCode() != 0) {
+            HLOG(kError, "Restart log: failed to restart pool {} (rc={})",
+                 pool_config.pool_name_, task->GetReturnCode());
+            // Keep restarting the remaining containers rather than aborting.
+          }
+        }
+      }
+      // Collapse the appended rm entries so dead paths don't linger in the log.
+      if (pruned_any) {
+        restart_log.Compact();
+      }
     }
   }
 

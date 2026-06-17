@@ -204,7 +204,7 @@ class ClioCte(Service):
         #      connect() probe, so server_alive_ stays true on a half-open
         #      ctx and the existing reconnect path is never triggered).
         # When either lands, drop this loop and revert to:
-        #   cmd = f'clio_run compose {self.compose_config_path}'
+        #   cmd = f'clio_run compose start {self.compose_config_path}'
         # Single-shot compose. The jarvis-cd SSH layer prepends env vars
         # as ``KEY=VAL`` before the command, and bash only forwards them
         # to a *simple* command — wrapping in ``for ... do ... done``
@@ -214,7 +214,7 @@ class ClioCte(Service):
         # The original retry loop existed for an Aurora apptainer
         # ZMTP-greeting race at >=64 daemons; for the bare-metal /
         # single-node path here the simple form is enough.
-        cmd = f'clio_run compose {self.compose_config_path}'
+        cmd = f'clio_run compose start {self.compose_config_path}'
 
         # Pssh fans the compose out to every node. With pool_query:
         # broadcast in the compose YAML, each admin container instance
