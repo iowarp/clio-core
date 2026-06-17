@@ -18,7 +18,11 @@ endif()
 # otherwise find just the Interpreter component, which is lightweight and does
 # NOT pull in nanobind / Development.Module.
 if(NOT Python_EXECUTABLE)
-    find_package(Python COMPONENTS Interpreter REQUIRED)
+    find_package(Python COMPONENTS Interpreter QUIET)
+    if(NOT Python_FOUND)
+        message(STATUS "Context-visualizer component disabled (requires Python)")
+        return()
+    endif()
 endif()
 
 # Resolve the interpreter's site-packages directory *relative to its prefix*
