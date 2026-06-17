@@ -621,8 +621,13 @@ if(CAE_LABELING_ENABLED)
   endif()
 
   add_test(NAME cae_label_client_all COMMAND test_cae_label_client)
+  # msan_skip: the label client drives HTTP through the uninstrumented
+  # libcurl.so (and poll() over its sockets) and prints counts through
+  # SimpleTest::print_summary (uninstrumented libstdc++ ostream). All reported
+  # reads originate in third-party libraries MSan cannot instrument.
   set_tests_properties(cae_label_client_all PROPERTIES
     TIMEOUT 60
+    LABELS "msan_skip"
     ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}"
   )
 
