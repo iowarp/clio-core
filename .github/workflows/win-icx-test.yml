@@ -104,6 +104,29 @@ jobs:
           path: ${{ env.ONEAPI_ROOT_DIR }}
           key: oneapi-${{ runner.os }}-${{ env.CACHE_NUMBER }}-${{ env.WINDOWS_BASEKIT_URL }}-${{ env.WINDOWS_CPP_COMPONENTS }}
 
+      - name: Probe icx-cl /Fo behavior
+        shell: cmd
+        run: |
+          @echo on
+          call "%ProgramFiles(x86)%\Intel\oneAPI\setvars.bat" >nul || exit /b 1
+          if exist probe rmdir /s /q probe
+          mkdir probe & cd probe & mkdir out
+          echo int foo(){return 0;} > t.cpp
+          echo ===== case A: cl-style "/c /Fo" =====
+          icx-cl /nologo /c /Foout\a.obj t.cpp
+          if exist out\a.obj (echo A_RESULT: obj at out\a.obj) else (echo A_RESULT: MISSING)
+          if exist t.o (echo A_RESULT: stray t.o present)
+          del /q t.o out\a.obj 2>nul
+          echo ===== case B: dash "-c /Fo" =====
+          icx-cl /nologo -c /Foout\b.obj t.cpp
+          if exist out\b.obj (echo B_RESULT: obj at out\b.obj) else (echo B_RESULT: MISSING)
+          if exist t.o (echo B_RESULT: stray t.o present)
+          del /q t.o out\b.obj 2>nul
+          echo ===== case C: dash "-c -o" =====
+          icx-cl /nologo -c -oout\c.obj t.cpp
+          if exist out\c.obj (echo C_RESULT: obj at out\c.obj) else (echo C_RESULT: MISSING)
+          if exist t.o (echo C_RESULT: stray t.o present)
+
       - name: Configure and build (icx)
         shell: cmd
         run: |
