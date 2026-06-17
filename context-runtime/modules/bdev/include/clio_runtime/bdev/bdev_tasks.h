@@ -83,7 +83,8 @@ enum class BdevType : chi::u32 {
   kRam = 1,     // RAM-based block device
   kHbm = 2,     // GPU High-Bandwidth Memory via cudaMalloc (device memory)
   kPinned = 3,  // Pinned host memory via cudaMallocHost
-  kNoop = 4     // No-op backend for latency testing (no actual I/O)
+  kNoop = 4,    // No-op backend for latency testing (no actual I/O)
+  kS3 = 5       // Amazon S3 object store backend
 };
 
 /**
