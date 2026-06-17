@@ -201,14 +201,16 @@ static int cte_fuse_mkdir(const char *path, mode_t mode) {
   auto *cfs = CLIO_CFS_CLIENT;
   auto t = cfs->AsyncMkdir(std::string(path));
   t.Wait();
-  return t->GetReturnCode() == 0 ? 0 : -EIO;
+  int rc = static_cast<int>(t->GetReturnCode());  // errno-style (0/EEXIST/EIO)
+  return rc == 0 ? 0 : -rc;
 }
 
 static int cte_fuse_rmdir(const char *path) {
   auto *cfs = CLIO_CFS_CLIENT;
   auto t = cfs->AsyncRmdir(std::string(path));
   t.Wait();
-  return t->GetReturnCode() == 0 ? 0 : -EIO;
+  int rc = static_cast<int>(t->GetReturnCode());  // 0/ENOTEMPTY/ENOENT/EIO
+  return rc == 0 ? 0 : -rc;
 }
 
 // ============================================================================
@@ -348,7 +350,8 @@ static int cte_fuse_unlink(const char *path) {
   auto *cfs = CLIO_CFS_CLIENT;
   auto t = cfs->AsyncUnlink(std::string(path));
   t.Wait();
-  return t->GetReturnCode() == 0 ? 0 : -EIO;
+  int rc = static_cast<int>(t->GetReturnCode());  // 0/EISDIR/EIO
+  return rc == 0 ? 0 : -rc;
 }
 
 static int cte_fuse_truncate(const char *path, off_t size,
