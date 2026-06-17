@@ -174,7 +174,10 @@ jobs:
             -DCLIO_CORE_ENABLE_BENCHMARKS=OFF ^
             -DCMAKE_EXPORT_COMPILE_COMMANDS=ON ^
             -DCLIO_CTP_LOG_LEVEL=0 || exit /b 1
-          cmake --build build --config Debug -j %NUMBER_OF_PROCESSORS% || exit /b 1
+          rem --verbose (temporary): print the exact ninja-invoked compile
+          rem command, including dep flags (-QMD/-QMT/-QMF) that ninja injects
+          rem but compile_commands.json omits -- to see why icx-cl drops /Fo.
+          cmake --build build --config Debug --verbose -j %NUMBER_OF_PROCESSORS% || exit /b 1
 
       - name: Diagnose export-def failure
         if: failure()
