@@ -1,0 +1,52 @@
+name: Leak Check
+
+# Gating allocation-leak detection. Unlike the Sanitizers job (LeakSanitizer
+# under CDash, non-gating and broadly suppressed), this builds with
+# CLIO_CORE_ENABLE_LEAK_CHECK=ON (defines CTP_ALLOC_TRACK_SIZE) and runs the
+# force-net leak test, which asserts per-RPC runtime-heap growth stays ~0. A
+# regression (e.g. an unfreed FutureShm — see #560/#563) fails the build.
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+  workflow_dispatch:
+
+jobs:
+  leak-check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v5
+      with:
+        submodules: recursive
+
+    - name: Install system libraries
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libhdf5-dev liburing-dev
+
+    - name: Install dependencies (conda env)
+      run: |
+        chmod +x install.sh
+        ./install.sh --only-deps
+
+    - name: Build with leak tracking and run leak tests
+      run: |
+        # Activate the conda env that install.sh provisioned.
+        if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
+          source "$HOME/miniconda3/etc/profile.d/conda.sh"
+        elif [ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]; then
+          source "$HOME/anaconda3/etc/profile.d/conda.sh"
+        elif command -v conda &>/dev/null; then
+          eval "$(conda shell.bash hook)"
+        fi
+        conda activate iowarp
+        cmake --preset=leak-check
+        cmake --build build-leak -j"$(nproc)"
+        # Run the leak-tagged tests (currently cr_streaming_leak_force_net).
+        # --no-tests=error so the job fails loudly if the test is ever dropped
+        # instead of silently passing with nothing run.
+        ctest --test-dir build-leak -R leak --output-on-failure --no-tests=error
