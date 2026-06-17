@@ -142,6 +142,20 @@ std::string JoinPath(const std::string &parent_full, const std::string &leaf) {
   return parent_full + "/" + leaf;
 }
 
+// Split an absolute path into (parent_path, leaf): "/a/b/c" -> ("/a/b","c"),
+// "/c" -> ("/","c"). Returns false for "/" or names with no component.
+bool SplitParentLeaf(const std::string &path, std::string &parent_out,
+                     std::string &leaf_out) {
+  std::vector<std::string> comps = SplitPathComponents(path);
+  if (comps.empty()) return false;
+  leaf_out = comps.back();
+  parent_out = "/";
+  for (size_t i = 0; i + 1 < comps.size(); ++i) {
+    parent_out += (i == 0 ? "" : "/") + comps[i];
+  }
+  return true;
+}
+
 }  // namespace
 
 // No more static member definitions - using instance-based locking
@@ -1757,44 +1771,71 @@ chi::TaskResume Runtime::GetOrCreateTagAlias(
       CLIO_CO_RETURN;
     }
 
-    chi::ScopedCoRwWriteLock lock(tag_map_lock_);
-    // Resolve the target id from a local name binding if it wasn't supplied.
-    if (tag_id.IsNull() && !existing_name.empty()) {
-      TagId *p = tag_name_to_id_.find(existing_name);
-      if (p != nullptr) {
-        tag_id = *p;
+    // Phase A: resolve + verify the target tag exists. The target may be given
+    // by id or by name (absolute paths are walked through the hierarchy).
+    {
+      chi::ScopedCoRwReadLock lock(tag_map_lock_);
+      if (tag_id.IsNull() && !existing_name.empty()) {
+        if (IsHierPath(existing_name)) {
+          tag_id = ResolvePathToIdLocked(existing_name);
+        }
+        if (tag_id.IsNull()) {
+          TagId *p = tag_name_to_id_.find(existing_name);
+          if (p != nullptr) tag_id = *p;
+        }
+      }
+      if (tag_id.IsNull() || tag_id_to_info_.find(tag_id) == nullptr) {
+        task->found_ = 0;
+        task->tag_id_ = TagId::GetNull();
+        task->return_code_ = 0;  // found_ conveys "target missing"; not an error
+        CLIO_CO_RETURN;
       }
     }
-    // The canonical container (the one holding the target's TagInfo) verifies
-    // the target exists and binds the alias name to the SAME id — so the alias
-    // shares all of the target's blobs (a tag-level hard link). GetOrCreate:
-    // if the alias name is already bound, return its existing id unchanged.
-    if (!tag_id.IsNull()) {
-      TagInfo *info = tag_id_to_info_.find(tag_id);
-      if (info != nullptr) {
-        task->found_ = 1;
-        TagId *existing_alias = tag_name_to_id_.find(alias_name);
-        if (existing_alias == nullptr) {
-          tag_name_to_id_.insert_or_assign(alias_name, tag_id);
-          // Record the alias on the tag so DelTag can cascade-remove it. The
-          // canonical name (tag_name_) is never added here. Dedup defensively
-          // even though the name binding above guarantees first-time insert.
-          bool present = (alias_name == info->tag_name_.str());
+    task->found_ = 1;
+
+    // Compute the binding KEY for the alias. An absolute-path alias becomes a
+    // first-class hierarchy entry: create its parent chain (outside the lock —
+    // GetOrCreateTagChain takes tag_map_lock_) and bind the relative key
+    // "$tagid{parent}/leaf" so the link resolves, lists, and opens like any
+    // other path. A flat alias binds verbatim (legacy behavior).
+    std::string alias_key = alias_name;
+    if (IsHierPath(alias_name)) {
+      std::string parent_path, leaf;
+      if (!SplitParentLeaf(alias_name, parent_path, leaf)) {
+        task->return_code_ = 1;  // cannot alias onto the root
+        CLIO_CO_RETURN;
+      }
+      TagId parent_id = GetOrCreateTagChain(parent_path);
+      alias_key = MakeRelativeName(parent_id, leaf);
+    }
+
+    // Phase C: bind the alias key to the target id (a tag-level hard link — the
+    // alias shares the target's id and therefore all of its blobs). GetOrCreate:
+    // if the key is already bound, return whatever it points at unchanged.
+    {
+      chi::ScopedCoRwWriteLock lock(tag_map_lock_);
+      TagId *existing_alias = tag_name_to_id_.find(alias_key);
+      if (existing_alias != nullptr) {
+        tag_id = *existing_alias;
+      } else {
+        tag_name_to_id_.insert_or_assign(alias_key, tag_id);
+        // Record the alias key on the target so DelTag cascades to it when the
+        // canonical tag is deleted. The canonical name is never added here.
+        TagInfo *info = tag_id_to_info_.find(tag_id);
+        if (info != nullptr) {
+          bool present = (alias_key == info->tag_name_.str());
           for (size_t i = 0; !present && i < info->aliases_.size(); ++i) {
-            if (info->aliases_[i].str() == alias_name) present = true;
+            if (info->aliases_[i].str() == alias_key) present = true;
           }
           if (!present) {
-            info->aliases_.push_back(chi::priv::string(CLIO_PRIV_ALLOC,
-                                                       alias_name));
+            info->aliases_.push_back(
+                chi::priv::string(CLIO_PRIV_ALLOC, alias_key));
           }
           info->last_modified_ = GetCurrentTimeNs();
-        } else {
-          tag_id = *existing_alias;
         }
       }
     }
     task->tag_id_ = tag_id;
-    // found_ conveys whether the target existed; the op itself didn't fail.
     task->return_code_ = 0;
   } catch (const std::exception &e) {
     HLOG(kError, "GetOrCreateTagAlias failed: {}", e.what());
@@ -1816,19 +1857,32 @@ chi::TaskResume Runtime::DelTag(ctp::ipc::FullPtr<DelTagTask> task,
     TagId tag_id = task->tag_id_;
     std::string tag_name = task->tag_name_.str();
 
-    // Step 1: Resolve tag ID if tag name was provided instead. Absolute paths
-    // are walked through the hierarchy; if that fails (or the name is flat),
-    // fall back to a verbatim lookup so flat tags and aliases still resolve.
+    // Step 1: Resolve the tag id AND the tag_name_to_id_ key the request
+    // resolves *through* (resolved_key). For an absolute path that key is the
+    // relative "$tagid{parent}/leaf"; for a flat name it is the name itself;
+    // for a by-id delete it stays empty. resolved_key is what distinguishes
+    // deleting an alias (a non-canonical name) from deleting the tag itself.
+    std::string resolved_key;
     if (tag_id.IsNull() && !tag_name.empty()) {
       chi::ScopedCoRwReadLock lock(tag_map_lock_);
       if (IsHierPath(tag_name)) {
-        tag_id = ResolvePathToIdLocked(tag_name);
-      }
-      if (tag_id.IsNull()) {
-        TagId *found_tag_id_ptr = tag_name_to_id_.find(tag_name);
-        if (found_tag_id_ptr != nullptr) {
-          tag_id = *found_tag_id_ptr;
+        std::string parent_path, leaf;
+        if (tag_name == "/") {
+          TagId *r = tag_name_to_id_.find(std::string("/"));
+          if (r != nullptr) { tag_id = *r; resolved_key = "/"; }
+        } else if (SplitParentLeaf(tag_name, parent_path, leaf)) {
+          TagId parent_id = ResolvePathToIdLocked(parent_path);
+          if (!parent_id.IsNull()) {
+            std::string key = MakeRelativeName(parent_id, leaf);
+            TagId *p = tag_name_to_id_.find(key);
+            if (p != nullptr) { tag_id = *p; resolved_key = key; }
+          }
         }
+      }
+      // Fall back to a verbatim lookup (flat tags and flat aliases).
+      if (tag_id.IsNull()) {
+        TagId *p = tag_name_to_id_.find(tag_name);
+        if (p != nullptr) { tag_id = *p; resolved_key = tag_name; }
       }
       if (tag_id.IsNull()) {
         task->return_code_ = 1;  // Tag not found by name
@@ -1840,11 +1894,8 @@ chi::TaskResume Runtime::DelTag(ctp::ipc::FullPtr<DelTagTask> task,
       CLIO_CO_RETURN;
     }
 
-    // Step 2: Find the tag by ID. Also capture the canonical name and the set
-    // of alias names so we can either (a) unlink just one alias or (b) cascade
-    // and remove every alias when the canonical (non-alias) tag is deleted.
-    std::string cached_tag_name;
-    std::vector<std::string> cached_aliases;
+    // Step 2: Find the tag by ID and capture its canonical (own) stored name.
+    std::string canonical;
     {
       chi::ScopedCoRwReadLock lock(tag_map_lock_);
       TagInfo *tag_info_ptr = tag_id_to_info_.find(tag_id);
@@ -1852,34 +1903,21 @@ chi::TaskResume Runtime::DelTag(ctp::ipc::FullPtr<DelTagTask> task,
         task->return_code_ = 1;  // Tag not found by ID
         CLIO_CO_RETURN;
       }
-      cached_tag_name = tag_info_ptr->tag_name_.str();
-      for (size_t i = 0; i < tag_info_ptr->aliases_.size(); ++i) {
-        cached_aliases.push_back(tag_info_ptr->aliases_[i].str());
-      }
+      canonical = tag_info_ptr->tag_name_.str();
     }
 
-    // If the caller deleted *by name* and that name is one of the tag's
-    // aliases, this is a hard-link "unlink": drop only that one name binding
+    // If the request resolved through a key that is NOT the tag's own canonical
+    // name, it is an alias/hard-link "unlink": drop only that one name binding
     // and leave the tag, its blobs, and other names intact. Deleting by id, or
-    // by the canonical name/path, falls through to a full tag delete that
-    // cascades to every alias below. Membership in the alias set (not string
-    // inequality with the canonical name) is the test, because a hierarchical
-    // tag's canonical stored name is a relative "$tagid{..}/leaf" form that
-    // never equals the absolute path the caller passed.
-    bool is_alias_unlink = false;
-    if (!tag_name.empty()) {
-      for (const std::string &a : cached_aliases) {
-        if (a == tag_name) { is_alias_unlink = true; break; }
-      }
-    }
-    (void)cached_tag_name;
-    if (is_alias_unlink) {
+    // through the canonical name, falls through to a full recursive delete that
+    // cascades to every alias below.
+    if (!resolved_key.empty() && resolved_key != canonical) {
       chi::ScopedCoRwWriteLock lock(tag_map_lock_);
-      tag_name_to_id_.erase(tag_name);
+      tag_name_to_id_.erase(resolved_key);
       TagInfo *tag_info_ptr = tag_id_to_info_.find(tag_id);
       if (tag_info_ptr != nullptr) {
         for (size_t i = 0; i < tag_info_ptr->aliases_.size(); ++i) {
-          if (tag_info_ptr->aliases_[i].str() == tag_name) {
+          if (tag_info_ptr->aliases_[i].str() == resolved_key) {
             tag_info_ptr->aliases_.erase(tag_info_ptr->aliases_.begin() + i);
             break;
           }

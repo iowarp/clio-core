@@ -387,6 +387,145 @@ TEST_CASE("Cfs - filesystem chimod open/write/getattr/read/truncate",
   REQUIRE(reborn->GetReturnCode() == 0);
   REQUIRE(!(reborn->tag_id_ == d_id));
 
+  // ---- Filesystem chimod: directory operations over the hierarchy ----
+  auto gattr = [&](const std::string &p) {
+    auto g = cfs.AsyncGetattr(p);
+    g.Wait();
+    REQUIRE(g->GetReturnCode() == 0);
+    return std::make_tuple((unsigned)g->exists_, (unsigned)g->is_dir_,
+                           (unsigned long long)g->size_);
+  };
+
+  // mkdir of an empty directory -> getattr reports a directory (size 0).
+  {
+    auto mk = cfs.AsyncMkdir("/d1");
+    mk.Wait();
+    REQUIRE(mk->GetReturnCode() == 0);
+    auto [ex, dir, sz] = gattr("/d1");
+    REQUIRE(ex == 1);
+    REQUIRE(dir == 1);
+    REQUIRE(sz == 0);
+  }
+  // mkdir again -> EEXIST.
+  {
+    auto mk = cfs.AsyncMkdir("/d1");
+    mk.Wait();
+    REQUIRE(mk->GetReturnCode() == EEXIST);
+  }
+
+  // Create a file inside the directory and write to it.
+  const std::string kFile = "/d1/f.txt";
+  const char kFileMsg[] = "dir-file-payload!";
+  constexpr chi::u64 kFileN = sizeof(kFileMsg);
+  {
+    auto op = cfs.AsyncOpen(kFile, O_CREAT | O_RDWR, 0644);
+    op.Wait();
+    REQUIRE(op->GetReturnCode() == 0);
+    chi::u64 h = op->handle_;
+    ctp::ipc::FullPtr<char> wb = ipc->AllocateBuffer(kFileN);
+    memcpy(wb.ptr_, kFileMsg, kFileN);
+    auto w = cfs.AsyncWrite(h, 0, kFileN, wb.shm_.template Cast<void>());
+    w.Wait();
+    REQUIRE(w->GetReturnCode() == 0);
+    REQUIRE(w->bytes_written_ == kFileN);
+    ipc->FreeBuffer(wb);
+    auto cl = cfs.AsyncClose(h);
+    cl.Wait();
+  }
+
+  // The file is a regular file; the directory is still a directory.
+  {
+    auto [fex, fdir, fsz] = gattr(kFile);
+    REQUIRE(fex == 1);
+    REQUIRE(fdir == 0);
+    REQUIRE(fsz == kFileN);
+    auto [dex, ddir, dsz] = gattr("/d1");
+    REQUIRE(dex == 1);
+    REQUIRE(ddir == 1);
+  }
+
+  // readdir lists the file and hides the internal directory marker.
+  {
+    auto rd = cfs.AsyncReaddir("/d1");
+    rd.Wait();
+    REQUIRE(rd->GetReturnCode() == 0);
+    bool saw_file = false;
+    for (const auto &e : rd->entries_) {
+      std::string full = e.str();
+      REQUIRE(full.find(".__clio_dir__") == std::string::npos);  // marker hidden
+      if (full == kFile) saw_file = true;
+    }
+    REQUIRE(saw_file);
+  }
+
+  // ---- Hard link via tag alias ----
+  const std::string kLink = "/d1/link.txt";
+  {
+    auto ln = cfs.AsyncLink(kFile, kLink);
+    ln.Wait();
+    REQUIRE(ln->GetReturnCode() == 0);
+  }
+  // The link is a regular file of the same size and reads back the same data.
+  {
+    auto [lex, ldir, lsz] = gattr(kLink);
+    REQUIRE(lex == 1);
+    REQUIRE(ldir == 0);
+    REQUIRE(lsz == kFileN);
+
+    auto op = cfs.AsyncOpen(kLink, O_RDWR, 0644);
+    op.Wait();
+    REQUIRE(op->GetReturnCode() == 0);
+    REQUIRE(op->handle_ != 0);
+    ctp::ipc::FullPtr<char> rb = ipc->AllocateBuffer(kFileN);
+    memset(rb.ptr_, 0, kFileN);
+    auto r = cfs.AsyncRead(op->handle_, 0, kFileN, rb.shm_.template Cast<void>());
+    r.Wait();
+    REQUIRE(r->GetReturnCode() == 0);
+    REQUIRE(r->bytes_read_ == kFileN);
+    REQUIRE(memcmp(rb.ptr_, kFileMsg, kFileN) == 0);
+    ipc->FreeBuffer(rb);
+    auto cl = cfs.AsyncClose(op->handle_);
+    cl.Wait();
+  }
+  // Linking onto an existing name fails.
+  {
+    auto ln = cfs.AsyncLink(kFile, kLink);
+    ln.Wait();
+    REQUIRE(ln->GetReturnCode() == EEXIST);
+  }
+
+  // rmdir of a non-empty directory fails.
+  {
+    auto rm = cfs.AsyncRmdir("/d1");
+    rm.Wait();
+    REQUIRE(rm->GetReturnCode() == ENOTEMPTY);
+  }
+
+  // Unlinking the hard link removes only that name; the original file (and its
+  // data) survive.
+  {
+    auto ul = cfs.AsyncUnlink(kLink);
+    ul.Wait();
+    REQUIRE(ul->GetReturnCode() == 0);
+    auto [lex, ldir, lsz] = gattr(kLink);
+    REQUIRE(lex == 0);  // link gone
+    auto [fex, fdir, fsz] = gattr(kFile);
+    REQUIRE(fex == 1);  // original still there
+    REQUIRE(fsz == kFileN);
+  }
+
+  // Remove the original file, then the now-empty directory.
+  {
+    auto ul = cfs.AsyncUnlink(kFile);
+    ul.Wait();
+    REQUIRE(ul->GetReturnCode() == 0);
+    auto rm = cfs.AsyncRmdir("/d1");
+    rm.Wait();
+    REQUIRE(rm->GetReturnCode() == 0);
+    auto [ex, dir, sz] = gattr("/d1");
+    REQUIRE(ex == 0);  // directory gone
+  }
+
   RunCliTimed({"stop", "--grace-period", "2000"}, 90);
   for (int i = 0; i < 200 && server.IsRunning(); ++i) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));

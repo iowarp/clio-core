@@ -45,6 +45,7 @@ class Runtime : public chi::Container {
   chi::TaskResume Mkdir(ctp::ipc::FullPtr<MkdirTask> task, chi::RunContext &ctx);
   chi::TaskResume Rmdir(ctp::ipc::FullPtr<RmdirTask> task, chi::RunContext &ctx);
   chi::TaskResume Rename(ctp::ipc::FullPtr<RenameTask> task, chi::RunContext &ctx);
+  chi::TaskResume Link(ctp::ipc::FullPtr<LinkTask> task, chi::RunContext &ctx);
   chi::TaskResume Readdir(ctp::ipc::FullPtr<ReaddirTask> task, chi::RunContext &ctx);
   chi::TaskResume StatSize(ctp::ipc::FullPtr<StatSizeTask> task, chi::RunContext &ctx);
 

@@ -360,6 +360,16 @@ static int cte_fuse_truncate(const char *path, off_t size,
   return t->GetReturnCode() == 0 ? 0 : -EIO;
 }
 
+static int cte_fuse_link(const char *from, const char *to) {
+  // Hard link `to` -> existing file `from`. The chimod binds both names to the
+  // same CTE tag (a tag-level alias), so they share all data.
+  auto *cfs = CLIO_CFS_CLIENT;
+  auto t = cfs->AsyncLink(std::string(from), std::string(to));
+  t.Wait();
+  int rc = static_cast<int>(t->GetReturnCode());
+  return rc == 0 ? 0 : -rc;  // chimod returns errno-style codes
+}
+
 static int cte_fuse_rename(const char *from, const char *to,
                            unsigned int flags) {
   // RENAME_NOREPLACE / RENAME_EXCHANGE aren't supported; POSIX replace is.
@@ -383,6 +393,7 @@ static const struct fuse_operations cte_fuse_ops = {
     .unlink = cte_fuse_unlink,
     .rmdir = cte_fuse_rmdir,
     .rename = cte_fuse_rename,
+    .link = cte_fuse_link,
     .truncate = cte_fuse_truncate,
     .open = cte_fuse_open,
     .read = cte_fuse_read,

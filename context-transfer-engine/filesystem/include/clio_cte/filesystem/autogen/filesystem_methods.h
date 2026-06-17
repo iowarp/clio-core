@@ -30,8 +30,9 @@ GLOBAL_CROSS_CONST chi::u32 kRmdir = 19;
 GLOBAL_CROSS_CONST chi::u32 kUnlink = 20;
 GLOBAL_CROSS_CONST chi::u32 kRename = 21;
 GLOBAL_CROSS_CONST chi::u32 kStatSize = 22;
+GLOBAL_CROSS_CONST chi::u32 kLink = 23;
 
-GLOBAL_CROSS_CONST chi::u32 kMaxMethodId = 23;
+GLOBAL_CROSS_CONST chi::u32 kMaxMethodId = 24;
 
 inline const std::vector<std::string>& GetMethodNames() {
   static const std::vector<std::string> names = [] {
@@ -52,6 +53,7 @@ inline const std::vector<std::string>& GetMethodNames() {
     v[20] = "Unlink";
     v[21] = "Rename";
     v[22] = "StatSize";
+    v[23] = "Link";
     return v;
   }();
   return names;

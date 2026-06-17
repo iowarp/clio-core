@@ -124,6 +124,14 @@ class Client : public clio::cte::core::Client {
     return ipc->Send(task);
   }
 
+  chi::Future<LinkTask> AsyncLink(const std::string &target,
+                                  const std::string &link) {
+    auto *ipc = CLIO_CPU_IPC;
+    auto task = ipc->NewTask<LinkTask>(chi::CreateTaskId(), pool_id_,
+                                       chi::PoolQuery::Local(), target, link);
+    return ipc->Send(task);
+  }
+
   chi::Future<ReaddirTask> AsyncReaddir(const std::string &path) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<ReaddirTask>(chi::CreateTaskId(), pool_id_,

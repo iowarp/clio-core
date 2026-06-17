@@ -315,6 +315,29 @@ struct RenameTask : public chi::Task {
   template <typename Ar> void SerializeOut(Ar &ar) { Task::SerializeOut(ar); }
 };
 
+/**
+ * Link: create a hard link `link_` to the existing file `target_`. Both names
+ * end up bound to the same CTE tag id (a tag-level alias), so they share all
+ * data. Returns errno-style codes in return_code_ (0 / ENOENT / EIO).
+ */
+struct LinkTask : public chi::Task {
+  IN chi::priv::string target_;  // existing file path
+  IN chi::priv::string link_;    // new link path
+  LinkTask() : chi::Task(), target_(CTP_MALLOC), link_(CTP_MALLOC) {}
+  explicit LinkTask(const chi::TaskId &task_id, const chi::PoolId &pool_id,
+                    const chi::PoolQuery &pool_query, const std::string &target,
+                    const std::string &link)
+      : chi::Task(task_id, pool_id, pool_query, Method::kLink),
+        target_(CTP_MALLOC, target), link_(CTP_MALLOC, link) {}
+  void Copy(const ctp::ipc::FullPtr<LinkTask>& o) {
+    target_ = o->target_; link_ = o->link_;
+  }
+  template <typename Ar> void SerializeIn(Ar &ar) {
+    Task::SerializeIn(ar); ar(target_, link_);
+  }
+  template <typename Ar> void SerializeOut(Ar &ar) { Task::SerializeOut(ar); }
+};
+
 /** Readdir: list direct children of a directory. */
 struct ReaddirTask : public chi::Task {
   IN chi::priv::string path_;

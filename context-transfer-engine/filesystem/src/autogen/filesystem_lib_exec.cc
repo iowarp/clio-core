@@ -29,6 +29,7 @@ namespace clio::cte::filesystem {
   X(kRmdir, RmdirTask, Rmdir)             \
   X(kUnlink, UnlinkTask, Unlink)          \
   X(kRename, RenameTask, Rename)          \
+  X(kLink, LinkTask, Link)                \
   X(kStatSize, StatSizeTask, StatSize)
 
 void Runtime::Init(const chi::PoolId &pool_id, const std::string &pool_name,

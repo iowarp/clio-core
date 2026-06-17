@@ -18,9 +18,27 @@
 namespace clio::cte::filesystem {
 
 namespace {
+/**
+ * Reserved child tag that marks an explicit (possibly empty) directory.
+ *
+ * With hierarchical tag names a directory no longer needs a trailing-slash
+ * sentinel tag (which now collides with the file of the same path). Instead a
+ * directory is simply "a tag that has at least one child": intermediate dirs
+ * already have children (the files/dirs under them), and an *empty* directory
+ * created by mkdir gets this one hidden marker child so it is still detectable.
+ * The marker is filtered out of readdir and hidden from getattr.
+ */
+constexpr const char *kDirMarker = ".__clio_dir__";
+
 /** Page name for a byte offset (1 MiB pages, stringified index — libfuse). */
 inline std::string PageName(chi::u64 off) {
   return std::to_string(off / kFsPageSize);
+}
+
+/** Strip a single trailing '/' from a path (keeping a bare root "/"). */
+inline std::string StripTrailingSlash(std::string p) {
+  if (p.size() > 1 && p.back() == '/') p.pop_back();
+  return p;
 }
 /** Escape regex metacharacters for an exact TagQuery match (from libfuse). */
 inline std::string EscapeExact(const std::string &s) {
@@ -316,7 +334,20 @@ chi::TaskResume Runtime::Getattr(ctp::ipc::FullPtr<GetattrTask> task,
   CLIO_TASK_BODY_BEGIN
   std::string path = task->path_.str();
 
-  // Live logical size wins if the file is currently tracked.
+  // The empty-directory marker is an internal tag; hide it from stat().
+  {
+    std::string base = path;
+    auto slash = base.find_last_of('/');
+    if (slash != std::string::npos) base = base.substr(slash + 1);
+    if (base == kDirMarker) {
+      task->exists_ = 0; task->is_dir_ = 0; task->size_ = 0;
+      task->return_code_ = 0;
+      CLIO_CO_RETURN;
+    }
+  }
+
+  // Live logical size wins if the file is currently tracked (open files only;
+  // directories are never tracked here).
   {
     std::lock_guard<std::mutex> g(meta_mu_);
     auto it = by_path_.find(path);
@@ -329,10 +360,12 @@ chi::TaskResume Runtime::Getattr(ctp::ipc::FullPtr<GetattrTask> task,
     }
   }
 
-  // Directory? sentinel tag "path/" (libfuse convention).
+  // Directory? Any tag with at least one direct child is a directory (real
+  // children for populated dirs, the hidden marker child for empty ones).
+  std::string dir = StripTrailingSlash(path);
   {
-    auto q = cte_.AsyncTagQuery(EscapeExact(path + "/"), 1,
-                                chi::PoolQuery::Local());
+    std::string child_re = "^" + EscapeExact(dir) + "/[^/]+$";
+    auto q = cte_.AsyncTagQuery(child_re, 1, chi::PoolQuery::Local());
     CLIO_CO_AWAIT(q);
     if (q->GetReturnCode() == 0 && !q->results_.empty()) {
       task->exists_ = 1; task->is_dir_ = 1; task->size_ = 0;
@@ -341,7 +374,7 @@ chi::TaskResume Runtime::Getattr(ctp::ipc::FullPtr<GetattrTask> task,
     }
   }
 
-  // Regular file: tag exists? fall back to physical size.
+  // Regular file: an exact tag with no children. Fall back to physical size.
   auto q = cte_.AsyncTagQuery(EscapeExact(path), 1, chi::PoolQuery::Local());
   CLIO_CO_AWAIT(q);
   if (q->GetReturnCode() == 0 && !q->results_.empty()) {
@@ -440,7 +473,21 @@ chi::TaskResume Runtime::Truncate(ctp::ipc::FullPtr<TruncateTask> task,
 chi::TaskResume Runtime::Unlink(ctp::ipc::FullPtr<UnlinkTask> task,
                                 chi::RunContext &ctx) {
   CLIO_TASK_BODY_BEGIN
-  std::string path = task->path_.str();
+  std::string path = StripTrailingSlash(task->path_.str());
+
+  // Refuse to unlink a directory (a tag with children) — that is rmdir's job.
+  {
+    std::string child_re = "^" + EscapeExact(path) + "/[^/]+$";
+    auto q = cte_.AsyncTagQuery(child_re, 1, chi::PoolQuery::Local());
+    CLIO_CO_AWAIT(q);
+    if (q->GetReturnCode() == 0 && !q->results_.empty()) {
+      task->return_code_ = EISDIR;
+      CLIO_CO_RETURN;
+    }
+  }
+
+  // DelTag is hierarchy-aware: a hard-link (alias) path unlinks only that name;
+  // the canonical path removes the file and all its remaining links + blobs.
   auto d = cte_.AsyncDelTag(path, chi::PoolQuery::Local());
   CLIO_CO_AWAIT(d);
   {
@@ -456,8 +503,32 @@ chi::TaskResume Runtime::Unlink(ctp::ipc::FullPtr<UnlinkTask> task,
 chi::TaskResume Runtime::Mkdir(ctp::ipc::FullPtr<MkdirTask> task,
                                chi::RunContext &ctx) {
   CLIO_TASK_BODY_BEGIN
-  // Mark an explicit directory with a sentinel tag "path/" (libfuse).
-  auto t = cte_.AsyncGetOrCreateTag(task->path_.str() + "/",
+  std::string path = StripTrailingSlash(task->path_.str());
+
+  // EEXIST if the path already exists as a directory (has a child) or a file
+  // (an exact tag).
+  {
+    std::string child_re = "^" + EscapeExact(path) + "/[^/]+$";
+    auto q = cte_.AsyncTagQuery(child_re, 1, chi::PoolQuery::Local());
+    CLIO_CO_AWAIT(q);
+    if (q->GetReturnCode() == 0 && !q->results_.empty()) {
+      task->return_code_ = EEXIST;
+      CLIO_CO_RETURN;
+    }
+  }
+  {
+    auto q = cte_.AsyncTagQuery(EscapeExact(path), 1, chi::PoolQuery::Local());
+    CLIO_CO_AWAIT(q);
+    if (q->GetReturnCode() == 0 && !q->results_.empty()) {
+      task->return_code_ = EEXIST;
+      CLIO_CO_RETURN;
+    }
+  }
+
+  // Create the directory by giving it one hidden marker child. This also
+  // creates the directory's own hierarchical tag (the parent chain), so the
+  // directory becomes detectable as "a tag with a child".
+  auto t = cte_.AsyncGetOrCreateTag(path + "/" + kDirMarker,
                                     clio::cte::core::TagId::GetNull(),
                                     chi::PoolQuery::Local());
   CLIO_CO_AWAIT(t);
@@ -470,7 +541,34 @@ chi::TaskResume Runtime::Mkdir(ctp::ipc::FullPtr<MkdirTask> task,
 chi::TaskResume Runtime::Rmdir(ctp::ipc::FullPtr<RmdirTask> task,
                                chi::RunContext &ctx) {
   CLIO_TASK_BODY_BEGIN
-  auto d = cte_.AsyncDelTag(task->path_.str() + "/", chi::PoolQuery::Local());
+  std::string path = StripTrailingSlash(task->path_.str());
+
+  // List direct children. A directory must have at least one child (the marker,
+  // for an empty dir); any NON-marker child means the directory is not empty.
+  std::string child_re = "^" + EscapeExact(path) + "/[^/]+$";
+  auto q = cte_.AsyncTagQuery(child_re, 0, chi::PoolQuery::Local());
+  CLIO_CO_AWAIT(q);
+  if (q->GetReturnCode() != 0) {
+    task->return_code_ = EIO;
+    CLIO_CO_RETURN;
+  }
+  bool is_dir = false;
+  const size_t prefix = path.size() + 1;  // strip "<path>/"
+  for (const auto &full : q->results_) {
+    is_dir = true;
+    std::string base = full.size() > prefix ? full.substr(prefix) : std::string();
+    if (base != kDirMarker) {
+      task->return_code_ = ENOTEMPTY;
+      CLIO_CO_RETURN;
+    }
+  }
+  if (!is_dir) {
+    task->return_code_ = ENOENT;  // not a directory (or doesn't exist)
+    CLIO_CO_RETURN;
+  }
+
+  // Empty directory: recursive DelTag removes its tag and the marker child.
+  auto d = cte_.AsyncDelTag(path, chi::PoolQuery::Local());
   CLIO_CO_AWAIT(d);
   task->return_code_ = 0;
   (void)ctx;
@@ -544,18 +642,55 @@ chi::TaskResume Runtime::Rename(ctp::ipc::FullPtr<RenameTask> task,
   CLIO_TASK_BODY_END
 }
 
+chi::TaskResume Runtime::Link(ctp::ipc::FullPtr<LinkTask> task,
+                              chi::RunContext &ctx) {
+  CLIO_TASK_BODY_BEGIN
+  std::string target = StripTrailingSlash(task->target_.str());
+  std::string link = StripTrailingSlash(task->link_.str());
+
+  // A hard link must not land on an existing name.
+  {
+    auto q = cte_.AsyncTagQuery(EscapeExact(link), 1, chi::PoolQuery::Local());
+    CLIO_CO_AWAIT(q);
+    if (q->GetReturnCode() == 0 && !q->results_.empty()) {
+      task->return_code_ = EEXIST;
+      CLIO_CO_RETURN;
+    }
+  }
+
+  // Bind `link` as an alias of `target`'s tag. GetOrCreateTagAlias resolves the
+  // target by path, creates `link`'s parent chain, and binds the relative key
+  // for `link` to the target's tag id — so both paths share the same data.
+  // found_ == 0 means the target did not exist.
+  auto a = cte_.AsyncGetOrCreateTagAlias(target, link, chi::PoolQuery::Local());
+  CLIO_CO_AWAIT(a);
+  if (a->GetReturnCode() != 0) {
+    task->return_code_ = EIO;
+    CLIO_CO_RETURN;
+  }
+  task->return_code_ = (a->found_ == 1) ? 0 : ENOENT;
+  (void)ctx;
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
 chi::TaskResume Runtime::Readdir(ctp::ipc::FullPtr<ReaddirTask> task,
                                  chi::RunContext &ctx) {
   CLIO_TASK_BODY_BEGIN
-  // Direct children: tags matching "<dir>/<name>" with no further slash.
+  // Direct children: tags whose resolved name is "<dir>/<name>" with no
+  // further slash. Returns full resolved paths; the adapter strips the prefix.
   std::string dir = task->path_.str();
-  if (!dir.empty() && dir.back() != '/') dir += '/';
+  if (dir.empty() || dir.back() != '/') dir += '/';
   std::string regex = "^" + EscapeExact(dir) + "[^/]+$";
   auto q = cte_.AsyncTagQuery(regex, 0, chi::PoolQuery::Local());
   CLIO_CO_AWAIT(q);
   task->entries_ = chi::priv::vector<chi::priv::string>(CTP_MALLOC);
   if (q->GetReturnCode() == 0) {
+    const size_t prefix = dir.size();
     for (auto &name : q->results_) {
+      // Hide the internal empty-directory marker.
+      std::string base = name.size() > prefix ? name.substr(prefix) : name;
+      if (base == kDirMarker) continue;
       task->entries_.push_back(chi::priv::string(CTP_MALLOC, name));
     }
   }
