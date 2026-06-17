@@ -12,6 +12,15 @@ namespace clio::run::bdev {
 // The implementation of WorkerBlockMap, GlobalBlockMap, Heap 
 // will be moved here from bdev_runtime.cc
 
+const size_t kBlockSizes[] = {
+    4096,     // 4KB
+    16384,    // 16KB
+    32768,    // 32KB
+    65536,    // 64KB
+    131072,   // 128KB
+    1048576   // 1MB
+};
+
 WorkerBlockMap::WorkerBlockMap() {
   blocks_.resize(static_cast<size_t>(BlockSizeCategory::kMaxCategories));
 }

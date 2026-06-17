@@ -12,11 +12,24 @@
 
 #include <clio_runtime/clio_runtime.h>
 #include <clio_runtime/bdev/bdev_tasks.h>
+#include <clio_runtime/comutex.h>
 #include <atomic>
 #include <vector>
 #include <list>
 
 namespace clio::run::bdev {
+
+enum class BlockSizeCategory : chi::u32 {
+  k256B = 0,
+  k1KB = 1,
+  k4KB = 2,
+  k64KB = 3,
+  k128KB = 4,
+  k1MB = 5,
+  kMaxCategories = 6
+};
+
+extern const size_t kBlockSizes[];
 
 /**
  * Worker-local block map to reduce lock contention
