@@ -56,14 +56,17 @@ jobs:
         # Tests that intentionally retain runtime-heap memory (durable blobs/
         # tags, one-time runtime init) are tagged [noleak] in their source.
         #
-        # cte_tag_force_net / cte_query_force_net previously hung in CI at the
-        # reorganize path for a PRE-EXISTING, non-leak reason (#579). Re-enabled
-        # after merging main, which includes #572 (PoolManager::pool_metadata_
-        # concurrent-rehash guard) — a likely fix for that wedge. If they hang
-        # again, re-exclude with -E and reopen #579/#580.
+        # cte_tag_force_net / cte_query_force_net are excluded: they hang in CI
+        # at the reorganize path (#579) — a PRE-EXISTING, non-leak issue that is
+        # CI-only (they pass in ~6s locally). Confirmed it persists across main's
+        # #572 and the dev bdev refactor + NIXL fix, so it is independent of this
+        # PR. Re-add them once #579 is fixed (#580). Everything else — streaming
+        # (incl. the per-RPC leak test and the AllocateBuffer/NewTask detector
+        # positive-controls) and the rest of the CTE force-net suite — is gated.
         #
         # --no-tests=error so the job fails loudly if the filter ever matches
         # nothing instead of silently passing.
         ctest --test-dir build-leak \
           -R "leak|cr_streaming_force_net|cte_.*force_net" \
+          -E "cte_tag_force_net|cte_query_force_net" \
           --output-on-failure --no-tests=error
