@@ -56,11 +56,12 @@ class GlobalBlockMap {
   bool AllocateBlock(int worker, size_t io_size, Block& block);
   bool FreeBlock(int worker, Block& block);
 
+  /** Map an I/O size to its block-size category, or -1 if larger than all. */
+  static int FindBlockType(size_t io_size);
+
  private:
   std::vector<WorkerBlockMap> worker_maps_;
   std::vector<chi::CoMutex> worker_locks_;
-
-  int FindBlockType(size_t io_size);
 };
 
 /**

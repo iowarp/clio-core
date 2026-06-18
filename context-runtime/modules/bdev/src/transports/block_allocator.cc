@@ -147,8 +147,16 @@ bool StandardBlockAllocator::AllocateBlocks(size_t size, int worker_id, std::vec
   }
 
   chi::u64 aligned_total_size = AlignSize(total_size);
-  if (heap_.Allocate(aligned_total_size, static_cast<int>(BlockSizeCategory::kMaxCategories) - 1, block)) {
-    block.size_ = total_size; 
+  // Classify the fresh allocation by its size category so callers (and the
+  // free list it returns to) see the correct block_type_. Previously this
+  // hardcoded the largest category, so e.g. a 4KB allocation came back tagged
+  // as 1MB (block_type_ != 0).
+  int block_type = GlobalBlockMap::FindBlockType(aligned_total_size);
+  if (block_type == -1) {
+    block_type = static_cast<int>(BlockSizeCategory::kMaxCategories) - 1;
+  }
+  if (heap_.Allocate(aligned_total_size, block_type, block)) {
+    block.size_ = total_size;
     blocks.push_back(block);
     allocated_bytes_.fetch_add(block.size_, std::memory_order_relaxed);
     return true;
