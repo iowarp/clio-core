@@ -14,6 +14,13 @@ elseif(CLIO_CORE_ENABLE_ROCM)
   list(APPEND BDEV_GPU_LIBS ctp::rocm_cxx)
 endif()
 
+set(BDEV_S3_SOURCES "")
+set(BDEV_S3_LIBS "")
+if(CLIO_ENABLE_AMAZON_DRIVE)
+  list(APPEND BDEV_S3_SOURCES src/transports/s3_bdev_transport.cc)
+  list(APPEND BDEV_S3_LIBS aws-cpp-sdk-s3 aws-cpp-sdk-core)
+endif()
+
 # Client library — ctp::aio provides async I/O headers via its INTERFACE includes.
 # LIB_NAME pins the library to `clio_bdev_client` (the new brand-aligned
 # name); ALIAS keeps `chimaera_bdev_client` working as a CMake target for
@@ -34,12 +41,18 @@ add_clio_module_runtime(
   LIB_NAME clio_bdev
   SOURCES
     src/bdev_runtime.cc
+    src/transports/block_allocator.cc
+    src/transports/bdev_transport.cc
+    src/transports/fs_bdev_transport.cc
+    src/transports/mem_bdev_transport.cc
+    ${BDEV_S3_SOURCES}
     src/autogen/bdev_lib_exec.cc
   LINK_LIBRARIES
     clio_admin_runtime
     ctp::aio
     ${BDEV_OPTIONAL_LIBS}
     ${BDEV_GPU_LIBS}
+    ${BDEV_S3_LIBS}
 )
 add_library(chimaera_bdev_runtime ALIAS clio_bdev_runtime)
 

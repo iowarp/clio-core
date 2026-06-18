@@ -147,6 +147,7 @@ option(CLIO_CORE_ENABLE_NIXL "Enable NIXL (NVIDIA Inference Xfer Library) transp
 option(CLIO_CORE_ENABLE_NVSHMEM "Enable NVSHMEM GPU-to-GPU communication library" OFF)
 option(CLIO_CORE_ENABLE_SYCL "Enable Intel GPU support via SYCL/oneAPI (icpx -fsycl)" OFF)
 option(CLIO_CORE_ENABLE_JARVIS "Enable Jarvis CI infrastructure installation" OFF)
+option(CLIO_ENABLE_AMAZON_DRIVE "Enable Amazon S3 intermediate storage" OFF)
 
 #------------------------------------------------------------------------------
 # ClioCtp (context-transport-primitives) Options
