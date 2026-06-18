@@ -51,6 +51,7 @@
 #include "clio_ctp/util/gpu_intrinsics.h"
 #include "clio_runtime/manager.h"
 #include "clio_runtime/corwlock.h"
+#include "clio_runtime/batch_manager.h"
 #include "clio_runtime/scheduler/scheduler.h"
 #include "clio_runtime/task.h"
 #include "clio_runtime/task_archives.h"
@@ -646,6 +647,14 @@ class IpcManager {
   RouteResult RouteGlobal(Future<Task> &future,
                           const std::vector<PoolQuery> &pool_queries);
 
+  /**
+   * Route a ManyToOne task: forward to the neighborhood leader, or — if this
+   * node is the leader — park it in the BatchManager for collective
+   * batch+aggregate. Returns RouteResult::Local when parked (the worker takes
+   * no further action; completion happens later via the batch flush).
+   */
+  RouteResult RouteManyToOne(Future<Task> &future);
+
   // RouteToGpu / cpu→gpu dispatch removed along with the GPU runtime.
 
   /**
@@ -1198,6 +1207,9 @@ class IpcManager {
    */
   Scheduler *GetScheduler() { return scheduler_.get(); }
 
+  /** Get the ManyToOne batch/aggregation manager (leader-side). */
+  BatchManager *GetBatchManager() { return batch_manager_.get(); }
+
   /**
    * Register an existing shared memory segment into the IpcManager
    * Called by worker when encountering an unknown allocator in a FutureShm
@@ -1498,6 +1510,7 @@ class IpcManager {
 
   // Scheduler for task routing
   std::unique_ptr<Scheduler> scheduler_;
+  std::unique_ptr<BatchManager> batch_manager_;
 
   //============================================================================
   // Per-Process Shared Memory Management

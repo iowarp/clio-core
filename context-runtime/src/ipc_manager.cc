@@ -401,6 +401,9 @@ bool IpcManager::ServerInit() {
     HLOG(kDebug, "Scheduler initialized: {}", sched_name);
   }
 
+  // ManyToOne collective batch/aggregation manager (leader-side).
+  batch_manager_ = std::make_unique<BatchManager>(this);
+
   // Create lightbeam transports for client task reception
   {
     u32 port = config->GetPort();
@@ -2687,6 +2690,14 @@ RouteResult IpcManager::RouteTask(Future<Task> &future, bool force_enqueue) {
     return RouteResult::ExecHere;
   }
 
+  // ManyToOne collective routing is handled before the normal resolve path:
+  // forward to the neighborhood leader, or park into the batch manager if we
+  // are the leader. (The aggregate task the leader later runs is a plain
+  // Local task and does not re-enter this branch.)
+  if (task_ptr->pool_query_.IsManyToOneMode()) {
+    return RouteManyToOne(future);
+  }
+
   // Only call ScheduleTask for Dynamic pool queries.
   // ScheduleTask resolves Dynamic routing into concrete modes (e.g.,
   // Broadcast, DirectHash, Local). Concrete routing modes (Range, Physical,
@@ -2746,6 +2757,25 @@ RouteResult IpcManager::RouteTask(Future<Task> &future, bool force_enqueue) {
   } else {
     return RouteGlobal(future, pool_queries);
   }
+}
+
+RouteResult IpcManager::RouteManyToOne(Future<Task> &future) {
+  FullPtr<Task> task_ptr = future.GetTaskPtr();
+  u64 leader = GetNeighborhoodLeaderNodeId();
+  if (leader == GetNodeId()) {
+    // We are the neighborhood leader: park the task into its batch group. The
+    // batch flusher aggregates, runs once, and completes each member later.
+    // RouteResult::Local tells the worker the task is owned elsewhere now and
+    // must not be executed here.
+    task_ptr->SetFlags(TASK_ROUTED);
+    batch_manager_->Add(task_ptr);
+    return RouteResult::Local;
+  }
+  // Forward to the leader. pool_query_ stays ManyToOne so the leader re-enters
+  // this path and batches; only the network address is the leader node.
+  std::vector<PoolQuery> pool_queries = {PoolQuery::Physical((u32)leader)};
+  pool_queries[0].SetReturnNode(GetNodeId());
+  return RouteGlobal(future, pool_queries);
 }
 
 bool IpcManager::IsTaskLocal(const FullPtr<Task> & /*task_ptr*/,
@@ -2962,6 +2992,12 @@ std::vector<PoolQuery> IpcManager::ResolvePoolQuery(
     case RoutingMode::Null:
       // GPU producer-only ToLocalCpu and Null modes pass through.
       result = {query};
+      break;
+    case RoutingMode::ManyToOne:
+      // ManyToOne is intercepted in RouteTask (RouteManyToOne) before reaching
+      // here. If it ever falls through, resolve to the neighborhood leader.
+      result = {PoolQuery::Physical(
+          (u32)GetNeighborhoodLeaderNodeId())};
       break;
   }
 
