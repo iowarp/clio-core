@@ -16,7 +16,13 @@ bool WorkerIOContext::Init(const std::string &file_path, chi::u32 io_depth,
                            chi::u32 worker_id) {
   if (is_initialized_) return true;
 
-#if defined(__linux__)
+  // Use the NIXL backend only when it is actually compiled in; otherwise fall
+  // back to the default backend (io_uring/libaio/POSIX AIO). The #571 refactor
+  // gated this on `defined(__linux__)`, so on a Linux build with NIXL disabled
+  // (the normal case) it requested kNixl from AsyncIoFactory, which returns
+  // nullptr — the per-worker I/O context never initialized and every file read
+  // returned 0 bytes. Restore the original CTP_ENABLE_NIXL guard.
+#if CTP_ENABLE_NIXL
   async_io_ = ctp::AsyncIoFactory::Get(io_depth, ctp::AsyncIoBackend::kNixl);
 #else
   async_io_ = ctp::AsyncIoFactory::Get(io_depth);
