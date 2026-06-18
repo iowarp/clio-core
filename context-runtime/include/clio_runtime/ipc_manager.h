@@ -185,6 +185,20 @@ struct ClientShmInfo {
  * and priority queues for task processing.
  * Uses CTP global cross pointer variable singleton pattern.
  */
+#if defined(CTP_ALLOC_TRACK_SIZE) && CTP_IS_HOST
+// Leak-check accounting for tasks. NewTask uses global operator new (not the
+// CTP_MALLOC allocator), so the allocator's GetCurrentlyAllocatedSize() does not
+// see task allocations. Track the net outstanding NewTask bytes here so that
+// GetRuntimeHeapAllocatedBytes() — and thus the leak detector — also catches an
+// unfreed NewTask. NewTask increments, DelTask decrements; AllocLoadTask routes
+// through NewTask, so client and runtime task allocations are both covered and
+// stay balanced. Only compiled in leak-check builds.
+inline std::atomic<long long> &RuntimeTaskAllocBytes() {
+  static std::atomic<long long> bytes{0};
+  return bytes;
+}
+#endif
+
 class IpcManager {
   friend struct IpcCpu2Self;
   friend struct IpcCpu2Cpu;
@@ -301,6 +315,9 @@ class IpcManager {
   ctp::ipc::FullPtr<TaskT> NewTask(Args &&...args) {
     TaskT *ptr = new TaskT(std::forward<Args>(args)...);
     ptr->pod_size_ = static_cast<u32>(sizeof(TaskT));
+#if defined(CTP_ALLOC_TRACK_SIZE) && CTP_IS_HOST
+    RuntimeTaskAllocBytes() += static_cast<long long>(sizeof(TaskT));
+#endif
     ctp::ipc::FullPtr<TaskT> result(ptr);
     return result;
   }
@@ -324,6 +341,9 @@ class IpcManager {
   template <typename TaskT>
   void DelTask(ctp::ipc::FullPtr<TaskT> task_ptr) {
     if (task_ptr.IsNull()) return;
+#if defined(CTP_ALLOC_TRACK_SIZE) && CTP_IS_HOST
+    RuntimeTaskAllocBytes() -= static_cast<long long>(sizeof(TaskT));
+#endif
     task_ptr.ptr_->~TaskT();
     void *raw = static_cast<void *>(task_ptr.ptr_);
     ::operator delete(raw);

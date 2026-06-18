@@ -278,4 +278,82 @@ TEST_CASE("Runtime Heap Leak Check", "[streaming][leak]") {
 #endif
 }
 
+// ===========================================================================
+// Positive controls for the leak detector itself: deliberately leak (skip the
+// free), confirm GetRuntimeHeapAllocatedBytes() *observes* the leak, then free
+// so the case ends balanced (also confirming the detector drops back toward
+// baseline on free). These prove a real un-freed allocation would be caught.
+// Only assert under CLIO_CORE_ENABLE_LEAK_CHECK (CTP_ALLOC_TRACK_SIZE); a no-op
+// otherwise. Run via cr_streaming_force_net (the whole binary).
+// ===========================================================================
+
+TEST_CASE("Leak Detector - AllocateBuffer leak is detected",
+          "[streaming][leak-detector]") {
+  StreamingTestFixture fixture;
+  REQUIRE(g_initialized);
+#ifdef CTP_ALLOC_TRACK_SIZE
+  auto *ipc = CLIO_IPC;
+  REQUIRE(ipc != nullptr);
+  constexpr size_t kLeakBytes = 1u << 20;       // 1 MiB — dwarfs idle churn
+  constexpr size_t kSlack = 64u << 10;          // tolerate background activity
+
+  const size_t before = ipc->GetRuntimeHeapAllocatedBytes();
+
+  // Leak: allocate from the runtime private heap (CTP_MALLOC) and DON'T free.
+  auto buf = ipc->AllocateBuffer(kLeakBytes);
+  REQUIRE(!buf.IsNull());
+  const size_t leaked = ipc->GetRuntimeHeapAllocatedBytes();
+  INFO("AllocateBuffer leak: detector observed +" << (leaked - before)
+       << " B (leaked " << kLeakBytes << ")");
+  REQUIRE(leaked >= before + kLeakBytes);        // detector found the leak
+
+  // Free it: the detector must drop back toward baseline.
+  ipc->FreeBuffer(buf);
+  const size_t after_free = ipc->GetRuntimeHeapAllocatedBytes();
+  REQUIRE(after_free < leaked);
+  REQUIRE(after_free <= before + kSlack);
+#else
+  INFO("Leak tracking off; build -DCLIO_CORE_ENABLE_LEAK_CHECK=ON to exercise");
+  REQUIRE(true);
+#endif
+}
+
+TEST_CASE("Leak Detector - NewTask leak is detected",
+          "[streaming][leak-detector]") {
+  StreamingTestFixture fixture;
+  REQUIRE(g_initialized);
+#ifdef CTP_ALLOC_TRACK_SIZE
+  auto *ipc = CLIO_IPC;
+  REQUIRE(ipc != nullptr);
+  using TaskT = clio::run::MOD_NAME::CustomTask;
+  constexpr int kNumTasks = 256;                 // dominate idle churn
+  constexpr size_t kSlack = 64u << 10;
+  const size_t expected = kNumTasks * sizeof(TaskT);
+
+  const size_t before = ipc->GetRuntimeHeapAllocatedBytes();
+
+  // Leak: allocate tasks via NewTask (global new — invisible to CTP_MALLOC, so
+  // this exercises the NewTask/DelTask accounting) and DON'T DelTask them.
+  std::vector<ctp::ipc::FullPtr<TaskT>> tasks;
+  tasks.reserve(kNumTasks);
+  for (int i = 0; i < kNumTasks; ++i) {
+    tasks.push_back(ipc->NewTask<TaskT>());
+    REQUIRE(!tasks.back().IsNull());
+  }
+  const size_t leaked = ipc->GetRuntimeHeapAllocatedBytes();
+  INFO("NewTask leak: detector observed +" << (leaked - before) << " B over "
+       << kNumTasks << " tasks (sizeof=" << sizeof(TaskT) << ")");
+  REQUIRE(leaked >= before + expected);          // detector found the leak
+
+  // Free them: the detector must drop back toward baseline.
+  for (auto &t : tasks) ipc->DelTask(t);
+  const size_t after_free = ipc->GetRuntimeHeapAllocatedBytes();
+  REQUIRE(after_free < leaked);
+  REQUIRE(after_free <= before + kSlack);
+#else
+  INFO("Leak tracking off; build -DCLIO_CORE_ENABLE_LEAK_CHECK=ON to exercise");
+  REQUIRE(true);
+#endif
+}
+
 SIMPLE_TEST_MAIN()
