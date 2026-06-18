@@ -12,30 +12,43 @@
 
 namespace clio::run::bdev {
 
+namespace {
+
+// Open `file_path` through the best AsyncIO backend that actually works at
+// runtime. AsyncIoFactory's kDefault selects the preferred backend at *compile*
+// time (NIXL > io_uring > libaio > POSIX), but a backend can be compiled in yet
+// be unavailable at runtime: under a container's default seccomp profile
+// io_uring_queue_init() fails, returning a negative errno as its return value
+// while leaving the global errno untouched, so IoUringAsyncIO::Open() reports
+// failure (errno=0) even though the file itself opened fine. When the preferred
+// backend cannot open the file, transparently fall back to POSIX AIO, which
+// works in restricted environments (containers/CI). Returns an opened AsyncIO,
+// or nullptr only if even POSIX AIO cannot open the file (a genuine error).
+std::unique_ptr<ctp::AsyncIO> OpenBackingFile(chi::u32 io_depth,
+                                              const std::string &file_path) {
+  auto io = ctp::AsyncIoFactory::Get(io_depth);
+  if (io && io->Open(file_path, O_RDWR | O_CREAT, 0644)) {
+    return io;
+  }
+  // Preferred backend is unusable in this environment. IoUringAsyncIO::Open()
+  // closes any fds it opened before returning false, so it is safe to discard
+  // it and retry with POSIX AIO.
+  io = ctp::AsyncIoFactory::Get(io_depth, ctp::AsyncIoBackend::kPosixAio);
+  if (io && io->Open(file_path, O_RDWR | O_CREAT, 0644)) {
+    return io;
+  }
+  return nullptr;
+}
+
+}  // namespace
+
 bool WorkerIOContext::Init(const std::string &file_path, chi::u32 io_depth,
                            chi::u32 worker_id) {
   if (is_initialized_) return true;
 
-  // Use the NIXL backend only when it is actually compiled in; otherwise fall
-  // back to the default backend (io_uring/libaio/POSIX AIO). The #571 refactor
-  // gated this on `defined(__linux__)`, so on a Linux build with NIXL disabled
-  // (the normal case) it requested kNixl from AsyncIoFactory, which returns
-  // nullptr — the per-worker I/O context never initialized and every file read
-  // returned 0 bytes. Restore the original CTP_ENABLE_NIXL guard.
-#if CTP_ENABLE_NIXL
-  async_io_ = ctp::AsyncIoFactory::Get(io_depth, ctp::AsyncIoBackend::kNixl);
-#else
-  async_io_ = ctp::AsyncIoFactory::Get(io_depth);
-#endif
-
+  async_io_ = OpenBackingFile(io_depth, file_path);
   if (!async_io_) {
-    HLOG(kError, "Failed to create AsyncIO backend for worker {}", worker_id);
-    return false;
-  }
-
-  if (!async_io_->Open(file_path, O_RDWR | O_CREAT, 0644)) {
     HLOG(kError, "Worker {} failed to open file {}", worker_id, file_path);
-    async_io_.reset();
     return false;
   }
 
@@ -59,13 +72,8 @@ bool FsBdevTransport::Init(const CreateParams& params,
   file_path_ = pool_name;
   io_depth_ = params.io_depth_;
 
-  auto setup_io = ctp::AsyncIoFactory::Get(io_depth_);
+  auto setup_io = OpenBackingFile(io_depth_, file_path_);
   if (!setup_io) {
-    HLOG(kError, "Failed to create setup AsyncIO backend for filesystem tier");
-    return false;
-  }
-
-  if (!setup_io->Open(file_path_, O_RDWR | O_CREAT, 0644)) {
     HLOG(kError, "Failed to open bdev file: {}", file_path_);
     return false;
   }
