@@ -21,7 +21,8 @@ class S3BdevTransport : public BdevTransport {
   S3BdevTransport() = default;
   ~S3BdevTransport() override { Destroy(); }
 
-  bool Init(const CreateParams& params, Runtime* runtime) override;
+  bool Init(const CreateParams& params, const std::string& pool_name,
+            Runtime* runtime) override;
   void Destroy() override;
 
   bool AllocateBlocks(size_t size, int worker_id, std::vector<Block>& blocks) override;

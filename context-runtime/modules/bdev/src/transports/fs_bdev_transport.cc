@@ -8,6 +8,7 @@
 #include <clio_runtime/clio_runtime.h>
 #include <clio_runtime/worker.h>
 #include <clio_runtime/work_orchestrator.h>
+#include <fcntl.h>
 
 namespace clio::run::bdev {
 
@@ -21,15 +22,14 @@ bool WorkerIOContext::Init(const std::string &file_path, chi::u32 io_depth,
   async_io_ = ctp::AsyncIoFactory::Get(io_depth);
 #endif
 
-  if (!async_io_ || !async_io_->Init()) {
-    HLOG(kError, "Failed to initialize generic AsyncIo for worker {}",
-         worker_id);
+  if (!async_io_) {
+    HLOG(kError, "Failed to create AsyncIO backend for worker {}", worker_id);
     return false;
   }
 
-  if (!async_io_->Open(file_path)) {
+  if (!async_io_->Open(file_path, O_RDWR | O_CREAT, 0644)) {
     HLOG(kError, "Worker {} failed to open file {}", worker_id, file_path);
-    async_io_->Cleanup();
+    async_io_.reset();
     return false;
   }
 
@@ -41,29 +41,31 @@ void WorkerIOContext::Cleanup() {
   if (is_initialized_) {
     if (async_io_) {
       async_io_->Close();
-      async_io_->Cleanup();
+      async_io_.reset();
     }
     is_initialized_ = false;
   }
 }
 
-bool FsBdevTransport::Init(const CreateParams& params, Runtime* runtime) {
-  file_path_ = params.file_path_;
+bool FsBdevTransport::Init(const CreateParams& params,
+                           const std::string& pool_name, Runtime* runtime) {
+  // The pool name doubles as the backing file path.
+  file_path_ = pool_name;
   io_depth_ = params.io_depth_;
 
   auto setup_io = ctp::AsyncIoFactory::Get(io_depth_);
-  if (!setup_io->Init()) {
-    HLOG(kError, "Failed to initialize setup AsyncIo for filesystem tier");
+  if (!setup_io) {
+    HLOG(kError, "Failed to create setup AsyncIO backend for filesystem tier");
     return false;
   }
 
-  if (!setup_io->Open(file_path_)) {
+  if (!setup_io->Open(file_path_, O_RDWR | O_CREAT, 0644)) {
     HLOG(kError, "Failed to open bdev file: {}", file_path_);
     return false;
   }
 
   chi::u64 file_size = 0;
-  off_t current_size = setup_io->GetSize();
+  off_t current_size = setup_io->GetFileSize();
   if (current_size < 0) {
     HLOG(kError, "Failed to get file size for: {}", file_path_);
     setup_io->Close();

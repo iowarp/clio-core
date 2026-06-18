@@ -32,14 +32,15 @@ class PreallocatedStreamBuf : public std::streambuf {
 };
 #endif
 
-bool S3BdevTransport::Init(const CreateParams& params, Runtime* runtime) {
+bool S3BdevTransport::Init(const CreateParams& params,
+                           const std::string& pool_name, Runtime* runtime) {
 #ifdef CLIO_ENABLE_AMAZON_DRIVE
   if (init_count_.fetch_add(1) == 0) {
     Aws::InitAPI(options_);
   }
 
   // The bdev pool_name acts as the bucket name
-  bucket_name_ = Aws::String(params.pool_name_.c_str());
+  bucket_name_ = Aws::String(pool_name.c_str());
 
   Aws::Client::ClientConfiguration clientConfig;
   const char* region_env = std::getenv("AWS_DEFAULT_REGION");

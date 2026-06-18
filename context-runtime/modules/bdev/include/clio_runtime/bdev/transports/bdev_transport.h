@@ -38,6 +38,7 @@
 #include <clio_runtime/bdev/bdev_tasks.h>
 #include <vector>
 #include <memory>
+#include <string>
 
 namespace clio::run::bdev {
 
@@ -53,10 +54,13 @@ class BdevTransport {
   /**
    * Initialize the transport
    * @param params Creation parameters
+   * @param pool_name Pool name; doubles as the file path (kFile) or S3 bucket
+   *   name (kS3). Carried on the create task, not in CreateParams.
    * @param runtime Pointer to the parent bdev runtime
    * @return true if successful
    */
-  virtual bool Init(const CreateParams& params, Runtime* runtime) = 0;
+  virtual bool Init(const CreateParams& params, const std::string& pool_name,
+                    Runtime* runtime) = 0;
 
   /**
    * Destroy the transport and release resources

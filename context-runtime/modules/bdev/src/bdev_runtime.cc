@@ -75,7 +75,9 @@ chi::TaskResume Runtime::Create(ctp::ipc::FullPtr<CreateTask> task, chi::RunCont
     CLIO_CO_RETURN;
   }
 
-  if (!transport_->Init(params, this)) {
+  // pool_name doubles as the file path (kFile) / S3 bucket (kS3); it lives on
+  // the create task, not in CreateParams.
+  if (!transport_->Init(params, task->pool_name_.str(), this)) {
     HLOG(kError, "Failed to initialize bdev transport");
     task->return_code_ = 2;
     CLIO_CO_RETURN;

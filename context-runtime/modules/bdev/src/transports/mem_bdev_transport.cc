@@ -10,7 +10,8 @@
 
 namespace clio::run::bdev {
 
-bool MemBdevTransport::Init(const CreateParams& params, Runtime* runtime) {
+bool MemBdevTransport::Init(const CreateParams& params,
+                            const std::string& /*pool_name*/, Runtime* runtime) {
   ram_capacity_ = (params.total_size_ == 0) ? DefaultRamCapacityBytes() : params.total_size_;
 
   chi::WorkOrchestrator *work_orchestrator = CLIO_WORK_ORCHESTRATOR;
