@@ -8,7 +8,7 @@
 
 #include <clio_runtime/bdev/transports/bdev_transport.h>
 #include <clio_runtime/bdev/transports/block_allocator.h>
-#include <clio_ctp/posix/async_io_factory.h>
+#include <clio_ctp/io/async_io_factory.h>
 
 namespace clio::run::bdev {
 
