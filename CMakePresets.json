@@ -169,7 +169,8 @@
             "inherits": "release",
             "binaryDir": "${sourceDir}/build-leak",
             "cacheVariables": {
-                "CLIO_CORE_ENABLE_LEAK_CHECK": "ON"
+                "CLIO_CORE_ENABLE_LEAK_CHECK": "ON",
+                "CLIO_CTP_LOG_LEVEL": "3"
             }
         },
         {
