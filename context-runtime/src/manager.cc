@@ -464,6 +464,18 @@ void RuntimeManager::ServerFinalize() {
   auto *work_orchestrator = CLIO_WORK_ORCHESTRATOR;
   auto *ipc_manager = CLIO_IPC;
   work_orchestrator->StopWorkers();
+
+  // Destroy all containers now: the workers are stopped (no concurrent
+  // container access) but the Worker objects, event queues and transports are
+  // still alive, which the ChiMod Destroy methods / coroutine machinery may
+  // touch. Each container runs its Destroy method (releasing module-managed
+  // state — e.g. CTE clears its maps and closes WAL files) and is then deleted
+  // so ~Runtime() frees the rest (bdev RAM pages + fds, the object itself).
+  // Must run before ModuleManager::Finalize() unloads the ChiMod libraries.
+  // Without this the container state leaks until process exit.
+  auto *pool_manager = CLIO_POOL_MANAGER;
+  pool_manager->DestroyAllContainers();
+
   // Reset transports while Worker::EventManager objects are still alive.
   // Transports hold raw EventManager* pointers registered via
   // admin_runtime; Finalize() below destroys the workers that own them.
@@ -471,15 +483,6 @@ void RuntimeManager::ServerFinalize() {
     ipc_manager->ClearTransports();
   }
   work_orchestrator->Finalize();
-
-  // Destroy all containers (runs each ChiMod's ~Runtime via destroy_func) so
-  // their runtime-heap data is freed — CTE metadata maps, bdev RAM pages + file
-  // descriptors, the container objects themselves — instead of leaking until
-  // process exit. Must run while the ChiMod libraries are still loaded (before
-  // ModuleManager::Finalize() unloads them) and after StopWorkers() (no
-  // concurrent container access).
-  auto *pool_manager = CLIO_POOL_MANAGER;
-  pool_manager->DestroyAllContainers();
 
   auto *module_manager = CLIO_MODULE_MANAGER;
   module_manager->Finalize();

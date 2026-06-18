@@ -130,11 +130,20 @@ void PoolManager::DestroyAllContainers() {
   if (!module_manager) {
     return;
   }
-  // Delete every container via its ChiMod's destroy_func so ~Runtime() runs and
-  // frees the module's runtime-heap data. Without this the container objects
-  // (and their maps/buffers/fds) leak until process exit — the leaks papered
-  // over by CI/lsan_suppressions.txt (new_chimod, Container::Init, the CTE/bdev
-  // module allocations, etc.).
+  // Delete every container via its ChiMod's destroy_func, running ~Runtime() so
+  // the module frees its own runtime-heap data: CTE's metadata maps (members),
+  // bdev's RAM pages + file descriptors (~Runtime / CleanupWorkerIOContexts),
+  // and the container object itself. Without this the container state leaks
+  // until process exit — the leaks papered over by CI/lsan_suppressions.txt
+  // (new_chimod, Container::Init, the CTE/bdev module allocations, etc.).
+  //
+  // This runs the C++ destructor only. It does NOT invoke the ChiMod Destroy
+  // *task method* (e.g. CTE's explicit WAL flush + map clear): that is a
+  // coroutine and must be executed by a worker with a fully-initialized
+  // RunContext — driving it inline during finalize jumps through uninitialized
+  // coroutine continuation state and crashes. Running the Destroy method on
+  // shutdown (route it through the workers before StopWorkers) is tracked as a
+  // follow-up in #563.
   size_t destroyed = 0;
   for (auto &pair : pool_metadata_) {
     PoolInfo &info = pair.second;

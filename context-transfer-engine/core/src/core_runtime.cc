@@ -372,6 +372,32 @@ chi::TaskResume Runtime::Create(ctp::ipc::FullPtr<CreateTask> task,
   CLIO_TASK_BODY_END
 }
 
+Runtime::~Runtime() {
+  // Mirror Destroy()'s cleanup so deleting the container on graceful shutdown
+  // frees this module's runtime-heap state (the member containers below are
+  // also RAII, but closing the WAL files explicitly here is the safe, intended
+  // teardown). Destructor-safe: no task/RunContext, no coroutine, no worker
+  // state access.
+  for (auto &log : blob_txn_logs_) {
+    if (log) log->Close();
+  }
+  blob_txn_logs_.clear();
+  for (auto &log : tag_txn_logs_) {
+    if (log) log->Close();
+  }
+  tag_txn_logs_.clear();
+
+  registered_targets_.clear();
+  target_list_.clear();
+  target_name_to_id_.clear();
+  tag_name_to_id_.clear();
+  tag_id_to_info_.clear();
+  tag_blob_name_to_info_.clear();
+  storage_devices_.clear();
+  target_locks_.clear();
+  tag_locks_.clear();
+}
+
 chi::TaskResume Runtime::Destroy(ctp::ipc::FullPtr<DestroyTask> task,
                                  chi::RunContext &ctx) {
 #ifdef __NVCOMPILER
