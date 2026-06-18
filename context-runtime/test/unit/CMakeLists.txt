@@ -1006,11 +1006,15 @@ endif()
 # macOS (issue #482, fixed): the cross-process client/transport tests reach the
 # runtime through a ZeroMQ DEALER->ROUTER handshake (WaitForLocalServer always
 # probes over ZMQ regardless of the test's data mode). libzmq-on-Darwin cannot
-# route a ROUTER reply back to a TCP-loopback DEALER (EHOSTUNREACH), which used
-# to block all of these tests. The local client<->runtime ZMQ now runs over an
-# ipc:// unix socket on macOS (UseLocalZmqIpc(), ipc_manager.cc) -- whose engine
-# routes replies correctly -- including the post-restart DEALER recreate in
-# ReconnectToOriginalHost. So the tests are enabled again on macOS; they keep the
+# route a ROUTER reply back to a connected DEALER cross-process -- not just over
+# TCP loopback but over ipc:// too (the in-process #490 ipc:// workaround did not
+# fix the cross-process case). The client<->runtime control path now uses the
+# non-ZMQ unix-domain SocketTransport on macOS (ClientInit / WaitForLocalServer /
+# ReconnectToOriginalHost in ipc_manager.cc), which is connection-oriented and
+# routes replies over the same fd with no identity routing -- exactly the path
+# the kIpc tests (cr_ipc_transport_ipc, cr_client_retry_*_ipc) already take, and
+# which passes on macOS 14+. ipc_mode_ is unchanged, so SHM mode keeps its
+# shared-memory data path. So the tests are enabled again on macOS; they keep the
 # msan_skip label (multiprocess + uninstrumented libzmq) applied above.
 
 # Custom targets for running specific test categories

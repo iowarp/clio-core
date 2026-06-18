@@ -176,8 +176,20 @@ bool IpcManager::ClientInit() {
     auto *config = CLIO_CONFIG_MANAGER;
     u32 port = config->GetPort();
 
-    if (ipc_mode_ == IpcMode::kIpc) {
-      // IPC mode: Unix domain socket transport
+    if (ipc_mode_ == IpcMode::kIpc || UseLocalZmqIpc()) {
+      // Unix-domain SocketTransport for the client<->runtime control path.
+      //
+      // IPC mode always uses it. On macOS (issue #482) every other local mode
+      // uses it too: the ZMQ ROUTER->DEALER reply path is broken cross-process
+      // on macOS 14+ even over ipc:// (the in-process #490 ipc:// workaround did
+      // not fix the cross-process case -- the daemon receives the request and
+      // the reply reports no error but never reaches the client's DEALER). This
+      // connection-oriented unix socket routes replies back over the same fd
+      // with no identity routing, so it is unaffected; the kIpc transport tests
+      // (cr_ipc_transport_ipc, cr_client_retry_*_ipc) pass on macOS 14+. Only
+      // the control path moves -- ipc_mode_ is unchanged, so SHM mode keeps its
+      // shared-memory data path and the mode assertions still hold.
+      ctp::SystemInfo::EnsureMemfdDir();
       std::string ipc_path =
           ctp::SystemInfo::GetMemfdPath("chimaera_" + std::to_string(port) + ".ipc");
       try {
@@ -188,24 +200,6 @@ bool IpcManager::ClientInit() {
       } catch (const std::exception &e) {
         HLOG(kError,
              "IpcManager::ClientInit: Failed to create IPC transport: {}",
-             e.what());
-        return false;
-      }
-    } else if (UseLocalZmqIpc()) {
-      // macOS (issue #482): keep the ZMQ DEALER but carry it over a local
-      // ipc:// unix socket instead of TCP loopback, which libzmq cannot route
-      // replies over on macOS. Identity routing is unchanged.
-      try {
-        ctp::SystemInfo::EnsureMemfdDir();
-        std::string zmq_ipc = LocalZmqIpcPath(port);
-        zmq_transport_ = ctp::lbm::TransportFactory::Get(
-            zmq_ipc, ctp::lbm::TransportType::kZeroMq,
-            ctp::lbm::TransportMode::kClient, "ipc", 0);
-        HLOG(kInfo, "IpcManager: DEALER transport connected over ipc {}",
-             zmq_ipc);
-      } catch (const std::exception &e) {
-        HLOG(kError,
-             "IpcManager::ClientInit: Failed to create ipc DEALER transport: {}",
              e.what());
         return false;
       }
@@ -912,12 +906,13 @@ retry_attempt:
       }
       try {
         if (UseLocalZmqIpc()) {
-          // Mirror ClientInit: recreate the DEALER over the local ipc://
-          // endpoint on macOS (issue #482).
+          // Mirror ClientInit: on macOS the local control path uses the unix
+          // SocketTransport (not ZMQ), so recreate it the same way (issue #482).
           ctp::SystemInfo::EnsureMemfdDir();
-          std::string zmq_ipc = LocalZmqIpcPath(port);
+          std::string ipc_path = ctp::SystemInfo::GetMemfdPath(
+              "chimaera_" + std::to_string(port) + ".ipc");
           zmq_transport_ = ctp::lbm::TransportFactory::Get(
-              zmq_ipc, ctp::lbm::TransportType::kZeroMq,
+              ipc_path, ctp::lbm::TransportType::kSocket,
               ctp::lbm::TransportMode::kClient, "ipc", 0);
         } else {
           zmq_transport_ = ctp::lbm::TransportFactory::Get(
@@ -2184,14 +2179,16 @@ bool IpcManager::ReconnectToOriginalHost() {
     }
     try {
       if (UseLocalZmqIpc()) {
-        // macOS (issue #482): the original DEALER was carried over the local
-        // ipc:// endpoint (ClientInit / WaitForLocalServer do the same). A TCP
+        // macOS (issue #482): the original control transport was the unix
+        // SocketTransport (ClientInit / WaitForLocalServer do the same). A ZMQ
         // DEALER here cannot receive the restarted server's ROUTER reply on
-        // macOS, so the reconnect would time out forever. Recreate over ipc://.
+        // macOS 14+, so the reconnect would time out forever. Recreate the
+        // SocketTransport against the restarted daemon's IPC endpoint.
         ctp::SystemInfo::EnsureMemfdDir();
-        std::string zmq_ipc = LocalZmqIpcPath(port);
+        std::string ipc_path = ctp::SystemInfo::GetMemfdPath(
+            "chimaera_" + std::to_string(port) + ".ipc");
         zmq_transport_ = ctp::lbm::TransportFactory::Get(
-            zmq_ipc, ctp::lbm::TransportType::kZeroMq,
+            ipc_path, ctp::lbm::TransportType::kSocket,
             ctp::lbm::TransportMode::kClient, "ipc", 0);
       } else {
         zmq_transport_ = ctp::lbm::TransportFactory::Get(
