@@ -47,7 +47,9 @@
 #endif
 // LCOV_EXCL_STOP
 #include <cstdlib>
+#include <cstdio>
 #include <string>
+#include <iterator>
 
 #include "clio_ctp/constants/macros.h"
 // MSan: inform sanitizer that mmap-backed memory is initialized by the kernel
