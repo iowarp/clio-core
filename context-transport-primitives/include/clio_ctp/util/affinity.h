@@ -39,7 +39,16 @@
 // macOS exposes no equivalent in libpthread; Windows uses a different
 // API entirely. Both compile this class out — no current call site
 // needs it on those platforms.
-#ifdef __linux__
+//
+// It is also excluded from NVCC's device front-end (cudafe++): the class
+// is pure host code with no device call site, and cudafe++ in the CUDA
+// 12.x toolchain hits an internal error ("find_allocated_name_reference"
+// in lexical.c) when instantiating std::vector<cpu_set_t>'s destructor
+// (the ~cpu_set_t() pseudo-destructor). __CUDACC__ is defined for both
+// the host and device passes of nvcc, so this keeps the header out of
+// every CUDA translation unit that pulls it in transitively via
+// clio_ctp.h, while leaving it intact for ordinary host compilers.
+#if defined(__linux__) && !defined(__CUDACC__)
 
 // Reference:
 // https://stackoverflow.com/questions/63372288/getting-list-of-pids-from-proc-in-linux
@@ -196,6 +205,6 @@ class ProcessAffiner {
 
 }  // namespace ctp
 
-#endif  // __linux__
+#endif  // __linux__ && !__CUDACC__
 
 #endif  // CTP_SHM_AFFINITY_H
