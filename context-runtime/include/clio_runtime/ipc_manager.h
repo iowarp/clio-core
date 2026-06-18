@@ -879,6 +879,17 @@ class IpcManager {
    */
   bool IsLeader() const;
 
+  /**
+   * Get the neighborhood leader for a given node: the lowest alive node_id in
+   * the window [base, base + N), base = floor(for_node / N) * N, N =
+   * GetNeighborhoodSize(). Used by ManyToOne routing. Deterministic across the
+   * neighborhood; falls back to for_node if no other alive members.
+   */
+  u64 GetNeighborhoodLeaderNodeId(u64 for_node) const;
+
+  /** Neighborhood leader for this node (GetNeighborhoodLeaderNodeId(self)). */
+  u64 GetNeighborhoodLeaderNodeId() const;
+
   struct DeadNodeEntry {
     u64 node_id;
     std::chrono::steady_clock::time_point detected_at;

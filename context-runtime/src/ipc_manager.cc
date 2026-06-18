@@ -1199,6 +1199,32 @@ u64 IpcManager::GetLeaderNodeId() const {
 
 bool IpcManager::IsLeader() const { return GetNodeId() == GetLeaderNodeId(); }
 
+u64 IpcManager::GetNeighborhoodLeaderNodeId(u64 for_node) const {
+  // The neighborhood is the window [base, base + N) where N is the configured
+  // neighborhood size and base = floor(for_node / N) * N. The leader is the
+  // lowest *alive* node in that window. Computed from local SWIM membership,
+  // so every node in the neighborhood agrees deterministically. Falls back to
+  // for_node itself if the window has no other alive members.
+  u32 n = CLIO_CONFIG_MANAGER->GetNeighborhoodSize();
+  if (n == 0) {
+    n = 1;
+  }
+  u64 base = (for_node / n) * n;
+  u64 end = base + n;
+  u64 leader = std::numeric_limits<u64>::max();
+  for (const auto &[id, host] : hostfile_map_) {
+    if (host.state == NodeState::kAlive && host.node_id >= base &&
+        host.node_id < end && host.node_id < leader) {
+      leader = host.node_id;
+    }
+  }
+  return (leader == std::numeric_limits<u64>::max()) ? for_node : leader;
+}
+
+u64 IpcManager::GetNeighborhoodLeaderNodeId() const {
+  return GetNeighborhoodLeaderNodeId(GetNodeId());
+}
+
 u64 IpcManager::AddNode(const std::string &ip_address, u32 port) {
   (void)port;  // Port stored elsewhere (ConfigManager) for now
 
@@ -2778,8 +2804,10 @@ bool IpcManager::IsTaskLocal(const FullPtr<Task> & /*task_ptr*/,
     case RoutingMode::DirectHash:
     case RoutingMode::Range:
     case RoutingMode::Broadcast:
-      // These modes should have been resolved to Physical queries by now
-      // If we still see them here, they are not local
+    case RoutingMode::ManyToOne:
+      // These modes should have been resolved (ManyToOne → Local on the
+      // neighborhood leader, else Physical) by now. If we still see them
+      // here, they are not local.
       return false;
 
     case RoutingMode::ToLocalCpu:
