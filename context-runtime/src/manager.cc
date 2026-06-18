@@ -471,11 +471,20 @@ void RuntimeManager::ServerFinalize() {
     ipc_manager->ClearTransports();
   }
   work_orchestrator->Finalize();
+
+  // Destroy all containers (runs each ChiMod's ~Runtime via destroy_func) so
+  // their runtime-heap data is freed — CTE metadata maps, bdev RAM pages + file
+  // descriptors, the container objects themselves — instead of leaking until
+  // process exit. Must run while the ChiMod libraries are still loaded (before
+  // ModuleManager::Finalize() unloads them) and after StopWorkers() (no
+  // concurrent container access).
+  auto *pool_manager = CLIO_POOL_MANAGER;
+  pool_manager->DestroyAllContainers();
+
   auto *module_manager = CLIO_MODULE_MANAGER;
   module_manager->Finalize();
 
-  // Finalize shared components
-  auto *pool_manager = CLIO_POOL_MANAGER;
+  // Finalize shared components (metadata-only now that containers are gone)
   pool_manager->Finalize();
 
   // Reap all shared memory segments before finalizing IPC

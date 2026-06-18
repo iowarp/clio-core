@@ -122,12 +122,46 @@ bool PoolManager::ServerInit() {
   return true;
 }
 
+void PoolManager::DestroyAllContainers() {
+  if (!is_initialized_) {
+    return;
+  }
+  auto *module_manager = CLIO_MODULE_MANAGER;
+  if (!module_manager) {
+    return;
+  }
+  // Delete every container via its ChiMod's destroy_func so ~Runtime() runs and
+  // frees the module's runtime-heap data. Without this the container objects
+  // (and their maps/buffers/fds) leak until process exit — the leaks papered
+  // over by CI/lsan_suppressions.txt (new_chimod, Container::Init, the CTE/bdev
+  // module allocations, etc.).
+  size_t destroyed = 0;
+  for (auto &pair : pool_metadata_) {
+    PoolInfo &info = pair.second;
+    for (auto &cpair : info.containers_) {
+      if (cpair.second) {
+        module_manager->DestroyContainer(info.chimod_name_, cpair.second);
+        ++destroyed;
+      }
+    }
+    info.containers_.clear();
+    info.static_container_ = nullptr;
+    info.local_container_ = nullptr;
+  }
+  if (destroyed > 0) {
+    HLOG(kInfo, "PoolManager: Destroyed {} container(s) on shutdown", destroyed);
+  }
+}
+
 void PoolManager::Finalize() {
   if (!is_initialized_) {
     return;
   }
 
-  // Clear all containers in each PoolInfo, then clear metadata
+  // Clear all containers in each PoolInfo, then clear metadata. Container
+  // objects are deleted earlier by DestroyAllContainers() (while ChiMod
+  // libraries are still loaded); by the time Finalize() runs the maps may
+  // already be empty, so this is a safe metadata-only clear.
   for (auto &pair : pool_metadata_) {
     pair.second.containers_.clear();
     pair.second.static_container_ = nullptr;
