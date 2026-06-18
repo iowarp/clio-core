@@ -6,7 +6,7 @@ on:
     paths:
       - 'installers/spack/**'
   pull_request:
-    branches: [main]
+    branches: [main, dev]
     paths:
       - 'installers/spack/**'
   workflow_dispatch:
