@@ -147,4 +147,21 @@ if(BUILD_TESTING)
         ENVIRONMENT "CHI_WITH_RUNTIME=1;CLIO_BIND_ADDR=127.0.0.1"
         DEPENDS clio_cte_core_ext
     )
+
+    # GetBlob binary round-trip — regression guard for the nb::bytes return
+    # type (a std::string return decoded non-UTF-8 blob data and raised
+    # UnicodeDecodeError).
+    add_test(
+        NAME python_getblob_bytes_test
+        COMMAND ${Python_EXECUTABLE} -I ${CMAKE_CURRENT_SOURCE_DIR}/test_cte_getblob_bytes.py
+        WORKING_DIRECTORY $<TARGET_FILE_DIR:clio_cte_core_ext>
+    )
+    set_tests_properties(
+        python_getblob_bytes_test
+        PROPERTIES
+        LABELS "python;bindings;getblob"
+        TIMEOUT 120
+        ENVIRONMENT "CHI_WITH_RUNTIME=1;CLIO_BIND_ADDR=127.0.0.1"
+        DEPENDS clio_cte_core_ext
+    )
 endif()
