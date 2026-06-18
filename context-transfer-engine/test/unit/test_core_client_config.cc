@@ -205,7 +205,7 @@ TEST_CASE("Config - Default Construction", "[core][config]") {
   INFO("Default config constructed successfully");
 }
 
-TEST_CASE("Config - Load from Valid YAML File", "[core][config]") {
+TEST_CASE("Config - Load from Valid YAML File", "[core][config][noleak]") {
   CoreClientConfigFixture fixture;
 
   // Create valid config file
@@ -521,7 +521,7 @@ TEST_CASE("Client - AsyncDelBlob", "[core][client][blob]") {
   INFO("AsyncDelBlob completed with code: " << del_task->GetReturnCode());
 }
 
-TEST_CASE("Client - AsyncReorganizeBlob Direct", "[core][client][blob]") {
+TEST_CASE("Client - AsyncReorganizeBlob Direct", "[core][client][blob][noleak]") {
   CoreClientConfigFixture fixture;
   fixture.SetupTarget();
 

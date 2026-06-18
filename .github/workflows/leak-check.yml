@@ -48,11 +48,15 @@ jobs:
         cmake --build build-leak -j"$(nproc)"
         # In a leak-tracking build every test is auto-checked by the framework
         # (simple_test.h): each test must return the runtime private heap to its
-        # pre-test level or it fails. We run the calibrated streaming suite under
-        # force-net (cr_streaming_force_net = all streaming cases auto-checked)
-        # plus the dedicated high-sensitivity per-RPC test (cr_streaming_leak_*).
+        # pre-test level or it fails. We run the calibrated force-net suites —
+        # all cases auto-checked — plus the dedicated high-sensitivity per-RPC
+        # test (cr_streaming_leak_*):
+        #   * cr_streaming_force_net  : runtime streaming RPC path
+        #   * cte_.*force_net         : CTE blob/tag/query/reorganize paths
+        # Tests that intentionally retain runtime-heap memory (durable blobs/
+        # tags, one-time runtime init) are tagged [noleak] in their source.
         # --no-tests=error so the job fails loudly if the filter ever matches
         # nothing instead of silently passing.
         ctest --test-dir build-leak \
-          -R "leak|cr_streaming_force_net" \
+          -R "leak|cr_streaming_force_net|cte_.*force_net" \
           --output-on-failure --no-tests=error

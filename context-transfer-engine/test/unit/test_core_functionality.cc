@@ -618,7 +618,7 @@ TEST_CASE("FUNCTIONAL - Register Target", "[cte][core][target][registration]") {
  * 8. Error cases with real error handling
  */
 TEST_CASE("FUNCTIONAL - PutBlob Operations",
-          "[cte][core][blob][put][functional]") {
+          "[cte][core][blob][put][functional][noleak]") {
   auto *fixture = ctp::Singleton<CTECoreFunctionalTestFixture>::
       GetInstance();  // Setup: Create core pool and register target
   chi::PoolQuery pool_query = chi::PoolQuery::Dynamic();
@@ -891,7 +891,7 @@ TEST_CASE("FUNCTIONAL - PutBlob Operations",
  * 7. Cross-validation with previously stored blobs
  */
 TEST_CASE("FUNCTIONAL - GetBlob Operations",
-          "[cte][core][blob][get][functional]") {
+          "[cte][core][blob][get][functional][noleak]") {
   auto *fixture = ctp::Singleton<CTECoreFunctionalTestFixture>::
       GetInstance();  // Setup: Create core pool, register target, create tag
   chi::PoolQuery pool_query = chi::PoolQuery::Dynamic();
@@ -1280,7 +1280,7 @@ TEST_CASE("FUNCTIONAL - GetBlob Operations",
  * 7. Ensure proper cleanup and resource management
  */
 TEST_CASE("FUNCTIONAL - PutBlob-GetBlob Integration Cycles",
-          "[cte][core][blob][integration][put-get]") {
+          "[cte][core][blob][integration][put-get][noleak]") {
   auto *fixture = ctp::Singleton<CTECoreFunctionalTestFixture>::
       GetInstance();  // Setup: Create core pool and register target
   chi::PoolQuery pool_query = chi::PoolQuery::Dynamic();
@@ -1794,7 +1794,7 @@ TEST_CASE("FUNCTIONAL - PutBlob-GetBlob Integration Cycles",
  * - Test should FAIL if data doesn't match exactly
  */
 TEST_CASE("FUNCTIONAL - PutBlob-GetBlob Comprehensive Integration",
-          "[cte][core][blob][integration][put-get][comprehensive]") {
+          "[cte][core][blob][integration][put-get][comprehensive][noleak]") {
   auto *fixture = ctp::Singleton<CTECoreFunctionalTestFixture>::GetInstance();
   INFO("=== COMPREHENSIVE PutBlob-GetBlob Integration Test ===");
 
@@ -1954,7 +1954,7 @@ TEST_CASE("FUNCTIONAL - PutBlob-GetBlob Comprehensive Integration",
  * - Test processing multiple blobs (updated from batch API to per-blob API)
  */
 TEST_CASE("FUNCTIONAL - ReorganizeBlob Operations",
-          "[cte][core][blob][reorganize][functional]") {
+          "[cte][core][blob][reorganize][functional][noleak]") {
   auto *fixture = ctp::Singleton<CTECoreFunctionalTestFixture>::GetInstance();
   INFO("=== FUNCTIONAL ReorganizeBlob Test ===");
 
@@ -2334,7 +2334,7 @@ TEST_CASE("End-to-End CTE Core Workflow", "[cte][core][integration]") {
  * - CTE_NUM_NODES: Number of nodes in the distributed system (default: 1)
  */
 TEST_CASE("FUNCTIONAL - Distributed Execution Validation",
-          "[cte][core][distributed][validation]") {
+          "[cte][core][distributed][validation][noleak]") {
   auto *fixture = ctp::Singleton<CTECoreFunctionalTestFixture>::
       GetInstance();  // Parse number of nodes from environment variable
   int num_nodes = 1;
