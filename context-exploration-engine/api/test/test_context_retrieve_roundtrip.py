@@ -77,7 +77,7 @@ def _generate_config():
 
 
 def start_runtime():
-    """Start an in-process IOWarp runtime. Returns True if ready."""
+    """Start an in-process IOWarp runtime with a storage target. Returns True."""
     _setup_environment_paths()
     config_path = _generate_config()
 
@@ -88,6 +88,21 @@ def start_runtime():
     time.sleep(0.5)  # let the runtime finish coming up
     if hasattr(cte, "initialize_cte"):
         cte.initialize_cte(config_path, cte.PoolQuery.Dynamic())
+
+    # Register a storage target so context_bundle's PutBlob has somewhere to
+    # land. The in-process runtime starts with no devices, so without this the
+    # assimilator fails with "Failed to store description" (return_code 11).
+    client = cte.get_cte_client()
+    storage_dir = tempfile.mkdtemp(prefix="iowarp_store_")
+    target_path = os.path.join(storage_dir, "cee_roundtrip_target")
+    try:
+        client.RegisterTarget(target_path, cte.BdevType.kFile,
+                              1024 * 1024 * 1024, cte.PoolQuery.Local(),
+                              cte.PoolId(700, 0))
+    except TypeError:
+        # RegisterTarget's binding returns a std::atomic nanobind can't convert
+        # to a Python type; the registration side-effect still completes.
+        pass
     return True
 
 
