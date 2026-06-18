@@ -79,6 +79,16 @@ class RuntimeManager {
   void ServerFinalize();
 
   /**
+   * Graceful-shutdown drain: wait (bounded) for all in-flight non-periodic
+   * tasks to complete and the cross-node/client net queues to empty before the
+   * workers are stopped and containers torn down. Periodic tasks are excluded
+   * from the work count (see Worker::StartCoroutine), so this converges instead
+   * of spinning on monitoring tasks. Called at the start of ServerFinalize.
+   * @param timeout_ms hard cap; logs and returns if work hasn't drained by then
+   */
+  void DrainPendingTasks(u64 timeout_ms = 5000);
+
+  /**
    * Check if CLIO Runtime is initialized
    * @return true if initialized, false otherwise
    */

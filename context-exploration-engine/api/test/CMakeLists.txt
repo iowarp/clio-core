@@ -158,10 +158,12 @@ if(TARGET clio_cee)
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
   )
 
+  # Self-contained: the test starts an in-process runtime via
+  # clio_cte_core_ext.chimaera_init(kClient, True), so it no longer needs an
+  # externally running IOWarp daemon and is enabled by default.
   set_tests_properties(cee_python_retrieve_roundtrip PROPERTIES
-    LABELS "cee;api;python;retrieve;regression;manual"
+    LABELS "cee;api;python;retrieve;regression;msan_skip"
     TIMEOUT 120
-    DISABLED TRUE  # Requires externally running IOWarp runtime
   )
 
   install(FILES test_context_retrieve_roundtrip.py
@@ -182,3 +184,4 @@ endif()
 set_tests_properties(test_context_bundle PROPERTIES LABELS "cee;api;bundle;msan_skip")
 set_tests_properties(test_context_query PROPERTIES LABELS "cee;api;query;msan_skip")
 set_tests_properties(test_context_destroy PROPERTIES LABELS "cee;api;destroy;msan_skip")
+set_tests_properties(test_context_query_modes PROPERTIES LABELS "cee;api;query;modes;msan_skip")

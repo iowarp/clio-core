@@ -65,7 +65,12 @@ public:
   using CreateParams = clio::cte::core::CreateParams; // Required for CLIO_TASK_CC
 
   Runtime() = default;
-  ~Runtime() override = default;
+  // Virtual destructor performs the same metadata/WAL cleanup as the Destroy()
+  // method, so deleting the container on graceful shutdown (PoolManager::
+  // DestroyAllContainers) frees this module's runtime-heap state — closing the
+  // WAL files and clearing the tag/blob/target maps — instead of leaking it
+  // until process exit.
+  ~Runtime() override;
 
   /**
    * Fix up POD task members (chi::priv::string SSO data_ pointers,

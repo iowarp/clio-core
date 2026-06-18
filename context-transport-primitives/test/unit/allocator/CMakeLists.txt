@@ -127,7 +127,11 @@ set_tests_properties(
   ctp_mp_allocator_multiprocess
   ctp_buddy_allocator_multiprocess
   PROPERTIES
-    TIMEOUT 15
+    # 3 ranks x 2 threads each run a 5s contended alloc/free workload (rank 0
+    # leads by a 2s stagger), so a healthy run is ~11-12s on macOS once the
+    # ticket lock's backoff serializes the global allocator. 15s left almost no
+    # CI headroom; 60s keeps it comfortably non-flaky.
+    TIMEOUT 60
     ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}"
 )
 
@@ -144,14 +148,14 @@ set_tests_properties(
   PROPERTIES LABELS "msan_skip"
 )
 
-# macOS: ctp_mp_allocator_multiprocess deadlocks (15s timeout) inside the
-# shared-memory ProducerConsumerAllocator under cross-process contention --
-# a lock-free/atomics-on-shm issue specific to macOS (the per-thread workload
-# has a hard steady_clock deadline so it cannot itself overrun). Disabled on
-# macOS pending the real fix; tracked in issue #483. Linux is unaffected.
-if(APPLE)
-  set_tests_properties(ctp_mp_allocator_multiprocess PROPERTIES DISABLED TRUE)
-endif()
+# macOS (issue #483, fixed): ctp_mp_allocator_multiprocess used to livelock
+# under cross-process contention on the shared-memory ProducerConsumerAllocator.
+# Its global ticket lock (ctp::Mutex) busy-spun with only a PAUSE hint, and the
+# macOS scheduler would not preempt a spinning waiter to run the descheduled
+# lock holder -- starving the holder for the full 15s timeout. The ticket lock's
+# Backoff now additionally deschedules the OS thread (std::this_thread::sleep_for)
+# once contention is sustained, so the holder makes progress. The test passes on
+# macOS again and is enabled (it keeps the bumped timeout above for headroom).
 endif()
 
 #------------------------------------------------------------------------------

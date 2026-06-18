@@ -36,3 +36,7 @@ if(CLIO_CORE_ENABLE_CUDA OR CLIO_CORE_ENABLE_ROCM OR CLIO_CORE_ENABLE_SYCL)
 endif()
 
 add_subdirectory(lightbeam)
+
+if(CLIO_ENABLE_AMAZON_DRIVE)
+    add_subdirectory(amazon_s3)
+endif()

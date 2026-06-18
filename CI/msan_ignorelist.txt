@@ -103,7 +103,12 @@ fun:*basic_string*_S_copy*
 
 # ctp::Logger and ctp::Formatter use std::stringstream / std::ostream;
 # the stringstream internal buffer is filled by uninstrumented libstdc++, causing
-# false-positive "uninitialized" reports on every log message
+# false-positive "uninitialized" reports on every log message.
+# NOTE: the namespace was renamed hshm -> ctp; match both so the suppression keeps
+# working regardless of which mangled name the compiler emits.
+fun:*ctp*Logger*Log*
+fun:*ctp*Logger*Print*
+fun:*ctp*Formatter*format*
 fun:*hshm*Logger*Log*
 fun:*hshm*Logger*Print*
 fun:*hshm*Formatter*format*

@@ -834,7 +834,11 @@ set_tests_properties(
     cte_transaction_log_all
     PROPERTIES
         TIMEOUT 120
-        LABELS "unit;core;cte"
+        # msan_skip: persists records through std::ofstream and reads them back
+        # via std::ifstream (both in the uninstrumented libstdc++.so), and prints
+        # counts through SimpleTest::print_summary (uninstrumented libstdc++
+        # ostream). All reported reads are third-party false positives.
+        LABELS "unit;core;cte;msan_skip"
         ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1"
 )
 
@@ -863,7 +867,11 @@ set_tests_properties(
     cte_gpu_metadata_cache_all
     PROPERTIES
         TIMEOUT 120
-        LABELS "unit;core;cte"
+        # msan_skip: prints test counts through SimpleTest::print_summary, whose
+        # std::ostream number formatting lives in the uninstrumented libstdc++.so
+        # (std::num_put / std::ctype widening) — unfixable third-party false
+        # positives.
+        LABELS "unit;core;cte;msan_skip"
         ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1"
 )
 
@@ -892,6 +900,11 @@ set_tests_properties(
     cte_config_errors_all
     PROPERTIES
         TIMEOUT 120
-        LABELS "unit;core;cte"
+        # msan_skip: exercises config validation that reads files via
+        # std::ifstream and parses with std::isspace/std::tolower (locale facets),
+        # all in the uninstrumented libstdc++.so, then prints counts through
+        # SimpleTest::print_summary. Reported reads are third-party false
+        # positives.
+        LABELS "unit;core;cte;msan_skip"
         ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1"
 )

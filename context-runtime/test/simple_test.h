@@ -45,7 +45,46 @@
 #include <exception>
 #include <sstream>
 
+#ifdef CTP_ALLOC_TRACK_SIZE
+#include <chrono>
+#include <thread>
+#include "clio_ctp/memory/allocator/malloc_allocator.h"
+#endif
+
 namespace SimpleTest {
+
+#ifdef CTP_ALLOC_TRACK_SIZE
+// Automatic per-test leak checking. Only compiled in leak-tracking builds
+// (-DCLIO_CORE_ENABLE_LEAK_CHECK=ON, which defines CTP_ALLOC_TRACK_SIZE), so
+// normal builds are completely unaffected. Each test must return the runtime
+// private heap (CTP_MALLOC — where AllocateBuffer/NewObj draw from) to where it
+// started; an unfreed allocation (e.g. the #560/#563 FutureShm leaks) fails the
+// test. See run_all_tests() for the first-test/[noleak] exemptions.
+namespace detail {
+// Slack for incidental per-test allocations and measurement jitter. The
+// dedicated amplifying leak test (many RPCs in one case) catches sub-threshold
+// per-operation leaks that this coarse per-test gate would miss.
+inline constexpr size_t kLeakToleranceBytes = 4096;
+
+inline size_t RuntimeHeapBytes() {
+  return CTP_MALLOC->GetCurrentlyAllocatedSize();
+}
+
+// Poll until the runtime private-heap usage stops changing (so async server-side
+// frees — which can lag the client's Wait() — have settled) or a short bound
+// elapses. Returns early once stable, so the common case costs ~20 ms.
+inline size_t StabilizeRuntimeHeap() {
+  size_t prev = RuntimeHeapBytes();
+  for (int i = 0; i < 50; ++i) {  // up to ~0.5 s
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    size_t cur = RuntimeHeapBytes();
+    if (cur == prev) return cur;
+    prev = cur;
+  }
+  return prev;
+}
+}  // namespace detail
+#endif  // CTP_ALLOC_TRACK_SIZE
 
 // Test statistics
 struct TestStats {
@@ -207,6 +246,9 @@ inline int run_all_tests(const std::string& filter = "") {
         std::cout << "Running " << tests.size() << " test(s)..." << std::endl;
     }
 
+#ifdef CTP_ALLOC_TRACK_SIZE
+    int executed_count = 0;
+#endif
     for (const auto& test : tests) {
         // Skip tests that don't match filter
         if (!matches_filter(test.first, filter)) {
@@ -219,8 +261,38 @@ inline int run_all_tests(const std::string& filter = "") {
 
         std::cout << "\n[TEST] " << test.first << std::endl;
 
+#ifdef CTP_ALLOC_TRACK_SIZE
+        // Leak-check every test except:
+        //  - the first executed test, during which lazy one-time runtime init
+        //    (CHIMAERA_INIT in a fixture) allocates process-lifetime state that
+        //    is legitimate, not a leak; and
+        //  - tests tagged [noleak], which intentionally retain runtime-heap
+        //    memory (analogous to the LSan suppressions list).
+        const bool leak_check =
+            executed_count > 0 &&
+            test.first.find("[noleak]") == std::string::npos;
+        const size_t heap_before =
+            leak_check ? detail::StabilizeRuntimeHeap() : 0;
+        ++executed_count;
+#endif
+
         try {
             test.second();
+#ifdef CTP_ALLOC_TRACK_SIZE
+            if (leak_check) {
+                const size_t heap_after = detail::StabilizeRuntimeHeap();
+                if (heap_after > heap_before + detail::kLeakToleranceBytes) {
+                    std::ostringstream oss;
+                    oss << "Runtime-heap leak in test '" << test.first << "': "
+                        << (heap_after - heap_before)
+                        << " bytes still allocated after the test (before="
+                        << heap_before << ", after=" << heap_after
+                        << "). If this memory is intentionally retained for the "
+                           "process lifetime, tag the test [noleak].";
+                    throw TestFailure(oss.str());
+                }
+            }
+#endif
             g_stats.passed_tests++;
             std::cout << "  [PASS] " << test.first << std::endl;
         } catch (const TestFailure& e) {

@@ -328,7 +328,7 @@ TEST_CASE("Tag - PutBlob SHM Version", "[cte][tag][putblob]") {
   INFO("PutBlob SHM version completed");
 }
 
-TEST_CASE("Tag - PutBlob Multiple Blobs", "[cte][tag][putblob]") {
+TEST_CASE("Tag - PutBlob Multiple Blobs", "[cte][tag][putblob][noleak]") {
   TagTestFixture fixture;
   fixture.SetupCTEWithTarget();
 
@@ -567,7 +567,7 @@ TEST_CASE("Tag - ReorganizeBlob Basic", "[cte][tag][reorganize]") {
   REQUIRE(new_score == 0.8f);
 }
 
-TEST_CASE("Tag - ReorganizeBlob Multiple Times", "[cte][tag][reorganize]") {
+TEST_CASE("Tag - ReorganizeBlob Multiple Times", "[cte][tag][reorganize][noleak]") {
   TagTestFixture fixture;
   fixture.SetupCTEWithTarget();
 

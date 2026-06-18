@@ -1,0 +1,72 @@
+name: Leak Check
+
+# Gating allocation-leak detection. Unlike the Sanitizers job (LeakSanitizer
+# under CDash, non-gating and broadly suppressed), this builds with
+# CLIO_CORE_ENABLE_LEAK_CHECK=ON (defines CTP_ALLOC_TRACK_SIZE) and runs the
+# force-net leak test, which asserts per-RPC runtime-heap growth stays ~0. A
+# regression (e.g. an unfreed FutureShm — see #560/#563) fails the build.
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+  workflow_dispatch:
+
+jobs:
+  leak-check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v5
+      with:
+        submodules: recursive
+
+    - name: Install system libraries
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libhdf5-dev liburing-dev
+
+    - name: Install dependencies (conda env)
+      run: |
+        chmod +x install.sh
+        ./install.sh --only-deps
+
+    - name: Build with leak tracking and run leak tests
+      run: |
+        # Activate the conda env that install.sh provisioned.
+        if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
+          source "$HOME/miniconda3/etc/profile.d/conda.sh"
+        elif [ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]; then
+          source "$HOME/anaconda3/etc/profile.d/conda.sh"
+        elif command -v conda &>/dev/null; then
+          eval "$(conda shell.bash hook)"
+        fi
+        conda activate iowarp
+        cmake --preset=leak-check
+        cmake --build build-leak -j"$(nproc)"
+        # In a leak-tracking build every test is auto-checked by the framework
+        # (simple_test.h): each test must return the runtime private heap to its
+        # pre-test level or it fails. We run the calibrated force-net suites —
+        # all cases auto-checked — plus the dedicated high-sensitivity per-RPC
+        # test (cr_streaming_leak_*):
+        #   * cr_streaming_force_net  : runtime streaming RPC path
+        #   * cte_.*force_net         : CTE blob/tag/query/reorganize paths
+        # Tests that intentionally retain runtime-heap memory (durable blobs/
+        # tags, one-time runtime init) are tagged [noleak] in their source.
+        #
+        # cte_tag_force_net / cte_query_force_net are excluded: they hang in CI
+        # at the reorganize path (#579) — a PRE-EXISTING, non-leak issue that is
+        # CI-only (they pass in ~6s locally). Confirmed it persists across main's
+        # #572 and the dev bdev refactor + NIXL fix, so it is independent of this
+        # PR. Re-add them once #579 is fixed (#580). Everything else — streaming
+        # (incl. the per-RPC leak test and the AllocateBuffer/NewTask detector
+        # positive-controls) and the rest of the CTE force-net suite — is gated.
+        #
+        # --no-tests=error so the job fails loudly if the filter ever matches
+        # nothing instead of silently passing.
+        ctest --test-dir build-leak \
+          -R "leak|cr_streaming_force_net|cte_.*force_net" \
+          -E "cte_tag_force_net|cte_query_force_net" \
+          --output-on-failure --no-tests=error
