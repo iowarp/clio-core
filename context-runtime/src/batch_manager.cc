@@ -94,8 +94,11 @@ void BatchManager::BuildAndSubmit(Worker * /*worker*/, const GroupKey &key,
          key.pool_id, key.method);
     return;
   }
+  // Combine each remaining member's INPUTS into the aggregate (AggregateIn).
+  // Default is a no-op, so without a chimod override the aggregate is simply a
+  // copy of the first member (barrier/dedup collective).
   for (size_t i = 1; i < group.members.size(); ++i) {
-    container->Aggregate(key.method, agg, group.members[i]);
+    container->AggregateIn(key.method, agg, group.members[i]);
   }
 
   // Run the aggregate locally on the leader as a fresh, self-owned task.

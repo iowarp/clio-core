@@ -487,7 +487,11 @@ class Container {
   CTP_DLL virtual ctp::ipc::FullPtr<Task> NewTask(u32 method) = 0;
 
   /**
-   * Aggregate replica results into origin task via Container dispatch
+   * Aggregate replica OUTPUTS into the origin task via Container dispatch
+   * (a.k.a. AggregateOut). This is the existing output-merge semantics: every
+   * chimod's per-task Aggregate() merges OUT fields of a replica into the
+   * origin (used by the replica/gather path in RecvOutAggregate and by the
+   * ManyToOne result broadcast).
    * Replaces virtual Task::Aggregate to avoid vtable on Task
    * @param method The method ID for proper task type casting
    * @param orig_task The origin task to aggregate into
@@ -495,6 +499,31 @@ class Container {
    */
   virtual void Aggregate(u32 method, ctp::ipc::FullPtr<Task> orig_task,
                           const ctp::ipc::FullPtr<Task>& replica_task) = 0;
+
+  /** Alias spelling out the direction of Aggregate() — merges OUT fields. */
+  void AggregateOut(u32 method, ctp::ipc::FullPtr<Task> orig_task,
+                    const ctp::ipc::FullPtr<Task>& replica_task) {
+    Aggregate(method, orig_task, replica_task);
+  }
+
+  /**
+   * Aggregate member INPUTS into a collective aggregate task (ManyToOne).
+   * Combines the IN fields of a batched member into the synthetic aggregate
+   * task that will run once for the whole batch. Distinct from Aggregate
+   * (AggregateOut), which merges OUT fields. Default is a no-op: with no
+   * override the aggregate runs as a copy of the first member (e.g. a barrier
+   * / dedup collective). Chimods whose collective combines inputs (sum, max,
+   * concat, ...) override this. Dispatched per method by the chimod.
+   * @param method The method ID for proper task type casting
+   * @param agg_task The synthetic aggregate task to combine into
+   * @param member_task A batched member whose inputs are folded in
+   */
+  virtual void AggregateIn(u32 method, ctp::ipc::FullPtr<Task> agg_task,
+                           const ctp::ipc::FullPtr<Task>& member_task) {
+    (void)method;
+    (void)agg_task;
+    (void)member_task;
+  }
 
   /**
    * Delete a task via Container dispatch with proper type casting
