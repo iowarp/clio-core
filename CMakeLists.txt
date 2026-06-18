@@ -40,6 +40,11 @@ option(CLIO_CORE_ENABLE_CEE "Enable context-exploration-engine component" ON)
 option(CLIO_CORE_ENABLE_TESTS "Master switch: Enable testing for all components" OFF)
 option(CLIO_CORE_ENABLE_BENCHMARKS "Master switch: Enable benchmarks for all components" ON)
 option(CLIO_CORE_ENABLE_PYTHON "Enable Python bindings for all components" OFF)
+# The context visualizer is pure Python (no compilation), so it ships as a
+# standard feature in every package — independent of the heavyweight nanobind
+# bindings gated by CLIO_CORE_ENABLE_PYTHON. Keep it ON so the .deb/.rpm/conda
+# packages (built with CLIO_CORE_ENABLE_PYTHON=OFF) still include it.
+option(CLIO_CORE_ENABLE_VISUALIZER "Install the pure-Python context visualizer dashboard" ON)
 option(CLIO_CORE_ENABLE_CMAKE_DOTENV "Enable reading environment variables from .env.cmake" OFF)
 # Precompiled headers speed up builds but conflict with WINDOWS_EXPORT_ALL_SYMBOLS
 # under the Ninja generator with non-MSVC Windows compilers (icx/clang-cl): the
@@ -1226,12 +1231,14 @@ else()
     message(STATUS "Context-exploration-engine component disabled")
 endif()
 
-# Context Visualizer (pure Python web dashboard)
-if(CLIO_CORE_ENABLE_PYTHON)
+# Context Visualizer (pure Python web dashboard). Gated on its own option so
+# it ships in the .deb/.rpm/conda packages even though those set
+# CLIO_CORE_ENABLE_PYTHON=OFF (it needs no compilation, only a Python runtime).
+if(CLIO_CORE_ENABLE_VISUALIZER)
     message(STATUS "Building context-visualizer component (Python)")
     add_subdirectory(context-visualizer)
 else()
-    message(STATUS "Context-visualizer component disabled (requires CLIO_CORE_ENABLE_PYTHON)")
+    message(STATUS "Context-visualizer component disabled (CLIO_CORE_ENABLE_VISUALIZER=OFF)")
 endif()
 
 # Gray-Scott Example Application

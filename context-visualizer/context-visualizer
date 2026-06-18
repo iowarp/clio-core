@@ -1,0 +1,7 @@
+#!/bin/sh
+# Launcher for the IOWarp context visualizer dashboard.
+#
+# Shipped by the conda / .deb / .rpm packages (CMake installs this to bin/).
+# The pip wheel generates an equivalent console script from pyproject.toml's
+# [project.scripts], so this file is not used there.
+exec python3 -m context_visualizer "$@"

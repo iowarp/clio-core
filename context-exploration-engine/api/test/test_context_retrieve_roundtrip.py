@@ -6,16 +6,104 @@ Tests full data round-trip: bundle -> query -> retrieve -> verify -> destroy.
 On main this test crashes with SIGABRT (double-free in ContextRetrieve).
 With the fix (removing manual DelTask loop), it passes.
 
-Requires a running IOWarp runtime with clio_cte_core and clio_cae_core modules.
+Self-contained: starts an in-process IOWarp runtime (clio_cte_core +
+clio_cae_core modules are loaded from the build's bin directory) via
+clio_cte_core_ext.chimaera_init(kClient, True), so it no longer needs an
+externally running daemon.
 """
 
-import sys
 import os
+import socket
+import sys
 import tempfile
+import time
 
 # Add build directory to path for module import
 sys.path.insert(0, os.path.join(os.getcwd(), "bin"))
-sys.path.insert(0, "/usr/local/lib/python3.13/site-packages")
+
+
+def _setup_environment_paths():
+    """Point ChiMod discovery at the directory holding the python extensions."""
+    import clio_cte_core_ext as cte
+
+    bin_dir = os.path.dirname(os.path.abspath(cte.__file__))
+    os.environ["CLIO_REPO_PATH"] = bin_dir
+    # Linux uses LD_LIBRARY_PATH, macOS uses DYLD_LIBRARY_PATH.
+    for var in ("LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH"):
+        existing = os.getenv(var, "")
+        os.environ[var] = f"{bin_dir}:{existing}" if existing else bin_dir
+    return bin_dir
+
+
+def _generate_config():
+    """Write a minimal single-node runtime config and export CLIO_SERVER_CONF."""
+    import yaml
+
+    tmp = tempfile.gettempdir()
+    hostfile = os.path.join(tmp, "cee_roundtrip_hostfile")
+    with open(hostfile, "w") as f:
+        f.write("localhost\n")
+
+    port = None
+    for candidate in range(9229, 9300):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(("", candidate))
+                port = candidate
+                break
+            except OSError:
+                continue
+    if port is None:
+        raise RuntimeError("no available port for runtime in 9229-9300")
+
+    storage = os.path.join(tmp, "cee_roundtrip_storage")
+    os.makedirs(storage, exist_ok=True)
+
+    config = {
+        "networking": {"protocol": "zmq", "hostfile": hostfile, "port": port},
+        "workers": {"num_workers": 4},
+        "memory": {
+            "main_segment_size": "1G",
+            "client_data_segment_size": "512M",
+            "runtime_data_segment_size": "512M",
+        },
+        "devices": [{"mount_point": storage, "capacity": "1G"}],
+    }
+    config_path = os.path.join(tmp, "cee_roundtrip_conf.yaml")
+    with open(config_path, "w") as f:
+        yaml.dump(config, f)
+    os.environ["CLIO_SERVER_CONF"] = config_path
+    return config_path
+
+
+def start_runtime():
+    """Start an in-process IOWarp runtime with a storage target. Returns True."""
+    _setup_environment_paths()
+    config_path = _generate_config()
+
+    import clio_cte_core_ext as cte
+
+    if not cte.chimaera_init(cte.ChimaeraMode.kClient, True):
+        return False
+    time.sleep(0.5)  # let the runtime finish coming up
+    if hasattr(cte, "initialize_cte"):
+        cte.initialize_cte(config_path, cte.PoolQuery.Dynamic())
+
+    # Register a storage target so context_bundle's PutBlob has somewhere to
+    # land. The in-process runtime starts with no devices, so without this the
+    # assimilator fails with "Failed to store description" (return_code 11).
+    client = cte.get_cte_client()
+    storage_dir = tempfile.mkdtemp(prefix="iowarp_store_")
+    target_path = os.path.join(storage_dir, "cee_roundtrip_target")
+    try:
+        client.RegisterTarget(target_path, cte.BdevType.kFile,
+                              1024 * 1024 * 1024, cte.PoolQuery.Local(),
+                              cte.PoolId(700, 0))
+    except TypeError:
+        # RegisterTarget's binding returns a std::atomic nanobind can't convert
+        # to a Python type; the registration side-effect still completes.
+        pass
+    return True
 
 
 def test_retrieve_roundtrip():
@@ -25,8 +113,7 @@ def test_retrieve_roundtrip():
     ctx_interface = cee.ContextInterface()
     tag_name = "test_retrieve_roundtrip"
 
-    # Use /dev/shm so the runtime container can also access the file
-    tmpdir = tempfile.mkdtemp(prefix="iowarp_test_", dir="/dev/shm")
+    tmpdir = tempfile.mkdtemp(prefix="iowarp_test_")
     test_file = os.path.join(tmpdir, "test_data.bin")
 
     # Create test file with known pattern
@@ -87,6 +174,9 @@ def main():
     print("=" * 60)
 
     try:
+        if not start_runtime():
+            print("\nFAIL: could not start in-process IOWarp runtime")
+            return 1
         success = test_retrieve_roundtrip()
         if success:
             print("\nPASS: Data round-trip verified successfully")

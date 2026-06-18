@@ -24,6 +24,12 @@ target_link_libraries(test_msgpack_wrapper_exec
 
 add_test(NAME ctp_msgpack_wrapper COMMAND
         ${CMAKE_BINARY_DIR}/bin/test_msgpack_wrapper_exec)
+# Skip under MSan: msgpack::object payloads live in zones allocated by the
+# uninstrumented libmsgpack-c.so, so object::convert<>() reads bytes MSan
+# cannot prove initialized; those values then propagate into the uninstrumented
+# libstdc++ ostream used by SimpleTest::print_summary. Both are unfixable
+# third-party false positives.
+set_tests_properties(ctp_msgpack_wrapper PROPERTIES LABELS "msan_skip")
 
 add_test(NAME ctp_local_serialize_basic COMMAND
         ${CMAKE_BINARY_DIR}/bin/test_local_serialize_exec)

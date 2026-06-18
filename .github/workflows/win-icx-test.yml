@@ -51,9 +51,16 @@ env:
 
 jobs:
   win-icx-test:
-    name: windows-2025 (icx)
-    runs-on: windows-2025
+    name: ${{ matrix.os }} (icx)
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - windows-2022
+          - windows-2025
+          - windows-2025-vs2026
 
     steps:
       - name: Checkout repository
@@ -123,8 +130,8 @@ jobs:
             -DVCPKG_MANIFEST_DIR="%GITHUB_WORKSPACE%\installers\vcpkg" ^
             -DVCPKG_OVERLAY_PORTS="%GITHUB_WORKSPACE%\installers\vcpkg\overlay-ports" ^
             -DCMAKE_BUILD_TYPE=Debug ^
-            -DSITE=windows-2025 ^
-            -DBUILDNAME=vs2026/ninja/icx-2025.3 ^
+            -DSITE=${{ matrix.os }} ^
+            -DBUILDNAME=ninja/icx-2025.3 ^
             -DCLIO_CORE_ENABLE_RUNTIME=ON ^
             -DCLIO_CORE_ENABLE_CTE=ON ^
             -DCLIO_CORE_ENABLE_CAE=ON ^
@@ -165,7 +172,7 @@ jobs:
         shell: bash
         run: |
           LOG="build/Testing/Temporary/LastTest.log"
-          echo "## Windows ICX test summary (windows-2025)" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Windows ICX test summary (${{ matrix.os }})" >> "$GITHUB_STEP_SUMMARY"
           if [ -f "$LOG" ]; then
             echo '```' >> "$GITHUB_STEP_SUMMARY"
             grep -E "Test #|\*\*\*Failed|\*\*\*Exception|Passed|Failed" "$LOG" \
@@ -180,7 +187,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: win-icx-test-logs
+          name: win-icx-test-logs-${{ matrix.os }}
           path: |
             build/Testing/Temporary/LastTest.log
             build/Testing/Temporary/CTestCostData.txt

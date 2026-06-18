@@ -248,8 +248,10 @@ public:
   chi::TaskResume RegisterMemory(ctp::ipc::FullPtr<RegisterMemoryTask> task, chi::RunContext &rctx);
 
   /**
-   * Handle RestartContainers - Re-create pools from saved restart configs
-   * Reads conf_dir/restart/ directory and re-creates pools from saved YAML
+   * Handle RestartContainers - Re-create pools from the restart registry.
+   * Reads the RestartLog write-ahead log (~/.clio/restart_log.bin), the same
+   * persistent registry replayed at startup, and re-composes each registered
+   * compose file.
    */
   chi::TaskResume RestartContainers(ctp::ipc::FullPtr<RestartContainersTask> task, chi::RunContext &rctx);
 
