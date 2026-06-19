@@ -46,7 +46,9 @@
 #define PATH_MAX 4096  // POSIX default; not always in <climits> under NVHPC
 #endif
 // LCOV_EXCL_STOP
+#include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <string>
 
 #include "clio_ctp/constants/macros.h"
