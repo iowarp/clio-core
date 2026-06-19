@@ -57,7 +57,7 @@
 /* HDF5 header for dynamic plugin loading */
 #include "H5FDhermes.h" /* Clio file driver     */
 #include "H5PLextern.h"
-#include "adapter/posix/posix_fs_api.h"
+#include "adapter/cfs/cfs_io.h"
 #include "clio_cte/core/core_client.h"
 #include <clio_ctp/util/logging.h>
 
@@ -78,10 +78,6 @@ hid_t H5FDhermes_err_class_g = H5I_INVALID_HID;
 #define OP_UNKNOWN 0
 #define OP_READ 1
 #define OP_WRITE 2
-
-using clio::cae::AdapterStat;
-using clio::cae::File;
-using clio::cae::IoStatus;
 
 /* POSIX I/O mode used as the third parameter to open/_open
  * when creating a new file (O_CREAT is set). */
@@ -263,13 +259,10 @@ static H5FD_t *H5FD__hermes_open(const char *name, unsigned flags,
   }
 
 #ifdef USE_HERMES
-  auto fs_api = CLIO_CTE_POSIX_FS;
-  bool stat_exists;
-  AdapterStat stat;
-  stat.flags_ = o_flags;
-  stat.st_mode_ = H5FD_WRP_CTE_POSIX_CREATE_MODE_RW;
-  File f = fs_api->Open(stat, name);
-  fd = f.hermes_fd_;
+  // Route the file through the context-filesystem chimod (cfs core). The VFD
+  // is explicitly selected by the application, so every file it opens is
+  // CTE-backed regardless of the clio:: marker.
+  fd = CLIO_CTE_CFS->Open(name, o_flags, H5FD_WRP_CTE_POSIX_CREATE_MODE_RW);
   HLOG(kDebug, "");
 #else
   fd = open(name, o_flags);
@@ -294,7 +287,7 @@ static H5FD_t *H5FD__hermes_open(const char *name, unsigned flags,
   file->flags = flags;
 
 #ifdef USE_HERMES
-  file->eof = (haddr_t)fs_api->GetSize(f, stat_exists);
+  file->eof = (haddr_t)CLIO_CTE_CFS->SizeFd(fd);
 #else
   file->eof = stdfs::file_size(name);
 #endif
@@ -317,11 +310,7 @@ static herr_t H5FD__hermes_close(H5FD_t *_file) {
   herr_t ret_value = SUCCEED; /* Return value */
   assert(file);
 #ifdef USE_HERMES
-  auto fs_api = CLIO_CTE_POSIX_FS;
-  File f;
-  f.hermes_fd_ = file->fd;
-  bool stat_exists;
-  fs_api->Close(f, stat_exists);
+  CLIO_CTE_CFS->Close(file->fd);
   HLOG(kDebug, "");
 #else
   close(file->fd);
@@ -475,22 +464,26 @@ static herr_t H5FD__hermes_read(H5FD_t *_file, H5FD_mem_t type, hid_t dxpl_id,
   herr_t ret_value = SUCCEED;
 
 #ifdef USE_HERMES
-  bool stat_exists;
-  auto fs_api = CLIO_CTE_POSIX_FS;
-  File f;
-  f.hermes_fd_ = file->fd;
-  IoStatus io_status;
-  size_t count = fs_api->Read(f, stat_exists, buf, addr, size, io_status);
+  ssize_t count =
+      CLIO_CTE_CFS->Pread(file->fd, buf, size, static_cast<off_t>(addr));
+  if (getenv("CLIO_VFD_DEBUG"))
+    fprintf(stderr, "[vfd] READ  addr=%llu size=%llu got=%lld\n",
+            (unsigned long long)addr, (unsigned long long)size, (long long)count);
   HLOG(kDebug, "");
 #else
-  size_t count = read(file->fd, (char *)buf + addr, size);
+  ssize_t count = read(file->fd, (char *)buf + addr, size);
 #endif
 
-  if (count < size) {
-    // TODO(llogan)
+  // HDF5 treats the file as a flat byte array: a read of an allocated region
+  // that extends past the last byte ever written must come back zero-filled,
+  // not short. The chimod clamps reads to its logical size (POSIX EOF
+  // semantics), so zero-fill whatever tail it did not provide.
+  size_t got = (count > 0) ? static_cast<size_t>(count) : 0;
+  if (got < size) {
+    memset(static_cast<char *>(buf) + got, 0, size - got);
   }
   return ret_value;
-} /* end H5FD__hermes_read() */
+} /* end H5FD__hermes_write() */
 
 /*-------------------------------------------------------------------------
  * Function:    H5FD__hermes_write
@@ -513,18 +506,22 @@ static herr_t H5FD__hermes_write(H5FD_t *_file, H5FD_mem_t type, hid_t dxpl_id,
   H5FD_hermes_t *file = (H5FD_hermes_t *)_file;
   herr_t ret_value = SUCCEED;
 #ifdef USE_HERMES
-  bool stat_exists;
-  auto fs_api = CLIO_CTE_POSIX_FS;
-  File f;
-  f.hermes_fd_ = file->fd;
-  IoStatus io_status;
-  size_t count = fs_api->Write(f, stat_exists, buf, addr, size, io_status);
+  ssize_t count =
+      CLIO_CTE_CFS->Pwrite(file->fd, buf, size, static_cast<off_t>(addr));
+  if (getenv("CLIO_VFD_DEBUG"))
+    fprintf(stderr, "[vfd] WRITE addr=%llu size=%llu put=%lld\n",
+            (unsigned long long)addr, (unsigned long long)size, (long long)count);
   HLOG(kDebug, "");
 #else
-  size_t count = write(file->fd, (char *)buf + addr, size);
+  ssize_t count = write(file->fd, (char *)buf + addr, size);
 #endif
-  if (count < size) {
+  if (count < 0 || static_cast<size_t>(count) < size) {
     // TODO(llogan)
+  }
+  /* Track end-of-file so get_eof stays accurate within a session (HDF5
+   * checks it to validate file size; the chimod owns the durable size). */
+  if ((haddr_t)(addr + size) > file->eof) {
+    file->eof = (haddr_t)(addr + size);
   }
   return ret_value;
 } /* end H5FD__hermes_write() */

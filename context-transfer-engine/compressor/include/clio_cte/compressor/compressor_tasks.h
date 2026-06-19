@@ -439,7 +439,7 @@ struct DecompressTask : public chi::Task {
  */
 struct NodeLoadSample {
   chi::u32 node_id_;          ///< Node ID being sampled
-  float cpu_usage_pct_;       ///< Aggregate CPU utilization (0-100)
+  float cpu_usage_pct_;       ///< AggregateOut CPU utilization (0-100)
   float worker_load_us_;      ///< Sum of WorkerStats::load_ across all workers (us)
   chi::u32 num_queued_tasks_; ///< Sum of queued tasks across all workers
   chi::u32 num_blocked_tasks_;///< Sum of blocked tasks across all workers

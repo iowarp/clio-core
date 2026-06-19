@@ -298,6 +298,19 @@ void IpcManagerRun2Run::SendOut(ctp::ipc::FullPtr<chi::Task> origin_task) {
     return;
   }
 
+  // Capture the recv-side FutureShm before DelTask frees the task/RunContext.
+  // RecvInHandleOne created it via MakePointerFuture (NewObj<FutureShm> from the
+  // runtime's private CTP_MALLOC heap) and stored it in this task's RunContext.
+  // Unlike a client-origin Future it is never consumed_, so ~Future() never
+  // frees it; without the explicit FreeBuffer below every cross-node RPC leaks
+  // one FutureShm — the run2run analog of the cpu2cpu leak fixed in #560. The
+  // resolved FullPtr stays valid after DelTask (it points at the CTP_MALLOC
+  // buffer, which DelTask does not touch).
+  ctp::ipc::FullPtr<chi::FutureShm> recv_future_shm;
+  if (chi::RunContext *run_ctx = origin_task->GetRunCtx()) {
+    recv_future_shm = run_ctx->future_.GetFutureShm();
+  }
+
   size_t recv_key = origin_task->task_id_.net_key_ ^
                     (static_cast<size_t>(origin_task->task_id_.replica_id_) *
                      0x9e3779b97f4a7c15ULL);
@@ -329,6 +342,12 @@ void IpcManagerRun2Run::SendOut(ctp::ipc::FullPtr<chi::Task> origin_task) {
                            target_host);
   if (rc == 0) {
     container->DelTask(origin_task->method_, origin_task);
+    // Free the recv-side FutureShm captured above (see comment). Only on
+    // success: on failure SendOutTransmit re-queued the task for retry, so its
+    // FutureShm must stay alive.
+    if (!recv_future_shm.IsNull()) {
+      ipc_manager->FreeBuffer(recv_future_shm.Cast<char>());
+    }
   }
 }
 
@@ -520,10 +539,10 @@ int IpcManagerRun2Run::RecvOutAggregate(
 
     ctp::ipc::FullPtr<chi::Task> replica = origin_rctx->subtasks_[replica_id];
 
-    // Aggregate via the Container so the concrete task type's Aggregate()
-    // runs (which merges OUT fields like bdev's blocks_). Task::Aggregate is
+    // AggregateOut via the Container so the concrete task type's AggregateOut()
+    // runs (which merges OUT fields like bdev's blocks_). Task::AggregateOut is
     // intentionally non-virtual to keep Task vtable-free, so calling
-    // origin_task->Aggregate(replica) here would slice to the base and drop
+    // origin_task->AggregateOut(replica) here would slice to the base and drop
     // every derived OUT field — leaving callers with empty results.
     chi::Container *container =
         CLIO_POOL_MANAGER->GetStaticContainer(origin_task->pool_id_);
@@ -532,7 +551,7 @@ int IpcManagerRun2Run::RecvOutAggregate(
            origin_task->pool_id_);
       continue;
     }
-    container->Aggregate(origin_task->method_, origin_task, replica);
+    container->AggregateOut(origin_task->method_, origin_task, replica);
 
     HLOG(kDebug, "[RecvOut] Task {}", origin_task->task_id_);
 

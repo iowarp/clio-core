@@ -59,6 +59,12 @@ struct MallocPage {
 template <bool ATOMIC>
 class _MallocAllocator : public Allocator {
  public:
+  /** Running total of bytes allocated but not yet freed. Only mutated when
+   *  CTP_ALLOC_TRACK_SIZE is defined (see CLIO_CORE_ENABLE_LEAK_CHECK); stays
+   *  zero otherwise so GetCurrentlyAllocatedSize() is a cheap, valid no-op.
+   *  Mirrors _ArenaAllocator::total_alloc_. */
+  ctp::ipc::atomic<ctp::big_uint> total_alloc_;
+
   /**
    * Default constructor - initializes with null backend
    */
@@ -85,9 +91,9 @@ class _MallocAllocator : public Allocator {
     // Then: 0 + raw_pointer_as_offset = raw_pointer
     this_ = reinterpret_cast<size_t>(this);
 
-#ifdef CTP_ALLOC_TRACK_SIZE
+    // Always zero-initialize the tracking counter (atomic's default ctor does
+    // not), so GetCurrentlyAllocatedSize() reads 0 even when tracking is off.
     total_alloc_ = 0;
-#endif
   }
 
   /**
@@ -202,11 +208,9 @@ class _MallocAllocator : public Allocator {
    */
   CTP_CROSS_FUN
   size_t GetCurrentlyAllocatedSize() {
-#ifdef CTP_ALLOC_TRACK_SIZE
-    return total_alloc_;
-#else
-    return 0;
-#endif
+    // total_alloc_ is only incremented/decremented when CTP_ALLOC_TRACK_SIZE
+    // is defined; otherwise it stays 0, so this is a valid no-op either way.
+    return static_cast<size_t>(total_alloc_.load());
   }
 
   /**

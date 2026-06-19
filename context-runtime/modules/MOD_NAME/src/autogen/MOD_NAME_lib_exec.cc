@@ -58,6 +58,12 @@ chi::TaskResume Runtime::Run(chi::u32 method, ctp::ipc::FullPtr<chi::Task> task_
       CLIO_CO_AWAIT(Custom(typed_task, rctx));
       break;
     }
+    case Method::kManyToOneSum: {
+      // Cast task FullPtr to specific type
+      ctp::ipc::FullPtr<ManyToOneSumTask> typed_task = task_ptr.template Cast<ManyToOneSumTask>();
+      CLIO_CO_AWAIT(ManyToOneSum(typed_task, rctx));
+      break;
+    }
     case Method::kCoMutexTest: {
       // Cast task FullPtr to specific type
       ctp::ipc::FullPtr<CoMutexTestTask> typed_task = task_ptr.template Cast<CoMutexTestTask>();
@@ -126,6 +132,11 @@ void Runtime::SaveTask(chi::u32 method, chi::SaveTaskArchive& archive,
       archive << *typed_task.ptr_;
       break;
     }
+    case Method::kManyToOneSum: {
+      auto typed_task = task_ptr.template Cast<ManyToOneSumTask>();
+      archive << *typed_task.ptr_;
+      break;
+    }
     case Method::kCoMutexTest: {
       auto typed_task = task_ptr.template Cast<CoMutexTestTask>();
       archive << *typed_task.ptr_;
@@ -183,6 +194,11 @@ void Runtime::LoadTask(chi::u32 method, chi::LoadTaskArchive& archive,
     }
     case Method::kCustom: {
       auto typed_task = task_ptr.template Cast<CustomTask>();
+      archive >> *typed_task.ptr_;
+      break;
+    }
+    case Method::kManyToOneSum: {
+      auto typed_task = task_ptr.template Cast<ManyToOneSumTask>();
       archive >> *typed_task.ptr_;
       break;
     }
@@ -254,6 +270,12 @@ void Runtime::LocalLoadTask(chi::u32 method, chi::DefaultLoadArchive& archive,
     }
     case Method::kCustom: {
       auto typed_task = task_ptr.template Cast<CustomTask>();
+      // Use archive operator which respects msg_type
+      archive >> *typed_task.ptr_;
+      break;
+    }
+    case Method::kManyToOneSum: {
+      auto typed_task = task_ptr.template Cast<ManyToOneSumTask>();
       // Use archive operator which respects msg_type
       archive >> *typed_task.ptr_;
       break;
@@ -332,6 +354,12 @@ void Runtime::LocalSaveTask(chi::u32 method, chi::DefaultSaveArchive& archive,
     }
     case Method::kCustom: {
       auto typed_task = task_ptr.template Cast<CustomTask>();
+      // Use archive operator which respects msg_type
+      archive << *typed_task.ptr_;
+      break;
+    }
+    case Method::kManyToOneSum: {
+      auto typed_task = task_ptr.template Cast<ManyToOneSumTask>();
       // Use archive operator which respects msg_type
       archive << *typed_task.ptr_;
       break;
@@ -425,6 +453,17 @@ ctp::ipc::FullPtr<chi::Task> Runtime::NewCopyTask(chi::u32 method, ctp::ipc::Ful
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
         auto task_typed = orig_task_ptr.template Cast<CustomTask>();
+        new_task_ptr->Copy(task_typed);
+        return new_task_ptr.template Cast<chi::Task>();
+      }
+      break;
+    }
+    case Method::kManyToOneSum: {
+      // Allocate new task
+      auto new_task_ptr = ipc_manager->NewTask<ManyToOneSumTask>();
+      if (!new_task_ptr.IsNull()) {
+        // Copy task fields (includes base Task fields)
+        auto task_typed = orig_task_ptr.template Cast<ManyToOneSumTask>();
         new_task_ptr->Copy(task_typed);
         return new_task_ptr.template Cast<chi::Task>();
       }
@@ -534,6 +573,10 @@ ctp::ipc::FullPtr<chi::Task> Runtime::NewTask(chi::u32 method) {
       auto new_task_ptr = ipc_manager->NewTask<CustomTask>();
       return new_task_ptr.template Cast<chi::Task>();
     }
+    case Method::kManyToOneSum: {
+      auto new_task_ptr = ipc_manager->NewTask<ManyToOneSumTask>();
+      return new_task_ptr.template Cast<chi::Task>();
+    }
     case Method::kCoMutexTest: {
       auto new_task_ptr = ipc_manager->NewTask<CoMutexTestTask>();
       return new_task_ptr.template Cast<chi::Task>();
@@ -565,61 +608,131 @@ ctp::ipc::FullPtr<chi::Task> Runtime::NewTask(chi::u32 method) {
   }
 }
 
-void Runtime::Aggregate(chi::u32 method, ctp::ipc::FullPtr<chi::Task> orig_task,
+void Runtime::AggregateOut(chi::u32 method, ctp::ipc::FullPtr<chi::Task> orig_task,
                         const ctp::ipc::FullPtr<chi::Task>& replica_task) {
   switch (method) {
     case Method::kCreate: {
       auto typed_task = orig_task.template Cast<CreateTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kDestroy: {
       auto typed_task = orig_task.template Cast<DestroyTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kMonitor: {
       auto typed_task = orig_task.template Cast<MonitorTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kCustom: {
       auto typed_task = orig_task.template Cast<CustomTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
+      break;
+    }
+    case Method::kManyToOneSum: {
+      auto typed_task = orig_task.template Cast<ManyToOneSumTask>();
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kCoMutexTest: {
       auto typed_task = orig_task.template Cast<CoMutexTestTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kCoRwLockTest: {
       auto typed_task = orig_task.template Cast<CoRwLockTestTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kWaitTest: {
       auto typed_task = orig_task.template Cast<WaitTestTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kTestLargeOutput: {
       auto typed_task = orig_task.template Cast<TestLargeOutputTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kGpuSubmit: {
       auto typed_task = orig_task.template Cast<GpuSubmitTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kSubtaskTest: {
       auto typed_task = orig_task.template Cast<SubtaskTestTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     default: {
-      orig_task->Aggregate(replica_task);
+      orig_task->AggregateOut(replica_task);
+      break;
+    }
+  }
+}
+
+void Runtime::AggregateIn(chi::u32 method, ctp::ipc::FullPtr<chi::Task> agg_task,
+                        const ctp::ipc::FullPtr<chi::Task>& member_task) {
+  switch (method) {
+    case Method::kCreate: {
+      auto typed_task = agg_task.template Cast<CreateTask>();
+      typed_task->AggregateIn(member_task);
+      break;
+    }
+    case Method::kDestroy: {
+      auto typed_task = agg_task.template Cast<DestroyTask>();
+      typed_task->AggregateIn(member_task);
+      break;
+    }
+    case Method::kMonitor: {
+      auto typed_task = agg_task.template Cast<MonitorTask>();
+      typed_task->AggregateIn(member_task);
+      break;
+    }
+    case Method::kCustom: {
+      auto typed_task = agg_task.template Cast<CustomTask>();
+      typed_task->AggregateIn(member_task);
+      break;
+    }
+    case Method::kManyToOneSum: {
+      auto typed_task = agg_task.template Cast<ManyToOneSumTask>();
+      typed_task->AggregateIn(member_task);
+      break;
+    }
+    case Method::kCoMutexTest: {
+      auto typed_task = agg_task.template Cast<CoMutexTestTask>();
+      typed_task->AggregateIn(member_task);
+      break;
+    }
+    case Method::kCoRwLockTest: {
+      auto typed_task = agg_task.template Cast<CoRwLockTestTask>();
+      typed_task->AggregateIn(member_task);
+      break;
+    }
+    case Method::kWaitTest: {
+      auto typed_task = agg_task.template Cast<WaitTestTask>();
+      typed_task->AggregateIn(member_task);
+      break;
+    }
+    case Method::kTestLargeOutput: {
+      auto typed_task = agg_task.template Cast<TestLargeOutputTask>();
+      typed_task->AggregateIn(member_task);
+      break;
+    }
+    case Method::kGpuSubmit: {
+      auto typed_task = agg_task.template Cast<GpuSubmitTask>();
+      typed_task->AggregateIn(member_task);
+      break;
+    }
+    case Method::kSubtaskTest: {
+      auto typed_task = agg_task.template Cast<SubtaskTestTask>();
+      typed_task->AggregateIn(member_task);
+      break;
+    }
+    default: {
+      agg_task->AggregateIn(member_task);
       break;
     }
   }
@@ -643,6 +756,10 @@ void Runtime::DelTask(chi::u32 method, ctp::ipc::FullPtr<chi::Task> task_ptr) {
     }
     case Method::kCustom: {
       ipc_manager->DelTask(task_ptr.template Cast<CustomTask>());
+      break;
+    }
+    case Method::kManyToOneSum: {
+      ipc_manager->DelTask(task_ptr.template Cast<ManyToOneSumTask>());
       break;
     }
     case Method::kCoMutexTest: {

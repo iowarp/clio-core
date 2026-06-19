@@ -7,6 +7,15 @@ FROM iowarp/deps-cpu:latest
 USER root
 RUN userdel -r ubuntu || true
 
+# FUSE 3 runtime (fusermount3) + dev headers, needed to build the libfuse
+# adapter (clio_cte_fuse) and run its mount integration tests. Installed here
+# so a devcontainer rebuild picks it up immediately; it is also in the base
+# image (docker/iowarp-base.Dockerfile) as the canonical default. The
+# container runs --privileged, so /dev/fuse + SYS_ADMIN are available.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      fuse3 libfuse3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
 # The deps-cpu image already includes:
 # - All apt + source-built dependencies (boost, hdf5, yaml-cpp, zeromq, cereal, etc.)
 # - Compression libraries (zlib, bzip2, lzo, zstd, lz4, xz, brotli, snappy, c-blosc2)

@@ -401,6 +401,9 @@ bool IpcManager::ServerInit() {
     HLOG(kDebug, "Scheduler initialized: {}", sched_name);
   }
 
+  // ManyToOne collective batch/aggregation manager (leader-side).
+  batch_manager_ = std::make_unique<BatchManager>(this);
+
   // Create lightbeam transports for client task reception
   {
     u32 port = config->GetPort();
@@ -1199,6 +1202,32 @@ u64 IpcManager::GetLeaderNodeId() const {
 
 bool IpcManager::IsLeader() const { return GetNodeId() == GetLeaderNodeId(); }
 
+u64 IpcManager::GetNeighborhoodLeaderNodeId(u64 for_node) const {
+  // The neighborhood is the window [base, base + N) where N is the configured
+  // neighborhood size and base = floor(for_node / N) * N. The leader is the
+  // lowest *alive* node in that window. Computed from local SWIM membership,
+  // so every node in the neighborhood agrees deterministically. Falls back to
+  // for_node itself if the window has no other alive members.
+  u32 n = CLIO_CONFIG_MANAGER->GetNeighborhoodSize();
+  if (n == 0) {
+    n = 1;
+  }
+  u64 base = (for_node / n) * n;
+  u64 end = base + n;
+  u64 leader = std::numeric_limits<u64>::max();
+  for (const auto &[id, host] : hostfile_map_) {
+    if (host.state == NodeState::kAlive && host.node_id >= base &&
+        host.node_id < end && host.node_id < leader) {
+      leader = host.node_id;
+    }
+  }
+  return (leader == std::numeric_limits<u64>::max()) ? for_node : leader;
+}
+
+u64 IpcManager::GetNeighborhoodLeaderNodeId() const {
+  return GetNeighborhoodLeaderNodeId(GetNodeId());
+}
+
 u64 IpcManager::AddNode(const std::string &ip_address, u32 port) {
   (void)port;  // Port stored elsewhere (ConfigManager) for now
 
@@ -1443,6 +1472,28 @@ ctp::lbm::Transport *IpcManager::GetClientTransport(IpcMode mode) const {
 }
 
 const Host &IpcManager::GetThisHost() const { return this_host_; }
+
+size_t IpcManager::GetRuntimeHeapAllocatedBytes() const {
+#if CTP_IS_HOST
+  // CTP_MALLOC is the private heap backing AllocateBuffer/NewObj in runtime
+  // (and client ZMQ) mode. GetCurrentlyAllocatedSize() returns 0 unless built
+  // with CTP_ALLOC_TRACK_SIZE (CLIO_CORE_ENABLE_LEAK_CHECK).
+  size_t total = CTP_MALLOC->GetCurrentlyAllocatedSize();
+#if defined(CTP_ALLOC_TRACK_SIZE)
+  // NewTask uses global operator new, not CTP_MALLOC, so add the net outstanding
+  // task bytes (incremented by NewTask, decremented by DelTask) — otherwise an
+  // unfreed NewTask would be invisible to the leak detector. Clamp negatives
+  // (defensive; the NewTask/DelTask pairing should keep this >= 0).
+  long long task_bytes = RuntimeTaskAllocBytes().load();
+  if (task_bytes > 0) {
+    total += static_cast<size_t>(task_bytes);
+  }
+#endif
+  return total;
+#else
+  return 0;
+#endif
+}
 
 FullPtr<char> IpcManager::AllocateBuffer(size_t size) {
 #if CTP_IS_HOST
@@ -2639,6 +2690,14 @@ RouteResult IpcManager::RouteTask(Future<Task> &future, bool force_enqueue) {
     return RouteResult::ExecHere;
   }
 
+  // ManyToOne collective routing is handled before the normal resolve path:
+  // forward to the neighborhood leader, or park into the batch manager if we
+  // are the leader. (The aggregate task the leader later runs is a plain
+  // Local task and does not re-enter this branch.)
+  if (task_ptr->pool_query_.IsManyToOneMode()) {
+    return RouteManyToOne(future);
+  }
+
   // Only call ScheduleTask for Dynamic pool queries.
   // ScheduleTask resolves Dynamic routing into concrete modes (e.g.,
   // Broadcast, DirectHash, Local). Concrete routing modes (Range, Physical,
@@ -2700,6 +2759,25 @@ RouteResult IpcManager::RouteTask(Future<Task> &future, bool force_enqueue) {
   }
 }
 
+RouteResult IpcManager::RouteManyToOne(Future<Task> &future) {
+  FullPtr<Task> task_ptr = future.GetTaskPtr();
+  u64 leader = GetNeighborhoodLeaderNodeId();
+  if (leader == GetNodeId()) {
+    // We are the neighborhood leader: park the task into its batch group. The
+    // batch flusher aggregates, runs once, and completes each member later.
+    // RouteResult::Local tells the worker the task is owned elsewhere now and
+    // must not be executed here.
+    task_ptr->SetFlags(TASK_ROUTED);
+    batch_manager_->Add(task_ptr);
+    return RouteResult::Local;
+  }
+  // Forward to the leader. pool_query_ stays ManyToOne so the leader re-enters
+  // this path and batches; only the network address is the leader node.
+  std::vector<PoolQuery> pool_queries = {PoolQuery::Physical((u32)leader)};
+  pool_queries[0].SetReturnNode(GetNodeId());
+  return RouteGlobal(future, pool_queries);
+}
+
 bool IpcManager::IsTaskLocal(const FullPtr<Task> & /*task_ptr*/,
                              const std::vector<PoolQuery> &pool_queries,
                              bool originally_local) {
@@ -2756,8 +2834,10 @@ bool IpcManager::IsTaskLocal(const FullPtr<Task> & /*task_ptr*/,
     case RoutingMode::DirectHash:
     case RoutingMode::Range:
     case RoutingMode::Broadcast:
-      // These modes should have been resolved to Physical queries by now
-      // If we still see them here, they are not local
+    case RoutingMode::ManyToOne:
+      // These modes should have been resolved (ManyToOne → Local on the
+      // neighborhood leader, else Physical) by now. If we still see them
+      // here, they are not local.
       return false;
 
     case RoutingMode::ToLocalCpu:
@@ -2912,6 +2992,12 @@ std::vector<PoolQuery> IpcManager::ResolvePoolQuery(
     case RoutingMode::Null:
       // GPU producer-only ToLocalCpu and Null modes pass through.
       result = {query};
+      break;
+    case RoutingMode::ManyToOne:
+      // ManyToOne is intercepted in RouteTask (RouteManyToOne) before reaching
+      // here. If it ever falls through, resolve to the neighborhood leader.
+      result = {PoolQuery::Physical(
+          (u32)GetNeighborhoodLeaderNodeId())};
       break;
   }
 

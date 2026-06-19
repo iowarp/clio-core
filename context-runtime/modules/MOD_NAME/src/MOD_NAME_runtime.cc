@@ -46,7 +46,7 @@ namespace clio::run::MOD_NAME {
 
 // Method implementations for Runtime class
 
-// Virtual method implementations (Init, Run, Del, SaveTask, LoadTask, NewCopy, Aggregate) now in autogen/MOD_NAME_lib_exec.cc
+// Virtual method implementations (Init, Run, Del, SaveTask, LoadTask, NewCopy, AggregateOut) now in autogen/MOD_NAME_lib_exec.cc
 
 //===========================================================================
 // Method implementations
@@ -80,6 +80,19 @@ chi::TaskResume Runtime::Custom(ctp::ipc::FullPtr<CustomTask> task, chi::RunCont
   // In a real implementation, this would perform the custom operation
 
   HLOG(kDebug, "MOD_NAME: Custom completed (count: {})", custom_count_);
+  (void)rctx;
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+chi::TaskResume Runtime::ManyToOneSum(ctp::ipc::FullPtr<ManyToOneSumTask> task,
+                                      chi::RunContext &rctx) {
+  CLIO_TASK_BODY_BEGIN
+  // On the neighborhood leader the batch was folded into this aggregate task by
+  // AggregateIn, so value_ already holds the sum of every member's input. Echo
+  // it into the OUT field; the engine broadcasts sum_ back to all submitters.
+  task->sum_ = task->value_;
+  HLOG(kDebug, "MOD_NAME: ManyToOneSum total={}", task->sum_);
   (void)rctx;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END

@@ -34,6 +34,8 @@
 #ifndef CHIMAERA_INCLUDE_CHIMAERA_POOL_QUERY_H_
 #define CHIMAERA_INCLUDE_CHIMAERA_POOL_QUERY_H_
 
+#include <type_traits>
+
 #include "clio_runtime/types.h"
 
 namespace clio::run {
@@ -50,7 +52,8 @@ enum class RoutingMode {
   Physical,       /**< Route to specific physical node by ID */
   Dynamic,        /**< Dynamic routing with cache optimization (routes to Monitor) */
   ToLocalCpu,     /**< GPU → CPU direction (the only GPU-related mode) */
-  Null            /**< Do nothing */
+  Null,           /**< Do nothing */
+  ManyToOne       /**< Batch+aggregate matching tasks at the neighborhood leader */
 };
 
 /**
@@ -79,44 +82,16 @@ class PoolQuery {
       : routing_mode_(RoutingMode::Local), hash_value_(0),
         container_id_(kInvalidContainerId),
         range_offset_(0), range_count_(0), node_id_(0), ret_node_(0),
-        net_timeout_(-1.0f), parallelism_(32) {}
+        net_timeout_(-1.0f), parallelism_(32),
+        batch_key_(0), batch_for_ns_(0) {}
 
-  /**
-   * Copy constructor
-   */
-  CTP_CROSS_FUN PoolQuery(const PoolQuery& other)
-      : routing_mode_(other.routing_mode_),
-        hash_value_(other.hash_value_),
-        container_id_(other.container_id_),
-        range_offset_(other.range_offset_),
-        range_count_(other.range_count_),
-        node_id_(other.node_id_),
-        ret_node_(other.ret_node_),
-        net_timeout_(other.net_timeout_),
-        parallelism_(other.parallelism_) {}
-
-  /**
-   * Assignment operator
-   */
-  CTP_CROSS_FUN PoolQuery& operator=(const PoolQuery& other) {
-    if (this != &other) {
-      routing_mode_ = other.routing_mode_;
-      hash_value_ = other.hash_value_;
-      container_id_ = other.container_id_;
-      range_offset_ = other.range_offset_;
-      range_count_ = other.range_count_;
-      node_id_ = other.node_id_;
-      ret_node_ = other.ret_node_;
-      net_timeout_ = other.net_timeout_;
-      parallelism_ = other.parallelism_;
-    }
-    return *this;
-  }
-
-  /**
-   * Destructor
-   */
-  CTP_CROSS_FUN ~PoolQuery() {}
+  // Copy/move/destructor are intentionally left implicit (compiler-generated)
+  // so PoolQuery stays *trivially copyable*. It is raw-byte serialized and
+  // compared (e.g. the CTE transaction log WriteRaw/ReadRaw over
+  // sizeof(PoolQuery) and a memcmp roundtrip check), and is bytewise-copied
+  // across the GPU/host boundary. A hand-written field-wise copy would NOT
+  // copy padding, so two "equal" queries could differ in padding bytes and
+  // fail those raw-byte comparisons. (see static_assert below the class)
 
   // Static factory methods to create different types of PoolQuery
 
@@ -180,6 +155,24 @@ class PoolQuery {
    * @return PoolQuery configured for dynamic routing with cache optimization
    */
   static PoolQuery Dynamic(float net_timeout = -1);
+
+  /**
+   * Create a many-to-one collective routing pool query.
+   *
+   * Routes the task to the neighborhood leader, which briefly batches all
+   * tasks sharing the same (pool_id, method, container_hash, batch_key) for
+   * a batch_for window, aggregates them into a single task, runs it once,
+   * and broadcasts the result back to every batched task.
+   *
+   * @param container_hash Logical container key (stored in hash_value_);
+   *        also selects the container the aggregate task executes on.
+   * @param batch_key Sub-key to separate concurrent collectives on the same
+   *        (pool_id, method, container_hash). Default 0.
+   * @param batch_for_ns Batching window in nanoseconds. Default 10000 (10us).
+   * @return PoolQuery configured for many-to-one batch aggregation
+   */
+  static PoolQuery ManyToOne(u32 container_hash, u64 batch_key = 0,
+                             u64 batch_for_ns = 10000);
 
   /**
    * Create a pool query for GPU → CPU direction
@@ -371,13 +364,41 @@ class PoolQuery {
   CTP_CROSS_FUN void SetParallelism(u32 parallelism) { parallelism_ = parallelism; }
 
   /**
+   * Check if pool query is in ManyToOne routing mode
+   * @return true if routing mode is ManyToOne
+   */
+  CTP_CROSS_FUN bool IsManyToOneMode() const {
+    return routing_mode_ == RoutingMode::ManyToOne;
+  }
+
+  /**
+   * Get the container hash (ManyToOne). Aliases the hash value: it both
+   * keys the batch and selects the container the aggregate runs on.
+   * @return Container hash for many-to-one batching
+   */
+  CTP_CROSS_FUN u32 GetContainerHash() const { return hash_value_; }
+
+  /**
+   * Get the batch sub-key (ManyToOne)
+   * @return Batch key separating concurrent collectives
+   */
+  CTP_CROSS_FUN u64 GetBatchKey() const { return batch_key_; }
+
+  /**
+   * Get the batching window in nanoseconds (ManyToOne)
+   * @return Batch window in ns
+   */
+  CTP_CROSS_FUN u64 GetBatchForNs() const { return batch_for_ns_; }
+
+  /**
    * Serialization support for any archive type
    * @param ar Archive for serialization
    */
   template <class Archive>
   CTP_CROSS_FUN void serialize(Archive& ar) {
     ar.range(routing_mode_, hash_value_, container_id_, range_offset_,
-             range_count_, node_id_, ret_node_, net_timeout_, parallelism_);
+             range_count_, node_id_, ret_node_, net_timeout_, parallelism_,
+             batch_key_, batch_for_ns_);
   }
 
  private:
@@ -390,8 +411,16 @@ class PoolQuery {
   u32 ret_node_;             /**< Return node ID for distributed responses */
   float net_timeout_;        /**< Per-task network timeout in seconds (-1 = use default) */
   u32 parallelism_;          /**< GPU parallelism: 1 (lane 0), 32 (full warp), >32 (multi-warp) */
+  u64 batch_key_;            /**< ManyToOne: batch sub-key */
+  u64 batch_for_ns_;         /**< ManyToOne: batch window in nanoseconds */
 };
 
+// PoolQuery is raw-byte serialized and memcmp-compared (CTE transaction log,
+// GPU/host bytewise task copies). Keep it trivially copyable so copies preserve
+// every byte (including padding) — a hand-written field-wise copy would not,
+// breaking those raw-byte roundtrips.
+static_assert(std::is_trivially_copyable<PoolQuery>::value,
+              "PoolQuery must remain trivially copyable (raw-byte serialized)");
 
 }  // namespace clio::run
 

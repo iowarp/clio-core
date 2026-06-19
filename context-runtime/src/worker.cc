@@ -266,6 +266,18 @@ void Worker::Run() {
     // Check blocked queue for completed tasks at end of each iteration
     ContinueBlockedTasks(false);
 
+    // ManyToOne: flush due collective batches on the neighborhood leader.
+    // Driven from a single worker to avoid redundant locking; FlushDue is a
+    // cheap no-op when no batches are pending. Treat pending batches as work so
+    // this worker keeps polling and honors the short (e.g. 10us) batch window
+    // instead of deep-sleeping.
+    if (worker_id_ == 0) {
+      BatchManager *bm = CLIO_IPC->GetBatchManager();
+      if (bm != nullptr && bm->FlushDue(this)) {
+        did_work_ = true;
+      }
+    }
+
     // Increment iteration counter
     iteration_count_++;
 
@@ -1014,6 +1026,21 @@ void Worker::EndTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
   container->ReinforceWallModel(
       task_ptr->method_, run_ctx->predicted_wall_us_, actual_wall_us,
       run_ctx->predicted_stat_);
+
+  // ManyToOne aggregate task: this synthetic task has no external waiter. On
+  // completion, broadcast its OUT to the batched originals (which completes
+  // each of them), then delete the aggregate. Done after the model
+  // reinforcement above so load accounting stays consistent.
+  if (task_ptr->task_flags_.Any(TASK_BATCH_AGGREGATE)) {
+    BatchManager *bm = CLIO_IPC->GetBatchManager();
+    if (bm != nullptr) {
+      bm->OnAggregateComplete(this, task_ptr, run_ctx);
+    }
+    container->UpdateWork(task_ptr, *run_ctx, -1);
+    task_ptr->ClearFlags(TASK_DATA_OWNER);
+    container->DelTask(task_ptr->method_, task_ptr);
+    return;
+  }
 
   // Get task properties at the start
   bool is_remote = task_ptr->IsRemote();

@@ -69,6 +69,95 @@ namespace clio::cte::core {
 using chi::chi_cur_worker_key_;
 using chi::Worker;
 
+// ===========================================================================
+// Hierarchical tag-name encoding helpers.
+//
+// Absolute-path tags (names beginning with '/') are stored RELATIVELY so that
+// renaming/moving a directory tag is O(1): a child holds the canonical string
+//     "$tagid{<major>.<minor>}/<leaf>"
+// where <major>.<minor> is its PARENT tag's id and <leaf> is the single path
+// component. The root "/" is stored literally as "/". Flat (non-path) names
+// are stored verbatim. Resolution (ResolveTagName) walks the parent ids to
+// rebuild the full path. Non-path names are unaffected by any of this.
+// ===========================================================================
+namespace {
+
+constexpr const char *kTagRefPrefix = "$tagid{";
+
+// True for absolute-path names that participate in the hierarchy.
+bool IsHierPath(const std::string &name) {
+  return !name.empty() && name[0] == '/';
+}
+
+// Build the relative stored form for a child of `parent` with leaf `leaf`.
+std::string MakeRelativeName(const TagId &parent, const std::string &leaf) {
+  return std::string(kTagRefPrefix) + std::to_string(parent.major_) + "." +
+         std::to_string(parent.minor_) + "}/" + leaf;
+}
+
+// Split "/a/b/c" -> ["a","b","c"]; "/" or "" -> []. Repeated and trailing
+// slashes are collapsed (so "/a/b/" == "/a/b").
+std::vector<std::string> SplitPathComponents(const std::string &path) {
+  std::vector<std::string> out;
+  size_t i = 0;
+  const size_t n = path.size();
+  while (i < n) {
+    while (i < n && path[i] == '/') ++i;
+    size_t j = i;
+    while (j < n && path[j] != '/') ++j;
+    if (j > i) out.push_back(path.substr(i, j - i));
+    i = j;
+  }
+  return out;
+}
+
+// If `stored` is a "$tagid{M.m}/leaf" reference, parse out the parent id and
+// the leaf and return true; otherwise return false (flat name or root).
+bool ParseTagRef(const std::string &stored, TagId &parent_out,
+                 std::string &leaf_out) {
+  const size_t plen = std::char_traits<char>::length(kTagRefPrefix);
+  if (stored.compare(0, plen, kTagRefPrefix) != 0) return false;
+  size_t close = stored.find('}', plen);
+  if (close == std::string::npos) return false;
+  const std::string id_str = stored.substr(plen, close - plen);
+  size_t dot = id_str.find('.');
+  if (dot == std::string::npos) return false;
+  try {
+    parent_out.major_ =
+        static_cast<chi::u32>(std::stoul(id_str.substr(0, dot)));
+    parent_out.minor_ =
+        static_cast<chi::u32>(std::stoul(id_str.substr(dot + 1)));
+  } catch (const std::exception &) {
+    return false;
+  }
+  std::string suffix = stored.substr(close + 1);  // e.g. "/leaf"
+  if (!suffix.empty() && suffix[0] == '/') suffix.erase(0, 1);
+  leaf_out = std::move(suffix);
+  return true;
+}
+
+// Join an already-resolved parent path with a leaf, avoiding "//".
+std::string JoinPath(const std::string &parent_full, const std::string &leaf) {
+  if (parent_full == "/") return "/" + leaf;
+  return parent_full + "/" + leaf;
+}
+
+// Split an absolute path into (parent_path, leaf): "/a/b/c" -> ("/a/b","c"),
+// "/c" -> ("/","c"). Returns false for "/" or names with no component.
+bool SplitParentLeaf(const std::string &path, std::string &parent_out,
+                     std::string &leaf_out) {
+  std::vector<std::string> comps = SplitPathComponents(path);
+  if (comps.empty()) return false;
+  leaf_out = comps.back();
+  parent_out = "/";
+  for (size_t i = 0; i + 1 < comps.size(); ++i) {
+    parent_out += (i == 0 ? "" : "/") + comps[i];
+  }
+  return true;
+}
+
+}  // namespace
+
 // No more static member definitions - using instance-based locking
 
 chi::u64 Runtime::ParseCapacityToBytes(const std::string &capacity_str) {
@@ -370,6 +459,32 @@ chi::TaskResume Runtime::Create(ctp::ipc::FullPtr<CreateTask> task,
 
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
+}
+
+Runtime::~Runtime() {
+  // Mirror Destroy()'s cleanup so deleting the container on graceful shutdown
+  // frees this module's runtime-heap state (the member containers below are
+  // also RAII, but closing the WAL files explicitly here is the safe, intended
+  // teardown). Destructor-safe: no task/RunContext, no coroutine, no worker
+  // state access.
+  for (auto &log : blob_txn_logs_) {
+    if (log) log->Close();
+  }
+  blob_txn_logs_.clear();
+  for (auto &log : tag_txn_logs_) {
+    if (log) log->Close();
+  }
+  tag_txn_logs_.clear();
+
+  registered_targets_.clear();
+  target_list_.clear();
+  target_name_to_id_.clear();
+  tag_name_to_id_.clear();
+  tag_id_to_info_.clear();
+  tag_blob_name_to_info_.clear();
+  storage_devices_.clear();
+  target_locks_.clear();
+  tag_locks_.clear();
 }
 
 chi::TaskResume Runtime::Destroy(ctp::ipc::FullPtr<DestroyTask> task,
@@ -849,7 +964,10 @@ chi::TaskResume Runtime::GetOrCreateTag(
       CLIO_CO_RETURN;
     }
 
-    TagId tag_id = GetOrAssignTagId(tag_name, preferred_id);
+    // Absolute paths are created as a hierarchy ("/a/b/c" -> "/", "/a", "/a/b",
+    // "/a/b/c") with each child stored relative to its parent; the returned id
+    // is the deepest tag. Flat names create a single tag (legacy behavior).
+    TagId tag_id = GetOrCreateTagChain(tag_name, preferred_id);
     task->tag_id_ = tag_id;
 
     auto now = GetCurrentTimeNs();
@@ -1029,40 +1147,37 @@ chi::TaskResume Runtime::PutBlob(ctp::ipc::FullPtr<PutBlobTask> task,
       CLIO_CO_RETURN;
     }
 
-    // Step 1: ClearBlob — free blocks if full replacement
+    // Create blob metadata if new; otherwise remember its current size.
     chi::u64 old_blob_size = 0;
-    if (blob_found) {
-      bool cleared = false;
-      CLIO_CO_AWAIT(ClearBlob(*blob_info_ptr, blob_score, offset, size, cleared));
-      if (cleared) {
-        // WAL: log blob clear
-        if (!blob_txn_logs_.empty()) {
-          chi::u32 wid = CLIO_CUR_WORKER->GetWorkerStats().worker_id_;
-          TxnClearBlob txn;
-          txn.tag_major_ = tag_id.major_;
-          txn.tag_minor_ = tag_id.minor_;
-          txn.blob_name_ = blob_name;
-          blob_txn_logs_[wid % blob_txn_logs_.size()]->Log(TxnType::kClearBlob,
-                                                           txn);
-        }
-      } else {
-        old_blob_size = blob_info_ptr->GetTotalSize();
-      }
-    }
-
-    // Create blob metadata if new
     if (!blob_found) {
       blob_info_ptr = CreateNewBlob(blob_name, tag_id, blob_score);
       if (!blob_info_ptr) {
         task->return_code_ = 5;
         CLIO_CO_RETURN;
       }
+    } else {
+      old_blob_size = blob_info_ptr->GetTotalSize();
     }
 
-    // Step 2: ExtendBlob — allocate new blocks if needed
+    // Step 1+2: size the blob to fit the write.
+    //  - default (partial modify): grow to cover [offset, offset+size) but
+    //    NEVER shrink — writing must not truncate the tail (POSIX write
+    //    semantics). This is what makes out-of-order / descending partial
+    //    writes (e.g. HDF5 writing data high, then the superblock at offset 0)
+    //    safe; the old offset==0 "clear the whole blob" heuristic corrupted
+    //    them.
+    //  - kCtePutReplace (wholesale replace): resize to exactly offset+size,
+    //    shrinking if needed, via the shared ResizeBlob helper.
     chi::u32 alloc_result = 0;
-    CLIO_CO_AWAIT(ExtendBlob(*blob_info_ptr, offset, size, blob_score, alloc_result,
-                        task->context_.min_persistence_level_));
+    if (task->flags_ & kCtePutReplace) {
+      CLIO_CO_AWAIT(ResizeBlob(*blob_info_ptr, offset + size, blob_score,
+                          alloc_result,
+                          task->context_.min_persistence_level_));
+    } else {
+      CLIO_CO_AWAIT(ExtendBlob(*blob_info_ptr, offset, size, blob_score,
+                          alloc_result,
+                          task->context_.min_persistence_level_));
+    }
     if (alloc_result != 0) {
       task->return_code_ = 10 + alloc_result;
       CLIO_CO_RETURN;
@@ -1086,6 +1201,32 @@ chi::TaskResume Runtime::PutBlob(ctp::ipc::FullPtr<PutBlobTask> task,
       }
       blob_txn_logs_[wid % blob_txn_logs_.size()]->Log(TxnType::kExtendBlob,
                                                        txn);
+    }
+
+    // Step 2.5: Zero any hole created by writing past the old end-of-blob
+    // (sparse write). Newly allocated space is NOT guaranteed to be zero — the
+    // bdev recycles freed blocks, so a fresh block can hold stale data — and
+    // POSIX requires allocated-but-unwritten bytes to read as zeros. Only the
+    // gap [old_blob_size, offset) needs it; sequential appends (offset ==
+    // old_blob_size) and overwrites (offset < old_blob_size) create no hole.
+    if (offset > old_blob_size) {
+      chi::u64 hole = offset - old_blob_size;
+      auto *ipc_mgr = CLIO_IPC;
+      ctp::ipc::FullPtr<char> zbuf = ipc_mgr->AllocateBuffer(hole);
+      if (zbuf.IsNull()) {
+        task->return_code_ = 6;
+        CLIO_CO_RETURN;
+      }
+      std::memset(zbuf.ptr_, 0, hole);
+      chi::u32 zero_result = 0;
+      CLIO_CO_AWAIT(ModifyExistingData(blob_info_ptr->blocks_,
+                                  zbuf.shm_.template Cast<void>(), hole,
+                                  old_blob_size, zero_result));
+      ipc_mgr->FreeBuffer(zbuf);
+      if (zero_result != 0) {
+        task->return_code_ = 20 + zero_result;
+        CLIO_CO_RETURN;
+      }
     }
 
     // Step 3: ModifyExistingData — write data to blocks
@@ -1117,7 +1258,7 @@ chi::TaskResume Runtime::PutBlob(ctp::ipc::FullPtr<PutBlobTask> task,
       // tag's name lives on whichever container `GetOrCreateTag`'s
       // `DirectHash(tag_name)` selected; this container only owns the
       // blobs that `HashBlobToContainer(tag_id, blob_name)` routed
-      // here. To keep the `GetTagSize` broadcast-and-Aggregate sum
+      // here. To keep the `GetTagSize` broadcast-and-AggregateOut sum
       // correct, every container that holds any of the tag's bytes
       // must carry a `TagInfo` whose `total_size_` reflects its share.
       // The silent-skip variant of this block dropped the accounting
@@ -1447,6 +1588,289 @@ chi::TaskResume Runtime::DelBlob(ctp::ipc::FullPtr<DelBlobTask> task,
   CLIO_TASK_BODY_END
 }
 
+chi::TaskResume Runtime::TruncateBlob(ctp::ipc::FullPtr<TruncateBlobTask> task,
+                                      chi::RunContext &ctx) {
+#ifdef __NVCOMPILER
+  chi::RunContext& rctx = ctx;
+#else
+  (void)ctx;
+#endif
+  CLIO_TASK_BODY_BEGIN
+  try {
+    TagId tag_id = task->tag_id_;
+    std::string blob_name = task->blob_name_.str();
+    chi::u64 new_size = task->new_size_;
+    if (blob_name.empty()) {
+      task->return_code_ = 1;
+      CLIO_CO_RETURN;
+    }
+
+    BlobInfo *blob_info_ptr = CheckBlobExists(blob_name, tag_id);
+    if (blob_info_ptr == nullptr) {
+      // A missing blob is already "empty" — nothing to truncate.
+      task->return_code_ = 0;
+      CLIO_CO_RETURN;
+    }
+    chi::u64 old_size = blob_info_ptr->GetTotalSize();
+    float blob_score = blob_info_ptr->score_;
+
+    // Shared resize helper (also used by PutBlob's replace path).
+    chi::u32 resize_result = 0;
+    CLIO_CO_AWAIT(ResizeBlob(*blob_info_ptr, new_size, blob_score,
+                        resize_result, 0));
+    if (resize_result != 0) {
+      task->return_code_ = 10 + resize_result;
+      CLIO_CO_RETURN;
+    }
+    chi::u64 final_size = blob_info_ptr->GetTotalSize();
+
+    // Update the tag's total_size_ by the delta.
+    {
+      chi::ScopedCoRwWriteLock lock(tag_map_lock_);
+      TagInfo *tag_info_ptr = tag_id_to_info_.find(tag_id);
+      if (tag_info_ptr != nullptr) {
+        if (final_size >= old_size) {
+          tag_info_ptr->total_size_ += (final_size - old_size);
+        } else {
+          chi::u64 d = old_size - final_size;
+          tag_info_ptr->total_size_ =
+              (d <= tag_info_ptr->total_size_) ? tag_info_ptr->total_size_ - d
+                                               : 0;
+        }
+      }
+    }
+
+    // WAL: record the resized block list (full-replacement semantics), so a
+    // restart replays the truncated blob.
+    if (!blob_txn_logs_.empty() && !blob_info_ptr->blocks_.empty()) {
+      chi::u32 wid = CLIO_CUR_WORKER->GetWorkerStats().worker_id_;
+      TxnExtendBlob txn;
+      txn.tag_major_ = tag_id.major_;
+      txn.tag_minor_ = tag_id.minor_;
+      txn.blob_name_ = blob_name;
+      for (const auto &blk : blob_info_ptr->blocks_) {
+        TxnExtendBlobBlock tb;
+        tb.bdev_major_ = blk.bdev_client_.pool_id_.major_;
+        tb.bdev_minor_ = blk.bdev_client_.pool_id_.minor_;
+        tb.target_query_ = blk.target_query_;
+        tb.target_offset_ = blk.target_offset_;
+        tb.size_ = blk.size_;
+        txn.new_blocks_.push_back(tb);
+      }
+      blob_txn_logs_[wid % blob_txn_logs_.size()]->Log(TxnType::kExtendBlob,
+                                                       txn);
+    }
+
+    blob_info_ptr->last_modified_ = GetCurrentTimeNs();
+    task->return_code_ = 0;
+  } catch (const std::exception &e) {
+    HLOG(kError, "TruncateBlob failed: {}", e.what());
+    task->return_code_ = 1;
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+chi::TaskResume Runtime::RenameTag(ctp::ipc::FullPtr<RenameTagTask> task,
+                                   chi::RunContext &ctx) {
+#ifdef __NVCOMPILER
+  chi::RunContext& rctx = ctx;
+#else
+  (void)ctx;
+#endif
+  CLIO_TASK_BODY_BEGIN
+  try {
+    TagId tag_id = task->tag_id_;
+    std::string old_name = task->old_name_.str();
+    std::string new_name = task->new_name_.str();
+    if (old_name.empty() || new_name.empty()) {
+      task->return_code_ = 1;
+      CLIO_CO_RETURN;
+    }
+    if (old_name == new_name) {
+      task->return_code_ = 0;
+      CLIO_CO_RETURN;
+    }
+
+    // The tag keeps its TagId — only the name changes, so its blobs (keyed by
+    // TagId) are untouched, and so are any CHILDREN (they reference this tag's
+    // id, which does not change). That is what makes moving a directory tag
+    // O(1) regardless of how many descendants it has.
+    if (IsHierPath(old_name) && IsHierPath(new_name)) {
+      // ---- Hierarchical move: rebind only the leaf under its new parent. ----
+      // Phase A: resolve the target tag id and its current stored name.
+      std::string old_rel;
+      {
+        chi::ScopedCoRwReadLock lock(tag_map_lock_);
+        if (tag_id.IsNull()) {
+          tag_id = ResolvePathToIdLocked(old_name);
+        }
+        if (tag_id.IsNull()) {
+          task->return_code_ = 1;  // source path not found
+          CLIO_CO_RETURN;
+        }
+        TagInfo *info = tag_id_to_info_.find(tag_id);
+        if (info != nullptr) {
+          old_rel = info->tag_name_.str();
+        }
+      }
+
+      // Split destination into parent path + leaf.
+      std::vector<std::string> comps = SplitPathComponents(new_name);
+      if (comps.empty()) {
+        task->return_code_ = 1;  // cannot rename onto the root
+        CLIO_CO_RETURN;
+      }
+      std::string new_leaf = comps.back();
+      std::string new_parent_path = "/";
+      for (size_t i = 0; i + 1 < comps.size(); ++i) {
+        new_parent_path += (i == 0 ? "" : "/") + comps[i];
+      }
+
+      // Phase B: get-or-create the destination parent chain (no lock held —
+      // GetOrCreateTagChain takes tag_map_lock_ itself). Auto-creates missing
+      // parents (mkdir -p semantics).
+      TagId new_parent_id = GetOrCreateTagChain(new_parent_path);
+      std::string new_rel = MakeRelativeName(new_parent_id, new_leaf);
+
+      // Phase C: atomically move the name binding and refresh the stored name.
+      {
+        chi::ScopedCoRwWriteLock lock(tag_map_lock_);
+        if (!old_rel.empty()) {
+          tag_name_to_id_.erase(old_rel);
+        }
+        tag_name_to_id_.insert_or_assign(new_rel, tag_id);
+        TagInfo *info = tag_id_to_info_.find(tag_id);
+        if (info != nullptr) {
+          info->tag_name_ = chi::priv::string(CLIO_PRIV_ALLOC, new_rel);
+          info->last_modified_ = GetCurrentTimeNs();
+        }
+      }
+      task->tag_id_ = tag_id;
+      task->return_code_ = 0;
+      CLIO_CO_RETURN;
+    }
+
+    // ---- Flat rename (non-path tags): move the verbatim name binding. ----
+    // Broadcast: each container moves the name->id binding it happens to hold.
+    chi::ScopedCoRwWriteLock lock(tag_map_lock_);
+    TagId *idp = tag_name_to_id_.find(old_name);
+    if (idp != nullptr) {
+      TagId bound = *idp;
+      if (tag_id.IsNull()) {
+        tag_id = bound;
+      }
+      tag_name_to_id_.erase(old_name);
+      tag_name_to_id_.insert_or_assign(new_name, bound);
+    }
+    if (!tag_id.IsNull()) {
+      TagInfo *info = tag_id_to_info_.find(tag_id);
+      if (info != nullptr) {
+        info->tag_name_ = chi::priv::string(CLIO_PRIV_ALLOC, new_name);
+        info->last_modified_ = GetCurrentTimeNs();
+      }
+    }
+    task->tag_id_ = tag_id;
+    task->return_code_ = 0;
+  } catch (const std::exception &e) {
+    HLOG(kError, "RenameTag failed: {}", e.what());
+    task->return_code_ = 1;
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+chi::TaskResume Runtime::GetOrCreateTagAlias(
+    ctp::ipc::FullPtr<GetOrCreateTagAliasTask> task, chi::RunContext &ctx) {
+#ifdef __NVCOMPILER
+  chi::RunContext& rctx = ctx;
+#else
+  (void)ctx;
+#endif
+  CLIO_TASK_BODY_BEGIN
+  try {
+    TagId tag_id = task->tag_id_;
+    std::string existing_name = task->existing_name_.str();
+    std::string alias_name = task->alias_name_.str();
+    if (alias_name.empty()) {
+      task->return_code_ = 1;
+      CLIO_CO_RETURN;
+    }
+
+    // Phase A: resolve + verify the target tag exists. The target may be given
+    // by id or by name (absolute paths are walked through the hierarchy).
+    {
+      chi::ScopedCoRwReadLock lock(tag_map_lock_);
+      if (tag_id.IsNull() && !existing_name.empty()) {
+        if (IsHierPath(existing_name)) {
+          tag_id = ResolvePathToIdLocked(existing_name);
+        }
+        if (tag_id.IsNull()) {
+          TagId *p = tag_name_to_id_.find(existing_name);
+          if (p != nullptr) tag_id = *p;
+        }
+      }
+      if (tag_id.IsNull() || tag_id_to_info_.find(tag_id) == nullptr) {
+        task->found_ = 0;
+        task->tag_id_ = TagId::GetNull();
+        task->return_code_ = 0;  // found_ conveys "target missing"; not an error
+        CLIO_CO_RETURN;
+      }
+    }
+    task->found_ = 1;
+
+    // Compute the binding KEY for the alias. An absolute-path alias becomes a
+    // first-class hierarchy entry: create its parent chain (outside the lock —
+    // GetOrCreateTagChain takes tag_map_lock_) and bind the relative key
+    // "$tagid{parent}/leaf" so the link resolves, lists, and opens like any
+    // other path. A flat alias binds verbatim (legacy behavior).
+    std::string alias_key = alias_name;
+    if (IsHierPath(alias_name)) {
+      std::string parent_path, leaf;
+      if (!SplitParentLeaf(alias_name, parent_path, leaf)) {
+        task->return_code_ = 1;  // cannot alias onto the root
+        CLIO_CO_RETURN;
+      }
+      TagId parent_id = GetOrCreateTagChain(parent_path);
+      alias_key = MakeRelativeName(parent_id, leaf);
+    }
+
+    // Phase C: bind the alias key to the target id (a tag-level hard link — the
+    // alias shares the target's id and therefore all of its blobs). GetOrCreate:
+    // if the key is already bound, return whatever it points at unchanged.
+    {
+      chi::ScopedCoRwWriteLock lock(tag_map_lock_);
+      TagId *existing_alias = tag_name_to_id_.find(alias_key);
+      if (existing_alias != nullptr) {
+        tag_id = *existing_alias;
+      } else {
+        tag_name_to_id_.insert_or_assign(alias_key, tag_id);
+        // Record the alias key on the target so DelTag cascades to it when the
+        // canonical tag is deleted. The canonical name is never added here.
+        TagInfo *info = tag_id_to_info_.find(tag_id);
+        if (info != nullptr) {
+          bool present = (alias_key == info->tag_name_.str());
+          for (size_t i = 0; !present && i < info->aliases_.size(); ++i) {
+            if (info->aliases_[i].str() == alias_key) present = true;
+          }
+          if (!present) {
+            info->aliases_.push_back(
+                chi::priv::string(CLIO_PRIV_ALLOC, alias_key));
+          }
+          info->last_modified_ = GetCurrentTimeNs();
+        }
+      }
+    }
+    task->tag_id_ = tag_id;
+    task->return_code_ = 0;
+  } catch (const std::exception &e) {
+    HLOG(kError, "GetOrCreateTagAlias failed: {}", e.what());
+    task->return_code_ = 1;
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
 chi::TaskResume Runtime::DelTag(ctp::ipc::FullPtr<DelTagTask> task,
                                 chi::RunContext &ctx) {
 #ifdef __NVCOMPILER
@@ -1459,23 +1883,45 @@ chi::TaskResume Runtime::DelTag(ctp::ipc::FullPtr<DelTagTask> task,
     TagId tag_id = task->tag_id_;
     std::string tag_name = task->tag_name_.str();
 
-    // Step 1: Resolve tag ID if tag name was provided instead
+    // Step 1: Resolve the tag id AND the tag_name_to_id_ key the request
+    // resolves *through* (resolved_key). For an absolute path that key is the
+    // relative "$tagid{parent}/leaf"; for a flat name it is the name itself;
+    // for a by-id delete it stays empty. resolved_key is what distinguishes
+    // deleting an alias (a non-canonical name) from deleting the tag itself.
+    std::string resolved_key;
     if (tag_id.IsNull() && !tag_name.empty()) {
       chi::ScopedCoRwReadLock lock(tag_map_lock_);
-      TagId *found_tag_id_ptr = tag_name_to_id_.find(tag_name);
-      if (found_tag_id_ptr == nullptr) {
+      if (IsHierPath(tag_name)) {
+        std::string parent_path, leaf;
+        if (tag_name == "/") {
+          TagId *r = tag_name_to_id_.find(std::string("/"));
+          if (r != nullptr) { tag_id = *r; resolved_key = "/"; }
+        } else if (SplitParentLeaf(tag_name, parent_path, leaf)) {
+          TagId parent_id = ResolvePathToIdLocked(parent_path);
+          if (!parent_id.IsNull()) {
+            std::string key = MakeRelativeName(parent_id, leaf);
+            TagId *p = tag_name_to_id_.find(key);
+            if (p != nullptr) { tag_id = *p; resolved_key = key; }
+          }
+        }
+      }
+      // Fall back to a verbatim lookup (flat tags and flat aliases).
+      if (tag_id.IsNull()) {
+        TagId *p = tag_name_to_id_.find(tag_name);
+        if (p != nullptr) { tag_id = *p; resolved_key = tag_name; }
+      }
+      if (tag_id.IsNull()) {
         task->return_code_ = 1;  // Tag not found by name
         CLIO_CO_RETURN;
       }
-      tag_id = *found_tag_id_ptr;
       task->tag_id_ = tag_id;
     } else if (tag_id.IsNull() && tag_name.empty()) {
       task->return_code_ = 1;
       CLIO_CO_RETURN;
     }
 
-    // Step 2: Find the tag by ID
-    std::string cached_tag_name;
+    // Step 2: Find the tag by ID and capture its canonical (own) stored name.
+    std::string canonical;
     {
       chi::ScopedCoRwReadLock lock(tag_map_lock_);
       TagInfo *tag_info_ptr = tag_id_to_info_.find(tag_id);
@@ -1483,68 +1929,116 @@ chi::TaskResume Runtime::DelTag(ctp::ipc::FullPtr<DelTagTask> task,
         task->return_code_ = 1;  // Tag not found by ID
         CLIO_CO_RETURN;
       }
-      cached_tag_name = tag_info_ptr->tag_name_.str();
+      canonical = tag_info_ptr->tag_name_.str();
     }
 
-    // Step 3: Collect blob names under read lock, then delete
-    std::string tag_prefix = std::to_string(tag_id.major_) + "." +
-                             std::to_string(tag_id.minor_) + ".";
-    std::vector<std::string> blob_names_to_delete;
+    // If the request resolved through a key that is NOT the tag's own canonical
+    // name, it is an alias/hard-link "unlink": drop only that one name binding
+    // and leave the tag, its blobs, and other names intact. Deleting by id, or
+    // through the canonical name, falls through to a full recursive delete that
+    // cascades to every alias below.
+    if (!resolved_key.empty() && resolved_key != canonical) {
+      chi::ScopedCoRwWriteLock lock(tag_map_lock_);
+      tag_name_to_id_.erase(resolved_key);
+      TagInfo *tag_info_ptr = tag_id_to_info_.find(tag_id);
+      if (tag_info_ptr != nullptr) {
+        for (size_t i = 0; i < tag_info_ptr->aliases_.size(); ++i) {
+          if (tag_info_ptr->aliases_[i].str() == resolved_key) {
+            tag_info_ptr->aliases_.erase(tag_info_ptr->aliases_.begin() + i);
+            break;
+          }
+        }
+        tag_info_ptr->last_modified_ = GetCurrentTimeNs();
+      }
+      task->return_code_ = 0;
+      CLIO_CO_RETURN;
+    }
+
+    // Step 3: Determine the full set of tags to delete — the target plus every
+    // transitive hierarchical descendant. A child stores its parent's id in
+    // its name ("$tagid{parent}/leaf"), so build parent->children once and BFS
+    // from the target. A flat or leaf tag has no descendants and deletes only
+    // itself; a directory tag deletes its entire subtree (rm -r semantics).
+    std::vector<TagId> to_delete;
+    std::unordered_map<std::string, TagId> prefix_to_id;  // "M.m." -> id
+    {
+      chi::ScopedCoRwReadLock lock(tag_map_lock_);
+      std::unordered_map<TagId, std::vector<TagId>> children;
+      tag_id_to_info_.for_each([&](const TagId &id, const TagInfo &info) {
+        TagId parent;
+        std::string leaf;
+        if (ParseTagRef(info.tag_name_.str(), parent, leaf)) {
+          children[parent].push_back(id);
+        }
+      });
+      std::vector<TagId> frontier{tag_id};
+      while (!frontier.empty()) {
+        TagId cur = frontier.back();
+        frontier.pop_back();
+        to_delete.push_back(cur);
+        prefix_to_id[std::to_string(cur.major_) + "." +
+                     std::to_string(cur.minor_) + "."] = cur;
+        auto it = children.find(cur);
+        if (it != children.end()) {
+          for (const TagId &c : it->second) frontier.push_back(c);
+        }
+      }
+    }
+
+    // Step 4: collect every blob across all those tags in a single metadata
+    // scan. Keys are "major.minor.blobname"; match by the "major.minor."
+    // prefix against the deletion set.
+    auto compound_prefix = [](const std::string &key) -> std::string {
+      size_t d1 = key.find('.');
+      if (d1 == std::string::npos) return std::string();
+      size_t d2 = key.find('.', d1 + 1);
+      if (d2 == std::string::npos) return std::string();
+      return key.substr(0, d2 + 1);
+    };
+    std::vector<std::pair<TagId, std::string>> blobs_to_delete;
     {
       chi::ScopedCoRwReadLock lock(blob_map_lock_);
       tag_blob_name_to_info_.for_each(
-          [&tag_prefix, &blob_names_to_delete](const std::string &compound_key,
-                                               const BlobInfo &blob_info) {
-            if (compound_key.compare(0, tag_prefix.length(), tag_prefix) == 0) {
-              blob_names_to_delete.push_back(blob_info.blob_name_.str());
+          [&](const std::string &compound_key, const BlobInfo &blob_info) {
+            (void)blob_info;
+            auto it = prefix_to_id.find(compound_prefix(compound_key));
+            if (it != prefix_to_id.end()) {
+              blobs_to_delete.emplace_back(
+                  it->second, compound_key.substr(it->first.size()));
             }
           });
     }
 
-    // Process blobs in batches to limit concurrent async tasks
+    // Step 5: delete blobs in bounded-concurrency batches.
     constexpr size_t kMaxConcurrentDelBlobTasks = 32;
     std::vector<chi::Future<DelBlobTask>> async_tasks;
     size_t processed_blobs = 0;
-
-    for (size_t i = 0; i < blob_names_to_delete.size();
+    for (size_t i = 0; i < blobs_to_delete.size();
          i += kMaxConcurrentDelBlobTasks) {
-      // Create a batch of async tasks (up to kMaxConcurrentDelBlobTasks)
       async_tasks.clear();
       size_t batch_end =
-          std::min(i + kMaxConcurrentDelBlobTasks, blob_names_to_delete.size());
-
+          std::min(i + kMaxConcurrentDelBlobTasks, blobs_to_delete.size());
       for (size_t j = i; j < batch_end; ++j) {
-        const std::string &blob_name = blob_names_to_delete[j];
-
-        // Call AsyncDelBlob from client
-        auto async_task = client_.AsyncDelBlob(tag_id, blob_name);
-        async_tasks.push_back(async_task);
+        async_tasks.push_back(client_.AsyncDelBlob(blobs_to_delete[j].first,
+                                                   blobs_to_delete[j].second));
       }
-
-      // Wait for all async DelBlob operations in this batch to complete
-      for (auto task : async_tasks) {
-        CLIO_CO_AWAIT(task);
-
-        // Check if DelBlob succeeded
-        if (task->return_code_ != 0) {
-          HLOG(kWarning,
-               "DelBlob failed for blob during tag deletion, continuing");
-          // Continue with other blobs even if one fails
+      for (auto t : async_tasks) {
+        CLIO_CO_AWAIT(t);
+        if (t->return_code_ != 0) {
+          HLOG(kWarning, "DelBlob failed during tag deletion, continuing");
         }
-
-        // Clean up the task
         ++processed_blobs;
       }
     }
 
-    // Step 4: Remove all blob name mappings for this tag
+    // Step 6: erase blob-name mappings for all deleted tags.
     {
       chi::ScopedCoRwWriteLock lock(blob_map_lock_);
       std::vector<std::string> keys_to_erase;
       tag_blob_name_to_info_.for_each(
-          [&tag_prefix, &keys_to_erase](const std::string &compound_key,
-                                        const BlobInfo &blob_info) {
-            if (compound_key.compare(0, tag_prefix.length(), tag_prefix) == 0) {
+          [&](const std::string &compound_key, const BlobInfo &blob_info) {
+            (void)blob_info;
+            if (prefix_to_id.count(compound_prefix(compound_key)) != 0) {
               keys_to_erase.push_back(compound_key);
             }
           });
@@ -1553,47 +2047,91 @@ chi::TaskResume Runtime::DelTag(ctp::ipc::FullPtr<DelTagTask> task,
       }
     }
 
-    // Step 5: Remove tag name and tag info mappings
-    size_t blob_count = processed_blobs;
+    // Step 7: erase each tag's name binding(s) + aliases, WAL-log the delete,
+    // and drop the TagInfo.
     size_t total_size = 0;
-    {
-      chi::ScopedCoRwWriteLock lock(tag_map_lock_);
-      TagInfo *tag_info_ptr = tag_id_to_info_.find(tag_id);
-      if (tag_info_ptr != nullptr) {
-        total_size = tag_info_ptr->total_size_;
-        if (!tag_info_ptr->tag_name_.empty()) {
-          tag_name_to_id_.erase(tag_info_ptr->tag_name_.str());
+    const chi::u32 wid = tag_txn_logs_.empty()
+                             ? 0
+                             : CLIO_CUR_WORKER->GetWorkerStats().worker_id_;
+    for (const TagId &del_id : to_delete) {
+      std::string del_name;
+      {
+        chi::ScopedCoRwWriteLock lock(tag_map_lock_);
+        TagInfo *info = tag_id_to_info_.find(del_id);
+        if (info != nullptr) {
+          total_size += info->total_size_;
+          del_name = info->tag_name_.str();
+          if (!info->tag_name_.empty()) {
+            tag_name_to_id_.erase(info->tag_name_.str());
+          }
+          // Cascade: remove every alias name bound to this tag.
+          for (size_t i = 0; i < info->aliases_.size(); ++i) {
+            tag_name_to_id_.erase(info->aliases_[i].str());
+          }
         }
       }
+      if (!tag_txn_logs_.empty()) {
+        TxnDelTag txn;
+        txn.tag_name_ = del_name;
+        txn.tag_major_ = del_id.major_;
+        txn.tag_minor_ = del_id.minor_;
+        tag_txn_logs_[wid % tag_txn_logs_.size()]->Log(TxnType::kDelTag, txn);
+      }
+      {
+        chi::ScopedCoRwWriteLock lock(tag_map_lock_);
+        tag_id_to_info_.erase(del_id);
+      }
+      GpuCacheOnDelTag(del_id);
     }
 
-    // Log telemetry for DelTag operation
+    // Log telemetry for the DelTag operation (attributed to the target tag).
     auto now = GetCurrentTimeNs();
     LogTelemetry(CteOp::kDelTag, 0, total_size, tag_id, now, now);
 
-    // WAL: log tag deletion
-    if (!tag_txn_logs_.empty()) {
-      chi::u32 wid = CLIO_CUR_WORKER->GetWorkerStats().worker_id_;
-      TxnDelTag txn;
-      txn.tag_name_ = cached_tag_name;
-      txn.tag_major_ = tag_id.major_;
-      txn.tag_minor_ = tag_id.minor_;
-      tag_txn_logs_[wid % tag_txn_logs_.size()]->Log(TxnType::kDelTag, txn);
-    }
-
-    {
-      chi::ScopedCoRwWriteLock lock(tag_map_lock_);
-      tag_id_to_info_.erase(tag_id);
-    }
-
-    // Success
-    GpuCacheOnDelTag(tag_id);
     task->return_code_ = 0;
     HLOG(kDebug,
-         "DelTag successful: tag_id={},{}, removed {} blobs, total_size={}",
-         tag_id.major_, tag_id.minor_, blob_count, total_size);
+         "DelTag successful: tag_id={},{}, removed {} tags, {} blobs, "
+         "total_size={}",
+         tag_id.major_, tag_id.minor_, to_delete.size(), processed_blobs,
+         total_size);
 
   } catch (const std::exception &e) {
+    task->return_code_ = 1;
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+chi::TaskResume Runtime::GetTagName(ctp::ipc::FullPtr<GetTagNameTask> task,
+                                    chi::RunContext &ctx) {
+#ifdef __NVCOMPILER
+  chi::RunContext& rctx = ctx;
+#else
+  (void)ctx;
+#endif
+  CLIO_TASK_BODY_BEGIN
+  try {
+    TagId tag_id = task->tag_id_;
+    std::string stored;
+    bool found = false;
+    {
+      chi::ScopedCoRwReadLock lock(tag_map_lock_);
+      TagInfo *info = tag_id_to_info_.find(tag_id);
+      if (info != nullptr) {
+        stored = info->tag_name_.str();
+        found = true;
+      }
+      // ResolveTagName walks parent ids in tag_id_to_info_; keep it under the
+      // same read lock so the hierarchy can't shift mid-resolution.
+      if (found) {
+        std::string full = ResolveTagName(stored);
+        task->tag_name_ = chi::priv::string(CLIO_PRIV_ALLOC, full);
+      }
+    }
+    task->found_ = found ? 1 : 0;
+    task->return_code_ = 0;  // found_ conveys existence; the op itself is fine
+  } catch (const std::exception &e) {
+    HLOG(kError, "GetTagName failed: {}", e.what());
     task->return_code_ = 1;
   }
   CLIO_CO_RETURN;
@@ -1730,6 +2268,69 @@ TagId Runtime::GetOrAssignTagId(const std::string &tag_name,
   }
 
   return tag_id;
+}
+
+std::string Runtime::ResolveTagName(const std::string &stored_name,
+                                    int depth) {
+  // Guard against pathological / cyclic parent references.
+  if (depth > 256) {
+    return stored_name;
+  }
+  TagId parent;
+  std::string leaf;
+  if (!ParseTagRef(stored_name, parent, leaf)) {
+    // Flat name, root "/", or a legacy absolute name stored verbatim.
+    return stored_name;
+  }
+  TagInfo *pinfo = tag_id_to_info_.find(parent);
+  if (pinfo == nullptr) {
+    // Dangling parent (e.g. partially-replayed metadata). Best effort: present
+    // the leaf as a top-level name so the result is still a usable path.
+    return "/" + leaf;
+  }
+  std::string parent_full = ResolveTagName(pinfo->tag_name_.str(), depth + 1);
+  return JoinPath(parent_full, leaf);
+}
+
+TagId Runtime::ResolvePathToIdLocked(const std::string &path) {
+  // Walk from the root, looking up each component's relative key. Returns null
+  // if the root or any intermediate component does not exist.
+  TagId *root = tag_name_to_id_.find(std::string("/"));
+  if (root == nullptr) {
+    return TagId::GetNull();
+  }
+  TagId cur = *root;
+  for (const std::string &comp : SplitPathComponents(path)) {
+    TagId *child = tag_name_to_id_.find(MakeRelativeName(cur, comp));
+    if (child == nullptr) {
+      return TagId::GetNull();
+    }
+    cur = *child;
+  }
+  return cur;
+}
+
+TagId Runtime::GetOrCreateTagChain(const std::string &name,
+                                   const TagId &preferred_id) {
+  if (!IsHierPath(name)) {
+    // Non-path tag: a single flat tag stored verbatim (legacy behavior).
+    return GetOrAssignTagId(name, preferred_id);
+  }
+  // Every absolute path is rooted at the "/" tag (stored literally).
+  TagId parent = GetOrAssignTagId(std::string("/"));
+  std::vector<std::string> comps = SplitPathComponents(name);
+  if (comps.empty()) {
+    // name was "/" (or all slashes): the root tag itself.
+    return parent;
+  }
+  for (size_t i = 0; i < comps.size(); ++i) {
+    const bool is_leaf = (i + 1 == comps.size());
+    // preferred_id (a cross-node hint) only applies to the deepest tag.
+    TagId id = GetOrAssignTagId(MakeRelativeName(parent, comps[i]),
+                                is_leaf ? preferred_id : TagId::GetNull());
+    parent = id;
+  }
+  return parent;
 }
 
 chi::TaskResume Runtime::FlushMetadata(ctp::ipc::FullPtr<FlushMetadataTask> task,
@@ -2640,6 +3241,115 @@ chi::TaskResume Runtime::ExtendBlob(BlobInfo &blob_info, chi::u64 offset,
   CLIO_CO_RETURN;
 }
 
+chi::TaskResume Runtime::ResizeBlob(BlobInfo &blob_info, chi::u64 new_size,
+                                    float blob_score, chi::u32 &error_code,
+                                    int min_persistence_level) {
+#ifdef __NVCOMPILER
+  thread_local chi::RunContext _fb_rctx;
+  chi::RunContext* _fp = chi::GetCurrentRunContextFromWorker();
+  chi::RunContext& rctx = _fp ? *_fp : _fb_rctx;
+#endif
+  error_code = 0;
+  chi::u64 current_size = blob_info.GetTotalSize();
+  if (new_size == current_size) {
+    CLIO_CO_RETURN;
+  }
+  if (new_size > current_size) {
+    // Grow: allocate appended blocks up to new_size (shared with ExtendBlob)...
+    CLIO_CO_AWAIT(ExtendBlob(blob_info, 0, new_size, blob_score, error_code,
+                             min_persistence_level));
+    if (error_code != 0) {
+      CLIO_CO_RETURN;
+    }
+    // ...then zero the grown region. Newly allocated blocks are not zeroed
+    // (the bdev recycles freed blocks), and a resize-grow (e.g. ftruncate up,
+    // or a truncate-down whose target exceeds the blob's physical extent after
+    // sparse writes) must read back as zeros. Unlike PutBlob, no caller data
+    // overwrites this region, so zero all of [current_size, new_size).
+    chi::u64 grow = new_size - current_size;
+    auto *ipc_mgr = CLIO_IPC;
+    ctp::ipc::FullPtr<char> zbuf = ipc_mgr->AllocateBuffer(grow);
+    if (zbuf.IsNull()) {
+      error_code = 4;
+      CLIO_CO_RETURN;
+    }
+    std::memset(zbuf.ptr_, 0, grow);
+    chi::u32 zero_result = 0;
+    CLIO_CO_AWAIT(ModifyExistingData(blob_info.blocks_,
+                                zbuf.shm_.template Cast<void>(), grow,
+                                current_size, zero_result));
+    ipc_mgr->FreeBuffer(zbuf);
+    error_code = zero_result;
+    CLIO_CO_RETURN;
+  }
+
+  // Shrink: keep the blocks covering [0, new_size); free the rest. The block
+  // straddling new_size is trimmed logically (its physical tail stays
+  // allocated within that block and is reclaimed when the block is freed).
+  std::vector<BlobBlock> keep;
+  std::vector<BlobBlock> drop;
+  chi::u64 block_start = 0;
+  for (size_t i = 0; i < blob_info.blocks_.size(); ++i) {
+    BlobBlock blk = blob_info.blocks_[i];
+    chi::u64 block_end = block_start + blk.size_;
+    if (block_start >= new_size) {
+      drop.push_back(blk);  // entirely beyond the new end
+    } else if (block_end > new_size) {
+      blk.size_ = new_size - block_start;  // boundary block: trim
+      keep.push_back(blk);
+    } else {
+      keep.push_back(blk);
+    }
+    block_start = block_end;
+  }
+
+  // Rebuild blocks_ with only the kept blocks.
+  blob_info.blocks_.clear();
+  for (auto &b : keep) {
+    blob_info.blocks_.push_back(b);
+  }
+
+  // Free the dropped blocks, grouped by pool, and credit remaining_space_
+  // (mirrors FreeAllBlobBlocks).
+  std::unordered_map<chi::PoolId, std::pair<chi::PoolQuery,
+                                            std::vector<clio::run::bdev::Block>>>
+      blocks_by_pool;
+  for (const auto &blob_block : drop) {
+    chi::PoolId pool_id = blob_block.bdev_client_.pool_id_;
+    clio::run::bdev::Block block;
+    block.offset_ = blob_block.target_offset_;
+    block.size_ = blob_block.size_;
+    block.block_type_ = 0;
+    if (blocks_by_pool.find(pool_id) == blocks_by_pool.end()) {
+      blocks_by_pool[pool_id] = std::make_pair(
+          blob_block.target_query_, std::vector<clio::run::bdev::Block>());
+    }
+    blocks_by_pool[pool_id].second.push_back(block);
+  }
+  for (const auto &pool_entry : blocks_by_pool) {
+    const chi::PoolId &pool_id = pool_entry.first;
+    const chi::PoolQuery &target_query = pool_entry.second.first;
+    const std::vector<clio::run::bdev::Block> &blocks = pool_entry.second.second;
+    chi::u64 bytes_freed = 0;
+    for (const auto &block : blocks) {
+      bytes_freed += block.size_;
+    }
+    clio::run::bdev::Client bdev_client(pool_id);
+    auto free_task = bdev_client.AsyncFreeBlocks(target_query, blocks);
+    CLIO_CO_AWAIT(free_task);
+    if (free_task->GetReturnCode() == 0) {
+      chi::ScopedCoRwReadLock read_lock(target_lock_);
+      TargetInfo *target_info = registered_targets_.find(pool_id);
+      if (target_info != nullptr) {
+        ctp::ipc::atomic_ref<chi::u64>(target_info->remaining_space_)
+            .fetch_add(bytes_freed, std::memory_order_relaxed);
+      }
+    }
+  }
+  error_code = 0;
+  CLIO_CO_RETURN;
+}
+
 chi::TaskResume Runtime::ModifyExistingData(
     const chi::priv::vector<BlobBlock> &blocks, ctp::ipc::ShmPtr<> data, size_t data_size,
     size_t data_offset_in_blob, chi::u32 &error_code) {
@@ -3380,17 +4090,19 @@ chi::TaskResume Runtime::TagQuery(ctp::ipc::FullPtr<TagQueryTask> task,
     // Create regex pattern
     std::regex pattern(tag_regex);
 
-    // Collect matching tags (name + id)
+    // Collect matching tags (resolved full name + id). Tag names are stored
+    // relatively, so resolve each to its absolute form before matching and
+    // return the resolved name to the caller.
     std::vector<std::pair<std::string, TagId>> matching_tags;
     tag_name_to_id_.for_each(
-        [&pattern, &matching_tags](const std::string &tag_name,
-                                   const TagId &tag_id) {
-          if (std::regex_match(tag_name, pattern)) {
-            matching_tags.emplace_back(tag_name, tag_id);
+        [&](const std::string &stored, const TagId &tag_id) {
+          std::string full = ResolveTagName(stored);
+          if (std::regex_match(full, pattern)) {
+            matching_tags.emplace_back(full, tag_id);
           }
         });
 
-    // Total matched tags (summed across replicas during Aggregate)
+    // Total matched tags (summed across replicas during AggregateOut)
     task->total_tags_matched_ = matching_tags.size();
 
     // Build results: just tag names matching the query. Respect max_tags_ if
@@ -3433,13 +4145,13 @@ chi::TaskResume Runtime::BlobQuery(ctp::ipc::FullPtr<BlobQueryTask> task,
     std::regex tag_pattern(tag_regex);
     std::regex blob_pattern(blob_regex);
 
-    // Find matching tag IDs and names
+    // Find matching tag IDs and resolved names.
     std::vector<std::pair<std::string, TagId>> matching_tags;
     tag_name_to_id_.for_each(
-        [&tag_pattern, &matching_tags](const std::string &tag_name,
-                                       const TagId &tag_id) {
-          if (std::regex_match(tag_name, tag_pattern)) {
-            matching_tags.emplace_back(tag_name, tag_id);
+        [&](const std::string &stored, const TagId &tag_id) {
+          std::string full = ResolveTagName(stored);
+          if (std::regex_match(full, tag_pattern)) {
+            matching_tags.emplace_back(full, tag_id);
           }
         });
 
@@ -3562,10 +4274,10 @@ chi::TaskResume Runtime::SemanticSearch(
   // (same iteration as BlobQuery).
   std::vector<std::pair<std::string, TagId>> matching_tags;
   tag_name_to_id_.for_each(
-      [&tag_pattern, &matching_tags](const std::string &tag_name,
-                                     const TagId &tag_id) {
-        if (std::regex_match(tag_name, tag_pattern)) {
-          matching_tags.emplace_back(tag_name, tag_id);
+      [&](const std::string &stored, const TagId &tag_id) {
+        std::string full = ResolveTagName(stored);
+        if (std::regex_match(full, tag_pattern)) {
+          matching_tags.emplace_back(full, tag_id);
         }
       });
 
@@ -3734,10 +4446,10 @@ chi::TaskResume Runtime::TemporalSearch(
   // Step 1: collect matching tags (same as BlobQuery / SemanticSearch).
   std::vector<std::pair<std::string, TagId>> matching_tags;
   tag_name_to_id_.for_each(
-      [&tag_pattern, &matching_tags](const std::string &tag_name,
-                                     const TagId &tag_id) {
-        if (std::regex_match(tag_name, tag_pattern)) {
-          matching_tags.emplace_back(tag_name, tag_id);
+      [&](const std::string &stored, const TagId &tag_id) {
+        std::string full = ResolveTagName(stored);
+        if (std::regex_match(full, tag_pattern)) {
+          matching_tags.emplace_back(full, tag_id);
         }
       });
 

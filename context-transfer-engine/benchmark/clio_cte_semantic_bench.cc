@@ -40,7 +40,7 @@
  * 2. Issues ONE broadcast SemanticSearch for that keyword and asks for a
  *    configurable number of top-k results. With a broadcast query every
  *    tag-owning container scores its slice and returns its local top-k;
- *    SemanticSearchTask::Aggregate then merges those partial sets and keeps
+ *    SemanticSearchTask::AggregateOut then merges those partial sets and keeps
  *    the global top-k by descending BM25 score.
  *
  * On completion it prints an overall retrieval-performance summary — the

@@ -276,7 +276,7 @@ TEST_CASE("ReorganizeBlob - PutBlob to DRAM", "[reorganize][put][dram]") {
 /**
  * Test: ReorganizeBlob to score=0.2 (should move to disk)
  */
-TEST_CASE("ReorganizeBlob - Move to Disk", "[reorganize][move][disk]") {
+TEST_CASE("ReorganizeBlob - Move to Disk", "[reorganize][move][disk][noleak]") {
   REQUIRE(g_fixture != nullptr);
   REQUIRE(g_fixture->initialized_);
 
@@ -354,7 +354,7 @@ TEST_CASE("ReorganizeBlob - Verify Data Integrity", "[reorganize][integrity]") {
 /**
  * Test: ReorganizeBlob back to DRAM (promote data)
  */
-TEST_CASE("ReorganizeBlob - Promote to DRAM", "[reorganize][promote][dram]") {
+TEST_CASE("ReorganizeBlob - Promote to DRAM", "[reorganize][promote][dram][noleak]") {
   REQUIRE(g_fixture != nullptr);
   REQUIRE(g_fixture->initialized_);
 

@@ -113,6 +113,17 @@ class PoolManager {
   void Finalize();
 
   /**
+   * Destroy (delete) every registered container via its ChiMod's destroy_func,
+   * running each container's C++ destructor so its runtime-heap data is freed
+   * (CTE's metadata maps, bdev's RAM pages + file descriptors, the container
+   * object itself). Used on graceful shutdown to release this memory instead of
+   * leaking it until process exit. Must be called while the ChiMod shared
+   * libraries are still loaded (before ModuleManager::Finalize()) and after the
+   * workers are stopped (no concurrent container access).
+   */
+  void DestroyAllContainers();
+
+  /**
    * Register a Container with a specific PoolId and ContainerId
    * @param pool_id Pool identifier
    * @param container_id Container identifier

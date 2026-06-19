@@ -1586,6 +1586,57 @@ TEST_CASE("bdev_parallel_io_operations", "[bdev][parallel][io]") {
 }
 
 //==============================================================================
+// ManyToOne collective batch + aggregate (#587)
+//==============================================================================
+
+// Submits several AllocateBlocks tasks with PoolQuery::ManyToOne sharing the
+// same (container_hash, batch_key). On a single node the local node IS the
+// neighborhood leader, so the tasks are parked, batched within the batch_for
+// window, aggregated into one task, executed once, and the result is broadcast
+// back to every submitter. Each submitter's future must complete with the
+// aggregate's blocks.
+TEST_CASE("bdev_manytoone_batch", "[bdev][manytoone]") {
+  BdevChimodFixture fixture;
+  REQUIRE(g_initialized);
+  std::this_thread::sleep_for(100ms);
+
+  chi::PoolId custom_pool_id(8009, 0);
+  clio::run::bdev::Client bdev_client(custom_pool_id);
+
+  const chi::u64 ram_size = 1024 * 1024;
+  std::string pool_name =
+      "manytoone_" + std::to_string(getpid()) + "_" + std::to_string(8009);
+  bool bdev_success = BdevChimodFixture::CreateBdevAsync(
+      bdev_client, chi::PoolQuery::Dynamic(), pool_name, custom_pool_id,
+      clio::run::bdev::BdevType::kRam, ram_size);
+  REQUIRE(bdev_success);
+  std::this_thread::sleep_for(100ms);
+
+  // Submit a batch of ManyToOne allocations sharing one (hash, key). A 2ms
+  // window comfortably covers issuing all requests before the flush fires.
+  constexpr int kBatch = 4;
+  constexpr chi::u32 kContainerHash = 0;
+  constexpr chi::u64 kBatchKey = 0;
+  constexpr chi::u64 kBatchForNs = 2'000'000;  // 2ms
+
+  std::vector<chi::Future<clio::run::bdev::AllocateBlocksTask>> futures;
+  futures.reserve(kBatch);
+  for (int i = 0; i < kBatch; ++i) {
+    auto q = chi::PoolQuery::ManyToOne(kContainerHash, kBatchKey, kBatchForNs);
+    futures.push_back(bdev_client.AsyncAllocateBlocks(q, k4KB));
+  }
+
+  // Every submitter must complete successfully with the broadcast result.
+  for (int i = 0; i < kBatch; ++i) {
+    futures[i].Wait();
+    REQUIRE(futures[i]->return_code_ == 0);
+    REQUIRE(futures[i]->blocks_.size() > 0);
+    HLOG(kInfo, "ManyToOne member {} got {} block(s)", i,
+         futures[i]->blocks_.size());
+  }
+}
+
+//==============================================================================
 // MAIN TEST RUNNER
 //==============================================================================
 

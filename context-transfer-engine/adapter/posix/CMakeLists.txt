@@ -10,11 +10,8 @@ target_include_directories(clio_cte_posix PRIVATE
   ${CLIO_CTE_ROOT}                   # For adapter/adapter_types.h include path
 )
 
-add_dependencies(clio_cte_posix clio_cte_fs_base)
 target_link_libraries(clio_cte_posix
-        MPI::MPI_CXX
-        stdc++fs
-        clio_cte_fs_base          # Provides filesystem headers
+        clio_cte_cfs_adapter      # cfs-backed I/O core (context-filesystem chimod)
         clio_cte_core_client      # Provides core and bdev headers transitively
         ctp::cxx
         ctp::interceptor)       # Provides ELF support and CTP_ENABLE_ELF definition

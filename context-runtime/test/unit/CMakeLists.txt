@@ -762,6 +762,18 @@ if(CLIO_CORE_ENABLE_TESTS)
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500"
   )
+
+  # Runtime-heap leak regression (issue #563 / #560). Runs only the leak-check
+  # test case under force-net so every RPC exercises the ZMQ cpu2cpu path that
+  # allocates the server-side FutureShm. The assertion is active only when the
+  # build defines CTP_ALLOC_TRACK_SIZE (-DCLIO_CORE_ENABLE_LEAK_CHECK=ON);
+  # otherwise it is a fast no-op, so it is safe to register unconditionally.
+  clio_add_force_net_test(
+    NAME cr_streaming_leak_force_net
+    COMMAND ${STREAMING_TEST_TARGET} "Runtime Heap Leak Check"
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500"
+  )
   if(CLIO_CORE_ENABLE_CAE)
   clio_add_force_net_test(
     NAME cr_autogen_coverage_force_net

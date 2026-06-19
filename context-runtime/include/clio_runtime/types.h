@@ -460,6 +460,10 @@ struct AddressHash {
   BIT_OPT(chi::u32, 7)  ///< Task does not need a response. Wait/co_await return
                         ///< instantly; SendOut, ClientSend, and
                         ///< IpcManager::SendRuntime are skipped.
+#define TASK_BATCH_AGGREGATE \
+  BIT_OPT(chi::u32, 8)  ///< ManyToOne: this is the synthetic aggregate task the
+                        ///< neighborhood leader runs for a batch. On completion,
+                        ///< its OUT is broadcast to the batched original tasks.
 
 // Bulk transfer flags are defined in clio_ctp/lightbeam/lightbeam.h:
 // - BULK_EXPOSE: Bulk is exposed (sender exposes for reading)

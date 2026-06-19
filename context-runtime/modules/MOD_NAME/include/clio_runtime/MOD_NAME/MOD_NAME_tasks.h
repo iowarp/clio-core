@@ -148,12 +148,74 @@ struct CustomTask : public chi::Task {
   }
 
   /**
-   * Aggregate replica results into this task
+   * AggregateOut replica results into this task
    * @param other Pointer to the replica task to aggregate from
    */
-  void Aggregate(const ctp::ipc::FullPtr<chi::Task> &other_base) {
-    Task::Aggregate(other_base);
+  void AggregateOut(const ctp::ipc::FullPtr<chi::Task> &other_base) {
+    Task::AggregateOut(other_base);
     Copy(other_base.template Cast<CustomTask>());
+  }
+};
+
+/**
+ * ManyToOneSumTask - collective sum, used to exercise AggregateIn for the
+ * PoolQuery::ManyToOne path.
+ *
+ * Each submitter contributes value_. On the neighborhood leader the batch is
+ * folded into one aggregate task via AggregateIn (summing value_), which runs
+ * once and echoes the combined total into sum_; that single result is then
+ * broadcast (SerializeOut copy-back) to every submitter. After completion all
+ * submitters' sum_ equals the sum of the whole batch's value_.
+ */
+struct ManyToOneSumTask : public chi::Task {
+  IN chi::u64 value_;  // this submitter's contribution
+  OUT chi::u64 sum_;   // collective total (broadcast to all members)
+
+  /** SHM default constructor */
+  ManyToOneSumTask() : chi::Task(), value_(0), sum_(0) {}
+
+  /** Emplace constructor */
+  explicit ManyToOneSumTask(const chi::TaskId &task_node,
+                            const chi::PoolId &pool_id,
+                            const chi::PoolQuery &pool_query, chi::u64 value)
+      : chi::Task(task_node, pool_id, pool_query, Method::kManyToOneSum),
+        value_(value), sum_(0) {
+    task_id_ = task_node;
+    pool_id_ = pool_id;
+    method_ = Method::kManyToOneSum;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  ~ManyToOneSumTask() {}
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+    ar(value_);
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+    ar(sum_);
+  }
+
+  void Copy(const ctp::ipc::FullPtr<ManyToOneSumTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+    value_ = other->value_;
+    sum_ = other->sum_;
+  }
+
+  /** AggregateOut: gather replica OUT — sum partial totals (N->1). */
+  void AggregateOut(const ctp::ipc::FullPtr<chi::Task> &other_base) {
+    Task::AggregateOut(other_base);
+    sum_ += other_base.template Cast<ManyToOneSumTask>()->sum_;
+  }
+
+  /** AggregateIn: fold a batched member's input contribution into this. */
+  void AggregateIn(const ctp::ipc::FullPtr<chi::Task> &member_base) {
+    value_ += member_base.template Cast<ManyToOneSumTask>()->value_;
   }
 };
 
@@ -210,11 +272,11 @@ struct CoMutexTestTask : public chi::Task {
   }
 
   /**
-   * Aggregate replica results into this task
+   * AggregateOut replica results into this task
    * @param other Pointer to the replica task to aggregate from
    */
-  void Aggregate(const ctp::ipc::FullPtr<chi::Task> &other_base) {
-    Task::Aggregate(other_base);
+  void AggregateOut(const ctp::ipc::FullPtr<chi::Task> &other_base) {
+    Task::AggregateOut(other_base);
     Copy(other_base.template Cast<CoMutexTestTask>());
   }
 };
@@ -275,11 +337,11 @@ struct CoRwLockTestTask : public chi::Task {
   }
 
   /**
-   * Aggregate replica results into this task
+   * AggregateOut replica results into this task
    * @param other Pointer to the replica task to aggregate from
    */
-  void Aggregate(const ctp::ipc::FullPtr<chi::Task> &other_base) {
-    Task::Aggregate(other_base);
+  void AggregateOut(const ctp::ipc::FullPtr<chi::Task> &other_base) {
+    Task::AggregateOut(other_base);
     Copy(other_base.template Cast<CoRwLockTestTask>());
   }
 };
@@ -340,11 +402,11 @@ struct WaitTestTask : public chi::Task {
   }
 
   /**
-   * Aggregate replica results into this task
+   * AggregateOut replica results into this task
    * @param other Pointer to the replica task to aggregate from
    */
-  void Aggregate(const ctp::ipc::FullPtr<chi::Task> &other_base) {
-    Task::Aggregate(other_base);
+  void AggregateOut(const ctp::ipc::FullPtr<chi::Task> &other_base) {
+    Task::AggregateOut(other_base);
     Copy(other_base.template Cast<WaitTestTask>());
   }
 };
@@ -398,11 +460,11 @@ struct TestLargeOutputTask : public chi::Task {
   }
 
   /**
-   * Aggregate replica results into this task
+   * AggregateOut replica results into this task
    * @param other Pointer to the replica task to aggregate from
    */
-  void Aggregate(const ctp::ipc::FullPtr<chi::Task> &other_base) {
-    Task::Aggregate(other_base);
+  void AggregateOut(const ctp::ipc::FullPtr<chi::Task> &other_base) {
+    Task::AggregateOut(other_base);
     Copy(other_base.template Cast<TestLargeOutputTask>());
   }
 };
@@ -467,11 +529,11 @@ struct GpuSubmitTask : public chi::Task {
   }
 
   /**
-   * Aggregate replica results into this task
+   * AggregateOut replica results into this task
    * @param other Pointer to the replica task to aggregate from
    */
-  CTP_CROSS_FUN void Aggregate(const ctp::ipc::FullPtr<chi::Task> &other_base) {
-    Task::Aggregate(other_base);
+  CTP_CROSS_FUN void AggregateOut(const ctp::ipc::FullPtr<chi::Task> &other_base) {
+    Task::AggregateOut(other_base);
     Copy(other_base.template Cast<GpuSubmitTask>());
   }
 };
@@ -523,8 +585,8 @@ struct SubtaskTestTask : public chi::Task {
     result_value_ = other->result_value_;
   }
 
-  void Aggregate(const ctp::ipc::FullPtr<chi::Task> &other_base) {
-    Task::Aggregate(other_base);
+  void AggregateOut(const ctp::ipc::FullPtr<chi::Task> &other_base) {
+    Task::AggregateOut(other_base);
     Copy(other_base.template Cast<SubtaskTestTask>());
   }
 };

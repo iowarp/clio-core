@@ -465,12 +465,12 @@ class Task {
    * tasks Sets this task's return code to the replica's return code if replica
    * has non-zero return code Accepts any task type that inherits from Task
    *
-   * IMPORTANT: Derived classes that override Aggregate MUST call
-   * Task::Aggregate(replica_task) first before aggregating their own fields.
+   * IMPORTANT: Derived classes that override AggregateOut MUST call
+   * Task::AggregateOut(replica_task) first before aggregating their own fields.
    *
    * @param replica_task The replica task to aggregate from
    */
-  void Aggregate(const ctp::ipc::FullPtr<Task>& replica_task) {
+  void AggregateOut(const ctp::ipc::FullPtr<Task>& replica_task) {
     // Propagate return code from replica to this task
     if (!replica_task.IsNull() && replica_task->GetReturnCode() != 0) {
       SetReturnCode(replica_task->GetReturnCode());
@@ -481,6 +481,20 @@ class Task {
     }
     HLOG(kDebug, "[COMPLETER] Aggregated task {} with completer {}", task_id_,
          GetCompleter());
+  }
+
+  /**
+   * Combine a batched member's INPUTS into this aggregate task (ManyToOne).
+   * Counterpart to AggregateOut: AggregateOut merges a replica's OUT fields
+   * (N->1 gather), while AggregateIn folds a member's IN fields into the single
+   * collective aggregate task that runs once for the batch. Default is a no-op
+   * (aggregate = copy of the first member: a barrier/dedup collective). Derived
+   * tasks whose collective combines inputs (sum, max, concat, ...) override it.
+   *
+   * @param member_task The batched member whose inputs are folded in
+   */
+  void AggregateIn(const ctp::ipc::FullPtr<Task>& member_task) {
+    (void)member_task;
   }
 
   /**

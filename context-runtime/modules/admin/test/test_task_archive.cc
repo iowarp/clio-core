@@ -617,10 +617,10 @@ public:
     (void)task_ptr;
   }
 
-  void Aggregate(chi::u32 method, ctp::ipc::FullPtr<chi::Task> orig_task,
+  void AggregateOut(chi::u32 method, ctp::ipc::FullPtr<chi::Task> orig_task,
                  const ctp::ipc::FullPtr<chi::Task>& replica_task) override {
     (void)method;
-    orig_task->Aggregate(replica_task);
+    orig_task->AggregateOut(replica_task);
   }
 
   void DelTask(chi::u32 method, ctp::ipc::FullPtr<chi::Task> task_ptr) override {

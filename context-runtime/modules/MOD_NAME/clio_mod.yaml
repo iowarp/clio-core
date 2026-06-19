@@ -22,3 +22,4 @@ kWaitTest: 23           # Wait test method
 kTestLargeOutput: 24    # Test large output streaming (1MB)
 kGpuSubmit: 25          # GPU task submission test (Part 3)
 kSubtaskTest: 26        # GPU coroutine subtask test
+kManyToOneSum: 27       # ManyToOne collective: AggregateIn sums member inputs

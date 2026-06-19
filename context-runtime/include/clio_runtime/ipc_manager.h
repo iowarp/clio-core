@@ -51,6 +51,7 @@
 #include "clio_ctp/util/gpu_intrinsics.h"
 #include "clio_runtime/manager.h"
 #include "clio_runtime/corwlock.h"
+#include "clio_runtime/batch_manager.h"
 #include "clio_runtime/scheduler/scheduler.h"
 #include "clio_runtime/task.h"
 #include "clio_runtime/task_archives.h"
@@ -185,6 +186,20 @@ struct ClientShmInfo {
  * and priority queues for task processing.
  * Uses CTP global cross pointer variable singleton pattern.
  */
+#if defined(CTP_ALLOC_TRACK_SIZE) && CTP_IS_HOST
+// Leak-check accounting for tasks. NewTask uses global operator new (not the
+// CTP_MALLOC allocator), so the allocator's GetCurrentlyAllocatedSize() does not
+// see task allocations. Track the net outstanding NewTask bytes here so that
+// GetRuntimeHeapAllocatedBytes() — and thus the leak detector — also catches an
+// unfreed NewTask. NewTask increments, DelTask decrements; AllocLoadTask routes
+// through NewTask, so client and runtime task allocations are both covered and
+// stay balanced. Only compiled in leak-check builds.
+inline std::atomic<long long> &RuntimeTaskAllocBytes() {
+  static std::atomic<long long> bytes{0};
+  return bytes;
+}
+#endif
+
 class IpcManager {
   friend struct IpcCpu2Self;
   friend struct IpcCpu2Cpu;
@@ -254,6 +269,19 @@ class IpcManager {
     return main_allocator_;
   }
 
+  /**
+   * Bytes currently allocated-but-not-freed from the runtime's private heap
+   * (CTP_MALLOC). In runtime mode AllocateBuffer/NewObj/NewTask draw from this
+   * allocator, so this is the figure a leak test snapshots before/after a
+   * workload: a non-zero steady-state delta means a runtime-internal allocation
+   * was never freed (e.g. the server-side FutureShm leak in #560).
+   *
+   * Only meaningful when built with CLIO_CORE_ENABLE_LEAK_CHECK
+   * (CTP_ALLOC_TRACK_SIZE); returns 0 otherwise. Shared-memory allocator
+   * coverage (main_allocator_, alloc_map_) is a planned follow-up.
+   */
+  size_t GetRuntimeHeapAllocatedBytes() const;
+
   // GetIpcManagerGpuInfo / GetIpcManagerGpu were the orchestrator-info
   // accessors and have been removed. Use
   // GetGpuIpcManager()->GetGpuInfo(gpu_id) to obtain per-device info.
@@ -288,6 +316,9 @@ class IpcManager {
   ctp::ipc::FullPtr<TaskT> NewTask(Args &&...args) {
     TaskT *ptr = new TaskT(std::forward<Args>(args)...);
     ptr->pod_size_ = static_cast<u32>(sizeof(TaskT));
+#if defined(CTP_ALLOC_TRACK_SIZE) && CTP_IS_HOST
+    RuntimeTaskAllocBytes() += static_cast<long long>(sizeof(TaskT));
+#endif
     ctp::ipc::FullPtr<TaskT> result(ptr);
     return result;
   }
@@ -311,6 +342,9 @@ class IpcManager {
   template <typename TaskT>
   void DelTask(ctp::ipc::FullPtr<TaskT> task_ptr) {
     if (task_ptr.IsNull()) return;
+#if defined(CTP_ALLOC_TRACK_SIZE) && CTP_IS_HOST
+    RuntimeTaskAllocBytes() -= static_cast<long long>(sizeof(TaskT));
+#endif
     task_ptr.ptr_->~TaskT();
     void *raw = static_cast<void *>(task_ptr.ptr_);
     ::operator delete(raw);
@@ -613,6 +647,14 @@ class IpcManager {
   RouteResult RouteGlobal(Future<Task> &future,
                           const std::vector<PoolQuery> &pool_queries);
 
+  /**
+   * Route a ManyToOne task: forward to the neighborhood leader, or — if this
+   * node is the leader — park it in the BatchManager for collective
+   * batch+aggregate. Returns RouteResult::Local when parked (the worker takes
+   * no further action; completion happens later via the batch flush).
+   */
+  RouteResult RouteManyToOne(Future<Task> &future);
+
   // RouteToGpu / cpu→gpu dispatch removed along with the GPU runtime.
 
   /**
@@ -845,6 +887,17 @@ class IpcManager {
    * Check if this node is the current leader
    */
   bool IsLeader() const;
+
+  /**
+   * Get the neighborhood leader for a given node: the lowest alive node_id in
+   * the window [base, base + N), base = floor(for_node / N) * N, N =
+   * GetNeighborhoodSize(). Used by ManyToOne routing. Deterministic across the
+   * neighborhood; falls back to for_node if no other alive members.
+   */
+  u64 GetNeighborhoodLeaderNodeId(u64 for_node) const;
+
+  /** Neighborhood leader for this node (GetNeighborhoodLeaderNodeId(self)). */
+  u64 GetNeighborhoodLeaderNodeId() const;
 
   struct DeadNodeEntry {
     u64 node_id;
@@ -1154,6 +1207,9 @@ class IpcManager {
    */
   Scheduler *GetScheduler() { return scheduler_.get(); }
 
+  /** Get the ManyToOne batch/aggregation manager (leader-side). */
+  BatchManager *GetBatchManager() { return batch_manager_.get(); }
+
   /**
    * Register an existing shared memory segment into the IpcManager
    * Called by worker when encountering an unknown allocator in a FutureShm
@@ -1454,6 +1510,7 @@ class IpcManager {
 
   // Scheduler for task routing
   std::unique_ptr<Scheduler> scheduler_;
+  std::unique_ptr<BatchManager> batch_manager_;
 
   //============================================================================
   // Per-Process Shared Memory Management

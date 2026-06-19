@@ -65,7 +65,12 @@ public:
   using CreateParams = clio::cte::core::CreateParams; // Required for CLIO_TASK_CC
 
   Runtime() = default;
-  ~Runtime() override = default;
+  // Virtual destructor performs the same metadata/WAL cleanup as the Destroy()
+  // method, so deleting the container on graceful shutdown (PoolManager::
+  // DestroyAllContainers) frees this module's runtime-heap state — closing the
+  // WAL files and clearing the tag/blob/target maps — instead of leaking it
+  // until process exit.
+  ~Runtime() override;
 
   /**
    * Fix up POD task members (chi::priv::string SSO data_ pointers,
@@ -154,10 +159,39 @@ public:
   chi::TaskResume DelBlob(ctp::ipc::FullPtr<DelBlobTask> task, chi::RunContext &ctx);
 
   /**
+   * Truncate blob (Method::kTruncateBlob) - resize a blob to an exact logical
+   * size (grow/shrink) via the shared ResizeBlob helper.
+   */
+  chi::TaskResume TruncateBlob(ctp::ipc::FullPtr<TruncateBlobTask> task,
+                               chi::RunContext &ctx);
+
+  /**
+   * Rename tag (Method::kRenameTag) - change a tag's name in place, keeping
+   * its TagId (and all blobs). Broadcast op; shares no data movement.
+   */
+  chi::TaskResume RenameTag(ctp::ipc::FullPtr<RenameTagTask> task,
+                            chi::RunContext &ctx);
+
+  /**
+   * GetOrCreateTagAlias (Method::kGetOrCreateTagAlias) - bind an extra name to
+   * an existing tag's id (hard link at the tag level). Broadcast op.
+   */
+  chi::TaskResume GetOrCreateTagAlias(
+      ctp::ipc::FullPtr<GetOrCreateTagAliasTask> task, chi::RunContext &ctx);
+
+  /**
    * Delete tag operation - removes all blobs from tag and removes tag
    * Returns TaskResume for coroutine-based async operations
    */
   chi::TaskResume DelTag(ctp::ipc::FullPtr<DelTagTask> task, chi::RunContext &ctx);
+
+  /**
+   * GetTagName (Method::kGetTagName) - resolve a TagId to its full, absolute
+   * tag name by walking the stored relative "$tagid{parent}/leaf" references.
+   * Broadcast op; the container owning the tag's metadata answers.
+   */
+  chi::TaskResume GetTagName(ctp::ipc::FullPtr<GetTagNameTask> task,
+                             chi::RunContext &ctx);
 
   /**
    * Get tag size operation - returns total size of all blobs in tag
@@ -196,7 +230,7 @@ public:
   ctp::ipc::FullPtr<chi::Task> NewCopyTask(chi::u32 method, ctp::ipc::FullPtr<chi::Task> orig_task_ptr,
                                         bool deep) override;
   ctp::ipc::FullPtr<chi::Task> NewTask(chi::u32 method) override;
-  void Aggregate(chi::u32 method, ctp::ipc::FullPtr<chi::Task> orig_task,
+  void AggregateOut(chi::u32 method, ctp::ipc::FullPtr<chi::Task> orig_task,
                  const ctp::ipc::FullPtr<chi::Task>& replica_task) override;
   void DelTask(chi::u32 method, ctp::ipc::FullPtr<chi::Task> task_ptr) override;
   void LocalLoadTask(chi::u32 method, chi::DefaultLoadArchive &archive,
@@ -372,6 +406,32 @@ private:
                          const TagId &preferred_id = TagId::GetNull());
 
   /**
+   * Get-or-create the chain of tags for an absolute path, returning the id of
+   * the deepest tag. "/a/b/c" creates "/", "/a", "/a/b", "/a/b/c" (each child
+   * stored relative to its parent as "$tagid{parent}/leaf") and returns the id
+   * of "/a/b/c". Non-absolute names are created as a single flat tag.
+   * preferred_id (if set) is applied to the deepest tag only.
+   */
+  TagId GetOrCreateTagChain(const std::string &name,
+                            const TagId &preferred_id = TagId::GetNull());
+
+  /**
+   * Resolve an absolute path to an existing tag id by walking the hierarchy
+   * (no creation). Returns TagId::GetNull() if any component is missing.
+   * Must be called while holding tag_map_lock_.
+   */
+  TagId ResolvePathToIdLocked(const std::string &path);
+
+  /**
+   * Expand a stored (possibly relative "$tagid{parent}/leaf") tag name into its
+   * full absolute name by recursively resolving parent references against
+   * tag_id_to_info_. Flat names and the root "/" resolve to themselves. Lock
+   * free: callers iterate the tag maps with the same discipline used elsewhere.
+   * `depth` guards against pathological/cyclic references.
+   */
+  std::string ResolveTagName(const std::string &stored_name, int depth = 0);
+
+  /**
    * Helper function to generate a new TagId using node_id as major and atomic
    * counter as minor
    */
@@ -453,6 +513,21 @@ private:
    * @param min_persistence_level Minimum persistence level for target filtering
    */
   chi::TaskResume ExtendBlob(BlobInfo &blob_info, chi::u64 offset, chi::u64 size,
+                             float blob_score, chi::u32 &error_code,
+                             int min_persistence_level = 0);
+
+  /**
+   * Resize a blob to exactly new_size: grow (allocate appended blocks via
+   * ExtendBlob) or shrink (free trailing blocks, trim the boundary block).
+   * new_size == 0 frees all blocks. Shared by PutBlob's replace path
+   * (kCtePutReplace) and the explicit TruncateBlob op.
+   * @param blob_info Blob to resize
+   * @param new_size Target logical size in bytes
+   * @param blob_score Score for target selection on grow
+   * @param error_code Output: 0 for success, non-zero for failure
+   * @param min_persistence_level Minimum persistence level for target filtering
+   */
+  chi::TaskResume ResizeBlob(BlobInfo &blob_info, chi::u64 new_size,
                              float blob_score, chi::u32 &error_code,
                              int min_persistence_level = 0);
 

@@ -164,6 +164,17 @@
             }
         },
         {
+            "name": "leak-check",
+            "hidden": false,
+            "inherits": "release",
+            "binaryDir": "${sourceDir}/build-leak",
+            "cacheVariables": {
+                "CLIO_CORE_ENABLE_LEAK_CHECK": "ON",
+                "CLIO_CTP_LOG_LEVEL": "3",
+                "CLIO_CORE_ENABLE_IO_URING": "OFF"
+            }
+        },
+        {
             "name": "asan",
             "hidden": false,
             "generator": "Unix Makefiles",

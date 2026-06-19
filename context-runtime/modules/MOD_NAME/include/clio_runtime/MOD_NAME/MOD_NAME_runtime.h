@@ -145,6 +145,13 @@ public:
   chi::TaskResume SubtaskTest(ctp::ipc::FullPtr<SubtaskTestTask> task, chi::RunContext& rctx);
 
   /**
+   * Handle ManyToOneSum task — the aggregate task's value_ already holds the
+   * summed batch input (folded by AggregateIn); echo it into sum_, which is
+   * broadcast back to every batched submitter.
+   */
+  chi::TaskResume ManyToOneSum(ctp::ipc::FullPtr<ManyToOneSumTask> task, chi::RunContext& rctx);
+
+  /**
    * Handle Monitor task - return msgpack-encoded test data
    * Part of the unified kMonitor:9 interface
    */
@@ -209,8 +216,10 @@ public:
    * Create a new task of the specified method type
    */
   ctp::ipc::FullPtr<chi::Task> NewTask(chi::u32 method) override;
-  void Aggregate(chi::u32 method, ctp::ipc::FullPtr<chi::Task> orig_task,
+  void AggregateOut(chi::u32 method, ctp::ipc::FullPtr<chi::Task> orig_task,
                  const ctp::ipc::FullPtr<chi::Task>& replica_task) override;
+  void AggregateIn(chi::u32 method, ctp::ipc::FullPtr<chi::Task> agg_task,
+                   const ctp::ipc::FullPtr<chi::Task>& member_task) override;
   void DelTask(chi::u32 method, ctp::ipc::FullPtr<chi::Task> task_ptr) override;
 
 };

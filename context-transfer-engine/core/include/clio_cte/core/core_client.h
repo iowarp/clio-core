@@ -349,6 +349,26 @@ class Client : public chi::ContainerClient {
   }
 
   /**
+   * Asynchronously truncate a blob to an exact logical size (grow/shrink).
+   * @param tag_id Tag the blob belongs to
+   * @param blob_name Blob to resize
+   * @param new_size Target size in bytes (0 frees all blocks)
+   * @param pool_query Pool query for task routing (default: Dynamic)
+   */
+  chi::Future<TruncateBlobTask> AsyncTruncateBlob(
+      const TagId &tag_id,
+      const std::string &blob_name,
+      chi::u64 new_size,
+      const chi::PoolQuery &pool_query = chi::PoolQuery::Dynamic()) {
+    auto *ipc_manager = CLIO_CPU_IPC;
+
+    auto task = ipc_manager->NewTask<TruncateBlobTask>(
+        chi::CreateTaskId(), pool_id_, pool_query, tag_id, blob_name, new_size);
+
+    return ipc_manager->Send(task);
+  }
+
+  /**
    * Asynchronous delete tag by tag ID - returns immediately
    * @param tag_id Tag ID to delete
    * @param pool_query Pool query for task routing (default: Dynamic)
@@ -376,6 +396,82 @@ class Client : public chi::ContainerClient {
 
     auto task = ipc_manager->NewTask<DelTagTask>(
         chi::CreateTaskId(), pool_id_, pool_query, tag_name);
+
+    return ipc_manager->Send(task);
+  }
+
+  /**
+   * Rename a tag, keeping its TagId (and all blobs). Broadcast so every
+   * container moves the name binding it holds. tag_id may be null if the
+   * caller only knows the name; pass it when known (e.g. from a prior open).
+   * @param old_name Current tag name
+   * @param new_name Desired tag name
+   * @param tag_id   Tag id (optional; TagId::GetNull() to resolve by name)
+   * @param pool_query Routing (default Broadcast)
+   */
+  chi::Future<RenameTagTask> AsyncRenameTag(
+      const std::string &old_name,
+      const std::string &new_name,
+      const TagId &tag_id = TagId::GetNull(),
+      const chi::PoolQuery &pool_query = chi::PoolQuery::Broadcast()) {
+    auto *ipc_manager = CLIO_CPU_IPC;
+
+    auto task = ipc_manager->NewTask<RenameTagTask>(
+        chi::CreateTaskId(), pool_id_, pool_query, tag_id, old_name, new_name);
+
+    return ipc_manager->Send(task);
+  }
+
+  /**
+   * Bind an additional name to an EXISTING tag's id (tag-level hard link).
+   * The alias shares the target's TagId and therefore all its blobs. If the
+   * target does not exist, the returned task's found_ is 0 (error). Broadcast.
+   * Overload: target identified by TagId.
+   * @param existing_id Target tag id (must exist)
+   * @param alias_name  New name to bind to it
+   */
+  chi::Future<GetOrCreateTagAliasTask> AsyncGetOrCreateTagAlias(
+      const TagId &existing_id,
+      const std::string &alias_name,
+      const chi::PoolQuery &pool_query = chi::PoolQuery::Broadcast()) {
+    auto *ipc_manager = CLIO_CPU_IPC;
+    auto task = ipc_manager->NewTask<GetOrCreateTagAliasTask>(
+        chi::CreateTaskId(), pool_id_, pool_query, existing_id,
+        std::string(), alias_name);
+    return ipc_manager->Send(task);
+  }
+
+  /**
+   * Overload: target identified by name (resolved + verified server-side).
+   * @param existing_name Target tag name (must exist)
+   * @param alias_name    New name to bind to it
+   */
+  chi::Future<GetOrCreateTagAliasTask> AsyncGetOrCreateTagAlias(
+      const std::string &existing_name,
+      const std::string &alias_name,
+      const chi::PoolQuery &pool_query = chi::PoolQuery::Broadcast()) {
+    auto *ipc_manager = CLIO_CPU_IPC;
+    auto task = ipc_manager->NewTask<GetOrCreateTagAliasTask>(
+        chi::CreateTaskId(), pool_id_, pool_query, TagId::GetNull(),
+        existing_name, alias_name);
+    return ipc_manager->Send(task);
+  }
+
+  /**
+   * Resolve a TagId to its full, absolute tag name. Tag names are stored
+   * relatively ("$tagid{parent}/leaf"); this returns the fully-resolved path
+   * (or the verbatim name for a flat tag). Broadcast so the container that
+   * owns the tag's metadata answers; the result is in found_/tag_name_.
+   * @param tag_id Tag ID to resolve
+   * @param pool_query Pool query for task routing (default: Broadcast)
+   */
+  chi::Future<GetTagNameTask> AsyncGetTagName(
+      const TagId &tag_id,
+      const chi::PoolQuery &pool_query = chi::PoolQuery::Broadcast()) {
+    auto *ipc_manager = CLIO_CPU_IPC;
+
+    auto task = ipc_manager->NewTask<GetTagNameTask>(
+        chi::CreateTaskId(), pool_id_, pool_query, tag_id);
 
     return ipc_manager->Send(task);
   }

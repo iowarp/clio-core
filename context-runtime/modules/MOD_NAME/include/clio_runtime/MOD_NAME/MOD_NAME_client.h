@@ -113,6 +113,22 @@ class Client : public chi::ContainerClient {
   }
 
   /**
+   * Submit a ManyToOne collective-sum contribution (asynchronous).
+   * Pass a PoolQuery::ManyToOne(...) so the request is batched + summed at the
+   * neighborhood leader; the resulting future's sum_ is the batch total.
+   * @param pool_query Routing (use PoolQuery::ManyToOne for the collective)
+   * @param value This submitter's contribution
+   * @return Future for the ManyToOneSumTask
+   */
+  chi::Future<ManyToOneSumTask> AsyncManyToOneSum(
+      const chi::PoolQuery& pool_query, chi::u64 value) {
+    auto* ipc_manager = CLIO_CPU_IPC;
+    auto task = ipc_manager->NewTask<ManyToOneSumTask>(
+        chi::CreateTaskId(), pool_id_, pool_query, value);
+    return ipc_manager->Send(task);
+  }
+
+  /**
    * Execute CoMutex test (asynchronous)
    * @param pool_query Pool routing information
    * @param test_id Test identifier

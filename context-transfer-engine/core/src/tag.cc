@@ -40,7 +40,7 @@
 
 namespace clio::cte::core {
 
-// Aggregate timing for Tag::PutBlob(const char*) — broken down into the
+// AggregateOut timing for Tag::PutBlob(const char*) — broken down into the
 // four steps that path performs per call (alloc shm, memcpy, sync RPC,
 // free). Counters are flushed by FlushPutBlobTiming(); the POSIX adapter
 // calls that at the end of each Filesystem::Write so we get one summary

@@ -545,61 +545,61 @@ ctp::ipc::FullPtr<chi::Task> Runtime::NewTask(chi::u32 method) {
   }
 }
 
-void Runtime::Aggregate(chi::u32 method, ctp::ipc::FullPtr<chi::Task> orig_task,
+void Runtime::AggregateOut(chi::u32 method, ctp::ipc::FullPtr<chi::Task> orig_task,
                         const ctp::ipc::FullPtr<chi::Task>& replica_task) {
   switch (method) {
     case Method::kCreate: {
       auto typed_task = orig_task.template Cast<CreateTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kDestroy: {
       auto typed_task = orig_task.template Cast<DestroyTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kMonitor: {
       auto typed_task = orig_task.template Cast<MonitorTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kParseOmni: {
       auto typed_task = orig_task.template Cast<ParseOmniTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kProcessHdf5Dataset: {
       auto typed_task = orig_task.template Cast<ProcessHdf5DatasetTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kExportData: {
       auto typed_task = orig_task.template Cast<ExportDataTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kPutBlob: {
       auto typed_task = orig_task.template Cast<PutBlobTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kGetBlob: {
       auto typed_task = orig_task.template Cast<GetBlobTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kGetOrCreateTag: {
       auto typed_task = orig_task.template Cast<GetOrCreateTagTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kSemanticSearch: {
       auto typed_task = orig_task.template Cast<SemanticSearchTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     default: {
-      orig_task->Aggregate(replica_task);
+      orig_task->AggregateOut(replica_task);
       break;
     }
   }

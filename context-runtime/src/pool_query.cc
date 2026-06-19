@@ -119,6 +119,20 @@ PoolQuery PoolQuery::Dynamic(float net_timeout) {
   return query;
 }
 
+PoolQuery PoolQuery::ManyToOne(u32 container_hash, u64 batch_key,
+                               u64 batch_for_ns) {
+  PoolQuery query;
+  query.routing_mode_ = RoutingMode::ManyToOne;
+  query.hash_value_ = container_hash;
+  query.container_id_ = 0;
+  query.range_offset_ = 0;
+  query.range_count_ = 0;
+  query.node_id_ = 0;
+  query.batch_key_ = batch_key;
+  query.batch_for_ns_ = batch_for_ns;
+  return query;
+}
+
 PoolQuery PoolQuery::FromString(const std::string& str) {
   // Convert to lowercase for case-insensitive comparison
   std::string lower_str = str;
@@ -150,6 +164,21 @@ PoolQuery PoolQuery::FromString(const std::string& str) {
   } else if (lower_str.rfind("physical:", 0) == 0) {
     u32 node_id = std::stoul(lower_str.substr(9));
     return PoolQuery::Physical(node_id);
+  } else if (lower_str.rfind("many_to_one:", 0) == 0) {
+    // Format: many_to_one:<container_hash>[:<batch_key>[:<batch_for_ns>]]
+    std::string rest = lower_str.substr(12);
+    size_t c1 = rest.find(':');
+    u32 container_hash = std::stoul(rest.substr(0, c1));
+    u64 batch_key = 0, batch_for_ns = 10000;
+    if (c1 != std::string::npos) {
+      std::string rest2 = rest.substr(c1 + 1);
+      size_t c2 = rest2.find(':');
+      batch_key = std::stoull(rest2.substr(0, c2));
+      if (c2 != std::string::npos) {
+        batch_for_ns = std::stoull(rest2.substr(c2 + 1));
+      }
+    }
+    return PoolQuery::ManyToOne(container_hash, batch_key, batch_for_ns);
   } else {
     throw std::invalid_argument(
         "Invalid PoolQuery string: '" + str + "'");
@@ -172,6 +201,9 @@ std::string PoolQuery::ToString() const {
       return "range:" + std::to_string(range_offset_) + ":" + std::to_string(range_count_);
     case RoutingMode::Physical:
       return "physical:" + std::to_string(node_id_);
+    case RoutingMode::ManyToOne:
+      return "many_to_one:" + std::to_string(hash_value_) + ":" +
+             std::to_string(batch_key_) + ":" + std::to_string(batch_for_ns_);
     default:
       return "unknown";
   }

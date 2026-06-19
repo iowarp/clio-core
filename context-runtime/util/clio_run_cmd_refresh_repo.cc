@@ -39,7 +39,7 @@
  *
  * The libexec source files implement Container virtual API methods (Run, Del,
  * SaveTask, LoadTask, AllocLoadTask, LocalLoadTask, LocalAllocLoadTask,
- * NewCopy, Aggregate) with switch-case dispatch.
+ * NewCopy, AggregateOut, AggregateIn) with switch-case dispatch.
  *
  * Usage:
  *     chimaera repo refresh <chimod_repo_path>
@@ -530,8 +530,8 @@ class ChiModGenerator {
     oss << "  }\n";
     oss << "}\n";
     oss << "\n";
-    // Generate Aggregate method - dispatches to typed task's Aggregate
-    oss << "void Runtime::Aggregate(chi::u32 method, ctp::ipc::FullPtr<chi::Task> orig_task,\n";
+    // Generate AggregateOut method - dispatches to typed task's AggregateOut
+    oss << "void Runtime::AggregateOut(chi::u32 method, ctp::ipc::FullPtr<chi::Task> orig_task,\n";
     oss << "                        const ctp::ipc::FullPtr<chi::Task>& replica_task) {\n";
     oss << "  switch (method) {\n";
 
@@ -539,13 +539,35 @@ class ChiModGenerator {
       std::string task_type = GetTaskTypeName(method.method_name, chimod_name);
       oss << "    case Method::" << method.constant_name << ": {\n";
       oss << "      auto typed_task = orig_task.template Cast<" << task_type << ">();\n";
-      oss << "      typed_task->Aggregate(replica_task);\n";
+      oss << "      typed_task->AggregateOut(replica_task);\n";
       oss << "      break;\n";
       oss << "    }\n";
     }
 
     oss << "    default: {\n";
-    oss << "      orig_task->Aggregate(replica_task);\n";
+    oss << "      orig_task->AggregateOut(replica_task);\n";
+    oss << "      break;\n";
+    oss << "    }\n";
+    oss << "  }\n";
+    oss << "}\n";
+    oss << "\n";
+    // Generate AggregateIn method - dispatches to typed task's AggregateIn
+    // (ManyToOne collective input combine; default per-task is a no-op).
+    oss << "void Runtime::AggregateIn(chi::u32 method, ctp::ipc::FullPtr<chi::Task> agg_task,\n";
+    oss << "                        const ctp::ipc::FullPtr<chi::Task>& member_task) {\n";
+    oss << "  switch (method) {\n";
+
+    for (const auto& method : methods) {
+      std::string task_type = GetTaskTypeName(method.method_name, chimod_name);
+      oss << "    case Method::" << method.constant_name << ": {\n";
+      oss << "      auto typed_task = agg_task.template Cast<" << task_type << ">();\n";
+      oss << "      typed_task->AggregateIn(member_task);\n";
+      oss << "      break;\n";
+      oss << "    }\n";
+    }
+
+    oss << "    default: {\n";
+    oss << "      agg_task->AggregateIn(member_task);\n";
     oss << "      break;\n";
     oss << "    }\n";
     oss << "  }\n";

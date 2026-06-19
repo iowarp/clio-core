@@ -112,10 +112,30 @@ chi::TaskResume Runtime::Run(chi::u32 method, ctp::ipc::FullPtr<chi::Task> task_
       CLIO_CO_AWAIT(DelBlob(typed_task, rctx));
       break;
     }
+    case Method::kTruncateBlob: {
+      ctp::ipc::FullPtr<TruncateBlobTask> typed_task = task_ptr.template Cast<TruncateBlobTask>();
+      CLIO_CO_AWAIT(TruncateBlob(typed_task, rctx));
+      break;
+    }
     case Method::kDelTag: {
       // Cast task FullPtr to specific type
       ctp::ipc::FullPtr<DelTagTask> typed_task = task_ptr.template Cast<DelTagTask>();
       CLIO_CO_AWAIT(DelTag(typed_task, rctx));
+      break;
+    }
+    case Method::kRenameTag: {
+      ctp::ipc::FullPtr<RenameTagTask> typed_task = task_ptr.template Cast<RenameTagTask>();
+      CLIO_CO_AWAIT(RenameTag(typed_task, rctx));
+      break;
+    }
+    case Method::kGetOrCreateTagAlias: {
+      ctp::ipc::FullPtr<GetOrCreateTagAliasTask> typed_task = task_ptr.template Cast<GetOrCreateTagAliasTask>();
+      CLIO_CO_AWAIT(GetOrCreateTagAlias(typed_task, rctx));
+      break;
+    }
+    case Method::kGetTagName: {
+      ctp::ipc::FullPtr<GetTagNameTask> typed_task = task_ptr.template Cast<GetTagNameTask>();
+      CLIO_CO_AWAIT(GetTagName(typed_task, rctx));
       break;
     }
     case Method::kGetTagSize: {
@@ -266,8 +286,28 @@ void Runtime::SaveTask(chi::u32 method, chi::SaveTaskArchive& archive,
       archive << *typed_task.ptr_;
       break;
     }
+    case Method::kTruncateBlob: {
+      auto typed_task = task_ptr.template Cast<TruncateBlobTask>();
+      archive << *typed_task.ptr_;
+      break;
+    }
     case Method::kDelTag: {
       auto typed_task = task_ptr.template Cast<DelTagTask>();
+      archive << *typed_task.ptr_;
+      break;
+    }
+    case Method::kRenameTag: {
+      auto typed_task = task_ptr.template Cast<RenameTagTask>();
+      archive << *typed_task.ptr_;
+      break;
+    }
+    case Method::kGetOrCreateTagAlias: {
+      auto typed_task = task_ptr.template Cast<GetOrCreateTagAliasTask>();
+      archive << *typed_task.ptr_;
+      break;
+    }
+    case Method::kGetTagName: {
+      auto typed_task = task_ptr.template Cast<GetTagNameTask>();
       archive << *typed_task.ptr_;
       break;
     }
@@ -406,8 +446,28 @@ void Runtime::LoadTask(chi::u32 method, chi::LoadTaskArchive& archive,
       archive >> *typed_task.ptr_;
       break;
     }
+    case Method::kTruncateBlob: {
+      auto typed_task = task_ptr.template Cast<TruncateBlobTask>();
+      archive >> *typed_task.ptr_;
+      break;
+    }
     case Method::kDelTag: {
       auto typed_task = task_ptr.template Cast<DelTagTask>();
+      archive >> *typed_task.ptr_;
+      break;
+    }
+    case Method::kRenameTag: {
+      auto typed_task = task_ptr.template Cast<RenameTagTask>();
+      archive >> *typed_task.ptr_;
+      break;
+    }
+    case Method::kGetOrCreateTagAlias: {
+      auto typed_task = task_ptr.template Cast<GetOrCreateTagAliasTask>();
+      archive >> *typed_task.ptr_;
+      break;
+    }
+    case Method::kGetTagName: {
+      auto typed_task = task_ptr.template Cast<GetTagNameTask>();
       archive >> *typed_task.ptr_;
       break;
     }
@@ -566,8 +626,29 @@ void Runtime::LocalLoadTask(chi::u32 method, chi::DefaultLoadArchive& archive,
       archive >> *typed_task.ptr_;
       break;
     }
+    case Method::kTruncateBlob: {
+      auto typed_task = task_ptr.template Cast<TruncateBlobTask>();
+      archive >> *typed_task.ptr_;
+      break;
+    }
     case Method::kDelTag: {
       auto typed_task = task_ptr.template Cast<DelTagTask>();
+      // Use archive operator which respects msg_type
+      archive >> *typed_task.ptr_;
+      break;
+    }
+    case Method::kRenameTag: {
+      auto typed_task = task_ptr.template Cast<RenameTagTask>();
+      archive >> *typed_task.ptr_;
+      break;
+    }
+    case Method::kGetOrCreateTagAlias: {
+      auto typed_task = task_ptr.template Cast<GetOrCreateTagAliasTask>();
+      archive >> *typed_task.ptr_;
+      break;
+    }
+    case Method::kGetTagName: {
+      auto typed_task = task_ptr.template Cast<GetTagNameTask>();
       // Use archive operator which respects msg_type
       archive >> *typed_task.ptr_;
       break;
@@ -739,8 +820,29 @@ void Runtime::LocalSaveTask(chi::u32 method, chi::DefaultSaveArchive& archive,
       archive << *typed_task.ptr_;
       break;
     }
+    case Method::kTruncateBlob: {
+      auto typed_task = task_ptr.template Cast<TruncateBlobTask>();
+      archive << *typed_task.ptr_;
+      break;
+    }
     case Method::kDelTag: {
       auto typed_task = task_ptr.template Cast<DelTagTask>();
+      // Use archive operator which respects msg_type
+      archive << *typed_task.ptr_;
+      break;
+    }
+    case Method::kRenameTag: {
+      auto typed_task = task_ptr.template Cast<RenameTagTask>();
+      archive << *typed_task.ptr_;
+      break;
+    }
+    case Method::kGetOrCreateTagAlias: {
+      auto typed_task = task_ptr.template Cast<GetOrCreateTagAliasTask>();
+      archive << *typed_task.ptr_;
+      break;
+    }
+    case Method::kGetTagName: {
+      auto typed_task = task_ptr.template Cast<GetTagNameTask>();
       // Use archive operator which respects msg_type
       archive << *typed_task.ptr_;
       break;
@@ -968,12 +1070,48 @@ ctp::ipc::FullPtr<chi::Task> Runtime::NewCopyTask(chi::u32 method, ctp::ipc::Ful
       }
       break;
     }
+    case Method::kTruncateBlob: {
+      auto new_task_ptr = ipc_manager->NewTask<TruncateBlobTask>();
+      if (!new_task_ptr.IsNull()) {
+        auto task_typed = orig_task_ptr.template Cast<TruncateBlobTask>();
+        new_task_ptr->Copy(task_typed);
+        return new_task_ptr.template Cast<chi::Task>();
+      }
+      break;
+    }
+    case Method::kRenameTag: {
+      auto new_task_ptr = ipc_manager->NewTask<RenameTagTask>();
+      if (!new_task_ptr.IsNull()) {
+        auto task_typed = orig_task_ptr.template Cast<RenameTagTask>();
+        new_task_ptr->Copy(task_typed);
+        return new_task_ptr.template Cast<chi::Task>();
+      }
+      break;
+    }
+    case Method::kGetOrCreateTagAlias: {
+      auto new_task_ptr = ipc_manager->NewTask<GetOrCreateTagAliasTask>();
+      if (!new_task_ptr.IsNull()) {
+        auto task_typed = orig_task_ptr.template Cast<GetOrCreateTagAliasTask>();
+        new_task_ptr->Copy(task_typed);
+        return new_task_ptr.template Cast<chi::Task>();
+      }
+      break;
+    }
     case Method::kDelTag: {
       // Allocate new task
       auto new_task_ptr = ipc_manager->NewTask<DelTagTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
         auto task_typed = orig_task_ptr.template Cast<DelTagTask>();
+        new_task_ptr->Copy(task_typed);
+        return new_task_ptr.template Cast<chi::Task>();
+      }
+      break;
+    }
+    case Method::kGetTagName: {
+      auto new_task_ptr = ipc_manager->NewTask<GetTagNameTask>();
+      if (!new_task_ptr.IsNull()) {
+        auto task_typed = orig_task_ptr.template Cast<GetTagNameTask>();
         new_task_ptr->Copy(task_typed);
         return new_task_ptr.template Cast<chi::Task>();
       }
@@ -1188,8 +1326,24 @@ ctp::ipc::FullPtr<chi::Task> Runtime::NewTask(chi::u32 method) {
       auto new_task_ptr = ipc_manager->NewTask<DelBlobTask>();
       return new_task_ptr.template Cast<chi::Task>();
     }
+    case Method::kTruncateBlob: {
+      auto new_task_ptr = ipc_manager->NewTask<TruncateBlobTask>();
+      return new_task_ptr.template Cast<chi::Task>();
+    }
     case Method::kDelTag: {
       auto new_task_ptr = ipc_manager->NewTask<DelTagTask>();
+      return new_task_ptr.template Cast<chi::Task>();
+    }
+    case Method::kRenameTag: {
+      auto new_task_ptr = ipc_manager->NewTask<RenameTagTask>();
+      return new_task_ptr.template Cast<chi::Task>();
+    }
+    case Method::kGetOrCreateTagAlias: {
+      auto new_task_ptr = ipc_manager->NewTask<GetOrCreateTagAliasTask>();
+      return new_task_ptr.template Cast<chi::Task>();
+    }
+    case Method::kGetTagName: {
+      auto new_task_ptr = ipc_manager->NewTask<GetTagNameTask>();
       return new_task_ptr.template Cast<chi::Task>();
     }
     case Method::kGetTagSize: {
@@ -1251,141 +1405,161 @@ ctp::ipc::FullPtr<chi::Task> Runtime::NewTask(chi::u32 method) {
   }
 }
 
-void Runtime::Aggregate(chi::u32 method, ctp::ipc::FullPtr<chi::Task> orig_task,
+void Runtime::AggregateOut(chi::u32 method, ctp::ipc::FullPtr<chi::Task> orig_task,
                         const ctp::ipc::FullPtr<chi::Task>& replica_task) {
   switch (method) {
     case Method::kCreate: {
       auto typed_task = orig_task.template Cast<CreateTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kDestroy: {
       auto typed_task = orig_task.template Cast<DestroyTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kMonitor: {
       auto typed_task = orig_task.template Cast<MonitorTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kRegisterTarget: {
       auto typed_task = orig_task.template Cast<RegisterTargetTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kUnregisterTarget: {
       auto typed_task = orig_task.template Cast<UnregisterTargetTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kListTargets: {
       auto typed_task = orig_task.template Cast<ListTargetsTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kStatTargets: {
       auto typed_task = orig_task.template Cast<StatTargetsTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kGetOrCreateTag: {
       auto typed_task = orig_task.template Cast<core::GetOrCreateTagTask<core::CreateParams>>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kPutBlob: {
       auto typed_task = orig_task.template Cast<PutBlobTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kGetBlob: {
       auto typed_task = orig_task.template Cast<GetBlobTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kReorganizeBlob: {
       auto typed_task = orig_task.template Cast<ReorganizeBlobTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kDelBlob: {
       auto typed_task = orig_task.template Cast<DelBlobTask>();
+      typed_task->AggregateOut(replica_task);
+      break;
+    }
+    case Method::kTruncateBlob: {
+      auto typed_task = orig_task.template Cast<TruncateBlobTask>();
       typed_task->Aggregate(replica_task);
       break;
     }
     case Method::kDelTag: {
       auto typed_task = orig_task.template Cast<DelTagTask>();
+      typed_task->AggregateOut(replica_task);
+      break;
+    }
+    case Method::kRenameTag: {
+      auto typed_task = orig_task.template Cast<RenameTagTask>();
+      typed_task->Aggregate(replica_task);
+      break;
+    }
+    case Method::kGetOrCreateTagAlias: {
+      auto typed_task = orig_task.template Cast<GetOrCreateTagAliasTask>();
+      typed_task->Aggregate(replica_task);
+      break;
+    }
+    case Method::kGetTagName: {
+      auto typed_task = orig_task.template Cast<GetTagNameTask>();
       typed_task->Aggregate(replica_task);
       break;
     }
     case Method::kGetTagSize: {
       auto typed_task = orig_task.template Cast<GetTagSizeTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kPollTelemetryLog: {
       auto typed_task = orig_task.template Cast<PollTelemetryLogTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kGetBlobScore: {
       auto typed_task = orig_task.template Cast<GetBlobScoreTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kGetBlobSize: {
       auto typed_task = orig_task.template Cast<GetBlobSizeTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kGetContainedBlobs: {
       auto typed_task = orig_task.template Cast<GetContainedBlobsTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kGetBlobInfo: {
       auto typed_task = orig_task.template Cast<GetBlobInfoTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kTagQuery: {
       auto typed_task = orig_task.template Cast<TagQueryTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kBlobQuery: {
       auto typed_task = orig_task.template Cast<BlobQueryTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kGetTargetInfo: {
       auto typed_task = orig_task.template Cast<GetTargetInfoTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kFlushMetadata: {
       auto typed_task = orig_task.template Cast<FlushMetadataTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kFlushData: {
       auto typed_task = orig_task.template Cast<FlushDataTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kSemanticSearch: {
       auto typed_task = orig_task.template Cast<SemanticSearchTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kTemporalSearch: {
       auto typed_task = orig_task.template Cast<TemporalSearchTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     default: {
-      orig_task->Aggregate(replica_task);
+      orig_task->AggregateOut(replica_task);
       break;
     }
   }
@@ -1443,8 +1617,24 @@ void Runtime::DelTask(chi::u32 method, ctp::ipc::FullPtr<chi::Task> task_ptr) {
       ipc_manager->DelTask(task_ptr.template Cast<DelBlobTask>());
       break;
     }
+    case Method::kTruncateBlob: {
+      ipc_manager->DelTask(task_ptr.template Cast<TruncateBlobTask>());
+      break;
+    }
     case Method::kDelTag: {
       ipc_manager->DelTask(task_ptr.template Cast<DelTagTask>());
+      break;
+    }
+    case Method::kRenameTag: {
+      ipc_manager->DelTask(task_ptr.template Cast<RenameTagTask>());
+      break;
+    }
+    case Method::kGetOrCreateTagAlias: {
+      ipc_manager->DelTask(task_ptr.template Cast<GetOrCreateTagAliasTask>());
+      break;
+    }
+    case Method::kGetTagName: {
+      ipc_manager->DelTask(task_ptr.template Cast<GetTagNameTask>());
       break;
     }
     case Method::kGetTagSize: {

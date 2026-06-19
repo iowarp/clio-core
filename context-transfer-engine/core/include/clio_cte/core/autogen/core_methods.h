@@ -41,8 +41,12 @@ GLOBAL_CROSS_CONST chi::u32 kFlushMetadata = 33;
 GLOBAL_CROSS_CONST chi::u32 kFlushData = 34;
 GLOBAL_CROSS_CONST chi::u32 kSemanticSearch = 35;
 GLOBAL_CROSS_CONST chi::u32 kTemporalSearch = 36;
+GLOBAL_CROSS_CONST chi::u32 kTruncateBlob = 37;
+GLOBAL_CROSS_CONST chi::u32 kRenameTag = 38;
+GLOBAL_CROSS_CONST chi::u32 kGetOrCreateTagAlias = 39;
+GLOBAL_CROSS_CONST chi::u32 kGetTagName = 40;
 
-GLOBAL_CROSS_CONST chi::u32 kMaxMethodId = 37;
+GLOBAL_CROSS_CONST chi::u32 kMaxMethodId = 41;
 
 inline const std::vector<std::string>& GetMethodNames() {
   static const std::vector<std::string> names = [] {
@@ -73,6 +77,10 @@ inline const std::vector<std::string>& GetMethodNames() {
     v[34] = "FlushData";
     v[35] = "SemanticSearch";
     v[36] = "TemporalSearch";
+    v[37] = "TruncateBlob";
+    v[38] = "RenameTag";
+    v[39] = "GetOrCreateTagAlias";
+    v[40] = "GetTagName";
     return v;
   }();
   return names;

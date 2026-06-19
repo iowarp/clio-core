@@ -279,11 +279,11 @@ struct ParseOmniTask : public chi::Task {
   }
 
   /**
-   * Aggregate replica results into this task
+   * AggregateOut replica results into this task
    * @param other Pointer to the replica task to aggregate from
    */
-  void Aggregate(const ctp::ipc::FullPtr<chi::Task> &other_base) {
-    Task::Aggregate(other_base);
+  void AggregateOut(const ctp::ipc::FullPtr<chi::Task> &other_base) {
+    Task::AggregateOut(other_base);
     Copy(other_base.template Cast<ParseOmniTask>());
   }
 };
@@ -358,10 +358,10 @@ struct ProcessHdf5DatasetTask : public chi::Task {
   }
 
   /**
-   * Aggregate replica results into this task
+   * AggregateOut replica results into this task
    */
-  void Aggregate(const ctp::ipc::FullPtr<chi::Task> &other_base) {
-    Task::Aggregate(other_base);
+  void AggregateOut(const ctp::ipc::FullPtr<chi::Task> &other_base) {
+    Task::AggregateOut(other_base);
     auto other = other_base.template Cast<ProcessHdf5DatasetTask>();
     // Keep the first error if any
     if (result_code_ == 0 && other->result_code_ != 0) {
@@ -435,8 +435,8 @@ struct ExportDataTask : public chi::Task {
     bytes_exported_ = other->bytes_exported_;
   }
 
-  void Aggregate(const ctp::ipc::FullPtr<chi::Task> &other_base) {
-    Task::Aggregate(other_base);
+  void AggregateOut(const ctp::ipc::FullPtr<chi::Task> &other_base) {
+    Task::AggregateOut(other_base);
     Copy(other_base.template Cast<ExportDataTask>());
   }
 };

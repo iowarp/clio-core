@@ -4,6 +4,15 @@
 FROM iowarp/deps-ml:latest
 USER root
 
+# FUSE 3 runtime (fusermount3) + dev headers, needed to build the libfuse
+# adapter (clio_cte_fuse) and run its mount integration tests. Installed here
+# so a devcontainer rebuild picks it up immediately; it is also in the base
+# image (docker/iowarp-base.Dockerfile) as the canonical default. The
+# container runs --privileged, so /dev/fuse + SYS_ADMIN are available.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      fuse3 libfuse3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
 # Remap iowarp user UID/GID to match the host user.
 ARG HOST_UID=1000
 ARG HOST_GID=1000
