@@ -290,7 +290,7 @@ chi::TaskResume Runtime::Monitor(ctp::ipc::FullPtr<MonitorTask> task, chi::RunCo
     pk.pack("total_writes");           pk.pack(total_writes_.load());
     pk.pack("total_bytes_read");       pk.pack(total_bytes_read_.load());
     pk.pack("total_bytes_written");    pk.pack(total_bytes_written_.load());
-    pk.pack("device_health");          pk.pack(ctp::SystemInfo::GetDeviceHealthStats(file_path_));
+    pk.pack("device_health");          pk.pack(ctp::SystemInfo::GetDeviceHealthStats(pool_name_));
 
     task->results_[container_id_] = std::string(sbuf.data(), sbuf.size());
   }
