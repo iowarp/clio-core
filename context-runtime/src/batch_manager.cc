@@ -102,10 +102,16 @@ void BatchManager::BuildAndSubmit(Worker * /*worker*/, const GroupKey &key,
   }
 
   // Run the aggregate locally on the leader as a fresh, self-owned task.
+  // NewCopyTask copied the member's task_flags_ but NOT its host_run_ctx_
+  // (Task::Copy leaves run ctx per-task). Clear the execution-lifecycle flags
+  // the member had accumulated (routed/started/run-ctx-exists) so the submit
+  // path runs BeginTask and gives this aggregate its OWN RunContext + future.
+  // Without this the aggregate inherits TASK_RUN_CTX_EXISTS with a null run
+  // ctx, BeginTask is skipped, and the aggregate never executes (members hang).
   agg->task_id_ = CreateTaskId();
   agg->pool_query_ = PoolQuery::Local();
   agg->SetFlags(TASK_BATCH_AGGREGATE);
-  agg->ClearFlags(TASK_ROUTED);
+  agg->ClearFlags(TASK_ROUTED | TASK_STARTED | TASK_RUN_CTX_EXISTS);
 
   // Remember the originals to broadcast to when the aggregate completes.
   {

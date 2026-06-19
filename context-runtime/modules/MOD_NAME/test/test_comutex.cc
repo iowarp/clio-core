@@ -1098,5 +1098,42 @@ TEST_CASE("CoMutex and CoRwLock Integration", "[integration]") {
   }
 }
 
+// ManyToOne collective: exercises Container::AggregateIn. Several submitters
+// contribute value_ with PoolQuery::ManyToOne sharing one (container_hash,
+// batch_key). The neighborhood leader batches them, AggregateIn sums the
+// inputs into one aggregate task, the handler echoes the total into sum_, and
+// that single result is broadcast back to every submitter. Each submitter must
+// observe the whole batch's total.
+TEST_CASE("ManyToOne AggregateIn collective sum", "[manytoone][aggregatein]") {
+  CoMutexTestFixture fixture;
+  REQUIRE(g_initialized);
+  REQUIRE(fixture.createModNamePool());
+
+  clio::run::MOD_NAME::Client client(fixture.getTestPoolId());
+  auto create_task = client.AsyncCreate(
+      chi::PoolQuery::Dynamic(), "manytoone_pool", fixture.getTestPoolId());
+  create_task.Wait();
+  client.pool_id_ = create_task->new_pool_id_;
+  REQUIRE(create_task->return_code_ == 0);
+
+  constexpr chi::u32 kN = 5;
+  chi::u64 expected = 0;  // sum(1..kN)
+  std::vector<chi::Future<clio::run::MOD_NAME::ManyToOneSumTask>> futs;
+  for (chi::u32 i = 1; i <= kN; ++i) {
+    expected += i;
+    auto q = chi::PoolQuery::ManyToOne(/*container_hash=*/0, /*batch_key=*/0,
+                                       /*batch_for_ns=*/2'000'000);
+    futs.push_back(client.AsyncManyToOneSum(q, i));
+  }
+
+  // Every submitter sees the broadcast collective total.
+  for (chi::u32 i = 0; i < kN; ++i) {
+    futs[i].Wait();
+    REQUIRE(futs[i]->return_code_ == 0);
+    REQUIRE(futs[i]->sum_ == expected);
+  }
+  INFO("ManyToOne collective sum verified: " << expected);
+}
+
 // Main function to run all tests
 SIMPLE_TEST_MAIN()

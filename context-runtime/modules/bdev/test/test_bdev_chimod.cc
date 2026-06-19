@@ -1596,14 +1596,6 @@ TEST_CASE("bdev_parallel_io_operations", "[bdev][parallel][io]") {
 // back to every submitter. Each submitter's future must complete with the
 // aggregate's blocks.
 TEST_CASE("bdev_manytoone_batch", "[bdev][manytoone]") {
-  // WIP (#587): opt-in only. The collective batch+aggregate path currently
-  // hangs — batched members are parked on the leader but their futures are not
-  // yet completed (flush/aggregate completion path under debug). Guarded so the
-  // shared bdev suite stays green; run explicitly with CLIO_TEST_MANYTOONE=1.
-  if (std::getenv("CLIO_TEST_MANYTOONE") == nullptr) {
-    HLOG(kInfo, "Skipping bdev_manytoone_batch (set CLIO_TEST_MANYTOONE=1)");
-    return;
-  }
   BdevChimodFixture fixture;
   REQUIRE(g_initialized);
   std::this_thread::sleep_for(100ms);
