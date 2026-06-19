@@ -34,6 +34,8 @@
 #ifndef CHIMAERA_INCLUDE_CHIMAERA_POOL_QUERY_H_
 #define CHIMAERA_INCLUDE_CHIMAERA_POOL_QUERY_H_
 
+#include <type_traits>
+
 #include "clio_runtime/types.h"
 
 namespace clio::run {
@@ -83,46 +85,13 @@ class PoolQuery {
         net_timeout_(-1.0f), parallelism_(32),
         batch_key_(0), batch_for_ns_(0) {}
 
-  /**
-   * Copy constructor
-   */
-  CTP_CROSS_FUN PoolQuery(const PoolQuery& other)
-      : routing_mode_(other.routing_mode_),
-        hash_value_(other.hash_value_),
-        container_id_(other.container_id_),
-        range_offset_(other.range_offset_),
-        range_count_(other.range_count_),
-        node_id_(other.node_id_),
-        ret_node_(other.ret_node_),
-        net_timeout_(other.net_timeout_),
-        parallelism_(other.parallelism_),
-        batch_key_(other.batch_key_),
-        batch_for_ns_(other.batch_for_ns_) {}
-
-  /**
-   * Assignment operator
-   */
-  CTP_CROSS_FUN PoolQuery& operator=(const PoolQuery& other) {
-    if (this != &other) {
-      routing_mode_ = other.routing_mode_;
-      hash_value_ = other.hash_value_;
-      container_id_ = other.container_id_;
-      range_offset_ = other.range_offset_;
-      range_count_ = other.range_count_;
-      node_id_ = other.node_id_;
-      ret_node_ = other.ret_node_;
-      net_timeout_ = other.net_timeout_;
-      parallelism_ = other.parallelism_;
-      batch_key_ = other.batch_key_;
-      batch_for_ns_ = other.batch_for_ns_;
-    }
-    return *this;
-  }
-
-  /**
-   * Destructor
-   */
-  CTP_CROSS_FUN ~PoolQuery() {}
+  // Copy/move/destructor are intentionally left implicit (compiler-generated)
+  // so PoolQuery stays *trivially copyable*. It is raw-byte serialized and
+  // compared (e.g. the CTE transaction log WriteRaw/ReadRaw over
+  // sizeof(PoolQuery) and a memcmp roundtrip check), and is bytewise-copied
+  // across the GPU/host boundary. A hand-written field-wise copy would NOT
+  // copy padding, so two "equal" queries could differ in padding bytes and
+  // fail those raw-byte comparisons. (see static_assert below the class)
 
   // Static factory methods to create different types of PoolQuery
 
@@ -446,6 +415,12 @@ class PoolQuery {
   u64 batch_for_ns_;         /**< ManyToOne: batch window in nanoseconds */
 };
 
+// PoolQuery is raw-byte serialized and memcmp-compared (CTE transaction log,
+// GPU/host bytewise task copies). Keep it trivially copyable so copies preserve
+// every byte (including padding) — a hand-written field-wise copy would not,
+// breaking those raw-byte roundtrips.
+static_assert(std::is_trivially_copyable<PoolQuery>::value,
+              "PoolQuery must remain trivially copyable (raw-byte serialized)");
 
 }  // namespace clio::run
 
