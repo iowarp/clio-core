@@ -1470,7 +1470,7 @@ void Runtime::AggregateOut(chi::u32 method, ctp::ipc::FullPtr<chi::Task> orig_ta
     }
     case Method::kTruncateBlob: {
       auto typed_task = orig_task.template Cast<TruncateBlobTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kDelTag: {
@@ -1480,17 +1480,17 @@ void Runtime::AggregateOut(chi::u32 method, ctp::ipc::FullPtr<chi::Task> orig_ta
     }
     case Method::kRenameTag: {
       auto typed_task = orig_task.template Cast<RenameTagTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kGetOrCreateTagAlias: {
       auto typed_task = orig_task.template Cast<GetOrCreateTagAliasTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kGetTagName: {
       auto typed_task = orig_task.template Cast<GetTagNameTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kGetTagSize: {

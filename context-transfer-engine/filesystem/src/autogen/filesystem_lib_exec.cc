@@ -182,17 +182,17 @@ ctp::ipc::FullPtr<chi::Task> Runtime::NewTask(chi::u32 method) {
   }
 }
 
-void Runtime::Aggregate(chi::u32 method, ctp::ipc::FullPtr<chi::Task> orig_task,
-                        const ctp::ipc::FullPtr<chi::Task> &replica_task) {
+void Runtime::AggregateOut(chi::u32 method, ctp::ipc::FullPtr<chi::Task> orig_task,
+                            const ctp::ipc::FullPtr<chi::Task> &replica_task) {
   switch (method) {
-#define X(MID, TASK, HANDLER)                                  \
-    case Method::MID:                                          \
-      orig_task.template Cast<TASK>()->Aggregate(replica_task); \
+#define X(MID, TASK, HANDLER)                                    \
+    case Method::MID:                                            \
+      orig_task.template Cast<TASK>()->AggregateOut(replica_task); \
       break;
     CLIO_FS_FOR_EACH_METHOD(X)
 #undef X
     default:
-      orig_task->Aggregate(replica_task);
+      orig_task->AggregateOut(replica_task);
       break;
   }
 }

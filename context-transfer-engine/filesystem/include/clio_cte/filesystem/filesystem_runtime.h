@@ -61,8 +61,8 @@ class Runtime : public chi::Container {
       chi::u32 method, chi::DefaultLoadArchive &archive) override;
   void LocalSaveTask(chi::u32 method, chi::DefaultSaveArchive &archive,
                      ctp::ipc::FullPtr<chi::Task> task_ptr) override;
-  void Aggregate(chi::u32 method, ctp::ipc::FullPtr<chi::Task> orig_task,
-                 const ctp::ipc::FullPtr<chi::Task> &replica_task) override;
+  void AggregateOut(chi::u32 method, ctp::ipc::FullPtr<chi::Task> orig_task,
+                   const ctp::ipc::FullPtr<chi::Task> &replica_task) override;
   void DelTask(chi::u32 method, ctp::ipc::FullPtr<chi::Task> task_ptr) override;
   void SaveTask(chi::u32 method, chi::SaveTaskArchive &archive,
                 ctp::ipc::FullPtr<chi::Task> task_ptr) override;
