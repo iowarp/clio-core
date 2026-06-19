@@ -563,10 +563,19 @@ class unordered_map_ll {
   /** Erase by key. */
   CTP_CROSS_FUN
   size_type erase(const Key &key) {
+    // Must hold the global read lock for the whole bucket access, exactly like
+    // insert/find/operator[]: it pins the bucket/lock arrays so a concurrent
+    // rehash (which takes the global write lock and momentarily empties
+    // buckets_ during its move+resize) cannot run underneath us. Without it,
+    // bucket_of() can read buckets_.size()==0 mid-rehash and divide by zero
+    // (observed as a "Numerical" crash in the concurrent insert/erase/grow
+    // stress test on stricter toolchains).
+    global_read_lock();
     size_type b = bucket_of(key);
     write_lock_bucket(b);
     size_type r = erase_locked(key);
     write_unlock_bucket(b);
+    global_read_unlock();
     return r;
   }
 
