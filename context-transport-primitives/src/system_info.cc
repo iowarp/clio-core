@@ -41,7 +41,7 @@
 #ifdef __linux__
 #include <linux/limits.h>  // PATH_MAX on some Linux toolchains
 #endif
-// LCOV_EXCL_START ΓÇö compile-time fallback, unreachable on standard Linux
+// LCOV_EXCL_START — compile-time fallback, unreachable on standard Linux
 #ifndef PATH_MAX
 #define PATH_MAX 4096  // POSIX default; not always in <climits> under NVHPC
 #endif
@@ -531,7 +531,7 @@ bool SystemInfo::CreateNewSharedMemory(File &fd, const std::string &name,
 #endif
 #elif CTP_ENABLE_WINDOWS_SYSINFO
   // POSIX shared memory names start with `/` (e.g. "/ctp_shm_42"). Win32
-  // kernel object names can't contain `/`, so map to "Local\<base>" ΓÇö the
+  // kernel object names can't contain `/`, so map to "Local\<base>" — the
   // per-session namespace, which is right for single-host SHM. Without
   // this the mapping was created anonymously (nullptr name) and could
   // not be reopened by name, breaking every OpenSharedMemory.
@@ -1017,7 +1017,7 @@ void SystemInfo::Setenv(const char *name, const std::string &value,
   // reads) and the Win32 process environment block (which
   // GetEnvironmentVariable reads). SetEnvironmentVariable only touches
   // the Win32 block, which would leave std::getenv blind to the new
-  // value ΓÇö and chi::env::GetCompat goes through std::getenv. Honor the
+  // value — and chi::env::GetCompat goes through std::getenv. Honor the
   // overwrite flag manually since _putenv_s always overwrites.
   if (!overwrite) {
     char probe[2];
