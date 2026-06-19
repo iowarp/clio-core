@@ -45,6 +45,7 @@
                                   // apptainer --fusemount fd-injection path)
 #include <sys/uio.h>              // struct iovec, writev
 #include <sys/mount.h>            // mount syscall
+#include <sys/statvfs.h>          // struct statvfs (statfs op)
 #include <unistd.h>               // read, getuid, getgid
 #include <cerrno>                 // errno
 #include <cstdio>                 // snprintf, fprintf
@@ -390,6 +391,32 @@ static int cte_fuse_rename(const char *from, const char *to,
 // Main
 // ============================================================================
 
+// Report filesystem statistics. The clio filesystem is backed by elastic CTE
+// storage rather than a fixed device, so we advertise a large, mostly-free
+// synthetic capacity. Without this, statfs returns all zeros and a 0-block
+// filesystem is hidden by `df` (which lists no path) — that in turn breaks
+// tools that probe free space and xfstests' mount detection (its `_fs_type`
+// runs `df` with no path and sees nothing, so `./check` thinks the fs is not
+// mounted and tries to remount it).
+static int cte_fuse_statfs(const char *path, struct statvfs *stbuf) {
+  (void)path;
+  std::memset(stbuf, 0, sizeof(*stbuf));
+  constexpr fsblkcnt_t kBlockSize = 4096;
+  constexpr fsblkcnt_t kTotalBlocks =
+      (static_cast<fsblkcnt_t>(1) << 40) / kBlockSize;  // ~1 TiB
+  constexpr fsfilcnt_t kTotalInodes = static_cast<fsfilcnt_t>(1) << 20;
+  stbuf->f_bsize = kBlockSize;
+  stbuf->f_frsize = kBlockSize;
+  stbuf->f_blocks = kTotalBlocks;
+  stbuf->f_bfree = kTotalBlocks;
+  stbuf->f_bavail = kTotalBlocks;
+  stbuf->f_files = kTotalInodes;
+  stbuf->f_ffree = kTotalInodes;
+  stbuf->f_favail = kTotalInodes;
+  stbuf->f_namemax = 255;
+  return 0;
+}
+
 static const struct fuse_operations cte_fuse_ops = {
     .getattr = cte_fuse_getattr,
     .mkdir = cte_fuse_mkdir,
@@ -401,6 +428,7 @@ static const struct fuse_operations cte_fuse_ops = {
     .open = cte_fuse_open,
     .read = cte_fuse_read,
     .write = cte_fuse_write,
+    .statfs = cte_fuse_statfs,
     .flush = cte_fuse_flush,
     .release = cte_fuse_release,
     .fsync = cte_fuse_fsync,
