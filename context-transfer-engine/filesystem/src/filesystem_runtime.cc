@@ -89,6 +89,19 @@ chi::TaskResume Runtime::Create(ctp::ipc::FullPtr<CreateTask> task,
   // assigned pool id from the CreateTask (pool_id_ isn't reliable yet here),
   // matching how the CTE core initializes its self-client.
   self_.Init(task->new_pool_id_);
+
+  // Resolve the global append-staging tag (shared by all files). Append data
+  // blobs live here, so they don't inflate any file's GetTagSize. Flat tag
+  // name (no leading '/') => not hierarchical.
+  {
+    auto st = cte_.AsyncGetOrCreateTag("_clio_append_staging",
+                                       clio::cte::core::TagId::GetNull(),
+                                       chi::PoolQuery::Local());
+    CLIO_CO_AWAIT(st);
+    if (st->GetReturnCode() == 0) {
+      staging_tag_id_ = st->tag_id_;
+    }
+  }
   HLOG(kInfo, "filesystem: Create over CTE core pool {}",
        next_pool_id_.ToString());
   task->return_code_ = 0;
@@ -335,8 +348,10 @@ chi::TaskResume Runtime::Append(ctp::ipc::FullPtr<AppendTask> task,
   chi::u32 node_id = CLIO_IPC->GetNodeId();
   std::string data_blob_id = MakeDataBlobId(node_id, logical);
 
-  auto p = cte_.AsyncPutBlob(tag_id, data_blob_id, 0, want, task->data_, -1.0f,
-                             clio::cte::core::Context(), 0u,
+  // Stage the bytes under the shared staging tag (NOT the file tag), so the
+  // file's GetTagSize stays equal to its merged content (the true tail).
+  auto p = cte_.AsyncPutBlob(staging_tag_id_, data_blob_id, 0, want,
+                             task->data_, -1.0f, clio::cte::core::Context(), 0u,
                              chi::PoolQuery::Local());
   CLIO_CO_AWAIT(p);
   if (p->GetReturnCode() != 0) {
@@ -840,20 +855,17 @@ chi::TaskResume Runtime::AppendCollect(
               return a.logical_ < b.logical_;
             });
 
-  chi::u64 batch_total = 0;
-  for (auto &e : entries) batch_total += e.data_blob_size_;
-
-  // Tail of the file. GetTagSize (broadcast) sums all blobs under the tag,
-  // which still includes this batch's staged data blobs — subtract them to get
-  // the true file content size to append at. (Concurrent batches for the same
-  // tag are serialized by ManyToOne batching; cross-batch size tracking is a
-  // separate hardening issue.)
+  // Tail of the file = its merged content size. Append data blobs live under
+  // the separate staging tag, so GetTagSize(file_tag) is exactly the tail.
+  // Because at most one AppendCollect per tag runs at a time (BatchManager
+  // serialization) and each fully merges + deletes its staged blobs before
+  // completing, this read is stable: the previous batch's bytes are already in
+  // the file pages and no other batch is mutating it.
   chi::u64 cur_size = 0;
   {
     auto s = cte_.AsyncGetTagSize(tag_id, chi::PoolQuery::Broadcast());
     CLIO_CO_AWAIT(s);
-    chi::u64 total = (s->GetReturnCode() == 0) ? s->tag_size_ : 0;
-    cur_size = (total >= batch_total) ? (total - batch_total) : 0;
+    cur_size = (s->GetReturnCode() == 0) ? s->tag_size_ : 0;
   }
 
   // Build the merge plan: lay each data blob out contiguously starting at
@@ -896,7 +908,8 @@ chi::TaskResume Runtime::AppendCollect(
       if (bytes >= kMaxExecBytes && at_blob_boundary) break;
     }
     auto q = chi::PoolQuery::DirectHash(spread++);
-    futs.push_back(self_.AsyncAppendExecution(tag_id, slice, q));
+    futs.push_back(
+        self_.AsyncAppendExecution(tag_id, staging_tag_id_, slice, q));
   }
   for (auto &f : futs) {
     CLIO_CO_AWAIT(f);
@@ -912,7 +925,8 @@ chi::TaskResume Runtime::AppendCollect(
 chi::TaskResume Runtime::AppendExecution(
     ctp::ipc::FullPtr<AppendExecutionTask> task, chi::RunContext &ctx) {
   CLIO_TASK_BODY_BEGIN
-  clio::cte::core::TagId tag_id = task->tag_id_;
+  clio::cte::core::TagId tag_id = task->tag_id_;        // destination file tag
+  clio::cte::core::TagId staging = task->staging_tag_id_;  // source staged blobs
   auto *ipc = CLIO_IPC;
   const size_t n = task->steps_.size();
   bool ok = true;
@@ -937,24 +951,25 @@ chi::TaskResume Runtime::AppendExecution(
   gets.reserve(n);
   for (size_t i = 0; i < n; ++i) {
     const AppendPlanStep &s = task->steps_[i];
-    gets.push_back(cte_.AsyncGetBlob(tag_id, s.data_blob_id_, s.off_in_data_,
+    gets.push_back(cte_.AsyncGetBlob(staging, s.data_blob_id_, s.off_in_data_,
                                      s.size_, 0u,
                                      bufs[i].shm_.template Cast<void>(),
                                      chi::PoolQuery::Local()));
   }
 
   // 2) As each Get completes, PutBlob the bytes into the destination file page.
-  std::vector<chi::Future<clio::cte::core::PutBlobTask>> puts;
-  puts.reserve(n);
+  // PutBlobs are issued SEQUENTIALLY (await each before the next): multiple
+  // steps in a slice can target the SAME 1 MiB page blob at different offsets,
+  // and concurrent PutBlobs to one blob race in the core's extend/modify path
+  // (corrupting the block list). The GetBlobs above already overlap, so the
+  // reads still pipeline; only the same-tag writes are serialized.
   for (size_t i = 0; i < n; ++i) {
     CLIO_CO_AWAIT(gets[i]);  // a short/hole read just leaves zeros
     const AppendPlanStep &s = task->steps_[i];
-    puts.push_back(cte_.AsyncPutBlob(
+    auto p = cte_.AsyncPutBlob(
         tag_id, std::to_string(s.file_page_), s.off_in_page_, s.size_,
         bufs[i].shm_.template Cast<void>(), -1.0f, clio::cte::core::Context(),
-        0u, chi::PoolQuery::Local()));
-  }
-  for (auto &p : puts) {
+        0u, chi::PoolQuery::Local());
     CLIO_CO_AWAIT(p);
     if (p->GetReturnCode() != 0) ok = false;
   }
@@ -968,7 +983,7 @@ chi::TaskResume Runtime::AppendExecution(
   for (const auto &s : task->steps_) {
     if (seen.insert(s.data_blob_id_).second) {
       dels.push_back(
-          cte_.AsyncDelBlob(tag_id, s.data_blob_id_, chi::PoolQuery::Local()));
+          cte_.AsyncDelBlob(staging, s.data_blob_id_, chi::PoolQuery::Local()));
     }
   }
   for (auto &d : dels) {

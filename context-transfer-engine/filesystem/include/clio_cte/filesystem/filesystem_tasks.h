@@ -475,23 +475,27 @@ struct AppendCollectTask : public chi::Task {
 
 /** AppendExecution: apply a slice of the merge plan (GetBlob->PutBlob->DelBlob). */
 struct AppendExecutionTask : public chi::Task {
-  IN clio::cte::core::TagId tag_id_;
+  IN clio::cte::core::TagId tag_id_;          // destination file tag
+  IN clio::cte::core::TagId staging_tag_id_;  // source staged data blobs
   IN std::vector<AppendPlanStep> steps_;
   AppendExecutionTask()
-      : chi::Task(), tag_id_(clio::cte::core::TagId::GetNull()) {}
+      : chi::Task(), tag_id_(clio::cte::core::TagId::GetNull()),
+        staging_tag_id_(clio::cte::core::TagId::GetNull()) {}
   explicit AppendExecutionTask(const chi::TaskId &task_id,
                                const chi::PoolId &pool_id,
                                const chi::PoolQuery &pool_query,
                                const clio::cte::core::TagId &tag_id,
+                               const clio::cte::core::TagId &staging_tag_id,
                                const std::vector<AppendPlanStep> &steps)
       : chi::Task(task_id, pool_id, pool_query, Method::kAppendExecution),
-        tag_id_(tag_id), steps_(steps) {}
+        tag_id_(tag_id), staging_tag_id_(staging_tag_id), steps_(steps) {}
   void Copy(const ctp::ipc::FullPtr<AppendExecutionTask> &o) {
     Task::Copy(o.template Cast<Task>());
-    tag_id_ = o->tag_id_; steps_ = o->steps_;
+    tag_id_ = o->tag_id_; staging_tag_id_ = o->staging_tag_id_;
+    steps_ = o->steps_;
   }
   template <typename Ar> void SerializeIn(Ar &ar) {
-    Task::SerializeIn(ar); ar(tag_id_, steps_);
+    Task::SerializeIn(ar); ar(tag_id_, staging_tag_id_, steps_);
   }
   template <typename Ar> void SerializeOut(Ar &ar) { Task::SerializeOut(ar); }
 };

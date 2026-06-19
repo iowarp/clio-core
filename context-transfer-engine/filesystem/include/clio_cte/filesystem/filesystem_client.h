@@ -160,10 +160,11 @@ class Client : public clio::cte::core::Client {
   /** Apply a slice of the merge plan (GetBlob->PutBlob->DelBlob). */
   chi::Future<AppendExecutionTask> AsyncAppendExecution(
       const clio::cte::core::TagId &tag_id,
+      const clio::cte::core::TagId &staging_tag_id,
       const std::vector<AppendPlanStep> &steps, const chi::PoolQuery &pool_query) {
     auto *ipc = CLIO_CPU_IPC;
-    auto task = ipc->NewTask<AppendExecutionTask>(chi::CreateTaskId(), pool_id_,
-                                                  pool_query, tag_id, steps);
+    auto task = ipc->NewTask<AppendExecutionTask>(
+        chi::CreateTaskId(), pool_id_, pool_query, tag_id, staging_tag_id, steps);
     return ipc->Send(task);
   }
 

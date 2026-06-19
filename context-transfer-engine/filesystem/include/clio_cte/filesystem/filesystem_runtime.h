@@ -89,6 +89,10 @@ class Runtime : public chi::Container {
   // Client bound to THIS filesystem pool, for self-submitted pipeline tasks
   // (periodic AppendSequence, AppendCollect, AppendExecution).
   Client self_;
+  // Staging tag for append data blobs. Append writes the bytes here (NOT under
+  // the file's tag) so GetTagSize(file_tag) reports the true file tail,
+  // unpolluted by still-unmerged staged appends. Resolved once at Create.
+  clio::cte::core::TagId staging_tag_id_ = clio::cte::core::TagId::GetNull();
 
   // ---- per-file logical-size metadata + handle table ----
   struct FileInfo {

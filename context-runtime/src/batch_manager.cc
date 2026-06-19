@@ -57,12 +57,22 @@ bool BatchManager::FlushDue(Worker *worker) {
     u64 now = NowNs();
     for (auto it = groups_.begin(); it != groups_.end();) {
       if (now >= it->second.deadline_ns) {
+        if (in_flight_.count(it->first) != 0) {
+          // An aggregate for this key is still running. Leave the group in
+          // place so members keep accumulating; it flushes once the in-flight
+          // aggregate completes (OnAggregateComplete clears in_flight_).
+          ++it;
+          continue;
+        }
+        in_flight_.insert(it->first);  // claim: this group's aggregate is ours
         due.emplace_back(it->first, std::move(it->second));
         it = groups_.erase(it);
       } else {
         ++it;
       }
     }
+    // groups_ still holds not-yet-due groups AND in-flight-blocked groups; keep
+    // the leader polling so a blocked group flushes promptly once released.
     pending_remains = !groups_.empty();
   }
   for (auto &[key, group] : due) {
@@ -83,6 +93,8 @@ void BatchManager::BuildAndSubmit(Worker * /*worker*/, const GroupKey &key,
   if (container == nullptr) {
     HLOG(kError, "BatchManager: no container for pool {} (dropping {} tasks)",
          key.pool_id, group.members.size());
+    std::lock_guard<std::mutex> lk(mu_);
+    in_flight_.erase(key);  // release the claim so future batches can flush
     return;
   }
 
@@ -92,6 +104,8 @@ void BatchManager::BuildAndSubmit(Worker * /*worker*/, const GroupKey &key,
   if (agg.IsNull()) {
     HLOG(kError, "BatchManager: NewCopyTask failed for pool {} method {}",
          key.pool_id, key.method);
+    std::lock_guard<std::mutex> lk(mu_);
+    in_flight_.erase(key);
     return;
   }
   // Combine each remaining member's INPUTS into the aggregate (AggregateIn).
@@ -113,10 +127,16 @@ void BatchManager::BuildAndSubmit(Worker * /*worker*/, const GroupKey &key,
   agg->SetFlags(TASK_BATCH_AGGREGATE);
   agg->ClearFlags(TASK_ROUTED | TASK_STARTED | TASK_RUN_CTX_EXISTS);
 
-  // Remember the originals to broadcast to when the aggregate completes.
+  // Remember the originals to broadcast to when the aggregate completes, and
+  // map the aggregate back to its group key so OnAggregateComplete can release
+  // the in-flight claim (allowing the next batch for this key to flush).
   {
     std::lock_guard<std::mutex> lk(pending_mu_);
     pending_[agg->task_id_.unique_] = std::move(group.members);
+  }
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    agg_group_[agg->task_id_.unique_] = key;
   }
 
   ipc_->Send(agg);
@@ -129,6 +149,19 @@ bool BatchManager::IsAggregate(const ctp::ipc::FullPtr<Task> &task) const {
 void BatchManager::OnAggregateComplete(Worker *worker,
                                        const ctp::ipc::FullPtr<Task> &agg,
                                        RunContext *agg_rctx) {
+  // Release the in-flight claim for this group key first, so a fresh batch can
+  // start now that this aggregate's effects are fully settled. Done before the
+  // broadcast below (which only signals the original submitters) so the leader
+  // can begin the next batch promptly.
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto git = agg_group_.find(agg->task_id_.unique_);
+    if (git != agg_group_.end()) {
+      in_flight_.erase(git->second);
+      agg_group_.erase(git);
+    }
+  }
+
   std::vector<ctp::ipc::FullPtr<Task>> members;
   {
     std::lock_guard<std::mutex> lk(pending_mu_);

@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "clio_runtime/task.h"
@@ -111,6 +112,14 @@ class BatchManager {
   IpcManager *ipc_;
   std::mutex mu_;
   std::unordered_map<GroupKey, Group, GroupKeyHash> groups_;
+  // At most one aggregate per group key may be in flight at a time. While a
+  // group's aggregate is running, new members keep accumulating in groups_ and
+  // are NOT flushed until that aggregate completes (OnAggregateComplete clears
+  // the key). This serializes collectives sharing a (pool,method,hash,key) so
+  // e.g. each runs against the fully-settled output of the previous one.
+  std::unordered_set<GroupKey, GroupKeyHash> in_flight_;
+  /** in-flight aggregate task unique id → its group key (to release on done). */
+  std::unordered_map<u64, GroupKey> agg_group_;
   /** agg task unique id → its batched originals, awaiting broadcast. */
   std::mutex pending_mu_;
   std::unordered_map<u64, std::vector<ctp::ipc::FullPtr<Task>>> pending_;

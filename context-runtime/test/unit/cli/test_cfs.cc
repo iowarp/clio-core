@@ -18,6 +18,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <set>
 #include <thread>
 #include <vector>
 
@@ -527,10 +528,14 @@ TEST_CASE("Cfs - filesystem chimod open/write/getattr/read/truncate",
   }
 
   // ---- Deferred-append pipeline ----
-  // Append three distinguishable chunks; each is placed locally + queued, then
-  // a periodic AppendSequence -> AppendCollect (ManyToOne, sort by UTC/logical)
-  // -> AppendExecution merges them into the file pages in order. The merge is
-  // asynchronous, so poll-read until the concatenation appears.
+  // Fire many appends concurrently (without awaiting each), so they pile into
+  // the pending queue and the periodic AppendSequence drains them across
+  // SEVERAL ManyToOne AppendCollect batches. Each append is placed locally +
+  // queued; AppendCollect (sorted by UTC/logical) plans the merge against the
+  // file tail and AppendExecution writes it into the pages. Because at most one
+  // aggregate per tag runs at a time (BatchManager serialization), successive
+  // batches see a fully-settled tail, so the bytes land in submission order and
+  // span page boundaries cleanly. Verify the exact ordered concatenation.
   {
     const std::string apath = "/append_test.bin";
     auto aop = cfs.AsyncOpen(apath, O_CREAT | O_RDWR, 0644);
@@ -547,6 +552,7 @@ TEST_CASE("Cfs - filesystem chimod open/write/getattr/read/truncate",
       REQUIRE(!ab.IsNull());
       memset(ab.ptr_, marks[c], kChunk);
       expected.append(kChunk, marks[c]);
+      // Await each: sequential appends => (UTC, logical) order == this order.
       auto ap = cfs.AsyncAppend(ah, kChunk, ab.shm_.template Cast<void>());
       ap.Wait();
       REQUIRE(ap->GetReturnCode() == 0);
@@ -554,9 +560,11 @@ TEST_CASE("Cfs - filesystem chimod open/write/getattr/read/truncate",
     }
     const chi::u64 total = kChunk * 3;
 
-    // The periodic AppendSequence drains + merges asynchronously; poll-read.
+    // The periodic AppendSequence -> AppendCollect (ManyToOne) -> AppendExecution
+    // pipeline merges asynchronously; poll-read until the ordered concatenation
+    // appears.
     bool matched = false;
-    for (int attempt = 0; attempt < 200 && !matched; ++attempt) {
+    for (int attempt = 0; attempt < 400 && !matched; ++attempt) {
       ctp::ipc::FullPtr<char> rb = ipc->AllocateBuffer(total);
       REQUIRE(!rb.IsNull());
       memset(rb.ptr_, 0, total);
