@@ -323,7 +323,7 @@ TEST_CASE("RefreshRepo - generates methods header and lib_exec source",
   REQUIRE(Contains(s, "void Runtime::LocalSaveTask("));
   REQUIRE(Contains(s, "Runtime::NewCopyTask("));
   REQUIRE(Contains(s, "Runtime::NewTask("));
-  REQUIRE(Contains(s, "void Runtime::Aggregate("));
+  REQUIRE(Contains(s, "void Runtime::AggregateOut("));
   REQUIRE(Contains(s, "void Runtime::DelTask("));
   REQUIRE(Contains(s, "case Method::kGetOrCreateThing:"));
 

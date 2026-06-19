@@ -37,16 +37,16 @@
  * Unit tests for the CAE ExportData feature and related task structs.
  *
  * Coverage targets (>95%):
- *   - ExportDataTask: default ctor, emplace ctor, Copy, Aggregate,
+ *   - ExportDataTask: default ctor, emplace ctor, Copy, AggregateOut,
  *     SerializeIn, SerializeOut
- *   - ParseOmniTask: default ctor, emplace ctor, Copy, Aggregate,
+ *   - ParseOmniTask: default ctor, emplace ctor, Copy, AggregateOut,
  *     SerializeIn, SerializeOut
- *   - ProcessHdf5DatasetTask: default ctor, emplace ctor, Copy, Aggregate,
+ *   - ProcessHdf5DatasetTask: default ctor, emplace ctor, Copy, AggregateOut,
  *     SerializeIn, SerializeOut
  *   - Runtime::ExportData: empty-tag, binary roundtrip, binary bad path,
  *     unknown format (falls to binary), HDF5 or not-compiled path
  *   - autogen core_lib_exec.cc: kExportData cases in Run, SaveTask, LoadTask,
- *     LocalLoadTask, LocalSaveTask, NewCopyTask, NewTask, Aggregate, DelTask
+ *     LocalLoadTask, LocalSaveTask, NewCopyTask, NewTask, AggregateOut, DelTask
  *     (exercised implicitly via AsyncExportData / AsyncParseOmni)
  */
 
@@ -217,7 +217,7 @@ TEST_CASE("ExportData - Task Copy", "[cae][export][task]") {
   INFO("ExportDataTask Copy OK");
 }
 
-TEST_CASE("ExportData - Task Aggregate", "[cae][export][task]") {
+TEST_CASE("ExportData - Task AggregateOut", "[cae][export][task]") {
   ExportDataFixture f;
 
   auto *ipc = CLIO_IPC;
@@ -235,15 +235,15 @@ TEST_CASE("ExportData - Task Aggregate", "[cae][export][task]") {
   replica->bytes_exported_ = 200;
   replica->result_code_ = 5;
 
-  orig->Aggregate(replica.template Cast<chi::Task>());
+  orig->AggregateOut(replica.template Cast<chi::Task>());
 
-  // Aggregate calls Copy, so orig should now have replica's values
+  // AggregateOut calls Copy, so orig should now have replica's values
   REQUIRE(orig->bytes_exported_ == 200);
   REQUIRE(orig->result_code_ == 5);
 
   ipc->DelTask(orig);
   ipc->DelTask(replica);
-  INFO("ExportDataTask Aggregate OK");
+  INFO("ExportDataTask AggregateOut OK");
 }
 
 TEST_CASE("ExportData - Task SerializeIn roundtrip", "[cae][export][task]") {
@@ -535,7 +535,7 @@ TEST_CASE("ParseOmni - Task Copy", "[cae][export][task]") {
   INFO("ParseOmniTask Copy OK");
 }
 
-TEST_CASE("ParseOmni - Task Aggregate", "[cae][export][task]") {
+TEST_CASE("ParseOmni - Task AggregateOut", "[cae][export][task]") {
   ExportDataFixture f;
 
   auto *ipc = CLIO_IPC;
@@ -554,14 +554,14 @@ TEST_CASE("ParseOmni - Task Aggregate", "[cae][export][task]") {
   rep->num_tasks_scheduled_ = 5;
   rep->result_code_ = 9;
 
-  orig->Aggregate(rep.template Cast<chi::Task>());
+  orig->AggregateOut(rep.template Cast<chi::Task>());
 
   REQUIRE(orig->num_tasks_scheduled_ == 5);
   REQUIRE(orig->result_code_ == 9);
 
   ipc->DelTask(orig);
   ipc->DelTask(rep);
-  INFO("ParseOmniTask Aggregate OK");
+  INFO("ParseOmniTask AggregateOut OK");
 }
 
 TEST_CASE("ParseOmni - Task SerializeIn roundtrip", "[cae][export][task]") {
@@ -695,7 +695,7 @@ TEST_CASE("ProcessHdf5Dataset - Task Copy", "[cae][export][task]") {
   INFO("ProcessHdf5DatasetTask Copy OK");
 }
 
-TEST_CASE("ProcessHdf5Dataset - Task Aggregate keeps first error",
+TEST_CASE("ProcessHdf5Dataset - Task AggregateOut keeps first error",
           "[cae][export][task]") {
   ExportDataFixture f;
 
@@ -715,17 +715,17 @@ TEST_CASE("ProcessHdf5Dataset - Task Aggregate keeps first error",
   rep->error_message_ = chi::priv::string("second_err", CTP_MALLOC);
 
   // orig already has error → keeps its own error, does not overwrite
-  orig->Aggregate(rep.template Cast<chi::Task>());
+  orig->AggregateOut(rep.template Cast<chi::Task>());
 
   REQUIRE(orig->result_code_ == -1);
   REQUIRE(orig->error_message_.str() == "first_err");
 
   ipc->DelTask(orig);
   ipc->DelTask(rep);
-  INFO("ProcessHdf5DatasetTask Aggregate keeps first error OK");
+  INFO("ProcessHdf5DatasetTask AggregateOut keeps first error OK");
 }
 
-TEST_CASE("ProcessHdf5Dataset - Task Aggregate adopts replica error",
+TEST_CASE("ProcessHdf5Dataset - Task AggregateOut adopts replica error",
           "[cae][export][task]") {
   ExportDataFixture f;
 
@@ -744,14 +744,14 @@ TEST_CASE("ProcessHdf5Dataset - Task Aggregate adopts replica error",
   rep->error_message_ = chi::priv::string("rep_err", CTP_MALLOC);
 
   // orig has no error → adopts replica's error
-  orig->Aggregate(rep.template Cast<chi::Task>());
+  orig->AggregateOut(rep.template Cast<chi::Task>());
 
   REQUIRE(orig->result_code_ == -3);
   REQUIRE(orig->error_message_.str() == "rep_err");
 
   ipc->DelTask(orig);
   ipc->DelTask(rep);
-  INFO("ProcessHdf5DatasetTask Aggregate adopts replica error OK");
+  INFO("ProcessHdf5DatasetTask AggregateOut adopts replica error OK");
 }
 
 TEST_CASE("ProcessHdf5Dataset - Task SerializeIn roundtrip",

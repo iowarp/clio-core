@@ -46,7 +46,7 @@ namespace clio::run::MOD_NAME {
 
 // Method implementations for Runtime class
 
-// Virtual method implementations (Init, Run, Del, SaveTask, LoadTask, NewCopy, Aggregate) now in autogen/MOD_NAME_lib_exec.cc
+// Virtual method implementations (Init, Run, Del, SaveTask, LoadTask, NewCopy, AggregateOut) now in autogen/MOD_NAME_lib_exec.cc
 
 //===========================================================================
 // Method implementations

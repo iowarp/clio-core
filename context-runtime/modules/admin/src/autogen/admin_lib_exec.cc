@@ -1296,146 +1296,146 @@ ctp::ipc::FullPtr<chi::Task> Runtime::NewTask(chi::u32 method) {
   }
 }
 
-void Runtime::Aggregate(chi::u32 method, ctp::ipc::FullPtr<chi::Task> orig_task,
+void Runtime::AggregateOut(chi::u32 method, ctp::ipc::FullPtr<chi::Task> orig_task,
                         const ctp::ipc::FullPtr<chi::Task>& replica_task) {
   switch (method) {
     case Method::kCreate: {
       auto typed_task = orig_task.template Cast<CreateTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kDestroy: {
       auto typed_task = orig_task.template Cast<DestroyTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kMonitor: {
       auto typed_task = orig_task.template Cast<MonitorTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kGetOrCreatePool: {
       auto typed_task = orig_task.template Cast<admin::GetOrCreatePoolTask<admin::CreateParams>>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kDestroyPool: {
       auto typed_task = orig_task.template Cast<DestroyPoolTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kStopRuntime: {
       auto typed_task = orig_task.template Cast<StopRuntimeTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kFlush: {
       auto typed_task = orig_task.template Cast<FlushTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kSend: {
       auto typed_task = orig_task.template Cast<SendTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kRecv: {
       auto typed_task = orig_task.template Cast<RecvTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kClientConnect: {
       auto typed_task = orig_task.template Cast<ClientConnectTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kSubmitBatch: {
       auto typed_task = orig_task.template Cast<SubmitBatchTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kWreapDeadIpcs: {
       auto typed_task = orig_task.template Cast<WreapDeadIpcsTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kClientRecv: {
       auto typed_task = orig_task.template Cast<ClientRecvTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kClientSend: {
       auto typed_task = orig_task.template Cast<ClientSendTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kRegisterMemory: {
       auto typed_task = orig_task.template Cast<RegisterMemoryTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kRestartContainers: {
       auto typed_task = orig_task.template Cast<RestartContainersTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kAddNode: {
       auto typed_task = orig_task.template Cast<AddNodeTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kChangeAddressTable: {
       auto typed_task = orig_task.template Cast<ChangeAddressTableTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kMigrateContainers: {
       auto typed_task = orig_task.template Cast<MigrateContainersTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kHeartbeat: {
       auto typed_task = orig_task.template Cast<HeartbeatTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kHeartbeatProbe: {
       auto typed_task = orig_task.template Cast<HeartbeatProbeTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kProbeRequest: {
       auto typed_task = orig_task.template Cast<ProbeRequestTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kRecoverContainers: {
       auto typed_task = orig_task.template Cast<RecoverContainersTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kSystemMonitor: {
       auto typed_task = orig_task.template Cast<SystemMonitorTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kAnnounceShutdown: {
       auto typed_task = orig_task.template Cast<AnnounceShutdownTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kRegisterGpuContainer: {
       auto typed_task = orig_task.template Cast<RegisterGpuContainerTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kListContainers: {
       auto typed_task = orig_task.template Cast<ListContainersTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     default: {
-      orig_task->Aggregate(replica_task);
+      orig_task->AggregateOut(replica_task);
       break;
     }
   }

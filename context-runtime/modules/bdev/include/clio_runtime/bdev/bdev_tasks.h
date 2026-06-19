@@ -369,9 +369,9 @@ struct AllocateBlocksTask : public chi::Task {
     blocks_ = other->blocks_;
   }
 
-  /** Aggregate replica results into this task */
-  void Aggregate(const ctp::ipc::FullPtr<chi::Task> &other_base) {
-    Task::Aggregate(other_base);
+  /** AggregateOut replica results into this task */
+  void AggregateOut(const ctp::ipc::FullPtr<chi::Task> &other_base) {
+    Task::AggregateOut(other_base);
     Copy(other_base.template Cast<AllocateBlocksTask>());
   }
 };
@@ -444,9 +444,9 @@ struct FreeBlocksTask : public chi::Task {
     blocks_ = other->blocks_;
   }
 
-  /** Aggregate replica results into this task */
-  void Aggregate(const ctp::ipc::FullPtr<chi::Task> &other_base) {
-    Task::Aggregate(other_base);
+  /** AggregateOut replica results into this task */
+  void AggregateOut(const ctp::ipc::FullPtr<chi::Task> &other_base) {
+    Task::AggregateOut(other_base);
     Copy(other_base.template Cast<FreeBlocksTask>());
   }
 };
@@ -510,9 +510,9 @@ struct WriteTask : public chi::Task {
     blocks_.FixupSvoPtr();
   }
 
-  /** Aggregate */
-  void Aggregate(const ctp::ipc::FullPtr<chi::Task> &other_base) {
-    Task::Aggregate(other_base);
+  /** AggregateOut */
+  void AggregateOut(const ctp::ipc::FullPtr<chi::Task> &other_base) {
+    Task::AggregateOut(other_base);
     Copy(other_base.template Cast<WriteTask>());
   }
 
@@ -592,9 +592,9 @@ struct ReadTask : public chi::Task {
     blocks_.FixupSvoPtr();
   }
 
-  /** Aggregate */
-  void Aggregate(const ctp::ipc::FullPtr<chi::Task> &other_base) {
-    Task::Aggregate(other_base);
+  /** AggregateOut */
+  void AggregateOut(const ctp::ipc::FullPtr<chi::Task> &other_base) {
+    Task::AggregateOut(other_base);
     Copy(other_base.template Cast<ReadTask>());
   }
 
@@ -663,9 +663,9 @@ struct GetStatsTask : public chi::Task {
     remaining_size_ = other->remaining_size_;
   }
 
-  /** Aggregate replica results into this task */
-  void Aggregate(const ctp::ipc::FullPtr<chi::Task> &other_base) {
-    Task::Aggregate(other_base);
+  /** AggregateOut replica results into this task */
+  void AggregateOut(const ctp::ipc::FullPtr<chi::Task> &other_base) {
+    Task::AggregateOut(other_base);
     Copy(other_base.template Cast<GetStatsTask>());
   }
 };
@@ -729,8 +729,8 @@ struct UpdateTask : public chi::Task {
     alignment_   = other->alignment_;
   }
 
-  void Aggregate(const ctp::ipc::FullPtr<chi::Task> &other_base) {
-    Task::Aggregate(other_base);
+  void AggregateOut(const ctp::ipc::FullPtr<chi::Task> &other_base) {
+    Task::AggregateOut(other_base);
     Copy(other_base.template Cast<UpdateTask>());
   }
 };

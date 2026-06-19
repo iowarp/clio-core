@@ -469,51 +469,51 @@ ctp::ipc::FullPtr<chi::Task> Runtime::NewTask(chi::u32 method) {
   }
 }
 
-void Runtime::Aggregate(chi::u32 method, ctp::ipc::FullPtr<chi::Task> orig_task,
+void Runtime::AggregateOut(chi::u32 method, ctp::ipc::FullPtr<chi::Task> orig_task,
                         const ctp::ipc::FullPtr<chi::Task>& replica_task) {
   switch (method) {
     case Method::kCreate: {
       auto typed_task = orig_task.template Cast<CreateTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kDestroy: {
       auto typed_task = orig_task.template Cast<DestroyTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kMonitor: {
       auto typed_task = orig_task.template Cast<MonitorTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kDynamicSchedule: {
       auto typed_task = orig_task.template Cast<DynamicScheduleTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kCompress: {
       auto typed_task = orig_task.template Cast<CompressTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kDecompress: {
       auto typed_task = orig_task.template Cast<DecompressTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kPollNodeLoad: {
       auto typed_task = orig_task.template Cast<PollNodeLoadTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kPollConsumers: {
       auto typed_task = orig_task.template Cast<PollConsumersTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     default: {
-      orig_task->Aggregate(replica_task);
+      orig_task->AggregateOut(replica_task);
       break;
     }
   }

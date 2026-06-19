@@ -2,7 +2,7 @@
  * Comprehensive unit tests for autogen code coverage
  *
  * This test file exercises the SaveTask, LoadTask, NewTask, NewCopyTask,
- * and Aggregate methods in the autogen lib_exec.cc files to increase
+ * and AggregateOut methods in the autogen lib_exec.cc files to increase
  * code coverage.
  *
  * Target autogen files:
@@ -315,7 +315,7 @@ TEST_CASE("Autogen - Admin NewCopyTask", "[autogen][admin][copytask]") {
   }
 }
 
-TEST_CASE("Autogen - Admin Aggregate", "[autogen][admin][aggregate]") {
+TEST_CASE("Autogen - Admin AggregateOut", "[autogen][admin][aggregate]") {
   EnsureInitialized();
 
   auto* ipc_manager = CLIO_IPC;
@@ -327,7 +327,7 @@ TEST_CASE("Autogen - Admin Aggregate", "[autogen][admin][aggregate]") {
     return;
   }
 
-  SECTION("Aggregate for FlushTask") {
+  SECTION("AggregateOut for FlushTask") {
     auto origin_task = ipc_manager->NewTask<clio::run::admin::FlushTask>(
         chi::CreateTaskId(), chi::kAdminPoolId, chi::PoolQuery::Local());
     auto replica_task = ipc_manager->NewTask<clio::run::admin::FlushTask>(
@@ -342,14 +342,14 @@ TEST_CASE("Autogen - Admin Aggregate", "[autogen][admin][aggregate]") {
 
     ctp::ipc::FullPtr<chi::Task> origin_ptr = origin_task.template Cast<chi::Task>();
     ctp::ipc::FullPtr<chi::Task> replica_ptr = replica_task.template Cast<chi::Task>();
-    origin_ptr.ptr_->Aggregate(replica_ptr.template Cast<chi::Task>());
+    origin_ptr.ptr_->AggregateOut(replica_ptr.template Cast<chi::Task>());
 
-    INFO("Aggregate for FlushTask completed");
+    INFO("AggregateOut for FlushTask completed");
     CLIO_IPC->DelTask(origin_task);
     CLIO_IPC->DelTask(replica_task);
   }
 
-  SECTION("Aggregate for MonitorTask") {
+  SECTION("AggregateOut for MonitorTask") {
     auto origin_task = ipc_manager->NewTask<clio::run::admin::MonitorTask>(
         chi::CreateTaskId(), chi::kAdminPoolId, chi::PoolQuery::Local(), std::string("status"));
     auto replica_task = ipc_manager->NewTask<clio::run::admin::MonitorTask>(
@@ -364,9 +364,9 @@ TEST_CASE("Autogen - Admin Aggregate", "[autogen][admin][aggregate]") {
 
     ctp::ipc::FullPtr<chi::Task> origin_ptr = origin_task.template Cast<chi::Task>();
     ctp::ipc::FullPtr<chi::Task> replica_ptr = replica_task.template Cast<chi::Task>();
-    origin_ptr.ptr_->Aggregate(replica_ptr.template Cast<chi::Task>());
+    origin_ptr.ptr_->AggregateOut(replica_ptr.template Cast<chi::Task>());
 
-    INFO("Aggregate for MonitorTask completed");
+    INFO("AggregateOut for MonitorTask completed");
     CLIO_IPC->DelTask(origin_task);
     CLIO_IPC->DelTask(replica_task);
   }
@@ -703,11 +703,11 @@ TEST_CASE("Autogen - Admin StopRuntimeTask coverage", "[autogen][admin][stoprunt
         CLIO_IPC->DelTask(copied_task);
       }
 
-      // Test Aggregate
+      // Test AggregateOut
       auto replica_task = container->NewTask(clio::run::admin::Method::kStopRuntime);
       if (!replica_task.IsNull()) {
-        new_task.ptr_->Aggregate(replica_task.template Cast<chi::Task>());
-        INFO("Aggregate for StopRuntimeTask succeeded");
+        new_task.ptr_->AggregateOut(replica_task.template Cast<chi::Task>());
+        INFO("AggregateOut for StopRuntimeTask succeeded");
         CLIO_IPC->DelTask(replica_task);
       }
 
@@ -755,11 +755,11 @@ TEST_CASE("Autogen - Admin DestroyPoolTask coverage", "[autogen][admin][destroyp
         CLIO_IPC->DelTask(copied_task);
       }
 
-      // Aggregate
+      // AggregateOut
       auto replica_task = container->NewTask(clio::run::admin::Method::kDestroyPool);
       if (!replica_task.IsNull()) {
-        new_task.ptr_->Aggregate(replica_task.template Cast<chi::Task>());
-        INFO("Aggregate for DestroyPoolTask succeeded");
+        new_task.ptr_->AggregateOut(replica_task.template Cast<chi::Task>());
+        INFO("AggregateOut for DestroyPoolTask succeeded");
         CLIO_IPC->DelTask(replica_task);
       }
 
@@ -792,11 +792,11 @@ TEST_CASE("Autogen - Admin SubmitBatchTask coverage", "[autogen][admin][submitba
         CLIO_IPC->DelTask(copied_task);
       }
 
-      // Aggregate
+      // AggregateOut
       auto replica_task = container->NewTask(clio::run::admin::Method::kSubmitBatch);
       if (!replica_task.IsNull()) {
-        new_task.ptr_->Aggregate(replica_task.template Cast<chi::Task>());
-        INFO("Aggregate for SubmitBatchTask succeeded");
+        new_task.ptr_->AggregateOut(replica_task.template Cast<chi::Task>());
+        INFO("AggregateOut for SubmitBatchTask succeeded");
         CLIO_IPC->DelTask(replica_task);
       }
 
@@ -829,11 +829,11 @@ TEST_CASE("Autogen - Admin CreateTask and DestroyTask coverage", "[autogen][admi
         CLIO_IPC->DelTask(copied_task);
       }
 
-      // Aggregate
+      // AggregateOut
       auto replica_task = container->NewTask(clio::run::admin::Method::kCreate);
       if (!replica_task.IsNull()) {
-        new_task.ptr_->Aggregate(replica_task.template Cast<chi::Task>());
-        INFO("Aggregate for CreateTask succeeded");
+        new_task.ptr_->AggregateOut(replica_task.template Cast<chi::Task>());
+        INFO("AggregateOut for CreateTask succeeded");
         CLIO_IPC->DelTask(replica_task);
       }
 
@@ -853,11 +853,11 @@ TEST_CASE("Autogen - Admin CreateTask and DestroyTask coverage", "[autogen][admi
         CLIO_IPC->DelTask(copied_task);
       }
 
-      // Aggregate
+      // AggregateOut
       auto replica_task = container->NewTask(clio::run::admin::Method::kDestroy);
       if (!replica_task.IsNull()) {
-        new_task.ptr_->Aggregate(replica_task.template Cast<chi::Task>());
-        INFO("Aggregate for DestroyTask succeeded");
+        new_task.ptr_->AggregateOut(replica_task.template Cast<chi::Task>());
+        INFO("AggregateOut for DestroyTask succeeded");
         CLIO_IPC->DelTask(replica_task);
       }
 
@@ -890,11 +890,11 @@ TEST_CASE("Autogen - Admin GetOrCreatePoolTask coverage", "[autogen][admin][geto
         CLIO_IPC->DelTask(copied_task);
       }
 
-      // Aggregate
+      // AggregateOut
       auto replica_task = container->NewTask(clio::run::admin::Method::kGetOrCreatePool);
       if (!replica_task.IsNull()) {
-        new_task.ptr_->Aggregate(replica_task.template Cast<chi::Task>());
-        INFO("Aggregate for GetOrCreatePoolTask succeeded");
+        new_task.ptr_->AggregateOut(replica_task.template Cast<chi::Task>());
+        INFO("AggregateOut for GetOrCreatePoolTask succeeded");
         CLIO_IPC->DelTask(replica_task);
       }
 
@@ -927,11 +927,11 @@ TEST_CASE("Autogen - Admin SendTask and RecvTask coverage", "[autogen][admin][se
         CLIO_IPC->DelTask(copied_task);
       }
 
-      // Aggregate
+      // AggregateOut
       auto replica_task = container->NewTask(clio::run::admin::Method::kSend);
       if (!replica_task.IsNull()) {
-        new_task.ptr_->Aggregate(replica_task.template Cast<chi::Task>());
-        INFO("Aggregate for SendTask succeeded");
+        new_task.ptr_->AggregateOut(replica_task.template Cast<chi::Task>());
+        INFO("AggregateOut for SendTask succeeded");
         CLIO_IPC->DelTask(replica_task);
       }
 
@@ -951,11 +951,11 @@ TEST_CASE("Autogen - Admin SendTask and RecvTask coverage", "[autogen][admin][se
         CLIO_IPC->DelTask(copied_task);
       }
 
-      // Aggregate
+      // AggregateOut
       auto replica_task = container->NewTask(clio::run::admin::Method::kRecv);
       if (!replica_task.IsNull()) {
-        new_task.ptr_->Aggregate(replica_task.template Cast<chi::Task>());
-        INFO("Aggregate for RecvTask succeeded");
+        new_task.ptr_->AggregateOut(replica_task.template Cast<chi::Task>());
+        INFO("AggregateOut for RecvTask succeeded");
         CLIO_IPC->DelTask(replica_task);
       }
 
@@ -1540,7 +1540,7 @@ TEST_CASE("Autogen - CTE BlobQueryTask coverage", "[autogen][cte][blobquery]") {
 }
 
 //==============================================================================
-// CTE Core - Copy and Aggregate Tests for Higher Coverage
+// CTE Core - Copy and AggregateOut Tests for Higher Coverage
 //==============================================================================
 
 TEST_CASE("Autogen - CTE Task Copy operations", "[autogen][cte][copy]") {
@@ -1597,57 +1597,57 @@ TEST_CASE("Autogen - CTE Task Copy operations", "[autogen][cte][copy]") {
   }
 }
 
-TEST_CASE("Autogen - CTE Task Aggregate operations", "[autogen][cte][aggregate]") {
+TEST_CASE("Autogen - CTE Task AggregateOut operations", "[autogen][cte][aggregate]") {
   EnsureInitialized();
 
   auto* ipc_manager = CLIO_IPC;
 
-  SECTION("Aggregate for ListTargetsTask") {
+  SECTION("AggregateOut for ListTargetsTask") {
     auto origin_task = ipc_manager->NewTask<clio::cte::core::ListTargetsTask>();
     auto replica_task = ipc_manager->NewTask<clio::cte::core::ListTargetsTask>();
 
     if (!origin_task.IsNull() && !replica_task.IsNull()) {
       // Add some test data to replica
       replica_task->target_names_.push_back("test_target");
-      origin_task->Aggregate(replica_task.template Cast<chi::Task>());
-      INFO("ListTargetsTask Aggregate completed");
+      origin_task->AggregateOut(replica_task.template Cast<chi::Task>());
+      INFO("ListTargetsTask AggregateOut completed");
       REQUIRE(origin_task->target_names_.size() == 1);
       CLIO_IPC->DelTask(origin_task);
       CLIO_IPC->DelTask(replica_task);
     }
   }
 
-  SECTION("Aggregate for GetTagSizeTask") {
+  SECTION("AggregateOut for GetTagSizeTask") {
     auto origin_task = ipc_manager->NewTask<clio::cte::core::GetTagSizeTask>();
     auto replica_task = ipc_manager->NewTask<clio::cte::core::GetTagSizeTask>();
 
     if (!origin_task.IsNull() && !replica_task.IsNull()) {
       origin_task->tag_size_ = 100;
       replica_task->tag_size_ = 200;
-      origin_task->Aggregate(replica_task.template Cast<chi::Task>());
-      INFO("GetTagSizeTask Aggregate completed");
+      origin_task->AggregateOut(replica_task.template Cast<chi::Task>());
+      INFO("GetTagSizeTask AggregateOut completed");
       REQUIRE(origin_task->tag_size_ == 300);
       CLIO_IPC->DelTask(origin_task);
       CLIO_IPC->DelTask(replica_task);
     }
   }
 
-  SECTION("Aggregate for GetContainedBlobsTask") {
+  SECTION("AggregateOut for GetContainedBlobsTask") {
     auto origin_task = ipc_manager->NewTask<clio::cte::core::GetContainedBlobsTask>();
     auto replica_task = ipc_manager->NewTask<clio::cte::core::GetContainedBlobsTask>();
 
     if (!origin_task.IsNull() && !replica_task.IsNull()) {
       replica_task->blob_names_.push_back("blob1");
       replica_task->blob_names_.push_back("blob2");
-      origin_task->Aggregate(replica_task.template Cast<chi::Task>());
-      INFO("GetContainedBlobsTask Aggregate completed");
+      origin_task->AggregateOut(replica_task.template Cast<chi::Task>());
+      INFO("GetContainedBlobsTask AggregateOut completed");
       REQUIRE(origin_task->blob_names_.size() == 2);
       CLIO_IPC->DelTask(origin_task);
       CLIO_IPC->DelTask(replica_task);
     }
   }
 
-  SECTION("Aggregate for TagQueryTask") {
+  SECTION("AggregateOut for TagQueryTask") {
     auto origin_task = ipc_manager->NewTask<clio::cte::core::TagQueryTask>();
     auto replica_task = ipc_manager->NewTask<clio::cte::core::TagQueryTask>();
 
@@ -1655,15 +1655,15 @@ TEST_CASE("Autogen - CTE Task Aggregate operations", "[autogen][cte][aggregate]"
       replica_task->total_tags_matched_ = 5;
       replica_task->results_.push_back("tag1");
       origin_task->total_tags_matched_ = 3;
-      origin_task->Aggregate(replica_task.template Cast<chi::Task>());
-      INFO("TagQueryTask Aggregate completed");
+      origin_task->AggregateOut(replica_task.template Cast<chi::Task>());
+      INFO("TagQueryTask AggregateOut completed");
       REQUIRE(origin_task->total_tags_matched_ == 8);
       CLIO_IPC->DelTask(origin_task);
       CLIO_IPC->DelTask(replica_task);
     }
   }
 
-  SECTION("Aggregate for BlobQueryTask") {
+  SECTION("AggregateOut for BlobQueryTask") {
     auto origin_task = ipc_manager->NewTask<clio::cte::core::BlobQueryTask>();
     auto replica_task = ipc_manager->NewTask<clio::cte::core::BlobQueryTask>();
 
@@ -1672,8 +1672,8 @@ TEST_CASE("Autogen - CTE Task Aggregate operations", "[autogen][cte][aggregate]"
       replica_task->tag_names_.push_back("tag1");
       replica_task->blob_names_.push_back("blob1");
       origin_task->total_blobs_matched_ = 5;
-      origin_task->Aggregate(replica_task.template Cast<chi::Task>());
-      INFO("BlobQueryTask Aggregate completed");
+      origin_task->AggregateOut(replica_task.template Cast<chi::Task>());
+      INFO("BlobQueryTask AggregateOut completed");
       REQUIRE(origin_task->total_blobs_matched_ == 15);
       CLIO_IPC->DelTask(origin_task);
       CLIO_IPC->DelTask(replica_task);
@@ -1685,7 +1685,7 @@ TEST_CASE("Autogen - CTE Task Aggregate operations", "[autogen][cte][aggregate]"
 // Additional Bdev Task-Level Tests for Higher Coverage
 //==============================================================================
 
-TEST_CASE("Autogen - Bdev Task Copy and Aggregate", "[autogen][bdev][copy][aggregate]") {
+TEST_CASE("Autogen - Bdev Task Copy and AggregateOut", "[autogen][bdev][copy][aggregate]") {
   EnsureInitialized();
 
   auto* ipc_manager = CLIO_IPC;
@@ -1702,13 +1702,13 @@ TEST_CASE("Autogen - Bdev Task Copy and Aggregate", "[autogen][bdev][copy][aggre
     }
   }
 
-  SECTION("Aggregate for GetStatsTask") {
+  SECTION("AggregateOut for GetStatsTask") {
     auto task1 = ipc_manager->NewTask<clio::run::bdev::GetStatsTask>();
     auto task2 = ipc_manager->NewTask<clio::run::bdev::GetStatsTask>();
 
     if (!task1.IsNull() && !task2.IsNull()) {
-      task1->Aggregate(task2.template Cast<chi::Task>());
-      INFO("GetStatsTask Aggregate completed");
+      task1->AggregateOut(task2.template Cast<chi::Task>());
+      INFO("GetStatsTask AggregateOut completed");
       CLIO_IPC->DelTask(task1);
       CLIO_IPC->DelTask(task2);
     }
@@ -1853,7 +1853,7 @@ TEST_CASE("Autogen - Admin Container SaveTask/LoadTask all methods", "[autogen][
 }
 
 //==============================================================================
-// Admin Task additional Copy and Aggregate tests
+// Admin Task additional Copy and AggregateOut tests
 //==============================================================================
 
 TEST_CASE("Autogen - Admin Additional Task operations", "[autogen][admin][additional]") {
@@ -1903,43 +1903,43 @@ TEST_CASE("Autogen - Admin Additional Task operations", "[autogen][admin][additi
     }
   }
 
-  SECTION("Aggregate for additional Admin task types") {
-    // Test Aggregate for CreateTask
+  SECTION("AggregateOut for additional Admin task types") {
+    // Test AggregateOut for CreateTask
     auto create1 = ipc_manager->NewTask<clio::run::admin::CreateTask>();
     auto create2 = ipc_manager->NewTask<clio::run::admin::CreateTask>();
     if (!create1.IsNull() && !create2.IsNull()) {
-      create1->Aggregate(create2.template Cast<chi::Task>());
-      INFO("CreateTask Aggregate completed");
+      create1->AggregateOut(create2.template Cast<chi::Task>());
+      INFO("CreateTask AggregateOut completed");
       CLIO_IPC->DelTask(create1);
       CLIO_IPC->DelTask(create2);
     }
 
-    // Test Aggregate for DestroyTask
+    // Test AggregateOut for DestroyTask
     auto destroy1 = ipc_manager->NewTask<clio::run::admin::DestroyTask>();
     auto destroy2 = ipc_manager->NewTask<clio::run::admin::DestroyTask>();
     if (!destroy1.IsNull() && !destroy2.IsNull()) {
-      destroy1->Aggregate(destroy2.template Cast<chi::Task>());
-      INFO("DestroyTask Aggregate completed");
+      destroy1->AggregateOut(destroy2.template Cast<chi::Task>());
+      INFO("DestroyTask AggregateOut completed");
       CLIO_IPC->DelTask(destroy1);
       CLIO_IPC->DelTask(destroy2);
     }
 
-    // Test Aggregate for StopRuntimeTask
+    // Test AggregateOut for StopRuntimeTask
     auto stop1 = ipc_manager->NewTask<clio::run::admin::StopRuntimeTask>();
     auto stop2 = ipc_manager->NewTask<clio::run::admin::StopRuntimeTask>();
     if (!stop1.IsNull() && !stop2.IsNull()) {
-      stop1->Aggregate(stop2.template Cast<chi::Task>());
-      INFO("StopRuntimeTask Aggregate completed");
+      stop1->AggregateOut(stop2.template Cast<chi::Task>());
+      INFO("StopRuntimeTask AggregateOut completed");
       CLIO_IPC->DelTask(stop1);
       CLIO_IPC->DelTask(stop2);
     }
 
-    // Test Aggregate for DestroyPoolTask
+    // Test AggregateOut for DestroyPoolTask
     auto pool1 = ipc_manager->NewTask<clio::run::admin::DestroyPoolTask>();
     auto pool2 = ipc_manager->NewTask<clio::run::admin::DestroyPoolTask>();
     if (!pool1.IsNull() && !pool2.IsNull()) {
-      pool1->Aggregate(pool2.template Cast<chi::Task>());
-      INFO("DestroyPoolTask Aggregate completed");
+      pool1->AggregateOut(pool2.template Cast<chi::Task>());
+      INFO("DestroyPoolTask AggregateOut completed");
       CLIO_IPC->DelTask(pool1);
       CLIO_IPC->DelTask(pool2);
     }
@@ -2016,7 +2016,7 @@ TEST_CASE("Autogen - CAE ProcessHdf5DatasetTask coverage", "[autogen][cae][proce
   }
 }
 
-TEST_CASE("Autogen - CAE Task Copy and Aggregate", "[autogen][cae][copy][aggregate]") {
+TEST_CASE("Autogen - CAE Task Copy and AggregateOut", "[autogen][cae][copy][aggregate]") {
   EnsureInitialized();
 
   auto* ipc_manager = CLIO_IPC;
@@ -2045,25 +2045,25 @@ TEST_CASE("Autogen - CAE Task Copy and Aggregate", "[autogen][cae][copy][aggrega
     }
   }
 
-  SECTION("Aggregate for ParseOmniTask") {
+  SECTION("AggregateOut for ParseOmniTask") {
     auto task1 = ipc_manager->NewTask<clio::cae::core::ParseOmniTask>();
     auto task2 = ipc_manager->NewTask<clio::cae::core::ParseOmniTask>();
 
     if (!task1.IsNull() && !task2.IsNull()) {
-      task1->Aggregate(task2.template Cast<chi::Task>());
-      INFO("ParseOmniTask Aggregate completed");
+      task1->AggregateOut(task2.template Cast<chi::Task>());
+      INFO("ParseOmniTask AggregateOut completed");
       CLIO_IPC->DelTask(task1);
       CLIO_IPC->DelTask(task2);
     }
   }
 
-  SECTION("Aggregate for ProcessHdf5DatasetTask") {
+  SECTION("AggregateOut for ProcessHdf5DatasetTask") {
     auto task1 = ipc_manager->NewTask<clio::cae::core::ProcessHdf5DatasetTask>();
     auto task2 = ipc_manager->NewTask<clio::cae::core::ProcessHdf5DatasetTask>();
 
     if (!task1.IsNull() && !task2.IsNull()) {
-      task1->Aggregate(task2.template Cast<chi::Task>());
-      INFO("ProcessHdf5DatasetTask Aggregate completed");
+      task1->AggregateOut(task2.template Cast<chi::Task>());
+      INFO("ProcessHdf5DatasetTask AggregateOut completed");
       CLIO_IPC->DelTask(task1);
       CLIO_IPC->DelTask(task2);
     }
@@ -2071,7 +2071,7 @@ TEST_CASE("Autogen - CAE Task Copy and Aggregate", "[autogen][cae][copy][aggrega
 }
 
 //==============================================================================
-// Additional CTE Task Copy and Aggregate Tests for Higher Coverage
+// Additional CTE Task Copy and AggregateOut Tests for Higher Coverage
 //==============================================================================
 
 TEST_CASE("Autogen - CTE Additional Task Coverage", "[autogen][cte][additional]") {
@@ -2224,150 +2224,150 @@ TEST_CASE("Autogen - CTE Additional Task Coverage", "[autogen][cte][additional]"
   }
 }
 
-TEST_CASE("Autogen - CTE Additional Aggregate Tests", "[autogen][cte][aggregate]") {
+TEST_CASE("Autogen - CTE Additional AggregateOut Tests", "[autogen][cte][aggregate]") {
   EnsureInitialized();
 
   auto* ipc_manager = CLIO_IPC;
 
-  SECTION("Aggregate for UnregisterTargetTask") {
+  SECTION("AggregateOut for UnregisterTargetTask") {
     auto task1 = ipc_manager->NewTask<clio::cte::core::UnregisterTargetTask>();
     auto task2 = ipc_manager->NewTask<clio::cte::core::UnregisterTargetTask>();
 
     if (!task1.IsNull() && !task2.IsNull()) {
-      task1->Aggregate(task2.template Cast<chi::Task>());
-      INFO("UnregisterTargetTask Aggregate completed");
+      task1->AggregateOut(task2.template Cast<chi::Task>());
+      INFO("UnregisterTargetTask AggregateOut completed");
       CLIO_IPC->DelTask(task1);
       CLIO_IPC->DelTask(task2);
     }
   }
 
-  SECTION("Aggregate for StatTargetsTask") {
+  SECTION("AggregateOut for StatTargetsTask") {
     auto task1 = ipc_manager->NewTask<clio::cte::core::StatTargetsTask>();
     auto task2 = ipc_manager->NewTask<clio::cte::core::StatTargetsTask>();
 
     if (!task1.IsNull() && !task2.IsNull()) {
-      task1->Aggregate(task2.template Cast<chi::Task>());
-      INFO("StatTargetsTask Aggregate completed");
+      task1->AggregateOut(task2.template Cast<chi::Task>());
+      INFO("StatTargetsTask AggregateOut completed");
       CLIO_IPC->DelTask(task1);
       CLIO_IPC->DelTask(task2);
     }
   }
 
-  SECTION("Aggregate for ReorganizeBlobTask") {
+  SECTION("AggregateOut for ReorganizeBlobTask") {
     auto task1 = ipc_manager->NewTask<clio::cte::core::ReorganizeBlobTask>();
     auto task2 = ipc_manager->NewTask<clio::cte::core::ReorganizeBlobTask>();
 
     if (!task1.IsNull() && !task2.IsNull()) {
-      task1->Aggregate(task2.template Cast<chi::Task>());
-      INFO("ReorganizeBlobTask Aggregate completed");
+      task1->AggregateOut(task2.template Cast<chi::Task>());
+      INFO("ReorganizeBlobTask AggregateOut completed");
       CLIO_IPC->DelTask(task1);
       CLIO_IPC->DelTask(task2);
     }
   }
 
-  SECTION("Aggregate for DelBlobTask") {
+  SECTION("AggregateOut for DelBlobTask") {
     auto task1 = ipc_manager->NewTask<clio::cte::core::DelBlobTask>();
     auto task2 = ipc_manager->NewTask<clio::cte::core::DelBlobTask>();
 
     if (!task1.IsNull() && !task2.IsNull()) {
-      task1->Aggregate(task2.template Cast<chi::Task>());
-      INFO("DelBlobTask Aggregate completed");
+      task1->AggregateOut(task2.template Cast<chi::Task>());
+      INFO("DelBlobTask AggregateOut completed");
       CLIO_IPC->DelTask(task1);
       CLIO_IPC->DelTask(task2);
     }
   }
 
-  SECTION("Aggregate for DelTagTask") {
+  SECTION("AggregateOut for DelTagTask") {
     auto task1 = ipc_manager->NewTask<clio::cte::core::DelTagTask>();
     auto task2 = ipc_manager->NewTask<clio::cte::core::DelTagTask>();
 
     if (!task1.IsNull() && !task2.IsNull()) {
-      task1->Aggregate(task2.template Cast<chi::Task>());
-      INFO("DelTagTask Aggregate completed");
+      task1->AggregateOut(task2.template Cast<chi::Task>());
+      INFO("DelTagTask AggregateOut completed");
       CLIO_IPC->DelTask(task1);
       CLIO_IPC->DelTask(task2);
     }
   }
 
-  SECTION("Aggregate for GetBlobScoreTask") {
+  SECTION("AggregateOut for GetBlobScoreTask") {
     auto task1 = ipc_manager->NewTask<clio::cte::core::GetBlobScoreTask>();
     auto task2 = ipc_manager->NewTask<clio::cte::core::GetBlobScoreTask>();
 
     if (!task1.IsNull() && !task2.IsNull()) {
-      task1->Aggregate(task2.template Cast<chi::Task>());
-      INFO("GetBlobScoreTask Aggregate completed");
+      task1->AggregateOut(task2.template Cast<chi::Task>());
+      INFO("GetBlobScoreTask AggregateOut completed");
       CLIO_IPC->DelTask(task1);
       CLIO_IPC->DelTask(task2);
     }
   }
 
-  SECTION("Aggregate for GetBlobSizeTask") {
+  SECTION("AggregateOut for GetBlobSizeTask") {
     auto task1 = ipc_manager->NewTask<clio::cte::core::GetBlobSizeTask>();
     auto task2 = ipc_manager->NewTask<clio::cte::core::GetBlobSizeTask>();
 
     if (!task1.IsNull() && !task2.IsNull()) {
-      task1->Aggregate(task2.template Cast<chi::Task>());
-      INFO("GetBlobSizeTask Aggregate completed");
+      task1->AggregateOut(task2.template Cast<chi::Task>());
+      INFO("GetBlobSizeTask AggregateOut completed");
       CLIO_IPC->DelTask(task1);
       CLIO_IPC->DelTask(task2);
     }
   }
 
-  SECTION("Aggregate for PollTelemetryLogTask") {
+  SECTION("AggregateOut for PollTelemetryLogTask") {
     auto task1 = ipc_manager->NewTask<clio::cte::core::PollTelemetryLogTask>();
     auto task2 = ipc_manager->NewTask<clio::cte::core::PollTelemetryLogTask>();
 
     if (!task1.IsNull() && !task2.IsNull()) {
-      task1->Aggregate(task2.template Cast<chi::Task>());
-      INFO("PollTelemetryLogTask Aggregate completed");
+      task1->AggregateOut(task2.template Cast<chi::Task>());
+      INFO("PollTelemetryLogTask AggregateOut completed");
       CLIO_IPC->DelTask(task1);
       CLIO_IPC->DelTask(task2);
     }
   }
 
-  SECTION("Aggregate for RegisterTargetTask") {
+  SECTION("AggregateOut for RegisterTargetTask") {
     auto task1 = ipc_manager->NewTask<clio::cte::core::RegisterTargetTask>();
     auto task2 = ipc_manager->NewTask<clio::cte::core::RegisterTargetTask>();
 
     if (!task1.IsNull() && !task2.IsNull()) {
-      task1->Aggregate(task2.template Cast<chi::Task>());
-      INFO("RegisterTargetTask Aggregate completed");
+      task1->AggregateOut(task2.template Cast<chi::Task>());
+      INFO("RegisterTargetTask AggregateOut completed");
       CLIO_IPC->DelTask(task1);
       CLIO_IPC->DelTask(task2);
     }
   }
 
-  SECTION("Aggregate for GetOrCreateTagTask") {
+  SECTION("AggregateOut for GetOrCreateTagTask") {
     auto task1 = ipc_manager->NewTask<clio::cte::core::GetOrCreateTagTask<clio::cte::core::CreateParams>>();
     auto task2 = ipc_manager->NewTask<clio::cte::core::GetOrCreateTagTask<clio::cte::core::CreateParams>>();
 
     if (!task1.IsNull() && !task2.IsNull()) {
-      task1->Aggregate(task2.template Cast<chi::Task>());
-      INFO("GetOrCreateTagTask Aggregate completed");
+      task1->AggregateOut(task2.template Cast<chi::Task>());
+      INFO("GetOrCreateTagTask AggregateOut completed");
       CLIO_IPC->DelTask(task1);
       CLIO_IPC->DelTask(task2);
     }
   }
 
-  SECTION("Aggregate for PutBlobTask") {
+  SECTION("AggregateOut for PutBlobTask") {
     auto task1 = ipc_manager->NewTask<clio::cte::core::PutBlobTask>();
     auto task2 = ipc_manager->NewTask<clio::cte::core::PutBlobTask>();
 
     if (!task1.IsNull() && !task2.IsNull()) {
-      task1->Aggregate(task2.template Cast<chi::Task>());
-      INFO("PutBlobTask Aggregate completed");
+      task1->AggregateOut(task2.template Cast<chi::Task>());
+      INFO("PutBlobTask AggregateOut completed");
       CLIO_IPC->DelTask(task1);
       CLIO_IPC->DelTask(task2);
     }
   }
 
-  SECTION("Aggregate for GetBlobTask") {
+  SECTION("AggregateOut for GetBlobTask") {
     auto task1 = ipc_manager->NewTask<clio::cte::core::GetBlobTask>();
     auto task2 = ipc_manager->NewTask<clio::cte::core::GetBlobTask>();
 
     if (!task1.IsNull() && !task2.IsNull()) {
-      task1->Aggregate(task2.template Cast<chi::Task>());
-      INFO("GetBlobTask Aggregate completed");
+      task1->AggregateOut(task2.template Cast<chi::Task>());
+      INFO("GetBlobTask AggregateOut completed");
       CLIO_IPC->DelTask(task1);
       CLIO_IPC->DelTask(task2);
     }
@@ -2431,49 +2431,49 @@ TEST_CASE("Autogen - Bdev Additional Task Coverage", "[autogen][bdev][additional
     }
   }
 
-  SECTION("Aggregate for AllocateBlocksTask") {
+  SECTION("AggregateOut for AllocateBlocksTask") {
     auto task1 = ipc_manager->NewTask<clio::run::bdev::AllocateBlocksTask>();
     auto task2 = ipc_manager->NewTask<clio::run::bdev::AllocateBlocksTask>();
 
     if (!task1.IsNull() && !task2.IsNull()) {
-      task1->Aggregate(task2.template Cast<chi::Task>());
-      INFO("AllocateBlocksTask Aggregate completed");
+      task1->AggregateOut(task2.template Cast<chi::Task>());
+      INFO("AllocateBlocksTask AggregateOut completed");
       CLIO_IPC->DelTask(task1);
       CLIO_IPC->DelTask(task2);
     }
   }
 
-  SECTION("Aggregate for FreeBlocksTask") {
+  SECTION("AggregateOut for FreeBlocksTask") {
     auto task1 = ipc_manager->NewTask<clio::run::bdev::FreeBlocksTask>();
     auto task2 = ipc_manager->NewTask<clio::run::bdev::FreeBlocksTask>();
 
     if (!task1.IsNull() && !task2.IsNull()) {
-      task1->Aggregate(task2.template Cast<chi::Task>());
-      INFO("FreeBlocksTask Aggregate completed");
+      task1->AggregateOut(task2.template Cast<chi::Task>());
+      INFO("FreeBlocksTask AggregateOut completed");
       CLIO_IPC->DelTask(task1);
       CLIO_IPC->DelTask(task2);
     }
   }
 
-  SECTION("Aggregate for WriteTask") {
+  SECTION("AggregateOut for WriteTask") {
     auto task1 = ipc_manager->NewTask<clio::run::bdev::WriteTask>();
     auto task2 = ipc_manager->NewTask<clio::run::bdev::WriteTask>();
 
     if (!task1.IsNull() && !task2.IsNull()) {
-      task1->Aggregate(task2.template Cast<chi::Task>());
-      INFO("WriteTask Aggregate completed");
+      task1->AggregateOut(task2.template Cast<chi::Task>());
+      INFO("WriteTask AggregateOut completed");
       CLIO_IPC->DelTask(task1);
       CLIO_IPC->DelTask(task2);
     }
   }
 
-  SECTION("Aggregate for ReadTask") {
+  SECTION("AggregateOut for ReadTask") {
     auto task1 = ipc_manager->NewTask<clio::run::bdev::ReadTask>();
     auto task2 = ipc_manager->NewTask<clio::run::bdev::ReadTask>();
 
     if (!task1.IsNull() && !task2.IsNull()) {
-      task1->Aggregate(task2.template Cast<chi::Task>());
-      INFO("ReadTask Aggregate completed");
+      task1->AggregateOut(task2.template Cast<chi::Task>());
+      INFO("ReadTask AggregateOut completed");
       CLIO_IPC->DelTask(task1);
       CLIO_IPC->DelTask(task2);
     }
@@ -2531,43 +2531,43 @@ TEST_CASE("Autogen - Admin Additional Task Coverage", "[autogen][admin][addition
     }
   }
 
-  SECTION("Aggregate for FlushTask") {
+  SECTION("AggregateOut for FlushTask") {
     auto task1 = ipc_manager->NewTask<clio::run::admin::FlushTask>(
         chi::CreateTaskId(), chi::kAdminPoolId, chi::PoolQuery::Local());
     auto task2 = ipc_manager->NewTask<clio::run::admin::FlushTask>(
         chi::CreateTaskId(), chi::kAdminPoolId, chi::PoolQuery::Local());
 
     if (!task1.IsNull() && !task2.IsNull()) {
-      task1->Aggregate(task2.template Cast<chi::Task>());
-      INFO("FlushTask Aggregate completed");
+      task1->AggregateOut(task2.template Cast<chi::Task>());
+      INFO("FlushTask AggregateOut completed");
       CLIO_IPC->DelTask(task1);
       CLIO_IPC->DelTask(task2);
     }
   }
 
-  SECTION("Aggregate for MonitorTask") {
+  SECTION("AggregateOut for MonitorTask") {
     auto task1 = ipc_manager->NewTask<clio::run::admin::MonitorTask>(
         chi::CreateTaskId(), chi::kAdminPoolId, chi::PoolQuery::Local(), std::string("status"));
     auto task2 = ipc_manager->NewTask<clio::run::admin::MonitorTask>(
         chi::CreateTaskId(), chi::kAdminPoolId, chi::PoolQuery::Local(), std::string("status"));
 
     if (!task1.IsNull() && !task2.IsNull()) {
-      task1->Aggregate(task2.template Cast<chi::Task>());
-      INFO("MonitorTask Aggregate completed");
+      task1->AggregateOut(task2.template Cast<chi::Task>());
+      INFO("MonitorTask AggregateOut completed");
       CLIO_IPC->DelTask(task1);
       CLIO_IPC->DelTask(task2);
     }
   }
 
-  SECTION("Aggregate for ClientConnectTask") {
+  SECTION("AggregateOut for ClientConnectTask") {
     auto task1 = ipc_manager->NewTask<clio::run::admin::ClientConnectTask>(
         chi::CreateTaskId(), chi::kAdminPoolId, chi::PoolQuery::Local());
     auto task2 = ipc_manager->NewTask<clio::run::admin::ClientConnectTask>(
         chi::CreateTaskId(), chi::kAdminPoolId, chi::PoolQuery::Local());
 
     if (!task1.IsNull() && !task2.IsNull()) {
-      task1->Aggregate(task2.template Cast<chi::Task>());
-      INFO("ClientConnectTask Aggregate completed");
+      task1->AggregateOut(task2.template Cast<chi::Task>());
+      INFO("ClientConnectTask AggregateOut completed");
       CLIO_IPC->DelTask(task1);
       CLIO_IPC->DelTask(task2);
     }
@@ -2882,12 +2882,12 @@ TEST_CASE("Autogen - Admin Container advanced operations", "[autogen][admin][con
     }
   }
 
-  SECTION("Admin Container Aggregate for multiple methods") {
+  SECTION("Admin Container AggregateOut for multiple methods") {
     auto task1a = admin_container->NewTask(clio::run::admin::Method::kFlush);
     auto task1b = admin_container->NewTask(clio::run::admin::Method::kFlush);
     if (!task1a.IsNull() && !task1b.IsNull()) {
-      task1a.ptr_->Aggregate(task1b.template Cast<chi::Task>());
-      INFO("Admin Container Aggregate for Flush completed");
+      task1a.ptr_->AggregateOut(task1b.template Cast<chi::Task>());
+      INFO("Admin Container AggregateOut for Flush completed");
       CLIO_IPC->DelTask(task1a);
       CLIO_IPC->DelTask(task1b);
     }
@@ -2895,8 +2895,8 @@ TEST_CASE("Autogen - Admin Container advanced operations", "[autogen][admin][con
     auto task2a = admin_container->NewTask(clio::run::admin::Method::kClientConnect);
     auto task2b = admin_container->NewTask(clio::run::admin::Method::kClientConnect);
     if (!task2a.IsNull() && !task2b.IsNull()) {
-      task2a.ptr_->Aggregate(task2b.template Cast<chi::Task>());
-      INFO("Admin Container Aggregate for ClientConnect completed");
+      task2a.ptr_->AggregateOut(task2b.template Cast<chi::Task>());
+      INFO("Admin Container AggregateOut for ClientConnect completed");
       CLIO_IPC->DelTask(task2a);
       CLIO_IPC->DelTask(task2b);
     }
@@ -2904,7 +2904,7 @@ TEST_CASE("Autogen - Admin Container advanced operations", "[autogen][admin][con
 }
 
 //==============================================================================
-// Additional CTE Copy/Aggregate tests for more coverage
+// Additional CTE Copy/AggregateOut tests for more coverage
 //==============================================================================
 
 TEST_CASE("Autogen - CTE Comprehensive Copy tests", "[autogen][cte][copy][comprehensive]") {
@@ -2936,10 +2936,10 @@ TEST_CASE("Autogen - CTE Comprehensive Copy tests", "[autogen][cte][copy][compre
 }
 
 //==============================================================================
-// Additional Bdev Copy/Aggregate tests for more coverage
+// Additional Bdev Copy/AggregateOut tests for more coverage
 //==============================================================================
 
-TEST_CASE("Autogen - Bdev Comprehensive Copy and Aggregate", "[autogen][bdev][comprehensive]") {
+TEST_CASE("Autogen - Bdev Comprehensive Copy and AggregateOut", "[autogen][bdev][comprehensive]") {
   EnsureInitialized();
 
   auto* ipc_manager = CLIO_IPC;
@@ -2956,13 +2956,13 @@ TEST_CASE("Autogen - Bdev Comprehensive Copy and Aggregate", "[autogen][bdev][co
     }
   }
 
-  SECTION("Additional Aggregate for Bdev tasks") {
-    // Aggregate for GetStatsTask
+  SECTION("Additional AggregateOut for Bdev tasks") {
+    // AggregateOut for GetStatsTask
     auto stats1 = ipc_manager->NewTask<clio::run::bdev::GetStatsTask>();
     auto stats2 = ipc_manager->NewTask<clio::run::bdev::GetStatsTask>();
     if (!stats1.IsNull() && !stats2.IsNull()) {
-      stats1->Aggregate(stats2.template Cast<chi::Task>());
-      INFO("GetStatsTask Aggregate completed");
+      stats1->AggregateOut(stats2.template Cast<chi::Task>());
+      INFO("GetStatsTask AggregateOut completed");
       CLIO_IPC->DelTask(stats1);
       CLIO_IPC->DelTask(stats2);
     }
@@ -2995,12 +2995,12 @@ TEST_CASE("Autogen - CAE Comprehensive tests", "[autogen][cae][comprehensive]") 
     }
   }
 
-  SECTION("Aggregate for CAE tasks") {
+  SECTION("AggregateOut for CAE tasks") {
     auto task1 = ipc_manager->NewTask<clio::cae::core::ParseOmniTask>();
     auto task2 = ipc_manager->NewTask<clio::cae::core::ParseOmniTask>();
     if (!task1.IsNull() && !task2.IsNull()) {
-      task1->Aggregate(task2.template Cast<chi::Task>());
-      INFO("ParseOmniTask Aggregate completed");
+      task1->AggregateOut(task2.template Cast<chi::Task>());
+      INFO("ParseOmniTask AggregateOut completed");
       CLIO_IPC->DelTask(task1);
       CLIO_IPC->DelTask(task2);
     }
@@ -3008,8 +3008,8 @@ TEST_CASE("Autogen - CAE Comprehensive tests", "[autogen][cae][comprehensive]") 
     auto hdf1 = ipc_manager->NewTask<clio::cae::core::ProcessHdf5DatasetTask>();
     auto hdf2 = ipc_manager->NewTask<clio::cae::core::ProcessHdf5DatasetTask>();
     if (!hdf1.IsNull() && !hdf2.IsNull()) {
-      hdf1->Aggregate(hdf2.template Cast<chi::Task>());
-      INFO("ProcessHdf5DatasetTask Aggregate completed");
+      hdf1->AggregateOut(hdf2.template Cast<chi::Task>());
+      INFO("ProcessHdf5DatasetTask AggregateOut completed");
       CLIO_IPC->DelTask(hdf1);
       CLIO_IPC->DelTask(hdf2);
     }
@@ -3017,10 +3017,10 @@ TEST_CASE("Autogen - CAE Comprehensive tests", "[autogen][cae][comprehensive]") 
 }
 
 //==============================================================================
-// Additional Admin Copy/Aggregate tests for more coverage
+// Additional Admin Copy/AggregateOut tests for more coverage
 //==============================================================================
 
-TEST_CASE("Autogen - Admin Comprehensive Copy and Aggregate", "[autogen][admin][comprehensive]") {
+TEST_CASE("Autogen - Admin Comprehensive Copy and AggregateOut", "[autogen][admin][comprehensive]") {
   EnsureInitialized();
 
   auto* ipc_manager = CLIO_IPC;
@@ -3058,33 +3058,33 @@ TEST_CASE("Autogen - Admin Comprehensive Copy and Aggregate", "[autogen][admin][
 
   }
 
-  SECTION("More Aggregate tests for Admin") {
-    // Aggregate for SubmitBatchTask
+  SECTION("More AggregateOut tests for Admin") {
+    // AggregateOut for SubmitBatchTask
     auto batch1 = ipc_manager->NewTask<clio::run::admin::SubmitBatchTask>();
     auto batch2 = ipc_manager->NewTask<clio::run::admin::SubmitBatchTask>();
     if (!batch1.IsNull() && !batch2.IsNull()) {
-      batch1->Aggregate(batch2.template Cast<chi::Task>());
-      INFO("SubmitBatchTask Aggregate completed");
+      batch1->AggregateOut(batch2.template Cast<chi::Task>());
+      INFO("SubmitBatchTask AggregateOut completed");
       CLIO_IPC->DelTask(batch1);
       CLIO_IPC->DelTask(batch2);
     }
 
-    // Aggregate for SendTask
+    // AggregateOut for SendTask
     auto send1 = ipc_manager->NewTask<clio::run::admin::SendTask>();
     auto send2 = ipc_manager->NewTask<clio::run::admin::SendTask>();
     if (!send1.IsNull() && !send2.IsNull()) {
-      send1->Aggregate(send2.template Cast<chi::Task>());
-      INFO("SendTask Aggregate completed");
+      send1->AggregateOut(send2.template Cast<chi::Task>());
+      INFO("SendTask AggregateOut completed");
       CLIO_IPC->DelTask(send1);
       CLIO_IPC->DelTask(send2);
     }
 
-    // Aggregate for RecvTask
+    // AggregateOut for RecvTask
     auto recv1 = ipc_manager->NewTask<clio::run::admin::RecvTask>();
     auto recv2 = ipc_manager->NewTask<clio::run::admin::RecvTask>();
     if (!recv1.IsNull() && !recv2.IsNull()) {
-      recv1->Aggregate(recv2.template Cast<chi::Task>());
-      INFO("RecvTask Aggregate completed");
+      recv1->AggregateOut(recv2.template Cast<chi::Task>());
+      INFO("RecvTask AggregateOut completed");
       CLIO_IPC->DelTask(recv1);
       CLIO_IPC->DelTask(recv2);
     }
@@ -3821,8 +3821,8 @@ TEST_CASE("Autogen - More Bdev Container coverage", "[autogen][bdev][more]") {
     auto alloc2 = ipc_manager->NewTask<clio::run::bdev::AllocateBlocksTask>();
     if (!alloc1.IsNull() && !alloc2.IsNull()) {
       alloc2->Copy(alloc1);
-      alloc1->Aggregate(alloc2.template Cast<chi::Task>());
-      INFO("AllocateBlocksTask Copy+Aggregate completed");
+      alloc1->AggregateOut(alloc2.template Cast<chi::Task>());
+      INFO("AllocateBlocksTask Copy+AggregateOut completed");
       CLIO_IPC->DelTask(alloc1);
       CLIO_IPC->DelTask(alloc2);
     }
@@ -3832,8 +3832,8 @@ TEST_CASE("Autogen - More Bdev Container coverage", "[autogen][bdev][more]") {
     auto free2 = ipc_manager->NewTask<clio::run::bdev::FreeBlocksTask>();
     if (!free1.IsNull() && !free2.IsNull()) {
       free2->Copy(free1);
-      free1->Aggregate(free2.template Cast<chi::Task>());
-      INFO("FreeBlocksTask Copy+Aggregate completed");
+      free1->AggregateOut(free2.template Cast<chi::Task>());
+      INFO("FreeBlocksTask Copy+AggregateOut completed");
       CLIO_IPC->DelTask(free1);
       CLIO_IPC->DelTask(free2);
     }
@@ -3843,8 +3843,8 @@ TEST_CASE("Autogen - More Bdev Container coverage", "[autogen][bdev][more]") {
     auto write2 = ipc_manager->NewTask<clio::run::bdev::WriteTask>();
     if (!write1.IsNull() && !write2.IsNull()) {
       write2->Copy(write1);
-      write1->Aggregate(write2.template Cast<chi::Task>());
-      INFO("WriteTask Copy+Aggregate completed");
+      write1->AggregateOut(write2.template Cast<chi::Task>());
+      INFO("WriteTask Copy+AggregateOut completed");
       CLIO_IPC->DelTask(write1);
       CLIO_IPC->DelTask(write2);
     }
@@ -3854,8 +3854,8 @@ TEST_CASE("Autogen - More Bdev Container coverage", "[autogen][bdev][more]") {
     auto read2 = ipc_manager->NewTask<clio::run::bdev::ReadTask>();
     if (!read1.IsNull() && !read2.IsNull()) {
       read2->Copy(read1);
-      read1->Aggregate(read2.template Cast<chi::Task>());
-      INFO("ReadTask Copy+Aggregate completed");
+      read1->AggregateOut(read2.template Cast<chi::Task>());
+      INFO("ReadTask Copy+AggregateOut completed");
       CLIO_IPC->DelTask(read1);
       CLIO_IPC->DelTask(read2);
     }
@@ -3865,8 +3865,8 @@ TEST_CASE("Autogen - More Bdev Container coverage", "[autogen][bdev][more]") {
     auto stats2 = ipc_manager->NewTask<clio::run::bdev::GetStatsTask>();
     if (!stats1.IsNull() && !stats2.IsNull()) {
       stats2->Copy(stats1);
-      stats1->Aggregate(stats2.template Cast<chi::Task>());
-      INFO("GetStatsTask Copy+Aggregate completed");
+      stats1->AggregateOut(stats2.template Cast<chi::Task>());
+      INFO("GetStatsTask Copy+AggregateOut completed");
       CLIO_IPC->DelTask(stats1);
       CLIO_IPC->DelTask(stats2);
     }
@@ -3874,7 +3874,7 @@ TEST_CASE("Autogen - More Bdev Container coverage", "[autogen][bdev][more]") {
 }
 
 //==============================================================================
-// CAE Container NewCopyTask and Aggregate coverage
+// CAE Container NewCopyTask and AggregateOut coverage
 //==============================================================================
 
 TEST_CASE("Autogen - CAE Container operations", "[autogen][cae][container][ops]") {
@@ -3882,14 +3882,14 @@ TEST_CASE("Autogen - CAE Container operations", "[autogen][cae][container][ops]"
 
   auto* ipc_manager = CLIO_IPC;
 
-  SECTION("CAE task Copy and Aggregate") {
+  SECTION("CAE task Copy and AggregateOut") {
     // ParseOmniTask
     auto parse1 = ipc_manager->NewTask<clio::cae::core::ParseOmniTask>();
     auto parse2 = ipc_manager->NewTask<clio::cae::core::ParseOmniTask>();
     if (!parse1.IsNull() && !parse2.IsNull()) {
       parse2->Copy(parse1);
-      parse1->Aggregate(parse2.template Cast<chi::Task>());
-      INFO("ParseOmniTask Copy+Aggregate completed");
+      parse1->AggregateOut(parse2.template Cast<chi::Task>());
+      INFO("ParseOmniTask Copy+AggregateOut completed");
       CLIO_IPC->DelTask(parse1);
       CLIO_IPC->DelTask(parse2);
     }
@@ -3899,8 +3899,8 @@ TEST_CASE("Autogen - CAE Container operations", "[autogen][cae][container][ops]"
     auto hdf2 = ipc_manager->NewTask<clio::cae::core::ProcessHdf5DatasetTask>();
     if (!hdf1.IsNull() && !hdf2.IsNull()) {
       hdf2->Copy(hdf1);
-      hdf1->Aggregate(hdf2.template Cast<chi::Task>());
-      INFO("ProcessHdf5DatasetTask Copy+Aggregate completed");
+      hdf1->AggregateOut(hdf2.template Cast<chi::Task>());
+      INFO("ProcessHdf5DatasetTask Copy+AggregateOut completed");
       CLIO_IPC->DelTask(hdf1);
       CLIO_IPC->DelTask(hdf2);
     }
@@ -3908,153 +3908,153 @@ TEST_CASE("Autogen - CAE Container operations", "[autogen][cae][container][ops]"
 }
 
 //==============================================================================
-// More CTE Copy and Aggregate tests for remaining tasks
+// More CTE Copy and AggregateOut tests for remaining tasks
 //==============================================================================
 
-TEST_CASE("Autogen - CTE Remaining tasks Copy and Aggregate", "[autogen][cte][remaining]") {
+TEST_CASE("Autogen - CTE Remaining tasks Copy and AggregateOut", "[autogen][cte][remaining]") {
   EnsureInitialized();
 
   auto* ipc_manager = CLIO_IPC;
 
-  SECTION("DelBlobTask Copy+Aggregate") {
+  SECTION("DelBlobTask Copy+AggregateOut") {
     auto task1 = ipc_manager->NewTask<clio::cte::core::DelBlobTask>();
     auto task2 = ipc_manager->NewTask<clio::cte::core::DelBlobTask>();
     if (!task1.IsNull() && !task2.IsNull()) {
       task2->Copy(task1);
-      task1->Aggregate(task2.template Cast<chi::Task>());
-      INFO("DelBlobTask Copy+Aggregate completed");
+      task1->AggregateOut(task2.template Cast<chi::Task>());
+      INFO("DelBlobTask Copy+AggregateOut completed");
       CLIO_IPC->DelTask(task1);
       CLIO_IPC->DelTask(task2);
     }
   }
 
-  SECTION("DelTagTask Copy+Aggregate") {
+  SECTION("DelTagTask Copy+AggregateOut") {
     auto task1 = ipc_manager->NewTask<clio::cte::core::DelTagTask>();
     auto task2 = ipc_manager->NewTask<clio::cte::core::DelTagTask>();
     if (!task1.IsNull() && !task2.IsNull()) {
       task2->Copy(task1);
-      task1->Aggregate(task2.template Cast<chi::Task>());
-      INFO("DelTagTask Copy+Aggregate completed");
+      task1->AggregateOut(task2.template Cast<chi::Task>());
+      INFO("DelTagTask Copy+AggregateOut completed");
       CLIO_IPC->DelTask(task1);
       CLIO_IPC->DelTask(task2);
     }
   }
 
-  SECTION("GetTagSizeTask Copy+Aggregate") {
+  SECTION("GetTagSizeTask Copy+AggregateOut") {
     auto task1 = ipc_manager->NewTask<clio::cte::core::GetTagSizeTask>();
     auto task2 = ipc_manager->NewTask<clio::cte::core::GetTagSizeTask>();
     if (!task1.IsNull() && !task2.IsNull()) {
       task2->Copy(task1);
-      task1->Aggregate(task2.template Cast<chi::Task>());
-      INFO("GetTagSizeTask Copy+Aggregate completed");
+      task1->AggregateOut(task2.template Cast<chi::Task>());
+      INFO("GetTagSizeTask Copy+AggregateOut completed");
       CLIO_IPC->DelTask(task1);
       CLIO_IPC->DelTask(task2);
     }
   }
 
-  SECTION("PollTelemetryLogTask Copy+Aggregate") {
+  SECTION("PollTelemetryLogTask Copy+AggregateOut") {
     auto task1 = ipc_manager->NewTask<clio::cte::core::PollTelemetryLogTask>();
     auto task2 = ipc_manager->NewTask<clio::cte::core::PollTelemetryLogTask>();
     if (!task1.IsNull() && !task2.IsNull()) {
       task2->Copy(task1);
-      task1->Aggregate(task2.template Cast<chi::Task>());
-      INFO("PollTelemetryLogTask Copy+Aggregate completed");
+      task1->AggregateOut(task2.template Cast<chi::Task>());
+      INFO("PollTelemetryLogTask Copy+AggregateOut completed");
       CLIO_IPC->DelTask(task1);
       CLIO_IPC->DelTask(task2);
     }
   }
 
-  SECTION("GetBlobScoreTask Copy+Aggregate") {
+  SECTION("GetBlobScoreTask Copy+AggregateOut") {
     auto task1 = ipc_manager->NewTask<clio::cte::core::GetBlobScoreTask>();
     auto task2 = ipc_manager->NewTask<clio::cte::core::GetBlobScoreTask>();
     if (!task1.IsNull() && !task2.IsNull()) {
       task2->Copy(task1);
-      task1->Aggregate(task2.template Cast<chi::Task>());
-      INFO("GetBlobScoreTask Copy+Aggregate completed");
+      task1->AggregateOut(task2.template Cast<chi::Task>());
+      INFO("GetBlobScoreTask Copy+AggregateOut completed");
       CLIO_IPC->DelTask(task1);
       CLIO_IPC->DelTask(task2);
     }
   }
 
-  SECTION("GetBlobSizeTask Copy+Aggregate") {
+  SECTION("GetBlobSizeTask Copy+AggregateOut") {
     auto task1 = ipc_manager->NewTask<clio::cte::core::GetBlobSizeTask>();
     auto task2 = ipc_manager->NewTask<clio::cte::core::GetBlobSizeTask>();
     if (!task1.IsNull() && !task2.IsNull()) {
       task2->Copy(task1);
-      task1->Aggregate(task2.template Cast<chi::Task>());
-      INFO("GetBlobSizeTask Copy+Aggregate completed");
+      task1->AggregateOut(task2.template Cast<chi::Task>());
+      INFO("GetBlobSizeTask Copy+AggregateOut completed");
       CLIO_IPC->DelTask(task1);
       CLIO_IPC->DelTask(task2);
     }
   }
 
-  SECTION("GetContainedBlobsTask Copy+Aggregate") {
+  SECTION("GetContainedBlobsTask Copy+AggregateOut") {
     auto task1 = ipc_manager->NewTask<clio::cte::core::GetContainedBlobsTask>();
     auto task2 = ipc_manager->NewTask<clio::cte::core::GetContainedBlobsTask>();
     if (!task1.IsNull() && !task2.IsNull()) {
       task2->Copy(task1);
-      task1->Aggregate(task2.template Cast<chi::Task>());
-      INFO("GetContainedBlobsTask Copy+Aggregate completed");
+      task1->AggregateOut(task2.template Cast<chi::Task>());
+      INFO("GetContainedBlobsTask Copy+AggregateOut completed");
       CLIO_IPC->DelTask(task1);
       CLIO_IPC->DelTask(task2);
     }
   }
 
-  SECTION("TagQueryTask Copy+Aggregate") {
+  SECTION("TagQueryTask Copy+AggregateOut") {
     auto task1 = ipc_manager->NewTask<clio::cte::core::TagQueryTask>();
     auto task2 = ipc_manager->NewTask<clio::cte::core::TagQueryTask>();
     if (!task1.IsNull() && !task2.IsNull()) {
       task2->Copy(task1);
-      task1->Aggregate(task2.template Cast<chi::Task>());
-      INFO("TagQueryTask Copy+Aggregate completed");
+      task1->AggregateOut(task2.template Cast<chi::Task>());
+      INFO("TagQueryTask Copy+AggregateOut completed");
       CLIO_IPC->DelTask(task1);
       CLIO_IPC->DelTask(task2);
     }
   }
 
-  SECTION("BlobQueryTask Copy+Aggregate") {
+  SECTION("BlobQueryTask Copy+AggregateOut") {
     auto task1 = ipc_manager->NewTask<clio::cte::core::BlobQueryTask>();
     auto task2 = ipc_manager->NewTask<clio::cte::core::BlobQueryTask>();
     if (!task1.IsNull() && !task2.IsNull()) {
       task2->Copy(task1);
-      task1->Aggregate(task2.template Cast<chi::Task>());
-      INFO("BlobQueryTask Copy+Aggregate completed");
+      task1->AggregateOut(task2.template Cast<chi::Task>());
+      INFO("BlobQueryTask Copy+AggregateOut completed");
       CLIO_IPC->DelTask(task1);
       CLIO_IPC->DelTask(task2);
     }
   }
 
-  SECTION("ReorganizeBlobTask Copy+Aggregate") {
+  SECTION("ReorganizeBlobTask Copy+AggregateOut") {
     auto task1 = ipc_manager->NewTask<clio::cte::core::ReorganizeBlobTask>();
     auto task2 = ipc_manager->NewTask<clio::cte::core::ReorganizeBlobTask>();
     if (!task1.IsNull() && !task2.IsNull()) {
       task2->Copy(task1);
-      task1->Aggregate(task2.template Cast<chi::Task>());
-      INFO("ReorganizeBlobTask Copy+Aggregate completed");
+      task1->AggregateOut(task2.template Cast<chi::Task>());
+      INFO("ReorganizeBlobTask Copy+AggregateOut completed");
       CLIO_IPC->DelTask(task1);
       CLIO_IPC->DelTask(task2);
     }
   }
 
-  SECTION("StatTargetsTask Copy+Aggregate") {
+  SECTION("StatTargetsTask Copy+AggregateOut") {
     auto task1 = ipc_manager->NewTask<clio::cte::core::StatTargetsTask>();
     auto task2 = ipc_manager->NewTask<clio::cte::core::StatTargetsTask>();
     if (!task1.IsNull() && !task2.IsNull()) {
       task2->Copy(task1);
-      task1->Aggregate(task2.template Cast<chi::Task>());
-      INFO("StatTargetsTask Copy+Aggregate completed");
+      task1->AggregateOut(task2.template Cast<chi::Task>());
+      INFO("StatTargetsTask Copy+AggregateOut completed");
       CLIO_IPC->DelTask(task1);
       CLIO_IPC->DelTask(task2);
     }
   }
 
-  SECTION("UnregisterTargetTask Copy+Aggregate") {
+  SECTION("UnregisterTargetTask Copy+AggregateOut") {
     auto task1 = ipc_manager->NewTask<clio::cte::core::UnregisterTargetTask>();
     auto task2 = ipc_manager->NewTask<clio::cte::core::UnregisterTargetTask>();
     if (!task1.IsNull() && !task2.IsNull()) {
       task2->Copy(task1);
-      task1->Aggregate(task2.template Cast<chi::Task>());
-      INFO("UnregisterTargetTask Copy+Aggregate completed");
+      task1->AggregateOut(task2.template Cast<chi::Task>());
+      INFO("UnregisterTargetTask Copy+AggregateOut completed");
       CLIO_IPC->DelTask(task1);
       CLIO_IPC->DelTask(task2);
     }
@@ -4187,10 +4187,10 @@ TEST_CASE("Autogen - Admin NewCopyTask comprehensive", "[autogen][admin][newcopy
 }
 
 //==============================================================================
-// Admin Container comprehensive Aggregate coverage
+// Admin Container comprehensive AggregateOut coverage
 //==============================================================================
 
-TEST_CASE("Autogen - Admin Aggregate comprehensive", "[autogen][admin][aggregate][comprehensive]") {
+TEST_CASE("Autogen - Admin AggregateOut comprehensive", "[autogen][admin][aggregate][comprehensive]") {
   EnsureInitialized();
 
   auto* ipc_manager = CLIO_IPC;
@@ -4202,100 +4202,100 @@ TEST_CASE("Autogen - Admin Aggregate comprehensive", "[autogen][admin][aggregate
     return;
   }
 
-  SECTION("Aggregate for Create") {
+  SECTION("AggregateOut for Create") {
     auto t1 = admin_container->NewTask(clio::run::admin::Method::kCreate);
     auto t2 = admin_container->NewTask(clio::run::admin::Method::kCreate);
     if (!t1.IsNull() && !t2.IsNull()) {
-      t1.ptr_->Aggregate(t2.template Cast<chi::Task>());
-      INFO("Admin Aggregate for Create completed");
+      t1.ptr_->AggregateOut(t2.template Cast<chi::Task>());
+      INFO("Admin AggregateOut for Create completed");
       CLIO_IPC->DelTask(t1);
       CLIO_IPC->DelTask(t2);
     }
   }
 
-  SECTION("Aggregate for Destroy") {
+  SECTION("AggregateOut for Destroy") {
     auto t1 = admin_container->NewTask(clio::run::admin::Method::kDestroy);
     auto t2 = admin_container->NewTask(clio::run::admin::Method::kDestroy);
     if (!t1.IsNull() && !t2.IsNull()) {
-      t1.ptr_->Aggregate(t2.template Cast<chi::Task>());
-      INFO("Admin Aggregate for Destroy completed");
+      t1.ptr_->AggregateOut(t2.template Cast<chi::Task>());
+      INFO("Admin AggregateOut for Destroy completed");
       CLIO_IPC->DelTask(t1);
       CLIO_IPC->DelTask(t2);
     }
   }
 
-  SECTION("Aggregate for StopRuntime") {
+  SECTION("AggregateOut for StopRuntime") {
     auto t1 = admin_container->NewTask(clio::run::admin::Method::kStopRuntime);
     auto t2 = admin_container->NewTask(clio::run::admin::Method::kStopRuntime);
     if (!t1.IsNull() && !t2.IsNull()) {
-      t1.ptr_->Aggregate(t2.template Cast<chi::Task>());
-      INFO("Admin Aggregate for StopRuntime completed");
+      t1.ptr_->AggregateOut(t2.template Cast<chi::Task>());
+      INFO("Admin AggregateOut for StopRuntime completed");
       CLIO_IPC->DelTask(t1);
       CLIO_IPC->DelTask(t2);
     }
   }
 
-  SECTION("Aggregate for DestroyPool") {
+  SECTION("AggregateOut for DestroyPool") {
     auto t1 = admin_container->NewTask(clio::run::admin::Method::kDestroyPool);
     auto t2 = admin_container->NewTask(clio::run::admin::Method::kDestroyPool);
     if (!t1.IsNull() && !t2.IsNull()) {
-      t1.ptr_->Aggregate(t2.template Cast<chi::Task>());
-      INFO("Admin Aggregate for DestroyPool completed");
+      t1.ptr_->AggregateOut(t2.template Cast<chi::Task>());
+      INFO("Admin AggregateOut for DestroyPool completed");
       CLIO_IPC->DelTask(t1);
       CLIO_IPC->DelTask(t2);
     }
   }
 
-  SECTION("Aggregate for GetOrCreatePool") {
+  SECTION("AggregateOut for GetOrCreatePool") {
     auto t1 = admin_container->NewTask(clio::run::admin::Method::kGetOrCreatePool);
     auto t2 = admin_container->NewTask(clio::run::admin::Method::kGetOrCreatePool);
     if (!t1.IsNull() && !t2.IsNull()) {
-      t1.ptr_->Aggregate(t2.template Cast<chi::Task>());
-      INFO("Admin Aggregate for GetOrCreatePool completed");
+      t1.ptr_->AggregateOut(t2.template Cast<chi::Task>());
+      INFO("Admin AggregateOut for GetOrCreatePool completed");
       CLIO_IPC->DelTask(t1);
       CLIO_IPC->DelTask(t2);
     }
   }
 
-  SECTION("Aggregate for SubmitBatch") {
+  SECTION("AggregateOut for SubmitBatch") {
     auto t1 = admin_container->NewTask(clio::run::admin::Method::kSubmitBatch);
     auto t2 = admin_container->NewTask(clio::run::admin::Method::kSubmitBatch);
     if (!t1.IsNull() && !t2.IsNull()) {
-      t1.ptr_->Aggregate(t2.template Cast<chi::Task>());
-      INFO("Admin Aggregate for SubmitBatch completed");
+      t1.ptr_->AggregateOut(t2.template Cast<chi::Task>());
+      INFO("Admin AggregateOut for SubmitBatch completed");
       CLIO_IPC->DelTask(t1);
       CLIO_IPC->DelTask(t2);
     }
   }
 
-  SECTION("Aggregate for Send") {
+  SECTION("AggregateOut for Send") {
     auto t1 = admin_container->NewTask(clio::run::admin::Method::kSend);
     auto t2 = admin_container->NewTask(clio::run::admin::Method::kSend);
     if (!t1.IsNull() && !t2.IsNull()) {
-      t1.ptr_->Aggregate(t2.template Cast<chi::Task>());
-      INFO("Admin Aggregate for Send completed");
+      t1.ptr_->AggregateOut(t2.template Cast<chi::Task>());
+      INFO("Admin AggregateOut for Send completed");
       CLIO_IPC->DelTask(t1);
       CLIO_IPC->DelTask(t2);
     }
   }
 
-  SECTION("Aggregate for Recv") {
+  SECTION("AggregateOut for Recv") {
     auto t1 = admin_container->NewTask(clio::run::admin::Method::kRecv);
     auto t2 = admin_container->NewTask(clio::run::admin::Method::kRecv);
     if (!t1.IsNull() && !t2.IsNull()) {
-      t1.ptr_->Aggregate(t2.template Cast<chi::Task>());
-      INFO("Admin Aggregate for Recv completed");
+      t1.ptr_->AggregateOut(t2.template Cast<chi::Task>());
+      INFO("Admin AggregateOut for Recv completed");
       CLIO_IPC->DelTask(t1);
       CLIO_IPC->DelTask(t2);
     }
   }
 
-  SECTION("Aggregate for Monitor") {
+  SECTION("AggregateOut for Monitor") {
     auto t1 = admin_container->NewTask(clio::run::admin::Method::kMonitor);
     auto t2 = admin_container->NewTask(clio::run::admin::Method::kMonitor);
     if (!t1.IsNull() && !t2.IsNull()) {
-      t1.ptr_->Aggregate(t2.template Cast<chi::Task>());
-      INFO("Admin Aggregate for Monitor completed");
+      t1.ptr_->AggregateOut(t2.template Cast<chi::Task>());
+      INFO("Admin AggregateOut for Monitor completed");
       CLIO_IPC->DelTask(t1);
       CLIO_IPC->DelTask(t2);
     }
@@ -4694,12 +4694,12 @@ TEST_CASE("Autogen - Bdev All Methods Comprehensive", "[autogen][bdev][all][comp
       load_in >> *loaded_in;
       INFO("AllocateBlocksTask SerializeIn completed");
 
-      // Copy and Aggregate
+      // Copy and AggregateOut
       auto task2 = ipc_manager->NewTask<clio::run::bdev::AllocateBlocksTask>();
       if (!task2.IsNull()) {
         task2->Copy(task);
-        task->Aggregate(task2.template Cast<chi::Task>());
-        INFO("AllocateBlocksTask Copy+Aggregate completed");
+        task->AggregateOut(task2.template Cast<chi::Task>());
+        INFO("AllocateBlocksTask Copy+AggregateOut completed");
         CLIO_IPC->DelTask(task2);
       }
 
@@ -4722,8 +4722,8 @@ TEST_CASE("Autogen - Bdev All Methods Comprehensive", "[autogen][bdev][all][comp
       auto task2 = ipc_manager->NewTask<clio::run::bdev::FreeBlocksTask>();
       if (!task2.IsNull()) {
         task2->Copy(task);
-        task->Aggregate(task2.template Cast<chi::Task>());
-        INFO("FreeBlocksTask Copy+Aggregate completed");
+        task->AggregateOut(task2.template Cast<chi::Task>());
+        INFO("FreeBlocksTask Copy+AggregateOut completed");
         CLIO_IPC->DelTask(task2);
       }
 
@@ -4746,8 +4746,8 @@ TEST_CASE("Autogen - Bdev All Methods Comprehensive", "[autogen][bdev][all][comp
       auto task2 = ipc_manager->NewTask<clio::run::bdev::WriteTask>();
       if (!task2.IsNull()) {
         task2->Copy(task);
-        task->Aggregate(task2.template Cast<chi::Task>());
-        INFO("WriteTask Copy+Aggregate completed");
+        task->AggregateOut(task2.template Cast<chi::Task>());
+        INFO("WriteTask Copy+AggregateOut completed");
         CLIO_IPC->DelTask(task2);
       }
 
@@ -4770,8 +4770,8 @@ TEST_CASE("Autogen - Bdev All Methods Comprehensive", "[autogen][bdev][all][comp
       auto task2 = ipc_manager->NewTask<clio::run::bdev::ReadTask>();
       if (!task2.IsNull()) {
         task2->Copy(task);
-        task->Aggregate(task2.template Cast<chi::Task>());
-        INFO("ReadTask Copy+Aggregate completed");
+        task->AggregateOut(task2.template Cast<chi::Task>());
+        INFO("ReadTask Copy+AggregateOut completed");
         CLIO_IPC->DelTask(task2);
       }
 
@@ -4794,8 +4794,8 @@ TEST_CASE("Autogen - Bdev All Methods Comprehensive", "[autogen][bdev][all][comp
       auto task2 = ipc_manager->NewTask<clio::run::bdev::GetStatsTask>();
       if (!task2.IsNull()) {
         task2->Copy(task);
-        task->Aggregate(task2.template Cast<chi::Task>());
-        INFO("GetStatsTask Copy+Aggregate completed");
+        task->AggregateOut(task2.template Cast<chi::Task>());
+        INFO("GetStatsTask Copy+AggregateOut completed");
         CLIO_IPC->DelTask(task2);
       }
 
@@ -4827,7 +4827,7 @@ TEST_CASE("Autogen - Admin All Methods Comprehensive", "[autogen][admin][all][co
       auto task2 = ipc_manager->NewTask<clio::run::admin::CreateTask>();
       if (!task2.IsNull()) {
         task2->Copy(task);
-        task->Aggregate(task2.template Cast<chi::Task>());
+        task->AggregateOut(task2.template Cast<chi::Task>());
         CLIO_IPC->DelTask(task2);
       }
       INFO("CreateTask full coverage completed");
@@ -4849,7 +4849,7 @@ TEST_CASE("Autogen - Admin All Methods Comprehensive", "[autogen][admin][all][co
       auto task2 = ipc_manager->NewTask<clio::run::admin::DestroyTask>();
       if (!task2.IsNull()) {
         task2->Copy(task);
-        task->Aggregate(task2.template Cast<chi::Task>());
+        task->AggregateOut(task2.template Cast<chi::Task>());
         CLIO_IPC->DelTask(task2);
       }
       INFO("DestroyTask full coverage completed");
@@ -4871,7 +4871,7 @@ TEST_CASE("Autogen - Admin All Methods Comprehensive", "[autogen][admin][all][co
       auto task2 = ipc_manager->NewTask<clio::run::admin::StopRuntimeTask>();
       if (!task2.IsNull()) {
         task2->Copy(task);
-        task->Aggregate(task2.template Cast<chi::Task>());
+        task->AggregateOut(task2.template Cast<chi::Task>());
         CLIO_IPC->DelTask(task2);
       }
       INFO("StopRuntimeTask full coverage completed");
@@ -4893,7 +4893,7 @@ TEST_CASE("Autogen - Admin All Methods Comprehensive", "[autogen][admin][all][co
       auto task2 = ipc_manager->NewTask<clio::run::admin::DestroyPoolTask>();
       if (!task2.IsNull()) {
         task2->Copy(task);
-        task->Aggregate(task2.template Cast<chi::Task>());
+        task->AggregateOut(task2.template Cast<chi::Task>());
         CLIO_IPC->DelTask(task2);
       }
       INFO("DestroyPoolTask full coverage completed");
@@ -4915,7 +4915,7 @@ TEST_CASE("Autogen - Admin All Methods Comprehensive", "[autogen][admin][all][co
       auto task2 = ipc_manager->NewTask<clio::run::admin::SubmitBatchTask>();
       if (!task2.IsNull()) {
         task2->Copy(task);
-        task->Aggregate(task2.template Cast<chi::Task>());
+        task->AggregateOut(task2.template Cast<chi::Task>());
         CLIO_IPC->DelTask(task2);
       }
       INFO("SubmitBatchTask full coverage completed");
@@ -4937,7 +4937,7 @@ TEST_CASE("Autogen - Admin All Methods Comprehensive", "[autogen][admin][all][co
       auto task2 = ipc_manager->NewTask<clio::run::admin::SendTask>();
       if (!task2.IsNull()) {
         task2->Copy(task);
-        task->Aggregate(task2.template Cast<chi::Task>());
+        task->AggregateOut(task2.template Cast<chi::Task>());
         CLIO_IPC->DelTask(task2);
       }
       INFO("SendTask full coverage completed");
@@ -4959,7 +4959,7 @@ TEST_CASE("Autogen - Admin All Methods Comprehensive", "[autogen][admin][all][co
       auto task2 = ipc_manager->NewTask<clio::run::admin::RecvTask>();
       if (!task2.IsNull()) {
         task2->Copy(task);
-        task->Aggregate(task2.template Cast<chi::Task>());
+        task->AggregateOut(task2.template Cast<chi::Task>());
         CLIO_IPC->DelTask(task2);
       }
       INFO("RecvTask full coverage completed");
@@ -4984,7 +4984,7 @@ TEST_CASE("Autogen - Admin All Methods Comprehensive", "[autogen][admin][all][co
           chi::CreateTaskId(), chi::kAdminPoolId, chi::PoolQuery::Local());
       if (!task2.IsNull()) {
         task2->Copy(task);
-        task->Aggregate(task2.template Cast<chi::Task>());
+        task->AggregateOut(task2.template Cast<chi::Task>());
         CLIO_IPC->DelTask(task2);
       }
       INFO("FlushTask full coverage completed");
@@ -5009,7 +5009,7 @@ TEST_CASE("Autogen - Admin All Methods Comprehensive", "[autogen][admin][all][co
           chi::CreateTaskId(), chi::kAdminPoolId, chi::PoolQuery::Local(), std::string("status"));
       if (!task2.IsNull()) {
         task2->Copy(task);
-        task->Aggregate(task2.template Cast<chi::Task>());
+        task->AggregateOut(task2.template Cast<chi::Task>());
         CLIO_IPC->DelTask(task2);
       }
       INFO("MonitorTask full coverage completed");
@@ -5034,7 +5034,7 @@ TEST_CASE("Autogen - Admin All Methods Comprehensive", "[autogen][admin][all][co
           chi::CreateTaskId(), chi::kAdminPoolId, chi::PoolQuery::Local());
       if (!task2.IsNull()) {
         task2->Copy(task);
-        task->Aggregate(task2.template Cast<chi::Task>());
+        task->AggregateOut(task2.template Cast<chi::Task>());
         CLIO_IPC->DelTask(task2);
       }
       INFO("ClientConnectTask full coverage completed");
@@ -5074,12 +5074,12 @@ TEST_CASE("Autogen - CAE All Methods Comprehensive", "[autogen][cae][all][compre
       load_out >> *loaded_out;
       INFO("ParseOmniTask SerializeOut completed");
 
-      // Copy and Aggregate
+      // Copy and AggregateOut
       auto task2 = ipc_manager->NewTask<clio::cae::core::ParseOmniTask>();
       if (!task2.IsNull()) {
         task2->Copy(task);
-        task->Aggregate(task2.template Cast<chi::Task>());
-        INFO("ParseOmniTask Copy+Aggregate completed");
+        task->AggregateOut(task2.template Cast<chi::Task>());
+        INFO("ParseOmniTask Copy+AggregateOut completed");
         CLIO_IPC->DelTask(task2);
       }
 
@@ -5110,12 +5110,12 @@ TEST_CASE("Autogen - CAE All Methods Comprehensive", "[autogen][cae][all][compre
       load_out >> *loaded_out;
       INFO("ProcessHdf5DatasetTask SerializeOut completed");
 
-      // Copy and Aggregate
+      // Copy and AggregateOut
       auto task2 = ipc_manager->NewTask<clio::cae::core::ProcessHdf5DatasetTask>();
       if (!task2.IsNull()) {
         task2->Copy(task);
-        task->Aggregate(task2.template Cast<chi::Task>());
-        INFO("ProcessHdf5DatasetTask Copy+Aggregate completed");
+        task->AggregateOut(task2.template Cast<chi::Task>());
+        INFO("ProcessHdf5DatasetTask Copy+AggregateOut completed");
         CLIO_IPC->DelTask(task2);
       }
 
@@ -5153,9 +5153,9 @@ TEST_CASE("Autogen - CTE Full Coverage Per Task", "[autogen][cte][full]") {
       lo.msg_type_ = chi::MsgType::kSerializeOut;
       auto l2 = ipc_manager->NewTask<clio::cte::core::RegisterTargetTask>();
       lo >> *l2;
-      // Copy and Aggregate
+      // Copy and AggregateOut
       t2->Copy(t1);
-      t1->Aggregate(t2.template Cast<chi::Task>());
+      t1->AggregateOut(t2.template Cast<chi::Task>());
       INFO("RegisterTargetTask full completed");
       CLIO_IPC->DelTask(l1);
       CLIO_IPC->DelTask(l2);
@@ -5181,7 +5181,7 @@ TEST_CASE("Autogen - CTE Full Coverage Per Task", "[autogen][cte][full]") {
       auto l2 = ipc_manager->NewTask<clio::cte::core::UnregisterTargetTask>();
       lo >> *l2;
       t2->Copy(t1);
-      t1->Aggregate(t2.template Cast<chi::Task>());
+      t1->AggregateOut(t2.template Cast<chi::Task>());
       INFO("UnregisterTargetTask full completed");
       CLIO_IPC->DelTask(l1);
       CLIO_IPC->DelTask(l2);
@@ -5207,7 +5207,7 @@ TEST_CASE("Autogen - CTE Full Coverage Per Task", "[autogen][cte][full]") {
       auto l2 = ipc_manager->NewTask<clio::cte::core::ListTargetsTask>();
       lo >> *l2;
       t2->Copy(t1);
-      t1->Aggregate(t2.template Cast<chi::Task>());
+      t1->AggregateOut(t2.template Cast<chi::Task>());
       INFO("ListTargetsTask full completed");
       CLIO_IPC->DelTask(l1);
       CLIO_IPC->DelTask(l2);
@@ -5233,7 +5233,7 @@ TEST_CASE("Autogen - CTE Full Coverage Per Task", "[autogen][cte][full]") {
       auto l2 = ipc_manager->NewTask<clio::cte::core::StatTargetsTask>();
       lo >> *l2;
       t2->Copy(t1);
-      t1->Aggregate(t2.template Cast<chi::Task>());
+      t1->AggregateOut(t2.template Cast<chi::Task>());
       INFO("StatTargetsTask full completed");
       CLIO_IPC->DelTask(l1);
       CLIO_IPC->DelTask(l2);
@@ -5259,7 +5259,7 @@ TEST_CASE("Autogen - CTE Full Coverage Per Task", "[autogen][cte][full]") {
       auto l2 = ipc_manager->NewTask<clio::cte::core::PutBlobTask>();
       lo >> *l2;
       t2->Copy(t1);
-      t1->Aggregate(t2.template Cast<chi::Task>());
+      t1->AggregateOut(t2.template Cast<chi::Task>());
       INFO("PutBlobTask full completed");
       CLIO_IPC->DelTask(l1);
       CLIO_IPC->DelTask(l2);
@@ -5285,7 +5285,7 @@ TEST_CASE("Autogen - CTE Full Coverage Per Task", "[autogen][cte][full]") {
       auto l2 = ipc_manager->NewTask<clio::cte::core::GetBlobTask>();
       lo >> *l2;
       t2->Copy(t1);
-      t1->Aggregate(t2.template Cast<chi::Task>());
+      t1->AggregateOut(t2.template Cast<chi::Task>());
       INFO("GetBlobTask full completed");
       CLIO_IPC->DelTask(l1);
       CLIO_IPC->DelTask(l2);
@@ -5311,7 +5311,7 @@ TEST_CASE("Autogen - CTE Full Coverage Per Task", "[autogen][cte][full]") {
       auto l2 = ipc_manager->NewTask<clio::cte::core::ReorganizeBlobTask>();
       lo >> *l2;
       t2->Copy(t1);
-      t1->Aggregate(t2.template Cast<chi::Task>());
+      t1->AggregateOut(t2.template Cast<chi::Task>());
       INFO("ReorganizeBlobTask full completed");
       CLIO_IPC->DelTask(l1);
       CLIO_IPC->DelTask(l2);
@@ -5337,7 +5337,7 @@ TEST_CASE("Autogen - CTE Full Coverage Per Task", "[autogen][cte][full]") {
       auto l2 = ipc_manager->NewTask<clio::cte::core::DelBlobTask>();
       lo >> *l2;
       t2->Copy(t1);
-      t1->Aggregate(t2.template Cast<chi::Task>());
+      t1->AggregateOut(t2.template Cast<chi::Task>());
       INFO("DelBlobTask full completed");
       CLIO_IPC->DelTask(l1);
       CLIO_IPC->DelTask(l2);
@@ -5363,7 +5363,7 @@ TEST_CASE("Autogen - CTE Full Coverage Per Task", "[autogen][cte][full]") {
       auto l2 = ipc_manager->NewTask<clio::cte::core::DelTagTask>();
       lo >> *l2;
       t2->Copy(t1);
-      t1->Aggregate(t2.template Cast<chi::Task>());
+      t1->AggregateOut(t2.template Cast<chi::Task>());
       INFO("DelTagTask full completed");
       CLIO_IPC->DelTask(l1);
       CLIO_IPC->DelTask(l2);
@@ -5389,7 +5389,7 @@ TEST_CASE("Autogen - CTE Full Coverage Per Task", "[autogen][cte][full]") {
       auto l2 = ipc_manager->NewTask<clio::cte::core::GetTagSizeTask>();
       lo >> *l2;
       t2->Copy(t1);
-      t1->Aggregate(t2.template Cast<chi::Task>());
+      t1->AggregateOut(t2.template Cast<chi::Task>());
       INFO("GetTagSizeTask full completed");
       CLIO_IPC->DelTask(l1);
       CLIO_IPC->DelTask(l2);
@@ -5415,7 +5415,7 @@ TEST_CASE("Autogen - CTE Full Coverage Per Task", "[autogen][cte][full]") {
       auto l2 = ipc_manager->NewTask<clio::cte::core::PollTelemetryLogTask>();
       lo >> *l2;
       t2->Copy(t1);
-      t1->Aggregate(t2.template Cast<chi::Task>());
+      t1->AggregateOut(t2.template Cast<chi::Task>());
       INFO("PollTelemetryLogTask full completed");
       CLIO_IPC->DelTask(l1);
       CLIO_IPC->DelTask(l2);
@@ -5441,7 +5441,7 @@ TEST_CASE("Autogen - CTE Full Coverage Per Task", "[autogen][cte][full]") {
       auto l2 = ipc_manager->NewTask<clio::cte::core::GetBlobScoreTask>();
       lo >> *l2;
       t2->Copy(t1);
-      t1->Aggregate(t2.template Cast<chi::Task>());
+      t1->AggregateOut(t2.template Cast<chi::Task>());
       INFO("GetBlobScoreTask full completed");
       CLIO_IPC->DelTask(l1);
       CLIO_IPC->DelTask(l2);
@@ -5467,7 +5467,7 @@ TEST_CASE("Autogen - CTE Full Coverage Per Task", "[autogen][cte][full]") {
       auto l2 = ipc_manager->NewTask<clio::cte::core::GetBlobSizeTask>();
       lo >> *l2;
       t2->Copy(t1);
-      t1->Aggregate(t2.template Cast<chi::Task>());
+      t1->AggregateOut(t2.template Cast<chi::Task>());
       INFO("GetBlobSizeTask full completed");
       CLIO_IPC->DelTask(l1);
       CLIO_IPC->DelTask(l2);
@@ -5493,7 +5493,7 @@ TEST_CASE("Autogen - CTE Full Coverage Per Task", "[autogen][cte][full]") {
       auto l2 = ipc_manager->NewTask<clio::cte::core::GetContainedBlobsTask>();
       lo >> *l2;
       t2->Copy(t1);
-      t1->Aggregate(t2.template Cast<chi::Task>());
+      t1->AggregateOut(t2.template Cast<chi::Task>());
       INFO("GetContainedBlobsTask full completed");
       CLIO_IPC->DelTask(l1);
       CLIO_IPC->DelTask(l2);
@@ -5519,7 +5519,7 @@ TEST_CASE("Autogen - CTE Full Coverage Per Task", "[autogen][cte][full]") {
       auto l2 = ipc_manager->NewTask<clio::cte::core::TagQueryTask>();
       lo >> *l2;
       t2->Copy(t1);
-      t1->Aggregate(t2.template Cast<chi::Task>());
+      t1->AggregateOut(t2.template Cast<chi::Task>());
       INFO("TagQueryTask full completed");
       CLIO_IPC->DelTask(l1);
       CLIO_IPC->DelTask(l2);
@@ -5545,7 +5545,7 @@ TEST_CASE("Autogen - CTE Full Coverage Per Task", "[autogen][cte][full]") {
       auto l2 = ipc_manager->NewTask<clio::cte::core::BlobQueryTask>();
       lo >> *l2;
       t2->Copy(t1);
-      t1->Aggregate(t2.template Cast<chi::Task>());
+      t1->AggregateOut(t2.template Cast<chi::Task>());
       INFO("BlobQueryTask full completed");
       CLIO_IPC->DelTask(l1);
       CLIO_IPC->DelTask(l2);
@@ -5558,7 +5558,7 @@ TEST_CASE("Autogen - CTE Full Coverage Per Task", "[autogen][cte][full]") {
 //==============================================================================
 // CTE Runtime Container Method Coverage Tests
 // These tests directly exercise the Runtime::SaveTask, LoadTask, DelTask,
-// NewTask, NewCopyTask, and Aggregate methods in CTE lib_exec.cc
+// NewTask, NewCopyTask, and AggregateOut methods in CTE lib_exec.cc
 //==============================================================================
 
 TEST_CASE("Autogen - CTE Runtime Container Methods", "[autogen][cte][runtime]") {
@@ -6097,228 +6097,228 @@ TEST_CASE("Autogen - CTE Runtime Container Methods", "[autogen][cte][runtime]") 
     INFO("CTE Runtime::NewCopyTask tests completed");
   }
 
-  SECTION("CTE Runtime Aggregate all methods") {
-    INFO("Testing CTE Runtime::Aggregate for all methods");
+  SECTION("CTE Runtime AggregateOut all methods") {
+    INFO("Testing CTE Runtime::AggregateOut for all methods");
 
-    // Test Aggregate for CreateTask
+    // Test AggregateOut for CreateTask
     auto t1_c = ipc_manager->NewTask<clio::cte::core::CreateTask>();
     auto t2_c = ipc_manager->NewTask<clio::cte::core::CreateTask>();
     if (!t1_c.IsNull() && !t2_c.IsNull()) {
       ctp::ipc::FullPtr<chi::Task> ptr1 = t1_c.template Cast<chi::Task>();
       ctp::ipc::FullPtr<chi::Task> ptr2 = t2_c.template Cast<chi::Task>();
-      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      ptr1.ptr_->AggregateOut(ptr2.template Cast<chi::Task>());
       CLIO_IPC->DelTask(t1_c);
       CLIO_IPC->DelTask(t2_c);
     }
 
-    // Test Aggregate for DestroyTask
+    // Test AggregateOut for DestroyTask
     auto t1_d = ipc_manager->NewTask<clio::cte::core::DestroyTask>();
     auto t2_d = ipc_manager->NewTask<clio::cte::core::DestroyTask>();
     if (!t1_d.IsNull() && !t2_d.IsNull()) {
       ctp::ipc::FullPtr<chi::Task> ptr1 = t1_d.template Cast<chi::Task>();
       ctp::ipc::FullPtr<chi::Task> ptr2 = t2_d.template Cast<chi::Task>();
-      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      ptr1.ptr_->AggregateOut(ptr2.template Cast<chi::Task>());
       CLIO_IPC->DelTask(t1_d);
       CLIO_IPC->DelTask(t2_d);
     }
 
-    // Test Aggregate for RegisterTargetTask
+    // Test AggregateOut for RegisterTargetTask
     auto t1_r = ipc_manager->NewTask<clio::cte::core::RegisterTargetTask>();
     auto t2_r = ipc_manager->NewTask<clio::cte::core::RegisterTargetTask>();
     if (!t1_r.IsNull() && !t2_r.IsNull()) {
       ctp::ipc::FullPtr<chi::Task> ptr1 = t1_r.template Cast<chi::Task>();
       ctp::ipc::FullPtr<chi::Task> ptr2 = t2_r.template Cast<chi::Task>();
-      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      ptr1.ptr_->AggregateOut(ptr2.template Cast<chi::Task>());
       CLIO_IPC->DelTask(t1_r);
       CLIO_IPC->DelTask(t2_r);
     }
 
-    // Test Aggregate for UnregisterTargetTask
+    // Test AggregateOut for UnregisterTargetTask
     auto t1_u = ipc_manager->NewTask<clio::cte::core::UnregisterTargetTask>();
     auto t2_u = ipc_manager->NewTask<clio::cte::core::UnregisterTargetTask>();
     if (!t1_u.IsNull() && !t2_u.IsNull()) {
       ctp::ipc::FullPtr<chi::Task> ptr1 = t1_u.template Cast<chi::Task>();
       ctp::ipc::FullPtr<chi::Task> ptr2 = t2_u.template Cast<chi::Task>();
-      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      ptr1.ptr_->AggregateOut(ptr2.template Cast<chi::Task>());
       CLIO_IPC->DelTask(t1_u);
       CLIO_IPC->DelTask(t2_u);
     }
 
-    // Test Aggregate for ListTargetsTask
+    // Test AggregateOut for ListTargetsTask
     auto t1_l = ipc_manager->NewTask<clio::cte::core::ListTargetsTask>();
     auto t2_l = ipc_manager->NewTask<clio::cte::core::ListTargetsTask>();
     if (!t1_l.IsNull() && !t2_l.IsNull()) {
       ctp::ipc::FullPtr<chi::Task> ptr1 = t1_l.template Cast<chi::Task>();
       ctp::ipc::FullPtr<chi::Task> ptr2 = t2_l.template Cast<chi::Task>();
-      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      ptr1.ptr_->AggregateOut(ptr2.template Cast<chi::Task>());
       CLIO_IPC->DelTask(t1_l);
       CLIO_IPC->DelTask(t2_l);
     }
 
-    // Test Aggregate for PutBlobTask
+    // Test AggregateOut for PutBlobTask
     auto t1_p = ipc_manager->NewTask<clio::cte::core::PutBlobTask>();
     auto t2_p = ipc_manager->NewTask<clio::cte::core::PutBlobTask>();
     if (!t1_p.IsNull() && !t2_p.IsNull()) {
       ctp::ipc::FullPtr<chi::Task> ptr1 = t1_p.template Cast<chi::Task>();
       ctp::ipc::FullPtr<chi::Task> ptr2 = t2_p.template Cast<chi::Task>();
-      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      ptr1.ptr_->AggregateOut(ptr2.template Cast<chi::Task>());
       CLIO_IPC->DelTask(t1_p);
       CLIO_IPC->DelTask(t2_p);
     }
 
-    // Test Aggregate for GetBlobTask
+    // Test AggregateOut for GetBlobTask
     auto t1_g = ipc_manager->NewTask<clio::cte::core::GetBlobTask>();
     auto t2_g = ipc_manager->NewTask<clio::cte::core::GetBlobTask>();
     if (!t1_g.IsNull() && !t2_g.IsNull()) {
       ctp::ipc::FullPtr<chi::Task> ptr1 = t1_g.template Cast<chi::Task>();
       ctp::ipc::FullPtr<chi::Task> ptr2 = t2_g.template Cast<chi::Task>();
-      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      ptr1.ptr_->AggregateOut(ptr2.template Cast<chi::Task>());
       CLIO_IPC->DelTask(t1_g);
       CLIO_IPC->DelTask(t2_g);
     }
 
-    // Test Aggregate for StatTargetsTask
+    // Test AggregateOut for StatTargetsTask
     auto t1_st = ipc_manager->NewTask<clio::cte::core::StatTargetsTask>();
     auto t2_st = ipc_manager->NewTask<clio::cte::core::StatTargetsTask>();
     if (!t1_st.IsNull() && !t2_st.IsNull()) {
       ctp::ipc::FullPtr<chi::Task> ptr1 = t1_st.template Cast<chi::Task>();
       ctp::ipc::FullPtr<chi::Task> ptr2 = t2_st.template Cast<chi::Task>();
-      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      ptr1.ptr_->AggregateOut(ptr2.template Cast<chi::Task>());
       CLIO_IPC->DelTask(t1_st);
       CLIO_IPC->DelTask(t2_st);
     }
 
-    // Test Aggregate for GetOrCreateTagTask
+    // Test AggregateOut for GetOrCreateTagTask
     auto t1_gt = ipc_manager->NewTask<clio::cte::core::GetOrCreateTagTask<clio::cte::core::CreateParams>>();
     auto t2_gt = ipc_manager->NewTask<clio::cte::core::GetOrCreateTagTask<clio::cte::core::CreateParams>>();
     if (!t1_gt.IsNull() && !t2_gt.IsNull()) {
       ctp::ipc::FullPtr<chi::Task> ptr1 = t1_gt.template Cast<chi::Task>();
       ctp::ipc::FullPtr<chi::Task> ptr2 = t2_gt.template Cast<chi::Task>();
-      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      ptr1.ptr_->AggregateOut(ptr2.template Cast<chi::Task>());
       CLIO_IPC->DelTask(t1_gt);
       CLIO_IPC->DelTask(t2_gt);
     }
 
-    // Test Aggregate for ReorganizeBlobTask
+    // Test AggregateOut for ReorganizeBlobTask
     auto t1_re = ipc_manager->NewTask<clio::cte::core::ReorganizeBlobTask>();
     auto t2_re = ipc_manager->NewTask<clio::cte::core::ReorganizeBlobTask>();
     if (!t1_re.IsNull() && !t2_re.IsNull()) {
       ctp::ipc::FullPtr<chi::Task> ptr1 = t1_re.template Cast<chi::Task>();
       ctp::ipc::FullPtr<chi::Task> ptr2 = t2_re.template Cast<chi::Task>();
-      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      ptr1.ptr_->AggregateOut(ptr2.template Cast<chi::Task>());
       CLIO_IPC->DelTask(t1_re);
       CLIO_IPC->DelTask(t2_re);
     }
 
-    // Test Aggregate for DelBlobTask
+    // Test AggregateOut for DelBlobTask
     auto t1_db = ipc_manager->NewTask<clio::cte::core::DelBlobTask>();
     auto t2_db = ipc_manager->NewTask<clio::cte::core::DelBlobTask>();
     if (!t1_db.IsNull() && !t2_db.IsNull()) {
       ctp::ipc::FullPtr<chi::Task> ptr1 = t1_db.template Cast<chi::Task>();
       ctp::ipc::FullPtr<chi::Task> ptr2 = t2_db.template Cast<chi::Task>();
-      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      ptr1.ptr_->AggregateOut(ptr2.template Cast<chi::Task>());
       CLIO_IPC->DelTask(t1_db);
       CLIO_IPC->DelTask(t2_db);
     }
 
-    // Test Aggregate for DelTagTask
+    // Test AggregateOut for DelTagTask
     auto t1_dt = ipc_manager->NewTask<clio::cte::core::DelTagTask>();
     auto t2_dt = ipc_manager->NewTask<clio::cte::core::DelTagTask>();
     if (!t1_dt.IsNull() && !t2_dt.IsNull()) {
       ctp::ipc::FullPtr<chi::Task> ptr1 = t1_dt.template Cast<chi::Task>();
       ctp::ipc::FullPtr<chi::Task> ptr2 = t2_dt.template Cast<chi::Task>();
-      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      ptr1.ptr_->AggregateOut(ptr2.template Cast<chi::Task>());
       CLIO_IPC->DelTask(t1_dt);
       CLIO_IPC->DelTask(t2_dt);
     }
 
-    // Test Aggregate for GetTagSizeTask
+    // Test AggregateOut for GetTagSizeTask
     auto t1_ts = ipc_manager->NewTask<clio::cte::core::GetTagSizeTask>();
     auto t2_ts = ipc_manager->NewTask<clio::cte::core::GetTagSizeTask>();
     if (!t1_ts.IsNull() && !t2_ts.IsNull()) {
       ctp::ipc::FullPtr<chi::Task> ptr1 = t1_ts.template Cast<chi::Task>();
       ctp::ipc::FullPtr<chi::Task> ptr2 = t2_ts.template Cast<chi::Task>();
-      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      ptr1.ptr_->AggregateOut(ptr2.template Cast<chi::Task>());
       CLIO_IPC->DelTask(t1_ts);
       CLIO_IPC->DelTask(t2_ts);
     }
 
-    // Test Aggregate for PollTelemetryLogTask
+    // Test AggregateOut for PollTelemetryLogTask
     auto t1_tl = ipc_manager->NewTask<clio::cte::core::PollTelemetryLogTask>();
     auto t2_tl = ipc_manager->NewTask<clio::cte::core::PollTelemetryLogTask>();
     if (!t1_tl.IsNull() && !t2_tl.IsNull()) {
       ctp::ipc::FullPtr<chi::Task> ptr1 = t1_tl.template Cast<chi::Task>();
       ctp::ipc::FullPtr<chi::Task> ptr2 = t2_tl.template Cast<chi::Task>();
-      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      ptr1.ptr_->AggregateOut(ptr2.template Cast<chi::Task>());
       CLIO_IPC->DelTask(t1_tl);
       CLIO_IPC->DelTask(t2_tl);
     }
 
-    // Test Aggregate for GetBlobScoreTask
+    // Test AggregateOut for GetBlobScoreTask
     auto t1_sc = ipc_manager->NewTask<clio::cte::core::GetBlobScoreTask>();
     auto t2_sc = ipc_manager->NewTask<clio::cte::core::GetBlobScoreTask>();
     if (!t1_sc.IsNull() && !t2_sc.IsNull()) {
       ctp::ipc::FullPtr<chi::Task> ptr1 = t1_sc.template Cast<chi::Task>();
       ctp::ipc::FullPtr<chi::Task> ptr2 = t2_sc.template Cast<chi::Task>();
-      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      ptr1.ptr_->AggregateOut(ptr2.template Cast<chi::Task>());
       CLIO_IPC->DelTask(t1_sc);
       CLIO_IPC->DelTask(t2_sc);
     }
 
-    // Test Aggregate for GetBlobSizeTask
+    // Test AggregateOut for GetBlobSizeTask
     auto t1_bs = ipc_manager->NewTask<clio::cte::core::GetBlobSizeTask>();
     auto t2_bs = ipc_manager->NewTask<clio::cte::core::GetBlobSizeTask>();
     if (!t1_bs.IsNull() && !t2_bs.IsNull()) {
       ctp::ipc::FullPtr<chi::Task> ptr1 = t1_bs.template Cast<chi::Task>();
       ctp::ipc::FullPtr<chi::Task> ptr2 = t2_bs.template Cast<chi::Task>();
-      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      ptr1.ptr_->AggregateOut(ptr2.template Cast<chi::Task>());
       CLIO_IPC->DelTask(t1_bs);
       CLIO_IPC->DelTask(t2_bs);
     }
 
-    // Test Aggregate for GetContainedBlobsTask
+    // Test AggregateOut for GetContainedBlobsTask
     auto t1_cb = ipc_manager->NewTask<clio::cte::core::GetContainedBlobsTask>();
     auto t2_cb = ipc_manager->NewTask<clio::cte::core::GetContainedBlobsTask>();
     if (!t1_cb.IsNull() && !t2_cb.IsNull()) {
       ctp::ipc::FullPtr<chi::Task> ptr1 = t1_cb.template Cast<chi::Task>();
       ctp::ipc::FullPtr<chi::Task> ptr2 = t2_cb.template Cast<chi::Task>();
-      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      ptr1.ptr_->AggregateOut(ptr2.template Cast<chi::Task>());
       CLIO_IPC->DelTask(t1_cb);
       CLIO_IPC->DelTask(t2_cb);
     }
 
-    // Test Aggregate for TagQueryTask
+    // Test AggregateOut for TagQueryTask
     auto t1_tq = ipc_manager->NewTask<clio::cte::core::TagQueryTask>();
     auto t2_tq = ipc_manager->NewTask<clio::cte::core::TagQueryTask>();
     if (!t1_tq.IsNull() && !t2_tq.IsNull()) {
       ctp::ipc::FullPtr<chi::Task> ptr1 = t1_tq.template Cast<chi::Task>();
       ctp::ipc::FullPtr<chi::Task> ptr2 = t2_tq.template Cast<chi::Task>();
-      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      ptr1.ptr_->AggregateOut(ptr2.template Cast<chi::Task>());
       CLIO_IPC->DelTask(t1_tq);
       CLIO_IPC->DelTask(t2_tq);
     }
 
-    // Test Aggregate for BlobQueryTask
+    // Test AggregateOut for BlobQueryTask
     auto t1_bq = ipc_manager->NewTask<clio::cte::core::BlobQueryTask>();
     auto t2_bq = ipc_manager->NewTask<clio::cte::core::BlobQueryTask>();
     if (!t1_bq.IsNull() && !t2_bq.IsNull()) {
       ctp::ipc::FullPtr<chi::Task> ptr1 = t1_bq.template Cast<chi::Task>();
       ctp::ipc::FullPtr<chi::Task> ptr2 = t2_bq.template Cast<chi::Task>();
-      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      ptr1.ptr_->AggregateOut(ptr2.template Cast<chi::Task>());
       CLIO_IPC->DelTask(t1_bq);
       CLIO_IPC->DelTask(t2_bq);
     }
 
-    // Test Aggregate for unknown method (default case)
+    // Test AggregateOut for unknown method (default case)
     auto t1_unk = ipc_manager->NewTask<chi::Task>();
     auto t2_unk = ipc_manager->NewTask<chi::Task>();
     if (!t1_unk.IsNull() && !t2_unk.IsNull()) {
-      t1_unk.ptr_->Aggregate(t2_unk.template Cast<chi::Task>());
+      t1_unk.ptr_->AggregateOut(t2_unk.template Cast<chi::Task>());
       CLIO_IPC->DelTask(t1_unk);
       CLIO_IPC->DelTask(t2_unk);
     }
 
-    INFO("CTE Runtime::Aggregate tests completed");
+    INFO("CTE Runtime::AggregateOut tests completed");
   }
 
   SECTION("CTE Runtime GetOrCreateTag SaveTask test") {
@@ -6551,15 +6551,15 @@ TEST_CASE("Autogen - Bdev Runtime Container Methods", "[autogen][bdev][runtime]"
     INFO("Bdev Runtime::NewCopyTask tests completed");
   }
 
-  SECTION("Bdev Runtime Aggregate all methods") {
-    INFO("Testing Bdev Runtime::Aggregate for all methods");
+  SECTION("Bdev Runtime AggregateOut all methods") {
+    INFO("Testing Bdev Runtime::AggregateOut for all methods");
 
     auto t1_c = ipc_manager->NewTask<clio::run::bdev::CreateTask>();
     auto t2_c = ipc_manager->NewTask<clio::run::bdev::CreateTask>();
     if (!t1_c.IsNull() && !t2_c.IsNull()) {
       ctp::ipc::FullPtr<chi::Task> ptr1 = t1_c.template Cast<chi::Task>();
       ctp::ipc::FullPtr<chi::Task> ptr2 = t2_c.template Cast<chi::Task>();
-      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      ptr1.ptr_->AggregateOut(ptr2.template Cast<chi::Task>());
       CLIO_IPC->DelTask(t1_c);
       CLIO_IPC->DelTask(t2_c);
     }
@@ -6569,7 +6569,7 @@ TEST_CASE("Autogen - Bdev Runtime Container Methods", "[autogen][bdev][runtime]"
     if (!t1_d.IsNull() && !t2_d.IsNull()) {
       ctp::ipc::FullPtr<chi::Task> ptr1 = t1_d.template Cast<chi::Task>();
       ctp::ipc::FullPtr<chi::Task> ptr2 = t2_d.template Cast<chi::Task>();
-      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      ptr1.ptr_->AggregateOut(ptr2.template Cast<chi::Task>());
       CLIO_IPC->DelTask(t1_d);
       CLIO_IPC->DelTask(t2_d);
     }
@@ -6579,7 +6579,7 @@ TEST_CASE("Autogen - Bdev Runtime Container Methods", "[autogen][bdev][runtime]"
     if (!t1_a.IsNull() && !t2_a.IsNull()) {
       ctp::ipc::FullPtr<chi::Task> ptr1 = t1_a.template Cast<chi::Task>();
       ctp::ipc::FullPtr<chi::Task> ptr2 = t2_a.template Cast<chi::Task>();
-      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      ptr1.ptr_->AggregateOut(ptr2.template Cast<chi::Task>());
       CLIO_IPC->DelTask(t1_a);
       CLIO_IPC->DelTask(t2_a);
     }
@@ -6589,7 +6589,7 @@ TEST_CASE("Autogen - Bdev Runtime Container Methods", "[autogen][bdev][runtime]"
     if (!t1_f.IsNull() && !t2_f.IsNull()) {
       ctp::ipc::FullPtr<chi::Task> ptr1 = t1_f.template Cast<chi::Task>();
       ctp::ipc::FullPtr<chi::Task> ptr2 = t2_f.template Cast<chi::Task>();
-      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      ptr1.ptr_->AggregateOut(ptr2.template Cast<chi::Task>());
       CLIO_IPC->DelTask(t1_f);
       CLIO_IPC->DelTask(t2_f);
     }
@@ -6599,7 +6599,7 @@ TEST_CASE("Autogen - Bdev Runtime Container Methods", "[autogen][bdev][runtime]"
     if (!t1_w.IsNull() && !t2_w.IsNull()) {
       ctp::ipc::FullPtr<chi::Task> ptr1 = t1_w.template Cast<chi::Task>();
       ctp::ipc::FullPtr<chi::Task> ptr2 = t2_w.template Cast<chi::Task>();
-      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      ptr1.ptr_->AggregateOut(ptr2.template Cast<chi::Task>());
       CLIO_IPC->DelTask(t1_w);
       CLIO_IPC->DelTask(t2_w);
     }
@@ -6609,7 +6609,7 @@ TEST_CASE("Autogen - Bdev Runtime Container Methods", "[autogen][bdev][runtime]"
     if (!t1_r.IsNull() && !t2_r.IsNull()) {
       ctp::ipc::FullPtr<chi::Task> ptr1 = t1_r.template Cast<chi::Task>();
       ctp::ipc::FullPtr<chi::Task> ptr2 = t2_r.template Cast<chi::Task>();
-      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      ptr1.ptr_->AggregateOut(ptr2.template Cast<chi::Task>());
       CLIO_IPC->DelTask(t1_r);
       CLIO_IPC->DelTask(t2_r);
     }
@@ -6619,12 +6619,12 @@ TEST_CASE("Autogen - Bdev Runtime Container Methods", "[autogen][bdev][runtime]"
     if (!t1_s.IsNull() && !t2_s.IsNull()) {
       ctp::ipc::FullPtr<chi::Task> ptr1 = t1_s.template Cast<chi::Task>();
       ctp::ipc::FullPtr<chi::Task> ptr2 = t2_s.template Cast<chi::Task>();
-      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      ptr1.ptr_->AggregateOut(ptr2.template Cast<chi::Task>());
       CLIO_IPC->DelTask(t1_s);
       CLIO_IPC->DelTask(t2_s);
     }
 
-    INFO("Bdev Runtime::Aggregate tests completed");
+    INFO("Bdev Runtime::AggregateOut tests completed");
   }
 }
 
@@ -6909,8 +6909,8 @@ TEST_CASE("Autogen - CAE Runtime Container Methods", "[autogen][cae][runtime]") 
     INFO("CAE Runtime::NewCopyTask tests completed");
   }
 
-  SECTION("CAE Runtime Aggregate all methods") {
-    INFO("Testing CAE Runtime::Aggregate for all methods");
+  SECTION("CAE Runtime AggregateOut all methods") {
+    INFO("Testing CAE Runtime::AggregateOut for all methods");
 
     // Test kCreate
     auto t1_c = ipc_manager->NewTask<clio::cae::core::CreateTask>();
@@ -6918,7 +6918,7 @@ TEST_CASE("Autogen - CAE Runtime Container Methods", "[autogen][cae][runtime]") 
     if (!t1_c.IsNull() && !t2_c.IsNull()) {
       ctp::ipc::FullPtr<chi::Task> ptr1 = t1_c.template Cast<chi::Task>();
       ctp::ipc::FullPtr<chi::Task> ptr2 = t2_c.template Cast<chi::Task>();
-      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      ptr1.ptr_->AggregateOut(ptr2.template Cast<chi::Task>());
       CLIO_IPC->DelTask(t1_c);
       CLIO_IPC->DelTask(t2_c);
     }
@@ -6927,7 +6927,7 @@ TEST_CASE("Autogen - CAE Runtime Container Methods", "[autogen][cae][runtime]") 
     auto t1_d = ipc_manager->NewTask<chi::Task>();
     auto t2_d = ipc_manager->NewTask<chi::Task>();
     if (!t1_d.IsNull() && !t2_d.IsNull()) {
-      t1_d.ptr_->Aggregate(t2_d.template Cast<chi::Task>());
+      t1_d.ptr_->AggregateOut(t2_d.template Cast<chi::Task>());
       CLIO_IPC->DelTask(t1_d);
       CLIO_IPC->DelTask(t2_d);
     }
@@ -6938,7 +6938,7 @@ TEST_CASE("Autogen - CAE Runtime Container Methods", "[autogen][cae][runtime]") 
     if (!t1_p.IsNull() && !t2_p.IsNull()) {
       ctp::ipc::FullPtr<chi::Task> ptr1 = t1_p.template Cast<chi::Task>();
       ctp::ipc::FullPtr<chi::Task> ptr2 = t2_p.template Cast<chi::Task>();
-      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      ptr1.ptr_->AggregateOut(ptr2.template Cast<chi::Task>());
       CLIO_IPC->DelTask(t1_p);
       CLIO_IPC->DelTask(t2_p);
     }
@@ -6949,7 +6949,7 @@ TEST_CASE("Autogen - CAE Runtime Container Methods", "[autogen][cae][runtime]") 
     if (!t1_h.IsNull() && !t2_h.IsNull()) {
       ctp::ipc::FullPtr<chi::Task> ptr1 = t1_h.template Cast<chi::Task>();
       ctp::ipc::FullPtr<chi::Task> ptr2 = t2_h.template Cast<chi::Task>();
-      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      ptr1.ptr_->AggregateOut(ptr2.template Cast<chi::Task>());
       CLIO_IPC->DelTask(t1_h);
       CLIO_IPC->DelTask(t2_h);
     }
@@ -6958,12 +6958,12 @@ TEST_CASE("Autogen - CAE Runtime Container Methods", "[autogen][cae][runtime]") 
     auto t1_u = ipc_manager->NewTask<chi::Task>();
     auto t2_u = ipc_manager->NewTask<chi::Task>();
     if (!t1_u.IsNull() && !t2_u.IsNull()) {
-      t1_u.ptr_->Aggregate(t2_u.template Cast<chi::Task>());
+      t1_u.ptr_->AggregateOut(t2_u.template Cast<chi::Task>());
       CLIO_IPC->DelTask(t1_u);
       CLIO_IPC->DelTask(t2_u);
     }
 
-    INFO("CAE Runtime::Aggregate tests completed");
+    INFO("CAE Runtime::AggregateOut tests completed");
   }
 }
 
@@ -7069,21 +7069,21 @@ TEST_CASE("Autogen - CAE Task Serialization Methods", "[autogen][cae][serialize]
     INFO("ProcessHdf5DatasetTask Copy test passed");
   }
 
-  SECTION("ProcessHdf5DatasetTask Aggregate with error propagation") {
+  SECTION("ProcessHdf5DatasetTask AggregateOut with error propagation") {
     auto task1 = ipc_manager->NewTask<clio::cae::core::ProcessHdf5DatasetTask>();
     auto task2 = ipc_manager->NewTask<clio::cae::core::ProcessHdf5DatasetTask>();
     if (!task1.IsNull() && !task2.IsNull()) {
       // Set error in task2
       task2->result_code_ = 42;
 
-      // Aggregate should propagate error
-      task1->Aggregate(task2.template Cast<chi::Task>());
+      // AggregateOut should propagate error
+      task1->AggregateOut(task2.template Cast<chi::Task>());
       REQUIRE(task1->result_code_ == 42);
 
       CLIO_IPC->DelTask(task1);
       CLIO_IPC->DelTask(task2);
     }
-    INFO("ProcessHdf5DatasetTask Aggregate with error propagation test passed");
+    INFO("ProcessHdf5DatasetTask AggregateOut with error propagation test passed");
   }
 }
 
@@ -7494,8 +7494,8 @@ TEST_CASE("Autogen - MOD_NAME Runtime Container Methods", "[autogen][mod_name][r
     INFO("MOD_NAME Runtime::NewCopyTask tests completed");
   }
 
-  SECTION("MOD_NAME Runtime Aggregate all methods") {
-    INFO("Testing MOD_NAME Runtime::Aggregate for all methods");
+  SECTION("MOD_NAME Runtime AggregateOut all methods") {
+    INFO("Testing MOD_NAME Runtime::AggregateOut for all methods");
 
     // Test kCreate
     auto t1_c = ipc_manager->NewTask<clio::run::MOD_NAME::CreateTask>();
@@ -7503,7 +7503,7 @@ TEST_CASE("Autogen - MOD_NAME Runtime Container Methods", "[autogen][mod_name][r
     if (!t1_c.IsNull() && !t2_c.IsNull()) {
       ctp::ipc::FullPtr<chi::Task> ptr1 = t1_c.template Cast<chi::Task>();
       ctp::ipc::FullPtr<chi::Task> ptr2 = t2_c.template Cast<chi::Task>();
-      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      ptr1.ptr_->AggregateOut(ptr2.template Cast<chi::Task>());
       CLIO_IPC->DelTask(t1_c);
       CLIO_IPC->DelTask(t2_c);
     }
@@ -7514,7 +7514,7 @@ TEST_CASE("Autogen - MOD_NAME Runtime Container Methods", "[autogen][mod_name][r
     if (!t1_d.IsNull() && !t2_d.IsNull()) {
       ctp::ipc::FullPtr<chi::Task> ptr1 = t1_d.template Cast<chi::Task>();
       ctp::ipc::FullPtr<chi::Task> ptr2 = t2_d.template Cast<chi::Task>();
-      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      ptr1.ptr_->AggregateOut(ptr2.template Cast<chi::Task>());
       CLIO_IPC->DelTask(t1_d);
       CLIO_IPC->DelTask(t2_d);
     }
@@ -7525,7 +7525,7 @@ TEST_CASE("Autogen - MOD_NAME Runtime Container Methods", "[autogen][mod_name][r
     if (!t1_cu.IsNull() && !t2_cu.IsNull()) {
       ctp::ipc::FullPtr<chi::Task> ptr1 = t1_cu.template Cast<chi::Task>();
       ctp::ipc::FullPtr<chi::Task> ptr2 = t2_cu.template Cast<chi::Task>();
-      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      ptr1.ptr_->AggregateOut(ptr2.template Cast<chi::Task>());
       CLIO_IPC->DelTask(t1_cu);
       CLIO_IPC->DelTask(t2_cu);
     }
@@ -7536,7 +7536,7 @@ TEST_CASE("Autogen - MOD_NAME Runtime Container Methods", "[autogen][mod_name][r
     if (!t1_cm.IsNull() && !t2_cm.IsNull()) {
       ctp::ipc::FullPtr<chi::Task> ptr1 = t1_cm.template Cast<chi::Task>();
       ctp::ipc::FullPtr<chi::Task> ptr2 = t2_cm.template Cast<chi::Task>();
-      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      ptr1.ptr_->AggregateOut(ptr2.template Cast<chi::Task>());
       CLIO_IPC->DelTask(t1_cm);
       CLIO_IPC->DelTask(t2_cm);
     }
@@ -7547,7 +7547,7 @@ TEST_CASE("Autogen - MOD_NAME Runtime Container Methods", "[autogen][mod_name][r
     if (!t1_cr.IsNull() && !t2_cr.IsNull()) {
       ctp::ipc::FullPtr<chi::Task> ptr1 = t1_cr.template Cast<chi::Task>();
       ctp::ipc::FullPtr<chi::Task> ptr2 = t2_cr.template Cast<chi::Task>();
-      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      ptr1.ptr_->AggregateOut(ptr2.template Cast<chi::Task>());
       CLIO_IPC->DelTask(t1_cr);
       CLIO_IPC->DelTask(t2_cr);
     }
@@ -7558,7 +7558,7 @@ TEST_CASE("Autogen - MOD_NAME Runtime Container Methods", "[autogen][mod_name][r
     if (!t1_w.IsNull() && !t2_w.IsNull()) {
       ctp::ipc::FullPtr<chi::Task> ptr1 = t1_w.template Cast<chi::Task>();
       ctp::ipc::FullPtr<chi::Task> ptr2 = t2_w.template Cast<chi::Task>();
-      ptr1.ptr_->Aggregate(ptr2.template Cast<chi::Task>());
+      ptr1.ptr_->AggregateOut(ptr2.template Cast<chi::Task>());
       CLIO_IPC->DelTask(t1_w);
       CLIO_IPC->DelTask(t2_w);
     }
@@ -7567,12 +7567,12 @@ TEST_CASE("Autogen - MOD_NAME Runtime Container Methods", "[autogen][mod_name][r
     auto t1_u = ipc_manager->NewTask<chi::Task>();
     auto t2_u = ipc_manager->NewTask<chi::Task>();
     if (!t1_u.IsNull() && !t2_u.IsNull()) {
-      t1_u.ptr_->Aggregate(t2_u.template Cast<chi::Task>());
+      t1_u.ptr_->AggregateOut(t2_u.template Cast<chi::Task>());
       CLIO_IPC->DelTask(t1_u);
       CLIO_IPC->DelTask(t2_u);
     }
 
-    INFO("MOD_NAME Runtime::Aggregate tests completed");
+    INFO("MOD_NAME Runtime::AggregateOut tests completed");
   }
 }
 
@@ -7640,52 +7640,52 @@ TEST_CASE("Autogen - MOD_NAME Task Serialization", "[autogen][mod_name][serializ
     INFO("WaitTestTask serialization test passed");
   }
 
-  SECTION("CustomTask Copy and Aggregate") {
+  SECTION("CustomTask Copy and AggregateOut") {
     auto task1 = ipc_manager->NewTask<clio::run::MOD_NAME::CustomTask>();
     auto task2 = ipc_manager->NewTask<clio::run::MOD_NAME::CustomTask>();
     if (!task1.IsNull() && !task2.IsNull()) {
       task1->Copy(task2);
-      task1->Aggregate(task2.template Cast<chi::Task>());
+      task1->AggregateOut(task2.template Cast<chi::Task>());
       CLIO_IPC->DelTask(task1);
       CLIO_IPC->DelTask(task2);
     }
-    INFO("CustomTask Copy and Aggregate test passed");
+    INFO("CustomTask Copy and AggregateOut test passed");
   }
 
-  SECTION("CoMutexTestTask Copy and Aggregate") {
+  SECTION("CoMutexTestTask Copy and AggregateOut") {
     auto task1 = ipc_manager->NewTask<clio::run::MOD_NAME::CoMutexTestTask>();
     auto task2 = ipc_manager->NewTask<clio::run::MOD_NAME::CoMutexTestTask>();
     if (!task1.IsNull() && !task2.IsNull()) {
       task1->Copy(task2);
-      task1->Aggregate(task2.template Cast<chi::Task>());
+      task1->AggregateOut(task2.template Cast<chi::Task>());
       CLIO_IPC->DelTask(task1);
       CLIO_IPC->DelTask(task2);
     }
-    INFO("CoMutexTestTask Copy and Aggregate test passed");
+    INFO("CoMutexTestTask Copy and AggregateOut test passed");
   }
 
-  SECTION("CoRwLockTestTask Copy and Aggregate") {
+  SECTION("CoRwLockTestTask Copy and AggregateOut") {
     auto task1 = ipc_manager->NewTask<clio::run::MOD_NAME::CoRwLockTestTask>();
     auto task2 = ipc_manager->NewTask<clio::run::MOD_NAME::CoRwLockTestTask>();
     if (!task1.IsNull() && !task2.IsNull()) {
       task1->Copy(task2);
-      task1->Aggregate(task2.template Cast<chi::Task>());
+      task1->AggregateOut(task2.template Cast<chi::Task>());
       CLIO_IPC->DelTask(task1);
       CLIO_IPC->DelTask(task2);
     }
-    INFO("CoRwLockTestTask Copy and Aggregate test passed");
+    INFO("CoRwLockTestTask Copy and AggregateOut test passed");
   }
 
-  SECTION("WaitTestTask Copy and Aggregate") {
+  SECTION("WaitTestTask Copy and AggregateOut") {
     auto task1 = ipc_manager->NewTask<clio::run::MOD_NAME::WaitTestTask>();
     auto task2 = ipc_manager->NewTask<clio::run::MOD_NAME::WaitTestTask>();
     if (!task1.IsNull() && !task2.IsNull()) {
       task1->Copy(task2);
-      task1->Aggregate(task2.template Cast<chi::Task>());
+      task1->AggregateOut(task2.template Cast<chi::Task>());
       CLIO_IPC->DelTask(task1);
       CLIO_IPC->DelTask(task2);
     }
-    INFO("WaitTestTask Copy and Aggregate test passed");
+    INFO("WaitTestTask Copy and AggregateOut test passed");
   }
 }
 
@@ -7768,15 +7768,15 @@ TEST_CASE("Autogen - CTE ListTargetsTask coverage", "[autogen][cte][listtargets]
     INFO("ListTargetsTask Copy test passed");
   }
 
-  SECTION("ListTargetsTask Aggregate") {
+  SECTION("ListTargetsTask AggregateOut") {
     auto task1 = ipc_manager->NewTask<clio::cte::core::ListTargetsTask>();
     auto task2 = ipc_manager->NewTask<clio::cte::core::ListTargetsTask>();
     if (!task1.IsNull() && !task2.IsNull()) {
-      task1->Aggregate(task2.template Cast<chi::Task>());
+      task1->AggregateOut(task2.template Cast<chi::Task>());
       CLIO_IPC->DelTask(task1);
       CLIO_IPC->DelTask(task2);
     }
-    INFO("ListTargetsTask Aggregate test passed");
+    INFO("ListTargetsTask AggregateOut test passed");
   }
 }
 
@@ -7828,15 +7828,15 @@ TEST_CASE("Autogen - CTE StatTargetsTask coverage", "[autogen][cte][stattargets]
     INFO("StatTargetsTask Copy test passed");
   }
 
-  SECTION("StatTargetsTask Aggregate") {
+  SECTION("StatTargetsTask AggregateOut") {
     auto task1 = ipc_manager->NewTask<clio::cte::core::StatTargetsTask>();
     auto task2 = ipc_manager->NewTask<clio::cte::core::StatTargetsTask>();
     if (!task1.IsNull() && !task2.IsNull()) {
-      task1->Aggregate(task2.template Cast<chi::Task>());
+      task1->AggregateOut(task2.template Cast<chi::Task>());
       CLIO_IPC->DelTask(task1);
       CLIO_IPC->DelTask(task2);
     }
-    INFO("StatTargetsTask Aggregate test passed");
+    INFO("StatTargetsTask AggregateOut test passed");
   }
 }
 
@@ -7888,15 +7888,15 @@ TEST_CASE("Autogen - CTE RegisterTargetTask coverage", "[autogen][cte][registert
     INFO("RegisterTargetTask Copy test passed");
   }
 
-  SECTION("RegisterTargetTask Aggregate") {
+  SECTION("RegisterTargetTask AggregateOut") {
     auto task1 = ipc_manager->NewTask<clio::cte::core::RegisterTargetTask>();
     auto task2 = ipc_manager->NewTask<clio::cte::core::RegisterTargetTask>();
     if (!task1.IsNull() && !task2.IsNull()) {
-      task1->Aggregate(task2.template Cast<chi::Task>());
+      task1->AggregateOut(task2.template Cast<chi::Task>());
       CLIO_IPC->DelTask(task1);
       CLIO_IPC->DelTask(task2);
     }
-    INFO("RegisterTargetTask Aggregate test passed");
+    INFO("RegisterTargetTask AggregateOut test passed");
   }
 }
 
@@ -7923,16 +7923,16 @@ TEST_CASE("Autogen - CTE TagQueryTask coverage", "[autogen][cte][tagquery]") {
     INFO("TagQueryTask serialization tests passed");
   }
 
-  SECTION("TagQueryTask Copy and Aggregate") {
+  SECTION("TagQueryTask Copy and AggregateOut") {
     auto task1 = ipc_manager->NewTask<clio::cte::core::TagQueryTask>();
     auto task2 = ipc_manager->NewTask<clio::cte::core::TagQueryTask>();
     if (!task1.IsNull() && !task2.IsNull()) {
       task1->Copy(task2);
-      task1->Aggregate(task2.template Cast<chi::Task>());
+      task1->AggregateOut(task2.template Cast<chi::Task>());
       CLIO_IPC->DelTask(task1);
       CLIO_IPC->DelTask(task2);
     }
-    INFO("TagQueryTask Copy and Aggregate test passed");
+    INFO("TagQueryTask Copy and AggregateOut test passed");
   }
 }
 
@@ -7959,16 +7959,16 @@ TEST_CASE("Autogen - CTE BlobQueryTask coverage", "[autogen][cte][blobquery]") {
     INFO("BlobQueryTask serialization tests passed");
   }
 
-  SECTION("BlobQueryTask Copy and Aggregate") {
+  SECTION("BlobQueryTask Copy and AggregateOut") {
     auto task1 = ipc_manager->NewTask<clio::cte::core::BlobQueryTask>();
     auto task2 = ipc_manager->NewTask<clio::cte::core::BlobQueryTask>();
     if (!task1.IsNull() && !task2.IsNull()) {
       task1->Copy(task2);
-      task1->Aggregate(task2.template Cast<chi::Task>());
+      task1->AggregateOut(task2.template Cast<chi::Task>());
       CLIO_IPC->DelTask(task1);
       CLIO_IPC->DelTask(task2);
     }
-    INFO("BlobQueryTask Copy and Aggregate test passed");
+    INFO("BlobQueryTask Copy and AggregateOut test passed");
   }
 }
 
@@ -7995,16 +7995,16 @@ TEST_CASE("Autogen - CTE UnregisterTargetTask coverage", "[autogen][cte][unregis
     INFO("UnregisterTargetTask serialization tests passed");
   }
 
-  SECTION("UnregisterTargetTask Copy and Aggregate") {
+  SECTION("UnregisterTargetTask Copy and AggregateOut") {
     auto task1 = ipc_manager->NewTask<clio::cte::core::UnregisterTargetTask>();
     auto task2 = ipc_manager->NewTask<clio::cte::core::UnregisterTargetTask>();
     if (!task1.IsNull() && !task2.IsNull()) {
       task1->Copy(task2);
-      task1->Aggregate(task2.template Cast<chi::Task>());
+      task1->AggregateOut(task2.template Cast<chi::Task>());
       CLIO_IPC->DelTask(task1);
       CLIO_IPC->DelTask(task2);
     }
-    INFO("UnregisterTargetTask Copy and Aggregate test passed");
+    INFO("UnregisterTargetTask Copy and AggregateOut test passed");
   }
 }
 
@@ -8031,16 +8031,16 @@ TEST_CASE("Autogen - CTE GetBlobSizeTask coverage", "[autogen][cte][getblobsize]
     INFO("GetBlobSizeTask serialization tests passed");
   }
 
-  SECTION("GetBlobSizeTask Copy and Aggregate") {
+  SECTION("GetBlobSizeTask Copy and AggregateOut") {
     auto task1 = ipc_manager->NewTask<clio::cte::core::GetBlobSizeTask>();
     auto task2 = ipc_manager->NewTask<clio::cte::core::GetBlobSizeTask>();
     if (!task1.IsNull() && !task2.IsNull()) {
       task1->Copy(task2);
-      task1->Aggregate(task2.template Cast<chi::Task>());
+      task1->AggregateOut(task2.template Cast<chi::Task>());
       CLIO_IPC->DelTask(task1);
       CLIO_IPC->DelTask(task2);
     }
-    INFO("GetBlobSizeTask Copy and Aggregate test passed");
+    INFO("GetBlobSizeTask Copy and AggregateOut test passed");
   }
 }
 
@@ -8067,16 +8067,16 @@ TEST_CASE("Autogen - CTE GetBlobScoreTask coverage", "[autogen][cte][getblobscor
     INFO("GetBlobScoreTask serialization tests passed");
   }
 
-  SECTION("GetBlobScoreTask Copy and Aggregate") {
+  SECTION("GetBlobScoreTask Copy and AggregateOut") {
     auto task1 = ipc_manager->NewTask<clio::cte::core::GetBlobScoreTask>();
     auto task2 = ipc_manager->NewTask<clio::cte::core::GetBlobScoreTask>();
     if (!task1.IsNull() && !task2.IsNull()) {
       task1->Copy(task2);
-      task1->Aggregate(task2.template Cast<chi::Task>());
+      task1->AggregateOut(task2.template Cast<chi::Task>());
       CLIO_IPC->DelTask(task1);
       CLIO_IPC->DelTask(task2);
     }
-    INFO("GetBlobScoreTask Copy and Aggregate test passed");
+    INFO("GetBlobScoreTask Copy and AggregateOut test passed");
   }
 }
 
@@ -8103,16 +8103,16 @@ TEST_CASE("Autogen - CTE PollTelemetryLogTask coverage", "[autogen][cte][polltel
     INFO("PollTelemetryLogTask serialization tests passed");
   }
 
-  SECTION("PollTelemetryLogTask Copy and Aggregate") {
+  SECTION("PollTelemetryLogTask Copy and AggregateOut") {
     auto task1 = ipc_manager->NewTask<clio::cte::core::PollTelemetryLogTask>();
     auto task2 = ipc_manager->NewTask<clio::cte::core::PollTelemetryLogTask>();
     if (!task1.IsNull() && !task2.IsNull()) {
       task1->Copy(task2);
-      task1->Aggregate(task2.template Cast<chi::Task>());
+      task1->AggregateOut(task2.template Cast<chi::Task>());
       CLIO_IPC->DelTask(task1);
       CLIO_IPC->DelTask(task2);
     }
-    INFO("PollTelemetryLogTask Copy and Aggregate test passed");
+    INFO("PollTelemetryLogTask Copy and AggregateOut test passed");
   }
 }
 
@@ -8139,16 +8139,16 @@ TEST_CASE("Autogen - CTE GetContainedBlobsTask coverage", "[autogen][cte][getcon
     INFO("GetContainedBlobsTask serialization tests passed");
   }
 
-  SECTION("GetContainedBlobsTask Copy and Aggregate") {
+  SECTION("GetContainedBlobsTask Copy and AggregateOut") {
     auto task1 = ipc_manager->NewTask<clio::cte::core::GetContainedBlobsTask>();
     auto task2 = ipc_manager->NewTask<clio::cte::core::GetContainedBlobsTask>();
     if (!task1.IsNull() && !task2.IsNull()) {
       task1->Copy(task2);
-      task1->Aggregate(task2.template Cast<chi::Task>());
+      task1->AggregateOut(task2.template Cast<chi::Task>());
       CLIO_IPC->DelTask(task1);
       CLIO_IPC->DelTask(task2);
     }
-    INFO("GetContainedBlobsTask Copy and Aggregate test passed");
+    INFO("GetContainedBlobsTask Copy and AggregateOut test passed");
   }
 }
 
@@ -8759,12 +8759,12 @@ TEST_CASE("Autogen - Bdev Container NewCopyTask coverage", "[autogen][bdev][cont
     }
   }
 
-  SECTION("Aggregate for WriteTask") {
+  SECTION("AggregateOut for WriteTask") {
     auto task1 = container->NewTask(clio::run::bdev::Method::kWrite);
     auto task2 = container->NewTask(clio::run::bdev::Method::kWrite);
     if (!task1.IsNull() && !task2.IsNull()) {
-      task1.ptr_->Aggregate(task2.template Cast<chi::Task>());
-      INFO("Aggregate for WriteTask succeeded");
+      task1.ptr_->AggregateOut(task2.template Cast<chi::Task>());
+      INFO("AggregateOut for WriteTask succeeded");
       CLIO_IPC->DelTask(task1);
       CLIO_IPC->DelTask(task2);
     }
@@ -8811,23 +8811,23 @@ TEST_CASE("Autogen - Admin Container NewCopyTask coverage", "[autogen][admin][co
     }
   }
 
-  SECTION("Aggregate for SendTask") {
+  SECTION("AggregateOut for SendTask") {
     auto task1 = container->NewTask(clio::run::admin::Method::kSend);
     auto task2 = container->NewTask(clio::run::admin::Method::kSend);
     if (!task1.IsNull() && !task2.IsNull()) {
-      task1.ptr_->Aggregate(task2.template Cast<chi::Task>());
-      INFO("Aggregate for SendTask succeeded");
+      task1.ptr_->AggregateOut(task2.template Cast<chi::Task>());
+      INFO("AggregateOut for SendTask succeeded");
       CLIO_IPC->DelTask(task1);
       CLIO_IPC->DelTask(task2);
     }
   }
 
-  SECTION("Aggregate for RecvTask") {
+  SECTION("AggregateOut for RecvTask") {
     auto task1 = container->NewTask(clio::run::admin::Method::kRecv);
     auto task2 = container->NewTask(clio::run::admin::Method::kRecv);
     if (!task1.IsNull() && !task2.IsNull()) {
-      task1.ptr_->Aggregate(task2.template Cast<chi::Task>());
-      INFO("Aggregate for RecvTask succeeded");
+      task1.ptr_->AggregateOut(task2.template Cast<chi::Task>());
+      INFO("AggregateOut for RecvTask succeeded");
       CLIO_IPC->DelTask(task1);
       CLIO_IPC->DelTask(task2);
     }
@@ -8874,12 +8874,12 @@ TEST_CASE("Autogen - CTE Container NewCopyTask coverage", "[autogen][cte][contai
     }
   }
 
-  SECTION("Aggregate for GetBlobTask") {
+  SECTION("AggregateOut for GetBlobTask") {
     auto task1 = container->NewTask(clio::cte::core::Method::kGetBlob);
     auto task2 = container->NewTask(clio::cte::core::Method::kGetBlob);
     if (!task1.IsNull() && !task2.IsNull()) {
-      task1.ptr_->Aggregate(task2.template Cast<chi::Task>());
-      INFO("Aggregate for GetBlobTask succeeded");
+      task1.ptr_->AggregateOut(task2.template Cast<chi::Task>());
+      INFO("AggregateOut for GetBlobTask succeeded");
       CLIO_IPC->DelTask(task1);
       CLIO_IPC->DelTask(task2);
     }
@@ -9346,7 +9346,7 @@ TEST_CASE("Autogen - CAE Container NewCopyTask coverage", "[autogen][cae][contai
   }
 }
 
-TEST_CASE("Autogen - CAE Container Aggregate coverage", "[autogen][cae][container][aggregate]") {
+TEST_CASE("Autogen - CAE Container AggregateOut coverage", "[autogen][cae][container][aggregate]") {
   EnsureInitialized();
 
   auto* ipc_manager = CLIO_IPC;
@@ -9361,34 +9361,34 @@ TEST_CASE("Autogen - CAE Container Aggregate coverage", "[autogen][cae][containe
     return;
   }
 
-  SECTION("Aggregate for CreateTask") {
+  SECTION("AggregateOut for CreateTask") {
     auto task1 = container->NewTask(clio::cae::core::Method::kCreate);
     auto task2 = container->NewTask(clio::cae::core::Method::kCreate);
     if (!task1.IsNull() && !task2.IsNull()) {
-      task1.ptr_->Aggregate(task2.template Cast<chi::Task>());
-      INFO("Aggregate for CreateTask succeeded");
+      task1.ptr_->AggregateOut(task2.template Cast<chi::Task>());
+      INFO("AggregateOut for CreateTask succeeded");
       CLIO_IPC->DelTask(task1);
       CLIO_IPC->DelTask(task2);
     }
   }
 
-  SECTION("Aggregate for ParseOmniTask") {
+  SECTION("AggregateOut for ParseOmniTask") {
     auto task1 = container->NewTask(clio::cae::core::Method::kParseOmni);
     auto task2 = container->NewTask(clio::cae::core::Method::kParseOmni);
     if (!task1.IsNull() && !task2.IsNull()) {
-      task1.ptr_->Aggregate(task2.template Cast<chi::Task>());
-      INFO("Aggregate for ParseOmniTask succeeded");
+      task1.ptr_->AggregateOut(task2.template Cast<chi::Task>());
+      INFO("AggregateOut for ParseOmniTask succeeded");
       CLIO_IPC->DelTask(task1);
       CLIO_IPC->DelTask(task2);
     }
   }
 
-  SECTION("Aggregate for ProcessHdf5DatasetTask") {
+  SECTION("AggregateOut for ProcessHdf5DatasetTask") {
     auto task1 = container->NewTask(clio::cae::core::Method::kProcessHdf5Dataset);
     auto task2 = container->NewTask(clio::cae::core::Method::kProcessHdf5Dataset);
     if (!task1.IsNull() && !task2.IsNull()) {
-      task1.ptr_->Aggregate(task2.template Cast<chi::Task>());
-      INFO("Aggregate for ProcessHdf5DatasetTask succeeded");
+      task1.ptr_->AggregateOut(task2.template Cast<chi::Task>());
+      INFO("AggregateOut for ProcessHdf5DatasetTask succeeded");
       CLIO_IPC->DelTask(task1);
       CLIO_IPC->DelTask(task2);
     }
@@ -9644,15 +9644,15 @@ TEST_CASE("Autogen - Admin WreapDeadIpcs Container Methods", "[autogen][admin][w
     }
   }
 
-  SECTION("WreapDeadIpcs Aggregate") {
+  SECTION("WreapDeadIpcs AggregateOut") {
     auto t1 = container->NewTask(clio::run::admin::Method::kWreapDeadIpcs);
     auto t2 = container->NewTask(clio::run::admin::Method::kWreapDeadIpcs);
     if (!t1.IsNull() && !t2.IsNull()) {
-      t1.ptr_->Aggregate(t2.template Cast<chi::Task>());
+      t1.ptr_->AggregateOut(t2.template Cast<chi::Task>());
       CLIO_IPC->DelTask(t2);
     }
     if (!t1.IsNull()) CLIO_IPC->DelTask(t1);
-    INFO("WreapDeadIpcs Aggregate completed");
+    INFO("WreapDeadIpcs AggregateOut completed");
   }
 
   SECTION("WreapDeadIpcs LocalSaveTask/LocalLoadTask") {
@@ -10045,15 +10045,15 @@ TEST_CASE("Autogen - CTE GetTargetInfo Container Methods", "[autogen][cte][getta
     }
   }
 
-  SECTION("GetTargetInfo Aggregate") {
+  SECTION("GetTargetInfo AggregateOut") {
     auto t1 = cte_runtime.NewTask(clio::cte::core::Method::kGetTargetInfo);
     auto t2 = cte_runtime.NewTask(clio::cte::core::Method::kGetTargetInfo);
     if (!t1.IsNull() && !t2.IsNull()) {
-      t1.ptr_->Aggregate(t2.template Cast<chi::Task>());
+      t1.ptr_->AggregateOut(t2.template Cast<chi::Task>());
       CLIO_IPC->DelTask(t2);
     }
     if (!t1.IsNull()) CLIO_IPC->DelTask(t1);
-    INFO("CTE GetTargetInfo Aggregate completed");
+    INFO("CTE GetTargetInfo AggregateOut completed");
   }
 }
 
@@ -10280,15 +10280,15 @@ TEST_CASE("Autogen - Admin Default Case Coverage", "[autogen][admin][default]") 
     INFO("Admin default NewTask completed");
   }
 
-  SECTION("Default Aggregate") {
+  SECTION("Default AggregateOut") {
     auto t1 = container->NewTask(clio::run::admin::Method::kFlush);
     auto t2 = container->NewTask(clio::run::admin::Method::kFlush);
     if (!t1.IsNull() && !t2.IsNull()) {
-      t1.ptr_->Aggregate(t2.template Cast<chi::Task>());
+      t1.ptr_->AggregateOut(t2.template Cast<chi::Task>());
       CLIO_IPC->DelTask(t2);
     }
     if (!t1.IsNull()) CLIO_IPC->DelTask(t1);
-    INFO("Admin default Aggregate completed");
+    INFO("Admin default AggregateOut completed");
   }
 }
 
@@ -10376,15 +10376,15 @@ TEST_CASE("Autogen - Bdev Default Case Coverage", "[autogen][bdev][default]") {
     INFO("Bdev default NewTask completed");
   }
 
-  SECTION("Default Aggregate") {
+  SECTION("Default AggregateOut") {
     auto t1 = bdev_runtime.NewTask(clio::run::bdev::Method::kGetStats);
     auto t2 = bdev_runtime.NewTask(clio::run::bdev::Method::kGetStats);
     if (!t1.IsNull() && !t2.IsNull()) {
-      t1.ptr_->Aggregate(t2.template Cast<chi::Task>());
+      t1.ptr_->AggregateOut(t2.template Cast<chi::Task>());
       CLIO_IPC->DelTask(t2);
     }
     if (!t1.IsNull()) CLIO_IPC->DelTask(t1);
-    INFO("Bdev default Aggregate completed");
+    INFO("Bdev default AggregateOut completed");
   }
 }
 
@@ -10505,15 +10505,15 @@ TEST_CASE("Autogen - CTE Default Case Coverage", "[autogen][cte][default]") {
     INFO("CTE default NewTask completed");
   }
 
-  SECTION("Default Aggregate") {
+  SECTION("Default AggregateOut") {
     auto t1 = cte_runtime.NewTask(clio::cte::core::Method::kGetTagSize);
     auto t2 = cte_runtime.NewTask(clio::cte::core::Method::kGetTagSize);
     if (!t1.IsNull() && !t2.IsNull()) {
-      t1.ptr_->Aggregate(t2.template Cast<chi::Task>());
+      t1.ptr_->AggregateOut(t2.template Cast<chi::Task>());
       CLIO_IPC->DelTask(t2);
     }
     if (!t1.IsNull()) CLIO_IPC->DelTask(t1);
-    INFO("CTE default Aggregate completed");
+    INFO("CTE default AggregateOut completed");
   }
 }
 
@@ -10761,11 +10761,11 @@ TEST_CASE("Autogen - Admin StopRuntimeTask full coverage", "[autogen][admin][sto
         CLIO_IPC->DelTask(copy);
       }
 
-      // Test Aggregate
+      // Test AggregateOut
       auto agg = ipc_manager->NewTask<clio::run::admin::StopRuntimeTask>(
           chi::CreateTaskId(), chi::kAdminPoolId, chi::PoolQuery::Local());
       if (!agg.IsNull()) {
-        agg->Aggregate(task.template Cast<chi::Task>());
+        agg->AggregateOut(task.template Cast<chi::Task>());
         CLIO_IPC->DelTask(agg);
       }
 
@@ -10809,11 +10809,11 @@ TEST_CASE("Autogen - Admin SendTask full coverage", "[autogen][admin][sendtask][
         CLIO_IPC->DelTask(copy);
       }
 
-      // Test Aggregate
+      // Test AggregateOut
       auto agg = ipc_manager->NewTask<clio::run::admin::SendTask>(
           chi::CreateTaskId(), chi::kAdminPoolId, chi::PoolQuery::Local());
       if (!agg.IsNull()) {
-        agg->Aggregate(task.template Cast<chi::Task>());
+        agg->AggregateOut(task.template Cast<chi::Task>());
         CLIO_IPC->DelTask(agg);
       }
 
@@ -10897,11 +10897,11 @@ TEST_CASE("Autogen - Admin WreapDeadIpcsTask full coverage", "[autogen][admin][w
         CLIO_IPC->DelTask(copy);
       }
 
-      // Test Aggregate
+      // Test AggregateOut
       auto agg = ipc_manager->NewTask<clio::run::admin::WreapDeadIpcsTask>(
           chi::CreateTaskId(), chi::kAdminPoolId, chi::PoolQuery::Local());
       if (!agg.IsNull()) {
-        agg->Aggregate(task.template Cast<chi::Task>());
+        agg->AggregateOut(task.template Cast<chi::Task>());
         CLIO_IPC->DelTask(agg);
       }
 
@@ -11102,48 +11102,48 @@ TEST_CASE("Autogen - Admin Container StopRuntime", "[autogen][admin][container][
     }
   }
 
-  SECTION("Aggregate for kStopRuntime") {
+  SECTION("AggregateOut for kStopRuntime") {
     auto t1 = admin_runtime.NewTask(clio::run::admin::Method::kStopRuntime);
     auto t2 = admin_runtime.NewTask(clio::run::admin::Method::kStopRuntime);
     if (!t1.IsNull() && !t2.IsNull()) {
-      t1.ptr_->Aggregate(t2.template Cast<chi::Task>());
+      t1.ptr_->AggregateOut(t2.template Cast<chi::Task>());
       CLIO_IPC->DelTask(t2);
     }
     if (!t1.IsNull()) CLIO_IPC->DelTask(t1);
-    INFO("Admin kStopRuntime Aggregate completed");
+    INFO("Admin kStopRuntime AggregateOut completed");
   }
 
-  SECTION("Aggregate for kSend") {
+  SECTION("AggregateOut for kSend") {
     auto t1 = admin_runtime.NewTask(clio::run::admin::Method::kSend);
     auto t2 = admin_runtime.NewTask(clio::run::admin::Method::kSend);
     if (!t1.IsNull() && !t2.IsNull()) {
-      t1.ptr_->Aggregate(t2.template Cast<chi::Task>());
+      t1.ptr_->AggregateOut(t2.template Cast<chi::Task>());
       CLIO_IPC->DelTask(t2);
     }
     if (!t1.IsNull()) CLIO_IPC->DelTask(t1);
-    INFO("Admin kSend Aggregate completed");
+    INFO("Admin kSend AggregateOut completed");
   }
 
-  SECTION("Aggregate for kRecv") {
+  SECTION("AggregateOut for kRecv") {
     auto t1 = admin_runtime.NewTask(clio::run::admin::Method::kRecv);
     auto t2 = admin_runtime.NewTask(clio::run::admin::Method::kRecv);
     if (!t1.IsNull() && !t2.IsNull()) {
-      t1.ptr_->Aggregate(t2.template Cast<chi::Task>());
+      t1.ptr_->AggregateOut(t2.template Cast<chi::Task>());
       CLIO_IPC->DelTask(t2);
     }
     if (!t1.IsNull()) CLIO_IPC->DelTask(t1);
-    INFO("Admin kRecv Aggregate completed");
+    INFO("Admin kRecv AggregateOut completed");
   }
 
-  SECTION("Aggregate for kWreapDeadIpcs") {
+  SECTION("AggregateOut for kWreapDeadIpcs") {
     auto t1 = admin_runtime.NewTask(clio::run::admin::Method::kWreapDeadIpcs);
     auto t2 = admin_runtime.NewTask(clio::run::admin::Method::kWreapDeadIpcs);
     if (!t1.IsNull() && !t2.IsNull()) {
-      t1.ptr_->Aggregate(t2.template Cast<chi::Task>());
+      t1.ptr_->AggregateOut(t2.template Cast<chi::Task>());
       CLIO_IPC->DelTask(t2);
     }
     if (!t1.IsNull()) CLIO_IPC->DelTask(t1);
-    INFO("Admin kWreapDeadIpcs Aggregate completed");
+    INFO("Admin kWreapDeadIpcs AggregateOut completed");
   }
 
   SECTION("LocalSaveTask for kStopRuntime") {
@@ -11296,11 +11296,11 @@ TEST_CASE("Autogen - Admin Container StopRuntime", "[autogen][admin][container][
 }
 
 // ============================================================================
-// CTE Task SerializeIn/SerializeOut/Copy/Aggregate coverage
+// CTE Task SerializeIn/SerializeOut/Copy/AggregateOut coverage
 // These call the methods directly to cover core_tasks.h template instantiations
 // ============================================================================
 
-// Helper macro to test SerializeIn, SerializeOut, Copy, and Aggregate for a CTE task
+// Helper macro to test SerializeIn, SerializeOut, Copy, and AggregateOut for a CTE task
 #define TEST_CTE_TASK_METHODS(TaskType, task_label) \
 TEST_CASE("Autogen - CTE " task_label " methods", "[autogen][cte][methods][" task_label "]") { \
   EnsureInitialized(); \
@@ -11339,12 +11339,12 @@ TEST_CASE("Autogen - CTE " task_label " methods", "[autogen][cte][methods][" tas
     if (!t2.IsNull()) CLIO_IPC->DelTask(t2); \
   } \
   \
-  SECTION("Aggregate") { \
+  SECTION("AggregateOut") { \
     auto t1 = ipc_manager->NewTask<TaskType>(); \
     auto t2 = ipc_manager->NewTask<TaskType>(); \
     if (!t1.IsNull() && !t2.IsNull()) { \
-      t1->Aggregate(t2.template Cast<chi::Task>()); \
-      INFO(task_label " Aggregate completed"); \
+      t1->AggregateOut(t2.template Cast<chi::Task>()); \
+      INFO(task_label " AggregateOut completed"); \
     } \
     if (!t1.IsNull()) CLIO_IPC->DelTask(t1); \
     if (!t2.IsNull()) CLIO_IPC->DelTask(t2); \
@@ -11408,12 +11408,12 @@ TEST_CASE("Autogen - CTE GetOrCreateTagTask methods", "[autogen][cte][methods][G
     if (!t2.IsNull()) CLIO_IPC->DelTask(t2);
   }
 
-  SECTION("Aggregate") {
+  SECTION("AggregateOut") {
     auto t1 = ipc_manager->NewTask<TagCreateTask>();
     auto t2 = ipc_manager->NewTask<TagCreateTask>();
     if (!t1.IsNull() && !t2.IsNull()) {
-      t1->Aggregate(t2.template Cast<chi::Task>());
-      INFO("GetOrCreateTagTask Aggregate completed");
+      t1->AggregateOut(t2.template Cast<chi::Task>());
+      INFO("GetOrCreateTagTask AggregateOut completed");
     }
     if (!t1.IsNull()) CLIO_IPC->DelTask(t1);
     if (!t2.IsNull()) CLIO_IPC->DelTask(t2);
@@ -12407,7 +12407,7 @@ TEST_CASE("Autogen - CTE Container NewTask/DelTask", "[autogen][cte][container][
 }
 
 // ==========================================================================
-// CTE Container NewCopyTask and Aggregate dispatch tests
+// CTE Container NewCopyTask and AggregateOut dispatch tests
 // ==========================================================================
 TEST_CASE("Autogen - CTE Container NewCopyTask dispatch", "[autogen][cte][container][newcopy]") {
   EnsureInitialized();
@@ -12432,8 +12432,8 @@ TEST_CASE("Autogen - CTE Container NewCopyTask dispatch", "[autogen][cte][contai
     }
   }
 
-  SECTION("Aggregate dispatch for CTE methods") {
-    // Exercise Aggregate dispatch in core_lib_exec.cc
+  SECTION("AggregateOut dispatch for CTE methods") {
+    // Exercise AggregateOut dispatch in core_lib_exec.cc
     chi::u32 methods[] = {
       clio::cte::core::Method::kRegisterTarget,
       clio::cte::core::Method::kUnregisterTarget,
@@ -12454,14 +12454,14 @@ TEST_CASE("Autogen - CTE Container NewCopyTask dispatch", "[autogen][cte][contai
       auto t1 = cte_runtime.NewTask(method);
       auto t2 = cte_runtime.NewTask(method);
       if (!t1.IsNull() && !t2.IsNull()) {
-        t1.ptr_->Aggregate(t2.template Cast<chi::Task>());
+        t1.ptr_->AggregateOut(t2.template Cast<chi::Task>());
         CLIO_IPC->DelTask(t2);
       }
       if (!t1.IsNull()) {
         CLIO_IPC->DelTask(t1);
       }
     }
-    INFO("CTE Aggregate dispatch for all methods completed");
+    INFO("CTE AggregateOut dispatch for all methods completed");
   }
 }
 

@@ -899,7 +899,7 @@ class CTECompressBenchmark {
     HLOG(kInfo, "Bandwidth per thread (min): {} MB/s", min_bw);
     HLOG(kInfo, "Bandwidth per thread (max): {} MB/s", max_bw);
     HLOG(kInfo, "Bandwidth per thread (avg): {} MB/s", avg_bw);
-    HLOG(kInfo, "Aggregate bandwidth: {} MB/s", agg_bw);
+    HLOG(kInfo, "AggregateOut bandwidth: {} MB/s", agg_bw);
     HLOG(kInfo, "");
     HLOG(kInfo, "Compression ratio (avg): {}:1", avg_ratio);
     HLOG(kInfo, "=============================================");

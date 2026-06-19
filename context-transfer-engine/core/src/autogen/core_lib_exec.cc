@@ -1251,141 +1251,141 @@ ctp::ipc::FullPtr<chi::Task> Runtime::NewTask(chi::u32 method) {
   }
 }
 
-void Runtime::Aggregate(chi::u32 method, ctp::ipc::FullPtr<chi::Task> orig_task,
+void Runtime::AggregateOut(chi::u32 method, ctp::ipc::FullPtr<chi::Task> orig_task,
                         const ctp::ipc::FullPtr<chi::Task>& replica_task) {
   switch (method) {
     case Method::kCreate: {
       auto typed_task = orig_task.template Cast<CreateTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kDestroy: {
       auto typed_task = orig_task.template Cast<DestroyTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kMonitor: {
       auto typed_task = orig_task.template Cast<MonitorTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kRegisterTarget: {
       auto typed_task = orig_task.template Cast<RegisterTargetTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kUnregisterTarget: {
       auto typed_task = orig_task.template Cast<UnregisterTargetTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kListTargets: {
       auto typed_task = orig_task.template Cast<ListTargetsTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kStatTargets: {
       auto typed_task = orig_task.template Cast<StatTargetsTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kGetOrCreateTag: {
       auto typed_task = orig_task.template Cast<core::GetOrCreateTagTask<core::CreateParams>>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kPutBlob: {
       auto typed_task = orig_task.template Cast<PutBlobTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kGetBlob: {
       auto typed_task = orig_task.template Cast<GetBlobTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kReorganizeBlob: {
       auto typed_task = orig_task.template Cast<ReorganizeBlobTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kDelBlob: {
       auto typed_task = orig_task.template Cast<DelBlobTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kDelTag: {
       auto typed_task = orig_task.template Cast<DelTagTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kGetTagSize: {
       auto typed_task = orig_task.template Cast<GetTagSizeTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kPollTelemetryLog: {
       auto typed_task = orig_task.template Cast<PollTelemetryLogTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kGetBlobScore: {
       auto typed_task = orig_task.template Cast<GetBlobScoreTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kGetBlobSize: {
       auto typed_task = orig_task.template Cast<GetBlobSizeTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kGetContainedBlobs: {
       auto typed_task = orig_task.template Cast<GetContainedBlobsTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kGetBlobInfo: {
       auto typed_task = orig_task.template Cast<GetBlobInfoTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kTagQuery: {
       auto typed_task = orig_task.template Cast<TagQueryTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kBlobQuery: {
       auto typed_task = orig_task.template Cast<BlobQueryTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kGetTargetInfo: {
       auto typed_task = orig_task.template Cast<GetTargetInfoTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kFlushMetadata: {
       auto typed_task = orig_task.template Cast<FlushMetadataTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kFlushData: {
       auto typed_task = orig_task.template Cast<FlushDataTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kSemanticSearch: {
       auto typed_task = orig_task.template Cast<SemanticSearchTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     case Method::kTemporalSearch: {
       auto typed_task = orig_task.template Cast<TemporalSearchTask>();
-      typed_task->Aggregate(replica_task);
+      typed_task->AggregateOut(replica_task);
       break;
     }
     default: {
-      orig_task->Aggregate(replica_task);
+      orig_task->AggregateOut(replica_task);
       break;
     }
   }

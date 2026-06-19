@@ -86,7 +86,7 @@ void BatchManager::BuildAndSubmit(Worker * /*worker*/, const GroupKey &key,
     return;
   }
 
-  // Aggregate task = a copy of the first member; merge the rest in as inputs.
+  // Aggregate task = a copy of the first member; combine the rest in as inputs.
   ctp::ipc::FullPtr<Task> agg =
       container->NewCopyTask(key.method, group.members[0], /*deep=*/true);
   if (agg.IsNull()) {
@@ -146,11 +146,24 @@ void BatchManager::OnAggregateComplete(Worker *worker,
   }
 
   u32 rc = agg->GetReturnCode();
+  ContainerId completer = agg->GetCompleter();
+  u32 method = agg->method_;
+
+  // Serialize the aggregate's OUT fields once. ManyToOne distributes the single
+  // collective result to every member via SerializeOut copy-back (the original
+  // spec's `member->SerializeOut(aggregate)`), NOT AggregateOut — that is the
+  // replica-gather (N->1) merge. Here it is one result broadcast 1->N.
+  chi::priv::vector<char> out_buf(CLIO_PRIV_ALLOC);
+  chi::DefaultSaveArchive save_ar(chi::LocalMsgType::kSerializeOut, out_buf);
+  container->LocalSaveTask(method, save_ar, agg);
+
   for (auto &member : members) {
-    // Broadcast: copy the aggregate's OUT into each original (collective).
-    container->Aggregate(member->method_, member, agg);
+    // Copy the aggregate's OUT into this member (broadcast).
+    chi::DefaultLoadArchive load_ar(save_ar.GetMutableData());
+    load_ar.Reset(chi::LocalMsgType::kSerializeOut);
+    container->LocalLoadTask(member->method_, load_ar, member);
     member->SetReturnCode(rc);
-    member->SetCompleter(agg->GetCompleter());
+    member->SetCompleter(completer);
     // Complete the original: local future signal or remote SendOut.
     RunContext *m_rctx = member->GetRunCtx();
     if (m_rctx == nullptr) {

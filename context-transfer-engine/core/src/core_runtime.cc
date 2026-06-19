@@ -1143,7 +1143,7 @@ chi::TaskResume Runtime::PutBlob(ctp::ipc::FullPtr<PutBlobTask> task,
       // tag's name lives on whichever container `GetOrCreateTag`'s
       // `DirectHash(tag_name)` selected; this container only owns the
       // blobs that `HashBlobToContainer(tag_id, blob_name)` routed
-      // here. To keep the `GetTagSize` broadcast-and-Aggregate sum
+      // here. To keep the `GetTagSize` broadcast-and-AggregateOut sum
       // correct, every container that holds any of the tag's bytes
       // must carry a `TagInfo` whose `total_size_` reflects its share.
       // The silent-skip variant of this block dropped the accounting
@@ -3416,7 +3416,7 @@ chi::TaskResume Runtime::TagQuery(ctp::ipc::FullPtr<TagQueryTask> task,
           }
         });
 
-    // Total matched tags (summed across replicas during Aggregate)
+    // Total matched tags (summed across replicas during AggregateOut)
     task->total_tags_matched_ = matching_tags.size();
 
     // Build results: just tag names matching the query. Respect max_tags_ if

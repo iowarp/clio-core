@@ -10,7 +10,7 @@
  *
  * The per-method tests in test_autogen_coverage.cc exercise the autogen
  * lib_exec dispatch functions (SaveTask, LoadTask, AllocLoadTask,
- * LocalSaveTask, LocalLoadTask, LocalAllocLoadTask, NewCopyTask, Aggregate)
+ * LocalSaveTask, LocalLoadTask, LocalAllocLoadTask, NewCopyTask, AggregateOut)
  * only for the low-numbered methods. This file sweeps EVERY method id of the
  * admin, bdev, and MOD_NAME modules through the full dispatch battery so the
  * remaining switch arms (and the task serialization/copy code in the
@@ -145,12 +145,12 @@ void SweepMethod(chi::Container &container, chi::u32 method) {
     }
   }
 
-  // --- Aggregate via the container dispatch switch (the per-method tests
-  // call task->Aggregate directly, leaving the dispatch arms uncovered).
+  // --- AggregateOut via the container dispatch switch (the per-method tests
+  // call task->AggregateOut directly, leaving the dispatch arms uncovered).
   {
     auto replica = container.NewTask(method);
     if (!replica.IsNull()) {
-      container.Aggregate(method, task, replica);
+      container.AggregateOut(method, task, replica);
       container.DelTask(method, replica);
     }
   }

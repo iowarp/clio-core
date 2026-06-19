@@ -137,11 +137,11 @@ struct FlushTask : public chi::Task {
   }
 
   /**
-   * Aggregate replica results into this task
+   * AggregateOut replica results into this task
    * @param other Pointer to the replica task to aggregate from
    */
-  void Aggregate(const ctp::ipc::FullPtr<chi::Task> &other_base) {
-    Task::Aggregate(other_base);
+  void AggregateOut(const ctp::ipc::FullPtr<chi::Task> &other_base) {
+    Task::AggregateOut(other_base);
     Copy(other_base.template Cast<FlushTask>());
   }
 };

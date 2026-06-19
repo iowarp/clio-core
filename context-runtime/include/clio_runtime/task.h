@@ -465,12 +465,12 @@ class Task {
    * tasks Sets this task's return code to the replica's return code if replica
    * has non-zero return code Accepts any task type that inherits from Task
    *
-   * IMPORTANT: Derived classes that override Aggregate MUST call
-   * Task::Aggregate(replica_task) first before aggregating their own fields.
+   * IMPORTANT: Derived classes that override AggregateOut MUST call
+   * Task::AggregateOut(replica_task) first before aggregating their own fields.
    *
    * @param replica_task The replica task to aggregate from
    */
-  void Aggregate(const ctp::ipc::FullPtr<Task>& replica_task) {
+  void AggregateOut(const ctp::ipc::FullPtr<Task>& replica_task) {
     // Propagate return code from replica to this task
     if (!replica_task.IsNull() && replica_task->GetReturnCode() != 0) {
       SetReturnCode(replica_task->GetReturnCode());

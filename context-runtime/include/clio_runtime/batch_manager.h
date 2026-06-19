@@ -33,13 +33,15 @@ class Worker;
  * (batch_for_ns, measured from the first arrival) elapses, the group is
  * flushed:
  *   1. A synthetic aggregate task is built as a copy of the first member,
- *      and each remaining member is merged in via Container::Aggregate
- *      (collective input combine).
+ *      and each remaining member's INPUTS are combined in via
+ *      Container::AggregateIn (the collective input combine).
  *   2. The aggregate task runs once (flagged TASK_BATCH_AGGREGATE).
  *   3. On completion (Worker::EndTask), the aggregate's OUT is broadcast back
- *      into every original task via Container::Aggregate, and each original is
- *      completed through Worker::EndTask (local future signal or remote
- *      SendOut to its return node).
+ *      into every original task via a SerializeOut copy (LocalSaveTask/
+ *      LocalLoadTask, kSerializeOut) — one result distributed 1->N, distinct
+ *      from AggregateOut which is the replica-gather N->1 merge — and each
+ *      original is completed through Worker::EndTask (local future signal or
+ *      remote SendOut to its return node).
  */
 class BatchManager {
  public:

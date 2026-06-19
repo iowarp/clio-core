@@ -1095,7 +1095,7 @@ chi::TaskResume Runtime::PollNodeLoad(ctp::ipc::FullPtr<PollNodeLoadTask> task,
     prev_cpu_times_ = cur;
   }
 
-  // Aggregate worker load across all workers on this node.
+  // AggregateOut worker load across all workers on this node.
   auto* orchestrator = CLIO_WORK_ORCHESTRATOR;
   if (orchestrator) {
     std::size_t num_workers = orchestrator->GetWorkerCount();

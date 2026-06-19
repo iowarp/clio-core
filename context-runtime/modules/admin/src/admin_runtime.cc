@@ -70,7 +70,7 @@ namespace clio::run::admin {
 // Method implementations for Runtime class
 
 // Virtual method implementations (Init, Run, Del, SaveTask, LoadTask, NewCopy,
-// Aggregate) now in autogen/admin_lib_exec.cc
+// AggregateOut) now in autogen/admin_lib_exec.cc
 
 //===========================================================================
 // Method implementations
