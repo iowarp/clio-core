@@ -1003,30 +1003,19 @@ if(CLIO_CORE_ENABLE_TESTS)
   set_tests_properties(${_msan_skip_tests} PROPERTIES LABELS "msan_skip")
 endif()
 
-# macOS: the cross-process client/transport tests reach the runtime through a
-# ZeroMQ DEALER->ROUTER handshake (WaitForLocalServer always probes over ZMQ
-# regardless of the test's data mode). On macOS the daemon receives the request
-# but every ROUTER reply to the connected DEALER's known identity fails
-# EHOSTUNREACH -- a libzmq-on-Darwin outbound-routing anomaly that persists even
-# when the send is issued from the same thread that received the request and
-# even with an explicit ZMQ_IDENTITY (see issue #482). Disable (not silently
-# exclude) the affected tests on macOS so the rest of the suite can gate; the
-# IPC unix-socket transport variants are unaffected and stay enabled.
-if(APPLE)
-  set(_macos_zmq_router_disabled
-    cr_per_process_shm_tests
-    cr_external_client_basic_connection
-    cr_external_client_multiple_clients
-    cr_external_client_operations
-    cr_ipc_transport_shm
-    cr_ipc_transport_tcp
-    cr_ipc_transport_default
-    cr_client_retry_server_restart_tcp
-    cr_client_retry_client_death_tcp
-    cr_client_retry_client_death_shm
-  )
-  set_tests_properties(${_macos_zmq_router_disabled} PROPERTIES DISABLED TRUE)
-endif()
+# macOS (issue #482, fixed): the cross-process client/transport tests reach the
+# runtime through a ZeroMQ DEALER->ROUTER handshake (WaitForLocalServer always
+# probes over ZMQ regardless of the test's data mode). libzmq-on-Darwin cannot
+# route a ROUTER reply back to a connected DEALER cross-process -- not just over
+# TCP loopback but over ipc:// too (the in-process #490 ipc:// workaround did not
+# fix the cross-process case). The client<->runtime control path now uses the
+# non-ZMQ unix-domain SocketTransport on macOS (ClientInit / WaitForLocalServer /
+# ReconnectToOriginalHost in ipc_manager.cc), which is connection-oriented and
+# routes replies over the same fd with no identity routing -- exactly the path
+# the kIpc tests (cr_ipc_transport_ipc, cr_client_retry_*_ipc) already take, and
+# which passes on macOS 14+. ipc_mode_ is unchanged, so SHM mode keeps its
+# shared-memory data path. So the tests are enabled again on macOS; they keep the
+# msan_skip label (multiprocess + uninstrumented libzmq) applied above.
 
 # Custom targets for running specific test categories
 add_custom_target(test_runtime

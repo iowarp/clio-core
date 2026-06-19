@@ -38,6 +38,7 @@
 #include <string>
 #include <vector>
 #include <atomic>
+#include <shared_mutex>
 #include "clio_runtime/types.h"
 
 namespace clio::run {
@@ -304,11 +305,30 @@ class PoolManager {
    */
   Container* GetContainerRaw(PoolId pool_id, ContainerId container_id) const;
 
+  /**
+   * Internal: erase a pool's metadata entry under the write lock. Used by the
+   * CreatePool error paths and DestroyPool so they don't touch pool_metadata_
+   * without holding pool_metadata_mutex_.
+   * @param pool_id Pool identifier
+   */
+  void ErasePoolMetadata(PoolId pool_id);
+
   bool is_initialized_ = false;
 
   // Map PoolId to pool metadata (contains containers, address map, etc.)
   std::unordered_map<PoolId, PoolInfo> pool_metadata_;
-  
+
+  // Guards pool_metadata_ (and the PoolInfo contents reachable through it)
+  // against concurrent access by worker threads. Lookups on the hot task-
+  // routing path (GetStaticContainer/GetContainer via IpcManager::RouteTask)
+  // run on workers while CreatePool/UpdatePoolMetadata insert (and rehash) the
+  // map from another worker; without this lock a concurrent rehash tears the
+  // bucket array and find() dereferences null (issue #572). Readers take a
+  // shared lock, structural/PoolInfo mutators take an exclusive lock. Locks are
+  // always scoped to a single map operation so the lock is never held across
+  // CreatePool's co_await.
+  mutable std::shared_mutex pool_metadata_mutex_;
+
   // Pool ID counter for generating unique IDs (used as minor number)
   std::atomic<u32> next_pool_minor_{5}; // Start at 5 for safety, 1 reserved for admin
 
