@@ -33,7 +33,8 @@ namespace clio::cte::filesystem {
   X(kStatSize, StatSizeTask, StatSize)    \
   X(kAppendSequence, AppendSequenceTask, AppendSequence)    \
   X(kAppendCollect, AppendCollectTask, AppendCollect)       \
-  X(kAppendExecution, AppendExecutionTask, AppendExecution)
+  X(kAppendExecution, AppendExecutionTask, AppendExecution) \
+  X(kAppendPlan, AppendPlanTask, AppendPlan)
 
 void Runtime::Init(const chi::PoolId &pool_id, const std::string &pool_name,
                    chi::u32 container_id) {

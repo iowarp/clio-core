@@ -33,10 +33,11 @@ GLOBAL_CROSS_CONST chi::u32 kStatSize = 22;
 GLOBAL_CROSS_CONST chi::u32 kLink = 23;
 // Deferred-append pipeline (collective, log-structured appends):
 GLOBAL_CROSS_CONST chi::u32 kAppendSequence = 24;   // periodic local queue drain
-GLOBAL_CROSS_CONST chi::u32 kAppendCollect = 25;    // ManyToOne collect+plan per tag
+GLOBAL_CROSS_CONST chi::u32 kAppendCollect = 25;    // ManyToOne collect (synchronous)
 GLOBAL_CROSS_CONST chi::u32 kAppendExecution = 26;  // merge a plan slice into pages
+GLOBAL_CROSS_CONST chi::u32 kAppendPlan = 27;       // sort+plan+dispatch (suspendable)
 
-GLOBAL_CROSS_CONST chi::u32 kMaxMethodId = 27;
+GLOBAL_CROSS_CONST chi::u32 kMaxMethodId = 28;
 
 inline const std::vector<std::string>& GetMethodNames() {
   static const std::vector<std::string> names = [] {
@@ -61,6 +62,7 @@ inline const std::vector<std::string>& GetMethodNames() {
     v[24] = "AppendSequence";
     v[25] = "AppendCollect";
     v[26] = "AppendExecution";
+    v[27] = "AppendPlan";
     return v;
   }();
   return names;

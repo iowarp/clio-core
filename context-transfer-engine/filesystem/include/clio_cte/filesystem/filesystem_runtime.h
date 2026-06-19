@@ -52,6 +52,7 @@ class Runtime : public chi::Container {
   // ---- deferred-append pipeline ----
   chi::TaskResume AppendSequence(ctp::ipc::FullPtr<AppendSequenceTask> task, chi::RunContext &ctx);
   chi::TaskResume AppendCollect(ctp::ipc::FullPtr<AppendCollectTask> task, chi::RunContext &ctx);
+  chi::TaskResume AppendPlan(ctp::ipc::FullPtr<AppendPlanTask> task, chi::RunContext &ctx);
   chi::TaskResume AppendExecution(ctp::ipc::FullPtr<AppendExecutionTask> task, chi::RunContext &ctx);
 
   // ---- Container virtuals (defined in autogen/filesystem_lib_exec.cc) ----

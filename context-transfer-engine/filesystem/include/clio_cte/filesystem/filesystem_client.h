@@ -157,6 +157,16 @@ class Client : public clio::cte::core::Client {
     return ipc->Send(task);
   }
 
+  /** Plan + dispatch one tag's batch (suspendable; submitted by AppendCollect). */
+  chi::Future<AppendPlanTask> AsyncAppendPlan(
+      const clio::cte::core::TagId &tag_id,
+      const std::vector<AppendEntry> &entries, const chi::PoolQuery &pool_query) {
+    auto *ipc = CLIO_CPU_IPC;
+    auto task = ipc->NewTask<AppendPlanTask>(chi::CreateTaskId(), pool_id_,
+                                             pool_query, tag_id, entries);
+    return ipc->Send(task);
+  }
+
   /** Apply a slice of the merge plan (GetBlob->PutBlob->DelBlob). */
   chi::Future<AppendExecutionTask> AsyncAppendExecution(
       const clio::cte::core::TagId &tag_id,

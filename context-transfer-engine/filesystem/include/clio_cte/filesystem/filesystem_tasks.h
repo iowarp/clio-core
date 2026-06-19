@@ -473,6 +473,34 @@ struct AppendCollectTask : public chi::Task {
   }
 };
 
+/**
+ * AppendPlan: a REGULAR (suspendable) task that does the heavy planning work
+ * for one tag's batch. Submitted by the synchronous AppendCollect aggregate
+ * (the ManyToOne synthetic aggregate task can't itself suspend). Sorts the
+ * batch, reads the file tail, builds the page-merge plan, and dispatches
+ * AppendExecution slices.
+ */
+struct AppendPlanTask : public chi::Task {
+  IN clio::cte::core::TagId tag_id_;
+  IN std::vector<AppendEntry> entries_;
+  AppendPlanTask()
+      : chi::Task(), tag_id_(clio::cte::core::TagId::GetNull()) {}
+  explicit AppendPlanTask(const chi::TaskId &task_id, const chi::PoolId &pool_id,
+                          const chi::PoolQuery &pool_query,
+                          const clio::cte::core::TagId &tag_id,
+                          const std::vector<AppendEntry> &entries)
+      : chi::Task(task_id, pool_id, pool_query, Method::kAppendPlan),
+        tag_id_(tag_id), entries_(entries) {}
+  void Copy(const ctp::ipc::FullPtr<AppendPlanTask> &o) {
+    Task::Copy(o.template Cast<Task>());
+    tag_id_ = o->tag_id_; entries_ = o->entries_;
+  }
+  template <typename Ar> void SerializeIn(Ar &ar) {
+    Task::SerializeIn(ar); ar(tag_id_, entries_);
+  }
+  template <typename Ar> void SerializeOut(Ar &ar) { Task::SerializeOut(ar); }
+};
+
 /** AppendExecution: apply a slice of the merge plan (GetBlob->PutBlob->DelBlob). */
 struct AppendExecutionTask : public chi::Task {
   IN clio::cte::core::TagId tag_id_;          // destination file tag

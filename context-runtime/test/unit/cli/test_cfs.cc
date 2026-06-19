@@ -545,24 +545,26 @@ TEST_CASE("Cfs - filesystem chimod open/write/getattr/read/truncate",
     REQUIRE(ah != 0);
 
     constexpr chi::u64 kChunk = 4096;
-    const char marks[3] = {'A', 'B', 'C'};
-    std::string expected;
-    for (int c = 0; c < 3; ++c) {
+    constexpr int kNum = 16;  // concurrent stress (probe for corruption)
+    std::vector<ctp::ipc::FullPtr<char>> abufs;
+    std::vector<chi::Future<clio::cte::filesystem::AppendTask>> afuts;
+    for (int c = 0; c < kNum; ++c) {
+      char mark = static_cast<char>('a' + c);
       ctp::ipc::FullPtr<char> ab = ipc->AllocateBuffer(kChunk);
       REQUIRE(!ab.IsNull());
-      memset(ab.ptr_, marks[c], kChunk);
-      expected.append(kChunk, marks[c]);
-      // Await each: sequential appends => (UTC, logical) order == this order.
-      auto ap = cfs.AsyncAppend(ah, kChunk, ab.shm_.template Cast<void>());
-      ap.Wait();
-      REQUIRE(ap->GetReturnCode() == 0);
-      ipc->FreeBuffer(ab);
+      memset(ab.ptr_, mark, kChunk);
+      abufs.push_back(ab);
+      afuts.push_back(cfs.AsyncAppend(ah, kChunk, ab.shm_.template Cast<void>()));
     }
-    const chi::u64 total = kChunk * 3;
+    for (auto &f : afuts) { f.Wait(); REQUIRE(f->GetReturnCode() == 0); }
+    for (auto &ab : abufs) ipc->FreeBuffer(ab);
+    const chi::u64 total = kChunk * kNum;
 
-    // The periodic AppendSequence -> AppendCollect (ManyToOne) -> AppendExecution
-    // pipeline merges asynchronously; poll-read until the ordered concatenation
-    // appears.
+    // Concurrent appends are ordered by (UTC, logical), not submission order, so
+    // we don't pin the order. The pipeline (periodic AppendSequence -> ManyToOne
+    // AppendCollect -> AppendPlan -> AppendExecution) must merge them with no
+    // overlap or corruption: poll-read until the file is exactly kNum back-to-
+    // back kChunk regions, each a single distinct marker, all present once.
     bool matched = false;
     for (int attempt = 0; attempt < 400 && !matched; ++attempt) {
       ctp::ipc::FullPtr<char> rb = ipc->AllocateBuffer(total);
@@ -570,16 +572,26 @@ TEST_CASE("Cfs - filesystem chimod open/write/getattr/read/truncate",
       memset(rb.ptr_, 0, total);
       auto r = cfs.AsyncRead(ah, 0, total, rb.shm_.template Cast<void>());
       r.Wait();
-      if (r->GetReturnCode() == 0 && r->bytes_read_ == total &&
-          memcmp(rb.ptr_, expected.data(), total) == 0) {
-        matched = true;
+      bool ok = (r->GetReturnCode() == 0 && r->bytes_read_ == total);
+      if (ok) {
+        std::set<char> seen;
+        for (int c = 0; c < kNum && ok; ++c) {
+          const char *region = rb.ptr_ + static_cast<size_t>(c) * kChunk;
+          char m = region[0];
+          for (chi::u64 i = 0; i < kChunk; ++i) {
+            if (region[i] != m) { ok = false; break; }
+          }
+          if (ok && m >= 'a' && m < 'a' + kNum) seen.insert(m);
+          else ok = false;
+        }
+        if (ok && seen.size() == static_cast<size_t>(kNum)) matched = true;
       }
       ipc->FreeBuffer(rb);
       if (!matched) {
         std::this_thread::sleep_for(std::chrono::milliseconds(25));
       }
     }
-    REQUIRE(matched);  // appends merged into the file in order
+    REQUIRE(matched);  // all appends merged intact into their own regions
 
     auto acl = cfs.AsyncClose(ah);
     acl.Wait();
