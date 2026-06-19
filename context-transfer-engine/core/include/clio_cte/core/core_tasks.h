@@ -1598,8 +1598,8 @@ struct TruncateBlobTask : public chi::Task {
     new_size_ = other->new_size_;
   }
 
-  void Aggregate(const ctp::ipc::FullPtr<chi::Task> &other_base) {
-    Task::Aggregate(other_base);
+  void AggregateOut(const ctp::ipc::FullPtr<chi::Task> &other_base) {
+    Task::AggregateOut(other_base);
     Copy(other_base.template Cast<TruncateBlobTask>());
   }
 };
@@ -1736,8 +1736,8 @@ struct RenameTagTask : public chi::Task {
     new_name_ = other->new_name_;
   }
 
-  void Aggregate(const ctp::ipc::FullPtr<chi::Task> &other_base) {
-    Task::Aggregate(other_base);
+  void AggregateOut(const ctp::ipc::FullPtr<chi::Task> &other_base) {
+    Task::AggregateOut(other_base);
     Copy(other_base.template Cast<RenameTagTask>());
   }
 };
@@ -1801,8 +1801,8 @@ struct GetOrCreateTagAliasTask : public chi::Task {
 
   // Broadcast aggregation: the alias exists if ANY container confirmed the
   // target, and the resolved id is whichever non-null id a replica reported.
-  void Aggregate(const ctp::ipc::FullPtr<chi::Task> &other_base) {
-    Task::Aggregate(other_base);
+  void AggregateOut(const ctp::ipc::FullPtr<chi::Task> &other_base) {
+    Task::AggregateOut(other_base);
     auto other = other_base.template Cast<GetOrCreateTagAliasTask>();
     if (other->found_) {
       found_ = 1;
@@ -1870,8 +1870,8 @@ struct GetTagNameTask : public chi::Task {
 
   // Broadcast aggregation: keep the answer from whichever container owns the
   // tag (the one that set found_ and a non-empty resolved name).
-  void Aggregate(const ctp::ipc::FullPtr<chi::Task> &other_base) {
-    Task::Aggregate(other_base);
+  void AggregateOut(const ctp::ipc::FullPtr<chi::Task> &other_base) {
+    Task::AggregateOut(other_base);
     auto other = other_base.template Cast<GetTagNameTask>();
     if (other->found_ && !found_) {
       found_ = 1;
