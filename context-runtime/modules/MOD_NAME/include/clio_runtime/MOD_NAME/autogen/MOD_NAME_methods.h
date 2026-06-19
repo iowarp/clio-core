@@ -25,8 +25,9 @@ GLOBAL_CROSS_CONST chi::u32 kWaitTest = 23;
 GLOBAL_CROSS_CONST chi::u32 kTestLargeOutput = 24;
 GLOBAL_CROSS_CONST chi::u32 kGpuSubmit = 25;
 GLOBAL_CROSS_CONST chi::u32 kSubtaskTest = 26;
+GLOBAL_CROSS_CONST chi::u32 kManyToOneSum = 27;
 
-GLOBAL_CROSS_CONST chi::u32 kMaxMethodId = 27;
+GLOBAL_CROSS_CONST chi::u32 kMaxMethodId = 28;
 
 inline const std::vector<std::string>& GetMethodNames() {
   static const std::vector<std::string> names = [] {
@@ -41,6 +42,7 @@ inline const std::vector<std::string>& GetMethodNames() {
     v[24] = "TestLargeOutput";
     v[25] = "GpuSubmit";
     v[26] = "SubtaskTest";
+    v[27] = "ManyToOneSum";
     return v;
   }();
   return names;

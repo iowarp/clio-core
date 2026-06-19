@@ -551,6 +551,28 @@ class ChiModGenerator {
     oss << "  }\n";
     oss << "}\n";
     oss << "\n";
+    // Generate AggregateIn method - dispatches to typed task's AggregateIn
+    // (ManyToOne collective input combine; default per-task is a no-op).
+    oss << "void Runtime::AggregateIn(chi::u32 method, ctp::ipc::FullPtr<chi::Task> agg_task,\n";
+    oss << "                        const ctp::ipc::FullPtr<chi::Task>& member_task) {\n";
+    oss << "  switch (method) {\n";
+
+    for (const auto& method : methods) {
+      std::string task_type = GetTaskTypeName(method.method_name, chimod_name);
+      oss << "    case Method::" << method.constant_name << ": {\n";
+      oss << "      auto typed_task = agg_task.template Cast<" << task_type << ">();\n";
+      oss << "      typed_task->AggregateIn(member_task);\n";
+      oss << "      break;\n";
+      oss << "    }\n";
+    }
+
+    oss << "    default: {\n";
+    oss << "      agg_task->AggregateIn(member_task);\n";
+    oss << "      break;\n";
+    oss << "    }\n";
+    oss << "  }\n";
+    oss << "}\n";
+    oss << "\n";
 
     // Generate DelTask method - dispatches to typed task deletion
     oss << "void Runtime::DelTask(chi::u32 method, ctp::ipc::FullPtr<chi::Task> task_ptr) {\n";

@@ -484,6 +484,20 @@ class Task {
   }
 
   /**
+   * Combine a batched member's INPUTS into this aggregate task (ManyToOne).
+   * Counterpart to AggregateOut: AggregateOut merges a replica's OUT fields
+   * (N->1 gather), while AggregateIn folds a member's IN fields into the single
+   * collective aggregate task that runs once for the batch. Default is a no-op
+   * (aggregate = copy of the first member: a barrier/dedup collective). Derived
+   * tasks whose collective combines inputs (sum, max, concat, ...) override it.
+   *
+   * @param member_task The batched member whose inputs are folded in
+   */
+  void AggregateIn(const ctp::ipc::FullPtr<Task>& member_task) {
+    (void)member_task;
+  }
+
+  /**
    * Get the copy space size for serialized task output
    * Derived classes can override to specify custom copy space sizes
    * Default is 4KB (4096 bytes) for most tasks
