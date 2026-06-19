@@ -41,15 +41,13 @@
 #ifdef __linux__
 #include <linux/limits.h>  // PATH_MAX on some Linux toolchains
 #endif
-// LCOV_EXCL_START — compile-time fallback, unreachable on standard Linux
+// LCOV_EXCL_START ΓÇö compile-time fallback, unreachable on standard Linux
 #ifndef PATH_MAX
 #define PATH_MAX 4096  // POSIX default; not always in <climits> under NVHPC
 #endif
 // LCOV_EXCL_STOP
 #include <cstdlib>
-#include <cstdio>
 #include <string>
-#include <iterator>
 
 #include "clio_ctp/constants/macros.h"
 // MSan: inform sanitizer that mmap-backed memory is initialized by the kernel
@@ -533,7 +531,7 @@ bool SystemInfo::CreateNewSharedMemory(File &fd, const std::string &name,
 #endif
 #elif CTP_ENABLE_WINDOWS_SYSINFO
   // POSIX shared memory names start with `/` (e.g. "/ctp_shm_42"). Win32
-  // kernel object names can't contain `/`, so map to "Local\<base>" — the
+  // kernel object names can't contain `/`, so map to "Local\<base>" ΓÇö the
   // per-session namespace, which is right for single-host SHM. Without
   // this the mapping was created anonymously (nullptr name) and could
   // not be reopened by name, breaking every OpenSharedMemory.
@@ -1019,202 +1017,7 @@ void SystemInfo::Setenv(const char *name, const std::string &value,
   // reads) and the Win32 process environment block (which
   // GetEnvironmentVariable reads). SetEnvironmentVariable only touches
   // the Win32 block, which would leave std::getenv blind to the new
-  // value — and chi::env::GetCompat goes through std::getenv. Honor the
-  // overwrite flag manually since _putenv_s always overwrites.
-  if (!overwrite) {
-    char probe[2];
-    if (::GetEnvironmentVariableA(name, probe, sizeof(probe)) != 0) {
-      return;  // already set, caller asked us not to overwrite
-    }
-  }
-  (void)_putenv_s(name, value.c_str());
-#endif
-}
-
-void SystemInfo::Unsetenv(const char *name) {
-#if CTP_ENABLE_PROCFS_SYSINFO
-  unsetenv(name);
-#elif CTP_ENABLE_WINDOWS_SYSINFO
-  // Setting an env var to an empty string via _putenv_s removes it from
-  // both the CRT and Win32 environment blocks.
-  (void)_putenv_s(name, "");
-#endif
-}
-
-SharedLibrary::SharedLibrary(const std::string &name) : handle_(nullptr) {
-  Load(name);
-}
-
-SharedLibrary::~SharedLibrary() {
-  if (handle_) {
-#if CTP_ENABLE_PROCFS_SYSINFO
-    dlclose(handle_);
-#elif CTP_ENABLE_WINDOWS_SYSINFO
-    ::FreeLibrary((HMODULE)handle_);
-#endif
-    handle_ = nullptr;
-  }
-}
-
-void SharedLibrary::Load(const std::string &name) {
-#if CTP_ENABLE_PROCFS_SYSINFO
-  handle_ = dlopen(name.c_str(), RTLD_GLOBAL | RTLD_NOW);
-#elif CTP_ENABLE_WINDOWS_SYSINFO
-  handle_ = LoadLibraryA(name.c_str());
-  if (!handle_) {
-    DWORD err = ::GetLastError();
-    char *buf = nullptr;
-    DWORD len = ::FormatMessageA(
-        FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM |
-            FORMAT_MESSAGE_IGNORE_INSERTS,
-        nullptr, err, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
-        reinterpret_cast<LPSTR>(&buf), 0, nullptr);
-    if (buf) {
-      error_string_.assign(buf, len);
-      ::LocalFree(buf);
-    } else {
-      error_string_ = "LoadLibraryA failed: " + std::to_string(err);
-    }
-  } else {
-    error_string_.clear();
-  }
-#endif
-}
-
-std::string SharedLibrary::GetError() const {
-#if CTP_ENABLE_PROCFS_SYSINFO
-  const char *err = dlerror();
-  return err ? std::string(err) : std::string();
-#elif CTP_ENABLE_WINDOWS_SYSINFO
-  return error_string_;
-#endif
-}
-
-void *SharedLibrary::GetSymbol(const std::string &name) {
-#if CTP_ENABLE_PROCFS_SYSINFO
-  return dlsym(handle_, name.c_str());
-#elif CTP_ENABLE_WINDOWS_SYSINFO
-  return (void *)::GetProcAddress((HMODULE)handle_, name.c_str());
-#endif
-}
-
-SharedLibrary::SharedLibrary(SharedLibrary &&other) noexcept
-    : handle_(other.handle_) {
-  other.handle_ = nullptr;
-}
-
-    return ips;
-  }
-  for (struct addrinfo *p = res; p != nullptr; p = p->ai_next) {
-    char buf[INET6_ADDRSTRLEN] = {0};
-    if (p->ai_family == AF_INET) {
-      auto *sa = reinterpret_cast<struct sockaddr_in *>(p->ai_addr);
-      if (inet_ntop(AF_INET, &sa->sin_addr, buf, sizeof(buf))) {
-        ips.emplace_back(buf);
-      }
-    } else if (p->ai_family == AF_INET6) {
-      auto *sa = reinterpret_cast<struct sockaddr_in6 *>(p->ai_addr);
-      if (inet_ntop(AF_INET6, &sa->sin6_addr, buf, sizeof(buf))) {
-        std::string s(buf);
-        auto pct = s.find('%');
-        ips.push_back(pct == std::string::npos ? s : s.substr(0, pct));
-      }
-    }
-  }
-  freeaddrinfo(res);
-  return ips;
-}
-
-std::vector<std::string> SystemInfo::ListDirectory(const std::string &path) {
-  std::vector<std::string> entries;
-#if CTP_ENABLE_PROCFS_SYSINFO
-  DIR *dir = opendir(path.c_str());
-  if (dir == nullptr) return entries;
-  while (struct dirent *entry = readdir(dir)) {
-    if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
-      continue;
-    }
-    entries.emplace_back(entry->d_name);
-  }
-  closedir(dir);
-#elif CTP_ENABLE_WINDOWS_SYSINFO
-  std::error_code ec;
-  if (!std::filesystem::is_directory(path, ec)) return entries;
-  for (auto &p : std::filesystem::directory_iterator(path, ec)) {
-    if (ec) break;
-    entries.push_back(p.path().filename().string());
-  }
-#endif
-  return entries;
-}
-
-bool SystemInfo::RemoveFile(const std::string &path) {
-#if CTP_ENABLE_PROCFS_SYSINFO
-  return ::unlink(path.c_str()) == 0;
-#elif CTP_ENABLE_WINDOWS_SYSINFO
-  std::error_code ec;
-  return std::filesystem::remove(path, ec);
-#endif
-}
-
-std::string SystemInfo::GetLibrarySearchPathVar() {
-#if CTP_ENABLE_PROCFS_SYSINFO
-  return "LD_LIBRARY_PATH";
-#elif CTP_ENABLE_WINDOWS_SYSINFO
-  return "PATH";
-#endif
-}
-
-char SystemInfo::GetPathListSeparator() {
-#if CTP_ENABLE_PROCFS_SYSINFO
-  return ':';
-#elif CTP_ENABLE_WINDOWS_SYSINFO
-  return ';';
-#endif
-}
-
-std::string SystemInfo::GetSharedLibExtension() {
-#if CTP_ENABLE_WINDOWS_SYSINFO
-  return ".dll";
-#elif __APPLE__
-  return ".dylib";
-#else
-  return ".so";
-#endif
-}
-
-std::string SystemInfo::Getenv(const char *name, size_t max_size) {
-#if CTP_ENABLE_PROCFS_SYSINFO
-  char *var = getenv(name);
-  if (var == nullptr) {
-    return "";
-  }
-  return std::string(var);
-#elif CTP_ENABLE_WINDOWS_SYSINFO
-  std::string var;
-  var.resize(max_size);
-  DWORD len = GetEnvironmentVariable(name, var.data(),
-                                     static_cast<DWORD>(var.size()));
-  if (len == 0) {
-    return "";
-  }
-  var.resize(len);
-  return var;
-#endif
-  std::cout << "undefined" << std::endl;
-  return "";
-}
-
-void SystemInfo::Setenv(const char *name, const std::string &value,
-                        int overwrite) {
-#if CTP_ENABLE_PROCFS_SYSINFO
-  setenv(name, value.c_str(), overwrite);
-#elif CTP_ENABLE_WINDOWS_SYSINFO
-  // _putenv_s updates BOTH the CRT environment block (which std::getenv
-  // reads) and the Win32 process environment block (which
-  // GetEnvironmentVariable reads). SetEnvironmentVariable only touches
-  // the Win32 block, which would leave std::getenv blind to the new
-  // value — and chi::env::GetCompat goes through std::getenv. Honor the
+  // value ΓÇö and chi::env::GetCompat goes through std::getenv. Honor the
   // overwrite flag manually since _putenv_s always overwrites.
   if (!overwrite) {
     char probe[2];
@@ -1306,24 +1109,36 @@ SharedLibrary &SharedLibrary::operator=(SharedLibrary &&other) noexcept {
   return *this;
 }
 
+/// @brief Retrieves storage device hardware health statistics.
+///
+/// Reads a JSON file left by an external admin service
+/// (e.g. a smartmontools/smartd cron job writing
+/// /tmp/iowarp_hw_health_<device>.json).  iowarp itself never needs
+/// elevated privileges; this function is purely a non-root consumer.
+///
+/// @param path  Path to the file or block device whose health to query.
+///              If not already a /dev/ node, df is used to find the backing
+///              device so the correct per-device JSON file is located.
+/// @return      JSON string with health stats, or "{}" if unavailable.
 std::string SystemInfo::GetDeviceHealthStats(const std::string &path) {
 #if CTP_ENABLE_PROCFS_SYSINFO
   std::string device = path;
 
-  // If the path is not a raw block device, find the mount's backing device
+  // If the path is not a raw block device, find the mount's backing device.
   if (path.find("/dev/") != 0) {
-    // Note: Wrapping path in quotes to handle spaces safely
-    std::string cmd = "df -P \"" + path + "\" 2>/dev/null | tail -1 | awk '{print $1}'";
+    // Quote path to handle spaces safely.
+    std::string cmd =
+        "df -P \"" + path + "\" 2>/dev/null | tail -1 | awk '{print $1}'";
     char buffer[256];
-    FILE* pipe = popen(cmd.c_str(), "r");
+    FILE *pipe = popen(cmd.c_str(), "r");
     if (pipe) {
       if (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
         std::string df_out = buffer;
         if (!df_out.empty() && df_out.back() == '\n') {
           df_out.pop_back();
         }
-        // Only use the df output if it returned a real /dev/ node 
-        // (ignoring things like 'overlay' in containers)
+        // Only use the df output if it returned a real /dev/ node
+        // (ignore things like 'overlay' in containers).
         if (df_out.find("/dev/") == 0) {
           device = df_out;
         }
@@ -1332,29 +1147,27 @@ std::string SystemInfo::GetDeviceHealthStats(const std::string &path) {
     }
   }
 
-  // Extract the basename of the device (e.g., /dev/nvme0n1 -> nvme0n1)
-  std::string basename = device;
-  size_t slash_pos = basename.find_last_of('/');
+  // Extract the basename of the device (e.g. /dev/nvme0n1 -> nvme0n1).
+  std::string dev_basename = device;
+  size_t slash_pos = dev_basename.find_last_of('/');
   if (slash_pos != std::string::npos) {
-    basename = basename.substr(slash_pos + 1);
+    dev_basename = dev_basename.substr(slash_pos + 1);
   }
 
-  // Read the health stats from a file generated by an external admin service
-  // e.g., /tmp/iowarp_hw_health_nvme0n1.json
-  std::string stats_file_path = "/tmp/iowarp_hw_health_" + basename + ".json";
-  std::ifstream stats_file(stats_file_path);
+  // Read health stats written by the external admin service.
+  // e.g. /tmp/iowarp_hw_health_nvme0n1.json
+  std::string stats_path =
+      "/tmp/iowarp_hw_health_" + dev_basename + ".json";
+  std::ifstream stats_file(stats_path);
   if (!stats_file.is_open()) {
     return "{}";
   }
 
   std::string result((std::istreambuf_iterator<char>(stats_file)),
                      std::istreambuf_iterator<char>());
-  
-  if (result.empty()) {
-    return "{}";
-  }
-  return result;
+  return result.empty() ? "{}" : result;
 #else
+  (void)path;
   return "{}";
 #endif
 }
