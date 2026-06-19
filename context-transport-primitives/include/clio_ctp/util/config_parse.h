@@ -275,10 +275,16 @@ class ConfigParse {
       size_t end = path.find("}", pos + 2);
       if (end == std::string::npos) break;
       std::string env_name = path.substr(pos + 2, end - pos - 2);
-      std::string env_val = ctp::SystemInfo::Getenv(
-          env_name.c_str(), ctp::Unit<size_t>::Megabytes(1));
-      if (env_val.empty() && env_name == "HOME") {
+      std::string env_val;
+      // Expand ${HOME} via GetHomeDir() so it stays consistent with the
+      // canonical home directory. On Windows GetHomeDir() prefers USERPROFILE
+      // over a stray HOME (e.g. set by MSYS/git), which the raw HOME env var
+      // would otherwise contradict.
+      if (env_name == "HOME") {
         env_val = ctp::SystemInfo::GetHomeDir();
+      } else {
+        env_val = ctp::SystemInfo::Getenv(
+            env_name.c_str(), ctp::Unit<size_t>::Megabytes(1));
       }
       path.replace(pos, end - pos + 1, env_val);
       pos += env_val.size();
