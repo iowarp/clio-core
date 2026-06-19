@@ -39,7 +39,7 @@
  *
  * The libexec source files implement Container virtual API methods (Run, Del,
  * SaveTask, LoadTask, AllocLoadTask, LocalLoadTask, LocalAllocLoadTask,
- * NewCopy, AggregateOut) with switch-case dispatch.
+ * NewCopy, AggregateOut, AggregateIn) with switch-case dispatch.
  *
  * Usage:
  *     chimaera repo refresh <chimod_repo_path>
