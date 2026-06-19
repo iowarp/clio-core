@@ -493,6 +493,19 @@ class Client : public chi::ContainerClient {
   }
 
   /**
+   * Get max (total) storage capacity in bytes.
+   * @param pool_query Local() sums this node's targets; Broadcast() sums the
+   *        whole cluster (AggregateOut adds per-node results). Default Local.
+   */
+  chi::Future<GetMaxCapacityTask> AsyncGetMaxCapacity(
+      const chi::PoolQuery &pool_query = chi::PoolQuery::Local()) {
+    auto *ipc_manager = CLIO_CPU_IPC;
+    auto task = ipc_manager->NewTask<GetMaxCapacityTask>(
+        chi::CreateTaskId(), pool_id_, pool_query);
+    return ipc_manager->Send(task);
+  }
+
+  /**
    * Asynchronous poll telemetry log - returns immediately
    * @param minimum_logical_time Minimum logical time filter
    * @param pool_query Pool query for task routing (default: Dynamic)

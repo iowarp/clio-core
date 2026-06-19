@@ -707,6 +707,8 @@ chi::TaskResume Runtime::RegisterTarget(ctp::ipc::FullPtr<RegisterTargetTask> ta
     }
     target_info.remaining_space_ =
         total_size;  // Use actual remaining space from bdev
+    target_info.max_capacity_ =
+        total_size;  // Total (max) capacity, fixed for the life of the target
     target_info.perf_metrics_ =
         perf_metrics;  // Store the entire PerfMetrics structure
     target_info.persistence_level_ = GetPersistenceLevelForTarget(target_name);
@@ -2176,6 +2178,30 @@ chi::TaskResume Runtime::GetTagSize(ctp::ipc::FullPtr<GetTagSizeTask> task,
     task->return_code_ = 1;
     task->tag_size_ = 0;
   }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+chi::TaskResume Runtime::GetMaxCapacity(
+    ctp::ipc::FullPtr<GetMaxCapacityTask> task, chi::RunContext &ctx) {
+#ifdef __NVCOMPILER
+  chi::RunContext &rctx = ctx;
+#else
+  (void)ctx;
+#endif
+  CLIO_TASK_BODY_BEGIN
+  // Sum the fixed capacity of every target registered on this node. A Local
+  // query returns this node's capacity; the task's AggregateOut sums replicas,
+  // so a Broadcast returns the whole cluster's capacity.
+  chi::u64 total = 0;
+  {
+    chi::ScopedCoRwReadLock read_lock(target_lock_);
+    for (const auto &t : target_list_) {
+      total += t.max_capacity_;
+    }
+  }
+  task->max_capacity_ = total;
+  task->return_code_ = 0;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }

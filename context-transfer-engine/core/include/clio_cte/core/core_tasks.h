@@ -217,6 +217,7 @@ struct TargetInfo {
   chi::u64 ops_written_;
   float target_score_;        // Target score (0-1, normalized log bandwidth)
   chi::u64 remaining_space_;  // Remaining allocatable space in bytes
+  chi::u64 max_capacity_;     // Total (max) capacity in bytes, fixed at register
   clio::run::bdev::PerfMetrics perf_metrics_;  // Performance metrics from bdev
   clio::run::bdev::PersistenceLevel persistence_level_;
   // Underlying bdev type, captured at RegisterTarget time. Used by the
@@ -233,6 +234,7 @@ struct TargetInfo {
         ops_written_(0),
         target_score_(0.0f),
         remaining_space_(0),
+        max_capacity_(0),
         persistence_level_(clio::run::bdev::PersistenceLevel::kVolatile),
         bdev_type_(clio::run::bdev::BdevType::kFile) {}
 
@@ -246,6 +248,7 @@ struct TargetInfo {
         ops_written_(0),
         target_score_(0.0f),
         remaining_space_(0),
+        max_capacity_(0),
         persistence_level_(clio::run::bdev::PersistenceLevel::kVolatile) {}
 #endif
 
@@ -260,6 +263,7 @@ struct TargetInfo {
         ops_written_(other.ops_written_),
         target_score_(other.target_score_),
         remaining_space_(other.remaining_space_),
+        max_capacity_(other.max_capacity_),
         perf_metrics_(other.perf_metrics_),
         persistence_level_(other.persistence_level_),
         bdev_type_(other.bdev_type_) {}
@@ -276,6 +280,7 @@ struct TargetInfo {
       ops_written_ = other.ops_written_;
       target_score_ = other.target_score_;
       remaining_space_ = other.remaining_space_;
+      max_capacity_ = other.max_capacity_;
       perf_metrics_ = other.perf_metrics_;
       persistence_level_ = other.persistence_level_;
       bdev_type_ = other.bdev_type_;
@@ -1941,6 +1946,58 @@ struct GetTagSizeTask : public chi::Task {
     Task::AggregateOut(other_base);
     auto replica = other_base.template Cast<GetTagSizeTask>();
     tag_size_ += replica->tag_size_;
+  }
+};
+
+/**
+ * GetMaxCapacity task - total (max) storage capacity.
+ *
+ * The handler sums max_capacity_ over the targets registered on this node, so a
+ * Local query returns this node's capacity. Because AggregateOut sums across
+ * replicas, a Broadcast query returns the whole cluster's capacity.
+ */
+struct GetMaxCapacityTask : public chi::Task {
+  OUT chi::u64 max_capacity_;  // Summed capacity in bytes
+
+  // SHM constructor
+  GetMaxCapacityTask() : chi::Task(), max_capacity_(0) {}
+
+  // Emplace constructor
+  CTP_CROSS_FUN explicit GetMaxCapacityTask(const chi::TaskId &task_id,
+                                            const chi::PoolId &pool_id,
+                                            const chi::PoolQuery &pool_query)
+      : chi::Task(task_id, pool_id, pool_query, Method::kGetMaxCapacity),
+        max_capacity_(0) {
+    task_id_ = task_id;
+    pool_id_ = pool_id;
+    method_ = Method::kGetMaxCapacity;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+    ar(max_capacity_);
+  }
+
+  void Copy(const ctp::ipc::FullPtr<GetMaxCapacityTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+    max_capacity_ = other->max_capacity_;
+  }
+
+  /**
+   * AggregateOut: sum capacity from each node so a Broadcast yields the total
+   * cluster capacity.
+   */
+  void AggregateOut(const ctp::ipc::FullPtr<chi::Task> &other_base) {
+    Task::AggregateOut(other_base);
+    max_capacity_ += other_base.template Cast<GetMaxCapacityTask>()->max_capacity_;
   }
 };
 

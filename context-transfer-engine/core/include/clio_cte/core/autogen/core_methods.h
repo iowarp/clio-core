@@ -45,8 +45,9 @@ GLOBAL_CROSS_CONST chi::u32 kTruncateBlob = 37;
 GLOBAL_CROSS_CONST chi::u32 kRenameTag = 38;
 GLOBAL_CROSS_CONST chi::u32 kGetOrCreateTagAlias = 39;
 GLOBAL_CROSS_CONST chi::u32 kGetTagName = 40;
+GLOBAL_CROSS_CONST chi::u32 kGetMaxCapacity = 41;
 
-GLOBAL_CROSS_CONST chi::u32 kMaxMethodId = 41;
+GLOBAL_CROSS_CONST chi::u32 kMaxMethodId = 42;
 
 inline const std::vector<std::string>& GetMethodNames() {
   static const std::vector<std::string> names = [] {
@@ -81,6 +82,7 @@ inline const std::vector<std::string>& GetMethodNames() {
     v[38] = "RenameTag";
     v[39] = "GetOrCreateTagAlias";
     v[40] = "GetTagName";
+    v[41] = "GetMaxCapacity";
     return v;
   }();
   return names;

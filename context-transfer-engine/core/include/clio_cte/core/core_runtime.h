@@ -199,6 +199,12 @@ public:
   chi::TaskResume GetTagSize(ctp::ipc::FullPtr<GetTagSizeTask> task, chi::RunContext &ctx);
 
   /**
+   * Get max (total) capacity — sum of max_capacity_ over targets registered on
+   * this node. Broadcast to sum across the cluster (AggregateOut adds replicas).
+   */
+  chi::TaskResume GetMaxCapacity(ctp::ipc::FullPtr<GetMaxCapacityTask> task, chi::RunContext &ctx);
+
+  /**
    * Schedule a task by resolving Dynamic pool queries.
    */
   chi::PoolQuery ScheduleTask(const ctp::ipc::FullPtr<chi::Task> &task) override;

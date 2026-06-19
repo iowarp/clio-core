@@ -53,6 +53,7 @@
 
 #include "clio_runtime/clio_runtime.h"
 #include "clio_cte/core/content_transfer_engine.h"
+#include "clio_cte/core/core_client.h"  // CLIO_CTE_CLIENT + GetMaxCapacity
 #include "clio_cte/filesystem/filesystem_client.h"
 
 using namespace clio::cae::fuse;
@@ -100,6 +101,11 @@ static void *cte_fuse_init(struct fuse_conn_info *conn,
   if (!clio::cte::filesystem::CLIO_CFS_CLIENT_INIT()) {
     fprintf(stderr, "ERROR: filesystem client init failed\n");
     return nullptr;
+  }
+  // Bind the CTE core client to the same clio_cte_core pool (idempotent) so
+  // statfs can query real capacity via GetMaxCapacity.
+  if (!clio::cte::core::CLIO_CTE_CLIENT_INIT()) {
+    fprintf(stderr, "WARNING: CTE core client init failed; statfs capacity=0\n");
   }
   return nullptr;
 }
@@ -391,28 +397,40 @@ static int cte_fuse_rename(const char *from, const char *to,
 // Main
 // ============================================================================
 
-// Report filesystem statistics. The clio filesystem is backed by elastic CTE
-// storage rather than a fixed device, so we advertise a large, mostly-free
-// synthetic capacity. Without this, statfs returns all zeros and a 0-block
-// filesystem is hidden by `df` (which lists no path) — that in turn breaks
-// tools that probe free space and xfstests' mount detection (its `_fs_type`
-// runs `df` with no path and sees nothing, so `./check` thinks the fs is not
-// mounted and tries to remount it).
+// Report filesystem statistics. Total capacity is the real cluster-wide
+// storage capacity, obtained from the CTE: GetMaxCapacity sums the registered
+// targets' capacity per node, and a Broadcast aggregates that across the
+// cluster (the task's AggregateOut sums per-node results). Reporting a non-zero
+// capacity also matters operationally: a 0-block fs is hidden by `df` (which
+// lists no path), which breaks tools that probe free space and xfstests' mount
+// detection.
 static int cte_fuse_statfs(const char *path, struct statvfs *stbuf) {
   (void)path;
   std::memset(stbuf, 0, sizeof(*stbuf));
   constexpr fsblkcnt_t kBlockSize = 4096;
-  constexpr fsblkcnt_t kTotalBlocks =
-      (static_cast<fsblkcnt_t>(1) << 40) / kBlockSize;  // ~1 TiB
-  constexpr fsfilcnt_t kTotalInodes = static_cast<fsfilcnt_t>(1) << 20;
+
+  chi::u64 capacity_bytes = 0;
+  auto *cte = CLIO_CTE_CLIENT;
+  if (cte != nullptr) {
+    // Broadcast: total capacity across the whole cluster.
+    auto t = cte->AsyncGetMaxCapacity(chi::PoolQuery::Broadcast());
+    t.Wait();
+    if (t->return_code_ == 0) {
+      capacity_bytes = t->max_capacity_;
+    }
+  }
+  fsblkcnt_t total_blocks = capacity_bytes / kBlockSize;
+
   stbuf->f_bsize = kBlockSize;
   stbuf->f_frsize = kBlockSize;
-  stbuf->f_blocks = kTotalBlocks;
-  stbuf->f_bfree = kTotalBlocks;
-  stbuf->f_bavail = kTotalBlocks;
-  stbuf->f_files = kTotalInodes;
-  stbuf->f_ffree = kTotalInodes;
-  stbuf->f_favail = kTotalInodes;
+  stbuf->f_blocks = total_blocks;
+  // Free-space accounting (used vs. free) is a follow-up; report capacity as
+  // available so writes aren't gated and df shows the real total size.
+  stbuf->f_bfree = total_blocks;
+  stbuf->f_bavail = total_blocks;
+  stbuf->f_files = static_cast<fsfilcnt_t>(1) << 20;
+  stbuf->f_ffree = static_cast<fsfilcnt_t>(1) << 20;
+  stbuf->f_favail = static_cast<fsfilcnt_t>(1) << 20;
   stbuf->f_namemax = 255;
   return 0;
 }
