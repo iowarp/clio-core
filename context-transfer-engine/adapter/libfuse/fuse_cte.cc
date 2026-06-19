@@ -53,7 +53,7 @@
 
 #include "clio_runtime/clio_runtime.h"
 #include "clio_cte/core/content_transfer_engine.h"
-#include "clio_cte/core/core_client.h"  // CLIO_CTE_CLIENT + GetMaxCapacity
+#include "clio_cte/core/core_client.h"  // CLIO_CTE_CLIENT + GetCapacity
 #include "clio_cte/filesystem/filesystem_client.h"
 
 using namespace clio::cae::fuse;
@@ -103,7 +103,7 @@ static void *cte_fuse_init(struct fuse_conn_info *conn,
     return nullptr;
   }
   // Bind the CTE core client to the same clio_cte_core pool (idempotent) so
-  // statfs can query real capacity via GetMaxCapacity.
+  // statfs can query real capacity via GetCapacity.
   if (!clio::cte::core::CLIO_CTE_CLIENT_INIT()) {
     fprintf(stderr, "WARNING: CTE core client init failed; statfs capacity=0\n");
   }
@@ -397,37 +397,40 @@ static int cte_fuse_rename(const char *from, const char *to,
 // Main
 // ============================================================================
 
-// Report filesystem statistics. Total capacity is the real cluster-wide
-// storage capacity, obtained from the CTE: GetMaxCapacity sums the registered
-// targets' capacity per node, and a Broadcast aggregates that across the
-// cluster (the task's AggregateOut sums per-node results). Reporting a non-zero
-// capacity also matters operationally: a 0-block fs is hidden by `df` (which
-// lists no path), which breaks tools that probe free space and xfstests' mount
-// detection.
+// Report filesystem statistics. Total and remaining capacity are the real
+// cluster-wide values, obtained from the CTE: GetCapacity sums the registered
+// targets' total and remaining capacity per node, and a Broadcast aggregates
+// that across the cluster (the task's AggregateOut sums per-node results).
+// Reporting a non-zero capacity also matters operationally: a 0-block fs is
+// hidden by `df` (which lists no path), which breaks tools that probe free
+// space and xfstests' mount detection.
 static int cte_fuse_statfs(const char *path, struct statvfs *stbuf) {
   (void)path;
   std::memset(stbuf, 0, sizeof(*stbuf));
   constexpr fsblkcnt_t kBlockSize = 4096;
 
-  chi::u64 capacity_bytes = 0;
+  chi::u64 total_bytes = 0;
+  chi::u64 remaining_bytes = 0;
   auto *cte = CLIO_CTE_CLIENT;
   if (cte != nullptr) {
-    // Broadcast: total capacity across the whole cluster.
-    auto t = cte->AsyncGetMaxCapacity(chi::PoolQuery::Broadcast());
+    // Broadcast: total + remaining capacity across the whole cluster.
+    auto t = cte->AsyncGetCapacity(chi::PoolQuery::Broadcast());
     t.Wait();
     if (t->return_code_ == 0) {
-      capacity_bytes = t->max_capacity_;
+      total_bytes = t->total_capacity_;
+      remaining_bytes = t->remaining_capacity_;
     }
   }
-  fsblkcnt_t total_blocks = capacity_bytes / kBlockSize;
+  fsblkcnt_t total_blocks = total_bytes / kBlockSize;
+  fsblkcnt_t free_blocks = remaining_bytes / kBlockSize;
 
   stbuf->f_bsize = kBlockSize;
   stbuf->f_frsize = kBlockSize;
   stbuf->f_blocks = total_blocks;
-  // Free-space accounting (used vs. free) is a follow-up; report capacity as
-  // available so writes aren't gated and df shows the real total size.
-  stbuf->f_bfree = total_blocks;
-  stbuf->f_bavail = total_blocks;
+  // Report real remaining space as both free and available (no reservation
+  // distinction), so df shows used = total - remaining.
+  stbuf->f_bfree = free_blocks;
+  stbuf->f_bavail = free_blocks;
   stbuf->f_files = static_cast<fsfilcnt_t>(1) << 20;
   stbuf->f_ffree = static_cast<fsfilcnt_t>(1) << 20;
   stbuf->f_favail = static_cast<fsfilcnt_t>(1) << 20;

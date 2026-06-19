@@ -1950,27 +1950,31 @@ struct GetTagSizeTask : public chi::Task {
 };
 
 /**
- * GetMaxCapacity task - total (max) storage capacity.
+ * GetCapacity task - total and remaining storage capacity.
  *
- * The handler sums max_capacity_ over the targets registered on this node, so a
- * Local query returns this node's capacity. Because AggregateOut sums across
- * replicas, a Broadcast query returns the whole cluster's capacity.
+ * The handler sums max_capacity_ (total) and remaining_space_ (free) over the
+ * targets registered on this node, so a Local query returns this node's
+ * capacity. Because AggregateOut sums both fields across replicas, a Broadcast
+ * query returns the whole cluster's total and remaining capacity.
  */
-struct GetMaxCapacityTask : public chi::Task {
-  OUT chi::u64 max_capacity_;  // Summed capacity in bytes
+struct GetCapacityTask : public chi::Task {
+  OUT chi::u64 total_capacity_;      // Summed total capacity in bytes
+  OUT chi::u64 remaining_capacity_;  // Summed remaining (free) capacity in bytes
 
   // SHM constructor
-  GetMaxCapacityTask() : chi::Task(), max_capacity_(0) {}
+  GetCapacityTask()
+      : chi::Task(), total_capacity_(0), remaining_capacity_(0) {}
 
   // Emplace constructor
-  CTP_CROSS_FUN explicit GetMaxCapacityTask(const chi::TaskId &task_id,
+  CTP_CROSS_FUN explicit GetCapacityTask(const chi::TaskId &task_id,
                                             const chi::PoolId &pool_id,
                                             const chi::PoolQuery &pool_query)
-      : chi::Task(task_id, pool_id, pool_query, Method::kGetMaxCapacity),
-        max_capacity_(0) {
+      : chi::Task(task_id, pool_id, pool_query, Method::kGetCapacity),
+        total_capacity_(0),
+        remaining_capacity_(0) {
     task_id_ = task_id;
     pool_id_ = pool_id;
-    method_ = Method::kGetMaxCapacity;
+    method_ = Method::kGetCapacity;
     task_flags_.Clear();
     pool_query_ = pool_query;
   }
@@ -1983,21 +1987,24 @@ struct GetMaxCapacityTask : public chi::Task {
   template <typename Archive>
   CTP_CROSS_FUN void SerializeOut(Archive &ar) {
     Task::SerializeOut(ar);
-    ar(max_capacity_);
+    ar(total_capacity_, remaining_capacity_);
   }
 
-  void Copy(const ctp::ipc::FullPtr<GetMaxCapacityTask> &other) {
+  void Copy(const ctp::ipc::FullPtr<GetCapacityTask> &other) {
     Task::Copy(other.template Cast<Task>());
-    max_capacity_ = other->max_capacity_;
+    total_capacity_ = other->total_capacity_;
+    remaining_capacity_ = other->remaining_capacity_;
   }
 
   /**
    * AggregateOut: sum capacity from each node so a Broadcast yields the total
-   * cluster capacity.
+   * and remaining cluster capacity.
    */
   void AggregateOut(const ctp::ipc::FullPtr<chi::Task> &other_base) {
     Task::AggregateOut(other_base);
-    max_capacity_ += other_base.template Cast<GetMaxCapacityTask>()->max_capacity_;
+    auto other = other_base.template Cast<GetCapacityTask>();
+    total_capacity_ += other->total_capacity_;
+    remaining_capacity_ += other->remaining_capacity_;
   }
 };
 

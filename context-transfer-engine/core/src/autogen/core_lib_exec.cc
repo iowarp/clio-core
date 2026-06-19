@@ -144,10 +144,10 @@ chi::TaskResume Runtime::Run(chi::u32 method, ctp::ipc::FullPtr<chi::Task> task_
       CLIO_CO_AWAIT(GetTagSize(typed_task, rctx));
       break;
     }
-    case Method::kGetMaxCapacity: {
+    case Method::kGetCapacity: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<GetMaxCapacityTask> typed_task = task_ptr.template Cast<GetMaxCapacityTask>();
-      CLIO_CO_AWAIT(GetMaxCapacity(typed_task, rctx));
+      ctp::ipc::FullPtr<GetCapacityTask> typed_task = task_ptr.template Cast<GetCapacityTask>();
+      CLIO_CO_AWAIT(GetCapacity(typed_task, rctx));
       break;
     }
     case Method::kPollTelemetryLog: {
@@ -322,8 +322,8 @@ void Runtime::SaveTask(chi::u32 method, chi::SaveTaskArchive& archive,
       archive << *typed_task.ptr_;
       break;
     }
-    case Method::kGetMaxCapacity: {
-      auto typed_task = task_ptr.template Cast<GetMaxCapacityTask>();
+    case Method::kGetCapacity: {
+      auto typed_task = task_ptr.template Cast<GetCapacityTask>();
       archive << *typed_task.ptr_;
       break;
     }
@@ -487,8 +487,8 @@ void Runtime::LoadTask(chi::u32 method, chi::LoadTaskArchive& archive,
       archive >> *typed_task.ptr_;
       break;
     }
-    case Method::kGetMaxCapacity: {
-      auto typed_task = task_ptr.template Cast<GetMaxCapacityTask>();
+    case Method::kGetCapacity: {
+      auto typed_task = task_ptr.template Cast<GetCapacityTask>();
       archive >> *typed_task.ptr_;
       break;
     }
@@ -675,8 +675,8 @@ void Runtime::LocalLoadTask(chi::u32 method, chi::DefaultLoadArchive& archive,
       archive >> *typed_task.ptr_;
       break;
     }
-    case Method::kGetMaxCapacity: {
-      auto typed_task = task_ptr.template Cast<GetMaxCapacityTask>();
+    case Method::kGetCapacity: {
+      auto typed_task = task_ptr.template Cast<GetCapacityTask>();
       // Use archive operator which respects msg_type
       archive >> *typed_task.ptr_;
       break;
@@ -875,8 +875,8 @@ void Runtime::LocalSaveTask(chi::u32 method, chi::DefaultSaveArchive& archive,
       archive << *typed_task.ptr_;
       break;
     }
-    case Method::kGetMaxCapacity: {
-      auto typed_task = task_ptr.template Cast<GetMaxCapacityTask>();
+    case Method::kGetCapacity: {
+      auto typed_task = task_ptr.template Cast<GetCapacityTask>();
       // Use archive operator which respects msg_type
       archive << *typed_task.ptr_;
       break;
@@ -1156,12 +1156,12 @@ ctp::ipc::FullPtr<chi::Task> Runtime::NewCopyTask(chi::u32 method, ctp::ipc::Ful
       }
       break;
     }
-    case Method::kGetMaxCapacity: {
+    case Method::kGetCapacity: {
       // Allocate new task
-      auto new_task_ptr = ipc_manager->NewTask<GetMaxCapacityTask>();
+      auto new_task_ptr = ipc_manager->NewTask<GetCapacityTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<GetMaxCapacityTask>();
+        auto task_typed = orig_task_ptr.template Cast<GetCapacityTask>();
         new_task_ptr->Copy(task_typed);
         return new_task_ptr.template Cast<chi::Task>();
       }
@@ -1389,8 +1389,8 @@ ctp::ipc::FullPtr<chi::Task> Runtime::NewTask(chi::u32 method) {
       auto new_task_ptr = ipc_manager->NewTask<GetTagSizeTask>();
       return new_task_ptr.template Cast<chi::Task>();
     }
-    case Method::kGetMaxCapacity: {
-      auto new_task_ptr = ipc_manager->NewTask<GetMaxCapacityTask>();
+    case Method::kGetCapacity: {
+      auto new_task_ptr = ipc_manager->NewTask<GetCapacityTask>();
       return new_task_ptr.template Cast<chi::Task>();
     }
     case Method::kPollTelemetryLog: {
@@ -1541,8 +1541,8 @@ void Runtime::AggregateOut(chi::u32 method, ctp::ipc::FullPtr<chi::Task> orig_ta
       typed_task->AggregateOut(replica_task);
       break;
     }
-    case Method::kGetMaxCapacity: {
-      auto typed_task = orig_task.template Cast<GetMaxCapacityTask>();
+    case Method::kGetCapacity: {
+      auto typed_task = orig_task.template Cast<GetCapacityTask>();
       typed_task->AggregateOut(replica_task);
       break;
     }
@@ -1689,8 +1689,8 @@ void Runtime::DelTask(chi::u32 method, ctp::ipc::FullPtr<chi::Task> task_ptr) {
       ipc_manager->DelTask(task_ptr.template Cast<GetTagSizeTask>());
       break;
     }
-    case Method::kGetMaxCapacity: {
-      ipc_manager->DelTask(task_ptr.template Cast<GetMaxCapacityTask>());
+    case Method::kGetCapacity: {
+      ipc_manager->DelTask(task_ptr.template Cast<GetCapacityTask>());
       break;
     }
     case Method::kPollTelemetryLog: {

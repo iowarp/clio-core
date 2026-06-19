@@ -202,7 +202,7 @@ public:
    * Get max (total) capacity — sum of max_capacity_ over targets registered on
    * this node. Broadcast to sum across the cluster (AggregateOut adds replicas).
    */
-  chi::TaskResume GetMaxCapacity(ctp::ipc::FullPtr<GetMaxCapacityTask> task, chi::RunContext &ctx);
+  chi::TaskResume GetCapacity(ctp::ipc::FullPtr<GetCapacityTask> task, chi::RunContext &ctx);
 
   /**
    * Schedule a task by resolving Dynamic pool queries.

@@ -2182,25 +2182,35 @@ chi::TaskResume Runtime::GetTagSize(ctp::ipc::FullPtr<GetTagSizeTask> task,
   CLIO_TASK_BODY_END
 }
 
-chi::TaskResume Runtime::GetMaxCapacity(
-    ctp::ipc::FullPtr<GetMaxCapacityTask> task, chi::RunContext &ctx) {
+chi::TaskResume Runtime::GetCapacity(
+    ctp::ipc::FullPtr<GetCapacityTask> task, chi::RunContext &ctx) {
 #ifdef __NVCOMPILER
   chi::RunContext &rctx = ctx;
 #else
   (void)ctx;
 #endif
   CLIO_TASK_BODY_BEGIN
-  // Sum the fixed capacity of every target registered on this node. A Local
-  // query returns this node's capacity; the task's AggregateOut sums replicas,
-  // so a Broadcast returns the whole cluster's capacity.
+  // Sum the total and remaining capacity of every target registered on this
+  // node. A Local query returns this node's capacity; the task's AggregateOut
+  // sums replicas, so a Broadcast returns the whole cluster's capacity.
+  //
+  // Iterate registered_targets_ (the canonical map) rather than the target_list_
+  // mirror: the PutBlob/Free data path debits/credits remaining_space_ on the
+  // canonical entry only (the mirror is refreshed lazily by StatTargets), so the
+  // mirror lags real usage. for_each takes the map's internal lock for a
+  // consistent snapshot; target_lock_ (read) guards structural stability.
   chi::u64 total = 0;
+  chi::u64 remaining = 0;
   {
     chi::ScopedCoRwReadLock read_lock(target_lock_);
-    for (const auto &t : target_list_) {
-      total += t.max_capacity_;
-    }
+    registered_targets_.for_each(
+        [&total, &remaining](const chi::PoolId & /*key*/, const TargetInfo &t) {
+          total += t.max_capacity_;
+          remaining += t.remaining_space_;
+        });
   }
-  task->max_capacity_ = total;
+  task->total_capacity_ = total;
+  task->remaining_capacity_ = remaining;
   task->return_code_ = 0;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END

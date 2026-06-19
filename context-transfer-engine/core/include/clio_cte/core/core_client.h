@@ -497,10 +497,10 @@ class Client : public chi::ContainerClient {
    * @param pool_query Local() sums this node's targets; Broadcast() sums the
    *        whole cluster (AggregateOut adds per-node results). Default Local.
    */
-  chi::Future<GetMaxCapacityTask> AsyncGetMaxCapacity(
+  chi::Future<GetCapacityTask> AsyncGetCapacity(
       const chi::PoolQuery &pool_query = chi::PoolQuery::Local()) {
     auto *ipc_manager = CLIO_CPU_IPC;
-    auto task = ipc_manager->NewTask<GetMaxCapacityTask>(
+    auto task = ipc_manager->NewTask<GetCapacityTask>(
         chi::CreateTaskId(), pool_id_, pool_query);
     return ipc_manager->Send(task);
   }
