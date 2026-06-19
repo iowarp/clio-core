@@ -30,7 +30,10 @@ namespace clio::cte::filesystem {
   X(kUnlink, UnlinkTask, Unlink)          \
   X(kRename, RenameTask, Rename)          \
   X(kLink, LinkTask, Link)                \
-  X(kStatSize, StatSizeTask, StatSize)
+  X(kStatSize, StatSizeTask, StatSize)    \
+  X(kAppendSequence, AppendSequenceTask, AppendSequence)    \
+  X(kAppendCollect, AppendCollectTask, AppendCollect)       \
+  X(kAppendExecution, AppendExecutionTask, AppendExecution)
 
 void Runtime::Init(const chi::PoolId &pool_id, const std::string &pool_name,
                    chi::u32 container_id) {
@@ -194,6 +197,15 @@ void Runtime::AggregateOut(chi::u32 method, ctp::ipc::FullPtr<chi::Task> orig_ta
     default:
       orig_task->AggregateOut(replica_task);
       break;
+  }
+}
+
+void Runtime::AggregateIn(chi::u32 method, ctp::ipc::FullPtr<chi::Task> agg_task,
+                          const ctp::ipc::FullPtr<chi::Task> &member_task) {
+  // Only AppendCollect combines member inputs (ManyToOne). All other methods
+  // keep the default no-op (the aggregate is a copy of the first member).
+  if (method == Method::kAppendCollect) {
+    agg_task.template Cast<AppendCollectTask>()->AggregateIn(member_task);
   }
 }
 

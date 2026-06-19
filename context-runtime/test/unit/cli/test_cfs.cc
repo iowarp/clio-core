@@ -526,6 +526,57 @@ TEST_CASE("Cfs - filesystem chimod open/write/getattr/read/truncate",
     REQUIRE(ex == 0);  // directory gone
   }
 
+  // ---- Deferred-append pipeline ----
+  // Append three distinguishable chunks; each is placed locally + queued, then
+  // a periodic AppendSequence -> AppendCollect (ManyToOne, sort by UTC/logical)
+  // -> AppendExecution merges them into the file pages in order. The merge is
+  // asynchronous, so poll-read until the concatenation appears.
+  {
+    const std::string apath = "/append_test.bin";
+    auto aop = cfs.AsyncOpen(apath, O_CREAT | O_RDWR, 0644);
+    aop.Wait();
+    REQUIRE(aop->GetReturnCode() == 0);
+    chi::u64 ah = aop->handle_;
+    REQUIRE(ah != 0);
+
+    constexpr chi::u64 kChunk = 4096;
+    const char marks[3] = {'A', 'B', 'C'};
+    std::string expected;
+    for (int c = 0; c < 3; ++c) {
+      ctp::ipc::FullPtr<char> ab = ipc->AllocateBuffer(kChunk);
+      REQUIRE(!ab.IsNull());
+      memset(ab.ptr_, marks[c], kChunk);
+      expected.append(kChunk, marks[c]);
+      auto ap = cfs.AsyncAppend(ah, kChunk, ab.shm_.template Cast<void>());
+      ap.Wait();
+      REQUIRE(ap->GetReturnCode() == 0);
+      ipc->FreeBuffer(ab);
+    }
+    const chi::u64 total = kChunk * 3;
+
+    // The periodic AppendSequence drains + merges asynchronously; poll-read.
+    bool matched = false;
+    for (int attempt = 0; attempt < 200 && !matched; ++attempt) {
+      ctp::ipc::FullPtr<char> rb = ipc->AllocateBuffer(total);
+      REQUIRE(!rb.IsNull());
+      memset(rb.ptr_, 0, total);
+      auto r = cfs.AsyncRead(ah, 0, total, rb.shm_.template Cast<void>());
+      r.Wait();
+      if (r->GetReturnCode() == 0 && r->bytes_read_ == total &&
+          memcmp(rb.ptr_, expected.data(), total) == 0) {
+        matched = true;
+      }
+      ipc->FreeBuffer(rb);
+      if (!matched) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+      }
+    }
+    REQUIRE(matched);  // appends merged into the file in order
+
+    auto acl = cfs.AsyncClose(ah);
+    acl.Wait();
+  }
+
   RunCliTimed({"stop", "--grace-period", "2000"}, 90);
   for (int i = 0; i < 200 && server.IsRunning(); ++i) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
