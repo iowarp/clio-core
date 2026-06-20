@@ -980,6 +980,9 @@ chi::TaskResume Runtime::GetOrCreateTag(
       TagId *existing_tag_id_ptr = tag_name_to_id_.find(tag_name);
       if (existing_tag_id_ptr == nullptr) {
         tag_name_to_id_.insert_or_assign(tag_name, preferred_id);
+        // Mirror the binding into the search index so a Local TagQuery still
+        // sees remote-canonical tag names (parity with the old full scan). (#598)
+        tag_search_.Insert(ResolveTagName(tag_name), preferred_id);
       }
       task->tag_id_ = preferred_id;
       GpuCacheOnGetOrCreateTag(preferred_id, tag_name);
@@ -1894,6 +1897,10 @@ chi::TaskResume Runtime::GetOrCreateTagAlias(
         tag_id = *existing_alias;
       } else {
         tag_name_to_id_.insert_or_assign(alias_key, tag_id);
+        // Index the alias's absolute name so it is findable via TagQuery
+        // (getattr/readdir) just like a canonical name (#598). Aliases bypass
+        // GetOrAssignTagId, so this is the only place they enter the index.
+        tag_search_.Insert(ResolveTagName(alias_key), tag_id);
         // Record the alias key on the target so DelTag cascades to it when the
         // canonical tag is deleted. The canonical name is never added here.
         TagInfo *info = tag_id_to_info_.find(tag_id);
@@ -1992,6 +1999,9 @@ chi::TaskResume Runtime::DelTag(ctp::ipc::FullPtr<DelTagTask> task,
     if (!resolved_key.empty() && resolved_key != canonical) {
       chi::ScopedCoRwWriteLock lock(tag_map_lock_);
       tag_name_to_id_.erase(resolved_key);
+      // Drop just this alias name from the search index; the tag and its other
+      // names (canonical + remaining aliases) stay. (#598)
+      tag_search_.Delete(ResolveTagName(resolved_key));
       TagInfo *tag_info_ptr = tag_id_to_info_.find(tag_id);
       if (tag_info_ptr != nullptr) {
         for (size_t i = 0; i < tag_info_ptr->aliases_.size(); ++i) {
@@ -2031,6 +2041,11 @@ chi::TaskResume Runtime::DelTag(ctp::ipc::FullPtr<DelTagTask> task,
     // itself; a directory tag deletes its entire subtree (rm -r semantics).
     std::vector<TagId> to_delete;
     std::unordered_map<std::string, TagId> prefix_to_id;  // "M.m." -> id
+    // Alias absolute names of the deleted tags. Canonical names live under
+    // del_abs and were removed by the prefix cleanup above, but an alias can
+    // resolve OUTSIDE that subtree (e.g. a hard link elsewhere), so collect and
+    // remove those from the search index too. (#598)
+    std::vector<std::string> dead_alias_abs;
     {
       chi::ScopedCoRwReadLock lock(tag_map_lock_);
       std::unordered_map<TagId, std::vector<TagId>> children;
@@ -2048,10 +2063,22 @@ chi::TaskResume Runtime::DelTag(ctp::ipc::FullPtr<DelTagTask> task,
         to_delete.push_back(cur);
         prefix_to_id[std::to_string(cur.major_) + "." +
                      std::to_string(cur.minor_) + "."] = cur;
+        TagInfo *cinfo = tag_id_to_info_.find(cur);
+        if (cinfo != nullptr) {
+          for (size_t i = 0; i < cinfo->aliases_.size(); ++i) {
+            dead_alias_abs.push_back(ResolveTagName(cinfo->aliases_[i].str()));
+          }
+        }
         auto it = children.find(cur);
         if (it != children.end()) {
           for (const TagId &c : it->second) frontier.push_back(c);
         }
+      }
+    }
+    if (!dead_alias_abs.empty()) {
+      chi::ScopedCoRwWriteLock lock(tag_map_lock_);
+      for (const auto &a : dead_alias_abs) {
+        tag_search_.Delete(a);
       }
     }
 
