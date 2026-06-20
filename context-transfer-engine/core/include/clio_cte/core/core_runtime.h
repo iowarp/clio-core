@@ -47,6 +47,7 @@
 #include <clio_cte/core/core_tasks.h>
 #include <clio_cte/core/gpu_metadata_cache.h>
 #include <clio_cte/core/transaction_log.h>
+#include <search/regex_search_engine.h>
 
 // Forward declarations to avoid circular dependency
 namespace clio::cte::core {
@@ -287,6 +288,13 @@ private:
   ctp::priv::unordered_map_ll<std::string, BlobInfo>
       tag_blob_name_to_info_; // "tag_id.blob_name" -> BlobInfo
 
+  // Secondary search index: absolute resolved tag name -> tag id. Lets TagQuery
+  // answer regex queries via a trigram prefilter instead of scanning every tag
+  // (#598). Maintained in lockstep with tag_name_to_id_/tag_id_to_info_ under
+  // tag_map_lock_ (created in GetOrAssignTagId, removed in DelTag, moved in
+  // RenameTag, rebuilt after WAL/metadata restore).
+  ctp::search::RegexSearchEngine<TagId> tag_search_;
+
   // Atomic counters for thread-safe ID generation
   std::atomic<chi::u32>
       next_tag_id_minor_; // Minor counter for TagId UniqueId generation
@@ -445,6 +453,13 @@ private:
    * `depth` guards against pathological/cyclic references.
    */
   std::string ResolveTagName(const std::string &stored_name, int depth = 0);
+
+  /**
+   * Rebuild tag_search_ from scratch out of tag_id_to_info_. Order-independent
+   * (every tag's parents are present), so it is the safe way to repopulate the
+   * index after WAL/metadata restore. Caller must hold tag_map_lock_ (write).
+   */
+  void RebuildTagSearchIndexLocked();
 
   /**
    * Helper function to generate a new TagId using node_id as major and atomic

@@ -85,10 +85,15 @@ class RegexSearchEngine {
     auto res = entries_.insert_or_assign(key, value);
     const bool is_new = res.second;
     if (is_new) {
+      // Postings store a stable pointer to the single key copy owned by
+      // entries_ (node pointers/refs survive rehash; only erasing that key
+      // invalidates it, and Delete scrubs the postings first). This avoids
+      // copying the (possibly long) key into every one of its trigram postings.
+      const std::string *kp = &res.first->first;
       std::vector<std::string> tg;
       Trigrams(key, tg);
       for (const auto &t : tg) {
-        index_[t].insert(key);
+        index_[t].insert(kp);
       }
     }
     return is_new;
@@ -100,18 +105,21 @@ class RegexSearchEngine {
     if (it == entries_.end()) {
       return false;
     }
-    entries_.erase(it);
+    // Scrub the postings (by pointer) BEFORE erasing the entries_ node, so the
+    // stored pointer never dangles.
+    const std::string *kp = &it->first;
     std::vector<std::string> tg;
     Trigrams(key, tg);
     for (const auto &t : tg) {
       auto p = index_.find(t);
       if (p != index_.end()) {
-        p->second.erase(key);
+        p->second.erase(kp);
         if (p->second.empty()) {
           index_.erase(p);
         }
       }
     }
+    entries_.erase(it);
     return true;
   }
 
@@ -218,7 +226,7 @@ class RegexSearchEngine {
       // Candidates = keys present in the posting lists of ALL required
       // trigrams. Walk the smallest posting list and test membership in the
       // others; this is a superset of the true matches.
-      const std::unordered_set<std::string> *smallest = nullptr;
+      const std::unordered_set<const std::string *> *smallest = nullptr;
       for (const auto &t : required) {
         auto it = index_.find(t);
         if (it == index_.end()) {
@@ -229,17 +237,17 @@ class RegexSearchEngine {
           smallest = &it->second;
         }
       }
-      for (const auto &key : *smallest) {
+      for (const std::string *kp : *smallest) {
         bool in_all = true;
         for (const auto &t : required) {
           const auto &posting = index_.find(t)->second;
-          if (posting.find(key) == posting.end()) {
+          if (posting.find(kp) == posting.end()) {
             in_all = false;
             break;
           }
         }
-        if (in_all && std::regex_match(key, re)) {
-          matches.push_back(key);
+        if (in_all && std::regex_match(*kp, re)) {
+          matches.push_back(*kp);
         }
       }
     }
@@ -396,7 +404,10 @@ class RegexSearchEngine {
   }
 
   std::unordered_map<std::string, ValueT> entries_;
-  std::unordered_map<std::string, std::unordered_set<std::string>> index_;
+  // trigram -> set of pointers to keys (owned by entries_). Pointers, not
+  // copies, to keep the index small for long keys.
+  std::unordered_map<std::string, std::unordered_set<const std::string *>>
+      index_;
 };
 
 }  // namespace ctp::search

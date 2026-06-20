@@ -84,6 +84,22 @@ namespace {
 
 constexpr const char *kTagRefPrefix = "$tagid{";
 
+// Escape regex metacharacters so `s` matches itself literally. Used to build
+// exact/prefix patterns for the tag search index (#598).
+std::string EscapeRegexLiteral(const std::string &s) {
+  std::string out;
+  out.reserve(s.size() + 8);
+  for (char c : s) {
+    if (c == '.' || c == '[' || c == ']' || c == '(' || c == ')' ||
+        c == '{' || c == '}' || c == '+' || c == '*' || c == '?' ||
+        c == '\\' || c == '^' || c == '$' || c == '|' || c == '/') {
+      out += '\\';
+    }
+    out += c;
+  }
+  return out;
+}
+
 // True for absolute-path names that participate in the hierarchy.
 bool IsHierPath(const std::string &name) {
   return !name.empty() && name[0] == '/';
@@ -397,6 +413,11 @@ chi::TaskResume Runtime::Create(ctp::ipc::FullPtr<CreateTask> task,
   if (is_restart_) {
     RestoreMetadataFromLog();
     ReplayTransactionLogs();
+    // Both paths populate the tag table directly (bypassing GetOrAssignTagId's
+    // per-insert indexing), so rebuild the regex search index once from the
+    // final tag set (#598).
+    chi::ScopedCoRwWriteLock lock(tag_map_lock_);
+    RebuildTagSearchIndexLocked();
   }
 
   // Open WAL files if metadata_log_path is configured
@@ -1744,12 +1765,32 @@ chi::TaskResume Runtime::RenameTag(ctp::ipc::FullPtr<RenameTagTask> task,
         }
         // Fresh read of the canonical name, under the lock that erases it.
         std::string cur_rel = info->tag_name_.str();
+        // Absolute paths BEFORE/AFTER the move. old_abs == ResolveTagName(
+        // cur_rel) is exactly the search-index key stored at insert time.
+        std::string old_abs = ResolveTagName(cur_rel);
+        std::string new_abs = ResolveTagName(new_rel);
         if (cur_rel != new_rel) {
           tag_name_to_id_.erase(cur_rel);
         }
         tag_name_to_id_.insert_or_assign(new_rel, tag_id);
         info->tag_name_ = chi::priv::string(CLIO_PRIV_ALLOC, new_rel);
         info->last_modified_ = GetCurrentTimeNs();
+
+        // Re-key this tag and its descendants in the search index from old_abs
+        // to new_abs (#598). A directory move changes the absolute names of the
+        // whole subtree, so move every entry under old_abs; a file moves just
+        // one. Enumerated via the index's own trigram-prefiltered prefix search
+        // => O(subtree), not O(N).
+        std::string esc = EscapeRegexLiteral(old_abs);
+        auto self_hit = tag_search_.Search("^" + esc + "$");
+        auto descendants = tag_search_.Search("^" + esc + "/.*");
+        std::vector<std::string> movers = self_hit.keys();
+        for (const auto &k : descendants.keys()) {
+          movers.push_back(k);
+        }
+        for (const auto &k : movers) {
+          tag_search_.Rename(k, new_abs + k.substr(old_abs.size()));
+        }
       }
       task->tag_id_ = tag_id;
       task->return_code_ = 0;
@@ -1775,6 +1816,9 @@ chi::TaskResume Runtime::RenameTag(ctp::ipc::FullPtr<RenameTagTask> task,
         info->last_modified_ = GetCurrentTimeNs();
       }
     }
+    // Flat tags have no hierarchy, so the index key is the verbatim name; move
+    // the single entry (no-op if it was never indexed). (#598)
+    tag_search_.Rename(old_name, new_name);
     task->tag_id_ = tag_id;
     task->return_code_ = 0;
   } catch (const std::exception &e) {
@@ -1925,8 +1969,10 @@ chi::TaskResume Runtime::DelTag(ctp::ipc::FullPtr<DelTagTask> task,
       CLIO_CO_RETURN;
     }
 
-    // Step 2: Find the tag by ID and capture its canonical (own) stored name.
+    // Step 2: Find the tag by ID and capture its canonical (own) stored name
+    // and its absolute path (the search-index key) while the subtree is intact.
     std::string canonical;
+    std::string del_abs;
     {
       chi::ScopedCoRwReadLock lock(tag_map_lock_);
       TagInfo *tag_info_ptr = tag_id_to_info_.find(tag_id);
@@ -1935,6 +1981,7 @@ chi::TaskResume Runtime::DelTag(ctp::ipc::FullPtr<DelTagTask> task,
         CLIO_CO_RETURN;
       }
       canonical = tag_info_ptr->tag_name_.str();
+      del_abs = ResolveTagName(canonical);
     }
 
     // If the request resolved through a key that is NOT the tag's own canonical
@@ -1957,6 +2004,24 @@ chi::TaskResume Runtime::DelTag(ctp::ipc::FullPtr<DelTagTask> task,
       }
       task->return_code_ = 0;
       CLIO_CO_RETURN;
+    }
+
+    // Full recursive delete: remove this tag and its whole subtree from the
+    // search index (#598), using the absolute path captured before any deletion.
+    // O(subtree) via the index's trigram-prefiltered prefix search.
+    {
+      chi::ScopedCoRwWriteLock lock(tag_map_lock_);
+      std::string esc = EscapeRegexLiteral(del_abs);
+      auto self_hit = tag_search_.Search("^" + esc + "$");
+      auto descendants = tag_search_.Search("^" + esc + "/.*");
+      // keys() is a snapshot independent of the engine's maps, so deleting from
+      // the engine while iterating it is safe.
+      for (const auto &k : self_hit.keys()) {
+        tag_search_.Delete(k);
+      }
+      for (const auto &k : descendants.keys()) {
+        tag_search_.Delete(k);
+      }
     }
 
     // Step 3: Determine the full set of tags to delete — the target plus every
@@ -2355,6 +2420,11 @@ TagId Runtime::GetOrAssignTagId(const std::string &tag_name,
   tag_name_to_id_.insert_or_assign(tag_name, tag_id);
   tag_id_to_info_.insert_or_assign(tag_id, tag_info);
 
+  // Index the new tag's ABSOLUTE name for regex TagQuery (#598). The parent
+  // chain is already created (GetOrCreateTagChain builds parents first), so
+  // ResolveTagName yields the full path. We hold the write lock here.
+  tag_search_.Insert(ResolveTagName(tag_name), tag_id);
+
   // WAL: log tag creation
   if (!tag_txn_logs_.empty()) {
     chi::u32 wid = CLIO_CUR_WORKER->GetWorkerStats().worker_id_;
@@ -2406,6 +2476,20 @@ TagId Runtime::ResolvePathToIdLocked(const std::string &path) {
     cur = *child;
   }
   return cur;
+}
+
+void Runtime::RebuildTagSearchIndexLocked() {
+  // Repopulate the regex search index from the authoritative tag table (#598).
+  // Order-independent: every tag's parents are present, so ResolveTagName always
+  // yields the full path. Used after WAL/metadata restore, where tags are
+  // inserted directly (bypassing GetOrAssignTagId's per-insert indexing).
+  tag_search_.Clear();
+  tag_id_to_info_.for_each([&](const TagId & /*id*/, const TagInfo &info) {
+    std::string abs = ResolveTagName(info.tag_name_.str());
+    if (!abs.empty()) {
+      tag_search_.Insert(abs, info.tag_id_);
+    }
+  });
 }
 
 TagId Runtime::GetOrCreateTagChain(const std::string &name,
@@ -4185,39 +4269,33 @@ chi::TaskResume Runtime::TagQuery(ctp::ipc::FullPtr<TagQueryTask> task,
   try {
     std::string tag_regex = task->tag_regex_.str();
 
-    // Create regex pattern
-    std::regex pattern(tag_regex);
-
-    // Collect matching tags (resolved full name + id). Tag names are stored
-    // relatively, so resolve each to its absolute form before matching and
-    // return the resolved name to the caller.
-    std::vector<std::pair<std::string, TagId>> matching_tags;
-    tag_name_to_id_.for_each(
-        [&](const std::string &stored, const TagId &tag_id) {
-          std::string full = ResolveTagName(stored);
-          if (std::regex_match(full, pattern)) {
-            matching_tags.emplace_back(full, tag_id);
-          }
-        });
+    // Query the secondary search index (#598): its keys are the absolute tag
+    // names, so a regex match over them needs no per-tag ResolveTagName scan.
+    // The index derives the trigrams every match must contain and only verifies
+    // a small candidate set against the full regex (falling back to a scan of
+    // its own entries when the pattern has no usable trigram). Held under the
+    // tag map read lock since the index is mutated under the write lock.
+    task->results_.clear();
+    size_t total = 0;
+    {
+      chi::ScopedCoRwReadLock lock(tag_map_lock_);
+      auto result = tag_search_.Search(tag_regex);
+      total = result.size();
+      for (const auto &name : result.keys()) {
+        if (task->max_tags_ != 0 && task->results_.size() >= task->max_tags_) {
+          break;
+        }
+        task->results_.push_back(name);
+      }
+    }
 
     // Total matched tags (summed across replicas during AggregateOut)
-    task->total_tags_matched_ = matching_tags.size();
-
-    // Build results: just tag names matching the query. Respect max_tags_ if
-    // non-zero.
-    task->results_.clear();
-    for (const auto &tn : matching_tags) {
-      if (task->max_tags_ != 0 && task->results_.size() >= task->max_tags_) {
-        break;
-      }
-      const std::string &tag_name = tn.first;
-      task->results_.push_back(tag_name);
-    }
+    task->total_tags_matched_ = total;
 
     // Success
     task->return_code_ = 0;
     HLOG(kDebug, "TagQuery successful: pattern={}, found {} tags", tag_regex,
-         matching_tags.size());
+         total);
 
   } catch (const std::exception &e) {
     task->return_code_ = 1;
