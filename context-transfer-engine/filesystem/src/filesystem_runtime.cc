@@ -674,6 +674,63 @@ chi::TaskResume Runtime::Rename(ctp::ipc::FullPtr<RenameTask> task,
     CLIO_CO_RETURN;
   }
 
+  // Classify source as a directory iff it has at least one child entry (a dir
+  // always has at least its hidden marker child; a regular file has none).
+  bool src_is_dir = false;
+  {
+    std::string re = "^" + EscapeExact(src) + "/[^/]+$";
+    auto q = cte_.AsyncTagQuery(re, 1, chi::PoolQuery::Local());
+    CLIO_CO_AWAIT(q);
+    src_is_dir = (q->GetReturnCode() == 0 && !q->results_.empty());
+  }
+
+  // Classify the destination and enforce POSIX rename-overwrite rules before
+  // touching anything (issue #597 B1, generic/245). Replacing a destination is
+  // only legal file-over-file or dir-over-empty-dir; everything else is an error
+  // and must leave both operands untouched.
+  //   dst_state: 0 = absent, 1 = file, 2 = empty dir, 3 = non-empty dir.
+  int dst_state = 0;
+  {
+    std::string re = "^" + EscapeExact(dst) + "/[^/]+$";
+    auto q = cte_.AsyncTagQuery(re, 0, chi::PoolQuery::Local());
+    CLIO_CO_AWAIT(q);
+    if (q->GetReturnCode() == 0 && !q->results_.empty()) {
+      const size_t prefix = dst.size() + 1;  // strip "<dst>/"
+      dst_state = 2;                          // has a child => directory
+      for (const auto &full : q->results_) {
+        std::string base =
+            full.size() > prefix ? full.substr(prefix) : std::string();
+        if (base != kDirMarker) { dst_state = 3; break; }  // real child
+      }
+    } else {
+      // No children: a regular file if an exact tag exists, else nonexistent.
+      auto qf =
+          cte_.AsyncTagQuery(EscapeExact(dst), 1, chi::PoolQuery::Local());
+      CLIO_CO_AWAIT(qf);
+      dst_state =
+          (qf->GetReturnCode() == 0 && !qf->results_.empty()) ? 1 : 0;
+    }
+  }
+  if (dst_state != 0) {
+    if (dst_state == 2 || dst_state == 3) {  // destination is a directory
+      if (!src_is_dir) {
+        task->return_code_ = EISDIR;  // non-dir onto a directory
+        CLIO_CO_RETURN;
+      }
+      if (dst_state == 3) {
+        task->return_code_ = ENOTEMPTY;  // directory onto a non-empty directory
+        CLIO_CO_RETURN;
+      }
+      // dir onto an empty dir: allowed (the empty dst is replaced below).
+    } else {  // destination is a regular file
+      if (src_is_dir) {
+        task->return_code_ = ENOTDIR;  // directory onto a non-dir
+        CLIO_CO_RETURN;
+      }
+      // file onto file: allowed (overwrite below).
+    }
+  }
+
   // POSIX rename overwrites an existing destination: drop dst's tag first.
   {
     auto d = cte_.AsyncDelTag(dst, chi::PoolQuery::Local());
