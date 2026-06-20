@@ -2216,6 +2216,65 @@ chi::TaskResume Runtime::GetCapacity(
   CLIO_TASK_BODY_END
 }
 
+chi::TaskResume Runtime::GetNumAliases(
+    ctp::ipc::FullPtr<GetNumAliasesTask> task, chi::RunContext &ctx) {
+#ifdef __NVCOMPILER
+  chi::RunContext &rctx = ctx;
+#else
+  (void)ctx;
+#endif
+  CLIO_TASK_BODY_BEGIN
+  try {
+    task->num_aliases_ = 0;
+    task->found_ = 0;
+
+    chi::ScopedCoRwReadLock lock(tag_map_lock_);
+
+    // Resolve the tag id: prefer an explicit id, else resolve the name the same
+    // way DelTag does — hierarchical "$tagid{parent}/leaf" key first, then a
+    // verbatim lookup for flat names and flat aliases.
+    TagId tag_id = task->tag_id_;
+    if (tag_id.IsNull()) {
+      std::string tag_name = task->tag_name_.str();
+      if (!tag_name.empty()) {
+        if (IsHierPath(tag_name)) {
+          if (tag_name == "/") {
+            TagId *r = tag_name_to_id_.find(std::string("/"));
+            if (r != nullptr) tag_id = *r;
+          } else {
+            std::string parent_path, leaf;
+            if (SplitParentLeaf(tag_name, parent_path, leaf)) {
+              TagId parent_id = ResolvePathToIdLocked(parent_path);
+              if (!parent_id.IsNull()) {
+                TagId *p = tag_name_to_id_.find(MakeRelativeName(parent_id, leaf));
+                if (p != nullptr) tag_id = *p;
+              }
+            }
+          }
+        }
+        if (tag_id.IsNull()) {
+          TagId *p = tag_name_to_id_.find(tag_name);
+          if (p != nullptr) tag_id = *p;
+        }
+      }
+    }
+
+    if (!tag_id.IsNull()) {
+      TagInfo *info = tag_id_to_info_.find(tag_id);
+      if (info != nullptr) {
+        task->num_aliases_ = static_cast<chi::u32>(info->aliases_.size());
+        task->found_ = 1;
+      }
+    }
+    task->return_code_ = 0;  // found_ conveys existence; the op itself is fine
+  } catch (const std::exception &e) {
+    HLOG(kError, "GetNumAliases failed: {}", e.what());
+    task->return_code_ = 1;
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
 // Private helper methods
 const Config &Runtime::GetConfig() const { return config_; }
 

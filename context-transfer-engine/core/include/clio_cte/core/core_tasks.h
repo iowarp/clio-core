@@ -2009,6 +2009,79 @@ struct GetCapacityTask : public chi::Task {
 };
 
 /**
+ * GetNumAliases task - number of extra names (tag-level hard links) bound to a
+ * tag, identified by name or id. The canonical name is NOT counted, so a file
+ * with no hard links returns 0; the POSIX link count is num_aliases_ + 1.
+ *
+ * The tag's metadata (and its aliases_ list) lives on a single container, so
+ * this is a Broadcast-safe op: AggregateOut keeps the answer from whichever
+ * replica located the tag (mirrors GetTagName).
+ */
+struct GetNumAliasesTask : public chi::Task {
+  IN chi::priv::string tag_name_;  // Tag name/path (empty => use tag_id_)
+  IN TagId tag_id_;                // Tag id (used when tag_name_ is empty)
+  OUT chi::u32 num_aliases_;       // # of extra names bound to the tag
+  OUT chi::u32 found_;             // 1 if the tag's metadata was located
+
+  // SHM constructor
+  GetNumAliasesTask()
+      : chi::Task(),
+        tag_name_(CLIO_PRIV_ALLOC),
+        tag_id_(TagId::GetNull()),
+        num_aliases_(0),
+        found_(0) {}
+
+  // Emplace constructor
+  CTP_CROSS_FUN explicit GetNumAliasesTask(const chi::TaskId &task_id,
+                                           const chi::PoolId &pool_id,
+                                           const chi::PoolQuery &pool_query,
+                                           const std::string &tag_name,
+                                           const TagId &tag_id)
+      : chi::Task(task_id, pool_id, pool_query, Method::kGetNumAliases),
+        tag_name_(CLIO_PRIV_ALLOC, tag_name),
+        tag_id_(tag_id),
+        num_aliases_(0),
+        found_(0) {
+    task_id_ = task_id;
+    pool_id_ = pool_id;
+    method_ = Method::kGetNumAliases;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+    ar(tag_name_, tag_id_);
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+    ar(num_aliases_, found_);
+  }
+
+  void Copy(const ctp::ipc::FullPtr<GetNumAliasesTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+    tag_name_ = other->tag_name_;
+    tag_id_ = other->tag_id_;
+    num_aliases_ = other->num_aliases_;
+    found_ = other->found_;
+  }
+
+  // Broadcast aggregation: keep the answer from whichever container owns the
+  // tag (the one that set found_).
+  void AggregateOut(const ctp::ipc::FullPtr<chi::Task> &other_base) {
+    Task::AggregateOut(other_base);
+    auto other = other_base.template Cast<GetNumAliasesTask>();
+    if (other->found_ && !found_) {
+      found_ = 1;
+      num_aliases_ = other->num_aliases_;
+    }
+  }
+};
+
+/**
  * PollTelemetryLog task - Poll telemetry log with minimum logical time filter
  */
 struct PollTelemetryLogTask : public chi::Task {

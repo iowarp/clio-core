@@ -150,6 +150,12 @@ chi::TaskResume Runtime::Run(chi::u32 method, ctp::ipc::FullPtr<chi::Task> task_
       CLIO_CO_AWAIT(GetCapacity(typed_task, rctx));
       break;
     }
+    case Method::kGetNumAliases: {
+      // Cast task FullPtr to specific type
+      ctp::ipc::FullPtr<GetNumAliasesTask> typed_task = task_ptr.template Cast<GetNumAliasesTask>();
+      CLIO_CO_AWAIT(GetNumAliases(typed_task, rctx));
+      break;
+    }
     case Method::kPollTelemetryLog: {
       // Cast task FullPtr to specific type
       ctp::ipc::FullPtr<PollTelemetryLogTask> typed_task = task_ptr.template Cast<PollTelemetryLogTask>();
@@ -327,6 +333,11 @@ void Runtime::SaveTask(chi::u32 method, chi::SaveTaskArchive& archive,
       archive << *typed_task.ptr_;
       break;
     }
+    case Method::kGetNumAliases: {
+      auto typed_task = task_ptr.template Cast<GetNumAliasesTask>();
+      archive << *typed_task.ptr_;
+      break;
+    }
     case Method::kPollTelemetryLog: {
       auto typed_task = task_ptr.template Cast<PollTelemetryLogTask>();
       archive << *typed_task.ptr_;
@@ -489,6 +500,11 @@ void Runtime::LoadTask(chi::u32 method, chi::LoadTaskArchive& archive,
     }
     case Method::kGetCapacity: {
       auto typed_task = task_ptr.template Cast<GetCapacityTask>();
+      archive >> *typed_task.ptr_;
+      break;
+    }
+    case Method::kGetNumAliases: {
+      auto typed_task = task_ptr.template Cast<GetNumAliasesTask>();
       archive >> *typed_task.ptr_;
       break;
     }
@@ -677,6 +693,12 @@ void Runtime::LocalLoadTask(chi::u32 method, chi::DefaultLoadArchive& archive,
     }
     case Method::kGetCapacity: {
       auto typed_task = task_ptr.template Cast<GetCapacityTask>();
+      // Use archive operator which respects msg_type
+      archive >> *typed_task.ptr_;
+      break;
+    }
+    case Method::kGetNumAliases: {
+      auto typed_task = task_ptr.template Cast<GetNumAliasesTask>();
       // Use archive operator which respects msg_type
       archive >> *typed_task.ptr_;
       break;
@@ -877,6 +899,12 @@ void Runtime::LocalSaveTask(chi::u32 method, chi::DefaultSaveArchive& archive,
     }
     case Method::kGetCapacity: {
       auto typed_task = task_ptr.template Cast<GetCapacityTask>();
+      // Use archive operator which respects msg_type
+      archive << *typed_task.ptr_;
+      break;
+    }
+    case Method::kGetNumAliases: {
+      auto typed_task = task_ptr.template Cast<GetNumAliasesTask>();
       // Use archive operator which respects msg_type
       archive << *typed_task.ptr_;
       break;
@@ -1167,6 +1195,17 @@ ctp::ipc::FullPtr<chi::Task> Runtime::NewCopyTask(chi::u32 method, ctp::ipc::Ful
       }
       break;
     }
+    case Method::kGetNumAliases: {
+      // Allocate new task
+      auto new_task_ptr = ipc_manager->NewTask<GetNumAliasesTask>();
+      if (!new_task_ptr.IsNull()) {
+        // Copy task fields (includes base Task fields)
+        auto task_typed = orig_task_ptr.template Cast<GetNumAliasesTask>();
+        new_task_ptr->Copy(task_typed);
+        return new_task_ptr.template Cast<chi::Task>();
+      }
+      break;
+    }
     case Method::kPollTelemetryLog: {
       // Allocate new task
       auto new_task_ptr = ipc_manager->NewTask<PollTelemetryLogTask>();
@@ -1393,6 +1432,10 @@ ctp::ipc::FullPtr<chi::Task> Runtime::NewTask(chi::u32 method) {
       auto new_task_ptr = ipc_manager->NewTask<GetCapacityTask>();
       return new_task_ptr.template Cast<chi::Task>();
     }
+    case Method::kGetNumAliases: {
+      auto new_task_ptr = ipc_manager->NewTask<GetNumAliasesTask>();
+      return new_task_ptr.template Cast<chi::Task>();
+    }
     case Method::kPollTelemetryLog: {
       auto new_task_ptr = ipc_manager->NewTask<PollTelemetryLogTask>();
       return new_task_ptr.template Cast<chi::Task>();
@@ -1546,6 +1589,11 @@ void Runtime::AggregateOut(chi::u32 method, ctp::ipc::FullPtr<chi::Task> orig_ta
       typed_task->AggregateOut(replica_task);
       break;
     }
+    case Method::kGetNumAliases: {
+      auto typed_task = orig_task.template Cast<GetNumAliasesTask>();
+      typed_task->AggregateOut(replica_task);
+      break;
+    }
     case Method::kPollTelemetryLog: {
       auto typed_task = orig_task.template Cast<PollTelemetryLogTask>();
       typed_task->AggregateOut(replica_task);
@@ -1691,6 +1739,10 @@ void Runtime::DelTask(chi::u32 method, ctp::ipc::FullPtr<chi::Task> task_ptr) {
     }
     case Method::kGetCapacity: {
       ipc_manager->DelTask(task_ptr.template Cast<GetCapacityTask>());
+      break;
+    }
+    case Method::kGetNumAliases: {
+      ipc_manager->DelTask(task_ptr.template Cast<GetNumAliasesTask>());
       break;
     }
     case Method::kPollTelemetryLog: {

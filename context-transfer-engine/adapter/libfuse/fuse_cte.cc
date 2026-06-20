@@ -90,6 +90,14 @@ static void *cte_fuse_init(struct fuse_conn_info *conn,
   (void)conn;
   cfg->use_ino = 0;
   cfg->direct_io = 1;
+  // Disable the kernel attribute/entry caches. Metadata (size, and especially
+  // st_nlink for hard links) can change without this FUSE process being the one
+  // that triggered the change, and there is no upcall to invalidate the cache.
+  // Without this, e.g. `ln a b; stat a` returns a's stale cached nlink. Every
+  // getattr/lookup goes to the chimod, which is the source of truth.
+  cfg->attr_timeout = 0;
+  cfg->entry_timeout = 0;
+  cfg->negative_timeout = 0;
 
   bool success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
   if (!success) {
@@ -149,7 +157,18 @@ static int cte_fuse_getattr(const char *path, struct stat *stbuf,
     stbuf->st_nlink = 2;
   } else {
     stbuf->st_mode = S_IFREG | 0644;
-    stbuf->st_nlink = 1;
+    // POSIX link count = canonical name (1) + tag-level hard-link aliases.
+    // Ask the CTE core how many extra names are bound to this tag.
+    nlink_t nlink = 1;
+    auto *cte = CLIO_CTE_CLIENT;
+    if (cte != nullptr) {
+      auto na = cte->AsyncGetNumAliases(p);
+      na.Wait();
+      if (na->return_code_ == 0 && na->found_) {
+        nlink = static_cast<nlink_t>(na->num_aliases_) + 1;
+      }
+    }
+    stbuf->st_nlink = nlink;
     stbuf->st_size = static_cast<off_t>(t->size_);
   }
   return 0;
