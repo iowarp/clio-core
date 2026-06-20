@@ -199,6 +199,21 @@ public:
   chi::TaskResume GetTagSize(ctp::ipc::FullPtr<GetTagSizeTask> task, chi::RunContext &ctx);
 
   /**
+   * Get max (total) capacity — sum of max_capacity_ over targets registered on
+   * this node. Broadcast to sum across the cluster (AggregateOut adds replicas).
+   */
+  chi::TaskResume GetCapacity(ctp::ipc::FullPtr<GetCapacityTask> task, chi::RunContext &ctx);
+
+  /**
+   * GetNumAliases (Method::kGetNumAliases) - number of extra names (tag-level
+   * hard links) bound to a tag, by name or id. Excludes the canonical name, so
+   * the POSIX link count is num_aliases_ + 1. Broadcast op; the container that
+   * owns the tag answers.
+   */
+  chi::TaskResume GetNumAliases(ctp::ipc::FullPtr<GetNumAliasesTask> task,
+                                chi::RunContext &ctx);
+
+  /**
    * Schedule a task by resolving Dynamic pool queries.
    */
   chi::PoolQuery ScheduleTask(const ctp::ipc::FullPtr<chi::Task> &task) override;

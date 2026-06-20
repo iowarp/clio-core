@@ -217,6 +217,7 @@ struct TargetInfo {
   chi::u64 ops_written_;
   float target_score_;        // Target score (0-1, normalized log bandwidth)
   chi::u64 remaining_space_;  // Remaining allocatable space in bytes
+  chi::u64 max_capacity_;     // Total (max) capacity in bytes, fixed at register
   clio::run::bdev::PerfMetrics perf_metrics_;  // Performance metrics from bdev
   clio::run::bdev::PersistenceLevel persistence_level_;
   // Underlying bdev type, captured at RegisterTarget time. Used by the
@@ -233,6 +234,7 @@ struct TargetInfo {
         ops_written_(0),
         target_score_(0.0f),
         remaining_space_(0),
+        max_capacity_(0),
         persistence_level_(clio::run::bdev::PersistenceLevel::kVolatile),
         bdev_type_(clio::run::bdev::BdevType::kFile) {}
 
@@ -246,6 +248,7 @@ struct TargetInfo {
         ops_written_(0),
         target_score_(0.0f),
         remaining_space_(0),
+        max_capacity_(0),
         persistence_level_(clio::run::bdev::PersistenceLevel::kVolatile) {}
 #endif
 
@@ -260,6 +263,7 @@ struct TargetInfo {
         ops_written_(other.ops_written_),
         target_score_(other.target_score_),
         remaining_space_(other.remaining_space_),
+        max_capacity_(other.max_capacity_),
         perf_metrics_(other.perf_metrics_),
         persistence_level_(other.persistence_level_),
         bdev_type_(other.bdev_type_) {}
@@ -276,6 +280,7 @@ struct TargetInfo {
       ops_written_ = other.ops_written_;
       target_score_ = other.target_score_;
       remaining_space_ = other.remaining_space_;
+      max_capacity_ = other.max_capacity_;
       perf_metrics_ = other.perf_metrics_;
       persistence_level_ = other.persistence_level_;
       bdev_type_ = other.bdev_type_;
@@ -1941,6 +1946,138 @@ struct GetTagSizeTask : public chi::Task {
     Task::AggregateOut(other_base);
     auto replica = other_base.template Cast<GetTagSizeTask>();
     tag_size_ += replica->tag_size_;
+  }
+};
+
+/**
+ * GetCapacity task - total and remaining storage capacity.
+ *
+ * The handler sums max_capacity_ (total) and remaining_space_ (free) over the
+ * targets registered on this node, so a Local query returns this node's
+ * capacity. Because AggregateOut sums both fields across replicas, a Broadcast
+ * query returns the whole cluster's total and remaining capacity.
+ */
+struct GetCapacityTask : public chi::Task {
+  OUT chi::u64 total_capacity_;      // Summed total capacity in bytes
+  OUT chi::u64 remaining_capacity_;  // Summed remaining (free) capacity in bytes
+
+  // SHM constructor
+  GetCapacityTask()
+      : chi::Task(), total_capacity_(0), remaining_capacity_(0) {}
+
+  // Emplace constructor
+  CTP_CROSS_FUN explicit GetCapacityTask(const chi::TaskId &task_id,
+                                            const chi::PoolId &pool_id,
+                                            const chi::PoolQuery &pool_query)
+      : chi::Task(task_id, pool_id, pool_query, Method::kGetCapacity),
+        total_capacity_(0),
+        remaining_capacity_(0) {
+    task_id_ = task_id;
+    pool_id_ = pool_id;
+    method_ = Method::kGetCapacity;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+    ar(total_capacity_, remaining_capacity_);
+  }
+
+  void Copy(const ctp::ipc::FullPtr<GetCapacityTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+    total_capacity_ = other->total_capacity_;
+    remaining_capacity_ = other->remaining_capacity_;
+  }
+
+  /**
+   * AggregateOut: sum capacity from each node so a Broadcast yields the total
+   * and remaining cluster capacity.
+   */
+  void AggregateOut(const ctp::ipc::FullPtr<chi::Task> &other_base) {
+    Task::AggregateOut(other_base);
+    auto other = other_base.template Cast<GetCapacityTask>();
+    total_capacity_ += other->total_capacity_;
+    remaining_capacity_ += other->remaining_capacity_;
+  }
+};
+
+/**
+ * GetNumAliases task - number of extra names (tag-level hard links) bound to a
+ * tag, identified by name or id. The canonical name is NOT counted, so a file
+ * with no hard links returns 0; the POSIX link count is num_aliases_ + 1.
+ *
+ * The tag's metadata (and its aliases_ list) lives on a single container, so
+ * this is a Broadcast-safe op: AggregateOut keeps the answer from whichever
+ * replica located the tag (mirrors GetTagName).
+ */
+struct GetNumAliasesTask : public chi::Task {
+  IN chi::priv::string tag_name_;  // Tag name/path (empty => use tag_id_)
+  IN TagId tag_id_;                // Tag id (used when tag_name_ is empty)
+  OUT chi::u32 num_aliases_;       // # of extra names bound to the tag
+  OUT chi::u32 found_;             // 1 if the tag's metadata was located
+
+  // SHM constructor
+  GetNumAliasesTask()
+      : chi::Task(),
+        tag_name_(CLIO_PRIV_ALLOC),
+        tag_id_(TagId::GetNull()),
+        num_aliases_(0),
+        found_(0) {}
+
+  // Emplace constructor
+  CTP_CROSS_FUN explicit GetNumAliasesTask(const chi::TaskId &task_id,
+                                           const chi::PoolId &pool_id,
+                                           const chi::PoolQuery &pool_query,
+                                           const std::string &tag_name,
+                                           const TagId &tag_id)
+      : chi::Task(task_id, pool_id, pool_query, Method::kGetNumAliases),
+        tag_name_(CLIO_PRIV_ALLOC, tag_name),
+        tag_id_(tag_id),
+        num_aliases_(0),
+        found_(0) {
+    task_id_ = task_id;
+    pool_id_ = pool_id;
+    method_ = Method::kGetNumAliases;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+    ar(tag_name_, tag_id_);
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+    ar(num_aliases_, found_);
+  }
+
+  void Copy(const ctp::ipc::FullPtr<GetNumAliasesTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+    tag_name_ = other->tag_name_;
+    tag_id_ = other->tag_id_;
+    num_aliases_ = other->num_aliases_;
+    found_ = other->found_;
+  }
+
+  // Broadcast aggregation: keep the answer from whichever container owns the
+  // tag (the one that set found_).
+  void AggregateOut(const ctp::ipc::FullPtr<chi::Task> &other_base) {
+    Task::AggregateOut(other_base);
+    auto other = other_base.template Cast<GetNumAliasesTask>();
+    if (other->found_ && !found_) {
+      found_ = 1;
+      num_aliases_ = other->num_aliases_;
+    }
   }
 };
 

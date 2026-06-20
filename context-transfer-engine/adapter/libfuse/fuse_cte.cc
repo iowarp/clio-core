@@ -45,6 +45,7 @@
                                   // apptainer --fusemount fd-injection path)
 #include <sys/uio.h>              // struct iovec, writev
 #include <sys/mount.h>            // mount syscall
+#include <sys/statvfs.h>          // struct statvfs (statfs op)
 #include <unistd.h>               // read, getuid, getgid
 #include <cerrno>                 // errno
 #include <cstdio>                 // snprintf, fprintf
@@ -52,6 +53,7 @@
 
 #include "clio_runtime/clio_runtime.h"
 #include "clio_cte/core/content_transfer_engine.h"
+#include "clio_cte/core/core_client.h"  // CLIO_CTE_CLIENT + GetCapacity
 #include "clio_cte/filesystem/filesystem_client.h"
 
 using namespace clio::cae::fuse;
@@ -88,6 +90,14 @@ static void *cte_fuse_init(struct fuse_conn_info *conn,
   (void)conn;
   cfg->use_ino = 0;
   cfg->direct_io = 1;
+  // Disable the kernel attribute/entry caches. Metadata (size, and especially
+  // st_nlink for hard links) can change without this FUSE process being the one
+  // that triggered the change, and there is no upcall to invalidate the cache.
+  // Without this, e.g. `ln a b; stat a` returns a's stale cached nlink. Every
+  // getattr/lookup goes to the chimod, which is the source of truth.
+  cfg->attr_timeout = 0;
+  cfg->entry_timeout = 0;
+  cfg->negative_timeout = 0;
 
   bool success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
   if (!success) {
@@ -99,6 +109,11 @@ static void *cte_fuse_init(struct fuse_conn_info *conn,
   if (!clio::cte::filesystem::CLIO_CFS_CLIENT_INIT()) {
     fprintf(stderr, "ERROR: filesystem client init failed\n");
     return nullptr;
+  }
+  // Bind the CTE core client to the same clio_cte_core pool (idempotent) so
+  // statfs can query real capacity via GetCapacity.
+  if (!clio::cte::core::CLIO_CTE_CLIENT_INIT()) {
+    fprintf(stderr, "WARNING: CTE core client init failed; statfs capacity=0\n");
   }
   return nullptr;
 }
@@ -142,7 +157,18 @@ static int cte_fuse_getattr(const char *path, struct stat *stbuf,
     stbuf->st_nlink = 2;
   } else {
     stbuf->st_mode = S_IFREG | 0644;
-    stbuf->st_nlink = 1;
+    // POSIX link count = canonical name (1) + tag-level hard-link aliases.
+    // Ask the CTE core how many extra names are bound to this tag.
+    nlink_t nlink = 1;
+    auto *cte = CLIO_CTE_CLIENT;
+    if (cte != nullptr) {
+      auto na = cte->AsyncGetNumAliases(p);
+      na.Wait();
+      if (na->return_code_ == 0 && na->found_) {
+        nlink = static_cast<nlink_t>(na->num_aliases_) + 1;
+      }
+    }
+    stbuf->st_nlink = nlink;
     stbuf->st_size = static_cast<off_t>(t->size_);
   }
   return 0;
@@ -390,6 +416,47 @@ static int cte_fuse_rename(const char *from, const char *to,
 // Main
 // ============================================================================
 
+// Report filesystem statistics. Total and remaining capacity are the real
+// cluster-wide values, obtained from the CTE: GetCapacity sums the registered
+// targets' total and remaining capacity per node, and a Broadcast aggregates
+// that across the cluster (the task's AggregateOut sums per-node results).
+// Reporting a non-zero capacity also matters operationally: a 0-block fs is
+// hidden by `df` (which lists no path), which breaks tools that probe free
+// space and xfstests' mount detection.
+static int cte_fuse_statfs(const char *path, struct statvfs *stbuf) {
+  (void)path;
+  std::memset(stbuf, 0, sizeof(*stbuf));
+  constexpr fsblkcnt_t kBlockSize = 4096;
+
+  chi::u64 total_bytes = 0;
+  chi::u64 remaining_bytes = 0;
+  auto *cte = CLIO_CTE_CLIENT;
+  if (cte != nullptr) {
+    // Broadcast: total + remaining capacity across the whole cluster.
+    auto t = cte->AsyncGetCapacity(chi::PoolQuery::Broadcast());
+    t.Wait();
+    if (t->return_code_ == 0) {
+      total_bytes = t->total_capacity_;
+      remaining_bytes = t->remaining_capacity_;
+    }
+  }
+  fsblkcnt_t total_blocks = total_bytes / kBlockSize;
+  fsblkcnt_t free_blocks = remaining_bytes / kBlockSize;
+
+  stbuf->f_bsize = kBlockSize;
+  stbuf->f_frsize = kBlockSize;
+  stbuf->f_blocks = total_blocks;
+  // Report real remaining space as both free and available (no reservation
+  // distinction), so df shows used = total - remaining.
+  stbuf->f_bfree = free_blocks;
+  stbuf->f_bavail = free_blocks;
+  stbuf->f_files = static_cast<fsfilcnt_t>(1) << 20;
+  stbuf->f_ffree = static_cast<fsfilcnt_t>(1) << 20;
+  stbuf->f_favail = static_cast<fsfilcnt_t>(1) << 20;
+  stbuf->f_namemax = 255;
+  return 0;
+}
+
 static const struct fuse_operations cte_fuse_ops = {
     .getattr = cte_fuse_getattr,
     .mkdir = cte_fuse_mkdir,
@@ -401,6 +468,7 @@ static const struct fuse_operations cte_fuse_ops = {
     .open = cte_fuse_open,
     .read = cte_fuse_read,
     .write = cte_fuse_write,
+    .statfs = cte_fuse_statfs,
     .flush = cte_fuse_flush,
     .release = cte_fuse_release,
     .fsync = cte_fuse_fsync,

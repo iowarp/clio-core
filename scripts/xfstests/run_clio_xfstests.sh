@@ -63,12 +63,16 @@ cleanup() {
 }
 trap cleanup EXIT
 
-mount_fuse() {  # $1 = mountpoint, $2 = with_runtime(1/0)
-  local mnt="$1" with_rt="$2"
-  echo "[xfstests] mounting clio FUSE at ${mnt} (runtime=${with_rt})"
+mount_fuse() {  # $1 = mountpoint, $2 = with_runtime(1/0), $3 = fsname (mount source)
+  local mnt="$1" with_rt="$2" fsname="$3"
+  echo "[xfstests] mounting clio FUSE at ${mnt} (runtime=${with_rt}, fsname=${fsname})"
+  # Distinct -o fsname per mount so xfstests can tell TEST_DEV and SCRATCH_DEV
+  # apart: _check_mounted_on uses `findmnt -S <dev>` and aborts if a device
+  # appears mounted on more than one target. (Both mounts otherwise share the
+  # source "clio_cte_fuse".)
   CHI_REPO_PATH="${BUILD_BIN}" LD_LIBRARY_PATH="${BUILD_BIN}:${HOME}/.local/lib:${LD_LIBRARY_PATH:-}" \
     CLIO_WITH_RUNTIME="${with_rt}" CLIO_BIND_ADDR=127.0.0.1 \
-    "${FUSE_BIN}" "${mnt}" -f &
+    "${FUSE_BIN}" "${mnt}" -o "fsname=${fsname}" -f &
   FUSE_PIDS+=("$!")
   # wait for the mount to appear
   for _ in $(seq 1 50); do
@@ -79,44 +83,70 @@ mount_fuse() {  # $1 = mountpoint, $2 = with_runtime(1/0)
   return 1
 }
 
-# TEST mount brings up the co-located runtime; SCRATCH mount joins as a client.
-mount_fuse "${TEST_DIR}" 1 || exit 1
-mount_fuse "${SCRATCH_MNT}" 0 || echo "[xfstests] warning: scratch mount failed (SCRATCH tests will notrun)"
+# --- root requirement -------------------------------------------------------
+# xfstests' ./check refuses to run unless euid==0. Re-exec under a user+mount
+# namespace ('unshare -r' maps the caller to root) so this works unprivileged;
+# a real-root invocation skips this.
+if [ "$(id -u)" -ne 0 ] && [ -z "${CLIO_XFS_INNS:-}" ]; then
+  echo "[xfstests] not root; re-executing under 'unshare -rm' (namespaced root)"
+  exec env CLIO_XFS_INNS=1 unshare -rm "$0" "$@"
+fi
 
 # --- xfstests config --------------------------------------------------------
-# A from-scratch FUSE fs has no mkfs/mount-by-device, so we present the already
-# mounted dirs and treat FSTYP generically. SCRATCH-reformatting tests will
-# 'notrun'; TEST_DIR-only tests execute.
+# SCRATCH_DEV is intentionally left UNSET: the clio fs can't be reformatted
+# (no mkfs/mount-by-device), and if SCRATCH_DEV is set ./check tries to mkfs it
+# during setup and aborts. With it unset, TEST_DIR tests run and
+# scratch-reformatting tests 'notrun'. A distinct -o fsname lets ./check's
+# device->mount detection (df / findmnt -S) recognize the already-mounted fs.
 export FSTYP="${FSTYP:-fuse}"
-export TEST_DEV="${TEST_DEV:-clio_fuse_test}"
-export TEST_DIR
-export SCRATCH_DEV="${SCRATCH_DEV:-clio_fuse_scratch}"
-export SCRATCH_MNT
-cat > "${XFSTESTS_DIR}/local.config" <<EOF
+TEST_DEV="${TEST_DEV:-clio_test}"
+write_config() {
+  cat > "${XFSTESTS_DIR}/local.config" <<EOF
 export FSTYP=${FSTYP}
 export TEST_DEV=${TEST_DEV}
 export TEST_DIR=${TEST_DIR}
-export SCRATCH_DEV=${SCRATCH_DEV}
-export SCRATCH_MNT=${SCRATCH_MNT}
 EOF
-echo "[xfstests] local.config:"; cat "${XFSTESTS_DIR}/local.config"
+}
+write_config
 
-# --- run --------------------------------------------------------------------
+# (Re)mount the clio FUSE test fs fresh. ./check unmounts TEST_DIR after each
+# test and our FUSE fs can't be remounted by ./check itself, so every test gets
+# its own fresh mount + runtime.
+remount() {
+  pkill -9 -x clio_cte_fuse 2>/dev/null; pkill -9 -x clio_run 2>/dev/null
+  fusermount3 -u "${TEST_DIR}" 2>/dev/null
+  rm -rf "/tmp/chimaera_$(id -un)" /dev/shm/chimaera* 2>/dev/null
+  sleep 0.5
+  mount_fuse "${TEST_DIR}" 1 "${TEST_DEV}"
+}
+
+# --- resolve test list (expands groups like '-g quick' via ./check -n) ------
 cd "${XFSTESTS_DIR}" || exit 1
-if [ "$#" -gt 0 ]; then
-  ARGS=("$@")
-elif [ -n "${TESTS:-}" ]; then
-  # shellcheck disable=SC2206
-  ARGS=(${TESTS})
-else
-  # A small, file-data-focused default set: open/write/read/seek/truncate,
-  # the exact surface the chimod implements. Expand as the fs matures.
-  ARGS=(generic/001 generic/002 generic/005 generic/007 generic/011
-        generic/013 generic/124 generic/130)
-fi
+if [ "$#" -gt 0 ]; then RAW=("$@")
+elif [ -n "${TESTS:-}" ]; then RAW=(${TESTS})  # shellcheck disable=SC2206
+else RAW=(generic/001 generic/002 generic/005 generic/007 generic/011
+          generic/013 generic/124 generic/130); fi
 
-echo "[xfstests] running: ./check ${ARGS[*]}"
-./check "${ARGS[@]}"
-rc=$?
-echo "[xfstests] ./check exit=${rc}"
-exit "${rc}"
+remount >/dev/null 2>&1 || { echo "ERROR: initial clio FUSE mount failed" >&2; exit 1; }
+mapfile -t LIST < <(./check -n "${RAW[@]}" 2>/dev/null | grep -E '^[a-z_]+/[0-9]+')
+[ "${#LIST[@]}" -eq 0 ] && LIST=("${RAW[@]}")
+echo "[xfstests] running ${#LIST[@]} test(s) (mount-per-test)"
+
+# --- run, one fresh mount per test ------------------------------------------
+pass=0; fail=0; notrun=0; hang=0; failed_list=""
+for t in "${LIST[@]}"; do
+  remount >/dev/null 2>&1 || { echo "${t}: MOUNTFAIL"; fail=$((fail+1)); failed_list="${failed_list} ${t}"; continue; }
+  out=$(timeout "${CLIO_XFS_PERTEST_TIMEOUT:-90}" ./check "${t}" 2>/dev/null)
+  rc=$?
+  if [ "${rc}" -eq 124 ]; then echo "${t}: HANG"; hang=$((hang+1)); failed_list="${failed_list} ${t}(hang)"
+  elif echo "${out}" | grep -q "^Passed all"; then echo "${t}: pass"; pass=$((pass+1))
+  elif echo "${out}" | grep -q "^Not run:"; then echo "${t}: notrun"; notrun=$((notrun+1))
+  else echo "${t}: FAIL"; fail=$((fail+1)); failed_list="${failed_list} ${t}"; fi
+done
+
+ran=$((pass+fail))
+echo "===================================================================="
+echo "[xfstests] TALLY: pass=${pass} fail=${fail} notrun=${notrun} hang=${hang} (list=${#LIST[@]})"
+[ "${ran}" -gt 0 ] && echo "[xfstests] pass rate (of run, excl. notrun): $((100*pass/ran))%"
+[ -n "${failed_list}" ] && echo "[xfstests] not passing:${failed_list}"
+exit 0

@@ -132,6 +132,52 @@ class Client : public clio::cte::core::Client {
     return ipc->Send(task);
   }
 
+  // ---- deferred-append pipeline ----
+  /** Kick off (or tick) the periodic local pending-append drain. */
+  chi::Future<AppendSequenceTask> AsyncAppendSequence(
+      double period_us = 0.0,
+      const chi::PoolQuery &pool_query = chi::PoolQuery::Local()) {
+    auto *ipc = CLIO_CPU_IPC;
+    auto task = ipc->NewTask<AppendSequenceTask>(chi::CreateTaskId(), pool_id_,
+                                                 pool_query);
+    if (period_us > 0.0) {
+      task->SetPeriod(period_us, chi::kMicro);
+      task->SetFlags(TASK_PERIODIC);
+    }
+    return ipc->Send(task);
+  }
+
+  /** Collect one tag's pending appends at its sequencer (ManyToOne batch). */
+  chi::Future<AppendCollectTask> AsyncAppendCollect(
+      const clio::cte::core::TagId &tag_id,
+      const std::vector<AppendEntry> &entries, const chi::PoolQuery &pool_query) {
+    auto *ipc = CLIO_CPU_IPC;
+    auto task = ipc->NewTask<AppendCollectTask>(chi::CreateTaskId(), pool_id_,
+                                                pool_query, tag_id, entries);
+    return ipc->Send(task);
+  }
+
+  /** Plan + dispatch one tag's batch (suspendable; submitted by AppendCollect). */
+  chi::Future<AppendPlanTask> AsyncAppendPlan(
+      const clio::cte::core::TagId &tag_id,
+      const std::vector<AppendEntry> &entries, const chi::PoolQuery &pool_query) {
+    auto *ipc = CLIO_CPU_IPC;
+    auto task = ipc->NewTask<AppendPlanTask>(chi::CreateTaskId(), pool_id_,
+                                             pool_query, tag_id, entries);
+    return ipc->Send(task);
+  }
+
+  /** Apply a slice of the merge plan (GetBlob->PutBlob->DelBlob). */
+  chi::Future<AppendExecutionTask> AsyncAppendExecution(
+      const clio::cte::core::TagId &tag_id,
+      const clio::cte::core::TagId &staging_tag_id,
+      const std::vector<AppendPlanStep> &steps, const chi::PoolQuery &pool_query) {
+    auto *ipc = CLIO_CPU_IPC;
+    auto task = ipc->NewTask<AppendExecutionTask>(
+        chi::CreateTaskId(), pool_id_, pool_query, tag_id, staging_tag_id, steps);
+    return ipc->Send(task);
+  }
+
   chi::Future<ReaddirTask> AsyncReaddir(const std::string &path) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<ReaddirTask>(chi::CreateTaskId(), pool_id_,

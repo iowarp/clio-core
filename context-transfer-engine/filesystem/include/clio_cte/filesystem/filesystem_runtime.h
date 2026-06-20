@@ -9,6 +9,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include <clio_runtime/clio_runtime.h>
 #include <clio_cte/core/core_client.h>
@@ -48,6 +49,11 @@ class Runtime : public chi::Container {
   chi::TaskResume Link(ctp::ipc::FullPtr<LinkTask> task, chi::RunContext &ctx);
   chi::TaskResume Readdir(ctp::ipc::FullPtr<ReaddirTask> task, chi::RunContext &ctx);
   chi::TaskResume StatSize(ctp::ipc::FullPtr<StatSizeTask> task, chi::RunContext &ctx);
+  // ---- deferred-append pipeline ----
+  chi::TaskResume AppendSequence(ctp::ipc::FullPtr<AppendSequenceTask> task, chi::RunContext &ctx);
+  chi::TaskResume AppendCollect(ctp::ipc::FullPtr<AppendCollectTask> task, chi::RunContext &ctx);
+  chi::TaskResume AppendPlan(ctp::ipc::FullPtr<AppendPlanTask> task, chi::RunContext &ctx);
+  chi::TaskResume AppendExecution(ctp::ipc::FullPtr<AppendExecutionTask> task, chi::RunContext &ctx);
 
   // ---- Container virtuals (defined in autogen/filesystem_lib_exec.cc) ----
   void Init(const chi::PoolId &pool_id, const std::string &pool_name,
@@ -62,7 +68,9 @@ class Runtime : public chi::Container {
   void LocalSaveTask(chi::u32 method, chi::DefaultSaveArchive &archive,
                      ctp::ipc::FullPtr<chi::Task> task_ptr) override;
   void AggregateOut(chi::u32 method, ctp::ipc::FullPtr<chi::Task> orig_task,
-                   const ctp::ipc::FullPtr<chi::Task> &replica_task) override;
+                    const ctp::ipc::FullPtr<chi::Task> &replica_task) override;
+  void AggregateIn(chi::u32 method, ctp::ipc::FullPtr<chi::Task> agg_task,
+                   const ctp::ipc::FullPtr<chi::Task> &member_task) override;
   void DelTask(chi::u32 method, ctp::ipc::FullPtr<chi::Task> task_ptr) override;
   void SaveTask(chi::u32 method, chi::SaveTaskArchive &archive,
                 ctp::ipc::FullPtr<chi::Task> task_ptr) override;
@@ -79,6 +87,13 @@ class Runtime : public chi::Container {
   // CTE core client this filesystem sits over (set at Create from next_pool_id_).
   clio::cte::core::Client cte_;
   chi::PoolId next_pool_id_ = chi::PoolId::GetNull();
+  // Client bound to THIS filesystem pool, for self-submitted pipeline tasks
+  // (periodic AppendSequence, AppendCollect, AppendExecution).
+  Client self_;
+  // Staging tag for append data blobs. Append writes the bytes here (NOT under
+  // the file's tag) so GetTagSize(file_tag) reports the true file tail,
+  // unpolluted by still-unmerged staged appends. Resolved once at Create.
+  clio::cte::core::TagId staging_tag_id_ = clio::cte::core::TagId::GetNull();
 
   // ---- per-file logical-size metadata + handle table ----
   struct FileInfo {
@@ -90,6 +105,21 @@ class Runtime : public chi::Container {
   std::unordered_map<chi::u64, std::shared_ptr<FileInfo>> handles_;  // handle -> file
   std::unordered_map<std::string, std::shared_ptr<FileInfo>> by_path_;
   std::atomic<chi::u64> next_handle_{1};
+
+  // ---- deferred-append pipeline state ----
+  // Per-node logical append counter (orders appends sharing a UTC tick).
+  std::atomic<chi::u64> append_logical_{0};
+  // Pending appends placed locally, awaiting the periodic AppendSequence drain.
+  // Multi-producer (worker threads running Append), single-consumer
+  // (AppendSequence) — guarded by a mutex rather than a fixed-capacity ring so
+  // a burst of appends can never be silently dropped.
+  struct PendingAppend {
+    clio::cte::core::TagId tag_id_;
+    AppendEntry entry_;
+  };
+  std::mutex append_mu_;
+  std::vector<PendingAppend> append_pending_;
+  bool append_seq_started_ = false;  // periodic AppendSequence kicked off once
 };
 
 }  // namespace clio::cte::filesystem

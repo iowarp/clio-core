@@ -22,6 +22,9 @@
 #ifndef CLIO_CTE_FILESYSTEM_FILESYSTEM_TASKS_H_
 #define CLIO_CTE_FILESYSTEM_FILESYSTEM_TASKS_H_
 
+#include <string>
+#include <vector>
+
 #include <clio_runtime/clio_runtime.h>
 #include <clio_runtime/task.h>
 #include <clio_runtime/admin/admin_tasks.h>
@@ -378,6 +381,151 @@ struct StatSizeTask : public chi::Task {
   template <typename Ar> void SerializeOut(Ar &ar) {
     Task::SerializeOut(ar); ar(exists_, size_);
   }
+};
+
+// ===========================================================================
+// Deferred-append pipeline
+//
+// Appends are NOT applied to the tail synchronously. Instead Append stamps a
+// (UTC, logical) order, writes the bytes as a standalone "data blob" under the
+// file's tag, and queues a pending entry. A periodic AppendSequence drains the
+// per-node queue and, per tag, submits an AppendCollect routed ManyToOne to the
+// tag's sequencer. There the batched members' entries are combined (AggregateIn)
+// into one global, timestamp-sorted batch (the "plan" phase): it reads the file
+// tail (GetTagSize minus this batch's still-staged data), lays each data blob
+// out into 1 MiB file pages, and dispatches AppendExecution slices (<=16 MiB
+// each) that GetBlob->PutBlob->DelBlob the data into the file pages.
+// ===========================================================================
+
+/** One pending append: a staged data blob waiting to be merged into a file. */
+struct AppendEntry {
+  std::string data_blob_id_;     ///< name of the staged blob (under file tag)
+  chi::u64 data_blob_size_ = 0;  ///< staged blob length in bytes
+  chi::u64 utc_ns_ = 0;          ///< wallclock at placement (primary sort key)
+  chi::u64 logical_ = 0;         ///< per-node logical counter (tiebreak)
+  template <class Ar> void serialize(Ar &ar) {
+    ar(data_blob_id_, data_blob_size_, utc_ns_, logical_);
+  }
+};
+
+/** One merge step: copy [size_] bytes of a data blob into a file page blob. */
+struct AppendPlanStep {
+  chi::u64 file_page_ = 0;       ///< destination file page index (blob name)
+  std::string data_blob_id_;     ///< source staged blob
+  chi::u64 off_in_page_ = 0;     ///< destination offset within the file page
+  chi::u64 off_in_data_ = 0;     ///< source offset within the data blob
+  chi::u64 size_ = 0;            ///< bytes copied by this step (<= data size)
+  chi::u64 data_blob_size_ = 0;  ///< full data blob size (the final step for a
+                                 ///< blob has size_==data_blob_size_ so its
+                                 ///< DelBlob can't race a partial copy)
+  template <class Ar> void serialize(Ar &ar) {
+    ar(file_page_, data_blob_id_, off_in_page_, off_in_data_, size_,
+       data_blob_size_);
+  }
+};
+
+/** AppendSequence: periodic local trigger to drain the pending-append queue. */
+struct AppendSequenceTask : public chi::Task {
+  AppendSequenceTask() : chi::Task() {}
+  explicit AppendSequenceTask(const chi::TaskId &task_id,
+                              const chi::PoolId &pool_id,
+                              const chi::PoolQuery &pool_query)
+      : chi::Task(task_id, pool_id, pool_query, Method::kAppendSequence) {}
+  void Copy(const ctp::ipc::FullPtr<AppendSequenceTask> &o) {
+    Task::Copy(o.template Cast<Task>());
+  }
+  template <typename Ar> void SerializeIn(Ar &ar) { Task::SerializeIn(ar); }
+  template <typename Ar> void SerializeOut(Ar &ar) { Task::SerializeOut(ar); }
+};
+
+/**
+ * AppendCollect: ManyToOne collective per tag. Each node submits its pending
+ * entries for the tag; AggregateIn concatenates them at the sequencer; the
+ * single aggregate run sorts + plans + dispatches the merge.
+ */
+struct AppendCollectTask : public chi::Task {
+  IN clio::cte::core::TagId tag_id_;
+  IN std::vector<AppendEntry> entries_;
+  OUT chi::u64 new_size_;  ///< file logical size after the batch is applied
+  AppendCollectTask()
+      : chi::Task(), tag_id_(clio::cte::core::TagId::GetNull()), new_size_(0) {}
+  explicit AppendCollectTask(const chi::TaskId &task_id,
+                             const chi::PoolId &pool_id,
+                             const chi::PoolQuery &pool_query,
+                             const clio::cte::core::TagId &tag_id,
+                             const std::vector<AppendEntry> &entries)
+      : chi::Task(task_id, pool_id, pool_query, Method::kAppendCollect),
+        tag_id_(tag_id), entries_(entries), new_size_(0) {}
+  void Copy(const ctp::ipc::FullPtr<AppendCollectTask> &o) {
+    Task::Copy(o.template Cast<Task>());
+    tag_id_ = o->tag_id_; entries_ = o->entries_; new_size_ = o->new_size_;
+  }
+  template <typename Ar> void SerializeIn(Ar &ar) {
+    Task::SerializeIn(ar); ar(tag_id_, entries_);
+  }
+  template <typename Ar> void SerializeOut(Ar &ar) {
+    Task::SerializeOut(ar); ar(new_size_);
+  }
+  /** ManyToOne: fold a batched member's pending entries into this aggregate. */
+  void AggregateIn(const ctp::ipc::FullPtr<chi::Task> &member_base) {
+    auto m = member_base.template Cast<AppendCollectTask>();
+    entries_.insert(entries_.end(), m->entries_.begin(), m->entries_.end());
+  }
+};
+
+/**
+ * AppendPlan: a REGULAR (suspendable) task that does the heavy planning work
+ * for one tag's batch. Submitted by the synchronous AppendCollect aggregate
+ * (the ManyToOne synthetic aggregate task can't itself suspend). Sorts the
+ * batch, reads the file tail, builds the page-merge plan, and dispatches
+ * AppendExecution slices.
+ */
+struct AppendPlanTask : public chi::Task {
+  IN clio::cte::core::TagId tag_id_;
+  IN std::vector<AppendEntry> entries_;
+  AppendPlanTask()
+      : chi::Task(), tag_id_(clio::cte::core::TagId::GetNull()) {}
+  explicit AppendPlanTask(const chi::TaskId &task_id, const chi::PoolId &pool_id,
+                          const chi::PoolQuery &pool_query,
+                          const clio::cte::core::TagId &tag_id,
+                          const std::vector<AppendEntry> &entries)
+      : chi::Task(task_id, pool_id, pool_query, Method::kAppendPlan),
+        tag_id_(tag_id), entries_(entries) {}
+  void Copy(const ctp::ipc::FullPtr<AppendPlanTask> &o) {
+    Task::Copy(o.template Cast<Task>());
+    tag_id_ = o->tag_id_; entries_ = o->entries_;
+  }
+  template <typename Ar> void SerializeIn(Ar &ar) {
+    Task::SerializeIn(ar); ar(tag_id_, entries_);
+  }
+  template <typename Ar> void SerializeOut(Ar &ar) { Task::SerializeOut(ar); }
+};
+
+/** AppendExecution: apply a slice of the merge plan (GetBlob->PutBlob->DelBlob). */
+struct AppendExecutionTask : public chi::Task {
+  IN clio::cte::core::TagId tag_id_;          // destination file tag
+  IN clio::cte::core::TagId staging_tag_id_;  // source staged data blobs
+  IN std::vector<AppendPlanStep> steps_;
+  AppendExecutionTask()
+      : chi::Task(), tag_id_(clio::cte::core::TagId::GetNull()),
+        staging_tag_id_(clio::cte::core::TagId::GetNull()) {}
+  explicit AppendExecutionTask(const chi::TaskId &task_id,
+                               const chi::PoolId &pool_id,
+                               const chi::PoolQuery &pool_query,
+                               const clio::cte::core::TagId &tag_id,
+                               const clio::cte::core::TagId &staging_tag_id,
+                               const std::vector<AppendPlanStep> &steps)
+      : chi::Task(task_id, pool_id, pool_query, Method::kAppendExecution),
+        tag_id_(tag_id), staging_tag_id_(staging_tag_id), steps_(steps) {}
+  void Copy(const ctp::ipc::FullPtr<AppendExecutionTask> &o) {
+    Task::Copy(o.template Cast<Task>());
+    tag_id_ = o->tag_id_; staging_tag_id_ = o->staging_tag_id_;
+    steps_ = o->steps_;
+  }
+  template <typename Ar> void SerializeIn(Ar &ar) {
+    Task::SerializeIn(ar); ar(tag_id_, staging_tag_id_, steps_);
+  }
+  template <typename Ar> void SerializeOut(Ar &ar) { Task::SerializeOut(ar); }
 };
 
 }  // namespace clio::cte::filesystem

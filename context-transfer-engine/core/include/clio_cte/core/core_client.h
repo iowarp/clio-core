@@ -493,6 +493,49 @@ class Client : public chi::ContainerClient {
   }
 
   /**
+   * Get max (total) storage capacity in bytes.
+   * @param pool_query Local() sums this node's targets; Broadcast() sums the
+   *        whole cluster (AggregateOut adds per-node results). Default Local.
+   */
+  chi::Future<GetCapacityTask> AsyncGetCapacity(
+      const chi::PoolQuery &pool_query = chi::PoolQuery::Local()) {
+    auto *ipc_manager = CLIO_CPU_IPC;
+    auto task = ipc_manager->NewTask<GetCapacityTask>(
+        chi::CreateTaskId(), pool_id_, pool_query);
+    return ipc_manager->Send(task);
+  }
+
+  /**
+   * Get the number of extra names (tag-level hard links) bound to a tag, by
+   * path/name. Excludes the canonical name, so the POSIX link count is
+   * num_aliases_ + 1. found_ is 1 if the tag exists.
+   * @param tag_name Tag name / absolute path.
+   * @param pool_query Broadcast() finds the tag wherever it lives; Local() if
+   *        the caller knows the tag is on this node. Default Local.
+   */
+  chi::Future<GetNumAliasesTask> AsyncGetNumAliases(
+      const std::string &tag_name,
+      const chi::PoolQuery &pool_query = chi::PoolQuery::Local()) {
+    auto *ipc_manager = CLIO_CPU_IPC;
+    auto task = ipc_manager->NewTask<GetNumAliasesTask>(
+        chi::CreateTaskId(), pool_id_, pool_query, tag_name, TagId::GetNull());
+    return ipc_manager->Send(task);
+  }
+
+  /**
+   * Get the number of extra names bound to a tag, by id. See the by-name
+   * overload above for the link-count semantics.
+   */
+  chi::Future<GetNumAliasesTask> AsyncGetNumAliases(
+      const TagId &tag_id,
+      const chi::PoolQuery &pool_query = chi::PoolQuery::Local()) {
+    auto *ipc_manager = CLIO_CPU_IPC;
+    auto task = ipc_manager->NewTask<GetNumAliasesTask>(
+        chi::CreateTaskId(), pool_id_, pool_query, std::string(), tag_id);
+    return ipc_manager->Send(task);
+  }
+
+  /**
    * Asynchronous poll telemetry log - returns immediately
    * @param minimum_logical_time Minimum logical time filter
    * @param pool_query Pool query for task routing (default: Dynamic)

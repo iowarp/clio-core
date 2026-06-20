@@ -25,12 +25,23 @@ target_link_libraries(test_priv_string_ext_exec
         clio_ctp_host
         ctp::serialize)
 
+add_executable(test_priv_unordered_map_ll_exec
+        test_priv_unordered_map_ll.cc)
+add_dependencies(test_priv_unordered_map_ll_exec clio_ctp_host)
+target_link_libraries(test_priv_unordered_map_ll_exec
+        clio_ctp_host
+        ctp::serialize
+        ${CMAKE_THREAD_LIBS_INIT})
+
 #------------------------------------------------------------------------------
 # Test Cases
 #------------------------------------------------------------------------------
 
 add_test(NAME ctp_priv_string_ext COMMAND
         ${CMAKE_BINARY_DIR}/bin/test_priv_string_ext_exec)
+
+add_test(NAME ctp_priv_umap_ll COMMAND
+        ${CMAKE_BINARY_DIR}/bin/test_priv_unordered_map_ll_exec)
 
 add_test(NAME ctp_priv_vector COMMAND
         ${CMAKE_BINARY_DIR}/bin/test_priv_vector_exec)
@@ -94,6 +105,7 @@ install(TARGETS
         test_priv_vector_exec
         test_priv_string_exec
         test_priv_string_ext_exec
+        test_priv_unordered_map_ll_exec
         LIBRARY DESTINATION lib
         ARCHIVE DESTINATION lib
         RUNTIME DESTINATION bin)

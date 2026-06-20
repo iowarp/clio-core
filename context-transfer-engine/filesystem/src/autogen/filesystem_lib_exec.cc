@@ -30,7 +30,11 @@ namespace clio::cte::filesystem {
   X(kUnlink, UnlinkTask, Unlink)          \
   X(kRename, RenameTask, Rename)          \
   X(kLink, LinkTask, Link)                \
-  X(kStatSize, StatSizeTask, StatSize)
+  X(kStatSize, StatSizeTask, StatSize)    \
+  X(kAppendSequence, AppendSequenceTask, AppendSequence)    \
+  X(kAppendCollect, AppendCollectTask, AppendCollect)       \
+  X(kAppendExecution, AppendExecutionTask, AppendExecution) \
+  X(kAppendPlan, AppendPlanTask, AppendPlan)
 
 void Runtime::Init(const chi::PoolId &pool_id, const std::string &pool_name,
                    chi::u32 container_id) {
@@ -183,10 +187,10 @@ ctp::ipc::FullPtr<chi::Task> Runtime::NewTask(chi::u32 method) {
 }
 
 void Runtime::AggregateOut(chi::u32 method, ctp::ipc::FullPtr<chi::Task> orig_task,
-                            const ctp::ipc::FullPtr<chi::Task> &replica_task) {
+                           const ctp::ipc::FullPtr<chi::Task> &replica_task) {
   switch (method) {
-#define X(MID, TASK, HANDLER)                                    \
-    case Method::MID:                                            \
+#define X(MID, TASK, HANDLER)                                      \
+    case Method::MID:                                              \
       orig_task.template Cast<TASK>()->AggregateOut(replica_task); \
       break;
     CLIO_FS_FOR_EACH_METHOD(X)
@@ -194,6 +198,15 @@ void Runtime::AggregateOut(chi::u32 method, ctp::ipc::FullPtr<chi::Task> orig_ta
     default:
       orig_task->AggregateOut(replica_task);
       break;
+  }
+}
+
+void Runtime::AggregateIn(chi::u32 method, ctp::ipc::FullPtr<chi::Task> agg_task,
+                          const ctp::ipc::FullPtr<chi::Task> &member_task) {
+  // Only AppendCollect combines member inputs (ManyToOne). All other methods
+  // keep the default no-op (the aggregate is a copy of the first member).
+  if (method == Method::kAppendCollect) {
+    agg_task.template Cast<AppendCollectTask>()->AggregateIn(member_task);
   }
 }
 

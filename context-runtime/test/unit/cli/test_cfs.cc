@@ -18,6 +18,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <set>
 #include <thread>
 #include <vector>
 
@@ -524,6 +525,76 @@ TEST_CASE("Cfs - filesystem chimod open/write/getattr/read/truncate",
     REQUIRE(rm->GetReturnCode() == 0);
     auto [ex, dir, sz] = gattr("/d1");
     REQUIRE(ex == 0);  // directory gone
+  }
+
+  // ---- Deferred-append pipeline ----
+  // Fire many appends concurrently (without awaiting each), so they pile into
+  // the pending queue and the periodic AppendSequence drains them across
+  // SEVERAL ManyToOne AppendCollect batches. Each append is placed locally +
+  // queued; AppendCollect (sorted by UTC/logical) plans the merge against the
+  // file tail and AppendExecution writes it into the pages. Because at most one
+  // aggregate per tag runs at a time (BatchManager serialization), successive
+  // batches see a fully-settled tail, so the bytes land in submission order and
+  // span page boundaries cleanly. Verify the exact ordered concatenation.
+  {
+    const std::string apath = "/append_test.bin";
+    auto aop = cfs.AsyncOpen(apath, O_CREAT | O_RDWR, 0644);
+    aop.Wait();
+    REQUIRE(aop->GetReturnCode() == 0);
+    chi::u64 ah = aop->handle_;
+    REQUIRE(ah != 0);
+
+    constexpr chi::u64 kChunk = 4096;
+    constexpr int kNum = 16;  // concurrent stress (probe for corruption)
+    std::vector<ctp::ipc::FullPtr<char>> abufs;
+    std::vector<chi::Future<clio::cte::filesystem::AppendTask>> afuts;
+    for (int c = 0; c < kNum; ++c) {
+      char mark = static_cast<char>('a' + c);
+      ctp::ipc::FullPtr<char> ab = ipc->AllocateBuffer(kChunk);
+      REQUIRE(!ab.IsNull());
+      memset(ab.ptr_, mark, kChunk);
+      abufs.push_back(ab);
+      afuts.push_back(cfs.AsyncAppend(ah, kChunk, ab.shm_.template Cast<void>()));
+    }
+    for (auto &f : afuts) { f.Wait(); REQUIRE(f->GetReturnCode() == 0); }
+    for (auto &ab : abufs) ipc->FreeBuffer(ab);
+    const chi::u64 total = kChunk * kNum;
+
+    // Concurrent appends are ordered by (UTC, logical), not submission order, so
+    // we don't pin the order. The pipeline (periodic AppendSequence -> ManyToOne
+    // AppendCollect -> AppendPlan -> AppendExecution) must merge them with no
+    // overlap or corruption: poll-read until the file is exactly kNum back-to-
+    // back kChunk regions, each a single distinct marker, all present once.
+    bool matched = false;
+    for (int attempt = 0; attempt < 400 && !matched; ++attempt) {
+      ctp::ipc::FullPtr<char> rb = ipc->AllocateBuffer(total);
+      REQUIRE(!rb.IsNull());
+      memset(rb.ptr_, 0, total);
+      auto r = cfs.AsyncRead(ah, 0, total, rb.shm_.template Cast<void>());
+      r.Wait();
+      bool ok = (r->GetReturnCode() == 0 && r->bytes_read_ == total);
+      if (ok) {
+        std::set<char> seen;
+        for (int c = 0; c < kNum && ok; ++c) {
+          const char *region = rb.ptr_ + static_cast<size_t>(c) * kChunk;
+          char m = region[0];
+          for (chi::u64 i = 0; i < kChunk; ++i) {
+            if (region[i] != m) { ok = false; break; }
+          }
+          if (ok && m >= 'a' && m < 'a' + kNum) seen.insert(m);
+          else ok = false;
+        }
+        if (ok && seen.size() == static_cast<size_t>(kNum)) matched = true;
+      }
+      ipc->FreeBuffer(rb);
+      if (!matched) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+      }
+    }
+    REQUIRE(matched);  // all appends merged intact into their own regions
+
+    auto acl = cfs.AsyncClose(ah);
+    acl.Wait();
   }
 
   RunCliTimed({"stop", "--grace-period", "2000"}, 90);

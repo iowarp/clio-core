@@ -707,6 +707,8 @@ chi::TaskResume Runtime::RegisterTarget(ctp::ipc::FullPtr<RegisterTargetTask> ta
     }
     target_info.remaining_space_ =
         total_size;  // Use actual remaining space from bdev
+    target_info.max_capacity_ =
+        total_size;  // Total (max) capacity, fixed for the life of the target
     target_info.perf_metrics_ =
         perf_metrics;  // Store the entire PerfMetrics structure
     target_info.persistence_level_ = GetPersistenceLevelForTarget(target_name);
@@ -1698,23 +1700,6 @@ chi::TaskResume Runtime::RenameTag(ctp::ipc::FullPtr<RenameTagTask> task,
     // O(1) regardless of how many descendants it has.
     if (IsHierPath(old_name) && IsHierPath(new_name)) {
       // ---- Hierarchical move: rebind only the leaf under its new parent. ----
-      // Phase A: resolve the target tag id and its current stored name.
-      std::string old_rel;
-      {
-        chi::ScopedCoRwReadLock lock(tag_map_lock_);
-        if (tag_id.IsNull()) {
-          tag_id = ResolvePathToIdLocked(old_name);
-        }
-        if (tag_id.IsNull()) {
-          task->return_code_ = 1;  // source path not found
-          CLIO_CO_RETURN;
-        }
-        TagInfo *info = tag_id_to_info_.find(tag_id);
-        if (info != nullptr) {
-          old_rel = info->tag_name_.str();
-        }
-      }
-
       // Split destination into parent path + leaf.
       std::vector<std::string> comps = SplitPathComponents(new_name);
       if (comps.empty()) {
@@ -1727,24 +1712,44 @@ chi::TaskResume Runtime::RenameTag(ctp::ipc::FullPtr<RenameTagTask> task,
         new_parent_path += (i == 0 ? "" : "/") + comps[i];
       }
 
-      // Phase B: get-or-create the destination parent chain (no lock held —
-      // GetOrCreateTagChain takes tag_map_lock_ itself). Auto-creates missing
-      // parents (mkdir -p semantics).
+      // Get-or-create the destination parent chain FIRST, before taking the tag
+      // map lock — GetOrCreateTagChain acquires tag_map_lock_ itself, so it
+      // cannot run while we hold it. Auto-creates missing parents (mkdir -p).
       TagId new_parent_id = GetOrCreateTagChain(new_parent_path);
       std::string new_rel = MakeRelativeName(new_parent_id, new_leaf);
 
-      // Phase C: atomically move the name binding and refresh the stored name.
+      // Resolve the source, move the name binding, and refresh the stored name
+      // as a SINGLE atomic read-modify-write under the write lock. The previous
+      // design read the tag's current name under a read lock, released it, then
+      // erased that value under a separate write lock — so a name read before
+      // the lock could go stale and erase a binding a racing rename/create had
+      // since reassigned to a *different* tag. That left a tag still resolvable
+      // upward (readdir/stat list it) but not forward (unlink/rmdir cannot find
+      // it). Reading the canonical name under the SAME lock that erases it, with
+      // no gap, serializes overlapping renames and keeps tag_name_to_id_ and the
+      // per-tag canonical name in agreement. See issue #596.
       {
         chi::ScopedCoRwWriteLock lock(tag_map_lock_);
-        if (!old_rel.empty()) {
-          tag_name_to_id_.erase(old_rel);
+        if (tag_id.IsNull()) {
+          tag_id = ResolvePathToIdLocked(old_name);
+        }
+        if (tag_id.IsNull()) {
+          task->return_code_ = 1;  // source path not found
+          CLIO_CO_RETURN;
+        }
+        TagInfo *info = tag_id_to_info_.find(tag_id);
+        if (info == nullptr) {
+          task->return_code_ = 1;  // source tag has no metadata
+          CLIO_CO_RETURN;
+        }
+        // Fresh read of the canonical name, under the lock that erases it.
+        std::string cur_rel = info->tag_name_.str();
+        if (cur_rel != new_rel) {
+          tag_name_to_id_.erase(cur_rel);
         }
         tag_name_to_id_.insert_or_assign(new_rel, tag_id);
-        TagInfo *info = tag_id_to_info_.find(tag_id);
-        if (info != nullptr) {
-          info->tag_name_ = chi::priv::string(CLIO_PRIV_ALLOC, new_rel);
-          info->last_modified_ = GetCurrentTimeNs();
-        }
+        info->tag_name_ = chi::priv::string(CLIO_PRIV_ALLOC, new_rel);
+        info->last_modified_ = GetCurrentTimeNs();
       }
       task->tag_id_ = tag_id;
       task->return_code_ = 0;
@@ -2175,6 +2180,99 @@ chi::TaskResume Runtime::GetTagSize(ctp::ipc::FullPtr<GetTagSizeTask> task,
   } catch (const std::exception &e) {
     task->return_code_ = 1;
     task->tag_size_ = 0;
+  }
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+chi::TaskResume Runtime::GetCapacity(
+    ctp::ipc::FullPtr<GetCapacityTask> task, chi::RunContext &ctx) {
+#ifdef __NVCOMPILER
+  chi::RunContext &rctx = ctx;
+#else
+  (void)ctx;
+#endif
+  CLIO_TASK_BODY_BEGIN
+  // Sum the total and remaining capacity of every target registered on this
+  // node. A Local query returns this node's capacity; the task's AggregateOut
+  // sums replicas, so a Broadcast returns the whole cluster's capacity.
+  //
+  // Iterate registered_targets_ (the canonical map) rather than the target_list_
+  // mirror: the PutBlob/Free data path debits/credits remaining_space_ on the
+  // canonical entry only (the mirror is refreshed lazily by StatTargets), so the
+  // mirror lags real usage. for_each takes the map's internal lock for a
+  // consistent snapshot; target_lock_ (read) guards structural stability.
+  chi::u64 total = 0;
+  chi::u64 remaining = 0;
+  {
+    chi::ScopedCoRwReadLock read_lock(target_lock_);
+    registered_targets_.for_each(
+        [&total, &remaining](const chi::PoolId & /*key*/, const TargetInfo &t) {
+          total += t.max_capacity_;
+          remaining += t.remaining_space_;
+        });
+  }
+  task->total_capacity_ = total;
+  task->remaining_capacity_ = remaining;
+  task->return_code_ = 0;
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+chi::TaskResume Runtime::GetNumAliases(
+    ctp::ipc::FullPtr<GetNumAliasesTask> task, chi::RunContext &ctx) {
+#ifdef __NVCOMPILER
+  chi::RunContext &rctx = ctx;
+#else
+  (void)ctx;
+#endif
+  CLIO_TASK_BODY_BEGIN
+  try {
+    task->num_aliases_ = 0;
+    task->found_ = 0;
+
+    chi::ScopedCoRwReadLock lock(tag_map_lock_);
+
+    // Resolve the tag id: prefer an explicit id, else resolve the name the same
+    // way DelTag does — hierarchical "$tagid{parent}/leaf" key first, then a
+    // verbatim lookup for flat names and flat aliases.
+    TagId tag_id = task->tag_id_;
+    if (tag_id.IsNull()) {
+      std::string tag_name = task->tag_name_.str();
+      if (!tag_name.empty()) {
+        if (IsHierPath(tag_name)) {
+          if (tag_name == "/") {
+            TagId *r = tag_name_to_id_.find(std::string("/"));
+            if (r != nullptr) tag_id = *r;
+          } else {
+            std::string parent_path, leaf;
+            if (SplitParentLeaf(tag_name, parent_path, leaf)) {
+              TagId parent_id = ResolvePathToIdLocked(parent_path);
+              if (!parent_id.IsNull()) {
+                TagId *p = tag_name_to_id_.find(MakeRelativeName(parent_id, leaf));
+                if (p != nullptr) tag_id = *p;
+              }
+            }
+          }
+        }
+        if (tag_id.IsNull()) {
+          TagId *p = tag_name_to_id_.find(tag_name);
+          if (p != nullptr) tag_id = *p;
+        }
+      }
+    }
+
+    if (!tag_id.IsNull()) {
+      TagInfo *info = tag_id_to_info_.find(tag_id);
+      if (info != nullptr) {
+        task->num_aliases_ = static_cast<chi::u32>(info->aliases_.size());
+        task->found_ = 1;
+      }
+    }
+    task->return_code_ = 0;  // found_ conveys existence; the op itself is fine
+  } catch (const std::exception &e) {
+    HLOG(kError, "GetNumAliases failed: {}", e.what());
+    task->return_code_ = 1;
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END

@@ -994,11 +994,26 @@ void Worker::ExecTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
     if (run_ctx->yield_time_us_ > 0) {
       AddToBlockedQueue(run_ctx);
     }
+    // The worker is no longer running this coroutine; drop the current
+    // RunContext so between-task main-loop code (below) can't read it. See the
+    // note at the end of this function.
+    SetCurrentRunContext(nullptr);
     return;
   }
 
   // End task execution and cleanup (handles periodic rescheduling internally)
   EndTask(task_ptr, run_ctx, true);
+
+  // Clear the worker's current RunContext now that this task is no longer
+  // executing. Main-loop code that runs *between* tasks — notably
+  // BatchManager::FlushDue -> CreateTaskId -> Worker::GetCurrentTask — must not
+  // dereference current_run_context_ after the task it pointed at has been
+  // freed. A completed remote task's RunContext is destroyed on the network
+  // (ZMQ) thread, so leaving current_run_context_ set here is a cross-thread
+  // dangling pointer (observed as a heap-use-after-free in CreateTaskId during
+  // a ManyToOne flush). run_ctx may itself be freed by EndTask above, so only
+  // store nullptr — never read run_ctx past this point.
+  SetCurrentRunContext(nullptr);
 }
 
 
