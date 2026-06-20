@@ -89,7 +89,15 @@ static void *cte_fuse_init(struct fuse_conn_info *conn,
                            struct fuse_config *cfg) {
   (void)conn;
   cfg->use_ino = 0;
-  cfg->direct_io = 1;
+  // Keep the kernel page cache for file data (direct_io OFF). mmap on a FUSE
+  // file is served generically by the page cache — there is no .mmap callback
+  // in the high-level API; the kernel faults mapped pages through cte_fuse_read
+  // and flushes dirty pages through cte_fuse_write. direct_io bypasses the page
+  // cache, so the kernel returns ENODEV ("No such device") for any mmap (issue
+  // #597). Writes stay write-through (no FUSE_CAP_WRITEBACK_CACHE), so each
+  // write() still reaches the chimod synchronously and the exact logical size
+  // is preserved; only mmap dirty pages flush lazily, which is inherent to mmap.
+  cfg->direct_io = 0;
   // Disable the kernel attribute/entry caches. Metadata (size, and especially
   // st_nlink for hard links) can change without this FUSE process being the one
   // that triggered the change, and there is no upcall to invalidate the cache.
