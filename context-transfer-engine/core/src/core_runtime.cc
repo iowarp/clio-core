@@ -1700,23 +1700,6 @@ chi::TaskResume Runtime::RenameTag(ctp::ipc::FullPtr<RenameTagTask> task,
     // O(1) regardless of how many descendants it has.
     if (IsHierPath(old_name) && IsHierPath(new_name)) {
       // ---- Hierarchical move: rebind only the leaf under its new parent. ----
-      // Phase A: resolve the target tag id and its current stored name.
-      std::string old_rel;
-      {
-        chi::ScopedCoRwReadLock lock(tag_map_lock_);
-        if (tag_id.IsNull()) {
-          tag_id = ResolvePathToIdLocked(old_name);
-        }
-        if (tag_id.IsNull()) {
-          task->return_code_ = 1;  // source path not found
-          CLIO_CO_RETURN;
-        }
-        TagInfo *info = tag_id_to_info_.find(tag_id);
-        if (info != nullptr) {
-          old_rel = info->tag_name_.str();
-        }
-      }
-
       // Split destination into parent path + leaf.
       std::vector<std::string> comps = SplitPathComponents(new_name);
       if (comps.empty()) {
@@ -1729,24 +1712,44 @@ chi::TaskResume Runtime::RenameTag(ctp::ipc::FullPtr<RenameTagTask> task,
         new_parent_path += (i == 0 ? "" : "/") + comps[i];
       }
 
-      // Phase B: get-or-create the destination parent chain (no lock held —
-      // GetOrCreateTagChain takes tag_map_lock_ itself). Auto-creates missing
-      // parents (mkdir -p semantics).
+      // Get-or-create the destination parent chain FIRST, before taking the tag
+      // map lock — GetOrCreateTagChain acquires tag_map_lock_ itself, so it
+      // cannot run while we hold it. Auto-creates missing parents (mkdir -p).
       TagId new_parent_id = GetOrCreateTagChain(new_parent_path);
       std::string new_rel = MakeRelativeName(new_parent_id, new_leaf);
 
-      // Phase C: atomically move the name binding and refresh the stored name.
+      // Resolve the source, move the name binding, and refresh the stored name
+      // as a SINGLE atomic read-modify-write under the write lock. The previous
+      // design read the tag's current name under a read lock, released it, then
+      // erased that value under a separate write lock — so a name read before
+      // the lock could go stale and erase a binding a racing rename/create had
+      // since reassigned to a *different* tag. That left a tag still resolvable
+      // upward (readdir/stat list it) but not forward (unlink/rmdir cannot find
+      // it). Reading the canonical name under the SAME lock that erases it, with
+      // no gap, serializes overlapping renames and keeps tag_name_to_id_ and the
+      // per-tag canonical name in agreement. See issue #596.
       {
         chi::ScopedCoRwWriteLock lock(tag_map_lock_);
-        if (!old_rel.empty()) {
-          tag_name_to_id_.erase(old_rel);
+        if (tag_id.IsNull()) {
+          tag_id = ResolvePathToIdLocked(old_name);
+        }
+        if (tag_id.IsNull()) {
+          task->return_code_ = 1;  // source path not found
+          CLIO_CO_RETURN;
+        }
+        TagInfo *info = tag_id_to_info_.find(tag_id);
+        if (info == nullptr) {
+          task->return_code_ = 1;  // source tag has no metadata
+          CLIO_CO_RETURN;
+        }
+        // Fresh read of the canonical name, under the lock that erases it.
+        std::string cur_rel = info->tag_name_.str();
+        if (cur_rel != new_rel) {
+          tag_name_to_id_.erase(cur_rel);
         }
         tag_name_to_id_.insert_or_assign(new_rel, tag_id);
-        TagInfo *info = tag_id_to_info_.find(tag_id);
-        if (info != nullptr) {
-          info->tag_name_ = chi::priv::string(CLIO_PRIV_ALLOC, new_rel);
-          info->last_modified_ = GetCurrentTimeNs();
-        }
+        info->tag_name_ = chi::priv::string(CLIO_PRIV_ALLOC, new_rel);
+        info->last_modified_ = GetCurrentTimeNs();
       }
       task->tag_id_ = tag_id;
       task->return_code_ = 0;
