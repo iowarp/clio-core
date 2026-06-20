@@ -171,6 +171,41 @@ if(CLIO_CORE_ENABLE_TESTS)
       TIMEOUT 110
       LABELS "msan_skip"
     )
+
+    # Focused rename stress + concurrency test (issue #597): POSIX
+    # rename-overwrite semantics and renames racing on shared destinations.
+    add_executable(chimaera_cfs_rename_test test_cfs_rename.cc)
+    target_include_directories(chimaera_cfs_rename_test PRIVATE
+      ${CLIO_RUN_ROOT}/include
+      ${CLIO_RUN_ROOT}/test
+    )
+    target_link_libraries(chimaera_cfs_rename_test
+      clio_cte_filesystem_client
+      clio_cte_core_client
+      clio_admin_client
+      chimaera_cxx
+      ctp::cxx
+      ${CMAKE_THREAD_LIBS_INIT}
+    )
+    target_compile_definitions(chimaera_cfs_rename_test PRIVATE
+      CLIO_RUN_EXE="$<TARGET_FILE:clio_run>")
+    add_dependencies(chimaera_cfs_rename_test clio_run clio_cte_filesystem_runtime)
+    set_target_properties(chimaera_cfs_rename_test PROPERTIES
+      CXX_STANDARD 20
+      CXX_STANDARD_REQUIRED ON
+      RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    add_test(
+      NAME cr_cli_cfs_rename
+      COMMAND chimaera_cfs_rename_test
+      WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    set_tests_properties(cr_cli_cfs_rename PROPERTIES
+      ENVIRONMENT "${_cli_live_env}"
+      RESOURCE_LOCK "chimaera_runtime_port"
+      TIMEOUT 180
+      LABELS "msan_skip"
+    )
   endif()
 
   # RestartLog unit test: pure file-level WAL behavior (no daemon).
