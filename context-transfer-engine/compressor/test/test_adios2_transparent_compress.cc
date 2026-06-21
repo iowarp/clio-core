@@ -45,7 +45,7 @@ static void EnsureInit() {
                           "test_transparent_compress_config.yaml";
   setenv("CLIO_SERVER_CONF", config_path.c_str(), 1);
 
-  bool success = clio::run::CLIO_INIT(clio::run::ChimaeraMode::kServer);
+  bool success = clio::run::CLIO_INIT(clio::run::RuntimeMode::kServer);
   REQUIRE(success);
   g_initialized = true;
   SimpleTest::g_test_finalize = clio::run::CLIO_RUNTIME_FINALIZE;

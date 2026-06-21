@@ -54,11 +54,11 @@ namespace {
 /**
  * Test helper to initialize CLIO Runtime system
  */
-class ChimaeraTestFixture {
+class ClioTestFixture {
  public:
-  ChimaeraTestFixture() {
+  ClioTestFixture() {
     // Use the unified CLIO Runtime initialization
-    bool success = clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, true);
+    bool success = clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true);
     REQUIRE(success);
     SimpleTest::g_test_finalize = clio::run::CLIO_RUNTIME_FINALIZE;
 
@@ -70,7 +70,7 @@ class ChimaeraTestFixture {
     REQUIRE(CLIO_IPC->IsInitialized());
   }
 
-  ~ChimaeraTestFixture() {
+  ~ClioTestFixture() {
     // Cleanup handled by runtime
   }
 };
@@ -78,7 +78,7 @@ class ChimaeraTestFixture {
 }  // anonymous namespace
 
 TEST_CASE("TaskBatch Basic Functionality", "[submit_batch][admin]") {
-  ChimaeraTestFixture fixture;
+  ClioTestFixture fixture;
 
   SECTION("TaskBatch starts empty") {
     clio::run::admin::TaskBatch batch;
@@ -118,7 +118,7 @@ TEST_CASE("TaskBatch Basic Functionality", "[submit_batch][admin]") {
 }
 
 TEST_CASE("SubmitBatch Empty Batch", "[submit_batch][admin]") {
-  ChimaeraTestFixture fixture;
+  ClioTestFixture fixture;
 
   SECTION("SubmitBatch with empty batch returns success immediately") {
     // Create admin client
@@ -141,7 +141,7 @@ TEST_CASE("SubmitBatch Empty Batch", "[submit_batch][admin]") {
 }
 
 TEST_CASE("SubmitBatch Single Task", "[submit_batch][admin]") {
-  ChimaeraTestFixture fixture;
+  ClioTestFixture fixture;
 
   SECTION("SubmitBatch with single FlushTask succeeds") {
     // Create admin client
@@ -170,7 +170,7 @@ TEST_CASE("SubmitBatch Single Task", "[submit_batch][admin]") {
 }
 
 TEST_CASE("SubmitBatch Multiple Tasks", "[submit_batch][admin]") {
-  ChimaeraTestFixture fixture;
+  ClioTestFixture fixture;
 
   SECTION("SubmitBatch with multiple FlushTasks succeeds") {
     // Create admin client
@@ -204,7 +204,7 @@ TEST_CASE("SubmitBatch Multiple Tasks", "[submit_batch][admin]") {
 }
 
 TEST_CASE("SubmitBatch Large Batch", "[submit_batch][admin]") {
-  ChimaeraTestFixture fixture;
+  ClioTestFixture fixture;
 
   SECTION("SubmitBatch with batch larger than parallel limit (32) succeeds") {
     // Create admin client
@@ -238,7 +238,7 @@ TEST_CASE("SubmitBatch Large Batch", "[submit_batch][admin]") {
 }
 
 TEST_CASE("SubmitBatch with MonitorTask", "[submit_batch][admin]") {
-  ChimaeraTestFixture fixture;
+  ClioTestFixture fixture;
 
   SECTION("SubmitBatch with MonitorTasks succeeds") {
     // Create admin client

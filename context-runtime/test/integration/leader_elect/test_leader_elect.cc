@@ -83,8 +83,8 @@ class LeaderElectFixture {
  public:
   LeaderElectFixture() {
     if (!g_initialized) {
-      INFO("Initializing Chimaera client for leader election tests...");
-      bool success = clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, true);
+      INFO("Initializing Clio client for leader election tests...");
+      bool success = clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true);
       if (success) {
         g_initialized = true;
         std::this_thread::sleep_for(500ms);
@@ -92,9 +92,9 @@ class LeaderElectFixture {
         REQUIRE(CLIO_IPC != nullptr);
         REQUIRE(CLIO_POOL_MANAGER != nullptr);
         REQUIRE(CLIO_IPC->IsInitialized());
-        INFO("Chimaera initialization successful");
+        INFO("Clio initialization successful");
       } else {
-        FAIL("Failed to initialize Chimaera");
+        FAIL("Failed to initialize Clio");
       }
     }
   }
@@ -181,15 +181,15 @@ TEST_CASE("System healthy after leader restart",
           "[leader_elect][post_restart]") {
   // Fresh initialization — the previous client state is stale because
   // run_tests.sh launches this as a separate process invocation.
-  INFO("Initializing fresh Chimaera client after leader restart...");
-  bool success = clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, true);
+  INFO("Initializing fresh Clio client after leader restart...");
+  bool success = clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true);
   REQUIRE(success);
   std::this_thread::sleep_for(500ms);
   REQUIRE(CLIO_RUNTIME_MANAGER != nullptr);
   REQUIRE(CLIO_IPC != nullptr);
   REQUIRE(CLIO_POOL_MANAGER != nullptr);
   REQUIRE(CLIO_IPC->IsInitialized());
-  INFO("Fresh Chimaera initialization successful");
+  INFO("Fresh Clio initialization successful");
 
   SECTION("post_restart_task") {
     // ------------------------------------------------------------------

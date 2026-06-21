@@ -1,4 +1,4 @@
-"""GET /api/config -- return the active Chimaera YAML config as JSON."""
+"""GET /api/config -- return the active Clio YAML config as JSON."""
 
 import os
 from pathlib import Path

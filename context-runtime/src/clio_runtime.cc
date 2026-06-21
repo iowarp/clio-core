@@ -43,7 +43,7 @@
 
 namespace clio::run {
 
-bool ClioInitImpl(ChimaeraMode mode, bool default_with_runtime,
+bool ClioInitImpl(RuntimeMode mode, bool default_with_runtime,
                   bool is_restart) {
   // Static guard to prevent double initialization
   static bool s_initialized = false;
@@ -67,7 +67,7 @@ bool ClioInitImpl(ChimaeraMode mode, bool default_with_runtime,
   bool init_runtime = false;
   bool init_client = false;
 
-  if (mode == ChimaeraMode::kServer || mode == ChimaeraMode::kRuntime) {
+  if (mode == RuntimeMode::kServer || mode == RuntimeMode::kRuntime) {
     // Server/Runtime mode: always start runtime
     init_runtime = true;
     init_client = true;  // Runtime also needs client components

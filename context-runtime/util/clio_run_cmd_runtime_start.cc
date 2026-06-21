@@ -102,13 +102,13 @@ bool InductNode() {
 
 void PrintRuntimeStartUsage() {
   HIPRINT("Usage: chimaera runtime start [--induct]");
-  HIPRINT("  Starts the Chimaera runtime server");
+  HIPRINT("  Starts the Clio runtime server");
   HIPRINT("  --induct: Register this node with all existing cluster nodes");
 }
 
 void PrintRuntimeRestartUsage() {
   HIPRINT("Usage: chimaera runtime restart [--induct]");
-  HIPRINT("  Restarts the Chimaera runtime, replaying WAL to recover address table");
+  HIPRINT("  Restarts the Clio runtime, replaying WAL to recover address table");
   HIPRINT("  --induct: Register this node with all existing cluster nodes");
 }
 
@@ -133,14 +133,14 @@ int RuntimeStart(int argc, char* argv[]) {
   std::signal(SIGTERM, SignalHandler);
   std::signal(SIGINT, SignalHandler);
 
-  HLOG(kDebug, "Starting Chimaera runtime...");
+  HLOG(kDebug, "Starting Clio runtime...");
 
-  if (!clio::run::CLIO_INIT(clio::run::ChimaeraMode::kRuntime, true)) {
-    HLOG(kError, "Failed to initialize Chimaera runtime");
+  if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kRuntime, true)) {
+    HLOG(kError, "Failed to initialize Clio runtime");
     return 1;
   }
 
-  HLOG(kDebug, "Chimaera runtime started successfully");
+  HLOG(kDebug, "Clio runtime started successfully");
 
   if (!InitializeAdminChiMod()) {
     HLOG(kError, "FATAL ERROR: Failed to find or initialize admin ChiMod");
@@ -160,9 +160,9 @@ int RuntimeStart(int argc, char* argv[]) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
   }
 
-  HLOG(kDebug, "Shutting down Chimaera runtime...");
+  HLOG(kDebug, "Shutting down Clio runtime...");
   ShutdownAdminChiMod();
-  HLOG(kDebug, "Chimaera runtime stopped (finalization will happen automatically)");
+  HLOG(kDebug, "Clio runtime stopped (finalization will happen automatically)");
   return 0;
 }
 
@@ -185,15 +185,15 @@ int RuntimeRestart(int argc, char* argv[]) {
   std::signal(SIGTERM, SignalHandler);
   std::signal(SIGINT, SignalHandler);
 
-  HLOG(kInfo, "Restarting Chimaera runtime (WAL replay enabled)...");
+  HLOG(kInfo, "Restarting Clio runtime (WAL replay enabled)...");
 
-  if (!clio::run::CLIO_INIT(clio::run::ChimaeraMode::kRuntime, true,
+  if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kRuntime, true,
                            /*is_restart=*/true)) {
-    HLOG(kError, "Failed to restart Chimaera runtime");
+    HLOG(kError, "Failed to restart Clio runtime");
     return 1;
   }
 
-  HLOG(kInfo, "Chimaera runtime restarted successfully");
+  HLOG(kInfo, "Clio runtime restarted successfully");
 
   if (!InitializeAdminChiMod()) {
     HLOG(kError, "FATAL ERROR: Failed to find or initialize admin ChiMod");
@@ -213,8 +213,8 @@ int RuntimeRestart(int argc, char* argv[]) {
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
   }
 
-  HLOG(kDebug, "Shutting down Chimaera runtime...");
+  HLOG(kDebug, "Shutting down Clio runtime...");
   ShutdownAdminChiMod();
-  HLOG(kDebug, "Chimaera runtime stopped (finalization will happen automatically)");
+  HLOG(kDebug, "Clio runtime stopped (finalization will happen automatically)");
   return 0;
 }

@@ -52,7 +52,7 @@ TEST_CASE("StringDataAssimilator stores ctx.src_data as one named blob",
                           "test_cae_string_assim_config.yaml";
   ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", config_path.string(), 1);
 
-  REQUIRE(clio::run::CLIO_INIT(clio::run::ChimaeraMode::kServer));
+  REQUIRE(clio::run::CLIO_INIT(clio::run::RuntimeMode::kServer));
   SimpleTest::g_test_finalize = clio::run::CLIO_RUNTIME_FINALIZE;
   std::this_thread::sleep_for(1s);
 

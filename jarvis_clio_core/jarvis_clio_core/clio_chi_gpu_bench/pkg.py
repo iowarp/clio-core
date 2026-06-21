@@ -1,9 +1,9 @@
 """
-Chimaera GPU Runtime Benchmark Package
+Clio GPU Runtime Benchmark Package
 
 Benchmarks GPU task submission latency and throughput using the
 bench_gpu_runtime binary.  bench_gpu_runtime is self-contained: it starts
-its own Chimaera runtime internally, so no clio_runtime package is needed.
+its own Clio runtime internally, so no clio_runtime package is needed.
 
 Supported test cases:
   latency      -- GPU task round-trip latency (default)
@@ -40,11 +40,11 @@ import time
 
 class ClioChiGpuBench(Application):
     """
-    Chimaera GPU Runtime Benchmark
+    Clio GPU Runtime Benchmark
 
     Runs bench_gpu_runtime to measure GPU task submission latency and
-    throughput against the Chimaera GPU work orchestrator.
-    The benchmark is self-contained and starts its own Chimaera runtime.
+    throughput against the Clio GPU work orchestrator.
+    The benchmark is self-contained and starts its own Clio runtime.
     """
 
     def _init(self):
@@ -123,7 +123,7 @@ class ClioChiGpuBench(Application):
 
         warps = (self.config['client_blocks'] *
                  self.config['client_threads']) // 32
-        self.log("Chimaera GPU runtime benchmark configured")
+        self.log("Clio GPU runtime benchmark configured")
         self.log(f"  Test case:      {self.config['test_case']}")
         self.log(f"  RT config:      {self.config['rt_blocks']}b x "
                  f"{self.config['rt_threads']}t")

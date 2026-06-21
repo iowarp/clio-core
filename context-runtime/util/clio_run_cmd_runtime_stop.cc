@@ -10,12 +10,12 @@
 #include "clio_run_commands.h"
 
 int RuntimeStop(int argc, char* argv[]) {
-  HLOG(kDebug, "Stopping Chimaera runtime...");
+  HLOG(kDebug, "Stopping Clio runtime...");
 
   try {
-    HLOG(kDebug, "Initializing Chimaera client...");
-    if (!clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, false)) {
-      HLOG(kError, "Failed to initialize Chimaera client components");
+    HLOG(kDebug, "Initializing Clio client...");
+    if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, false)) {
+      HLOG(kError, "Failed to initialize Clio client components");
       return 1;
     }
 
@@ -36,7 +36,7 @@ int RuntimeStop(int argc, char* argv[]) {
 
     auto* ipc_manager = CLIO_IPC;
     if (!ipc_manager || !ipc_manager->IsInitialized()) {
-      HLOG(kError, "IPC manager not available - is Chimaera runtime running?");
+      HLOG(kError, "IPC manager not available - is Clio runtime running?");
       return 1;
     }
 

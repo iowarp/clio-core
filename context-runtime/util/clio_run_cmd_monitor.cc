@@ -115,7 +115,7 @@ void PrintStats(const std::vector<clio::run::WorkerStats>& workers) {
   std::ostringstream time_ss;
   time_ss << std::put_time(std::localtime(&now_t), "%Y-%m-%d %H:%M:%S");
   HIPRINT("==================================================");
-  HIPRINT("        Chimaera Worker Monitor");
+  HIPRINT("        Clio Worker Monitor");
   HIPRINT("        {}", time_ss.str());
   HIPRINT("==================================================");
   HIPRINT("");
@@ -176,12 +176,12 @@ int Monitor(int argc, char* argv[]) {
   }
 
   if (opts.verbose) {
-    HLOG(kInfo, "Initializing Chimaera client...");
+    HLOG(kInfo, "Initializing Clio client...");
   }
 
-  if (!clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, false)) {
-    HLOG(kError, "Failed to initialize Chimaera client");
-    HLOG(kError, "Make sure the Chimaera runtime is running");
+  if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, false)) {
+    HLOG(kError, "Failed to initialize Clio client");
+    HLOG(kError, "Make sure the Clio runtime is running");
     return 1;
   }
 

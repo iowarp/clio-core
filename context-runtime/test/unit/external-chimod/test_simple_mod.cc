@@ -62,15 +62,15 @@ int main() {
 
   try {
     // Step 1: Initialize CLIO Runtime client
-    HLOG(kInfo, "\n1. Initializing Chimaera client...");
-    bool client_init_success = clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, true);
+    HLOG(kInfo, "\n1. Initializing Clio client...");
+    bool client_init_success = clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true);
 
     if (!client_init_success) {
-      HLOG(kInfo, "NOTICE: Chimaera client initialization failed.");
+      HLOG(kInfo, "NOTICE: Clio client initialization failed.");
       HLOG(kInfo, "This is expected when no runtime is active.");
       HLOG(kInfo, "In a production environment, ensure chimaera runtime start is running.");
     } else {
-      HLOG(kSuccess, "SUCCESS: Chimaera client initialized!");
+      HLOG(kSuccess, "SUCCESS: Clio client initialized!");
     }
 
     // Step 2: Create admin client (required for pool management)

@@ -52,8 +52,8 @@ int Migrate(int argc, char** argv) {
   // Parse pool ID from "major.minor" format
   clio::run::PoolId pool_id = clio::run::UniqueId::FromString(pool_id_str);
 
-  if (!clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, false)) {
-    HLOG(kError, "Failed to initialize Chimaera client");
+  if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, false)) {
+    HLOG(kError, "Failed to initialize Clio client");
     return 1;
   }
 

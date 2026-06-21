@@ -3,7 +3,7 @@ CTE GPU Benchmark Package
 
 Benchmarks GPU-initiated I/O operations through the Content Transfer
 Engine (CTE) and compares against BaM page cache and baselines.
-clio_cte_gpu_bench is self-contained: it starts its own Chimaera runtime
+clio_cte_gpu_bench is self-contained: it starts its own Clio runtime
 internally, so no clio_runtime package is needed.
 
 Supported test cases:

@@ -1,3 +1,3 @@
 """
-CTE GPU Benchmark Package for IOWarp (Chimaera)
+CTE GPU Benchmark Package for IOWarp (Clio)
 """

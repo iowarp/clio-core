@@ -36,7 +36,7 @@ bool g_initialized = false;
 
 void EnsureInitialized() {
   if (!g_initialized) {
-    clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, true);
+    clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true);
     g_initialized = true;
     SimpleTest::g_test_finalize = clio::run::CLIO_RUNTIME_FINALIZE;
   }

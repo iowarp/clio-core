@@ -7,7 +7,7 @@ Python bindings in Model Context Protocol (MCP) servers.
 
 Key Features:
 -----------
-1. Runtime Initialization: Demonstrates how to initialize the Chimaera runtime
+1. Runtime Initialization: Demonstrates how to initialize the Clio runtime
    and CTE subsystem with proper error handling
 
 2. Context Operations: Examples of context_bundle, context_query, and context_delete
@@ -28,7 +28,7 @@ Example Usage in Your Code:
     import clio_cte_core_ext as cte
 
     # 1. Initialize runtime (if not already done externally)
-    cte.chimaera_init(cte.ChimaeraMode.kClient, True)
+    cte.chimaera_init(cte.RuntimeMode.kClient, True)
     cte.initialize_cte(config_path, cte.PoolQuery.Dynamic())
     
     # 2. Bundle data (context_bundle)
@@ -48,7 +48,7 @@ Example Usage in Your Code:
 Environment Variables:
 ---------------------
     CLIO_WITH_RUNTIME: Set to "0" or "false" to skip runtime initialization
-    CLIO_SERVER_CONF: Path to Chimaera server configuration file
+    CLIO_SERVER_CONF: Path to Clio server configuration file
     CLIO_REPO_PATH: Path to ChiMod repository (for finding shared libraries)
     LD_LIBRARY_PATH: Library path for runtime dependencies
 """
@@ -131,11 +131,11 @@ def setup_environment_paths():
 
 
 def generate_test_config():
-    """Generate a minimal test configuration for Chimaera runtime
+    """Generate a minimal test configuration for Clio runtime
 
     Example: Configuration File Structure
     ------------------------------------
-    This demonstrates how to create a Chimaera configuration file programmatically.
+    This demonstrates how to create a Clio configuration file programmatically.
     The configuration is written as YAML and should contain:
     
     - networking: Protocol, hostfile, and port settings
@@ -241,11 +241,11 @@ def generate_test_config():
 
 
 def initialize_runtime_early(cte):
-    """Initialize Chimaera runtime early in the test (called from main() before client code)
+    """Initialize Clio runtime early in the test (called from main() before client code)
 
     Example: Complete Runtime Initialization Pattern
     ------------------------------------------------
-    This demonstrates the complete pattern for initializing the Chimaera runtime
+    This demonstrates the complete pattern for initializing the Clio runtime
     and CTE subsystem. This is required before any client operations.
     
     Usage Pattern:
@@ -258,9 +258,9 @@ def initialize_runtime_early(cte):
         os.environ["CLIO_SERVER_CONF"] = config_path
         
         # Step 3: Initialize CLIO Runtime (unified init - both runtime and client)
-        if not cte.chimaera_init(cte.ChimaeraMode.kClient, True):
-            raise RuntimeError("Failed to initialize Chimaera")
-        time.sleep(0.5)  # Give Chimaera time to initialize
+        if not cte.chimaera_init(cte.RuntimeMode.kClient, True):
+            raise RuntimeError("Failed to initialize Clio")
+        time.sleep(0.5)  # Give Clio time to initialize
         
         # Step 5: Initialize CTE subsystem
         pool_query = cte.PoolQuery.Dynamic()
@@ -268,7 +268,7 @@ def initialize_runtime_early(cte):
             raise RuntimeError("Failed to initialize CTE subsystem")
     
     This follows the C++ test pattern from context-runtime/test/unit/test_clio_run_runtime.cc:
-    - Calls CHIMAERA_INIT(ChimaeraMode::kClient, true)
+    - Calls CHIMAERA_INIT(RuntimeMode::kClient, true)
     - Sleeps 500ms after initialization
     - Verifies initialization state
 
@@ -296,19 +296,19 @@ def initialize_runtime_early(cte):
         # Step 1: Initialize CLIO Runtime (unified init - both runtime and client)
         # Following pattern from test_clio_run_runtime.cc
         if not runtime_initialized or not client_initialized:
-            print("🔧 Initializing Chimaera (unified CHIMAERA_INIT)...")
+            print("🔧 Initializing Clio (unified CHIMAERA_INIT)...")
             print("   Note: If runtime isn't configured, this may cause FATAL and process exit")
             sys.stdout.flush()  # Ensure output is flushed before potential abort
 
             try:
-                init_result = cte.chimaera_init(cte.ChimaeraMode.kClient, True)
+                init_result = cte.chimaera_init(cte.RuntimeMode.kClient, True)
             except Exception as e:
-                print(f"⚠️  Chimaera initialization exception: {e}")
+                print(f"⚠️  Clio initialization exception: {e}")
                 print("   Continuing with binding tests only...")
                 return False
 
             if not init_result:
-                print("⚠️  Chimaera initialization returned False")
+                print("⚠️  Clio initialization returned False")
                 print("   This may indicate runtime configuration issues")
                 print("   Continuing with binding tests only...")
                 return False
@@ -320,12 +320,12 @@ def initialize_runtime_early(cte):
             time.sleep(0.5)
 
             # Verify initialization succeeded
-            print("✅ Chimaera initialized")
+            print("✅ Clio initialized")
             sys.stdout.flush()
 
             # Verify client initialization (following C++ pattern that checks IPC)
             # In C++ tests they verify: REQUIRE(CLIO_IPC != nullptr) and REQUIRE(CLIO_IPC->IsInitialized())
-            print("✅ Chimaera client initialized")
+            print("✅ Clio client initialized")
             sys.stdout.flush()
 
         # Step 3: Initialize CTE subsystem (CTE-specific, not in base runtime tests)
@@ -384,7 +384,7 @@ def initialize_runtime_early(cte):
     except SystemExit as e:
         # Handle FATAL errors from C++ that cause SystemExit
         print(f"⚠️  Runtime initialization FATAL error (process would exit): {e}")
-        print("   This usually means Chimaera runtime isn't properly configured")
+        print("   This usually means Clio runtime isn't properly configured")
         print("   Continuing with binding tests only...")
         sys.stdout.flush()
         return False

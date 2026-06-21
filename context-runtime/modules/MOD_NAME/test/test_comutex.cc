@@ -104,8 +104,8 @@ public:
   CoMutexTestFixture() : test_pool_id_(generateTestPoolId()) {
     // Initialize CLIO Runtime once per test suite
     if (!g_initialized) {
-      INFO("Initializing Chimaera for CoMutex tests...");
-      bool success = clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, true);
+      INFO("Initializing Clio for CoMutex tests...");
+      bool success = clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true);
       if (success) {
         g_initialized = true;
         SimpleTest::g_test_finalize = clio::run::CLIO_RUNTIME_FINALIZE;
@@ -121,9 +121,9 @@ public:
       // Verify client can access IPC manager
       REQUIRE(CLIO_IPC->IsInitialized());
 
-        INFO("Chimaera initialization successful");
+        INFO("Clio initialization successful");
       } else {
-        FAIL("Failed to initialize Chimaera");
+        FAIL("Failed to initialize Clio");
       }
     }
   }

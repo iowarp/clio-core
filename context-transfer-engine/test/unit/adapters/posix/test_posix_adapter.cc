@@ -73,12 +73,12 @@ bool initializeRuntime() {
     return true;
   }
 
-  INFO("Initializing Chimaera runtime...");
-  if (!clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, true)) {
-    INFO("Chimaera initialization failed");
+  INFO("Initializing Clio runtime...");
+  if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true)) {
+    INFO("Clio initialization failed");
     return false;
   }
-  INFO("✓ Chimaera runtime initialized");
+  INFO("✓ Clio runtime initialized");
 
   INFO("Initializing CTE runtime...");
   if (!clio::cte::core::CLIO_CTE_CLIENT_INIT()) {

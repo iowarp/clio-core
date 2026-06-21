@@ -150,9 +150,9 @@ int main(int argc, char **argv) {
   Args a = ParseArgs(argc, argv);
   if (!a.ok) return 1;
 
-  HLOG(kInfo, "Initializing Chimaera runtime...");
-  if (!clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, false)) {
-    HLOG(kError, "Failed to initialize Chimaera runtime");
+  HLOG(kInfo, "Initializing Clio runtime...");
+  if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, false)) {
+    HLOG(kError, "Failed to initialize Clio runtime");
     return 1;
   }
   struct ClientFinalizeGuard {

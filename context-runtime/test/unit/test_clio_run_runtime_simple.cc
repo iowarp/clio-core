@@ -65,15 +65,15 @@ public:
   SimpleChimaeraFixture() {
     // Initialize CLIO Runtime once per test suite
     if (!g_initialized) {
-      INFO("Initializing Chimaera...");
-      bool success = clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, true);
+      INFO("Initializing Clio...");
+      bool success = clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true);
       if (success) {
         g_initialized = true;
         SimpleTest::g_test_finalize = clio::run::CLIO_RUNTIME_FINALIZE;
         std::this_thread::sleep_for(500ms); // Give runtime time to initialize
-        INFO("Chimaera initialization successful");
+        INFO("Clio initialization successful");
       } else {
-        INFO("Failed to initialize Chimaera");
+        INFO("Failed to initialize Clio");
       }
     }
   }
@@ -87,20 +87,20 @@ public:
 // Basic Runtime and Client Initialization Tests
 //------------------------------------------------------------------------------
 
-TEST_CASE("Basic Chimaera Initialization", "[runtime][basic]") {
+TEST_CASE("Basic Clio Initialization", "[runtime][basic]") {
   SimpleChimaeraFixture fixture;
 
-  SECTION("Chimaera initialization should succeed") {
+  SECTION("Clio initialization should succeed") {
     REQUIRE(g_initialized);
 
     // Verify core managers are available (if not null)
     if (CLIO_RUNTIME_MANAGER != nullptr) {
-      INFO("Chimaera manager is available");
+      INFO("Clio manager is available");
       REQUIRE(CLIO_RUNTIME_MANAGER->IsInitialized());
       REQUIRE(CLIO_RUNTIME_MANAGER->IsRuntime());
       REQUIRE(CLIO_RUNTIME_MANAGER->IsClient());
     } else {
-      INFO("Chimaera manager is not available");
+      INFO("Clio manager is not available");
     }
 
     if (CLIO_IPC != nullptr) {
@@ -111,7 +111,7 @@ TEST_CASE("Basic Chimaera Initialization", "[runtime][basic]") {
     }
   }
 
-  SECTION("Multiple Chimaera initializations should be safe") {
+  SECTION("Multiple Clio initializations should be safe") {
     REQUIRE(g_initialized);
     REQUIRE(g_initialized); // Second call should succeed
   }
@@ -130,7 +130,7 @@ TEST_CASE("Combined Initialization", "[runtime][client][combined]") {
       
       // Check if managers are available
       if (CLIO_RUNTIME_MANAGER != nullptr) {
-        INFO("Chimaera manager available");
+        INFO("Clio manager available");
       }
       if (CLIO_IPC != nullptr) {
         INFO("IPC manager available");
@@ -160,7 +160,7 @@ TEST_CASE("Error Handling", "[error][basic]") {
 TEST_CASE("Basic Performance", "[performance][timing]") {
   SimpleChimaeraFixture fixture;
 
-  SECTION("Chimaera initialization timing") {
+  SECTION("Clio initialization timing") {
     auto start_time = std::chrono::high_resolution_clock::now();
 
     bool result = g_initialized;
@@ -169,8 +169,8 @@ TEST_CASE("Basic Performance", "[performance][timing]") {
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
         end_time - start_time);
 
-    INFO("Chimaera initialization time: " << duration.count() << " milliseconds");
-    INFO("Chimaera initialization result: " << result);
+    INFO("Clio initialization time: " << duration.count() << " milliseconds");
+    INFO("Clio initialization result: " << result);
 
     // Reasonable performance expectation (should complete within 10 seconds)
     REQUIRE(duration.count() < 10000); // 10 seconds in milliseconds

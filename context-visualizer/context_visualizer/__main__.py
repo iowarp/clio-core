@@ -27,7 +27,7 @@ from .app import create_app
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Chimaera runtime visualizer")
+    parser = argparse.ArgumentParser(description="Clio runtime visualizer")
     parser.add_argument("--host", default="127.0.0.1", help="Bind address (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=5000, help="Listen port (default: 5000)")
     parser.add_argument("--debug", action="store_true", help="Enable Flask debug mode")

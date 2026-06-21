@@ -59,8 +59,8 @@ bool ContextInterface::EnsureInitialized() {
   }
 
   // Initialize CLIO Runtime as a client for the context interface
-  if (!clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, false)) {
-    HLOG(kError, "Failed to initialize Chimaera client");
+  if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, false)) {
+    HLOG(kError, "Failed to initialize Clio client");
     init_failed = true;
     return false;
   }
@@ -74,7 +74,7 @@ bool ContextInterface::EnsureInitialized() {
   // Verify CLIO Runtime IPC is available
   auto* ipc_manager = CLIO_IPC;
   if (!ipc_manager) {
-    HLOG(kError, "Chimaera IPC not initialized. Is the runtime running?");
+    HLOG(kError, "Clio IPC not initialized. Is the runtime running?");
     return false;
   }
 
@@ -222,7 +222,7 @@ std::vector<std::string> ContextInterface::ContextRetrieve(
     // Get IPC manager for buffer allocation
     auto* ipc_manager = CLIO_IPC;
     if (!ipc_manager) {
-      HLOG(kError, "Chimaera IPC not initialized");
+      HLOG(kError, "Clio IPC not initialized");
       return std::vector<std::string>();
     }
 

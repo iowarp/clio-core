@@ -49,8 +49,8 @@ bool g_initialized = false;
 void EnsureInit() {
 #if !CTP_IS_DEVICE_PASS
   if (g_initialized) return;
-  std::fprintf(stderr, "[INIT] Starting Chimaera server (gpu_vector test)\n");
-  REQUIRE(clio::run::CLIO_INIT(clio::run::ChimaeraMode::kServer));
+  std::fprintf(stderr, "[INIT] Starting Clio server (gpu_vector test)\n");
+  REQUIRE(clio::run::CLIO_INIT(clio::run::RuntimeMode::kServer));
   REQUIRE(clio::cte::core::CLIO_CTE_CLIENT_INIT());
   auto *cte_client = CLIO_CTE_CLIENT;
   REQUIRE(cte_client != nullptr);

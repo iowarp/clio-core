@@ -58,7 +58,7 @@
 namespace {
 // Test setup helper - same pattern as other tests
 bool initialize_chimaera() {
-  return clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, true);
+  return clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true);
 }
 
 // The runtime server is launched out-of-process via clio::run::test::RuntimeServer
@@ -92,7 +92,7 @@ TEST_CASE("Per-process shared memory GetClientShmInfo",
     (void)freopen("/dev/null", "w", stderr);
     setenv("CLIO_WITH_RUNTIME", "0", 1);
     setenv("CLIO_IPC_MODE", "SHM", 1);
-    if (!clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, false)) {
+    if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, false)) {
       _exit(1);
     }
     auto *client_ipc = CLIO_IPC;

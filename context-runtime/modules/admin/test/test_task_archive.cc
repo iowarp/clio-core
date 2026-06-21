@@ -936,9 +936,9 @@ int main(int argc, char *argv[]) {
   (void)argv;
 
   // Initialize CLIO Runtime runtime for memory management
-  bool runtime_success = clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, true);
+  bool runtime_success = clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true);
   if (!runtime_success) {
-    HLOG(kError, "Failed to initialize Chimaera runtime");
+    HLOG(kError, "Failed to initialize Clio runtime");
     return 1;
   }
 

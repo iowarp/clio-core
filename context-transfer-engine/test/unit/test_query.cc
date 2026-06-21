@@ -173,9 +173,9 @@ static std::string chi_test_data_dir() {
 
      // Initialize CLIO Runtime and CTE client once per test suite
      if (!g_initialized) {
-       bool success = clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, true);
+       bool success = clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true);
        if (!success) {
-         throw std::runtime_error("Failed to initialize Chimaera runtime");
+         throw std::runtime_error("Failed to initialize Clio runtime");
        }
 
        // Wait for runtime to be fully ready

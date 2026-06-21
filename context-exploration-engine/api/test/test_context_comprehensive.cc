@@ -82,7 +82,7 @@ public:
       INFO("=== Initializing CEE Test Environment ===");
 
       // Initialize CLIO Runtime runtime
-      bool success = clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, true);
+      bool success = clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true);
       if (!success) {
         throw std::runtime_error("CLIO_INIT failed");
       }

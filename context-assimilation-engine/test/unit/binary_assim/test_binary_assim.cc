@@ -221,21 +221,21 @@ int main(int argc, char* argv[]) {
 
   try {
     // Initialize CLIO Runtime runtime (CLIO_WITH_RUNTIME controls behavior)
-    HLOG(kInfo, "Initializing Chimaera...");
-    bool success = clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, true);
+    HLOG(kInfo, "Initializing Clio...");
+    bool success = clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true);
     if (!success) {
-      HLOG(kError, "Failed to initialize Chimaera");
+      HLOG(kError, "Failed to initialize Clio");
       return 1;
     }
-    HLOG(kSuccess, "Chimaera initialized successfully");
+    HLOG(kSuccess, "Clio initialized successfully");
 
     // Verify CLIO Runtime IPC is available
     auto* ipc_manager = CLIO_IPC;
     if (!ipc_manager) {
-      HLOG(kError, "Chimaera IPC not initialized");
+      HLOG(kError, "Clio IPC not initialized");
       return 1;
     }
-    HLOG(kSuccess, "Chimaera IPC verified");
+    HLOG(kSuccess, "Clio IPC verified");
 
     // Get test file size from environment or use default
     size_t file_size_mb = kDefaultFileSizeMB;

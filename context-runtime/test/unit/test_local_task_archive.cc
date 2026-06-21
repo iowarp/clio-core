@@ -50,7 +50,7 @@ class LocalTaskArchiveTest {
 public:
   LocalTaskArchiveTest() {
     // Initialize CLIO Runtime with client mode and runtime
-    bool success = clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, true);
+    bool success = clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true);
     REQUIRE(success);
     SimpleTest::g_test_finalize = clio::run::CLIO_RUNTIME_FINALIZE;
 

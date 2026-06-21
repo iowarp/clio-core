@@ -64,7 +64,7 @@ bool g_initialized = false;
 // Initialize CLIO Runtime runtime once
 void EnsureInitialized() {
   if (!g_initialized) {
-    clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, true);
+    clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true);
     g_initialized = true;
     SimpleTest::g_test_finalize = clio::run::CLIO_RUNTIME_FINALIZE;
   }
@@ -12643,32 +12643,32 @@ TEST_CASE("Autogen - PoolManager operations", "[autogen][poolmanager][ops]") {
 }
 
 // ==========================================================================
-// ChimaeraManager tests
+// RuntimeManager tests
 // ==========================================================================
-TEST_CASE("Autogen - ChimaeraManager accessors", "[autogen][chimaera][manager]") {
+TEST_CASE("Autogen - RuntimeManager accessors", "[autogen][chimaera][manager]") {
   EnsureInitialized();
   auto* chimaera_mgr = CLIO_RUNTIME_MANAGER;
 
   SECTION("IsInitialized") {
     REQUIRE(chimaera_mgr->IsInitialized() == true);
-    INFO("ChimaeraManager is initialized");
+    INFO("RuntimeManager is initialized");
   }
 
   SECTION("IsRuntime") {
     bool is_runtime = chimaera_mgr->IsRuntime();
     REQUIRE(is_runtime == true);
-    INFO("ChimaeraManager IsRuntime: " + std::to_string(is_runtime));
+    INFO("RuntimeManager IsRuntime: " + std::to_string(is_runtime));
   }
 
   SECTION("IsClient") {
     bool is_client = chimaera_mgr->IsClient();
-    INFO("ChimaeraManager IsClient: " + std::to_string(is_client));
+    INFO("RuntimeManager IsClient: " + std::to_string(is_client));
   }
 
   SECTION("IsInitializing") {
     bool initializing = chimaera_mgr->IsInitializing();
     REQUIRE(initializing == false);  // should not be initializing after init
-    INFO("ChimaeraManager IsInitializing: " + std::to_string(initializing));
+    INFO("RuntimeManager IsInitializing: " + std::to_string(initializing));
   }
 
   SECTION("GetCurrentHostname") {
@@ -14241,9 +14241,9 @@ TEST_CASE("Autogen - PoolManager extended", "[autogen][poolmgr][extended]") {
 }
 
 // ==========================================================================
-// ChimaeraManager extended tests
+// RuntimeManager extended tests
 // ==========================================================================
-TEST_CASE("Autogen - ChimaeraManager extended", "[autogen][chimgr][extended]") {
+TEST_CASE("Autogen - RuntimeManager extended", "[autogen][chimgr][extended]") {
   EnsureInitialized();
   auto* chi_mgr = CLIO_RUNTIME_MANAGER;
 

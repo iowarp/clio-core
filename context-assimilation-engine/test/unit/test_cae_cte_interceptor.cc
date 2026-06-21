@@ -47,7 +47,7 @@ TEST_CASE("CLIO_CTE_CLIENT PutBlob writes to CAE interceptor and reads back",
                           "test_cae_cte_interceptor_config.yaml";
   ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", config_path.string(), 1);
 
-  bool success = clio::run::CLIO_INIT(clio::run::ChimaeraMode::kServer);
+  bool success = clio::run::CLIO_INIT(clio::run::RuntimeMode::kServer);
   REQUIRE(success);
   SimpleTest::g_test_finalize = clio::run::CLIO_RUNTIME_FINALIZE;
 

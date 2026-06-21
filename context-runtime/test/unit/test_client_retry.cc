@@ -80,7 +80,7 @@ void TestServerRestart(const std::string &mode) {
   // 2. Client connects
   setenv("CLIO_IPC_MODE", mode.c_str(), 1);
   setenv("CLIO_WITH_RUNTIME", "0", 1);
-  bool success = CLIO_INIT(ChimaeraMode::kClient, false);
+  bool success = CLIO_INIT(RuntimeMode::kClient, false);
   REQUIRE(success);
   REQUIRE(CLIO_IPC != nullptr);
   REQUIRE(CLIO_IPC->IsInitialized());
@@ -147,7 +147,7 @@ void TestClientDeath(const std::string &mode) {
     // Child process: connect as client, submit task, exit immediately
     setenv("CLIO_IPC_MODE", mode.c_str(), 1);
     setenv("CLIO_WITH_RUNTIME", "0", 1);
-    bool success = CLIO_INIT(ChimaeraMode::kClient, false);
+    bool success = CLIO_INIT(RuntimeMode::kClient, false);
     if (!success) {
       _exit(1);
     }
@@ -179,7 +179,7 @@ void TestClientDeath(const std::string &mode) {
   //    because the child called it in a forked process)
   setenv("CLIO_IPC_MODE", mode.c_str(), 1);
   setenv("CLIO_WITH_RUNTIME", "0", 1);
-  bool success = CLIO_INIT(ChimaeraMode::kClient, false);
+  bool success = CLIO_INIT(RuntimeMode::kClient, false);
   REQUIRE(success);
   REQUIRE(CLIO_IPC != nullptr);
   REQUIRE(CLIO_IPC->IsInitialized());

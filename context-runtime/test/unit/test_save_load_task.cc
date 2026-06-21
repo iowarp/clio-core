@@ -80,11 +80,11 @@ ctp::ipc::MallocAllocator* GetTestAllocator() {
 }
 
 // Initialize CLIO Runtime runtime for tests
-class ChimaeraTestFixture {
+class ClioTestFixture {
 public:
-  ChimaeraTestFixture() {
+  ClioTestFixture() {
     // Initialize CLIO Runtime (client with embedded runtime)
-    clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, true);
+    clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true);
     SimpleTest::g_test_finalize = clio::run::CLIO_RUNTIME_FINALIZE;
 
     // Create admin pool
@@ -105,7 +105,7 @@ public:
     // Task automatically freed when create_task goes out of scope
   }
 
-  ~ChimaeraTestFixture() {
+  ~ClioTestFixture() {
     // Cleanup
     admin_client_.reset();
   }
@@ -119,7 +119,7 @@ private:
 
 TEST_CASE("SaveTask and LoadTask - Admin CreateTask full flow",
           "[save_load_task][admin][create]") {
-  ChimaeraTestFixture fixture;
+  ClioTestFixture fixture;
 
   auto *ipc_manager = CLIO_IPC;
   auto alloc = GetTestAllocator();
@@ -237,7 +237,7 @@ TEST_CASE("SaveTask and LoadTask - Admin CreateTask full flow",
 
 TEST_CASE("SaveTask and LoadTask - Admin FlushTask full flow",
           "[save_load_task][admin][flush]") {
-  ChimaeraTestFixture fixture;
+  ClioTestFixture fixture;
 
   auto *ipc_manager = CLIO_IPC;
   auto alloc = GetTestAllocator();
@@ -317,7 +317,7 @@ TEST_CASE("SaveTask and LoadTask - Admin FlushTask full flow",
 
 TEST_CASE("SaveTask and LoadTask - Admin SendTask full flow",
           "[save_load_task][admin][send]") {
-  ChimaeraTestFixture fixture;
+  ClioTestFixture fixture;
 
   auto *ipc_manager = CLIO_IPC;
   auto alloc = GetTestAllocator();
@@ -398,7 +398,7 @@ TEST_CASE("SaveTask and LoadTask - Admin SendTask full flow",
 
 TEST_CASE("SaveTask and LoadTask - Admin DestroyPoolTask full flow",
           "[save_load_task][admin][destroy]") {
-  ChimaeraTestFixture fixture;
+  ClioTestFixture fixture;
 
   auto *ipc_manager = CLIO_IPC;
   auto alloc = GetTestAllocator();

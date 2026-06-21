@@ -1,3 +1,3 @@
 """
-WRP Benchmark Package for IOWarp (Chimaera)
+WRP Benchmark Package for IOWarp (Clio)
 """

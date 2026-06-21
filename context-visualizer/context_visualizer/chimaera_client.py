@@ -32,7 +32,7 @@ _chi_worker = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
 
 def _ensure_init():
-    """Lazy-initialize the Chimaera client connection."""
+    """Lazy-initialize the Clio client connection."""
     global _chi, _init_done
     if _init_done:
         return
@@ -269,7 +269,7 @@ def shutdown_node(node_id, grace_period_ms=5000):
 
 
 def restart_node(ip_address, port=9413):
-    """Restart a node's Chimaera runtime (non-blocking).
+    """Restart a node's Clio runtime (non-blocking).
 
     Assumes the runtime is already dead (shutdown_node was called first).
     Launches ``clio_run runtime restart`` (WAL replay) so the node rejoins
@@ -353,7 +353,7 @@ def restart_node(ip_address, port=9413):
 
 
 def finalize():
-    """Clean shutdown of the Chimaera client."""
+    """Clean shutdown of the Clio client."""
     global _init_done
     if _init_done and _chi is not None:
         _chi.chimaera_finalize()

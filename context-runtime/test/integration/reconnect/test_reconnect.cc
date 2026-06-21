@@ -80,8 +80,8 @@ class ReconnectTestFixture {
  public:
   ReconnectTestFixture() {
     if (!g_initialized) {
-      INFO("Initializing Chimaera client for Reconnect tests...");
-      bool success = clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, true);
+      INFO("Initializing Clio client for Reconnect tests...");
+      bool success = clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true);
       if (success) {
         g_initialized = true;
         // NOTE: Do NOT set g_test_finalize here because the test
@@ -92,9 +92,9 @@ class ReconnectTestFixture {
         REQUIRE(CLIO_IPC != nullptr);
         REQUIRE(CLIO_POOL_MANAGER != nullptr);
         REQUIRE(CLIO_IPC->IsInitialized());
-        INFO("Chimaera initialization successful");
+        INFO("Clio initialization successful");
       } else {
-        FAIL("Failed to initialize Chimaera");
+        FAIL("Failed to initialize Clio");
       }
     }
   }

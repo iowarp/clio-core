@@ -54,16 +54,16 @@
 namespace {
 
 // Test helper to initialize CLIO Runtime system
-class ChimaeraTestFixture {
+class ClioTestFixture {
  public:
-  ChimaeraTestFixture() {
+  ClioTestFixture() {
     // Use the unified CLIO Runtime initialization
-    bool success = clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, true);
+    bool success = clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true);
     REQUIRE(success);
     SimpleTest::g_test_finalize = clio::run::CLIO_RUNTIME_FINALIZE;
   }
 
-  ~ChimaeraTestFixture() {
+  ~ClioTestFixture() {
     // Cleanup handled by runtime
   }
 };
@@ -71,7 +71,7 @@ class ChimaeraTestFixture {
 }  // anonymous namespace
 
 TEST_CASE("FlushTask Basic Functionality", "[flush][admin]") {
-  ChimaeraTestFixture fixture;
+  ClioTestFixture fixture;
 
   SECTION("Flush with no work remaining returns success immediately") {
     // Create admin client
@@ -92,7 +92,7 @@ TEST_CASE("FlushTask Basic Functionality", "[flush][admin]") {
 
 TEST_CASE("FlushTask with MOD_NAME Container and Async Tasks",
           "[flush][mod_name]") {
-  ChimaeraTestFixture fixture;
+  ClioTestFixture fixture;
 
   SECTION("Flush waits for MOD_NAME async Custom tasks to complete") {
     // Create MOD_NAME client and container - CreateTask will auto-create pool

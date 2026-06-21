@@ -97,7 +97,7 @@ namespace {
     
     WaitTestFixture() {
       if (!g_initialized) {
-        bool success = clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, true);
+        bool success = clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true);
         if (success) {
           g_initialized = true;
           SimpleTest::g_test_finalize = clio::run::CLIO_RUNTIME_FINALIZE;

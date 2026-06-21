@@ -8,7 +8,7 @@ namespace cte_ffi {
 
 bool cte_init(rust::Str config_path) {
   std::string path(config_path.data(), config_path.size());
-  bool ok = clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, true);
+  bool ok = clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true);
   if (!ok) return false;
   return clio::cte::core::CLIO_CTE_CLIENT_INIT(path);
 }

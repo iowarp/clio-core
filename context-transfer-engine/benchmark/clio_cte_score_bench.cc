@@ -499,14 +499,14 @@ int main(int argc, char **argv) {
 
   // Initialize CLIO Runtime runtime
   if (rank == 0) {
-    HLOG(kInfo, "Initializing Chimaera runtime...");
+    HLOG(kInfo, "Initializing Clio runtime...");
   }
 
   MPI_Barrier(MPI_COMM_WORLD);
 
-  if (!clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, true)) {
+  if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true)) {
     if (rank == 0) {
-      HLOG(kError, "Failed to initialize Chimaera runtime");
+      HLOG(kError, "Failed to initialize Clio runtime");
     }
     MPI_Finalize();
     return 1;

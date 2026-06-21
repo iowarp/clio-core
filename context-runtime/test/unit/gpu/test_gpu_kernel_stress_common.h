@@ -75,8 +75,8 @@ inline void EnsureInit() {
   static bool initialized = false;
   if (initialized) return;
   std::fprintf(stderr,
-               "[INIT] Starting Chimaera server (producer-only GPU)\n");
-  if (!clio::run::CLIO_INIT(clio::run::ChimaeraMode::kServer)) {
+               "[INIT] Starting Clio server (producer-only GPU)\n");
+  if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kServer)) {
     std::fprintf(stderr, "[INIT] CLIO_INIT failed\n");
     std::abort();
   }

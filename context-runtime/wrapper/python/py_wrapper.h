@@ -49,14 +49,14 @@
  * ZMQ I/O threads it spawns never touch the calling (Python) thread's
  * GIL state.  The caller blocks until initialization is complete.
  *
- * @param mode ChimaeraMode integer (0 = kClient)
+ * @param mode RuntimeMode integer (0 = kClient)
  * @return true if initialization succeeded
  */
 inline bool py_chimaera_init(int mode) {
   bool result = false;
   std::thread([&result, mode]() {
     result = clio::run::CLIO_INIT(
-        static_cast<clio::run::ChimaeraMode>(mode), false, false);
+        static_cast<clio::run::RuntimeMode>(mode), false, false);
   }).join();
   return result;
 }

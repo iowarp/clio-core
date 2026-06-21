@@ -1,7 +1,7 @@
 """
 IOWarp Runtime Service Package
 
-Manages the Chimaera runtime deployment. Supports both bare-metal (default)
+Manages the Clio runtime deployment. Supports both bare-metal (default)
 and container deployment modes via deploy_mode configuration.
 """
 from jarvis_cd.core.pkg import Service
@@ -282,7 +282,7 @@ class ClioRuntime(Service):
         }
 
         with open(self.config_file, 'w') as f:
-            f.write('# Chimaera Runtime Configuration\n\n')
+            f.write('# Clio Runtime Configuration\n\n')
             yaml.dump(config_dict, f, default_flow_style=False, sort_keys=False)
 
     # ------------------------------------------------------------------

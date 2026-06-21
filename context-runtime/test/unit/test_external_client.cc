@@ -87,7 +87,7 @@ TEST_CASE("ExternalClient - Basic Connection", "[external_client][ipc]") {
 
   // Now connect as EXTERNAL CLIENT (not integrated server+client)
   setenv("CLIO_WITH_RUNTIME", "0", 1);  // Force client-only mode
-  bool success = CLIO_INIT(ChimaeraMode::kClient, false);
+  bool success = CLIO_INIT(RuntimeMode::kClient, false);
   REQUIRE(success);
 
   // Verify client initialized successfully
@@ -130,7 +130,7 @@ TEST_CASE("ExternalClient - Multiple Clients", "[external_client][ipc]") {
 
       // Child process: Connect as client
       setenv("CLIO_WITH_RUNTIME", "0", 1);
-      bool success = CLIO_INIT(ChimaeraMode::kClient, false);
+      bool success = CLIO_INIT(RuntimeMode::kClient, false);
       if (!success) {
         _exit(1);
       }
@@ -175,7 +175,7 @@ TEST_CASE("ExternalClient - Connection Without Server",
 
   // This should fail gracefully (not crash)
   // Note: May succeed if a stale server from another test is still running
-  bool success = CLIO_INIT(ChimaeraMode::kClient, false);
+  bool success = CLIO_INIT(RuntimeMode::kClient, false);
   (void)success;  // Just verify it doesn't crash
 }
 
@@ -187,7 +187,7 @@ TEST_CASE("ExternalClient - Client Operations", "[external_client][ipc]") {
 
   // Connect as client
   setenv("CLIO_WITH_RUNTIME", "0", 1);
-  bool success = CLIO_INIT(ChimaeraMode::kClient, false);
+  bool success = CLIO_INIT(RuntimeMode::kClient, false);
   REQUIRE(success);
 
   auto *ipc = CLIO_IPC;

@@ -163,12 +163,12 @@ class CTECoreFunctionalTestFixture {
     // Initialize CLIO Runtime runtime and client for functional testing
     if (ShouldInitializeRuntime()) {
       INFO("Initializing runtime (CLIO_WITH_RUNTIME not set or enabled)");
-      bool success = clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, true);
+      bool success = clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true);
       REQUIRE(success);
     } else {
       INFO("Runtime already initialized externally (CLIO_WITH_RUNTIME="
            << clio::run::env::GetCompat("WITH_RUNTIME") << ")");
-      bool success = clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, true);
+      bool success = clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true);
       REQUIRE(success);
     }
 
@@ -1838,7 +1838,7 @@ TEST_CASE("FUNCTIONAL - PutBlob-GetBlob Comprehensive Integration",
   REQUIRE(CLIO_POOL_MANAGER != nullptr);
   REQUIRE(CLIO_MODULE_MANAGER != nullptr);
   REQUIRE(CLIO_IPC->IsInitialized());
-  INFO("✓ Chimaera runtime initialization verified");
+  INFO("✓ Clio runtime initialization verified");
 
   // Step 4: PutBlob with blob_name="test_blob"
   INFO("Step 4: Executing PutBlob with specific requirements...");

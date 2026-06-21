@@ -75,7 +75,7 @@ public:
 
   ADIOS2AdapterTestFixture() : test_counter_(0) {
     // Initialize CLIO Runtime runtime and CTE client
-    bool success = clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, true);
+    bool success = clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true);
     REQUIRE(success);
 
     // Give runtime time to initialize

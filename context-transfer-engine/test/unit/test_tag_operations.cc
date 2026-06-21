@@ -89,7 +89,7 @@ class TagTestFixture {
       if (fs::exists(test_storage_path_)) {
         fs::remove(test_storage_path_);
       }
-      bool success = clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, true);
+      bool success = clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true);
       REQUIRE(success);
 
       // Give runtime time to initialize

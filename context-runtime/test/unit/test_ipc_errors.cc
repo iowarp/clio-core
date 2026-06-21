@@ -56,7 +56,7 @@ using namespace clio::run;
 static bool InitializeRuntime() {
   static bool initialized = false;
   if (!initialized) {
-    bool success = CLIO_INIT(ChimaeraMode::kClient, true);
+    bool success = CLIO_INIT(RuntimeMode::kClient, true);
     initialized = success;
     if (success) SimpleTest::g_test_finalize = clio::run::CLIO_RUNTIME_FINALIZE;
     return success;
@@ -81,7 +81,7 @@ TEST_CASE("IpcErrors - Client Connect Without Server", "[ipc][errors]") {
   setenv("CLIO_WITH_RUNTIME", "0", 1);
 
   // This should timeout and fail gracefully (not crash)
-  bool success = CLIO_INIT(ChimaeraMode::kClient, false);
+  bool success = CLIO_INIT(RuntimeMode::kClient, false);
   REQUIRE(!success);
 
   // Verify IPC manager is not initialized
@@ -103,7 +103,7 @@ TEST_CASE("IpcErrors - Connection Timeout", "[ipc][errors]") {
   if (server_pid == 0) {
     // Child: Start server then immediately exit
     setenv("CLIO_WITH_RUNTIME", "1", 1);
-    CLIO_INIT(ChimaeraMode::kServer, true);
+    CLIO_INIT(RuntimeMode::kServer, true);
     exit(0);  // Exit immediately
   }
 
@@ -116,7 +116,7 @@ TEST_CASE("IpcErrors - Connection Timeout", "[ipc][errors]") {
 
   // Now try to connect - server is gone
   setenv("CLIO_WITH_RUNTIME", "0", 1);
-  bool success = CLIO_INIT(ChimaeraMode::kClient, false);
+  bool success = CLIO_INIT(RuntimeMode::kClient, false);
 
   // May succeed or fail depending on timing and leftover shm
   // The important thing is it doesn't crash
@@ -348,7 +348,7 @@ TEST_CASE("IpcErrors - Concurrent Init/Finalize", "[ipc][errors][multiproc]") {
     pids[i] = fork();
     if (pids[i] == 0) {
       // Child: Try to initialize
-      bool success = CLIO_INIT(ChimaeraMode::kClient, true);
+      bool success = CLIO_INIT(RuntimeMode::kClient, true);
 
       if (success) {
         auto *ipc = CLIO_IPC;

@@ -32,7 +32,7 @@ const char *kClioFile = "clio::/tmp/clio_cte_vfd_smoke.h5";
   } while (0)
 
 bool InitRuntime() {
-  if (!clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, true)) {
+  if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true)) {
     return false;
   }
   if (!clio::cte::core::CLIO_CTE_CLIENT_INIT()) {

@@ -97,7 +97,7 @@ TEST_CASE("Cfs - filesystem chimod open/write/getattr/read/truncate",
   REQUIRE(server.WaitForReady());
   REQUIRE(RunCliTimed({"compose", "start", yaml.string()}, 60) == 0);
 
-  REQUIRE(clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, false));
+  REQUIRE(clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, false));
   auto* ipc = CLIO_IPC;
   REQUIRE(ipc != nullptr);
 

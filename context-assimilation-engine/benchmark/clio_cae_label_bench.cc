@@ -410,8 +410,8 @@ int main(int argc, char **argv) {
   setenv("CLIO_SERVER_CONF", config_path.c_str(), 1);
   HLOG(kInfo, "Config: {}", config_path);
 
-  HLOG(kInfo, "Initializing Chimaera runtime (kServer)...");
-  if (!clio::run::CLIO_INIT(clio::run::ChimaeraMode::kServer)) {
+  HLOG(kInfo, "Initializing Clio runtime (kServer)...");
+  if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kServer)) {
     HLOG(kError, "CLIO_INIT failed");
     return 1;
   }

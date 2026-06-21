@@ -127,9 +127,9 @@ std::vector<char> GenerateTestData(size_t size, const std::string& pattern) {
  */
 void InitializeChimaera() {
   // Initialize CLIO Runtime runtime in client mode with runtime
-  bool success = clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, true);
+  bool success = clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true);
   if (!success) {
-    throw std::runtime_error("Failed to initialize Chimaera runtime");
+    throw std::runtime_error("Failed to initialize Clio runtime");
   }
 }
 

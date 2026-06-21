@@ -2,7 +2,7 @@
 GPU Runtime Benchmark Package
 
 Benchmarks GPU task submission latency using the bench_gpu_runtime binary.
-bench_gpu_runtime is self-contained: it starts its own Chimaera runtime
+bench_gpu_runtime is self-contained: it starts its own Clio runtime
 internally, so no clio_runtime package is needed in the pipeline.
 
 Measures round-trip task latency from GPU client kernels to the GPU work
@@ -30,7 +30,7 @@ class ClioGpuBench(Application):
     GPU Runtime Latency Benchmark
 
     Runs the self-contained bench_gpu_runtime binary to measure GPU task
-    submission round-trip latency against the Chimaera GPU work orchestrator.
+    submission round-trip latency against the Clio GPU work orchestrator.
     """
 
     def _init(self):

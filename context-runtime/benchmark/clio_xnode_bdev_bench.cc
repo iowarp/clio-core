@@ -87,7 +87,7 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  if (!clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, false)) {
+  if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, false)) {
     HLOG(kError, "rank={} CLIO_INIT failed", world_rank);
     MPI_Finalize();
     return 2;

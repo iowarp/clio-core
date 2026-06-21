@@ -55,13 +55,13 @@ static nb::dict results_to_dict(
 }
 
 NB_MODULE(chimaera_runtime_ext, m) {
-  m.doc() = "Python bindings for Chimaera runtime monitoring";
+  m.doc() = "Python bindings for Clio runtime monitoring";
 
   m.def("chimaera_init", &py_chimaera_init, "mode"_a,
-        "Initialize the Chimaera runtime. mode: 0=kClient.");
+        "Initialize the Clio runtime. mode: 0=kClient.");
 
   m.def("chimaera_finalize", &py_chimaera_finalize,
-        "Finalize the Chimaera runtime.");
+        "Finalize the Clio runtime.");
 
   nb::class_<PyMonitorTask>(m, "MonitorTask")
       .def("wait", [](PyMonitorTask& self, float max_sec) -> nb::dict {

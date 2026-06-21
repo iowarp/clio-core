@@ -112,7 +112,7 @@ class ClioCteBench(Application):
             },
             {
                 'name': 'init_runtime',
-                'msg': 'Initialize Chimaera runtime (otherwise assumes runtime already running)',
+                'msg': 'Initialize Clio runtime (otherwise assumes runtime already running)',
                 'type': bool,
                 'default': False,
                 'help': 'Set to True to initialize runtime, False to only initialize client'

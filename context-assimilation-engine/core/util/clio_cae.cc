@@ -194,15 +194,15 @@ int main(int argc, char* argv[]) {
 
   try {
     // Initialize CLIO Runtime client
-    if (!clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, false)) {
-      HLOG(kError, "Error: Failed to initialize Chimaera client");
+    if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, false)) {
+      HLOG(kError, "Error: Failed to initialize Clio client");
       return 1;
     }
 
     // Verify CLIO Runtime IPC is available
     auto* ipc_manager = CLIO_IPC;
     if (!ipc_manager) {
-      HLOG(kError, "Error: Chimaera IPC not initialized. Is the runtime running?");
+      HLOG(kError, "Error: Clio IPC not initialized. Is the runtime running?");
       return 1;
     }
 

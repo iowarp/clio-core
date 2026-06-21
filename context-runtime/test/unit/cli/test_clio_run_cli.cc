@@ -465,7 +465,7 @@ TEST_CASE("CliDispatch - command help and argument errors", "[cli][dispatch]") {
 //==============================================================================
 // CliClientError — client-mode commands with no runtime available.
 // CLIO_WAIT_SERVER=0 (set by RunCli) makes WaitForLocalServer fail
-// immediately, so each command takes its "Failed to initialize Chimaera
+// immediately, so each command takes its "Failed to initialize Clio
 // client" path without ever waiting on or spawning a daemon.
 //==============================================================================
 

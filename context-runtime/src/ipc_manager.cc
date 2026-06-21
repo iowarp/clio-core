@@ -887,7 +887,7 @@ retry_attempt:
       HLOG(kError, "Timeout waiting for runtime after {} seconds ({} attempts)",
            wait_server_timeout_, attempt_idx);
       HLOG(kError, "This usually means:");
-      HLOG(kError, "1. Chimaera runtime is not running");
+      HLOG(kError, "1. Clio runtime is not running");
       HLOG(kError, "2. Runtime failed to start");
       HLOG(kError, "3. Network connectivity issues");
       return false;
@@ -1411,7 +1411,7 @@ bool IpcManager::IdentifyThisHost() {
   HLOG(kError, "  macOS:   sudo lsof -i :{} -P -n", port);
   HLOG(kError, "           sudo lsof -nP -iTCP:{} | grep LISTEN", port);
   HLOG(kError, "");
-  HLOG(kError, "To stop the Chimaera runtime, run:");
+  HLOG(kError, "To stop the Clio runtime, run:");
   HLOG(kError, "  chimaera runtime stop");
   HLOG(kError, "");
   HLOG(kError, "Or kill the process directly:");

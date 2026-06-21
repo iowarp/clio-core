@@ -14,7 +14,7 @@ class ClioCteSemanticBench(Application):
     the broadcast -> SemanticSearchTask::Aggregate (merge-by-score) path.
 
     Runs the `clio_cte_semantic_bench` binary as a CTE client; assumes a
-    Chimaera runtime + CTE pool are already up (init_runtime=False).
+    Clio runtime + CTE pool are already up (init_runtime=False).
     """
 
     def _init(self):
@@ -73,7 +73,7 @@ class ClioCteSemanticBench(Application):
             },
             {
                 'name': 'init_runtime',
-                'msg': 'Initialize Chimaera runtime (else assume already running)',
+                'msg': 'Initialize Clio runtime (else assume already running)',
                 'type': bool,
                 'default': False,
             },

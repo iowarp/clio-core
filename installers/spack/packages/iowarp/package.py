@@ -7,7 +7,7 @@ from spack.package import *
 
 
 class Iowarp(CMakePackage):
-    """IOWarp Core: Unified repository containing runtime (Chimaera),
+    """IOWarp Core: Unified repository containing runtime (Clio),
     context-transport-primitives, context-transfer-engine,
     context-assimilation-engine, and context-exploration-engine."""
 
@@ -25,7 +25,7 @@ class Iowarp(CMakePackage):
     variant('benchmark', default=True, description='Enable benchmarks for all components')
 
     # Component enable/disable variants
-    variant('runtime', default=True, description='Enable Chimaera runtime component')
+    variant('runtime', default=True, description='Enable Clio runtime component')
     variant('cte', default=True, description='Enable context-transfer-engine component')
     variant('cae', default=True, description='Enable context-assimilation-engine component')
     variant('cee', default=True, description='Enable context-exploration-engine component')

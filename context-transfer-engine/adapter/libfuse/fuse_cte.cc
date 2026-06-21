@@ -111,7 +111,7 @@ static void *cte_fuse_init(struct fuse_conn_info *conn,
   cfg->entry_timeout = 0;
   cfg->negative_timeout = 0;
 
-  bool success = clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, true);
+  bool success = clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true);
   if (!success) {
     fprintf(stderr, "ERROR: CLIO_INIT failed\n");
     return nullptr;

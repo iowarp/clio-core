@@ -1,3 +1,3 @@
 """
-GPU Runtime Benchmark Package for IOWarp (Chimaera)
+GPU Runtime Benchmark Package for IOWarp (Clio)
 """

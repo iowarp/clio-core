@@ -107,14 +107,14 @@ int main() {
   try {
     const char* init_chimaera = std::getenv("INIT_CHIMAERA");
     if (init_chimaera && std::strcmp(init_chimaera, "1") == 0) {
-      HLOG(kInfo, "Initializing Chimaera (INIT_CHIMAERA=1)...");
-      clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, true);
-      HLOG(kSuccess, "Chimaera initialized");
+      HLOG(kInfo, "Initializing Clio (INIT_CHIMAERA=1)...");
+      clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true);
+      HLOG(kSuccess, "Clio initialized");
     }
 
     auto* ipc_manager = CLIO_IPC;
     if (!ipc_manager) {
-      HLOG(kError, "Chimaera IPC not initialized. Is the runtime running?");
+      HLOG(kError, "Clio IPC not initialized. Is the runtime running?");
       ctp::SystemInfo::TerminateProcessNow(1);
       return 1;
     }

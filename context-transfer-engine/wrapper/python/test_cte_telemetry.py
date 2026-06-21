@@ -7,7 +7,7 @@ functionality of the CTE Python bindings.
 
 Requirements:
 - clio_cte_core_ext module (Python bindings)
-- Chimaera runtime initialized with CLIO_WITH_RUNTIME=1
+- Clio runtime initialized with CLIO_WITH_RUNTIME=1
 - CLIO_SERVER_CONF environment variable set to config file
 - pytest (optional, for test framework mode)
 
@@ -67,7 +67,7 @@ def cte_module():
 
 @pytest.fixture(scope="module")
 def runtime_initialized(cte_module):
-    """Fixture to initialize Chimaera runtime once per module
+    """Fixture to initialize Clio runtime once per module
 
     This follows the pattern from test_bindings.py for runtime initialization.
     Requires CLIO_WITH_RUNTIME=1 environment variable.
@@ -101,9 +101,9 @@ def runtime_initialized(cte_module):
 
     # Initialize CLIO Runtime
     try:
-        init_result = cte_module.chimaera_init(cte_module.ChimaeraMode.kClient, True)
+        init_result = cte_module.chimaera_init(cte_module.RuntimeMode.kClient, True)
         if not init_result:
-            pytest.skip("Chimaera initialization failed")
+            pytest.skip("Clio initialization failed")
 
         # Give runtime time to initialize
         time.sleep(0.5)
@@ -340,8 +340,8 @@ def main():
                 os.environ["LD_LIBRARY_PATH"] = bin_dir
 
         # Initialize runtime
-        if not cte.chimaera_init(cte.ChimaeraMode.kClient, True):
-            print("❌ Chimaera initialization failed")
+        if not cte.chimaera_init(cte.RuntimeMode.kClient, True):
+            print("❌ Clio initialization failed")
             return 1
 
         time.sleep(0.5)

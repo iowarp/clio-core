@@ -18,7 +18,7 @@ Additional CTE Operations:
 - reorganize_blob: Reorganize blob placement with new score
 
 Runtime Management:
-- initialize_cte_runtime: Initialize CTE runtime (Chimaera runtime, client, and CTE subsystem)
+- initialize_cte_runtime: Initialize CTE runtime (Clio runtime, client, and CTE subsystem)
 - get_client_status: Get CTE client initialization status
 - get_cte_types: Get available CTE types and operations
 
@@ -155,11 +155,11 @@ def _initialize_runtime() -> bool:
             
             # Step 1: Initialize CLIO Runtime (unified init)
             chimaera_result = False
-            if hasattr(cte, 'chimaera_init') and hasattr(cte, 'ChimaeraMode'):
+            if hasattr(cte, 'chimaera_init') and hasattr(cte, 'RuntimeMode'):
                 try:
-                    chimaera_result = cte.chimaera_init(cte.ChimaeraMode.kClient, True)
+                    chimaera_result = cte.chimaera_init(cte.RuntimeMode.kClient, True)
                     if chimaera_result:
-                        time.sleep(0.5)  # Give Chimaera time to initialize (500ms as per tests)
+                        time.sleep(0.5)  # Give Clio time to initialize (500ms as per tests)
                 except Exception:
                     pass  # May fail in some environments
 
@@ -572,12 +572,12 @@ def reorganize_blob(tag_id_major: int, tag_id_minor: int, blob_name: str, new_sc
 
 @mcp.tool()
 def initialize_cte_runtime() -> str:
-    """Initialize the CTE runtime (Chimaera runtime, client, and CTE subsystem).
+    """Initialize the CTE runtime (Clio runtime, client, and CTE subsystem).
     
     This function follows the initialization pattern from test_bindings.py:
     1. Setup environment paths (CLIO_REPO_PATH, LD_LIBRARY_PATH)
     2. Use CLIO_SERVER_CONF if available, otherwise try empty config
-    3. Initialize Chimaera (chimaera_init with kClient mode, True) - wait 500ms
+    3. Initialize Clio (chimaera_init with kClient mode, True) - wait 500ms
     4. Initialize CTE subsystem (initialize_cte with config_path)
     
     Returns:
@@ -723,30 +723,30 @@ def initialize_cte_runtime() -> str:
             
             # Step 1: Initialize CLIO Runtime (unified init - following test_bindings.py pattern)
             # Note: This may fail if runtime is already running or config is missing
-            if hasattr(cte, 'chimaera_init') and hasattr(cte, 'ChimaeraMode'):
+            if hasattr(cte, 'chimaera_init') and hasattr(cte, 'RuntimeMode'):
                 try:
                     # Try to initialize - if it fails, it may return False or raise an exception
                     # In some cases, C++ FATAL may cause process abort which we can't catch
-                    chimaera_result = cte.chimaera_init(cte.ChimaeraMode.kClient, True)
+                    chimaera_result = cte.chimaera_init(cte.RuntimeMode.kClient, True)
                     result['runtime_init'] = bool(chimaera_result)
                     result['client_init'] = bool(chimaera_result)
                     if chimaera_result:
                         # Give CLIO Runtime time to initialize all components (500ms as per tests)
                         time.sleep(0.5)
-                        result['messages'].append('Chimaera initialized successfully')
+                        result['messages'].append('Clio initialized successfully')
                     else:
                         # Init returned False - might already be initialized or failed silently
-                        result['messages'].append('Chimaera init returned False - may already be initialized or needs external setup')
+                        result['messages'].append('Clio init returned False - may already be initialized or needs external setup')
                         # Don't mark as failed yet - might still work
                         result['runtime_init'] = True  # Assume it's okay to proceed
                         result['client_init'] = True
                 except SystemExit as e:
                     # Process may exit due to FATAL errors in C++ code - we can't prevent this
                     # But we try to return JSON before exit
-                    result['messages'].append(f'Chimaera init caused process exit (code: {e.code}) - port may be in use or config invalid')
+                    result['messages'].append(f'Clio init caused process exit (code: {e.code}) - port may be in use or config invalid')
                     result['runtime_init'] = False
                     result['client_init'] = False
-                    result['error'] = 'Process exit during Chimaera initialization'
+                    result['error'] = 'Process exit during Clio initialization'
                     # Try to return immediately before process exits
                     try:
                         os.dup2(old_stderr_fd, 2)
@@ -755,12 +755,12 @@ def initialize_cte_runtime() -> str:
                         pass
                     return json.dumps(result, indent=2)
                 except Exception as e:
-                    result['messages'].append(f'Chimaera init failed: {type(e).__name__}: {str(e)}')
+                    result['messages'].append(f'Clio init failed: {type(e).__name__}: {str(e)}')
                     result['runtime_init'] = False
                     result['client_init'] = False
             else:
                 result['messages'].append('chimaera_init not available in bindings')
-            log_progress(result) # Log after Chimaera init
+            log_progress(result) # Log after Clio init
 
             # Step 2: Initialize CTE subsystem (following test_bindings.py pattern)
             if hasattr(cte, 'initialize_cte') and hasattr(cte, 'PoolQuery') and result['client_init']:
@@ -864,7 +864,7 @@ def initialize_cte_runtime() -> str:
         
         # Add helpful message if initialization failed
         if not result['success']:
-            result['note'] = 'CTE runtime initialization may require external setup. Options: 1) Set CLIO_SERVER_CONF to a valid config file path, 2) Ensure PyYAML is installed for automatic config generation (pip install pyyaml), 3) Ensure Chimaera runtime is not already running on the same port, 4) Use external Chimaera runtime setup. Note: If initialization fails with process exit, the C++ code may have called FATAL - check logs or try external setup.'
+            result['note'] = 'CTE runtime initialization may require external setup. Options: 1) Set CLIO_SERVER_CONF to a valid config file path, 2) Ensure PyYAML is installed for automatic config generation (pip install pyyaml), 3) Ensure Clio runtime is not already running on the same port, 4) Use external Clio runtime setup. Note: If initialization fails with process exit, the C++ code may have called FATAL - check logs or try external setup.'
         log_progress(result) # Log before finally block
         
     except Exception as e:

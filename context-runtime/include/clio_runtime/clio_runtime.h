@@ -62,8 +62,7 @@ enum class RuntimeMode {
 };
 
 /// Backward-compat alias for the pre-rename name.  External code that
-/// still uses clio::run::ChimaeraMode keeps compiling unchanged.
-using ChimaeraMode = RuntimeMode;
+/// still uses clio::run::RuntimeMode keeps compiling unchanged.
 
 /**
  * Global initialization functions
@@ -86,18 +85,18 @@ using ChimaeraMode = RuntimeMode;
  *   (CLIO_WITH_RUNTIME is honored as a legacy alias via env::GetCompat.)
  *   If not set, uses default_with_runtime parameter
  */
-bool ClioInitImpl(ChimaeraMode mode, bool default_with_runtime,
+bool ClioInitImpl(RuntimeMode mode, bool default_with_runtime,
                   bool is_restart);
 
 /**
  * CLIO_INIT — canonical Clio runtime entry point.  Thin inline wrapper
  * around ClioInitImpl (the heavy lifting lives in clio_runtime.cc because
- * it touches the IpcManager / ChimaeraManager singletons whose
+ * it touches the IpcManager / RuntimeManager singletons whose
  * headers we don't want to drag into clio_runtime.h's transitive
  * include set).  Inline, not a macro, so the call resolves through the
  * normal overload-set + ADL rules.
  */
-inline bool CLIO_INIT(ChimaeraMode mode, bool default_with_runtime = false,
+inline bool CLIO_INIT(RuntimeMode mode, bool default_with_runtime = false,
                        bool is_restart = false) {
   return ClioInitImpl(mode, default_with_runtime, is_restart);
 }

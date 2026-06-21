@@ -155,7 +155,7 @@ TEST_CASE("IpcTransportMode - SHM Client Connection",
   // Set SHM mode and connect as external client
   clio::run::test::SetEnvVar("CLIO_IPC_MODE", "SHM");
   clio::run::test::SetEnvVar("CLIO_WITH_RUNTIME", "0");
-  bool success = CLIO_INIT(ChimaeraMode::kClient, false);
+  bool success = CLIO_INIT(RuntimeMode::kClient, false);
   REQUIRE(success);
 
   auto *ipc = CLIO_IPC;
@@ -180,7 +180,7 @@ TEST_CASE("IpcTransportMode - TCP Client Connection",
   // Set TCP mode and connect as external client
   clio::run::test::SetEnvVar("CLIO_IPC_MODE", "TCP");
   clio::run::test::SetEnvVar("CLIO_WITH_RUNTIME", "0");
-  bool success = CLIO_INIT(ChimaeraMode::kClient, false);
+  bool success = CLIO_INIT(RuntimeMode::kClient, false);
   REQUIRE(success);
 
   auto *ipc = CLIO_IPC;
@@ -205,7 +205,7 @@ TEST_CASE("IpcTransportMode - IPC Client Connection",
   // Set IPC (Unix Domain Socket) mode and connect as external client
   clio::run::test::SetEnvVar("CLIO_IPC_MODE", "IPC");
   clio::run::test::SetEnvVar("CLIO_WITH_RUNTIME", "0");
-  bool success = CLIO_INIT(ChimaeraMode::kClient, false);
+  bool success = CLIO_INIT(RuntimeMode::kClient, false);
   REQUIRE(success);
 
   auto *ipc = CLIO_IPC;
@@ -230,7 +230,7 @@ TEST_CASE("IpcTransportMode - Default Mode Is TCP",
   // Unset CLIO_IPC_MODE to test default behavior
   clio::run::test::UnsetEnvVar("CLIO_IPC_MODE");
   clio::run::test::SetEnvVar("CLIO_WITH_RUNTIME", "0");
-  bool success = CLIO_INIT(ChimaeraMode::kClient, false);
+  bool success = CLIO_INIT(RuntimeMode::kClient, false);
   REQUIRE(success);
 
   auto *ipc = CLIO_IPC;

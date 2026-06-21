@@ -70,8 +70,8 @@ def test_cte_types():
         import clio_cte_core_ext as cte
 
         # Test that key types/enums are accessible
-        _ = cte.ChimaeraMode.kClient
-        print("  ✅ ChimaeraMode enum accessible")
+        _ = cte.RuntimeMode.kClient
+        print("  ✅ RuntimeMode enum accessible")
 
         _ = cte.PoolQuery.Dynamic()
         print("  ✅ PoolQuery accessible")

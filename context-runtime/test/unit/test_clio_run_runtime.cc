@@ -77,11 +77,11 @@ bool g_initialized = false;
  * Test fixture for CLIO Runtime runtime tests
  * Handles setup and teardown of runtime and client components
  */
-class ChimaeraRuntimeFixture {
+class ClioRuntimeFixture {
 public:
-  ChimaeraRuntimeFixture() {
+  ClioRuntimeFixture() {
     if (!g_initialized) {
-      bool success = clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, true);
+      bool success = clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true);
       if (success) {
         g_initialized = true;
         SimpleTest::g_test_finalize = clio::run::CLIO_RUNTIME_FINALIZE;
@@ -90,7 +90,7 @@ public:
     }
   }
 
-  ~ChimaeraRuntimeFixture() { cleanup(); }
+  ~ClioRuntimeFixture() { cleanup(); }
 
   /**
    * Wait for task completion with timeout
@@ -170,10 +170,10 @@ public:
 // Basic Runtime and Client Initialization Tests
 //------------------------------------------------------------------------------
 
-TEST_CASE("Chimaera Initialization", "[runtime][initialization]") {
-  ChimaeraRuntimeFixture fixture;
+TEST_CASE("Clio Initialization", "[runtime][initialization]") {
+  ClioRuntimeFixture fixture;
 
-  SECTION("Chimaera initialization should succeed") {
+  SECTION("Clio initialization should succeed") {
     REQUIRE(g_initialized);
 
     // Verify runtime state
@@ -192,7 +192,7 @@ TEST_CASE("Chimaera Initialization", "[runtime][initialization]") {
 //------------------------------------------------------------------------------
 
 TEST_CASE("MOD_NAME Custom Task Execution", "[task][mod_name][custom]") {
-  ChimaeraRuntimeFixture fixture;
+  ClioRuntimeFixture fixture;
 
   SECTION(
       "Complete workflow: runtime + client + pool creation + task submission") {
@@ -238,7 +238,7 @@ TEST_CASE("MOD_NAME Custom Task Execution", "[task][mod_name][custom]") {
 }
 
 TEST_CASE("MOD_NAME Async Task Execution", "[task][mod_name][async]") {
-  ChimaeraRuntimeFixture fixture;
+  ClioRuntimeFixture fixture;
 
   SECTION("Async task submission and completion") {
     // Initialize everything
@@ -285,7 +285,7 @@ TEST_CASE("MOD_NAME Async Task Execution", "[task][mod_name][async]") {
 //------------------------------------------------------------------------------
 
 TEST_CASE("Error Handling Tests", "[error][edge_cases]") {
-  ChimaeraRuntimeFixture fixture;
+  ClioRuntimeFixture fixture;
 
   SECTION("Task submission without runtime should fail gracefully") {
     (void)g_initialized; // Mark as used
@@ -357,7 +357,7 @@ TEST_CASE("Error Handling Tests", "[error][edge_cases]") {
 //------------------------------------------------------------------------------
 
 TEST_CASE("Concurrent Task Execution", "[concurrent][stress]") {
-  ChimaeraRuntimeFixture fixture;
+  ClioRuntimeFixture fixture;
 
   SECTION("Multiple concurrent tasks") {
     REQUIRE(g_initialized);
@@ -406,7 +406,7 @@ TEST_CASE("Concurrent Task Execution", "[concurrent][stress]") {
 //------------------------------------------------------------------------------
 
 TEST_CASE("Memory Management", "[memory][cleanup]") {
-  ChimaeraRuntimeFixture fixture;
+  ClioRuntimeFixture fixture;
 
   SECTION("Task allocation and deallocation") {
     REQUIRE(g_initialized);
@@ -444,7 +444,7 @@ TEST_CASE("Memory Management", "[memory][cleanup]") {
 //------------------------------------------------------------------------------
 
 TEST_CASE("Performance Tests", "[performance][timing]") {
-  ChimaeraRuntimeFixture fixture;
+  ClioRuntimeFixture fixture;
 
   SECTION("Task execution latency") {
     REQUIRE(g_initialized);

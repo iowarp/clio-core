@@ -442,7 +442,7 @@ int main(int argc, char **argv) {
   }
 
   // Print benchmark header
-  HIPRINT("=== Chimaera Task Throughput Benchmark ===");
+  HIPRINT("=== Clio Task Throughput Benchmark ===");
   switch (config.test_case) {
   case TestCase::kBDevIO:
     HIPRINT("Test case: BDev I/O (Allocate -> Write -> Free)");
@@ -467,8 +467,8 @@ int main(int argc, char **argv) {
   }
 
   // Initialize CLIO Runtime client
-  if (!clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, false)) {
-    HLOG(kError, "ERROR: Failed to initialize Chimaera client");
+  if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, false)) {
+    HLOG(kError, "ERROR: Failed to initialize Clio client");
     return 1;
   }
 

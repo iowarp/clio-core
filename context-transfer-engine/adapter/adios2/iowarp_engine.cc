@@ -124,7 +124,7 @@ IowarpEngine::IowarpEngine(adios2::core::IO &io, const std::string &name,
     throw std::runtime_error(
         "IowarpEngine: CLIO_CTE_CLIENT_INIT failed after " +
         std::to_string(max_attempts) +
-        " attempts - is Chimaera runtime running?");
+        " attempts - is Clio runtime running?");
   }
   HLOG(kDebug, "[IowarpEngine] CLIO_CTE_CLIENT_INIT completed");
 

@@ -63,11 +63,11 @@ NB_MODULE(clio_cte_core_ext, m) {
       .value("kFile", clio::run::bdev::BdevType::kFile)
       .value("kRam", clio::run::bdev::BdevType::kRam);
 
-  // Bind ChimaeraMode enum
-  nb::enum_<clio::run::ChimaeraMode>(m, "ChimaeraMode")
-      .value("kClient", clio::run::ChimaeraMode::kClient)
-      .value("kServer", clio::run::ChimaeraMode::kServer)
-      .value("kRuntime", clio::run::ChimaeraMode::kRuntime);
+  // Bind RuntimeMode enum
+  nb::enum_<clio::run::RuntimeMode>(m, "RuntimeMode")
+      .value("kClient", clio::run::RuntimeMode::kClient)
+      .value("kServer", clio::run::RuntimeMode::kServer)
+      .value("kRuntime", clio::run::RuntimeMode::kRuntime);
 
   // Bind UniqueId type (used by TagId, BlobId, and PoolId)
   // Note: TagId, BlobId, and PoolId are all aliases for clio::run::UniqueId, so we register the base type
@@ -343,9 +343,9 @@ NB_MODULE(clio_cte_core_ext, m) {
   // CLIO Runtime initialization function (unified)
   m.def("chimaera_init", &clio::run::CLIO_INIT,
         "mode"_a, "default_with_runtime"_a = false, "is_restart"_a = false,
-        "Initialize Chimaera with specified mode.\n\n"
+        "Initialize Clio with specified mode.\n\n"
         "Args:\n"
-        "    mode: ChimaeraMode.kClient or ChimaeraMode.kServer/kRuntime\n"
+        "    mode: RuntimeMode.kClient or RuntimeMode.kServer/kRuntime\n"
         "    default_with_runtime: If True, starts runtime in addition to client (default: False)\n"
         "    is_restart: If True, force restart on compose pools and replay WAL (default: False)\n\n"
         "Environment variable CLIO_WITH_RUNTIME overrides default_with_runtime:\n"

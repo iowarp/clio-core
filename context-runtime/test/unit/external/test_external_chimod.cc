@@ -14,11 +14,11 @@ int main() {
 
   try {
     // Initialize CLIO Runtime client
-    if (!clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, true)) {
-      HLOG(kError, "Failed to initialize Chimaera client");
+    if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true)) {
+      HLOG(kError, "Failed to initialize Clio client");
       return 1;
     }
-    HIPRINT("Chimaera client initialized successfully");
+    HIPRINT("Clio client initialized successfully");
 
     // Create admin client
     clio::run::admin::Client admin_client(clio::run::kAdminPoolId);

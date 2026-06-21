@@ -62,7 +62,7 @@
 using namespace std::chrono_literals;
 
 namespace cte = clio::cte::core;
-using ChimaeraInit = clio::run::ChimaeraMode;
+using ClioInit = clio::run::RuntimeMode;
 
 namespace {
 
@@ -77,8 +77,8 @@ cte::TagId g_tag_id;
 void EnsureInit() {
 #if !CTP_IS_DEVICE_PASS
   if (g_initialized) return;
-  std::fprintf(stderr, "[INIT] Bringing up Chimaera server\n");
-  REQUIRE(clio::run::CLIO_INIT(clio::run::ChimaeraMode::kServer));
+  std::fprintf(stderr, "[INIT] Bringing up Clio server\n");
+  REQUIRE(clio::run::CLIO_INIT(clio::run::RuntimeMode::kServer));
   REQUIRE(cte::CLIO_CTE_CLIENT_INIT());
   auto *cte_client = CLIO_CTE_CLIENT;
   REQUIRE(cte_client != nullptr);

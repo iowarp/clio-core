@@ -141,15 +141,15 @@ class BdevChimodFixture {
   BdevChimodFixture() : current_test_file_("") {
     // Initialize CLIO Runtime once per test suite
     if (!g_initialized) {
-      HLOG(kInfo, "Initializing Chimaera...");
-      bool success = clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, true);
+      HLOG(kInfo, "Initializing Clio...");
+      bool success = clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true);
       if (success) {
         g_initialized = true;
         SimpleTest::g_test_finalize = clio::run::CLIO_RUNTIME_FINALIZE;
         std::this_thread::sleep_for(500ms);
-        HLOG(kInfo, "Chimaera initialization successful");
+        HLOG(kInfo, "Clio initialization successful");
       } else {
-        HLOG(kInfo, "Failed to initialize Chimaera");
+        HLOG(kInfo, "Failed to initialize Clio");
       }
     }
 

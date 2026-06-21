@@ -253,13 +253,13 @@ int main(int argc, char* argv[]) {
 
   if (rank == 0) {
     // --- Server rank ---
-    HLOG(kInfo, "[Rank 0] Starting Chimaera server...");
+    HLOG(kInfo, "[Rank 0] Starting Clio server...");
 
     // Cleanup stale shared memory
     CleanupSharedMemory();
 
     setenv("CLIO_WITH_RUNTIME", "1", 1);
-    bool success = CLIO_INIT(ChimaeraMode::kServer, true);
+    bool success = CLIO_INIT(RuntimeMode::kServer, true);
     if (!success) {
       HLOG(kError, "[Rank 0] CLIO_INIT(kServer) failed!");
       MPI_Abort(MPI_COMM_WORLD, 1);
@@ -312,7 +312,7 @@ int main(int argc, char* argv[]) {
 
     HLOG(kInfo, "[Rank {}] Connecting as {} client...", rank, mode_name);
 
-    bool success = CLIO_INIT(ChimaeraMode::kClient, false);
+    bool success = CLIO_INIT(RuntimeMode::kClient, false);
     if (!success) {
       HLOG(kError, "[Rank {}] CLIO_INIT(kClient) failed!", rank);
       MPI_Abort(MPI_COMM_WORLD, 1);

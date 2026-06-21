@@ -406,8 +406,8 @@ static int RunSearch(clio::cte::core::Client *client, const Args &a) {
 int main(int argc, char **argv) {
   Args args = ParseArgs(argc, argv);
 
-  if (!clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, false)) {
-    std::cerr << "error: failed to initialize Chimaera runtime\n";
+  if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, false)) {
+    std::cerr << "error: failed to initialize Clio runtime\n";
     return 1;
   }
   struct Finalizer {

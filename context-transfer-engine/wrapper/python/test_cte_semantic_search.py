@@ -117,7 +117,7 @@ def generate_test_config() -> str:
 
 def initialize_runtime(cte) -> bool:
     config_path = generate_test_config()
-    if not cte.chimaera_init(cte.ChimaeraMode.kClient, True):
+    if not cte.chimaera_init(cte.RuntimeMode.kClient, True):
         return False
     time.sleep(0.5)
     if not cte.initialize_cte(config_path, cte.PoolQuery.Dynamic()):

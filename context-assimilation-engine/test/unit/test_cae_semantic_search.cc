@@ -104,7 +104,7 @@ TEST_CASE("CAE labels 10 docs; CTE SemanticSearch returns top-5",
                           "test_cae_semantic_search_config.yaml";
   ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", config_path.string(), 1);
 
-  REQUIRE(clio::run::CLIO_INIT(clio::run::ChimaeraMode::kServer));
+  REQUIRE(clio::run::CLIO_INIT(clio::run::RuntimeMode::kServer));
   SimpleTest::g_test_finalize = clio::run::CLIO_RUNTIME_FINALIZE;
   std::this_thread::sleep_for(1s);
 

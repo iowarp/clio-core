@@ -37,7 +37,7 @@
  * Exercises the connector through its public surface only: the HDF5 plugin
  * discovery entry points and the H5VL registration / property-list APIs.
  * The connector's initialize callback is nullptr, so none of this requires
- * a running Chimaera runtime.
+ * a running Clio runtime.
  *
  * These tests also serve as a link-time regression for issue #518: both the
  * connector DLL and this executable consume ${HDF5_LIBRARIES}, which was

@@ -42,7 +42,7 @@ static void EnsureInit() {
 
   // Start as server — compose will create all pools (compressor at 512.0,
   // CTE core at 513.0, bdev at 301.0).
-  bool success = clio::run::CLIO_INIT(clio::run::ChimaeraMode::kServer);
+  bool success = clio::run::CLIO_INIT(clio::run::RuntimeMode::kServer);
   REQUIRE(success);
   g_initialized = true;
   SimpleTest::g_test_finalize = clio::run::CLIO_RUNTIME_FINALIZE;
