@@ -59,15 +59,15 @@ static constexpr int kRun2RunNetworkTimeoutRC = -1000;
  * marker — doing so silently drops every task targeting node 0, which under
  * CLIO_FORCE_NET=1 on a single-node deployment is *every* task.
  */
-static constexpr chi::u64 kInvalidNodeId = ~chi::u64(0);
+static constexpr clio::run::u64 kInvalidNodeId = ~clio::run::u64(0);
 
 /** How long (seconds) to keep a task in the retry queue before failing it */
 static constexpr float kRun2RunRetryTimeoutSec = 30.0f;
 
 /** Entry in a retry queue for tasks that could not be sent */
 struct RetryEntry {
-  ctp::ipc::FullPtr<chi::Task> task;
-  chi::u64 target_node_id;
+  ctp::ipc::FullPtr<clio::run::Task> task;
+  clio::run::u64 target_node_id;
   std::chrono::steady_clock::time_point enqueued_at;
 };
 
@@ -89,14 +89,14 @@ class IpcManagerRun2Run {
    * per replica, serializes, and sends via Lightbeam.  Dead/unreachable nodes
    * are queued in send_in_retry_ for later retry.
    */
-  void SendIn(ctp::ipc::FullPtr<chi::Task> origin_task);
+  void SendIn(ctp::ipc::FullPtr<clio::run::Task> origin_task);
 
   /**
    * Send task outputs back to the originating node.
    * Reads the return-node from pool_query_, serializes via Lightbeam, then
    * calls DelTask on success.  Failures are queued in send_out_retry_.
    */
-  void SendOut(ctp::ipc::FullPtr<chi::Task> origin_task);
+  void SendOut(ctp::ipc::FullPtr<clio::run::Task> origin_task);
 
   /**
    * Receive task inputs from a remote node (inbound kSerializeIn messages).
@@ -104,7 +104,7 @@ class IpcManagerRun2Run {
    * onto a worker lane.
    * @return 0 on success, non-zero on error.
    */
-  int RecvIn(chi::LoadTaskArchive &archive, ctp::lbm::Transport *lbm_transport);
+  int RecvIn(clio::run::LoadTaskArchive &archive, ctp::lbm::Transport *lbm_transport);
 
   /**
    * Receive task outputs from a remote node (inbound kSerializeOut messages).
@@ -113,7 +113,7 @@ class IpcManagerRun2Run {
    * the origin when all replicas are done.
    * @return 0 on success, non-zero on error.
    */
-  int RecvOut(chi::LoadTaskArchive &archive, ctp::lbm::Transport *lbm_transport);
+  int RecvOut(clio::run::LoadTaskArchive &archive, ctp::lbm::Transport *lbm_transport);
 
   /**
    * Process the send_in_retry_ and send_out_retry_ queues.
@@ -135,7 +135,7 @@ class IpcManagerRun2Run {
    * alive again (restarted node).  Prevents stale tasks from the previous
    * incarnation being re-sent to a fresh runtime.
    */
-  void FlushStaleStateForNode(chi::u64 node_id);
+  void FlushStaleStateForNode(clio::run::u64 node_id);
 
   /**
    * Spawn the dedicated peer-recv and client-recv threads.
@@ -167,21 +167,21 @@ class IpcManagerRun2Run {
   // ---------------------------------------------------------------------------
 
   /** Resolve the target node_id for one pool query. Returns 0 to skip. */
-  chi::u64 SendInResolveTargetNode(chi::IpcManager *ipc_manager,
-                                    chi::PoolManager *pool_manager,
-                                    ctp::ipc::FullPtr<chi::Task> origin_task,
-                                    const chi::PoolQuery &query);
+  clio::run::u64 SendInResolveTargetNode(clio::run::IpcManager *ipc_manager,
+                                    clio::run::PoolManager *pool_manager,
+                                    ctp::ipc::FullPtr<clio::run::Task> origin_task,
+                                    const clio::run::PoolQuery &query);
 
   /**
    * Serialize task_copy and transmit it to target_node_id.
    * On failure marks the node dead (if appropriate) and queues in
    * send_in_retry_.
    */
-  void SendInTransmitReplica(chi::Container *container,
-                              chi::IpcManager *ipc_manager,
-                              ctp::ipc::FullPtr<chi::Task> task_copy,
-                              chi::u64 target_node_id,
-                              ctp::ipc::FullPtr<chi::Task> origin_task);
+  void SendInTransmitReplica(clio::run::Container *container,
+                              clio::run::IpcManager *ipc_manager,
+                              ctp::ipc::FullPtr<clio::run::Task> task_copy,
+                              clio::run::u64 target_node_id,
+                              ctp::ipc::FullPtr<clio::run::Task> origin_task);
 
   // ---------------------------------------------------------------------------
   // SendOut sub-functions
@@ -191,11 +191,11 @@ class IpcManagerRun2Run {
    * Serialize origin_task (out-direction) and send to target_node_id.
    * Queues in send_out_retry_ on failure.  Returns the Lightbeam rc.
    */
-  int SendOutTransmit(chi::Container *container,
-                      chi::IpcManager *ipc_manager,
-                      ctp::ipc::FullPtr<chi::Task> origin_task,
-                      chi::u64 target_node_id,
-                      const chi::Host *target_host);
+  int SendOutTransmit(clio::run::Container *container,
+                      clio::run::IpcManager *ipc_manager,
+                      ctp::ipc::FullPtr<clio::run::Task> origin_task,
+                      clio::run::u64 target_node_id,
+                      const clio::run::Host *target_host);
 
   // ---------------------------------------------------------------------------
   // RecvIn sub-functions
@@ -205,10 +205,10 @@ class IpcManagerRun2Run {
    * Deserialize, register, and dispatch one inbound task.
    * Returns false if the task could not be loaded or dispatched.
    */
-  bool RecvInHandleOne(chi::IpcManager *ipc_manager,
-                       chi::PoolManager *pool_manager,
-                       const chi::TaskInfo &task_info,
-                       chi::LoadTaskArchive &archive,
+  bool RecvInHandleOne(clio::run::IpcManager *ipc_manager,
+                       clio::run::PoolManager *pool_manager,
+                       const clio::run::TaskInfo &task_info,
+                       clio::run::LoadTaskArchive &archive,
                        ctp::lbm::Transport *lbm_transport);
 
   // ---------------------------------------------------------------------------
@@ -219,38 +219,38 @@ class IpcManagerRun2Run {
    * First pass: load output data from archive into each replica task.
    * Returns non-zero on hard error.
    */
-  int RecvOutDeserialize(chi::PoolManager *pool_manager,
-                         const std::vector<chi::TaskInfo> &task_infos,
-                         chi::LoadTaskArchive &archive);
+  int RecvOutDeserialize(clio::run::PoolManager *pool_manager,
+                         const std::vector<clio::run::TaskInfo> &task_infos,
+                         clio::run::LoadTaskArchive &archive);
 
   /**
    * Second pass: aggregate each replica into its origin task; complete the
    * origin when all replicas have been received.
    * Returns non-zero on hard error.
    */
-  int RecvOutAggregate(const std::vector<chi::TaskInfo> &task_infos);
+  int RecvOutAggregate(const std::vector<clio::run::TaskInfo> &task_infos);
 
   /**
    * Finalize an origin task once all its replicas have been aggregated:
    * delete replica tasks, remove from send_map_, and call EndTask.
    */
   void RecvOutCompleteOriginTask(size_t net_key,
-                                  ctp::ipc::FullPtr<chi::Task> origin_task,
-                                  chi::RunContext *origin_rctx);
+                                  ctp::ipc::FullPtr<clio::run::Task> origin_task,
+                                  clio::run::RunContext *origin_rctx);
 
   // ---------------------------------------------------------------------------
   // Retry helpers
   // ---------------------------------------------------------------------------
 
   /** Attempt to (re-)send a retry entry's task to node_id via Lightbeam. */
-  bool RetrySendToNode(RetryEntry &entry, chi::u64 node_id);
+  bool RetrySendToNode(RetryEntry &entry, clio::run::u64 node_id);
 
   /**
    * Re-resolve the target node for a retry entry whose original target is dead.
    * Consults the current address_map_ via pool_manager.
    * @return New node ID, or 0 if resolution fails.
    */
-  chi::u64 RerouteRetryEntry(RetryEntry &entry);
+  clio::run::u64 RerouteRetryEntry(RetryEntry &entry);
 
   // -------------------------------------------------------------------------
   // Dedicated recv threads
@@ -272,8 +272,8 @@ class IpcManagerRun2Run {
   static constexpr size_t kNumMapBuckets = 1024;
   mutable std::mutex send_map_mutex_;
   mutable std::mutex recv_map_mutex_;
-  ctp::priv::unordered_map_ll<size_t, ctp::ipc::FullPtr<chi::Task>> send_map_;
-  ctp::priv::unordered_map_ll<size_t, ctp::ipc::FullPtr<chi::Task>> recv_map_;
+  ctp::priv::unordered_map_ll<size_t, ctp::ipc::FullPtr<clio::run::Task>> send_map_;
+  ctp::priv::unordered_map_ll<size_t, ctp::ipc::FullPtr<clio::run::Task>> recv_map_;
 
   // Retry queues for tasks that could not be sent due to dead / unreachable
   // nodes.  Guarded by retry_queues_mutex_.

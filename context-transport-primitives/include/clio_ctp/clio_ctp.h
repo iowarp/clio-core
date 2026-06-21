@@ -143,8 +143,8 @@
 // Concrete transports + factory (only when ctp::lightbeam is linked)
 #include "lightbeam/transport_factory_impl.h"
 
-// Backward-compat aliases for the hermes_shm / HSHM era. Provides hshm::,
-// hipc::, and HSHM_* aliases for the new ctp::, ctp::ipc::, and CTP_* names.
+// Backward-compat aliases for the hermes_shm / HSHM era. Provides ctp::,
+// ctp::ipc::, and HSHM_* aliases for the new ctp::, ctp::ipc::, and CTP_* names.
 // Included last so every CTP_* macro is defined before its alias references
 // it. See rebranding.md for the full migration table.
 #include "compat/hshm_aliases.h"

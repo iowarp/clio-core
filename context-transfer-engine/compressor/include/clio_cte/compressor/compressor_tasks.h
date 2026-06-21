@@ -59,7 +59,7 @@ struct CompressorConfig {
   std::string distribution_model_path_;
   std::string dnn_model_weights_path_;
   std::string trace_folder_path_;
-  chi::PoolId next_pool_id_;  ///< Pool ID of the next module in the pipeline
+  clio::run::PoolId next_pool_id_;  ///< Pool ID of the next module in the pipeline
                                ///< (e.g., CTE core at 513.0)
   /**
    * When true (default), the compressor tracks per-tag consumer node sets
@@ -73,9 +73,9 @@ struct CompressorConfig {
    */
   bool tracking_enabled_ = true;
 
-  CompressorConfig() : next_pool_id_(chi::PoolId::GetNull()) {}
+  CompressorConfig() : next_pool_id_(clio::run::PoolId::GetNull()) {}
 
-  CompressorConfig(const chi::PoolId &pool_id, const CompressorConfig &other)
+  CompressorConfig(const clio::run::PoolId &pool_id, const CompressorConfig &other)
       : qtable_model_path_(other.qtable_model_path_),
         linreg_model_path_(other.linreg_model_path_),
         distribution_model_path_(other.distribution_model_path_),
@@ -96,7 +96,7 @@ struct CompressorConfig {
    * Load configuration from compose YAML.
    * Reads next_pool_id from the pool config.
    */
-  void LoadConfig(const chi::PoolConfig &pool_config) {
+  void LoadConfig(const clio::run::PoolConfig &pool_config) {
     // Parse next_pool_id from compose YAML config
     if (!pool_config.config_.empty()) {
       try {
@@ -106,9 +106,9 @@ struct CompressorConfig {
           // Parse "major.minor" format
           auto dot = next_str.find('.');
           if (dot != std::string::npos) {
-            chi::u32 major = std::stoul(next_str.substr(0, dot));
-            chi::u32 minor = std::stoul(next_str.substr(dot + 1));
-            next_pool_id_ = chi::PoolId(major, minor);
+            clio::run::u32 major = std::stoul(next_str.substr(0, dot));
+            clio::run::u32 minor = std::stoul(next_str.substr(dot + 1));
+            next_pool_id_ = clio::run::PoolId(major, minor);
           }
         }
         if (node["tracking_enabled"]) {
@@ -129,16 +129,16 @@ using CreateTask = clio::run::admin::GetOrCreatePoolTask<CompressorConfig>;
 /**
  * DestroyTask - Cleanup the compressor container
  */
-struct DestroyTask : public chi::Task {
+struct DestroyTask : public clio::run::Task {
   // No additional fields needed
-  DestroyTask() : chi::Task() {}
+  DestroyTask() : clio::run::Task() {}
 
-  explicit DestroyTask(const chi::TaskId &task_id, const chi::PoolId &pool_id,
-                       const chi::PoolQuery &pool_query)
-      : chi::Task(task_id, pool_id, pool_query, Method::kDestroy) {}
+  explicit DestroyTask(const clio::run::TaskId &task_id, const clio::run::PoolId &pool_id,
+                       const clio::run::PoolQuery &pool_query)
+      : clio::run::Task(task_id, pool_id, pool_query, Method::kDestroy) {}
 
   void Copy(const ctp::ipc::FullPtr<DestroyTask>& other) {
-    // No additional fields to copy beyond chi::Task
+    // No additional fields to copy beyond clio::run::Task
   }
 
   template <typename Ar> void SerializeStart(Ar &ar) { task_serialize<Ar>(ar); }
@@ -152,15 +152,15 @@ struct DestroyTask : public chi::Task {
 struct TargetState {
   std::string target_name_;      // Name of the target
   float target_score_;           // Target score (0-1, normalized log bandwidth)
-  chi::u64 remaining_space_;     // Remaining allocatable space in bytes
-  chi::u64 bytes_written_;       // Bytes written to target
+  clio::run::u64 remaining_space_;     // Remaining allocatable space in bytes
+  clio::run::u64 bytes_written_;       // Bytes written to target
   Timestamp last_updated_;       // When this state was last refreshed
 
   TargetState()
       : target_score_(0.0f), remaining_space_(0), bytes_written_(0),
         last_updated_(std::chrono::steady_clock::now()) {}
 
-  TargetState(const std::string &name, float score, chi::u64 space, chi::u64 written)
+  TargetState(const std::string &name, float score, clio::run::u64 space, clio::run::u64 written)
       : target_name_(name), target_score_(score), remaining_space_(space),
         bytes_written_(written), last_updated_(std::chrono::steady_clock::now()) {}
 };
@@ -174,8 +174,8 @@ using MonitorTask = clio::run::admin::MonitorTask;
 struct CompressionTelemetry {
   CteOp op_;                     // Operation type (kPutBlob or kGetBlob)
   int compress_lib_;             // Compression library used (0 = none)
-  chi::u64 original_size_;       // Original data size in bytes
-  chi::u64 compressed_size_;     // Compressed data size in bytes
+  clio::run::u64 original_size_;       // Original data size in bytes
+  clio::run::u64 compressed_size_;     // Compressed data size in bytes
   double compress_time_ms_;      // Actual compression time in milliseconds
   double decompress_time_ms_;    // Actual decompression time in milliseconds
   double psnr_db_;               // Actual PSNR for lossy compression
@@ -188,7 +188,7 @@ struct CompressionTelemetry {
         psnr_db_(0.0), timestamp_(std::chrono::steady_clock::now()),
         logical_time_(0) {}
 
-  CompressionTelemetry(CteOp op, int lib, chi::u64 orig_size, chi::u64 comp_size,
+  CompressionTelemetry(CteOp op, int lib, clio::run::u64 orig_size, clio::run::u64 comp_size,
                        double comp_time, double decomp_time, double psnr,
                        const Timestamp &ts, std::uint64_t logical_time = 0)
       : op_(op), compress_lib_(lib), original_size_(orig_size),
@@ -221,41 +221,41 @@ struct CompressionTelemetry {
  * Then performs compression and calls PutBlob to store the data.
  * Has the same inputs as PutBlobTask for seamless integration.
  */
-struct DynamicScheduleTask : public chi::Task {
+struct DynamicScheduleTask : public clio::run::Task {
   // Same inputs as PutBlobTask
   IN clio::cte::core::TagId tag_id_;        // Tag ID for blob grouping
-  INOUT chi::priv::string blob_name_;     // Blob name (required)
-  IN chi::u64 offset_;                    // Offset within blob
-  IN chi::u64 size_;                      // Size of blob data
+  INOUT clio::run::priv::string blob_name_;     // Blob name (required)
+  IN clio::run::u64 offset_;                    // Offset within blob
+  IN clio::run::u64 size_;                      // Size of blob data
   IN ctp::ipc::ShmPtr<> blob_data_;           // Blob data (shared memory pointer)
   IN float score_;                        // Score 0-1 for placement decisions
   INOUT Context context_;                 // Context for compression control and statistics
-  IN chi::u32 flags_;                     // Operation flags
-  IN chi::PoolId core_pool_id_;           // Pool ID of core chimod for PutBlob
+  IN clio::run::u32 flags_;                     // Operation flags
+  IN clio::run::PoolId core_pool_id_;           // Pool ID of core chimod for PutBlob
 
   // Output fields
   OUT float tier_score_;                  // Selected tier score (0-1, normalized)
 
   // SHM constructor
   DynamicScheduleTask()
-      : chi::Task(), tag_id_(clio::cte::core::TagId::GetNull()),
+      : clio::run::Task(), tag_id_(clio::cte::core::TagId::GetNull()),
         blob_name_(CTP_MALLOC), offset_(0), size_(0),
         blob_data_(ctp::ipc::ShmPtr<>::GetNull()), score_(0.5f),
-        context_(), flags_(0), core_pool_id_(chi::PoolId::GetNull()),
+        context_(), flags_(0), core_pool_id_(clio::run::PoolId::GetNull()),
         tier_score_(0.0f) {}
 
   // Emplace constructor
-  explicit DynamicScheduleTask(const chi::TaskId &task_id,
-                               const chi::PoolId &pool_id,
-                               const chi::PoolQuery &pool_query,
+  explicit DynamicScheduleTask(const clio::run::TaskId &task_id,
+                               const clio::run::PoolId &pool_id,
+                               const clio::run::PoolQuery &pool_query,
                                const clio::cte::core::TagId &tag_id,
                                const std::string &blob_name,
-                               chi::u64 offset, chi::u64 size,
+                               clio::run::u64 offset, clio::run::u64 size,
                                ctp::ipc::ShmPtr<> blob_data,
                                float score, const Context &context,
-                               chi::u32 flags,
-                               const chi::PoolId &core_pool_id)
-      : chi::Task(task_id, pool_id, pool_query, Method::kDynamicSchedule),
+                               clio::run::u32 flags,
+                               const clio::run::PoolId &core_pool_id)
+      : clio::run::Task(task_id, pool_id, pool_query, Method::kDynamicSchedule),
         tag_id_(tag_id), blob_name_(CTP_MALLOC, blob_name),
         offset_(offset), size_(size), blob_data_(blob_data), score_(score),
         context_(context), flags_(flags), core_pool_id_(core_pool_id),
@@ -294,41 +294,41 @@ struct DynamicScheduleTask : public chi::Task {
  * CompressTask - Performs compression and calls PutBlob to store the data.
  * Has the same inputs as PutBlobTask for seamless integration.
  */
-struct CompressTask : public chi::Task {
+struct CompressTask : public clio::run::Task {
   // Same inputs as PutBlobTask
   IN clio::cte::core::TagId tag_id_;        // Tag ID for blob grouping
-  INOUT chi::priv::string blob_name_;     // Blob name (required)
-  IN chi::u64 offset_;                    // Offset within blob
-  IN chi::u64 size_;                      // Size of blob data
+  INOUT clio::run::priv::string blob_name_;     // Blob name (required)
+  IN clio::run::u64 offset_;                    // Offset within blob
+  IN clio::run::u64 size_;                      // Size of blob data
   IN ctp::ipc::ShmPtr<> blob_data_;           // Blob data (shared memory pointer)
   IN float score_;                        // Score 0-1 for placement decisions
   INOUT Context context_;                 // Context for compression control and statistics
-  IN chi::u32 flags_;                     // Operation flags
-  IN chi::PoolId core_pool_id_;           // Pool ID of core chimod for PutBlob
+  IN clio::run::u32 flags_;                     // Operation flags
+  IN clio::run::PoolId core_pool_id_;           // Pool ID of core chimod for PutBlob
 
   // Output fields
   OUT float tier_score_;                  // Selected tier score (0-1, normalized)
 
   // SHM constructor
   CompressTask()
-      : chi::Task(), tag_id_(clio::cte::core::TagId::GetNull()),
+      : clio::run::Task(), tag_id_(clio::cte::core::TagId::GetNull()),
         blob_name_(CTP_MALLOC), offset_(0), size_(0),
         blob_data_(ctp::ipc::ShmPtr<>::GetNull()), score_(0.5f),
-        context_(), flags_(0), core_pool_id_(chi::PoolId::GetNull()),
+        context_(), flags_(0), core_pool_id_(clio::run::PoolId::GetNull()),
         tier_score_(0.0f) {}
 
   // Emplace constructor
-  explicit CompressTask(const chi::TaskId &task_id,
-                        const chi::PoolId &pool_id,
-                        const chi::PoolQuery &pool_query,
+  explicit CompressTask(const clio::run::TaskId &task_id,
+                        const clio::run::PoolId &pool_id,
+                        const clio::run::PoolQuery &pool_query,
                         const clio::cte::core::TagId &tag_id,
                         const std::string &blob_name,
-                        chi::u64 offset, chi::u64 size,
+                        clio::run::u64 offset, clio::run::u64 size,
                         ctp::ipc::ShmPtr<> blob_data,
                         float score, const Context &context,
-                        chi::u32 flags,
-                        const chi::PoolId &core_pool_id)
-      : chi::Task(task_id, pool_id, pool_query, Method::kCompress),
+                        clio::run::u32 flags,
+                        const clio::run::PoolId &core_pool_id)
+      : clio::run::Task(task_id, pool_id, pool_query, Method::kCompress),
         tag_id_(tag_id), blob_name_(CTP_MALLOC, blob_name),
         offset_(offset), size_(size), blob_data_(blob_data), score_(score),
         context_(context), flags_(flags), core_pool_id_(core_pool_id),
@@ -367,38 +367,38 @@ struct CompressTask : public chi::Task {
  * DecompressTask - Calls GetBlob to retrieve data, then performs decompression.
  * Has the same inputs as GetBlobTask plus decompression output.
  */
-struct DecompressTask : public chi::Task {
+struct DecompressTask : public clio::run::Task {
   // Same inputs as GetBlobTask
   IN clio::cte::core::TagId tag_id_;        // Tag ID for blob lookup
-  IN chi::priv::string blob_name_;        // Blob name (required)
-  IN chi::u64 offset_;                    // Offset within blob
-  IN chi::u64 size_;                      // Size of data to retrieve (decompressed size)
-  IN chi::u32 flags_;                     // Operation flags
+  IN clio::run::priv::string blob_name_;        // Blob name (required)
+  IN clio::run::u64 offset_;                    // Offset within blob
+  IN clio::run::u64 size_;                      // Size of data to retrieve (decompressed size)
+  IN clio::run::u32 flags_;                     // Operation flags
   IN ctp::ipc::ShmPtr<> blob_data_;           // Output buffer for decompressed data
-  IN chi::PoolId core_pool_id_;           // Pool ID of core chimod for GetBlob
+  IN clio::run::PoolId core_pool_id_;           // Pool ID of core chimod for GetBlob
 
   // Output fields
-  OUT chi::u64 output_size_;              // Actual decompressed size
+  OUT clio::run::u64 output_size_;              // Actual decompressed size
   OUT double decompress_time_ms_;         // Decompression time in milliseconds
 
   // SHM constructor
   DecompressTask()
-      : chi::Task(), tag_id_(clio::cte::core::TagId::GetNull()),
+      : clio::run::Task(), tag_id_(clio::cte::core::TagId::GetNull()),
         blob_name_(CTP_MALLOC), offset_(0), size_(0), flags_(0),
         blob_data_(ctp::ipc::ShmPtr<>::GetNull()),
-        core_pool_id_(chi::PoolId::GetNull()),
+        core_pool_id_(clio::run::PoolId::GetNull()),
         output_size_(0), decompress_time_ms_(0.0) {}
 
   // Emplace constructor
-  explicit DecompressTask(const chi::TaskId &task_id,
-                          const chi::PoolId &pool_id,
-                          const chi::PoolQuery &pool_query,
+  explicit DecompressTask(const clio::run::TaskId &task_id,
+                          const clio::run::PoolId &pool_id,
+                          const clio::run::PoolQuery &pool_query,
                           const clio::cte::core::TagId &tag_id,
                           const std::string &blob_name,
-                          chi::u64 offset, chi::u64 size,
-                          chi::u32 flags, ctp::ipc::ShmPtr<> blob_data,
-                          const chi::PoolId &core_pool_id)
-      : chi::Task(task_id, pool_id, pool_query, Method::kDecompress),
+                          clio::run::u64 offset, clio::run::u64 size,
+                          clio::run::u32 flags, ctp::ipc::ShmPtr<> blob_data,
+                          const clio::run::PoolId &core_pool_id)
+      : clio::run::Task(task_id, pool_id, pool_query, Method::kDecompress),
         tag_id_(tag_id), blob_name_(CTP_MALLOC, blob_name),
         offset_(offset), size_(size), flags_(flags), blob_data_(blob_data),
         core_pool_id_(core_pool_id),
@@ -438,12 +438,12 @@ struct DecompressTask : public chi::Task {
  * Returned as the OUT payload of a PollNodeLoadTask.
  */
 struct NodeLoadSample {
-  chi::u32 node_id_;          ///< Node ID being sampled
+  clio::run::u32 node_id_;          ///< Node ID being sampled
   float cpu_usage_pct_;       ///< AggregateOut CPU utilization (0-100)
   float worker_load_us_;      ///< Sum of WorkerStats::load_ across all workers (us)
-  chi::u32 num_queued_tasks_; ///< Sum of queued tasks across all workers
-  chi::u32 num_blocked_tasks_;///< Sum of blocked tasks across all workers
-  chi::u32 num_workers_;      ///< Total worker count on this node
+  clio::run::u32 num_queued_tasks_; ///< Sum of queued tasks across all workers
+  clio::run::u32 num_blocked_tasks_;///< Sum of blocked tasks across all workers
+  clio::run::u32 num_workers_;      ///< Total worker count on this node
 
   NodeLoadSample()
       : node_id_(0), cpu_usage_pct_(0.0f), worker_load_us_(0.0f),
@@ -463,15 +463,15 @@ struct NodeLoadSample {
  * and the runtime samples the local node's stats and writes them into the OUT
  * NodeLoadSample.
  */
-struct PollNodeLoadTask : public chi::Task {
+struct PollNodeLoadTask : public clio::run::Task {
   OUT NodeLoadSample sample_;  ///< Sampled node load (filled by runtime)
 
-  PollNodeLoadTask() : chi::Task(), sample_() {}
+  PollNodeLoadTask() : clio::run::Task(), sample_() {}
 
-  explicit PollNodeLoadTask(const chi::TaskId &task_id,
-                            const chi::PoolId &pool_id,
-                            const chi::PoolQuery &pool_query)
-      : chi::Task(task_id, pool_id, pool_query, Method::kPollNodeLoad),
+  explicit PollNodeLoadTask(const clio::run::TaskId &task_id,
+                            const clio::run::PoolId &pool_id,
+                            const clio::run::PoolQuery &pool_query)
+      : clio::run::Task(task_id, pool_id, pool_query, Method::kPollNodeLoad),
         sample_() {}
 
   void Copy(const ctp::ipc::FullPtr<PollNodeLoadTask> &other) {
@@ -495,13 +495,13 @@ struct PollNodeLoadTask : public chi::Task {
  * compressor's tracked consumer list and dispatches PollNodeLoad to each
  * consumer node. Has no IN/OUT fields — it is a trigger.
  */
-struct PollConsumersTask : public chi::Task {
-  PollConsumersTask() : chi::Task() {}
+struct PollConsumersTask : public clio::run::Task {
+  PollConsumersTask() : clio::run::Task() {}
 
-  explicit PollConsumersTask(const chi::TaskId &task_id,
-                             const chi::PoolId &pool_id,
-                             const chi::PoolQuery &pool_query)
-      : chi::Task(task_id, pool_id, pool_query, Method::kPollConsumers) {}
+  explicit PollConsumersTask(const clio::run::TaskId &task_id,
+                             const clio::run::PoolId &pool_id,
+                             const clio::run::PoolQuery &pool_query)
+      : clio::run::Task(task_id, pool_id, pool_query, Method::kPollConsumers) {}
 
   void Copy(const ctp::ipc::FullPtr<PollConsumersTask> &other) {
     (void)other;

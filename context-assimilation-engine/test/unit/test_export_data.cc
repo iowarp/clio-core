@@ -95,7 +95,7 @@ class ExportDataFixture {
     if (g_initialized) return;
 
     // Step 1: CLIO Runtime client init
-    bool ok = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
+    bool ok = clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true);
     if (!ok) throw std::runtime_error("CHIMAERA_INIT failed");
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
 
@@ -106,7 +106,7 @@ class ExportDataFixture {
     cte->Init(clio::cte::core::kCtePoolId);
 
     clio::cte::core::CreateParams cte_params;
-    auto cte_fut = cte->AsyncCreate(chi::PoolQuery::Dynamic(),
+    auto cte_fut = cte->AsyncCreate(clio::run::PoolQuery::Dynamic(),
                                     clio::cte::core::kCtePoolName,
                                     clio::cte::core::kCtePoolId, cte_params);
     cte_fut.Wait();
@@ -115,7 +115,7 @@ class ExportDataFixture {
     CLIO_CAE_CLIENT_INIT();
     clio::cae::core::Client cae_client;
     clio::cae::core::CreateParams cae_params;
-    auto cae_fut = cae_client.AsyncCreate(chi::PoolQuery::Local(),
+    auto cae_fut = cae_client.AsyncCreate(clio::run::PoolQuery::Local(),
                                           "test_cae_pool",
                                           clio::cae::core::kCaePoolId, cae_params);
     cae_fut.Wait();
@@ -141,7 +141,7 @@ class ExportDataFixture {
     ctp::ipc::ShmPtr<> shm_ptr = buf.shm_.template Cast<void>();
 
     auto put_fut = cte->AsyncPutBlob(tag_id, blob_name, 0,
-                                     static_cast<chi::u64>(data.size()),
+                                     static_cast<clio::run::u64>(data.size()),
                                      shm_ptr);
     put_fut.Wait();
     CLIO_IPC->FreeBuffer(buf);
@@ -174,9 +174,9 @@ TEST_CASE("ExportData - Task emplace constructor", "[cae][export][task]") {
   ExportDataFixture f;
 
   auto *ipc = CLIO_IPC;
-  chi::TaskId tid = chi::CreateTaskId();
+  clio::run::TaskId tid = clio::run::CreateTaskId();
   auto task = ipc->NewTask<ExportDataTask>(tid, clio::cae::core::kCaePoolId,
-                                           chi::PoolQuery::Local(),
+                                           clio::run::PoolQuery::Local(),
                                            "my_tag", "/tmp/out.bin", "binary");
 
   REQUIRE(task->tag_name_.str() == "my_tag");
@@ -194,13 +194,13 @@ TEST_CASE("ExportData - Task Copy", "[cae][export][task]") {
   ExportDataFixture f;
 
   auto *ipc = CLIO_IPC;
-  auto src = ipc->NewTask<ExportDataTask>(chi::CreateTaskId(),
+  auto src = ipc->NewTask<ExportDataTask>(clio::run::CreateTaskId(),
                                           clio::cae::core::kCaePoolId,
-                                          chi::PoolQuery::Local(),
+                                          clio::run::PoolQuery::Local(),
                                           "tag_copy", "/tmp/copy.bin", "binary");
   src->bytes_exported_ = 42;
   src->result_code_ = 7;
-  src->error_message_ = chi::priv::string("copy_err", CTP_MALLOC);
+  src->error_message_ = clio::run::priv::string("copy_err", CTP_MALLOC);
 
   auto dst = ipc->NewTask<ExportDataTask>();
   dst->Copy(src);
@@ -221,21 +221,21 @@ TEST_CASE("ExportData - Task AggregateOut", "[cae][export][task]") {
   ExportDataFixture f;
 
   auto *ipc = CLIO_IPC;
-  auto orig = ipc->NewTask<ExportDataTask>(chi::CreateTaskId(),
+  auto orig = ipc->NewTask<ExportDataTask>(clio::run::CreateTaskId(),
                                            clio::cae::core::kCaePoolId,
-                                           chi::PoolQuery::Local(),
+                                           clio::run::PoolQuery::Local(),
                                            "tag_agg", "/tmp/agg.bin", "binary");
   orig->bytes_exported_ = 100;
   orig->result_code_ = 1;
 
-  auto replica = ipc->NewTask<ExportDataTask>(chi::CreateTaskId(),
+  auto replica = ipc->NewTask<ExportDataTask>(clio::run::CreateTaskId(),
                                               clio::cae::core::kCaePoolId,
-                                              chi::PoolQuery::Local(),
+                                              clio::run::PoolQuery::Local(),
                                               "tag_agg", "/tmp/agg.bin", "binary");
   replica->bytes_exported_ = 200;
   replica->result_code_ = 5;
 
-  orig->AggregateOut(replica.template Cast<chi::Task>());
+  orig->AggregateOut(replica.template Cast<clio::run::Task>());
 
   // AggregateOut calls Copy, so orig should now have replica's values
   REQUIRE(orig->bytes_exported_ == 200);
@@ -250,9 +250,9 @@ TEST_CASE("ExportData - Task SerializeIn roundtrip", "[cae][export][task]") {
   ExportDataFixture f;
 
   auto *ipc = CLIO_IPC;
-  auto task = ipc->NewTask<ExportDataTask>(chi::CreateTaskId(),
+  auto task = ipc->NewTask<ExportDataTask>(clio::run::CreateTaskId(),
                                            clio::cae::core::kCaePoolId,
-                                           chi::PoolQuery::Local(),
+                                           clio::run::PoolQuery::Local(),
                                            "ser_tag", "/tmp/ser.bin", "binary");
 
   // Write IN fields (tag_name_, output_path_, format_)
@@ -286,7 +286,7 @@ TEST_CASE("ExportData - Task SerializeOut roundtrip", "[cae][export][task]") {
   auto task = ipc->NewTask<ExportDataTask>();
   task->result_code_ = 3;
   task->bytes_exported_ = 777;
-  task->error_message_ = chi::priv::string("err_msg", CTP_MALLOC);
+  task->error_message_ = clio::run::priv::string("err_msg", CTP_MALLOC);
 
   // Write OUT fields (result_code_, error_message_, bytes_exported_)
   std::vector<char> buf;
@@ -494,9 +494,9 @@ TEST_CASE("ParseOmni - Task emplace constructor", "[cae][export][task]") {
   std::vector<clio::cae::core::AssimilationCtx> contexts;
   contexts.emplace_back("file::/tmp/a.bin", "iowarp::tag_a", "binary");
 
-  auto task = ipc->NewTask<ParseOmniTask>(chi::CreateTaskId(),
+  auto task = ipc->NewTask<ParseOmniTask>(clio::run::CreateTaskId(),
                                           clio::cae::core::kCaePoolId,
-                                          chi::PoolQuery::Local(),
+                                          clio::run::PoolQuery::Local(),
                                           contexts);
   REQUIRE(!task->serialized_ctx_.str().empty());
   REQUIRE(task->num_tasks_scheduled_ == 0);
@@ -514,13 +514,13 @@ TEST_CASE("ParseOmni - Task Copy", "[cae][export][task]") {
   std::vector<clio::cae::core::AssimilationCtx> contexts;
   contexts.emplace_back("file::/tmp/b.bin", "iowarp::tag_b", "binary");
 
-  auto src = ipc->NewTask<ParseOmniTask>(chi::CreateTaskId(),
+  auto src = ipc->NewTask<ParseOmniTask>(clio::run::CreateTaskId(),
                                          clio::cae::core::kCaePoolId,
-                                         chi::PoolQuery::Local(),
+                                         clio::run::PoolQuery::Local(),
                                          contexts);
   src->num_tasks_scheduled_ = 3;
   src->result_code_ = 2;
-  src->error_message_ = chi::priv::string("omni_err", CTP_MALLOC);
+  src->error_message_ = clio::run::priv::string("omni_err", CTP_MALLOC);
 
   auto dst = ipc->NewTask<ParseOmniTask>();
   dst->Copy(src);
@@ -542,19 +542,19 @@ TEST_CASE("ParseOmni - Task AggregateOut", "[cae][export][task]") {
   std::vector<clio::cae::core::AssimilationCtx> ctxs;
   ctxs.emplace_back("file::/tmp/c.bin", "iowarp::tag_c", "binary");
 
-  auto orig = ipc->NewTask<ParseOmniTask>(chi::CreateTaskId(),
+  auto orig = ipc->NewTask<ParseOmniTask>(clio::run::CreateTaskId(),
                                           clio::cae::core::kCaePoolId,
-                                          chi::PoolQuery::Local(), ctxs);
+                                          clio::run::PoolQuery::Local(), ctxs);
   orig->num_tasks_scheduled_ = 1;
   orig->result_code_ = 0;
 
-  auto rep = ipc->NewTask<ParseOmniTask>(chi::CreateTaskId(),
+  auto rep = ipc->NewTask<ParseOmniTask>(clio::run::CreateTaskId(),
                                          clio::cae::core::kCaePoolId,
-                                         chi::PoolQuery::Local(), ctxs);
+                                         clio::run::PoolQuery::Local(), ctxs);
   rep->num_tasks_scheduled_ = 5;
   rep->result_code_ = 9;
 
-  orig->AggregateOut(rep.template Cast<chi::Task>());
+  orig->AggregateOut(rep.template Cast<clio::run::Task>());
 
   REQUIRE(orig->num_tasks_scheduled_ == 5);
   REQUIRE(orig->result_code_ == 9);
@@ -571,9 +571,9 @@ TEST_CASE("ParseOmni - Task SerializeIn roundtrip", "[cae][export][task]") {
   std::vector<clio::cae::core::AssimilationCtx> ctxs;
   ctxs.emplace_back("file::/tmp/d.bin", "iowarp::ser_tag", "binary");
 
-  auto task = ipc->NewTask<ParseOmniTask>(chi::CreateTaskId(),
+  auto task = ipc->NewTask<ParseOmniTask>(clio::run::CreateTaskId(),
                                           clio::cae::core::kCaePoolId,
-                                          chi::PoolQuery::Local(), ctxs);
+                                          clio::run::PoolQuery::Local(), ctxs);
   const std::string ser_data = task->serialized_ctx_.str();
 
   std::vector<char> buf;
@@ -603,7 +603,7 @@ TEST_CASE("ParseOmni - Task SerializeOut roundtrip", "[cae][export][task]") {
   auto task = ipc->NewTask<ParseOmniTask>();
   task->num_tasks_scheduled_ = 7;
   task->result_code_ = 4;
-  task->error_message_ = chi::priv::string("out_err", CTP_MALLOC);
+  task->error_message_ = clio::run::priv::string("out_err", CTP_MALLOC);
 
   std::vector<char> buf;
   {
@@ -652,9 +652,9 @@ TEST_CASE("ProcessHdf5Dataset - Task emplace constructor",
   ExportDataFixture f;
 
   auto *ipc = CLIO_IPC;
-  auto task = ipc->NewTask<ProcessHdf5DatasetTask>(chi::CreateTaskId(),
+  auto task = ipc->NewTask<ProcessHdf5DatasetTask>(clio::run::CreateTaskId(),
                                                     clio::cae::core::kCaePoolId,
-                                                    chi::PoolQuery::Local(),
+                                                    clio::run::PoolQuery::Local(),
                                                     "/tmp/test.h5",
                                                     "/dataset/path",
                                                     "my_prefix");
@@ -672,14 +672,14 @@ TEST_CASE("ProcessHdf5Dataset - Task Copy", "[cae][export][task]") {
   ExportDataFixture f;
 
   auto *ipc = CLIO_IPC;
-  auto src = ipc->NewTask<ProcessHdf5DatasetTask>(chi::CreateTaskId(),
+  auto src = ipc->NewTask<ProcessHdf5DatasetTask>(clio::run::CreateTaskId(),
                                                    clio::cae::core::kCaePoolId,
-                                                   chi::PoolQuery::Local(),
+                                                   clio::run::PoolQuery::Local(),
                                                    "/h5/file.h5",
                                                    "/ds",
                                                    "prefix_x");
   src->result_code_ = 5;
-  src->error_message_ = chi::priv::string("hdf5_err", CTP_MALLOC);
+  src->error_message_ = clio::run::priv::string("hdf5_err", CTP_MALLOC);
 
   auto dst = ipc->NewTask<ProcessHdf5DatasetTask>();
   dst->Copy(src);
@@ -700,22 +700,22 @@ TEST_CASE("ProcessHdf5Dataset - Task AggregateOut keeps first error",
   ExportDataFixture f;
 
   auto *ipc = CLIO_IPC;
-  auto orig = ipc->NewTask<ProcessHdf5DatasetTask>(chi::CreateTaskId(),
+  auto orig = ipc->NewTask<ProcessHdf5DatasetTask>(clio::run::CreateTaskId(),
                                                     clio::cae::core::kCaePoolId,
-                                                    chi::PoolQuery::Local(),
+                                                    clio::run::PoolQuery::Local(),
                                                     "/f1.h5", "/d1", "p1");
   orig->result_code_ = -1;
-  orig->error_message_ = chi::priv::string("first_err", CTP_MALLOC);
+  orig->error_message_ = clio::run::priv::string("first_err", CTP_MALLOC);
 
-  auto rep = ipc->NewTask<ProcessHdf5DatasetTask>(chi::CreateTaskId(),
+  auto rep = ipc->NewTask<ProcessHdf5DatasetTask>(clio::run::CreateTaskId(),
                                                    clio::cae::core::kCaePoolId,
-                                                   chi::PoolQuery::Local(),
+                                                   clio::run::PoolQuery::Local(),
                                                    "/f2.h5", "/d2", "p2");
   rep->result_code_ = -2;
-  rep->error_message_ = chi::priv::string("second_err", CTP_MALLOC);
+  rep->error_message_ = clio::run::priv::string("second_err", CTP_MALLOC);
 
   // orig already has error → keeps its own error, does not overwrite
-  orig->AggregateOut(rep.template Cast<chi::Task>());
+  orig->AggregateOut(rep.template Cast<clio::run::Task>());
 
   REQUIRE(orig->result_code_ == -1);
   REQUIRE(orig->error_message_.str() == "first_err");
@@ -730,21 +730,21 @@ TEST_CASE("ProcessHdf5Dataset - Task AggregateOut adopts replica error",
   ExportDataFixture f;
 
   auto *ipc = CLIO_IPC;
-  auto orig = ipc->NewTask<ProcessHdf5DatasetTask>(chi::CreateTaskId(),
+  auto orig = ipc->NewTask<ProcessHdf5DatasetTask>(clio::run::CreateTaskId(),
                                                     clio::cae::core::kCaePoolId,
-                                                    chi::PoolQuery::Local(),
+                                                    clio::run::PoolQuery::Local(),
                                                     "/f3.h5", "/d3", "p3");
   orig->result_code_ = 0;  // success so far
 
-  auto rep = ipc->NewTask<ProcessHdf5DatasetTask>(chi::CreateTaskId(),
+  auto rep = ipc->NewTask<ProcessHdf5DatasetTask>(clio::run::CreateTaskId(),
                                                    clio::cae::core::kCaePoolId,
-                                                   chi::PoolQuery::Local(),
+                                                   clio::run::PoolQuery::Local(),
                                                    "/f4.h5", "/d4", "p4");
   rep->result_code_ = -3;
-  rep->error_message_ = chi::priv::string("rep_err", CTP_MALLOC);
+  rep->error_message_ = clio::run::priv::string("rep_err", CTP_MALLOC);
 
   // orig has no error → adopts replica's error
-  orig->AggregateOut(rep.template Cast<chi::Task>());
+  orig->AggregateOut(rep.template Cast<clio::run::Task>());
 
   REQUIRE(orig->result_code_ == -3);
   REQUIRE(orig->error_message_.str() == "rep_err");
@@ -759,9 +759,9 @@ TEST_CASE("ProcessHdf5Dataset - Task SerializeIn roundtrip",
   ExportDataFixture f;
 
   auto *ipc = CLIO_IPC;
-  auto task = ipc->NewTask<ProcessHdf5DatasetTask>(chi::CreateTaskId(),
+  auto task = ipc->NewTask<ProcessHdf5DatasetTask>(clio::run::CreateTaskId(),
                                                     clio::cae::core::kCaePoolId,
-                                                    chi::PoolQuery::Local(),
+                                                    clio::run::PoolQuery::Local(),
                                                     "/ser/file.h5",
                                                     "/ser/dataset",
                                                     "ser_prefix");
@@ -794,7 +794,7 @@ TEST_CASE("ProcessHdf5Dataset - Task SerializeOut roundtrip",
   auto *ipc = CLIO_IPC;
   auto task = ipc->NewTask<ProcessHdf5DatasetTask>();
   task->result_code_ = 8;
-  task->error_message_ = chi::priv::string("ds_err", CTP_MALLOC);
+  task->error_message_ = clio::run::priv::string("ds_err", CTP_MALLOC);
 
   std::vector<char> buf;
   {

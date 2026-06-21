@@ -181,9 +181,9 @@ std::string GetCompressionName(int dynamic_compress, int compress_lib) {
 /**
  * Parse size string with k/K, m/M, g/G suffixes
  */
-chi::u64 ParseSize(const std::string &size_str) {
+clio::run::u64 ParseSize(const std::string &size_str) {
   double size = 0.0;
-  chi::u64 multiplier = 1;
+  clio::run::u64 multiplier = 1;
 
   std::string num_str;
   char suffix = 0;
@@ -212,13 +212,13 @@ chi::u64 ParseSize(const std::string &size_str) {
     default: multiplier = 1; break;
   }
 
-  return static_cast<chi::u64>(size * multiplier);
+  return static_cast<clio::run::u64>(size * multiplier);
 }
 
 /**
  * Convert bytes to human-readable string
  */
-std::string FormatSize(chi::u64 bytes) {
+std::string FormatSize(clio::run::u64 bytes) {
   if (bytes >= 1024ULL * 1024 * 1024) {
     return std::to_string(bytes / (1024ULL * 1024 * 1024)) + " GB";
   } else if (bytes >= 1024 * 1024) {
@@ -233,7 +233,7 @@ std::string FormatSize(chi::u64 bytes) {
 /**
  * Calculate bandwidth in MB/s
  */
-double CalcBandwidth(chi::u64 total_bytes, double microseconds) {
+double CalcBandwidth(clio::run::u64 total_bytes, double microseconds) {
   if (microseconds <= 0.0) return 0.0;
   double seconds = microseconds / 1000000.0;
   double megabytes = static_cast<double>(total_bytes) / (1024.0 * 1024.0);
@@ -483,8 +483,8 @@ std::string GetCompressibilityName(DataGenerator::Compressibility comp) {
 class CTECompressBenchmark {
  public:
   CTECompressBenchmark(int dynamic_compress, int compress_lib,
-                       size_t num_threads, chi::u64 data_per_thread,
-                       chi::u64 transfer_size, DataGenerator::DataType data_type,
+                       size_t num_threads, clio::run::u64 data_per_thread,
+                       clio::run::u64 transfer_size, DataGenerator::DataType data_type,
                        DataGenerator::Distribution distribution,
                        DataGenerator::Compressibility compressibility,
                        const std::string &test_case, double compute_phase_sec,
@@ -588,11 +588,11 @@ class CTECompressBenchmark {
     clio::cte::core::Context ctx = CreateCompressionContext();
 
     // Track pending tasks for checkpointing
-    std::vector<chi::Future<clio::cte::core::PutBlobTask>> pending_tasks;
+    std::vector<clio::run::Future<clio::cte::core::PutBlobTask>> pending_tasks;
     int phases_since_checkpoint = 0;
 
-    chi::u64 total_original_size = 0;
-    chi::u64 total_compressed_size = 0;
+    clio::run::u64 total_original_size = 0;
+    clio::run::u64 total_compressed_size = 0;
 
     auto start_time = high_resolution_clock::now();
 
@@ -785,7 +785,7 @@ class CTECompressBenchmark {
     clio::cte::core::Context ctx = CreateCompressionContext();
 
     // Track pending tasks
-    std::vector<chi::Future<clio::cte::core::PutBlobTask>> pending_tasks;
+    std::vector<clio::run::Future<clio::cte::core::PutBlobTask>> pending_tasks;
     int phases_since_checkpoint = 0;
 
     auto start_time = high_resolution_clock::now();
@@ -882,8 +882,8 @@ class CTECompressBenchmark {
     }
     avg_ratio /= num_threads_;
 
-    chi::u64 total_bytes = data_per_thread_;
-    chi::u64 aggregate_bytes = total_bytes * num_threads_;
+    clio::run::u64 total_bytes = data_per_thread_;
+    clio::run::u64 aggregate_bytes = total_bytes * num_threads_;
 
     double min_bw = CalcBandwidth(total_bytes, min_time);
     double max_bw = CalcBandwidth(total_bytes, max_time);
@@ -908,8 +908,8 @@ class CTECompressBenchmark {
   int dynamic_compress_;
   int compress_lib_;
   size_t num_threads_;
-  chi::u64 data_per_thread_;
-  chi::u64 transfer_size_;
+  clio::run::u64 data_per_thread_;
+  clio::run::u64 transfer_size_;
   size_t transfers_per_thread_;
   DataGenerator::DataType data_type_;
   DataGenerator::Distribution distribution_;
@@ -956,8 +956,8 @@ int main(int argc, char **argv) {
 
   // Parse other arguments
   size_t num_threads = std::stoull(argv[2]);
-  chi::u64 data_per_thread = ParseSize(argv[3]);
-  chi::u64 transfer_size = ParseSize(argv[4]);
+  clio::run::u64 data_per_thread = ParseSize(argv[3]);
+  clio::run::u64 transfer_size = ParseSize(argv[4]);
   DataGenerator::DataType data_type = ParseDataType(argv[5]);
   DataGenerator::Distribution distribution = ParseDistribution(argv[6]);
   DataGenerator::Compressibility compressibility = ParseCompressibility(argv[7]);
@@ -979,7 +979,7 @@ int main(int argc, char **argv) {
   // Initialize CLIO Runtime runtime
   HLOG(kInfo, "Initializing Chimaera runtime...");
 
-  if (!chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true)) {
+  if (!clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true)) {
     HLOG(kError, "Failed to initialize Chimaera runtime");
     return 1;
   }

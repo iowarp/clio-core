@@ -99,13 +99,13 @@ TEST_CASE("TransactionLog - ExtendBlob roundtrip with blocks", "[cte][txnlog]") 
   TxnExtendBlobBlock blk0;
   blk0.bdev_major_ = 512;
   blk0.bdev_minor_ = 1;
-  blk0.target_query_ = chi::PoolQuery::Local();
+  blk0.target_query_ = clio::run::PoolQuery::Local();
   blk0.target_offset_ = 4096;
   blk0.size_ = 1024;
   TxnExtendBlobBlock blk1;
   blk1.bdev_major_ = 513;
   blk1.bdev_minor_ = 2;
-  blk1.target_query_ = chi::PoolQuery::Local();
+  blk1.target_query_ = clio::run::PoolQuery::Local();
   blk1.target_offset_ = 8192;
   blk1.size_ = 2048;
   txn.new_blocks_.push_back(blk0);
@@ -131,7 +131,7 @@ TEST_CASE("TransactionLog - ExtendBlob roundtrip with blocks", "[cte][txnlog]") 
   REQUIRE(out.new_blocks_[1].size_ == 2048);
   // PoolQuery raw bytes round-trip
   REQUIRE(std::memcmp(&out.new_blocks_[0].target_query_,
-                      &blk0.target_query_, sizeof(chi::PoolQuery)) == 0);
+                      &blk0.target_query_, sizeof(clio::run::PoolQuery)) == 0);
 
   log.Close();
   TxnRemove(path);

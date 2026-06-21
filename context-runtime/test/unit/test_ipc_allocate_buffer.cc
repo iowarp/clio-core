@@ -47,8 +47,8 @@
 namespace {
 // Test setup helper - same pattern as other tests
 bool initialize_chimaera() {
-  bool success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
-  if (success) SimpleTest::g_test_finalize = chi::CHIMAERA_FINALIZE;
+  bool success = clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true);
+  if (success) SimpleTest::g_test_finalize = clio::run::CHIMAERA_FINALIZE;
   return success;
 }
 }  // namespace

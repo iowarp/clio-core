@@ -32,20 +32,20 @@ const char *kClioFile = "clio::/tmp/clio_cte_vfd_smoke.h5";
   } while (0)
 
 bool InitRuntime() {
-  if (!chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true)) {
+  if (!clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true)) {
     return false;
   }
   if (!clio::cte::core::CLIO_CTE_CLIENT_INIT()) {
     return false;
   }
   auto *cte = CLIO_CTE_CLIENT;
-  chi::PoolId bdev_pool_id(953, 0);
+  clio::run::PoolId bdev_pool_id(953, 0);
   clio::run::bdev::Client bdev(bdev_pool_id);
-  auto ct = bdev.AsyncCreate(chi::PoolQuery::Dynamic(), kBackend, bdev_pool_id,
+  auto ct = bdev.AsyncCreate(clio::run::PoolQuery::Dynamic(), kBackend, bdev_pool_id,
                              clio::run::bdev::BdevType::kFile);
   ct.Wait();
   auto rt = cte->AsyncRegisterTarget(kBackend, clio::run::bdev::BdevType::kFile,
-                                     64ULL * 1024 * 1024, chi::PoolQuery::Local(),
+                                     64ULL * 1024 * 1024, clio::run::PoolQuery::Local(),
                                      bdev_pool_id);
   rt.Wait();
   return rt->GetReturnCode() == 0;

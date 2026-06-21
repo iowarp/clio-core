@@ -19,7 +19,7 @@
 
 namespace clio::run::bdev {
 
-enum class BlockSizeCategory : chi::u32 {
+enum class BlockSizeCategory : clio::run::u32 {
   k256B = 0,
   k1KB = 1,
   k4KB = 2,
@@ -61,7 +61,7 @@ class GlobalBlockMap {
 
  private:
   std::vector<WorkerBlockMap> worker_maps_;
-  std::vector<chi::CoMutex> worker_locks_;
+  std::vector<clio::run::CoMutex> worker_locks_;
 };
 
 /**
@@ -71,14 +71,14 @@ class Heap {
  public:
   Heap();
 
-  void Init(chi::u64 total_size, chi::u32 alignment = 4096);
+  void Init(clio::run::u64 total_size, clio::run::u32 alignment = 4096);
   bool Allocate(size_t block_size, int block_type, Block& block);
-  chi::u64 GetRemainingSize() const;
+  clio::run::u64 GetRemainingSize() const;
 
  private:
-  std::atomic<chi::u64> heap_;
-  chi::u64 total_size_;
-  chi::u32 alignment_;
+  std::atomic<clio::run::u64> heap_;
+  clio::run::u64 total_size_;
+  clio::run::u32 alignment_;
 };
 
 /**
@@ -88,7 +88,7 @@ class StandardBlockAllocator {
  public:
   StandardBlockAllocator() : alignment_(4096), capacity_(0) {}
 
-  void Init(size_t num_workers, chi::u64 capacity, chi::u32 alignment) {
+  void Init(size_t num_workers, clio::run::u64 capacity, clio::run::u32 alignment) {
     capacity_ = capacity;
     alignment_ = alignment;
     global_block_map_.Init(num_workers);
@@ -98,17 +98,17 @@ class StandardBlockAllocator {
   bool AllocateBlocks(size_t size, int worker_id, std::vector<Block>& blocks);
   void FreeBlocks(int worker_id, const std::vector<Block>& blocks);
 
-  chi::u64 GetRemainingSize() const;
-  chi::u64 GetCapacity() const { return capacity_; }
+  clio::run::u64 GetRemainingSize() const;
+  clio::run::u64 GetCapacity() const { return capacity_; }
 
  private:
   GlobalBlockMap global_block_map_;
   Heap heap_;
-  chi::u32 alignment_;
-  chi::u64 capacity_;
-  std::atomic<chi::u64> allocated_bytes_{0};
+  clio::run::u32 alignment_;
+  clio::run::u64 capacity_;
+  std::atomic<clio::run::u64> allocated_bytes_{0};
 
-  chi::u64 AlignSize(chi::u64 size) {
+  clio::run::u64 AlignSize(clio::run::u64 size) {
     if (alignment_ == 0) alignment_ = 4096;
     return ((size + alignment_ - 1) / alignment_) * alignment_;
   }

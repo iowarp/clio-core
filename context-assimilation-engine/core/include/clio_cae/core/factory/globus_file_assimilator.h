@@ -82,7 +82,7 @@ class GlobusFileAssimilator : public BaseAssimilator {
    * -15: Exception during download (Globus-to-local)
    * -20: Globus support not compiled in
    */
-  chi::TaskResume Schedule(const AssimilationCtx& ctx, int& error_code) override;
+  clio::run::TaskResume Schedule(const AssimilationCtx& ctx, int& error_code) override;
 
  private:
   /**

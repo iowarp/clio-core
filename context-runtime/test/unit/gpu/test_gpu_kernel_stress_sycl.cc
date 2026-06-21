@@ -37,11 +37,11 @@ TEST_CASE("GPU producer-only stress: kernel submits N tasks (SYCL)",
   using namespace chi_test_gpu_stress;
   EnsureInit();
   auto *ipc = CLIO_CPU_IPC;
-  const chi::u32 gpu_id = 0;
+  const clio::run::u32 gpu_id = 0;
 
   char *base = nullptr;
   ctp::ipc::AllocatorId alloc_id = ipc->AllocateAndRegisterGpuBackend(
-      gpu_id, chi::gpu::IpcManager::MemKind::kPinnedHost, kBackendBytes,
+      gpu_id, clio::run::gpu::IpcManager::MemKind::kPinnedHost, kBackendBytes,
       &base);
   REQUIRE(!alloc_id.IsNull());
   REQUIRE(base != nullptr);
@@ -49,7 +49,7 @@ TEST_CASE("GPU producer-only stress: kernel submits N tasks (SYCL)",
   auto handles = PlaceTaskSlots(base, alloc_id, gpu_id);
   REQUIRE(handles.size() == kNumTasks);
 
-  chi::IpcManagerGpuInfo gpu_info = ipc->GetGpuIpcManager()->GetGpuInfo(gpu_id);
+  clio::run::IpcManagerGpuInfo gpu_info = ipc->GetGpuIpcManager()->GetGpuInfo(gpu_id);
   REQUIRE(gpu_info.gpu2cpu_queue != nullptr);
 
   // Stage gpu_info, kernel-scope IpcManager, and the FullPtr array in
@@ -63,22 +63,22 @@ TEST_CASE("GPU producer-only stress: kernel submits N tasks (SYCL)",
   // avoids that and inherits the same context, so the pinned-host
   // gpu2cpu_queue and any malloc_host backend are still reachable.
   sycl::queue q{sycl::gpu_selector_v};
-  auto *info_storage = sycl::malloc_shared<chi::IpcManagerGpuInfo>(1, q);
+  auto *info_storage = sycl::malloc_shared<clio::run::IpcManagerGpuInfo>(1, q);
   REQUIRE(info_storage != nullptr);
   *info_storage = gpu_info;
 
-  auto *ipc_storage = sycl::malloc_shared<chi::gpu::IpcManager>(1, q);
+  auto *ipc_storage = sycl::malloc_shared<clio::run::gpu::IpcManager>(1, q);
   REQUIRE(ipc_storage != nullptr);
-  new (ipc_storage) chi::gpu::IpcManager();
+  new (ipc_storage) clio::run::gpu::IpcManager();
 
   auto *handle_storage =
       sycl::malloc_shared<ctp::ipc::FullPtr<TaskT>>(kNumTasks, q);
   REQUIRE(handle_storage != nullptr);
-  for (chi::u32 i = 0; i < kNumTasks; ++i) handle_storage[i] = handles[i];
+  for (clio::run::u32 i = 0; i < kNumTasks; ++i) handle_storage[i] = handles[i];
 
   // Slot index lives in shared USM so the kernel functor can read it
   // (lambda captures by value, but we want a fresh slot per submission).
-  auto *slot_storage = sycl::malloc_shared<chi::u32>(1, q);
+  auto *slot_storage = sycl::malloc_shared<clio::run::u32>(1, q);
   REQUIRE(slot_storage != nullptr);
 
   std::fprintf(stderr, "[STRESS] queuing %u single_task submissions\n",
@@ -87,7 +87,7 @@ TEST_CASE("GPU producer-only stress: kernel submits N tasks (SYCL)",
   // DPC++ has been observed to elide kernel emission when the lambda body's
   // only host-pass content is (void)cast no-ops, so write through this
   // pointer unconditionally.
-  auto *marker_storage = sycl::malloc_shared<chi::u32>(1, q);
+  auto *marker_storage = sycl::malloc_shared<clio::run::u32>(1, q);
   REQUIRE(marker_storage != nullptr);
   // First do a minimal sanity kernel to confirm the SYCL+CUDA backend
   // can run a basic kernel under our setup.
@@ -101,7 +101,7 @@ TEST_CASE("GPU producer-only stress: kernel submits N tasks (SYCL)",
                *marker_storage, 0xBEEF);
   REQUIRE(*marker_storage == 0xBEEF);
 
-  for (chi::u32 i = 0; i < kNumTasks; ++i) {
+  for (clio::run::u32 i = 0; i < kNumTasks; ++i) {
     *slot_storage = i;
     *marker_storage = 0;
     try {
@@ -117,7 +117,7 @@ TEST_CASE("GPU producer-only stress: kernel submits N tasks (SYCL)",
 #if CTP_IS_DEVICE_PASS
           CHIMAERA_GPU_INIT(*info_storage, ipc_storage);
           *marker_storage = 2;
-          chi::u32 slot = *slot_storage;
+          clio::run::u32 slot = *slot_storage;
           auto fp = handle_storage[slot];
           if (!fp.IsNull()) {
             *marker_storage = 3;
@@ -151,7 +151,7 @@ TEST_CASE("GPU producer-only stress: kernel submits N tasks (SYCL)",
     }
   }
 
-  chi::u32 first_bad = VerifyResults(handles, gpu_id);
+  clio::run::u32 first_bad = VerifyResults(handles, gpu_id);
   REQUIRE(first_bad == kNumTasks);
   std::fprintf(stderr, "[STRESS] all %u tasks completed correctly\n",
                kNumTasks);

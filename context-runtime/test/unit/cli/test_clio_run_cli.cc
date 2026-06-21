@@ -314,7 +314,7 @@ TEST_CASE("RefreshRepo - generates methods header and lib_exec source",
   REQUIRE(Contains(s, "Cast<CustomOpTask>"));
 
   SECTION("all Container virtual APIs are generated");
-  REQUIRE(Contains(s, "chi::TaskResume Runtime::Run("));
+  REQUIRE(Contains(s, "clio::run::TaskResume Runtime::Run("));
   REQUIRE(Contains(s, "void Runtime::SaveTask("));
   REQUIRE(Contains(s, "void Runtime::LoadTask("));
   REQUIRE(Contains(s, "Runtime::AllocLoadTask("));
@@ -353,14 +353,14 @@ TEST_CASE("RefreshRepo - default namespace and module with no methods",
   REQUIRE(fs::exists(source));
 
   const std::string h = ReadAll(header);
-  REQUIRE(Contains(h, "namespace chimaera::beta {"));
+  REQUIRE(Contains(h, "namespace clio::run::beta {"));
   REQUIRE(Contains(h, "kMaxMethodId = 0;"));
   REQUIRE_FALSE(Contains(h, "// Inherited methods"));
 
   const std::string s = ReadAll(source);
   // Without kRestart the Restart override must not be generated.
   REQUIRE_FALSE(Contains(s, "void Runtime::Restart("));
-  REQUIRE(Contains(s, "namespace chimaera::beta {"));
+  REQUIRE(Contains(s, "namespace clio::run::beta {"));
 }
 
 TEST_CASE("RefreshRepo - unwritable output directory fails",
@@ -493,7 +493,7 @@ TEST_CASE("CliClientError - commands fail fast without a runtime",
 
 //==============================================================================
 // CliRuntime — monitor/compose/migrate/stop against a LIVE runtime daemon.
-// The daemon is spawned via chi::test::RuntimeServer (posix_spawn of the
+// The daemon is spawned via clio::run::test::RuntimeServer (posix_spawn of the
 // clio_run binary) and is guaranteed to be reaped: RuntimeServer::Stop()
 // runs from the destructor even when a REQUIRE throws, and every client
 // subprocess has a hard RunCliTimed kill deadline so nothing can hang.

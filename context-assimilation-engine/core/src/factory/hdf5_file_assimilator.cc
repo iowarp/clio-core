@@ -57,12 +57,12 @@ Hdf5FileAssimilator::Hdf5FileAssimilator(
     std::shared_ptr<clio::cte::core::Client> cte_client)
     : cte_client_(cte_client) {}
 
-chi::TaskResume Hdf5FileAssimilator::Schedule(const AssimilationCtx& ctx,
+clio::run::TaskResume Hdf5FileAssimilator::Schedule(const AssimilationCtx& ctx,
                                               int& error_code) {
 #ifdef __NVCOMPILER
-  thread_local chi::RunContext _fb_rctx;
-  chi::RunContext* _fp = chi::GetCurrentRunContextFromWorker();
-  chi::RunContext& rctx = _fp ? *_fp : _fb_rctx;
+  thread_local clio::run::RunContext _fb_rctx;
+  clio::run::RunContext* _fp = clio::run::GetCurrentRunContextFromWorker();
+  clio::run::RunContext& rctx = _fp ? *_fp : _fb_rctx;
 #endif
   CLIO_TASK_BODY_BEGIN
   HLOG(kDebug, "Hdf5FileAssimilator::Schedule() - ENTRY");
@@ -181,7 +181,7 @@ chi::TaskResume Hdf5FileAssimilator::Schedule(const AssimilationCtx& ctx,
   // Get distributed processing info from CTE/IPC manager
   size_t num_nodes = 1;
   auto* ipc_manager = CLIO_IPC;
-  std::vector<chi::Host> all_hosts;
+  std::vector<clio::run::Host> all_hosts;
   if (ipc_manager) {
     all_hosts = ipc_manager->GetAllHosts();
     num_nodes = all_hosts.size();
@@ -216,14 +216,14 @@ chi::TaskResume Hdf5FileAssimilator::Schedule(const AssimilationCtx& ctx,
           kCaePoolId);
 
     // Create futures for all dataset tasks
-    std::vector<chi::Future<ProcessHdf5DatasetTask>> futures;
+    std::vector<clio::run::Future<ProcessHdf5DatasetTask>> futures;
     futures.reserve(filtered_paths.size());
 
     for (size_t i = 0; i < filtered_paths.size(); ++i) {
       const auto& dataset_path = filtered_paths[i];
       // Round-robin distribution to nodes using direct hash
-      chi::u32 target_node = static_cast<chi::u32>(i % num_nodes);
-      auto pool_query = chi::PoolQuery::DirectHash(target_node);
+      clio::run::u32 target_node = static_cast<clio::run::u32>(i % num_nodes);
+      auto pool_query = clio::run::PoolQuery::DirectHash(target_node);
 
       HLOG(kDebug, "Hdf5FileAssimilator: Routing dataset {}/{} '{}' to node {}",
            i + 1, filtered_paths.size(), dataset_path, target_node);
@@ -395,13 +395,13 @@ int Hdf5FileAssimilator::DiscoverDatasets(
   return 0;
 }
 
-chi::TaskResume Hdf5FileAssimilator::ProcessDataset(
+clio::run::TaskResume Hdf5FileAssimilator::ProcessDataset(
     hid_t file_id, const std::string& dataset_path,
     const std::string& tag_prefix, int& error_code) {
 #ifdef __NVCOMPILER
-  thread_local chi::RunContext _fb_rctx;
-  chi::RunContext* _fp = chi::GetCurrentRunContextFromWorker();
-  chi::RunContext& rctx = _fp ? *_fp : _fb_rctx;
+  thread_local clio::run::RunContext _fb_rctx;
+  clio::run::RunContext* _fp = clio::run::GetCurrentRunContextFromWorker();
+  clio::run::RunContext& rctx = _fp ? *_fp : _fb_rctx;
 #endif
   CLIO_TASK_BODY_BEGIN
   HLOG(kDebug, "ProcessDataset: ENTRY - dataset: '{}', tag_prefix: '{}'",
@@ -580,7 +580,7 @@ chi::TaskResume Hdf5FileAssimilator::ProcessDataset(
   // Process data in chunks and send to CTE
   size_t chunk_idx = 0;
   size_t bytes_processed = 0;
-  std::vector<chi::Future<clio::cte::core::PutBlobTask>> active_tasks;
+  std::vector<clio::run::Future<clio::cte::core::PutBlobTask>> active_tasks;
 
   HLOG(kDebug, "ProcessDataset: Starting chunk transfer loop...");
   while (bytes_processed < total_bytes) {

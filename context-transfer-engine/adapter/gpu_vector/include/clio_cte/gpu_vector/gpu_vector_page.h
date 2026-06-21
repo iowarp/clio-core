@@ -23,13 +23,13 @@ namespace clio::cte::gpu_vector {
  * `prefetch_q` for the prefetch phase.
  */
 struct RescoreEntry {
-  chi::u32 page_idx; /**< Logical blob page index. */
+  clio::run::u32 page_idx; /**< Logical blob page index. */
   float score;       /**< Caller-provided priority (higher = hotter). */
 };
 
 /** Power-of-two capacities so producer ring indexing is `tail & (cap-1)`. */
-inline constexpr chi::u32 kRescoreQueueCap = 256;
-inline constexpr chi::u32 kPrefetchQueueCap = 256;
+inline constexpr clio::run::u32 kRescoreQueueCap = 256;
+inline constexpr clio::run::u32 kPrefetchQueueCap = 256;
 
 /**
  * Per-block MPSC ring fed by user kernels. `tail` is the producer
@@ -39,8 +39,8 @@ inline constexpr chi::u32 kPrefetchQueueCap = 256;
  * rescore lambda's lookahead to what fits.
  */
 struct RescoreQueue {
-  chi::u32 head;
-  chi::u32 tail;
+  clio::run::u32 head;
+  clio::run::u32 tail;
   RescoreEntry slots[kRescoreQueueCap];
 };
 
@@ -50,8 +50,8 @@ struct RescoreQueue {
  * No cross-thread access — only the manager warp/kernel touches this.
  */
 struct PrefetchQueue {
-  chi::u32 head;
-  chi::u32 tail;
+  clio::run::u32 head;
+  clio::run::u32 tail;
   RescoreEntry slots[kPrefetchQueueCap];
 };
 
@@ -80,12 +80,12 @@ struct Page {
   int32_t page_idx;       /**< -1 if slot is empty. */
   int32_t modify_min;     /**< -1 = clean. */
   int32_t modify_max;     /**< -1 = clean. */
-  chi::u32 flags;          /**< See kPage* bits below. */
-  chi::u64 lru_clock;      /**< clock64() at last access (for LRU). */
+  clio::run::u32 flags;          /**< See kPage* bits below. */
+  clio::run::u64 lru_clock;      /**< clock64() at last access (for LRU). */
   float score;             /**< Normalized priority, set by manager. */
-  chi::u32 tier;           /**< 0 = HBM (kDeviceMem), 1 = DRAM (kPinnedHost). */
-  chi::gpu::Future<clio::cte::core::PutBlobTask> active_put;
-  chi::gpu::Future<clio::cte::core::GetBlobTask> active_get;
+  clio::run::u32 tier;           /**< 0 = HBM (kDeviceMem), 1 = DRAM (kPinnedHost). */
+  clio::run::gpu::Future<clio::cte::core::PutBlobTask> active_put;
+  clio::run::gpu::Future<clio::cte::core::GetBlobTask> active_get;
 };
 
 /**
@@ -99,13 +99,13 @@ struct Page {
  * `_pi<page_idx>` is appended runtime-side from `gpu_page_idx_`).
  */
 struct Block {
-  chi::u32 block_idx;
-  chi::u32 num_modified;          /**< atomic counter, bumped by writers. */
-  chi::u32 gpu_pages_per_block;
-  chi::u32 host_pages_per_block;
+  clio::run::u32 block_idx;
+  clio::run::u32 num_modified;          /**< atomic counter, bumped by writers. */
+  clio::run::u32 gpu_pages_per_block;
+  clio::run::u32 host_pages_per_block;
   void *swap_scratch;             /**< page-sized HBM scratch for swap. */
-  chi::u32 flush_cursor;          /**< Round-robin Phase 3 starting slot. */
-  chi::u32 _pad0;                 /**< keep pages[] 16-byte aligned. */
+  clio::run::u32 flush_cursor;          /**< Round-robin Phase 3 starting slot. */
+  clio::run::u32 _pad0;                 /**< keep pages[] 16-byte aligned. */
   RescoreQueue rescore_q;
   PrefetchQueue prefetch_q;
   /** `pages[i]` is the i-th cached slot for this block. Slots
@@ -116,13 +116,13 @@ struct Block {
 
 /** Page::flags bits. */
 /** A PutBlob is in flight for this page (FlushPage will not double-submit). */
-inline constexpr chi::u32 kPagePutInFlight = 1u << 0;
+inline constexpr clio::run::u32 kPagePutInFlight = 1u << 0;
 /** Layout mutex — CAS-acquired by whoever mutates page_idx / modify_min/max /
  *  tier-contents. Both the user kernel (write_range/read_range) and the
  *  CacheManagerKernel (reorganize/prefetch) honor this bit. */
-inline constexpr chi::u32 kPageBusy = 1u << 1;
+inline constexpr clio::run::u32 kPageBusy = 1u << 1;
 /** A GetBlob is in flight for this page (FaultPage path). */
-inline constexpr chi::u32 kPageGetInFlight = 1u << 2;
+inline constexpr clio::run::u32 kPageGetInFlight = 1u << 2;
 
 }  // namespace clio::cte::gpu_vector
 

@@ -223,11 +223,11 @@ bool Config::SetParameterFromString(const std::string &param_name,
                                     const std::string &value) {
   try {
     if (param_name == "target_stat_interval_ms") {
-      performance_.target_stat_interval_ms_ = static_cast<chi::u32>(std::stoul(value));
+      performance_.target_stat_interval_ms_ = static_cast<clio::run::u32>(std::stoul(value));
       return true;
     }
     if (param_name == "max_concurrent_operations") {
-      performance_.max_concurrent_operations_ = static_cast<chi::u32>(std::stoul(value));
+      performance_.max_concurrent_operations_ = static_cast<clio::run::u32>(std::stoul(value));
       return true;
     }
     if (param_name == "score_threshold") {
@@ -239,15 +239,15 @@ bool Config::SetParameterFromString(const std::string &param_name,
       return true;
     }
     if (param_name == "neighborhood") {
-      targets_.neighborhood_ = static_cast<chi::u32>(std::stoul(value));
+      targets_.neighborhood_ = static_cast<clio::run::u32>(std::stoul(value));
       return true;
     }
     if (param_name == "default_target_timeout_ms") {
-      targets_.default_target_timeout_ms_ = static_cast<chi::u32>(std::stoul(value));
+      targets_.default_target_timeout_ms_ = static_cast<clio::run::u32>(std::stoul(value));
       return true;
     }
     if (param_name == "poll_period_ms") {
-      targets_.poll_period_ms_ = static_cast<chi::u32>(std::stoul(value));
+      targets_.poll_period_ms_ = static_cast<clio::run::u32>(std::stoul(value));
       return true;
     }
 
@@ -299,10 +299,10 @@ bool Config::ParseYamlNode(const YAML::Node &node) {
       ParseSizeString(cap_str, gpu_metadata_cache_.capacity_bytes_);
     }
     if (gmc["max_blobs"]) {
-      gpu_metadata_cache_.max_blobs_ = gmc["max_blobs"].as<chi::u32>();
+      gpu_metadata_cache_.max_blobs_ = gmc["max_blobs"].as<clio::run::u32>();
     }
     if (gmc["max_tags"]) {
-      gpu_metadata_cache_.max_tags_ = gmc["max_tags"].as<chi::u32>();
+      gpu_metadata_cache_.max_tags_ = gmc["max_tags"].as<clio::run::u32>();
     }
   }
 
@@ -372,15 +372,15 @@ void Config::EmitYaml(YAML::Emitter &emitter) const {
 
 bool Config::ParsePerformanceConfig(const YAML::Node &node) {
   if (node["target_stat_interval_ms"]) {
-    performance_.target_stat_interval_ms_ = node["target_stat_interval_ms"].as<chi::u32>();
+    performance_.target_stat_interval_ms_ = node["target_stat_interval_ms"].as<clio::run::u32>();
   }
 
   if (node["stat_targets_period_ms"]) {
-    performance_.stat_targets_period_ms_ = node["stat_targets_period_ms"].as<chi::u32>();
+    performance_.stat_targets_period_ms_ = node["stat_targets_period_ms"].as<clio::run::u32>();
   }
 
   if (node["max_concurrent_operations"]) {
-    performance_.max_concurrent_operations_ = node["max_concurrent_operations"].as<chi::u32>();
+    performance_.max_concurrent_operations_ = node["max_concurrent_operations"].as<clio::run::u32>();
   }
 
   if (node["score_threshold"]) {
@@ -392,7 +392,7 @@ bool Config::ParsePerformanceConfig(const YAML::Node &node) {
   }
 
   if (node["flush_metadata_period_ms"]) {
-    performance_.flush_metadata_period_ms_ = node["flush_metadata_period_ms"].as<chi::u32>();
+    performance_.flush_metadata_period_ms_ = node["flush_metadata_period_ms"].as<clio::run::u32>();
   }
 
   if (node["metadata_log_path"]) {
@@ -401,7 +401,7 @@ bool Config::ParsePerformanceConfig(const YAML::Node &node) {
   }
 
   if (node["flush_data_period_ms"]) {
-    performance_.flush_data_period_ms_ = node["flush_data_period_ms"].as<chi::u32>();
+    performance_.flush_data_period_ms_ = node["flush_data_period_ms"].as<clio::run::u32>();
   }
 
   if (node["flush_data_min_persistence"]) {
@@ -418,15 +418,15 @@ bool Config::ParsePerformanceConfig(const YAML::Node &node) {
 
 bool Config::ParseTargetConfig(const YAML::Node &node) {
   if (node["neighborhood"]) {
-    targets_.neighborhood_ = node["neighborhood"].as<chi::u32>();
+    targets_.neighborhood_ = node["neighborhood"].as<clio::run::u32>();
   }
 
   if (node["default_target_timeout_ms"]) {
-    targets_.default_target_timeout_ms_ = node["default_target_timeout_ms"].as<chi::u32>();
+    targets_.default_target_timeout_ms_ = node["default_target_timeout_ms"].as<clio::run::u32>();
   }
 
   if (node["poll_period_ms"]) {
-    targets_.poll_period_ms_ = node["poll_period_ms"].as<chi::u32>();
+    targets_.poll_period_ms_ = node["poll_period_ms"].as<clio::run::u32>();
   }
 
   return true;
@@ -549,7 +549,7 @@ bool Config::ParseDpeConfig(const YAML::Node &node) {
   return true;
 }
 
-bool Config::ParseSizeString(const std::string &size_str, chi::u64 &size_bytes) const {
+bool Config::ParseSizeString(const std::string &size_str, clio::run::u64 &size_bytes) const {
   if (size_str.empty()) {
     return false;
   }
@@ -592,7 +592,7 @@ bool Config::ParseSizeString(const std::string &size_str, chi::u64 &size_bytes) 
   }
   
   // Parse the suffix and convert to bytes
-  chi::u64 multiplier = 1;
+  clio::run::u64 multiplier = 1;
   if (suffix_part.empty() || suffix_part == "b" || suffix_part == "bytes") {
     multiplier = 1;
   } else if (suffix_part == "k" || suffix_part == "kb" || suffix_part == "kilobytes") {
@@ -611,13 +611,13 @@ bool Config::ParseSizeString(const std::string &size_str, chi::u64 &size_bytes) 
   }
   
   // Calculate final size in bytes
-  size_bytes = static_cast<chi::u64>(value * multiplier);
+  size_bytes = static_cast<clio::run::u64>(value * multiplier);
   return true;
 }
 
-std::string Config::FormatSizeBytes(chi::u64 size_bytes) const {
+std::string Config::FormatSizeBytes(clio::run::u64 size_bytes) const {
   const char* units[] = {"B", "KB", "MB", "GB", "TB", "PB"};
-  const chi::u64 base = 1024;
+  const clio::run::u64 base = 1024;
   
   if (size_bytes == 0) {
     return "0B";
@@ -633,9 +633,9 @@ std::string Config::FormatSizeBytes(chi::u64 size_bytes) const {
   }
   
   // Format the size
-  if (size == static_cast<chi::u64>(size)) {
+  if (size == static_cast<clio::run::u64>(size)) {
     // No decimal places needed
-    return std::to_string(static_cast<chi::u64>(size)) + units[unit_index];
+    return std::to_string(static_cast<clio::run::u64>(size)) + units[unit_index];
   } else {
     // Use one decimal place
     char buffer[32];

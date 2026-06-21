@@ -72,7 +72,7 @@ struct iowarp_dataset_t {
      name. */
   bool cacheable;
   /* Pending async writes flushed on close */
-  std::vector<chi::Future<clio::cte::core::PutBlobTask>> pending_puts;
+  std::vector<clio::run::Future<clio::cte::core::PutBlobTask>> pending_puts;
   std::vector<ctp::ipc::FullPtr<char>> pending_buffers;
 };
 
@@ -565,7 +565,7 @@ static herr_t iowarp_dataset_read(size_t count, void *dset[],
     char *dst = static_cast<char *>(buf[d]);
 
     /* Hit test: a fully-populated cache always has a non-empty chunk_0. */
-    chi::u64 cached = 0;
+    clio::run::u64 cached = 0;
     {
       auto sz = cte_client->AsyncGetBlobSize(
           dataset->file->tag_id, dataset->dataset_path + "/chunk_0");
@@ -596,7 +596,7 @@ static herr_t iowarp_dataset_read(size_t count, void *dset[],
       }
     } else {
       /* HIT — serve every chunk from the CTE tier. */
-      std::vector<chi::Future<clio::cte::core::GetBlobTask>> futures;
+      std::vector<clio::run::Future<clio::cte::core::GetBlobTask>> futures;
       std::vector<ctp::ipc::FullPtr<char>> buffers;
       for (size_t i = 0; i < num_chunks; ++i) {
         size_t offset = i * chunk_size;

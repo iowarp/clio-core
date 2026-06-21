@@ -47,22 +47,22 @@ namespace clio::cte::core {
  * Performance configuration for CTE Core operations
  */
 struct PerformanceConfig {
-  chi::u32
+  clio::run::u32
       target_stat_interval_ms_;  // Interval for updating target stats (legacy)
-  chi::u32 stat_targets_period_ms_;     // Period for periodic StatTargets calls
+  clio::run::u32 stat_targets_period_ms_;     // Period for periodic StatTargets calls
                                         // (default 50ms)
-  chi::u32 max_concurrent_operations_;  // Max concurrent I/O operations
+  clio::run::u32 max_concurrent_operations_;  // Max concurrent I/O operations
   float score_threshold_;               // Threshold for blob reorganization
   float score_difference_threshold_;    // Minimum score difference for
                                         // reorganization
 
-  chi::u32 flush_metadata_period_ms_;  // Period for periodic metadata flush
+  clio::run::u32 flush_metadata_period_ms_;  // Period for periodic metadata flush
                                        // (default 5s)
   std::string metadata_log_path_;   // Path for metadata log (empty = disabled)
-  chi::u32 flush_data_period_ms_;   // Period for data flush (default 10s)
+  clio::run::u32 flush_data_period_ms_;   // Period for data flush (default 10s)
   int flush_data_min_persistence_;  // Min persistence level to flush to
                                     // (1=temp-nonvolatile)
-  chi::u64
+  clio::run::u64
       transaction_log_capacity_bytes_;  // Total WAL capacity (default 32MB)
 
   PerformanceConfig()
@@ -86,9 +86,9 @@ struct PerformanceConfig {
  * Target management configuration
  */
 struct TargetConfig {
-  chi::u32 neighborhood_;  // Number of targets (nodes CTE can buffer to)
-  chi::u32 default_target_timeout_ms_;  // Default timeout for target operations
-  chi::u32 poll_period_ms_;  // Period to rescan targets for statistics
+  clio::run::u32 neighborhood_;  // Number of targets (nodes CTE can buffer to)
+  clio::run::u32 default_target_timeout_ms_;  // Default timeout for target operations
+  clio::run::u32 poll_period_ms_;  // Period to rescan targets for statistics
 
   TargetConfig()
       : neighborhood_(4),
@@ -102,7 +102,7 @@ struct TargetConfig {
 struct StorageDeviceConfig {
   std::string path_;       // Directory path for the block device
   std::string bdev_type_;  // Block device type ("file", "ram", etc.)
-  chi::u64
+  clio::run::u64
       capacity_limit_;  // Capacity limit in bytes (parsed from size string)
   float score_;  // Optional manual score (0.0-1.0), -1.0 means use automatic
                  // scoring
@@ -111,7 +111,7 @@ struct StorageDeviceConfig {
   StorageDeviceConfig()
       : capacity_limit_(0), score_(-1.0f), persistence_level_("volatile") {}
   StorageDeviceConfig(const std::string &path, const std::string &bdev_type,
-                      chi::u64 capacity, float score = -1.0f,
+                      clio::run::u64 capacity, float score = -1.0f,
                       const std::string &persistence_level = "volatile")
       : path_(path),
         bdev_type_(bdev_type),
@@ -157,9 +157,9 @@ struct DpeConfig {
  */
 struct GpuMetadataCacheConfig {
   bool enabled_;             /**< Master switch — off by default. */
-  chi::u64 capacity_bytes_;  /**< Total GPU memory footprint cap. */
-  chi::u32 max_blobs_;       /**< Hash slot count for blob entries.  */
-  chi::u32 max_tags_;        /**< Hash slot count for tag entries.   */
+  clio::run::u64 capacity_bytes_;  /**< Total GPU memory footprint cap. */
+  clio::run::u32 max_blobs_;       /**< Hash slot count for blob entries.  */
+  clio::run::u32 max_tags_;        /**< Hash slot count for tag entries.   */
 
   GpuMetadataCacheConfig()
       : enabled_(false),
@@ -315,14 +315,14 @@ class Config {
    * @param size_bytes Output size in bytes
    * @return true if successful, false otherwise
    */
-  bool ParseSizeString(const std::string &size_str, chi::u64 &size_bytes) const;
+  bool ParseSizeString(const std::string &size_str, clio::run::u64 &size_bytes) const;
 
   /**
    * Format size in bytes to human-readable string (e.g., "1GB", "512MB")
    * @param size_bytes Size in bytes
    * @return Formatted size string
    */
-  std::string FormatSizeBytes(chi::u64 size_bytes) const;
+  std::string FormatSizeBytes(clio::run::u64 size_bytes) const;
 };
 
 }  // namespace clio::cte::core

@@ -20,7 +20,7 @@ CLIO_CTE_DEFINE_GLOBAL_PTR_VAR_CC(clio::cte::filesystem::Client, g_fs_client);
  * and binds to the existing one if a launcher already composed it.
  */
 bool CLIO_CFS_CLIENT_INIT(const std::string &config_path,
-                          const chi::PoolQuery &pool_query) {
+                          const clio::run::PoolQuery &pool_query) {
   static bool s_initialized = false;
   if (s_initialized) {
     return true;

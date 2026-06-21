@@ -40,7 +40,7 @@ int RunReadmeExample() {
   auto *cte = CLIO_CTE_CLIENT;
 
   // 2. Get-or-create a named container for blobs.  The async APIs
-  //    return a chi::Future immediately; Wait() blocks for completion.
+  //    return a clio::run::Future immediately; Wait() blocks for completion.
   auto tag_future = cte->AsyncGetOrCreateTag("my_tag");
   tag_future.Wait();
   auto tag_id = tag_future->tag_id_;

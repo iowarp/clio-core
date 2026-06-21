@@ -14,7 +14,7 @@ int RuntimeStop(int argc, char* argv[]) {
 
   try {
     HLOG(kDebug, "Initializing Chimaera client...");
-    if (!chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, false)) {
+    if (!clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, false)) {
       HLOG(kError, "Failed to initialize Chimaera client components");
       return 1;
     }
@@ -32,7 +32,7 @@ int RuntimeStop(int argc, char* argv[]) {
     } finalize_guard;
 
     HLOG(kDebug, "Creating admin client connection...");
-    clio::run::admin::Client admin_client(chi::kAdminPoolId);
+    clio::run::admin::Client admin_client(clio::run::kAdminPoolId);
 
     auto* ipc_manager = CLIO_IPC;
     if (!ipc_manager || !ipc_manager->IsInitialized()) {
@@ -47,7 +47,7 @@ int RuntimeStop(int argc, char* argv[]) {
     auto* task_queue = ipc_manager->GetTaskQueue();
     if (task_queue) {
       try {
-        chi::u32 num_lanes = task_queue->GetNumLanes();
+        clio::run::u32 num_lanes = task_queue->GetNumLanes();
         if (num_lanes == 0) {
           HLOG(kError, "TaskQueue has no lanes configured - runtime initialization incomplete");
           return 1;
@@ -61,14 +61,14 @@ int RuntimeStop(int argc, char* argv[]) {
       HLOG(kDebug, "TaskQueue not in shared memory (TCP mode) - sending stop via ZMQ transport");
     }
 
-    chi::PoolQuery pool_query;
-    chi::u32 shutdown_flags = 0;
-    chi::u32 grace_period_ms = 5000;
+    clio::run::PoolQuery pool_query;
+    clio::run::u32 shutdown_flags = 0;
+    clio::run::u32 grace_period_ms = 5000;
 
     // Parse --grace-period flag
     for (int i = 0; i < argc; ++i) {
       if (std::strcmp(argv[i], "--grace-period") == 0 && i + 1 < argc) {
-        grace_period_ms = static_cast<chi::u32>(std::atoi(argv[++i]));
+        grace_period_ms = static_cast<clio::run::u32>(std::atoi(argv[++i]));
         if (grace_period_ms == 0) grace_period_ms = 5000;
       }
     }
@@ -77,7 +77,7 @@ int RuntimeStop(int argc, char* argv[]) {
 
     auto start_time = std::chrono::steady_clock::now();
 
-    chi::Future<clio::run::admin::StopRuntimeTask> stop_task;
+    clio::run::Future<clio::run::admin::StopRuntimeTask> stop_task;
     try {
       stop_task = admin_client.AsyncStopRuntime(pool_query, shutdown_flags, grace_period_ms);
       if (stop_task.IsNull()) {

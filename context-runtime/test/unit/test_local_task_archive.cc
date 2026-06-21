@@ -50,9 +50,9 @@ class LocalTaskArchiveTest {
 public:
   LocalTaskArchiveTest() {
     // Initialize CLIO Runtime with client mode and runtime
-    bool success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
+    bool success = clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true);
     REQUIRE(success);
-    SimpleTest::g_test_finalize = chi::CHIMAERA_FINALIZE;
+    SimpleTest::g_test_finalize = clio::run::CHIMAERA_FINALIZE;
 
     // Give runtime time to initialize
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
@@ -74,7 +74,7 @@ TEST_CASE("LocalTaskArchive: Serialize and deserialize basic types", "[local_tas
   std::string str_val = "hello world";
 
   // Serialize
-  chi::priv::vector<char> save_buf;
+  clio::run::priv::vector<char> save_buf;
   DefaultSaveArchive save_archive(LocalMsgType::kSerializeIn, save_buf);
   save_archive << int_val << double_val << str_val;
 
@@ -101,7 +101,7 @@ TEST_CASE("LocalTaskArchive: Serialize ShmPtr with bulk()", "[local_task_archive
   uint32_t flags = 0;
 
   // Serialize with bulk
-  chi::priv::vector<char> save_buf;
+  clio::run::priv::vector<char> save_buf;
   DefaultSaveArchive save_archive(LocalMsgType::kSerializeIn, save_buf);
   save_archive.bulk(shm_ptr, data_size, flags);
 
@@ -127,7 +127,7 @@ TEST_CASE("LocalTaskArchive: Serialize FullPtr with bulk()", "[local_task_archiv
   uint32_t flags = 1;
 
   // Serialize with bulk
-  chi::priv::vector<char> save_buf;
+  clio::run::priv::vector<char> save_buf;
   DefaultSaveArchive save_archive(LocalMsgType::kSerializeIn, save_buf);
   save_archive.bulk(full_ptr, data_size, flags);
 
@@ -153,7 +153,7 @@ TEST_CASE("LocalTaskArchive: Serialize raw pointer with bulk()", "[local_task_ar
   uint32_t flags = 2;
 
   // Serialize with bulk (full memory copy)
-  chi::priv::vector<char> save_buf;
+  clio::run::priv::vector<char> save_buf;
   DefaultSaveArchive save_archive(LocalMsgType::kSerializeIn, save_buf);
   save_archive.bulk(original_data, data_size, flags);
 
@@ -174,7 +174,7 @@ TEST_CASE("LocalTaskArchive: Mixed serialization with operator()", "[local_task_
   double val3 = 2.71828;
 
   // Serialize using operator()
-  chi::priv::vector<char> save_buf;
+  clio::run::priv::vector<char> save_buf;
   DefaultSaveArchive save_archive(LocalMsgType::kSerializeIn, save_buf);
   save_archive(val1, val2, val3);
 
@@ -198,7 +198,7 @@ TEST_CASE("LocalTaskArchive: Serialize and deserialize multiple values", "[local
   int num = 999;
 
   // Serialize
-  chi::priv::vector<char> save_buf;
+  clio::run::priv::vector<char> save_buf;
   DefaultSaveArchive save_archive(LocalMsgType::kSerializeIn, save_buf);
   save_archive << vec << str1 << str2 << num;
 
@@ -222,12 +222,12 @@ TEST_CASE("LocalTaskArchive: Serialize and deserialize multiple values", "[local
 
 TEST_CASE("LocalTaskArchive: Message types", "[local_task_archive]") {
   // Test kSerializeIn
-  chi::priv::vector<char> buf_in;
+  clio::run::priv::vector<char> buf_in;
   DefaultSaveArchive save_in(LocalMsgType::kSerializeIn, buf_in);
   REQUIRE(save_in.GetMsgType() == LocalMsgType::kSerializeIn);
 
   // Test kSerializeOut
-  chi::priv::vector<char> buf_out;
+  clio::run::priv::vector<char> buf_out;
   DefaultSaveArchive save_out(LocalMsgType::kSerializeOut, buf_out);
   REQUIRE(save_out.GetMsgType() == LocalMsgType::kSerializeOut);
 }
@@ -249,7 +249,7 @@ TEST_CASE("LocalTaskArchive: Multiple bulk transfers", "[local_task_archive][bul
   shm_ptr2.alloc_id_ = ctp::ipc::AllocatorId(3, 3);
 
   // Serialize all bulk transfers
-  chi::priv::vector<char> save_buf;
+  clio::run::priv::vector<char> save_buf;
   DefaultSaveArchive save_archive(LocalMsgType::kSerializeIn, save_buf);
   save_archive.bulk(shm_ptr1, 10, 0);
   save_archive.bulk(full_ptr, 20, 1);

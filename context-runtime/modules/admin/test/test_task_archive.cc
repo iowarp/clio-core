@@ -68,8 +68,8 @@
 using namespace chi;
 
 // Test constants
-constexpr chi::u32 kTestWriteFlag = 0x1;  // BULK_XFER
-constexpr chi::u32 kTestExposeFlag = 0x2; // BULK_EXPOSE
+constexpr clio::run::u32 kTestWriteFlag = 0x1;  // BULK_XFER
+constexpr clio::run::u32 kTestExposeFlag = 0x2; // BULK_EXPOSE
 
 // Helper allocator for tests - uses CTP_MALLOC for non-IPC allocations
 ctp::ipc::MallocAllocator* GetTestAllocator() {
@@ -77,10 +77,10 @@ ctp::ipc::MallocAllocator* GetTestAllocator() {
 }
 
 // Helper to create test task with sample data
-std::unique_ptr<chi::Task> CreateTestTask() {
-  auto task = std::make_unique<chi::Task>(chi::TaskId(1, 1, 1, 0, 1),
-                                          chi::PoolId(100, 0), chi::PoolQuery(),
-                                          chi::MethodId(42));
+std::unique_ptr<clio::run::Task> CreateTestTask() {
+  auto task = std::make_unique<clio::run::Task>(clio::run::TaskId(1, 1, 1, 0, 1),
+                                          clio::run::PoolId(100, 0), clio::run::PoolQuery(),
+                                          clio::run::MethodId(42));
   task->period_ns_ = 1000000.0; // 1ms
   task->task_flags_.SetBits(0x10);
   return task;
@@ -90,11 +90,11 @@ std::unique_ptr<chi::Task> CreateTestTask() {
 std::unique_ptr<clio::run::admin::CreateTask> CreateTestAdminTask() {
   auto alloc = GetTestAllocator();
   auto task = std::make_unique<clio::run::admin::CreateTask>(
-      chi::TaskId(2, 2, 2, 0, 2), chi::PoolId(200, 0), chi::PoolQuery(),
-      "test_chimod", "test_pool", chi::PoolId(300, 0),
+      clio::run::TaskId(2, 2, 2, 0, 2), clio::run::PoolId(200, 0), clio::run::PoolQuery(),
+      "test_chimod", "test_pool", clio::run::PoolId(300, 0),
       nullptr);  // No client for test task
   task->return_code_ = 42;
-  task->error_message_ = chi::priv::string(CTP_MALLOC, "test error message");
+  task->error_message_ = clio::run::priv::string(CTP_MALLOC, "test error message");
   return task;
 }
 
@@ -126,33 +126,33 @@ TestData CreateTestData() {
 TEST_CASE("NetTaskArchive - Base Class Functionality",
           "[task_archive][net_task_archive]") {
   SECTION("SaveTaskArchive inherits from NetTaskArchive") {
-    chi::SaveTaskArchive archive(chi::MsgType::kSerializeIn);
+    clio::run::SaveTaskArchive archive(clio::run::MsgType::kSerializeIn);
 
     // Test NetTaskArchive methods
-    REQUIRE(archive.GetMsgType() == chi::MsgType::kSerializeIn);
+    REQUIRE(archive.GetMsgType() == clio::run::MsgType::kSerializeIn);
     REQUIRE(archive.GetTaskInfos().empty());
     REQUIRE(archive.GetSendBulkCount() == 0);
     REQUIRE(archive.GetRecvBulkCount() == 0);
   }
 
   SECTION("LoadTaskArchive inherits from NetTaskArchive") {
-    chi::LoadTaskArchive archive;
+    clio::run::LoadTaskArchive archive;
 
     // Test NetTaskArchive methods
-    REQUIRE(archive.GetMsgType() == chi::MsgType::kSerializeIn);
+    REQUIRE(archive.GetMsgType() == clio::run::MsgType::kSerializeIn);
     REQUIRE(archive.GetTaskInfos().empty());
     REQUIRE(archive.GetSendBulkCount() == 0);
     REQUIRE(archive.GetRecvBulkCount() == 0);
   }
 
   SECTION("SaveTaskArchive with different message types") {
-    chi::SaveTaskArchive archive_in(chi::MsgType::kSerializeIn);
-    chi::SaveTaskArchive archive_out(chi::MsgType::kSerializeOut);
-    chi::SaveTaskArchive archive_hb(chi::MsgType::kHeartbeat);
+    clio::run::SaveTaskArchive archive_in(clio::run::MsgType::kSerializeIn);
+    clio::run::SaveTaskArchive archive_out(clio::run::MsgType::kSerializeOut);
+    clio::run::SaveTaskArchive archive_hb(clio::run::MsgType::kHeartbeat);
 
-    REQUIRE(archive_in.GetMsgType() == chi::MsgType::kSerializeIn);
-    REQUIRE(archive_out.GetMsgType() == chi::MsgType::kSerializeOut);
-    REQUIRE(archive_hb.GetMsgType() == chi::MsgType::kHeartbeat);
+    REQUIRE(archive_in.GetMsgType() == clio::run::MsgType::kSerializeIn);
+    REQUIRE(archive_out.GetMsgType() == clio::run::MsgType::kSerializeOut);
+    REQUIRE(archive_hb.GetMsgType() == clio::run::MsgType::kHeartbeat);
   }
 }
 
@@ -163,7 +163,7 @@ TEST_CASE("NetTaskArchive - Base Class Functionality",
 TEST_CASE("SaveTaskArchive - Basic Construction and Data Retrieval",
           "[task_archive][save_archive]") {
   SECTION("Construction with message type") {
-    chi::SaveTaskArchive archive(chi::MsgType::kSerializeIn);
+    clio::run::SaveTaskArchive archive(clio::run::MsgType::kSerializeIn);
 
     // Should start with empty bulk transfers
     REQUIRE(archive.GetSendBulkCount() == 0);
@@ -175,7 +175,7 @@ TEST_CASE("SaveTaskArchive - Basic Construction and Data Retrieval",
   }
 
   SECTION("Serializing simple data") {
-    chi::SaveTaskArchive archive(chi::MsgType::kSerializeIn);
+    clio::run::SaveTaskArchive archive(clio::run::MsgType::kSerializeIn);
     int test_value = 42;
 
     REQUIRE_NOTHROW(archive << test_value);
@@ -192,7 +192,7 @@ TEST_CASE("SaveTaskArchive - Basic Construction and Data Retrieval",
 TEST_CASE("LoadTaskArchive - Basic Construction",
           "[task_archive][load_archive]") {
   SECTION("Default construction") {
-    chi::LoadTaskArchive archive;
+    clio::run::LoadTaskArchive archive;
 
     REQUIRE(archive.GetSendBulkCount() == 0);
     REQUIRE(archive.GetRecvBulkCount() == 0);
@@ -200,7 +200,7 @@ TEST_CASE("LoadTaskArchive - Basic Construction",
 
   SECTION("Construction from string") {
     std::string test_data = "test serialized data";
-    chi::LoadTaskArchive archive(test_data);
+    clio::run::LoadTaskArchive archive(test_data);
 
     REQUIRE(archive.GetSendBulkCount() == 0);
     REQUIRE(archive.GetRecvBulkCount() == 0);
@@ -209,7 +209,7 @@ TEST_CASE("LoadTaskArchive - Basic Construction",
   SECTION("Construction from const char* and size") {
     const char *test_data = "test data";
     size_t size = strlen(test_data);
-    chi::LoadTaskArchive archive(test_data, size);
+    clio::run::LoadTaskArchive archive(test_data, size);
 
     REQUIRE(archive.GetSendBulkCount() == 0);
   }
@@ -221,7 +221,7 @@ TEST_CASE("LoadTaskArchive - Basic Construction",
 
 TEST_CASE("Bulk Transfer Recording", "[task_archive][bulk_transfer]") {
   SECTION("SaveTaskArchive bulk transfer recording") {
-    chi::SaveTaskArchive archive(chi::MsgType::kSerializeIn);
+    clio::run::SaveTaskArchive archive(clio::run::MsgType::kSerializeIn);
 
     ctp::ipc::ShmPtr<> test_ptr = ctp::ipc::ShmPtr<>::GetNull();
     size_t test_size = 1024;
@@ -236,7 +236,7 @@ TEST_CASE("Bulk Transfer Recording", "[task_archive][bulk_transfer]") {
   }
 
   SECTION("Multiple bulk transfers") {
-    chi::SaveTaskArchive archive(chi::MsgType::kSerializeIn);
+    clio::run::SaveTaskArchive archive(clio::run::MsgType::kSerializeIn);
 
     // Add multiple bulk transfers
     archive.bulk(ctp::ipc::ShmPtr<>::GetNull(), 100, kTestWriteFlag);
@@ -260,12 +260,12 @@ TEST_CASE("Non-Task Object Serialization", "[task_archive][non_task]") {
     TestData original = CreateTestData();
 
     // Serialize using SaveTaskArchive
-    chi::SaveTaskArchive out_archive(chi::MsgType::kSerializeIn);
+    clio::run::SaveTaskArchive out_archive(clio::run::MsgType::kSerializeIn);
     REQUIRE_NOTHROW(out_archive << original);
     std::string serialized_data = out_archive.GetData();
 
     // Deserialize using LoadTaskArchive
-    chi::LoadTaskArchive in_archive(serialized_data);
+    clio::run::LoadTaskArchive in_archive(serialized_data);
     TestData deserialized;
     REQUIRE_NOTHROW(in_archive >> deserialized);
 
@@ -279,12 +279,12 @@ TEST_CASE("Non-Task Object Serialization", "[task_archive][non_task]") {
     double double1 = 3.14159;
 
     // Serialize using operator()
-    chi::SaveTaskArchive out_archive(chi::MsgType::kSerializeIn);
+    clio::run::SaveTaskArchive out_archive(clio::run::MsgType::kSerializeIn);
     REQUIRE_NOTHROW(out_archive(str1, int1, double1));
     std::string serialized_data = out_archive.GetData();
 
     // Deserialize using operator()
-    chi::LoadTaskArchive in_archive(serialized_data);
+    clio::run::LoadTaskArchive in_archive(serialized_data);
     std::string str2;
     int int2;
     double double2;
@@ -306,7 +306,7 @@ TEST_CASE("Task Base Class Serialization", "[task_archive][task_base]") {
     auto original_task = CreateTestTask();
 
     // Serialize using SaveTaskArchive with kSerializeIn mode
-    chi::SaveTaskArchive out_archive(chi::MsgType::kSerializeIn);
+    clio::run::SaveTaskArchive out_archive(clio::run::MsgType::kSerializeIn);
     REQUIRE_NOTHROW(out_archive << *original_task);
     std::string serialized_data = out_archive.GetData();
 
@@ -317,8 +317,8 @@ TEST_CASE("Task Base Class Serialization", "[task_archive][task_base]") {
     REQUIRE(out_archive.GetTaskInfos()[0].method_id_ == original_task->method_);
 
     // Deserialize using LoadTaskArchive with kSerializeIn mode
-    chi::LoadTaskArchive in_archive(serialized_data);
-    in_archive.msg_type_ = chi::MsgType::kSerializeIn;
+    clio::run::LoadTaskArchive in_archive(serialized_data);
+    in_archive.msg_type_ = clio::run::MsgType::kSerializeIn;
     auto new_task = CreateTestTask();
     new_task->SetNull(); // Clear data to ensure deserialization works
     REQUIRE_NOTHROW(in_archive >> *new_task);
@@ -337,13 +337,13 @@ TEST_CASE("Task Base Class Serialization", "[task_archive][task_base]") {
     original_task->return_code_ = 42; // Set a return code (OUT parameter)
 
     // Serialize using SaveTaskArchive with kSerializeOut mode
-    chi::SaveTaskArchive out_archive(chi::MsgType::kSerializeOut);
+    clio::run::SaveTaskArchive out_archive(clio::run::MsgType::kSerializeOut);
     REQUIRE_NOTHROW(out_archive << *original_task);
     std::string serialized_data = out_archive.GetData();
 
     // Deserialize using LoadTaskArchive with kSerializeOut mode
-    chi::LoadTaskArchive in_archive(serialized_data);
-    in_archive.msg_type_ = chi::MsgType::kSerializeOut;
+    clio::run::LoadTaskArchive in_archive(serialized_data);
+    in_archive.msg_type_ = clio::run::MsgType::kSerializeOut;
     auto new_task = CreateTestTask();
     new_task->return_code_ = 0; // Clear return code
     REQUIRE_NOTHROW(in_archive >> *new_task);
@@ -362,15 +362,15 @@ TEST_CASE("Admin Task Serialization", "[task_archive][admin_tasks]") {
     auto original_task = CreateTestAdminTask();
 
     // Test IN parameter serialization
-    chi::SaveTaskArchive out_archive_in(chi::MsgType::kSerializeIn);
+    clio::run::SaveTaskArchive out_archive_in(clio::run::MsgType::kSerializeIn);
     REQUIRE_NOTHROW(out_archive_in << *original_task);
     std::string in_data = out_archive_in.GetData();
 
-    chi::LoadTaskArchive in_archive_in(in_data);
-    in_archive_in.msg_type_ = chi::MsgType::kSerializeIn;
+    clio::run::LoadTaskArchive in_archive_in(in_data);
+    in_archive_in.msg_type_ = clio::run::MsgType::kSerializeIn;
     auto new_task_in = CreateTestAdminTask();
-    new_task_in->chimod_name_ = chi::priv::string(CTP_MALLOC, ""); // Clear
-    new_task_in->pool_name_ = chi::priv::string(CTP_MALLOC, "");
+    new_task_in->chimod_name_ = clio::run::priv::string(CTP_MALLOC, ""); // Clear
+    new_task_in->pool_name_ = clio::run::priv::string(CTP_MALLOC, "");
     REQUIRE_NOTHROW(in_archive_in >> *new_task_in);
 
     // Verify IN/INOUT parameters were preserved
@@ -380,15 +380,15 @@ TEST_CASE("Admin Task Serialization", "[task_archive][admin_tasks]") {
     REQUIRE(new_task_in->pool_id_ == original_task->pool_id_);
 
     // Test OUT parameter serialization
-    chi::SaveTaskArchive out_archive_out(chi::MsgType::kSerializeOut);
+    clio::run::SaveTaskArchive out_archive_out(clio::run::MsgType::kSerializeOut);
     REQUIRE_NOTHROW(out_archive_out << *original_task);
     std::string out_data = out_archive_out.GetData();
 
-    chi::LoadTaskArchive in_archive_out(out_data);
-    in_archive_out.msg_type_ = chi::MsgType::kSerializeOut;
+    clio::run::LoadTaskArchive in_archive_out(out_data);
+    in_archive_out.msg_type_ = clio::run::MsgType::kSerializeOut;
     auto new_task_out = CreateTestAdminTask();
     new_task_out->return_code_ = 0; // Clear
-    new_task_out->error_message_ = chi::priv::string(CTP_MALLOC, "");
+    new_task_out->error_message_ = clio::run::priv::string(CTP_MALLOC, "");
     REQUIRE_NOTHROW(in_archive_out >> *new_task_out);
 
     // Verify OUT/INOUT parameters were preserved
@@ -402,17 +402,17 @@ TEST_CASE("Admin Task Serialization", "[task_archive][admin_tasks]") {
   SECTION("DestroyPoolTask serialization") {
     auto alloc = GetTestAllocator();
     clio::run::admin::DestroyPoolTask original_task(
-        chi::TaskId(3, 3, 3, 0, 3), chi::PoolId(400, 0),
-        chi::PoolQuery(), chi::PoolId(500, 0), 0x123);
+        clio::run::TaskId(3, 3, 3, 0, 3), clio::run::PoolId(400, 0),
+        clio::run::PoolQuery(), clio::run::PoolId(500, 0), 0x123);
     original_task.return_code_ = 99;
-    original_task.error_message_ = chi::priv::string(CTP_MALLOC, "destroy error");
+    original_task.error_message_ = clio::run::priv::string(CTP_MALLOC, "destroy error");
 
     // Test round-trip IN parameters
-    chi::SaveTaskArchive out_archive_in(chi::MsgType::kSerializeIn);
+    clio::run::SaveTaskArchive out_archive_in(clio::run::MsgType::kSerializeIn);
     out_archive_in << original_task;
 
-    chi::LoadTaskArchive in_archive_in(out_archive_in.GetData());
-    in_archive_in.msg_type_ = chi::MsgType::kSerializeIn;
+    clio::run::LoadTaskArchive in_archive_in(out_archive_in.GetData());
+    in_archive_in.msg_type_ = clio::run::MsgType::kSerializeIn;
     clio::run::admin::DestroyPoolTask new_task_in;
     in_archive_in >> new_task_in;
 
@@ -420,11 +420,11 @@ TEST_CASE("Admin Task Serialization", "[task_archive][admin_tasks]") {
     REQUIRE(new_task_in.destruction_flags_ == original_task.destruction_flags_);
 
     // Test round-trip OUT parameters
-    chi::SaveTaskArchive out_archive_out(chi::MsgType::kSerializeOut);
+    clio::run::SaveTaskArchive out_archive_out(clio::run::MsgType::kSerializeOut);
     out_archive_out << original_task;
 
-    chi::LoadTaskArchive in_archive_out(out_archive_out.GetData());
-    in_archive_out.msg_type_ = chi::MsgType::kSerializeOut;
+    clio::run::LoadTaskArchive in_archive_out(out_archive_out.GetData());
+    in_archive_out.msg_type_ = clio::run::MsgType::kSerializeOut;
     clio::run::admin::DestroyPoolTask new_task_out;
     in_archive_out >> new_task_out;
 
@@ -436,17 +436,17 @@ TEST_CASE("Admin Task Serialization", "[task_archive][admin_tasks]") {
   SECTION("StopRuntimeTask serialization") {
     auto alloc = GetTestAllocator();
     clio::run::admin::StopRuntimeTask original_task(
-        chi::TaskId(4, 4, 4, 0, 4), chi::PoolId(600, 0),
-        chi::PoolQuery(), 0x456, 10000);
+        clio::run::TaskId(4, 4, 4, 0, 4), clio::run::PoolId(600, 0),
+        clio::run::PoolQuery(), 0x456, 10000);
     original_task.return_code_ = 777;
-    original_task.error_message_ = chi::priv::string(CTP_MALLOC, "shutdown error");
+    original_task.error_message_ = clio::run::priv::string(CTP_MALLOC, "shutdown error");
 
     // Test IN parameters
-    chi::SaveTaskArchive out_archive_in(chi::MsgType::kSerializeIn);
+    clio::run::SaveTaskArchive out_archive_in(clio::run::MsgType::kSerializeIn);
     out_archive_in << original_task;
 
-    chi::LoadTaskArchive in_archive_in(out_archive_in.GetData());
-    in_archive_in.msg_type_ = chi::MsgType::kSerializeIn;
+    clio::run::LoadTaskArchive in_archive_in(out_archive_in.GetData());
+    in_archive_in.msg_type_ = clio::run::MsgType::kSerializeIn;
     clio::run::admin::StopRuntimeTask new_task_in;
     in_archive_in >> new_task_in;
 
@@ -454,11 +454,11 @@ TEST_CASE("Admin Task Serialization", "[task_archive][admin_tasks]") {
     REQUIRE(new_task_in.grace_period_ms_ == original_task.grace_period_ms_);
 
     // Test OUT parameters
-    chi::SaveTaskArchive out_archive_out(chi::MsgType::kSerializeOut);
+    clio::run::SaveTaskArchive out_archive_out(clio::run::MsgType::kSerializeOut);
     out_archive_out << original_task;
 
-    chi::LoadTaskArchive in_archive_out(out_archive_out.GetData());
-    in_archive_out.msg_type_ = chi::MsgType::kSerializeOut;
+    clio::run::LoadTaskArchive in_archive_out(out_archive_out.GetData());
+    in_archive_out.msg_type_ = clio::run::MsgType::kSerializeOut;
     clio::run::admin::StopRuntimeTask new_task_out;
     in_archive_out >> new_task_out;
 
@@ -489,7 +489,7 @@ TEST_CASE("Archive Operator() Bidirectional Functionality",
     }
 
     // Deserialize with LoadTaskArchive using operator()
-    chi::LoadTaskArchive in_archive(std::string(buf.begin(), buf.end()));
+    clio::run::LoadTaskArchive in_archive(std::string(buf.begin(), buf.end()));
     int result1;
     std::string result2;
     double result3;
@@ -506,11 +506,11 @@ TEST_CASE("Archive Operator() Bidirectional Functionality",
     double value3 = 2.71828;
 
     // Serialize with SaveTaskArchive using operator()
-    chi::SaveTaskArchive out_archive(chi::MsgType::kSerializeIn);
+    clio::run::SaveTaskArchive out_archive(clio::run::MsgType::kSerializeIn);
     REQUIRE_NOTHROW(out_archive(value1, value2, value3));
 
     // Deserialize using LoadTaskArchive
-    chi::LoadTaskArchive in_archive(out_archive.GetData());
+    clio::run::LoadTaskArchive in_archive(out_archive.GetData());
     int result1;
     std::string result2;
     double result3;
@@ -527,14 +527,14 @@ TEST_CASE("Archive Operator() Bidirectional Functionality",
 //==============================================================================
 
 // Test container class that implements all pure virtual methods
-class TestContainer : public chi::Container {
+class TestContainer : public clio::run::Container {
 public:
-  chi::u64 GetWorkRemaining() const override {
+  clio::run::u64 GetWorkRemaining() const override {
     return 0; // Test implementation returns no work
   }
 
-  chi::TaskResume Run(chi::u32 method, ctp::ipc::FullPtr<chi::Task> task_ptr,
-                      chi::RunContext &rctx) override {
+  clio::run::TaskResume Run(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> task_ptr,
+                      clio::run::RunContext &rctx) override {
     // Test implementation - do nothing
     (void)method;
     (void)task_ptr;
@@ -543,87 +543,87 @@ public:
     CLIO_TASK_BODY_END
   }
 
-  void SaveTask(chi::u32 method, chi::SaveTaskArchive &archive,
-                ctp::ipc::FullPtr<chi::Task> task_ptr) override {
+  void SaveTask(clio::run::u32 method, clio::run::SaveTaskArchive &archive,
+                ctp::ipc::FullPtr<clio::run::Task> task_ptr) override {
     // Test implementation - just call task serialization
     (void)method;
     archive << *task_ptr;
   }
 
-  void LoadTask(chi::u32 method, chi::LoadTaskArchive &archive,
-                ctp::ipc::FullPtr<chi::Task> task_ptr) override {
+  void LoadTask(clio::run::u32 method, clio::run::LoadTaskArchive &archive,
+                ctp::ipc::FullPtr<clio::run::Task> task_ptr) override {
     // Test implementation - just call task deserialization
     (void)method;
     archive >> *task_ptr;
   }
 
-  ctp::ipc::FullPtr<chi::Task> AllocLoadTask(chi::u32 method, chi::LoadTaskArchive &archive) override {
+  ctp::ipc::FullPtr<clio::run::Task> AllocLoadTask(clio::run::u32 method, clio::run::LoadTaskArchive &archive) override {
     // Test implementation - allocate task and call LoadTask
-    ctp::ipc::FullPtr<chi::Task> task_ptr = NewTask(method);
+    ctp::ipc::FullPtr<clio::run::Task> task_ptr = NewTask(method);
     if (!task_ptr.IsNull()) {
       LoadTask(method, archive, task_ptr);
     }
     return task_ptr;
   }
 
-  ctp::ipc::FullPtr<chi::Task> NewCopyTask(chi::u32 method, ctp::ipc::FullPtr<chi::Task> orig_task_ptr,
+  ctp::ipc::FullPtr<clio::run::Task> NewCopyTask(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> orig_task_ptr,
                                         bool deep) override {
     // Test implementation - create new task and copy
     (void)method;
     (void)deep;
     auto *ipc_manager = CLIO_IPC;
     if (ipc_manager) {
-      auto new_task_ptr = ipc_manager->NewTask<chi::Task>();
+      auto new_task_ptr = ipc_manager->NewTask<clio::run::Task>();
       if (!new_task_ptr.IsNull()) {
         new_task_ptr->Copy(orig_task_ptr);
       }
       return new_task_ptr;
     }
-    return ctp::ipc::FullPtr<chi::Task>();
+    return ctp::ipc::FullPtr<clio::run::Task>();
   }
 
-  ctp::ipc::FullPtr<chi::Task> NewTask(chi::u32 method) override {
+  ctp::ipc::FullPtr<clio::run::Task> NewTask(clio::run::u32 method) override {
     // Test implementation - create a basic Task
     (void)method;
     auto *ipc_manager = CLIO_IPC;
     if (ipc_manager) {
-      return ipc_manager->NewTask<chi::Task>();
+      return ipc_manager->NewTask<clio::run::Task>();
     }
-    return ctp::ipc::FullPtr<chi::Task>();
+    return ctp::ipc::FullPtr<clio::run::Task>();
   }
 
-  void LocalLoadTask(chi::u32 method, chi::DefaultLoadArchive &archive,
-                     ctp::ipc::FullPtr<chi::Task> task_ptr) override {
+  void LocalLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive &archive,
+                     ctp::ipc::FullPtr<clio::run::Task> task_ptr) override {
     // Test implementation - do nothing for now
     (void)method;
     (void)archive;
     (void)task_ptr;
   }
 
-  ctp::ipc::FullPtr<chi::Task> LocalAllocLoadTask(chi::u32 method, chi::DefaultLoadArchive &archive) override {
+  ctp::ipc::FullPtr<clio::run::Task> LocalAllocLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive &archive) override {
     // Test implementation - allocate task and call LocalLoadTask
-    ctp::ipc::FullPtr<chi::Task> task_ptr = NewTask(method);
+    ctp::ipc::FullPtr<clio::run::Task> task_ptr = NewTask(method);
     if (!task_ptr.IsNull()) {
       LocalLoadTask(method, archive, task_ptr);
     }
     return task_ptr;
   }
 
-  void LocalSaveTask(chi::u32 method, chi::DefaultSaveArchive &archive,
-                     ctp::ipc::FullPtr<chi::Task> task_ptr) override {
+  void LocalSaveTask(clio::run::u32 method, clio::run::DefaultSaveArchive &archive,
+                     ctp::ipc::FullPtr<clio::run::Task> task_ptr) override {
     // Test implementation - do nothing
     (void)method;
     (void)archive;
     (void)task_ptr;
   }
 
-  void AggregateOut(chi::u32 method, ctp::ipc::FullPtr<chi::Task> orig_task,
-                 const ctp::ipc::FullPtr<chi::Task>& replica_task) override {
+  void AggregateOut(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> orig_task,
+                 const ctp::ipc::FullPtr<clio::run::Task>& replica_task) override {
     (void)method;
     orig_task->AggregateOut(replica_task);
   }
 
-  void DelTask(chi::u32 method, ctp::ipc::FullPtr<chi::Task> task_ptr) override {
+  void DelTask(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> task_ptr) override {
     (void)method;
     auto *ipc_manager = CLIO_IPC;
     if (ipc_manager) {
@@ -636,11 +636,11 @@ TEST_CASE("Container Serialization Methods", "[task_archive][container]") {
   SECTION("Container SaveTask/LoadTask with SerializeIn mode") {
     TestContainer container;
     auto original_task = CreateTestTask();
-    ctp::ipc::FullPtr<chi::Task> task_ptr(original_task.get());
+    ctp::ipc::FullPtr<clio::run::Task> task_ptr(original_task.get());
 
     // Test SaveTask with SerializeIn mode (inputs)
-    chi::SaveTaskArchive save_archive(chi::MsgType::kSerializeIn);
-    chi::u32 method = task_ptr->method_;
+    clio::run::SaveTaskArchive save_archive(clio::run::MsgType::kSerializeIn);
+    clio::run::u32 method = task_ptr->method_;
     REQUIRE_NOTHROW(container.SaveTask(method, save_archive, task_ptr));
     std::string serialized_data = save_archive.GetData();
     REQUIRE_FALSE(serialized_data.empty());
@@ -649,28 +649,28 @@ TEST_CASE("Container Serialization Methods", "[task_archive][container]") {
     REQUIRE(save_archive.GetTaskInfos().size() == 1);
 
     // Test AllocLoadTask with SerializeIn mode (inputs)
-    chi::LoadTaskArchive load_archive(serialized_data);
-    load_archive.msg_type_ = chi::MsgType::kSerializeIn;
-    ctp::ipc::FullPtr<chi::Task> new_task_ptr;
+    clio::run::LoadTaskArchive load_archive(serialized_data);
+    load_archive.msg_type_ = clio::run::MsgType::kSerializeIn;
+    ctp::ipc::FullPtr<clio::run::Task> new_task_ptr;
     REQUIRE_NOTHROW(new_task_ptr = container.AllocLoadTask(method, load_archive));
   }
 
   SECTION("Container SaveTask/LoadTask with SerializeOut mode") {
     TestContainer container;
     auto original_task = CreateTestTask();
-    ctp::ipc::FullPtr<chi::Task> task_ptr(original_task.get());
+    ctp::ipc::FullPtr<clio::run::Task> task_ptr(original_task.get());
 
     // Test SaveTask with SerializeOut mode (outputs)
-    chi::SaveTaskArchive save_archive(chi::MsgType::kSerializeOut);
-    chi::u32 method = task_ptr->method_;
+    clio::run::SaveTaskArchive save_archive(clio::run::MsgType::kSerializeOut);
+    clio::run::u32 method = task_ptr->method_;
     REQUIRE_NOTHROW(container.SaveTask(method, save_archive, task_ptr));
     std::string serialized_data = save_archive.GetData();
     REQUIRE_FALSE(serialized_data.empty());
 
     // Test AllocLoadTask with SerializeOut mode (outputs)
-    chi::LoadTaskArchive load_archive(serialized_data);
-    load_archive.msg_type_ = chi::MsgType::kSerializeOut;
-    ctp::ipc::FullPtr<chi::Task> new_task_ptr;
+    clio::run::LoadTaskArchive load_archive(serialized_data);
+    load_archive.msg_type_ = clio::run::MsgType::kSerializeOut;
+    ctp::ipc::FullPtr<clio::run::Task> new_task_ptr;
     REQUIRE_NOTHROW(new_task_ptr = container.AllocLoadTask(method, load_archive));
   }
 }
@@ -682,7 +682,7 @@ TEST_CASE("Container Serialization Methods", "[task_archive][container]") {
 TEST_CASE("Error Handling and Edge Cases", "[task_archive][error_handling]") {
   SECTION("Invalid serialization data") {
     std::string invalid_data = "this is not valid serialized data";
-    chi::LoadTaskArchive archive(invalid_data);
+    clio::run::LoadTaskArchive archive(invalid_data);
 
     // Archive should be constructed without throwing
     REQUIRE_NOTHROW(archive.GetSendBulkCount());
@@ -690,13 +690,13 @@ TEST_CASE("Error Handling and Edge Cases", "[task_archive][error_handling]") {
 
   SECTION("Empty serialization data") {
     std::string empty_data = "";
-    chi::LoadTaskArchive archive(empty_data);
+    clio::run::LoadTaskArchive archive(empty_data);
 
     REQUIRE(archive.GetSendBulkCount() == 0);
   }
 
   SECTION("Bulk transfer with null pointer") {
-    chi::SaveTaskArchive archive(chi::MsgType::kSerializeIn);
+    clio::run::SaveTaskArchive archive(clio::run::MsgType::kSerializeIn);
     ctp::ipc::ShmPtr<> null_ptr = ctp::ipc::ShmPtr<>::GetNull();
 
     REQUIRE_NOTHROW(archive.bulk(null_ptr, 0, 0));
@@ -715,13 +715,13 @@ TEST_CASE("Performance and Large Data", "[task_archive][performance]") {
   SECTION("Large string serialization") {
     std::string large_string(10000, 'X'); // 10KB string
 
-    chi::SaveTaskArchive out_archive(chi::MsgType::kSerializeIn);
+    clio::run::SaveTaskArchive out_archive(clio::run::MsgType::kSerializeIn);
     REQUIRE_NOTHROW(out_archive << large_string);
 
     std::string serialized_data = out_archive.GetData();
     REQUIRE(serialized_data.size() > large_string.size()); // Should include serialization overhead
 
-    chi::LoadTaskArchive in_archive(serialized_data);
+    clio::run::LoadTaskArchive in_archive(serialized_data);
     std::string result_string;
     REQUIRE_NOTHROW(in_archive >> result_string);
 
@@ -731,10 +731,10 @@ TEST_CASE("Performance and Large Data", "[task_archive][performance]") {
   SECTION("Large vector serialization") {
     std::vector<double> large_vector(1000, 3.14159); // 1000 doubles
 
-    chi::SaveTaskArchive out_archive(chi::MsgType::kSerializeIn);
+    clio::run::SaveTaskArchive out_archive(clio::run::MsgType::kSerializeIn);
     out_archive << large_vector;
 
-    chi::LoadTaskArchive in_archive(out_archive.GetData());
+    clio::run::LoadTaskArchive in_archive(out_archive.GetData());
     std::vector<double> result_vector;
     in_archive >> result_vector;
 
@@ -748,12 +748,12 @@ TEST_CASE("Performance and Large Data", "[task_archive][performance]") {
 
     for (int i = 0; i < 10; ++i) {
       // Create tasks with unique TaskIds
-      auto task = std::make_unique<chi::Task>(chi::TaskId(1, 1, 1, 0, static_cast<chi::u32>(i)),
-                                              chi::PoolId(100, 0), chi::PoolQuery(),
-                                              chi::MethodId(42));
+      auto task = std::make_unique<clio::run::Task>(clio::run::TaskId(1, 1, 1, 0, static_cast<clio::run::u32>(i)),
+                                              clio::run::PoolId(100, 0), clio::run::PoolQuery(),
+                                              clio::run::MethodId(42));
       task->period_ns_ = 1000000.0 + i; // Vary the period to make tasks different
 
-      chi::SaveTaskArchive archive(chi::MsgType::kSerializeIn);
+      clio::run::SaveTaskArchive archive(clio::run::MsgType::kSerializeIn);
       archive << *task;
       serialized_tasks.push_back(archive.GetData());
     }
@@ -779,7 +779,7 @@ TEST_CASE("Complete Serialization Flow", "[task_archive][integration]") {
     auto original_task = CreateTestAdminTask();
 
     // Step 1: Serialize IN parameters (for sending task to remote node)
-    chi::SaveTaskArchive in_archive(chi::MsgType::kSerializeIn);
+    clio::run::SaveTaskArchive in_archive(clio::run::MsgType::kSerializeIn);
     in_archive << *original_task;
     std::string in_data = in_archive.GetData();
 
@@ -787,11 +787,11 @@ TEST_CASE("Complete Serialization Flow", "[task_archive][integration]") {
     REQUIRE(in_archive.GetTaskInfos().size() == 1);
 
     // Step 2: Simulate remote node receiving and deserializing IN parameters
-    chi::LoadTaskArchive recv_in_archive(in_data);
-    recv_in_archive.msg_type_ = chi::MsgType::kSerializeIn;
+    clio::run::LoadTaskArchive recv_in_archive(in_data);
+    recv_in_archive.msg_type_ = clio::run::MsgType::kSerializeIn;
     auto remote_task = CreateTestAdminTask();
-    remote_task->chimod_name_ = chi::priv::string(CTP_MALLOC, ""); // Clear
-    remote_task->pool_name_ = chi::priv::string(CTP_MALLOC, "");
+    remote_task->chimod_name_ = clio::run::priv::string(CTP_MALLOC, ""); // Clear
+    remote_task->pool_name_ = clio::run::priv::string(CTP_MALLOC, "");
     recv_in_archive >> *remote_task;
 
     // Verify IN parameters were transferred
@@ -803,19 +803,19 @@ TEST_CASE("Complete Serialization Flow", "[task_archive][integration]") {
     // Step 3: Simulate task execution and result generation on remote node
     remote_task->return_code_ = 123;
     remote_task->error_message_ =
-        chi::priv::string(CTP_MALLOC, "remote execution result");
+        clio::run::priv::string(CTP_MALLOC, "remote execution result");
 
     // Step 4: Serialize OUT parameters (for sending results back)
-    chi::SaveTaskArchive out_archive(chi::MsgType::kSerializeOut);
+    clio::run::SaveTaskArchive out_archive(clio::run::MsgType::kSerializeOut);
     out_archive << *remote_task;
     std::string out_data = out_archive.GetData();
 
     // Step 5: Simulate client receiving and deserializing OUT parameters
-    chi::LoadTaskArchive recv_out_archive(out_data);
-    recv_out_archive.msg_type_ = chi::MsgType::kSerializeOut;
+    clio::run::LoadTaskArchive recv_out_archive(out_data);
+    recv_out_archive.msg_type_ = clio::run::MsgType::kSerializeOut;
     auto final_task = CreateTestAdminTask();
     final_task->return_code_ = 0; // Clear
-    final_task->error_message_ = chi::priv::string(CTP_MALLOC, "");
+    final_task->error_message_ = clio::run::priv::string(CTP_MALLOC, "");
     recv_out_archive >> *final_task;
 
     // Verify OUT parameters were transferred back
@@ -835,11 +835,11 @@ TEST_CASE("Complete Serialization Flow", "[task_archive][integration]") {
     INFO("Testing network transport round-trip serialization");
 
     // Step 1: Create a SaveTaskArchive with test data
-    chi::SaveTaskArchive save_archive(chi::MsgType::kSerializeIn);
+    clio::run::SaveTaskArchive save_archive(clio::run::MsgType::kSerializeIn);
     auto original_task = CreateTestAdminTask();
-    original_task->chimod_name_ = chi::priv::string(CTP_MALLOC, "test_module");
-    original_task->pool_name_ = chi::priv::string(CTP_MALLOC, "test_pool");
-    original_task->pool_id_ = chi::PoolId(100, 200);
+    original_task->chimod_name_ = clio::run::priv::string(CTP_MALLOC, "test_module");
+    original_task->pool_name_ = clio::run::priv::string(CTP_MALLOC, "test_pool");
+    original_task->pool_id_ = clio::run::PoolId(100, 200);
     save_archive << *original_task;
 
     // Step 2: Serialize SaveTaskArchive using GlobalSerialize (mimics ZMQ Send)
@@ -854,7 +854,7 @@ TEST_CASE("Complete Serialization Flow", "[task_archive][integration]") {
     REQUIRE(network_data.size() > 0);
 
     // Step 3: Deserialize into LoadTaskArchive (mimics ZMQ RecvMetadata)
-    chi::LoadTaskArchive load_archive;
+    clio::run::LoadTaskArchive load_archive;
     {
       std::vector<char> recv_buf(network_data.begin(), network_data.end());
       ctp::ipc::GlobalDeserialize<std::vector<char>> ar(recv_buf);
@@ -862,21 +862,21 @@ TEST_CASE("Complete Serialization Flow", "[task_archive][integration]") {
     }
 
     // Step 4: Verify metadata was transferred correctly
-    REQUIRE(load_archive.GetMsgType() == chi::MsgType::kSerializeIn);
+    REQUIRE(load_archive.GetMsgType() == clio::run::MsgType::kSerializeIn);
     REQUIRE(load_archive.GetTaskInfos().size() == 1);
     const auto& task_info = load_archive.GetTaskInfos()[0];
-    REQUIRE(task_info.pool_id_ == chi::PoolId(100, 200));
+    REQUIRE(task_info.pool_id_ == clio::run::PoolId(100, 200));
 
     // Step 5: Deserialize the actual task from LoadTaskArchive
     auto recv_task = CreateTestAdminTask();
-    recv_task->chimod_name_ = chi::priv::string(CTP_MALLOC, "");
-    recv_task->pool_name_ = chi::priv::string(CTP_MALLOC, "");
+    recv_task->chimod_name_ = clio::run::priv::string(CTP_MALLOC, "");
+    recv_task->pool_name_ = clio::run::priv::string(CTP_MALLOC, "");
     load_archive >> *recv_task;
 
     // Step 6: Verify task data was transferred correctly
     REQUIRE(recv_task->chimod_name_.str() == "test_module");
     REQUIRE(recv_task->pool_name_.str() == "test_pool");
-    REQUIRE(recv_task->pool_id_ == chi::PoolId(100, 200));
+    REQUIRE(recv_task->pool_id_ == clio::run::PoolId(100, 200));
 
     INFO("Network transport round-trip simulation completed successfully");
   }
@@ -886,10 +886,10 @@ TEST_CASE("Complete Serialization Flow", "[task_archive][integration]") {
     INFO("Testing network transport round-trip with bulk data");
 
     // Step 1: Create a SaveTaskArchive with bulk data
-    chi::SaveTaskArchive save_archive(chi::MsgType::kSerializeIn);
+    clio::run::SaveTaskArchive save_archive(clio::run::MsgType::kSerializeIn);
     auto original_task = CreateTestAdminTask();
-    original_task->chimod_name_ = chi::priv::string(CTP_MALLOC, "bulk_module");
-    original_task->pool_name_ = chi::priv::string(CTP_MALLOC, "bulk_pool");
+    original_task->chimod_name_ = clio::run::priv::string(CTP_MALLOC, "bulk_module");
+    original_task->pool_name_ = clio::run::priv::string(CTP_MALLOC, "bulk_pool");
     save_archive << *original_task;
 
     // Add a bulk descriptor to the send vector
@@ -910,7 +910,7 @@ TEST_CASE("Complete Serialization Flow", "[task_archive][integration]") {
     REQUIRE(network_data.size() > 0);
 
     // Step 3: Deserialize into LoadTaskArchive
-    chi::LoadTaskArchive load_archive;
+    clio::run::LoadTaskArchive load_archive;
     {
       std::vector<char> recv_buf(network_data.begin(), network_data.end());
       ctp::ipc::GlobalDeserialize<std::vector<char>> ar(recv_buf);
@@ -923,7 +923,7 @@ TEST_CASE("Complete Serialization Flow", "[task_archive][integration]") {
     REQUIRE(load_archive.send[0].flags.Any(BULK_XFER));
 
     // Step 5: Verify task infos and message type
-    REQUIRE(load_archive.GetMsgType() == chi::MsgType::kSerializeIn);
+    REQUIRE(load_archive.GetMsgType() == clio::run::MsgType::kSerializeIn);
     REQUIRE(load_archive.GetTaskInfos().size() == 1);
 
     INFO("Network transport round-trip with bulk completed successfully");
@@ -936,7 +936,7 @@ int main(int argc, char *argv[]) {
   (void)argv;
 
   // Initialize CLIO Runtime runtime for memory management
-  bool runtime_success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
+  bool runtime_success = clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true);
   if (!runtime_success) {
     HLOG(kError, "Failed to initialize Chimaera runtime");
     return 1;

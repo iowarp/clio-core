@@ -195,7 +195,7 @@ class CopyWorkspaceFixture {
 
   CopyWorkspaceFixture() {
     if (!g_initialized) {
-      bool success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
+      bool success = clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true);
       REQUIRE(success);
 
       std::this_thread::sleep_for(std::chrono::milliseconds(500));
@@ -209,7 +209,7 @@ class CopyWorkspaceFixture {
 
       clio::cte::core::CreateParams params;
       auto create_task = cte_client->AsyncCreate(
-          chi::PoolQuery::Dynamic(), clio::cte::core::kCtePoolName,
+          clio::run::PoolQuery::Dynamic(), clio::cte::core::kCtePoolName,
           clio::cte::core::kCtePoolId, params);
       create_task.Wait();
       REQUIRE(create_task->GetReturnCode() == 0);

@@ -74,7 +74,7 @@ bool GlobalBlockMap::AllocateBlock(int worker, size_t io_size, Block &block) {
   size_t worker_idx = static_cast<size_t>(worker) % worker_maps_.size();
 
   {
-    chi::ScopedCoMutex lock(worker_locks_[worker_idx]);
+    clio::run::ScopedCoMutex lock(worker_locks_[worker_idx]);
     if (worker_maps_[worker_idx].AllocateBlock(block_type, block, io_size)) {
       return true;
     }
@@ -82,7 +82,7 @@ bool GlobalBlockMap::AllocateBlock(int worker, size_t io_size, Block &block) {
 
   for (size_t i = 1; i < worker_maps_.size(); ++i) {
     size_t other_worker = (worker_idx + i) % worker_maps_.size();
-    chi::ScopedCoMutex lock(worker_locks_[other_worker]);
+    clio::run::ScopedCoMutex lock(worker_locks_[other_worker]);
     if (worker_maps_[other_worker].AllocateBlock(block_type, block, io_size)) {
       return true;
     }
@@ -94,38 +94,38 @@ bool GlobalBlockMap::AllocateBlock(int worker, size_t io_size, Block &block) {
 bool GlobalBlockMap::FreeBlock(int worker, Block &block) {
   if (worker_maps_.empty()) return false;
   size_t worker_idx = static_cast<size_t>(worker) % worker_maps_.size();
-  chi::ScopedCoMutex lock(worker_locks_[worker_idx]);
+  clio::run::ScopedCoMutex lock(worker_locks_[worker_idx]);
   worker_maps_[worker_idx].FreeBlock(block);
   return true;
 }
 
 Heap::Heap() : heap_(0), total_size_(0), alignment_(4096) {}
 
-void Heap::Init(chi::u64 total_size, chi::u32 alignment) {
+void Heap::Init(clio::run::u64 total_size, clio::run::u32 alignment) {
   heap_.store(0);
   total_size_ = total_size;
   alignment_ = alignment;
 }
 
 bool Heap::Allocate(size_t block_size, int block_type, Block &block) {
-  chi::u32 alignment = (alignment_ == 0) ? 4096 : alignment_;
-  chi::u64 aligned_size =
+  clio::run::u32 alignment = (alignment_ == 0) ? 4096 : alignment_;
+  clio::run::u64 aligned_size =
       ((block_size + alignment - 1) / alignment) * alignment;
 
-  chi::u64 old_heap = heap_.fetch_add(aligned_size);
+  clio::run::u64 old_heap = heap_.fetch_add(aligned_size);
   if (total_size_ > 0 && old_heap + aligned_size > total_size_) {
     heap_.fetch_sub(aligned_size);
     return false;
   }
 
   block.offset_ = old_heap;
-  block.size_ = static_cast<chi::u64>(block_size);
-  block.block_type_ = static_cast<chi::u32>(block_type);
+  block.size_ = static_cast<clio::run::u64>(block_size);
+  block.block_type_ = static_cast<clio::run::u32>(block_type);
   return true;
 }
 
-chi::u64 Heap::GetRemainingSize() const {
-  chi::u64 current_heap = heap_.load();
+clio::run::u64 Heap::GetRemainingSize() const {
+  clio::run::u64 current_heap = heap_.load();
   if (total_size_ > current_heap) {
     return total_size_ - current_heap;
   }
@@ -133,7 +133,7 @@ chi::u64 Heap::GetRemainingSize() const {
 }
 
 bool StandardBlockAllocator::AllocateBlocks(size_t size, int worker_id, std::vector<Block>& blocks) {
-  chi::u64 total_size = size;
+  clio::run::u64 total_size = size;
   if (total_size == 0) {
     blocks.clear();
     return true;
@@ -146,7 +146,7 @@ bool StandardBlockAllocator::AllocateBlocks(size_t size, int worker_id, std::vec
     return true;
   }
 
-  chi::u64 aligned_total_size = AlignSize(total_size);
+  clio::run::u64 aligned_total_size = AlignSize(total_size);
   // Classify the fresh allocation by its size category so callers (and the
   // free list it returns to) see the correct block_type_. Previously this
   // hardcoded the largest category, so e.g. a 4KB allocation came back tagged
@@ -166,10 +166,10 @@ bool StandardBlockAllocator::AllocateBlocks(size_t size, int worker_id, std::vec
 }
 
 void StandardBlockAllocator::FreeBlocks(int worker_id, const std::vector<Block>& blocks) {
-  chi::u64 freed_bytes = 0;
+  clio::run::u64 freed_bytes = 0;
   for (const auto& block : blocks) {
     Block block_copy = block;
-    chi::u64 aligned_size = AlignSize(block.size_);
+    clio::run::u64 aligned_size = AlignSize(block.size_);
     block_copy.size_ = aligned_size;
     int bt = -1;
     for (int i = 0; i < static_cast<int>(BlockSizeCategory::kMaxCategories); ++i) {
@@ -179,18 +179,18 @@ void StandardBlockAllocator::FreeBlocks(int worker_id, const std::vector<Block>&
       }
     }
     if (bt == -1) bt = static_cast<int>(BlockSizeCategory::kMaxCategories) - 1;
-    block_copy.block_type_ = static_cast<chi::u32>(bt);
+    block_copy.block_type_ = static_cast<clio::run::u32>(bt);
     freed_bytes += block_copy.size_;
     global_block_map_.FreeBlock(worker_id, block_copy);
   }
 
-  chi::u64 cur = allocated_bytes_.load(std::memory_order_relaxed);
-  chi::u64 dec = std::min(cur, freed_bytes);
+  clio::run::u64 cur = allocated_bytes_.load(std::memory_order_relaxed);
+  clio::run::u64 dec = std::min(cur, freed_bytes);
   allocated_bytes_.fetch_sub(dec, std::memory_order_relaxed);
 }
 
-chi::u64 StandardBlockAllocator::GetRemainingSize() const {
-  chi::u64 live = allocated_bytes_.load(std::memory_order_relaxed);
+clio::run::u64 StandardBlockAllocator::GetRemainingSize() const {
+  clio::run::u64 live = allocated_bytes_.load(std::memory_order_relaxed);
   return (capacity_ > live) ? (capacity_ - live) : 0;
 }
 

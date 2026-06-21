@@ -42,18 +42,18 @@ namespace {
  * immediately because IpcGpu2Cpu::ClientSend is gated on
  * `threadIdx.x == 0` (other lanes get an empty future).
  */
-__global__ void ChiGpuKernelStress(chi::IpcManagerGpuInfo gpu_info,
+__global__ void ChiGpuKernelStress(clio::run::IpcManagerGpuInfo gpu_info,
                                     ctp::ipc::FullPtr<TaskT> *task_handles,
-                                    chi::u32 num_tasks) {
+                                    clio::run::u32 num_tasks) {
   CHIMAERA_GPU_INIT(gpu_info, /*ipc_ptr=*/nullptr);
   if (threadIdx.x != 0) return;
-  chi::u32 slot = blockIdx.x;
+  clio::run::u32 slot = blockIdx.x;
   if (slot >= num_tasks) return;
   // Use the kernel-scope `g_ipc_manager_ptr` (declared by CHIMAERA_GPU_INIT)
   // rather than the CLIO_IPC macro: NVCC compiles the kernel body in both
   // the host and device passes, and the host-pass expansion of CLIO_IPC
   // resolves the global `g_ipc_manager` symbol — which the macro shadows
-  // with a `chi::gpu::IpcManager&` local. Reaching through the typed
+  // with a `clio::run::gpu::IpcManager&` local. Reaching through the typed
   // pointer dodges that name collision and compiles cleanly in both passes.
   auto fp = task_handles[slot];
   auto fut = g_ipc_manager_ptr->Send(fp);
@@ -64,7 +64,7 @@ __global__ void ChiGpuKernelStress(chi::IpcManagerGpuInfo gpu_info,
 }  // namespace
 
 // NVCC parses every host TU in two passes; the host fixture below uses
-// chi::IpcManager APIs (GetGpuIpcManager, AllocateAndRegisterGpuBackend,
+// clio::run::IpcManager APIs (GetGpuIpcManager, AllocateAndRegisterGpuBackend,
 // PlaceTaskSlots) that are CTP_IS_HOST-only. Gate the TEST_CASE body so
 // only the host pass instantiates it. The __global__ kernel above remains
 // visible to both passes — NVCC needs the host stub for the launch glue.
@@ -75,12 +75,12 @@ TEST_CASE("GPU producer-only stress: kernel submits N tasks",
   using namespace chi_test_gpu_stress;
   EnsureInit();
   auto *ipc = CLIO_CPU_IPC;
-  const chi::u32 gpu_id = 0;
+  const clio::run::u32 gpu_id = 0;
 
   // 1. Allocate + register a pinned-host backend big enough for all slots.
   char *base = nullptr;
   ctp::ipc::AllocatorId alloc_id = ipc->AllocateAndRegisterGpuBackend(
-      gpu_id, chi::gpu::IpcManager::MemKind::kPinnedHost, kBackendBytes,
+      gpu_id, clio::run::gpu::IpcManager::MemKind::kPinnedHost, kBackendBytes,
       &base);
   REQUIRE(!alloc_id.IsNull());
   REQUIRE(base != nullptr);
@@ -93,10 +93,10 @@ TEST_CASE("GPU producer-only stress: kernel submits N tasks",
   ctp::ipc::FullPtr<TaskT> *task_handle_dev =
       ctp::GpuApi::MallocHost<ctp::ipc::FullPtr<TaskT>>(kNumTasks);
   REQUIRE(task_handle_dev != nullptr);
-  for (chi::u32 i = 0; i < kNumTasks; ++i) task_handle_dev[i] = handles[i];
+  for (clio::run::u32 i = 0; i < kNumTasks; ++i) task_handle_dev[i] = handles[i];
 
   // 4. Launch: one block per task, 32 threads (warp scheduler == lane 0).
-  chi::IpcManagerGpuInfo info = ipc->GetGpuIpcManager()->GetGpuInfo(gpu_id);
+  clio::run::IpcManagerGpuInfo info = ipc->GetGpuIpcManager()->GetGpuInfo(gpu_id);
   REQUIRE(info.gpu2cpu_queue != nullptr);
 
   std::fprintf(stderr,
@@ -106,7 +106,7 @@ TEST_CASE("GPU producer-only stress: kernel submits N tasks",
   ctp::GpuApi::Synchronize();
 
   // 5. Verify every slot saw the chimod's formula.
-  chi::u32 first_bad = VerifyResults(handles, gpu_id);
+  clio::run::u32 first_bad = VerifyResults(handles, gpu_id);
   REQUIRE(first_bad == kNumTasks);
   std::fprintf(stderr, "[STRESS] all %u tasks completed correctly\n",
                kNumTasks);

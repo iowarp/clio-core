@@ -55,8 +55,8 @@
 inline bool py_chimaera_init(int mode) {
   bool result = false;
   std::thread([&result, mode]() {
-    result = chi::CHIMAERA_INIT(
-        static_cast<chi::ChimaeraMode>(mode), false, false);
+    result = clio::run::CHIMAERA_INIT(
+        static_cast<clio::run::ChimaeraMode>(mode), false, false);
   }).join();
   return result;
 }
@@ -67,21 +67,21 @@ inline bool py_chimaera_init(int mode) {
  * Closes ZMQ sockets and joins background threads.
  */
 inline void py_chimaera_finalize() {
-  chi::CHIMAERA_FINALIZE();
+  clio::run::CHIMAERA_FINALIZE();
 }
 
 /**
  * Python-visible wrapper around a MonitorTask future.
  *
- * Owns the chi::Future and exposes a blocking wait() that returns
+ * Owns the clio::run::Future and exposes a blocking wait() that returns
  * the result map and frees the underlying C++ task.
  */
 class PyMonitorTask {
-  chi::Future<clio::run::admin::MonitorTask> future_;
+  clio::run::Future<clio::run::admin::MonitorTask> future_;
 
  public:
   /** @param f Moved-from future returned by AsyncMonitor */
-  explicit PyMonitorTask(chi::Future<clio::run::admin::MonitorTask>&& f)
+  explicit PyMonitorTask(clio::run::Future<clio::run::admin::MonitorTask>&& f)
       : future_(std::move(f)) {}
 
   PyMonitorTask(const PyMonitorTask&) = delete;
@@ -100,7 +100,7 @@ class PyMonitorTask {
    * @param max_sec Maximum seconds to wait (0 = wait indefinitely)
    * @return map of container-id to serialized result blob
    */
-  std::unordered_map<chi::ContainerId, std::string> wait(float max_sec = 0) {
+  std::unordered_map<clio::run::ContainerId, std::string> wait(float max_sec = 0) {
     bool ok = future_.Wait(max_sec);
     if (!ok) {
       // Recv() failed (server dead, timeout, etc.)
@@ -144,7 +144,7 @@ class PyMonitorTask {
 inline PyMonitorTask py_async_monitor(const std::string& pool_query_str,
                                       const std::string& query) {
   auto* admin = CLIO_ADMIN;
-  chi::PoolQuery pq = chi::PoolQuery::FromString(pool_query_str);
+  clio::run::PoolQuery pq = clio::run::PoolQuery::FromString(pool_query_str);
   auto future = admin->AsyncMonitor(pq, query);
   return PyMonitorTask(std::move(future));
 }
@@ -165,7 +165,7 @@ inline PyMonitorTask py_async_monitor(const std::string& pool_query_str,
 inline void py_stop_runtime(const std::string& pool_query_str,
                             uint32_t grace_period_ms = 5000) {
   auto* admin = CLIO_ADMIN;
-  chi::PoolQuery pq = chi::PoolQuery::FromString(pool_query_str);
+  clio::run::PoolQuery pq = clio::run::PoolQuery::FromString(pool_query_str);
   admin->AsyncStopRuntime(pq, 0, grace_period_ms);
 }
 

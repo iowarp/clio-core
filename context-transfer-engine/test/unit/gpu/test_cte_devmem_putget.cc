@@ -22,7 +22,7 @@
  *      then calls Send) and waits on the device-side gpu::FutureShm.
  *   2. CPU GPU worker pops the task, D2H-copies the POD into a host
  *      scratch slot, calls Container::FixupAfterCopy to relocate the
- *      chi::priv::string SSO data_ pointer, runs the chimod handler,
+ *      clio::run::priv::string SSO data_ pointer, runs the chimod handler,
  *      then H2D-copies the (mutated) POD back to the original device
  *      address and flips FUTURE_COMPLETE on the device fshm via
  *      cudaMemcpy.
@@ -62,12 +62,12 @@
 using namespace std::chrono_literals;
 
 namespace cte = clio::cte::core;
-using ChimaeraInit = chi::ChimaeraMode;
+using ChimaeraInit = clio::run::ChimaeraMode;
 
 namespace {
 
-constexpr chi::u32 kBlobBytes = 256;
-constexpr chi::u32 kPatternSeed = 0xC3u;
+constexpr clio::run::u32 kBlobBytes = 256;
+constexpr clio::run::u32 kPatternSeed = 0xC3u;
 constexpr const char *kBlobName = "kdev";  // SSO-friendly (≤ 23 chars)
 
 bool g_initialized = false;
@@ -78,31 +78,31 @@ void EnsureInit() {
 #if !CTP_IS_DEVICE_PASS
   if (g_initialized) return;
   std::fprintf(stderr, "[INIT] Bringing up Chimaera server\n");
-  REQUIRE(chi::CHIMAERA_INIT(chi::ChimaeraMode::kServer));
+  REQUIRE(clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kServer));
   REQUIRE(cte::CLIO_CTE_CLIENT_INIT());
   auto *cte_client = CLIO_CTE_CLIENT;
   REQUIRE(cte_client != nullptr);
   cte_client->Init(cte::kCtePoolId);
   cte::CreateParams params;
   auto create_task = cte_client->AsyncCreate(
-      chi::PoolQuery::Dynamic(), cte::kCtePoolName, cte::kCtePoolId, params);
+      clio::run::PoolQuery::Dynamic(), cte::kCtePoolName, cte::kCtePoolId, params);
   create_task.Wait();
   REQUIRE(create_task->GetReturnCode() == 0);
   std::this_thread::sleep_for(50ms);
 
   // Register a kRam bdev target so PutBlob has somewhere to land.
-  const chi::u64 kRamCapacity = 64ULL << 20;  // 64 MiB
-  chi::PoolId bdev_pool_id(960, 0);
+  const clio::run::u64 kRamCapacity = 64ULL << 20;  // 64 MiB
+  clio::run::PoolId bdev_pool_id(960, 0);
   clio::run::bdev::Client bdev_client(bdev_pool_id);
   auto bdev_create = bdev_client.AsyncCreate(
-      chi::PoolQuery::Dynamic(), std::string("cte_devmem_ram"),
+      clio::run::PoolQuery::Dynamic(), std::string("cte_devmem_ram"),
       bdev_pool_id, clio::run::bdev::BdevType::kRam, kRamCapacity);
   bdev_create.Wait();
   REQUIRE(bdev_create->GetReturnCode() == 0);
   std::this_thread::sleep_for(50ms);
   auto reg_task = cte_client->AsyncRegisterTarget(
       "cte_devmem_ram", clio::run::bdev::BdevType::kRam, kRamCapacity,
-      chi::PoolQuery::Local(), bdev_pool_id);
+      clio::run::PoolQuery::Local(), bdev_pool_id);
   reg_task.Wait();
   REQUIRE(reg_task->GetReturnCode() == 0);
   std::this_thread::sleep_for(50ms);
@@ -122,14 +122,14 @@ void EnsureInit() {
 }  // namespace
 
 /** Fill the blob_data buffer on device with the byte pattern. */
-__global__ void DevMemFillKernel(char *buf, chi::u32 size, chi::u32 seed) {
-  chi::u32 i = blockIdx.x * blockDim.x + threadIdx.x;
+__global__ void DevMemFillKernel(char *buf, clio::run::u32 size, clio::run::u32 seed) {
+  clio::run::u32 i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= size) return;
   buf[i] = static_cast<char>((seed ^ i) & 0xFFu);
 }
 
 /** Submit one pre-built device-resident task and wait for completion. */
-__global__ void DevMemSubmitPutKernel(chi::IpcManagerGpuInfo info,
+__global__ void DevMemSubmitPutKernel(clio::run::IpcManagerGpuInfo info,
                                        ctp::ipc::FullPtr<cte::PutBlobTask> task) {
   CHIMAERA_GPU_INIT(info, /*ipc_ptr=*/nullptr);
   if (threadIdx.x != 0) return;
@@ -138,7 +138,7 @@ __global__ void DevMemSubmitPutKernel(chi::IpcManagerGpuInfo info,
   (void)g_ipc_manager;
 }
 
-__global__ void DevMemSubmitGetKernel(chi::IpcManagerGpuInfo info,
+__global__ void DevMemSubmitGetKernel(clio::run::IpcManagerGpuInfo info,
                                        ctp::ipc::FullPtr<cte::GetBlobTask> task) {
   CHIMAERA_GPU_INIT(info, /*ipc_ptr=*/nullptr);
   if (threadIdx.x != 0) return;
@@ -149,11 +149,11 @@ __global__ void DevMemSubmitGetKernel(chi::IpcManagerGpuInfo info,
 
 /** Verify the byte pattern on the device-resident GET buffer (host
  *  reads it back via cudaMemcpy after the kernel returns). */
-chi::u32 VerifyDevicePattern(const char *device_buf, chi::u32 size,
-                              chi::u32 seed) {
+clio::run::u32 VerifyDevicePattern(const char *device_buf, clio::run::u32 size,
+                              clio::run::u32 seed) {
   std::vector<char> host(size);
   ctp::GpuApi::Memcpy(host.data(), device_buf, size);
-  for (chi::u32 i = 0; i < size; ++i) {
+  for (clio::run::u32 i = 0; i < size; ++i) {
     char want = static_cast<char>((seed ^ i) & 0xFFu);
     if (host[i] != want) return i;
   }
@@ -169,20 +169,20 @@ TEST_CASE("CTE PutBlob+GetBlob round trip with device-memory task & data",
   REQUIRE(ipc->GetGpuIpcManager() != nullptr);
   REQUIRE(ipc->GetGpuQueueCount() >= 1u);
 
-  chi::IpcManagerGpuInfo gpu_info =
+  clio::run::IpcManagerGpuInfo gpu_info =
       ipc->GetGpuIpcManager()->GetGpuInfo(/*gpu_id=*/0);
   REQUIRE(gpu_info.gpu2cpu_queue != nullptr);
 
   // ---- 1) Allocate kDeviceMem backends ----
   // (a) Task slots: PutBlobTask + FutureShm + GetBlobTask + FutureShm.
-  const chi::u32 kPutSlot = sizeof(cte::PutBlobTask) +
-                             sizeof(chi::gpu::FutureShm);
-  const chi::u32 kGetSlot = sizeof(cte::GetBlobTask) +
-                             sizeof(chi::gpu::FutureShm);
-  const chi::u32 kTaskBackendBytes = kPutSlot + kGetSlot + 64;
+  const clio::run::u32 kPutSlot = sizeof(cte::PutBlobTask) +
+                             sizeof(clio::run::gpu::FutureShm);
+  const clio::run::u32 kGetSlot = sizeof(cte::GetBlobTask) +
+                             sizeof(clio::run::gpu::FutureShm);
+  const clio::run::u32 kTaskBackendBytes = kPutSlot + kGetSlot + 64;
   char *task_dev_base = nullptr;
   auto task_alloc_id = ipc->AllocateAndRegisterGpuBackend(
-      /*gpu_id=*/0, chi::gpu::IpcManager::MemKind::kDeviceMem,
+      /*gpu_id=*/0, clio::run::gpu::IpcManager::MemKind::kDeviceMem,
       kTaskBackendBytes, &task_dev_base);
   REQUIRE(!task_alloc_id.IsNull());
   REQUIRE(task_dev_base != nullptr);
@@ -190,7 +190,7 @@ TEST_CASE("CTE PutBlob+GetBlob round trip with device-memory task & data",
   // (b) Blob data: a single 256-byte buffer used for both Put and Get.
   char *blob_dev = nullptr;
   auto blob_alloc_id = ipc->AllocateAndRegisterGpuBackend(
-      /*gpu_id=*/0, chi::gpu::IpcManager::MemKind::kDeviceMem,
+      /*gpu_id=*/0, clio::run::gpu::IpcManager::MemKind::kDeviceMem,
       kBlobBytes, &blob_dev);
   REQUIRE(!blob_alloc_id.IsNull());
   REQUIRE(blob_dev != nullptr);
@@ -202,14 +202,14 @@ TEST_CASE("CTE PutBlob+GetBlob round trip with device-memory task & data",
   std::memset(put_proto, 0, sizeof(put_proto));
   ctp::ipc::ShmPtr<> put_blob_shm;
   put_blob_shm.alloc_id_.SetNull();
-  put_blob_shm.off_ = reinterpret_cast<chi::u64>(blob_dev);
+  put_blob_shm.off_ = reinterpret_cast<clio::run::u64>(blob_dev);
   auto *put_proto_task = new (put_proto) cte::PutBlobTask(
-      chi::CreateTaskId(), cte::kCtePoolId, chi::PoolQuery::ToLocalCpu(),
-      g_tag_id, kBlobName, /*offset=*/chi::u64(0),
-      static_cast<chi::u64>(kBlobBytes), put_blob_shm,
-      /*score=*/-1.0f, cte::Context(), /*flags=*/chi::u32(0));
+      clio::run::CreateTaskId(), cte::kCtePoolId, clio::run::PoolQuery::ToLocalCpu(),
+      g_tag_id, kBlobName, /*offset=*/clio::run::u64(0),
+      static_cast<clio::run::u64>(kBlobBytes), put_blob_shm,
+      /*score=*/-1.0f, cte::Context(), /*flags=*/clio::run::u32(0));
   put_proto_task->pod_size_ = sizeof(cte::PutBlobTask);
-  new (put_proto + sizeof(cte::PutBlobTask)) chi::gpu::FutureShm();
+  new (put_proto + sizeof(cte::PutBlobTask)) clio::run::gpu::FutureShm();
   ctp::GpuApi::Memcpy(task_dev_base, put_proto, sizeof(put_proto));
 
   // GetBlob prototype:
@@ -217,19 +217,19 @@ TEST_CASE("CTE PutBlob+GetBlob round trip with device-memory task & data",
   std::memset(get_proto, 0, sizeof(get_proto));
   ctp::ipc::ShmPtr<> get_blob_shm;
   get_blob_shm.alloc_id_.SetNull();
-  get_blob_shm.off_ = reinterpret_cast<chi::u64>(blob_dev);
+  get_blob_shm.off_ = reinterpret_cast<clio::run::u64>(blob_dev);
   auto *get_proto_task = new (get_proto) cte::GetBlobTask(
-      chi::CreateTaskId(), cte::kCtePoolId, chi::PoolQuery::ToLocalCpu(),
-      g_tag_id, kBlobName, /*offset=*/chi::u64(0),
-      static_cast<chi::u64>(kBlobBytes), /*flags=*/chi::u32(0),
+      clio::run::CreateTaskId(), cte::kCtePoolId, clio::run::PoolQuery::ToLocalCpu(),
+      g_tag_id, kBlobName, /*offset=*/clio::run::u64(0),
+      static_cast<clio::run::u64>(kBlobBytes), /*flags=*/clio::run::u32(0),
       get_blob_shm);
   get_proto_task->pod_size_ = sizeof(cte::GetBlobTask);
-  new (get_proto + sizeof(cte::GetBlobTask)) chi::gpu::FutureShm();
+  new (get_proto + sizeof(cte::GetBlobTask)) clio::run::gpu::FutureShm();
   ctp::GpuApi::Memcpy(task_dev_base + kPutSlot, get_proto, sizeof(get_proto));
 
   // ---- 3) Fill blob_data on device with the source pattern. ----
-  chi::u32 fill_threads = 256;
-  chi::u32 fill_blocks = (kBlobBytes + fill_threads - 1) / fill_threads;
+  clio::run::u32 fill_threads = 256;
+  clio::run::u32 fill_blocks = (kBlobBytes + fill_threads - 1) / fill_threads;
   DevMemFillKernel<<<fill_blocks, fill_threads>>>(blob_dev, kBlobBytes,
                                                     kPatternSeed);
   ctp::GpuApi::Synchronize();
@@ -238,12 +238,12 @@ TEST_CASE("CTE PutBlob+GetBlob round trip with device-memory task & data",
   //         stashed in off_, null alloc_id). ----
   ctp::ipc::FullPtr<cte::PutBlobTask> put_fp;
   put_fp.shm_.alloc_id_.SetNull();
-  put_fp.shm_.off_ = reinterpret_cast<chi::u64>(task_dev_base);
+  put_fp.shm_.off_ = reinterpret_cast<clio::run::u64>(task_dev_base);
   put_fp.ptr_ = reinterpret_cast<cte::PutBlobTask *>(task_dev_base);
   ctp::ipc::FullPtr<cte::GetBlobTask> get_fp;
   get_fp.shm_.alloc_id_.SetNull();
   get_fp.shm_.off_ =
-      reinterpret_cast<chi::u64>(task_dev_base + kPutSlot);
+      reinterpret_cast<clio::run::u64>(task_dev_base + kPutSlot);
   get_fp.ptr_ = reinterpret_cast<cte::GetBlobTask *>(
       task_dev_base + kPutSlot);
 
@@ -287,7 +287,7 @@ TEST_CASE("CTE PutBlob+GetBlob round trip with device-memory task & data",
   REQUIRE(get_after.return_code_.load() == 0u);
 
   // ---- 8) Verify the device buffer contains the original pattern. ----
-  chi::u32 first_bad = VerifyDevicePattern(blob_dev, kBlobBytes,
+  clio::run::u32 first_bad = VerifyDevicePattern(blob_dev, kBlobBytes,
                                             kPatternSeed);
   if (first_bad != kBlobBytes) {
     std::fprintf(stderr,

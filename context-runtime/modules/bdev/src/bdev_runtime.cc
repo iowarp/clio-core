@@ -22,12 +22,12 @@
 
 namespace clio::run::bdev {
 
-chi::TaskStat Runtime::GetTaskStats(const chi::Task *task) const {
-  if (!task) return chi::TaskStat();
+clio::run::TaskStat Runtime::GetTaskStats(const clio::run::Task *task) const {
+  if (!task) return clio::run::TaskStat();
   switch (task->method_) {
     case Method::kWrite: {
       auto *wt = static_cast<const WriteTask *>(task);
-      chi::TaskStat stat;
+      clio::run::TaskStat stat;
       stat.io_size_ = wt->length_;
       size_t aligned = ((stat.io_size_ + 4095) / 4096) * 4096;
       stat.wall_time_ = static_cast<float>(aligned) / 500.0f;
@@ -35,27 +35,27 @@ chi::TaskStat Runtime::GetTaskStats(const chi::Task *task) const {
     }
     case Method::kRead: {
       auto *rt = static_cast<const ReadTask *>(task);
-      chi::TaskStat stat;
+      clio::run::TaskStat stat;
       stat.io_size_ = rt->length_;
       size_t aligned = ((stat.io_size_ + 4095) / 4096) * 4096;
       stat.wall_time_ = static_cast<float>(aligned) / 500.0f;
       return stat;
     }
-    default: return chi::TaskStat();
+    default: return clio::run::TaskStat();
   }
 }
 
-size_t Runtime::GetWorkerID(chi::RunContext &ctx) {
-  chi::Worker *worker = CLIO_CUR_WORKER;
+size_t Runtime::GetWorkerID(clio::run::RunContext &ctx) {
+  clio::run::Worker *worker = CLIO_CUR_WORKER;
   if (worker == nullptr) {
     return 0;
   }
   return worker->GetId();
 }
 
-chi::TaskResume Runtime::Create(ctp::ipc::FullPtr<CreateTask> task, chi::RunContext &ctx) {
+clio::run::TaskResume Runtime::Create(ctp::ipc::FullPtr<CreateTask> task, clio::run::RunContext &ctx) {
 #ifdef __NVCOMPILER
-  chi::RunContext& rctx = ctx;
+  clio::run::RunContext& rctx = ctx;
 #else
   (void)ctx;
 #endif
@@ -95,8 +95,8 @@ chi::TaskResume Runtime::Create(ctp::ipc::FullPtr<CreateTask> task, chi::RunCont
   CLIO_TASK_BODY_END
 }
 
-chi::TaskResume Runtime::AllocateBlocks(ctp::ipc::FullPtr<AllocateBlocksTask> task, chi::RunContext &ctx) {
-  chi::RunContext& rctx = ctx;
+clio::run::TaskResume Runtime::AllocateBlocks(ctp::ipc::FullPtr<AllocateBlocksTask> task, clio::run::RunContext &ctx) {
+  clio::run::RunContext& rctx = ctx;
   CLIO_TASK_BODY_BEGIN
 
   if (bdev_type_ == BdevType::kNoop) {
@@ -122,8 +122,8 @@ chi::TaskResume Runtime::AllocateBlocks(ctp::ipc::FullPtr<AllocateBlocksTask> ta
   CLIO_TASK_BODY_END
 }
 
-chi::TaskResume Runtime::FreeBlocks(ctp::ipc::FullPtr<FreeBlocksTask> task, chi::RunContext &ctx) {
-  chi::RunContext& rctx = ctx;
+clio::run::TaskResume Runtime::FreeBlocks(ctp::ipc::FullPtr<FreeBlocksTask> task, clio::run::RunContext &ctx) {
+  clio::run::RunContext& rctx = ctx;
   CLIO_TASK_BODY_BEGIN
 
   if (bdev_type_ == BdevType::kNoop) {
@@ -144,8 +144,8 @@ chi::TaskResume Runtime::FreeBlocks(ctp::ipc::FullPtr<FreeBlocksTask> task, chi:
   CLIO_TASK_BODY_END
 }
 
-chi::TaskResume Runtime::Write(ctp::ipc::FullPtr<WriteTask> task, chi::RunContext &ctx) {
-  chi::RunContext& rctx = ctx;
+clio::run::TaskResume Runtime::Write(ctp::ipc::FullPtr<WriteTask> task, clio::run::RunContext &ctx) {
+  clio::run::RunContext& rctx = ctx;
   CLIO_TASK_BODY_BEGIN
 
   if (bdev_type_ == BdevType::kNoop) {
@@ -167,8 +167,8 @@ chi::TaskResume Runtime::Write(ctp::ipc::FullPtr<WriteTask> task, chi::RunContex
   CLIO_TASK_BODY_END
 }
 
-chi::TaskResume Runtime::Read(ctp::ipc::FullPtr<ReadTask> task, chi::RunContext &ctx) {
-  chi::RunContext& rctx = ctx;
+clio::run::TaskResume Runtime::Read(ctp::ipc::FullPtr<ReadTask> task, clio::run::RunContext &ctx) {
+  clio::run::RunContext& rctx = ctx;
   CLIO_TASK_BODY_BEGIN
 
   if (bdev_type_ == BdevType::kNoop) {
@@ -190,15 +190,15 @@ chi::TaskResume Runtime::Read(ctp::ipc::FullPtr<ReadTask> task, chi::RunContext 
   CLIO_TASK_BODY_END
 }
 
-chi::TaskResume Runtime::Update(ctp::ipc::FullPtr<UpdateTask> task, chi::RunContext &ctx) {
+clio::run::TaskResume Runtime::Update(ctp::ipc::FullPtr<UpdateTask> task, clio::run::RunContext &ctx) {
   task->return_code_ = 0;
   (void)ctx;
   co_return;
 }
 
-chi::TaskResume Runtime::GetStats(ctp::ipc::FullPtr<GetStatsTask> task, chi::RunContext &ctx) {
+clio::run::TaskResume Runtime::GetStats(ctp::ipc::FullPtr<GetStatsTask> task, clio::run::RunContext &ctx) {
 #ifdef __NVCOMPILER
-  chi::RunContext& rctx = ctx;
+  clio::run::RunContext& rctx = ctx;
 #else
   (void)ctx;
 #endif
@@ -209,8 +209,8 @@ chi::TaskResume Runtime::GetStats(ctp::ipc::FullPtr<GetStatsTask> task, chi::Run
   WriteTask w_synthetic;
   w_synthetic.method_ = Method::kWrite;
   w_synthetic.length_ = 1024 * 1024;
-  chi::TaskStat read_stat = GetTaskStats(&r_synthetic);
-  chi::TaskStat write_stat = GetTaskStats(&w_synthetic);
+  clio::run::TaskStat read_stat = GetTaskStats(&r_synthetic);
+  clio::run::TaskStat write_stat = GetTaskStats(&w_synthetic);
   float read_wall_us = InferWallClockTime(Method::kRead, read_stat);
   float write_wall_us = InferWallClockTime(Method::kWrite, write_stat);
   double read_size_mb = static_cast<double>(read_stat.io_size_) / (1024.0 * 1024.0);
@@ -234,9 +234,9 @@ chi::TaskResume Runtime::GetStats(ctp::ipc::FullPtr<GetStatsTask> task, chi::Run
   CLIO_TASK_BODY_END
 }
 
-chi::TaskResume Runtime::Destroy(ctp::ipc::FullPtr<DestroyTask> task, chi::RunContext &ctx) {
+clio::run::TaskResume Runtime::Destroy(ctp::ipc::FullPtr<DestroyTask> task, clio::run::RunContext &ctx) {
 #ifdef __NVCOMPILER
-  chi::RunContext& rctx = ctx;
+  clio::run::RunContext& rctx = ctx;
 #else
   (void)ctx;
 #endif
@@ -250,9 +250,9 @@ chi::TaskResume Runtime::Destroy(ctp::ipc::FullPtr<DestroyTask> task, chi::RunCo
   CLIO_TASK_BODY_END
 }
 
-chi::u64 Runtime::GetWorkRemaining() const { return 0; }
+clio::run::u64 Runtime::GetWorkRemaining() const { return 0; }
 
-chi::TaskResume Runtime::Monitor(ctp::ipc::FullPtr<MonitorTask> task, chi::RunContext &rctx) {
+clio::run::TaskResume Runtime::Monitor(ctp::ipc::FullPtr<MonitorTask> task, clio::run::RunContext &rctx) {
   CLIO_TASK_BODY_BEGIN
   (void)rctx;
   if (task->query_ == "stats") {
@@ -262,8 +262,8 @@ chi::TaskResume Runtime::Monitor(ctp::ipc::FullPtr<MonitorTask> task, chi::RunCo
     WriteTask w_synthetic;
     w_synthetic.method_ = Method::kWrite;
     w_synthetic.length_ = 1024 * 1024;
-    chi::TaskStat read_stat = GetTaskStats(&r_synthetic);
-    chi::TaskStat write_stat = GetTaskStats(&w_synthetic);
+    clio::run::TaskStat read_stat = GetTaskStats(&r_synthetic);
+    clio::run::TaskStat write_stat = GetTaskStats(&w_synthetic);
     float read_wall_us = InferWallClockTime(Method::kRead, read_stat);
     float write_wall_us = InferWallClockTime(Method::kWrite, write_stat);
     double read_size_mb = static_cast<double>(read_stat.io_size_) / (1024.0 * 1024.0);
@@ -278,7 +278,7 @@ chi::TaskResume Runtime::Monitor(ctp::ipc::FullPtr<MonitorTask> task, chi::RunCo
 
     pk.pack_map(14);
     pk.pack("pool_name");              pk.pack(pool_name_);
-    pk.pack("bdev_type");              pk.pack(static_cast<chi::u32>(bdev_type_));
+    pk.pack("bdev_type");              pk.pack(static_cast<clio::run::u32>(bdev_type_));
     pk.pack("total_capacity");         pk.pack(transport_ ? transport_->GetCapacity() : 0);
     pk.pack("remaining_capacity");     pk.pack(transport_ ? transport_->GetRemainingSize() : 0);
     pk.pack("read_bandwidth_mbps");    pk.pack(read_bw);

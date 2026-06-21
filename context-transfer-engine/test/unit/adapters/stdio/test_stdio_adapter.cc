@@ -33,7 +33,7 @@ bool initializeRuntime() {
   static bool initialized = false;
   if (initialized) return true;
 
-  if (!chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true)) {
+  if (!clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true)) {
     INFO("Chimaera init failed");
     return false;
   }
@@ -43,15 +43,15 @@ bool initializeRuntime() {
   }
   // Give the CTE core pool a file-backed storage target.
   auto *cte_client = CLIO_CTE_CLIENT;
-  chi::PoolId bdev_pool_id(951, 0);
+  clio::run::PoolId bdev_pool_id(951, 0);
   clio::run::bdev::Client bdev_client(bdev_pool_id);
   auto create_task = bdev_client.AsyncCreate(
-      chi::PoolQuery::Dynamic(), kBackend, bdev_pool_id,
+      clio::run::PoolQuery::Dynamic(), kBackend, bdev_pool_id,
       clio::run::bdev::BdevType::kFile);
   create_task.Wait();
   auto reg_task = cte_client->AsyncRegisterTarget(
       kBackend, clio::run::bdev::BdevType::kFile, kSmall * 64,
-      chi::PoolQuery::Local(), bdev_pool_id);
+      clio::run::PoolQuery::Local(), bdev_pool_id);
   reg_task.Wait();
   if (reg_task->GetReturnCode() != 0) {
     INFO("Failed to register target, rc=" << reg_task->GetReturnCode());

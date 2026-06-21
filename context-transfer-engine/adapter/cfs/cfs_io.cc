@@ -24,7 +24,7 @@ bool CfsIo::EnsureClient() {
 }
 
 bool CfsIo::QueryGetattr(const std::string &path, bool *exists,
-                         chi::u64 *size) {
+                         clio::run::u64 *size) {
   if (!EnsureClient()) {
     return false;
   }
@@ -39,7 +39,7 @@ bool CfsIo::QueryGetattr(const std::string &path, bool *exists,
   return true;
 }
 
-bool CfsIo::QuerySize(const std::string &path, chi::u64 *size) {
+bool CfsIo::QuerySize(const std::string &path, clio::run::u64 *size) {
   bool exists = false;
   if (!QueryGetattr(path, &exists, size)) {
     return false;
@@ -50,7 +50,7 @@ bool CfsIo::QuerySize(const std::string &path, chi::u64 *size) {
   return true;
 }
 
-ssize_t CfsIo::DoRead(chi::u64 handle, chi::u64 off, void *buf, size_t count) {
+ssize_t CfsIo::DoRead(clio::run::u64 handle, clio::run::u64 off, void *buf, size_t count) {
   if (count == 0) {
     return 0;
   }
@@ -79,7 +79,7 @@ ssize_t CfsIo::DoRead(chi::u64 handle, chi::u64 off, void *buf, size_t count) {
   return ret;
 }
 
-ssize_t CfsIo::DoWrite(chi::u64 handle, chi::u64 off, const void *buf,
+ssize_t CfsIo::DoWrite(clio::run::u64 handle, clio::run::u64 off, const void *buf,
                        size_t count) {
   if (count == 0) {
     return 0;
@@ -113,8 +113,8 @@ int CfsIo::Open(const std::string &raw_path, int flags, int mode) {
   }
   std::string path = StripClioPrefix(raw_path);
   auto *cfs = CLIO_CFS_CLIENT;
-  auto t = cfs->AsyncOpen(path, static_cast<chi::u32>(flags),
-                          static_cast<chi::u32>(mode));
+  auto t = cfs->AsyncOpen(path, static_cast<clio::run::u32>(flags),
+                          static_cast<clio::run::u32>(mode));
   t.Wait();
   if (t->GetReturnCode() != 0) {
     errno = EIO;
@@ -125,7 +125,7 @@ int CfsIo::Open(const std::string &raw_path, int flags, int mode) {
     errno = ENOENT;
     return -1;
   }
-  chi::u64 size = t->size_;
+  clio::run::u64 size = t->size_;
   // O_TRUNC: drop the logical size to zero.
   if (flags & O_TRUNC) {
     auto tr = cfs->AsyncTruncate(path, 0);
@@ -144,7 +144,7 @@ int CfsIo::Open(const std::string &raw_path, int flags, int mode) {
 }
 
 ssize_t CfsIo::Read(int fd, void *buf, size_t count) {
-  chi::u64 handle, off;
+  clio::run::u64 handle, off;
   {
     std::lock_guard<std::mutex> g(mu_);
     auto it = fds_.find(fd);
@@ -160,14 +160,14 @@ ssize_t CfsIo::Read(int fd, void *buf, size_t count) {
     std::lock_guard<std::mutex> g(mu_);
     auto it = fds_.find(fd);
     if (it != fds_.end()) {
-      it->second.off += static_cast<chi::u64>(n);
+      it->second.off += static_cast<clio::run::u64>(n);
     }
   }
   return n;
 }
 
 ssize_t CfsIo::Write(int fd, const void *buf, size_t count) {
-  chi::u64 handle, off;
+  clio::run::u64 handle, off;
   {
     std::lock_guard<std::mutex> g(mu_);
     auto it = fds_.find(fd);
@@ -183,14 +183,14 @@ ssize_t CfsIo::Write(int fd, const void *buf, size_t count) {
     std::lock_guard<std::mutex> g(mu_);
     auto it = fds_.find(fd);
     if (it != fds_.end()) {
-      it->second.off += static_cast<chi::u64>(n);
+      it->second.off += static_cast<clio::run::u64>(n);
     }
   }
   return n;
 }
 
 ssize_t CfsIo::Pread(int fd, void *buf, size_t count, off_t offset) {
-  chi::u64 handle;
+  clio::run::u64 handle;
   {
     std::lock_guard<std::mutex> g(mu_);
     auto it = fds_.find(fd);
@@ -200,11 +200,11 @@ ssize_t CfsIo::Pread(int fd, void *buf, size_t count, off_t offset) {
     }
     handle = it->second.handle;
   }
-  return DoRead(handle, static_cast<chi::u64>(offset), buf, count);
+  return DoRead(handle, static_cast<clio::run::u64>(offset), buf, count);
 }
 
 ssize_t CfsIo::Pwrite(int fd, const void *buf, size_t count, off_t offset) {
-  chi::u64 handle;
+  clio::run::u64 handle;
   {
     std::lock_guard<std::mutex> g(mu_);
     auto it = fds_.find(fd);
@@ -214,12 +214,12 @@ ssize_t CfsIo::Pwrite(int fd, const void *buf, size_t count, off_t offset) {
     }
     handle = it->second.handle;
   }
-  return DoWrite(handle, static_cast<chi::u64>(offset), buf, count);
+  return DoWrite(handle, static_cast<clio::run::u64>(offset), buf, count);
 }
 
 off_t CfsIo::Seek(int fd, off_t offset, int whence) {
   std::string path;
-  chi::u64 cur;
+  clio::run::u64 cur;
   {
     std::lock_guard<std::mutex> g(mu_);
     auto it = fds_.find(fd);
@@ -230,7 +230,7 @@ off_t CfsIo::Seek(int fd, off_t offset, int whence) {
     path = it->second.path;
     cur = it->second.off;
   }
-  chi::u64 base = 0;
+  clio::run::u64 base = 0;
   switch (whence) {
     case SEEK_SET:
       base = 0;
@@ -239,7 +239,7 @@ off_t CfsIo::Seek(int fd, off_t offset, int whence) {
       base = cur;
       break;
     case SEEK_END: {
-      chi::u64 size = 0;
+      clio::run::u64 size = 0;
       if (!QuerySize(path, &size)) {
         errno = EIO;
         return -1;
@@ -262,7 +262,7 @@ off_t CfsIo::Seek(int fd, off_t offset, int whence) {
     errno = EBADF;
     return -1;
   }
-  it->second.off = static_cast<chi::u64>(newoff);
+  it->second.off = static_cast<clio::run::u64>(newoff);
   return newoff;
 }
 
@@ -287,7 +287,7 @@ off_t CfsIo::SizeFd(int fd) {
     }
     path = it->second.path;
   }
-  chi::u64 size = 0;
+  clio::run::u64 size = 0;
   if (!QuerySize(path, &size)) {
     return -1;
   }
@@ -320,7 +320,7 @@ int CfsIo::TruncatePath(const std::string &raw_path, off_t length) {
   }
   std::string path = StripClioPrefix(raw_path);
   auto *cfs = CLIO_CFS_CLIENT;
-  auto t = cfs->AsyncTruncate(path, static_cast<chi::u64>(length));
+  auto t = cfs->AsyncTruncate(path, static_cast<clio::run::u64>(length));
   t.Wait();
   if (t->GetReturnCode() != 0) {
     errno = EIO;
@@ -346,7 +346,7 @@ int CfsIo::RemovePath(const std::string &raw_path) {
 }
 
 int CfsIo::Close(int fd) {
-  chi::u64 handle;
+  clio::run::u64 handle;
   {
     std::lock_guard<std::mutex> g(mu_);
     auto it = fds_.find(fd);

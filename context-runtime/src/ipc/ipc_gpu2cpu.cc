@@ -19,7 +19,7 @@ namespace clio::run {
 /**
  * RuntimeRecv: producer-only — the GPU never serializes a task through
  * lightbeam. Worker::ProcessNewTaskGpu already wrapped the popped task
- * pointer in a chi::Future<Task> (for kDeviceMem the wrapped pointer
+ * pointer in a clio::run::Future<Task> (for kDeviceMem the wrapped pointer
  * is a host scratch copy of the device POD). We just hand it back.
  */
 ctp::ipc::FullPtr<Task> IpcGpu2Cpu::RuntimeRecv(

@@ -38,7 +38,7 @@
  * GPU-accessible projection of the CTE Core metadata.
  *
  * Why this header exists:
- *   The CPU-side CTE metadata uses chi::priv::string and chi::priv::vector
+ *   The CPU-side CTE metadata uses clio::run::priv::string and clio::run::priv::vector
  *   templated on CLIO_PRIV_ALLOC_T, whose layout differs between SYCL host
  *   and device passes (see context-transfer-engine/test/unit/gpu/
  *   test_sycl_cte_putblob.cc). That makes those types unusable from a
@@ -72,10 +72,10 @@ namespace clio::cte::core {
 namespace gpu_cache {
 
 /** Maximum length (including the null terminator) of a name in the cache. */
-static constexpr chi::u32 kMaxName = 64;
+static constexpr clio::run::u32 kMaxName = 64;
 
 /** Slot states (POD, replicated to host and device atomics-of-int32 below). */
-enum SlotState : chi::u32 {
+enum SlotState : clio::run::u32 {
   kEmpty = 0,
   kOccupied = 1,
   kTombstone = 2,
@@ -87,10 +87,10 @@ enum SlotState : chi::u32 {
  * and to let GPU readers identify the tag by name.
  */
 struct GpuTagEntry {
-  chi::u32 state_;        /**< SlotState */
-  chi::u32 tag_major_;    /**< TagId.major_ */
-  chi::u32 tag_minor_;    /**< TagId.minor_ */
-  chi::u32 _pad0_;
+  clio::run::u32 state_;        /**< SlotState */
+  clio::run::u32 tag_major_;    /**< TagId.major_ */
+  clio::run::u32 tag_minor_;    /**< TagId.minor_ */
+  clio::run::u32 _pad0_;
   char tag_name_[kMaxName];
 
   CTP_CROSS_FUN void Reset() {
@@ -109,13 +109,13 @@ struct GpuTagEntry {
  * resident on (matches the bdev-type strings — see core_config.h).
  */
 struct GpuBlobEntry {
-  chi::u32 state_;          /**< SlotState */
-  chi::u32 tag_major_;      /**< Owning TagId.major_ */
-  chi::u32 tag_minor_;      /**< Owning TagId.minor_ */
-  chi::u32 storage_class_;  /**< StorageClass below */
-  chi::u64 size_;           /**< Blob logical size in bytes */
+  clio::run::u32 state_;          /**< SlotState */
+  clio::run::u32 tag_major_;      /**< Owning TagId.major_ */
+  clio::run::u32 tag_minor_;      /**< Owning TagId.minor_ */
+  clio::run::u32 storage_class_;  /**< StorageClass below */
+  clio::run::u64 size_;           /**< Blob logical size in bytes */
   float score_;             /**< Placement score 0-1 */
-  chi::u32 _pad0_;
+  clio::run::u32 _pad0_;
   char blob_name_[kMaxName];
 
   CTP_CROSS_FUN void Reset() {
@@ -137,7 +137,7 @@ struct GpuBlobEntry {
  * for projection (they aren't directly accessible from device code
  * via UVA / managed memory).
  */
-enum StorageClass : chi::u32 {
+enum StorageClass : clio::run::u32 {
   kStorageUnknown = 0,
   kStorageRam = 1,      /**< host RAM bdev (DRAM)            */
   kStorageHbm = 2,      /**< on-device HBM bdev              */
@@ -145,12 +145,12 @@ enum StorageClass : chi::u32 {
 };
 
 /** Whether a storage class is eligible for the GPU cache. */
-CTP_CROSS_FUN inline bool IsGpuVisible(chi::u32 sc) {
+CTP_CROSS_FUN inline bool IsGpuVisible(clio::run::u32 sc) {
   return sc == kStorageRam || sc == kStorageHbm || sc == kStoragePinned;
 }
 
 /** Map a bdev-type string to a StorageClass. Used on the host. */
-inline chi::u32 BdevTypeToStorageClass(const char *bdev_type) {
+inline clio::run::u32 BdevTypeToStorageClass(const char *bdev_type) {
   if (!bdev_type) return kStorageUnknown;
   if (std::strcmp(bdev_type, "ram") == 0) return kStorageRam;
   if (std::strcmp(bdev_type, "hbm") == 0) return kStorageHbm;
@@ -160,7 +160,7 @@ inline chi::u32 BdevTypeToStorageClass(const char *bdev_type) {
 
 /** Copy at most kMaxName-1 bytes of src into dst, NUL-terminated. */
 CTP_CROSS_FUN inline void CopyName(char *dst, const char *src) {
-  chi::u32 i = 0;
+  clio::run::u32 i = 0;
   if (src) {
     for (; i + 1 < kMaxName && src[i] != '\0'; ++i) dst[i] = src[i];
   }
@@ -168,15 +168,15 @@ CTP_CROSS_FUN inline void CopyName(char *dst, const char *src) {
 }
 
 /** GPU-safe length (no libc dependency). */
-CTP_CROSS_FUN inline chi::u32 NameLen(const char *s) {
-  chi::u32 n = 0;
+CTP_CROSS_FUN inline clio::run::u32 NameLen(const char *s) {
+  clio::run::u32 n = 0;
   while (n < kMaxName && s[n] != '\0') ++n;
   return n;
 }
 
 /** GPU-safe equality (bounded). */
 CTP_CROSS_FUN inline bool NameEq(const char *a, const char *b) {
-  for (chi::u32 i = 0; i < kMaxName; ++i) {
+  for (clio::run::u32 i = 0; i < kMaxName; ++i) {
     if (a[i] != b[i]) return false;
     if (a[i] == '\0') return true;
   }
@@ -188,27 +188,27 @@ CTP_CROSS_FUN inline bool NameEq(const char *a, const char *b) {
  * Used for both blob and tag name keys. Combined with the tag id for
  * blob entries.
  */
-CTP_CROSS_FUN inline chi::u64 FnvHashString(const char *s) {
-  chi::u64 h = 0xcbf29ce484222325ULL;
-  for (chi::u32 i = 0; i < kMaxName && s[i] != '\0'; ++i) {
-    h ^= static_cast<chi::u64>(static_cast<unsigned char>(s[i]));
+CTP_CROSS_FUN inline clio::run::u64 FnvHashString(const char *s) {
+  clio::run::u64 h = 0xcbf29ce484222325ULL;
+  for (clio::run::u32 i = 0; i < kMaxName && s[i] != '\0'; ++i) {
+    h ^= static_cast<clio::run::u64>(static_cast<unsigned char>(s[i]));
     h *= 0x100000001b3ULL;
   }
   return h;
 }
 
 /** Hash a (tag, blob_name) tuple. */
-CTP_CROSS_FUN inline chi::u64 HashBlobKey(chi::u32 tag_major, chi::u32 tag_minor,
+CTP_CROSS_FUN inline clio::run::u64 HashBlobKey(clio::run::u32 tag_major, clio::run::u32 tag_minor,
                                              const char *blob_name) {
-  chi::u64 h = FnvHashString(blob_name);
-  h ^= (static_cast<chi::u64>(tag_major) << 32) | tag_minor;
+  clio::run::u64 h = FnvHashString(blob_name);
+  h ^= (static_cast<clio::run::u64>(tag_major) << 32) | tag_minor;
   h *= 0x100000001b3ULL;
   return h;
 }
 
 /** Hash a tag (major, minor) key. */
-CTP_CROSS_FUN inline chi::u64 HashTagKey(chi::u32 tag_major, chi::u32 tag_minor) {
-  chi::u64 h = (static_cast<chi::u64>(tag_major) << 32) | tag_minor;
+CTP_CROSS_FUN inline clio::run::u64 HashTagKey(clio::run::u32 tag_major, clio::run::u32 tag_minor) {
+  clio::run::u64 h = (static_cast<clio::run::u64>(tag_major) << 32) | tag_minor;
   h ^= 0xcbf29ce484222325ULL;
   h *= 0x100000001b3ULL;
   return h;
@@ -230,25 +230,25 @@ CTP_CROSS_FUN inline chi::u64 HashTagKey(chi::u32 tag_major, chi::u32 tag_minor)
  * device when the region lives in shared USM.
  */
 struct GpuMetadataCacheHeader {
-  chi::u32 magic_;           /**< 0xCAFEC7E0 — quick sanity check */
-  chi::u32 version_;         /**< Layout version */
-  chi::u32 max_tags_;        /**< Tag-slot capacity (open-addressing) */
-  chi::u32 max_blobs_;       /**< Blob-slot capacity (open-addressing) */
-  chi::u64 region_bytes_;    /**< Total bytes of the USM region */
-  chi::u32 num_tags_;        /**< Currently populated tag entries */
-  chi::u32 num_blobs_;       /**< Currently populated blob entries */
-  chi::u32 _pad0_;
-  chi::u32 _pad1_;
+  clio::run::u32 magic_;           /**< 0xCAFEC7E0 — quick sanity check */
+  clio::run::u32 version_;         /**< Layout version */
+  clio::run::u32 max_tags_;        /**< Tag-slot capacity (open-addressing) */
+  clio::run::u32 max_blobs_;       /**< Blob-slot capacity (open-addressing) */
+  clio::run::u64 region_bytes_;    /**< Total bytes of the USM region */
+  clio::run::u32 num_tags_;        /**< Currently populated tag entries */
+  clio::run::u32 num_blobs_;       /**< Currently populated blob entries */
+  clio::run::u32 _pad0_;
+  clio::run::u32 _pad1_;
 
-  static constexpr chi::u32 kMagic = 0xCAFEC7E0u;
-  static constexpr chi::u32 kVersion = 1u;
+  static constexpr clio::run::u32 kMagic = 0xCAFEC7E0u;
+  static constexpr clio::run::u32 kVersion = 1u;
 
   /**
    * Compute total region size for a given map capacity.
    * @param max_tags_in tag-slot count
    * @param max_blobs_in blob-slot count
    */
-  static size_t Layout(chi::u32 max_tags_in, chi::u32 max_blobs_in) {
+  static size_t Layout(clio::run::u32 max_tags_in, clio::run::u32 max_blobs_in) {
     return sizeof(GpuMetadataCacheHeader) +
            static_cast<size_t>(max_tags_in) * sizeof(gpu_cache::GpuTagEntry) +
            static_cast<size_t>(max_blobs_in) * sizeof(gpu_cache::GpuBlobEntry);
@@ -281,8 +281,8 @@ struct GpuMetadataCacheHeader {
    * for having allocated at least Layout(max_tags_in, max_blobs_in)
    * bytes at `this`.
    */
-  void Init(chi::u32 max_tags_in, chi::u32 max_blobs_in,
-            chi::u64 region_bytes) {
+  void Init(clio::run::u32 max_tags_in, clio::run::u32 max_blobs_in,
+            clio::run::u64 region_bytes) {
     magic_ = kMagic;
     version_ = kVersion;
     max_tags_ = max_tags_in;
@@ -293,9 +293,9 @@ struct GpuMetadataCacheHeader {
     _pad0_ = 0;
     _pad1_ = 0;
     auto *t = TagSlots();
-    for (chi::u32 i = 0; i < max_tags_; ++i) t[i].Reset();
+    for (clio::run::u32 i = 0; i < max_tags_; ++i) t[i].Reset();
     auto *b = BlobSlots();
-    for (chi::u32 i = 0; i < max_blobs_; ++i) b[i].Reset();
+    for (clio::run::u32 i = 0; i < max_blobs_; ++i) b[i].Reset();
   }
 
   CTP_CROSS_FUN bool ValidMagic() const {
@@ -312,15 +312,15 @@ struct GpuMetadataCacheHeader {
  * inserts but probe walks continue past them.
  */
 CTP_CROSS_FUN inline gpu_cache::GpuTagEntry *GpuCacheUpsertTag(
-    GpuMetadataCacheHeader *hdr, chi::u32 tag_major, chi::u32 tag_minor,
+    GpuMetadataCacheHeader *hdr, clio::run::u32 tag_major, clio::run::u32 tag_minor,
     const char *tag_name) {
   if (!hdr || hdr->max_tags_ == 0) return nullptr;
-  chi::u64 h = gpu_cache::HashTagKey(tag_major, tag_minor);
-  chi::u32 cap = hdr->max_tags_;
+  clio::run::u64 h = gpu_cache::HashTagKey(tag_major, tag_minor);
+  clio::run::u32 cap = hdr->max_tags_;
   auto *slots = hdr->TagSlots();
   gpu_cache::GpuTagEntry *first_tomb = nullptr;
-  for (chi::u32 i = 0; i < cap; ++i) {
-    chi::u32 idx = static_cast<chi::u32>((h + i) % cap);
+  for (clio::run::u32 i = 0; i < cap; ++i) {
+    clio::run::u32 idx = static_cast<clio::run::u32>((h + i) % cap);
     auto &s = slots[idx];
     if (s.state_ == gpu_cache::kEmpty) {
       auto *target = first_tomb ? first_tomb : &s;
@@ -356,15 +356,15 @@ CTP_CROSS_FUN inline gpu_cache::GpuTagEntry *GpuCacheUpsertTag(
  * Returns nullptr if the table is full.
  */
 CTP_CROSS_FUN inline gpu_cache::GpuBlobEntry *GpuCacheUpsertBlob(
-    GpuMetadataCacheHeader *hdr, chi::u32 tag_major, chi::u32 tag_minor,
-    const char *blob_name, chi::u64 size, float score, chi::u32 storage_class) {
+    GpuMetadataCacheHeader *hdr, clio::run::u32 tag_major, clio::run::u32 tag_minor,
+    const char *blob_name, clio::run::u64 size, float score, clio::run::u32 storage_class) {
   if (!hdr || hdr->max_blobs_ == 0) return nullptr;
-  chi::u64 h = gpu_cache::HashBlobKey(tag_major, tag_minor, blob_name);
-  chi::u32 cap = hdr->max_blobs_;
+  clio::run::u64 h = gpu_cache::HashBlobKey(tag_major, tag_minor, blob_name);
+  clio::run::u32 cap = hdr->max_blobs_;
   auto *slots = hdr->BlobSlots();
   gpu_cache::GpuBlobEntry *first_tomb = nullptr;
-  for (chi::u32 i = 0; i < cap; ++i) {
-    chi::u32 idx = static_cast<chi::u32>((h + i) % cap);
+  for (clio::run::u32 i = 0; i < cap; ++i) {
+    clio::run::u32 idx = static_cast<clio::run::u32>((h + i) % cap);
     auto &s = slots[idx];
     if (s.state_ == gpu_cache::kEmpty) {
       auto *target = first_tomb ? first_tomb : &s;
@@ -406,15 +406,15 @@ CTP_CROSS_FUN inline gpu_cache::GpuBlobEntry *GpuCacheUpsertBlob(
 
 /** Mark a blob as a tombstone if found; no-op otherwise. */
 CTP_CROSS_FUN inline bool GpuCacheRemoveBlob(GpuMetadataCacheHeader *hdr,
-                                               chi::u32 tag_major,
-                                               chi::u32 tag_minor,
+                                               clio::run::u32 tag_major,
+                                               clio::run::u32 tag_minor,
                                                const char *blob_name) {
   if (!hdr || hdr->max_blobs_ == 0) return false;
-  chi::u64 h = gpu_cache::HashBlobKey(tag_major, tag_minor, blob_name);
-  chi::u32 cap = hdr->max_blobs_;
+  clio::run::u64 h = gpu_cache::HashBlobKey(tag_major, tag_minor, blob_name);
+  clio::run::u32 cap = hdr->max_blobs_;
   auto *slots = hdr->BlobSlots();
-  for (chi::u32 i = 0; i < cap; ++i) {
-    chi::u32 idx = static_cast<chi::u32>((h + i) % cap);
+  for (clio::run::u32 i = 0; i < cap; ++i) {
+    clio::run::u32 idx = static_cast<clio::run::u32>((h + i) % cap);
     auto &s = slots[idx];
     if (s.state_ == gpu_cache::kEmpty) return false;
     if (s.state_ == gpu_cache::kTombstone) continue;
@@ -432,17 +432,17 @@ CTP_CROSS_FUN inline bool GpuCacheRemoveBlob(GpuMetadataCacheHeader *hdr,
  * Mark a tag as tombstone and remove all blobs owned by that tag.
  * Returns the number of blob entries removed.
  */
-CTP_CROSS_FUN inline chi::u32 GpuCacheRemoveTag(GpuMetadataCacheHeader *hdr,
-                                                   chi::u32 tag_major,
-                                                   chi::u32 tag_minor) {
+CTP_CROSS_FUN inline clio::run::u32 GpuCacheRemoveTag(GpuMetadataCacheHeader *hdr,
+                                                   clio::run::u32 tag_major,
+                                                   clio::run::u32 tag_minor) {
   if (!hdr) return 0;
   // Tombstone the tag.
   if (hdr->max_tags_ > 0) {
-    chi::u64 h = gpu_cache::HashTagKey(tag_major, tag_minor);
-    chi::u32 cap = hdr->max_tags_;
+    clio::run::u64 h = gpu_cache::HashTagKey(tag_major, tag_minor);
+    clio::run::u32 cap = hdr->max_tags_;
     auto *slots = hdr->TagSlots();
-    for (chi::u32 i = 0; i < cap; ++i) {
-      chi::u32 idx = static_cast<chi::u32>((h + i) % cap);
+    for (clio::run::u32 i = 0; i < cap; ++i) {
+      clio::run::u32 idx = static_cast<clio::run::u32>((h + i) % cap);
       auto &s = slots[idx];
       if (s.state_ == gpu_cache::kEmpty) break;
       if (s.state_ == gpu_cache::kTombstone) continue;
@@ -454,11 +454,11 @@ CTP_CROSS_FUN inline chi::u32 GpuCacheRemoveTag(GpuMetadataCacheHeader *hdr,
     }
   }
   // Cascade-tombstone all blob entries owned by the tag.
-  chi::u32 removed = 0;
+  clio::run::u32 removed = 0;
   if (hdr->max_blobs_ > 0) {
-    chi::u32 cap = hdr->max_blobs_;
+    clio::run::u32 cap = hdr->max_blobs_;
     auto *slots = hdr->BlobSlots();
-    for (chi::u32 i = 0; i < cap; ++i) {
+    for (clio::run::u32 i = 0; i < cap; ++i) {
       auto &s = slots[i];
       if (s.state_ == gpu_cache::kOccupied &&
           s.tag_major_ == tag_major && s.tag_minor_ == tag_minor) {
@@ -477,14 +477,14 @@ CTP_CROSS_FUN inline chi::u32 GpuCacheRemoveTag(GpuMetadataCacheHeader *hdr,
  * Returns nullptr if the blob is not currently in the cache.
  */
 CTP_CROSS_FUN inline const gpu_cache::GpuBlobEntry *GpuCacheFindBlob(
-    const GpuMetadataCacheHeader *hdr, chi::u32 tag_major, chi::u32 tag_minor,
+    const GpuMetadataCacheHeader *hdr, clio::run::u32 tag_major, clio::run::u32 tag_minor,
     const char *blob_name) {
   if (!hdr || hdr->max_blobs_ == 0) return nullptr;
-  chi::u64 h = gpu_cache::HashBlobKey(tag_major, tag_minor, blob_name);
-  chi::u32 cap = hdr->max_blobs_;
+  clio::run::u64 h = gpu_cache::HashBlobKey(tag_major, tag_minor, blob_name);
+  clio::run::u32 cap = hdr->max_blobs_;
   const auto *slots = hdr->BlobSlots();
-  for (chi::u32 i = 0; i < cap; ++i) {
-    chi::u32 idx = static_cast<chi::u32>((h + i) % cap);
+  for (clio::run::u32 i = 0; i < cap; ++i) {
+    clio::run::u32 idx = static_cast<clio::run::u32>((h + i) % cap);
     const auto &s = slots[idx];
     if (s.state_ == gpu_cache::kEmpty) return nullptr;
     if (s.state_ == gpu_cache::kTombstone) continue;
@@ -498,14 +498,14 @@ CTP_CROSS_FUN inline const gpu_cache::GpuBlobEntry *GpuCacheFindBlob(
 
 /** Read-only lookup of a tag entry. */
 CTP_CROSS_FUN inline const gpu_cache::GpuTagEntry *GpuCacheFindTag(
-    const GpuMetadataCacheHeader *hdr, chi::u32 tag_major,
-    chi::u32 tag_minor) {
+    const GpuMetadataCacheHeader *hdr, clio::run::u32 tag_major,
+    clio::run::u32 tag_minor) {
   if (!hdr || hdr->max_tags_ == 0) return nullptr;
-  chi::u64 h = gpu_cache::HashTagKey(tag_major, tag_minor);
-  chi::u32 cap = hdr->max_tags_;
+  clio::run::u64 h = gpu_cache::HashTagKey(tag_major, tag_minor);
+  clio::run::u32 cap = hdr->max_tags_;
   const auto *slots = hdr->TagSlots();
-  for (chi::u32 i = 0; i < cap; ++i) {
-    chi::u32 idx = static_cast<chi::u32>((h + i) % cap);
+  for (clio::run::u32 i = 0; i < cap; ++i) {
+    clio::run::u32 idx = static_cast<clio::run::u32>((h + i) % cap);
     const auto &s = slots[idx];
     if (s.state_ == gpu_cache::kEmpty) return nullptr;
     if (s.state_ == gpu_cache::kTombstone) continue;

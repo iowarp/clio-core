@@ -56,7 +56,7 @@
 #include <clio_cte/core/core_tasks.h>
 
 static constexpr int kNumBlobs = 10;
-static constexpr chi::u64 kBlobSize = 4096;
+static constexpr clio::run::u64 kBlobSize = 4096;
 static const char* kTagName = "restart_test_tag";
 
 /**
@@ -64,13 +64,13 @@ static const char* kTagName = "restart_test_tag";
  */
 int PutBlobs() {
   // Connect to external runtime as client
-  if (!chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, false)) {
+  if (!clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, false)) {
     HLOG(kError, "Phase 1: Failed to init client");
     return 1;
   }
 
   // Create CTE client bound to pool 512.0
-  clio::cte::core::Client cte_client(chi::PoolId(512, 0));
+  clio::cte::core::Client cte_client(clio::run::PoolId(512, 0));
 
   // Create or get tag
   auto tag_task = cte_client.AsyncGetOrCreateTag(kTagName);
@@ -111,13 +111,13 @@ int PutBlobs() {
 
   // Flush metadata (one-shot)
   HLOG(kInfo, "Phase 1: Flushing metadata...");
-  auto flush_meta = cte_client.AsyncFlushMetadata(chi::PoolQuery::Local(), 0);
+  auto flush_meta = cte_client.AsyncFlushMetadata(clio::run::PoolQuery::Local(), 0);
   flush_meta.Wait();
   HLOG(kInfo, "Phase 1: Metadata flush complete");
 
   // Flush data (one-shot, persistence level 0 for RAM target)
   HLOG(kInfo, "Phase 1: Flushing data...");
-  auto flush_data = cte_client.AsyncFlushData(chi::PoolQuery::Local(), 0, 0);
+  auto flush_data = cte_client.AsyncFlushData(clio::run::PoolQuery::Local(), 0, 0);
   flush_data.Wait();
   HLOG(kInfo, "Phase 1: Data flush complete");
 
@@ -130,19 +130,19 @@ int PutBlobs() {
  */
 int VerifyBlobs() {
   // Connect to external runtime as client
-  if (!chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, false)) {
+  if (!clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, false)) {
     HLOG(kError, "Phase 2: Failed to init client");
     return 1;
   }
 
   // Call RestartContainers via admin client
   HLOG(kInfo, "Phase 2: Calling RestartContainers...");
-  clio::run::admin::Client admin_client(chi::kAdminPoolId);
-  auto restart_task = admin_client.AsyncRestartContainers(chi::PoolQuery::Local());
+  clio::run::admin::Client admin_client(clio::run::kAdminPoolId);
+  auto restart_task = admin_client.AsyncRestartContainers(clio::run::PoolQuery::Local());
   restart_task.Wait();
 
-  chi::u32 rc = restart_task->GetReturnCode();
-  chi::u32 restarted = restart_task->containers_restarted_;
+  clio::run::u32 rc = restart_task->GetReturnCode();
+  clio::run::u32 restarted = restart_task->containers_restarted_;
   HLOG(kInfo, "Phase 2: RestartContainers complete, rc={}, containers_restarted={}",
        rc, restarted);
 
@@ -158,7 +158,7 @@ int VerifyBlobs() {
   }
 
   // Verify pool was recreated by connecting a CTE client
-  clio::cte::core::Client cte_client(chi::PoolId(512, 0));
+  clio::cte::core::Client cte_client(clio::run::PoolId(512, 0));
 
   // Verify we can create/get a tag on the restarted pool
   auto tag_task = cte_client.AsyncGetOrCreateTag(kTagName);
@@ -172,7 +172,7 @@ int VerifyBlobs() {
   HLOG(kInfo, "Phase 2: Tag '{}' accessible on restarted pool", kTagName);
 
   // Verify targets were re-registered by listing them
-  auto targets_task = cte_client.AsyncListTargets(chi::PoolQuery::Local());
+  auto targets_task = cte_client.AsyncListTargets(clio::run::PoolQuery::Local());
   targets_task.Wait();
   HLOG(kInfo, "Phase 2: ListTargets rc={}", targets_task->GetReturnCode());
 
@@ -202,7 +202,7 @@ int VerifyBlobs() {
 
     // Verify data pattern
     bool data_ok = true;
-    for (chi::u64 j = 0; j < kBlobSize; ++j) {
+    for (clio::run::u64 j = 0; j < kBlobSize; ++j) {
       if (buf.ptr_[j] != expected_pattern) {
         data_ok = false;
         break;

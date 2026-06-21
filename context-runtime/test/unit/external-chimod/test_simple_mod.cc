@@ -53,7 +53,7 @@
 #include <clio_runtime/admin/admin_client.h>
 
 namespace {
-constexpr chi::PoolId kExternalTestPoolId = chi::PoolId(7001, 0);
+constexpr clio::run::PoolId kExternalTestPoolId = clio::run::PoolId(7001, 0);
 }
 
 int main() {
@@ -63,7 +63,7 @@ int main() {
   try {
     // Step 1: Initialize CLIO Runtime client
     HLOG(kInfo, "\n1. Initializing Chimaera client...");
-    bool client_init_success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
+    bool client_init_success = clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true);
 
     if (!client_init_success) {
       HLOG(kInfo, "NOTICE: Chimaera client initialization failed.");
@@ -75,8 +75,8 @@ int main() {
 
     // Step 2: Create admin client (required for pool management)
     HLOG(kInfo, "\n2. Creating admin client...");
-    clio::run::admin::Client admin_client(chi::kAdminPoolId);
-    HLOG(kInfo, "Admin client created with pool ID: {}", chi::kAdminPoolId);
+    clio::run::admin::Client admin_client(clio::run::kAdminPoolId);
+    HLOG(kInfo, "Admin client created with pool ID: {}", clio::run::kAdminPoolId);
 
     // Step 3: Create simple_mod client (from external_test namespace)
     HLOG(kInfo, "\n3. Creating external_test::simple_mod client...");
@@ -88,7 +88,7 @@ int main() {
     HLOG(kInfo, "\n4. Creating simple_mod container...");
 
     // Use local pool query (recommended default)
-    auto pool_query = chi::PoolQuery::Local();
+    auto pool_query = clio::run::PoolQuery::Local();
 
     try {
       // This will create the pool if it doesn't exist
@@ -130,6 +130,6 @@ int main() {
   HIPRINT("\nNOTE: This test demonstrates successful external ChiMod development patterns.");
   HIPRINT("For full functionality, run chimaera runtime start in another terminal.");
 
-  chi::CHIMAERA_FINALIZE();
+  clio::run::CHIMAERA_FINALIZE();
   return 0;
 }

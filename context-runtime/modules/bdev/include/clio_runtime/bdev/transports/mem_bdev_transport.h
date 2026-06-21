@@ -25,15 +25,15 @@ class MemBdevTransport : public BdevTransport {
   bool AllocateBlocks(size_t size, int worker_id, std::vector<Block>& blocks) override;
   void FreeBlocks(int worker_id, const std::vector<Block>& blocks) override;
 
-  chi::TaskResume WriteBlocks(ctp::ipc::FullPtr<WriteTask> task, chi::RunContext &ctx) override;
-  chi::TaskResume ReadBlocks(ctp::ipc::FullPtr<ReadTask> task, chi::RunContext &ctx) override;
+  clio::run::TaskResume WriteBlocks(ctp::ipc::FullPtr<WriteTask> task, clio::run::RunContext &ctx) override;
+  clio::run::TaskResume ReadBlocks(ctp::ipc::FullPtr<ReadTask> task, clio::run::RunContext &ctx) override;
 
-  chi::u64 GetCapacity() const override { return allocator_.GetCapacity(); }
-  chi::u64 GetRemainingSize() const override { return allocator_.GetRemainingSize(); }
+  clio::run::u64 GetCapacity() const override { return allocator_.GetCapacity(); }
+  clio::run::u64 GetRemainingSize() const override { return allocator_.GetRemainingSize(); }
 
  private:
   StandardBlockAllocator allocator_;
-  chi::u64 ram_capacity_{0};
+  clio::run::u64 ram_capacity_{0};
 
   static constexpr size_t kRamPageSize = 1ULL << 30; // 1 GiB pages
 

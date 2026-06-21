@@ -55,19 +55,19 @@
 namespace chi_test_gpu_stress {
 
 /** Number of tasks submitted from the GPU per test run. */
-inline constexpr chi::u32 kNumTasks = 64;
+inline constexpr clio::run::u32 kNumTasks = 64;
 
 /** Stride between adjacent (TaskT + FutureShm) pairs in the backend. */
 inline constexpr size_t kSlotBytes =
-    sizeof(clio::run::MOD_NAME::GpuSubmitTask) + sizeof(chi::gpu::FutureShm);
+    sizeof(clio::run::MOD_NAME::GpuSubmitTask) + sizeof(clio::run::gpu::FutureShm);
 
 /** Total backend size: kNumTasks slots + a few extra bytes of slack. */
 inline constexpr size_t kBackendBytes =
     static_cast<size_t>(kNumTasks) * kSlotBytes + 256;
 
 /** Pool ID for the MOD_NAME pool used by the stress test. */
-inline chi::PoolId GetTestPoolId() {
-  return chi::PoolId(20002, 1);
+inline clio::run::PoolId GetTestPoolId() {
+  return clio::run::PoolId(20002, 1);
 }
 
 /** One-time runtime setup shared by every TEST_CASE in this binary. */
@@ -76,7 +76,7 @@ inline void EnsureInit() {
   if (initialized) return;
   std::fprintf(stderr,
                "[INIT] Starting Chimaera server (producer-only GPU)\n");
-  if (!chi::CHIMAERA_INIT(chi::ChimaeraMode::kServer)) {
+  if (!clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kServer)) {
     std::fprintf(stderr, "[INIT] CHIMAERA_INIT failed\n");
     std::abort();
   }
@@ -93,8 +93,8 @@ inline void EnsureInit() {
   using CreateTask = clio::run::MOD_NAME::CreateTask;
   using CreateParams = clio::run::MOD_NAME::CreateParams;
   auto task = ipc->NewTask<CreateTask>(
-      chi::CreateTaskId(), chi::kAdminPoolId,
-      chi::PoolQuery::Dynamic(),
+      clio::run::CreateTaskId(), clio::run::kAdminPoolId,
+      clio::run::PoolQuery::Dynamic(),
       CreateParams::chimod_lib_name,
       std::string("gpu_kernel_stress_pool"),
       GetTestPoolId(), &client);
@@ -116,19 +116,19 @@ inline void EnsureInit() {
  * @return        Vector of task FullPtrs (each carries {alloc_id, off}).
  */
 inline std::vector<ctp::ipc::FullPtr<clio::run::MOD_NAME::GpuSubmitTask>>
-PlaceTaskSlots(char *base, ctp::ipc::AllocatorId alloc_id, chi::u32 gpu_id) {
+PlaceTaskSlots(char *base, ctp::ipc::AllocatorId alloc_id, clio::run::u32 gpu_id) {
   using TaskT = clio::run::MOD_NAME::GpuSubmitTask;
   std::vector<ctp::ipc::FullPtr<TaskT>> handles;
   handles.reserve(kNumTasks);
-  for (chi::u32 i = 0; i < kNumTasks; ++i) {
+  for (clio::run::u32 i = 0; i < kNumTasks; ++i) {
     size_t task_off = static_cast<size_t>(i) * kSlotBytes;
     char *task_addr = base + task_off;
     char *fshm_addr = task_addr + sizeof(TaskT);
     auto *task = new (task_addr) TaskT(
-        chi::CreateTaskId(), GetTestPoolId(),
-        chi::PoolQuery::ToLocalCpu(), gpu_id, /*test_value=*/i);
-    task->pod_size_ = static_cast<chi::u32>(sizeof(TaskT));
-    new (fshm_addr) chi::gpu::FutureShm();
+        clio::run::CreateTaskId(), GetTestPoolId(),
+        clio::run::PoolQuery::ToLocalCpu(), gpu_id, /*test_value=*/i);
+    task->pod_size_ = static_cast<clio::run::u32>(sizeof(TaskT));
+    new (fshm_addr) clio::run::gpu::FutureShm();
 
     ctp::ipc::FullPtr<TaskT> fp;
     fp.shm_.alloc_id_ = alloc_id;
@@ -144,13 +144,13 @@ PlaceTaskSlots(char *base, ctp::ipc::AllocatorId alloc_id, chi::u32 gpu_id) {
  * `test_value = i`, so `result_value_` must equal `i * 2 + gpu_id`.
  * Returns the index of the first mismatch, or kNumTasks on success.
  */
-inline chi::u32 VerifyResults(
+inline clio::run::u32 VerifyResults(
     const std::vector<ctp::ipc::FullPtr<clio::run::MOD_NAME::GpuSubmitTask>>
         &handles,
-    chi::u32 gpu_id) {
-  for (chi::u32 i = 0; i < handles.size(); ++i) {
-    chi::u32 expected = (i * 2u) + gpu_id;
-    chi::u32 actual = handles[i]->result_value_;
+    clio::run::u32 gpu_id) {
+  for (clio::run::u32 i = 0; i < handles.size(); ++i) {
+    clio::run::u32 expected = (i * 2u) + gpu_id;
+    clio::run::u32 actual = handles[i]->result_value_;
     if (actual != expected) {
       std::fprintf(stderr,
                    "[CHECK] slot=%u expected=%u actual=%u\n",
@@ -158,7 +158,7 @@ inline chi::u32 VerifyResults(
       return i;
     }
   }
-  return static_cast<chi::u32>(handles.size());
+  return static_cast<clio::run::u32>(handles.size());
 }
 
 }  // namespace chi_test_gpu_stress

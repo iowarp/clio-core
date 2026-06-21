@@ -65,16 +65,16 @@ using namespace std::chrono_literals;
 namespace {
 bool g_initialized = false;
 
-chi::PoolId generateTestPoolId() {
+clio::run::PoolId generateTestPoolId() {
   auto now = std::chrono::high_resolution_clock::now();
   auto duration = now.time_since_epoch();
   auto microseconds =
       std::chrono::duration_cast<std::chrono::microseconds>(duration).count();
-  return chi::PoolId(static_cast<chi::u32>(microseconds & 0xFFFFFFFF) + 1000,
+  return clio::run::PoolId(static_cast<clio::run::u32>(microseconds & 0xFFFFFFFF) + 1000,
                      0);
 }
 
-constexpr chi::u32 kHoldMs = 100;
+constexpr clio::run::u32 kHoldMs = 100;
 }  // namespace
 
 class MigrateTestFixture {
@@ -82,10 +82,10 @@ class MigrateTestFixture {
   MigrateTestFixture() : test_pool_id_(generateTestPoolId()) {
     if (!g_initialized) {
       INFO("Initializing Chimaera for Migrate tests...");
-      bool success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
+      bool success = clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true);
       if (success) {
         g_initialized = true;
-        SimpleTest::g_test_finalize = chi::CHIMAERA_FINALIZE;
+        SimpleTest::g_test_finalize = clio::run::CHIMAERA_FINALIZE;
         std::this_thread::sleep_for(500ms);
         REQUIRE(CLIO_RUNTIME_MANAGER != nullptr);
         REQUIRE(CLIO_IPC != nullptr);
@@ -98,11 +98,11 @@ class MigrateTestFixture {
     }
   }
 
-  chi::PoolId getTestPoolId() const { return test_pool_id_; }
+  clio::run::PoolId getTestPoolId() const { return test_pool_id_; }
 
   bool createModNamePool() {
     try {
-      chi::PoolQuery pool_query = chi::PoolQuery::Dynamic();
+      clio::run::PoolQuery pool_query = clio::run::PoolQuery::Dynamic();
       clio::run::MOD_NAME::Client mod_name_client(test_pool_id_);
       std::string pool_name = "test_migrate_pool";
       auto create_task =
@@ -121,7 +121,7 @@ class MigrateTestFixture {
   }
 
  private:
-  chi::PoolId test_pool_id_;
+  clio::run::PoolId test_pool_id_;
 };
 
 TEST_CASE("Migrate container and verify task re-routing",
@@ -133,7 +133,7 @@ TEST_CASE("Migrate container and verify task re-routing",
     REQUIRE(fixture.createModNamePool());
 
     clio::run::MOD_NAME::Client mod_name_client(fixture.getTestPoolId());
-    chi::PoolQuery create_query = chi::PoolQuery::Dynamic();
+    clio::run::PoolQuery create_query = clio::run::PoolQuery::Dynamic();
     std::string pool_name = "test_migrate_pool";
     auto create_task = mod_name_client.AsyncCreate(
         create_query, pool_name, fixture.getTestPoolId());
@@ -141,13 +141,13 @@ TEST_CASE("Migrate container and verify task re-routing",
     mod_name_client.pool_id_ = create_task->new_pool_id_;
     REQUIRE(create_task->return_code_ == 0);
 
-    chi::PoolId pool_id = mod_name_client.pool_id_;
+    clio::run::PoolId pool_id = mod_name_client.pool_id_;
     INFO("Pool created: " << pool_id.ToU64());
 
     // Step 1: Submit CoMutexTest targeting container 0 (on node 0)
     INFO("Step 1: Submitting CoMutexTest with DirectHash(0) pre-migration");
     auto pre_task = mod_name_client.AsyncCoMutexTest(
-        chi::PoolQuery::DirectHash(0), 1, kHoldMs);
+        clio::run::PoolQuery::DirectHash(0), 1, kHoldMs);
     pre_task.Wait();
     REQUIRE(pre_task->return_code_ == 0);
     INFO("Step 1: Pre-migration task completed successfully");
@@ -159,11 +159,11 @@ TEST_CASE("Migrate container and verify task re-routing",
     auto *admin_client = CLIO_ADMIN;
     REQUIRE(admin_client != nullptr);
 
-    std::vector<chi::MigrateInfo> migrations;
-    migrations.emplace_back(pool_id, chi::ContainerId(0), 2);
+    std::vector<clio::run::MigrateInfo> migrations;
+    migrations.emplace_back(pool_id, clio::run::ContainerId(0), 2);
 
     auto migrate_task = admin_client->AsyncMigrateContainers(
-        chi::PoolQuery::Local(), migrations);
+        clio::run::PoolQuery::Local(), migrations);
     migrate_task.Wait();
     REQUIRE(migrate_task->GetReturnCode() == 0);
     REQUIRE(migrate_task->num_migrated_ == 1);
@@ -175,7 +175,7 @@ TEST_CASE("Migrate container and verify task re-routing",
     // If source node still has the task, the retry queue should re-route it
     INFO("Step 3: Submitting CoMutexTest with DirectHash(0) post-migration");
     auto post_task = mod_name_client.AsyncCoMutexTest(
-        chi::PoolQuery::DirectHash(0), 2, kHoldMs);
+        clio::run::PoolQuery::DirectHash(0), 2, kHoldMs);
     post_task.Wait();
     REQUIRE(post_task->return_code_ == 0);
     INFO("Step 3: Post-migration task completed successfully");
@@ -193,7 +193,7 @@ TEST_CASE("Migrate container during broadcast event",
     REQUIRE(fixture.createModNamePool());
 
     clio::run::MOD_NAME::Client mod_name_client(fixture.getTestPoolId());
-    chi::PoolQuery create_query = chi::PoolQuery::Dynamic();
+    clio::run::PoolQuery create_query = clio::run::PoolQuery::Dynamic();
     std::string pool_name = "test_migrate_broadcast_pool";
     auto create_task = mod_name_client.AsyncCreate(
         create_query, pool_name, fixture.getTestPoolId());
@@ -201,13 +201,13 @@ TEST_CASE("Migrate container during broadcast event",
     mod_name_client.pool_id_ = create_task->new_pool_id_;
     REQUIRE(create_task->return_code_ == 0);
 
-    chi::PoolId pool_id = mod_name_client.pool_id_;
+    clio::run::PoolId pool_id = mod_name_client.pool_id_;
     INFO("Pool created: " << pool_id.ToU64());
 
     // Step 1: Submit broadcast CoMutexTest pre-migration
     INFO("Step 1: Submitting CoMutexTest with Broadcast() pre-migration");
     auto pre_task = mod_name_client.AsyncCoMutexTest(
-        chi::PoolQuery::Broadcast(), 1, kHoldMs);
+        clio::run::PoolQuery::Broadcast(), 1, kHoldMs);
     pre_task.Wait();
     REQUIRE(pre_task->return_code_ == 0);
     INFO("Step 1: Pre-migration broadcast task completed successfully");
@@ -217,11 +217,11 @@ TEST_CASE("Migrate container during broadcast event",
     auto *admin_client = CLIO_ADMIN;
     REQUIRE(admin_client != nullptr);
 
-    std::vector<chi::MigrateInfo> migrations;
-    migrations.emplace_back(pool_id, chi::ContainerId(0), 2);
+    std::vector<clio::run::MigrateInfo> migrations;
+    migrations.emplace_back(pool_id, clio::run::ContainerId(0), 2);
 
     auto migrate_task = admin_client->AsyncMigrateContainers(
-        chi::PoolQuery::Local(), migrations);
+        clio::run::PoolQuery::Local(), migrations);
     migrate_task.Wait();
     REQUIRE(migrate_task->GetReturnCode() == 0);
     REQUIRE(migrate_task->num_migrated_ == 1);
@@ -233,7 +233,7 @@ TEST_CASE("Migrate container during broadcast event",
     // on its new node (node 2 now has containers 0 and 1)
     INFO("Step 3: Submitting CoMutexTest with Broadcast() post-migration");
     auto post_task = mod_name_client.AsyncCoMutexTest(
-        chi::PoolQuery::Broadcast(), 2, kHoldMs);
+        clio::run::PoolQuery::Broadcast(), 2, kHoldMs);
     post_task.Wait();
     REQUIRE(post_task->return_code_ == 0);
     INFO("Step 3: Post-migration broadcast task completed successfully");

@@ -47,7 +47,7 @@
  * Following CLAUDE.md requirements:
  * - Use simple_test.h framework (NOT Catch2 - Catch2 causes segfaults with CLIO Runtime runtime)
  * - Use proper runtime initialization
- * - Use chi::kAdminPoolId for CreateTask operations
+ * - Use clio::run::kAdminPoolId for CreateTask operations
  * - Use semantic names for QueueIds and priorities
  * - Never use null pool queries - always use Local() or Broadcast()
  * - Follow Google C++ style guide
@@ -80,7 +80,7 @@
  namespace fs = std::filesystem;
 
 static std::string chi_test_data_dir() {
-  const char *d = chi::env::GetCompat("TEST_DATA_DIR");
+  const char *d = clio::run::env::GetCompat("TEST_DATA_DIR");
   return (d && *d) ? d : ".";
 }
 
@@ -100,17 +100,17 @@ static std::string chi_test_data_dir() {
  public:
    // Semantic names for queue IDs and priorities (following CLAUDE.md
    // requirements)
-   static constexpr chi::QueueId kCTEMainQueueId = chi::QueueId(1);
-   static constexpr chi::QueueId kCTEWorkerQueueId = chi::QueueId(2);
-   static constexpr chi::u32 kCTEHighPriority = 1;
-   static constexpr chi::u32 kCTENormalPriority = 2;
+   static constexpr clio::run::QueueId kCTEMainQueueId = clio::run::QueueId(1);
+   static constexpr clio::run::QueueId kCTEWorkerQueueId = clio::run::QueueId(2);
+   static constexpr clio::run::u32 kCTEHighPriority = 1;
+   static constexpr clio::run::u32 kCTENormalPriority = 2;
 
    // Test configuration constants
-   static constexpr chi::u64 kTestTargetSize = 1024ULL * 1024 * 100; // 100MB test target
+   static constexpr clio::run::u64 kTestTargetSize = 1024ULL * 1024 * 100; // 100MB test target
    static constexpr size_t kTestBlobSize = 4096; // 4KB test blobs
 
    // CTE Core pool configuration - use constants from core_tasks.h
-   static inline const chi::PoolId& kCTECorePoolId = clio::cte::core::kCtePoolId;
+   static inline const clio::run::PoolId& kCTECorePoolId = clio::cte::core::kCtePoolId;
    static inline const char* kCTECorePoolName = clio::cte::core::kCtePoolName;
 
    std::string test_storage_path_;
@@ -127,8 +127,8 @@ static std::string chi_test_data_dir() {
     */
    static std::vector<std::string> TagQueryAsync(clio::cte::core::Client* client,
                                                   const std::string& tag_pattern,
-                                                  chi::u32 flags,
-                                                  const chi::PoolQuery& pool_query) {
+                                                  clio::run::u32 flags,
+                                                  const clio::run::PoolQuery& pool_query) {
      auto task = client->AsyncTagQuery(tag_pattern, flags, pool_query);
      task.Wait();
      return task->results_;
@@ -141,8 +141,8 @@ static std::string chi_test_data_dir() {
        clio::cte::core::Client* client,
        const std::string& tag_pattern,
        const std::string& blob_pattern,
-       chi::u32 flags,
-       const chi::PoolQuery& pool_query) {
+       clio::run::u32 flags,
+       const clio::run::PoolQuery& pool_query) {
      auto task = client->AsyncBlobQuery(tag_pattern, blob_pattern, flags, pool_query);
      task.Wait();
      // Combine tag_names_ and blob_names_ into pairs
@@ -173,7 +173,7 @@ static std::string chi_test_data_dir() {
 
      // Initialize CLIO Runtime and CTE client once per test suite
      if (!g_initialized) {
-       bool success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
+       bool success = clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true);
        if (!success) {
          throw std::runtime_error("Failed to initialize Chimaera runtime");
        }
@@ -213,9 +213,9 @@ static std::string chi_test_data_dir() {
      auto *cte_client = CLIO_CTE_CLIENT;
 
      // Create test storage target using bdev client
-     chi::PoolId bdev_pool_id(200, 0);  // Custom pool ID for bdev
+     clio::run::PoolId bdev_pool_id(200, 0);  // Custom pool ID for bdev
      clio::run::bdev::Client bdev_client(bdev_pool_id);
-     auto create_task = bdev_client.AsyncCreate(chi::PoolQuery::Dynamic(), test_storage_path_,
+     auto create_task = bdev_client.AsyncCreate(clio::run::PoolQuery::Dynamic(), test_storage_path_,
                                                  bdev_pool_id, clio::run::bdev::BdevType::kFile);
      create_task.Wait();
 
@@ -225,7 +225,7 @@ static std::string chi_test_data_dir() {
      // Register the storage target with CTE
      auto reg_task = cte_client->AsyncRegisterTarget(test_storage_path_,
                                                       clio::run::bdev::BdevType::kFile,
-                                                      kTestTargetSize, chi::PoolQuery::Local(), bdev_pool_id);
+                                                      kTestTargetSize, clio::run::PoolQuery::Local(), bdev_pool_id);
      reg_task.Wait();
      std::this_thread::sleep_for(100ms);
 
@@ -282,7 +282,7 @@ static std::string chi_test_data_dir() {
   (void)fixture; // Suppress unused variable warning
 
    auto *cte_client = CLIO_CTE_CLIENT;
-   auto results = CTEQueryTestFixture::TagQueryAsync(cte_client, "user_data", 0, chi::PoolQuery::Broadcast());
+   auto results = CTEQueryTestFixture::TagQueryAsync(cte_client, "user_data", 0, clio::run::PoolQuery::Broadcast());
 
    INFO("Query returned " << results.size() << " tags");
    REQUIRE(results.size() >= 1);
@@ -307,7 +307,7 @@ static std::string chi_test_data_dir() {
 
    // Query for all tags starting with "user_"
    auto *cte_client = CLIO_CTE_CLIENT;
-   auto results = CTEQueryTestFixture::TagQueryAsync(cte_client, "user_.*", 0, chi::PoolQuery::Broadcast());
+   auto results = CTEQueryTestFixture::TagQueryAsync(cte_client, "user_.*", 0, clio::run::PoolQuery::Broadcast());
 
    INFO("Query returned " << results.size() << " tags");
    REQUIRE(results.size() >= 2); // Should match user_data and user_logs
@@ -338,7 +338,7 @@ static std::string chi_test_data_dir() {
 
    // Query for tags matching either "system_config" or "system_cache"
    auto *cte_client = CLIO_CTE_CLIENT;
-   auto results = CTEQueryTestFixture::TagQueryAsync(cte_client, "system_(config|cache)", 0, chi::PoolQuery::Broadcast());
+   auto results = CTEQueryTestFixture::TagQueryAsync(cte_client, "system_(config|cache)", 0, clio::run::PoolQuery::Broadcast());
 
    INFO("Query returned " << results.size() << " tags");
    REQUIRE(results.size() >= 2);
@@ -369,7 +369,7 @@ static std::string chi_test_data_dir() {
 
    // Query for all tags
    auto *cte_client = CLIO_CTE_CLIENT;
-   auto results = CTEQueryTestFixture::TagQueryAsync(cte_client, ".*", 0, chi::PoolQuery::Broadcast());
+   auto results = CTEQueryTestFixture::TagQueryAsync(cte_client, ".*", 0, clio::run::PoolQuery::Broadcast());
 
    INFO("Query returned " << results.size() << " tags");
    REQUIRE(results.size() >= fixture->test_tags_.size());
@@ -400,7 +400,7 @@ static std::string chi_test_data_dir() {
 
    // Query for non-existent tag pattern
    auto *cte_client = CLIO_CTE_CLIENT;
-   auto results = CTEQueryTestFixture::TagQueryAsync(cte_client, "nonexistent_tag_pattern_xyz", 0, chi::PoolQuery::Broadcast());
+   auto results = CTEQueryTestFixture::TagQueryAsync(cte_client, "nonexistent_tag_pattern_xyz", 0, clio::run::PoolQuery::Broadcast());
 
    INFO("Query returned " << results.size() << " tags");
    REQUIRE(results.empty());
@@ -416,7 +416,7 @@ static std::string chi_test_data_dir() {
 
    // Query for specific blob in specific tag
    auto *cte_client = CLIO_CTE_CLIENT;
-   auto results = CTEQueryTestFixture::BlobQueryAsync(cte_client, "user_data", "blob_001\\.dat", 0, chi::PoolQuery::Broadcast());
+   auto results = CTEQueryTestFixture::BlobQueryAsync(cte_client, "user_data", "blob_001\\.dat", 0, clio::run::PoolQuery::Broadcast());
 
    INFO("Query returned " << results.size() << " blob pairs");
    REQUIRE(results.size() > 0);
@@ -442,7 +442,7 @@ static std::string chi_test_data_dir() {
 
    // Query for all .dat blobs in user_data tag
    auto *cte_client = CLIO_CTE_CLIENT;
-   auto results = CTEQueryTestFixture::BlobQueryAsync(cte_client, "user_data", "blob_.*\\.dat", 0, chi::PoolQuery::Broadcast());
+   auto results = CTEQueryTestFixture::BlobQueryAsync(cte_client, "user_data", "blob_.*\\.dat", 0, clio::run::PoolQuery::Broadcast());
 
    INFO("Total blobs matched: " << results.size());
    REQUIRE(results.size() >= 2); // Should match blob_001.dat and blob_002.dat
@@ -469,7 +469,7 @@ static std::string chi_test_data_dir() {
 
    // Query for all .txt files in any "user_" tag
    auto *cte_client = CLIO_CTE_CLIENT;
-   auto results = CTEQueryTestFixture::BlobQueryAsync(cte_client, "user_.*", "file_.*\\.txt", 0, chi::PoolQuery::Broadcast());
+   auto results = CTEQueryTestFixture::BlobQueryAsync(cte_client, "user_.*", "file_.*\\.txt", 0, clio::run::PoolQuery::Broadcast());
 
    INFO("Total blobs matched: " << results.size());
    REQUIRE(results.size() >= 4); // user_data and user_logs each have 2 .txt files
@@ -494,7 +494,7 @@ static std::string chi_test_data_dir() {
 
    // Query for all blobs in all tags
    auto *cte_client = CLIO_CTE_CLIENT;
-   auto results = CTEQueryTestFixture::BlobQueryAsync(cte_client, ".*", ".*", 0, chi::PoolQuery::Broadcast());
+   auto results = CTEQueryTestFixture::BlobQueryAsync(cte_client, ".*", ".*", 0, clio::run::PoolQuery::Broadcast());
 
    INFO("Total blobs matched: " << results.size());
    REQUIRE(results.size() >= fixture->test_blobs_.size());
@@ -510,7 +510,7 @@ static std::string chi_test_data_dir() {
 
    // Query for non-existent blob pattern in existing tag
    auto *cte_client = CLIO_CTE_CLIENT;
-   auto results = CTEQueryTestFixture::BlobQueryAsync(cte_client, "user_data", "nonexistent_blob_xyz", 0, chi::PoolQuery::Broadcast());
+   auto results = CTEQueryTestFixture::BlobQueryAsync(cte_client, "user_data", "nonexistent_blob_xyz", 0, clio::run::PoolQuery::Broadcast());
 
    INFO("Total blobs matched: " << results.size());
    REQUIRE(results.size() == 0);
@@ -526,7 +526,7 @@ static std::string chi_test_data_dir() {
 
    // Query for non-existent tag pattern
    auto *cte_client = CLIO_CTE_CLIENT;
-   auto results = CTEQueryTestFixture::BlobQueryAsync(cte_client, "nonexistent_tag_xyz", ".*", 0, chi::PoolQuery::Broadcast());
+   auto results = CTEQueryTestFixture::BlobQueryAsync(cte_client, "nonexistent_tag_xyz", ".*", 0, clio::run::PoolQuery::Broadcast());
 
    INFO("Query returned " << results.size() << " blob pairs");
    REQUIRE(results.empty());
@@ -543,14 +543,14 @@ static std::string chi_test_data_dir() {
    auto *cte_client = CLIO_CTE_CLIENT;
 
    // TagQuery with Local should work but only return local results
-   auto tag_results = CTEQueryTestFixture::TagQueryAsync(cte_client, "user_.*", 0, chi::PoolQuery::Local());
+   auto tag_results = CTEQueryTestFixture::TagQueryAsync(cte_client, "user_.*", 0, clio::run::PoolQuery::Local());
 
    INFO("TagQuery with Local returned " << tag_results.size() << " tags");
    // Should get results since tags were created locally
    REQUIRE(!tag_results.empty());
 
    // BlobQuery with Local should also work
-   auto blob_results = CTEQueryTestFixture::BlobQueryAsync(cte_client, "user_.*", "blob_.*", 0, chi::PoolQuery::Local());
+   auto blob_results = CTEQueryTestFixture::BlobQueryAsync(cte_client, "user_.*", "blob_.*", 0, clio::run::PoolQuery::Local());
 
    INFO("BlobQuery with Local returned " << blob_results.size() << " blob pairs");
    REQUIRE(blob_results.size() > 0);

@@ -40,7 +40,7 @@ namespace clio::cae::core {
 
 // CAE Pool ID - used consistently across tests and utilities
 // This ID uniquely identifies the CAE core container pool
-constexpr chi::PoolId kCaePoolId(400, 0);
+constexpr clio::run::PoolId kCaePoolId(400, 0);
 
 }  // namespace clio::cae::core
 

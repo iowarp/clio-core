@@ -42,7 +42,7 @@ struct Args {
   size_t num_ops = 256;         // writes per rank
   size_t depth = 16;            // outstanding writes per rank (pipeline depth)
   std::string pool_name = "bench_bdev";
-  chi::PoolId pool_id{777, 0};  // unique id reserved for this bench
+  clio::run::PoolId pool_id{777, 0};  // unique id reserved for this bench
   size_t tier_bytes = 4ULL << 30;  // 4 GiB per node — fits cluster total in node-local RAM
   bool create_pool = true;      // first rank creates, others find
 };
@@ -87,20 +87,20 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  if (!chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, false)) {
+  if (!clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, false)) {
     HLOG(kError, "rank={} CHIMAERA_INIT failed", world_rank);
     MPI_Finalize();
     return 2;
   }
 
   auto *ipc = CLIO_IPC;
-  const chi::u64 num_nodes = ipc->GetNumHosts();
-  const chi::u64 my_node = ipc->GetNodeId();
+  const clio::run::u64 num_nodes = ipc->GetNumHosts();
+  const clio::run::u64 my_node = ipc->GetNodeId();
   // Ring pattern: every rank's writes target the NEXT node's bdev
   // container. With one bdev container per node (DirectHash(i) -> node i)
   // this guarantees every task crosses the network.
-  const chi::u32 target_container =
-      static_cast<chi::u32>((my_node + 1) % num_nodes);
+  const clio::run::u32 target_container =
+      static_cast<clio::run::u32>((my_node + 1) % num_nodes);
 
   HLOG(kInfo,
        "rank={}/{} node={} num_nodes={} target_container={} "
@@ -120,7 +120,7 @@ int main(int argc, char **argv) {
     params.alignment_ = 4096;
 
     auto create_task = bdev_client.AsyncCreate(
-        chi::PoolQuery::Broadcast(), args.pool_name, args.pool_id,
+        clio::run::PoolQuery::Broadcast(), args.pool_name, args.pool_id,
         clio::run::bdev::BdevType::kRam, args.tier_bytes);
     create_task.Wait();
     if (create_task->return_code_ != 0) {
@@ -152,29 +152,29 @@ int main(int argc, char **argv) {
   // we just synthesize Block{offset_, size_} the same shape AsyncWrite
   // accepts, with offset varying per rank so writes don't trample.
   // bdev WriteToRam paths use the offset to index into ram_pages_.
-  const chi::u64 rank_offset =
-      static_cast<chi::u64>(world_rank) * args.num_ops * args.io_size;
+  const clio::run::u64 rank_offset =
+      static_cast<clio::run::u64>(world_rank) * args.num_ops * args.io_size;
 
   // -------- Pipeline --------
   // Each rank keeps `depth` outstanding AsyncWrites at a time. Wait on
   // the oldest before issuing a new one. This is how you actually
   // saturate a cross-node DEALER without the client-side Wait-after-
   // every-send anti-pattern we see in the FUSE adapter.
-  std::vector<chi::Future<clio::run::bdev::WriteTask>> inflight;
+  std::vector<clio::run::Future<clio::run::bdev::WriteTask>> inflight;
   inflight.reserve(args.depth);
 
   MPI_Barrier(MPI_COMM_WORLD);
   auto t_start = std::chrono::steady_clock::now();
 
   for (size_t i = 0; i < args.num_ops; ++i) {
-    chi::priv::vector<clio::run::bdev::Block> blocks(CTP_MALLOC);
+    clio::run::priv::vector<clio::run::bdev::Block> blocks(CTP_MALLOC);
     clio::run::bdev::Block blk;
     blk.offset_ = rank_offset + i * args.io_size;
     blk.size_ = args.io_size;
     blocks.push_back(blk);
 
     auto fut = bdev_client.AsyncWrite(
-        chi::PoolQuery::DirectHash(target_container), blocks,
+        clio::run::PoolQuery::DirectHash(target_container), blocks,
         write_buf.shm_.template Cast<void>(), args.io_size);
     inflight.push_back(std::move(fut));
 

@@ -62,7 +62,7 @@ struct VectorStats {
 
 struct DeviceViewBase {
   Block *blocks;                  /**< device pointer (kDeviceMem). */
-  chi::u32 block_stride_bytes;
+  clio::run::u32 block_stride_bytes;
   void *pages_base;               /**< HBM page backend (kDeviceMem). */
   void *host_pages_base;          /**< DRAM page backend (kPinnedHost). nullptr in legacy. */
   /**
@@ -73,8 +73,8 @@ struct DeviceViewBase {
    */
   char *put_pool_base;            /**< pinned host. */
   char *get_pool_base;            /**< pinned host. */
-  chi::u32 put_slot_stride;       /**< sizeof(PutBlobTask)+sizeof(gpu::FutureShm). */
-  chi::u32 get_slot_stride;
+  clio::run::u32 put_slot_stride;       /**< sizeof(PutBlobTask)+sizeof(gpu::FutureShm). */
+  clio::run::u32 get_slot_stride;
   /**
    * Allocator ids of the page backends. The bdev runtime resolves
    * blob_data_ ShmPtrs via ctp::DeviceAwareMemcpy; pinned-host
@@ -86,10 +86,10 @@ struct DeviceViewBase {
   ctp::ipc::AllocatorId get_pool_alloc_id;
   /** Tag the kernel writes blobs against. Set once at Vector ctor. */
   clio::cte::core::TagId tag_id;
-  chi::u32 nblocks;
-  chi::u32 gpu_pages_per_block;   /**< HBM cache slots per block. */
-  chi::u32 host_pages_per_block;  /**< DRAM cache slots per block. 0 ⇒ legacy. */
-  chi::u64 page_size_bytes;
+  clio::run::u32 nblocks;
+  clio::run::u32 gpu_pages_per_block;   /**< HBM cache slots per block. */
+  clio::run::u32 host_pages_per_block;  /**< DRAM cache slots per block. 0 ⇒ legacy. */
+  clio::run::u64 page_size_bytes;
   /** When false (default), Resolve's cold-miss path does NOT do the
    *  synchronous EvictSlot+FaultPage. Instead the user kernel pushes
    *  a high-priority hint and spin-waits for the cache-manager kernel
@@ -102,7 +102,7 @@ struct DeviceViewBase {
 };
 
 /** Total slots per block across both tiers. */
-CTP_INLINE_CROSS_FUN chi::u32 TotalPagesPerBlock(const DeviceViewBase &v) {
+CTP_INLINE_CROSS_FUN clio::run::u32 TotalPagesPerBlock(const DeviceViewBase &v) {
   return v.gpu_pages_per_block + v.host_pages_per_block;
 }
 
@@ -118,48 +118,48 @@ struct DeviceView {
    * Number of T-elements per page. Computed as
    * `page_size_bytes / sizeof(T)` at ctor time.
    */
-  chi::u64 page_capacity_t;
+  clio::run::u64 page_capacity_t;
 };
 
 /** Per-block resolution helper — handles the variable-size Page array. */
 CTP_INLINE_CROSS_FUN Block *GetBlock(const DeviceViewBase &v,
-                                             chi::u32 block_idx) {
+                                             clio::run::u32 block_idx) {
   return reinterpret_cast<Block *>(
       reinterpret_cast<char *>(v.blocks) +
-      static_cast<chi::u64>(v.block_stride_bytes) * block_idx);
+      static_cast<clio::run::u64>(v.block_stride_bytes) * block_idx);
 }
 
 /** Resolve the i-th task in the put pool. `slot` indexes BOTH tiers
  *  (0..total_pages_per_block - 1). */
 CTP_INLINE_CROSS_FUN clio::cte::core::PutBlobTask *GetPutTask(
-    const DeviceViewBase &v, chi::u32 block_idx, chi::u32 slot) {
-  chi::u64 off =
-      (static_cast<chi::u64>(block_idx) * TotalPagesPerBlock(v) + slot) *
+    const DeviceViewBase &v, clio::run::u32 block_idx, clio::run::u32 slot) {
+  clio::run::u64 off =
+      (static_cast<clio::run::u64>(block_idx) * TotalPagesPerBlock(v) + slot) *
       v.put_slot_stride;
   return reinterpret_cast<clio::cte::core::PutBlobTask *>(v.put_pool_base + off);
 }
 
 /** Resolve the i-th task in the get pool. */
 CTP_INLINE_CROSS_FUN clio::cte::core::GetBlobTask *GetGetTask(
-    const DeviceViewBase &v, chi::u32 block_idx, chi::u32 slot) {
-  chi::u64 off =
-      (static_cast<chi::u64>(block_idx) * TotalPagesPerBlock(v) + slot) *
+    const DeviceViewBase &v, clio::run::u32 block_idx, clio::run::u32 slot) {
+  clio::run::u64 off =
+      (static_cast<clio::run::u64>(block_idx) * TotalPagesPerBlock(v) + slot) *
       v.get_slot_stride;
   return reinterpret_cast<clio::cte::core::GetBlobTask *>(v.get_pool_base + off);
 }
 
 /** Co-located gpu::FutureShm for a put task. */
-CTP_INLINE_CROSS_FUN chi::gpu::FutureShm *GetPutFutureShm(
-    const DeviceViewBase &v, chi::u32 block_idx, chi::u32 slot) {
-  return reinterpret_cast<chi::gpu::FutureShm *>(
+CTP_INLINE_CROSS_FUN clio::run::gpu::FutureShm *GetPutFutureShm(
+    const DeviceViewBase &v, clio::run::u32 block_idx, clio::run::u32 slot) {
+  return reinterpret_cast<clio::run::gpu::FutureShm *>(
       reinterpret_cast<char *>(GetPutTask(v, block_idx, slot)) +
       sizeof(clio::cte::core::PutBlobTask));
 }
 
 /** Co-located gpu::FutureShm for a get task. */
-CTP_INLINE_CROSS_FUN chi::gpu::FutureShm *GetGetFutureShm(
-    const DeviceViewBase &v, chi::u32 block_idx, chi::u32 slot) {
-  return reinterpret_cast<chi::gpu::FutureShm *>(
+CTP_INLINE_CROSS_FUN clio::run::gpu::FutureShm *GetGetFutureShm(
+    const DeviceViewBase &v, clio::run::u32 block_idx, clio::run::u32 slot) {
+  return reinterpret_cast<clio::run::gpu::FutureShm *>(
       reinterpret_cast<char *>(GetGetTask(v, block_idx, slot)) +
       sizeof(clio::cte::core::GetBlobTask));
 }

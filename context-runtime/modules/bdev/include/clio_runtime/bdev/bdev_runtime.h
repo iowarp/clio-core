@@ -22,7 +22,7 @@ namespace clio::run::bdev {
 /**
  * Runtime container for bdev operations
  */
-class Runtime : public chi::Container {
+class Runtime : public clio::run::Container {
  public:
   // Required typedef for CLIO_TASK_CC macro
   using CreateParams = clio::run::bdev::CreateParams;
@@ -37,43 +37,43 @@ class Runtime : public chi::Container {
   /**
    * Get live task statistics for this task instance.
    */
-  chi::TaskStat GetTaskStats(const chi::Task *task) const override;
+  clio::run::TaskStat GetTaskStats(const clio::run::Task *task) const override;
 
-  chi::TaskResume Create(ctp::ipc::FullPtr<CreateTask> task, chi::RunContext& ctx);
-  chi::TaskResume AllocateBlocks(ctp::ipc::FullPtr<AllocateBlocksTask> task, chi::RunContext& ctx);
-  chi::TaskResume FreeBlocks(ctp::ipc::FullPtr<FreeBlocksTask> task, chi::RunContext& ctx);
-  chi::TaskResume Write(ctp::ipc::FullPtr<WriteTask> task, chi::RunContext& ctx);
-  chi::TaskResume Read(ctp::ipc::FullPtr<ReadTask> task, chi::RunContext& ctx);
-  chi::TaskResume GetStats(ctp::ipc::FullPtr<GetStatsTask> task, chi::RunContext& ctx);
-  chi::TaskResume Update(ctp::ipc::FullPtr<UpdateTask> task, chi::RunContext& ctx);
-  chi::TaskResume Monitor(ctp::ipc::FullPtr<MonitorTask> task, chi::RunContext &rctx);
-  chi::TaskResume Destroy(ctp::ipc::FullPtr<DestroyTask> task, chi::RunContext& ctx);
+  clio::run::TaskResume Create(ctp::ipc::FullPtr<CreateTask> task, clio::run::RunContext& ctx);
+  clio::run::TaskResume AllocateBlocks(ctp::ipc::FullPtr<AllocateBlocksTask> task, clio::run::RunContext& ctx);
+  clio::run::TaskResume FreeBlocks(ctp::ipc::FullPtr<FreeBlocksTask> task, clio::run::RunContext& ctx);
+  clio::run::TaskResume Write(ctp::ipc::FullPtr<WriteTask> task, clio::run::RunContext& ctx);
+  clio::run::TaskResume Read(ctp::ipc::FullPtr<ReadTask> task, clio::run::RunContext& ctx);
+  clio::run::TaskResume GetStats(ctp::ipc::FullPtr<GetStatsTask> task, clio::run::RunContext& ctx);
+  clio::run::TaskResume Update(ctp::ipc::FullPtr<UpdateTask> task, clio::run::RunContext& ctx);
+  clio::run::TaskResume Monitor(ctp::ipc::FullPtr<MonitorTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume Destroy(ctp::ipc::FullPtr<DestroyTask> task, clio::run::RunContext& ctx);
 
-  void Init(const chi::PoolId &pool_id, const std::string &pool_name,
-            chi::u32 container_id = 0) override;
+  void Init(const clio::run::PoolId &pool_id, const std::string &pool_name,
+            clio::run::u32 container_id = 0) override;
   void PostGpuContainerCreate() override;
-  chi::TaskResume Run(chi::u32 method, ctp::ipc::FullPtr<chi::Task> task_ptr,
-                      chi::RunContext& rctx) override;
-  chi::u64 GetWorkRemaining() const override;
+  clio::run::TaskResume Run(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> task_ptr,
+                      clio::run::RunContext& rctx) override;
+  clio::run::u64 GetWorkRemaining() const override;
 
-  void SaveTask(chi::u32 method, chi::SaveTaskArchive& archive,
-                ctp::ipc::FullPtr<chi::Task> task_ptr) override;
-  void LoadTask(chi::u32 method, chi::LoadTaskArchive& archive,
-                ctp::ipc::FullPtr<chi::Task> task_ptr) override;
-  ctp::ipc::FullPtr<chi::Task> AllocLoadTask(chi::u32 method, chi::LoadTaskArchive& archive) override;
+  void SaveTask(clio::run::u32 method, clio::run::SaveTaskArchive& archive,
+                ctp::ipc::FullPtr<clio::run::Task> task_ptr) override;
+  void LoadTask(clio::run::u32 method, clio::run::LoadTaskArchive& archive,
+                ctp::ipc::FullPtr<clio::run::Task> task_ptr) override;
+  ctp::ipc::FullPtr<clio::run::Task> AllocLoadTask(clio::run::u32 method, clio::run::LoadTaskArchive& archive) override;
 
-  void LocalLoadTask(chi::u32 method, chi::DefaultLoadArchive& archive,
-                     ctp::ipc::FullPtr<chi::Task> task_ptr) override;
-  ctp::ipc::FullPtr<chi::Task> LocalAllocLoadTask(chi::u32 method, chi::DefaultLoadArchive& archive) override;
-  void LocalSaveTask(chi::u32 method, chi::DefaultSaveArchive& archive,
-                     ctp::ipc::FullPtr<chi::Task> task_ptr) override;
+  void LocalLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive& archive,
+                     ctp::ipc::FullPtr<clio::run::Task> task_ptr) override;
+  ctp::ipc::FullPtr<clio::run::Task> LocalAllocLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive& archive) override;
+  void LocalSaveTask(clio::run::u32 method, clio::run::DefaultSaveArchive& archive,
+                     ctp::ipc::FullPtr<clio::run::Task> task_ptr) override;
 
-  ctp::ipc::FullPtr<chi::Task> NewCopyTask(chi::u32 method, ctp::ipc::FullPtr<chi::Task> orig_task_ptr,
+  ctp::ipc::FullPtr<clio::run::Task> NewCopyTask(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> orig_task_ptr,
                                         bool deep) override;
-  ctp::ipc::FullPtr<chi::Task> NewTask(chi::u32 method) override;
-  void AggregateOut(chi::u32 method, ctp::ipc::FullPtr<chi::Task> orig_task,
-                 const ctp::ipc::FullPtr<chi::Task>& replica_task) override;
-  void DelTask(chi::u32 method, ctp::ipc::FullPtr<chi::Task> task_ptr) override;
+  ctp::ipc::FullPtr<clio::run::Task> NewTask(clio::run::u32 method) override;
+  void AggregateOut(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> orig_task,
+                 const ctp::ipc::FullPtr<clio::run::Task>& replica_task) override;
+  void DelTask(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> task_ptr) override;
 
  private:
   Client client_;
@@ -81,17 +81,17 @@ class Runtime : public chi::Container {
 
   std::unique_ptr<BdevTransport> transport_;
 
-  std::atomic<chi::u64> total_reads_;
-  std::atomic<chi::u64> total_writes_;
-  std::atomic<chi::u64> total_bytes_read_;
-  std::atomic<chi::u64> total_bytes_written_;
+  std::atomic<clio::run::u64> total_reads_;
+  std::atomic<clio::run::u64> total_writes_;
+  std::atomic<clio::run::u64> total_bytes_read_;
+  std::atomic<clio::run::u64> total_bytes_written_;
   std::chrono::high_resolution_clock::time_point start_time_;
   
   PerfMetrics perf_metrics_;
 
-  size_t GetWorkerID(chi::RunContext& ctx);
+  size_t GetWorkerID(clio::run::RunContext& ctx);
 
-  void UpdatePerformanceMetrics(bool is_write, chi::u64 bytes,
+  void UpdatePerformanceMetrics(bool is_write, clio::run::u64 bytes,
                                 double duration_us);
 };
 

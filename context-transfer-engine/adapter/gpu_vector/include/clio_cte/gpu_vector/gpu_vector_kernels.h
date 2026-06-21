@@ -33,21 +33,21 @@ CTP_GPU_FUN int32_t AtomicExchI32(int32_t *p, int32_t new_val) {
 }
 
 /** Atomic CAS for u32. */
-CTP_GPU_FUN chi::u32 AtomicCasU32(chi::u32 *p, chi::u32 expected,
-                                          chi::u32 desired) {
+CTP_GPU_FUN clio::run::u32 AtomicCasU32(clio::run::u32 *p, clio::run::u32 expected,
+                                          clio::run::u32 desired) {
   return atomicCAS(reinterpret_cast<unsigned int *>(p),
                    static_cast<unsigned int>(expected),
                    static_cast<unsigned int>(desired));
 }
 
 /** Atomic OR on u32 — returns the old value. */
-CTP_GPU_FUN chi::u32 AtomicOrU32(chi::u32 *p, chi::u32 mask) {
+CTP_GPU_FUN clio::run::u32 AtomicOrU32(clio::run::u32 *p, clio::run::u32 mask) {
   return atomicOr(reinterpret_cast<unsigned int *>(p),
                   static_cast<unsigned int>(mask));
 }
 
 /** Atomic AND-NOT on u32 (clears bits). */
-CTP_GPU_FUN chi::u32 AtomicClearBitsU32(chi::u32 *p, chi::u32 mask) {
+CTP_GPU_FUN clio::run::u32 AtomicClearBitsU32(clio::run::u32 *p, clio::run::u32 mask) {
   return atomicAnd(reinterpret_cast<unsigned int *>(p),
                    static_cast<unsigned int>(~mask));
 }
@@ -63,18 +63,18 @@ CTP_GPU_FUN void AtomicMaxI32(int32_t *p, int32_t v) {
 }
 
 /** Atomic increment for u32. */
-CTP_GPU_FUN chi::u32 AtomicIncU32(chi::u32 *p) {
+CTP_GPU_FUN clio::run::u32 AtomicIncU32(clio::run::u32 *p) {
   return atomicAdd(reinterpret_cast<unsigned int *>(p), 1u);
 }
 
 /** Atomic decrement for u32. */
-CTP_GPU_FUN chi::u32 AtomicDecU32(chi::u32 *p) {
+CTP_GPU_FUN clio::run::u32 AtomicDecU32(clio::run::u32 *p) {
   return atomicSub(reinterpret_cast<unsigned int *>(p), 1u);
 }
 
 /** Attempt to acquire kPageBusy. Returns true on success. */
 CTP_GPU_FUN bool TryAcquireBusy(Page *p) {
-  chi::u32 prev = AtomicOrU32(&p->flags, kPageBusy);
+  clio::run::u32 prev = AtomicOrU32(&p->flags, kPageBusy);
   return (prev & kPageBusy) == 0;
 }
 
@@ -100,7 +100,7 @@ CTP_GPU_FUN ctp::ipc::ShmPtr<> MakeBlobShmPtr(void *device_addr,
   (void)alloc_id;
   ctp::ipc::ShmPtr<> p;
   p.alloc_id_ = ctp::ipc::AllocatorId::GetNull();
-  p.off_ = reinterpret_cast<chi::u64>(device_addr);
+  p.off_ = reinterpret_cast<clio::run::u64>(device_addr);
   return p;
 }
 
@@ -109,10 +109,10 @@ CTP_GPU_FUN ctp::ipc::ShmPtr<> MakeBlobShmPtr(void *device_addr,
  * MPSC: bump tail atomically; drop if full. Returns true if the entry
  * was enqueued.
  */
-CTP_GPU_FUN bool RescorePush(RescoreQueue *q, chi::u32 page_idx,
+CTP_GPU_FUN bool RescorePush(RescoreQueue *q, clio::run::u32 page_idx,
                               float score) {
-  chi::u32 cur_tail = AtomicIncU32(&q->tail);
-  chi::u32 head = q->head;
+  clio::run::u32 cur_tail = AtomicIncU32(&q->tail);
+  clio::run::u32 head = q->head;
   if (cur_tail - head >= kRescoreQueueCap) {
     // Roll back. Not perfectly atomic, but a dropped hint is benign.
     AtomicDecU32(&q->tail);
@@ -124,8 +124,8 @@ CTP_GPU_FUN bool RescorePush(RescoreQueue *q, chi::u32 page_idx,
 }
 
 /** Remaining capacity in the rescore queue (lower bound — may be stale). */
-CTP_GPU_FUN chi::u32 RescoreRemaining(const RescoreQueue *q) {
-  chi::u32 used = q->tail - q->head;
+CTP_GPU_FUN clio::run::u32 RescoreRemaining(const RescoreQueue *q) {
+  clio::run::u32 used = q->tail - q->head;
   if (used > kRescoreQueueCap) used = kRescoreQueueCap;
   return kRescoreQueueCap - used;
 }
@@ -139,11 +139,11 @@ CTP_GPU_FUN chi::u32 RescoreRemaining(const RescoreQueue *q) {
  *
  *  Caller must pass the kernel-scope `g_ipc_manager_ptr` from
  *  CHIMAERA_GPU_INIT — going through CLIO_IPC in this device function
- *  trips the host-pass typing check (CLIO_IPC expands to chi::IpcManager*
- *  on host pass, which returns chi::Future, not gpu::Future). */
-CTP_GPU_FUN void FlushPageBase(::chi::gpu::IpcManager *ipc,
-                                 const DeviceViewBase &v, chi::u32 block_idx,
-                                 Page *page, chi::u32 slot) {
+ *  trips the host-pass typing check (CLIO_IPC expands to clio::run::IpcManager*
+ *  on host pass, which returns clio::run::Future, not gpu::Future). */
+CTP_GPU_FUN void FlushPageBase(::clio::run::gpu::IpcManager *ipc,
+                                 const DeviceViewBase &v, clio::run::u32 block_idx,
+                                 Page *page, clio::run::u32 slot) {
   if (page->page_idx < 0) return;
 
   int32_t mn = detail::AtomicExchI32(&page->modify_min, -1);
@@ -156,19 +156,19 @@ CTP_GPU_FUN void FlushPageBase(::chi::gpu::IpcManager *ipc,
   // Reset lifecycle flags + fresh task_id for slot reuse.
   task->task_flags_.Clear();
   task->return_code_.store(0);
-  task->task_id_ = chi::CreateTaskId();
+  task->task_id_ = clio::run::CreateTaskId();
   // T-agnostic path: flush the whole page. The page-keyed blob name is
   // composed runtime-side from blob_name_ + "_pi" + gpu_page_idx_.
   task->offset_ = 0;
   task->size_ = v.page_size_bytes;
-  task->gpu_page_idx_ = static_cast<chi::u32>(page->page_idx);
+  task->gpu_page_idx_ = static_cast<clio::run::u32>(page->page_idx);
   ctp::ipc::AllocatorId alloc =
       (page->tier == 0) ? v.pages_alloc_id : v.host_pages_alloc_id;
   task->blob_data_ = detail::MakeBlobShmPtr(page->device_ptr, alloc);
 
   ctp::ipc::FullPtr<clio::cte::core::PutBlobTask> fp;
   fp.shm_.alloc_id_ = v.put_pool_alloc_id;
-  fp.shm_.off_ = reinterpret_cast<chi::u64>(task);
+  fp.shm_.off_ = reinterpret_cast<clio::run::u64>(task);
   fp.ptr_ = task;
   page->active_put = ipc->Send(fp);
 }
@@ -183,9 +183,9 @@ CTP_GPU_FUN void FlushPageBase(::chi::gpu::IpcManager *ipc,
  * to pick which task slot in the put pool we use.
  */
 template <typename T>
-CTP_GPU_FUN void FlushPage(::chi::gpu::IpcManager *ipc,
-                            const DeviceView<T> &v, chi::u32 block_idx,
-                            Page *page, chi::u32 slot) {
+CTP_GPU_FUN void FlushPage(::clio::run::gpu::IpcManager *ipc,
+                            const DeviceView<T> &v, clio::run::u32 block_idx,
+                            Page *page, clio::run::u32 slot) {
   if (page->page_idx < 0) return;
 
   // Atomically reset the dirty range so the next concurrent writer
@@ -204,13 +204,13 @@ CTP_GPU_FUN void FlushPage(::chi::gpu::IpcManager *ipc,
   // this slot (TASK_ROUTED in particular). Mint a fresh task_id_.
   task->task_flags_.Clear();
   task->return_code_.store(0);
-  task->task_id_ = chi::CreateTaskId();
-  chi::u64 t_size = sizeof(T);
-  chi::u64 mn_b = static_cast<chi::u64>(mn) * t_size;
-  chi::u64 mx_b = (static_cast<chi::u64>(mx) + 1) * t_size;
+  task->task_id_ = clio::run::CreateTaskId();
+  clio::run::u64 t_size = sizeof(T);
+  clio::run::u64 mn_b = static_cast<clio::run::u64>(mn) * t_size;
+  clio::run::u64 mx_b = (static_cast<clio::run::u64>(mx) + 1) * t_size;
   task->offset_ = mn_b;            // offset within the per-page blob
   task->size_ = mx_b - mn_b;
-  task->gpu_page_idx_ = static_cast<chi::u32>(page->page_idx);
+  task->gpu_page_idx_ = static_cast<clio::run::u32>(page->page_idx);
   ctp::ipc::AllocatorId alloc =
       (page->tier == 0) ? v.base.pages_alloc_id : v.base.host_pages_alloc_id;
   task->blob_data_ = detail::MakeBlobShmPtr(
@@ -218,7 +218,7 @@ CTP_GPU_FUN void FlushPage(::chi::gpu::IpcManager *ipc,
 
   ctp::ipc::FullPtr<clio::cte::core::PutBlobTask> fp;
   fp.shm_.alloc_id_ = v.base.put_pool_alloc_id;
-  fp.shm_.off_ = reinterpret_cast<chi::u64>(task);
+  fp.shm_.off_ = reinterpret_cast<clio::run::u64>(task);
   fp.ptr_ = task;
 
   page->active_put = ipc->Send(fp);
@@ -226,24 +226,24 @@ CTP_GPU_FUN void FlushPage(::chi::gpu::IpcManager *ipc,
 
 /** Submit a GetBlob to fault `target_page_idx` into `page->device_ptr`. */
 template <typename T>
-CTP_GPU_FUN void FaultPage(::chi::gpu::IpcManager *ipc,
-                            const DeviceView<T> &v, chi::u32 block_idx,
-                            Page *page, chi::u32 slot,
+CTP_GPU_FUN void FaultPage(::clio::run::gpu::IpcManager *ipc,
+                            const DeviceView<T> &v, clio::run::u32 block_idx,
+                            Page *page, clio::run::u32 slot,
                             int32_t target_page_idx) {
   auto *task = GetGetTask(v.base, block_idx, slot);
   // Reset lifecycle flags + mint a fresh task_id for slot reuse.
   task->task_flags_.Clear();
   task->return_code_.store(0);
-  task->task_id_ = chi::CreateTaskId();
+  task->task_id_ = clio::run::CreateTaskId();
   task->offset_ = 0;
   task->size_ = v.base.page_size_bytes;
-  task->gpu_page_idx_ = static_cast<chi::u32>(target_page_idx);
+  task->gpu_page_idx_ = static_cast<clio::run::u32>(target_page_idx);
   ctp::ipc::AllocatorId alloc =
       (page->tier == 0) ? v.base.pages_alloc_id : v.base.host_pages_alloc_id;
   task->blob_data_ = detail::MakeBlobShmPtr(page->device_ptr, alloc);
   ctp::ipc::FullPtr<clio::cte::core::GetBlobTask> fp;
   fp.shm_.alloc_id_ = v.base.get_pool_alloc_id;
-  fp.shm_.off_ = reinterpret_cast<chi::u64>(task);
+  fp.shm_.off_ = reinterpret_cast<clio::run::u64>(task);
   fp.ptr_ = task;
   page->active_get = ipc->Send(fp);
 }
@@ -252,7 +252,7 @@ CTP_GPU_FUN void FaultPage(::chi::gpu::IpcManager *ipc,
 CTP_GPU_FUN void DrainPut(Page *page) {
   if (!page->active_put.IsNull()) {
     page->active_put.Wait();
-    page->active_put = chi::gpu::Future<clio::cte::core::PutBlobTask>();
+    page->active_put = clio::run::gpu::Future<clio::cte::core::PutBlobTask>();
     detail::AtomicClearBitsU32(&page->flags, kPagePutInFlight);
   }
 }
@@ -261,19 +261,19 @@ CTP_GPU_FUN void DrainPut(Page *page) {
 CTP_GPU_FUN void DrainGet(Page *page) {
   if (!page->active_get.IsNull()) {
     page->active_get.Wait();
-    page->active_get = chi::gpu::Future<clio::cte::core::GetBlobTask>();
+    page->active_get = clio::run::gpu::Future<clio::cte::core::GetBlobTask>();
     detail::AtomicClearBitsU32(&page->flags, kPageGetInFlight);
   }
 }
 
 /** Flush every dirty page in the calling block across BOTH tiers. */
 template <typename T>
-CTP_GPU_FUN void FlushAllInBlock(::chi::gpu::IpcManager *ipc,
+CTP_GPU_FUN void FlushAllInBlock(::clio::run::gpu::IpcManager *ipc,
                                   const DeviceView<T> &v,
-                                  chi::u32 block_idx) {
+                                  clio::run::u32 block_idx) {
   Block *b = GetBlock(v.base, block_idx);
-  chi::u32 total = TotalPagesPerBlock(v.base);
-  for (chi::u32 s = 0; s < total; ++s) {
+  clio::run::u32 total = TotalPagesPerBlock(v.base);
+  for (clio::run::u32 s = 0; s < total; ++s) {
     Page *p = &b->pages[s];
     if (p->modify_min < 0) continue;
     if (detail::AtomicOrU32(&p->flags, kPagePutInFlight) & kPagePutInFlight) {
@@ -289,14 +289,14 @@ CTP_GPU_FUN void FlushAllInBlock(::chi::gpu::IpcManager *ipc,
  * reuse the slot freely. `tier_lo`/`tier_hi` bound the search range.
  */
 template <typename T>
-CTP_GPU_FUN chi::u32 EvictSlotInRange(::chi::gpu::IpcManager *ipc,
+CTP_GPU_FUN clio::run::u32 EvictSlotInRange(::clio::run::gpu::IpcManager *ipc,
                                        const DeviceView<T> &v,
-                                       chi::u32 block_idx,
-                                       chi::u32 tier_lo, chi::u32 tier_hi) {
+                                       clio::run::u32 block_idx,
+                                       clio::run::u32 tier_lo, clio::run::u32 tier_hi) {
   Block *b = GetBlock(v.base, block_idx);
   // Flush every dirty page first (kicks Sends in flight; we'll Wait on
   // the chosen victim's active_put below).
-  for (chi::u32 s = tier_lo; s < tier_hi; ++s) {
+  for (clio::run::u32 s = tier_lo; s < tier_hi; ++s) {
     Page *p = &b->pages[s];
     if (p->modify_min < 0) continue;
     if (detail::AtomicOrU32(&p->flags, kPagePutInFlight) & kPagePutInFlight) {
@@ -305,7 +305,7 @@ CTP_GPU_FUN chi::u32 EvictSlotInRange(::chi::gpu::IpcManager *ipc,
     FlushPage(ipc, v, block_idx, p, s);
   }
   // Free slot?
-  for (chi::u32 s = tier_lo; s < tier_hi; ++s) {
+  for (clio::run::u32 s = tier_lo; s < tier_hi; ++s) {
     if (b->pages[s].page_idx < 0) {
       DrainPut(&b->pages[s]);
       DrainGet(&b->pages[s]);
@@ -313,9 +313,9 @@ CTP_GPU_FUN chi::u32 EvictSlotInRange(::chi::gpu::IpcManager *ipc,
     }
   }
   // LRU within range.
-  chi::u32 lru = tier_lo;
-  chi::u64 lru_clock = b->pages[tier_lo].lru_clock;
-  for (chi::u32 s = tier_lo + 1; s < tier_hi; ++s) {
+  clio::run::u32 lru = tier_lo;
+  clio::run::u64 lru_clock = b->pages[tier_lo].lru_clock;
+  for (clio::run::u32 s = tier_lo + 1; s < tier_hi; ++s) {
     if (b->pages[s].lru_clock < lru_clock) {
       lru_clock = b->pages[s].lru_clock;
       lru = s;
@@ -328,9 +328,9 @@ CTP_GPU_FUN chi::u32 EvictSlotInRange(::chi::gpu::IpcManager *ipc,
 
 /** Pick a victim slot anywhere in the block, preferring HBM (tier 0). */
 template <typename T>
-CTP_GPU_FUN chi::u32 EvictSlot(::chi::gpu::IpcManager *ipc,
+CTP_GPU_FUN clio::run::u32 EvictSlot(::clio::run::gpu::IpcManager *ipc,
                                 const DeviceView<T> &v,
-                                chi::u32 block_idx) {
+                                clio::run::u32 block_idx) {
   return EvictSlotInRange(ipc, v, block_idx, 0, v.base.gpu_pages_per_block);
 }
 
@@ -342,11 +342,11 @@ CTP_GPU_FUN chi::u32 EvictSlot(::chi::gpu::IpcManager *ipc,
  * eviction.
  */
 CTP_GPU_FUN void WarpCopyUint4(void *dst, const void *src,
-                                 chi::u64 bytes, chi::u32 lane) {
-  chi::u64 n = bytes / sizeof(uint4);
+                                 clio::run::u64 bytes, clio::run::u32 lane) {
+  clio::run::u64 n = bytes / sizeof(uint4);
   uint4 *d = static_cast<uint4 *>(dst);
   const uint4 *s = static_cast<const uint4 *>(src);
-  for (chi::u64 i = lane; i < n; i += 32) d[i] = s[i];
+  for (clio::run::u64 i = lane; i < n; i += 32) d[i] = s[i];
 }
 
 /**
@@ -365,8 +365,8 @@ CTP_GPU_FUN void WarpCopyUint4(void *dst, const void *src,
  */
 template <typename T>
 CTP_GPU_FUN Page *WarpCoopAllocSlotForWrite(
-    ::chi::gpu::IpcManager *ipc, const DeviceView<T> &v,
-    chi::u32 block_idx, int32_t target_page, chi::u32 lane) {
+    ::clio::run::gpu::IpcManager *ipc, const DeviceView<T> &v,
+    clio::run::u32 block_idx, int32_t target_page, clio::run::u32 lane) {
   __shared__ Page *s_dst;
   __shared__ Page *s_evict_src;   // populated only if we need to copy
   __shared__ Page *s_evict_dst;
@@ -375,9 +375,9 @@ CTP_GPU_FUN Page *WarpCoopAllocSlotForWrite(
     s_dst = nullptr;
     s_evict_src = nullptr;
     s_evict_dst = nullptr;
-    chi::u32 total = TotalPagesPerBlock(v.base);
+    clio::run::u32 total = TotalPagesPerBlock(v.base);
     // Path 1: free HBM?
-    for (chi::u32 s = 0; s < v.base.gpu_pages_per_block; ++s) {
+    for (clio::run::u32 s = 0; s < v.base.gpu_pages_per_block; ++s) {
       Page *p = &b->pages[s];
       if (p->flags & (kPageBusy | kPageGetInFlight)) continue;
       if (p->page_idx < 0) {
@@ -389,7 +389,7 @@ CTP_GPU_FUN Page *WarpCoopAllocSlotForWrite(
     }
     // Path 1b: free DRAM?
     if (s_dst == nullptr && v.base.host_pages_per_block > 0) {
-      for (chi::u32 s = v.base.gpu_pages_per_block; s < total; ++s) {
+      for (clio::run::u32 s = v.base.gpu_pages_per_block; s < total; ++s) {
         Page *p = &b->pages[s];
         if (p->flags & (kPageBusy | kPageGetInFlight)) continue;
         if (p->page_idx < 0) {
@@ -402,8 +402,8 @@ CTP_GPU_FUN Page *WarpCoopAllocSlotForWrite(
     }
     // Path 2/3: need eviction. Pick LRU HBM victim.
     if (s_dst == nullptr) {
-      chi::u32 hv = ~0u; chi::u64 hclk = ~0ULL;
-      for (chi::u32 s = 0; s < v.base.gpu_pages_per_block; ++s) {
+      clio::run::u32 hv = ~0u; clio::run::u64 hclk = ~0ULL;
+      for (clio::run::u32 s = 0; s < v.base.gpu_pages_per_block; ++s) {
         Page *p = &b->pages[s];
         if (p->flags & (kPageBusy | kPageGetInFlight)) continue;
         if (p->lru_clock < hclk) { hclk = p->lru_clock; hv = s; }
@@ -415,8 +415,8 @@ CTP_GPU_FUN Page *WarpCoopAllocSlotForWrite(
         s_evict_src = vp;
         // Find a DRAM slot — free first, else LRU.
         if (v.base.host_pages_per_block > 0 && vp->page_idx >= 0) {
-          chi::u32 dv = ~0u; chi::u64 dclk = ~0ULL;
-          for (chi::u32 s = v.base.gpu_pages_per_block; s < total; ++s) {
+          clio::run::u32 dv = ~0u; clio::run::u64 dclk = ~0ULL;
+          for (clio::run::u32 s = v.base.gpu_pages_per_block; s < total; ++s) {
             Page *p = &b->pages[s];
             if (p->flags & (kPageBusy | kPageGetInFlight)) continue;
             if (p->page_idx < 0) { dv = s; break; }
@@ -473,8 +473,8 @@ CTP_GPU_FUN Page *WarpCoopAllocSlotForWrite(
 // Back-compat alias for the previous name.
 template <typename T>
 CTP_GPU_FUN Page *WarpCoopEvictHbmToDram(
-    ::chi::gpu::IpcManager *ipc, const DeviceView<T> &v,
-    chi::u32 block_idx, int32_t target_page, chi::u32 lane) {
+    ::clio::run::gpu::IpcManager *ipc, const DeviceView<T> &v,
+    clio::run::u32 block_idx, int32_t target_page, clio::run::u32 lane) {
   return WarpCoopAllocSlotForWrite(ipc, v, block_idx, target_page, lane);
 }
 
@@ -487,12 +487,12 @@ CTP_GPU_FUN Page *WarpCoopEvictHbmToDram(
  *  from CTE. In kAsync mode the caller also pushes a high-score hint
  *  into the rescore queue so neighboring pages get pulled in next tick. */
 template <typename T>
-CTP_GPU_FUN T *Resolve(::chi::gpu::IpcManager *ipc, DeviceView<T> v,
-                        Page **last_page_array, chi::u64 i, bool is_write) {
-  chi::u32 block_idx = blockIdx.x;
+CTP_GPU_FUN T *Resolve(::clio::run::gpu::IpcManager *ipc, DeviceView<T> v,
+                        Page **last_page_array, clio::run::u64 i, bool is_write) {
+  clio::run::u32 block_idx = blockIdx.x;
   Block *b = GetBlock(v.base, block_idx);
   int32_t target_page = static_cast<int32_t>(i / v.page_capacity_t);
-  chi::u64 off_t = i - static_cast<chi::u64>(target_page) * v.page_capacity_t;
+  clio::run::u64 off_t = i - static_cast<clio::run::u64>(target_page) * v.page_capacity_t;
   // Instrument: bump resolve_total. Cheap relative to the IPC work below.
   if (v.base.stats) {
     atomicAdd_system(&v.base.stats->resolve_total, 1ULL);
@@ -509,8 +509,8 @@ CTP_GPU_FUN T *Resolve(::chi::gpu::IpcManager *ipc, DeviceView<T> v,
     //     Skip slots that are locked (manager prefetch in flight) —
     //     treat them as not-cached so we fault into a different slot
     //     rather than spin-waiting on TryAcquireBusy below.
-    chi::u32 total = TotalPagesPerBlock(v.base);
-    for (chi::u32 s = 0; s < total; ++s) {
+    clio::run::u32 total = TotalPagesPerBlock(v.base);
+    for (clio::run::u32 s = 0; s < total; ++s) {
       Page *p = &b->pages[s];
       if (p->page_idx != target_page) continue;
       if (p->flags & (kPageBusy | kPageGetInFlight)) continue;
@@ -528,7 +528,7 @@ CTP_GPU_FUN T *Resolve(::chi::gpu::IpcManager *ipc, DeviceView<T> v,
       if (v.base.stats && !is_write) {
         atomicAdd_system(&v.base.stats->resolve_fault_get, 1ULL);
       }
-      chi::u32 slot = EvictSlot(ipc, v, block_idx);
+      clio::run::u32 slot = EvictSlot(ipc, v, block_idx);
       Page *p = &b->pages[slot];
       p->page_idx = target_page;
       p->lru_clock = clock64();
@@ -539,26 +539,26 @@ CTP_GPU_FUN T *Resolve(::chi::gpu::IpcManager *ipc, DeviceView<T> v,
       hit = p;
       last = hit;
       detail::RescorePush(&b->rescore_q,
-                          static_cast<chi::u32>(target_page), 1.0f);
+                          static_cast<clio::run::u32>(target_page), 1.0f);
     } else {
       // (3b) Async-only path: push a high-priority hint and spin-wait
       // for the manager to populate the page. Score sign distinguishes
       // alloc-only (writes; negative) from prefetch (reads; positive).
       float hint_score = is_write ? -1.0f : 1.0f;
       detail::RescorePush(&b->rescore_q,
-                          static_cast<chi::u32>(target_page), hint_score);
-      chi::u32 total = TotalPagesPerBlock(v.base);
+                          static_cast<clio::run::u32>(target_page), hint_score);
+      clio::run::u32 total = TotalPagesPerBlock(v.base);
       while (!hit) {
         // __threadfence() ensures we observe the manager kernel's
         // writes to page_idx and flags. Without it, the compiler
         // may hoist the load out of the loop.
         __threadfence();
-        for (chi::u32 s = 0; s < total; ++s) {
+        for (clio::run::u32 s = 0; s < total; ++s) {
           Page *p = &b->pages[s];
           // Use volatile reads to defeat caching across iterations.
           int32_t pi = *reinterpret_cast<volatile int32_t *>(&p->page_idx);
           if (pi != target_page) continue;
-          chi::u32 fl = *reinterpret_cast<volatile chi::u32 *>(&p->flags);
+          clio::run::u32 fl = *reinterpret_cast<volatile clio::run::u32 *>(&p->flags);
           if (fl & (kPageBusy | kPageGetInFlight)) continue;
           hit = p;
           last = hit;
@@ -571,7 +571,7 @@ CTP_GPU_FUN T *Resolve(::chi::gpu::IpcManager *ipc, DeviceView<T> v,
           __nanosleep(1000);
           // Re-push in case the manager dropped it (queue overflow).
           detail::RescorePush(&b->rescore_q,
-                              static_cast<chi::u32>(target_page),
+                              static_cast<clio::run::u32>(target_page),
                               hint_score);
         }
       }
@@ -622,12 +622,12 @@ class vector;
  * it via the first warp.
  *
  * Usage:
- *   __global__ void K(chi::IpcManagerGpuInfo info,
+ *   __global__ void K(clio::run::IpcManagerGpuInfo info,
  *                     clio::cte::gpu_vector::DeviceView<int> view) {
  *     CHIMAERA_GPU_INIT(info, nullptr);
  *     cte::gpu::dev::vector<int> v(view, g_ipc_manager_ptr);
- *     v.write_range(lo, hi, [] (chi::u64 i) { return T_for(i); });
- *     v.read_range (lo, hi, [](chi::u64 i, T val) { use(i, val); });
+ *     v.write_range(lo, hi, [] (clio::run::u64 i) { return T_for(i); });
+ *     v.read_range (lo, hi, [](clio::run::u64 i, T val) { use(i, val); });
  *   }
  *
  * Only thread 0 of each warp issues `Send`s under the hood (matches the
@@ -648,7 +648,7 @@ class vector {
    *             CHIMAERA_GPU_INIT.
    */
   CTP_GPU_FUN vector(const DeviceView &view,
-                      ::chi::gpu::IpcManager *ipc) noexcept
+                      ::clio::run::gpu::IpcManager *ipc) noexcept
       : view_(view), ipc_(ipc) {
     __shared__ ::clio::cte::gpu_vector::Page *last_page_storage[32];
     last_page_array_ = last_page_storage;
@@ -664,10 +664,10 @@ class vector {
    * stores in parallel.
    */
   template <typename F>
-  CTP_GPU_FUN void write_range(chi::u64 lo, chi::u64 hi, F &&value_at) {
+  CTP_GPU_FUN void write_range(clio::run::u64 lo, clio::run::u64 hi, F &&value_at) {
     if (lo >= hi) return;
-    chi::u32 lane = threadIdx.x & 31;
-    chi::u64 cap = view_.page_capacity_t;
+    clio::run::u32 lane = threadIdx.x & 31;
+    clio::run::u64 cap = view_.page_capacity_t;
     while (lo < hi) {
       int32_t target_page = static_cast<int32_t>(lo / cap);
       // 1. Cache lookup (lane 0, broadcast). Acquire kPageBusy if hit.
@@ -675,7 +675,7 @@ class vector {
         ::clio::cte::gpu_vector::Page *hit = nullptr;
         ::clio::cte::gpu_vector::Page *&last =
             ::clio::cte::gpu_vector::detail::LaneLastPage(last_page_array_);
-        const chi::u32 busy_mask =
+        const clio::run::u32 busy_mask =
             ::clio::cte::gpu_vector::kPageBusy |
             ::clio::cte::gpu_vector::kPageGetInFlight;
         if (last && last->page_idx == target_page &&
@@ -684,9 +684,9 @@ class vector {
         } else {
           ::clio::cte::gpu_vector::Block *bx =
               ::clio::cte::gpu_vector::GetBlock(view_.base, blockIdx.x);
-          chi::u32 total =
+          clio::run::u32 total =
               ::clio::cte::gpu_vector::TotalPagesPerBlock(view_.base);
-          for (chi::u32 s = 0; s < total; ++s) {
+          for (clio::run::u32 s = 0; s < total; ++s) {
             ::clio::cte::gpu_vector::Page *p = &bx->pages[s];
             if (p->page_idx != target_page) continue;
             if (p->flags & busy_mask) continue;
@@ -722,11 +722,11 @@ class vector {
       }
       // 3. Warp-coop write.
       T *page_base = static_cast<T *>(p->device_ptr);
-      chi::u64 page_start_i =
-          static_cast<chi::u64>(p->page_idx) * cap;
-      chi::u64 page_end_i = page_start_i + cap;
-      chi::u64 stop = (hi < page_end_i) ? hi : page_end_i;
-      chi::u64 page_off_lo = lo - page_start_i;
+      clio::run::u64 page_start_i =
+          static_cast<clio::run::u64>(p->page_idx) * cap;
+      clio::run::u64 page_end_i = page_start_i + cap;
+      clio::run::u64 stop = (hi < page_end_i) ? hi : page_end_i;
+      clio::run::u64 page_off_lo = lo - page_start_i;
       if (lane == 0) {
         int32_t hi_off = static_cast<int32_t>(stop - 1 - page_start_i);
         if (p->modify_min < 0) {
@@ -740,8 +740,8 @@ class vector {
         if (hi_off > p->modify_max) p->modify_max = hi_off;
       }
       __syncwarp();
-      chi::u64 nelem = stop - lo;
-      for (chi::u64 j = lane; j < nelem; j += 32) {
+      clio::run::u64 nelem = stop - lo;
+      for (clio::run::u64 j = lane; j < nelem; j += 32) {
         page_base[page_off_lo + j] = value_at(lo + j);
       }
       __syncwarp();
@@ -755,15 +755,15 @@ class vector {
 
   /**
    * Stride-1 read fast path — warp-cooperative twin of write_range.
-   * consume is called from each lane as `void consume(chi::u64 i, T v)`.
+   * consume is called from each lane as `void consume(clio::run::u64 i, T v)`.
    */
   template <typename F>
-  CTP_GPU_FUN void read_range(chi::u64 lo, chi::u64 hi, F &&consume) {
+  CTP_GPU_FUN void read_range(clio::run::u64 lo, clio::run::u64 hi, F &&consume) {
     if (lo >= hi) return;
-    chi::u32 lane = threadIdx.x & 31;
-    chi::u64 cap = view_.page_capacity_t;
-    const chi::u32 first_page = static_cast<chi::u32>(lo / cap);
-    const chi::u32 last_page = static_cast<chi::u32>((hi - 1) / cap);
+    clio::run::u32 lane = threadIdx.x & 31;
+    clio::run::u64 cap = view_.page_capacity_t;
+    const clio::run::u32 first_page = static_cast<clio::run::u32>(lo / cap);
+    const clio::run::u32 last_page = static_cast<clio::run::u32>((hi - 1) / cap);
     // Lookahead = ~HBM tier size. Larger values just thrash the
     // rescore_q (it's size 256 with kRescoreQueueCap; each page
     // transition pushes kLookahead entries, so at lookahead=32 with
@@ -773,19 +773,19 @@ class vector {
     constexpr int kLookbehind = 2;
     while (lo < hi) {
       if (lane == 0) {
-        chi::u32 cur_page = static_cast<chi::u32>(lo / cap);
+        clio::run::u32 cur_page = static_cast<clio::run::u32>(lo / cap);
         ::clio::cte::gpu_vector::Block *bx =
             ::clio::cte::gpu_vector::GetBlock(view_.base, blockIdx.x);
         for (int la = 1; la <= kLookahead; ++la) {
-          chi::u32 hint = cur_page + static_cast<chi::u32>(la);
+          clio::run::u32 hint = cur_page + static_cast<clio::run::u32>(la);
           if (hint > last_page) break;
           (void)::clio::cte::gpu_vector::detail::RescorePush(
               &bx->rescore_q, hint,
               1.0f - static_cast<float>(la) / (kLookahead + 1));
         }
         for (int lb = 1; lb <= kLookbehind; ++lb) {
-          if (cur_page < first_page + static_cast<chi::u32>(lb)) break;
-          chi::u32 hint = cur_page - static_cast<chi::u32>(lb);
+          if (cur_page < first_page + static_cast<clio::run::u32>(lb)) break;
+          clio::run::u32 hint = cur_page - static_cast<clio::run::u32>(lb);
           (void)::clio::cte::gpu_vector::detail::RescorePush(
               &bx->rescore_q, hint, 0.1f);
         }
@@ -797,13 +797,13 @@ class vector {
       __syncwarp();
       ::clio::cte::gpu_vector::Page *p = last_page_array_[0];
       T *page_base = static_cast<T *>(p->device_ptr);
-      chi::u64 page_start_i =
-          static_cast<chi::u64>(p->page_idx) * cap;
-      chi::u64 page_end_i = page_start_i + cap;
-      chi::u64 stop = (hi < page_end_i) ? hi : page_end_i;
-      chi::u64 page_off_lo = lo - page_start_i;
-      chi::u64 nelem = stop - lo;
-      for (chi::u64 j = lane; j < nelem; j += 32) {
+      clio::run::u64 page_start_i =
+          static_cast<clio::run::u64>(p->page_idx) * cap;
+      clio::run::u64 page_end_i = page_start_i + cap;
+      clio::run::u64 stop = (hi < page_end_i) ? hi : page_end_i;
+      clio::run::u64 page_off_lo = lo - page_start_i;
+      clio::run::u64 nelem = stop - lo;
+      for (clio::run::u64 j = lane; j < nelem; j += 32) {
         consume(lo + j, page_base[page_off_lo + j]);
       }
       __syncwarp();
@@ -828,28 +828,28 @@ class vector {
    * the lane-fast-path makes consecutive same-page hits free.
    */
   template <typename NextI, typename V, typename R>
-  CTP_GPU_FUN void write_range(NextI next_i, chi::u64 n,
+  CTP_GPU_FUN void write_range(NextI next_i, clio::run::u64 n,
                                  V value_at, R rescore,
-                                 chi::u32 lookahead, chi::u32 lookbehind) {
+                                 clio::run::u32 lookahead, clio::run::u32 lookbehind) {
     if (n == 0) return;
-    chi::u32 lane = threadIdx.x & 31;
+    clio::run::u32 lane = threadIdx.x & 31;
     // Iterator form is lane-0 only. Lanes != 0 just return; control
     // reconverges naturally at the function epilogue (no __syncwarp
     // here — that would deadlock against the early-returned lanes).
     if (lane != 0) return;
     ::clio::cte::gpu_vector::Block *b =
         ::clio::cte::gpu_vector::GetBlock(view_.base, blockIdx.x);
-    chi::u64 cap = view_.page_capacity_t;
+    clio::run::u64 cap = view_.page_capacity_t;
     ::clio::cte::gpu_vector::Page *held = nullptr;
     int32_t held_page = -1;
-    for (chi::u64 k = 0; k < n; ++k) {
-      chi::u64 idx = next_i(k);
+    for (clio::run::u64 k = 0; k < n; ++k) {
+      clio::run::u64 idx = next_i(k);
       int32_t pg = static_cast<int32_t>(idx / cap);
       if (pg != held_page) {
         if (held) ::clio::cte::gpu_vector::detail::ReleaseBusy(held);
-        chi::u32 cap_left =
+        clio::run::u32 cap_left =
             ::clio::cte::gpu_vector::detail::RescoreRemaining(&b->rescore_q);
-        chi::u32 clipped_la = (lookahead < cap_left) ? lookahead : cap_left;
+        clio::run::u32 clipped_la = (lookahead < cap_left) ? lookahead : cap_left;
         rescore(k, clipped_la, lookbehind, b->rescore_q);
         (void)::clio::cte::gpu_vector::Resolve(
             ipc_, view_, last_page_array_, idx, /*is_write=*/true);
@@ -857,7 +857,7 @@ class vector {
         while (!::clio::cte::gpu_vector::detail::TryAcquireBusy(held)) {}
         held_page = pg;
       }
-      chi::u64 off_t = idx - static_cast<chi::u64>(pg) * cap;
+      clio::run::u64 off_t = idx - static_cast<clio::run::u64>(pg) * cap;
       T *page_base = static_cast<T *>(held->device_ptr);
       page_base[off_t] = value_at(idx);
       int32_t off_i = static_cast<int32_t>(off_t);
@@ -871,25 +871,25 @@ class vector {
 
   /** Iterator + rescore read form (lane-0 only). */
   template <typename NextI, typename C, typename R>
-  CTP_GPU_FUN void read_range(NextI next_i, chi::u64 n,
+  CTP_GPU_FUN void read_range(NextI next_i, clio::run::u64 n,
                                 C consume, R rescore,
-                                chi::u32 lookahead, chi::u32 lookbehind) {
+                                clio::run::u32 lookahead, clio::run::u32 lookbehind) {
     if (n == 0) return;
-    chi::u32 lane = threadIdx.x & 31;
+    clio::run::u32 lane = threadIdx.x & 31;
     if (lane != 0) return;
     ::clio::cte::gpu_vector::Block *b =
         ::clio::cte::gpu_vector::GetBlock(view_.base, blockIdx.x);
-    chi::u64 cap = view_.page_capacity_t;
+    clio::run::u64 cap = view_.page_capacity_t;
     ::clio::cte::gpu_vector::Page *held = nullptr;
     int32_t held_page = -1;
-    for (chi::u64 k = 0; k < n; ++k) {
-      chi::u64 idx = next_i(k);
+    for (clio::run::u64 k = 0; k < n; ++k) {
+      clio::run::u64 idx = next_i(k);
       int32_t pg = static_cast<int32_t>(idx / cap);
       if (pg != held_page) {
         if (held) ::clio::cte::gpu_vector::detail::ReleaseBusy(held);
-        chi::u32 cap_left =
+        clio::run::u32 cap_left =
             ::clio::cte::gpu_vector::detail::RescoreRemaining(&b->rescore_q);
-        chi::u32 clipped_la = (lookahead < cap_left) ? lookahead : cap_left;
+        clio::run::u32 clipped_la = (lookahead < cap_left) ? lookahead : cap_left;
         rescore(k, clipped_la, lookbehind, b->rescore_q);
         (void)::clio::cte::gpu_vector::Resolve(
             ipc_, view_, last_page_array_, idx, /*is_write=*/false);
@@ -897,7 +897,7 @@ class vector {
         while (!::clio::cte::gpu_vector::detail::TryAcquireBusy(held)) {}
         held_page = pg;
       }
-      chi::u64 off_t = idx - static_cast<chi::u64>(pg) * cap;
+      clio::run::u64 off_t = idx - static_cast<clio::run::u64>(pg) * cap;
       T *page_base = static_cast<T *>(held->device_ptr);
       consume(idx, page_base[off_t]);
     }
@@ -916,7 +916,7 @@ class vector {
 
  private:
   DeviceView view_;
-  ::chi::gpu::IpcManager *ipc_;
+  ::clio::run::gpu::IpcManager *ipc_;
   ::clio::cte::gpu_vector::Page **last_page_array_;
 };
 

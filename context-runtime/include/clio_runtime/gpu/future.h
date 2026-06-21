@@ -38,8 +38,8 @@
 #include "clio_ctp/memory/allocator/allocator.h"
 
 namespace clio::run {
-// Forward-declared so gpu::Future::operator chi::Future<>() can resolve
-// without dragging the full chi::Future header into device-pass code.
+// Forward-declared so gpu::Future::operator clio::run::Future<>() can resolve
+// without dragging the full clio::run::Future header into device-pass code.
 template <typename TaskT, typename AllocT>
 class Future;
 namespace gpu {
@@ -183,12 +183,12 @@ class Future {
   CTP_CROSS_FUN void Wait();
 
   /**
-   * Conversion to chi::Future<TaskT> for host return-type compatibility.
-   * Always produces an empty chi::Future on the host (host-side Send is
+   * Conversion to clio::run::Future<TaskT> for host return-type compatibility.
+   * Always produces an empty clio::run::Future on the host (host-side Send is
    * not GPU-aware in the producer-only model).
    */
-  CTP_CROSS_FUN operator chi::Future<TaskT, AllocT>() const {
-    return chi::Future<TaskT, AllocT>();
+  CTP_CROSS_FUN operator clio::run::Future<TaskT, AllocT>() const {
+    return clio::run::Future<TaskT, AllocT>();
   }
 };
 

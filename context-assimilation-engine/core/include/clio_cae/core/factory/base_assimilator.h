@@ -57,7 +57,7 @@ class BaseAssimilator {
    * @param error_code Output: 0 on success, non-zero error code on failure
    * @return TaskResume for coroutine suspension/resumption
    */
-  virtual chi::TaskResume Schedule(const AssimilationCtx& ctx, int& error_code) = 0;
+  virtual clio::run::TaskResume Schedule(const AssimilationCtx& ctx, int& error_code) = 0;
 };
 
 }  // namespace clio::cae::core

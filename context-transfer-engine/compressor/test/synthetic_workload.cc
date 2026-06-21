@@ -263,7 +263,7 @@ int main(int argc, char** argv) {
   }
 
   // Initialize CTE client (assumes CLIO Runtime runtime is already running)
-  if (!clio::cte::core::CLIO_CTE_CLIENT_INIT("", chi::PoolQuery::Local())) {
+  if (!clio::cte::core::CLIO_CTE_CLIENT_INIT("", clio::run::PoolQuery::Local())) {
     if (rank == 0) {
       HLOG(kError, "Failed to initialize CTE client. Make sure chimaera runtime is started.");
     }
@@ -280,9 +280,9 @@ int main(int argc, char** argv) {
   if (config.compress_option != "none") {
     compressor_client = std::make_unique<clio::cte::compressor::Client>();
     auto create_task = compressor_client->AsyncCreate(
-        chi::PoolQuery::Local(),
+        clio::run::PoolQuery::Local(),
         "clio_cte_compressor",
-        chi::PoolId(513, 0));
+        clio::run::PoolId(513, 0));
     create_task.Wait();
     if (create_task->GetReturnCode() == 0) {
       if (rank == 0) {
@@ -312,7 +312,7 @@ int main(int argc, char** argv) {
   bool use_dynamic = (compress_lib == -1);
 
   // Pending async operations from previous iteration
-  std::vector<chi::Future<clio::cte::core::PutBlobTask>> pending_futures;
+  std::vector<clio::run::Future<clio::cte::core::PutBlobTask>> pending_futures;
   std::vector<ctp::ipc::FullPtr<char>> pending_buffers;  // Keep SHM buffers alive
 
   // Start end-to-end wall clock timer

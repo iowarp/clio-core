@@ -89,7 +89,7 @@ class BdevTransport {
    * @param ctx The coroutine context
    * @return TaskResume to yield or complete the task
    */
-  virtual chi::TaskResume WriteBlocks(ctp::ipc::FullPtr<WriteTask> task, chi::RunContext &ctx) = 0;
+  virtual clio::run::TaskResume WriteBlocks(ctp::ipc::FullPtr<WriteTask> task, clio::run::RunContext &ctx) = 0;
 
   /**
    * Read data from the storage blocks
@@ -97,17 +97,17 @@ class BdevTransport {
    * @param ctx The coroutine context
    * @return TaskResume to yield or complete the task
    */
-  virtual chi::TaskResume ReadBlocks(ctp::ipc::FullPtr<ReadTask> task, chi::RunContext &ctx) = 0;
+  virtual clio::run::TaskResume ReadBlocks(ctp::ipc::FullPtr<ReadTask> task, clio::run::RunContext &ctx) = 0;
 
   /**
    * Get the total capacity of the storage device
    */
-  virtual chi::u64 GetCapacity() const = 0;
+  virtual clio::run::u64 GetCapacity() const = 0;
 
   /**
    * Get the remaining allocatable size
    */
-  virtual chi::u64 GetRemainingSize() const = 0;
+  virtual clio::run::u64 GetRemainingSize() const = 0;
 };
 
 /**

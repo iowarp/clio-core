@@ -9,7 +9,7 @@
 // ============================================================================
 // Backward-compat aliases for the hermes_shm / HSHM era.
 //
-// Makes the legacy hshm::, hipc::, and HSHM_* identifiers remain valid for
+// Makes the legacy ctp::, ctp::ipc::, and HSHM_* identifiers remain valid for
 // external code that has not migrated to the new ctp::, ctp::ipc::, and
 // CTP_* names. Both forms work simultaneously.
 //
@@ -21,15 +21,15 @@
 // ============================================================================
 
 // --- Namespace aliases ---
-// hshm::X   resolves to ctp::X
-// hshm::ipc::X / hipc::X resolves to ctp::ipc::X
+// ctp::X   resolves to ctp::X
+// ctp::ipc::X / ctp::ipc::X resolves to ctp::ipc::X
 //
 // These rely on the `ctp` and `ctp::ipc` namespaces being declared somewhere
 // (the rest of <clio_ctp/clio_ctp.h>); forward-declare them so this header
 // is self-contained.
 namespace ctp { namespace ipc {} }
 namespace hshm = ctp;
-namespace hipc = ctp::ipc;  // shorthand alias (matches the historical hipc:: usage)
+namespace hipc = ctp::ipc;  // shorthand alias (matches the historical ctp::ipc:: usage)
 
 // --- Macro aliases ---
 #define HSHM_COMPILING_DLL                   CTP_COMPILING_DLL

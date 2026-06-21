@@ -77,7 +77,7 @@ using namespace std::chrono;
 namespace {
 
 // Blob size for this benchmark (1MB per blob)
-constexpr chi::u64 kBlobSize = 1024 * 1024;
+constexpr clio::run::u64 kBlobSize = 1024 * 1024;
 
 // Scores for tiered storage (higher score = higher priority/faster tier)
 constexpr float kFastTierScore = 1.0f;  // RAM (fast tier)
@@ -86,9 +86,9 @@ constexpr float kSlowTierScore = 0.0f;  // NVMe (slow tier)
 /**
  * Parse size string with k/K, m/M, g/G suffixes
  */
-chi::u64 ParseSize(const std::string &size_str) {
+clio::run::u64 ParseSize(const std::string &size_str) {
   double size = 0.0;
-  chi::u64 multiplier = 1;
+  clio::run::u64 multiplier = 1;
 
   std::string num_str;
   char suffix = 0;
@@ -124,13 +124,13 @@ chi::u64 ParseSize(const std::string &size_str) {
       break;
   }
 
-  return static_cast<chi::u64>(size * multiplier);
+  return static_cast<clio::run::u64>(size * multiplier);
 }
 
 /**
  * Convert bytes to human-readable string
  */
-std::string FormatSize(chi::u64 bytes) {
+std::string FormatSize(clio::run::u64 bytes) {
   if (bytes >= 1024ULL * 1024 * 1024) {
     return std::to_string(bytes / (1024ULL * 1024 * 1024)) + " GB";
   } else if (bytes >= 1024 * 1024) {
@@ -145,7 +145,7 @@ std::string FormatSize(chi::u64 bytes) {
 /**
  * Calculate bandwidth in MB/s
  */
-double CalcBandwidthMBs(chi::u64 total_bytes, double milliseconds) {
+double CalcBandwidthMBs(clio::run::u64 total_bytes, double milliseconds) {
   if (milliseconds <= 0.0) return 0.0;
   double seconds = milliseconds / 1000.0;
   double megabytes = static_cast<double>(total_bytes) / (1024.0 * 1024.0);
@@ -200,7 +200,7 @@ struct BenchmarkResult {
   double put_time_ms;
   double demotion_time_ms;
   double total_time_ms;
-  chi::u64 total_bytes;
+  clio::run::u64 total_bytes;
   double put_bw_mbs;
   double total_bw_mbs;
 };
@@ -210,7 +210,7 @@ struct BenchmarkResult {
  */
 class CTEScoreBenchmark {
  public:
-  CTEScoreBenchmark(int rank, int num_procs, chi::u64 data_per_rank_step,
+  CTEScoreBenchmark(int rank, int num_procs, clio::run::u64 data_per_rank_step,
                     double busy_wait_sec, int num_steps, int demotion_pct)
       : rank_(rank),
         num_procs_(num_procs),
@@ -307,7 +307,7 @@ class CTEScoreBenchmark {
 
     for (int step = 0; step < num_steps_; ++step) {
       // Step 1: Start async reorganization of blobs from PREVIOUS step
-      std::vector<chi::Future<clio::cte::core::ReorganizeBlobTask>> reorg_tasks;
+      std::vector<clio::run::Future<clio::cte::core::ReorganizeBlobTask>> reorg_tasks;
 
       if (step > 0 && demotion_pct > 0) {
         int prev_step = step - 1;
@@ -350,10 +350,10 @@ class CTEScoreBenchmark {
       std::string tag_name = GetTagName(rank_, step);
       clio::cte::core::Tag tag(tag_name);
 
-      std::vector<chi::Future<clio::cte::core::PutBlobTask>> put_tasks;
+      std::vector<clio::run::Future<clio::cte::core::PutBlobTask>> put_tasks;
       put_tasks.reserve(blobs_per_step_);
 
-      for (chi::u64 b = 0; b < blobs_per_step_; ++b) {
+      for (clio::run::u64 b = 0; b < blobs_per_step_; ++b) {
         std::string blob_name = GetBlobName(rank_, step, b);
         auto task =
             tag.AsyncPutBlob(blob_name, shm_ptr, kBlobSize, 0, kFastTierScore);
@@ -416,10 +416,10 @@ class CTEScoreBenchmark {
       clio::cte::core::TagId tag_id = tag.GetTagId();
 
       // Delete each blob in this tag
-      std::vector<chi::Future<clio::cte::core::DelBlobTask>> del_blob_tasks;
+      std::vector<clio::run::Future<clio::cte::core::DelBlobTask>> del_blob_tasks;
       del_blob_tasks.reserve(blobs_per_step_);
 
-      for (chi::u64 b = 0; b < blobs_per_step_; ++b) {
+      for (clio::run::u64 b = 0; b < blobs_per_step_; ++b) {
         std::string blob_name = GetBlobName(rank_, step, b);
         auto task = cte_client->AsyncDelBlob(tag_id, blob_name);
         del_blob_tasks.push_back(task);
@@ -445,11 +445,11 @@ class CTEScoreBenchmark {
 
   int rank_;
   int num_procs_;
-  chi::u64 data_per_rank_step_;
+  clio::run::u64 data_per_rank_step_;
   double busy_wait_sec_;
   int num_steps_;
   int demotion_pct_;
-  chi::u64 blobs_per_step_;
+  clio::run::u64 blobs_per_step_;
 };
 
 int main(int argc, char **argv) {
@@ -480,7 +480,7 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  chi::u64 data_per_rank_step = ParseSize(argv[1]);
+  clio::run::u64 data_per_rank_step = ParseSize(argv[1]);
   double busy_wait_sec = std::stod(argv[2]);
   int num_steps = std::atoi(argv[3]);
   int demotion_pct = std::atoi(argv[4]);
@@ -504,7 +504,7 @@ int main(int argc, char **argv) {
 
   MPI_Barrier(MPI_COMM_WORLD);
 
-  if (!chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true)) {
+  if (!clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true)) {
     if (rank == 0) {
       HLOG(kError, "Failed to initialize Chimaera runtime");
     }

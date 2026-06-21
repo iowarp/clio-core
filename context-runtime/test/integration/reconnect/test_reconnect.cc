@@ -72,8 +72,8 @@ using namespace std::chrono_literals;
 
 namespace {
 bool g_initialized = false;
-const chi::PoolId kReconnectPoolId(60000, 0);
-constexpr chi::u32 kHoldMs = 100;
+const clio::run::PoolId kReconnectPoolId(60000, 0);
+constexpr clio::run::u32 kHoldMs = 100;
 }  // namespace
 
 class ReconnectTestFixture {
@@ -81,7 +81,7 @@ class ReconnectTestFixture {
   ReconnectTestFixture() {
     if (!g_initialized) {
       INFO("Initializing Chimaera client for Reconnect tests...");
-      bool success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
+      bool success = clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true);
       if (success) {
         g_initialized = true;
         // NOTE: Do NOT set g_test_finalize here because the test
@@ -114,7 +114,7 @@ TEST_CASE("Failover to new host after server shutdown",
     clio::run::MOD_NAME::Client mod_name_client(kReconnectPoolId);
     {
       auto create_task = mod_name_client.AsyncCreate(
-          chi::PoolQuery::Dynamic(), "reconnect_test_pool", kReconnectPoolId);
+          clio::run::PoolQuery::Dynamic(), "reconnect_test_pool", kReconnectPoolId);
       create_task.Wait();
       mod_name_client.pool_id_ = create_task->new_pool_id_;
       mod_name_client.return_code_ = create_task->return_code_;
@@ -124,7 +124,7 @@ TEST_CASE("Failover to new host after server shutdown",
 
     {
       auto task = mod_name_client.AsyncCoMutexTest(
-          chi::PoolQuery::Local(), 1, kHoldMs);
+          clio::run::PoolQuery::Local(), 1, kHoldMs);
       task.Wait();
       REQUIRE(task->return_code_ == 0);
       INFO("Step 1: Pre-shutdown task completed on local node");
@@ -135,11 +135,11 @@ TEST_CASE("Failover to new host after server shutdown",
     // ------------------------------------------------------------------
     INFO("Step 2: Sending AsyncStopRuntime to local runtime");
     {
-      clio::run::admin::Client admin_client(chi::kAdminPoolId);
+      clio::run::admin::Client admin_client(clio::run::kAdminPoolId);
       // Fire-and-forget: send stop with short grace period.
       // Do NOT call Wait() — the server may die before responding.
       admin_client.AsyncStopRuntime(
-          chi::PoolQuery::Local(), 0, 1000);
+          clio::run::PoolQuery::Local(), 0, 1000);
     }
 
     // Wait for the runtime process to actually exit
@@ -164,7 +164,7 @@ TEST_CASE("Failover to new host after server shutdown",
     {
       clio::run::MOD_NAME::Client new_client(kReconnectPoolId);
       auto create_task = new_client.AsyncCreate(
-          chi::PoolQuery::Dynamic(), "reconnect_post_failover_pool",
+          clio::run::PoolQuery::Dynamic(), "reconnect_post_failover_pool",
           kReconnectPoolId);
       create_task.Wait();
       new_client.pool_id_ = create_task->new_pool_id_;
@@ -173,7 +173,7 @@ TEST_CASE("Failover to new host after server shutdown",
       INFO("Step 3: Pool created on new host");
 
       auto task = new_client.AsyncCoMutexTest(
-          chi::PoolQuery::Local(), 1, kHoldMs);
+          clio::run::PoolQuery::Local(), 1, kHoldMs);
       task.Wait();
       REQUIRE(task->return_code_ == 0);
       INFO("Step 3: Post-failover task completed successfully");

@@ -194,7 +194,7 @@ int main(int argc, char* argv[]) {
 
   try {
     // Initialize CLIO Runtime client
-    if (!chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, false)) {
+    if (!clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, false)) {
       HLOG(kError, "Error: Failed to initialize Chimaera client");
       return 1;
     }
@@ -218,8 +218,8 @@ int main(int argc, char* argv[]) {
     // Call ParseOmni with vector of contexts
     auto parse_task = client.AsyncParseOmni(contexts);
     parse_task.Wait();
-    chi::u32 result = parse_task->GetReturnCode();
-    chi::u32 num_tasks_scheduled = parse_task->num_tasks_scheduled_;
+    clio::run::u32 result = parse_task->GetReturnCode();
+    clio::run::u32 num_tasks_scheduled = parse_task->num_tasks_scheduled_;
 
     if (result != 0) {
       HLOG(kError, "Error: ParseOmni failed with result code {}", result);

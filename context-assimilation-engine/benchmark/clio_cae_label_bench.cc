@@ -222,7 +222,7 @@ class LabelBench {
     // that talks to the *real* CTE core at 513.0 directly. Both
     // clients share the same chimaera runtime / IPC.
     cte_direct_ = std::make_unique<clio::cte::core::Client>(
-        chi::PoolId(513, 0));
+        clio::run::PoolId(513, 0));
 
     // Per-thread results.
     std::vector<long long> times_us(a_.threads);
@@ -411,12 +411,12 @@ int main(int argc, char **argv) {
   HLOG(kInfo, "Config: {}", config_path);
 
   HLOG(kInfo, "Initializing Chimaera runtime (kServer)...");
-  if (!chi::CHIMAERA_INIT(chi::ChimaeraMode::kServer)) {
+  if (!clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kServer)) {
     HLOG(kError, "CHIMAERA_INIT failed");
     return 1;
   }
   struct FinalizeGuard {
-    ~FinalizeGuard() { chi::CHIMAERA_FINALIZE(); }
+    ~FinalizeGuard() { clio::run::CHIMAERA_FINALIZE(); }
   } guard;
   std::this_thread::sleep_for(std::chrono::seconds(1));
 

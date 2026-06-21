@@ -64,16 +64,16 @@ NB_MODULE(clio_cte_core_ext, m) {
       .value("kRam", clio::run::bdev::BdevType::kRam);
 
   // Bind ChimaeraMode enum
-  nb::enum_<chi::ChimaeraMode>(m, "ChimaeraMode")
-      .value("kClient", chi::ChimaeraMode::kClient)
-      .value("kServer", chi::ChimaeraMode::kServer)
-      .value("kRuntime", chi::ChimaeraMode::kRuntime);
+  nb::enum_<clio::run::ChimaeraMode>(m, "ChimaeraMode")
+      .value("kClient", clio::run::ChimaeraMode::kClient)
+      .value("kServer", clio::run::ChimaeraMode::kServer)
+      .value("kRuntime", clio::run::ChimaeraMode::kRuntime);
 
   // Bind UniqueId type (used by TagId, BlobId, and PoolId)
-  // Note: TagId, BlobId, and PoolId are all aliases for chi::UniqueId, so we register the base type
+  // Note: TagId, BlobId, and PoolId are all aliases for clio::run::UniqueId, so we register the base type
   auto unique_id_class = nb::class_<clio::cte::core::TagId>(m, "UniqueId")
       .def(nb::init<>())
-      .def(nb::init<chi::u32, chi::u32>(), "major"_a, "minor"_a,
+      .def(nb::init<clio::run::u32, clio::run::u32>(), "major"_a, "minor"_a,
            "Create UniqueId with major and minor values")
       .def_static("GetNull", &clio::cte::core::TagId::GetNull)
       .def("ToU64", &clio::cte::core::TagId::ToU64)
@@ -90,19 +90,19 @@ NB_MODULE(clio_cte_core_ext, m) {
   // nanobind/stl/chrono.h
 
   // Bind PoolQuery for routing queries
-  nb::class_<chi::PoolQuery>(m, "PoolQuery")
+  nb::class_<clio::run::PoolQuery>(m, "PoolQuery")
       .def(nb::init<>())
-      .def_static("Broadcast", &chi::PoolQuery::Broadcast,
+      .def_static("Broadcast", &clio::run::PoolQuery::Broadcast,
                   "net_timeout"_a = -1.0f,
                   "Create a Broadcast pool query (routes to all nodes)")
-      .def_static("Dynamic", &chi::PoolQuery::Dynamic,
+      .def_static("Dynamic", &clio::run::PoolQuery::Dynamic,
                   "net_timeout"_a = -1.0f,
                   "Create a Dynamic pool query (automatic routing optimization)")
-      .def_static("Local", &chi::PoolQuery::Local,
+      .def_static("Local", &clio::run::PoolQuery::Local,
                   "parallelism"_a = 32,
                   "Create a Local pool query (routes to local node only). "
                   "parallelism defaults to 32 — matches C++ "
-                  "chi::PoolQuery::Local default");
+                  "clio::run::PoolQuery::Local default");
 
   // Bind SemanticSearchResult — one row in the ranked output of a
   // SemanticSearch task. Exposed as a plain dataclass-style object so
@@ -154,12 +154,12 @@ NB_MODULE(clio_cte_core_ext, m) {
   // Note: All methods use lambda wrappers to call async methods and wait for completion
   nb::class_<clio::cte::core::Client>(m, "Client")
       .def(nb::init<>())
-      .def(nb::init<const chi::PoolId &>())
+      .def(nb::init<const clio::run::PoolId &>())
       .def("PollTelemetryLog",
           [](clio::cte::core::Client &self, std::uint64_t minimum_logical_time) {
             auto task = self.AsyncPollTelemetryLog(minimum_logical_time);
             task.Wait();
-            // Convert chi::priv::vector to std::vector for Python
+            // Convert clio::run::priv::vector to std::vector for Python
             std::vector<clio::cte::core::CteTelemetry> result;
             for (size_t i = 0; i < task->entries_.size(); ++i) {
               result.push_back(task->entries_[i]);
@@ -180,7 +180,7 @@ NB_MODULE(clio_cte_core_ext, m) {
           "Reorganize single blob with new score for data placement optimization")
      .def("TagQuery",
          [](clio::cte::core::Client &self,
-            const std::string &tag_regex, uint32_t max_tags, const chi::PoolQuery &pool_query) {
+            const std::string &tag_regex, uint32_t max_tags, const clio::run::PoolQuery &pool_query) {
            auto task = self.AsyncTagQuery(tag_regex, max_tags, pool_query);
            task.Wait();
            return task->results_;
@@ -190,7 +190,7 @@ NB_MODULE(clio_cte_core_ext, m) {
      .def("BlobQuery",
          [](clio::cte::core::Client &self,
             const std::string &tag_regex, const std::string &blob_regex,
-            uint32_t max_blobs, const chi::PoolQuery &pool_query) {
+            uint32_t max_blobs, const clio::run::PoolQuery &pool_query) {
            auto task = self.AsyncBlobQuery(tag_regex, blob_regex, max_blobs, pool_query);
            task.Wait();
            // Convert separate tag_names_ and blob_names_ vectors to vector of pairs
@@ -207,7 +207,7 @@ NB_MODULE(clio_cte_core_ext, m) {
          [](clio::cte::core::Client &self,
             const std::string &tag_regex, const std::string &blob_regex,
             const std::string &query_text, uint32_t k,
-            const chi::PoolQuery &pool_query) {
+            const clio::run::PoolQuery &pool_query) {
            // Server-side BM25 over the (tag, blob) pairs that match
            // both regexes. Returns the top-k scored results already
            // sorted descending. Wait() here is fine for the Python
@@ -233,7 +233,7 @@ NB_MODULE(clio_cte_core_ext, m) {
          [](clio::cte::core::Client &self,
             const std::string &tag_regex, const std::string &blob_regex,
             uint64_t time_begin, uint64_t time_end, uint32_t max_entries,
-            const chi::PoolQuery &pool_query) {
+            const clio::run::PoolQuery &pool_query) {
            auto task = self.AsyncTemporalSearch(tag_regex, blob_regex,
                                                 time_begin, time_end,
                                                 max_entries, pool_query);
@@ -252,7 +252,7 @@ NB_MODULE(clio_cte_core_ext, m) {
      .def("RegisterTarget",
          [](clio::cte::core::Client &self,
             const std::string &target_name, clio::run::bdev::BdevType bdev_type,
-            uint64_t total_size, const chi::PoolQuery &target_query, const chi::PoolId &bdev_id) {
+            uint64_t total_size, const clio::run::PoolQuery &target_query, const clio::run::PoolId &bdev_id) {
            auto task = self.AsyncRegisterTarget(target_name, bdev_type, total_size, target_query, bdev_id);
            task.Wait();
            return task->return_code_;
@@ -341,7 +341,7 @@ NB_MODULE(clio_cte_core_ext, m) {
       "Get a copy of the global CTE client instance");
 
   // CLIO Runtime initialization function (unified)
-  m.def("chimaera_init", &chi::CHIMAERA_INIT,
+  m.def("chimaera_init", &clio::run::CHIMAERA_INIT,
         "mode"_a, "default_with_runtime"_a = false, "is_restart"_a = false,
         "Initialize Chimaera with specified mode.\n\n"
         "Args:\n"
@@ -355,9 +355,9 @@ NB_MODULE(clio_cte_core_ext, m) {
         "    bool: True if initialization successful, False otherwise");
 
   // CTE-specific initialization
-  // Note: Lambda wrapper used to avoid chi::PoolQuery::Dynamic() evaluation at import
+  // Note: Lambda wrapper used to avoid clio::run::PoolQuery::Dynamic() evaluation at import
   m.def("initialize_cte",
-        [](const std::string &config_path, const chi::PoolQuery &pool_query) {
+        [](const std::string &config_path, const clio::run::PoolQuery &pool_query) {
           return clio::cte::core::CLIO_CTE_CLIENT_INIT(config_path, pool_query);
         },
         "config_path"_a, "pool_query"_a,

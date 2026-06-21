@@ -88,8 +88,8 @@ namespace gpu { class IpcManager; }
 // included after CLIO_IPC is defined at the bottom of this header.
 template <typename BufferT> class LocalSaveTaskArchive;
 template <typename BufferT> class LocalLoadTaskArchive;
-using DefaultSaveArchive = LocalSaveTaskArchive<chi::priv::vector<char>>;
-using DefaultLoadArchive = LocalLoadTaskArchive<chi::priv::vector<char>>;
+using DefaultSaveArchive = LocalSaveTaskArchive<clio::run::priv::vector<char>>;
+using DefaultLoadArchive = LocalLoadTaskArchive<clio::run::priv::vector<char>>;
 enum class LocalMsgType : uint8_t;
 
 /**
@@ -127,7 +127,7 @@ using NetQueue = ctp::ipc::multi_mpsc_ring_buffer<Future<Task>, CLIO_QUEUE_ALLOC
 /**
  * Typedef for worker queue type to simplify usage
  */
-using WorkQueue = chi::ipc::mpsc_ring_buffer<ctp::ipc::ShmPtr<TaskLane>>;
+using WorkQueue = clio::run::ipc::mpsc_ring_buffer<ctp::ipc::ShmPtr<TaskLane>>;
 
 /**
  * Metadata for client <-> server communication via lightbeam
@@ -384,7 +384,7 @@ class IpcManager {
 
   // AllocateDeviceData / AllocateGpuBuffer were removed along with the
   // GPU runtime concept. Kernel-side buffer allocation now goes
-  // through chi::gpu::IpcManager::AllocateBuffer (carved out of the
+  // through clio::run::gpu::IpcManager::AllocateBuffer (carved out of the
   // gpu2cpu_copy_backend), and host-side device allocation uses
   // ctp::GpuApi::Malloc directly.
 
@@ -1167,7 +1167,7 @@ class IpcManager {
   /**
    * Get number of GPU→CPU queues (one per GPU device).
    * Forwards to gpu::IpcManager::per_gpu_devices_ — there is no longer a
-   * separate gpu_queues_ vector on chi::IpcManager.
+   * separate gpu_queues_ vector on clio::run::IpcManager.
    */
   size_t GetGpuQueueCount() const {
 #if CTP_IS_HOST && (CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL)
@@ -1549,7 +1549,7 @@ class IpcManager {
    * Reader lock: for normal ToFullPtr lookups and allocation attempts
    * Writer lock: for IpcManager cleanup and memory increase operations
    */
-  chi::CoRwLock allocator_map_lock_;
+  clio::run::CoRwLock allocator_map_lock_;
 
 
 #if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL
@@ -1607,9 +1607,9 @@ class IpcManager {
 }  // namespace clio::run
 
 // Global pointer variable declaration for IPC manager singleton
-CLIO_RUN_DEFINE_GLOBAL_PTR_VAR_H(chi::IpcManager, g_ipc_manager);
+CLIO_RUN_DEFINE_GLOBAL_PTR_VAR_H(clio::run::IpcManager, g_ipc_manager);
 
-#define CLIO_IPC CTP_GET_GLOBAL_PTR_VAR(::chi::IpcManager, g_ipc_manager)
+#define CLIO_IPC CTP_GET_GLOBAL_PTR_VAR(::clio::run::IpcManager, g_ipc_manager)
 #define CLIO_CPU_IPC CLIO_IPC
 
 // Backward-compat aliases (clio_run rebrand). External code that still
@@ -1622,7 +1622,7 @@ CLIO_RUN_DEFINE_GLOBAL_PTR_VAR_H(chi::IpcManager, g_ipc_manager);
 #define CHI_CPU_IPC  CLIO_CPU_IPC
 
 // Include local_task_archives after CLIO_IPC is defined, since on GPU
-// CLIO_PRIV_ALLOC expands to chi::GetPrivAllocGpu() (defined below)
+// CLIO_PRIV_ALLOC expands to clio::run::GetPrivAllocGpu() (defined below)
 #include "clio_runtime/local_task_archives.h"
 
 // ================================================================
@@ -1652,12 +1652,12 @@ CTP_CROSS_FUN inline IpcManager *GetGpuIpcManager() {
 //     host IpcManager, not nullptr. Mirrors the SYCL two-form override.
 #undef CLIO_IPC
 #if CTP_IS_GPU
-#define CLIO_IPC (::chi::gpu::GetGpuIpcManager())
+#define CLIO_IPC (::clio::run::gpu::GetGpuIpcManager())
 #else
-#define CLIO_IPC CTP_GET_GLOBAL_PTR_VAR(::chi::IpcManager, g_ipc_manager)
+#define CLIO_IPC CTP_GET_GLOBAL_PTR_VAR(::clio::run::IpcManager, g_ipc_manager)
 #endif
 #undef CLIO_CPU_IPC
-#define CLIO_CPU_IPC CTP_GET_GLOBAL_PTR_VAR(::chi::IpcManager, g_ipc_manager)
+#define CLIO_CPU_IPC CTP_GET_GLOBAL_PTR_VAR(::clio::run::IpcManager, g_ipc_manager)
 
 namespace clio::run {
 // Producer-only model: kernels do not allocate. The legacy
@@ -1724,7 +1724,7 @@ inline ctp::ipc::RoundRobinAllocator *GetSharedAllocGpu() { return nullptr; }
 //
 // Declared `inline` so multiple TUs sharing this header don't generate
 // conflicting definitions.
-inline ::chi::gpu::IpcManager *g_ipc_manager_ptr = nullptr;
+inline ::clio::run::gpu::IpcManager *g_ipc_manager_ptr = nullptr;
 
 // CLIO_IPC under SYCL needs different expansions in the two compilation
 // passes that DPC++ runs over a SYCL TU:
@@ -1743,10 +1743,10 @@ inline ::chi::gpu::IpcManager *g_ipc_manager_ptr = nullptr;
 #if CTP_IS_SYCL_DEVICE
 #define CLIO_IPC (g_ipc_manager_ptr)
 #else
-#define CLIO_IPC CTP_GET_GLOBAL_PTR_VAR(::chi::IpcManager, g_ipc_manager)
+#define CLIO_IPC CTP_GET_GLOBAL_PTR_VAR(::clio::run::IpcManager, g_ipc_manager)
 #endif
 #undef CLIO_CPU_IPC
-#define CLIO_CPU_IPC CTP_GET_GLOBAL_PTR_VAR(::chi::IpcManager, g_ipc_manager)
+#define CLIO_CPU_IPC CTP_GET_GLOBAL_PTR_VAR(::clio::run::IpcManager, g_ipc_manager)
 
 #endif  // CTP_IS_SYCL_COMPILER
 
@@ -1953,7 +1953,7 @@ CTP_CROSS_FUN bool Future<TaskT, AllocT>::Wait(float max_sec,
 template <typename TaskT, typename AllocT>
 CTP_GPU_FUN bool Future<TaskT, AllocT>::WaitGpu2Gpu(float max_sec,
                                                       bool reuse_task) {
-  // chi::Future should not be used for GPU-to-GPU paths.
+  // clio::run::Future should not be used for GPU-to-GPU paths.
   // Use gpu::Future::WaitGpu2Gpu instead.
   (void)max_sec; (void)reuse_task;
   return true;
@@ -2001,7 +2001,7 @@ template <typename TaskT, typename AllocT>
 CTP_HOST_FUN bool Future<TaskT, AllocT>::WaitGpu2Cpu(float max_sec,
                                                        bool reuse_task) {
 #if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM
-  // Host-side polling path (test harness): polls chi::FutureShm with
+  // Host-side polling path (test harness): polls clio::run::FutureShm with
   // system-scope atomics. The GPU kernel uses IpcGpu2Cpu::ClientRecv
   // (device-side) which polls gpu::FutureShm instead.
   ctp::ipc::FullPtr<FutureShm> future_full =
@@ -2030,7 +2030,7 @@ CTP_HOST_FUN bool Future<TaskT, AllocT>::WaitGpu2Cpu(float max_sec,
     ctp::lbm::LbmContext ctx;
     ctx.copy_space = future_full->copy_space;
     ctx.shm_info_ = &future_full->output_;
-    chi::priv::vector<char> load_buf(CLIO_PRIV_ALLOC);
+    clio::run::priv::vector<char> load_buf(CLIO_PRIV_ALLOC);
     load_buf.reserve(256);
     DefaultLoadArchive load_ar(load_buf);
     load_ar.SetMsgType(LocalMsgType::kSerializeOut);

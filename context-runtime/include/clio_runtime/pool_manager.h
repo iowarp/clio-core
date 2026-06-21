@@ -348,10 +348,10 @@ class PoolManager {
 }  // namespace clio::run
 
 // Global pointer variable declaration for Pool manager singleton
-CLIO_RUN_DEFINE_GLOBAL_PTR_VAR_H(chi::PoolManager, g_pool_manager);
+CLIO_RUN_DEFINE_GLOBAL_PTR_VAR_H(clio::run::PoolManager, g_pool_manager);
 
 // Macro for accessing the Pool manager singleton using global pointer variable
-#define CLIO_POOL_MANAGER CTP_GET_GLOBAL_PTR_VAR(::chi::PoolManager, g_pool_manager)
+#define CLIO_POOL_MANAGER CTP_GET_GLOBAL_PTR_VAR(::clio::run::PoolManager, g_pool_manager)
 // Backward-compat alias (clio_run rebrand). External code that still
 // uses the legacy CHI_* spelling keeps working unchanged.
 #define CHI_POOL_MANAGER  CLIO_POOL_MANAGER

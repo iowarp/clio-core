@@ -24,7 +24,7 @@ namespace clio::cte::filesystem {
  * like the libfuse adapter), driving the CTE core client. The one addition is
  * per-file logical-size metadata so getattr is exact and truncate/append work.
  */
-class Runtime : public chi::Container {
+class Runtime : public clio::run::Container {
  public:
   using CreateParams = FilesystemConfig;  // required by CLIO_TASK_CC
 
@@ -32,61 +32,61 @@ class Runtime : public chi::Container {
   ~Runtime() override = default;
 
   // ---- Method handlers ----
-  chi::TaskResume Create(ctp::ipc::FullPtr<CreateTask> task, chi::RunContext &ctx);
-  chi::TaskResume Destroy(ctp::ipc::FullPtr<DestroyTask> task, chi::RunContext &ctx);
-  chi::TaskResume Monitor(ctp::ipc::FullPtr<MonitorTask> task, chi::RunContext &ctx);
-  chi::TaskResume Open(ctp::ipc::FullPtr<OpenTask> task, chi::RunContext &ctx);
-  chi::TaskResume Close(ctp::ipc::FullPtr<CloseTask> task, chi::RunContext &ctx);
-  chi::TaskResume Read(ctp::ipc::FullPtr<ReadTask> task, chi::RunContext &ctx);
-  chi::TaskResume Write(ctp::ipc::FullPtr<WriteTask> task, chi::RunContext &ctx);
-  chi::TaskResume Append(ctp::ipc::FullPtr<AppendTask> task, chi::RunContext &ctx);
-  chi::TaskResume Getattr(ctp::ipc::FullPtr<GetattrTask> task, chi::RunContext &ctx);
-  chi::TaskResume Truncate(ctp::ipc::FullPtr<TruncateTask> task, chi::RunContext &ctx);
-  chi::TaskResume Unlink(ctp::ipc::FullPtr<UnlinkTask> task, chi::RunContext &ctx);
-  chi::TaskResume Mkdir(ctp::ipc::FullPtr<MkdirTask> task, chi::RunContext &ctx);
-  chi::TaskResume Rmdir(ctp::ipc::FullPtr<RmdirTask> task, chi::RunContext &ctx);
-  chi::TaskResume Rename(ctp::ipc::FullPtr<RenameTask> task, chi::RunContext &ctx);
-  chi::TaskResume Link(ctp::ipc::FullPtr<LinkTask> task, chi::RunContext &ctx);
-  chi::TaskResume Readdir(ctp::ipc::FullPtr<ReaddirTask> task, chi::RunContext &ctx);
-  chi::TaskResume StatSize(ctp::ipc::FullPtr<StatSizeTask> task, chi::RunContext &ctx);
+  clio::run::TaskResume Create(ctp::ipc::FullPtr<CreateTask> task, clio::run::RunContext &ctx);
+  clio::run::TaskResume Destroy(ctp::ipc::FullPtr<DestroyTask> task, clio::run::RunContext &ctx);
+  clio::run::TaskResume Monitor(ctp::ipc::FullPtr<MonitorTask> task, clio::run::RunContext &ctx);
+  clio::run::TaskResume Open(ctp::ipc::FullPtr<OpenTask> task, clio::run::RunContext &ctx);
+  clio::run::TaskResume Close(ctp::ipc::FullPtr<CloseTask> task, clio::run::RunContext &ctx);
+  clio::run::TaskResume Read(ctp::ipc::FullPtr<ReadTask> task, clio::run::RunContext &ctx);
+  clio::run::TaskResume Write(ctp::ipc::FullPtr<WriteTask> task, clio::run::RunContext &ctx);
+  clio::run::TaskResume Append(ctp::ipc::FullPtr<AppendTask> task, clio::run::RunContext &ctx);
+  clio::run::TaskResume Getattr(ctp::ipc::FullPtr<GetattrTask> task, clio::run::RunContext &ctx);
+  clio::run::TaskResume Truncate(ctp::ipc::FullPtr<TruncateTask> task, clio::run::RunContext &ctx);
+  clio::run::TaskResume Unlink(ctp::ipc::FullPtr<UnlinkTask> task, clio::run::RunContext &ctx);
+  clio::run::TaskResume Mkdir(ctp::ipc::FullPtr<MkdirTask> task, clio::run::RunContext &ctx);
+  clio::run::TaskResume Rmdir(ctp::ipc::FullPtr<RmdirTask> task, clio::run::RunContext &ctx);
+  clio::run::TaskResume Rename(ctp::ipc::FullPtr<RenameTask> task, clio::run::RunContext &ctx);
+  clio::run::TaskResume Link(ctp::ipc::FullPtr<LinkTask> task, clio::run::RunContext &ctx);
+  clio::run::TaskResume Readdir(ctp::ipc::FullPtr<ReaddirTask> task, clio::run::RunContext &ctx);
+  clio::run::TaskResume StatSize(ctp::ipc::FullPtr<StatSizeTask> task, clio::run::RunContext &ctx);
   // ---- deferred-append pipeline ----
-  chi::TaskResume AppendSequence(ctp::ipc::FullPtr<AppendSequenceTask> task, chi::RunContext &ctx);
-  chi::TaskResume AppendCollect(ctp::ipc::FullPtr<AppendCollectTask> task, chi::RunContext &ctx);
-  chi::TaskResume AppendPlan(ctp::ipc::FullPtr<AppendPlanTask> task, chi::RunContext &ctx);
-  chi::TaskResume AppendExecution(ctp::ipc::FullPtr<AppendExecutionTask> task, chi::RunContext &ctx);
+  clio::run::TaskResume AppendSequence(ctp::ipc::FullPtr<AppendSequenceTask> task, clio::run::RunContext &ctx);
+  clio::run::TaskResume AppendCollect(ctp::ipc::FullPtr<AppendCollectTask> task, clio::run::RunContext &ctx);
+  clio::run::TaskResume AppendPlan(ctp::ipc::FullPtr<AppendPlanTask> task, clio::run::RunContext &ctx);
+  clio::run::TaskResume AppendExecution(ctp::ipc::FullPtr<AppendExecutionTask> task, clio::run::RunContext &ctx);
 
   // ---- Container virtuals (defined in autogen/filesystem_lib_exec.cc) ----
-  void Init(const chi::PoolId &pool_id, const std::string &pool_name,
-            chi::u32 container_id = 0) override;
-  chi::TaskResume Run(chi::u32 method, ctp::ipc::FullPtr<chi::Task> task_ptr,
-                      chi::RunContext &rctx) override;
-  chi::u64 GetWorkRemaining() const override;
-  void LocalLoadTask(chi::u32 method, chi::DefaultLoadArchive &archive,
-                     ctp::ipc::FullPtr<chi::Task> task_ptr) override;
-  ctp::ipc::FullPtr<chi::Task> LocalAllocLoadTask(
-      chi::u32 method, chi::DefaultLoadArchive &archive) override;
-  void LocalSaveTask(chi::u32 method, chi::DefaultSaveArchive &archive,
-                     ctp::ipc::FullPtr<chi::Task> task_ptr) override;
-  void AggregateOut(chi::u32 method, ctp::ipc::FullPtr<chi::Task> orig_task,
-                    const ctp::ipc::FullPtr<chi::Task> &replica_task) override;
-  void AggregateIn(chi::u32 method, ctp::ipc::FullPtr<chi::Task> agg_task,
-                   const ctp::ipc::FullPtr<chi::Task> &member_task) override;
-  void DelTask(chi::u32 method, ctp::ipc::FullPtr<chi::Task> task_ptr) override;
-  void SaveTask(chi::u32 method, chi::SaveTaskArchive &archive,
-                ctp::ipc::FullPtr<chi::Task> task_ptr) override;
-  void LoadTask(chi::u32 method, chi::LoadTaskArchive &archive,
-                ctp::ipc::FullPtr<chi::Task> task_ptr) override;
-  ctp::ipc::FullPtr<chi::Task> AllocLoadTask(chi::u32 method,
-                                             chi::LoadTaskArchive &archive) override;
-  ctp::ipc::FullPtr<chi::Task> NewCopyTask(chi::u32 method,
-                                           ctp::ipc::FullPtr<chi::Task> orig,
+  void Init(const clio::run::PoolId &pool_id, const std::string &pool_name,
+            clio::run::u32 container_id = 0) override;
+  clio::run::TaskResume Run(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> task_ptr,
+                      clio::run::RunContext &rctx) override;
+  clio::run::u64 GetWorkRemaining() const override;
+  void LocalLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive &archive,
+                     ctp::ipc::FullPtr<clio::run::Task> task_ptr) override;
+  ctp::ipc::FullPtr<clio::run::Task> LocalAllocLoadTask(
+      clio::run::u32 method, clio::run::DefaultLoadArchive &archive) override;
+  void LocalSaveTask(clio::run::u32 method, clio::run::DefaultSaveArchive &archive,
+                     ctp::ipc::FullPtr<clio::run::Task> task_ptr) override;
+  void AggregateOut(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> orig_task,
+                    const ctp::ipc::FullPtr<clio::run::Task> &replica_task) override;
+  void AggregateIn(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> agg_task,
+                   const ctp::ipc::FullPtr<clio::run::Task> &member_task) override;
+  void DelTask(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> task_ptr) override;
+  void SaveTask(clio::run::u32 method, clio::run::SaveTaskArchive &archive,
+                ctp::ipc::FullPtr<clio::run::Task> task_ptr) override;
+  void LoadTask(clio::run::u32 method, clio::run::LoadTaskArchive &archive,
+                ctp::ipc::FullPtr<clio::run::Task> task_ptr) override;
+  ctp::ipc::FullPtr<clio::run::Task> AllocLoadTask(clio::run::u32 method,
+                                             clio::run::LoadTaskArchive &archive) override;
+  ctp::ipc::FullPtr<clio::run::Task> NewCopyTask(clio::run::u32 method,
+                                           ctp::ipc::FullPtr<clio::run::Task> orig,
                                            bool deep) override;
-  ctp::ipc::FullPtr<chi::Task> NewTask(chi::u32 method) override;
+  ctp::ipc::FullPtr<clio::run::Task> NewTask(clio::run::u32 method) override;
 
  private:
   // CTE core client this filesystem sits over (set at Create from next_pool_id_).
   clio::cte::core::Client cte_;
-  chi::PoolId next_pool_id_ = chi::PoolId::GetNull();
+  clio::run::PoolId next_pool_id_ = clio::run::PoolId::GetNull();
   // Client bound to THIS filesystem pool, for self-submitted pipeline tasks
   // (periodic AppendSequence, AppendCollect, AppendExecution).
   Client self_;
@@ -99,16 +99,16 @@ class Runtime : public chi::Container {
   struct FileInfo {
     clio::cte::core::TagId tag_id_;
     std::string path_;
-    std::atomic<chi::u64> size_{0};  // logical size
+    std::atomic<clio::run::u64> size_{0};  // logical size
   };
   std::mutex meta_mu_;
-  std::unordered_map<chi::u64, std::shared_ptr<FileInfo>> handles_;  // handle -> file
+  std::unordered_map<clio::run::u64, std::shared_ptr<FileInfo>> handles_;  // handle -> file
   std::unordered_map<std::string, std::shared_ptr<FileInfo>> by_path_;
-  std::atomic<chi::u64> next_handle_{1};
+  std::atomic<clio::run::u64> next_handle_{1};
 
   // ---- deferred-append pipeline state ----
   // Per-node logical append counter (orders appends sharing a UTC tick).
-  std::atomic<chi::u64> append_logical_{0};
+  std::atomic<clio::run::u64> append_logical_{0};
   // Pending appends placed locally, awaiting the periodic AppendSequence drain.
   // Multi-producer (worker threads running Append), single-consumer
   // (AppendSequence) — guarded by a mutex rather than a fixed-capacity ring so

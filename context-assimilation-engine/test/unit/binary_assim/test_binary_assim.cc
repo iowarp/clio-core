@@ -222,7 +222,7 @@ int main(int argc, char* argv[]) {
   try {
     // Initialize CLIO Runtime runtime (CHI_WITH_RUNTIME controls behavior)
     HLOG(kInfo, "Initializing Chimaera...");
-    bool success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
+    bool success = clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true);
     if (!success) {
       HLOG(kError, "Failed to initialize Chimaera");
       return 1;
@@ -267,7 +267,7 @@ int main(int argc, char* argv[]) {
     clio::cae::core::CreateParams params;
 
     auto create_task = cae_client.AsyncCreate(
-        chi::PoolQuery::Local(),
+        clio::run::PoolQuery::Local(),
         "test_cae_pool",
         clio::cae::core::kCaePoolId,
         params);
@@ -303,8 +303,8 @@ int main(int argc, char* argv[]) {
     HLOG(kInfo, "[STEP 5] Calling ParseOmni...");
     auto parse_task = cae_client.AsyncParseOmni(contexts);
     parse_task.Wait();
-    chi::u32 result_code = parse_task->GetReturnCode();
-    chi::u32 num_tasks_scheduled = parse_task->num_tasks_scheduled_;
+    clio::run::u32 result_code = parse_task->GetReturnCode();
+    clio::run::u32 num_tasks_scheduled = parse_task->num_tasks_scheduled_;
 
     HLOG(kInfo, "ParseOmni completed:");
     HLOG(kInfo, "  result_code: {}", result_code);

@@ -58,7 +58,7 @@
 
 using namespace chi;
 
-// The runtime server is launched out-of-process via chi::test::RuntimeServer
+// The runtime server is launched out-of-process via clio::run::test::RuntimeServer
 // (clio_run start) instead of fork()+CHIMAERA_INIT(kServer): fork-without-exec
 // deadlocks on macOS when the child dlopen()s ChiMods (and nondeterministically
 // leaks a port-holding process). The client children below are real fork()s --
@@ -81,7 +81,7 @@ void CleanupSharedMemory() {
 
 TEST_CASE("ExternalClient - Basic Connection", "[external_client][ipc]") {
   // Start the runtime daemon out-of-process
-  chi::test::RuntimeServer server;
+  clio::run::test::RuntimeServer server;
   REQUIRE(server.Start());
   REQUIRE(server.WaitForReady());
 
@@ -113,7 +113,7 @@ TEST_CASE("ExternalClient - Basic Connection", "[external_client][ipc]") {
 
 TEST_CASE("ExternalClient - Multiple Clients", "[external_client][ipc]") {
   // Start the runtime daemon out-of-process
-  chi::test::RuntimeServer server;
+  clio::run::test::RuntimeServer server;
   REQUIRE(server.Start());
   REQUIRE(server.WaitForReady());
 
@@ -181,7 +181,7 @@ TEST_CASE("ExternalClient - Connection Without Server",
 
 TEST_CASE("ExternalClient - Client Operations", "[external_client][ipc]") {
   // Start the runtime daemon out-of-process
-  chi::test::RuntimeServer server;
+  clio::run::test::RuntimeServer server;
   REQUIRE(server.Start());
   REQUIRE(server.WaitForReady());
 

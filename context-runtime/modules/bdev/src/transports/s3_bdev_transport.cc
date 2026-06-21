@@ -51,7 +51,7 @@ bool S3BdevTransport::Init(const CreateParams& params,
 
   s3_capacity_ = (params.total_size_ == 0) ? (1ULL << 40) : params.total_size_; // Default to 1TB
 
-  chi::WorkOrchestrator *work_orchestrator = CLIO_WORK_ORCHESTRATOR;
+  clio::run::WorkOrchestrator *work_orchestrator = CLIO_WORK_ORCHESTRATOR;
   size_t num_workers = work_orchestrator ? work_orchestrator->GetWorkerCount() : 16;
   allocator_.Init(num_workers, s3_capacity_, params.alignment_);
 
@@ -87,8 +87,8 @@ void S3BdevTransport::FreeBlocks(int worker_id, const std::vector<Block>& blocks
   allocator_.FreeBlocks(worker_id, blocks);
 }
 
-chi::TaskResume S3BdevTransport::WriteBlocks(ctp::ipc::FullPtr<WriteTask> task, chi::RunContext &ctx) {
-  chi::RunContext& rctx = ctx;
+clio::run::TaskResume S3BdevTransport::WriteBlocks(ctp::ipc::FullPtr<WriteTask> task, clio::run::RunContext &ctx) {
+  clio::run::RunContext& rctx = ctx;
   CLIO_TASK_BODY_BEGIN
 
 #ifdef CLIO_ENABLE_AMAZON_DRIVE
@@ -102,14 +102,14 @@ chi::TaskResume S3BdevTransport::WriteBlocks(ctp::ipc::FullPtr<WriteTask> task, 
     ctp::DeviceAwareMemcpy(staging.data(), data_ptr.ptr_, task->length_);
   }
 
-  chi::u64 total_bytes_written = 0;
-  chi::u64 data_offset = 0;
+  clio::run::u64 total_bytes_written = 0;
+  clio::run::u64 data_offset = 0;
 
   for (size_t i = 0; i < task->blocks_.size(); ++i) {
     const Block &block = task->blocks_[i];
-    chi::u64 remaining = task->length_ - total_bytes_written;
+    clio::run::u64 remaining = task->length_ - total_bytes_written;
     if (remaining == 0) break;
-    chi::u64 block_write_size = std::min(remaining, block.size_);
+    clio::run::u64 block_write_size = std::min(remaining, block.size_);
 
     char *block_data = data_on_device
                            ? staging.data() + data_offset
@@ -147,8 +147,8 @@ chi::TaskResume S3BdevTransport::WriteBlocks(ctp::ipc::FullPtr<WriteTask> task, 
   CLIO_TASK_BODY_END
 }
 
-chi::TaskResume S3BdevTransport::ReadBlocks(ctp::ipc::FullPtr<ReadTask> task, chi::RunContext &ctx) {
-  chi::RunContext& rctx = ctx;
+clio::run::TaskResume S3BdevTransport::ReadBlocks(ctp::ipc::FullPtr<ReadTask> task, clio::run::RunContext &ctx) {
+  clio::run::RunContext& rctx = ctx;
   CLIO_TASK_BODY_BEGIN
 
 #ifdef CLIO_ENABLE_AMAZON_DRIVE
@@ -161,14 +161,14 @@ chi::TaskResume S3BdevTransport::ReadBlocks(ctp::ipc::FullPtr<ReadTask> task, ch
     staging.resize(task->length_);
   }
 
-  chi::u64 total_bytes_read = 0;
-  chi::u64 data_offset = 0;
+  clio::run::u64 total_bytes_read = 0;
+  clio::run::u64 data_offset = 0;
 
   for (size_t i = 0; i < task->blocks_.size(); ++i) {
     const Block &block = task->blocks_[i];
-    chi::u64 remaining = task->length_ - total_bytes_read;
+    clio::run::u64 remaining = task->length_ - total_bytes_read;
     if (remaining == 0) break;
-    chi::u64 block_read_size = std::min(remaining, block.size_);
+    clio::run::u64 block_read_size = std::min(remaining, block.size_);
 
     char *block_data = data_on_device
                            ? staging.data() + data_offset

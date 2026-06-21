@@ -97,14 +97,14 @@ TEST_CASE("Cfs - filesystem chimod open/write/getattr/read/truncate",
   REQUIRE(server.WaitForReady());
   REQUIRE(RunCliTimed({"compose", "start", yaml.string()}, 60) == 0);
 
-  REQUIRE(chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, false));
+  REQUIRE(clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, false));
   auto* ipc = CLIO_IPC;
   REQUIRE(ipc != nullptr);
 
   clio::cte::filesystem::Client cfs;
-  cfs.Init(chi::PoolId(600, 0));
+  cfs.Init(clio::run::PoolId(600, 0));
 
-  constexpr chi::u64 kSize = 1024 * 1024;  // 1 MiB
+  constexpr clio::run::u64 kSize = 1024 * 1024;  // 1 MiB
   const std::string path = "clio::/cfs_content.bin";
 
   // Open (create).
@@ -114,7 +114,7 @@ TEST_CASE("Cfs - filesystem chimod open/write/getattr/read/truncate",
           open->GetReturnCode(), (unsigned long long)open->handle_,
           (unsigned long long)open->size_, open->created_);
   REQUIRE(open->GetReturnCode() == 0);
-  chi::u64 handle = open->handle_;
+  clio::run::u64 handle = open->handle_;
 
   // Write 1 MiB of '5'.
   ctp::ipc::FullPtr<char> wbuf = ipc->AllocateBuffer(kSize);
@@ -147,7 +147,7 @@ TEST_CASE("Cfs - filesystem chimod open/write/getattr/read/truncate",
   REQUIRE(r->GetReturnCode() == 0);
   REQUIRE(r->bytes_read_ == kSize);
   bool all_five = true;
-  for (chi::u64 i = 0; i < kSize; ++i) {
+  for (clio::run::u64 i = 0; i < kSize; ++i) {
     if (rbuf.ptr_[i] != '5') { all_five = false; break; }
   }
   REQUIRE(all_five);
@@ -168,26 +168,26 @@ TEST_CASE("Cfs - filesystem chimod open/write/getattr/read/truncate",
   // ---- GetOrCreateTagAlias (tag-level hard link) ----
   // Talk to the cte_core pool (512.0) directly with the core client.
   clio::cte::core::Client core;
-  core.Init(chi::PoolId(512, 0));
+  core.Init(clio::run::PoolId(512, 0));
 
   // Create a fresh tag and write a known blob to it.
   const std::string kOrig = "alias_orig_tag";
   auto mk = core.AsyncGetOrCreateTag(kOrig, clio::cte::core::TagId::GetNull(),
-                                     chi::PoolQuery::Local());
+                                     clio::run::PoolQuery::Local());
   mk.Wait();
   REQUIRE(mk->GetReturnCode() == 0);
   clio::cte::core::TagId orig_id = mk->tag_id_;
   REQUIRE(!orig_id.IsNull());
 
   const char kMsg[] = "hello-alias-payload";
-  constexpr chi::u64 kMsgN = sizeof(kMsg);  // includes NUL
+  constexpr clio::run::u64 kMsgN = sizeof(kMsg);  // includes NUL
   ctp::ipc::FullPtr<char> pbuf = ipc->AllocateBuffer(kMsgN);
   REQUIRE(!pbuf.IsNull());
   memcpy(pbuf.ptr_, kMsg, kMsgN);
   auto pb = core.AsyncPutBlob(orig_id, "0", 0, kMsgN,
                               pbuf.shm_.template Cast<void>(), -1.0f,
                               clio::cte::core::Context(), 0u,
-                              chi::PoolQuery::Local());
+                              clio::run::PoolQuery::Local());
   pb.Wait();
   REQUIRE(pb->GetReturnCode() == 0);
   ipc->FreeBuffer(pbuf);
@@ -202,7 +202,7 @@ TEST_CASE("Cfs - filesystem chimod open/write/getattr/read/truncate",
 
   // Resolving the alias name must yield the SAME TagId (hard link).
   auto rs = core.AsyncGetOrCreateTag(kAlias, clio::cte::core::TagId::GetNull(),
-                                     chi::PoolQuery::Local());
+                                     clio::run::PoolQuery::Local());
   rs.Wait();
   REQUIRE(rs->GetReturnCode() == 0);
   REQUIRE(rs->tag_id_ == orig_id);
@@ -213,7 +213,7 @@ TEST_CASE("Cfs - filesystem chimod open/write/getattr/read/truncate",
   memset(gbuf.ptr_, 0, kMsgN);
   auto gb = core.AsyncGetBlob(rs->tag_id_, "0", 0, kMsgN, 0u,
                               gbuf.shm_.template Cast<void>(),
-                              chi::PoolQuery::Local());
+                              clio::run::PoolQuery::Local());
   gb.Wait();
   REQUIRE(gb->GetReturnCode() == 0);
   REQUIRE(memcmp(gbuf.ptr_, kMsg, kMsgN) == 0);
@@ -231,7 +231,7 @@ TEST_CASE("Cfs - filesystem chimod open/write/getattr/read/truncate",
   al2.Wait();
   REQUIRE(al2->found_ == 1);
 
-  auto unlink = core.AsyncDelTag(kAlias2, chi::PoolQuery::Local());
+  auto unlink = core.AsyncDelTag(kAlias2, clio::run::PoolQuery::Local());
   unlink.Wait();
   REQUIRE(unlink->GetReturnCode() == 0);
 
@@ -241,7 +241,7 @@ TEST_CASE("Cfs - filesystem chimod open/write/getattr/read/truncate",
   memset(ubuf.ptr_, 0, kMsgN);
   auto ug = core.AsyncGetBlob(orig_id, "0", 0, kMsgN, 0u,
                               ubuf.shm_.template Cast<void>(),
-                              chi::PoolQuery::Local());
+                              clio::run::PoolQuery::Local());
   ug.Wait();
   REQUIRE(ug->GetReturnCode() == 0);
   REQUIRE(memcmp(ubuf.ptr_, kMsg, kMsgN) == 0);
@@ -249,12 +249,12 @@ TEST_CASE("Cfs - filesystem chimod open/write/getattr/read/truncate",
 
   // The first alias must still resolve to the SAME id.
   auto still = core.AsyncGetOrCreateTag(
-      kAlias, clio::cte::core::TagId::GetNull(), chi::PoolQuery::Local());
+      kAlias, clio::cte::core::TagId::GetNull(), clio::run::PoolQuery::Local());
   still.Wait();
   REQUIRE(still->tag_id_ == orig_id);
 
   // ---- Cascade delete: deleting the canonical tag removes all aliases ----
-  auto del = core.AsyncDelTag(kOrig, chi::PoolQuery::Local());
+  auto del = core.AsyncDelTag(kOrig, clio::run::PoolQuery::Local());
   del.Wait();
   REQUIRE(del->GetReturnCode() == 0);
 
@@ -263,7 +263,7 @@ TEST_CASE("Cfs - filesystem chimod open/write/getattr/read/truncate",
   REQUIRE(!dbuf.IsNull());
   auto dg = core.AsyncGetBlob(orig_id, "0", 0, kMsgN, 0u,
                               dbuf.shm_.template Cast<void>(),
-                              chi::PoolQuery::Local());
+                              clio::run::PoolQuery::Local());
   dg.Wait();
   REQUIRE(dg->GetReturnCode() != 0);
   ipc->FreeBuffer(dbuf);
@@ -271,7 +271,7 @@ TEST_CASE("Cfs - filesystem chimod open/write/getattr/read/truncate",
   // The surviving alias was cascade-removed: re-resolving its name now mints
   // a fresh, DIFFERENT tag id (the old binding to orig_id is gone).
   auto gone = core.AsyncGetOrCreateTag(
-      kAlias, clio::cte::core::TagId::GetNull(), chi::PoolQuery::Local());
+      kAlias, clio::cte::core::TagId::GetNull(), clio::run::PoolQuery::Local());
   gone.Wait();
   REQUIRE(gone->GetReturnCode() == 0);
   REQUIRE(!(gone->tag_id_ == orig_id));
@@ -288,14 +288,14 @@ TEST_CASE("Cfs - filesystem chimod open/write/getattr/read/truncate",
 
   // Creating "/a/b/c/d" builds the whole chain; the returned id is the leaf.
   auto deep = core.AsyncGetOrCreateTag(
-      "/a/b/c/d", TagId::GetNull(), chi::PoolQuery::Local());
+      "/a/b/c/d", TagId::GetNull(), clio::run::PoolQuery::Local());
   deep.Wait();
   REQUIRE(deep->GetReturnCode() == 0);
   TagId d_id = deep->tag_id_;
 
   // The intermediate "/a/b" already exists from the chain — same id, no dup.
   auto mid = core.AsyncGetOrCreateTag(
-      "/a/b", TagId::GetNull(), chi::PoolQuery::Local());
+      "/a/b", TagId::GetNull(), clio::run::PoolQuery::Local());
   mid.Wait();
   REQUIRE(mid->GetReturnCode() == 0);
   TagId b_id = mid->tag_id_;
@@ -308,14 +308,14 @@ TEST_CASE("Cfs - filesystem chimod open/write/getattr/read/truncate",
 
   // Write a blob under the deepest tag so we can prove data survives the move.
   const char kDeepMsg[] = "deep-payload";
-  constexpr chi::u64 kDeepN = sizeof(kDeepMsg);
+  constexpr clio::run::u64 kDeepN = sizeof(kDeepMsg);
   ctp::ipc::FullPtr<char> hpb = ipc->AllocateBuffer(kDeepN);
   REQUIRE(!hpb.IsNull());
   memcpy(hpb.ptr_, kDeepMsg, kDeepN);
   auto hp = core.AsyncPutBlob(d_id, "0", 0, kDeepN,
                               hpb.shm_.template Cast<void>(), -1.0f,
                               clio::cte::core::Context(), 0u,
-                              chi::PoolQuery::Local());
+                              clio::run::PoolQuery::Local());
   hp.Wait();
   REQUIRE(hp->GetReturnCode() == 0);
   ipc->FreeBuffer(hpb);
@@ -336,7 +336,7 @@ TEST_CASE("Cfs - filesystem chimod open/write/getattr/read/truncate",
   memset(hgb.ptr_, 0, kDeepN);
   auto hg = core.AsyncGetBlob(d_id, "0", 0, kDeepN, 0u,
                               hgb.shm_.template Cast<void>(),
-                              chi::PoolQuery::Local());
+                              clio::run::PoolQuery::Local());
   hg.Wait();
   REQUIRE(hg->GetReturnCode() == 0);
   REQUIRE(memcmp(hgb.ptr_, kDeepMsg, kDeepN) == 0);
@@ -345,7 +345,7 @@ TEST_CASE("Cfs - filesystem chimod open/write/getattr/read/truncate",
   // The old path "/a/b" is now free: re-creating it mints a NEW id (the old
   // binding moved away), while "/a" itself still exists as a parent.
   auto recreate = core.AsyncGetOrCreateTag(
-      "/a/b", TagId::GetNull(), chi::PoolQuery::Local());
+      "/a/b", TagId::GetNull(), clio::run::PoolQuery::Local());
   recreate.Wait();
   REQUIRE(recreate->GetReturnCode() == 0);
   REQUIRE(!(recreate->tag_id_ == b_id));
@@ -354,12 +354,12 @@ TEST_CASE("Cfs - filesystem chimod open/write/getattr/read/truncate",
   // Current tree under the moved dir: "/x/y" (b_id) -> "/x/y/c" -> "/x/y/c/d"
   // (d_id, holds a blob). Capture the intermediate id "/x/y/c" too.
   auto cmid = core.AsyncGetOrCreateTag(
-      "/x/y/c", TagId::GetNull(), chi::PoolQuery::Local());
+      "/x/y/c", TagId::GetNull(), clio::run::PoolQuery::Local());
   cmid.Wait();
   REQUIRE(cmid->GetReturnCode() == 0);
   TagId c_id = cmid->tag_id_;
 
-  auto rmrf = core.AsyncDelTag(std::string("/x/y"), chi::PoolQuery::Local());
+  auto rmrf = core.AsyncDelTag(std::string("/x/y"), clio::run::PoolQuery::Local());
   rmrf.Wait();
   REQUIRE(rmrf->GetReturnCode() == 0);
 
@@ -376,14 +376,14 @@ TEST_CASE("Cfs - filesystem chimod open/write/getattr/read/truncate",
   REQUIRE(!rdb.IsNull());
   auto rdg = core.AsyncGetBlob(d_id, "0", 0, kDeepN, 0u,
                                rdb.shm_.template Cast<void>(),
-                               chi::PoolQuery::Local());
+                               clio::run::PoolQuery::Local());
   rdg.Wait();
   REQUIRE(rdg->GetReturnCode() != 0);
   ipc->FreeBuffer(rdb);
 
   // Re-creating the deepest path mints fresh ids (subtree fully removed).
   auto reborn = core.AsyncGetOrCreateTag(
-      "/x/y/c/d", TagId::GetNull(), chi::PoolQuery::Local());
+      "/x/y/c/d", TagId::GetNull(), clio::run::PoolQuery::Local());
   reborn.Wait();
   REQUIRE(reborn->GetReturnCode() == 0);
   REQUIRE(!(reborn->tag_id_ == d_id));
@@ -417,12 +417,12 @@ TEST_CASE("Cfs - filesystem chimod open/write/getattr/read/truncate",
   // Create a file inside the directory and write to it.
   const std::string kFile = "/d1/f.txt";
   const char kFileMsg[] = "dir-file-payload!";
-  constexpr chi::u64 kFileN = sizeof(kFileMsg);
+  constexpr clio::run::u64 kFileN = sizeof(kFileMsg);
   {
     auto op = cfs.AsyncOpen(kFile, O_CREAT | O_RDWR, 0644);
     op.Wait();
     REQUIRE(op->GetReturnCode() == 0);
-    chi::u64 h = op->handle_;
+    clio::run::u64 h = op->handle_;
     ctp::ipc::FullPtr<char> wb = ipc->AllocateBuffer(kFileN);
     memcpy(wb.ptr_, kFileMsg, kFileN);
     auto w = cfs.AsyncWrite(h, 0, kFileN, wb.shm_.template Cast<void>());
@@ -541,13 +541,13 @@ TEST_CASE("Cfs - filesystem chimod open/write/getattr/read/truncate",
     auto aop = cfs.AsyncOpen(apath, O_CREAT | O_RDWR, 0644);
     aop.Wait();
     REQUIRE(aop->GetReturnCode() == 0);
-    chi::u64 ah = aop->handle_;
+    clio::run::u64 ah = aop->handle_;
     REQUIRE(ah != 0);
 
-    constexpr chi::u64 kChunk = 4096;
+    constexpr clio::run::u64 kChunk = 4096;
     constexpr int kNum = 16;  // concurrent stress (probe for corruption)
     std::vector<ctp::ipc::FullPtr<char>> abufs;
-    std::vector<chi::Future<clio::cte::filesystem::AppendTask>> afuts;
+    std::vector<clio::run::Future<clio::cte::filesystem::AppendTask>> afuts;
     for (int c = 0; c < kNum; ++c) {
       char mark = static_cast<char>('a' + c);
       ctp::ipc::FullPtr<char> ab = ipc->AllocateBuffer(kChunk);
@@ -558,7 +558,7 @@ TEST_CASE("Cfs - filesystem chimod open/write/getattr/read/truncate",
     }
     for (auto &f : afuts) { f.Wait(); REQUIRE(f->GetReturnCode() == 0); }
     for (auto &ab : abufs) ipc->FreeBuffer(ab);
-    const chi::u64 total = kChunk * kNum;
+    const clio::run::u64 total = kChunk * kNum;
 
     // Concurrent appends are ordered by (UTC, logical), not submission order, so
     // we don't pin the order. The pipeline (periodic AppendSequence -> ManyToOne
@@ -578,7 +578,7 @@ TEST_CASE("Cfs - filesystem chimod open/write/getattr/read/truncate",
         for (int c = 0; c < kNum && ok; ++c) {
           const char *region = rb.ptr_ + static_cast<size_t>(c) * kChunk;
           char m = region[0];
-          for (chi::u64 i = 0; i < kChunk; ++i) {
+          for (clio::run::u64 i = 0; i < kChunk; ++i) {
             if (region[i] != m) { ok = false; break; }
           }
           if (ok && m >= 'a' && m < 'a' + kNum) seen.insert(m);

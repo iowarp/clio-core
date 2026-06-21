@@ -14,23 +14,23 @@ int main() {
 
   try {
     // Initialize CLIO Runtime client
-    if (!chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true)) {
+    if (!clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true)) {
       HLOG(kError, "Failed to initialize Chimaera client");
       return 1;
     }
     HIPRINT("Chimaera client initialized successfully");
 
     // Create admin client
-    clio::run::admin::Client admin_client(chi::kAdminPoolId);
+    clio::run::admin::Client admin_client(clio::run::kAdminPoolId);
     HIPRINT("Admin client created successfully");
 
     // Test that we can call basic methods (without actually creating containers)
     // This tests that the linking and symbol resolution is working
-    auto pool_query = chi::PoolQuery::Local();
+    auto pool_query = clio::run::PoolQuery::Local();
     HIPRINT("Pool query created successfully");
 
     HIPRINT("All external ChiMod integration tests passed!");
-    chi::CHIMAERA_FINALIZE();
+    clio::run::CHIMAERA_FINALIZE();
     return 0;
 
   } catch (const std::exception& e) {

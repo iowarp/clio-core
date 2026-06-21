@@ -80,16 +80,16 @@
 namespace fs = std::filesystem;
 
 static std::string chi_test_data_dir() {
-  const char *d = chi::env::GetCompat("TEST_DATA_DIR");
+  const char *d = clio::run::env::GetCompat("TEST_DATA_DIR");
   return (d && *d) ? d : ".";
 }
 
 // Working set: small vs. 80% DRAM, big enough to drive real placement +
 // inter-tier migration.
-static constexpr chi::u64 kBlobSize = 1 * 1024 * 1024;          // 1MB
-static constexpr chi::u64 kTotalDataSize = 96 * 1024 * 1024;    // 96MB
+static constexpr clio::run::u64 kBlobSize = 1 * 1024 * 1024;          // 1MB
+static constexpr clio::run::u64 kTotalDataSize = 96 * 1024 * 1024;    // 96MB
 static constexpr int kNumBlobs = kTotalDataSize / kBlobSize;    // 96 blobs
-static constexpr chi::u64 kSlowFileCapacity = 64 * 1024 * 1024; // 64MB
+static constexpr clio::run::u64 kSlowFileCapacity = 64 * 1024 * 1024; // 64MB
 
 static constexpr float kFastTierScore = 1.0f;  // ram::dram_default (0g)
 static constexpr float kSlowTierScore = 0.0f;  // bounded file tier
@@ -113,7 +113,7 @@ class DramDefaultTieringFixture {
     ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", config_path_.c_str(), 1);
     ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", config_path_.c_str(), 1);
 
-    bool success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
+    bool success = clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true);
     REQUIRE(success);
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
@@ -210,8 +210,8 @@ static DramDefaultTieringFixture *g_fixture = nullptr;
  */
 TEST_CASE("DramDefault - 80% policy is sane and >= working set",
           "[tiered][dram-default][policy]") {
-  chi::u64 total_dram = ctp::SystemInfo::GetRamCapacity();
-  chi::u64 defaulted = clio::run::bdev::DefaultRamCapacityBytes();
+  clio::run::u64 total_dram = ctp::SystemInfo::GetRamCapacity();
+  clio::run::u64 defaulted = clio::run::bdev::DefaultRamCapacityBytes();
 
   INFO("Total system DRAM: " << total_dram << " bytes");
   INFO("0g default (80%):  " << defaulted << " bytes");

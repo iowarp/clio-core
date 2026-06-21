@@ -8,7 +8,7 @@ namespace cte_ffi {
 
 bool cte_init(rust::Str config_path) {
   std::string path(config_path.data(), config_path.size());
-  bool ok = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
+  bool ok = clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true);
   if (!ok) return false;
   return clio::cte::core::CLIO_CTE_CLIENT_INIT(path);
 }
@@ -71,17 +71,17 @@ CteTagId tag_get_id(const CteTag &tag) {
 bool client_register_target(rust::Str target_path, uint64_t size) {
   std::string path(target_path.data(), target_path.size());
   // Create a bdev pool for this target
-  chi::PoolId bdev_pool_id(800, 0);
+  clio::run::PoolId bdev_pool_id(800, 0);
   clio::run::bdev::Client bdev_client(bdev_pool_id);
   auto create_task = bdev_client.AsyncCreate(
-      chi::PoolQuery::Dynamic(), path, bdev_pool_id,
+      clio::run::PoolQuery::Dynamic(), path, bdev_pool_id,
       clio::run::bdev::BdevType::kFile);
   create_task.Wait();
   // Register with CTE
   auto *client = CLIO_CTE_CLIENT;
   auto reg_task = client->AsyncRegisterTarget(
       path, clio::run::bdev::BdevType::kFile, size,
-      chi::PoolQuery::Local(), bdev_pool_id);
+      clio::run::PoolQuery::Local(), bdev_pool_id);
   reg_task.Wait();
   return true;
 }

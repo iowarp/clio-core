@@ -94,7 +94,7 @@ namespace ctp::ipc {
  * @param info LocalTaskInfo to serialize
  */
 template <typename Ar>
-CTP_CROSS_FUN void save(Ar &ar, const chi::LocalTaskInfo &info) {
+CTP_CROSS_FUN void save(Ar &ar, const clio::run::LocalTaskInfo &info) {
   // Serialize TaskId fields
   ar << info.task_id_.pid_;
   ar << info.task_id_.tid_;
@@ -116,7 +116,7 @@ CTP_CROSS_FUN void save(Ar &ar, const chi::LocalTaskInfo &info) {
  * @param info LocalTaskInfo to deserialize into
  */
 template <typename Ar>
-CTP_CROSS_FUN void load(Ar &ar, chi::LocalTaskInfo &info) {
+CTP_CROSS_FUN void load(Ar &ar, clio::run::LocalTaskInfo &info) {
   // Deserialize TaskId fields
   ar >> info.task_id_.pid_;
   ar >> info.task_id_.tid_;
@@ -141,7 +141,7 @@ namespace clio::run {
 // and on host (MallocAllocator).
 using LocalLbmBase = ctp::lbm::LbmMeta<CLIO_PRIV_ALLOC_T>;
 
-using LocalTaskInfoVec = chi::priv::vector<LocalTaskInfo>;
+using LocalTaskInfoVec = clio::run::priv::vector<LocalTaskInfo>;
 
 /**
  * Dry-run archive that computes serialized size for a task without copying.
@@ -260,7 +260,7 @@ class CalculateSizeTaskArchive {
 /**
  * Archive for saving tasks (inputs or outputs) using LocalSerialize.
  * Templated on BufferT so callers can use any vector-like container
- * (e.g., chi::priv::vector<char>, ctp::priv::wrap_vector, etc.).
+ * (e.g., clio::run::priv::vector<char>, ctp::priv::wrap_vector, etc.).
  *
  * Does NOT own the buffer — callers provide a reference.
  * Inherits from LbmMeta for ShmTransport::Send compatibility.
@@ -732,9 +732,9 @@ class LocalLoadTaskArchive : public LocalLbmBase {
   }
 };
 
-/** Default archive type aliases using chi::priv::vector<char> buffer */
-using DefaultSaveArchive = LocalSaveTaskArchive<chi::priv::vector<char>>;
-using DefaultLoadArchive = LocalLoadTaskArchive<chi::priv::vector<char>>;
+/** Default archive type aliases using clio::run::priv::vector<char> buffer */
+using DefaultSaveArchive = LocalSaveTaskArchive<clio::run::priv::vector<char>>;
+using DefaultLoadArchive = LocalLoadTaskArchive<clio::run::priv::vector<char>>;
 
 /** Wrap-vector archive aliases for zero-copy GPU transport */
 using WrapSaveArchive = LocalSaveTaskArchive<ctp::priv::wrap_vector>;

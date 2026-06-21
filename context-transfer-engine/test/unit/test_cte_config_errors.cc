@@ -169,7 +169,7 @@ TEST_CASE("ConfigErrors - dpe and gpu_metadata_cache parsing",
 namespace {
 
 /** Drive ParseSizeString (private) through the storage capacity_limit key. */
-bool ParseCapacity(const std::string &cap, chi::u64 *out_bytes = nullptr) {
+bool ParseCapacity(const std::string &cap, clio::run::u64 *out_bytes = nullptr) {
   Config config;
   std::string yaml =
       "storage:\n  - path: /tmp/cap_probe\n    bdev_type: ram\n"
@@ -187,7 +187,7 @@ bool ParseCapacity(const std::string &cap, chi::u64 *out_bytes = nullptr) {
 
 TEST_CASE("ConfigErrors - size string parsing via capacity_limit",
           "[cte][config][size]") {
-  chi::u64 bytes = 0;
+  clio::run::u64 bytes = 0;
 
   SECTION("Empty and malformed inputs rejected");
   REQUIRE_FALSE(ParseCapacity(""));

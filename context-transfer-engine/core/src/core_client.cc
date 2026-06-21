@@ -42,7 +42,7 @@ namespace clio::cte::core {
 CLIO_CTE_DEFINE_GLOBAL_PTR_VAR_CC(clio::cte::core::Client, g_cte_client);
 
 bool CLIO_CTE_CLIENT_INIT(const std::string &config_path,
-                         const chi::PoolQuery &pool_query) {
+                         const clio::run::PoolQuery &pool_query) {
   // Static guard to prevent double initialization
   static bool s_initialized = false;
   if (s_initialized) {

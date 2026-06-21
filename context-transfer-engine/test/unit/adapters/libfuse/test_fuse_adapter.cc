@@ -65,7 +65,7 @@ using namespace clio::cae::fuse;
 
 class FuseAdapterTestFixture {
  public:
-  static constexpr chi::u64 kTestTargetSize = 1024 * 1024 * 10;  // 10MB
+  static constexpr clio::run::u64 kTestTargetSize = 1024 * 1024 * 10;  // 10MB
 
   std::string test_storage_path_;
   static inline bool g_initialized = false;
@@ -81,7 +81,7 @@ class FuseAdapterTestFixture {
     }
 
     if (!g_initialized) {
-      bool success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
+      bool success = clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true);
       REQUIRE(success);
 
       std::this_thread::sleep_for(std::chrono::milliseconds(500));
@@ -95,7 +95,7 @@ class FuseAdapterTestFixture {
 
       clio::cte::core::CreateParams params;
       auto create_task = cte_client->AsyncCreate(
-          chi::PoolQuery::Dynamic(), clio::cte::core::kCtePoolName,
+          clio::run::PoolQuery::Dynamic(), clio::cte::core::kCtePoolName,
           clio::cte::core::kCtePoolId, params);
       create_task.Wait();
       REQUIRE(create_task->GetReturnCode() == 0);
@@ -118,10 +118,10 @@ class FuseAdapterTestFixture {
 
     auto *cte_client = CLIO_CTE_CLIENT;
 
-    chi::PoolId bdev_pool_id(950, 0);
+    clio::run::PoolId bdev_pool_id(950, 0);
     clio::run::bdev::Client bdev_client(bdev_pool_id);
     auto create_task =
-        bdev_client.AsyncCreate(chi::PoolQuery::Dynamic(), test_storage_path_,
+        bdev_client.AsyncCreate(clio::run::PoolQuery::Dynamic(), test_storage_path_,
                                 bdev_pool_id, clio::run::bdev::BdevType::kFile);
     create_task.Wait();
 
@@ -129,7 +129,7 @@ class FuseAdapterTestFixture {
 
     auto reg_task = cte_client->AsyncRegisterTarget(
         test_storage_path_, clio::run::bdev::BdevType::kFile, kTestTargetSize,
-        chi::PoolQuery::Local(), bdev_pool_id);
+        clio::run::PoolQuery::Local(), bdev_pool_id);
     reg_task.Wait();
     REQUIRE(reg_task->GetReturnCode() == 0);
 

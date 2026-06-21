@@ -57,7 +57,7 @@
 namespace fs = std::filesystem;
 
 static std::string chi_test_data_dir() {
-  const char *d = chi::env::GetCompat("TEST_DATA_DIR");
+  const char *d = clio::run::env::GetCompat("TEST_DATA_DIR");
   return (d && *d) ? d : ".";
 }
 
@@ -66,7 +66,7 @@ static std::string chi_test_data_dir() {
  */
 class TagTestFixture {
  public:
-  static constexpr chi::u64 kTestTargetSize = 1024 * 1024 * 10;  // 10MB
+  static constexpr clio::run::u64 kTestTargetSize = 1024 * 1024 * 10;  // 10MB
   static constexpr size_t kSmallDataSize = 1024;                  // 1KB
   static constexpr size_t kMediumDataSize = 16 * 1024;           // 16KB
   static constexpr size_t kLargeDataSize = 1024 * 1024;          // 1MB
@@ -89,7 +89,7 @@ class TagTestFixture {
       if (fs::exists(test_storage_path_)) {
         fs::remove(test_storage_path_);
       }
-      bool success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
+      bool success = clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true);
       REQUIRE(success);
 
       // Give runtime time to initialize
@@ -112,7 +112,7 @@ class TagTestFixture {
       // Create the CTE core pool explicitly
       clio::cte::core::CreateParams params;
       auto create_task = cte_client->AsyncCreate(
-          chi::PoolQuery::Dynamic(),
+          clio::run::PoolQuery::Dynamic(),
           clio::cte::core::kCtePoolName,
           clio::cte::core::kCtePoolId,
           params);
@@ -147,10 +147,10 @@ class TagTestFixture {
     REQUIRE(cte_client != nullptr);
 
     // Create test storage target using bdev client
-    chi::PoolId bdev_pool_id(800, 0);
+    clio::run::PoolId bdev_pool_id(800, 0);
     clio::run::bdev::Client bdev_client(bdev_pool_id);
     auto create_task = bdev_client.AsyncCreate(
-        chi::PoolQuery::Dynamic(), test_storage_path_,
+        clio::run::PoolQuery::Dynamic(), test_storage_path_,
         bdev_pool_id, clio::run::bdev::BdevType::kFile);
     create_task.Wait();
 
@@ -160,7 +160,7 @@ class TagTestFixture {
     // Register the storage target with CTE
     auto reg_task = cte_client->AsyncRegisterTarget(
         test_storage_path_, clio::run::bdev::BdevType::kFile,
-        kTestTargetSize, chi::PoolQuery::Local(), bdev_pool_id);
+        kTestTargetSize, clio::run::PoolQuery::Local(), bdev_pool_id);
     reg_task.Wait();
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
@@ -251,7 +251,7 @@ TEST_CASE("Tag - PutBlob Basic Operation", "[cte][tag][putblob]") {
   tag.PutBlob("test_blob", data.data(), data.size());
 
   // Verify blob was stored by checking size
-  chi::u64 size = tag.GetBlobSize("test_blob");
+  clio::run::u64 size = tag.GetBlobSize("test_blob");
   REQUIRE(size == fixture.kSmallDataSize);
 }
 
@@ -504,7 +504,7 @@ TEST_CASE("Tag - GetBlobSize", "[cte][tag][metadata]") {
   auto data = fixture.CreateTestData(fixture.kMediumDataSize, 'Z');
   tag.PutBlob("size_blob", data.data(), data.size());
 
-  chi::u64 size = tag.GetBlobSize("size_blob");
+  clio::run::u64 size = tag.GetBlobSize("size_blob");
   REQUIRE(size == fixture.kMediumDataSize);
 }
 
@@ -620,7 +620,7 @@ TEST_CASE("Tag - AsyncPutBlob", "[cte][tag][async]") {
   ipc->FreeBuffer(shm_fullptr);
 
   // Verify blob was stored
-  chi::u64 size = tag.GetBlobSize("async_blob");
+  clio::run::u64 size = tag.GetBlobSize("async_blob");
   REQUIRE(size == fixture.kSmallDataSize);
 }
 

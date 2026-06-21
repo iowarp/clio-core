@@ -58,8 +58,8 @@ CLIO_TASK_CC(clio::cae::core::Runtime)
 
 namespace clio::cae::core {
 
-chi::TaskResume Runtime::Monitor(ctp::ipc::FullPtr<MonitorTask> task,
-                                 chi::RunContext &rctx) {
+clio::run::TaskResume Runtime::Monitor(ctp::ipc::FullPtr<MonitorTask> task,
+                                 clio::run::RunContext &rctx) {
   CLIO_TASK_BODY_BEGIN
   task->SetReturnCode(0);
   (void)rctx;
@@ -67,9 +67,9 @@ chi::TaskResume Runtime::Monitor(ctp::ipc::FullPtr<MonitorTask> task,
   CLIO_TASK_BODY_END
 }
 
-chi::TaskResume Runtime::Create(ctp::ipc::FullPtr<CreateTask> task, chi::RunContext& ctx) {
+clio::run::TaskResume Runtime::Create(ctp::ipc::FullPtr<CreateTask> task, clio::run::RunContext& ctx) {
 #ifdef __NVCOMPILER
-  chi::RunContext& rctx = ctx;
+  clio::run::RunContext& rctx = ctx;
 #else
   (void)ctx;
 #endif
@@ -89,7 +89,7 @@ chi::TaskResume Runtime::Create(ctp::ipc::FullPtr<CreateTask> task, chi::RunCont
   // (compose YAML sets next_pool_id), forward to that pool instead of the
   // hard-coded kCtePoolId; otherwise fall back to the legacy default so
   // existing CAE deployments keep working.
-  chi::PoolId cte_pool = !next_pool_id_.IsNull()
+  clio::run::PoolId cte_pool = !next_pool_id_.IsNull()
                             ? next_pool_id_
                             : clio::cte::core::kCtePoolId;
   cte_client_ = std::make_shared<clio::cte::core::Client>(cte_pool);
@@ -103,13 +103,13 @@ chi::TaskResume Runtime::Create(ctp::ipc::FullPtr<CreateTask> task, chi::RunCont
   CLIO_TASK_BODY_END
 }
 
-chi::PoolId Runtime::ResolveNextPoolId() const {
+clio::run::PoolId Runtime::ResolveNextPoolId() const {
   if (!next_pool_id_.IsNull()) return next_pool_id_;
   return clio::cte::core::kCtePoolId;
 }
 
-chi::PoolQuery Runtime::ScheduleTask(
-    const ctp::ipc::FullPtr<chi::Task> &task) {
+clio::run::PoolQuery Runtime::ScheduleTask(
+    const ctp::ipc::FullPtr<clio::run::Task> &task) {
   // Interceptor methods always run locally — they immediately forward
   // synchronously to the configured CTE core pool, so there is no value
   // in bouncing the task across nodes. Mirrors compressor_runtime.cc
@@ -119,9 +119,9 @@ chi::PoolQuery Runtime::ScheduleTask(
     case Method::kGetBlob:
     case Method::kGetOrCreateTag:
     case Method::kSemanticSearch:
-      return chi::PoolQuery::Local();
+      return clio::run::PoolQuery::Local();
     default:
-      return chi::PoolQuery::Local();
+      return clio::run::PoolQuery::Local();
   }
 }
 
@@ -152,8 +152,8 @@ static const LabelMatch *FindLabelMatch(
   return nullptr;
 }
 
-chi::TaskResume Runtime::PutBlob(ctp::ipc::FullPtr<PutBlobTask> task,
-                                 chi::RunContext &ctx) {
+clio::run::TaskResume Runtime::PutBlob(ctp::ipc::FullPtr<PutBlobTask> task,
+                                 clio::run::RunContext &ctx) {
 #ifndef __NVCOMPILER
   (void)ctx;
 #endif
@@ -170,7 +170,7 @@ chi::TaskResume Runtime::PutBlob(ctp::ipc::FullPtr<PutBlobTask> task,
   auto fwd = cte_client_->AsyncPutBlob(
       task->tag_id_, task->blob_name_.str(), task->offset_, task->size_,
       task->blob_data_, task->score_, task->context_, task->flags_,
-      chi::PoolQuery::Local());
+      clio::run::PoolQuery::Local());
   CLIO_CO_AWAIT(fwd);
   task->context_ = fwd->context_;
   task->SetReturnCode(fwd->GetReturnCode());
@@ -289,8 +289,8 @@ chi::TaskResume Runtime::PutBlob(ctp::ipc::FullPtr<PutBlobTask> task,
   clio::cte::core::Context label_ctx;
   auto label_fut = cte_client_->AsyncPutBlob(
       task->tag_id_, label_blob_name, 0,
-      static_cast<chi::u64>(label_text.size()), label_shm, task->score_,
-      label_ctx, 0, chi::PoolQuery::Local());
+      static_cast<clio::run::u64>(label_text.size()), label_shm, task->score_,
+      label_ctx, 0, clio::run::PoolQuery::Local());
   CLIO_CO_AWAIT(label_fut);
   ipc->FreeBuffer(label_buf);
   if (label_fut->GetReturnCode() != 0) {
@@ -302,8 +302,8 @@ chi::TaskResume Runtime::PutBlob(ctp::ipc::FullPtr<PutBlobTask> task,
   CLIO_TASK_BODY_END
 }
 
-chi::TaskResume Runtime::GetBlob(ctp::ipc::FullPtr<GetBlobTask> task,
-                                 chi::RunContext &ctx) {
+clio::run::TaskResume Runtime::GetBlob(ctp::ipc::FullPtr<GetBlobTask> task,
+                                 clio::run::RunContext &ctx) {
 #ifndef __NVCOMPILER
   (void)ctx;
 #endif
@@ -313,15 +313,15 @@ chi::TaskResume Runtime::GetBlob(ctp::ipc::FullPtr<GetBlobTask> task,
   }
   auto fwd = cte_client_->AsyncGetBlob(
       task->tag_id_, task->blob_name_.str(), task->offset_, task->size_,
-      task->flags_, task->blob_data_, chi::PoolQuery::Local());
+      task->flags_, task->blob_data_, clio::run::PoolQuery::Local());
   CLIO_CO_AWAIT(fwd);
   task->SetReturnCode(fwd->GetReturnCode());
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
 
-chi::TaskResume Runtime::GetOrCreateTag(
-    ctp::ipc::FullPtr<GetOrCreateTagTask> task, chi::RunContext &ctx) {
+clio::run::TaskResume Runtime::GetOrCreateTag(
+    ctp::ipc::FullPtr<GetOrCreateTagTask> task, clio::run::RunContext &ctx) {
 #ifndef __NVCOMPILER
   (void)ctx;
 #endif
@@ -331,7 +331,7 @@ chi::TaskResume Runtime::GetOrCreateTag(
   }
   std::string tag_name = task->tag_name_.str();
   auto fwd = cte_client_->AsyncGetOrCreateTag(
-      tag_name, task->tag_id_, chi::PoolQuery::Local());
+      tag_name, task->tag_id_, clio::run::PoolQuery::Local());
   CLIO_CO_AWAIT(fwd);
   task->tag_id_ = fwd->tag_id_;
   task->SetReturnCode(fwd->GetReturnCode());
@@ -347,8 +347,8 @@ chi::TaskResume Runtime::GetOrCreateTag(
   CLIO_TASK_BODY_END
 }
 
-chi::TaskResume Runtime::SemanticSearch(
-    ctp::ipc::FullPtr<SemanticSearchTask> task, chi::RunContext &ctx) {
+clio::run::TaskResume Runtime::SemanticSearch(
+    ctp::ipc::FullPtr<SemanticSearchTask> task, clio::run::RunContext &ctx) {
 #ifndef __NVCOMPILER
   (void)ctx;
 #endif
@@ -362,7 +362,7 @@ chi::TaskResume Runtime::SemanticSearch(
   // without any client-side rewiring.
   auto fwd = cte_client_->AsyncSemanticSearch(
       task->tag_regex_.str(), task->blob_regex_.str(),
-      task->query_text_.str(), task->k_, chi::PoolQuery::Local());
+      task->query_text_.str(), task->k_, clio::run::PoolQuery::Local());
   CLIO_CO_AWAIT(fwd);
   task->results_ = fwd->results_;
   task->SetReturnCode(fwd->GetReturnCode());
@@ -370,16 +370,16 @@ chi::TaskResume Runtime::SemanticSearch(
   CLIO_TASK_BODY_END
 }
 
-chi::u64 Runtime::GetWorkRemaining() const {
+clio::run::u64 Runtime::GetWorkRemaining() const {
   // CAE doesn't currently track work remaining
   // Return 0 to indicate no pending work
   return 0;
 }
 
-chi::TaskResume Runtime::ParseOmni(ctp::ipc::FullPtr<ParseOmniTask> task,
-                                   chi::RunContext& ctx) {
+clio::run::TaskResume Runtime::ParseOmni(ctp::ipc::FullPtr<ParseOmniTask> task,
+                                   clio::run::RunContext& ctx) {
 #ifdef __NVCOMPILER
-  chi::RunContext& rctx = ctx;
+  clio::run::RunContext& rctx = ctx;
 #else
   (void)ctx;
 #endif
@@ -407,7 +407,7 @@ chi::TaskResume Runtime::ParseOmni(ctp::ipc::FullPtr<ParseOmniTask> task,
        assimilation_contexts.size());
 
   // Process each assimilation context
-  chi::u32 tasks_scheduled = 0;
+  clio::run::u32 tasks_scheduled = 0;
   AssimilatorFactory factory(cte_client_);
 
   for (size_t i = 0; i < assimilation_contexts.size(); ++i) {
@@ -459,10 +459,10 @@ chi::TaskResume Runtime::ParseOmni(ctp::ipc::FullPtr<ParseOmniTask> task,
   CLIO_TASK_BODY_END
 }
 
-chi::TaskResume Runtime::ProcessHdf5Dataset(
-    ctp::ipc::FullPtr<ProcessHdf5DatasetTask> task, chi::RunContext& ctx) {
+clio::run::TaskResume Runtime::ProcessHdf5Dataset(
+    ctp::ipc::FullPtr<ProcessHdf5DatasetTask> task, clio::run::RunContext& ctx) {
 #ifdef __NVCOMPILER
-  chi::RunContext& rctx = ctx;
+  clio::run::RunContext& rctx = ctx;
 #else
   (void)ctx;
 #endif
@@ -480,7 +480,7 @@ chi::TaskResume Runtime::ProcessHdf5Dataset(
          task->file_path_.str());
     task->result_code_ = -1;
     task->error_message_ =
-        chi::priv::string("Failed to open HDF5 file", CTP_MALLOC);
+        clio::run::priv::string("Failed to open HDF5 file", CTP_MALLOC);
     CLIO_CO_RETURN;
   }
 
@@ -499,7 +499,7 @@ chi::TaskResume Runtime::ProcessHdf5Dataset(
          task->dataset_path_.str(), result);
     task->result_code_ = result;
     task->error_message_ =
-        chi::priv::string("Dataset processing failed", CTP_MALLOC);
+        clio::run::priv::string("Dataset processing failed", CTP_MALLOC);
   } else {
     HLOG(kInfo, "ProcessHdf5Dataset: Successfully processed dataset '{}'",
          task->dataset_path_.str());
@@ -508,16 +508,16 @@ chi::TaskResume Runtime::ProcessHdf5Dataset(
 #else
   task->result_code_ = -1;
   task->error_message_ =
-      chi::priv::string("HDF5 support not compiled in", CTP_MALLOC);
+      clio::run::priv::string("HDF5 support not compiled in", CTP_MALLOC);
 #endif
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
 
-chi::TaskResume Runtime::ExportData(ctp::ipc::FullPtr<ExportDataTask> task,
-                                    chi::RunContext& ctx) {
+clio::run::TaskResume Runtime::ExportData(ctp::ipc::FullPtr<ExportDataTask> task,
+                                    clio::run::RunContext& ctx) {
 #ifdef __NVCOMPILER
-  chi::RunContext& rctx = ctx;
+  clio::run::RunContext& rctx = ctx;
 #else
   (void)ctx;
 #endif
@@ -539,7 +539,7 @@ chi::TaskResume Runtime::ExportData(ctp::ipc::FullPtr<ExportDataTask> task,
   if (tag_id.IsNull()) {
     HLOG(kError, "ExportData: tag '{}' not found", tag_name);
     task->result_code_ = -1;
-    task->error_message_ = chi::priv::string("Tag not found", CTP_MALLOC);
+    task->error_message_ = clio::run::priv::string("Tag not found", CTP_MALLOC);
     CLIO_CO_RETURN;
   }
 
@@ -561,7 +561,7 @@ chi::TaskResume Runtime::ExportData(ctp::ipc::FullPtr<ExportDataTask> task,
       HLOG(kError, "ExportData: failed to create HDF5 file '{}'", output_path);
       task->result_code_ = -2;
       task->error_message_ =
-          chi::priv::string("Failed to create HDF5 file", CTP_MALLOC);
+          clio::run::priv::string("Failed to create HDF5 file", CTP_MALLOC);
       CLIO_CO_RETURN;
     }
 
@@ -569,7 +569,7 @@ chi::TaskResume Runtime::ExportData(ctp::ipc::FullPtr<ExportDataTask> task,
       // Get blob size
       auto size_future = cte_client_->AsyncGetBlobSize(tag_id, blob_name);
       CLIO_CO_AWAIT(size_future);
-      chi::u64 blob_size = size_future->size_;
+      clio::run::u64 blob_size = size_future->size_;
       if (blob_size == 0) continue;
 
       // Allocate buffer and read blob
@@ -606,7 +606,7 @@ chi::TaskResume Runtime::ExportData(ctp::ipc::FullPtr<ExportDataTask> task,
 #else
     task->result_code_ = -3;
     task->error_message_ =
-        chi::priv::string("HDF5 support not compiled in", CTP_MALLOC);
+        clio::run::priv::string("HDF5 support not compiled in", CTP_MALLOC);
 #endif
   } else {
     // Binary format: sequential blob data with a simple header per blob
@@ -615,14 +615,14 @@ chi::TaskResume Runtime::ExportData(ctp::ipc::FullPtr<ExportDataTask> task,
       HLOG(kError, "ExportData: failed to open '{}' for writing", output_path);
       task->result_code_ = -2;
       task->error_message_ =
-          chi::priv::string("Failed to open output file", CTP_MALLOC);
+          clio::run::priv::string("Failed to open output file", CTP_MALLOC);
       CLIO_CO_RETURN;
     }
 
     for (const auto &blob_name : blob_names) {
       auto size_future = cte_client_->AsyncGetBlobSize(tag_id, blob_name);
       CLIO_CO_AWAIT(size_future);
-      chi::u64 blob_size = size_future->size_;
+      clio::run::u64 blob_size = size_future->size_;
       if (blob_size == 0) continue;
 
       auto *ipc_manager = CLIO_IPC;

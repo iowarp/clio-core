@@ -108,7 +108,7 @@ int main() {
     const char* init_chimaera = std::getenv("INIT_CHIMAERA");
     if (init_chimaera && std::strcmp(init_chimaera, "1") == 0) {
       HLOG(kInfo, "Initializing Chimaera (INIT_CHIMAERA=1)...");
-      chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
+      clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true);
       HLOG(kSuccess, "Chimaera initialized");
     }
 

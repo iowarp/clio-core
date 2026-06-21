@@ -13,42 +13,42 @@ namespace clio::cte::core {
 
 namespace Method {
 // Inherited methods
-GLOBAL_CROSS_CONST chi::u32 kCreate = 0;
-GLOBAL_CROSS_CONST chi::u32 kDestroy = 1;
-GLOBAL_CROSS_CONST chi::u32 kMonitor = 9;
+GLOBAL_CROSS_CONST clio::run::u32 kCreate = 0;
+GLOBAL_CROSS_CONST clio::run::u32 kDestroy = 1;
+GLOBAL_CROSS_CONST clio::run::u32 kMonitor = 9;
 
 // core-specific methods
-GLOBAL_CROSS_CONST chi::u32 kRegisterTarget = 10;
-GLOBAL_CROSS_CONST chi::u32 kUnregisterTarget = 11;
-GLOBAL_CROSS_CONST chi::u32 kListTargets = 12;
-GLOBAL_CROSS_CONST chi::u32 kStatTargets = 13;
-GLOBAL_CROSS_CONST chi::u32 kGetOrCreateTag = 14;
-GLOBAL_CROSS_CONST chi::u32 kPutBlob = 15;
-GLOBAL_CROSS_CONST chi::u32 kGetBlob = 16;
-GLOBAL_CROSS_CONST chi::u32 kReorganizeBlob = 17;
-GLOBAL_CROSS_CONST chi::u32 kDelBlob = 18;
-GLOBAL_CROSS_CONST chi::u32 kDelTag = 19;
-GLOBAL_CROSS_CONST chi::u32 kGetTagSize = 20;
-GLOBAL_CROSS_CONST chi::u32 kPollTelemetryLog = 21;
-GLOBAL_CROSS_CONST chi::u32 kGetBlobScore = 22;
-GLOBAL_CROSS_CONST chi::u32 kGetBlobSize = 23;
-GLOBAL_CROSS_CONST chi::u32 kGetContainedBlobs = 24;
-GLOBAL_CROSS_CONST chi::u32 kGetBlobInfo = 25;
-GLOBAL_CROSS_CONST chi::u32 kTagQuery = 30;
-GLOBAL_CROSS_CONST chi::u32 kBlobQuery = 31;
-GLOBAL_CROSS_CONST chi::u32 kGetTargetInfo = 32;
-GLOBAL_CROSS_CONST chi::u32 kFlushMetadata = 33;
-GLOBAL_CROSS_CONST chi::u32 kFlushData = 34;
-GLOBAL_CROSS_CONST chi::u32 kSemanticSearch = 35;
-GLOBAL_CROSS_CONST chi::u32 kTemporalSearch = 36;
-GLOBAL_CROSS_CONST chi::u32 kTruncateBlob = 37;
-GLOBAL_CROSS_CONST chi::u32 kRenameTag = 38;
-GLOBAL_CROSS_CONST chi::u32 kGetOrCreateTagAlias = 39;
-GLOBAL_CROSS_CONST chi::u32 kGetTagName = 40;
-GLOBAL_CROSS_CONST chi::u32 kGetCapacity = 41;
-GLOBAL_CROSS_CONST chi::u32 kGetNumAliases = 42;
+GLOBAL_CROSS_CONST clio::run::u32 kRegisterTarget = 10;
+GLOBAL_CROSS_CONST clio::run::u32 kUnregisterTarget = 11;
+GLOBAL_CROSS_CONST clio::run::u32 kListTargets = 12;
+GLOBAL_CROSS_CONST clio::run::u32 kStatTargets = 13;
+GLOBAL_CROSS_CONST clio::run::u32 kGetOrCreateTag = 14;
+GLOBAL_CROSS_CONST clio::run::u32 kPutBlob = 15;
+GLOBAL_CROSS_CONST clio::run::u32 kGetBlob = 16;
+GLOBAL_CROSS_CONST clio::run::u32 kReorganizeBlob = 17;
+GLOBAL_CROSS_CONST clio::run::u32 kDelBlob = 18;
+GLOBAL_CROSS_CONST clio::run::u32 kDelTag = 19;
+GLOBAL_CROSS_CONST clio::run::u32 kGetTagSize = 20;
+GLOBAL_CROSS_CONST clio::run::u32 kPollTelemetryLog = 21;
+GLOBAL_CROSS_CONST clio::run::u32 kGetBlobScore = 22;
+GLOBAL_CROSS_CONST clio::run::u32 kGetBlobSize = 23;
+GLOBAL_CROSS_CONST clio::run::u32 kGetContainedBlobs = 24;
+GLOBAL_CROSS_CONST clio::run::u32 kGetBlobInfo = 25;
+GLOBAL_CROSS_CONST clio::run::u32 kTagQuery = 30;
+GLOBAL_CROSS_CONST clio::run::u32 kBlobQuery = 31;
+GLOBAL_CROSS_CONST clio::run::u32 kGetTargetInfo = 32;
+GLOBAL_CROSS_CONST clio::run::u32 kFlushMetadata = 33;
+GLOBAL_CROSS_CONST clio::run::u32 kFlushData = 34;
+GLOBAL_CROSS_CONST clio::run::u32 kSemanticSearch = 35;
+GLOBAL_CROSS_CONST clio::run::u32 kTemporalSearch = 36;
+GLOBAL_CROSS_CONST clio::run::u32 kTruncateBlob = 37;
+GLOBAL_CROSS_CONST clio::run::u32 kRenameTag = 38;
+GLOBAL_CROSS_CONST clio::run::u32 kGetOrCreateTagAlias = 39;
+GLOBAL_CROSS_CONST clio::run::u32 kGetTagName = 40;
+GLOBAL_CROSS_CONST clio::run::u32 kGetCapacity = 41;
+GLOBAL_CROSS_CONST clio::run::u32 kGetNumAliases = 42;
 
-GLOBAL_CROSS_CONST chi::u32 kMaxMethodId = 43;
+GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 43;
 
 inline const std::vector<std::string>& GetMethodNames() {
   static const std::vector<std::string> names = [] {

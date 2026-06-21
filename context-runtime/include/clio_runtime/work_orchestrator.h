@@ -194,10 +194,10 @@ class WorkOrchestrator {
 }  // namespace clio::run
 
 // Global pointer variable declaration for Work Orchestrator singleton
-CLIO_RUN_DEFINE_GLOBAL_PTR_VAR_H(chi::WorkOrchestrator, g_work_orchestrator);
+CLIO_RUN_DEFINE_GLOBAL_PTR_VAR_H(clio::run::WorkOrchestrator, g_work_orchestrator);
 
 // Macro for accessing the Work Orchestrator singleton using global pointer variable
-#define CLIO_WORK_ORCHESTRATOR CTP_GET_GLOBAL_PTR_VAR(::chi::WorkOrchestrator, g_work_orchestrator)
+#define CLIO_WORK_ORCHESTRATOR CTP_GET_GLOBAL_PTR_VAR(::clio::run::WorkOrchestrator, g_work_orchestrator)
 // Backward-compat alias (clio_run rebrand). External code that still
 // uses the legacy CHI_* spelling keeps working unchanged.
 #define CHI_WORK_ORCHESTRATOR  CLIO_WORK_ORCHESTRATOR

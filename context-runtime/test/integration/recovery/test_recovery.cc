@@ -75,9 +75,9 @@ bool g_initialized = false;
 // Fixed pool ID shared between Phase 1 and Phase 2
 // Phase 2 reuses the pool created by Phase 1 (no new pool creation
 // since Dynamic() would try to reach the dead node)
-const chi::PoolId kRecoveryPoolId(50000, 0);
+const clio::run::PoolId kRecoveryPoolId(50000, 0);
 
-constexpr chi::u32 kHoldMs = 100;
+constexpr clio::run::u32 kHoldMs = 100;
 }  // namespace
 
 class RecoveryTestFixture {
@@ -85,10 +85,10 @@ class RecoveryTestFixture {
   RecoveryTestFixture() {
     if (!g_initialized) {
       INFO("Initializing Chimaera for Recovery tests...");
-      bool success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
+      bool success = clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true);
       if (success) {
         g_initialized = true;
-        SimpleTest::g_test_finalize = chi::CHIMAERA_FINALIZE;
+        SimpleTest::g_test_finalize = clio::run::CHIMAERA_FINALIZE;
         std::this_thread::sleep_for(500ms);
         REQUIRE(CLIO_RUNTIME_MANAGER != nullptr);
         REQUIRE(CLIO_IPC != nullptr);
@@ -101,11 +101,11 @@ class RecoveryTestFixture {
     }
   }
 
-  chi::PoolId getTestPoolId() const { return kRecoveryPoolId; }
+  clio::run::PoolId getTestPoolId() const { return kRecoveryPoolId; }
 
   bool createModNamePool(const std::string &pool_name) {
     try {
-      chi::PoolQuery pool_query = chi::PoolQuery::Dynamic();
+      clio::run::PoolQuery pool_query = clio::run::PoolQuery::Dynamic();
       clio::run::MOD_NAME::Client mod_name_client(kRecoveryPoolId);
       auto create_task =
           mod_name_client.AsyncCreate(pool_query, pool_name, kRecoveryPoolId);
@@ -132,7 +132,7 @@ TEST_CASE("Pre-failure: verify tasks work on all nodes",
     REQUIRE(fixture.createModNamePool("test_recovery_pool"));
 
     clio::run::MOD_NAME::Client mod_name_client(kRecoveryPoolId);
-    chi::PoolQuery create_query = chi::PoolQuery::Dynamic();
+    clio::run::PoolQuery create_query = clio::run::PoolQuery::Dynamic();
     std::string pool_name = "test_recovery_pool";
     auto create_task = mod_name_client.AsyncCreate(
         create_query, pool_name, kRecoveryPoolId);
@@ -140,13 +140,13 @@ TEST_CASE("Pre-failure: verify tasks work on all nodes",
     mod_name_client.pool_id_ = create_task->new_pool_id_;
     REQUIRE(create_task->return_code_ == 0);
 
-    chi::PoolId pool_id = mod_name_client.pool_id_;
+    clio::run::PoolId pool_id = mod_name_client.pool_id_;
     INFO("Pool created: " << pool_id.ToU64());
 
     // Step 1: Submit CoMutexTest targeting container 3 (on node 4)
     INFO("Step 1: Submitting CoMutexTest with DirectHash(3) pre-failure");
     auto direct_task = mod_name_client.AsyncCoMutexTest(
-        chi::PoolQuery::DirectHash(3), 1, kHoldMs);
+        clio::run::PoolQuery::DirectHash(3), 1, kHoldMs);
     direct_task.Wait();
     REQUIRE(direct_task->return_code_ == 0);
     INFO("Step 1: DirectHash(3) task completed successfully");
@@ -154,7 +154,7 @@ TEST_CASE("Pre-failure: verify tasks work on all nodes",
     // Step 2: Submit broadcast CoMutexTest across all 4 nodes
     INFO("Step 2: Submitting CoMutexTest with Broadcast() pre-failure");
     auto broadcast_task = mod_name_client.AsyncCoMutexTest(
-        chi::PoolQuery::Broadcast(), 1, kHoldMs);
+        clio::run::PoolQuery::Broadcast(), 1, kHoldMs);
     broadcast_task.Wait();
     REQUIRE(broadcast_task->return_code_ == 0);
     INFO("Step 2: Broadcast task completed successfully");
@@ -182,7 +182,7 @@ TEST_CASE("Post-failure: verify recovery re-routes tasks",
     // Originally on node 4 (now dead), should route to recovery destination
     INFO("Step 1: Submitting CoMutexTest with DirectHash(3) post-failure");
     auto direct_task = mod_name_client.AsyncCoMutexTest(
-        chi::PoolQuery::DirectHash(3), 1, kHoldMs);
+        clio::run::PoolQuery::DirectHash(3), 1, kHoldMs);
     direct_task.Wait();
     REQUIRE(direct_task->return_code_ == 0);
     INFO("Step 1: DirectHash(3) post-failure task completed — recovery works");
@@ -191,7 +191,7 @@ TEST_CASE("Post-failure: verify recovery re-routes tasks",
     // Should succeed across 3 surviving nodes + recovered container
     INFO("Step 2: Submitting CoMutexTest with Broadcast() post-failure");
     auto broadcast_task = mod_name_client.AsyncCoMutexTest(
-        chi::PoolQuery::Broadcast(), 1, kHoldMs);
+        clio::run::PoolQuery::Broadcast(), 1, kHoldMs);
     broadcast_task.Wait();
     REQUIRE(broadcast_task->return_code_ == 0);
     INFO("Step 2: Broadcast post-failure task completed successfully");

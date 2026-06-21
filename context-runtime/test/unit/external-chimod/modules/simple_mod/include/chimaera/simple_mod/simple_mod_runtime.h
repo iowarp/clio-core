@@ -52,14 +52,14 @@ enum SimpleModQueueIndex {
  * Minimal ChiMod for testing external development patterns.
  * Demonstrates basic runtime structure for external ChiMod development.
  */
-class Runtime : public chi::Container {
+class Runtime : public clio::run::Container {
 public:
   // CreateParams type used by CLIO_TASK_CC macro for lib_name access
   using CreateParams = external_test::simple_mod::CreateParams;
 
 private:
   // Container-specific state
-  chi::u32 create_count_ = 0;
+  clio::run::u32 create_count_ = 0;
   
   // Client for making calls to this ChiMod
   Client client_;
@@ -81,13 +81,13 @@ public:
    * @param pool_name The semantic name of this pool (user-provided)
    * @param container_id The container ID
    */
-  void Init(const chi::PoolId& pool_id, const std::string& pool_name,
-            chi::u32 container_id = 0) override;
+  void Init(const clio::run::PoolId& pool_id, const std::string& pool_name,
+            clio::run::u32 container_id = 0) override;
 
   /**
    * Execute a method on a task
    */
-  chi::TaskResume Run(chi::u32 method, ctp::ipc::FullPtr<chi::Task> task_ptr, chi::RunContext& rctx) override;
+  clio::run::TaskResume Run(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> task_ptr, clio::run::RunContext& rctx) override;
 
   //===========================================================================
   // Method implementations
@@ -96,22 +96,22 @@ public:
   /**
    * Handle Create task - Initialize the Simple Mod container
    */
-  void Create(ctp::ipc::FullPtr<CreateTask> task, chi::RunContext& rctx);
+  void Create(ctp::ipc::FullPtr<CreateTask> task, clio::run::RunContext& rctx);
 
   /**
    * Handle Destroy task - Destroy the Simple Mod container
    */
-  void Destroy(ctp::ipc::FullPtr<DestroyTask> task, chi::RunContext& rctx);
+  void Destroy(ctp::ipc::FullPtr<DestroyTask> task, clio::run::RunContext& rctx);
 
   /**
    * Handle Flush task - Flush simple mod operations
    */
-  void Flush(ctp::ipc::FullPtr<FlushTask> task, chi::RunContext& rctx);
+  void Flush(ctp::ipc::FullPtr<FlushTask> task, clio::run::RunContext& rctx);
 
   /**
    * Get remaining work count for this simple mod container
    */
-  chi::u64 GetWorkRemaining() const override;
+  clio::run::u64 GetWorkRemaining() const override;
 
   //===========================================================================
   // Container Virtual Methods (automatically generated in autogen/)
@@ -123,8 +123,8 @@ public:
    * @param archive SaveTaskArchive for serialization
    * @param task_ptr The task to serialize
    */
-  void SaveTask(chi::u32 method, chi::SaveTaskArchive& archive,
-                ctp::ipc::FullPtr<chi::Task> task_ptr) override;
+  void SaveTask(clio::run::u32 method, clio::run::SaveTaskArchive& archive,
+                ctp::ipc::FullPtr<clio::run::Task> task_ptr) override;
 
   /**
    * Deserialize task parameters from network transfer (auto-generated)
@@ -132,33 +132,33 @@ public:
    * @param archive LoadTaskArchive for deserialization
    * @return The deserialized task
    */
-  ctp::ipc::FullPtr<chi::Task> LoadTask(chi::u32 method, chi::LoadTaskArchive& archive) override;
+  ctp::ipc::FullPtr<clio::run::Task> LoadTask(clio::run::u32 method, clio::run::LoadTaskArchive& archive) override;
 
   /**
    * Deserialize task for local transfer (auto-generated)
    */
-  ctp::ipc::FullPtr<chi::Task> LocalLoadTask(chi::u32 method, chi::DefaultLoadArchive& archive) override;
+  ctp::ipc::FullPtr<clio::run::Task> LocalLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive& archive) override;
 
   /**
    * Serialize task for local transfer (auto-generated)
    */
-  void LocalSaveTask(chi::u32 method, chi::DefaultSaveArchive& archive,
-                     ctp::ipc::FullPtr<chi::Task> task_ptr) override;
+  void LocalSaveTask(clio::run::u32 method, clio::run::DefaultSaveArchive& archive,
+                     ctp::ipc::FullPtr<clio::run::Task> task_ptr) override;
 
   /**
    * Create a new copy of a task for distributed execution (auto-generated)
    */
-  ctp::ipc::FullPtr<chi::Task> NewCopyTask(chi::u32 method,
-                                        ctp::ipc::FullPtr<chi::Task> orig_task_ptr,
+  ctp::ipc::FullPtr<clio::run::Task> NewCopyTask(clio::run::u32 method,
+                                        ctp::ipc::FullPtr<clio::run::Task> orig_task_ptr,
                                         bool deep) override;
 
   /**
    * Create a new task of the specified method type (auto-generated)
    */
-  ctp::ipc::FullPtr<chi::Task> NewTask(chi::u32 method) override;
-  void AggregateOut(chi::u32 method, ctp::ipc::FullPtr<chi::Task> orig_task,
-                 const ctp::ipc::FullPtr<chi::Task>& replica_task) override;
-  void DelTask(chi::u32 method, ctp::ipc::FullPtr<chi::Task> task_ptr) override;
+  ctp::ipc::FullPtr<clio::run::Task> NewTask(clio::run::u32 method) override;
+  void AggregateOut(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> orig_task,
+                 const ctp::ipc::FullPtr<clio::run::Task>& replica_task) override;
+  void DelTask(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> task_ptr) override;
 
 };
 

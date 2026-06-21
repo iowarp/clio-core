@@ -151,7 +151,7 @@ int main(int argc, char **argv) {
   if (!a.ok) return 1;
 
   HLOG(kInfo, "Initializing Chimaera runtime...");
-  if (!chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, false)) {
+  if (!clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, false)) {
     HLOG(kError, "Failed to initialize Chimaera runtime");
     return 1;
   }
@@ -193,7 +193,7 @@ int main(int argc, char **argv) {
   for (long k = 0; k < a.blobs; ++k) {
     std::string blob_name = "blob_" + std::to_string(k);
     auto t = cte->AsyncPutBlob(tag_id, blob_name.c_str(), 0,
-                               static_cast<chi::u64>(a.size), put_ptr, 1.0f,
+                               static_cast<clio::run::u64>(a.size), put_ptr, 1.0f,
                                clio::cte::core::Context(), 0);
     t.Wait();
     if (t->return_code_.load() != 0) {
@@ -217,7 +217,7 @@ int main(int argc, char **argv) {
   for (int it = 0; it < a.query_iters; ++it) {
     auto q_t0 = steady_clock::now();
     auto search = cte->AsyncSemanticSearch(
-        tag_name, ".*", a.keyword, a.results, chi::PoolQuery::Broadcast());
+        tag_name, ".*", a.keyword, a.results, clio::run::PoolQuery::Broadcast());
     search.Wait();
     double q_s = duration<double>(steady_clock::now() - q_t0).count();
     if (search->return_code_.load() != 0) {

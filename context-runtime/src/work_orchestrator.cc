@@ -47,7 +47,7 @@
 #include "clio_runtime/ipc_manager.h"
 
 // Global pointer variable definition for Work Orchestrator singleton
-CLIO_RUN_DEFINE_GLOBAL_PTR_VAR_CC(chi::WorkOrchestrator, g_work_orchestrator);
+CLIO_RUN_DEFINE_GLOBAL_PTR_VAR_CC(clio::run::WorkOrchestrator, g_work_orchestrator);
 
 namespace clio::run {
 

@@ -81,7 +81,7 @@ struct CompressionStats {
  * CTE Compressor Runtime Container
  * Implements compression scheduling and execution
  */
-class Runtime : public chi::Container {
+class Runtime : public clio::run::Container {
 public:
   using CreateParams = CompressorConfig; // Required for CLIO_TASK_CC (defined in compressor_tasks.h)
 
@@ -99,85 +99,85 @@ private:
    * Create the container (Method::kCreate)
    * Initializes predictors and loads AI models
    */
-  chi::TaskResume Create(ctp::ipc::FullPtr<CreateTask> task, chi::RunContext &ctx);
+  clio::run::TaskResume Create(ctp::ipc::FullPtr<CreateTask> task, clio::run::RunContext &ctx);
 
   /**
    * Destroy the container (Method::kDestroy)
    * Cleanup resources and predictors
    */
-  chi::TaskResume Destroy(ctp::ipc::FullPtr<DestroyTask> task, chi::RunContext &ctx);
+  clio::run::TaskResume Destroy(ctp::ipc::FullPtr<DestroyTask> task, clio::run::RunContext &ctx);
 
   /**
    * Monitor container state (Method::kMonitor)
    * Polls core for target information and serializes results with msgpack
    */
-  chi::TaskResume Monitor(ctp::ipc::FullPtr<MonitorTask> task, chi::RunContext &ctx);
+  clio::run::TaskResume Monitor(ctp::ipc::FullPtr<MonitorTask> task, clio::run::RunContext &ctx);
 
   /**
    * Dynamic compression scheduling (Method::kDynamicSchedule)
    * Analyzes data and determines optimal compression strategy
    */
-  chi::TaskResume DynamicSchedule(ctp::ipc::FullPtr<DynamicScheduleTask> task,
-                                   chi::RunContext &ctx);
+  clio::run::TaskResume DynamicSchedule(ctp::ipc::FullPtr<DynamicScheduleTask> task,
+                                   clio::run::RunContext &ctx);
 
   /**
    * Compress data (Method::kCompress)
    * Executes compression with specified library and parameters
    */
-  chi::TaskResume Compress(ctp::ipc::FullPtr<CompressTask> task,
-                            chi::RunContext &ctx);
+  clio::run::TaskResume Compress(ctp::ipc::FullPtr<CompressTask> task,
+                            clio::run::RunContext &ctx);
 
   /**
    * Decompress data (Method::kDecompress)
    * Executes decompression with specified library and parameters
    */
-  chi::TaskResume Decompress(ctp::ipc::FullPtr<DecompressTask> task,
-                              chi::RunContext &ctx);
+  clio::run::TaskResume Decompress(ctp::ipc::FullPtr<DecompressTask> task,
+                              clio::run::RunContext &ctx);
 
   /**
    * Sample this node's CPU utilization and aggregated worker load
    * (Method::kPollNodeLoad). Writes results into task->sample_.
    */
-  chi::TaskResume PollNodeLoad(ctp::ipc::FullPtr<PollNodeLoadTask> task,
-                                chi::RunContext &ctx);
+  clio::run::TaskResume PollNodeLoad(ctp::ipc::FullPtr<PollNodeLoadTask> task,
+                                clio::run::RunContext &ctx);
 
   /**
    * Periodic task that iterates the tracked consumer list and dispatches
    * PollNodeLoad to each consumer node (Method::kPollConsumers).
    */
-  chi::TaskResume PollConsumers(ctp::ipc::FullPtr<PollConsumersTask> task,
-                                 chi::RunContext &ctx);
+  clio::run::TaskResume PollConsumers(ctp::ipc::FullPtr<PollConsumersTask> task,
+                                 clio::run::RunContext &ctx);
 
   /**
    * Schedule a task by resolving Dynamic pool queries.
    */
-  chi::PoolQuery ScheduleTask(const ctp::ipc::FullPtr<chi::Task> &task) override;
+  clio::run::PoolQuery ScheduleTask(const ctp::ipc::FullPtr<clio::run::Task> &task) override;
 
   // Autogen-provided methods
-  void Init(const chi::PoolId &pool_id, const std::string &pool_name,
-            chi::u32 container_id = 0) override;
-  chi::TaskResume Run(chi::u32 method, ctp::ipc::FullPtr<chi::Task> task_ptr,
-                      chi::RunContext &rctx) override;
-  chi::u64 GetWorkRemaining() const override;
-  void SaveTask(chi::u32 method, chi::SaveTaskArchive& archive,
-                ctp::ipc::FullPtr<chi::Task> task_ptr) override;
+  void Init(const clio::run::PoolId &pool_id, const std::string &pool_name,
+            clio::run::u32 container_id = 0) override;
+  clio::run::TaskResume Run(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> task_ptr,
+                      clio::run::RunContext &rctx) override;
+  clio::run::u64 GetWorkRemaining() const override;
+  void SaveTask(clio::run::u32 method, clio::run::SaveTaskArchive& archive,
+                ctp::ipc::FullPtr<clio::run::Task> task_ptr) override;
 
   // Container virtual method implementations (defined in autogen/compressor_lib_exec.cc)
-  void LoadTask(chi::u32 method, chi::LoadTaskArchive &archive,
-                ctp::ipc::FullPtr<chi::Task> task_ptr) override;
-  ctp::ipc::FullPtr<chi::Task> AllocLoadTask(chi::u32 method, chi::LoadTaskArchive &archive) override;
-  ctp::ipc::FullPtr<chi::Task> NewCopyTask(chi::u32 method, ctp::ipc::FullPtr<chi::Task> orig_task_ptr,
+  void LoadTask(clio::run::u32 method, clio::run::LoadTaskArchive &archive,
+                ctp::ipc::FullPtr<clio::run::Task> task_ptr) override;
+  ctp::ipc::FullPtr<clio::run::Task> AllocLoadTask(clio::run::u32 method, clio::run::LoadTaskArchive &archive) override;
+  ctp::ipc::FullPtr<clio::run::Task> NewCopyTask(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> orig_task_ptr,
                                         bool deep) override;
-  ctp::ipc::FullPtr<chi::Task> NewTask(chi::u32 method) override;
-  void AggregateOut(chi::u32 method, ctp::ipc::FullPtr<chi::Task> orig_task,
-                 const ctp::ipc::FullPtr<chi::Task>& replica_task) override;
-  void DelTask(chi::u32 method, ctp::ipc::FullPtr<chi::Task> task_ptr) override;
-  void LocalLoadTask(chi::u32 method, chi::DefaultLoadArchive &archive,
-                     ctp::ipc::FullPtr<chi::Task> task_ptr) override;
-  ctp::ipc::FullPtr<chi::Task> LocalAllocLoadTask(chi::u32 method,
-                                               chi::DefaultLoadArchive &archive) override;
-  void LocalSaveTask(chi::u32 method, chi::DefaultSaveArchive &archive,
-                     ctp::ipc::FullPtr<chi::Task> task_ptr) override;
+  ctp::ipc::FullPtr<clio::run::Task> NewTask(clio::run::u32 method) override;
+  void AggregateOut(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> orig_task,
+                 const ctp::ipc::FullPtr<clio::run::Task>& replica_task) override;
+  void DelTask(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> task_ptr) override;
+  void LocalLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive &archive,
+                     ctp::ipc::FullPtr<clio::run::Task> task_ptr) override;
+  ctp::ipc::FullPtr<clio::run::Task> LocalAllocLoadTask(clio::run::u32 method,
+                                               clio::run::DefaultLoadArchive &archive) override;
+  void LocalSaveTask(clio::run::u32 method, clio::run::DefaultSaveArchive &archive,
+                     ctp::ipc::FullPtr<clio::run::Task> task_ptr) override;
 
 private:
   // AI model predictors
@@ -216,9 +216,9 @@ private:
   // Skipped entirely when CompressorConfig::tracking_enabled_ is false —
   // ScheduleTask then routes Compress via DirectHash(tag_id) and the
   // periodic PollConsumers becomes a no-op.
-  std::unordered_map<clio::cte::core::TagId, std::vector<chi::u32>>
+  std::unordered_map<clio::cte::core::TagId, std::vector<clio::run::u32>>
       tag_consumers_;
-  chi::CoRwLock tag_consumers_lock_;
+  clio::run::CoRwLock tag_consumers_lock_;
 
   // Previous CPU times sample, used by PollNodeLoad to compute CPU%.
   ctp::CpuTimes prev_cpu_times_;
@@ -232,7 +232,7 @@ private:
    * @param tag_id Tag that the inbound Decompress is reading.
    * @param node_id Originating node ID of the Decompress request.
    */
-  void RegisterConsumer(const clio::cte::core::TagId &tag_id, chi::u32 node_id);
+  void RegisterConsumer(const clio::cte::core::TagId &tag_id, clio::run::u32 node_id);
 
   /**
    * Pick the best consumer node for placing future Compress traffic for
@@ -247,7 +247,7 @@ private:
    * @return true if a consumer was found, false otherwise.
    */
   bool PickConsumerForTag(const clio::cte::core::TagId &tag_id,
-                          chi::u32 &node_id_out);
+                          clio::run::u32 &node_id_out);
 
   /**
    * Estimate compression statistics using AI models
@@ -257,7 +257,7 @@ private:
    * @return Vector of compression statistics for candidate libraries
    */
   std::vector<CompressionStats> EstCompressionStats(
-      const void* chunk, chi::u64 chunk_size, const Context& context);
+      const void* chunk, clio::run::u64 chunk_size, const Context& context);
 
   /**
    * Estimate workflow compression time for a specific tier
@@ -268,7 +268,7 @@ private:
    * @return Estimated time in milliseconds
    */
   double EstWorkflowCompressTime(
-      chi::u64 chunk_size, double tier_bw, const CompressionStats& stats,
+      clio::run::u64 chunk_size, double tier_bw, const CompressionStats& stats,
       const Context& context);
 
   /**
@@ -281,7 +281,7 @@ private:
    * @return Tuple of (tier_id, compress_lib, compress_preset, estimated_time, tier_score)
    */
   std::tuple<int, int, int, double, float> BestCompressRatio(
-      const void* chunk, chi::u64 chunk_size, int container_id,
+      const void* chunk, clio::run::u64 chunk_size, int container_id,
       const std::vector<CompressionStats>& stats, const Context& context);
 
   /**
@@ -294,7 +294,7 @@ private:
    * @return Tuple of (tier_id, compress_lib, compress_preset, estimated_time, tier_score)
    */
   std::tuple<int, int, int, double, float> BestCompressTime(
-      const void* chunk, chi::u64 chunk_size, int container_id,
+      const void* chunk, clio::run::u64 chunk_size, int container_id,
       const std::vector<CompressionStats>& stats, const Context& context);
 
   /**
@@ -307,7 +307,7 @@ private:
    * @return Tuple of (tier_id, compress_lib, compress_preset, estimated_time, tier_score)
    */
   std::tuple<int, int, int, double, float> BestCompressForNode(
-      const Context& context, const void* chunk, chi::u64 chunk_size,
+      const Context& context, const void* chunk, clio::run::u64 chunk_size,
       int container_id, const std::vector<CompressionStats>& stats);
 
   /**

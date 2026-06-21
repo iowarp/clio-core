@@ -39,10 +39,10 @@
 
 namespace clio::cae::core {
 
-class Client : public chi::ContainerClient {
+class Client : public clio::run::ContainerClient {
  public:
   Client() = default;
-  explicit Client(const chi::PoolId& pool_id) { Init(pool_id); }
+  explicit Client(const clio::run::PoolId& pool_id) { Init(pool_id); }
 
   /**
    * Asynchronous Create - returns immediately
@@ -50,18 +50,18 @@ class Client : public chi::ContainerClient {
    *   1. Update client pool_id_: client.Init(task->new_pool_id_)
    * Note: Task is automatically freed when Future goes out of scope
    */
-  chi::Future<CreateTask> AsyncCreate(
-      const chi::PoolQuery& pool_query,
+  clio::run::Future<CreateTask> AsyncCreate(
+      const clio::run::PoolQuery& pool_query,
       const std::string& pool_name,
-      const chi::PoolId& custom_pool_id,
+      const clio::run::PoolId& custom_pool_id,
       const CreateParams& params = CreateParams()) {
     auto* ipc_manager = CLIO_IPC;
 
     // CRITICAL: CreateTask MUST use admin pool for GetOrCreatePool processing
     // Pass 'this' as client pointer for PostWait callback
     auto task = ipc_manager->NewTask<CreateTask>(
-        chi::CreateTaskId(),
-        chi::kAdminPoolId,  // Always use admin pool for CreateTask
+        clio::run::CreateTaskId(),
+        clio::run::kAdminPoolId,  // Always use admin pool for CreateTask
         pool_query,
         CreateParams::chimod_lib_name,  // ChiMod name from CreateParams
         pool_name,                       // Pool name
@@ -76,11 +76,11 @@ class Client : public chi::ContainerClient {
   /**
    * Monitor container state - asynchronous
    */
-  chi::Future<MonitorTask> AsyncMonitor(const chi::PoolQuery &pool_query,
+  clio::run::Future<MonitorTask> AsyncMonitor(const clio::run::PoolQuery &pool_query,
                                         const std::string &query) {
     auto *ipc_manager = CLIO_IPC;
     auto task = ipc_manager->NewTask<MonitorTask>(
-        chi::CreateTaskId(), pool_id_, pool_query, query);
+        clio::run::CreateTaskId(), pool_id_, pool_query, query);
     return ipc_manager->Send(task);
   }
 
@@ -89,14 +89,14 @@ class Client : public chi::ContainerClient {
    * Accepts vector of AssimilationCtx and serializes it transparently in the task constructor
    * After Wait(), access results via task->num_tasks_scheduled_ and task->result_code_
    */
-  chi::Future<ParseOmniTask> AsyncParseOmni(
+  clio::run::Future<ParseOmniTask> AsyncParseOmni(
       const std::vector<AssimilationCtx>& contexts) {
     auto* ipc_manager = CLIO_IPC;
 
     auto task = ipc_manager->NewTask<ParseOmniTask>(
-        chi::CreateTaskId(),
+        clio::run::CreateTaskId(),
         pool_id_,
-        chi::PoolQuery::Local(),
+        clio::run::PoolQuery::Local(),
         contexts);
 
     return ipc_manager->Send(task);
@@ -117,20 +117,20 @@ class Client : public chi::ContainerClient {
    * @param format  Export format: "hdf5" or "binary"
    * @param pool_query  Pool query for routing (default: Local)
    */
-  chi::Future<ExportDataTask> AsyncExportData(
+  clio::run::Future<ExportDataTask> AsyncExportData(
       const std::string &tag_name,
       const std::string &output_path,
       const std::string &format,
-      const chi::PoolQuery &pool_query = chi::PoolQuery::Local()) {
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Local()) {
     auto *ipc_manager = CLIO_IPC;
     auto task = ipc_manager->NewTask<ExportDataTask>(
-        chi::CreateTaskId(), pool_id_, pool_query,
+        clio::run::CreateTaskId(), pool_id_, pool_query,
         tag_name, output_path, format);
     return ipc_manager->Send(task);
   }
 
-  chi::Future<ProcessHdf5DatasetTask> AsyncProcessHdf5Dataset(
-      const chi::PoolQuery& pool_query,
+  clio::run::Future<ProcessHdf5DatasetTask> AsyncProcessHdf5Dataset(
+      const clio::run::PoolQuery& pool_query,
       const std::string& file_path,
       const std::string& dataset_path,
       const std::string& tag_prefix) {
@@ -140,7 +140,7 @@ class Client : public chi::ContainerClient {
          pool_id_, file_path, dataset_path);
 
     auto task = ipc_manager->NewTask<ProcessHdf5DatasetTask>(
-        chi::CreateTaskId(),
+        clio::run::CreateTaskId(),
         pool_id_,
         pool_query,
         file_path,
@@ -170,61 +170,61 @@ class Client : public chi::ContainerClient {
   // from clio::cte::core::Method, so we re-stamp method_ after NewTask so
   // dispatch at CAE lands in the right Run case.
   // --------------------------------------------------------------------
-  chi::Future<PutBlobTask> AsyncPutBlob(
+  clio::run::Future<PutBlobTask> AsyncPutBlob(
       const clio::cte::core::TagId &tag_id, const char *blob_name,
-      chi::u64 offset, chi::u64 size, ctp::ipc::ShmPtr<> blob_data,
+      clio::run::u64 offset, clio::run::u64 size, ctp::ipc::ShmPtr<> blob_data,
       float score = -1.0f,
       const clio::cte::core::Context &context = clio::cte::core::Context(),
-      chi::u32 flags = 0,
-      const chi::PoolQuery &pool_query = chi::PoolQuery::Dynamic()) {
+      clio::run::u32 flags = 0,
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
     auto *ipc_manager = CLIO_IPC;
     auto task = ipc_manager->NewTask<PutBlobTask>(
-        chi::CreateTaskId(), pool_id_, pool_query, tag_id, blob_name,
+        clio::run::CreateTaskId(), pool_id_, pool_query, tag_id, blob_name,
         offset, size, blob_data, score, context, flags);
     task->method_ = Method::kPutBlob;
     return ipc_manager->Send(task);
   }
 
-  chi::Future<PutBlobTask> AsyncPutBlob(
+  clio::run::Future<PutBlobTask> AsyncPutBlob(
       const clio::cte::core::TagId &tag_id, const std::string &blob_name,
-      chi::u64 offset, chi::u64 size, ctp::ipc::ShmPtr<> blob_data,
+      clio::run::u64 offset, clio::run::u64 size, ctp::ipc::ShmPtr<> blob_data,
       float score = -1.0f,
       const clio::cte::core::Context &context = clio::cte::core::Context(),
-      chi::u32 flags = 0,
-      const chi::PoolQuery &pool_query = chi::PoolQuery::Dynamic()) {
+      clio::run::u32 flags = 0,
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
     return AsyncPutBlob(tag_id, blob_name.c_str(), offset, size, blob_data,
                         score, context, flags, pool_query);
   }
 
-  chi::Future<GetBlobTask> AsyncGetBlob(
+  clio::run::Future<GetBlobTask> AsyncGetBlob(
       const clio::cte::core::TagId &tag_id, const char *blob_name,
-      chi::u64 offset, chi::u64 size, chi::u32 flags,
+      clio::run::u64 offset, clio::run::u64 size, clio::run::u32 flags,
       ctp::ipc::ShmPtr<> blob_data,
-      const chi::PoolQuery &pool_query = chi::PoolQuery::Dynamic()) {
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
     auto *ipc_manager = CLIO_IPC;
     auto task = ipc_manager->NewTask<GetBlobTask>(
-        chi::CreateTaskId(), pool_id_, pool_query, tag_id, blob_name,
+        clio::run::CreateTaskId(), pool_id_, pool_query, tag_id, blob_name,
         offset, size, flags, blob_data);
     task->method_ = Method::kGetBlob;
     return ipc_manager->Send(task);
   }
 
-  chi::Future<GetBlobTask> AsyncGetBlob(
+  clio::run::Future<GetBlobTask> AsyncGetBlob(
       const clio::cte::core::TagId &tag_id, const std::string &blob_name,
-      chi::u64 offset, chi::u64 size, chi::u32 flags,
+      clio::run::u64 offset, clio::run::u64 size, clio::run::u32 flags,
       ctp::ipc::ShmPtr<> blob_data,
-      const chi::PoolQuery &pool_query = chi::PoolQuery::Dynamic()) {
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
     return AsyncGetBlob(tag_id, blob_name.c_str(), offset, size, flags,
                         blob_data, pool_query);
   }
 
-  chi::Future<GetOrCreateTagTask> AsyncGetOrCreateTag(
+  clio::run::Future<GetOrCreateTagTask> AsyncGetOrCreateTag(
       const std::string &tag_name,
       const clio::cte::core::TagId &tag_id = clio::cte::core::TagId::GetNull(),
-      const chi::PoolQuery &pool_query = chi::PoolQuery::Dynamic()) {
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
     auto *ipc_manager = CLIO_IPC;
     auto task = ipc_manager->NewTask<GetOrCreateTagTask>(
-        chi::CreateTaskId(), pool_id_, pool_query, tag_name, tag_id);
+        clio::run::CreateTaskId(), pool_id_, pool_query, tag_name, tag_id);
     task->method_ = Method::kGetOrCreateTag;
     return ipc_manager->Send(task);
   }
@@ -235,13 +235,13 @@ class Client : public chi::ContainerClient {
    * clio::cte::core::Client::AsyncSemanticSearch — see that for the
    * matching/scoring rules.
    */
-  chi::Future<SemanticSearchTask> AsyncSemanticSearch(
+  clio::run::Future<SemanticSearchTask> AsyncSemanticSearch(
       const std::string &tag_regex, const std::string &blob_regex,
-      const std::string &query_text, chi::u32 k = 10,
-      const chi::PoolQuery &pool_query = chi::PoolQuery::Local()) {
+      const std::string &query_text, clio::run::u32 k = 10,
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Local()) {
     auto *ipc_manager = CLIO_IPC;
     auto task = ipc_manager->NewTask<SemanticSearchTask>(
-        chi::CreateTaskId(), pool_id_, pool_query, tag_regex, blob_regex,
+        clio::run::CreateTaskId(), pool_id_, pool_query, tag_regex, blob_regex,
         query_text, k);
     task->method_ = Method::kSemanticSearch;
     return ipc_manager->Send(task);
@@ -263,7 +263,7 @@ CTP_DEFINE_GLOBAL_PTR_VAR_H(clio::cae::core::Client, g_cae_client);
  * @return true on success, false on failure
  */
 bool CLIO_CAE_CLIENT_INIT(const std::string &config_path = "",
-                         const chi::PoolQuery &pool_query = chi::PoolQuery::Dynamic());
+                         const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic());
 
 /**
  * Global CAE client singleton accessor macro

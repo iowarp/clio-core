@@ -1,17 +1,17 @@
 // context-runtime/include/clio_runtime/compat/chimaera_namespace.h
 //
-// Module namespace migrated from `chimaera::` to `clio::run::`. This header
-// keeps the legacy `chimaera::` form working for downstream code in two
+// Module namespace migrated from `clio::run::` to `clio::run::`. This header
+// keeps the legacy `clio::run::` form working for downstream code in two
 // distinct ways, depending on what the downstream code is trying to do:
 //
-//  - Qualified name lookups like `chimaera::admin::Client` resolve to
+//  - Qualified name lookups like `clio::run::admin::Client` resolve to
 //    `clio::run::admin::Client` via `using namespace` directives.
 //
-//  - New `namespace chimaera::<x> { class Foo; }` declarations remain
+//  - New `namespace clio::run::<x> { class Foo; }` declarations remain
 //    legal because `chimaera` is kept as a *real* namespace (not a
 //    `namespace chimaera = clio_run;` alias, which would forbid opening
 //    it as a namespace — see the build error in external/coeus-adapter
-//    which declares `namespace chimaera::coeus_mdm { ... }`).
+//    which declares `namespace clio::run::coeus_mdm { ... }`).
 //
 // External chimods that haven't migrated yet (coeus-adapter and friends)
 // keep compiling unchanged.
@@ -31,10 +31,10 @@ namespace clio::run::admin {}
 namespace clio::run::bdev {}
 namespace clio::run::MOD_NAME {}
 
-// Re-export each canonical sub-namespace under `chimaera::<x>`. `using
+// Re-export each canonical sub-namespace under `clio::run::<x>`. `using
 // namespace` makes every name declared in `clio::run::admin` (etc.)
-// findable via `chimaera::admin::<name>` lookups, without freezing
-// `chimaera::admin` as an alias — so new `namespace chimaera::other {}`
+// findable via `clio::run::admin::<name>` lookups, without freezing
+// `clio::run::admin` as an alias — so new `namespace clio::run::other {}`
 // declarations by downstream code remain legal.
 namespace chimaera {
 namespace admin     { using namespace clio::run::admin; }
@@ -44,9 +44,9 @@ namespace MOD_NAME  { using namespace clio::run::MOD_NAME; }
 
 // Pre-`clio::run`-rename intermediate spelling.  In-tree code uses the
 // canonical `clio::run::*` form everywhere now, but downstream code that
-// already migrated off `chimaera::*` to the `clio_run::*` waypoint keeps
+// already migrated off `clio::run::*` to the `clio::run::*` waypoint keeps
 // compiling via this alias.  Safe to use the simple `namespace X = Y;`
-// form here because no external chimod opens `namespace clio_run::xxx {}`
+// form here because no external chimod opens `namespace clio::run::xxx {}`
 // (unlike `chimaera`, which coeus-adapter does open).
 namespace clio_run = clio::run;
 

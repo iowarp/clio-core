@@ -328,7 +328,7 @@
 /** Mark a function whose address is taken on the device.
  *
  *  Use on every function that gets stored in a function-pointer table the
- *  device side dispatches through (for example chi::gpu::Container::run_,
+ *  device side dispatches through (for example clio::run::gpu::Container::run_,
  *  alloc_task_, save_task_, ...).
  *
  *  - On CUDA/ROCm: expands to nothing; nvcc/hipcc allow taking the address

@@ -24,7 +24,7 @@ namespace {
 // backend cannot open the file, transparently fall back to POSIX AIO, which
 // works in restricted environments (containers/CI). Returns an opened AsyncIO,
 // or nullptr only if even POSIX AIO cannot open the file (a genuine error).
-std::unique_ptr<ctp::AsyncIO> OpenBackingFile(chi::u32 io_depth,
+std::unique_ptr<ctp::AsyncIO> OpenBackingFile(clio::run::u32 io_depth,
                                               const std::string &file_path) {
   auto io = ctp::AsyncIoFactory::Get(io_depth);
   if (io && io->Open(file_path, O_RDWR | O_CREAT, 0644)) {
@@ -42,8 +42,8 @@ std::unique_ptr<ctp::AsyncIO> OpenBackingFile(chi::u32 io_depth,
 
 }  // namespace
 
-bool WorkerIOContext::Init(const std::string &file_path, chi::u32 io_depth,
-                           chi::u32 worker_id) {
+bool WorkerIOContext::Init(const std::string &file_path, clio::run::u32 io_depth,
+                           clio::run::u32 worker_id) {
   if (is_initialized_) return true;
 
   async_io_ = OpenBackingFile(io_depth, file_path);
@@ -78,14 +78,14 @@ bool FsBdevTransport::Init(const CreateParams& params,
     return false;
   }
 
-  chi::u64 file_size = 0;
+  clio::run::u64 file_size = 0;
   off_t current_size = setup_io->GetFileSize();
   if (current_size < 0) {
     HLOG(kError, "Failed to get file size for: {}", file_path_);
     setup_io->Close();
     return false;
   }
-  file_size = static_cast<chi::u64>(current_size);
+  file_size = static_cast<clio::run::u64>(current_size);
 
   if (params.total_size_ > 0 && params.total_size_ < file_size) {
     file_size = params.total_size_;
@@ -106,7 +106,7 @@ bool FsBdevTransport::Init(const CreateParams& params,
     HLOG(kWarning, "Failed to initialize per-worker I/O contexts");
   }
 
-  chi::WorkOrchestrator *work_orchestrator = CLIO_WORK_ORCHESTRATOR;
+  clio::run::WorkOrchestrator *work_orchestrator = CLIO_WORK_ORCHESTRATOR;
   size_t num_workers = work_orchestrator ? work_orchestrator->GetWorkerCount() : 16;
   allocator_.Init(num_workers, file_size, params.alignment_);
 
@@ -126,13 +126,13 @@ void FsBdevTransport::FreeBlocks(int worker_id, const std::vector<Block>& blocks
 }
 
 bool FsBdevTransport::InitializeWorkerIOContexts() {
-  chi::WorkOrchestrator *work_orchestrator = CLIO_WORK_ORCHESTRATOR;
+  clio::run::WorkOrchestrator *work_orchestrator = CLIO_WORK_ORCHESTRATOR;
   size_t num_workers = work_orchestrator ? work_orchestrator->GetWorkerCount() : 16;
 
   io_contexts_.resize(num_workers);
   bool success = true;
   for (size_t i = 0; i < num_workers; ++i) {
-    if (!io_contexts_[i].Init(file_path_, io_depth_, static_cast<chi::u32>(i))) {
+    if (!io_contexts_[i].Init(file_path_, io_depth_, static_cast<clio::run::u32>(i))) {
       success = false;
     }
   }
@@ -151,17 +151,17 @@ WorkerIOContext *FsBdevTransport::GetWorkerIOContext(size_t worker_id) {
   }
   WorkerIOContext *ctx = &io_contexts_[worker_id];
   if (!ctx->is_initialized_) {
-    if (!ctx->Init(file_path_, io_depth_, static_cast<chi::u32>(worker_id))) {
+    if (!ctx->Init(file_path_, io_depth_, static_cast<clio::run::u32>(worker_id))) {
       return nullptr;
     }
   }
   return ctx;
 }
 
-chi::TaskResume FsBdevTransport::WriteBlocks(ctp::ipc::FullPtr<WriteTask> task, chi::RunContext &ctx) {
-  chi::RunContext& rctx = ctx;
+clio::run::TaskResume FsBdevTransport::WriteBlocks(ctp::ipc::FullPtr<WriteTask> task, clio::run::RunContext &ctx) {
+  clio::run::RunContext& rctx = ctx;
   CLIO_TASK_BODY_BEGIN
-  chi::Worker *worker = CLIO_CUR_WORKER;
+  clio::run::Worker *worker = CLIO_CUR_WORKER;
   size_t worker_id = worker ? worker->GetId() : 0;
   WorkerIOContext *io_ctx = GetWorkerIOContext(worker_id);
 
@@ -175,14 +175,14 @@ chi::TaskResume FsBdevTransport::WriteBlocks(ctp::ipc::FullPtr<WriteTask> task, 
     ctp::DeviceAwareMemcpy(staging.data(), data_ptr.ptr_, task->length_);
   }
 
-  chi::u64 total_bytes_written = 0;
-  chi::u64 data_offset = 0;
+  clio::run::u64 total_bytes_written = 0;
+  clio::run::u64 data_offset = 0;
 
   for (size_t i = 0; i < task->blocks_.size(); ++i) {
     const Block &block = task->blocks_[i];
-    chi::u64 remaining = task->length_ - total_bytes_written;
+    clio::run::u64 remaining = task->length_ - total_bytes_written;
     if (remaining == 0) break;
-    chi::u64 block_write_size = std::min(remaining, block.size_);
+    clio::run::u64 block_write_size = std::min(remaining, block.size_);
 
     void *block_data = data_on_device
                            ? static_cast<void *>(staging.data() + data_offset)
@@ -206,7 +206,7 @@ chi::TaskResume FsBdevTransport::WriteBlocks(ctp::ipc::FullPtr<WriteTask> task, 
 
     ctp::IoResult result;
     while (!io_ctx->async_io_->IsComplete(token, result)) {
-      CLIO_CO_AWAIT(chi::yield(10.0));
+      CLIO_CO_AWAIT(clio::run::yield(10.0));
     }
 
     if (result.error_code != 0) {
@@ -215,8 +215,8 @@ chi::TaskResume FsBdevTransport::WriteBlocks(ctp::ipc::FullPtr<WriteTask> task, 
       CLIO_CO_RETURN;
     }
 
-    chi::u64 actual_bytes = std::min(
-        static_cast<chi::u64>(result.bytes_transferred), block_write_size);
+    clio::run::u64 actual_bytes = std::min(
+        static_cast<clio::run::u64>(result.bytes_transferred), block_write_size);
     total_bytes_written += actual_bytes;
     data_offset += actual_bytes;
   }
@@ -227,10 +227,10 @@ chi::TaskResume FsBdevTransport::WriteBlocks(ctp::ipc::FullPtr<WriteTask> task, 
   CLIO_TASK_BODY_END
 }
 
-chi::TaskResume FsBdevTransport::ReadBlocks(ctp::ipc::FullPtr<ReadTask> task, chi::RunContext &ctx) {
-  chi::RunContext& rctx = ctx;
+clio::run::TaskResume FsBdevTransport::ReadBlocks(ctp::ipc::FullPtr<ReadTask> task, clio::run::RunContext &ctx) {
+  clio::run::RunContext& rctx = ctx;
   CLIO_TASK_BODY_BEGIN
-  chi::Worker *worker = CLIO_CUR_WORKER;
+  clio::run::Worker *worker = CLIO_CUR_WORKER;
   size_t worker_id = worker ? worker->GetId() : 0;
   WorkerIOContext *io_ctx = GetWorkerIOContext(worker_id);
 
@@ -243,14 +243,14 @@ chi::TaskResume FsBdevTransport::ReadBlocks(ctp::ipc::FullPtr<ReadTask> task, ch
     staging.resize(task->length_);
   }
 
-  chi::u64 total_bytes_read = 0;
-  chi::u64 data_offset = 0;
+  clio::run::u64 total_bytes_read = 0;
+  clio::run::u64 data_offset = 0;
 
   for (size_t i = 0; i < task->blocks_.size(); ++i) {
     const Block &block = task->blocks_[i];
-    chi::u64 remaining = task->length_ - total_bytes_read;
+    clio::run::u64 remaining = task->length_ - total_bytes_read;
     if (remaining == 0) break;
-    chi::u64 block_read_size = std::min(remaining, block.size_);
+    clio::run::u64 block_read_size = std::min(remaining, block.size_);
 
     void *block_data = data_on_device
                            ? static_cast<void *>(staging.data() + data_offset)
@@ -273,7 +273,7 @@ chi::TaskResume FsBdevTransport::ReadBlocks(ctp::ipc::FullPtr<ReadTask> task, ch
 
     ctp::IoResult result;
     while (!io_ctx->async_io_->IsComplete(token, result)) {
-      CLIO_CO_AWAIT(chi::yield(10.0));
+      CLIO_CO_AWAIT(clio::run::yield(10.0));
     }
 
     if (result.error_code != 0) {
@@ -282,8 +282,8 @@ chi::TaskResume FsBdevTransport::ReadBlocks(ctp::ipc::FullPtr<ReadTask> task, ch
       CLIO_CO_RETURN;
     }
 
-    chi::u64 actual_bytes = std::min(
-        static_cast<chi::u64>(result.bytes_transferred), block_read_size);
+    clio::run::u64 actual_bytes = std::min(
+        static_cast<clio::run::u64>(result.bytes_transferred), block_read_size);
     total_bytes_read += actual_bytes;
     data_offset += actual_bytes;
   }

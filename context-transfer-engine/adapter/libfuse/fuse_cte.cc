@@ -72,7 +72,7 @@ using namespace clio::cae::fuse;
 namespace {
 /** Per-open-file state: the chimod handle + the path it was opened on. */
 struct CfsHandle {
-  chi::u64 fh = 0;
+  clio::run::u64 fh = 0;
   std::string path;
 };
 
@@ -111,7 +111,7 @@ static void *cte_fuse_init(struct fuse_conn_info *conn,
   cfg->entry_timeout = 0;
   cfg->negative_timeout = 0;
 
-  bool success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
+  bool success = clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true);
   if (!success) {
     fprintf(stderr, "ERROR: CHIMAERA_INIT failed\n");
     return nullptr;
@@ -132,7 +132,7 @@ static void *cte_fuse_init(struct fuse_conn_info *conn,
 
 static void cte_fuse_destroy(void *private_data) {
   (void)private_data;
-  chi::CHIMAERA_FINALIZE();
+  clio::run::CHIMAERA_FINALIZE();
 }
 
 // ============================================================================
@@ -269,7 +269,7 @@ static int cte_fuse_create(const char *path, mode_t mode,
                            struct fuse_file_info *fi) {
   std::string p(path);
   auto *cfs = CLIO_CFS_CLIENT;
-  auto t = cfs->AsyncOpen(p, O_CREAT | O_RDWR, static_cast<chi::u32>(mode));
+  auto t = cfs->AsyncOpen(p, O_CREAT | O_RDWR, static_cast<clio::run::u32>(mode));
   t.Wait();
   if (t->GetReturnCode() != 0) return -EIO;
 
@@ -285,7 +285,7 @@ static int cte_fuse_open(const char *path, struct fuse_file_info *fi) {
   auto *cfs = CLIO_CFS_CLIENT;
   // The chimod honors O_CREAT: a plain open of a missing file returns
   // handle==0 so we can surface ENOENT.
-  auto t = cfs->AsyncOpen(p, static_cast<chi::u32>(fi->flags), 0644);
+  auto t = cfs->AsyncOpen(p, static_cast<clio::run::u32>(fi->flags), 0644);
   t.Wait();
   if (t->GetReturnCode() != 0) return -EIO;
   if (t->handle_ == 0) return -ENOENT;
@@ -345,7 +345,7 @@ static int cte_fuse_read(const char *path, char *buf, size_t size,
   ctp::ipc::ShmPtr<> shm_ptr(shm_buf.shm_);
 
   auto *cfs = CLIO_CFS_CLIENT;
-  auto t = cfs->AsyncRead(handle->fh, static_cast<chi::u64>(offset), size,
+  auto t = cfs->AsyncRead(handle->fh, static_cast<clio::run::u64>(offset), size,
                           shm_ptr);
   t.Wait();
   int rc;
@@ -377,7 +377,7 @@ static int cte_fuse_write(const char *path, const char *buf, size_t size,
   ctp::ipc::ShmPtr<> shm_ptr(shm_buf.shm_);
 
   auto *cfs = CLIO_CFS_CLIENT;
-  auto t = cfs->AsyncWrite(handle->fh, static_cast<chi::u64>(offset), size,
+  auto t = cfs->AsyncWrite(handle->fh, static_cast<clio::run::u64>(offset), size,
                            shm_ptr);
   t.Wait();
   int rc;
@@ -406,7 +406,7 @@ static int cte_fuse_truncate(const char *path, off_t size,
                              struct fuse_file_info *fi) {
   (void)fi;
   auto *cfs = CLIO_CFS_CLIENT;
-  auto t = cfs->AsyncTruncate(std::string(path), static_cast<chi::u64>(size));
+  auto t = cfs->AsyncTruncate(std::string(path), static_cast<clio::run::u64>(size));
   t.Wait();
   return t->GetReturnCode() == 0 ? 0 : -EIO;
 }
@@ -450,12 +450,12 @@ static int cte_fuse_statfs(const char *path, struct statvfs *stbuf) {
   std::memset(stbuf, 0, sizeof(*stbuf));
   constexpr fsblkcnt_t kBlockSize = 4096;
 
-  chi::u64 total_bytes = 0;
-  chi::u64 remaining_bytes = 0;
+  clio::run::u64 total_bytes = 0;
+  clio::run::u64 remaining_bytes = 0;
   auto *cte = CLIO_CTE_CLIENT;
   if (cte != nullptr) {
     // Broadcast: total + remaining capacity across the whole cluster.
-    auto t = cte->AsyncGetCapacity(chi::PoolQuery::Broadcast());
+    auto t = cte->AsyncGetCapacity(clio::run::PoolQuery::Broadcast());
     t.Wait();
     if (t->return_code_ == 0) {
       total_bytes = t->total_capacity_;

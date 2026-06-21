@@ -58,9 +58,9 @@ class ChimaeraTestFixture {
  public:
   ChimaeraTestFixture() {
     // Use the unified CLIO Runtime initialization
-    bool success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
+    bool success = clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true);
     REQUIRE(success);
-    SimpleTest::g_test_finalize = chi::CHIMAERA_FINALIZE;
+    SimpleTest::g_test_finalize = clio::run::CHIMAERA_FINALIZE;
   }
 
   ~ChimaeraTestFixture() {
@@ -75,10 +75,10 @@ TEST_CASE("FlushTask Basic Functionality", "[flush][admin]") {
 
   SECTION("Flush with no work remaining returns success immediately") {
     // Create admin client
-    clio::run::admin::Client admin_client(chi::kAdminPoolId);
+    clio::run::admin::Client admin_client(clio::run::kAdminPoolId);
 
     // Create flush task
-    auto pool_query = chi::PoolQuery();
+    auto pool_query = clio::run::PoolQuery();
     auto flush_task = admin_client.AsyncFlush(pool_query);
 
     // Wait for completion
@@ -96,12 +96,12 @@ TEST_CASE("FlushTask with MOD_NAME Container and Async Tasks",
 
   SECTION("Flush waits for MOD_NAME async Custom tasks to complete") {
     // Create MOD_NAME client and container - CreateTask will auto-create pool
-    const chi::PoolId mod_name_pool_id = chi::PoolId(4000, 0);
+    const clio::run::PoolId mod_name_pool_id = clio::run::PoolId(4000, 0);
     clio::run::MOD_NAME::Client mod_name_client(mod_name_pool_id);
 
     // Create the MOD_NAME container with local pool query - this will create
     // pool if needed
-    auto pool_query = chi::PoolQuery::Local();
+    auto pool_query = clio::run::PoolQuery::Local();
     std::string pool_name = "flush_test_mod_name_pool";
     auto create_task = mod_name_client.AsyncCreate(pool_query, pool_name, mod_name_pool_id);
     create_task.Wait();
@@ -112,26 +112,26 @@ TEST_CASE("FlushTask with MOD_NAME Container and Async Tasks",
 
     // Send multiple async Custom tasks to the MOD_NAME runtime
     const int num_async_tasks = 5;
-    std::vector<chi::Future<clio::run::MOD_NAME::CustomTask>> async_tasks;
+    std::vector<clio::run::Future<clio::run::MOD_NAME::CustomTask>> async_tasks;
 
     for (int i = 0; i < num_async_tasks; i++) {
       std::string input_data = "test_data_" + std::to_string(i);
-      chi::u32 operation_id = static_cast<chi::u32>(i + 1);
+      clio::run::u32 operation_id = static_cast<clio::run::u32>(i + 1);
 
       // Create async custom task
-      auto async_task = mod_name_client.AsyncCustom(chi::PoolQuery::Local(), input_data, operation_id);
+      auto async_task = mod_name_client.AsyncCustom(clio::run::PoolQuery::Local(), input_data, operation_id);
 
       async_tasks.push_back(async_task);
     }
 
     // Start flush operation in background thread
-    clio::run::admin::Client flush_admin_client(chi::kAdminPoolId);
+    clio::run::admin::Client flush_admin_client(clio::run::kAdminPoolId);
     std::atomic<bool> flush_completed{false};
-    std::atomic<chi::u32> flush_result_code{999};
+    std::atomic<clio::run::u32> flush_result_code{999};
 
     std::thread flush_thread([&]() {
       auto flush_task =
-          flush_admin_client.AsyncFlush(chi::PoolQuery::Local());
+          flush_admin_client.AsyncFlush(clio::run::PoolQuery::Local());
       flush_task.Wait();
 
       flush_result_code.store(flush_task->return_code_);

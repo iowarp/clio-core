@@ -55,7 +55,7 @@ namespace fs = std::filesystem;
  * 4. **GetBlob Test**: Test blob retrieval with data integrity
  * 
  * The tests follow Google C++ style guide and use semantic naming for 
- * QueueIds and priorities. All CreateTask operations use chi::kAdminPoolId
+ * QueueIds and priorities. All CreateTask operations use clio::run::kAdminPoolId
  * as required.
  */
 
@@ -68,12 +68,12 @@ public:
   bool setup_completed_ = false;
 
   // Semantic names for test constants (following CLAUDE.md requirements)
-  static constexpr chi::QueueId kCTETestQueueId = chi::QueueId(1);
-  static constexpr chi::u64 kTestTargetSize = 10 * 1024 * 1024;  // 10MB
+  static constexpr clio::run::QueueId kCTETestQueueId = clio::run::QueueId(1);
+  static constexpr clio::run::u64 kTestTargetSize = 10 * 1024 * 1024;  // 10MB
   
   std::unique_ptr<clio::cte::core::Client> core_client_;
   std::string test_storage_path_;
-  chi::PoolId core_pool_id_;
+  clio::run::PoolId core_pool_id_;
   
   CTECoreTestFixture() {
     // Setup test storage path in home directory (HOME on POSIX,
@@ -90,7 +90,7 @@ public:
     }
     
     // Create unique pool ID for this test session
-    core_pool_id_ = chi::PoolId(42, 0);  // Using fixed ID for testing (major=42, minor=0)
+    core_pool_id_ = clio::run::PoolId(42, 0);  // Using fixed ID for testing (major=42, minor=0)
     
     // Create CTE core client
     core_client_ = std::make_unique<clio::cte::core::Client>(core_pool_id_);
@@ -132,7 +132,7 @@ public:
  * 
  * Verifies:
  * - CTE Core pool creation with proper parameters
- * - Uses chi::kAdminPoolId for CreateTask as required by CLAUDE.md  
+ * - Uses clio::run::kAdminPoolId for CreateTask as required by CLAUDE.md  
  * - Configuration parameters are applied correctly
  * - Both synchronous and asynchronous creation patterns
  */
@@ -159,7 +159,7 @@ TEST_CASE("Create CTE Core Pool", "[cte][core][pool]") {
   
   SECTION("Pool query validation") {
     // Verify dynamic pool query usage (never null as per CLAUDE.md)
-    chi::PoolQuery dynamic_query = chi::PoolQuery::Dynamic();
+    clio::run::PoolQuery dynamic_query = clio::run::PoolQuery::Dynamic();
 
     // Pool query should be valid and dynamic
     INFO("Pool query validation completed - using Local() as required");
@@ -210,14 +210,14 @@ TEST_CASE("Register Target", "[cte][core][target]") {
   
   SECTION("Target size validation") {
     // Test various target sizes
-    std::vector<chi::u64> valid_sizes = {
+    std::vector<clio::run::u64> valid_sizes = {
         1024,                // 1KB
         1024 * 1024,         // 1MB  
         10 * 1024 * 1024,    // 10MB
         100 * 1024 * 1024    // 100MB
     };
     
-    for (chi::u64 size : valid_sizes) {
+    for (clio::run::u64 size : valid_sizes) {
       REQUIRE(size > 0);
       INFO("Valid target size: " << size << " bytes");
     }
@@ -238,11 +238,11 @@ TEST_CASE("PutBlob Operations", "[cte][core][putblob]") {
   auto *fixture = ctp::Singleton<CTECoreTestFixture>::GetInstance();  SECTION("PutBlob parameter validation") {
     // Test valid blob parameters - Updated for new pattern
     const std::string valid_blob_name = "test_blob_001";
-    const chi::u32 valid_blob_id = 0;  // Use null ID for PutBlob
-    const chi::u64 valid_offset = 0;
-    const chi::u64 valid_size = 4096;  // 4KB
+    const clio::run::u32 valid_blob_id = 0;  // Use null ID for PutBlob
+    const clio::run::u64 valid_offset = 0;
+    const clio::run::u64 valid_size = 4096;  // 4KB
     const float valid_score = 0.75f;
-    const chi::u32 valid_flags = 0;
+    const clio::run::u32 valid_flags = 0;
     
     (void)valid_offset;  // Suppress unused warning
     (void)valid_flags;   // Suppress unused warning
@@ -292,14 +292,14 @@ TEST_CASE("PutBlob Operations", "[cte][core][putblob]") {
     // Test blob ID validation logic - Updated for new pattern
     
     // Null/zero IDs are now VALID for PutBlob (auto-allocation)
-    chi::u32 null_id = 0;
+    clio::run::u32 null_id = 0;
     REQUIRE(null_id == 0);  // Null ID is valid for auto-allocation
     INFO("Null blob ID (valid for auto-allocation): " << null_id);
     
     // Auto-generated IDs (non-zero) are valid for GetBlob
-    std::vector<chi::u32> generated_ids = {1, 42, 12345, 999999};
+    std::vector<clio::run::u32> generated_ids = {1, 42, 12345, 999999};
     
-    for (chi::u32 id : generated_ids) {
+    for (clio::run::u32 id : generated_ids) {
       REQUIRE(id != 0);
       INFO("Auto-generated blob ID: " << id);
     }
@@ -334,12 +334,12 @@ TEST_CASE("GetBlob Operations", "[cte][core][getblob]") {
 
   auto *fixture = ctp::Singleton<CTECoreTestFixture>::GetInstance();  SECTION("GetBlob parameter validation") {
     // Test valid retrieval parameters - Updated for new pattern
-    const chi::u32 valid_tag_id = 100;
+    const clio::run::u32 valid_tag_id = 100;
     const std::string valid_blob_name = "";  // Empty name for GetBlob
-    const chi::u32 valid_blob_id = 54321;  // Auto-generated ID
-    const chi::u64 valid_offset = 0;
-    const chi::u64 valid_size = 2048;  // 2KB
-    const chi::u32 valid_flags = 0;
+    const clio::run::u32 valid_blob_id = 54321;  // Auto-generated ID
+    const clio::run::u64 valid_offset = 0;
+    const clio::run::u64 valid_size = 2048;  // 2KB
+    const clio::run::u32 valid_flags = 0;
     
     (void)valid_flags;   // Suppress unused warning
     
@@ -383,8 +383,8 @@ TEST_CASE("GetBlob Operations", "[cte][core][getblob]") {
   SECTION("Partial retrieval simulation") {
     // Test partial blob retrieval logic
     const size_t total_size = 8192;   // 8KB total blob
-    const chi::u64 partial_offset = 1024;  // Start at 1KB
-    const chi::u64 partial_size = 2048;    // Retrieve 2KB
+    const clio::run::u64 partial_offset = 1024;  // Start at 1KB
+    const clio::run::u64 partial_size = 2048;    // Retrieve 2KB
     
     REQUIRE(partial_offset < total_size);
     REQUIRE(partial_offset + partial_size <= total_size);
@@ -421,7 +421,7 @@ TEST_CASE("GetBlob Operations", "[cte][core][getblob]") {
   SECTION("Error case simulation") {
     // Test error handling for non-existent blobs - Updated for new pattern
     const std::string nonexistent_name = "";  // Empty name for GetBlob
-    const chi::u32 nonexistent_id = 99999;  // Non-existent allocated ID
+    const clio::run::u32 nonexistent_id = 99999;  // Non-existent allocated ID
     
     REQUIRE(nonexistent_name.empty());   // Empty name for GetBlob
     REQUIRE(nonexistent_id != 0);         // ID should be allocated (non-zero)
@@ -463,7 +463,7 @@ TEST_CASE("CTE Core Integration Workflow", "[cte][core][integration]") {
     
     // Step 3: Tag creation simulation
     const std::string tag_name = "integration_tag";
-    const chi::u32 tag_id = 200;
+    const clio::run::u32 tag_id = 200;
     REQUIRE(!tag_name.empty());
     REQUIRE(tag_id > 0);
     INFO("Step 3 ✓: Tag '" << tag_name << "' with ID " << tag_id << " ready");
@@ -471,7 +471,7 @@ TEST_CASE("CTE Core Integration Workflow", "[cte][core][integration]") {
     // Step 4: Multiple blob operations
     const size_t blob_count = 5;
     std::vector<std::string> blob_names;
-    std::vector<chi::u32> blob_ids;
+    std::vector<clio::run::u32> blob_ids;
     std::vector<std::vector<char>> blob_data;
     
     for (size_t i = 0; i < blob_count; ++i) {

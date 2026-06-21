@@ -74,7 +74,7 @@ bool initializeRuntime() {
   }
 
   INFO("Initializing Chimaera runtime...");
-  if (!chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true)) {
+  if (!clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true)) {
     INFO("Chimaera initialization failed");
     return false;
   }
@@ -91,16 +91,16 @@ bool initializeRuntime() {
   // somewhere to place blobs (mirrors the libfuse adapter test fixture).
   INFO("Registering test target with CTE...");
   auto *cte_client = CLIO_CTE_CLIENT;
-  chi::PoolId bdev_pool_id(950, 0);
+  clio::run::PoolId bdev_pool_id(950, 0);
   clio::run::bdev::Client bdev_client(bdev_pool_id);
   auto create_task = bdev_client.AsyncCreate(
-      chi::PoolQuery::Dynamic(), kTestBackendFile, bdev_pool_id,
+      clio::run::PoolQuery::Dynamic(), kTestBackendFile, bdev_pool_id,
       clio::run::bdev::BdevType::kFile);
   create_task.Wait();
   std::this_thread::sleep_for(100ms);
   auto reg_task = cte_client->AsyncRegisterTarget(
       kTestBackendFile, clio::run::bdev::BdevType::kFile, kTestFileSize * 10,
-      chi::PoolQuery::Local(), bdev_pool_id);
+      clio::run::PoolQuery::Local(), bdev_pool_id);
   reg_task.Wait();
   if (reg_task->GetReturnCode() != 0) {
     INFO("Failed to register target, rc=" << reg_task->GetReturnCode());

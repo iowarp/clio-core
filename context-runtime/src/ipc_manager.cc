@@ -65,7 +65,7 @@
 #endif
 
 // Global pointer variable definition for IPC manager singleton
-CLIO_RUN_DEFINE_GLOBAL_PTR_VAR_CC(chi::IpcManager, g_ipc_manager);
+CLIO_RUN_DEFINE_GLOBAL_PTR_VAR_CC(clio::run::IpcManager, g_ipc_manager);
 
 namespace clio::run {
 
@@ -94,7 +94,7 @@ namespace {
 // main port) is untouched, so multi-node TCP is unaffected; on Linux/Windows
 // nothing changes. Override the platform default with CLIO_ZMQ_LOCAL_IPC=0/1.
 inline bool UseLocalZmqIpc() {
-  if (const char *env = chi::env::GetCompat("ZMQ_LOCAL_IPC")) {
+  if (const char *env = clio::run::env::GetCompat("ZMQ_LOCAL_IPC")) {
     return *env != '\0' && std::strcmp(env, "0") != 0;
   }
 #ifdef __APPLE__
@@ -127,7 +127,7 @@ bool IpcManager::ClientInit() {
   }
 
   // Parse CHI_IPC_MODE environment variable (default: TCP)
-  const char *ipc_mode_env = chi::env::GetCompat("IPC_MODE");
+  const char *ipc_mode_env = clio::run::env::GetCompat("IPC_MODE");
   if (ipc_mode_env != nullptr) {
     std::string mode_str(ipc_mode_env);
     if (mode_str == "SHM" || mode_str == "shm") {
@@ -145,7 +145,7 @@ bool IpcManager::ClientInit() {
 
   // Parse retry timeout environment variable
   // Semantics: 0 = fail immediately, -1 = wait forever, >0 = timeout in seconds
-  const char *retry_env = chi::env::GetCompat("CLIENT_RETRY_TIMEOUT");
+  const char *retry_env = clio::run::env::GetCompat("CLIENT_RETRY_TIMEOUT");
   if (retry_env) {
     client_retry_timeout_ = static_cast<float>(std::atof(retry_env));
   }
@@ -153,7 +153,7 @@ bool IpcManager::ClientInit() {
        client_retry_timeout_);
 
   // Parse CHI_CLIENT_TRY_NEW_SERVERS environment variable
-  const char *try_new_env = chi::env::GetCompat("CLIENT_TRY_NEW_SERVERS");
+  const char *try_new_env = clio::run::env::GetCompat("CLIENT_TRY_NEW_SERVERS");
   if (try_new_env) {
     client_try_new_servers_ = std::atoi(try_new_env);
   }
@@ -315,7 +315,7 @@ bool IpcManager::ServerInit() {
   // serialize/send/recv loop without needing a real multi-node
   // setup.  Read once here; IsTaskLocal consults force_net_ on the
   // hot path.
-  if (const char *env = chi::env::GetCompat("FORCE_NET")) {
+  if (const char *env = clio::run::env::GetCompat("FORCE_NET")) {
     if (*env != '\0' && std::strcmp(env, "0") != 0) {
       force_net_ = true;
       HLOG(kInfo, "IpcManager: CLIO_FORCE_NET=1 — routing all non-Local "
@@ -414,7 +414,7 @@ bool IpcManager::ServerInit() {
       // avoid the Defender Firewall prompt on the ROUTER port even when
       // the main server is on loopback.
       std::string router_bind = "0.0.0.0";
-      if (const char *env = chi::env::GetCompat("BIND_ADDR")) {
+      if (const char *env = clio::run::env::GetCompat("BIND_ADDR")) {
         if (*env) router_bind = env;
       }
       if (UseLocalZmqIpc()) {
@@ -841,7 +841,7 @@ bool IpcManager::StartLocalServer() {
 bool IpcManager::WaitForLocalServer() {
   // Read environment variables for wait configuration
   // Semantics: 0 = fail immediately, -1 = wait forever, >0 = timeout in seconds
-  const char *wait_env = chi::env::GetCompat("WAIT_SERVER");
+  const char *wait_env = clio::run::env::GetCompat("WAIT_SERVER");
   if (wait_env != nullptr) {
     wait_server_timeout_ = static_cast<float>(std::atof(wait_env));
   }
@@ -1045,7 +1045,7 @@ bool IpcManager::LoadHostfile() {
     // 127.0.0.1 so the Defender Firewall doesn't pop "Allow access?"
     // for every new test binary that binds a fresh port.
     std::string bind_addr = "0.0.0.0";
-    if (const char *env = chi::env::GetCompat("BIND_ADDR")) {
+    if (const char *env = clio::run::env::GetCompat("BIND_ADDR")) {
       if (*env) bind_addr = env;
     }
     HLOG(kDebug, "No hostfile configured, binding {} as node 0", bind_addr);
@@ -1818,7 +1818,7 @@ bool IpcManager::IncreaseClientShm(size_t size) {
     // Use kAdminPoolId directly (not admin_client->pool_id_) because
     // the admin client may not be initialized yet during ClientInit.
     auto reg_task = NewTask<clio::run::admin::RegisterMemoryTask>(
-        chi::CreateTaskId(), chi::kAdminPoolId, chi::PoolQuery::Local(),
+        clio::run::CreateTaskId(), clio::run::kAdminPoolId, clio::run::PoolQuery::Local(),
         alloc_id);
     IpcCpu2CpuZmq::ClientSend(this,reg_task, IpcMode::kTcp).Wait();
 
@@ -2200,7 +2200,7 @@ bool IpcManager::ReconnectToOriginalHost() {
     for (auto *alloc : alloc_vector_) {
       auto alloc_id = alloc->GetId();
       auto reg_task = NewTask<clio::run::admin::RegisterMemoryTask>(
-          chi::CreateTaskId(), chi::kAdminPoolId, chi::PoolQuery::Local(),
+          clio::run::CreateTaskId(), clio::run::kAdminPoolId, clio::run::PoolQuery::Local(),
           alloc_id);
       IpcCpu2CpuZmq::ClientSend(this,reg_task, IpcMode::kTcp).Wait();
     }
@@ -2592,7 +2592,7 @@ ctp::ipc::AllocatorId IpcManager::AllocateAndRegisterGpuBackend(
     std::memcpy(ipc_handle_bytes, &base, sizeof(char *));
 
     auto reg_task = NewTask<clio::run::admin::RegisterMemoryTask>(
-        chi::CreateTaskId(), chi::kAdminPoolId, chi::PoolQuery::Local(),
+        clio::run::CreateTaskId(), clio::run::kAdminPoolId, clio::run::PoolQuery::Local(),
         backend_id, admin_kind, gpu_id, static_cast<u64>(bytes),
         ipc_handle_bytes);
     IpcCpu2CpuZmq::ClientSend(this, reg_task, IpcMode::kTcp).Wait();

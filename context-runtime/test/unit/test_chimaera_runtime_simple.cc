@@ -51,7 +51,7 @@ using namespace std::chrono_literals;
 
 namespace {
   // Test configuration constants
-  constexpr chi::u32 kTestTimeoutMs = 5000;
+  constexpr clio::run::u32 kTestTimeoutMs = 5000;
 
   // Global initialization flag to prevent double initialization
   bool g_initialized = false;
@@ -66,10 +66,10 @@ public:
     // Initialize CLIO Runtime once per test suite
     if (!g_initialized) {
       INFO("Initializing Chimaera...");
-      bool success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
+      bool success = clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true);
       if (success) {
         g_initialized = true;
-        SimpleTest::g_test_finalize = chi::CHIMAERA_FINALIZE;
+        SimpleTest::g_test_finalize = clio::run::CHIMAERA_FINALIZE;
         std::this_thread::sleep_for(500ms); // Give runtime time to initialize
         INFO("Chimaera initialization successful");
       } else {

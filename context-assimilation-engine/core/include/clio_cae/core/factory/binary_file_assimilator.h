@@ -64,7 +64,7 @@ class BinaryFileAssimilator : public BaseAssimilator {
    * @param error_code Output: 0 on success, non-zero error code on failure
    * @return TaskResume for coroutine suspension/resumption
    */
-  chi::TaskResume Schedule(const AssimilationCtx& ctx, int& error_code) override;
+  clio::run::TaskResume Schedule(const AssimilationCtx& ctx, int& error_code) override;
 
  private:
   /**

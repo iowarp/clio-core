@@ -43,7 +43,7 @@
 #include "clio_runtime/container.h"
 
 // Global pointer variable definition for Module manager singleton
-CLIO_RUN_DEFINE_GLOBAL_PTR_VAR_CC(chi::ModuleManager, g_module_manager);
+CLIO_RUN_DEFINE_GLOBAL_PTR_VAR_CC(clio::run::ModuleManager, g_module_manager);
 
 namespace clio::run {
 
@@ -230,7 +230,7 @@ std::vector<std::string> ModuleManager::GetScanDirectories() const {
   }
 
   // Get CHI_REPO_PATH
-  const char *chi_repo_path = chi::env::GetCompat("REPO_PATH");
+  const char *chi_repo_path = clio::run::env::GetCompat("REPO_PATH");
   if (chi_repo_path) {
     std::string path_str(chi_repo_path);
     // Split by colon (Unix) or semicolon (Windows)

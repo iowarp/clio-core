@@ -38,7 +38,7 @@ struct CacheRegion {
   void *mem_ = nullptr;
   GpuMetadataCacheHeader *hdr_ = nullptr;
 
-  CacheRegion(chi::u32 max_tags, chi::u32 max_blobs) {
+  CacheRegion(clio::run::u32 max_tags, clio::run::u32 max_blobs) {
     size_t bytes = GpuMetadataCacheHeader::Layout(max_tags, max_blobs);
     mem_ = std::calloc(1, bytes);
     hdr_ = static_cast<GpuMetadataCacheHeader *>(mem_);
@@ -68,10 +68,10 @@ TEST_CASE("GpuMetadataCache - layout, init, and magic",
   REQUIRE(region.hdr_->max_blobs_ == 16);
   REQUIRE(region.hdr_->num_tags_ == 0);
   REQUIRE(region.hdr_->num_blobs_ == 0);
-  for (chi::u32 i = 0; i < 8; ++i) {
+  for (clio::run::u32 i = 0; i < 8; ++i) {
     REQUIRE(region.hdr_->TagSlots()[i].state_ == gpu_cache::kEmpty);
   }
-  for (chi::u32 i = 0; i < 16; ++i) {
+  for (clio::run::u32 i = 0; i < 16; ++i) {
     REQUIRE(region.hdr_->BlobSlots()[i].state_ == gpu_cache::kEmpty);
   }
 
@@ -251,7 +251,7 @@ TEST_CASE("GpuMetadataCache - RemoveTag cascades to owned blobs",
   REQUIRE(hdr->num_blobs_ == 3);
 
   SECTION("Removing the victim removes both of its blobs");
-  chi::u32 removed = GpuCacheRemoveTag(hdr, 5, 0);
+  clio::run::u32 removed = GpuCacheRemoveTag(hdr, 5, 0);
   REQUIRE(removed == 2);
   REQUIRE(hdr->num_tags_ == 1);
   REQUIRE(hdr->num_blobs_ == 1);

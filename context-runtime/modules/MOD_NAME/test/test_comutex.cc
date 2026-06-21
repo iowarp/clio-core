@@ -65,27 +65,27 @@ using namespace std::chrono_literals;
 
 namespace {
 // Test configuration constants
-constexpr chi::u32 kTestTimeoutMs =
+constexpr clio::run::u32 kTestTimeoutMs =
     10000; // Increased timeout for synchronization tests
-constexpr chi::u32 kMaxRetries = 100;
-constexpr chi::u32 kRetryDelayMs = 50;
+constexpr clio::run::u32 kMaxRetries = 100;
+constexpr clio::run::u32 kRetryDelayMs = 50;
 
 // Test pool ID generator - avoid hardcoding, use dynamic generation
-chi::PoolId generateTestPoolId() {
+clio::run::PoolId generateTestPoolId() {
   // Generate pool ID based on current time to avoid conflicts
   auto now = std::chrono::high_resolution_clock::now();
   auto duration = now.time_since_epoch();
   auto microseconds =
       std::chrono::duration_cast<std::chrono::microseconds>(duration).count();
   // Use lower 32 bits to avoid overflow, add offset to avoid admin pool range
-  return chi::PoolId(static_cast<chi::u32>(microseconds & 0xFFFFFFFF) + 1000,
+  return clio::run::PoolId(static_cast<clio::run::u32>(microseconds & 0xFFFFFFFF) + 1000,
                      0);
 }
 
 // Test parameters
-constexpr chi::u32 kShortHoldMs = 10;  // Short hold duration
-constexpr chi::u32 kMediumHoldMs = 50; // Medium hold duration
-constexpr chi::u32 kLongHoldMs = 100;  // Long hold duration
+constexpr clio::run::u32 kShortHoldMs = 10;  // Short hold duration
+constexpr clio::run::u32 kMediumHoldMs = 50; // Medium hold duration
+constexpr clio::run::u32 kLongHoldMs = 100;  // Long hold duration
 
 // Global test state
 bool g_initialized = false;
@@ -105,10 +105,10 @@ public:
     // Initialize CLIO Runtime once per test suite
     if (!g_initialized) {
       INFO("Initializing Chimaera for CoMutex tests...");
-      bool success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
+      bool success = clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true);
       if (success) {
         g_initialized = true;
-        SimpleTest::g_test_finalize = chi::CHIMAERA_FINALIZE;
+        SimpleTest::g_test_finalize = clio::run::CHIMAERA_FINALIZE;
         std::this_thread::sleep_for(100ms);
 
         // Verify core managers are available
@@ -135,7 +135,7 @@ public:
    */
   template <typename TaskT>
   bool waitForTaskCompletion(ctp::ipc::FullPtr<TaskT> task,
-                             chi::u32 timeout_ms = kTestTimeoutMs) {
+                             clio::run::u32 timeout_ms = kTestTimeoutMs) {
     if (task.IsNull()) {
       return false;
     }
@@ -162,8 +162,8 @@ public:
    */
   template <typename TaskT>
   int waitForMultipleTaskCompletion(
-      std::vector<chi::Future<TaskT>> &tasks,
-      chi::u32 timeout_ms = kTestTimeoutMs) {
+      std::vector<clio::run::Future<TaskT>> &tasks,
+      clio::run::u32 timeout_ms = kTestTimeoutMs) {
     (void)timeout_ms;  // Timeout not used with Wait() approach
 
     size_t completed_count = 0;
@@ -187,7 +187,7 @@ public:
     try {
       // Initialize admin client
       // Admin client is automatically initialized via CLIO_ADMIN singleton
-      chi::PoolQuery pool_query = chi::PoolQuery::Dynamic();
+      clio::run::PoolQuery pool_query = clio::run::PoolQuery::Dynamic();
 
       // Create MOD_NAME client and container directly with dynamic pool ID
       clio::run::MOD_NAME::Client mod_name_client(test_pool_id_);
@@ -221,7 +221,7 @@ public:
   /**
    * Get the dynamically generated test pool ID
    */
-  chi::PoolId getTestPoolId() const { return test_pool_id_; }
+  clio::run::PoolId getTestPoolId() const { return test_pool_id_; }
 
   /**
    * Clean up test resources
@@ -229,7 +229,7 @@ public:
   void cleanup() { INFO("CoMutex test cleanup completed"); }
 
 private:
-  chi::PoolId test_pool_id_; // Dynamically generated pool ID for this test run
+  clio::run::PoolId test_pool_id_; // Dynamically generated pool ID for this test run
 };
 
 //------------------------------------------------------------------------------
@@ -244,7 +244,7 @@ TEST_CASE("CoMutex Basic Locking", "[comutex][basic]") {
     REQUIRE(fixture.createModNamePool());
 
     clio::run::MOD_NAME::Client mod_name_client(fixture.getTestPoolId());
-    chi::PoolQuery create_query = chi::PoolQuery::Dynamic();
+    clio::run::PoolQuery create_query = clio::run::PoolQuery::Dynamic();
     std::string pool_name = "test_mod_name_pool";
     auto create_task = mod_name_client.AsyncCreate(create_query, pool_name, fixture.getTestPoolId());
     create_task.Wait();
@@ -254,12 +254,12 @@ TEST_CASE("CoMutex Basic Locking", "[comutex][basic]") {
     REQUIRE(success);
 
     // Execute single CoMutex test
-    chi::PoolQuery pool_query = chi::PoolQuery::Local();
-    chi::u32 test_id = 1;
+    clio::run::PoolQuery pool_query = clio::run::PoolQuery::Local();
+    clio::run::u32 test_id = 1;
     auto task = mod_name_client.AsyncCoMutexTest(pool_query,
                                                   test_id, kShortHoldMs);
     task.Wait();
-    chi::u32 result = task->return_code_;
+    clio::run::u32 result = task->return_code_;
 
     REQUIRE(result == 0); // Assuming 0 means success
 
@@ -271,7 +271,7 @@ TEST_CASE("CoMutex Basic Locking", "[comutex][basic]") {
     REQUIRE(fixture.createModNamePool());
 
     clio::run::MOD_NAME::Client mod_name_client(fixture.getTestPoolId());
-    chi::PoolQuery create_query = chi::PoolQuery::Dynamic();
+    clio::run::PoolQuery create_query = clio::run::PoolQuery::Dynamic();
     std::string pool_name = "test_mod_name_pool";
     auto create_task = mod_name_client.AsyncCreate(create_query, pool_name, fixture.getTestPoolId());
     create_task.Wait();
@@ -281,9 +281,9 @@ TEST_CASE("CoMutex Basic Locking", "[comutex][basic]") {
     REQUIRE(success);
 
     // Execute multiple sequential CoMutex tests
-    chi::PoolQuery pool_query = chi::PoolQuery::Local();
+    clio::run::PoolQuery pool_query = clio::run::PoolQuery::Local();
     const int kNumSequentialTasks = 5;
-    std::vector<chi::u32> results;
+    std::vector<clio::run::u32> results;
 
     auto start_time = std::chrono::high_resolution_clock::now();
 
@@ -291,7 +291,7 @@ TEST_CASE("CoMutex Basic Locking", "[comutex][basic]") {
       auto task = mod_name_client.AsyncCoMutexTest(pool_query,
                                                     i + 1, kShortHoldMs);
       task.Wait();
-      chi::u32 result = task->return_code_;
+      clio::run::u32 result = task->return_code_;
       results.push_back(result);
     }
 
@@ -322,7 +322,7 @@ TEST_CASE("CoMutex Concurrent Access", "[comutex][concurrent]") {
     REQUIRE(fixture.createModNamePool());
 
     clio::run::MOD_NAME::Client mod_name_client(fixture.getTestPoolId());
-    chi::PoolQuery create_query = chi::PoolQuery::Dynamic();
+    clio::run::PoolQuery create_query = clio::run::PoolQuery::Dynamic();
     std::string pool_name = "test_mod_name_pool";
     auto create_task = mod_name_client.AsyncCreate(create_query, pool_name, fixture.getTestPoolId());
     create_task.Wait();
@@ -335,9 +335,9 @@ TEST_CASE("CoMutex Concurrent Access", "[comutex][concurrent]") {
 
     // Submit multiple async tasks with same TaskId characteristics
     // Tasks with same pid/tid/major but different minor should proceed together
-    chi::PoolQuery pool_query = chi::PoolQuery::Local();
+    clio::run::PoolQuery pool_query = clio::run::PoolQuery::Local();
     const int kNumConcurrentTasks = 4;
-    std::vector<chi::Future<clio::run::MOD_NAME::CoMutexTestTask>> tasks;
+    std::vector<clio::run::Future<clio::run::MOD_NAME::CoMutexTestTask>> tasks;
 
     auto start_time = std::chrono::high_resolution_clock::now();
 
@@ -385,7 +385,7 @@ TEST_CASE("CoMutex Concurrent Access", "[comutex][concurrent]") {
     REQUIRE(fixture.createModNamePool());
 
     clio::run::MOD_NAME::Client mod_name_client(fixture.getTestPoolId());
-    chi::PoolQuery create_query = chi::PoolQuery::Dynamic();
+    clio::run::PoolQuery create_query = clio::run::PoolQuery::Dynamic();
     std::string pool_name = "test_mod_name_pool";
     auto create_task = mod_name_client.AsyncCreate(create_query, pool_name, fixture.getTestPoolId());
     create_task.Wait();
@@ -396,9 +396,9 @@ TEST_CASE("CoMutex Concurrent Access", "[comutex][concurrent]") {
 
     // This test would require creating tasks with different TaskId
     // characteristics For now, we'll test that tasks do serialize when expected
-    chi::PoolQuery pool_query = chi::PoolQuery::Local();
+    clio::run::PoolQuery pool_query = clio::run::PoolQuery::Local();
     const int kNumSerialTasks = 3;
-    std::vector<chi::Future<clio::run::MOD_NAME::CoMutexTestTask>> tasks;
+    std::vector<clio::run::Future<clio::run::MOD_NAME::CoMutexTestTask>> tasks;
 
     auto start_time = std::chrono::high_resolution_clock::now();
 
@@ -437,7 +437,7 @@ TEST_CASE("CoRwLock Basic Reader-Writer Semantics", "[corwlock][basic]") {
     REQUIRE(fixture.createModNamePool());
 
     clio::run::MOD_NAME::Client mod_name_client(fixture.getTestPoolId());
-    chi::PoolQuery create_query = chi::PoolQuery::Dynamic();
+    clio::run::PoolQuery create_query = clio::run::PoolQuery::Dynamic();
     std::string pool_name = "test_mod_name_pool";
     auto create_task = mod_name_client.AsyncCreate(create_query, pool_name, fixture.getTestPoolId());
     create_task.Wait();
@@ -447,10 +447,10 @@ TEST_CASE("CoRwLock Basic Reader-Writer Semantics", "[corwlock][basic]") {
     REQUIRE(success);
 
     // Execute single reader test
-    chi::PoolQuery pool_query = chi::PoolQuery::Local();
+    clio::run::PoolQuery pool_query = clio::run::PoolQuery::Local();
     auto task = mod_name_client.AsyncCoRwLockTest(pool_query, 1, false, kShortHoldMs); // false = reader
     task.Wait();
-    chi::u32 result = task->return_code_;
+    clio::run::u32 result = task->return_code_;
 
     REQUIRE(result == 0);
     INFO("Single reader test completed successfully");
@@ -461,7 +461,7 @@ TEST_CASE("CoRwLock Basic Reader-Writer Semantics", "[corwlock][basic]") {
     REQUIRE(fixture.createModNamePool());
 
     clio::run::MOD_NAME::Client mod_name_client(fixture.getTestPoolId());
-    chi::PoolQuery create_query = chi::PoolQuery::Dynamic();
+    clio::run::PoolQuery create_query = clio::run::PoolQuery::Dynamic();
     std::string pool_name = "test_mod_name_pool";
     auto create_task = mod_name_client.AsyncCreate(create_query, pool_name, fixture.getTestPoolId());
     create_task.Wait();
@@ -471,10 +471,10 @@ TEST_CASE("CoRwLock Basic Reader-Writer Semantics", "[corwlock][basic]") {
     REQUIRE(success);
 
     // Execute single writer test
-    chi::PoolQuery pool_query = chi::PoolQuery::Local();
+    clio::run::PoolQuery pool_query = clio::run::PoolQuery::Local();
     auto task = mod_name_client.AsyncCoRwLockTest(pool_query, 2, true, kShortHoldMs); // true = writer
     task.Wait();
-    chi::u32 result = task->return_code_;
+    clio::run::u32 result = task->return_code_;
 
     REQUIRE(result == 0);
     INFO("Single writer test completed successfully");
@@ -485,7 +485,7 @@ TEST_CASE("CoRwLock Basic Reader-Writer Semantics", "[corwlock][basic]") {
     REQUIRE(fixture.createModNamePool());
 
     clio::run::MOD_NAME::Client mod_name_client(fixture.getTestPoolId());
-    chi::PoolQuery create_query = chi::PoolQuery::Dynamic();
+    clio::run::PoolQuery create_query = clio::run::PoolQuery::Dynamic();
     std::string pool_name = "test_mod_name_pool";
     auto create_task = mod_name_client.AsyncCreate(create_query, pool_name, fixture.getTestPoolId());
     create_task.Wait();
@@ -495,8 +495,8 @@ TEST_CASE("CoRwLock Basic Reader-Writer Semantics", "[corwlock][basic]") {
     REQUIRE(success);
 
     // Execute sequential reader-writer pattern
-    chi::PoolQuery pool_query = chi::PoolQuery::Local();
-    std::vector<chi::u32> results;
+    clio::run::PoolQuery pool_query = clio::run::PoolQuery::Local();
+    std::vector<clio::run::u32> results;
 
     auto start_time = std::chrono::high_resolution_clock::now();
 
@@ -544,7 +544,7 @@ TEST_CASE("CoRwLock Multiple Readers", "[corwlock][readers]") {
     REQUIRE(fixture.createModNamePool());
 
     clio::run::MOD_NAME::Client mod_name_client(fixture.getTestPoolId());
-    chi::PoolQuery create_query = chi::PoolQuery::Dynamic();
+    clio::run::PoolQuery create_query = clio::run::PoolQuery::Dynamic();
     std::string pool_name = "test_mod_name_pool";
     auto create_task = mod_name_client.AsyncCreate(create_query, pool_name, fixture.getTestPoolId());
     create_task.Wait();
@@ -556,9 +556,9 @@ TEST_CASE("CoRwLock Multiple Readers", "[corwlock][readers]") {
     fixture.resetCounters();
 
     // Submit multiple async reader tasks
-    chi::PoolQuery pool_query = chi::PoolQuery::Local();
+    clio::run::PoolQuery pool_query = clio::run::PoolQuery::Local();
     const int kNumReaders = 5;
-    std::vector<chi::Future<clio::run::MOD_NAME::CoRwLockTestTask>> tasks;
+    std::vector<clio::run::Future<clio::run::MOD_NAME::CoRwLockTestTask>> tasks;
 
     auto start_time = std::chrono::high_resolution_clock::now();
 
@@ -610,7 +610,7 @@ TEST_CASE("CoRwLock Writer Exclusivity", "[corwlock][writers]") {
     REQUIRE(fixture.createModNamePool());
 
     clio::run::MOD_NAME::Client mod_name_client(fixture.getTestPoolId());
-    chi::PoolQuery create_query = chi::PoolQuery::Dynamic();
+    clio::run::PoolQuery create_query = clio::run::PoolQuery::Dynamic();
     std::string pool_name = "test_mod_name_pool";
     auto create_task = mod_name_client.AsyncCreate(create_query, pool_name, fixture.getTestPoolId());
     create_task.Wait();
@@ -620,9 +620,9 @@ TEST_CASE("CoRwLock Writer Exclusivity", "[corwlock][writers]") {
     REQUIRE(success);
 
     // Submit multiple async writer tasks
-    chi::PoolQuery pool_query = chi::PoolQuery::Local();
+    clio::run::PoolQuery pool_query = clio::run::PoolQuery::Local();
     const int kNumWriters = 3;
-    std::vector<chi::Future<clio::run::MOD_NAME::CoRwLockTestTask>> tasks;
+    std::vector<clio::run::Future<clio::run::MOD_NAME::CoRwLockTestTask>> tasks;
 
     auto start_time = std::chrono::high_resolution_clock::now();
 
@@ -657,7 +657,7 @@ TEST_CASE("CoRwLock Writer Exclusivity", "[corwlock][writers]") {
     }
 
     // Writers should execute exclusively, so total time should be close to sum
-    chi::u32 expected_min_time =
+    clio::run::u32 expected_min_time =
         kNumWriters * kShortHoldMs * 0.8; // 20% tolerance
     INFO("Duration analysis: " << duration.count() << "ms vs expected min "
                                << expected_min_time << "ms");
@@ -673,7 +673,7 @@ TEST_CASE("CoRwLock Reader-Writer Interaction", "[corwlock][interaction]") {
     REQUIRE(fixture.createModNamePool());
 
     clio::run::MOD_NAME::Client mod_name_client(fixture.getTestPoolId());
-    chi::PoolQuery create_query = chi::PoolQuery::Dynamic();
+    clio::run::PoolQuery create_query = clio::run::PoolQuery::Dynamic();
     std::string pool_name = "test_mod_name_pool";
     auto create_task = mod_name_client.AsyncCreate(create_query, pool_name, fixture.getTestPoolId());
     create_task.Wait();
@@ -683,8 +683,8 @@ TEST_CASE("CoRwLock Reader-Writer Interaction", "[corwlock][interaction]") {
     REQUIRE(success);
 
     // Submit mixed reader-writer tasks
-    chi::PoolQuery pool_query = chi::PoolQuery::Local();
-    std::vector<chi::Future<clio::run::MOD_NAME::CoRwLockTestTask>> tasks;
+    clio::run::PoolQuery pool_query = clio::run::PoolQuery::Local();
+    std::vector<clio::run::Future<clio::run::MOD_NAME::CoRwLockTestTask>> tasks;
 
     auto start_time = std::chrono::high_resolution_clock::now();
 
@@ -728,7 +728,7 @@ TEST_CASE("TaskId Grouping", "[tasknode][grouping]") {
     REQUIRE(fixture.createModNamePool());
 
     clio::run::MOD_NAME::Client mod_name_client(fixture.getTestPoolId());
-    chi::PoolQuery create_query = chi::PoolQuery::Dynamic();
+    clio::run::PoolQuery create_query = clio::run::PoolQuery::Dynamic();
     std::string pool_name = "test_mod_name_pool";
     auto create_task = mod_name_client.AsyncCreate(create_query, pool_name, fixture.getTestPoolId());
     create_task.Wait();
@@ -739,9 +739,9 @@ TEST_CASE("TaskId Grouping", "[tasknode][grouping]") {
 
     // This test validates the TaskId grouping concept
     // Tasks with same pid/tid/major but different minor should proceed together
-    chi::PoolQuery pool_query = chi::PoolQuery::Local();
+    clio::run::PoolQuery pool_query = clio::run::PoolQuery::Local();
     const int kNumGroupedTasks = 3;
-    std::vector<chi::Future<clio::run::MOD_NAME::CoMutexTestTask>> tasks;
+    std::vector<clio::run::Future<clio::run::MOD_NAME::CoMutexTestTask>> tasks;
 
     auto start_time = std::chrono::high_resolution_clock::now();
 
@@ -776,7 +776,7 @@ TEST_CASE("TaskId Grouping", "[tasknode][grouping]") {
     REQUIRE(fixture.createModNamePool());
 
     clio::run::MOD_NAME::Client mod_name_client(fixture.getTestPoolId());
-    chi::PoolQuery create_query = chi::PoolQuery::Dynamic();
+    clio::run::PoolQuery create_query = clio::run::PoolQuery::Dynamic();
     std::string pool_name = "test_mod_name_pool";
     auto create_task = mod_name_client.AsyncCreate(create_query, pool_name, fixture.getTestPoolId());
     create_task.Wait();
@@ -786,9 +786,9 @@ TEST_CASE("TaskId Grouping", "[tasknode][grouping]") {
     REQUIRE(success);
 
     // Test TaskId grouping for readers
-    chi::PoolQuery pool_query = chi::PoolQuery::Local();
+    clio::run::PoolQuery pool_query = clio::run::PoolQuery::Local();
     const int kNumGroupedReaders = 4;
-    std::vector<chi::Future<clio::run::MOD_NAME::CoRwLockTestTask>> tasks;
+    std::vector<clio::run::Future<clio::run::MOD_NAME::CoRwLockTestTask>> tasks;
 
     auto start_time = std::chrono::high_resolution_clock::now();
 
@@ -829,7 +829,7 @@ TEST_CASE("CoMutex Error Handling", "[comutex][error]") {
     REQUIRE(fixture.createModNamePool());
 
     clio::run::MOD_NAME::Client mod_name_client(fixture.getTestPoolId());
-    chi::PoolQuery create_query = chi::PoolQuery::Dynamic();
+    clio::run::PoolQuery create_query = clio::run::PoolQuery::Dynamic();
     std::string pool_name = "test_mod_name_pool";
     auto create_task = mod_name_client.AsyncCreate(create_query, pool_name, fixture.getTestPoolId());
     create_task.Wait();
@@ -839,10 +839,10 @@ TEST_CASE("CoMutex Error Handling", "[comutex][error]") {
     REQUIRE(success);
 
     // Test with zero hold duration
-    chi::PoolQuery pool_query = chi::PoolQuery::Local();
+    clio::run::PoolQuery pool_query = clio::run::PoolQuery::Local();
     auto task = mod_name_client.AsyncCoMutexTest(pool_query, 100, 0);
     task.Wait();
-    chi::u32 result = task->return_code_;
+    clio::run::u32 result = task->return_code_;
 
     // Should still succeed even with zero duration
     REQUIRE(result == 0);
@@ -854,7 +854,7 @@ TEST_CASE("CoMutex Error Handling", "[comutex][error]") {
     REQUIRE(fixture.createModNamePool());
 
     clio::run::MOD_NAME::Client mod_name_client(fixture.getTestPoolId());
-    chi::PoolQuery create_query = chi::PoolQuery::Dynamic();
+    clio::run::PoolQuery create_query = clio::run::PoolQuery::Dynamic();
     std::string pool_name = "test_mod_name_pool";
     auto create_task = mod_name_client.AsyncCreate(create_query, pool_name, fixture.getTestPoolId());
     create_task.Wait();
@@ -864,9 +864,9 @@ TEST_CASE("CoMutex Error Handling", "[comutex][error]") {
     REQUIRE(success);
 
     // Stress test with many concurrent tasks
-    chi::PoolQuery pool_query = chi::PoolQuery::Local();
+    clio::run::PoolQuery pool_query = clio::run::PoolQuery::Local();
     const int kManyTasks = 10;
-    std::vector<chi::Future<clio::run::MOD_NAME::CoMutexTestTask>> tasks;
+    std::vector<clio::run::Future<clio::run::MOD_NAME::CoMutexTestTask>> tasks;
 
     for (int i = 0; i < kManyTasks; ++i) {
       auto task = mod_name_client.AsyncCoMutexTest(pool_query,
@@ -898,7 +898,7 @@ TEST_CASE("CoRwLock Error Handling", "[corwlock][error]") {
     REQUIRE(fixture.createModNamePool());
 
     clio::run::MOD_NAME::Client mod_name_client(fixture.getTestPoolId());
-    chi::PoolQuery create_query = chi::PoolQuery::Dynamic();
+    clio::run::PoolQuery create_query = clio::run::PoolQuery::Dynamic();
     std::string pool_name = "test_mod_name_pool";
     auto create_task = mod_name_client.AsyncCreate(create_query, pool_name, fixture.getTestPoolId());
     create_task.Wait();
@@ -908,16 +908,16 @@ TEST_CASE("CoRwLock Error Handling", "[corwlock][error]") {
     REQUIRE(success);
 
     // Test reader with zero hold duration
-    chi::PoolQuery pool_query = chi::PoolQuery::Local();
+    clio::run::PoolQuery pool_query = clio::run::PoolQuery::Local();
     auto task1 = mod_name_client.AsyncCoRwLockTest(pool_query, 300, false, 0);
     task1.Wait();
-    chi::u32 result1 = task1->return_code_;
+    clio::run::u32 result1 = task1->return_code_;
     REQUIRE(result1 == 0);
 
     // Test writer with zero hold duration
     auto task2 = mod_name_client.AsyncCoRwLockTest(pool_query, 301, true, 0);
     task2.Wait();
-    chi::u32 result2 = task2->return_code_;
+    clio::run::u32 result2 = task2->return_code_;
     REQUIRE(result2 == 0);
 
     INFO("Zero duration CoRwLock tests completed successfully");
@@ -936,7 +936,7 @@ TEST_CASE("CoMutex Performance", "[comutex][performance]") {
     REQUIRE(fixture.createModNamePool());
 
     clio::run::MOD_NAME::Client mod_name_client(fixture.getTestPoolId());
-    chi::PoolQuery create_query = chi::PoolQuery::Dynamic();
+    clio::run::PoolQuery create_query = clio::run::PoolQuery::Dynamic();
     std::string pool_name = "test_mod_name_pool";
     auto create_task = mod_name_client.AsyncCreate(create_query, pool_name, fixture.getTestPoolId());
     create_task.Wait();
@@ -946,9 +946,9 @@ TEST_CASE("CoMutex Performance", "[comutex][performance]") {
     REQUIRE(success);
 
     // Measure task execution time vs hold duration
-    chi::PoolQuery pool_query = chi::PoolQuery::Local();
+    clio::run::PoolQuery pool_query = clio::run::PoolQuery::Local();
     const int kNumPerfTests = 5;
-    std::vector<chi::u64> execution_times;
+    std::vector<clio::run::u64> execution_times;
 
     for (int i = 0; i < kNumPerfTests; ++i) {
       auto start_time = std::chrono::high_resolution_clock::now();
@@ -956,7 +956,7 @@ TEST_CASE("CoMutex Performance", "[comutex][performance]") {
       auto task = mod_name_client.AsyncCoMutexTest(pool_query,
                                                     i + 400, kShortHoldMs);
       task.Wait();
-      chi::u32 result = task->return_code_;
+      clio::run::u32 result = task->return_code_;
 
       auto end_time = std::chrono::high_resolution_clock::now();
       auto duration = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -967,11 +967,11 @@ TEST_CASE("CoMutex Performance", "[comutex][performance]") {
     }
 
     // Calculate average execution time
-    chi::u64 total_time = 0;
+    clio::run::u64 total_time = 0;
     for (auto time : execution_times) {
       total_time += time;
     }
-    chi::u64 avg_time = total_time / kNumPerfTests;
+    clio::run::u64 avg_time = total_time / kNumPerfTests;
 
     INFO("Average CoMutex execution time: " << avg_time << " microseconds");
     INFO("Hold duration: " << kShortHoldMs << "ms (" << (kShortHoldMs * 1000)
@@ -991,7 +991,7 @@ TEST_CASE("CoRwLock Performance", "[corwlock][performance]") {
     REQUIRE(fixture.createModNamePool());
 
     clio::run::MOD_NAME::Client mod_name_client(fixture.getTestPoolId());
-    chi::PoolQuery create_query = chi::PoolQuery::Dynamic();
+    clio::run::PoolQuery create_query = clio::run::PoolQuery::Dynamic();
     std::string pool_name = "test_mod_name_pool";
     auto create_task = mod_name_client.AsyncCreate(create_query, pool_name, fixture.getTestPoolId());
     create_task.Wait();
@@ -1001,11 +1001,11 @@ TEST_CASE("CoRwLock Performance", "[corwlock][performance]") {
     REQUIRE(success);
 
     // Measure reader performance
-    chi::PoolQuery pool_query = chi::PoolQuery::Local();
+    clio::run::PoolQuery pool_query = clio::run::PoolQuery::Local();
     auto start_time = std::chrono::high_resolution_clock::now();
     auto reader_task = mod_name_client.AsyncCoRwLockTest(pool_query, 500, false, kShortHoldMs);
     reader_task.Wait();
-    chi::u32 reader_result = reader_task->return_code_;
+    clio::run::u32 reader_result = reader_task->return_code_;
     auto reader_end = std::chrono::high_resolution_clock::now();
     auto reader_duration =
         std::chrono::duration_cast<std::chrono::microseconds>(reader_end -
@@ -1015,7 +1015,7 @@ TEST_CASE("CoRwLock Performance", "[corwlock][performance]") {
     start_time = std::chrono::high_resolution_clock::now();
     auto writer_task = mod_name_client.AsyncCoRwLockTest(pool_query, 501, true, kShortHoldMs);
     writer_task.Wait();
-    chi::u32 writer_result = writer_task->return_code_;
+    clio::run::u32 writer_result = writer_task->return_code_;
     auto writer_end = std::chrono::high_resolution_clock::now();
     auto writer_duration =
         std::chrono::duration_cast<std::chrono::microseconds>(writer_end -
@@ -1048,7 +1048,7 @@ TEST_CASE("CoMutex and CoRwLock Integration", "[integration]") {
     REQUIRE(fixture.createModNamePool());
 
     clio::run::MOD_NAME::Client mod_name_client(fixture.getTestPoolId());
-    chi::PoolQuery create_query = chi::PoolQuery::Dynamic();
+    clio::run::PoolQuery create_query = clio::run::PoolQuery::Dynamic();
     std::string pool_name = "test_mod_name_pool";
     auto create_task = mod_name_client.AsyncCreate(create_query, pool_name, fixture.getTestPoolId());
     create_task.Wait();
@@ -1058,8 +1058,8 @@ TEST_CASE("CoMutex and CoRwLock Integration", "[integration]") {
     REQUIRE(success);
 
     // Execute mixed operations
-    chi::PoolQuery pool_query = chi::PoolQuery::Local();
-    std::vector<chi::u32> results;
+    clio::run::PoolQuery pool_query = clio::run::PoolQuery::Local();
+    std::vector<clio::run::u32> results;
 
     // CoMutex test
     {
@@ -1111,23 +1111,23 @@ TEST_CASE("ManyToOne AggregateIn collective sum", "[manytoone][aggregatein]") {
 
   clio::run::MOD_NAME::Client client(fixture.getTestPoolId());
   auto create_task = client.AsyncCreate(
-      chi::PoolQuery::Dynamic(), "manytoone_pool", fixture.getTestPoolId());
+      clio::run::PoolQuery::Dynamic(), "manytoone_pool", fixture.getTestPoolId());
   create_task.Wait();
   client.pool_id_ = create_task->new_pool_id_;
   REQUIRE(create_task->return_code_ == 0);
 
-  constexpr chi::u32 kN = 5;
-  chi::u64 expected = 0;  // sum(1..kN)
-  std::vector<chi::Future<clio::run::MOD_NAME::ManyToOneSumTask>> futs;
-  for (chi::u32 i = 1; i <= kN; ++i) {
+  constexpr clio::run::u32 kN = 5;
+  clio::run::u64 expected = 0;  // sum(1..kN)
+  std::vector<clio::run::Future<clio::run::MOD_NAME::ManyToOneSumTask>> futs;
+  for (clio::run::u32 i = 1; i <= kN; ++i) {
     expected += i;
-    auto q = chi::PoolQuery::ManyToOne(/*container_hash=*/0, /*batch_key=*/0,
+    auto q = clio::run::PoolQuery::ManyToOne(/*container_hash=*/0, /*batch_key=*/0,
                                        /*batch_for_ns=*/2'000'000);
     futs.push_back(client.AsyncManyToOneSum(q, i));
   }
 
   // Every submitter sees the broadcast collective total.
-  for (chi::u32 i = 0; i < kN; ++i) {
+  for (clio::run::u32 i = 0; i < kN; ++i) {
     futs[i].Wait();
     REQUIRE(futs[i]->return_code_ == 0);
     REQUIRE(futs[i]->sum_ == expected);

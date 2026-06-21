@@ -50,7 +50,7 @@
 #include <shared_mutex>
 
 // Global pointer variable definition for Pool manager singleton
-CLIO_RUN_DEFINE_GLOBAL_PTR_VAR_CC(chi::PoolManager, g_pool_manager);
+CLIO_RUN_DEFINE_GLOBAL_PTR_VAR_CC(clio::run::PoolManager, g_pool_manager);
 
 namespace clio::run {
 
@@ -614,8 +614,8 @@ TaskResume PoolManager::CreatePool(FullPtr<Task> task, RunContext* run_ctx) {
     // Check if this is a restart scenario (compose mode with restart flag)
     bool is_restart = false;
     if (create_task->do_compose_) {
-      chi::PoolConfig pool_config =
-          chi::Task::Deserialize<chi::PoolConfig>(create_task->chimod_params_);
+      clio::run::PoolConfig pool_config =
+          clio::run::Task::Deserialize<clio::run::PoolConfig>(create_task->chimod_params_);
       is_restart = pool_config.restart_;
     }
 
@@ -662,7 +662,7 @@ TaskResume PoolManager::CreatePool(FullPtr<Task> task, RunContext* run_ctx) {
     // GPU container allocation removed along with the GPU runtime.
     // ChiMods now have CPU-only handlers; kernels submit tasks via
     // gpu2cpu_queue and the CPU dispatches into the standard
-    // chi::Container path.
+    // clio::run::Container path.
 
   } catch (const std::exception& e) {
     HLOG(kError, "PoolManager: Exception during pool creation: {}", e.what());
@@ -691,8 +691,8 @@ TaskResume PoolManager::DestroyPool(PoolId pool_id) {
   // For NVHPC: provide a dummy RunContext reference so CLIO_TASK_BODY_BEGIN
   // lambda can compile (the macro captures rctx by ref, but we never use it).
 #ifdef __NVCOMPILER
-  chi::RunContext _dummy_rctx;
-  chi::RunContext& rctx = _dummy_rctx;
+  clio::run::RunContext _dummy_rctx;
+  clio::run::RunContext& rctx = _dummy_rctx;
 #endif
   CLIO_TASK_BODY_BEGIN
   if (!is_initialized_) {

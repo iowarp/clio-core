@@ -86,8 +86,8 @@ bool gpu::IpcManager::ServerInitGpuQueues(u32 queue_depth) {
           *out_off = static_cast<size_t>(-1);
           return;
         }
-        ctp::ipc::FullPtr<chi::GpuTaskQueue> queue =
-            alloc->NewObj<chi::GpuTaskQueue>(
+        ctp::ipc::FullPtr<clio::run::GpuTaskQueue> queue =
+            alloc->NewObj<clio::run::GpuTaskQueue>(
                 alloc, /*num_lanes=*/1u, /*num_prio=*/2u, queue_depth);
         *out_off = queue.IsNull() ? static_cast<size_t>(-1)
                                   : queue.shm_.off_.load();
@@ -104,7 +104,7 @@ bool gpu::IpcManager::ServerInitGpuQueues(u32 queue_depth) {
     }
     dev.gpu2cpu_queue.shm_.off_ = queue_off;
     dev.gpu2cpu_queue.shm_.alloc_id_ = ctp::ipc::AllocatorId{0, 0};
-    dev.gpu2cpu_queue.ptr_ = reinterpret_cast<chi::GpuTaskQueue *>(
+    dev.gpu2cpu_queue.ptr_ = reinterpret_cast<clio::run::GpuTaskQueue *>(
         dev.queue_backend + queue_off);
 
     HLOG(kInfo, "ServerInitGpuQueues (SYCL): gpu_id={} queue at {} ({}MB)",
@@ -126,7 +126,7 @@ void gpu::IpcManager::FinalizeGpuQueues() {
       sycl::free(dev.queue_backend, q);
       dev.queue_backend = nullptr;
     }
-    dev.gpu2cpu_queue = ctp::ipc::FullPtr<chi::GpuTaskQueue>::GetNull();
+    dev.gpu2cpu_queue = ctp::ipc::FullPtr<clio::run::GpuTaskQueue>::GetNull();
     dev.client_backends.clear();
   }
   per_gpu_devices_.clear();
@@ -151,7 +151,7 @@ void gpu::IpcManager::UnregisterClientBackend(
 // FindClientBackend is now inline in gpu_ipc_manager.h.
 
 CLIO_RUN_GPU_API bool ChiServerBootstrapSyclGpu(IpcManager *self,
-                                                chi::u32 queue_depth,
+                                                clio::run::u32 queue_depth,
                                                 size_t backend_bytes) {
   (void)backend_bytes;
   if (!self) return false;

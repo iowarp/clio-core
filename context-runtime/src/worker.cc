@@ -343,7 +343,7 @@ bool Worker::ProcessNewTaskGpu(GpuTaskLane *gpu_lane) {
   // the Task struct) into per-thread host scratch and runs the chimod
   // on those copies; RuntimeSend H2D-copies the mutated Task POD back
   // to the original device address before signaling FUTURE_COMPLETE.
-  // The chi::FutureShm carries the original device pointers
+  // The clio::run::FutureShm carries the original device pointers
   // (gpu_task_device_ptr_ / gpu_fshm_device_ptr_) plus task size so
   // RuntimeSend can issue the writeback memcpys.
   gpu::Future<Task> gpu_future;
@@ -826,7 +826,7 @@ void Worker::StartCoroutine(const FullPtr<Task> &task_ptr,
       // Check if fiber completed
       if (run_ctx->coro_handle_.done()) {
         run_ctx->coro_handle_.destroy();
-        run_ctx->coro_handle_ = chi::detail::FiberHandle{};
+        run_ctx->coro_handle_ = clio::run::detail::FiberHandle{};
       }
     }
 #endif // __NVCOMPILER
@@ -838,7 +838,7 @@ void Worker::StartCoroutine(const FullPtr<Task> &task_ptr,
 #ifndef __NVCOMPILER
       run_ctx->coro_handle_ = nullptr;
 #else
-      run_ctx->coro_handle_ = chi::detail::FiberHandle{};
+      run_ctx->coro_handle_ = clio::run::detail::FiberHandle{};
 #endif
     }
   } catch (...) {
@@ -849,7 +849,7 @@ void Worker::StartCoroutine(const FullPtr<Task> &task_ptr,
 #ifndef __NVCOMPILER
       run_ctx->coro_handle_ = nullptr;
 #else
-      run_ctx->coro_handle_ = chi::detail::FiberHandle{};
+      run_ctx->coro_handle_ = clio::run::detail::FiberHandle{};
 #endif
     }
   }
@@ -891,7 +891,7 @@ void Worker::ResumeCoroutine(const FullPtr<Task> &task_ptr,
 #ifndef __NVCOMPILER
       run_ctx->coro_handle_ = nullptr;
 #else
-      run_ctx->coro_handle_ = chi::detail::FiberHandle{};
+      run_ctx->coro_handle_ = clio::run::detail::FiberHandle{};
 #endif
     }
   } catch (const std::exception &e) {
@@ -902,7 +902,7 @@ void Worker::ResumeCoroutine(const FullPtr<Task> &task_ptr,
 #ifndef __NVCOMPILER
       run_ctx->coro_handle_ = nullptr;
 #else
-      run_ctx->coro_handle_ = chi::detail::FiberHandle{};
+      run_ctx->coro_handle_ = clio::run::detail::FiberHandle{};
 #endif
     }
   } catch (...) {
@@ -913,7 +913,7 @@ void Worker::ResumeCoroutine(const FullPtr<Task> &task_ptr,
 #ifndef __NVCOMPILER
       run_ctx->coro_handle_ = nullptr;
 #else
-      run_ctx->coro_handle_ = chi::detail::FiberHandle{};
+      run_ctx->coro_handle_ = clio::run::detail::FiberHandle{};
 #endif
     }
   }

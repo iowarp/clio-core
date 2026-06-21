@@ -43,12 +43,12 @@ bool InitializeAdminChiMod() {
   try {
     HLOG(kDebug, "Admin pool creation handled by PoolManager::ServerInit()");
 
-    if (!pool_manager->HasPool(chi::kAdminPoolId)) {
+    if (!pool_manager->HasPool(clio::run::kAdminPoolId)) {
       HLOG(kError, "Admin pool creation reported success but pool is not found");
       return false;
     }
 
-    HLOG(kDebug, "Admin ChiPool created successfully (ID: {})", chi::kAdminPoolId);
+    HLOG(kDebug, "Admin ChiPool created successfully (ID: {})", clio::run::kAdminPoolId);
     return true;
 
   } catch (const std::exception& e) {
@@ -62,8 +62,8 @@ void ShutdownAdminChiMod() {
 
   try {
     auto* pool_manager = CLIO_POOL_MANAGER;
-    if (pool_manager && pool_manager->HasPool(chi::kAdminPoolId)) {
-      if (pool_manager->DestroyLocalPool(chi::kAdminPoolId)) {
+    if (pool_manager && pool_manager->HasPool(clio::run::kAdminPoolId)) {
+      if (pool_manager->DestroyLocalPool(clio::run::kAdminPoolId)) {
         HLOG(kDebug, "Admin pool destroyed successfully");
       } else {
         HLOG(kError, "Failed to destroy admin pool");
@@ -83,12 +83,12 @@ bool InductNode() {
   auto* admin_client = CLIO_ADMIN;
 
   std::string my_ip = ipc_manager->GetCurrentHostname();
-  chi::u32 my_port = config->GetPort();
+  clio::run::u32 my_port = config->GetPort();
 
   HLOG(kInfo, "Inducting this node ({}:{}) into the cluster...", my_ip, my_port);
 
   auto task = admin_client->AsyncAddNode(
-      chi::PoolQuery::Broadcast(), my_ip, my_port);
+      clio::run::PoolQuery::Broadcast(), my_ip, my_port);
   task.Wait();
 
   if (task->GetReturnCode() != 0) {
@@ -135,7 +135,7 @@ int RuntimeStart(int argc, char* argv[]) {
 
   HLOG(kDebug, "Starting Chimaera runtime...");
 
-  if (!chi::CHIMAERA_INIT(chi::ChimaeraMode::kRuntime, true)) {
+  if (!clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kRuntime, true)) {
     HLOG(kError, "Failed to initialize Chimaera runtime");
     return 1;
   }
@@ -147,7 +147,7 @@ int RuntimeStart(int argc, char* argv[]) {
     return 1;
   }
 
-  HLOG(kDebug, "Admin ChiMod initialized successfully with pool ID {}", chi::kAdminPoolId);
+  HLOG(kDebug, "Admin ChiMod initialized successfully with pool ID {}", clio::run::kAdminPoolId);
 
   if (induct) {
     if (!InductNode()) {
@@ -187,7 +187,7 @@ int RuntimeRestart(int argc, char* argv[]) {
 
   HLOG(kInfo, "Restarting Chimaera runtime (WAL replay enabled)...");
 
-  if (!chi::CHIMAERA_INIT(chi::ChimaeraMode::kRuntime, true,
+  if (!clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kRuntime, true,
                            /*is_restart=*/true)) {
     HLOG(kError, "Failed to restart Chimaera runtime");
     return 1;
@@ -200,7 +200,7 @@ int RuntimeRestart(int argc, char* argv[]) {
     return 1;
   }
 
-  HLOG(kDebug, "Admin ChiMod initialized successfully with pool ID {}", chi::kAdminPoolId);
+  HLOG(kDebug, "Admin ChiMod initialized successfully with pool ID {}", clio::run::kAdminPoolId);
 
   if (induct) {
     if (!InductNode()) {

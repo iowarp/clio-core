@@ -127,7 +127,7 @@ std::vector<char> GenerateTestData(size_t size, const std::string& pattern) {
  */
 void InitializeChimaera() {
   // Initialize CLIO Runtime runtime in client mode with runtime
-  bool success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
+  bool success = clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true);
   if (!success) {
     throw std::runtime_error("Failed to initialize Chimaera runtime");
   }
@@ -143,13 +143,13 @@ void CleanupChimaera() {
 /**
  * Create and return pool ID for core chimod
  */
-chi::PoolId CreateCorePool() {
-  chi::PoolId core_pool_id = chi::PoolId(1, 1);
+clio::run::PoolId CreateCorePool() {
+  clio::run::PoolId core_pool_id = clio::run::PoolId(1, 1);
   clio::cte::core::Client core_client;
 
   clio::cte::core::CreateParams core_params;
   auto create_task = core_client.AsyncCreate(
-      chi::PoolQuery::Local(),
+      clio::run::PoolQuery::Local(),
       "test_core_pool",
       core_pool_id,
       core_params);
@@ -161,12 +161,12 @@ chi::PoolId CreateCorePool() {
 /**
  * Create and return pool ID for compressor chimod
  */
-chi::PoolId CreateCompressorPool() {
-  chi::PoolId compressor_pool_id = chi::PoolId(2, 1);
+clio::run::PoolId CreateCompressorPool() {
+  clio::run::PoolId compressor_pool_id = clio::run::PoolId(2, 1);
   Client compressor_client;
 
   auto create_task = compressor_client.AsyncCreateCompressor(
-      chi::PoolQuery::Local(),
+      clio::run::PoolQuery::Local(),
       "test_compressor_pool",
       compressor_pool_id);
   create_task.Wait();
@@ -178,8 +178,8 @@ chi::PoolId CreateCompressorPool() {
  * Test fixture for CTE integration tests
  */
 struct CTETestFixture {
-  chi::PoolId core_pool_id_;
-  chi::PoolId compressor_pool_id_;
+  clio::run::PoolId core_pool_id_;
+  clio::run::PoolId compressor_pool_id_;
   clio::cte::core::Client core_client_;
   Client compressor_client_;
   clio::cte::core::TagId tag_id_;
@@ -247,7 +247,7 @@ TEST_CASE("Basic Compress and Store", "[compressor][functional][basic]") {
 
   // Call AsyncCompress which compresses and stores via PutBlob
   auto task = fixture.compressor_client_.AsyncCompress(
-      chi::PoolQuery::Local(),
+      clio::run::PoolQuery::Local(),
       fixture.tag_id_,
       "test_blob_compress",
       0,  // offset
@@ -286,7 +286,7 @@ TEST_CASE("Decompress and Retrieve", "[compressor][functional][basic]") {
   context.compress_preset_ = 2;
 
   auto compress_task = fixture.compressor_client_.AsyncCompress(
-      chi::PoolQuery::Local(),
+      clio::run::PoolQuery::Local(),
       fixture.tag_id_,
       "test_blob_roundtrip",
       0,
@@ -308,7 +308,7 @@ TEST_CASE("Decompress and Retrieve", "[compressor][functional][basic]") {
   ctp::ipc::ShmPtr<> get_blob_data = get_buffer.shm_.template Cast<void>();
 
   auto decompress_task = fixture.compressor_client_.AsyncDecompressExplicit(
-      chi::PoolQuery::Local(),
+      clio::run::PoolQuery::Local(),
       fixture.tag_id_,
       "test_blob_roundtrip",
       0,
@@ -348,7 +348,7 @@ TEST_CASE("Dynamic Schedule Compression", "[compressor][functional][dynamic]") {
   context.max_performance_ = false;  // Optimize for ratio
 
   auto task = fixture.compressor_client_.AsyncDynamicSchedule(
-      chi::PoolQuery::Local(),
+      clio::run::PoolQuery::Local(),
       fixture.tag_id_,
       "test_blob_dynamic",
       0,
@@ -395,7 +395,7 @@ TEST_CASE("Multiple Compression Libraries", "[compressor][functional][libraries]
 
       std::string blob_name = "test_blob_" + lib_name;
       auto task = fixture.compressor_client_.AsyncCompress(
-          chi::PoolQuery::Local(),
+          clio::run::PoolQuery::Local(),
           fixture.tag_id_,
           blob_name,
           0,
@@ -433,7 +433,7 @@ TEST_CASE("No Compression Passthrough", "[compressor][functional][passthrough]")
   context.compress_lib_ = 0;  // No compression
 
   auto task = fixture.compressor_client_.AsyncCompress(
-      chi::PoolQuery::Local(),
+      clio::run::PoolQuery::Local(),
       fixture.tag_id_,
       "test_blob_passthrough",
       0,
@@ -464,7 +464,7 @@ TEST_CASE("Error Handling - Invalid Parameters", "[compressor][functional][error
     context.compress_lib_ = CompLib::LZ4;
 
     auto task = fixture.compressor_client_.AsyncCompress(
-        chi::PoolQuery::Local(),
+        clio::run::PoolQuery::Local(),
         fixture.tag_id_,
         "test_blob_null",
         0,
@@ -491,7 +491,7 @@ TEST_CASE("Error Handling - Invalid Parameters", "[compressor][functional][error
     context.compress_lib_ = CompLib::LZ4;
 
     auto task = fixture.compressor_client_.AsyncCompress(
-        chi::PoolQuery::Local(),
+        clio::run::PoolQuery::Local(),
         fixture.tag_id_,
         "test_blob_zero_size",
         0,
@@ -539,7 +539,7 @@ TEST_CASE("NvComp GPU Round-trip", "[compressor][functional][nvcomp][gpu]") {
   context.compress_preset_ = 2;
 
   auto compress_task = fixture.compressor_client_.AsyncCompress(
-      chi::PoolQuery::Local(), fixture.tag_id_, "test_blob_nvcomp", 0,
+      clio::run::PoolQuery::Local(), fixture.tag_id_, "test_blob_nvcomp", 0,
       original_data.size(), put_blob_data, 0.5f, context, 0,
       fixture.core_pool_id_);
   compress_task.Wait();
@@ -552,7 +552,7 @@ TEST_CASE("NvComp GPU Round-trip", "[compressor][functional][nvcomp][gpu]") {
   ctp::ipc::ShmPtr<> get_blob_data = get_buffer.shm_.template Cast<void>();
 
   auto decompress_task = fixture.compressor_client_.AsyncDecompressExplicit(
-      chi::PoolQuery::Local(), fixture.tag_id_, "test_blob_nvcomp", 0,
+      clio::run::PoolQuery::Local(), fixture.tag_id_, "test_blob_nvcomp", 0,
       original_data.size(), 0, get_blob_data, fixture.core_pool_id_);
   decompress_task.Wait();
   REQUIRE(decompress_task->return_code_ == 0);

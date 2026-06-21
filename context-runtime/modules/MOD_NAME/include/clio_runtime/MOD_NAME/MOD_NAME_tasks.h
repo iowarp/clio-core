@@ -55,14 +55,14 @@ using MonitorTask = clio::run::admin::MonitorTask;
  */
 struct CreateParams {
   // MOD_NAME-specific parameters (primitives only for cereal compatibility)
-  chi::u32 worker_count_;
-  chi::u32 config_flags_;
+  clio::run::u32 worker_count_;
+  clio::run::u32 config_flags_;
 
   // Required: chimod library name for module manager
   static constexpr const char* chimod_lib_name = "chimaera_MOD_NAME";
 
   // Constructor with parameters (also serves as default)
-  CreateParams(chi::u32 worker_count = 1, chi::u32 config_flags = 0)
+  CreateParams(clio::run::u32 worker_count = 1, clio::run::u32 config_flags = 0)
       : worker_count_(worker_count), config_flags_(config_flags) {
   }
 
@@ -83,25 +83,25 @@ using CreateTask = clio::run::admin::GetOrCreatePoolTask<CreateParams>;
 /**
  * CustomTask - Example custom operation
  */
-struct CustomTask : public chi::Task {
+struct CustomTask : public clio::run::Task {
   // Task-specific data
-  INOUT chi::priv::string data_;
-  IN chi::u32 operation_id_;
+  INOUT clio::run::priv::string data_;
+  IN clio::run::u32 operation_id_;
 
   /** SHM default constructor */
   CustomTask()
-      : chi::Task(),
+      : clio::run::Task(),
         data_(CLIO_PRIV_ALLOC), operation_id_(0) {
   }
 
   /** Emplace constructor */
   explicit CustomTask(
-      const chi::TaskId &task_node,
-      const chi::PoolId &pool_id,
-      const chi::PoolQuery &pool_query,
+      const clio::run::TaskId &task_node,
+      const clio::run::PoolId &pool_id,
+      const clio::run::PoolQuery &pool_query,
       const std::string &data,
-      chi::u32 operation_id)
-      : chi::Task(task_node, pool_id, pool_query, 10),
+      clio::run::u32 operation_id)
+      : clio::run::Task(task_node, pool_id, pool_query, 10),
         data_(CLIO_PRIV_ALLOC, data), operation_id_(operation_id) {
     // Initialize task
     task_id_ = task_node;
@@ -151,7 +151,7 @@ struct CustomTask : public chi::Task {
    * AggregateOut replica results into this task
    * @param other Pointer to the replica task to aggregate from
    */
-  void AggregateOut(const ctp::ipc::FullPtr<chi::Task> &other_base) {
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
     Copy(other_base.template Cast<CustomTask>());
   }
@@ -167,18 +167,18 @@ struct CustomTask : public chi::Task {
  * broadcast (SerializeOut copy-back) to every submitter. After completion all
  * submitters' sum_ equals the sum of the whole batch's value_.
  */
-struct ManyToOneSumTask : public chi::Task {
-  IN chi::u64 value_;  // this submitter's contribution
-  OUT chi::u64 sum_;   // collective total (broadcast to all members)
+struct ManyToOneSumTask : public clio::run::Task {
+  IN clio::run::u64 value_;  // this submitter's contribution
+  OUT clio::run::u64 sum_;   // collective total (broadcast to all members)
 
   /** SHM default constructor */
-  ManyToOneSumTask() : chi::Task(), value_(0), sum_(0) {}
+  ManyToOneSumTask() : clio::run::Task(), value_(0), sum_(0) {}
 
   /** Emplace constructor */
-  explicit ManyToOneSumTask(const chi::TaskId &task_node,
-                            const chi::PoolId &pool_id,
-                            const chi::PoolQuery &pool_query, chi::u64 value)
-      : chi::Task(task_node, pool_id, pool_query, Method::kManyToOneSum),
+  explicit ManyToOneSumTask(const clio::run::TaskId &task_node,
+                            const clio::run::PoolId &pool_id,
+                            const clio::run::PoolQuery &pool_query, clio::run::u64 value)
+      : clio::run::Task(task_node, pool_id, pool_query, Method::kManyToOneSum),
         value_(value), sum_(0) {
     task_id_ = task_node;
     pool_id_ = pool_id;
@@ -208,13 +208,13 @@ struct ManyToOneSumTask : public chi::Task {
   }
 
   /** AggregateOut: gather replica OUT — sum partial totals (N->1). */
-  void AggregateOut(const ctp::ipc::FullPtr<chi::Task> &other_base) {
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
     sum_ += other_base.template Cast<ManyToOneSumTask>()->sum_;
   }
 
   /** AggregateIn: fold a batched member's input contribution into this. */
-  void AggregateIn(const ctp::ipc::FullPtr<chi::Task> &member_base) {
+  void AggregateIn(const ctp::ipc::FullPtr<clio::run::Task> &member_base) {
     value_ += member_base.template Cast<ManyToOneSumTask>()->value_;
   }
 };
@@ -222,22 +222,22 @@ struct ManyToOneSumTask : public chi::Task {
 /**
  * CoMutexTestTask - Test CoMutex functionality
  */
-struct CoMutexTestTask : public chi::Task {
-  IN chi::u32 test_id_;         // Test identifier
-  IN chi::u32 hold_duration_ms_; // How long to hold the mutex
+struct CoMutexTestTask : public clio::run::Task {
+  IN clio::run::u32 test_id_;         // Test identifier
+  IN clio::run::u32 hold_duration_ms_; // How long to hold the mutex
 
   /** SHM default constructor */
   CoMutexTestTask()
-      : chi::Task(), test_id_(0), hold_duration_ms_(0) {}
+      : clio::run::Task(), test_id_(0), hold_duration_ms_(0) {}
 
   /** Emplace constructor */
   explicit CoMutexTestTask(
-      const chi::TaskId &task_node,
-      const chi::PoolId &pool_id,
-      const chi::PoolQuery &pool_query,
-      chi::u32 test_id,
-      chi::u32 hold_duration_ms)
-      : chi::Task(task_node, pool_id, pool_query, 20),
+      const clio::run::TaskId &task_node,
+      const clio::run::PoolId &pool_id,
+      const clio::run::PoolQuery &pool_query,
+      clio::run::u32 test_id,
+      clio::run::u32 hold_duration_ms)
+      : clio::run::Task(task_node, pool_id, pool_query, 20),
         test_id_(test_id), hold_duration_ms_(hold_duration_ms) {
     // Initialize task
     task_id_ = task_node;
@@ -275,7 +275,7 @@ struct CoMutexTestTask : public chi::Task {
    * AggregateOut replica results into this task
    * @param other Pointer to the replica task to aggregate from
    */
-  void AggregateOut(const ctp::ipc::FullPtr<chi::Task> &other_base) {
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
     Copy(other_base.template Cast<CoMutexTestTask>());
   }
@@ -284,24 +284,24 @@ struct CoMutexTestTask : public chi::Task {
 /**
  * CoRwLockTestTask - Test CoRwLock functionality
  */
-struct CoRwLockTestTask : public chi::Task {
-  IN chi::u32 test_id_;         // Test identifier
+struct CoRwLockTestTask : public clio::run::Task {
+  IN clio::run::u32 test_id_;         // Test identifier
   IN bool is_writer_;           // True for write lock, false for read lock
-  IN chi::u32 hold_duration_ms_; // How long to hold the lock
+  IN clio::run::u32 hold_duration_ms_; // How long to hold the lock
 
   /** SHM default constructor */
   CoRwLockTestTask()
-      : chi::Task(), test_id_(0), is_writer_(false), hold_duration_ms_(0) {}
+      : clio::run::Task(), test_id_(0), is_writer_(false), hold_duration_ms_(0) {}
 
   /** Emplace constructor */
   explicit CoRwLockTestTask(
-      const chi::TaskId &task_node,
-      const chi::PoolId &pool_id,
-      const chi::PoolQuery &pool_query,
-      chi::u32 test_id,
+      const clio::run::TaskId &task_node,
+      const clio::run::PoolId &pool_id,
+      const clio::run::PoolQuery &pool_query,
+      clio::run::u32 test_id,
       bool is_writer,
-      chi::u32 hold_duration_ms)
-      : chi::Task(task_node, pool_id, pool_query, 21),
+      clio::run::u32 hold_duration_ms)
+      : clio::run::Task(task_node, pool_id, pool_query, 21),
         test_id_(test_id), is_writer_(is_writer), hold_duration_ms_(hold_duration_ms) {
     // Initialize task
     task_id_ = task_node;
@@ -340,7 +340,7 @@ struct CoRwLockTestTask : public chi::Task {
    * AggregateOut replica results into this task
    * @param other Pointer to the replica task to aggregate from
    */
-  void AggregateOut(const ctp::ipc::FullPtr<chi::Task> &other_base) {
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
     Copy(other_base.template Cast<CoRwLockTestTask>());
   }
@@ -350,23 +350,23 @@ struct CoRwLockTestTask : public chi::Task {
  * WaitTestTask - Test recursive task->Wait() functionality
  * This task calls itself recursively "depth" times to test nested Wait() calls
  */
-struct WaitTestTask : public chi::Task {
-  IN chi::u32 depth_;              // Number of recursive calls to make
-  IN chi::u32 test_id_;            // Test identifier for tracking
-  INOUT chi::u32 current_depth_;   // Current recursion level (starts at 0)
+struct WaitTestTask : public clio::run::Task {
+  IN clio::run::u32 depth_;              // Number of recursive calls to make
+  IN clio::run::u32 test_id_;            // Test identifier for tracking
+  INOUT clio::run::u32 current_depth_;   // Current recursion level (starts at 0)
 
   /** SHM default constructor */
   WaitTestTask()
-      : chi::Task(), depth_(0), test_id_(0), current_depth_(0) {}
+      : clio::run::Task(), depth_(0), test_id_(0), current_depth_(0) {}
 
   /** Emplace constructor */
   explicit WaitTestTask(
-      const chi::TaskId &task_node,
-      const chi::PoolId &pool_id,
-      const chi::PoolQuery &pool_query,
-      chi::u32 depth,
-      chi::u32 test_id)
-      : chi::Task(task_node, pool_id, pool_query, 23),
+      const clio::run::TaskId &task_node,
+      const clio::run::PoolId &pool_id,
+      const clio::run::PoolQuery &pool_query,
+      clio::run::u32 depth,
+      clio::run::u32 test_id)
+      : clio::run::Task(task_node, pool_id, pool_query, 23),
         depth_(depth), test_id_(test_id), current_depth_(0) {
     // Initialize task
     task_id_ = task_node;
@@ -405,7 +405,7 @@ struct WaitTestTask : public chi::Task {
    * AggregateOut replica results into this task
    * @param other Pointer to the replica task to aggregate from
    */
-  void AggregateOut(const ctp::ipc::FullPtr<chi::Task> &other_base) {
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
     Copy(other_base.template Cast<WaitTestTask>());
   }
@@ -415,20 +415,20 @@ struct WaitTestTask : public chi::Task {
  * TestLargeOutputTask - Test large output streaming (1MB)
  * Tests streaming mechanism for large output data
  */
-struct TestLargeOutputTask : public chi::Task {
+struct TestLargeOutputTask : public clio::run::Task {
   // Task-specific data
   OUT std::vector<uint8_t> data_;  // Output: 1MB of test data
 
   /** SHM default constructor */
   TestLargeOutputTask()
-      : chi::Task() {}
+      : clio::run::Task() {}
 
   /** Emplace constructor */
   explicit TestLargeOutputTask(
-      const chi::TaskId &task_node,
-      const chi::PoolId &pool_id,
-      const chi::PoolQuery &pool_query)
-      : chi::Task(task_node, pool_id, pool_query, 24) {
+      const clio::run::TaskId &task_node,
+      const clio::run::PoolId &pool_id,
+      const clio::run::PoolQuery &pool_query)
+      : clio::run::Task(task_node, pool_id, pool_query, 24) {
     // Initialize task
     task_id_ = task_node;
     pool_id_ = pool_id;
@@ -463,7 +463,7 @@ struct TestLargeOutputTask : public chi::Task {
    * AggregateOut replica results into this task
    * @param other Pointer to the replica task to aggregate from
    */
-  void AggregateOut(const ctp::ipc::FullPtr<chi::Task> &other_base) {
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
     Copy(other_base.template Cast<TestLargeOutputTask>());
   }
@@ -473,25 +473,25 @@ struct TestLargeOutputTask : public chi::Task {
  * GpuSubmitTask - GPU-compatible task for testing Part 3
  * This task can be created and submitted from GPU kernels
  */
-struct GpuSubmitTask : public chi::Task {
-  IN chi::u32 gpu_id_;          // GPU ID that submitted the task
-  IN chi::u32 test_value_;      // Test value to verify correct execution
-  INOUT chi::u32 result_value_; // Result computed by the task
-  OUT chi::u32 counter_value_;  // Atomic counter: number of lanes that executed
+struct GpuSubmitTask : public clio::run::Task {
+  IN clio::run::u32 gpu_id_;          // GPU ID that submitted the task
+  IN clio::run::u32 test_value_;      // Test value to verify correct execution
+  INOUT clio::run::u32 result_value_; // Result computed by the task
+  OUT clio::run::u32 counter_value_;  // Atomic counter: number of lanes that executed
 
   /** SHM default constructor */
   CTP_CROSS_FUN GpuSubmitTask()
-      : chi::Task(), gpu_id_(0), test_value_(0), result_value_(0),
+      : clio::run::Task(), gpu_id_(0), test_value_(0), result_value_(0),
         counter_value_(0) {}
 
   /** Emplace constructor */
   CTP_CROSS_FUN explicit GpuSubmitTask(
-      const chi::TaskId &task_node,
-      const chi::PoolId &pool_id,
-      const chi::PoolQuery &pool_query,
-      chi::u32 gpu_id,
-      chi::u32 test_value)
-      : chi::Task(task_node, pool_id, pool_query, 25),
+      const clio::run::TaskId &task_node,
+      const clio::run::PoolId &pool_id,
+      const clio::run::PoolQuery &pool_query,
+      clio::run::u32 gpu_id,
+      clio::run::u32 test_value)
+      : clio::run::Task(task_node, pool_id, pool_query, 25),
         gpu_id_(gpu_id), test_value_(test_value), result_value_(0),
         counter_value_(0) {
     // Initialize task
@@ -532,7 +532,7 @@ struct GpuSubmitTask : public chi::Task {
    * AggregateOut replica results into this task
    * @param other Pointer to the replica task to aggregate from
    */
-  CTP_CROSS_FUN void AggregateOut(const ctp::ipc::FullPtr<chi::Task> &other_base) {
+  CTP_CROSS_FUN void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
     Copy(other_base.template Cast<GpuSubmitTask>());
   }
@@ -542,21 +542,21 @@ struct GpuSubmitTask : public chi::Task {
  * SubtaskTestTask - GPU coroutine subtask spawning test.
  * The GPU implementation co_awaits GpuSubmit on itself.
  */
-struct SubtaskTestTask : public chi::Task {
-  IN chi::u32 test_value_;
-  IN chi::u32 num_subtasks_;  /**< Number of subtasks to spawn (for benchmarking) */
-  OUT chi::u32 result_value_;
+struct SubtaskTestTask : public clio::run::Task {
+  IN clio::run::u32 test_value_;
+  IN clio::run::u32 num_subtasks_;  /**< Number of subtasks to spawn (for benchmarking) */
+  OUT clio::run::u32 result_value_;
 
   CTP_CROSS_FUN SubtaskTestTask()
-      : chi::Task(), test_value_(0), num_subtasks_(1), result_value_(0) {}
+      : clio::run::Task(), test_value_(0), num_subtasks_(1), result_value_(0) {}
 
   CTP_CROSS_FUN explicit SubtaskTestTask(
-      const chi::TaskId &task_node,
-      const chi::PoolId &pool_id,
-      const chi::PoolQuery &pool_query,
-      chi::u32 test_value,
-      chi::u32 num_subtasks = 1)
-      : chi::Task(task_node, pool_id, pool_query, 10),
+      const clio::run::TaskId &task_node,
+      const clio::run::PoolId &pool_id,
+      const clio::run::PoolQuery &pool_query,
+      clio::run::u32 test_value,
+      clio::run::u32 num_subtasks = 1)
+      : clio::run::Task(task_node, pool_id, pool_query, 10),
         test_value_(test_value), num_subtasks_(num_subtasks), result_value_(0) {
     task_id_ = task_node;
     pool_id_ = pool_id;
@@ -585,7 +585,7 @@ struct SubtaskTestTask : public chi::Task {
     result_value_ = other->result_value_;
   }
 
-  void AggregateOut(const ctp::ipc::FullPtr<chi::Task> &other_base) {
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
     Copy(other_base.template Cast<SubtaskTestTask>());
   }

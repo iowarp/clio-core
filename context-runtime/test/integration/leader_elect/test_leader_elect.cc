@@ -75,8 +75,8 @@ using namespace std::chrono_literals;
 
 namespace {
 bool g_initialized = false;
-const chi::PoolId kLeaderElectPoolId(70000, 0);
-constexpr chi::u32 kHoldMs = 100;
+const clio::run::PoolId kLeaderElectPoolId(70000, 0);
+constexpr clio::run::u32 kHoldMs = 100;
 }  // namespace
 
 class LeaderElectFixture {
@@ -84,7 +84,7 @@ class LeaderElectFixture {
   LeaderElectFixture() {
     if (!g_initialized) {
       INFO("Initializing Chimaera client for leader election tests...");
-      bool success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
+      bool success = clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true);
       if (success) {
         g_initialized = true;
         std::this_thread::sleep_for(500ms);
@@ -117,7 +117,7 @@ TEST_CASE("Leader shutdown and failover to new host",
     clio::run::MOD_NAME::Client mod_name_client(kLeaderElectPoolId);
     {
       auto create_task = mod_name_client.AsyncCreate(
-          chi::PoolQuery::Dynamic(), "leader_elect_test_pool",
+          clio::run::PoolQuery::Dynamic(), "leader_elect_test_pool",
           kLeaderElectPoolId);
       create_task.Wait();
       mod_name_client.pool_id_ = create_task->new_pool_id_;
@@ -128,7 +128,7 @@ TEST_CASE("Leader shutdown and failover to new host",
 
     {
       auto task = mod_name_client.AsyncCoMutexTest(
-          chi::PoolQuery::Local(), 1, kHoldMs);
+          clio::run::PoolQuery::Local(), 1, kHoldMs);
       task.Wait();
       REQUIRE(task->return_code_ == 0);
       INFO("Step 1: Pre-shutdown task completed on local node");
@@ -139,9 +139,9 @@ TEST_CASE("Leader shutdown and failover to new host",
     // ------------------------------------------------------------------
     INFO("Step 2: Sending AsyncStopRuntime to local runtime");
     {
-      clio::run::admin::Client admin_client(chi::kAdminPoolId);
+      clio::run::admin::Client admin_client(clio::run::kAdminPoolId);
       admin_client.AsyncStopRuntime(
-          chi::PoolQuery::Local(), 0, 1000);
+          clio::run::PoolQuery::Local(), 0, 1000);
     }
 
     INFO("Step 2: Waiting for local runtime to die...");
@@ -155,7 +155,7 @@ TEST_CASE("Leader shutdown and failover to new host",
     {
       clio::run::MOD_NAME::Client new_client(kLeaderElectPoolId);
       auto create_task = new_client.AsyncCreate(
-          chi::PoolQuery::Dynamic(), "leader_elect_post_failover_pool",
+          clio::run::PoolQuery::Dynamic(), "leader_elect_post_failover_pool",
           kLeaderElectPoolId);
       create_task.Wait();
       new_client.pool_id_ = create_task->new_pool_id_;
@@ -164,7 +164,7 @@ TEST_CASE("Leader shutdown and failover to new host",
       INFO("Step 3: Pool created on new host");
 
       auto task = new_client.AsyncCoMutexTest(
-          chi::PoolQuery::Local(), 1, kHoldMs);
+          clio::run::PoolQuery::Local(), 1, kHoldMs);
       task.Wait();
       REQUIRE(task->return_code_ == 0);
       INFO("Step 3: Post-failover task completed successfully");
@@ -182,7 +182,7 @@ TEST_CASE("System healthy after leader restart",
   // Fresh initialization — the previous client state is stale because
   // run_tests.sh launches this as a separate process invocation.
   INFO("Initializing fresh Chimaera client after leader restart...");
-  bool success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
+  bool success = clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true);
   REQUIRE(success);
   std::this_thread::sleep_for(500ms);
   REQUIRE(CLIO_RUNTIME_MANAGER != nullptr);
@@ -199,7 +199,7 @@ TEST_CASE("System healthy after leader restart",
     clio::run::MOD_NAME::Client mod_name_client(kLeaderElectPoolId);
     {
       auto create_task = mod_name_client.AsyncCreate(
-          chi::PoolQuery::Dynamic(), "leader_elect_post_restart_pool",
+          clio::run::PoolQuery::Dynamic(), "leader_elect_post_restart_pool",
           kLeaderElectPoolId);
       create_task.Wait();
       mod_name_client.pool_id_ = create_task->new_pool_id_;
@@ -210,7 +210,7 @@ TEST_CASE("System healthy after leader restart",
 
     {
       auto task = mod_name_client.AsyncCoMutexTest(
-          chi::PoolQuery::Local(), 1, kHoldMs);
+          clio::run::PoolQuery::Local(), 1, kHoldMs);
       task.Wait();
       REQUIRE(task->return_code_ == 0);
       INFO("Post-restart task completed successfully");

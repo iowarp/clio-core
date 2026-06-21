@@ -23,7 +23,7 @@ namespace ctp::env {
  * Defined in clio_ctp (lower-level than clio_runtime) so that ctp-internal
  * code that reads legacy CHI_* env vars (e.g. lightbeam transports) can use
  * it without an upward dependency on clio_runtime. clio_runtime.h exposes
- * the same helper under chi::env::GetCompat via a `using` alias.
+ * the same helper under clio::run::env::GetCompat via a `using` alias.
  */
 inline const char* GetCompat(const char* suffix) {
   std::string clio_name = std::string("CLIO_") + suffix;

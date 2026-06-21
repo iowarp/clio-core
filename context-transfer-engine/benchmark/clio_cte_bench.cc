@@ -108,16 +108,16 @@ class CTEBenchmark {
 
   // PoolQuery flavor each AsyncPutBlob/AsyncGetBlob is issued with.
   // Read once per worker thread; constant for the duration of the run.
-  chi::PoolQuery MakeQuery() const {
+  clio::run::PoolQuery MakeQuery() const {
     if (a_.query_type == "dynamic") {
-      return chi::PoolQuery::Dynamic();
+      return clio::run::PoolQuery::Dynamic();
     }
     if (a_.query_type == "direct0") {
       // DirectHash(0) — routing mode is non-Local, so under CLIO_FORCE_NET=1
       // every op takes the loopback ZMQ path even on single-node.
-      return chi::PoolQuery::DirectHash(0);
+      return clio::run::PoolQuery::DirectHash(0);
     }
-    return chi::PoolQuery::Local();
+    return clio::run::PoolQuery::Local();
   }
 
   // Number of distinct keys a thread uses (finite pool for Get to read).
@@ -143,7 +143,7 @@ class CTEBenchmark {
     auto blob_name = [&](long k) {
       return "blob_t" + std::to_string(tid) + "_" + std::to_string(k);
     };
-    const chi::PoolQuery pq = MakeQuery();
+    const clio::run::PoolQuery pq = MakeQuery();
 
     // Get needs the keyspace populated first (untimed).
     if (mode == Mode::kGet) {
@@ -172,7 +172,7 @@ class CTEBenchmark {
       long batch = timed ? a_.depth : std::min<long>(a_.depth, target - i);
 
       if (mode == Mode::kPut || mode == Mode::kPutGet) {
-        std::vector<chi::Future<clio::cte::core::PutBlobTask>> pts;
+        std::vector<clio::run::Future<clio::cte::core::PutBlobTask>> pts;
         pts.reserve(batch);
         for (long j = 0; j < batch; ++j) {
           pts.push_back(cte->AsyncPutBlob(
@@ -237,7 +237,7 @@ int main(int argc, char **argv) {
   if (!args.ok) return 1;
 
   HLOG(kInfo, "Initializing Chimaera runtime...");
-  if (!chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, false)) {
+  if (!clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, false)) {
     HLOG(kError, "Failed to initialize Chimaera runtime");
     return 1;
   }

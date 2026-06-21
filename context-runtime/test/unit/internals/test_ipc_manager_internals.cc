@@ -36,9 +36,9 @@ bool g_initialized = false;
 
 void EnsureInitialized() {
   if (!g_initialized) {
-    chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
+    clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true);
     g_initialized = true;
-    SimpleTest::g_test_finalize = chi::CHIMAERA_FINALIZE;
+    SimpleTest::g_test_finalize = clio::run::CHIMAERA_FINALIZE;
   }
 }
 
@@ -54,7 +54,7 @@ TEST_CASE("IpcInternals - SWIM node state tracking", "[ipc][swim]") {
 
   SECTION("SetDead then SetAlive round-trip");
   ipc->SetDead(424242);
-  REQUIRE(ipc->GetNodeState(424242) == chi::NodeState::kDead);
+  REQUIRE(ipc->GetNodeState(424242) == clio::run::NodeState::kDead);
   // SetAlive removes the node from dead-tracking; nodes absent from the
   // table read back as kDead by design, so only exercise the transition.
   ipc->SetAlive(424242);
@@ -128,7 +128,7 @@ TEST_CASE("IpcInternals - hostfile loading and host lookup",
   REQUIRE(ipc->LoadHostfile());
 
   SECTION("GetHost by node id and by IP");
-  const chi::Host *h0 = ipc->GetHost(0);
+  const clio::run::Host *h0 = ipc->GetHost(0);
   REQUIRE(h0 != nullptr);
   REQUIRE(ipc->GetHost(999) == nullptr);
   REQUIRE(ipc->GetHostByIp("127.0.0.1") != nullptr);
@@ -168,14 +168,14 @@ TEST_CASE("IpcInternals - PoolQuery FromString/ToString round-trips",
       {"physical:1", "physical:1"},
   };
   for (const auto &c : cases) {
-    chi::PoolQuery q = chi::PoolQuery::FromString(c.in);
+    clio::run::PoolQuery q = clio::run::PoolQuery::FromString(c.in);
     REQUIRE(q.ToString() == c.out);
   }
 
   SECTION("Invalid strings throw");
   bool threw = false;
   try {
-    (void)chi::PoolQuery::FromString("warp_speed");
+    (void)clio::run::PoolQuery::FromString("warp_speed");
   } catch (const std::exception &) {
     threw = true;
   }
@@ -183,7 +183,7 @@ TEST_CASE("IpcInternals - PoolQuery FromString/ToString round-trips",
 
   threw = false;
   try {
-    (void)chi::PoolQuery::FromString("range:5");  // missing count
+    (void)clio::run::PoolQuery::FromString("range:5");  // missing count
   } catch (const std::exception &) {
     threw = true;
   }

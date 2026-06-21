@@ -61,14 +61,14 @@
 namespace fs = std::filesystem;
 
 static std::string chi_test_data_dir() {
-  const char *d = chi::env::GetCompat("TEST_DATA_DIR");
+  const char *d = clio::run::env::GetCompat("TEST_DATA_DIR");
   return (d && *d) ? d : ".";
 }
 
 // Test constants for two-tier storage
-static constexpr chi::u64 kDramCapacity = 16 * 1024 * 1024;  // 16MB
-static constexpr chi::u64 kDiskCapacity = 64 * 1024 * 1024;  // 64MB
-static constexpr chi::u64 kBlobSize = 1 * 1024 * 1024;       // 1MB per blob
+static constexpr clio::run::u64 kDramCapacity = 16 * 1024 * 1024;  // 16MB
+static constexpr clio::run::u64 kDiskCapacity = 64 * 1024 * 1024;  // 64MB
+static constexpr clio::run::u64 kBlobSize = 1 * 1024 * 1024;       // 1MB per blob
 
 // Tier scores (higher score = faster tier in this config)
 static constexpr float kDramScore = 1.0f;    // Fast tier - DRAM
@@ -104,7 +104,7 @@ class ReorganizeBlobTestFixture {
     ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", config_path_.c_str(), 1);
 
     // Initialize CLIO Runtime runtime
-    bool success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
+    bool success = clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true);
     REQUIRE(success);
 
     std::this_thread::sleep_for(std::chrono::milliseconds(500));

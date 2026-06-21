@@ -105,20 +105,20 @@ TEST_CASE("Cfs - rename POSIX semantics + concurrency", "[cli][cfs][rename]") {
   REQUIRE(server.WaitForReady());
   REQUIRE(RunCliTimed({"compose", "start", yaml.string()}, 60) == 0);
 
-  REQUIRE(chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, false));
+  REQUIRE(clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, false));
   auto* ipc = CLIO_IPC;
   REQUIRE(ipc != nullptr);
 
   clio::cte::filesystem::Client cfs;
-  cfs.Init(chi::PoolId(600, 0));
+  cfs.Init(clio::run::PoolId(600, 0));
 
   // ---- helpers -------------------------------------------------------------
   // Create a file and fill it with `n` bytes of marker byte `mark`.
-  auto mkfile = [&](const std::string& path, char mark, chi::u64 n) {
+  auto mkfile = [&](const std::string& path, char mark, clio::run::u64 n) {
     auto op = cfs.AsyncOpen(path, O_CREAT | O_RDWR, 0644);
     op.Wait();
     REQUIRE(op->GetReturnCode() == 0);
-    chi::u64 h = op->handle_;
+    clio::run::u64 h = op->handle_;
     if (n > 0) {
       ctp::ipc::FullPtr<char> wb = ipc->AllocateBuffer(n);
       memset(wb.ptr_, mark, n);
@@ -141,7 +141,7 @@ TEST_CASE("Cfs - rename POSIX semantics + concurrency", "[cli][cfs][rename]") {
     g.Wait();
     return g->GetReturnCode() == 0 && g->exists_ == 1 && g->is_dir_ == 1;
   };
-  auto fsize = [&](const std::string& path) -> chi::u64 {
+  auto fsize = [&](const std::string& path) -> clio::run::u64 {
     auto g = cfs.AsyncGetattr(path);
     g.Wait();
     REQUIRE(g->GetReturnCode() == 0);
@@ -152,7 +152,7 @@ TEST_CASE("Cfs - rename POSIX semantics + concurrency", "[cli][cfs][rename]") {
     auto op = cfs.AsyncOpen(path, O_RDWR, 0644);
     op.Wait();
     if (op->GetReturnCode() != 0) return -1;
-    chi::u64 h = op->handle_;
+    clio::run::u64 h = op->handle_;
     ctp::ipc::FullPtr<char> rb = ipc->AllocateBuffer(1);
     rb.ptr_[0] = 0;
     auto r = cfs.AsyncRead(h, 0, 1, rb.shm_.template Cast<void>());
@@ -185,7 +185,7 @@ TEST_CASE("Cfs - rename POSIX semantics + concurrency", "[cli][cfs][rename]") {
     return {total, matches};
   };
 
-  constexpr chi::u64 kN = 4096;
+  constexpr clio::run::u64 kN = 4096;
 
   // ======================================================================
   // A. Basic rename correctness (sanity): move keeps data, source vanishes.
@@ -241,7 +241,7 @@ TEST_CASE("Cfs - rename POSIX semantics + concurrency", "[cli][cfs][rename]") {
     auto op = cfs.AsyncOpen("/C/open.bin", O_RDWR, 0644);
     op.Wait();
     REQUIRE(op->GetReturnCode() == 0);
-    chi::u64 h = op->handle_;
+    clio::run::u64 h = op->handle_;
 
     REQUIRE(rename_rc("/C/open.bin", "/C/moved.bin") == 0);
     REQUIRE_FALSE(exists("/C/open.bin"));
@@ -270,7 +270,7 @@ TEST_CASE("Cfs - rename POSIX semantics + concurrency", "[cli][cfs][rename]") {
       mkfile("/D1/s" + std::to_string(i) + ".bin",
              (char)('A' + i), kN);
     }
-    std::vector<chi::Future<clio::cte::filesystem::RenameTask>> futs;
+    std::vector<clio::run::Future<clio::cte::filesystem::RenameTask>> futs;
     futs.reserve(kFiles);
     for (int i = 0; i < kFiles; ++i) {
       futs.push_back(cfs.AsyncRename("/D1/s" + std::to_string(i) + ".bin",
@@ -298,7 +298,7 @@ TEST_CASE("Cfs - rename POSIX semantics + concurrency", "[cli][cfs][rename]") {
       mkfile("/D2/src" + std::to_string(i) + ".bin",
              (char)('0' + i), kN);
     }
-    std::vector<chi::Future<clio::cte::filesystem::RenameTask>> futs;
+    std::vector<clio::run::Future<clio::cte::filesystem::RenameTask>> futs;
     futs.reserve(kSrc);
     for (int i = 0; i < kSrc; ++i) {
       futs.push_back(cfs.AsyncRename("/D2/src" + std::to_string(i) + ".bin",
@@ -361,8 +361,8 @@ TEST_CASE("Cfs - rename POSIX semantics + concurrency", "[cli][cfs][rename]") {
     for (int round = 0; round < kRounds; ++round) {
       const std::string from = (round % 2 == 0) ? "a" : "b";
       const std::string to = (round % 2 == 0) ? "b" : "a";
-      std::vector<chi::Future<clio::cte::filesystem::RenameTask>> rmv;
-      std::vector<chi::Future<clio::cte::filesystem::ReaddirTask>> rdd;
+      std::vector<clio::run::Future<clio::cte::filesystem::RenameTask>> rmv;
+      std::vector<clio::run::Future<clio::cte::filesystem::ReaddirTask>> rdd;
       rmv.reserve(kFiles);
       for (int i = 0; i < kFiles; ++i) {
         rmv.push_back(cfs.AsyncRename("/D4/" + from + std::to_string(i) + ".bin",

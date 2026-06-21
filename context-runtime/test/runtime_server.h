@@ -77,7 +77,7 @@ extern char **environ;
 
 // NOTE: `chi` is a namespace ALIAS (namespace chi = clio::run), so we must not
 // open `namespace chi { ... }` here. Define in clio::run::test; tests reach it
-// as chi::test::RuntimeServer through the alias.
+// as clio::run::test::RuntimeServer through the alias.
 namespace clio {
 namespace run {
 namespace test {

@@ -78,7 +78,7 @@ static constexpr size_t kMaxInFlightWrites = 8;
  * race with the in-flight handler.
  */
 struct PendingWrite {
-  chi::Future<clio::cte::core::PutBlobTask> task;
+  clio::run::Future<clio::cte::core::PutBlobTask> task;
   ctp::ipc::FullPtr<char> shm_buf;
 };
 
@@ -121,7 +121,7 @@ struct FuseFileHandle {
 /** Query CTE for the authoritative tag size */
 static inline size_t CteGetTagSize(const clio::cte::core::TagId &tag_id) {
   auto *cte_client = CLIO_CTE_CLIENT;
-  auto task = cte_client->AsyncGetTagSize(tag_id, chi::PoolQuery::Local());
+  auto task = cte_client->AsyncGetTagSize(tag_id, clio::run::PoolQuery::Local());
   task.Wait();
   if (task->GetReturnCode() != 0) return 0;
   return task->tag_size_;
@@ -130,7 +130,7 @@ static inline size_t CteGetTagSize(const clio::cte::core::TagId &tag_id) {
 /** Delete a CTE tag by name */
 static inline void CteDelTag(const std::string &tag_name) {
   auto *cte_client = CLIO_CTE_CLIENT;
-  auto task = cte_client->AsyncDelTag(tag_name, chi::PoolQuery::Local());
+  auto task = cte_client->AsyncDelTag(tag_name, clio::run::PoolQuery::Local());
   task.Wait();
 }
 
@@ -141,7 +141,7 @@ static inline clio::cte::core::TagId CteGetOrCreateTag(const std::string &name) 
   // new tags — without it the tag is hashed to a peer node and a subsequent
   // CteTagExists(Local) from the same FUSE adapter won't find it.
   auto task = cte_client->AsyncGetOrCreateTag(
-      name, clio::cte::core::TagId::GetNull(), chi::PoolQuery::Local());
+      name, clio::cte::core::TagId::GetNull(), clio::run::PoolQuery::Local());
   task.Wait();
   if (task->GetReturnCode() != 0) return clio::cte::core::TagId::GetNull();
   return task->tag_id_;
@@ -167,7 +167,7 @@ static inline bool CteTagExists(const std::string &tag_name) {
   // missed/duplicate response leaves the originating future un-completed,
   // which is exactly the hang reproduced under 4n×256m load (one rank's
   // getattr parked in TagQuery.Wait, all daemon workers idle).
-  auto task = cte_client->AsyncTagQuery(escaped, 1, chi::PoolQuery::Local());
+  auto task = cte_client->AsyncTagQuery(escaped, 1, clio::run::PoolQuery::Local());
   task.Wait();
   return task->GetReturnCode() == 0 && !task->results_.empty();
 }
@@ -195,7 +195,7 @@ CteListDirectChildren(const std::string &dir_path) {
   if (!escaped.empty() && escaped.back() != '/') escaped += '/';
   std::string regex = "^" + escaped + "[^/]+$";
 
-  auto task = cte_client->AsyncTagQuery(regex, 0, chi::PoolQuery::Local());
+  auto task = cte_client->AsyncTagQuery(regex, 0, clio::run::PoolQuery::Local());
   task.Wait();
 
   std::vector<std::string> basenames;
@@ -235,7 +235,7 @@ CteListSubdirs(const std::string &dir_path) {
   // Match tags with at least one more slash after the child component
   std::string regex = "^" + escaped + "[^/]+/.*";
 
-  auto task = cte_client->AsyncTagQuery(regex, 0, chi::PoolQuery::Local());
+  auto task = cte_client->AsyncTagQuery(regex, 0, clio::run::PoolQuery::Local());
   task.Wait();
 
   // Extract unique immediate subdirectory names
@@ -275,7 +275,7 @@ static inline bool CteDirExists(const std::string &dir_path) {
   }
   if (!escaped.empty() && escaped.back() != '/') escaped += '/';
   std::string regex = "^" + escaped + ".*";
-  auto task = cte_client->AsyncTagQuery(regex, 1, chi::PoolQuery::Local());
+  auto task = cte_client->AsyncTagQuery(regex, 1, clio::run::PoolQuery::Local());
   task.Wait();
   return task->GetReturnCode() == 0 && !task->results_.empty();
 }
@@ -299,7 +299,7 @@ static inline bool CtePutBlob(const clio::cte::core::TagId &tag_id,
   auto task = cte_client->AsyncPutBlob(
       tag_id, blob_name, blob_off, data_size, shm_ptr,
       /*score*/ -1.0f, clio::cte::core::Context(), /*flags*/ 0u,
-      chi::PoolQuery::Local());
+      clio::run::PoolQuery::Local());
   task.Wait();
   ipc_manager->FreeBuffer(shm_buf);
   return task->GetReturnCode() == 0;
@@ -334,7 +334,7 @@ static inline bool CtePutBlobAsync(struct FuseFileHandle *handle,
   auto task = cte_client->AsyncPutBlob(
       handle->tag_id, blob_name, blob_off, data_size, shm_ptr,
       /*score*/ -1.0f, clio::cte::core::Context(), /*flags*/ 0u,
-      chi::PoolQuery::Local());
+      clio::run::PoolQuery::Local());
 
   std::lock_guard<std::mutex> lk(handle->pending_mu);
   handle->pending_writes.push_back(
@@ -408,7 +408,7 @@ static inline bool CteGetBlob(const clio::cte::core::TagId &tag_id,
   ctp::ipc::ShmPtr<> shm_ptr(shm_buf.shm_);
   auto task = cte_client->AsyncGetBlob(
       tag_id, blob_name, blob_off, data_size, /*flags*/ 0u, shm_ptr,
-      chi::PoolQuery::Local());
+      clio::run::PoolQuery::Local());
   task.Wait();
   bool ok = (task->GetReturnCode() == 0);
   if (ok) memcpy(data, shm_buf.ptr_, data_size);

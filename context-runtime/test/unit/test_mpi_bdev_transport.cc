@@ -71,9 +71,9 @@ using namespace chi;
 
 // --- Helpers ---
 
-inline chi::priv::vector<clio::run::bdev::Block> WrapBlock(
+inline clio::run::priv::vector<clio::run::bdev::Block> WrapBlock(
     const clio::run::bdev::Block& block) {
-  chi::priv::vector<clio::run::bdev::Block> blocks(CTP_MALLOC);
+  clio::run::priv::vector<clio::run::bdev::Block> blocks(CTP_MALLOC);
   blocks.push_back(block);
   return blocks;
 }
@@ -109,17 +109,17 @@ void CleanupSharedMemory() {
  * Returns true on success, false on failure.
  */
 bool RunBdevIoTest(int rank, const std::string& mode_name, size_t io_size) {
-  const chi::u64 kRamSize = 16 * 1024 * 1024;  // 16MB pool
-  const chi::u64 kBlockSize = io_size;
+  const clio::run::u64 kRamSize = 16 * 1024 * 1024;  // 16MB pool
+  const clio::run::u64 kBlockSize = io_size;
 
   // Rank-specific pool to avoid conflicts
-  chi::PoolId pool_id(9000 + rank, 0);
+  clio::run::PoolId pool_id(9000 + rank, 0);
   clio::run::bdev::Client client(pool_id);
   std::string pool_name = "mpi_bdev_" + mode_name + "_rank" + std::to_string(rank);
 
   // Create pool
   auto create_task = client.AsyncCreate(
-      chi::PoolQuery::Dynamic(), pool_name, pool_id,
+      clio::run::PoolQuery::Dynamic(), pool_name, pool_id,
       clio::run::bdev::BdevType::kRam, kRamSize);
   create_task.Wait();
   if (create_task->return_code_ != 0) {
@@ -130,7 +130,7 @@ bool RunBdevIoTest(int rank, const std::string& mode_name, size_t io_size) {
 
   // Allocate blocks
   auto alloc_task = client.AsyncAllocateBlocks(
-      chi::PoolQuery::Local(), kBlockSize);
+      clio::run::PoolQuery::Local(), kBlockSize);
   alloc_task.Wait();
   if (alloc_task->return_code_ != 0 || alloc_task->blocks_.size() == 0) {
     HLOG(kError, "[Rank {}] AllocateBlocks failed", rank);
@@ -152,7 +152,7 @@ bool RunBdevIoTest(int rank, const std::string& mode_name, size_t io_size) {
   }
   memcpy(write_buffer.ptr_, write_data.data(), write_data.size());
   auto write_task = client.AsyncWrite(
-      chi::PoolQuery::Local(), WrapBlock(block),
+      clio::run::PoolQuery::Local(), WrapBlock(block),
       write_buffer.shm_.template Cast<void>().template Cast<void>(),
       write_data.size());
   write_task.Wait();
@@ -171,7 +171,7 @@ bool RunBdevIoTest(int rank, const std::string& mode_name, size_t io_size) {
     return false;
   }
   auto read_task = client.AsyncRead(
-      chi::PoolQuery::Local(), WrapBlock(block),
+      clio::run::PoolQuery::Local(), WrapBlock(block),
       read_buffer.shm_.template Cast<void>().template Cast<void>(),
       io_size);
   read_task.Wait();
@@ -288,7 +288,7 @@ int main(int argc, char* argv[]) {
     }
 
     // Cleanup
-    chi::CHIMAERA_FINALIZE();
+    clio::run::CHIMAERA_FINALIZE();
     CleanupSharedMemory();
     MPI_Finalize();
     return (global_pass == 1) ? 0 : 1;
@@ -339,7 +339,7 @@ int main(int argc, char* argv[]) {
     MPI_Reduce(&local_pass, &global_pass, 1, MPI_INT, MPI_MIN,
                0, MPI_COMM_WORLD);
 
-    chi::CHIMAERA_FINALIZE();
+    clio::run::CHIMAERA_FINALIZE();
     MPI_Finalize();
     return (local_pass == 1) ? 0 : 1;
   }

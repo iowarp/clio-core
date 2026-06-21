@@ -43,7 +43,7 @@ CTP_DEFINE_GLOBAL_PTR_VAR_CC(clio::cte::core::ContentTransferEngine,
 
 namespace clio::cte::core {
 
-bool ContentTransferEngine::ClientInit(const chi::PoolQuery &pool_query) {
+bool ContentTransferEngine::ClientInit(const clio::run::PoolQuery &pool_query) {
   // Check for race conditions - if already initialized or initializing
   if (is_initialized_) {
     return true;
@@ -60,7 +60,7 @@ bool ContentTransferEngine::ClientInit(const chi::PoolQuery &pool_query) {
   is_initializing_ = true;
 
   // Initialize CLIO Runtime client
-  if (!chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, false)) {
+  if (!clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, false)) {
     is_initializing_ = false;
     return false;
   }
@@ -79,7 +79,7 @@ bool ContentTransferEngine::ClientInit(const chi::PoolQuery &pool_query) {
   create_task.Wait();
 
   // Check if Create operation succeeded
-  chi::u32 return_code = create_task->GetReturnCode();
+  clio::run::u32 return_code = create_task->GetReturnCode();
   if (return_code != 0) {
     HLOG(kError, "CTE ClientInit: Failed to create CTE pool '{}' with return code: {}",
           clio::cte::core::kCtePoolName, return_code);
@@ -101,8 +101,8 @@ bool ContentTransferEngine::ClientInit(const chi::PoolQuery &pool_query) {
 
 std::vector<std::string> ContentTransferEngine::TagQuery(
     const std::string &tag_re,
-    chi::u32 max_tags,
-    const chi::PoolQuery &pool_query) {
+    clio::run::u32 max_tags,
+    const clio::run::PoolQuery &pool_query) {
   auto *cte_client = CLIO_CTE_CLIENT;
   auto task = cte_client->AsyncTagQuery(tag_re, max_tags, pool_query);
   task.Wait();
@@ -114,8 +114,8 @@ std::vector<std::string> ContentTransferEngine::TagQuery(
 std::vector<std::pair<std::string, std::string>> ContentTransferEngine::BlobQuery(
     const std::string &tag_re,
     const std::string &blob_re,
-    chi::u32 max_blobs,
-    const chi::PoolQuery &pool_query) {
+    clio::run::u32 max_blobs,
+    const clio::run::PoolQuery &pool_query) {
   auto *cte_client = CLIO_CTE_CLIENT;
   auto task = cte_client->AsyncBlobQuery(tag_re, blob_re, max_blobs, pool_query);
   task.Wait();

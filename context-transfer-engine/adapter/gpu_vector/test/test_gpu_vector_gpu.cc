@@ -50,14 +50,14 @@ void EnsureInit() {
 #if !CTP_IS_DEVICE_PASS
   if (g_initialized) return;
   std::fprintf(stderr, "[INIT] Starting Chimaera server (gpu_vector test)\n");
-  REQUIRE(chi::CHIMAERA_INIT(chi::ChimaeraMode::kServer));
+  REQUIRE(clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kServer));
   REQUIRE(clio::cte::core::CLIO_CTE_CLIENT_INIT());
   auto *cte_client = CLIO_CTE_CLIENT;
   REQUIRE(cte_client != nullptr);
   cte_client->Init(clio::cte::core::kCtePoolId);
   clio::cte::core::CreateParams params;
   auto create_task = cte_client->AsyncCreate(
-      chi::PoolQuery::Dynamic(), clio::cte::core::kCtePoolName,
+      clio::run::PoolQuery::Dynamic(), clio::cte::core::kCtePoolName,
       clio::cte::core::kCtePoolId, params);
   create_task.Wait();
   REQUIRE(create_task->GetReturnCode() == 0);
@@ -66,18 +66,18 @@ void EnsureInit() {
   // Register a kRam bdev target so PutBlob/GetBlob have somewhere to
   // land. Required for eviction tests since dirty pages are flushed
   // through the bdev runtime.
-  const chi::u64 kRamCapacity = 4ULL << 30;  // 4 GiB
-  chi::PoolId bdev_pool_id(950, 0);
+  const clio::run::u64 kRamCapacity = 4ULL << 30;  // 4 GiB
+  clio::run::PoolId bdev_pool_id(950, 0);
   clio::run::bdev::Client bdev_client(bdev_pool_id);
   auto bdev_create = bdev_client.AsyncCreate(
-      chi::PoolQuery::Dynamic(), std::string("gpu_vector_ram"),
+      clio::run::PoolQuery::Dynamic(), std::string("gpu_vector_ram"),
       bdev_pool_id, clio::run::bdev::BdevType::kRam, kRamCapacity);
   bdev_create.Wait();
   REQUIRE(bdev_create->GetReturnCode() == 0);
   std::this_thread::sleep_for(50ms);
   auto reg_task = cte_client->AsyncRegisterTarget(
       "gpu_vector_ram", clio::run::bdev::BdevType::kRam, kRamCapacity,
-      chi::PoolQuery::Local(), bdev_pool_id);
+      clio::run::PoolQuery::Local(), bdev_pool_id);
   reg_task.Wait();
   REQUIRE(reg_task->GetReturnCode() == 0);
   std::this_thread::sleep_for(50ms);
@@ -92,31 +92,31 @@ namespace gv = clio::cte::gpu_vector;
 namespace dev = cte::gpu::dev;
 
 /** Write v[i] = i*2 for the first total elements. */
-__global__ void GpuVectorWriteKernel(chi::IpcManagerGpuInfo info,
-                                      gv::DeviceView<chi::u32> view,
-                                      chi::u64 total) {
+__global__ void GpuVectorWriteKernel(clio::run::IpcManagerGpuInfo info,
+                                      gv::DeviceView<clio::run::u32> view,
+                                      clio::run::u64 total) {
   CHIMAERA_GPU_INIT(info, /*ipc_ptr=*/nullptr);
-  dev::vector<chi::u32> v(view, g_ipc_manager_ptr);
-  chi::u64 stripe = (total + gridDim.x - 1) / gridDim.x;
-  chi::u64 lo = static_cast<chi::u64>(blockIdx.x) * stripe;
-  chi::u64 hi = lo + stripe;
+  dev::vector<clio::run::u32> v(view, g_ipc_manager_ptr);
+  clio::run::u64 stripe = (total + gridDim.x - 1) / gridDim.x;
+  clio::run::u64 lo = static_cast<clio::run::u64>(blockIdx.x) * stripe;
+  clio::run::u64 hi = lo + stripe;
   if (hi > total) hi = total;
-  v.write_range(lo, hi, [] (chi::u64 i) {
-    return static_cast<chi::u32>(i * 2u);
+  v.write_range(lo, hi, [] (clio::run::u64 i) {
+    return static_cast<clio::run::u32>(i * 2u);
   });
   (void)g_ipc_manager;
 }
 
-__global__ void GpuVectorReadKernel(chi::IpcManagerGpuInfo info,
-                                     gv::DeviceView<chi::u32> view,
-                                     chi::u32 *result, chi::u64 total) {
+__global__ void GpuVectorReadKernel(clio::run::IpcManagerGpuInfo info,
+                                     gv::DeviceView<clio::run::u32> view,
+                                     clio::run::u32 *result, clio::run::u64 total) {
   CHIMAERA_GPU_INIT(info, /*ipc_ptr=*/nullptr);
-  dev::vector<chi::u32> v(view, g_ipc_manager_ptr);
-  chi::u64 stripe = (total + gridDim.x - 1) / gridDim.x;
-  chi::u64 lo = static_cast<chi::u64>(blockIdx.x) * stripe;
-  chi::u64 hi = lo + stripe;
+  dev::vector<clio::run::u32> v(view, g_ipc_manager_ptr);
+  clio::run::u64 stripe = (total + gridDim.x - 1) / gridDim.x;
+  clio::run::u64 lo = static_cast<clio::run::u64>(blockIdx.x) * stripe;
+  clio::run::u64 hi = lo + stripe;
   if (hi > total) hi = total;
-  v.read_range(lo, hi, [result] (chi::u64 i, chi::u32 val) {
+  v.read_range(lo, hi, [result] (clio::run::u64 i, clio::run::u32 val) {
     result[i] = val;
   });
   (void)g_ipc_manager;
@@ -128,13 +128,13 @@ TEST_CASE("gpu_vector: write then read round-trip",
           "[gpu_vector][cte][stress]") {
   EnsureInit();
   auto *ipc = CLIO_CPU_IPC;
-  const chi::u32 nblocks = 4;
-  const chi::u32 pages_per_block = 4;
-  const chi::u64 page_size_bytes = 4096;
+  const clio::run::u32 nblocks = 4;
+  const clio::run::u32 pages_per_block = 4;
+  const clio::run::u64 page_size_bytes = 4096;
 
   // Legacy mode (host_pages_per_block=0); enable cold-miss fault since
   // the test kernel doesn't push lookahead hints ahead of access.
-  gv::Vector<chi::u32> vec("gpu_vector_smoke", nblocks, /*gpu_id=*/0,
+  gv::Vector<clio::run::u32> vec("gpu_vector_smoke", nblocks, /*gpu_id=*/0,
                             pages_per_block,
                             /*host_pages_per_block=*/0,
                             page_size_bytes,
@@ -143,20 +143,20 @@ TEST_CASE("gpu_vector: write then read round-trip",
                             /*manager_threads_per_block=*/32,
                             /*allow_cold_miss_fault=*/true);
 
-  chi::u64 elements_per_page = page_size_bytes / sizeof(chi::u32);
-  chi::u64 total = static_cast<chi::u64>(nblocks) * pages_per_block *
+  clio::run::u64 elements_per_page = page_size_bytes / sizeof(clio::run::u32);
+  clio::run::u64 total = static_cast<clio::run::u64>(nblocks) * pages_per_block *
                     elements_per_page;
   std::fprintf(stderr, "[GPUVEC] total=%llu elements\n",
                (unsigned long long)total);
 
   auto view = vec.Device();
-  chi::IpcManagerGpuInfo gpu_info = ipc->GetGpuIpcManager()->GetGpuInfo(0);
+  clio::run::IpcManagerGpuInfo gpu_info = ipc->GetGpuIpcManager()->GetGpuInfo(0);
 
   // ctp::GpuApi::MallocHost takes BYTES (not elements).
-  auto *result = ctp::GpuApi::MallocHost<chi::u32>(
-      total * sizeof(chi::u32));
+  auto *result = ctp::GpuApi::MallocHost<clio::run::u32>(
+      total * sizeof(clio::run::u32));
   REQUIRE(result != nullptr);
-  std::memset(result, 0, total * sizeof(chi::u32));
+  std::memset(result, 0, total * sizeof(clio::run::u32));
 
   // 1. Write v[i] = i*2 across all blocks.
   GpuVectorWriteKernel<<<nblocks, 32>>>(gpu_info, view, total);
@@ -170,13 +170,13 @@ TEST_CASE("gpu_vector: write then read round-trip",
   ctp::GpuApi::Synchronize();
 
   // 4. Verify.
-  for (chi::u64 i = 0; i < total; ++i) {
-    if (result[i] != static_cast<chi::u32>(i * 2u)) {
+  for (clio::run::u64 i = 0; i < total; ++i) {
+    if (result[i] != static_cast<clio::run::u32>(i * 2u)) {
       std::fprintf(stderr,
                    "[GPUVEC] mismatch at %llu: got %u expected %u\n",
                    (unsigned long long)i, result[i],
-                   static_cast<chi::u32>(i * 2u));
-      REQUIRE(result[i] == static_cast<chi::u32>(i * 2u));
+                   static_cast<clio::run::u32>(i * 2u));
+      REQUIRE(result[i] == static_cast<clio::run::u32>(i * 2u));
     }
   }
   std::fprintf(stderr, "[GPUVEC] OK %llu / %llu\n",

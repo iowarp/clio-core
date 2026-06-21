@@ -48,13 +48,13 @@
 
 namespace clio::run::MOD_NAME {
 
-class Client : public chi::ContainerClient {
+class Client : public clio::run::ContainerClient {
  public:
   /** Default constructor */
   CTP_CROSS_FUN Client() = default;
 
   /** Constructor with pool ID */
-  CTP_CROSS_FUN explicit Client(const chi::PoolId& pool_id) { Init(pool_id); }
+  CTP_CROSS_FUN explicit Client(const clio::run::PoolId& pool_id) { Init(pool_id); }
 
   /**
    * Create the container (asynchronous)
@@ -63,16 +63,16 @@ class Client : public chi::ContainerClient {
    * @param custom_pool_id Explicit pool ID for the pool being created
    * @return Future for the CreateTask
    */
-  chi::Future<CreateTask> AsyncCreate(const chi::PoolQuery& pool_query,
+  clio::run::Future<CreateTask> AsyncCreate(const clio::run::PoolQuery& pool_query,
                                        const std::string& pool_name,
-                                       const chi::PoolId& custom_pool_id) {
+                                       const clio::run::PoolId& custom_pool_id) {
     auto* ipc_manager = CLIO_CPU_IPC;
 
     // CreateTask is a GetOrCreatePoolTask, which must be handled by admin pool
     // Pass 'this' as client pointer for PostWait callback
     auto task = ipc_manager->NewTask<CreateTask>(
-        chi::CreateTaskId(),
-        chi::kAdminPoolId,  // Send to admin pool for GetOrCreatePool processing
+        clio::run::CreateTaskId(),
+        clio::run::kAdminPoolId,  // Send to admin pool for GetOrCreatePool processing
         pool_query,
         CreateParams::chimod_lib_name,  // chimod name from CreateParams
         pool_name,                      // user-provided pool name
@@ -86,11 +86,11 @@ class Client : public chi::ContainerClient {
   /**
    * Monitor container state - asynchronous
    */
-  chi::Future<MonitorTask> AsyncMonitor(const chi::PoolQuery &pool_query,
+  clio::run::Future<MonitorTask> AsyncMonitor(const clio::run::PoolQuery &pool_query,
                                         const std::string &query) {
     auto *ipc_manager = CLIO_CPU_IPC;
     auto task = ipc_manager->NewTask<MonitorTask>(
-        chi::CreateTaskId(), pool_id_, pool_query, query);
+        clio::run::CreateTaskId(), pool_id_, pool_query, query);
     return ipc_manager->Send(task);
   }
 
@@ -101,13 +101,13 @@ class Client : public chi::ContainerClient {
    * @param operation_id Operation identifier
    * @return Future for the CustomTask
    */
-  chi::Future<CustomTask> AsyncCustom(const chi::PoolQuery& pool_query,
+  clio::run::Future<CustomTask> AsyncCustom(const clio::run::PoolQuery& pool_query,
                                        const std::string& input_data,
-                                       chi::u32 operation_id) {
+                                       clio::run::u32 operation_id) {
     auto* ipc_manager = CLIO_CPU_IPC;
 
     auto task = ipc_manager->NewTask<CustomTask>(
-        chi::CreateTaskId(), pool_id_, pool_query, input_data, operation_id);
+        clio::run::CreateTaskId(), pool_id_, pool_query, input_data, operation_id);
 
     return ipc_manager->Send(task);
   }
@@ -120,11 +120,11 @@ class Client : public chi::ContainerClient {
    * @param value This submitter's contribution
    * @return Future for the ManyToOneSumTask
    */
-  chi::Future<ManyToOneSumTask> AsyncManyToOneSum(
-      const chi::PoolQuery& pool_query, chi::u64 value) {
+  clio::run::Future<ManyToOneSumTask> AsyncManyToOneSum(
+      const clio::run::PoolQuery& pool_query, clio::run::u64 value) {
     auto* ipc_manager = CLIO_CPU_IPC;
     auto task = ipc_manager->NewTask<ManyToOneSumTask>(
-        chi::CreateTaskId(), pool_id_, pool_query, value);
+        clio::run::CreateTaskId(), pool_id_, pool_query, value);
     return ipc_manager->Send(task);
   }
 
@@ -135,13 +135,13 @@ class Client : public chi::ContainerClient {
    * @param hold_duration_ms Duration to hold the mutex in milliseconds
    * @return Future for the CoMutexTestTask
    */
-  chi::Future<CoMutexTestTask> AsyncCoMutexTest(
-      const chi::PoolQuery& pool_query,
-      chi::u32 test_id, chi::u32 hold_duration_ms) {
+  clio::run::Future<CoMutexTestTask> AsyncCoMutexTest(
+      const clio::run::PoolQuery& pool_query,
+      clio::run::u32 test_id, clio::run::u32 hold_duration_ms) {
     auto* ipc_manager = CLIO_CPU_IPC;
 
     auto task = ipc_manager->NewTask<CoMutexTestTask>(
-        chi::CreateTaskId(), pool_id_, pool_query, test_id, hold_duration_ms);
+        clio::run::CreateTaskId(), pool_id_, pool_query, test_id, hold_duration_ms);
 
     return ipc_manager->Send(task);
   }
@@ -154,13 +154,13 @@ class Client : public chi::ContainerClient {
    * @param hold_duration_ms Duration to hold the lock in milliseconds
    * @return Future for the CoRwLockTestTask
    */
-  chi::Future<CoRwLockTestTask> AsyncCoRwLockTest(
-      const chi::PoolQuery& pool_query,
-      chi::u32 test_id, bool is_writer, chi::u32 hold_duration_ms) {
+  clio::run::Future<CoRwLockTestTask> AsyncCoRwLockTest(
+      const clio::run::PoolQuery& pool_query,
+      clio::run::u32 test_id, bool is_writer, clio::run::u32 hold_duration_ms) {
     auto* ipc_manager = CLIO_CPU_IPC;
 
     auto task = ipc_manager->NewTask<CoRwLockTestTask>(
-        chi::CreateTaskId(), pool_id_, pool_query, test_id, is_writer,
+        clio::run::CreateTaskId(), pool_id_, pool_query, test_id, is_writer,
         hold_duration_ms);
 
     return ipc_manager->Send(task);
@@ -174,13 +174,13 @@ class Client : public chi::ContainerClient {
    * @param test_id Test identifier for tracking
    * @return Future for the WaitTestTask
    */
-  chi::Future<WaitTestTask> AsyncWaitTest(const chi::PoolQuery& pool_query,
-                                           chi::u32 depth,
-                                           chi::u32 test_id) {
+  clio::run::Future<WaitTestTask> AsyncWaitTest(const clio::run::PoolQuery& pool_query,
+                                           clio::run::u32 depth,
+                                           clio::run::u32 test_id) {
     auto* ipc_manager = CLIO_CPU_IPC;
 
     auto task = ipc_manager->NewTask<WaitTestTask>(
-        chi::CreateTaskId(), pool_id_, pool_query, depth, test_id);
+        clio::run::CreateTaskId(), pool_id_, pool_query, depth, test_id);
 
     return ipc_manager->Send(task);
   }
@@ -191,11 +191,11 @@ class Client : public chi::ContainerClient {
    * @param pool_query Pool routing information
    * @return Future for the TestLargeOutputTask
    */
-  chi::Future<TestLargeOutputTask> AsyncTestLargeOutput(const chi::PoolQuery& pool_query) {
+  clio::run::Future<TestLargeOutputTask> AsyncTestLargeOutput(const clio::run::PoolQuery& pool_query) {
     auto* ipc_manager = CLIO_CPU_IPC;
 
     auto task = ipc_manager->NewTask<TestLargeOutputTask>(
-        chi::CreateTaskId(), pool_id_, pool_query);
+        clio::run::CreateTaskId(), pool_id_, pool_query);
 
     return ipc_manager->Send(task);
   }
@@ -212,22 +212,22 @@ class Client : public chi::ContainerClient {
    * Submit SubtaskTest task (asynchronous)
    * GPU implementation co_awaits GpuSubmit on itself to test coroutine yielding.
    */
-  chi::Future<SubtaskTestTask> AsyncSubtaskTest(const chi::PoolQuery& pool_query,
-                                                chi::u32 test_value,
-                                                chi::u32 num_subtasks = 1) {
+  clio::run::Future<SubtaskTestTask> AsyncSubtaskTest(const clio::run::PoolQuery& pool_query,
+                                                clio::run::u32 test_value,
+                                                clio::run::u32 num_subtasks = 1) {
     auto* ipc_manager = CLIO_CPU_IPC;
     auto task = ipc_manager->NewTask<SubtaskTestTask>(
-        chi::CreateTaskId(), pool_id_, pool_query, test_value, num_subtasks);
+        clio::run::CreateTaskId(), pool_id_, pool_query, test_value, num_subtasks);
     return ipc_manager->Send(task);
   }
 
-  chi::Future<GpuSubmitTask> AsyncGpuSubmit(const chi::PoolQuery& pool_query,
-                                            chi::u32 gpu_id,
-                                            chi::u32 test_value) {
+  clio::run::Future<GpuSubmitTask> AsyncGpuSubmit(const clio::run::PoolQuery& pool_query,
+                                            clio::run::u32 gpu_id,
+                                            clio::run::u32 test_value) {
     auto* ipc_manager = CLIO_CPU_IPC;
 
     auto task = ipc_manager->NewTask<GpuSubmitTask>(
-        chi::CreateTaskId(), pool_id_, pool_query, gpu_id, test_value);
+        clio::run::CreateTaskId(), pool_id_, pool_query, gpu_id, test_value);
 
     return ipc_manager->Send(task);
   }

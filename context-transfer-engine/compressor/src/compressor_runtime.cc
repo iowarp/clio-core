@@ -57,8 +57,8 @@
 namespace clio::cte::compressor {
 
 // Bring chi namespace items into scope for CLIO_CUR_WORKER macro
-using chi::chi_cur_worker_key_;
-using chi::Worker;
+using clio::run::chi_cur_worker_key_;
+using clio::run::Worker;
 
 /**
  * Compression header prepended to compressed data for self-describing format.
@@ -88,8 +88,8 @@ struct CompressionHeader {
 static_assert(sizeof(CompressionHeader) == 24,
               "CompressionHeader must be 24 bytes");
 
-chi::TaskResume Runtime::Create(ctp::ipc::FullPtr<CreateTask> task,
-                                chi::RunContext& ctx) {
+clio::run::TaskResume Runtime::Create(ctp::ipc::FullPtr<CreateTask> task,
+                                clio::run::RunContext& ctx) {
   // Load configuration from compose YAML (or direct CreateParams)
   config_ = task->GetParams();
 
@@ -189,13 +189,13 @@ chi::TaskResume Runtime::Create(ctp::ipc::FullPtr<CreateTask> task,
 
   // Spawn the periodic consumer-poll task (5s period). It iterates this
   // container's consumer list and dispatches PollNodeLoad to each node.
-  client_.AsyncPollConsumers(chi::PoolQuery::Local(), 5000000);
+  client_.AsyncPollConsumers(clio::run::PoolQuery::Local(), 5000000);
 
   CLIO_CO_RETURN;
 }
 
-chi::TaskResume Runtime::Destroy(ctp::ipc::FullPtr<DestroyTask> task,
-                                 chi::RunContext& ctx) {
+clio::run::TaskResume Runtime::Destroy(ctp::ipc::FullPtr<DestroyTask> task,
+                                 clio::run::RunContext& ctx) {
   try {
     // Reset predictors
     qtable_predictor_.reset();
@@ -216,7 +216,7 @@ chi::TaskResume Runtime::Destroy(ctp::ipc::FullPtr<DestroyTask> task,
   CLIO_CO_RETURN;
 }
 
-chi::PoolQuery Runtime::ScheduleTask(const ctp::ipc::FullPtr<chi::Task> &task) {
+clio::run::PoolQuery Runtime::ScheduleTask(const ctp::ipc::FullPtr<clio::run::Task> &task) {
   // Compress placement: consult per-tag consumer tracking (when enabled)
   // so the compressed copy lands on the node that most recently read
   // the tag. Falls through to DirectHash(tag_id) when tracking is off
@@ -224,24 +224,24 @@ chi::PoolQuery Runtime::ScheduleTask(const ctp::ipc::FullPtr<chi::Task> &task) {
   // deterministic per tag without the tracking overhead.
   if (task->method_ == Method::kCompress) {
     auto compress_task = task.template Cast<CompressTask>();
-    chi::u32 consumer_node = 0;
+    clio::run::u32 consumer_node = 0;
     if (PickConsumerForTag(compress_task->tag_id_, consumer_node)) {
-      return chi::PoolQuery::Physical(consumer_node);
+      return clio::run::PoolQuery::Physical(consumer_node);
     }
     // No consumer info — hash on tag_id so all blobs of the same tag
     // converge on the same container regardless of which node submits.
-    chi::u32 hash = static_cast<chi::u32>(
+    clio::run::u32 hash = static_cast<clio::run::u32>(
         std::hash<clio::cte::core::TagId>{}(compress_task->tag_id_));
-    return chi::PoolQuery::DirectHash(hash);
+    return clio::run::PoolQuery::DirectHash(hash);
   }
   // Other Dynamic methods (Decompress, periodic ticks) resolve Local.
-  return chi::PoolQuery::Local();
+  return clio::run::PoolQuery::Local();
 }
 
-chi::TaskResume Runtime::Monitor(ctp::ipc::FullPtr<MonitorTask> task,
-                                 chi::RunContext &ctx) {
+clio::run::TaskResume Runtime::Monitor(ctp::ipc::FullPtr<MonitorTask> task,
+                                 clio::run::RunContext &ctx) {
 #ifdef __NVCOMPILER
-  chi::RunContext& rctx = ctx;
+  clio::run::RunContext& rctx = ctx;
 #else
   (void)ctx;
 #endif
@@ -294,7 +294,7 @@ chi::TaskResume Runtime::Monitor(ctp::ipc::FullPtr<MonitorTask> task,
 // ==============================================================================
 
 std::vector<CompressionStats> Runtime::EstCompressionStats(
-    const void* chunk, chi::u64 chunk_size, const Context& context) {
+    const void* chunk, clio::run::u64 chunk_size, const Context& context) {
   std::vector<CompressionStats> results;
 
   // Determine data type from context
@@ -304,7 +304,7 @@ std::vector<CompressionStats> Runtime::EstCompressionStats(
   size_t type_size = ctp::DataStatisticsFactory::GetTypeSize(data_type);
 
   // Calculate number of elements (sample up to 64KB for efficiency)
-  chi::u64 sample_bytes = std::min(chunk_size, static_cast<chi::u64>(65536));
+  clio::run::u64 sample_bytes = std::min(chunk_size, static_cast<clio::run::u64>(65536));
   size_t num_elements = sample_bytes / type_size;
   if (num_elements == 0) {
     num_elements = 1;
@@ -399,7 +399,7 @@ std::vector<CompressionStats> Runtime::EstCompressionStats(
   return results;
 }
 
-double Runtime::EstWorkflowCompressTime(chi::u64 chunk_size, double tier_bw,
+double Runtime::EstWorkflowCompressTime(clio::run::u64 chunk_size, double tier_bw,
                                         const CompressionStats& stats,
                                         const Context& context) {
   double compressed_size = chunk_size / stats.compression_ratio_;
@@ -419,7 +419,7 @@ double Runtime::EstWorkflowCompressTime(chi::u64 chunk_size, double tier_bw,
 }
 
 std::tuple<int, int, int, double, float> Runtime::BestCompressRatio(
-    const void* chunk, chi::u64 chunk_size, int container_id,
+    const void* chunk, clio::run::u64 chunk_size, int container_id,
     const std::vector<CompressionStats>& stats, const Context& context) {
   int best_tier = 0;
   int best_lib = 0;
@@ -469,7 +469,7 @@ std::tuple<int, int, int, double, float> Runtime::BestCompressRatio(
 }
 
 std::tuple<int, int, int, double, float> Runtime::BestCompressTime(
-    const void* chunk, chi::u64 chunk_size, int container_id,
+    const void* chunk, clio::run::u64 chunk_size, int container_id,
     const std::vector<CompressionStats>& stats, const Context& context) {
   int best_tier = 0;
   int best_lib = 0;
@@ -517,7 +517,7 @@ std::tuple<int, int, int, double, float> Runtime::BestCompressTime(
 }
 
 std::tuple<int, int, int, double, float> Runtime::BestCompressForNode(
-    const Context& context, const void* chunk, chi::u64 chunk_size,
+    const Context& context, const void* chunk, clio::run::u64 chunk_size,
     int container_id, const std::vector<CompressionStats>& stats) {
   // Choose strategy based on context objective
   if (context.max_performance_) {
@@ -533,11 +533,11 @@ std::tuple<int, int, int, double, float> Runtime::BestCompressForNode(
 // ==============================================================================
 
 // Static atomic trace key counter for generating unique trace IDs
-static std::atomic<chi::u64> g_trace_key_counter{1};
+static std::atomic<clio::run::u64> g_trace_key_counter{1};
 
 // Helper function to write trace log entry
 static void WriteTraceLog(const std::string& trace_folder,
-                          const std::string& log_name, chi::u32 container_id,
+                          const std::string& log_name, clio::run::u32 container_id,
                           const std::string& entry) {
   if (trace_folder.empty()) return;
 
@@ -554,11 +554,11 @@ static void WriteTraceLog(const std::string& trace_folder,
   }
 }
 
-chi::TaskResume Runtime::DynamicSchedule(
-    ctp::ipc::FullPtr<DynamicScheduleTask> task, chi::RunContext& ctx) {
+clio::run::TaskResume Runtime::DynamicSchedule(
+    ctp::ipc::FullPtr<DynamicScheduleTask> task, clio::run::RunContext& ctx) {
   try {
     // Extract task parameters (same as PutBlobTask)
-    chi::u64 chunk_size = task->size_;
+    clio::run::u64 chunk_size = task->size_;
     // Convert ShmPtr to raw pointer via FullPtr
     auto blob_fullptr =
         CLIO_IPC->ToFullPtr<char>(task->blob_data_.template Cast<char>());
@@ -629,7 +629,7 @@ chi::TaskResume Runtime::DynamicSchedule(
 
     // Now call Compress to perform compression and PutBlob
     auto compress_task = client_.AsyncCompress(
-        chi::PoolQuery::Local(), task->tag_id_, task->blob_name_.str(),
+        clio::run::PoolQuery::Local(), task->tag_id_, task->blob_name_.str(),
         task->offset_, task->size_, task->blob_data_, task->score_, context,
         task->flags_, task->core_pool_id_);
     compress_task.Wait();
@@ -647,11 +647,11 @@ chi::TaskResume Runtime::DynamicSchedule(
   CLIO_CO_RETURN;
 }
 
-chi::TaskResume Runtime::Compress(ctp::ipc::FullPtr<CompressTask> task,
-                                  chi::RunContext& ctx) {
+clio::run::TaskResume Runtime::Compress(ctp::ipc::FullPtr<CompressTask> task,
+                                  clio::run::RunContext& ctx) {
   try {
     // Extract task parameters (same as PutBlobTask)
-    chi::u64 input_size = task->size_;
+    clio::run::u64 input_size = task->size_;
     Context& context = task->context_;
 
     // Validate inputs
@@ -662,7 +662,7 @@ chi::TaskResume Runtime::Compress(ctp::ipc::FullPtr<CompressTask> task,
 
     // Initialize core client if needed (from compose next_pool_id or task param)
     if (!core_client_) {
-      chi::PoolId core_id = !config_.next_pool_id_.IsNull()
+      clio::run::PoolId core_id = !config_.next_pool_id_.IsNull()
           ? config_.next_pool_id_ : task->core_pool_id_;
       if (!core_id.IsNull()) {
         core_client_ = std::make_unique<clio::cte::core::Client>(core_id);
@@ -686,7 +686,7 @@ chi::TaskResume Runtime::Compress(ctp::ipc::FullPtr<CompressTask> task,
       auto put_task = core_client_->AsyncPutBlob(
           task->tag_id_, task->blob_name_.str(), task->offset_, task->size_,
           task->blob_data_, task->score_, context, task->flags_,
-          chi::PoolQuery::Local());
+          clio::run::PoolQuery::Local());
       put_task.Wait();
       task->context_ = put_task->context_;
       task->return_code_ = put_task->return_code_;
@@ -778,7 +778,7 @@ chi::TaskResume Runtime::Compress(ctp::ipc::FullPtr<CompressTask> task,
       auto put_task = core_client_->AsyncPutBlob(
           task->tag_id_, task->blob_name_.str(), task->offset_,
           total_stored_size, compressed_shm_ptr, task->score_, context,
-          task->flags_, chi::PoolQuery::Local());
+          task->flags_, clio::run::PoolQuery::Local());
       put_task.Wait();
 
       // Free compressed data buffer
@@ -807,7 +807,7 @@ chi::TaskResume Runtime::Compress(ctp::ipc::FullPtr<CompressTask> task,
       auto put_task = core_client_->AsyncPutBlob(
           task->tag_id_, task->blob_name_.str(), task->offset_, task->size_,
           task->blob_data_, task->score_, context, task->flags_,
-          chi::PoolQuery::Local());
+          clio::run::PoolQuery::Local());
       put_task.Wait();
 
       context.compress_lib_ = 0;  // Mark as uncompressed
@@ -823,8 +823,8 @@ chi::TaskResume Runtime::Compress(ctp::ipc::FullPtr<CompressTask> task,
   CLIO_CO_RETURN;
 }
 
-chi::TaskResume Runtime::Decompress(ctp::ipc::FullPtr<DecompressTask> task,
-                                    chi::RunContext& ctx) {
+clio::run::TaskResume Runtime::Decompress(ctp::ipc::FullPtr<DecompressTask> task,
+                                    clio::run::RunContext& ctx) {
   try {
     // Record the originating node (the consumer that issued this Decompress)
     // against this specific tag. pool_query_.ret_node_ was stamped by the
@@ -835,7 +835,7 @@ chi::TaskResume Runtime::Decompress(ctp::ipc::FullPtr<DecompressTask> task,
     RegisterConsumer(task->tag_id_, task->pool_query_.GetReturnNode());
 
     // Extract task parameters (same as GetBlobTask)
-    chi::u64 expected_size = task->size_;
+    clio::run::u64 expected_size = task->size_;
 
     // Validate output buffer
     if (task->blob_data_.IsNull()) {
@@ -845,7 +845,7 @@ chi::TaskResume Runtime::Decompress(ctp::ipc::FullPtr<DecompressTask> task,
 
     // Initialize core client if needed (from compose next_pool_id or task param)
     if (!core_client_) {
-      chi::PoolId core_id = !config_.next_pool_id_.IsNull()
+      clio::run::PoolId core_id = !config_.next_pool_id_.IsNull()
           ? config_.next_pool_id_ : task->core_pool_id_;
       if (!core_id.IsNull()) {
         core_client_ = std::make_unique<clio::cte::core::Client>(core_id);
@@ -865,7 +865,7 @@ chi::TaskResume Runtime::Decompress(ctp::ipc::FullPtr<DecompressTask> task,
     // Call GetBlob to retrieve the (potentially compressed) data
     auto get_task = core_client_->AsyncGetBlob(
         task->tag_id_, task->blob_name_.str(), task->offset_, expected_size,
-        task->flags_, temp_buffer_ptr, chi::PoolQuery::Local());
+        task->flags_, temp_buffer_ptr, clio::run::PoolQuery::Local());
     get_task.Wait();
 
     if (get_task->return_code_ != 0) {
@@ -882,7 +882,7 @@ chi::TaskResume Runtime::Decompress(ctp::ipc::FullPtr<DecompressTask> task,
       // Data is compressed - decompress it
       int compress_lib = static_cast<int>(header->compress_lib_);
       int compress_preset = static_cast<int>(header->compress_preset_);
-      chi::u64 original_size = header->original_size_;
+      clio::run::u64 original_size = header->original_size_;
 
       // Map the wire ID to a library name via the shared registry (single
       // source of truth; out-of-range falls back to "zstd"). Wire ID is a
@@ -998,7 +998,7 @@ void Runtime::LogCompressionTelemetry(const CompressionTelemetry& telemetry) {
   }
 }
 
-chi::u64 Runtime::GetWorkRemaining() const {
+clio::run::u64 Runtime::GetWorkRemaining() const {
   // Return 0 - compressor has no persistent work queue
   return 0;
 }
@@ -1008,7 +1008,7 @@ chi::u64 Runtime::GetWorkRemaining() const {
 // ==============================================================================
 
 void Runtime::RegisterConsumer(const clio::cte::core::TagId &tag_id,
-                               chi::u32 node_id) {
+                               clio::run::u32 node_id) {
   // Tracking knob: when off, no per-tag bookkeeping happens and
   // ScheduleTask falls through to DirectHash on the tag_id. Use this to
   // measure the overhead of the tracking mechanism itself, or for
@@ -1022,10 +1022,10 @@ void Runtime::RegisterConsumer(const clio::cte::core::TagId &tag_id,
   // duplicate registration through the writer path — which the writer
   // re-check absorbs.
   {
-    chi::ScopedCoRwReadLock read_lock(tag_consumers_lock_);
+    clio::run::ScopedCoRwReadLock read_lock(tag_consumers_lock_);
     auto it = tag_consumers_.find(tag_id);
     if (it != tag_consumers_.end()) {
-      for (chi::u32 existing : it->second) {
+      for (clio::run::u32 existing : it->second) {
         if (existing == node_id) {
           return;  // Already registered for this tag.
         }
@@ -1035,9 +1035,9 @@ void Runtime::RegisterConsumer(const clio::cte::core::TagId &tag_id,
 
   // Writer path: insert/grow under exclusive lock. Re-check first (another
   // writer may have raced us); cap at kMaxConsumersPerTag.
-  chi::ScopedCoRwWriteLock write_lock(tag_consumers_lock_);
+  clio::run::ScopedCoRwWriteLock write_lock(tag_consumers_lock_);
   auto &slots = tag_consumers_[tag_id];
-  for (chi::u32 existing : slots) {
+  for (clio::run::u32 existing : slots) {
     if (existing == node_id) {
       return;
     }
@@ -1055,11 +1055,11 @@ void Runtime::RegisterConsumer(const clio::cte::core::TagId &tag_id,
 }
 
 bool Runtime::PickConsumerForTag(const clio::cte::core::TagId &tag_id,
-                                 chi::u32 &node_id_out) {
+                                 clio::run::u32 &node_id_out) {
   if (!config_.tracking_enabled_) {
     return false;
   }
-  chi::ScopedCoRwReadLock read_lock(tag_consumers_lock_);
+  clio::run::ScopedCoRwReadLock read_lock(tag_consumers_lock_);
   auto it = tag_consumers_.find(tag_id);
   if (it == tag_consumers_.end() || it->second.empty()) {
     return false;
@@ -1077,12 +1077,12 @@ bool Runtime::PickConsumerForTag(const clio::cte::core::TagId &tag_id,
 // Node Load Sampling
 // ==============================================================================
 
-chi::TaskResume Runtime::PollNodeLoad(ctp::ipc::FullPtr<PollNodeLoadTask> task,
-                                      chi::RunContext& ctx) {
+clio::run::TaskResume Runtime::PollNodeLoad(ctp::ipc::FullPtr<PollNodeLoadTask> task,
+                                      clio::run::RunContext& ctx) {
   (void)ctx;
   NodeLoadSample sample;
   auto* ipc_manager = CLIO_IPC;
-  sample.node_id_ = ipc_manager ? static_cast<chi::u32>(ipc_manager->GetNodeId())
+  sample.node_id_ = ipc_manager ? static_cast<clio::run::u32>(ipc_manager->GetNodeId())
                                 : 0;
 
   // CPU utilization since the last sample. Mutex protects prev_cpu_times_
@@ -1099,13 +1099,13 @@ chi::TaskResume Runtime::PollNodeLoad(ctp::ipc::FullPtr<PollNodeLoadTask> task,
   auto* orchestrator = CLIO_WORK_ORCHESTRATOR;
   if (orchestrator) {
     std::size_t num_workers = orchestrator->GetWorkerCount();
-    sample.num_workers_ = static_cast<chi::u32>(num_workers);
+    sample.num_workers_ = static_cast<clio::run::u32>(num_workers);
     for (std::size_t i = 0; i < num_workers; ++i) {
-      chi::Worker* worker = orchestrator->GetWorker(static_cast<chi::u32>(i));
+      clio::run::Worker* worker = orchestrator->GetWorker(static_cast<clio::run::u32>(i));
       if (!worker) {
         continue;
       }
-      chi::WorkerStats stats = worker->GetWorkerStats();
+      clio::run::WorkerStats stats = worker->GetWorkerStats();
       sample.worker_load_us_ += stats.load_;
       sample.num_queued_tasks_ += stats.num_queued_tasks_;
       sample.num_blocked_tasks_ += stats.num_blocked_tasks_;
@@ -1117,8 +1117,8 @@ chi::TaskResume Runtime::PollNodeLoad(ctp::ipc::FullPtr<PollNodeLoadTask> task,
   CLIO_CO_RETURN;
 }
 
-chi::TaskResume Runtime::PollConsumers(ctp::ipc::FullPtr<PollConsumersTask> task,
-                                       chi::RunContext& ctx) {
+clio::run::TaskResume Runtime::PollConsumers(ctp::ipc::FullPtr<PollConsumersTask> task,
+                                       clio::run::RunContext& ctx) {
   (void)task;
   (void)ctx;
   // No-op when tracking is disabled.
@@ -1129,12 +1129,12 @@ chi::TaskResume Runtime::PollConsumers(ctp::ipc::FullPtr<PollConsumersTask> task
   // lock so the periodic poll does not hold the lock while issuing
   // remote tasks. We dedupe to a single PollNodeLoad per node — readers
   // may appear in multiple tags' lists.
-  std::vector<chi::u32> snapshot;
+  std::vector<clio::run::u32> snapshot;
   {
-    chi::ScopedCoRwReadLock read_lock(tag_consumers_lock_);
-    std::unordered_set<chi::u32> dedup;
+    clio::run::ScopedCoRwReadLock read_lock(tag_consumers_lock_);
+    std::unordered_set<clio::run::u32> dedup;
     for (const auto &kv : tag_consumers_) {
-      for (chi::u32 node : kv.second) {
+      for (clio::run::u32 node : kv.second) {
         if (dedup.insert(node).second) {
           snapshot.push_back(node);
         }
@@ -1147,11 +1147,11 @@ chi::TaskResume Runtime::PollConsumers(ctp::ipc::FullPtr<PollConsumersTask> task
   }
 
   // Fan out one PollNodeLoad task per consumer node, then await each.
-  std::vector<chi::Future<PollNodeLoadTask>> futures;
+  std::vector<clio::run::Future<PollNodeLoadTask>> futures;
   futures.reserve(snapshot.size());
-  for (chi::u32 node_id : snapshot) {
+  for (clio::run::u32 node_id : snapshot) {
     futures.emplace_back(
-        client_.AsyncPollNodeLoad(chi::PoolQuery::Physical(node_id)));
+        client_.AsyncPollNodeLoad(clio::run::PoolQuery::Physical(node_id)));
   }
 
   for (std::size_t i = 0; i < futures.size(); ++i) {

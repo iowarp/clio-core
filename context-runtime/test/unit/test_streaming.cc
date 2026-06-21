@@ -51,7 +51,7 @@ using namespace chi;
 using namespace std::chrono_literals;
 
 // Test pool ID for MOD_NAME
-constexpr chi::PoolId kTestModNamePoolId = chi::PoolId(200, 0);
+constexpr clio::run::PoolId kTestModNamePoolId = clio::run::PoolId(200, 0);
 
 // Global flag to track runtime initialization
 static bool g_initialized = false;
@@ -63,10 +63,10 @@ class StreamingTestFixture {
 public:
   StreamingTestFixture() {
     if (!g_initialized) {
-      bool success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
+      bool success = clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true);
       if (success) {
         g_initialized = true;
-        SimpleTest::g_test_finalize = chi::CHIMAERA_FINALIZE;
+        SimpleTest::g_test_finalize = clio::run::CHIMAERA_FINALIZE;
         std::this_thread::sleep_for(500ms);
       }
     }
@@ -81,7 +81,7 @@ TEST_CASE("Task Streaming - Small Output", "[streaming][small]") {
   clio::run::MOD_NAME::Client client(kTestModNamePoolId);
 
   // Create the MOD_NAME container
-  chi::PoolQuery pool_query = chi::PoolQuery::Dynamic();
+  clio::run::PoolQuery pool_query = clio::run::PoolQuery::Dynamic();
   std::string pool_name = "streaming_test_small";
   auto create_task = client.AsyncCreate(pool_query, pool_name, kTestModNamePoolId);
   create_task.Wait();
@@ -107,7 +107,7 @@ TEST_CASE("Task Streaming - Large Output (1MB)", "[streaming][large]") {
   clio::run::MOD_NAME::Client client(kTestModNamePoolId);
 
   // Create the MOD_NAME container
-  chi::PoolQuery pool_query = chi::PoolQuery::Dynamic();
+  clio::run::PoolQuery pool_query = clio::run::PoolQuery::Dynamic();
   std::string pool_name = "streaming_test_large";
   auto create_task = client.AsyncCreate(pool_query, pool_name, kTestModNamePoolId);
   create_task.Wait();
@@ -158,7 +158,7 @@ TEST_CASE("FutureShm Bitfield Operations", "[streaming][bitfield]") {
   clio::run::MOD_NAME::Client client(kTestModNamePoolId);
 
   // Create the MOD_NAME container
-  chi::PoolQuery pool_query = chi::PoolQuery::Dynamic();
+  clio::run::PoolQuery pool_query = clio::run::PoolQuery::Dynamic();
   std::string pool_name = "streaming_test_bitfield";
   auto create_task = client.AsyncCreate(pool_query, pool_name, kTestModNamePoolId);
   create_task.Wait();
@@ -181,7 +181,7 @@ TEST_CASE("FutureShm Bitfield Operations", "[streaming][bitfield]") {
 
   // After completion, FUTURE_COMPLETE should be set
   INFO("Testing FUTURE_COMPLETE flag after Wait()");
-  using FutureShm = chi::FutureShm;
+  using FutureShm = clio::run::FutureShm;
   REQUIRE(future_shm->flags_.Any(FutureShm::FUTURE_COMPLETE));
 
   // Test manual flag operations on a separate bitfield
@@ -216,7 +216,7 @@ TEST_CASE("Runtime Heap Leak Check", "[streaming][leak]") {
   REQUIRE(g_initialized);
 
   clio::run::MOD_NAME::Client client(kTestModNamePoolId);
-  chi::PoolQuery pool_query = chi::PoolQuery::Dynamic();
+  clio::run::PoolQuery pool_query = clio::run::PoolQuery::Dynamic();
   std::string pool_name = "streaming_test_leak";
   auto create_task =
       client.AsyncCreate(pool_query, pool_name, kTestModNamePoolId);

@@ -70,16 +70,16 @@ enum AdminQueueIndex {
  * Critical ChiMod responsible for managing ChiPools and runtime lifecycle.
  * Must always be found by the runtime or a fatal error occurs.
  */
-class Runtime : public chi::Container {
+class Runtime : public clio::run::Container {
 public:
   // CreateParams type used by CLIO_TASK_CC macro for lib_name access
   using CreateParams = clio::run::admin::CreateParams;
 
 private:
   // Container-specific state
-  chi::u32 create_count_ = 0;
-  chi::u32 pools_created_ = 0;
-  chi::u32 pools_destroyed_ = 0;
+  clio::run::u32 create_count_ = 0;
+  clio::run::u32 pools_created_ = 0;
+  clio::run::u32 pools_destroyed_ = 0;
 
   // Runtime state
   bool is_shutdown_requested_ = false;
@@ -107,19 +107,19 @@ public:
   /**
    * Initialize container with pool information
    */
-  void Init(const chi::PoolId &pool_id, const std::string &pool_name,
-            chi::u32 container_id = 0) override;
+  void Init(const clio::run::PoolId &pool_id, const std::string &pool_name,
+            clio::run::u32 container_id = 0) override;
 
   /**
    * Schedule a task by resolving Dynamic pool queries.
    */
-  chi::PoolQuery ScheduleTask(const ctp::ipc::FullPtr<chi::Task> &task) override;
+  clio::run::PoolQuery ScheduleTask(const ctp::ipc::FullPtr<clio::run::Task> &task) override;
 
   /**
    * Execute a method on a task
    */
-  chi::TaskResume Run(chi::u32 method, ctp::ipc::FullPtr<chi::Task> task_ptr,
-                      chi::RunContext &rctx) override;
+  clio::run::TaskResume Run(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> task_ptr,
+                      clio::run::RunContext &rctx) override;
 
   //===========================================================================
   // Method implementations
@@ -129,40 +129,40 @@ public:
    * Handle Create task - Initialize the Admin container (IS_ADMIN=true)
    * Returns TaskResume for consistency with other methods called from Run
    */
-  chi::TaskResume Create(ctp::ipc::FullPtr<CreateTask> task, chi::RunContext &rctx);
+  clio::run::TaskResume Create(ctp::ipc::FullPtr<CreateTask> task, clio::run::RunContext &rctx);
 
   /**
    * Handle GetOrCreatePool task - Pool get-or-create operation (IS_ADMIN=false)
    * This is a coroutine that can co_await nested Create methods
    */
-  chi::TaskResume GetOrCreatePool(
+  clio::run::TaskResume GetOrCreatePool(
       ctp::ipc::FullPtr<
           clio::run::admin::GetOrCreatePoolTask<clio::run::admin::CreateParams>>
           task,
-      chi::RunContext &rctx);
+      clio::run::RunContext &rctx);
 
   /**
    * Handle Destroy task - Alias for DestroyPool (DestroyTask = DestroyPoolTask)
    * This is a coroutine for consistency with GetOrCreatePool
    */
-  chi::TaskResume Destroy(ctp::ipc::FullPtr<DestroyTask> task, chi::RunContext &rctx);
+  clio::run::TaskResume Destroy(ctp::ipc::FullPtr<DestroyTask> task, clio::run::RunContext &rctx);
 
   /**
    * Handle DestroyPool task - Destroy an existing ChiPool
    * This is a coroutine that can co_await pool destruction
    */
-  chi::TaskResume DestroyPool(ctp::ipc::FullPtr<DestroyPoolTask> task, chi::RunContext &rctx);
+  clio::run::TaskResume DestroyPool(ctp::ipc::FullPtr<DestroyPoolTask> task, clio::run::RunContext &rctx);
 
   /**
    * Handle StopRuntime task - Stop the entire runtime
    * Returns TaskResume for consistency with other methods called from Run
    */
-  chi::TaskResume StopRuntime(ctp::ipc::FullPtr<StopRuntimeTask> task, chi::RunContext &rctx);
+  clio::run::TaskResume StopRuntime(ctp::ipc::FullPtr<StopRuntimeTask> task, clio::run::RunContext &rctx);
 
   /**
    * Handle Flush task - Flush administrative operations
    */
-  chi::TaskResume Flush(ctp::ipc::FullPtr<FlushTask> task, chi::RunContext &rctx);
+  clio::run::TaskResume Flush(ctp::ipc::FullPtr<FlushTask> task, clio::run::RunContext &rctx);
 
   //===========================================================================
   // Distributed Task Scheduling Methods
@@ -172,38 +172,38 @@ public:
    * Handle Send - Send task inputs or outputs over network
    * Returns TaskResume for consistency with other methods called from Run
    */
-  chi::TaskResume Send(ctp::ipc::FullPtr<SendTask> task, chi::RunContext &rctx);
+  clio::run::TaskResume Send(ctp::ipc::FullPtr<SendTask> task, clio::run::RunContext &rctx);
 
   /**
    * Handle Recv - Receive task inputs or outputs from network
    * Returns TaskResume for consistency with other methods called from Run
    */
-  chi::TaskResume Recv(ctp::ipc::FullPtr<RecvTask> task, chi::RunContext &rctx);
+  clio::run::TaskResume Recv(ctp::ipc::FullPtr<RecvTask> task, clio::run::RunContext &rctx);
 
   /**
    * Handle ClientConnect - Respond to client connection request
    * Sets response to 0 to indicate runtime is healthy
    */
-  chi::TaskResume ClientConnect(ctp::ipc::FullPtr<ClientConnectTask> task, chi::RunContext &rctx);
+  clio::run::TaskResume ClientConnect(ctp::ipc::FullPtr<ClientConnectTask> task, clio::run::RunContext &rctx);
 
   /**
    * Handle ClientRecv - Receive tasks from ZMQ clients (TCP/IPC)
    * Polls ZMQ ROUTER sockets for incoming task submissions
    */
-  chi::TaskResume ClientRecv(ctp::ipc::FullPtr<ClientRecvTask> task, chi::RunContext &rctx);
+  clio::run::TaskResume ClientRecv(ctp::ipc::FullPtr<ClientRecvTask> task, clio::run::RunContext &rctx);
 
   /**
    * Handle ClientSend - Send completed task outputs to ZMQ clients
    * Polls net_queue_ kClientSendTcp/kClientSendIpc priorities
    */
-  chi::TaskResume ClientSend(ctp::ipc::FullPtr<ClientSendTask> task, chi::RunContext &rctx);
+  clio::run::TaskResume ClientSend(ctp::ipc::FullPtr<ClientSendTask> task, clio::run::RunContext &rctx);
 
   /**
    * Handle WreapDeadIpcs - Periodic task to reap shared memory from dead processes
    * Calls IpcManager::WreapDeadIpcs() to clean up orphaned shared memory segments
    * Returns TaskResume for consistency with other methods called from Run
    */
-  chi::TaskResume WreapDeadIpcs(ctp::ipc::FullPtr<WreapDeadIpcsTask> task, chi::RunContext &rctx);
+  clio::run::TaskResume WreapDeadIpcs(ctp::ipc::FullPtr<WreapDeadIpcsTask> task, clio::run::RunContext &rctx);
 
   /**
    * Handle Monitor - Unified monitor query for admin chimod
@@ -213,7 +213,7 @@ public:
    *   "system_stats[:<min_event_id>]" - system resource utilization
    *   "bdev_stats" - block device statistics
    */
-  chi::TaskResume Monitor(ctp::ipc::FullPtr<MonitorTask> task, chi::RunContext &rctx);
+  clio::run::TaskResume Monitor(ctp::ipc::FullPtr<MonitorTask> task, clio::run::RunContext &rctx);
 
   /** Monitor sub-handler: collect per-worker statistics. */
   void MonitorWorkerStats(ctp::ipc::FullPtr<MonitorTask> task);
@@ -222,13 +222,13 @@ public:
   void MonitorContainerStats(ctp::ipc::FullPtr<MonitorTask> task);
 
   /** Monitor sub-handler: delegate query to a specific pool. */
-  chi::TaskResume MonitorPoolStats(ctp::ipc::FullPtr<MonitorTask> task);
+  clio::run::TaskResume MonitorPoolStats(ctp::ipc::FullPtr<MonitorTask> task);
 
   /** Monitor sub-handler: return system_stats ring buffer entries. */
   void MonitorSystemStats(ctp::ipc::FullPtr<MonitorTask> task);
 
   /** Monitor sub-handler: collect bdev pool statistics. */
-  chi::TaskResume MonitorBdevStats(ctp::ipc::FullPtr<MonitorTask> task);
+  clio::run::TaskResume MonitorBdevStats(ctp::ipc::FullPtr<MonitorTask> task);
 
   /** Monitor sub-handler: return host info (hostname, IP, node_id). */
   void MonitorGetHostInfo(ctp::ipc::FullPtr<MonitorTask> task);
@@ -237,15 +237,15 @@ public:
    * Handle AnnounceShutdown - Mark a departing node as dead immediately
    * and trigger recovery if this node is the new leader.
    */
-  chi::TaskResume AnnounceShutdown(ctp::ipc::FullPtr<AnnounceShutdownTask> task,
-                                    chi::RunContext &rctx);
+  clio::run::TaskResume AnnounceShutdown(ctp::ipc::FullPtr<AnnounceShutdownTask> task,
+                                    clio::run::RunContext &rctx);
 
   /**
    * Handle RegisterMemory - Register client shared memory with runtime
    * Called by SHM-mode clients after IncreaseMemory() to tell the runtime
    * to attach to the new shared memory segment
    */
-  chi::TaskResume RegisterMemory(ctp::ipc::FullPtr<RegisterMemoryTask> task, chi::RunContext &rctx);
+  clio::run::TaskResume RegisterMemory(ctp::ipc::FullPtr<RegisterMemoryTask> task, clio::run::RunContext &rctx);
 
   /**
    * Handle RestartContainers - Re-create pools from the restart registry.
@@ -253,19 +253,19 @@ public:
    * persistent registry replayed at startup, and re-composes each registered
    * compose file.
    */
-  chi::TaskResume RestartContainers(ctp::ipc::FullPtr<RestartContainersTask> task, chi::RunContext &rctx);
+  clio::run::TaskResume RestartContainers(ctp::ipc::FullPtr<RestartContainersTask> task, clio::run::RunContext &rctx);
 
   /**
    * Handle ListContainers - Enumerate active pools/containers in this daemon.
    * Fills the task's pool_names_ / pool_ids_ output vectors.
    */
-  chi::TaskResume ListContainers(ctp::ipc::FullPtr<ListContainersTask> task, chi::RunContext &rctx);
+  clio::run::TaskResume ListContainers(ctp::ipc::FullPtr<ListContainersTask> task, clio::run::RunContext &rctx);
 
   /**
    * Handle AddNode - Register a new node with this runtime
    * Updates IpcManager's hostfile and calls Expand on all containers
    */
-  chi::TaskResume AddNode(ctp::ipc::FullPtr<AddNodeTask> task, chi::RunContext &rctx);
+  clio::run::TaskResume AddNode(ctp::ipc::FullPtr<AddNodeTask> task, clio::run::RunContext &rctx);
 
   /**
    * Handle SubmitBatch - Submit a batch of tasks in a single RPC
@@ -274,67 +274,67 @@ public:
    * @param task The SubmitBatchTask containing serialized tasks
    * @param rctx Runtime context for the current worker
    */
-  chi::TaskResume SubmitBatch(ctp::ipc::FullPtr<SubmitBatchTask> task, chi::RunContext &rctx);
+  clio::run::TaskResume SubmitBatch(ctp::ipc::FullPtr<SubmitBatchTask> task, clio::run::RunContext &rctx);
 
   /**
    * Handle ChangeAddressTable - Update ContainerId->NodeId mapping
    * Writes WAL entry and updates pool manager's address table
    */
-  chi::TaskResume ChangeAddressTable(ctp::ipc::FullPtr<ChangeAddressTableTask> task, chi::RunContext &rctx);
+  clio::run::TaskResume ChangeAddressTable(ctp::ipc::FullPtr<ChangeAddressTableTask> task, clio::run::RunContext &rctx);
 
   /**
    * Handle MigrateContainers - Orchestrate container migration
    * Processes each MigrateInfo entry and broadcasts address table changes
    */
-  chi::TaskResume MigrateContainers(ctp::ipc::FullPtr<MigrateContainersTask> task, chi::RunContext &rctx);
+  clio::run::TaskResume MigrateContainers(ctp::ipc::FullPtr<MigrateContainersTask> task, clio::run::RunContext &rctx);
 
   /**
    * Handle Heartbeat - Liveness probe, just returns success
    */
-  chi::TaskResume Heartbeat(ctp::ipc::FullPtr<HeartbeatTask> task, chi::RunContext &rctx);
+  clio::run::TaskResume Heartbeat(ctp::ipc::FullPtr<HeartbeatTask> task, clio::run::RunContext &rctx);
 
   /**
    * Handle HeartbeatProbe - Periodic SWIM failure detector
    * Sends direct probes, escalates to indirect probes, manages suspicion
    */
-  chi::TaskResume HeartbeatProbe(ctp::ipc::FullPtr<HeartbeatProbeTask> task, chi::RunContext &rctx);
+  clio::run::TaskResume HeartbeatProbe(ctp::ipc::FullPtr<HeartbeatProbeTask> task, clio::run::RunContext &rctx);
 
   /**
    * Handle ProbeRequest - Indirect probe on behalf of another node
    * Probes target node and returns result to requester
    */
-  chi::TaskResume ProbeRequest(ctp::ipc::FullPtr<ProbeRequestTask> task, chi::RunContext &rctx);
+  clio::run::TaskResume ProbeRequest(ctp::ipc::FullPtr<ProbeRequestTask> task, clio::run::RunContext &rctx);
 
   /**
    * Handle RecoverContainers - Recreate containers from dead nodes
    * All nodes update address_map_, only dest node creates the container
    */
-  chi::TaskResume RecoverContainers(ctp::ipc::FullPtr<RecoverContainersTask> task, chi::RunContext &rctx);
+  clio::run::TaskResume RecoverContainers(ctp::ipc::FullPtr<RecoverContainersTask> task, clio::run::RunContext &rctx);
 
   /**
    * Handle SystemMonitor - Periodic system resource utilization sampling
    * Samples DRAM, CPU, and (optionally) GPU/HBM utilization into ring buffer
    */
-  chi::TaskResume SystemMonitor(ctp::ipc::FullPtr<SystemMonitorTask> task, chi::RunContext &rctx);
+  clio::run::TaskResume SystemMonitor(ctp::ipc::FullPtr<SystemMonitorTask> task, clio::run::RunContext &rctx);
 
   /**
    * Handle RegisterGpuContainer - Register a GPU container with the GPU orchestrator
    * The GPU orchestrator's gpu::PoolManager will be updated with the new container
    */
-  chi::TaskResume RegisterGpuContainer(ctp::ipc::FullPtr<RegisterGpuContainerTask> task, chi::RunContext &rctx);
+  clio::run::TaskResume RegisterGpuContainer(ctp::ipc::FullPtr<RegisterGpuContainerTask> task, clio::run::RunContext &rctx);
 
   /**
    * Get live task statistics for this task instance.
    * For network periodics, compute_ = total queue depth across priorities;
    * io_size_ is a static stand-in (admin periodics don't have a payload).
    */
-  chi::TaskStat GetTaskStats(const chi::Task *task) const override;
+  clio::run::TaskStat GetTaskStats(const clio::run::Task *task) const override;
 
   /**
    * Get remaining work count for this admin container
    * Admin container typically has no pending work, returns 0
    */
-  chi::u64 GetWorkRemaining() const override;
+  clio::run::u64 GetWorkRemaining() const override;
 
   //===========================================================================
   // Task Serialization Methods
@@ -343,67 +343,67 @@ public:
   /**
    * Serialize task parameters (IN or OUT based on archive mode)
    */
-  void SaveTask(chi::u32 method, chi::SaveTaskArchive &archive,
-                ctp::ipc::FullPtr<chi::Task> task_ptr) override;
+  void SaveTask(clio::run::u32 method, clio::run::SaveTaskArchive &archive,
+                ctp::ipc::FullPtr<clio::run::Task> task_ptr) override;
 
   /**
    * Deserialize task parameters into an existing task (IN or OUT based on archive mode)
    */
-  void LoadTask(chi::u32 method, chi::LoadTaskArchive &archive,
-                ctp::ipc::FullPtr<chi::Task> task_ptr) override;
+  void LoadTask(clio::run::u32 method, clio::run::LoadTaskArchive &archive,
+                ctp::ipc::FullPtr<clio::run::Task> task_ptr) override;
 
   /**
    * Allocate and deserialize task parameters from network transfer
    */
-  ctp::ipc::FullPtr<chi::Task> AllocLoadTask(chi::u32 method, chi::LoadTaskArchive &archive) override;
+  ctp::ipc::FullPtr<clio::run::Task> AllocLoadTask(clio::run::u32 method, clio::run::LoadTaskArchive &archive) override;
 
   /**
    * Deserialize task input parameters into an existing task using LocalSerialize
    */
-  void LocalLoadTask(chi::u32 method, chi::DefaultLoadArchive &archive,
-                     ctp::ipc::FullPtr<chi::Task> task_ptr) override;
+  void LocalLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive &archive,
+                     ctp::ipc::FullPtr<clio::run::Task> task_ptr) override;
 
   /**
    * Allocate and deserialize task input parameters using LocalSerialize
    */
-  ctp::ipc::FullPtr<chi::Task> LocalAllocLoadTask(chi::u32 method, chi::DefaultLoadArchive &archive) override;
+  ctp::ipc::FullPtr<clio::run::Task> LocalAllocLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive &archive) override;
 
   /**
    * Serialize task output parameters using LocalSerialize (for local transfers)
    */
-  void LocalSaveTask(chi::u32 method, chi::DefaultSaveArchive &archive,
-                     ctp::ipc::FullPtr<chi::Task> task_ptr) override;
+  void LocalSaveTask(clio::run::u32 method, clio::run::DefaultSaveArchive &archive,
+                     ctp::ipc::FullPtr<clio::run::Task> task_ptr) override;
 
   /**
    * Create a new copy of a task (deep copy for distributed execution)
    */
-  ctp::ipc::FullPtr<chi::Task> NewCopyTask(chi::u32 method, ctp::ipc::FullPtr<chi::Task> orig_task_ptr,
+  ctp::ipc::FullPtr<clio::run::Task> NewCopyTask(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> orig_task_ptr,
                                         bool deep) override;
 
   /**
    * Create a new task of the specified method type
    */
-  ctp::ipc::FullPtr<chi::Task> NewTask(chi::u32 method) override;
-  void AggregateOut(chi::u32 method, ctp::ipc::FullPtr<chi::Task> orig_task,
-                 const ctp::ipc::FullPtr<chi::Task>& replica_task) override;
-  void DelTask(chi::u32 method, ctp::ipc::FullPtr<chi::Task> task_ptr) override;
+  ctp::ipc::FullPtr<clio::run::Task> NewTask(clio::run::u32 method) override;
+  void AggregateOut(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> orig_task,
+                 const ctp::ipc::FullPtr<clio::run::Task>& replica_task) override;
+  void DelTask(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> task_ptr) override;
 
 private:
   /**
    * Initiate runtime shutdown sequence
    */
-  void InitiateShutdown(chi::u32 grace_period_ms);
+  void InitiateShutdown(clio::run::u32 grace_period_ms);
 
   // SWIM failure detection state
   struct PendingProbe {
-    chi::Future<HeartbeatTask> future;
-    chi::u64 target_node_id;
+    clio::run::Future<HeartbeatTask> future;
+    clio::run::u64 target_node_id;
     std::chrono::steady_clock::time_point sent_at;
   };
   struct PendingIndirectProbe {
-    chi::Future<ProbeRequestTask> future;
-    chi::u64 target_node_id;   // suspected node
-    chi::u64 helper_node_id;   // node doing the probe
+    clio::run::Future<ProbeRequestTask> future;
+    clio::run::u64 target_node_id;   // suspected node
+    clio::run::u64 helper_node_id;   // node doing the probe
     std::chrono::steady_clock::time_point sent_at;
   };
 
@@ -421,16 +421,16 @@ private:
   // probe matches what the rest of the codebase already assumes,
   // and gives the workload's burst phase room to drain.
   // SWIM probe / suspicion timeouts moved to ConfigManager so they can
-  // be tuned from the deployment yaml (see chi::ConfigManager::
+  // be tuned from the deployment yaml (see clio::run::ConfigManager::
   // GetSwimDirectProbeTimeoutSec, GetSwimIndirectProbeTimeoutSec,
   // GetSwimSuspicionTimeoutSec, GetSwimEnabled). Defaults there match
   // the prior values (30s / 15s / 60s).
   static constexpr size_t kIndirectProbeHelpers = 3;
 
   // Recovery state
-  std::vector<chi::RecoveryAssignment> ComputeRecoveryPlan(chi::u64 dead_node_id);
-  chi::TaskResume TriggerRecovery(chi::u64 dead_node_id);
-  std::unordered_set<chi::u64> recovery_initiated_;
+  std::vector<clio::run::RecoveryAssignment> ComputeRecoveryPlan(clio::run::u64 dead_node_id);
+  clio::run::TaskResume TriggerRecovery(clio::run::u64 dead_node_id);
+  std::unordered_set<clio::run::u64> recovery_initiated_;
 };
 
 } // namespace clio::run::admin

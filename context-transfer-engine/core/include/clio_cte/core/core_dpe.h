@@ -46,7 +46,7 @@ namespace clio::cte::core {
 /**
  * Data Placement Engine types
  */
-enum class DpeType : chi::u32 {
+enum class DpeType : clio::run::u32 {
   kRandom = 0,    // Random placement
   kRoundRobin = 1, // Round-robin placement
   kMaxBW = 2      // Max bandwidth placement
@@ -78,7 +78,7 @@ public:
    */
   virtual std::vector<TargetInfo> SelectTargets(const std::vector<TargetInfo>& targets, 
                                                float blob_score, 
-                                               chi::u64 data_size) = 0;
+                                               clio::run::u64 data_size) = 0;
   
   /**
    * Get the DPE type
@@ -95,7 +95,7 @@ public:
   
   std::vector<TargetInfo> SelectTargets(const std::vector<TargetInfo>& targets, 
                                        float blob_score, 
-                                       chi::u64 data_size) override;
+                                       clio::run::u64 data_size) override;
   
   DpeType GetType() const override { return DpeType::kRandom; }
 
@@ -112,12 +112,12 @@ public:
   
   std::vector<TargetInfo> SelectTargets(const std::vector<TargetInfo>& targets, 
                                        float blob_score, 
-                                       chi::u64 data_size) override;
+                                       clio::run::u64 data_size) override;
   
   DpeType GetType() const override { return DpeType::kRoundRobin; }
 
 private:
-  static std::atomic<chi::u32> round_robin_counter_;
+  static std::atomic<clio::run::u32> round_robin_counter_;
 };
 
 /**
@@ -129,12 +129,12 @@ public:
   
   std::vector<TargetInfo> SelectTargets(const std::vector<TargetInfo>& targets, 
                                        float blob_score, 
-                                       chi::u64 data_size) override;
+                                       clio::run::u64 data_size) override;
   
   DpeType GetType() const override { return DpeType::kMaxBW; }
 
 private:
-  static constexpr chi::u64 kLatencyThreshold = 32 * 1024; // 32KB threshold
+  static constexpr clio::run::u64 kLatencyThreshold = 32 * 1024; // 32KB threshold
 };
 
 /**

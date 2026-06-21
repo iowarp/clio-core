@@ -59,7 +59,7 @@
 
 using namespace chi;
 
-// The runtime server runs out-of-process via chi::test::RuntimeServer
+// The runtime server runs out-of-process via clio::run::test::RuntimeServer
 // (clio_run start). The previous fork()+execl("/proc/self/exe", "--server-mode")
 // approach was Linux-only: macOS has no /proc/self/exe, so execl failed and the
 // server never started. clio_run is portable. The client-death test still
@@ -73,7 +73,7 @@ void TestServerRestart(const std::string &mode) {
   setenv("CLIO_CLIENT_RETRY_TIMEOUT", "30", 1);
 
   // 1. Start first server, wait for ready
-  chi::test::RuntimeServer server1;
+  clio::run::test::RuntimeServer server1;
   REQUIRE(server1.Start());
   REQUIRE(server1.WaitForReady());
 
@@ -87,11 +87,11 @@ void TestServerRestart(const std::string &mode) {
 
   // 3. Baseline task: submit + complete a bdev Create
   {
-    chi::PoolId pool_id1(8000, 0);
+    clio::run::PoolId pool_id1(8000, 0);
     clio::run::bdev::Client client1(pool_id1);
     std::string pool_name1 = "retry_baseline_" + mode;
     auto task = client1.AsyncCreate(
-        chi::PoolQuery::Dynamic(), pool_name1, pool_id1,
+        clio::run::PoolQuery::Dynamic(), pool_name1, pool_id1,
         clio::run::bdev::BdevType::kRam, 4 * 1024 * 1024);
     task.Wait();
     REQUIRE(task->return_code_ == 0);
@@ -104,7 +104,7 @@ void TestServerRestart(const std::string &mode) {
   INFO("Server stopped and resources cleaned");
 
   // 6. Start a new server, wait for ready
-  chi::test::RuntimeServer server2;
+  clio::run::test::RuntimeServer server2;
   REQUIRE(server2.Start());
   REQUIRE(server2.WaitForReady(40000));  // More time for restart scenario
   INFO("New server started");
@@ -116,11 +116,11 @@ void TestServerRestart(const std::string &mode) {
 
   // 8. Submit a second task with different pool name/ID
   {
-    chi::PoolId pool_id2(8001, 0);
+    clio::run::PoolId pool_id2(8001, 0);
     clio::run::bdev::Client client2(pool_id2);
     std::string pool_name2 = "retry_after_restart_" + mode;
     auto task = client2.AsyncCreate(
-        chi::PoolQuery::Dynamic(), pool_name2, pool_id2,
+        clio::run::PoolQuery::Dynamic(), pool_name2, pool_id2,
         clio::run::bdev::BdevType::kRam, 4 * 1024 * 1024);
     task.Wait();
     REQUIRE(task->return_code_ == 0);
@@ -137,7 +137,7 @@ void TestClientDeath(const std::string &mode) {
   setenv("CLIO_CLIENT_RETRY_TIMEOUT", "30", 1);
 
   // 1. Start server, wait for ready
-  chi::test::RuntimeServer server;
+  clio::run::test::RuntimeServer server;
   REQUIRE(server.Start());
   REQUIRE(server.WaitForReady());
 
@@ -153,11 +153,11 @@ void TestClientDeath(const std::string &mode) {
     }
 
     // Submit a task (no Wait) — response goes to dead process
-    chi::PoolId pool_id(8100, 0);
+    clio::run::PoolId pool_id(8100, 0);
     clio::run::bdev::Client client(pool_id);
     std::string pool_name = "client_death_child_" + mode;
     client.AsyncCreate(
-        chi::PoolQuery::Dynamic(), pool_name, pool_id,
+        clio::run::PoolQuery::Dynamic(), pool_name, pool_id,
         clio::run::bdev::BdevType::kRam, 4 * 1024 * 1024);
 
     // Exit immediately — response will arrive at dead process
@@ -186,11 +186,11 @@ void TestClientDeath(const std::string &mode) {
 
   // 5. Submit + complete parent's own task
   {
-    chi::PoolId pool_id(8101, 0);
+    clio::run::PoolId pool_id(8101, 0);
     clio::run::bdev::Client client(pool_id);
     std::string pool_name = "client_death_parent_" + mode;
     auto task = client.AsyncCreate(
-        chi::PoolQuery::Dynamic(), pool_name, pool_id,
+        clio::run::PoolQuery::Dynamic(), pool_name, pool_id,
         clio::run::bdev::BdevType::kRam, 4 * 1024 * 1024);
     task.Wait();
     REQUIRE(task->return_code_ == 0);
@@ -238,13 +238,13 @@ TEST_CASE("ClientRetry - Client Death SHM", "[client_retry][shm]") {
 
 int main(int argc, char* argv[]) {
   // The runtime server is now launched out-of-process via clio_run
-  // (chi::test::RuntimeServer), so this binary no longer re-execs itself in a
+  // (clio::run::test::RuntimeServer), so this binary no longer re-execs itself in a
   // "--server-mode"; it only runs tests.
   std::string filter = "";
   if (argc > 1) {
     filter = argv[1];
   }
   int rc = SimpleTest::run_all_tests(filter);
-  chi::CHIMAERA_FINALIZE();
+  clio::run::CHIMAERA_FINALIZE();
   return rc;
 }

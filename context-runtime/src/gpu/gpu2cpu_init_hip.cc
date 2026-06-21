@@ -9,7 +9,7 @@
  * Slim CUDA / ROCm gpu2cpu init.
  *
  * Producer-only design: per detected GPU, allocate one pinned-host backend
- * holding a chi::GpuTaskQueue. The CPU GPU worker polls each queue;
+ * holding a clio::run::GpuTaskQueue. The CPU GPU worker polls each queue;
  * kernels push admin-registered task allocations onto them via
  * IpcGpu2Cpu::ClientSend. There is no longer a per-device "copy_backend"
  * — clients allocate their own task and data backends on the host and
@@ -93,8 +93,8 @@ bool gpu::IpcManager::ServerInitGpuQueues(u32 queue_depth) {
       proxy.data_capacity_ = kQueueBackendBytes;
       CLIO_QUEUE_ALLOC_T *alloc = proxy.MakeAlloc<CLIO_QUEUE_ALLOC_T>();
       if (alloc) {
-        ctp::ipc::FullPtr<chi::GpuTaskQueue> queue =
-            alloc->NewObj<chi::GpuTaskQueue>(
+        ctp::ipc::FullPtr<clio::run::GpuTaskQueue> queue =
+            alloc->NewObj<clio::run::GpuTaskQueue>(
                 alloc, /*num_lanes=*/1u, /*num_prio=*/2u, queue_depth);
         if (!queue.IsNull()) {
           queue_off = queue.shm_.off_.load();
@@ -109,7 +109,7 @@ bool gpu::IpcManager::ServerInitGpuQueues(u32 queue_depth) {
     }
     dev.gpu2cpu_queue.shm_.off_ = queue_off;
     dev.gpu2cpu_queue.shm_.alloc_id_ = ctp::ipc::AllocatorId{0, 0};
-    dev.gpu2cpu_queue.ptr_ = reinterpret_cast<chi::GpuTaskQueue *>(
+    dev.gpu2cpu_queue.ptr_ = reinterpret_cast<clio::run::GpuTaskQueue *>(
         dev.queue_backend + queue_off);
 
     HLOG(kInfo, "ServerInitGpuQueues: gpu_id={} queue at {} ({}MB)",
@@ -129,7 +129,7 @@ void gpu::IpcManager::FinalizeGpuQueues() {
       ctp::GpuApi::FreeHost(dev.queue_backend);
       dev.queue_backend = nullptr;
     }
-    dev.gpu2cpu_queue = ctp::ipc::FullPtr<chi::GpuTaskQueue>::GetNull();
+    dev.gpu2cpu_queue = ctp::ipc::FullPtr<clio::run::GpuTaskQueue>::GetNull();
     dev.client_backends.clear();
   }
   per_gpu_devices_.clear();
@@ -156,7 +156,7 @@ void gpu::IpcManager::UnregisterClientBackend(
 // available without linking libchimaera_cxx_gpu (used by ToFullPtr).
 
 CLIO_RUN_GPU_API bool ChiServerBootstrapHipGpu(IpcManager *self,
-                                               chi::u32 queue_depth,
+                                               clio::run::u32 queue_depth,
                                                std::size_t backend_bytes) {
   (void)backend_bytes;  // No host-managed copy_backend in producer-only model.
   if (!self) return false;

@@ -69,8 +69,8 @@ constexpr double kDefaultRamCapacityFraction = 0.80;
 
 /** Bytes to use for a RAM bdev configured with capacity 0/"0g": 80% of
  *  total system DRAM. */
-inline chi::u64 DefaultRamCapacityBytes() {
-  return static_cast<chi::u64>(
+inline clio::run::u64 DefaultRamCapacityBytes() {
+  return static_cast<clio::run::u64>(
       static_cast<double>(ctp::SystemInfo::GetRamCapacity()) *
       kDefaultRamCapacityFraction);
 }
@@ -78,7 +78,7 @@ inline chi::u64 DefaultRamCapacityBytes() {
 /**
  * Block device type enumeration
  */
-enum class BdevType : chi::u32 {
+enum class BdevType : clio::run::u32 {
   kFile = 0,    // File-based block device (default)
   kRam = 1,     // RAM-based block device
   kHbm = 2,     // GPU High-Bandwidth Memory via cudaMalloc (device memory)
@@ -91,12 +91,12 @@ enum class BdevType : chi::u32 {
  * Block structure for data allocation
  */
 struct Block {
-  chi::u64 offset_;      // Offset within file
-  chi::u64 size_;        // Size of block
-  chi::u32 block_type_;  // Block size category (0=4KB, 1=64KB, 2=256KB, 3=1MB)
+  clio::run::u64 offset_;      // Offset within file
+  clio::run::u64 size_;        // Size of block
+  clio::run::u32 block_type_;  // Block size category (0=4KB, 1=64KB, 2=256KB, 3=1MB)
 
   CTP_GPU_FUN Block() : offset_(0), size_(0), block_type_(0) {}
-  CTP_GPU_FUN Block(chi::u64 offset, chi::u64 size, chi::u32 block_type)
+  CTP_GPU_FUN Block(clio::run::u64 offset, clio::run::u64 size, clio::run::u32 block_type)
       : offset_(offset), size_(size), block_type_(block_type) {}
 
   // Cereal serialization
@@ -135,7 +135,7 @@ struct PerfMetrics {
 /**
  * Persistence level for block devices
  */
-enum class PersistenceLevel : chi::u32 {
+enum class PersistenceLevel : clio::run::u32 {
   kVolatile = 0,            // RAM-backed, lost on crash (e.g., RAM bdev)
   kTemporaryNonVolatile = 1, // File-backed but not long-term (e.g., local SSD scratch)
   kLongTerm = 2             // Durable persistent storage (e.g., PFS, NVMe)
@@ -148,10 +148,10 @@ enum class PersistenceLevel : chi::u32 {
 struct CreateParams {
   // bdev-specific parameters
   BdevType bdev_type_;   // Block device type (file or RAM)
-  chi::u64 total_size_;  // Total size for allocation (0 = file size for kFile,
+  clio::run::u64 total_size_;  // Total size for allocation (0 = file size for kFile,
                          // required for kRam)
-  chi::u32 io_depth_;    // libaio queue depth (ignored for kRam)
-  chi::u32 alignment_;   // I/O alignment (default 4096)
+  clio::run::u32 io_depth_;    // libaio queue depth (ignored for kRam)
+  clio::run::u32 alignment_;   // I/O alignment (default 4096)
 
   // Performance characteristics (user-defined instead of benchmarked)
   PerfMetrics perf_metrics_;  // User-provided performance characteristics
@@ -178,8 +178,8 @@ struct CreateParams {
   }
 
   // Constructor with basic parameters (uses default performance)
-  CreateParams(BdevType bdev_type, chi::u64 total_size = 0,
-               chi::u32 io_depth = 32, chi::u32 alignment = 4096)
+  CreateParams(BdevType bdev_type, clio::run::u64 total_size = 0,
+               clio::run::u32 io_depth = 32, clio::run::u32 alignment = 4096)
       : bdev_type_(bdev_type),
         total_size_(total_size),
         io_depth_(io_depth),
@@ -195,12 +195,12 @@ struct CreateParams {
     HLOG(kDebug,
          "DEBUG: CreateParams constructor called with: bdev_type={}, "
          "total_size={}, io_depth={}, alignment={}",
-         static_cast<chi::u32>(bdev_type_), total_size_, io_depth_, alignment_);
+         static_cast<clio::run::u32>(bdev_type_), total_size_, io_depth_, alignment_);
   }
 
   // Constructor with optional performance metrics (as last parameter)
-  CreateParams(BdevType bdev_type, chi::u64 total_size, chi::u32 io_depth,
-               chi::u32 alignment, const PerfMetrics *perf_metrics = nullptr)
+  CreateParams(BdevType bdev_type, clio::run::u64 total_size, clio::run::u32 io_depth,
+               clio::run::u32 alignment, const PerfMetrics *perf_metrics = nullptr)
       : bdev_type_(bdev_type),
         total_size_(total_size),
         io_depth_(io_depth),
@@ -212,7 +212,7 @@ struct CreateParams {
            "DEBUG: CreateParams constructor called with custom performance: "
            "bdev_type={}, total_size={}, io_depth={}, alignment={}, "
            "read_bw={}, write_bw={}",
-           static_cast<chi::u32>(bdev_type_), total_size_, io_depth_,
+           static_cast<clio::run::u32>(bdev_type_), total_size_, io_depth_,
            alignment_, perf_metrics_.read_bandwidth_mbps_,
            perf_metrics_.write_bandwidth_mbps_);
     } else {
@@ -225,7 +225,7 @@ struct CreateParams {
       HLOG(kDebug,
            "DEBUG: CreateParams constructor called with default performance: "
            "bdev_type={}, total_size={}, io_depth={}, alignment={}",
-           static_cast<chi::u32>(bdev_type_), total_size_, io_depth_,
+           static_cast<clio::run::u32>(bdev_type_), total_size_, io_depth_,
            alignment_);
     }
   }
@@ -240,7 +240,7 @@ struct CreateParams {
    * Load configuration from PoolConfig (for compose mode)
    * @param pool_config Pool configuration from compose section
    */
-  void LoadConfig(const chi::PoolConfig &pool_config) {
+  void LoadConfig(const clio::run::PoolConfig &pool_config) {
     // Parse YAML config string
     YAML::Node config = YAML::Load(pool_config.config_);
 
@@ -268,12 +268,12 @@ struct CreateParams {
 
     // Load io_depth (optional)
     if (config["io_depth"]) {
-      io_depth_ = config["io_depth"].as<chi::u32>();
+      io_depth_ = config["io_depth"].as<clio::run::u32>();
     }
 
     // Load alignment (optional)
     if (config["alignment"]) {
-      alignment_ = config["alignment"].as<chi::u32>();
+      alignment_ = config["alignment"].as<clio::run::u32>();
     }
 
     // Load performance metrics (optional)
@@ -322,19 +322,19 @@ using CreateTask = clio::run::admin::GetOrCreatePoolTask<CreateParams>;
 /**
  * AllocateBlocksTask - Allocate multiple blocks with specified total size
  */
-struct AllocateBlocksTask : public chi::Task {
+struct AllocateBlocksTask : public clio::run::Task {
   // Task-specific data
-  IN chi::u64 size_;  // Requested total size
-  OUT chi::priv::vector<Block> blocks_;  // Allocated blocks information
+  IN clio::run::u64 size_;  // Requested total size
+  OUT clio::run::priv::vector<Block> blocks_;  // Allocated blocks information
 
   /** SHM default constructor */
-  CTP_CROSS_FUN AllocateBlocksTask() : chi::Task(), size_(0), blocks_(CLIO_PRIV_ALLOC) {}
+  CTP_CROSS_FUN AllocateBlocksTask() : clio::run::Task(), size_(0), blocks_(CLIO_PRIV_ALLOC) {}
 
   /** Emplace constructor */
-  CTP_CROSS_FUN explicit AllocateBlocksTask(const chi::TaskId &task_node,
-                              const chi::PoolId &pool_id,
-                              const chi::PoolQuery &pool_query, chi::u64 size)
-      : chi::Task(task_node, pool_id, pool_query, Method::kAllocateBlocks), size_(size), blocks_(CLIO_PRIV_ALLOC) {
+  CTP_CROSS_FUN explicit AllocateBlocksTask(const clio::run::TaskId &task_node,
+                              const clio::run::PoolId &pool_id,
+                              const clio::run::PoolQuery &pool_query, clio::run::u64 size)
+      : clio::run::Task(task_node, pool_id, pool_query, Method::kAllocateBlocks), size_(size), blocks_(CLIO_PRIV_ALLOC) {
   }
 
   /** Fix up priv::vector SVO pointer after cudaMemcpy D→H */
@@ -370,7 +370,7 @@ struct AllocateBlocksTask : public chi::Task {
   }
 
   /** AggregateOut replica results into this task */
-  void AggregateOut(const ctp::ipc::FullPtr<chi::Task> &other_base) {
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
     Copy(other_base.template Cast<AllocateBlocksTask>());
   }
@@ -379,19 +379,19 @@ struct AllocateBlocksTask : public chi::Task {
 /**
  * FreeBlocksTask - Free allocated blocks
  */
-struct FreeBlocksTask : public chi::Task {
+struct FreeBlocksTask : public clio::run::Task {
   // Task-specific data
-  IN chi::priv::vector<Block> blocks_;  // Blocks to free
+  IN clio::run::priv::vector<Block> blocks_;  // Blocks to free
 
   /** SHM default constructor */
-  CTP_CROSS_FUN FreeBlocksTask() : chi::Task(), blocks_(CLIO_PRIV_ALLOC) {}
+  CTP_CROSS_FUN FreeBlocksTask() : clio::run::Task(), blocks_(CLIO_PRIV_ALLOC) {}
 
   /** Emplace constructor for multiple blocks */
-  explicit FreeBlocksTask(const chi::TaskId &task_node,
-                          const chi::PoolId &pool_id,
-                          const chi::PoolQuery &pool_query,
+  explicit FreeBlocksTask(const clio::run::TaskId &task_node,
+                          const clio::run::PoolId &pool_id,
+                          const clio::run::PoolQuery &pool_query,
                           const std::vector<Block> &blocks)
-      : chi::Task(task_node, pool_id, pool_query, 10), blocks_(CLIO_PRIV_ALLOC) {
+      : clio::run::Task(task_node, pool_id, pool_query, 10), blocks_(CLIO_PRIV_ALLOC) {
     // Initialize task
     task_id_ = task_node;
     pool_id_ = pool_id;
@@ -399,18 +399,18 @@ struct FreeBlocksTask : public chi::Task {
     task_flags_.Clear();
     pool_query_ = pool_query;
 
-    // Copy blocks from std::vector to chi::priv::vector
+    // Copy blocks from std::vector to clio::run::priv::vector
     for (const auto &block : blocks) {
       blocks_.push_back(block);
     }
   }
 
   /** Emplace constructor for GPU (priv::vector) */
-  CTP_CROSS_FUN explicit FreeBlocksTask(const chi::TaskId &task_node,
-                          const chi::PoolId &pool_id,
-                          const chi::PoolQuery &pool_query,
-                          const chi::priv::vector<Block> &blocks)
-      : chi::Task(task_node, pool_id, pool_query, Method::kFreeBlocks),
+  CTP_CROSS_FUN explicit FreeBlocksTask(const clio::run::TaskId &task_node,
+                          const clio::run::PoolId &pool_id,
+                          const clio::run::PoolQuery &pool_query,
+                          const clio::run::priv::vector<Block> &blocks)
+      : clio::run::Task(task_node, pool_id, pool_query, Method::kFreeBlocks),
         blocks_(blocks) {
   }
 
@@ -445,7 +445,7 @@ struct FreeBlocksTask : public chi::Task {
   }
 
   /** AggregateOut replica results into this task */
-  void AggregateOut(const ctp::ipc::FullPtr<chi::Task> &other_base) {
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
     Copy(other_base.template Cast<FreeBlocksTask>());
   }
@@ -454,22 +454,22 @@ struct FreeBlocksTask : public chi::Task {
 /**
  * WriteTask - Write data to a block using libaio
  */
-struct WriteTask : public chi::Task {
+struct WriteTask : public clio::run::Task {
   // Task-specific data
-  IN chi::priv::vector<Block> blocks_;  // Blocks to write to
+  IN clio::run::priv::vector<Block> blocks_;  // Blocks to write to
   IN ctp::ipc::ShmPtr<> data_;              // Data to write (pointer-based)
   IN size_t length_;                    // Size of data to write
-  OUT chi::u64 bytes_written_;          // Number of bytes actually written
+  OUT clio::run::u64 bytes_written_;          // Number of bytes actually written
 
   /** SHM default constructor */
-  CTP_CROSS_FUN WriteTask() : chi::Task(), blocks_(CLIO_PRIV_ALLOC), length_(0), bytes_written_(0) {}
+  CTP_CROSS_FUN WriteTask() : clio::run::Task(), blocks_(CLIO_PRIV_ALLOC), length_(0), bytes_written_(0) {}
 
   /** Emplace constructor */
-  CTP_CROSS_FUN explicit WriteTask(const chi::TaskId &task_node, const chi::PoolId &pool_id,
-                     const chi::PoolQuery &pool_query,
-                     const chi::priv::vector<Block> &blocks, ctp::ipc::ShmPtr<> data,
+  CTP_CROSS_FUN explicit WriteTask(const clio::run::TaskId &task_node, const clio::run::PoolId &pool_id,
+                     const clio::run::PoolQuery &pool_query,
+                     const clio::run::priv::vector<Block> &blocks, ctp::ipc::ShmPtr<> data,
                      size_t length)
-      : chi::Task(task_node, pool_id, pool_query, Method::kWrite),
+      : clio::run::Task(task_node, pool_id, pool_query, Method::kWrite),
         blocks_(blocks),
         data_(data),
         length_(length),
@@ -511,7 +511,7 @@ struct WriteTask : public chi::Task {
   }
 
   /** AggregateOut */
-  void AggregateOut(const ctp::ipc::FullPtr<chi::Task> &other_base) {
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
     Copy(other_base.template Cast<WriteTask>());
   }
@@ -534,23 +534,23 @@ struct WriteTask : public chi::Task {
 /**
  * ReadTask - Read data from a block using libaio
  */
-struct ReadTask : public chi::Task {
+struct ReadTask : public clio::run::Task {
   // Task-specific data
-  IN chi::priv::vector<Block> blocks_;  // Blocks to read from
+  IN clio::run::priv::vector<Block> blocks_;  // Blocks to read from
   OUT ctp::ipc::ShmPtr<> data_;             // Read data (pointer-based)
   INOUT size_t
       length_;  // Size of data buffer (IN: buffer size, OUT: actual size)
-  OUT chi::u64 bytes_read_;  // Number of bytes actually read
+  OUT clio::run::u64 bytes_read_;  // Number of bytes actually read
 
   /** SHM default constructor */
-  CTP_CROSS_FUN ReadTask() : chi::Task(), blocks_(CLIO_PRIV_ALLOC), length_(0), bytes_read_(0) {}
+  CTP_CROSS_FUN ReadTask() : clio::run::Task(), blocks_(CLIO_PRIV_ALLOC), length_(0), bytes_read_(0) {}
 
   /** Emplace constructor */
-  CTP_CROSS_FUN explicit ReadTask(const chi::TaskId &task_node, const chi::PoolId &pool_id,
-                    const chi::PoolQuery &pool_query,
-                    const chi::priv::vector<Block> &blocks, ctp::ipc::ShmPtr<> data,
+  CTP_CROSS_FUN explicit ReadTask(const clio::run::TaskId &task_node, const clio::run::PoolId &pool_id,
+                    const clio::run::PoolQuery &pool_query,
+                    const clio::run::priv::vector<Block> &blocks, ctp::ipc::ShmPtr<> data,
                     size_t length)
-      : chi::Task(task_node, pool_id, pool_query, Method::kRead),
+      : clio::run::Task(task_node, pool_id, pool_query, Method::kRead),
         blocks_(blocks),
         data_(data),
         length_(length),
@@ -593,7 +593,7 @@ struct ReadTask : public chi::Task {
   }
 
   /** AggregateOut */
-  void AggregateOut(const ctp::ipc::FullPtr<chi::Task> &other_base) {
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
     Copy(other_base.template Cast<ReadTask>());
   }
@@ -616,19 +616,19 @@ struct ReadTask : public chi::Task {
 /**
  * GetStatsTask - Get performance statistics and remaining size
  */
-struct GetStatsTask : public chi::Task {
+struct GetStatsTask : public clio::run::Task {
   // Task-specific data (no inputs)
   OUT PerfMetrics metrics_;      // Performance metrics
-  OUT chi::u64 remaining_size_;  // Remaining allocatable space
+  OUT clio::run::u64 remaining_size_;  // Remaining allocatable space
 
   /** SHM default constructor */
-  GetStatsTask() : chi::Task(), remaining_size_(0) {}
+  GetStatsTask() : clio::run::Task(), remaining_size_(0) {}
 
   /** Emplace constructor */
-  explicit GetStatsTask(const chi::TaskId &task_node,
-                        const chi::PoolId &pool_id,
-                        const chi::PoolQuery &pool_query)
-      : chi::Task(task_node, pool_id, pool_query, 10), remaining_size_(0) {
+  explicit GetStatsTask(const clio::run::TaskId &task_node,
+                        const clio::run::PoolId &pool_id,
+                        const clio::run::PoolQuery &pool_query)
+      : clio::run::Task(task_node, pool_id, pool_query, 10), remaining_size_(0) {
     // Initialize task
     task_id_ = task_node;
     pool_id_ = pool_id;
@@ -664,7 +664,7 @@ struct GetStatsTask : public chi::Task {
   }
 
   /** AggregateOut replica results into this task */
-  void AggregateOut(const ctp::ipc::FullPtr<chi::Task> &other_base) {
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
     Copy(other_base.template Cast<GetStatsTask>());
   }
@@ -675,27 +675,27 @@ struct GetStatsTask : public chi::Task {
  * Called by the CPU bdev runtime after allocating kHbm or kPinned memory,
  * so the GPU-side GpuRuntime container can perform direct device memcpy.
  */
-struct UpdateTask : public chi::Task {
-  IN chi::u64 hbm_ptr_;     ///< Device pointer to HBM buffer (0 if none)
-  IN chi::u64 pinned_ptr_;  ///< Pinned host pointer (0 if none)
-  IN chi::u64 hbm_size_;    ///< Byte size of the HBM buffer
-  IN chi::u64 pinned_size_; ///< Byte size of the pinned buffer
-  IN chi::u64 total_size_;  ///< Allocatable size (max of hbm/pinned)
-  IN chi::u32 bdev_type_;   ///< BdevType enum value
-  IN chi::u32 alignment_;   ///< Allocation alignment in bytes
+struct UpdateTask : public clio::run::Task {
+  IN clio::run::u64 hbm_ptr_;     ///< Device pointer to HBM buffer (0 if none)
+  IN clio::run::u64 pinned_ptr_;  ///< Pinned host pointer (0 if none)
+  IN clio::run::u64 hbm_size_;    ///< Byte size of the HBM buffer
+  IN clio::run::u64 pinned_size_; ///< Byte size of the pinned buffer
+  IN clio::run::u64 total_size_;  ///< Allocatable size (max of hbm/pinned)
+  IN clio::run::u32 bdev_type_;   ///< BdevType enum value
+  IN clio::run::u32 alignment_;   ///< Allocation alignment in bytes
 
   CTP_CROSS_FUN UpdateTask()
-      : chi::Task(), hbm_ptr_(0), pinned_ptr_(0), hbm_size_(0),
+      : clio::run::Task(), hbm_ptr_(0), pinned_ptr_(0), hbm_size_(0),
         pinned_size_(0), total_size_(0), bdev_type_(0), alignment_(4096) {}
 
-  explicit UpdateTask(const chi::TaskId &task_node,
-                      const chi::PoolId &pool_id,
-                      const chi::PoolQuery &pool_query,
-                      chi::u64 hbm_ptr, chi::u64 pinned_ptr,
-                      chi::u64 hbm_size, chi::u64 pinned_size,
-                      chi::u64 total_size, chi::u32 bdev_type,
-                      chi::u32 alignment)
-      : chi::Task(task_node, pool_id, pool_query, 10),
+  explicit UpdateTask(const clio::run::TaskId &task_node,
+                      const clio::run::PoolId &pool_id,
+                      const clio::run::PoolQuery &pool_query,
+                      clio::run::u64 hbm_ptr, clio::run::u64 pinned_ptr,
+                      clio::run::u64 hbm_size, clio::run::u64 pinned_size,
+                      clio::run::u64 total_size, clio::run::u32 bdev_type,
+                      clio::run::u32 alignment)
+      : clio::run::Task(task_node, pool_id, pool_query, 10),
         hbm_ptr_(hbm_ptr), pinned_ptr_(pinned_ptr),
         hbm_size_(hbm_size), pinned_size_(pinned_size),
         total_size_(total_size), bdev_type_(bdev_type), alignment_(alignment) {
@@ -729,7 +729,7 @@ struct UpdateTask : public chi::Task {
     alignment_   = other->alignment_;
   }
 
-  void AggregateOut(const ctp::ipc::FullPtr<chi::Task> &other_base) {
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
     Copy(other_base.template Cast<UpdateTask>());
   }

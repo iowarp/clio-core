@@ -104,8 +104,8 @@ TEST_CASE("CAE labels 10 docs; CTE SemanticSearch returns top-5",
                           "test_cae_semantic_search_config.yaml";
   ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", config_path.string(), 1);
 
-  REQUIRE(chi::CHIMAERA_INIT(chi::ChimaeraMode::kServer));
-  SimpleTest::g_test_finalize = chi::CHIMAERA_FINALIZE;
+  REQUIRE(clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kServer));
+  SimpleTest::g_test_finalize = clio::run::CHIMAERA_FINALIZE;
   std::this_thread::sleep_for(1s);
 
   // CLIO_CTE_CLIENT lands on the CAE entrypoint pool (512.0) — that's
@@ -140,7 +140,7 @@ TEST_CASE("CAE labels 10 docs; CTE SemanticSearch returns top-5",
   // Step 2: confirm every doc got a label. CAE doesn't forward
   // GetBlobSize, so we ask CTE directly via a client pointed at 513.0.
   auto cte_direct = std::make_unique<clio::cte::core::Client>(
-      chi::PoolId(513, 0));
+      clio::run::PoolId(513, 0));
   size_t labels_present = 0;
   for (const auto &doc : kCorpus) {
     std::string lname = std::string(doc.name) + "_label";

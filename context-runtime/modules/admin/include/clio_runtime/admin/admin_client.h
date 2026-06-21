@@ -50,7 +50,7 @@
 
 namespace clio::run::admin {
 
-class Client : public chi::ContainerClient {
+class Client : public clio::run::ContainerClient {
  public:
   /**
    * Default constructor
@@ -64,7 +64,7 @@ class Client : public chi::ContainerClient {
   /**
    * Constructor with pool ID
    */
-  explicit Client(const chi::PoolId& pool_id) { Init(pool_id); }
+  explicit Client(const clio::run::PoolId& pool_id) { Init(pool_id); }
 
   /**
    * Create the Admin container (asynchronous)
@@ -72,9 +72,9 @@ class Client : public chi::ContainerClient {
    * @param pool_name Unique name for the admin pool (user-provided)
    * @param custom_pool_id Explicit pool ID for the pool being created
    */
-  chi::Future<CreateTask> AsyncCreate(const chi::PoolQuery& pool_query,
+  clio::run::Future<CreateTask> AsyncCreate(const clio::run::PoolQuery& pool_query,
                                       const std::string& pool_name,
-                                      const chi::PoolId& custom_pool_id) {
+                                      const clio::run::PoolId& custom_pool_id) {
     auto* ipc_manager = CLIO_IPC;
 
     // Allocate CreateTask for admin container creation
@@ -82,7 +82,7 @@ class Client : public chi::ContainerClient {
     // The custom_pool_id is the ID for the pool being created (not the task
     // pool) Pass 'this' as client pointer for PostWait callback
     auto task = ipc_manager->NewTask<CreateTask>(
-        chi::CreateTaskId(), chi::kAdminPoolId, pool_query, "", pool_name,
+        clio::run::CreateTaskId(), clio::run::kAdminPoolId, pool_query, "", pool_name,
         custom_pool_id, this);
 
     // Submit to runtime and return Future
@@ -92,14 +92,14 @@ class Client : public chi::ContainerClient {
   /**
    * Destroy an existing ChiPool (asynchronous)
    */
-  chi::Future<DestroyPoolTask> AsyncDestroyPool(
-      const chi::PoolQuery& pool_query, chi::PoolId target_pool_id,
-      chi::u32 destruction_flags = 0) {
+  clio::run::Future<DestroyPoolTask> AsyncDestroyPool(
+      const clio::run::PoolQuery& pool_query, clio::run::PoolId target_pool_id,
+      clio::run::u32 destruction_flags = 0) {
     auto* ipc_manager = CLIO_IPC;
 
     // Allocate DestroyPoolTask
     auto task = ipc_manager->NewTask<DestroyPoolTask>(
-        chi::CreateTaskId(), pool_id_, pool_query, target_pool_id,
+        clio::run::CreateTaskId(), pool_id_, pool_query, target_pool_id,
         destruction_flags);
 
     // Submit to runtime and return Future
@@ -114,18 +114,18 @@ class Client : public chi::ContainerClient {
    * @param period_us Period in microseconds (default 25us)
    * @return Future for the periodic SendTask
    */
-  chi::Future<SendTask> AsyncSendPoll(const chi::PoolQuery& pool_query,
-                                      chi::u32 transfer_flags = 0,
+  clio::run::Future<SendTask> AsyncSendPoll(const clio::run::PoolQuery& pool_query,
+                                      clio::run::u32 transfer_flags = 0,
                                       double period_us = 25) {
     auto* ipc_manager = CLIO_IPC;
 
     // Allocate SendTask for polling
-    auto task = ipc_manager->NewTask<SendTask>(chi::CreateTaskId(), pool_id_,
+    auto task = ipc_manager->NewTask<SendTask>(clio::run::CreateTaskId(), pool_id_,
                                                pool_query, transfer_flags);
 
     // Set task as periodic if period is specified
     if (period_us > 0) {
-      task->SetPeriod(period_us, chi::kMicro);
+      task->SetPeriod(period_us, clio::run::kMicro);
       task->SetFlags(TASK_PERIODIC);
     }
 
@@ -138,18 +138,18 @@ class Client : public chi::ContainerClient {
    * Can be used for both SerializeIn (receiving inputs) and SerializeOut
    * (receiving outputs)
    */
-  chi::Future<RecvTask> AsyncRecv(const chi::PoolQuery& pool_query,
-                                  chi::u32 transfer_flags = 0,
+  clio::run::Future<RecvTask> AsyncRecv(const clio::run::PoolQuery& pool_query,
+                                  clio::run::u32 transfer_flags = 0,
                                   double period_us = 25) {
     auto* ipc_manager = CLIO_IPC;
 
     // Allocate RecvTask
-    auto task = ipc_manager->NewTask<RecvTask>(chi::CreateTaskId(), pool_id_,
+    auto task = ipc_manager->NewTask<RecvTask>(clio::run::CreateTaskId(), pool_id_,
                                                pool_query, transfer_flags);
 
     // Set task as periodic if period is specified
     if (period_us > 0) {
-      task->SetPeriod(period_us, chi::kMicro);
+      task->SetPeriod(period_us, clio::run::kMicro);
       task->SetFlags(TASK_PERIODIC);
     }
 
@@ -160,11 +160,11 @@ class Client : public chi::ContainerClient {
   /**
    * Flush administrative operations (asynchronous)
    */
-  chi::Future<FlushTask> AsyncFlush(const chi::PoolQuery& pool_query) {
+  clio::run::Future<FlushTask> AsyncFlush(const clio::run::PoolQuery& pool_query) {
     auto* ipc_manager = CLIO_IPC;
 
     // Allocate FlushTask
-    auto task = ipc_manager->NewTask<FlushTask>(chi::CreateTaskId(), pool_id_,
+    auto task = ipc_manager->NewTask<FlushTask>(clio::run::CreateTaskId(), pool_id_,
                                                 pool_query);
 
     // Submit to runtime and return Future
@@ -174,14 +174,14 @@ class Client : public chi::ContainerClient {
   /**
    * Stop the entire CLIO Runtime runtime (asynchronous)
    */
-  chi::Future<StopRuntimeTask> AsyncStopRuntime(
-      const chi::PoolQuery& pool_query, chi::u32 shutdown_flags = 0,
-      chi::u32 grace_period_ms = 5000) {
+  clio::run::Future<StopRuntimeTask> AsyncStopRuntime(
+      const clio::run::PoolQuery& pool_query, clio::run::u32 shutdown_flags = 0,
+      clio::run::u32 grace_period_ms = 5000) {
     auto* ipc_manager = CLIO_IPC;
 
     // Allocate StopRuntimeTask
     auto task = ipc_manager->NewTask<StopRuntimeTask>(
-        chi::CreateTaskId(), pool_id_, pool_query, shutdown_flags,
+        clio::run::CreateTaskId(), pool_id_, pool_query, shutdown_flags,
         grace_period_ms);
 
     // Submit to runtime and return Future
@@ -193,14 +193,14 @@ class Client : public chi::ContainerClient {
    * @param pool_config Configuration for the pool to create
    * @return Future for the compose task
    */
-  chi::Future<ComposeTask<chi::PoolConfig>> AsyncCompose(
-      const chi::PoolConfig& pool_config) {
+  clio::run::Future<ComposeTask<clio::run::PoolConfig>> AsyncCompose(
+      const clio::run::PoolConfig& pool_config) {
     auto* ipc_manager = CLIO_IPC;
 
     // Create ComposeTask with PoolConfig passed directly to constructor
     auto task_ptr =
-        ipc_manager->NewTask<clio::run::admin::ComposeTask<chi::PoolConfig>>(
-            chi::CreateTaskId(), chi::kAdminPoolId, pool_config.pool_query_,
+        ipc_manager->NewTask<clio::run::admin::ComposeTask<clio::run::PoolConfig>>(
+            clio::run::CreateTaskId(), clio::run::kAdminPoolId, pool_config.pool_query_,
             pool_config);
 
     // Submit to runtime and return Future
@@ -215,15 +215,15 @@ class Client : public chi::ContainerClient {
    * one-shot)
    * @return Future for the connect task
    */
-  chi::Future<ClientConnectTask> AsyncClientConnect(
-      const chi::PoolQuery& pool_query, double period_us = 5000) {
+  clio::run::Future<ClientConnectTask> AsyncClientConnect(
+      const clio::run::PoolQuery& pool_query, double period_us = 5000) {
     auto* ipc_manager = CLIO_IPC;
 
-    auto task = ipc_manager->NewTask<ClientConnectTask>(chi::CreateTaskId(),
+    auto task = ipc_manager->NewTask<ClientConnectTask>(clio::run::CreateTaskId(),
                                                         pool_id_, pool_query);
 
     if (period_us > 0) {
-      task->SetPeriod(period_us, chi::kMicro);
+      task->SetPeriod(period_us, clio::run::kMicro);
       task->SetFlags(TASK_PERIODIC);
     }
 
@@ -237,15 +237,15 @@ class Client : public chi::ContainerClient {
    * @param period_us Period in microseconds (default 100us)
    * @return Future for the client recv task
    */
-  chi::Future<ClientRecvTask> AsyncClientRecv(const chi::PoolQuery& pool_query,
+  clio::run::Future<ClientRecvTask> AsyncClientRecv(const clio::run::PoolQuery& pool_query,
                                               double period_us = 100) {
     auto* ipc_manager = CLIO_IPC;
 
-    auto task = ipc_manager->NewTask<ClientRecvTask>(chi::CreateTaskId(),
+    auto task = ipc_manager->NewTask<ClientRecvTask>(clio::run::CreateTaskId(),
                                                      pool_id_, pool_query);
 
     if (period_us > 0) {
-      task->SetPeriod(period_us, chi::kMicro);
+      task->SetPeriod(period_us, clio::run::kMicro);
       task->SetFlags(TASK_PERIODIC);
     }
 
@@ -259,15 +259,15 @@ class Client : public chi::ContainerClient {
    * @param period_us Period in microseconds (default 100us)
    * @return Future for the client send task
    */
-  chi::Future<ClientSendTask> AsyncClientSend(const chi::PoolQuery& pool_query,
+  clio::run::Future<ClientSendTask> AsyncClientSend(const clio::run::PoolQuery& pool_query,
                                               double period_us = 100) {
     auto* ipc_manager = CLIO_IPC;
 
-    auto task = ipc_manager->NewTask<ClientSendTask>(chi::CreateTaskId(),
+    auto task = ipc_manager->NewTask<ClientSendTask>(clio::run::CreateTaskId(),
                                                      pool_id_, pool_query);
 
     if (period_us > 0) {
-      task->SetPeriod(period_us, chi::kMicro);
+      task->SetPeriod(period_us, clio::run::kMicro);
       task->SetFlags(TASK_PERIODIC);
     }
 
@@ -282,17 +282,17 @@ class Client : public chi::ContainerClient {
    * @param period_us Period in microseconds (default 1000000us = 1s)
    * @return Future for the WreapDeadIpcs task
    */
-  chi::Future<WreapDeadIpcsTask> AsyncWreapDeadIpcs(
-      const chi::PoolQuery& pool_query, double period_us = 1000000) {
+  clio::run::Future<WreapDeadIpcsTask> AsyncWreapDeadIpcs(
+      const clio::run::PoolQuery& pool_query, double period_us = 1000000) {
     auto* ipc_manager = CLIO_IPC;
 
     // Allocate WreapDeadIpcsTask
-    auto task = ipc_manager->NewTask<WreapDeadIpcsTask>(chi::CreateTaskId(),
+    auto task = ipc_manager->NewTask<WreapDeadIpcsTask>(clio::run::CreateTaskId(),
                                                         pool_id_, pool_query);
 
     // Set task as periodic if period is specified
     if (period_us > 0) {
-      task->SetPeriod(period_us, chi::kMicro);
+      task->SetPeriod(period_us, clio::run::kMicro);
       task->SetFlags(TASK_PERIODIC);
     }
 
@@ -308,11 +308,11 @@ class Client : public chi::ContainerClient {
    * @param query Free-form query string
    * @return Future for MonitorTask with results
    */
-  chi::Future<MonitorTask> AsyncMonitor(const chi::PoolQuery& pool_query,
+  clio::run::Future<MonitorTask> AsyncMonitor(const clio::run::PoolQuery& pool_query,
                                         const std::string& query) {
     auto* ipc_manager = CLIO_IPC;
     auto task = ipc_manager->NewTask<MonitorTask>(
-        chi::CreateTaskId(), pool_id_, pool_query, query);
+        clio::run::CreateTaskId(), pool_id_, pool_query, query);
     return ipc_manager->Send(task);
   }
 
@@ -324,13 +324,13 @@ class Client : public chi::ContainerClient {
    * @param batch TaskBatch containing the tasks to submit
    * @return Future for SubmitBatchTask with completion results
    */
-  chi::Future<SubmitBatchTask> AsyncSubmitBatch(
-      const chi::PoolQuery& pool_query, const TaskBatch& batch) {
+  clio::run::Future<SubmitBatchTask> AsyncSubmitBatch(
+      const clio::run::PoolQuery& pool_query, const TaskBatch& batch) {
     auto* ipc_manager = CLIO_IPC;
 
     // Allocate SubmitBatchTask with batch data
     auto task = ipc_manager->NewTask<SubmitBatchTask>(
-        chi::CreateTaskId(), pool_id_, pool_query, batch);
+        clio::run::CreateTaskId(), pool_id_, pool_query, batch);
 
     // Submit to runtime and return Future
     return ipc_manager->Send(task);
@@ -341,26 +341,26 @@ class Client : public chi::ContainerClient {
    * @param alloc_id Allocator ID (major=pid, minor=index) to register
    * @return Future for RegisterMemoryTask
    */
-  chi::Future<RegisterMemoryTask> AsyncRegisterMemory(
-      const chi::PoolQuery& pool_query, const ctp::ipc::AllocatorId& alloc_id) {
+  clio::run::Future<RegisterMemoryTask> AsyncRegisterMemory(
+      const clio::run::PoolQuery& pool_query, const ctp::ipc::AllocatorId& alloc_id) {
     auto* ipc_manager = CLIO_IPC;
 
     auto task = ipc_manager->NewTask<RegisterMemoryTask>(
-        chi::CreateTaskId(), pool_id_, pool_query, alloc_id);
+        clio::run::CreateTaskId(), pool_id_, pool_query, alloc_id);
 
-    return chi::IpcCpu2CpuZmq::ClientSend(ipc_manager, task, chi::IpcMode::kTcp);
+    return clio::run::IpcCpu2CpuZmq::ClientSend(ipc_manager, task, clio::run::IpcMode::kTcp);
   }
   /**
    * RestartContainers - Re-create pools from saved restart configs
    * @param pool_query Pool routing information
    * @return Future for the RestartContainers task
    */
-  chi::Future<RestartContainersTask> AsyncRestartContainers(
-      const chi::PoolQuery& pool_query) {
+  clio::run::Future<RestartContainersTask> AsyncRestartContainers(
+      const clio::run::PoolQuery& pool_query) {
     auto* ipc_manager = CLIO_IPC;
 
     auto task = ipc_manager->NewTask<RestartContainersTask>(
-        chi::CreateTaskId(), pool_id_, pool_query);
+        clio::run::CreateTaskId(), pool_id_, pool_query);
 
     return ipc_manager->Send(task);
   }
@@ -371,12 +371,12 @@ class Client : public chi::ContainerClient {
    * @return Future for the ListContainers task; on completion the task's
    *         pool_names_ / pool_ids_ vectors hold the active pools.
    */
-  chi::Future<ListContainersTask> AsyncListContainers(
-      const chi::PoolQuery& pool_query) {
+  clio::run::Future<ListContainersTask> AsyncListContainers(
+      const clio::run::PoolQuery& pool_query) {
     auto* ipc_manager = CLIO_IPC;
 
     auto task = ipc_manager->NewTask<ListContainersTask>(
-        chi::CreateTaskId(), pool_id_, pool_query);
+        clio::run::CreateTaskId(), pool_id_, pool_query);
 
     return ipc_manager->Send(task);
   }
@@ -388,12 +388,12 @@ class Client : public chi::ContainerClient {
    * @param new_node_port Port of the new node's runtime
    * @return Future for the AddNode task
    */
-  chi::Future<AddNodeTask> AsyncAddNode(const chi::PoolQuery& pool_query,
+  clio::run::Future<AddNodeTask> AsyncAddNode(const clio::run::PoolQuery& pool_query,
                                         const std::string& new_node_ip,
-                                        chi::u32 new_node_port) {
+                                        clio::run::u32 new_node_port) {
     auto* ipc_manager = CLIO_IPC;
     auto task = ipc_manager->NewTask<AddNodeTask>(
-        chi::CreateTaskId(), pool_id_, pool_query,
+        clio::run::CreateTaskId(), pool_id_, pool_query,
         new_node_ip, new_node_port);
     return ipc_manager->Send(task);
   }
@@ -406,14 +406,14 @@ class Client : public chi::ContainerClient {
    * @param new_node_id New node ID for the container
    * @return Future for the ChangeAddressTable task
    */
-  chi::Future<ChangeAddressTableTask> AsyncChangeAddressTable(
-      const chi::PoolQuery& pool_query,
-      const chi::PoolId& target_pool_id,
-      chi::ContainerId container_id,
-      chi::u32 new_node_id) {
+  clio::run::Future<ChangeAddressTableTask> AsyncChangeAddressTable(
+      const clio::run::PoolQuery& pool_query,
+      const clio::run::PoolId& target_pool_id,
+      clio::run::ContainerId container_id,
+      clio::run::u32 new_node_id) {
     auto* ipc_manager = CLIO_IPC;
     auto task = ipc_manager->NewTask<ChangeAddressTableTask>(
-        chi::CreateTaskId(), pool_id_, pool_query,
+        clio::run::CreateTaskId(), pool_id_, pool_query,
         target_pool_id, container_id, new_node_id);
     return ipc_manager->Send(task);
   }
@@ -423,10 +423,10 @@ class Client : public chi::ContainerClient {
    * @param pool_query Pool routing (use Physical(node_id) to target a node)
    * @return Future for the HeartbeatTask
    */
-  chi::Future<HeartbeatTask> AsyncHeartbeat(const chi::PoolQuery& pool_query) {
+  clio::run::Future<HeartbeatTask> AsyncHeartbeat(const clio::run::PoolQuery& pool_query) {
     auto* ipc_manager = CLIO_IPC;
     auto task = ipc_manager->NewTask<HeartbeatTask>(
-        chi::CreateTaskId(), pool_id_, pool_query);
+        clio::run::CreateTaskId(), pool_id_, pool_query);
     return ipc_manager->Send(task);
   }
 
@@ -436,15 +436,15 @@ class Client : public chi::ContainerClient {
    * @param period_us Period in microseconds (default 2000000us = 2s)
    * @return Future for the HeartbeatProbeTask
    */
-  chi::Future<HeartbeatProbeTask> AsyncHeartbeatProbe(
-      const chi::PoolQuery& pool_query, double period_us = 2000000) {
+  clio::run::Future<HeartbeatProbeTask> AsyncHeartbeatProbe(
+      const clio::run::PoolQuery& pool_query, double period_us = 2000000) {
     auto* ipc_manager = CLIO_IPC;
 
     auto task = ipc_manager->NewTask<HeartbeatProbeTask>(
-        chi::CreateTaskId(), pool_id_, pool_query);
+        clio::run::CreateTaskId(), pool_id_, pool_query);
 
     if (period_us > 0) {
-      task->SetPeriod(period_us, chi::kMicro);
+      task->SetPeriod(period_us, clio::run::kMicro);
       task->SetFlags(TASK_PERIODIC);
     }
 
@@ -457,12 +457,12 @@ class Client : public chi::ContainerClient {
    * @param target_node_id Node to probe
    * @return Future for the ProbeRequestTask
    */
-  chi::Future<ProbeRequestTask> AsyncProbeRequest(
-      const chi::PoolQuery& pool_query, chi::u64 target_node_id) {
+  clio::run::Future<ProbeRequestTask> AsyncProbeRequest(
+      const clio::run::PoolQuery& pool_query, clio::run::u64 target_node_id) {
     auto* ipc_manager = CLIO_IPC;
 
     auto task = ipc_manager->NewTask<ProbeRequestTask>(
-        chi::CreateTaskId(), pool_id_, pool_query, target_node_id);
+        clio::run::CreateTaskId(), pool_id_, pool_query, target_node_id);
 
     return ipc_manager->Send(task);
   }
@@ -473,9 +473,9 @@ class Client : public chi::ContainerClient {
    * @param migrations Vector of MigrateInfo describing migrations to perform
    * @return Future for the MigrateContainers task
    */
-  chi::Future<MigrateContainersTask> AsyncMigrateContainers(
-      const chi::PoolQuery& pool_query,
-      const std::vector<chi::MigrateInfo>& migrations) {
+  clio::run::Future<MigrateContainersTask> AsyncMigrateContainers(
+      const clio::run::PoolQuery& pool_query,
+      const std::vector<clio::run::MigrateInfo>& migrations) {
     auto* ipc_manager = CLIO_IPC;
     // Serialize migrations using GlobalSerialize
     std::vector<char> buf;
@@ -485,7 +485,7 @@ class Client : public chi::ContainerClient {
       ar.Finalize();
     }
     auto task = ipc_manager->NewTask<MigrateContainersTask>(
-        chi::CreateTaskId(), pool_id_, pool_query, std::string(buf.begin(), buf.end()));
+        clio::run::CreateTaskId(), pool_id_, pool_query, std::string(buf.begin(), buf.end()));
     return ipc_manager->Send(task);
   }
   /**
@@ -495,10 +495,10 @@ class Client : public chi::ContainerClient {
    * @param dead_node_id ID of the dead node being recovered
    * @return Future for the RecoverContainers task
    */
-  chi::Future<RecoverContainersTask> AsyncRecoverContainers(
-      const chi::PoolQuery& pool_query,
-      const std::vector<chi::RecoveryAssignment>& assignments,
-      chi::u64 dead_node_id) {
+  clio::run::Future<RecoverContainersTask> AsyncRecoverContainers(
+      const clio::run::PoolQuery& pool_query,
+      const std::vector<clio::run::RecoveryAssignment>& assignments,
+      clio::run::u64 dead_node_id) {
     auto* ipc_manager = CLIO_IPC;
     std::vector<char> buf;
     {
@@ -507,7 +507,7 @@ class Client : public chi::ContainerClient {
       ar.Finalize();
     }
     auto task = ipc_manager->NewTask<RecoverContainersTask>(
-        chi::CreateTaskId(), pool_id_, pool_query, std::string(buf.begin(), buf.end()), dead_node_id);
+        clio::run::CreateTaskId(), pool_id_, pool_query, std::string(buf.begin(), buf.end()), dead_node_id);
     return ipc_manager->Send(task);
   }
   /**
@@ -516,13 +516,13 @@ class Client : public chi::ContainerClient {
    * @param period_us Period in microseconds (default 1000000us = 1s)
    * @return Future for the SystemMonitorTask
    */
-  chi::Future<SystemMonitorTask> AsyncSystemMonitor(
-      const chi::PoolQuery &pool_query, double period_us = 1000000) {
+  clio::run::Future<SystemMonitorTask> AsyncSystemMonitor(
+      const clio::run::PoolQuery &pool_query, double period_us = 1000000) {
     auto *ipc_manager = CLIO_IPC;
     auto task = ipc_manager->NewTask<SystemMonitorTask>(
-        chi::CreateTaskId(), pool_id_, pool_query);
+        clio::run::CreateTaskId(), pool_id_, pool_query);
     if (period_us > 0) {
-      task->SetPeriod(period_us, chi::kMicro);
+      task->SetPeriod(period_us, clio::run::kMicro);
       task->SetFlags(TASK_PERIODIC);
     }
     return ipc_manager->Send(task);
@@ -535,11 +535,11 @@ class Client : public chi::ContainerClient {
    * @param shutting_down_node_id Node ID that is shutting down
    * @return Future for the AnnounceShutdownTask
    */
-  chi::Future<AnnounceShutdownTask> AsyncAnnounceShutdown(
-      const chi::PoolQuery &pool_query, chi::u64 shutting_down_node_id) {
+  clio::run::Future<AnnounceShutdownTask> AsyncAnnounceShutdown(
+      const clio::run::PoolQuery &pool_query, clio::run::u64 shutting_down_node_id) {
     auto *ipc_manager = CLIO_IPC;
     auto task = ipc_manager->NewTask<AnnounceShutdownTask>(
-        chi::CreateTaskId(), pool_id_, pool_query, shutting_down_node_id);
+        clio::run::CreateTaskId(), pool_id_, pool_query, shutting_down_node_id);
     return ipc_manager->Send(task);
   }
 };

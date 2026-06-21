@@ -65,16 +65,16 @@ using namespace std::chrono_literals;
 
 namespace {
 // Test configuration constants
-constexpr chi::u32 kTestTimeoutMs = 30000; // 30 second timeout for streaming tests
-constexpr chi::u32 kMaxRetries = 100;
-constexpr chi::u32 kRetryDelayMs = 50;
+constexpr clio::run::u32 kTestTimeoutMs = 30000; // 30 second timeout for streaming tests
+constexpr clio::run::u32 kMaxRetries = 100;
+constexpr clio::run::u32 kRetryDelayMs = 50;
 
 // Global test state
 bool g_initialized = false;
-chi::PoolId g_test_pool_id = chi::PoolId::GetNull();
+clio::run::PoolId g_test_pool_id = clio::run::PoolId::GetNull();
 
 // Get shared pool ID for all streaming tests (generated once)
-chi::PoolId getSharedTestPoolId() {
+clio::run::PoolId getSharedTestPoolId() {
   if (g_test_pool_id.IsNull()) {
     // Generate pool ID based on current time to avoid conflicts
     auto now = std::chrono::high_resolution_clock::now();
@@ -82,7 +82,7 @@ chi::PoolId getSharedTestPoolId() {
     auto microseconds =
         std::chrono::duration_cast<std::chrono::microseconds>(duration).count();
     // Use lower 32 bits to avoid overflow, add offset to avoid admin pool range
-    g_test_pool_id = chi::PoolId(static_cast<chi::u32>(microseconds & 0xFFFFFFFF) + 1000, 0);
+    g_test_pool_id = clio::run::PoolId(static_cast<clio::run::u32>(microseconds & 0xFFFFFFFF) + 1000, 0);
     INFO("Generated shared pool ID: " << g_test_pool_id.ToU64());
   } else {
     INFO("Reusing shared pool ID: " << g_test_pool_id.ToU64());
@@ -102,10 +102,10 @@ public:
     // Initialize CLIO Runtime once per test suite
     if (!g_initialized) {
       INFO("Initializing Chimaera for streaming tests...");
-      bool success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
+      bool success = clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true);
       if (success) {
         g_initialized = true;
-        SimpleTest::g_test_finalize = chi::CHIMAERA_FINALIZE;
+        SimpleTest::g_test_finalize = clio::run::CHIMAERA_FINALIZE;
         std::this_thread::sleep_for(500ms);
 
         // Verify core managers are available
@@ -132,7 +132,7 @@ public:
    */
   template <typename TaskT>
   bool waitForTaskCompletion(ctp::ipc::FullPtr<TaskT> task,
-                             chi::u32 timeout_ms = kTestTimeoutMs) {
+                             clio::run::u32 timeout_ms = kTestTimeoutMs) {
     if (task.IsNull()) {
       return false;
     }
@@ -159,8 +159,8 @@ public:
    */
   template <typename TaskT>
   int waitForMultipleTaskCompletion(
-      std::vector<chi::Future<TaskT>> &tasks,
-      chi::u32 timeout_ms = kTestTimeoutMs) {
+      std::vector<clio::run::Future<TaskT>> &tasks,
+      clio::run::u32 timeout_ms = kTestTimeoutMs) {
     (void)timeout_ms;  // Timeout not used with Wait() approach
 
     size_t completed_count = 0;
@@ -184,7 +184,7 @@ public:
     try {
       // Initialize admin client
       // Admin client is automatically initialized via CLIO_ADMIN singleton
-      chi::PoolQuery pool_query = chi::PoolQuery::Dynamic();
+      clio::run::PoolQuery pool_query = clio::run::PoolQuery::Dynamic();
 
       // Create MOD_NAME client and container directly with dynamic pool ID
       clio::run::MOD_NAME::Client mod_name_client(test_pool_id_);
@@ -212,7 +212,7 @@ public:
     // No explicit cleanup needed - resources managed by shared memory
   }
 
-  chi::PoolId test_pool_id_;
+  clio::run::PoolId test_pool_id_;
 };
 
 /**
@@ -229,7 +229,7 @@ TEST_CASE("MOD_NAME Small Output Test", "[streaming][small]") {
 
   // Create client
   clio::run::MOD_NAME::Client client(fixture.test_pool_id_);
-  chi::PoolQuery pool_query = chi::PoolQuery::Dynamic();
+  clio::run::PoolQuery pool_query = clio::run::PoolQuery::Dynamic();
 
   // Create a custom task with 2KB of data (fits in default copy space)
   constexpr size_t kSmallDataSize = 2048; // 2KB
@@ -276,7 +276,7 @@ TEST_CASE("MOD_NAME Large Output Streaming Test", "[streaming][large]") {
 
   // Create client
   clio::run::MOD_NAME::Client client(fixture.test_pool_id_);
-  chi::PoolQuery pool_query = chi::PoolQuery::Dynamic();
+  clio::run::PoolQuery pool_query = clio::run::PoolQuery::Dynamic();
 
   // Create a TestLargeOutput task (returns 1MB of data)
   constexpr size_t kLargeDataSize = 1024 * 1024; // 1MB
@@ -332,11 +332,11 @@ TEST_CASE("MOD_NAME Concurrent Streaming Test", "[streaming][concurrent]") {
 
   // Create client
   clio::run::MOD_NAME::Client client(fixture.test_pool_id_);
-  chi::PoolQuery pool_query = chi::PoolQuery::Dynamic();
+  clio::run::PoolQuery pool_query = clio::run::PoolQuery::Dynamic();
 
   // Create 5 concurrent tasks with large outputs
   constexpr size_t kNumTasks = 5;
-  std::vector<chi::Future<clio::run::MOD_NAME::TestLargeOutputTask>> tasks;
+  std::vector<clio::run::Future<clio::run::MOD_NAME::TestLargeOutputTask>> tasks;
 
   INFO("Creating " << kNumTasks << " concurrent TestLargeOutput tasks...");
   auto start_time = std::chrono::high_resolution_clock::now();

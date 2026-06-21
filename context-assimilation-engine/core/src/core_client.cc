@@ -45,7 +45,7 @@ CTP_DEFINE_GLOBAL_PTR_VAR_CC(clio::cae::core::Client, g_cae_client);
  * Calls CLIO_CTE_CLIENT_INIT internally to ensure CTE is initialized
  */
 bool CLIO_CAE_CLIENT_INIT(const std::string &config_path,
-                         const chi::PoolQuery &pool_query) {
+                         const clio::run::PoolQuery &pool_query) {
   // Note: Default parameters are defined in the header
 
   // Static guard to prevent multiple initializations

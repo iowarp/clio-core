@@ -58,15 +58,15 @@
 namespace fs = std::filesystem;
 
 static std::string chi_test_data_dir() {
-  const char *d = chi::env::GetCompat("TEST_DATA_DIR");
+  const char *d = clio::run::env::GetCompat("TEST_DATA_DIR");
   return (d && *d) ? d : ".";
 }
 
 // Test constants
-static constexpr chi::u64 kDramCapacity = 64 * 1024 * 1024;   // 64MB
-static constexpr chi::u64 kFileCapacity = 256 * 1024 * 1024;  // 256MB
-static constexpr chi::u64 kTotalDataSize = 128 * 1024 * 1024; // 128MB
-static constexpr chi::u64 kBlobSize = 1 * 1024 * 1024;        // 1MB per blob
+static constexpr clio::run::u64 kDramCapacity = 64 * 1024 * 1024;   // 64MB
+static constexpr clio::run::u64 kFileCapacity = 256 * 1024 * 1024;  // 256MB
+static constexpr clio::run::u64 kTotalDataSize = 128 * 1024 * 1024; // 128MB
+static constexpr clio::run::u64 kBlobSize = 1 * 1024 * 1024;        // 1MB per blob
 static constexpr int kNumBlobs = kTotalDataSize / kBlobSize;  // 128 blobs
 
 static constexpr float kFastTierScore = 0.0f;  // DRAM
@@ -102,7 +102,7 @@ class TieredStorageStressFixture {
     ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", config_path_.c_str(), 1);
 
     // Initialize CLIO Runtime runtime
-    bool success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
+    bool success = clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true);
     REQUIRE(success);
 
     std::this_thread::sleep_for(std::chrono::milliseconds(500));

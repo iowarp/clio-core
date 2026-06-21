@@ -69,7 +69,7 @@ class Hdf5FileAssimilator : public BaseAssimilator {
    * @param error_code Output: 0 on success, non-zero error code on failure
    * @return TaskResume for coroutine suspension/resumption
    */
-  chi::TaskResume Schedule(const AssimilationCtx& ctx, int& error_code) override;
+  clio::run::TaskResume Schedule(const AssimilationCtx& ctx, int& error_code) override;
 
  private:
   /**
@@ -123,7 +123,7 @@ class Hdf5FileAssimilator : public BaseAssimilator {
    * @param error_code Output: 0 on success, non-zero error code on failure
    * @return TaskResume for coroutine suspension/resumption
    */
-  chi::TaskResume ProcessDataset(hid_t file_id, const std::string& dataset_path,
+  clio::run::TaskResume ProcessDataset(hid_t file_id, const std::string& dataset_path,
                                   const std::string& tag_prefix, int& error_code);
 
  private:

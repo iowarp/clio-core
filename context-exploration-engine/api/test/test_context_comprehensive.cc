@@ -62,7 +62,7 @@
 using namespace iowarp;
 
 static std::string chi_test_data_dir() {
-  const char *d = chi::env::GetCompat("TEST_DATA_DIR");
+  const char *d = clio::run::env::GetCompat("TEST_DATA_DIR");
   return (d && *d) ? d : ".";
 }
 
@@ -82,7 +82,7 @@ public:
       INFO("=== Initializing CEE Test Environment ===");
 
       // Initialize CLIO Runtime runtime
-      bool success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
+      bool success = clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true);
       if (!success) {
         throw std::runtime_error("CHIMAERA_INIT failed");
       }
@@ -101,7 +101,7 @@ public:
       // Create CTE core pool
       clio::cte::core::CreateParams cte_params;
       auto cte_create = cte_client->AsyncCreate(
-          chi::PoolQuery::Dynamic(),
+          clio::run::PoolQuery::Dynamic(),
           clio::cte::core::kCtePoolName,
           clio::cte::core::kCtePoolId,
           cte_params);
@@ -118,8 +118,8 @@ public:
           "ram::cee_test_cache",
           clio::run::bdev::BdevType::kRam,
           512 * 1024 * 1024,             // 512 MB
-          chi::PoolQuery::Local(),
-          chi::PoolId(512, 10));          // explicit bdev pool id
+          clio::run::PoolQuery::Local(),
+          clio::run::PoolId(512, 10));          // explicit bdev pool id
       reg_task.Wait();
 
       // Initialize CAE client
@@ -129,7 +129,7 @@ public:
       clio::cae::core::Client cae_client;
       clio::cae::core::CreateParams cae_params;
       auto cae_create = cae_client.AsyncCreate(
-          chi::PoolQuery::Local(),
+          clio::run::PoolQuery::Local(),
           "test_cae_pool",
           clio::cae::core::kCaePoolId,
           cae_params);

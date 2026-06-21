@@ -135,7 +135,7 @@ struct FutureShm {
   ctp::abitfield32_t flags_;
 
   /**
-   * Opaque pointer to the parent's GPU RunContext (chi::gpu::RunContext*).
+   * Opaque pointer to the parent's GPU RunContext (clio::run::gpu::RunContext*).
    * Set by Future::await_suspend on GPU so that the worker completing
    * this sub-task can directly resume the parent coroutine (same thread,
    * no event queue needed). Null for top-level (client-originated) tasks.

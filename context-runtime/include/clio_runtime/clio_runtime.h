@@ -62,7 +62,7 @@ enum class RuntimeMode {
 };
 
 /// Backward-compat alias for the pre-rename name.  External code that
-/// still uses chi::ChimaeraMode keeps compiling unchanged.
+/// still uses clio::run::ChimaeraMode keeps compiling unchanged.
 using ChimaeraMode = RuntimeMode;
 
 /**
@@ -104,7 +104,7 @@ inline bool CLIO_INIT(ChimaeraMode mode, bool default_with_runtime = false,
 
 /**
  * CHIMAERA_INIT — legacy name retained as a thin inline wrapper around
- * CLIO_INIT for source-level compat with the chimaera::* era.  Will
+ * CLIO_INIT for source-level compat with the clio::run::* era.  Will
  * stay until external callers (coeus-adapter, downstream tests) drop
  * the old spelling.
  */
@@ -141,7 +141,7 @@ inline void CHIMAERA_FINALIZE() { CLIO_RUNTIME_FINALIZE(); }
 // migration table.
 //==============================================================================
 
-// --- Module namespace alias (chimaera:: -> clio::run::) ---
+// --- Module namespace alias (clio::run:: -> clio::run::) ---
 // Pulled in last so the alias is visible to every TU that includes this
 // umbrella, regardless of which module headers come along for the ride.
 #include "clio_runtime/compat/chimaera_namespace.h"

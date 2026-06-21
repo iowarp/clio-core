@@ -59,7 +59,7 @@ bool ContextInterface::EnsureInitialized() {
   }
 
   // Initialize CLIO Runtime as a client for the context interface
-  if (!chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, false)) {
+  if (!clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, false)) {
     HLOG(kError, "Failed to initialize Chimaera client");
     init_failed = true;
     return false;
@@ -106,8 +106,8 @@ int ContextInterface::ContextBundle(
     auto task = cae_client.AsyncParseOmni(bundle);
     task.Wait();
 
-    chi::u32 result = task->result_code_;
-    chi::u32 num_tasks_scheduled = task->num_tasks_scheduled_;
+    clio::run::u32 result = task->result_code_;
+    clio::run::u32 num_tasks_scheduled = task->num_tasks_scheduled_;
 
     if (result != 0) {
       HLOG(kError, "ParseOmni failed with result code {}", result);
@@ -149,8 +149,8 @@ std::vector<std::string> ContextInterface::ContextQuery(
       auto task = cte_client->AsyncTemporalSearch(
           tag_re, blob_re,
           time_begin, time_end,
-          static_cast<chi::u32>(max_results),
-          chi::PoolQuery::Broadcast());
+          static_cast<clio::run::u32>(max_results),
+          clio::run::PoolQuery::Broadcast());
       task.Wait();
 
       std::vector<std::string> results;
@@ -165,9 +165,9 @@ std::vector<std::string> ContextInterface::ContextQuery(
     if (!prompt.empty()) {
       // max_results=0 means "unlimited" for the regex path, but BM25 needs
       // a positive top-k; fall back to the SemanticSearchTask default (10).
-      chi::u32 k = max_results > 0 ? max_results : 10;
+      clio::run::u32 k = max_results > 0 ? max_results : 10;
       auto task = cte_client->AsyncSemanticSearch(
-          tag_re, blob_re, prompt, k, chi::PoolQuery::Broadcast());
+          tag_re, blob_re, prompt, k, clio::run::PoolQuery::Broadcast());
       task.Wait();
 
       std::vector<std::string> results;
@@ -182,7 +182,7 @@ std::vector<std::string> ContextInterface::ContextQuery(
     auto task = cte_client->AsyncBlobQuery(
         tag_re, blob_re,
         max_results,
-        chi::PoolQuery::Broadcast());
+        clio::run::PoolQuery::Broadcast());
     task.Wait();
 
     std::vector<std::string> results;
@@ -234,8 +234,8 @@ std::vector<std::string> ContextInterface::ContextRetrieve(
       auto task = cte_client->AsyncTemporalSearch(
           tag_re, blob_re,
           time_begin, time_end,
-          static_cast<chi::u32>(max_results),
-          chi::PoolQuery::Broadcast());
+          static_cast<clio::run::u32>(max_results),
+          clio::run::PoolQuery::Broadcast());
       task.Wait();
       query_results.reserve(task->results_.size());
       for (const auto& r : task->results_) {
@@ -243,9 +243,9 @@ std::vector<std::string> ContextInterface::ContextRetrieve(
       }
     } else if (!prompt.empty()) {
       // Mode 2: BM25 semantic search
-      chi::u32 k = max_results > 0 ? max_results : 10;
+      clio::run::u32 k = max_results > 0 ? max_results : 10;
       auto task = cte_client->AsyncSemanticSearch(
-          tag_re, blob_re, prompt, k, chi::PoolQuery::Broadcast());
+          tag_re, blob_re, prompt, k, clio::run::PoolQuery::Broadcast());
       task.Wait();
       query_results.reserve(task->results_.size());
       for (const auto& r : task->results_) {
@@ -254,7 +254,7 @@ std::vector<std::string> ContextInterface::ContextRetrieve(
     } else {
       // Mode 3: regex-only via BlobQuery
       auto query_task = cte_client->AsyncBlobQuery(
-          tag_re, blob_re, max_results, chi::PoolQuery::Broadcast());
+          tag_re, blob_re, max_results, clio::run::PoolQuery::Broadcast());
       query_task.Wait();
       size_t result_count = std::min(query_task->tag_names_.size(),
                                      query_task->blob_names_.size());
@@ -288,7 +288,7 @@ std::vector<std::string> ContextInterface::ContextRetrieve(
       size_t batch_count = batch_end - batch_start;
 
       // Schedule AsyncGetBlob operations for this batch
-      std::vector<chi::Future<clio::cte::core::GetBlobTask>> tasks;
+      std::vector<clio::run::Future<clio::cte::core::GetBlobTask>> tasks;
       tasks.reserve(batch_count);
 
       for (size_t i = batch_start; i < batch_end; ++i) {
@@ -306,7 +306,7 @@ std::vector<std::string> ContextInterface::ContextRetrieve(
         // Get blob size first
         auto size_task = cte_client->AsyncGetBlobSize(tag_id, blob_name);
         size_task.Wait();
-        chi::u64 blob_size = size_task->size_;
+        clio::run::u64 blob_size = size_task->size_;
         if (blob_size == 0) {
           HLOG(kWarning, "Blob '{}' has zero size, skipping", blob_name);
           continue;

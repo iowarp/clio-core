@@ -13,25 +13,25 @@ namespace clio::cae::core {
 
 namespace Method {
 // Inherited methods
-GLOBAL_CROSS_CONST chi::u32 kCreate = 0;
-GLOBAL_CROSS_CONST chi::u32 kDestroy = 1;
-GLOBAL_CROSS_CONST chi::u32 kMonitor = 9;
+GLOBAL_CROSS_CONST clio::run::u32 kCreate = 0;
+GLOBAL_CROSS_CONST clio::run::u32 kDestroy = 1;
+GLOBAL_CROSS_CONST clio::run::u32 kMonitor = 9;
 
 // core-specific methods
-GLOBAL_CROSS_CONST chi::u32 kParseOmni = 10;
-GLOBAL_CROSS_CONST chi::u32 kProcessHdf5Dataset = 11;
-GLOBAL_CROSS_CONST chi::u32 kExportData = 12;
+GLOBAL_CROSS_CONST clio::run::u32 kParseOmni = 10;
+GLOBAL_CROSS_CONST clio::run::u32 kProcessHdf5Dataset = 11;
+GLOBAL_CROSS_CONST clio::run::u32 kExportData = 12;
 
 // CTE interceptor methods. IDs MUST match clio::cte::core::Method::k*
 // so that a CTE-built task (whose constructor stamps the CTE method id)
 // dispatches to the matching CAE handler when routed to a CAE pool.
 // Keep these in sync with context-transfer-engine/core/clio_mod.yaml.
-GLOBAL_CROSS_CONST chi::u32 kGetOrCreateTag = 14;
-GLOBAL_CROSS_CONST chi::u32 kPutBlob = 15;
-GLOBAL_CROSS_CONST chi::u32 kGetBlob = 16;
-GLOBAL_CROSS_CONST chi::u32 kSemanticSearch = 35;
+GLOBAL_CROSS_CONST clio::run::u32 kGetOrCreateTag = 14;
+GLOBAL_CROSS_CONST clio::run::u32 kPutBlob = 15;
+GLOBAL_CROSS_CONST clio::run::u32 kGetBlob = 16;
+GLOBAL_CROSS_CONST clio::run::u32 kSemanticSearch = 35;
 
-GLOBAL_CROSS_CONST chi::u32 kMaxMethodId = 36;
+GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 36;
 
 inline const std::vector<std::string>& GetMethodNames() {
   static const std::vector<std::string> names = [] {

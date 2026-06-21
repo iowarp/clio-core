@@ -36,18 +36,18 @@ namespace clio::cte::filesystem {
   X(kAppendExecution, AppendExecutionTask, AppendExecution) \
   X(kAppendPlan, AppendPlanTask, AppendPlan)
 
-void Runtime::Init(const chi::PoolId &pool_id, const std::string &pool_name,
-                   chi::u32 container_id) {
-  chi::Container::Init(pool_id, pool_name, container_id);
+void Runtime::Init(const clio::run::PoolId &pool_id, const std::string &pool_name,
+                   clio::run::u32 container_id) {
+  clio::run::Container::Init(pool_id, pool_name, container_id);
   DefineModel(Method::kMaxMethodId);
   SetMethodNames(Method::GetMethodNames());
 }
 
-chi::u64 Runtime::GetWorkRemaining() const { return 0; }
+clio::run::u64 Runtime::GetWorkRemaining() const { return 0; }
 
-chi::TaskResume Runtime::Run(chi::u32 method,
-                             ctp::ipc::FullPtr<chi::Task> task_ptr,
-                             chi::RunContext &rctx) {
+clio::run::TaskResume Runtime::Run(clio::run::u32 method,
+                             ctp::ipc::FullPtr<clio::run::Task> task_ptr,
+                             clio::run::RunContext &rctx) {
   CLIO_TASK_BODY_BEGIN
   switch (method) {
 #define X(MID, TASK, HANDLER)                                       \
@@ -65,8 +65,8 @@ chi::TaskResume Runtime::Run(chi::u32 method,
   CLIO_TASK_BODY_END
 }
 
-void Runtime::SaveTask(chi::u32 method, chi::SaveTaskArchive &archive,
-                       ctp::ipc::FullPtr<chi::Task> task_ptr) {
+void Runtime::SaveTask(clio::run::u32 method, clio::run::SaveTaskArchive &archive,
+                       ctp::ipc::FullPtr<clio::run::Task> task_ptr) {
   switch (method) {
 #define X(MID, TASK, HANDLER)                                  \
     case Method::MID:                                          \
@@ -79,8 +79,8 @@ void Runtime::SaveTask(chi::u32 method, chi::SaveTaskArchive &archive,
   }
 }
 
-void Runtime::LoadTask(chi::u32 method, chi::LoadTaskArchive &archive,
-                       ctp::ipc::FullPtr<chi::Task> task_ptr) {
+void Runtime::LoadTask(clio::run::u32 method, clio::run::LoadTaskArchive &archive,
+                       ctp::ipc::FullPtr<clio::run::Task> task_ptr) {
   switch (method) {
 #define X(MID, TASK, HANDLER)                                  \
     case Method::MID:                                          \
@@ -93,17 +93,17 @@ void Runtime::LoadTask(chi::u32 method, chi::LoadTaskArchive &archive,
   }
 }
 
-ctp::ipc::FullPtr<chi::Task> Runtime::AllocLoadTask(
-    chi::u32 method, chi::LoadTaskArchive &archive) {
-  ctp::ipc::FullPtr<chi::Task> task_ptr = NewTask(method);
+ctp::ipc::FullPtr<clio::run::Task> Runtime::AllocLoadTask(
+    clio::run::u32 method, clio::run::LoadTaskArchive &archive) {
+  ctp::ipc::FullPtr<clio::run::Task> task_ptr = NewTask(method);
   if (!task_ptr.IsNull()) {
     LoadTask(method, archive, task_ptr);
   }
   return task_ptr;
 }
 
-void Runtime::LocalLoadTask(chi::u32 method, chi::DefaultLoadArchive &archive,
-                            ctp::ipc::FullPtr<chi::Task> task_ptr) {
+void Runtime::LocalLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive &archive,
+                            ctp::ipc::FullPtr<clio::run::Task> task_ptr) {
   switch (method) {
 #define X(MID, TASK, HANDLER)                                  \
     case Method::MID:                                          \
@@ -116,17 +116,17 @@ void Runtime::LocalLoadTask(chi::u32 method, chi::DefaultLoadArchive &archive,
   }
 }
 
-ctp::ipc::FullPtr<chi::Task> Runtime::LocalAllocLoadTask(
-    chi::u32 method, chi::DefaultLoadArchive &archive) {
-  ctp::ipc::FullPtr<chi::Task> task_ptr = NewTask(method);
+ctp::ipc::FullPtr<clio::run::Task> Runtime::LocalAllocLoadTask(
+    clio::run::u32 method, clio::run::DefaultLoadArchive &archive) {
+  ctp::ipc::FullPtr<clio::run::Task> task_ptr = NewTask(method);
   if (!task_ptr.IsNull()) {
     LocalLoadTask(method, archive, task_ptr);
   }
   return task_ptr;
 }
 
-void Runtime::LocalSaveTask(chi::u32 method, chi::DefaultSaveArchive &archive,
-                            ctp::ipc::FullPtr<chi::Task> task_ptr) {
+void Runtime::LocalSaveTask(clio::run::u32 method, clio::run::DefaultSaveArchive &archive,
+                            ctp::ipc::FullPtr<clio::run::Task> task_ptr) {
   switch (method) {
 #define X(MID, TASK, HANDLER)                                  \
     case Method::MID:                                          \
@@ -139,11 +139,11 @@ void Runtime::LocalSaveTask(chi::u32 method, chi::DefaultSaveArchive &archive,
   }
 }
 
-ctp::ipc::FullPtr<chi::Task> Runtime::NewCopyTask(
-    chi::u32 method, ctp::ipc::FullPtr<chi::Task> orig_task_ptr, bool deep) {
+ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(
+    clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> orig_task_ptr, bool deep) {
   auto *ipc_manager = CLIO_IPC;
   if (!ipc_manager) {
-    return ctp::ipc::FullPtr<chi::Task>();
+    return ctp::ipc::FullPtr<clio::run::Task>();
   }
   (void)deep;
   switch (method) {
@@ -152,14 +152,14 @@ ctp::ipc::FullPtr<chi::Task> Runtime::NewCopyTask(
       auto new_task = ipc_manager->NewTask<TASK>();                      \
       if (!new_task.IsNull()) {                                          \
         new_task->Copy(orig_task_ptr.template Cast<TASK>());             \
-        return new_task.template Cast<chi::Task>();                      \
+        return new_task.template Cast<clio::run::Task>();                      \
       }                                                                  \
       break;                                                             \
     }
     CLIO_FS_FOR_EACH_METHOD(X)
 #undef X
     default: {
-      auto new_task = ipc_manager->NewTask<chi::Task>();
+      auto new_task = ipc_manager->NewTask<clio::run::Task>();
       if (!new_task.IsNull()) {
         new_task->Copy(orig_task_ptr);
         return new_task;
@@ -167,27 +167,27 @@ ctp::ipc::FullPtr<chi::Task> Runtime::NewCopyTask(
       break;
     }
   }
-  return ctp::ipc::FullPtr<chi::Task>();
+  return ctp::ipc::FullPtr<clio::run::Task>();
 }
 
-ctp::ipc::FullPtr<chi::Task> Runtime::NewTask(chi::u32 method) {
+ctp::ipc::FullPtr<clio::run::Task> Runtime::NewTask(clio::run::u32 method) {
   auto *ipc_manager = CLIO_IPC;
   if (!ipc_manager) {
-    return ctp::ipc::FullPtr<chi::Task>();
+    return ctp::ipc::FullPtr<clio::run::Task>();
   }
   switch (method) {
 #define X(MID, TASK, HANDLER)                                  \
     case Method::MID:                                          \
-      return ipc_manager->NewTask<TASK>().template Cast<chi::Task>();
+      return ipc_manager->NewTask<TASK>().template Cast<clio::run::Task>();
     CLIO_FS_FOR_EACH_METHOD(X)
 #undef X
     default:
-      return ctp::ipc::FullPtr<chi::Task>();
+      return ctp::ipc::FullPtr<clio::run::Task>();
   }
 }
 
-void Runtime::AggregateOut(chi::u32 method, ctp::ipc::FullPtr<chi::Task> orig_task,
-                           const ctp::ipc::FullPtr<chi::Task> &replica_task) {
+void Runtime::AggregateOut(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> orig_task,
+                           const ctp::ipc::FullPtr<clio::run::Task> &replica_task) {
   switch (method) {
 #define X(MID, TASK, HANDLER)                                      \
     case Method::MID:                                              \
@@ -201,8 +201,8 @@ void Runtime::AggregateOut(chi::u32 method, ctp::ipc::FullPtr<chi::Task> orig_ta
   }
 }
 
-void Runtime::AggregateIn(chi::u32 method, ctp::ipc::FullPtr<chi::Task> agg_task,
-                          const ctp::ipc::FullPtr<chi::Task> &member_task) {
+void Runtime::AggregateIn(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> agg_task,
+                          const ctp::ipc::FullPtr<clio::run::Task> &member_task) {
   // Only AppendCollect combines member inputs (ManyToOne). All other methods
   // keep the default no-op (the aggregate is a copy of the first member).
   if (method == Method::kAppendCollect) {
@@ -210,7 +210,7 @@ void Runtime::AggregateIn(chi::u32 method, ctp::ipc::FullPtr<chi::Task> agg_task
   }
 }
 
-void Runtime::DelTask(chi::u32 method, ctp::ipc::FullPtr<chi::Task> task_ptr) {
+void Runtime::DelTask(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> task_ptr) {
   auto *ipc_manager = CLIO_IPC;
   if (!ipc_manager) {
     return;

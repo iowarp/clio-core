@@ -1019,7 +1019,7 @@ void SystemInfo::Setenv(const char *name, const std::string &value,
   // reads) and the Win32 process environment block (which
   // GetEnvironmentVariable reads). SetEnvironmentVariable only touches
   // the Win32 block, which would leave std::getenv blind to the new
-  // value — and chi::env::GetCompat goes through std::getenv. Honor the
+  // value — and clio::run::env::GetCompat goes through std::getenv. Honor the
   // overwrite flag manually since _putenv_s always overwrites.
   if (!overwrite) {
     char probe[2];

@@ -78,7 +78,7 @@ IowarpEngine::IowarpEngine(adios2::core::IO &io, const std::string &name,
     int local_rank = rank_ % ppn;
     // Per-local-rank stagger step (μs); default 250 ms so 12 ranks
     // spread over 3s. Tunable via CHI_INIT_STAGGER_MS.
-    const char *stag_env = chi::env::GetCompat("INIT_STAGGER_MS");
+    const char *stag_env = clio::run::env::GetCompat("INIT_STAGGER_MS");
     int stagger_ms = (stag_env && *stag_env) ? std::atoi(stag_env) : 250;
     if (stagger_ms < 0) stagger_ms = 0;
     if (local_rank > 0) {
@@ -96,10 +96,10 @@ IowarpEngine::IowarpEngine(adios2::core::IO &io, const std::string &name,
   // on the same second. Tunable via CHI_INIT_ATTEMPTS and
   // CHI_INIT_SLEEP_MS (sleep is mean; actual is uniform [0.5x, 1.5x]).
   HLOG(kDebug, "[IowarpEngine] About to call CLIO_CTE_CLIENT_INIT");
-  const char *att_env = chi::env::GetCompat("INIT_ATTEMPTS");
+  const char *att_env = clio::run::env::GetCompat("INIT_ATTEMPTS");
   int max_attempts = (att_env && *att_env) ? std::atoi(att_env) : 60;
   if (max_attempts < 1) max_attempts = 1;
-  const char *slp_env = chi::env::GetCompat("INIT_SLEEP_MS");
+  const char *slp_env = clio::run::env::GetCompat("INIT_SLEEP_MS");
   int mean_sleep_ms = (slp_env && *slp_env) ? std::atoi(slp_env) : 3000;
   if (mean_sleep_ms < 1) mean_sleep_ms = 1;
   // Per-rank seed so each rank's jitter sequence differs.
@@ -108,7 +108,7 @@ IowarpEngine::IowarpEngine(adios2::core::IO &io, const std::string &name,
       static_cast<unsigned int>(::getpid());
   bool ok = false;
   for (int attempt = 0; attempt < max_attempts; ++attempt) {
-    if (clio::cte::core::CLIO_CTE_CLIENT_INIT("", chi::PoolQuery::Local())) {
+    if (clio::cte::core::CLIO_CTE_CLIENT_INIT("", clio::run::PoolQuery::Local())) {
       ok = true;
       break;
     }

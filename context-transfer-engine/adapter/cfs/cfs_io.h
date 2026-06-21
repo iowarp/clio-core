@@ -87,9 +87,9 @@ static constexpr dev_t kClioStDev = static_cast<dev_t>(0xC110);
 class CfsIo {
  public:
   struct OpenFile {
-    chi::u64 handle = 0;   ///< chimod handle
+    clio::run::u64 handle = 0;   ///< chimod handle
     std::string path;      ///< bare (stripped) path == CTE tag name
-    chi::u64 off = 0;      ///< current seek offset
+    clio::run::u64 off = 0;      ///< current seek offset
     int flags = 0;         ///< open() flags
   };
 
@@ -155,7 +155,7 @@ class CfsIo {
       }
       of = it->second;
     }
-    chi::u64 size = 0;
+    clio::run::u64 size = 0;
     if (!QuerySize(of.path, &size)) {
       errno = EBADF;
       return -1;
@@ -168,7 +168,7 @@ class CfsIo {
   template <typename StatT>
   int StatPath(const std::string &raw_path, StatT *buf) {
     std::string path = StripClioPrefix(raw_path);
-    chi::u64 size = 0;
+    clio::run::u64 size = 0;
     bool exists = false;
     if (!QueryGetattr(path, &exists, &size) || !exists) {
       std::memset(buf, 0, sizeof(StatT));
@@ -189,13 +189,13 @@ class CfsIo {
   bool EnsureClient();
 
   /** Logical size of a tag (0 if absent). */
-  bool QuerySize(const std::string &path, chi::u64 *size);
+  bool QuerySize(const std::string &path, clio::run::u64 *size);
   /** Existence + logical size of a tag. */
-  bool QueryGetattr(const std::string &path, bool *exists, chi::u64 *size);
+  bool QueryGetattr(const std::string &path, bool *exists, clio::run::u64 *size);
 
   /** Core read/write against a chimod handle (no offset bookkeeping). */
-  ssize_t DoRead(chi::u64 handle, chi::u64 off, void *buf, size_t count);
-  ssize_t DoWrite(chi::u64 handle, chi::u64 off, const void *buf, size_t count);
+  ssize_t DoRead(clio::run::u64 handle, clio::run::u64 off, void *buf, size_t count);
+  ssize_t DoWrite(clio::run::u64 handle, clio::run::u64 off, const void *buf, size_t count);
 
   /** Stable 64-bit synthetic inode from the bare path. */
   static uint64_t SyntheticInode(const std::string &path) {
@@ -204,7 +204,7 @@ class CfsIo {
   }
 
   template <typename StatT>
-  static void FillStat(StatT *buf, const std::string &path, chi::u64 size) {
+  static void FillStat(StatT *buf, const std::string &path, clio::run::u64 size) {
     std::memset(buf, 0, sizeof(StatT));
     buf->st_dev = kClioStDev;
     buf->st_ino = SyntheticInode(path);

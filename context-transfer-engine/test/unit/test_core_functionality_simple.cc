@@ -70,15 +70,15 @@ public:
   bool setup_completed_ = false;
 
   // Semantic names for queue IDs and priorities (following CLAUDE.md requirements)
-  static constexpr chi::QueueId kTestMainQueueId = chi::QueueId(1);
+  static constexpr clio::run::QueueId kTestMainQueueId = clio::run::QueueId(1);
   
   // Test configuration constants
-  static constexpr chi::u64 kTestTargetSize = 1024 * 1024 * 10;  // 10MB test target
-  static constexpr chi::u32 kTestWorkerCount = 2;
+  static constexpr clio::run::u64 kTestTargetSize = 1024 * 1024 * 10;  // 10MB test target
+  static constexpr clio::run::u32 kTestWorkerCount = 2;
   
   std::unique_ptr<clio::cte::core::Client> core_client_;
   std::string test_storage_path_;
-  chi::PoolId core_pool_id_;
+  clio::run::PoolId core_pool_id_;
 
   CTECoreTestFixture() {
     INFO("=== Initializing CTE Core Test Environment ===");
@@ -100,12 +100,12 @@ public:
     }
     
     // Initialize CLIO Runtime runtime and client for proper functionality
-    bool success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
+    bool success = clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true);
     REQUIRE(success);
     
     // Generate unique pool ID for this test
     int rand_id = 1000 + rand() % 9000;  // Random ID 1000-9999
-    core_pool_id_ = chi::PoolId(static_cast<chi::u32>(rand_id), 0);
+    core_pool_id_ = clio::run::PoolId(static_cast<clio::run::u32>(rand_id), 0);
     INFO("Generated pool ID: " << core_pool_id_.ToU64());
     
     // Create and initialize core client with the generated pool ID
@@ -268,14 +268,14 @@ TEST_CASE("Target Configuration Validation", "[cte][core][target][config]") {
   
   SECTION("Target size validation") {
     // Test various target sizes
-    std::vector<chi::u64> test_sizes = {
+    std::vector<clio::run::u64> test_sizes = {
       1024,                    // 1KB
       1024 * 1024,            // 1MB
       1024 * 1024 * 10,       // 10MB
       1024ULL * 1024 * 1024   // 1GB
     };
     
-    for (chi::u64 size : test_sizes) {
+    for (clio::run::u64 size : test_sizes) {
       REQUIRE(size > 0);
       INFO("Target size validated: " << size << " bytes");
     }
@@ -299,7 +299,7 @@ TEST_CASE("Tag Information Structure", "[cte][core][tag][info]") {
     
     // Test TagInfo structure parameters
     const std::string test_tag_name = "test_tag";
-    const chi::u32 test_tag_id = 123;
+    const clio::run::u32 test_tag_id = 123;
     
     REQUIRE(!test_tag_name.empty());
     REQUIRE(test_tag_id > 0);
@@ -312,9 +312,9 @@ TEST_CASE("Tag Information Structure", "[cte][core][tag][info]") {
   
   SECTION("Blob ID mapping concepts") {
     // Test that blob ID mapping concepts are valid
-    std::vector<chi::u32> test_blob_ids = {1, 2, 3, 42, 100};
+    std::vector<clio::run::u32> test_blob_ids = {1, 2, 3, 42, 100};
     
-    for (chi::u32 blob_id : test_blob_ids) {
+    for (clio::run::u32 blob_id : test_blob_ids) {
       REQUIRE(blob_id > 0);  // Valid blob IDs should be non-zero
     }
     
@@ -337,11 +337,11 @@ TEST_CASE("Blob Information Structure", "[cte][core][blob][info]") {
     // initialization complexity. These tests validate parameter ranges and types.
     
     // Test BlobInfo parameters
-    const chi::u32 test_blob_id = 456;
+    const clio::run::u32 test_blob_id = 456;
     const std::string test_blob_name = "test_blob";
     const std::string test_target_name = "test_target"; 
-    const chi::u64 test_offset = 1024;
-    const chi::u64 test_size = 4096;
+    const clio::run::u64 test_offset = 1024;
+    const clio::run::u64 test_size = 4096;
     const float test_score = 0.7f;
     
     REQUIRE(test_blob_id > 0);
@@ -389,11 +389,11 @@ TEST_CASE("Task Structure Validation", "[cte][core][tasks]") {
     // compile correctly and have the expected member variables.
     
     // Test task parameter types and ranges
-    const chi::u32 test_result_code = 0;
-    const chi::u64 test_total_size = 1024 * 1024;  // 1MB
+    const clio::run::u32 test_result_code = 0;
+    const clio::run::u64 test_total_size = 1024 * 1024;  // 1MB
     const clio::run::bdev::BdevType test_bdev_type = clio::run::bdev::BdevType::kFile;
-    const chi::u32 test_tag_id = 100;
-    const chi::u32 test_blob_id = 200;
+    const clio::run::u32 test_tag_id = 100;
+    const clio::run::u32 test_blob_id = 200;
     const float test_score = 0.5f;
     
     REQUIRE(test_result_code == 0);
@@ -515,15 +515,15 @@ TEST_CASE("CTE Core Workflow Validation", "[cte][core][workflow]") {
     // Validate configuration parameters for different scenarios
     
     // Multiple configuration scenarios - test parameter ranges
-    std::vector<chi::u32> worker_counts = {1, 2, 4, 8};
-    std::vector<chi::u64> target_sizes = {1024, 1024*1024, 10*1024*1024};
+    std::vector<clio::run::u32> worker_counts = {1, 2, 4, 8};
+    std::vector<clio::run::u64> target_sizes = {1024, 1024*1024, 10*1024*1024};
     
-    for (chi::u32 workers : worker_counts) {
+    for (clio::run::u32 workers : worker_counts) {
       REQUIRE(workers > 0);
       REQUIRE(workers <= 16);  // Reasonable upper bound for testing
     }
     
-    for (chi::u64 size : target_sizes) {
+    for (clio::run::u64 size : target_sizes) {
       REQUIRE(size > 0);
     }
     

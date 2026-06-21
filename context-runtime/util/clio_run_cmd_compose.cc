@@ -52,7 +52,7 @@ struct ClientFinalizeGuard {
 };
 
 bool InitClient() {
-  if (!chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, false)) {
+  if (!clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, false)) {
     HLOG(kError, "Failed to initialize Clio runtime client");
     return false;
   }
@@ -61,8 +61,8 @@ bool InitClient() {
 
 // Load a compose file into a local ConfigManager (avoids clobbering the
 // process-wide singleton) and copy out its pool list.
-bool LoadComposeFile(const std::string& path, chi::ComposeConfig* out) {
-  chi::ConfigManager cfg;
+bool LoadComposeFile(const std::string& path, clio::run::ComposeConfig* out) {
+  clio::run::ConfigManager cfg;
   if (!cfg.LoadYaml(path)) {
     HLOG(kError, "Failed to load compose file: {}", path);
     return false;
@@ -77,7 +77,7 @@ int ComposeStart(const std::string& path) {
   }
   ClientFinalizeGuard guard;
 
-  chi::ComposeConfig compose;
+  clio::run::ComposeConfig compose;
   if (!LoadComposeFile(path, &compose)) {
     return 1;
   }
@@ -129,7 +129,7 @@ int ComposeStart(const std::string& path) {
 
 // Destroy every pool listed in a compose file. Used by both stop and rm.
 int DestroyComposePools(const std::string& path) {
-  chi::ComposeConfig compose;
+  clio::run::ComposeConfig compose;
   if (!LoadComposeFile(path, &compose)) {
     return 1;
   }
@@ -142,7 +142,7 @@ int DestroyComposePools(const std::string& path) {
     HLOG(kInfo, "Stopping pool {} (module: {})", pool_config.pool_name_,
          pool_config.mod_name_);
     auto task =
-        admin->AsyncDestroyPool(chi::PoolQuery::Dynamic(), pool_config.pool_id_);
+        admin->AsyncDestroyPool(clio::run::PoolQuery::Dynamic(), pool_config.pool_id_);
     task.Wait();
     if (task->GetReturnCode() != 0) {
       HLOG(kWarning, "Failed to stop pool {}, return code: {}",
@@ -203,7 +203,7 @@ int ComposeList(bool restartable) {
     HLOG(kError, "Failed to get admin client");
     return 1;
   }
-  auto task = admin->AsyncListContainers(chi::PoolQuery::Local());
+  auto task = admin->AsyncListContainers(clio::run::PoolQuery::Local());
   task.Wait();
   if (task->GetReturnCode() != 0) {
     HLOG(kError, "ListContainers failed, return code: {}",

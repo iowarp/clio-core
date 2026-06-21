@@ -19,7 +19,7 @@ struct WorkerIOContext {
   bool is_initialized_{false};
   std::unique_ptr<ctp::AsyncIO> async_io_;
 
-  bool Init(const std::string &file_path, chi::u32 io_depth, chi::u32 worker_id);
+  bool Init(const std::string &file_path, clio::run::u32 io_depth, clio::run::u32 worker_id);
   void Cleanup();
 };
 
@@ -35,17 +35,17 @@ class FsBdevTransport : public BdevTransport {
   bool AllocateBlocks(size_t size, int worker_id, std::vector<Block>& blocks) override;
   void FreeBlocks(int worker_id, const std::vector<Block>& blocks) override;
 
-  chi::TaskResume WriteBlocks(ctp::ipc::FullPtr<WriteTask> task, chi::RunContext &ctx) override;
-  chi::TaskResume ReadBlocks(ctp::ipc::FullPtr<ReadTask> task, chi::RunContext &ctx) override;
+  clio::run::TaskResume WriteBlocks(ctp::ipc::FullPtr<WriteTask> task, clio::run::RunContext &ctx) override;
+  clio::run::TaskResume ReadBlocks(ctp::ipc::FullPtr<ReadTask> task, clio::run::RunContext &ctx) override;
 
-  chi::u64 GetCapacity() const override { return allocator_.GetCapacity(); }
-  chi::u64 GetRemainingSize() const override { return allocator_.GetRemainingSize(); }
+  clio::run::u64 GetCapacity() const override { return allocator_.GetCapacity(); }
+  clio::run::u64 GetRemainingSize() const override { return allocator_.GetRemainingSize(); }
 
  private:
   StandardBlockAllocator allocator_;
   std::vector<WorkerIOContext> io_contexts_;
   std::string file_path_;
-  chi::u32 io_depth_;
+  clio::run::u32 io_depth_;
 
   bool InitializeWorkerIOContexts();
   void CleanupWorkerIOContexts();

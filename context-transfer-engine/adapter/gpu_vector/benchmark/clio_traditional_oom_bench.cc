@@ -49,17 +49,17 @@ using namespace std::chrono_literals;
 namespace {
 
 struct BenchOpts {
-  chi::u32 nblocks = 32;
-  chi::u32 pages_per_block = 2;     // accepted for CLI compat; unused here
-  chi::u64 page_size = 1ULL << 20;  // 1 MiB
+  clio::run::u32 nblocks = 32;
+  clio::run::u32 pages_per_block = 2;     // accepted for CLI compat; unused here
+  clio::run::u64 page_size = 1ULL << 20;  // 1 MiB
   double ratio = 1.0;
-  chi::u64 total_bytes = 0;
-  chi::u64 per_block_bytes = 0;
-  chi::u32 cache_period_ms = 0;     // accepted for CLI compat; unused here
-  chi::u32 iters = 1;
+  clio::run::u64 total_bytes = 0;
+  clio::run::u64 per_block_bytes = 0;
+  clio::run::u32 cache_period_ms = 0;     // accepted for CLI compat; unused here
+  clio::run::u32 iters = 1;
   bool do_read = true;
-  chi::u32 gpu_id = 0;
-  chi::u64 bdev_capacity_mib = 0;
+  clio::run::u32 gpu_id = 0;
+  clio::run::u64 bdev_capacity_mib = 0;
 };
 
 void PrintUsage(const char *prog) {
@@ -123,9 +123,9 @@ bool ParseOpts(int argc, char *argv[], BenchOpts &opts) {
 }
 
 #if !CTP_IS_DEVICE_PASS
-void EnsureInit(const BenchOpts &opts, chi::u64 bdev_capacity_bytes) {
+void EnsureInit(const BenchOpts &opts, clio::run::u64 bdev_capacity_bytes) {
   std::fprintf(stderr, "[INIT] Starting Chimaera server\n");
-  if (!chi::CHIMAERA_INIT(chi::ChimaeraMode::kServer)) {
+  if (!clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kServer)) {
     std::fprintf(stderr, "[INIT] CHIMAERA_INIT failed\n");
     std::exit(2);
   }
@@ -137,7 +137,7 @@ void EnsureInit(const BenchOpts &opts, chi::u64 bdev_capacity_bytes) {
   cte_client->Init(clio::cte::core::kCtePoolId);
   clio::cte::core::CreateParams params;
   auto create_task = cte_client->AsyncCreate(
-      chi::PoolQuery::Dynamic(), clio::cte::core::kCtePoolName,
+      clio::run::PoolQuery::Dynamic(), clio::cte::core::kCtePoolName,
       clio::cte::core::kCtePoolId, params);
   create_task.Wait();
   if (create_task->GetReturnCode() != 0) {
@@ -147,10 +147,10 @@ void EnsureInit(const BenchOpts &opts, chi::u64 bdev_capacity_bytes) {
   }
   std::this_thread::sleep_for(50ms);
 
-  chi::PoolId bdev_pool_id(951, 0);
+  clio::run::PoolId bdev_pool_id(951, 0);
   clio::run::bdev::Client bdev_client(bdev_pool_id);
   auto bdev_create = bdev_client.AsyncCreate(
-      chi::PoolQuery::Dynamic(), std::string("trad_bench_ram"),
+      clio::run::PoolQuery::Dynamic(), std::string("trad_bench_ram"),
       bdev_pool_id, clio::run::bdev::BdevType::kRam, bdev_capacity_bytes);
   bdev_create.Wait();
   if (bdev_create->GetReturnCode() != 0) {
@@ -161,7 +161,7 @@ void EnsureInit(const BenchOpts &opts, chi::u64 bdev_capacity_bytes) {
   std::this_thread::sleep_for(50ms);
   auto reg_task = cte_client->AsyncRegisterTarget(
       "trad_bench_ram", clio::run::bdev::BdevType::kRam,
-      bdev_capacity_bytes, chi::PoolQuery::Local(), bdev_pool_id);
+      bdev_capacity_bytes, clio::run::PoolQuery::Local(), bdev_pool_id);
   reg_task.Wait();
   if (reg_task->GetReturnCode() != 0) {
     std::fprintf(stderr, "[INIT] RegisterTarget failed rc=%u\n",
@@ -176,27 +176,27 @@ void EnsureInit(const BenchOpts &opts, chi::u64 bdev_capacity_bytes) {
 }  // namespace
 
 /** Each block writes its slice of stripe page p into dev_buf[b*page_size]. */
-__global__ void TradFillPageKernel(chi::u32 *dev_buf,
-                                    chi::u64 elems_per_page,
-                                    chi::u64 page_idx,
-                                    chi::u64 per_block_pages) {
-  chi::u32 b = blockIdx.x;
-  chi::u64 base =
-      (static_cast<chi::u64>(b) * per_block_pages + page_idx) * elems_per_page;
-  chi::u32 *slot = dev_buf + b * elems_per_page;
-  for (chi::u64 j = threadIdx.x; j < elems_per_page; j += blockDim.x) {
-    slot[j] = static_cast<chi::u32>(base + j);
+__global__ void TradFillPageKernel(clio::run::u32 *dev_buf,
+                                    clio::run::u64 elems_per_page,
+                                    clio::run::u64 page_idx,
+                                    clio::run::u64 per_block_pages) {
+  clio::run::u32 b = blockIdx.x;
+  clio::run::u64 base =
+      (static_cast<clio::run::u64>(b) * per_block_pages + page_idx) * elems_per_page;
+  clio::run::u32 *slot = dev_buf + b * elems_per_page;
+  for (clio::run::u64 j = threadIdx.x; j < elems_per_page; j += blockDim.x) {
+    slot[j] = static_cast<clio::run::u32>(base + j);
   }
 }
 
 /** Touch the H2D-copied data so the H2D path is observable on profilers. */
-__global__ void TradConsumePageKernel(const chi::u32 *dev_buf,
-                                       chi::u64 elems_per_page,
-                                       chi::u32 *out_xor) {
-  chi::u32 b = blockIdx.x;
-  const chi::u32 *slot = dev_buf + b * elems_per_page;
-  chi::u32 acc = 0;
-  for (chi::u64 j = threadIdx.x; j < elems_per_page; j += blockDim.x) {
+__global__ void TradConsumePageKernel(const clio::run::u32 *dev_buf,
+                                       clio::run::u64 elems_per_page,
+                                       clio::run::u32 *out_xor) {
+  clio::run::u32 b = blockIdx.x;
+  const clio::run::u32 *slot = dev_buf + b * elems_per_page;
+  clio::run::u32 acc = 0;
+  for (clio::run::u64 j = threadIdx.x; j < elems_per_page; j += blockDim.x) {
     acc ^= slot[j];
   }
   // single-warp xor reduction
@@ -213,7 +213,7 @@ __global__ void TradConsumePageKernel(const chi::u32 *dev_buf,
 #if !CTP_IS_DEVICE_PASS
 
 namespace {
-std::string FmtBytes(chi::u64 b) {
+std::string FmtBytes(clio::run::u64 b) {
   char buf[64];
   if (b >= (1ULL << 30)) {
     std::snprintf(buf, sizeof(buf), "%.2f GiB",
@@ -239,20 +239,20 @@ int main(int argc, char *argv[]) {
     std::fprintf(stderr, "blocks/pages/page_size must be > 0\n");
     return 2;
   }
-  if (opts.page_size % sizeof(chi::u32) != 0) {
+  if (opts.page_size % sizeof(clio::run::u32) != 0) {
     std::fprintf(stderr, "page_size must be a multiple of sizeof(u32)\n");
     return 2;
   }
 
-  chi::u64 cache_bytes = static_cast<chi::u64>(opts.nblocks) *
+  clio::run::u64 cache_bytes = static_cast<clio::run::u64>(opts.nblocks) *
                          opts.pages_per_block * opts.page_size;
-  chi::u64 per_block_bytes;
+  clio::run::u64 per_block_bytes;
   if (opts.per_block_bytes > 0) {
     per_block_bytes = opts.per_block_bytes;
   } else if (opts.total_bytes > 0) {
     per_block_bytes = opts.total_bytes / opts.nblocks;
   } else {
-    chi::u64 t = static_cast<chi::u64>(opts.ratio * cache_bytes);
+    clio::run::u64 t = static_cast<clio::run::u64>(opts.ratio * cache_bytes);
     if (t < opts.page_size) t = opts.page_size;
     per_block_bytes = t / opts.nblocks;
   }
@@ -262,22 +262,22 @@ int main(int argc, char *argv[]) {
                        opts.page_size) * opts.page_size;
   }
   opts.total_bytes = per_block_bytes * opts.nblocks;
-  chi::u64 per_block_pages = per_block_bytes / opts.page_size;
-  chi::u64 elems_per_page = opts.page_size / sizeof(chi::u32);
+  clio::run::u64 per_block_pages = per_block_bytes / opts.page_size;
+  clio::run::u64 elems_per_page = opts.page_size / sizeof(clio::run::u32);
 
-  chi::u64 bdev_capacity_bytes;
+  clio::run::u64 bdev_capacity_bytes;
   if (opts.bdev_capacity_mib > 0) {
     bdev_capacity_bytes = opts.bdev_capacity_mib * (1ULL << 20);
   } else {
     bdev_capacity_bytes =
-        std::max<chi::u64>(64ULL << 20, opts.total_bytes * 4);
+        std::max<clio::run::u64>(64ULL << 20, opts.total_bytes * 4);
   }
 
   // Per traditional pattern: 1 PutBlob per (block, page) on the write side
   // and 1 GetBlob per (block, page) on the read side.
-  chi::u64 expected_puts =
-      static_cast<chi::u64>(opts.nblocks) * per_block_pages;
-  chi::u64 expected_gets = expected_puts;
+  clio::run::u64 expected_puts =
+      static_cast<clio::run::u64>(opts.nblocks) * per_block_pages;
+  clio::run::u64 expected_gets = expected_puts;
 
   std::fprintf(stderr,
                "[BENCH] mode=traditional (sync D2H + sync PutBlob)\n"
@@ -302,12 +302,12 @@ int main(int argc, char *argv[]) {
   auto *cte_client = CLIO_CTE_CLIENT;
 
   // One-page-per-block working set on device, plus matching pinned host buf.
-  chi::u64 workspace_bytes =
-      static_cast<chi::u64>(opts.nblocks) * opts.page_size;
-  chi::u32 *dev_buf =
-      ctp::GpuApi::Malloc<chi::u32>(workspace_bytes);
-  chi::u32 *host_buf =
-      ctp::GpuApi::MallocHost<chi::u32>(workspace_bytes);
+  clio::run::u64 workspace_bytes =
+      static_cast<clio::run::u64>(opts.nblocks) * opts.page_size;
+  clio::run::u32 *dev_buf =
+      ctp::GpuApi::Malloc<clio::run::u32>(workspace_bytes);
+  clio::run::u32 *host_buf =
+      ctp::GpuApi::MallocHost<clio::run::u32>(workspace_bytes);
   if (!dev_buf || !host_buf) {
     std::fprintf(stderr,
                  "[BENCH] failed to allocate %s workspace (dev=%p host=%p)\n",
@@ -321,8 +321,8 @@ int main(int argc, char *argv[]) {
   // physical pages on first write.
   std::memset(host_buf, 0, workspace_bytes);
   // Tiny xor-out buffer so the read kernel has somewhere to land its result.
-  chi::u32 *xor_out = ctp::GpuApi::Malloc<chi::u32>(
-      static_cast<chi::u64>(opts.nblocks) * sizeof(chi::u32));
+  clio::run::u32 *xor_out = ctp::GpuApi::Malloc<clio::run::u32>(
+      static_cast<clio::run::u64>(opts.nblocks) * sizeof(clio::run::u32));
 
   using clock = std::chrono::steady_clock;
   auto us_since = [](clock::time_point t0) -> long long {
@@ -336,7 +336,7 @@ int main(int argc, char *argv[]) {
   write_us.reserve(opts.iters);
   read_us.reserve(opts.iters);
 
-  for (chi::u32 it = 0; it < opts.iters; ++it) {
+  for (clio::run::u32 it = 0; it < opts.iters; ++it) {
     std::string tag_name = "trad_iter_" + std::to_string(it);
     auto tag_fut = cte_client->AsyncGetOrCreateTag(tag_name);
     tag_fut.Wait();
@@ -349,19 +349,19 @@ int main(int argc, char *argv[]) {
 
     // ---- Write phase: per-page synchronous fill -> D2H -> PutBlob ----
     auto t0 = clock::now();
-    for (chi::u64 p = 0; p < per_block_pages; ++p) {
+    for (clio::run::u64 p = 0; p < per_block_pages; ++p) {
       TradFillPageKernel<<<opts.nblocks, 32>>>(
           dev_buf, elems_per_page, p, per_block_pages);
       ctp::GpuApi::Synchronize();
-      ctp::GpuApi::Memcpy<chi::u32>(host_buf, dev_buf, workspace_bytes);
-      for (chi::u32 b = 0; b < opts.nblocks; ++b) {
+      ctp::GpuApi::Memcpy<clio::run::u32>(host_buf, dev_buf, workspace_bytes);
+      for (clio::run::u32 b = 0; b < opts.nblocks; ++b) {
         std::string blob_name = "trad_b" + std::to_string(b) +
                                 "_pi" + std::to_string(p);
         ctp::ipc::ShmPtr<> ptr;
         ptr.alloc_id_.SetNull();
-        ptr.off_ = reinterpret_cast<chi::u64>(host_buf + b * elems_per_page);
+        ptr.off_ = reinterpret_cast<clio::run::u64>(host_buf + b * elems_per_page);
         auto fut = cte_client->AsyncPutBlob(
-            tag_id, blob_name, /*offset=*/chi::u64(0),
+            tag_id, blob_name, /*offset=*/clio::run::u64(0),
             opts.page_size, ptr);
         fut.Wait();
         if (fut->GetReturnCode() != 0) {
@@ -377,16 +377,16 @@ int main(int argc, char *argv[]) {
     long long r = 0;
     if (opts.do_read) {
       auto t1 = clock::now();
-      for (chi::u64 p = 0; p < per_block_pages; ++p) {
-        for (chi::u32 b = 0; b < opts.nblocks; ++b) {
+      for (clio::run::u64 p = 0; p < per_block_pages; ++p) {
+        for (clio::run::u32 b = 0; b < opts.nblocks; ++b) {
           std::string blob_name = "trad_b" + std::to_string(b) +
                                   "_pi" + std::to_string(p);
           ctp::ipc::ShmPtr<> ptr;
           ptr.alloc_id_.SetNull();
-          ptr.off_ = reinterpret_cast<chi::u64>(host_buf + b * elems_per_page);
+          ptr.off_ = reinterpret_cast<clio::run::u64>(host_buf + b * elems_per_page);
           auto fut = cte_client->AsyncGetBlob(
-              tag_id, blob_name, /*offset=*/chi::u64(0),
-              opts.page_size, /*flags=*/chi::u32(0), ptr);
+              tag_id, blob_name, /*offset=*/clio::run::u64(0),
+              opts.page_size, /*flags=*/clio::run::u32(0), ptr);
           fut.Wait();
           if (fut->GetReturnCode() != 0) {
             std::fprintf(stderr,
@@ -395,7 +395,7 @@ int main(int argc, char *argv[]) {
             return 2;
           }
         }
-        ctp::GpuApi::Memcpy<chi::u32>(dev_buf, host_buf, workspace_bytes);
+        ctp::GpuApi::Memcpy<clio::run::u32>(dev_buf, host_buf, workspace_bytes);
         TradConsumePageKernel<<<opts.nblocks, 32>>>(
             dev_buf, elems_per_page, xor_out);
         ctp::GpuApi::Synchronize();
@@ -419,9 +419,9 @@ int main(int argc, char *argv[]) {
                  r / 1e3, opts.do_read ? bw(r) : 0.0);
   }
 
-  ctp::GpuApi::Free<chi::u32>(dev_buf);
-  ctp::GpuApi::FreeHost<chi::u32>(host_buf);
-  ctp::GpuApi::Free<chi::u32>(xor_out);
+  ctp::GpuApi::Free<clio::run::u32>(dev_buf);
+  ctp::GpuApi::FreeHost<clio::run::u32>(host_buf);
+  ctp::GpuApi::Free<clio::run::u32>(xor_out);
 
   // ----- Summary -----
   auto stat = [&](std::vector<long long> &v) {

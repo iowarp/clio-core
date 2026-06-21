@@ -192,14 +192,14 @@ void BatchManager::OnAggregateComplete(Worker *worker,
   // collective result to every member via SerializeOut copy-back (the original
   // spec's `member->SerializeOut(aggregate)`), NOT AggregateOut — that is the
   // replica-gather (N->1) merge. Here it is one result broadcast 1->N.
-  chi::priv::vector<char> out_buf(CLIO_PRIV_ALLOC);
-  chi::DefaultSaveArchive save_ar(chi::LocalMsgType::kSerializeOut, out_buf);
+  clio::run::priv::vector<char> out_buf(CLIO_PRIV_ALLOC);
+  clio::run::DefaultSaveArchive save_ar(clio::run::LocalMsgType::kSerializeOut, out_buf);
   container->LocalSaveTask(method, save_ar, agg);
 
   for (auto &member : members) {
     // Copy the aggregate's OUT into this member (broadcast).
-    chi::DefaultLoadArchive load_ar(save_ar.GetMutableData());
-    load_ar.Reset(chi::LocalMsgType::kSerializeOut);
+    clio::run::DefaultLoadArchive load_ar(save_ar.GetMutableData());
+    load_ar.Reset(clio::run::LocalMsgType::kSerializeOut);
     container->LocalLoadTask(member->method_, load_ar, member);
     member->SetReturnCode(rc);
     member->SetCompleter(completer);

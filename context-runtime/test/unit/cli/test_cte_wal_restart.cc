@@ -141,10 +141,10 @@ TEST_CASE("CteWalRestart - WAL snapshot, replay on daemon restart",
 
   REQUIRE(RunCliTimed({"compose", compose_yaml.string()}, 60) == 0);
 
-  REQUIRE(chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, false));
+  REQUIRE(clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, false));
   REQUIRE(clio::cte::core::CLIO_CTE_CLIENT_INIT());
   auto* cte = CLIO_CTE_CLIENT;
-  cte->Init(chi::PoolId(700, 0));
+  cte->Init(clio::run::PoolId(700, 0));
 
   auto* ipc = CLIO_IPC;
   REQUIRE(ipc != nullptr);
@@ -181,9 +181,9 @@ TEST_CASE("CteWalRestart - WAL snapshot, replay on daemon restart",
 
   // Snapshot the metadata, then add entries AFTER the snapshot so the
   // restart exercises BOTH RestoreMetadataFromLog and ReplayTransactionLogs.
-  auto flush_meta = cte->AsyncFlushMetadata(chi::PoolQuery::Local(), 0);
+  auto flush_meta = cte->AsyncFlushMetadata(clio::run::PoolQuery::Local(), 0);
   flush_meta.Wait();
-  auto flush_data = cte->AsyncFlushData(chi::PoolQuery::Local(), 0, 0);
+  auto flush_data = cte->AsyncFlushData(clio::run::PoolQuery::Local(), 0, 0);
   flush_data.Wait();
 
   auto tag_c = cte->AsyncGetOrCreateTag("wal_tag_post_snapshot");

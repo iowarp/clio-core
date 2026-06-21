@@ -61,9 +61,9 @@ void EnsureChimaera() {
   fs::path config_path = fs::path(__FILE__).parent_path() /
                           "test_cae_labeling_config.yaml";
   ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", config_path.string(), 1);
-  bool success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kServer);
+  bool success = clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kServer);
   REQUIRE(success);
-  SimpleTest::g_test_finalize = chi::CHIMAERA_FINALIZE;
+  SimpleTest::g_test_finalize = clio::run::CHIMAERA_FINALIZE;
   std::this_thread::sleep_for(1s);
   auto *cte_client = CLIO_CTE_CLIENT;
   cte_client->Init(clio::cte::core::kCtePoolId);

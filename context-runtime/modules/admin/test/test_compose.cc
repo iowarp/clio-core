@@ -91,11 +91,11 @@ std::string CreateComposeConfig() {
  */
 TEST_CASE("PoolId::FromString parsing", "[compose]") {
   // Test valid pool ID formats
-  chi::PoolId pool_id1 = chi::PoolId::FromString("200.0");
+  clio::run::PoolId pool_id1 = clio::run::PoolId::FromString("200.0");
   REQUIRE(pool_id1.major_ == 200);
   REQUIRE(pool_id1.minor_ == 0);
 
-  chi::PoolId pool_id2 = chi::PoolId::FromString("123.456");
+  clio::run::PoolId pool_id2 = clio::run::PoolId::FromString("123.456");
   REQUIRE(pool_id2.major_ == 123);
   REQUIRE(pool_id2.minor_ == 456);
 
@@ -107,18 +107,18 @@ TEST_CASE("PoolId::FromString parsing", "[compose]") {
  */
 TEST_CASE("PoolQuery::FromString parsing", "[compose]") {
   // Test "local"
-  chi::PoolQuery query1 = chi::PoolQuery::FromString("local");
+  clio::run::PoolQuery query1 = clio::run::PoolQuery::FromString("local");
   REQUIRE(query1.IsLocalMode());
 
   // Test "dynamic"
-  chi::PoolQuery query2 = chi::PoolQuery::FromString("dynamic");
+  clio::run::PoolQuery query2 = clio::run::PoolQuery::FromString("dynamic");
   REQUIRE(query2.IsDynamicMode());
 
   // Test case insensitive
-  chi::PoolQuery query3 = chi::PoolQuery::FromString("LOCAL");
+  clio::run::PoolQuery query3 = clio::run::PoolQuery::FromString("LOCAL");
   REQUIRE(query3.IsLocalMode());
 
-  chi::PoolQuery query4 = chi::PoolQuery::FromString("Dynamic");
+  clio::run::PoolQuery query4 = clio::run::PoolQuery::FromString("Dynamic");
   REQUIRE(query4.IsDynamicMode());
 
   HIPRINT("PoolQuery::FromString tests passed");
@@ -192,11 +192,11 @@ TEST_CASE("Admin client Compose method", "[compose]") {
   }
 
   // Verify pool was created by checking if we can access it
-  chi::PoolId bdev_pool_id(200, 0);
+  clio::run::PoolId bdev_pool_id(200, 0);
   clio::run::bdev::Client bdev_client(bdev_pool_id);
 
   // Try to allocate blocks to verify the pool exists and is functional
-  auto alloc_task = bdev_client.AsyncAllocateBlocks(chi::PoolQuery::Local(), 1024);
+  auto alloc_task = bdev_client.AsyncAllocateBlocks(clio::run::PoolQuery::Local(), 1024);
   alloc_task.Wait();
   std::vector<clio::run::bdev::Block> blocks;
   for (size_t i = 0; i < alloc_task->blocks_.size(); ++i) {
@@ -216,7 +216,7 @@ int main(int argc, char **argv) {
 
   // Initialize runtime
   HIPRINT("Initializing Chimaera runtime...");
-  if (!chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true)) {
+  if (!clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true)) {
     HLOG(kError, "Failed to initialize Chimaera runtime");
     return 1;
   }

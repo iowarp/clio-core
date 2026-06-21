@@ -36,7 +36,7 @@
  *
  * Tests that each IPC transport mode (SHM, TCP, IPC) initializes correctly
  * and that the correct transport path is active. Each test case launches the
- * runtime daemon out-of-process (chi::test::RuntimeServer -> clio_run start),
+ * runtime daemon out-of-process (clio::run::test::RuntimeServer -> clio_run start),
  * sets CHI_IPC_MODE, connects as client, and verifies mode state.
  */
 
@@ -54,24 +54,24 @@
 
 using namespace chi;
 
-inline chi::priv::vector<clio::run::bdev::Block> WrapBlock(
+inline clio::run::priv::vector<clio::run::bdev::Block> WrapBlock(
     const clio::run::bdev::Block& block) {
-  chi::priv::vector<clio::run::bdev::Block> blocks(CTP_MALLOC);
+  clio::run::priv::vector<clio::run::bdev::Block> blocks(CTP_MALLOC);
   blocks.push_back(block);
   return blocks;
 }
 
 void SubmitTasksForMode(const std::string &mode_name) {
-  const chi::u64 kRamSize = 16 * 1024 * 1024;  // 16MB pool
-  const chi::u64 kBlockSize = 4096;             // 4KB block allocation
-  const chi::u64 kIoSize = 1024 * 1024;         // 1MB I/O transfer size
+  const clio::run::u64 kRamSize = 16 * 1024 * 1024;  // 16MB pool
+  const clio::run::u64 kBlockSize = 4096;             // 4KB block allocation
+  const clio::run::u64 kIoSize = 1024 * 1024;         // 1MB I/O transfer size
 
   // --- Category 1: Create bdev pool (inputs > outputs) ---
-  chi::PoolId pool_id(9000, 0);
+  clio::run::PoolId pool_id(9000, 0);
   clio::run::bdev::Client client(pool_id);
   std::string pool_name = "ipc_test_ram_" + mode_name;
   auto create_task = client.AsyncCreate(
-      chi::PoolQuery::Dynamic(), pool_name, pool_id,
+      clio::run::PoolQuery::Dynamic(), pool_name, pool_id,
       clio::run::bdev::BdevType::kRam, kRamSize);
   create_task.Wait();
   REQUIRE(create_task->return_code_ == 0);
@@ -79,7 +79,7 @@ void SubmitTasksForMode(const std::string &mode_name) {
 
   // --- Category 2: AllocateBlocks (outputs > inputs) ---
   auto alloc_task = client.AsyncAllocateBlocks(
-      chi::PoolQuery::Local(), kBlockSize);
+      clio::run::PoolQuery::Local(), kBlockSize);
   alloc_task.Wait();
   REQUIRE(alloc_task->return_code_ == 0);
   REQUIRE(alloc_task->blocks_.size() > 0);
@@ -98,7 +98,7 @@ void SubmitTasksForMode(const std::string &mode_name) {
   REQUIRE_FALSE(write_buffer.IsNull());
   memcpy(write_buffer.ptr_, write_data.data(), write_data.size());
   auto write_task = client.AsyncWrite(
-      chi::PoolQuery::Local(), WrapBlock(block),
+      clio::run::PoolQuery::Local(), WrapBlock(block),
       write_buffer.shm_.template Cast<void>().template Cast<void>(),
       write_data.size());
   write_task.Wait();
@@ -111,7 +111,7 @@ void SubmitTasksForMode(const std::string &mode_name) {
   auto read_buffer = CLIO_IPC->AllocateBuffer(kIoSize);
   REQUIRE_FALSE(read_buffer.IsNull());
   auto read_task = client.AsyncRead(
-      chi::PoolQuery::Local(), WrapBlock(block),
+      clio::run::PoolQuery::Local(), WrapBlock(block),
       read_buffer.shm_.template Cast<void>().template Cast<void>(),
       kIoSize);
   read_task.Wait();
@@ -135,7 +135,7 @@ void SubmitTasksForMode(const std::string &mode_name) {
   CLIO_IPC->FreeBuffer(read_buffer);
 }
 
-// The runtime server is launched out-of-process via chi::test::RuntimeServer
+// The runtime server is launched out-of-process via clio::run::test::RuntimeServer
 // (clio_run start), which is portable across Linux, macOS and Windows. The old
 // fork()+CHIMAERA_INIT(kServer) helpers were removed: fork-without-exec is
 // unsupported on macOS (post-fork dlopen of ChiMods deadlocks) and impossible
@@ -148,13 +148,13 @@ void SubmitTasksForMode(const std::string &mode_name) {
 TEST_CASE("IpcTransportMode - SHM Client Connection",
           "[ipc_transport][shm]") {
   // Start the runtime daemon out-of-process
-  chi::test::RuntimeServer server;
+  clio::run::test::RuntimeServer server;
   REQUIRE(server.Start());
   REQUIRE(server.WaitForReady());
 
   // Set SHM mode and connect as external client
-  chi::test::SetEnvVar("CLIO_IPC_MODE", "SHM");
-  chi::test::SetEnvVar("CLIO_WITH_RUNTIME", "0");
+  clio::run::test::SetEnvVar("CLIO_IPC_MODE", "SHM");
+  clio::run::test::SetEnvVar("CLIO_WITH_RUNTIME", "0");
   bool success = CHIMAERA_INIT(ChimaeraMode::kClient, false);
   REQUIRE(success);
 
@@ -173,13 +173,13 @@ TEST_CASE("IpcTransportMode - SHM Client Connection",
 TEST_CASE("IpcTransportMode - TCP Client Connection",
           "[ipc_transport][tcp]") {
   // Start the runtime daemon out-of-process
-  chi::test::RuntimeServer server;
+  clio::run::test::RuntimeServer server;
   REQUIRE(server.Start());
   REQUIRE(server.WaitForReady());
 
   // Set TCP mode and connect as external client
-  chi::test::SetEnvVar("CLIO_IPC_MODE", "TCP");
-  chi::test::SetEnvVar("CLIO_WITH_RUNTIME", "0");
+  clio::run::test::SetEnvVar("CLIO_IPC_MODE", "TCP");
+  clio::run::test::SetEnvVar("CLIO_WITH_RUNTIME", "0");
   bool success = CHIMAERA_INIT(ChimaeraMode::kClient, false);
   REQUIRE(success);
 
@@ -198,13 +198,13 @@ TEST_CASE("IpcTransportMode - TCP Client Connection",
 TEST_CASE("IpcTransportMode - IPC Client Connection",
           "[ipc_transport][ipc]") {
   // Start the runtime daemon out-of-process
-  chi::test::RuntimeServer server;
+  clio::run::test::RuntimeServer server;
   REQUIRE(server.Start());
   REQUIRE(server.WaitForReady());
 
   // Set IPC (Unix Domain Socket) mode and connect as external client
-  chi::test::SetEnvVar("CLIO_IPC_MODE", "IPC");
-  chi::test::SetEnvVar("CLIO_WITH_RUNTIME", "0");
+  clio::run::test::SetEnvVar("CLIO_IPC_MODE", "IPC");
+  clio::run::test::SetEnvVar("CLIO_WITH_RUNTIME", "0");
   bool success = CHIMAERA_INIT(ChimaeraMode::kClient, false);
   REQUIRE(success);
 
@@ -223,13 +223,13 @@ TEST_CASE("IpcTransportMode - IPC Client Connection",
 TEST_CASE("IpcTransportMode - Default Mode Is TCP",
           "[ipc_transport][default]") {
   // Start the runtime daemon out-of-process
-  chi::test::RuntimeServer server;
+  clio::run::test::RuntimeServer server;
   REQUIRE(server.Start());
   REQUIRE(server.WaitForReady());
 
   // Unset CHI_IPC_MODE to test default behavior
-  chi::test::UnsetEnvVar("CLIO_IPC_MODE");
-  chi::test::SetEnvVar("CLIO_WITH_RUNTIME", "0");
+  clio::run::test::UnsetEnvVar("CLIO_IPC_MODE");
+  clio::run::test::SetEnvVar("CLIO_WITH_RUNTIME", "0");
   bool success = CHIMAERA_INIT(ChimaeraMode::kClient, false);
   REQUIRE(success);
 

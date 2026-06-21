@@ -217,10 +217,10 @@ class ModuleManager {
 }  // namespace clio::run
 
 // Global pointer variable declaration for Module manager singleton
-CLIO_RUN_DEFINE_GLOBAL_PTR_VAR_H(chi::ModuleManager, g_module_manager);
+CLIO_RUN_DEFINE_GLOBAL_PTR_VAR_H(clio::run::ModuleManager, g_module_manager);
 
 // Macro for accessing the Module manager singleton using global pointer variable
-#define CLIO_MODULE_MANAGER CTP_GET_GLOBAL_PTR_VAR(::chi::ModuleManager, g_module_manager)
+#define CLIO_MODULE_MANAGER CTP_GET_GLOBAL_PTR_VAR(::clio::run::ModuleManager, g_module_manager)
 // Backward-compat alias (clio_run rebrand). External code that still
 // uses the legacy CHI_* spelling keeps working unchanged.
 #define CHI_MODULE_MANAGER  CLIO_MODULE_MANAGER

@@ -40,7 +40,7 @@
 namespace clio::cte::core {
 
 // Static member definition for round-robin counter
-std::atomic<chi::u32> RoundRobinDpe::round_robin_counter_(0);
+std::atomic<clio::run::u32> RoundRobinDpe::round_robin_counter_(0);
 
 // DPE Type conversion functions
 DpeType StringToDpeType(const std::string& dpe_str) {
@@ -75,7 +75,7 @@ RandomDpe::RandomDpe() : rng_(std::chrono::steady_clock::now().time_since_epoch(
 
 std::vector<TargetInfo> RandomDpe::SelectTargets(const std::vector<TargetInfo>& targets,
                                                 float blob_score,
-                                                chi::u64 data_size) {
+                                                clio::run::u64 data_size) {
   std::vector<TargetInfo> result;
 
   if (targets.empty()) {
@@ -118,7 +118,7 @@ RoundRobinDpe::RoundRobinDpe() {
 
 std::vector<TargetInfo> RoundRobinDpe::SelectTargets(const std::vector<TargetInfo>& targets,
                                                     float blob_score,
-                                                    chi::u64 data_size) {
+                                                    clio::run::u64 data_size) {
   std::vector<TargetInfo> result;
 
   if (targets.empty()) {
@@ -140,7 +140,7 @@ std::vector<TargetInfo> RoundRobinDpe::SelectTargets(const std::vector<TargetInf
   }
 
   // Apply round-robin rotation to each group
-  chi::u32 counter = round_robin_counter_.fetch_add(1);
+  clio::run::u32 counter = round_robin_counter_.fetch_add(1);
 
   if (!low_score_targets.empty()) {
     size_t shift_amount = counter % low_score_targets.size();
@@ -178,7 +178,7 @@ MaxBwDpe::MaxBwDpe() {
 
 std::vector<TargetInfo> MaxBwDpe::SelectTargets(const std::vector<TargetInfo>& targets,
                                                float blob_score,
-                                               chi::u64 data_size) {
+                                               clio::run::u64 data_size) {
   std::vector<TargetInfo> result;
 
   if (targets.empty()) {

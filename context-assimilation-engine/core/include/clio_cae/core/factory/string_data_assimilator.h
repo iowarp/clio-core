@@ -62,7 +62,7 @@ class StringDataAssimilator : public BaseAssimilator {
   explicit StringDataAssimilator(
       std::shared_ptr<clio::cte::core::Client> cte_client);
 
-  chi::TaskResume Schedule(const AssimilationCtx& ctx,
+  clio::run::TaskResume Schedule(const AssimilationCtx& ctx,
                            int& error_code) override;
 
  private:

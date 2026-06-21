@@ -160,7 +160,7 @@ bool ParseArgs(int argc, char **argv, BenchmarkConfig &config) {
  * Runs Allocate -> Free loop until stop flag is set (no I/O operations)
  */
 void AllocationWorkerThread(size_t thread_id, const BenchmarkConfig &config,
-                            chi::PoolId pool_id, std::atomic<bool> &stop_flag,
+                            clio::run::PoolId pool_id, std::atomic<bool> &stop_flag,
                             std::atomic<size_t> &completed_ops,
                             std::chrono::nanoseconds &elapsed_time) {
   // Create BDev client for this thread
@@ -177,7 +177,7 @@ void AllocationWorkerThread(size_t thread_id, const BenchmarkConfig &config,
   // Continuously perform allocate/free operations until stop signal
   while (!stop_flag.load(std::memory_order_relaxed)) {
     // Allocate blocks
-    auto alloc_task = bdev_client.AsyncAllocateBlocks(chi::PoolQuery::Local(),
+    auto alloc_task = bdev_client.AsyncAllocateBlocks(clio::run::PoolQuery::Local(),
                                                        alloc_size);
     alloc_task.Wait();
     if (alloc_task->GetReturnCode() != 0 || alloc_task->blocks_.empty()) {
@@ -192,7 +192,7 @@ void AllocationWorkerThread(size_t thread_id, const BenchmarkConfig &config,
     }
 
     // Free blocks immediately
-    auto free_task = bdev_client.AsyncFreeBlocks(chi::PoolQuery::Local(), blocks);
+    auto free_task = bdev_client.AsyncFreeBlocks(clio::run::PoolQuery::Local(), blocks);
     free_task.Wait();
 
     local_ops++;
@@ -223,7 +223,7 @@ void AllocationWorkerThread(size_t thread_id, const BenchmarkConfig &config,
  * Creates AllocateBlocksTask and FreeBlocksTask, then immediately deletes them
  */
 void TaskAllocationWorkerThread(size_t thread_id, const BenchmarkConfig &config,
-                                chi::PoolId pool_id,
+                                clio::run::PoolId pool_id,
                                 std::atomic<bool> &stop_flag,
                                 std::atomic<size_t> &completed_ops,
                                 std::chrono::nanoseconds &elapsed_time) {
@@ -250,12 +250,12 @@ void TaskAllocationWorkerThread(size_t thread_id, const BenchmarkConfig &config,
   while (!stop_flag.load(std::memory_order_relaxed)) {
     // Create and delete AllocateBlocksTask
     auto alloc_task = ipc_manager->NewTask<clio::run::bdev::AllocateBlocksTask>(
-        chi::CreateTaskId(), pool_id, chi::PoolQuery::Local(), alloc_size);
+        clio::run::CreateTaskId(), pool_id, clio::run::PoolQuery::Local(), alloc_size);
     ipc_manager->DelTask(alloc_task);
 
     // Create and delete FreeBlocksTask
     auto free_task = ipc_manager->NewTask<clio::run::bdev::FreeBlocksTask>(
-        chi::CreateTaskId(), pool_id, chi::PoolQuery::Local(), dummy_blocks);
+        clio::run::CreateTaskId(), pool_id, clio::run::PoolQuery::Local(), dummy_blocks);
     ipc_manager->DelTask(free_task);
 
     local_ops += 2; // Count both allocate and free task creations
@@ -286,7 +286,7 @@ void TaskAllocationWorkerThread(size_t thread_id, const BenchmarkConfig &config,
  * Runs Allocate -> Write -> Free loop until stop flag is set
  */
 void IOWorkerThread(size_t thread_id, const BenchmarkConfig &config,
-                    chi::PoolId pool_id, std::atomic<bool> &stop_flag,
+                    clio::run::PoolId pool_id, std::atomic<bool> &stop_flag,
                     std::atomic<size_t> &completed_ops,
                     std::atomic<size_t> &total_bytes,
                     std::chrono::nanoseconds &elapsed_time) {
@@ -306,7 +306,7 @@ void IOWorkerThread(size_t thread_id, const BenchmarkConfig &config,
   // Continuously perform I/O operations until stop signal
   while (!stop_flag.load(std::memory_order_relaxed)) {
     // Allocate blocks for the requested I/O size
-    auto alloc_task = bdev_client.AsyncAllocateBlocks(chi::PoolQuery::Local(),
+    auto alloc_task = bdev_client.AsyncAllocateBlocks(clio::run::PoolQuery::Local(),
                                                        config.io_size);
     alloc_task.Wait();
     if (alloc_task->GetReturnCode() != 0 || alloc_task->blocks_.empty()) {
@@ -330,14 +330,14 @@ void IOWorkerThread(size_t thread_id, const BenchmarkConfig &config,
       size_t block_capacity = blocks[block_idx].size_;
       size_t bytes_to_write = std::min(bytes_remaining, block_capacity);
 
-      // Create chi::priv::vector with single block for Write operation
-      chi::priv::vector<clio::run::bdev::Block> single_block(CTP_MALLOC);
+      // Create clio::run::priv::vector with single block for Write operation
+      clio::run::priv::vector<clio::run::bdev::Block> single_block(CTP_MALLOC);
       single_block.push_back(blocks[block_idx]);
 
-      auto write_task = bdev_client.AsyncWrite(chi::PoolQuery::Local(),
+      auto write_task = bdev_client.AsyncWrite(clio::run::PoolQuery::Local(),
                                                 single_block, write_buffer.shm_.template Cast<void>(), bytes_to_write);
       write_task.Wait();
-      chi::u64 ret = write_task->bytes_written_;
+      clio::run::u64 ret = write_task->bytes_written_;
       if (ret != bytes_to_write) {
         HLOG(kError, "ERROR: Thread {} failed to write data to block {}", thread_id, block_idx);
         stop_flag.store(true, std::memory_order_relaxed);
@@ -347,7 +347,7 @@ void IOWorkerThread(size_t thread_id, const BenchmarkConfig &config,
     }
 
     // Free blocks
-    auto free_task = bdev_client.AsyncFreeBlocks(chi::PoolQuery::Local(), blocks);
+    auto free_task = bdev_client.AsyncFreeBlocks(clio::run::PoolQuery::Local(), blocks);
     free_task.Wait();
 
     local_ops++;
@@ -384,7 +384,7 @@ void IOWorkerThread(size_t thread_id, const BenchmarkConfig &config,
  * Uses MOD_NAME Custom function for pure task overhead measurement
  */
 void LatencyWorkerThread(size_t thread_id, const BenchmarkConfig &config,
-                         chi::PoolId pool_id, std::atomic<bool> &stop_flag,
+                         clio::run::PoolId pool_id, std::atomic<bool> &stop_flag,
                          std::atomic<size_t> &completed_ops,
                          std::chrono::nanoseconds &elapsed_time) {
   // Create MOD_NAME client for this thread
@@ -398,10 +398,10 @@ void LatencyWorkerThread(size_t thread_id, const BenchmarkConfig &config,
   std::string input_data = "test";
   while (!stop_flag.load(std::memory_order_relaxed)) {
     // Call Custom with simple operation (operation_id = 0)
-    auto task = mod_client.AsyncCustom(chi::PoolQuery::Broadcast(),
+    auto task = mod_client.AsyncCustom(clio::run::PoolQuery::Broadcast(),
                                         input_data, 0);
     task.Wait();
-    chi::u32 result = task->return_code_;
+    clio::run::u32 result = task->return_code_;
 
     // Verify result (should echo back input_data)
     if (result != 0) {
@@ -467,7 +467,7 @@ int main(int argc, char **argv) {
   }
 
   // Initialize CLIO Runtime client
-  if (!chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, false)) {
+  if (!clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, false)) {
     HLOG(kError, "ERROR: Failed to initialize Chimaera client");
     return 1;
   }
@@ -476,12 +476,12 @@ int main(int argc, char **argv) {
   HIPRINT("Lane policy: map_by_pid_tid (default)");
 
   // Create pool based on test case
-  chi::PoolId test_pool_id;
+  clio::run::PoolId test_pool_id;
   if (config.test_case == TestCase::kLatency) {
     // Create MOD_NAME container for latency test
-    test_pool_id = chi::PoolId(8000, 0);
+    test_pool_id = clio::run::PoolId(8000, 0);
     clio::run::MOD_NAME::Client mod_client(test_pool_id);
-    auto create_task = mod_client.AsyncCreate(chi::PoolQuery::Broadcast(),
+    auto create_task = mod_client.AsyncCreate(clio::run::PoolQuery::Broadcast(),
                       "latency_test_pool", test_pool_id);
     create_task.Wait();
     mod_client.pool_id_ = create_task->new_pool_id_;
@@ -493,7 +493,7 @@ int main(int argc, char **argv) {
     }
   } else {
     // Create BDev container for I/O and allocation tests
-    test_pool_id = chi::PoolId(7000, 0);
+    test_pool_id = clio::run::PoolId(7000, 0);
     clio::run::bdev::Client bdev_client(test_pool_id);
 
     // Determine BDev type and pool name based on output directory
@@ -524,7 +524,7 @@ int main(int argc, char **argv) {
       HIPRINT("Using file-based BDev: {}", pool_name);
     }
 
-    auto create_task = bdev_client.AsyncCreate(chi::PoolQuery::Broadcast(), pool_name,
+    auto create_task = bdev_client.AsyncCreate(clio::run::PoolQuery::Broadcast(), pool_name,
                                                 test_pool_id, bdev_type, config.max_file_size, 32, 4096);
     create_task.Wait();
 

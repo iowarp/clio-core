@@ -30,7 +30,7 @@ ctp::ipc::FullPtr<Task> IpcCpu2Cpu::RuntimeRecv(
   // Detect legacy GPU->CPU tasks by client_task_vaddr_ == 0
   bool is_gpu_task = (future_shm->client_task_vaddr_ == 0);
   if (is_gpu_task) {
-    chi::priv::vector<char> recv_buf(CLIO_PRIV_ALLOC);
+    clio::run::priv::vector<char> recv_buf(CLIO_PRIV_ALLOC);
     recv_buf.reserve(256);
     DefaultLoadArchive local_archive(recv_buf);
     recv_transport->Recv(local_archive, ctx);

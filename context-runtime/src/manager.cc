@@ -167,8 +167,8 @@ bool RuntimeManager::ClientInit() {
   // CLIO_ADMIN uses GetGlobalPtrVar which auto-creates with default constructor!
   if (g_admin == nullptr) {
     HLOG(kInfo, "ClientInit: Creating admin client with kAdminPoolId={}",
-         chi::kAdminPoolId);
-    g_admin = new clio::run::admin::Client(chi::kAdminPoolId);
+         clio::run::kAdminPoolId);
+    g_admin = new clio::run::admin::Client(clio::run::kAdminPoolId);
     HLOG(kInfo, "ClientInit: Admin client created, pool_id_={}",
          g_admin->pool_id_);
   } else {
@@ -332,7 +332,7 @@ bool RuntimeManager::ServerInit() {
           pruned_any = true;
           continue;
         }
-        chi::ConfigManager file_config;
+        clio::run::ConfigManager file_config;
         if (!file_config.LoadYaml(container_path)) {
           HLOG(kError, "Restart log: failed to load container '{}' (skipping)",
                container_path);
@@ -365,7 +365,7 @@ bool RuntimeManager::ServerInit() {
 
   // GPU work orchestrator removed: kernels submit tasks to the CPU
   // runtime via gpu2cpu_queue and the CPU executes them through the
-  // standard chi::Container path. No orchestrator launch needed —
+  // standard clio::run::Container path. No orchestrator launch needed —
   // ChiServerBootstrap{Hip,Sycl}Gpu in IpcManager::ServerInit already
   // set up the gpu2cpu_queue + gpu2cpu_copy_backend at server-init
   // time.

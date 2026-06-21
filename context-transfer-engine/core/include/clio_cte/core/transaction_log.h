@@ -57,55 +57,55 @@ enum class TxnType : uint8_t {
 
 /** A single block entry within TxnExtendBlob */
 struct TxnExtendBlobBlock {
-  chi::u32 bdev_major_;
-  chi::u32 bdev_minor_;
-  chi::PoolQuery target_query_;
-  chi::u64 target_offset_;
-  chi::u64 size_;
+  clio::run::u32 bdev_major_;
+  clio::run::u32 bdev_minor_;
+  clio::run::PoolQuery target_query_;
+  clio::run::u64 target_offset_;
+  clio::run::u64 size_;
 };
 
 /** Payload: create a new blob (metadata only, no blocks yet) */
 struct TxnCreateNewBlob {
-  chi::u32 tag_major_;
-  chi::u32 tag_minor_;
+  clio::run::u32 tag_major_;
+  clio::run::u32 tag_minor_;
   std::string blob_name_;
   float score_;
 };
 
 /** Payload: extend (or replace) blob blocks */
 struct TxnExtendBlob {
-  chi::u32 tag_major_;
-  chi::u32 tag_minor_;
+  clio::run::u32 tag_major_;
+  clio::run::u32 tag_minor_;
   std::string blob_name_;
   std::vector<TxnExtendBlobBlock> new_blocks_;
 };
 
 /** Payload: clear all blocks from a blob */
 struct TxnClearBlob {
-  chi::u32 tag_major_;
-  chi::u32 tag_minor_;
+  clio::run::u32 tag_major_;
+  clio::run::u32 tag_minor_;
   std::string blob_name_;
 };
 
 /** Payload: delete a blob */
 struct TxnDelBlob {
-  chi::u32 tag_major_;
-  chi::u32 tag_minor_;
+  clio::run::u32 tag_major_;
+  clio::run::u32 tag_minor_;
   std::string blob_name_;
 };
 
 /** Payload: create a tag */
 struct TxnCreateTag {
   std::string tag_name_;
-  chi::u32 tag_major_;
-  chi::u32 tag_minor_;
+  clio::run::u32 tag_major_;
+  clio::run::u32 tag_minor_;
 };
 
 /** Payload: delete a tag */
 struct TxnDelTag {
   std::string tag_name_;
-  chi::u32 tag_major_;
-  chi::u32 tag_minor_;
+  clio::run::u32 tag_major_;
+  clio::run::u32 tag_minor_;
 };
 
 /**
@@ -123,7 +123,7 @@ class TransactionLog {
   ~TransactionLog() { Close(); }
 
   /** Open (or create) the WAL file in append mode. */
-  void Open(const std::string &file_path, chi::u64 capacity_bytes) {
+  void Open(const std::string &file_path, clio::run::u64 capacity_bytes) {
     file_path_ = file_path;
     capacity_bytes_ = capacity_bytes;
     buffer_.reserve(4096);
@@ -147,11 +147,11 @@ class TransactionLog {
     WriteU32(buffer_, txn.tag_major_);
     WriteU32(buffer_, txn.tag_minor_);
     WriteString(buffer_, txn.blob_name_);
-    WriteU32(buffer_, static_cast<chi::u32>(txn.new_blocks_.size()));
+    WriteU32(buffer_, static_cast<clio::run::u32>(txn.new_blocks_.size()));
     for (const auto &blk : txn.new_blocks_) {
       WriteU32(buffer_, blk.bdev_major_);
       WriteU32(buffer_, blk.bdev_minor_);
-      WriteRaw(buffer_, &blk.target_query_, sizeof(chi::PoolQuery));
+      WriteRaw(buffer_, &blk.target_query_, sizeof(clio::run::PoolQuery));
       WriteU64(buffer_, blk.target_offset_);
       WriteU64(buffer_, blk.size_);
     }
@@ -198,10 +198,10 @@ class TransactionLog {
   }
 
   /** Return current on-disk file size */
-  chi::u64 Size() const {
+  clio::run::u64 Size() const {
     namespace fs = std::filesystem;
     if (fs::exists(file_path_)) {
-      return static_cast<chi::u64>(fs::file_size(file_path_));
+      return static_cast<clio::run::u64>(fs::file_size(file_path_));
     }
     return 0;
   }
@@ -274,13 +274,13 @@ class TransactionLog {
     txn.tag_major_ = ReadU32(data, off);
     txn.tag_minor_ = ReadU32(data, off);
     txn.blob_name_ = ReadString(data, off);
-    chi::u32 num_blocks = ReadU32(data, off);
+    clio::run::u32 num_blocks = ReadU32(data, off);
     txn.new_blocks_.resize(num_blocks);
-    for (chi::u32 i = 0; i < num_blocks; ++i) {
+    for (clio::run::u32 i = 0; i < num_blocks; ++i) {
       txn.new_blocks_[i].bdev_major_ = ReadU32(data, off);
       txn.new_blocks_[i].bdev_minor_ = ReadU32(data, off);
       ReadRaw(data, off, &txn.new_blocks_[i].target_query_,
-              sizeof(chi::PoolQuery));
+              sizeof(clio::run::PoolQuery));
       txn.new_blocks_[i].target_offset_ = ReadU64(data, off);
       txn.new_blocks_[i].size_ = ReadU64(data, off);
     }
@@ -325,7 +325,7 @@ class TransactionLog {
 
  private:
   std::string file_path_;
-  chi::u64 capacity_bytes_ = 0;
+  clio::run::u64 capacity_bytes_ = 0;
   std::ofstream ofs_;
   std::vector<char> buffer_;  // Reusable serialization buffer
 
@@ -341,11 +341,11 @@ class TransactionLog {
   }
 
   // ---- Serialization primitives ----
-  static void WriteU32(std::vector<char> &buf, chi::u32 val) {
+  static void WriteU32(std::vector<char> &buf, clio::run::u32 val) {
     const char *p = reinterpret_cast<const char *>(&val);
     buf.insert(buf.end(), p, p + sizeof(val));
   }
-  static void WriteU64(std::vector<char> &buf, chi::u64 val) {
+  static void WriteU64(std::vector<char> &buf, clio::run::u64 val) {
     const char *p = reinterpret_cast<const char *>(&val);
     buf.insert(buf.end(), p, p + sizeof(val));
   }
@@ -354,7 +354,7 @@ class TransactionLog {
     buf.insert(buf.end(), p, p + sizeof(val));
   }
   static void WriteString(std::vector<char> &buf, const std::string &s) {
-    WriteU32(buf, static_cast<chi::u32>(s.size()));
+    WriteU32(buf, static_cast<clio::run::u32>(s.size()));
     buf.insert(buf.end(), s.data(), s.data() + s.size());
   }
   static void WriteRaw(std::vector<char> &buf, const void *ptr, size_t len) {
@@ -363,14 +363,14 @@ class TransactionLog {
   }
 
   // ---- Deserialization primitives ----
-  static chi::u32 ReadU32(const std::vector<char> &data, size_t &off) {
-    chi::u32 val;
+  static clio::run::u32 ReadU32(const std::vector<char> &data, size_t &off) {
+    clio::run::u32 val;
     std::memcpy(&val, data.data() + off, sizeof(val));
     off += sizeof(val);
     return val;
   }
-  static chi::u64 ReadU64(const std::vector<char> &data, size_t &off) {
-    chi::u64 val;
+  static clio::run::u64 ReadU64(const std::vector<char> &data, size_t &off) {
+    clio::run::u64 val;
     std::memcpy(&val, data.data() + off, sizeof(val));
     off += sizeof(val);
     return val;
@@ -382,7 +382,7 @@ class TransactionLog {
     return val;
   }
   static std::string ReadString(const std::vector<char> &data, size_t &off) {
-    chi::u32 len = ReadU32(data, off);
+    clio::run::u32 len = ReadU32(data, off);
     std::string s(data.data() + off, len);
     off += len;
     return s;

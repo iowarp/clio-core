@@ -103,7 +103,7 @@ struct CreateParams {
   // 513.0) when CAE is configured as a transparent interceptor in front of
   // CTE. When null, the CAE forwarding handlers fall back to the global CTE
   // pool ID (kCtePoolId). Mirrors compressor's CompressorConfig::next_pool_id_.
-  chi::PoolId next_pool_id_;
+  clio::run::PoolId next_pool_id_;
 
   // Transparent labeling configuration (all optional).
   // label_matches_ is empty by default — CAE behaves as a pure passthrough.
@@ -118,7 +118,7 @@ struct CreateParams {
   std::string label_endpoint_;
 
   // Default constructor
-  CreateParams() : next_pool_id_(chi::PoolId::GetNull()) {}
+  CreateParams() : next_pool_id_(clio::run::PoolId::GetNull()) {}
 
   // Copy constructor (for BaseCreateTask)
   CreateParams(const CreateParams &other)
@@ -128,7 +128,7 @@ struct CreateParams {
         label_endpoint_(other.label_endpoint_) {}
 
   // Compose pool-id ctor (matches compressor pattern)
-  CreateParams(const chi::PoolId &pool_id, const CreateParams &other)
+  CreateParams(const clio::run::PoolId &pool_id, const CreateParams &other)
       : next_pool_id_(other.next_pool_id_),
         label_matches_(other.label_matches_),
         label_prompts_(other.label_prompts_),
@@ -149,7 +149,7 @@ struct CreateParams {
    *   - `label_prompts`       (map of prompt-name → prompt template)
    *   - `label_endpoint`      (LLM HTTP endpoint base URL)
    */
-  void LoadConfig(const chi::PoolConfig &pool_config) {
+  void LoadConfig(const clio::run::PoolConfig &pool_config) {
     if (pool_config.config_.empty()) return;
     try {
       YAML::Node node = YAML::Load(pool_config.config_);
@@ -157,9 +157,9 @@ struct CreateParams {
         std::string next_str = node["next_pool_id"].as<std::string>();
         auto dot = next_str.find('.');
         if (dot != std::string::npos) {
-          chi::u32 major = std::stoul(next_str.substr(0, dot));
-          chi::u32 minor = std::stoul(next_str.substr(dot + 1));
-          next_pool_id_ = chi::PoolId(major, minor);
+          clio::run::u32 major = std::stoul(next_str.substr(0, dot));
+          clio::run::u32 minor = std::stoul(next_str.substr(dot + 1));
+          next_pool_id_ = clio::run::PoolId(major, minor);
         }
       }
       if (node["label_endpoint"]) {
@@ -202,23 +202,23 @@ using CreateTask = clio::run::admin::GetOrCreatePoolTask<CreateParams>;
 /**
  * DestroyTask - Destroy the core container
  */
-using DestroyTask = chi::Task;  // Simple task for destruction
+using DestroyTask = clio::run::Task;  // Simple task for destruction
 
 /**
  * ParseOmniTask - Parse OMNI YAML file and schedule assimilation tasks
  */
-struct ParseOmniTask : public chi::Task {
+struct ParseOmniTask : public clio::run::Task {
   // Task-specific data using CTP macros
-  IN chi::priv::string
+  IN clio::run::priv::string
       serialized_ctx_;  // Input: Serialized AssimilationCtx (internal use)
-  OUT chi::u32
+  OUT clio::run::u32
       num_tasks_scheduled_;   // Output: Number of assimilation tasks scheduled
-  OUT chi::u32 result_code_;  // Output: Result code (0 = success)
-  OUT chi::priv::string error_message_;  // Output: Error message if failed
+  OUT clio::run::u32 result_code_;  // Output: Result code (0 = success)
+  OUT clio::run::priv::string error_message_;  // Output: Error message if failed
 
   // SHM constructor
   ParseOmniTask()
-      : chi::Task(),
+      : clio::run::Task(),
         serialized_ctx_(CTP_MALLOC),
         num_tasks_scheduled_(0),
         result_code_(0),
@@ -227,10 +227,10 @@ struct ParseOmniTask : public chi::Task {
   // Emplace constructor - accepts vector of AssimilationCtx and serializes
   // internally
   CTP_CROSS_FUN explicit ParseOmniTask(
-      const chi::TaskId &task_node, const chi::PoolId &pool_id,
-      const chi::PoolQuery &pool_query,
+      const clio::run::TaskId &task_node, const clio::run::PoolId &pool_id,
+      const clio::run::PoolQuery &pool_query,
       const std::vector<clio::cae::core::AssimilationCtx> &contexts)
-      : chi::Task(task_node, pool_id, pool_query, Method::kParseOmni),
+      : clio::run::Task(task_node, pool_id, pool_query, Method::kParseOmni),
         serialized_ctx_(CTP_MALLOC),
         num_tasks_scheduled_(0),
         result_code_(0),
@@ -247,7 +247,7 @@ struct ParseOmniTask : public chi::Task {
       ar(contexts);
       ar.Finalize();
     }
-    serialized_ctx_ = chi::priv::string(CTP_MALLOC, std::string(buf.begin(), buf.end()));
+    serialized_ctx_ = clio::run::priv::string(CTP_MALLOC, std::string(buf.begin(), buf.end()));
   }
 
   /**
@@ -282,7 +282,7 @@ struct ParseOmniTask : public chi::Task {
    * AggregateOut replica results into this task
    * @param other Pointer to the replica task to aggregate from
    */
-  void AggregateOut(const ctp::ipc::FullPtr<chi::Task> &other_base) {
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
     Copy(other_base.template Cast<ParseOmniTask>());
   }
@@ -293,17 +293,17 @@ struct ParseOmniTask : public chi::Task {
  * Used for distributed processing where each dataset can be routed to different
  * nodes
  */
-struct ProcessHdf5DatasetTask : public chi::Task {
+struct ProcessHdf5DatasetTask : public clio::run::Task {
   // Task-specific data
-  IN chi::priv::string file_path_;       // HDF5 file path
-  IN chi::priv::string dataset_path_;    // Dataset path within HDF5 file
-  IN chi::priv::string tag_prefix_;      // Tag prefix for CTE storage
-  OUT chi::u32 result_code_;             // Result code (0 = success)
-  OUT chi::priv::string error_message_;  // Error message if failed
+  IN clio::run::priv::string file_path_;       // HDF5 file path
+  IN clio::run::priv::string dataset_path_;    // Dataset path within HDF5 file
+  IN clio::run::priv::string tag_prefix_;      // Tag prefix for CTE storage
+  OUT clio::run::u32 result_code_;             // Result code (0 = success)
+  OUT clio::run::priv::string error_message_;  // Error message if failed
 
   // SHM constructor
   ProcessHdf5DatasetTask()
-      : chi::Task(),
+      : clio::run::Task(),
         file_path_(CTP_MALLOC),
         dataset_path_(CTP_MALLOC),
         tag_prefix_(CTP_MALLOC),
@@ -311,13 +311,13 @@ struct ProcessHdf5DatasetTask : public chi::Task {
         error_message_(CTP_MALLOC) {}
 
   // Emplace constructor
-  CTP_CROSS_FUN explicit ProcessHdf5DatasetTask(const chi::TaskId &task_node,
-                                  const chi::PoolId &pool_id,
-                                  const chi::PoolQuery &pool_query,
+  CTP_CROSS_FUN explicit ProcessHdf5DatasetTask(const clio::run::TaskId &task_node,
+                                  const clio::run::PoolId &pool_id,
+                                  const clio::run::PoolQuery &pool_query,
                                   const std::string &file_path,
                                   const std::string &dataset_path,
                                   const std::string &tag_prefix)
-      : chi::Task(task_node, pool_id, pool_query, Method::kProcessHdf5Dataset),
+      : clio::run::Task(task_node, pool_id, pool_query, Method::kProcessHdf5Dataset),
         file_path_(CTP_MALLOC, file_path),
         dataset_path_(CTP_MALLOC, dataset_path),
         tag_prefix_(CTP_MALLOC, tag_prefix),
@@ -360,7 +360,7 @@ struct ProcessHdf5DatasetTask : public chi::Task {
   /**
    * AggregateOut replica results into this task
    */
-  void AggregateOut(const ctp::ipc::FullPtr<chi::Task> &other_base) {
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
     auto other = other_base.template Cast<ProcessHdf5DatasetTask>();
     // Keep the first error if any
@@ -375,17 +375,17 @@ struct ProcessHdf5DatasetTask : public chi::Task {
  * ExportDataTask - Export blobs from CTE to a file
  * Iterates over all blobs in a tag and writes them to the output path.
  */
-struct ExportDataTask : public chi::Task {
-  IN chi::priv::string tag_name_;      // Tag to export from CTE
-  IN chi::priv::string output_path_;   // Destination file path
-  IN chi::priv::string format_;        // Export format: "hdf5" or "binary"
-  OUT chi::u32 result_code_;           // 0 = success
-  OUT chi::priv::string error_message_;
-  OUT chi::u64 bytes_exported_;
+struct ExportDataTask : public clio::run::Task {
+  IN clio::run::priv::string tag_name_;      // Tag to export from CTE
+  IN clio::run::priv::string output_path_;   // Destination file path
+  IN clio::run::priv::string format_;        // Export format: "hdf5" or "binary"
+  OUT clio::run::u32 result_code_;           // 0 = success
+  OUT clio::run::priv::string error_message_;
+  OUT clio::run::u64 bytes_exported_;
 
   // SHM constructor
   ExportDataTask()
-      : chi::Task(),
+      : clio::run::Task(),
         tag_name_(CTP_MALLOC),
         output_path_(CTP_MALLOC),
         format_(CTP_MALLOC),
@@ -394,13 +394,13 @@ struct ExportDataTask : public chi::Task {
         bytes_exported_(0) {}
 
   // Emplace constructor
-  explicit ExportDataTask(const chi::TaskId &task_node,
-                          const chi::PoolId &pool_id,
-                          const chi::PoolQuery &pool_query,
+  explicit ExportDataTask(const clio::run::TaskId &task_node,
+                          const clio::run::PoolId &pool_id,
+                          const clio::run::PoolQuery &pool_query,
                           const std::string &tag_name,
                           const std::string &output_path,
                           const std::string &format)
-      : chi::Task(task_node, pool_id, pool_query, Method::kExportData),
+      : clio::run::Task(task_node, pool_id, pool_query, Method::kExportData),
         tag_name_(CTP_MALLOC, tag_name),
         output_path_(CTP_MALLOC, output_path),
         format_(CTP_MALLOC, format),
@@ -435,7 +435,7 @@ struct ExportDataTask : public chi::Task {
     bytes_exported_ = other->bytes_exported_;
   }
 
-  void AggregateOut(const ctp::ipc::FullPtr<chi::Task> &other_base) {
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
     Copy(other_base.template Cast<ExportDataTask>());
   }

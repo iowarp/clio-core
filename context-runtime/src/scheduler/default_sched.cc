@@ -137,7 +137,7 @@ u32 DefaultScheduler::ClientMapTask(IpcManager *ipc_manager,
   Task *task_ptr = task.get();
 
   // Network tasks (Send/Recv from admin pool) → last lane
-  if (task_ptr != nullptr && task_ptr->pool_id_ == chi::kAdminPoolId) {
+  if (task_ptr != nullptr && task_ptr->pool_id_ == clio::run::kAdminPoolId) {
     u32 method_id = task_ptr->method_;
     if (method_id == 14 || method_id == 15 || method_id == 20 || method_id == 21) {
       return num_lanes - 1;
@@ -184,7 +184,7 @@ u32 DefaultScheduler::RuntimeMapTask(Worker *worker, const Future<Task> &task,
   // back-pressure on ZMQ HWM — keeping it off the recv worker means
   // inbound SWIM probe responses can still be polled.
   if (task_ptr != nullptr && task_ptr->IsPeriodic()) {
-    if (task_ptr->pool_id_ == chi::kAdminPoolId) {
+    if (task_ptr->pool_id_ == clio::run::kAdminPoolId) {
       u32 method_id = task_ptr->method_;
       Worker *target = nullptr;
       if (method_id == 14) {

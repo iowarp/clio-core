@@ -13,18 +13,18 @@ namespace clio::cte::compressor {
 
 namespace Method {
 // Inherited methods
-GLOBAL_CROSS_CONST chi::u32 kCreate = 0;
-GLOBAL_CROSS_CONST chi::u32 kDestroy = 1;
-GLOBAL_CROSS_CONST chi::u32 kMonitor = 9;
+GLOBAL_CROSS_CONST clio::run::u32 kCreate = 0;
+GLOBAL_CROSS_CONST clio::run::u32 kDestroy = 1;
+GLOBAL_CROSS_CONST clio::run::u32 kMonitor = 9;
 
 // compressor-specific methods
-GLOBAL_CROSS_CONST chi::u32 kDynamicSchedule = 10;
-GLOBAL_CROSS_CONST chi::u32 kCompress = 11;
-GLOBAL_CROSS_CONST chi::u32 kDecompress = 12;
-GLOBAL_CROSS_CONST chi::u32 kPollNodeLoad = 13;
-GLOBAL_CROSS_CONST chi::u32 kPollConsumers = 14;
+GLOBAL_CROSS_CONST clio::run::u32 kDynamicSchedule = 10;
+GLOBAL_CROSS_CONST clio::run::u32 kCompress = 11;
+GLOBAL_CROSS_CONST clio::run::u32 kDecompress = 12;
+GLOBAL_CROSS_CONST clio::run::u32 kPollNodeLoad = 13;
+GLOBAL_CROSS_CONST clio::run::u32 kPollConsumers = 14;
 
-GLOBAL_CROSS_CONST chi::u32 kMaxMethodId = 15;
+GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 15;
 
 inline const std::vector<std::string>& GetMethodNames() {
   static const std::vector<std::string> names = [] {

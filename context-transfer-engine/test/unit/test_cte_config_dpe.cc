@@ -459,7 +459,7 @@ storage:
 
   Config config;
   REQUIRE(config.LoadFromString(yaml_string));
-  chi::u64 expected = static_cast<chi::u64>(1.5 * 1024 * 1024 * 1024);
+  clio::run::u64 expected = static_cast<clio::run::u64>(1.5 * 1024 * 1024 * 1024);
   REQUIRE(config.storage_.devices_[0].capacity_limit_ == expected);
 }
 

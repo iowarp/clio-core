@@ -58,10 +58,10 @@
 namespace {
 // Test setup helper - same pattern as other tests
 bool initialize_chimaera() {
-  return chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
+  return clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true);
 }
 
-// The runtime server is launched out-of-process via chi::test::RuntimeServer
+// The runtime server is launched out-of-process via clio::run::test::RuntimeServer
 // (clio_run start) instead of fork()+CHIMAERA_INIT(kServer): fork-without-exec
 // deadlocks on macOS when the child dlopen()s ChiMods. The client child below
 // is still a real fork() -- client mode does not dlopen, so it is macOS-safe
@@ -81,7 +81,7 @@ TEST_CASE("Per-process shared memory GetClientShmInfo",
           "[ipc][per_process_shm][shm_info][fork]") {
   // Fork a server, then fork a client child to test GetClientShmInfo.
   // Both children start with clean process state (no prior CHIMAERA_INIT).
-  chi::test::RuntimeServer server;
+  clio::run::test::RuntimeServer server;
   REQUIRE(server.Start());
   REQUIRE(server.WaitForReady());
 
@@ -92,7 +92,7 @@ TEST_CASE("Per-process shared memory GetClientShmInfo",
     (void)freopen("/dev/null", "w", stderr);
     setenv("CLIO_WITH_RUNTIME", "0", 1);
     setenv("CLIO_IPC_MODE", "SHM", 1);
-    if (!chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, false)) {
+    if (!clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, false)) {
       _exit(1);
     }
     auto *client_ipc = CLIO_IPC;
@@ -101,7 +101,7 @@ TEST_CASE("Per-process shared memory GetClientShmInfo",
     auto buffer = client_ipc->AllocateBuffer(k1MB);
     if (buffer.IsNull()) _exit(3);
 
-    chi::ClientShmInfo info = client_ipc->GetClientShmInfo(0);
+    clio::run::ClientShmInfo info = client_ipc->GetClientShmInfo(0);
     if (info.owner_pid != getpid()) _exit(4);
     if (info.shm_index != 0) _exit(5);
     if (info.size == 0) _exit(6);
@@ -433,12 +433,12 @@ TEST_CASE("Per-process shared memory ClientShmInfo",
 
   SECTION("ClientShmInfo struct creation") {
     // Create a ClientShmInfo manually
-    chi::ClientShmInfo info;
+    clio::run::ClientShmInfo info;
     info.shm_name = "test_shm";
     info.owner_pid = getpid();
     info.shm_index = 0;
     info.size = k100MB;
-    info.alloc_id = ctp::ipc::AllocatorId(static_cast<chi::u32>(getpid()), 0);
+    info.alloc_id = ctp::ipc::AllocatorId(static_cast<clio::run::u32>(getpid()), 0);
 
     REQUIRE(info.shm_name == "test_shm");
     REQUIRE(info.owner_pid == getpid());

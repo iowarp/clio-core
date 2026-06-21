@@ -175,10 +175,10 @@ void test_bundle_and_retrieve_workflow() {
       "ram::cee_test_storage",  // Target name (RAM storage)
       clio::run::bdev::BdevType::kRam,  // RAM block device type
       4ULL * 1024 * 1024 * 1024,  // 4GB capacity
-      chi::PoolQuery::Local(),  // Local pool query for single-node
-      chi::PoolId(800, 0));  // Explicit bdev pool ID
+      clio::run::PoolQuery::Local(),  // Local pool query for single-node
+      clio::run::PoolId(800, 0));  // Explicit bdev pool ID
   register_task.Wait();
-  chi::u32 register_result = register_task->return_code_;
+  clio::run::u32 register_result = register_task->return_code_;
   assert(register_result == 0 && "Failed to register storage target");
   HLOG(kSuccess, "Storage target registered successfully");
 
@@ -188,7 +188,7 @@ void test_bundle_and_retrieve_workflow() {
   clio::cae::core::CreateParams params;
 
   auto create_task = cae_client.AsyncCreate(
-      chi::PoolQuery::Local(),
+      clio::run::PoolQuery::Local(),
       "test_cee_cae_pool",
       clio::cae::core::kCaePoolId,
       params);
@@ -265,7 +265,7 @@ int main(int argc, char** argv) {
     const char* init_chimaera = std::getenv("INIT_CHIMAERA");
     if (init_chimaera && std::strcmp(init_chimaera, "1") == 0) {
       HLOG(kInfo, "Initializing Chimaera (INIT_CHIMAERA=1)...");
-      chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
+      clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true);
       HLOG(kSuccess, "Chimaera initialized");
     }
 

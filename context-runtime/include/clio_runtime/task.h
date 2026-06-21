@@ -59,7 +59,7 @@ using pid_t = int;
 // Include GlobalSerialize for architecture-portable serialization
 #include <clio_ctp/data_structures/serialization/global_serialize.h>
 
-// Forward declare chi::priv::string for cereal support
+// Forward declare clio::run::priv::string for cereal support
 namespace ctp::priv {
 template <typename T, typename AllocT, size_t SmallSize>
 class basic_string;
@@ -360,29 +360,29 @@ class Task {
   CTP_CROSS_FUN void ClearFlags(u32 flags) { task_flags_.UnsetBits(flags); }
 
   /**
-   * Serialize data structures to chi::priv::string using GlobalSerialize
+   * Serialize data structures to clio::run::priv::string using GlobalSerialize
    * @param alloc Allocator for memory management (CLIO_PRIV_ALLOC_T)
    * @param output_str The string to store serialized data
    * @param args The arguments to serialize
    */
   template <typename... Args>
   static void Serialize(CLIO_PRIV_ALLOC_T* alloc,
-                        chi::priv::string& output_str, const Args&... args) {
+                        clio::run::priv::string& output_str, const Args&... args) {
     std::vector<char> buffer;
     ctp::ipc::GlobalSerialize<std::vector<char>> ar(buffer);
     ar(args...);
     ar.Finalize();
     std::string serialized(buffer.begin(), buffer.end());
-    output_str = chi::priv::string(alloc, serialized);
+    output_str = clio::run::priv::string(alloc, serialized);
   }
 
   /**
-   * Deserialize data structure from chi::ipc::string using GlobalDeserialize
+   * Deserialize data structure from clio::run::ipc::string using GlobalDeserialize
    * @param input_str The string containing serialized data
    * @return The deserialized object
    */
   template <typename OutT>
-  static OutT Deserialize(const chi::priv::string& input_str) {
+  static OutT Deserialize(const clio::run::priv::string& input_str) {
     std::vector<char> data(input_str.data(),
                            input_str.data() + input_str.size());
     ctp::ipc::GlobalDeserialize<std::vector<char>> ar(data);
@@ -581,7 +581,7 @@ typedef ctp::ipc::multi_mpsc_ring_buffer<Future<Task>, CLIO_QUEUE_ALLOC_T> TaskQ
 
 }  // namespace clio::run
 
-// GPU Future types (must be after chi::Future and chi::Task are complete)
+// GPU Future types (must be after clio::run::Future and clio::run::Task are complete)
 #include "clio_runtime/gpu/future.h"
 
 namespace clio::run {
@@ -602,7 +602,7 @@ struct RunContext {
 #ifndef __NVCOMPILER
   std::coroutine_handle<> coro_handle_;
 #else
-  chi::detail::FiberHandle coro_handle_;
+  clio::run::detail::FiberHandle coro_handle_;
 #endif
   u32 worker_id_;               /**< Worker ID executing this task */
   FullPtr<Task> task_;          /**< Task being executed by this context */
@@ -688,7 +688,7 @@ struct RunContext {
 #ifndef __NVCOMPILER
     other.coro_handle_ = nullptr;
 #else
-    other.coro_handle_ = chi::detail::FiberHandle{};
+    other.coro_handle_ = clio::run::detail::FiberHandle{};
 #endif
     other.event_queue_ = nullptr;
   }
@@ -724,7 +724,7 @@ struct RunContext {
 #ifndef __NVCOMPILER
       other.coro_handle_ = nullptr;
 #else
-      other.coro_handle_ = chi::detail::FiberHandle{};
+      other.coro_handle_ = clio::run::detail::FiberHandle{};
 #endif
       other.event_queue_ = nullptr;
     }
@@ -1129,25 +1129,25 @@ class TaskResume {
 /**
  * TaskResume (NVHPC) - Fiber-based return type for runtime methods
  *
- * Wraps a chi::detail::FiberHandle instead of a coroutine handle.
+ * Wraps a clio::run::detail::FiberHandle instead of a coroutine handle.
  * Used when compiling with NVHPC which crashes on C++20 coroutines.
  */
 class TaskResume {
-  chi::detail::FiberHandle handle_;
+  clio::run::detail::FiberHandle handle_;
 
 public:
   TaskResume() = default;
-  explicit TaskResume(chi::detail::FiberHandle h) : handle_(std::move(h)) {}
+  explicit TaskResume(clio::run::detail::FiberHandle h) : handle_(std::move(h)) {}
 
   TaskResume(TaskResume&& o) noexcept : handle_(o.handle_) {
-    o.handle_ = chi::detail::FiberHandle{};
+    o.handle_ = clio::run::detail::FiberHandle{};
   }
 
   TaskResume& operator=(TaskResume&& o) noexcept {
     if (this != &o) {
       if (handle_) handle_.destroy();
       handle_ = o.handle_;
-      o.handle_ = chi::detail::FiberHandle{};
+      o.handle_ = clio::run::detail::FiberHandle{};
     }
     return *this;
   }
@@ -1163,15 +1163,15 @@ public:
   void resume() { handle_.resume(); }
   void destroy() { handle_.destroy(); }
 
-  chi::detail::FiberHandle& get_handle() { return handle_; }
-  const chi::detail::FiberHandle& get_handle() const { return handle_; }
+  clio::run::detail::FiberHandle& get_handle() { return handle_; }
+  const clio::run::detail::FiberHandle& get_handle() const { return handle_; }
 
   /**
    * Release ownership of the fiber handle without destroying it
    */
-  chi::detail::FiberHandle release() {
+  clio::run::detail::FiberHandle release() {
     auto h = handle_;
-    handle_ = chi::detail::FiberHandle{};
+    handle_ = clio::run::detail::FiberHandle{};
     return h;
   }
 
@@ -1189,8 +1189,8 @@ public:
  * back to the worker with an optional delay before resumption.
  *
  * Usage:
- *   co_await chi::yield();       // Yield immediately
- *   co_await chi::yield(25.0);   // Yield with 25 microsecond delay
+ *   co_await clio::run::yield();       // Yield immediately
+ *   co_await clio::run::yield(25.0);   // Yield with 25 microsecond delay
  */
 class YieldAwaiter {
  private:
@@ -1254,8 +1254,8 @@ class YieldAwaiter {
  * @return YieldAwaiter object that can be co_awaited
  *
  * Usage:
- *   co_await chi::yield();       // Yield immediately
- *   co_await chi::yield(25.0);   // Yield with 25 microsecond delay
+ *   co_await clio::run::yield();       // Yield immediately
+ *   co_await clio::run::yield(25.0);   // Yield with 25 microsecond delay
  */
 inline YieldAwaiter yield(double us = 0.0) { return YieldAwaiter(us); }
 
@@ -1267,13 +1267,13 @@ inline YieldAwaiter yield(double us = 0.0) { return YieldAwaiter(us); }
 
 // ============================================================================
 // NVHPC fiber_co_await overloads and make_task_fiber
-// (outside chi namespace, in chi::detail namespace)
+// (outside chi namespace, in clio::run::detail namespace)
 // ============================================================================
 #ifdef __NVCOMPILER
 namespace clio::run::detail {
 
 /// Yield awaiter overload: suspends fiber and marks rctx as yielded
-inline void fiber_co_await(chi::YieldAwaiter ya, chi::RunContext& rctx) {
+inline void fiber_co_await(clio::run::YieldAwaiter ya, clio::run::RunContext& rctx) {
   auto* fs = tls_current_fiber;
   if (!fs) return;
   rctx.is_yielded_ = true;
@@ -1284,7 +1284,7 @@ inline void fiber_co_await(chi::YieldAwaiter ya, chi::RunContext& rctx) {
 
 /// Future overload: waits for async task completion
 template<typename TaskT, typename AllocT>
-inline void fiber_co_await(chi::Future<TaskT, AllocT>& future, chi::RunContext& rctx) {
+inline void fiber_co_await(clio::run::Future<TaskT, AllocT>& future, clio::run::RunContext& rctx) {
   if (future.IsReady()) return;
   auto* fs = tls_current_fiber;
   if (!fs) return;
@@ -1297,13 +1297,13 @@ inline void fiber_co_await(chi::Future<TaskT, AllocT>& future, chi::RunContext& 
 
 /// Future rvalue overload (for temporaries)
 template<typename TaskT, typename AllocT>
-inline void fiber_co_await(chi::Future<TaskT, AllocT>&& future, chi::RunContext& rctx) {
+inline void fiber_co_await(clio::run::Future<TaskT, AllocT>&& future, clio::run::RunContext& rctx) {
   fiber_co_await(future, rctx);
 }
 
 /// TaskResume fiber overload: runs inner fiber until it completes, yielding
 /// outer fiber whenever inner suspends
-inline void fiber_co_await(chi::TaskResume inner, chi::RunContext& rctx) {
+inline void fiber_co_await(clio::run::TaskResume inner, clio::run::RunContext& rctx) {
   if (!inner) return;
   while (!inner.done()) {
     inner.get_handle().resume();
@@ -1322,7 +1322,7 @@ inline void fiber_co_await(chi::TaskResume inner, chi::RunContext& rctx) {
 
 /// Create a TaskResume wrapping a new fiber
 template<typename F>
-inline chi::TaskResume make_task_fiber(F&& fn) {
+inline clio::run::TaskResume make_task_fiber(F&& fn) {
   auto* state = new FiberState();
   state->fn = std::make_unique<FiberCallableT<typename std::decay<F>::type>>(std::forward<F>(fn));
   getcontext(&state->fiber_ctx);
@@ -1330,7 +1330,7 @@ inline chi::TaskResume make_task_fiber(F&& fn) {
   state->fiber_ctx.uc_stack.ss_size = FIBER_STACK_SIZE;
   state->fiber_ctx.uc_link = nullptr;
   makecontext(&state->fiber_ctx, fiber_trampoline, 0);
-  return chi::TaskResume(FiberHandle(state));
+  return clio::run::TaskResume(FiberHandle(state));
 }
 
 }  // namespace clio::run::detail
@@ -1345,9 +1345,9 @@ inline chi::TaskResume make_task_fiber(F&& fn) {
 #  define CLIO_CO_AWAIT(expr)  co_await (expr)
 #  define CLIO_CO_RETURN       co_return
 #else
-#  define CLIO_TASK_BODY_BEGIN return chi::detail::make_task_fiber([=, &rctx]() mutable {
+#  define CLIO_TASK_BODY_BEGIN return clio::run::detail::make_task_fiber([=, &rctx]() mutable {
 #  define CLIO_TASK_BODY_END   });
-#  define CLIO_CO_AWAIT(expr)  chi::detail::fiber_co_await((expr), rctx)
+#  define CLIO_CO_AWAIT(expr)  clio::run::detail::fiber_co_await((expr), rctx)
 // Use plain return so RAII destructors (e.g. ScopedCoMutex) run before the
 // fiber stack is freed. fiber_trampoline handles the final swapcontext back
 // to the worker after the lambda returns.

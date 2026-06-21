@@ -70,11 +70,11 @@
 namespace fs = std::filesystem;
 
 static std::string chi_test_data_dir() {
-  const char *d = chi::env::GetCompat("TEST_DATA_DIR");
+  const char *d = clio::run::env::GetCompat("TEST_DATA_DIR");
   return (d && *d) ? d : ".";
 }
 
-static constexpr chi::u64 kBlobSize = 1 * 1024 * 1024;  // 1 MiB
+static constexpr clio::run::u64 kBlobSize = 1 * 1024 * 1024;  // 1 MiB
 // 1024 cycles * 1 MiB = 1 GiB cumulative, 4x the 256 MiB tier below.
 // Overridable via BLOCK_REUSE_CYCLES: the CLIO_FORCE_NET stress variant routes
 // every Put/Del through the loopback network path (≈300 ms/cycle), so 1024
@@ -103,7 +103,7 @@ class BlockReuseFixture {
     ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", config_path_.c_str(), 1);
     ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", config_path_.c_str(), 1);
 
-    bool success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
+    bool success = clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true);
     REQUIRE(success);
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
     success = clio::cte::core::CLIO_CTE_CLIENT_INIT();

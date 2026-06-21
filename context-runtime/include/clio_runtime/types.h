@@ -56,7 +56,7 @@
  */
 
 // Canonical runtime namespace: clio::run.  `chi` is kept as a permanent
-// alias so the millions of existing chi::Foo qualified lookups in this
+// alias so the millions of existing clio::run::Foo qualified lookups in this
 // codebase (and in every downstream chimod) keep resolving unchanged.
 // The forward-decl ensures the alias resolves even at this top-of-file
 // position where the clio::run namespace hasn't been opened yet.
@@ -69,7 +69,7 @@ namespace clio::run {
 
 // Backward-compat env-var helper alias. Canonical lives in clio_ctp
 // (ctp::env::GetCompat) so ctp-internal code can use it without an upward
-// dependency on clio_runtime; this alias makes chi::env::GetCompat reachable
+// dependency on clio_runtime; this alias makes clio::run::env::GetCompat reachable
 // from every clio_runtime TU that already includes <clio_runtime/types.h>.
 // See clio_ctp/util/env_compat.h for the implementation.
 namespace env {
@@ -438,10 +438,10 @@ struct AddressHash {
 };
 
 // Task flags using CTP BIT_OPT macro
-#define TASK_PERIODIC BIT_OPT(chi::u32, 0)
-#define TASK_ROUTED BIT_OPT(chi::u32, 1)
-#define TASK_DATA_OWNER BIT_OPT(chi::u32, 2)
-#define TASK_REMOTE BIT_OPT(chi::u32, 3)
+#define TASK_PERIODIC BIT_OPT(clio::run::u32, 0)
+#define TASK_ROUTED BIT_OPT(clio::run::u32, 1)
+#define TASK_DATA_OWNER BIT_OPT(clio::run::u32, 2)
+#define TASK_REMOTE BIT_OPT(clio::run::u32, 3)
 // Bit 4 was TASK_FORCE_NET — removed in favor of the CLIO_FORCE_NET env
 // variable (read by IpcManager::ServerInit, stored as force_net_, checked
 // in IsTaskLocal). The per-task flag was redundant and noisier: every
@@ -450,18 +450,18 @@ struct AddressHash {
 // reserved so existing on-wire/persisted flag values keep their bit
 // numbering.
 #define TASK_STARTED \
-  BIT_OPT(chi::u32, 5)  ///< Task execution has been started (set in BeginTask,
+  BIT_OPT(clio::run::u32, 5)  ///< Task execution has been started (set in BeginTask,
                         ///< unset in ReschedulePeriodicTask)
 #define TASK_RUN_CTX_EXISTS \
-  BIT_OPT(chi::u32, 6)  ///< RunContext has been allocated for this task (set in
+  BIT_OPT(clio::run::u32, 6)  ///< RunContext has been allocated for this task (set in
                         ///< BeginTask, prevents duplicate BeginTask calls when
                         ///< task is forwarded between workers)
 #define TASK_FIRE_AND_FORGET \
-  BIT_OPT(chi::u32, 7)  ///< Task does not need a response. Wait/co_await return
+  BIT_OPT(clio::run::u32, 7)  ///< Task does not need a response. Wait/co_await return
                         ///< instantly; SendOut, ClientSend, and
                         ///< IpcManager::SendRuntime are skipped.
 #define TASK_BATCH_AGGREGATE \
-  BIT_OPT(chi::u32, 8)  ///< ManyToOne: this is the synthetic aggregate task the
+  BIT_OPT(clio::run::u32, 8)  ///< ManyToOne: this is the synthetic aggregate task the
                         ///< neighborhood leader runs for a batch. On completion,
                         ///< its OUT is broadcast to the batched original tasks.
 
@@ -486,7 +486,7 @@ constexpr PoolId kAdminPoolId =
 //
 // CLIO_QUEUE_ALLOC_T: BuddyAllocator on both CPU and GPU (queue ring buffers)
 //
-// CLIO_TASK_ALLOC_T: allocator for task data and chi::priv structures
+// CLIO_TASK_ALLOC_T: allocator for task data and clio::run::priv structures
 //   CPU: MultiProcessAllocator — shared across processes in the main SHM
 //   segment GPU: BuddyAllocator       — per-thread GPU allocator
 //
@@ -494,7 +494,7 @@ constexpr PoolId kAdminPoolId =
 //   CPU: MallocAllocator / CTP_MALLOC
 //   GPU: CLIO_TASK_ALLOC_T  / CLIO_IPC->GetMainAllocator()
 //        (task constructors are never called from GPU kernels, so the GPU
-//         CLIO_PRIV_ALLOC is only used for dynamic chi::priv operations in
+//         CLIO_PRIV_ALLOC is only used for dynamic clio::run::priv operations in
 //         kernels)
 #define CLIO_QUEUE_ALLOC_T ctp::ipc::BuddyAllocator
 
@@ -529,14 +529,14 @@ enum class AllocScope { kPrivate, kShared };
  * @return Pointer to the warp's cached BuddyAllocator
  */
 CTP_GPU_FUN ctp::ipc::PrivateBuddyAllocator *GetPrivAllocGpu();
-#define CLIO_PRIV_ALLOC (::chi::GetPrivAllocGpu())
+#define CLIO_PRIV_ALLOC (::clio::run::GetPrivAllocGpu())
 // GPU: CLIO_PRIV_SHARED_ALLOC returns the PartitionedAllocator
 // (PartitionedAllocator) which dispatches allocations to the calling warp's
 // partition via GetAutoTid(). Use for cross-warp data structures (shared maps,
 // vectors) where multiple warps may allocate/free concurrently.
 #define CLIO_PRIV_SHARED_ALLOC_T ctp::ipc::RoundRobinAllocator
 CTP_GPU_FUN ctp::ipc::RoundRobinAllocator *GetSharedAllocGpu();
-#define CLIO_PRIV_SHARED_ALLOC (::chi::GetSharedAllocGpu())
+#define CLIO_PRIV_SHARED_ALLOC (::clio::run::GetSharedAllocGpu())
 #endif
 
 // ---------------------------------------------------------------------------
@@ -709,16 +709,16 @@ using vector = ctp::ipc::vector<T, CLIO_QUEUE_ALLOC_T>;
 // Hash function specializations for std::unordered_map
 namespace std {
 template <>
-struct hash<chi::UniqueId> {
-  size_t operator()(const chi::UniqueId &id) const {
-    return hash<chi::u32>()(id.major_) ^ (hash<chi::u32>()(id.minor_) << 1);
+struct hash<clio::run::UniqueId> {
+  size_t operator()(const clio::run::UniqueId &id) const {
+    return hash<clio::run::u32>()(id.major_) ^ (hash<clio::run::u32>()(id.minor_) << 1);
   }
 };
 
 template <>
-struct hash<chi::TaskId> {
-  size_t operator()(const chi::TaskId &id) const {
-    return hash<chi::u64>()(id.ToU64());
+struct hash<clio::run::TaskId> {
+  size_t operator()(const clio::run::TaskId &id) const {
+    return hash<clio::run::u64>()(id.ToU64());
   }
 };
 

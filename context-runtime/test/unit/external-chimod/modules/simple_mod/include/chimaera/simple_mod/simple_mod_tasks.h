@@ -84,19 +84,19 @@ using DestroyTask = clio::run::admin::DestroyTask;
  * FlushTask - Simple flush task for simple_mod
  * Minimal task with no additional inputs beyond basic task parameters
  */
-struct FlushTask : public chi::Task {
+struct FlushTask : public clio::run::Task {
   // Output results
-  OUT chi::u64 total_work_done_;  ///< Total amount of work completed
+  OUT clio::run::u64 total_work_done_;  ///< Total amount of work completed
 
   /** SHM default constructor */
   explicit FlushTask(AllocT* alloc)
-      : chi::Task(alloc), total_work_done_(0) {}
+      : clio::run::Task(alloc), total_work_done_(0) {}
 
   /** Emplace constructor */
   explicit FlushTask(AllocT* alloc,
-                     const chi::TaskId &task_node, const chi::PoolId &pool_id,
-                     const chi::PoolQuery &pool_query)
-      : chi::Task(alloc, task_node, pool_id, pool_query, 10),
+                     const clio::run::TaskId &task_node, const clio::run::PoolId &pool_id,
+                     const clio::run::PoolQuery &pool_query)
+      : clio::run::Task(alloc, task_node, pool_id, pool_query, 10),
         total_work_done_(0) {
     // Initialize task
     task_id_ = task_node;
@@ -140,7 +140,7 @@ struct FlushTask : public chi::Task {
    * AggregateOut replica results into this task
    * @param other Pointer to the replica task to aggregate from
    */
-  void AggregateOut(const ctp::ipc::FullPtr<chi::Task> &other_base) {
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
     Copy(other_base.template Cast<FlushTask>());
   }

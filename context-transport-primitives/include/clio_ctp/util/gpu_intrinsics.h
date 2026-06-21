@@ -43,7 +43,7 @@
  * Backend-conditional GPU device intrinsic wrappers.
  *
  * Use CTP_DEVICE_* from device-side runtime/orchestrator code (e.g.
- * chi::gpu::Worker) so the same source compiles under CUDA, ROCm, or SYCL
+ * clio::run::gpu::Worker) so the same source compiles under CUDA, ROCm, or SYCL
  * device compilers. Each wrapper expands to:
  *   - the raw nvcc/hipcc intrinsic when CTP_IS_GPU_COMPILER is set
  *   - a sycl::* equivalent when CTP_IS_SYCL_COMPILER is set
@@ -74,7 +74,7 @@
 #endif
 
 // =====================================================================
-// Atomic OR (uint32_t) — used by chi::gpu::Worker for FUTURE_COMPLETE flags
+// Atomic OR (uint32_t) — used by clio::run::gpu::Worker for FUTURE_COMPLETE flags
 // =====================================================================
 
 #if CTP_IS_GPU_COMPILER
