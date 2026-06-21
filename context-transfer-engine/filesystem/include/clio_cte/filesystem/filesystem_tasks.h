@@ -241,21 +241,23 @@ struct GetattrTask : public chi::Task {
   OUT chi::u32 exists_;
   OUT chi::u32 is_dir_;
   OUT chi::u64 size_;
+  OUT chi::u64 ctime_;  // tag change-time (ns); 0 if unknown
   GetattrTask()
-      : chi::Task(), path_(CTP_MALLOC), exists_(0), is_dir_(0), size_(0) {}
+      : chi::Task(), path_(CTP_MALLOC), exists_(0), is_dir_(0), size_(0),
+        ctime_(0) {}
   explicit GetattrTask(const chi::TaskId &task_id, const chi::PoolId &pool_id,
                        const chi::PoolQuery &pool_query, const std::string &path)
       : chi::Task(task_id, pool_id, pool_query, Method::kGetattr),
-        path_(CTP_MALLOC, path), exists_(0), is_dir_(0), size_(0) {}
+        path_(CTP_MALLOC, path), exists_(0), is_dir_(0), size_(0), ctime_(0) {}
   void Copy(const ctp::ipc::FullPtr<GetattrTask>& o) {
     path_ = o->path_; exists_ = o->exists_; is_dir_ = o->is_dir_;
-    size_ = o->size_;
+    size_ = o->size_; ctime_ = o->ctime_;
   }
   template <typename Ar> void SerializeIn(Ar &ar) {
     Task::SerializeIn(ar); ar(path_);
   }
   template <typename Ar> void SerializeOut(Ar &ar) {
-    Task::SerializeOut(ar); ar(exists_, is_dir_, size_);
+    Task::SerializeOut(ar); ar(exists_, is_dir_, size_, ctime_);
   }
 };
 

@@ -1302,12 +1302,14 @@ chi::TaskResume Runtime::PutBlob(ctp::ipc::FullPtr<PutBlobTask> task,
         seed.tag_id_ = tag_id;
         seed.last_modified_ = now;
         seed.last_read_ = now;
+        seed.last_changed_ = now;
         seed.total_size_ = 0;
         auto ins = tag_id_to_info_.insert_or_assign(tag_id, seed);
         tag_info_ptr = ins.value;
       }
       if (tag_info_ptr) {
         tag_info_ptr->last_modified_ = now;
+        tag_info_ptr->last_changed_ = now;  // size change => ctime bump
         if (size_change >= 0) {
           tag_info_ptr->total_size_ += static_cast<chi::u64>(size_change);
         } else {
@@ -1575,6 +1577,7 @@ chi::TaskResume Runtime::DelBlob(ctp::ipc::FullPtr<DelBlobTask> task,
         } else {
           tag_info_ptr->total_size_ = 0;
         }
+        tag_info_ptr->last_changed_ = GetCurrentTimeNs();  // size change => ctime
       }
     }
 
@@ -1663,6 +1666,7 @@ chi::TaskResume Runtime::TruncateBlob(ctp::ipc::FullPtr<TruncateBlobTask> task,
               (d <= tag_info_ptr->total_size_) ? tag_info_ptr->total_size_ - d
                                                : 0;
         }
+        tag_info_ptr->last_changed_ = GetCurrentTimeNs();  // truncate => ctime
       }
     }
 
@@ -1778,6 +1782,7 @@ chi::TaskResume Runtime::RenameTag(ctp::ipc::FullPtr<RenameTagTask> task,
         tag_name_to_id_.insert_or_assign(new_rel, tag_id);
         info->tag_name_ = chi::priv::string(CLIO_PRIV_ALLOC, new_rel);
         info->last_modified_ = GetCurrentTimeNs();
+        info->last_changed_ = info->last_modified_;  // rename => ctime bump
 
         // Re-key this tag and its descendants in the search index from old_abs
         // to new_abs (#598). A directory move changes the absolute names of the
@@ -1817,6 +1822,7 @@ chi::TaskResume Runtime::RenameTag(ctp::ipc::FullPtr<RenameTagTask> task,
       if (info != nullptr) {
         info->tag_name_ = chi::priv::string(CLIO_PRIV_ALLOC, new_name);
         info->last_modified_ = GetCurrentTimeNs();
+        info->last_changed_ = info->last_modified_;  // rename => ctime bump
       }
     }
     // Flat tags have no hierarchy, so the index key is the verbatim name; move
@@ -1914,6 +1920,7 @@ chi::TaskResume Runtime::GetOrCreateTagAlias(
                 chi::priv::string(CLIO_PRIV_ALLOC, alias_key));
           }
           info->last_modified_ = GetCurrentTimeNs();
+          info->last_changed_ = info->last_modified_;  // link added => ctime
         }
       }
     }
@@ -2010,6 +2017,7 @@ chi::TaskResume Runtime::DelTag(ctp::ipc::FullPtr<DelTagTask> task,
             break;
           }
         }
+        tag_info_ptr->last_changed_ = GetCurrentTimeNs();  // unlink => ctime
         tag_info_ptr->last_modified_ = GetCurrentTimeNs();
       }
       task->return_code_ = 0;
@@ -2260,6 +2268,7 @@ chi::TaskResume Runtime::GetTagSize(ctp::ipc::FullPtr<GetTagSizeTask> task,
     tag_info_ptr->last_read_ = now;
 
     task->tag_size_ = tag_info_ptr->total_size_;
+    task->ctime_ = tag_info_ptr->last_changed_;  // surface ctime to getattr
     task->return_code_ = 0;
 
     // Log telemetry for GetTagSize operation
@@ -2442,6 +2451,7 @@ TagId Runtime::GetOrAssignTagId(const std::string &tag_name,
   TagInfo tag_info;
   tag_info.tag_name_ = tag_name;
   tag_info.tag_id_ = tag_id;
+  tag_info.last_changed_ = GetCurrentTimeNs();  // ctime at creation
 
   // Store mappings
   tag_name_to_id_.insert_or_assign(tag_name, tag_id);

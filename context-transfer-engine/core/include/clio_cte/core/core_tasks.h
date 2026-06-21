@@ -673,6 +673,10 @@ struct TagInfo {
       total_size_;  // Total size of all blobs in this tag (non-atomic for GPU)
   Timestamp last_modified_;
   Timestamp last_read_;
+  // Change time (ctime): bumped whenever this tag's METADATA changes — create,
+  // rename, hard-link add/remove, or size change. Distinct from last_modified_
+  // (content/mtime) and last_read_ (atime). Tags only; blobs are not tracked.
+  Timestamp last_changed_;
   // Additional names bound to this tag's id (tag-level hard links). The
   // canonical name lives in tag_name_; aliases_ holds every extra name. When
   // the canonical tag is deleted, all of these bindings are removed too.
@@ -684,6 +688,7 @@ struct TagInfo {
         total_size_(0),
         last_modified_(0),
         last_read_(0),
+        last_changed_(0),
         aliases_(CLIO_PRIV_ALLOC) {}
 
   CTP_CROSS_FUN TagInfo(const chi::priv::string &tag_name, const TagId &tag_id)
@@ -692,6 +697,7 @@ struct TagInfo {
         total_size_(0),
         last_modified_(0),
         last_read_(0),
+        last_changed_(0),
         aliases_(CLIO_PRIV_ALLOC) {}
 
 #if CTP_IS_HOST
@@ -701,6 +707,7 @@ struct TagInfo {
         total_size_(0),
         last_modified_(GetCurrentTimeNs()),
         last_read_(GetCurrentTimeNs()),
+        last_changed_(GetCurrentTimeNs()),
         aliases_(CLIO_PRIV_ALLOC) {}
 #endif
 
@@ -710,6 +717,7 @@ struct TagInfo {
         total_size_(other.total_size_),
         last_modified_(other.last_modified_),
         last_read_(other.last_read_),
+        last_changed_(other.last_changed_),
         aliases_(other.aliases_) {}
 
   CTP_CROSS_FUN TagInfo &operator=(const TagInfo &other) {
@@ -719,6 +727,7 @@ struct TagInfo {
       total_size_ = other.total_size_;
       last_modified_ = other.last_modified_;
       last_read_ = other.last_read_;
+      last_changed_ = other.last_changed_;
       aliases_ = other.aliases_;
     }
     return *this;
@@ -1891,9 +1900,11 @@ struct GetTagNameTask : public chi::Task {
 struct GetTagSizeTask : public chi::Task {
   IN TagId tag_id_;      // Tag ID to query
   OUT size_t tag_size_;  // Total size of all blobs in tag
+  OUT chi::u64 ctime_;   // Tag change-time (last_changed_), ns; 0 if unknown
 
   // SHM constructor
-  GetTagSizeTask() : chi::Task(), tag_id_(TagId::GetNull()), tag_size_(0) {}
+  GetTagSizeTask()
+      : chi::Task(), tag_id_(TagId::GetNull()), tag_size_(0), ctime_(0) {}
 
   // Emplace constructor
   CTP_CROSS_FUN explicit GetTagSizeTask(const chi::TaskId &task_id,
@@ -1902,7 +1913,8 @@ struct GetTagSizeTask : public chi::Task {
                                          const TagId &tag_id)
       : chi::Task(task_id, pool_id, pool_query, Method::kGetTagSize),
         tag_id_(tag_id),
-        tag_size_(0) {
+        tag_size_(0),
+        ctime_(0) {
     task_id_ = task_id;
     pool_id_ = pool_id;
     method_ = Method::kGetTagSize;
@@ -1925,7 +1937,7 @@ struct GetTagSizeTask : public chi::Task {
   template <typename Archive>
   CTP_CROSS_FUN void SerializeOut(Archive &ar) {
     Task::SerializeOut(ar);
-    ar(tag_size_);
+    ar(tag_size_, ctime_);
   }
 
   /**
@@ -1936,16 +1948,18 @@ struct GetTagSizeTask : public chi::Task {
     Task::Copy(other.template Cast<Task>());
     tag_id_ = other->tag_id_;
     tag_size_ = other->tag_size_;
+    ctime_ = other->ctime_;
   }
 
   /**
    * AggregateOut results from a replica task
-   * Sums the tag_size_ values from multiple nodes
+   * Sums the tag_size_ values from multiple nodes; keeps the newest ctime.
    */
   void AggregateOut(const ctp::ipc::FullPtr<chi::Task> &other_base) {
     Task::AggregateOut(other_base);
     auto replica = other_base.template Cast<GetTagSizeTask>();
     tag_size_ += replica->tag_size_;
+    if (replica->ctime_ > ctime_) ctime_ = replica->ctime_;
   }
 };
 

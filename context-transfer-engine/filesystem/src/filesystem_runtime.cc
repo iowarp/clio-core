@@ -410,12 +410,28 @@ chi::TaskResume Runtime::Getattr(ctp::ipc::FullPtr<GetattrTask> task,
   // Live logical size wins if the file is currently tracked (open files only;
   // directories are never tracked here).
   {
-    std::lock_guard<std::mutex> g(meta_mu_);
-    auto it = by_path_.find(path);
-    if (it != by_path_.end()) {
+    bool tracked = false;
+    chi::u64 live_size = 0;
+    clio::cte::core::TagId h_tag = clio::cte::core::TagId::GetNull();
+    {
+      std::lock_guard<std::mutex> g(meta_mu_);
+      auto it = by_path_.find(path);
+      if (it != by_path_.end()) {
+        tracked = true;
+        live_size = it->second->size_.load();
+        h_tag = it->second->tag_id_;
+      }
+    }
+    if (tracked) {
       task->exists_ = 1;
       task->is_dir_ = 0;
-      task->size_ = it->second->size_.load();
+      task->size_ = live_size;
+      // ctime from the tag (mutex released before this RPC).
+      if (!h_tag.IsNull()) {
+        auto s = cte_.AsyncGetTagSize(h_tag, chi::PoolQuery::Local());
+        CLIO_CO_AWAIT(s);
+        task->ctime_ = (s->GetReturnCode() == 0) ? s->ctime_ : 0;
+      }
       task->return_code_ = 0;
       CLIO_CO_RETURN;
     }
@@ -430,6 +446,13 @@ chi::TaskResume Runtime::Getattr(ctp::ipc::FullPtr<GetattrTask> task,
     CLIO_CO_AWAIT(q);
     if (q->GetReturnCode() == 0 && !q->results_.empty()) {
       task->exists_ = 1; task->is_dir_ = 1; task->size_ = 0;
+      // ctime of the directory tag itself.
+      auto tag = cte_.AsyncGetOrCreateTag(dir, clio::cte::core::TagId::GetNull(),
+                                          chi::PoolQuery::Local());
+      CLIO_CO_AWAIT(tag);
+      auto s = cte_.AsyncGetTagSize(tag->tag_id_, chi::PoolQuery::Local());
+      CLIO_CO_AWAIT(s);
+      task->ctime_ = (s->GetReturnCode() == 0) ? s->ctime_ : 0;
       task->return_code_ = 0;
       CLIO_CO_RETURN;
     }
@@ -446,6 +469,7 @@ chi::TaskResume Runtime::Getattr(ctp::ipc::FullPtr<GetattrTask> task,
     auto s = cte_.AsyncGetTagSize(tag->tag_id_, chi::PoolQuery::Local());
     CLIO_CO_AWAIT(s);
     task->size_ = (s->GetReturnCode() == 0) ? s->tag_size_ : 0;
+    task->ctime_ = (s->GetReturnCode() == 0) ? s->ctime_ : 0;
   } else {
     task->exists_ = 0; task->is_dir_ = 0; task->size_ = 0;
   }
