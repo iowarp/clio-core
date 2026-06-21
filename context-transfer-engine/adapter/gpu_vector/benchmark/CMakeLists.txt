@@ -41,8 +41,8 @@ if(CLIO_CORE_ENABLE_CUDA)
             ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
             ${CMAKE_SOURCE_DIR}/context-transfer-engine/adapter/gpu_vector/include
         LINK_LIBS
-            chimaera_cxx
-            chimaera_cxx_gpu
+            clio_run_cxx
+            clio_run_cxx_gpu
             clio_admin_client
             clio_bdev_client
             clio_cte_core_client
@@ -64,7 +64,7 @@ if(CLIO_CORE_ENABLE_CUDA)
             ${CMAKE_SOURCE_DIR}/context-runtime/modules/admin/include
             ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
         LINK_LIBS
-            chimaera_cxx
+            clio_run_cxx
             clio_admin_client
             clio_bdev_client
             clio_cte_core_client
@@ -85,7 +85,7 @@ if(CLIO_CORE_ENABLE_CUDA)
             ${CMAKE_SOURCE_DIR}/context-runtime/modules/admin/include
             ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
         LINK_LIBS
-            chimaera_cxx
+            clio_run_cxx
             clio_admin_client
             clio_bdev_client
             clio_cte_core_client
@@ -137,8 +137,8 @@ if(CLIO_CORE_ENABLE_ROCM)
         ${CMAKE_SOURCE_DIR}/context-transfer-engine/adapter/gpu_vector/include
     )
     target_link_libraries(clio_cte_gpu_vector_bench PUBLIC
-        chimaera_cxx
-        chimaera_cxx_gpu
+        clio_run_cxx
+        clio_run_cxx_gpu
         clio_admin_client
         clio_bdev_client
         clio_cte_core_client
@@ -168,7 +168,7 @@ if(CLIO_CORE_ENABLE_ROCM)
         ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
     )
     target_link_libraries(clio_traditional_oom_bench PUBLIC
-        chimaera_cxx
+        clio_run_cxx
         clio_admin_client
         clio_bdev_client
         clio_cte_core_client
@@ -197,7 +197,7 @@ if(CLIO_CORE_ENABLE_ROCM)
         ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
     )
     target_link_libraries(clio_uvm_bench PUBLIC
-        chimaera_cxx
+        clio_run_cxx
         clio_admin_client
         clio_bdev_client
         clio_cte_core_client

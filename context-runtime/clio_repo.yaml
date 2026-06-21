@@ -13,11 +13,6 @@
 # silently shadows the real value and produces a target name like
 # `<garbage>::cxx`.
 name: runtime
-# Legacy value (kept until the chimaera::* -> clio_run::* alias migration
-# is finished; see context-runtime/src/CMakeLists.txt ~L234 and downstream
-# references in context-runtime/test, context-transfer-engine,
-# context-assimilation-engine, context-exploration-engine, which still
-# link against chimaera::cxx / chimaera::admin_* / chimaera::bdev_*).
-namespace: chimaera
+namespace: clio::run
 version: 1.0.0
 description: CLIO Runtime - task dispatch, IPC, ChiMod orchestration

@@ -81,8 +81,8 @@ echo ""
 echo "Starting Chimaera runtime..."
 export CLIO_SERVER_CONF="${RUNTIME_CONF}"
 clio_run runtime start &
-CHIMAERA_PID=$!
-echo "Chimaera runtime started (PID: ${CHIMAERA_PID})"
+CLIO_PID=$!
+echo "Chimaera runtime started (PID: ${CLIO_PID})"
 echo ""
 
 # Wait for runtime to initialize and create compose pools (CTE + CAE).
@@ -131,8 +131,8 @@ fi
 # Cleanup: Stop CLIO Runtime runtime
 echo ""
 echo "Stopping Chimaera runtime..."
-clio_run runtime stop 2>/dev/null || kill ${CHIMAERA_PID} 2>/dev/null || true
-wait ${CHIMAERA_PID} 2>/dev/null || true
+clio_run runtime stop 2>/dev/null || kill ${CLIO_PID} 2>/dev/null || true
+wait ${CLIO_PID} 2>/dev/null || true
 echo "Chimaera runtime stopped"
 
 exit ${OMNI_STATUS}

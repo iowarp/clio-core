@@ -7,7 +7,7 @@ cmake_minimum_required(VERSION 3.10)
 
 # Include common utilities for dependency management
 if(NOT COMMAND add_clio_module_client)
-  include(${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/ChimaeraCommon.cmake)
+  include(${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/ClioCoreCommon.cmake)
 endif()
 
 # Core runtime test executable
@@ -104,7 +104,7 @@ target_include_directories(${TEST_TARGET} PRIVATE
 )
 
 target_link_libraries(${TEST_TARGET}
-  chimaera_cxx               # Main CLIO Runtime library
+  clio_run_cxx               # Main CLIO Runtime library
   ctp::cxx                  # ClioCtp library
   ${CMAKE_THREAD_LIBS_INIT}  # Threading support
 )
@@ -127,7 +127,7 @@ target_include_directories(${IPC_ALLOCATE_BUFFER_TEST_TARGET} PRIVATE
 )
 
 target_link_libraries(${IPC_ALLOCATE_BUFFER_TEST_TARGET}
-  chimaera_cxx               # Main CLIO Runtime library
+  clio_run_cxx               # Main CLIO Runtime library
   ctp::cxx                  # ClioCtp library
   ${CMAKE_THREAD_LIBS_INIT}  # Threading support
 )
@@ -146,7 +146,7 @@ add_executable(${UNORDERED_MAP_LL_TEST_TARGET} ${UNORDERED_MAP_LL_TEST_SOURCES})
 
 target_link_libraries(${UNORDERED_MAP_LL_TEST_TARGET}
   ${CMAKE_THREAD_LIBS_INIT}  # Threading support
-  chimaera::cxx              # Core library with runtime headers
+  clio::run::cxx              # Core library with runtime headers
 )
 
 set_target_properties(${UNORDERED_MAP_LL_TEST_TARGET} PROPERTIES
@@ -227,7 +227,7 @@ target_include_directories(${PER_PROCESS_SHM_TEST_TARGET} PRIVATE
 )
 
 target_link_libraries(${PER_PROCESS_SHM_TEST_TARGET}
-  chimaera_cxx               # Main CLIO Runtime library
+  clio_run_cxx               # Main CLIO Runtime library
   ctp::cxx                  # ClioCtp library
   ${CMAKE_THREAD_LIBS_INIT}  # Threading support
 )
@@ -260,8 +260,8 @@ add_executable(${AUTOGEN_COVERAGE_TEST_TARGET} ${AUTOGEN_COVERAGE_TEST_SOURCES})
   )
 
   target_link_libraries(${AUTOGEN_COVERAGE_TEST_TARGET}
-    chimaera_MOD_NAME_runtime
-    chimaera_MOD_NAME_client
+    clio_MOD_NAME_runtime
+    clio_MOD_NAME_client
     clio_cte_core_runtime
     clio_cae_core_runtime
     clio_cae_core_client
@@ -270,7 +270,7 @@ add_executable(${AUTOGEN_COVERAGE_TEST_TARGET} ${AUTOGEN_COVERAGE_TEST_SOURCES})
     clio_cte_core_client
     clio_bdev_client
     clio_admin_client
-    chimaera_cxx
+    clio_run_cxx
     ctp::cxx
     ${CMAKE_THREAD_LIBS_INIT}
   )
@@ -295,9 +295,9 @@ target_include_directories(${STREAMING_TEST_TARGET} PRIVATE
 )
 
 target_link_libraries(${STREAMING_TEST_TARGET}
-  chimaera_cxx               # Main CLIO Runtime library
-  chimaera_MOD_NAME_client   # MOD_NAME client
-  chimaera_MOD_NAME_runtime  # MOD_NAME runtime
+  clio_run_cxx               # Main CLIO Runtime library
+  clio_MOD_NAME_client   # MOD_NAME client
+  clio_MOD_NAME_runtime  # MOD_NAME runtime
   ctp::cxx                  # ClioCtp library
   ${CMAKE_THREAD_LIBS_INIT}  # Threading support
 )
@@ -322,7 +322,7 @@ target_include_directories(${EXTERNAL_CLIENT_TEST_TARGET} PRIVATE
 )
 
 target_link_libraries(${EXTERNAL_CLIENT_TEST_TARGET}
-  chimaera_cxx               # Main CLIO Runtime library
+  clio_run_cxx               # Main CLIO Runtime library
   ctp::cxx                  # ClioCtp library
   ${CMAKE_THREAD_LIBS_INIT}  # Threading support
 )
@@ -351,7 +351,7 @@ target_include_directories(${RUNTIME_CLEANUP_TEST_TARGET} PRIVATE
 )
 
 target_link_libraries(${RUNTIME_CLEANUP_TEST_TARGET}
-  chimaera_cxx               # Main CLIO Runtime library
+  clio_run_cxx               # Main CLIO Runtime library
   ctp::cxx                  # ClioCtp library
   ${CMAKE_THREAD_LIBS_INIT}  # Threading support
 )
@@ -374,7 +374,7 @@ target_include_directories(${IPC_ERRORS_TEST_TARGET} PRIVATE
 )
 
 target_link_libraries(${IPC_ERRORS_TEST_TARGET}
-  chimaera_cxx               # Main CLIO Runtime library
+  clio_run_cxx               # Main CLIO Runtime library
   ctp::cxx                  # ClioCtp library
   ${CMAKE_THREAD_LIBS_INIT}  # Threading support
 )
@@ -390,7 +390,7 @@ set_target_properties(${IPC_ERRORS_TEST_TARGET} PROPERTIES
 
 # Create IPC Transport Modes test executable.
 # Launches the runtime out-of-process via chi::test::RuntimeServer (clio_run
-# start) instead of fork()+CHIMAERA_INIT(kServer). POSIX-only for now: the
+# start) instead of fork()+CLIO_INIT(kServer). POSIX-only for now: the
 # RuntimeServer helper's Windows path pulls in <windows.h>, which collides with
 # the ctp lightbeam headers' <winsock2.h> and leaks the Yield/min/max macros
 # into widely-included headers (the project deliberately keeps <windows.h> out
@@ -407,7 +407,7 @@ target_include_directories(${IPC_TRANSPORT_MODES_TEST_TARGET} PRIVATE
 )
 
 target_link_libraries(${IPC_TRANSPORT_MODES_TEST_TARGET}
-  chimaera_cxx               # Main CLIO Runtime library
+  clio_run_cxx               # Main CLIO Runtime library
   clio_bdev_client        # Bdev module client
   clio_admin_client       # Admin module client
   ctp::cxx                  # ClioCtp library
@@ -443,7 +443,7 @@ target_include_directories(${CLIENT_RETRY_TEST_TARGET} PRIVATE
 )
 
 target_link_libraries(${CLIENT_RETRY_TEST_TARGET}
-  chimaera_cxx               # Main CLIO Runtime library
+  clio_run_cxx               # Main CLIO Runtime library
   clio_bdev_client        # Bdev module client
   clio_admin_client       # Admin module client
   ctp::cxx                  # ClioCtp library
@@ -473,7 +473,7 @@ if(FALSE)
     INCLUDE_DIRS
       ${CLIO_RUN_ROOT}/test
       ${CLIO_RUN_ROOT}/modules/MOD_NAME/include
-    LINK_LIBS chimaera_cxx ctp::cuda_cxx
+    LINK_LIBS clio_run_cxx ctp::cuda_cxx
   )
   target_include_directories(${IPC_ALLOCATE_BUFFER_GPU_TEST_TARGET} PRIVATE
     ${CLIO_RUN_ROOT}/include
@@ -481,7 +481,7 @@ if(FALSE)
     ${CLIO_RUN_ROOT}/modules/MOD_NAME/include
   )
   target_link_libraries(${IPC_ALLOCATE_BUFFER_GPU_TEST_TARGET}
-    chimaera_cxx
+    clio_run_cxx
     ctp::cuda_cxx
     ${CMAKE_THREAD_LIBS_INIT}
   )
@@ -510,10 +510,10 @@ if(CLIO_CORE_ENABLE_CUDA)
       ${CLIO_RUN_ROOT}/modules/MOD_NAME/include
       ${CLIO_RUN_ROOT}/modules/admin/include
     LINK_LIBS
-      chimaera_cxx
-      chimaera_cxx_gpu
+      clio_run_cxx
+      clio_run_cxx_gpu
       clio_admin_client
-      chimaera_MOD_NAME_client
+      clio_MOD_NAME_client
       ctp::cuda_cxx
       ${CMAKE_THREAD_LIBS_INIT}
   )
@@ -541,10 +541,10 @@ if(CLIO_CORE_ENABLE_ROCM)
     ${CLIO_RUN_ROOT}/modules/admin/include
   )
   target_link_libraries(test_gpu_kernel_stress PUBLIC
-    chimaera_cxx
-    chimaera_cxx_gpu
+    clio_run_cxx
+    clio_run_cxx_gpu
     clio_admin_client
-    chimaera_MOD_NAME_client
+    clio_MOD_NAME_client
     ctp::rocm_cxx
     ${CMAKE_THREAD_LIBS_INIT}
   )
@@ -570,10 +570,10 @@ if(CLIO_CORE_ENABLE_SYCL)
       ${CLIO_RUN_ROOT}/modules/MOD_NAME/include
       ${CLIO_RUN_ROOT}/modules/admin/include
     LINK_LIBS
-      chimaera_cxx
-      chimaera_cxx_gpu
+      clio_run_cxx
+      clio_run_cxx_gpu
       clio_admin_client
-      chimaera_MOD_NAME_client
+      clio_MOD_NAME_client
       ctp::cxx
       ${CMAKE_THREAD_LIBS_INIT}
   )
@@ -608,7 +608,7 @@ if(CLIO_CORE_ENABLE_TESTS)
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
   set_tests_properties(cr_unit_tests PROPERTIES
-    ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;CHIMAERA_TEST_MODE=1;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500"
+    ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;CLIO_TEST_MODE=1;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500"
     TIMEOUT 600
   )
 
@@ -784,7 +784,7 @@ if(CLIO_CORE_ENABLE_TESTS)
   endif()  # CLIO_CORE_ENABLE_CAE
 
   # External Client Tests (POSIX fork-based — Linux/macOS only)
-  # NOTE: Each test case must run in its own process because CHIMAERA_INIT has
+  # NOTE: Each test case must run in its own process because CLIO_INIT has
   # a static guard that prevents re-initialization. Running all tests in one
   # process causes the static guard to return true for subsequent calls,
   # breaking tests that expect initialization failure.
@@ -853,7 +853,7 @@ if(CLIO_CORE_ENABLE_TESTS)
   )
 
   # IPC Transport Mode Tests (POSIX fork-based — Linux/macOS only)
-  # NOTE: Each test case must run in its own process because CHIMAERA_INIT has
+  # NOTE: Each test case must run in its own process because CLIO_INIT has
   # a static guard that prevents re-initialization.
   if(NOT WIN32)
   add_test(
@@ -898,7 +898,7 @@ if(CLIO_CORE_ENABLE_TESTS)
   endif()  # NOT WIN32 (ipc_transport_modes tests)
 
   # Client Retry Tests (POSIX fork-based — Linux/macOS only)
-  # NOTE: Each test case must run in its own process because CHIMAERA_INIT has
+  # NOTE: Each test case must run in its own process because CLIO_INIT has
   # a static guard that prevents re-initialization.
   if(NOT WIN32)
   add_test(
@@ -1140,7 +1140,7 @@ if(CLIO_CORE_ENABLE_MPI)
   )
 
   target_link_libraries(${MPI_BDEV_TRANSPORT_TEST_TARGET}
-    chimaera_cxx
+    clio_run_cxx
     clio_bdev_client
     clio_admin_client
     ctp::cxx
@@ -1170,7 +1170,7 @@ if(CLIO_CORE_ENABLE_MPI)
     )
     set_tests_properties(cr_mpi_bdev_transport_all_modes PROPERTIES
       ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500"
-      RESOURCE_LOCK "chimaera_runtime_port"
+      RESOURCE_LOCK "clio_runtime_port"
       TIMEOUT 300
     )
 
@@ -1185,7 +1185,7 @@ if(CLIO_CORE_ENABLE_MPI)
     )
     set_tests_properties(cr_mpi_bdev_transport_minimal PROPERTIES
       ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500"
-      RESOURCE_LOCK "chimaera_runtime_port"
+      RESOURCE_LOCK "clio_runtime_port"
       TIMEOUT 180
     )
   endif()

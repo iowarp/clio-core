@@ -23,7 +23,7 @@ endif()
 
 # Client library — ctp::aio provides async I/O headers via its INTERFACE includes.
 # LIB_NAME pins the library to `clio_bdev_client` (the new brand-aligned
-# name); ALIAS keeps `chimaera_bdev_client` working as a CMake target for
+# name); ALIAS keeps `clio_bdev_client` working as a CMake target for
 # any in-tree or out-of-tree consumer that still references the old name.
 add_clio_module_client(
   LIB_NAME clio_bdev
@@ -34,7 +34,6 @@ add_clio_module_client(
     ctp::aio
     ${BDEV_OPTIONAL_LIBS}
 )
-add_library(chimaera_bdev_client ALIAS clio_bdev_client)
 
 # Runtime library (see client block above for the LIB_NAME + ALIAS rationale).
 add_clio_module_runtime(
@@ -54,7 +53,6 @@ add_clio_module_runtime(
     ${BDEV_GPU_LIBS}
     ${BDEV_S3_LIBS}
 )
-add_library(chimaera_bdev_runtime ALIAS clio_bdev_runtime)
 
 # SYCL HBM bdev support: a separate task. Adding -fsycl to
 # clio_bdev_runtime conflicts with the runtime's precompiled

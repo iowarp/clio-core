@@ -136,10 +136,10 @@ target_include_directories(test_reorganize_blob PRIVATE
 target_link_libraries(cte_core_unit_tests
     clio_cte_core_runtime         # CTE core runtime library
     clio_cte_core_client          # CTE core client library
-    chimaera::admin_runtime      # Admin module runtime (required for runtime mode)
-    chimaera::admin_client       # Admin module client
-    chimaera::bdev_runtime       # Bdev module runtime (required for runtime mode)
-    chimaera::bdev_client        # Bdev client for BdevType enum
+    clio::run::admin_runtime      # Admin module runtime (required for runtime mode)
+    clio::run::admin_client       # Admin module client
+    clio::run::bdev_runtime       # Bdev module runtime (required for runtime mode)
+    clio::run::bdev_client        # Bdev client for BdevType enum
     ctp::cxx                    # ClioCtp library
     ${CMAKE_THREAD_LIBS_INIT}    # Threading support
 )
@@ -147,10 +147,10 @@ target_link_libraries(cte_core_unit_tests
 target_link_libraries(cte_core_functionality_simple_tests
     clio_cte_core_runtime
     clio_cte_core_client
-    chimaera::admin_runtime
-    chimaera::admin_client
-    chimaera::bdev_runtime
-    chimaera::bdev_client
+    clio::run::admin_runtime
+    clio::run::admin_client
+    clio::run::bdev_runtime
+    clio::run::bdev_client
     ctp::cxx
     ${CMAKE_THREAD_LIBS_INIT}
 )
@@ -159,10 +159,10 @@ target_link_libraries(cte_core_functionality_simple_tests
 target_link_libraries(test_core_functionality
     clio_cte_core_runtime         # CTE core runtime library
     clio_cte_core_client          # CTE core client library
-    chimaera::admin_runtime      # Admin module runtime (required for runtime mode)
-    chimaera::admin_client       # Admin module client
-    chimaera::bdev_runtime       # Bdev module runtime (required for runtime mode)
-    chimaera::bdev_client        # Bdev client for BdevType enum
+    clio::run::admin_runtime      # Admin module runtime (required for runtime mode)
+    clio::run::admin_client       # Admin module client
+    clio::run::bdev_runtime       # Bdev module runtime (required for runtime mode)
+    clio::run::bdev_client        # Bdev client for BdevType enum
     ctp::cxx                    # ClioCtp library
     ${CMAKE_THREAD_LIBS_INIT}    # Threading support
 )
@@ -171,10 +171,10 @@ target_link_libraries(test_core_functionality
 target_link_libraries(test_cte_config_dpe
     clio_cte_core_runtime         # CTE core runtime library
     clio_cte_core_client          # CTE core client library
-    chimaera::admin_runtime      # Admin module runtime (required for runtime mode)
-    chimaera::admin_client       # Admin module client
-    chimaera::bdev_runtime       # Bdev module runtime (required for runtime mode)
-    chimaera::bdev_client        # Bdev client for BdevType enum
+    clio::run::admin_runtime      # Admin module runtime (required for runtime mode)
+    clio::run::admin_client       # Admin module client
+    clio::run::bdev_runtime       # Bdev module runtime (required for runtime mode)
+    clio::run::bdev_client        # Bdev client for BdevType enum
     ctp::cxx                    # ClioCtp library
     ${CMAKE_THREAD_LIBS_INIT}    # Threading support
 )
@@ -183,10 +183,10 @@ target_link_libraries(test_cte_config_dpe
 target_link_libraries(test_query
     clio_cte_core_runtime         # CTE core runtime library
     clio_cte_core_client          # CTE core client library
-    chimaera::admin_runtime      # Admin module runtime (required for runtime mode)
-    chimaera::admin_client       # Admin module client
-    chimaera::bdev_runtime       # Bdev module runtime (required for runtime mode)
-    chimaera::bdev_client        # Bdev client for BdevType enum
+    clio::run::admin_runtime      # Admin module runtime (required for runtime mode)
+    clio::run::admin_client       # Admin module client
+    clio::run::bdev_runtime       # Bdev module runtime (required for runtime mode)
+    clio::run::bdev_client        # Bdev client for BdevType enum
     ctp::cxx                    # ClioCtp library
     ${CMAKE_THREAD_LIBS_INIT}    # Threading support
 )
@@ -195,10 +195,10 @@ target_link_libraries(test_query
 target_link_libraries(test_tag_operations
     clio_cte_core_runtime         # CTE core runtime library
     clio_cte_core_client          # CTE core client library
-    chimaera::admin_runtime      # Admin module runtime (required for runtime mode)
-    chimaera::admin_client       # Admin module client
-    chimaera::bdev_runtime       # Bdev module runtime (required for runtime mode)
-    chimaera::bdev_client        # Bdev client for BdevType enum
+    clio::run::admin_runtime      # Admin module runtime (required for runtime mode)
+    clio::run::admin_client       # Admin module client
+    clio::run::bdev_runtime       # Bdev module runtime (required for runtime mode)
+    clio::run::bdev_client        # Bdev client for BdevType enum
     ctp::cxx                    # ClioCtp library
     ${CMAKE_THREAD_LIBS_INIT}    # Threading support
 )
@@ -207,10 +207,10 @@ target_link_libraries(test_tag_operations
 target_link_libraries(test_core_client_config
     clio_cte_core_runtime         # CTE core runtime library
     clio_cte_core_client          # CTE core client library
-    chimaera::admin_runtime      # Admin module runtime (required for runtime mode)
-    chimaera::admin_client       # Admin module client
-    chimaera::bdev_runtime       # Bdev module runtime (required for runtime mode)
-    chimaera::bdev_client        # Bdev client for BdevType enum
+    clio::run::admin_runtime      # Admin module runtime (required for runtime mode)
+    clio::run::admin_client       # Admin module client
+    clio::run::bdev_runtime       # Bdev module runtime (required for runtime mode)
+    clio::run::bdev_client        # Bdev client for BdevType enum
     ctp::cxx                    # ClioCtp library
     ${CMAKE_THREAD_LIBS_INIT}    # Threading support
 )
@@ -219,10 +219,10 @@ target_link_libraries(test_core_client_config
 target_link_libraries(test_core_runtime_coverage
     clio_cte_core_runtime         # CTE core runtime library
     clio_cte_core_client          # CTE core client library
-    chimaera::admin_runtime      # Admin module runtime (required for runtime mode)
-    chimaera::admin_client       # Admin module client
-    chimaera::bdev_runtime       # Bdev module runtime (required for runtime mode)
-    chimaera::bdev_client        # Bdev client for BdevType enum
+    clio::run::admin_runtime      # Admin module runtime (required for runtime mode)
+    clio::run::admin_client       # Admin module client
+    clio::run::bdev_runtime       # Bdev module runtime (required for runtime mode)
+    clio::run::bdev_client        # Bdev client for BdevType enum
     ctp::cxx                    # ClioCtp library
     ${CMAKE_THREAD_LIBS_INIT}    # Threading support
 )
@@ -231,10 +231,10 @@ target_link_libraries(test_core_runtime_coverage
 target_link_libraries(test_tiered_storage_stress
     clio_cte_core_runtime         # CTE core runtime library
     clio_cte_core_client          # CTE core client library
-    chimaera::admin_runtime      # Admin module runtime (required for runtime mode)
-    chimaera::admin_client       # Admin module client
-    chimaera::bdev_runtime       # Bdev module runtime (required for runtime mode)
-    chimaera::bdev_client        # Bdev client for BdevType enum
+    clio::run::admin_runtime      # Admin module runtime (required for runtime mode)
+    clio::run::admin_client       # Admin module client
+    clio::run::bdev_runtime       # Bdev module runtime (required for runtime mode)
+    clio::run::bdev_client        # Bdev client for BdevType enum
     ctp::cxx                    # ClioCtp library
     ${CMAKE_THREAD_LIBS_INIT}    # Threading support
 )
@@ -243,10 +243,10 @@ target_link_libraries(test_tiered_storage_stress
 target_link_libraries(test_tiered_storage_dram_default
     clio_cte_core_runtime         # CTE core runtime library
     clio_cte_core_client          # CTE core client library
-    chimaera::admin_runtime      # Admin module runtime (required for runtime mode)
-    chimaera::admin_client       # Admin module client
-    chimaera::bdev_runtime       # Bdev module runtime (required for runtime mode)
-    chimaera::bdev_client        # Bdev client for BdevType enum + policy helper
+    clio::run::admin_runtime      # Admin module runtime (required for runtime mode)
+    clio::run::admin_client       # Admin module client
+    clio::run::bdev_runtime       # Bdev module runtime (required for runtime mode)
+    clio::run::bdev_client        # Bdev client for BdevType enum + policy helper
     ctp::cxx                    # ClioCtp library
     ${CMAKE_THREAD_LIBS_INIT}    # Threading support
 )
@@ -255,10 +255,10 @@ target_link_libraries(test_tiered_storage_dram_default
 target_link_libraries(test_blob_block_reuse
     clio_cte_core_runtime         # CTE core runtime library
     clio_cte_core_client          # CTE core client library
-    chimaera::admin_runtime      # Admin module runtime (required for runtime mode)
-    chimaera::admin_client       # Admin module client
-    chimaera::bdev_runtime       # Bdev module runtime (required for runtime mode)
-    chimaera::bdev_client        # Bdev client for BdevType enum
+    clio::run::admin_runtime      # Admin module runtime (required for runtime mode)
+    clio::run::admin_client       # Admin module client
+    clio::run::bdev_runtime       # Bdev module runtime (required for runtime mode)
+    clio::run::bdev_client        # Bdev client for BdevType enum
     ctp::cxx                    # ClioCtp library
     ${CMAKE_THREAD_LIBS_INIT}    # Threading support
 )
@@ -267,10 +267,10 @@ target_link_libraries(test_blob_block_reuse
 target_link_libraries(test_reorganize_blob
     clio_cte_core_runtime         # CTE core runtime library
     clio_cte_core_client          # CTE core client library
-    chimaera::admin_runtime      # Admin module runtime (required for runtime mode)
-    chimaera::admin_client       # Admin module client
-    chimaera::bdev_runtime       # Bdev module runtime (required for runtime mode)
-    chimaera::bdev_client        # Bdev client for BdevType enum
+    clio::run::admin_runtime      # Admin module runtime (required for runtime mode)
+    clio::run::admin_client       # Admin module client
+    clio::run::bdev_runtime       # Bdev module runtime (required for runtime mode)
+    clio::run::bdev_client        # Bdev client for BdevType enum
     ctp::cxx                    # ClioCtp library
     ${CMAKE_THREAD_LIBS_INIT}    # Threading support
 )
@@ -638,7 +638,7 @@ set_tests_properties(
     PROPERTIES LABELS "msan_skip"
 )
 
-# Tests that start a full CLIO Runtime runtime share /tmp/chimaera_iowarp SHM
+# Tests that start a full CLIO Runtime runtime share /tmp/clio_iowarp SHM
 # segments and TCP/IPC ports, so they must NOT run in parallel. They also
 # need the chimaera cleanup fixture so a previous runtime process holding
 # 0.0.0.0:9416 doesn't break the next test's `IpcManager::ServerInit` with
@@ -674,8 +674,8 @@ set_tests_properties(
     cte_block_reuse_all
     cte_reorganize_all
     PROPERTIES
-        RESOURCE_LOCK "chimaera_runtime"
-        FIXTURES_REQUIRED "chimaera_test_cleanup_fixture"
+        RESOURCE_LOCK "clio_runtime"
+        FIXTURES_REQUIRED "clio_test_cleanup_fixture"
         # Move the runtime off port 9413 (and its derivatives 9414/9416) onto
         # a high range so that an IDE / random local server squatting on the
         # default port doesn't break the test run. libzmq's Windows socket
@@ -734,8 +734,8 @@ if(CLIO_CORE_ENABLE_CUDA)
       ${CMAKE_SOURCE_DIR}/context-runtime/modules/admin/include
       ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
     LINK_LIBS
-      chimaera_cxx
-      chimaera_cxx_gpu
+      clio_run_cxx
+      clio_run_cxx_gpu
       clio_admin_client
       clio_bdev_client
       clio_cte_core_client
@@ -776,8 +776,8 @@ if(CLIO_CORE_ENABLE_ROCM)
     ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
   )
   target_link_libraries(test_cte_devmem_putget PUBLIC
-    chimaera_cxx
-    chimaera_cxx_gpu
+    clio_run_cxx
+    clio_run_cxx_gpu
     clio_admin_client
     clio_bdev_client
     clio_cte_core_client
@@ -819,10 +819,10 @@ add_executable(test_cte_transaction_log
 target_link_libraries(test_cte_transaction_log
     clio_cte_core_runtime         # CTE core runtime library
     clio_cte_core_client          # CTE core client library
-    chimaera::admin_runtime      # Admin module runtime (required for runtime mode)
-    chimaera::admin_client       # Admin module client
-    chimaera::bdev_runtime       # Bdev module runtime (required for runtime mode)
-    chimaera::bdev_client        # Bdev client for BdevType enum
+    clio::run::admin_runtime      # Admin module runtime (required for runtime mode)
+    clio::run::admin_client       # Admin module client
+    clio::run::bdev_runtime       # Bdev module runtime (required for runtime mode)
+    clio::run::bdev_client        # Bdev client for BdevType enum
     ctp::cxx                    # ClioCtp library
     ${CMAKE_THREAD_LIBS_INIT}    # Threading support
 )
@@ -852,10 +852,10 @@ add_executable(test_cte_gpu_metadata_cache
 target_link_libraries(test_cte_gpu_metadata_cache
     clio_cte_core_runtime
     clio_cte_core_client
-    chimaera::admin_runtime
-    chimaera::admin_client
-    chimaera::bdev_runtime
-    chimaera::bdev_client
+    clio::run::admin_runtime
+    clio::run::admin_client
+    clio::run::bdev_runtime
+    clio::run::bdev_client
     ctp::cxx
     ${CMAKE_THREAD_LIBS_INIT}
 )
@@ -885,10 +885,10 @@ add_executable(test_cte_config_errors
 target_link_libraries(test_cte_config_errors
     clio_cte_core_runtime
     clio_cte_core_client
-    chimaera::admin_runtime
-    chimaera::admin_client
-    chimaera::bdev_runtime
-    chimaera::bdev_client
+    clio::run::admin_runtime
+    clio::run::admin_client
+    clio::run::bdev_runtime
+    clio::run::bdev_client
     ctp::cxx
     ${CMAKE_THREAD_LIBS_INIT}
 )

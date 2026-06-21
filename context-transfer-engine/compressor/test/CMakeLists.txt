@@ -56,10 +56,10 @@ target_link_libraries(test_compressor_functional
   clio::cte::compressor_client
   clio::cte::core_runtime         # For Context type
   clio::cte::core_client          # For core client if needed
-  chimaera::admin_runtime       # For CLIO Runtime
-  chimaera::admin_client        # For admin client
-  chimaera::bdev_runtime        # For bdev runtime
-  chimaera::bdev_client         # For bdev client
+  clio::run::admin_runtime       # For CLIO Runtime
+  clio::run::admin_client        # For admin client
+  clio::run::bdev_runtime        # For bdev runtime
+  clio::run::bdev_client         # For bdev client
   ctp::compress                # For compression libraries
   ctp::cxx                     # For ClioCtp library
   ${CMAKE_THREAD_LIBS_INIT}     # Threading support
@@ -121,10 +121,10 @@ target_link_libraries(test_transparent_compress
   clio::cte::compressor_client
   clio::cte::core_runtime
   clio::cte::core_client
-  chimaera::admin_runtime
-  chimaera::admin_client
-  chimaera::bdev_runtime
-  chimaera::bdev_client
+  clio::run::admin_runtime
+  clio::run::admin_client
+  clio::run::bdev_runtime
+  clio::run::bdev_client
   ctp::compress
   ctp::cxx
   ${CMAKE_THREAD_LIBS_INIT}
@@ -149,7 +149,7 @@ set_tests_properties(
     PROPERTIES
         TIMEOUT 120
         LABELS "compressor;transparent;integration;msan_skip"
-        RESOURCE_LOCK "chimaera_runtime"
+        RESOURCE_LOCK "clio_runtime"
 )
 
 install(TARGETS test_transparent_compress RUNTIME DESTINATION bin)
@@ -167,10 +167,10 @@ target_link_libraries(test_adios2_transparent_compress
   clio::cte::compressor_client
   clio::cte::core_runtime
   clio::cte::core_client
-  chimaera::admin_runtime
-  chimaera::admin_client
-  chimaera::bdev_runtime
-  chimaera::bdev_client
+  clio::run::admin_runtime
+  clio::run::admin_client
+  clio::run::bdev_runtime
+  clio::run::bdev_client
   ctp::compress
   ctp::cxx
   ${CMAKE_THREAD_LIBS_INIT}
@@ -192,7 +192,7 @@ set_tests_properties(
     PROPERTIES
         TIMEOUT 120
         LABELS "compressor;adios2;transparent;integration;msan_skip"
-        RESOURCE_LOCK "chimaera_runtime"
+        RESOURCE_LOCK "clio_runtime"
 )
 
 install(TARGETS test_adios2_transparent_compress RUNTIME DESTINATION bin)
@@ -213,7 +213,7 @@ target_compile_definitions(clio_cte_compress_bench PRIVATE CLIO_CORE_ENABLE_COMP
 target_link_libraries(clio_cte_compress_bench
     clio::cte::core_client          # CTE core client library
     clio::cte::core_runtime         # CTE core runtime (for compression context)
-    chimaera::cxx                 # Core CLIO Runtime library
+    clio::run::cxx                 # Core CLIO Runtime library
     ctp::compress                # Compression library
     ${CMAKE_THREAD_LIBS_INIT}     # Threading support (for pthread_setaffinity_np)
 )
@@ -311,7 +311,7 @@ if(MPI_FOUND)
         clio::cte::compressor_client
         clio::cte::core_client
         clio::cte::core_runtime
-        chimaera::cxx
+        clio::run::cxx
         ctp::compress
         ctp::cxx
         ${MPI_CXX_LIBRARIES}

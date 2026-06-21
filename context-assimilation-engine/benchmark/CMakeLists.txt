@@ -10,7 +10,7 @@ if(NOT WIN32)
 
   target_link_libraries(clio_cae_label_bench
     clio::cte::core_client
-    chimaera::cxx
+    clio::run::cxx
   )
 
   target_compile_features(clio_cae_label_bench PRIVATE cxx_std_17)

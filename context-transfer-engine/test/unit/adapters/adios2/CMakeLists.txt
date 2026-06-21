@@ -31,10 +31,10 @@ target_link_libraries(test_adios2_adapter
     iowarp_engine                # IOWarp ADIOS2 engine adapter
     clio_cte_core_runtime         # CTE core runtime library
     clio_cte_core_client          # CTE core client library
-    chimaera::admin_runtime      # Admin module runtime (required for runtime mode)
-    chimaera::admin_client       # Admin module client
-    chimaera::bdev_runtime       # Bdev module runtime (required for runtime mode)
-    chimaera::bdev_client        # Bdev client
+    clio::run::admin_runtime      # Admin module runtime (required for runtime mode)
+    clio::run::admin_client       # Admin module client
+    clio::run::bdev_runtime       # Bdev module runtime (required for runtime mode)
+    clio::run::bdev_client        # Bdev client
     ctp::cxx                    # ClioCtp library
     adios2::adios2               # ADIOS2 library
     ${CMAKE_THREAD_LIBS_INIT}    # Threading support

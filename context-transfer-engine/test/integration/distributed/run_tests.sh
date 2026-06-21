@@ -121,9 +121,9 @@ start_environment() {
     print_msg "$BLUE" "Starting containers..."
     # Auto-detect Docker image: use nvidia image if binary requires CUDA
     if [ -z "${IOWARP_DOCKER_IMAGE:-}" ]; then
-        CHIMAERA_BIN="/workspace/build/bin/chimaera"
-        [ ! -f "$CHIMAERA_BIN" ] && CHIMAERA_BIN="${IOWARP_CORE_ROOT:-/workspace}/build/bin/chimaera"
-        if [ -f "$CHIMAERA_BIN" ] && ldd "$CHIMAERA_BIN" 2>/dev/null | grep -q "libcudart"; then
+        CLIO_BIN="/workspace/build/bin/chimaera"
+        [ ! -f "$CLIO_BIN" ] && CLIO_BIN="${IOWARP_CORE_ROOT:-/workspace}/build/bin/chimaera"
+        if [ -f "$CLIO_BIN" ] && ldd "$CLIO_BIN" 2>/dev/null | grep -q "libcudart"; then
             export IOWARP_DOCKER_IMAGE="iowarp/deps-nvidia:latest"
         else
             export IOWARP_DOCKER_IMAGE="iowarp/deps-cpu:latest"

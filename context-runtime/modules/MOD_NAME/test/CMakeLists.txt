@@ -42,8 +42,8 @@ target_link_libraries(${FLUSH_TEST_TARGET}
   cxx                             # Core CLIO Runtime
   clio_admin_runtime          # Admin module runtime
   clio_admin_client           # Admin module client
-  chimaera_MOD_NAME_runtime       # MOD_NAME module runtime for work tracking
-  chimaera_MOD_NAME_client        # MOD_NAME module client
+  clio_MOD_NAME_runtime       # MOD_NAME module runtime for work tracking
+  clio_MOD_NAME_client        # MOD_NAME module client
   ctp::cxx                       # ClioCtp library
   ${CMAKE_THREAD_LIBS_INIT}       # Threading support
 )
@@ -53,7 +53,7 @@ set_target_properties(${FLUSH_TEST_TARGET} PROPERTIES
   CXX_STANDARD_REQUIRED ON
 )
 
-target_compile_definitions(${FLUSH_TEST_TARGET} PRIVATE CHIMAERA_RUNTIME=1)
+target_compile_definitions(${FLUSH_TEST_TARGET} PRIVATE CLIO_RUNTIME=1)
 
 set_target_properties(${FLUSH_TEST_TARGET} PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
@@ -72,8 +72,8 @@ target_include_directories(${COMUTEX_TEST_TARGET} PRIVATE
 target_link_libraries(${COMUTEX_TEST_TARGET}
   clio_admin_runtime          # Admin module runtime
   clio_admin_client           # Admin module client
-  chimaera_MOD_NAME_runtime       # MOD_NAME module runtime for CoMutex/CoRwLock
-  chimaera_MOD_NAME_client        # MOD_NAME module client
+  clio_MOD_NAME_runtime       # MOD_NAME module runtime for CoMutex/CoRwLock
+  clio_MOD_NAME_client        # MOD_NAME module client
   ctp::cxx                       # ClioCtp library
   ${CMAKE_THREAD_LIBS_INIT}       # Threading support
 )
@@ -100,8 +100,8 @@ target_include_directories(${WAIT_FUNCTIONALITY_TEST_TARGET} PRIVATE
 target_link_libraries(${WAIT_FUNCTIONALITY_TEST_TARGET}
   clio_admin_runtime          # Admin module runtime
   clio_admin_client           # Admin module client
-  chimaera_MOD_NAME_runtime       # MOD_NAME module runtime for WaitTest tasks
-  chimaera_MOD_NAME_client        # MOD_NAME module client
+  clio_MOD_NAME_runtime       # MOD_NAME module runtime for WaitTest tasks
+  clio_MOD_NAME_client        # MOD_NAME module client
   ctp::cxx                       # ClioCtp library
   ${CMAKE_THREAD_LIBS_INIT}       # Threading support
 )
@@ -128,8 +128,8 @@ target_include_directories(${STREAMING_TEST_TARGET} PRIVATE
 target_link_libraries(${STREAMING_TEST_TARGET}
   clio_admin_runtime          # Admin module runtime
   clio_admin_client           # Admin module client
-  chimaera_MOD_NAME_runtime       # MOD_NAME module runtime for streaming tasks
-  chimaera_MOD_NAME_client        # MOD_NAME module client
+  clio_MOD_NAME_runtime       # MOD_NAME module runtime for streaming tasks
+  clio_MOD_NAME_client        # MOD_NAME module client
   ctp::cxx                       # ClioCtp library
   ${CMAKE_THREAD_LIBS_INIT}       # Threading support
 )
@@ -180,7 +180,7 @@ if(CLIO_CORE_ENABLE_TESTS)
     cr_all_streaming_tests
     PROPERTIES
       TIMEOUT 300
-      ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CHIMAERA_TEST_MODE=1;CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500"
+      ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_MODE=1;CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500"
       LABELS "msan_skip;asan_skip"
   )
 
@@ -298,8 +298,8 @@ target_include_directories(${MIGRATE_TEST_TARGET} PRIVATE
 target_link_libraries(${MIGRATE_TEST_TARGET}
   clio_admin_runtime
   clio_admin_client
-  chimaera_MOD_NAME_runtime
-  chimaera_MOD_NAME_client
+  clio_MOD_NAME_runtime
+  clio_MOD_NAME_client
   ctp::cxx
   ${CMAKE_THREAD_LIBS_INIT}
 )
@@ -328,8 +328,8 @@ target_include_directories(${RECOVERY_TEST_TARGET} PRIVATE
 target_link_libraries(${RECOVERY_TEST_TARGET}
   clio_admin_runtime
   clio_admin_client
-  chimaera_MOD_NAME_runtime
-  chimaera_MOD_NAME_client
+  clio_MOD_NAME_runtime
+  clio_MOD_NAME_client
   ctp::cxx
   ${CMAKE_THREAD_LIBS_INIT}
 )
@@ -358,8 +358,8 @@ target_include_directories(${RECONNECT_TEST_TARGET} PRIVATE
 target_link_libraries(${RECONNECT_TEST_TARGET}
   clio_admin_runtime
   clio_admin_client
-  chimaera_MOD_NAME_runtime
-  chimaera_MOD_NAME_client
+  clio_MOD_NAME_runtime
+  clio_MOD_NAME_client
   ctp::cxx
   ${CMAKE_THREAD_LIBS_INIT}
 )

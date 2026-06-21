@@ -7,9 +7,9 @@ add_executable(clio_run_thrpt_bench
 
 target_link_libraries(clio_run_thrpt_bench
   cxx                             # Core CLIO Runtime
-  chimaera::bdev_client           # BDev client for I/O operations
-  chimaera::MOD_NAME_client       # MOD_NAME template module
-  chimaera::admin_client          # Admin client for container creation
+  clio::run::bdev_client           # BDev client for I/O operations
+  clio::run::MOD_NAME_client       # MOD_NAME template module
+  clio::run::admin_client          # Admin client for container creation
   ctp::cxx                       # ClioCtp shared memory framework
 )
 
@@ -27,8 +27,8 @@ if(MPI_CXX_FOUND)
   add_executable(clio_xnode_bdev_bench clio_xnode_bdev_bench.cc)
   target_link_libraries(clio_xnode_bdev_bench
     cxx
-    chimaera::bdev_client
-    chimaera::admin_client
+    clio::run::bdev_client
+    clio::run::admin_client
     ctp::cxx
     MPI::MPI_CXX
   )

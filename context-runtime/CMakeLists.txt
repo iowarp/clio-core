@@ -19,7 +19,7 @@ if(CLIO_CORE_ENABLE_SYCL)
     wrp_core_enable_sycl(20)
 endif()
 
-# Read namespace from chimaera_repo.yaml in project root (function defined in ChimaeraCommon.cmake)
+# Read namespace from clio_repo.yaml in project root (function defined in ClioCoreCommon.cmake)
 # This will be called after the utilities are included below
 
 #------------------------------------------------------------------------------
@@ -31,7 +31,7 @@ endif()
 #------------------------------------------------------------------------------
 # SECTION 4: DEPENDENCY VERIFICATION
 #------------------------------------------------------------------------------
-# Verify that required dependencies were found by ChimaeraCommon.cmake
+# Verify that required dependencies were found by ClioCoreCommon.cmake
 # Check for both package and target availability (supports both installed and subdirectory modes)
 if(NOT ClioCtp_FOUND AND NOT TARGET cxx AND NOT TARGET ctp::cxx)
   message(FATAL_ERROR "Clio CTP not found")
@@ -54,7 +54,7 @@ include_directories(${ClioCtp_INCLUDE_DIRS})
 
 # Output directories are set by root CMakeLists.txt
 
-# Read namespace from chimaera_repo.yaml BEFORE processing subdirectories
+# Read namespace from clio_repo.yaml BEFORE processing subdirectories
 # This searches up the directory tree starting from CLIO_RUN_ROOT
 read_repo_namespace(CLIO_RUN_NAMESPACE "${CLIO_RUN_ROOT}")
 # Derive a filesystem-safe form: replace `::` with `_` so target prefixes
@@ -127,7 +127,7 @@ endif()
 # Collect GPU target if it exists.
 #
 # The GPU twin is defined in context-runtime/src/CMakeLists.txt as
-# `${CHIMAERA_LIB_NAME}_gpu` where CHIMAERA_LIB_NAME is hardcoded to
+# `${CLIO_LIB_NAME}_gpu` where CLIO_LIB_NAME is hardcoded to
 # "clio_run_cxx" — so the literal target name is `clio_run_cxx_gpu`,
 # NOT `${CLIO_RUN_NAMESPACE}_cxx_gpu`.  These can differ: the user-
 # facing namespace deliberately stays `chimaera` for downstream
@@ -141,7 +141,7 @@ endif()
 
 # Install main library (and GPU library if built). The canonical target name
 # is `clio_run_cxx` (see context-runtime/src/CMakeLists.txt); the
-# install-time alias namespace stays `chimaera::` for backward compat with
+# install-time alias namespace stays `clio::run::` for backward compat with
 # external find_package consumers like coeus-adapter.
 install(TARGETS clio_run_cxx ${_GPU_TARGET} ${_CEREAL_TARGET}
   EXPORT ${MAIN_EXPORT_NAME}
@@ -152,10 +152,10 @@ install(TARGETS clio_run_cxx ${_GPU_TARGET} ${_CEREAL_TARGET}
   INCLUDES DESTINATION include
 )
 
-# Install libchimaera_cxx.{so,dylib} / libchimaera_cxx_gpu.{so,dylib}
+# Install libclio_run_cxx.{so,dylib} / libclio_run_cxx_gpu.{so,dylib}
 # symlinks alongside the canonical libclio_run_cxx{,_gpu}.{so,dylib}* so
 # any external binary that loaded the historical name via LD_LIBRARY_PATH
-# or RPATH (dlopen / direct -lchimaera_cxx{,_gpu} link) keeps resolving.
+# or RPATH (dlopen / direct -lclio_run_cxx{,_gpu} link) keeps resolving.
 install(CODE "
   if(WIN32)
     return()
@@ -168,12 +168,12 @@ install(CODE "
   # The wildcards catch both the host lib AND the GPU twin
   # (libclio_run_cxx_gpu) so the legacy symlink trio is created for
   # both — verified by the gpu-tests CI step which tests for
-  # libchimaera_cxx_gpu.so.
+  # libclio_run_cxx_gpu.so.
   file(GLOB _real_files RELATIVE \"\${_libdir}\"
        \"\${_libdir}/libclio_run_cxx*.so*\"
        \"\${_libdir}/libclio_run_cxx*.dylib\")
   foreach(_real_name \${_real_files})
-    string(REPLACE \"libclio_run_cxx\" \"libchimaera_cxx\"
+    string(REPLACE \"libclio_run_cxx\" \"libclio_run_cxx\"
            _link_name \"\${_real_name}\")
     if(NOT \"\${_link_name}\" STREQUAL \"\${_real_name}\"
        AND NOT EXISTS \"\${_libdir}/\${_link_name}\")
@@ -221,7 +221,7 @@ install(CODE "
   # During CPack packaging, CMAKE_INSTALL_PREFIX points to /usr (or similar)
   # but files are actually staged under DESTDIR. If the source yaml does not
   # exist at the bare prefix path, this is a packaging install — skip seeding.
-  set(_DEFAULT_SRC \"\${CMAKE_INSTALL_PREFIX}/etc/chimaera/chimaera_default.yaml\")
+  set(_DEFAULT_SRC \"\${CMAKE_INSTALL_PREFIX}/etc/chimaera/clio_default.yaml\")
   if(NOT EXISTS \"\${_DEFAULT_SRC}\")
     message(STATUS \"Skipping user config seed (packaging install): \${_DEFAULT_SRC} not present\")
     return()
@@ -258,8 +258,8 @@ install(EXPORT ${MAIN_EXPORT_NAME}
 # Generate and install package config file for main library
 include(CMakePackageConfigHelpers)
 
-# Generate ChimaeraConfig.cmake inline (no template file needed)
-set(CHIMAERA_CONFIG_CONTENT "@PACKAGE_INIT@
+# Generate ClioRunConfig.cmake inline (no template file needed)
+set(CLIO_CONFIG_CONTENT "@PACKAGE_INIT@
 
 include(CMakeFindDependencyMacro)
 
@@ -270,27 +270,27 @@ include(\"\${CMAKE_CURRENT_LIST_DIR}/ClioCoreCommon.cmake\")
 # Include the exported targets
 include(\"\${CMAKE_CURRENT_LIST_DIR}/@MAIN_EXPORT_NAME@.cmake\")
 
-# Backward-compat / forward-canonical aliases: chimaera::cxx is the
+# Backward-compat / forward-canonical aliases: clio::run::cxx is the
 # install-time target name (pinned for downstream find_package compat),
 # but new code should link via the canonical `clio::run::cxx`.  The
 # intermediate `clio::run::cxx` waypoint is also kept for source-level
 # back-compat with the pre-`::` rename spelling.
-if(TARGET chimaera::cxx AND NOT TARGET clio::run::cxx)
+if(TARGET clio::run::cxx AND NOT TARGET clio::run::cxx)
   add_library(clio::run::cxx INTERFACE IMPORTED)
   set_target_properties(clio::run::cxx PROPERTIES
-    INTERFACE_LINK_LIBRARIES chimaera::cxx)
+    INTERFACE_LINK_LIBRARIES clio::run::cxx)
 endif()
-if(TARGET chimaera::cxx AND NOT TARGET clio::run::cxx)
+if(TARGET clio::run::cxx AND NOT TARGET clio::run::cxx)
   add_library(clio::run::cxx INTERFACE IMPORTED)
   set_target_properties(clio::run::cxx PROPERTIES
-    INTERFACE_LINK_LIBRARIES chimaera::cxx)
+    INTERFACE_LINK_LIBRARIES clio::run::cxx)
 endif()
 
 # Provide components
 check_required_components(@MAIN_PACKAGE_NAME@)
 ")
 
-file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/${MAIN_PACKAGE_NAME}Config.cmake.in" "${CHIMAERA_CONFIG_CONTENT}")
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/${MAIN_PACKAGE_NAME}Config.cmake.in" "${CLIO_CONFIG_CONTENT}")
 
 configure_package_config_file(
   "${CMAKE_CURRENT_BINARY_DIR}/${MAIN_PACKAGE_NAME}Config.cmake.in"

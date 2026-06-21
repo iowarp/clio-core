@@ -59,7 +59,7 @@ function(add_cae_unit_test TEST_NAME TEST_SOURCE)
     PRIVATE
       clio_cae_core_client
       clio_cte_core_client
-      chimaera::cxx
+      clio::run::cxx
       ctp::configure
       ${ARG_EXTRA_LIBS}
   )
@@ -158,8 +158,8 @@ target_link_libraries(test_cae_comprehensive
   PRIVATE
     clio_cae_core_client
     clio_cte_core_client
-    chimaera::admin_runtime
-    chimaera::bdev_runtime
+    clio::run::admin_runtime
+    clio::run::bdev_runtime
     ctp::cxx
     ${CMAKE_THREAD_LIBS_INIT}
 )
@@ -269,7 +269,7 @@ target_link_libraries(test_export_data
   PRIVATE
     clio_cae_core_client
     clio_cte_core_client
-    chimaera::cxx
+    clio::run::cxx
     ctp::configure
     ${CMAKE_THREAD_LIBS_INIT}
 )
@@ -323,11 +323,11 @@ target_link_libraries(test_cae_cte_interceptor
     clio_cae_core_runtime
     clio_cte_core_client
     clio_cte_core_runtime
-    chimaera::admin_runtime
-    chimaera::admin_client
-    chimaera::bdev_runtime
-    chimaera::bdev_client
-    chimaera::cxx
+    clio::run::admin_runtime
+    clio::run::admin_client
+    clio::run::bdev_runtime
+    clio::run::bdev_client
+    clio::run::cxx
     ctp::cxx
     ctp::configure
     ${CMAKE_THREAD_LIBS_INIT}
@@ -350,7 +350,7 @@ set_tests_properties(
     PROPERTIES
         TIMEOUT 180
         LABELS "cae;interceptor;integration;msan_skip"
-        RESOURCE_LOCK "chimaera_runtime"
+        RESOURCE_LOCK "clio_runtime"
 )
 
 # Tests 8 & 9 (LLM labeling + semantic search) require a running Ollama
@@ -383,11 +383,11 @@ target_link_libraries(test_cae_labeling
     clio_cae_core_runtime
     clio_cte_core_client
     clio_cte_core_runtime
-    chimaera::admin_runtime
-    chimaera::admin_client
-    chimaera::bdev_runtime
-    chimaera::bdev_client
-    chimaera::cxx
+    clio::run::admin_runtime
+    clio::run::admin_client
+    clio::run::bdev_runtime
+    clio::run::bdev_client
+    clio::run::cxx
     ctp::cxx
     ctp::configure
     ${CMAKE_THREAD_LIBS_INIT}
@@ -412,7 +412,7 @@ set_tests_properties(
     PROPERTIES
         TIMEOUT 300
         LABELS "cae;labeling;ollama;integration;msan_skip"
-        RESOURCE_LOCK "chimaera_runtime"
+        RESOURCE_LOCK "clio_runtime"
 )
 
 #------------------------------------------------------------------------------
@@ -439,11 +439,11 @@ target_link_libraries(test_cae_semantic_search
     clio_cae_core_runtime
     clio_cte_core_client
     clio_cte_core_runtime
-    chimaera::admin_runtime
-    chimaera::admin_client
-    chimaera::bdev_runtime
-    chimaera::bdev_client
-    chimaera::cxx
+    clio::run::admin_runtime
+    clio::run::admin_client
+    clio::run::bdev_runtime
+    clio::run::bdev_client
+    clio::run::cxx
     ctp::cxx
     ctp::configure
     ${CMAKE_THREAD_LIBS_INIT}
@@ -467,7 +467,7 @@ set_tests_properties(
     PROPERTIES
         TIMEOUT 600
         LABELS "cae;cte;bm25;semantic-search;ollama;integration;msan_skip"
-        RESOURCE_LOCK "chimaera_runtime"
+        RESOURCE_LOCK "clio_runtime"
 )
 
 endif()  # CLIO_CAE_ENABLE_SUMMARY
@@ -496,11 +496,11 @@ target_link_libraries(test_cae_string_assim
     clio_cae_core_runtime
     clio_cte_core_client
     clio_cte_core_runtime
-    chimaera::admin_runtime
-    chimaera::admin_client
-    chimaera::bdev_runtime
-    chimaera::bdev_client
-    chimaera::cxx
+    clio::run::admin_runtime
+    clio::run::admin_client
+    clio::run::bdev_runtime
+    clio::run::bdev_client
+    clio::run::cxx
     ctp::cxx
     ctp::configure
     ${CMAKE_THREAD_LIBS_INIT}
@@ -522,7 +522,7 @@ set_tests_properties(
     PROPERTIES
         TIMEOUT 180
         LABELS "cae;string-assim;integration;msan_skip"
-        RESOURCE_LOCK "chimaera_runtime"
+        RESOURCE_LOCK "clio_runtime"
 )
 
 #------------------------------------------------------------------------------
@@ -609,8 +609,8 @@ if(CAE_LABELING_ENABLED)
       clio_cae_core_runtime
       clio_cae_core_client
       clio_cte_core_client
-      chimaera::admin_runtime
-      chimaera::bdev_runtime
+      clio::run::admin_runtime
+      clio::run::bdev_runtime
       ctp::cxx
       ${CMAKE_THREAD_LIBS_INIT}
   )

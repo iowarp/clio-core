@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.10)
 
 # Create client library for simple_mod
-# Automatically reads namespace from chimaera_repo.yaml (searches up directory tree)
+# Automatically reads namespace from clio_repo.yaml (searches up directory tree)
 # This creates the following target:
 #   - external_test_simple_mod_client:  Client-side API for user processes (shared library)
 add_clio_module_client(

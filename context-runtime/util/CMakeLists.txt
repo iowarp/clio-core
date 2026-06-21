@@ -15,7 +15,7 @@ add_library(clio_run_commands STATIC
   ${CMAKE_CURRENT_SOURCE_DIR}/clio_run_cmd_refresh_repo.cc
 )
 target_link_libraries(clio_run_commands
-  PUBLIC chimaera_cxx
+  PUBLIC clio_run_cxx
   PUBLIC clio_admin_client
 )
 target_include_directories(clio_run_commands

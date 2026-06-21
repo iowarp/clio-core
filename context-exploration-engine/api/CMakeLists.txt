@@ -5,7 +5,7 @@ project(clio_cee_api VERSION 1.0.0)
 # Find Required Packages
 #------------------------------------------------------------------------------
 # All dependencies are provided by the unified build - no find_package needed
-# chimaera::cxx, clio_cte_core_client, and clio_cae_core_client are already available
+# clio::run::cxx, clio_cte_core_client, and clio_cae_core_client are already available
 
 #------------------------------------------------------------------------------
 # Context Interface Library
@@ -27,7 +27,7 @@ target_include_directories(clio_cee_api
 
 target_link_libraries(clio_cee_api
   PUBLIC
-    chimaera::cxx
+    clio::run::cxx
     clio_cte_core_client
     clio_cae_core_client
 )

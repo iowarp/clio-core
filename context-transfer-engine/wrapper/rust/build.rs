@@ -43,7 +43,7 @@ fn main() {
     // Direct dependency
     println!("cargo:rustc-link-lib=dylib=clio_cte_core_client");
     // Transitive deps (needed for test binary linking)
-    println!("cargo:rustc-link-lib=dylib=chimaera_cxx");
+    println!("cargo:rustc-link-lib=dylib=clio_run_cxx");
     println!("cargo:rustc-link-lib=dylib=clio_ctp_host");
     println!("cargo:rustc-link-lib=dylib=zmq");
 

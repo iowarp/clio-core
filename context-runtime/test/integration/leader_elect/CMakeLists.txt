@@ -23,8 +23,8 @@ target_include_directories(${LEADER_ELECT_TEST_TARGET} PRIVATE
 target_link_libraries(${LEADER_ELECT_TEST_TARGET}
   clio_admin_runtime
   clio_admin_client
-  chimaera_MOD_NAME_runtime
-  chimaera_MOD_NAME_client
+  clio_MOD_NAME_runtime
+  clio_MOD_NAME_client
   ctp::cxx
   ${CMAKE_THREAD_LIBS_INIT}
 )

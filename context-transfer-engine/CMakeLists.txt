@@ -17,7 +17,7 @@ set(CLIO_CTE_ROOT ${CMAKE_CURRENT_SOURCE_DIR})
 
 # CMake modules and ChiMod utilities are now provided by ClioCoreCommon.cmake
 # All find_package calls are handled by root CMakeLists.txt
-# Targets chimaera::cxx, clio_admin_client, etc. are already available
+# Targets clio::run::cxx, clio_admin_client, etc. are already available
 
 # Python bindings configuration
 # nanobind is configured by root CMakeLists.txt when CLIO_CORE_ENABLE_PYTHON=ON

@@ -174,7 +174,7 @@ def restart_node(node_id):
           f"rc={result.get('returncode')} stderr={result.get('stderr', '')[:200]}", flush=True)
 
     # NOTE: We intentionally do NOT call reinit() here.
-    # 1. CHIMAERA_INIT has a static guard that prevents re-initialization,
+    # 1. CLIO_INIT has a static guard that prevents re-initialization,
     #    so reinit() is effectively a no-op after the first init.
     # 2. After Phase 2 failover, the C++ client is connected to a surviving
     #    node and can route physical:N queries to any node (including the

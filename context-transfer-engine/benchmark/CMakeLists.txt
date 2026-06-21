@@ -9,7 +9,7 @@ add_executable(clio_cte_bench
 # Link required libraries (MPI no longer required - uses worker threads instead)
 target_link_libraries(clio_cte_bench
   clio::cte::core_client
-  chimaera::cxx
+  clio::run::cxx
 )
 
 # Set C++ standard
@@ -27,7 +27,7 @@ add_executable(clio_cte_semantic_bench
 )
 target_link_libraries(clio_cte_semantic_bench
   clio::cte::core_client
-  chimaera::cxx
+  clio::run::cxx
 )
 target_compile_features(clio_cte_semantic_bench PRIVATE cxx_std_17)
 install(TARGETS clio_cte_semantic_bench
@@ -44,7 +44,7 @@ if(CLIO_CORE_ENABLE_MPI)
   # Link required libraries including MPI
   target_link_libraries(clio_cte_score_bench
     clio::cte::core_client
-    chimaera::cxx
+    clio::run::cxx
     MPI::MPI_CXX
   )
 

@@ -18,7 +18,7 @@ target_include_directories(${CLI_TEST_TARGET} PRIVATE
 
 target_link_libraries(${CLI_TEST_TARGET}
   clio_run_commands          # Command entry points (RefreshRepo, ...)
-  chimaera_cxx               # Main CLIO Runtime library
+  clio_run_cxx               # Main CLIO Runtime library
   ctp::cxx                   # ClioCtp library
   ${CMAKE_THREAD_LIBS_INIT}  # Threading support
 )
@@ -97,7 +97,7 @@ if(CLIO_CORE_ENABLE_TESTS)
   )
   set_tests_properties(cr_cli_runtime_command_tests PROPERTIES
     ENVIRONMENT "${_cli_live_env}"
-    RESOURCE_LOCK "chimaera_runtime_port"
+    RESOURCE_LOCK "clio_runtime_port"
     TIMEOUT 110
     LABELS "msan_skip"
   )
@@ -112,7 +112,7 @@ if(CLIO_CORE_ENABLE_TESTS)
   target_link_libraries(clio_run_cte_wal_restart_test
     clio_cte_core_client
     clio_admin_client
-    chimaera_cxx
+    clio_run_cxx
     ctp::cxx
     ${CMAKE_THREAD_LIBS_INIT}
   )
@@ -131,7 +131,7 @@ if(CLIO_CORE_ENABLE_TESTS)
   )
   set_tests_properties(cr_cli_cte_wal_restart PROPERTIES
     ENVIRONMENT "${_cli_live_env}"
-    RESOURCE_LOCK "chimaera_runtime_port"
+    RESOURCE_LOCK "clio_runtime_port"
     TIMEOUT 110
     LABELS "msan_skip"
   )
@@ -148,7 +148,7 @@ if(CLIO_CORE_ENABLE_TESTS)
       clio_cte_filesystem_client
       clio_cte_core_client
       clio_admin_client
-      chimaera_cxx
+      clio_run_cxx
       ctp::cxx
       ${CMAKE_THREAD_LIBS_INIT}
     )
@@ -167,7 +167,7 @@ if(CLIO_CORE_ENABLE_TESTS)
     )
     set_tests_properties(cr_cli_cfs PROPERTIES
       ENVIRONMENT "${_cli_live_env}"
-      RESOURCE_LOCK "chimaera_runtime_port"
+      RESOURCE_LOCK "clio_runtime_port"
       TIMEOUT 110
       LABELS "msan_skip"
     )
@@ -183,7 +183,7 @@ if(CLIO_CORE_ENABLE_TESTS)
       clio_cte_filesystem_client
       clio_cte_core_client
       clio_admin_client
-      chimaera_cxx
+      clio_run_cxx
       ctp::cxx
       ${CMAKE_THREAD_LIBS_INIT}
     )
@@ -202,7 +202,7 @@ if(CLIO_CORE_ENABLE_TESTS)
     )
     set_tests_properties(cr_cli_cfs_rename PROPERTIES
       ENVIRONMENT "${_cli_live_env}"
-      RESOURCE_LOCK "chimaera_runtime_port"
+      RESOURCE_LOCK "clio_runtime_port"
       TIMEOUT 180
       LABELS "msan_skip"
     )
@@ -215,7 +215,7 @@ if(CLIO_CORE_ENABLE_TESTS)
     ${CLIO_RUN_ROOT}/test
   )
   target_link_libraries(clio_run_restart_log_test
-    chimaera_cxx
+    clio_run_cxx
     ctp::cxx
     ${CMAKE_THREAD_LIBS_INIT}
   )
@@ -244,7 +244,7 @@ if(CLIO_CORE_ENABLE_TESTS)
   )
   target_link_libraries(clio_run_compose_restart_test
     clio_admin_client
-    chimaera_cxx
+    clio_run_cxx
     ctp::cxx
     ${CMAKE_THREAD_LIBS_INIT}
   )
@@ -263,7 +263,7 @@ if(CLIO_CORE_ENABLE_TESTS)
   )
   set_tests_properties(cr_cli_compose_restart PROPERTIES
     ENVIRONMENT "${_cli_live_env}"
-    RESOURCE_LOCK "chimaera_runtime_port"
+    RESOURCE_LOCK "clio_runtime_port"
     TIMEOUT 240
     LABELS "msan_skip"
   )

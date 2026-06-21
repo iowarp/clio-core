@@ -17,8 +17,8 @@ BIN_DIR="${BUILD_DIR}/bin"
 TEST_CONFIG="/tmp/test_chimaera compose_config.yaml"
 
 # Executables
-CHIMAERA_START_RUNTIME="${BIN_DIR}/clio_run runtime start"
-CHIMAERA_COMPOSE="${BIN_DIR}/clio_run compose"
+CLIO_START_RUNTIME="${BIN_DIR}/clio_run runtime start"
+CLIO_COMPOSE="${BIN_DIR}/clio_run compose"
 
 echo -e "${YELLOW}=== Chimaera Compose Utility Test ===${NC}"
 
@@ -78,7 +78,7 @@ trap cleanup EXIT INT TERM
 
 # Start clio_run runtime in background
 echo -e "${YELLOW}Starting Chimaera runtime...${NC}"
-"${CHIMAERA_START_RUNTIME}" &
+"${CLIO_START_RUNTIME}" &
 RUNTIME_PID=$!
 
 # Wait for runtime to initialize
@@ -95,7 +95,7 @@ echo -e "${GREEN}Runtime started successfully (PID: ${RUNTIME_PID})${NC}"
 
 # Run clio_run compose utility
 echo -e "${YELLOW}Running clio_run compose utility...${NC}"
-if "${CHIMAERA_COMPOSE}" "${TEST_CONFIG}"; then
+if "${CLIO_COMPOSE}" "${TEST_CONFIG}"; then
     echo -e "${GREEN}clio_run compose completed successfully${NC}"
 else
     echo -e "${RED}Error: clio_run compose failed${NC}"

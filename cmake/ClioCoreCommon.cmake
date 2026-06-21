@@ -811,19 +811,19 @@ function(_clio_run_link_runtime_to_client RUNTIME_TARGET CLIENT_TARGET)
 endfunction()
 
 # Function to read repository namespace from clio_repo.yaml (preferred) or
-# chimaera_repo.yaml (legacy). Both formats are accepted; the new clio_repo.yaml
+# clio_repo.yaml (legacy). Both formats are accepted; the new clio_repo.yaml
 # takes precedence so projects can migrate gradually. Searches up the directory
 # tree from the given path.
 function(read_repo_namespace output_var start_path)
   set(current_path "${start_path}")
-  set(namespace "chimaera")  # Default fallback
+  set(namespace "clio::run")  # Default fallback
 
   # Search up the directory tree; at each level look for the new name first,
   # then the legacy name. Either is sufficient.
   while(NOT "${current_path}" STREQUAL "/" AND NOT "${current_path}" STREQUAL "")
     set(_repo_candidates
         "${current_path}/clio_repo.yaml"      # preferred (new)
-        "${current_path}/chimaera_repo.yaml") # legacy, still supported
+        "${current_path}/clio_repo.yaml") # legacy, still supported
     foreach(repo_file ${_repo_candidates})
       if(EXISTS "${repo_file}")
         file(READ "${repo_file}" REPO_YAML_CONTENT)
@@ -852,12 +852,12 @@ function(read_repo_namespace output_var start_path)
 endfunction()
 
 # Function to read module configuration from clio_mod.yaml (preferred) or
-# chimaera_mod.yaml (legacy). Both formats are accepted; the new name takes
+# clio_mod.yaml (legacy). Both formats are accepted; the new name takes
 # precedence to enable gradual migration.
 function(clio_run_read_module_config MODULE_DIR)
   set(_mod_candidates
       "${MODULE_DIR}/clio_mod.yaml"
-      "${MODULE_DIR}/chimaera_mod.yaml")
+      "${MODULE_DIR}/clio_mod.yaml")
   set(CONFIG_FILE "")
   foreach(_cand ${_mod_candidates})
     if(EXISTS "${_cand}")
@@ -868,7 +868,7 @@ function(clio_run_read_module_config MODULE_DIR)
 
   if(NOT CONFIG_FILE)
     message(FATAL_ERROR
-            "Missing clio_mod.yaml (or legacy chimaera_mod.yaml) in ${MODULE_DIR}")
+            "Missing clio_mod.yaml (or legacy clio_mod.yaml) in ${MODULE_DIR}")
   endif()
 
   # Parse YAML file (simple regex parsing for key: value pairs)
@@ -995,10 +995,10 @@ function(add_clio_module_client)
     target_link_directories(${TARGET_NAME} PUBLIC ${ARG_LINK_DIRECTORIES})
   endif()
 
-  # Link libraries - use chimaera::cxx for internal builds, ctp::cxx for external
+  # Link libraries - use clio::run::cxx for internal builds, ctp::cxx for external
   set(CORE_LIB "")
-  if(TARGET chimaera::cxx)
-    set(CORE_LIB chimaera::cxx)
+  if(TARGET clio::run::cxx)
+    set(CORE_LIB clio::run::cxx)
   elseif(TARGET ctp::cxx)
     set(CORE_LIB ctp::cxx)
   elseif(TARGET ClioCtp::cxx)
@@ -1006,12 +1006,12 @@ function(add_clio_module_client)
   elseif(TARGET cxx)
     set(CORE_LIB cxx)
   else()
-    message(FATAL_ERROR "Neither chimaera::cxx, ctp::cxx, ClioCtp::cxx nor cxx target found")
+    message(FATAL_ERROR "Neither clio::run::cxx, ctp::cxx, ClioCtp::cxx nor cxx target found")
   endif()
 
   # Automatically add foundational ChiMod dependencies in unified builds.
   # Skip when the target being built IS one of those foundational modules
-  # (admin keeps LIB_NAME=chimaera_admin, bdev uses LIB_NAME=clio_bdev) — the
+  # (admin keeps LIB_NAME=clio_run_admin, bdev uses LIB_NAME=clio_bdev) — the
   # old guard `NOT NAMESPACE STREQUAL "chimaera"` no longer works now that
   # admin's own namespace is `clio_run`.
   set(CLIO_RUN_MODULE_DEPS "")
@@ -1035,12 +1035,6 @@ function(add_clio_module_client)
 
   # Create alias for external use
   add_library(${CLIO_RUN_NAMESPACE}::${CLIO_RUN_MODULE_NAME}_client ALIAS ${TARGET_NAME})
-  # Also expose the legacy `chimaera::` alias so consumers that pre-date
-  # the module-namespace rename (e.g. coeus-adapter, in-tree CMakeLists
-  # that link to chimaera::admin_client) keep working at build time.
-  if(NOT TARGET chimaera::${CLIO_RUN_MODULE_NAME}_client)
-    add_library(chimaera::${CLIO_RUN_MODULE_NAME}_client ALIAS ${TARGET_NAME})
-  endif()
 
   # Set properties for installation. OUTPUT_NAME tracks LIB_NAME when given
   # so the .so file on disk matches the CMake target.  PACKAGE_NAME (not
@@ -1063,15 +1057,11 @@ function(add_clio_module_client)
   # Install the client library
   # MODULE_PACKAGE_NAME: install dir under lib/cmake/. For runtime modules
   # whose namespace was renamed chimaera -> clio::run (admin, bdev, MOD_NAME)
-  # we pin to the legacy `chimaera_<module>` form so external find_package
+  # we pin to the legacy `clio_<module>` form so external find_package
   # consumers (e.g. coeus-adapter) keep working. For other namespaces
   # (clio::cte, clio::cae, …) we use the standard `<package>_<module>` form
   # (always filesystem-safe).
-  if("${CLIO_RUN_NAMESPACE}" STREQUAL "clio::run")
-    set(MODULE_PACKAGE_NAME "chimaera_${CLIO_RUN_MODULE_NAME}")
-  else()
-    set(MODULE_PACKAGE_NAME "${CLIO_RUN_PACKAGE_NAME}_${CLIO_RUN_MODULE_NAME}")
-  endif()
+  set(MODULE_PACKAGE_NAME "${CLIO_RUN_PACKAGE_NAME}_${CLIO_RUN_MODULE_NAME}")
   set(MODULE_EXPORT_NAME "${MODULE_PACKAGE_NAME}")
 
   install(TARGETS ${TARGET_NAME}
@@ -1162,10 +1152,10 @@ function(add_clio_module_runtime)
     $<$<CONFIG:Release>:NDEBUG>
   )
 
-  # Add compile definitions (runtime always has CHIMAERA_RUNTIME=1)
+  # Add compile definitions (runtime always has CLIO_RUNTIME=1)
   target_compile_definitions(${TARGET_NAME}
     PUBLIC
-      CHIMAERA_RUNTIME=1
+      CLIO_RUNTIME=1
       ${CLIO_RUN_COMMON_COMPILE_DEFS}
       ${ARG_COMPILE_DEFINITIONS}
   )
@@ -1189,10 +1179,10 @@ function(add_clio_module_runtime)
     target_link_directories(${TARGET_NAME} PUBLIC ${ARG_LINK_DIRECTORIES})
   endif()
 
-  # Link libraries - use ctp::cxx for internal builds, chimaera::cxx for external
+  # Link libraries - use ctp::cxx for internal builds, clio::run::cxx for external
   set(CORE_LIB "")
-  if(TARGET chimaera::cxx)
-    set(CORE_LIB chimaera::cxx)
+  if(TARGET clio::run::cxx)
+    set(CORE_LIB clio::run::cxx)
   elseif(TARGET ctp::cxx)
     set(CORE_LIB ctp::cxx)
   elseif(TARGET ClioCtp::cxx)
@@ -1200,7 +1190,7 @@ function(add_clio_module_runtime)
   elseif(TARGET cxx)
     set(CORE_LIB cxx)
   else()
-    message(FATAL_ERROR "Neither chimaera::cxx, ctp::cxx, ClioCtp::cxx nor cxx target found")
+    message(FATAL_ERROR "Neither clio::run::cxx, ctp::cxx, ClioCtp::cxx nor cxx target found")
   endif()
 
   # Runtime-specific link libraries
@@ -1247,12 +1237,6 @@ function(add_clio_module_runtime)
 
   # Create alias for external use
   add_library(${CLIO_RUN_NAMESPACE}::${CLIO_RUN_MODULE_NAME}_runtime ALIAS ${TARGET_NAME})
-  # Also expose the legacy `chimaera::` alias so consumers that pre-date
-  # the module-namespace rename (e.g. coeus-adapter, in-tree CMakeLists
-  # that link to chimaera::admin_runtime) keep working at build time.
-  if(NOT TARGET chimaera::${CLIO_RUN_MODULE_NAME}_runtime)
-    add_library(chimaera::${CLIO_RUN_MODULE_NAME}_runtime ALIAS ${TARGET_NAME})
-  endif()
 
   # Set properties for installation. OUTPUT_NAME tracks LIB_NAME when given
   # so the .so file on disk matches the CMake target.  PACKAGE_NAME (not
@@ -1276,15 +1260,11 @@ function(add_clio_module_runtime)
   # Install the runtime library (add to existing export set if client exists)
   # MODULE_PACKAGE_NAME: install dir under lib/cmake/. For runtime modules
   # whose namespace was renamed chimaera -> clio::run (admin, bdev, MOD_NAME)
-  # we pin to the legacy `chimaera_<module>` form so external find_package
+  # we pin to the legacy `clio_<module>` form so external find_package
   # consumers (e.g. coeus-adapter) keep working. For other namespaces
   # (clio::cte, clio::cae, …) we use the standard `<package>_<module>` form
   # (filesystem-safe).
-  if("${CLIO_RUN_NAMESPACE}" STREQUAL "clio::run")
-    set(MODULE_PACKAGE_NAME "chimaera_${CLIO_RUN_MODULE_NAME}")
-  else()
-    set(MODULE_PACKAGE_NAME "${CLIO_RUN_PACKAGE_NAME}_${CLIO_RUN_MODULE_NAME}")
-  endif()
+  set(MODULE_PACKAGE_NAME "${CLIO_RUN_PACKAGE_NAME}_${CLIO_RUN_MODULE_NAME}")
   set(MODULE_EXPORT_NAME "${MODULE_PACKAGE_NAME}")
 
   install(TARGETS ${TARGET_NAME}
@@ -1314,14 +1294,11 @@ function(add_clio_module_runtime)
   if(SHOULD_GENERATE_CONFIG)
     # Export targets file
     # NAMESPACE: for chimaera-renamed runtime modules (admin/bdev/MOD_NAME,
-    # now under clio::run::), pin to `chimaera::` so installed targets keep
+    # now under clio::run::), pin to `clio::run::` so installed targets keep
     # the legacy name external consumers (coeus-adapter etc.) expect. For
     # other modules use the canonical namespace. Either way the modern
     # alias namespace is emitted in Config.cmake below.
     set(_install_namespace "${CLIO_RUN_NAMESPACE}")
-    if("${CLIO_RUN_NAMESPACE}" STREQUAL "clio::run")
-      set(_install_namespace "chimaera")
-    endif()
     install(EXPORT ${MODULE_EXPORT_NAME}
       FILE ${MODULE_EXPORT_NAME}.cmake
       NAMESPACE ${_install_namespace}::
@@ -1444,9 +1421,9 @@ endfunction()
 message(STATUS "IowarpCoreCommon.cmake loaded successfully")
 
 #==============================================================================
-# Backward-compat aliases (CHIMAERA_* / chimaera_* / add_chimod_* names)
+# Backward-compat aliases (CLIO_* / clio_* / add_chimod_* names)
 #
-# All CMake-facing identifiers in this file were renamed CHIMAERA_* -> CLIO_RUN_*
+# All CMake-facing identifiers in this file were renamed CLIO_* -> CLIO_RUN_*
 # and the helper functions gained `clio` branding (e.g. add_chimod_client ->
 # add_clio_module_client). The legacy names below are macro wrappers that
 # forward to the new names so out-of-tree CMake code keeps building unchanged.
@@ -1462,16 +1439,6 @@ macro(add_chimod_runtime)
   add_clio_module_runtime(${ARGV})
 endmacro()
 
-macro(chimaera_read_module_config _dir)
-  clio_run_read_module_config(${_dir})
-  # Re-export the new variables under their legacy CHIMAERA_* names so any
-  # CMakeLists.txt that still reads e.g. `${CHIMAERA_MODULE_NAME}` keeps
-  # working transparently.
-  set(CHIMAERA_NAMESPACE             "${CLIO_RUN_NAMESPACE}"             PARENT_SCOPE)
-  set(CHIMAERA_MODULE_NAME           "${CLIO_RUN_MODULE_NAME}"           PARENT_SCOPE)
-endmacro()
-
-
 # ---------------------------------------------------------------------------
 # clio_add_force_net_test
 # ---------------------------------------------------------------------------
@@ -1483,7 +1450,7 @@ endmacro()
 #
 # Such tests are always:
 #   * LABELS "msan_skip"            (libzmq is uninstrumented)
-#   * RESOURCE_LOCK "chimaera_runtime" (one runtime owns the fixed port at a time)
+#   * RESOURCE_LOCK "clio_runtime" (one runtime owns the fixed port at a time)
 #   * given CLIO_FORCE_NET=1 appended to the supplied ENVIRONMENT
 #
 # Usage:
@@ -1519,7 +1486,7 @@ function(clio_add_force_net_test)
   set_tests_properties(${FN_NAME} PROPERTIES
     TIMEOUT ${FN_TIMEOUT}
     LABELS "msan_skip"
-    RESOURCE_LOCK "chimaera_runtime"
+    RESOURCE_LOCK "clio_runtime"
     ENVIRONMENT "${FN_ENVIRONMENT};CLIO_FORCE_NET=1")
   if(FN_WORKING_DIRECTORY)
     set_tests_properties(${FN_NAME} PROPERTIES

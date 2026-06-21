@@ -22,8 +22,8 @@ target_include_directories(${AUTOGEN_SWEEP_TEST_TARGET} PRIVATE
 )
 
 target_link_libraries(${AUTOGEN_SWEEP_TEST_TARGET}
-  chimaera_MOD_NAME_runtime
-  chimaera_MOD_NAME_client
+  clio_MOD_NAME_runtime
+  clio_MOD_NAME_client
   clio_cte_core_runtime
   clio_cte_core_client
   clio_cae_core_runtime
@@ -32,7 +32,7 @@ target_link_libraries(${AUTOGEN_SWEEP_TEST_TARGET}
   clio_admin_runtime
   clio_bdev_client
   clio_admin_client
-  chimaera_cxx
+  clio_run_cxx
   ctp::cxx
   ${CMAKE_THREAD_LIBS_INIT}
 )

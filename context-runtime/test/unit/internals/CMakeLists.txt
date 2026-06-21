@@ -15,7 +15,7 @@ target_link_libraries(${IPC_INTERNALS_TEST_TARGET}
   clio_admin_client
   clio_bdev_runtime
   clio_bdev_client
-  chimaera_cxx
+  clio_run_cxx
   ctp::cxx
   ${CMAKE_THREAD_LIBS_INIT}
 )

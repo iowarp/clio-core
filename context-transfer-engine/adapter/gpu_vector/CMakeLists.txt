@@ -5,7 +5,7 @@
 # include/clio_cte/gpu_vector/*.h and are instantiated by the user's
 # CUDA / HIP TU. This INTERFACE library carries the include path and
 # transitive link to the producer-only chimaera GPU stack
-# (chimaera_cxx + chimaera_cxx_gpu + clio_cte_core_client).
+# (clio_run_cxx + clio_run_cxx_gpu + clio_cte_core_client).
 #-----------------------------------------------------------------------------
 
 add_library(clio_cte_gpu_vector INTERFACE)
@@ -16,8 +16,8 @@ target_include_directories(clio_cte_gpu_vector INTERFACE
 )
 
 target_link_libraries(clio_cte_gpu_vector INTERFACE
-    chimaera_cxx
-    chimaera_cxx_gpu
+    clio_run_cxx
+    clio_run_cxx_gpu
     clio_admin_client
     clio_cte_core_client
 )

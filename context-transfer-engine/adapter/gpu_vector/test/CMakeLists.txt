@@ -12,8 +12,8 @@ if(CLIO_CORE_ENABLE_CUDA)
             ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
             ${CMAKE_SOURCE_DIR}/context-transfer-engine/adapter/gpu_vector/include
         LINK_LIBS
-            chimaera_cxx
-            chimaera_cxx_gpu
+            clio_run_cxx
+            clio_run_cxx_gpu
             clio_admin_client
             clio_bdev_client
             clio_cte_core_client
@@ -60,8 +60,8 @@ if(CLIO_CORE_ENABLE_ROCM)
         ${CMAKE_SOURCE_DIR}/context-transfer-engine/adapter/gpu_vector/include
     )
     target_link_libraries(test_gpu_vector PUBLIC
-        chimaera_cxx
-        chimaera_cxx_gpu
+        clio_run_cxx
+        clio_run_cxx_gpu
         clio_admin_client
         clio_bdev_client
         clio_cte_core_client

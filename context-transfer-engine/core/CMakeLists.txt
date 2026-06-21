@@ -48,6 +48,6 @@ if(TARGET clio_cte_core_client)
 endif()
 
 # Note: Cross-namespace dependencies (chimaera admin and bdev) are automatically
-# linked by add_chimod_* functions in ChimaeraCommon.cmake for non-chimaera namespaces
+# linked by add_chimod_* functions in ClioCoreCommon.cmake for non-chimaera namespaces
 
 add_subdirectory(util)

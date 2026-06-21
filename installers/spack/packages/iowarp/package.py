@@ -146,14 +146,14 @@ class Iowarp(CMakePackage):
         if '+test' in self.spec:
             args.append(self.define('CLIO_CORE_ENABLE_TESTS', 'ON'))
             args.append(self.define('CTP_ENABLE_TESTS', 'ON'))
-            args.append(self.define('CHIMAERA_ENABLE_TESTS', 'ON'))
+            args.append(self.define('CLIO_ENABLE_TESTS', 'ON'))
             args.append(self.define('CLIO_CTE_ENABLE_TESTS', 'ON'))
             args.append(self.define('CLIO_CAE_ENABLE_TESTS', 'ON'))
             args.append(self.define('CLIO_CEE_ENABLE_TESTS', 'ON'))
         else:
             args.append(self.define('CLIO_CORE_ENABLE_TESTS', 'OFF'))
             args.append(self.define('CTP_ENABLE_TESTS', 'OFF'))
-            args.append(self.define('CHIMAERA_ENABLE_TESTS', 'OFF'))
+            args.append(self.define('CLIO_ENABLE_TESTS', 'OFF'))
             args.append(self.define('CLIO_CTE_ENABLE_TESTS', 'OFF'))
             args.append(self.define('CLIO_CAE_ENABLE_TESTS', 'OFF'))
             args.append(self.define('CLIO_CEE_ENABLE_TESTS', 'OFF'))
@@ -161,14 +161,14 @@ class Iowarp(CMakePackage):
         if '+benchmark' in self.spec:
             args.append(self.define('CLIO_CORE_ENABLE_BENCHMARKS', 'ON'))
             args.append(self.define('CTP_ENABLE_BENCHMARKS', 'ON'))
-            args.append(self.define('CHIMAERA_ENABLE_BENCHMARKS', 'ON'))
+            args.append(self.define('CLIO_ENABLE_BENCHMARKS', 'ON'))
             args.append(self.define('CLIO_CTE_ENABLE_BENCHMARKS', 'ON'))
             args.append(self.define('CLIO_CAE_ENABLE_BENCHMARKS', 'ON'))
             args.append(self.define('CLIO_CEE_ENABLE_BENCHMARKS', 'ON'))
         else:
             args.append(self.define('CLIO_CORE_ENABLE_BENCHMARKS', 'OFF'))
             args.append(self.define('CTP_ENABLE_BENCHMARKS', 'OFF'))
-            args.append(self.define('CHIMAERA_ENABLE_BENCHMARKS', 'OFF'))
+            args.append(self.define('CLIO_ENABLE_BENCHMARKS', 'OFF'))
             args.append(self.define('CLIO_CTE_ENABLE_BENCHMARKS', 'OFF'))
             args.append(self.define('CLIO_CAE_ENABLE_BENCHMARKS', 'OFF'))
             args.append(self.define('CLIO_CEE_ENABLE_BENCHMARKS', 'OFF'))
@@ -176,9 +176,9 @@ class Iowarp(CMakePackage):
         # CLIO Runtime runtime options (if enabled)
         if '+runtime' in self.spec:
             if '+cuda' in self.spec:
-                args.append(self.define('CHIMAERA_ENABLE_CUDA', 'ON'))
+                args.append(self.define('CLIO_ENABLE_CUDA', 'ON'))
             if '+rocm' in self.spec:
-                args.append(self.define('CHIMAERA_ENABLE_ROCM', 'ON'))
+                args.append(self.define('CLIO_ENABLE_ROCM', 'ON'))
 
         # Context-transfer-engine (CTE) options (if enabled)
         if '+cte' in self.spec:

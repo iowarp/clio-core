@@ -6,7 +6,7 @@ project(clio_cae_core VERSION 1.0.0)
 #------------------------------------------------------------------------------
 # ChiMod utilities are now provided by ClioCoreCommon.cmake in /workspace/cmake
 # All find_package calls are handled by root CMakeLists.txt
-# Targets chimaera::cxx, clio::cte::core_client, etc. are already available
+# Targets clio::run::cxx, clio::cte::core_client, etc. are already available
 
 # All required packages (chimaera, clio_cte_core, yaml-cpp) are already found
 # by ClioCoreCommon.cmake in the root CMakeLists.txt
@@ -150,7 +150,7 @@ add_executable(clio_cae util/clio_cae.cc)
 target_link_libraries(clio_cae
   PRIVATE
     clio_cae_core_client
-    chimaera::cxx
+    clio::run::cxx
     ctp::configure
 )
 install(TARGETS clio_cae DESTINATION bin)
