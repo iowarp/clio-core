@@ -146,9 +146,9 @@ set_target_properties(${STREAMING_TEST_TARGET} PROPERTIES
 # Enable CTest integration if testing is enabled
 if(CLIO_CORE_ENABLE_TESTS)
   # Each binary is registered once and runs all its Catch2 sections in a single
-  # chimaera init/finalize cycle.  The previous setup added ~22 filtered ctest
+  # clio_run init/finalize cycle.  The previous setup added ~22 filtered ctest
   # entries over the same 4 binaries, which forced ~22 init/finalize cycles
-  # serialized via RESOURCE_LOCK and exposed the chimaera shutdown ZMQ race.
+  # serialized via RESOURCE_LOCK and exposed the clio_run shutdown ZMQ race.
   add_test(
     NAME cr_all_flush_tests
     COMMAND ${FLUSH_TEST_TARGET}
@@ -192,91 +192,91 @@ add_custom_target(test_flush
   COMMAND ${FLUSH_TEST_TARGET}
   DEPENDS ${FLUSH_TEST_TARGET}
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
-  COMMENT "Running Chimaera flush correctness tests"
+  COMMENT "Running Clio flush correctness tests"
 )
 
 add_custom_target(test_flush_basic
   COMMAND ${FLUSH_TEST_TARGET}
   DEPENDS ${FLUSH_TEST_TARGET}
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
-  COMMENT "Running Chimaera flush basic tests"
+  COMMENT "Running Clio flush basic tests"
 )
 
 add_custom_target(test_flush_work_orchestrator
   COMMAND ${FLUSH_TEST_TARGET}
   DEPENDS ${FLUSH_TEST_TARGET}
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
-  COMMENT "Running Chimaera flush WorkOrchestrator integration tests"
+  COMMENT "Running Clio flush WorkOrchestrator integration tests"
 )
 
 add_custom_target(test_flush_stress
   COMMAND ${FLUSH_TEST_TARGET}
   DEPENDS ${FLUSH_TEST_TARGET}
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
-  COMMENT "Running Chimaera flush stress tests"
+  COMMENT "Running Clio flush stress tests"
 )
 
 add_custom_target(test_comutex
   COMMAND ${COMUTEX_TEST_TARGET}
   DEPENDS ${COMUTEX_TEST_TARGET}
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
-  COMMENT "Running Chimaera CoMutex and CoRwLock tests"
+  COMMENT "Running Clio CoMutex and CoRwLock tests"
 )
 
 add_custom_target(test_comutex_basic
   COMMAND ${COMUTEX_TEST_TARGET} "[comutex][basic]"
   DEPENDS ${COMUTEX_TEST_TARGET}
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
-  COMMENT "Running Chimaera CoMutex basic tests"
+  COMMENT "Running Clio CoMutex basic tests"
 )
 
 add_custom_target(test_corwlock_basic
   COMMAND ${COMUTEX_TEST_TARGET} "[corwlock][basic]"
   DEPENDS ${COMUTEX_TEST_TARGET}
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
-  COMMENT "Running Chimaera CoRwLock basic tests"
+  COMMENT "Running Clio CoRwLock basic tests"
 )
 
 add_custom_target(test_comutex_concurrent
   COMMAND ${COMUTEX_TEST_TARGET} "[comutex][concurrent]"
   DEPENDS ${COMUTEX_TEST_TARGET}
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
-  COMMENT "Running Chimaera concurrency tests"
+  COMMENT "Running Clio concurrency tests"
 )
 
 add_custom_target(test_comutex_performance
   COMMAND ${COMUTEX_TEST_TARGET} "[comutex][performance]"
   DEPENDS ${COMUTEX_TEST_TARGET}
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
-  COMMENT "Running Chimaera synchronization performance tests"
+  COMMENT "Running Clio synchronization performance tests"
 )
 
 add_custom_target(test_streaming
   COMMAND ${STREAMING_TEST_TARGET}
   DEPENDS ${STREAMING_TEST_TARGET}
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
-  COMMENT "Running Chimaera output streaming tests"
+  COMMENT "Running Clio output streaming tests"
 )
 
 add_custom_target(test_streaming_small
   COMMAND ${STREAMING_TEST_TARGET}
   DEPENDS ${STREAMING_TEST_TARGET}
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
-  COMMENT "Running Chimaera small output tests"
+  COMMENT "Running Clio small output tests"
 )
 
 add_custom_target(test_streaming_large
   COMMAND ${STREAMING_TEST_TARGET}
   DEPENDS ${STREAMING_TEST_TARGET}
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
-  COMMENT "Running Chimaera large output streaming tests"
+  COMMENT "Running Clio large output streaming tests"
 )
 
 add_custom_target(test_streaming_concurrent
   COMMAND ${STREAMING_TEST_TARGET}
   DEPENDS ${STREAMING_TEST_TARGET}
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
-  COMMENT "Running Chimaera concurrent streaming tests"
+  COMMENT "Running Clio concurrent streaming tests"
 )
 
 

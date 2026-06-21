@@ -1,4 +1,4 @@
-# Dashboard Integration Test -- 4-node Chimaera cluster with context-visualizer
+# Dashboard Integration Test -- 4-node Clio cluster with context-visualizer
 #
 # Usage:
 #   docker compose up -d

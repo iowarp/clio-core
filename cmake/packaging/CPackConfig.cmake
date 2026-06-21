@@ -113,7 +113,7 @@ if(CLIO_CORE_ENABLE_RPM_PACKAGE OR CLIO_CORE_ENABLE_CPACK)
     # Disable auto-generated Requires on internal libraries. With AUTOREQ
     # default-on, rpmbuild scans every installed .so and adds a
     # Requires: lib<x>.so()(64bit) for each one — including our OWN
-    # libclio_admin_client.so / libchimaera_MOD_NAME_*.so / etc. which
+    # libclio_admin_client.so / libclio_MOD_NAME_*.so / etc. which
     # ARE in the same RPM. The matching Provides: side isn't generated
     # at the same path (sym-version mismatch under the cpack flow),
     # so dnf refuses to install with "nothing provides libclio_*". Turn

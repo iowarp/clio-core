@@ -30,14 +30,14 @@ stop_runtime() {
 cleanup() {
     stop_runtime
     sleep 1
-    rm -f /dev/shm/chimaera_*
+    rm -f /dev/shm/clio_*
     rm -rf "$CONF_DIR"
     rm -rf /tmp/cte_restart_ram
 }
 trap cleanup EXIT
 
 # Clean slate
-rm -f /dev/shm/chimaera_*
+rm -f /dev/shm/clio_*
 rm -rf "$CONF_DIR"
 rm -rf /tmp/cte_restart_ram
 
@@ -61,7 +61,7 @@ stop_runtime
 sleep 1
 
 # Clear SHM but keep persistent files
-rm -f /dev/shm/chimaera_*
+rm -f /dev/shm/clio_*
 
 echo "Phase 1 complete. Persistent files in $CONF_DIR:"
 ls -la "$CONF_DIR"/restart/ 2>/dev/null || echo "  (no restart dir yet)"

@@ -8,7 +8,7 @@
 #   clio_cte      (clio_cte_core)       at 513.0 — downstream storage
 #
 # Stack:
-#   clio_runtime     -> chimaera daemon
+#   clio_runtime     -> clio_run daemon
 #   clio_cte         -> CTE storage tiers at pool 513.0
 #   clio_compress    -> clio_cte_compressor at 512.0, next_pool_id=513.0,
 #                       snappy as the default static library

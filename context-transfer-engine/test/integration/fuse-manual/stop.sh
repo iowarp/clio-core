@@ -48,12 +48,12 @@ fi
 if [ -f "$PID_DIR/runtime.pid" ]; then
     RUNTIME_PID="$(cat "$PID_DIR/runtime.pid")"
     if kill -0 "$RUNTIME_PID" 2>/dev/null; then
-        info "Stopping Chimaera runtime (PID $RUNTIME_PID)..."
+        info "Stopping Clio runtime (PID $RUNTIME_PID)..."
         kill "$RUNTIME_PID" 2>/dev/null || true
         wait "$RUNTIME_PID" 2>/dev/null || true
     fi
     rm -f "$PID_DIR/runtime.pid"
-    ok "Chimaera runtime stopped"
+    ok "Clio runtime stopped"
 fi
 
 # --- Cleanup -----------------------------------------------------------------

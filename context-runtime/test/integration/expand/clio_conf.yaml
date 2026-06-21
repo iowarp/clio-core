@@ -1,4 +1,4 @@
-# Chimaera Configuration for Expand/Induction Testing
+# Clio Configuration for Expand/Induction Testing
 # Nodes 1-2 start with hostfile_initial, node 3 starts with hostfile_full
 # The hostfile path is set per-container via CONTAINER_HOSTFILE env var
 
@@ -11,7 +11,7 @@ networking:
 # Logging configuration
 logging:
   level: "info"
-  file: "/tmp/chimaera.log"
+  file: "/tmp/clio.log"
 
 # Runtime configuration
 runtime:

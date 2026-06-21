@@ -47,36 +47,7 @@ if(CLIO_CORE_ENABLE_TESTS AND CMAKE_CONFIGURATION_TYPES)
   )
 endif()
 
-# Install the binary under its canonical name `clio_run`. The legacy name
-# `chimaera` (predates the CLIO rebrand) is installed as a symlink in the
-# same bin/ dir so existing pipelines and scripts keep working. The binary
-# adapts its own usage messages via argv[0] so each invocation prints the
-# right name. See docs/deprecation-notes.md for the full migration table.
+# Install the binary under its canonical name `clio_run`.
 install(TARGETS clio_run
   RUNTIME DESTINATION bin
 )
-
-# Install `chimaera` as a symlink to `clio_run` (Windows: copy fallback).
-# Done at install time so it lands at ${CMAKE_INSTALL_PREFIX}/bin regardless
-# of CPACK/DESTDIR. The Windows source path needs the `.exe` suffix — the
-# bare-name check silently skipped on Windows wheels and shipped without
-# chimaera.exe, breaking `pip install iowarp-core` users' first-touch
-# experience.
-install(CODE "
-  if(WIN32)
-    set(_src \"\${CMAKE_INSTALL_PREFIX}/bin/clio_run.exe\")
-    set(_dst \"\${CMAKE_INSTALL_PREFIX}/bin/chimaera.exe\")
-  else()
-    set(_src \"\${CMAKE_INSTALL_PREFIX}/bin/clio_run\")
-    set(_dst \"\${CMAKE_INSTALL_PREFIX}/bin/chimaera\")
-  endif()
-  if(EXISTS \"\${_src}\")
-    if(WIN32)
-      file(INSTALL \"\${_src}\" DESTINATION \"\${CMAKE_INSTALL_PREFIX}/bin\"
-           RENAME chimaera.exe)
-    else()
-      execute_process(COMMAND \${CMAKE_COMMAND} -E create_symlink clio_run \"\${_dst}\")
-    endif()
-    message(STATUS \"Installed chimaera -> clio_run legacy symlink at \${_dst}\")
-  endif()
-")

@@ -7,7 +7,7 @@
 # mpiexec -x literal-env-forwarding hazard that breaks clio at scale.
 #
 # Layout:
-#   clio_runtime      -> chimaera daemon per node (shm IPC; peer
+#   clio_runtime      -> clio_run daemon per node (shm IPC; peer
 #                       DEALER/ROUTER over the 40 GbE -40g fabric)
 #   clio_cte          -> CTE pool with a RAM tier per node, NO compressor
 #   clio_cte_libfuse  -> per-node FUSE mount at ${HOME}/cte_libfuse_sbatch_16n
@@ -27,7 +27,7 @@ env:
   # FUSE path: clio_cte_fuse is launched per-node via pssh, so the ssh
   # hop expands ${HOSTNAME} correctly per node (unlike the clio/mpiexec
   # case). Node-local memfd dir, NFS-safe.
-  CLIO_MEMFD_DIR: "/home/llogan/iowarp_chimaera_tmp_${HOSTNAME}"
+  CLIO_MEMFD_DIR: "/home/llogan/iowarp_clio_tmp_${HOSTNAME}"
 
 scheduler:
   name: slurm
@@ -84,7 +84,7 @@ pkgs:
     api: posix
     write: true
     read: true
-    # Each chimaera daemon + CTE pool + FUSE mount is node-local;
+    # Each clio_run daemon + CTE pool + FUSE mount is node-local;
     # shared-file IOR would cross nodes and break by construction.
     # file-per-process: each rank writes a unique file on its own mount.
     fpp: true

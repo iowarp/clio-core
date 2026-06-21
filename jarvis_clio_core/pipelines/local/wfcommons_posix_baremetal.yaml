@@ -1,7 +1,7 @@
 # WfCommons (bare-metal) + CTE via POSIX adapter.
 #
 # Layout:
-#   clio_runtime    - starts the chimaera/CTE runtime locally
+#   clio_runtime    - starts the clio_run/CTE runtime locally
 #   clio_adapters   - LD_PRELOADs libclio_cte_posix.so into the next pkg
 #   wfcommons      - bare-metal install (creates a venv, pip installs
 #                    wfcommons, then runs the recipe + wfbench driver)
@@ -21,7 +21,7 @@ pkgs:
     # Use shared-memory IPC instead of TCP. wfbench spawns stress-ng
     # subprocesses for its memory benchmarks which signal the parent
     # frequently; ZMQ's DEALER send under TCP returns EINTR on those
-    # signals and chimaera's transport wrapper currently doesn't
+    # signals and clio_run's transport wrapper currently doesn't
     # retry, wedging the FSM on the first request. SHM bypass avoids
     # ZMQ entirely.
     ipc_mode: shm

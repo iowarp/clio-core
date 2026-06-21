@@ -51,6 +51,6 @@ set_tests_properties(cr_leader_elect_integration_docker PROPERTIES
     ENVIRONMENT "NUM_NODES=4;TEST_FILTER=[leader_elect]"
 )
 
-message(STATUS "Chimaera leader election integration test configured")
+message(STATUS "Clio leader election integration test configured")
 message(STATUS "  Test directory: ${LEADER_ELECT_TEST_DIR}")
 message(STATUS "  Run with: ctest -L integration")

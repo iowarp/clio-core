@@ -1,6 +1,6 @@
 ---
 # WRP Configuration for Distributed CTE Testing
-# Combines Chimaera runtime configuration with CTE compose deployment
+# Combines Clio runtime configuration with CTE compose deployment
 # 4-node cluster configuration
 
 # Memory segment configuration
@@ -19,7 +19,7 @@ networking:
 # Logging configuration
 logging:
   level: info
-  file: /tmp/chimaera.log
+  file: /tmp/clio.log
 
 # Runtime configuration
 runtime:

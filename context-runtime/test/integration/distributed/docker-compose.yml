@@ -1,4 +1,4 @@
-# Distributed Integration Tests for Chimaera Runtime
+# Distributed Integration Tests for Clio Runtime
 # Uses deps-cpu container with mounted build directory for coverage support
 #
 # Usage:

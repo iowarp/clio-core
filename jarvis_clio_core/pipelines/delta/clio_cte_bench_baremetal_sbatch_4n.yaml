@@ -5,7 +5,7 @@
 # clio_runtime daemon + clio_cte pool + clio_cte_bench (Put). The bench
 # connects to its LOCAL daemon via SHM IPC and issues PutBlob;
 # cross-node placement (neighborhood=1) keeps writes local, so this is
-# a sanity check that the 4-node chimaera + CTE stack stands up on
+# a sanity check that the 4-node clio_run + CTE stack stands up on
 # Delta inside a SLURM allocation.
 #
 # Usage:
@@ -27,7 +27,7 @@ scheduler:
   partition: cpu
   nodes: 4
   ntasks_per_node: 1
-  # Generous core count: chimaera has num_threads=4 workers + 1 net
+  # Generous core count: clio_run has num_threads=4 workers + 1 net
   # worker, plus the bench, FUSE if added, and helper threads. Stay
   # well above num_threads so the net worker isn't starved by Slurm's
   # cgroup cpuset.
@@ -37,7 +37,7 @@ scheduler:
   output: slurm-%j.out
   error: slurm-%j.err
 
-# Pin chimaera's node-local memfd symlink dir to /tmp (node-local NVMe
+# Pin clio_run's node-local memfd symlink dir to /tmp (node-local NVMe
 # on Delta; ~800 GB per node, purged at job end). MUST NOT live on
 # /u or /work (shared NFS/Lustre) -- the symlinks point into
 # /proc/<daemon_pid>/fd/<n>, only resolvable on the host that created

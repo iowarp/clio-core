@@ -17,7 +17,7 @@ mpi_cmd: 'mpiexec --mca btl_tcp_if_include enp47s0np0 --mca oob_tcp_if_include e
 
 env:
   TMPDIR: "/home/llogan/iowarp_prte_tmp"
-  CLIO_MEMFD_DIR: "/home/llogan/iowarp_chimaera_tmp_${HOSTNAME}"
+  CLIO_MEMFD_DIR: "/home/llogan/iowarp_clio_tmp_${HOSTNAME}"
 
 scheduler:
   name: slurm

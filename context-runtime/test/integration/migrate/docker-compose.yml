@@ -1,4 +1,4 @@
-# Migrate Integration Tests for Chimaera Runtime
+# Migrate Integration Tests for Clio Runtime
 # Tests container migration with retry queue:
 # 1. Start 4-node cluster
 # 2. Create MOD_NAME pool with 4 containers

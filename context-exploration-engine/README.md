@@ -209,7 +209,7 @@ clio_run start &
 ./build/release/bin/test_context_bundle
 
 # With an embedded runtime (auto-spawned by the test):
-INIT_CHIMAERA=1 ./build/release/bin/test_context_bundle
+INIT_CLIO=1 ./build/release/bin/test_context_bundle
 ```
 
 ## Project structure

@@ -47,7 +47,7 @@ if(TARGET clio_cte_core_client)
   target_compile_definitions(clio_cte_core_client PRIVATE CLIO_CTE_CORE_BUILDING_DLL=1)
 endif()
 
-# Note: Cross-namespace dependencies (chimaera admin and bdev) are automatically
-# linked by add_chimod_* functions in ClioCoreCommon.cmake for non-chimaera namespaces
+# Note: Cross-namespace dependencies (clio_run admin and bdev) are automatically
+# linked by add_chimod_* functions in ClioCoreCommon.cmake for non-clio_run namespaces
 
 add_subdirectory(util)

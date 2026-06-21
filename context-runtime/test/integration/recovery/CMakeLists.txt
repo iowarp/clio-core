@@ -25,6 +25,6 @@ set_tests_properties(cr_recovery_integration_docker PROPERTIES
     ENVIRONMENT "NUM_NODES=4;TEST_FILTER=[recovery]"
 )
 
-message(STATUS "Chimaera recovery integration test configured")
+message(STATUS "Clio recovery integration test configured")
 message(STATUS "  Test directory: ${RECOVERY_TEST_DIR}")
 message(STATUS "  Run with: ctest -L integration")

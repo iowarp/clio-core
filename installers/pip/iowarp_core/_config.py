@@ -14,9 +14,9 @@ def find_config():
     Search order:
     1. CLIO_SERVER_CONF env var (preferred), or CLIO_SERVER_CONF (legacy)
     2. ~/.clio/clio.yaml        (new canonical user config)
-    3. ~/.clio/chimaera.yaml    (legacy filename in new dir)
-    4. ~/.chimaera/clio.yaml    (new filename in legacy dir)
-    5. ~/.chimaera/chimaera.yaml (legacy)
+    3. ~/.clio/clio_run.yaml    (legacy filename in new dir)
+    4. ~/.clio/clio.yaml    (new filename in legacy dir)
+    5. ~/.clio/clio_run.yaml (legacy)
     6. Bundled default in the package data/ directory
 
     Returns:
@@ -31,9 +31,9 @@ def find_config():
     # 2-5. User-local config — new dir/name combos first, legacy last
     for rel in (
         "~/.clio/clio.yaml",
-        "~/.clio/chimaera.yaml",
-        "~/.chimaera/clio.yaml",
-        "~/.chimaera/chimaera.yaml",
+        "~/.clio/clio_run.yaml",
+        "~/.clio/clio.yaml",
+        "~/.clio/clio_run.yaml",
     ):
         path = os.path.expanduser(rel)
         if os.path.isfile(path):

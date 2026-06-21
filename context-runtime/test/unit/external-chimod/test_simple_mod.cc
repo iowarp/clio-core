@@ -49,7 +49,7 @@
 #include <memory>
 #include <clio_ctp/util/logging.h>
 #include <clio_runtime/clio_runtime.h>
-#include <clio_runtime/simple_mod/simple_mod_client.h>
+#include <external_test/simple_mod/simple_mod_client.h>
 #include <clio_runtime/admin/admin_client.h>
 
 namespace {

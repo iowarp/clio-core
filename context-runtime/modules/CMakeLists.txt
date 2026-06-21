@@ -3,7 +3,7 @@
 
 cmake_minimum_required(VERSION 3.10)
 
-message(STATUS "Building Chimaera modules (ChiMods)...")
+message(STATUS "Building Clio modules (ChiMods)...")
 
 # Add individual module subdirectories
 add_subdirectory(MOD_NAME)  # Test module for Wait functionality

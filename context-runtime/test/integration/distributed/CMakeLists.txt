@@ -23,6 +23,6 @@ set_tests_properties(cr_distributed_integration_docker PROPERTIES
     # bdev_file_explicit_backend_shm, _tcp, _ipc
 )
 
-message(STATUS "Chimaera distributed integration test configured")
+message(STATUS "Clio distributed integration test configured")
 message(STATUS "  Test directory: ${DISTRIBUTED_TEST_DIR}")
 message(STATUS "  Run with: ctest -L integration")

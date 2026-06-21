@@ -8,7 +8,7 @@ With the fix (removing manual DelTask loop), it passes.
 
 Self-contained: starts an in-process IOWarp runtime (clio_cte_core +
 clio_cae_core modules are loaded from the build's bin directory) via
-clio_cte_core_ext.chimaera_init(kClient, True), so it no longer needs an
+clio_cte_core_ext.clio_init(kClient, True), so it no longer needs an
 externally running daemon.
 """
 
@@ -83,7 +83,7 @@ def start_runtime():
 
     import clio_cte_core_ext as cte
 
-    if not cte.chimaera_init(cte.RuntimeMode.kClient, True):
+    if not cte.clio_init(cte.RuntimeMode.kClient, True):
         return False
     time.sleep(0.5)  # let the runtime finish coming up
     if hasattr(cte, "initialize_cte"):

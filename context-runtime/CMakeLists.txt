@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.10)
-project(chimaera VERSION 1.0.0)
+project(clio_run VERSION 1.0.0)
 
 # Set root directory for this component
 set(CLIO_RUN_ROOT ${CMAKE_CURRENT_SOURCE_DIR})
@@ -64,9 +64,9 @@ string(REPLACE "::" "_" CLIO_RUN_PACKAGE_NAME "${CLIO_RUN_NAMESPACE}")
 # Set namespace as cache variable so it's available to all CMakeLists.txt
 set(CLIO_RUN_NAMESPACE "${CLIO_RUN_NAMESPACE}" CACHE STRING "Project namespace for chimod targets (C++/target prefix; may contain `::`)")
 set(CLIO_RUN_PACKAGE_NAME "${CLIO_RUN_PACKAGE_NAME}" CACHE STRING "Filesystem-safe form of CLIO_RUN_NAMESPACE (no `::`)")
-message(STATUS "Chimaera namespace: ${CLIO_RUN_NAMESPACE} (package=${CLIO_RUN_PACKAGE_NAME})")
+message(STATUS "Clio namespace: ${CLIO_RUN_NAMESPACE} (package=${CLIO_RUN_PACKAGE_NAME})")
 
-# Add utilities subdirectory FIRST so chimaera repo refresh builds before everything else
+# Add utilities subdirectory FIRST so clio_run repo refresh builds before everything else
 add_subdirectory(util)
 
 # Add source subdirectory to build main library
@@ -94,7 +94,7 @@ endif()
 if(CLIO_CORE_ENABLE_PYTHON)
   if(COMMAND nanobind_add_module)
     add_subdirectory(wrapper/python)
-    message(STATUS "Chimaera runtime Python bindings enabled")
+    message(STATUS "Clio runtime Python bindings enabled")
   else()
     message(WARNING "CLIO_CORE_ENABLE_PYTHON is ON but nanobind_add_module not found.")
   endif()
@@ -111,7 +111,7 @@ endif()
 #------------------------------------------------------------------------------
 # SECTION 7: INSTALL CODE
 #------------------------------------------------------------------------------
-# Install the main chimaera library using the same dynamic system as modules.
+# Install the main clio_run library using the same dynamic system as modules.
 # Both names are filesystem paths (one ends up as `lib/cmake/${MAIN_PACKAGE_NAME}/`,
 # the other as `${MAIN_EXPORT_NAME}.cmake` inside it) so we use the
 # filesystem-safe PACKAGE_NAME, not the `::`-bearing NAMESPACE.
@@ -130,7 +130,7 @@ endif()
 # `${CLIO_LIB_NAME}_gpu` where CLIO_LIB_NAME is hardcoded to
 # "clio_run_cxx" — so the literal target name is `clio_run_cxx_gpu`,
 # NOT `${CLIO_RUN_NAMESPACE}_cxx_gpu`.  These can differ: the user-
-# facing namespace deliberately stays `chimaera` for downstream
+# facing namespace deliberately stays `clio_run` for downstream
 # find_package compat (see context-runtime/clio_repo.yaml), while the
 # canonical .so / target names already use the new `clio_run_cxx`
 # prefix.  Check the literal so this works regardless of the namespace.
@@ -199,7 +199,7 @@ install(DIRECTORY config/
 # Seed the user's default config at ~/.clio/clio.yaml — the canonical
 # user-config location the runtime checks first
 # (ConfigManager::GetServerConfigPath). Existing files are never
-# overwritten. Legacy ~/.chimaera/chimaera.yaml is still HONORED at
+# overwritten. Legacy ~/.clio/clio_run.yaml is still HONORED at
 # read time as a fallback for users with pre-existing configs, but we
 # no longer seed it on install — that path is documented as legacy
 # in docs/deprecation-notes.md and will eventually be removed.

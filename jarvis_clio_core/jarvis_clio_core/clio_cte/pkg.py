@@ -182,18 +182,18 @@ class ClioCte(Service):
             self.log(f"Error: Compose config not found: {self.compose_config_path}")
             return False
 
-        # WORKAROUND — proper fix lives in clio-core (chimaera client).
+        # WORKAROUND — proper fix lives in clio-core (clio_run client).
         #
-        # At >=64 chimaera daemons on Aurora apptainer the very first
+        # At >=64 clio_run daemons on Aurora apptainer the very first
         # `clio_run compose` after clio_runtime startup hits a ZMTP greeting
         # timeout against the daemon's local 9416 ROUTER (the daemon's I/O
         # threads are still saturated by initial SWIM probes). The compose
-        # process's ZMQ shared context (chimaera GetSharedContext singleton)
+        # process's ZMQ shared context (clio_run GetSharedContext singleton)
         # then ends up half-open, and no in-process retry can recover from
         # it: ROUTER_HANDOVER=1, in-process DEALER recreate, and
         # WaitForLocalServer per-attempt timeouts were all tried and all
         # fail because the broken state is in the ZMQ ctx, not the socket.
-        # A brand-new chimaera process gets a fresh context and connects in
+        # A brand-new clio_run process gets a fresh context and connects in
         # <1s. The bash loop forks a new process per retry to sidestep the
         # in-process recovery problem.
         #

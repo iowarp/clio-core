@@ -229,7 +229,7 @@ def run_globus_assim_test(output_dir: str | None = None) -> int:
         )
 
         # Wait for IPC socket
-        ipc_socket = f"/tmp/chimaera_{os.environ.get('USER', 'user')}/chimaera_9413.ipc"
+        ipc_socket = f"/tmp/clio_{os.environ.get('USER', 'user')}/clio_9413.ipc"
         print(f"Waiting for runtime socket ({ipc_socket})...", end="", flush=True)
         for _ in range(60):
             if os.path.exists(ipc_socket):

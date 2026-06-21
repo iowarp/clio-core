@@ -28,7 +28,7 @@ Example Usage in Your Code:
     import clio_cte_core_ext as cte
 
     # 1. Initialize runtime (if not already done externally)
-    cte.chimaera_init(cte.RuntimeMode.kClient, True)
+    cte.clio_init(cte.RuntimeMode.kClient, True)
     cte.initialize_cte(config_path, cte.PoolQuery.Dynamic())
     
     # 2. Bundle data (context_bundle)
@@ -258,7 +258,7 @@ def initialize_runtime_early(cte):
         os.environ["CLIO_SERVER_CONF"] = config_path
         
         # Step 3: Initialize CLIO Runtime (unified init - both runtime and client)
-        if not cte.chimaera_init(cte.RuntimeMode.kClient, True):
+        if not cte.clio_init(cte.RuntimeMode.kClient, True):
             raise RuntimeError("Failed to initialize Clio")
         time.sleep(0.5)  # Give Clio time to initialize
         
@@ -301,7 +301,7 @@ def initialize_runtime_early(cte):
             sys.stdout.flush()  # Ensure output is flushed before potential abort
 
             try:
-                init_result = cte.chimaera_init(cte.RuntimeMode.kClient, True)
+                init_result = cte.clio_init(cte.RuntimeMode.kClient, True)
             except Exception as e:
                 print(f"⚠️  Clio initialization exception: {e}")
                 print("   Continuing with binding tests only...")

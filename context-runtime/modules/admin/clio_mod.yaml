@@ -18,7 +18,7 @@ kMonitor: 9       # 9 - Unified monitor (all chimods implement this)
 # Admin-specific Methods (start from 10)
 kGetOrCreatePool: 10  # Get or create a new ChiPool
 kDestroyPool: 11      # Destroy an existing ChiPool
-kStopRuntime: 12      # Stop the entire Chimaera runtime
+kStopRuntime: 12      # Stop the entire Clio runtime
 kFlush: 13            # Flush pending operations
 
 # Distributed task scheduling methods

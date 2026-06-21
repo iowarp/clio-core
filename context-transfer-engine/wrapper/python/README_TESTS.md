@@ -83,7 +83,7 @@ Each `CteTelemetry` entry contains:
 import clio_cte_core_ext as cte
 
 # Initialize runtime
-cte.chimaera_init(cte.ChimaeraMode.kClient, True)
+cte.clio_init(cte.RuntimeMode.kClient, True)
 cte.initialize_cte(config_path, cte.PoolQuery.Dynamic())
 
 # Perform operations

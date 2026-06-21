@@ -1,4 +1,4 @@
-# Leader Election Integration Tests for Chimaera Runtime
+# Leader Election Integration Tests for Clio Runtime
 # Tests leader shutdown, client failover, and leader restart:
 # Phase 1: Client on node 1 shuts down local runtime, fails over to another node
 # Phase 2: Node 1 runtime restarted, client re-initializes, verifies system health

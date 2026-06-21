@@ -121,49 +121,49 @@ add_custom_target(test_bdev
   COMMAND ${BDEV_TEST_TARGET}
   DEPENDS ${BDEV_TEST_TARGET}
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
-  COMMENT "Running Chimaera bdev ChiMod tests"
+  COMMENT "Running Clio bdev ChiMod tests"
 )
 
 add_custom_target(test_bdev_create
   COMMAND ${BDEV_TEST_TARGET}
   DEPENDS ${BDEV_TEST_TARGET}
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
-  COMMENT "Running Chimaera bdev container creation tests"
+  COMMENT "Running Clio bdev container creation tests"
 )
 
 add_custom_target(test_bdev_allocate
   COMMAND ${BDEV_TEST_TARGET}
   DEPENDS ${BDEV_TEST_TARGET}
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
-  COMMENT "Running Chimaera bdev block allocation tests"
+  COMMENT "Running Clio bdev block allocation tests"
 )
 
 add_custom_target(test_bdev_io
   COMMAND ${BDEV_TEST_TARGET}
   DEPENDS ${BDEV_TEST_TARGET}
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
-  COMMENT "Running Chimaera bdev I/O operation tests"
+  COMMENT "Running Clio bdev I/O operation tests"
 )
 
 add_custom_target(test_bdev_async
   COMMAND ${BDEV_TEST_TARGET}
   DEPENDS ${BDEV_TEST_TARGET}
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
-  COMMENT "Running Chimaera bdev asynchronous I/O tests"
+  COMMENT "Running Clio bdev asynchronous I/O tests"
 )
 
 add_custom_target(test_bdev_performance
   COMMAND ${BDEV_TEST_TARGET}
   DEPENDS ${BDEV_TEST_TARGET}
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
-  COMMENT "Running Chimaera bdev performance metrics tests"
+  COMMENT "Running Clio bdev performance metrics tests"
 )
 
 add_custom_target(test_bdev_error
   COMMAND ${BDEV_TEST_TARGET}
   DEPENDS ${BDEV_TEST_TARGET}
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
-  COMMENT "Running Chimaera bdev error handling tests"
+  COMMENT "Running Clio bdev error handling tests"
 )
 
 # Install test executable

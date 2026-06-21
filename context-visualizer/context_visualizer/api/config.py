@@ -13,23 +13,15 @@ def _load_config():
 
     Search order matches the runtime
     (see ConfigManager::GetServerConfigPath in context-runtime/src/config_manager.cc):
-      1. CLIO_SERVER_CONF env (preferred)
-      2. CLIO_SERVER_CONF env (legacy)
-      3. ~/.clio/clio.yaml         (new canonical user config)
-      4. ~/.clio/chimaera.yaml     (legacy filename in new dir)
-      5. ~/.chimaera/clio.yaml     (new filename in legacy dir)
-      6. ~/.chimaera/chimaera.yaml (legacy)
+      1. CLIO_SERVER_CONF env
+      2. ~/.clio/clio.yaml  (canonical user config)
     """
     import yaml
 
     home = Path.home()
     candidates = [
         os.environ.get("CLIO_SERVER_CONF"),
-        os.environ.get("CLIO_SERVER_CONF"),
         str(home / ".clio" / "clio.yaml"),
-        str(home / ".clio" / "chimaera.yaml"),
-        str(home / ".chimaera" / "clio.yaml"),
-        str(home / ".chimaera" / "chimaera.yaml"),
     ]
     for path in candidates:
         if path and os.path.isfile(path):
@@ -44,10 +36,6 @@ def get_config():
     if cfg is None:
         return jsonify({"error": "no config file found", "searched": [
             "CLIO_SERVER_CONF",
-            "CLIO_SERVER_CONF",
             "~/.clio/clio.yaml",
-            "~/.clio/chimaera.yaml",
-            "~/.chimaera/clio.yaml",
-            "~/.chimaera/chimaera.yaml",
         ]}), 404
     return jsonify({"config": cfg})

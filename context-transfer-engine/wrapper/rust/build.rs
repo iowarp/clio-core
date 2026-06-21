@@ -8,14 +8,14 @@ fn main() {
         .include(".") // for "shim/shim.h"
         // Coroutine support
         .flag("-fcoroutines")
-        // Suppress warnings from CTE/chimaera headers
+        // Suppress warnings from CTE/clio_run headers
         .flag("-Wno-unused-parameter")
         .flag("-Wno-unused-variable")
         .flag("-Wno-missing-field-initializers")
         .flag("-Wno-sign-compare")
         .flag("-Wno-reorder")
         .flag("-Wno-pedantic")
-        // CTP / chimaera defines (match CMake build)
+        // CTP / clio_run defines (match CMake build)
         .define("CTP_COMPILER_GNU", "1")
         .define("CTP_COMPILER_MSVC", "0")
         .define("CTP_DEBUG_LOCK", "0")

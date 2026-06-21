@@ -54,7 +54,7 @@ cd /workspace/chimods/test/unit/binary_assim
 
 **Test parameters (environment variables):**
 - `TEST_FILE_SIZE`: Size of test file in MB (default: 256)
-- `INIT_CHIMAERA`: Set to "1" to manually initialize Chimaera (default: handled by runner)
+- `INIT_CLIO`: Set to "1" to manually initialize Clio (default: handled by runner)
 
 **Expected output:**
 ```
@@ -183,15 +183,15 @@ TEST SUITE PASSED
 ### Enable verbose output:
 
 ```bash
-export CHIMAERA_LOG_LEVEL=debug
+export CTP_LOG_LEVEL=debug
 ./run_test.sh
 ```
 
 ### Check logs:
 
 ```bash
-# Chimaera logs
-cat /tmp/chimaera_runtime.log
+# Clio logs
+cat /tmp/clio_runtime.log
 
 # CTE logs
 cat /tmp/clio_cte_daemon.log
@@ -209,7 +209,7 @@ clio_cte_daemon /workspace/chimods/test/unit/clio_config.yaml &
 
 # Cleanup
 killall chi_runtime clio_cte_daemon
-rm -f /dev/shm/chimaera_*
+rm -f /dev/shm/clio_*
 ```
 
 ## Adding New Tests

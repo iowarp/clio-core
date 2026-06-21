@@ -4,7 +4,7 @@ import os
 
 from flask import Blueprint, jsonify, request
 
-from .. import chimaera_client
+from .. import clio_client
 
 bp = Blueprint("node", __name__)
 
@@ -25,7 +25,7 @@ def _node_is_alive(node_id):
             lines = [line.strip() for line in f if line.strip()]
         if node_id < len(lines):
             ip = lines[node_id]
-            alive = chimaera_client.check_nodes_alive([ip], port=9413, timeout=1)
+            alive = clio_client.check_nodes_alive([ip], port=9413, timeout=1)
             return 0 in alive
     except Exception:
         pass
@@ -35,22 +35,22 @@ def _node_is_alive(node_id):
 def _worker_stats(node_id):
     """Get worker stats, falling back to local if node_id is 0."""
     if node_id == 0:
-        return chimaera_client.get_worker_stats()
-    return chimaera_client.get_worker_stats_for_node(node_id)
+        return clio_client.get_worker_stats()
+    return clio_client.get_worker_stats_for_node(node_id)
 
 
 def _system_stats(node_id, min_event_id=0):
     """Get system stats, falling back to local if node_id is 0."""
     if node_id == 0:
-        return chimaera_client.get_system_stats("local", min_event_id)
-    return chimaera_client.get_system_stats_for_node(node_id, min_event_id)
+        return clio_client.get_system_stats("local", min_event_id)
+    return clio_client.get_system_stats_for_node(node_id, min_event_id)
 
 
 def _bdev_stats(node_id):
     """Get bdev stats, falling back to local if node_id is 0."""
     if node_id == 0:
-        return chimaera_client.get_bdev_stats("local")
-    return chimaera_client.get_bdev_stats_for_node(node_id)
+        return clio_client.get_bdev_stats("local")
+    return clio_client.get_bdev_stats_for_node(node_id)
 
 
 @bp.route("/node/<int:node_id>/workers")
@@ -111,9 +111,9 @@ def get_node_container_stats(node_id):
 
     try:
         if node_id == 0:
-            raw = chimaera_client.get_container_stats("local")
+            raw = clio_client.get_container_stats("local")
         else:
-            raw = chimaera_client.get_container_stats_for_node(node_id)
+            raw = clio_client.get_container_stats_for_node(node_id)
     except Exception as exc:
         return jsonify({"error": str(exc)}), 503
 

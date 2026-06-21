@@ -2,14 +2,14 @@
 
 from flask import Blueprint, jsonify
 
-from .. import chimaera_client
+from .. import clio_client
 
 bp = Blueprint("system", __name__)
 
 
 @bp.route("/system")
 def get_system():
-    connected = chimaera_client.is_connected()
+    connected = clio_client.is_connected()
 
     info = {
         "connected": connected,
@@ -22,13 +22,13 @@ def get_system():
     if not connected:
         # Try to connect on first request
         try:
-            raw = chimaera_client.get_worker_stats()
+            raw = clio_client.get_worker_stats()
             connected = True
         except Exception as exc:
             return jsonify({"connected": False, "error": str(exc)}), 503
     else:
         try:
-            raw = chimaera_client.get_worker_stats()
+            raw = clio_client.get_worker_stats()
         except Exception as exc:
             return jsonify({"connected": True, "error": str(exc)}), 503
 

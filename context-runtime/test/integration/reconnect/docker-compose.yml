@@ -1,4 +1,4 @@
-# Reconnect Integration Tests for Chimaera Runtime
+# Reconnect Integration Tests for Clio Runtime
 # Tests client failover to a new host when the connected server dies:
 # 1. Start 4-node cluster
 # 2. Client on node 1 connects to local runtime

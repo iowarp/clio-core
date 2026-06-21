@@ -290,28 +290,28 @@ add_custom_target(test_task_archive
   COMMAND ${TASK_ARCHIVE_TEST_TARGET}
   DEPENDS ${TASK_ARCHIVE_TEST_TARGET}
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
-  COMMENT "Running Chimaera task archive tests"
+  COMMENT "Running Clio task archive tests"
 )
 
 add_custom_target(test_task_archive_basic
   COMMAND ${TASK_ARCHIVE_TEST_TARGET} "[task_archive][input_in],[task_archive][output_in],[task_archive][input_out],[task_archive][output_out]"
   DEPENDS ${TASK_ARCHIVE_TEST_TARGET}
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
-  COMMENT "Running Chimaera task archive basic tests"
+  COMMENT "Running Clio task archive basic tests"
 )
 
 add_custom_target(test_task_archive_serialization
   COMMAND ${TASK_ARCHIVE_TEST_TARGET} "[task_archive][task_base],[task_archive][admin_tasks]"
   DEPENDS ${TASK_ARCHIVE_TEST_TARGET}
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
-  COMMENT "Running Chimaera task serialization tests"
+  COMMENT "Running Clio task serialization tests"
 )
 
 add_custom_target(test_task_archive_performance
   COMMAND ${TASK_ARCHIVE_TEST_TARGET} "[task_archive][performance]"
   DEPENDS ${TASK_ARCHIVE_TEST_TARGET}
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
-  COMMENT "Running Chimaera task archive performance tests"
+  COMMENT "Running Clio task archive performance tests"
 )
 
 # Install test executables

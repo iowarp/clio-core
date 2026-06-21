@@ -236,7 +236,7 @@ endif()
 
 # Create test labels for selective execution
 # Skip under MSan: CAE tests use uninstrumented HDF5/yaml-cpp/ZMQ deps and
-# the chimaera runtime which involves shared memory and forked processes.
+# the clio_run runtime which involves shared memory and forked processes.
 set_tests_properties(cae_binary_assim PROPERTIES LABELS "core;basic;msan_skip")
 set_tests_properties(cae_range_assim PROPERTIES LABELS "core;advanced;msan_skip")
 set_tests_properties(cae_error_handling PROPERTIES LABELS "core;validation;msan_skip")

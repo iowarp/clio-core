@@ -1,4 +1,4 @@
-"""Wrapper around chimaera_runtime_ext for the visualizer."""
+"""Wrapper around clio_runtime_ext for the visualizer."""
 
 import concurrent.futures
 import os
@@ -39,12 +39,12 @@ def _ensure_init():
     with _lock:
         if _init_done:
             return
-        import chimaera_runtime_ext as chi
+        import clio_runtime_ext as chi
         _chi = chi
         # 0 = kClient — pass a plain int to avoid any nanobind enum objects
-        ok = chi.chimaera_init(0)
+        ok = chi.clio_init(0)
         if not ok:
-            raise RuntimeError("chimaera_init(kClient) failed -- is the runtime running?")
+            raise RuntimeError("clio_init(kClient) failed -- is the runtime running?")
         _init_done = True
 
 
@@ -103,7 +103,7 @@ def reinit():
     with _lock:
         if _init_done and _chi is not None:
             try:
-                _chi.chimaera_finalize()
+                _chi.clio_finalize()
             except Exception:
                 pass
         _init_done = False
@@ -289,7 +289,7 @@ def restart_node(ip_address, port=9413):
         print("[restart_node] Launching local runtime via Popen", flush=True)
         try:
             subprocess.Popen(
-                ["chimaera", "runtime", "restart"],
+                ["clio_run", "runtime", "restart"],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -356,5 +356,5 @@ def finalize():
     """Clean shutdown of the Clio client."""
     global _init_done
     if _init_done and _chi is not None:
-        _chi.chimaera_finalize()
+        _chi.clio_finalize()
         _init_done = False

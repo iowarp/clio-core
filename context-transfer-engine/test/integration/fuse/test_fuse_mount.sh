@@ -11,7 +11,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MOUNT_POINT="/tmp/cte_fuse_test_mount"
 FUSE_BIN="${FUSE_BIN:-/workspace/build/bin/clio_cte_fuse}"
-RUNTIME_BIN="${RUNTIME_BIN:-/workspace/build/bin/chimaera}"
+RUNTIME_BIN="${RUNTIME_BIN:-/workspace/build/bin/clio_run}"
 CONFIG_FILE="${SCRIPT_DIR}/clio_config.yaml"
 FUSE_PID=""
 RUNTIME_PID=""
@@ -77,17 +77,17 @@ if [ ! -c /dev/fuse ]; then
 fi
 
 # Start CLIO Runtime runtime
-info "Starting Chimaera runtime..."
+info "Starting Clio runtime..."
 export CLIO_SERVER_CONF="$CONFIG_FILE"
 "$RUNTIME_BIN" runtime start &
 RUNTIME_PID=$!
 sleep 3
 
 if ! kill -0 "$RUNTIME_PID" 2>/dev/null; then
-    fail "Chimaera runtime failed to start"
+    fail "Clio runtime failed to start"
     exit 1
 fi
-pass "Chimaera runtime started (PID $RUNTIME_PID)"
+pass "Clio runtime started (PID $RUNTIME_PID)"
 
 # Create mount point and start FUSE daemon
 mkdir -p "$MOUNT_POINT"

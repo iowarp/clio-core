@@ -40,7 +40,7 @@ cd test/integration/globus_matsci
 
 The `run_test.sh` script performs the following steps:
 
-1. **Start Chimaera Runtime**: Launches the Clio runtime in the background
+1. **Start Clio Runtime**: Launches the Clio runtime in the background
 2. **Launch CTE**: Starts the Content Transfer Engine
 3. **Launch CAE**: Starts the Content Assimilation Engine with Globus support
 4. **Process OMNI File**: Uses `clio_cae` to process the transfer requests

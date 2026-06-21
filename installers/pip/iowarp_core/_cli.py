@@ -88,13 +88,13 @@ def clio_run_main():
 
 
 def main():
-    """Entry point for the deprecated ``chimaera`` console script.
+    """Entry point for the deprecated ``clio_run`` console script.
 
     Kept as a backward-compat shim. New code should call ``clio_run``;
-    this dispatches to the chimaera.exe alias so existing pipelines
+    this dispatches to the clio_run.exe alias so existing pipelines
     keep working until the alias is removed in a future release.
     """
-    _exec_iowarp_bin("chimaera")
+    _exec_iowarp_bin("clio_run")
 
 
 def cte_bench_main():

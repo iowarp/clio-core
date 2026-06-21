@@ -9,7 +9,7 @@
 # Prerequisites:
 # - GLOBUS_ACCESS_TOKEN environment variable must be set
 # - Globus endpoint must be accessible
-# - chimaera and clio_cae must be installed and in PATH
+# - clio_run and clio_cae must be installed and in PATH
 # - Built with -DCAE_ENABLE_GLOBUS=ON
 #
 # Usage:
@@ -78,18 +78,18 @@ echo ""
 # Start CLIO Runtime runtime in the background
 # The runtime config contains a compose section that creates both
 # CTE (pool 512.0) and CAE (pool 400.0) automatically on startup.
-echo "Starting Chimaera runtime..."
+echo "Starting Clio runtime..."
 export CLIO_SERVER_CONF="${RUNTIME_CONF}"
 clio_run runtime start &
 CLIO_PID=$!
-echo "Chimaera runtime started (PID: ${CLIO_PID})"
+echo "Clio runtime started (PID: ${CLIO_PID})"
 echo ""
 
 # Wait for runtime to initialize and create compose pools (CTE + CAE).
 # The IPC socket appears once the runtime is up; then we wait a further
 # grace period for the compose pools to finish registering.
 echo "Waiting for runtime to initialize..."
-IPC_SOCKET="/tmp/chimaera_${USER}/chimaera_9413.ipc"
+IPC_SOCKET="/tmp/clio_${USER}/clio_9413.ipc"
 MAX_WAIT=60
 WAITED=0
 while [ $WAITED -lt $MAX_WAIT ]; do
@@ -130,9 +130,9 @@ fi
 
 # Cleanup: Stop CLIO Runtime runtime
 echo ""
-echo "Stopping Chimaera runtime..."
+echo "Stopping Clio runtime..."
 clio_run runtime stop 2>/dev/null || kill ${CLIO_PID} 2>/dev/null || true
 wait ${CLIO_PID} 2>/dev/null || true
-echo "Chimaera runtime stopped"
+echo "Clio runtime stopped"
 
 exit ${OMNI_STATUS}

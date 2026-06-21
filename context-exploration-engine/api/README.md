@@ -256,7 +256,7 @@ If nanobind is not found, the build will skip Python bindings with a warning.
 cmake --build build --target test_context_bundle test_context_query test_context_destroy
 ```
 
-#### Starting the Chimaera Runtime
+#### Starting the Clio Runtime
 
 **IMPORTANT**: Tests require the Clio runtime to be running. Start it before running tests:
 

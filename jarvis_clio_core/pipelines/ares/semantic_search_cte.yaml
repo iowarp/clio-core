@@ -34,7 +34,7 @@ config:
 
   env:
     TMPDIR: "/home/llogan/iowarp_prte_tmp"
-    CLIO_MEMFD_DIR: "/home/llogan/iowarp_chimaera_tmp_${HOSTNAME}"
+    CLIO_MEMFD_DIR: "/home/llogan/iowarp_clio_tmp_${HOSTNAME}"
     # Pin iowarp/lightbeam ZMQ daemon<->daemon traffic to the 40G NIC.
     LIGHTBEAM_TCP_DEVICE: enp47s0np0
     CLIO_IPC_MODE: "shm"

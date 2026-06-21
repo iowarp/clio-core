@@ -2,7 +2,7 @@
 # Purpose: Validate the IOWarp FUSE adapter under a POSIX workload.
 #
 # Flow:
-#   1. clio_runtime            — Chimaera storage daemon (IOWarp core)
+#   1. clio_runtime            — Clio storage daemon (IOWarp core)
 #   2. clio_cte                — Content Transfer Engine compose
 #   3. clio_cte_libfuse        — mounts the CTE FUSE filesystem at /mnt/clio_cte
 #   4. builtin.ior            — writes via plain POSIX to /mnt/clio_cte/ior.bin

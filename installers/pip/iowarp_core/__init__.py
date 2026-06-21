@@ -29,7 +29,7 @@ _DATA_DIR = os.path.join(_PACKAGE_DIR, "data")
 
 # Extension modules that live in ext/ and can be imported via
 # "from iowarp_core import <name>".
-_EXT_MODULES = {"clio_cee", "clio_cte_core_ext", "chimaera_runtime_ext"}
+_EXT_MODULES = {"clio_cee", "clio_cte_core_ext", "clio_runtime_ext"}
 
 
 def _setup():
@@ -50,7 +50,7 @@ def _setup():
         convention). Python 3.8+ restricts LoadLibraryEx to the .pyd's
         own dir + system32 by default — register bin/ and lib/ via
         os.add_dll_directory so .pyd extensions find clio_*.dll deps.
-        Also prepend PATH for child procs spawned by the chimaera
+        Also prepend PATH for child procs spawned by the clio_run
         wrapper.
     """
     if sys.platform == "win32":
@@ -63,7 +63,7 @@ def _setup():
                 except (OSError, AttributeError):
                     pass  # add_dll_directory is Py3.8+ and Windows-only.
         # Prepend bin/ + lib/ to PATH so child processes (the wrapped
-        # chimaera/clio_*_bench) inherit a search path that finds the
+        # clio_run/clio_*_bench) inherit a search path that finds the
         # same DLLs.
         _paths = [d for d in (_BIN_DIR, _LIB_DIR) if os.path.isdir(d)]
         if _paths:
@@ -86,11 +86,11 @@ def _setup():
         if sys.platform.startswith("linux"):
             for _lib_name in [
                 "libclio_ctp_host.so",
-                "libchimaera_cxx.so",
+                "libclio_run_cxx.so",
                 "libclio_admin_client.so",
                 "libclio_admin_runtime.so",
-                "libchimaera_bdev_client.so",
-                "libchimaera_bdev_runtime.so",
+                "libclio_bdev_client.so",
+                "libclio_bdev_runtime.so",
                 "libclio_cte_core_client.so",
                 "libclio_cte_core_runtime.so",
                 "libclio_cte_cae_config.so",
@@ -109,7 +109,7 @@ def _setup():
     # Seed the per-user default config at ~/.clio/clio.yaml if missing.
     # This is the canonical user-config path the C++ runtime checks
     # first; see ConfigManager::GetServerConfigPath. Legacy
-    # ~/.chimaera/chimaera.yaml is still honored at read time as a
+    # ~/.clio/clio_run.yaml is still honored at read time as a
     # fallback for users with pre-existing configs, but we no longer
     # seed it on install.
     _bundled_default = os.path.join(_DATA_DIR, "clio_default.yaml")

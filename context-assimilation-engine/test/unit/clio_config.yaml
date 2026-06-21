@@ -1,5 +1,5 @@
 # WRP Configuration Example
-# Demonstrates how to configure Chimaera runtime with CTE and CAE modules
+# Demonstrates how to configure Clio runtime with CTE and CAE modules
 # This configuration combines runtime settings with declarative pool creation
 
 # Memory segment configuration
@@ -16,7 +16,7 @@ networking:
 # Logging configuration
 logging:
   level: info
-  file: /tmp/chimaera.log
+  file: /tmp/clio.log
 
 # Runtime configuration
 runtime:

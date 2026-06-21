@@ -24,7 +24,7 @@ This test serves multiple purposes:
    ```
 
 2. **Dependencies**: Ensure all CTE Core dependencies are available:
-   - Clio framework (chimaera-core, chimaera-admin)
+   - Clio framework (clio_run-core, clio_run-admin)
    - CTP (Clio Shared Memory)
    - yaml-cpp
 
@@ -97,7 +97,7 @@ When successful, the test produces output like:
 === External CTE Core Integration Test ===
 Initializing CTE Core system...
 1. Initializing Clio runtime...
-2. Initializing Chimaera client...
+2. Initializing Clio client...
 3. Initializing CTE subsystem...
 4. Getting CTE client instance...
 5. Creating CTE container...
@@ -148,8 +148,8 @@ The `CMakeLists.txt` in this directory demonstrates the **proper MODULE_DEVELOPM
 1. **Package Discovery** (Modern Pattern):
    ```cmake
    # Find required Clio framework packages
-   find_package(chimaera REQUIRED)              # Core library
-   find_package(chimaera_admin REQUIRED)        # Admin Module
+   find_package(clio_run REQUIRED)              # Core library
+   find_package(clio_run_admin REQUIRED)        # Admin Module
    
    # Find CTE Core Module package
    find_package(clio_cte_core REQUIRED)          # CTE Core Module
@@ -183,7 +183,7 @@ The `CMakeLists.txt` in this directory demonstrates the **proper MODULE_DEVELOPM
 ### Common Issues:
 
 1. **Library Not Found**: Ensure CTE Core is built and libraries exist in the build directory
-2. **Missing Dependencies**: Verify all dependencies (Chimaera, CTP, etc.) are properly installed
+2. **Missing Dependencies**: Verify all dependencies (Clio, CTP, etc.) are properly installed
 3. **Runtime Initialization Failure**: Check that the runtime environment is properly configured
 4. **Permission Issues**: Ensure write permissions for temporary files (e.g., `/tmp/cte_external_test_target`)
 
@@ -199,15 +199,15 @@ make
 
 Some dependencies may require environment variables:
 ```bash
-export PKG_CONFIG_PATH=/path/to/chimaera/lib/pkgconfig:$PKG_CONFIG_PATH
-export LD_LIBRARY_PATH=/path/to/chimaera/lib:$LD_LIBRARY_PATH
+export PKG_CONFIG_PATH=/path/to/clio_run/lib/pkgconfig:$PKG_CONFIG_PATH
+export LD_LIBRARY_PATH=/path/to/clio_run/lib:$LD_LIBRARY_PATH
 ```
 
 ## Integration Notes
 
 This test demonstrates several important patterns for external CTE Core integration:
 
-1. **Proper Initialization Order**: Clio runtime → Chimaera client → CTE subsystem
+1. **Proper Initialization Order**: Clio runtime → Clio client → CTE subsystem
 2. **Memory Management**: Using CTP allocators for shared data
 3. **Error Handling**: Checking return codes and handling exceptions
 4. **Resource Cleanup**: Proper cleanup of tags, blobs, and resources

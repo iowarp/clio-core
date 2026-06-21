@@ -895,7 +895,7 @@ function(clio_run_read_module_config MODULE_DIR)
   # value gets reused for library output names, install destinations and
   # export file names where `::` is illegal or filesystem-unfriendly. Replace
   # `::` with `_` so `clio::run` -> `clio_run`, `clio::cte` -> `clio_cte`,
-  # legacy `chimaera` -> `chimaera`. Downstream code that needs the path
+  # legacy `clio_run` -> `clio_run`. Downstream code that needs the path
   # form references CLIO_RUN_PACKAGE_NAME; code that needs the C++/target
   # prefix references CLIO_RUN_NAMESPACE.
   string(REPLACE "::" "_" CLIO_RUN_PACKAGE_NAME "${CLIO_RUN_NAMESPACE}")
@@ -926,9 +926,9 @@ endfunction()
 #   INCLUDE_DIRECTORIES - Additional include directories
 #
 # Automatic Cross-Namespace Dependencies (Unified Builds):
-#   For non-chimaera namespaces (e.g., clio_cte, clio_cae), this function automatically
-#   links chimaera admin and bdev client libraries if they are available as targets.
-#   This enables wrp_* ChiMods to use chimaera ChiMod headers and functionality without
+#   For non-clio_run namespaces (e.g., clio_cte, clio_cae), this function automatically
+#   links clio_run admin and bdev client libraries if they are available as targets.
+#   This enables wrp_* ChiMods to use clio_run ChiMod headers and functionality without
 #   explicit dependency declarations in their CMakeLists.txt files.
 #
 function(add_clio_module_client)
@@ -1012,7 +1012,7 @@ function(add_clio_module_client)
   # Automatically add foundational ChiMod dependencies in unified builds.
   # Skip when the target being built IS one of those foundational modules
   # (admin keeps LIB_NAME=clio_run_admin, bdev uses LIB_NAME=clio_bdev) — the
-  # old guard `NOT NAMESPACE STREQUAL "chimaera"` no longer works now that
+  # old guard `NOT NAMESPACE STREQUAL "clio_run"` no longer works now that
   # admin's own namespace is `clio_run`.
   set(CLIO_RUN_MODULE_DEPS "")
   if(NOT "${CLIO_RUN_MODULE_NAME}" STREQUAL "admin" AND
@@ -1056,7 +1056,7 @@ function(add_clio_module_client)
 
   # Install the client library
   # MODULE_PACKAGE_NAME: install dir under lib/cmake/. For runtime modules
-  # whose namespace was renamed chimaera -> clio::run (admin, bdev, MOD_NAME)
+  # whose namespace was renamed clio_run -> clio::run (admin, bdev, MOD_NAME)
   # we pin to the legacy `clio_<module>` form so external find_package
   # consumers (e.g. coeus-adapter) keep working. For other namespaces
   # (clio::cte, clio::cae, …) we use the standard `<package>_<module>` form
@@ -1112,9 +1112,9 @@ endfunction()
 #   INCLUDE_DIRECTORIES - Additional include directories
 #
 # Automatic Cross-Namespace Dependencies (Unified Builds):
-#   For non-chimaera namespaces (e.g., clio_cte, clio_cae), this function automatically
-#   links chimaera admin and bdev runtime libraries if they are available as targets.
-#   This enables wrp_* ChiMods to use chimaera ChiMod headers and functionality without
+#   For non-clio_run namespaces (e.g., clio_cte, clio_cae), this function automatically
+#   links clio_run admin and bdev runtime libraries if they are available as targets.
+#   This enables wrp_* ChiMods to use clio_run ChiMod headers and functionality without
 #   explicit dependency declarations in their CMakeLists.txt files.
 #
 function(add_clio_module_runtime)
@@ -1259,7 +1259,7 @@ function(add_clio_module_runtime)
 
   # Install the runtime library (add to existing export set if client exists)
   # MODULE_PACKAGE_NAME: install dir under lib/cmake/. For runtime modules
-  # whose namespace was renamed chimaera -> clio::run (admin, bdev, MOD_NAME)
+  # whose namespace was renamed clio_run -> clio::run (admin, bdev, MOD_NAME)
   # we pin to the legacy `clio_<module>` form so external find_package
   # consumers (e.g. coeus-adapter) keep working. For other namespaces
   # (clio::cte, clio::cae, …) we use the standard `<package>_<module>` form
@@ -1293,7 +1293,7 @@ function(add_clio_module_runtime)
 
   if(SHOULD_GENERATE_CONFIG)
     # Export targets file
-    # NAMESPACE: for chimaera-renamed runtime modules (admin/bdev/MOD_NAME,
+    # NAMESPACE: for clio_run-renamed runtime modules (admin/bdev/MOD_NAME,
     # now under clio::run::), pin to `clio::run::` so installed targets keep
     # the legacy name external consumers (coeus-adapter etc.) expect. For
     # other modules use the canonical namespace. Either way the modern
@@ -1337,7 +1337,7 @@ function(add_clio_module_runtime)
 include(CMakeFindDependencyMacro)
 
 # Find the core CLIO Runtime package (handles all other dependencies)
-find_dependency(chimaera REQUIRED)
+find_dependency(clio_run REQUIRED)
 
 # Include the exported targets
 include(\"\${CMAKE_CURRENT_LIST_DIR}/${MODULE_EXPORT_NAME}.cmake\")

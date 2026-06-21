@@ -1,5 +1,5 @@
 ---
-# Chimaera runtime config for FUSE manual testing.
+# Clio runtime config for FUSE manual testing.
 #
 # NOTE: the CTE pool is no longer composed here. The manual test now mirrors
 # the jarvis pipeline shape:

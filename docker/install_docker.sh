@@ -128,7 +128,7 @@ echo '==================================================================='
 echo 'Step 3: Verifying installation'
 echo '==================================================================='
 echo 'Checking installed libraries in /opt/venv/lib:'
-ls -lh /opt/venv/lib/libchimaera* 2>/dev/null || echo 'No chimaera libraries found'
+ls -lh /opt/venv/lib/libclio_run* 2>/dev/null || echo 'No clio_run libraries found'
 ls -lh /opt/venv/lib/libhshm* 2>/dev/null || echo 'No hshm libraries found'
 ls -lh /opt/venv/lib/libwrp* 2>/dev/null || echo 'No wrp libraries found'
 

@@ -1,4 +1,4 @@
-# Expand/Induction Integration Tests for Chimaera Runtime
+# Expand/Induction Integration Tests for Clio Runtime
 # Tests dynamic node induction: nodes 1-2 form initial cluster,
 # node 3 joins via --induct flag.
 #

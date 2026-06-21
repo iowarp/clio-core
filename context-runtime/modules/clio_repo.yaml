@@ -1,13 +1,13 @@
-# Chimaera Module Repository Configuration
-# This repository contains the standard Chimaera modules
+# Clio Module Repository Configuration
+# This repository contains the standard Clio modules
 
 name: modules
 namespace: clio::run
 version: 1.0.0
-description: Standard Chimaera modules repository
+description: Standard Clio modules repository
 
 # Repository metadata
-author: Chimaera Project
+author: Clio Project
 license: Apache-2.0
 
 # Modules in this repository
@@ -18,5 +18,5 @@ modules:
 
 # Build configuration
 build:
-  requires_chimaera: true
-  min_chimaera_version: 1.0.0
+  requires_clio_run: true
+  min_clio_run_version: 1.0.0

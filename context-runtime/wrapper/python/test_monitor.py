@@ -6,14 +6,14 @@ import time
 sys.path.insert(0, os.getcwd())
 os.environ.pop("CLIO_WITH_RUNTIME", None)
 
-import chimaera_runtime_ext as chi
+import clio_runtime_ext as chi
 
 
 def test_init():
-    """Test that chimaera_init(kClient) succeeds."""
-    ok = chi.chimaera_init(0)  # 0 = kClient
+    """Test that clio_init(kClient) succeeds."""
+    ok = chi.clio_init(0)  # 0 = kClient
     if not ok:
-        print("SKIPPED: No runtime available (chimaera_init returned False)")
+        print("SKIPPED: No runtime available (clio_init returned False)")
         sys.exit(0)
     print("PASSED: test_init")
 
@@ -64,7 +64,7 @@ def test_threaded():
 
 def test_finalize():
     """Test clean shutdown."""
-    chi.chimaera_finalize()
+    chi.clio_finalize()
     print("PASSED: test_finalize")
 
 

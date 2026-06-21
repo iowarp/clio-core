@@ -1,8 +1,8 @@
 # IOR + CTE (libfuse adapter) — SLURM sbatch deployment.
 #
 # Layout (single-node by default; bump `nodes:` for multi-node):
-#   clio_runtime      -> chimaera daemon (shm IPC; works in both 1-node
-#                       and multi-node because chimaera uses shm for
+#   clio_runtime      -> clio_run daemon (shm IPC; works in both 1-node
+#                       and multi-node because clio_run uses shm for
 #                       client<->daemon within a node and another
 #                       transport for daemon<->daemon across nodes)
 #   clio_cte          -> CTE pool with a RAM tier
@@ -44,7 +44,7 @@ ssh_cmd: "env -u LD_LIBRARY_PATH ssh"
 #
 # Earlier runs pinned every layer to eno1 because compose / PMIx kept
 # binding to the docker bridge or APIPA links and crashing at MPI_Init.
-# That worked but capped chimaera's cross-node CTE traffic at the 1 GbE
+# That worked but capped clio_run's cross-node CTE traffic at the 1 GbE
 # line rate (~112 MiB/s single-stream — confirmed with iperf3 +
 # zmq_microbench in the same allocation). Moving the data plane to the
 # 40 GbE NIC requires routing daemon↔daemon and (optionally) IOR ranks
@@ -59,8 +59,8 @@ mpi_cmd: 'mpiexec --mca btl_tcp_if_include enp47s0np0 --mca oob_tcp_if_include e
 # Some compute nodes have a small / partition that fills up (ares-comp-10/11,
 # 28, etc.). PRTE / PMIx default to /tmp for the per-job session directory
 # (prterun.<host>.<pid>...) and aborts with "No space left on device" when
-# /tmp is full. chimaera_runtime puts its per-user memfd symlinks at
-# /tmp/chimaera_$USER for the same reason and gets the same failure mode
+# /tmp is full. clio_runtime puts its per-user memfd symlinks at
+# /tmp/clio_$USER for the same reason and gets the same failure mode
 # (`shm_open failed: No such file or directory`).
 #
 # CLIO_MEMFD_DIR MUST be node-local (or have hostname baked in). The dir
@@ -72,7 +72,7 @@ mpi_cmd: 'mpiexec --mca btl_tcp_if_include enp47s0np0 --mca oob_tcp_if_include e
 # the command on the remote side.
 env:
   TMPDIR: "/home/llogan/iowarp_prte_tmp"
-  CLIO_MEMFD_DIR: "/home/llogan/iowarp_chimaera_tmp_${HOSTNAME}"
+  CLIO_MEMFD_DIR: "/home/llogan/iowarp_clio_tmp_${HOSTNAME}"
 
 scheduler:
   name: slurm
@@ -81,13 +81,13 @@ scheduler:
   ntasks_per_node: 1
   # Ares SLURM has `ProctrackType=proctrack/cgroup` +
   # `ConstrainCores=yes`. With ntasks_per_node=1 the per-task cgroup
-  # gets ONE core, and chimaera's 4 worker threads (3 task + 1
+  # gets ONE core, and clio_run's 4 worker threads (3 task + 1
   # dedicated net) all fight for it. The net worker gets starved and
   # cross-node ZMQ task delivery stalls (HANDSHAKE_SUCCEEDED but
   # SendIn/RecvOut never make timely progress). Salloc + ssh works
   # because pam_slurm_adopt drops the ssh session into the whole-node
   # cgroup, not the per-task one. `cpus_per_task=16` (much larger than
-  # `num_threads=4`) leaves room for the chimaera workers, FUSE, ior,
+  # `num_threads=4`) leaves room for the clio_run workers, FUSE, ior,
   # and mpiexec helper threads. Switch to `--exclusive` if a future
   # workload needs the whole node.
   cpus_per_task: 40
@@ -103,7 +103,7 @@ scheduler:
   # pipeline reports "Pipeline started successfully" anyway). Three plain
   # `module load` lines, no /tmp salvage, no log scraping, no bash -c.
   # Append "-40g" to every hostname jarvis-cd writes into the pipeline
-  # hostfile. Routes chimaera daemon↔daemon DEALER/ROUTER over
+  # hostfile. Routes clio_run daemon↔daemon DEALER/ROUTER over
   # enp47s0np0 (40 GbE, 172.25/16) instead of eno1 (1 GbE, 172.20/16).
   # /etc/hosts maps `ares-comp-N-40g` → `172.25.101.N`. jarvis-cd's
   # `suffix:` key handles this in scheduler.py (post-scontrol awk).
@@ -116,7 +116,7 @@ scheduler:
     - 'module load gcc/11.4.0/openmpi/5.0.5-x2kvx5l ior/3.3.0-fihmxeb'
     # Avoid /tmp (small + filled up on some nodes). PRTE/PMIx default
     # to /tmp for its per-job session dir; route it to NFS.
-    # (CLIO_MEMFD_DIR's per-host dir is auto-created by chimaera's
+    # (CLIO_MEMFD_DIR's per-host dir is auto-created by clio_run's
     # EnsureMemfdDir at first use, so it's not mkdir'd here.)
     - 'mkdir -p /home/llogan/iowarp_prte_tmp'
 
@@ -165,7 +165,7 @@ pkgs:
     api: posix
     write: true
     read: true
-    # Each chimaera daemon + CTE pool + FUSE mount is local to its
+    # Each clio_run daemon + CTE pool + FUSE mount is local to its
     # own node -- shared-file IOR would have ranks writing through
     # one node's FUSE/CTE and expecting reads through another, which
     # is impossible by construction. file-per-process: each rank

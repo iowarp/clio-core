@@ -28,7 +28,7 @@ ENV OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
 # image. /usr/local/include is needed when this deploy image is injected
 # into a jarvis build container as a compile-time dependency for a
 # downstream package (e.g. chronolog's chimod/*_client.cc uses
-# <chimaera/chimaera.h>).
+# <clio_run/clio_run.h>).
 COPY --from=builder /usr/local/lib     /usr/local/lib
 COPY --from=builder /usr/local/bin     /usr/local/bin
 COPY --from=builder /usr/local/share   /usr/local/share

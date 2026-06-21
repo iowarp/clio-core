@@ -1,6 +1,6 @@
 # Redis vs CTE throughput comparison — multi-experiment pipeline.
 #
-# Brings up the Chimaera runtime + CTE core AND a Redis server in the
+# Brings up the Clio runtime + CTE core AND a Redis server in the
 # same deployment, then runs the two apples-to-apples benchmarks
 # (clio_cte_bench and clio_redis_bench — same CLI/metrics via
 # bench_common.h) back to back under identical conditions.
@@ -24,7 +24,7 @@
 config:
   name: redis_vs_cte_thrpt
   pkgs:
-    # --- Chimaera runtime (owns the daemon) ---
+    # --- Clio runtime (owns the daemon) ---
     - pkg_type: jarvis_clio_core.clio_runtime
       pkg_name: runtime
       num_threads: 4

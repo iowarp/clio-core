@@ -115,7 +115,7 @@ write_config
 remount() {
   pkill -9 -x clio_cte_fuse 2>/dev/null; pkill -9 -x clio_run 2>/dev/null
   fusermount3 -u "${TEST_DIR}" 2>/dev/null
-  rm -rf "/tmp/chimaera_$(id -un)" /dev/shm/chimaera* 2>/dev/null
+  rm -rf "/tmp/clio_$(id -un)" /dev/shm/clio_run* 2>/dev/null
   sleep 0.5
   mount_fuse "${TEST_DIR}" 1 "${TEST_DEV}"
 }

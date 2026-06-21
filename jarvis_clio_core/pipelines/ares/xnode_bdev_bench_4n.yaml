@@ -1,7 +1,7 @@
-# Cross-node chimaera bdev throughput benchmark — SLURM sbatch deployment.
+# Cross-node clio_run bdev throughput benchmark — SLURM sbatch deployment.
 #
 # Layout:
-#   clio_runtime              -> chimaera daemon (one per node)
+#   clio_runtime              -> clio_run daemon (one per node)
 #   clio_xnode_bdev_bench     -> mpiexec across all ranks, each issuing
 #                               AsyncWrite to DirectHash((my_node + 1)
 #                               % num_nodes) so every op crosses the
@@ -43,14 +43,14 @@ mpi_cmd: 'mpiexec --mca btl_tcp_if_include enp47s0np0 --mca oob_tcp_if_include e
 # remote shell when ssh_exec inlines KEY="value" prefixes.
 env:
   TMPDIR: "/home/llogan/iowarp_prte_tmp"
-  CLIO_MEMFD_DIR: "/home/llogan/iowarp_chimaera_tmp_${HOSTNAME}"
+  CLIO_MEMFD_DIR: "/home/llogan/iowarp_clio_tmp_${HOSTNAME}"
 
 scheduler:
   name: slurm
   job_name: xnode_bdev_bench_4n
   nodes: 4
   ntasks_per_node: 1
-  # Wide cpus_per_task: chimaera spawns net + task workers per daemon
+  # Wide cpus_per_task: clio_run spawns net + task workers per daemon
   # and we run 24 ranks/node; need slack for the kernel + libfabric
   # threads. Matches the IOR pipeline's value.
   cpus_per_task: 40

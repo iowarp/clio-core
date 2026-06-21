@@ -5,7 +5,7 @@
             "name": "Debug ChiMod Runtime",
             "type": "cppdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/build/bin/chimaera",
+            "program": "${workspaceFolder}/build/bin/clio_run",
             "args": ["runtime", "start"],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}",
@@ -398,10 +398,10 @@
             "preLaunchTask": "cmake-build-debug"
         },
         {
-            "name": "Debug chimaera runtime stop",
+            "name": "Debug clio_run runtime stop",
             "type": "cppdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/build/bin/chimaera",
+            "program": "${workspaceFolder}/build/bin/clio_run",
             "args": ["runtime", "stop"],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}/build",
@@ -566,7 +566,7 @@
             "name": "debug_runtime",
             "type": "cppdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/build/bin/chimaera",
+            "program": "${workspaceFolder}/build/bin/clio_run",
             "cwd": "${workspaceFolder}",
             "MIMode": "gdb",
             "miDebuggerServerAddress": "localhost:4000",
@@ -587,7 +587,7 @@
             "name": "debug_client",
             "type": "cppdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/build/bin/chimaera",
+            "program": "${workspaceFolder}/build/bin/clio_run",
             "cwd": "${workspaceFolder}",
             "MIMode": "gdb",
             "miDebuggerServerAddress": "localhost:4001",
@@ -605,10 +605,10 @@
             ]
         },
         {
-            "name": "Debug chimaera monitor",
+            "name": "Debug clio_run monitor",
             "type": "cppdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/build/bin/chimaera",
+            "program": "${workspaceFolder}/build/bin/clio_run",
             "args": [
                 "monitor",
                 "-o",

@@ -9,7 +9,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(clio_run REQUIRED)
 find_package(clio_run_admin REQUIRED)
 
-# ClioCoreCommon.cmake utilities are included via chimaera package
+# ClioCoreCommon.cmake utilities are included via clio_run package
 
 # Add modules directory
 add_subdirectory(modules/simple_mod)

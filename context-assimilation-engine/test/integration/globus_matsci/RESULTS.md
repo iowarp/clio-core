@@ -29,16 +29,16 @@ End-to-end Globus HTTPS file download through the Clio runtime works correctly.
 
 ---
 
-## Key Fix: NSS SIGSEGV in Chimaera Worker Thread
+## Key Fix: NSS SIGSEGV in Clio Worker Thread
 
 ### Root Cause
 
-Calling `Poco::Net::HTTPSClientSession` from inside a chimaera worker thread
+Calling `Poco::Net::HTTPSClientSession` from inside a clio_run worker thread
 triggered `getaddrinfo()` → glibc NSS hostname resolution → **SIGSEGV** at
 `nss_action.h:64` (glibc 2.39, offset `0x160a8d` in libc.so.6).
 
 - Crash address: `segfault at 2` — null `nss_action_list` accessed at field offset 2
-- NSS lazy-init is broken in chimaera's dlopen'd module context (hshm allocator interference)
+- NSS lazy-init is broken in clio_run's dlopen'd module context (hshm allocator interference)
 - Not a catchable C++ exception; kills the runtime process immediately
 - Crash happens in both worker threads and background threads; standalone `std::thread` DNS works fine
 

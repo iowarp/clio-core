@@ -86,7 +86,7 @@ cd build && ctest -VV
 Component-specific tests:
 ```bash
 ctest -R context_transport   # Transport primitives
-ctest -R chimaera            # Runtime
+ctest -R clio_run            # Runtime
 ctest -R cte                 # Context Transfer Engine
 ctest -R omni                # Context Assimilation Engine
 ```
@@ -245,8 +245,8 @@ cmake --preset=cuda-debug
 
 **Shared memory errors / stale IPC segments:**
 ```bash
-# Chimaera auto-cleans on init, but for manual cleanup:
-rm -rf /tmp/chimaera_$(whoami)/*
+# Clio auto-cleans on init, but for manual cleanup:
+rm -rf /tmp/clio_$(whoami)/*
 ```
 
 **Runtime won't start:**

@@ -1489,7 +1489,7 @@ message(STATUS "  Package name: iowarp-core (canonical alias: clio-core)")
 message(STATUS "  Install destination: lib/cmake/iowarp-core, lib/cmake/clio-core")
 message(STATUS "  Components included:")
 message(STATUS "    - ClioCtp (context-transport-primitives)")
-message(STATUS "    - Chimaera (runtime)")
+message(STATUS "    - Clio (runtime)")
 message(STATUS "    - Core ChiMods: admin, bdev")
 if(CLIO_CORE_ENABLE_CTE)
     message(STATUS "    - CTE ChiMod: clio_cte_core")
@@ -1552,7 +1552,7 @@ if(TARGET clio_bdev_client)
 endif()
 # Template chimod (used by clio_run_thrpt_bench's "latency" test case via
 # clio::run::MOD_NAME_client).  Without this the benchmark binary's NEEDED list
-# references libchimaera_MOD_NAME_client.so but the wheel doesn't contain it,
+# references libclio_MOD_NAME_client.so but the wheel doesn't contain it,
 # and the dynamic linker segfaults at load time on glibc/patchelf combinations
 # instead of failing cleanly.  See #429.
 if(TARGET clio_MOD_NAME_client)
@@ -1579,7 +1579,7 @@ if(PIP_LIB_TARGETS)
   # same shared libs ship in the .deb / .rpm built by cpack -G DEB/RPM
   # (those generators filter to CPACK_COMPONENTS_ALL=Unspecified). Without
   # this, libclio_admin_client.so / libclio_admin_runtime.so /
-  # libclio_bdev_*.so / libchimaera_MOD_NAME_*.so are only in the pip
+  # libclio_bdev_*.so / libclio_MOD_NAME_*.so are only in the pip
   # wheel — and the .rpm's clio_run binary then fails to start with
   #   error while loading shared libraries: libclio_admin_client.so
   # because its NEEDED entry (Fedora's ld doesn't strip --as-needed as
@@ -1595,54 +1595,17 @@ if(PIP_LIB_TARGETS)
     PUBLIC_HEADER DESTINATION include/clio_runtime)
 endif()
 
-# CLI binary -> iowarp_core/bin/
-# Install the canonical `clio_run` binary plus a legacy `chimaera` symlink.
-# Matches the parallel install in context-runtime/util/CMakeLists.txt for
-# system installs; this branch handles the pip-wheel COMPONENT pip_package.
+# CLI binary -> iowarp_core/bin/ (pip-wheel COMPONENT pip_package).
 if(TARGET clio_run)
   install(TARGETS clio_run
     COMPONENT pip_package
     RUNTIME DESTINATION bin)
-  install(CODE "
-    if(WIN32)
-      set(_pip_src \"\${CMAKE_INSTALL_PREFIX}/bin/clio_run.exe\")
-      set(_pip_dst \"\${CMAKE_INSTALL_PREFIX}/bin/chimaera.exe\")
-    else()
-      set(_pip_src \"\${CMAKE_INSTALL_PREFIX}/bin/clio_run\")
-      set(_pip_dst \"\${CMAKE_INSTALL_PREFIX}/bin/chimaera\")
-    endif()
-    if(EXISTS \"\${_pip_src}\" AND NOT EXISTS \"\${_pip_dst}\")
-      if(WIN32)
-        file(INSTALL \"\${_pip_src}\"
-             DESTINATION \"\${CMAKE_INSTALL_PREFIX}/bin\" RENAME chimaera.exe)
-      else()
-        execute_process(COMMAND \${CMAKE_COMMAND} -E create_symlink clio_run \"\${_pip_dst}\")
-      endif()
-    endif()
-  " COMPONENT pip_package)
   # Also install to PYTHON_SITE_PACKAGES/iowarp_core/bin/ so that
   # `sudo make install` keeps the binary in sync with the Python package,
   # matching how clio_runtime_ext.so is installed directly to site-packages.
   if(CLIO_CORE_ENABLE_PYTHON AND PYTHON_SITE_PACKAGES)
     install(TARGETS clio_run
       RUNTIME DESTINATION "${PYTHON_SITE_PACKAGES}/iowarp_core/bin")
-    install(CODE "
-      if(WIN32)
-        set(_py_src \"${PYTHON_SITE_PACKAGES}/iowarp_core/bin/clio_run.exe\")
-        set(_py_dst \"${PYTHON_SITE_PACKAGES}/iowarp_core/bin/chimaera.exe\")
-      else()
-        set(_py_src \"${PYTHON_SITE_PACKAGES}/iowarp_core/bin/clio_run\")
-        set(_py_dst \"${PYTHON_SITE_PACKAGES}/iowarp_core/bin/chimaera\")
-      endif()
-      if(EXISTS \"\${_py_src}\" AND NOT EXISTS \"\${_py_dst}\")
-        if(WIN32)
-          file(INSTALL \"\${_py_src}\"
-               DESTINATION \"${PYTHON_SITE_PACKAGES}/iowarp_core/bin\" RENAME chimaera.exe)
-        else()
-          execute_process(COMMAND \${CMAKE_COMMAND} -E create_symlink clio_run \"\${_py_dst}\")
-        endif()
-      endif()
-    ")
   endif()
 endif()
 
@@ -1674,7 +1637,7 @@ endif()
 # context-runtime/benchmark/CMakeLists.txt:17 are functionally identical
 # to the working installs at context-transfer-engine/benchmark and
 # context-assimilation-engine/core, but at v1.9.5 the resulting .deb
-# shipped without clio_run / clio_run_thrpt_bench / chimaera while it
+# shipped without clio_run / clio_run_thrpt_bench / clio_run while it
 # DID ship clio_cte_bench / clio_cae / allocator_benchmark. Exact root
 # cause is unidentified (the per-subdir rules look correct in cmake_install.cmake).
 # Add explicit top-level installs as a safety net so any future drop-out
@@ -1686,7 +1649,7 @@ endif()
 if(TARGET clio_run_thrpt_bench)
   install(TARGETS clio_run_thrpt_bench RUNTIME DESTINATION bin)
 endif()
-# `chimaera` is created as a symlink to `clio_run` by an install(CODE)
+# `clio_run` is created as a symlink to `clio_run` by an install(CODE)
 # in context-runtime/util/CMakeLists.txt — that runs after this point
 # during cmake --install, so the symlink lands in the default
 # component too. No extra rule needed here.

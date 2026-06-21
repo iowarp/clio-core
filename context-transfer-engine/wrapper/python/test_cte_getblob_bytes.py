@@ -66,7 +66,7 @@ def initialize_runtime(cte) -> bool:
     with open(cfg_path, "w") as f:
         yaml.dump(config, f)
     os.environ["CLIO_SERVER_CONF"] = cfg_path
-    if not cte.chimaera_init(cte.RuntimeMode.kClient, True):
+    if not cte.clio_init(cte.RuntimeMode.kClient, True):
         return False
     time.sleep(0.5)
     return cte.initialize_cte(cfg_path, cte.PoolQuery.Dynamic())

@@ -20,7 +20,7 @@ install(TARGETS clio_run_thrpt_bench
 
 # Cross-node bdev throughput benchmark (MPI). Each rank targets its
 # +1 neighbour's bdev container via DirectHash so all writes cross
-# the network — isolates chimaera's cross-node task path from CTE/
+# the network — isolates clio_run's cross-node task path from CTE/
 # FUSE/IOR.
 find_package(MPI QUIET)
 if(MPI_CXX_FOUND)

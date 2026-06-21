@@ -1,10 +1,10 @@
 """
-clio_xnode_bdev_bench — jarvis-cd wrapper for the cross-node chimaera
+clio_xnode_bdev_bench — jarvis-cd wrapper for the cross-node clio_run
 bdev benchmark binary (`clio_xnode_bdev_bench`).
 
 The benchmark:
   - Calls MPI_Init, then chi::CLIO_INIT(kClient, false), so it needs
-    a running chimaera daemon cluster (clio_runtime in the same pipeline).
+    a running clio_run daemon cluster (clio_runtime in the same pipeline).
   - Rank 0 creates a per-bench bdev pool (id 777.0) on every node via
     AsyncCreate(Broadcast, ..., kRam, 4 GiB).
   - Each rank issues AsyncWrite to DirectHash((my_node + 1) % num_nodes),
@@ -47,7 +47,7 @@ from jarvis_cd.shell import Exec, LocalExecInfo
 
 class ClioXnodeBdevBench(Application):
     """
-    Cross-node chimaera bdev write-throughput benchmark.
+    Cross-node clio_run bdev write-throughput benchmark.
     """
 
     # ------------------------------------------------------------------
@@ -93,7 +93,7 @@ class ClioXnodeBdevBench(Application):
             {
                 'name': 'bind_to',
                 'msg': 'OpenMPI --bind-to value (none is what the manual '
-                       'sbatch script uses; chimaera spawns its own threads)',
+                       'sbatch script uses; clio_run spawns its own threads)',
                 'type': str,
                 'default': 'none',
             },
@@ -157,9 +157,9 @@ class ClioXnodeBdevBench(Application):
         verbatim values, no shell expansion. ``CLIO_MEMFD_DIR``, by
         contrast, intentionally embeds the literal token ``$HOSTNAME``
         (the pipeline YAML's `env:` block writes
-        ``/home/llogan/iowarp_chimaera_tmp_${HOSTNAME}``) so that it can
+        ``/home/llogan/iowarp_clio_tmp_${HOSTNAME}``) so that it can
         resolve to the *local* hostname on every node — needed because
-        chimaera's per-PID memfd symlinks point into /proc/<pid>/fd and
+        clio_run's per-PID memfd symlinks point into /proc/<pid>/fd and
         a single NFS-shared dir clobbers them across nodes
         (project_chi_memfd_dir_must_be_node_local). ``-x`` would
         forward the literal token, so each rank would look for the
@@ -167,7 +167,7 @@ class ClioXnodeBdevBench(Application):
         Instead we wrap the bench in ``bash -lc 'export
         CLIO_MEMFD_DIR=...$HOSTNAME...; exec <bench> ...'`` — the rank-
         side shell expands ``$HOSTNAME`` to its own node. Same trick
-        the per-node chimaera daemon spawn uses (PsshExec's
+        the per-node clio_run daemon spawn uses (PsshExec's
         ``KEY=value <cmd>`` prefix, eval'd by the remote shell).
         """
         pipeline = self.pipeline
@@ -198,7 +198,7 @@ class ClioXnodeBdevBench(Application):
 
         # The mod_env CLIO_MEMFD_DIR is the un-expanded template from
         # the pipeline yaml (e.g.
-        # ``/home/llogan/iowarp_chimaera_tmp_${HOSTNAME}``). Each rank
+        # ``/home/llogan/iowarp_clio_tmp_${HOSTNAME}``). Each rank
         # must resolve ${HOSTNAME} to its own node, which means letting
         # the *rank-side* bash do the expansion. Use double quotes in
         # the inner script so $HOSTNAME expands there. The outer
@@ -207,7 +207,7 @@ class ClioXnodeBdevBench(Application):
         # passes $HOSTNAME through verbatim.
         memfd_template = self.mod_env.get(
             'CLIO_MEMFD_DIR',
-            '/tmp/chimaera_$USER')
+            '/tmp/clio_$USER')
         # Normalize ${HOSTNAME} → $HOSTNAME (bash treats them the same;
         # we use the bare form so simple double-quoted expansion works
         # without brace gymnastics inside a single-quoted outer wrap).

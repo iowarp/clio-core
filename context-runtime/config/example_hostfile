@@ -1,4 +1,4 @@
-# Example hostfile for Chimaera runtime
+# Example hostfile for Clio runtime
 # This file contains host patterns that the runtime will attempt to bind to
 # in order to identify which host the process is running on
 

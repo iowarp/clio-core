@@ -1,4 +1,4 @@
-# Chimaera runtime configuration for Globus integration test
+# Clio runtime configuration for Globus integration test
 # Includes compose section to auto-create CTE and CAE pools on startup
 
 # Memory segment configuration
@@ -15,7 +15,7 @@ networking:
 # Logging configuration
 logging:
   level: info
-  file: /tmp/chimaera.log
+  file: /tmp/clio.log
 
 # Runtime configuration
 runtime:

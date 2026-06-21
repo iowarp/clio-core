@@ -1,4 +1,4 @@
-# Chimaera Configuration for Reconnect Integration Testing
+# Clio Configuration for Reconnect Integration Testing
 # 4-node cluster testing client failover to new hosts after server death
 
 # Network configuration
@@ -10,7 +10,7 @@ networking:
 # Logging configuration
 logging:
   level: "info"
-  file: "/tmp/chimaera.log"
+  file: "/tmp/clio.log"
 
 # Runtime configuration
 runtime:

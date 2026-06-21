@@ -5,7 +5,7 @@ import socket
 
 from flask import Blueprint, jsonify
 
-from .. import chimaera_client
+from .. import clio_client
 
 bp = Blueprint("topology", __name__)
 
@@ -45,7 +45,7 @@ def get_topology():
     alive_set = set()
     if ip_list:
         try:
-            alive_set = chimaera_client.check_nodes_alive(ip_list, port=9413, timeout=1)
+            alive_set = clio_client.check_nodes_alive(ip_list, port=9413, timeout=1)
         except Exception:
             pass
 
@@ -54,14 +54,14 @@ def get_topology():
     live_nodes = {}  # node_id -> entry
     if alive_node_ids:
         try:
-            live_nodes = chimaera_client.get_system_stats_per_node(alive_node_ids, timeout=3)
+            live_nodes = clio_client.get_system_stats_per_node(alive_node_ids, timeout=3)
         except Exception:
             pass
 
     # Fallback: no hostfile — broadcast (legacy, may block if nodes are dead)
     if not hostfile_nodes:
         try:
-            raw = chimaera_client.get_system_stats_all()
+            raw = clio_client.get_system_stats_all()
             for cid, entries in raw.items():
                 if not isinstance(entries, list):
                     continue
@@ -148,7 +148,7 @@ def get_topology():
 @bp.route("/topology/node/<node_id>/shutdown", methods=["POST"])
 def shutdown_node(node_id):
     try:
-        result = chimaera_client.shutdown_node(int(node_id))
+        result = clio_client.shutdown_node(int(node_id))
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
 
@@ -165,7 +165,7 @@ def restart_node(node_id):
         return jsonify({"error": f"Node {node_id} not found or has no IP"}), 404
 
     try:
-        result = chimaera_client.restart_node(ip)
+        result = clio_client.restart_node(ip)
     except Exception as exc:
         print(f"[topology] restart_node raised: {exc}", flush=True)
         return jsonify({"error": str(exc)}), 500

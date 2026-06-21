@@ -404,7 +404,7 @@ add_test(NAME cte_tag_edge
 
 # Single-process runs of test_core_client_config / test_core_runtime_coverage.
 # Previously each Catch2 SECTION was registered as a standalone ctest entry
-# (27 + 19), which serialized via RESOURCE_LOCK but multiplied chimaera
+# (27 + 19), which serialized via RESOURCE_LOCK but multiplied clio_run
 # init/finalize cycles and exposed shutdown ZMQ races.
 add_test(NAME cte_client_config_all
     COMMAND test_core_client_config)
@@ -589,7 +589,7 @@ clio_add_force_net_test(NAME cte_config_dpe_force_net
 # executable"). The current GPU CTE test is cte_devmem_putget_cuda
 # (test_cte_devmem_putget, defined below).
 
-# Mark all CTE tests as msan_skip (they use ZMQ via chimaera runtime which is uninstrumented)
+# Mark all CTE tests as msan_skip (they use ZMQ via clio_run runtime which is uninstrumented)
 set_tests_properties(
     cte_core_pool_creation
     cte_core_target_registration
@@ -640,7 +640,7 @@ set_tests_properties(
 
 # Tests that start a full CLIO Runtime runtime share /tmp/clio_iowarp SHM
 # segments and TCP/IPC ports, so they must NOT run in parallel. They also
-# need the chimaera cleanup fixture so a previous runtime process holding
+# need the clio_run cleanup fixture so a previous runtime process holding
 # 0.0.0.0:9416 doesn't break the next test's `IpcManager::ServerInit` with
 # "Address in use" (especially on Windows, where TIME_WAIT can hang on for
 # minutes and SIMPLE_TEST_PROCESS_EXIT skips libzmq's own socket close).
@@ -685,7 +685,7 @@ set_tests_properties(
         ENVIRONMENT "CLIO_PORT=10500"
 )
 # All cte_functional_* tests run test_core_functionality (9 test cases, each
-# initializing and finalizing the full chimaera runtime).  After multiple
+# initializing and finalizing the full clio_run runtime).  After multiple
 # runtime init/finalize cycles, ZMQ background threads fire callbacks on
 # already-freed runtime memory, producing non-deterministic heap-use-after-free
 # defects under ASan.  The same uninstrumented-runtime category caused all CTE

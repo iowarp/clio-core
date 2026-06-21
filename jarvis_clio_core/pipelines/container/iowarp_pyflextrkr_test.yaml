@@ -38,7 +38,7 @@ pkgs:
   - pkg_type: builtin.compress_libs
     deploy_mode: container
 
-  # IOWarp runtime (Chimaera storage daemon)
+  # IOWarp runtime (Clio storage daemon)
   - pkg_type: jarvis_clio_core.clio_runtime
     deploy_mode: container
     git_branch: transparent-compress

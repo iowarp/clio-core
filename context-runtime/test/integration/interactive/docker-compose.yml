@@ -1,4 +1,4 @@
-# Interactive Dashboard Cluster -- 8-node Chimaera runtime cluster
+# Interactive Dashboard Cluster -- 8-node Clio runtime cluster
 #
 # The dashboard runs inside node 1 alongside the runtime.
 # run.sh forwards port 5000 from this devcontainer into the container

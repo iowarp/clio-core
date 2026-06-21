@@ -5,7 +5,7 @@
 #   docker run -e TEST_CASE=Put -e NUM_PROCS=1 -e DEPTH=4 -e IO_SIZE=1m -e IO_COUNT=100 iowarp/cte-wrp-bench:latest
 #   docker run -e TEST_CASE=Get -e NUM_PROCS=4 -e DEPTH=8 -e IO_SIZE=4k -e IO_COUNT=1000 iowarp/cte-wrp-bench:latest
 #
-# Note: This container uses environment variables only and automatically stops the Chimaera runtime after benchmark completion
+# Note: This container uses environment variables only and automatically stops the Clio runtime after benchmark completion
 
 FROM iowarp/deps-cpu:latest
 
@@ -52,7 +52,7 @@ RUN echo '#!/bin/bash' > /benchmarks/run_bench.sh && \
     echo '# Run benchmark using environment variables' >> /benchmarks/run_bench.sh && \
     echo '/benchmarks/clio_cte_bench.sh "$TEST_CASE" "$NUM_PROCS" "$DEPTH" "$IO_SIZE" "$IO_COUNT"' >> /benchmarks/run_bench.sh && \
     echo 'BENCH_EXIT=$?' >> /benchmarks/run_bench.sh && \
-    echo '# Stop Chimaera runtime after benchmark completes' >> /benchmarks/run_bench.sh && \
+    echo '# Stop Clio runtime after benchmark completes' >> /benchmarks/run_bench.sh && \
     echo 'clio_run runtime stop' >> /benchmarks/run_bench.sh && \
     echo 'exit $BENCH_EXIT' >> /benchmarks/run_bench.sh && \
     sudo chmod +x /benchmarks/run_bench.sh

@@ -100,7 +100,7 @@ include("${CMAKE_CURRENT_LIST_DIR}/../ClioCtp/ClioCtpCoreConfig.cmake")
 # utilities. The canonical alias `clio::run::cxx` (and the pre-`::` waypoint
 # `clio_run::cxx`) are added below.  The install path follows
 # CLIO_RUN_PACKAGE_NAME (filesystem-safe form of the YAML namespace —
-# `clio::run` -> `clio_run`, legacy `chimaera` -> `chimaera`).
+# `clio::run` -> `clio_run`, legacy `clio_run` -> `clio_run`).
 include("${CMAKE_CURRENT_LIST_DIR}/../@CLIO_RUN_PACKAGE_NAME@/@CLIO_RUN_PACKAGE_NAME@_coreTargets.cmake")
 
 # Include CLIO Runtime ChiMods that are always available. We pull in the
@@ -164,7 +164,7 @@ message(STATUS "  Prefix: ${IOWARP_CORE_PREFIX}")
 message(STATUS "")
 message(STATUS "Core Components:")
 message(STATUS "  ClioCtp: Available (ctp::cxx, ctp::configure, ctp::serialize, etc.)")
-message(STATUS "  Chimaera Runtime: Available (clio::run::cxx)")
+message(STATUS "  Clio Runtime: Available (clio::run::cxx)")
 message(STATUS "  IowarpCoreCommon: Available (ChiMod build utilities)")
 message(STATUS "")
 message(STATUS "Core ChiMods (Always Available):")

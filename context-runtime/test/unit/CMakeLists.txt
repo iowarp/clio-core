@@ -599,9 +599,9 @@ endif()
 # Enable CTest integration if testing is enabled
 if(CLIO_CORE_ENABLE_TESTS)
   # Core Runtime Tests
-  # Single ctest entry runs the whole binary in one chimaera init/finalize cycle.
+  # Single ctest entry runs the whole binary in one clio_run init/finalize cycle.
   # Previously 8 redundant entries each invoked the full unfiltered binary, which
-  # serialized via RESOURCE_LOCK but multiplied chimaera shutdown ZMQ-race exposure.
+  # serialized via RESOURCE_LOCK but multiplied clio_run shutdown ZMQ-race exposure.
   add_test(
     NAME cr_unit_tests
     COMMAND ${TEST_TARGET}
@@ -1034,35 +1034,35 @@ add_custom_target(test_runtime
   COMMAND ${TEST_TARGET}
   DEPENDS ${TEST_TARGET}
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
-  COMMENT "Running Chimaera runtime tests"
+  COMMENT "Running Clio runtime tests"
 )
 
 add_custom_target(test_client
   COMMAND ${TEST_TARGET}
   DEPENDS ${TEST_TARGET}
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
-  COMMENT "Running Chimaera client tests"
+  COMMENT "Running Clio client tests"
 )
 
 add_custom_target(test_tasks
   COMMAND ${TEST_TARGET}
   DEPENDS ${TEST_TARGET}
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
-  COMMENT "Running Chimaera task tests"
+  COMMENT "Running Clio task tests"
 )
 
 add_custom_target(test_errors
   COMMAND ${TEST_TARGET}
   DEPENDS ${TEST_TARGET}
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
-  COMMENT "Running Chimaera error handling tests"
+  COMMENT "Running Clio error handling tests"
 )
 
 add_custom_target(test_performance
   COMMAND ${TEST_TARGET}
   DEPENDS ${TEST_TARGET}
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
-  COMMENT "Running Chimaera performance tests"
+  COMMENT "Running Clio performance tests"
 )
 
 # Custom targets for per-process shared memory tests (Linux/macOS only — the
@@ -1072,21 +1072,21 @@ add_custom_target(test_per_process_shm
   COMMAND ${PER_PROCESS_SHM_TEST_TARGET}
   DEPENDS ${PER_PROCESS_SHM_TEST_TARGET}
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
-  COMMENT "Running Chimaera per-process shared memory tests"
+  COMMENT "Running Clio per-process shared memory tests"
 )
 
 add_custom_target(test_per_process_shm_large
   COMMAND ${PER_PROCESS_SHM_TEST_TARGET}
   DEPENDS ${PER_PROCESS_SHM_TEST_TARGET}
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
-  COMMENT "Running Chimaera per-process shared memory large allocation tests (>1GB)"
+  COMMENT "Running Clio per-process shared memory large allocation tests (>1GB)"
 )
 
 add_custom_target(test_per_process_shm_stress
   COMMAND ${PER_PROCESS_SHM_TEST_TARGET}
   DEPENDS ${PER_PROCESS_SHM_TEST_TARGET}
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
-  COMMENT "Running Chimaera per-process shared memory stress tests"
+  COMMENT "Running Clio per-process shared memory stress tests"
 )
 endif()  # NOT WIN32
 
@@ -1095,7 +1095,7 @@ add_custom_target(test_all_unit
   COMMAND ${TEST_TARGET}
   DEPENDS ${TEST_TARGET}
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
-  COMMENT "Running all Chimaera core unit tests"
+  COMMENT "Running all Clio core unit tests"
 )
 
 # Install test executables.
@@ -1192,7 +1192,7 @@ if(CLIO_CORE_ENABLE_MPI)
 endif()
 
 # Print configuration summary
-message(STATUS "Chimaera core unit tests configured:")
+message(STATUS "Clio core unit tests configured:")
 message(STATUS "  Test target: ${TEST_TARGET}")
 message(STATUS "  Test sources: ${TEST_SOURCES}")
 message(STATUS "  IPC AllocateBuffer test target: ${IPC_ALLOCATE_BUFFER_TEST_TARGET}")

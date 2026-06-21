@@ -8,7 +8,7 @@
 #-----------------------------------------------------------------------------
 
 if(CLIO_CORE_ENABLE_CUDA)
-    # Baseline cudaMemcpy bench (pure CUDA runtime; no chimaera deps).
+    # Baseline cudaMemcpy bench (pure CUDA runtime; no clio_run deps).
     add_cuda_executable(clio_memcpy_d2h_bench FALSE
         clio_memcpy_d2h_bench.cc
         LINK_LIBS

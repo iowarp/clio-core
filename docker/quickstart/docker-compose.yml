@@ -1,6 +1,6 @@
 # IOWarp Quickstart - Docker Compose
 #
-# Single-node Chimaera runtime for getting started quickly.
+# Single-node Clio runtime for getting started quickly.
 #
 # Usage:
 #   docker compose up -d        # Start in background

@@ -1,4 +1,4 @@
-# Chimaera Configuration for Recovery Integration Testing
+# Clio Configuration for Recovery Integration Testing
 # 4-node cluster testing node failure detection and container recovery
 # Uses faster heartbeat for quicker SWIM detection
 
@@ -11,7 +11,7 @@ networking:
 # Logging configuration
 logging:
   level: "info"
-  file: "/tmp/chimaera.log"
+  file: "/tmp/clio.log"
 
 # Runtime configuration
 runtime:

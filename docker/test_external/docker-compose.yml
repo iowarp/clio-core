@@ -34,7 +34,7 @@ services:
     container_name: cae-external
     environment:
       - CLIO_SERVER_CONF=/etc/iowarp/clio_conf.yaml
-    # Share IPC namespace with host for Chimaera communication
+    # Share IPC namespace with host for Clio communication
     ipc: host
     # Use host network so both containers can communicate via 127.0.0.1
     network_mode: host

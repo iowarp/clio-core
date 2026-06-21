@@ -6,7 +6,7 @@
 #  - install_manager: container is *required* — without it
 #    pipeline._propagate_deploy_mode() overwrites every package's
 #    deploy_mode back to 'default' no matter what the pkgs block says,
-#    which then tries to exec chimaera from the host PATH.
+#    which then tries to exec clio_run from the host PATH.
 #  - container_extensions:pull_policy: never keeps docker-compose from
 #    hitting a registry for the locally-built pipeline image.
 #  - Jarvis copies the effective hostfile into <shared_dir>/hostfile on

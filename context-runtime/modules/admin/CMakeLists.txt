@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.10)
 
 # Create client library
 # LIB_NAME pins the library to `clio_run_admin_*` so changing the
-# C++ namespace (chimaera -> clio_run) doesn't cascade into renaming
+# C++ namespace (clio_run -> clio_run) doesn't cascade into renaming
 # this load-bearing .so. See deprecation-notes.md.
 add_clio_module_client(
   LIB_NAME clio_admin

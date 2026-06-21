@@ -1,4 +1,4 @@
-# Test hostfile for Chimaera runtime host identification
+# Test hostfile for Clio runtime host identification
 # Simple hostnames
 localhost
 127.0.0.1

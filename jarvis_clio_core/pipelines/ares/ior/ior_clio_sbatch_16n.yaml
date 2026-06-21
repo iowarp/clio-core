@@ -3,11 +3,11 @@
 # "clio" path (NOT FUSE): the clio_adapters interceptor LD_PRELOADs
 # libclio_cte_posix.so into the IOR ranks; any path prefixed "clio::"
 # is rerouted through the CTE client (shm IPC to the node-local
-# chimaera daemon). The adapter strips the prefix before touching the
+# clio_run daemon). The adapter strips the prefix before touching the
 # backend, so there is no FUSE mount and no clio_cte_libfuse pkg.
 #
 # Layout:
-#   clio_runtime  -> chimaera daemon per node (shm IPC; daemon<->daemon
+#   clio_runtime  -> clio_run daemon per node (shm IPC; daemon<->daemon
 #                   over the 40 GbE -40g fabric)
 #   clio_cte      -> CTE pool with a RAM tier per node (pool 512.0,
 #                   adapter entrypoint; NO compressor in this pipeline)
@@ -29,7 +29,7 @@ mpi_cmd: 'mpiexec --mca btl_tcp_if_include enp47s0np0 --mca oob_tcp_if_include e
 env:
   TMPDIR: "/home/llogan/iowarp_prte_tmp"
   # CLIO_MEMFD_DIR must resolve to the SAME node-local dir for both the
-  # chimaera daemon (launched per-node via pssh) AND the IOR ranks
+  # clio_run daemon (launched per-node via pssh) AND the IOR ranks
   # (spawned via `mpiexec -x CLIO_MEMFD_DIR=...`). The FUSE pipelines use
   # ".../_${HOSTNAME}" which works only because the ssh hop expands
   # ${HOSTNAME} per-node; mpiexec -x forwards ONE literal string to every
@@ -41,7 +41,7 @@ env:
   # literal path is independently node-local everywhere — no per-node
   # shell expansion needed. Username is constant so the literal is safe
   # through both the ssh inline and mpiexec -x.
-  CLIO_MEMFD_DIR: "/dev/shm/chimaera_llogan"
+  CLIO_MEMFD_DIR: "/dev/shm/clio_llogan"
 
 scheduler:
   name: slurm
@@ -49,7 +49,7 @@ scheduler:
   nodes: 16
   ntasks_per_node: 1
   # ConstrainCores=yes + ntasks_per_node=1 gives the per-task cgroup one
-  # core; chimaera's worker threads + IOR ranks need headroom. Oversize
+  # core; clio_run's worker threads + IOR ranks need headroom. Oversize
   # cpus_per_task so the whole node's cores are available to the step.
   cpus_per_task: 40
   partition: compute
@@ -58,7 +58,7 @@ scheduler:
   time: "00:05:00"
   output: slurm-%j.out
   error: slurm-%j.err
-  # -40g suffix routes chimaera daemon<->daemon over the 40 GbE NIC.
+  # -40g suffix routes clio_run daemon<->daemon over the 40 GbE NIC.
   suffix: "-40g"
   pre_cmds:
     - 'source /etc/profile.d/lmod.sh 2>/dev/null || source /etc/profile.d/modules.sh'
@@ -97,7 +97,7 @@ pkgs:
     api: posix
     write: true
     read: true
-    # Each chimaera daemon + CTE pool is node-local; shared-file IOR
+    # Each clio_run daemon + CTE pool is node-local; shared-file IOR
     # would cross nodes and break by construction. file-per-process:
     # each rank writes a unique clio:: file routed to its own node.
     fpp: true

@@ -14,17 +14,17 @@ NC='\033[0m' # No Color
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="${SCRIPT_DIR}/../../build"
 BIN_DIR="${BUILD_DIR}/bin"
-TEST_CONFIG="/tmp/test_chimaera compose_config.yaml"
+TEST_CONFIG="/tmp/test_clio compose_config.yaml"
 
 # Executables
 CLIO_START_RUNTIME="${BIN_DIR}/clio_run runtime start"
 CLIO_COMPOSE="${BIN_DIR}/clio_run compose"
 
-echo -e "${YELLOW}=== Chimaera Compose Utility Test ===${NC}"
+echo -e "${YELLOW}=== Clio Compose Utility Test ===${NC}"
 
 # Check if executables exist
-if [ ! -f "${BIN_DIR}/chimaera" ]; then
-    echo -e "${RED}Error: chimaera not found at ${BIN_DIR}/chimaera${NC}"
+if [ ! -f "${BIN_DIR}/clio_run" ]; then
+    echo -e "${RED}Error: clio_run not found at ${BIN_DIR}/clio_run${NC}"
     exit 1
 fi
 
@@ -58,7 +58,7 @@ export CLIO_SERVER_CONF="${TEST_CONFIG}"
 # Cleanup function
 cleanup() {
     echo -e "${YELLOW}Cleaning up...${NC}"
-    # Kill all chimaera processes
+    # Kill all clio_run processes
     pkill -9 -f "clio_run runtime start" 2>/dev/null || true
     pkill -9 -f "clio_run compose" 2>/dev/null || true
 
@@ -67,7 +67,7 @@ cleanup() {
     rm -f /tmp/test_compose_util_bdev.dat 2>/dev/null || true
 
     # Clean up memfd symlinks
-    rm -rf /tmp/chimaera_${USER:-unknown}/* 2>/dev/null || true
+    rm -rf /tmp/clio_${USER:-unknown}/* 2>/dev/null || true
 
     sleep 1
     echo -e "${GREEN}Cleanup complete${NC}"
@@ -77,7 +77,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # Start clio_run runtime in background
-echo -e "${YELLOW}Starting Chimaera runtime...${NC}"
+echo -e "${YELLOW}Starting Clio runtime...${NC}"
 "${CLIO_START_RUNTIME}" &
 RUNTIME_PID=$!
 

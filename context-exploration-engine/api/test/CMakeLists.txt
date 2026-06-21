@@ -26,7 +26,7 @@ function(add_cee_api_unit_test TEST_NAME TEST_SOURCE)
 
   # Set test environment variables
   set_tests_properties(${TEST_NAME} PROPERTIES
-    ENVIRONMENT "INIT_CHIMAERA=1;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500"
+    ENVIRONMENT "INIT_CLIO=1;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500"
     TIMEOUT 300  # 5 minute timeout
   )
 endfunction()
@@ -179,7 +179,7 @@ endif()
 #------------------------------------------------------------------------------
 # Test labels for selective execution
 #------------------------------------------------------------------------------
-# Skip under MSan: CEE tests use uninstrumented chimaera runtime (ZMQ, shared
+# Skip under MSan: CEE tests use uninstrumented clio_run runtime (ZMQ, shared
 # memory, forked processes) that produce false-positive MSan reports.
 set_tests_properties(test_context_bundle PROPERTIES LABELS "cee;api;bundle;msan_skip")
 set_tests_properties(test_context_query PROPERTIES LABELS "cee;api;query;msan_skip")

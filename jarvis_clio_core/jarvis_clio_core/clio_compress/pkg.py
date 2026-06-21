@@ -1,7 +1,7 @@
 """
 IOWarp transparent compression service for the CTE stack.
 
-Generates a chimaera-compose YAML that places the clio_cte_compressor
+Generates a clio_run-compose YAML that places the clio_cte_compressor
 module at the configured ``pool_id`` (default 512.0 — the CTE entrypoint
 that adapters target via CLIO_CTE_CLIENT_INIT) and points it at the
 downstream clio_cte_core via ``next_pool_id`` (default 513.0). Pairs
@@ -186,7 +186,7 @@ class ClioCompress(Service):
         compose_config = {'compose': [compose_entry]}
 
         with open(self.compose_config_path, 'w') as f:
-            f.write('# clio_compress chimaera-compose configuration\n\n')
+            f.write('# clio_compress clio_run-compose configuration\n\n')
             yaml.dump(compose_config, f, default_flow_style=False, indent=2)
 
         # Stash the chosen library/preset as env vars so adapters that

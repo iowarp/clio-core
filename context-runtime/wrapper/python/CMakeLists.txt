@@ -8,7 +8,7 @@ nanobind_add_module(
     runtime_bindings.cc
 )
 
-# Link against the admin client library (provides MonitorTask, admin::Client, chimaera headers)
+# Link against the admin client library (provides MonitorTask, admin::Client, clio_run headers)
 target_link_libraries(clio_runtime_ext PRIVATE clio_admin_client)
 
 # Local includes only
@@ -24,7 +24,7 @@ install(
     TARGETS clio_runtime_ext
     LIBRARY DESTINATION "${PYTHON_SITE_PACKAGES}"
 )
-message(STATUS "Chimaera runtime Python wrapper will be installed to: ${PYTHON_SITE_PACKAGES}")
+message(STATUS "Clio runtime Python wrapper will be installed to: ${PYTHON_SITE_PACKAGES}")
 
 # Add Python bindings tests
 if(BUILD_TESTING)

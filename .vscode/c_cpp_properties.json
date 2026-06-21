@@ -14,7 +14,7 @@
                 "${workspaceFolder}/context-assimilation-engine/include",
                 "${workspaceFolder}/context-exploration-engine/include",
                 "${workspaceFolder}/runtime/include",
-                "/usr/local/include/chimaera",
+                "/usr/local/include/clio_run",
                 "/usr/local/include/clio-ctp"
             ]
         }

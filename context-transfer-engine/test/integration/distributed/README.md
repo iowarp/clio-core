@@ -290,7 +290,7 @@ Edit `cte_config.yaml` and change `media_type` (e.g., "SSD", "NVMe") and adjust 
 
 ## Notes
 
-- The configuration uses the default IOWarp runtime configuration (no custom chimaera config needed)
+- The configuration uses the default IOWarp runtime configuration (no custom clio_run config needed)
 - All nodes share the same CTE configuration file mounted read-only
 - Node 1 is responsible for running the tests
 - The test execution is sequential - Node 1 runs tests after ensuring all nodes are ready

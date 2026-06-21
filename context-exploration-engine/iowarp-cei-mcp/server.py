@@ -154,18 +154,18 @@ def _initialize_runtime() -> bool:
             config_path = os.getenv("CLIO_SERVER_CONF", "")
             
             # Step 1: Initialize CLIO Runtime (unified init)
-            chimaera_result = False
-            if hasattr(cte, 'chimaera_init') and hasattr(cte, 'RuntimeMode'):
+            clio_result = False
+            if hasattr(cte, 'clio_init') and hasattr(cte, 'RuntimeMode'):
                 try:
-                    chimaera_result = cte.chimaera_init(cte.RuntimeMode.kClient, True)
-                    if chimaera_result:
+                    clio_result = cte.clio_init(cte.RuntimeMode.kClient, True)
+                    if clio_result:
                         time.sleep(0.5)  # Give Clio time to initialize (500ms as per tests)
                 except Exception:
                     pass  # May fail in some environments
 
             # Step 2: Initialize CTE subsystem (only if CLIO Runtime succeeded)
             cte_result = False
-            if chimaera_result and hasattr(cte, 'initialize_cte') and hasattr(cte, 'PoolQuery'):
+            if clio_result and hasattr(cte, 'initialize_cte') and hasattr(cte, 'PoolQuery'):
                 try:
                     pool_query = cte.PoolQuery.Dynamic()
                     cte_result = cte.initialize_cte(config_path, pool_query)
@@ -577,7 +577,7 @@ def initialize_cte_runtime() -> str:
     This function follows the initialization pattern from test_bindings.py:
     1. Setup environment paths (CLIO_REPO_PATH, LD_LIBRARY_PATH)
     2. Use CLIO_SERVER_CONF if available, otherwise try empty config
-    3. Initialize Clio (chimaera_init with kClient mode, True) - wait 500ms
+    3. Initialize Clio (clio_init with kClient mode, True) - wait 500ms
     4. Initialize CTE subsystem (initialize_cte with config_path)
     
     Returns:
@@ -723,14 +723,14 @@ def initialize_cte_runtime() -> str:
             
             # Step 1: Initialize CLIO Runtime (unified init - following test_bindings.py pattern)
             # Note: This may fail if runtime is already running or config is missing
-            if hasattr(cte, 'chimaera_init') and hasattr(cte, 'RuntimeMode'):
+            if hasattr(cte, 'clio_init') and hasattr(cte, 'RuntimeMode'):
                 try:
                     # Try to initialize - if it fails, it may return False or raise an exception
                     # In some cases, C++ FATAL may cause process abort which we can't catch
-                    chimaera_result = cte.chimaera_init(cte.RuntimeMode.kClient, True)
-                    result['runtime_init'] = bool(chimaera_result)
-                    result['client_init'] = bool(chimaera_result)
-                    if chimaera_result:
+                    clio_result = cte.clio_init(cte.RuntimeMode.kClient, True)
+                    result['runtime_init'] = bool(clio_result)
+                    result['client_init'] = bool(clio_result)
+                    if clio_result:
                         # Give CLIO Runtime time to initialize all components (500ms as per tests)
                         time.sleep(0.5)
                         result['messages'].append('Clio initialized successfully')
@@ -759,7 +759,7 @@ def initialize_cte_runtime() -> str:
                     result['runtime_init'] = False
                     result['client_init'] = False
             else:
-                result['messages'].append('chimaera_init not available in bindings')
+                result['messages'].append('clio_init not available in bindings')
             log_progress(result) # Log after Clio init
 
             # Step 2: Initialize CTE subsystem (following test_bindings.py pattern)

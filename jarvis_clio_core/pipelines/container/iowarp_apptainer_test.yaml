@@ -19,14 +19,14 @@
 
 name: iowarp_apptainer_test
 
-# Pin chimaera's ZMQ TCP traffic (server bind + client source-bind) to a
+# Pin clio_run's ZMQ TCP traffic (server bind + client source-bind) to a
 # single Aurora HSN rail so connections are symmetric. Without this the
 # FQDN can resolve to one of hsn0..hsn7 while connect() picks another
 # rail, causing silent drops at scale (PR #399).
 env:
   LIGHTBEAM_TCP_DEVICE: hsn0
-  # At >=64 chimaera nodes, the daemon's ROUTER on 127.0.0.1:9416 is
-  # busy serving cross-node SWIM probes when chimaera-compose tries to
+  # At >=64 clio_run nodes, the daemon's ROUTER on 127.0.0.1:9416 is
+  # busy serving cross-node SWIM probes when clio_run-compose tries to
   # connect, so the default 30s WaitForLocalServer expires before the
   # daemon's ZMTP greeting completes — observed as
   # HANDSHAKE_FAILED_NO_DETAIL value=32 (EPIPE) on the daemon's
@@ -34,7 +34,7 @@ env:
   # daemon plenty of time to answer.
   CLIO_WAIT_SERVER: "300"
   CLIO_RETRY_TIMEOUT: "300"
-  # Bump ZMQ I/O threads inside the chimaera daemon to handle the
+  # Bump ZMQ I/O threads inside the clio_run daemon to handle the
   # 1023-peer cross-node SWIM probe storm at scale (default 2
   # saturates at >=64 nodes).
   CLIO_ZMQ_IO_THREADS: "8"
@@ -70,7 +70,7 @@ pkgs:
     git_branch: transparent-compress-router-port-offset
     cmake_preset: release-adapter
     port: 9413
-    # 60s post-startup sleep before clio_cte compose. At >=64 chimaera
+    # 60s post-startup sleep before clio_cte compose. At >=64 clio_run
     # daemons, SWIM probe round + initial cross-node DEALER warmup
     # takes longer than the prior 2s; compose then races the
     # half-formed cluster and fails ZMTP greeting (ACCEPTED ->

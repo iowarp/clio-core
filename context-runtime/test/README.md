@@ -1,10 +1,10 @@
-# Chimaera Unit Tests
+# Clio Unit Tests
 
 This directory contains comprehensive unit tests for the Clio runtime system using the Catch2 testing framework.
 
 ## Overview
 
-The unit tests demonstrate and verify the complete Chimaera workflow:
+The unit tests demonstrate and verify the complete Clio workflow:
 
 1. **Runtime Startup** - Initialize Clio runtime components
 2. **Client Initialization** - Connect client to the runtime
@@ -15,7 +15,7 @@ The unit tests demonstrate and verify the complete Chimaera workflow:
 ## Test Categories
 
 ### Core Functionality Tests
-- **Chimaera Initialization** `[initialization]` - Tests for `CHIMAERA_INIT()`
+- **Clio Initialization** `[initialization]` - Tests for `CLIO_INIT()`
 - **MOD_NAME Task Execution** `[task][mod_name]` - Custom task creation and execution
 - **Async Task Handling** `[task][mod_name][async]` - Asynchronous task submission
 
@@ -59,7 +59,7 @@ If you prefer to build and run manually:
 ```bash
 # 1. Configure with tests enabled
 mkdir -p build && cd build
-cmake .. -DCHIMAERA_ENABLE_TESTS=ON
+cmake .. -DCLIO_CORE_ENABLE_TESTS=ON
 
 # 2. Build the project
 make -j$(nproc)
@@ -78,7 +78,7 @@ If you want to use CMake's CTest framework:
 
 ```bash
 cd build
-cmake .. -DCHIMAERA_ENABLE_TESTS=ON
+cmake .. -DCLIO_CORE_ENABLE_TESTS=ON
 make -j$(nproc)
 
 # Run all tests via CTest
@@ -94,10 +94,10 @@ ctest -V
 
 ## Test Structure
 
-### Test Fixture: `ChimaeraRuntimeFixture`
+### Test Fixture: `ClioRuntimeFixture`
 
 The test fixture provides:
-- **`initialize()`** - Complete Chimaera initialization (client with embedded runtime)
+- **`initialize()`** - Complete Clio initialization (client with embedded runtime)
 - **`waitForTaskCompletion()`** - Wait for async task completion with timeout
 - **`createModNamePool()`** - Create MOD_NAME pool using admin client
 - **`cleanup()`** - Automatic resource cleanup
@@ -108,7 +108,7 @@ Tests are organized using Catch2 sections and tags:
 
 ```cpp
 TEST_CASE("Test Description", "[tag1][tag2]") {
-  ChimaeraRuntimeFixture fixture;
+  ClioRuntimeFixture fixture;
   
   SECTION("Specific scenario") {
     // Test implementation
@@ -122,7 +122,7 @@ TEST_CASE("Test Description", "[tag1][tag2]") {
 
 ```cpp
 TEST_CASE("My New Test", "[category][subcategory]") {
-  ChimaeraRuntimeFixture fixture;
+  ClioRuntimeFixture fixture;
   
   SECTION("Test scenario description") {
     // 1. Setup
@@ -143,7 +143,7 @@ TEST_CASE("My New Test", "[category][subcategory]") {
 
 ```cpp
 TEST_CASE("Custom Task Test", "[task][custom]") {
-  ChimaeraRuntimeFixture fixture;
+  ClioRuntimeFixture fixture;
   
   SECTION("Task execution") {
     // Initialize everything
@@ -152,7 +152,7 @@ TEST_CASE("Custom Task Test", "[task][custom]") {
     
     // Create client
     clio::run::MOD_NAME::Client client(kTestModNamePoolId);
-    chi::DomainQuery pool_query;
+    clio::run::DomainQuery pool_query;
     client.Create(pool_query);
     
     // Submit task
@@ -174,7 +174,7 @@ TEST_CASE("Custom Task Test", "[task][custom]") {
 
 ### CMake Options
 
-- **`CHIMAERA_ENABLE_TESTS`** - Enable/disable test building (default: OFF)
+- **`CLIO_CORE_ENABLE_TESTS`** - Enable/disable test building (default: OFF)
 - **`CMAKE_BUILD_TYPE`** - Debug/Release build (Debug recommended for tests)
 
 ### Test Constants
@@ -182,17 +182,17 @@ TEST_CASE("Custom Task Test", "[task][custom]") {
 Key test configuration in `test_clio_run_runtime.cc`:
 
 ```cpp
-constexpr chi::u32 kTestTimeoutMs = 5000;     // Task completion timeout
-constexpr chi::u32 kMaxRetries = 50;          // Retry attempts
-constexpr chi::u32 kRetryDelayMs = 100;       // Delay between retries
-constexpr chi::PoolId kTestModNamePoolId = 100; // Test pool ID
+constexpr clio::run::u32 kTestTimeoutMs = 5000;     // Task completion timeout
+constexpr clio::run::u32 kMaxRetries = 50;          // Retry attempts
+constexpr clio::run::u32 kRetryDelayMs = 100;       // Delay between retries
+constexpr clio::run::PoolId kTestModNamePoolId = 100; // Test pool ID
 ```
 
 ## Troubleshooting
 
 ### Common Issues
 
-1. **Tests timeout** - Increase `kTestTimeoutMs` or check Chimaera initialization
+1. **Tests timeout** - Increase `kTestTimeoutMs` or check Clio initialization
 2. **Pool creation fails** - Verify admin Module is available and working
 3. **Task submission fails** - Check IPC manager initialization and pool existence
 
@@ -217,7 +217,7 @@ Each test case runs independently. The fixture ensures:
 
 The tests require:
 - **Catch2** - Testing framework (included with CTP)
-- **Chimaera Core** - Main runtime library
+- **Clio Core** - Main runtime library
 - **Admin Module** - For pool management
 - **MOD_NAME Module** - For custom task testing
 - **CTP** - Shared memory and threading support

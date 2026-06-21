@@ -21,6 +21,6 @@ set_tests_properties(cr_migrate_integration_docker PROPERTIES
     ENVIRONMENT "NUM_NODES=4;TEST_FILTER=[migrate]"
 )
 
-message(STATUS "Chimaera migrate integration test configured")
+message(STATUS "Clio migrate integration test configured")
 message(STATUS "  Test directory: ${MIGRATE_TEST_DIR}")
 message(STATUS "  Run with: ctest -L integration")

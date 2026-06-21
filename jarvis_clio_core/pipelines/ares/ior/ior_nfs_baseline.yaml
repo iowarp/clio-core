@@ -3,7 +3,7 @@
 # Matched topology to ior_cte_libfuse_sbatch.yaml so the numbers line up
 # apples-to-apples: 8 nodes, 24 PPN, 1 MiB xfer, 64 MiB block, fpp. The
 # only differences are:
-#   - no chimaera daemon / no CTE pool / no FUSE mount
+#   - no clio_run daemon / no CTE pool / no FUSE mount
 #   - output path is on NFS (`$HOME`) instead of the FUSE mount
 #   - mpi_cmd / OOB / PRTE settings preserved verbatim so the spawn graph
 #     uses the same network as the iowarp run for the control plane
@@ -34,7 +34,7 @@ scheduler:
   output: slurm-%j.out
   error: slurm-%j.err
   # Match the iowarp run's hostfile suffix so MPI ranks talk to each
-  # other over 40 GbE just like chimaera does there.
+  # other over 40 GbE just like clio_run does there.
   suffix: "-40g"
   pre_cmds:
     - 'source /etc/profile.d/lmod.sh 2>/dev/null || source /etc/profile.d/modules.sh'

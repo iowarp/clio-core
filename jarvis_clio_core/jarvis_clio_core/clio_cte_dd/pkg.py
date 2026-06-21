@@ -4,7 +4,7 @@ Per-node `dd` writer through the CTE FUSE mount.
 Drop-in replacement for `builtin.ior` in the multi-node CTE pipeline. Where
 ior wants an MPI runtime and a shared file layout, this just fans out one
 `dd` invocation per node via pssh -- a much smaller blast radius for
-debugging the chimaera 2n flow.
+debugging the clio_run 2n flow.
 
 Each node writes <count>x<bs> to <mountpoint>/dd_<hostname>.bin (file-per-
 process semantics, by construction).

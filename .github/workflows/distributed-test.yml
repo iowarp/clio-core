@@ -3,7 +3,7 @@ name: Distributed Test
 # Docker-based distributed integration CI.
 #
 # Spins up 4-node clusters from the iowarp/deps-cpu image and runs the
-# Chimaera runtime AND the CTE distributed integration tests across all nodes,
+# Clio runtime AND the CTE distributed integration tests across all nodes,
 # exercising the run-to-run network path (SendIn/RecvIn/SendOut/RecvOut) over
 # the SHM, TCP, and IPC transports.
 #

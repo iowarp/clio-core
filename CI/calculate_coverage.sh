@@ -533,7 +533,7 @@ for COMPONENT in ctp runtime cte cae cee; do
             NAME="Context Transport Primitives (CTP)"
             ;;
         runtime)
-            NAME="Context Runtime (Chimaera)"
+            NAME="Context Runtime (Clio)"
             ;;
         cte)
             NAME="Context Transfer Engine (CTE)"

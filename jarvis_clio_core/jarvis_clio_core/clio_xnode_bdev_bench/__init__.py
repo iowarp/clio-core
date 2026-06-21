@@ -1,3 +1,3 @@
 """
-Cross-node chimaera bdev benchmark wrapper.
+Cross-node clio_run bdev benchmark wrapper.
 """

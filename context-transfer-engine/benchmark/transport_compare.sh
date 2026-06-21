@@ -10,7 +10,7 @@ set -u  # don't `set -e` — bench errors on one config shouldn't kill the rest
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_BIN="${BUILD_BIN:-/workspace/build/bin}"
 CTE_BENCH="$BUILD_BIN/clio_cte_bench"
-CHIMAERA="$BUILD_BIN/chimaera"
+CLIO="$BUILD_BIN/clio_run"
 CTE_CONFIG="${CTE_CONFIG:-$SCRIPT_DIR/cte_config_ram.yaml}"
 REDIS_PORT="${REDIS_PORT:-6390}"
 RESULTS_DIR="${RESULTS_DIR:-/tmp/transport_compare}"
@@ -37,44 +37,44 @@ export CLIO_REPO_PATH="${CLIO_REPO_PATH:-$BUILD_BIN}"
 export CLIO_SERVER_CONF="$CTE_CONFIG"
 
 # Kill any leftover servers
-pkill -9 -f "$CHIMAERA runtime start" >/dev/null 2>&1 || true
-pkill -9 chimaera >/dev/null 2>&1 || true
+pkill -9 -f "$CLIO runtime start" >/dev/null 2>&1 || true
+pkill -9 clio_run >/dev/null 2>&1 || true
 sleep 1
 
-start_chimaera() {
+start_clio_run() {
   local mode="$1"
-  log "Starting Chimaera runtime (CLIO_IPC_MODE=$mode)"
+  log "Starting Clio runtime (CLIO_IPC_MODE=$mode)"
   CLIO_IPC_MODE="$mode" \
-    "$CHIMAERA" runtime start > "$RESULTS_DIR/chimaera_${mode}.log" 2>&1 &
+    "$CLIO" runtime start > "$RESULTS_DIR/clio_${mode}.log" 2>&1 &
   CLIO_PID=$!
   # Wait for server to be listening (matches "Successfully started local server"
-  # in the chimaera log)
+  # in the clio_run log)
   for i in $(seq 1 30); do
     if grep -q "Successfully started local server" \
-         "$RESULTS_DIR/chimaera_${mode}.log" 2>/dev/null; then
-      log "Chimaera up (pid=$CLIO_PID, mode=$mode)"
+         "$RESULTS_DIR/clio_${mode}.log" 2>/dev/null; then
+      log "Clio up (pid=$CLIO_PID, mode=$mode)"
       return 0
     fi
     sleep 0.5
   done
-  fail "Chimaera ($mode) did not start within 15s"
+  fail "Clio ($mode) did not start within 15s"
   return 1
 }
 
-stop_chimaera() {
+stop_clio_run() {
   if [ -n "${CLIO_PID:-}" ]; then
     kill "$CLIO_PID" 2>/dev/null || true
     wait "$CLIO_PID" 2>/dev/null || true
     CLIO_PID=""
   fi
-  pkill -9 -f "$CHIMAERA runtime start" >/dev/null 2>&1 || true
-  pkill -9 chimaera >/dev/null 2>&1 || true
+  pkill -9 -f "$CLIO runtime start" >/dev/null 2>&1 || true
+  pkill -9 clio_run >/dev/null 2>&1 || true
   sleep 1
 }
 
 run_iowarp() {
   local mode="$1"  # TCP | IPC | SHM
-  start_chimaera "$mode" || return
+  start_clio_run "$mode" || return
   for op in "${OPS[@]}"; do
     for nt in "${THREAD_COUNTS[@]}"; do
       log "  IOWarp $mode op=$op threads=$nt"
@@ -95,7 +95,7 @@ run_iowarp() {
       echo "iowarp-${mode},${op},${nt},${total_ops},${total_bytes},${agg:-NA},${per:-NA}" >> "$CSV"
     done
   done
-  stop_chimaera
+  stop_clio_run
 }
 
 # ----- Redis setup ---------------------------------------------------------

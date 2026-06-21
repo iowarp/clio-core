@@ -6,7 +6,7 @@
 
 name: clio_cte_bench_aurora_baremetal_2n
 
-# Pin chimaera's ZMQ TCP traffic (server bind + client source-bind) to a
+# Pin clio_run's ZMQ TCP traffic (server bind + client source-bind) to a
 # single Aurora HSN rail so connections are symmetric. Without this, the
 # FQDN can resolve to one of hsn0..hsn7 while the kernel picks a
 # different outbound NIC, causing silent drops at scale.

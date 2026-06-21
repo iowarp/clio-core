@@ -131,9 +131,9 @@ Every C/C++ source file (.h, .hpp, .cc, .cpp) MUST have the BSD 3-Clause license
 | Functions | PascalCase | `CreatePool()`, `GetNodeId()` |
 | Variables | snake_case with trailing `_` for members | `pool_id_`, `container_id_` |
 | Constants | kPascalCase | `kAdminPoolId`, `kCtePoolName` |
-| Macros | UPPER_SNAKE | `CTP_IS_GPU`, `CHI_IPC` |
-| CMake targets | namespace::component | `chimaera::admin_client` |
-| Module names | lowercase underscore | `clio_cte_core`, `chimaera_admin` |
+| Macros | UPPER_SNAKE | `CTP_IS_GPU`, `CLIO_IPC` |
+| CMake targets | namespace::component | `clio::run::admin_client` |
+| Module names | lowercase underscore | `clio_cte_core`, `clio_run_admin` |
 
 ---
 
@@ -148,8 +148,8 @@ clio-core/
 │   ├── src/                        # Implementation
 │   └── docs/MODULE_DEVELOPMENT_GUIDE.md  # Module dev guide
 │
-├── context-runtime/                # Chimaera modular runtime (chi:: namespace)
-│   ├── include/chimaera/           # Runtime headers
+├── context-runtime/                # Clio modular runtime (clio::run:: namespace)
+│   ├── include/clio_run/           # Runtime headers
 │   ├── src/scheduler/              # Worker, scheduler implementation
 │   ├── modules/                    # Built-in ChiMods (admin, bdev)
 │   ├── config/                     # Default YAML configs
@@ -188,7 +188,7 @@ Applications
     ├── context-assimilation-engine (CAE)
     └── context-transfer-engine (CTE)
             │
-            └── context-runtime (Chimaera)
+            └── context-runtime (Clio)
                     │
                     └── context-transport-primitives (CTP)
 ```
@@ -197,9 +197,9 @@ Every component depends on the ones below it. Never create upward dependencies.
 
 ### Key Abstractions
 
-**Module (Chimaera Module):** The fundamental extensibility unit. Each engine (CTE, CAE) is implemented as a Module with a client library and a runtime library.
+**Module (Clio Module):** The fundamental extensibility unit. Each engine (CTE, CAE) is implemented as a Module with a client library and a runtime library.
 
-**Task:** The unit of work in Chimaera. Tasks are coroutine-based, support cooperative yielding, and are scheduled across worker threads.
+**Task:** The unit of work in Clio. Tasks are coroutine-based, support cooperative yielding, and are scheduled across worker threads.
 
 **Pool:** A logical grouping of resources managed by a Module. Each pool has a unique ID and name.
 
@@ -287,7 +287,7 @@ For Clio runtime tests, use `simple_test.h` (NOT Catch2):
 #include "../../../context-runtime/test/simple_test.h"
 
 TEST_CASE("Reproduce issue #<N>", "[regression]") {
-  bool success = chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true);
+  bool success = clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true);
   REQUIRE(success);
   // ... code that triggers the bug ...
   REQUIRE(expected_condition);
@@ -378,7 +378,7 @@ Use the right agent for the job:
 
 - All new code must have unit tests
 - Use `simple_test.h` (NOT Catch2) for Clio runtime tests
-- Initialize with `chi::CHIMAERA_INIT(chi::ChimaeraMode::kClient, true)`
+- Initialize with `clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true)`
 - Always `ASSERT_EQ(client.GetReturnCode(), 0)` after Create operations
 - Run sanitizers before submitting: `bash CI/run_sanitizers.sh`
 

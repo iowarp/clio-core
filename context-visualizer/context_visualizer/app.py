@@ -4,7 +4,7 @@ import atexit
 
 from flask import Flask, render_template
 
-from . import chimaera_client
+from . import clio_client
 
 
 def create_app():
@@ -43,6 +43,6 @@ def create_app():
         return render_template("node.html", node_id=node_id)
 
     # Clean shutdown
-    atexit.register(chimaera_client.finalize)
+    atexit.register(clio_client.finalize)
 
     return app

@@ -58,7 +58,7 @@ The GPU side of CLIO Runtime is a **pure task producer** — kernels do not allo
 tasks, FutureShm, or data buffers. All allocations happen on the host before
 kernel launch into client-owned device-memory backends that are registered
 with the runtime via `admin::RegisterMemoryTask`. Inside a kernel the only
-operation `chi::gpu::IpcManager` exposes is `Send` — pack a pre-allocated
+operation `clio::run::gpu::IpcManager` exposes is `Send` — pack a pre-allocated
 task and push it onto the per-device gpu2cpu_queue.
 
 ### Lifecycle (host)
@@ -69,7 +69,7 @@ task and push it onto the per-device gpu2cpu_queue.
    ```cpp
    char *base = nullptr;
    auto alloc_id = ipc->AllocateAndRegisterGpuBackend(
-       gpu_id, chi::gpu::IpcManager::MemKind::kPinnedHost, bytes, &base);
+       gpu_id, clio::run::gpu::IpcManager::MemKind::kPinnedHost, bytes, &base);
    ```
    Available kinds: `kPinnedHost` (pinned host, fastest), `kManagedUvm`
    (CUDA managed / SYCL shared), `kDeviceMem` (device-only; worker copies
@@ -83,7 +83,7 @@ task and push it onto the per-device gpu2cpu_queue.
 ```cpp
 __global__ void MyKernel(IpcManagerGpuInfo info,
                          ctp::ipc::FullPtr<MyTaskT> task) {
-  CHIMAERA_GPU_INIT(info, /*ipc_ptr=*/nullptr);
+  CLIO_GPU_INIT(info, /*ipc_ptr=*/nullptr);
   if (threadIdx.x == 0) {
     // Mutate POD task fields. No NewTask, no AllocateBuffer.
     task->some_input_ = ...;
@@ -95,7 +95,7 @@ __global__ void MyKernel(IpcManagerGpuInfo info,
 ```
 SYCL kernels get a kernel-scope IpcManager pointer; CUDA/ROCm kernels use
 the per-block `__shared__` IpcManager via `GetBlockIpcManager()`. The
-single `CHIMAERA_GPU_INIT(gpu_info, ipc_ptr)` macro covers both backends.
+single `CLIO_GPU_INIT(gpu_info, ipc_ptr)` macro covers both backends.
 
 ### Worker pop path
 The CPU GPU worker (`Worker::ProcessNewTaskGpu`) pops a `gpu::Future<Task>`
@@ -204,7 +204,7 @@ All timing prints MUST include units of measurement in milliseconds (ms). Always
 When CLIO Runtime RuntimeInit is called (via `IpcManager::ServerInit()`), it automatically cleans up leftover shared memory segments from previous runs or crashed processes by calling `IpcManager::ClearUserIpcs()`.
 
 **ClearUserIpcs() Behavior:**
-- Scans the per-user chimaera directory (`SystemInfo::GetMemfdDir()`, i.e. `/tmp/chimaera_$USER/`)
+- Scans the per-user clio_run directory (`SystemInfo::GetMemfdDir()`, i.e. `/tmp/clio_$USER/`)
 - Removes all memfd symlinks and IPC socket files from that directory
 - Silently ignores permission errors (EACCES, EPERM) to support multi-user systems
 - Other users' active CLIO Runtime processes are not affected
@@ -215,12 +215,12 @@ This ensures a clean state for each runtime initialization without requiring man
 
 ### IPC Path Convention
 
-**CRITICAL**: Never hardcode `/tmp/chimaera_*` paths in IpcManager or elsewhere. Always use the `SystemInfo` helpers:
-- `ctp::SystemInfo::GetMemfdDir()` — returns `/tmp/chimaera_$USER`
-- `ctp::SystemInfo::GetMemfdPath(name)` — returns `/tmp/chimaera_$USER/<name>` (strips leading `/`)
+**CRITICAL**: Never hardcode `/tmp/clio_*` paths in IpcManager or elsewhere. Always use the `SystemInfo` helpers:
+- `ctp::SystemInfo::GetMemfdDir()` — returns `/tmp/clio_$USER`
+- `ctp::SystemInfo::GetMemfdPath(name)` — returns `/tmp/clio_$USER/<name>` (strips leading `/`)
 - `ctp::SystemInfo::EnsureMemfdDir()` — creates the directory if it doesn't exist
 
-For IPC Unix domain socket paths, use: `ctp::SystemInfo::GetMemfdPath("chimaera_" + std::to_string(port) + ".ipc")`
+For IPC Unix domain socket paths, use: `ctp::SystemInfo::GetMemfdPath("clio_" + std::to_string(port) + ".ipc")`
 
 ## Workflow
 
@@ -296,8 +296,8 @@ This project follows the CLIO Runtime MODULE_DEVELOPMENT_GUIDE.md patterns for p
 
 **Required Packages for Module Development:**
 ```cmake
-# Core Clio framework (includes ChimaeraCommon.cmake functions)
-find_package(chimaera REQUIRED)              # Core library (clio::run::cxx)
+# Core Clio framework (includes ClioCoreCommon.cmake functions)
+find_package(clio_run REQUIRED)              # Core library (clio::run::cxx)
 find_package(clio_admin REQUIRED)        # Admin Module (required for most Modules)
 ```
 
@@ -322,8 +322,8 @@ add_clio_module_client(
 **Target Naming:**
 - **Actual Targets**: `${PACKAGE_NAME}_${MODULE_NAME}_runtime`, `${PACKAGE_NAME}_${MODULE_NAME}_client` (or `${LIB_NAME}_runtime`/`_client` if `LIB_NAME` is passed to override — used e.g. by the bdev module which installs as `clio_bdev_*`).  `PACKAGE_NAME` is the filesystem-safe form of `NAMESPACE` (e.g. `clio::run` -> `clio_run`).
 - **CMake Aliases**: `${NAMESPACE}::${MODULE_NAME}_runtime`, `${NAMESPACE}::${MODULE_NAME}_client` (recommended — e.g. `clio::run::admin_client`, `clio::cte::core_client`)
-- **Legacy Aliases**: For chimaera-renamed modules (admin / bdev / MOD_NAME, now under `clio::run::`), the install layout still exposes `chimaera::<module>_<x>` aliases so external consumers (e.g. coeus-adapter) keep working.  The pre-`::` waypoint spellings (`clio_run::`, `clio_cte::`, `clio_cae::`) also resolve as forwarders.
-- **Package Names**: `${PACKAGE_NAME}_${MODULE_NAME}` for clio::cte / clio::cae; pinned to `chimaera_${MODULE_NAME}` for clio::run-namespace modules to keep `find_package(chimaera_admin/_bdev/_MOD_NAME)` backward compat.
+- **Legacy Aliases**: For clio_run-renamed modules (admin / bdev / MOD_NAME, now under `clio::run::`), the install layout still exposes `clio::run::<module>_<x>` aliases so external consumers (e.g. coeus-adapter) keep working.  The pre-`::` waypoint spellings (`clio_run::`, `clio_cte::`, `clio_cae::`) also resolve as forwarders.
+- **Package Names**: `${PACKAGE_NAME}_${MODULE_NAME}` for clio::cte / clio::cae; pinned to `clio_${MODULE_NAME}` for clio::run-namespace modules to keep `find_package(clio_run_admin/_bdev/_MOD_NAME)` backward compat.
 
 ## Worker Method Return Types
 
@@ -409,7 +409,7 @@ void Task::Yield(double block_time_us = 0.0);
 
 Use the `WorkQueue` typedef for worker queue types:
 ```cpp
-using WorkQueue = chi::ipc::mpsc_ring_buffer<ctp::ipc::TypedPointer<TaskLane>>;
+using WorkQueue = clio::run::ipc::mpsc_ring_buffer<ctp::ipc::TypedPointer<TaskLane>>;
 ```
 
 This simplifies code readability and maintenance for worker queue operations.
@@ -417,7 +417,7 @@ This simplifies code readability and maintenance for worker queue operations.
 **TaskLane Typedef:**
 The `TaskLane` typedef is defined globally in the `chi` namespace:
 ```cpp
-using TaskLane = chi::ipc::multi_mpsc_ring_buffer<ctp::ipc::TypedPointer<Task>, TaskQueueHeader>::queue_t;
+using TaskLane = clio::run::ipc::multi_mpsc_ring_buffer<ctp::ipc::TypedPointer<Task>, TaskQueueHeader>::queue_t;
 ```
 
 Use `TaskLane*` for all lane pointers in RunContext and other interfaces. Avoid `void*` and explicit type casts.
@@ -439,18 +439,18 @@ Use `TaskLane*` for all lane pointers in RunContext and other interfaces. Avoid 
 **Correct Usage:**
 ```cpp
 // Recommended: Use Dynamic() for automatic caching
-admin_client.Create(mctx, chi::PoolQuery::Dynamic(), "admin");
-bdev_client.Create(mctx, chi::PoolQuery::Dynamic(), file_path, clio_run::bdev::BdevType::kFile);
+admin_client.Create(mctx, clio::run::PoolQuery::Dynamic(), "admin");
+bdev_client.Create(mctx, clio::run::PoolQuery::Dynamic(), file_path, clio_run::bdev::BdevType::kFile);
 ```
 
 ### CreateTask Pool Assignment
-CreateTask operations in all Module clients MUST use `chi::kAdminPoolId` instead of the client's `pool_id_`. This is because CreateTask is actually a GetOrCreatePoolTask that must be processed by the admin Module to create or find the target pool.
+CreateTask operations in all Module clients MUST use `clio::run::kAdminPoolId` instead of the client's `pool_id_`. This is because CreateTask is actually a GetOrCreatePoolTask that must be processed by the admin Module to create or find the target pool.
 
 **Correct Usage:**
 ```cpp
 auto task = ipc_manager->NewTask<CreateTask>(
-    chi::CreateTaskNode(),
-    chi::kAdminPoolId,  // Always use admin pool for CreateTask
+    clio::run::CreateTaskNode(),
+    clio::run::kAdminPoolId,  // Always use admin pool for CreateTask
     pool_query,
     // ... other parameters
 );
@@ -493,9 +493,9 @@ Module libraries use consistent underscore-based naming:
 - Client: `${NAMESPACE}::${MODULE_NAME}_client` (e.g., `clio::run::admin_client`)
 
 **Package Names:**
-- Format: `${NAMESPACE}_${MODULE_NAME}` (e.g., `chimaera_admin`)
+- Format: `${NAMESPACE}_${MODULE_NAME}` (e.g., `clio_run_admin`)
 - Used with `find_package(clio_admin REQUIRED)`
-- Core package: `chimaera` (provides `clio::run::cxx`)
+- Core package: `clio_run` (provides `clio::run::cxx`)
 
 ### Automatic Dependency Linking
 Module libraries automatically handle common dependencies:
@@ -541,9 +541,9 @@ target_link_libraries(your_target
 If you need finer control, you can still find packages individually:
 ```cmake
 find_package(ClioCtp REQUIRED)        # Provides ctp::* targets
-find_package(chimaera REQUIRED)         # Provides clio::run::cxx
+find_package(clio_run REQUIRED)         # Provides clio::run::cxx
 find_package(clio_admin REQUIRED)   # Provides admin Module
-find_package(chimaera_bdev REQUIRED)    # Provides bdev Module (library now: clio_bdev_*)
+find_package(clio_run_bdev REQUIRED)    # Provides bdev Module (library now: clio_bdev_*)
 find_package(clio_cte_core REQUIRED)     # Provides CTE Module (if enabled)
 find_package(clio_cae_core REQUIRED)     # Provides CAE Module (if enabled)
 ```
@@ -783,7 +783,7 @@ SIMPLE_TEST_MAIN()
 **Required Pattern for All Unit Tests:**
 ```cpp
 // At the beginning of your test or test fixture setup
-bool success = CLIO_RUNTIME_INIT(chi::ChimaeraMode::kClient, true);
+bool success = CLIO_RUNTIME_INIT(clio::run::RuntimeMode::kClient, true);
 REQUIRE(success);
 
 // Optional: Wait for initialization to complete
@@ -795,7 +795,7 @@ REQUIRE(CLIO_IPC->IsInitialized());
 ```
 
 **Initialization Parameters:**
-- **Mode**: Always use `chi::ChimaeraMode::kClient` for unit tests
+- **Mode**: Always use `clio::run::RuntimeMode::kClient` for unit tests
 - **default_with_runtime**: Always use `true` for unit tests (starts runtime automatically)
 - **Environment Variable**: `CLIO_X` is handled automatically by `CLIO_RUNTIME_INIT()`
   - If set to `1`: Runtime will be started
@@ -813,7 +813,7 @@ class MyTestFixture {
 public:
   MyTestFixture() {
     // Initialize CLIO Runtime with client mode and runtime
-    bool success = CLIO_RUNTIME_INIT(chi::ChimaeraMode::kClient, true);
+    bool success = CLIO_RUNTIME_INIT(clio::run::RuntimeMode::kClient, true);
     REQUIRE(success);
 
     // Give runtime time to initialize
@@ -952,9 +952,9 @@ python -m build --wheel
 ```
 
 **What Gets Bundled:**
-- All IOWarp libraries (libchimaera_cxx.so, libclio_ctp_host.so, Module libraries)
+- All IOWarp libraries (libclio_run_cxx.so, libclio_ctp_host.so, Module libraries)
 - Dependencies from install.sh (Boost, HDF5, ZeroMQ, yaml-cpp, etc.)
-- Command-line tools (clio_cte, clio_cae, chimaera, etc.)
+- Command-line tools (clio_cte, clio_cae, clio_run, etc.)
 - Headers and CMake configuration files
 - Conda dependencies (if building in a Conda environment)
 

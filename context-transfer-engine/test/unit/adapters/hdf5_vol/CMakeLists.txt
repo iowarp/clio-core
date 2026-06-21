@@ -1,7 +1,7 @@
 # HDF5 VOL Connector Unit Tests
 #
 # Exercises the connector's plugin entry points, class definition,
-# registration and property-list integration with HDF5. No Chimaera runtime
+# registration and property-list integration with HDF5. No Clio runtime
 # is required (the connector's initialize callback is nullptr), so these
 # tests run standalone without RESOURCE_LOCK / cleanup fixtures.
 #

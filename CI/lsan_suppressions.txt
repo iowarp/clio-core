@@ -48,11 +48,11 @@ leak:chi::IpcManager::NewTask
 leak:TestLargeOutput
 
 # ---------------------------------------------------------------------------
-# Chi runtime: Chimaera::ServerInit internal allocations
+# Chi runtime: Clio::ServerInit internal allocations
 # ServerInit allocates runtime-lifetime objects (config, singletons, queues)
 # that persist until process exit. These are architectural and not leaked.
 # ---------------------------------------------------------------------------
-leak:chi::Chimaera::ServerInit
+leak:chi::Clio::ServerInit
 
 # ---------------------------------------------------------------------------
 # Chi runtime: Task::Serialize pool config string allocations
@@ -159,7 +159,7 @@ leak:chi::LocalLoadTaskArchive::bulk
 # CTE core module: coroutine frame allocation in autogen Run dispatch
 # clio_cte::core::Runtime::Run() is a C++20 coroutine. Each task invocation
 # allocates a coroutine frame (~1640 bytes) at the first co_await. If the
-# chimaera server shuts down while a CTE Run coroutine is suspended
+# clio_run server shuts down while a CTE Run coroutine is suspended
 # (task still in-flight), the frame is never resumed and thus never freed.
 # This is the same architectural shutdown-before-drain pattern as BeginTask;
 # the allocation site lands in the autogen dispatch file, not core_runtime.cc.
@@ -171,9 +171,9 @@ leak:context-transfer-engine/core/src/autogen/core_lib_exec.cc
 # clio_cae::core::Runtime::Init() in context-assimilation-engine/core/src/
 # autogen/core_lib_exec.cc calls DefineModel() (and other Init-time methods)
 # through the Container vtable. When the vtable entry for DefineModel resolves
-# to the copy compiled into libchimaera_bdev_runtime.so (dynamic-linker
+# to the copy compiled into libclio_bdev_runtime.so (dynamic-linker
 # first-wins for weak inline symbols), the frame lacks a source path and
-# leak:chimaera/container.h cannot match it. Suppress by Init call-site: all
+# leak:clio_run/container.h cannot match it. Suppress by Init call-site: all
 # allocations during CAE pool creation are architectural (runtime-lifetime
 # containers not destroyed on server shutdown), identical to the CTE pattern.
 # ---------------------------------------------------------------------------
@@ -221,16 +221,16 @@ leak:chi::IpcManager::RouteGlobal
 # sub-allocations are never freed and appear as indirect leaks reachable only
 # through the abandoned coroutine frame.
 # ---------------------------------------------------------------------------
-leak:chimaera::admin::Runtime::SendIn
+leak:clio_run::admin::Runtime::SendIn
 
 # ---------------------------------------------------------------------------
 # Chi runtime: Container::DefineModel() and SetMethodNames() allocations
 # DefineModel() resizes four std::vector<float> members (method_model_,
 # method_mape_, method_model_wall_, method_mape_wall_) and SetMethodNames()
 # stores a std::vector<std::string>. Both are virtual / non-virtual methods
-# in chimaera/container.h, called during pool Init. When the server shuts
+# in clio_run/container.h, called during pool Init. When the server shuts
 # down without destroying container objects, these vectors are never freed.
 # Suppressed via source-file path because GCC 11 LSAN does not reliably
 # substring-match virtual function names in its suppression engine.
 # ---------------------------------------------------------------------------
-leak:chimaera/container.h
+leak:clio_run/container.h

@@ -31,7 +31,7 @@ vcpkg_cmake_install()
 # Fix CMake config paths
 vcpkg_cmake_config_fixup(PACKAGE_NAME iowarp-core CONFIG_PATH lib/cmake/iowarp-core)
 vcpkg_cmake_config_fixup(PACKAGE_NAME ClioCtp CONFIG_PATH lib/cmake/ClioCtp)
-vcpkg_cmake_config_fixup(PACKAGE_NAME chimaera CONFIG_PATH lib/cmake/chimaera)
+vcpkg_cmake_config_fixup(PACKAGE_NAME clio_run CONFIG_PATH lib/cmake/clio_run)
 vcpkg_cmake_config_fixup(PACKAGE_NAME clio_run_admin CONFIG_PATH lib/cmake/clio_run_admin)
 vcpkg_cmake_config_fixup(PACKAGE_NAME clio_run_bdev CONFIG_PATH lib/cmake/clio_run_bdev)
 

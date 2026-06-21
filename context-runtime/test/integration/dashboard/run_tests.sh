@@ -137,8 +137,8 @@ start_docker_cluster() {
 
     # Auto-detect Docker image: use nvidia image if binary requires CUDA
     if [ -z "${IOWARP_DOCKER_IMAGE:-}" ]; then
-        CLIO_BIN="/workspace/build/bin/chimaera"
-        [ ! -f "$CLIO_BIN" ] && CLIO_BIN="${IOWARP_CORE_ROOT:-/workspace}/build/bin/chimaera"
+        CLIO_BIN="/workspace/build/bin/clio_run"
+        [ ! -f "$CLIO_BIN" ] && CLIO_BIN="${IOWARP_CORE_ROOT:-/workspace}/build/bin/clio_run"
         if [ -f "$CLIO_BIN" ] && ldd "$CLIO_BIN" 2>/dev/null | grep -q "libcudart"; then
             export IOWARP_DOCKER_IMAGE="iowarp/deps-nvidia:latest"
         else

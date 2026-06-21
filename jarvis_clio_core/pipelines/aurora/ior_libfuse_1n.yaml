@@ -4,7 +4,7 @@
 # (this pipeline) is meaningful.
 #
 # Stack:
-#   clio_runtime  -> chimaera daemon
+#   clio_runtime  -> clio_run daemon
 #   clio_cte      -> CTE storage tiers
 #   clio_cte_libfuse -> mounts /home/llogan/libfuse via clio_cte_fuse
 #   builtin.ior  -> POSIX writes through the mountpoint

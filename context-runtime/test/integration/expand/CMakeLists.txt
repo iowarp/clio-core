@@ -17,6 +17,6 @@ set_tests_properties(cr_expand_induction_docker PROPERTIES
     TIMEOUT 600  # 10 minute timeout for Docker-based tests
 )
 
-message(STATUS "Chimaera expand/induction integration test configured")
+message(STATUS "Clio expand/induction integration test configured")
 message(STATUS "  Test directory: ${EXPAND_TEST_DIR}")
 message(STATUS "  Run with: ctest -R cr_expand_induction_docker")

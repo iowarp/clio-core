@@ -74,8 +74,8 @@ jobs:
       shell: bash -el {0}
       run: |
         conda list iowarp
-        test -f "$CONDA_PREFIX/lib/libchimaera_cxx.so"
-        test -f "$CONDA_PREFIX/lib/libchimaera_cxx_gpu.so"
+        test -f "$CONDA_PREFIX/lib/libclio_run_cxx.so"
+        test -f "$CONDA_PREFIX/lib/libclio_run_cxx_gpu.so"
         echo "CUDA conda package installed successfully"
 
     # NOTE: GPU tests are disabled until self-hosted GPU runners are available.
@@ -93,7 +93,7 @@ jobs:
     #   shell: bash -el {0}
     #   working-directory: build
     #   run: |
-    #     ctest -R "test_gpu_runtime|cr_gpu_client_process|cr_gpu_parallelism|cr_gpu_runtime_tests|cr_gpu_task_trace|test_gpu_pod_transfer|chimaera_bdev_gpu_kernel|cr_bdev_gpu" \
+    #     ctest -R "test_gpu_runtime|cr_gpu_client_process|cr_gpu_parallelism|cr_gpu_runtime_tests|cr_gpu_task_trace|test_gpu_pod_transfer|clio_run_bdev_gpu_kernel|cr_bdev_gpu" \
     #       --output-on-failure --timeout 120
     #
     # - name: Run GPU allocator tests

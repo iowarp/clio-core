@@ -27,7 +27,7 @@ endmacro()
 include(CMakeFindDependencyMacro)
 
 # Find required dependencies
-find_dependency(chimaera REQUIRED)
+find_dependency(clio_run REQUIRED)
 find_dependency(clio_cte_core REQUIRED)
 find_dependency(clio_cae_core REQUIRED)
 

@@ -192,7 +192,7 @@ $CONDA_PREFIX/
 │   ├── clio_cae
 │   └── ...
 ├── lib/                           # Shared libraries
-│   ├── libchimaera_cxx.so
+│   ├── libclio_run_cxx.so
 │   ├── libclio_ctp_host.so
 │   ├── clio_admin_runtime.so
 │   └── ...
@@ -200,12 +200,12 @@ $CONDA_PREFIX/
 │   ├── clio_cte/
 │   └── clio_cee/
 ├── include/                       # C++ headers
-│   ├── chimaera/
+│   ├── clio_run/
 │   ├── hshm/
 │   └── ...
 └── lib/cmake/                     # CMake package configs
     ├── iowarp-core/
-    ├── chimaera/
+    ├── clio_run/
     ├── ClioCtp/
     └── ...
 ```

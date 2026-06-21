@@ -4,7 +4,7 @@
 # All kernel launches and device functions live in
 # include/clio_cte/gpu_vector/*.h and are instantiated by the user's
 # CUDA / HIP TU. This INTERFACE library carries the include path and
-# transitive link to the producer-only chimaera GPU stack
+# transitive link to the producer-only clio_run GPU stack
 # (clio_run_cxx + clio_run_cxx_gpu + clio_cte_core_client).
 #-----------------------------------------------------------------------------
 

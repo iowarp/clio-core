@@ -1,4 +1,4 @@
-# Chimaera Configuration for Distributed Testing
+# Clio Configuration for Distributed Testing
 # This configuration is used by the distributed unit test Docker cluster
 
 # Network configuration
@@ -10,7 +10,7 @@ networking:
 # Logging configuration
 logging:
   level: "info"
-  file: "/tmp/chimaera.log"
+  file: "/tmp/clio.log"
 
 # Runtime configuration
 runtime:

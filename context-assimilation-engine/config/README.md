@@ -1,6 +1,6 @@
 # Context Assimilation Engine (CAE) Configuration
 
-This directory contains example configuration files for deploying the Context Assimilation Engine (CAE) using Chimaera compose.
+This directory contains example configuration files for deploying the Context Assimilation Engine (CAE) using Clio compose.
 
 ## Configuration Files
 
@@ -63,7 +63,7 @@ See `clio_config_example.yaml` for a complete configuration showing both ChiMods
 
 | Component | Pool ID | Constant Name | Module Name |
 |-----------|---------|---------------|-------------|
-| Admin     | 1.0     | kAdminPoolId  | chimaera_admin |
+| Admin     | 1.0     | kAdminPoolId  | clio_run_admin |
 | CTE Core  | 512.0   | kCtePoolId    | clio_cte_core |
 | CAE Core  | 400.0   | kCaePoolId    | clio_cae_core |
 

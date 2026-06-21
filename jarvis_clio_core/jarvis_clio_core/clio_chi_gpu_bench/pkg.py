@@ -133,9 +133,9 @@ class ClioChiGpuBench(Application):
         self.log(f"  Total tasks:    {self.config['total_tasks']}")
 
     def _kill_stale_processes(self):
-        """Kill any leftover bench_gpu_runtime or chimaera processes and
+        """Kill any leftover bench_gpu_runtime or clio_run processes and
         free port 9413 so the next run can start cleanly."""
-        for proc_name in ['bench_gpu_runtime', 'chimaera']:
+        for proc_name in ['bench_gpu_runtime', 'clio_run']:
             try:
                 subprocess.run(
                     ['pkill', '-9', '-f', proc_name],

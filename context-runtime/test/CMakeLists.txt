@@ -7,4 +7,4 @@ add_subdirectory(unit)
 # Add integration tests (Docker-based distributed tests)
 add_subdirectory(integration)
 
-message(STATUS "Chimaera tests configured")
+message(STATUS "Clio tests configured")

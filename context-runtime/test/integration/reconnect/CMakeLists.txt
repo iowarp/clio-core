@@ -25,6 +25,6 @@ set_tests_properties(cr_reconnect_integration_docker PROPERTIES
     ENVIRONMENT "NUM_NODES=4;TEST_FILTER=[reconnect]"
 )
 
-message(STATUS "Chimaera reconnect integration test configured")
+message(STATUS "Clio reconnect integration test configured")
 message(STATUS "  Test directory: ${RECONNECT_TEST_DIR}")
 message(STATUS "  Run with: ctest -L integration")

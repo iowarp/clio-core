@@ -1,4 +1,4 @@
-# CAE Chimaera Repository Configuration
+# CAE Clio Repository Configuration
 namespace: clio::cae
 version: 1.0.0
 description: "Content Assimilation Engine (CAE) ChiMod Repository"

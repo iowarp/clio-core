@@ -31,7 +31,7 @@ die()   { echo -e "${RED}[ERR]${NC}  $1" >&2; exit 1; }
 
 # --- Preflight checks -------------------------------------------------------
 
-[ -x "$BUILD_BIN/chimaera" ]      || die "chimaera not found — build with: cmake --preset release-fuse && cmake --build build -j\$(nproc)"
+[ -x "$BUILD_BIN/clio_run" ]      || die "clio_run not found — build with: cmake --preset release-fuse && cmake --build build -j\$(nproc)"
 [ -x "$BUILD_BIN/clio_cte_fuse" ]  || die "clio_cte_fuse not found — build with: cmake --preset release-fuse && cmake --build build -j\$(nproc)"
 [ -f "$SCRIPT_DIR/cte_compose.yaml" ] || die "cte_compose.yaml missing next to cte_config.yaml"
 command -v fusermount3 &>/dev/null || die "fusermount3 not found — install fuse3: sudo apt install fuse3"
@@ -48,7 +48,7 @@ mkdir -p "$PID_DIR" "$MOUNT_POINT"
 
 # --- Start CLIO Runtime runtime -------------------------------------------------
 
-info "Starting Chimaera runtime..."
+info "Starting Clio runtime..."
 export CLIO_SERVER_CONF="$CLIO_SERVER_CONF"
 clio_run runtime start &
 RUNTIME_PID=$!
@@ -56,9 +56,9 @@ echo "$RUNTIME_PID" > "$PID_DIR/runtime.pid"
 sleep 3
 
 if ! kill -0 "$RUNTIME_PID" 2>/dev/null; then
-    die "Chimaera runtime failed to start"
+    die "Clio runtime failed to start"
 fi
-ok "Chimaera runtime started (PID $RUNTIME_PID)"
+ok "Clio runtime started (PID $RUNTIME_PID)"
 
 # --- Compose the CTE pool (separate step, mirrors jarvis clio_cte) -----------
 

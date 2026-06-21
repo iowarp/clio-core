@@ -1,7 +1,7 @@
 # IOR + CTE via POSIX adapter (bare-metal, single node).
 #
 # Layout:
-#   clio_runtime    - starts the chimaera/CTE runtime locally (shm IPC).
+#   clio_runtime    - starts the clio_run/CTE runtime locally (shm IPC).
 #   clio_adapters   - LD_PRELOADs libclio_cte_posix.so into ior; binds via
 #                    the `interceptors: [cte_posix]` reference below.
 #   builtin.ior    - runs ior with the output path prefixed by "clio::"

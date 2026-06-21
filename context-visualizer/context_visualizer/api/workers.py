@@ -2,7 +2,7 @@
 
 from flask import Blueprint, jsonify
 
-from .. import chimaera_client
+from .. import clio_client
 
 bp = Blueprint("workers", __name__)
 
@@ -10,7 +10,7 @@ bp = Blueprint("workers", __name__)
 @bp.route("/workers")
 def get_workers():
     try:
-        raw = chimaera_client.get_worker_stats()
+        raw = clio_client.get_worker_stats()
     except Exception as exc:
         return jsonify({"error": str(exc)}), 503
 

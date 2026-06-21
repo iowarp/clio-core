@@ -30,7 +30,7 @@ if(CLIO_CORE_ENABLE_PYTHON)
   endif()
 endif()
 
-message(STATUS "Found Chimaera framework - building full ChiMod implementation")
+message(STATUS "Found Clio framework - building full ChiMod implementation")
 
 # Ensure CUDA language is enabled in this directory scope so that chimod
 # subdirectories (core, compressor) can use add_cuda_library when

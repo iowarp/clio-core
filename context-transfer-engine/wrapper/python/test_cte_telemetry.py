@@ -101,7 +101,7 @@ def runtime_initialized(cte_module):
 
     # Initialize CLIO Runtime
     try:
-        init_result = cte_module.chimaera_init(cte_module.RuntimeMode.kClient, True)
+        init_result = cte_module.clio_init(cte_module.RuntimeMode.kClient, True)
         if not init_result:
             pytest.skip("Clio initialization failed")
 
@@ -340,7 +340,7 @@ def main():
                 os.environ["LD_LIBRARY_PATH"] = bin_dir
 
         # Initialize runtime
-        if not cte.chimaera_init(cte.RuntimeMode.kClient, True):
+        if not cte.clio_init(cte.RuntimeMode.kClient, True):
             print("❌ Clio initialization failed")
             return 1
 
