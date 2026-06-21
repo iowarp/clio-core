@@ -4303,16 +4303,23 @@ chi::TaskResume Runtime::TagQuery(ctp::ipc::FullPtr<TagQueryTask> task,
     // its own entries when the pattern has no usable trigram). Held under the
     // tag map read lock since the index is mutated under the write lock.
     task->results_.clear();
+    task->result_ids_.clear();
     size_t total = 0;
     {
       chi::ScopedCoRwReadLock lock(tag_map_lock_);
       auto result = tag_search_.Search(tag_regex);
       total = result.size();
-      for (const auto &name : result.keys()) {
+      // Iterate (name, TagId) pairs so each result carries a packed id, used by
+      // the filesystem readdir to assign a stable inode without a second lookup.
+      for (const auto &kv : result) {
         if (task->max_tags_ != 0 && task->results_.size() >= task->max_tags_) {
           break;
         }
-        task->results_.push_back(name);
+        task->results_.push_back(kv.first);
+        const TagId &id = kv.second;
+        task->result_ids_.push_back(
+            (static_cast<chi::u64>(id.major_) << 32) |
+            static_cast<chi::u64>(id.minor_));
       }
     }
 

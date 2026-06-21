@@ -300,6 +300,9 @@ class SystemInfo {
    *  to compile-switch on the library name. POSIX: "libm.so.6";
    *  Windows: "ucrtbase.dll" (UCRT exports the C math entry points). */
   CTP_DLL static std::string GetMathLibraryName();
+
+  /** Get device health statistics via smartctl */
+  CTP_DLL static std::string GetDeviceHealthStats(const std::string &path);
 };
 
 }  // namespace ctp

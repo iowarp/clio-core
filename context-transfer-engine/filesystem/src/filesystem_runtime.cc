@@ -75,6 +75,16 @@ inline std::string EscapeExact(const std::string &s) {
   }
   return out;
 }
+/** Stable inode = packed TagId ((major<<32)|minor). A tag's id is fixed for its
+ *  lifetime and unique, so this is a stable, collision-free inode; hard-link
+ *  aliases share the TagId and thus correctly share an inode. 0 maps to 1 since
+ *  st_ino==0 means "no inode". The CTE core already packs the same way in
+ *  TagQueryTask::result_ids_, so getattr and readdir agree. */
+inline chi::u64 InoFromPacked(chi::u64 packed) { return packed ? packed : 1; }
+inline chi::u64 InoFromTag(const clio::cte::core::TagId &t) {
+  return InoFromPacked((static_cast<chi::u64>(t.major_) << 32) |
+                       static_cast<chi::u64>(t.minor_));
+}
 }  // namespace
 
 chi::TaskResume Runtime::Create(ctp::ipc::FullPtr<CreateTask> task,
@@ -416,6 +426,7 @@ chi::TaskResume Runtime::Getattr(ctp::ipc::FullPtr<GetattrTask> task,
       task->exists_ = 1;
       task->is_dir_ = 0;
       task->size_ = it->second->size_.load();
+      task->ino_ = InoFromTag(it->second->tag_id_);
       task->return_code_ = 0;
       CLIO_CO_RETURN;
     }
@@ -430,6 +441,11 @@ chi::TaskResume Runtime::Getattr(ctp::ipc::FullPtr<GetattrTask> task,
     CLIO_CO_AWAIT(q);
     if (q->GetReturnCode() == 0 && !q->results_.empty()) {
       task->exists_ = 1; task->is_dir_ = 1; task->size_ = 0;
+      // Resolve the directory's own tag to give it a stable inode.
+      auto tag = cte_.AsyncGetOrCreateTag(
+          dir, clio::cte::core::TagId::GetNull(), chi::PoolQuery::Local());
+      CLIO_CO_AWAIT(tag);
+      task->ino_ = InoFromTag(tag->tag_id_);
       task->return_code_ = 0;
       CLIO_CO_RETURN;
     }
@@ -446,6 +462,7 @@ chi::TaskResume Runtime::Getattr(ctp::ipc::FullPtr<GetattrTask> task,
     auto s = cte_.AsyncGetTagSize(tag->tag_id_, chi::PoolQuery::Local());
     CLIO_CO_AWAIT(s);
     task->size_ = (s->GetReturnCode() == 0) ? s->tag_size_ : 0;
+    task->ino_ = InoFromTag(tag->tag_id_);
   } else {
     task->exists_ = 0; task->is_dir_ = 0; task->size_ = 0;
   }
@@ -803,13 +820,19 @@ chi::TaskResume Runtime::Readdir(ctp::ipc::FullPtr<ReaddirTask> task,
   auto q = cte_.AsyncTagQuery(regex, 0, chi::PoolQuery::Local());
   CLIO_CO_AWAIT(q);
   task->entries_ = chi::priv::vector<chi::priv::string>(CTP_MALLOC);
+  task->inos_ = chi::priv::vector<chi::u64>(CTP_MALLOC);
   if (q->GetReturnCode() == 0) {
     const size_t prefix = dir.size();
-    for (auto &name : q->results_) {
+    // q->result_ids_ is index-aligned with q->results_; carry each child's
+    // packed TagId through as its inode so readdir d_ino matches stat st_ino.
+    for (size_t i = 0; i < q->results_.size(); ++i) {
+      const std::string &name = q->results_[i];
       // Hide the internal empty-directory marker.
       std::string base = name.size() > prefix ? name.substr(prefix) : name;
       if (base == kDirMarker) continue;
       task->entries_.push_back(chi::priv::string(CTP_MALLOC, name));
+      chi::u64 packed = i < q->result_ids_.size() ? q->result_ids_[i] : 0;
+      task->inos_.push_back(InoFromPacked(packed));
     }
   }
   task->return_code_ = 0;
