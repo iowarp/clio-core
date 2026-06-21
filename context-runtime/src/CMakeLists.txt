@@ -110,14 +110,14 @@ if(CHIMAERA_GPU_SOURCES)
     # -fsycl, host code uses sycl::malloc_host / sycl::queue / sycl::free
     # as plain runtime API calls. The chimaera_cxx_gpu library compiled by
     # add_sycl_library still gets full -fsycl + device-pass treatment.
-    target_compile_definitions(${CHIMAERA_LIB_NAME} PRIVATE CTP_ENABLE_SYCL=1)
-    if(EXISTS "/opt/intel/dpcpp/include/sycl/sycl.hpp")
-      target_include_directories(${CHIMAERA_LIB_NAME} PRIVATE
-          /opt/intel/dpcpp/include
-          /opt/intel/dpcpp/include/sycl)
-    elseif(EXISTS "/opt/adaptivecpp/include/AdaptiveCpp/sycl/sycl.hpp")
-      target_include_directories(${CHIMAERA_LIB_NAME} PRIVATE
-          /opt/adaptivecpp/include/AdaptiveCpp)
+    # SYCL_DISABLE_FSYCL_SYCLHPP_WARNING silences the "including <sycl/sycl.hpp>
+    # without -fsycl" pragma warning that <sycl/sycl.hpp> emits in host TUs.
+    target_compile_definitions(${CHIMAERA_LIB_NAME} PRIVATE
+        CTP_ENABLE_SYCL=1 SYCL_DISABLE_FSYCL_SYCLHPP_WARNING=1)
+    # CLIO_SYCL_INCLUDE_DIR is discovered in wrp_core_enable_sycl() from the
+    # actual compiler location (works on Aurora oneAPI, not just /opt/intel).
+    if(CLIO_SYCL_INCLUDE_DIR)
+      target_include_directories(${CHIMAERA_LIB_NAME} PRIVATE ${CLIO_SYCL_INCLUDE_DIR})
     endif()
   elseif(CLIO_CORE_ENABLE_ROCM)
     add_rocm_gpu_library(${CHIMAERA_LIB_NAME}_gpu SHARED FALSE ${CHIMAERA_GPU_SOURCES})

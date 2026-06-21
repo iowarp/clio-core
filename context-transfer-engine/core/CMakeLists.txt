@@ -17,14 +17,12 @@ add_clio_module_runtime(
 # see the matching #if CTP_ENABLE_{CUDA,ROCM,SYCL} branches. Without
 # these the GPU code paths in core_runtime.cc are no-ops.
 if(CLIO_CORE_ENABLE_SYCL)
-  target_compile_definitions(clio_cte_core_runtime PRIVATE CTP_ENABLE_SYCL=1)
-  if(EXISTS "/opt/intel/dpcpp/include/sycl/sycl.hpp")
-    target_include_directories(clio_cte_core_runtime PRIVATE
-      /opt/intel/dpcpp/include
-      /opt/intel/dpcpp/include/sycl)
-  elseif(EXISTS "/opt/adaptivecpp/include/AdaptiveCpp/sycl/sycl.hpp")
-    target_include_directories(clio_cte_core_runtime PRIVATE
-      /opt/adaptivecpp/include/AdaptiveCpp)
+  # Host TU: CTP_ENABLE_SYCL=1 without -fsycl. See context-runtime/src for the
+  # rationale; CLIO_SYCL_INCLUDE_DIR is discovered in wrp_core_enable_sycl().
+  target_compile_definitions(clio_cte_core_runtime PRIVATE
+    CTP_ENABLE_SYCL=1 SYCL_DISABLE_FSYCL_SYCLHPP_WARNING=1)
+  if(CLIO_SYCL_INCLUDE_DIR)
+    target_include_directories(clio_cte_core_runtime PRIVATE ${CLIO_SYCL_INCLUDE_DIR})
   endif()
 endif()
 if(CLIO_CORE_ENABLE_CUDA)
