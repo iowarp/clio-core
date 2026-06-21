@@ -114,7 +114,7 @@ void CLIO_RUNTIME_FINALIZE();
 }  // namespace clio::run
 
 //==============================================================================
-// CLIO_* runtime API surface (rebranding: chimaera -> clio_runtime).
+// CLIO_* runtime API surface (rebranding: clio -> clio_runtime).
 //
 // All CLIO_* singleton / class-body / allocator macros are now defined at
 // their canonical site in the individual subsystem headers (admin.h,

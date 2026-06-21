@@ -44,7 +44,7 @@
  * - Tests offset + size combinations
  *
  * Environment Variables:
- * - INIT_CHIMAERA: If set to "1", initializes CLIO Runtime runtime
+ * - INIT_CLIO: If set to "1", initializes CLIO Runtime runtime
  */
 
 #include <iostream>

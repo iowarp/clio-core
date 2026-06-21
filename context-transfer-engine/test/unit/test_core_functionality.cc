@@ -49,7 +49,7 @@
  * 5. Test the complete end-to-end workflow with real API calls
  *
  * Following CLAUDE.md requirements:
- * - Use proper runtime initialization (CHIMAERA_RUNTIME_INIT if needed)
+ * - Use proper runtime initialization (CLIO_INIT if needed)
  * - Use clio::run::kAdminPoolId for CreateTask operations
  * - Use semantic names for QueueIds and priorities
  * - Never use null pool queries - always use Local()
@@ -212,7 +212,7 @@ class CTECoreFunctionalTestFixture {
   /**
    * Initialize CLIO Runtime runtime following the module test guide pattern
    * This sets up the shared memory infrastructure needed for real API calls
-   * Note: The CHIMAERA_RUNTIME_INIT macro has internal state tracking
+   * Note: The CLIO_INIT macro has internal state tracking
    */
 
   /**
@@ -1790,7 +1790,7 @@ TEST_CASE("FUNCTIONAL - PutBlob-GetBlob Integration Cycles",
  * - GetBlob should use the blob ID returned from PutBlob
  * - GetBlob should NOT specify blob name (use empty string)
  * - GetBlob should retrieve the same data that was stored
- * - Test should FAIL if chimaera runtime is not properly initialized
+ * - Test should FAIL if clio runtime is not properly initialized
  * - Test should FAIL if data doesn't match exactly
  */
 TEST_CASE("FUNCTIONAL - PutBlob-GetBlob Comprehensive Integration",

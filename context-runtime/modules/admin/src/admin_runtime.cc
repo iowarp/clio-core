@@ -1039,7 +1039,7 @@ clio::run::TaskResume Runtime::MonitorBdevStats(ctp::ipc::FullPtr<MonitorTask> t
   std::vector<clio::run::PoolId> bdev_pools;
   for (const auto &pid : all_pool_ids) {
     const auto *info = pool_manager->GetPoolInfo(pid);
-    if (info && (info->chimod_name_ == "clio_bdev" || info->chimod_name_ == "chimaera_bdev")) {
+    if (info && (info->chimod_name_ == "clio_bdev" || info->chimod_name_ == "clio_bdev")) {
       bdev_pools.push_back(pid);
     }
   }

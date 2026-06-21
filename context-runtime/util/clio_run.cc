@@ -7,7 +7,7 @@
 namespace {
 // Program name to display in usage messages: derived from argv[0]'s basename
 // so the symlink invocation `clio_run` prints "Usage: clio_run ..." while
-// the legacy `chimaera` invocation keeps the historical text. Set by main().
+// the legacy `clio` invocation keeps the historical text. Set by main().
 const char* g_progname = "clio_run";
 
 void PrintUsage() {
@@ -34,7 +34,7 @@ void PrintUsage() {
 
 int main(int argc, char* argv[]) {
   // Set the displayed program name from argv[0]'s basename so usage messages
-  // match whichever symlink (clio_run or chimaera) the user invoked.
+  // match whichever symlink (clio_run or clio) the user invoked.
   if (argc > 0 && argv[0] != nullptr && argv[0][0] != '\0') {
     const char* base = std::strrchr(argv[0], '/');
     g_progname = base ? base + 1 : argv[0];

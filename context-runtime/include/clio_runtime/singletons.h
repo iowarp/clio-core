@@ -68,12 +68,12 @@
 
 // All macros are defined in their respective header files:
 // - CLIO_RUNTIME_MANAGER defined in clio_runtime/manager.h
-// - CLIO_CONFIG_MANAGER defined in chimaera/config_manager.h
-// - CLIO_IPC defined in chimaera/ipc_manager.h
-// - CLIO_POOL_MANAGER defined in chimaera/pool_manager.h
-// - CLIO_MODULE_MANAGER defined in chimaera/module_manager.h
-// - CLIO_WORK_ORCHESTRATOR defined in chimaera/work_orchestrator.h
-// - CLIO_ADMIN defined in chimaera/admin.h
+// - CLIO_CONFIG_MANAGER defined in clio/config_manager.h
+// - CLIO_IPC defined in clio/ipc_manager.h
+// - CLIO_POOL_MANAGER defined in clio/pool_manager.h
+// - CLIO_MODULE_MANAGER defined in clio/module_manager.h
+// - CLIO_WORK_ORCHESTRATOR defined in clio/work_orchestrator.h
+// - CLIO_ADMIN defined in clio/admin.h
 
 /**
  * Example usage:

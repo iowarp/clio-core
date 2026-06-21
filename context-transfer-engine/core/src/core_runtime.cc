@@ -1091,7 +1091,7 @@ clio::run::TaskResume Runtime::PutBlob(ctp::ipc::FullPtr<PutBlobTask> task,
   // (client newtask) + (ipc send) + (cross-node serialize+wire+
   // deserialize, if remote) + (lane queue wait) + (worker dispatch)
   // — i.e. everything between when the rank issued the put and when
-  // chimaera actually started executing it. Dumped sparsely to keep
+  // clio actually started executing it. Dumped sparsely to keep
   // log volume sane; the per-task ns are kInfo at 1 in 64 and the
   // running aggregate is kInfo every kPutLatDumpPeriod tasks.
   {

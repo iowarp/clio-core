@@ -1271,7 +1271,7 @@ void run_bdev_file_explicit_backend_test(const char *mode_name) {
   std::this_thread::sleep_for(100ms);
 
   // Create bdev client with explicit file backend.
-  // Pool ID is process-unique: the chimaera runtime daemon outlives a
+  // Pool ID is process-unique: the clio runtime daemon outlives a
   // single clio_run_bdev_chimod_tests invocation (the distributed test
   // runner does `docker exec` three times for shm/tcp/ipc against the
   // same daemon), and a hardcoded pool ID would let the second test

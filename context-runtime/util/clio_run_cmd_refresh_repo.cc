@@ -32,17 +32,17 @@
  */
 
 /**
- * chimaera repo refresh - ChiMod Autogeneration Utility
+ * clio repo refresh - ChiMod Autogeneration Utility
  *
  * This utility automatically generates libexec source files (.cc) and methods
- * header files (.h) for ChiMods based on their chimaera_mod.yaml configuration files.
+ * header files (.h) for ChiMods based on their clio_mod.yaml configuration files.
  *
  * The libexec source files implement Container virtual API methods (Run, Del,
  * SaveTask, LoadTask, AllocLoadTask, LocalLoadTask, LocalAllocLoadTask,
  * NewCopy, AggregateOut, AggregateIn) with switch-case dispatch.
  *
  * Usage:
- *     chimaera repo refresh <chimod_repo_path>
+ *     clio repo refresh <chimod_repo_path>
  */
 
 #include <algorithm>
@@ -84,14 +84,14 @@ class ChiModGenerator {
  public:
   explicit ChiModGenerator(const std::string& repo_path)
       : repo_path_(fs::absolute(repo_path)),
-        repo_yaml_path_(repo_path_ / "chimaera_repo.yaml") {
+        repo_yaml_path_(repo_path_ / "clio_repo.yaml") {
     if (!fs::exists(repo_yaml_path_)) {
       throw std::runtime_error("Repository YAML not found: " + repo_yaml_path_.string());
     }
 
-    // Load repository namespace from chimaera_repo.yaml
+    // Load repository namespace from clio_repo.yaml
     YAML::Node repo_config = LoadRepoConfig();
-    repo_namespace_ = repo_config["namespace"] ? repo_config["namespace"].as<std::string>() : "chimaera";
+    repo_namespace_ = repo_config["namespace"] ? repo_config["namespace"].as<std::string>() : "clio";
   }
 
   /**
@@ -109,7 +109,7 @@ class ChiModGenerator {
    * Load a specific ChiMod configuration
    */
   YAML::Node LoadChiModConfig(const std::string& chimod_name) {
-    fs::path chimod_yaml_path = repo_path_ / chimod_name / "chimaera_mod.yaml";
+    fs::path chimod_yaml_path = repo_path_ / chimod_name / "clio_mod.yaml";
     if (!fs::exists(chimod_yaml_path)) {
       throw std::runtime_error("ChiMod YAML not found: " + chimod_yaml_path.string());
     }
@@ -699,13 +699,13 @@ static void PrintRefreshRepoUsage(const char* program_name) {
 /**
  * Entry point for the repo refresh subcommand
  *
- * @param argc Argument count (after stripping "chimaera repo refresh")
+ * @param argc Argument count (after stripping "clio repo refresh")
  * @param argv Argument values
  * @return 0 on success, 1 on failure
  */
 int RefreshRepo(int argc, char** argv) {
   if (argc != 1) {
-    PrintRefreshRepoUsage("chimaera repo refresh");
+    PrintRefreshRepoUsage("clio repo refresh");
     return 1;
   }
 

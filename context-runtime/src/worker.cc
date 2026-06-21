@@ -47,7 +47,7 @@
 #include <iostream>
 #include <unordered_set>
 
-// Include task_queue.h before other chimaera headers to ensure proper
+// Include task_queue.h before other clio headers to ensure proper
 // resolution
 #include "clio_runtime/admin/admin_client.h"
 #include "clio_runtime/container.h"

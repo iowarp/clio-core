@@ -211,7 +211,7 @@ TEST_CASE("RefreshRepo - usage and bad repo path", "[cli][refresh_repo]") {
   SECTION("nonexistent repository path fails");
   REQUIRE(CallRefreshRepo({"/nonexistent/clio_cli_test_repo"}) == 1);
 
-  SECTION("directory without chimaera_repo.yaml fails");
+  SECTION("directory without clio_repo.yaml fails");
   TempDir tmp;
   REQUIRE(CallRefreshRepo({tmp.path.string()}) == 1);
 }
@@ -220,21 +220,21 @@ TEST_CASE("RefreshRepo - malformed repository yaml", "[cli][refresh_repo]") {
   SECTION("unparsable repo yaml fails");
   {
     TempDir tmp;
-    WriteFile(tmp.path / "chimaera_repo.yaml", "modules: [unclosed\n  - bad\n");
+    WriteFile(tmp.path / "clio_repo.yaml", "modules: [unclosed\n  - bad\n");
     REQUIRE(CallRefreshRepo({tmp.path.string()}) == 1);
   }
 
   SECTION("repo yaml without modules key fails");
   {
     TempDir tmp;
-    WriteFile(tmp.path / "chimaera_repo.yaml", "namespace: foo\nname: x\n");
+    WriteFile(tmp.path / "clio_repo.yaml", "namespace: foo\nname: x\n");
     REQUIRE(CallRefreshRepo({tmp.path.string()}) == 1);
   }
 
   SECTION("repo yaml with non-sequence modules fails");
   {
     TempDir tmp;
-    WriteFile(tmp.path / "chimaera_repo.yaml", "modules: 5\n");
+    WriteFile(tmp.path / "clio_repo.yaml", "modules: 5\n");
     REQUIRE(CallRefreshRepo({tmp.path.string()}) == 1);
   }
 }
@@ -244,15 +244,15 @@ TEST_CASE("RefreshRepo - generates methods header and lib_exec source",
   TempDir tmp;
   // Repo with one full module plus a missing module dir and a module with
   // malformed yaml — the latter two must produce warnings, not failures.
-  WriteFile(tmp.path / "chimaera_repo.yaml",
+  WriteFile(tmp.path / "clio_repo.yaml",
             "name: testrepo\n"
             "namespace: test::ns\n"
             "modules:\n"
             "  - alpha\n"
             "  - missing_mod\n"
             "  - badmod\n");
-  WriteFile(tmp.path / "alpha" / "chimaera_mod.yaml", kAlphaModYaml);
-  WriteFile(tmp.path / "badmod" / "chimaera_mod.yaml",
+  WriteFile(tmp.path / "alpha" / "clio_mod.yaml", kAlphaModYaml);
+  WriteFile(tmp.path / "badmod" / "clio_mod.yaml",
             "module_name: [unterminated\n  : :\n");
 
   REQUIRE(CallRefreshRepo({tmp.path.string()}) == 0);
@@ -337,16 +337,16 @@ TEST_CASE("RefreshRepo - generates methods header and lib_exec source",
 TEST_CASE("RefreshRepo - default namespace and module with no methods",
           "[cli][refresh_repo]") {
   TempDir tmp;
-  // No namespace key -> defaults to "chimaera"; module yaml with no method
+  // No namespace key -> defaults to "clio"; module yaml with no method
   // keys and no module_name -> empty method table, kMaxMethodId = 0.
-  WriteFile(tmp.path / "chimaera_repo.yaml",
+  WriteFile(tmp.path / "clio_repo.yaml",
             "modules:\n"
             "  - beta\n");
-  WriteFile(tmp.path / "beta" / "chimaera_mod.yaml", "version: 1.0.0\n");
+  WriteFile(tmp.path / "beta" / "clio_mod.yaml", "version: 1.0.0\n");
 
   REQUIRE(CallRefreshRepo({tmp.path.string()}) == 0);
 
-  fs::path header = tmp.path / "beta" / "include" / "chimaera" / "beta" /
+  fs::path header = tmp.path / "beta" / "include" / "clio" / "beta" /
                     "autogen" / "beta_methods.h";
   fs::path source = tmp.path / "beta" / "src" / "autogen" / "beta_lib_exec.cc";
   REQUIRE(fs::exists(header));
@@ -371,14 +371,14 @@ TEST_CASE("RefreshRepo - unwritable output directory fails",
   }
 
   TempDir tmp;
-  WriteFile(tmp.path / "chimaera_repo.yaml", "modules:\n  - gamma\n");
-  WriteFile(tmp.path / "gamma" / "chimaera_mod.yaml",
+  WriteFile(tmp.path / "clio_repo.yaml", "modules:\n  - gamma\n");
+  WriteFile(tmp.path / "gamma" / "clio_mod.yaml",
             "module_name: gamma\nkCreate: 0\n");
 
   // Pre-create the methods-header autogen dir read-only so the ofstream
   // open fails and GenerateChiModFiles throws.
   fs::path autogen_dir =
-      tmp.path / "gamma" / "include" / "chimaera" / "gamma" / "autogen";
+      tmp.path / "gamma" / "include" / "clio" / "gamma" / "autogen";
   fs::create_directories(autogen_dir);
   fs::permissions(autogen_dir,
                   fs::perms::owner_read | fs::perms::owner_exec,

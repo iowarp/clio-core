@@ -46,7 +46,7 @@
  * (< 16 KB threshold) and forces multiple RepopulateSmallArena() calls.
  *
  * Stack-size requirement (measured with ptxas -v):
- *   When BuddyAllocator is inlined into the chimaera_gpu_orchestrator kernel
+ *   When BuddyAllocator is inlined into the clio_gpu_orchestrator kernel
  *   it adds 80 B to the stack frame (752 B vs 672 B for ArenaAllocator),
  *   well within the 4 096 B limit used by the orchestrator.  In isolation
  *   (this test) the kernel compiles to 0 bytes stack frame — everything fits

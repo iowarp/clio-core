@@ -235,7 +235,7 @@ class IpcManager {
    * Resolve an AllocatorId to its registered ClientBackend record.
    * Used by IpcManager::ToFullPtr when a CPU SHM allocator lookup
    * misses, so this must be inline (header-only) — callers like
-   * chimaera_commands link without libchimaera_cxx_gpu.
+   * clio_commands link without libclio_run_cxx_gpu.
    * Returns nullptr if unknown.
    */
   inline const ClientBackend *FindClientBackend(

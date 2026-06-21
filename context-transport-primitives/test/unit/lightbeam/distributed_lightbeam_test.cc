@@ -256,7 +256,7 @@ int main(int argc, char** argv) {
   std::string actual_addr = server_ptr->GetAddress();
   std::cout << "[Rank " << my_rank << "] Server address: " << actual_addr
             << ", port: " << my_port << std::endl;
-  // Match chimaera's PeerRecvThread polling cadence: chimaera sleeps 1 µs
+  // Match clio's PeerRecvThread polling cadence: clio sleeps 1 µs
   // on EAGAIN (busy-poll with backoff), not 1 ms. Env LBM_BENCH_EAGAIN_US
   // overrides for diagnostics.
   long eagain_us = 1;
@@ -274,7 +274,7 @@ int main(int argc, char** argv) {
 
   // LBM_BENCH_SKIP_SELF=1: each rank skips its self-send. Useful for
   // thallium where RPC-to-self via the same engine can deadlock under
-  // certain argobots configurations; this matches chimaera's actual
+  // certain argobots configurations; this matches clio's actual
   // usage (self fan-out goes via local lanes, not the transport).
   bool skip_self = []() {
     const char *v = std::getenv("LBM_BENCH_SKIP_SELF");
@@ -298,7 +298,7 @@ int main(int argc, char** argv) {
       auto recv_time = std::chrono::high_resolution_clock::now();
 
       // Recv with retry loop (does everything - metadata + bulks). Match
-      // chimaera: 1 µs sleep_for on EAGAIN.
+      // clio: 1 µs sleep_for on EAGAIN.
       LbmMeta<> meta;
       int rc;
       while (true) {

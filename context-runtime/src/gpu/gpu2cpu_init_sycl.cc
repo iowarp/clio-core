@@ -32,7 +32,7 @@
 namespace clio::run {
 
 namespace {
-class chimaera_sycl_init_queue_kernel;
+class clio_sycl_init_queue_kernel;
 }
 
 #if CTP_IS_HOST
@@ -77,7 +77,7 @@ bool gpu::IpcManager::ServerInitGpuQueues(u32 queue_depth) {
     char *queue_backend_ptr = dev.queue_backend;
     size_t queue_backend_size = kQueueBackendBytes;
     q.submit([&](sycl::handler &cgh) {
-      cgh.single_task<chimaera_sycl_init_queue_kernel>([=]() {
+      cgh.single_task<clio_sycl_init_queue_kernel>([=]() {
         ctp::ipc::MemoryBackend proxy;
         proxy.data_ = queue_backend_ptr;
         proxy.data_capacity_ = queue_backend_size;

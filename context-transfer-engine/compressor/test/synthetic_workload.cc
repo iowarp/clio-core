@@ -265,7 +265,7 @@ int main(int argc, char** argv) {
   // Initialize CTE client (assumes CLIO Runtime runtime is already running)
   if (!clio::cte::core::CLIO_CTE_CLIENT_INIT("", clio::run::PoolQuery::Local())) {
     if (rank == 0) {
-      HLOG(kError, "Failed to initialize CTE client. Make sure chimaera runtime is started.");
+      HLOG(kError, "Failed to initialize CTE client. Make sure clio runtime is started.");
     }
     MPI_Finalize();
     return 1;

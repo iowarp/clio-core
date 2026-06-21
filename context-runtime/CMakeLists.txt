@@ -192,7 +192,7 @@ install(DIRECTORY include/clio_runtime
 
 # Install config files
 install(DIRECTORY config/
-  DESTINATION etc/chimaera
+  DESTINATION etc/clio
   FILES_MATCHING PATTERN "*"
 )
 
@@ -221,7 +221,7 @@ install(CODE "
   # During CPack packaging, CMAKE_INSTALL_PREFIX points to /usr (or similar)
   # but files are actually staged under DESTDIR. If the source yaml does not
   # exist at the bare prefix path, this is a packaging install — skip seeding.
-  set(_DEFAULT_SRC \"\${CMAKE_INSTALL_PREFIX}/etc/chimaera/clio_default.yaml\")
+  set(_DEFAULT_SRC \"\${CMAKE_INSTALL_PREFIX}/etc/clio/clio_default.yaml\")
   if(NOT EXISTS \"\${_DEFAULT_SRC}\")
     message(STATUS \"Skipping user config seed (packaging install): \${_DEFAULT_SRC} not present\")
     return()

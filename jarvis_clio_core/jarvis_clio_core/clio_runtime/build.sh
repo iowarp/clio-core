@@ -139,5 +139,5 @@ ldconfig
 # ~/.clio/clio.yaml is the canonical user-config location the runtime
 # checks first; Dockerfile.deploy COPYs this dir from the builder.
 mkdir -p /root/.clio
-cp /opt/iowarp/context-runtime/config/chimaera_default.yaml \
+cp /opt/iowarp/context-runtime/config/clio_default.yaml \
    /root/.clio/clio.yaml

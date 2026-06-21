@@ -2,7 +2,7 @@
  * Container virtual API dispatch for the filesystem ChiMod (Run / Save / Load /
  * NewTask / Aggregate / DelTask), switch-case over Method ids. Hand-maintained
  * to match clio_mod.yaml + filesystem_methods.h (mirrors compressor's
- * autogen/compressor_lib_exec.cc — no chimaera_repo.yaml in-tree).
+ * autogen/compressor_lib_exec.cc — no clio_repo.yaml in-tree).
  */
 #include "clio_cte/filesystem/filesystem_runtime.h"
 #include "clio_cte/filesystem/autogen/filesystem_methods.h"

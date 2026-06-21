@@ -112,16 +112,16 @@ std::string ConfigManager::GetServerConfigPath() const {
 
   // Fall back to a per-user config file. Lookup order, first hit wins:
   //   1. ~/.clio/clio.yaml      (new canonical name)
-  //   2. ~/.clio/chimaera.yaml  (legacy filename in the new dir)
-  //   3. ~/.chimaera/clio.yaml  (new filename in the legacy dir)
-  //   4. ~/.chimaera/chimaera.yaml  (legacy)
-  // All four are supported; installers seed both ~/.clio/ AND ~/.chimaera/
+  //   2. ~/.clio/clio.yaml  (legacy filename in the new dir)
+  //   3. ~/.clio/clio.yaml  (new filename in the legacy dir)
+  //   4. ~/.clio/clio.yaml  (legacy)
+  // All four are supported; installers seed both ~/.clio/ AND ~/.clio/
   // with identical content so either layout works in the wild.
   const char *kCandidates[] = {
       "${HOME}/.clio/clio.yaml",
-      "${HOME}/.clio/chimaera.yaml",
-      "${HOME}/.chimaera/clio.yaml",
-      "${HOME}/.chimaera/chimaera.yaml",
+      "${HOME}/.clio/clio.yaml",
+      "${HOME}/.clio/clio.yaml",
+      "${HOME}/.clio/clio.yaml",
   };
   for (const char *tmpl : kCandidates) {
     std::string path = ctp::ConfigParse::ExpandPath(tmpl);

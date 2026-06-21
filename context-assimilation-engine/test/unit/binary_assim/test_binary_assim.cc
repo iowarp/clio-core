@@ -48,7 +48,7 @@
  * - Tests chunking behavior for files > 1MB
  *
  * Environment Variables:
- * - INIT_CHIMAERA: If set to "1", initializes CLIO Runtime runtime
+ * - INIT_CLIO: If set to "1", initializes CLIO Runtime runtime
  * - TEST_FILE_SIZE: Override default 256MB test file size (in MB)
  */
 

@@ -52,7 +52,7 @@
  * @param mode RuntimeMode integer (0 = kClient)
  * @return true if initialization succeeded
  */
-inline bool py_chimaera_init(int mode) {
+inline bool py_clio_init(int mode) {
   bool result = false;
   std::thread([&result, mode]() {
     result = clio::run::CLIO_INIT(
@@ -66,7 +66,7 @@ inline bool py_chimaera_init(int mode) {
  *
  * Closes ZMQ sockets and joins background threads.
  */
-inline void py_chimaera_finalize() {
+inline void py_clio_finalize() {
   clio::run::CLIO_RUNTIME_FINALIZE();
 }
 

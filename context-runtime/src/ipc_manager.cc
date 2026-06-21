@@ -105,11 +105,11 @@ inline bool UseLocalZmqIpc() {
 }
 
 // Unix-domain socket path for the local ZMQ ROUTER/DEALER. Distinct from the
-// non-ZMQ SocketTransport endpoint (chimaera_<port>.ipc) so the two local
+// non-ZMQ SocketTransport endpoint (clio_<port>.ipc) so the two local
 // servers never collide.
 inline std::string LocalZmqIpcPath(u32 port) {
   return ctp::SystemInfo::GetMemfdPath(
-      "chimaera_zmq_" + std::to_string(port + 3) + ".ipc");
+      "clio_zmq_" + std::to_string(port + 3) + ".ipc");
 }
 
 }  // namespace
@@ -191,7 +191,7 @@ bool IpcManager::ClientInit() {
       // shared-memory data path and the mode assertions still hold.
       ctp::SystemInfo::EnsureMemfdDir();
       std::string ipc_path =
-          ctp::SystemInfo::GetMemfdPath("chimaera_" + std::to_string(port) + ".ipc");
+          ctp::SystemInfo::GetMemfdPath("clio_" + std::to_string(port) + ".ipc");
       try {
         zmq_transport_ = ctp::lbm::TransportFactory::Get(
             ipc_path, ctp::lbm::TransportType::kSocket,
@@ -366,7 +366,7 @@ bool IpcManager::ServerInit() {
   }
 #elif CTP_ENABLE_SYCL
   // SYCL backend: same shape as the CUDA/HIP path above. Bootstrap
-  // helper lives in chimaera_cxx_gpu (gpu2cpu_init_sycl.cc) — call
+  // helper lives in clio_run_cxx_gpu (gpu2cpu_init_sycl.cc) — call
   // into it via a free function with normal linkage; both libraries
   // see the same IpcManager layout because CTP_ENABLE_SYCL=1 is set
   // on both.
@@ -446,7 +446,7 @@ bool IpcManager::ServerInit() {
       // not created by default, so binding the socket would otherwise fail.
       ctp::SystemInfo::EnsureMemfdDir();
       std::string ipc_path =
-          ctp::SystemInfo::GetMemfdPath("chimaera_" + std::to_string(port) + ".ipc");
+          ctp::SystemInfo::GetMemfdPath("clio_" + std::to_string(port) + ".ipc");
       client_ipc_transport_ = ctp::lbm::TransportFactory::Get(
           ipc_path, ctp::lbm::TransportType::kSocket,
           ctp::lbm::TransportMode::kServer, "ipc", 0);
@@ -855,7 +855,7 @@ bool IpcManager::WaitForLocalServer() {
     return false;
   }
 
-  // At scale (>=64 chimaera daemons) the daemon's local 9416 ROUTER's I/O
+  // At scale (>=64 clio daemons) the daemon's local 9416 ROUTER's I/O
   // thread is starved by initial cross-node SWIM probes when this DEALER
   // first connects, the ZMTP greeting EPIPE's, and the DEALER ends up in
   // a half-open state ZMQ's auto-reconnect cannot recover from. Sending a
@@ -913,7 +913,7 @@ retry_attempt:
           // SocketTransport (not ZMQ), so recreate it the same way (issue #482).
           ctp::SystemInfo::EnsureMemfdDir();
           std::string ipc_path = ctp::SystemInfo::GetMemfdPath(
-              "chimaera_" + std::to_string(port) + ".ipc");
+              "clio_" + std::to_string(port) + ".ipc");
           zmq_transport_ = ctp::lbm::TransportFactory::Get(
               ipc_path, ctp::lbm::TransportType::kSocket,
               ctp::lbm::TransportMode::kClient, "ipc", 0);
@@ -1412,10 +1412,10 @@ bool IpcManager::IdentifyThisHost() {
   HLOG(kError, "           sudo lsof -nP -iTCP:{} | grep LISTEN", port);
   HLOG(kError, "");
   HLOG(kError, "To stop the Clio runtime, run:");
-  HLOG(kError, "  chimaera runtime stop");
+  HLOG(kError, "  clio runtime stop");
   HLOG(kError, "");
   HLOG(kError, "Or kill the process directly:");
-  HLOG(kError, "  pkill -9 chimaera");
+  HLOG(kError, "  pkill -9 clio");
   HLOG(kFatal, "  kill -9 <PID>");
   return false;
 }
@@ -1755,9 +1755,9 @@ bool IpcManager::IncreaseClientShm(size_t size) {
   int pid = ctp::SystemInfo::GetPid();
   u32 index = shm_count_.fetch_add(1, std::memory_order_relaxed);
 
-  // Create shared memory name: chimaera_{pid}_{index}
+  // Create shared memory name: clio_{pid}_{index}
   std::string shm_name =
-      "chimaera_" + std::to_string(pid) + "_" + std::to_string(index);
+      "clio_" + std::to_string(pid) + "_" + std::to_string(index);
 
   // Add 32MB metadata overhead
   size_t total_size = size + kShmMetadataOverhead;
@@ -1840,11 +1840,11 @@ bool IpcManager::RegisterMemory(const ctp::ipc::AllocatorId &alloc_id) {
   // Acquire writer lock on allocator_map_lock_ during memory registration
   allocator_map_lock_.WriteLock();
 
-  // Derive shm_name from alloc_id: chimaera_{pid}_{index}
+  // Derive shm_name from alloc_id: clio_{pid}_{index}
   int owner_pid = static_cast<int>(alloc_id.major_);
   u32 shm_index = alloc_id.minor_;
   std::string shm_name =
-      "chimaera_" + std::to_string(owner_pid) + "_" + std::to_string(shm_index);
+      "clio_" + std::to_string(owner_pid) + "_" + std::to_string(shm_index);
 
   HLOG(kInfo, "IpcManager::RegisterMemory: Registering {} from pid {}",
        shm_name, owner_pid);
@@ -1914,7 +1914,7 @@ ClientShmInfo IpcManager::GetClientShmInfo(u32 index) const {
 
   int pid = ctp::SystemInfo::GetPid();
   std::string shm_name =
-      "chimaera_" + std::to_string(pid) + "_" + std::to_string(index);
+      "clio_" + std::to_string(pid) + "_" + std::to_string(index);
 
   ctp::ipc::MultiProcessAllocator *allocator = alloc_vector_[index];
   ctp::ipc::AllocatorId alloc_id = allocator->GetId();
@@ -1981,7 +1981,7 @@ size_t IpcManager::WreapDeadIpcs() {
 
     // Get the allocator ID to construct shm_name
     ctp::ipc::AllocatorId alloc_id = allocator->GetId();
-    std::string shm_name = "chimaera_" + std::to_string(alloc_id.major_) + "_" +
+    std::string shm_name = "clio_" + std::to_string(alloc_id.major_) + "_" +
                            std::to_string(alloc_id.minor_);
 
     // Find and destroy the corresponding backend
@@ -2066,7 +2066,7 @@ size_t IpcManager::WreapAllIpcs() {
 
     // Get the allocator ID to construct shm_name
     ctp::ipc::AllocatorId alloc_id = allocator->GetId();
-    std::string shm_name = "chimaera_" + std::to_string(alloc_id.major_) + "_" +
+    std::string shm_name = "clio_" + std::to_string(alloc_id.major_) + "_" +
                            std::to_string(alloc_id.minor_);
 
     // Find and destroy the corresponding backend
@@ -2237,7 +2237,7 @@ bool IpcManager::ReconnectToOriginalHost() {
         // SocketTransport against the restarted daemon's IPC endpoint.
         ctp::SystemInfo::EnsureMemfdDir();
         std::string ipc_path = ctp::SystemInfo::GetMemfdPath(
-            "chimaera_" + std::to_string(port) + ".ipc");
+            "clio_" + std::to_string(port) + ".ipc");
         zmq_transport_ = ctp::lbm::TransportFactory::Get(
             ipc_path, ctp::lbm::TransportType::kSocket,
             ctp::lbm::TransportMode::kClient, "ipc", 0);

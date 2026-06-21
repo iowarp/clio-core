@@ -84,8 +84,8 @@ TEST_CASE("Cleanup - Server Finalization", "[cleanup][ipc]") {
   u64 node_id = ipc->GetNodeId();
   (void)node_id;
 
-  auto *chimaera = CLIO_RUNTIME_MANAGER;
-  chimaera->ServerFinalize();
+  auto *clio = CLIO_RUNTIME_MANAGER;
+  clio->ServerFinalize();
 
   REQUIRE(!ipc->IsInitialized());
 }
@@ -119,8 +119,8 @@ TEST_CASE("Cleanup - Client Finalization", "[cleanup][ipc]") {
   REQUIRE(ipc->IsInitialized());
 
   // Explicitly call ClientFinalize through CLIO Runtime API
-  auto *chimaera = CLIO_RUNTIME_MANAGER;
-  chimaera->ClientFinalize();
+  auto *clio = CLIO_RUNTIME_MANAGER;
+  clio->ClientFinalize();
 
   // Note: After ClientFinalize(), IPC shared resources remain active
   // (servers, shm, etc.) so IsInitialized() is still true.
@@ -148,8 +148,8 @@ TEST_CASE("Cleanup - Repeated Init/Finalize", "[cleanup][ipc]") {
     REQUIRE(ipc->IsInitialized());
 
     // Finalize using CLIO Runtime API
-    auto *chimaera = CLIO_RUNTIME_MANAGER;
-    chimaera->ServerFinalize();
+    auto *clio = CLIO_RUNTIME_MANAGER;
+    clio->ServerFinalize();
     REQUIRE(!ipc->IsInitialized());
 
     // Small delay between cycles

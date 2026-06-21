@@ -153,7 +153,7 @@ void gpu::IpcManager::UnregisterClientBackend(
 }
 
 // FindClientBackend is now inline in gpu_ipc_manager.h so it's
-// available without linking libchimaera_cxx_gpu (used by ToFullPtr).
+// available without linking libclio_run_cxx_gpu (used by ToFullPtr).
 
 CLIO_RUN_GPU_API bool ChiServerBootstrapHipGpu(IpcManager *self,
                                                clio::run::u32 queue_depth,

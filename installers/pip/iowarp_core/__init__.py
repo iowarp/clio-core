@@ -112,7 +112,7 @@ def _setup():
     # ~/.chimaera/chimaera.yaml is still honored at read time as a
     # fallback for users with pre-existing configs, but we no longer
     # seed it on install.
-    _bundled_default = os.path.join(_DATA_DIR, "chimaera_default.yaml")
+    _bundled_default = os.path.join(_DATA_DIR, "clio_default.yaml")
     if os.path.exists(_bundled_default):
         _user_conf_dir = os.path.expanduser("~/.clio")
         _user_conf = os.path.join(_user_conf_dir, "clio.yaml")

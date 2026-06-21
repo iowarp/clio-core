@@ -125,7 +125,7 @@ class ExportDataFixture {
 
   /**
    * Put a blob with known data into CTE and return the tag ID.
-   * Caller must ensure chimaera is initialised (fixture ctor handles this).
+   * Caller must ensure clio is initialised (fixture ctor handles this).
    */
   clio::cte::core::TagId PutBlob(const std::string &tag_name,
                                 const std::string &blob_name,

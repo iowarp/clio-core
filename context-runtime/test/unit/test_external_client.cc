@@ -69,7 +69,7 @@ using namespace clio::run;
  */
 void CleanupSharedMemory() {
   const char *user = std::getenv("USER");
-  std::string memfd_path = std::string("/tmp/chimaera_") +
+  std::string memfd_path = std::string("/tmp/clio_") +
                            (user ? user : "unknown") +
                            "/chi_main_segment_" + (user ? user : "");
   unlink(memfd_path.c_str());

@@ -656,7 +656,7 @@ typedef void (*destroy_chimod_t)(clio::run::Container* container);
     delete reinterpret_cast<CONTAINER_CLASS*>(container);            \
   }                                                                  \
                                                                      \
-  static bool is_chimaera_chimod_ = true;                            \
+  static bool is_clio_chimod_ = true;                            \
   }
 // Backward-compat alias (clio_run rebrand). External code that still
 // uses the legacy CHI_* spelling keeps working unchanged.
@@ -690,7 +690,7 @@ typedef void (*destroy_chimod_t)(clio::run::Container* container);
     delete reinterpret_cast<CONTAINER_CLASS*>(container);            \
   }                                                                  \
                                                                      \
-  static bool is_chimaera_chimod_ = true;                            \
+  static bool is_clio_chimod_ = true;                            \
   }
 // Backward-compat alias (clio_run rebrand). External code that still
 // uses the legacy CHI_* spelling keeps working unchanged.

@@ -62,7 +62,7 @@ RUN sudo chown -R $(whoami):$(whoami) /workspace && \
 # Seed default config at ~/.clio/clio.yaml (the canonical user-config
 # location the runtime checks first; see ConfigManager::GetServerConfigPath).
 RUN mkdir -p /home/iowarp/.clio && \
-    cp /workspace/context-runtime/config/chimaera_default.yaml \
+    cp /workspace/context-runtime/config/clio_default.yaml \
        /home/iowarp/.clio/clio.yaml
 
 #------------------------------------------------------------

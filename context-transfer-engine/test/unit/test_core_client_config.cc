@@ -84,7 +84,7 @@ class CoreClientConfigFixture {
 
     // Clean up existing files. Non-throwing form: on Windows the previous
     // test case's bdev runtime still holds the storage file open (same
-    // CHIMAERA singleton, persists across fixtures), so fs::remove throws
+    // CLIO singleton, persists across fixtures), so fs::remove throws
     // a sharing-violation. Best-effort removal is what we want — if the
     // file's open, leaving it in place is harmless because the runtime
     // already truncates/reuses it on the next pool create.
@@ -133,7 +133,7 @@ class CoreClientConfigFixture {
     // implicitly noexcept, so a throw here calls std::terminate (which
     // surfaces as 0xC0000409 / STATUS_STACK_BUFFER_OVERRUN). Best-effort
     // cleanup is correct here — leftover files are scrubbed by the
-    // chimaera_test_cleanup_fixture between test binaries.
+    // clio_test_cleanup_fixture between test binaries.
     std::error_code ec;
     fs::remove(test_storage_path_, ec);
     fs::remove(test_config_path_, ec);

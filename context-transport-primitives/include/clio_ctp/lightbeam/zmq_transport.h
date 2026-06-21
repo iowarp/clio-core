@@ -128,7 +128,7 @@ class ZeroMqTransport : public Transport {
     if (!owner.ctx) {
       owner.ctx = zmq_ctx_new();
       // I/O thread count. Default 2 saturated at 64+ nodes during SWIM
-      // probe rounds + cross-node SendIn fan-out (each chimaera daemon
+      // probe rounds + cross-node SendIn fan-out (each clio daemon
       // talks to N-1 peers; N²=4096 connections at N=64 is enough to
       // bottleneck 2 I/O threads). 8 scales comfortably to ~512.
       // Override at runtime via CLIO_ZMQ_IO_THREADS env if needed.

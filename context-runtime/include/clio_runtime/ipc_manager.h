@@ -152,7 +152,7 @@ struct ClientTaskMeta {
  * Used for registering client memory with the runtime
  */
 struct ClientShmInfo {
-  std::string shm_name;        // Shared memory name (chimaera_{pid}_{count})
+  std::string shm_name;        // Shared memory name (clio_{pid}_{count})
   pid_t owner_pid;             // PID of the owning process
   u32 shm_index;               // Index within the owner's shm segments
   size_t size;                 // Size of the shared memory segment
@@ -1213,7 +1213,7 @@ class IpcManager {
   /**
    * Register an existing shared memory segment into the IpcManager
    * Called by worker when encountering an unknown allocator in a FutureShm
-   * Derives shm_name from alloc_id: chimaera_{pid}_{index}
+   * Derives shm_name from alloc_id: clio_{pid}_{index}
    * @param alloc_id Allocator ID (major=pid, minor=index)
    * @return true if successful (or already registered), false on error
    */
@@ -1280,7 +1280,7 @@ class IpcManager {
 #endif
 
   /**
-   * Clear all memfd symlinks from the per-user chimaera directory.
+   * Clear all memfd symlinks from the per-user clio directory.
    *
    * Called during RuntimeInit to clean up leftover memfd symlinks
    * from previous runs or crashed processes. Since the directory is
@@ -1560,7 +1560,7 @@ class IpcManager {
 #else
   /** Layout placeholder — keeps struct size/offsets identical whether
    *  any GPU backend is enabled or not, preventing ODR violations when test
-   *  binaries link chimaera_cxx without GPU support. */
+   *  binaries link clio_run_cxx without GPU support. */
   void *gpu_ipc_placeholder_ = nullptr;
 #endif
 
@@ -1682,7 +1682,7 @@ CTP_GPU_FUN inline ctp::ipc::RoundRobinAllocator *GetSharedAllocGpu() {
 // and DPC++ rejects function-local static variables in device code. The
 // CUDA path lets CLIO_IPC auto-resolve via a static method; the SYCL path
 // instead binds a kernel-scope local variable named `g_ipc_manager_ptr`
-// in the CHIMAERA_GPU_*_INIT macros (see gpu_ipc_manager.h), and CLIO_IPC
+// in the CLIO_GPU_*_INIT macros (see gpu_ipc_manager.h), and CLIO_IPC
 // is a macro that resolves to that local via plain C++ name lookup.
 //
 // Consequence: CLIO_IPC works inside the kernel body and inside any
@@ -1690,7 +1690,7 @@ CTP_GPU_FUN inline ctp::ipc::RoundRobinAllocator *GetSharedAllocGpu() {
 // in lexical scope (typically because the function takes it as a
 // parameter or is inlined into the kernel). Free functions that take
 // no parameters and reach for CLIO_IPC will not compile under SYCL —
-// pass the IpcManager pointer through explicitly. The chimaera runtime
+// pass the IpcManager pointer through explicitly. The clio runtime
 // follows this convention: chimod methods are called from the worker's
 // kernel body, where g_ipc_manager_ptr is in scope.
 //
@@ -1709,7 +1709,7 @@ inline ctp::ipc::RoundRobinAllocator *GetSharedAllocGpu() { return nullptr; }
 
 // Global-namespace fallback for `g_ipc_manager_ptr`. Code inside the
 // kernel scope shadows this with a local established by
-// CHIMAERA_GPU_*_INIT and gets the real IpcManager pointer; host-only
+// CLIO_GPU_*_INIT and gets the real IpcManager pointer; host-only
 // methods that get parsed (but never emitted) in the SYCL device pass —
 // e.g. bdev_client's AsyncMonitor — find this nullptr fallback so they
 // parse cleanly. They are never reachable from a kernel, so DPC++ does
@@ -1728,7 +1728,7 @@ inline ::clio::run::gpu::IpcManager *g_ipc_manager_ptr = nullptr;
 // passes that DPC++ runs over a SYCL TU:
 //
 //   - Device pass (CTP_IS_SYCL_DEVICE=1): resolve to the kernel-scope
-//     local `g_ipc_manager_ptr` established by CHIMAERA_GPU_*_INIT, picked
+//     local `g_ipc_manager_ptr` established by CLIO_GPU_*_INIT, picked
 //     up via unqualified C++ name lookup from the enclosing function.
 //   - Host pass: keep using the global pointer accessor — host-only
 //     functions (e.g. bdev_client::AsyncMonitor) get compiled in this
@@ -2129,9 +2129,9 @@ CTP_CROSS_FUN void Future<TaskT, AllocT>::WaitRecv(float max_sec,
 #endif
 }
 
-// gpu::Future is fully defined inline in chimaera/gpu/future.h after the
+// gpu::Future is fully defined inline in clio/gpu/future.h after the
 // producer-only redesign — no out-of-line method implementations needed.
-// gpu::Future::Wait() is defined in chimaera/ipc/ipc_gpu2cpu_impl.h
+// gpu::Future::Wait() is defined in clio/ipc/ipc_gpu2cpu_impl.h
 // alongside IpcGpu2Cpu::ClientSend.
 
 }  // namespace clio::run

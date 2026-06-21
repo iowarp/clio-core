@@ -60,9 +60,9 @@ namespace {
 /**
  * Simple test fixture for CLIO Runtime runtime tests
  */
-class SimpleChimaeraFixture {
+class SimpleClioFixture {
 public:
-  SimpleChimaeraFixture() {
+  SimpleClioFixture() {
     // Initialize CLIO Runtime once per test suite
     if (!g_initialized) {
       INFO("Initializing Clio...");
@@ -78,7 +78,7 @@ public:
     }
   }
 
-  ~SimpleChimaeraFixture() {
+  ~SimpleClioFixture() {
     INFO("Test cleanup completed");
   }
 };
@@ -88,7 +88,7 @@ public:
 //------------------------------------------------------------------------------
 
 TEST_CASE("Basic Clio Initialization", "[runtime][basic]") {
-  SimpleChimaeraFixture fixture;
+  SimpleClioFixture fixture;
 
   SECTION("Clio initialization should succeed") {
     REQUIRE(g_initialized);
@@ -118,7 +118,7 @@ TEST_CASE("Basic Clio Initialization", "[runtime][basic]") {
 }
 
 TEST_CASE("Combined Initialization", "[runtime][client][combined]") {
-  SimpleChimaeraFixture fixture;
+  SimpleClioFixture fixture;
   
   SECTION("Initialize both runtime and client") {
     bool both_result = g_initialized;
@@ -149,7 +149,7 @@ TEST_CASE("Combined Initialization", "[runtime][client][combined]") {
 }
 
 TEST_CASE("Error Handling", "[error][basic]") {
-  SimpleChimaeraFixture fixture;
+  SimpleClioFixture fixture;
 
   SECTION("Operations should not crash") {
     // These should not crash even if they fail
@@ -158,7 +158,7 @@ TEST_CASE("Error Handling", "[error][basic]") {
 }
 
 TEST_CASE("Basic Performance", "[performance][timing]") {
-  SimpleChimaeraFixture fixture;
+  SimpleClioFixture fixture;
 
   SECTION("Clio initialization timing") {
     auto start_time = std::chrono::high_resolution_clock::now();

@@ -68,7 +68,7 @@ bool ContentTransferEngine::ClientInit(const clio::run::PoolQuery &pool_query) {
   // Initialize CTE core client
   auto *cte_client = CLIO_CTE_CLIENT;
 
-  // Create CreateParams without config - configuration is now provided via chimaera compose
+  // Create CreateParams without config - configuration is now provided via clio compose
   CreateParams params;
 
   // Create CTE Core container using constants from core_tasks.h and specified pool_query

@@ -25,7 +25,7 @@ bool CLIO_CFS_CLIENT_INIT(const std::string &config_path,
   if (s_initialized) {
     return true;
   }
-  (void)config_path;  // configuration now flows through chimaera compose
+  (void)config_path;  // configuration now flows through clio compose
 
   // The filesystem chimod sits over the default CTE core pool, so make sure
   // that exists first (also brings up the runtime client / IPC).

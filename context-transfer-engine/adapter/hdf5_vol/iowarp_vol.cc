@@ -31,7 +31,7 @@
 /* transport_factory_impl.h provides the inline definitions of
    ctp::lbm::Transport::ClearRecvHandles / Send<...>. They are required
    when AsyncPutBlob template-instantiates here (it doesn't fire from
-   chimaera.h alone). Without this include the linker leaves the
+   clio.h alone). Without this include the linker leaves the
    templated symbols undefined in our .so. */
 #include <clio_ctp/lightbeam/transport_factory_impl.h>
 #include <clio_cte/core/core_client.h>
@@ -114,7 +114,7 @@ struct iowarp_wrap_ctx_t {
  * ======================================================================== */
 
 static clio::cte::core::Client *get_cte_client() {
-  /* Lazily attach this process to the running chimaera/CTE runtime on first
+  /* Lazily attach this process to the running clio/CTE runtime on first
      use. When HDF5 dlopen()s the connector via HDF5_VOL_CONNECTOR there is no
      LD_PRELOAD constructor to do it (the POSIX adapter inits in
      Filesystem::Filesystem -> CLIO_CTE_CLIENT_INIT()); without this the CTE

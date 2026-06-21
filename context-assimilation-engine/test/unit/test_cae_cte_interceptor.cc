@@ -19,7 +19,7 @@
  * performed in CAE yet — these handlers just forward.
  *
  * The full GetOrCreateTag → PutBlob → GetBlob round-trip runs inside a
- * single TEST_CASE so that all calls share one chimaera server lifetime
+ * single TEST_CASE so that all calls share one clio server lifetime
  * (the RAM bdev storage doesn't survive a process restart).
  */
 

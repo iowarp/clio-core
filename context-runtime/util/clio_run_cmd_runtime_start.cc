@@ -28,7 +28,7 @@ bool InitializeAdminChiMod() {
     return false;
   }
 
-  auto* admin_chimod = module_manager->GetChiMod("chimaera_admin");
+  auto* admin_chimod = module_manager->GetChiMod("clio_admin");
   if (!admin_chimod) {
     HLOG(kError, "CRITICAL: Admin ChiMod not found! This is a required system component.");
     return false;
@@ -101,13 +101,13 @@ bool InductNode() {
 }
 
 void PrintRuntimeStartUsage() {
-  HIPRINT("Usage: chimaera runtime start [--induct]");
+  HIPRINT("Usage: clio runtime start [--induct]");
   HIPRINT("  Starts the Clio runtime server");
   HIPRINT("  --induct: Register this node with all existing cluster nodes");
 }
 
 void PrintRuntimeRestartUsage() {
-  HIPRINT("Usage: chimaera runtime restart [--induct]");
+  HIPRINT("Usage: clio runtime restart [--induct]");
   HIPRINT("  Restarts the Clio runtime, replaying WAL to recover address table");
   HIPRINT("  --induct: Register this node with all existing cluster nodes");
 }

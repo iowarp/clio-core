@@ -39,7 +39,7 @@
  * created as part of the external-chimod unit test.
  * 
  * This test demonstrates:
- * - External namespace usage (external_test vs chimaera)  
+ * - External namespace usage (external_test vs clio)  
  * - Custom ChiMod development patterns
  * - Proper CMake find_package and linking
  * - add_clio_module_client and add_clio_module_runtime functionality
@@ -68,7 +68,7 @@ int main() {
     if (!client_init_success) {
       HLOG(kInfo, "NOTICE: Clio client initialization failed.");
       HLOG(kInfo, "This is expected when no runtime is active.");
-      HLOG(kInfo, "In a production environment, ensure chimaera runtime start is running.");
+      HLOG(kInfo, "In a production environment, ensure clio runtime start is running.");
     } else {
       HLOG(kSuccess, "SUCCESS: Clio client initialized!");
     }
@@ -119,16 +119,16 @@ int main() {
   }
 
   HIPRINT("\n=== Key External ChiMod Features Demonstrated ===");
-  HIPRINT("Custom namespace (external_test vs chimaera)");
-  HIPRINT("External chimaera_repo.yaml configuration");
+  HIPRINT("Custom namespace (external_test vs clio)");
+  HIPRINT("External clio_repo.yaml configuration");
   HIPRINT("add_clio_module_client()/add_clio_module_runtime() CMake functions");
   HIPRINT("install_chimod() CMake function usage");
-  HIPRINT("find_package(chimaera) linking");
+  HIPRINT("find_package(clio) linking");
   HIPRINT("External module directory structure");
   HIPRINT("CLIO_TASK_CC macro with external library name");
 
   HIPRINT("\nNOTE: This test demonstrates successful external ChiMod development patterns.");
-  HIPRINT("For full functionality, run chimaera runtime start in another terminal.");
+  HIPRINT("For full functionality, run clio runtime start in another terminal.");
 
   clio::run::CLIO_RUNTIME_FINALIZE();
   return 0;

@@ -69,7 +69,7 @@ static constexpr size_t kDefaultPageSize = 1024 * 1024;  // 1 MB
 static constexpr size_t kMaxInFlightWrites = 8;
 
 /**
- * In-flight async PutBlob — owns the chimaera Future and the SHM buffer
+ * In-flight async PutBlob — owns the clio Future and the SHM buffer
  * the put is reading from. Both must outlive the put (so the daemon can
  * still copy out of shm_buf when its handler runs). Stored in a
  * std::list on the handle so iterators stay stable across insertion and
@@ -316,7 +316,7 @@ static inline bool CtePutBlob(const clio::cte::core::TagId &tag_id,
  * on the oldest entry's Wait() until at least one slot frees up.
  *
  * Doing the reap in write() (as opposed to deferring to release()/
- * fsync()) keeps both the chimaera FutureShm allocator and the per-fd
+ * fsync()) keeps both the clio FutureShm allocator and the per-fd
  * SHM buffer footprint bounded under sustained writes, while still
  * letting the FUSE kernel pipeline up to kMaxInFlightWrites concurrent
  * chunks per fd before the writer stalls.

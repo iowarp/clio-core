@@ -125,7 +125,7 @@ std::vector<char> GenerateTestData(size_t size, const std::string& pattern) {
 /**
  * Initialize CLIO Runtime runtime for compressor tests
  */
-void InitializeChimaera() {
+void InitializeClio() {
   // Initialize CLIO Runtime runtime in client mode with runtime
   bool success = clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true);
   if (!success) {
@@ -136,7 +136,7 @@ void InitializeChimaera() {
 /**
  * Cleanup CLIO Runtime runtime
  */
-void CleanupChimaera() {
+void CleanupClio() {
   // Client finalize handled by CLIO_CLIENT destructor
 }
 
@@ -185,7 +185,7 @@ struct CTETestFixture {
   clio::cte::core::TagId tag_id_;
 
   CTETestFixture() {
-    InitializeChimaera();
+    InitializeClio();
     core_pool_id_ = CreateCorePool();
     compressor_pool_id_ = CreateCompressorPool();
     core_client_.Init(core_pool_id_);
@@ -198,7 +198,7 @@ struct CTETestFixture {
   }
 
   ~CTETestFixture() {
-    CleanupChimaera();
+    CleanupClio();
   }
 
   /**

@@ -126,7 +126,7 @@ Args ParseArgs(int argc, char **argv) {
 }
 
 /**
- * Write the temporary compose YAML used by chimaera. CAE sits at 512.0
+ * Write the temporary compose YAML used by clio. CAE sits at 512.0
  * with a single labeling rule whose `model`, `context_length`, and
  * `num_predict` reflect the CLI args. CTE core is behind it at 513.0.
  */
@@ -220,7 +220,7 @@ class LabelBench {
     // doesn't forward every CTE method, in particular GetBlobSize.
     // For the post-run label inspection we need a second CTE client
     // that talks to the *real* CTE core at 513.0 directly. Both
-    // clients share the same chimaera runtime / IPC.
+    // clients share the same clio runtime / IPC.
     cte_direct_ = std::make_unique<clio::cte::core::Client>(
         clio::run::PoolId(513, 0));
 
@@ -405,7 +405,7 @@ int main(int argc, char **argv) {
   if (!args.ok) return 1;
 
   // Write a tmp YAML that reflects --model / --endpoint / --summary-tokens /
-  // --context-length, then have chimaera consume it via CLIO_SERVER_CONF.
+  // --context-length, then have clio consume it via CLIO_SERVER_CONF.
   std::string config_path = WriteTempConfig(args);
   setenv("CLIO_SERVER_CONF", config_path.c_str(), 1);
   HLOG(kInfo, "Config: {}", config_path);

@@ -9,7 +9,7 @@ This repository contains the unified IOWarp Core framework, integrating multiple
 
 ## Documentation Updates
 Whenever you modify the configurations for context-runtime, context-transfer-engine, context-assimilation-engine, or bdev, we should update our documentation accordingly.
-First, we should update context-runtime/config/chimaera_default.yaml to have the default parameters -- even just as comments. We should document the parameter options here as well.
+First, we should update context-runtime/config/clio_default.yaml to have the default parameters -- even just as comments. We should document the parameter options here as well.
 
 After this, we need to update the following doc:
 docs/docs/deployment/configuration.md

@@ -41,7 +41,7 @@ def find_config():
 
     # 6. Bundled default
     package_dir = os.path.dirname(os.path.abspath(__file__))
-    default_conf = os.path.join(package_dir, "data", "chimaera_default.yaml")
+    default_conf = os.path.join(package_dir, "data", "clio_default.yaml")
     if os.path.isfile(default_conf):
         return default_conf
 
@@ -52,7 +52,7 @@ def get_default_config():
     """Return the path to the bundled default configuration file.
 
     Returns:
-        str: Path to chimaera_default.yaml in the package data directory.
+        str: Path to clio_default.yaml in the package data directory.
     """
     package_dir = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(package_dir, "data", "chimaera_default.yaml")
+    return os.path.join(package_dir, "data", "clio_default.yaml")

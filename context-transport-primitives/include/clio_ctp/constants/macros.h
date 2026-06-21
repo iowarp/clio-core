@@ -205,7 +205,7 @@
 #endif
 
 // Pull <sycl/sycl.hpp> in whenever the SYCL backend is enabled, not only
-// when this TU is being compiled with -fsycl. Host TUs in chimaera_cxx
+// when this TU is being compiled with -fsycl. Host TUs in clio_run_cxx
 // (compiled by dpcpp without -fsycl) still need sycl::malloc_host /
 // sycl::queue / sycl::free declarations because gpu_api.h's sycl::
 // branches activate on CTP_ENABLE_SYCL=1. The header is plain C++ —

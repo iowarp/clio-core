@@ -435,12 +435,12 @@ void *SystemInfo::GetTls(const ThreadLocalKey &key) {
 }
 
 std::string SystemInfo::GetMemfdDir() {
-  // Default is /tmp/chimaera_$USER, but some sites have a tiny /
+  // Default is /tmp/clio_$USER, but some sites have a tiny /
   // partition where /tmp fills up (ares compute nodes are a known
   // example: a stale prior run -- or any other user's clutter --
   // can leave no space, mkdir under /tmp silently fails, and the
   // subsequent memfd symlink + shm_open returns ENOENT here. Allow
-  // env override so deployments can point chimaera's per-user
+  // env override so deployments can point clio's per-user
   // bookkeeping at an NFS-backed location (e.g. $HOME).
   const char *override_dir = ctp::env::GetCompat("MEMFD_DIR");
   if (override_dir && *override_dir) {
@@ -454,11 +454,11 @@ std::string SystemInfo::GetMemfdDir() {
   std::error_code ec;
   std::filesystem::path base = std::filesystem::temp_directory_path(ec);
   if (ec) base = std::filesystem::path(".");
-  return (base / (std::string("chimaera_") + user)).string();
+  return (base / (std::string("clio_") + user)).string();
 #else
   const char *user = getenv("USER");
   if (!user) user = "unknown";
-  return std::string("/tmp/chimaera_") + user;
+  return std::string("/tmp/clio_") + user;
 #endif
 }
 
@@ -512,7 +512,7 @@ bool SystemInfo::CreateNewSharedMemory(File &fd, const std::string &name,
   // macOS / BSD: POSIX shm_open() names are capped at PSHMNAMLEN (31 chars
   // on macOS) and shm objects live in an anonymous namespace with no
   // filesystem path, so the per-user readiness probes and tooling that
-  // expect /tmp/chimaera_$USER/<name> (mirroring Linux's memfd symlink)
+  // expect /tmp/clio_$USER/<name> (mirroring Linux's memfd symlink)
   // never observe the segment -- WaitForServer() then times out, the test
   // leaves an orphaned server holding the port, and every later test fails
   // with "Address already in use". Back the segment with a regular file in

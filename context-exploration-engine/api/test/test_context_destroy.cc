@@ -40,7 +40,7 @@
  * 3. Testing special characters in context names
  *
  * Environment Variables:
- * - INIT_CHIMAERA: If set to "1", initializes CLIO Runtime runtime
+ * - INIT_CLIO: If set to "1", initializes CLIO Runtime runtime
  */
 
 #include <clio_cee/api/context_interface.h>
@@ -113,9 +113,9 @@ int main(int argc, char** argv) {
 
   try {
     // Initialize CLIO Runtime runtime if requested (for unit tests)
-    const char* init_chimaera = std::getenv("INIT_CHIMAERA");
-    if (init_chimaera && std::strcmp(init_chimaera, "1") == 0) {
-      HLOG(kInfo, "Initializing Clio (INIT_CHIMAERA=1)...");
+    const char* init_clio = std::getenv("INIT_CLIO");
+    if (init_clio && std::strcmp(init_clio, "1") == 0) {
+      HLOG(kInfo, "Initializing Clio (INIT_CLIO=1)...");
       clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true);
       HLOG(kSuccess, "Clio initialized");
     }
@@ -124,7 +124,7 @@ int main(int argc, char** argv) {
     auto* ipc_manager = CLIO_IPC;
     if (!ipc_manager) {
       HLOG(kError, "Clio IPC not initialized. Is the runtime running?");
-      HLOG(kInfo, "HINT: Set INIT_CHIMAERA=1 to initialize runtime or start runtime externally");
+      HLOG(kInfo, "HINT: Set INIT_CLIO=1 to initialize runtime or start runtime externally");
       ctp::SystemInfo::TerminateProcessNow(1);
       return 1;
     }

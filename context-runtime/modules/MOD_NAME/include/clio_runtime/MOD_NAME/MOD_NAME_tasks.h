@@ -59,7 +59,7 @@ struct CreateParams {
   clio::run::u32 config_flags_;
 
   // Required: chimod library name for module manager
-  static constexpr const char* chimod_lib_name = "chimaera_MOD_NAME";
+  static constexpr const char* chimod_lib_name = "clio_MOD_NAME";
 
   // Constructor with parameters (also serves as default)
   CreateParams(clio::run::u32 worker_count = 1, clio::run::u32 config_flags = 0)

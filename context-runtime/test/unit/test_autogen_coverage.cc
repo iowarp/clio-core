@@ -12608,12 +12608,12 @@ TEST_CASE("Autogen - PoolManager operations", "[autogen][poolmanager][ops]") {
   }
 
   SECTION("ValidatePoolParams") {
-    bool valid = pool_manager->ValidatePoolParams("chimaera_admin", "admin");
+    bool valid = pool_manager->ValidatePoolParams("clio_admin", "admin");
     REQUIRE(valid == true);
     // Empty names should fail
     bool empty_mod = pool_manager->ValidatePoolParams("", "admin");
     REQUIRE(empty_mod == false);
-    bool empty_pool = pool_manager->ValidatePoolParams("chimaera_admin", "");
+    bool empty_pool = pool_manager->ValidatePoolParams("clio_admin", "");
     REQUIRE(empty_pool == false);
     // Non-existent chimod
     bool bad_mod = pool_manager->ValidatePoolParams("nonexistent_chimod", "test_pool");
@@ -12645,40 +12645,40 @@ TEST_CASE("Autogen - PoolManager operations", "[autogen][poolmanager][ops]") {
 // ==========================================================================
 // RuntimeManager tests
 // ==========================================================================
-TEST_CASE("Autogen - RuntimeManager accessors", "[autogen][chimaera][manager]") {
+TEST_CASE("Autogen - RuntimeManager accessors", "[autogen][clio][manager]") {
   EnsureInitialized();
-  auto* chimaera_mgr = CLIO_RUNTIME_MANAGER;
+  auto* clio_mgr = CLIO_RUNTIME_MANAGER;
 
   SECTION("IsInitialized") {
-    REQUIRE(chimaera_mgr->IsInitialized() == true);
+    REQUIRE(clio_mgr->IsInitialized() == true);
     INFO("RuntimeManager is initialized");
   }
 
   SECTION("IsRuntime") {
-    bool is_runtime = chimaera_mgr->IsRuntime();
+    bool is_runtime = clio_mgr->IsRuntime();
     REQUIRE(is_runtime == true);
     INFO("RuntimeManager IsRuntime: " + std::to_string(is_runtime));
   }
 
   SECTION("IsClient") {
-    bool is_client = chimaera_mgr->IsClient();
+    bool is_client = clio_mgr->IsClient();
     INFO("RuntimeManager IsClient: " + std::to_string(is_client));
   }
 
   SECTION("IsInitializing") {
-    bool initializing = chimaera_mgr->IsInitializing();
+    bool initializing = clio_mgr->IsInitializing();
     REQUIRE(initializing == false);  // should not be initializing after init
     INFO("RuntimeManager IsInitializing: " + std::to_string(initializing));
   }
 
   SECTION("GetCurrentHostname") {
-    const std::string& hostname = chimaera_mgr->GetCurrentHostname();
+    const std::string& hostname = clio_mgr->GetCurrentHostname();
     REQUIRE(!hostname.empty());
     INFO("Hostname: " + hostname);
   }
 
   SECTION("GetNodeId") {
-    clio::run::u64 node_id = chimaera_mgr->GetNodeId();
+    clio::run::u64 node_id = clio_mgr->GetNodeId();
     INFO("Node ID: " + std::to_string(node_id));
   }
 }

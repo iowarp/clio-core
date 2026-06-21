@@ -1,6 +1,6 @@
 /*
  * libaio_shim.c — implements the four libaio functions used by bdev via direct
- * Linux syscalls, so libchimaera_bdev_runtime.so has no dependency on libaio.so.
+ * Linux syscalls, so libclio_bdev_runtime.so has no dependency on libaio.so.
  *
  * io_prep_pread / io_prep_pwrite / io_set_eventfd are static inlines in
  * libaio.h and need no implementation here.

@@ -80,7 +80,7 @@ inline clio::run::priv::vector<clio::run::bdev::Block> WrapBlock(
 
 bool WaitForServer(int max_attempts = 100) {
   const char* user = std::getenv("USER");
-  std::string memfd_path = std::string("/tmp/chimaera_") +
+  std::string memfd_path = std::string("/tmp/clio_") +
                            (user ? user : "unknown") +
                            "/chi_main_segment_" + (user ? user : "");
 
@@ -98,7 +98,7 @@ bool WaitForServer(int max_attempts = 100) {
 
 void CleanupSharedMemory() {
   const char* user = std::getenv("USER");
-  std::string memfd_path = std::string("/tmp/chimaera_") +
+  std::string memfd_path = std::string("/tmp/clio_") +
                            (user ? user : "unknown") +
                            "/chi_main_segment_" + (user ? user : "");
   unlink(memfd_path.c_str());

@@ -521,7 +521,7 @@ class Task {
 // FutureShm and Future classes (must be before RunContext which uses Future)
 #include "clio_runtime/future.h"
 
-// FutureShm and Future are defined in chimaera/future.h (included above)
+// FutureShm and Future are defined in clio/future.h (included above)
 
 namespace clio::run {
 

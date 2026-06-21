@@ -49,7 +49,7 @@
  * - Tests integration with CTE (tag creation, blob storage)
  *
  * Environment Variables:
- * - INIT_CHIMAERA: If set to "1", initializes CLIO Runtime runtime
+ * - INIT_CLIO: If set to "1", initializes CLIO Runtime runtime
  * - TEST_HDF5_FILE: Override default test file path
  */
 

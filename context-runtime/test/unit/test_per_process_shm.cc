@@ -57,7 +57,7 @@
 
 namespace {
 // Test setup helper - same pattern as other tests
-bool initialize_chimaera() {
+bool initialize_clio() {
   return clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true);
 }
 
@@ -107,7 +107,7 @@ TEST_CASE("Per-process shared memory GetClientShmInfo",
     if (info.size == 0) _exit(6);
 
     std::string expected_prefix =
-        "chimaera_" + std::to_string(getpid()) + "_";
+        "clio_" + std::to_string(getpid()) + "_";
     if (info.shm_name.find(expected_prefix) != 0) _exit(7);
 
     _exit(0);  // Success
@@ -124,7 +124,7 @@ TEST_CASE("Per-process shared memory GetClientShmInfo",
 
 TEST_CASE("Per-process shared memory AllocateBuffer medium sizes",
           "[ipc][per_process_shm][allocate][medium]") {
-  REQUIRE(initialize_chimaera());
+  REQUIRE(initialize_clio());
 
   auto* ipc_manager = CLIO_IPC;
   REQUIRE(ipc_manager != nullptr);
@@ -164,7 +164,7 @@ TEST_CASE("Per-process shared memory AllocateBuffer medium sizes",
 
 TEST_CASE("Per-process shared memory AllocateBuffer exceeding 1GB",
           "[ipc][per_process_shm][allocate][large]") {
-  REQUIRE(initialize_chimaera());
+  REQUIRE(initialize_clio());
 
   auto* ipc_manager = CLIO_IPC;
   REQUIRE(ipc_manager != nullptr);
@@ -203,7 +203,7 @@ TEST_CASE("Per-process shared memory AllocateBuffer exceeding 1GB",
 
 TEST_CASE("Per-process shared memory multiple large allocations",
           "[ipc][per_process_shm][allocate][multiple_large]") {
-  REQUIRE(initialize_chimaera());
+  REQUIRE(initialize_clio());
 
   auto* ipc_manager = CLIO_IPC;
   REQUIRE(ipc_manager != nullptr);
@@ -249,7 +249,7 @@ TEST_CASE("Per-process shared memory multiple large allocations",
 
 TEST_CASE("Per-process shared memory allocation patterns",
           "[ipc][per_process_shm][allocate][patterns]") {
-  REQUIRE(initialize_chimaera());
+  REQUIRE(initialize_clio());
 
   auto* ipc_manager = CLIO_IPC;
   REQUIRE(ipc_manager != nullptr);
@@ -305,7 +305,7 @@ TEST_CASE("Per-process shared memory allocation patterns",
 
 TEST_CASE("Per-process shared memory FreeBuffer",
           "[ipc][per_process_shm][free]") {
-  REQUIRE(initialize_chimaera());
+  REQUIRE(initialize_clio());
 
   auto* ipc_manager = CLIO_IPC;
   REQUIRE(ipc_manager != nullptr);
@@ -349,7 +349,7 @@ TEST_CASE("Per-process shared memory FreeBuffer",
 
 TEST_CASE("Per-process shared memory ToFullPtr conversion",
           "[ipc][per_process_shm][tofullptr]") {
-  REQUIRE(initialize_chimaera());
+  REQUIRE(initialize_clio());
 
   auto* ipc_manager = CLIO_IPC;
   REQUIRE(ipc_manager != nullptr);
@@ -383,7 +383,7 @@ TEST_CASE("Per-process shared memory ToFullPtr conversion",
 
 TEST_CASE("Per-process shared memory stress test",
           "[ipc][per_process_shm][stress]") {
-  REQUIRE(initialize_chimaera());
+  REQUIRE(initialize_clio());
 
   auto* ipc_manager = CLIO_IPC;
   REQUIRE(ipc_manager != nullptr);
@@ -426,7 +426,7 @@ TEST_CASE("Per-process shared memory stress test",
 
 TEST_CASE("Per-process shared memory ClientShmInfo",
           "[ipc][per_process_shm][shm_info]") {
-  REQUIRE(initialize_chimaera());
+  REQUIRE(initialize_clio());
 
   auto* ipc_manager = CLIO_IPC;
   REQUIRE(ipc_manager != nullptr);

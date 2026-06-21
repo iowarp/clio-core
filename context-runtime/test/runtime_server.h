@@ -176,7 +176,7 @@ class RuntimeServer {
   /**
    * Poll until the runtime's main shared-memory segment exists, signalling that
    * the daemon has initialized far enough to serve clients. Portable: on POSIX
-   * the segment is a file under /tmp/chimaera_$USER, on Windows a named mapping
+   * the segment is a file under /tmp/clio_$USER, on Windows a named mapping
    * — SystemInfo::OpenSharedMemory abstracts both. Returns false if the timeout
    * elapses or the daemon exits early.
    */

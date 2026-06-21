@@ -229,7 +229,7 @@ class SystemInfo {
 
   CTP_DLL static void Unsetenv(const char *name);
 
-  /** Get the per-user chimaera tmp directory path (/tmp/chimaera_$USER) */
+  /** Get the per-user clio tmp directory path (/tmp/clio_$USER) */
   CTP_DLL static std::string GetMemfdDir();
 
   /** Get the full path for a named file in the memfd directory */

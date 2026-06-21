@@ -100,7 +100,7 @@ TEST_CASE("TestSystemInfo") {
   std::string mod_dir = ctp::SystemInfo::GetModuleDirectory();
   REQUIRE(!mod_dir.empty());
 
-  // GetMemfdDir / GetMemfdPath: exercises the /tmp/chimaera_<user> path helpers
+  // GetMemfdDir / GetMemfdPath: exercises the /tmp/clio_<user> path helpers
   std::string memfd_dir = ctp::SystemInfo::GetMemfdDir();
   REQUIRE(!memfd_dir.empty());
   REQUIRE(memfd_dir.find("/tmp/") != std::string::npos);

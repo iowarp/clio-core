@@ -474,7 +474,7 @@ int main(int argc, char **argv) {
       HLOG(kError, "  mpirun -n 4 clio_cte_score_bench 100m 0.5 10 50");
       HLOG(kError, "");
       HLOG(kError, "Environment variables:");
-      HLOG(kError, "  CLIO_SERVER_CONF: Path to chimaera configuration file");
+      HLOG(kError, "  CLIO_SERVER_CONF: Path to clio configuration file");
     }
     MPI_Finalize();
     return 1;

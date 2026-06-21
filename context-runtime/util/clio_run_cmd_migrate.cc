@@ -10,7 +10,7 @@
 
 namespace {
 void PrintMigrateUsage() {
-  HIPRINT("Usage: chimaera migrate --pool-id <major.minor> --container-id <CID> --node-id <NID>");
+  HIPRINT("Usage: clio migrate --pool-id <major.minor> --container-id <CID> --node-id <NID>");
   HIPRINT("  Migrate a container to a different node");
   HIPRINT("");
   HIPRINT("Options:");

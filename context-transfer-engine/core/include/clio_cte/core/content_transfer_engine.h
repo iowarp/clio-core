@@ -60,7 +60,7 @@ public:
 
   /**
    * Initialize client components
-   * Configuration is now provided via chimaera compose using CLIO_SERVER_CONF
+   * Configuration is now provided via clio compose using CLIO_SERVER_CONF
    * @param pool_query Pool query type for CTE container creation
    * @return true if initialization successful, false otherwise
    */

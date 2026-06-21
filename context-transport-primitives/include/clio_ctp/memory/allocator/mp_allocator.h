@@ -250,7 +250,7 @@ class _ProducerConsumerAllocator : public Allocator {
     // (daemon) frees on a different thread whose EnsureTls() returns the
     // daemon's tblock — Free then corrupts the daemon's free lists with
     // phantom entries pointing into producer memory. Symptom: 4n / 256m
-    // FPP stalls after a few hundred ops with chimaera workers idle and
+    // FPP stalls after a few hundred ops with clio workers idle and
     // FUSE adapter threads parked in Future.Wait.
     // Route all alloc/free through the global buddy allocator under
     // lock_ so alloc and free hit the same data structure.

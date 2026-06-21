@@ -54,13 +54,13 @@ static nb::dict results_to_dict(
   return d;
 }
 
-NB_MODULE(chimaera_runtime_ext, m) {
+NB_MODULE(clio_runtime_ext, m) {
   m.doc() = "Python bindings for Clio runtime monitoring";
 
-  m.def("chimaera_init", &py_chimaera_init, "mode"_a,
+  m.def("clio_init", &py_clio_init, "mode"_a,
         "Initialize the Clio runtime. mode: 0=kClient.");
 
-  m.def("chimaera_finalize", &py_chimaera_finalize,
+  m.def("clio_finalize", &py_clio_finalize,
         "Finalize the Clio runtime.");
 
   nb::class_<PyMonitorTask>(m, "MonitorTask")

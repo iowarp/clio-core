@@ -46,7 +46,7 @@
 
 namespace {
 // Test setup helper - same pattern as other tests
-bool initialize_chimaera() {
+bool initialize_clio() {
   bool success = clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true);
   if (success) SimpleTest::g_test_finalize = clio::run::CLIO_RUNTIME_FINALIZE;
   return success;
@@ -56,7 +56,7 @@ bool initialize_chimaera() {
 TEST_CASE("CLIO_IPC AllocateBuffer basic functionality",
           "[ipc][allocate_buffer][basic]") {
   // Initialize CLIO Runtime client for testing
-  REQUIRE(initialize_chimaera());
+  REQUIRE(initialize_clio());
 
   auto* ipc_manager = CLIO_IPC;
   REQUIRE(ipc_manager != nullptr);
@@ -122,7 +122,7 @@ TEST_CASE("CLIO_IPC AllocateBuffer basic functionality",
 
 TEST_CASE("CLIO_IPC AllocateBuffer return type verification",
           "[ipc][allocate_buffer][types]") {
-  REQUIRE(initialize_chimaera());
+  REQUIRE(initialize_clio());
 
   auto* ipc_manager = CLIO_IPC;
   REQUIRE(ipc_manager != nullptr);
@@ -150,7 +150,7 @@ TEST_CASE("CLIO_IPC AllocateBuffer return type verification",
 
 TEST_CASE("CLIO_IPC AllocateBuffer size variations",
           "[ipc][allocate_buffer][sizes]") {
-  REQUIRE(initialize_chimaera());
+  REQUIRE(initialize_clio());
 
   auto* ipc_manager = CLIO_IPC;
   REQUIRE(ipc_manager != nullptr);
@@ -188,7 +188,7 @@ TEST_CASE("CLIO_IPC AllocateBuffer size variations",
 
 TEST_CASE("CLIO_IPC AllocateBuffer multiple allocations",
           "[ipc][allocate_buffer][multiple]") {
-  REQUIRE(initialize_chimaera());
+  REQUIRE(initialize_clio());
 
   auto* ipc_manager = CLIO_IPC;
   REQUIRE(ipc_manager != nullptr);
@@ -229,7 +229,7 @@ TEST_CASE("CLIO_IPC AllocateBuffer multiple allocations",
 
 TEST_CASE("CLIO_IPC AllocateBuffer client vs runtime behavior",
           "[ipc][allocate_buffer][client_runtime]") {
-  REQUIRE(initialize_chimaera());
+  REQUIRE(initialize_clio());
 
   auto* ipc_manager = CLIO_IPC;
   REQUIRE(ipc_manager != nullptr);
@@ -258,7 +258,7 @@ TEST_CASE("CLIO_IPC AllocateBuffer client vs runtime behavior",
 
 TEST_CASE("CLIO_IPC AllocateBuffer memory alignment",
           "[ipc][allocate_buffer][alignment]") {
-  REQUIRE(initialize_chimaera());
+  REQUIRE(initialize_clio());
 
   auto* ipc_manager = CLIO_IPC;
   REQUIRE(ipc_manager != nullptr);
@@ -292,7 +292,7 @@ TEST_CASE("CLIO_IPC AllocateBuffer memory alignment",
 
 TEST_CASE("CLIO_IPC AllocateBuffer documentation examples",
           "[ipc][allocate_buffer][documentation]") {
-  REQUIRE(initialize_chimaera());
+  REQUIRE(initialize_clio());
 
   SECTION("MODULE_DEVELOPMENT_GUIDE.md examples") {
     // Test the exact examples from the documentation
