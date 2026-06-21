@@ -49,7 +49,7 @@
 #include "clio_runtime/ipc_manager.h"
 #include "clio_runtime/singletons.h"
 
-using namespace chi;
+using namespace clio::run;
 
 // ============================================================================
 // Global Setup - Initialize once for all tests

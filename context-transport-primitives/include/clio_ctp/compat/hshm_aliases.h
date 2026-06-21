@@ -24,13 +24,6 @@
 // ctp::X   resolves to ctp::X
 // ctp::ipc::X / ctp::ipc::X resolves to ctp::ipc::X
 //
-// These rely on the `ctp` and `ctp::ipc` namespaces being declared somewhere
-// (the rest of <clio_ctp/clio_ctp.h>); forward-declare them so this header
-// is self-contained.
-namespace ctp { namespace ipc {} }
-namespace hshm = ctp;
-namespace hipc = ctp::ipc;  // shorthand alias (matches the historical ctp::ipc:: usage)
-
 // --- Macro aliases ---
 #define HSHM_COMPILING_DLL                   CTP_COMPILING_DLL
 #define HSHM_CROSS_FUN                       CTP_CROSS_FUN

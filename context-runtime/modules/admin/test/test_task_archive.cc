@@ -65,7 +65,7 @@
 // Include GlobalSerialize for serialization
 #include "clio_ctp/data_structures/serialization/global_serialize.h"
 
-using namespace chi;
+using namespace clio::run;
 
 // Test constants
 constexpr clio::run::u32 kTestWriteFlag = 0x1;  // BULK_XFER

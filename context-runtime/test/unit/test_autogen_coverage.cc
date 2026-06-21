@@ -55,7 +55,7 @@
 // Include CTE core config
 #include <clio_cte/core/core_config.h>
 
-using namespace chi;
+using namespace clio::run;
 
 namespace {
 // Global initialization flag

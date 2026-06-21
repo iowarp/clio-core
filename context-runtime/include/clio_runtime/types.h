@@ -55,15 +55,7 @@
  * Core type definitions for CLIO Runtime distributed task execution framework
  */
 
-// Canonical runtime namespace: clio::run.  `chi` is kept as a permanent
-// alias so the millions of existing clio::run::Foo qualified lookups in this
-// codebase (and in every downstream chimod) keep resolving unchanged.
-// The forward-decl ensures the alias resolves even at this top-of-file
-// position where the clio::run namespace hasn't been opened yet.
-namespace clio {
-namespace run {}
-}  // namespace clio
-namespace chi = clio::run;
+// Canonical runtime namespace: clio::run.
 
 namespace clio::run {
 

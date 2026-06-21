@@ -47,7 +47,7 @@
 #include <chrono>
 #include <thread>
 
-using namespace chi;
+using namespace clio::run;
 using namespace std::chrono_literals;
 
 // Test pool ID for MOD_NAME

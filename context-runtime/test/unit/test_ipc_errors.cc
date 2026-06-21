@@ -48,7 +48,7 @@
 #include "clio_runtime/clio_runtime.h"
 #include "clio_runtime/ipc_manager.h"
 
-using namespace chi;
+using namespace clio::run;
 
 // ============================================================================
 // Global Setup - Initialize once for all tests

@@ -41,7 +41,7 @@
 #include "clio_runtime/admin/admin_client.h"
 #include "clio_runtime/bdev/bdev_client.h"
 
-using namespace chi;
+using namespace clio::run;
 
 /**
  * Test fixture for LocalTaskArchive tests

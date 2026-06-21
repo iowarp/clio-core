@@ -56,7 +56,7 @@
 #include "clio_runtime/clio_runtime.h"
 #include "clio_runtime/ipc_manager.h"
 
-using namespace chi;
+using namespace clio::run;
 
 // The runtime server is launched out-of-process via clio::run::test::RuntimeServer
 // (clio_run start) instead of fork()+CHIMAERA_INIT(kServer): fork-without-exec

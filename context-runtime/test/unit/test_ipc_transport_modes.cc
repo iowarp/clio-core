@@ -52,7 +52,7 @@
 #include <clio_runtime/bdev/bdev_client.h>
 #include <clio_runtime/bdev/bdev_tasks.h>
 
-using namespace chi;
+using namespace clio::run;
 
 inline clio::run::priv::vector<clio::run::bdev::Block> WrapBlock(
     const clio::run::bdev::Block& block) {

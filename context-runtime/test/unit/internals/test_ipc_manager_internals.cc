@@ -27,7 +27,7 @@
 #include <clio_runtime/singletons.h>
 #include <clio_runtime/types.h>
 
-using namespace chi;
+using namespace clio::run;
 
 namespace {
 namespace fs = std::filesystem;

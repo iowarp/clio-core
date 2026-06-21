@@ -141,9 +141,4 @@ inline void CHIMAERA_FINALIZE() { CLIO_RUNTIME_FINALIZE(); }
 // migration table.
 //==============================================================================
 
-// --- Module namespace alias (clio::run:: -> clio::run::) ---
-// Pulled in last so the alias is visible to every TU that includes this
-// umbrella, regardless of which module headers come along for the ride.
-#include "clio_runtime/compat/chimaera_namespace.h"
-
 #endif  // CLIO_RUNTIME_INCLUDE_CLIO_RUNTIME_CLIO_RUNTIME_H_

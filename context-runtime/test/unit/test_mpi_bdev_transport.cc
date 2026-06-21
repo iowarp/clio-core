@@ -67,7 +67,7 @@
 #include <clio_runtime/bdev/bdev_client.h>
 #include <clio_runtime/bdev/bdev_tasks.h>
 
-using namespace chi;
+using namespace clio::run;
 
 // --- Helpers ---
 

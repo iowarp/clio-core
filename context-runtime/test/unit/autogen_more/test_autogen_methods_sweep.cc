@@ -55,7 +55,7 @@
 #include <clio_cae/core/core_tasks.h>
 #include <clio_cae/core/autogen/core_methods.h>
 
-using namespace chi;
+using namespace clio::run;
 
 namespace {
 
