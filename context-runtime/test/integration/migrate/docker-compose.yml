@@ -8,7 +8,7 @@
 # Usage:
 #   docker compose up -d
 #   # Run test from node1
-#   docker exec iowarp-migrate-node1 bash -c "chimaera_mod_name_tests 'migrate_reroute'"
+#   docker exec iowarp-migrate-node1 bash -c "clio_run_mod_name_tests 'migrate_reroute'"
 
 services:
   # Node 1 - Test coordinator

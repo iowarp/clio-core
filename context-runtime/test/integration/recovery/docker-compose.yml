@@ -9,12 +9,12 @@
 # Usage:
 #   docker compose up -d
 #   # Run pre-failure test from node1
-#   docker exec iowarp-recovery-node1 bash -c "chimaera_recovery_tests '[recovery][pre_failure]'"
+#   docker exec iowarp-recovery-node1 bash -c "clio_run_recovery_tests '[recovery][pre_failure]'"
 #   # Kill node 4
 #   docker stop iowarp-recovery-node4
 #   # Wait 30s for SWIM detection + recovery
 #   # Run post-failure test from node1
-#   docker exec iowarp-recovery-node1 bash -c "chimaera_recovery_tests '[recovery][post_failure]'"
+#   docker exec iowarp-recovery-node1 bash -c "clio_run_recovery_tests '[recovery][post_failure]'"
 
 services:
   # Node 1 - Test coordinator

@@ -2,7 +2,7 @@
 runtime:
   num_threads: 4
   queue_depth: 256
-  conf_dir: /tmp/chimaera_restart_test
+  conf_dir: /tmp/clio_run_restart_test
 
 compose:
   - mod_name: clio_cte_core
@@ -15,7 +15,7 @@ compose:
         bdev_type: ram
         capacity_limit: 100MB
     performance:
-      metadata_log_path: /tmp/chimaera_restart_test/metadata.log
+      metadata_log_path: /tmp/clio_run_restart_test/metadata.log
       transaction_log_capacity: 32MB
       flush_metadata_period_ms: 0
       flush_data_period_ms: 0

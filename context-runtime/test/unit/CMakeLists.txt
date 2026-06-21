@@ -11,13 +11,13 @@ if(NOT COMMAND add_clio_module_client)
 endif()
 
 # Core runtime test executable
-set(TEST_TARGET chimaera_unit_tests)
+set(TEST_TARGET clio_run_unit_tests)
 set(TEST_SOURCES
-  test_chimaera_runtime_simple.cc
+  test_clio_run_runtime_simple.cc
 )
 
 # IPC AllocateBuffer test executable
-set(IPC_ALLOCATE_BUFFER_TEST_TARGET chimaera_ipc_allocate_buffer_tests)
+set(IPC_ALLOCATE_BUFFER_TEST_TARGET clio_run_ipc_allocate_buffer_tests)
 set(IPC_ALLOCATE_BUFFER_TEST_SOURCES
   test_ipc_allocate_buffer.cc
 )
@@ -29,61 +29,61 @@ set(UNORDERED_MAP_LL_TEST_SOURCES
 )
 
 # SaveTask and LoadTask test executable
-set(SAVE_LOAD_TASK_TEST_TARGET chimaera_save_load_task_tests)
+set(SAVE_LOAD_TASK_TEST_TARGET clio_run_save_load_task_tests)
 set(SAVE_LOAD_TASK_TEST_SOURCES
   test_save_load_task.cc
 )
 
 # Local Task Archive test executable
-set(LOCAL_TASK_ARCHIVE_TEST_TARGET chimaera_local_task_archive_tests)
+set(LOCAL_TASK_ARCHIVE_TEST_TARGET clio_run_local_task_archive_tests)
 set(LOCAL_TASK_ARCHIVE_TEST_SOURCES
   test_local_task_archive.cc
 )
 
 # Per-Process Shared Memory test executable
-set(PER_PROCESS_SHM_TEST_TARGET chimaera_per_process_shm_tests)
+set(PER_PROCESS_SHM_TEST_TARGET clio_run_per_process_shm_tests)
 set(PER_PROCESS_SHM_TEST_SOURCES
   test_per_process_shm.cc
 )
 
 # Autogen Coverage test executable
-set(AUTOGEN_COVERAGE_TEST_TARGET chimaera_autogen_coverage_tests)
+set(AUTOGEN_COVERAGE_TEST_TARGET clio_run_autogen_coverage_tests)
 set(AUTOGEN_COVERAGE_TEST_SOURCES
   test_autogen_coverage.cc
 )
 
 # Output Streaming test executable
-set(STREAMING_TEST_TARGET chimaera_output_streaming_tests)
+set(STREAMING_TEST_TARGET clio_run_output_streaming_tests)
 set(STREAMING_TEST_SOURCES
   test_streaming.cc
 )
 
 # External Client test executable
-set(EXTERNAL_CLIENT_TEST_TARGET chimaera_external_client_tests)
+set(EXTERNAL_CLIENT_TEST_TARGET clio_run_external_client_tests)
 set(EXTERNAL_CLIENT_TEST_SOURCES
   test_external_client.cc
 )
 
 # Runtime Cleanup test executable
-set(RUNTIME_CLEANUP_TEST_TARGET chimaera_runtime_cleanup_tests)
+set(RUNTIME_CLEANUP_TEST_TARGET clio_run_runtime_cleanup_tests)
 set(RUNTIME_CLEANUP_TEST_SOURCES
   test_runtime_cleanup.cc
 )
 
 # IPC Errors test executable
-set(IPC_ERRORS_TEST_TARGET chimaera_ipc_errors_tests)
+set(IPC_ERRORS_TEST_TARGET clio_run_ipc_errors_tests)
 set(IPC_ERRORS_TEST_SOURCES
   test_ipc_errors.cc
 )
 
 # IPC Transport Modes test executable
-set(IPC_TRANSPORT_MODES_TEST_TARGET chimaera_ipc_transport_modes_tests)
+set(IPC_TRANSPORT_MODES_TEST_TARGET clio_run_ipc_transport_modes_tests)
 set(IPC_TRANSPORT_MODES_TEST_SOURCES
   test_ipc_transport_modes.cc
 )
 
 # Client Retry test executable
-set(CLIENT_RETRY_TEST_TARGET chimaera_client_retry_tests)
+set(CLIENT_RETRY_TEST_TARGET clio_run_client_retry_tests)
 set(CLIENT_RETRY_TEST_SOURCES
   test_client_retry.cc
 )
@@ -1124,12 +1124,12 @@ endif()
 install(TARGETS ${_install_test_targets} RUNTIME DESTINATION bin)
 
 # Note: Module-specific tests are now in their respective module directories
-# Note: Distributed tests are run via Docker using the chimaera_bdev_chimod_tests binary
+# Note: Distributed tests are run via Docker using the clio_run_bdev_chimod_tests binary
 # See test/unit/distributed/docker-compose.yml and run_tests.sh for distributed test execution
 
 # MPI BDev Transport Integration Test
 if(CLIO_CORE_ENABLE_MPI)
-  set(MPI_BDEV_TRANSPORT_TEST_TARGET chimaera_mpi_bdev_transport_tests)
+  set(MPI_BDEV_TRANSPORT_TEST_TARGET clio_run_mpi_bdev_transport_tests)
   add_executable(${MPI_BDEV_TRANSPORT_TEST_TARGET} test_mpi_bdev_transport.cc)
 
   target_include_directories(${MPI_BDEV_TRANSPORT_TEST_TARGET} PRIVATE

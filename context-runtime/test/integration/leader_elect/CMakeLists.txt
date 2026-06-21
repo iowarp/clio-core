@@ -7,7 +7,7 @@ cmake_minimum_required(VERSION 3.10)
 # Phase 2: Node 1 runtime restarted externally, client re-inits and verifies health
 
 # Build the test binary
-set(LEADER_ELECT_TEST_TARGET chimaera_leader_elect_tests)
+set(LEADER_ELECT_TEST_TARGET clio_run_leader_elect_tests)
 
 add_executable(${LEADER_ELECT_TEST_TARGET}
   ${CMAKE_CURRENT_SOURCE_DIR}/test_leader_elect.cc

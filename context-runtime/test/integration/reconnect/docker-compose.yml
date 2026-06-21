@@ -10,7 +10,7 @@
 #
 # Usage:
 #   docker compose up -d
-#   docker exec iowarp-reconnect-node1 bash -c "chimaera_reconnect_tests '[reconnect]'"
+#   docker exec iowarp-reconnect-node1 bash -c "clio_run_reconnect_tests '[reconnect]'"
 
 services:
   # Node 1 - Test coordinator (runtime will be shut down by the test)

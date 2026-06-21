@@ -2,19 +2,19 @@
 cmake_minimum_required(VERSION 3.10)
 
 # Task archive test executable
-set(TASK_ARCHIVE_TEST_TARGET chimaera_task_archive_tests)
+set(TASK_ARCHIVE_TEST_TARGET clio_run_task_archive_tests)
 set(TASK_ARCHIVE_TEST_SOURCES
   test_task_archive.cc
 )
 
 # Compose feature test executable
-set(COMPOSE_TEST_TARGET chimaera_compose_tests)
+set(COMPOSE_TEST_TARGET clio_run_compose_tests)
 set(COMPOSE_TEST_SOURCES
   test_compose.cc
 )
 
 # SubmitBatch test executable
-set(SUBMIT_BATCH_TEST_TARGET chimaera_submit_batch_tests)
+set(SUBMIT_BATCH_TEST_TARGET clio_run_submit_batch_tests)
 set(SUBMIT_BATCH_TEST_SOURCES
   test_submit_batch.cc
 )

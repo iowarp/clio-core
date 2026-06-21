@@ -65,7 +65,7 @@
             "name": "Debug bdev_file_explicit_backend test",
             "type": "cppdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/build/bin/chimaera_bdev_chimod_tests",
+            "program": "${workspaceFolder}/build/bin/clio_run_bdev_chimod_tests",
             "args": [
                 "bdev_file_explicit_backend"
             ],
@@ -87,7 +87,7 @@
             "name": "Debug test_bdev_chimod (All Tests)",
             "type": "cppdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/build/bin/chimaera_bdev_chimod_tests",
+            "program": "${workspaceFolder}/build/bin/clio_run_bdev_chimod_tests",
             "args": [],
             "stopAtEntry": false,
             "cwd": "${workspaceFolder}",
@@ -107,7 +107,7 @@
             "name": "Debug bdev_force_net_flag test",
             "type": "cppdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/build/bin/chimaera_bdev_chimod_tests",
+            "program": "${workspaceFolder}/build/bin/clio_run_bdev_chimod_tests",
             "args": [
                 "bdev_force_net_flag"
             ],
@@ -129,7 +129,7 @@
             "name": "Debug bdev_parallel_io_operations test",
             "type": "cppdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/build/bin/chimaera_bdev_chimod_tests",
+            "program": "${workspaceFolder}/build/bin/clio_run_bdev_chimod_tests",
             "args": [
                 "bdev_parallel_io_operations"
             ],
@@ -151,7 +151,7 @@
             "name": "Debug bdev_create_destroy test",
             "type": "cppdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/build/bin/chimaera_bdev_chimod_tests",
+            "program": "${workspaceFolder}/build/bin/clio_run_bdev_chimod_tests",
             "args": [
                 "bdev_create_destroy"
             ],
@@ -487,7 +487,7 @@
             "name": "Debug Wait Test - Basic Depth 3",
             "type": "cppdbg",
             "request": "launch",
-            "program": "${workspaceFolder}/build/bin/chimaera_wait_functionality_tests",
+            "program": "${workspaceFolder}/build/bin/clio_run_wait_functionality_tests",
             "args": [
                 "wait_test_basic_functionality"
             ],

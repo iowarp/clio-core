@@ -65,11 +65,11 @@ cmake .. -DCHIMAERA_ENABLE_TESTS=ON
 make -j$(nproc)
 
 # 3. Run tests
-./bin/chimaera_unit_tests
+./bin/clio_run_unit_tests
 
 # Run specific test categories
-./bin/chimaera_unit_tests "[runtime]"
-./bin/chimaera_unit_tests "[task][mod_name]"
+./bin/clio_run_unit_tests "[runtime]"
+./bin/clio_run_unit_tests "[task][mod_name]"
 ```
 
 ### Using CTest
@@ -179,7 +179,7 @@ TEST_CASE("Custom Task Test", "[task][custom]") {
 
 ### Test Constants
 
-Key test configuration in `test_chimaera_runtime.cc`:
+Key test configuration in `test_clio_run_runtime.cc`:
 
 ```cpp
 constexpr chi::u32 kTestTimeoutMs = 5000;     // Task completion timeout
@@ -203,7 +203,7 @@ Run tests with verbose output for debugging:
 ```bash
 ./test/run_tests.sh -v
 # or
-./bin/chimaera_unit_tests --success --out --durations yes
+./bin/clio_run_unit_tests --success --out --durations yes
 ```
 
 ### Test Isolation

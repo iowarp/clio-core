@@ -122,7 +122,7 @@ run_single_test() {
     if ! docker exec iowarp-distributed-node1 bash -c "
         export CLIO_WITH_RUNTIME=0
         ${ipc_mode:+export CLIO_IPC_MODE=$ipc_mode}
-        chimaera_bdev_chimod_tests '$filter'
+        clio_run_bdev_chimod_tests '$filter'
     "; then
         return 1
     fi

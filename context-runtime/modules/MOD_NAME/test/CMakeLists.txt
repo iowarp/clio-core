@@ -2,25 +2,25 @@
 cmake_minimum_required(VERSION 3.10)
 
 # Flush correctness test executable
-set(FLUSH_TEST_TARGET chimaera_flush_correctness_tests)
+set(FLUSH_TEST_TARGET clio_run_flush_correctness_tests)
 set(FLUSH_TEST_SOURCES
   test_flush_correctness.cc
 )
 
 # CoMutex test executable
-set(COMUTEX_TEST_TARGET chimaera_comutex_tests)
+set(COMUTEX_TEST_TARGET clio_run_comutex_tests)
 set(COMUTEX_TEST_SOURCES
   test_comutex.cc
 )
 
 # Wait Functionality test executable
-set(WAIT_FUNCTIONALITY_TEST_TARGET chimaera_wait_functionality_tests)
+set(WAIT_FUNCTIONALITY_TEST_TARGET clio_run_wait_functionality_tests)
 set(WAIT_FUNCTIONALITY_TEST_SOURCES
   test_wait_functionality.cc
 )
 
 # Streaming test executable
-set(STREAMING_TEST_TARGET chimaera_streaming_tests)
+set(STREAMING_TEST_TARGET clio_run_streaming_tests)
 set(STREAMING_TEST_SOURCES
   test_streaming.cc
 )
@@ -281,7 +281,7 @@ add_custom_target(test_streaming_concurrent
 
 
 # Migrate test executable (integration test binary for container migration)
-set(MIGRATE_TEST_TARGET chimaera_migrate_tests)
+set(MIGRATE_TEST_TARGET clio_run_migrate_tests)
 set(MIGRATE_TEST_SOURCES
   ${CLIO_RUN_ROOT}/test/integration/migrate/test_migrate.cc
 )
@@ -311,7 +311,7 @@ set_target_properties(${MIGRATE_TEST_TARGET} PROPERTIES
 )
 
 # Recovery test executable (integration test binary for node failure recovery)
-set(RECOVERY_TEST_TARGET chimaera_recovery_tests)
+set(RECOVERY_TEST_TARGET clio_run_recovery_tests)
 set(RECOVERY_TEST_SOURCES
   ${CLIO_RUN_ROOT}/test/integration/recovery/test_recovery.cc
 )
@@ -341,7 +341,7 @@ set_target_properties(${RECOVERY_TEST_TARGET} PROPERTIES
 )
 
 # Reconnect test executable (integration test binary for client failover)
-set(RECONNECT_TEST_TARGET chimaera_reconnect_tests)
+set(RECONNECT_TEST_TARGET clio_run_reconnect_tests)
 set(RECONNECT_TEST_SOURCES
   ${CLIO_RUN_ROOT}/test/integration/reconnect/test_reconnect.cc
 )

@@ -27,7 +27,7 @@ class ClioDistributed(Application):
     - output_dir: Directory for test results
     - verbose: Enable verbose test output
 
-    Assumes chimaera_distributed_bdev_tests is installed and available in PATH.
+    Assumes clio_run_distributed_bdev_tests is installed and available in PATH.
     Requires clio_runtime to be running.
     """
 
@@ -82,7 +82,7 @@ class ClioDistributed(Application):
     def start(self):
         """Run the distributed test"""
         # Verify test executable is available
-        Which('chimaera_distributed_bdev_tests', LocalExecInfo(env=self.mod_env)).run()
+        Which('clio_run_distributed_bdev_tests', LocalExecInfo(env=self.mod_env)).run()
 
         self.log(f"Starting distributed bdev test: {self.config['test_case']}")
 
@@ -99,7 +99,7 @@ class ClioDistributed(Application):
 
             # Build test command
             cmd_parts = [
-                'chimaera_distributed_bdev_tests',
+                'clio_run_distributed_bdev_tests',
                 f'--num-nodes {self.config["num_nodes"]}',
                 f'--test-case {test_case}'
             ]

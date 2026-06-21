@@ -91,7 +91,7 @@ run_single_test() {
     local filter="$1"
     docker exec iowarp-leader-elect-node1 bash -c "
         export CLIO_WITH_RUNTIME=0
-        chimaera_leader_elect_tests '$filter'
+        clio_run_leader_elect_tests '$filter'
     "
 }
 

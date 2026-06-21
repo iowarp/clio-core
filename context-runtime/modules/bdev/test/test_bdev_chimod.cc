@@ -1272,7 +1272,7 @@ void run_bdev_file_explicit_backend_test(const char *mode_name) {
 
   // Create bdev client with explicit file backend.
   // Pool ID is process-unique: the chimaera runtime daemon outlives a
-  // single chimaera_bdev_chimod_tests invocation (the distributed test
+  // single clio_run_bdev_chimod_tests invocation (the distributed test
   // runner does `docker exec` three times for shm/tcp/ipc against the
   // same daemon), and a hardcoded pool ID would let the second test
   // attach to the FIRST test's stale pool whose file has already been

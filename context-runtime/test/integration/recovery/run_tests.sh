@@ -91,7 +91,7 @@ run_single_test() {
     local filter="$1"
     docker exec iowarp-recovery-node1 bash -c "
         export CLIO_WITH_RUNTIME=0
-        chimaera_recovery_tests '$filter'
+        clio_run_recovery_tests '$filter'
     "
 }
 

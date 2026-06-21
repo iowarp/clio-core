@@ -2,7 +2,7 @@
 cmake_minimum_required(VERSION 3.10)
 
 # Bdev ChiMod test executable
-set(BDEV_TEST_TARGET chimaera_bdev_chimod_tests)
+set(BDEV_TEST_TARGET clio_run_bdev_chimod_tests)
 set(BDEV_TEST_SOURCES
   test_bdev_chimod.cc
 )

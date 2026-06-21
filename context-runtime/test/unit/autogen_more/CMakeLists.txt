@@ -7,7 +7,7 @@
 # preset used for the conda GPU package).
 if(CLIO_CORE_ENABLE_CAE)
 
-set(AUTOGEN_SWEEP_TEST_TARGET chimaera_autogen_sweep_tests)
+set(AUTOGEN_SWEEP_TEST_TARGET clio_run_autogen_sweep_tests)
 
 add_executable(${AUTOGEN_SWEEP_TEST_TARGET}
   test_autogen_methods_sweep.cc

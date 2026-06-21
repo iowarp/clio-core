@@ -267,7 +267,7 @@ def initialize_runtime_early(cte):
         if not cte.initialize_cte(config_path, pool_query):
             raise RuntimeError("Failed to initialize CTE subsystem")
     
-    This follows the C++ test pattern from context-runtime/test/unit/test_chimaera_runtime.cc:
+    This follows the C++ test pattern from context-runtime/test/unit/test_clio_run_runtime.cc:
     - Calls CHIMAERA_INIT(ChimaeraMode::kClient, true)
     - Sleeps 500ms after initialization
     - Verifies initialization state
@@ -294,7 +294,7 @@ def initialize_runtime_early(cte):
             return False
 
         # Step 1: Initialize CLIO Runtime (unified init - both runtime and client)
-        # Following pattern from test_chimaera_runtime.cc
+        # Following pattern from test_clio_run_runtime.cc
         if not runtime_initialized or not client_initialized:
             print("🔧 Initializing Chimaera (unified CHIMAERA_INIT)...")
             print("   Note: If runtime isn't configured, this may cause FATAL and process exit")
@@ -886,7 +886,7 @@ def main():
     print()
     
     # STEP 0: Runtime initialization (if enabled) - MUST BE FIRST before any client code
-    # Following pattern from context-runtime/test/unit/test_chimaera_runtime.cc
+    # Following pattern from context-runtime/test/unit/test_clio_run_runtime.cc
     # Runtime initialization happens at the very beginning if enabled
     runtime_ok = False
     if should_initialize_runtime():
@@ -906,7 +906,7 @@ def main():
         setup_environment_paths()
 
         # Initialize runtime NOW (before any client code)
-        # Following pattern from context-runtime/test/unit/test_chimaera_runtime.cc:58-84
+        # Following pattern from context-runtime/test/unit/test_clio_run_runtime.cc:58-84
         runtime_ok = initialize_runtime_early(cte)
         print()
     else:

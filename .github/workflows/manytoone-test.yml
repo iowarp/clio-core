@@ -5,10 +5,10 @@ name: ManyToOne Test
 # leader. The project is compiled inside the iowarp/deps-cpu image (ABI-matched
 # to the runtime) and the ManyToOne tests are run in that same container:
 #
-#   * chimaera_bdev_chimod_tests "[manytoone]" — the focused collective test:
+#   * clio_run_bdev_chimod_tests "[manytoone]" — the focused collective test:
 #     a batch of AllocateBlocks requests sharing one (hash, key) is combined via
 #     AggregateIn, run once, and the result broadcast back to every submitter.
-#   * chimaera_cfs_test — the context-filesystem deferred-append pipeline, which
+#   * clio_run_cfs_test — the context-filesystem deferred-append pipeline, which
 #     routes per-tag AppendCollect tasks ManyToOne to a sequencer (exercising the
 #     single-in-flight-per-group-key serialization end to end).
 
@@ -74,7 +74,7 @@ jobs:
               # line: it is force-enabled inside context-transfer-engine, but the
               # cfs test lives in context-runtime, which is configured first — so
               # without this flag the option is still OFF when the test target is
-              # evaluated and chimaera_cfs_test never gets built (exit 127 below).
+              # evaluated and clio_run_cfs_test never gets built (exit 127 below).
               cmake --preset release -DCLIO_CORE_ENABLE_PYTHON=OFF \
                     -DCLIO_CTE_ENABLE_FILESYSTEM=ON
               cmake --build build -j"$(nproc)"
@@ -85,8 +85,8 @@ jobs:
               export CLIO_BIND_ADDR=127.0.0.1
 
               echo "==== ManyToOne collective (bdev AllocateBlocks batch) ===="
-              ./chimaera_bdev_chimod_tests "[manytoone]"
+              ./clio_run_bdev_chimod_tests "[manytoone]"
 
               echo "==== ManyToOne via context-filesystem deferred append ===="
-              ./chimaera_cfs_test
+              ./clio_run_cfs_test
             '

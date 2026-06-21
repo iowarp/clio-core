@@ -7,7 +7,7 @@ cmake_minimum_required(VERSION 3.10)
 # inspects exit codes via <sys/wait.h>.
 if(NOT WIN32)
 
-set(CLI_TEST_TARGET chimaera_cli_command_tests)
+set(CLI_TEST_TARGET clio_run_cli_command_tests)
 
 add_executable(${CLI_TEST_TARGET} test_clio_run_cli.cc)
 
@@ -104,29 +104,29 @@ if(CLIO_CORE_ENABLE_TESTS)
   # CTE WAL restart test: full persistence cycle (compose with restart:true,
   # write WAL, snapshot, daemon restart, replay). Spawns its own daemons on
   # port 10602 — serialize with the other live-runtime tests.
-  add_executable(chimaera_cte_wal_restart_test test_cte_wal_restart.cc)
-  target_include_directories(chimaera_cte_wal_restart_test PRIVATE
+  add_executable(clio_run_cte_wal_restart_test test_cte_wal_restart.cc)
+  target_include_directories(clio_run_cte_wal_restart_test PRIVATE
     ${CLIO_RUN_ROOT}/include
     ${CLIO_RUN_ROOT}/test
   )
-  target_link_libraries(chimaera_cte_wal_restart_test
+  target_link_libraries(clio_run_cte_wal_restart_test
     clio_cte_core_client
     clio_admin_client
     chimaera_cxx
     ctp::cxx
     ${CMAKE_THREAD_LIBS_INIT}
   )
-  target_compile_definitions(chimaera_cte_wal_restart_test PRIVATE
+  target_compile_definitions(clio_run_cte_wal_restart_test PRIVATE
     CLIO_RUN_EXE="$<TARGET_FILE:clio_run>")
-  add_dependencies(chimaera_cte_wal_restart_test clio_run)
-  set_target_properties(chimaera_cte_wal_restart_test PROPERTIES
+  add_dependencies(clio_run_cte_wal_restart_test clio_run)
+  set_target_properties(clio_run_cte_wal_restart_test PROPERTIES
     CXX_STANDARD 20
     CXX_STANDARD_REQUIRED ON
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
   add_test(
     NAME cr_cli_cte_wal_restart
-    COMMAND chimaera_cte_wal_restart_test
+    COMMAND clio_run_cte_wal_restart_test
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
   set_tests_properties(cr_cli_cte_wal_restart PROPERTIES
@@ -139,12 +139,12 @@ if(CLIO_CORE_ENABLE_TESTS)
   # client (open/write/getattr/read/truncate), assert EXACT logical size.
   # Only built when the filesystem chimod is enabled.
   if(CLIO_CTE_ENABLE_FILESYSTEM)
-    add_executable(chimaera_cfs_test test_cfs.cc)
-    target_include_directories(chimaera_cfs_test PRIVATE
+    add_executable(clio_run_cfs_test test_cfs.cc)
+    target_include_directories(clio_run_cfs_test PRIVATE
       ${CLIO_RUN_ROOT}/include
       ${CLIO_RUN_ROOT}/test
     )
-    target_link_libraries(chimaera_cfs_test
+    target_link_libraries(clio_run_cfs_test
       clio_cte_filesystem_client
       clio_cte_core_client
       clio_admin_client
@@ -152,17 +152,17 @@ if(CLIO_CORE_ENABLE_TESTS)
       ctp::cxx
       ${CMAKE_THREAD_LIBS_INIT}
     )
-    target_compile_definitions(chimaera_cfs_test PRIVATE
+    target_compile_definitions(clio_run_cfs_test PRIVATE
       CLIO_RUN_EXE="$<TARGET_FILE:clio_run>")
-    add_dependencies(chimaera_cfs_test clio_run clio_cte_filesystem_runtime)
-    set_target_properties(chimaera_cfs_test PROPERTIES
+    add_dependencies(clio_run_cfs_test clio_run clio_cte_filesystem_runtime)
+    set_target_properties(clio_run_cfs_test PROPERTIES
       CXX_STANDARD 20
       CXX_STANDARD_REQUIRED ON
       RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     )
     add_test(
       NAME cr_cli_cfs
-      COMMAND chimaera_cfs_test
+      COMMAND clio_run_cfs_test
       WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     )
     set_tests_properties(cr_cli_cfs PROPERTIES
@@ -174,12 +174,12 @@ if(CLIO_CORE_ENABLE_TESTS)
 
     # Focused rename stress + concurrency test (issue #597): POSIX
     # rename-overwrite semantics and renames racing on shared destinations.
-    add_executable(chimaera_cfs_rename_test test_cfs_rename.cc)
-    target_include_directories(chimaera_cfs_rename_test PRIVATE
+    add_executable(clio_run_cfs_rename_test test_cfs_rename.cc)
+    target_include_directories(clio_run_cfs_rename_test PRIVATE
       ${CLIO_RUN_ROOT}/include
       ${CLIO_RUN_ROOT}/test
     )
-    target_link_libraries(chimaera_cfs_rename_test
+    target_link_libraries(clio_run_cfs_rename_test
       clio_cte_filesystem_client
       clio_cte_core_client
       clio_admin_client
@@ -187,17 +187,17 @@ if(CLIO_CORE_ENABLE_TESTS)
       ctp::cxx
       ${CMAKE_THREAD_LIBS_INIT}
     )
-    target_compile_definitions(chimaera_cfs_rename_test PRIVATE
+    target_compile_definitions(clio_run_cfs_rename_test PRIVATE
       CLIO_RUN_EXE="$<TARGET_FILE:clio_run>")
-    add_dependencies(chimaera_cfs_rename_test clio_run clio_cte_filesystem_runtime)
-    set_target_properties(chimaera_cfs_rename_test PROPERTIES
+    add_dependencies(clio_run_cfs_rename_test clio_run clio_cte_filesystem_runtime)
+    set_target_properties(clio_run_cfs_rename_test PROPERTIES
       CXX_STANDARD 20
       CXX_STANDARD_REQUIRED ON
       RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     )
     add_test(
       NAME cr_cli_cfs_rename
-      COMMAND chimaera_cfs_rename_test
+      COMMAND clio_run_cfs_rename_test
       WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     )
     set_tests_properties(cr_cli_cfs_rename PROPERTIES
@@ -209,24 +209,24 @@ if(CLIO_CORE_ENABLE_TESTS)
   endif()
 
   # RestartLog unit test: pure file-level WAL behavior (no daemon).
-  add_executable(chimaera_restart_log_test test_restart_log.cc)
-  target_include_directories(chimaera_restart_log_test PRIVATE
+  add_executable(clio_run_restart_log_test test_restart_log.cc)
+  target_include_directories(clio_run_restart_log_test PRIVATE
     ${CLIO_RUN_ROOT}/include
     ${CLIO_RUN_ROOT}/test
   )
-  target_link_libraries(chimaera_restart_log_test
+  target_link_libraries(clio_run_restart_log_test
     chimaera_cxx
     ctp::cxx
     ${CMAKE_THREAD_LIBS_INIT}
   )
-  set_target_properties(chimaera_restart_log_test PROPERTIES
+  set_target_properties(clio_run_restart_log_test PROPERTIES
     CXX_STANDARD 20
     CXX_STANDARD_REQUIRED ON
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
   add_test(
     NAME cr_cli_restart_log
-    COMMAND chimaera_restart_log_test
+    COMMAND clio_run_restart_log_test
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
   set_tests_properties(cr_cli_restart_log PROPERTIES
@@ -237,28 +237,28 @@ if(CLIO_CORE_ENABLE_TESTS)
   # compose start/stop/rm/list + restart-WAL integration test: drives the
   # clio_run binary against a live daemon. Spawns daemons on ports 10610-10612
   # — serialize with the other live-runtime tests.
-  add_executable(chimaera_compose_restart_test test_compose_restart.cc)
-  target_include_directories(chimaera_compose_restart_test PRIVATE
+  add_executable(clio_run_compose_restart_test test_compose_restart.cc)
+  target_include_directories(clio_run_compose_restart_test PRIVATE
     ${CLIO_RUN_ROOT}/include
     ${CLIO_RUN_ROOT}/test
   )
-  target_link_libraries(chimaera_compose_restart_test
+  target_link_libraries(clio_run_compose_restart_test
     clio_admin_client
     chimaera_cxx
     ctp::cxx
     ${CMAKE_THREAD_LIBS_INIT}
   )
-  target_compile_definitions(chimaera_compose_restart_test PRIVATE
+  target_compile_definitions(clio_run_compose_restart_test PRIVATE
     CLIO_RUN_EXE="$<TARGET_FILE:clio_run>")
-  add_dependencies(chimaera_compose_restart_test clio_run)
-  set_target_properties(chimaera_compose_restart_test PROPERTIES
+  add_dependencies(clio_run_compose_restart_test clio_run)
+  set_target_properties(clio_run_compose_restart_test PROPERTIES
     CXX_STANDARD 20
     CXX_STANDARD_REQUIRED ON
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
   add_test(
     NAME cr_cli_compose_restart
-    COMMAND chimaera_compose_restart_test
+    COMMAND clio_run_compose_restart_test
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
   set_tests_properties(cr_cli_compose_restart PROPERTIES

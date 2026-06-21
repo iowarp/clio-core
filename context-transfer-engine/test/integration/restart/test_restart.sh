@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # Use BIN_DIR from environment, or fall back to /workspace/build/bin
 BIN_DIR="${BIN_DIR:-/workspace/build/bin}"
 COMPOSE_CONFIG="${SCRIPT_DIR}/test_restart_compose.yaml"
-CONF_DIR="/tmp/chimaera_restart_test"
+CONF_DIR="/tmp/clio_run_restart_test"
 
 echo "=== CTE Restart Integration Test ==="
 echo "BIN_DIR: $BIN_DIR"

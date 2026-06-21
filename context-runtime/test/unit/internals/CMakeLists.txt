@@ -1,5 +1,5 @@
 # IpcManager / runtime internals unit tests.
-set(IPC_INTERNALS_TEST_TARGET chimaera_ipc_internals_tests)
+set(IPC_INTERNALS_TEST_TARGET clio_run_ipc_internals_tests)
 
 add_executable(${IPC_INTERNALS_TEST_TARGET}
   test_ipc_manager_internals.cc

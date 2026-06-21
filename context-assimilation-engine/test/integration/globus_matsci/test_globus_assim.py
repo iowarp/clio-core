@@ -63,7 +63,7 @@ networking:
   neighborhood_size: 1
 logging:
   level: info
-  file: /tmp/chimaera_globus_test.log
+  file: /tmp/clio_run_globus_test.log
 runtime:
   num_threads: 4
   queue_depth: 1024
