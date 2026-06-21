@@ -420,13 +420,29 @@ clio::run::TaskResume Runtime::Getattr(ctp::ipc::FullPtr<GetattrTask> task,
   // Live logical size wins if the file is currently tracked (open files only;
   // directories are never tracked here).
   {
-    std::lock_guard<std::mutex> g(meta_mu_);
-    auto it = by_path_.find(path);
-    if (it != by_path_.end()) {
+    bool tracked = false;
+    clio::run::u64 live_size = 0;
+    clio::cte::core::TagId h_tag = clio::cte::core::TagId::GetNull();
+    {
+      std::lock_guard<std::mutex> g(meta_mu_);
+      auto it = by_path_.find(path);
+      if (it != by_path_.end()) {
+        tracked = true;
+        live_size = it->second->size_.load();
+        h_tag = it->second->tag_id_;
+      }
+    }
+    if (tracked) {
       task->exists_ = 1;
       task->is_dir_ = 0;
-      task->size_ = it->second->size_.load();
-      task->ino_ = InoFromTag(it->second->tag_id_);
+      task->size_ = live_size;
+      task->ino_ = InoFromTag(h_tag);
+      // ctime from the tag (mutex released before this RPC).
+      if (!h_tag.IsNull()) {
+        auto s = cte_.AsyncGetTagSize(h_tag, clio::run::PoolQuery::Local());
+        CLIO_CO_AWAIT(s);
+        task->ctime_ = (s->GetReturnCode() == 0) ? s->ctime_ : 0;
+      }
       task->return_code_ = 0;
       CLIO_CO_RETURN;
     }
@@ -446,6 +462,8 @@ clio::run::TaskResume Runtime::Getattr(ctp::ipc::FullPtr<GetattrTask> task,
           dir, clio::cte::core::TagId::GetNull(), clio::run::PoolQuery::Local());
       CLIO_CO_AWAIT(tag);
       task->ino_ = InoFromTag(tag->tag_id_);
+      // Directory ctime is intentionally left at 0: fetching it needs an extra
+      // GetTagSize per dir-stat (the ctime xfstests are file-level). (#603)
       task->return_code_ = 0;
       CLIO_CO_RETURN;
     }
@@ -463,6 +481,7 @@ clio::run::TaskResume Runtime::Getattr(ctp::ipc::FullPtr<GetattrTask> task,
     CLIO_CO_AWAIT(s);
     task->size_ = (s->GetReturnCode() == 0) ? s->tag_size_ : 0;
     task->ino_ = InoFromTag(tag->tag_id_);
+    task->ctime_ = (s->GetReturnCode() == 0) ? s->ctime_ : 0;
   } else {
     task->exists_ = 0; task->is_dir_ = 0; task->size_ = 0;
   }

@@ -241,23 +241,25 @@ struct GetattrTask : public clio::run::Task {
   OUT clio::run::u32 exists_;
   OUT clio::run::u32 is_dir_;
   OUT clio::run::u64 size_;
-  OUT clio::run::u64 ino_;  // stable inode = packed TagId (0 when nonexistent)
+  OUT clio::run::u64 ino_;     // stable inode = packed TagId (0 when nonexistent)
+  OUT clio::run::u64 ctime_;   // tag change-time (ns); 0 if unknown
   GetattrTask()
       : clio::run::Task(), path_(CTP_MALLOC), exists_(0), is_dir_(0), size_(0),
-        ino_(0) {}
+        ino_(0), ctime_(0) {}
   explicit GetattrTask(const clio::run::TaskId &task_id, const clio::run::PoolId &pool_id,
                        const clio::run::PoolQuery &pool_query, const std::string &path)
       : clio::run::Task(task_id, pool_id, pool_query, Method::kGetattr),
-        path_(CTP_MALLOC, path), exists_(0), is_dir_(0), size_(0), ino_(0) {}
+        path_(CTP_MALLOC, path), exists_(0), is_dir_(0), size_(0), ino_(0),
+        ctime_(0) {}
   void Copy(const ctp::ipc::FullPtr<GetattrTask>& o) {
     path_ = o->path_; exists_ = o->exists_; is_dir_ = o->is_dir_;
-    size_ = o->size_; ino_ = o->ino_;
+    size_ = o->size_; ino_ = o->ino_; ctime_ = o->ctime_;
   }
   template <typename Ar> void SerializeIn(Ar &ar) {
     Task::SerializeIn(ar); ar(path_);
   }
   template <typename Ar> void SerializeOut(Ar &ar) {
-    Task::SerializeOut(ar); ar(exists_, is_dir_, size_, ino_);
+    Task::SerializeOut(ar); ar(exists_, is_dir_, size_, ino_, ctime_);
   }
 };
 

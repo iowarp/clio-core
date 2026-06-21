@@ -374,7 +374,7 @@
                 "WRP_CORE_ENABLE_HDF5": "OFF",
                 "WRP_CORE_ENABLE_BENCHMARKS": "OFF",
                 "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
-                "HSHM_LOG_LEVEL": "0"
+                "CTP_LOG_LEVEL": "0"
             },
             "condition": {
                 "type": "equals",
@@ -409,7 +409,7 @@
                 "WRP_CORE_ENABLE_HDF5": "OFF",
                 "WRP_CORE_ENABLE_BENCHMARKS": "OFF",
                 "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
-                "HSHM_LOG_LEVEL": "1"
+                "CTP_LOG_LEVEL": "1"
             },
             "condition": {
                 "type": "equals",

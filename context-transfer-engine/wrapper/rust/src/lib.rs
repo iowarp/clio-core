@@ -193,12 +193,12 @@ mod tests {
 
     #[test]
     fn test_config_based_init() {
-        // Use CHI_SERVER_CONF like the memorybench does
+        // Use CLIO_SERVER_CONF like the memorybench does
         std::env::set_var(
-            "CHI_SERVER_CONF",
+            "CLIO_SERVER_CONF",
             "/workspace/context-transfer-engine/benchmark/memorybench/cte_config.yaml",
         );
-        std::env::set_var("CHI_WITH_RUNTIME", "1");
+        std::env::set_var("CLIO_WITH_RUNTIME", "1");
 
         init("").expect("CTE init failed");
 

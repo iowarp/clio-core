@@ -76,7 +76,7 @@ if(CLIO_CORE_ENABLE_TESTS)
     LABELS "msan_skip"
   )
   # Live-runtime variant: spawns its own clio_run daemon on port 10601 via
-  # chi::test::RuntimeServer (always reaped — destructor SIGTERM/SIGKILLs),
+  # clio::run::test::RuntimeServer (always reaped — destructor SIGTERM/SIGKILLs),
   # then drives monitor/compose/migrate/stop through the binary. The shared
   # memory segment name is per-user, so serialize with the other tests that
   # run a runtime.

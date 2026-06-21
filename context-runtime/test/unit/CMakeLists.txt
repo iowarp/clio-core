@@ -389,7 +389,7 @@ set_target_properties(${IPC_ERRORS_TEST_TARGET} PROPERTIES
 )
 
 # Create IPC Transport Modes test executable.
-# Launches the runtime out-of-process via chi::test::RuntimeServer (clio_run
+# Launches the runtime out-of-process via clio::run::test::RuntimeServer (clio_run
 # start) instead of fork()+CLIO_INIT(kServer). POSIX-only for now: the
 # RuntimeServer helper's Windows path pulls in <windows.h>, which collides with
 # the ctp lightbeam headers' <winsock2.h> and leaks the Yield/min/max macros

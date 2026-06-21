@@ -284,7 +284,7 @@ endmacro()
 #          -fsycl-allow-virtual-functions if CLIO_SYCL_ALLOW_VIRTUAL_FUNCTIONS=ON.
 #   ACPP   --acpp-targets=<target>.
 #
-# -fsycl-allow-func-ptr is required by chi::gpu::Container's function-pointer
+# -fsycl-allow-func-ptr is required by clio::run::gpu::Container's function-pointer
 # dispatch table; without it DPC++ rejects taking the address of device
 # functions.
 function(wrp_core_apply_sycl_flags target)

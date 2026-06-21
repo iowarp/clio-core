@@ -9,7 +9,7 @@ add_clio_module_runtime(
     src/autogen/core_lib_exec.cc
     # GPU runtime concept removed — kernels submit tasks to the CPU runtime
     # via gpu2cpu_queue and the CPU executes them through the standard
-    # chi::Container dispatch path.
+    # clio::run::Container dispatch path.
 )
 
 # Surface the GPU backend flags into the runtime library so the

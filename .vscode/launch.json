@@ -185,11 +185,11 @@
                     "value": "${workspaceFolder}/build/bin"
                 },
                 {
-                    "name": "CHI_WITH_RUNTIME",
+                    "name": "CLIO_WITH_RUNTIME",
                     "value": "1"
                 },
                 {
-                    "name": "CHI_SERVER_CONF",
+                    "name": "CLIO_SERVER_CONF",
                     "value": "/workspace/context-exploration-engine/api/demo/clio_conf.yaml"
                 }
             ],
@@ -235,11 +235,11 @@
             "cwd": "${workspaceFolder}/build",
             "environment": [
                 {
-                    "name": "CHI_WITH_RUNTIME",
+                    "name": "CLIO_WITH_RUNTIME",
                     "value": "1"
                 },
                 {
-                    "name": "CHI_SERVER_CONF",
+                    "name": "CLIO_SERVER_CONF",
                     "value": "/workspace/context-assimilation-engine/test/unit/clio_config.yaml"
                 }
             ],
@@ -495,7 +495,7 @@
             "cwd": "${workspaceFolder}/build",
             "environment": [
                 {
-                    "name": "CHI_WITH_RUNTIME",
+                    "name": "CLIO_WITH_RUNTIME",
                     "value": "1"
                 }
             ],
@@ -520,7 +520,7 @@
             "cwd": "${workspaceFolder}/build",
             "environment": [
                 {
-                    "name": "CHI_WITH_RUNTIME",
+                    "name": "CLIO_WITH_RUNTIME",
                     "value": "1"
                 }
             ],
@@ -547,7 +547,7 @@
             "cwd": "${workspaceFolder}/build",
             "environment": [
                 {
-                    "name": "CHI_WITH_RUNTIME",
+                    "name": "CLIO_WITH_RUNTIME",
                     "value": "0"
                 }
             ],

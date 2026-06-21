@@ -267,7 +267,7 @@ class ClioRuntime(Service):
                 'first_busy_wait': self.config['first_busy_wait'],
                 'max_sleep': self.config['max_sleep']
             },
-            # Parsed by chi::ConfigManager::ParseYAML — keys must match
+            # Parsed by clio::run::ConfigManager::ParseYAML — keys must match
             # the names used there (swim.enabled, swim.direct_probe_timeout_sec,
             # swim.indirect_probe_timeout_sec, swim.suspicion_timeout_sec).
             'swim': {

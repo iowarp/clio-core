@@ -185,6 +185,12 @@ static int cte_fuse_getattr(const char *path, struct stat *stbuf,
     stbuf->st_nlink = nlink;
     stbuf->st_size = static_cast<off_t>(t->size_);
   }
+  // Change time (ctime): the tag's last_changed_, in ns since the epoch. Tags
+  // only; 0 means the chimod had no value (leave st_ctim at the epoch).
+  if (t->ctime_ != 0) {
+    stbuf->st_ctim.tv_sec = static_cast<time_t>(t->ctime_ / 1000000000ULL);
+    stbuf->st_ctim.tv_nsec = static_cast<long>(t->ctime_ % 1000000000ULL);
+  }
   return 0;
 }
 

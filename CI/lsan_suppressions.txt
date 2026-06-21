@@ -14,13 +14,13 @@ leak:libzmq.so
 # ---------------------------------------------------------------------------
 # Chi runtime: RunContext leaks on shutdown
 # When the runtime shuts down, some tasks may still be in-flight. Their
-# RunContext (unique_ptr<chi::RunContext> created in IpcManager::BeginTask
+# RunContext (unique_ptr<clio::run::RunContext> created in IpcManager::BeginTask
 # or Worker::BeginTask) is freed only when the task reaches DelTask.
 # Stopping worker threads before draining the queue leaves RunContexts
 # unreachable.
 # ---------------------------------------------------------------------------
-leak:chi::Worker::BeginTask
-leak:chi::IpcManager::BeginTask
+leak:clio::run::Worker::BeginTask
+leak:clio::run::IpcManager::BeginTask
 
 # ---------------------------------------------------------------------------
 # Chi runtime: large IPC buffer allocations in tests
@@ -28,7 +28,7 @@ leak:chi::IpcManager::BeginTask
 # intentionally exercising IncreaseMemory() and do not always call
 # FreeBuffer() afterwards. The OS reclaims these allocations on exit.
 # ---------------------------------------------------------------------------
-leak:chi::IpcManager::AllocateBuffer
+leak:clio::run::IpcManager::AllocateBuffer
 
 # ---------------------------------------------------------------------------
 # Chi runtime: IpcManager::NewTask allocations not freed on shutdown
@@ -37,7 +37,7 @@ leak:chi::IpcManager::AllocateBuffer
 # remain allocated. Suppress the NewTask allocation site to avoid
 # spurious reports from infrastructure failures.
 # ---------------------------------------------------------------------------
-leak:chi::IpcManager::NewTask
+leak:clio::run::IpcManager::NewTask
 
 # ---------------------------------------------------------------------------
 # Chi runtime: MOD_NAME TestLargeOutput task data vector
@@ -52,7 +52,7 @@ leak:TestLargeOutput
 # ServerInit allocates runtime-lifetime objects (config, singletons, queues)
 # that persist until process exit. These are architectural and not leaked.
 # ---------------------------------------------------------------------------
-leak:chi::Clio::ServerInit
+leak:clio::run::Clio::ServerInit
 
 # ---------------------------------------------------------------------------
 # Chi runtime: Task::Serialize pool config string allocations
@@ -60,7 +60,7 @@ leak:chi::Clio::ServerInit
 # buffers that are freed only when the task is destructed. Tasks freed via
 # IPC path bypass C++ destructors, leaving these buffers unreachable.
 # ---------------------------------------------------------------------------
-leak:chi::Task::Serialize
+leak:clio::run::Task::Serialize
 
 # ---------------------------------------------------------------------------
 # bdev: AllocateBlocks block-list vector growth
@@ -93,13 +93,13 @@ leak:BlobQuery
 
 # ---------------------------------------------------------------------------
 # Chi runtime: per-thread TaskCounter in CreateTaskId()
-# chi::CreateTaskId() allocates a 4-byte TaskCounter via new and stores it
+# clio::run::CreateTaskId() allocates a 4-byte TaskCounter via new and stores it
 # in thread-local storage using CTP_THREAD_MODEL->SetTls(). Worker threads
 # created with std::thread may not invoke the TLS destructor on exit, leaving
 # the counter unreachable. This is an architectural TLS lifetime pattern;
 # the OS reclaims the allocation on process exit.
 # ---------------------------------------------------------------------------
-leak:chi::CreateTaskId
+leak:clio::run::CreateTaskId
 
 # ---------------------------------------------------------------------------
 # Chi modules: new_chimod container objects leak on server shutdown
@@ -138,12 +138,12 @@ leak:context-assimilation-engine/core/src/core_runtime.cc
 
 # ---------------------------------------------------------------------------
 # Chi runtime: Container::Init() name string allocation
-# chi::Container::Init() assigns the module pool name to a std::string member
+# clio::run::Container::Init() assigns the module pool name to a std::string member
 # (Container::name_). When the module container object is not explicitly
 # destroyed on server shutdown, this std::string heap allocation leaks.
 # All chi module containers (bdev, CTE, CAE, admin) go through this path.
 # ---------------------------------------------------------------------------
-leak:chi::Container::Init
+leak:clio::run::Container::Init
 
 # ---------------------------------------------------------------------------
 # Chi runtime: LocalLoadTaskArchive::bulk IPC buffer allocations in tests
@@ -153,7 +153,7 @@ leak:chi::Container::Init
 # a paired destruction path, so these 16-byte allocations are never freed.
 # This is a test-infrastructure artefact; the OS reclaims on process exit.
 # ---------------------------------------------------------------------------
-leak:chi::LocalLoadTaskArchive::bulk
+leak:clio::run::LocalLoadTaskArchive::bulk
 
 # ---------------------------------------------------------------------------
 # CTE core module: coroutine frame allocation in autogen Run dispatch
@@ -181,7 +181,7 @@ leak:context-assimilation-engine/core/src/autogen/core_lib_exec.cc
 
 # ---------------------------------------------------------------------------
 # bdev / ZMQ transport: block-data vectors allocated during RecvBulks
-# ctp::lbm::ZeroMqTransport::RecvBulks<chi::LoadTaskArchive>() receives a
+# ctp::lbm::ZeroMqTransport::RecvBulks<clio::run::LoadTaskArchive>() receives a
 # ZMQ multi-part message and deserialises bdev Block entries into heap vectors
 # (via cereal/msgpack) before passing them to LoadTask / AllocLoadTask.
 # If the server shuts down before the task completes, the interim heap buffer
@@ -195,7 +195,7 @@ leak:ctp::lbm::ZeroMqTransport::RecvBulks
 # bdev module: Block vector deserialized in LoadTask / AllocLoadTask
 # bdev::Runtime::LoadTask() and AllocLoadTask() (autogen bdev_lib_exec.cc)
 # deserialise incoming bdev tasks (WriteTask, ReadTask, etc.) from the
-# chi::LoadTaskArchive. This calls LoadTaskArchive::operator>> which resizes
+# clio::run::LoadTaskArchive. This calls LoadTaskArchive::operator>> which resizes
 # a ctp::priv::vector<bdev::Block> on the malloc heap. If the server shuts
 # down while bdev tasks are still in-flight, these block vectors are never
 # freed (the task is freed via IPC path that bypasses C++ destructors).
@@ -210,7 +210,7 @@ leak:bdev/src/autogen/bdev_lib_exec.cc
 # this copied PoolQuery vector is never freed. The leak manifests as an
 # indirect leak reachable only through the (suppressed) task allocation.
 # ---------------------------------------------------------------------------
-leak:chi::IpcManager::RouteGlobal
+leak:clio::run::IpcManager::RouteGlobal
 
 # ---------------------------------------------------------------------------
 # Chi runtime: admin::Runtime::SendIn coroutine sub-allocations

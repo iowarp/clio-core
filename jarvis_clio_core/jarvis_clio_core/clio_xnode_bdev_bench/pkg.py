@@ -3,7 +3,7 @@ clio_xnode_bdev_bench — jarvis-cd wrapper for the cross-node clio_run
 bdev benchmark binary (`clio_xnode_bdev_bench`).
 
 The benchmark:
-  - Calls MPI_Init, then chi::CLIO_INIT(kClient, false), so it needs
+  - Calls MPI_Init, then clio::run::CLIO_INIT(kClient, false), so it needs
     a running clio_run daemon cluster (clio_runtime in the same pipeline).
   - Rank 0 creates a per-bench bdev pool (id 777.0) on every node via
     AsyncCreate(Broadcast, ..., kRam, 4 GiB).

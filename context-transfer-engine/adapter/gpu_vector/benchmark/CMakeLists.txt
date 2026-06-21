@@ -1,7 +1,7 @@
 #-----------------------------------------------------------------------------
 # gpu_vector performance benchmark.
 #
-# Drives a Vector<chi::u32> through write/flush/read and prints
+# Drives a Vector<clio::run::u32> through write/flush/read and prints
 # bandwidth + latency. Knobs: --blocks, --pages-per-block, --page-size,
 # --ratio, --total-bytes, --cache-period-ms, --iters, --no-read,
 # --bdev-capacity-mib, --gpu-id.
