@@ -37,7 +37,7 @@
  * Contains the server-side task processing logic.
  */
 
-#include "../include/chimaera/MOD_NAME/MOD_NAME_runtime.h"
+#include "../include/clio_runtime/MOD_NAME/MOD_NAME_runtime.h"
 
 #include <chrono>
 #include <clio_ctp/serialize/msgpack_wrapper.h>

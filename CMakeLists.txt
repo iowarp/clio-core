@@ -1574,7 +1574,7 @@ if(PIP_LIB_TARGETS)
     LIBRARY DESTINATION lib
     ARCHIVE DESTINATION lib
     RUNTIME DESTINATION bin
-    PUBLIC_HEADER DESTINATION include/chimaera)
+    PUBLIC_HEADER DESTINATION include/clio_runtime)
   # Mirror the install into the default ("Unspecified") component so the
   # same shared libs ship in the .deb / .rpm built by cpack -G DEB/RPM
   # (those generators filter to CPACK_COMPONENTS_ALL=Unspecified). Without
@@ -1592,7 +1592,7 @@ if(PIP_LIB_TARGETS)
     LIBRARY DESTINATION lib
     ARCHIVE DESTINATION lib
     RUNTIME DESTINATION bin
-    PUBLIC_HEADER DESTINATION include/chimaera)
+    PUBLIC_HEADER DESTINATION include/clio_runtime)
 endif()
 
 # CLI binary -> iowarp_core/bin/

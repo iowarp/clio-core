@@ -184,13 +184,8 @@ install(CODE "
   endforeach()
 ")
 
-# Install canonical headers (new name) AND the legacy forwarder-shim tree
-# (so external code using `#include <chimaera/...>` still resolves).
+# Install canonical headers.
 install(DIRECTORY include/clio_runtime
-  DESTINATION include
-  FILES_MATCHING PATTERN "*.h"
-)
-install(DIRECTORY include/chimaera
   DESTINATION include
   FILES_MATCHING PATTERN "*.h"
 )
