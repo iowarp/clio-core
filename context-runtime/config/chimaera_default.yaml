@@ -144,3 +144,18 @@ compose:
     #   flush_data_period_ms: 10000      # Data flush interval (ms)
     #   flush_data_min_persistence: 1    # Min persistence level (1=temp-nonvolatile)
     #   transaction_log_capacity: "32MB" # Write-ahead log capacity
+
+  # === Context Filesystem (CFS) ===
+  # POSIX-style filesystem chimod that the libfuse / POSIX adapters drive. It
+  # sits at the canonical filesystem pool 560.0 (clio::cte::filesystem::
+  # kCfsPoolId) over the CTE core at next_pool_id (512.0): paths map to CTE tags
+  # and offsets to 1 MiB page-blobs. Composing it here means a filesystem pool
+  # exists out of the box; the adapters create-or-bind it idempotently, so this
+  # is safe whether or not an adapter is also used. Must come AFTER the CTE core
+  # entry above — its Create resolves tags on the CTE pool (512.0). Remove it if
+  # you do not need the filesystem layer.
+  - mod_name: clio_cte_filesystem
+    pool_name: clio_cte_filesystem
+    pool_query: local
+    pool_id: "560.0"
+    next_pool_id: "512.0"               # CTE core pool — see entry above
