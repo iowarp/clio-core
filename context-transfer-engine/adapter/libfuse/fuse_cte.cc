@@ -88,7 +88,11 @@ CfsHandle *GetHandle(struct fuse_file_info *fi) {
 static void *cte_fuse_init(struct fuse_conn_info *conn,
                            struct fuse_config *cfg) {
   (void)conn;
-  cfg->use_ino = 0;
+  // Trust the inode numbers we report (st_ino in getattr, d_ino in readdir),
+  // both derived from the tag id, instead of letting FUSE auto-generate them.
+  // This makes stat and readdir agree on d_ino/st_ino (generic/637), and gives
+  // hard-link aliases (which share a TagId) the same inode.
+  cfg->use_ino = 1;
   cfg->direct_io = 1;
   // Disable the kernel attribute/entry caches. Metadata (size, and especially
   // st_nlink for hard links) can change without this FUSE process being the one
@@ -138,6 +142,7 @@ static int cte_fuse_getattr(const char *path, struct stat *stbuf,
   if (p == "/") {
     stbuf->st_mode = S_IFDIR | 0755;
     stbuf->st_nlink = 2;
+    stbuf->st_ino = 1;  // fixed root inode
     stbuf->st_uid = getuid();
     stbuf->st_gid = getgid();
     return 0;
@@ -152,6 +157,7 @@ static int cte_fuse_getattr(const char *path, struct stat *stbuf,
   }
   stbuf->st_uid = getuid();
   stbuf->st_gid = getgid();
+  stbuf->st_ino = static_cast<ino_t>(t->ino_);  // stable inode = packed TagId
   if (t->is_dir_) {
     stbuf->st_mode = S_IFDIR | 0755;
     stbuf->st_nlink = 2;
@@ -210,14 +216,22 @@ static int cte_fuse_readdir(const char *path, void *buf,
   }
   size_t prefix_len = p.size();
   if (!p.empty() && p.back() != '/') prefix_len++;
-  for (const auto &entry : t->entries_) {
-    std::string full = entry.str();
+  // entries_ and inos_ are index-aligned (the chimod builds them together).
+  for (size_t i = 0; i < t->entries_.size(); ++i) {
+    std::string full = t->entries_[i].str();
     std::string name = full.size() > prefix_len ? full.substr(prefix_len) : full;
-    // A child sentinel directory comes back as "<dir>/<name>/"; drop the
+    // A child sentinel directory may come back as "<dir>/<name>/"; drop the
     // trailing slash so it shows as a plain directory entry.
     if (!name.empty() && name.back() == '/') name.pop_back();
     if (name.empty()) continue;
-    filler(buf, name.c_str(), nullptr, 0, static_cast<fuse_fill_dir_flags>(0));
+    // Supply only d_ino (the child's tag-derived inode) so getdents agrees with
+    // a subsequent stat (generic/637). Leave st_mode = 0 (DT_UNKNOWN): the entry
+    // type is not reliably known here, so the kernel issues a getattr to resolve
+    // it — setting a wrong d_type would mislead `rm -rf`/`find`.
+    struct stat st;
+    memset(&st, 0, sizeof(st));
+    st.st_ino = i < t->inos_.size() ? static_cast<ino_t>(t->inos_[i]) : 0;
+    filler(buf, name.c_str(), &st, 0, static_cast<fuse_fill_dir_flags>(0));
   }
   return 0;
 }

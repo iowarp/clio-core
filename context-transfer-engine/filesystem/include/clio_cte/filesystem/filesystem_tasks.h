@@ -241,21 +241,23 @@ struct GetattrTask : public chi::Task {
   OUT chi::u32 exists_;
   OUT chi::u32 is_dir_;
   OUT chi::u64 size_;
+  OUT chi::u64 ino_;  // stable inode = packed TagId (0 when nonexistent)
   GetattrTask()
-      : chi::Task(), path_(CTP_MALLOC), exists_(0), is_dir_(0), size_(0) {}
+      : chi::Task(), path_(CTP_MALLOC), exists_(0), is_dir_(0), size_(0),
+        ino_(0) {}
   explicit GetattrTask(const chi::TaskId &task_id, const chi::PoolId &pool_id,
                        const chi::PoolQuery &pool_query, const std::string &path)
       : chi::Task(task_id, pool_id, pool_query, Method::kGetattr),
-        path_(CTP_MALLOC, path), exists_(0), is_dir_(0), size_(0) {}
+        path_(CTP_MALLOC, path), exists_(0), is_dir_(0), size_(0), ino_(0) {}
   void Copy(const ctp::ipc::FullPtr<GetattrTask>& o) {
     path_ = o->path_; exists_ = o->exists_; is_dir_ = o->is_dir_;
-    size_ = o->size_;
+    size_ = o->size_; ino_ = o->ino_;
   }
   template <typename Ar> void SerializeIn(Ar &ar) {
     Task::SerializeIn(ar); ar(path_);
   }
   template <typename Ar> void SerializeOut(Ar &ar) {
-    Task::SerializeOut(ar); ar(exists_, is_dir_, size_);
+    Task::SerializeOut(ar); ar(exists_, is_dir_, size_, ino_);
   }
 };
 
@@ -345,20 +347,22 @@ struct LinkTask : public chi::Task {
 struct ReaddirTask : public chi::Task {
   IN chi::priv::string path_;
   OUT chi::priv::vector<chi::priv::string> entries_;
+  OUT chi::priv::vector<chi::u64> inos_;  // packed TagId per entry (parallel)
   ReaddirTask()
-      : chi::Task(), path_(CTP_MALLOC), entries_(CTP_MALLOC) {}
+      : chi::Task(), path_(CTP_MALLOC), entries_(CTP_MALLOC),
+        inos_(CTP_MALLOC) {}
   explicit ReaddirTask(const chi::TaskId &task_id, const chi::PoolId &pool_id,
                        const chi::PoolQuery &pool_query, const std::string &path)
       : chi::Task(task_id, pool_id, pool_query, Method::kReaddir),
-        path_(CTP_MALLOC, path), entries_(CTP_MALLOC) {}
+        path_(CTP_MALLOC, path), entries_(CTP_MALLOC), inos_(CTP_MALLOC) {}
   void Copy(const ctp::ipc::FullPtr<ReaddirTask>& o) {
-    path_ = o->path_; entries_ = o->entries_;
+    path_ = o->path_; entries_ = o->entries_; inos_ = o->inos_;
   }
   template <typename Ar> void SerializeIn(Ar &ar) {
     Task::SerializeIn(ar); ar(path_);
   }
   template <typename Ar> void SerializeOut(Ar &ar) {
-    Task::SerializeOut(ar); ar(entries_);
+    Task::SerializeOut(ar); ar(entries_, inos_);
   }
 };
 
