@@ -28,6 +28,7 @@ on:
   push:
     branches:
       - main
+      - dev
       - issue-555-windows-icx
   pull_request:
     branches:
