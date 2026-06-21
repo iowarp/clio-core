@@ -42,6 +42,14 @@ ctp::ipc::FullPtr<Task> IpcCpu2Cpu::RuntimeRecv(
     task_full_ptr = container->AllocLoadTask(method_id, archive);
   }
 
+  // This task came straight from an external user client (the
+  // FUTURE_COPY_FROM_CLIENT guard above), so tag it for per-RPC access control.
+  // The flag is serialized in SerializeIn, so it survives if the task is later
+  // forwarded to a remote container owner.
+  if (!task_full_ptr.IsNull()) {
+    task_full_ptr->SetFlags(TASK_EXTERNAL_CLIENT);
+  }
+
   // Update the Future's task pointer and mark as copied
   future.GetTaskPtr() = task_full_ptr;
   future_shm->flags_.SetBits(FutureShm::FUTURE_WAS_COPIED);

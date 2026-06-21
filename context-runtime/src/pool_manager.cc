@@ -611,10 +611,13 @@ TaskResume PoolManager::CreatePool(FullPtr<Task> task, RunContext* run_ctx) {
          "Creating container for pool {} on node {} with container_id={}",
          target_pool_id, node_id, node_id);
 
-    // Check if this is a restart scenario (compose mode with restart flag)
+    // Check if this is a restart scenario (compose mode with restart flag).
+    // The compose PoolConfig also carries optional per-RPC access control
+    // (container_visibility / container_rpc_acl), applied after Init below.
     bool is_restart = false;
+    chi::PoolConfig pool_config;
     if (create_task->do_compose_) {
-      chi::PoolConfig pool_config =
+      pool_config =
           chi::Task::Deserialize<chi::PoolConfig>(create_task->chimod_params_);
       is_restart = pool_config.restart_;
     }
@@ -626,6 +629,12 @@ TaskResume PoolManager::CreatePool(FullPtr<Task> task, RunContext* run_ctx) {
     } else {
       container->Init(target_pool_id, pool_name, node_id);
     }
+
+    // Apply per-RPC access control now that the module's Init has populated the
+    // method-name table (via SetMethodNames). Defaults (public, no overrides)
+    // make this a no-op for pools that don't opt in.
+    container->ConfigureAcl(pool_config.container_visibility_,
+                            pool_config.rpc_acl_);
 
     HLOG(kInfo,
          "Container initialized with pool ID {}, name {}, and container ID {}",

@@ -464,6 +464,13 @@ struct AddressHash {
   BIT_OPT(chi::u32, 8)  ///< ManyToOne: this is the synthetic aggregate task the
                         ///< neighborhood leader runs for a batch. On completion,
                         ///< its OUT is broadcast to the batched original tasks.
+#define TASK_EXTERNAL_CLIENT \
+  BIT_OPT(chi::u32, 9)  ///< Task ingressed from an external user client (set in
+                        ///< the IpcCpu2Cpu / IpcCpu2CpuZmq client-receive paths,
+                        ///< never on runtime-internal self-sends). Serialized in
+                        ///< SerializeIn so it rides a remote hop to the container
+                        ///< owner, which enforces per-RPC access control
+                        ///< (private methods reject external callers).
 
 // Bulk transfer flags are defined in clio_ctp/lightbeam/lightbeam.h:
 // - BULK_EXPOSE: Bulk is exposed (sender exposes for reading)

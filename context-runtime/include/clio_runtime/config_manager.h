@@ -35,6 +35,7 @@
 #define CHIMAERA_INCLUDE_CHIMAERA_MANAGERS_CONFIG_MANAGER_H_
 
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "clio_runtime/types.h"
@@ -52,6 +53,13 @@ struct PoolConfig {
   PoolQuery pool_query_;     /**< Pool query routing (Dynamic or Local) */
   std::string config_;       /**< Remaining YAML configuration as string */
   bool restart_ = false;     /**< If true, store compose file for crash-restart */
+  /** Default RPC visibility for the container: 0 = public (default),
+   *  1 = private. A private container rejects RPCs from external user clients
+   *  (runtime-internal callers are always allowed). */
+  u32 container_visibility_ = 0;
+  /** Per-RPC visibility overrides, keyed by RPC method NAME -> 0 public /
+   *  1 private. Methods absent here inherit container_visibility_. */
+  std::unordered_map<std::string, u32> rpc_acl_;
 
   PoolConfig() = default;
 
@@ -70,7 +78,8 @@ struct PoolConfig {
    */
   template <class Archive>
   void serialize(Archive& ar) {
-    ar(mod_name_, pool_name_, pool_id_, pool_query_, config_, restart_);
+    ar(mod_name_, pool_name_, pool_id_, pool_query_, config_, restart_,
+       container_visibility_, rpc_acl_);
   }
 };
 

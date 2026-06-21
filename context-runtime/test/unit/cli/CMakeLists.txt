@@ -208,6 +208,43 @@ if(CLIO_CORE_ENABLE_TESTS)
     )
   endif()
 
+  # Per-RPC access-control test (private containers/methods). Composes ram bdev
+  # pools marked private (whole-container and per-RPC) and asserts an external
+  # client's direct Write/AllocateBlocks is rejected with EACCES while a public
+  # control pool succeeds. Spawns its own daemon on port 10606 — serialize with
+  # the other live-runtime tests.
+  add_executable(chimaera_bdev_acl_test test_bdev_acl.cc)
+  target_include_directories(chimaera_bdev_acl_test PRIVATE
+    ${CLIO_RUN_ROOT}/include
+    ${CLIO_RUN_ROOT}/test
+  )
+  target_link_libraries(chimaera_bdev_acl_test
+    clio_bdev_client
+    clio_admin_client
+    chimaera_cxx
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+  )
+  target_compile_definitions(chimaera_bdev_acl_test PRIVATE
+    CLIO_RUN_EXE="$<TARGET_FILE:clio_run>")
+  add_dependencies(chimaera_bdev_acl_test clio_run clio_bdev_runtime)
+  set_target_properties(chimaera_bdev_acl_test PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  add_test(
+    NAME cr_cli_bdev_acl
+    COMMAND chimaera_bdev_acl_test
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_cli_bdev_acl PROPERTIES
+    ENVIRONMENT "${_cli_live_env}"
+    RESOURCE_LOCK "chimaera_runtime_port"
+    TIMEOUT 120
+    LABELS "msan_skip"
+  )
+
   # RestartLog unit test: pure file-level WAL behavior (no daemon).
   add_executable(chimaera_restart_log_test test_restart_log.cc)
   target_include_directories(chimaera_restart_log_test PRIVATE

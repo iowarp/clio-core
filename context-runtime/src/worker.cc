@@ -43,6 +43,7 @@
 #ifndef __NVCOMPILER
 #include <coroutine>
 #endif
+#include <cerrno>
 #include <cstdlib>
 #include <iostream>
 #include <unordered_set>
@@ -940,6 +941,27 @@ void Worker::ExecTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
       pool_manager->GetContainer(task_ptr->pool_id_, container_id, is_plugged);
   if (exec_container && !is_plugged) {
     run_ctx->container_ = exec_container;
+  }
+
+  // Per-RPC access control. This is the owning host (the container is resolved
+  // locally and the method is about to run) and the only place reached exactly
+  // once per locally-executed task — including remote-forwarded ones, which
+  // re-enter here on arrival with TASK_EXTERNAL_CLIENT preserved across the hop.
+  // Reject an external user client's call to a private method before the
+  // handler runs; deliver EACCES through the normal completion path. Internal
+  // callers and public methods pass through. Only on first execution (resumes
+  // of an already-admitted task carry no new authorization decision).
+  if (!is_started && exec_container &&
+      !exec_container->IsRpcAllowed(
+          task_ptr->method_,
+          task_ptr->task_flags_.Any(TASK_EXTERNAL_CLIENT))) {
+    HLOG(kWarning,
+         "Worker {}: denying external client call to private method {} on "
+         "pool {}",
+         worker_id_, task_ptr->method_, task_ptr->pool_id_);
+    task_ptr->SetReturnCode(EACCES);
+    EndTask(task_ptr, run_ctx, /*can_resched=*/false);
+    return;
   }
 
   // Start CPU and wall timers before execution
