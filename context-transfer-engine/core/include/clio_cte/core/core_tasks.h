@@ -2487,6 +2487,10 @@ struct TagQueryTask : public chi::Task {
   IN chi::u32 max_tags_;
   OUT chi::u64 total_tags_matched_;
   OUT std::vector<std::string> results_;
+  // Packed TagId per matched tag, index-aligned with results_:
+  // (major_ << 32) | minor_. Lets callers (e.g. the filesystem readdir) assign
+  // a stable per-tag inode without a second round trip per entry.
+  OUT std::vector<chi::u64> result_ids_;
 
   // SHM constructor
   TagQueryTask()
@@ -2527,7 +2531,7 @@ struct TagQueryTask : public chi::Task {
   template <typename Archive>
   CTP_CROSS_FUN void SerializeOut(Archive &ar) {
     Task::SerializeOut(ar);
-    ar(total_tags_matched_, results_);
+    ar(total_tags_matched_, results_, result_ids_);
   }
 
   /**
@@ -2540,6 +2544,7 @@ struct TagQueryTask : public chi::Task {
     max_tags_ = other->max_tags_;
     total_tags_matched_ = other->total_tags_matched_;
     results_ = other->results_;
+    result_ids_ = other->result_ids_;
   }
 
   /**
@@ -2551,11 +2556,13 @@ struct TagQueryTask : public chi::Task {
     // Sum total matched tags across replicas
     total_tags_matched_ += other->total_tags_matched_;
 
-    // Append results up to max_tags_ (if non-zero)
-    for (const auto &tag_name : other->results_) {
+    // Append results (and their packed ids, in lockstep) up to max_tags_.
+    for (size_t i = 0; i < other->results_.size(); ++i) {
       if (max_tags_ != 0 && results_.size() >= static_cast<size_t>(max_tags_))
         break;
-      results_.push_back(tag_name);
+      results_.push_back(other->results_[i]);
+      if (i < other->result_ids_.size())
+        result_ids_.push_back(other->result_ids_[i]);
     }
   }
 };
