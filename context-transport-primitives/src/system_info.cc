@@ -46,7 +46,9 @@
 #define PATH_MAX 4096  // POSIX default; not always in <climits> under NVHPC
 #endif
 // LCOV_EXCL_STOP
+#include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <string>
 
 #include "clio_ctp/constants/macros.h"
@@ -1107,6 +1109,69 @@ SharedLibrary &SharedLibrary::operator=(SharedLibrary &&other) noexcept {
     other.handle_ = nullptr;
   }
   return *this;
+}
+
+/// @brief Retrieves storage device hardware health statistics.
+///
+/// Reads a JSON file left by an external admin service
+/// (e.g. a smartmontools/smartd cron job writing
+/// /tmp/iowarp_hw_health_<device>.json).  iowarp itself never needs
+/// elevated privileges; this function is purely a non-root consumer.
+///
+/// @param path  Path to the file or block device whose health to query.
+///              If not already a /dev/ node, df is used to find the backing
+///              device so the correct per-device JSON file is located.
+/// @return      JSON string with health stats, or "{}" if unavailable.
+std::string SystemInfo::GetDeviceHealthStats(const std::string &path) {
+#if CTP_ENABLE_PROCFS_SYSINFO
+  std::string device = path;
+
+  // If the path is not a raw block device, find the mount's backing device.
+  if (path.find("/dev/") != 0) {
+    // Quote path to handle spaces safely.
+    std::string cmd =
+        "df -P \"" + path + "\" 2>/dev/null | tail -1 | awk '{print $1}'";
+    char buffer[256];
+    FILE *pipe = popen(cmd.c_str(), "r");
+    if (pipe) {
+      if (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+        std::string df_out = buffer;
+        if (!df_out.empty() && df_out.back() == '\n') {
+          df_out.pop_back();
+        }
+        // Only use the df output if it returned a real /dev/ node
+        // (ignore things like 'overlay' in containers).
+        if (df_out.find("/dev/") == 0) {
+          device = df_out;
+        }
+      }
+      pclose(pipe);
+    }
+  }
+
+  // Extract the basename of the device (e.g. /dev/nvme0n1 -> nvme0n1).
+  std::string dev_basename = device;
+  size_t slash_pos = dev_basename.find_last_of('/');
+  if (slash_pos != std::string::npos) {
+    dev_basename = dev_basename.substr(slash_pos + 1);
+  }
+
+  // Read health stats written by the external admin service.
+  // e.g. /tmp/iowarp_hw_health_nvme0n1.json
+  std::string stats_path =
+      "/tmp/iowarp_hw_health_" + dev_basename + ".json";
+  std::ifstream stats_file(stats_path);
+  if (!stats_file.is_open()) {
+    return "{}";
+  }
+
+  std::string result((std::istreambuf_iterator<char>(stats_file)),
+                     std::istreambuf_iterator<char>());
+  return result.empty() ? "{}" : result;
+#else
+  (void)path;
+  return "{}";
+#endif
 }
 
 }  // namespace ctp

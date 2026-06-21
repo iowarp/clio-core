@@ -276,7 +276,7 @@ chi::TaskResume Runtime::Monitor(ctp::ipc::FullPtr<MonitorTask> task, chi::RunCo
     msgpack::sbuffer sbuf;
     msgpack::packer<msgpack::sbuffer> pk(sbuf);
 
-    pk.pack_map(13);
+    pk.pack_map(14);
     pk.pack("pool_name");              pk.pack(pool_name_);
     pk.pack("bdev_type");              pk.pack(static_cast<chi::u32>(bdev_type_));
     pk.pack("total_capacity");         pk.pack(transport_ ? transport_->GetCapacity() : 0);
@@ -290,6 +290,7 @@ chi::TaskResume Runtime::Monitor(ctp::ipc::FullPtr<MonitorTask> task, chi::RunCo
     pk.pack("total_writes");           pk.pack(total_writes_.load());
     pk.pack("total_bytes_read");       pk.pack(total_bytes_read_.load());
     pk.pack("total_bytes_written");    pk.pack(total_bytes_written_.load());
+    pk.pack("device_health");          pk.pack(ctp::SystemInfo::GetDeviceHealthStats(pool_name_));
 
     task->results_[container_id_] = std::string(sbuf.data(), sbuf.size());
   }
