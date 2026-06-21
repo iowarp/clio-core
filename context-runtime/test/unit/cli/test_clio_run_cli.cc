@@ -353,14 +353,14 @@ TEST_CASE("RefreshRepo - default namespace and module with no methods",
   REQUIRE(fs::exists(source));
 
   const std::string h = ReadAll(header);
-  REQUIRE(Contains(h, "namespace clio::run::beta {"));
+  REQUIRE(Contains(h, "namespace clio::beta {"));
   REQUIRE(Contains(h, "kMaxMethodId = 0;"));
   REQUIRE_FALSE(Contains(h, "// Inherited methods"));
 
   const std::string s = ReadAll(source);
   // Without kRestart the Restart override must not be generated.
   REQUIRE_FALSE(Contains(s, "void Runtime::Restart("));
-  REQUIRE(Contains(s, "namespace clio::run::beta {"));
+  REQUIRE(Contains(s, "namespace clio::beta {"));
 }
 
 TEST_CASE("RefreshRepo - unwritable output directory fails",
