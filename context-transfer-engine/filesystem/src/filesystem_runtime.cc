@@ -446,13 +446,11 @@ chi::TaskResume Runtime::Getattr(ctp::ipc::FullPtr<GetattrTask> task,
     CLIO_CO_AWAIT(q);
     if (q->GetReturnCode() == 0 && !q->results_.empty()) {
       task->exists_ = 1; task->is_dir_ = 1; task->size_ = 0;
-      // ctime of the directory tag itself.
-      auto tag = cte_.AsyncGetOrCreateTag(dir, clio::cte::core::TagId::GetNull(),
-                                          chi::PoolQuery::Local());
-      CLIO_CO_AWAIT(tag);
-      auto s = cte_.AsyncGetTagSize(tag->tag_id_, chi::PoolQuery::Local());
-      CLIO_CO_AWAIT(s);
-      task->ctime_ = (s->GetReturnCode() == 0) ? s->ctime_ : 0;
+      // NOTE: deliberately do NOT fetch the directory's ctime here. getattr must
+      // be read-only; resolving the dir tag via GetOrCreateTag would re-create a
+      // concurrently-removed directory (corrupts dirstress/nested-dir tests),
+      // and it adds RPCs to the hot dir-stat path. Directory ctime is left at 0
+      // for now; file ctime (below) is what the ctime xfstests exercise. (#603)
       task->return_code_ = 0;
       CLIO_CO_RETURN;
     }
