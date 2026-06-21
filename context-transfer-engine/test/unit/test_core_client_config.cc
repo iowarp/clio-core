@@ -94,11 +94,11 @@ class CoreClientConfigFixture {
 
     // Initialize CLIO Runtime and CTE once
     if (!g_initialized) {
-      bool success = clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true);
+      bool success = clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, true);
       REQUIRE(success);
 
       // Drain ZMQ background threads in main() before static dtors fire.
-      SimpleTest::g_test_finalize = clio::run::CHIMAERA_FINALIZE;
+      SimpleTest::g_test_finalize = clio::run::CLIO_RUNTIME_FINALIZE;
 
       std::this_thread::sleep_for(std::chrono::milliseconds(500));
 

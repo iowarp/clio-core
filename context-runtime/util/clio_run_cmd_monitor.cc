@@ -179,7 +179,7 @@ int Monitor(int argc, char* argv[]) {
     HLOG(kInfo, "Initializing Chimaera client...");
   }
 
-  if (!clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, false)) {
+  if (!clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, false)) {
     HLOG(kError, "Failed to initialize Chimaera client");
     HLOG(kError, "Make sure the Chimaera runtime is running");
     return 1;

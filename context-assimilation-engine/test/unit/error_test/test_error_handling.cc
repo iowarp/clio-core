@@ -168,7 +168,7 @@ int main(int argc, char* argv[]) {
   try {
     // Initialize CLIO Runtime runtime (CHI_WITH_RUNTIME controls behavior)
     HLOG(kInfo, "Initializing Chimaera...");
-    bool success = clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true);
+    bool success = clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, true);
     if (!success) {
       HLOG(kError, "Failed to initialize Chimaera");
       return 1;

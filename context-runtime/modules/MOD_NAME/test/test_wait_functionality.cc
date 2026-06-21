@@ -97,10 +97,10 @@ namespace {
     
     WaitTestFixture() {
       if (!g_initialized) {
-        bool success = clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true);
+        bool success = clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, true);
         if (success) {
           g_initialized = true;
-          SimpleTest::g_test_finalize = clio::run::CHIMAERA_FINALIZE;
+          SimpleTest::g_test_finalize = clio::run::CLIO_RUNTIME_FINALIZE;
           std::this_thread::sleep_for(500ms);
         }
       }

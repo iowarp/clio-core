@@ -31,8 +31,8 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#ifndef CHIMAERA_INCLUDE_CHIMAERA_MANAGERS_MODULE_MANAGER_H_
-#define CHIMAERA_INCLUDE_CHIMAERA_MANAGERS_MODULE_MANAGER_H_
+#ifndef CLIO_RUNTIME_INCLUDE_MANAGERS_MODULE_MANAGER_H_
+#define CLIO_RUNTIME_INCLUDE_MANAGERS_MODULE_MANAGER_H_
 
 #include <map>
 #include <string>
@@ -223,6 +223,5 @@ CLIO_RUN_DEFINE_GLOBAL_PTR_VAR_H(clio::run::ModuleManager, g_module_manager);
 #define CLIO_MODULE_MANAGER CTP_GET_GLOBAL_PTR_VAR(::clio::run::ModuleManager, g_module_manager)
 // Backward-compat alias (clio_run rebrand). External code that still
 // uses the legacy CHI_* spelling keeps working unchanged.
-#define CHI_MODULE_MANAGER  CLIO_MODULE_MANAGER
 
-#endif  // CHIMAERA_INCLUDE_CHIMAERA_MANAGERS_MODULE_MANAGER_H_
+#endif  // CLIO_RUNTIME_INCLUDE_MANAGERS_MODULE_MANAGER_H_

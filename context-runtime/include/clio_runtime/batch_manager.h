@@ -7,8 +7,8 @@
  * BSD 3-Clause License. See LICENSE file.
  */
 
-#ifndef CHIMAERA_INCLUDE_CHIMAERA_BATCH_MANAGER_H_
-#define CHIMAERA_INCLUDE_CHIMAERA_BATCH_MANAGER_H_
+#ifndef CLIO_RUNTIME_INCLUDE_BATCH_MANAGER_H_
+#define CLIO_RUNTIME_INCLUDE_BATCH_MANAGER_H_
 
 #include <cstdint>
 #include <mutex>
@@ -127,4 +127,4 @@ class BatchManager {
 
 }  // namespace clio::run
 
-#endif  // CHIMAERA_INCLUDE_CHIMAERA_BATCH_MANAGER_H_
+#endif  // CLIO_RUNTIME_INCLUDE_BATCH_MANAGER_H_

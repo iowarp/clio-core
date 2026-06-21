@@ -31,8 +31,8 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#ifndef CHIMAERA_INCLUDE_CHIMAERA_POOL_QUERY_H_
-#define CHIMAERA_INCLUDE_CHIMAERA_POOL_QUERY_H_
+#ifndef CLIO_RUNTIME_INCLUDE_POOL_QUERY_H_
+#define CLIO_RUNTIME_INCLUDE_POOL_QUERY_H_
 
 #include <type_traits>
 
@@ -424,4 +424,4 @@ static_assert(std::is_trivially_copyable<PoolQuery>::value,
 
 }  // namespace clio::run
 
-#endif  // CHIMAERA_INCLUDE_CHIMAERA_POOL_QUERY_H_
+#endif  // CLIO_RUNTIME_INCLUDE_POOL_QUERY_H_

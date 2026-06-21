@@ -31,8 +31,8 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#ifndef CHIMAERA_INCLUDE_CHIMAERA_CONTAINER_H_
-#define CHIMAERA_INCLUDE_CHIMAERA_CONTAINER_H_
+#ifndef CLIO_RUNTIME_INCLUDE_CONTAINER_H_
+#define CLIO_RUNTIME_INCLUDE_CONTAINER_H_
 
 #include <cmath>
 #include <clio_ctp/data_structures/serialization/global_serialize.h>
@@ -660,7 +660,6 @@ typedef void (*destroy_chimod_t)(clio::run::Container* container);
   }
 // Backward-compat alias (clio_run rebrand). External code that still
 // uses the legacy CHI_* spelling keeps working unchanged.
-#define CHI_CHIMOD_CC  CLIO_CHIMOD_CC
 
 /**
  * Macro to define ChiMod entry points for task-based modules
@@ -695,6 +694,5 @@ typedef void (*destroy_chimod_t)(clio::run::Container* container);
   }
 // Backward-compat alias (clio_run rebrand). External code that still
 // uses the legacy CHI_* spelling keeps working unchanged.
-#define CHI_TASK_CC  CLIO_TASK_CC
 
-#endif  // CHIMAERA_INCLUDE_CHIMAERA_CONTAINER_H_
+#endif  // CLIO_RUNTIME_INCLUDE_CONTAINER_H_

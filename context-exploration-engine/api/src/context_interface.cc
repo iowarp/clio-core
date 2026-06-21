@@ -59,7 +59,7 @@ bool ContextInterface::EnsureInitialized() {
   }
 
   // Initialize CLIO Runtime as a client for the context interface
-  if (!clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, false)) {
+  if (!clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, false)) {
     HLOG(kError, "Failed to initialize Chimaera client");
     init_failed = true;
     return false;

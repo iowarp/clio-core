@@ -31,8 +31,8 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#ifndef CHIMAERA_INCLUDE_CHIMAERA_GPU_FUTURE_H_
-#define CHIMAERA_INCLUDE_CHIMAERA_GPU_FUTURE_H_
+#ifndef CLIO_RUNTIME_INCLUDE_GPU_FUTURE_H_
+#define CLIO_RUNTIME_INCLUDE_GPU_FUTURE_H_
 
 #include "clio_runtime/types.h"
 #include "clio_ctp/memory/allocator/allocator.h"
@@ -202,4 +202,4 @@ using GpuTaskLane = GpuTaskQueue::ring_buffer_type;
 
 }  // namespace clio::run
 
-#endif  // CHIMAERA_INCLUDE_CHIMAERA_GPU_FUTURE_H_
+#endif  // CLIO_RUNTIME_INCLUDE_GPU_FUTURE_H_

@@ -70,12 +70,12 @@ public:
       INFO("=== Initializing Runtime Coverage Test Environment ===");
 
       // Step 1: Initialize CLIO Runtime runtime
-      bool success = clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true);
+      bool success = clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, true);
       if (!success) {
-        throw std::runtime_error("CHIMAERA_INIT failed");
+        throw std::runtime_error("CLIO_INIT failed");
       }
       // Drain ZMQ background threads in main() before static dtors fire.
-      SimpleTest::g_test_finalize = clio::run::CHIMAERA_FINALIZE;
+      SimpleTest::g_test_finalize = clio::run::CLIO_RUNTIME_FINALIZE;
       std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
       // Step 2: Initialize CTE client subsystem (CRITICAL!)

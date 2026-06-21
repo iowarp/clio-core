@@ -31,8 +31,8 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#ifndef CHIMAERA_INCLUDE_CHIMAERA_IPC_CPU2SELF_H_
-#define CHIMAERA_INCLUDE_CHIMAERA_IPC_CPU2SELF_H_
+#ifndef CLIO_RUNTIME_INCLUDE_IPC_CPU2SELF_H_
+#define CLIO_RUNTIME_INCLUDE_IPC_CPU2SELF_H_
 
 #include "clio_runtime/types.h"
 #include "clio_runtime/task.h"
@@ -131,4 +131,4 @@ struct IpcCpu2Self {
 
 }  // namespace clio::run
 
-#endif  // CHIMAERA_INCLUDE_CHIMAERA_IPC_CPU2SELF_H_
+#endif  // CLIO_RUNTIME_INCLUDE_IPC_CPU2SELF_H_

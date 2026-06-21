@@ -216,7 +216,7 @@ int main(int argc, char **argv) {
 
   // Initialize runtime
   HIPRINT("Initializing Chimaera runtime...");
-  if (!clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true)) {
+  if (!clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, true)) {
     HLOG(kError, "Failed to initialize Chimaera runtime");
     return 1;
   }

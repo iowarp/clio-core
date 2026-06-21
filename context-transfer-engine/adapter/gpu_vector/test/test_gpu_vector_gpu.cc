@@ -50,7 +50,7 @@ void EnsureInit() {
 #if !CTP_IS_DEVICE_PASS
   if (g_initialized) return;
   std::fprintf(stderr, "[INIT] Starting Chimaera server (gpu_vector test)\n");
-  REQUIRE(clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kServer));
+  REQUIRE(clio::run::CLIO_INIT(clio::run::ChimaeraMode::kServer));
   REQUIRE(clio::cte::core::CLIO_CTE_CLIENT_INIT());
   auto *cte_client = CLIO_CTE_CLIENT;
   REQUIRE(cte_client != nullptr);
@@ -95,7 +95,7 @@ namespace dev = cte::gpu::dev;
 __global__ void GpuVectorWriteKernel(clio::run::IpcManagerGpuInfo info,
                                       gv::DeviceView<clio::run::u32> view,
                                       clio::run::u64 total) {
-  CHIMAERA_GPU_INIT(info, /*ipc_ptr=*/nullptr);
+  CLIO_GPU_INIT(info, /*ipc_ptr=*/nullptr);
   dev::vector<clio::run::u32> v(view, g_ipc_manager_ptr);
   clio::run::u64 stripe = (total + gridDim.x - 1) / gridDim.x;
   clio::run::u64 lo = static_cast<clio::run::u64>(blockIdx.x) * stripe;
@@ -110,7 +110,7 @@ __global__ void GpuVectorWriteKernel(clio::run::IpcManagerGpuInfo info,
 __global__ void GpuVectorReadKernel(clio::run::IpcManagerGpuInfo info,
                                      gv::DeviceView<clio::run::u32> view,
                                      clio::run::u32 *result, clio::run::u64 total) {
-  CHIMAERA_GPU_INIT(info, /*ipc_ptr=*/nullptr);
+  CLIO_GPU_INIT(info, /*ipc_ptr=*/nullptr);
   dev::vector<clio::run::u32> v(view, g_ipc_manager_ptr);
   clio::run::u64 stripe = (total + gridDim.x - 1) / gridDim.x;
   clio::run::u64 lo = static_cast<clio::run::u64>(blockIdx.x) * stripe;

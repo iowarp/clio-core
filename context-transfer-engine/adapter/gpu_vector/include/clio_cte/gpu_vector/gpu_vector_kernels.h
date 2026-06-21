@@ -138,7 +138,7 @@ CTP_GPU_FUN clio::run::u32 RescoreRemaining(const RescoreQueue *q) {
  *  registered by nvcc's launch glue).
  *
  *  Caller must pass the kernel-scope `g_ipc_manager_ptr` from
- *  CHIMAERA_GPU_INIT — going through CLIO_IPC in this device function
+ *  CLIO_GPU_INIT — going through CLIO_IPC in this device function
  *  trips the host-pass typing check (CLIO_IPC expands to clio::run::IpcManager*
  *  on host pass, which returns clio::run::Future, not gpu::Future). */
 CTP_GPU_FUN void FlushPageBase(::clio::run::gpu::IpcManager *ipc,
@@ -177,7 +177,7 @@ CTP_GPU_FUN void FlushPageBase(::clio::run::gpu::IpcManager *ipc,
  * Submit a PutBlob for `page` covering its current modify range. Caller
  * already CAS-holds the kPagePutInFlight bit. Returns once the queue
  * push completes; does not wait for the runtime to ack. `ipc` is the
- * kernel-scope `g_ipc_manager_ptr` from CHIMAERA_GPU_INIT.
+ * kernel-scope `g_ipc_manager_ptr` from CLIO_GPU_INIT.
  *
  * `slot` is the index in `Block::pages[]` (covering BOTH tiers), used
  * to pick which task slot in the put pool we use.
@@ -617,14 +617,14 @@ class vector;
 
 /**
  * Per-block in-kernel handle to a host-side Vector<T>. Constructed once
- * at the top of a user kernel after CHIMAERA_GPU_INIT. The ctor allocates
+ * at the top of a user kernel after CLIO_GPU_INIT. The ctor allocates
  * the per-warp last-page cache in __shared__ memory and zero-initializes
  * it via the first warp.
  *
  * Usage:
  *   __global__ void K(clio::run::IpcManagerGpuInfo info,
  *                     clio::cte::gpu_vector::DeviceView<int> view) {
- *     CHIMAERA_GPU_INIT(info, nullptr);
+ *     CLIO_GPU_INIT(info, nullptr);
  *     cte::gpu::dev::vector<int> v(view, g_ipc_manager_ptr);
  *     v.write_range(lo, hi, [] (clio::run::u64 i) { return T_for(i); });
  *     v.read_range (lo, hi, [](clio::run::u64 i, T val) { use(i, val); });
@@ -645,7 +645,7 @@ class vector {
    * @param view DeviceView<T> from `Vector<T>::Device()` (POD, captured
    *             by the kernel by value).
    * @param ipc  Kernel-scope `g_ipc_manager_ptr` declared by
-   *             CHIMAERA_GPU_INIT.
+   *             CLIO_GPU_INIT.
    */
   CTP_GPU_FUN vector(const DeviceView &view,
                       ::clio::run::gpu::IpcManager *ipc) noexcept

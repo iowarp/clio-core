@@ -45,11 +45,11 @@ namespace {
 __global__ void ChiGpuKernelStress(clio::run::IpcManagerGpuInfo gpu_info,
                                     ctp::ipc::FullPtr<TaskT> *task_handles,
                                     clio::run::u32 num_tasks) {
-  CHIMAERA_GPU_INIT(gpu_info, /*ipc_ptr=*/nullptr);
+  CLIO_GPU_INIT(gpu_info, /*ipc_ptr=*/nullptr);
   if (threadIdx.x != 0) return;
   clio::run::u32 slot = blockIdx.x;
   if (slot >= num_tasks) return;
-  // Use the kernel-scope `g_ipc_manager_ptr` (declared by CHIMAERA_GPU_INIT)
+  // Use the kernel-scope `g_ipc_manager_ptr` (declared by CLIO_GPU_INIT)
   // rather than the CLIO_IPC macro: NVCC compiles the kernel body in both
   // the host and device passes, and the host-pass expansion of CLIO_IPC
   // resolves the global `g_ipc_manager` symbol — which the macro shadows

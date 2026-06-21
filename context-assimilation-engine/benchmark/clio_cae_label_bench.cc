@@ -411,12 +411,12 @@ int main(int argc, char **argv) {
   HLOG(kInfo, "Config: {}", config_path);
 
   HLOG(kInfo, "Initializing Chimaera runtime (kServer)...");
-  if (!clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kServer)) {
-    HLOG(kError, "CHIMAERA_INIT failed");
+  if (!clio::run::CLIO_INIT(clio::run::ChimaeraMode::kServer)) {
+    HLOG(kError, "CLIO_INIT failed");
     return 1;
   }
   struct FinalizeGuard {
-    ~FinalizeGuard() { clio::run::CHIMAERA_FINALIZE(); }
+    ~FinalizeGuard() { clio::run::CLIO_RUNTIME_FINALIZE(); }
   } guard;
   std::this_thread::sleep_for(std::chrono::seconds(1));
 

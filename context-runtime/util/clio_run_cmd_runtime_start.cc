@@ -135,7 +135,7 @@ int RuntimeStart(int argc, char* argv[]) {
 
   HLOG(kDebug, "Starting Chimaera runtime...");
 
-  if (!clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kRuntime, true)) {
+  if (!clio::run::CLIO_INIT(clio::run::ChimaeraMode::kRuntime, true)) {
     HLOG(kError, "Failed to initialize Chimaera runtime");
     return 1;
   }
@@ -187,7 +187,7 @@ int RuntimeRestart(int argc, char* argv[]) {
 
   HLOG(kInfo, "Restarting Chimaera runtime (WAL replay enabled)...");
 
-  if (!clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kRuntime, true,
+  if (!clio::run::CLIO_INIT(clio::run::ChimaeraMode::kRuntime, true,
                            /*is_restart=*/true)) {
     HLOG(kError, "Failed to restart Chimaera runtime");
     return 1;

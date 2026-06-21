@@ -103,17 +103,6 @@ inline bool CLIO_INIT(ChimaeraMode mode, bool default_with_runtime = false,
 }
 
 /**
- * CHIMAERA_INIT — legacy name retained as a thin inline wrapper around
- * CLIO_INIT for source-level compat with the clio::run::* era.  Will
- * stay until external callers (coeus-adapter, downstream tests) drop
- * the old spelling.
- */
-inline bool CHIMAERA_INIT(ChimaeraMode mode, bool default_with_runtime = false,
-                           bool is_restart = false) {
-  return CLIO_INIT(mode, default_with_runtime, is_restart);
-}
-
-/**
  * Finalize CLIO Runtime and release all resources.
  *
  * Canonical name. Calls ClientFinalize on the CLIO Runtime manager to close
@@ -122,9 +111,6 @@ inline bool CHIMAERA_INIT(ChimaeraMode mode, bool default_with_runtime = false,
  * heap-allocated so its destructor is never invoked automatically).
  */
 void CLIO_RUNTIME_FINALIZE();
-
-/** Deprecated alias — calls CLIO_RUNTIME_FINALIZE(). */
-inline void CHIMAERA_FINALIZE() { CLIO_RUNTIME_FINALIZE(); }
 
 }  // namespace clio::run
 

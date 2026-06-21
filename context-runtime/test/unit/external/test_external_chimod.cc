@@ -14,7 +14,7 @@ int main() {
 
   try {
     // Initialize CLIO Runtime client
-    if (!clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true)) {
+    if (!clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, true)) {
       HLOG(kError, "Failed to initialize Chimaera client");
       return 1;
     }
@@ -30,7 +30,7 @@ int main() {
     HIPRINT("Pool query created successfully");
 
     HIPRINT("All external ChiMod integration tests passed!");
-    clio::run::CHIMAERA_FINALIZE();
+    clio::run::CLIO_RUNTIME_FINALIZE();
     return 0;
 
   } catch (const std::exception& e) {

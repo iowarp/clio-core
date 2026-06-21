@@ -31,8 +31,8 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#ifndef CHIMAERA_INCLUDE_CHIMAERA_MANAGERS_IPC_MANAGER_H_
-#define CHIMAERA_INCLUDE_CHIMAERA_MANAGERS_IPC_MANAGER_H_
+#ifndef CLIO_RUNTIME_INCLUDE_MANAGERS_IPC_MANAGER_H_
+#define CLIO_RUNTIME_INCLUDE_MANAGERS_IPC_MANAGER_H_
 
 #include <atomic>
 #include <chrono>
@@ -1618,8 +1618,6 @@ CLIO_RUN_DEFINE_GLOBAL_PTR_VAR_H(clio::run::IpcManager, g_ipc_manager);
 // active in the current pass (host / GPU host pass / GPU device pass /
 // SYCL device pass), surviving any later #undef/#define cycle on
 // CLIO_IPC / CLIO_CPU_IPC further down in this file.
-#define CHI_IPC      CLIO_IPC
-#define CHI_CPU_IPC  CLIO_CPU_IPC
 
 // Include local_task_archives after CLIO_IPC is defined, since on GPU
 // CLIO_PRIV_ALLOC expands to clio::run::GetPrivAllocGpu() (defined below)
@@ -1644,7 +1642,7 @@ CTP_CROSS_FUN inline IpcManager *GetGpuIpcManager() {
 
 // CLIO_IPC needs different expansions in nvcc/hipcc's two passes:
 //   - Device pass (CTP_IS_GPU=1): GetBlockIpcManager() — the per-block
-//     `__shared__` singleton initialized by CHIMAERA_GPU_INIT.
+//     `__shared__` singleton initialized by CLIO_GPU_INIT.
 //   - Host pass (CTP_IS_GPU=0): the global host pointer accessor —
 //     same as the non-GPU-compiler default. Host-only client code
 //     (bdev_client::AsyncCreate, etc.) gets compiled in this pass too
@@ -2142,4 +2140,4 @@ CTP_CROSS_FUN void Future<TaskT, AllocT>::WaitRecv(float max_sec,
 #include "clio_runtime/ipc/ipc_cpu2cpu_impl.h"
 #include "clio_runtime/ipc/ipc_cpu2cpu_zmq_impl.h"
 
-#endif  // CHIMAERA_INCLUDE_CHIMAERA_MANAGERS_IPC_MANAGER_H_
+#endif  // CLIO_RUNTIME_INCLUDE_MANAGERS_IPC_MANAGER_H_

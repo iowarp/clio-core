@@ -194,7 +194,7 @@ int main(int argc, char* argv[]) {
 
   try {
     // Initialize CLIO Runtime client
-    if (!clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, false)) {
+    if (!clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, false)) {
       HLOG(kError, "Error: Failed to initialize Chimaera client");
       return 1;
     }

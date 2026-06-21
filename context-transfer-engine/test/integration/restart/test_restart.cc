@@ -64,7 +64,7 @@ static const char* kTagName = "restart_test_tag";
  */
 int PutBlobs() {
   // Connect to external runtime as client
-  if (!clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, false)) {
+  if (!clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, false)) {
     HLOG(kError, "Phase 1: Failed to init client");
     return 1;
   }
@@ -130,7 +130,7 @@ int PutBlobs() {
  */
 int VerifyBlobs() {
   // Connect to external runtime as client
-  if (!clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, false)) {
+  if (!clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, false)) {
     HLOG(kError, "Phase 2: Failed to init client");
     return 1;
   }

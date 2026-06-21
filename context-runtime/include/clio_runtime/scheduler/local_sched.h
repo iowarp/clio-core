@@ -32,8 +32,8 @@
  */
 
 // Copyright 2024 IOWarp contributors
-#ifndef CHIMAERA_INCLUDE_CHIMAERA_SCHEDULER_LOCAL_SCHED_H_
-#define CHIMAERA_INCLUDE_CHIMAERA_SCHEDULER_LOCAL_SCHED_H_
+#ifndef CLIO_RUNTIME_INCLUDE_SCHEDULER_LOCAL_SCHED_H_
+#define CLIO_RUNTIME_INCLUDE_SCHEDULER_LOCAL_SCHED_H_
 
 #include <atomic>
 #include <vector>
@@ -72,4 +72,4 @@ class LocalScheduler : public Scheduler {
 
 }  // namespace clio::run
 
-#endif  // CHIMAERA_INCLUDE_CHIMAERA_SCHEDULER_LOCAL_SCHED_H_
+#endif  // CLIO_RUNTIME_INCLUDE_SCHEDULER_LOCAL_SCHED_H_

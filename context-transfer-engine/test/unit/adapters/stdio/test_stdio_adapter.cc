@@ -33,7 +33,7 @@ bool initializeRuntime() {
   static bool initialized = false;
   if (initialized) return true;
 
-  if (!clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true)) {
+  if (!clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, true)) {
     INFO("Chimaera init failed");
     return false;
   }

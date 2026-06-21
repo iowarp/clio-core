@@ -63,9 +63,9 @@ bool g_initialized = false;
 
 void EnsureInitialized() {
   if (!g_initialized) {
-    clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true);
+    clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, true);
     g_initialized = true;
-    SimpleTest::g_test_finalize = clio::run::CHIMAERA_FINALIZE;
+    SimpleTest::g_test_finalize = clio::run::CLIO_RUNTIME_FINALIZE;
   }
 }
 

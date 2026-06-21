@@ -74,7 +74,7 @@ bool initializeRuntime() {
   }
 
   INFO("Initializing Chimaera runtime...");
-  if (!clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true)) {
+  if (!clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, true)) {
     INFO("Chimaera initialization failed");
     return false;
   }

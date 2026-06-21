@@ -259,9 +259,9 @@ int main(int argc, char* argv[]) {
     CleanupSharedMemory();
 
     setenv("CLIO_WITH_RUNTIME", "1", 1);
-    bool success = CHIMAERA_INIT(ChimaeraMode::kServer, true);
+    bool success = CLIO_INIT(ChimaeraMode::kServer, true);
     if (!success) {
-      HLOG(kError, "[Rank 0] CHIMAERA_INIT(kServer) failed!");
+      HLOG(kError, "[Rank 0] CLIO_INIT(kServer) failed!");
       MPI_Abort(MPI_COMM_WORLD, 1);
       return 1;
     }
@@ -288,7 +288,7 @@ int main(int argc, char* argv[]) {
     }
 
     // Cleanup
-    clio::run::CHIMAERA_FINALIZE();
+    clio::run::CLIO_RUNTIME_FINALIZE();
     CleanupSharedMemory();
     MPI_Finalize();
     return (global_pass == 1) ? 0 : 1;
@@ -312,9 +312,9 @@ int main(int argc, char* argv[]) {
 
     HLOG(kInfo, "[Rank {}] Connecting as {} client...", rank, mode_name);
 
-    bool success = CHIMAERA_INIT(ChimaeraMode::kClient, false);
+    bool success = CLIO_INIT(ChimaeraMode::kClient, false);
     if (!success) {
-      HLOG(kError, "[Rank {}] CHIMAERA_INIT(kClient) failed!", rank);
+      HLOG(kError, "[Rank {}] CLIO_INIT(kClient) failed!", rank);
       MPI_Abort(MPI_COMM_WORLD, 1);
       return 1;
     }
@@ -339,7 +339,7 @@ int main(int argc, char* argv[]) {
     MPI_Reduce(&local_pass, &global_pass, 1, MPI_INT, MPI_MIN,
                0, MPI_COMM_WORLD);
 
-    clio::run::CHIMAERA_FINALIZE();
+    clio::run::CLIO_RUNTIME_FINALIZE();
     MPI_Finalize();
     return (local_pass == 1) ? 0 : 1;
   }

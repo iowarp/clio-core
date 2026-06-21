@@ -32,8 +32,8 @@
  */
 
 // Copyright 2024 IOWarp contributors
-#ifndef CHIMAERA_INCLUDE_CHIMAERA_SCHEDULER_SCHEDULER_H_
-#define CHIMAERA_INCLUDE_CHIMAERA_SCHEDULER_SCHEDULER_H_
+#ifndef CLIO_RUNTIME_INCLUDE_SCHEDULER_SCHEDULER_H_
+#define CLIO_RUNTIME_INCLUDE_SCHEDULER_SCHEDULER_H_
 
 #include "clio_runtime/types.h"
 #include "clio_runtime/task.h"
@@ -140,4 +140,4 @@ class Scheduler {
 
 }  // namespace clio::run
 
-#endif  // CHIMAERA_INCLUDE_CHIMAERA_SCHEDULER_SCHEDULER_H_
+#endif  // CLIO_RUNTIME_INCLUDE_SCHEDULER_SCHEDULER_H_

@@ -45,7 +45,7 @@
 /**
  * Initialize the CLIO Runtime runtime from Python.
  *
- * Runs CHIMAERA_INIT on a dedicated background thread so that the
+ * Runs CLIO_INIT on a dedicated background thread so that the
  * ZMQ I/O threads it spawns never touch the calling (Python) thread's
  * GIL state.  The caller blocks until initialization is complete.
  *
@@ -55,7 +55,7 @@
 inline bool py_chimaera_init(int mode) {
   bool result = false;
   std::thread([&result, mode]() {
-    result = clio::run::CHIMAERA_INIT(
+    result = clio::run::CLIO_INIT(
         static_cast<clio::run::ChimaeraMode>(mode), false, false);
   }).join();
   return result;
@@ -67,7 +67,7 @@ inline bool py_chimaera_init(int mode) {
  * Closes ZMQ sockets and joins background threads.
  */
 inline void py_chimaera_finalize() {
-  clio::run::CHIMAERA_FINALIZE();
+  clio::run::CLIO_RUNTIME_FINALIZE();
 }
 
 /**

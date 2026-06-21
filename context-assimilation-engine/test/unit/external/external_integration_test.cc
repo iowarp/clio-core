@@ -41,7 +41,7 @@ public:
         try {
             // Step 1: Initialize CLIO Runtime (runtime + client)
             HLOG(kInfo, "1. Initializing Chimaera...");
-            bool chimaera_init = clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true);
+            bool chimaera_init = clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, true);
             if (!chimaera_init) {
                 HLOG(kError, "Failed to initialize Chimaera");
                 return false;

@@ -58,9 +58,9 @@ class ChimaeraTestFixture {
  public:
   ChimaeraTestFixture() {
     // Use the unified CLIO Runtime initialization
-    bool success = clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true);
+    bool success = clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, true);
     REQUIRE(success);
-    SimpleTest::g_test_finalize = clio::run::CHIMAERA_FINALIZE;
+    SimpleTest::g_test_finalize = clio::run::CLIO_RUNTIME_FINALIZE;
 
     // Wait for runtime to fully initialize
     std::this_thread::sleep_for(std::chrono::milliseconds(500));

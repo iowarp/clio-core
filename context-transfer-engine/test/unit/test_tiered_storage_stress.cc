@@ -102,7 +102,7 @@ class TieredStorageStressFixture {
     ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", config_path_.c_str(), 1);
 
     // Initialize CLIO Runtime runtime
-    bool success = clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true);
+    bool success = clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, true);
     REQUIRE(success);
 
     std::this_thread::sleep_for(std::chrono::milliseconds(500));

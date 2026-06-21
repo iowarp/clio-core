@@ -31,8 +31,8 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#ifndef CHIMAERA_INCLUDE_CHIMAERA_CORWLOCK_H_
-#define CHIMAERA_INCLUDE_CHIMAERA_CORWLOCK_H_
+#ifndef CLIO_RUNTIME_INCLUDE_CORWLOCK_H_
+#define CLIO_RUNTIME_INCLUDE_CORWLOCK_H_
 
 #include <clio_ctp/thread/lock/rwlock.h>
 #include "clio_runtime/types.h"
@@ -145,4 +145,4 @@ struct ScopedCoRwWriteLock {
 
 }  // namespace clio::run
 
-#endif  // CHIMAERA_INCLUDE_CHIMAERA_CORWLOCK_H_
+#endif  // CLIO_RUNTIME_INCLUDE_CORWLOCK_H_

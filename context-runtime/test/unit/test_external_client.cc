@@ -59,7 +59,7 @@
 using namespace clio::run;
 
 // The runtime server is launched out-of-process via clio::run::test::RuntimeServer
-// (clio_run start) instead of fork()+CHIMAERA_INIT(kServer): fork-without-exec
+// (clio_run start) instead of fork()+CLIO_INIT(kServer): fork-without-exec
 // deadlocks on macOS when the child dlopen()s ChiMods (and nondeterministically
 // leaks a port-holding process). The client children below are real fork()s --
 // client mode does not dlopen, so they remain macOS-safe.
@@ -87,7 +87,7 @@ TEST_CASE("ExternalClient - Basic Connection", "[external_client][ipc]") {
 
   // Now connect as EXTERNAL CLIENT (not integrated server+client)
   setenv("CLIO_WITH_RUNTIME", "0", 1);  // Force client-only mode
-  bool success = CHIMAERA_INIT(ChimaeraMode::kClient, false);
+  bool success = CLIO_INIT(ChimaeraMode::kClient, false);
   REQUIRE(success);
 
   // Verify client initialized successfully
@@ -130,7 +130,7 @@ TEST_CASE("ExternalClient - Multiple Clients", "[external_client][ipc]") {
 
       // Child process: Connect as client
       setenv("CLIO_WITH_RUNTIME", "0", 1);
-      bool success = CHIMAERA_INIT(ChimaeraMode::kClient, false);
+      bool success = CLIO_INIT(ChimaeraMode::kClient, false);
       if (!success) {
         _exit(1);
       }
@@ -175,7 +175,7 @@ TEST_CASE("ExternalClient - Connection Without Server",
 
   // This should fail gracefully (not crash)
   // Note: May succeed if a stale server from another test is still running
-  bool success = CHIMAERA_INIT(ChimaeraMode::kClient, false);
+  bool success = CLIO_INIT(ChimaeraMode::kClient, false);
   (void)success;  // Just verify it doesn't crash
 }
 
@@ -187,7 +187,7 @@ TEST_CASE("ExternalClient - Client Operations", "[external_client][ipc]") {
 
   // Connect as client
   setenv("CLIO_WITH_RUNTIME", "0", 1);
-  bool success = CHIMAERA_INIT(ChimaeraMode::kClient, false);
+  bool success = CLIO_INIT(ChimaeraMode::kClient, false);
   REQUIRE(success);
 
   auto *ipc = CLIO_IPC;

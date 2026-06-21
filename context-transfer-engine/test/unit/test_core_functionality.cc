@@ -163,18 +163,18 @@ class CTECoreFunctionalTestFixture {
     // Initialize CLIO Runtime runtime and client for functional testing
     if (ShouldInitializeRuntime()) {
       INFO("Initializing runtime (CHI_WITH_RUNTIME not set or enabled)");
-      bool success = clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true);
+      bool success = clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, true);
       REQUIRE(success);
     } else {
       INFO("Runtime already initialized externally (CHI_WITH_RUNTIME="
            << clio::run::env::GetCompat("WITH_RUNTIME") << ")");
-      bool success = clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true);
+      bool success = clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, true);
       REQUIRE(success);
     }
 
     // Drain ZMQ background threads in main() before static dtors fire — the
     // shutdown race here used to produce flaky timeouts under repeated runs.
-    SimpleTest::g_test_finalize = clio::run::CHIMAERA_FINALIZE;
+    SimpleTest::g_test_finalize = clio::run::CLIO_RUNTIME_FINALIZE;
 
     // Generate unique pool ID for this test session
     int rand_id = 1000 + rand() % 9000;  // Random ID 1000-9999
@@ -217,7 +217,7 @@ class CTECoreFunctionalTestFixture {
 
   /**
    * Initialize CLIO Runtime client following the module test guide pattern
-   * Note: The CHIMAERA_INIT macro has internal state tracking
+   * Note: The CLIO_INIT macro has internal state tracking
    */
 
   /**

@@ -39,8 +39,8 @@
  * by clients without requiring explicit Create() calls.
  */
 
-#ifndef CHIMAERA_INCLUDE_CHIMAERA_ADMIN_H_
-#define CHIMAERA_INCLUDE_CHIMAERA_ADMIN_H_
+#ifndef CLIO_RUNTIME_INCLUDE_ADMIN_H_
+#define CLIO_RUNTIME_INCLUDE_ADMIN_H_
 
 #include "clio_runtime/api.h"
 #include "clio_runtime/types.h"
@@ -57,6 +57,5 @@ CLIO_RUN_DEFINE_GLOBAL_PTR_VAR_H(clio::run::admin::Client, g_admin);
 #define CLIO_ADMIN CTP_GET_GLOBAL_PTR_VAR(::clio::run::admin::Client, g_admin)
 // Backward-compat alias (clio_run rebrand). External code that still
 // uses the legacy CHI_* spelling keeps working unchanged.
-#define CHI_ADMIN  CLIO_ADMIN
 
-#endif  // CHIMAERA_INCLUDE_CHIMAERA_ADMIN_H_
+#endif  // CLIO_RUNTIME_INCLUDE_ADMIN_H_

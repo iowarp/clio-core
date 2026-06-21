@@ -31,8 +31,8 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#ifndef CHIMAERA_INCLUDE_CHIMAERA_TYPES_H_
-#define CHIMAERA_INCLUDE_CHIMAERA_TYPES_H_
+#ifndef CLIO_RUNTIME_INCLUDE_TYPES_H_
+#define CLIO_RUNTIME_INCLUDE_TYPES_H_
 
 #include <chrono>
 #include <cstdint>
@@ -545,13 +545,6 @@ CTP_GPU_FUN ctp::ipc::RoundRobinAllocator *GetSharedAllocGpu();
 // uses the legacy CHI_* spelling keeps working unchanged. These are
 // text-substitution aliases — they resolve to whichever CLIO_* def is
 // active for the current compilation pass (host vs device).
-#define CHI_QUEUE_ALLOC_T CLIO_QUEUE_ALLOC_T
-#define CHI_TASK_ALLOC_T CLIO_TASK_ALLOC_T
-#define CHI_PRIV_ALLOC_T CLIO_PRIV_ALLOC_T
-#define CHI_PRIV_ALLOC CLIO_PRIV_ALLOC
-#define CHI_PRIV_SHARED_ALLOC_T CLIO_PRIV_SHARED_ALLOC_T
-#define CHI_PRIV_SHARED_ALLOC CLIO_PRIV_SHARED_ALLOC
-#define CHI_MAIN_ALLOC_T CLIO_MAIN_ALLOC_T
 
 // Memory segment identifiers
 enum MemorySegment {
@@ -716,4 +709,4 @@ struct hash<clio::run::TaskId> {
 
 }  // namespace std
 
-#endif  // CHIMAERA_INCLUDE_CHIMAERA_TYPES_H_
+#endif  // CLIO_RUNTIME_INCLUDE_TYPES_H_

@@ -141,7 +141,7 @@ TEST_CASE("CteWalRestart - WAL snapshot, replay on daemon restart",
 
   REQUIRE(RunCliTimed({"compose", compose_yaml.string()}, 60) == 0);
 
-  REQUIRE(clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, false));
+  REQUIRE(clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, false));
   REQUIRE(clio::cte::core::CLIO_CTE_CLIENT_INIT());
   auto* cte = CLIO_CTE_CLIENT;
   cte->Init(clio::run::PoolId(700, 0));

@@ -5,8 +5,8 @@
  * BSD 3-Clause License. See LICENSE file.
  */
 
-#ifndef CHIMAERA_INCLUDE_CHIMAERA_IPC_CPU2CPU_H_
-#define CHIMAERA_INCLUDE_CHIMAERA_IPC_CPU2CPU_H_
+#ifndef CLIO_RUNTIME_INCLUDE_IPC_CPU2CPU_H_
+#define CLIO_RUNTIME_INCLUDE_IPC_CPU2CPU_H_
 
 #include "clio_runtime/types.h"
 #include "clio_runtime/task.h"
@@ -43,4 +43,4 @@ struct IpcCpu2Cpu {
 
 }  // namespace clio::run
 
-#endif  // CHIMAERA_INCLUDE_CHIMAERA_IPC_CPU2CPU_H_
+#endif  // CLIO_RUNTIME_INCLUDE_IPC_CPU2CPU_H_

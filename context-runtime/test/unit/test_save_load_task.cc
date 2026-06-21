@@ -84,8 +84,8 @@ class ChimaeraTestFixture {
 public:
   ChimaeraTestFixture() {
     // Initialize CLIO Runtime (client with embedded runtime)
-    clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true);
-    SimpleTest::g_test_finalize = clio::run::CHIMAERA_FINALIZE;
+    clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, true);
+    SimpleTest::g_test_finalize = clio::run::CLIO_RUNTIME_FINALIZE;
 
     // Create admin pool
     admin_client_ =

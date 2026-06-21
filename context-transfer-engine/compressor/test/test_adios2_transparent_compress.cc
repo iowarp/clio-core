@@ -45,10 +45,10 @@ static void EnsureInit() {
                           "test_transparent_compress_config.yaml";
   setenv("CLIO_SERVER_CONF", config_path.c_str(), 1);
 
-  bool success = clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kServer);
+  bool success = clio::run::CLIO_INIT(clio::run::ChimaeraMode::kServer);
   REQUIRE(success);
   g_initialized = true;
-  SimpleTest::g_test_finalize = clio::run::CHIMAERA_FINALIZE;
+  SimpleTest::g_test_finalize = clio::run::CLIO_RUNTIME_FINALIZE;
 
   // Wait for compose pools to initialize
   std::this_thread::sleep_for(1s);

@@ -504,7 +504,7 @@ int main(int argc, char **argv) {
 
   MPI_Barrier(MPI_COMM_WORLD);
 
-  if (!clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true)) {
+  if (!clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, true)) {
     if (rank == 0) {
       HLOG(kError, "Failed to initialize Chimaera runtime");
     }

@@ -1,5 +1,5 @@
-#ifndef CHIMAERA_MOD_NAME_AUTOGEN_METHODS_H_
-#define CHIMAERA_MOD_NAME_AUTOGEN_METHODS_H_
+#ifndef CLIO_MOD_NAME_AUTOGEN_METHODS_H_
+#define CLIO_MOD_NAME_AUTOGEN_METHODS_H_
 
 #include <clio_runtime/clio_runtime.h>
 #include <string>

@@ -100,7 +100,7 @@ public:
     }
     
     // Initialize CLIO Runtime runtime and client for proper functionality
-    bool success = clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true);
+    bool success = clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, true);
     REQUIRE(success);
     
     // Generate unique pool ID for this test

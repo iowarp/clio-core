@@ -81,11 +81,11 @@ class ReconnectTestFixture {
   ReconnectTestFixture() {
     if (!g_initialized) {
       INFO("Initializing Chimaera client for Reconnect tests...");
-      bool success = clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true);
+      bool success = clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, true);
       if (success) {
         g_initialized = true;
         // NOTE: Do NOT set g_test_finalize here because the test
-        // intentionally kills the local runtime.  Calling CHIMAERA_FINALIZE
+        // intentionally kills the local runtime.  Calling CLIO_RUNTIME_FINALIZE
         // after the server is dead would hang or crash.
         std::this_thread::sleep_for(500ms);
         REQUIRE(CLIO_RUNTIME_MANAGER != nullptr);

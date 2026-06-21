@@ -39,8 +39,8 @@
  * get access to all singleton macros in one place.
  */
 
-#ifndef CHIMAERA_INCLUDE_CHIMAERA_SINGLETONS_H_
-#define CHIMAERA_INCLUDE_CHIMAERA_SINGLETONS_H_
+#ifndef CLIO_RUNTIME_INCLUDE_SINGLETONS_H_
+#define CLIO_RUNTIME_INCLUDE_SINGLETONS_H_
 
 #include "clio_runtime/manager.h"
 #include "clio_runtime/config_manager.h"
@@ -95,4 +95,4 @@
  * CLIO_POOL_MANAGER->RegisterContainer(pool_id, container);
  */
 
-#endif  // CHIMAERA_INCLUDE_CHIMAERA_SINGLETONS_H_
+#endif  // CLIO_RUNTIME_INCLUDE_SINGLETONS_H_

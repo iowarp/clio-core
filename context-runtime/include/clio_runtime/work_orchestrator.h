@@ -31,8 +31,8 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#ifndef CHIMAERA_INCLUDE_CHIMAERA_WORKERS_WORK_ORCHESTRATOR_H_
-#define CHIMAERA_INCLUDE_CHIMAERA_WORKERS_WORK_ORCHESTRATOR_H_
+#ifndef CLIO_RUNTIME_INCLUDE_WORKERS_WORK_ORCHESTRATOR_H_
+#define CLIO_RUNTIME_INCLUDE_WORKERS_WORK_ORCHESTRATOR_H_
 
 #include <atomic>
 #include <memory>
@@ -200,6 +200,5 @@ CLIO_RUN_DEFINE_GLOBAL_PTR_VAR_H(clio::run::WorkOrchestrator, g_work_orchestrato
 #define CLIO_WORK_ORCHESTRATOR CTP_GET_GLOBAL_PTR_VAR(::clio::run::WorkOrchestrator, g_work_orchestrator)
 // Backward-compat alias (clio_run rebrand). External code that still
 // uses the legacy CHI_* spelling keeps working unchanged.
-#define CHI_WORK_ORCHESTRATOR  CLIO_WORK_ORCHESTRATOR
 
-#endif  // CHIMAERA_INCLUDE_CHIMAERA_WORKERS_WORK_ORCHESTRATOR_H_
+#endif  // CLIO_RUNTIME_INCLUDE_WORKERS_WORK_ORCHESTRATOR_H_

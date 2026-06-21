@@ -60,7 +60,7 @@ bool ContentTransferEngine::ClientInit(const clio::run::PoolQuery &pool_query) {
   is_initializing_ = true;
 
   // Initialize CLIO Runtime client
-  if (!clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, false)) {
+  if (!clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, false)) {
     is_initializing_ = false;
     return false;
   }

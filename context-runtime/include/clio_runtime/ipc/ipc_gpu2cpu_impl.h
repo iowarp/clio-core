@@ -5,8 +5,8 @@
  * BSD 3-Clause License. See LICENSE file.
  */
 
-#ifndef CHIMAERA_INCLUDE_CHIMAERA_IPC_GPU2CPU_IMPL_H_
-#define CHIMAERA_INCLUDE_CHIMAERA_IPC_GPU2CPU_IMPL_H_
+#ifndef CLIO_RUNTIME_INCLUDE_IPC_GPU2CPU_IMPL_H_
+#define CLIO_RUNTIME_INCLUDE_IPC_GPU2CPU_IMPL_H_
 
 #include "clio_runtime/ipc/ipc_gpu2cpu.h"
 #include "clio_ctp/util/gpu_intrinsics.h"
@@ -104,4 +104,4 @@ CTP_CROSS_FUN void gpu::Future<TaskT, AllocT>::Wait() {
 }  // namespace clio::run
 
 #endif  // CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL
-#endif  // CHIMAERA_INCLUDE_CHIMAERA_IPC_GPU2CPU_IMPL_H_
+#endif  // CLIO_RUNTIME_INCLUDE_IPC_GPU2CPU_IMPL_H_

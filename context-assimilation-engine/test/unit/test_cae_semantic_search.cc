@@ -104,8 +104,8 @@ TEST_CASE("CAE labels 10 docs; CTE SemanticSearch returns top-5",
                           "test_cae_semantic_search_config.yaml";
   ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", config_path.string(), 1);
 
-  REQUIRE(clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kServer));
-  SimpleTest::g_test_finalize = clio::run::CHIMAERA_FINALIZE;
+  REQUIRE(clio::run::CLIO_INIT(clio::run::ChimaeraMode::kServer));
+  SimpleTest::g_test_finalize = clio::run::CLIO_RUNTIME_FINALIZE;
   std::this_thread::sleep_for(1s);
 
   // CLIO_CTE_CLIENT lands on the CAE entrypoint pool (512.0) — that's

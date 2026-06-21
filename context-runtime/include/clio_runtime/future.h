@@ -31,8 +31,8 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#ifndef CHIMAERA_INCLUDE_CHIMAERA_FUTURE_H_
-#define CHIMAERA_INCLUDE_CHIMAERA_FUTURE_H_
+#ifndef CLIO_RUNTIME_INCLUDE_FUTURE_H_
+#define CLIO_RUNTIME_INCLUDE_FUTURE_H_
 
 #include <coroutine>
 
@@ -770,4 +770,4 @@ class Future {
 
 }  // namespace clio::run
 
-#endif  // CHIMAERA_INCLUDE_CHIMAERA_FUTURE_H_
+#endif  // CLIO_RUNTIME_INCLUDE_FUTURE_H_

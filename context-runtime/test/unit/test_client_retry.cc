@@ -80,7 +80,7 @@ void TestServerRestart(const std::string &mode) {
   // 2. Client connects
   setenv("CLIO_IPC_MODE", mode.c_str(), 1);
   setenv("CLIO_WITH_RUNTIME", "0", 1);
-  bool success = CHIMAERA_INIT(ChimaeraMode::kClient, false);
+  bool success = CLIO_INIT(ChimaeraMode::kClient, false);
   REQUIRE(success);
   REQUIRE(CLIO_IPC != nullptr);
   REQUIRE(CLIO_IPC->IsInitialized());
@@ -147,7 +147,7 @@ void TestClientDeath(const std::string &mode) {
     // Child process: connect as client, submit task, exit immediately
     setenv("CLIO_IPC_MODE", mode.c_str(), 1);
     setenv("CLIO_WITH_RUNTIME", "0", 1);
-    bool success = CHIMAERA_INIT(ChimaeraMode::kClient, false);
+    bool success = CLIO_INIT(ChimaeraMode::kClient, false);
     if (!success) {
       _exit(1);
     }
@@ -175,11 +175,11 @@ void TestClientDeath(const std::string &mode) {
   // Give server time to process the orphan task
   std::this_thread::sleep_for(std::chrono::seconds(2));
 
-  // 4. Parent connects as a new client (CHIMAERA_INIT static guard is clean
+  // 4. Parent connects as a new client (CLIO_INIT static guard is clean
   //    because the child called it in a forked process)
   setenv("CLIO_IPC_MODE", mode.c_str(), 1);
   setenv("CLIO_WITH_RUNTIME", "0", 1);
-  bool success = CHIMAERA_INIT(ChimaeraMode::kClient, false);
+  bool success = CLIO_INIT(ChimaeraMode::kClient, false);
   REQUIRE(success);
   REQUIRE(CLIO_IPC != nullptr);
   REQUIRE(CLIO_IPC->IsInitialized());
@@ -245,6 +245,6 @@ int main(int argc, char* argv[]) {
     filter = argv[1];
   }
   int rc = SimpleTest::run_all_tests(filter);
-  clio::run::CHIMAERA_FINALIZE();
+  clio::run::CLIO_RUNTIME_FINALIZE();
   return rc;
 }

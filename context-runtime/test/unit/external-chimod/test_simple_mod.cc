@@ -63,7 +63,7 @@ int main() {
   try {
     // Step 1: Initialize CLIO Runtime client
     HLOG(kInfo, "\n1. Initializing Chimaera client...");
-    bool client_init_success = clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true);
+    bool client_init_success = clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, true);
 
     if (!client_init_success) {
       HLOG(kInfo, "NOTICE: Chimaera client initialization failed.");
@@ -130,6 +130,6 @@ int main() {
   HIPRINT("\nNOTE: This test demonstrates successful external ChiMod development patterns.");
   HIPRINT("For full functionality, run chimaera runtime start in another terminal.");
 
-  clio::run::CHIMAERA_FINALIZE();
+  clio::run::CLIO_RUNTIME_FINALIZE();
   return 0;
 }

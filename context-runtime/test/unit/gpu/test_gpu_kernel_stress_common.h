@@ -12,7 +12,7 @@
  * Three flavors of this test exist — one per GPU backend — and all of
  * them go through the same producer-only flow:
  *
- *   1. CHIMAERA_INIT(kServer) brings up the CPU runtime; ServerInit
+ *   1. CLIO_INIT(kServer) brings up the CPU runtime; ServerInit
  *      enumerates GPUs and allocates one per-device gpu2cpu_queue.
  *   2. Create a MOD_NAME pool whose CPU-side container handles
  *      `GpuSubmit` (formula: result = test_value * 2 + gpu_id).
@@ -33,8 +33,8 @@
  * when its backend is on.
  */
 
-#ifndef CHIMAERA_TEST_UNIT_GPU_TEST_GPU_KERNEL_STRESS_COMMON_H_
-#define CHIMAERA_TEST_UNIT_GPU_TEST_GPU_KERNEL_STRESS_COMMON_H_
+#ifndef CLIO_TEST_UNIT_GPU_TEST_GPU_KERNEL_STRESS_COMMON_H_
+#define CLIO_TEST_UNIT_GPU_TEST_GPU_KERNEL_STRESS_COMMON_H_
 
 #include <clio_runtime/clio_runtime.h>
 #include <clio_runtime/singletons.h>
@@ -76,8 +76,8 @@ inline void EnsureInit() {
   if (initialized) return;
   std::fprintf(stderr,
                "[INIT] Starting Chimaera server (producer-only GPU)\n");
-  if (!clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kServer)) {
-    std::fprintf(stderr, "[INIT] CHIMAERA_INIT failed\n");
+  if (!clio::run::CLIO_INIT(clio::run::ChimaeraMode::kServer)) {
+    std::fprintf(stderr, "[INIT] CLIO_INIT failed\n");
     std::abort();
   }
   initialized = true;
@@ -163,4 +163,4 @@ inline clio::run::u32 VerifyResults(
 
 }  // namespace chi_test_gpu_stress
 
-#endif  // CHIMAERA_TEST_UNIT_GPU_TEST_GPU_KERNEL_STRESS_COMMON_H_
+#endif  // CLIO_TEST_UNIT_GPU_TEST_GPU_KERNEL_STRESS_COMMON_H_

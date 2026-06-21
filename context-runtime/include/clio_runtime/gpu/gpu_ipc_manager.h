@@ -31,8 +31,8 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#ifndef CHIMAERA_INCLUDE_CHIMAERA_GPU_IPC_MANAGER_H_
-#define CHIMAERA_INCLUDE_CHIMAERA_GPU_IPC_MANAGER_H_
+#ifndef CLIO_RUNTIME_INCLUDE_GPU_IPC_MANAGER_H_
+#define CLIO_RUNTIME_INCLUDE_GPU_IPC_MANAGER_H_
 
 #include "clio_runtime/api.h"
 #include "clio_runtime/types.h"
@@ -73,7 +73,7 @@ namespace gpu {
  *
  * Device-side (GPU) state held here:
  *   - `gpu_info_`: copy of the IpcManagerGpuInfo passed by value into
- *     the kernel via CHIMAERA_GPU_INIT.
+ *     the kernel via CLIO_GPU_INIT.
  */
 class IpcManager {
  public:
@@ -101,7 +101,7 @@ class IpcManager {
 
   /**
    * Initialize the per-block IpcManager from the host-supplied gpu_info.
-   * Called by the CHIMAERA_GPU_INIT macro at kernel entry.
+   * Called by the CLIO_GPU_INIT macro at kernel entry.
    */
   CTP_GPU_FUN void ClientInitGpu(const IpcManagerGpuInfo &gpu_info) {
     gpu_info_ = gpu_info;
@@ -136,7 +136,7 @@ class IpcManager {
    * helpers reachable from the kernel (e.g. IpcGpu2Cpu::ClientSend) can
    * resolve it via plain symbol lookup. SYCL achieves the same with a
    * kernel-scope local + `g_ipc_manager_ptr` name-lookup trick (see the
-   * SYCL CHIMAERA_GPU_INIT macro below).
+   * SYCL CLIO_GPU_INIT macro below).
    */
   static CTP_GPU_FUN __noinline__ IpcManager *GetBlockIpcManager() {
     __shared__ char s_ipc_bytes[sizeof(IpcManager)];
@@ -262,7 +262,7 @@ class IpcManager {
 #include "clio_runtime/ipc/ipc_gpu2cpu_impl.h"
 
 // ================================================================
-// Single CHIMAERA_GPU_INIT macro (replaces the 5 legacy variants)
+// Single CLIO_GPU_INIT macro (replaces the 5 legacy variants)
 // ================================================================
 //
 // CUDA/ROCm: per-block IpcManager lives in __shared__ storage so any
@@ -274,14 +274,14 @@ class IpcManager {
 
 #if CTP_IS_SYCL_COMPILER
 
-#define CHIMAERA_GPU_INIT(gpu_info, ipc_ptr)                                  \
+#define CLIO_GPU_INIT(gpu_info, ipc_ptr)                                  \
   clio::run::gpu::IpcManager *g_ipc_manager_ptr = (ipc_ptr);                        \
   g_ipc_manager_ptr->ClientInitGpu(gpu_info);                                 \
   clio::run::gpu::IpcManager &g_ipc_manager = *g_ipc_manager_ptr
 
 #else  // CUDA / ROCm
 
-#define CHIMAERA_GPU_INIT(gpu_info, ipc_ptr)                                  \
+#define CLIO_GPU_INIT(gpu_info, ipc_ptr)                                  \
   (void)(ipc_ptr);                                                            \
   clio::run::gpu::IpcManager *g_ipc_manager_ptr =                                   \
       clio::run::gpu::IpcManager::GetBlockIpcManager();                             \
@@ -294,4 +294,4 @@ class IpcManager {
 #endif  // CTP_IS_SYCL_COMPILER
 
 #endif  // CTP_ENABLE_GPU
-#endif  // CHIMAERA_INCLUDE_CHIMAERA_GPU_IPC_MANAGER_H_
+#endif  // CLIO_RUNTIME_INCLUDE_GPU_IPC_MANAGER_H_

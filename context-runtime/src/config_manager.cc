@@ -270,7 +270,7 @@ void ConfigManager::ParseYAML(YAML::Node &yaml_conf) {
   }
   // Environment variable overrides for GPU config (higher priority than YAML).
   // Allows benchmarks to set the partition count dynamically from their
-  // thread parameters before CHIMAERA_INIT().
+  // thread parameters before CLIO_INIT().
   if (const char *env = clio::run::env::GetCompat("GPU_BLOCKS")) {
     gpu_blocks_ = static_cast<u32>(std::stoul(env));
   }

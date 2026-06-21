@@ -58,11 +58,11 @@
 namespace {
 // Test setup helper - same pattern as other tests
 bool initialize_chimaera() {
-  return clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true);
+  return clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, true);
 }
 
 // The runtime server is launched out-of-process via clio::run::test::RuntimeServer
-// (clio_run start) instead of fork()+CHIMAERA_INIT(kServer): fork-without-exec
+// (clio_run start) instead of fork()+CLIO_INIT(kServer): fork-without-exec
 // deadlocks on macOS when the child dlopen()s ChiMods. The client child below
 // is still a real fork() -- client mode does not dlopen, so it is macOS-safe
 // and exercises the per-process shm path this test is about.
@@ -80,7 +80,7 @@ constexpr size_t k1_5GB = 1536ULL * 1024 * 1024;  // 1.5 GB
 TEST_CASE("Per-process shared memory GetClientShmInfo",
           "[ipc][per_process_shm][shm_info][fork]") {
   // Fork a server, then fork a client child to test GetClientShmInfo.
-  // Both children start with clean process state (no prior CHIMAERA_INIT).
+  // Both children start with clean process state (no prior CLIO_INIT).
   clio::run::test::RuntimeServer server;
   REQUIRE(server.Start());
   REQUIRE(server.WaitForReady());
@@ -92,7 +92,7 @@ TEST_CASE("Per-process shared memory GetClientShmInfo",
     (void)freopen("/dev/null", "w", stderr);
     setenv("CLIO_WITH_RUNTIME", "0", 1);
     setenv("CLIO_IPC_MODE", "SHM", 1);
-    if (!clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, false)) {
+    if (!clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, false)) {
       _exit(1);
     }
     auto *client_ipc = CLIO_IPC;

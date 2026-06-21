@@ -78,7 +78,7 @@ void EnsureInit() {
 #if !CTP_IS_DEVICE_PASS
   if (g_initialized) return;
   std::fprintf(stderr, "[INIT] Bringing up Chimaera server\n");
-  REQUIRE(clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kServer));
+  REQUIRE(clio::run::CLIO_INIT(clio::run::ChimaeraMode::kServer));
   REQUIRE(cte::CLIO_CTE_CLIENT_INIT());
   auto *cte_client = CLIO_CTE_CLIENT;
   REQUIRE(cte_client != nullptr);
@@ -131,7 +131,7 @@ __global__ void DevMemFillKernel(char *buf, clio::run::u32 size, clio::run::u32 
 /** Submit one pre-built device-resident task and wait for completion. */
 __global__ void DevMemSubmitPutKernel(clio::run::IpcManagerGpuInfo info,
                                        ctp::ipc::FullPtr<cte::PutBlobTask> task) {
-  CHIMAERA_GPU_INIT(info, /*ipc_ptr=*/nullptr);
+  CLIO_GPU_INIT(info, /*ipc_ptr=*/nullptr);
   if (threadIdx.x != 0) return;
   auto fut = g_ipc_manager_ptr->Send(task);
   fut.Wait();
@@ -140,7 +140,7 @@ __global__ void DevMemSubmitPutKernel(clio::run::IpcManagerGpuInfo info,
 
 __global__ void DevMemSubmitGetKernel(clio::run::IpcManagerGpuInfo info,
                                        ctp::ipc::FullPtr<cte::GetBlobTask> task) {
-  CHIMAERA_GPU_INIT(info, /*ipc_ptr=*/nullptr);
+  CLIO_GPU_INIT(info, /*ipc_ptr=*/nullptr);
   if (threadIdx.x != 0) return;
   auto fut = g_ipc_manager_ptr->Send(task);
   fut.Wait();

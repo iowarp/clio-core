@@ -5,8 +5,8 @@
  * BSD 3-Clause License. See LICENSE file.
  */
 
-#ifndef CHIMAERA_INCLUDE_CHIMAERA_IPC_CPU2CPU_ZMQ_IMPL_H_
-#define CHIMAERA_INCLUDE_CHIMAERA_IPC_CPU2CPU_ZMQ_IMPL_H_
+#ifndef CLIO_RUNTIME_INCLUDE_IPC_CPU2CPU_ZMQ_IMPL_H_
+#define CLIO_RUNTIME_INCLUDE_IPC_CPU2CPU_ZMQ_IMPL_H_
 
 #include "clio_runtime/ipc/ipc_cpu2cpu_zmq.h"
 
@@ -160,4 +160,4 @@ void IpcCpu2CpuZmq::ResendTask(IpcManager *ipc, Future<TaskT> &future) {
 
 }  // namespace clio::run
 
-#endif  // CHIMAERA_INCLUDE_CHIMAERA_IPC_CPU2CPU_ZMQ_IMPL_H_
+#endif  // CLIO_RUNTIME_INCLUDE_IPC_CPU2CPU_ZMQ_IMPL_H_

@@ -341,7 +341,7 @@ NB_MODULE(clio_cte_core_ext, m) {
       "Get a copy of the global CTE client instance");
 
   // CLIO Runtime initialization function (unified)
-  m.def("chimaera_init", &clio::run::CHIMAERA_INIT,
+  m.def("chimaera_init", &clio::run::CLIO_INIT,
         "mode"_a, "default_with_runtime"_a = false, "is_restart"_a = false,
         "Initialize Chimaera with specified mode.\n\n"
         "Args:\n"

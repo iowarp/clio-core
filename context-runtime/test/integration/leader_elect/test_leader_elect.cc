@@ -84,7 +84,7 @@ class LeaderElectFixture {
   LeaderElectFixture() {
     if (!g_initialized) {
       INFO("Initializing Chimaera client for leader election tests...");
-      bool success = clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true);
+      bool success = clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, true);
       if (success) {
         g_initialized = true;
         std::this_thread::sleep_for(500ms);
@@ -182,7 +182,7 @@ TEST_CASE("System healthy after leader restart",
   // Fresh initialization — the previous client state is stale because
   // run_tests.sh launches this as a separate process invocation.
   INFO("Initializing fresh Chimaera client after leader restart...");
-  bool success = clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true);
+  bool success = clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, true);
   REQUIRE(success);
   std::this_thread::sleep_for(500ms);
   REQUIRE(CLIO_RUNTIME_MANAGER != nullptr);

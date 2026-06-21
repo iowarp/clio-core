@@ -56,9 +56,9 @@ using namespace clio::run;
 static bool InitializeRuntime() {
   static bool initialized = false;
   if (!initialized) {
-    bool success = CHIMAERA_INIT(ChimaeraMode::kClient, true);
+    bool success = CLIO_INIT(ChimaeraMode::kClient, true);
     initialized = success;
-    if (success) SimpleTest::g_test_finalize = clio::run::CHIMAERA_FINALIZE;
+    if (success) SimpleTest::g_test_finalize = clio::run::CLIO_RUNTIME_FINALIZE;
     return success;
   }
   return true;
@@ -68,7 +68,7 @@ static bool InitializeRuntime() {
 // Connection Error Tests
 // ============================================================================
 
-// NOTE: This test is disabled because CHIMAERA_INIT has a static guard
+// NOTE: This test is disabled because CLIO_INIT has a static guard
 // that prevents multiple initializations in the same process. Once it
 // succeeds in any test, it will return true in all subsequent tests.
 // This test would need to run in a separate process to work correctly.
@@ -81,7 +81,7 @@ TEST_CASE("IpcErrors - Client Connect Without Server", "[ipc][errors]") {
   setenv("CLIO_WITH_RUNTIME", "0", 1);
 
   // This should timeout and fail gracefully (not crash)
-  bool success = CHIMAERA_INIT(ChimaeraMode::kClient, false);
+  bool success = CLIO_INIT(ChimaeraMode::kClient, false);
   REQUIRE(!success);
 
   // Verify IPC manager is not initialized
@@ -93,7 +93,7 @@ TEST_CASE("IpcErrors - Client Connect Without Server", "[ipc][errors]") {
 }
 */
 
-// NOTE: This test is disabled because it tries to call CHIMAERA_INIT
+// NOTE: This test is disabled because it tries to call CLIO_INIT
 // which can only be called once per process. It would need to run in
 // a separate process to work correctly.
 /*
@@ -103,7 +103,7 @@ TEST_CASE("IpcErrors - Connection Timeout", "[ipc][errors]") {
   if (server_pid == 0) {
     // Child: Start server then immediately exit
     setenv("CLIO_WITH_RUNTIME", "1", 1);
-    CHIMAERA_INIT(ChimaeraMode::kServer, true);
+    CLIO_INIT(ChimaeraMode::kServer, true);
     exit(0);  // Exit immediately
   }
 
@@ -116,7 +116,7 @@ TEST_CASE("IpcErrors - Connection Timeout", "[ipc][errors]") {
 
   // Now try to connect - server is gone
   setenv("CLIO_WITH_RUNTIME", "0", 1);
-  bool success = CHIMAERA_INIT(ChimaeraMode::kClient, false);
+  bool success = CLIO_INIT(ChimaeraMode::kClient, false);
 
   // May succeed or fail depending on timing and leftover shm
   // The important thing is it doesn't crash
@@ -348,7 +348,7 @@ TEST_CASE("IpcErrors - Concurrent Init/Finalize", "[ipc][errors][multiproc]") {
     pids[i] = fork();
     if (pids[i] == 0) {
       // Child: Try to initialize
-      bool success = CHIMAERA_INIT(ChimaeraMode::kClient, true);
+      bool success = CLIO_INIT(ChimaeraMode::kClient, true);
 
       if (success) {
         auto *ipc = CLIO_IPC;

@@ -125,8 +125,8 @@ bool ParseOpts(int argc, char *argv[], BenchOpts &opts) {
 #if !CTP_IS_DEVICE_PASS
 void EnsureInit(const BenchOpts &opts, clio::run::u64 bdev_capacity_bytes) {
   std::fprintf(stderr, "[INIT] Starting Chimaera server\n");
-  if (!clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kServer)) {
-    std::fprintf(stderr, "[INIT] CHIMAERA_INIT failed\n");
+  if (!clio::run::CLIO_INIT(clio::run::ChimaeraMode::kServer)) {
+    std::fprintf(stderr, "[INIT] CLIO_INIT failed\n");
     std::exit(2);
   }
   if (!clio::cte::core::CLIO_CTE_CLIENT_INIT()) {

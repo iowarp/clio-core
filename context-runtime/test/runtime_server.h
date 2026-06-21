@@ -38,7 +38,7 @@
  * RuntimeServer — cross-platform test helper that launches the canonical
  * `clio_run` runtime daemon as a SEPARATE process and manages its lifetime.
  *
- * This replaces the older `fork()` + in-process `CHIMAERA_INIT(kServer)` +
+ * This replaces the older `fork()` + in-process `CLIO_INIT(kServer)` +
  * `sleep(300)` pattern used by the IPC/transport/external-client tests. That
  * pattern is:
  *   - broken on macOS: the forked child dlopen()s the ChiMod .dylibs and spawns

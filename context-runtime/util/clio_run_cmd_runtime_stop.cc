@@ -14,7 +14,7 @@ int RuntimeStop(int argc, char* argv[]) {
 
   try {
     HLOG(kDebug, "Initializing Chimaera client...");
-    if (!clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, false)) {
+    if (!clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, false)) {
       HLOG(kError, "Failed to initialize Chimaera client components");
       return 1;
     }

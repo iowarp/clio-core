@@ -209,7 +209,7 @@ __global__ void InitMetaKernel(DeviceViewBase v, char *pages_base,
  *  non-empty modify range. */
 __global__ void LegacyFlushKernel(::clio::run::IpcManagerGpuInfo info,
                                    DeviceViewBase v) {
-  CHIMAERA_GPU_INIT(info, /*ipc_ptr=*/nullptr);
+  CLIO_GPU_INIT(info, /*ipc_ptr=*/nullptr);
   clio::run::u32 total_per_block = TotalPagesPerBlock(v);
   clio::run::u32 idx = blockIdx.x * blockDim.x + threadIdx.x;
   clio::run::u32 total = v.nblocks * total_per_block;
@@ -260,7 +260,7 @@ __global__ void ClearHostPrefetchFlagsBatchKernel(DeviceViewBase v,
 /** Drain kernel — non-template. Waits on every page's active_put /
  *  active_get and clears the slots. */
 __global__ void DrainKernel(::clio::run::IpcManagerGpuInfo info, DeviceViewBase v) {
-  CHIMAERA_GPU_INIT(info, /*ipc_ptr=*/nullptr);
+  CLIO_GPU_INIT(info, /*ipc_ptr=*/nullptr);
   clio::run::u32 total_per_block = TotalPagesPerBlock(v);
   clio::run::u32 idx = blockIdx.x * blockDim.x + threadIdx.x;
   clio::run::u32 total = v.nblocks * total_per_block;
@@ -695,7 +695,7 @@ __global__ void PersistentCacheManagerKernel(
     clio::run::u32 base_sleep_ns,
     clio::run::u32 max_sleep_ns,
     clio::run::u64 idle_exit_ns) {
-  CHIMAERA_GPU_INIT(info, /*ipc_ptr=*/nullptr);
+  CLIO_GPU_INIT(info, /*ipc_ptr=*/nullptr);
   if (blockIdx.x >= v.nblocks) return;
   Block *b = GetBlock(v, blockIdx.x);
   clio::run::u32 total = TotalPagesPerBlock(v);
@@ -735,7 +735,7 @@ __global__ void PersistentCacheManagerKernel(
  */
 __global__ void CacheManagerKernel(::clio::run::IpcManagerGpuInfo info,
                                     DeviceViewBase v) {
-  CHIMAERA_GPU_INIT(info, /*ipc_ptr=*/nullptr);
+  CLIO_GPU_INIT(info, /*ipc_ptr=*/nullptr);
   if (blockIdx.x >= v.nblocks) return;
   Block *b = GetBlock(v, blockIdx.x);
   clio::run::u32 total = TotalPagesPerBlock(v);

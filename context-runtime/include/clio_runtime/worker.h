@@ -31,8 +31,8 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#ifndef CHIMAERA_INCLUDE_CHIMAERA_WORKERS_WORKER_H_
-#define CHIMAERA_INCLUDE_CHIMAERA_WORKERS_WORKER_H_
+#ifndef CLIO_RUNTIME_INCLUDE_WORKERS_WORKER_H_
+#define CLIO_RUNTIME_INCLUDE_WORKERS_WORKER_H_
 
 #include <chrono>
 #ifndef __NVCOMPILER
@@ -120,7 +120,6 @@ struct WorkerStats {
   (CTP_THREAD_MODEL->GetTls<clio::run::Worker>(clio::run::chi_cur_worker_key_))
 // Backward-compat alias (clio_run rebrand). External code that still
 // uses the legacy CHI_* spelling keeps working unchanged.
-#define CHI_CUR_WORKER  CLIO_CUR_WORKER
 
 /**
  * Worker class for executing tasks
@@ -504,4 +503,4 @@ class Worker {
 
 }  // namespace clio::run
 
-#endif  // CHIMAERA_INCLUDE_CHIMAERA_WORKERS_WORKER_H_
+#endif  // CLIO_RUNTIME_INCLUDE_WORKERS_WORKER_H_

@@ -31,8 +31,8 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#ifndef CHIMAERA_INCLUDE_CHIMAERA_GPU_INFO_H_
-#define CHIMAERA_INCLUDE_CHIMAERA_GPU_INFO_H_
+#ifndef CLIO_RUNTIME_INCLUDE_GPU_INFO_H_
+#define CLIO_RUNTIME_INCLUDE_GPU_INFO_H_
 
 #include "clio_runtime/types.h"
 #include "clio_runtime/task.h"
@@ -62,4 +62,4 @@ struct IpcManagerGpuInfo {
 
 }  // namespace clio::run
 
-#endif  // CHIMAERA_INCLUDE_CHIMAERA_GPU_INFO_H_
+#endif  // CLIO_RUNTIME_INCLUDE_GPU_INFO_H_

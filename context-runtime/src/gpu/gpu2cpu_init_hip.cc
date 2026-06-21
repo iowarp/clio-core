@@ -53,7 +53,7 @@ bool gpu::IpcManager::ServerInitGpuQueues(u32 queue_depth) {
     // against per_gpu_devices_.size() and gracefully return null for
     // unknown gpu_ids, so a runtime without GPUs operates correctly —
     // it just never services GPU→CPU tasks. Returning true here lets
-    // CHIMAERA_INIT complete on hosts and CI containers without a
+    // CLIO_INIT complete on hosts and CI containers without a
     // visible CUDA device.
     HLOG(kInfo, "ServerInitGpuQueues: no GPU devices detected — "
          "GPU queues will not be initialized (CPU-only mode)");

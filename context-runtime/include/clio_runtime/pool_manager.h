@@ -31,8 +31,8 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#ifndef CHIMAERA_INCLUDE_CHIMAERA_MANAGERS_POOL_MANAGER_H_
-#define CHIMAERA_INCLUDE_CHIMAERA_MANAGERS_POOL_MANAGER_H_
+#ifndef CLIO_RUNTIME_INCLUDE_MANAGERS_POOL_MANAGER_H_
+#define CLIO_RUNTIME_INCLUDE_MANAGERS_POOL_MANAGER_H_
 
 #include <unordered_map>
 #include <string>
@@ -354,6 +354,5 @@ CLIO_RUN_DEFINE_GLOBAL_PTR_VAR_H(clio::run::PoolManager, g_pool_manager);
 #define CLIO_POOL_MANAGER CTP_GET_GLOBAL_PTR_VAR(::clio::run::PoolManager, g_pool_manager)
 // Backward-compat alias (clio_run rebrand). External code that still
 // uses the legacy CHI_* spelling keeps working unchanged.
-#define CHI_POOL_MANAGER  CLIO_POOL_MANAGER
 
-#endif  // CHIMAERA_INCLUDE_CHIMAERA_MANAGERS_POOL_MANAGER_H_
+#endif  // CLIO_RUNTIME_INCLUDE_MANAGERS_POOL_MANAGER_H_

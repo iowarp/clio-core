@@ -10,7 +10,7 @@
  * GPU producer-only stress test (SYCL).
  *
  * SYCL twin of test_gpu_kernel_stress_gpu.cc. SYCL kernels run as
- * single_task by convention in this codebase (the CHIMAERA_GPU_INIT
+ * single_task by convention in this codebase (the CLIO_GPU_INIT
  * macro and IpcGpu2Cpu::ClientSend assume one work-item per kernel),
  * so we serialize submissions on the host: per slot, launch a
  * single_task that does Send + Wait, queue them all without waiting,
@@ -57,7 +57,7 @@ TEST_CASE("GPU producer-only stress: kernel submits N tasks (SYCL)",
   //
   // Use a fresh GPU queue rather than ctp::GpuApi::SyclQueue() (the
   // singleton). The singleton was used for ServerInitGpuQueues during
-  // CHIMAERA_INIT; on the DPC++ CUDA backend, subsequent submissions
+  // CLIO_INIT; on the DPC++ CUDA backend, subsequent submissions
   // on the same singleton can silently no-op (observed: kernel runs
   // but malloc_shared writes don't propagate to host). A fresh queue
   // avoids that and inherits the same context, so the pinned-host
@@ -115,7 +115,7 @@ TEST_CASE("GPU producer-only stress: kernel submits N tasks (SYCL)",
           (void)handle_storage; (void)slot_storage;
           *marker_storage = 1;
 #if CTP_IS_DEVICE_PASS
-          CHIMAERA_GPU_INIT(*info_storage, ipc_storage);
+          CLIO_GPU_INIT(*info_storage, ipc_storage);
           *marker_storage = 2;
           clio::run::u32 slot = *slot_storage;
           auto fp = handle_storage[slot];

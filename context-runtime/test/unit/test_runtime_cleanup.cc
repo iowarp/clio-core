@@ -57,9 +57,9 @@ using namespace clio::run;
 static bool InitializeRuntime() {
   static bool initialized = false;
   if (!initialized) {
-    bool success = CHIMAERA_INIT(ChimaeraMode::kClient, true);
+    bool success = CLIO_INIT(ChimaeraMode::kClient, true);
     initialized = success;
-    if (success) SimpleTest::g_test_finalize = clio::run::CHIMAERA_FINALIZE;
+    if (success) SimpleTest::g_test_finalize = clio::run::CLIO_RUNTIME_FINALIZE;
     return success;
   }
   return true;
@@ -74,7 +74,7 @@ static bool InitializeRuntime() {
 // indefinitely. ServerFinalize is exercised by atexit handlers in other tests.
 /*
 TEST_CASE("Cleanup - Server Finalization", "[cleanup][ipc]") {
-  bool success = CHIMAERA_INIT(ChimaeraMode::kClient, true);
+  bool success = CLIO_INIT(ChimaeraMode::kClient, true);
   REQUIRE(success);
 
   auto *ipc = CLIO_IPC;
@@ -101,7 +101,7 @@ TEST_CASE("Cleanup - Client Finalization", "[cleanup][ipc]") {
   if (server_pid == 0) {
     // Child: Start server
     setenv("CLIO_WITH_RUNTIME", "1", 1);
-    CHIMAERA_INIT(ChimaeraMode::kServer, true);
+    CLIO_INIT(ChimaeraMode::kServer, true);
     sleep(300);
     exit(0);
   }
@@ -111,7 +111,7 @@ TEST_CASE("Cleanup - Client Finalization", "[cleanup][ipc]") {
 
   // Connect as client only
   setenv("CLIO_WITH_RUNTIME", "0", 1);
-  bool success = CHIMAERA_INIT(ChimaeraMode::kClient, false);
+  bool success = CLIO_INIT(ChimaeraMode::kClient, false);
   REQUIRE(success);
 
   auto *ipc = CLIO_IPC;
@@ -132,7 +132,7 @@ TEST_CASE("Cleanup - Client Finalization", "[cleanup][ipc]") {
 }
 */
 
-// NOTE: This test is disabled because CHIMAERA_INIT has a static guard
+// NOTE: This test is disabled because CLIO_INIT has a static guard
 // that prevents multiple initialization in the same process. Once called,
 // subsequent calls just return true without re-initializing.
 // To test repeated init/finalize, would need to use separate processes.
@@ -141,7 +141,7 @@ TEST_CASE("Cleanup - Repeated Init/Finalize", "[cleanup][ipc]") {
   // Test multiple init/finalize cycles
   for (int i = 0; i < 3; ++i) {
     // Initialize
-    bool success = CHIMAERA_INIT(ChimaeraMode::kClient, true);
+    bool success = CLIO_INIT(ChimaeraMode::kClient, true);
     REQUIRE(success);
 
     auto *ipc = CLIO_IPC;

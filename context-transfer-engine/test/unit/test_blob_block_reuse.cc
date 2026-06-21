@@ -103,7 +103,7 @@ class BlockReuseFixture {
     ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", config_path_.c_str(), 1);
     ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", config_path_.c_str(), 1);
 
-    bool success = clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true);
+    bool success = clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, true);
     REQUIRE(success);
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
     success = clio::cte::core::CLIO_CTE_CLIENT_INIT();

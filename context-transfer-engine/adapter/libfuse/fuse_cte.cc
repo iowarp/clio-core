@@ -111,9 +111,9 @@ static void *cte_fuse_init(struct fuse_conn_info *conn,
   cfg->entry_timeout = 0;
   cfg->negative_timeout = 0;
 
-  bool success = clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true);
+  bool success = clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, true);
   if (!success) {
-    fprintf(stderr, "ERROR: CHIMAERA_INIT failed\n");
+    fprintf(stderr, "ERROR: CLIO_INIT failed\n");
     return nullptr;
   }
   // Create-or-bind the filesystem chimod pool (which also brings up the CTE
@@ -132,7 +132,7 @@ static void *cte_fuse_init(struct fuse_conn_info *conn,
 
 static void cte_fuse_destroy(void *private_data) {
   (void)private_data;
-  clio::run::CHIMAERA_FINALIZE();
+  clio::run::CLIO_RUNTIME_FINALIZE();
 }
 
 // ============================================================================

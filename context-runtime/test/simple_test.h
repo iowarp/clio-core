@@ -264,7 +264,7 @@ inline int run_all_tests(const std::string& filter = "") {
 #ifdef CTP_ALLOC_TRACK_SIZE
         // Leak-check every test except:
         //  - the first executed test, during which lazy one-time runtime init
-        //    (CHIMAERA_INIT in a fixture) allocates process-lifetime state that
+        //    (CLIO_INIT in a fixture) allocates process-lifetime state that
         //    is legitimate, not a leak; and
         //  - tests tagged [noleak], which intentionally retain runtime-heap
         //    memory (analogous to the LSan suppressions list).

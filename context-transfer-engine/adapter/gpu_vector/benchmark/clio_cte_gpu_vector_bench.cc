@@ -170,8 +170,8 @@ bool ParseOpts(int argc, char *argv[], BenchOpts &opts) {
 #if !CTP_IS_DEVICE_PASS
 void EnsureInit(const BenchOpts &opts, clio::run::u64 bdev_capacity_bytes) {
   std::fprintf(stderr, "[INIT] Starting Chimaera server\n");
-  if (!clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kServer)) {
-    std::fprintf(stderr, "[INIT] CHIMAERA_INIT failed\n");
+  if (!clio::run::CLIO_INIT(clio::run::ChimaeraMode::kServer)) {
+    std::fprintf(stderr, "[INIT] CLIO_INIT failed\n");
     std::exit(2);
   }
   if (!clio::cte::core::CLIO_CTE_CLIENT_INIT()) {
@@ -249,7 +249,7 @@ clio::run::u64 ExpectedGets(clio::run::u32 nblocks, clio::run::u32 pages_per_blo
 __global__ void BenchWriteKernel(clio::run::IpcManagerGpuInfo info,
                                   gv::DeviceView<clio::run::u32> view,
                                   clio::run::u64 per_block) {
-  CHIMAERA_GPU_INIT(info, /*ipc_ptr=*/nullptr);
+  CLIO_GPU_INIT(info, /*ipc_ptr=*/nullptr);
   dev::vector<clio::run::u32> v(view, g_ipc_manager_ptr);
   clio::run::u64 lo = static_cast<clio::run::u64>(blockIdx.x) * per_block;
   clio::run::u64 hi = lo + per_block;
@@ -269,7 +269,7 @@ __global__ void BenchWriteKernel(clio::run::IpcManagerGpuInfo info,
 __global__ void BenchReadKernel(clio::run::IpcManagerGpuInfo info,
                                  gv::DeviceView<clio::run::u32> view,
                                  clio::run::u32 *result, clio::run::u64 per_block) {
-  CHIMAERA_GPU_INIT(info, /*ipc_ptr=*/nullptr);
+  CLIO_GPU_INIT(info, /*ipc_ptr=*/nullptr);
   dev::vector<clio::run::u32> v(view, g_ipc_manager_ptr);
   clio::run::u64 lo = static_cast<clio::run::u64>(blockIdx.x) * per_block;
   clio::run::u64 hi = lo + per_block;

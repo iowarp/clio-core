@@ -52,8 +52,8 @@ TEST_CASE("StringDataAssimilator stores ctx.src_data as one named blob",
                           "test_cae_string_assim_config.yaml";
   ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", config_path.string(), 1);
 
-  REQUIRE(clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kServer));
-  SimpleTest::g_test_finalize = clio::run::CHIMAERA_FINALIZE;
+  REQUIRE(clio::run::CLIO_INIT(clio::run::ChimaeraMode::kServer));
+  SimpleTest::g_test_finalize = clio::run::CLIO_RUNTIME_FINALIZE;
   std::this_thread::sleep_for(1s);
 
   // CAE peer pool at 400.0; CTE peer pool at 512.0 (kCtePoolId default).

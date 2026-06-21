@@ -95,8 +95,8 @@ class ExportDataFixture {
     if (g_initialized) return;
 
     // Step 1: CLIO Runtime client init
-    bool ok = clio::run::CHIMAERA_INIT(clio::run::ChimaeraMode::kClient, true);
-    if (!ok) throw std::runtime_error("CHIMAERA_INIT failed");
+    bool ok = clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, true);
+    if (!ok) throw std::runtime_error("CLIO_INIT failed");
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
 
     // Step 2: CTE client + pool

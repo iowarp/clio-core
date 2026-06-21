@@ -31,8 +31,8 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#ifndef CHIMAERA_INCLUDE_CHIMAERA_TASK_H_
-#define CHIMAERA_INCLUDE_CHIMAERA_TASK_H_
+#ifndef CLIO_RUNTIME_INCLUDE_TASK_H_
+#define CLIO_RUNTIME_INCLUDE_TASK_H_
 
 #ifdef _WIN32
 using pid_t = int;
@@ -1355,9 +1355,5 @@ inline clio::run::TaskResume make_task_fiber(F&& fn) {
 #endif
 // Backward-compat aliases (clio_run rebrand). External code that still
 // uses the legacy CHI_* spelling keeps working unchanged.
-#define CHI_TASK_BODY_BEGIN  CLIO_TASK_BODY_BEGIN
-#define CHI_TASK_BODY_END    CLIO_TASK_BODY_END
-#define CHI_CO_AWAIT         CLIO_CO_AWAIT
-#define CHI_CO_RETURN        CLIO_CO_RETURN
 
-#endif  // CHIMAERA_INCLUDE_CHIMAERA_TASK_H_
+#endif  // CLIO_RUNTIME_INCLUDE_TASK_H_
