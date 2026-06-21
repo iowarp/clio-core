@@ -112,7 +112,7 @@ public:
       }
 
       // Register a RAM storage target so PutBlob can allocate space.
-      // When CHI_SERVER_CONF is set, compose config already registers targets,
+      // When CLIO_SERVER_CONF is set, compose config already registers targets,
       // but when it's absent (e.g., compute nodes), the pool has none.
       auto reg_task = cte_client->AsyncRegisterTarget(
           "ram::cee_test_cache",

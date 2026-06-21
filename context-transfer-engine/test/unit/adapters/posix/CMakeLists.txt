@@ -26,7 +26,7 @@ if(CLIO_CORE_ENABLE_MPI)
 endif()
 
 # The co-located runtime (CHIMAERA_INIT(kClient, /*default_with_runtime=*/true))
-# dlopens the chimods from CHI_REPO_PATH, so make sure they are built first.
+# dlopens the chimods from CLIO_REPO_PATH, so make sure they are built first.
 add_dependencies(clio_cte_posix_unit_tests
     clio_cte_core_runtime
     clio_cte_filesystem_runtime
@@ -46,7 +46,7 @@ if(CLIO_CORE_ENABLE_TESTS)
         WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     )
     set_tests_properties(clio_cte_posix_unit_tests PROPERTIES
-        ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1"
+        ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1"
         RESOURCE_LOCK "chimaera_runtime_port"
         TIMEOUT 120
         LABELS "msan_skip")

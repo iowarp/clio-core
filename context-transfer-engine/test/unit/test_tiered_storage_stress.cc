@@ -97,7 +97,7 @@ class TieredStorageStressFixture {
     CreateConfigFile();
 
     // Set environment variable for runtime config
-    // CHI_SERVER_CONF is checked first, so set it to override any existing value
+    // CLIO_SERVER_CONF is checked first, so set it to override any existing value
     ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", config_path_.c_str(), 1);
     ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", config_path_.c_str(), 1);
 

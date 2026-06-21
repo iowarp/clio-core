@@ -76,7 +76,7 @@ struct ChiModInfo {
  * 
  * Handles discovery and loading of ChiMod shared libraries from:
  * - LD_LIBRARY_PATH directories
- * - CHI_REPO_PATH directories
+ * - CLIO_REPO_PATH directories
  * 
  * Each ChiMod provides functions to query name and allocate ChiContainers.
  * Uses CTP SharedLibrary for cross-platform dynamic loading.

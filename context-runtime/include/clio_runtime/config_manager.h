@@ -88,7 +88,7 @@ struct ComposeConfig {
  *
  * Inherits from ctp BaseConfig and manages YAML configuration parsing.
  * Config lookup, first hit wins:
- *   1. CLIO_SERVER_CONF env (or legacy CHI_SERVER_CONF via env_compat)
+ *   1. CLIO_SERVER_CONF env (or legacy CLIO_SERVER_CONF via env_compat)
  *   2. ~/.clio/clio.yaml
  *   3. ~/.clio/chimaera.yaml
  *   4. ~/.chimaera/clio.yaml
@@ -129,7 +129,7 @@ class ConfigManager : public ctp::BaseConfig {
   /**
    * Get server configuration file path.
    * Lookup order (first hit wins):
-   *   1. CLIO_SERVER_CONF env var (or legacy CHI_SERVER_CONF via env_compat)
+   *   1. CLIO_SERVER_CONF env var (or legacy CLIO_SERVER_CONF via env_compat)
    *   2. ~/.clio/clio.yaml         (new canonical user config)
    *   3. ~/.clio/chimaera.yaml     (legacy filename in new dir)
    *   4. ~/.chimaera/clio.yaml     (new filename in legacy dir)
@@ -180,7 +180,7 @@ class ConfigManager : public ctp::BaseConfig {
 
   /**
    * Get server address for client connections
-   * @return Server address (default: "127.0.0.1", overridden by CHI_SERVER_ADDR)
+   * @return Server address (default: "127.0.0.1", overridden by CLIO_SERVER_ADDR)
    */
   std::string GetServerAddr() const;
 

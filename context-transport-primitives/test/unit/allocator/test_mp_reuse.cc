@@ -1,6 +1,6 @@
 // Stress test: verify _ProducerConsumerAllocator reuses freed memory.
 //
-// Pattern mirrors IpcManager::AllocateBuffer/FreeBuffer in CHI_IPC_MODE=shm:
+// Pattern mirrors IpcManager::AllocateBuffer/FreeBuffer in CLIO_IPC_MODE=shm:
 // repeat (Allocate -> Free) tightly. With reuse, the heap should never grow.
 #include <catch2/catch_test_macros.hpp>
 #include "allocator_test.h"

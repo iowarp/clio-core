@@ -34,7 +34,7 @@
 /**
  * Integration test for client failover to new hosts
  *
- * Validates WaitForServerAndReconnect Phase 2 (CHI_CLIENT_TRY_NEW_SERVERS).
+ * Validates WaitForServerAndReconnect Phase 2 (CLIO_CLIENT_TRY_NEW_SERVERS).
  *
  * Test flow (single phase, orchestrated by run_tests.sh):
  *   1. Start 4 runtimes (via docker-compose)
@@ -48,8 +48,8 @@
  *   9. Task completes successfully on the new host
  *
  * Environment (set by docker-compose):
- *   CHI_CLIENT_RETRY_TIMEOUT=5    (Phase 1 gives up after 5s)
- *   CHI_CLIENT_TRY_NEW_SERVERS=16 (Phase 2 tries up to 16 random hosts)
+ *   CLIO_CLIENT_RETRY_TIMEOUT=5    (Phase 1 gives up after 5s)
+ *   CLIO_CLIENT_TRY_NEW_SERVERS=16 (Phase 2 tries up to 16 random hosts)
  */
 
 #include "simple_test.h"
@@ -152,8 +152,8 @@ TEST_CASE("Failover to new host after server shutdown",
     // ------------------------------------------------------------------
     // The Recv() call will detect the server is dead, enter
     // WaitForServerAndReconnect, time out on the original server
-    // (Phase 1, ~5s via CHI_CLIENT_RETRY_TIMEOUT), then try random
-    // hosts from the hostfile (Phase 2, CHI_CLIENT_TRY_NEW_SERVERS=16).
+    // (Phase 1, ~5s via CLIO_CLIENT_RETRY_TIMEOUT), then try random
+    // hosts from the hostfile (Phase 2, CLIO_CLIENT_TRY_NEW_SERVERS=16).
     // One of nodes 2/3/4 should accept the connection.
     //
     // After reconnection the client is on a new node where the pool

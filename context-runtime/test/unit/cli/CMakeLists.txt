@@ -41,7 +41,7 @@ if(CLIO_CORE_ENABLE_TESTS)
   # started or waited for. CLIO_PORT is off the default 10500 to avoid
   # colliding with concurrently running runtime tests.
   set(_cli_test_env
-    "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_WAIT_SERVER=0;CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10599")
+    "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_WAIT_SERVER=0;CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10599")
 
   add_test(
     NAME cr_cli_refresh_repo_tests
@@ -81,7 +81,7 @@ if(CLIO_CORE_ENABLE_TESTS)
   # memory segment name is per-user, so serialize with the other tests that
   # run a runtime.
   set(_cli_live_env
-    "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1")
+    "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1")
   if(APPLE)
     # macOS (issue #482): the local ZMQ DEALER->ROUTER control plane does not
     # deliver ClientConnect replies on the macos-14/15/26 CI runners, so every

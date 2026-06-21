@@ -87,7 +87,7 @@ namespace fs = std::filesystem;
 
 /**
  * Helper function to check if runtime should be initialized
- * Reads CHI_WITH_RUNTIME environment variable
+ * Reads CLIO_WITH_RUNTIME environment variable
  * Returns true if unset or set to any value except "0", "false", "no", "off"
  */
 bool ShouldInitializeRuntime() {
@@ -162,11 +162,11 @@ class CTECoreFunctionalTestFixture {
 
     // Initialize CLIO Runtime runtime and client for functional testing
     if (ShouldInitializeRuntime()) {
-      INFO("Initializing runtime (CHI_WITH_RUNTIME not set or enabled)");
+      INFO("Initializing runtime (CLIO_WITH_RUNTIME not set or enabled)");
       bool success = clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, true);
       REQUIRE(success);
     } else {
-      INFO("Runtime already initialized externally (CHI_WITH_RUNTIME="
+      INFO("Runtime already initialized externally (CLIO_WITH_RUNTIME="
            << clio::run::env::GetCompat("WITH_RUNTIME") << ")");
       bool success = clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, true);
       REQUIRE(success);
@@ -709,7 +709,7 @@ TEST_CASE("FUNCTIONAL - PutBlob Operations",
       auto test_data = fixture->CreateTestData(blob_size, pattern);
       REQUIRE(fixture->VerifyTestData(test_data, pattern));
 
-      // Allocate and copy to shared memory using CHI_CLIENT pattern
+      // Allocate and copy to shared memory using CLIO_CLIENT pattern
       // Following MODULE_DEVELOPMENT_GUIDE.md AllocateBuffer<T> specification
       ctp::ipc::FullPtr<char> blob_data_fullptr =
           CLIO_IPC->AllocateBuffer(blob_size);
@@ -1313,7 +1313,7 @@ TEST_CASE("FUNCTIONAL - PutBlob-GetBlob Integration Cycles",
         fixture->CreateTestData(blob_size, 'I');  // 'I' for Integration
     REQUIRE(fixture->VerifyTestData(original_data, 'I'));
 
-    // Allocate shared memory and store data using CHI_CLIENT pattern
+    // Allocate shared memory and store data using CLIO_CLIENT pattern
     // Following MODULE_DEVELOPMENT_GUIDE.md AllocateBuffer<T> specification
     ctp::ipc::FullPtr<char> put_fullptr = CLIO_IPC->AllocateBuffer(blob_size);
     if (put_fullptr.IsNull()) {

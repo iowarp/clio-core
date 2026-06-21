@@ -279,7 +279,7 @@ class Config {
   /**
    * Environment variable name for configuration file path
    */
-  std::string config_env_var_ = "CHI_SERVER_CONF";
+  std::string config_env_var_ = "CLIO_SERVER_CONF";
 
   /**
    * Parse performance configuration from YAML

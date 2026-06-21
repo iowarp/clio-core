@@ -70,7 +70,7 @@ mount_fuse() {  # $1 = mountpoint, $2 = with_runtime(1/0), $3 = fsname (mount so
   # apart: _check_mounted_on uses `findmnt -S <dev>` and aborts if a device
   # appears mounted on more than one target. (Both mounts otherwise share the
   # source "clio_cte_fuse".)
-  CHI_REPO_PATH="${BUILD_BIN}" LD_LIBRARY_PATH="${BUILD_BIN}:${HOME}/.local/lib:${LD_LIBRARY_PATH:-}" \
+  CLIO_REPO_PATH="${BUILD_BIN}" LD_LIBRARY_PATH="${BUILD_BIN}:${HOME}/.local/lib:${LD_LIBRARY_PATH:-}" \
     CLIO_WITH_RUNTIME="${with_rt}" CLIO_BIND_ADDR=127.0.0.1 \
     "${FUSE_BIN}" "${mnt}" -o "fsname=${fsname}" -f &
   FUSE_PIDS+=("$!")

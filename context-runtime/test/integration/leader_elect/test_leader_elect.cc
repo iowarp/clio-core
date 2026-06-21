@@ -51,8 +51,8 @@
  *     3. Verify completion — system healthy after leader restart
  *
  * Environment (set by docker-compose):
- *   CHI_CLIENT_RETRY_TIMEOUT=5    (Phase 1 gives up after 5s)
- *   CHI_CLIENT_TRY_NEW_SERVERS=16 (Phase 2 tries up to 16 random hosts)
+ *   CLIO_CLIENT_RETRY_TIMEOUT=5    (Phase 1 gives up after 5s)
+ *   CLIO_CLIENT_TRY_NEW_SERVERS=16 (Phase 2 tries up to 16 random hosts)
  */
 
 #include "simple_test.h"

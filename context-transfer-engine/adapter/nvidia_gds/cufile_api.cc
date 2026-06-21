@@ -87,7 +87,7 @@ ssize_t cuFileWrite(CUfileHandle_t fh, const void *buf, size_t size,
                     off_t offset, off_t offset2) {
   //    printf("Intercepted the REAL API\n");
   // Read data from GPU using cudaMemcpy
-  // FullPtr<char> p = CHI_CLIENT->AllocateBuffer(size);
+  // FullPtr<char> p = CLIO_CLIENT->AllocateBuffer(size);
   char *host_data = (char *)malloc(size);
   cudaMemcpy(host_data, buf, size, cudaMemcpyDeviceToHost);
   // Write data to Clio

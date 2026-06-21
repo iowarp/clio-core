@@ -131,7 +131,7 @@ class ZeroMqTransport : public Transport {
       // probe rounds + cross-node SendIn fan-out (each chimaera daemon
       // talks to N-1 peers; N²=4096 connections at N=64 is enough to
       // bottleneck 2 I/O threads). 8 scales comfortably to ~512.
-      // Override at runtime via CHI_ZMQ_IO_THREADS env if needed.
+      // Override at runtime via CLIO_ZMQ_IO_THREADS env if needed.
       const char *iot_env = ctp::env::GetCompat("ZMQ_IO_THREADS");
       int iot = (iot_env && *iot_env) ? std::atoi(iot_env) : 8;
       if (iot < 1) iot = 1;

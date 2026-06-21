@@ -137,7 +137,7 @@ void InitializeChimaera() {
  * Cleanup CLIO Runtime runtime
  */
 void CleanupChimaera() {
-  // Client finalize handled by CHI_CLIENT destructor
+  // Client finalize handled by CLIO_CLIENT destructor
 }
 
 /**

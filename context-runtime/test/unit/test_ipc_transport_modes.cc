@@ -37,7 +37,7 @@
  * Tests that each IPC transport mode (SHM, TCP, IPC) initializes correctly
  * and that the correct transport path is active. Each test case launches the
  * runtime daemon out-of-process (clio::run::test::RuntimeServer -> clio_run start),
- * sets CHI_IPC_MODE, connects as client, and verifies mode state.
+ * sets CLIO_IPC_MODE, connects as client, and verifies mode state.
  */
 
 #include "../simple_test.h"
@@ -227,7 +227,7 @@ TEST_CASE("IpcTransportMode - Default Mode Is TCP",
   REQUIRE(server.Start());
   REQUIRE(server.WaitForReady());
 
-  // Unset CHI_IPC_MODE to test default behavior
+  // Unset CLIO_IPC_MODE to test default behavior
   clio::run::test::UnsetEnvVar("CLIO_IPC_MODE");
   clio::run::test::SetEnvVar("CLIO_WITH_RUNTIME", "0");
   bool success = CLIO_INIT(ChimaeraMode::kClient, false);

@@ -72,7 +72,7 @@ if(BUILD_TESTING)
         PROPERTIES
         LABELS "python;bindings"
         TIMEOUT 120
-        ENVIRONMENT "CHI_WITH_RUNTIME=1"
+        ENVIRONMENT "CLIO_WITH_RUNTIME=1"
     )
 
     # Ensure test depends on the built module
@@ -128,7 +128,7 @@ if(BUILD_TESTING)
         PROPERTIES
         LABELS "python;bindings;semantic-search"
         TIMEOUT 120
-        ENVIRONMENT "CHI_WITH_RUNTIME=1;CLIO_BIND_ADDR=127.0.0.1"
+        ENVIRONMENT "CLIO_WITH_RUNTIME=1;CLIO_BIND_ADDR=127.0.0.1"
         DEPENDS clio_cte_core_ext
     )
 
@@ -144,7 +144,7 @@ if(BUILD_TESTING)
         PROPERTIES
         LABELS "python;bindings;temporal-search"
         TIMEOUT 120
-        ENVIRONMENT "CHI_WITH_RUNTIME=1;CLIO_BIND_ADDR=127.0.0.1"
+        ENVIRONMENT "CLIO_WITH_RUNTIME=1;CLIO_BIND_ADDR=127.0.0.1"
         DEPENDS clio_cte_core_ext
     )
 
@@ -161,7 +161,7 @@ if(BUILD_TESTING)
         PROPERTIES
         LABELS "python;bindings;getblob"
         TIMEOUT 120
-        ENVIRONMENT "CHI_WITH_RUNTIME=1;CLIO_BIND_ADDR=127.0.0.1"
+        ENVIRONMENT "CLIO_WITH_RUNTIME=1;CLIO_BIND_ADDR=127.0.0.1"
         DEPENDS clio_cte_core_ext
     )
 endif()

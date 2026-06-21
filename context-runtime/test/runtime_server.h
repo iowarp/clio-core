@@ -119,10 +119,10 @@ class RuntimeServer {
     const std::string exe = RuntimeExe();
     // Point the daemon at the directory holding clio_run for ChiMod (.so/.dylib
     // /.dll) discovery — the modules are built alongside it. Not every test
-    // sets CHI_REPO_PATH in its CTest ENVIRONMENT, so set it unconditionally.
+    // sets CLIO_REPO_PATH in its CTest ENVIRONMENT, so set it unconditionally.
     {
       size_t slash = exe.find_last_of("/\\");
-      if (slash != std::string::npos) SetEnv("CHI_REPO_PATH", exe.substr(0, slash));
+      if (slash != std::string::npos) SetEnv("CLIO_REPO_PATH", exe.substr(0, slash));
     }
     const std::string log = ServerLogPath();
 
@@ -242,12 +242,12 @@ class RuntimeServer {
 
  private:
   /** Absolute path to the clio_run binary. CMake passes CLIO_RUN_EXE via
-   *  $<TARGET_FILE:clio_run>; fall back to CHI_REPO_PATH/clio_run otherwise. */
+   *  $<TARGET_FILE:clio_run>; fall back to CLIO_REPO_PATH/clio_run otherwise. */
   static std::string RuntimeExe() {
 #ifdef CLIO_RUN_EXE
     return std::string(CLIO_RUN_EXE);
 #else
-    const char *repo = std::getenv("CHI_REPO_PATH");
+    const char *repo = std::getenv("CLIO_REPO_PATH");
     std::string dir = (repo && *repo) ? std::string(repo) : std::string(".");
 #ifdef _WIN32
     return dir + "\\clio_run.exe";

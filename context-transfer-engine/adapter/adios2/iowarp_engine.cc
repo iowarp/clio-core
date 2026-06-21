@@ -77,7 +77,7 @@ IowarpEngine::IowarpEngine(adios2::core::IO &io, const std::string &name,
     if (ppn < 1) ppn = 1;
     int local_rank = rank_ % ppn;
     // Per-local-rank stagger step (μs); default 250 ms so 12 ranks
-    // spread over 3s. Tunable via CHI_INIT_STAGGER_MS.
+    // spread over 3s. Tunable via CLIO_INIT_STAGGER_MS.
     const char *stag_env = clio::run::env::GetCompat("INIT_STAGGER_MS");
     int stagger_ms = (stag_env && *stag_env) ? std::atoi(stag_env) : 250;
     if (stagger_ms < 0) stagger_ms = 0;
@@ -93,8 +93,8 @@ IowarpEngine::IowarpEngine(adios2::core::IO &io, const std::string &name,
   // seconds to drain its 9416 ROUTER accept queue; a few short retries
   // are not enough. Default 60 attempts × ~3s mean = ~3 min budget.
   // Jitter desynchronizes 12 same-node ranks so they don't all retry
-  // on the same second. Tunable via CHI_INIT_ATTEMPTS and
-  // CHI_INIT_SLEEP_MS (sleep is mean; actual is uniform [0.5x, 1.5x]).
+  // on the same second. Tunable via CLIO_INIT_ATTEMPTS and
+  // CLIO_INIT_SLEEP_MS (sleep is mean; actual is uniform [0.5x, 1.5x]).
   HLOG(kDebug, "[IowarpEngine] About to call CLIO_CTE_CLIENT_INIT");
   const char *att_env = clio::run::env::GetCompat("INIT_ATTEMPTS");
   int max_attempts = (att_env && *att_env) ? std::atoi(att_env) : 60;

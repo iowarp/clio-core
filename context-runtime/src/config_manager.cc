@@ -67,7 +67,7 @@ bool ConfigManager::ClientInit() {
   }
 
   // Check CLIO_PORT env var (overrides YAML and default).
-  // GetCompat reads CLIO_PORT first, falls back to CHI_PORT for old deployments.
+  // GetCompat reads CLIO_PORT first, falls back to CLIO_PORT for old deployments.
   if (const char *env = clio::run::env::GetCompat("PORT")) {
     std::string port_env(env);
     if (!port_env.empty()) {
@@ -76,7 +76,7 @@ bool ConfigManager::ClientInit() {
   }
 
   // Check CLIO_SERVER_ADDR env var (overrides default 127.0.0.1).
-  // GetCompat reads CLIO_SERVER_ADDR first, falls back to CHI_SERVER_ADDR.
+  // GetCompat reads CLIO_SERVER_ADDR first, falls back to CLIO_SERVER_ADDR.
   if (const char *env = clio::run::env::GetCompat("SERVER_ADDR")) {
     std::string addr_env(env);
     if (!addr_env.empty()) {
@@ -104,7 +104,7 @@ bool ConfigManager::LoadYaml(const std::string &config_path) {
 }
 
 std::string ConfigManager::GetServerConfigPath() const {
-  // Check env var first: CLIO_SERVER_CONF preferred, CHI_SERVER_CONF legacy.
+  // Check env var first: CLIO_SERVER_CONF preferred, CLIO_SERVER_CONF legacy.
   const char *env_path = clio::run::env::GetCompat("SERVER_CONF");
   if (env_path) {
     return std::string(env_path);

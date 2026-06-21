@@ -106,7 +106,7 @@ if(CHIMAERA_GPU_SOURCES)
     target_link_libraries(${CHIMAERA_LIB_NAME} PRIVATE ${CHIMAERA_LIB_NAME}_gpu)
     # Add CTP_ENABLE_SYCL=1 + sycl headers to the host library (NOT -fsycl,
     # which would force a device-pass parse of every host TU and trip
-    # type-mismatches on host-only methods accessed via CHI_IPC). Without
+    # type-mismatches on host-only methods accessed via CLIO_IPC). Without
     # -fsycl, host code uses sycl::malloc_host / sycl::queue / sycl::free
     # as plain runtime API calls. The chimaera_cxx_gpu library compiled by
     # add_sycl_library still gets full -fsycl + device-pass treatment.
@@ -200,7 +200,7 @@ endif()
 
 # Add CMAKE_INSTALL_PREFIX as a compile definition for ChiMod search paths
 target_compile_definitions(${CHIMAERA_LIB_NAME} PRIVATE
-  CHI_INSTALL_PREFIX="${CMAKE_INSTALL_PREFIX}"
+  CLIO_INSTALL_PREFIX="${CMAKE_INSTALL_PREFIX}"
   # Tell clio_runtime/api.h to emit dllexport (instead of the default
   # dllimport that consumer DLLs see).
   CLIO_RUN_BUILDING_DLL=1

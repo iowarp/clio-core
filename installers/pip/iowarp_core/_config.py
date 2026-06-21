@@ -12,7 +12,7 @@ def find_config():
     """Find the Clio server configuration file.
 
     Search order:
-    1. CLIO_SERVER_CONF env var (preferred), or CHI_SERVER_CONF (legacy)
+    1. CLIO_SERVER_CONF env var (preferred), or CLIO_SERVER_CONF (legacy)
     2. ~/.clio/clio.yaml        (new canonical user config)
     3. ~/.clio/chimaera.yaml    (legacy filename in new dir)
     4. ~/.chimaera/clio.yaml    (new filename in legacy dir)
@@ -23,7 +23,7 @@ def find_config():
         str: Path to the configuration file, or None if not found.
     """
     # 1. Environment variable override (new name, then legacy fallback)
-    for var in ("CLIO_SERVER_CONF", "CHI_SERVER_CONF"):
+    for var in ("CLIO_SERVER_CONF", "CLIO_SERVER_CONF"):
         env_conf = os.environ.get(var)
         if env_conf and os.path.isfile(env_conf):
             return env_conf

@@ -126,7 +126,7 @@ bool IpcManager::ClientInit() {
     return true;
   }
 
-  // Parse CHI_IPC_MODE environment variable (default: TCP)
+  // Parse CLIO_IPC_MODE environment variable (default: TCP)
   const char *ipc_mode_env = clio::run::env::GetCompat("IPC_MODE");
   if (ipc_mode_env != nullptr) {
     std::string mode_str(ipc_mode_env);
@@ -152,7 +152,7 @@ bool IpcManager::ClientInit() {
   HLOG(kInfo, "IpcManager::ClientInit: retry_timeout = {}s",
        client_retry_timeout_);
 
-  // Parse CHI_CLIENT_TRY_NEW_SERVERS environment variable
+  // Parse CLIO_CLIENT_TRY_NEW_SERVERS environment variable
   const char *try_new_env = clio::run::env::GetCompat("CLIENT_TRY_NEW_SERVERS");
   if (try_new_env) {
     client_try_new_servers_ = std::atoi(try_new_env);
@@ -308,7 +308,7 @@ bool IpcManager::ServerInit() {
     return true;
   }
 
-  // CLIO_FORCE_NET (legacy CHI_FORCE_NET also honored via GetCompat):
+  // CLIO_FORCE_NET (legacy CLIO_FORCE_NET also honored via GetCompat):
   // when set to anything non-empty, every task whose PoolQuery isn't
   // explicitly Local() is routed via the network path even on a
   // single-node deployment. Used by the bench to stress the ZMQ
@@ -851,7 +851,7 @@ bool IpcManager::WaitForLocalServer() {
 
   // 0 = don't wait at all
   if (wait_server_timeout_ == 0) {
-    HLOG(kError, "CHI_WAIT_SERVER=0: not waiting for runtime");
+    HLOG(kError, "CLIO_WAIT_SERVER=0: not waiting for runtime");
     return false;
   }
 
@@ -2633,8 +2633,8 @@ void IpcManager::BeginTask(Future<Task> &future, Container *container,
   run_ctx->worker_id_ = worker ? worker->GetId() : 0;
   run_ctx->task_ = task_ptr;        // Store task in RunContext
   run_ctx->is_yielded_ = false;     // Initially not blocked
-  run_ctx->container_ = container;  // Store container for CHI_CUR_CONTAINER
-  run_ctx->lane_ = lane;            // Store lane for CHI_CUR_LANE
+  run_ctx->container_ = container;  // Store container for CLIO_CUR_CONTAINER
+  run_ctx->lane_ = lane;            // Store lane for CLIO_CUR_LANE
   run_ctx->event_queue_ =
       worker ? worker->GetEventQueue() : nullptr;  // Set event queue
   run_ctx->future_ = future;        // Store future in RunContext

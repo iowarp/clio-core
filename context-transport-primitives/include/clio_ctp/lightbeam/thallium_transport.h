@@ -66,9 +66,9 @@ namespace tl = thallium;
 //   - rpc_thread_count argobots ES for running RPC handler ULTs. With v2
 //     (bulk RDMA pull happens inside the handler), more handler threads
 //     means more peers can pull in parallel. Set via
-//     CHI_LBM_THALLIUM_RPC_THREADS (default 4).
+//     CLIO_LBM_THALLIUM_RPC_THREADS (default 4).
 //
-// Protocol is set via CHI_LBM_THALLIUM_PROTOCOL (default "ofi+tcp;ofi_rxm";
+// Protocol is set via CLIO_LBM_THALLIUM_PROTOCOL (default "ofi+tcp;ofi_rxm";
 // use "ofi+verbs;ofi_rxm" + FI_PROVIDER=verbs + FI_DOMAIN=<roce_domain>
 // for the RDMA path).
 class ThalliumEngine {

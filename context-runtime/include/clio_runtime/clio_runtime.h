@@ -73,7 +73,7 @@ using ChimaeraMode = RuntimeMode;
  * Initialize CLIO Runtime with specified mode
  *
  * @param mode Initialization mode (kClient or kServer/kRuntime)
- * @param default_with_runtime Default behavior if CHI_WITH_RUNTIME env var not set
+ * @param default_with_runtime Default behavior if CLIO_WITH_RUNTIME env var not set
  *        If true, will start runtime in addition to client initialization
  *        If false, will only initialize client components
  * @param is_restart If true, force restart_=true on compose pools and replay WAL
@@ -83,7 +83,7 @@ using ChimaeraMode = RuntimeMode;
  * Environment variable:
  *   CLIO_WITH_RUNTIME=1 - Start runtime regardless of mode
  *   CLIO_WITH_RUNTIME=0 - Don't start runtime (client only)
- *   (CHI_WITH_RUNTIME is honored as a legacy alias via env::GetCompat.)
+ *   (CLIO_WITH_RUNTIME is honored as a legacy alias via env::GetCompat.)
  *   If not set, uses default_with_runtime parameter
  */
 bool ClioInitImpl(ChimaeraMode mode, bool default_with_runtime,

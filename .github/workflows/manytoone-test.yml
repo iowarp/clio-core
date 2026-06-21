@@ -80,7 +80,7 @@ jobs:
               cmake --build build -j"$(nproc)"
 
               cd build/bin
-              export CHI_REPO_PATH="$PWD"
+              export CLIO_REPO_PATH="$PWD"
               export LD_LIBRARY_PATH="$PWD:$LD_LIBRARY_PATH"
               export CLIO_BIND_ADDR=127.0.0.1
 

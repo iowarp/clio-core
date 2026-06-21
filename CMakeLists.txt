@@ -836,7 +836,7 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   message(STATUS "GCC detected - enabling coroutines with -fcoroutines")
 elseif(CMAKE_CXX_COMPILER_ID STREQUAL "NVHPC")
   # NVHPC 25.5 crashes (ICE in llc) when compiling GCC 14 libstdc++ coroutines.
-  # CLIO Runtime uses ucontext_t fibers via CHI_CO_AWAIT/CHI_CO_RETURN macros instead.
+  # CLIO Runtime uses ucontext_t fibers via CLIO_CO_AWAIT/CLIO_CO_RETURN macros instead.
   # No __cpp_impl_coroutine needed - we do not include <coroutine> for NVHPC.
   message(STATUS "NVHPC detected - using ucontext_t fiber fallback for C++20 coroutines")
 elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")

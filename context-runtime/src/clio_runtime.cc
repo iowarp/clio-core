@@ -54,7 +54,7 @@ bool ClioInitImpl(ChimaeraMode mode, bool default_with_runtime,
   auto* runtime_manager = CLIO_RUNTIME_MANAGER;
   runtime_manager->is_restart_ = is_restart;
 
-  // Check environment variable CHI_WITH_RUNTIME
+  // Check environment variable CLIO_WITH_RUNTIME
   bool with_runtime = default_with_runtime;
   const char* env_val = clio::run::env::GetCompat("WITH_RUNTIME");
   if (env_val != nullptr) {

@@ -27,7 +27,7 @@ add_executable(test_cte_config_dpe
 )
 
 # Create single version of test_core_functionality that uses environment variable
-# CHI_WITH_RUNTIME to control whether runtime is initialized (default: yes)
+# CLIO_WITH_RUNTIME to control whether runtime is initialized (default: yes)
 add_executable(test_core_functionality
     test_core_functionality.cc
 )
@@ -441,7 +441,7 @@ set_tests_properties(
     PROPERTIES
         TIMEOUT 300  # 5 minute timeout
         LABELS "functional;core;cte"
-        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CHI_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
 )
 
 set_tests_properties(
@@ -460,7 +460,7 @@ set_tests_properties(
     PROPERTIES
         TIMEOUT 300  # 5 minute timeout for each test
         LABELS "query;core;cte"
-        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CHI_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
 )
 
 set_tests_properties(
@@ -476,7 +476,7 @@ set_tests_properties(
     PROPERTIES
         TIMEOUT 300  # 5 minute timeout for each test
         LABELS "unit;tag;cte"
-        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CHI_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
 )
 
 set_tests_properties(cte_client_config_all PROPERTIES
@@ -488,7 +488,7 @@ set_tests_properties(cte_client_config_all PROPERTIES
 set_tests_properties(cte_runtime_coverage_all PROPERTIES
     TIMEOUT 600
     LABELS "unit;core;cte;runtime;coverage"
-    ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CHI_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
+    ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
 )
 
 # Add tiered storage stress tests
@@ -503,7 +503,7 @@ set_tests_properties(
     PROPERTIES
         TIMEOUT 300  # 5 minute timeout
         LABELS "stress;tiered;cte"
-        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CHI_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
 )
 
 # Stresses the "0g" -> 80% DRAM RAM-tier default through the CTE tiering
@@ -517,7 +517,7 @@ set_tests_properties(
     PROPERTIES
         TIMEOUT 300  # 5 minute timeout
         LABELS "stress;tiered;cte"
-        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CHI_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
 )
 
 # Regression: blocks freed by DelBlob return to their bdev partition.
@@ -529,7 +529,7 @@ set_tests_properties(
     PROPERTIES
         TIMEOUT 300  # 5 minute timeout
         LABELS "regression;cte"
-        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CHI_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
 )
 
 # Add reorganize blob tests
@@ -544,7 +544,7 @@ set_tests_properties(
     PROPERTIES
         TIMEOUT 300  # 5 minute timeout
         LABELS "unit;reorganize;cte"
-        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CHI_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
 )
 
 # ---------------------------------------------------------------------------
@@ -555,7 +555,7 @@ set_tests_properties(
 # pure-stress binaries are intentionally excluded.
 # ---------------------------------------------------------------------------
 set(_cte_fn_env_basic "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1")
-set(_cte_fn_env_data "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CHI_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1")
+set(_cte_fn_env_data "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1")
 clio_add_force_net_test(NAME cte_core_unit_force_net
     COMMAND cte_core_unit_tests ENVIRONMENT "${_cte_fn_env_basic}")
 clio_add_force_net_test(NAME cte_core_simple_force_net
@@ -750,7 +750,7 @@ if(CLIO_CORE_ENABLE_CUDA)
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
   set_tests_properties(cte_devmem_putget_cuda PROPERTIES
-    ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;CLIO_BIND_ADDR=127.0.0.1"
+    ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;CLIO_BIND_ADDR=127.0.0.1"
     TIMEOUT 120
     LABELS "gpu;cuda;cte;devmem;putblob"
   )
@@ -789,7 +789,7 @@ if(CLIO_CORE_ENABLE_ROCM)
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
   set_tests_properties(cte_devmem_putget_rocm PROPERTIES
-    ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;CLIO_BIND_ADDR=127.0.0.1"
+    ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;CLIO_BIND_ADDR=127.0.0.1"
     TIMEOUT 120
     LABELS "gpu;rocm;cte;devmem;putblob"
   )

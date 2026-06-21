@@ -1344,7 +1344,7 @@ class IpcManager {
   /**
    * Wait for local server to become available via lightbeam transport
    * Sends a ClientConnectTask and waits for response with timeout
-   * Uses CHI_WAIT_SERVER environment variable for timeout (default 30s)
+   * Uses CLIO_WAIT_SERVER environment variable for timeout (default 30s)
    * @return true if server responded, false on timeout
    */
   bool WaitForLocalServer();
@@ -1435,7 +1435,7 @@ class IpcManager {
   std::mutex transport_shutdown_hooks_mutex_;
   std::vector<std::function<void()>> transport_shutdown_hooks_;
 
-  // IPC transport mode (TCP default, configurable via CHI_IPC_MODE)
+  // IPC transport mode (TCP default, configurable via CLIO_IPC_MODE)
   IpcMode ipc_mode_ = IpcMode::kTcp;
 
   // SHM lightbeam transport (for SendShm / RecvShm)
@@ -1491,16 +1491,16 @@ class IpcManager {
   // Client-side server waiting configuration (from environment variables)
   // Semantics: 0 = fail immediately, -1 = wait forever, >0 = timeout in seconds
   float wait_server_timeout_ =
-      30.0f;  // CHI_WAIT_SERVER: timeout in seconds (default 30)
+      30.0f;  // CLIO_WAIT_SERVER: timeout in seconds (default 30)
   u32 poll_server_interval_ =
-      1;  // CHI_POLL_SERVER: poll interval in seconds (default 1)
+      1;  // CLIO_POLL_SERVER: poll interval in seconds (default 1)
 
   // Client-side retry configuration
   // Semantics: 0 = fail immediately, -1 = wait forever, >0 = timeout in seconds
   u64 client_generation_ = 0;  // Cached server generation at connect time
   float client_retry_timeout_ =
-      60.0f;                        // CHI_CLIENT_RETRY_TIMEOUT (default 60s)
-  int client_try_new_servers_ = 0;  // CHI_CLIENT_TRY_NEW_SERVERS (default 0)
+      60.0f;                        // CLIO_CLIENT_RETRY_TIMEOUT (default 60s)
+  int client_try_new_servers_ = 0;  // CLIO_CLIENT_TRY_NEW_SERVERS (default 0)
   std::atomic<bool> reconnecting_{false};  // Guards against recursive reconnect
 
   // Persistent ZeroMQ transport connection pool

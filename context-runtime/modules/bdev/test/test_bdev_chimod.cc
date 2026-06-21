@@ -222,12 +222,12 @@ class BdevChimodFixture {
    * @return Number of containers in the distributed setup
    */
   clio::run::u32 getNumContainers() const {
-    // First check CHI_NUM_CONTAINERS environment variable
+    // First check CLIO_NUM_CONTAINERS environment variable
     const char* num_containers_env = clio::run::env::GetCompat("NUM_CONTAINERS");
     if (num_containers_env) {
       clio::run::u32 num_containers = std::atoi(num_containers_env);
       if (num_containers > 0) {
-        HLOG(kInfo, "Using CHI_NUM_CONTAINERS={} from environment",
+        HLOG(kInfo, "Using CLIO_NUM_CONTAINERS={} from environment",
              num_containers);
         return num_containers;
       }
@@ -235,7 +235,7 @@ class BdevChimodFixture {
 
     // Default to 1 for local/non-distributed tests
     HLOG(kInfo,
-         "CHI_NUM_CONTAINERS not set, defaulting to 1 container (local test)");
+         "CLIO_NUM_CONTAINERS not set, defaulting to 1 container (local test)");
     return 1;
   }
 
@@ -1260,7 +1260,7 @@ TEST_CASE("bdev_file_vs_ram_comparison", "[bdev][file][ram][comparison]") {
  * Helper: runs the bdev file explicit backend write/read test.
  * Called by per-mode TEST_CASEs (SHM, TCP, IPC).
  * Each mode must run in a separate process because g_initialized
- * prevents re-initialization with a different CHI_IPC_MODE.
+ * prevents re-initialization with a different CLIO_IPC_MODE.
  */
 void run_bdev_file_explicit_backend_test(const char *mode_name) {
   HLOG(kInfo, "[bdev_file_explicit_backend_{}] TEST START", mode_name);
@@ -1372,7 +1372,7 @@ void run_bdev_file_explicit_backend_test(const char *mode_name) {
 TEST_CASE("bdev_file_explicit_backend_shm", "[bdev][file][explicit][shm]") {
   const char* ipc_mode = clio::run::env::GetCompat("IPC_MODE");
   if (ipc_mode && std::string(ipc_mode) != "SHM" && std::string(ipc_mode) != "shm") {
-    INFO("Skipping: CHI_IPC_MODE=" + std::string(ipc_mode) + " (need SHM)");
+    INFO("Skipping: CLIO_IPC_MODE=" + std::string(ipc_mode) + " (need SHM)");
     return;
   }
   ctp::SystemInfo::Setenv("CLIO_IPC_MODE", "SHM", 1);
@@ -1382,7 +1382,7 @@ TEST_CASE("bdev_file_explicit_backend_shm", "[bdev][file][explicit][shm]") {
 TEST_CASE("bdev_file_explicit_backend_tcp", "[bdev][file][explicit][tcp]") {
   const char* ipc_mode = clio::run::env::GetCompat("IPC_MODE");
   if (ipc_mode && std::string(ipc_mode) != "TCP" && std::string(ipc_mode) != "tcp") {
-    INFO("Skipping: CHI_IPC_MODE=" + std::string(ipc_mode) + " (need TCP)");
+    INFO("Skipping: CLIO_IPC_MODE=" + std::string(ipc_mode) + " (need TCP)");
     return;
   }
   ctp::SystemInfo::Setenv("CLIO_IPC_MODE", "TCP", 1);
@@ -1392,7 +1392,7 @@ TEST_CASE("bdev_file_explicit_backend_tcp", "[bdev][file][explicit][tcp]") {
 TEST_CASE("bdev_file_explicit_backend_ipc", "[bdev][file][explicit][ipc]") {
   const char* ipc_mode = clio::run::env::GetCompat("IPC_MODE");
   if (ipc_mode && std::string(ipc_mode) != "IPC" && std::string(ipc_mode) != "ipc") {
-    INFO("Skipping: CHI_IPC_MODE=" + std::string(ipc_mode) + " (need IPC)");
+    INFO("Skipping: CLIO_IPC_MODE=" + std::string(ipc_mode) + " (need IPC)");
     return;
   }
   ctp::SystemInfo::Setenv("CLIO_IPC_MODE", "IPC", 1);

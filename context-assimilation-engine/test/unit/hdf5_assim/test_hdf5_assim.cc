@@ -476,7 +476,7 @@ int main(int argc, char* argv[]) {
   int exit_code = 0;
 
   try {
-    // Initialize CLIO Runtime runtime (CHI_WITH_RUNTIME controls behavior)
+    // Initialize CLIO Runtime runtime (CLIO_WITH_RUNTIME controls behavior)
     HLOG(kInfo, "Initializing Chimaera...");
     bool success = clio::run::CLIO_INIT(clio::run::ChimaeraMode::kClient, true);
     if (!success) {

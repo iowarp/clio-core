@@ -520,7 +520,7 @@ TEST_CASE("CliRuntime - client commands against a live runtime",
   setenv("CLIO_BIND_ADDR", "127.0.0.1", 1);
 
   clio::run::test::RuntimeServer server;
-  REQUIRE(server.Start(kPort));  // also exports CLIO_PORT / CHI_REPO_PATH
+  REQUIRE(server.Start(kPort));  // also exports CLIO_PORT / CLIO_REPO_PATH
   REQUIRE(server.WaitForReady());
 
   SECTION("monitor --once renders the worker stats table");

@@ -39,7 +39,7 @@ sleep 1
 rm -rf "${MNT}"; mkdir -p "${MNT}"
 
 echo "[mmap-smoke] mounting clio FUSE at ${MNT}"
-CHI_REPO_PATH="${BUILD_BIN}" \
+CLIO_REPO_PATH="${BUILD_BIN}" \
   LD_LIBRARY_PATH="${BUILD_BIN}:${HOME}/.local/lib:${LD_LIBRARY_PATH:-}" \
   CLIO_WITH_RUNTIME=1 CLIO_BIND_ADDR=127.0.0.1 \
   "${FUSE_BIN}" "${MNT}" -o fsname=clio_mmap_smoke -f > /tmp/clio_mmap_fuse.log 2>&1 &
