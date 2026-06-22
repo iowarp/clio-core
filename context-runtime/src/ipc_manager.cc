@@ -1950,6 +1950,25 @@ bool IpcManager::RegisterMemory(const ctp::ipc::AllocatorId &alloc_id) {
     // Release the lock before returning
     allocator_map_lock_.WriteUnlock();
 
+    // Fallback mode: also register this client segment on the main runtime so
+    // it can resolve + complete FutureShms for tasks this runtime punts to it
+    // (a punted task's FutureShm lives in this client segment). Sent over the
+    // fallback client's control (TCP) path — like IncreaseClientShm — which
+    // serializes over the wire and so does not need a shared FutureShm (a
+    // runtime always allocates from private heap).
+    if (fallback_) {
+      HLOG(kInfo,
+           "IpcManager::RegisterMemory: forwarding {} registration to main "
+           "runtime (fallback mode)",
+           shm_name);
+      auto fb_reg_task =
+          fallback_->NewTask<clio::run::admin::RegisterMemoryTask>(
+              clio::run::CreateTaskId(), clio::run::kAdminPoolId,
+              clio::run::PoolQuery::Local(), alloc_id);
+      IpcCpu2CpuZmq::ClientSend(fallback_.get(), fb_reg_task, IpcMode::kTcp)
+          .Wait();
+    }
+
     return true;
 
   } catch (const std::exception &e) {

@@ -39,6 +39,7 @@
  */
 
 #include "clio_runtime/worker.h"
+#include "clio_runtime/ipc/ipc_run2fallback.h"
 
 #ifndef __NVCOMPILER
 #include <coroutine>
@@ -550,6 +551,17 @@ bool Worker::ProcessNewTask(TaskLane *lane) {
   Container *container = pool_manager->GetStaticContainer(pool_id);
 
   if (!container) {
+    // Pool is not owned by this runtime. If a fallback ("main") runtime is
+    // configured, punt the task there: the main runtime owns the pool and
+    // completes the shared FutureShm in place, so the client sees the result
+    // directly. SendIn returns false when there is no fallback (or the task was
+    // already punted), in which case we fail it locally as before.
+    if (IpcRun2Fallback::SendIn(CLIO_IPC, future)) {
+      HLOG(kDebug,
+           "Worker {}: punted pool={} method={} to fallback (main) runtime",
+           worker_id_, pool_id, method_id);
+      return true;
+    }
     // Container not found - mark as complete with error
     HLOG(kError, "Worker {}: Container not found for pool_id={}, method={}",
          worker_id_, pool_id, method_id);
