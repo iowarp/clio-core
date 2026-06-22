@@ -60,6 +60,11 @@ struct PoolConfig {
   /** Per-RPC visibility overrides, keyed by RPC method NAME -> 0 public /
    *  1 private. Methods absent here inherit container_visibility_. */
   std::unordered_map<std::string, u32> rpc_acl_;
+  /** If true, this pool's container is hosted on the fallback ("main") runtime,
+   *  not here. We still create a local static container (so the pool resolves
+   *  and tasks can be serialized), but mark it external; tasks targeting it are
+   *  punted to the fallback instead of executed locally. Default false. */
+  bool external_ = false;
 
   PoolConfig() = default;
 
@@ -79,7 +84,7 @@ struct PoolConfig {
   template <class Archive>
   void serialize(Archive& ar) {
     ar(mod_name_, pool_name_, pool_id_, pool_query_, config_, restart_,
-       container_visibility_, rpc_acl_);
+       container_visibility_, rpc_acl_, external_);
   }
 };
 

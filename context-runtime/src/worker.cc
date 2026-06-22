@@ -550,22 +550,27 @@ bool Worker::ProcessNewTask(TaskLane *lane) {
   auto *pool_manager = CLIO_POOL_MANAGER;
   Container *container = pool_manager->GetStaticContainer(pool_id);
 
-  if (!container) {
-    // Pool is not owned by this runtime. If a fallback ("main") runtime is
-    // configured, punt the task there: the main runtime owns the pool and
-    // completes the shared FutureShm in place, so the client sees the result
-    // directly. SendIn returns false when there is no fallback (or the task was
-    // already punted), in which case we fail it locally as before.
+  // Punt to the fallback ("main") runtime when this pool is hosted there: it is
+  // either composed locally as an external stub (compose pool_external: true —
+  // preferred, explicit), or genuinely absent here (legacy heuristic). The main
+  // runtime owns the real container and completes the shared FutureShm in place,
+  // so the client sees the result directly. SendIn returns false when there is
+  // no fallback (or the task was already punted).
+  bool is_external = (container != nullptr) && container->IsExternal();
+  if (is_external || !container) {
     if (IpcRun2Fallback::SendIn(CLIO_IPC, future)) {
       HLOG(kDebug,
-           "Worker {}: punted pool={} method={} to fallback (main) runtime",
-           worker_id_, pool_id, method_id);
+           "Worker {}: punted pool={} method={} to fallback runtime ({})",
+           worker_id_, pool_id, method_id,
+           is_external ? "external stub" : "not local");
       return true;
     }
-    // Container not found - mark as complete with error
-    HLOG(kError, "Worker {}: Container not found for pool_id={}, method={}",
-         worker_id_, pool_id, method_id);
-    // Set both error bit AND FUTURE_COMPLETE so client doesn't hang
+    // No fallback available (or already punted): fail so the client doesn't
+    // hang. (An external stub with no reachable fallback is a misconfiguration.)
+    HLOG(kError,
+         "Worker {}: cannot service pool_id={} method={} ({}); no fallback",
+         worker_id_, pool_id, method_id,
+         is_external ? "external stub" : "container not found");
     future_shm->flags_.SetBits(1 | FutureShm::FUTURE_COMPLETE);
     return true;
   }

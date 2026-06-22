@@ -636,9 +636,16 @@ TaskResume PoolManager::CreatePool(FullPtr<Task> task, RunContext* run_ctx) {
     container->ConfigureAcl(pool_config.container_visibility_,
                             pool_config.rpc_acl_);
 
+    // pool_external: this is a stub for a pool hosted on the fallback runtime.
+    // Mark it external (tasks targeting it are punted to the fallback) and skip
+    // running its Create method below — the real resources live on the fallback.
+    container->SetExternal(pool_config.external_);
+
     HLOG(kInfo,
-         "Container initialized with pool ID {}, name {}, and container ID {}",
-         target_pool_id, pool_name, container->container_id_);
+         "Container initialized with pool ID {}, name {}, and container ID {} "
+         "(external={})",
+         target_pool_id, pool_name, container->container_id_,
+         pool_config.external_);
 
     // Register the container BEFORE running Create method
     // This allows Create to spawn tasks that can find this container in the map
@@ -654,18 +661,31 @@ TaskResume PoolManager::CreatePool(FullPtr<Task> task, RunContext* run_ctx) {
     // nested pool creation (e.g., CTE Create calling bdev Create).
     // By using co_await, we properly suspend and resume, allowing the worker
     // to process nested tasks while we wait.
-    HLOG(kInfo, "CreatePool: Running Create method for pool {}", target_pool_id);
-    CLIO_CO_AWAIT(container->Run(0, task, *run_ctx));  // Method::kCreate = 0
-    HLOG(kInfo, "CreatePool: Create method completed for pool {}", target_pool_id);
+    //
+    // External stubs skip Create entirely: the real container (and its
+    // resources) live on the fallback runtime, so there is nothing to allocate
+    // here — running Create would build local resources we never use.
+    if (!pool_config.external_) {
+      HLOG(kInfo, "CreatePool: Running Create method for pool {}",
+           target_pool_id);
+      CLIO_CO_AWAIT(container->Run(0, task, *run_ctx));  // Method::kCreate = 0
+      HLOG(kInfo, "CreatePool: Create method completed for pool {}",
+           target_pool_id);
 
-    if (task->GetReturnCode() != 0) {
-      HLOG(kError, "PoolManager: Failed to create container for ChiMod: {}",
-           chimod_name);
-      // Unregister the container since Create failed
-      UnregisterContainer(target_pool_id, node_id);
-      module_manager->DestroyContainer(chimod_name, container);
-      ErasePoolMetadata(target_pool_id);
-      CLIO_CO_RETURN;
+      if (task->GetReturnCode() != 0) {
+        HLOG(kError, "PoolManager: Failed to create container for ChiMod: {}",
+             chimod_name);
+        // Unregister the container since Create failed
+        UnregisterContainer(target_pool_id, node_id);
+        module_manager->DestroyContainer(chimod_name, container);
+        ErasePoolMetadata(target_pool_id);
+        CLIO_CO_RETURN;
+      }
+    } else {
+      HLOG(kInfo,
+           "CreatePool: pool {} is external (hosted on fallback runtime); "
+           "skipping local Create",
+           target_pool_id);
     }
 
     // GPU container allocation removed along with the GPU runtime.

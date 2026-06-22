@@ -381,6 +381,14 @@ void ConfigManager::ParseYAML(YAML::Node &yaml_conf) {
           pool_config.restart_ = pool_node["restart"].as<bool>();
         }
 
+        // pool_external: the pool's real container lives on the fallback
+        // ("main") runtime. We still create a local static container (a stub)
+        // so the pool resolves + tasks serialize, but mark it external so its
+        // tasks are punted to the fallback instead of executed here.
+        if (pool_node["pool_external"]) {
+          pool_config.external_ = pool_node["pool_external"].as<bool>();
+        }
+
         // Optional RPC access control. container_visibility sets the default
         // visibility for every RPC (public|private, default public); a private
         // container rejects RPCs from external user clients (runtime-internal

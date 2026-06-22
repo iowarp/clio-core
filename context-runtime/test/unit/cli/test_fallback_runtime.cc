@@ -104,6 +104,22 @@ TEST_CASE("Fallback runtime - external client task punted to main runtime",
          "    capacity: \"64mb\"\n";
   }
 
+  // Compose file for USER: the SAME bdev pool 711, but marked pool_external —
+  // the real container lives on MAIN. The user runtime creates a stub so 711
+  // resolves locally, and punts its tasks to MAIN.
+  const fs::path user_yaml = work / "user_compose.yaml";
+  {
+    std::ofstream f(user_yaml);
+    f << "compose:\n"
+         "  - mod_name: clio_bdev\n"
+         "    pool_name: \"ram::fallback_bdev_stub\"\n"
+         "    pool_query: local\n"
+         "    pool_id: \"711.0\"\n"
+         "    bdev_type: ram\n"
+         "    capacity: \"64mb\"\n"
+         "    pool_external: true\n";
+  }
+
   setenv("CLIO_WAIT_SERVER", "20", 1);
   setenv("CLIO_BIND_ADDR", "127.0.0.1", 1);
 
@@ -123,6 +139,10 @@ TEST_CASE("Fallback runtime - external client task punted to main runtime",
   clio::run::test::RuntimeServer user_server;
   REQUIRE(user_server.Start(kUserPort));
   REQUIRE(user_server.WaitForReady());
+  // Compose the external stub for 711 on the USER runtime (targets CLIO_PORT =
+  // kUserPort). Done before CLIO_IPC_MODE is pinned to SHM below.
+  SetEnvStr("CLIO_PORT", std::to_string(kUserPort));
+  REQUIRE(RunCliTimed({"compose", "start", user_yaml.string()}, 60) == 0);
   // Do not leak the fallback port to the in-process client.
   unsetenv("CLIO_FALLBACK_PORT");
 
