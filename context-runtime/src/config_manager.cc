@@ -75,6 +75,16 @@ bool ConfigManager::ClientInit() {
     }
   }
 
+  // Check CLIO_FALLBACK_PORT env var (overrides YAML and default). Setting it
+  // makes this runtime forward tasks for pools it does not own to the runtime
+  // on that port (fallback-runtime crash isolation).
+  if (const char *env = clio::run::env::GetCompat("FALLBACK_PORT")) {
+    std::string fb_env(env);
+    if (!fb_env.empty()) {
+      fallback_port_ = std::stoul(fb_env);
+    }
+  }
+
   // Check CLIO_SERVER_ADDR env var (overrides default 127.0.0.1).
   // GetCompat reads CLIO_SERVER_ADDR first, falls back to CLIO_SERVER_ADDR.
   if (const char *env = clio::run::env::GetCompat("SERVER_ADDR")) {
@@ -148,12 +158,15 @@ size_t ConfigManager::GetMemorySegmentSize(MemorySegment segment) const {
 
 u32 ConfigManager::GetPort() const { return port_; }
 
+u32 ConfigManager::GetFallbackPort() const { return fallback_port_; }
+
 std::string ConfigManager::GetServerAddr() const { return server_addr_; }
 
 u32 ConfigManager::GetNeighborhoodSize() const { return neighborhood_size_; }
 
 std::string
-ConfigManager::GetSharedMemorySegmentName(MemorySegment segment) const {
+ConfigManager::GetSharedMemorySegmentName(MemorySegment segment,
+                                          u32 port) const {
   std::string segment_name;
 
   switch (segment) {
@@ -170,8 +183,14 @@ ConfigManager::GetSharedMemorySegmentName(MemorySegment segment) const {
     return "";
   }
 
+  // Suffix with the port so multiple runtimes on one node + ${USER} (the
+  // fallback-runtime topology) own distinct segments rather than colliding.
+  // port == 0 means "this runtime"; a non-zero port names another runtime's
+  // segment (the fallback client attaching the main runtime's segments).
+  u32 name_port = (port != 0) ? port : port_;
   // Use CTP's ExpandPath to resolve environment variables
-  return ctp::ConfigParse::ExpandPath(segment_name);
+  return ctp::ConfigParse::ExpandPath(segment_name) + "_" +
+         std::to_string(name_port);
 }
 
 std::string ConfigManager::GetHostfilePath() const {
@@ -283,6 +302,9 @@ void ConfigManager::ParseYAML(YAML::Node &yaml_conf) {
     auto networking = yaml_conf["networking"];
     if (networking["port"]) {
       port_ = networking["port"].as<u32>();
+    }
+    if (networking["fallback_port"]) {
+      fallback_port_ = networking["fallback_port"].as<u32>();
     }
     if (networking["neighborhood_size"]) {
       neighborhood_size_ = networking["neighborhood_size"].as<u32>();
