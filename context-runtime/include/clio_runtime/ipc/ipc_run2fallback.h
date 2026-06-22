@@ -14,6 +14,7 @@
 namespace clio::run {
 
 class IpcManager;
+class Container;
 
 /**
  * IPC transport for forwarding ("punting") a task from this runtime to the
@@ -46,6 +47,31 @@ struct IpcRun2Fallback {
    *   the task was already punted (caller should then fail it locally).
    */
   static bool SendIn(IpcManager *ipc, Future<Task> &future);
+
+  /**
+   * Relay a task to the fallback ("main") runtime via a SYNCHRONOUS round-trip
+   * over the fallback DEALER, then complete the original (local) FutureShm.
+   *
+   * Used for runtime-internal subtasks targeting an external pool (e.g. CTE on
+   * the user runtime calling a bdev hosted on main): their task + data live in
+   * the runtime's PRIVATE heap, so they cannot be completed in place by main.
+   * Instead we serialize the task (inputs + bulk data) against the local
+   * external-stub @p container, send it to main as an ordinary client call,
+   * receive the serialized outputs, deserialize them back into the task, and
+   * mark the local FutureShm complete so the local waiter resumes. Works for
+   * any task whose pool resolves to an external stub.
+   *
+   * @param ipc This runtime's IpcManager (its fallback_ is the main client).
+   * @param container The local external-stub container (provides SaveTask /
+   *   LoadTask for this task's concrete type).
+   * @param task The task to relay (generic Task pointer).
+   * @param future The task's Future, whose FutureShm is completed on success.
+   * @return true if the task was relayed and completed; false if no fallback,
+   *   already punted, or the main runtime did not answer.
+   */
+  static bool RelayToFallback(IpcManager *ipc, Container *container,
+                              const ctp::ipc::FullPtr<Task> &task,
+                              Future<Task> &future);
 };
 
 }  // namespace clio::run

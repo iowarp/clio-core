@@ -558,9 +558,31 @@ bool Worker::ProcessNewTask(TaskLane *lane) {
   // no fallback (or the task was already punted).
   bool is_external = (container != nullptr) && container->IsExternal();
   if (is_external || !container) {
-    if (IpcRun2Fallback::SendIn(CLIO_IPC, future)) {
-      HLOG(kDebug,
-           "Worker {}: punted pool={} method={} to fallback runtime ({})",
+    bool punted = false;
+    if (future_shm->flags_.Any(FutureShm::FUTURE_COPY_FROM_CLIENT)) {
+      // External client task: its FutureShm + serialized task already live in
+      // the client's shared segment, so the main runtime can complete it in
+      // place. Forward the same Future onto main's SHM queue (no re-serialize).
+      punted = IpcRun2Fallback::SendIn(CLIO_IPC, future);
+    } else if (container != nullptr) {
+      // Runtime-internal subtask (e.g. CTE -> remote bdev): its task + data are
+      // in this runtime's private heap, so main cannot complete it in place.
+      // Serialize it against the external stub and relay it to main, then
+      // complete the local FutureShm with the returned outputs.
+      FullPtr<Task> tp = future.GetTaskPtr();
+      if (tp.IsNull()) {
+        HLOG(kError, "Worker {}: relay punt pool={} method={}: null task ptr",
+             worker_id_, pool_id, method_id);
+      }
+      punted = !tp.IsNull() &&
+               IpcRun2Fallback::RelayToFallback(CLIO_IPC, container, tp, future);
+    } else {
+      // No local stub container (legacy not-found): only the in-place path is
+      // possible (we have nothing to serialize against).
+      punted = IpcRun2Fallback::SendIn(CLIO_IPC, future);
+    }
+    if (punted) {
+      HLOG(kDebug, "Worker {}: punted pool={} method={} to fallback runtime ({})",
            worker_id_, pool_id, method_id,
            is_external ? "external stub" : "not local");
       return true;
@@ -579,6 +601,13 @@ bool Worker::ProcessNewTask(TaskLane *lane) {
   FullPtr<Task> task_full_ptr =
       GetOrCopyTaskFromFuture(future, container, method_id);
 
+  if (!task_full_ptr.IsNull()) {
+    HLOG(kDebug,
+         "Worker {}: deserialized task hdr_pool={} task.pool_id_={} "
+         "pq_container={} method={}",
+         worker_id_, pool_id, task_full_ptr->pool_id_,
+         task_full_ptr->pool_query_.GetContainerId(), method_id);
+  }
   // Check if task deserialization failed
   if (task_full_ptr.IsNull()) {
     HLOG(kError,

@@ -201,6 +201,14 @@ class ConfigManager : public ctp::BaseConfig {
   u32 GetFallbackPort() const;
 
   /**
+   * @return true if this runtime is ephemeral (started with --ephemeral /
+   * CLIO_EPHEMERAL): it skips the default compose section and starts bare
+   * (admin only), to be composed explicitly. Used for spawned per-app runtimes
+   * that back onto a main runtime via the fallback.
+   */
+  bool IsEphemeral() const;
+
+  /**
    * Get server address for client connections
    * @return Server address (default: "127.0.0.1", overridden by CLIO_SERVER_ADDR)
    */
@@ -356,6 +364,8 @@ class ConfigManager : public ctp::BaseConfig {
   // Fallback ("main") runtime port. 0 = no fallback (standalone runtime).
   // When set, tasks for pools this runtime does not own are punted to it.
   u32 fallback_port_ = 0;
+  // If true (CLIO_EPHEMERAL / --ephemeral), skip the default compose at startup.
+  bool ephemeral_ = false;
   std::string server_addr_ = "127.0.0.1";
   u32 neighborhood_size_ = 32;
 

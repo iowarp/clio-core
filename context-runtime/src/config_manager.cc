@@ -85,6 +85,15 @@ bool ConfigManager::ClientInit() {
     }
   }
 
+  // Check CLIO_EPHEMERAL env var (set by `clio_run start --ephemeral`). An
+  // ephemeral runtime skips the default compose section — it starts bare (just
+  // admin) and is composed explicitly, e.g. a spawned per-app runtime that
+  // points at a main runtime via the fallback.
+  if (const char *env = clio::run::env::GetCompat("EPHEMERAL")) {
+    std::string e(env);
+    ephemeral_ = !e.empty() && e != "0";
+  }
+
   // Check CLIO_SERVER_ADDR env var (overrides default 127.0.0.1).
   // GetCompat reads CLIO_SERVER_ADDR first, falls back to CLIO_SERVER_ADDR.
   if (const char *env = clio::run::env::GetCompat("SERVER_ADDR")) {
@@ -159,6 +168,8 @@ size_t ConfigManager::GetMemorySegmentSize(MemorySegment segment) const {
 u32 ConfigManager::GetPort() const { return port_; }
 
 u32 ConfigManager::GetFallbackPort() const { return fallback_port_; }
+
+bool ConfigManager::IsEphemeral() const { return ephemeral_; }
 
 std::string ConfigManager::GetServerAddr() const { return server_addr_; }
 
