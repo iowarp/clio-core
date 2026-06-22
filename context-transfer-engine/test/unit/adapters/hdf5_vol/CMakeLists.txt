@@ -59,7 +59,55 @@ set_tests_properties(
         ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}"
 )
 
+#------------------------------------------------------------------------------
+# End-to-end I/O test: drives real HDF5 file/dataset/group/attr operations
+# through the connector against an in-process Chimaera/CTE runtime. Unlike the
+# registration-only suite above, this links the CTE core + admin + bdev
+# runtimes so CHIMAERA_INIT(kClient, true) stands up an in-process runtime.
+#------------------------------------------------------------------------------
+add_executable(test_hdf5_vol_io
+    test_hdf5_vol_io.cc
+)
+
+target_include_directories(test_hdf5_vol_io PRIVATE
+    ${CMAKE_SOURCE_DIR}/context-transfer-engine/adapter/hdf5_vol
+    ${CMAKE_SOURCE_DIR}/context-runtime/test
+    ${HDF5_INCLUDE_DIRS}
+)
+
+target_link_libraries(test_hdf5_vol_io
+    iowarp_hdf5_vol
+    clio_cte_core_runtime
+    clio_cte_core_client
+    chimaera::admin_runtime
+    chimaera::admin_client
+    chimaera::bdev_runtime
+    chimaera::bdev_client
+    ctp::cxx
+    ${HDF5_LIBRARIES}
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+
+add_test(NAME cte_hdf5_vol_io_dataset
+    COMMAND test_hdf5_vol_io "HDF5 VOL IO - Create-Write-Read whole dataset")
+
+add_test(NAME cte_hdf5_vol_io_groups_attrs
+    COMMAND test_hdf5_vol_io "HDF5 VOL IO - Groups and attributes")
+
+add_test(NAME cte_hdf5_vol_io_passthrough
+    COMMAND test_hdf5_vol_io "HDF5 VOL IO - Passthrough callbacks")
+
+set_tests_properties(
+    cte_hdf5_vol_io_dataset
+    cte_hdf5_vol_io_groups_attrs
+    cte_hdf5_vol_io_passthrough
+    PROPERTIES
+        TIMEOUT 300
+        LABELS "unit;adapter;hdf5_vol;cte"
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1"
+)
+
 install(
-    TARGETS test_hdf5_vol_adapter
+    TARGETS test_hdf5_vol_adapter test_hdf5_vol_io
     RUNTIME DESTINATION bin
 )
