@@ -601,13 +601,6 @@ bool Worker::ProcessNewTask(TaskLane *lane) {
   FullPtr<Task> task_full_ptr =
       GetOrCopyTaskFromFuture(future, container, method_id);
 
-  if (!task_full_ptr.IsNull()) {
-    HLOG(kDebug,
-         "Worker {}: deserialized task hdr_pool={} task.pool_id_={} "
-         "pq_container={} method={}",
-         worker_id_, pool_id, task_full_ptr->pool_id_,
-         task_full_ptr->pool_query_.GetContainerId(), method_id);
-  }
   // Check if task deserialization failed
   if (task_full_ptr.IsNull()) {
     HLOG(kError,

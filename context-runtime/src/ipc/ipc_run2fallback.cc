@@ -85,6 +85,20 @@ bool IpcRun2Fallback::RelayToFallback(IpcManager *ipc, Container *container,
   // the normal ZMQ client path).
   const size_t net_key = reinterpret_cast<size_t>(task.ptr_);
   task->task_id_.net_key_ = net_key;
+  // Present the task to the main runtime as a LOCAL client call so that, after
+  // it executes, EndTask responds via the ZMQ client path (back to our DEALER)
+  // rather than run2run SendOut (which would route the reply to a peer node and
+  // never reach us). Both pieces are needed: clear TASK_REMOTE, AND set a Local
+  // pool_query — otherwise the main runtime's RouteTask re-derives TASK_REMOTE
+  // from the task's return-node pool_query.
+  task->ClearFlags(TASK_REMOTE);
+  task->pool_query_ = PoolQuery::Local();
+  // The RunContext is process-local and must NOT cross the relay: clear
+  // TASK_RUN_CTX_EXISTS so the main runtime creates a fresh RunContext
+  // (BeginTask) for the task. Otherwise it skips BeginTask, dereferences a
+  // stale run_ctx pointer (null on main), and ExecTask early-returns without
+  // ever running the handler or replying.
+  task->ClearFlags(TASK_RUN_CTX_EXISTS | TASK_STARTED);
 
   // Serialize the task (inputs + bulk data) against the local external-stub
   // container, send it to main as a client call over the fallback DEALER, then
@@ -101,8 +115,6 @@ bool IpcRun2Fallback::RelayToFallback(IpcManager *ipc, Container *container,
       SaveTaskArchive in_ar(MsgType::kSerializeIn, fb->zmq_transport_.get());
       container->SaveTask(method, in_ar, task);
       fb->zmq_transport_->Send(in_ar, ctp::lbm::LbmContext());
-      HLOG(kDebug, "RelayToFallback: sent pool={} method={} net_key={} to main",
-           task->pool_id_, method, net_key);
 
       auto attempt_start = std::chrono::steady_clock::now();
       while (std::chrono::duration<float>(std::chrono::steady_clock::now() -
@@ -118,12 +130,8 @@ bool IpcRun2Fallback::RelayToFallback(IpcManager *ipc, Container *container,
           fb->zmq_transport_->ClearRecvHandles(*out_ar);
           break;  // re-send
         }
-        size_t got_key = out_ar->task_infos_.empty()
-                             ? 0
-                             : out_ar->task_infos_[0].task_id_.net_key_;
-        HLOG(kDebug, "RelayToFallback: recv reply net_key={} (want {})", got_key,
-             net_key);
-        if (out_ar->task_infos_.empty() || got_key != net_key) {
+        if (out_ar->task_infos_.empty() ||
+            out_ar->task_infos_[0].task_id_.net_key_ != net_key) {
           fb->zmq_transport_->ClearRecvHandles(*out_ar);
           continue;  // not our reply
         }
@@ -147,10 +155,26 @@ bool IpcRun2Fallback::RelayToFallback(IpcManager *ipc, Container *container,
     return false;
   }
 
-  // Complete the original (local, private-heap) FutureShm in place. The fence
-  // (SetBitsSystem) publishes the deserialized outputs before completion is
-  // observed by the local waiter (e.g. the CTE handler's co_await).
-  future_shm->flags_.SetBitsSystem(FutureShm::FUTURE_COMPLETE);
+  // Signal completion to the local waiter. Mirror IpcCpu2Self::RuntimeSend: a
+  // runtime subtask with a parent (e.g. CTE's co_await on this bdev call) is
+  // resumed by enqueueing its Future to the parent worker's event queue —
+  // ProcessEventQueue sets FUTURE_COMPLETE on the parent's thread. Only a
+  // top-level task sets FUTURE_COMPLETE directly here. (Without the event-queue
+  // hop, the parent coroutine's co_await never wakes.)
+  RunContext *parent_task = future.GetParentTask();
+  if (parent_task != nullptr && parent_task->event_queue_ != nullptr) {
+    auto *parent_event_queue = reinterpret_cast<ctp::ipc::mpsc_ring_buffer<
+        Future<Task, CLIO_QUEUE_ALLOC_T>, ctp::ipc::MallocAllocator> *>(
+        parent_task->event_queue_);
+    parent_event_queue->Emplace(future);
+    if (parent_task->lane_ != nullptr) {
+      ipc->AwakenWorker(parent_task->lane_);
+    }
+  } else {
+    // The fence publishes the deserialized outputs before the waiter observes
+    // completion.
+    future_shm->flags_.SetBitsSystem(FutureShm::FUTURE_COMPLETE);
+  }
   return true;
 }
 

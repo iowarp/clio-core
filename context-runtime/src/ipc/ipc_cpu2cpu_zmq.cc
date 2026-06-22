@@ -64,8 +64,6 @@ bool IpcCpu2CpuZmq::RuntimeRecv(IpcManager *ipc, u32 &tasks_received) {
       const auto &info = task_infos[0];
       PoolId pool_id = info.pool_id_;
       u32 method_id = info.method_id_;
-      HLOG(kDebug, "IpcCpu2CpuZmq::RuntimeRecv: got task pool={} method={} "
-           "net_key={}", pool_id, method_id, info.task_id_.net_key_);
 
       // Get container for deserialization
       Container *container = pool_manager->GetStaticContainer(pool_id);
@@ -275,9 +273,6 @@ bool IpcCpu2CpuZmq::RuntimeSend(
       // FUTURE_COMPLETE forever, so re-queue on failure (without
       // DelTask — task lifetime stays with the queued_future).
       ctp::lbm::LbmContext send_ctx(ctp::lbm::LBM_SYNC);
-      HLOG(kDebug, "RuntimeSend: responding pool={} method={} net_key={}",
-           origin_task->pool_id_, origin_task->method_,
-           origin_task->task_id_.net_key_);
       int rc = response_transport->Send(archive, send_ctx);
       if (rc != 0) {
         size_t fail_total =
