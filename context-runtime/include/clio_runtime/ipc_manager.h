@@ -1358,6 +1358,16 @@ class IpcManager {
    */
   bool TryStartMainServer(const std::string &hostname);
 
+  /**
+   * Effective runtime port for this IpcManager: the per-instance override if
+   * set (fallback client → main runtime's port), else the global config port.
+   * Used on the client-init path for connect target + SHM segment names so a
+   * nested fallback client attaches the main runtime instead of this one.
+   */
+  u32 GetEffectivePort() const {
+    return port_override_ != 0 ? port_override_ : CLIO_CONFIG_MANAGER->GetPort();
+  }
+
   bool is_initialized_ = false;
 
   // Run-to-run IPC manager: owns all cross-node task-transfer state
@@ -1437,6 +1447,18 @@ class IpcManager {
 
   // IPC transport mode (TCP default, configurable via CLIO_IPC_MODE)
   IpcMode ipc_mode_ = IpcMode::kTcp;
+
+  // Port override for nested fallback clients. 0 = use the global config port
+  // (the normal case). The fallback IpcManager sets this to the main runtime's
+  // port so its connect target + SHM segment names resolve to the main runtime
+  // instead of this runtime. Consulted via GetEffectivePort().
+  u32 port_override_ = 0;
+
+  // Fallback ("main") runtime connection. Non-null on a runtime configured with
+  // a fallback port: a nested IpcManager acting as an SHM client of the main
+  // runtime. Tasks for pools this runtime does not own are punted here (see
+  // IpcRun2Fallback). Null = standalone runtime (no punting).
+  std::unique_ptr<IpcManager> fallback_;
 
   // SHM lightbeam transport (for SendShm / RecvShm)
   ctp::lbm::TransportPtr shm_send_transport_;

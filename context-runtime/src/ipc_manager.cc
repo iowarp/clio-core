@@ -126,9 +126,13 @@ bool IpcManager::ClientInit() {
     return true;
   }
 
-  // Parse CLIO_IPC_MODE environment variable (default: TCP)
-  const char *ipc_mode_env = clio::run::env::GetCompat("IPC_MODE");
-  if (ipc_mode_env != nullptr) {
+  // Parse CLIO_IPC_MODE environment variable (default: TCP).
+  // A fallback client (port_override_ set) is pinned to SHM regardless of the
+  // env: punted tasks are completed in place in shared memory by the main
+  // runtime, which only works over the SHM data path.
+  if (port_override_ != 0) {
+    ipc_mode_ = IpcMode::kShm;
+  } else if (const char *ipc_mode_env = clio::run::env::GetCompat("IPC_MODE")) {
     std::string mode_str(ipc_mode_env);
     if (mode_str == "SHM" || mode_str == "shm") {
       ipc_mode_ = IpcMode::kShm;
@@ -174,7 +178,8 @@ bool IpcManager::ClientInit() {
   // Create lightbeam transport for client-server communication
   {
     auto *config = CLIO_CONFIG_MANAGER;
-    u32 port = config->GetPort();
+    // Effective port: a fallback client connects to the MAIN runtime's port.
+    u32 port = GetEffectivePort();
 
     if (ipc_mode_ == IpcMode::kIpc || UseLocalZmqIpc()) {
       // Unix-domain SocketTransport for the client<->runtime control path.
@@ -226,7 +231,12 @@ bool IpcManager::ClientInit() {
   // Initialize CTP TLS key for task counter before calling WaitForLocalServer,
   // which calls CreateTaskId(). Without the key registered first, GetTls() on
   // the zero-initialized key may return a stale/freed pointer → crash.
-  CTP_THREAD_MODEL->CreateTls<TaskCounter>(chi_task_counter_key_, nullptr);
+  // Guard against re-creating the global key: a fallback runtime brings up a
+  // second IpcManager (client) inside a process that already created it.
+  if (!chi_task_counter_key_created_) {
+    CTP_THREAD_MODEL->CreateTls<TaskCounter>(chi_task_counter_key_, nullptr);
+    chi_task_counter_key_created_ = true;
+  }
   auto *tls_counter = new TaskCounter();
   CTP_THREAD_MODEL->SetTls(chi_task_counter_key_, tls_counter);
 
@@ -390,8 +400,12 @@ bool IpcManager::ServerInit() {
   }
 
   // Initialize CTP TLS key for task counter (needed for CreateTaskId in
-  // runtime)
-  CTP_THREAD_MODEL->CreateTls<TaskCounter>(chi_task_counter_key_, nullptr);
+  // runtime). Guarded so a later fallback-client bring-up in this process does
+  // not re-create the global key.
+  if (!chi_task_counter_key_created_) {
+    CTP_THREAD_MODEL->CreateTls<TaskCounter>(chi_task_counter_key_, nullptr);
+    chi_task_counter_key_created_ = true;
+  }
 
   // Create scheduler using factory
   auto *config = CLIO_CONFIG_MANAGER;
@@ -458,6 +472,44 @@ bool IpcManager::ServerInit() {
   }
 
   is_initialized_ = true;
+
+  // Bring up the fallback ("main") runtime connection if configured. This
+  // runtime punts tasks for pools it does not own to the main runtime (crash
+  // isolation). The fallback is a nested IpcManager acting as an SHM client of
+  // the main runtime: port_override_ makes its connect target + segment names
+  // resolve to the main runtime, and ipc_mode_ is pinned to SHM so punted tasks
+  // complete in place. ClientInit already retries for CLIO_CLIENT_RETRY_TIMEOUT
+  // via WaitForLocalServer, so a failed bring-up means the main runtime stayed
+  // unreachable — warn and run standalone (unknown-pool tasks then fail locally
+  // exactly as before, no punting).
+  {
+    ConfigManager *config = CLIO_CONFIG_MANAGER;
+    u32 fb_port = config->GetFallbackPort();
+    if (fb_port != 0 && fb_port != config->GetPort()) {
+      HLOG(kInfo,
+           "IpcManager: connecting fallback client to main runtime on port {}",
+           fb_port);
+      auto fb = std::make_unique<IpcManager>();
+      fb->port_override_ = fb_port;  // forces SHM + main-runtime segment names
+      if (fb->ClientInit()) {
+        fallback_ = std::move(fb);
+        HLOG(kSuccess,
+             "IpcManager: fallback client connected to main runtime (port {})",
+             fb_port);
+      } else {
+        HLOG(kWarning,
+             "IpcManager: fallback runtime on port {} unreachable; running "
+             "standalone (tasks for non-local pools will fail locally)",
+             fb_port);
+      }
+    } else if (fb_port != 0) {
+      HLOG(kError,
+           "IpcManager: fallback_port ({}) equals this runtime's port; "
+           "ignoring self-referential fallback",
+           fb_port);
+    }
+  }
+
   return true;
 }
 
@@ -668,11 +720,13 @@ bool IpcManager::ClientInitShm() {
     main_allocator_id_ = ctp::ipc::AllocatorId(1, 0);
     queue_allocator_id_ = ctp::ipc::AllocatorId(2, 0);
 
-    // Get configurable segment names with environment variable expansion
+    // Get configurable segment names with environment variable expansion.
+    // port_override_ (non-zero on a fallback client) names the MAIN runtime's
+    // segments so this client attaches them instead of this runtime's own.
     std::string main_segment_name =
-        config->GetSharedMemorySegmentName(kMainSegment);
+        config->GetSharedMemorySegmentName(kMainSegment, port_override_);
     std::string queue_segment_name =
-        config->GetSharedMemorySegmentName(kQueueSegment);
+        config->GetSharedMemorySegmentName(kQueueSegment, port_override_);
 
     // Attach to existing main shared memory segment created by server
     if (!main_backend_.shm_attach(main_segment_name)) {
@@ -896,7 +950,8 @@ retry_attempt:
          attempt_idx, per_attempt);
     if (ipc_mode_ == IpcMode::kTcp) {
       auto *config = CLIO_CONFIG_MANAGER;
-      u32 port = config->GetPort();
+      // Effective port: a fallback client recreates its DEALER to the MAIN port.
+      u32 port = GetEffectivePort();
       if (zmq_recv_running_.load()) {
         zmq_recv_running_.store(false);
         if (zmq_recv_thread_.joinable()) zmq_recv_thread_.join();

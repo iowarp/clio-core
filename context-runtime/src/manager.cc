@@ -61,6 +61,7 @@ namespace clio::run {
 CLIO_RUN_API ctp::ThreadLocalKey chi_cur_worker_key_;
 CLIO_RUN_API bool chi_cur_worker_key_created_ = false;
 CLIO_RUN_API ctp::ThreadLocalKey chi_task_counter_key_;
+CLIO_RUN_API bool chi_task_counter_key_created_ = false;
 CLIO_RUN_API ctp::ThreadLocalKey chi_is_client_thread_key_;
 
 /**
