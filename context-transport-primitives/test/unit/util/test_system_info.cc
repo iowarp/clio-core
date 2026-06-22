@@ -141,8 +141,17 @@ TEST_CASE("SystemInfoProcessAndModule") {
   REQUIRE_FALSE(SystemInfo::IsProcessAlive(0x7FFFFFFF));
 
   // GetModuleDirectory resolves the directory of the loaded module via
-  // dladdr/realpath; it must return a non-empty absolute path for this binary.
+  // dladdr/realpath (POSIX) or GetModuleFileNameA (Windows); it must return a
+  // non-empty absolute path for this binary.
   std::string mod_dir = SystemInfo::GetModuleDirectory();
   REQUIRE(!mod_dir.empty());
+#ifdef _WIN32
+  // Windows absolute paths are drive-letter rooted ("D:\...") or UNC ("\\...").
+  bool is_absolute = (mod_dir.size() >= 2 && mod_dir[1] == ':') ||
+                     (mod_dir.size() >= 2 && mod_dir[0] == '\\' &&
+                      mod_dir[1] == '\\');
+  REQUIRE(is_absolute);
+#else
   REQUIRE(mod_dir.front() == '/');
+#endif
 }
