@@ -490,8 +490,11 @@ bool IpcManager::ServerInit() {
            "IpcManager: connecting fallback client to main runtime on port {}",
            fb_port);
       auto fb = std::make_unique<IpcManager>();
-      fb->port_override_ = fb_port;  // forces SHM + main-runtime segment names
-      if (fb->ClientInit()) {
+      // Dedicated minimal bring-up (NOT full ClientInit): a second full client
+      // in this server process collides on process-global ZMQ recv/heartbeat
+      // state. FallbackClientInit does only the SHM attach + a synchronous
+      // ClientConnect + worker-queue rebuild.
+      if (fb->FallbackClientInit(fb_port)) {
         fallback_ = std::move(fb);
         HLOG(kSuccess,
              "IpcManager: fallback client connected to main runtime (port {})",
@@ -864,6 +867,119 @@ bool IpcManager::ClientInitQueues() {
   } catch (const std::exception &e) {
     return false;
   }
+}
+
+bool IpcManager::FallbackClientInit(u32 main_port) {
+  ConfigManager *config = CLIO_CONFIG_MANAGER;
+  port_override_ = main_port;        // segment names + (for consistency) port
+  ipc_mode_ = IpcMode::kShm;         // punted tasks complete in place via SHM
+
+  // Per-attempt + total wait budget (same env as the normal client path).
+  const char *wait_env = clio::run::env::GetCompat("WAIT_SERVER");
+  float total_timeout = wait_env ? static_cast<float>(std::atof(wait_env)) : 30.0f;
+  if (total_timeout <= 0) total_timeout = 30.0f;
+
+  // A dedicated DEALER to the MAIN runtime's control ROUTER (main_port + 3).
+  try {
+    zmq_transport_ = ctp::lbm::TransportFactory::Get(
+        config->GetServerAddr(), ctp::lbm::TransportType::kZeroMq,
+        ctp::lbm::TransportMode::kClient, "tcp", main_port + 3);
+  } catch (const std::exception &e) {
+    HLOG(kError, "FallbackClientInit: failed to create DEALER to main: {}",
+         e.what());
+    return false;
+  }
+
+  // CreateTaskId() needs a per-thread TaskCounter (guard the global key, then
+  // ensure this thread has a counter value).
+  if (!chi_task_counter_key_created_) {
+    CTP_THREAD_MODEL->CreateTls<TaskCounter>(chi_task_counter_key_, nullptr);
+    chi_task_counter_key_created_ = true;
+  }
+  if (CTP_THREAD_MODEL->GetTls<TaskCounter>(chi_task_counter_key_) == nullptr) {
+    CTP_THREAD_MODEL->SetTls(chi_task_counter_key_, new TaskCounter());
+  }
+
+  // Synchronous ClientConnect: send the task, then block-poll the SAME DEALER
+  // for the reply and deserialize it inline. No async recv thread (the source
+  // of the two-IpcManager-in-one-process response-routing collision).
+  auto start = std::chrono::steady_clock::now();
+  bool connected = false;
+  while (!connected) {
+    auto task = NewTask<clio::run::admin::ClientConnectTask>(
+        CreateTaskId(), kAdminPoolId, PoolQuery::Local());
+    size_t net_key = reinterpret_cast<size_t>(task.ptr_);
+    task->task_id_.net_key_ = net_key;
+
+    SaveTaskArchive send_archive(MsgType::kSerializeIn, zmq_transport_.get());
+    send_archive << (*task.ptr_);
+    {
+      std::lock_guard<std::mutex> lock(zmq_client_send_mutex_);
+      zmq_transport_->Send(send_archive, ctp::lbm::LbmContext());
+    }
+
+    // Poll for the reply for up to ~2s before re-sending (handles the ZMTP
+    // handshake window on a freshly-created DEALER).
+    auto attempt_start = std::chrono::steady_clock::now();
+    while (std::chrono::duration<float>(std::chrono::steady_clock::now() -
+                                        attempt_start)
+               .count() < 2.0f) {
+      auto archive = std::make_unique<LoadTaskArchive>();
+      auto info = zmq_transport_->Recv(*archive);
+      if (info.rc == EAGAIN) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        continue;
+      }
+      if (info.rc != 0) {
+        zmq_transport_->ClearRecvHandles(*archive);
+        break;  // re-send
+      }
+      if (archive->task_infos_.empty() ||
+          archive->task_infos_[0].task_id_.net_key_ != net_key) {
+        zmq_transport_->ClearRecvHandles(*archive);
+        continue;  // not our reply
+      }
+      archive->msg_type_ = MsgType::kSerializeOut;
+      *archive >> (*task.ptr_);
+      zmq_transport_->ClearRecvHandles(*archive);
+      if (task->response_ == 0) {
+        worker_queues_off_ = task->worker_queues_off_;
+        runtime_pid_ = task->server_pid_;
+        server_generation_.store(task->server_generation_);
+        connected = true;
+      }
+      break;
+    }
+    DelTask(task);
+    if (connected) break;
+    if (std::chrono::duration<float>(std::chrono::steady_clock::now() - start)
+            .count() >= total_timeout) {
+      HLOG(kError,
+           "FallbackClientInit: main runtime on port {} did not answer "
+           "ClientConnect within {}s",
+           main_port, total_timeout);
+      return false;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+
+  // Attach the main runtime's segments (port-keyed via port_override_) and
+  // rebuild its worker queues from the offset learned above.
+  if (!ClientInitShm() || !ClientInitQueues()) {
+    HLOG(kError, "FallbackClientInit: failed to attach main runtime segments");
+    return false;
+  }
+
+  // Scheduler for ClientMapTask (lane selection on the main runtime's queues).
+  if (config && config->IsValid()) {
+    scheduler_ = SchedulerFactory::Get(config->GetLocalSched());
+  }
+
+  is_initialized_ = true;
+  HLOG(kSuccess,
+       "FallbackClientInit: connected to main runtime (port {}, pid {})",
+       main_port, runtime_pid_);
+  return true;
 }
 
 bool IpcManager::StartLocalServer() {

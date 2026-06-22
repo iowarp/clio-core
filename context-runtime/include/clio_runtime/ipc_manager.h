@@ -1360,6 +1360,21 @@ class IpcManager {
   bool TryStartMainServer(const std::string &hostname);
 
   /**
+   * Minimal bring-up for a fallback ("main"-runtime) client, used in place of
+   * the full ClientInit when this IpcManager is the nested fallback_ of another
+   * runtime in the same process. It does ONLY what punting needs and nothing
+   * that collides with the host runtime's process-global state: it attaches the
+   * main runtime's SHM segments, performs a single synchronous ClientConnect to
+   * learn the main runtime's worker-queue offset + pid, rebuilds the main
+   * runtime's worker queues, and creates a scheduler. It starts no async ZMQ
+   * recv thread and no heartbeat thread (those are what break a second full
+   * ClientInit inside a server process).
+   * @param main_port The main runtime's port.
+   * @return true on success; false if the main runtime is unreachable.
+   */
+  bool FallbackClientInit(u32 main_port);
+
+  /**
    * Effective runtime port for this IpcManager: the per-instance override if
    * set (fallback client → main runtime's port), else the global config port.
    * Used on the client-init path for connect target + SHM segment names so a
