@@ -114,6 +114,7 @@ class RuntimeServer {
    */
   bool Start(unsigned port = 10500,
              const std::string &bind_addr = "127.0.0.1") {
+    port_ = port;
     SetEnv("CLIO_PORT", std::to_string(port));
     SetEnv("CLIO_BIND_ADDR", bind_addr);
     const std::string exe = RuntimeExe();
@@ -181,8 +182,11 @@ class RuntimeServer {
    * elapses or the daemon exits early.
    */
   bool WaitForReady(int timeout_ms = 30000) {
+    // Segment names are port-keyed (see ConfigManager::GetSharedMemorySegmentName)
+    // so they match the daemon started on port_.
     const std::string seg =
-        ctp::ConfigParse::ExpandPath("chi_main_segment_${USER}");
+        ctp::ConfigParse::ExpandPath("chi_main_segment_${USER}") + "_" +
+        std::to_string(port_);
     const int attempts = timeout_ms / 200;
     for (int i = 0; i < attempts; ++i) {
       std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -275,6 +279,9 @@ class RuntimeServer {
   }
 
   bool started_ = false;
+  // Port the daemon was started on; segment names are port-keyed so multiple
+  // runtimes (the fallback topology) can coexist on one node + ${USER}.
+  unsigned port_ = 0;
 #ifdef _WIN32
   PROCESS_INFORMATION pi_{};
 #else

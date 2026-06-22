@@ -245,6 +245,42 @@ if(CLIO_CORE_ENABLE_TESTS)
     LABELS "msan_skip"
   )
 
+  # Fallback-runtime (crash isolation) test: spawns TWO runtimes (main on 10650
+  # with a bdev, user on 10651 with CLIO_FALLBACK_PORT=10650 and no bdev), then
+  # an SHM client calls the bdev through the user runtime, which punts to main.
+  # Serialize with other live-runtime tests (shared per-user SHM segments).
+  add_executable(clio_run_fallback_runtime_test test_fallback_runtime.cc)
+  target_include_directories(clio_run_fallback_runtime_test PRIVATE
+    ${CLIO_RUN_ROOT}/include
+    ${CLIO_RUN_ROOT}/test
+  )
+  target_link_libraries(clio_run_fallback_runtime_test
+    clio_bdev_client
+    clio_admin_client
+    clio_run_cxx
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+  )
+  target_compile_definitions(clio_run_fallback_runtime_test PRIVATE
+    CLIO_RUN_EXE="$<TARGET_FILE:clio_run>")
+  add_dependencies(clio_run_fallback_runtime_test clio_run clio_bdev_runtime)
+  set_target_properties(clio_run_fallback_runtime_test PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  add_test(
+    NAME cr_cli_fallback_runtime
+    COMMAND clio_run_fallback_runtime_test
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_cli_fallback_runtime PROPERTIES
+    ENVIRONMENT "${_cli_live_env}"
+    RESOURCE_LOCK "clio_runtime_port"
+    TIMEOUT 180
+    LABELS "msan_skip"
+  )
+
   # RestartLog unit test: pure file-level WAL behavior (no daemon).
   add_executable(clio_run_restart_log_test test_restart_log.cc)
   target_include_directories(clio_run_restart_log_test PRIVATE
