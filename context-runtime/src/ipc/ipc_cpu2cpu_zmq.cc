@@ -93,6 +93,12 @@ bool IpcCpu2CpuZmq::RuntimeRecv(IpcManager *ipc, u32 &tasks_received) {
         continue;
       }
 
+      // This transport serves external user clients (TCP/IPC); runtime peers
+      // use the run2run path. Tag the task for per-RPC access control. The flag
+      // is in SerializeIn, so it rides along if the task is forwarded to a
+      // remote container owner.
+      task_ptr->SetFlags(TASK_EXTERNAL_CLIENT);
+
       // If SerializeIn copied any ZMQ-owned BULK_XFER input into a fresh
       // CHI buffer, the task now owns that buffer. Promote the count to
       // TASK_DATA_OWNER so the task destructor frees it (mirrors admin

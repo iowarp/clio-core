@@ -90,6 +90,14 @@ class Container {
  public:
   static constexpr u32 CONTAINER_PLUG = BIT_OPT(u32, 0);
 
+  /** RPC visibility, as a small bitfield. A "private" RPC rejects calls from
+   *  external user clients; runtime-internal callers are always allowed. */
+  struct MethodProperty {
+    static constexpr u32 kPrivate = BIT_OPT(u32, 0);
+    u32 bits_ = 0;
+    bool IsPrivate() const { return (bits_ & kPrivate) != 0; }
+  };
+
   PoolId pool_id_;         ///< The unique ID of this pool
   std::string pool_name_;  ///< The semantic name of this pool
   u32 container_id_;       ///< The logical ID of this container instance
@@ -108,6 +116,13 @@ class Container {
   std::vector<float> method_mape_wall_;   ///< Per-method wall clock MAPE
   std::vector<std::string> method_names_;  ///< Per-method human-readable names
   float learning_rate_ = 0.2f;      ///< SGD learning rate for model updates
+  /** Default RPC visibility for this container (from compose
+   *  container_visibility). */
+  MethodProperty container_visibility_;
+  /** Per-method visibility overrides keyed by method id (from compose
+   *  container_rpc_acl). Built once in ConfigureAcl, then read-only — no
+   *  locking needed on the enforcement hot path. */
+  std::unordered_map<u32, MethodProperty> method_acl_;
 
  public:
   Container() = default;
@@ -158,6 +173,45 @@ class Container {
    */
   void SetMethodNames(const std::vector<std::string>& names) {
     method_names_ = names;
+  }
+
+  /**
+   * Configure per-RPC access control from a compose PoolConfig. Must be called
+   * once after Init()/SetMethodNames() (so method_names_ is populated), before
+   * the container serves tasks. Translates the name-keyed ACL into a
+   * method_id-keyed map; afterwards the ACL state is read-only.
+   * @param container_visibility default visibility (0 public, 1 private)
+   * @param rpc_acl per-RPC overrides: method NAME -> 0 public / 1 private
+   */
+  void ConfigureAcl(u32 container_visibility,
+                    const std::unordered_map<std::string, u32>& rpc_acl) {
+    container_visibility_.bits_ =
+        container_visibility ? MethodProperty::kPrivate : 0u;
+    method_acl_.clear();
+    for (const auto& kv : rpc_acl) {
+      for (u32 id = 0; id < method_names_.size(); ++id) {
+        if (method_names_[id] == kv.first) {
+          method_acl_[id].bits_ = kv.second ? MethodProperty::kPrivate : 0u;
+          break;
+        }
+      }
+    }
+  }
+
+  /**
+   * @return true if a caller may invoke `method_id`. Runtime-internal callers
+   * (is_external == false) are always allowed. External user clients are
+   * rejected when the method is private (per-method override if present, else
+   * the container default visibility).
+   */
+  bool IsRpcAllowed(u32 method_id, bool is_external) const {
+    if (!is_external) {
+      return true;
+    }
+    auto it = method_acl_.find(method_id);
+    const MethodProperty& mp =
+        (it != method_acl_.end()) ? it->second : container_visibility_;
+    return !mp.IsPrivate();
   }
 
   /**

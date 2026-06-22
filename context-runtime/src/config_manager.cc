@@ -359,6 +359,25 @@ void ConfigManager::ParseYAML(YAML::Node &yaml_conf) {
           pool_config.restart_ = pool_node["restart"].as<bool>();
         }
 
+        // Optional RPC access control. container_visibility sets the default
+        // visibility for every RPC (public|private, default public); a private
+        // container rejects RPCs from external user clients (runtime-internal
+        // callers are always allowed).
+        if (pool_node["container_visibility"]) {
+          std::string vis = pool_node["container_visibility"].as<std::string>();
+          pool_config.container_visibility_ = (vis == "private") ? 1u : 0u;
+        }
+        // container_rpc_acl is a map of RPC method NAME -> public|private that
+        // overrides container_visibility per method.
+        if (pool_node["container_rpc_acl"] &&
+            pool_node["container_rpc_acl"].IsMap()) {
+          for (const auto& kv : pool_node["container_rpc_acl"]) {
+            std::string name = kv.first.as<std::string>();
+            std::string v = kv.second.as<std::string>();
+            pool_config.rpc_acl_[name] = (v == "private") ? 1u : 0u;
+          }
+        }
+
         // Add to compose config
         compose_config_.pools_.push_back(pool_config);
       }
