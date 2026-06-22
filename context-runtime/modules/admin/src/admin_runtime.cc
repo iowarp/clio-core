@@ -593,6 +593,10 @@ clio::run::TaskResume Runtime::ClientConnect(ctp::ipc::FullPtr<ClientConnectTask
   task->server_generation_ = CLIO_IPC->GetServerGeneration();
   task->server_pid_ = static_cast<int32_t>(getpid());
   task->worker_queues_off_ = CLIO_IPC->GetWorkerQueuesOffset();
+  // Report this runtime's pid-based allocator ids so the client attaches the
+  // correct allocators (segments are no longer the hardcoded (1,0)/(2,0)).
+  task->main_alloc_id_ = CLIO_IPC->GetMainAllocatorId();
+  task->queue_alloc_id_ = CLIO_IPC->GetQueueAllocatorId();
 
   // GPU queue info for client attachment.
   //

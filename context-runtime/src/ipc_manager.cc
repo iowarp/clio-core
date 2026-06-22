@@ -44,6 +44,7 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <functional>
 #include <iostream>
 #include <memory>
@@ -666,8 +667,12 @@ bool IpcManager::ServerInitShm() {
   ConfigManager *config = CLIO_CONFIG_MANAGER;
 
   try {
-    // Set allocator ID for main segment
-    main_allocator_id_ = ctp::ipc::AllocatorId::Get(1, 0);
+    // Allocator IDs are based on this runtime's pid so that multiple runtimes
+    // on one node (the fallback topology) own globally-distinct allocators
+    // instead of every runtime claiming (1,0)/(2,0). Convention: pid.1 = main,
+    // pid.2 = queue. Clients learn these dynamically via ClientConnect.
+    u32 pid = static_cast<u32>(ctp::SystemInfo::GetPid());
+    main_allocator_id_ = ctp::ipc::AllocatorId::Get(pid, 1);
 
     // Get configurable segment name
     std::string main_segment_name =
@@ -693,7 +698,7 @@ bool IpcManager::ServerInitShm() {
     }
 
     // Initialize queue segment (CLIO_QUEUE_ALLOC_T = ArenaAllocator) for TaskQueues
-    queue_allocator_id_ = ctp::ipc::AllocatorId::Get(2, 0);
+    queue_allocator_id_ = ctp::ipc::AllocatorId::Get(pid, 2);
     std::string queue_segment_name =
         config->GetSharedMemorySegmentName(kQueueSegment);
     size_t queue_segment_size = config->CalculateQueueSegmentSize();
@@ -719,9 +724,11 @@ bool IpcManager::ClientInitShm() {
   ConfigManager *config = CLIO_CONFIG_MANAGER;
 
   try {
-    // Set allocator IDs (must match server)
-    main_allocator_id_ = ctp::ipc::AllocatorId(1, 0);
-    queue_allocator_id_ = ctp::ipc::AllocatorId(2, 0);
+    // Allocator IDs are NOT hardcoded: the server's are pid-based (pid.1 main,
+    // pid.2 queue) and differ per runtime. They are recovered from each
+    // segment's header on attach (and also reported by ClientConnect), so a
+    // fallback client attaching the main runtime's segments gets the main
+    // runtime's IDs — not a colliding (1,0)/(2,0).
 
     // Get configurable segment names with environment variable expansion.
     // port_override_ (non-zero on a fallback client) names the MAIN runtime's
@@ -733,26 +740,38 @@ bool IpcManager::ClientInitShm() {
 
     // Attach to existing main shared memory segment created by server
     if (!main_backend_.shm_attach(main_segment_name)) {
+      HLOG(kError, "ClientInitShm: shm_attach(main='{}') failed",
+           main_segment_name);
       return false;
     }
 
     // Attach to main allocator (CLIO_TASK_ALLOC_T = BuddyAllocator)
     main_allocator_ = main_backend_.AttachAlloc<CLIO_TASK_ALLOC_T>();
     if (!main_allocator_) {
+      HLOG(kError, "ClientInitShm: AttachAlloc(main='{}') failed",
+           main_segment_name);
       return false;
     }
+    // Recover the server's actual (pid-based) allocator id from the header.
+    main_allocator_id_ = main_allocator_->GetId();
 
     // Attach to queue segment (CLIO_QUEUE_ALLOC_T = ArenaAllocator)
     if (!queue_backend_.shm_attach(queue_segment_name)) {
+      HLOG(kError, "ClientInitShm: shm_attach(queue='{}') failed",
+           queue_segment_name);
       return false;
     }
     queue_allocator_ = queue_backend_.AttachAlloc<CLIO_QUEUE_ALLOC_T>();
     if (!queue_allocator_) {
+      HLOG(kError, "ClientInitShm: AttachAlloc(queue='{}') failed",
+           queue_segment_name);
       return false;
     }
+    queue_allocator_id_ = queue_allocator_->GetId();
 
     return true;
   } catch (const std::exception &e) {
+    HLOG(kError, "ClientInitShm: exception: {}", e.what());
     return false;
   }
 }
@@ -869,6 +888,62 @@ bool IpcManager::ClientInitQueues() {
   }
 }
 
+namespace {
+// Synchronous request/reply over a DEALER transport: serialize + send the
+// task, then block-poll the SAME socket for the matching reply and deserialize
+// it inline. The fallback client uses this instead of the async recv-thread
+// path (two full clients in one process collide on that path). Retries the send
+// every ~2s until total_timeout. The mutex serializes concurrent round-trips on
+// the shared dealer. Returns true if a reply for this task was deserialized
+// (caller inspects the task's OUT fields); false on timeout.
+template <typename TaskT>
+bool FallbackSyncRoundtrip(ctp::lbm::Transport *dealer, std::mutex &mtx,
+                           const ctp::ipc::FullPtr<TaskT> &task,
+                           float total_timeout) {
+  size_t net_key = reinterpret_cast<size_t>(task.ptr_);
+  task->task_id_.net_key_ = net_key;
+  auto start = std::chrono::steady_clock::now();
+  while (std::chrono::duration<float>(std::chrono::steady_clock::now() - start)
+             .count() < total_timeout) {
+    {
+      std::lock_guard<std::mutex> lock(mtx);
+      SaveTaskArchive send_archive(MsgType::kSerializeIn, dealer);
+      send_archive << (*task.ptr_);
+      dealer->Send(send_archive, ctp::lbm::LbmContext());
+
+      // Poll for the reply for up to ~2s before re-sending (covers the ZMTP
+      // handshake window on a freshly-created DEALER).
+      auto attempt_start = std::chrono::steady_clock::now();
+      while (std::chrono::duration<float>(std::chrono::steady_clock::now() -
+                                          attempt_start)
+                 .count() < 2.0f) {
+        auto archive = std::make_unique<LoadTaskArchive>();
+        auto info = dealer->Recv(*archive);
+        if (info.rc == EAGAIN) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(2));
+          continue;
+        }
+        if (info.rc != 0) {
+          dealer->ClearRecvHandles(*archive);
+          break;  // re-send
+        }
+        if (archive->task_infos_.empty() ||
+            archive->task_infos_[0].task_id_.net_key_ != net_key) {
+          dealer->ClearRecvHandles(*archive);
+          continue;  // not our reply
+        }
+        archive->msg_type_ = MsgType::kSerializeOut;
+        *archive >> (*task.ptr_);
+        dealer->ClearRecvHandles(*archive);
+        return true;
+      }
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  return false;
+}
+}  // namespace
+
 bool IpcManager::FallbackClientInit(u32 main_port) {
   ConfigManager *config = CLIO_CONFIG_MANAGER;
   port_override_ = main_port;        // segment names + (for consistency) port
@@ -900,67 +975,28 @@ bool IpcManager::FallbackClientInit(u32 main_port) {
     CTP_THREAD_MODEL->SetTls(chi_task_counter_key_, new TaskCounter());
   }
 
-  // Synchronous ClientConnect: send the task, then block-poll the SAME DEALER
-  // for the reply and deserialize it inline. No async recv thread (the source
-  // of the two-IpcManager-in-one-process response-routing collision).
-  auto start = std::chrono::steady_clock::now();
-  bool connected = false;
-  while (!connected) {
-    auto task = NewTask<clio::run::admin::ClientConnectTask>(
-        CreateTaskId(), kAdminPoolId, PoolQuery::Local());
-    size_t net_key = reinterpret_cast<size_t>(task.ptr_);
-    task->task_id_.net_key_ = net_key;
-
-    SaveTaskArchive send_archive(MsgType::kSerializeIn, zmq_transport_.get());
-    send_archive << (*task.ptr_);
-    {
-      std::lock_guard<std::mutex> lock(zmq_client_send_mutex_);
-      zmq_transport_->Send(send_archive, ctp::lbm::LbmContext());
-    }
-
-    // Poll for the reply for up to ~2s before re-sending (handles the ZMTP
-    // handshake window on a freshly-created DEALER).
-    auto attempt_start = std::chrono::steady_clock::now();
-    while (std::chrono::duration<float>(std::chrono::steady_clock::now() -
-                                        attempt_start)
-               .count() < 2.0f) {
-      auto archive = std::make_unique<LoadTaskArchive>();
-      auto info = zmq_transport_->Recv(*archive);
-      if (info.rc == EAGAIN) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
-        continue;
-      }
-      if (info.rc != 0) {
-        zmq_transport_->ClearRecvHandles(*archive);
-        break;  // re-send
-      }
-      if (archive->task_infos_.empty() ||
-          archive->task_infos_[0].task_id_.net_key_ != net_key) {
-        zmq_transport_->ClearRecvHandles(*archive);
-        continue;  // not our reply
-      }
-      archive->msg_type_ = MsgType::kSerializeOut;
-      *archive >> (*task.ptr_);
-      zmq_transport_->ClearRecvHandles(*archive);
-      if (task->response_ == 0) {
-        worker_queues_off_ = task->worker_queues_off_;
-        runtime_pid_ = task->server_pid_;
-        server_generation_.store(task->server_generation_);
-        connected = true;
-      }
-      break;
-    }
-    DelTask(task);
-    if (connected) break;
-    if (std::chrono::duration<float>(std::chrono::steady_clock::now() - start)
-            .count() >= total_timeout) {
-      HLOG(kError,
-           "FallbackClientInit: main runtime on port {} did not answer "
-           "ClientConnect within {}s",
-           main_port, total_timeout);
-      return false;
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  // Synchronous ClientConnect (no async recv thread — see FallbackSyncRoundtrip).
+  auto task = NewTask<clio::run::admin::ClientConnectTask>(
+      CreateTaskId(), kAdminPoolId, PoolQuery::Local());
+  bool connected =
+      FallbackSyncRoundtrip(zmq_transport_.get(), zmq_client_send_mutex_, task,
+                            total_timeout) &&
+      task->response_ == 0;
+  if (connected) {
+    worker_queues_off_ = task->worker_queues_off_;
+    runtime_pid_ = task->server_pid_;
+    server_generation_.store(task->server_generation_);
+    // Adopt the main runtime's dynamic (pid-based) allocator ids.
+    main_allocator_id_ = task->main_alloc_id_;
+    queue_allocator_id_ = task->queue_alloc_id_;
+  }
+  DelTask(task);
+  if (!connected) {
+    HLOG(kError,
+         "FallbackClientInit: main runtime on port {} did not answer "
+         "ClientConnect within {}s",
+         main_port, total_timeout);
+    return false;
   }
 
   // Attach the main runtime's segments (port-keyed via port_override_) and
@@ -1107,6 +1143,10 @@ retry_attempt:
   if (task->response_ == 0) {
     client_generation_ = task->server_generation_;
     worker_queues_off_ = task->worker_queues_off_;
+    // Adopt the runtime's dynamic (pid-based) allocator ids rather than
+    // assuming (1,0)/(2,0).
+    main_allocator_id_ = task->main_alloc_id_;
+    queue_allocator_id_ = task->queue_alloc_id_;
     if (task->server_pid_ > 0) {
       runtime_pid_ = static_cast<int>(task->server_pid_);
     }
@@ -2069,9 +2109,8 @@ bool IpcManager::RegisterMemory(const ctp::ipc::AllocatorId &alloc_id) {
     // Fallback mode: also register this client segment on the main runtime so
     // it can resolve + complete FutureShms for tasks this runtime punts to it
     // (a punted task's FutureShm lives in this client segment). Sent over the
-    // fallback client's control (TCP) path — like IncreaseClientShm — which
-    // serializes over the wire and so does not need a shared FutureShm (a
-    // runtime always allocates from private heap).
+    // fallback client's DEALER as a SYNCHRONOUS round-trip — the fallback runs
+    // no async recv thread, so the normal ClientSend().Wait() path would hang.
     if (fallback_) {
       HLOG(kInfo,
            "IpcManager::RegisterMemory: forwarding {} registration to main "
@@ -2081,8 +2120,15 @@ bool IpcManager::RegisterMemory(const ctp::ipc::AllocatorId &alloc_id) {
           fallback_->NewTask<clio::run::admin::RegisterMemoryTask>(
               clio::run::CreateTaskId(), clio::run::kAdminPoolId,
               clio::run::PoolQuery::Local(), alloc_id);
-      IpcCpu2CpuZmq::ClientSend(fallback_.get(), fb_reg_task, IpcMode::kTcp)
-          .Wait();
+      if (!FallbackSyncRoundtrip(fallback_->zmq_transport_.get(),
+                                 fallback_->zmq_client_send_mutex_, fb_reg_task,
+                                 30.0f)) {
+        HLOG(kWarning,
+             "IpcManager::RegisterMemory: main runtime did not ack {} "
+             "registration; punted tasks using it may fail to resolve",
+             shm_name);
+      }
+      fallback_->DelTask(fb_reg_task);
     }
 
     return true;
@@ -2310,9 +2356,33 @@ size_t IpcManager::WreapAllIpcs() {
 size_t IpcManager::ClearUserIpcs() {
   size_t removed_count = 0;
   std::string memfd_dir = ctp::SystemInfo::GetMemfdDir();
+  int current_pid = ctp::SystemInfo::GetPid();
 
   for (const auto &name : ctp::SystemInfo::ListDirectory(memfd_dir)) {
     std::string full_path = memfd_dir + "/" + name;
+
+    // The per-user memfd dir is shared by every runtime on this node (the
+    // fallback topology runs several). Only reap leftovers from DEAD processes
+    // — never clobber a segment a still-running runtime owns, or we break its
+    // clients (and its fallbacks). memfd entries are symlinks to
+    // /proc/<pid>/fd/N; if that pid is alive and isn't us, keep the entry.
+    std::error_code ec;
+    auto target = std::filesystem::read_symlink(full_path, ec);
+    if (!ec) {
+      const std::string t = target.string();
+      constexpr const char *kProc = "/proc/";
+      if (t.rfind(kProc, 0) == 0) {
+        int owner_pid = std::atoi(t.c_str() + std::strlen(kProc));
+        if (owner_pid > 0 && owner_pid != current_pid &&
+            ctp::SystemInfo::IsProcessAlive(owner_pid)) {
+          HLOG(kDebug,
+               "ClearUserIpcs: keeping {} (owned by live pid {})", name,
+               owner_pid);
+          continue;
+        }
+      }
+    }
+
     if (ctp::SystemInfo::RemoveFile(full_path)) {
       HLOG(kDebug, "ClearUserIpcs: Removed memfd symlink: {}", name);
       removed_count++;

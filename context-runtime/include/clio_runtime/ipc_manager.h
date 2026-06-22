@@ -270,6 +270,14 @@ class IpcManager {
     return main_allocator_;
   }
 
+  /** Pid-based allocator ids of this runtime's SHM segments (pid.1 main,
+   *  pid.2 queue). Reported to clients via ClientConnect so they attach the
+   *  right allocators instead of assuming (1,0)/(2,0). */
+  ctp::ipc::AllocatorId GetMainAllocatorId() const { return main_allocator_id_; }
+  ctp::ipc::AllocatorId GetQueueAllocatorId() const {
+    return queue_allocator_id_;
+  }
+
   /**
    * Bytes currently allocated-but-not-freed from the runtime's private heap
    * (CTP_MALLOC). In runtime mode AllocateBuffer/NewObj/NewTask draw from this

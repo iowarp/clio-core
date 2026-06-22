@@ -785,7 +785,13 @@ struct ClientConnectTask : public clio::run::Task {
   OUT int32_t server_pid_;          ///< Server process PID (for AwakenWorker SIGUSR1)
 
   // Worker task queue SHM offset (for SHM-mode client attach)
-  OUT clio::run::u64 worker_queues_off_;  ///< SHM offset of worker_queues_ within main allocator
+  OUT clio::run::u64 worker_queues_off_;  ///< SHM offset of worker_queues_ within queue allocator
+
+  // Pid-based allocator ids of the server's SHM segments (pid.1 main, pid.2
+  // queue). Returned dynamically so the client attaches the right allocators
+  // rather than assuming (1,0)/(2,0).
+  OUT ctp::ipc::AllocatorId main_alloc_id_;
+  OUT ctp::ipc::AllocatorId queue_alloc_id_;
 
   // GPU queue info (populated by server if GPUs are present)
   OUT clio::run::u32 num_gpus_;  ///< Number of GPU devices
@@ -846,7 +852,8 @@ struct ClientConnectTask : public clio::run::Task {
   template <typename Archive>
   CTP_CROSS_FUN void SerializeOut(Archive &ar) {
     Task::SerializeOut(ar);
-    ar(response_, server_generation_, server_pid_, worker_queues_off_, num_gpus_, gpu_queue_depth_);
+    ar(response_, server_generation_, server_pid_, worker_queues_off_,
+       main_alloc_id_, queue_alloc_id_, num_gpus_, gpu_queue_depth_);
     for (clio::run::u32 i = 0; i < kMaxGpuDevices; ++i) {
       ar(cpu2gpu_queue_off_[i], gpu2cpu_queue_off_[i], gpu2gpu_queue_off_[i],
          cpu2gpu_backend_size_[i], gpu2cpu_backend_size_[i]);
@@ -866,6 +873,8 @@ struct ClientConnectTask : public clio::run::Task {
     server_generation_ = other->server_generation_;
     server_pid_ = other->server_pid_;
     worker_queues_off_ = other->worker_queues_off_;
+    main_alloc_id_ = other->main_alloc_id_;
+    queue_alloc_id_ = other->queue_alloc_id_;
     num_gpus_ = other->num_gpus_;
     gpu_queue_depth_ = other->gpu_queue_depth_;
     memcpy(cpu2gpu_queue_off_, other->cpu2gpu_queue_off_,
