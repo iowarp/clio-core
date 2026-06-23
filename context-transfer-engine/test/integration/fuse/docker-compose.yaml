@@ -12,9 +12,16 @@
 
 services:
   cte-fuse-test:
-    image: iowarp/deps-cpu:latest
+    # This test needs fusermount3 (fuse3) in the image; deps-cpu/deps-nvidia do
+    # not carry it, but the cte-xfstests image does. Overridable via
+    # IOWARP_DOCKER_IMAGE for environments that ship fuse3 elsewhere.
+    image: ${IOWARP_DOCKER_IMAGE:-iowarp/cte-xfstests:latest}
     security_opt:
       - seccomp:unconfined
+      # The host's default Docker AppArmor profile denies the mount(2) syscall
+      # even with CAP_SYS_ADMIN, so fuse_main's fusermount fails with
+      # "Permission denied". Disable it for this FUSE-mounting container.
+      - apparmor:unconfined
     cap_add:
       - SYS_ADMIN
     devices:

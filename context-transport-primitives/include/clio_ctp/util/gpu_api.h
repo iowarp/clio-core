@@ -415,13 +415,17 @@ inline void DeviceAwareMemcpy(void *dst, const void *src, size_t n) {
   auto is_host_kind = [](const void *p) {
     cudaPointerAttributes a{};
     cudaError_t rc = cudaPointerGetAttributes(&a, p);
-    if (rc == cudaErrorInvalidValue) {
-      // Older CUDA returned this for unregistered host memory; clear the
-      // sticky error so it doesn't trip the next CUDA call.
+    if (rc != cudaSuccess) {
+      // Any failure — older CUDA's cudaErrorInvalidValue for unregistered host
+      // memory, OR a host with no usable GPU driver (e.g. error 35, "driver
+      // version is insufficient") — means this is not a confirmed device
+      // pointer. Treat it as host so the copy stays on std::memcpy instead of
+      // FATAL-ing the device path below. Clear the sticky error so it does not
+      // trip the next CUDA call. (With a working driver the query succeeds, so a
+      // real device pointer is never misclassified.)
       (void)cudaGetLastError();
       return true;
     }
-    if (rc != cudaSuccess) return false;
     return a.type == cudaMemoryTypeHost ||
            a.type == cudaMemoryTypeUnregistered;
   };
@@ -439,11 +443,14 @@ inline void DeviceAwareMemcpy(void *dst, const void *src, size_t n) {
   auto is_host_kind = [](const void *p) {
     hipPointerAttribute_t a{};
     hipError_t rc = hipPointerGetAttributes(&a, p);
-    if (rc == hipErrorInvalidValue) {
+    if (rc != hipSuccess) {
+      // See the CUDA branch: any query failure (unregistered host pointer, or a
+      // host with no usable GPU driver) means "not a confirmed device pointer".
+      // Treat as host and stay on std::memcpy instead of FATAL-ing the device
+      // path. Clear the sticky error.
       (void)hipGetLastError();
       return true;
     }
-    if (rc != hipSuccess) return false;
 #if defined(HIP_VERSION) && HIP_VERSION >= 60000000
     return a.type == hipMemoryTypeHost ||
            a.type == hipMemoryTypeUnregistered;
