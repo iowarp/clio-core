@@ -261,16 +261,31 @@ class GpuApi {
   static bool IsDevicePointer(T *ptr) {
     if (ptr == nullptr) return false;
 #if CTP_ENABLE_ROCM
+    // A failed attribute query means there is no usable GPU (no driver / no
+    // device) or the pointer is an unregistered host allocation — either way it
+    // is NOT a device pointer. Do not treat this as fatal: a GPU-enabled build
+    // must still run entirely on the CPU path on a host without a GPU driver.
+    // Clear the sticky error so a later real GPU call is not misattributed.
     hipPointerAttribute_t attributes{};
-    HIP_ERROR_CHECK(hipPointerGetAttributes(&attributes, (void *)ptr));
+    if (hipPointerGetAttributes(&attributes, (void *)ptr) != hipSuccess) {
+      (void)hipGetLastError();
+      return false;
+    }
 #if defined(HIP_VERSION) && HIP_VERSION >= 60000000
     return attributes.type == hipMemoryTypeDevice;
 #else
     return attributes.memoryType == hipMemoryTypeDevice;
 #endif
 #elif CTP_ENABLE_CUDA
+    // See the ROCm note above: a failed query (e.g. CUDA error 35, "driver
+    // version is insufficient", on a host with no GPU driver) means this is a
+    // host pointer, not a fatal condition. Clear the sticky error and fall back
+    // to the CPU path.
     cudaPointerAttributes attributes{};
-    CUDA_ERROR_CHECK(cudaPointerGetAttributes(&attributes, (void *)ptr));
+    if (cudaPointerGetAttributes(&attributes, (void *)ptr) != cudaSuccess) {
+      (void)cudaGetLastError();
+      return false;
+    }
     return attributes.type == cudaMemoryTypeDevice;
 #elif CTP_ENABLE_SYCL
     auto kind = sycl::get_pointer_type(static_cast<const void *>(ptr),
