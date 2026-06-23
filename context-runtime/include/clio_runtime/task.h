@@ -151,10 +151,26 @@ namespace clio::run::detail {
 // ============================================================================
 #elif defined(CLIO_ENABLE_BOOST_COROUTINES)
 #include <boost/context/fiber.hpp>
-#include <boost/context/fixedsize_stack.hpp>
+#include <boost/context/protected_fixedsize_stack.hpp>
+#include <cstdlib>
 #include <functional>
 namespace clio::run::detail {
-  static constexpr size_t FIBER_STACK_SIZE = 256 * 1024;
+  // Per-task fiber stack size in bytes, overridable via CLIO_BOOST_STACK_SIZE
+  // (KiB). Defaults to 1 MiB: the whole task — incl. nested helper coroutines —
+  // runs on this one stack, and Debug builds (large frames, esp. on Windows)
+  // plus the DPE/allocation/serialization call chain need well over the 256 KiB
+  // the NVHPC ucontext path uses. Paired with protected_fixedsize_stack so an
+  // overflow faults on a guard page instead of silently corrupting neighbouring
+  // stack data (which manifested as empty allocation results on Windows).
+  inline size_t boost_stack_size() {
+    static const size_t sz = []() -> size_t {
+      const char* e = std::getenv("CLIO_BOOST_STACK_SIZE");
+      size_t kib = (e && *e) ? std::strtoul(e, nullptr, 10) : 1024;
+      if (kib < 64) kib = 64;
+      return kib * 1024;
+    }();
+    return sz;
+  }
   struct FiberState;
   inline thread_local FiberState* tls_current_fiber = nullptr;
 
@@ -1468,7 +1484,8 @@ inline clio::run::TaskResume make_task_fiber(F&& fn) {
   auto* state = new FiberState();
   state->fn = std::make_unique<FiberCallableT<typename std::decay<F>::type>>(std::forward<F>(fn));
   state->task_ = boost::context::fiber{
-      std::allocator_arg, boost::context::fixedsize_stack(FIBER_STACK_SIZE),
+      std::allocator_arg,
+      boost::context::protected_fixedsize_stack(boost_stack_size()),
       [state](boost::context::fiber&& caller) -> boost::context::fiber {
         state->caller_ = std::move(caller);
         try { state->fn->call(); } catch (...) {}

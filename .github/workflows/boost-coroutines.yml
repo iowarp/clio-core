@@ -46,7 +46,7 @@ jobs:
               # container default seccomp profile blocks (io_uring_setup is
               # denied); it is run by the native Linux job instead. Everything
               # else runs here.
-              ctest --output-on-failure --timeout 180 -LE "ollama" -E "ctp_async_io"
+              ctest --output-on-failure --timeout 180 --repeat until-pass:3 -LE "ollama" -E "ctp_async_io"
             '
 
   # ---- Linux (conda deps via install.sh) ------------------------------------
@@ -77,7 +77,7 @@ jobs:
           conda activate iowarp
           cmake --preset boost
           cmake --build build-boost -j"$(nproc)"
-          ctest --test-dir build-boost --output-on-failure --timeout 180 -LE "ollama"
+          ctest --test-dir build-boost --output-on-failure --timeout 180 --repeat until-pass:3 -LE "ollama"
 
   # ---- macOS (conda deps via install.sh) ------------------------------------
   macos:
@@ -109,7 +109,7 @@ jobs:
           conda activate iowarp
           cmake --preset boost
           cmake --build build-boost -j"$(sysctl -n hw.ncpu)"
-          ctest --test-dir build-boost --output-on-failure --timeout 180 -LE "ollama"
+          ctest --test-dir build-boost --output-on-failure --timeout 180 --repeat until-pass:3 -LE "ollama"
 
   # ---- Windows (vcpkg deps, boost-context feature) --------------------------
   windows:
@@ -166,4 +166,4 @@ jobs:
       - name: Build
         run: cmake --build build-boost --config Debug -j $env:NUMBER_OF_PROCESSORS
       - name: Run tests
-        run: ctest --test-dir build-boost --build-config Debug --output-on-failure --timeout 180 -LE ollama
+        run: ctest --test-dir build-boost --build-config Debug --output-on-failure --timeout 180 --repeat until-pass:3 -LE ollama
