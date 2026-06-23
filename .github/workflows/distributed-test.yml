@@ -2,15 +2,24 @@ name: Distributed Test
 
 # Docker-based distributed integration CI.
 #
-# Spins up 4-node clusters from the iowarp/deps-cpu image and runs the
-# Clio runtime AND the CTE distributed integration tests across all nodes,
-# exercising the run-to-run network path (SendIn/RecvIn/SendOut/RecvOut) over
-# the SHM, TCP, and IPC transports.
+# Spins up multi-node clusters from the iowarp/deps-cpu image (and the
+# cte-xfstests image for the FUSE test) and runs EVERY docker integration
+# suite: the runtime distributed / expand / migrate / reconnect /
+# leader-election / recovery tests, plus the CTE distributed and CTE FUSE
+# tests. (cte_jarvis_deploy_integration_docker is intentionally NOT run here —
+# it needs the external Jarvis deployment tool + SSH, not just docker;
+# cte_restart_integration is a local non-docker test covered by the normal
+# ctest run.) This exercises
+# the run-to-run network path (SendIn/RecvIn/SendOut/RecvOut over SHM/TCP/IPC)
+# AND the node-failure paths (SWIM membership detection, dead-node broadcast
+# completion, container recovery, client failover) so regressions in those
+# paths are caught automatically instead of silently.
 #
 # The project is compiled ONCE INSIDE the deps-cpu image so the binaries are
 # ABI compatible with the runtime node containers (which load the .so files
-# from the mounted build directory), then both distributed test suites run
-# against that single build.
+# from the mounted build directory), then every suite runs against that single
+# build. The cte-xfstests image used by the FUSE test is also Ubuntu 24.04 /
+# glibc 2.39, so it runs the same mounted build.
 
 on:
   push:
@@ -34,9 +43,9 @@ concurrency:
 
 jobs:
   distributed:
-    name: Distributed (4-node docker, runtime + CTE)
+    name: Distributed (multi-node docker integration suites)
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 150
     env:
       DEPS_IMAGE: iowarp/deps-cpu:latest
       DOCKER_HUB_USERNAME: ${{ secrets.DOCKER_HUB_USERNAME }}
@@ -55,8 +64,12 @@ jobs:
           username: ${{ secrets.DOCKER_HUB_USERNAME }}
           password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
 
-      - name: Pull dependency image
-        run: docker pull "$DEPS_IMAGE"
+      - name: Pull dependency images
+        run: |
+          docker pull "$DEPS_IMAGE"
+          # The FUSE test needs fusermount3, which only the cte-xfstests image
+          # ships. Pull it up front so the FUSE step doesn't pay for it mid-run.
+          docker pull iowarp/cte-xfstests:latest || true
 
       # Build inside the deps-cpu image so the resulting binaries link against
       # the same libraries the runtime node containers provide at runtime.
@@ -73,32 +86,80 @@ jobs:
               cmake --preset release -DCLIO_CORE_ENABLE_PYTHON=OFF
               cmake --build build -j"$(nproc)"
               # Hand ownership back to the runner so post-job cleanup and the
-              # test cluster (which runs as the runner uid) can access build/.
+              # test clusters (which run as the runner uid) can access build/.
               chown -R "$HOST_UID:$HOST_GID" build
             '
 
-      - name: Run runtime distributed test (4-node, shm/tcp/ipc)
+      # Each step exports HOST_UID/HOST_GID so the container processes match
+      # host file ownership (coverage gcda + mounted build access), and uses
+      # `if: !cancelled()` so every suite reports a result even if an earlier
+      # one failed.
+      - name: Runtime distributed test (4-node, shm/tcp/ipc)
+        if: ${{ !cancelled() }}
         run: |
-          export HOST_UID="$(id -u)"
-          export HOST_GID="$(id -g)"
+          export HOST_UID="$(id -u)" HOST_GID="$(id -g)"
           ./context-runtime/test/integration/distributed/run_tests.sh all
 
-      # Run even if the runtime suite failed so both suites report a result.
+      - name: Runtime expand/induction test (node join)
+        if: ${{ !cancelled() }}
+        run: |
+          export HOST_UID="$(id -u)" HOST_GID="$(id -g)"
+          ./context-runtime/test/integration/expand/run_tests.sh all
+
+      - name: Runtime migrate test (container migration)
+        if: ${{ !cancelled() }}
+        run: |
+          export HOST_UID="$(id -u)" HOST_GID="$(id -g)"
+          ./context-runtime/test/integration/migrate/run_tests.sh all
+
+      - name: Runtime reconnect failover test (node death + client failover)
+        if: ${{ !cancelled() }}
+        run: |
+          export HOST_UID="$(id -u)" HOST_GID="$(id -g)"
+          ./context-runtime/test/integration/reconnect/run_tests.sh all
+
+      - name: Runtime leader-election test (leader death + re-election)
+        if: ${{ !cancelled() }}
+        run: |
+          export HOST_UID="$(id -u)" HOST_GID="$(id -g)"
+          ./context-runtime/test/integration/leader_elect/run_tests.sh all
+
+      - name: Runtime recovery test (container recovery after node death)
+        if: ${{ !cancelled() }}
+        run: |
+          export HOST_UID="$(id -u)" HOST_GID="$(id -g)"
+          ./context-runtime/test/integration/recovery/run_tests.sh all
+
+      # Run even if a runtime suite failed so both projects report a result.
       # The "Distributed Execution Validation" cross-node assertions are
       # temporarily disabled in test_core_functionality.cc (#503) because every
       # CTE blob op currently resolves to the client node's local container;
       # the rest of the CTE distributed suite is a hard check.
-      - name: Run CTE distributed test (4-node, shm/tcp/ipc)
+      - name: CTE distributed test (4-node, shm/tcp/ipc)
         if: ${{ !cancelled() }}
         run: |
-          export HOST_UID="$(id -u)"
-          export HOST_GID="$(id -g)"
+          export HOST_UID="$(id -u)" HOST_GID="$(id -g)"
           ./context-transfer-engine/test/integration/distributed/run_tests.sh
+
+      - name: CTE FUSE test (mount + POSIX I/O)
+        if: ${{ !cancelled() }}
+        run: |
+          export HOST_UID="$(id -u)" HOST_GID="$(id -g)"
+          ./context-transfer-engine/test/integration/fuse/run_tests.sh
 
       # The run_tests.sh scripts tear their clusters down on success and
       # failure; this only fires if a step was killed before its own cleanup.
       - name: Cleanup clusters
         if: always()
         run: |
-          docker compose -f context-runtime/test/integration/distributed/docker-compose.yml down -v || true
-          docker compose -f context-transfer-engine/test/integration/distributed/docker-compose.yaml down -v || true
+          for f in \
+            context-runtime/test/integration/distributed/docker-compose.yml \
+            context-runtime/test/integration/expand/docker-compose.yml \
+            context-runtime/test/integration/migrate/docker-compose.yml \
+            context-runtime/test/integration/reconnect/docker-compose.yml \
+            context-runtime/test/integration/leader_elect/docker-compose.yml \
+            context-runtime/test/integration/recovery/docker-compose.yml \
+            context-transfer-engine/test/integration/distributed/docker-compose.yaml \
+            context-transfer-engine/test/integration/fuse/docker-compose.yaml ; do
+            docker compose -f "$f" down -v 2>/dev/null || true
+          done
