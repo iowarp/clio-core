@@ -11,7 +11,11 @@ USER root
 # container runs --privileged, so /dev/fuse + SYS_ADMIN are available.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       fuse3 libfuse3-dev \
+      libboost-context-dev libboost-dev \
     && rm -rf /var/lib/apt/lists/*
+
+# Boost.Context stackful coroutine backend available + on by default (issue #620).
+ENV CLIO_CORE_ENABLE_BOOST_COROUTINES=ON
 
 # Remap iowarp user UID/GID to match the host user.
 ARG HOST_UID=1000

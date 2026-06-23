@@ -46,6 +46,8 @@ class Iowarp(CMakePackage):
     variant('rocm', default=False, description='Enable ROCm support')
     variant('adios2', default=False, description='Build with ADIOS2 support')
     variant('fuse', default=False, description='Enable FUSE3 adapter (CTE)')
+    variant('boost_coro', default=False,
+            description='Use Boost.Context stackful coroutine backend (issue #620)')
 
     # Core dependencies (always required)
     depends_on('cmake@3.25:')
@@ -73,6 +75,7 @@ class Iowarp(CMakePackage):
     depends_on('hdf5', when='+hdf5')
     depends_on('adios2', when='+adios2')
     depends_on('libfuse@3:', when='+fuse')
+    depends_on('boost+context', when='+boost_coro')
 
     conflicts('+fuse', when='~cte', msg='fuse adapter lives under CTE; enable +cte')
 
@@ -120,6 +123,8 @@ class Iowarp(CMakePackage):
         args.append(self.define_from_variant('CLIO_CORE_ENABLE_CTE', 'cte'))
         args.append(self.define_from_variant('CLIO_CORE_ENABLE_CAE', 'cae'))
         args.append(self.define_from_variant('CLIO_CORE_ENABLE_CEE', 'cee'))
+        args.append(self.define_from_variant(
+            'CLIO_CORE_ENABLE_BOOST_COROUTINES', 'boost_coro'))
 
         # Context-transport-primitives (CTP) options
         if '+hdf5' in self.spec:

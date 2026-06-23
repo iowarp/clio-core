@@ -14,7 +14,13 @@ RUN userdel -r ubuntu || true
 # container runs --privileged, so /dev/fuse + SYS_ADMIN are available.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       fuse3 libfuse3-dev \
+      libboost-context-dev libboost-dev \
     && rm -rf /var/lib/apt/lists/*
+
+# Build the Boost.Context stackful coroutine backend by default in the
+# devcontainer so it is exercised during development (issue #620). Build tooling
+# that honors this passes -DCLIO_CORE_ENABLE_BOOST_COROUTINES=ON.
+ENV CLIO_CORE_ENABLE_BOOST_COROUTINES=ON
 
 # The deps-cpu image already includes:
 # - All apt + source-built dependencies (boost, hdf5, yaml-cpp, zeromq, cereal, etc.)

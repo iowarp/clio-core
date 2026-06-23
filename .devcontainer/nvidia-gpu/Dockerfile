@@ -14,7 +14,11 @@ RUN userdel -r ubuntu || true
 # container runs --privileged, so /dev/fuse + SYS_ADMIN are available.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       fuse3 libfuse3-dev \
+      libboost-context-dev libboost-dev \
     && rm -rf /var/lib/apt/lists/*
+
+# Boost.Context stackful coroutine backend available + on by default (issue #620).
+ENV CLIO_CORE_ENABLE_BOOST_COROUTINES=ON
 
 # The deps-nvidia image already includes (inherited from deps-cpu):
 # - All apt + source-built dependencies (boost, hdf5, yaml-cpp, zeromq, cereal, etc.)

@@ -41,6 +41,7 @@ requirements:
     - liburing    # [linux]
     - nlohmann_json
     - libcurl
+    - libboost-devel  # Boost.Context: optional stackful coroutine backend (#620)
   run:
     - python
     - zeromq
