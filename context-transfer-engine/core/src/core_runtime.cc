@@ -1998,6 +1998,32 @@ clio::run::TaskResume Runtime::DelTag(ctp::ipc::FullPtr<DelTagTask> task,
       del_abs = ResolveTagName(canonical);
     }
 
+    // Capture the target's ancestor id chain (immediate parent up to, but
+    // excluding, the root) BEFORE any deletion. After the subtree is removed we
+    // prune any of these that became an empty directory. GetOrCreateTagChain
+    // materializes a tag for every path component, so deleting the last file
+    // under "/a/b" would otherwise leave orphaned "/a" and "/a/b" tags that keep
+    // CteDirExists("/a") true forever. An *explicit* cfs directory always keeps
+    // its reserved ".__clio_dir__" child, so it is never childless and is never
+    // pruned here.
+    std::vector<TagId> ancestor_chain;
+    {
+      clio::run::ScopedCoRwReadLock lock(tag_map_lock_);
+      TagId root_id;
+      TagId *rp = tag_name_to_id_.find(std::string("/"));
+      if (rp != nullptr) root_id = *rp;
+      std::string name = canonical;
+      TagId parent;
+      std::string leaf;
+      while (ParseTagRef(name, parent, leaf)) {
+        if (!root_id.IsNull() && parent == root_id) break;  // never prune root
+        TagInfo *pinfo = tag_id_to_info_.find(parent);
+        if (pinfo == nullptr) break;
+        ancestor_chain.push_back(parent);
+        name = pinfo->tag_name_.str();
+      }
+    }
+
     // If the request resolved through a key that is NOT the tag's own canonical
     // name, it is an alias/hard-link "unlink": drop only that one name binding
     // and leave the tag, its blobs, and other names intact. Deleting by id, or
@@ -2187,6 +2213,57 @@ clio::run::TaskResume Runtime::DelTag(ctp::ipc::FullPtr<DelTagTask> task,
         tag_id_to_info_.erase(del_id);
       }
       GpuCacheOnDelTag(del_id);
+    }
+
+    // Step 7b: prune now-empty auto-created parent directories, bottom-up. Stop
+    // at the first ancestor that still has a child (it — and everything above —
+    // stays). Pruning a child first can make its parent childless, so each
+    // iteration re-checks against the live tag table.
+    for (const TagId &anc : ancestor_chain) {
+      bool has_child = false;
+      {
+        clio::run::ScopedCoRwReadLock lock(tag_map_lock_);
+        if (tag_id_to_info_.find(anc) == nullptr) {
+          continue;  // already removed (e.g. part of the deleted subtree)
+        }
+        tag_id_to_info_.for_each([&](const TagId &id, const TagInfo &info) {
+          (void)id;
+          if (has_child) return;
+          TagId cparent;
+          std::string cleaf;
+          if (ParseTagRef(info.tag_name_.str(), cparent, cleaf) &&
+              cparent == anc) {
+            has_child = true;
+          }
+        });
+      }
+      if (has_child) {
+        break;  // non-empty directory: this and all higher ancestors persist
+      }
+      std::string anc_name;
+      {
+        clio::run::ScopedCoRwWriteLock lock(tag_map_lock_);
+        TagInfo *info = tag_id_to_info_.find(anc);
+        if (info == nullptr) continue;
+        anc_name = info->tag_name_.str();
+        std::string anc_abs = ResolveTagName(anc_name);  // parent chain intact
+        if (!info->tag_name_.empty()) {
+          tag_name_to_id_.erase(anc_name);
+        }
+        for (size_t i = 0; i < info->aliases_.size(); ++i) {
+          tag_name_to_id_.erase(info->aliases_[i].str());
+        }
+        tag_search_.Delete(anc_abs);
+        tag_id_to_info_.erase(anc);
+      }
+      if (!tag_txn_logs_.empty()) {
+        TxnDelTag txn;
+        txn.tag_name_ = anc_name;
+        txn.tag_major_ = anc.major_;
+        txn.tag_minor_ = anc.minor_;
+        tag_txn_logs_[wid % tag_txn_logs_.size()]->Log(TxnType::kDelTag, txn);
+      }
+      GpuCacheOnDelTag(anc);
     }
 
     // Log telemetry for the DelTag operation (attributed to the target tag).
