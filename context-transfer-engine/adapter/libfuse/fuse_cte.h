@@ -173,15 +173,24 @@ static inline bool CteTagExists(const std::string &tag_name) {
 }
 
 /**
- * Query CTE for tags that are direct children of a directory path.
- * For directory "/a/b", finds tags matching "^/a/b/[^/]+$".
- * Returns just the basenames (not full paths).
+ * Query CTE for the direct FILE children of a directory path.
+ * For directory "/a/b", returns the basenames of tags "/a/b/<name>" that are
+ * leaves (files). Subdirectories are intentionally excluded — they are reported
+ * separately by CteListSubdirs.
+ *
+ * GetOrCreateTagChain materializes an intermediate tag for every path component
+ * (creating "/a/b/sub/c.txt" also creates the tag "/a/b/sub"), so a naive
+ * "^/a/b/[^/]+$" query would return the directory "sub" alongside the real
+ * files. We instead query the whole subtree once and classify each immediate
+ * component: a component is a directory if any tag exists *beneath* it
+ * ("/a/b/<name>/..."), otherwise it is a file.
  */
 static inline std::vector<std::string>
 CteListDirectChildren(const std::string &dir_path) {
   auto *cte_client = CLIO_CTE_CLIENT;
 
-  // Build regex: escape dir_path, then match one path component
+  // Build regex: escape dir_path, then match the subtree (one-or-more chars
+  // after the trailing slash, at any depth).
   std::string escaped;
   for (char c : dir_path) {
     if (c == '.' || c == '[' || c == ']' || c == '(' || c == ')' ||
@@ -193,7 +202,7 @@ CteListDirectChildren(const std::string &dir_path) {
   }
   // Ensure trailing slash
   if (!escaped.empty() && escaped.back() != '/') escaped += '/';
-  std::string regex = "^" + escaped + "[^/]+$";
+  std::string regex = "^" + escaped + ".+";
 
   auto task = cte_client->AsyncTagQuery(regex, 0, clio::run::PoolQuery::Local());
   task.Wait();
@@ -201,12 +210,36 @@ CteListDirectChildren(const std::string &dir_path) {
   std::vector<std::string> basenames;
   if (task->GetReturnCode() != 0) return basenames;
 
-  // Extract basenames from full paths
+  // Partition immediate components into leaf-file candidates (tag is exactly
+  // "/dir/<name>") and directories (a tag "/dir/<name>/..." exists below).
   size_t prefix_len = dir_path.size();
   if (!dir_path.empty() && dir_path.back() != '/') prefix_len++;
+  std::vector<std::string> file_candidates;
+  std::vector<std::string> dir_names;
   for (const auto &full_path : task->results_) {
-    if (full_path.size() > prefix_len) {
-      basenames.push_back(full_path.substr(prefix_len));
+    if (full_path.size() <= prefix_len) continue;
+    std::string remainder = full_path.substr(prefix_len);
+    size_t slash_pos = remainder.find('/');
+    if (slash_pos == std::string::npos) {
+      file_candidates.push_back(remainder);
+    } else {
+      std::string subdir = remainder.substr(0, slash_pos);
+      if (std::find(dir_names.begin(), dir_names.end(), subdir) ==
+          dir_names.end()) {
+        dir_names.push_back(subdir);
+      }
+    }
+  }
+
+  // Keep only leaf files (exclude any candidate that is actually a directory),
+  // de-duplicated.
+  for (const auto &name : file_candidates) {
+    if (std::find(dir_names.begin(), dir_names.end(), name) != dir_names.end()) {
+      continue;  // it is a directory, not a file
+    }
+    if (std::find(basenames.begin(), basenames.end(), name) ==
+        basenames.end()) {
+      basenames.push_back(name);
     }
   }
   return basenames;
