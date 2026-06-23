@@ -41,7 +41,21 @@ using pid_t = int;
 #endif
 
 #include <atomic>
-#ifndef __NVCOMPILER
+// ============================================================================
+// Coroutine backend selection.
+//   * Default: C++20 stackless coroutines (std::coroutine_handle).
+//   * Stackful "fiber" backend, selected when EITHER:
+//       - compiling with NVHPC (which ICEs on libstdc++ coroutines), or
+//       - CLIO_ENABLE_BOOST_COROUTINES is defined (opt-in Boost.Context
+//         stackful backend, issue #620 — reuses stacks to avoid the per-task
+//         heap frame the stackless backend allocates).
+// Both fiber variants share the same FiberHandle/TaskResume/macro surface;
+// only the low-level context switch + stack allocation differ.
+// ============================================================================
+#if defined(__NVCOMPILER) || defined(CLIO_ENABLE_BOOST_COROUTINES)
+#define CLIO_USE_FIBER_BACKEND 1
+#endif
+#ifndef CLIO_USE_FIBER_BACKEND
 #include <coroutine>
 #endif
 #include <memory>
@@ -128,7 +142,71 @@ namespace clio::run::detail {
     bool operator!=(std::nullptr_t) const noexcept { return state_ != nullptr; }
   };
 }  // namespace clio::run::detail
-#endif // __NVCOMPILER
+
+// ============================================================================
+// Boost.Context stackful fiber infrastructure (issue #620).
+// Opt-in alternative to C++20 stackless coroutines. Mirrors the ucontext
+// FiberHandle/FiberState interface above so RunContext, the worker, and the
+// task-body macros are backend-agnostic; only the context switch differs.
+// ============================================================================
+#elif defined(CLIO_ENABLE_BOOST_COROUTINES)
+#include <boost/context/fiber.hpp>
+#include <boost/context/fixedsize_stack.hpp>
+#include <functional>
+namespace clio::run::detail {
+  static constexpr size_t FIBER_STACK_SIZE = 256 * 1024;
+  struct FiberState;
+  inline thread_local FiberState* tls_current_fiber = nullptr;
+
+  struct FiberCallable {
+    virtual void call() = 0;
+    virtual ~FiberCallable() = default;
+  };
+
+  template<typename F>
+  struct FiberCallableT : FiberCallable {
+    F fn;
+    explicit FiberCallableT(F&& f) : fn(std::move(f)) {}
+    void call() override { fn(); }
+  };
+
+  // `task_` holds the suspended task continuation (entered by resume()).
+  // `caller_` holds the continuation back to the worker, refreshed on every
+  // suspend. A finished/destroyed fiber unwinds its own stack via RAII.
+  struct FiberState {
+    boost::context::fiber task_;
+    boost::context::fiber caller_;
+    bool done = false;
+    std::unique_ptr<FiberCallable> fn;
+  };
+
+  // Suspend the running fiber back to the worker (inverse of FiberHandle::resume).
+  inline void fiber_suspend_to_caller(FiberState* fs) {
+    fs->caller_ = std::move(fs->caller_).resume();
+  }
+
+  class FiberHandle {
+  public:
+    FiberState* state_ = nullptr;
+    FiberHandle() = default;
+    explicit FiberHandle(FiberState* s) : state_(s) {}
+    bool done() const noexcept { return !state_ || state_->done; }
+    void resume() {
+      if (!state_ || state_->done) return;
+      auto* prev = tls_current_fiber;
+      tls_current_fiber = state_;
+      state_->task_ = std::move(state_->task_).resume();
+      tls_current_fiber = prev;
+    }
+    void destroy() { delete state_; state_ = nullptr; }
+    explicit operator bool() const { return state_ != nullptr; }
+    bool operator!() const { return state_ == nullptr; }
+    FiberHandle& operator=(std::nullptr_t) noexcept { state_ = nullptr; return *this; }
+    bool operator==(std::nullptr_t) const noexcept { return state_ == nullptr; }
+    bool operator!=(std::nullptr_t) const noexcept { return state_ != nullptr; }
+  };
+}  // namespace clio::run::detail
+#endif // fiber backend (NVHPC ucontext / Boost.Context)
 
 namespace clio::run {
 
@@ -599,7 +677,7 @@ namespace clio::run {
  */
 struct RunContext {
   /** Coroutine handle for C++20 stackless coroutines (or fiber handle for NVHPC) */
-#ifndef __NVCOMPILER
+#ifndef CLIO_USE_FIBER_BACKEND
   std::coroutine_handle<> coro_handle_;
 #else
   clio::run::detail::FiberHandle coro_handle_;
@@ -685,7 +763,7 @@ struct RunContext {
         wall_timer_(other.wall_timer_),
         predicted_wall_us_(other.predicted_wall_us_),
         predicted_stat_(other.predicted_stat_) {
-#ifndef __NVCOMPILER
+#ifndef CLIO_USE_FIBER_BACKEND
     other.coro_handle_ = nullptr;
 #else
     other.coro_handle_ = clio::run::detail::FiberHandle{};
@@ -721,7 +799,7 @@ struct RunContext {
       wall_timer_ = other.wall_timer_;
       predicted_wall_us_ = other.predicted_wall_us_;
       predicted_stat_ = other.predicted_stat_;
-#ifndef __NVCOMPILER
+#ifndef CLIO_USE_FIBER_BACKEND
       other.coro_handle_ = nullptr;
 #else
       other.coro_handle_ = clio::run::detail::FiberHandle{};
@@ -763,7 +841,7 @@ struct RunContext {
 // definition)
 // ============================================================================
 
-#ifndef __NVCOMPILER
+#ifndef CLIO_USE_FIBER_BACKEND
 template <typename TaskT, typename AllocT>
 bool Future<TaskT, AllocT>::await_suspend_impl(
     std::coroutine_handle<> handle) noexcept {
@@ -790,7 +868,7 @@ bool Future<TaskT, AllocT>::await_suspend_impl(
 // TaskResume and YieldAwaiter (must be after RunContext for member access)
 // ============================================================================
 
-#ifndef __NVCOMPILER
+#ifndef CLIO_USE_FIBER_BACKEND
 /**
  * TaskResume - Coroutine return type for runtime methods
  *
@@ -1124,10 +1202,10 @@ class TaskResume {
   }
 };
 
-#else // __NVCOMPILER - use ucontext_t fiber-based TaskResume
+#else // CLIO_USE_FIBER_BACKEND - fiber-based TaskResume (NVHPC / Boost.Context)
 
 /**
- * TaskResume (NVHPC) - Fiber-based return type for runtime methods
+ * TaskResume (fiber backend) - return type for runtime methods
  *
  * Wraps a clio::run::detail::FiberHandle instead of a coroutine handle.
  * Used when compiling with NVHPC which crashes on C++20 coroutines.
@@ -1210,7 +1288,7 @@ class YieldAwaiter {
    */
   bool await_ready() const noexcept { return false; }
 
-#ifndef __NVCOMPILER
+#ifndef CLIO_USE_FIBER_BACKEND
   /**
    * Suspend the coroutine and mark for yielded resumption
    *
@@ -1266,10 +1344,10 @@ inline YieldAwaiter yield(double us = 0.0) { return YieldAwaiter(us); }
 }  // namespace clio::run
 
 // ============================================================================
-// NVHPC fiber_co_await overloads and make_task_fiber
+// Fiber backend: fiber_co_await overloads and make_task_fiber
 // (outside chi namespace, in clio::run::detail namespace)
 // ============================================================================
-#ifdef __NVCOMPILER
+#if defined(__NVCOMPILER)
 namespace clio::run::detail {
 
 /// Yield awaiter overload: suspends fiber and marks rctx as yielded
@@ -1285,7 +1363,7 @@ inline void fiber_co_await(clio::run::YieldAwaiter ya, clio::run::RunContext& rc
 /// Future overload: waits for async task completion
 template<typename TaskT, typename AllocT>
 inline void fiber_co_await(clio::run::Future<TaskT, AllocT>& future, clio::run::RunContext& rctx) {
-  if (future.IsReady()) return;
+  if (future.IsComplete()) return;
   auto* fs = tls_current_fiber;
   if (!fs) return;
   future.SetParentTask(&rctx);
@@ -1334,17 +1412,80 @@ inline clio::run::TaskResume make_task_fiber(F&& fn) {
 }
 
 }  // namespace clio::run::detail
-#endif // __NVCOMPILER
+
+#elif defined(CLIO_ENABLE_BOOST_COROUTINES)
+namespace clio::run::detail {
+
+// Boost backend model (issue #620): the WORKER creates ONE fiber per task (via
+// make_task_fiber, with the entry calling Container::Run) and the whole task —
+// including any nested helper coroutines — runs NATIVELY on that fiber's stack.
+// CLIO_TASK_BODY_BEGIN/END are therefore empty (no lambda, so reference
+// parameters and locals behave exactly like ordinary C++), nested helper calls
+// run inline (so awaiting their returned TaskResume is a no-op), and an await
+// simply suspends the one fiber back to the worker until the future completes.
+
+/// Yield: suspend the running fiber back to the worker.
+inline void boost_await(clio::run::YieldAwaiter ya, clio::run::RunContext& rctx) {
+  auto* fs = tls_current_fiber;
+  if (!fs) return;
+  rctx.is_yielded_ = true;
+  rctx.yield_time_us_ = ya.get_yield_time_us();
+  fiber_suspend_to_caller(fs);
+  rctx.is_yielded_ = false;
+}
+
+/// Future: suspend the fiber until the worker observes the future complete.
+template<typename TaskT, typename AllocT>
+inline void boost_await(clio::run::Future<TaskT, AllocT>& future, clio::run::RunContext& rctx) {
+  if (future.IsComplete()) return;
+  auto* fs = tls_current_fiber;
+  if (!fs) return;
+  future.SetParentTask(&rctx);
+  rctx.is_yielded_ = true;
+  rctx.yield_time_us_ = 0.0;
+  fiber_suspend_to_caller(fs);
+  rctx.is_yielded_ = false;
+}
+
+/// Future rvalue overload (for temporaries).
+template<typename TaskT, typename AllocT>
+inline void boost_await(clio::run::Future<TaskT, AllocT>&& future, clio::run::RunContext& rctx) {
+  boost_await(future, rctx);
+}
+
+/// Nested helper coroutine: it already ran to completion inline (empty
+/// CLIO_TASK_BODY_BEGIN means it executed as a plain call on this fiber's
+/// stack, suspending the fiber itself at its own awaits), so there is nothing
+/// left to drive.
+inline void boost_await(clio::run::TaskResume&&, clio::run::RunContext&) {}
+inline void boost_await(clio::run::TaskResume&, clio::run::RunContext&) {}
+
+/// Create a task fiber whose entry runs `fn` (which invokes Container::Run).
+/// Lazy: the body runs on the first FiberHandle::resume(). Returned wrapped in
+/// a TaskResume so the worker can release()/store the FiberHandle.
+template<typename F>
+inline clio::run::TaskResume make_task_fiber(F&& fn) {
+  auto* state = new FiberState();
+  state->fn = std::make_unique<FiberCallableT<typename std::decay<F>::type>>(std::forward<F>(fn));
+  state->task_ = boost::context::fiber{
+      std::allocator_arg, boost::context::fixedsize_stack(FIBER_STACK_SIZE),
+      [state](boost::context::fiber&& caller) -> boost::context::fiber {
+        state->caller_ = std::move(caller);
+        try { state->fn->call(); } catch (...) {}
+        state->done = true;
+        return std::move(state->caller_);
+      }};
+  return clio::run::TaskResume(FiberHandle(state));
+}
+
+}  // namespace clio::run::detail
+#endif // fiber backend (NVHPC ucontext / Boost.Context)
 
 // ============================================================================
 // Cross-compiler macros for task bodies (co_await / co_return replacements)
 // ============================================================================
-#ifndef __NVCOMPILER
-#  define CLIO_TASK_BODY_BEGIN
-#  define CLIO_TASK_BODY_END
-#  define CLIO_CO_AWAIT(expr)  co_await (expr)
-#  define CLIO_CO_RETURN       co_return
-#else
+#if defined(__NVCOMPILER)
+// NVHPC ucontext fiber: the body becomes a lambda wrapped in a per-call fiber.
 #  define CLIO_TASK_BODY_BEGIN return clio::run::detail::make_task_fiber([=, &rctx]() mutable {
 #  define CLIO_TASK_BODY_END   });
 #  define CLIO_CO_AWAIT(expr)  clio::run::detail::fiber_co_await((expr), rctx)
@@ -1352,6 +1493,21 @@ inline clio::run::TaskResume make_task_fiber(F&& fn) {
 // fiber stack is freed. fiber_trampoline handles the final swapcontext back
 // to the worker after the lambda returns.
 #  define CLIO_CO_RETURN       return
+#elif defined(CLIO_ENABLE_BOOST_COROUTINES)
+// Boost.Context: the worker runs the whole method natively on one fiber stack
+// (issue #620). The body is NOT wrapped in a lambda, so begin/end are empty,
+// references/locals behave like ordinary C++, awaits suspend the fiber, and a
+// method returns a (trivial) TaskResume by value.
+#  define CLIO_TASK_BODY_BEGIN
+#  define CLIO_TASK_BODY_END
+#  define CLIO_CO_AWAIT(expr)  clio::run::detail::boost_await((expr), rctx)
+#  define CLIO_CO_RETURN       return clio::run::TaskResume{}
+#else
+// C++20 stackless coroutines.
+#  define CLIO_TASK_BODY_BEGIN
+#  define CLIO_TASK_BODY_END
+#  define CLIO_CO_AWAIT(expr)  co_await (expr)
+#  define CLIO_CO_RETURN       co_return
 #endif
 // Backward-compat aliases (clio_run rebrand). External code that still
 // uses the legacy CHI_* spelling keeps working unchanged.

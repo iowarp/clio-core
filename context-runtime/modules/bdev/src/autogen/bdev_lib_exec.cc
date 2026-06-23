@@ -85,7 +85,7 @@ clio::run::TaskResume Runtime::Run(clio::run::u32 method, ctp::ipc::FullPtr<clio
     case Method::kUpdate: {
       // Cast task FullPtr to specific type
       ctp::ipc::FullPtr<UpdateTask> typed_task = task_ptr.template Cast<UpdateTask>();
-      co_await Update(typed_task, rctx);
+      CLIO_CO_AWAIT(Update(typed_task, rctx));
       break;
     }
     default: {

@@ -127,6 +127,7 @@ option(CLIO_CORE_ENABLE_CEREAL "Enable serialization using cereal" ON)
 option(CLIO_CTE_ENABLE_COMPRESS "Enable compression support (builds compressor chimod and tests)" OFF)
 option(CLIO_CORE_ENABLE_ENCRYPT "Enable encryption" OFF)
 option(CLIO_CORE_ENABLE_IO_URING "Enable io_uring async I/O backend (Linux 5.1+, requires liburing)" OFF)
+option(CLIO_CORE_ENABLE_BOOST_COROUTINES "Use Boost.Context stackful coroutines for task execution instead of C++20 stackless coroutines (issue #620). Opt-in; reuses fiber stacks to avoid the per-task heap frame the stackless backend allocates." OFF)
 
 # Set internal compression flags from CLIO_CTE_ENABLE_COMPRESS
 if(CLIO_CTE_ENABLE_COMPRESS)
@@ -849,6 +850,20 @@ elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
   else()
     message(STATUS "Clang ${CMAKE_CXX_COMPILER_VERSION} detected - C++20 coroutines enabled natively")
   endif()
+endif()
+
+# Boost.Context stackful coroutine backend (issue #620). Opt-in alternative to
+# the C++20 stackless coroutines above. Selected globally (the coroutine return
+# type / macros are header-driven, so the whole program must agree) and links
+# Boost::context into every target via the runtime's public interface.
+if(CLIO_CORE_ENABLE_BOOST_COROUTINES)
+  find_package(Boost REQUIRED COMPONENTS context)
+  add_compile_definitions(CLIO_ENABLE_BOOST_COROUTINES=1)
+  # make_task_fiber() (boost::context::fiber) is header-instantiated in every
+  # module's task methods, so every target must link Boost::context. This block
+  # runs before any add_subdirectory(), so link_libraries() reaches them all.
+  link_libraries(Boost::context)
+  message(STATUS "Boost stackful coroutine backend ENABLED (Boost::context ${Boost_VERSION})")
 endif()
 
 # Export compile commands for IDE integration - Applied to all subdirectories

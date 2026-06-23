@@ -68,7 +68,7 @@ clio::run::TaskResume Runtime::Monitor(ctp::ipc::FullPtr<MonitorTask> task,
 }
 
 clio::run::TaskResume Runtime::Create(ctp::ipc::FullPtr<CreateTask> task, clio::run::RunContext& ctx) {
-#ifdef __NVCOMPILER
+#ifdef CLIO_USE_FIBER_BACKEND
   clio::run::RunContext& rctx = ctx;
 #else
   (void)ctx;
@@ -154,8 +154,10 @@ static const LabelMatch *FindLabelMatch(
 
 clio::run::TaskResume Runtime::PutBlob(ctp::ipc::FullPtr<PutBlobTask> task,
                                  clio::run::RunContext &ctx) {
-#ifndef __NVCOMPILER
+#ifndef CLIO_USE_FIBER_BACKEND
   (void)ctx;
+#else
+  clio::run::RunContext& rctx = ctx;  // fiber macro captures &rctx
 #endif
   CLIO_TASK_BODY_BEGIN
   if (!cte_client_) {
@@ -304,8 +306,10 @@ clio::run::TaskResume Runtime::PutBlob(ctp::ipc::FullPtr<PutBlobTask> task,
 
 clio::run::TaskResume Runtime::GetBlob(ctp::ipc::FullPtr<GetBlobTask> task,
                                  clio::run::RunContext &ctx) {
-#ifndef __NVCOMPILER
+#ifndef CLIO_USE_FIBER_BACKEND
   (void)ctx;
+#else
+  clio::run::RunContext& rctx = ctx;  // fiber macro captures &rctx
 #endif
   CLIO_TASK_BODY_BEGIN
   if (!cte_client_) {
@@ -322,8 +326,10 @@ clio::run::TaskResume Runtime::GetBlob(ctp::ipc::FullPtr<GetBlobTask> task,
 
 clio::run::TaskResume Runtime::GetOrCreateTag(
     ctp::ipc::FullPtr<GetOrCreateTagTask> task, clio::run::RunContext &ctx) {
-#ifndef __NVCOMPILER
+#ifndef CLIO_USE_FIBER_BACKEND
   (void)ctx;
+#else
+  clio::run::RunContext& rctx = ctx;  // fiber macro captures &rctx
 #endif
   CLIO_TASK_BODY_BEGIN
   if (!cte_client_) {
@@ -349,8 +355,10 @@ clio::run::TaskResume Runtime::GetOrCreateTag(
 
 clio::run::TaskResume Runtime::SemanticSearch(
     ctp::ipc::FullPtr<SemanticSearchTask> task, clio::run::RunContext &ctx) {
-#ifndef __NVCOMPILER
+#ifndef CLIO_USE_FIBER_BACKEND
   (void)ctx;
+#else
+  clio::run::RunContext& rctx = ctx;  // fiber macro captures &rctx
 #endif
   CLIO_TASK_BODY_BEGIN
   if (!cte_client_) {
@@ -378,7 +386,7 @@ clio::run::u64 Runtime::GetWorkRemaining() const {
 
 clio::run::TaskResume Runtime::ParseOmni(ctp::ipc::FullPtr<ParseOmniTask> task,
                                    clio::run::RunContext& ctx) {
-#ifdef __NVCOMPILER
+#ifdef CLIO_USE_FIBER_BACKEND
   clio::run::RunContext& rctx = ctx;
 #else
   (void)ctx;
@@ -461,7 +469,7 @@ clio::run::TaskResume Runtime::ParseOmni(ctp::ipc::FullPtr<ParseOmniTask> task,
 
 clio::run::TaskResume Runtime::ProcessHdf5Dataset(
     ctp::ipc::FullPtr<ProcessHdf5DatasetTask> task, clio::run::RunContext& ctx) {
-#ifdef __NVCOMPILER
+#ifdef CLIO_USE_FIBER_BACKEND
   clio::run::RunContext& rctx = ctx;
 #else
   (void)ctx;
@@ -516,7 +524,7 @@ clio::run::TaskResume Runtime::ProcessHdf5Dataset(
 
 clio::run::TaskResume Runtime::ExportData(ctp::ipc::FullPtr<ExportDataTask> task,
                                     clio::run::RunContext& ctx) {
-#ifdef __NVCOMPILER
+#ifdef CLIO_USE_FIBER_BACKEND
   clio::run::RunContext& rctx = ctx;
 #else
   (void)ctx;

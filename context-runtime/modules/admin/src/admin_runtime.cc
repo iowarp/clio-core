@@ -615,6 +615,7 @@ clio::run::TaskResume Runtime::ClientConnect(ctp::ipc::FullPtr<ClientConnectTask
  */
 clio::run::TaskResume Runtime::ClientRecv(ctp::ipc::FullPtr<ClientRecvTask> task,
                                     clio::run::RunContext &rctx) {
+  CLIO_TASK_BODY_BEGIN
   clio::run::u32 tasks_received = 0;
   bool did_work = clio::run::IpcCpu2CpuZmq::RuntimeRecv(CLIO_IPC, tasks_received);
   task->tasks_received_ = tasks_received;
@@ -631,6 +632,7 @@ clio::run::TaskResume Runtime::ClientRecv(ctp::ipc::FullPtr<ClientRecvTask> task
  */
 clio::run::TaskResume Runtime::ClientSend(ctp::ipc::FullPtr<ClientSendTask> task,
                                     clio::run::RunContext &rctx) {
+  CLIO_TASK_BODY_BEGIN
   static std::vector<ctp::ipc::FullPtr<clio::run::Task>> deferred_deletes;
   clio::run::u32 tasks_sent = 0;
   bool did_work = clio::run::IpcCpu2CpuZmq::RuntimeSend(
@@ -791,7 +793,7 @@ void Runtime::MonitorContainerStats(ctp::ipc::FullPtr<MonitorTask> task) {
 }
 
 clio::run::TaskResume Runtime::MonitorPoolStats(ctp::ipc::FullPtr<MonitorTask> task) {
-#ifdef __NVCOMPILER
+#ifdef CLIO_USE_FIBER_BACKEND
   clio::run::RunContext _dummy_rctx;
   clio::run::RunContext& rctx = _dummy_rctx;
 #endif
@@ -1023,7 +1025,7 @@ clio::run::TaskResume Runtime::AnnounceShutdown(
 }
 
 clio::run::TaskResume Runtime::MonitorBdevStats(ctp::ipc::FullPtr<MonitorTask> task) {
-#ifdef __NVCOMPILER
+#ifdef CLIO_USE_FIBER_BACKEND
   clio::run::RunContext _dummy_rctx;
   clio::run::RunContext& rctx = _dummy_rctx;
 #endif
@@ -1869,7 +1871,7 @@ std::vector<clio::run::RecoveryAssignment> Runtime::ComputeRecoveryPlan(
 }
 
 clio::run::TaskResume Runtime::TriggerRecovery(clio::run::u64 dead_node_id) {
-#ifdef __NVCOMPILER
+#ifdef CLIO_USE_FIBER_BACKEND
   clio::run::RunContext _dummy_rctx;
   clio::run::RunContext& rctx = _dummy_rctx;
 #endif
@@ -2000,6 +2002,7 @@ clio::run::TaskResume Runtime::SystemMonitor(ctp::ipc::FullPtr<SystemMonitorTask
 
 clio::run::TaskResume Runtime::RegisterGpuContainer(
     ctp::ipc::FullPtr<RegisterGpuContainerTask> task, clio::run::RunContext &rctx) {
+  CLIO_TASK_BODY_BEGIN
   // This task is handled on the CPU side.
   // The GPU orchestrator's gpu::PoolManager is updated via a GPU kernel launch,
   // not directly from the admin runtime. The pool_manager.cc CreatePool
@@ -2008,7 +2011,8 @@ clio::run::TaskResume Runtime::RegisterGpuContainer(
   HLOG(kDebug, "RegisterGpuContainer: pool_id={}, container_id={}",
        task->target_pool_id_, task->container_id_);
   rctx.did_work_ = true;
-  co_return;
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
 }
 
 //===========================================================================

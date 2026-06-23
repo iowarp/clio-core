@@ -284,12 +284,14 @@ clio::run::TaskResume Runtime::GpuSubmit(ctp::ipc::FullPtr<GpuSubmitTask> task,
 
 clio::run::TaskResume Runtime::SubtaskTest(ctp::ipc::FullPtr<SubtaskTestTask> task,
                                      clio::run::RunContext &rctx) {
+  CLIO_TASK_BODY_BEGIN
   HLOG(kDebug, "MOD_NAME: Executing SubtaskTest task with test_value={}",
        task->test_value_);
   task->result_value_ = task->test_value_ + 1;
   task->return_code_ = 0;
   (void)rctx;
-  co_return;
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
 }
 
 clio::run::TaskResume Runtime::Monitor(ctp::ipc::FullPtr<MonitorTask> task,

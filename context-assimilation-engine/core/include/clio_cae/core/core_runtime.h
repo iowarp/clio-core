@@ -99,7 +99,7 @@ class Runtime : public clio::run::Container {
   clio::run::TaskResume Destroy(ctp::ipc::FullPtr<DestroyTask> task, clio::run::RunContext& ctx) {
     HLOG(kInfo, "Core container destroyed for pool: {} (ID: {})",
           pool_name_, pool_id_);
-#ifdef __NVCOMPILER
+#ifdef CLIO_USE_FIBER_BACKEND
     clio::run::RunContext& rctx = ctx;
 #endif
     CLIO_TASK_BODY_BEGIN

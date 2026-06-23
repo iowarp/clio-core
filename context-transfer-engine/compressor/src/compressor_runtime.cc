@@ -90,6 +90,12 @@ static_assert(sizeof(CompressionHeader) == 24,
 
 clio::run::TaskResume Runtime::Create(ctp::ipc::FullPtr<CreateTask> task,
                                 clio::run::RunContext& ctx) {
+#ifdef CLIO_USE_FIBER_BACKEND
+  clio::run::RunContext& rctx = ctx;  // fiber macro captures &rctx
+#else
+  (void)ctx;
+#endif
+  CLIO_TASK_BODY_BEGIN
   // Load configuration from compose YAML (or direct CreateParams)
   config_ = task->GetParams();
 
@@ -192,10 +198,17 @@ clio::run::TaskResume Runtime::Create(ctp::ipc::FullPtr<CreateTask> task,
   client_.AsyncPollConsumers(clio::run::PoolQuery::Local(), 5000000);
 
   CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
 }
 
 clio::run::TaskResume Runtime::Destroy(ctp::ipc::FullPtr<DestroyTask> task,
                                  clio::run::RunContext& ctx) {
+#ifdef CLIO_USE_FIBER_BACKEND
+  clio::run::RunContext& rctx = ctx;  // fiber macro captures &rctx
+#else
+  (void)ctx;
+#endif
+  CLIO_TASK_BODY_BEGIN
   try {
     // Reset predictors
     qtable_predictor_.reset();
@@ -214,6 +227,7 @@ clio::run::TaskResume Runtime::Destroy(ctp::ipc::FullPtr<DestroyTask> task,
     HLOG(kError, "Exception during compressor destroy: {}", e.what());
   }
   CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
 }
 
 clio::run::PoolQuery Runtime::ScheduleTask(const ctp::ipc::FullPtr<clio::run::Task> &task) {
@@ -240,7 +254,7 @@ clio::run::PoolQuery Runtime::ScheduleTask(const ctp::ipc::FullPtr<clio::run::Ta
 
 clio::run::TaskResume Runtime::Monitor(ctp::ipc::FullPtr<MonitorTask> task,
                                  clio::run::RunContext &ctx) {
-#ifdef __NVCOMPILER
+#ifdef CLIO_USE_FIBER_BACKEND
   clio::run::RunContext& rctx = ctx;
 #else
   (void)ctx;
@@ -556,6 +570,12 @@ static void WriteTraceLog(const std::string& trace_folder,
 
 clio::run::TaskResume Runtime::DynamicSchedule(
     ctp::ipc::FullPtr<DynamicScheduleTask> task, clio::run::RunContext& ctx) {
+#ifdef CLIO_USE_FIBER_BACKEND
+  clio::run::RunContext& rctx = ctx;  // fiber macro captures &rctx
+#else
+  (void)ctx;
+#endif
+  CLIO_TASK_BODY_BEGIN
   try {
     // Extract task parameters (same as PutBlobTask)
     clio::run::u64 chunk_size = task->size_;
@@ -645,10 +665,17 @@ clio::run::TaskResume Runtime::DynamicSchedule(
   }
 
   CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
 }
 
 clio::run::TaskResume Runtime::Compress(ctp::ipc::FullPtr<CompressTask> task,
                                   clio::run::RunContext& ctx) {
+#ifdef CLIO_USE_FIBER_BACKEND
+  clio::run::RunContext& rctx = ctx;  // fiber macro captures &rctx
+#else
+  (void)ctx;
+#endif
+  CLIO_TASK_BODY_BEGIN
   try {
     // Extract task parameters (same as PutBlobTask)
     clio::run::u64 input_size = task->size_;
@@ -821,10 +848,17 @@ clio::run::TaskResume Runtime::Compress(ctp::ipc::FullPtr<CompressTask> task,
   }
 
   CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
 }
 
 clio::run::TaskResume Runtime::Decompress(ctp::ipc::FullPtr<DecompressTask> task,
                                     clio::run::RunContext& ctx) {
+#ifdef CLIO_USE_FIBER_BACKEND
+  clio::run::RunContext& rctx = ctx;  // fiber macro captures &rctx
+#else
+  (void)ctx;
+#endif
+  CLIO_TASK_BODY_BEGIN
   try {
     // Record the originating node (the consumer that issued this Decompress)
     // against this specific tag. pool_query_.ret_node_ was stamped by the
@@ -972,6 +1006,7 @@ clio::run::TaskResume Runtime::Decompress(ctp::ipc::FullPtr<DecompressTask> task
   }
 
   CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
 }
 
 void Runtime::LogCompressionTelemetry(const CompressionTelemetry& telemetry) {
@@ -1079,6 +1114,12 @@ bool Runtime::PickConsumerForTag(const clio::cte::core::TagId &tag_id,
 
 clio::run::TaskResume Runtime::PollNodeLoad(ctp::ipc::FullPtr<PollNodeLoadTask> task,
                                       clio::run::RunContext& ctx) {
+#ifdef CLIO_USE_FIBER_BACKEND
+  clio::run::RunContext& rctx = ctx;  // fiber macro captures &rctx
+#else
+  (void)ctx;
+#endif
+  CLIO_TASK_BODY_BEGIN
   (void)ctx;
   NodeLoadSample sample;
   auto* ipc_manager = CLIO_IPC;
@@ -1115,10 +1156,17 @@ clio::run::TaskResume Runtime::PollNodeLoad(ctp::ipc::FullPtr<PollNodeLoadTask> 
   task->sample_ = sample;
   task->SetReturnCode(0);
   CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
 }
 
 clio::run::TaskResume Runtime::PollConsumers(ctp::ipc::FullPtr<PollConsumersTask> task,
                                        clio::run::RunContext& ctx) {
+#ifdef CLIO_USE_FIBER_BACKEND
+  clio::run::RunContext& rctx = ctx;  // fiber macro captures &rctx
+#else
+  (void)ctx;
+#endif
+  CLIO_TASK_BODY_BEGIN
   (void)task;
   (void)ctx;
   // No-op when tracking is disabled.
@@ -1171,6 +1219,7 @@ clio::run::TaskResume Runtime::PollConsumers(ctp::ipc::FullPtr<PollConsumersTask
   }
 
   CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
 }
 
 }  // namespace clio::cte::compressor

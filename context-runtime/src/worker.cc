@@ -40,7 +40,10 @@
 
 #include "clio_runtime/worker.h"
 
-#ifndef __NVCOMPILER
+// <coroutine> only for the C++20 stackless backend (not NVHPC, not Boost
+// stackful). CLIO_USE_FIBER_BACKEND is defined by task.h (included below), so
+// spell the condition out here in terms of its inputs.
+#if !defined(__NVCOMPILER) && !defined(CLIO_ENABLE_BOOST_COROUTINES)
 #include <coroutine>
 #endif
 #include <cerrno>
@@ -73,7 +76,7 @@ namespace clio::run {
 // using FiberHandle::done().
 namespace {
 inline bool CoroCompleted(const RunContext *run_ctx) {
-#ifndef __NVCOMPILER
+#ifndef CLIO_USE_FIBER_BACKEND
   return run_ctx->coro_completed_.load(std::memory_order_acquire);
 #else
   return run_ctx->coro_handle_ && run_ctx->coro_handle_.done();
@@ -777,10 +780,35 @@ void Worker::StartCoroutine(const FullPtr<Task> &task_ptr,
 
   // Call the container's Run function which returns a TaskResume coroutine/fiber
   try {
+#if defined(CLIO_ENABLE_BOOST_COROUTINES)
+    // Boost.Context path (issue #620): the worker owns one fiber per task whose
+    // entry runs Container::Run natively on the fiber stack. The whole task —
+    // including nested helper coroutines, which run inline — executes as
+    // ordinary C++ (no lambda capture of task parameters), so reference
+    // parameters and locals behave exactly as in the C++20 stackless backend.
+    {
+      auto method = task_ptr->method_;
+      Container *cont = container;
+      FullPtr<Task> tp = task_ptr;
+      RunContext *rc = run_ctx;
+      run_ctx->coro_completed_.store(false, std::memory_order_relaxed);
+      run_ctx->coro_handle_ =
+          clio::run::detail::make_task_fiber(
+              [cont, method, tp, rc]() { cont->Run(method, tp, *rc); })
+              .release();
+      if (run_ctx->coro_handle_) {
+        run_ctx->coro_handle_.resume();
+        if (run_ctx->coro_handle_.done()) {
+          run_ctx->coro_handle_.destroy();
+          run_ctx->coro_handle_ = clio::run::detail::FiberHandle{};
+        }
+      }
+    }
+#else
     TaskResume task_resume =
         container->Run(task_ptr->method_, task_ptr, *run_ctx);
 
-#ifndef __NVCOMPILER
+#ifndef CLIO_USE_FIBER_BACKEND
     // Standard C++20 coroutine path
     auto handle = task_resume.release();
     run_ctx->coro_handle_ = handle;
@@ -831,12 +859,13 @@ void Worker::StartCoroutine(const FullPtr<Task> &task_ptr,
       }
     }
 #endif // __NVCOMPILER
+#endif // CLIO_ENABLE_BOOST_COROUTINES vs others
   } catch (const std::exception &e) {
     HLOG(kError, "Task execution failed: {}", e.what());
     // Clean up handle on exception
     if (run_ctx->coro_handle_) {
       run_ctx->coro_handle_.destroy();
-#ifndef __NVCOMPILER
+#ifndef CLIO_USE_FIBER_BACKEND
       run_ctx->coro_handle_ = nullptr;
 #else
       run_ctx->coro_handle_ = clio::run::detail::FiberHandle{};
@@ -847,7 +876,7 @@ void Worker::StartCoroutine(const FullPtr<Task> &task_ptr,
     // Clean up handle on exception
     if (run_ctx->coro_handle_) {
       run_ctx->coro_handle_.destroy();
-#ifndef __NVCOMPILER
+#ifndef CLIO_USE_FIBER_BACKEND
       run_ctx->coro_handle_ = nullptr;
 #else
       run_ctx->coro_handle_ = clio::run::detail::FiberHandle{};
@@ -889,7 +918,7 @@ void Worker::ResumeCoroutine(const FullPtr<Task> &task_ptr,
     if (CoroCompleted(run_ctx)) {
       // Completed - clean up
       run_ctx->coro_handle_.destroy();
-#ifndef __NVCOMPILER
+#ifndef CLIO_USE_FIBER_BACKEND
       run_ctx->coro_handle_ = nullptr;
 #else
       run_ctx->coro_handle_ = clio::run::detail::FiberHandle{};
@@ -900,7 +929,7 @@ void Worker::ResumeCoroutine(const FullPtr<Task> &task_ptr,
     // Clean up handle on exception
     if (run_ctx->coro_handle_) {
       run_ctx->coro_handle_.destroy();
-#ifndef __NVCOMPILER
+#ifndef CLIO_USE_FIBER_BACKEND
       run_ctx->coro_handle_ = nullptr;
 #else
       run_ctx->coro_handle_ = clio::run::detail::FiberHandle{};
@@ -911,7 +940,7 @@ void Worker::ResumeCoroutine(const FullPtr<Task> &task_ptr,
     // Clean up handle on exception
     if (run_ctx->coro_handle_) {
       run_ctx->coro_handle_.destroy();
-#ifndef __NVCOMPILER
+#ifndef CLIO_USE_FIBER_BACKEND
       run_ctx->coro_handle_ = nullptr;
 #else
       run_ctx->coro_handle_ = clio::run::detail::FiberHandle{};

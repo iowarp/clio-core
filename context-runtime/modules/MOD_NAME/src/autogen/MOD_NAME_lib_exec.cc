@@ -97,7 +97,7 @@ clio::run::TaskResume Runtime::Run(clio::run::u32 method, ctp::ipc::FullPtr<clio
     case Method::kSubtaskTest: {
       // Cast task FullPtr to specific type
       ctp::ipc::FullPtr<SubtaskTestTask> typed_task = task_ptr.template Cast<SubtaskTestTask>();
-      co_await SubtaskTest(typed_task, rctx);
+      CLIO_CO_AWAIT(SubtaskTest(typed_task, rctx));
       break;
     }
     default: {

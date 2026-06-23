@@ -187,13 +187,13 @@ clio::run::TaskResume Runtime::Run(clio::run::u32 method, ctp::ipc::FullPtr<clio
     case Method::kRegisterGpuContainer: {
       // Cast task FullPtr to specific type
       ctp::ipc::FullPtr<RegisterGpuContainerTask> typed_task = task_ptr.template Cast<RegisterGpuContainerTask>();
-      co_await RegisterGpuContainer(typed_task, rctx);
+      CLIO_CO_AWAIT(RegisterGpuContainer(typed_task, rctx));
       break;
     }
     case Method::kListContainers: {
       // Cast task FullPtr to specific type
       ctp::ipc::FullPtr<ListContainersTask> typed_task = task_ptr.template Cast<ListContainersTask>();
-      co_await ListContainers(typed_task, rctx);
+      CLIO_CO_AWAIT(ListContainers(typed_task, rctx));
       break;
     }
     default: {

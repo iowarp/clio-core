@@ -339,19 +339,21 @@ class ChiModGenerator {
     }
 
     oss << "clio::run::TaskResume Runtime::Run(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> task_ptr, clio::run::RunContext& rctx) {\n";
+    // CLIO_TASK_BODY_BEGIN/END + CLIO_CO_AWAIT/CLIO_CO_RETURN abstract over the
+    // C++20 stackless and the stackful (NVHPC/Boost) coroutine backends so the
+    // generated dispatcher compiles under whichever is selected.
+    oss << "  CLIO_TASK_BODY_BEGIN\n";
     oss << "  switch (method) {\n";
 
-    // Add Run switch cases for each method
-    // All method calls use co_await since Run is a coroutine and methods
-    // may return TaskResume (coroutines). Methods returning void are wrapped
-    // to be awaitable. This ensures coroutines actually execute rather than
-    // being discarded when the return value is ignored.
+    // Add Run switch cases for each method. Every method call is awaited so
+    // coroutines actually execute rather than being discarded when the return
+    // value is ignored.
     for (const auto& method : methods) {
       std::string task_type = GetTaskTypeName(method.method_name, chimod_name);
       oss << "    case Method::" << method.constant_name << ": {\n";
       oss << "      // Cast task FullPtr to specific type\n";
       oss << "      ctp::ipc::FullPtr<" << task_type << "> typed_task = task_ptr.template Cast<" << task_type << ">();\n";
-      oss << "      co_await " << method.method_name << "(typed_task, rctx);\n";
+      oss << "      CLIO_CO_AWAIT(" << method.method_name << "(typed_task, rctx));\n";
       oss << "      break;\n";
       oss << "    }\n";
     }
@@ -361,8 +363,8 @@ class ChiModGenerator {
     oss << "      break;\n";
     oss << "    }\n";
     oss << "  }\n";
-    oss << "  // co_return makes this a coroutine returning TaskResume\n";
-    oss << "  co_return;\n";
+    oss << "  CLIO_CO_RETURN;\n";
+    oss << "  CLIO_TASK_BODY_END\n";
     oss << "}\n";
     oss << "\n";
     oss << "void Runtime::SaveTask(clio::run::u32 method, clio::run::SaveTaskArchive& archive, \n";

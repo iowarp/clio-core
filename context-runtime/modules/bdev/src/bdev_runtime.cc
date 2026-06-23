@@ -54,7 +54,7 @@ size_t Runtime::GetWorkerID(clio::run::RunContext &ctx) {
 }
 
 clio::run::TaskResume Runtime::Create(ctp::ipc::FullPtr<CreateTask> task, clio::run::RunContext &ctx) {
-#ifdef __NVCOMPILER
+#ifdef CLIO_USE_FIBER_BACKEND
   clio::run::RunContext& rctx = ctx;
 #else
   (void)ctx;
@@ -191,13 +191,19 @@ clio::run::TaskResume Runtime::Read(ctp::ipc::FullPtr<ReadTask> task, clio::run:
 }
 
 clio::run::TaskResume Runtime::Update(ctp::ipc::FullPtr<UpdateTask> task, clio::run::RunContext &ctx) {
-  task->return_code_ = 0;
+#ifdef CLIO_USE_FIBER_BACKEND
+  clio::run::RunContext& rctx = ctx;  // fiber macro captures &rctx
+#else
   (void)ctx;
-  co_return;
+#endif
+  CLIO_TASK_BODY_BEGIN
+  task->return_code_ = 0;
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
 }
 
 clio::run::TaskResume Runtime::GetStats(ctp::ipc::FullPtr<GetStatsTask> task, clio::run::RunContext &ctx) {
-#ifdef __NVCOMPILER
+#ifdef CLIO_USE_FIBER_BACKEND
   clio::run::RunContext& rctx = ctx;
 #else
   (void)ctx;
@@ -235,7 +241,7 @@ clio::run::TaskResume Runtime::GetStats(ctp::ipc::FullPtr<GetStatsTask> task, cl
 }
 
 clio::run::TaskResume Runtime::Destroy(ctp::ipc::FullPtr<DestroyTask> task, clio::run::RunContext &ctx) {
-#ifdef __NVCOMPILER
+#ifdef CLIO_USE_FIBER_BACKEND
   clio::run::RunContext& rctx = ctx;
 #else
   (void)ctx;

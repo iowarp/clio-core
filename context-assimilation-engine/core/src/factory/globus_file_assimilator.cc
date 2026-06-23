@@ -60,7 +60,7 @@ GlobusFileAssimilator::GlobusFileAssimilator(
 
 clio::run::TaskResume GlobusFileAssimilator::Schedule(const AssimilationCtx& ctx,
                                                 int& error_code) {
-#ifdef __NVCOMPILER
+#ifdef CLIO_USE_FIBER_BACKEND
   thread_local clio::run::RunContext _fb_rctx;
   clio::run::RunContext* _fp = clio::run::GetCurrentRunContextFromWorker();
   clio::run::RunContext& rctx = _fp ? *_fp : _fb_rctx;
