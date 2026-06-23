@@ -83,6 +83,11 @@ jobs:
               export LD_LIBRARY_PATH=/usr/local/lib:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
               export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/lib/x86_64-linux-gnu/pkgconfig:$PKG_CONFIG_PATH
               git config --global --add safe.directory /workspace
+              # The deps-cpu image ships no FUSE3, so the adapter build below
+              # (CLIO_CTE_ENABLE_FUSE_ADAPTER=ON) would FATAL_ERROR without it.
+              # The cte-xfstests image that runs the FUSE test already carries
+              # the matching libfuse3.so.3 runtime + fusermount3.
+              apt-get update -qq && apt-get install -y -qq libfuse3-dev
               # DOCKER_CI=ON builds the integration test binaries
               # (clio_run_{leader_elect,reconnect,recovery}_tests) the suites
               # below docker-exec; the release preset leaves it OFF, so without
