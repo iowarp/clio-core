@@ -128,13 +128,19 @@ class _ProducerConsumerAllocator : public Allocator {
   ctp::Mutex lock_;            /**< Mutex protecting global allocator */
   ThreadLocalKey tblock_key_;   /**< TLS key for PcThreadBlock* */
   size_t thread_unit_;          /**< Default PcThreadBlock expansion size */
+  /** Outstanding (allocated-but-not-freed) user bytes. Only updated under
+   *  CTP_ALLOC_TRACK_SIZE so leak builds can observe runtime buffer leaks;
+   *  a cheap, exact no-op otherwise. Lives in the shared header so a consumer
+   *  process that frees decrements the same counter the producer incremented. */
+  ctp::ipc::atomic<ctp::big_uint> total_alloc_;
   BuddyAllocator alloc_;        /**< Global buddy allocator */
 
  public:
   /**
    * Default constructor
    */
-  _ProducerConsumerAllocator() : tid_count_(0), thread_unit_(0) {}
+  _ProducerConsumerAllocator()
+      : tid_count_(0), thread_unit_(0), total_alloc_(0) {}
 
   /**
    * Initialize the allocator with a new memory region.
@@ -154,6 +160,7 @@ class _ProducerConsumerAllocator : public Allocator {
     region_size_ = region_size;
 
     tid_count_ = 0;
+    total_alloc_ = 0;
     lock_.Init();
 
     // Set up TLS key
@@ -235,6 +242,44 @@ class _ProducerConsumerAllocator : public Allocator {
   }
 
   /**
+   * Data-portion size of the BuddyPage backing an allocation, masking off the
+   * free flag. The offset points at user data; the page header precedes it.
+   */
+  CTP_INLINE_CROSS_FUN
+  size_t PageSizeOf(OffsetPtr<> p) {
+    auto *page = reinterpret_cast<BuddyPage<> *>(
+        GetBackendData() + p.load() - sizeof(BuddyPage<>));
+    return page->GetSize();
+  }
+
+  /** Record \a size bytes as outstanding (leak builds only; else no-op). */
+  CTP_INLINE_CROSS_FUN
+  void AddSize(ctp::big_uint size) {
+#ifdef CTP_ALLOC_TRACK_SIZE
+    total_alloc_ += size;
+#endif
+  }
+
+  /** Drop \a size bytes from the outstanding count (leak builds only). */
+  CTP_INLINE_CROSS_FUN
+  void SubSize(ctp::big_uint size) {
+#ifdef CTP_ALLOC_TRACK_SIZE
+    total_alloc_ -= size;
+#endif
+  }
+
+  /**
+   * Outstanding allocated-but-not-freed bytes. Returns 0 unless built with
+   * CTP_ALLOC_TRACK_SIZE. Lets the runtime leak detector observe buffers
+   * allocated here (the runtime's AllocateBuffer path), which no longer flow
+   * through CTP_MALLOC.
+   */
+  CTP_INLINE_CROSS_FUN
+  size_t GetCurrentlyAllocatedSize() {
+    return static_cast<size_t>(total_alloc_.load());
+  }
+
+  /**
    * Allocate memory from the producer-consumer allocator.
    *
    * Implements a 2-tier fallback strategy:
@@ -255,7 +300,13 @@ class _ProducerConsumerAllocator : public Allocator {
     // Route all alloc/free through the global buddy allocator under
     // lock_ so alloc and free hit the same data structure.
     ScopedMutex scoped_lock(lock_, 0);
-    return alloc_.AllocateOffset(size);
+    OffsetPtr<> ret = alloc_.AllocateOffset(size);
+#ifdef CTP_ALLOC_TRACK_SIZE
+    if (!ret.IsNull()) {
+      AddSize(PageSizeOf(ret));
+    }
+#endif
+    return ret;
   }
 
   /**
@@ -284,6 +335,12 @@ class _ProducerConsumerAllocator : public Allocator {
     // Route to the global allocator under lock_ — see AllocateOffset for
     // the cross-process per-tblock corruption that this avoids.
     ScopedMutex scoped_lock(lock_, 0);
+#ifdef CTP_ALLOC_TRACK_SIZE
+    // Read the page size before freeing — the page may be coalesced/reused
+    // by FreeOffset. Uses the same BuddyPage size AddSize recorded, so a
+    // balanced alloc/free nets exactly to zero.
+    SubSize(PageSizeOf(p));
+#endif
     alloc_.FreeOffset(p);
   }
 

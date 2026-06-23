@@ -1703,8 +1703,8 @@ const Host &IpcManager::GetThisHost() const { return this_host_; }
 
 size_t IpcManager::GetRuntimeHeapAllocatedBytes() const {
 #if CTP_IS_HOST
-  // CTP_MALLOC is the private heap backing AllocateBuffer/NewObj in runtime
-  // (and client ZMQ) mode. GetCurrentlyAllocatedSize() returns 0 unless built
+  // CTP_MALLOC is the private heap backing NewObj and the client-ZMQ
+  // AllocateBuffer path. GetCurrentlyAllocatedSize() returns 0 unless built
   // with CTP_ALLOC_TRACK_SIZE (CLIO_CORE_ENABLE_LEAK_CHECK).
   size_t total = CTP_MALLOC->GetCurrentlyAllocatedSize();
 #if defined(CTP_ALLOC_TRACK_SIZE)
@@ -1715,6 +1715,17 @@ size_t IpcManager::GetRuntimeHeapAllocatedBytes() const {
   long long task_bytes = RuntimeTaskAllocBytes().load();
   if (task_bytes > 0) {
     total += static_cast<size_t>(task_bytes);
+  }
+  // The runtime's AllocateBuffer draws from the per-process SHM
+  // MultiProcessAllocator segments (not CTP_MALLOC), so add their outstanding
+  // bytes too — otherwise a leaked runtime buffer is invisible here.
+  {
+    std::lock_guard<std::mutex> lock(shm_mutex_);
+    for (auto *alloc : alloc_vector_) {
+      if (alloc != nullptr) {
+        total += alloc->GetCurrentlyAllocatedSize();
+      }
+    }
   }
 #endif
   return total;
