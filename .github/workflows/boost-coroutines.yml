@@ -144,7 +144,7 @@ jobs:
             -DVCPKG_MANIFEST_DIR="${{ github.workspace }}/installers/vcpkg" `
             -DVCPKG_MANIFEST_FEATURES="boost-coroutines" `
             -DVCPKG_OVERLAY_PORTS="${{ github.workspace }}/installers/vcpkg/overlay-ports" `
-            -DCMAKE_BUILD_TYPE=Debug `
+            -DCMAKE_BUILD_TYPE=Release `
             -DCLIO_CORE_ENABLE_BOOST_COROUTINES=ON `
             -DCLIO_CORE_ENABLE_RUNTIME=ON `
             -DCLIO_CORE_ENABLE_CTE=ON `
@@ -164,6 +164,6 @@ jobs:
             -DCMAKE_EXPORT_COMPILE_COMMANDS=ON `
             -DCLIO_CTP_LOG_LEVEL=0
       - name: Build
-        run: cmake --build build-boost --config Debug -j $env:NUMBER_OF_PROCESSORS
+        run: cmake --build build-boost --config Release -j $env:NUMBER_OF_PROCESSORS
       - name: Run tests
-        run: ctest --test-dir build-boost --build-config Debug --output-on-failure --timeout 180 --repeat until-pass:3 -LE ollama
+        run: ctest --test-dir build-boost --build-config Release --output-on-failure --timeout 180 --repeat until-pass:3 -LE ollama
