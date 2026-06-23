@@ -151,7 +151,11 @@ namespace clio::run::detail {
 // ============================================================================
 #elif defined(CLIO_ENABLE_BOOST_COROUTINES)
 #include <boost/context/fiber.hpp>
-#include <boost/context/protected_fixedsize_stack.hpp>
+// Use fixedsize_stack (plain malloc), NOT protected_fixedsize_stack: the latter
+// pulls in windows.h (VirtualAlloc/VirtualProtect) on Windows, whose macros
+// clash with the IPC headers (error C2760). Stack overflow is mitigated by a
+// generous default size instead of a guard page.
+#include <boost/context/fixedsize_stack.hpp>
 #include <cstdlib>
 #include <functional>
 namespace clio::run::detail {
@@ -159,9 +163,8 @@ namespace clio::run::detail {
   // (KiB). Defaults to 1 MiB: the whole task — incl. nested helper coroutines —
   // runs on this one stack, and Debug builds (large frames, esp. on Windows)
   // plus the DPE/allocation/serialization call chain need well over the 256 KiB
-  // the NVHPC ucontext path uses. Paired with protected_fixedsize_stack so an
-  // overflow faults on a guard page instead of silently corrupting neighbouring
-  // stack data (which manifested as empty allocation results on Windows).
+  // the NVHPC ucontext path uses. (fixedsize_stack has no guard page, so keep
+  // this comfortably above the deepest expected frame.)
   inline size_t boost_stack_size() {
     static const size_t sz = []() -> size_t {
       const char* e = std::getenv("CLIO_BOOST_STACK_SIZE");
@@ -1485,7 +1488,7 @@ inline clio::run::TaskResume make_task_fiber(F&& fn) {
   state->fn = std::make_unique<FiberCallableT<typename std::decay<F>::type>>(std::forward<F>(fn));
   state->task_ = boost::context::fiber{
       std::allocator_arg,
-      boost::context::protected_fixedsize_stack(boost_stack_size()),
+      boost::context::fixedsize_stack(boost_stack_size()),
       [state](boost::context::fiber&& caller) -> boost::context::fiber {
         state->caller_ = std::move(caller);
         try { state->fn->call(); } catch (...) {}
