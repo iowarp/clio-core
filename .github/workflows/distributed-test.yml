@@ -48,6 +48,9 @@ jobs:
     timeout-minutes: 150
     env:
       DEPS_IMAGE: iowarp/deps-cpu:latest
+      # deps-cpu + fuse3, built locally in "Pull dependency images" for the
+      # FUSE test (deps-cpu lacks fusermount3; cte-xfstests isn't published).
+      FUSE_IMAGE: clio-fuse-test:local
       DOCKER_HUB_USERNAME: ${{ secrets.DOCKER_HUB_USERNAME }}
     steps:
       - name: Checkout repository
@@ -67,9 +70,18 @@ jobs:
       - name: Pull dependency images
         run: |
           docker pull "$DEPS_IMAGE"
-          # The FUSE test needs fusermount3, which only the cte-xfstests image
-          # ships. Pull it up front so the FUSE step doesn't pay for it mid-run.
-          docker pull iowarp/cte-xfstests:latest || true
+          # The FUSE test needs fusermount3 + libfuse3, which deps-cpu does not
+          # ship and which the previously-used cte-xfstests image is not
+          # published to a registry CI can pull (manifest unknown). Build a
+          # small fuse-capable image from deps-cpu so the FUSE test runs on the
+          # same glibc/base the clio_cte_fuse binary was built against.
+          docker build -t "$FUSE_IMAGE" - <<'DOCKERFILE'
+          FROM iowarp/deps-cpu:latest
+          USER root
+          RUN apt-get update \
+            && apt-get install -y --no-install-recommends fuse3 libfuse3-dev \
+            && rm -rf /var/lib/apt/lists/*
+          DOCKERFILE
 
       # Build inside the deps-cpu image so the resulting binaries link against
       # the same libraries the runtime node containers provide at runtime.
@@ -156,6 +168,8 @@ jobs:
         if: ${{ !cancelled() }}
         run: |
           export HOST_UID="$(id -u)" HOST_GID="$(id -g)"
+          # Run against the fuse-capable image built in "Pull dependency images".
+          export IOWARP_DOCKER_IMAGE="$FUSE_IMAGE"
           ./context-transfer-engine/test/integration/fuse/run_tests.sh
 
       # The run_tests.sh scripts tear their clusters down on success and
