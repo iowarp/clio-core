@@ -83,8 +83,13 @@ jobs:
               export LD_LIBRARY_PATH=/usr/local/lib:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
               export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/lib/x86_64-linux-gnu/pkgconfig:$PKG_CONFIG_PATH
               git config --global --add safe.directory /workspace
+              # DOCKER_CI=ON builds the integration test binaries
+              # (clio_run_{leader_elect,reconnect,recovery}_tests) the suites
+              # below docker-exec; the release preset leaves it OFF, so without
+              # this every gated suite fails with "command not found".
               cmake --preset release -DCLIO_CORE_ENABLE_PYTHON=OFF \
-                -DCLIO_CTE_ENABLE_FUSE_ADAPTER=ON
+                -DCLIO_CTE_ENABLE_FUSE_ADAPTER=ON \
+                -DCLIO_CORE_ENABLE_DOCKER_CI=ON
               cmake --build build -j"$(nproc)"
               # Hand ownership back to the runner so post-job cleanup and the
               # test clusters (which run as the runner uid) can access build/.

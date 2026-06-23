@@ -397,7 +397,7 @@ bool IpcManager::ServerInit() {
     HLOG(kError, "Warning: Could not identify host, using default node ID");
     this_host_ = Host();  // Default constructor gives node_id = 0
   } else {
-    HLOG(kDebug, "Node ID identified: 0x{:x}", this_host_.node_id);
+    HLOG(kDebug, "Node ID identified: {}", this_host_.node_id);
   }
 
   // Initialize CTP TLS key for task counter (needed for CreateTaskId in
@@ -1115,7 +1115,7 @@ retry_attempt:
       HLOG(kError, "3. Network connectivity issues");
       return false;
     }
-    HLOG(kWarning, "Attempt {} timed out after {:.1f}s; recreating DEALER",
+    HLOG(kWarning, "Attempt {} timed out after {}s; recreating DEALER",
          attempt_idx, per_attempt);
     if (ipc_mode_ == IpcMode::kTcp) {
       auto *config = CLIO_CONFIG_MANAGER;
@@ -2654,7 +2654,7 @@ bool IpcManager::WaitForServerAndReconnect(
               .count();
       if (client_retry_timeout_ >= 0 && elapsed >= client_retry_timeout_) {
         HLOG(kWarning, "WaitForServerAndReconnect: Original server timed out "
-             "after {:.1f}s", elapsed);
+             "after {}s", elapsed);
         break;
       }
       std::this_thread::sleep_for(std::chrono::seconds(1));
