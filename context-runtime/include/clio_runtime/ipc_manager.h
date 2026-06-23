@@ -1622,6 +1622,16 @@ class IpcManager {
   bool IncreaseClientShm(size_t size);
 
   /**
+   * Register one of this runtime's data segments with its fallback (main)
+   * runtime so main can resolve this runtime's FutureShm when a punted task
+   * completes in place. Sent over the fallback DEALER as a synchronous
+   * round-trip (the fallback connection runs no async recv thread). No-op if
+   * this runtime has no fallback. Used by IncreaseClientShm (runtime path) and
+   * RegisterMemory (client-segment forward).
+   */
+  void RegisterMemoryWithFallback(const ctp::ipc::AllocatorId &alloc_id);
+
+  /**
    * Vector of allocators owned by this process
    * Used for allocation attempts before calling IncreaseClientShm
    */

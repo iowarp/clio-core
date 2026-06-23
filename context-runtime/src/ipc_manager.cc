@@ -714,6 +714,13 @@ bool IpcManager::ServerInitShm() {
       return false;
     }
 
+    // Reserve segment indices 0-2 of this pid's allocator-id space: index 1 is
+    // the main segment and index 2 is the queue segment (see above). Runtime
+    // data segments created on demand by IncreaseClientShm (for AllocateBuffer
+    // / FutureShm) start at index 3 so their AllocatorId never collides with
+    // main/queue. Clients use a different pid, so they keep starting at 0.
+    shm_count_.store(3, std::memory_order_relaxed);
+
     return true;
   } catch (const std::exception &e) {
     return false;
@@ -1710,19 +1717,22 @@ FullPtr<char> IpcManager::AllocateBuffer(size_t size) {
 #if CTP_IS_HOST
   // HOST-ONLY PATH: The device implementation is in ipc_manager.h
 
-  // RUNTIME PATH: Use private memory (CTP_MALLOC) — runtime never uses
-  // per-process shared memory segments
-  if (CLIO_RUNTIME_MANAGER && CLIO_RUNTIME_MANAGER->IsRuntime()) {
-    // Use CTP_MALLOC allocator for private memory allocation
-    FullPtr<char> buffer = CTP_MALLOC->AllocateObjs<char>(size);
-    if (buffer.IsNull()) {
-      HLOG(kError, "AllocateBuffer: CTP_MALLOC failed for {} bytes", size);
-    }
-    return buffer;
-  }
+  // RUNTIME PATH: draw from per-process shared-memory segments (same growable
+  // MultiProcessAllocator strategy as the SHM client below), NOT CTP_MALLOC.
+  // Buffers and FutureShm allocated here must be resolvable from another
+  // process so a task this runtime punts to its fallback (main) can have its
+  // FutureShm completed IN PLACE by main. MultiProcessAllocator gives each
+  // worker thread its own lock-free block (like malloc's per-thread arenas), so
+  // unlike the single-lock main BuddyAllocator it absorbs the runtime's
+  // high-concurrency churn without contending. The runtime falls through to the
+  // shared steps 1-4 (it is the SHM owner; IsRuntime() gates registration in
+  // IncreaseClientShm so it does not ClientSend to itself).
+  const bool is_runtime =
+      (CLIO_RUNTIME_MANAGER != nullptr) && CLIO_RUNTIME_MANAGER->IsRuntime();
 
-  // CLIENT TCP/IPC PATH: Use private memory (no shared memory needed)
-  if (ipc_mode_ != IpcMode::kShm) {
+  // CLIENT TCP/IPC PATH: Use private memory (no shared memory needed). The
+  // runtime always uses the SHM path regardless of ipc_mode_.
+  if (!is_runtime && ipc_mode_ != IpcMode::kShm) {
     FullPtr<char> buffer = CTP_MALLOC->AllocateObjs<char>(size);
     if (buffer.IsNull()) {
       HLOG(kError,
@@ -1956,6 +1966,29 @@ bool IpcManager::TryPopNetTask(NetQueuePriority priority,
 // Per-Process Shared Memory Management
 //==============================================================================
 
+void IpcManager::RegisterMemoryWithFallback(
+    const ctp::ipc::AllocatorId &alloc_id) {
+  if (fallback_ == nullptr) {
+    return;
+  }
+  HLOG(kInfo,
+       "IpcManager::RegisterMemoryWithFallback: forwarding ({}.{}) registration "
+       "to main runtime",
+       alloc_id.major_, alloc_id.minor_);
+  auto fb_reg_task = fallback_->NewTask<clio::run::admin::RegisterMemoryTask>(
+      clio::run::CreateTaskId(), clio::run::kAdminPoolId,
+      clio::run::PoolQuery::Local(), alloc_id);
+  if (!FallbackSyncRoundtrip(fallback_->zmq_transport_.get(),
+                             fallback_->zmq_client_send_mutex_, fb_reg_task,
+                             30.0f)) {
+    HLOG(kWarning,
+         "IpcManager::RegisterMemoryWithFallback: main runtime did not ack "
+         "({}.{}); punted tasks using it may fail to resolve",
+         alloc_id.major_, alloc_id.minor_);
+  }
+  fallback_->DelTask(fb_reg_task);
+}
+
 bool IpcManager::IncreaseClientShm(size_t size) {
   HLOG(kDebug, "IncreaseClientShm CALLED: size={}", size);
   std::lock_guard<std::mutex> lock(shm_mutex_);
@@ -2025,8 +2058,23 @@ bool IpcManager::IncreaseClientShm(size_t size) {
     // Release the lock before returning
     allocator_map_lock_.WriteUnlock();
 
-    // Tell the runtime server to attach to this new shared memory segment.
-    // Use kAdminPoolId directly (not admin_client->pool_id_) because
+    // RUNTIME PATH: the server owns this segment and already inserted it into
+    // its own alloc_map_ above, so it resolves its own buffers/FutureShm
+    // directly — there is no server to ask and no client DEALER to send on (a
+    // self-directed ClientSend().Wait() would block forever). If this runtime
+    // has a fallback (main) runtime, register the new segment with main over
+    // the fallback DEALER so main can resolve this runtime's FutureShm when a
+    // punted task completes in place. Done synchronously (no async recv thread
+    // on the fallback connection), mirroring the dual-RegisterMemory path.
+    if (CLIO_RUNTIME_MANAGER && CLIO_RUNTIME_MANAGER->IsRuntime()) {
+      if (fallback_ != nullptr) {
+        RegisterMemoryWithFallback(alloc_id);
+      }
+      return true;
+    }
+
+    // CLIENT PATH: tell the runtime server to attach to this new shared memory
+    // segment. Use kAdminPoolId directly (not admin_client->pool_id_) because
     // the admin client may not be initialized yet during ClientInit.
     auto reg_task = NewTask<clio::run::admin::RegisterMemoryTask>(
         clio::run::CreateTaskId(), clio::run::kAdminPoolId, clio::run::PoolQuery::Local(),
@@ -2108,28 +2156,8 @@ bool IpcManager::RegisterMemory(const ctp::ipc::AllocatorId &alloc_id) {
 
     // Fallback mode: also register this client segment on the main runtime so
     // it can resolve + complete FutureShms for tasks this runtime punts to it
-    // (a punted task's FutureShm lives in this client segment). Sent over the
-    // fallback client's DEALER as a SYNCHRONOUS round-trip — the fallback runs
-    // no async recv thread, so the normal ClientSend().Wait() path would hang.
-    if (fallback_) {
-      HLOG(kInfo,
-           "IpcManager::RegisterMemory: forwarding {} registration to main "
-           "runtime (fallback mode)",
-           shm_name);
-      auto fb_reg_task =
-          fallback_->NewTask<clio::run::admin::RegisterMemoryTask>(
-              clio::run::CreateTaskId(), clio::run::kAdminPoolId,
-              clio::run::PoolQuery::Local(), alloc_id);
-      if (!FallbackSyncRoundtrip(fallback_->zmq_transport_.get(),
-                                 fallback_->zmq_client_send_mutex_, fb_reg_task,
-                                 30.0f)) {
-        HLOG(kWarning,
-             "IpcManager::RegisterMemory: main runtime did not ack {} "
-             "registration; punted tasks using it may fail to resolve",
-             shm_name);
-      }
-      fallback_->DelTask(fb_reg_task);
-    }
+    // (a punted task's FutureShm lives in this client segment).
+    RegisterMemoryWithFallback(alloc_id);
 
     return true;
 
