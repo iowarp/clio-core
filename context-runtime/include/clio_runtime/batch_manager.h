@@ -101,6 +101,11 @@ class BatchManager {
   struct Group {
     std::vector<ctp::ipc::FullPtr<Task>> members;
     u64 deadline_ns = 0;  /**< steady-clock ns of the first arrival + window */
+    // AllToOne (count-based barrier): the aggregate does not run until tasks
+    // from every container in the pool have arrived. When set, FlushDue ignores
+    // deadline_ns and instead flushes once the accumulated member count reaches
+    // the pool's container count. ManyToOne leaves this false (time-windowed).
+    bool count_based = false;
   };
 
   /** Monotonic nanoseconds (steady clock). */

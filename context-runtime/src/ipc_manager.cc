@@ -2690,11 +2690,13 @@ RouteResult IpcManager::RouteTask(Future<Task> &future, bool force_enqueue) {
     return RouteResult::ExecHere;
   }
 
-  // ManyToOne collective routing is handled before the normal resolve path:
-  // forward to the neighborhood leader, or park into the batch manager if we
-  // are the leader. (The aggregate task the leader later runs is a plain
-  // Local task and does not re-enter this branch.)
-  if (task_ptr->pool_query_.IsManyToOneMode()) {
+  // Collective (ManyToOne / AllToOne) routing is handled before the normal
+  // resolve path: forward to the neighborhood leader, or park into the batch
+  // manager if we are the leader. Both modes share this routing; they differ
+  // only in the BatchManager flush condition (time window vs. all-containers
+  // barrier). (The aggregate task the leader later runs is a plain Local task
+  // and does not re-enter this branch.)
+  if (task_ptr->pool_query_.IsCollectiveMode()) {
     return RouteManyToOne(future);
   }
 
@@ -2771,8 +2773,9 @@ RouteResult IpcManager::RouteManyToOne(Future<Task> &future) {
     batch_manager_->Add(task_ptr);
     return RouteResult::Local;
   }
-  // Forward to the leader. pool_query_ stays ManyToOne so the leader re-enters
-  // this path and batches; only the network address is the leader node.
+  // Forward to the leader. The forwarded task keeps its collective pool_query_
+  // (ManyToOne or AllToOne) so the leader re-enters this path and batches; only
+  // the network address is the leader node.
   std::vector<PoolQuery> pool_queries = {PoolQuery::Physical((u32)leader)};
   pool_queries[0].SetReturnNode(GetNodeId());
   return RouteGlobal(future, pool_queries);
@@ -2835,8 +2838,9 @@ bool IpcManager::IsTaskLocal(const FullPtr<Task> & /*task_ptr*/,
     case RoutingMode::Range:
     case RoutingMode::Broadcast:
     case RoutingMode::ManyToOne:
-      // These modes should have been resolved (ManyToOne → Local on the
-      // neighborhood leader, else Physical) by now. If we still see them
+    case RoutingMode::AllToOne:
+      // These modes should have been resolved (ManyToOne/AllToOne → Local on
+      // the neighborhood leader, else Physical) by now. If we still see them
       // here, they are not local.
       return false;
 
@@ -2994,8 +2998,10 @@ std::vector<PoolQuery> IpcManager::ResolvePoolQuery(
       result = {query};
       break;
     case RoutingMode::ManyToOne:
-      // ManyToOne is intercepted in RouteTask (RouteManyToOne) before reaching
-      // here. If it ever falls through, resolve to the neighborhood leader.
+    case RoutingMode::AllToOne:
+      // Collective modes are intercepted in RouteTask (RouteManyToOne) before
+      // reaching here. If one ever falls through, resolve to the neighborhood
+      // leader.
       result = {PoolQuery::Physical(
           (u32)GetNeighborhoodLeaderNodeId())};
       break;

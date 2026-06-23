@@ -36,12 +36,18 @@ void BatchManager::Add(const ctp::ipc::FullPtr<Task> &task) {
   const PoolQuery &q = task->pool_query_;
   GroupKey key{task->pool_id_, task->method_, q.GetContainerHash(),
                q.GetBatchKey()};
+  const bool count_based = q.IsAllToOneMode();
   std::lock_guard<std::mutex> lk(mu_);
   Group &group = groups_[key];
   if (group.members.empty()) {
-    // First arrival starts the batch window.
-    u64 window = q.GetBatchForNs();
-    group.deadline_ns = NowNs() + window;
+    // AllToOne: a count-based barrier — flush only once tasks from every
+    // container have arrived (FlushDue checks the count against the pool's
+    // container count); no time window. ManyToOne: the first arrival starts the
+    // batch window.
+    group.count_based = count_based;
+    if (!count_based) {
+      group.deadline_ns = NowNs() + q.GetBatchForNs();
+    }
   }
   group.members.push_back(task);
 }
@@ -55,8 +61,29 @@ bool BatchManager::FlushDue(Worker *worker) {
       return false;
     }
     u64 now = NowNs();
+    auto *pool_manager = CLIO_POOL_MANAGER;
     for (auto it = groups_.begin(); it != groups_.end();) {
-      if (now >= it->second.deadline_ns) {
+      bool ready;
+      if (it->second.count_based) {
+        // AllToOne barrier: ready once a task from every container in the pool
+        // has been aggregated. Each member is one container's contribution
+        // (the collective contract — one task per container), so the
+        // accumulated member count IS the number of aggregations performed;
+        // when it reaches the pool's container count, the aggregate runs.
+        // num_containers is read live (not at Add) so a transiently-unregistered
+        // pool just keeps the group pending until it resolves.
+        const PoolInfo *pool_info =
+            pool_manager ? pool_manager->GetPoolInfo(it->first.pool_id)
+                         : nullptr;
+        u32 num_containers =
+            (pool_info != nullptr) ? pool_info->num_containers_ : 0;
+        ready = (num_containers > 0) &&
+                (it->second.members.size() >= num_containers);
+      } else {
+        // ManyToOne: ready once the time window has elapsed.
+        ready = now >= it->second.deadline_ns;
+      }
+      if (ready) {
         if (in_flight_.count(it->first) != 0) {
           // An aggregate for this key is still running. Leave the group in
           // place so members keep accumulating; it flushes once the in-flight

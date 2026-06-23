@@ -53,7 +53,10 @@ enum class RoutingMode {
   Dynamic,        /**< Dynamic routing with cache optimization (routes to Monitor) */
   ToLocalCpu,     /**< GPU → CPU direction (the only GPU-related mode) */
   Null,           /**< Do nothing */
-  ManyToOne       /**< Batch+aggregate matching tasks at the neighborhood leader */
+  ManyToOne,      /**< Batch+aggregate matching tasks at the neighborhood leader */
+  AllToOne        /**< Like ManyToOne, but the aggregate runs only once tasks
+                       from ALL containers in the pool have arrived (a collective
+                       barrier), instead of after a time window */
 };
 
 /**
@@ -173,6 +176,29 @@ class PoolQuery {
    */
   static PoolQuery ManyToOne(u32 container_hash, u64 batch_key = 0,
                              u64 batch_for_ns = 10000);
+
+  /**
+   * Create an all-to-one collective routing pool query.
+   *
+   * Identical to ManyToOne except for the flush condition: the neighborhood
+   * leader batches all tasks sharing the same (pool_id, method, container_hash,
+   * batch_key) and does NOT run the aggregate until tasks from EVERY container
+   * in the pool have arrived (a collective barrier). The aggregate tracks how
+   * many tasks have been combined into it; when that count reaches the pool's
+   * container count, it runs once and the result is broadcast back to every
+   * batched task (same 1->N result path as ManyToOne).
+   *
+   * Use this when the "one" must observe the contribution of all "many" before
+   * it can compute (e.g. a global reduction / barrier); use ManyToOne when a
+   * best-effort time-windowed batch is sufficient.
+   *
+   * @param container_hash Logical container key (stored in hash_value_); also
+   *        selects the container the aggregate task executes on.
+   * @param batch_key Sub-key to separate concurrent collectives on the same
+   *        (pool_id, method, container_hash). Default 0.
+   * @return PoolQuery configured for all-to-one barrier aggregation
+   */
+  static PoolQuery AllToOne(u32 container_hash, u64 batch_key = 0);
 
   /**
    * Create a pool query for GPU → CPU direction
@@ -369,6 +395,25 @@ class PoolQuery {
    */
   CTP_CROSS_FUN bool IsManyToOneMode() const {
     return routing_mode_ == RoutingMode::ManyToOne;
+  }
+
+  /**
+   * Check if pool query is in AllToOne routing mode
+   * @return true if routing mode is AllToOne
+   */
+  CTP_CROSS_FUN bool IsAllToOneMode() const {
+    return routing_mode_ == RoutingMode::AllToOne;
+  }
+
+  /**
+   * Check if pool query is in any collective batch+aggregate mode
+   * (ManyToOne or AllToOne). Both route to the neighborhood leader and park in
+   * the BatchManager; they differ only in the flush condition.
+   * @return true if routing mode is ManyToOne or AllToOne
+   */
+  CTP_CROSS_FUN bool IsCollectiveMode() const {
+    return routing_mode_ == RoutingMode::ManyToOne ||
+           routing_mode_ == RoutingMode::AllToOne;
   }
 
   /**

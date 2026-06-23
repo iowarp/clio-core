@@ -133,6 +133,21 @@ PoolQuery PoolQuery::ManyToOne(u32 container_hash, u64 batch_key,
   return query;
 }
 
+PoolQuery PoolQuery::AllToOne(u32 container_hash, u64 batch_key) {
+  PoolQuery query;
+  query.routing_mode_ = RoutingMode::AllToOne;
+  query.hash_value_ = container_hash;
+  query.container_id_ = 0;
+  query.range_offset_ = 0;
+  query.range_count_ = 0;
+  query.node_id_ = 0;
+  query.batch_key_ = batch_key;
+  // batch_for_ns_ is unused for AllToOne (count-based barrier, not time-based),
+  // but keep it deterministic for the raw-byte serialized/memcmp roundtrip.
+  query.batch_for_ns_ = 0;
+  return query;
+}
+
 PoolQuery PoolQuery::FromString(const std::string& str) {
   // Convert to lowercase for case-insensitive comparison
   std::string lower_str = str;
@@ -179,6 +194,16 @@ PoolQuery PoolQuery::FromString(const std::string& str) {
       }
     }
     return PoolQuery::ManyToOne(container_hash, batch_key, batch_for_ns);
+  } else if (lower_str.rfind("all_to_one:", 0) == 0) {
+    // Format: all_to_one:<container_hash>[:<batch_key>]
+    std::string rest = lower_str.substr(11);
+    size_t c1 = rest.find(':');
+    u32 container_hash = std::stoul(rest.substr(0, c1));
+    u64 batch_key = 0;
+    if (c1 != std::string::npos) {
+      batch_key = std::stoull(rest.substr(c1 + 1));
+    }
+    return PoolQuery::AllToOne(container_hash, batch_key);
   } else {
     throw std::invalid_argument(
         "Invalid PoolQuery string: '" + str + "'");
@@ -204,6 +229,9 @@ std::string PoolQuery::ToString() const {
     case RoutingMode::ManyToOne:
       return "many_to_one:" + std::to_string(hash_value_) + ":" +
              std::to_string(batch_key_) + ":" + std::to_string(batch_for_ns_);
+    case RoutingMode::AllToOne:
+      return "all_to_one:" + std::to_string(hash_value_) + ":" +
+             std::to_string(batch_key_);
     default:
       return "unknown";
   }
