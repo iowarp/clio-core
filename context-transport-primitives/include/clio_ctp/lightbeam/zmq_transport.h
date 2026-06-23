@@ -109,15 +109,21 @@ class ZeroMqTransport : public Transport {
           (void)ctx;
 #else
           // zmq_ctx_shutdown() causes all blocking ZMQ calls on open sockets
-          // to return immediately with ETERM.  This unblocks any background
-          // receive threads (e.g. RecvZmqClientThread) that are polling the
-          // socket, allowing them to exit cleanly.  zmq_ctx_destroy() would
-          // otherwise block forever if a socket is still open (because the
-          // CLIO Runtime singleton is heap-allocated and its destructor --
-          // which calls ClientFinalize / closes the socket -- is never
-          // invoked).
+          // to return immediately with ETERM, unblocking background receive
+          // threads (e.g. RecvZmqClientThread) so they can exit.
+          //
+          // We deliberately do NOT call zmq_ctx_destroy()/zmq_ctx_term() here:
+          // it blocks until every socket opened on the context has been closed
+          // with zmq_close(), and the CLIO Runtime singleton is heap-allocated
+          // with a destructor (ClientFinalize, which closes the socket) that is
+          // never invoked. Some workloads (force-net tag/query/compose,
+          // assimilation) reach process exit with a DEALER socket on this
+          // shared context still open, so zmq_ctx_term would hang forever
+          // (observed: main thread parked in poll(-1) inside ctx_t::terminate
+          // at atexit). The process is exiting anyway, so we leak the context
+          // and let the OS reclaim it — a one-time leak at exit is strictly
+          // better than a shutdown deadlock. Mirrors the Windows path above.
           zmq_ctx_shutdown(ctx);
-          zmq_ctx_destroy(ctx);
 #endif
           ctx = nullptr;
         }
@@ -136,6 +142,11 @@ class ZeroMqTransport : public Transport {
       int iot = (iot_env && *iot_env) ? std::atoi(iot_env) : 8;
       if (iot < 1) iot = 1;
       zmq_ctx_set(owner.ctx, ZMQ_IO_THREADS, iot);
+      // Non-blocking termination semantics: new sockets default to LINGER=0 so
+      // a close never waits for unsent messages, and blocking calls return
+      // ETERM promptly on shutdown. Belt-and-suspenders alongside the leak in
+      // ~CtxOwner (we never call the blocking zmq_ctx_term).
+      zmq_ctx_set(owner.ctx, ZMQ_BLOCKY, 0);
       HLOG(kInfo, "[ZeroMqTransport] Created shared context with {} I/O threads", iot);
     }
     return owner.ctx;
