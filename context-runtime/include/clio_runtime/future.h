@@ -79,7 +79,7 @@ struct FutureShm {
       32; /**< POD cudaMemcpy path: no serialization, task is raw memcpy'd */
   static constexpr u32 FUTURE_PUNTED =
       64; /**< Task was forwarded to the fallback (main) runtime because its
-             pool is not local. Loop guard: a runtime never re-punts an
+             pool is non-local. Loop guard: a runtime never re-punts an
              already-punted task (see IpcRun2Fallback). */
 
   // Origin constants: how the client submitted this task

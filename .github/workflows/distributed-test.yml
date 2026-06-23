@@ -83,7 +83,8 @@ jobs:
               export LD_LIBRARY_PATH=/usr/local/lib:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
               export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/lib/x86_64-linux-gnu/pkgconfig:$PKG_CONFIG_PATH
               git config --global --add safe.directory /workspace
-              cmake --preset release -DCLIO_CORE_ENABLE_PYTHON=OFF
+              cmake --preset release -DCLIO_CORE_ENABLE_PYTHON=OFF \
+                -DCLIO_CTE_ENABLE_FUSE_ADAPTER=ON
               cmake --build build -j"$(nproc)"
               # Hand ownership back to the runner so post-job cleanup and the
               # test clusters (which run as the runner uid) can access build/.

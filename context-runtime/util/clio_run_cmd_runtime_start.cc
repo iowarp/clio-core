@@ -125,7 +125,11 @@ int RuntimeStart(int argc, char* argv[]) {
       // Skip the default compose: start bare (admin only), to be composed
       // explicitly. Communicated to ConfigManager via CLIO_EPHEMERAL, read
       // during the CLIO_INIT below.
+#ifdef _WIN32
+      _putenv_s("CLIO_EPHEMERAL", "1");
+#else
       setenv("CLIO_EPHEMERAL", "1", 1);
+#endif
     } else if (std::strcmp(argv[i], "--help") == 0 ||
                std::strcmp(argv[i], "-h") == 0) {
       PrintRuntimeStartUsage();
