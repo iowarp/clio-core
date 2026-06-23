@@ -151,29 +151,46 @@ namespace clio::run::detail {
 // ============================================================================
 #elif defined(CLIO_ENABLE_BOOST_COROUTINES)
 #include <boost/context/fiber.hpp>
-// Use fixedsize_stack (plain malloc), NOT protected_fixedsize_stack: the latter
-// pulls in windows.h (VirtualAlloc/VirtualProtect) on Windows, whose macros
-// clash with the IPC headers (error C2760). Stack overflow is mitigated by a
-// generous default size instead of a guard page.
+// Stack allocator: on Windows we must use fixedsize_stack (plain malloc) —
+// protected_fixedsize_stack pulls in windows.h (VirtualAlloc/VirtualProtect),
+// whose macros clash with the IPC headers (error C2760). Everywhere else we use
+// protected_fixedsize_stack so the fiber gets a guard page: a stack overflow
+// then faults cleanly (SIGSEGV at the overflow site) instead of silently
+// corrupting adjacent memory — which manifests as platform-divergent UB (hang
+// on macOS, wrong data on Windows, benign on Linux). See issue #620.
+#if defined(_WIN32)
 #include <boost/context/fixedsize_stack.hpp>
+#else
+#include <boost/context/protected_fixedsize_stack.hpp>
+#endif
 #include <cstdlib>
 #include <functional>
 namespace clio::run::detail {
   // Per-task fiber stack size in bytes, overridable via CLIO_BOOST_STACK_SIZE
-  // (KiB). Defaults to 1 MiB: the whole task — incl. nested helper coroutines —
-  // runs on this one stack, and Debug builds (large frames, esp. on Windows)
-  // plus the DPE/allocation/serialization call chain need well over the 256 KiB
-  // the NVHPC ucontext path uses. (fixedsize_stack has no guard page, so keep
-  // this comfortably above the deepest expected frame.)
+  // (KiB). Defaults to 8 MiB (matching the typical main-thread stack): the whole
+  // task — incl. nested helper coroutines and the DPE/allocation/cereal
+  // serialization call chain — runs on this one stack. The C++20 stackless path
+  // borrows the worker's 8 MiB thread stack, so per-platform frame growth that
+  // fits there must also fit here; 1 MiB was marginal on macOS/Windows.
   inline size_t boost_stack_size() {
     static const size_t sz = []() -> size_t {
       const char* e = std::getenv("CLIO_BOOST_STACK_SIZE");
-      size_t kib = (e && *e) ? std::strtoul(e, nullptr, 10) : 1024;
+      size_t kib = (e && *e) ? std::strtoul(e, nullptr, 10) : 8192;
       if (kib < 64) kib = 64;
       return kib * 1024;
     }();
     return sz;
   }
+  // Stack allocator factory — guard-page protected off-Windows (see above).
+#if defined(_WIN32)
+  inline boost::context::fixedsize_stack boost_stack_alloc() {
+    return boost::context::fixedsize_stack(boost_stack_size());
+  }
+#else
+  inline boost::context::protected_fixedsize_stack boost_stack_alloc() {
+    return boost::context::protected_fixedsize_stack(boost_stack_size());
+  }
+#endif
   struct FiberState;
   inline thread_local FiberState* tls_current_fiber = nullptr;
 
@@ -1488,7 +1505,7 @@ inline clio::run::TaskResume make_task_fiber(F&& fn) {
   state->fn = std::make_unique<FiberCallableT<typename std::decay<F>::type>>(std::forward<F>(fn));
   state->task_ = boost::context::fiber{
       std::allocator_arg,
-      boost::context::fixedsize_stack(boost_stack_size()),
+      boost_stack_alloc(),
       [state](boost::context::fiber&& caller) -> boost::context::fiber {
         state->caller_ = std::move(caller);
         try { state->fn->call(); } catch (...) {}
