@@ -1018,6 +1018,16 @@ bool IpcManager::FallbackClientInit(u32 main_port) {
     scheduler_ = SchedulerFactory::Get(config->GetLocalSched());
   }
 
+  // SHM lightbeam transports used to serialize a punted internal subtask into
+  // its (shared) FutureShm copy_space and to deserialize the outputs main wrote
+  // back. The kShm transport is segment-agnostic — it operates on the
+  // per-call ctx.copy_space — so these can serialize into any copy_space the
+  // owning runtime allocated. See IpcRun2Fallback::PuntCopyIn / CompletePunt.
+  shm_send_transport_ = ctp::lbm::TransportFactory::Get(
+      "", ctp::lbm::TransportType::kShm, ctp::lbm::TransportMode::kClient);
+  shm_recv_transport_ = ctp::lbm::TransportFactory::Get(
+      "", ctp::lbm::TransportType::kShm, ctp::lbm::TransportMode::kServer);
+
   is_initialized_ = true;
   HLOG(kSuccess,
        "FallbackClientInit: connected to main runtime (port {}, pid {})",

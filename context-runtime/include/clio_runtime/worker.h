@@ -45,6 +45,7 @@
 #include <vector>
 
 #include "clio_runtime/container.h"
+#include "clio_runtime/ipc/ipc_run2fallback.h"
 #include "clio_runtime/pool_query.h"
 #include "clio_runtime/task.h"
 #include "clio_runtime/types.h"
@@ -331,6 +332,16 @@ class Worker {
   void ProcessEventQueue();
 
   /**
+   * Poll outstanding cross-runtime punts (PuntCopyIn) for in-place completion
+   * by the main runtime. For each PendingPunt whose shared FutureShm main has
+   * marked FUTURE_COMPLETE, deserialize the outputs back into the original task
+   * and resume the parent coroutine, then drop the entry. Called once per loop
+   * iteration.
+   * @return true if any punt is still in flight (worker should keep polling).
+   */
+  bool PollPendingPunts();
+
+  /**
    * Process retry queue: re-check containers and re-route as needed
    * Tasks with plugged containers stay in retry queue.
    * Tasks with nullptr containers get re-routed via RouteGlobal.
@@ -462,6 +473,12 @@ class Worker {
   // Allocated from malloc allocator (temporary runtime data, not IPC)
   static constexpr u32 EVENT_QUEUE_DEPTH = 1024;
   ctp::ipc::mpsc_ring_buffer<Future<Task, CLIO_QUEUE_ALLOC_T>, ctp::ipc::MallocAllocator> *event_queue_;
+
+  // Cross-runtime subtasks this worker punted to the main runtime and is
+  // awaiting in-place completion of (see IpcRun2Fallback::PuntCopyIn). Owned by
+  // this worker only (no cross-thread access), polled each loop iteration by
+  // PollPendingPunts.
+  std::vector<PendingPunt> pending_punts_;
 
   // Periodic queue system for time-based periodic tasks:
   // - Queue[0]: Tasks with yield_time_us_ <= 50us (checked every 16 iterations)

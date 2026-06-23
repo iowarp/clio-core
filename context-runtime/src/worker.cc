@@ -268,6 +268,14 @@ void Worker::Run() {
     // Check blocked queue for completed tasks at end of each iteration
     ContinueBlockedTasks(false);
 
+    // Poll cross-runtime punts for in-place completion by the main runtime.
+    // While any are in flight, keep this worker awake (treat as work) so the
+    // parent coroutine resumes promptly once main sets FUTURE_COMPLETE —
+    // mirrors the ManyToOne pending-batch handling below.
+    if (PollPendingPunts()) {
+      did_work_ = true;
+    }
+
     // ManyToOne: flush due collective batches on the neighborhood leader.
     // Driven from a single worker to avoid redundant locking; FlushDue is a
     // cheap no-op when no batches are pending. Treat pending batches as work so
@@ -565,17 +573,24 @@ bool Worker::ProcessNewTask(TaskLane *lane) {
       // place. Forward the same Future onto main's SHM queue (no re-serialize).
       punted = IpcRun2Fallback::SendIn(CLIO_IPC, future);
     } else if (container != nullptr) {
-      // Runtime-internal subtask (e.g. CTE -> remote bdev): its task + data are
-      // in this runtime's private heap, so main cannot complete it in place.
-      // Serialize it against the external stub and relay it to main, then
-      // complete the local FutureShm with the returned outputs.
+      // Runtime-internal subtask (e.g. CTE -> remote bdev): its task lives in
+      // this runtime's memory. Serialize it into a fresh SHARED FutureShm
+      // copy_space and enqueue it onto main's lane (non-blocking). Main runs it
+      // and completes the shared FutureShm in place; this worker polls the
+      // registered PendingPunt (PollPendingPunts) and, on completion,
+      // deserializes the outputs back and resumes the parent coroutine — no
+      // worker thread is blocked waiting for main.
       FullPtr<Task> tp = future.GetTaskPtr();
       if (tp.IsNull()) {
-        HLOG(kError, "Worker {}: relay punt pool={} method={}: null task ptr",
+        HLOG(kError, "Worker {}: punt pool={} method={}: null task ptr",
              worker_id_, pool_id, method_id);
+      } else {
+        PendingPunt pp;
+        if (IpcRun2Fallback::PuntCopyIn(CLIO_IPC, container, tp, future, pp)) {
+          pending_punts_.push_back(pp);
+          punted = true;
+        }
       }
-      punted = !tp.IsNull() &&
-               IpcRun2Fallback::RelayToFallback(CLIO_IPC, container, tp, future);
     } else {
       // No local stub container (legacy not-found): only the in-place path is
       // possible (we have nothing to serialize against).
@@ -1328,6 +1343,24 @@ void Worker::ProcessEventQueue() {
     // Execute the task
     ExecTask(run_ctx->task_, run_ctx, true);
   }
+}
+
+bool Worker::PollPendingPunts() {
+  if (pending_punts_.empty()) {
+    return false;
+  }
+  // Walk the list; swap-erase completed punts (order is irrelevant). Each
+  // CompletePunt either finishes (deserialize outputs + resume parent) or
+  // leaves the entry in flight.
+  for (size_t i = 0; i < pending_punts_.size();) {
+    if (IpcRun2Fallback::CompletePunt(CLIO_IPC, pending_punts_[i])) {
+      pending_punts_[i] = pending_punts_.back();
+      pending_punts_.pop_back();
+    } else {
+      ++i;
+    }
+  }
+  return !pending_punts_.empty();
 }
 
 void Worker::ContinueBlockedTasks(bool force) {
