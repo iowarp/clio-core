@@ -140,6 +140,27 @@ bool Worker::Init() {
               Future<Task, CLIO_QUEUE_ALLOC_T>, ctp::ipc::MallocAllocator>>(
               CTP_MALLOC, event_queue_depth)
           .ptr_;
+  // DIAG(#620): confirm the event queue was actually sized (macOS boost hang =
+  // WAIT_FOR_SPACE Emplace spins because capacity is ~0). If capacity here is
+  // correct (==depth-1) but RuntimeSend sees cap=0, then event_queue_ is read
+  // at a wrong offset (RunContext layout) rather than mis-allocated.
+  HLOG(kError,
+       "Worker {} event_queue alloc: depth={} ptr={} capacity={} entrySize={} "
+       "futureSize={}",
+       worker_id_, event_queue_depth,
+       reinterpret_cast<uintptr_t>(event_queue_), event_queue_->Capacity(),
+       sizeof(ctp::ipc::RingBufferEntry<Future<Task, CLIO_QUEUE_ALLOC_T>>),
+       sizeof(Future<Task, CLIO_QUEUE_ALLOC_T>));
+
+#if defined(CLIO_ENABLE_BOOST_COROUTINES)
+  // Per-worker freed-fiber-stack pool (see AllocateStack/FreeStack).
+  free_stacks_ =
+      CTP_MALLOC
+          ->template NewObj<ctp::ipc::ext_ring_buffer<
+              boost::context::stack_context, ctp::ipc::MallocAllocator>>(
+              CTP_MALLOC, STACK_POOL_DEPTH)
+          .ptr_;
+#endif
 
   // Get scheduler from IpcManager (IpcManager is the single owner)
   scheduler_ = CLIO_IPC->GetScheduler();
@@ -234,6 +255,17 @@ void Worker::Finalize() {
   while (!retry_queue_.empty()) {
     retry_queue_.pop();
   }
+
+#if defined(CLIO_ENABLE_BOOST_COROUTINES)
+  // Free every pooled fiber stack (raw mallocs from boost::fixedsize_stack).
+  if (free_stacks_) {
+    boost::context::stack_context sctx;
+    while (free_stacks_->Pop(sctx)) {
+      boost::context::fixedsize_stack(clio::run::detail::boost_stack_size())
+          .deallocate(sctx);
+    }
+  }
+#endif
 
   // Clear assigned lane reference (don't delete - it's in shared memory)
   assigned_lane_ = nullptr;
@@ -767,16 +799,55 @@ void Worker::ClearCurrentWorker() {
 }
 
 #if defined(CLIO_ENABLE_BOOST_COROUTINES)
+boost::context::stack_context Worker::AllocateStack() {
+  boost::context::stack_context sctx;
+  if (free_stacks_ && free_stacks_->Pop(sctx)) {
+    return sctx;  // reuse a freed stack
+  }
+  return boost::context::fixedsize_stack(clio::run::detail::boost_stack_size())
+      .allocate();
+}
+
+void Worker::FreeStack(boost::context::stack_context &sctx) {
+  // Cache for reuse; if the pool is full (ext_ring_buffer reports no space),
+  // free the stack outright.
+  if (!free_stacks_ || !free_stacks_->Emplace(sctx)) {
+    boost::context::fixedsize_stack(clio::run::detail::boost_stack_size())
+        .deallocate(sctx);
+  }
+}
+
+namespace {
+// Boost StackAllocator backed by the owning worker's stack pool. allocate()
+// always runs on the creating worker (make_task_fiber), so it draws from that
+// worker's pool. deallocate() returns the stack to that same pool only when run
+// on the owner's thread (the common case — the creating worker finishes the
+// task); off-thread reclaims free directly, keeping each pool single-threaded.
+struct WorkerStackAllocator {
+  Worker *worker_;
+  boost::context::stack_context allocate() { return worker_->AllocateStack(); }
+  void deallocate(boost::context::stack_context &sctx) noexcept {
+    if (CLIO_CUR_WORKER == worker_) {
+      worker_->FreeStack(sctx);
+    } else {
+      boost::context::fixedsize_stack(clio::run::detail::boost_stack_size())
+          .deallocate(sctx);
+    }
+  }
+};
+}  // namespace
+
 // Set up the task's RunContext to run on a fresh Boost.Context fiber, recording
 // `this` worker as the one responsible for the fiber state. The fiber state
-// lives in rctx->fiber_state_, so the ONLY allocation is the fiber stack. The
-// entry captures the typed RunContext* (no callable type erasure) and runs the
+// lives in rctx->fiber_state_, and the fiber stack comes from this worker's
+// pool (WorkerStackAllocator), so a reused stack costs no malloc. The entry
+// captures the typed RunContext* (no callable type erasure) and runs the
 // container directly off it. Lazy: the body runs on first resume().
 clio::run::detail::FiberHandle Worker::make_task_fiber(RunContext *rctx) {
   rctx->fiber_state_.done = false;
   rctx->fiber_state_.worker_ = this;
   rctx->fiber_state_.task_ = boost::context::fiber{
-      std::allocator_arg, clio::run::detail::boost_stack_alloc(),
+      std::allocator_arg, WorkerStackAllocator{this},
       [rctx](boost::context::fiber &&caller) -> boost::context::fiber {
         rctx->fiber_state_.caller_ = std::move(caller);
         // Must not let an exception escape the fiber entry (Boost.Context calls

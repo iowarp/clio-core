@@ -114,9 +114,6 @@ namespace clio::run::detail {
     }();
     return sz;
   }
-  inline boost::context::fixedsize_stack boost_stack_alloc() {
-    return boost::context::fixedsize_stack(boost_stack_size());
-  }
   // Per-task fiber state. It lives INSIDE the task's RunContext (see
   // RunContext::fiber_state_), so starting a task fiber allocates ONLY the
   // stack — there is no heap FiberState and no type-erased callable. `task_`

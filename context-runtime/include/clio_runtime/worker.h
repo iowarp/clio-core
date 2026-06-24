@@ -417,14 +417,30 @@ class Worker {
   void StartCoroutine(const FullPtr<Task> &task_ptr, RunContext *run_ctx);
 
 #if defined(CLIO_ENABLE_BOOST_COROUTINES)
+ public:
   /**
    * Create the Boost.Context fiber for a task and record this worker as the one
    * responsible for its fiber state (run_ctx->fiber_state_). Only the fiber
-   * stack is allocated.
+   * stack is allocated (and that is pooled — see AllocateStack).
    * @param run_ctx RunContext whose task the fiber will run
    * @return Handle to the created fiber
    */
   clio::run::detail::FiberHandle make_task_fiber(RunContext *run_ctx);
+
+  /**
+   * Allocate a Boost fiber stack, reusing one from this worker's free pool if
+   * available (else allocating fresh). The worker that creates a task's fiber is
+   * the one that finishes/frees it, so the pool is single-thread (SPSC).
+   */
+  boost::context::stack_context AllocateStack();
+
+  /**
+   * Return a fiber stack to this worker's free pool for reuse (frees it outright
+   * if the pool is full).
+   */
+  void FreeStack(boost::context::stack_context &sctx);
+
+ private:
 #endif
 
   /**
@@ -480,6 +496,16 @@ class Worker {
   // single parent's fan-out (which otherwise self-deadlocks the worker, #620).
   static constexpr u32 EVENT_QUEUE_DEPTH_MULTIPLIER = 2;
   ctp::ipc::mpsc_ring_buffer<Future<Task, CLIO_QUEUE_ALLOC_T>, ctp::ipc::MallocAllocator> *event_queue_;
+
+#if defined(CLIO_ENABLE_BOOST_COROUTINES)
+  // Per-worker pool of freed Boost fiber stacks, reused by AllocateStack to
+  // avoid malloc/free of the (256 KiB) stack on every task. Extensible SPSC:
+  // only this worker pushes/pops it (the worker that creates a fiber finishes
+  // it). Allocated in Init, drained + freed in Finalize.
+  static constexpr u32 STACK_POOL_DEPTH = 1024;
+  ctp::ipc::ext_ring_buffer<boost::context::stack_context, ctp::ipc::MallocAllocator>
+      *free_stacks_ = nullptr;
+#endif
 
   // Periodic queue system for time-based periodic tasks:
   // - Queue[0]: Tasks with yield_time_us_ <= 50us (checked every 16 iterations)
