@@ -112,22 +112,14 @@ jobs:
           ctest --test-dir build-boost --output-on-failure --timeout 180 --repeat until-pass:3 -LE "ollama"
 
   # ---- macOS (conda deps via install.sh) ------------------------------------
-  # DIAGNOSTIC (temporary, #620): the full macOS Boost run is a 2h black box
-  # (~30m queue + ~60m from-scratch build + ctest riding to the 120m cap on the
-  # hangs). This job instead builds ONLY the targets the hanging runtime test
-  # needs (the test + the admin/bdev/MOD_NAME chimod runtimes + the daemon),
-  # which skips the heavy CTE/CAE/filesystem trees and the ~40 other test exes,
-  # then runs ONLY that one test and captures a backtrace of the stuck process
-  # to pinpoint the Darwin-only boost-fiber deadlock. Restore the full
-  # macos-14/macos-15 ctest job after diagnosis.
   macos:
     name: macos (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 90
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-14]
+        os: [macos-14, macos-15]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
@@ -137,7 +129,7 @@ jobs:
         run: |
           chmod +x install.sh
           ./install.sh --only-deps release
-      - name: Build runtime-only (Boost) + backtrace the hanging test
+      - name: Build with Boost backend + run ctest
         run: |
           if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
             source "$HOME/miniconda3/etc/profile.d/conda.sh"
@@ -147,60 +139,9 @@ jobs:
             eval "$(conda shell.bash hook)"
           fi
           conda activate iowarp
-          # Release build (preset default, -O2) — verifies the #620 null-pointer
-          # arithmetic fix in FullPtr holds under the optimization that exposed it.
-          cmake --preset boost -DCLIO_CTP_LOG_LEVEL=0
-          # Build only what the runtime test needs (skips CTE/CAE/filesystem +
-          # the other test exes). The runtime dlopens the chimod *_runtime libs.
-          cmake --build build-boost -j"$(sysctl -n hw.ncpu)" \
-            --target clio_run_wait_functionality_tests \
-                     clio_admin_runtime clio_bdev_runtime clio_MOD_NAME_runtime \
-                     clio_run
-          cd build-boost
-          # --- Discriminator: does the SAME test pass with a SINGLE worker? ---
-          # CLIO_NUM_THREADS=1 => one worker serving both task + network roles.
-          # PASS  => the deadlock needs >=2 workers (cross-worker hand-off).
-          # HANG  => single-worker self-deadlock (re-entrant ProcessEventQueue).
-          echo "===================== SINGLE-WORKER (CLIO_NUM_THREADS=1) ====================="
-          CLIO_NUM_THREADS=1 ./bin/clio_run_wait_functionality_tests > /tmp/sw.out 2>&1 &
-          SW=$!
-          SW_DONE=0
-          for i in $(seq 1 90); do
-            if ! kill -0 "$SW" 2>/dev/null; then SW_DONE=1; break; fi
-            sleep 1
-          done
-          if [ "$SW_DONE" = "1" ]; then
-            wait "$SW"; RC=$?
-            echo "SINGLE-WORKER: completed in <90s, rc=$RC  => PASS means the bug is CROSS-WORKER"
-          else
-            echo "SINGLE-WORKER: STILL RUNNING after 90s => HANGS (single-worker self-deadlock)"
-            lldb -p "$SW" --batch -o 'thread backtrace all' -o 'detach' 2>&1 | sed -n '1,250p' || true
-            kill -9 "$SW" 2>/dev/null || true
-          fi
-          echo "--- single-worker output: last 150 lines (the loop in progress) ---"
-          tail -150 /tmp/sw.out || true
-          echo "--- single-worker: most-repeated normalized log lines (loop signature) ---"
-          sed -E 's/^[^ ]+ //; s/[0-9]+/N/g' /tmp/sw.out | sort | uniq -c | sort -rn | head -20 || true
-          echo "===================== END SINGLE-WORKER ====================="
-          # Launch the known-hanging test (default workers); let it deadlock.
-          ctest -R '^cr_all_wait_functionality_tests$' --timeout 300 -V > /tmp/ctest.out 2>&1 &
-          CT=$!
-          echo "Waiting for the test to reach its hang..."
-          sleep 50
-          echo "=== clio/test processes ==="
-          ps -axww | grep -iE 'clio|wait_functionality' | grep -v grep || true
-          for p in $(pgrep -f 'clio_run_wait_functionality_tests'); do
-            echo "===================== sample $p ====================="
-            sample "$p" 4 -mayDie 2>&1 | sed -n '1,250p' || true
-            echo "===================== lldb backtrace all $p ====================="
-            lldb -p "$p" --batch -o 'thread backtrace all' -o 'detach' 2>&1 | sed -n '1,400p' || true
-          done
-          echo "=== ctest output (tail) ==="
-          tail -50 /tmp/ctest.out || true
-          # Don't fail the job on the (expected) hang — this is a diagnostic.
-          kill "$CT" 2>/dev/null || true
-          pkill -f 'clio_run_wait_functionality_tests' 2>/dev/null || true
-          exit 0
+          cmake --preset boost
+          cmake --build build-boost -j"$(sysctl -n hw.ncpu)"
+          ctest --test-dir build-boost --output-on-failure --timeout 180 --repeat until-pass:3 -LE "ollama"
 
   # ---- Windows (vcpkg deps, boost-context feature) --------------------------
   windows:

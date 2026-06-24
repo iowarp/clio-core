@@ -140,11 +140,6 @@ bool Worker::Init() {
               Future<Task, CLIO_QUEUE_ALLOC_T>, ctp::ipc::MallocAllocator>>(
               CTP_MALLOC, event_queue_depth)
           .ptr_;
-  // TEMP(#620): confirm the event queue is sized correctly under the Boost
-  // backend on macOS (capacity must be event_queue_depth-1, not 0). Remove once
-  // the macOS Boost CI is green.
-  HLOG(kInfo, "Worker {} event_queue: depth={} capacity={}", worker_id_,
-       event_queue_depth, event_queue_->Capacity());
 
 #if defined(CLIO_ENABLE_BOOST_COROUTINES)
   // Per-worker freed-fiber-stack pool (see AllocateStack/FreeStack).
