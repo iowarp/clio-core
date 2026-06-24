@@ -186,7 +186,9 @@ class Allocator {
    */
   CTP_INLINE_CROSS_FUN
   char *GetAllocatorDataStart() const {
-    return GetBackendData() + GetAllocatorDataOff();
+    // Integer arithmetic — GetBackendData() may be null (#620).
+    return reinterpret_cast<char *>(
+        reinterpret_cast<size_t>(GetBackendData()) + GetAllocatorDataOff());
   }
 
   /**
@@ -219,8 +221,9 @@ class Allocator {
     if (backend_.data_capacity_ == SIZE_MAX) {
       return true;
     }
-    const char *char_ptr = reinterpret_cast<const char *>(ptr);
-    const char *data = GetBackendData();
+    // Integer arithmetic — GetBackendData() may be null (#620).
+    size_t char_ptr = reinterpret_cast<size_t>(ptr);
+    size_t data = reinterpret_cast<size_t>(GetBackendData());
     size_t off = char_ptr - data;
     return char_ptr >= data && off < backend_.data_capacity_;
   }
@@ -813,8 +816,12 @@ struct FullPtr : public ShmPointer {
     if (alloc && alloc->ContainsPtr(shm)) {
       shm_.off_ = shm.load();
       shm_.alloc_id_ = alloc->GetId();
-      char *backend_data = alloc->GetBackendData();
-      ptr_ = reinterpret_cast<T *>(backend_data + shm.load());
+      // Integer arithmetic, NOT `char* + offset`: GetBackendData() is null for
+      // the MallocAllocator (it stores absolute addresses as the "offset"), and
+      // `nullptr + offset` is undefined behavior that macOS clang at -O2 folds
+      // to null — corrupting every MallocAllocator-backed structure (#620).
+      ptr_ = reinterpret_cast<T *>(
+          reinterpret_cast<size_t>(alloc->GetBackendData()) + shm.load());
     } else {
       SetNull();
     }
@@ -825,7 +832,9 @@ struct FullPtr : public ShmPointer {
   CTP_CROSS_FUN explicit FullPtr(AllocT *alloc, size_t offset) {
     shm_.off_ = offset;
     shm_.alloc_id_ = alloc->GetId();
-    ptr_ = reinterpret_cast<T *>(alloc->GetBackendData() + offset);
+    // Integer arithmetic — see the OffsetPtr ctor above (#620).
+    ptr_ = reinterpret_cast<T *>(
+        reinterpret_cast<size_t>(alloc->GetBackendData()) + offset);
   }
 
   /** Shared half + alloc constructor for ShmPtr */
@@ -835,7 +844,9 @@ struct FullPtr : public ShmPointer {
     if (alloc->ContainsPtr(shm)) {
       shm_.off_ = shm.off_.load();
       shm_.alloc_id_ = shm.alloc_id_;
-      ptr_ = reinterpret_cast<T *>(alloc->GetBackendData() + shm.off_.load());
+      // Integer arithmetic — see the OffsetPtr ctor above (#620).
+      ptr_ = reinterpret_cast<T *>(
+          reinterpret_cast<size_t>(alloc->GetBackendData()) + shm.off_.load());
     } else {
       SetNull();
     }
@@ -845,8 +856,9 @@ struct FullPtr : public ShmPointer {
   template <typename AllocT>
   CTP_CROSS_FUN explicit FullPtr(AllocT *alloc, const T *ptr) {
     if (alloc->ContainsPtr(ptr)) {
-      shm_.off_ = (size_t)(reinterpret_cast<const char *>(ptr) -
-                           alloc->GetBackendData());
+      // Integer arithmetic — GetBackendData() may be null (#620).
+      shm_.off_ = reinterpret_cast<size_t>(ptr) -
+                  reinterpret_cast<size_t>(alloc->GetBackendData());
       shm_.alloc_id_ = alloc->GetId();
       ptr_ = const_cast<T *>(ptr);
     } else {

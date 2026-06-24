@@ -147,12 +147,9 @@ jobs:
             eval "$(conda shell.bash hook)"
           fi
           conda activate iowarp
-          # Build with DEBUG logging (override preset's INFO level) so the
-          # single-worker depth-3 trace shows which task re-executes/re-completes.
-          # CMAKE_BUILD_TYPE=Debug (-O0): tests whether the macOS event-queue
-          # cap=0 is an optimization-exposed miscompile (the stackless Mac Test
-          # that passes builds Debug; the Boost CI builds Release/-O2). #620
-          cmake --preset boost -DCLIO_CTP_LOG_LEVEL=0 -DCMAKE_BUILD_TYPE=Debug
+          # Release build (preset default, -O2) — verifies the #620 null-pointer
+          # arithmetic fix in FullPtr holds under the optimization that exposed it.
+          cmake --preset boost -DCLIO_CTP_LOG_LEVEL=0
           # Build only what the runtime test needs (skips CTE/CAE/filesystem +
           # the other test exes). The runtime dlopens the chimod *_runtime libs.
           cmake --build build-boost -j"$(sysctl -n hw.ncpu)" \
