@@ -79,6 +79,38 @@ jobs:
           cmake --build build-boost -j"$(nproc)"
           ctest --test-dir build-boost --output-on-failure --timeout 180 --repeat until-pass:3 -LE "ollama"
 
+  # ---- Linux arm64 (conda deps) — does the macOS/arm64 hang reproduce on a
+  #      native, debuggable arm64 box? Disambiguates "arm64 issue" (memory
+  #      model) from "macOS/Darwin issue". Free GitHub arm64 runner. (#620) -----
+  linux-arm:
+    name: linux-arm (ubuntu-24.04-arm)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - name: Install system libraries
+        run: sudo apt-get update && sudo apt-get install -y libhdf5-dev liburing-dev
+      - name: Install dependencies (conda env, incl. Boost.Context)
+        run: |
+          chmod +x install.sh
+          ./install.sh --only-deps
+      - name: Build with Boost backend + run ctest
+        run: |
+          if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
+            source "$HOME/miniconda3/etc/profile.d/conda.sh"
+          elif [ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]; then
+            source "$HOME/anaconda3/etc/profile.d/conda.sh"
+          elif command -v conda &>/dev/null; then
+            eval "$(conda shell.bash hook)"
+          fi
+          conda activate iowarp
+          cmake --preset boost
+          cmake --build build-boost -j"$(nproc)"
+          ctest --test-dir build-boost --output-on-failure --timeout 180 --repeat until-pass:3 -LE "ollama"
+
   # ---- macOS (conda deps via install.sh) ------------------------------------
   macos:
     name: macos (${{ matrix.os }})
