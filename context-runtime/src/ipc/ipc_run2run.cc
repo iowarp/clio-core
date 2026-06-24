@@ -325,6 +325,17 @@ void IpcManagerRun2Run::SendOut(ctp::ipc::FullPtr<chi::Task> origin_task) {
     return;
   }
 
+  // Cross-node response breadcrumb (issue #628). The origin node matches this
+  // reply to its in-flight task purely by the echoed net_key; if a responder
+  // returns a net_key the origin never sent, RecvOut can't find the origin and
+  // the cross-node op hangs. This responder-side line — at kInfo so it survives
+  // a default (non-debug) build, unlike the kDebug [RecvIn]/[RecvOut] lines —
+  // records the exact net_key being echoed so a mismatch is diagnosable from
+  // the side the origin never sees.
+  HLOG(kInfo, "[SendOut] Task {} replica {} -> node {}: echoing net_key {}",
+       origin_task->task_id_, origin_task->task_id_.replica_id_, target_node_id,
+       origin_task->task_id_.net_key_);
+
   int rc = SendOutTransmit(container, ipc_manager, origin_task, target_node_id,
                            target_host);
   if (rc == 0) {
@@ -382,7 +393,11 @@ bool IpcManagerRun2Run::RecvInHandleOne(
     recv_map_[recv_key] = task_ptr;
   }
 
-  HLOG(kDebug, "[RecvIn] Task {} method={} pool_id={} dispatching to workers",
+  // kInfo (not kDebug) so the received net_key is visible on a default build:
+  // paired with the [SendOut] breadcrumb it lets a net_key mismatch (issue #628)
+  // be localized entirely from the responder's log — received here vs. echoed
+  // on SendOut.
+  HLOG(kInfo, "[RecvIn] Task {} method={} pool_id={} dispatching to workers",
        task_ptr->task_id_, task_ptr->method_, task_ptr->pool_id_);
 
   chi::Future<chi::Task> future = ipc_manager->MakePointerFuture(task_ptr);
