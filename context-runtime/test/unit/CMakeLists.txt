@@ -88,6 +88,12 @@ set(CLIENT_RETRY_TEST_SOURCES
   test_client_retry.cc
 )
 
+# RecvOut stale-replica robustness test executable
+set(RECVOUT_ROBUSTNESS_TEST_TARGET chimaera_recvout_robustness_tests)
+set(RECVOUT_ROBUSTNESS_TEST_SOURCES
+  test_recvout_robustness.cc
+)
+
 
 # GPU IPC AllocateBuffer test executable (only if CUDA or HIP is enabled)
 set(IPC_ALLOCATE_BUFFER_GPU_TEST_TARGET test_ipc_allocate_buffer_gpu)
@@ -385,6 +391,34 @@ set_target_properties(${IPC_ERRORS_TEST_TARGET} PROPERTIES
 )
 
 set_target_properties(${IPC_ERRORS_TEST_TARGET} PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+
+# Create RecvOut stale-replica robustness test executable.
+# Links the admin module so the EndTask guard test can allocate a concrete
+# task; IpcManagerRun2Run / Worker live in chimaera_cxx.
+add_executable(${RECVOUT_ROBUSTNESS_TEST_TARGET} ${RECVOUT_ROBUSTNESS_TEST_SOURCES})
+
+target_include_directories(${RECVOUT_ROBUSTNESS_TEST_TARGET} PRIVATE
+  ${CLIO_RUN_ROOT}/include
+  ${CLIO_RUN_ROOT}/test  # For simple_test.h
+  ${CLIO_RUN_ROOT}/modules/admin/include  # For admin tasks
+)
+
+target_link_libraries(${RECVOUT_ROBUSTNESS_TEST_TARGET}
+  clio_admin_runtime          # Admin module runtime
+  clio_admin_client           # Admin module client
+  chimaera_cxx               # Main CLIO Runtime library
+  ctp::cxx                  # ClioCtp library
+  ${CMAKE_THREAD_LIBS_INIT}  # Threading support
+)
+
+set_target_properties(${RECVOUT_ROBUSTNESS_TEST_TARGET} PROPERTIES
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED ON
+)
+
+set_target_properties(${RECVOUT_ROBUSTNESS_TEST_TARGET} PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 
@@ -840,6 +874,17 @@ if(CLIO_CORE_ENABLE_TESTS)
     TIMEOUT 120
   )
 
+  # RecvOut Stale-Replica Robustness Tests
+  add_test(
+    NAME cr_recvout_robustness_tests
+    COMMAND ${RECVOUT_ROBUSTNESS_TEST_TARGET}
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_recvout_robustness_tests PROPERTIES
+    ENVIRONMENT "CHI_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500"
+    TIMEOUT 120
+  )
+
   # IPC Transport Mode Tests (POSIX fork-based — Linux/macOS only)
   # NOTE: Each test case must run in its own process because CHIMAERA_INIT has
   # a static guard that prevents re-initialization.
@@ -979,6 +1024,7 @@ if(CLIO_CORE_ENABLE_TESTS)
     cr_all_streaming_tests
     cr_runtime_cleanup_tests
     cr_ipc_errors_tests
+    cr_recvout_robustness_tests
     cr_unordered_map_ll_tests
   )
   if(NOT WIN32)
