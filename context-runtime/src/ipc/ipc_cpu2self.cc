@@ -110,13 +110,15 @@ void IpcCpu2Self::RuntimeSend(const FullPtr<Task> &task_ptr,
                                                 ctp::ipc::MallocAllocator> *>(
             parent_task->event_queue_);
     // DIAG(#620): log the event-queue state right before Emplace, which spins
-    // (WAIT_FOR_SPACE) on the macOS boost-fiber hang.
+    // (WAIT_FOR_SPACE) on the macOS boost-fiber hang. cap==0 => vector never
+    // sized; headDev/tailDev != head/tail => scoped-atomic inconsistency.
     HLOG(kError,
-         "RuntimeSend pre-Emplace: parent={} peq={} head={} tail={} size={}",
-         reinterpret_cast<uintptr_t>(parent_task),
+         "RuntimeSend pre-Emplace: peq={} head={} tail={} headDev={} tailDev={} "
+         "cap={} size={}",
          reinterpret_cast<uintptr_t>(parent_event_queue),
          parent_event_queue->GetHead(), parent_event_queue->GetTail(),
-         parent_event_queue->Size());
+         parent_event_queue->GetHeadDevice(), parent_event_queue->GetTailDevice(),
+         parent_event_queue->Capacity(), parent_event_queue->Size());
     parent_event_queue->Emplace(run_ctx->future_);
     if (parent_task->lane_) {
       // Always signal — see ipc_cpu2cpu_impl.h for the race.
