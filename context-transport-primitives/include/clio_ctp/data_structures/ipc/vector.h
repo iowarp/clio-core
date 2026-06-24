@@ -1045,11 +1045,15 @@ CTP_CROSS_FUN vector<T, AllocT>::vector(AllocT *alloc, size_t size, Args&&... ar
     if (!fp.ptr_) {
       // DIAG(#620): vector storage resolution failed -> size_ stays 0 -> a
       // WAIT_FOR_SPACE ring buffer built on this vector spins forever.
+      auto *a = this->GetAllocator();
       fprintf(stderr,
               "[VEC-DIAG #620] size=%zu alloc=%p data_off=0x%zx capacity_=%zu "
-              "fp.ptr=%p\n",
-              size, reinterpret_cast<void *>(this->GetAllocator()),
-              data_.off_.load(), capacity_, reinterpret_cast<void *>(fp.ptr_));
+              "fp.ptr=%p backendData=%p dataCap=0x%zx contains=%d\n",
+              size, reinterpret_cast<void *>(a), data_.off_.load(), capacity_,
+              reinterpret_cast<void *>(fp.ptr_),
+              a ? reinterpret_cast<void *>(a->GetBackendData()) : nullptr,
+              a ? a->GetBackendDataCapacity() : static_cast<size_t>(0),
+              a ? static_cast<int>(a->ContainsPtr(data_)) : -1);
       fflush(stderr);
     }
 #endif
