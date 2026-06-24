@@ -204,6 +204,7 @@ class IpcManager {
   friend struct IpcCpu2Self;
   friend struct IpcCpu2Cpu;
   friend struct IpcCpu2CpuZmq;
+  friend struct IpcRun2Fallback;
 #if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL
   friend struct IpcGpu2Cpu;
 #endif
@@ -267,6 +268,14 @@ class IpcManager {
    */
   CLIO_TASK_ALLOC_T *GetMainAllocator() {
     return main_allocator_;
+  }
+
+  /** Pid-based allocator ids of this runtime's SHM segments (pid.1 main,
+   *  pid.2 queue). Reported to clients via ClientConnect so they attach the
+   *  right allocators instead of assuming (1,0)/(2,0). */
+  ctp::ipc::AllocatorId GetMainAllocatorId() const { return main_allocator_id_; }
+  ctp::ipc::AllocatorId GetQueueAllocatorId() const {
+    return queue_allocator_id_;
   }
 
   /**
@@ -1358,6 +1367,31 @@ class IpcManager {
    */
   bool TryStartMainServer(const std::string &hostname);
 
+  /**
+   * Minimal bring-up for a fallback ("main"-runtime) client, used in place of
+   * the full ClientInit when this IpcManager is the nested fallback_ of another
+   * runtime in the same process. It does ONLY what punting needs and nothing
+   * that collides with the host runtime's process-global state: it attaches the
+   * main runtime's SHM segments, performs a single synchronous ClientConnect to
+   * learn the main runtime's worker-queue offset + pid, rebuilds the main
+   * runtime's worker queues, and creates a scheduler. It starts no async ZMQ
+   * recv thread and no heartbeat thread (those are what break a second full
+   * ClientInit inside a server process).
+   * @param main_port The main runtime's port.
+   * @return true on success; false if the main runtime is unreachable.
+   */
+  bool FallbackClientInit(u32 main_port);
+
+  /**
+   * Effective runtime port for this IpcManager: the per-instance override if
+   * set (fallback client → main runtime's port), else the global config port.
+   * Used on the client-init path for connect target + SHM segment names so a
+   * nested fallback client attaches the main runtime instead of this one.
+   */
+  u32 GetEffectivePort() const {
+    return port_override_ != 0 ? port_override_ : CLIO_CONFIG_MANAGER->GetPort();
+  }
+
   bool is_initialized_ = false;
 
   // Run-to-run IPC manager: owns all cross-node task-transfer state
@@ -1437,6 +1471,18 @@ class IpcManager {
 
   // IPC transport mode (TCP default, configurable via CLIO_IPC_MODE)
   IpcMode ipc_mode_ = IpcMode::kTcp;
+
+  // Port override for nested fallback clients. 0 = use the global config port
+  // (the normal case). The fallback IpcManager sets this to the main runtime's
+  // port so its connect target + SHM segment names resolve to the main runtime
+  // instead of this runtime. Consulted via GetEffectivePort().
+  u32 port_override_ = 0;
+
+  // Fallback ("main") runtime connection. Non-null on a runtime configured with
+  // a fallback port: a nested IpcManager acting as an SHM client of the main
+  // runtime. Tasks for pools this runtime does not own are punted here (see
+  // IpcRun2Fallback). Null = standalone runtime (no punting).
+  std::unique_ptr<IpcManager> fallback_;
 
   // SHM lightbeam transport (for SendShm / RecvShm)
   ctp::lbm::TransportPtr shm_send_transport_;
@@ -1574,6 +1620,16 @@ class IpcManager {
    * @return true if successful, false otherwise
    */
   bool IncreaseClientShm(size_t size);
+
+  /**
+   * Register one of this runtime's data segments with its fallback (main)
+   * runtime so main can resolve this runtime's FutureShm when a punted task
+   * completes in place. Sent over the fallback DEALER as a synchronous
+   * round-trip (the fallback connection runs no async recv thread). No-op if
+   * this runtime has no fallback. Used by IncreaseClientShm (runtime path) and
+   * RegisterMemory (client-segment forward).
+   */
+  void RegisterMemoryWithFallback(const ctp::ipc::AllocatorId &alloc_id);
 
   /**
    * Vector of allocators owned by this process

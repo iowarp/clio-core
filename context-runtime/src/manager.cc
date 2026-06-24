@@ -61,6 +61,7 @@ namespace clio::run {
 CLIO_RUN_API ctp::ThreadLocalKey chi_cur_worker_key_;
 CLIO_RUN_API bool chi_cur_worker_key_created_ = false;
 CLIO_RUN_API ctp::ThreadLocalKey chi_task_counter_key_;
+CLIO_RUN_API bool chi_task_counter_key_created_ = false;
 CLIO_RUN_API ctp::ThreadLocalKey chi_is_client_thread_key_;
 
 /**
@@ -244,9 +245,17 @@ bool RuntimeManager::ServerInit() {
     return false;
   }
 
-  // Process compose section if present
+  // Process compose section if present — unless this runtime is ephemeral
+  // (--ephemeral / CLIO_EPHEMERAL), in which case it starts bare and is
+  // composed explicitly (e.g. a spawned per-app runtime backed by a main
+  // runtime via the fallback).
   const auto &compose_config = config_manager->GetComposeConfig();
-  if (!compose_config.pools_.empty()) {
+  if (config_manager->IsEphemeral() && !compose_config.pools_.empty()) {
+    HLOG(kInfo,
+         "Ephemeral runtime: skipping default compose ({} pools in config)",
+         compose_config.pools_.size());
+  }
+  if (!config_manager->IsEphemeral() && !compose_config.pools_.empty()) {
     HLOG(kInfo, "Processing compose configuration with {} pools",
          compose_config.pools_.size());
 

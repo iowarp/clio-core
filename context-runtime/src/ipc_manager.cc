@@ -44,6 +44,7 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <functional>
 #include <iostream>
 #include <memory>
@@ -126,9 +127,13 @@ bool IpcManager::ClientInit() {
     return true;
   }
 
-  // Parse CLIO_IPC_MODE environment variable (default: TCP)
-  const char *ipc_mode_env = clio::run::env::GetCompat("IPC_MODE");
-  if (ipc_mode_env != nullptr) {
+  // Parse CLIO_IPC_MODE environment variable (default: TCP).
+  // A fallback client (port_override_ set) is pinned to SHM regardless of the
+  // env: punted tasks are completed in place in shared memory by the main
+  // runtime, which only works over the SHM data path.
+  if (port_override_ != 0) {
+    ipc_mode_ = IpcMode::kShm;
+  } else if (const char *ipc_mode_env = clio::run::env::GetCompat("IPC_MODE")) {
     std::string mode_str(ipc_mode_env);
     if (mode_str == "SHM" || mode_str == "shm") {
       ipc_mode_ = IpcMode::kShm;
@@ -174,7 +179,8 @@ bool IpcManager::ClientInit() {
   // Create lightbeam transport for client-server communication
   {
     auto *config = CLIO_CONFIG_MANAGER;
-    u32 port = config->GetPort();
+    // Effective port: a fallback client connects to the MAIN runtime's port.
+    u32 port = GetEffectivePort();
 
     if (ipc_mode_ == IpcMode::kIpc || UseLocalZmqIpc()) {
       // Unix-domain SocketTransport for the client<->runtime control path.
@@ -226,7 +232,12 @@ bool IpcManager::ClientInit() {
   // Initialize CTP TLS key for task counter before calling WaitForLocalServer,
   // which calls CreateTaskId(). Without the key registered first, GetTls() on
   // the zero-initialized key may return a stale/freed pointer → crash.
-  CTP_THREAD_MODEL->CreateTls<TaskCounter>(chi_task_counter_key_, nullptr);
+  // Guard against re-creating the global key: a fallback runtime brings up a
+  // second IpcManager (client) inside a process that already created it.
+  if (!chi_task_counter_key_created_) {
+    CTP_THREAD_MODEL->CreateTls<TaskCounter>(chi_task_counter_key_, nullptr);
+    chi_task_counter_key_created_ = true;
+  }
   auto *tls_counter = new TaskCounter();
   CTP_THREAD_MODEL->SetTls(chi_task_counter_key_, tls_counter);
 
@@ -386,12 +397,16 @@ bool IpcManager::ServerInit() {
     HLOG(kError, "Warning: Could not identify host, using default node ID");
     this_host_ = Host();  // Default constructor gives node_id = 0
   } else {
-    HLOG(kDebug, "Node ID identified: 0x{:x}", this_host_.node_id);
+    HLOG(kDebug, "Node ID identified: {}", this_host_.node_id);
   }
 
   // Initialize CTP TLS key for task counter (needed for CreateTaskId in
-  // runtime)
-  CTP_THREAD_MODEL->CreateTls<TaskCounter>(chi_task_counter_key_, nullptr);
+  // runtime). Guarded so a later fallback-client bring-up in this process does
+  // not re-create the global key.
+  if (!chi_task_counter_key_created_) {
+    CTP_THREAD_MODEL->CreateTls<TaskCounter>(chi_task_counter_key_, nullptr);
+    chi_task_counter_key_created_ = true;
+  }
 
   // Create scheduler using factory
   auto *config = CLIO_CONFIG_MANAGER;
@@ -458,6 +473,47 @@ bool IpcManager::ServerInit() {
   }
 
   is_initialized_ = true;
+
+  // Bring up the fallback ("main") runtime connection if configured. This
+  // runtime punts tasks for pools it does not own to the main runtime (crash
+  // isolation). The fallback is a nested IpcManager acting as an SHM client of
+  // the main runtime: port_override_ makes its connect target + segment names
+  // resolve to the main runtime, and ipc_mode_ is pinned to SHM so punted tasks
+  // complete in place. ClientInit already retries for CLIO_CLIENT_RETRY_TIMEOUT
+  // via WaitForLocalServer, so a failed bring-up means the main runtime stayed
+  // unreachable — warn and run standalone (unknown-pool tasks then fail locally
+  // exactly as before, no punting).
+  {
+    ConfigManager *config = CLIO_CONFIG_MANAGER;
+    u32 fb_port = config->GetFallbackPort();
+    if (fb_port != 0 && fb_port != config->GetPort()) {
+      HLOG(kInfo,
+           "IpcManager: connecting fallback client to main runtime on port {}",
+           fb_port);
+      auto fb = std::make_unique<IpcManager>();
+      // Dedicated minimal bring-up (NOT full ClientInit): a second full client
+      // in this server process collides on process-global ZMQ recv/heartbeat
+      // state. FallbackClientInit does only the SHM attach + a synchronous
+      // ClientConnect + worker-queue rebuild.
+      if (fb->FallbackClientInit(fb_port)) {
+        fallback_ = std::move(fb);
+        HLOG(kSuccess,
+             "IpcManager: fallback client connected to main runtime (port {})",
+             fb_port);
+      } else {
+        HLOG(kWarning,
+             "IpcManager: fallback runtime on port {} unreachable; running "
+             "standalone (tasks for non-local pools will fail locally)",
+             fb_port);
+      }
+    } else if (fb_port != 0) {
+      HLOG(kError,
+           "IpcManager: fallback_port ({}) equals this runtime's port; "
+           "ignoring self-referential fallback",
+           fb_port);
+    }
+  }
+
   return true;
 }
 
@@ -611,8 +667,12 @@ bool IpcManager::ServerInitShm() {
   ConfigManager *config = CLIO_CONFIG_MANAGER;
 
   try {
-    // Set allocator ID for main segment
-    main_allocator_id_ = ctp::ipc::AllocatorId::Get(1, 0);
+    // Allocator IDs are based on this runtime's pid so that multiple runtimes
+    // on one node (the fallback topology) own globally-distinct allocators
+    // instead of every runtime claiming (1,0)/(2,0). Convention: pid.1 = main,
+    // pid.2 = queue. Clients learn these dynamically via ClientConnect.
+    u32 pid = static_cast<u32>(ctp::SystemInfo::GetPid());
+    main_allocator_id_ = ctp::ipc::AllocatorId::Get(pid, 1);
 
     // Get configurable segment name
     std::string main_segment_name =
@@ -638,7 +698,7 @@ bool IpcManager::ServerInitShm() {
     }
 
     // Initialize queue segment (CLIO_QUEUE_ALLOC_T = ArenaAllocator) for TaskQueues
-    queue_allocator_id_ = ctp::ipc::AllocatorId::Get(2, 0);
+    queue_allocator_id_ = ctp::ipc::AllocatorId::Get(pid, 2);
     std::string queue_segment_name =
         config->GetSharedMemorySegmentName(kQueueSegment);
     size_t queue_segment_size = config->CalculateQueueSegmentSize();
@@ -654,6 +714,13 @@ bool IpcManager::ServerInitShm() {
       return false;
     }
 
+    // Reserve segment indices 0-2 of this pid's allocator-id space: index 1 is
+    // the main segment and index 2 is the queue segment (see above). Runtime
+    // data segments created on demand by IncreaseClientShm (for AllocateBuffer
+    // / FutureShm) start at index 3 so their AllocatorId never collides with
+    // main/queue. Clients use a different pid, so they keep starting at 0.
+    shm_count_.store(3, std::memory_order_relaxed);
+
     return true;
   } catch (const std::exception &e) {
     return false;
@@ -664,38 +731,54 @@ bool IpcManager::ClientInitShm() {
   ConfigManager *config = CLIO_CONFIG_MANAGER;
 
   try {
-    // Set allocator IDs (must match server)
-    main_allocator_id_ = ctp::ipc::AllocatorId(1, 0);
-    queue_allocator_id_ = ctp::ipc::AllocatorId(2, 0);
+    // Allocator IDs are NOT hardcoded: the server's are pid-based (pid.1 main,
+    // pid.2 queue) and differ per runtime. They are recovered from each
+    // segment's header on attach (and also reported by ClientConnect), so a
+    // fallback client attaching the main runtime's segments gets the main
+    // runtime's IDs — not a colliding (1,0)/(2,0).
 
-    // Get configurable segment names with environment variable expansion
+    // Get configurable segment names with environment variable expansion.
+    // port_override_ (non-zero on a fallback client) names the MAIN runtime's
+    // segments so this client attaches them instead of this runtime's own.
     std::string main_segment_name =
-        config->GetSharedMemorySegmentName(kMainSegment);
+        config->GetSharedMemorySegmentName(kMainSegment, port_override_);
     std::string queue_segment_name =
-        config->GetSharedMemorySegmentName(kQueueSegment);
+        config->GetSharedMemorySegmentName(kQueueSegment, port_override_);
 
     // Attach to existing main shared memory segment created by server
     if (!main_backend_.shm_attach(main_segment_name)) {
+      HLOG(kError, "ClientInitShm: shm_attach(main='{}') failed",
+           main_segment_name);
       return false;
     }
 
     // Attach to main allocator (CLIO_TASK_ALLOC_T = BuddyAllocator)
     main_allocator_ = main_backend_.AttachAlloc<CLIO_TASK_ALLOC_T>();
     if (!main_allocator_) {
+      HLOG(kError, "ClientInitShm: AttachAlloc(main='{}') failed",
+           main_segment_name);
       return false;
     }
+    // Recover the server's actual (pid-based) allocator id from the header.
+    main_allocator_id_ = main_allocator_->GetId();
 
     // Attach to queue segment (CLIO_QUEUE_ALLOC_T = ArenaAllocator)
     if (!queue_backend_.shm_attach(queue_segment_name)) {
+      HLOG(kError, "ClientInitShm: shm_attach(queue='{}') failed",
+           queue_segment_name);
       return false;
     }
     queue_allocator_ = queue_backend_.AttachAlloc<CLIO_QUEUE_ALLOC_T>();
     if (!queue_allocator_) {
+      HLOG(kError, "ClientInitShm: AttachAlloc(queue='{}') failed",
+           queue_segment_name);
       return false;
     }
+    queue_allocator_id_ = queue_allocator_->GetId();
 
     return true;
   } catch (const std::exception &e) {
+    HLOG(kError, "ClientInitShm: exception: {}", e.what());
     return false;
   }
 }
@@ -812,6 +895,146 @@ bool IpcManager::ClientInitQueues() {
   }
 }
 
+namespace {
+// Synchronous request/reply over a DEALER transport: serialize + send the
+// task, then block-poll the SAME socket for the matching reply and deserialize
+// it inline. The fallback client uses this instead of the async recv-thread
+// path (two full clients in one process collide on that path). Retries the send
+// every ~2s until total_timeout. The mutex serializes concurrent round-trips on
+// the shared dealer. Returns true if a reply for this task was deserialized
+// (caller inspects the task's OUT fields); false on timeout.
+template <typename TaskT>
+bool FallbackSyncRoundtrip(ctp::lbm::Transport *dealer, std::mutex &mtx,
+                           const ctp::ipc::FullPtr<TaskT> &task,
+                           float total_timeout) {
+  size_t net_key = reinterpret_cast<size_t>(task.ptr_);
+  task->task_id_.net_key_ = net_key;
+  auto start = std::chrono::steady_clock::now();
+  while (std::chrono::duration<float>(std::chrono::steady_clock::now() - start)
+             .count() < total_timeout) {
+    {
+      std::lock_guard<std::mutex> lock(mtx);
+      SaveTaskArchive send_archive(MsgType::kSerializeIn, dealer);
+      send_archive << (*task.ptr_);
+      dealer->Send(send_archive, ctp::lbm::LbmContext());
+
+      // Poll for the reply for up to ~2s before re-sending (covers the ZMTP
+      // handshake window on a freshly-created DEALER).
+      auto attempt_start = std::chrono::steady_clock::now();
+      while (std::chrono::duration<float>(std::chrono::steady_clock::now() -
+                                          attempt_start)
+                 .count() < 2.0f) {
+        auto archive = std::make_unique<LoadTaskArchive>();
+        auto info = dealer->Recv(*archive);
+        if (info.rc == EAGAIN) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(2));
+          continue;
+        }
+        if (info.rc != 0) {
+          dealer->ClearRecvHandles(*archive);
+          break;  // re-send
+        }
+        if (archive->task_infos_.empty() ||
+            archive->task_infos_[0].task_id_.net_key_ != net_key) {
+          dealer->ClearRecvHandles(*archive);
+          continue;  // not our reply
+        }
+        archive->msg_type_ = MsgType::kSerializeOut;
+        *archive >> (*task.ptr_);
+        dealer->ClearRecvHandles(*archive);
+        return true;
+      }
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  return false;
+}
+}  // namespace
+
+bool IpcManager::FallbackClientInit(u32 main_port) {
+  ConfigManager *config = CLIO_CONFIG_MANAGER;
+  port_override_ = main_port;        // segment names + (for consistency) port
+  ipc_mode_ = IpcMode::kShm;         // punted tasks complete in place via SHM
+
+  // Per-attempt + total wait budget (same env as the normal client path).
+  const char *wait_env = clio::run::env::GetCompat("WAIT_SERVER");
+  float total_timeout = wait_env ? static_cast<float>(std::atof(wait_env)) : 30.0f;
+  if (total_timeout <= 0) total_timeout = 30.0f;
+
+  // A dedicated DEALER to the MAIN runtime's control ROUTER (main_port + 3).
+  try {
+    zmq_transport_ = ctp::lbm::TransportFactory::Get(
+        config->GetServerAddr(), ctp::lbm::TransportType::kZeroMq,
+        ctp::lbm::TransportMode::kClient, "tcp", main_port + 3);
+  } catch (const std::exception &e) {
+    HLOG(kError, "FallbackClientInit: failed to create DEALER to main: {}",
+         e.what());
+    return false;
+  }
+
+  // CreateTaskId() needs a per-thread TaskCounter (guard the global key, then
+  // ensure this thread has a counter value).
+  if (!chi_task_counter_key_created_) {
+    CTP_THREAD_MODEL->CreateTls<TaskCounter>(chi_task_counter_key_, nullptr);
+    chi_task_counter_key_created_ = true;
+  }
+  if (CTP_THREAD_MODEL->GetTls<TaskCounter>(chi_task_counter_key_) == nullptr) {
+    CTP_THREAD_MODEL->SetTls(chi_task_counter_key_, new TaskCounter());
+  }
+
+  // Synchronous ClientConnect (no async recv thread — see FallbackSyncRoundtrip).
+  auto task = NewTask<clio::run::admin::ClientConnectTask>(
+      CreateTaskId(), kAdminPoolId, PoolQuery::Local());
+  bool connected =
+      FallbackSyncRoundtrip(zmq_transport_.get(), zmq_client_send_mutex_, task,
+                            total_timeout) &&
+      task->response_ == 0;
+  if (connected) {
+    worker_queues_off_ = task->worker_queues_off_;
+    runtime_pid_ = task->server_pid_;
+    server_generation_.store(task->server_generation_);
+    // Adopt the main runtime's dynamic (pid-based) allocator ids.
+    main_allocator_id_ = task->main_alloc_id_;
+    queue_allocator_id_ = task->queue_alloc_id_;
+  }
+  DelTask(task);
+  if (!connected) {
+    HLOG(kError,
+         "FallbackClientInit: main runtime on port {} did not answer "
+         "ClientConnect within {}s",
+         main_port, total_timeout);
+    return false;
+  }
+
+  // Attach the main runtime's segments (port-keyed via port_override_) and
+  // rebuild its worker queues from the offset learned above.
+  if (!ClientInitShm() || !ClientInitQueues()) {
+    HLOG(kError, "FallbackClientInit: failed to attach main runtime segments");
+    return false;
+  }
+
+  // Scheduler for ClientMapTask (lane selection on the main runtime's queues).
+  if (config && config->IsValid()) {
+    scheduler_ = SchedulerFactory::Get(config->GetLocalSched());
+  }
+
+  // SHM lightbeam transports used to serialize a punted internal subtask into
+  // its (shared) FutureShm copy_space and to deserialize the outputs main wrote
+  // back. The kShm transport is segment-agnostic — it operates on the
+  // per-call ctx.copy_space — so these can serialize into any copy_space the
+  // owning runtime allocated. See IpcRun2Fallback::PuntCopyIn / CompletePunt.
+  shm_send_transport_ = ctp::lbm::TransportFactory::Get(
+      "", ctp::lbm::TransportType::kShm, ctp::lbm::TransportMode::kClient);
+  shm_recv_transport_ = ctp::lbm::TransportFactory::Get(
+      "", ctp::lbm::TransportType::kShm, ctp::lbm::TransportMode::kServer);
+
+  is_initialized_ = true;
+  HLOG(kSuccess,
+       "FallbackClientInit: connected to main runtime (port {}, pid {})",
+       main_port, runtime_pid_);
+  return true;
+}
+
 bool IpcManager::StartLocalServer() {
   ConfigManager *config = CLIO_CONFIG_MANAGER;
 
@@ -892,11 +1115,12 @@ retry_attempt:
       HLOG(kError, "3. Network connectivity issues");
       return false;
     }
-    HLOG(kWarning, "Attempt {} timed out after {:.1f}s; recreating DEALER",
+    HLOG(kWarning, "Attempt {} timed out after {}s; recreating DEALER",
          attempt_idx, per_attempt);
     if (ipc_mode_ == IpcMode::kTcp) {
       auto *config = CLIO_CONFIG_MANAGER;
-      u32 port = config->GetPort();
+      // Effective port: a fallback client recreates its DEALER to the MAIN port.
+      u32 port = GetEffectivePort();
       if (zmq_recv_running_.load()) {
         zmq_recv_running_.store(false);
         if (zmq_recv_thread_.joinable()) zmq_recv_thread_.join();
@@ -936,6 +1160,10 @@ retry_attempt:
   if (task->response_ == 0) {
     client_generation_ = task->server_generation_;
     worker_queues_off_ = task->worker_queues_off_;
+    // Adopt the runtime's dynamic (pid-based) allocator ids rather than
+    // assuming (1,0)/(2,0).
+    main_allocator_id_ = task->main_alloc_id_;
+    queue_allocator_id_ = task->queue_alloc_id_;
     if (task->server_pid_ > 0) {
       runtime_pid_ = static_cast<int>(task->server_pid_);
     }
@@ -1475,8 +1703,8 @@ const Host &IpcManager::GetThisHost() const { return this_host_; }
 
 size_t IpcManager::GetRuntimeHeapAllocatedBytes() const {
 #if CTP_IS_HOST
-  // CTP_MALLOC is the private heap backing AllocateBuffer/NewObj in runtime
-  // (and client ZMQ) mode. GetCurrentlyAllocatedSize() returns 0 unless built
+  // CTP_MALLOC is the private heap backing NewObj and the client-ZMQ
+  // AllocateBuffer path. GetCurrentlyAllocatedSize() returns 0 unless built
   // with CTP_ALLOC_TRACK_SIZE (CLIO_CORE_ENABLE_LEAK_CHECK).
   size_t total = CTP_MALLOC->GetCurrentlyAllocatedSize();
 #if defined(CTP_ALLOC_TRACK_SIZE)
@@ -1487,6 +1715,17 @@ size_t IpcManager::GetRuntimeHeapAllocatedBytes() const {
   long long task_bytes = RuntimeTaskAllocBytes().load();
   if (task_bytes > 0) {
     total += static_cast<size_t>(task_bytes);
+  }
+  // The runtime's AllocateBuffer draws from the per-process SHM
+  // MultiProcessAllocator segments (not CTP_MALLOC), so add their outstanding
+  // bytes too — otherwise a leaked runtime buffer is invisible here.
+  {
+    std::lock_guard<std::mutex> lock(shm_mutex_);
+    for (auto *alloc : alloc_vector_) {
+      if (alloc != nullptr) {
+        total += alloc->GetCurrentlyAllocatedSize();
+      }
+    }
   }
 #endif
   return total;
@@ -1499,19 +1738,22 @@ FullPtr<char> IpcManager::AllocateBuffer(size_t size) {
 #if CTP_IS_HOST
   // HOST-ONLY PATH: The device implementation is in ipc_manager.h
 
-  // RUNTIME PATH: Use private memory (CTP_MALLOC) — runtime never uses
-  // per-process shared memory segments
-  if (CLIO_RUNTIME_MANAGER && CLIO_RUNTIME_MANAGER->IsRuntime()) {
-    // Use CTP_MALLOC allocator for private memory allocation
-    FullPtr<char> buffer = CTP_MALLOC->AllocateObjs<char>(size);
-    if (buffer.IsNull()) {
-      HLOG(kError, "AllocateBuffer: CTP_MALLOC failed for {} bytes", size);
-    }
-    return buffer;
-  }
+  // RUNTIME PATH: draw from per-process shared-memory segments (same growable
+  // MultiProcessAllocator strategy as the SHM client below), NOT CTP_MALLOC.
+  // Buffers and FutureShm allocated here must be resolvable from another
+  // process so a task this runtime punts to its fallback (main) can have its
+  // FutureShm completed IN PLACE by main. MultiProcessAllocator gives each
+  // worker thread its own lock-free block (like malloc's per-thread arenas), so
+  // unlike the single-lock main BuddyAllocator it absorbs the runtime's
+  // high-concurrency churn without contending. The runtime falls through to the
+  // shared steps 1-4 (it is the SHM owner; IsRuntime() gates registration in
+  // IncreaseClientShm so it does not ClientSend to itself).
+  const bool is_runtime =
+      (CLIO_RUNTIME_MANAGER != nullptr) && CLIO_RUNTIME_MANAGER->IsRuntime();
 
-  // CLIENT TCP/IPC PATH: Use private memory (no shared memory needed)
-  if (ipc_mode_ != IpcMode::kShm) {
+  // CLIENT TCP/IPC PATH: Use private memory (no shared memory needed). The
+  // runtime always uses the SHM path regardless of ipc_mode_.
+  if (!is_runtime && ipc_mode_ != IpcMode::kShm) {
     FullPtr<char> buffer = CTP_MALLOC->AllocateObjs<char>(size);
     if (buffer.IsNull()) {
       HLOG(kError,
@@ -1745,6 +1987,29 @@ bool IpcManager::TryPopNetTask(NetQueuePriority priority,
 // Per-Process Shared Memory Management
 //==============================================================================
 
+void IpcManager::RegisterMemoryWithFallback(
+    const ctp::ipc::AllocatorId &alloc_id) {
+  if (fallback_ == nullptr) {
+    return;
+  }
+  HLOG(kInfo,
+       "IpcManager::RegisterMemoryWithFallback: forwarding ({}.{}) registration "
+       "to main runtime",
+       alloc_id.major_, alloc_id.minor_);
+  auto fb_reg_task = fallback_->NewTask<clio::run::admin::RegisterMemoryTask>(
+      clio::run::CreateTaskId(), clio::run::kAdminPoolId,
+      clio::run::PoolQuery::Local(), alloc_id);
+  if (!FallbackSyncRoundtrip(fallback_->zmq_transport_.get(),
+                             fallback_->zmq_client_send_mutex_, fb_reg_task,
+                             30.0f)) {
+    HLOG(kWarning,
+         "IpcManager::RegisterMemoryWithFallback: main runtime did not ack "
+         "({}.{}); punted tasks using it may fail to resolve",
+         alloc_id.major_, alloc_id.minor_);
+  }
+  fallback_->DelTask(fb_reg_task);
+}
+
 bool IpcManager::IncreaseClientShm(size_t size) {
   HLOG(kDebug, "IncreaseClientShm CALLED: size={}", size);
   std::lock_guard<std::mutex> lock(shm_mutex_);
@@ -1814,8 +2079,23 @@ bool IpcManager::IncreaseClientShm(size_t size) {
     // Release the lock before returning
     allocator_map_lock_.WriteUnlock();
 
-    // Tell the runtime server to attach to this new shared memory segment.
-    // Use kAdminPoolId directly (not admin_client->pool_id_) because
+    // RUNTIME PATH: the server owns this segment and already inserted it into
+    // its own alloc_map_ above, so it resolves its own buffers/FutureShm
+    // directly — there is no server to ask and no client DEALER to send on (a
+    // self-directed ClientSend().Wait() would block forever). If this runtime
+    // has a fallback (main) runtime, register the new segment with main over
+    // the fallback DEALER so main can resolve this runtime's FutureShm when a
+    // punted task completes in place. Done synchronously (no async recv thread
+    // on the fallback connection), mirroring the dual-RegisterMemory path.
+    if (CLIO_RUNTIME_MANAGER && CLIO_RUNTIME_MANAGER->IsRuntime()) {
+      if (fallback_ != nullptr) {
+        RegisterMemoryWithFallback(alloc_id);
+      }
+      return true;
+    }
+
+    // CLIENT PATH: tell the runtime server to attach to this new shared memory
+    // segment. Use kAdminPoolId directly (not admin_client->pool_id_) because
     // the admin client may not be initialized yet during ClientInit.
     auto reg_task = NewTask<clio::run::admin::RegisterMemoryTask>(
         clio::run::CreateTaskId(), clio::run::kAdminPoolId, clio::run::PoolQuery::Local(),
@@ -1894,6 +2174,11 @@ bool IpcManager::RegisterMemory(const ctp::ipc::AllocatorId &alloc_id) {
 
     // Release the lock before returning
     allocator_map_lock_.WriteUnlock();
+
+    // Fallback mode: also register this client segment on the main runtime so
+    // it can resolve + complete FutureShms for tasks this runtime punts to it
+    // (a punted task's FutureShm lives in this client segment).
+    RegisterMemoryWithFallback(alloc_id);
 
     return true;
 
@@ -2120,9 +2405,33 @@ size_t IpcManager::WreapAllIpcs() {
 size_t IpcManager::ClearUserIpcs() {
   size_t removed_count = 0;
   std::string memfd_dir = ctp::SystemInfo::GetMemfdDir();
+  int current_pid = ctp::SystemInfo::GetPid();
 
   for (const auto &name : ctp::SystemInfo::ListDirectory(memfd_dir)) {
     std::string full_path = memfd_dir + "/" + name;
+
+    // The per-user memfd dir is shared by every runtime on this node (the
+    // fallback topology runs several). Only reap leftovers from DEAD processes
+    // — never clobber a segment a still-running runtime owns, or we break its
+    // clients (and its fallbacks). memfd entries are symlinks to
+    // /proc/<pid>/fd/N; if that pid is alive and isn't us, keep the entry.
+    std::error_code ec;
+    auto target = std::filesystem::read_symlink(full_path, ec);
+    if (!ec) {
+      const std::string t = target.string();
+      constexpr const char *kProc = "/proc/";
+      if (t.rfind(kProc, 0) == 0) {
+        int owner_pid = std::atoi(t.c_str() + std::strlen(kProc));
+        if (owner_pid > 0 && owner_pid != current_pid &&
+            ctp::SystemInfo::IsProcessAlive(owner_pid)) {
+          HLOG(kDebug,
+               "ClearUserIpcs: keeping {} (owned by live pid {})", name,
+               owner_pid);
+          continue;
+        }
+      }
+    }
+
     if (ctp::SystemInfo::RemoveFile(full_path)) {
       HLOG(kDebug, "ClearUserIpcs: Removed memfd symlink: {}", name);
       removed_count++;
@@ -2345,7 +2654,7 @@ bool IpcManager::WaitForServerAndReconnect(
               .count();
       if (client_retry_timeout_ >= 0 && elapsed >= client_retry_timeout_) {
         HLOG(kWarning, "WaitForServerAndReconnect: Original server timed out "
-             "after {:.1f}s", elapsed);
+             "after {}s", elapsed);
         break;
       }
       std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -2690,11 +2999,13 @@ RouteResult IpcManager::RouteTask(Future<Task> &future, bool force_enqueue) {
     return RouteResult::ExecHere;
   }
 
-  // ManyToOne collective routing is handled before the normal resolve path:
-  // forward to the neighborhood leader, or park into the batch manager if we
-  // are the leader. (The aggregate task the leader later runs is a plain
-  // Local task and does not re-enter this branch.)
-  if (task_ptr->pool_query_.IsManyToOneMode()) {
+  // Collective (ManyToOne / AllToOne) routing is handled before the normal
+  // resolve path: forward to the neighborhood leader, or park into the batch
+  // manager if we are the leader. Both modes share this routing; they differ
+  // only in the BatchManager flush condition (time window vs. all-containers
+  // barrier). (The aggregate task the leader later runs is a plain Local task
+  // and does not re-enter this branch.)
+  if (task_ptr->pool_query_.IsCollectiveMode()) {
     return RouteManyToOne(future);
   }
 
@@ -2771,8 +3082,9 @@ RouteResult IpcManager::RouteManyToOne(Future<Task> &future) {
     batch_manager_->Add(task_ptr);
     return RouteResult::Local;
   }
-  // Forward to the leader. pool_query_ stays ManyToOne so the leader re-enters
-  // this path and batches; only the network address is the leader node.
+  // Forward to the leader. The forwarded task keeps its collective pool_query_
+  // (ManyToOne or AllToOne) so the leader re-enters this path and batches; only
+  // the network address is the leader node.
   std::vector<PoolQuery> pool_queries = {PoolQuery::Physical((u32)leader)};
   pool_queries[0].SetReturnNode(GetNodeId());
   return RouteGlobal(future, pool_queries);
@@ -2835,8 +3147,9 @@ bool IpcManager::IsTaskLocal(const FullPtr<Task> & /*task_ptr*/,
     case RoutingMode::Range:
     case RoutingMode::Broadcast:
     case RoutingMode::ManyToOne:
-      // These modes should have been resolved (ManyToOne → Local on the
-      // neighborhood leader, else Physical) by now. If we still see them
+    case RoutingMode::AllToOne:
+      // These modes should have been resolved (ManyToOne/AllToOne → Local on
+      // the neighborhood leader, else Physical) by now. If we still see them
       // here, they are not local.
       return false;
 
@@ -2994,8 +3307,10 @@ std::vector<PoolQuery> IpcManager::ResolvePoolQuery(
       result = {query};
       break;
     case RoutingMode::ManyToOne:
-      // ManyToOne is intercepted in RouteTask (RouteManyToOne) before reaching
-      // here. If it ever falls through, resolve to the neighborhood leader.
+    case RoutingMode::AllToOne:
+      // Collective modes are intercepted in RouteTask (RouteManyToOne) before
+      // reaching here. If one ever falls through, resolve to the neighborhood
+      // leader.
       result = {PoolQuery::Physical(
           (u32)GetNeighborhoodLeaderNodeId())};
       break;

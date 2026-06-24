@@ -1,14 +1,13 @@
 #!/bin/bash
-# Run IOWarp Migrate Integration Test (CLIO Runtime Runtime)
+# Run IOWarp AllToOne Collective Integration Test (CLIO Runtime)
 #
-# Tests container migration with retry queue:
-# 1. Starts 4-node Docker cluster
-# 2. Runs test binary on node 1 that:
-#    a. Creates MOD_NAME pool with 4 containers
-#    b. Submits task targeting container 0 (pre-migration)
-#    c. Migrates container 0 from node 1 to node 2
-#    d. Submits task targeting container 0 (post-migration, exercises retry queue)
-#    e. Verifies both tasks complete successfully
+# This script manages the distributed test environment, including:
+# - 4-node docker cluster; runs the AllToOne barrier test as a client
+# - Test execution with coverage support
+# - Cleanup
+#
+# Coverage: Uses deps-cpu container with mounted workspace, allowing
+# gcda files to be written directly to the build directory for coverage.
 
 set -e
 
@@ -17,23 +16,28 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../../../" && pwd)"
 
 # Export workspace path for docker-compose
+# Priority: HOST_WORKSPACE > existing IOWARP_CORE_ROOT > computed REPO_ROOT
 if [ -n "${HOST_WORKSPACE:-}" ]; then
+    # Explicitly set by user
     export IOWARP_CORE_ROOT="${HOST_WORKSPACE}"
 elif [ -z "${IOWARP_CORE_ROOT:-}" ]; then
+    # IOWARP_CORE_ROOT not set, use computed path
     export IOWARP_CORE_ROOT="${REPO_ROOT}"
 fi
+# Otherwise keep existing IOWARP_CORE_ROOT (e.g., from devcontainer.json)
 
 # Configuration
 NUM_NODES=${NUM_NODES:-4}
-TEST_FILTER=${TEST_FILTER:-[migrate]}
+TEST_FILTER=${TEST_FILTER:-"[alltoone]"}  # Catch2 tag of the AllToOne barrier test
 
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-NC='\033[0m'
+NC='\033[0m' # No Color
 
+# Functions
 log_info() {
     echo -e "${BLUE}[INFO]${NC} $1"
 }
@@ -59,19 +63,13 @@ start_docker_cluster() {
     export HOST_UID=$(id -u)
     export HOST_GID=$(id -g)
 
+    # Start containers in detached mode
     # Auto-detect Docker image: use nvidia image if binary requires CUDA
     if [ -z "${IOWARP_DOCKER_IMAGE:-}" ]; then
         CLIO_BIN="/workspace/build/bin/clio_run"
         [ ! -f "$CLIO_BIN" ] && CLIO_BIN="${IOWARP_CORE_ROOT:-/workspace}/build/bin/clio_run"
         if [ -f "$CLIO_BIN" ] && ldd "$CLIO_BIN" 2>/dev/null | grep -q "libcudart"; then
             export IOWARP_DOCKER_IMAGE="iowarp/deps-nvidia:latest"
-            # Stage the libcudart the host binary links into build/bin (mounted +
-            # first on the container LD_LIBRARY_PATH) so a CUDA build loads in the
-            # driverless container. No-op for a CPU build (no libcudart).
-            _bindir="$(dirname "$CLIO_BIN")"
-            ldd "$CLIO_BIN" 2>/dev/null | awk '/libcudart/{print $3}' | while read -r _lib; do
-                { [ -n "$_lib" ] && [ -f "$_lib" ] && cp -Lu "$_lib" "$_bindir/" 2>/dev/null; } || true
-            done
         else
             export IOWARP_DOCKER_IMAGE="iowarp/deps-cpu:latest"
         fi
@@ -79,12 +77,15 @@ start_docker_cluster() {
 
     docker compose up -d
 
+    # Wait for containers to be ready
     log_info "Waiting for containers to initialize..."
     sleep 10
 
+    # Check container status
     docker compose ps
 
     log_success "Docker cluster started"
+    log_info "View live logs with: docker compose logs -f"
 }
 
 # Stop Docker cluster
@@ -95,53 +96,93 @@ stop_docker_cluster() {
     log_success "Docker cluster stopped"
 }
 
-# Run a single test case inside the Docker cluster
-run_single_test() {
-    local filter="$1"
-    docker exec iowarp-migrate-node1 bash -c "
-        export CLIO_WITH_RUNTIME=0
-        clio_run_migrate_tests '$filter'
-    "
+
+
+# Check if a test name matches the filter
+matches_filter() {
+    local name="$1"
+    local filter="$2"
+    if [ -z "$filter" ]; then
+        return 0
+    fi
+    case "$name" in
+        *"$filter"*) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
-# Run test directly in Docker
+# Run the AllToOne collective test inside the cluster as a client of node 1.
+# CLIO_WITH_RUNTIME=0 attaches to the already-running 4-node cluster instead of
+# spawning a local runtime; CLIO_NUM_CONTAINERS (from the compose env) tells the
+# test how many AllToOne requests to issue (one per container = one per node),
+# which is exactly the pool's container count, so the barrier releases when all
+# arrive. Returns the docker exec's exit code (also catches a crashed daemon's
+# "container is not running").
+run_single_test() {
+    local filter="$1"
+    if ! docker exec iowarp-alltoone-node1 bash -c "
+        export CLIO_WITH_RUNTIME=0
+        clio_run_bdev_chimod_tests '$filter'
+    "; then
+        return 1
+    fi
+    return 0
+}
+
+# Run the AllToOne barrier test against the cluster.
 run_test_docker_direct() {
-    log_info "Running migrate test with filter: $TEST_FILTER"
+    log_info "Running AllToOne barrier test with filter: $TEST_FILTER"
     cd "$SCRIPT_DIR"
 
-    # Wait for all runtimes to be ready
+    # Wait for all runtimes to be ready (give them time to initialize).
     log_info "Waiting for runtimes to initialize across all nodes..."
     sleep 5
 
-    log_info "Running $TEST_FILTER..."
-    run_single_test "$TEST_FILTER"
-    log_success "$TEST_FILTER passed"
-
-    log_success "All tests completed"
+    if run_single_test "$TEST_FILTER"; then
+        log_success "AllToOne barrier test passed"
+        log_success "All tests completed"
+        return 0
+    fi
+    log_error "AllToOne barrier test FAILED"
+    return 1
 }
 
-# Usage
+
+# Usage information
 usage() {
     cat << EOF
 Usage: $0 [OPTIONS] COMMAND
 
 Commands:
     setup       Start the Docker cluster
-    run         Run the migrate test
+    run         Run the AllToOne test
     clean       Stop the Docker cluster and clean up
-    all         Setup, run, and clean (default)
+    all         Setup and run (default)
 
 Options:
     -n, --num-nodes NUM     Number of nodes (default: 4)
-    -f, --filter FILTER     Test name filter (default: migrate_reroute)
+    -f, --filter FILTER     Test name filter (default: bdev_file_explicit_backend)
     -h, --help              Show this help message
 
+Environment Variables:
+    NUM_NODES       Number of nodes
+    TEST_FILTER     Test name filter
+
 Examples:
+    # Start cluster and run tests (default)
     $0 all
-    $0 -f "migrate_reroute" run
+
+    # Run specific test
+    $0 -f "bdev_file_explicit_backend" run
+
+    # Use different number of nodes
+    $0 -n 8 all
+
+    # Just setup cluster
     $0 setup
+
+    # Run tests on existing cluster
     $0 run
-    $0 clean
 EOF
 }
 
@@ -172,10 +213,11 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Default command
 COMMAND=${COMMAND:-all}
 
 # Main execution
-log_info "IOWarp Migrate Test Runner"
+log_info "IOWarp AllToOne Test Runner"
 log_info "Configuration:"
 log_info "  Nodes: $NUM_NODES"
 log_info "  Test filter: $TEST_FILTER"
@@ -202,10 +244,10 @@ case $COMMAND in
         run_test_docker_direct || EXIT_CODE=$?
         stop_docker_cluster
         if [ $EXIT_CODE -ne 0 ]; then
-            log_error "Migrate test FAILED"
+            log_error "AllToOne test FAILED"
             exit $EXIT_CODE
         fi
-        log_success "Migrate test PASSED"
+        log_success "AllToOne test PASSED"
         ;;
 
     *)

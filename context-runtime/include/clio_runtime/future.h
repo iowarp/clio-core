@@ -77,6 +77,10 @@ struct FutureShm {
       16; /**< GPU->GPU path: use device-scope atomics (no system fence) */
   static constexpr u32 FUTURE_POD_COPY =
       32; /**< POD cudaMemcpy path: no serialization, task is raw memcpy'd */
+  static constexpr u32 FUTURE_PUNTED =
+      64; /**< Task was forwarded to the fallback (main) runtime because its
+             pool is non-local. Loop guard: a runtime never re-punts an
+             already-punted task (see IpcRun2Fallback). */
 
   // Origin constants: how the client submitted this task
   static constexpr u32 FUTURE_CLIENT_SHM = 0; /**< Client used shared memory */

@@ -1636,6 +1636,69 @@ TEST_CASE("bdev_manytoone_batch", "[bdev][manytoone]") {
   }
 }
 
+// AllToOne collective barrier: unlike ManyToOne (time-windowed), the aggregate
+// must NOT run until a task from EVERY container in the pool has arrived. We
+// submit exactly num_containers AllToOne requests sharing one (hash, key); the
+// neighborhood leader holds them until the count reaches the pool's container
+// count, then runs the aggregate ONCE and broadcasts the result to all members.
+//
+// Meaningful on a multi-node cluster (num_containers = node count, set via
+// CLIO_NUM_CONTAINERS); degenerates to a single-member barrier on one node.
+// Correctness relies on the barrier: if the leader flushed before all arrived,
+// the remaining members would never reach the count and their Wait() would hang
+// (the test would time out), so completion-of-all confirms the count-based
+// flush fired at exactly the right moment. The single 1->N broadcast is checked
+// by requiring every member to observe the SAME allocated blocks.
+TEST_CASE("bdev_alltoone_barrier", "[bdev][alltoone]") {
+  BdevChimodFixture fixture;
+  REQUIRE(g_initialized);
+  std::this_thread::sleep_for(100ms);
+
+  clio::run::PoolId custom_pool_id(8019, 0);
+  clio::run::bdev::Client bdev_client(custom_pool_id);
+
+  const clio::run::u64 ram_size = 16 * 1024 * 1024;
+  std::string pool_name =
+      "alltoone_" + std::to_string(getpid()) + "_" + std::to_string(8019);
+  bool bdev_success = BdevChimodFixture::CreateBdevAsync(
+      bdev_client, clio::run::PoolQuery::Dynamic(), pool_name, custom_pool_id,
+      clio::run::bdev::BdevType::kRam, ram_size);
+  REQUIRE(bdev_success);
+  std::this_thread::sleep_for(100ms);
+
+  // One AllToOne request per container in the pool — the collective contract.
+  const clio::run::u32 num_containers = fixture.getNumContainers();
+  HLOG(kInfo, "AllToOne barrier over num_containers={}", num_containers);
+  constexpr clio::run::u32 kContainerHash = 0;
+  constexpr clio::run::u64 kBatchKey = 0;
+
+  std::vector<clio::run::Future<clio::run::bdev::AllocateBlocksTask>> futures;
+  futures.reserve(num_containers);
+  for (clio::run::u32 i = 0; i < num_containers; ++i) {
+    auto q = clio::run::PoolQuery::AllToOne(kContainerHash, kBatchKey);
+    futures.push_back(bdev_client.AsyncAllocateBlocks(q, k4KB));
+  }
+
+  // Every submitter completes once the barrier releases (all arrived), each
+  // carrying the single aggregate's broadcast result.
+  clio::run::u64 first_block = 0;
+  bool have_first = false;
+  for (clio::run::u32 i = 0; i < num_containers; ++i) {
+    futures[i].Wait();
+    REQUIRE(futures[i]->return_code_ == 0);
+    REQUIRE(futures[i]->blocks_.size() > 0);
+    HLOG(kInfo, "AllToOne member {} got {} block(s)", i,
+         futures[i]->blocks_.size());
+    // All members must observe the SAME blocks — one aggregate broadcast 1->N.
+    if (!have_first) {
+      first_block = futures[i]->blocks_[0].offset_;
+      have_first = true;
+    } else {
+      REQUIRE(futures[i]->blocks_[0].offset_ == first_block);
+    }
+  }
+}
+
 //==============================================================================
 // MAIN TEST RUNNER
 //==============================================================================

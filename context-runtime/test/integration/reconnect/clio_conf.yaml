@@ -18,3 +18,11 @@ runtime:
   queue_depth: 1024
   local_sched: "default"
   first_busy_wait: 50
+
+# Fast SWIM failure detection for the test (production defaults are 30/15/60s,
+# which would take ~150s to confirm a dead node — longer than the scenario).
+swim:
+  enabled: true
+  direct_probe_timeout_sec: 2.0
+  indirect_probe_timeout_sec: 2.0
+  suspicion_timeout_sec: 3.0

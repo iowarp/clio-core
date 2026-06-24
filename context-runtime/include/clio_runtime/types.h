@@ -570,6 +570,10 @@ enum MemorySegment {
 extern CLIO_RUN_API ctp::ThreadLocalKey chi_cur_worker_key_;
 extern CLIO_RUN_API bool chi_cur_worker_key_created_;
 extern CLIO_RUN_API ctp::ThreadLocalKey chi_task_counter_key_;
+// Guards chi_task_counter_key_ creation. Without it a second IpcManager bring-up
+// in the same process (the fallback runtime client) would re-create the global
+// pthread key, leaking the old one and colliding all TLS ops on key 0.
+extern CLIO_RUN_API bool chi_task_counter_key_created_;
 extern CLIO_RUN_API ctp::ThreadLocalKey chi_is_client_thread_key_;
 
 /**

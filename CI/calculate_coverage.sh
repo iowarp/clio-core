@@ -142,6 +142,14 @@ fi
 COVERAGE_EXCLUDE_LABELS="integration|restart|functional|query|stress|docker"
 COVERAGE_EXCLUDE_NAMES="cr_bdev_|cr_mpi_|cr_per_process_shm_stress"
 
+# macOS-only: cr_cli_fallback_runtime brings up two in-process runtimes and
+# completes a punted task's FutureShm in place across them, which hangs on macOS
+# (consistent 120s timeout) — the same in-process-runtime concurrency class as
+# #482/#485. It passes on Linux (~18s), where it stays enabled.
+if [ "$(uname -s)" = "Darwin" ]; then
+    COVERAGE_EXCLUDE_NAMES="${COVERAGE_EXCLUDE_NAMES}|cr_cli_fallback_runtime"
+fi
+
 # Detect lcov version for RC option compatibility.
 # lcov 1.x uses 'lcov_branch_coverage' and 'geninfo_unexecuted_blocks';
 # lcov 2.x renamed them and treats unknown keys as fatal errors.

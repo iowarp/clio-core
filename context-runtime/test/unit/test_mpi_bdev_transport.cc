@@ -48,6 +48,7 @@
 #include <mpi.h>
 
 #ifndef _WIN32
+#include <dirent.h>
 #include <fcntl.h>
 #include <unistd.h>
 #endif
@@ -78,30 +79,54 @@ inline clio::run::priv::vector<clio::run::bdev::Block> WrapBlock(
   return blocks;
 }
 
-bool WaitForServer(int max_attempts = 100) {
+// The runtime suffixes its SHM segment names with the server port
+// (GetSharedMemorySegmentName: "<base>_<port>") so multiple runtimes on one node
+// do not collide. The exact port is not known here (the client ranks probe
+// before their own CLIO_INIT), so match the base name as a prefix and accept any
+// port suffix. Returns the matched full path, or "" if none yet.
+static std::string FindMainSegment() {
   const char* user = std::getenv("USER");
-  std::string memfd_path = std::string("/tmp/clio_") +
-                           (user ? user : "unknown") +
-                           "/chi_main_segment_" + (user ? user : "");
+  std::string user_s = user ? user : "unknown";
+  std::string dir = std::string("/tmp/clio_") + user_s;
+  std::string prefix = std::string("chi_main_segment_") + user_s;
+  DIR* d = opendir(dir.c_str());
+  if (d == nullptr) {
+    return "";
+  }
+  std::string found;
+  struct dirent* ent;
+  while ((ent = readdir(d)) != nullptr) {
+    std::string name(ent->d_name);
+    if (name.rfind(prefix, 0) == 0) {  // name starts with prefix
+      found = dir + "/" + name;
+      break;
+    }
+  }
+  closedir(d);
+  return found;
+}
 
+bool WaitForServer(int max_attempts = 100) {
   for (int i = 0; i < max_attempts; ++i) {
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    int fd = open(memfd_path.c_str(), O_RDONLY);
-    if (fd >= 0) {
-      close(fd);
-      std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-      return true;
+    std::string seg = FindMainSegment();
+    if (!seg.empty()) {
+      int fd = open(seg.c_str(), O_RDONLY);
+      if (fd >= 0) {
+        close(fd);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+        return true;
+      }
     }
   }
   return false;
 }
 
 void CleanupSharedMemory() {
-  const char* user = std::getenv("USER");
-  std::string memfd_path = std::string("/tmp/clio_") +
-                           (user ? user : "unknown") +
-                           "/chi_main_segment_" + (user ? user : "");
-  unlink(memfd_path.c_str());
+  std::string seg = FindMainSegment();
+  if (!seg.empty()) {
+    unlink(seg.c_str());
+  }
 }
 
 /**

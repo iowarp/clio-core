@@ -113,7 +113,9 @@ class RuntimeServer {
    * WaitForReady() to confirm it actually came up).
    */
   bool Start(unsigned port = 10500,
-             const std::string &bind_addr = "127.0.0.1") {
+             const std::string &bind_addr = "127.0.0.1",
+             bool ephemeral = false) {
+    port_ = port;
     SetEnv("CLIO_PORT", std::to_string(port));
     SetEnv("CLIO_BIND_ADDR", bind_addr);
     const std::string exe = RuntimeExe();
@@ -128,6 +130,7 @@ class RuntimeServer {
 
 #ifdef _WIN32
     std::string cmd = "\"" + exe + "\" start";
+    if (ephemeral) cmd += " --ephemeral";
     STARTUPINFOA si;
     ZeroMemory(&si, sizeof(si));
     si.cb = sizeof(si);
@@ -160,9 +163,12 @@ class RuntimeServer {
     posix_spawn_file_actions_addopen(&actions, 1, log.c_str(),
                                      O_WRONLY | O_CREAT | O_TRUNC, 0644);
     posix_spawn_file_actions_adddup2(&actions, 1, 2);
-    const char *argv[] = {exe.c_str(), "start", nullptr};
+    const char *argv_plain[] = {exe.c_str(), "start", nullptr};
+    const char *argv_eph[] = {exe.c_str(), "start", "--ephemeral", nullptr};
     int rc = posix_spawn(&pid_, exe.c_str(), &actions, nullptr,
-                         const_cast<char *const *>(argv), environ);
+                         const_cast<char *const *>(ephemeral ? argv_eph
+                                                             : argv_plain),
+                         environ);
     posix_spawn_file_actions_destroy(&actions);
     if (rc != 0) {
       pid_ = -1;
@@ -181,8 +187,11 @@ class RuntimeServer {
    * elapses or the daemon exits early.
    */
   bool WaitForReady(int timeout_ms = 30000) {
+    // Segment names are port-keyed (see ConfigManager::GetSharedMemorySegmentName)
+    // so they match the daemon started on port_.
     const std::string seg =
-        ctp::ConfigParse::ExpandPath("chi_main_segment_${USER}");
+        ctp::ConfigParse::ExpandPath("chi_main_segment_${USER}") + "_" +
+        std::to_string(port_);
     const int attempts = timeout_ms / 200;
     for (int i = 0; i < attempts; ++i) {
       std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -275,6 +284,9 @@ class RuntimeServer {
   }
 
   bool started_ = false;
+  // Port the daemon was started on; segment names are port-keyed so multiple
+  // runtimes (the fallback topology) can coexist on one node + ${USER}.
+  unsigned port_ = 0;
 #ifdef _WIN32
   PROCESS_INFORMATION pi_{};
 #else

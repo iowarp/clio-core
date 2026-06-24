@@ -261,16 +261,31 @@ class GpuApi {
   static bool IsDevicePointer(T *ptr) {
     if (ptr == nullptr) return false;
 #if CTP_ENABLE_ROCM
+    // A failed attribute query means there is no usable GPU (no driver / no
+    // device) or the pointer is an unregistered host allocation — either way it
+    // is NOT a device pointer. Do not treat this as fatal: a GPU-enabled build
+    // must still run entirely on the CPU path on a host without a GPU driver.
+    // Clear the sticky error so a later real GPU call is not misattributed.
     hipPointerAttribute_t attributes{};
-    HIP_ERROR_CHECK(hipPointerGetAttributes(&attributes, (void *)ptr));
+    if (hipPointerGetAttributes(&attributes, (void *)ptr) != hipSuccess) {
+      (void)hipGetLastError();
+      return false;
+    }
 #if defined(HIP_VERSION) && HIP_VERSION >= 60000000
     return attributes.type == hipMemoryTypeDevice;
 #else
     return attributes.memoryType == hipMemoryTypeDevice;
 #endif
 #elif CTP_ENABLE_CUDA
+    // See the ROCm note above: a failed query (e.g. CUDA error 35, "driver
+    // version is insufficient", on a host with no GPU driver) means this is a
+    // host pointer, not a fatal condition. Clear the sticky error and fall back
+    // to the CPU path.
     cudaPointerAttributes attributes{};
-    CUDA_ERROR_CHECK(cudaPointerGetAttributes(&attributes, (void *)ptr));
+    if (cudaPointerGetAttributes(&attributes, (void *)ptr) != cudaSuccess) {
+      (void)cudaGetLastError();
+      return false;
+    }
     return attributes.type == cudaMemoryTypeDevice;
 #elif CTP_ENABLE_SYCL
     auto kind = sycl::get_pointer_type(static_cast<const void *>(ptr),
@@ -400,13 +415,17 @@ inline void DeviceAwareMemcpy(void *dst, const void *src, size_t n) {
   auto is_host_kind = [](const void *p) {
     cudaPointerAttributes a{};
     cudaError_t rc = cudaPointerGetAttributes(&a, p);
-    if (rc == cudaErrorInvalidValue) {
-      // Older CUDA returned this for unregistered host memory; clear the
-      // sticky error so it doesn't trip the next CUDA call.
+    if (rc != cudaSuccess) {
+      // Any failure — older CUDA's cudaErrorInvalidValue for unregistered host
+      // memory, OR a host with no usable GPU driver (e.g. error 35, "driver
+      // version is insufficient") — means this is not a confirmed device
+      // pointer. Treat it as host so the copy stays on std::memcpy instead of
+      // FATAL-ing the device path below. Clear the sticky error so it does not
+      // trip the next CUDA call. (With a working driver the query succeeds, so a
+      // real device pointer is never misclassified.)
       (void)cudaGetLastError();
       return true;
     }
-    if (rc != cudaSuccess) return false;
     return a.type == cudaMemoryTypeHost ||
            a.type == cudaMemoryTypeUnregistered;
   };
@@ -424,11 +443,14 @@ inline void DeviceAwareMemcpy(void *dst, const void *src, size_t n) {
   auto is_host_kind = [](const void *p) {
     hipPointerAttribute_t a{};
     hipError_t rc = hipPointerGetAttributes(&a, p);
-    if (rc == hipErrorInvalidValue) {
+    if (rc != hipSuccess) {
+      // See the CUDA branch: any query failure (unregistered host pointer, or a
+      // host with no usable GPU driver) means "not a confirmed device pointer".
+      // Treat as host and stay on std::memcpy instead of FATAL-ing the device
+      // path. Clear the sticky error.
       (void)hipGetLastError();
       return true;
     }
-    if (rc != hipSuccess) return false;
 #if defined(HIP_VERSION) && HIP_VERSION >= 60000000
     return a.type == hipMemoryTypeHost ||
            a.type == hipMemoryTypeUnregistered;

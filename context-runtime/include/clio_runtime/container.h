@@ -123,6 +123,11 @@ class Container {
    *  container_rpc_acl). Built once in ConfigureAcl, then read-only — no
    *  locking needed on the enforcement hot path. */
   std::unordered_map<u32, MethodProperty> method_acl_;
+  /** True if this is a stub for a pool whose real container lives on the
+   *  fallback ("main") runtime (compose pool_external: true). The pool resolves
+   *  locally (so tasks can be serialized), but tasks are punted to the fallback
+   *  rather than executed here. Set once at pool creation. */
+  bool is_external_ = false;
 
  public:
   Container() = default;
@@ -213,6 +218,14 @@ class Container {
         (it != method_acl_.end()) ? it->second : container_visibility_;
     return !mp.IsPrivate();
   }
+
+  /** Mark this container as a stub for a pool hosted on the fallback runtime
+   *  (compose pool_external: true). */
+  void SetExternal(bool external) { is_external_ = external; }
+
+  /** @return true if this pool's real container lives on the fallback runtime;
+   *  tasks targeting it are punted there rather than executed locally. */
+  bool IsExternal() const { return is_external_; }
 
   /**
    * Get live task statistics for THIS specific task instance.

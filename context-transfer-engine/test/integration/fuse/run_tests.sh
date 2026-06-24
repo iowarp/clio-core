@@ -120,6 +120,20 @@ main() {
     print_header "Starting FUSE Test Container"
     export HOST_UID=$(id -u)
     export HOST_GID=$(id -g)
+
+    # A CUDA-enabled clio_cte_fuse links libcudart.so.N, which the container
+    # image may not carry. The container runs with no GPU driver, so the binary
+    # only needs the runtime lib to LOAD (IsDevicePointer falls back to the CPU
+    # path). Stage the exact libcudart into build/bin (mounted + first on the
+    # container LD_LIBRARY_PATH). No-op for a CPU build.
+    local _cte_bin="${IOWARP_CORE_ROOT}/build/bin/clio_cte_fuse"
+    if [ -f "$_cte_bin" ]; then
+        local _bindir="$(dirname "$_cte_bin")"
+        ldd "$_cte_bin" 2>/dev/null | awk '/libcudart/{print $3}' | while read -r _lib; do
+            { [ -n "$_lib" ] && [ -f "$_lib" ] && cp -Lu "$_lib" "$_bindir/" 2>/dev/null; } || true
+        done
+    fi
+
     docker compose up -d
 
     # Wait for container to start

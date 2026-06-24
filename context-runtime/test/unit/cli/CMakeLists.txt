@@ -206,6 +206,43 @@ if(CLIO_CORE_ENABLE_TESTS)
       TIMEOUT 180
       LABELS "msan_skip"
     )
+
+    # Fallback-runtime CTE test: CTE on a USER runtime backed by a bdev on a
+    # MAIN runtime. CTE's internal bdev calls are serialize-relayed across the
+    # fallback. Two ephemeral runtimes on ports 10670/10680.
+    add_executable(clio_run_cte_fallback_test test_cte_fallback.cc)
+    target_include_directories(clio_run_cte_fallback_test PRIVATE
+      ${CLIO_RUN_ROOT}/include
+      ${CLIO_RUN_ROOT}/test
+    )
+    target_link_libraries(clio_run_cte_fallback_test
+      clio_cte_core_client
+      clio_bdev_client
+      clio_admin_client
+      clio_run_cxx
+      ctp::cxx
+      ${CMAKE_THREAD_LIBS_INIT}
+    )
+    target_compile_definitions(clio_run_cte_fallback_test PRIVATE
+      CLIO_RUN_EXE="$<TARGET_FILE:clio_run>")
+    add_dependencies(clio_run_cte_fallback_test clio_run clio_bdev_runtime
+                     clio_cte_core_runtime)
+    set_target_properties(clio_run_cte_fallback_test PROPERTIES
+      CXX_STANDARD 20
+      CXX_STANDARD_REQUIRED ON
+      RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    add_test(
+      NAME cr_cli_cte_fallback
+      COMMAND clio_run_cte_fallback_test
+      WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    set_tests_properties(cr_cli_cte_fallback PROPERTIES
+      ENVIRONMENT "${_cli_live_env}"
+      RESOURCE_LOCK "clio_runtime_port"
+      TIMEOUT 180
+      LABELS "msan_skip"
+    )
   endif()
 
   # Per-RPC access-control test (private containers/methods). Composes ram bdev
@@ -242,6 +279,42 @@ if(CLIO_CORE_ENABLE_TESTS)
     ENVIRONMENT "${_cli_live_env}"
     RESOURCE_LOCK "clio_runtime_port"
     TIMEOUT 120
+    LABELS "msan_skip"
+  )
+
+  # Fallback-runtime (crash isolation) test: spawns TWO runtimes (main on 10650
+  # with a bdev, user on 10651 with CLIO_FALLBACK_PORT=10650 and no bdev), then
+  # an SHM client calls the bdev through the user runtime, which punts to main.
+  # Serialize with other live-runtime tests (shared per-user SHM segments).
+  add_executable(clio_run_fallback_runtime_test test_fallback_runtime.cc)
+  target_include_directories(clio_run_fallback_runtime_test PRIVATE
+    ${CLIO_RUN_ROOT}/include
+    ${CLIO_RUN_ROOT}/test
+  )
+  target_link_libraries(clio_run_fallback_runtime_test
+    clio_bdev_client
+    clio_admin_client
+    clio_run_cxx
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+  )
+  target_compile_definitions(clio_run_fallback_runtime_test PRIVATE
+    CLIO_RUN_EXE="$<TARGET_FILE:clio_run>")
+  add_dependencies(clio_run_fallback_runtime_test clio_run clio_bdev_runtime)
+  set_target_properties(clio_run_fallback_runtime_test PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  add_test(
+    NAME cr_cli_fallback_runtime
+    COMMAND clio_run_fallback_runtime_test
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_cli_fallback_runtime PROPERTIES
+    ENVIRONMENT "${_cli_live_env}"
+    RESOURCE_LOCK "clio_runtime_port"
+    TIMEOUT 180
     LABELS "msan_skip"
   )
 

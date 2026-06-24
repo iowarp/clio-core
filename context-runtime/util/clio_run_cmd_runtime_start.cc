@@ -1,5 +1,6 @@
 #include <chrono>
 #include <csignal>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <string>
@@ -101,9 +102,10 @@ bool InductNode() {
 }
 
 void PrintRuntimeStartUsage() {
-  HIPRINT("Usage: clio runtime start [--induct]");
+  HIPRINT("Usage: clio runtime start [--induct] [--ephemeral]");
   HIPRINT("  Starts the Clio runtime server");
   HIPRINT("  --induct: Register this node with all existing cluster nodes");
+  HIPRINT("  --ephemeral: Skip the default compose; start bare (admin only)");
 }
 
 void PrintRuntimeRestartUsage() {
@@ -119,6 +121,15 @@ int RuntimeStart(int argc, char* argv[]) {
   for (int i = 0; i < argc; ++i) {
     if (std::strcmp(argv[i], "--induct") == 0) {
       induct = true;
+    } else if (std::strcmp(argv[i], "--ephemeral") == 0) {
+      // Skip the default compose: start bare (admin only), to be composed
+      // explicitly. Communicated to ConfigManager via CLIO_EPHEMERAL, read
+      // during the CLIO_INIT below.
+#ifdef _WIN32
+      _putenv_s("CLIO_EPHEMERAL", "1");
+#else
+      setenv("CLIO_EPHEMERAL", "1", 1);
+#endif
     } else if (std::strcmp(argv[i], "--help") == 0 ||
                std::strcmp(argv[i], "-h") == 0) {
       PrintRuntimeStartUsage();

@@ -75,6 +75,25 @@ bool ConfigManager::ClientInit() {
     }
   }
 
+  // Check CLIO_FALLBACK_PORT env var (overrides YAML and default). Setting it
+  // makes this runtime forward tasks for pools it does not own to the runtime
+  // on that port (fallback-runtime crash isolation).
+  if (const char *env = clio::run::env::GetCompat("FALLBACK_PORT")) {
+    std::string fb_env(env);
+    if (!fb_env.empty()) {
+      fallback_port_ = std::stoul(fb_env);
+    }
+  }
+
+  // Check CLIO_EPHEMERAL env var (set by `clio_run start --ephemeral`). An
+  // ephemeral runtime skips the default compose section — it starts bare (just
+  // admin) and is composed explicitly, e.g. a spawned per-app runtime that
+  // points at a main runtime via the fallback.
+  if (const char *env = clio::run::env::GetCompat("EPHEMERAL")) {
+    std::string e(env);
+    ephemeral_ = !e.empty() && e != "0";
+  }
+
   // Check CLIO_SERVER_ADDR env var (overrides default 127.0.0.1).
   // GetCompat reads CLIO_SERVER_ADDR first, falls back to CLIO_SERVER_ADDR.
   if (const char *env = clio::run::env::GetCompat("SERVER_ADDR")) {
@@ -159,12 +178,17 @@ size_t ConfigManager::GetMemorySegmentSize(MemorySegment segment) const {
 
 u32 ConfigManager::GetPort() const { return port_; }
 
+u32 ConfigManager::GetFallbackPort() const { return fallback_port_; }
+
+bool ConfigManager::IsEphemeral() const { return ephemeral_; }
+
 std::string ConfigManager::GetServerAddr() const { return server_addr_; }
 
 u32 ConfigManager::GetNeighborhoodSize() const { return neighborhood_size_; }
 
 std::string
-ConfigManager::GetSharedMemorySegmentName(MemorySegment segment) const {
+ConfigManager::GetSharedMemorySegmentName(MemorySegment segment,
+                                          u32 port) const {
   std::string segment_name;
 
   switch (segment) {
@@ -181,8 +205,14 @@ ConfigManager::GetSharedMemorySegmentName(MemorySegment segment) const {
     return "";
   }
 
+  // Suffix with the port so multiple runtimes on one node + ${USER} (the
+  // fallback-runtime topology) own distinct segments rather than colliding.
+  // port == 0 means "this runtime"; a non-zero port names another runtime's
+  // segment (the fallback client attaching the main runtime's segments).
+  u32 name_port = (port != 0) ? port : port_;
   // Use CTP's ExpandPath to resolve environment variables
-  return ctp::ConfigParse::ExpandPath(segment_name);
+  return ctp::ConfigParse::ExpandPath(segment_name) + "_" +
+         std::to_string(name_port);
 }
 
 std::string ConfigManager::GetHostfilePath() const {
@@ -295,6 +325,9 @@ void ConfigManager::ParseYAML(YAML::Node &yaml_conf) {
     if (networking["port"]) {
       port_ = networking["port"].as<u32>();
     }
+    if (networking["fallback_port"]) {
+      fallback_port_ = networking["fallback_port"].as<u32>();
+    }
     if (networking["neighborhood_size"]) {
       neighborhood_size_ = networking["neighborhood_size"].as<u32>();
     }
@@ -368,6 +401,14 @@ void ConfigManager::ParseYAML(YAML::Node &yaml_conf) {
         // Parse restart field if present
         if (pool_node["restart"]) {
           pool_config.restart_ = pool_node["restart"].as<bool>();
+        }
+
+        // pool_external: the pool's real container lives on the fallback
+        // ("main") runtime. We still create a local static container (a stub)
+        // so the pool resolves + tasks serialize, but mark it external so its
+        // tasks are punted to the fallback instead of executed here.
+        if (pool_node["pool_external"]) {
+          pool_config.external_ = pool_node["pool_external"].as<bool>();
         }
 
         // Optional RPC access control. container_visibility sets the default

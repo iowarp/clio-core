@@ -93,7 +93,7 @@ bool IpcCpu2Cpu::ClientRecv(IpcManager *ipc,
                           std::chrono::steady_clock::now() - shm_start)
                           .count();
       if (elapsed >= max_sec) {
-        HLOG(kWarning, "Recv(SHM): Timeout after {:.1f}s", elapsed);
+        HLOG(kWarning, "Recv(SHM): Timeout after {}s", elapsed);
         return false;
       }
     }

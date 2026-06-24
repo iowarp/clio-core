@@ -60,6 +60,11 @@ struct PoolConfig {
   /** Per-RPC visibility overrides, keyed by RPC method NAME -> 0 public /
    *  1 private. Methods absent here inherit container_visibility_. */
   std::unordered_map<std::string, u32> rpc_acl_;
+  /** If true, this pool's container is hosted on the fallback ("main") runtime,
+   *  not here. We still create a local static container (so the pool resolves
+   *  and tasks can be serialized), but mark it external; tasks targeting it are
+   *  punted to the fallback instead of executed locally. Default false. */
+  bool external_ = false;
 
   PoolConfig() = default;
 
@@ -79,7 +84,7 @@ struct PoolConfig {
   template <class Archive>
   void serialize(Archive& ar) {
     ar(mod_name_, pool_name_, pool_id_, pool_query_, config_, restart_,
-       container_visibility_, rpc_acl_);
+       container_visibility_, rpc_acl_, external_);
   }
 };
 
@@ -188,6 +193,22 @@ class ConfigManager : public ctp::BaseConfig {
   u32 GetPort() const;
 
   /**
+   * Get the fallback ("main") runtime port. When non-zero, this runtime forwards
+   * tasks for pools it does not own to the runtime listening on this port (see
+   * the fallback-runtime / crash-isolation design). 0 = no fallback configured.
+   * @return Fallback runtime port, or 0 if disabled
+   */
+  u32 GetFallbackPort() const;
+
+  /**
+   * @return true if this runtime is ephemeral (started with --ephemeral /
+   * CLIO_EPHEMERAL): it skips the default compose section and starts bare
+   * (admin only), to be composed explicitly. Used for spawned per-app runtimes
+   * that back onto a main runtime via the fallback.
+   */
+  bool IsEphemeral() const;
+
+  /**
    * Get server address for client connections
    * @return Server address (default: "127.0.0.1", overridden by CLIO_SERVER_ADDR)
    */
@@ -200,11 +221,17 @@ class ConfigManager : public ctp::BaseConfig {
   u32 GetNeighborhoodSize() const;
 
   /**
-   * Get shared memory segment names
-   * @param segment Memory segment identifier`
+   * Get shared memory segment names. The name is suffixed with the runtime port
+   * so that multiple runtimes sharing one node + ${USER} (the fallback-runtime
+   * topology) each own a distinct segment instead of colliding. Pass an explicit
+   * non-zero @p port to compute another runtime's segment name (used by the
+   * fallback client to attach the main runtime's segments).
+   * @param segment Memory segment identifier
+   * @param port Port to key the name on; 0 = this runtime's configured port
    * @return Expanded segment name with environment variables resolved
    */
-  std::string GetSharedMemorySegmentName(MemorySegment segment) const;
+  std::string GetSharedMemorySegmentName(MemorySegment segment,
+                                         u32 port = 0) const;
 
   /**
    * Get hostfile path for distributed scheduling
@@ -334,6 +361,11 @@ class ConfigManager : public ctp::BaseConfig {
   size_t client_data_segment_size_ = ctp::Unit<size_t>::Megabytes(256);
 
   u32 port_ = 9413;
+  // Fallback ("main") runtime port. 0 = no fallback (standalone runtime).
+  // When set, tasks for pools this runtime does not own are punted to it.
+  u32 fallback_port_ = 0;
+  // If true (CLIO_EPHEMERAL / --ephemeral), skip the default compose at startup.
+  bool ephemeral_ = false;
   std::string server_addr_ = "127.0.0.1";
   u32 neighborhood_size_ = 32;
 
