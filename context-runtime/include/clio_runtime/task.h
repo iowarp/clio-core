@@ -91,46 +91,30 @@ class basic_string;
 // ============================================================================
 #ifdef CLIO_ENABLE_BOOST_COROUTINES
 #include <boost/context/fiber.hpp>
-// Stack allocator: on Windows we must use fixedsize_stack (plain malloc) —
-// protected_fixedsize_stack pulls in windows.h (VirtualAlloc/VirtualProtect),
-// whose macros clash with the IPC headers (error C2760). Everywhere else we use
-// protected_fixedsize_stack so the fiber gets a guard page: a stack overflow
-// then faults cleanly (SIGSEGV at the overflow site) instead of silently
-// corrupting adjacent memory — which manifests as platform-divergent UB (hang
-// on macOS, wrong data on Windows, benign on Linux). See issue #620.
-#if defined(_WIN32)
+// fixedsize_stack (plain malloc), NOT protected_fixedsize_stack: the latter
+// pulls in windows.h (VirtualAlloc/VirtualProtect) on Windows, whose macros
+// clash with the IPC headers (error C2760), and its per-fiber mmap+mprotect
+// would undermine the "avoid malloc" goal of the Boost backend (#620).
 #include <boost/context/fixedsize_stack.hpp>
-#else
-#include <boost/context/protected_fixedsize_stack.hpp>
-#endif
 #include <cstdlib>
 #include <functional>
 namespace clio::run::detail {
   // Per-task fiber stack size in bytes, overridable via CLIO_BOOST_STACK_SIZE
-  // (KiB). Defaults to 8 MiB (matching the typical main-thread stack): the whole
-  // task — incl. nested helper coroutines and the DPE/allocation/cereal
-  // serialization call chain — runs on this one stack. The C++20 stackless path
-  // borrows the worker's 8 MiB thread stack, so per-platform frame growth that
-  // fits there must also fit here; 1 MiB was marginal on macOS/Windows.
+  // (KiB). Defaults to 1 MiB: the whole task — incl. nested helper coroutines
+  // and the DPE/allocation/cereal serialization call chain — runs on this one
+  // stack.
   inline size_t boost_stack_size() {
     static const size_t sz = []() -> size_t {
       const char* e = std::getenv("CLIO_BOOST_STACK_SIZE");
-      size_t kib = (e && *e) ? std::strtoul(e, nullptr, 10) : 8192;
+      size_t kib = (e && *e) ? std::strtoul(e, nullptr, 10) : 1024;
       if (kib < 64) kib = 64;
       return kib * 1024;
     }();
     return sz;
   }
-  // Stack allocator factory — guard-page protected off-Windows (see above).
-#if defined(_WIN32)
   inline boost::context::fixedsize_stack boost_stack_alloc() {
     return boost::context::fixedsize_stack(boost_stack_size());
   }
-#else
-  inline boost::context::protected_fixedsize_stack boost_stack_alloc() {
-    return boost::context::protected_fixedsize_stack(boost_stack_size());
-  }
-#endif
   struct FiberState;
 
   struct FiberCallable {
