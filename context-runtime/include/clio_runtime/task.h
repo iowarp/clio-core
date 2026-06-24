@@ -99,14 +99,15 @@ class basic_string;
 #include <cstdlib>
 #include <functional>
 namespace clio::run::detail {
-  // Per-task fiber stack size in bytes, overridable via CLIO_BOOST_STACK_SIZE
-  // (KiB). Defaults to 1 MiB: the whole task — incl. nested helper coroutines
+  // (KiB). Defaults to 256 KiB: the whole task — incl. nested helper coroutines
   // and the DPE/allocation/cereal serialization call chain — runs on this one
-  // stack.
+  // stack, but with stacks reused per task a large default wastes memory across
+  // many concurrent fibers. Bump CLIO_BOOST_STACK_SIZE if a deep call chain
+  // overflows.
   inline size_t boost_stack_size() {
     static const size_t sz = []() -> size_t {
       const char* e = std::getenv("CLIO_BOOST_STACK_SIZE");
-      size_t kib = (e && *e) ? std::strtoul(e, nullptr, 10) : 1024;
+      size_t kib = (e && *e) ? std::strtoul(e, nullptr, 10) : 256;
       if (kib < 64) kib = 64;
       return kib * 1024;
     }();
