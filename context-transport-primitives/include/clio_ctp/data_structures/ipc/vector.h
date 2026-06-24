@@ -1041,6 +1041,18 @@ CTP_CROSS_FUN vector<T, AllocT>::vector(AllocT *alloc, size_t size, Args&&... ar
     AllocateStorage(size);
     // Initialize elements with provided arguments
     auto fp = FullPtr(this->GetAllocator(), data_);
+#ifndef __CUDA_ARCH__
+    if (!fp.ptr_) {
+      // DIAG(#620): vector storage resolution failed -> size_ stays 0 -> a
+      // WAIT_FOR_SPACE ring buffer built on this vector spins forever.
+      fprintf(stderr,
+              "[VEC-DIAG #620] size=%zu alloc=%p data_off=0x%zx capacity_=%zu "
+              "fp.ptr=%p\n",
+              size, reinterpret_cast<void *>(this->GetAllocator()),
+              data_.off_.load(), capacity_, reinterpret_cast<void *>(fp.ptr_));
+      fflush(stderr);
+    }
+#endif
     if (fp.ptr_) {
       for (size_t i = 0; i < size; ++i) {
         if constexpr (IS_SHM_CONTAINER(T)) {
