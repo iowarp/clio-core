@@ -147,7 +147,9 @@ jobs:
             eval "$(conda shell.bash hook)"
           fi
           conda activate iowarp
-          cmake --preset boost
+          # Build with DEBUG logging (override preset's INFO level) so the
+          # single-worker depth-3 trace shows which task re-executes/re-completes.
+          cmake --preset boost -DCLIO_CTP_LOG_LEVEL=0
           # Build only what the runtime test needs (skips CTE/CAE/filesystem +
           # the other test exes). The runtime dlopens the chimod *_runtime libs.
           cmake --build build-boost -j"$(sysctl -n hw.ncpu)" \
@@ -175,8 +177,10 @@ jobs:
             lldb -p "$SW" --batch -o 'thread backtrace all' -o 'detach' 2>&1 | sed -n '1,250p' || true
             kill -9 "$SW" 2>/dev/null || true
           fi
-          echo "--- single-worker test output (tail) ---"
-          tail -40 /tmp/sw.out || true
+          echo "--- single-worker output: last 150 lines (the loop in progress) ---"
+          tail -150 /tmp/sw.out || true
+          echo "--- single-worker: most-repeated normalized log lines (loop signature) ---"
+          sed -E 's/^[^ ]+ //; s/[0-9]+/N/g' /tmp/sw.out | sort | uniq -c | sort -rn | head -20 || true
           echo "===================== END SINGLE-WORKER ====================="
           # Launch the known-hanging test (default workers); let it deadlock.
           ctest -R '^cr_all_wait_functionality_tests$' --timeout 300 -V > /tmp/ctest.out 2>&1 &
