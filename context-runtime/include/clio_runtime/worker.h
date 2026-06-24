@@ -35,9 +35,9 @@
 #define CLIO_RUNTIME_INCLUDE_WORKERS_WORKER_H_
 
 #include <chrono>
-// <coroutine> only for the C++20 stackless backend (not NVHPC, not Boost
-// stackful). task.h (included below) derives CLIO_USE_FIBER_BACKEND from these.
-#if !defined(__NVCOMPILER) && !defined(CLIO_ENABLE_BOOST_COROUTINES)
+// <coroutine> only for the C++20 stackless backend, not the Boost stackful one.
+// (task.h, included below, derives CLIO_USE_FIBER_BACKEND from this.)
+#if !defined(CLIO_ENABLE_BOOST_COROUTINES)
 #include <coroutine>
 #endif
 #include <functional>

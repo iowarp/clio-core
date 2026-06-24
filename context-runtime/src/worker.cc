@@ -40,10 +40,10 @@
 
 #include "clio_runtime/worker.h"
 
-// <coroutine> only for the C++20 stackless backend (not NVHPC, not Boost
-// stackful). CLIO_USE_FIBER_BACKEND is defined by task.h (included below), so
-// spell the condition out here in terms of its inputs.
-#if !defined(__NVCOMPILER) && !defined(CLIO_ENABLE_BOOST_COROUTINES)
+// <coroutine> only for the C++20 stackless backend, not the Boost stackful one.
+// (CLIO_USE_FIBER_BACKEND is defined by task.h, included below, in terms of
+// CLIO_ENABLE_BOOST_COROUTINES.)
+#if !defined(CLIO_ENABLE_BOOST_COROUTINES)
 #include <coroutine>
 #endif
 #include <cerrno>
@@ -808,7 +808,6 @@ void Worker::StartCoroutine(const FullPtr<Task> &task_ptr,
     TaskResume task_resume =
         container->Run(task_ptr->method_, task_ptr, *run_ctx);
 
-#ifndef CLIO_USE_FIBER_BACKEND
     // Standard C++20 coroutine path
     auto handle = task_resume.release();
     run_ctx->coro_handle_ = handle;
@@ -844,22 +843,7 @@ void Worker::StartCoroutine(const FullPtr<Task> &task_ptr,
         run_ctx->coro_handle_ = nullptr;
       }
     }
-#else // __NVCOMPILER - ucontext_t fiber path
-    auto fhandle = task_resume.release();
-    run_ctx->coro_handle_ = fhandle;
-
-    if (fhandle) {
-      // Resume the fiber to run until first suspension point or completion
-      run_ctx->coro_handle_.resume();
-
-      // Check if fiber completed
-      if (run_ctx->coro_handle_.done()) {
-        run_ctx->coro_handle_.destroy();
-        run_ctx->coro_handle_ = clio::run::detail::FiberHandle{};
-      }
-    }
-#endif // __NVCOMPILER
-#endif // CLIO_ENABLE_BOOST_COROUTINES vs others
+#endif // CLIO_ENABLE_BOOST_COROUTINES vs C++20 stackless
   } catch (const std::exception &e) {
     HLOG(kError, "Task execution failed: {}", e.what());
     // Clean up handle on exception

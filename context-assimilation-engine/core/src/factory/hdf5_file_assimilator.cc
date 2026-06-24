@@ -60,9 +60,7 @@ Hdf5FileAssimilator::Hdf5FileAssimilator(
 clio::run::TaskResume Hdf5FileAssimilator::Schedule(const AssimilationCtx& ctx,
                                               int& error_code) {
 #ifdef CLIO_USE_FIBER_BACKEND
-  thread_local clio::run::RunContext _fb_rctx;
-  clio::run::RunContext* _fp = clio::run::GetCurrentRunContextFromWorker();
-  clio::run::RunContext& rctx = _fp ? *_fp : _fb_rctx;
+  clio::run::RunContext& rctx = *clio::run::GetCurrentRunContextFromWorker();
 #endif
   CLIO_TASK_BODY_BEGIN
   HLOG(kDebug, "Hdf5FileAssimilator::Schedule() - ENTRY");
@@ -399,9 +397,7 @@ clio::run::TaskResume Hdf5FileAssimilator::ProcessDataset(
     hid_t file_id, const std::string& dataset_path,
     const std::string& tag_prefix, int& error_code) {
 #ifdef CLIO_USE_FIBER_BACKEND
-  thread_local clio::run::RunContext _fb_rctx;
-  clio::run::RunContext* _fp = clio::run::GetCurrentRunContextFromWorker();
-  clio::run::RunContext& rctx = _fp ? *_fp : _fb_rctx;
+  clio::run::RunContext& rctx = *clio::run::GetCurrentRunContextFromWorker();
 #endif
   CLIO_TASK_BODY_BEGIN
   HLOG(kDebug, "ProcessDataset: ENTRY - dataset: '{}', tag_prefix: '{}'",

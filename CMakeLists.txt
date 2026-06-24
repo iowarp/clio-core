@@ -836,10 +836,14 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   add_compile_options(-fcoroutines)
   message(STATUS "GCC detected - enabling coroutines with -fcoroutines")
 elseif(CMAKE_CXX_COMPILER_ID STREQUAL "NVHPC")
-  # NVHPC 25.5 crashes (ICE in llc) when compiling GCC 14 libstdc++ coroutines.
-  # CLIO Runtime uses ucontext_t fibers via CLIO_CO_AWAIT/CLIO_CO_RETURN macros instead.
-  # No __cpp_impl_coroutine needed - we do not include <coroutine> for NVHPC.
-  message(STATUS "NVHPC detected - using ucontext_t fiber fallback for C++20 coroutines")
+  # NVHPC 25.5 crashes (ICE in llc) when compiling GCC 14 libstdc++ coroutines,
+  # so it cannot use the C++20 stackless backend. Force the Boost.Context
+  # stackful backend instead (issue #620). The C++ carries no NVHPC-specific
+  # coroutine path anymore: the compiler decision is made here, in the build,
+  # and the runtime never includes <coroutine> when the Boost backend is on.
+  set(CLIO_CORE_ENABLE_BOOST_COROUTINES ON CACHE BOOL
+      "Forced ON: NVHPC cannot compile C++20 coroutines (issue #620)" FORCE)
+  message(STATUS "NVHPC detected - C++20 coroutines unsupported; forcing Boost.Context stackful backend")
 elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
   # Clang 16+ enables C++20 coroutines natively (no flags needed for CXX).
   # NVCC host compilation uses GCC which needs -fcoroutines for the builtins.
