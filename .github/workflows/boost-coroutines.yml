@@ -155,7 +155,30 @@ jobs:
                      clio_admin_runtime clio_bdev_runtime clio_MOD_NAME_runtime \
                      clio_run
           cd build-boost
-          # Launch the known-hanging test; let it deadlock.
+          # --- Discriminator: does the SAME test pass with a SINGLE worker? ---
+          # CLIO_NUM_THREADS=1 => one worker serving both task + network roles.
+          # PASS  => the deadlock needs >=2 workers (cross-worker hand-off).
+          # HANG  => single-worker self-deadlock (re-entrant ProcessEventQueue).
+          echo "===================== SINGLE-WORKER (CLIO_NUM_THREADS=1) ====================="
+          CLIO_NUM_THREADS=1 ./bin/clio_run_wait_functionality_tests > /tmp/sw.out 2>&1 &
+          SW=$!
+          SW_DONE=0
+          for i in $(seq 1 90); do
+            if ! kill -0 "$SW" 2>/dev/null; then SW_DONE=1; break; fi
+            sleep 1
+          done
+          if [ "$SW_DONE" = "1" ]; then
+            wait "$SW"; RC=$?
+            echo "SINGLE-WORKER: completed in <90s, rc=$RC  => PASS means the bug is CROSS-WORKER"
+          else
+            echo "SINGLE-WORKER: STILL RUNNING after 90s => HANGS (single-worker self-deadlock)"
+            lldb -p "$SW" --batch -o 'thread backtrace all' -o 'detach' 2>&1 | sed -n '1,250p' || true
+            kill -9 "$SW" 2>/dev/null || true
+          fi
+          echo "--- single-worker test output (tail) ---"
+          tail -40 /tmp/sw.out || true
+          echo "===================== END SINGLE-WORKER ====================="
+          # Launch the known-hanging test (default workers); let it deadlock.
           ctest -R '^cr_all_wait_functionality_tests$' --timeout 300 -V > /tmp/ctest.out 2>&1 &
           CT=$!
           echo "Waiting for the test to reach its hang..."
