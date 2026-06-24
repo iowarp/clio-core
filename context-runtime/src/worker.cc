@@ -992,6 +992,14 @@ void Worker::ExecTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
 
 void Worker::EndTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
                      bool can_resched) {
+  // Defensively guard the RunContext itself: a task that lost its RunContext
+  // (e.g. a straggler/recovery response whose origin was already torn down)
+  // must never be dereferenced here, or the worker SIGSEGVs.
+  if (run_ctx == nullptr) {
+    HLOG(kError, "EndTask: run_ctx is null for task {}", task_ptr->task_id_);
+    return;
+  }
+
   // Check container once at the beginning
   Container *container = run_ctx->container_;
   if (container == nullptr) {

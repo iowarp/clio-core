@@ -442,6 +442,15 @@ int IpcManagerRun2Run::RecvOutDeserialize(
     chi::PoolManager *pool_manager,
     const std::vector<chi::TaskInfo> &task_infos,
     chi::LoadTaskArchive &archive) {
+  // Each task_info is an independent replica response. A per-item failure
+  // (stale net_key, missing RunContext, etc.) must only skip THAT item, not
+  // abort the whole batch: a batch can mix a live replica response with a
+  // straggler/duplicate whose origin was already completed and erased from
+  // send_map (e.g. the late 3rd-replica response, or a response that races
+  // dead-node recovery). Aborting here used to starve the sibling replicas in
+  // the same message of deserialization, so the origin task never completed
+  // and the cross-node data path hung. RecvOutAggregate already `continue`s on
+  // these same conditions; mirror that here so deserialize stays consistent.
   for (const auto &task_info : task_infos) {
     size_t net_key = task_info.task_id_.net_key_;
     ctp::ipc::FullPtr<chi::Task> origin_task;
@@ -449,18 +458,18 @@ int IpcManagerRun2Run::RecvOutDeserialize(
       std::lock_guard<std::mutex> lk(send_map_mutex_);
       auto send_it = send_map_.find(net_key);
       if (send_it == nullptr) {
-        HLOG(kError,
-             "[RecvOut] Task {} FAILED: Origin task not found in send_map "
-             "(size: {}) with net_key {}",
+        HLOG(kWarning,
+             "[RecvOut] Task {} skipped: origin not in send_map "
+             "(size: {}) with net_key {} — stale/duplicate replica response",
              task_info.task_id_, send_map_.size(), net_key);
-        return 5;
+        continue;
       }
       origin_task = *send_it;
     }
 
     if (!origin_task->GetRunCtx()) {
       HLOG(kError, "Admin: origin_task has no RunContext");
-      return 6;
+      continue;
     }
     chi::RunContext *origin_rctx = origin_task->GetRunCtx();
 
@@ -468,7 +477,7 @@ int IpcManagerRun2Run::RecvOutDeserialize(
     if (replica_id >= origin_rctx->subtasks_.size()) {
       HLOG(kError, "Admin: Invalid replica_id {} (subtasks size: {})",
            replica_id, origin_rctx->subtasks_.size());
-      return 7;
+      continue;
     }
 
     ctp::ipc::FullPtr<chi::Task> replica = origin_rctx->subtasks_[replica_id];
@@ -478,7 +487,7 @@ int IpcManagerRun2Run::RecvOutDeserialize(
     if (!container) {
       HLOG(kError, "Admin: Container not found for pool_id {}",
            origin_task->pool_id_);
-      return 8;
+      continue;
     }
 
     container->LoadTask(origin_task->method_, archive, replica);
