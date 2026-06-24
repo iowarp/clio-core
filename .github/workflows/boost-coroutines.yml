@@ -112,6 +112,11 @@ jobs:
           ctest --test-dir build-boost --output-on-failure --timeout 180 --repeat until-pass:3 -LE "ollama"
 
   # ---- macOS (conda deps via install.sh) ------------------------------------
+  # DIAGNOSTIC (temporary, #620): single runner + CLIO_NUM_THREADS=1 to test
+  # whether the Boost/macOS hang depends on cross-thread task migration (1
+  # worker => a suspended fiber is always resumed on the thread that created
+  # it). If this turns the job green, the fix is fiber->worker affinity. Revert
+  # to the macos-14/macos-15 matrix without the env once diagnosed.
   macos:
     name: macos (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -119,7 +124,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-14, macos-15]
+        os: [macos-14]
+    env:
+      CLIO_NUM_THREADS: "1"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5

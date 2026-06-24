@@ -84,6 +84,17 @@ bool ConfigManager::ClientInit() {
     }
   }
 
+  // CLIO_NUM_THREADS overrides the configured worker-thread count (last word,
+  // after any config file). Useful for forcing a single worker, e.g. to test
+  // whether a failure depends on cross-thread task migration.
+  if (const char *env = clio::run::env::GetCompat("NUM_THREADS")) {
+    char *end = nullptr;
+    unsigned long n = std::strtoul(env, &end, 10);
+    if (end != env && n >= 1) {
+      num_threads_ = static_cast<u32>(n);
+    }
+  }
+
   is_initialized_ = true;
   return true;
 }
