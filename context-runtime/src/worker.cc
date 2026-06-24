@@ -151,6 +151,13 @@ bool Worker::Init() {
        reinterpret_cast<uintptr_t>(event_queue_), event_queue_->Capacity(),
        sizeof(ctp::ipc::RingBufferEntry<Future<Task, CLIO_QUEUE_ALLOC_T>>),
        sizeof(Future<Task, CLIO_QUEUE_ALLOC_T>));
+  // DIAG(#620): cap=0 means the queue vector's FullPtr->ContainsPtr failed,
+  // which happens only if the MallocAllocator instance has data_capacity_ !=
+  // SIZE_MAX (its ctor never ran for this instance => per-binary singleton
+  // duplication / init-order). Log the singleton ptr + data_capacity_.
+  HLOG(kError, "Worker {} CTP_MALLOC={} dataCapacity={} (SIZE_MAX={})",
+       worker_id_, reinterpret_cast<uintptr_t>(CTP_MALLOC),
+       CTP_MALLOC->GetBackendDataCapacity(), static_cast<size_t>(SIZE_MAX));
 
 #if defined(CLIO_ENABLE_BOOST_COROUTINES)
   // Per-worker freed-fiber-stack pool (see AllocateStack/FreeStack).
