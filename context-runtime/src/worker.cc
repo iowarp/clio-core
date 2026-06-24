@@ -126,12 +126,19 @@ bool Worker::Init() {
 
   // Allocate and initialize event queue from malloc allocator (temporary
   // runtime data). Stores Future<Task> objects to avoid stale RunContext*
-  // pointers.
+  // pointers. Sized to 2x the configured per-worker task-queue depth so a
+  // single parent's completion fan-out can never fill this WAIT_FOR_SPACE ring
+  // and block the worker inside its own completion Emplace (issue #620).
+  u32 task_queue_depth = CLIO_CONFIG_MANAGER->GetQueueDepth();
+  if (task_queue_depth == 0) {
+    task_queue_depth = 1024;  // fallback if config is unset
+  }
+  u32 event_queue_depth = EVENT_QUEUE_DEPTH_MULTIPLIER * task_queue_depth;
   event_queue_ =
       CTP_MALLOC
           ->template NewObj<ctp::ipc::mpsc_ring_buffer<
               Future<Task, CLIO_QUEUE_ALLOC_T>, ctp::ipc::MallocAllocator>>(
-              CTP_MALLOC, EVENT_QUEUE_DEPTH)
+              CTP_MALLOC, event_queue_depth)
           .ptr_;
 
   // Get scheduler from IpcManager (IpcManager is the single owner)

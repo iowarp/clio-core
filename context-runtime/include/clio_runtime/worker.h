@@ -459,10 +459,15 @@ class Worker {
   //   - If container is available: execute locally
   std::queue<RunContext *> retry_queue_;
 
-  // Event queue for completing subtask futures on the parent worker's thread
-  // Stores Future<Task> objects to set FUTURE_COMPLETE, avoiding stale RunContext* pointers
-  // Allocated from malloc allocator (temporary runtime data, not IPC)
-  static constexpr u32 EVENT_QUEUE_DEPTH = 1024;
+  // Event queue for completing subtask futures on the parent worker's thread.
+  // Stores Future<Task> objects to set FUTURE_COMPLETE, avoiding stale
+  // RunContext* pointers. Allocated from malloc allocator (temporary runtime
+  // data, not IPC), sized in Init() to EVENT_QUEUE_DEPTH_MULTIPLIER x the
+  // configured per-worker task-queue depth (GetQueueDepth()): a parent fills at
+  // most ~queue_depth subtask slots in its lane, so giving the completion ring
+  // 2x that headroom keeps the WAIT_FOR_SPACE Emplace from ever blocking on a
+  // single parent's fan-out (which otherwise self-deadlocks the worker, #620).
+  static constexpr u32 EVENT_QUEUE_DEPTH_MULTIPLIER = 2;
   ctp::ipc::mpsc_ring_buffer<Future<Task, CLIO_QUEUE_ALLOC_T>, ctp::ipc::MallocAllocator> *event_queue_;
 
   // Periodic queue system for time-based periodic tasks:
