@@ -3214,7 +3214,7 @@ clio::run::TaskResume Runtime::ExtendBlob(BlobInfo &blob_info, clio::run::u64 of
                                     clio::run::u64 size, float blob_score,
                                     clio::run::u32 &error_code,
                                     int min_persistence_level) {
-#ifdef CLIO_USE_FIBER_BACKEND
+#ifdef CLIO_ENABLE_BOOST_COROUTINES
   clio::run::RunContext& rctx = *clio::run::GetCurrentRunContextFromWorker();
 #endif
   CLIO_TASK_BODY_BEGIN
@@ -3353,7 +3353,7 @@ clio::run::TaskResume Runtime::ExtendBlob(BlobInfo &blob_info, clio::run::u64 of
 clio::run::TaskResume Runtime::ResizeBlob(BlobInfo &blob_info, clio::run::u64 new_size,
                                     float blob_score, clio::run::u32 &error_code,
                                     int min_persistence_level) {
-#ifdef CLIO_USE_FIBER_BACKEND
+#ifdef CLIO_ENABLE_BOOST_COROUTINES
   clio::run::RunContext& rctx = *clio::run::GetCurrentRunContextFromWorker();
 #endif
   CLIO_TASK_BODY_BEGIN
@@ -3462,7 +3462,7 @@ clio::run::TaskResume Runtime::ResizeBlob(BlobInfo &blob_info, clio::run::u64 ne
 clio::run::TaskResume Runtime::ModifyExistingData(
     const clio::run::priv::vector<BlobBlock> &blocks, ctp::ipc::ShmPtr<> data, size_t data_size,
     size_t data_offset_in_blob, clio::run::u32 &error_code) {
-#ifdef CLIO_USE_FIBER_BACKEND
+#ifdef CLIO_ENABLE_BOOST_COROUTINES
   clio::run::RunContext& rctx = *clio::run::GetCurrentRunContextFromWorker();
 #endif
   CLIO_TASK_BODY_BEGIN
@@ -3582,7 +3582,7 @@ clio::run::TaskResume Runtime::ReadData(const clio::run::priv::vector<BlobBlock>
                                   ctp::ipc::ShmPtr<> data, size_t data_size,
                                   size_t data_offset_in_blob,
                                   clio::run::u32 &error_code) {
-#ifdef CLIO_USE_FIBER_BACKEND
+#ifdef CLIO_ENABLE_BOOST_COROUTINES
   clio::run::RunContext& rctx = *clio::run::GetCurrentRunContextFromWorker();
 #endif
   CLIO_TASK_BODY_BEGIN
@@ -3703,7 +3703,7 @@ clio::run::TaskResume Runtime::AllocateFromTarget(TargetInfo &target_info,
                                             clio::run::u64 size,
                                             clio::run::u64 &allocated_offset,
                                             bool &success) {
-#ifdef CLIO_USE_FIBER_BACKEND
+#ifdef CLIO_ENABLE_BOOST_COROUTINES
   clio::run::RunContext& rctx = *clio::run::GetCurrentRunContextFromWorker();
 #endif
   CLIO_TASK_BODY_BEGIN
@@ -3782,7 +3782,7 @@ clio::run::TaskResume Runtime::AllocateFromTarget(TargetInfo &target_info,
 clio::run::TaskResume Runtime::ClearBlob(BlobInfo &blob_info, float blob_score,
                                    clio::run::u64 offset, clio::run::u64 size,
                                    bool &cleared) {
-#ifdef CLIO_USE_FIBER_BACKEND
+#ifdef CLIO_ENABLE_BOOST_COROUTINES
   clio::run::RunContext& rctx = *clio::run::GetCurrentRunContextFromWorker();
 #endif
   CLIO_TASK_BODY_BEGIN
@@ -3808,7 +3808,7 @@ clio::run::TaskResume Runtime::ClearBlob(BlobInfo &blob_info, float blob_score,
 
 clio::run::TaskResume Runtime::FreeAllBlobBlocks(BlobInfo &blob_info,
                                            clio::run::u32 &error_code) {
-#ifdef CLIO_USE_FIBER_BACKEND
+#ifdef CLIO_ENABLE_BOOST_COROUTINES
   clio::run::RunContext& rctx = *clio::run::GetCurrentRunContextFromWorker();
 #endif
   CLIO_TASK_BODY_BEGIN

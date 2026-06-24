@@ -59,7 +59,7 @@ Hdf5FileAssimilator::Hdf5FileAssimilator(
 
 clio::run::TaskResume Hdf5FileAssimilator::Schedule(const AssimilationCtx& ctx,
                                               int& error_code) {
-#ifdef CLIO_USE_FIBER_BACKEND
+#ifdef CLIO_ENABLE_BOOST_COROUTINES
   clio::run::RunContext& rctx = *clio::run::GetCurrentRunContextFromWorker();
 #endif
   CLIO_TASK_BODY_BEGIN
@@ -396,7 +396,7 @@ int Hdf5FileAssimilator::DiscoverDatasets(
 clio::run::TaskResume Hdf5FileAssimilator::ProcessDataset(
     hid_t file_id, const std::string& dataset_path,
     const std::string& tag_prefix, int& error_code) {
-#ifdef CLIO_USE_FIBER_BACKEND
+#ifdef CLIO_ENABLE_BOOST_COROUTINES
   clio::run::RunContext& rctx = *clio::run::GetCurrentRunContextFromWorker();
 #endif
   CLIO_TASK_BODY_BEGIN

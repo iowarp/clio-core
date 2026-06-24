@@ -50,10 +50,7 @@ using pid_t = int;
 //     NVHPC, which ICEs in llc on libstdc++ coroutines), so the compiler
 //     decision lives in the build — not in #ifdefs here.
 // ============================================================================
-#if defined(CLIO_ENABLE_BOOST_COROUTINES)
-#define CLIO_USE_FIBER_BACKEND 1
-#endif
-#ifndef CLIO_USE_FIBER_BACKEND
+#ifndef CLIO_ENABLE_BOOST_COROUTINES
 #include <coroutine>
 #endif
 #include <memory>
@@ -633,7 +630,7 @@ namespace clio::run {
  */
 struct RunContext {
   /** Coroutine handle for C++20 stackless coroutines (or Boost fiber handle) */
-#ifndef CLIO_USE_FIBER_BACKEND
+#ifndef CLIO_ENABLE_BOOST_COROUTINES
   std::coroutine_handle<> coro_handle_;
 #else
   clio::run::detail::FiberHandle coro_handle_;
@@ -722,7 +719,7 @@ struct RunContext {
         wall_timer_(other.wall_timer_),
         predicted_wall_us_(other.predicted_wall_us_),
         predicted_stat_(other.predicted_stat_) {
-#ifndef CLIO_USE_FIBER_BACKEND
+#ifndef CLIO_ENABLE_BOOST_COROUTINES
     other.coro_handle_ = nullptr;
 #else
     other.coro_handle_ = clio::run::detail::FiberHandle{};
@@ -758,7 +755,7 @@ struct RunContext {
       wall_timer_ = other.wall_timer_;
       predicted_wall_us_ = other.predicted_wall_us_;
       predicted_stat_ = other.predicted_stat_;
-#ifndef CLIO_USE_FIBER_BACKEND
+#ifndef CLIO_ENABLE_BOOST_COROUTINES
       other.coro_handle_ = nullptr;
 #else
       other.coro_handle_ = clio::run::detail::FiberHandle{};
@@ -800,7 +797,7 @@ struct RunContext {
 // definition)
 // ============================================================================
 
-#ifndef CLIO_USE_FIBER_BACKEND
+#ifndef CLIO_ENABLE_BOOST_COROUTINES
 template <typename TaskT, typename AllocT>
 bool Future<TaskT, AllocT>::await_suspend_impl(
     std::coroutine_handle<> handle) noexcept {
@@ -821,13 +818,13 @@ bool Future<TaskT, AllocT>::await_suspend_impl(
   run_ctx->yield_time_us_ = 0.0;
   return true;  // Suspend the coroutine
 }
-#endif // !CLIO_USE_FIBER_BACKEND
+#endif // !CLIO_ENABLE_BOOST_COROUTINES
 
 // ============================================================================
 // TaskResume and YieldAwaiter (must be after RunContext for member access)
 // ============================================================================
 
-#ifndef CLIO_USE_FIBER_BACKEND
+#ifndef CLIO_ENABLE_BOOST_COROUTINES
 /**
  * TaskResume - Coroutine return type for runtime methods
  *
@@ -1161,7 +1158,7 @@ class TaskResume {
   }
 };
 
-#else // CLIO_USE_FIBER_BACKEND - Boost.Context fiber-based TaskResume
+#else // CLIO_ENABLE_BOOST_COROUTINES - Boost.Context fiber-based TaskResume
 
 /**
  * TaskResume (fiber backend) - return type for runtime methods
@@ -1216,7 +1213,7 @@ public:
   bool operator!() const { return !handle_; }
 };
 
-#endif // CLIO_USE_FIBER_BACKEND
+#endif // CLIO_ENABLE_BOOST_COROUTINES
 
 /**
  * YieldAwaiter - Awaitable for yielding control in coroutines
@@ -1247,7 +1244,7 @@ class YieldAwaiter {
    */
   bool await_ready() const noexcept { return false; }
 
-#ifndef CLIO_USE_FIBER_BACKEND
+#ifndef CLIO_ENABLE_BOOST_COROUTINES
   /**
    * Suspend the coroutine and mark for yielded resumption
    *
@@ -1268,7 +1265,7 @@ class YieldAwaiter {
     run_ctx->yield_time_us_ = yield_time_us_;
     return true;  // Suspend the coroutine
   }
-#endif // !CLIO_USE_FIBER_BACKEND
+#endif // !CLIO_ENABLE_BOOST_COROUTINES
 
   /**
    * Resume after yield - nothing to return

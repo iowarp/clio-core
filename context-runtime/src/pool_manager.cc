@@ -499,7 +499,7 @@ TaskResume PoolManager::CreatePool(FullPtr<Task> task, RunContext* run_ctx) {
   // Fiber backends (NVHPC / Boost): create a RunContext reference alias so the
   // CLIO_TASK_BODY_BEGIN lambda can capture it by reference (the macro uses
   // [=, &rctx]). The C++20 stackless macro is empty and needs no rctx.
-#ifdef CLIO_USE_FIBER_BACKEND
+#ifdef CLIO_ENABLE_BOOST_COROUTINES
   RunContext& rctx = *run_ctx;
 #endif
   CLIO_TASK_BODY_BEGIN
@@ -701,7 +701,7 @@ TaskResume PoolManager::DestroyPool(PoolId pool_id) {
   // Fiber backends (NVHPC / Boost): provide a dummy RunContext reference so the
   // CLIO_TASK_BODY_BEGIN lambda can compile (the macro captures rctx by ref,
   // but we never use it). The C++20 stackless macro is empty and needs no rctx.
-#ifdef CLIO_USE_FIBER_BACKEND
+#ifdef CLIO_ENABLE_BOOST_COROUTINES
   clio::run::RunContext _dummy_rctx;
   clio::run::RunContext& rctx = _dummy_rctx;
 #endif

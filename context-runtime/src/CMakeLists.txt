@@ -158,6 +158,20 @@ target_include_directories(${CLIO_LIB_NAME} PUBLIC
   $<INSTALL_INTERFACE:include>
 )
 
+# Boost.Context stackful coroutine backend (#620). PUBLIC so the single macro
+# CLIO_ENABLE_BOOST_COROUTINES reaches EVERY translation unit that includes
+# task.h (chimods, CTE, CAE, tests) via the clio_run_cxx link. A TU that
+# compiled RunContext without it would get the smaller stackless layout — an
+# ODR mismatch that corrupts RunContext-sized structures (e.g. the per-worker
+# event queue) when the linker folds the divergent template instantiations,
+# which manifested as the macOS-only Boost deadlock.
+if(CLIO_CORE_ENABLE_BOOST_COROUTINES)
+  target_compile_definitions(${CLIO_LIB_NAME} PUBLIC CLIO_ENABLE_BOOST_COROUTINES=1)
+  if(TARGET ${CLIO_LIB_NAME}_gpu)
+    target_compile_definitions(${CLIO_LIB_NAME}_gpu PUBLIC CLIO_ENABLE_BOOST_COROUTINES=1)
+  endif()
+endif()
+
 # When CUDA is enabled, g++ source files get CTP_ENABLE_CUDA=1 transitively from
 # the GPU library link. They need the CUDA toolkit include directory so that
 # cuda_runtime_api.h (host-callable CUDA runtime functions) can be found.

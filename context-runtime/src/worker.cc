@@ -41,7 +41,7 @@
 #include "clio_runtime/worker.h"
 
 // <coroutine> only for the C++20 stackless backend, not the Boost stackful one.
-// (CLIO_USE_FIBER_BACKEND is defined by task.h, included below, in terms of
+// (CLIO_ENABLE_BOOST_COROUTINES is defined by task.h, included below, in terms of
 // CLIO_ENABLE_BOOST_COROUTINES.)
 #if !defined(CLIO_ENABLE_BOOST_COROUTINES)
 #include <coroutine>
@@ -76,7 +76,7 @@ namespace clio::run {
 // using FiberHandle::done().
 namespace {
 inline bool CoroCompleted(const RunContext *run_ctx) {
-#ifndef CLIO_USE_FIBER_BACKEND
+#ifndef CLIO_ENABLE_BOOST_COROUTINES
   return run_ctx->coro_completed_.load(std::memory_order_acquire);
 #else
   return run_ctx->coro_handle_ && run_ctx->coro_handle_.done();
@@ -140,24 +140,11 @@ bool Worker::Init() {
               Future<Task, CLIO_QUEUE_ALLOC_T>, ctp::ipc::MallocAllocator>>(
               CTP_MALLOC, event_queue_depth)
           .ptr_;
-  // DIAG(#620): confirm the event queue was actually sized (macOS boost hang =
-  // WAIT_FOR_SPACE Emplace spins because capacity is ~0). If capacity here is
-  // correct (==depth-1) but RuntimeSend sees cap=0, then event_queue_ is read
-  // at a wrong offset (RunContext layout) rather than mis-allocated.
-  HLOG(kError,
-       "Worker {} event_queue alloc: depth={} ptr={} capacity={} entrySize={} "
-       "futureSize={}",
-       worker_id_, event_queue_depth,
-       reinterpret_cast<uintptr_t>(event_queue_), event_queue_->Capacity(),
-       sizeof(ctp::ipc::RingBufferEntry<Future<Task, CLIO_QUEUE_ALLOC_T>>),
-       sizeof(Future<Task, CLIO_QUEUE_ALLOC_T>));
-  // DIAG(#620): cap=0 means the queue vector's FullPtr->ContainsPtr failed,
-  // which happens only if the MallocAllocator instance has data_capacity_ !=
-  // SIZE_MAX (its ctor never ran for this instance => per-binary singleton
-  // duplication / init-order). Log the singleton ptr + data_capacity_.
-  HLOG(kError, "Worker {} CTP_MALLOC={} dataCapacity={} (SIZE_MAX={})",
-       worker_id_, reinterpret_cast<uintptr_t>(CTP_MALLOC),
-       CTP_MALLOC->GetBackendDataCapacity(), static_cast<size_t>(SIZE_MAX));
+  // TEMP(#620): confirm the event queue is sized correctly under the Boost
+  // backend on macOS (capacity must be event_queue_depth-1, not 0). Remove once
+  // the macOS Boost CI is green.
+  HLOG(kInfo, "Worker {} event_queue: depth={} capacity={}", worker_id_,
+       event_queue_depth, event_queue_->Capacity());
 
 #if defined(CLIO_ENABLE_BOOST_COROUTINES)
   // Per-worker freed-fiber-stack pool (see AllocateStack/FreeStack).
@@ -955,7 +942,7 @@ void Worker::StartCoroutine(const FullPtr<Task> &task_ptr,
     // Clean up handle on exception
     if (run_ctx->coro_handle_) {
       run_ctx->coro_handle_.destroy();
-#ifndef CLIO_USE_FIBER_BACKEND
+#ifndef CLIO_ENABLE_BOOST_COROUTINES
       run_ctx->coro_handle_ = nullptr;
 #else
       run_ctx->coro_handle_ = clio::run::detail::FiberHandle{};
@@ -966,7 +953,7 @@ void Worker::StartCoroutine(const FullPtr<Task> &task_ptr,
     // Clean up handle on exception
     if (run_ctx->coro_handle_) {
       run_ctx->coro_handle_.destroy();
-#ifndef CLIO_USE_FIBER_BACKEND
+#ifndef CLIO_ENABLE_BOOST_COROUTINES
       run_ctx->coro_handle_ = nullptr;
 #else
       run_ctx->coro_handle_ = clio::run::detail::FiberHandle{};
@@ -1008,7 +995,7 @@ void Worker::ResumeCoroutine(const FullPtr<Task> &task_ptr,
     if (CoroCompleted(run_ctx)) {
       // Completed - clean up
       run_ctx->coro_handle_.destroy();
-#ifndef CLIO_USE_FIBER_BACKEND
+#ifndef CLIO_ENABLE_BOOST_COROUTINES
       run_ctx->coro_handle_ = nullptr;
 #else
       run_ctx->coro_handle_ = clio::run::detail::FiberHandle{};
@@ -1019,7 +1006,7 @@ void Worker::ResumeCoroutine(const FullPtr<Task> &task_ptr,
     // Clean up handle on exception
     if (run_ctx->coro_handle_) {
       run_ctx->coro_handle_.destroy();
-#ifndef CLIO_USE_FIBER_BACKEND
+#ifndef CLIO_ENABLE_BOOST_COROUTINES
       run_ctx->coro_handle_ = nullptr;
 #else
       run_ctx->coro_handle_ = clio::run::detail::FiberHandle{};
@@ -1030,7 +1017,7 @@ void Worker::ResumeCoroutine(const FullPtr<Task> &task_ptr,
     // Clean up handle on exception
     if (run_ctx->coro_handle_) {
       run_ctx->coro_handle_.destroy();
-#ifndef CLIO_USE_FIBER_BACKEND
+#ifndef CLIO_ENABLE_BOOST_COROUTINES
       run_ctx->coro_handle_ = nullptr;
 #else
       run_ctx->coro_handle_ = clio::run::detail::FiberHandle{};

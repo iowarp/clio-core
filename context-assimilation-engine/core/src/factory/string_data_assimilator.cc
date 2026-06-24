@@ -65,7 +65,7 @@ StringDataAssimilator::StringDataAssimilator(
 
 clio::run::TaskResume StringDataAssimilator::Schedule(const AssimilationCtx& ctx,
                                                 int& error_code) {
-#ifdef CLIO_USE_FIBER_BACKEND
+#ifdef CLIO_ENABLE_BOOST_COROUTINES
   clio::run::RunContext& rctx = *clio::run::GetCurrentRunContextFromWorker();
 #endif
   CLIO_TASK_BODY_BEGIN

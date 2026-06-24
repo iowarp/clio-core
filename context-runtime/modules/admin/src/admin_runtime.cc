@@ -793,7 +793,7 @@ void Runtime::MonitorContainerStats(ctp::ipc::FullPtr<MonitorTask> task) {
 }
 
 clio::run::TaskResume Runtime::MonitorPoolStats(ctp::ipc::FullPtr<MonitorTask> task) {
-#ifdef CLIO_USE_FIBER_BACKEND
+#ifdef CLIO_ENABLE_BOOST_COROUTINES
   clio::run::RunContext _dummy_rctx;
   clio::run::RunContext& rctx = _dummy_rctx;
 #endif
@@ -1025,7 +1025,7 @@ clio::run::TaskResume Runtime::AnnounceShutdown(
 }
 
 clio::run::TaskResume Runtime::MonitorBdevStats(ctp::ipc::FullPtr<MonitorTask> task) {
-#ifdef CLIO_USE_FIBER_BACKEND
+#ifdef CLIO_ENABLE_BOOST_COROUTINES
   clio::run::RunContext _dummy_rctx;
   clio::run::RunContext& rctx = _dummy_rctx;
 #endif
@@ -1871,7 +1871,7 @@ std::vector<clio::run::RecoveryAssignment> Runtime::ComputeRecoveryPlan(
 }
 
 clio::run::TaskResume Runtime::TriggerRecovery(clio::run::u64 dead_node_id) {
-#ifdef CLIO_USE_FIBER_BACKEND
+#ifdef CLIO_ENABLE_BOOST_COROUTINES
   clio::run::RunContext _dummy_rctx;
   clio::run::RunContext& rctx = _dummy_rctx;
 #endif

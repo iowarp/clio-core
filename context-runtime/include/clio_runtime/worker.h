@@ -36,7 +36,7 @@
 
 #include <chrono>
 // <coroutine> only for the C++20 stackless backend, not the Boost stackful one.
-// (task.h, included below, derives CLIO_USE_FIBER_BACKEND from this.)
+// (task.h, included below, derives CLIO_ENABLE_BOOST_COROUTINES from this.)
 #if !defined(CLIO_ENABLE_BOOST_COROUTINES)
 #include <coroutine>
 #endif
