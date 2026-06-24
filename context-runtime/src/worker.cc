@@ -766,6 +766,32 @@ void Worker::ClearCurrentWorker() {
                             static_cast<class Worker *>(nullptr));
 }
 
+#if defined(CLIO_ENABLE_BOOST_COROUTINES)
+// Set up the task's RunContext to run on a fresh Boost.Context fiber, recording
+// `this` worker as the one responsible for the fiber state. The fiber state
+// lives in rctx->fiber_state_, so the ONLY allocation is the fiber stack. The
+// entry captures the typed RunContext* (no callable type erasure) and runs the
+// container directly off it. Lazy: the body runs on first resume().
+clio::run::detail::FiberHandle Worker::make_task_fiber(RunContext *rctx) {
+  rctx->fiber_state_.done = false;
+  rctx->fiber_state_.worker_ = this;
+  rctx->fiber_state_.task_ = boost::context::fiber{
+      std::allocator_arg, clio::run::detail::boost_stack_alloc(),
+      [rctx](boost::context::fiber &&caller) -> boost::context::fiber {
+        rctx->fiber_state_.caller_ = std::move(caller);
+        // Must not let an exception escape the fiber entry (Boost.Context calls
+        // std::terminate if one does).
+        try {
+          rctx->container_->Run(rctx->task_->method_, rctx->task_, *rctx);
+        } catch (...) {
+        }
+        rctx->fiber_state_.done = true;
+        return std::move(rctx->fiber_state_.caller_);
+      }};
+  return clio::run::detail::FiberHandle(&rctx->fiber_state_);
+}
+#endif  // CLIO_ENABLE_BOOST_COROUTINES
+
 void Worker::StartCoroutine(const FullPtr<Task> &task_ptr,
                             RunContext *run_ctx) {
   // Set current run context
@@ -791,18 +817,13 @@ void Worker::StartCoroutine(const FullPtr<Task> &task_ptr,
     // Boost.Context path (issue #620): the worker owns one fiber per task whose
     // entry runs Container::Run natively on the fiber stack. The whole task —
     // including nested helper coroutines, which run inline — executes as
-    // ordinary C++ (no lambda capture of task parameters), so reference
-    // parameters and locals behave exactly as in the C++20 stackless backend.
+    // ordinary C++, so reference parameters and locals behave exactly as in the
+    // C++20 stackless backend. The fiber state lives in run_ctx->fiber_state_
+    // (only the stack is heap-allocated); make_task_fiber's entry dispatches
+    // container->Run() directly off the RunContext.
     {
-      auto method = task_ptr->method_;
-      Container *cont = container;
-      FullPtr<Task> tp = task_ptr;
-      RunContext *rc = run_ctx;
       run_ctx->coro_completed_.store(false, std::memory_order_relaxed);
-      run_ctx->coro_handle_ =
-          clio::run::detail::make_task_fiber(
-              [cont, method, tp, rc]() { cont->Run(method, tp, *rc); })
-              .release();
+      run_ctx->coro_handle_ = make_task_fiber(run_ctx);
       if (run_ctx->coro_handle_) {
         run_ctx->coro_handle_.resume();
         if (run_ctx->coro_handle_.done()) {

@@ -91,17 +91,14 @@ class Runtime : public clio::run::Container {
    * This method creates queues and sets up container resources
    * NOTE: Container is already initialized via Init() before Create is called
    */
-  clio::run::TaskResume Create(ctp::ipc::FullPtr<CreateTask> task, clio::run::RunContext& ctx);
+  clio::run::TaskResume Create(ctp::ipc::FullPtr<CreateTask> task, clio::run::RunContext& rctx);
 
   /**
    * Destroy the container (Method::kDestroy)
    */
-  clio::run::TaskResume Destroy(ctp::ipc::FullPtr<DestroyTask> task, clio::run::RunContext& ctx) {
+  clio::run::TaskResume Destroy(ctp::ipc::FullPtr<DestroyTask> task, clio::run::RunContext& rctx) {
     HLOG(kInfo, "Core container destroyed for pool: {} (ID: {})",
           pool_name_, pool_id_);
-#ifdef CLIO_USE_FIBER_BACKEND
-    clio::run::RunContext& rctx = ctx;
-#endif
     CLIO_TASK_BODY_BEGIN
     CLIO_CO_RETURN;
     CLIO_TASK_BODY_END
@@ -112,21 +109,21 @@ class Runtime : public clio::run::Container {
    * This is a coroutine that uses co_await for async assimilator operations.
    * @return TaskResume for coroutine suspension/resumption
    */
-  clio::run::TaskResume ParseOmni(ctp::ipc::FullPtr<ParseOmniTask> task, clio::run::RunContext& ctx);
+  clio::run::TaskResume ParseOmni(ctp::ipc::FullPtr<ParseOmniTask> task, clio::run::RunContext& rctx);
 
   /**
    * ProcessHdf5Dataset - Process a single HDF5 dataset (Method::kProcessHdf5Dataset)
    * Used for distributed processing where each dataset task is routed to a specific node.
    * @return TaskResume for coroutine suspension/resumption
    */
-  clio::run::TaskResume ProcessHdf5Dataset(ctp::ipc::FullPtr<ProcessHdf5DatasetTask> task, clio::run::RunContext& ctx);
+  clio::run::TaskResume ProcessHdf5Dataset(ctp::ipc::FullPtr<ProcessHdf5DatasetTask> task, clio::run::RunContext& rctx);
 
   /**
    * ExportData - Export all blobs in a CTE tag to a file (Method::kExportData)
    * Supports "hdf5" and "binary" formats.
    * @return TaskResume for coroutine suspension/resumption
    */
-  clio::run::TaskResume ExportData(ctp::ipc::FullPtr<ExportDataTask> task, clio::run::RunContext& ctx);
+  clio::run::TaskResume ExportData(ctp::ipc::FullPtr<ExportDataTask> task, clio::run::RunContext& rctx);
 
   /**
    * CTE interceptor handlers (Method::kPutBlob / kGetBlob / kGetOrCreateTag).
@@ -135,13 +132,13 @@ class Runtime : public clio::run::Container {
    * the CAE pool transparently lands data in CTE behind it.
    */
   clio::run::TaskResume PutBlob(ctp::ipc::FullPtr<PutBlobTask> task,
-                          clio::run::RunContext &ctx);
+                          clio::run::RunContext &rctx);
   clio::run::TaskResume GetBlob(ctp::ipc::FullPtr<GetBlobTask> task,
-                          clio::run::RunContext &ctx);
+                          clio::run::RunContext &rctx);
   clio::run::TaskResume GetOrCreateTag(ctp::ipc::FullPtr<GetOrCreateTagTask> task,
-                                 clio::run::RunContext &ctx);
+                                 clio::run::RunContext &rctx);
   clio::run::TaskResume SemanticSearch(ctp::ipc::FullPtr<SemanticSearchTask> task,
-                                 clio::run::RunContext &ctx);
+                                 clio::run::RunContext &rctx);
 
   /**
    * Resolve PoolQuery::Dynamic() → PoolQuery::Local() for the interceptor

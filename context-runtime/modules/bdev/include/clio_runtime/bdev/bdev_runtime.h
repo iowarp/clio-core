@@ -39,15 +39,15 @@ class Runtime : public clio::run::Container {
    */
   clio::run::TaskStat GetTaskStats(const clio::run::Task *task) const override;
 
-  clio::run::TaskResume Create(ctp::ipc::FullPtr<CreateTask> task, clio::run::RunContext& ctx);
-  clio::run::TaskResume AllocateBlocks(ctp::ipc::FullPtr<AllocateBlocksTask> task, clio::run::RunContext& ctx);
-  clio::run::TaskResume FreeBlocks(ctp::ipc::FullPtr<FreeBlocksTask> task, clio::run::RunContext& ctx);
-  clio::run::TaskResume Write(ctp::ipc::FullPtr<WriteTask> task, clio::run::RunContext& ctx);
-  clio::run::TaskResume Read(ctp::ipc::FullPtr<ReadTask> task, clio::run::RunContext& ctx);
-  clio::run::TaskResume GetStats(ctp::ipc::FullPtr<GetStatsTask> task, clio::run::RunContext& ctx);
-  clio::run::TaskResume Update(ctp::ipc::FullPtr<UpdateTask> task, clio::run::RunContext& ctx);
+  clio::run::TaskResume Create(ctp::ipc::FullPtr<CreateTask> task, clio::run::RunContext& rctx);
+  clio::run::TaskResume AllocateBlocks(ctp::ipc::FullPtr<AllocateBlocksTask> task, clio::run::RunContext& rctx);
+  clio::run::TaskResume FreeBlocks(ctp::ipc::FullPtr<FreeBlocksTask> task, clio::run::RunContext& rctx);
+  clio::run::TaskResume Write(ctp::ipc::FullPtr<WriteTask> task, clio::run::RunContext& rctx);
+  clio::run::TaskResume Read(ctp::ipc::FullPtr<ReadTask> task, clio::run::RunContext& rctx);
+  clio::run::TaskResume GetStats(ctp::ipc::FullPtr<GetStatsTask> task, clio::run::RunContext& rctx);
+  clio::run::TaskResume Update(ctp::ipc::FullPtr<UpdateTask> task, clio::run::RunContext& rctx);
   clio::run::TaskResume Monitor(ctp::ipc::FullPtr<MonitorTask> task, clio::run::RunContext &rctx);
-  clio::run::TaskResume Destroy(ctp::ipc::FullPtr<DestroyTask> task, clio::run::RunContext& ctx);
+  clio::run::TaskResume Destroy(ctp::ipc::FullPtr<DestroyTask> task, clio::run::RunContext& rctx);
 
   void Init(const clio::run::PoolId &pool_id, const std::string &pool_name,
             clio::run::u32 container_id = 0) override;
@@ -89,7 +89,7 @@ class Runtime : public clio::run::Container {
   
   PerfMetrics perf_metrics_;
 
-  size_t GetWorkerID(clio::run::RunContext& ctx);
+  size_t GetWorkerID(clio::run::RunContext& rctx);
 
   void UpdatePerformanceMetrics(bool is_write, clio::run::u64 bytes,
                                 double duration_us);

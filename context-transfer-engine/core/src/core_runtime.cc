@@ -241,12 +241,7 @@ void Runtime::FixupAfterCopy(clio::run::u32 method,
 }
 
 clio::run::TaskResume Runtime::Create(ctp::ipc::FullPtr<CreateTask> task,
-                                clio::run::RunContext &ctx) {
-#ifdef CLIO_USE_FIBER_BACKEND
-  clio::run::RunContext& rctx = ctx;
-#else
-  (void)ctx;
-#endif
+                                clio::run::RunContext &rctx) {
   CLIO_TASK_BODY_BEGIN
   // Initialize unordered_map_ll instances with appropriately sized bucket
   // counts. Tag/blob maps are large to avoid excessive collisions at scale.
@@ -509,12 +504,7 @@ Runtime::~Runtime() {
 }
 
 clio::run::TaskResume Runtime::Destroy(ctp::ipc::FullPtr<DestroyTask> task,
-                                 clio::run::RunContext &ctx) {
-#ifdef CLIO_USE_FIBER_BACKEND
-  clio::run::RunContext& rctx = ctx;
-#else
-  (void)ctx;
-#endif
+                                 clio::run::RunContext &rctx) {
   CLIO_TASK_BODY_BEGIN
   try {
     // Close WAL files before clearing data structures
@@ -628,12 +618,7 @@ clio::run::PoolQuery Runtime::ScheduleTask(const ctp::ipc::FullPtr<clio::run::Ta
 }
 
 clio::run::TaskResume Runtime::RegisterTarget(ctp::ipc::FullPtr<RegisterTargetTask> task,
-                                        clio::run::RunContext &ctx) {
-#ifdef CLIO_USE_FIBER_BACKEND
-  clio::run::RunContext& rctx = ctx;
-#else
-  (void)ctx;
-#endif
+                                        clio::run::RunContext &rctx) {
   CLIO_TASK_BODY_BEGIN
   try {
     std::string target_name = task->target_name_.str();
@@ -782,12 +767,7 @@ clio::run::TaskResume Runtime::RegisterTarget(ctp::ipc::FullPtr<RegisterTargetTa
 }
 
 clio::run::TaskResume Runtime::UnregisterTarget(
-    ctp::ipc::FullPtr<UnregisterTargetTask> task, clio::run::RunContext &ctx) {
-#ifdef CLIO_USE_FIBER_BACKEND
-  clio::run::RunContext& rctx = ctx;
-#else
-  (void)ctx;
-#endif
+    ctp::ipc::FullPtr<UnregisterTargetTask> task, clio::run::RunContext &rctx) {
   CLIO_TASK_BODY_BEGIN
   try {
     std::string target_name = task->target_name_.str();
@@ -837,12 +817,7 @@ clio::run::TaskResume Runtime::UnregisterTarget(
 }
 
 clio::run::TaskResume Runtime::ListTargets(ctp::ipc::FullPtr<ListTargetsTask> task,
-                                     clio::run::RunContext &ctx) {
-#ifdef CLIO_USE_FIBER_BACKEND
-  clio::run::RunContext& rctx = ctx;
-#else
-  (void)ctx;
-#endif
+                                     clio::run::RunContext &rctx) {
   CLIO_TASK_BODY_BEGIN
   try {
     // Clear the output vector and populate with current target names
@@ -866,12 +841,7 @@ clio::run::TaskResume Runtime::ListTargets(ctp::ipc::FullPtr<ListTargetsTask> ta
 }
 
 clio::run::TaskResume Runtime::StatTargets(ctp::ipc::FullPtr<StatTargetsTask> task,
-                                     clio::run::RunContext &ctx) {
-#ifdef CLIO_USE_FIBER_BACKEND
-  clio::run::RunContext& rctx = ctx;
-#else
-  (void)ctx;
-#endif
+                                     clio::run::RunContext &rctx) {
   CLIO_TASK_BODY_BEGIN
   try {
     // Collect all target IDs under read lock (can't co_await inside lambda)
@@ -958,12 +928,7 @@ clio::run::TaskResume Runtime::StatTargets(ctp::ipc::FullPtr<StatTargetsTask> ta
 template <typename CreateParamsT>
 clio::run::TaskResume Runtime::GetOrCreateTag(
     ctp::ipc::FullPtr<GetOrCreateTagTask<CreateParamsT>> task,
-    clio::run::RunContext &ctx) {
-#ifdef CLIO_USE_FIBER_BACKEND
-  clio::run::RunContext& rctx = ctx;
-#else
-  (void)ctx;
-#endif
+    clio::run::RunContext &rctx) {
   CLIO_TASK_BODY_BEGIN
   try {
     std::string tag_name = task->tag_name_.str();
@@ -1018,12 +983,7 @@ clio::run::TaskResume Runtime::GetOrCreateTag(
 }
 
 clio::run::TaskResume Runtime::GetTargetInfo(ctp::ipc::FullPtr<GetTargetInfoTask> task,
-                                       clio::run::RunContext &ctx) {
-#ifdef CLIO_USE_FIBER_BACKEND
-  clio::run::RunContext& rctx = ctx;
-#else
-  (void)ctx;
-#endif
+                                       clio::run::RunContext &rctx) {
   CLIO_TASK_BODY_BEGIN
   try {
     std::string target_name = task->target_name_.str();
@@ -1063,12 +1023,7 @@ clio::run::TaskResume Runtime::GetTargetInfo(ctp::ipc::FullPtr<GetTargetInfoTask
 }
 
 clio::run::TaskResume Runtime::PutBlob(ctp::ipc::FullPtr<PutBlobTask> task,
-                                 clio::run::RunContext &ctx) {
-#ifdef CLIO_USE_FIBER_BACKEND
-  clio::run::RunContext& rctx = ctx;
-#else
-  (void)ctx;
-#endif
+                                 clio::run::RunContext &rctx) {
   CLIO_TASK_BODY_BEGIN
   // Per-PutBlob diagnostic logging — disabled in perf builds. Was burning
   // an atomic fetch_add + clock_gettime + branch on every 64 KB chunk plus
@@ -1332,12 +1287,7 @@ clio::run::TaskResume Runtime::PutBlob(ctp::ipc::FullPtr<PutBlobTask> task,
 }
 
 clio::run::TaskResume Runtime::GetBlob(ctp::ipc::FullPtr<GetBlobTask> task,
-                                 clio::run::RunContext &ctx) {
-#ifdef CLIO_USE_FIBER_BACKEND
-  clio::run::RunContext& rctx = ctx;
-#else
-  (void)ctx;
-#endif
+                                 clio::run::RunContext &rctx) {
   CLIO_TASK_BODY_BEGIN
   try {
     // Extract input parameters
@@ -1407,12 +1357,7 @@ clio::run::TaskResume Runtime::GetBlob(ctp::ipc::FullPtr<GetBlobTask> task,
 }
 
 clio::run::TaskResume Runtime::ReorganizeBlob(ctp::ipc::FullPtr<ReorganizeBlobTask> task,
-                                        clio::run::RunContext &ctx) {
-#ifdef CLIO_USE_FIBER_BACKEND
-  clio::run::RunContext& rctx = ctx;
-#else
-  (void)ctx;
-#endif
+                                        clio::run::RunContext &rctx) {
   CLIO_TASK_BODY_BEGIN
   try {
     // Extract input parameters
@@ -1527,12 +1472,7 @@ clio::run::TaskResume Runtime::ReorganizeBlob(ctp::ipc::FullPtr<ReorganizeBlobTa
 }
 
 clio::run::TaskResume Runtime::DelBlob(ctp::ipc::FullPtr<DelBlobTask> task,
-                                 clio::run::RunContext &ctx) {
-#ifdef CLIO_USE_FIBER_BACKEND
-  clio::run::RunContext& rctx = ctx;
-#else
-  (void)ctx;
-#endif
+                                 clio::run::RunContext &rctx) {
   CLIO_TASK_BODY_BEGIN
   try {
     // Extract input parameters
@@ -1618,12 +1558,7 @@ clio::run::TaskResume Runtime::DelBlob(ctp::ipc::FullPtr<DelBlobTask> task,
 }
 
 clio::run::TaskResume Runtime::TruncateBlob(ctp::ipc::FullPtr<TruncateBlobTask> task,
-                                      clio::run::RunContext &ctx) {
-#ifdef CLIO_USE_FIBER_BACKEND
-  clio::run::RunContext& rctx = ctx;
-#else
-  (void)ctx;
-#endif
+                                      clio::run::RunContext &rctx) {
   CLIO_TASK_BODY_BEGIN
   try {
     TagId tag_id = task->tag_id_;
@@ -1702,12 +1637,7 @@ clio::run::TaskResume Runtime::TruncateBlob(ctp::ipc::FullPtr<TruncateBlobTask> 
 }
 
 clio::run::TaskResume Runtime::RenameTag(ctp::ipc::FullPtr<RenameTagTask> task,
-                                   clio::run::RunContext &ctx) {
-#ifdef CLIO_USE_FIBER_BACKEND
-  clio::run::RunContext& rctx = ctx;
-#else
-  (void)ctx;
-#endif
+                                   clio::run::RunContext &rctx) {
   CLIO_TASK_BODY_BEGIN
   try {
     TagId tag_id = task->tag_id_;
@@ -1839,12 +1769,7 @@ clio::run::TaskResume Runtime::RenameTag(ctp::ipc::FullPtr<RenameTagTask> task,
 }
 
 clio::run::TaskResume Runtime::GetOrCreateTagAlias(
-    ctp::ipc::FullPtr<GetOrCreateTagAliasTask> task, clio::run::RunContext &ctx) {
-#ifdef CLIO_USE_FIBER_BACKEND
-  clio::run::RunContext& rctx = ctx;
-#else
-  (void)ctx;
-#endif
+    ctp::ipc::FullPtr<GetOrCreateTagAliasTask> task, clio::run::RunContext &rctx) {
   CLIO_TASK_BODY_BEGIN
   try {
     TagId tag_id = task->tag_id_;
@@ -1935,12 +1860,7 @@ clio::run::TaskResume Runtime::GetOrCreateTagAlias(
 }
 
 clio::run::TaskResume Runtime::DelTag(ctp::ipc::FullPtr<DelTagTask> task,
-                                clio::run::RunContext &ctx) {
-#ifdef CLIO_USE_FIBER_BACKEND
-  clio::run::RunContext& rctx = ctx;
-#else
-  (void)ctx;
-#endif
+                                clio::run::RunContext &rctx) {
   CLIO_TASK_BODY_BEGIN
   try {
     TagId tag_id = task->tag_id_;
@@ -2208,12 +2128,7 @@ clio::run::TaskResume Runtime::DelTag(ctp::ipc::FullPtr<DelTagTask> task,
 }
 
 clio::run::TaskResume Runtime::GetTagName(ctp::ipc::FullPtr<GetTagNameTask> task,
-                                    clio::run::RunContext &ctx) {
-#ifdef CLIO_USE_FIBER_BACKEND
-  clio::run::RunContext& rctx = ctx;
-#else
-  (void)ctx;
-#endif
+                                    clio::run::RunContext &rctx) {
   CLIO_TASK_BODY_BEGIN
   try {
     TagId tag_id = task->tag_id_;
@@ -2244,12 +2159,7 @@ clio::run::TaskResume Runtime::GetTagName(ctp::ipc::FullPtr<GetTagNameTask> task
 }
 
 clio::run::TaskResume Runtime::GetTagSize(ctp::ipc::FullPtr<GetTagSizeTask> task,
-                                    clio::run::RunContext &ctx) {
-#ifdef CLIO_USE_FIBER_BACKEND
-  clio::run::RunContext& rctx = ctx;
-#else
-  (void)ctx;
-#endif
+                                    clio::run::RunContext &rctx) {
   CLIO_TASK_BODY_BEGIN
   try {
     TagId tag_id = task->tag_id_;
@@ -2287,12 +2197,7 @@ clio::run::TaskResume Runtime::GetTagSize(ctp::ipc::FullPtr<GetTagSizeTask> task
 }
 
 clio::run::TaskResume Runtime::GetCapacity(
-    ctp::ipc::FullPtr<GetCapacityTask> task, clio::run::RunContext &ctx) {
-#ifdef CLIO_USE_FIBER_BACKEND
-  clio::run::RunContext &rctx = ctx;
-#else
-  (void)ctx;
-#endif
+    ctp::ipc::FullPtr<GetCapacityTask> task, clio::run::RunContext &rctx) {
   CLIO_TASK_BODY_BEGIN
   // Sum the total and remaining capacity of every target registered on this
   // node. A Local query returns this node's capacity; the task's AggregateOut
@@ -2321,12 +2226,7 @@ clio::run::TaskResume Runtime::GetCapacity(
 }
 
 clio::run::TaskResume Runtime::GetNumAliases(
-    ctp::ipc::FullPtr<GetNumAliasesTask> task, clio::run::RunContext &ctx) {
-#ifdef CLIO_USE_FIBER_BACKEND
-  clio::run::RunContext &rctx = ctx;
-#else
-  (void)ctx;
-#endif
+    ctp::ipc::FullPtr<GetNumAliasesTask> task, clio::run::RunContext &rctx) {
   CLIO_TASK_BODY_BEGIN
   try {
     task->num_aliases_ = 0;
@@ -2553,12 +2453,7 @@ TagId Runtime::GetOrCreateTagChain(const std::string &name,
 }
 
 clio::run::TaskResume Runtime::FlushMetadata(ctp::ipc::FullPtr<FlushMetadataTask> task,
-                                       clio::run::RunContext &ctx) {
-#ifdef CLIO_USE_FIBER_BACKEND
-  clio::run::RunContext& rctx = ctx;
-#else
-  (void)ctx;
-#endif
+                                       clio::run::RunContext &rctx) {
   CLIO_TASK_BODY_BEGIN
   task->entries_flushed_ = 0;
 
@@ -2686,12 +2581,7 @@ clio::run::TaskResume Runtime::FlushMetadata(ctp::ipc::FullPtr<FlushMetadataTask
 }
 
 clio::run::TaskResume Runtime::FlushData(ctp::ipc::FullPtr<FlushDataTask> task,
-                                   clio::run::RunContext &ctx) {
-#ifdef CLIO_USE_FIBER_BACKEND
-  clio::run::RunContext& rctx = ctx;
-#else
-  (void)ctx;
-#endif
+                                   clio::run::RunContext &rctx) {
   CLIO_TASK_BODY_BEGIN
   task->bytes_flushed_ = 0;
   task->blobs_flushed_ = 0;
@@ -3253,7 +3143,7 @@ TagId Runtime::GenerateNewTagId() {
 
 // Explicit template instantiations for required template methods
 template clio::run::TaskResume Runtime::GetOrCreateTag<CreateParams>(
-    ctp::ipc::FullPtr<GetOrCreateTagTask<CreateParams>> task, clio::run::RunContext &ctx);
+    ctp::ipc::FullPtr<GetOrCreateTagTask<CreateParams>> task, clio::run::RunContext &rctx);
 
 // Blob management helper functions
 BlobInfo *Runtime::CheckBlobExists(const std::string &blob_name,
@@ -4041,12 +3931,7 @@ size_t Runtime::GetTelemetryEntries(std::vector<CteTelemetry> &entries,
 }
 
 clio::run::TaskResume Runtime::PollTelemetryLog(
-    ctp::ipc::FullPtr<PollTelemetryLogTask> task, clio::run::RunContext &ctx) {
-#ifdef CLIO_USE_FIBER_BACKEND
-  clio::run::RunContext& rctx = ctx;
-#else
-  (void)ctx;
-#endif
+    ctp::ipc::FullPtr<PollTelemetryLogTask> task, clio::run::RunContext &rctx) {
   CLIO_TASK_BODY_BEGIN
   try {
     std::uint64_t minimum_logical_time = task->minimum_logical_time_;
@@ -4079,12 +3964,7 @@ clio::run::TaskResume Runtime::PollTelemetryLog(
 }
 
 clio::run::TaskResume Runtime::GetBlobScore(ctp::ipc::FullPtr<GetBlobScoreTask> task,
-                                      clio::run::RunContext &ctx) {
-#ifdef CLIO_USE_FIBER_BACKEND
-  clio::run::RunContext& rctx = ctx;
-#else
-  (void)ctx;
-#endif
+                                      clio::run::RunContext &rctx) {
   CLIO_TASK_BODY_BEGIN
   try {
     // Extract input parameters
@@ -4130,12 +4010,7 @@ clio::run::TaskResume Runtime::GetBlobScore(ctp::ipc::FullPtr<GetBlobScoreTask> 
 }
 
 clio::run::TaskResume Runtime::GetBlobSize(ctp::ipc::FullPtr<GetBlobSizeTask> task,
-                                     clio::run::RunContext &ctx) {
-#ifdef CLIO_USE_FIBER_BACKEND
-  clio::run::RunContext& rctx = ctx;
-#else
-  (void)ctx;
-#endif
+                                     clio::run::RunContext &rctx) {
   CLIO_TASK_BODY_BEGIN
   try {
     // Extract input parameters
@@ -4180,12 +4055,7 @@ clio::run::TaskResume Runtime::GetBlobSize(ctp::ipc::FullPtr<GetBlobSizeTask> ta
 }
 
 clio::run::TaskResume Runtime::GetBlobInfo(ctp::ipc::FullPtr<GetBlobInfoTask> task,
-                                     clio::run::RunContext &ctx) {
-#ifdef CLIO_USE_FIBER_BACKEND
-  clio::run::RunContext& rctx = ctx;
-#else
-  (void)ctx;
-#endif
+                                     clio::run::RunContext &rctx) {
   CLIO_TASK_BODY_BEGIN
   try {
     // Extract input parameters
@@ -4239,12 +4109,7 @@ clio::run::TaskResume Runtime::GetBlobInfo(ctp::ipc::FullPtr<GetBlobInfoTask> ta
 }
 
 clio::run::TaskResume Runtime::GetContainedBlobs(
-    ctp::ipc::FullPtr<GetContainedBlobsTask> task, clio::run::RunContext &ctx) {
-#ifdef CLIO_USE_FIBER_BACKEND
-  clio::run::RunContext& rctx = ctx;
-#else
-  (void)ctx;
-#endif
+    ctp::ipc::FullPtr<GetContainedBlobsTask> task, clio::run::RunContext &rctx) {
   CLIO_TASK_BODY_BEGIN
   try {
     // Extract input parameters
@@ -4296,12 +4161,7 @@ clio::run::TaskResume Runtime::GetContainedBlobs(
 }
 
 clio::run::TaskResume Runtime::TagQuery(ctp::ipc::FullPtr<TagQueryTask> task,
-                                  clio::run::RunContext &ctx) {
-#ifdef CLIO_USE_FIBER_BACKEND
-  clio::run::RunContext& rctx = ctx;
-#else
-  (void)ctx;
-#endif
+                                  clio::run::RunContext &rctx) {
   CLIO_TASK_BODY_BEGIN
   try {
     std::string tag_regex = task->tag_regex_.str();
@@ -4350,12 +4210,7 @@ clio::run::TaskResume Runtime::TagQuery(ctp::ipc::FullPtr<TagQueryTask> task,
 }
 
 clio::run::TaskResume Runtime::BlobQuery(ctp::ipc::FullPtr<BlobQueryTask> task,
-                                   clio::run::RunContext &ctx) {
-#ifdef CLIO_USE_FIBER_BACKEND
-  clio::run::RunContext& rctx = ctx;
-#else
-  (void)ctx;
-#endif
+                                   clio::run::RunContext &rctx) {
   CLIO_TASK_BODY_BEGIN
   try {
     std::string tag_regex = task->tag_regex_.str();
@@ -4463,12 +4318,7 @@ struct SemSearchDoc {
 }  // namespace
 
 clio::run::TaskResume Runtime::SemanticSearch(
-    ctp::ipc::FullPtr<SemanticSearchTask> task, clio::run::RunContext &ctx) {
-#ifdef CLIO_USE_FIBER_BACKEND
-  clio::run::RunContext &rctx = ctx;
-#else
-  (void)ctx;
-#endif
+    ctp::ipc::FullPtr<SemanticSearchTask> task, clio::run::RunContext &rctx) {
   CLIO_TASK_BODY_BEGIN
   task->results_.clear();
   task->return_code_ = 0;
@@ -4635,12 +4485,7 @@ clio::run::TaskResume Runtime::SemanticSearch(
 // ==============================================================================
 
 clio::run::TaskResume Runtime::TemporalSearch(
-    ctp::ipc::FullPtr<TemporalSearchTask> task, clio::run::RunContext &ctx) {
-#ifdef CLIO_USE_FIBER_BACKEND
-  clio::run::RunContext &rctx = ctx;
-#else
-  (void)ctx;
-#endif
+    ctp::ipc::FullPtr<TemporalSearchTask> task, clio::run::RunContext &rctx) {
   CLIO_TASK_BODY_BEGIN
   task->results_.clear();
   task->return_code_ = 0;

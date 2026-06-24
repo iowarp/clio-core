@@ -416,6 +416,17 @@ class Worker {
    */
   void StartCoroutine(const FullPtr<Task> &task_ptr, RunContext *run_ctx);
 
+#if defined(CLIO_ENABLE_BOOST_COROUTINES)
+  /**
+   * Create the Boost.Context fiber for a task and record this worker as the one
+   * responsible for its fiber state (run_ctx->fiber_state_). Only the fiber
+   * stack is allocated.
+   * @param run_ctx RunContext whose task the fiber will run
+   * @return Handle to the created fiber
+   */
+  clio::run::detail::FiberHandle make_task_fiber(RunContext *run_ctx);
+#endif
+
   /**
    * Resume coroutine execution for a yielded/blocked task
    * @param task_ptr Full pointer to task to resume

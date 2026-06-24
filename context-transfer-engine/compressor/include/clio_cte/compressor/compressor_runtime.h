@@ -99,54 +99,54 @@ private:
    * Create the container (Method::kCreate)
    * Initializes predictors and loads AI models
    */
-  clio::run::TaskResume Create(ctp::ipc::FullPtr<CreateTask> task, clio::run::RunContext &ctx);
+  clio::run::TaskResume Create(ctp::ipc::FullPtr<CreateTask> task, clio::run::RunContext &rctx);
 
   /**
    * Destroy the container (Method::kDestroy)
    * Cleanup resources and predictors
    */
-  clio::run::TaskResume Destroy(ctp::ipc::FullPtr<DestroyTask> task, clio::run::RunContext &ctx);
+  clio::run::TaskResume Destroy(ctp::ipc::FullPtr<DestroyTask> task, clio::run::RunContext &rctx);
 
   /**
    * Monitor container state (Method::kMonitor)
    * Polls core for target information and serializes results with msgpack
    */
-  clio::run::TaskResume Monitor(ctp::ipc::FullPtr<MonitorTask> task, clio::run::RunContext &ctx);
+  clio::run::TaskResume Monitor(ctp::ipc::FullPtr<MonitorTask> task, clio::run::RunContext &rctx);
 
   /**
    * Dynamic compression scheduling (Method::kDynamicSchedule)
    * Analyzes data and determines optimal compression strategy
    */
   clio::run::TaskResume DynamicSchedule(ctp::ipc::FullPtr<DynamicScheduleTask> task,
-                                   clio::run::RunContext &ctx);
+                                   clio::run::RunContext &rctx);
 
   /**
    * Compress data (Method::kCompress)
    * Executes compression with specified library and parameters
    */
   clio::run::TaskResume Compress(ctp::ipc::FullPtr<CompressTask> task,
-                            clio::run::RunContext &ctx);
+                            clio::run::RunContext &rctx);
 
   /**
    * Decompress data (Method::kDecompress)
    * Executes decompression with specified library and parameters
    */
   clio::run::TaskResume Decompress(ctp::ipc::FullPtr<DecompressTask> task,
-                              clio::run::RunContext &ctx);
+                              clio::run::RunContext &rctx);
 
   /**
    * Sample this node's CPU utilization and aggregated worker load
    * (Method::kPollNodeLoad). Writes results into task->sample_.
    */
   clio::run::TaskResume PollNodeLoad(ctp::ipc::FullPtr<PollNodeLoadTask> task,
-                                clio::run::RunContext &ctx);
+                                clio::run::RunContext &rctx);
 
   /**
    * Periodic task that iterates the tracked consumer list and dispatches
    * PollNodeLoad to each consumer node (Method::kPollConsumers).
    */
   clio::run::TaskResume PollConsumers(ctp::ipc::FullPtr<PollConsumersTask> task,
-                                 clio::run::RunContext &ctx);
+                                 clio::run::RunContext &rctx);
 
   /**
    * Schedule a task by resolving Dynamic pool queries.

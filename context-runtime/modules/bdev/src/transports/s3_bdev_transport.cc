@@ -87,8 +87,7 @@ void S3BdevTransport::FreeBlocks(int worker_id, const std::vector<Block>& blocks
   allocator_.FreeBlocks(worker_id, blocks);
 }
 
-clio::run::TaskResume S3BdevTransport::WriteBlocks(ctp::ipc::FullPtr<WriteTask> task, clio::run::RunContext &ctx) {
-  clio::run::RunContext& rctx = ctx;
+clio::run::TaskResume S3BdevTransport::WriteBlocks(ctp::ipc::FullPtr<WriteTask> task, clio::run::RunContext &rctx) {
   CLIO_TASK_BODY_BEGIN
 
 #ifdef CLIO_ENABLE_AMAZON_DRIVE
@@ -147,8 +146,7 @@ clio::run::TaskResume S3BdevTransport::WriteBlocks(ctp::ipc::FullPtr<WriteTask> 
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume S3BdevTransport::ReadBlocks(ctp::ipc::FullPtr<ReadTask> task, clio::run::RunContext &ctx) {
-  clio::run::RunContext& rctx = ctx;
+clio::run::TaskResume S3BdevTransport::ReadBlocks(ctp::ipc::FullPtr<ReadTask> task, clio::run::RunContext &rctx) {
   CLIO_TASK_BODY_BEGIN
 
 #ifdef CLIO_ENABLE_AMAZON_DRIVE

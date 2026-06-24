@@ -51,8 +51,7 @@ char* MemBdevTransport::GetRamPage(size_t page_idx) const {
   return ram_pages_[page_idx].get();
 }
 
-clio::run::TaskResume MemBdevTransport::WriteBlocks(ctp::ipc::FullPtr<WriteTask> task, clio::run::RunContext &ctx) {
-  clio::run::RunContext& rctx = ctx;
+clio::run::TaskResume MemBdevTransport::WriteBlocks(ctp::ipc::FullPtr<WriteTask> task, clio::run::RunContext &rctx) {
   CLIO_TASK_BODY_BEGIN
 
   auto *ipc_mgr = CLIO_IPC;
@@ -97,8 +96,7 @@ clio::run::TaskResume MemBdevTransport::WriteBlocks(ctp::ipc::FullPtr<WriteTask>
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume MemBdevTransport::ReadBlocks(ctp::ipc::FullPtr<ReadTask> task, clio::run::RunContext &ctx) {
-  clio::run::RunContext& rctx = ctx;
+clio::run::TaskResume MemBdevTransport::ReadBlocks(ctp::ipc::FullPtr<ReadTask> task, clio::run::RunContext &rctx) {
   CLIO_TASK_BODY_BEGIN
 
   auto *ipc_mgr = CLIO_IPC;

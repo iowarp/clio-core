@@ -67,12 +67,7 @@ clio::run::TaskResume Runtime::Monitor(ctp::ipc::FullPtr<MonitorTask> task,
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::Create(ctp::ipc::FullPtr<CreateTask> task, clio::run::RunContext& ctx) {
-#ifdef CLIO_USE_FIBER_BACKEND
-  clio::run::RunContext& rctx = ctx;
-#else
-  (void)ctx;
-#endif
+clio::run::TaskResume Runtime::Create(ctp::ipc::FullPtr<CreateTask> task, clio::run::RunContext& rctx) {
   CLIO_TASK_BODY_BEGIN
   // Container is already initialized via Init() before Create is called
   // Do NOT call Init() here
@@ -153,12 +148,7 @@ static const LabelMatch *FindLabelMatch(
 }
 
 clio::run::TaskResume Runtime::PutBlob(ctp::ipc::FullPtr<PutBlobTask> task,
-                                 clio::run::RunContext &ctx) {
-#ifndef CLIO_USE_FIBER_BACKEND
-  (void)ctx;
-#else
-  clio::run::RunContext& rctx = ctx;  // fiber macro captures &rctx
-#endif
+                                 clio::run::RunContext &rctx) {
   CLIO_TASK_BODY_BEGIN
   if (!cte_client_) {
     cte_client_ = std::make_shared<clio::cte::core::Client>(ResolveNextPoolId());
@@ -305,12 +295,7 @@ clio::run::TaskResume Runtime::PutBlob(ctp::ipc::FullPtr<PutBlobTask> task,
 }
 
 clio::run::TaskResume Runtime::GetBlob(ctp::ipc::FullPtr<GetBlobTask> task,
-                                 clio::run::RunContext &ctx) {
-#ifndef CLIO_USE_FIBER_BACKEND
-  (void)ctx;
-#else
-  clio::run::RunContext& rctx = ctx;  // fiber macro captures &rctx
-#endif
+                                 clio::run::RunContext &rctx) {
   CLIO_TASK_BODY_BEGIN
   if (!cte_client_) {
     cte_client_ = std::make_shared<clio::cte::core::Client>(ResolveNextPoolId());
@@ -325,12 +310,7 @@ clio::run::TaskResume Runtime::GetBlob(ctp::ipc::FullPtr<GetBlobTask> task,
 }
 
 clio::run::TaskResume Runtime::GetOrCreateTag(
-    ctp::ipc::FullPtr<GetOrCreateTagTask> task, clio::run::RunContext &ctx) {
-#ifndef CLIO_USE_FIBER_BACKEND
-  (void)ctx;
-#else
-  clio::run::RunContext& rctx = ctx;  // fiber macro captures &rctx
-#endif
+    ctp::ipc::FullPtr<GetOrCreateTagTask> task, clio::run::RunContext &rctx) {
   CLIO_TASK_BODY_BEGIN
   if (!cte_client_) {
     cte_client_ = std::make_shared<clio::cte::core::Client>(ResolveNextPoolId());
@@ -354,12 +334,7 @@ clio::run::TaskResume Runtime::GetOrCreateTag(
 }
 
 clio::run::TaskResume Runtime::SemanticSearch(
-    ctp::ipc::FullPtr<SemanticSearchTask> task, clio::run::RunContext &ctx) {
-#ifndef CLIO_USE_FIBER_BACKEND
-  (void)ctx;
-#else
-  clio::run::RunContext& rctx = ctx;  // fiber macro captures &rctx
-#endif
+    ctp::ipc::FullPtr<SemanticSearchTask> task, clio::run::RunContext &rctx) {
   CLIO_TASK_BODY_BEGIN
   if (!cte_client_) {
     cte_client_ = std::make_shared<clio::cte::core::Client>(ResolveNextPoolId());
@@ -385,12 +360,7 @@ clio::run::u64 Runtime::GetWorkRemaining() const {
 }
 
 clio::run::TaskResume Runtime::ParseOmni(ctp::ipc::FullPtr<ParseOmniTask> task,
-                                   clio::run::RunContext& ctx) {
-#ifdef CLIO_USE_FIBER_BACKEND
-  clio::run::RunContext& rctx = ctx;
-#else
-  (void)ctx;
-#endif
+                                   clio::run::RunContext& rctx) {
   CLIO_TASK_BODY_BEGIN
   HLOG(kInfo, "ParseOmni called with {} bytes of serialized data",
        task->serialized_ctx_.size());
@@ -468,12 +438,7 @@ clio::run::TaskResume Runtime::ParseOmni(ctp::ipc::FullPtr<ParseOmniTask> task,
 }
 
 clio::run::TaskResume Runtime::ProcessHdf5Dataset(
-    ctp::ipc::FullPtr<ProcessHdf5DatasetTask> task, clio::run::RunContext& ctx) {
-#ifdef CLIO_USE_FIBER_BACKEND
-  clio::run::RunContext& rctx = ctx;
-#else
-  (void)ctx;
-#endif
+    ctp::ipc::FullPtr<ProcessHdf5DatasetTask> task, clio::run::RunContext& rctx) {
   CLIO_TASK_BODY_BEGIN
 #ifdef CLIO_CAE_ENABLE_HDF5
   HLOG(kInfo, "ProcessHdf5Dataset: file='{}', dataset='{}', tag_prefix='{}'",
@@ -523,12 +488,7 @@ clio::run::TaskResume Runtime::ProcessHdf5Dataset(
 }
 
 clio::run::TaskResume Runtime::ExportData(ctp::ipc::FullPtr<ExportDataTask> task,
-                                    clio::run::RunContext& ctx) {
-#ifdef CLIO_USE_FIBER_BACKEND
-  clio::run::RunContext& rctx = ctx;
-#else
-  (void)ctx;
-#endif
+                                    clio::run::RunContext& rctx) {
   CLIO_TASK_BODY_BEGIN
   task->result_code_ = 0;
   task->bytes_exported_ = 0;

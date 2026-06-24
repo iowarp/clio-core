@@ -98,6 +98,7 @@ class basic_string;
 #include <boost/context/fixedsize_stack.hpp>
 #include <cstdlib>
 #include <functional>
+namespace clio::run { class Worker; }  // for FiberState::worker_
 namespace clio::run::detail {
   // (KiB). Defaults to 256 KiB: the whole task — incl. nested helper coroutines
   // and the DPE/allocation/cereal serialization call chain — runs on this one
@@ -116,28 +117,19 @@ namespace clio::run::detail {
   inline boost::context::fixedsize_stack boost_stack_alloc() {
     return boost::context::fixedsize_stack(boost_stack_size());
   }
-  struct FiberState;
-
-  struct FiberCallable {
-    virtual void call() = 0;
-    virtual ~FiberCallable() = default;
-  };
-
-  template<typename F>
-  struct FiberCallableT : FiberCallable {
-    F fn;
-    explicit FiberCallableT(F&& f) : fn(std::move(f)) {}
-    void call() override { fn(); }
-  };
-
-  // `task_` holds the suspended task continuation (entered by resume()).
-  // `caller_` holds the continuation back to the worker, refreshed on every
-  // suspend. A finished/destroyed fiber unwinds its own stack via RAII.
+  // Per-task fiber state. It lives INSIDE the task's RunContext (see
+  // RunContext::fiber_state_), so starting a task fiber allocates ONLY the
+  // stack — there is no heap FiberState and no type-erased callable. `task_`
+  // holds the suspended task continuation (entered by resume()); `caller_`
+  // holds the continuation back to the worker, refreshed on every suspend;
+  // `worker_` is the worker that created the fiber (Worker::make_task_fiber) —
+  // the one originally responsible for driving/cleaning it up. A
+  // finished/destroyed fiber unwinds its own stack via RAII.
   struct FiberState {
     boost::context::fiber task_;
     boost::context::fiber caller_;
     bool done = false;
-    std::unique_ptr<FiberCallable> fn;
+    clio::run::Worker* worker_ = nullptr;
   };
 
   // Suspend the running fiber back to the worker (inverse of FiberHandle::resume).
@@ -145,6 +137,9 @@ namespace clio::run::detail {
     fs->caller_ = std::move(fs->caller_).resume();
   }
 
+  // Non-owning handle to a FiberState (owned by the RunContext). resume() drives
+  // the task fiber; destroy() detaches and frees the stack (the FiberState
+  // itself is freed with its RunContext).
   class FiberHandle {
   public:
     FiberState* state_ = nullptr;
@@ -155,7 +150,14 @@ namespace clio::run::detail {
       if (!state_ || state_->done) return;
       state_->task_ = std::move(state_->task_).resume();
     }
-    void destroy() { delete state_; state_ = nullptr; }
+    void destroy() {
+      if (state_) {
+        state_->task_ = boost::context::fiber{};    // free the fiber stack
+        state_->caller_ = boost::context::fiber{};
+        state_->done = false;
+      }
+      state_ = nullptr;
+    }
     explicit operator bool() const { return state_ != nullptr; }
     bool operator!() const { return state_ == nullptr; }
     FiberHandle& operator=(std::nullptr_t) noexcept { state_ = nullptr; return *this; }
@@ -638,6 +640,9 @@ struct RunContext {
   std::coroutine_handle<> coro_handle_;
 #else
   clio::run::detail::FiberHandle coro_handle_;
+  /** Inline fiber state for the Boost backend (so only the stack is heap
+   *  allocated, never the FiberState). coro_handle_ points at this. */
+  clio::run::detail::FiberState fiber_state_;
 #endif
   u32 worker_id_;               /**< Worker ID executing this task */
   FullPtr<Task> task_;          /**< Task being executed by this context */
@@ -1315,72 +1320,47 @@ namespace clio::run::detail {
 // run inline (so awaiting their returned TaskResume is a no-op), and an await
 // simply suspends the one fiber back to the worker until the future completes.
 
-// The running fiber is taken from the worker's current RunContext — its
-// coro_handle_ is set in StartCoroutine before the fiber is resumed, so
-// rctx.coro_handle_.state_ is the fiber currently executing this await. We do
-// NOT keep a "current fiber" thread_local: a thread_local defined in this
-// header gets a separate copy per DLL on Windows, so a value written in the
-// runtime DLL is invisible to boost_await called from a module DLL (CTE/CAE) —
-// fs would read back nullptr there and the await would silently no-op, leaving
-// the task reading its subtask's empty results (issue #620). RunContext instead
-// flows through the single exported GetCurrentRunContextFromWorker(), which is
-// the canonical CTP_THREAD_MODEL-backed accessor (same path as CLIO_CUR_WORKER)
-// and resolves identically from every DLL.
+// boost_await fetches the running task's RunContext itself, via the single
+// exported GetCurrentRunContextFromWorker() (the canonical CTP_THREAD_MODEL-
+// backed accessor, same path as CLIO_CUR_WORKER). So CLIO_CO_AWAIT does not
+// assume a local `rctx`, and there is no per-DLL "current fiber" thread_local to
+// go stale on Windows (issue #620). The fiber to suspend is rctx->fiber_state_.
 
 /// Yield: suspend the running fiber back to the worker.
-inline void boost_await(clio::run::YieldAwaiter ya, clio::run::RunContext& rctx) {
-  auto* fs = rctx.coro_handle_.state_;
-  if (!fs) return;
-  rctx.is_yielded_ = true;
-  rctx.yield_time_us_ = ya.get_yield_time_us();
-  fiber_suspend_to_caller(fs);
-  rctx.is_yielded_ = false;
+inline void boost_await(clio::run::YieldAwaiter ya) {
+  clio::run::RunContext* rctx = clio::run::GetCurrentRunContextFromWorker();
+  if (!rctx) return;
+  rctx->is_yielded_ = true;
+  rctx->yield_time_us_ = ya.get_yield_time_us();
+  fiber_suspend_to_caller(&rctx->fiber_state_);
+  rctx->is_yielded_ = false;
 }
 
 /// Future: suspend the fiber until the worker observes the future complete.
 template<typename TaskT, typename AllocT>
-inline void boost_await(clio::run::Future<TaskT, AllocT>& future, clio::run::RunContext& rctx) {
+inline void boost_await(clio::run::Future<TaskT, AllocT>& future) {
   if (future.IsComplete()) return;
-  auto* fs = rctx.coro_handle_.state_;
-  if (!fs) return;
-  future.SetParentTask(&rctx);
-  rctx.is_yielded_ = true;
-  rctx.yield_time_us_ = 0.0;
-  fiber_suspend_to_caller(fs);
-  rctx.is_yielded_ = false;
+  clio::run::RunContext* rctx = clio::run::GetCurrentRunContextFromWorker();
+  if (!rctx) return;
+  future.SetParentTask(rctx);
+  rctx->is_yielded_ = true;
+  rctx->yield_time_us_ = 0.0;
+  fiber_suspend_to_caller(&rctx->fiber_state_);
+  rctx->is_yielded_ = false;
 }
 
 /// Future rvalue overload (for temporaries).
 template<typename TaskT, typename AllocT>
-inline void boost_await(clio::run::Future<TaskT, AllocT>&& future, clio::run::RunContext& rctx) {
-  boost_await(future, rctx);
+inline void boost_await(clio::run::Future<TaskT, AllocT>&& future) {
+  boost_await(future);
 }
 
 /// Nested helper coroutine: it already ran to completion inline (empty
 /// CLIO_TASK_BODY_BEGIN means it executed as a plain call on this fiber's
 /// stack, suspending the fiber itself at its own awaits), so there is nothing
 /// left to drive.
-inline void boost_await(clio::run::TaskResume&&, clio::run::RunContext&) {}
-inline void boost_await(clio::run::TaskResume&, clio::run::RunContext&) {}
-
-/// Create a task fiber whose entry runs `fn` (which invokes Container::Run).
-/// Lazy: the body runs on the first FiberHandle::resume(). Returned wrapped in
-/// a TaskResume so the worker can release()/store the FiberHandle.
-template<typename F>
-inline clio::run::TaskResume make_task_fiber(F&& fn) {
-  auto* state = new FiberState();
-  state->fn = std::make_unique<FiberCallableT<typename std::decay<F>::type>>(std::forward<F>(fn));
-  state->task_ = boost::context::fiber{
-      std::allocator_arg,
-      boost_stack_alloc(),
-      [state](boost::context::fiber&& caller) -> boost::context::fiber {
-        state->caller_ = std::move(caller);
-        try { state->fn->call(); } catch (...) {}
-        state->done = true;
-        return std::move(state->caller_);
-      }};
-  return clio::run::TaskResume(FiberHandle(state));
-}
+inline void boost_await(clio::run::TaskResume&&) {}
+inline void boost_await(clio::run::TaskResume&) {}
 
 }  // namespace clio::run::detail
 #endif // CLIO_ENABLE_BOOST_COROUTINES
@@ -1395,7 +1375,7 @@ inline clio::run::TaskResume make_task_fiber(F&& fn) {
 // method returns a (trivial) TaskResume by value.
 #  define CLIO_TASK_BODY_BEGIN
 #  define CLIO_TASK_BODY_END
-#  define CLIO_CO_AWAIT(expr)  clio::run::detail::boost_await((expr), rctx)
+#  define CLIO_CO_AWAIT(expr)  clio::run::detail::boost_await((expr))
 #  define CLIO_CO_RETURN       return clio::run::TaskResume{}
 #else
 // C++20 stackless coroutines.

@@ -32,28 +32,28 @@ class Runtime : public clio::run::Container {
   ~Runtime() override = default;
 
   // ---- Method handlers ----
-  clio::run::TaskResume Create(ctp::ipc::FullPtr<CreateTask> task, clio::run::RunContext &ctx);
-  clio::run::TaskResume Destroy(ctp::ipc::FullPtr<DestroyTask> task, clio::run::RunContext &ctx);
-  clio::run::TaskResume Monitor(ctp::ipc::FullPtr<MonitorTask> task, clio::run::RunContext &ctx);
-  clio::run::TaskResume Open(ctp::ipc::FullPtr<OpenTask> task, clio::run::RunContext &ctx);
-  clio::run::TaskResume Close(ctp::ipc::FullPtr<CloseTask> task, clio::run::RunContext &ctx);
-  clio::run::TaskResume Read(ctp::ipc::FullPtr<ReadTask> task, clio::run::RunContext &ctx);
-  clio::run::TaskResume Write(ctp::ipc::FullPtr<WriteTask> task, clio::run::RunContext &ctx);
-  clio::run::TaskResume Append(ctp::ipc::FullPtr<AppendTask> task, clio::run::RunContext &ctx);
-  clio::run::TaskResume Getattr(ctp::ipc::FullPtr<GetattrTask> task, clio::run::RunContext &ctx);
-  clio::run::TaskResume Truncate(ctp::ipc::FullPtr<TruncateTask> task, clio::run::RunContext &ctx);
-  clio::run::TaskResume Unlink(ctp::ipc::FullPtr<UnlinkTask> task, clio::run::RunContext &ctx);
-  clio::run::TaskResume Mkdir(ctp::ipc::FullPtr<MkdirTask> task, clio::run::RunContext &ctx);
-  clio::run::TaskResume Rmdir(ctp::ipc::FullPtr<RmdirTask> task, clio::run::RunContext &ctx);
-  clio::run::TaskResume Rename(ctp::ipc::FullPtr<RenameTask> task, clio::run::RunContext &ctx);
-  clio::run::TaskResume Link(ctp::ipc::FullPtr<LinkTask> task, clio::run::RunContext &ctx);
-  clio::run::TaskResume Readdir(ctp::ipc::FullPtr<ReaddirTask> task, clio::run::RunContext &ctx);
-  clio::run::TaskResume StatSize(ctp::ipc::FullPtr<StatSizeTask> task, clio::run::RunContext &ctx);
+  clio::run::TaskResume Create(ctp::ipc::FullPtr<CreateTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume Destroy(ctp::ipc::FullPtr<DestroyTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume Monitor(ctp::ipc::FullPtr<MonitorTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume Open(ctp::ipc::FullPtr<OpenTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume Close(ctp::ipc::FullPtr<CloseTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume Read(ctp::ipc::FullPtr<ReadTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume Write(ctp::ipc::FullPtr<WriteTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume Append(ctp::ipc::FullPtr<AppendTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume Getattr(ctp::ipc::FullPtr<GetattrTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume Truncate(ctp::ipc::FullPtr<TruncateTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume Unlink(ctp::ipc::FullPtr<UnlinkTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume Mkdir(ctp::ipc::FullPtr<MkdirTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume Rmdir(ctp::ipc::FullPtr<RmdirTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume Rename(ctp::ipc::FullPtr<RenameTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume Link(ctp::ipc::FullPtr<LinkTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume Readdir(ctp::ipc::FullPtr<ReaddirTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume StatSize(ctp::ipc::FullPtr<StatSizeTask> task, clio::run::RunContext &rctx);
   // ---- deferred-append pipeline ----
-  clio::run::TaskResume AppendSequence(ctp::ipc::FullPtr<AppendSequenceTask> task, clio::run::RunContext &ctx);
-  clio::run::TaskResume AppendCollect(ctp::ipc::FullPtr<AppendCollectTask> task, clio::run::RunContext &ctx);
-  clio::run::TaskResume AppendPlan(ctp::ipc::FullPtr<AppendPlanTask> task, clio::run::RunContext &ctx);
-  clio::run::TaskResume AppendExecution(ctp::ipc::FullPtr<AppendExecutionTask> task, clio::run::RunContext &ctx);
+  clio::run::TaskResume AppendSequence(ctp::ipc::FullPtr<AppendSequenceTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume AppendCollect(ctp::ipc::FullPtr<AppendCollectTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume AppendPlan(ctp::ipc::FullPtr<AppendPlanTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume AppendExecution(ctp::ipc::FullPtr<AppendExecutionTask> task, clio::run::RunContext &rctx);
 
   // ---- Container virtuals (defined in autogen/filesystem_lib_exec.cc) ----
   void Init(const clio::run::PoolId &pool_id, const std::string &pool_name,

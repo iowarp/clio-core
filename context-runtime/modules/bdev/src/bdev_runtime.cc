@@ -45,7 +45,7 @@ clio::run::TaskStat Runtime::GetTaskStats(const clio::run::Task *task) const {
   }
 }
 
-size_t Runtime::GetWorkerID(clio::run::RunContext &ctx) {
+size_t Runtime::GetWorkerID(clio::run::RunContext &rctx) {
   clio::run::Worker *worker = CLIO_CUR_WORKER;
   if (worker == nullptr) {
     return 0;
@@ -53,12 +53,7 @@ size_t Runtime::GetWorkerID(clio::run::RunContext &ctx) {
   return worker->GetId();
 }
 
-clio::run::TaskResume Runtime::Create(ctp::ipc::FullPtr<CreateTask> task, clio::run::RunContext &ctx) {
-#ifdef CLIO_USE_FIBER_BACKEND
-  clio::run::RunContext& rctx = ctx;
-#else
-  (void)ctx;
-#endif
+clio::run::TaskResume Runtime::Create(ctp::ipc::FullPtr<CreateTask> task, clio::run::RunContext &rctx) {
   CLIO_TASK_BODY_BEGIN
   
   CreateParams params = task->GetParams();
@@ -95,8 +90,7 @@ clio::run::TaskResume Runtime::Create(ctp::ipc::FullPtr<CreateTask> task, clio::
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::AllocateBlocks(ctp::ipc::FullPtr<AllocateBlocksTask> task, clio::run::RunContext &ctx) {
-  clio::run::RunContext& rctx = ctx;
+clio::run::TaskResume Runtime::AllocateBlocks(ctp::ipc::FullPtr<AllocateBlocksTask> task, clio::run::RunContext &rctx) {
   CLIO_TASK_BODY_BEGIN
 
   if (bdev_type_ == BdevType::kNoop) {
@@ -122,8 +116,7 @@ clio::run::TaskResume Runtime::AllocateBlocks(ctp::ipc::FullPtr<AllocateBlocksTa
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::FreeBlocks(ctp::ipc::FullPtr<FreeBlocksTask> task, clio::run::RunContext &ctx) {
-  clio::run::RunContext& rctx = ctx;
+clio::run::TaskResume Runtime::FreeBlocks(ctp::ipc::FullPtr<FreeBlocksTask> task, clio::run::RunContext &rctx) {
   CLIO_TASK_BODY_BEGIN
 
   if (bdev_type_ == BdevType::kNoop) {
@@ -144,8 +137,7 @@ clio::run::TaskResume Runtime::FreeBlocks(ctp::ipc::FullPtr<FreeBlocksTask> task
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::Write(ctp::ipc::FullPtr<WriteTask> task, clio::run::RunContext &ctx) {
-  clio::run::RunContext& rctx = ctx;
+clio::run::TaskResume Runtime::Write(ctp::ipc::FullPtr<WriteTask> task, clio::run::RunContext &rctx) {
   CLIO_TASK_BODY_BEGIN
 
   if (bdev_type_ == BdevType::kNoop) {
@@ -167,8 +159,7 @@ clio::run::TaskResume Runtime::Write(ctp::ipc::FullPtr<WriteTask> task, clio::ru
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::Read(ctp::ipc::FullPtr<ReadTask> task, clio::run::RunContext &ctx) {
-  clio::run::RunContext& rctx = ctx;
+clio::run::TaskResume Runtime::Read(ctp::ipc::FullPtr<ReadTask> task, clio::run::RunContext &rctx) {
   CLIO_TASK_BODY_BEGIN
 
   if (bdev_type_ == BdevType::kNoop) {
@@ -190,24 +181,14 @@ clio::run::TaskResume Runtime::Read(ctp::ipc::FullPtr<ReadTask> task, clio::run:
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::Update(ctp::ipc::FullPtr<UpdateTask> task, clio::run::RunContext &ctx) {
-#ifdef CLIO_USE_FIBER_BACKEND
-  clio::run::RunContext& rctx = ctx;  // fiber macro captures &rctx
-#else
-  (void)ctx;
-#endif
+clio::run::TaskResume Runtime::Update(ctp::ipc::FullPtr<UpdateTask> task, clio::run::RunContext &rctx) {
   CLIO_TASK_BODY_BEGIN
   task->return_code_ = 0;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::GetStats(ctp::ipc::FullPtr<GetStatsTask> task, clio::run::RunContext &ctx) {
-#ifdef CLIO_USE_FIBER_BACKEND
-  clio::run::RunContext& rctx = ctx;
-#else
-  (void)ctx;
-#endif
+clio::run::TaskResume Runtime::GetStats(ctp::ipc::FullPtr<GetStatsTask> task, clio::run::RunContext &rctx) {
   CLIO_TASK_BODY_BEGIN
   ReadTask r_synthetic;
   r_synthetic.method_ = Method::kRead;
@@ -240,12 +221,7 @@ clio::run::TaskResume Runtime::GetStats(ctp::ipc::FullPtr<GetStatsTask> task, cl
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::Destroy(ctp::ipc::FullPtr<DestroyTask> task, clio::run::RunContext &ctx) {
-#ifdef CLIO_USE_FIBER_BACKEND
-  clio::run::RunContext& rctx = ctx;
-#else
-  (void)ctx;
-#endif
+clio::run::TaskResume Runtime::Destroy(ctp::ipc::FullPtr<DestroyTask> task, clio::run::RunContext &rctx) {
   CLIO_TASK_BODY_BEGIN
   if (transport_) {
     transport_->Destroy();

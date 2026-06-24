@@ -86,7 +86,7 @@ public:
    * This method both creates and initializes the container
    * Returns TaskResume for coroutine-based async operations
    */
-  clio::run::TaskResume Create(ctp::ipc::FullPtr<CreateTask> task, clio::run::RunContext &ctx);
+  clio::run::TaskResume Create(ctp::ipc::FullPtr<CreateTask> task, clio::run::RunContext &rctx);
 
   /**
    * Monitor container state (Method::kMonitor)
@@ -96,95 +96,95 @@ public:
   /**
    * Destroy the container (Method::kDestroy)
    */
-  clio::run::TaskResume Destroy(ctp::ipc::FullPtr<DestroyTask> task, clio::run::RunContext &ctx);
+  clio::run::TaskResume Destroy(ctp::ipc::FullPtr<DestroyTask> task, clio::run::RunContext &rctx);
 
   /**
    * Register a target (Method::kRegisterTarget)
    * Returns TaskResume for coroutine-based async operations
    */
   clio::run::TaskResume RegisterTarget(ctp::ipc::FullPtr<RegisterTargetTask> task,
-                                 clio::run::RunContext &ctx);
+                                 clio::run::RunContext &rctx);
 
   /**
    * Unregister a target (Method::kUnregisterTarget)
    */
   clio::run::TaskResume UnregisterTarget(ctp::ipc::FullPtr<UnregisterTargetTask> task,
-                        clio::run::RunContext &ctx);
+                        clio::run::RunContext &rctx);
 
   /**
    * List registered targets (Method::kListTargets)
    */
-  clio::run::TaskResume ListTargets(ctp::ipc::FullPtr<ListTargetsTask> task, clio::run::RunContext &ctx);
+  clio::run::TaskResume ListTargets(ctp::ipc::FullPtr<ListTargetsTask> task, clio::run::RunContext &rctx);
 
   /**
    * Update target statistics (Method::kStatTargets)
    */
-  clio::run::TaskResume StatTargets(ctp::ipc::FullPtr<StatTargetsTask> task, clio::run::RunContext &ctx);
+  clio::run::TaskResume StatTargets(ctp::ipc::FullPtr<StatTargetsTask> task, clio::run::RunContext &rctx);
 
   /**
    * Get target information (Method::kGetTargetInfo)
    * Returns target score, remaining space, and performance metrics
    */
-  clio::run::TaskResume GetTargetInfo(ctp::ipc::FullPtr<GetTargetInfoTask> task, clio::run::RunContext &ctx);
+  clio::run::TaskResume GetTargetInfo(ctp::ipc::FullPtr<GetTargetInfoTask> task, clio::run::RunContext &rctx);
 
   /**
    * Get or create a tag (Method::kGetOrCreateTag)
    */
   template <typename CreateParamsT = CreateParams>
   clio::run::TaskResume GetOrCreateTag(ctp::ipc::FullPtr<GetOrCreateTagTask<CreateParamsT>> task,
-                      clio::run::RunContext &ctx);
+                      clio::run::RunContext &rctx);
 
   /**
    * Put blob (Method::kPutBlob) - allocates and writes data to blob
    * Returns TaskResume for coroutine-based async operations
    */
-  clio::run::TaskResume PutBlob(ctp::ipc::FullPtr<PutBlobTask> task, clio::run::RunContext &ctx);
+  clio::run::TaskResume PutBlob(ctp::ipc::FullPtr<PutBlobTask> task, clio::run::RunContext &rctx);
 
   /**
    * Get blob (Method::kGetBlob) - reads data from existing blob
    * Returns TaskResume for coroutine-based async operations
    */
-  clio::run::TaskResume GetBlob(ctp::ipc::FullPtr<GetBlobTask> task, clio::run::RunContext &ctx);
+  clio::run::TaskResume GetBlob(ctp::ipc::FullPtr<GetBlobTask> task, clio::run::RunContext &rctx);
 
   /**
    * Reorganize single blob (Method::kReorganizeBlob) - update score for single
    * blob. Returns TaskResume for coroutine-based async operations
    */
   clio::run::TaskResume ReorganizeBlob(ctp::ipc::FullPtr<ReorganizeBlobTask> task,
-                                 clio::run::RunContext &ctx);
+                                 clio::run::RunContext &rctx);
 
   /**
    * Delete blob operation - removes blob and decrements tag size
    * Returns TaskResume for coroutine-based async operations
    */
-  clio::run::TaskResume DelBlob(ctp::ipc::FullPtr<DelBlobTask> task, clio::run::RunContext &ctx);
+  clio::run::TaskResume DelBlob(ctp::ipc::FullPtr<DelBlobTask> task, clio::run::RunContext &rctx);
 
   /**
    * Truncate blob (Method::kTruncateBlob) - resize a blob to an exact logical
    * size (grow/shrink) via the shared ResizeBlob helper.
    */
   clio::run::TaskResume TruncateBlob(ctp::ipc::FullPtr<TruncateBlobTask> task,
-                               clio::run::RunContext &ctx);
+                               clio::run::RunContext &rctx);
 
   /**
    * Rename tag (Method::kRenameTag) - change a tag's name in place, keeping
    * its TagId (and all blobs). Broadcast op; shares no data movement.
    */
   clio::run::TaskResume RenameTag(ctp::ipc::FullPtr<RenameTagTask> task,
-                            clio::run::RunContext &ctx);
+                            clio::run::RunContext &rctx);
 
   /**
    * GetOrCreateTagAlias (Method::kGetOrCreateTagAlias) - bind an extra name to
    * an existing tag's id (hard link at the tag level). Broadcast op.
    */
   clio::run::TaskResume GetOrCreateTagAlias(
-      ctp::ipc::FullPtr<GetOrCreateTagAliasTask> task, clio::run::RunContext &ctx);
+      ctp::ipc::FullPtr<GetOrCreateTagAliasTask> task, clio::run::RunContext &rctx);
 
   /**
    * Delete tag operation - removes all blobs from tag and removes tag
    * Returns TaskResume for coroutine-based async operations
    */
-  clio::run::TaskResume DelTag(ctp::ipc::FullPtr<DelTagTask> task, clio::run::RunContext &ctx);
+  clio::run::TaskResume DelTag(ctp::ipc::FullPtr<DelTagTask> task, clio::run::RunContext &rctx);
 
   /**
    * GetTagName (Method::kGetTagName) - resolve a TagId to its full, absolute
@@ -192,18 +192,18 @@ public:
    * Broadcast op; the container owning the tag's metadata answers.
    */
   clio::run::TaskResume GetTagName(ctp::ipc::FullPtr<GetTagNameTask> task,
-                             clio::run::RunContext &ctx);
+                             clio::run::RunContext &rctx);
 
   /**
    * Get tag size operation - returns total size of all blobs in tag
    */
-  clio::run::TaskResume GetTagSize(ctp::ipc::FullPtr<GetTagSizeTask> task, clio::run::RunContext &ctx);
+  clio::run::TaskResume GetTagSize(ctp::ipc::FullPtr<GetTagSizeTask> task, clio::run::RunContext &rctx);
 
   /**
    * Get max (total) capacity — sum of max_capacity_ over targets registered on
    * this node. Broadcast to sum across the cluster (AggregateOut adds replicas).
    */
-  clio::run::TaskResume GetCapacity(ctp::ipc::FullPtr<GetCapacityTask> task, clio::run::RunContext &ctx);
+  clio::run::TaskResume GetCapacity(ctp::ipc::FullPtr<GetCapacityTask> task, clio::run::RunContext &rctx);
 
   /**
    * GetNumAliases (Method::kGetNumAliases) - number of extra names (tag-level
@@ -212,7 +212,7 @@ public:
    * owns the tag answers.
    */
   clio::run::TaskResume GetNumAliases(ctp::ipc::FullPtr<GetNumAliasesTask> task,
-                                clio::run::RunContext &ctx);
+                                clio::run::RunContext &rctx);
 
   /**
    * Schedule a task by resolving Dynamic pool queries.
@@ -633,46 +633,46 @@ private:
   /**
    * Poll telemetry log (Method::kPollTelemetryLog)
    * @param task PollTelemetryLog task containing parameters and results
-   * @param ctx Runtime context for task execution
+   * @param rctx Runtime context for task execution
    */
   clio::run::TaskResume PollTelemetryLog(ctp::ipc::FullPtr<PollTelemetryLogTask> task,
-                        clio::run::RunContext &ctx);
+                        clio::run::RunContext &rctx);
 
   /**
    * Get blob score operation - returns the score of a blob
    * @param task GetBlobScore task containing blob lookup parameters and results
-   * @param ctx Runtime context for task execution
+   * @param rctx Runtime context for task execution
    */
-  clio::run::TaskResume GetBlobScore(ctp::ipc::FullPtr<GetBlobScoreTask> task, clio::run::RunContext &ctx);
+  clio::run::TaskResume GetBlobScore(ctp::ipc::FullPtr<GetBlobScoreTask> task, clio::run::RunContext &rctx);
 
   /**
    * Get blob size operation - returns the size of a blob in bytes
    * @param task GetBlobSize task containing blob lookup parameters and results
-   * @param ctx Runtime context for task execution
+   * @param rctx Runtime context for task execution
    */
-  clio::run::TaskResume GetBlobSize(ctp::ipc::FullPtr<GetBlobSizeTask> task, clio::run::RunContext &ctx);
+  clio::run::TaskResume GetBlobSize(ctp::ipc::FullPtr<GetBlobSizeTask> task, clio::run::RunContext &rctx);
 
   /**
    * Get contained blobs operation - returns all blob names in a tag
    * @param task GetContainedBlobs task containing tag ID and results
-   * @param ctx Runtime context for task execution
+   * @param rctx Runtime context for task execution
    */
   clio::run::TaskResume GetContainedBlobs(ctp::ipc::FullPtr<GetContainedBlobsTask> task,
-                         clio::run::RunContext &ctx);
+                         clio::run::RunContext &rctx);
 
   /**
    * Query tags by regex pattern (Method::kTagQuery)
    * @param task TagQuery task containing regex pattern and results
-   * @param ctx Runtime context for task execution
+   * @param rctx Runtime context for task execution
    */
-  clio::run::TaskResume TagQuery(ctp::ipc::FullPtr<TagQueryTask> task, clio::run::RunContext &ctx);
+  clio::run::TaskResume TagQuery(ctp::ipc::FullPtr<TagQueryTask> task, clio::run::RunContext &rctx);
 
   /**
    * Query blobs by tag and blob regex patterns (Method::kBlobQuery)
    * @param task BlobQuery task containing regex patterns and results
-   * @param ctx Runtime context for task execution
+   * @param rctx Runtime context for task execution
    */
-  clio::run::TaskResume BlobQuery(ctp::ipc::FullPtr<BlobQueryTask> task, clio::run::RunContext &ctx);
+  clio::run::TaskResume BlobQuery(ctp::ipc::FullPtr<BlobQueryTask> task, clio::run::RunContext &rctx);
 
   /**
    * BM25 keyword search over blob contents (Method::kSemanticSearch).
@@ -682,7 +682,7 @@ private:
    * set. Returns top-k results sorted by descending score.
    */
   clio::run::TaskResume SemanticSearch(ctp::ipc::FullPtr<SemanticSearchTask> task,
-                                 clio::run::RunContext &ctx);
+                                 clio::run::RunContext &rctx);
 
   /**
    * Timestamp-window search over blob metadata (Method::kTemporalSearch).
@@ -691,25 +691,25 @@ private:
    * [time_begin_, time_end_], sorted by ascending last_modified_.
    */
   clio::run::TaskResume TemporalSearch(ctp::ipc::FullPtr<TemporalSearchTask> task,
-                                 clio::run::RunContext &ctx);
+                                 clio::run::RunContext &rctx);
 
   /**
    * Get comprehensive blob metadata (Method::kGetBlobInfo)
    * Returns score, total size, and block placement information
    * @param task GetBlobInfo task containing blob lookup parameters and results
-   * @param ctx Runtime context for task execution
+   * @param rctx Runtime context for task execution
    */
-  clio::run::TaskResume GetBlobInfo(ctp::ipc::FullPtr<GetBlobInfoTask> task, clio::run::RunContext &ctx);
+  clio::run::TaskResume GetBlobInfo(ctp::ipc::FullPtr<GetBlobInfoTask> task, clio::run::RunContext &rctx);
 
   /**
    * Flush metadata to durable storage (Method::kFlushMetadata)
    */
-  clio::run::TaskResume FlushMetadata(ctp::ipc::FullPtr<FlushMetadataTask> task, clio::run::RunContext &ctx);
+  clio::run::TaskResume FlushMetadata(ctp::ipc::FullPtr<FlushMetadataTask> task, clio::run::RunContext &rctx);
 
   /**
    * Flush data from volatile to non-volatile targets (Method::kFlushData)
    */
-  clio::run::TaskResume FlushData(ctp::ipc::FullPtr<FlushDataTask> task, clio::run::RunContext &ctx);
+  clio::run::TaskResume FlushData(ctp::ipc::FullPtr<FlushDataTask> task, clio::run::RunContext &rctx);
 
 private:
   /**

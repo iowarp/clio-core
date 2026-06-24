@@ -86,18 +86,18 @@ class BdevTransport {
   /**
    * Write data to the storage blocks
    * @param task The write task containing data and target blocks
-   * @param ctx The coroutine context
+   * @param rctx The coroutine context
    * @return TaskResume to yield or complete the task
    */
-  virtual clio::run::TaskResume WriteBlocks(ctp::ipc::FullPtr<WriteTask> task, clio::run::RunContext &ctx) = 0;
+  virtual clio::run::TaskResume WriteBlocks(ctp::ipc::FullPtr<WriteTask> task, clio::run::RunContext &rctx) = 0;
 
   /**
    * Read data from the storage blocks
    * @param task The read task containing dest buffer and source blocks
-   * @param ctx The coroutine context
+   * @param rctx The coroutine context
    * @return TaskResume to yield or complete the task
    */
-  virtual clio::run::TaskResume ReadBlocks(ctp::ipc::FullPtr<ReadTask> task, clio::run::RunContext &ctx) = 0;
+  virtual clio::run::TaskResume ReadBlocks(ctp::ipc::FullPtr<ReadTask> task, clio::run::RunContext &rctx) = 0;
 
   /**
    * Get the total capacity of the storage device
