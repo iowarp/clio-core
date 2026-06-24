@@ -176,6 +176,12 @@ void IpcManagerRun2Run::SendIn(ctp::ipc::FullPtr<chi::Task> origin_task) {
   }
   chi::RunContext *origin_rctx = origin_task->GetRunCtx();
 
+  // Stamp the dispatch time so ScanSendMapTimeouts can apply an absolute
+  // deadline: if a replica response never comes back (lost, or misrouted to a
+  // node whose send_map can't match the net_key — #628), the origin still
+  // completes with a timeout RC instead of stalling forever.
+  origin_rctx->send_enqueue_time_ = std::chrono::steady_clock::now();
+
   const std::vector<chi::PoolQuery> &pool_queries = origin_rctx->pool_queries_;
   size_t num_replicas = pool_queries.size();
   origin_rctx->subtasks_.resize(num_replicas);
@@ -775,11 +781,14 @@ void IpcManagerRun2Run::ScanSendMapTimeouts() {
   auto *ipc_manager = CLIO_IPC;
   auto now = std::chrono::steady_clock::now();
 
+  // NOTE: we do NOT early-return when no nodes are dead. The dead-node check
+  // below only catches origins blocked on a node SWIM has marked dead; it
+  // misses the #628 failure where a replica response is misrouted to a *live*
+  // node (hostfile ordering differs across the cluster, so the responder's
+  // ret_node index resolves to the wrong host) and therefore never reaches the
+  // origin's send_map. Those origins would hang forever. The absolute-deadline
+  // pass added below completes them regardless of node liveness.
   const auto &dead_nodes = ipc_manager->GetDeadNodes();
-  if (dead_nodes.empty()) {
-    return;
-  }
-
   std::unordered_map<chi::u64, std::chrono::steady_clock::time_point> dead_map;
   for (const auto &entry : dead_nodes) {
     dead_map[entry.node_id] = entry.detected_at;
@@ -818,6 +827,22 @@ void IpcManagerRun2Run::ScanSendMapTimeouts() {
             }
           }
 
+          // Absolute deadline (#628): even if no target node is dead, an origin
+          // that has waited past its timeout for a replica response that will
+          // never arrive (lost or misrouted to the wrong node) must complete
+          // rather than hang. send_enqueue_time_ == epoch means the task was
+          // never cross-node dispatched, so skip it.
+          if (!any_timed_out &&
+              rctx->send_enqueue_time_ !=
+                  std::chrono::steady_clock::time_point{}) {
+            float waited =
+                std::chrono::duration<float>(now - rctx->send_enqueue_time_)
+                    .count();
+            if (waited >= task_timeout) {
+              any_timed_out = true;
+            }
+          }
+
           if (any_timed_out) {
             to_complete.emplace_back(key, origin_task);
           }
@@ -831,11 +856,26 @@ void IpcManagerRun2Run::ScanSendMapTimeouts() {
       continue;
     }
     HLOG(kError,
-         "[ScanSendMapTimeouts] Task {} timed out waiting for dead node",
+         "[ScanSendMapTimeouts] Task {} timed out waiting for replica "
+         "response (dead node or unmatchable/misrouted reply) — completing "
+         "with network-timeout rc",
          origin_task->task_id_);
     origin_task->SetReturnCode(kRun2RunNetworkTimeoutRC);
+    // Prefer the current worker; fall back to the net-recv worker when this
+    // runs off a worker thread (mirrors RecvOutCompleteOriginTask). Guard
+    // against a null worker so the scan never crashes.
     auto *worker = CLIO_CUR_WORKER;
-    worker->EndTask(origin_task, rctx, true);
+    if (worker == nullptr) {
+      auto *scheduler = ipc_manager->GetScheduler();
+      worker = scheduler ? scheduler->GetNetRecvWorker() : nullptr;
+    }
+    if (worker != nullptr) {
+      worker->EndTask(origin_task, rctx, true);
+    } else {
+      HLOG(kError,
+           "[ScanSendMapTimeouts] No worker available to complete task {}",
+           origin_task->task_id_);
+    }
   }
 
   if (!to_complete.empty()) {

@@ -41,6 +41,7 @@ using pid_t = int;
 #endif
 
 #include <atomic>
+#include <chrono>
 #ifndef __NVCOMPILER
 #include <coroutine>
 #endif
@@ -627,6 +628,13 @@ struct RunContext {
       0; /**< Predicted wall time from InferWallClockTime */
   TaskStat
       predicted_stat_; /**< TaskStat used for prediction (for reinforcement) */
+  // When this task's replicas were dispatched cross-node via SendIn (steady
+  // clock). ScanSendMapTimeouts uses it as an absolute deadline so an origin
+  // whose replica response never returns — e.g. a response misrouted to the
+  // wrong node because hostfile ordering differs across the cluster (#628) —
+  // still completes with a timeout RC instead of hanging forever. Default
+  // (epoch) means "not cross-node dispatched" and is skipped by the scan.
+  std::chrono::steady_clock::time_point send_enqueue_time_{};
 
   RunContext()
       : coro_handle_(),
@@ -670,7 +678,8 @@ struct RunContext {
         predicted_load_(other.predicted_load_),
         wall_timer_(other.wall_timer_),
         predicted_wall_us_(other.predicted_wall_us_),
-        predicted_stat_(other.predicted_stat_) {
+        predicted_stat_(other.predicted_stat_),
+        send_enqueue_time_(other.send_enqueue_time_) {
 #ifndef __NVCOMPILER
     other.coro_handle_ = nullptr;
 #else
