@@ -139,9 +139,27 @@ jobs:
             eval "$(conda shell.bash hook)"
           fi
           conda activate iowarp
-          cmake --preset boost
+          # DIAG(#619): build with DEBUG logging so the spawned fallback runtimes
+          # record the receiver side of the cross-process FIFO wake + punt flow.
+          cmake --preset boost -DCLIO_CTP_LOG_LEVEL=0
           cmake --build build-boost -j"$(sysctl -n hw.ncpu)"
+          set +e
           ctest --test-dir build-boost --output-on-failure --timeout 180 --repeat until-pass:3 -LE "ollama"
+          CTEST_RC=$?
+          set -e
+          # DIAG(#619): the fallback runtimes posix_spawn with stdout/stderr
+          # redirected to these files. Dump them to see whether MAIN woke on the
+          # cross-process FIFO ("woke on cross-process FIFO") and completed the
+          # punt, or where it is stuck.
+          echo "===================== #619 fallback runtime logs ====================="
+          for f in /tmp/cte_fb_main.log /tmp/cte_fb_user.log \
+                   /tmp/fb_main_runtime.log /tmp/fb_user_runtime.log; do
+            echo "----- $f (tail 200) -----"; tail -200 "$f" 2>/dev/null || echo "(missing)"
+          done
+          echo "===================== FIFO / punt activity ====================="
+          grep -hE "cross-process FIFO|FIFO open|PuntCopyIn|CompletePunt|[Pp]unt|AwakenWorker" \
+               /tmp/cte_fb_*.log /tmp/fb_*_runtime.log 2>/dev/null | tail -80 || true
+          exit "$CTEST_RC"
 
   # ---- Windows (vcpkg deps, boost-context feature) --------------------------
   windows:
