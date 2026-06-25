@@ -39,6 +39,9 @@
 
 #include <clio_ctp/lightbeam/transport_factory_impl.h>
 #include <zmq.h>
+#ifndef _WIN32
+#include <unistd.h>  // ::access / F_OK for the #619 fallback connect diagnostic
+#endif
 
 #include <algorithm>
 #include <cerrno>
@@ -975,17 +978,21 @@ bool IpcManager::FallbackClientInit(u32 main_port) {
   // clio_<port>.ipc control server is bound, so the first connect races and
   // throws. Retry across total_timeout instead of giving up on a single throw.
   {
+    std::string ipc_path;
+    if (UseLocalZmqIpc()) {
+      ctp::SystemInfo::EnsureMemfdDir();
+      ipc_path = ctp::SystemInfo::GetMemfdPath(
+          "clio_" + std::to_string(main_port) + ".ipc");
+    }
     auto connect_start = std::chrono::steady_clock::now();
     bool connected_transport = false;
     std::string last_err;
+    int attempts = 0;
     while (std::chrono::duration<float>(std::chrono::steady_clock::now() -
                                         connect_start)
                .count() < total_timeout) {
       try {
         if (UseLocalZmqIpc()) {
-          ctp::SystemInfo::EnsureMemfdDir();
-          std::string ipc_path = ctp::SystemInfo::GetMemfdPath(
-              "clio_" + std::to_string(main_port) + ".ipc");
           zmq_transport_ = ctp::lbm::TransportFactory::Get(
               ipc_path, ctp::lbm::TransportType::kSocket,
               ctp::lbm::TransportMode::kClient, "ipc", 0);
@@ -998,6 +1005,21 @@ bool IpcManager::FallbackClientInit(u32 main_port) {
         break;
       } catch (const std::exception &e) {
         last_err = e.what();
+        // DIAG(#619): on failure, is MAIN's control socket file present
+        // (listener gone -> ECONNREFUSED) or absent (MAIN never bound / unbound
+        // it)? Log the first few + every ~2s.
+        int sock_present = -1;
+#ifndef _WIN32
+        if (!ipc_path.empty()) {
+          sock_present = (::access(ipc_path.c_str(), F_OK) == 0) ? 1 : 0;
+        }
+#endif
+        if (++attempts <= 3 || attempts % 20 == 0) {
+          HLOG(kInfo,
+               "FallbackClientInit: connect attempt {} to {} failed ({}); "
+               "socket_file_present={}",
+               attempts, ipc_path, e.what(), sock_present);
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
       }
     }
