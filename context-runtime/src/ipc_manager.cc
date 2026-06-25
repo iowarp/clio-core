@@ -961,13 +961,28 @@ bool IpcManager::FallbackClientInit(u32 main_port) {
   float total_timeout = wait_env ? static_cast<float>(std::atof(wait_env)) : 30.0f;
   if (total_timeout <= 0) total_timeout = 30.0f;
 
-  // A dedicated DEALER to the MAIN runtime's control ROUTER (main_port + 3).
+  // Connect to the MAIN runtime's local control path. On macOS (issue #482)
+  // the TCP-loopback ROUTER->DEALER reply path is broken, so MAIN serves its
+  // local control endpoint over a unix-domain SocketTransport (clio_<port>.ipc)
+  // exactly as the normal client connects (see ClientInit). Mirror that choice
+  // here: a TCP DEALER to main_port+3 would simply never get an answer on macOS
+  // and FallbackClientInit would time out ("did not answer ClientConnect"),
+  // leaving fallback_ null and every punt failing with "no fallback_".
   try {
-    zmq_transport_ = ctp::lbm::TransportFactory::Get(
-        config->GetServerAddr(), ctp::lbm::TransportType::kZeroMq,
-        ctp::lbm::TransportMode::kClient, "tcp", main_port + 3);
+    if (UseLocalZmqIpc()) {
+      ctp::SystemInfo::EnsureMemfdDir();
+      std::string ipc_path = ctp::SystemInfo::GetMemfdPath(
+          "clio_" + std::to_string(main_port) + ".ipc");
+      zmq_transport_ = ctp::lbm::TransportFactory::Get(
+          ipc_path, ctp::lbm::TransportType::kSocket,
+          ctp::lbm::TransportMode::kClient, "ipc", 0);
+    } else {
+      zmq_transport_ = ctp::lbm::TransportFactory::Get(
+          config->GetServerAddr(), ctp::lbm::TransportType::kZeroMq,
+          ctp::lbm::TransportMode::kClient, "tcp", main_port + 3);
+    }
   } catch (const std::exception &e) {
-    HLOG(kError, "FallbackClientInit: failed to create DEALER to main: {}",
+    HLOG(kError, "FallbackClientInit: failed to create transport to main: {}",
          e.what());
     return false;
   }
