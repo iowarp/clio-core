@@ -151,12 +151,14 @@ jobs:
           # redirected to these files. Dump them to see whether MAIN woke on the
           # cross-process FIFO ("woke on cross-process FIFO") and completed the
           # punt, or where it is stuck.
+          echo "===================== ipc control sockets present after test ====================="
+          ls -la /tmp/clio_runner/ 2>/dev/null || echo "(no /tmp/clio_runner)"
           echo "===================== #619 fallback punt protocol (per runtime) ====================="
           for f in /tmp/cte_fb_main.log /tmp/cte_fb_user.log \
                    /tmp/fb_main_runtime.log /tmp/fb_user_runtime.log; do
-            echo "----- $f : protocol trace (whole file, last 80 matches) -----"
-            grep -nE "fallback client connected|unreachable|running standalone|FallbackClientInit|PuntCopyIn|no fallback_|FUTURE_PUNTED|woke on cross-process FIFO|FIFO wake|AwakenWorker:|Executing|CompletePunt|punted|ClientConnect|WaitForLocalServer" \
-                 "$f" 2>/dev/null | tail -80 || echo "(missing)"
+            echo "----- $f : protocol trace (whole file, last 100 matches) -----"
+            grep -nE "IPC lightbeam server bound|Failed to bind IPC|client ZMQ ROUTER bound|Successfully started local server|Main server started|ServerInit|StartLocalServer|fallback client connected|unreachable|running standalone|FallbackClientInit|could not connect|PuntCopyIn|no fallback_|FUTURE_PUNTED|woke on cross-process FIFO|AwakenWorker:|CompletePunt|punted|did not answer|abort|SIGABRT|SIGSEGV|terminate called|what\\(\\):" \
+                 "$f" 2>/dev/null | tail -100 || echo "(missing)"
           done
           exit "$CTEST_RC"
 
