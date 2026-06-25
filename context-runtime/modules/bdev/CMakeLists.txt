@@ -21,6 +21,27 @@ if(CLIO_ENABLE_AMAZON_DRIVE)
   list(APPEND BDEV_S3_LIBS aws-cpp-sdk-s3 aws-cpp-sdk-core)
 endif()
 
+# Google Cloud Storage transport (kGcs). Talks to GCS over HTTPS via Poco; the
+# root CMakeLists already auto-disables CLIO_ENABLE_GOOGLE_CLOUD if Poco is absent.
+set(BDEV_GCS_SOURCES "")
+set(BDEV_GCS_LIBS "")
+if(CLIO_ENABLE_GOOGLE_CLOUD)
+  list(APPEND BDEV_GCS_SOURCES src/transports/gcs_bdev_transport.cc)
+  list(APPEND BDEV_GCS_LIBS Poco::Net Poco::NetSSL Poco::Crypto)
+endif()
+
+# Feature flags must reach the compiler as -D defines, not just gate the source
+# list: the transport .cc files and the factory switch are guarded by
+# #ifdef CLIO_ENABLE_AMAZON_DRIVE / #ifdef CLIO_ENABLE_GOOGLE_CLOUD. Propagated
+# below via the runtime target's COMPILE_DEFINITIONS.
+set(BDEV_CLOUD_DEFS "")
+if(CLIO_ENABLE_AMAZON_DRIVE)
+  list(APPEND BDEV_CLOUD_DEFS CLIO_ENABLE_AMAZON_DRIVE=1)
+endif()
+if(CLIO_ENABLE_GOOGLE_CLOUD)
+  list(APPEND BDEV_CLOUD_DEFS CLIO_ENABLE_GOOGLE_CLOUD=1)
+endif()
+
 # Client library — ctp::aio provides async I/O headers via its INTERFACE includes.
 # LIB_NAME pins the library to `clio_bdev_client` (the new brand-aligned
 # name); ALIAS keeps `clio_bdev_client` working as a CMake target for
@@ -45,13 +66,17 @@ add_clio_module_runtime(
     src/transports/fs_bdev_transport.cc
     src/transports/mem_bdev_transport.cc
     ${BDEV_S3_SOURCES}
+    ${BDEV_GCS_SOURCES}
     src/autogen/bdev_lib_exec.cc
+  COMPILE_DEFINITIONS
+    ${BDEV_CLOUD_DEFS}
   LINK_LIBRARIES
     clio_admin_runtime
     ctp::aio
     ${BDEV_OPTIONAL_LIBS}
     ${BDEV_GPU_LIBS}
     ${BDEV_S3_LIBS}
+    ${BDEV_GCS_LIBS}
 )
 
 # SYCL HBM bdev support: a separate task. Adding -fsycl to
