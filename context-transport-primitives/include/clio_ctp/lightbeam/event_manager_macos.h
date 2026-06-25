@@ -186,10 +186,15 @@ class EventManager {
     // its registry are per-process, so a worker living in another runtime
     // process cannot be reached via Find()/write(). Also watch
     // EVFILT_SIGNAL(SIGUSR1) so a kill(pid, SIGUSR1) from another runtime wakes
-    // this worker's kqueue. SIG_IGN suppresses the default terminate; the
-    // EVFILT_SIGNAL filter still fires regardless of disposition. EV_CLEAR makes
-    // it edge-triggered so a delivered signal reports once.
-    ::signal(SIGUSR1, SIG_IGN);
+    // this worker's kqueue. macOS only DELIVERS (and thus EVFILT_SIGNAL only
+    // MONITORS) signals that are not ignored, so install a no-op handler — NOT
+    // SIG_IGN (which would suppress delivery) and NOT SIG_DFL (which would
+    // terminate). The actual wake is the kqueue event; the handler does nothing.
+    struct sigaction sa;
+    sa.sa_handler = [](int) {};
+    ::sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    ::sigaction(SIGUSR1, &sa, nullptr);
     struct kevent sigev;
     EV_SET(&sigev, SIGUSR1, EVFILT_SIGNAL, EV_ADD | EV_ENABLE | EV_CLEAR, 0, 0,
            nullptr);
@@ -216,8 +221,10 @@ class EventManager {
     // to that process trips EVFILT_SIGNAL on every worker's kqueue there (see
     // AddSignalEvent); they wake and re-check their queues. A broadcast wake,
     // but correct.
-    if (::kill(runtime_pid, SIGUSR1) == 0) return 0;
-    return -1;
+    int rc = ::kill(runtime_pid, SIGUSR1);
+    HLOG(kInfo, "EventManager::Signal: cross-process SIGUSR1 -> pid={} rc={}",
+         static_cast<int>(runtime_pid), rc);
+    return (rc == 0) ? 0 : -1;
   }
 
   int Wait(int timeout_us = -1) {
@@ -237,7 +244,10 @@ class EventManager {
       // Cross-process SIGUSR1 wake (#619): EVFILT_SIGNAL reports the signal
       // number in `ident`, not a fd. The wake itself is the effect — the worker
       // re-checks its queues after Wait() returns — so there is no per-fd action.
-      if (kev[i].filter == EVFILT_SIGNAL) continue;
+      if (kev[i].filter == EVFILT_SIGNAL) {
+        HLOG(kInfo, "EventManager::Wait: woke on cross-process SIGUSR1");
+        continue;
+      }
       int fd = static_cast<int>(kev[i].ident);
       auto it = fd_to_reg_.find(fd);
       if (it == fd_to_reg_.end()) continue;
