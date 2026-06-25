@@ -37,13 +37,11 @@
 #include <pthread.h>
 #include <sys/event.h>
 #include <sys/socket.h>
-#include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
 
 #include <cerrno>
 #include <cstdint>
-#include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <unordered_map>
@@ -114,13 +112,6 @@ class EventManager {
       ::close(signal_wfd_);
       signal_wfd_ = -1;
     }
-    if (fifo_rfd_ >= 0) {
-      ::close(fifo_rfd_);
-      fifo_rfd_ = -1;
-      char fifo_path[64];
-      WakePath(reg_pid_, reg_tid_, fifo_path, sizeof(fifo_path));
-      ::unlink(fifo_path);
-    }
     if (kqueue_fd_ >= 0) {
       ::close(kqueue_fd_);
       kqueue_fd_ = -1;
@@ -188,26 +179,6 @@ class EventManager {
     reg_tid_ = static_cast<int>(mac_tid);
 
     detail::MacSignalRegistry::Get().Register(reg_pid_, reg_tid_, signal_wfd_);
-
-    // Cross-process wakeup (#619 fallback-runtime punting): the socketpair and
-    // its registry are per-process, so a worker living in another runtime
-    // process cannot be reached via Find()/write(). EVFILT_SIGNAL proved
-    // unreliable on macOS (the signal is delivered but the kqueue never fires),
-    // so use a named FIFO at a (pid, tid)-derived path that the other process
-    // opens by name and writes a wake byte to. We watch its read-end on the same
-    // kqueue via EVFILT_READ (reliable, like the socketpair). Open O_RDWR so the
-    // FIFO always has a writer reference and never reports EOF.
-    char fifo_path[64];
-    WakePath(reg_pid_, reg_tid_, fifo_path, sizeof(fifo_path));
-    ::mkfifo(fifo_path, 0600);  // ignore EEXIST (stale FIFO from a prior run)
-    fifo_rfd_ = ::open(fifo_path, O_RDWR | O_NONBLOCK | O_CLOEXEC);
-    if (fifo_rfd_ >= 0) {
-      AddEvent(fifo_rfd_, 0, action);
-    } else {
-      HLOG(kError, "EventManager::AddSignalEvent: FIFO open failed {}: {}",
-           fifo_path, strerror(errno));
-    }
-
     return AddEvent(signal_rfd_, 0, action);
   }
 
@@ -216,33 +187,10 @@ class EventManager {
    *  On macOS, tid comes from SystemInfo::GetTid() which calls
    *  pthread_threadid_np — consistent with AddSignalEvent(). */
   static int Signal(pid_t runtime_pid, pid_t tid) {
-    // Same-process fast path: write the wakeup byte to the worker's socketpair,
-    // which wakes exactly that worker's kqueue.
     int wfd = detail::MacSignalRegistry::Get().Find(runtime_pid, tid);
-    if (wfd != -1) {
-      char b = 1;
-      if (::write(wfd, &b, 1) == 1) return 0;
-      // fall through to the cross-process path on a transient write failure
-    }
-    // Cross-process path (#619 fallback-runtime punting): the target worker is
-    // in another runtime process and not in our per-process registry. Open its
-    // named FIFO (created in AddSignalEvent) by the (pid, tid)-derived path and
-    // write a wake byte; that worker's kqueue fires via EVFILT_READ. ENXIO means
-    // no reader is open (worker gone) — treat as a failed wake.
-    char fifo_path[64];
-    WakePath(static_cast<int>(runtime_pid), static_cast<int>(tid), fifo_path,
-             sizeof(fifo_path));
-    int fwd = ::open(fifo_path, O_WRONLY | O_NONBLOCK);
-    if (fwd < 0) {
-      HLOG(kInfo, "EventManager::Signal: cross-process FIFO open {} failed: {}",
-           fifo_path, strerror(errno));
-      return -1;
-    }
+    if (wfd == -1) return -1;
     char b = 1;
-    ssize_t n = ::write(fwd, &b, 1);
-    ::close(fwd);
-    HLOG(kInfo, "EventManager::Signal: cross-process FIFO wake -> {} n={}",
-         fifo_path, static_cast<int>(n));
+    ssize_t n = ::write(wfd, &b, 1);
     return (n == 1) ? 0 : -1;
   }
 
@@ -264,14 +212,10 @@ class EventManager {
       auto it = fd_to_reg_.find(fd);
       if (it == fd_to_reg_.end()) continue;
       const EventRegistration& reg = it->second;
-      if (fd == signal_rfd_ || fd == fifo_rfd_) {
-        // Drain the wakeup byte(s): same-process socketpair (signal_rfd_) or a
-        // cross-process FIFO write (fifo_rfd_, #619). The wake is the effect.
+      if (fd == signal_rfd_) {
+        // Drain the wakeup byte(s) written by Signal().
         char buf[64];
-        while (::read(fd, buf, sizeof(buf)) > 0) {}
-        if (fd == fifo_rfd_) {
-          HLOG(kInfo, "EventManager::Wait: woke on cross-process FIFO");
-        }
+        while (::read(signal_rfd_, buf, sizeof(buf)) > 0) {}
       }
       if (reg.action_) {
         EventInfo info;
@@ -293,17 +237,9 @@ class EventManager {
  private:
   static constexpr int kMaxEvents = 256;
 
-  // Path of the per-worker cross-process wake FIFO. Must match on both the
-  // registering side (AddSignalEvent) and the waking side (Signal) — they use
-  // the same (pid, tid) derivation, so the same path. (#619)
-  static void WakePath(int pid, int tid, char* buf, size_t n) {
-    std::snprintf(buf, n, "/tmp/clio_wake_%d_%d", pid, tid);
-  }
-
   int kqueue_fd_;
   int signal_rfd_;
   int signal_wfd_;
-  int fifo_rfd_ = -1;
   int next_event_id_;
   int reg_pid_;
   int reg_tid_;

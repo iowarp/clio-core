@@ -39,9 +39,6 @@
 
 #include <clio_ctp/lightbeam/transport_factory_impl.h>
 #include <zmq.h>
-#ifndef _WIN32
-#include <unistd.h>  // ::access / F_OK for the #619 fallback connect diagnostic
-#endif
 
 #include <algorithm>
 #include <cerrno>
@@ -964,72 +961,15 @@ bool IpcManager::FallbackClientInit(u32 main_port) {
   float total_timeout = wait_env ? static_cast<float>(std::atof(wait_env)) : 30.0f;
   if (total_timeout <= 0) total_timeout = 30.0f;
 
-  // Connect to the MAIN runtime's local control path. On macOS (issue #482)
-  // the TCP-loopback ROUTER->DEALER reply path is broken, so MAIN serves its
-  // local control endpoint over a unix-domain SocketTransport (clio_<port>.ipc)
-  // exactly as the normal client connects (see ClientInit). Mirror that choice
-  // here: a TCP DEALER to main_port+3 would simply never get an answer on macOS
-  // and FallbackClientInit would time out ("did not answer ClientConnect"),
-  // leaving fallback_ null and every punt failing with "no fallback_".
-  // Retry the connect itself: unlike a ZMQ DEALER (which connects lazily and
-  // tolerates a not-yet-bound server), the unix-domain SocketTransport fails
-  // immediately if MAIN's local control server is not listening yet. MAIN can
-  // report "ready" (its cross-node server up) a beat before its local
-  // clio_<port>.ipc control server is bound, so the first connect races and
-  // throws. Retry across total_timeout instead of giving up on a single throw.
-  {
-    std::string ipc_path;
-    if (UseLocalZmqIpc()) {
-      ctp::SystemInfo::EnsureMemfdDir();
-      ipc_path = ctp::SystemInfo::GetMemfdPath(
-          "clio_" + std::to_string(main_port) + ".ipc");
-    }
-    auto connect_start = std::chrono::steady_clock::now();
-    bool connected_transport = false;
-    std::string last_err;
-    int attempts = 0;
-    while (std::chrono::duration<float>(std::chrono::steady_clock::now() -
-                                        connect_start)
-               .count() < total_timeout) {
-      try {
-        if (UseLocalZmqIpc()) {
-          zmq_transport_ = ctp::lbm::TransportFactory::Get(
-              ipc_path, ctp::lbm::TransportType::kSocket,
-              ctp::lbm::TransportMode::kClient, "ipc", 0);
-        } else {
-          zmq_transport_ = ctp::lbm::TransportFactory::Get(
-              config->GetServerAddr(), ctp::lbm::TransportType::kZeroMq,
-              ctp::lbm::TransportMode::kClient, "tcp", main_port + 3);
-        }
-        connected_transport = true;
-        break;
-      } catch (const std::exception &e) {
-        last_err = e.what();
-        // DIAG(#619): on failure, is MAIN's control socket file present
-        // (listener gone -> ECONNREFUSED) or absent (MAIN never bound / unbound
-        // it)? Log the first few + every ~2s.
-        int sock_present = -1;
-#ifndef _WIN32
-        if (!ipc_path.empty()) {
-          sock_present = (::access(ipc_path.c_str(), F_OK) == 0) ? 1 : 0;
-        }
-#endif
-        if (++attempts <= 3 || attempts % 20 == 0) {
-          HLOG(kInfo,
-               "FallbackClientInit: connect attempt {} to {} failed ({}); "
-               "socket_file_present={}",
-               attempts, ipc_path, e.what(), sock_present);
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-      }
-    }
-    if (!connected_transport) {
-      HLOG(kError,
-           "FallbackClientInit: could not connect transport to main within "
-           "{}s: {}",
-           total_timeout, last_err);
-      return false;
-    }
+  // A dedicated DEALER to the MAIN runtime's control ROUTER (main_port + 3).
+  try {
+    zmq_transport_ = ctp::lbm::TransportFactory::Get(
+        config->GetServerAddr(), ctp::lbm::TransportType::kZeroMq,
+        ctp::lbm::TransportMode::kClient, "tcp", main_port + 3);
+  } catch (const std::exception &e) {
+    HLOG(kError, "FallbackClientInit: failed to create DEALER to main: {}",
+         e.what());
+    return false;
   }
 
   // CreateTaskId() needs a per-thread TaskCounter (guard the global key, then

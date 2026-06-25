@@ -139,28 +139,14 @@ jobs:
             eval "$(conda shell.bash hook)"
           fi
           conda activate iowarp
-          # DIAG(#619): build with DEBUG logging so the spawned fallback runtimes
-          # record the receiver side of the cross-process FIFO wake + punt flow.
-          cmake --preset boost -DCLIO_CTP_LOG_LEVEL=0
+          cmake --preset boost
           cmake --build build-boost -j"$(sysctl -n hw.ncpu)"
-          set +e
-          ctest --test-dir build-boost --output-on-failure --timeout 180 --repeat until-pass:3 -LE "ollama"
-          CTEST_RC=$?
-          set -e
-          # DIAG(#619): the fallback runtimes posix_spawn with stdout/stderr
-          # redirected to these files. Dump them to see whether MAIN woke on the
-          # cross-process FIFO ("woke on cross-process FIFO") and completed the
-          # punt, or where it is stuck.
-          echo "===================== ipc control sockets present after test ====================="
-          ls -la /tmp/clio_runner/ 2>/dev/null || echo "(no /tmp/clio_runner)"
-          echo "===================== #619 fallback punt protocol (per runtime) ====================="
-          for f in /tmp/cte_fb_main.log /tmp/cte_fb_user.log \
-                   /tmp/fb_main_runtime.log /tmp/fb_user_runtime.log; do
-            echo "----- $f : protocol trace (whole file, last 100 matches) -----"
-            grep -nE "IPC lightbeam server bound|Failed to bind IPC|client ZMQ ROUTER bound|Successfully started local server|Main server started|ServerInit|StartLocalServer|fallback client connected|unreachable|running standalone|FallbackClientInit|could not connect|PuntCopyIn|no fallback_|FUTURE_PUNTED|woke on cross-process FIFO|AwakenWorker:|CompletePunt|punted|did not answer|abort|SIGABRT|SIGSEGV|terminate called|what\\(\\):" \
-                 "$f" 2>/dev/null | tail -100 || echo "(missing)"
-          done
-          exit "$CTEST_RC"
+          # #619's fallback-runtime punting has no macOS support yet (cross-runtime
+          # daemon startup / IPC). Excluded here until iowarp/clio-core#634 lands;
+          # these pass on Linux/Windows and are already excluded on the stackless
+          # Mac Test (mac-test.yml).
+          ctest --test-dir build-boost --output-on-failure --timeout 180 --repeat until-pass:3 \
+            -LE "ollama" -E "cr_cli_cte_fallback|cr_cli_fallback_runtime"
 
   # ---- Windows (vcpkg deps, boost-context feature) --------------------------
   windows:
