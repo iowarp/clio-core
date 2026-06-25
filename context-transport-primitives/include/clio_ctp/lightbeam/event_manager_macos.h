@@ -190,11 +190,13 @@ class EventManager {
     // MONITORS) signals that are not ignored, so install a no-op handler — NOT
     // SIG_IGN (which would suppress delivery) and NOT SIG_DFL (which would
     // terminate). The actual wake is the kqueue event; the handler does nothing.
+    // NB: sigemptyset / sa_handler are macros on macOS, so they must not be
+    // written with a `::` qualifier.
     struct sigaction sa;
     sa.sa_handler = [](int) {};
-    ::sigemptyset(&sa.sa_mask);
+    sigemptyset(&sa.sa_mask);
     sa.sa_flags = 0;
-    ::sigaction(SIGUSR1, &sa, nullptr);
+    sigaction(SIGUSR1, &sa, nullptr);
     struct kevent sigev;
     EV_SET(&sigev, SIGUSR1, EVFILT_SIGNAL, EV_ADD | EV_ENABLE | EV_CLEAR, 0, 0,
            nullptr);
