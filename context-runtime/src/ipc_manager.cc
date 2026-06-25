@@ -1679,11 +1679,11 @@ bool IpcManager::TryStartMainServer(const std::string &hostname) {
     return true;
 
   } catch (const std::exception &e) {
-    HLOG(kDebug, "Failed to start main server on {}:{} - exception: {}",
+    HLOG(kError, "Failed to start main server on {}:{} - exception: {}",
          hostname, config->GetPort(), e.what());
     return false;
   } catch (...) {
-    HLOG(kDebug, "Failed to start main server on {}:{} - unknown exception",
+    HLOG(kError, "Failed to start main server on {}:{} - unknown exception",
          hostname, config->GetPort());
     return false;
   }

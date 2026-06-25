@@ -204,11 +204,12 @@ class Client : public clio::run::ContainerClient {
   /**
    * Get performance statistics - asynchronous
    */
-  clio::run::Future<clio::run::bdev::GetStatsTask> AsyncGetStats() {
+  clio::run::Future<clio::run::bdev::GetStatsTask> AsyncGetStats(
+      const clio::run::PoolQuery& pool_query = clio::run::PoolQuery::Local()) {
     auto* ipc_manager = CLIO_CPU_IPC;
 
     auto task = ipc_manager->NewTask<clio::run::bdev::GetStatsTask>(
-        clio::run::CreateTaskId(), pool_id_, clio::run::PoolQuery());
+        clio::run::CreateTaskId(), pool_id_, pool_query);
 
     return ipc_manager->Send(task);
   }

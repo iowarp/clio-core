@@ -51,6 +51,8 @@ jobs:
           -DVCPKG_MANIFEST_DIR="${{ github.workspace }}/installers/vcpkg" `
           -DVCPKG_OVERLAY_PORTS="${{ github.workspace }}/installers/vcpkg/overlay-ports" `
           -DCMAKE_BUILD_TYPE=Debug `
+          -DSITE="${{ matrix.os }}" `
+          -DBUILDNAME="msvc/${{ matrix.arch }}/d" `
           -DCLIO_CORE_ENABLE_RUNTIME=ON `
           -DCLIO_CORE_ENABLE_CTE=ON `
           -DCLIO_CORE_ENABLE_CAE=ON `
@@ -72,7 +74,44 @@ jobs:
       run: cmake --build build --config Debug -j $env:NUMBER_OF_PROCESSORS
 
     - name: Run tests
-      run: ctest --test-dir build --build-config Debug --output-on-failure --timeout 120 -LE ollama
+      # -T Test writes the dashboard XML (Testing/<tag>/Test.xml) so the
+      # CDash step below can submit it. SITE/BUILDNAME (set at configure time)
+      # label the build on my.cdash.org/HERMES, mirroring win-icx-test.yml and
+      # mac-test.yml.
+      run: ctest --test-dir build -T Test --build-config Debug --output-on-failure --timeout 120 -LE ollama
+
+    - name: Submit results to CDash
+      if: always()
+      continue-on-error: true
+      # Non-fatal: submit the already-produced Test.xml to my.cdash.org/HERMES
+      # (no re-run of the suite). CTestConfig.cmake holds the drop settings.
+      run: ctest --test-dir build -T Submit --build-config Debug
+
+    - name: Summarize failed tests
+      if: always()
+      shell: bash
+      run: |
+        LOG="build/Testing/Temporary/LastTest.log"
+        echo "## Windows test summary (${{ matrix.os }})" >> "$GITHUB_STEP_SUMMARY"
+        if [ -f "$LOG" ]; then
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          grep -E "Test #|\*\*\*Failed|\*\*\*Exception|Passed|Failed" "$LOG" \
+            | grep -E "Failed|Exception" >> "$GITHUB_STEP_SUMMARY" || \
+            echo "(no failures parsed from LastTest.log)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+        else
+          echo "(LastTest.log not found)" >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+    - name: Upload test logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: windows-test-logs-${{ matrix.os }}
+        path: |
+          build/Testing/Temporary/LastTest.log
+          build/Testing/Temporary/CTestCostData.txt
+        if-no-files-found: warn
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

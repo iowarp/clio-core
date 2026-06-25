@@ -155,6 +155,7 @@ struct CreateParams {
        config_.gpu_metadata_cache_.capacity_bytes_,
        config_.gpu_metadata_cache_.max_blobs_,
        config_.gpu_metadata_cache_.max_tags_,
+       config_.performance_.stat_targets_period_ms_,
        gpu_cache_ptr_);
   }
 
