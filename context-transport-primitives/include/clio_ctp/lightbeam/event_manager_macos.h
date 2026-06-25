@@ -37,13 +37,13 @@
 #include <pthread.h>
 #include <sys/event.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
 
-#include <csignal>
-
 #include <cerrno>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <unordered_map>
@@ -113,6 +113,13 @@ class EventManager {
     if (signal_wfd_ >= 0) {
       ::close(signal_wfd_);
       signal_wfd_ = -1;
+    }
+    if (fifo_rfd_ >= 0) {
+      ::close(fifo_rfd_);
+      fifo_rfd_ = -1;
+      char fifo_path[64];
+      WakePath(reg_pid_, reg_tid_, fifo_path, sizeof(fifo_path));
+      ::unlink(fifo_path);
     }
     if (kqueue_fd_ >= 0) {
       ::close(kqueue_fd_);
@@ -184,23 +191,22 @@ class EventManager {
 
     // Cross-process wakeup (#619 fallback-runtime punting): the socketpair and
     // its registry are per-process, so a worker living in another runtime
-    // process cannot be reached via Find()/write(). Also watch
-    // EVFILT_SIGNAL(SIGUSR1) so a kill(pid, SIGUSR1) from another runtime wakes
-    // this worker's kqueue. macOS only DELIVERS (and thus EVFILT_SIGNAL only
-    // MONITORS) signals that are not ignored, so install a no-op handler — NOT
-    // SIG_IGN (which would suppress delivery) and NOT SIG_DFL (which would
-    // terminate). The actual wake is the kqueue event; the handler does nothing.
-    // NB: sigemptyset / sa_handler are macros on macOS, so they must not be
-    // written with a `::` qualifier.
-    struct sigaction sa;
-    sa.sa_handler = [](int) {};
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0;
-    sigaction(SIGUSR1, &sa, nullptr);
-    struct kevent sigev;
-    EV_SET(&sigev, SIGUSR1, EVFILT_SIGNAL, EV_ADD | EV_ENABLE | EV_CLEAR, 0, 0,
-           nullptr);
-    ::kevent(kqueue_fd_, &sigev, 1, nullptr, 0, nullptr);
+    // process cannot be reached via Find()/write(). EVFILT_SIGNAL proved
+    // unreliable on macOS (the signal is delivered but the kqueue never fires),
+    // so use a named FIFO at a (pid, tid)-derived path that the other process
+    // opens by name and writes a wake byte to. We watch its read-end on the same
+    // kqueue via EVFILT_READ (reliable, like the socketpair). Open O_RDWR so the
+    // FIFO always has a writer reference and never reports EOF.
+    char fifo_path[64];
+    WakePath(reg_pid_, reg_tid_, fifo_path, sizeof(fifo_path));
+    ::mkfifo(fifo_path, 0600);  // ignore EEXIST (stale FIFO from a prior run)
+    fifo_rfd_ = ::open(fifo_path, O_RDWR | O_NONBLOCK | O_CLOEXEC);
+    if (fifo_rfd_ >= 0) {
+      AddEvent(fifo_rfd_, 0, action);
+    } else {
+      HLOG(kError, "EventManager::AddSignalEvent: FIFO open failed {}: {}",
+           fifo_path, strerror(errno));
+    }
 
     return AddEvent(signal_rfd_, 0, action);
   }
@@ -219,14 +225,25 @@ class EventManager {
       // fall through to the cross-process path on a transient write failure
     }
     // Cross-process path (#619 fallback-runtime punting): the target worker is
-    // in another runtime process and not in our per-process registry. SIGUSR1
-    // to that process trips EVFILT_SIGNAL on every worker's kqueue there (see
-    // AddSignalEvent); they wake and re-check their queues. A broadcast wake,
-    // but correct.
-    int rc = ::kill(runtime_pid, SIGUSR1);
-    HLOG(kInfo, "EventManager::Signal: cross-process SIGUSR1 -> pid={} rc={}",
-         static_cast<int>(runtime_pid), rc);
-    return (rc == 0) ? 0 : -1;
+    // in another runtime process and not in our per-process registry. Open its
+    // named FIFO (created in AddSignalEvent) by the (pid, tid)-derived path and
+    // write a wake byte; that worker's kqueue fires via EVFILT_READ. ENXIO means
+    // no reader is open (worker gone) — treat as a failed wake.
+    char fifo_path[64];
+    WakePath(static_cast<int>(runtime_pid), static_cast<int>(tid), fifo_path,
+             sizeof(fifo_path));
+    int fwd = ::open(fifo_path, O_WRONLY | O_NONBLOCK);
+    if (fwd < 0) {
+      HLOG(kInfo, "EventManager::Signal: cross-process FIFO open {} failed: {}",
+           fifo_path, strerror(errno));
+      return -1;
+    }
+    char b = 1;
+    ssize_t n = ::write(fwd, &b, 1);
+    ::close(fwd);
+    HLOG(kInfo, "EventManager::Signal: cross-process FIFO wake -> {} n={}",
+         fifo_path, static_cast<int>(n));
+    return (n == 1) ? 0 : -1;
   }
 
   int Wait(int timeout_us = -1) {
@@ -243,21 +260,18 @@ class EventManager {
       return nfds;
     }
     for (int i = 0; i < nfds; ++i) {
-      // Cross-process SIGUSR1 wake (#619): EVFILT_SIGNAL reports the signal
-      // number in `ident`, not a fd. The wake itself is the effect — the worker
-      // re-checks its queues after Wait() returns — so there is no per-fd action.
-      if (kev[i].filter == EVFILT_SIGNAL) {
-        HLOG(kInfo, "EventManager::Wait: woke on cross-process SIGUSR1");
-        continue;
-      }
       int fd = static_cast<int>(kev[i].ident);
       auto it = fd_to_reg_.find(fd);
       if (it == fd_to_reg_.end()) continue;
       const EventRegistration& reg = it->second;
-      if (fd == signal_rfd_) {
-        // Drain the wakeup byte(s) written by Signal().
+      if (fd == signal_rfd_ || fd == fifo_rfd_) {
+        // Drain the wakeup byte(s): same-process socketpair (signal_rfd_) or a
+        // cross-process FIFO write (fifo_rfd_, #619). The wake is the effect.
         char buf[64];
-        while (::read(signal_rfd_, buf, sizeof(buf)) > 0) {}
+        while (::read(fd, buf, sizeof(buf)) > 0) {}
+        if (fd == fifo_rfd_) {
+          HLOG(kInfo, "EventManager::Wait: woke on cross-process FIFO");
+        }
       }
       if (reg.action_) {
         EventInfo info;
@@ -279,9 +293,17 @@ class EventManager {
  private:
   static constexpr int kMaxEvents = 256;
 
+  // Path of the per-worker cross-process wake FIFO. Must match on both the
+  // registering side (AddSignalEvent) and the waking side (Signal) — they use
+  // the same (pid, tid) derivation, so the same path. (#619)
+  static void WakePath(int pid, int tid, char* buf, size_t n) {
+    std::snprintf(buf, n, "/tmp/clio_wake_%d_%d", pid, tid);
+  }
+
   int kqueue_fd_;
   int signal_rfd_;
   int signal_wfd_;
+  int fifo_rfd_ = -1;
   int next_event_id_;
   int reg_pid_;
   int reg_tid_;
