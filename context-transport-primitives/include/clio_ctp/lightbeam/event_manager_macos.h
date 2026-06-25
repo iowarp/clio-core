@@ -40,6 +40,8 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <csignal>
+
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
@@ -179,6 +181,20 @@ class EventManager {
     reg_tid_ = static_cast<int>(mac_tid);
 
     detail::MacSignalRegistry::Get().Register(reg_pid_, reg_tid_, signal_wfd_);
+
+    // Cross-process wakeup (#619 fallback-runtime punting): the socketpair and
+    // its registry are per-process, so a worker living in another runtime
+    // process cannot be reached via Find()/write(). Also watch
+    // EVFILT_SIGNAL(SIGUSR1) so a kill(pid, SIGUSR1) from another runtime wakes
+    // this worker's kqueue. SIG_IGN suppresses the default terminate; the
+    // EVFILT_SIGNAL filter still fires regardless of disposition. EV_CLEAR makes
+    // it edge-triggered so a delivered signal reports once.
+    ::signal(SIGUSR1, SIG_IGN);
+    struct kevent sigev;
+    EV_SET(&sigev, SIGUSR1, EVFILT_SIGNAL, EV_ADD | EV_ENABLE | EV_CLEAR, 0, 0,
+           nullptr);
+    ::kevent(kqueue_fd_, &sigev, 1, nullptr, 0, nullptr);
+
     return AddEvent(signal_rfd_, 0, action);
   }
 
@@ -187,11 +203,21 @@ class EventManager {
    *  On macOS, tid comes from SystemInfo::GetTid() which calls
    *  pthread_threadid_np — consistent with AddSignalEvent(). */
   static int Signal(pid_t runtime_pid, pid_t tid) {
+    // Same-process fast path: write the wakeup byte to the worker's socketpair,
+    // which wakes exactly that worker's kqueue.
     int wfd = detail::MacSignalRegistry::Get().Find(runtime_pid, tid);
-    if (wfd == -1) return -1;
-    char b = 1;
-    ssize_t n = ::write(wfd, &b, 1);
-    return (n == 1) ? 0 : -1;
+    if (wfd != -1) {
+      char b = 1;
+      if (::write(wfd, &b, 1) == 1) return 0;
+      // fall through to the cross-process path on a transient write failure
+    }
+    // Cross-process path (#619 fallback-runtime punting): the target worker is
+    // in another runtime process and not in our per-process registry. SIGUSR1
+    // to that process trips EVFILT_SIGNAL on every worker's kqueue there (see
+    // AddSignalEvent); they wake and re-check their queues. A broadcast wake,
+    // but correct.
+    if (::kill(runtime_pid, SIGUSR1) == 0) return 0;
+    return -1;
   }
 
   int Wait(int timeout_us = -1) {
@@ -208,6 +234,10 @@ class EventManager {
       return nfds;
     }
     for (int i = 0; i < nfds; ++i) {
+      // Cross-process SIGUSR1 wake (#619): EVFILT_SIGNAL reports the signal
+      // number in `ident`, not a fd. The wake itself is the effect — the worker
+      // re-checks its queues after Wait() returns — so there is no per-fd action.
+      if (kev[i].filter == EVFILT_SIGNAL) continue;
       int fd = static_cast<int>(kev[i].ident);
       auto it = fd_to_reg_.find(fd);
       if (it == fd_to_reg_.end()) continue;
