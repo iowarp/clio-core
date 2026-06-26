@@ -927,7 +927,7 @@ bool FallbackSyncRoundtrip(ctp::lbm::Transport *dealer, std::mutex &mtx,
         auto archive = std::make_unique<LoadTaskArchive>();
         auto info = dealer->Recv(*archive);
         if (info.rc == EAGAIN) {
-          std::this_thread::sleep_for(std::chrono::milliseconds(2));
+          CTP_THREAD_MODEL->SleepForUs(2000);
           continue;
         }
         if (info.rc != 0) {
@@ -945,7 +945,7 @@ bool FallbackSyncRoundtrip(ctp::lbm::Transport *dealer, std::mutex &mtx,
         return true;
       }
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    CTP_THREAD_MODEL->SleepForUs(50000);
   }
   return false;
 }
@@ -2657,7 +2657,7 @@ bool IpcManager::WaitForServerAndReconnect(
              "after {}s", elapsed);
         break;
       }
-      std::this_thread::sleep_for(std::chrono::seconds(1));
+      CTP_THREAD_MODEL->SleepForUs(1000000);
       if (ReconnectToOriginalHost()) {
         wait_server_timeout_ = saved_timeout;
         reconnecting_.store(false, std::memory_order_release);
@@ -2813,7 +2813,7 @@ void IpcManager::HeartbeatThread() {
   while (heartbeat_running_.load()) {
     bool alive = IsServerAlive();
     server_alive_.store(alive, std::memory_order_release);
-    std::this_thread::sleep_for(std::chrono::seconds(1));
+    CTP_THREAD_MODEL->SleepForUs(1000000);
   }
 }
 

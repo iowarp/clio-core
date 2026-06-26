@@ -6,6 +6,8 @@
 #include <string>
 #include <thread>
 
+#include <clio_ctp/thread/thread_model_manager.h>
+
 #include "clio_runtime/clio_runtime.h"
 #include "clio_runtime/config_manager.h"
 #include "clio_runtime/admin/admin_client.h"
@@ -168,7 +170,7 @@ int RuntimeStart(int argc, char* argv[]) {
   }
 
   while (g_keep_running) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    CTP_THREAD_MODEL->SleepForUs(100000);
   }
 
   HLOG(kDebug, "Shutting down Clio runtime...");
@@ -221,7 +223,7 @@ int RuntimeRestart(int argc, char* argv[]) {
   }
 
   while (g_keep_running) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    CTP_THREAD_MODEL->SleepForUs(100000);
   }
 
   HLOG(kDebug, "Shutting down Clio runtime...");

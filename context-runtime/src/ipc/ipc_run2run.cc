@@ -40,6 +40,7 @@
 #include <clio_ctp/lightbeam/transport_factory_impl.h>
 #include <clio_runtime/ipc/ipc_cpu2cpu_zmq.h>
 #include <clio_ctp/introspect/system_info.h>
+#include <clio_ctp/thread/thread_model_manager.h>
 
 #include <atomic>
 #include <cerrno>
@@ -897,7 +898,7 @@ void IpcManagerRun2Run::StartRecvThreads() {
     for (int spin = 0; spin < 1000 && !recv_shutdown_.load(); ++spin) {
       lbm_transport = ipc_manager->GetMainTransport();
       if (lbm_transport) break;
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      CTP_THREAD_MODEL->SleepForUs(1000);
     }
     if (!lbm_transport) {
       HLOG(kError, "[PeerRecvThread] main transport never appeared");
@@ -909,7 +910,7 @@ void IpcManagerRun2Run::StartRecvThreads() {
       auto info = lbm_transport->Recv(archive);
       int rc = info.rc;
       if (rc == EAGAIN) {
-        std::this_thread::sleep_for(std::chrono::microseconds(1));
+        CTP_THREAD_MODEL->SleepForUs(1);
         continue;
       }
       if (rc != 0) {
@@ -949,7 +950,7 @@ void IpcManagerRun2Run::StartRecvThreads() {
       bool did_work = clio::run::IpcCpu2CpuZmq::RuntimeRecv(ipc_manager,
                                                        tasks_received);
       if (!did_work) {
-        std::this_thread::sleep_for(std::chrono::microseconds(1));
+        CTP_THREAD_MODEL->SleepForUs(1);
       }
     }
     HLOG(kInfo, "[ClientRecvThread] shutting down");
