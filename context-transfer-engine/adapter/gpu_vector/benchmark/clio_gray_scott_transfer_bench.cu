@@ -240,18 +240,19 @@ static Result RunAsync(const Opts& o, int rows, int cols, size_t snap_bytes) {
   CUDA_CHECK(cudaMalloc(&v2, snap_bytes));
   CUDA_CHECK(cudaMemset(u, 0, snap_bytes));
   CUDA_CHECK(cudaMemset(v, 0, snap_bytes));
-  // Two device snapshot staging buffers and two pinned host buffers.
-  uint8_t *d_snap[2], *h_snap[2];
+  // Two pinned host buffers (one per double-buffer slot). No device staging:
+  // the GS field is already double-buffered (u/v/u2/v2), so we D2H straight
+  // from the step's output field v2, gated by events.
+  uint8_t* h_snap[2];
   for (int i = 0; i < 2; ++i) {
-    CUDA_CHECK(cudaMalloc(&d_snap[i], snap_bytes));
     CUDA_CHECK(cudaMallocHost(&h_snap[i], snap_bytes));
   }
   cudaStream_t comp, copy;
   CUDA_CHECK(cudaStreamCreateWithFlags(&comp, cudaStreamNonBlocking));
   CUDA_CHECK(cudaStreamCreateWithFlags(&copy, cudaStreamNonBlocking));
-  cudaEvent_t snap_ready[2], copy_done[2];
+  cudaEvent_t gs_done[2], copy_done[2];
   for (int i = 0; i < 2; ++i) {
-    CUDA_CHECK(cudaEventCreateWithFlags(&snap_ready[i], cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventCreateWithFlags(&gs_done[i], cudaEventDisableTiming));
     CUDA_CHECK(cudaEventCreateWithFlags(&copy_done[i], cudaEventDisableTiming));
     CUDA_CHECK(cudaEventRecord(copy_done[i], copy));  // initially "free"
   }
@@ -265,17 +266,17 @@ static Result RunAsync(const Opts& o, int rows, int cols, size_t snap_bytes) {
     CUDA_CHECK(cudaEventRecord(t0));
     for (int s = 0; s < o.nsteps; ++s) {
       const int b = s & 1;
-      // Wait until the previous copy out of this buffer finished.
+      // Don't overwrite a buffer whose D2H (two steps ago) is still in flight.
       CUDA_CHECK(cudaStreamWaitEvent(comp, copy_done[b], 0));
       GrayScottStepKernel<<<rows, o.threads, 0, comp>>>(
           u, v, u2, v2, rows, cols, kDu, kDv, kF, kK, kDt);
-      // Stage snapshot into d_snap[b] on the compute stream (D2D), then signal.
-      CUDA_CHECK(cudaMemcpyAsync(d_snap[b], v2, snap_bytes,
-                                 cudaMemcpyDeviceToDevice, comp));
-      CUDA_CHECK(cudaEventRecord(snap_ready[b], comp));
-      // Copy stream: wait for snapshot, async D2H, signal buffer free.
-      CUDA_CHECK(cudaStreamWaitEvent(copy, snap_ready[b], 0));
-      CUDA_CHECK(cudaMemcpyAsync(h_snap[b], d_snap[b], snap_bytes,
+      CUDA_CHECK(cudaEventRecord(gs_done[b], comp));
+      // Copy stream: wait for this step's GS, then async D2H STRAIGHT from the
+      // output field v2 to pinned host. No device-to-device staging copy --
+      // the field is double-buffered, so v2 is not overwritten until step b+2,
+      // which is gated by copy_done[b] above.
+      CUDA_CHECK(cudaStreamWaitEvent(copy, gs_done[b], 0));
+      CUDA_CHECK(cudaMemcpyAsync(h_snap[b], v2, snap_bytes,
                                  cudaMemcpyDeviceToHost, copy));
       CUDA_CHECK(cudaEventRecord(copy_done[b], copy));
       std::swap(u, u2);
@@ -292,8 +293,8 @@ static Result RunAsync(const Opts& o, int rows, int cols, size_t snap_bytes) {
   }
   best.bytes_moved = (double)snap_bytes * o.nsteps;
   for (int i = 0; i < 2; ++i) {
-    cudaFree(d_snap[i]); cudaFreeHost(h_snap[i]);
-    cudaEventDestroy(snap_ready[i]); cudaEventDestroy(copy_done[i]);
+    cudaFreeHost(h_snap[i]);
+    cudaEventDestroy(gs_done[i]); cudaEventDestroy(copy_done[i]);
   }
   cudaStreamDestroy(comp); cudaStreamDestroy(copy);
   cudaFree(u); cudaFree(v); cudaFree(u2); cudaFree(v2);
