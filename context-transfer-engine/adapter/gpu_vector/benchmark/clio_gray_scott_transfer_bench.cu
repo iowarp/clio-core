@@ -33,6 +33,9 @@
 // ---------------------------------------------------------------------------
 
 #include <cuda_runtime.h>
+#ifdef USE_CUSZP
+#include <cuSZp.h>  // real cuSZp host API (cuSZp_compress on a stream)
+#endif
 
 #include <cstdint>
 #include <cstdio>
@@ -79,6 +82,34 @@ __global__ void GrayScottStepKernel(const float* __restrict__ u,
     const float uvv = uc * vc * vc;
     u2[idx] = uc + (Du * lap_u - uvv + F * (1.0f - uc)) * dt;
     v2[idx] = vc + (Dv * lap_v + uvv - (F + k) * vc) * dt;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Gray-Scott initial condition. Two regimes had to be avoided for a *real*
+// compressor: an all-zeros field collapses to a spatially uniform solution, and
+// a single small central seed does not spread across the domain in the O(100s)
+// of steps we run (real GS pattern formation needs thousands), so cuSZp sees a
+// near-constant field and reports an unrealistic ~128x. We therefore perturb the
+// WHOLE domain around the GS steady state (u~0.5, v~0.25) with a substantial,
+// spatially-decorrelated perturbation, giving the field realistic per-float
+// entropy from step 0; GS diffusion then adds spatial correlation over steps,
+// exactly like a real evolving simulation snapshot. u and v use independent
+// hashes so they are not trivially correlated. Runs ONCE, outside the timed
+// region, so it does not affect transfer timings.
+// ---------------------------------------------------------------------------
+__global__ void GrayScottInitKernel(float* __restrict__ u, float* __restrict__ v,
+                                    int rows, int cols) {
+  const int row = blockIdx.x;
+  if (row >= rows) return;
+  for (int col = threadIdx.x; col < cols; col += blockDim.x) {
+    const int idx = row * cols + col;
+    unsigned int hu = (unsigned int)idx * 2654435761u + 12345u;
+    unsigned int hv = (unsigned int)idx * 40503u + 6789u;
+    const float nu = (float)((hu >> 9) & 0xffff) / 65535.0f - 0.5f;  // [-.5,.5]
+    const float nv = (float)((hv >> 9) & 0xffff) / 65535.0f - 0.5f;
+    u[idx] = 0.5f + 0.40f * nu;   // ~[0.30, 0.70]
+    v[idx] = 0.25f + 0.20f * nv;  // ~[0.15, 0.35]
   }
 }
 
@@ -170,6 +201,21 @@ static size_t CompressOnStream(const float* d_v, uint8_t* d_comp, int rows,
 #ifdef USE_CUSZP
   // Real cuSZp host API on Delta. cmp_size filled by cuSZp; eb=1e-3 absolute.
   // (Linked when -DUSE_CUSZP; header/lib supplied via -I/-L.)
+  //
+  // CAVEAT (measured on A100, job 19721171): the RATIO cuSZp reports on this
+  // synthetic GS field is NOT a realistic number. Gray-Scott is a diffusion
+  // process whose uniform steady state is stable for these params, so within a
+  // few steps diffusion erases any initial perturbation and the snapshot becomes
+  // ~constant -> cuSZp pins at its constant-block floor (~128x) in every config.
+  // A trustworthy ratio needs genuinely pattern-formed GS data (localized seed,
+  // Turing-unstable params, thousands of steps) or a real scientific dataset.
+  // The stand-in quantizer's controlled ~4x is the right knob for comparing the
+  // four TRANSFER strategies; cuSZp here proves only that a real compressor drops
+  // into the pipeline slot. USEFUL finding from these runs: cuSZp's compression
+  // COMPUTE is far heavier than the quantizer, so the compressed cases are slower
+  // than raw at small/medium snapshots and only win once byte-reduction dominates
+  // at large sizes -- i.e. a heavyweight compressor pays off only above a
+  // transfer-size threshold. See GS_TRANSFER_RESULTS.md.
   size_t cmp_size = 0;
   uint3 dims = {0, 0, 0};
   cuSZp_compress((float*)d_v, d_comp, (size_t)rows * cols, &cmp_size, 1e-3f,
@@ -195,8 +241,8 @@ static Result RunRaw(const Opts& o, int rows, int cols, size_t snap_bytes) {
   CUDA_CHECK(cudaMalloc(&v, snap_bytes));
   CUDA_CHECK(cudaMalloc(&u2, snap_bytes));
   CUDA_CHECK(cudaMalloc(&v2, snap_bytes));
-  CUDA_CHECK(cudaMemset(u, 0, snap_bytes));
-  CUDA_CHECK(cudaMemset(v, 0, snap_bytes));
+  GrayScottInitKernel<<<rows, o.threads>>>(u, v, rows, cols);
+  CUDA_CHECK(cudaDeviceSynchronize());
   uint8_t* h_snap;
   CUDA_CHECK(cudaMallocHost(&h_snap, snap_bytes));
 
@@ -238,8 +284,8 @@ static Result RunAsync(const Opts& o, int rows, int cols, size_t snap_bytes) {
   CUDA_CHECK(cudaMalloc(&v, snap_bytes));
   CUDA_CHECK(cudaMalloc(&u2, snap_bytes));
   CUDA_CHECK(cudaMalloc(&v2, snap_bytes));
-  CUDA_CHECK(cudaMemset(u, 0, snap_bytes));
-  CUDA_CHECK(cudaMemset(v, 0, snap_bytes));
+  GrayScottInitKernel<<<rows, o.threads>>>(u, v, rows, cols);
+  CUDA_CHECK(cudaDeviceSynchronize());
   // Two pinned host buffers (one per double-buffer slot). No device staging:
   // the GS field is already double-buffered (u/v/u2/v2), so we D2H straight
   // from the step's output field v2, gated by events.
@@ -308,16 +354,24 @@ static Result RunAsync(const Opts& o, int rows, int cols, size_t snap_bytes) {
 static Result RunCompressed(const Opts& o, int rows, int cols,
                             size_t snap_bytes, int comp_block_bytes) {
   const size_t comp_bytes = (size_t)rows * comp_block_bytes;
+  // cuSZp's compressed output is data-dependent and can reach ~full input size
+  // in the worst case; the stand-in is a fixed comp_bytes. Allocate for the
+  // worst case so the buffer never overflows; only the returned cmp_size is D2H'd.
+#ifdef USE_CUSZP
+  const size_t comp_alloc = snap_bytes;
+#else
+  const size_t comp_alloc = comp_bytes;
+#endif
   float *u, *v, *u2, *v2;
   CUDA_CHECK(cudaMalloc(&u, snap_bytes));
   CUDA_CHECK(cudaMalloc(&v, snap_bytes));
   CUDA_CHECK(cudaMalloc(&u2, snap_bytes));
   CUDA_CHECK(cudaMalloc(&v2, snap_bytes));
-  CUDA_CHECK(cudaMemset(u, 0, snap_bytes));
-  CUDA_CHECK(cudaMemset(v, 0, snap_bytes));
+  GrayScottInitKernel<<<rows, o.threads>>>(u, v, rows, cols);
+  CUDA_CHECK(cudaDeviceSynchronize());
   uint8_t *d_comp, *h_comp;
-  CUDA_CHECK(cudaMalloc(&d_comp, comp_bytes));
-  CUDA_CHECK(cudaMallocHost(&h_comp, comp_bytes));
+  CUDA_CHECK(cudaMalloc(&d_comp, comp_alloc));
+  CUDA_CHECK(cudaMallocHost(&h_comp, comp_alloc));
   cudaStream_t stream;
   CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
 
@@ -360,17 +414,22 @@ static Result RunCompressed(const Opts& o, int rows, int cols,
 static Result RunAsyncCompressed(const Opts& o, int rows, int cols,
                                  size_t snap_bytes, int comp_block_bytes) {
   const size_t comp_bytes = (size_t)rows * comp_block_bytes;
+#ifdef USE_CUSZP
+  const size_t comp_alloc = snap_bytes;  // cuSZp worst case (see RunCompressed)
+#else
+  const size_t comp_alloc = comp_bytes;
+#endif
   float *u, *v, *u2, *v2;
   CUDA_CHECK(cudaMalloc(&u, snap_bytes));
   CUDA_CHECK(cudaMalloc(&v, snap_bytes));
   CUDA_CHECK(cudaMalloc(&u2, snap_bytes));
   CUDA_CHECK(cudaMalloc(&v2, snap_bytes));
-  CUDA_CHECK(cudaMemset(u, 0, snap_bytes));
-  CUDA_CHECK(cudaMemset(v, 0, snap_bytes));
+  GrayScottInitKernel<<<rows, o.threads>>>(u, v, rows, cols);
+  CUDA_CHECK(cudaDeviceSynchronize());
   uint8_t *d_comp[2], *h_comp[2];
   for (int i = 0; i < 2; ++i) {
-    CUDA_CHECK(cudaMalloc(&d_comp[i], comp_bytes));
-    CUDA_CHECK(cudaMallocHost(&h_comp[i], comp_bytes));
+    CUDA_CHECK(cudaMalloc(&d_comp[i], comp_alloc));
+    CUDA_CHECK(cudaMallocHost(&h_comp[i], comp_alloc));
   }
   cudaStream_t comp, copy;
   CUDA_CHECK(cudaStreamCreateWithFlags(&comp, cudaStreamNonBlocking));
