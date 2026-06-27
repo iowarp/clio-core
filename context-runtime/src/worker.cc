@@ -271,6 +271,13 @@ void Worker::Run() {
   SetAsCurrentWorker();
   is_running_ = true;
 
+  // Create this worker thread's IpcManagerTls on its OWN thread, which
+  // ServerInit's the named MPSC SHM receive server "clio-<pid>-<tid>" (#642).
+  // Producers reach this worker by that name; the DONTWAIT drain of it is wired
+  // together with the ipc_cpu2cpu send side. Must run on the worker thread so
+  // the segment is keyed to this thread's tid.
+  CLIO_IPC->GetTls();
+
   // Set up the signal event BEFORE publishing the tid. AwakenWorker
   // tgkill(SIGUSR1)s any published tid unconditionally; if a producer fires
   // in the window between SetTid and AddSignalEvent (which blocks SIGUSR1
