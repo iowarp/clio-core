@@ -12,10 +12,17 @@
 // CTP_THREAD_MODEL singleton, whose API is uniform across every backend
 // (every model provides Yield() and SleepForUs()).
 
+#include "clio_ctp/thread/thread_model_manager.h"
+
+// BusyWait drives std::function + the host Timepoint clock and is declared in
+// thread_model.h only under CTP_IS_HOST. Guard the definition with the same
+// condition so the CUDA/device compilation pass (CTP_IS_HOST == 0), which sees
+// no such member, does not try to define one (nvcc: "class ThreadModel has no
+// member BusyWait").
+#if CTP_IS_HOST
 #include <cstddef>
 #include <functional>
 
-#include "clio_ctp/thread/thread_model_manager.h"
 #include "clio_ctp/util/timer.h"
 
 namespace ctp::thread {
@@ -47,3 +54,4 @@ void ThreadModel::BusyWait(const std::function<bool()> &cond) {
 }
 
 }  // namespace ctp::thread
+#endif  // CTP_IS_HOST
