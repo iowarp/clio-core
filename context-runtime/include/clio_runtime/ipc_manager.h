@@ -65,6 +65,7 @@
 #include "clio_ctp/data_structures/serialization/serialize_common.h"
 #include "clio_ctp/lightbeam/transport_factory_impl.h"
 #include "clio_ctp/memory/backend/posix_shm_mmap.h"
+#include "clio_ctp/lightbeam/shm_mpsc_transport.h"
 #include "clio_runtime/gpu/gpu_info.h"
 
 #if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL
@@ -210,6 +211,13 @@ inline std::atomic<long long> &RuntimeTaskAllocBytes() {
 class IpcManagerTls {
  public:
   ctp::lbm::EventManager event_manager_;
+#if CTP_IS_HOST
+  // This thread's named MPSC SHM receive server "clio-<tid>" (issue #642).
+  // Producers (clients / other runtimes) connect to it by name to deliver task
+  // bytes; Worker::Run drains it with DONTWAIT. Host-only (drives OS shm).
+  ctp::lbm::ShmMpscTransport shm_server_;
+  bool shm_server_ok_ = false;
+#endif
 
   IpcManagerTls() {
     // Register the named signal event for the CURRENT thread's (pid, tid) so a
@@ -217,6 +225,10 @@ class IpcManagerTls {
     // owning thread (it does — GetTls creates it on first call from that
     // thread).
     event_manager_.AddSignalEvent();
+#if CTP_IS_HOST
+    shm_server_ok_ = shm_server_.ServerInit(
+        "clio-" + std::to_string(ctp::SystemInfo::GetTid()));
+#endif
   }
 };
 
