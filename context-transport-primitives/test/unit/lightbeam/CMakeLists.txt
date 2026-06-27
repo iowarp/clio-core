@@ -64,6 +64,20 @@ install(TARGETS shm_transfer_test
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
 
+# Named MPSC SHM transport test (issue #642): 16KB/1MB single-thread + multi-
+# producer 1MB into one consumer.
+add_executable(shm_mpsc_transport_test shm_mpsc_transport_test.cc)
+target_link_libraries(shm_mpsc_transport_test clio_ctp_host ctp::lightbeam Catch2::Catch2WithMain)
+add_test(NAME ctp_shm_mpsc_transport COMMAND shm_mpsc_transport_test)
+# Skip under MSan: Catch2 precompiled without MSan ignorelist; mmap-backed SHM.
+set_tests_properties(ctp_shm_mpsc_transport PROPERTIES
+    LABELS "msan_skip"
+    ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}")
+install(TARGETS shm_mpsc_transport_test
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+
 # EventManager test (always enabled - uses pipe/epoll + socket transport)
 add_executable(event_manager_test event_manager_test.cc)
 target_link_libraries(event_manager_test clio_ctp_host ctp::lightbeam ctp::serialize)
