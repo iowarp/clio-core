@@ -9,6 +9,8 @@
 #include "clio_runtime/singletons.h"
 #include "clio_ctp/introspect/system_info.h"
 
+#include <algorithm>
+#include <cstring>
 #include <deque>
 #include <mutex>
 #include <vector>
@@ -129,33 +131,54 @@ bool IpcCpu2CpuZmq::RuntimeRecv(IpcManager *ipc, u32 &tasks_received) {
       if (mode == IpcMode::kTcp) {
         const std::string &identity = recv_info.identity_;
         int client_port = archive.client_port_;
+        // Fast path: open (or reuse) a dedicated dial-back DEALER to the
+        // client's ephemeral response listener at <identity-host>:<client_port>
+        // and route the response there, off the inbound ROUTER's sock_mtx_. A
+        // DEALER has a single peer so it auto-routes with no identity frame.
+        // This requires the client to advertise a response port (client_port_)
+        // AND present a parseable "hostname:pid" routing identity.
         ctp::lbm::Transport *dial_back = nullptr;
-        if (!identity.empty() && client_port > 0) {
-          size_t colon = identity.find(':');
-          std::string host = (colon == std::string::npos)
-                                 ? identity
-                                 : identity.substr(0, colon);
+        size_t colon = identity.find(':');
+        const bool parseable_identity =
+            colon != std::string::npos &&
+            identity.find_first_not_of(
+                "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                "0123456789.-:") == std::string::npos;
+        if (client_port > 0 && parseable_identity) {
+          std::string host = identity.substr(0, colon);
           // Same-host client: dial loopback. The host part of the identity is
           // the client's gethostname(); when it matches ours the client is on
           // this machine, so 127.0.0.1 is both always resolvable and free of
           // the LAN-interface firewall rules an external hostname would need.
-          // The
-          // cache key stays the full identity, so distinct clients never alias.
+          // The cache key stays the full identity, so distinct clients never
+          // alias.
           if (host == ctp::SystemInfo::GetHostname()) {
             host = "127.0.0.1";
           }
           dial_back =
               ipc->GetOrCreateClientByIdentity(identity, host, client_port);
         }
-        if (!dial_back) {
-          HLOG(kError,
-               "RuntimeRecv: TCP dial-back unavailable (identity='{}', "
-               "client_port={}); response undeliverable",
-               identity, client_port);
+        if (dial_back) {
+          future_shm->response_transport_ = dial_back;
+          future_shm->response_identity_len_ = 0;  // DEALER: no identity frame
+        } else {
+          // Fallback: echo the response back over the inbound ROUTER using the
+          // captured routing identity. Covers clients that cannot use the
+          // dial-back path: the synchronous fallback-runtime client (advertises
+          // client_port_ == 0 and block-polls its own request DEALER) and any
+          // peer that connected with a ZMQ auto-assigned identity. The ROUTER
+          // already knows this identity (the request just arrived on it), so
+          // the reply routes without parsing or a new connection — slower than
+          // dial-back (shares the socket mutex) but always deliverable.
+          future_shm->response_transport_ = transport;
+          size_t n = std::min(identity.size(),
+                              sizeof(future_shm->response_identity_));
+          std::memcpy(future_shm->response_identity_, identity.data(), n);
+          future_shm->response_identity_len_ = static_cast<u32>(n);
         }
-        future_shm->response_transport_ = dial_back;
       } else {
         future_shm->response_transport_ = transport;
+        future_shm->response_identity_len_ = 0;
       }
       // Mark as copied so EndTask routes back via lightbeam
       future_shm->flags_.SetBits(FutureShm::FUTURE_WAS_COPIED);
@@ -274,12 +297,20 @@ bool IpcCpu2CpuZmq::RuntimeSend(
       SaveTaskArchive archive(MsgType::kSerializeOut, response_transport);
       container->SaveTask(origin_task->method_, archive, origin_task);
 
-      // Routing. TCP responses go over the dedicated dial-back DEALER resolved
-      // at RecvIn (response_transport_): a DEALER has exactly one connected
-      // peer (the client's response ROUTER), so it auto-routes — no identity
-      // frame. IPC replies still carry the client's socket fd.
+      // Routing. TCP responses normally go over the dedicated dial-back DEALER
+      // resolved at RecvIn (response_transport_): a DEALER has exactly one
+      // connected peer (the client's response ROUTER), so it auto-routes — no
+      // identity frame. When dial-back was not possible, response_transport_ is
+      // the inbound ROUTER and response_identity_len_ > 0; prepend the captured
+      // identity so the ROUTER routes the reply back over the request socket.
+      // IPC replies still carry the client's socket fd.
       if (mode == IpcMode::kIpc) {
         archive.client_info_.fd_ = future_shm->response_fd_;
+      } else if (mode == IpcMode::kTcp &&
+                 future_shm->response_identity_len_ > 0) {
+        archive.client_info_.identity_ =
+            std::string(future_shm->response_identity_,
+                        future_shm->response_identity_len_);
       }
 
       // SYNC send: lightbeam copies bulks into ZMQ inside this call and

@@ -1956,11 +1956,21 @@ ctp::lbm::Transport *IpcManager::GetOrCreateClient(const std::string &addr,
     return it->second.get();
   }
 
-  // Create new persistent client connection
+  // Create new persistent client connection. TransportFactory::Get throws
+  // (std::runtime_error) when the address is unroutable; a malformed client
+  // identity must never terminate the whole runtime, so swallow it and return
+  // nullptr — the caller falls back to echoing the response over the inbound
+  // ROUTER (see IpcCpu2CpuZmq::RuntimeRecv).
   HLOG(kInfo, "[ClientPool] Creating new persistent connection to {}", key);
-  auto transport = ctp::lbm::TransportFactory::Get(
-      addr, ctp::lbm::TransportType::kZeroMq,
-      ctp::lbm::TransportMode::kClient, "tcp", port);
+  ctp::lbm::TransportPtr transport;
+  try {
+    transport = ctp::lbm::TransportFactory::Get(
+        addr, ctp::lbm::TransportType::kZeroMq,
+        ctp::lbm::TransportMode::kClient, "tcp", port);
+  } catch (const std::exception &e) {
+    HLOG(kError, "[ClientPool] Failed to dial {}: {}", key, e.what());
+    return nullptr;
+  }
 
   if (!transport) {
     HLOG(kError, "[ClientPool] Failed to create client for {}", key);

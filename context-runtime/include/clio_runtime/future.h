@@ -135,15 +135,29 @@ struct FutureShm {
   ctp::lbm::ShmTransferInfo output_;
 
   /**
-   * Dedicated dial-back transport for returning this task's response to the
-   * originating client. Built (or fetched from the IpcManager connection
-   * cache) at RecvIn time from the sender's transport identity + the
-   * archive's client_port_, then used verbatim by SendOut. Replaces the old
-   * response_identity_ blob: once the connection exists, the transport itself
-   * is the route, so no per-response identity frame is needed. Non-owning —
-   * lifetime is held by IpcManager's client connection cache.
+   * Transport used to return this task's response to the originating client.
+   * Fast path (TCP): a dedicated dial-back DEALER, built (or fetched from the
+   * IpcManager connection cache) at RecvIn from the sender's "hostname:pid"
+   * identity + the archive's client_port_, then used verbatim by SendOut. A
+   * DEALER has a single peer so it auto-routes with no identity frame.
+   * Fallback path (TCP): when dial-back is impossible — the client advertised
+   * no response port (client_port_ == 0, e.g. the synchronous fallback-runtime
+   * client) or its routing identity is not a parseable "hostname:pid" (e.g. a
+   * ZMQ auto-assigned identity) — this points at the inbound ROUTER and the
+   * response is echoed back over it using response_identity_ (see below). Non-
+   * owning — lifetime is held by IpcManager's connection cache / the server.
    */
   ctp::lbm::Transport* response_transport_;
+
+  /**
+   * Captured ZMQ routing identity for the echo-back fallback path. Populated
+   * at RecvIn only when response_transport_ is the inbound ROUTER (dial-back
+   * was not possible); SendOut prepends it as the ROUTER identity frame so the
+   * response is delivered over the same socket the request arrived on. Length 0
+   * means the dial-back DEALER is in use and no identity frame is needed.
+   */
+  char response_identity_[64];
+  u32 response_identity_len_;
 
   /** Socket fd for routing response (IPC mode) */
   int response_fd_;
@@ -206,6 +220,7 @@ struct FutureShm {
     waiter_pid_ = 0;
     waiter_tid_ = 0;
     response_transport_ = nullptr;
+    response_identity_len_ = 0;
     response_fd_ = -1;
     parent_gpu_rctx_ = nullptr;
     completion_counter_.store(0);
