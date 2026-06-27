@@ -41,3 +41,7 @@ add_subdirectory(lightbeam)
 if(CLIO_ENABLE_AMAZON_DRIVE)
     add_subdirectory(amazon_s3)
 endif()
+
+if(CLIO_ENABLE_GOOGLE_CLOUD)
+    add_subdirectory(google_cloud)
+endif()

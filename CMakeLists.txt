@@ -149,6 +149,7 @@ option(CLIO_CORE_ENABLE_NVSHMEM "Enable NVSHMEM GPU-to-GPU communication library
 option(CLIO_CORE_ENABLE_SYCL "Enable Intel GPU support via SYCL/oneAPI (icpx -fsycl)" OFF)
 option(CLIO_CORE_ENABLE_JARVIS "Enable Jarvis CI infrastructure installation" OFF)
 option(CLIO_ENABLE_AMAZON_DRIVE "Enable Amazon S3 intermediate storage" OFF)
+option(CLIO_ENABLE_GOOGLE_CLOUD "Enable Google Cloud Storage intermediate storage" OFF)
 
 #------------------------------------------------------------------------------
 # ClioCtp (context-transport-primitives) Options
@@ -738,7 +739,8 @@ else()
     message(STATUS "HDF5 support disabled")
 endif()
 
-# Poco and nlohmann_json (optional - for CAE Globus support)
+# Poco and nlohmann_json (optional - for CAE Globus support and the Google
+# Cloud Storage bdev adapter, which uses Poco::Net for HTTPS + Poco::JSON).
 find_package(Poco COMPONENTS Net NetSSL Crypto JSON QUIET)
 find_package(nlohmann_json QUIET)
 if(NOT nlohmann_json_FOUND)
@@ -750,6 +752,20 @@ if(NOT nlohmann_json_FOUND)
   )
   FetchContent_MakeAvailable(nlohmann_json)
   set(nlohmann_json_FOUND TRUE)
+endif()
+
+# The Google Cloud Storage adapter (kGcs bdev transport) talks to GCS over HTTPS
+# via Poco. If the option is requested but Poco isn't available, warn and disable
+# rather than fail the configure (mirrors the CAE Globus dependency check).
+if(CLIO_ENABLE_GOOGLE_CLOUD AND NOT Poco_FOUND)
+  message(WARNING "CLIO_ENABLE_GOOGLE_CLOUD is ON but the Poco library "
+                  "(Net, NetSSL, Crypto, JSON components) was not found. "
+                  "Google Cloud Storage support will be disabled. "
+                  "Install Poco (libpoco-dev) to enable it.")
+  set(CLIO_ENABLE_GOOGLE_CLOUD OFF)
+endif()
+if(CLIO_ENABLE_GOOGLE_CLOUD)
+  message(STATUS "Google Cloud Storage bdev support: ENABLED (Poco found)")
 endif()
 
 if (CLIO_CTE_ENABLE_ADIOS2_ADAPTER OR CLIO_CORE_ENABLE_GRAY_SCOTT)

@@ -84,7 +84,8 @@ enum class BdevType : clio::run::u32 {
   kHbm = 2,     // GPU High-Bandwidth Memory via cudaMalloc (device memory)
   kPinned = 3,  // Pinned host memory via cudaMallocHost
   kNoop = 4,    // No-op backend for latency testing (no actual I/O)
-  kS3 = 5       // Amazon S3 object store backend
+  kS3 = 5,      // Amazon S3 object store backend
+  kGcs = 6      // Google Cloud Storage object store backend
 };
 
 /**
@@ -257,6 +258,10 @@ struct CreateParams {
         bdev_type_ = BdevType::kPinned;
       } else if (type_str == "noop") {
         bdev_type_ = BdevType::kNoop;
+      } else if (type_str == "s3") {
+        bdev_type_ = BdevType::kS3;
+      } else if (type_str == "gcs") {
+        bdev_type_ = BdevType::kGcs;
       }
     }
 
