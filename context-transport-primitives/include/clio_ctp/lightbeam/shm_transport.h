@@ -133,18 +133,6 @@ class ShmTransport
     using AllocT = typename MetaT::allocator_type;
     using CharVec = ctp::priv::vector<char, AllocT>;
 
-#if CTP_IS_HOST
-    // Wake the waiting receiver up front so it returns from its blocking Recv
-    // and immediately starts draining the ring as we fill it — this is what
-    // keeps the writer below from stalling on a full ring. The runtime
-    // completer holds no EventManager of its own; it targets the waiter's
-    // (pid, tid) via the static Signal. 0 = no registered waiter (e.g. an
-    // internal transfer) -> skip.
-    if (ctx.signal_pid_ != 0) {
-      EventManager::Signal(ctx.signal_pid_, ctx.signal_tid_);
-    }
-#endif
-
     // 1. Serialize metadata using LocalSerialize with allocator-backed buffer
     CharVec meta_buf(meta.alloc_);
     meta_buf.reserve(ctx.shm_info_->copy_space_size_.load());
@@ -157,6 +145,19 @@ class ShmTransport
     WriteTransfer(reinterpret_cast<const char*>(&meta_len), sizeof(meta_len),
                   ctx);
     WriteTransfer(meta_buf.data(), meta_buf.size(), ctx);
+
+#if CTP_IS_HOST
+    // Wake the waiting receiver now that the leading bytes (length + metadata)
+    // are in the ring, so when it wakes the data is already visible — avoids a
+    // wake/data race where the receiver wakes on an empty ring and falls back
+    // to a coarse re-check. It then drains any bulk frames written below as we
+    // fill them (back-pressure relief). The runtime completer holds no
+    // EventManager of its own; it targets the waiter's (pid, tid) via the
+    // static Signal. 0 = no registered waiter (internal transfer) -> skip.
+    if (ctx.signal_pid_ != 0) {
+      EventManager::Signal(ctx.signal_pid_, ctx.signal_tid_);
+    }
+#endif
 
     // 3. Send each bulk with BULK_XFER or BULK_EXPOSE flag
     for (size_t i = 0; i < meta.send.size(); ++i) {
@@ -283,12 +284,16 @@ class ShmTransport
       }
       if (ctx.event_manager_ != nullptr) {
         ctx.event_manager_->Wait(200);  // 200us bounded re-check
+        // Woken by the sender's Signal (fired after the metadata write), so the
+        // bytes are normally already visible; if the sender was descheduled
+        // between Signal and the visible store, spin a little longer for them
+        // before paying another (coarse) Wait.
         ctp::Timepoint woke;
         woke.Now();
         while (avail() == 0) {
           ctp::Timepoint now;
           now.Now();
-          if (woke.GetUsecFromStart(now) >= 20.0) break;
+          if (woke.GetUsecFromStart(now) >= 100.0) break;
           CTP_THREAD_MODEL->Yield();
         }
       } else {
