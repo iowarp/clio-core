@@ -226,8 +226,12 @@ class IpcManagerTls {
     // thread).
     event_manager_.AddSignalEvent();
 #if CTP_IS_HOST
+    // pid+tid so a client thread's server can't collide with a runtime worker's
+    // that happens to share a tid in another process. Producers form the same
+    // name from the worker PIDs (Admin::ClientConnect) + the target tid.
     shm_server_ok_ = shm_server_.ServerInit(
-        "clio-" + std::to_string(ctp::SystemInfo::GetTid()));
+        "clio-" + std::to_string(ctp::SystemInfo::GetPid()) + "-" +
+        std::to_string(ctp::SystemInfo::GetTid()));
 #endif
   }
 };
