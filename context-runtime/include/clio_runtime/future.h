@@ -119,6 +119,15 @@ struct FutureShm {
   /** Client PID for per-client response routing */
   u32 client_pid_;
 
+  /** PID + TID of the thread blocked in Recv waiting for this task to
+   *  complete. The completer (SendOut) passes these to the transport via
+   *  LbmContext and, after a brief busy-wait, calls EventManager::Signal to
+   *  wake the waiter — replacing the busy-poll on FUTURE_COMPLETE. For an
+   *  external client this is the client thread; for a runtime self-send it is
+   *  the awaiting worker. 0 = no waiter registered (busy-poll fallback). */
+  u32 waiter_pid_;
+  u32 waiter_tid_;
+
   /** SHM transfer info for input direction (client -> worker) */
   ctp::lbm::ShmTransferInfo input_;
 
@@ -194,6 +203,8 @@ struct FutureShm {
     origin_ = FUTURE_CLIENT_SHM;
     client_task_vaddr_ = 0;
     client_pid_ = 0;
+    waiter_pid_ = 0;
+    waiter_tid_ = 0;
     response_transport_ = nullptr;
     response_fd_ = -1;
     parent_gpu_rctx_ = nullptr;

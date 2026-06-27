@@ -45,6 +45,13 @@ Future<TaskT> IpcCpu2CpuZmq::ClientSend(IpcManager *ipc,
                             ? FutureShm::FUTURE_CLIENT_TCP
                             : FutureShm::FUTURE_CLIENT_IPC;
   future_shm->client_task_vaddr_ = net_key;
+  // Register this client thread as the waiter so the async recv thread can wake
+  // it via EventManager::Signal when the response lands, instead of the client
+  // busy-polling FUTURE_COMPLETE. GetTls creates this thread's EventManager
+  // (its named (pid,tid) event) before the response can arrive.
+  ipc->GetTls();
+  future_shm->waiter_pid_ = static_cast<u32>(ctp::SystemInfo::GetPid());
+  future_shm->waiter_tid_ = static_cast<u32>(ctp::SystemInfo::GetTid());
 
   // Register in pending futures map
   {
@@ -84,10 +91,14 @@ bool IpcCpu2CpuZmq::ClientRecv(IpcManager *ipc,
     future_shm = future.GetFutureShm();
   }
 
-  // ZMQ wait loop: spin until FUTURE_COMPLETE
+  // ZMQ wait loop: sleep on this thread's EventManager until the async recv
+  // thread sets FUTURE_COMPLETE and signals us. The bounded Wait re-checks
+  // FUTURE_COMPLETE / server liveness / timeout if a signal is missed, and the
+  // named auto-reset event latches a signal that races the Wait.
+  ctp::lbm::EventManager *em = &ipc->GetTls()->event_manager_;
   auto start = std::chrono::steady_clock::now();
   while (!future_shm->flags_.Any(FutureShm::FUTURE_COMPLETE)) {
-    CTP_THREAD_MODEL->Yield();
+    em->Wait(100);  // 100us bounded re-check; woken immediately by Signal
     float elapsed =
         std::chrono::duration<float>(std::chrono::steady_clock::now() - start)
             .count();

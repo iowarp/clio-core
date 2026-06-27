@@ -32,6 +32,13 @@ Future<TaskT> IpcCpu2Cpu::ClientSend(IpcManager *ipc,
   future_shm->input_.copy_space_size_ = copy_space_size;
   future_shm->output_.copy_space_size_ = copy_space_size;
   future_shm->flags_.SetBits(FutureShm::FUTURE_COPY_FROM_CLIENT);
+  // Register this thread as the waiter so RuntimeSend can wake it via
+  // EventManager::Signal. GetTls() lazily creates this thread's EventManager
+  // (registering its named (pid,tid) event) BEFORE the worker could complete,
+  // closing the lost-wakeup window. Recorded before the lane Push below.
+  ipc->GetTls();
+  future_shm->waiter_pid_ = static_cast<u32>(ctp::SystemInfo::GetPid());
+  future_shm->waiter_tid_ = static_cast<u32>(ctp::SystemInfo::GetTid());
 
   // Create Future
   auto future_shm_shmptr = buffer.shm_.template Cast<FutureShm>();
@@ -70,36 +77,36 @@ bool IpcCpu2Cpu::ClientRecv(IpcManager *ipc,
   auto future_shm = future.GetFutureShm();
   TaskT *task_ptr = future.get();
 
-  // Normal SHM path: server is alive, use ring buffer recv
+  // Normal SHM path: block in Recv until the worker's RuntimeSend streams the
+  // full output. Recv sleeps on this thread's EventManager (woken by SendOut's
+  // start-of-transfer Signal) instead of busy-polling FUTURE_COMPLETE. The
+  // bounded ctx.timeout_ms is the safety net: Recv returns EAGAIN if no output
+  // appears in time, which we treat as a possible server death.
   ctp::lbm::LbmContext ctx;
   ctx.copy_space = future_shm->copy_space;
   ctx.shm_info_ = &future_shm->output_;
+  ctx.event_manager_ = &ipc->GetTls()->event_manager_;
+  // Re-check liveness within ~1s even when the caller asked to wait forever, so
+  // a dead server is detected and routed to the ZMQ reconnect path below.
+  ctx.timeout_ms = (max_sec > 0) ? static_cast<int>(max_sec * 1000) : 1000;
 
   LoadTaskArchive archive;
-  ipc->shm_recv_transport_->Recv(archive, ctx);
-
-  // Wait for FUTURE_COMPLETE, but bail if the server dies or times out
-  ctp::abitfield32_t &flags = future_shm->flags_;
-  auto shm_start = std::chrono::steady_clock::now();
-  while (!flags.Any(FutureShm::FUTURE_COMPLETE)) {
-    CTP_THREAD_MODEL->Yield();
+  auto info = ipc->shm_recv_transport_->Recv(archive, ctx);
+  while (info.rc == EAGAIN) {
     if (!ipc->server_alive_.load()) {
       HLOG(kWarning, "Recv(SHM): Server died while waiting for response");
       // Fall through to ZMQ reconnect path
       return IpcCpu2CpuZmq::ClientRecv(ipc, future, max_sec);
     }
     if (max_sec > 0) {
-      float elapsed = std::chrono::duration<float>(
-                          std::chrono::steady_clock::now() - shm_start)
-                          .count();
-      if (elapsed >= max_sec) {
-        HLOG(kWarning, "Recv(SHM): Timeout after {}s", elapsed);
-        return false;
-      }
+      HLOG(kWarning, "Recv(SHM): Timeout waiting for response");
+      return false;
     }
+    // max_sec == 0 (wait forever): keep waiting through liveness re-checks.
+    info = ipc->shm_recv_transport_->Recv(archive, ctx);
   }
 
-  // Deserialize outputs
+  // Deserialize outputs (Recv guarantees the full task data is present).
   archive.ResetBulkIndex();
   archive.msg_type_ = MsgType::kSerializeOut;
   archive >> (*task_ptr);

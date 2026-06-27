@@ -54,6 +54,8 @@ namespace ctp::lbm {
 
 // Forward declaration — full definition in shm_transport.h
 struct ShmTransferInfo;
+// Forward declaration — full definition in event_manager.h (host-only).
+class EventManager;
 
 // --- Bulk Flags ---
 #define BULK_EXPOSE \
@@ -166,6 +168,9 @@ struct LbmContext {
   int server_pid_ = 0;                             /**< Server PID for SHM liveness check */
   int dst_fd_ = -1;                                /**< Destination file descriptor for CPU→storage (-1 = none) */
   size_t dst_offset_ = 0;                          /**< Offset within destination file for CPU→storage */
+  int signal_pid_ = 0;                             /**< Waiter PID for Send to EventManager::Signal (0 = none) */
+  int signal_tid_ = 0;                             /**< Waiter TID for Send to EventManager::Signal */
+  EventManager* event_manager_ = nullptr;          /**< Waiter's own EventManager (from IpcManager::GetTls) for Recv to block on; null on the runtime/Send side */
 
   CTP_CROSS_FUN LbmContext() : flags(0), timeout_ms(0) {}
 

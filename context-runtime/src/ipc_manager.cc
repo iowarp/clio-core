@@ -702,6 +702,26 @@ void IpcManager::AwakenWorker(TaskLane *lane) {
   }
 }
 
+IpcManagerTls *IpcManager::GetTls() {
+  // One-time key registration (double-checked under the mutex). The key is
+  // process-wide; the per-thread value below is what differs per thread.
+  if (!ipc_tls_key_created_) {
+    std::lock_guard<std::mutex> lk(ipc_tls_key_mutex_);
+    if (!ipc_tls_key_created_) {
+      CTP_THREAD_MODEL->CreateTls<IpcManagerTls>(ipc_tls_key_, nullptr);
+      ipc_tls_key_created_ = true;
+    }
+  }
+  // Lazily allocate this thread's IpcManagerTls. Its EventManager ctor runs on
+  // THIS thread, registering this thread's (pid, tid) signal event.
+  IpcManagerTls *tls = CTP_THREAD_MODEL->GetTls<IpcManagerTls>(ipc_tls_key_);
+  if (tls == nullptr) {
+    tls = new IpcManagerTls();
+    CTP_THREAD_MODEL->SetTls(ipc_tls_key_, tls);
+  }
+  return tls;
+}
+
 bool IpcManager::ServerInitShm() {
   ConfigManager *config = CLIO_CONFIG_MANAGER;
 
@@ -2860,6 +2880,14 @@ void IpcManager::RecvZmqClientThread() {
       // Signal completion
       future_shm->flags_.SetBits(FutureShm::FUTURE_NEW_DATA |
                                  FutureShm::FUTURE_COMPLETE);
+      // Wake the client thread blocked in ClientRecv — it sleeps on its
+      // EventManager rather than busy-polling FUTURE_COMPLETE. waiter_(pid,tid)
+      // identify that client thread (recorded in ClientSend).
+      if (future_shm->waiter_pid_ != 0) {
+        ctp::lbm::EventManager::Signal(
+            static_cast<int>(future_shm->waiter_pid_),
+            static_cast<int>(future_shm->waiter_tid_));
+      }
 
       // Remove from pending futures map
       pending_zmq_futures_.erase(it);

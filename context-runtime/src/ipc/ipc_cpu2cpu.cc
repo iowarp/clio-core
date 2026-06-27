@@ -68,6 +68,12 @@ void IpcCpu2Cpu::RuntimeSend(
   ctp::lbm::LbmContext ctx;
   ctx.copy_space = future_shm->copy_space;
   ctx.shm_info_ = &future_shm->output_;
+  // Wake the client thread blocked in Recv at the start of the transfer so it
+  // drains the output ring as we fill it (and returns promptly) instead of
+  // busy-polling FUTURE_COMPLETE. The transport's Send issues the static
+  // EventManager::Signal to this (pid, tid); 0 means no registered waiter.
+  ctx.signal_pid_ = static_cast<int>(future_shm->waiter_pid_);
+  ctx.signal_tid_ = static_cast<int>(future_shm->waiter_tid_);
   SaveTaskArchive archive(MsgType::kSerializeOut, send_transport);
   container->SaveTask(task_ptr->method_, archive, task_ptr);
   send_transport->Send(archive, ctx);

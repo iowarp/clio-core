@@ -200,6 +200,26 @@ inline std::atomic<long long> &RuntimeTaskAllocBytes() {
 }
 #endif
 
+/**
+ * Per-thread state for IpcManager, stored via CTP_THREAD_MODEL TLS and created
+ * lazily by IpcManager::GetTls() on first use per thread. Holds an EventManager
+ * whose AddSignalEvent() registers a named per-(pid,tid) signal event, so a
+ * task completer can wake this thread with EventManager::Signal(pid, tid)
+ * instead of the thread busy-polling FUTURE_COMPLETE.
+ */
+class IpcManagerTls {
+ public:
+  ctp::lbm::EventManager event_manager_;
+
+  IpcManagerTls() {
+    // Register the named signal event for the CURRENT thread's (pid, tid) so a
+    // remote completer can target it. Construction therefore must happen on the
+    // owning thread (it does — GetTls creates it on first call from that
+    // thread).
+    event_manager_.AddSignalEvent();
+  }
+};
+
 class IpcManager {
   friend struct IpcCpu2Self;
   friend struct IpcCpu2Cpu;
@@ -215,6 +235,15 @@ class IpcManager {
    * @return Pointer to the IpcManagerRun2Run instance owned by this IpcManager.
    */
   IpcManagerRun2Run *GetRun2Run() { return &run2run_; }
+
+  /**
+   * Get this thread's IpcManagerTls (its EventManager), creating it on first
+   * call from the thread. The EventManager registers a named signal event for
+   * the calling thread's (pid, tid), so a completer can wake it via
+   * EventManager::Signal. Pointer is owned by TLS and stays valid for the
+   * thread's lifetime.
+   */
+  IpcManagerTls *GetTls();
 
   /**
    * Initialize client components
@@ -1506,6 +1535,13 @@ class IpcManager {
   // SHM lightbeam transport (for SendShm / RecvShm)
   ctp::lbm::TransportPtr shm_send_transport_;
   ctp::lbm::TransportPtr shm_recv_transport_;
+
+  // Per-thread IpcManagerTls (EventManager) accessed via GetTls(). The key is
+  // created once (guarded by ipc_tls_key_mutex_); each thread lazily allocates
+  // its own IpcManagerTls value on first GetTls() call.
+  ctp::ThreadLocalKey ipc_tls_key_;
+  bool ipc_tls_key_created_ = false;
+  std::mutex ipc_tls_key_mutex_;
 
   // Client-side: DEALER transport for sending tasks and receiving responses
   ctp::lbm::TransportPtr zmq_transport_;

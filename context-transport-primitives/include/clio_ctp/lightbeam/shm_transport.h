@@ -47,6 +47,12 @@
 #include "clio_ctp/data_structures/priv/array_vector.h"
 #include "clio_ctp/thread/thread_model_manager.h"
 #include "lightbeam.h"
+#if CTP_IS_HOST
+// EventManager (OS signaling) + Timepoint are host-only; the device pass keeps
+// the busy-wait path. event_manager.h is <windows.h>-free.
+#include "clio_ctp/lightbeam/event_manager.h"
+#include "clio_ctp/util/timer.h"
+#endif
 
 namespace ctp::lbm {
 
@@ -127,6 +133,18 @@ class ShmTransport
     using AllocT = typename MetaT::allocator_type;
     using CharVec = ctp::priv::vector<char, AllocT>;
 
+#if CTP_IS_HOST
+    // Wake the waiting receiver up front so it returns from its blocking Recv
+    // and immediately starts draining the ring as we fill it — this is what
+    // keeps the writer below from stalling on a full ring. The runtime
+    // completer holds no EventManager of its own; it targets the waiter's
+    // (pid, tid) via the static Signal. 0 = no registered waiter (e.g. an
+    // internal transfer) -> skip.
+    if (ctx.signal_pid_ != 0) {
+      EventManager::Signal(ctx.signal_pid_, ctx.signal_tid_);
+    }
+#endif
+
     // 1. Serialize metadata using LocalSerialize with allocator-backed buffer
     CharVec meta_buf(meta.alloc_);
     meta_buf.reserve(ctx.shm_info_->copy_space_size_.load());
@@ -179,6 +197,19 @@ class ShmTransport
     using CharVec = ctp::priv::vector<char, AllocT>;
     ClientInfo info;
 
+#if CTP_IS_HOST
+    // Block (after a short busy-wait) until the sender starts the transfer,
+    // instead of busy-polling an empty ring. The sender signals our
+    // EventManager at the start of Send; once woken the streaming reads below
+    // proceed with their existing short Yield waits (the sender only signals
+    // once, so we must NOT re-block mid-transfer). Returns false only on a
+    // ctx.timeout_ms deadline, surfaced as EAGAIN so the caller can react.
+    if (!WaitForTransferStart(ctx)) {
+      info.rc = EAGAIN;
+      return info;
+    }
+#endif
+
     // 1. Receive 4-byte size prefix
     uint32_t meta_len = 0;
     ReadTransfer(reinterpret_cast<char*>(&meta_len), sizeof(meta_len), ctx);
@@ -206,6 +237,67 @@ class ShmTransport
     info.rc = 0;
     return info;
   }
+
+#if CTP_IS_HOST
+  /**
+   * Block until the sender begins writing the transfer, instead of busy-polling
+   * an empty ring. Spins for ~10us first (covers the fast case with no syscall),
+   * then sleeps on the waiter's EventManager until SendOut's start-of-transfer
+   * Signal arrives. Re-checks the ring after each wake: the named auto-reset
+   * event latches a signal that races the Wait, and the bounded timeout is a
+   * safety net against a missed wake. Falls back to Yield when no EventManager
+   * was provided (internal transfers / GPU host pass without a registered
+   * waiter).
+   */
+  static bool WaitForTransferStart(const LbmContext& ctx) {
+    auto avail = [&]() -> size_t {
+      return ctx.shm_info_->total_written_.load_system() -
+             ctx.shm_info_->total_read_.load_system();
+    };
+    if (avail() != 0) return true;
+    ctp::Timepoint start;
+    start.Now();
+    // Phase 1: short busy-wait — covers a fast sender with no syscall.
+    while (avail() == 0) {
+      ctp::Timepoint now;
+      now.Now();
+      if (start.GetUsecFromStart(now) >= 10.0) break;
+      CTP_THREAD_MODEL->Yield();
+    }
+    if (avail() != 0) return true;
+    // Phase 2: sleep until the sender's start-of-transfer Signal, then spin
+    // briefly for the data it announces. The Signal fires just BEFORE the first
+    // ring write, so after a wake the bytes land within microseconds — re-check
+    // with a tight spin instead of immediately re-sleeping. The bounded Wait
+    // timeout re-checks the ring if the Signal is missed or no waiter
+    // EventManager was registered (Yield fallback). ctx.timeout_ms (when > 0)
+    // bounds the total wait so a never-produced result can't hang the caller.
+    while (avail() == 0) {
+      if (ctx.timeout_ms > 0) {
+        ctp::Timepoint now;
+        now.Now();
+        if (start.GetUsecFromStart(now) >=
+            static_cast<double>(ctx.timeout_ms) * 1000.0) {
+          return false;  // timed out with no data
+        }
+      }
+      if (ctx.event_manager_ != nullptr) {
+        ctx.event_manager_->Wait(200);  // 200us bounded re-check
+        ctp::Timepoint woke;
+        woke.Now();
+        while (avail() == 0) {
+          ctp::Timepoint now;
+          now.Now();
+          if (woke.GetUsecFromStart(now) >= 20.0) break;
+          CTP_THREAD_MODEL->Yield();
+        }
+      } else {
+        CTP_THREAD_MODEL->Yield();
+      }
+    }
+    return true;
+  }
+#endif
 
   /**
    * Device-scope Send for GPU→GPU on same device.
