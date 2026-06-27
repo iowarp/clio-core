@@ -15,12 +15,14 @@ if(WIN32)
         # Headers stay Win32-clean; impls live here.
         iocp_io.cc
         event_manager_win.cc
+        thread_model.cc
     )
 else()
     set(SRC_FILES
         system_info.cc
         malloc_allocator.cc
         socket_posix.cc
+        thread_model.cc
     )
 endif()
 
