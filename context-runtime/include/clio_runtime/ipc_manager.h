@@ -1616,9 +1616,16 @@ class IpcManager {
   // client_port_, then stashed in FutureShm::response_transport_ so SendOut
   // routes the response over a dedicated connection instead of the inbound
   // socket. Self-locking (per-bucket RwLocks), so no external mutex needed.
+  // Host-only: the single-bucket-count unordered_map_ll constructor lives under
+  // CTP_IS_HOST (it pulls the global CTP_MALLOC), so nvcc's device pass has no
+  // matching constructor for this in-class initializer. The dial-back cache is
+  // host networking state used only from the host .cc, so guard the whole
+  // member out of the device pass.
+#if CTP_IS_HOST
   static constexpr size_t kConnCacheBuckets = 1024;
   ctp::priv::unordered_map_ll<size_t, ctp::lbm::Transport *> client_conn_cache_{
       kConnCacheBuckets};
+#endif
 
   // Client-side ephemeral ROUTER on which this process receives task responses.
   // Bound to an OS-assigned port at client init; that port is advertised to the
