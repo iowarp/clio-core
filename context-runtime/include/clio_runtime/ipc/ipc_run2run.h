@@ -45,6 +45,7 @@
 #include <clio_runtime/task.h>
 #include <clio_runtime/task_archives.h>
 #include <clio_ctp/data_structures/priv/unordered_map_ll.h>
+#include <clio_ctp/lightbeam/event_manager.h>
 
 namespace ctp::lbm { class Transport; }
 
@@ -258,6 +259,16 @@ class IpcManagerRun2Run {
   std::atomic<bool> recv_shutdown_{false};
   std::thread peer_recv_thread_;
   std::thread client_recv_thread_;
+
+  // EventManager for the client recv thread's IPC (unix-socket) transport,
+  // letting it block on socket readability (epoll on Linux, WSAEventSelect on
+  // Windows) instead of spin-polling. ZMQ transports (peer + client TCP) can't
+  // use this -- ZMQ_FD isn't WSAEventSelect-able on Windows -- so they block via
+  // Transport::PollRecv (native zmq_poll) instead. The thread calls
+  // UnregisterEventManager() on exit -- before this member destructs and while
+  // StopRecvThreads() (run from the transport-shutdown hook) still holds the
+  // transport alive -- so the transport never retains a stale EventManager*.
+  ctp::lbm::EventManager client_recv_em_;
 
   // -------------------------------------------------------------------------
   // Maps for in-flight tasks

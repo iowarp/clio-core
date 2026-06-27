@@ -219,6 +219,16 @@ class Transport {
   void RegisterEventManager(EventManager &em);
   void UnregisterEventManager();
 
+  // Block up to timeout_ms until readable, using the transport's native
+  // readiness primitive (ZMQ: zmq_poll). Non-ZMQ transports return 0 — they
+  // use the EventManager path instead. Used by recv threads to block instead
+  // of spin-polling.
+  int PollRecv(int timeout_ms);
+
+  // Actual bound TCP port for a server socket (resolves ephemeral port-0
+  // binds via ZMQ_LAST_ENDPOINT). Returns 0 for clients / non-TCP / non-ZMQ.
+  int GetBoundPort() const;
+
   // Liveness check
   bool IsServerAlive(const LbmContext& ctx = LbmContext()) const;
 };

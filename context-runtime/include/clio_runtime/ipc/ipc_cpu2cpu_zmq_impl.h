@@ -24,6 +24,10 @@ Future<TaskT> IpcCpu2CpuZmq::ClientSend(IpcManager *ipc,
 
   // Serialize task inputs
   SaveTaskArchive archive(MsgType::kSerializeIn, ipc->zmq_transport_.get());
+  // Advertise the ephemeral response-listener port (TCP mode) so the runtime
+  // opens a dedicated dial-back connection for the response. 0 in IPC mode,
+  // where the response returns over the same unix socket.
+  archive.client_port_ = ipc->GetClientResponsePort();
   archive << (*task_ptr.ptr_);
 
   // Allocate FutureShm via CTP_MALLOC (no copy_space needed)
@@ -140,6 +144,7 @@ void IpcCpu2CpuZmq::ResendTask(IpcManager *ipc, Future<TaskT> &future) {
   task_ptr->task_id_.net_key_ = net_key;
 
   SaveTaskArchive archive(MsgType::kSerializeIn, ipc->zmq_transport_.get());
+  archive.client_port_ = ipc->GetClientResponsePort();
   archive << (*task_ptr);
 
   future_shm->flags_.UnsetBits(FutureShm::FUTURE_COMPLETE);

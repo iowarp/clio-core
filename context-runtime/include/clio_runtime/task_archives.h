@@ -93,6 +93,13 @@ class NetTaskArchive : public ctp::lbm::LbmMeta<> {
 public:
   std::vector<TaskInfo> task_infos_; /**< Task metadata for each serialized task */
   MsgType msg_type_;                 /**< Message type: kSerializeIn, kSerializeOut, or kHeartbeat */
+  /**
+   * Ephemeral port on the requesting client where responses should be
+   * returned. Set on the SerializeIn (request) path; the receiver pairs it
+   * with the sender's transport identity to open/cache a dedicated dial-back
+   * connection for the SerializeOut (response). 0 = unset (legacy path).
+   */
+  int client_port_ = 0;
 
   /**
    * Default constructor
@@ -116,7 +123,8 @@ public:
   NetTaskArchive(NetTaskArchive &&other) noexcept
       : ctp::lbm::LbmMeta<>(std::move(other)),
         task_infos_(std::move(other.task_infos_)),
-        msg_type_(other.msg_type_) {}
+        msg_type_(other.msg_type_),
+        client_port_(other.client_port_) {}
 
   /**
    * Move assignment operator
@@ -126,6 +134,7 @@ public:
       ctp::lbm::LbmMeta<>::operator=(std::move(other));
       task_infos_ = std::move(other.task_infos_);
       msg_type_ = other.msg_type_;
+      client_port_ = other.client_port_;
     }
     return *this;
   }
@@ -261,7 +270,7 @@ public:
   template <typename Ar>
   void serialize(Ar &ar) {
     ar(send, recv, send_bulks, recv_bulks);
-    ar(task_infos_, msg_type_);
+    ar(task_infos_, msg_type_, client_port_);
     serializer_.Finalize();
     ar(buffer_);
   }
@@ -421,7 +430,7 @@ public:
   template <typename Ar>
   void serialize(Ar &ar) {
     ar(send, recv, send_bulks, recv_bulks);
-    ar(task_infos_, msg_type_);
+    ar(task_infos_, msg_type_, client_port_);
     ar(data_);
     // Reinitialize deserializer with new data
     new (&deserializer_)

@@ -223,6 +223,36 @@ bool IpcManager::ClientInit() {
              e.what());
         return false;
       }
+
+      // Decoupled response path: bind an ephemeral ROUTER on which this client
+      // receives task responses, independent of the request DEALER above. Its
+      // OS-assigned port is advertised to the runtime via client_port_ so the
+      // runtime opens a dedicated dial-back connection (see RuntimeRecv). This
+      // keeps the client's RX off the request socket — no shared sock_mtx_
+      // between send and recv.
+      //
+      // Constructed directly (not via the factory) for two reasons: (1) the
+      // factory maps port 0 -> 8192, but we need a genuinely OS-assigned
+      // ephemeral port so multiple clients on one host don't collide; (2) it
+      // must bind on the shared, leaked-at-exit ZMQ context (use_shared_ctx)
+      // — a ROUTER on its own owned context would zmq_ctx_destroy at clean exit
+      // and abort on Windows (libzmq signaler WSASTARTUP assertion).
+#if CTP_ENABLE_ZMQ
+      try {
+        client_response_listener_ = ctp::lbm::TransportPtr(
+            new ctp::lbm::ZeroMqTransport(ctp::lbm::TransportMode::kServer,
+                                          "0.0.0.0", "tcp", /*port=*/0,
+                                          /*use_shared_ctx=*/true));
+        client_response_port_ = client_response_listener_->GetBoundPort();
+        HLOG(kInfo, "IpcManager: client response listener bound to port {}",
+             client_response_port_);
+      } catch (const std::exception &e) {
+        HLOG(kError,
+             "IpcManager::ClientInit: Failed to bind response listener: {}",
+             e.what());
+        return false;
+      }
+#endif
     }
 
     zmq_recv_running_.store(true);
@@ -543,7 +573,16 @@ void IpcManager::ClientFinalize() {
     }
   }
 
-  // Clean up lightbeam transport objects
+  // Clean up lightbeam transport objects. The recv thread that reads the
+  // response listener is already stopped above, so closing it here is safe.
+  // NOTE (Windows): the listener is a ROUTER on the shared ZMQ context; at
+  // process exit libzmq's static-destructor context shutdown touches it and
+  // can abort in the signaler ("Successful WSASTARTUP not yet performed") —
+  // the same teardown landmine the codebase bypasses via TerminateProcess in
+  // tests. Closing vs leaking the listener does not change that, so we close
+  // it cleanly (no leak on POSIX, where teardown is well-behaved).
+  client_response_listener_.reset();
+  ClearClientPool();
   zmq_transport_.reset();
 
   // Clients should not destroy shared resources
@@ -1916,10 +1955,38 @@ ctp::lbm::Transport *IpcManager::GetOrCreateClient(const std::string &addr,
   return raw_ptr;
 }
 
+ctp::lbm::Transport *IpcManager::GetOrCreateClientByIdentity(
+    const std::string &key_id, const std::string &dial_addr, int port) {
+  // Cache key: routing identity + advertised response port. Two clients that
+  // happen to pick the same ephemeral port still differ by identity, and the
+  // same client reusing a port across reconnects re-resolves to a fresh dial.
+  size_t hkey = std::hash<std::string>{}(key_id + ":" + std::to_string(port));
+
+  // Fast path: already have a dial-back connection for this client.
+  if (ctp::lbm::Transport **found = client_conn_cache_.find(hkey)) {
+    return *found;
+  }
+
+  // Miss: open (and own, via client_pool_) a DEALER to the client's listener.
+  ctp::lbm::Transport *transport = GetOrCreateClient(dial_addr, port);
+  if (transport == nullptr) {
+    HLOG(kError, "[ConnCache] Failed to dial back to {}:{} (id={})", dial_addr,
+         port, key_id);
+    return nullptr;
+  }
+  // insert_or_assign is idempotent under a race: whichever thread lands second
+  // just overwrites with the same client_pool_-owned pointer.
+  client_conn_cache_.insert_or_assign(hkey, transport);
+  HLOG(kDebug, "[ConnCache] dial-back to {}:{} cached (id={}, key={})",
+       dial_addr, port, key_id, hkey);
+  return transport;
+}
+
 void IpcManager::ClearClientPool() {
   std::lock_guard<std::mutex> lock(client_pool_mutex_);
   HLOG(kInfo, "[ClientPool] Clearing {} persistent connections",
        client_pool_.size());
+  client_conn_cache_.clear();
   client_pool_.clear();
 }
 
@@ -2710,19 +2777,31 @@ bool IpcManager::WaitForServerAndReconnect(
 // ZMQ Transport Methods
 //==============================================================================
 
+// Milliseconds a blocking zmq_poll waits before returning to re-check the
+// running flag. zmq_poll returns immediately when a response is ready, so this
+// only bounds idle re-poll + shutdown-join latency; while idle it also caps how
+// long a concurrent Send can be held off (PollRecv holds the socket mutex).
+// Replaces the EventManager/WSAEventSelect wait, which can't watch ZMQ_FD on
+// Windows and there falls back to a tick-floored ::Sleep (~15.6ms → the 40ms
+// TCP round-trip).
+static constexpr int kZmqPollTimeoutMs = 1;
+
 void IpcManager::RecvZmqClientThread() {
-  // Client-side thread: polls for completed task responses from the server
-  // DEALER transport receives responses on the same socket used for sending
-  if (!zmq_transport_) {
-    HLOG(kError, "RecvZmqClientThread: No DEALER transport");
+  // Client-side thread: blocks for completed task responses. In TCP mode these
+  // arrive on the dedicated response listener (an ephemeral ROUTER bound in
+  // ClientInit) that the runtime dials back into — fully decoupled from the
+  // request DEALER, so there is no shared sock_mtx_ between send and recv. In
+  // IPC mode there is no listener; responses come back over the unix-socket
+  // transport (zmq_transport_) as before. Uses ZMQ's native zmq_poll (via
+  // Transport::PollRecv) rather than the EventManager, because ZMQ_FD cannot be
+  // registered with WSAEventSelect on Windows.
+  ctp::lbm::Transport *recv_transport = client_response_listener_
+                                            ? client_response_listener_.get()
+                                            : zmq_transport_.get();
+  if (!recv_transport) {
+    HLOG(kError, "RecvZmqClientThread: No response transport");
     return;
   }
-
-  // Set up EventManager for ZMQ transport polling.
-  // Use the member zmq_client_em_ (not a local) so the EventManager outlives
-  // the transport reset in ClientFinalize() and the ~SocketTransport()
-  // destructor can safely call em_->RemoveEvent().
-  zmq_transport_->RegisterEventManager(zmq_client_em_);
 
   // Instrumentation: count of responses this client has received and signaled
   // (FUTURE_COMPLETE set). Mismatch vs daemon-side send count = lost responses.
@@ -2736,11 +2815,11 @@ void IpcManager::RecvZmqClientThread() {
     while (got_message) {
       got_message = false;
       auto archive = std::make_unique<LoadTaskArchive>();
-      auto info = zmq_transport_->Recv(*archive);
+      auto info = recv_transport->Recv(*archive);
       int rc = info.rc;
       if (rc == EAGAIN) break;
       if (rc != 0) {
-        zmq_transport_->ClearRecvHandles(*archive);
+        recv_transport->ClearRecvHandles(*archive);
         if (!zmq_recv_running_.load()) break;
         // ETERM means the ZMQ context is being shut down (zmq_ctx_shutdown was
         // called).  Exit immediately so the context destructor is not blocked.
@@ -2766,7 +2845,7 @@ void IpcManager::RecvZmqClientThread() {
              "[CountClientRecv] miss#{}: No pending future for net_key {} "
              "(received={}, misses={})",
              miss_count, net_key, recv_count, miss_count);
-        zmq_transport_->ClearRecvHandles(*archive);
+        recv_transport->ClearRecvHandles(*archive);
         continue;
       }
 
@@ -2793,19 +2872,12 @@ void IpcManager::RecvZmqClientThread() {
       }
     }
 
-    // Only block on epoll when the drain loop found nothing;
-    // if we just processed messages, loop back immediately.
+    // Only block when the drain loop found nothing; if we just processed
+    // messages, loop back immediately to drain more. zmq_poll wakes the instant
+    // a response arrives, so this adds no latency to message delivery.
     if (!drained_any) {
-      zmq_client_em_.Wait(100);  // 100μs (precise with epoll_pwait2)
+      recv_transport->PollRecv(kZmqPollTimeoutMs);
     }
-  }
-  // `em` is about to be destroyed (stack-allocated). The transport
-  // stashed a raw pointer to it in RegisterEventManager — clear that
-  // before unwinding, otherwise ClientFinalize's later ~SocketTransport
-  // calls em_->RemoveEvent on freed memory (ASan: heap-use-after-free
-  // in EventManager::RemoveEvent → std::unordered_map::find).
-  if (zmq_transport_) {
-    zmq_transport_->UnregisterEventManager();
   }
 }
 

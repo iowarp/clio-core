@@ -126,6 +126,11 @@ void IpcManagerRun2Run::SendInTransmitReplica(
   }
 
   clio::run::SaveTaskArchive archive(clio::run::MsgType::kSerializeIn, lbm_transport);
+  // Advertise this node's server port as the response port. The receiver pairs
+  // it with our return-node address to open a dedicated dial-back connection
+  // for SendOut (see RecvInHandleOne), keyed in the connection cache by
+  // return-host + this port.
+  archive.client_port_ = static_cast<int>(config_manager->GetPort());
   container->SaveTask(task_copy->method_, archive, task_copy);
 
   ctp::lbm::LbmContext ctx(ctp::lbm::LBM_SYNC);
@@ -244,8 +249,21 @@ int IpcManagerRun2Run::SendOutTransmit(
     const clio::run::Host *target_host) {
   auto *config_manager = CLIO_CONFIG_MANAGER;
   int port = static_cast<int>(config_manager->GetPort());
-  ctp::lbm::Transport *lbm_transport =
-      ipc_manager->GetOrCreateClient(target_host->ip_address, port);
+
+  // Prefer the dedicated dial-back connection resolved at RecvIn (stored on the
+  // task's FutureShm). Fall back to resolving the peer connection by address if
+  // it is absent (e.g. a legacy sender that advertised no client_port_, or a
+  // retry whose FutureShm was already freed).
+  ctp::lbm::Transport *lbm_transport = nullptr;
+  if (clio::run::RunContext *run_ctx = origin_task->GetRunCtx()) {
+    ctp::ipc::FullPtr<clio::run::FutureShm> fshm = run_ctx->future_.GetFutureShm();
+    if (!fshm.IsNull() && fshm->response_transport_ != nullptr) {
+      lbm_transport = fshm->response_transport_;
+    }
+  }
+  if (lbm_transport == nullptr) {
+    lbm_transport = ipc_manager->GetOrCreateClient(target_host->ip_address, port);
+  }
 
   if (lbm_transport == nullptr) {
     HLOG(kError, "[SendOut] Task {} FAILED: Could not get client for {}:{}",
@@ -411,6 +429,23 @@ bool IpcManagerRun2Run::RecvInHandleOne(
          task_ptr->task_id_);
     return false;
   }
+
+  // Open (or reuse from the connection cache) a dedicated dial-back connection
+  // to the requesting node's server at <return-host>:<client_port> and stash it
+  // on this task's FutureShm. SendOut routes the response over it instead of
+  // re-resolving the peer connection. Keyed in the cache by return-host + port.
+  {
+    int client_port = archive.client_port_;
+    const clio::run::Host *return_host = ipc_manager->GetHost(sender_node);
+    if (return_host != nullptr && client_port > 0) {
+      ctp::lbm::Transport *dial_back = ipc_manager->GetOrCreateClientByIdentity(
+          return_host->ip_address, return_host->ip_address, client_port);
+      if (dial_back != nullptr) {
+        future.GetFutureShm()->response_transport_ = dial_back;
+      }
+    }
+  }
+
   if (!task_ptr->task_flags_.Any(TASK_RUN_CTX_EXISTS)) {
     ipc_manager->BeginTask(future, container, nullptr);
   }
@@ -888,6 +923,19 @@ void IpcManagerRun2Run::FlushStaleStateForNode(clio::run::u64 node_id) {
 // StartRecvThreads / StopRecvThreads
 // =============================================================================
 
+// How long a recv thread blocks in EventManager::Wait() before re-checking
+// recv_shutdown_ and re-draining. The fd-readability signal (epoll /
+// WSAEventSelect) wakes Wait() immediately when data arrives, so this only
+// bounds idle re-poll and shutdown-join latency; it is NOT added to
+// message-delivery latency. Mirrors the established RecvZmqClientThread wait.
+static constexpr int kRecvWaitTimeoutUs = 100;
+
+// Milliseconds a blocking zmq_poll (Transport::PollRecv) waits before returning
+// to re-check recv_shutdown_. zmq_poll wakes immediately on data, so this only
+// bounds idle re-poll + shutdown latency. ZMQ transports use this instead of an
+// EventManager because ZMQ_FD cannot be watched with WSAEventSelect on Windows.
+static constexpr int kZmqPollTimeoutMs = 1;
+
 void IpcManagerRun2Run::StartRecvThreads() {
   // Dedicated single peer recv thread: polls the main p2p transport
   // (port 9413 by default) and dispatches inbound task forwards/responses.
@@ -904,37 +952,48 @@ void IpcManagerRun2Run::StartRecvThreads() {
       HLOG(kError, "[PeerRecvThread] main transport never appeared");
       return;
     }
+    // Block on transport readability instead of spin-polling. main_transport_
+    // is a ZMQ transport, so we use its native zmq_poll (Transport::PollRecv)
+    // rather than an EventManager: ZMQ_FD can't be registered with
+    // WSAEventSelect on Windows. Each wake drains every pending message before
+    // blocking again.
     HLOG(kInfo, "[PeerRecvThread] started");
     while (!recv_shutdown_.load(std::memory_order_acquire)) {
-      clio::run::LoadTaskArchive archive;
-      auto info = lbm_transport->Recv(archive);
-      int rc = info.rc;
-      if (rc == EAGAIN) {
-        CTP_THREAD_MODEL->SleepForUs(1);
-        continue;
-      }
-      if (rc != 0) {
-        if (rc != -1) {
-          HLOG(kError, "[PeerRecvThread] Recv failed rc={}", rc);
+      bool drained_any = false;
+      while (!recv_shutdown_.load(std::memory_order_acquire)) {
+        clio::run::LoadTaskArchive archive;
+        auto info = lbm_transport->Recv(archive);
+        int rc = info.rc;
+        if (rc != 0) {
+          // EAGAIN (nothing left) or a peer-closed/transient error ends the
+          // drain. rc == -1 is the routine peer-closed case (SocketTransport
+          // already cleaned up the fd inside Recv()).
+          if (rc != EAGAIN && rc != -1) {
+            HLOG(kError, "[PeerRecvThread] Recv failed rc={}", rc);
+          }
+          break;
         }
-        continue;
+        drained_any = true;
+        clio::run::MsgType msg_type = archive.GetMsgType();
+        switch (msg_type) {
+          case clio::run::MsgType::kSerializeIn:
+            RecvIn(archive, lbm_transport);
+            break;
+          case clio::run::MsgType::kSerializeOut:
+            RecvOut(archive, lbm_transport);
+            break;
+          case clio::run::MsgType::kHeartbeat:
+            break;
+          default:
+            HLOG(kError, "[PeerRecvThread] unknown msg_type={}",
+                 static_cast<int>(msg_type));
+            break;
+        }
+        lbm_transport->ClearRecvHandles(archive);
       }
-      clio::run::MsgType msg_type = archive.GetMsgType();
-      switch (msg_type) {
-        case clio::run::MsgType::kSerializeIn:
-          RecvIn(archive, lbm_transport);
-          break;
-        case clio::run::MsgType::kSerializeOut:
-          RecvOut(archive, lbm_transport);
-          break;
-        case clio::run::MsgType::kHeartbeat:
-          break;
-        default:
-          HLOG(kError, "[PeerRecvThread] unknown msg_type={}",
-               static_cast<int>(msg_type));
-          break;
+      if (!drained_any && !recv_shutdown_.load(std::memory_order_acquire)) {
+        lbm_transport->PollRecv(kZmqPollTimeoutMs);
       }
-      lbm_transport->ClearRecvHandles(archive);
     }
     HLOG(kInfo, "[PeerRecvThread] shutting down");
   });
@@ -944,15 +1003,39 @@ void IpcManagerRun2Run::StartRecvThreads() {
   client_recv_thread_ = std::thread([this]() {
     ctp::SystemInfo::SetCurrentThreadName("chi-client-recv");
     auto *ipc_manager = CLIO_IPC;
+    // Block instead of spin-polling. The two client transports use different
+    // readiness primitives: the IPC (unix-socket) transport registers with our
+    // EventManager (epoll / WSAEventSelect both work); the TCP transport is ZMQ,
+    // whose ZMQ_FD can't be watched with WSAEventSelect on Windows, so it blocks
+    // via its native zmq_poll (Transport::PollRecv). The transports are created
+    // during IpcManager init, which may race this thread's start.
+    ctp::lbm::Transport *tcp_transport = nullptr;
+    ctp::lbm::Transport *ipc_transport = nullptr;
+    for (int spin = 0; spin < 1000 && !recv_shutdown_.load(); ++spin) {
+      tcp_transport = ipc_manager->GetClientTransport(clio::run::IpcMode::kTcp);
+      ipc_transport = ipc_manager->GetClientTransport(clio::run::IpcMode::kIpc);
+      if (tcp_transport || ipc_transport) break;
+      CTP_THREAD_MODEL->SleepForUs(1000);
+    }
+    if (ipc_transport) ipc_transport->RegisterEventManager(client_recv_em_);
     HLOG(kInfo, "[ClientRecvThread] started");
     while (!recv_shutdown_.load(std::memory_order_acquire)) {
       clio::run::u32 tasks_received = 0;
       bool did_work = clio::run::IpcCpu2CpuZmq::RuntimeRecv(ipc_manager,
                                                        tasks_received);
-      if (!did_work) {
-        CTP_THREAD_MODEL->SleepForUs(1);
+      if (!did_work && !recv_shutdown_.load(std::memory_order_acquire)) {
+        // Nothing drained: block on the IPC socket via the EventManager (its
+        // bounded timeout also re-polls the TCP transport). If only TCP exists,
+        // block on its native zmq_poll instead so we don't hit the EventManager's
+        // tick-floored empty-handle Sleep fallback on Windows.
+        if (ipc_transport) {
+          client_recv_em_.Wait(kRecvWaitTimeoutUs);
+        } else if (tcp_transport) {
+          tcp_transport->PollRecv(kZmqPollTimeoutMs);
+        }
       }
     }
+    if (ipc_transport) ipc_transport->UnregisterEventManager();
     HLOG(kInfo, "[ClientRecvThread] shutting down");
   });
 }

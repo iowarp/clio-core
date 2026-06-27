@@ -158,6 +158,29 @@ inline void Transport::ClearRecvHandles(LbmMeta<>& meta) {
   }
 }
 
+inline int Transport::PollRecv(int timeout_ms) {
+  switch (type_) {
+#if CTP_ENABLE_ZMQ
+    case TransportType::kZeroMq:
+      return static_cast<ZeroMqTransport*>(this)->PollRecv(timeout_ms);
+#endif
+    default:
+      // Non-ZMQ transports block via their EventManager registration instead.
+      return 0;
+  }
+}
+
+inline int Transport::GetBoundPort() const {
+  switch (type_) {
+#if CTP_ENABLE_ZMQ
+    case TransportType::kZeroMq:
+      return static_cast<const ZeroMqTransport*>(this)->GetBoundPort();
+#endif
+    default:
+      return 0;
+  }
+}
+
 inline void Transport::RegisterEventManager(EventManager &em) {
   switch (type_) {
 #if CTP_ENABLE_ZMQ

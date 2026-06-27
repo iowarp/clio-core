@@ -7,6 +7,7 @@
 
 #include "clio_runtime/ipc_manager.h"
 #include "clio_runtime/singletons.h"
+#include "clio_ctp/introspect/system_info.h"
 
 #include <deque>
 #include <mutex>
@@ -117,18 +118,44 @@ bool IpcCpu2CpuZmq::RuntimeRecv(IpcManager *ipc, u32 &tasks_received) {
                                 : FutureShm::FUTURE_CLIENT_IPC;
       future_shm->client_task_vaddr_ = info.task_id_.net_key_;
       future_shm->client_pid_ = info.task_id_.pid_;
-      // Store transport and routing info for response
-      future_shm->response_transport_ = transport;
       future_shm->response_fd_ = recv_info.fd_;
-      // Store ZMQ identity from recv frame for response routing
-      if (!recv_info.identity_.empty() &&
-          recv_info.identity_.size() <=
-              sizeof(future_shm->response_identity_)) {
-        std::memcpy(future_shm->response_identity_,
-                    recv_info.identity_.data(),
-                    recv_info.identity_.size());
-        future_shm->response_identity_len_ =
-            static_cast<u32>(recv_info.identity_.size());
+      // Resolve the response transport. TCP clients advertise an ephemeral
+      // response-listener port (archive.client_port_); open (or reuse from the
+      // connection cache) a dedicated dial-back DEALER to <identity-host>:<port>
+      // and route the response there instead of echoing back over the inbound
+      // ROUTER. The DEALER's identity is "hostname:pid", so the host part plus
+      // the advertised port is the listener address. IPC clients keep replying
+      // over the same connection-oriented unix socket.
+      if (mode == IpcMode::kTcp) {
+        const std::string &identity = recv_info.identity_;
+        int client_port = archive.client_port_;
+        ctp::lbm::Transport *dial_back = nullptr;
+        if (!identity.empty() && client_port > 0) {
+          size_t colon = identity.find(':');
+          std::string host = (colon == std::string::npos)
+                                 ? identity
+                                 : identity.substr(0, colon);
+          // Same-host client: dial loopback. The host part of the identity is
+          // the client's gethostname(); when it matches ours the client is on
+          // this machine, so 127.0.0.1 is both always resolvable and free of
+          // the LAN-interface firewall rules an external hostname would need.
+          // The
+          // cache key stays the full identity, so distinct clients never alias.
+          if (host == ctp::SystemInfo::GetHostname()) {
+            host = "127.0.0.1";
+          }
+          dial_back =
+              ipc->GetOrCreateClientByIdentity(identity, host, client_port);
+        }
+        if (!dial_back) {
+          HLOG(kError,
+               "RuntimeRecv: TCP dial-back unavailable (identity='{}', "
+               "client_port={}); response undeliverable",
+               identity, client_port);
+        }
+        future_shm->response_transport_ = dial_back;
+      } else {
+        future_shm->response_transport_ = transport;
       }
       // Mark as copied so EndTask routes back via lightbeam
       future_shm->flags_.SetBits(FutureShm::FUTURE_WAS_COPIED);
@@ -247,18 +274,11 @@ bool IpcCpu2CpuZmq::RuntimeSend(
       SaveTaskArchive archive(MsgType::kSerializeOut, response_transport);
       container->SaveTask(origin_task->method_, archive, origin_task);
 
-      // Set routing info for the response
-      if (mode == IpcMode::kTcp) {
-        if (future_shm->response_identity_len_ > 0) {
-          archive.client_info_.identity_ =
-              std::string(future_shm->response_identity_,
-                          future_shm->response_identity_len_);
-        } else {
-          u32 client_pid = future_shm->client_pid_;
-          archive.client_info_.identity_ = std::string(
-              reinterpret_cast<const char *>(&client_pid), sizeof(client_pid));
-        }
-      } else if (mode == IpcMode::kIpc) {
+      // Routing. TCP responses go over the dedicated dial-back DEALER resolved
+      // at RecvIn (response_transport_): a DEALER has exactly one connected
+      // peer (the client's response ROUTER), so it auto-routes — no identity
+      // frame. IPC replies still carry the client's socket fd.
+      if (mode == IpcMode::kIpc) {
         archive.client_info_.fd_ = future_shm->response_fd_;
       }
 

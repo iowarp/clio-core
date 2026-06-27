@@ -49,6 +49,20 @@
 #include <thread>
 #include <vector>
 #include <clio_ctp/util/logging.h>
+#include <clio_ctp/introspect/system_info.h>
+
+// Client fast-exit (repo pattern, mirrors SIMPLE_TEST_PROCESS_EXIT). On Windows
+// TerminateProcessNow skips the static-destructor chain that aborts in libzmq's
+// signaler ("Successful WSASTARTUP not yet performed") once this client has a
+// ZMQ ROUTER response listener; on POSIX it is a no-op so the normal teardown
+// (return below) runs. Flush first so results/output are not lost.
+#define BENCH_EXIT(code)                                                       \
+  do {                                                                         \
+    std::cout.flush();                                                         \
+    std::cerr.flush();                                                         \
+    ::ctp::SystemInfo::TerminateProcessNow((code));                            \
+    return (code);                                                             \
+  } while (0)
 
 #include "clio_runtime/MOD_NAME/MOD_NAME_client.h"
 #include "clio_runtime/admin/admin_client.h"
@@ -436,6 +450,11 @@ void LatencyWorkerThread(size_t thread_id, const BenchmarkConfig &config,
 int main(int argc, char **argv) {
   BenchmarkConfig config;
 
+  // Unbuffered stdout so results survive even if process teardown aborts
+  // (libzmq's static-destructor signaler assertion on Windows). std::cout is
+  // synced with stdio by default, so this makes HIPRINT output flush eagerly.
+  setvbuf(stdout, nullptr, _IONBF, 0);
+
   // Parse command line arguments
   if (!ParseArgs(argc, argv, config)) {
     return 1;
@@ -469,7 +488,7 @@ int main(int argc, char **argv) {
   // Initialize CLIO Runtime client
   if (!clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, false)) {
     HLOG(kError, "ERROR: Failed to initialize Clio client");
-    return 1;
+    BENCH_EXIT(1);
   }
 
   // Lane mapping always uses PID+TID hash
@@ -489,7 +508,7 @@ int main(int argc, char **argv) {
     if (create_task->GetReturnCode() != 0) {
       HLOG(kError, "ERROR: Failed to create MOD_NAME container (return code: {})",
            create_task->GetReturnCode());
-      return 1;
+      BENCH_EXIT(1);
     }
   } else {
     // Create BDev container for I/O and allocation tests
@@ -535,7 +554,7 @@ int main(int argc, char **argv) {
     if (create_task->GetReturnCode() != 0) {
       HLOG(kError, "ERROR: Failed to create BDev container (return code: {})",
            create_task->GetReturnCode());
-      return 1;
+      BENCH_EXIT(1);
     }
   }
 
@@ -662,5 +681,5 @@ int main(int argc, char **argv) {
     break;
   }
 
-  return 0;
+  BENCH_EXIT(0);
 }

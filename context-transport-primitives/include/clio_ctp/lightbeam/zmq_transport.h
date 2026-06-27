@@ -161,11 +161,13 @@ class ZeroMqTransport : public Transport {
   // back to the originating client by identity).  The previous
   // kPushPull alternative (PUSH/PULL, unidirectional) has been removed.
   explicit ZeroMqTransport(TransportMode mode, const std::string& addr,
-                           const std::string& protocol = "tcp", int port = 8192)
+                           const std::string& protocol = "tcp", int port = 8192,
+                           bool use_shared_ctx = false)
       : Transport(mode),
         addr_(addr),
         protocol_(protocol),
         port_(port),
+        use_shared_ctx_(use_shared_ctx),
         zmq_fired_action_(nullptr) {
     type_ = TransportType::kZeroMq;
     sock::InitSocketLib();
@@ -301,12 +303,24 @@ class ZeroMqTransport : public Transport {
       zmq_fired_action_.socket_ = socket_;
     } else {
       // Server socket: ROUTER, bind-style.
-      ctx_ = zmq_ctx_new();
-      owns_ctx_ = true;
-      const char *iot_env = ctp::env::GetCompat("ZMQ_IO_THREADS");
-      int iot = (iot_env && *iot_env) ? std::atoi(iot_env) : 8;
-      if (iot < 1) iot = 1;
-      zmq_ctx_set(ctx_, ZMQ_IO_THREADS, iot);
+      if (use_shared_ctx_) {
+        // Bind on the process-wide shared context, which is intentionally
+        // leaked at exit (see GetSharedContext / CtxOwner) and never
+        // zmq_ctx_destroy'd. On Windows that destroy aborts inside libzmq's
+        // signaler ("WSASTARTUP not yet performed"); a ROUTER on its own owned
+        // context in a clean-exit process (e.g. the client response listener)
+        // would trip it. IO_THREADS are already configured on the shared
+        // context, so don't re-set them here.
+        ctx_ = GetSharedContext();
+        owns_ctx_ = false;
+      } else {
+        ctx_ = zmq_ctx_new();
+        owns_ctx_ = true;
+        const char *iot_env = ctp::env::GetCompat("ZMQ_IO_THREADS");
+        int iot = (iot_env && *iot_env) ? std::atoi(iot_env) : 8;
+        if (iot < 1) iot = 1;
+        zmq_ctx_set(ctx_, ZMQ_IO_THREADS, iot);
+      }
       socket_ = zmq_socket(ctx_, ZMQ_ROUTER);
 
       // Mandatory routing makes zmq_send fail loudly if the destination
@@ -362,6 +376,28 @@ class ZeroMqTransport : public Transport {
       }
       HLOG(kDebug, "ZeroMqTransport(ROUTER) bound successfully to {}",
            full_url);
+
+      // Resolve the actual bound TCP port. When the caller asked for an
+      // ephemeral port (port_ == 0), the kernel assigns one; ZMQ_LAST_ENDPOINT
+      // reports the concrete "tcp://addr:port" it bound, whose trailing port is
+      // what clients advertise for dial-back. For a fixed bind, that port is
+      // simply port_.
+      if (protocol_ == "tcp") {
+        if (port_ != 0) {
+          bound_port_ = port_;
+        } else {
+          char endpoint[256];
+          size_t endpoint_len = sizeof(endpoint);
+          if (zmq_getsockopt(socket_, ZMQ_LAST_ENDPOINT, endpoint,
+                             &endpoint_len) == 0) {
+            std::string ep(endpoint);
+            size_t colon = ep.find_last_of(':');
+            if (colon != std::string::npos) {
+              bound_port_ = std::atoi(ep.c_str() + colon + 1);
+            }
+          }
+        }
+      }
       zmq_fired_action_.socket_ = socket_;
     }
   }
@@ -661,6 +697,20 @@ class ZeroMqTransport : public Transport {
     }
   }
 
+  /** Block up to timeout_ms until this socket is readable, using ZMQ's native
+   *  zmq_poll. This is the correct readiness primitive for a ZMQ socket: it
+   *  checks ZMQ_EVENTS rather than the raw ZMQ_FD, so it works on Windows where
+   *  WSAEventSelect/epoll cannot watch ZMQ_FD. Holds sock_mtx_ so it never runs
+   *  concurrently with Send/Recv on this non-thread-safe socket; zmq_poll
+   *  returns the instant data is ready, so it only blocks a would-be sender for
+   *  at most timeout_ms while the socket is genuinely idle. Returns >0 if
+   *  readable, 0 on timeout, <0 on error. */
+  int PollRecv(int timeout_ms) {
+    std::lock_guard<std::mutex> lock(sock_mtx_);
+    zmq_pollitem_t item = {socket_, 0, ZMQ_POLLIN, 0};
+    return zmq_poll(&item, 1, timeout_ms);
+  }
+
   std::string GetAddress() const { return addr_; }
 
   /** Check if the server is still alive via a connect probe. The actual
@@ -671,10 +721,18 @@ class ZeroMqTransport : public Transport {
     return sock::IsServerAlive(addr_, port_, protocol_);
   }
 
+ public:
+  /** Actual bound TCP port for a server socket. Equals port_ for a fixed
+   *  bind; resolved from ZMQ_LAST_ENDPOINT when bound to ephemeral port 0.
+   *  0 for client sockets / ipc:// servers. */
+  int GetBoundPort() const { return bound_port_; }
+
  private:
   std::string addr_;
   std::string protocol_;
   int port_;
+  int bound_port_ = 0;
+  bool use_shared_ctx_ = false;
   void* ctx_;
   bool owns_ctx_;
   void* socket_;

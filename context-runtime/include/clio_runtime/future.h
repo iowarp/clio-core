@@ -125,15 +125,19 @@ struct FutureShm {
   /** SHM transfer info for output direction (worker -> client) */
   ctp::lbm::ShmTransferInfo output_;
 
-  /** Transport to use for sending response back to client */
+  /**
+   * Dedicated dial-back transport for returning this task's response to the
+   * originating client. Built (or fetched from the IpcManager connection
+   * cache) at RecvIn time from the sender's transport identity + the
+   * archive's client_port_, then used verbatim by SendOut. Replaces the old
+   * response_identity_ blob: once the connection exists, the transport itself
+   * is the route, so no per-response identity frame is needed. Non-owning —
+   * lifetime is held by IpcManager's client connection cache.
+   */
   ctp::lbm::Transport* response_transport_;
 
   /** Socket fd for routing response (IPC mode) */
   int response_fd_;
-
-  /** ZMQ identity for routing response back to client (TCP mode) */
-  char response_identity_[64];
-  u32 response_identity_len_;
 
   /** Atomic bitfield for completion and data availability flags */
   ctp::abitfield32_t flags_;
@@ -192,7 +196,6 @@ struct FutureShm {
     client_pid_ = 0;
     response_transport_ = nullptr;
     response_fd_ = -1;
-    response_identity_len_ = 0;
     parent_gpu_rctx_ = nullptr;
     completion_counter_.store(0);
     total_warps_ = 1;
