@@ -53,10 +53,17 @@ class StdThread : public ThreadModel {
   CTP_CROSS_FUN
   void Init() {}
 
-  /** Sleep thread for a period of time */
+  /** Sleep thread for a period of time. Routes through SystemInfo so Windows
+   *  gets a high-resolution waitable timer (sub-ms) instead of
+   *  std::this_thread::sleep_for's coarse ~1-15.6ms tick. The Win32 timer code
+   *  stays in system_info.cc, keeping <windows.h> out of this header. */
   CTP_CROSS_FUN
   void SleepForUs(size_t us) {
-    std::this_thread::sleep_for(std::chrono::microseconds(us));
+#if CTP_IS_HOST
+    SystemInfo::SleepForUs(us);
+#else
+    (void)us;
+#endif
   }
 
   /** Yield thread time slice */

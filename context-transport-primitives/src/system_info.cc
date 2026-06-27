@@ -84,6 +84,7 @@
 #include <sys/sysctl.h>
 #endif
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 #if __linux__
 #include <linux/memfd.h>
@@ -771,6 +772,53 @@ void SystemInfo::TerminateProcessNow(int exit_code) {
   ::TerminateProcess(::GetCurrentProcess(), static_cast<UINT>(exit_code));
   // Fallback in case TerminateProcess somehow returns (it shouldn't).
   ::_exit(exit_code);
+#endif
+}
+
+#if CTP_ENABLE_WINDOWS_SYSINFO
+// Defined in winnt.h for SDK 10.0.17134 (Windows 10 1803) and later; define
+// defensively so an older SDK still compiles (the flag is simply ignored, and
+// the null-handle fallback below downgrades to a standard-resolution timer).
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+#endif
+
+void SystemInfo::SleepForUs(size_t us) {
+  if (us == 0) return;
+#if CTP_ENABLE_PROCFS_SYSINFO
+  // POSIX: nanosleep already honors sub-microsecond requests (subject to the
+  // hrtimer slack, ~50us by default), so no special handling is needed.
+  struct timespec ts;
+  ts.tv_sec = static_cast<time_t>(us / 1000000);
+  ts.tv_nsec = static_cast<long>((us % 1000000) * 1000);
+  nanosleep(&ts, nullptr);
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  // One-shot high-resolution waitable timer. Unlike std::this_thread::sleep_for
+  // (which rounds up to the ~1-15.6ms global timer tick), this gives
+  // sub-millisecond accuracy without calling timeBeginPeriod (no global timer
+  // rate change). The timer is created/closed per call rather than cached in a
+  // thread_local (a project rule + per-DLL duplication hazard on Windows); the
+  // CreateWaitableTimer cost is a few microseconds, dwarfed by any sleep long
+  // enough to be worth issuing.
+  HANDLE timer = ::CreateWaitableTimerExW(
+      nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+  if (timer == nullptr) {
+    // Pre-1803: high-resolution flag unsupported. Standard-resolution timer.
+    timer = ::CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_ALL_ACCESS);
+  }
+  if (timer != nullptr) {
+    LARGE_INTEGER due;
+    // Negative => relative due time, expressed in 100ns units.
+    due.QuadPart = -static_cast<LONGLONG>(us) * 10;
+    if (::SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) {
+      ::WaitForSingleObject(timer, INFINITE);
+    }
+    ::CloseHandle(timer);
+    return;
+  }
+  // Last resort: coarse Sleep, rounded up to >= 1ms.
+  ::Sleep(static_cast<DWORD>((us + 999) / 1000));
 #endif
 }
 

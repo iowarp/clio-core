@@ -269,6 +269,15 @@ class SystemInfo {
    *  fall through. */
   CTP_DLL static void TerminateProcessNow(int exit_code);
 
+  /** Sleep for `us` microseconds at the platform's best available precision.
+   *  Windows uses a one-shot high-resolution waitable timer
+   *  (CREATE_WAITABLE_TIMER_HIGH_RESOLUTION) for sub-millisecond accuracy
+   *  instead of std::this_thread::sleep_for, which rounds up to the ~1-15.6ms
+   *  system tick; POSIX uses nanosleep. The Win32 timer API is confined to
+   *  system_info.cc so <windows.h> never leaks into headers. us == 0 returns
+   *  immediately. */
+  CTP_DLL static void SleepForUs(size_t us);
+
   /** IPv4/IPv6 addresses bound to local interfaces (loopback included). */
   CTP_DLL static std::vector<std::string> GetLocalInterfaceIps();
 
