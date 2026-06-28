@@ -787,6 +787,12 @@ struct ClientConnectTask : public clio::run::Task {
   // Worker task queue SHM offset (for SHM-mode client attach)
   OUT clio::run::u64 worker_queues_off_;  ///< SHM offset of worker_queues_ within queue allocator
 
+  // #642: worker OS thread ids so an SHM client can address each worker's
+  // "clio-<server_pid>-<worker_tid>" MPSC receive server.
+  static constexpr clio::run::u32 kMaxWorkerTids = 64;
+  OUT clio::run::u32 num_worker_tids_;
+  OUT clio::run::u32 worker_tids_[kMaxWorkerTids];
+
   // Pid-based allocator ids of the server's SHM segments (pid.1 main, pid.2
   // queue). Returned dynamically so the client attaches the right allocators
   // rather than assuming (1,0)/(2,0).
@@ -810,8 +816,10 @@ struct ClientConnectTask : public clio::run::Task {
         server_generation_(0),
         server_pid_(0),
         worker_queues_off_(0),
+        num_worker_tids_(0),
         num_gpus_(0),
         gpu_queue_depth_(0) {
+    memset(worker_tids_, 0, sizeof(worker_tids_));
     memset(cpu2gpu_queue_off_, 0, sizeof(cpu2gpu_queue_off_));
     memset(gpu2cpu_queue_off_, 0, sizeof(gpu2cpu_queue_off_));
     memset(gpu2gpu_queue_off_, 0, sizeof(gpu2gpu_queue_off_));
@@ -829,8 +837,10 @@ struct ClientConnectTask : public clio::run::Task {
         server_generation_(0),
         server_pid_(0),
         worker_queues_off_(0),
+        num_worker_tids_(0),
         num_gpus_(0),
         gpu_queue_depth_(0) {
+    memset(worker_tids_, 0, sizeof(worker_tids_));
     task_id_ = task_node;
     pool_id_ = pool_id;
     method_ = Method::kClientConnect;
@@ -854,6 +864,10 @@ struct ClientConnectTask : public clio::run::Task {
     Task::SerializeOut(ar);
     ar(response_, server_generation_, server_pid_, worker_queues_off_,
        main_alloc_id_, queue_alloc_id_, num_gpus_, gpu_queue_depth_);
+    ar(num_worker_tids_);
+    for (clio::run::u32 i = 0; i < kMaxWorkerTids; ++i) {
+      ar(worker_tids_[i]);
+    }
     for (clio::run::u32 i = 0; i < kMaxGpuDevices; ++i) {
       ar(cpu2gpu_queue_off_[i], gpu2cpu_queue_off_[i], gpu2gpu_queue_off_[i],
          cpu2gpu_backend_size_[i], gpu2cpu_backend_size_[i]);

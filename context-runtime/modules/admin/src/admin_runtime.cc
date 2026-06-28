@@ -598,6 +598,24 @@ clio::run::TaskResume Runtime::ClientConnect(ctp::ipc::FullPtr<ClientConnectTask
   task->main_alloc_id_ = CLIO_IPC->GetMainAllocatorId();
   task->queue_alloc_id_ = CLIO_IPC->GetQueueAllocatorId();
 
+  // #642: publish worker OS thread ids so SHM clients can address each worker's
+  // "clio-<server_pid>-<worker_tid>" MPSC receive server.
+  {
+    auto *wo = CLIO_WORK_ORCHESTRATOR;
+    clio::run::u32 n = 0;
+    if (wo != nullptr) {
+      size_t cnt = wo->GetWorkerCount();
+      for (size_t i = 0;
+           i < cnt && n < ClientConnectTask::kMaxWorkerTids; ++i) {
+        clio::run::Worker *w = wo->GetWorker(static_cast<clio::run::u32>(i));
+        if (w != nullptr && w->GetTid() != 0) {
+          task->worker_tids_[n++] = w->GetTid();
+        }
+      }
+    }
+    task->num_worker_tids_ = n;
+  }
+
   // GPU queue info for client attachment.
   //
   // Producer-only redesign: clients no longer attach to host-managed

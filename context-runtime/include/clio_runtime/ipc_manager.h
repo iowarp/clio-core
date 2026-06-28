@@ -65,6 +65,7 @@
 #include "clio_ctp/data_structures/serialization/serialize_common.h"
 #include "clio_ctp/lightbeam/transport_factory_impl.h"
 #include "clio_ctp/memory/backend/posix_shm_mmap.h"
+#include "clio_ctp/lightbeam/shm_mpsc_transport.h"
 #include "clio_runtime/gpu/gpu_info.h"
 
 #if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL
@@ -210,6 +211,13 @@ inline std::atomic<long long> &RuntimeTaskAllocBytes() {
 class IpcManagerTls {
  public:
   ctp::lbm::EventManager event_manager_;
+#if CTP_IS_HOST
+  // This thread's named MPSC SHM receive server "clio-<tid>" (issue #642).
+  // Producers (clients / other runtimes) connect to it by name to deliver task
+  // bytes; Worker::Run drains it with DONTWAIT. Host-only (drives OS shm).
+  ctp::lbm::ShmMpscTransport shm_server_;
+  bool shm_server_ok_ = false;
+#endif
 
   IpcManagerTls() {
     // Register the named signal event for the CURRENT thread's (pid, tid) so a
@@ -217,6 +225,14 @@ class IpcManagerTls {
     // owning thread (it does — GetTls creates it on first call from that
     // thread).
     event_manager_.AddSignalEvent();
+#if CTP_IS_HOST
+    // pid+tid so a client thread's server can't collide with a runtime worker's
+    // that happens to share a tid in another process. Producers form the same
+    // name from the worker PIDs (Admin::ClientConnect) + the target tid.
+    shm_server_ok_ = shm_server_.ServerInit(
+        "clio-" + std::to_string(ctp::SystemInfo::GetPid()) + "-" +
+        std::to_string(ctp::SystemInfo::GetTid()));
+#endif
   }
 };
 
@@ -1492,6 +1508,25 @@ class IpcManager {
   // client receives it via ClientConnectTask and stores here for
   // ClientInitQueues)
   u64 worker_queues_off_ = 0;
+
+  // #642: SHM-mode client → worker routing. worker_tids_ comes from
+  // ClientConnect; worker_conns_ caches one MPSC client connection per worker
+  // server ("clio-<runtime_pid_>-<worker_tid>").
+  std::vector<u32> worker_tids_;
+#if CTP_IS_HOST
+  // Cached MPSC client connections keyed by server name ("clio-<pid>-<tid>"):
+  // clients → worker servers, and the runtime → client servers for responses.
+  std::unordered_map<std::string, std::unique_ptr<ctp::lbm::ShmMpscTransport>>
+      shm_conns_;
+  std::mutex shm_conns_mutex_;
+
+ public:
+  /** Get (or lazily create) a cached MPSC client connection to `name`. Returns
+   *  nullptr if the named server cannot be attached. #642 */
+  ctp::lbm::ShmMpscTransport *GetOrCreateShmConn(const std::string &name);
+
+ private:
+#endif
 
   // Network queue for send operations (one lane, two priorities)
   ctp::ipc::FullPtr<NetQueue> net_queue_;

@@ -722,6 +722,22 @@ IpcManagerTls *IpcManager::GetTls() {
   return tls;
 }
 
+ctp::lbm::ShmMpscTransport *IpcManager::GetOrCreateShmConn(
+    const std::string &name) {
+  std::lock_guard<std::mutex> lk(shm_conns_mutex_);
+  auto it = shm_conns_.find(name);
+  if (it != shm_conns_.end()) {
+    return it->second.get();
+  }
+  auto conn = std::make_unique<ctp::lbm::ShmMpscTransport>();
+  if (!conn->ClientInit(name)) {
+    return nullptr;
+  }
+  ctp::lbm::ShmMpscTransport *raw = conn.get();
+  shm_conns_[name] = std::move(conn);
+  return raw;
+}
+
 bool IpcManager::ServerInitShm() {
   ConfigManager *config = CLIO_CONFIG_MANAGER;
 
@@ -1051,6 +1067,8 @@ bool IpcManager::FallbackClientInit(u32 main_port) {
   if (connected) {
     worker_queues_off_ = task->worker_queues_off_;
     runtime_pid_ = task->server_pid_;
+    worker_tids_.assign(task->worker_tids_,
+                        task->worker_tids_ + task->num_worker_tids_);
     server_generation_.store(task->server_generation_);
     // Adopt the main runtime's dynamic (pid-based) allocator ids.
     main_allocator_id_ = task->main_alloc_id_;
@@ -1219,6 +1237,8 @@ retry_attempt:
   if (task->response_ == 0) {
     client_generation_ = task->server_generation_;
     worker_queues_off_ = task->worker_queues_off_;
+    worker_tids_.assign(task->worker_tids_,
+                        task->worker_tids_ + task->num_worker_tids_);
     // Adopt the runtime's dynamic (pid-based) allocator ids rather than
     // assuming (1,0)/(2,0).
     main_allocator_id_ = task->main_alloc_id_;
