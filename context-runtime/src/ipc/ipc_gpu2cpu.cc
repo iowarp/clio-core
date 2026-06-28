@@ -13,14 +13,169 @@
 #include "clio_runtime/gpu/future.h"
 #include "clio_runtime/gpu/gpu_ipc_manager.h"
 #include "clio_runtime/ipc_manager.h"
+#include "clio_runtime/singletons.h"
+#include "clio_runtime/worker.h"
 
 namespace clio::run {
 
 /**
- * RecvIn: producer-only — the GPU never serializes a task through
- * lightbeam. Worker::ProcessNewTaskGpu already wrapped the popped task
- * pointer in a clio::run::Future<Task> (for kDeviceMem the wrapped pointer
- * is a host scratch copy of the device POD). We just hand it back.
+ * RecvIn (producer-only gpu2cpu pop): pop one gpu::Future<Task> off `gpu_lane`,
+ * D2H-copy the gpu::FutureShm + POD task out of device memory when the kernel
+ * allocated in kDeviceMem (the CPU cannot dereference device pointers), wrap the
+ * host-resident task in a clio::run::Future<Task>, stash the original device
+ * pointers + size on the chi FutureShm (so SendOut can H2D-copy the mutated POD
+ * back and flip FUTURE_COMPLETE), then route it. Moved here from the worker so
+ * the worker never deserializes tasks/futures. Runs on the worker thread.
+ */
+bool IpcGpu2Cpu::RecvIn(IpcManager *ipc, GpuTaskLane *gpu_lane, Worker *worker) {
+  gpu::Future<Task> gpu_future;
+  if (!gpu_lane->Pop(gpu_future)) {
+    return false;
+  }
+  const u32 worker_id = worker->GetId();
+  HLOG(kDebug, "IpcGpu2Cpu::RecvIn: worker {} popped task from gpu2cpu queue",
+       worker_id);
+
+  worker->SetCurrentRunContext(nullptr);
+
+  ctp::ipc::ShmPtr<gpu::FutureShm> gpu_fshm_shmptr = gpu_future.GetFutureShmPtr();
+  ctp::ipc::ShmPtr<Task> task_shmptr = gpu_future.GetTaskPtr().shm_;
+  if (gpu_fshm_shmptr.IsNull() || task_shmptr.IsNull()) {
+    HLOG(kError, "IpcGpu2Cpu::RecvIn: worker {} null ShmPtr in queue entry",
+         worker_id);
+    return true;
+  }
+
+  void *gpu_fshm_raw = reinterpret_cast<void *>(gpu_fshm_shmptr.off_.load());
+  void *gpu_task_raw = reinterpret_cast<void *>(task_shmptr.off_.load());
+  if (!gpu_fshm_raw || !gpu_task_raw) {
+    HLOG(kError, "IpcGpu2Cpu::RecvIn: worker {} null off_ in queue entry",
+         worker_id);
+    return true;
+  }
+
+  // Detect whether the FutureShm / Task structs sit in pure device memory (host
+  // cannot dereference them). ctp::IsDevicePointer returns false on host builds.
+  bool fshm_on_device = ctp::IsDevicePointer(gpu_fshm_raw);
+  bool task_on_device = ctp::IsDevicePointer(gpu_task_raw);
+
+  // Pull gpu::FutureShm contents into a local copy (D2H if needed). task_size_
+  // tells us how many bytes the Task POD occupies.
+  alignas(8) char fshm_buf[sizeof(gpu::FutureShm)];
+  if (fshm_on_device) {
+    ctp::DeviceAwareMemcpy(fshm_buf, gpu_fshm_raw, sizeof(gpu::FutureShm));
+  } else {
+    std::memcpy(fshm_buf, gpu_fshm_raw, sizeof(gpu::FutureShm));
+  }
+  auto &fshm_copy = *reinterpret_cast<gpu::FutureShm *>(fshm_buf);
+  u32 task_pod_size = fshm_copy.task_size_;
+  if (task_pod_size == 0) {
+    HLOG(kError,
+         "IpcGpu2Cpu::RecvIn: worker {} gpu::FutureShm.task_size_=0 — kernel "
+         "did not call Reset(sizeof(TaskT)) before Send",
+         worker_id);
+    return true;
+  }
+
+  // Per-thread scratch for the host-resident task copy. Sized to fit any
+  // reasonable POD task (PutBlobTask is ~480 bytes today).
+  static constexpr size_t kTaskScratchBytes = 4096;
+  alignas(64) thread_local char task_scratch[kTaskScratchBytes];
+  if (task_pod_size > kTaskScratchBytes) {
+    HLOG(kError,
+         "IpcGpu2Cpu::RecvIn: worker {} task_pod_size {} exceeds scratch "
+         "capacity {}",
+         worker_id, task_pod_size, kTaskScratchBytes);
+    return true;
+  }
+  Task *task_raw = nullptr;
+  if (task_on_device) {
+    ctp::DeviceAwareMemcpy(task_scratch, gpu_task_raw, task_pod_size);
+    task_raw = reinterpret_cast<Task *>(task_scratch);
+  } else {
+    task_raw = static_cast<Task *>(gpu_task_raw);
+  }
+
+  PoolId pool_id = task_raw->pool_id_;
+  u32 method_id = task_raw->method_;
+
+  ctp::ipc::FullPtr<Task> task_full_ptr(task_raw);
+
+  Future<Task> future = ipc->MakePointerFuture(task_full_ptr);
+  if (future.GetFutureShmPtr().IsNull()) {
+    HLOG(kError,
+         "IpcGpu2Cpu::RecvIn: worker {} MakePointerFuture failed (pool={}, "
+         "method={})",
+         worker_id, pool_id, method_id);
+    if (!fshm_on_device) {
+      static_cast<gpu::FutureShm *>(gpu_fshm_raw)
+          ->flags_.SetBitsSystem(gpu::FutureShm::FUTURE_COMPLETE);
+    }
+    return true;
+  }
+
+  auto chi_fshm = future.GetFutureShm();
+  chi_fshm->pool_id_ = pool_id;
+  chi_fshm->method_id_ = method_id;
+  chi_fshm->origin_ = FutureShm::FUTURE_CLIENT_GPU2CPU;
+  // Stash original device-side pointers + size so SendOut can H2D-copy the
+  // mutated POD back and signal FUTURE_COMPLETE on the device-side gpu::FutureShm
+  // (cudaMemcpy when in kDeviceMem).
+  chi_fshm->gpu_fshm_device_ptr_ = reinterpret_cast<uintptr_t>(gpu_fshm_raw);
+  chi_fshm->gpu_task_device_ptr_ =
+      task_on_device ? reinterpret_cast<uintptr_t>(gpu_task_raw) : 0;
+  chi_fshm->gpu_task_size_ = task_pod_size;
+
+  auto *pool_manager = CLIO_POOL_MANAGER;
+  Container *container = pool_manager->GetStaticContainer(pool_id);
+  if (!container) {
+    HLOG(kError,
+         "IpcGpu2Cpu::RecvIn: worker {} Container not found (pool={}, method={})",
+         worker_id, pool_id, method_id);
+    chi_fshm->flags_.SetBits(1 | FutureShm::FUTURE_COMPLETE);
+    if (!fshm_on_device) {
+      static_cast<gpu::FutureShm *>(gpu_fshm_raw)
+          ->flags_.SetBitsSystem(gpu::FutureShm::FUTURE_COMPLETE);
+    } else {
+      // Best-effort: still flip the device flag via cudaMemcpy.
+      u32 v = gpu::FutureShm::FUTURE_COMPLETE;
+      ctp::DeviceAwareMemcpy(
+          &static_cast<gpu::FutureShm *>(gpu_fshm_raw)->flags_.bits_.x, &v,
+          sizeof(u32));
+    }
+    return true;
+  }
+
+  // Fix up SSO/SVO `data_` pointers in the host-resident task copy if we
+  // D2H-copied it. The chimod's container override dispatches by method id to
+  // the per-task FixupAfterCopy(). Skip when the task never moved (kPinnedHost /
+  // kManagedUvm path).
+  if (task_on_device) {
+    container->FixupAfterCopy(method_id, task_full_ptr);
+  }
+
+  if (!task_full_ptr->task_flags_.Any(TASK_RUN_CTX_EXISTS)) {
+    ipc->BeginTask(future, container, worker->GetLane());
+  } else {
+    RunContext *run_ctx = task_full_ptr->GetRunCtx();
+    if (run_ctx) {
+      run_ctx->worker_id_ = worker_id;
+      run_ctx->lane_ = worker->GetLane();
+      run_ctx->event_queue_ = worker->GetEventQueue();
+    }
+  }
+
+  RouteResult route_result = ipc->RouteTask(future, /*force_enqueue=*/true);
+  HLOG(kDebug,
+       "IpcGpu2Cpu::RecvIn: worker {} RouteTask returned {} pool={} method={}",
+       worker_id, (int)route_result, pool_id, method_id);
+  return true;
+}
+
+/**
+ * RecvIn (legacy copy-space overload): producer-only — the GPU never serializes
+ * a task through lightbeam, and the gpu2cpu-pop RecvIn above already wrapped the
+ * popped task pointer in a clio::run::Future<Task>. We just hand it back.
  */
 ctp::ipc::FullPtr<Task> IpcGpu2Cpu::RecvIn(
     IpcManager *ipc, Future<Task> &future, Container *container,

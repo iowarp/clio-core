@@ -295,45 +295,11 @@ void Worker::Run() {
     did_work_ = false;  // Reset work tracker at start of each loop iteration
     task_did_work_ = false;  // Reset task-level work tracker
 
-    // #642: drain this worker's MPSC SHM server (DONTWAIT) and enqueue any
-    // received external-client task onto the normal dispatch path. The client
-    // already addressed this worker, so the deserialize happens here (the work
-    // that used to funnel through one worker); routing/execution then follow the
-    // standard ProcessNewTask flow.
-    if (assigned_lane_) {
-      IpcManagerTls *tls = CLIO_IPC->GetTls();
-      if (tls->shm_server_ok_) {
-        clio::run::LoadTaskArchive archive;
-        ctp::lbm::ClientInfo info =
-            tls->shm_server_.Recv(archive, ctp::lbm::SHM_MPSC_DONTWAIT);
-        if (info.rc == 0) {
-          const auto &tis = archive.GetTaskInfos();
-          if (!tis.empty()) {
-            const auto &ti = tis[0];
-            Container *container =
-                CLIO_POOL_MANAGER->GetStaticContainer(ti.pool_id_);
-            if (container != nullptr) {
-              ctp::ipc::FullPtr<Task> tp =
-                  container->AllocLoadTask(ti.method_id_, archive);
-              if (!tp.IsNull()) {
-                tp->SetFlags(TASK_EXTERNAL_CLIENT);
-                ctp::ipc::FullPtr<FutureShm> fs = CLIO_IPC->NewObj<FutureShm>();
-                fs->pool_id_ = ti.pool_id_;
-                fs->method_id_ = ti.method_id_;
-                fs->origin_ = FutureShm::FUTURE_CLIENT_SHM;
-                fs->client_task_vaddr_ = ti.task_id_.net_key_;
-                fs->client_pid_ = ti.task_id_.pid_;
-                fs->waiter_pid_ = ti.task_id_.pid_;
-                fs->waiter_tid_ = ti.task_id_.tid_;
-                fs->flags_.SetBits(FutureShm::FUTURE_WAS_COPIED);
-                Future<Task> f(fs.shm_, tp);
-                assigned_lane_->Push(f);
-                did_work_ = true;
-              }
-            }
-          }
-        }
-      }
+    // Drain this worker's MPSC SHM server for inbound client tasks. All
+    // deserialization lives in IpcCpu2Cpu::RecvIn — the worker never touches
+    // serialized task/future bytes.
+    if (assigned_lane_ && IpcCpu2Cpu::RecvIn(CLIO_IPC, assigned_lane_)) {
+      did_work_ = true;
     }
 
     // Process tasks from assigned lane
@@ -410,169 +376,14 @@ u32 Worker::ProcessNewTasksGpu() {
 }
 
 bool Worker::ProcessNewTaskGpu(GpuTaskLane *gpu_lane) {
-  // Producer-only gpu2cpu pop path.
-  //
-  // The kernel pre-allocated a Task+FutureShm pair in a registered
-  // GPU client backend (kPinnedHost, kManagedUvm, or kDeviceMem) and
-  // pushed a gpu::Future<Task> carrying ShmPtrs (with the raw device-
-  // accessible address stashed in `off_`) for both the task and its
-  // co-located gpu::FutureShm.
-  //
-  // For kPinnedHost / kManagedUvm the worker dereferences both raw
-  // addresses directly: the CPU and GPU share visibility. For
-  // kDeviceMem the worker D2H-copies the POD bytes (gpu::FutureShm and
-  // the Task struct) into per-thread host scratch and runs the chimod
-  // on those copies; SendOut H2D-copies the mutated Task POD back
-  // to the original device address before signaling FUTURE_COMPLETE.
-  // The clio::run::FutureShm carries the original device pointers
-  // (gpu_task_device_ptr_ / gpu_fshm_device_ptr_) plus task size so
-  // SendOut can issue the writeback memcpys.
-  gpu::Future<Task> gpu_future;
-  if (!gpu_lane->Pop(gpu_future)) {
-    return false;
-  }
-  HLOG(kDebug, "Worker {}: ProcessNewTaskGpu: popped task from gpu2cpu queue",
-       worker_id_);
-
-  SetCurrentRunContext(nullptr);
-
-  ctp::ipc::ShmPtr<gpu::FutureShm> gpu_fshm_shmptr = gpu_future.GetFutureShmPtr();
-  ctp::ipc::ShmPtr<Task> task_shmptr = gpu_future.GetTaskPtr().shm_;
-  if (gpu_fshm_shmptr.IsNull() || task_shmptr.IsNull()) {
-    HLOG(kError, "Worker {}: ProcessNewTaskGpu: null ShmPtr in queue entry",
-         worker_id_);
-    return true;
-  }
-
-  void *gpu_fshm_raw = reinterpret_cast<void *>(
-      gpu_fshm_shmptr.off_.load());
-  void *gpu_task_raw = reinterpret_cast<void *>(task_shmptr.off_.load());
-  if (!gpu_fshm_raw || !gpu_task_raw) {
-    HLOG(kError, "Worker {}: ProcessNewTaskGpu: null off_ in queue entry",
-         worker_id_);
-    return true;
-  }
-
-  // Detect whether the FutureShm / Task structs sit in pure device
-  // memory (host cannot dereference them). ctp::IsDevicePointer returns
-  // false on host-only builds.
-  bool fshm_on_device = ctp::IsDevicePointer(gpu_fshm_raw);
-  bool task_on_device = ctp::IsDevicePointer(gpu_task_raw);
-
-  // Pull gpu::FutureShm contents into a local copy (D2H if needed).
-  // task_size_ tells us how many bytes the Task POD occupies.
-  alignas(8) char fshm_buf[sizeof(gpu::FutureShm)];
-  if (fshm_on_device) {
-    ctp::DeviceAwareMemcpy(fshm_buf, gpu_fshm_raw,
-                           sizeof(gpu::FutureShm));
-  } else {
-    std::memcpy(fshm_buf, gpu_fshm_raw, sizeof(gpu::FutureShm));
-  }
-  auto &fshm_copy = *reinterpret_cast<gpu::FutureShm *>(fshm_buf);
-  u32 task_pod_size = fshm_copy.task_size_;
-  if (task_pod_size == 0) {
-    HLOG(kError,
-         "Worker {}: ProcessNewTaskGpu: gpu::FutureShm.task_size_=0 — "
-         "kernel did not call Reset(sizeof(TaskT)) before Send",
-         worker_id_);
-    return true;
-  }
-
-  // Per-thread scratch for the host-resident task copy. Sized to fit
-  // any reasonable POD task (PutBlobTask is ~480 bytes today).
-  static constexpr size_t kTaskScratchBytes = 4096;
-  alignas(64) thread_local char task_scratch[kTaskScratchBytes];
-  if (task_pod_size > kTaskScratchBytes) {
-    HLOG(kError,
-         "Worker {}: ProcessNewTaskGpu: task_pod_size {} exceeds "
-         "scratch capacity {}",
-         worker_id_, task_pod_size, kTaskScratchBytes);
-    return true;
-  }
-  Task *task_raw = nullptr;
-  if (task_on_device) {
-    ctp::DeviceAwareMemcpy(task_scratch, gpu_task_raw, task_pod_size);
-    task_raw = reinterpret_cast<Task *>(task_scratch);
-  } else {
-    task_raw = static_cast<Task *>(gpu_task_raw);
-  }
-
-  PoolId pool_id = task_raw->pool_id_;
-  u32 method_id = task_raw->method_;
-
-  ctp::ipc::FullPtr<Task> task_full_ptr(task_raw);
-
-  Future<Task> future = CLIO_IPC->MakePointerFuture(task_full_ptr);
-  if (future.GetFutureShmPtr().IsNull()) {
-    HLOG(kError,
-         "Worker {}: ProcessNewTaskGpu: MakePointerFuture failed "
-         "(pool={}, method={})",
-         worker_id_, pool_id, method_id);
-    if (!fshm_on_device) {
-      static_cast<gpu::FutureShm *>(gpu_fshm_raw)
-          ->flags_.SetBitsSystem(gpu::FutureShm::FUTURE_COMPLETE);
-    }
-    return true;
-  }
-
-  auto chi_fshm = future.GetFutureShm();
-  chi_fshm->pool_id_ = pool_id;
-  chi_fshm->method_id_ = method_id;
-  chi_fshm->origin_ = FutureShm::FUTURE_CLIENT_GPU2CPU;
-  // Stash original device-side pointers + size so SendOut can
-  // H2D-copy the mutated POD back and signal FUTURE_COMPLETE on the
-  // device-side gpu::FutureShm (cudaMemcpy when in kDeviceMem).
-  chi_fshm->gpu_fshm_device_ptr_ =
-      reinterpret_cast<uintptr_t>(gpu_fshm_raw);
-  chi_fshm->gpu_task_device_ptr_ =
-      task_on_device ? reinterpret_cast<uintptr_t>(gpu_task_raw) : 0;
-  chi_fshm->gpu_task_size_ = task_pod_size;
-
-  auto *pool_manager = CLIO_POOL_MANAGER;
-  Container *container = pool_manager->GetStaticContainer(pool_id);
-  if (!container) {
-    HLOG(kError,
-         "Worker {}: ProcessNewTaskGpu: Container not found "
-         "(pool={}, method={})",
-         worker_id_, pool_id, method_id);
-    chi_fshm->flags_.SetBits(1 | FutureShm::FUTURE_COMPLETE);
-    if (!fshm_on_device) {
-      static_cast<gpu::FutureShm *>(gpu_fshm_raw)
-          ->flags_.SetBitsSystem(gpu::FutureShm::FUTURE_COMPLETE);
-    } else {
-      // Best-effort: still flip the device flag via cudaMemcpy.
-      u32 v = gpu::FutureShm::FUTURE_COMPLETE;
-      ctp::DeviceAwareMemcpy(
-          &static_cast<gpu::FutureShm *>(gpu_fshm_raw)->flags_.bits_.x,
-          &v, sizeof(u32));
-    }
-    return true;
-  }
-
-  // Fix up SSO/SVO `data_` pointers in the host-resident task copy if
-  // we D2H-copied it. The chimod's container override dispatches by
-  // method id to the per-task FixupAfterCopy(). Skip when the task
-  // never moved (kPinnedHost / kManagedUvm path).
-  if (task_on_device) {
-    container->FixupAfterCopy(method_id, task_full_ptr);
-  }
-
-  if (!task_full_ptr->task_flags_.Any(TASK_RUN_CTX_EXISTS)) {
-    CLIO_IPC->BeginTask(future, container, assigned_lane_);
-  } else {
-    RunContext *run_ctx = task_full_ptr->GetRunCtx();
-    if (run_ctx) {
-      run_ctx->worker_id_ = worker_id_;
-      run_ctx->lane_ = assigned_lane_;
-      run_ctx->event_queue_ = event_queue_;
-    }
-  }
-
-  RouteResult route_result = CLIO_IPC->RouteTask(future, /*force_enqueue=*/true);
-  HLOG(kDebug, "Worker {}: ProcessNewTaskGpu: RouteTask returned {} "
-       "pool={} method={}",
-       worker_id_, (int)route_result, pool_id, method_id);
-  return true;
+  // All gpu2cpu task/future deserialization lives in IpcGpu2Cpu::RecvIn — the
+  // worker never touches device task/future bytes.
+#if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL
+  return IpcGpu2Cpu::RecvIn(CLIO_IPC, gpu_lane, this);
+#else
+  (void)gpu_lane;
+  return false;
+#endif
 }
 
 ctp::ipc::FullPtr<Task> Worker::GetOrCopyTaskFromFuture(Future<Task> &future,

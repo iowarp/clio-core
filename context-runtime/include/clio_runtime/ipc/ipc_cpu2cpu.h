@@ -24,6 +24,17 @@ struct IpcCpu2Cpu {
   static Future<TaskT> SendIn(IpcManager *ipc,
                               const ctp::ipc::FullPtr<TaskT> &task_ptr);
 
+  /**
+   * Drain this worker thread's named MPSC SHM receive server (clio-<pid>-<tid>,
+   * DONTWAIT). If a client task is waiting, deserialize it, build a server-side
+   * FutureShm carrying the client's response identity, and push the resulting
+   * Future onto `lane` for the normal dispatch path. Keeps all task/future
+   * deserialization off the worker. Must run on the worker's own thread (the
+   * per-thread server is keyed by tid).
+   * @return true if a task was received and enqueued (the caller did work).
+   */
+  static bool RecvIn(IpcManager *ipc, TaskLane *lane);
+
   /** Deserialize task from SHM ring buffer on runtime side (inbound). */
   static ctp::ipc::FullPtr<Task> RecvIn(
       IpcManager *ipc, Future<Task> &future, Container *container,

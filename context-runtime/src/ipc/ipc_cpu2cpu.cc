@@ -7,8 +7,56 @@
 
 #include "clio_runtime/ipc/ipc_cpu2cpu.h"
 #include "clio_runtime/ipc_manager.h"
+#include "clio_runtime/singletons.h"
 
 namespace clio::run {
+
+bool IpcCpu2Cpu::RecvIn(IpcManager *ipc, TaskLane *lane) {
+  // #642: drain this worker's MPSC SHM server (DONTWAIT) and enqueue any
+  // received external-client task onto the normal dispatch path. The client
+  // already addressed this worker, so the deserialize happens here (the work
+  // that used to funnel through one worker); routing/execution then follow the
+  // standard ProcessNewTask flow. Keeping this off the worker means the worker
+  // never touches serialized task/future bytes.
+  IpcManagerTls *tls = ipc->GetTls();
+  if (!tls->shm_server_ok_) {
+    return false;
+  }
+  LoadTaskArchive archive;
+  ctp::lbm::ClientInfo info =
+      tls->shm_server_.Recv(archive, ctp::lbm::SHM_MPSC_DONTWAIT);
+  if (info.rc != 0) {
+    return false;
+  }
+  const auto &tis = archive.GetTaskInfos();
+  if (tis.empty()) {
+    return false;
+  }
+  const auto &ti = tis[0];
+  Container *container = CLIO_POOL_MANAGER->GetStaticContainer(ti.pool_id_);
+  if (container == nullptr) {
+    return false;
+  }
+  ctp::ipc::FullPtr<Task> tp = container->AllocLoadTask(ti.method_id_, archive);
+  if (tp.IsNull()) {
+    return false;
+  }
+  tp->SetFlags(TASK_EXTERNAL_CLIENT);
+  ctp::ipc::FullPtr<FutureShm> fs = ipc->NewObj<FutureShm>();
+  fs->pool_id_ = ti.pool_id_;
+  fs->method_id_ = ti.method_id_;
+  fs->origin_ = FutureShm::FUTURE_CLIENT_SHM;
+  fs->client_task_vaddr_ = ti.task_id_.net_key_;
+  fs->client_pid_ = ti.task_id_.pid_;
+  // The SHM client blocks on its own MPSC server clio-<pid>-<tid>; SendOut
+  // routes the result back there using these (the OS tid stamped by SendIn).
+  fs->waiter_pid_ = ti.task_id_.pid_;
+  fs->waiter_tid_ = ti.task_id_.tid_;
+  fs->flags_.SetBits(FutureShm::FUTURE_WAS_COPIED);
+  Future<Task> f(fs.shm_, tp);
+  lane->Push(f);
+  return true;
+}
 
 ctp::ipc::FullPtr<Task> IpcCpu2Cpu::RecvIn(
     IpcManager *ipc, Future<Task> &future, Container *container,

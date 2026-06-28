@@ -13,9 +13,12 @@
 
 #if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL
 
+#include "clio_runtime/gpu/future.h"  // GpuTaskLane
+
 namespace clio::run {
 
 class IpcManager;
+class Worker;
 namespace gpu { class IpcManager; }
 
 /**
@@ -45,6 +48,17 @@ struct IpcGpu2Cpu {
   template <typename TaskT>
   static CTP_GPU_FUN gpu::Future<TaskT> SendIn(
       gpu::IpcManager *ipc, const ctp::ipc::FullPtr<TaskT> &task_ptr);
+
+  /**
+   * CPU-side inbound receive for the producer-only gpu2cpu queue: pop one
+   * gpu::Future<Task> off `gpu_lane`, D2H-copy the gpu::FutureShm + POD task out
+   * of device memory if needed, wrap it in a host-side Future, stash the device
+   * pointers for SendOut, and route it for dispatch. All GPU task/future
+   * deserialization lives here so the worker never touches device bytes.
+   * @param worker the calling worker (for its id/lane/event-queue + run context).
+   * @return true if a task was popped (the caller did work).
+   */
+  static bool RecvIn(IpcManager *ipc, GpuTaskLane *gpu_lane, Worker *worker);
 
   /**
    * CPU-side: resolve the popped gpu::Future<Task> into a host-readable
