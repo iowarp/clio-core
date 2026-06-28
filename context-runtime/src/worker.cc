@@ -296,6 +296,47 @@ void Worker::Run() {
     did_work_ = false;  // Reset work tracker at start of each loop iteration
     task_did_work_ = false;  // Reset task-level work tracker
 
+    // #642: drain this worker's MPSC SHM server (DONTWAIT) and enqueue any
+    // received external-client task onto the normal dispatch path. The client
+    // already addressed this worker, so the deserialize happens here (the work
+    // that used to funnel through one worker); routing/execution then follow the
+    // standard ProcessNewTask flow.
+    if (assigned_lane_) {
+      IpcManagerTls *tls = CLIO_IPC->GetTls();
+      if (tls->shm_server_ok_) {
+        clio::run::LoadTaskArchive archive;
+        ctp::lbm::ClientInfo info =
+            tls->shm_server_.Recv(archive, ctp::lbm::SHM_MPSC_DONTWAIT);
+        if (info.rc == 0) {
+          const auto &tis = archive.GetTaskInfos();
+          if (!tis.empty()) {
+            const auto &ti = tis[0];
+            Container *container =
+                CLIO_POOL_MANAGER->GetStaticContainer(ti.pool_id_);
+            if (container != nullptr) {
+              ctp::ipc::FullPtr<Task> tp =
+                  container->AllocLoadTask(ti.method_id_, archive);
+              if (!tp.IsNull()) {
+                tp->SetFlags(TASK_EXTERNAL_CLIENT);
+                ctp::ipc::FullPtr<FutureShm> fs = CLIO_IPC->NewObj<FutureShm>();
+                fs->pool_id_ = ti.pool_id_;
+                fs->method_id_ = ti.method_id_;
+                fs->origin_ = FutureShm::FUTURE_CLIENT_SHM;
+                fs->client_task_vaddr_ = ti.task_id_.net_key_;
+                fs->client_pid_ = ti.task_id_.pid_;
+                fs->waiter_pid_ = ti.task_id_.pid_;
+                fs->waiter_tid_ = ti.task_id_.tid_;
+                fs->flags_.SetBits(FutureShm::FUTURE_WAS_COPIED);
+                Future<Task> f(fs.shm_, tp);
+                assigned_lane_->Push(f);
+                did_work_ = true;
+              }
+            }
+          }
+        }
+      }
+    }
+
     // Process tasks from assigned lane
     if (assigned_lane_) {
       u32 count = ProcessNewTasks(assigned_lane_);
