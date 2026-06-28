@@ -22,6 +22,16 @@ Future<TaskT> IpcCpu2Cpu::ClientSend(IpcManager *ipc,
   size_t net_key = reinterpret_cast<size_t>(task_ptr.ptr_);
   task_ptr->task_id_.net_key_ = net_key;
 
+  // The worker routes the result to "clio-<task_id_.pid_>-<task_id_.tid_>", which
+  // MUST equal this client thread's MPSC server name. IpcManagerTls names that
+  // server with ctp::SystemInfo::GetPid()/GetTid() (the OS tid), but CreateTaskId
+  // stamps task_id_.tid_ from the thread model's *logical* id (PthreadModel hands
+  // out a TLS counter, not the OS tid) — so without this the response is addressed
+  // to a non-existent segment and the client hangs forever. Stamp the routing
+  // identity from the same SystemInfo source the server is named with.
+  task_ptr->task_id_.pid_ = static_cast<u32>(ctp::SystemInfo::GetPid());
+  task_ptr->task_id_.tid_ = static_cast<u32>(ctp::SystemInfo::GetTid());
+
   // FutureShm now lives in PRIVATE memory: the worker never touches it; the
   // result returns over this client thread's MPSC server (clio-<pid>-<tid>).
   ctp::ipc::FullPtr<char> buffer =
