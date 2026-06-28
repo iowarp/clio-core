@@ -1509,6 +1509,16 @@ class IpcManager {
   // ClientInitQueues)
   u64 worker_queues_off_ = 0;
 
+  // #642: SHM-mode client → worker routing. worker_tids_ comes from
+  // ClientConnect; worker_conns_ caches one MPSC client connection per worker
+  // server ("clio-<runtime_pid_>-<worker_tid>").
+  std::vector<u32> worker_tids_;
+#if CTP_IS_HOST
+  std::unordered_map<u32, std::unique_ptr<ctp::lbm::ShmMpscTransport>>
+      worker_conns_;
+  std::mutex worker_conns_mutex_;
+#endif
+
   // Network queue for send operations (one lane, two priorities)
   ctp::ipc::FullPtr<NetQueue> net_queue_;
 

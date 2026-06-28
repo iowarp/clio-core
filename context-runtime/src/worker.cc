@@ -285,6 +285,7 @@ void Worker::Run() {
   // (issue #520). On Windows the same order matters for liveness: Signal()
   // on a tid without a registered event is a lost wakeup.
   int tid = ctp::SystemInfo::GetTid();
+  tid_ = static_cast<u32>(tid);  // publish for ClientConnect worker-tid list (#642)
   event_manager_.AddSignalEvent(nullptr);
   if (assigned_lane_) {
     assigned_lane_->SetTid(tid);

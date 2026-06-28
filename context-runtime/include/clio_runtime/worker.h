@@ -170,6 +170,9 @@ class Worker {
    */
   u32 GetId() const;
 
+  /** OS thread id of this worker (valid once Run() has started). #642 */
+  u32 GetTid() const { return tid_; }
+
   /**
    * Get the event queue for this worker
    * @return Pointer to this worker's event queue
@@ -462,6 +465,7 @@ class Worker {
   void ResumeCoroutine(const FullPtr<Task> &task_ptr, RunContext *run_ctx);
 
   u32 worker_id_;
+  u32 tid_ = 0;  /**< OS thread id, set in Run() (#642) */
   bool is_running_;
   bool is_initialized_;
   float load_;          // Estimated total CPU time (us) of active tasks
