@@ -3,6 +3,14 @@
 # migrate/start/stop) plus the clio_run binary's argument dispatch.
 cmake_minimum_required(VERSION 3.10)
 
+# The runtime-fallback (crash-isolation punt-to-main) feature was removed pending
+# a more foundational design. Its end-to-end tests (clio_run_cte_fallback_test,
+# clio_run_fallback_runtime_test) are kept in-tree but gated OFF so they are
+# neither built nor run until the feature is reintroduced. Flip this ON to
+# resurrect them alongside a fallback implementation.
+option(CLIO_CORE_ENABLE_RUNTIME_FALLBACK
+       "Build/run the runtime-fallback (crash-isolation) integration tests" OFF)
+
 # POSIX-only: the test drives the clio_run binary as a subprocess and
 # inspects exit codes via <sys/wait.h>.
 if(NOT WIN32)
@@ -208,8 +216,9 @@ if(CLIO_CORE_ENABLE_TESTS)
     )
 
     # Fallback-runtime CTE test: CTE on a USER runtime backed by a bdev on a
-    # MAIN runtime. CTE's internal bdev calls are serialize-relayed across the
-    # fallback. Two ephemeral runtimes on ports 10670/10680.
+    # MAIN runtime. Gated OFF — the runtime-fallback feature was removed (see
+    # CLIO_CORE_ENABLE_RUNTIME_FALLBACK at the top of this file).
+    if(CLIO_CORE_ENABLE_RUNTIME_FALLBACK)
     add_executable(clio_run_cte_fallback_test test_cte_fallback.cc)
     target_include_directories(clio_run_cte_fallback_test PRIVATE
       ${CLIO_RUN_ROOT}/include
@@ -243,6 +252,7 @@ if(CLIO_CORE_ENABLE_TESTS)
       TIMEOUT 180
       LABELS "msan_skip"
     )
+    endif()
   endif()
 
   # Per-RPC access-control test (private containers/methods). Composes ram bdev
@@ -282,10 +292,12 @@ if(CLIO_CORE_ENABLE_TESTS)
     LABELS "msan_skip"
   )
 
-  # Fallback-runtime (crash isolation) test: spawns TWO runtimes (main on 10650
-  # with a bdev, user on 10651 with CLIO_FALLBACK_PORT=10650 and no bdev), then
-  # an SHM client calls the bdev through the user runtime, which punts to main.
-  # Serialize with other live-runtime tests (shared per-user SHM segments).
+  # Fallback-runtime (crash isolation) test: spawns TWO runtimes (main with a
+  # bdev, user with CLIO_FALLBACK_PORT and no bdev), then an SHM client calls the
+  # bdev through the user runtime, which punts to main. Gated OFF — the
+  # runtime-fallback feature was removed (see CLIO_CORE_ENABLE_RUNTIME_FALLBACK
+  # at the top of this file).
+  if(CLIO_CORE_ENABLE_RUNTIME_FALLBACK)
   add_executable(clio_run_fallback_runtime_test test_fallback_runtime.cc)
   target_include_directories(clio_run_fallback_runtime_test PRIVATE
     ${CLIO_RUN_ROOT}/include
@@ -317,6 +329,7 @@ if(CLIO_CORE_ENABLE_TESTS)
     TIMEOUT 180
     LABELS "msan_skip"
   )
+  endif()
 
   # RestartLog unit test: pure file-level WAL behavior (no daemon).
   add_executable(clio_run_restart_log_test test_restart_log.cc)

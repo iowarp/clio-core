@@ -39,7 +39,6 @@
  */
 
 #include "clio_runtime/worker.h"
-#include "clio_runtime/ipc/ipc_run2fallback.h"
 
 // <coroutine> only for the C++20 stackless backend, not the Boost stackful one.
 // (CLIO_ENABLE_BOOST_COROUTINES is defined by task.h, included below, in terms of
@@ -348,14 +347,6 @@ void Worker::Run() {
     // Check blocked queue for completed tasks at end of each iteration
     ContinueBlockedTasks(false);
 
-    // Poll cross-runtime punts for in-place completion by the main runtime.
-    // While any are in flight, keep this worker awake (treat as work) so the
-    // parent coroutine resumes promptly once main sets FUTURE_COMPLETE —
-    // mirrors the ManyToOne pending-batch handling below.
-    if (PollPendingPunts()) {
-      did_work_ = true;
-    }
-
     // ManyToOne: flush due collective batches on the neighborhood leader.
     // Driven from a single worker to avoid redundant locking; FlushDue is a
     // cheap no-op when no batches are pending. Treat pending batches as work so
@@ -638,56 +629,10 @@ bool Worker::ProcessNewTask(TaskLane *lane) {
   auto *pool_manager = CLIO_POOL_MANAGER;
   Container *container = pool_manager->GetStaticContainer(pool_id);
 
-  // Punt to the fallback ("main") runtime when this pool is hosted there: it is
-  // either composed locally as an external stub (compose pool_external: true —
-  // preferred, explicit), or genuinely absent here (legacy heuristic). The main
-  // runtime owns the real container and completes the shared FutureShm in place,
-  // so the client sees the result directly. SendIn returns false when there is
-  // no fallback (or the task was already punted).
-  bool is_external = (container != nullptr) && container->IsExternal();
-  if (is_external || !container) {
-    bool punted = false;
-    if (future_shm->flags_.Any(FutureShm::FUTURE_COPY_FROM_CLIENT)) {
-      // External client task: its FutureShm + serialized task already live in
-      // the client's shared segment, so the main runtime can complete it in
-      // place. Forward the same Future onto main's SHM queue (no re-serialize).
-      punted = IpcRun2Fallback::SendIn(CLIO_IPC, future);
-    } else if (container != nullptr) {
-      // Runtime-internal subtask (e.g. CTE -> remote bdev): its task lives in
-      // this runtime's memory. Serialize it into a fresh SHARED FutureShm
-      // copy_space and enqueue it onto main's lane (non-blocking). Main runs it
-      // and completes the shared FutureShm in place; this worker polls the
-      // registered PendingPunt (PollPendingPunts) and, on completion,
-      // deserializes the outputs back and resumes the parent coroutine — no
-      // worker thread is blocked waiting for main.
-      FullPtr<Task> tp = future.GetTaskPtr();
-      if (tp.IsNull()) {
-        HLOG(kError, "Worker {}: punt pool={} method={}: null task ptr",
-             worker_id_, pool_id, method_id);
-      } else {
-        PendingPunt pp;
-        if (IpcRun2Fallback::PuntCopyIn(CLIO_IPC, container, tp, future, pp)) {
-          pending_punts_.push_back(pp);
-          punted = true;
-        }
-      }
-    } else {
-      // No local stub container (legacy not-found): only the in-place path is
-      // possible (we have nothing to serialize against).
-      punted = IpcRun2Fallback::SendIn(CLIO_IPC, future);
-    }
-    if (punted) {
-      HLOG(kDebug, "Worker {}: punted pool={} method={} to fallback runtime ({})",
-           worker_id_, pool_id, method_id,
-           is_external ? "external stub" : "not local");
-      return true;
-    }
-    // No fallback available (or already punted): fail so the client doesn't
-    // hang. (An external stub with no reachable fallback is a misconfiguration.)
-    HLOG(kError,
-         "Worker {}: cannot service pool_id={} method={} ({}); no fallback",
-         worker_id_, pool_id, method_id,
-         is_external ? "external stub" : "container not found");
+  // No local container for this pool: fail the task so the client doesn't hang.
+  if (!container) {
+    HLOG(kError, "Worker {}: cannot service pool_id={} method={}; "
+         "container not found", worker_id_, pool_id, method_id);
     future_shm->flags_.SetBits(1 | FutureShm::FUTURE_COMPLETE);
     return true;
   }
@@ -1493,24 +1438,6 @@ void Worker::ProcessEventQueue() {
     // Execute the task
     ExecTask(run_ctx->task_, run_ctx, true);
   }
-}
-
-bool Worker::PollPendingPunts() {
-  if (pending_punts_.empty()) {
-    return false;
-  }
-  // Walk the list; swap-erase completed punts (order is irrelevant). Each
-  // CompletePunt either finishes (deserialize outputs + resume parent) or
-  // leaves the entry in flight.
-  for (size_t i = 0; i < pending_punts_.size();) {
-    if (IpcRun2Fallback::CompletePunt(CLIO_IPC, pending_punts_[i])) {
-      pending_punts_[i] = pending_punts_.back();
-      pending_punts_.pop_back();
-    } else {
-      ++i;
-    }
-  }
-  return !pending_punts_.empty();
 }
 
 void Worker::ContinueBlockedTasks(bool force) {
