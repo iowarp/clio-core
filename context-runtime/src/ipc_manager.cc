@@ -222,7 +222,7 @@ bool IpcManager::ClientInit() {
       // Decoupled response path: bind an ephemeral ROUTER on which this client
       // receives task responses, independent of the request DEALER above. Its
       // OS-assigned port is advertised to the runtime via client_port_ so the
-      // runtime opens a dedicated dial-back connection (see RuntimeRecv). This
+      // runtime opens a dedicated dial-back connection (see RecvIn). This
       // keeps the client's RX off the request socket — no shared sock_mtx_
       // between send and recv.
       //
@@ -985,7 +985,7 @@ retry_attempt:
   // Send a ClientConnectTask via the lightbeam transport
   auto task = NewTask<clio::run::admin::ClientConnectTask>(
       CreateTaskId(), kAdminPoolId, PoolQuery::Local());
-  auto future = IpcCpu2CpuZmq::ClientSend(this,task, ipc_mode_);
+  auto future = IpcCpu2CpuZmq::SendIn(this,task, ipc_mode_);
 
   // Wait for response with per-attempt timeout
   if (!future.Wait(per_attempt)) {
@@ -1108,7 +1108,7 @@ bool IpcManager::WaitForLocalRuntimeStop(u32 timeout_sec) {
     // Send a ClientConnectTask with a 1-second timeout
     auto task = NewTask<clio::run::admin::ClientConnectTask>(
         CreateTaskId(), kAdminPoolId, PoolQuery::Local());
-    auto future = IpcCpu2CpuZmq::ClientSend(this,task, ipc_mode_);
+    auto future = IpcCpu2CpuZmq::SendIn(this,task, ipc_mode_);
 
     if (!future.Wait(1.0f)) {
       // Timeout or server dead: runtime is no longer responding
@@ -1789,7 +1789,7 @@ ctp::lbm::Transport *IpcManager::GetOrCreateClient(const std::string &addr,
   // (std::runtime_error) when the address is unroutable; a malformed client
   // identity must never terminate the whole runtime, so swallow it and return
   // nullptr — the caller falls back to echoing the response over the inbound
-  // ROUTER (see IpcCpu2CpuZmq::RuntimeRecv).
+  // ROUTER (see IpcCpu2CpuZmq::RecvIn).
   HLOG(kInfo, "[ClientPool] Creating new persistent connection to {}", key);
   ctp::lbm::TransportPtr transport;
   try {
@@ -1996,7 +1996,7 @@ bool IpcManager::IncreaseClientShm(size_t size) {
     auto reg_task = NewTask<clio::run::admin::RegisterMemoryTask>(
         clio::run::CreateTaskId(), clio::run::kAdminPoolId, clio::run::PoolQuery::Local(),
         alloc_id);
-    IpcCpu2CpuZmq::ClientSend(this,reg_task, IpcMode::kTcp).Wait();
+    IpcCpu2CpuZmq::SendIn(this,reg_task, IpcMode::kTcp).Wait();
 
     return true;
 
@@ -2402,7 +2402,7 @@ bool IpcManager::ReconnectToOriginalHost() {
       auto reg_task = NewTask<clio::run::admin::RegisterMemoryTask>(
           clio::run::CreateTaskId(), clio::run::kAdminPoolId, clio::run::PoolQuery::Local(),
           alloc_id);
-      IpcCpu2CpuZmq::ClientSend(this,reg_task, IpcMode::kTcp).Wait();
+      IpcCpu2CpuZmq::SendIn(this,reg_task, IpcMode::kTcp).Wait();
     }
   }
 
@@ -2808,7 +2808,7 @@ ctp::ipc::AllocatorId IpcManager::AllocateAndRegisterGpuBackend(
         clio::run::CreateTaskId(), clio::run::kAdminPoolId, clio::run::PoolQuery::Local(),
         backend_id, admin_kind, gpu_id, static_cast<u64>(bytes),
         ipc_handle_bytes);
-    IpcCpu2CpuZmq::ClientSend(this, reg_task, IpcMode::kTcp).Wait();
+    IpcCpu2CpuZmq::SendIn(this, reg_task, IpcMode::kTcp).Wait();
   }
 
   result = alloc_id;
@@ -3399,19 +3399,19 @@ ctp::ipc::FullPtr<Task> IpcManager::RecvRuntime(
   // Self-send path: no deserialization needed
   if (!future_shm->flags_.Any(FutureShm::FUTURE_COPY_FROM_CLIENT) ||
       future_shm->flags_.Any(FutureShm::FUTURE_WAS_COPIED)) {
-    return IpcCpu2Self::RuntimeRecv(future);
+    return IpcCpu2Self::RecvIn(future);
   }
 
   u32 origin = future_shm->origin_;
   switch (origin) {
 #if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL
     case FutureShm::FUTURE_CLIENT_GPU2CPU:
-      return IpcGpu2Cpu::RuntimeRecv(this, future, container,
+      return IpcGpu2Cpu::RecvIn(this, future, container,
                                       method_id, recv_transport);
 #endif
     case FutureShm::FUTURE_CLIENT_SHM:
     default:
-      return IpcCpu2Cpu::RuntimeRecv(this, future, container,
+      return IpcCpu2Cpu::RecvIn(this, future, container,
                                       method_id, recv_transport);
   }
 }
@@ -3425,16 +3425,16 @@ void IpcManager::SendRuntime(
   switch (origin) {
     case FutureShm::FUTURE_CLIENT_SHM:
     default:
-      IpcCpu2Cpu::RuntimeSend(this, task_ptr, run_ctx, container,
+      IpcCpu2Cpu::SendOut(this, task_ptr, run_ctx, container,
                                send_transport);
       break;
     case FutureShm::FUTURE_CLIENT_TCP:
     case FutureShm::FUTURE_CLIENT_IPC:
-      IpcCpu2CpuZmq::EnqueueRuntimeSend(this, run_ctx, origin);
+      IpcCpu2CpuZmq::EnqueueSendOut(this, run_ctx, origin);
       break;
 #if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL
     case FutureShm::FUTURE_CLIENT_GPU2CPU:
-      IpcGpu2Cpu::RuntimeSend(this, task_ptr, run_ctx, container);
+      IpcGpu2Cpu::SendOut(this, task_ptr, run_ctx, container);
       break;
 #endif
     // FUTURE_CLIENT_CPU2GPU dispatch was removed with the GPU runtime.

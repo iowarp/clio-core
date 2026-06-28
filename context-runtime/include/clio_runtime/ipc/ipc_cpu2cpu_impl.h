@@ -13,7 +13,7 @@
 namespace clio::run {
 
 template <typename TaskT>
-Future<TaskT> IpcCpu2Cpu::ClientSend(IpcManager *ipc,
+Future<TaskT> IpcCpu2Cpu::SendIn(IpcManager *ipc,
                                       const ctp::ipc::FullPtr<TaskT> &task_ptr) {
   if (task_ptr.IsNull()) return Future<TaskT>();
 
@@ -66,7 +66,7 @@ Future<TaskT> IpcCpu2Cpu::ClientSend(IpcManager *ipc,
         std::to_string(wtid));
   }
   if (conn == nullptr) {
-    HLOG(kError, "IpcCpu2Cpu::ClientSend: no MPSC worker server available");
+    HLOG(kError, "IpcCpu2Cpu::SendIn: no MPSC worker server available");
     future_shm->flags_.SetBits(1 | FutureShm::FUTURE_COMPLETE);
     return future;
   }
@@ -80,7 +80,7 @@ Future<TaskT> IpcCpu2Cpu::ClientSend(IpcManager *ipc,
 }
 
 template <typename TaskT>
-bool IpcCpu2Cpu::ClientRecv(IpcManager *ipc,
+bool IpcCpu2Cpu::RecvOut(IpcManager *ipc,
                              Future<TaskT> &future, float max_sec) {
   TaskT *task_ptr = future.get();
   auto *tls = ipc->GetTls();

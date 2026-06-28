@@ -10,7 +10,7 @@
 
 namespace clio::run {
 
-ctp::ipc::FullPtr<Task> IpcCpu2Cpu::RuntimeRecv(
+ctp::ipc::FullPtr<Task> IpcCpu2Cpu::RecvIn(
     IpcManager *ipc, Future<Task> &future, Container *container,
     u32 method_id, ctp::lbm::Transport *recv_transport) {
   auto future_shm = future.GetFutureShm();
@@ -56,7 +56,7 @@ ctp::ipc::FullPtr<Task> IpcCpu2Cpu::RuntimeRecv(
   return task_full_ptr;
 }
 
-void IpcCpu2Cpu::RuntimeSend(
+void IpcCpu2Cpu::SendOut(
     IpcManager *ipc, const FullPtr<Task> &task_ptr,
     RunContext *run_ctx, Container *container,
     ctp::lbm::Transport *send_transport) {
@@ -74,7 +74,7 @@ void IpcCpu2Cpu::RuntimeSend(
     container->SaveTask(task_ptr->method_, archive, task_ptr);
     conn->Send(archive);
   } else {
-    HLOG(kError, "IpcCpu2Cpu::RuntimeSend: no client server '{}'", name);
+    HLOG(kError, "IpcCpu2Cpu::SendOut: no client server '{}'", name);
   }
 
   // Signal completion and clean up

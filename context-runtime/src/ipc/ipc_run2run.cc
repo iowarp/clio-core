@@ -999,7 +999,7 @@ void IpcManagerRun2Run::StartRecvThreads() {
   });
 
   // Dedicated single client recv thread: drains TCP (port 9416) and IPC
-  // (unix socket) client transports via IpcCpu2CpuZmq::RuntimeRecv.
+  // (unix socket) client transports via IpcCpu2CpuZmq::RecvIn.
   client_recv_thread_ = std::thread([this]() {
     ctp::SystemInfo::SetCurrentThreadName("chi-client-recv");
     auto *ipc_manager = CLIO_IPC;
@@ -1021,7 +1021,7 @@ void IpcManagerRun2Run::StartRecvThreads() {
     HLOG(kInfo, "[ClientRecvThread] started");
     while (!recv_shutdown_.load(std::memory_order_acquire)) {
       clio::run::u32 tasks_received = 0;
-      bool did_work = clio::run::IpcCpu2CpuZmq::RuntimeRecv(ipc_manager,
+      bool did_work = clio::run::IpcCpu2CpuZmq::RecvIn(ipc_manager,
                                                        tasks_received);
       if (!did_work && !recv_shutdown_.load(std::memory_order_acquire)) {
         // Nothing drained: block on the IPC socket via the EventManager (its

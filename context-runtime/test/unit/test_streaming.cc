@@ -236,7 +236,7 @@ TEST_CASE("Runtime Heap Leak Check", "[streaming][leak]") {
   };
 
   // The server frees its per-request FutureShm *after* sending the response
-  // (RuntimeSend), so the free can lag the client's Wait(). Poll until the
+  // (SendOut), so the free can lag the client's Wait(). Poll until the
   // runtime private-heap usage stops moving before snapshotting.
   auto stabilized_heap = [&]() -> size_t {
     size_t prev = ipc->GetRuntimeHeapAllocatedBytes();

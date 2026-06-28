@@ -123,7 +123,7 @@ class IpcManager {
   CTP_CROSS_FUN gpu::Future<TaskT> Send(
       const ctp::ipc::FullPtr<TaskT> &task_ptr) {
 #if CTP_IS_GPU || CTP_IS_SYCL_DEVICE
-    return IpcGpu2Cpu::ClientSend(this, task_ptr);
+    return IpcGpu2Cpu::SendIn(this, task_ptr);
 #else
     (void)task_ptr;
     return gpu::Future<TaskT>();
@@ -133,7 +133,7 @@ class IpcManager {
 #if CTP_IS_GPU_COMPILER
   /**
    * CUDA/ROCm only: per-block IpcManager lives in __shared__ storage so
-   * helpers reachable from the kernel (e.g. IpcGpu2Cpu::ClientSend) can
+   * helpers reachable from the kernel (e.g. IpcGpu2Cpu::SendIn) can
    * resolve it via plain symbol lookup. SYCL achieves the same with a
    * kernel-scope local + `g_ipc_manager_ptr` name-lookup trick (see the
    * SYCL CLIO_GPU_INIT macro below).
@@ -258,7 +258,7 @@ class IpcManager {
 }  // namespace gpu
 }  // namespace clio::run
 
-// gpu::Future::Wait + IpcGpu2Cpu::ClientSend (both reach into gpu_info_).
+// gpu::Future::Wait + IpcGpu2Cpu::SendIn (both reach into gpu_info_).
 #include "clio_runtime/ipc/ipc_gpu2cpu_impl.h"
 
 // ================================================================

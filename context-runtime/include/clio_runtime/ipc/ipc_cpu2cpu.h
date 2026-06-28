@@ -19,26 +19,26 @@ class IpcManager;
  * IPC transport for CPU client → CPU runtime via shared memory (lightbeam).
  */
 struct IpcCpu2Cpu {
-  /** Serialize task into SHM ring buffer and enqueue to worker. */
+  /** Serialize task into SHM ring buffer and enqueue to worker (inbound). */
   template <typename TaskT>
-  static Future<TaskT> ClientSend(IpcManager *ipc,
-                                   const ctp::ipc::FullPtr<TaskT> &task_ptr);
+  static Future<TaskT> SendIn(IpcManager *ipc,
+                              const ctp::ipc::FullPtr<TaskT> &task_ptr);
 
-  /** Deserialize task from SHM ring buffer on runtime side. */
-  static ctp::ipc::FullPtr<Task> RuntimeRecv(
+  /** Deserialize task from SHM ring buffer on runtime side (inbound). */
+  static ctp::ipc::FullPtr<Task> RecvIn(
       IpcManager *ipc, Future<Task> &future, Container *container,
       u32 method_id, ctp::lbm::Transport *recv_transport);
 
-  /** Serialize outputs and set FUTURE_COMPLETE. */
-  static void RuntimeSend(
+  /** Serialize outputs and set FUTURE_COMPLETE (outbound). */
+  static void SendOut(
       IpcManager *ipc, const FullPtr<Task> &task_ptr,
       RunContext *run_ctx, Container *container,
       ctp::lbm::Transport *send_transport);
 
-  /** Wait for COMPLETE, then deserialize outputs. */
+  /** Wait for COMPLETE, then deserialize outputs (outbound). */
   template <typename TaskT>
-  static bool ClientRecv(IpcManager *ipc,
-                          Future<TaskT> &future, float max_sec);
+  static bool RecvOut(IpcManager *ipc,
+                      Future<TaskT> &future, float max_sec);
 };
 
 }  // namespace clio::run

@@ -620,17 +620,17 @@ class IpcManager {
 
     // Client TCP/IPC path
     if (!is_runtime && ipc_mode_ != IpcMode::kShm) {
-      return IpcCpu2CpuZmq::ClientSend(this, task_ptr, ipc_mode_);
+      return IpcCpu2CpuZmq::SendIn(this, task_ptr, ipc_mode_);
     }
 
     // Client SHM path
     if (!is_runtime) {
-      return IpcCpu2Cpu::ClientSend(this, task_ptr);
+      return IpcCpu2Cpu::SendIn(this, task_ptr);
     }
 
     // Runtime self-send: enqueue task by pointer (no serialization)
     Future<Task> base_future =
-        IpcCpu2Self::ClientSend(this, task_ptr.template Cast<Task>());
+        IpcCpu2Self::SendIn(this, task_ptr.template Cast<Task>());
     return base_future.Cast<TaskT>();
   }
 
@@ -723,9 +723,9 @@ class IpcManager {
     u32 origin = future_shm->origin_;
 
     if (origin == FutureShm::FUTURE_CLIENT_SHM && server_alive_.load()) {
-      return IpcCpu2Cpu::ClientRecv(this, future, max_sec);
+      return IpcCpu2Cpu::RecvOut(this, future, max_sec);
     }
-    return IpcCpu2CpuZmq::ClientRecv(this, future, max_sec);
+    return IpcCpu2CpuZmq::RecvOut(this, future, max_sec);
   }
 
   /**
@@ -2110,7 +2110,7 @@ CTP_HOST_FUN bool Future<TaskT, AllocT>::WaitCpu2Cpu(float max_sec,
     ctp::ipc::FullPtr<FutureShm> future_full =
         CLIO_CPU_IPC->ToFullPtr(future_shm_);
     if (future_full.IsNull()) return false;
-    bool ok = IpcCpu2Self::ClientRecv(*this, max_sec, future_full);
+    bool ok = IpcCpu2Self::RecvOut(*this, max_sec, future_full);
     if (!ok) return false;
   } else {
     // Client: SHM or ZMQ recv path
@@ -2129,7 +2129,7 @@ CTP_HOST_FUN bool Future<TaskT, AllocT>::WaitGpu2Cpu(float max_sec,
                                                        bool reuse_task) {
 #if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM
   // Host-side polling path (test harness): polls clio::run::FutureShm with
-  // system-scope atomics. The GPU kernel uses IpcGpu2Cpu::ClientRecv
+  // system-scope atomics. The GPU kernel uses IpcGpu2Cpu::RecvOut
   // (device-side) which polls gpu::FutureShm instead.
   ctp::ipc::FullPtr<FutureShm> future_full =
       CLIO_CPU_IPC->ToFullPtr(future_shm_);
@@ -2261,7 +2261,7 @@ CTP_CROSS_FUN void Future<TaskT, AllocT>::WaitRecv(float max_sec,
 // gpu::Future is fully defined inline in clio/gpu/future.h after the
 // producer-only redesign — no out-of-line method implementations needed.
 // gpu::Future::Wait() is defined in clio/ipc/ipc_gpu2cpu_impl.h
-// alongside IpcGpu2Cpu::ClientSend.
+// alongside IpcGpu2Cpu::SendIn.
 
 }  // namespace clio::run
 

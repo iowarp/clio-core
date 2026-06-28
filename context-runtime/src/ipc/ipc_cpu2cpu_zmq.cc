@@ -18,16 +18,16 @@
 namespace clio::run {
 
 //==============================================================================
-// RuntimeRecv: poll ZMQ transports for incoming client tasks
+// RecvIn: poll ZMQ transports for incoming client tasks
 //==============================================================================
 
-bool IpcCpu2CpuZmq::RuntimeRecv(IpcManager *ipc, u32 &tasks_received) {
+bool IpcCpu2CpuZmq::RecvIn(IpcManager *ipc, u32 &tasks_received) {
   auto *pool_manager = CLIO_POOL_MANAGER;
   bool did_work = false;
   tasks_received = 0;
 
   // Instrumentation: cumulative count of client requests this daemon has
-  // accepted from RuntimeRecv. Printed every 256 to keep log volume sane
+  // accepted from RecvIn. Printed every 256 to keep log volume sane
   // but still bracket the 24×128 = 3072-req IOR read phase.
   static std::atomic<size_t> recv_counter{0};
 
@@ -38,7 +38,7 @@ bool IpcCpu2CpuZmq::RuntimeRecv(IpcManager *ipc, u32 &tasks_received) {
     if (!transport) continue;
 
     // Drain all pending messages from this transport. Unbounded `while`
-    // is intentional: RuntimeRecv is invoked by the ClientRecv periodic
+    // is intentional: RecvIn is invoked by the ClientRecv periodic
     // which runs on its own dedicated net_recv worker (see
     // project_net_worker_split.md / DefaultScheduler::DivideWorkers),
     // so a hot client stream here doesn't starve any other periodic.
@@ -54,13 +54,13 @@ bool IpcCpu2CpuZmq::RuntimeRecv(IpcManager *ipc, u32 &tasks_received) {
         // up the dead fd inside Recv(); breaking out and retrying is the
         // correct behavior. Demote to kDebug so a routine client exit
         // doesn't spam the runtime log with kError lines.
-        HLOG(kDebug, "IpcCpu2CpuZmq::RuntimeRecv: Recv failed: {}", rc);
+        HLOG(kDebug, "IpcCpu2CpuZmq::RecvIn: Recv failed: {}", rc);
         break;
       }
 
       const auto &task_infos = archive.GetTaskInfos();
       if (task_infos.empty()) {
-        HLOG(kError, "IpcCpu2CpuZmq::RuntimeRecv: No task_infos in message");
+        HLOG(kError, "IpcCpu2CpuZmq::RecvIn: No task_infos in message");
         continue;
       }
 
@@ -71,7 +71,7 @@ bool IpcCpu2CpuZmq::RuntimeRecv(IpcManager *ipc, u32 &tasks_received) {
       // Get container for deserialization
       Container *container = pool_manager->GetStaticContainer(pool_id);
       if (!container) {
-        HLOG(kError, "IpcCpu2CpuZmq::RuntimeRecv: Container not found "
+        HLOG(kError, "IpcCpu2CpuZmq::RecvIn: Container not found "
              "for pool_id {}", pool_id);
         continue;
       }
@@ -92,7 +92,7 @@ bool IpcCpu2CpuZmq::RuntimeRecv(IpcManager *ipc, u32 &tasks_received) {
       transport->ClearRecvHandles(archive);
 
       if (task_ptr.IsNull()) {
-        HLOG(kError, "IpcCpu2CpuZmq::RuntimeRecv: Failed to deserialize task");
+        HLOG(kError, "IpcCpu2CpuZmq::RecvIn: Failed to deserialize task");
         continue;
       }
 
@@ -209,10 +209,10 @@ bool IpcCpu2CpuZmq::RuntimeRecv(IpcManager *ipc, u32 &tasks_received) {
 }
 
 //==============================================================================
-// EnqueueRuntimeSend: worker-inline enqueue to net_queue_
+// EnqueueSendOut: worker-inline enqueue to net_queue_
 //==============================================================================
 
-void IpcCpu2CpuZmq::EnqueueRuntimeSend(IpcManager *ipc, RunContext *run_ctx,
+void IpcCpu2CpuZmq::EnqueueSendOut(IpcManager *ipc, RunContext *run_ctx,
                                          u32 origin) {
   if (origin == FutureShm::FUTURE_CLIENT_TCP) {
     ipc->EnqueueNetTask(run_ctx->future_, NetQueuePriority::kClientSendTcp);
@@ -222,10 +222,10 @@ void IpcCpu2CpuZmq::EnqueueRuntimeSend(IpcManager *ipc, RunContext *run_ctx,
 }
 
 //==============================================================================
-// RuntimeSend: net-worker serialize and send response via ZMQ
+// SendOut: net-worker serialize and send response via ZMQ
 //==============================================================================
 
-bool IpcCpu2CpuZmq::RuntimeSend(
+bool IpcCpu2CpuZmq::SendOut(
     IpcManager *ipc, u32 &tasks_sent,
     std::vector<ctp::ipc::FullPtr<Task>> & /*deferred_deletes — unused*/) {
   auto *pool_manager = CLIO_POOL_MANAGER;
@@ -276,7 +276,7 @@ bool IpcCpu2CpuZmq::RuntimeSend(
       Container *container =
           pool_manager->GetStaticContainer(origin_task->pool_id_);
       if (!container) {
-        HLOG(kError, "IpcCpu2CpuZmq::RuntimeSend: Container not found "
+        HLOG(kError, "IpcCpu2CpuZmq::SendOut: Container not found "
              "for pool_id {}", origin_task->pool_id_);
         continue;
       }
@@ -285,7 +285,7 @@ bool IpcCpu2CpuZmq::RuntimeSend(
       ctp::lbm::Transport *response_transport =
           future_shm->response_transport_;
       if (!response_transport) {
-        HLOG(kError, "IpcCpu2CpuZmq::RuntimeSend: No response transport "
+        HLOG(kError, "IpcCpu2CpuZmq::SendOut: No response transport "
              "for mode {} pid {}", mode_idx, future_shm->client_pid_);
         continue;
       }
@@ -348,11 +348,11 @@ bool IpcCpu2CpuZmq::RuntimeSend(
       }
 
       // Free the server-side FutureShm allocated for this inbound request in
-      // RuntimeRecv (NewObj<FutureShm>()). The queued Future here is never
+      // RecvIn (NewObj<FutureShm>()). The queued Future here is never
       // consumed_, so ~Future() never runs its FutureShm-free path; without
       // this every cross-process RPC leaks one FutureShm. CleanupResponseArchive
       // is intentionally not called — that map is client-side only (see
-      // ipc_cpu2cpu_zmq_impl.h RuntimeRecv); on the server it would be a no-op.
+      // ipc_cpu2cpu_zmq_impl.h RecvIn); on the server it would be a no-op.
       if (!future_shm.IsNull()) {
         ipc->FreeBuffer(future_shm.Cast<char>());
       }

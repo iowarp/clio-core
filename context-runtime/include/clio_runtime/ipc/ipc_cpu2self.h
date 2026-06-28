@@ -50,10 +50,10 @@ class Worker;
  * non-worker threads use full RouteTask with force_enqueue.
  *
  * Lifecycle:
- *   ClientSend  -> enqueue Future<Task> to worker lane
- *   RuntimeRecv -> no-op (task is already a pointer)
- *   RuntimeSend -> set FUTURE_COMPLETE or enqueue to parent event queue
- *   ClientRecv  -> poll FUTURE_COMPLETE in shared memory
+ *   SendIn  -> enqueue Future<Task> to worker lane
+ *   RecvIn  -> no-op (task is already a pointer)
+ *   SendOut -> set FUTURE_COMPLETE or enqueue to parent event queue
+ *   RecvOut -> poll FUTURE_COMPLETE in shared memory
  */
 struct IpcCpu2Self {
   /**
@@ -68,7 +68,7 @@ struct IpcCpu2Self {
    * @param task_ptr Task to enqueue
    * @return Future wrapping the task pointer (no serialization)
    */
-  static Future<Task> ClientSend(IpcManager *ipc,
+  static Future<Task> SendIn(IpcManager *ipc,
                                  const ctp::ipc::FullPtr<Task> &task_ptr);
 
   /**
@@ -78,9 +78,9 @@ struct IpcCpu2Self {
    * Returns the task pointer directly from the future.
    *
    * @param future Future containing the task pointer
-   * @return FullPtr to the task (same pointer from ClientSend)
+   * @return FullPtr to the task (same pointer from SendIn)
    */
-  static ctp::ipc::FullPtr<Task> RuntimeRecv(Future<Task> &future);
+  static ctp::ipc::FullPtr<Task> RecvIn(Future<Task> &future);
 
   /**
    * Runtime sends the response after task execution.
@@ -96,7 +96,7 @@ struct IpcCpu2Self {
    * @param container Container for serialization (only if was_copied)
    * @param send_transport SHM transport (only if was_copied)
    */
-  static void RuntimeSend(const FullPtr<Task> &task_ptr,
+  static void SendOut(const FullPtr<Task> &task_ptr,
                            RunContext *run_ctx,
                            Container *container,
                            ctp::lbm::Transport *send_transport);
@@ -111,7 +111,7 @@ struct IpcCpu2Self {
    * @return true if completed, false if timed out
    */
   template <typename TaskT, typename AllocT>
-  static bool ClientRecv(Future<TaskT, AllocT> &future, float max_sec,
+  static bool RecvOut(Future<TaskT, AllocT> &future, float max_sec,
                          ctp::ipc::FullPtr<FutureShm> future_full) {
     // Poll FUTURE_COMPLETE in shared memory
     ctp::abitfield32_t &flags = future_full->flags_;

@@ -422,11 +422,11 @@ bool Worker::ProcessNewTaskGpu(GpuTaskLane *gpu_lane) {
   // addresses directly: the CPU and GPU share visibility. For
   // kDeviceMem the worker D2H-copies the POD bytes (gpu::FutureShm and
   // the Task struct) into per-thread host scratch and runs the chimod
-  // on those copies; RuntimeSend H2D-copies the mutated Task POD back
+  // on those copies; SendOut H2D-copies the mutated Task POD back
   // to the original device address before signaling FUTURE_COMPLETE.
   // The clio::run::FutureShm carries the original device pointers
   // (gpu_task_device_ptr_ / gpu_fshm_device_ptr_) plus task size so
-  // RuntimeSend can issue the writeback memcpys.
+  // SendOut can issue the writeback memcpys.
   gpu::Future<Task> gpu_future;
   if (!gpu_lane->Pop(gpu_future)) {
     return false;
@@ -519,7 +519,7 @@ bool Worker::ProcessNewTaskGpu(GpuTaskLane *gpu_lane) {
   chi_fshm->pool_id_ = pool_id;
   chi_fshm->method_id_ = method_id;
   chi_fshm->origin_ = FutureShm::FUTURE_CLIENT_GPU2CPU;
-  // Stash original device-side pointers + size so RuntimeSend can
+  // Stash original device-side pointers + size so SendOut can
   // H2D-copy the mutated POD back and signal FUTURE_COMPLETE on the
   // device-side gpu::FutureShm (cudaMemcpy when in kDeviceMem).
   chi_fshm->gpu_fshm_device_ptr_ =
@@ -1279,7 +1279,7 @@ void Worker::EndTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
   RunContext *parent_task = run_ctx->future_.GetParentTask();
 
   // Dispatch response via transport class
-  IpcCpu2Self::RuntimeSend(task_ptr, run_ctx, container,
+  IpcCpu2Self::SendOut(task_ptr, run_ctx, container,
                            shm_send_transport_.get());
 }
 

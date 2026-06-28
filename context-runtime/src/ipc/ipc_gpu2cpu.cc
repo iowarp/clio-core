@@ -17,12 +17,12 @@
 namespace clio::run {
 
 /**
- * RuntimeRecv: producer-only — the GPU never serializes a task through
+ * RecvIn: producer-only — the GPU never serializes a task through
  * lightbeam. Worker::ProcessNewTaskGpu already wrapped the popped task
  * pointer in a clio::run::Future<Task> (for kDeviceMem the wrapped pointer
  * is a host scratch copy of the device POD). We just hand it back.
  */
-ctp::ipc::FullPtr<Task> IpcGpu2Cpu::RuntimeRecv(
+ctp::ipc::FullPtr<Task> IpcGpu2Cpu::RecvIn(
     IpcManager *ipc, Future<Task> &future, Container *container,
     u32 method_id, ctp::lbm::Transport *recv_transport) {
   (void)ipc; (void)container; (void)method_id; (void)recv_transport;
@@ -30,7 +30,7 @@ ctp::ipc::FullPtr<Task> IpcGpu2Cpu::RuntimeRecv(
 }
 
 /**
- * RuntimeSend: writes the (mutated) POD task bytes back to the original
+ * SendOut: writes the (mutated) POD task bytes back to the original
  * device address (when the kernel allocated in kDeviceMem) and sets
  * FUTURE_COMPLETE on the device-side gpu::FutureShm so the kernel
  * poll-loop unblocks.
@@ -42,12 +42,12 @@ ctp::ipc::FullPtr<Task> IpcGpu2Cpu::RuntimeRecv(
  * of the flag word to flip FUTURE_COMPLETE atomically — single-aligned-
  * 32-bit writes are observed atomically by the device's volatile read.
  */
-void IpcGpu2Cpu::RuntimeSend(
+void IpcGpu2Cpu::SendOut(
     IpcManager *ipc, const FullPtr<Task> &task_ptr,
     RunContext *run_ctx, Container *container) {
   (void)container;
   auto future_shm = run_ctx->future_.GetFutureShm();
-  HLOG(kDebug, "IpcGpu2Cpu::RuntimeSend: pool={} method={}",
+  HLOG(kDebug, "IpcGpu2Cpu::SendOut: pool={} method={}",
        task_ptr->pool_id_, task_ptr->method_);
 
   // 1) Writeback the POD task bytes to device memory if the kernel

@@ -13,7 +13,7 @@
 namespace clio::run {
 
 template <typename TaskT>
-Future<TaskT> IpcCpu2CpuZmq::ClientSend(IpcManager *ipc,
+Future<TaskT> IpcCpu2CpuZmq::SendIn(IpcManager *ipc,
                                           const ctp::ipc::FullPtr<TaskT> &task_ptr,
                                           IpcMode mode) {
   if (task_ptr.IsNull()) return Future<TaskT>();
@@ -71,7 +71,7 @@ Future<TaskT> IpcCpu2CpuZmq::ClientSend(IpcManager *ipc,
 }
 
 template <typename TaskT>
-bool IpcCpu2CpuZmq::ClientRecv(IpcManager *ipc,
+bool IpcCpu2CpuZmq::RecvOut(IpcManager *ipc,
                                  Future<TaskT> &future, float max_sec) {
   auto future_shm = future.GetFutureShm();
   TaskT *task_ptr = future.get();

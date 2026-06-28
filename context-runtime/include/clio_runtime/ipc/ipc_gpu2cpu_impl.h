@@ -17,7 +17,7 @@ namespace clio::run {
 
 #if CTP_IS_GPU_COMPILER || CTP_IS_SYCL_COMPILER
 /**
- * GPU-side ClientSend.
+ * GPU-side SendIn.
  *
  * Producer-only design: the host pre-allocated Task+FutureShm in a
  * registered backend and passed `task_ptr` to the kernel. The kernel
@@ -31,7 +31,7 @@ namespace clio::run {
  *   - SYCL: kernels are single_task by convention, so the full WI runs.
  */
 template <typename TaskT>
-CTP_GPU_FUN gpu::Future<TaskT> IpcGpu2Cpu::ClientSend(
+CTP_GPU_FUN gpu::Future<TaskT> IpcGpu2Cpu::SendIn(
     gpu::IpcManager *ipc, const ctp::ipc::FullPtr<TaskT> &task_ptr) {
   gpu::Future<TaskT> future;
 

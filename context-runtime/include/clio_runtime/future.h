@@ -193,7 +193,7 @@ struct FutureShm {
 
   /**
    * GPU device-memory pointer to the *gpu::FutureShm* co-located with
-   * the task. RuntimeSend writes FUTURE_COMPLETE to this address (via
+   * the task. SendOut writes FUTURE_COMPLETE to this address (via
    * cudaMemcpy when the FutureShm itself is in kDeviceMem) so the
    * kernel poll-loop unblocks. Always non-zero on the GPU origin path.
    */

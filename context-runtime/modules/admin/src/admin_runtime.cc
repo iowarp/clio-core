@@ -104,11 +104,11 @@ clio::run::TaskResume Runtime::Create(ctp::ipc::FullPtr<CreateTask> task,
   // lbm_transport->Recv() directly and dispatch via RecvIn / RecvOut.
   //
   // Inbound dispatch only pushes Futures to worker lanes:
-  //   - RecvIn  -> IpcManager::Send -> IpcCpu2Self::ClientSend (non-worker
+  //   - RecvIn  -> IpcManager::Send -> IpcCpu2Self::SendIn (non-worker
   //                branch: RouteTask(force_enqueue=true), which is safe
   //                from a non-worker thread)
   //   - RecvOut -> direct worker_queues_->GetLane(...).Push(future)
-  //   - RuntimeRecv (client TCP/IPC) -> direct lane push
+  //   - RecvIn (client TCP/IPC) -> direct lane push
   //
   // None of these go through CLIO_CUR_WORKER (TLS) for anything that matters.
   // The outbound Send path is unchanged: still served by the net_send_worker
@@ -633,13 +633,13 @@ clio::run::TaskResume Runtime::ClientConnect(ctp::ipc::FullPtr<ClientConnectTask
 
 /**
  * Handle ClientRecv - Receive tasks from lightbeam client servers
- * Delegates to IpcCpu2CpuZmq::RuntimeRecv for the actual transport logic.
+ * Delegates to IpcCpu2CpuZmq::RecvIn for the actual transport logic.
  */
 clio::run::TaskResume Runtime::ClientRecv(ctp::ipc::FullPtr<ClientRecvTask> task,
                                     clio::run::RunContext &rctx) {
   CLIO_TASK_BODY_BEGIN
   clio::run::u32 tasks_received = 0;
-  bool did_work = clio::run::IpcCpu2CpuZmq::RuntimeRecv(CLIO_IPC, tasks_received);
+  bool did_work = clio::run::IpcCpu2CpuZmq::RecvIn(CLIO_IPC, tasks_received);
   task->tasks_received_ = tasks_received;
 
   rctx.did_work_ = did_work;
@@ -650,14 +650,14 @@ clio::run::TaskResume Runtime::ClientRecv(ctp::ipc::FullPtr<ClientRecvTask> task
 
 /**
  * Handle ClientSend - Send completed task outputs to clients via lightbeam
- * Delegates to IpcCpu2CpuZmq::RuntimeSend for the actual transport logic.
+ * Delegates to IpcCpu2CpuZmq::SendOut for the actual transport logic.
  */
 clio::run::TaskResume Runtime::ClientSend(ctp::ipc::FullPtr<ClientSendTask> task,
                                     clio::run::RunContext &rctx) {
   CLIO_TASK_BODY_BEGIN
   static std::vector<ctp::ipc::FullPtr<clio::run::Task>> deferred_deletes;
   clio::run::u32 tasks_sent = 0;
-  bool did_work = clio::run::IpcCpu2CpuZmq::RuntimeSend(
+  bool did_work = clio::run::IpcCpu2CpuZmq::SendOut(
       CLIO_IPC, tasks_sent, deferred_deletes);
   task->tasks_sent_ = tasks_sent;
 

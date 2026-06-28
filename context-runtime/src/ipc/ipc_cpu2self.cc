@@ -38,7 +38,7 @@
 
 namespace clio::run {
 
-Future<Task> IpcCpu2Self::ClientSend(IpcManager *ipc,
+Future<Task> IpcCpu2Self::SendIn(IpcManager *ipc,
                                       const ctp::ipc::FullPtr<Task> &task_ptr) {
   Worker *worker = CLIO_CUR_WORKER;
 
@@ -78,12 +78,12 @@ Future<Task> IpcCpu2Self::ClientSend(IpcManager *ipc,
   return future;
 }
 
-ctp::ipc::FullPtr<Task> IpcCpu2Self::RuntimeRecv(Future<Task> &future) {
+ctp::ipc::FullPtr<Task> IpcCpu2Self::RecvIn(Future<Task> &future) {
   // No deserialization needed — task is a direct pointer
   return future.GetTaskPtr();
 }
 
-void IpcCpu2Self::RuntimeSend(const FullPtr<Task> &task_ptr,
+void IpcCpu2Self::SendOut(const FullPtr<Task> &task_ptr,
                                RunContext *run_ctx,
                                Container *container,
                                ctp::lbm::Transport *send_transport) {
