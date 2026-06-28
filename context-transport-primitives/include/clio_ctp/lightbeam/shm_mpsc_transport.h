@@ -98,6 +98,10 @@ struct ShmTransportHeader {
 // form a circular include and only the allocator-first order defines
 // MemoryBackendId (== AllocatorId) before allocator.h references it.
 #include "clio_ctp/memory/allocator/allocator.h"
+// lightbeam.h gives the LbmMeta/Bulk/ClientInfo/BULK_* surface used by the
+// high-level Send/Recv below; local_serialize.h serializes the metadata.
+#include "clio_ctp/data_structures/serialization/local_serialize.h"
+#include "clio_ctp/lightbeam/lightbeam.h"
 #include "clio_ctp/memory/backend/posix_shm_mmap.h"
 #include "clio_ctp/thread/thread_model_manager.h"
 #include "clio_ctp/util/timer.h"
@@ -300,7 +304,113 @@ class ShmMpscTransport {
     }
   }
 
+  // --- High-level metadata + bulk API (mirrors Transport::Send/Recv) --------
+  // Build a bulk descriptor referencing `ptr` (Transport::Expose parity).
+  Bulk Expose(const ctp::ipc::FullPtr<char> &ptr, size_t data_size,
+              ctp::u32 flags) {
+    Bulk bulk;
+    bulk.data = ptr;
+    bulk.size = data_size;
+    bulk.flags = ctp::bitfield32_t(flags);
+    return bulk;
+  }
+
+  // Serialize metadata + bulk data into ONE message and SendBytes it, so a
+  // producer's framing can't interleave with another's at the consumer.
+  template <typename MetaT>
+  int Send(MetaT &meta) {
+    using AllocT = typename MetaT::allocator_type;
+    using CharVec = ctp::priv::vector<char, AllocT>;
+    CharVec meta_buf(meta.alloc_);
+    ctp::ipc::LocalSerialize<CharVec> ar(meta_buf);
+    ar(meta);
+    ar.Finalize();
+    std::vector<char> msg;
+    uint32_t meta_len = static_cast<uint32_t>(meta_buf.size());
+    AppendRaw(msg, &meta_len, sizeof(meta_len));
+    AppendRaw(msg, meta_buf.data(), meta_buf.size());
+    for (size_t i = 0; i < meta.send.size(); ++i) {
+      if (meta.send[i].flags.Any(BULK_EXPOSE)) {
+        AppendRaw(msg, &meta.send[i].data.shm_, sizeof(meta.send[i].data.shm_));
+      } else if (meta.send[i].flags.Any(BULK_XFER)) {
+        AppendRaw(msg, &meta.send[i].data.shm_, sizeof(meta.send[i].data.shm_));
+        if (meta.send[i].data.shm_.alloc_id_.IsNull()) {
+          AppendRaw(msg, meta.send[i].data.ptr_, meta.send[i].size);
+        }
+      }
+    }
+    return SendBytes(msg.data(), msg.size());
+  }
+
+  // Receive one complete message and rebuild metadata + bulks. rc=0 on success;
+  // rc=EAGAIN when DONTWAIT and nothing is in flight.
+  template <typename MetaT>
+  ClientInfo Recv(MetaT &meta, ctp::u32 flags = 0) {
+    using AllocT = typename MetaT::allocator_type;
+    using CharVec = ctp::priv::vector<char, AllocT>;
+    ClientInfo info;
+    std::vector<char> msg;
+    ctp::u64 conn = 0;
+    int rc = RecvBytes(msg, &conn, flags);
+    if (rc != 0) {
+      info.rc = (rc < 0) ? -rc : rc;  // surface EAGAIN as a positive errno
+      return info;
+    }
+    size_t pos = 0;
+    uint32_t meta_len = 0;
+    if (!ReadRaw(msg, pos, &meta_len, sizeof(meta_len))) {
+      info.rc = EIO;
+      return info;
+    }
+    CharVec meta_buf(meta_len, meta.alloc_);
+    if (meta_len > 0 && !ReadRaw(msg, pos, meta_buf.data(), meta_len)) {
+      info.rc = EIO;
+      return info;
+    }
+    ctp::ipc::LocalDeserialize<CharVec> dar(meta_buf);
+    dar(meta);
+    for (size_t i = 0; i < meta.send.size(); ++i) {
+      Bulk recv_bulk;
+      recv_bulk.size = meta.send[i].size;
+      recv_bulk.flags = meta.send[i].flags;
+      recv_bulk.data = ctp::ipc::FullPtr<char>::GetNull();
+      ctp::ipc::ShmPtr<char> shm;
+      if (recv_bulk.flags.Any(BULK_EXPOSE)) {
+        ReadRaw(msg, pos, &shm, sizeof(shm));
+        recv_bulk.data.shm_ = shm;
+        recv_bulk.data.ptr_ = nullptr;
+      } else if (recv_bulk.flags.Any(BULK_XFER)) {
+        ReadRaw(msg, pos, &shm, sizeof(shm));
+        if (!shm.alloc_id_.IsNull()) {
+          recv_bulk.data.shm_ = shm;
+          recv_bulk.data.ptr_ = nullptr;
+        } else {
+          char *buf = static_cast<char *>(std::malloc(recv_bulk.size));
+          ReadRaw(msg, pos, buf, recv_bulk.size);
+          recv_bulk.data.ptr_ = buf;
+          recv_bulk.data.shm_.alloc_id_ = ctp::ipc::AllocatorId::GetNull();
+          recv_bulk.data.shm_.off_ = reinterpret_cast<size_t>(buf);
+        }
+      }
+      meta.recv.push_back(recv_bulk);
+    }
+    info.rc = 0;
+    return info;
+  }
+
  private:
+  static void AppendRaw(std::vector<char> &v, const void *p, size_t n) {
+    const char *c = static_cast<const char *>(p);
+    v.insert(v.end(), c, c + n);
+  }
+  static bool ReadRaw(const std::vector<char> &v, size_t &pos, void *p,
+                      size_t n) {
+    if (pos + n > v.size()) return false;
+    std::memcpy(p, v.data() + pos, n);
+    pos += n;
+    return true;
+  }
+
   // The PosixShmMmap reserves a fixed 64KB header page (kBackendHeaderSize)
   // ahead of the data region; pad the request so the data region comfortably
   // holds header + ring.

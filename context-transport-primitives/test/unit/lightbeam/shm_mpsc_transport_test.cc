@@ -131,3 +131,39 @@ TEST_CASE("ShmMpsc - multi producer 1MB", "[shm_mpsc][multi]") {
   REQUIRE(ok.load() == kProducers);
   srv.Shutdown();
 }
+
+TEST_CASE("ShmMpsc - high-level Send/Recv (metadata + bulk)", "[shm_mpsc][meta]") {
+  const std::string name = "clio-mpsc-utest-meta";
+  const std::string magic = "hello-mpsc-high-level-Send-Recv-payload-0123456789";
+  ShmMpscTransport srv;
+  REQUIRE(srv.ServerInit(name));
+
+  std::atomic<int> ok{0};
+  std::thread prod([&] {
+    ShmMpscTransport cli;
+    if (!cli.ClientInit(name)) return;
+    // Expose `magic` as a private-memory BULK_XFER (alloc_id null => bytes are
+    // copied into the message).
+    ctp::ipc::FullPtr<char> ptr;
+    ptr.ptr_ = const_cast<char*>(magic.data());
+    ptr.shm_.alloc_id_ = ctp::ipc::AllocatorId::GetNull();
+    ptr.shm_.off_ = reinterpret_cast<size_t>(magic.data());
+    ctp::lbm::LbmMeta<> send_meta;
+    send_meta.send.push_back(cli.Expose(ptr, magic.size(), BULK_XFER));
+    if (cli.Send(send_meta) == 0) ok.fetch_add(1);
+    cli.Shutdown();
+  });
+
+  ctp::lbm::LbmMeta<> recv_meta;
+  ctp::lbm::ClientInfo info = srv.Recv(recv_meta);
+  REQUIRE(info.rc == 0);
+  REQUIRE(recv_meta.recv.size() == 1);
+  REQUIRE(recv_meta.recv[0].size == magic.size());
+  std::string got(recv_meta.recv[0].data.ptr_,
+                  recv_meta.recv[0].data.ptr_ + recv_meta.recv[0].size);
+  REQUIRE(got == magic);
+
+  prod.join();
+  REQUIRE(ok.load() == 1);
+  srv.Shutdown();
+}
