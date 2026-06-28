@@ -1514,9 +1514,18 @@ class IpcManager {
   // server ("clio-<runtime_pid_>-<worker_tid>").
   std::vector<u32> worker_tids_;
 #if CTP_IS_HOST
-  std::unordered_map<u32, std::unique_ptr<ctp::lbm::ShmMpscTransport>>
-      worker_conns_;
-  std::mutex worker_conns_mutex_;
+  // Cached MPSC client connections keyed by server name ("clio-<pid>-<tid>"):
+  // clients → worker servers, and the runtime → client servers for responses.
+  std::unordered_map<std::string, std::unique_ptr<ctp::lbm::ShmMpscTransport>>
+      shm_conns_;
+  std::mutex shm_conns_mutex_;
+
+ public:
+  /** Get (or lazily create) a cached MPSC client connection to `name`. Returns
+   *  nullptr if the named server cannot be attached. #642 */
+  ctp::lbm::ShmMpscTransport *GetOrCreateShmConn(const std::string &name);
+
+ private:
 #endif
 
   // Network queue for send operations (one lane, two priorities)

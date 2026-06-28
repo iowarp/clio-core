@@ -722,6 +722,22 @@ IpcManagerTls *IpcManager::GetTls() {
   return tls;
 }
 
+ctp::lbm::ShmMpscTransport *IpcManager::GetOrCreateShmConn(
+    const std::string &name) {
+  std::lock_guard<std::mutex> lk(shm_conns_mutex_);
+  auto it = shm_conns_.find(name);
+  if (it != shm_conns_.end()) {
+    return it->second.get();
+  }
+  auto conn = std::make_unique<ctp::lbm::ShmMpscTransport>();
+  if (!conn->ClientInit(name)) {
+    return nullptr;
+  }
+  ctp::lbm::ShmMpscTransport *raw = conn.get();
+  shm_conns_[name] = std::move(conn);
+  return raw;
+}
+
 bool IpcManager::ServerInitShm() {
   ConfigManager *config = CLIO_CONFIG_MANAGER;
 
