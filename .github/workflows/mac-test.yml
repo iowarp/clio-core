@@ -115,16 +115,9 @@ jobs:
           # #482/#485). Retry a failing test up to 3x so a transient flake
           # doesn't redden the whole matrix; a test that is genuinely broken
           # still fails all 3 attempts.
-          #
-          # cr_cli_fallback_runtime is excluded on macOS: it brings up TWO
-          # in-process runtimes and completes a punted task's FutureShm in place
-          # across them, which hangs on macOS (consistent 120s timeout on
-          # macos-14 and macos-26-intel) — the same in-process-runtime
-          # concurrency class as #482/#485. It passes on Linux (~18s) and the
-          # fallback-punting path is covered there by the Distributed suite.
           ctest -T Test --output-on-failure --timeout 120 --repeat until-pass:3 \
             -LE "integration|restart|functional|query|stress|docker" \
-            -E "cr_bdev_|cr_mpi_|cr_per_process_shm_stress|cr_cli_fallback_runtime"
+            -E "cr_bdev_|cr_mpi_|cr_per_process_shm_stress"
 
       - name: Submit results to CDash
         if: always()
