@@ -431,7 +431,8 @@ struct AddressHash {
 
 // Task flags using CTP BIT_OPT macro
 #define TASK_PERIODIC BIT_OPT(clio::run::u32, 0)
-#define TASK_ROUTED BIT_OPT(clio::run::u32, 1)
+// Bit 1 retired: TASK_ROUTED — now RunContext::routed_ (execution-local state,
+// no longer serialized on the task).
 #define TASK_DATA_OWNER BIT_OPT(clio::run::u32, 2)
 #define TASK_REMOTE BIT_OPT(clio::run::u32, 3)
 // Bit 4 was TASK_FORCE_NET — removed in favor of the CLIO_FORCE_NET env
@@ -441,13 +442,9 @@ struct AddressHash {
 // that flips the runtime's routing decision once. Bit position kept
 // reserved so existing on-wire/persisted flag values keep their bit
 // numbering.
-#define TASK_STARTED \
-  BIT_OPT(clio::run::u32, 5)  ///< Task execution has been started (set in BeginTask,
-                        ///< unset in ReschedulePeriodicTask)
-#define TASK_RUN_CTX_EXISTS \
-  BIT_OPT(clio::run::u32, 6)  ///< RunContext has been allocated for this task (set in
-                        ///< BeginTask, prevents duplicate BeginTask calls when
-                        ///< task is forwarded between workers)
+// Bit 5 retired: TASK_STARTED — now RunContext::started_.
+// (bit 6 retired: TASK_RUN_CTX_EXISTS — RunContext is now allocated exactly
+//  once by the inbound ipc_* transport's BeginTask, so no guard flag is needed)
 #define TASK_FIRE_AND_FORGET \
   BIT_OPT(clio::run::u32, 7)  ///< Task does not need a response. Wait/co_await return
                         ///< instantly; SendOut, ClientSend, and

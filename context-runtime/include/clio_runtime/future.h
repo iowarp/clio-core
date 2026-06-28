@@ -35,6 +35,7 @@
 #define CLIO_RUNTIME_INCLUDE_FUTURE_H_
 
 #include <coroutine>
+#include <memory>
 
 #include "clio_runtime/types.h"
 #include "clio_ctp/lightbeam/shm_transport.h"
@@ -53,26 +54,23 @@ struct RunContext;
 // ============================================================================
 
 /**
- * FutureShm - Fixed-size shared memory structure for task futures
+ * FutureShm - Fixed-size structure for task future state
  *
- * This structure contains metadata and a copy space buffer for task
- * serialization. The copy space is a flexible array member allocated as part of
- * the structure.
- *
- * Memory layout:
- * - Fixed-size header fields (pool_id, method_id, etc.)
- * - Flexible array: char copy_space[]
- *
- * Allocation: AllocateBuffer(sizeof(FutureShm) + copy_space_size)
+ * This structure contains task metadata and completion/transfer state. It is a
+ * plain fixed-size POD: the host-side Future owns it through a
+ * std::shared_ptr<FutureShm> (allocated with std::make_shared in the Future
+ * constructor), and device code references it via an offset-based ShmPtr. The
+ * former flexible-array `copy_space[]` member has been removed — the MPSC SHM
+ * transport carries serialized task bytes over the named MPSC server, not an
+ * inline copy buffer.
  */
 struct FutureShm {
   // Bitfield flags for flags_
   static constexpr u32 FUTURE_COMPLETE = 1; /**< Task execution is complete */
   static constexpr u32 FUTURE_NEW_DATA = 2; /**< New output data available */
-  static constexpr u32 FUTURE_COPY_FROM_CLIENT =
-      4; /**< Task needs to be copied from client serialization */
   static constexpr u32 FUTURE_WAS_COPIED =
-      8; /**< Task was already copied from client (don't re-copy) */
+      8; /**< Task arrived from an external client (response must be routed
+            back via a transport, not by resuming a parent coroutine) */
   static constexpr u32 FUTURE_DEVICE_SCOPE =
       16; /**< GPU->GPU path: use device-scope atomics (no system fence) */
   static constexpr u32 FUTURE_POD_COPY =
@@ -199,13 +197,8 @@ struct FutureShm {
    */
   uintptr_t gpu_fshm_device_ptr_;
 
-  /** Copy space for serialized task data (flexible array member).
-   *  Must be 4-byte aligned for WarpMemCpy uint32_t strided access. */
-  char copy_space[];
-
   /**
    * Default constructor - initializes fields
-   * Note: copy_space is allocated as part of the buffer, not separately
    */
   CTP_CROSS_FUN FutureShm() {
     pool_id_ = PoolId::GetNull();
@@ -225,6 +218,17 @@ struct FutureShm {
     gpu_task_size_ = 0;
     gpu_fshm_device_ptr_ = 0;
     flags_.Clear();
+  }
+
+  /**
+   * Parameterized constructor - initializes fields and stamps the task
+   * identity. Used by the Future constructor (via std::make_shared) so the
+   * pool/method are set at construction; transports then set origin_ and the
+   * client/waiter routing fields directly on the FutureShm.
+   */
+  CTP_CROSS_FUN FutureShm(PoolId pool_id, u32 method_id) : FutureShm() {
+    pool_id_ = pool_id;
+    method_id_ = method_id;
   }
 
   /**
@@ -281,8 +285,37 @@ class Future {
   /** FullPtr to the task (wraps private memory with null allocator) */
   ctp::ipc::FullPtr<TaskT> task_ptr_;
 
-  /** ShmPtr to the shared FutureShm object */
+  /**
+   * Handle to the FutureShm.
+   * Host: the Future OWNS the FutureShm via a std::shared_ptr created with
+   * std::make_shared in the parameterized constructor; copies/moves/Cast share
+   * the same object and the last owner frees it. Device: an offset-based ShmPtr
+   * (std::shared_ptr / make_shared are illegal in device code), unchanged.
+   */
+#if CTP_IS_HOST
+  std::shared_ptr<FutureT> future_shm_;
+#else
   ctp::ipc::ShmPtr<FutureT> future_shm_;
+#endif
+
+  /** Null-check on future_shm_ that works for both the shared_ptr (host) and
+   *  the ShmPtr (device) representations. */
+  CTP_CROSS_FUN bool FutureShmIsNull() const {
+#if CTP_IS_HOST
+    return future_shm_ == nullptr;
+#else
+    return future_shm_.IsNull();
+#endif
+  }
+
+  /** Null-out future_shm_ for both representations. */
+  CTP_CROSS_FUN void FutureShmSetNull() {
+#if CTP_IS_HOST
+    future_shm_ = nullptr;
+#else
+    future_shm_.SetNull();
+#endif
+  }
 
   /** Parent task RunContext pointer (nullptr if no parent waiting) */
   RunContext* parent_task_;
@@ -306,35 +339,59 @@ class Future {
 
  public:
   /**
-   * Constructor from ShmPtr<FutureShm> and FullPtr<Task>
-   * @param future_shm ShmPtr to existing FutureShm object
+   * Parameterized constructor (host) - creates and OWNS a fresh FutureShm.
+   *
+   * Allocates the FutureShm via std::make_shared (host-only — make_shared is
+   * illegal in device code) stamped with the task identity. The transport that
+   * builds the Future then sets origin_ and the client/waiter routing fields
+   * directly on GetFutureShm(). Copies/moves of this Future share ownership of
+   * the same FutureShm; the last owner frees it.
+   *
+   * @param pool_id Pool ID for the task
+   * @param method_id Method ID for the task
    * @param task_ptr FullPtr to the task (wraps private memory with null
    * allocator)
+   */
+#if CTP_IS_HOST
+  Future(PoolId pool_id, u32 method_id,
+         const ctp::ipc::FullPtr<TaskT>& task_ptr)
+      : future_shm_(std::make_shared<FutureT>(pool_id, method_id)),
+        parent_task_(nullptr),
+        consumed_(false) {
+    // Manually initialize task_ptr_ to avoid FullPtr copy constructor bug on
+    // GPU: copy shm_ directly, then reconstruct ptr_ from it.
+    task_ptr_.shm_ = task_ptr.shm_;
+    task_ptr_.ptr_ = task_ptr.ptr_;
+  }
+#endif
+
+#if !CTP_IS_HOST
+  /**
+   * Constructor from ShmPtr<FutureShm> and FullPtr<Task> (device).
+   * @param future_shm ShmPtr to existing FutureShm object
+   * @param task_ptr FullPtr to the task
    */
   CTP_CROSS_FUN Future(ctp::ipc::ShmPtr<FutureT> future_shm,
                         const ctp::ipc::FullPtr<TaskT>& task_ptr)
       : future_shm_(future_shm), parent_task_(nullptr), consumed_(false) {
-    // Manually initialize task_ptr_ to avoid FullPtr copy constructor bug on
-    // GPU Copy shm_ directly, then reconstruct ptr_ from it
     task_ptr_.shm_ = task_ptr.shm_;
     task_ptr_.ptr_ = task_ptr.ptr_;
   }
 
   /**
-   * Default constructor - creates null future
-   */
-  CTP_CROSS_FUN Future() : parent_task_(nullptr), consumed_(false) {}
-
-  /**
-   * Constructor from ShmPtr<FutureShm> - used by ring buffer deserialization
-   * Task pointer will be null and must be set later
+   * Constructor from ShmPtr<FutureShm> (device) - task pointer set later.
    * @param future_shm_ptr ShmPtr to FutureShm object
    */
   CTP_CROSS_FUN explicit Future(const ctp::ipc::ShmPtr<FutureT>& future_shm_ptr)
       : future_shm_(future_shm_ptr), parent_task_(nullptr), consumed_(false) {
-    // Task pointer starts null - will be set in ProcessNewTasks
     task_ptr_.SetNull();
   }
+#endif
+
+  /**
+   * Default constructor - creates null future
+   */
+  CTP_CROSS_FUN Future() : parent_task_(nullptr), consumed_(false) {}
 
   /**
    * Destructor - frees the task if this Future was consumed (via
@@ -414,7 +471,7 @@ class Future {
       parent_task_ = other.parent_task_;
       consumed_ = other.consumed_;
       other.task_ptr_.SetNull();
-      other.future_shm_.SetNull();
+      other.FutureShmSetNull();
       other.parent_task_ = nullptr;
       other.consumed_ = false;
     }
@@ -601,7 +658,7 @@ class Future {
    * Mark the task as complete
    */
   void Complete() {
-    if (!future_shm_.IsNull()) {
+    if (!FutureShmIsNull()) {
       auto future_shm = GetFutureShm();
       if (!future_shm.IsNull()) {
         future_shm->flags_.SetBits(FutureT::FUTURE_COMPLETE);
@@ -625,12 +682,27 @@ class Future {
    * @return ShmPtr to the FutureShm object
    */
   CTP_CROSS_FUN ctp::ipc::ShmPtr<FutureT> GetFutureShmPtr() const {
+#if CTP_IS_HOST
+    // Host owns the FutureShm via shared_ptr; synthesize a null-allocator
+    // ShmPtr whose offset is the raw address so .IsNull()/offset consumers
+    // keep working.
+    ctp::ipc::ShmPtr<FutureT> p;
+    if (future_shm_ == nullptr) {
+      p.SetNull();
+      return p;
+    }
+    p.alloc_id_.SetNull();
+    p.off_ = reinterpret_cast<size_t>(future_shm_.get());
+    return p;
+#else
     return future_shm_;
+#endif
   }
 
   /**
-   * Get the FutureShm FullPtr (for access to copy_space and flags_)
-   * Converts the internal ShmPtr to FullPtr using IpcManager
+   * Get the FutureShm as a FullPtr (for access to flags_ and routing fields).
+   * Host: wraps the shared_ptr's raw pointer with a null allocator. Device:
+   * resolves the ShmPtr offset.
    * @return FullPtr to the FutureShm object
    * Note: Implementation provided in ipc_manager.h where CLIO_IPC is defined
    */
@@ -641,7 +713,7 @@ class Future {
    * @return Pool ID for the task
    */
   PoolId GetPoolId() const {
-    if (future_shm_.IsNull()) {
+    if (FutureShmIsNull()) {
       return PoolId::GetNull();
     }
     auto future_shm = GetFutureShm();
@@ -656,7 +728,7 @@ class Future {
    * @param pool_id Pool ID to set
    */
   void SetPoolId(const PoolId& pool_id) {
-    if (!future_shm_.IsNull()) {
+    if (!FutureShmIsNull()) {
       auto future_shm = GetFutureShm();
       if (!future_shm.IsNull()) {
         future_shm->pool_id_ = pool_id;
@@ -717,7 +789,7 @@ class Future {
     // A null future (e.g. SendGpu allocation failure) is immediately ready
     // to prevent suspending with awaited_fshm_=nullptr, which would resume
     // the coroutine into a null task_ptr_ dereference.
-    if (future_shm_.IsNull() && task_ptr_.IsNull()) return true;
+    if (FutureShmIsNull() && task_ptr_.IsNull()) return true;
     if (IsComplete()) return true;
     if (!task_ptr_.IsNull() &&
         task_ptr_->task_flags_.Any(TASK_FIRE_AND_FORGET)) {
@@ -784,7 +856,7 @@ class Future {
       // Fire-and-forget: detach without destroying. The task is still
       // in-flight on the network; the remote EndTask will clean it up.
       task_ptr_.SetNull();
-      future_shm_.SetNull();
+      FutureShmSetNull();
       return;
     }
 #if CTP_IS_HOST

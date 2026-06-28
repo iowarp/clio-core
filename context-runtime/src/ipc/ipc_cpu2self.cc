@@ -42,8 +42,16 @@ Future<Task> IpcCpu2Self::SendIn(IpcManager *ipc,
                                       const ctp::ipc::FullPtr<Task> &task_ptr) {
   Worker *worker = CLIO_CUR_WORKER;
 
-  // Create pointer future (no serialization)
-  Future<Task> future = ipc->MakePointerFuture(task_ptr);
+  // Create pointer future (no serialization): the Future owns a fresh FutureShm
+  // via shared_ptr. Self-send origin is SHM and the task is a direct pointer
+  // (vaddr 0, no FUTURE_WAS_COPIED) so SendOut resumes the parent coroutine
+  // rather than routing a response back to a client.
+  Future<Task> future(task_ptr->pool_id_, task_ptr->method_, task_ptr);
+  {
+    auto fs = future.GetFutureShm();
+    fs->origin_ = FutureShm::FUTURE_CLIENT_SHM;
+    fs->client_task_vaddr_ = 0;
+  }
 
   if (worker != nullptr) {
     // Worker thread path: set parent RunContext so EndTask can resume parent
@@ -53,9 +61,7 @@ Future<Task> IpcCpu2Self::SendIn(IpcManager *ipc,
     }
 
     // Allocate RunContext before enqueueing
-    if (!task_ptr->task_flags_.Any(TASK_RUN_CTX_EXISTS)) {
-      ipc->BeginTask(future, nullptr, nullptr);
-    }
+    ipc->BeginTask(future, nullptr);
 
     // Use ClientMapTask to pick a lane and enqueue
     if (ipc->scheduler_ != nullptr) {
@@ -69,9 +75,7 @@ Future<Task> IpcCpu2Self::SendIn(IpcManager *ipc,
     }
   } else {
     // Non-worker thread path: full routing with force_enqueue
-    if (!task_ptr->task_flags_.Any(TASK_RUN_CTX_EXISTS)) {
-      ipc->BeginTask(future, nullptr, nullptr);
-    }
+    ipc->BeginTask(future, nullptr);
     ipc->RouteTask(future, /*force_enqueue=*/true);
   }
 

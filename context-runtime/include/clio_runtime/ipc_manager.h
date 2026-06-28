@@ -490,112 +490,11 @@ class IpcManager {
     return buffer.Cast<T>();
   }
 
-  /**
-   * Create Future by copying/serializing task
-   * Serializes the task into FutureShm's copy_space
-   *
-   * @tparam TaskT Task type (must derive from Task)
-   * @param task_ptr Task to serialize into Future
-   * @return Future<TaskT> with serialized task data
-   */
-  template <typename TaskT>
-  Future<TaskT> MakeCopyFuture(ctp::ipc::FullPtr<TaskT> task_ptr) {
-    if (task_ptr.IsNull()) {
-      return Future<TaskT>();
-    }
-
-    // Allocate FutureShm with copy_space (lightbeam handles the data transfer)
-    size_t copy_space_size = task_ptr->GetCopySpaceSize();
-    if (copy_space_size == 0) copy_space_size = KILOBYTES(4);
-    size_t alloc_size = sizeof(FutureShm) + copy_space_size;
-    ctp::ipc::FullPtr<char> buffer = AllocateBuffer(alloc_size);
-    if (buffer.IsNull()) {
-      return Future<TaskT>();
-    }
-
-    // Construct FutureShm in-place
-    FutureShm *future_shm_ptr = new (buffer.ptr_) FutureShm();
-    future_shm_ptr->pool_id_ = task_ptr->pool_id_;
-    future_shm_ptr->method_id_ = task_ptr->method_;
-    future_shm_ptr->origin_ = FutureShm::FUTURE_CLIENT_SHM;
-    future_shm_ptr->client_task_vaddr_ =
-        reinterpret_cast<uintptr_t>(task_ptr.ptr_);
-    future_shm_ptr->input_.copy_space_size_ = copy_space_size;
-    future_shm_ptr->flags_.SetBits(FutureShm::FUTURE_COPY_FROM_CLIENT);
-
-    // Create and return Future
-    ctp::ipc::ShmPtr<FutureShm> future_shm_shmptr =
-        buffer.shm_.template Cast<FutureShm>();
-    return Future<TaskT>(future_shm_shmptr, task_ptr);
-  }
-
-
-
-
-
-  /**
-   * Create Future by wrapping task pointer (runtime-only, no serialization)
-   * Used by runtime workers to avoid unnecessary copying
-   *
-   * @tparam TaskT Task type (must derive from Task)
-   * @param task_ptr Task to wrap in Future
-   * @return Future<TaskT> wrapping task pointer directly
-   */
-  template <typename TaskT>
-  Future<TaskT> MakePointerFuture(ctp::ipc::FullPtr<TaskT> task_ptr) {
-    // Check task_ptr validity
-    if (task_ptr.IsNull()) {
-      return Future<TaskT>();
-    }
-
-    // Allocate and construct FutureShm (no copy_space for runtime path)
-    ctp::ipc::FullPtr<FutureShm> future_shm = NewObj<FutureShm>();
-    if (future_shm.IsNull()) {
-      return Future<TaskT>();
-    }
-
-    // Initialize FutureShm fields
-    future_shm.ptr_->pool_id_ = task_ptr->pool_id_;
-    future_shm.ptr_->method_id_ = task_ptr->method_;
-    future_shm.ptr_->origin_ = FutureShm::FUTURE_CLIENT_SHM;
-    future_shm.ptr_->client_task_vaddr_ = 0;
-    // No copy_space in runtime path — ShmTransferInfo defaults are fine
-
-    // Create Future with ShmPtr and task_ptr (no serialization)
-    Future<TaskT> future(future_shm.shm_, task_ptr);
-    return future;
-  }
-
-  /**
-   * Create a Future for a task with optional serialization
-   * Used internally by Send and as a public interface for future creation
-   *
-   * Two execution paths:
-   * - Client thread (IsClientThread=true): Serialize the task into the Future
-   * - Runtime thread (IsClientThread=false): Wrap task_ptr directly without
-   * serialization
-   *
-   * @tparam TaskT Task type (must derive from Task)
-   * @param task_ptr Task to wrap in Future
-   * @return Future<TaskT> wrapping the task
-   */
-  template <typename TaskT>
-  Future<TaskT> MakeFuture(const ctp::ipc::FullPtr<TaskT> &task_ptr) {
-    bool is_runtime = CLIO_RUNTIME_MANAGER->IsRuntime();
-    Worker *worker = CLIO_CUR_WORKER;
-
-    // Runtime path requires BOTH IsRuntime AND worker to be non-null
-    bool use_runtime_path = is_runtime && worker != nullptr;
-
-    if (!use_runtime_path) {
-      // CLIENT PATH: Use MakeCopyFuture to serialize the task
-      return MakeCopyFuture(task_ptr);
-    } else {
-      // RUNTIME PATH: Use MakePointerFuture to wrap pointer without
-      // serialization
-      return MakePointerFuture(task_ptr);
-    }
-  }
+  // MakeCopyFuture / MakePointerFuture / MakeFuture have been removed. Futures
+  // are now constructed directly via the parameterized Future constructor
+  // (Future(pool_id, method_id, task_ptr)), which make_shares the FutureShm;
+  // each transport then sets origin_ and the routing fields on
+  // future.GetFutureShm(). See the ipc_* transports (SendIn/RecvIn).
 
   /**
    * Send task asynchronously (serializes into Future)
@@ -635,19 +534,6 @@ class IpcManager {
   }
 
 
-  /**
-   * Receive a task on the runtime side: deserialize from Future if needed.
-   * Handles origin-based dispatch (SHM, GPU2CPU, CPU2GPU, etc.).
-   *
-   * @param future Future containing the task
-   * @param container Container for deserialization
-   * @param method_id Method ID for task allocation
-   * @param recv_transport SHM transport for receiving serialized data
-   * @return FullPtr to the deserialized/retrieved task
-   */
-  ctp::ipc::FullPtr<Task> RecvRuntime(
-      Future<Task> &future, Container *container, u32 method_id,
-      ctp::lbm::Transport *recv_transport);
 
   /**
    * Send the runtime response back to the client after task execution.
@@ -669,7 +555,7 @@ class IpcManager {
    * @param container Container for the task (can be nullptr)
    * @param lane Lane for the task (can be nullptr)
    */
-  void BeginTask(Future<Task> &future, Container *container, TaskLane *lane);
+  void BeginTask(Future<Task> &future, TaskLane *lane);
 
   /** Route a task: resolve pool query, determine local vs global.
    * If force_enqueue is true, always enqueue to the destination worker's lane
@@ -1886,18 +1772,18 @@ namespace clio::run {
 template <typename TaskT, typename AllocT>
 CTP_CROSS_FUN Future<TaskT, AllocT>::~Future() {
   if (consumed_) {
-    // Clean up zero-copy response archive (TCP/IPC only, never used on GPU)
-    if (!future_shm_.IsNull()) {
+    // Clean up zero-copy response archive (TCP/IPC only, never used on GPU).
+    // The FutureShm itself is owned by the host shared_ptr and freed
+    // automatically when the last Future owner is destroyed — no manual
+    // FreeBuffer here.
+    if (!FutureShmIsNull()) {
 #if CTP_IS_HOST
-      ctp::ipc::FullPtr<FutureShm> fs = CLIO_CPU_IPC->ToFullPtr(future_shm_);
+      ctp::ipc::FullPtr<FutureShm> fs = GetFutureShm();
       if (!fs.IsNull() && (fs->origin_ == FutureShm::FUTURE_CLIENT_TCP ||
                            fs->origin_ == FutureShm::FUTURE_CLIENT_IPC)) {
         CLIO_CPU_IPC->CleanupResponseArchive(fs->client_task_vaddr_);
       }
-      // Free FutureShm (host only)
-      ctp::ipc::ShmPtr<char> buffer_shm = future_shm_.template Cast<char>();
-      CLIO_CPU_IPC->FreeBuffer(buffer_shm);
-      future_shm_.SetNull();
+      FutureShmSetNull();
 #endif
     }
     // Auto-free the task (only when consumed to avoid double-free
@@ -1910,18 +1796,20 @@ CTP_CROSS_FUN Future<TaskT, AllocT>::~Future() {
 template <typename TaskT, typename AllocT>
 CTP_CROSS_FUN ctp::ipc::FullPtr<typename Future<TaskT, AllocT>::FutureT>
 Future<TaskT, AllocT>::GetFutureShm() const {
-  if (future_shm_.IsNull()) {
+  if (FutureShmIsNull()) {
     return ctp::ipc::FullPtr<FutureT>();
   }
-#if CTP_IS_GPU
+#if CTP_IS_HOST
+  // Host owns the FutureShm via shared_ptr in private memory; wrap the raw
+  // pointer in a FullPtr with a null allocator (no ShmPtr/ToFullPtr resolution).
+  return ctp::ipc::FullPtr<FutureT>(future_shm_.get());
+#else
   // On device, ShmPtr::off_ already holds the resolved device-side address of
   // the FutureShm (the host pre-built the task+FutureShm pair in a registered
   // backend), so no allocator lookup / ToFullPtr is needed here — that path is
   // host-only. Mirrors gpu::Future::GetFutureShmPtrRaw().
   return ctp::ipc::FullPtr<FutureT>(
       reinterpret_cast<FutureT *>(future_shm_.off_.load()));
-#else
-  return CLIO_CPU_IPC->ToFullPtr(future_shm_);
 #endif
 }
 
@@ -1931,13 +1819,13 @@ Future<TaskT, AllocT>::GetFutureShm() const {
 
 template <typename TaskT, typename AllocT>
 CTP_CROSS_FUN bool Future<TaskT, AllocT>::IsComplete() const {
-  if (future_shm_.IsNull()) {
+  if (FutureShmIsNull()) {
     return false;
   }
 #if CTP_IS_GPU
   return IsCompleteGpu2Gpu();
 #else
-#if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM
+#if (CTP_ENABLE_CUDA || CTP_ENABLE_ROCM) && !CTP_IS_HOST
   if (future_shm_.alloc_id_ == FutureShm::GetCpu2GpuAllocId()) {
     return IsCompleteCpu2Gpu();
   }
@@ -1946,10 +1834,7 @@ CTP_CROSS_FUN bool Future<TaskT, AllocT>::IsComplete() const {
   if (future_shm.IsNull()) {
     return false;
   }
-  bool is_gpu_future =
-      future_shm->flags_.Any(FutureShm::FUTURE_COPY_FROM_CLIENT) &&
-      (future_shm->client_task_vaddr_ == 0);
-  if (is_gpu_future) {
+  if (future_shm->origin_ == FutureShm::FUTURE_CLIENT_GPU2CPU) {
     return IsCompleteGpu2Cpu();
   }
   return IsCompleteCpu2Cpu();
@@ -1977,8 +1862,9 @@ CTP_HOST_FUN bool Future<TaskT, AllocT>::IsCompleteGpu2Cpu() const {
 template <typename TaskT, typename AllocT>
 CTP_HOST_FUN bool Future<TaskT, AllocT>::IsCompleteCpu2Gpu() const {
 #if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM
-  // ShmPtr offset points to pinned-host gpu::FutureShm
-  void *host_fshm = reinterpret_cast<void *>(future_shm_.off_.load());
+  // ShmPtr offset points to pinned-host gpu::FutureShm. GetFutureShmPtr()
+  // exposes that offset for both the host shared_ptr and device ShmPtr forms.
+  void *host_fshm = reinterpret_cast<void *>(GetFutureShmPtr().off_.load());
   u32 flags_val = 0;
   size_t flags_offset = offsetof(gpu::FutureShm, flags_);
   ctp::GpuApi::Memcpy(
@@ -2013,13 +1899,13 @@ CTP_CROSS_FUN bool Future<TaskT, AllocT>::Wait(float max_sec,
 #if CTP_IS_GPU
   return WaitGpu2Gpu(max_sec, reuse_task);
 #else
-  if (task_ptr_.IsNull() || future_shm_.IsNull()) {
+  if (task_ptr_.IsNull() || FutureShmIsNull()) {
     return true;
   }
   // Fire-and-forget: return immediately without waiting.
   if (task_ptr_->task_flags_.Any(TASK_FIRE_AND_FORGET)) {
     task_ptr_.SetNull();
-    future_shm_.SetNull();
+    FutureShmSetNull();
     return true;
   }
 
@@ -2029,8 +1915,7 @@ CTP_CROSS_FUN bool Future<TaskT, AllocT>::Wait(float max_sec,
   // complete, fall through; the underlying recv will see the flag and
   // deserialize without blocking.
   if (max_sec == 0.0f) {
-    ctp::ipc::FullPtr<FutureShm> future_full_poll =
-        CLIO_CPU_IPC->ToFullPtr(future_shm_);
+    ctp::ipc::FullPtr<FutureShm> future_full_poll = GetFutureShm();
     if (future_full_poll.IsNull()) {
       return false;
     }
@@ -2042,7 +1927,7 @@ CTP_CROSS_FUN bool Future<TaskT, AllocT>::Wait(float max_sec,
 
   bool is_runtime = CLIO_RUNTIME_MANAGER->IsRuntime();
 
-#if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM
+#if (CTP_ENABLE_CUDA || CTP_ENABLE_ROCM) && !CTP_IS_HOST
   // CPU→GPU POD path: sentinel allocator ID marks device pointers.
   if (is_runtime &&
       future_shm_.alloc_id_ == FutureShm::GetCpu2GpuAllocId()) {
@@ -2051,9 +1936,9 @@ CTP_CROSS_FUN bool Future<TaskT, AllocT>::Wait(float max_sec,
 #endif
 
   // Resolve FutureShm for non-GPU paths
-  ctp::ipc::FullPtr<FutureShm> future_full = CLIO_CPU_IPC->ToFullPtr(future_shm_);
+  ctp::ipc::FullPtr<FutureShm> future_full = GetFutureShm();
   if (future_full.IsNull()) {
-    HLOG(kError, "Future::Wait: ToFullPtr returned null");
+    HLOG(kError, "Future::Wait: GetFutureShm returned null");
     return false;
   }
 
@@ -2062,10 +1947,7 @@ CTP_CROSS_FUN bool Future<TaskT, AllocT>::Wait(float max_sec,
   }
 
   // Client path: detect GPU-originated futures
-  bool is_gpu_future =
-      future_full->flags_.Any(FutureShm::FUTURE_COPY_FROM_CLIENT) &&
-      (future_full->client_task_vaddr_ == 0);
-  if (is_gpu_future) {
+  if (future_full->origin_ == FutureShm::FUTURE_CLIENT_GPU2CPU) {
     return WaitGpu2Cpu(max_sec, reuse_task);
   }
   return WaitCpu2Cpu(max_sec, reuse_task);
@@ -2107,8 +1989,7 @@ CTP_HOST_FUN bool Future<TaskT, AllocT>::WaitCpu2Cpu(float max_sec,
   bool is_runtime = CLIO_RUNTIME_MANAGER->IsRuntime();
   if (is_runtime) {
     // Runtime self-send: poll FUTURE_COMPLETE in SHM
-    ctp::ipc::FullPtr<FutureShm> future_full =
-        CLIO_CPU_IPC->ToFullPtr(future_shm_);
+    ctp::ipc::FullPtr<FutureShm> future_full = GetFutureShm();
     if (future_full.IsNull()) return false;
     bool ok = IpcCpu2Self::RecvOut(*this, max_sec, future_full);
     if (!ok) return false;
@@ -2131,10 +2012,9 @@ CTP_HOST_FUN bool Future<TaskT, AllocT>::WaitGpu2Cpu(float max_sec,
   // Host-side polling path (test harness): polls clio::run::FutureShm with
   // system-scope atomics. The GPU kernel uses IpcGpu2Cpu::RecvOut
   // (device-side) which polls gpu::FutureShm instead.
-  ctp::ipc::FullPtr<FutureShm> future_full =
-      CLIO_CPU_IPC->ToFullPtr(future_shm_);
+  ctp::ipc::FullPtr<FutureShm> future_full = GetFutureShm();
   if (future_full.IsNull()) {
-    HLOG(kError, "Future::WaitGpu2Cpu: ToFullPtr returned null");
+    HLOG(kError, "Future::WaitGpu2Cpu: GetFutureShm returned null");
     return false;
   }
   ctp::abitfield32_t &flags = future_full->flags_;
@@ -2152,18 +2032,11 @@ CTP_HOST_FUN bool Future<TaskT, AllocT>::WaitGpu2Cpu(float max_sec,
     }
   }
 
-  // Deserialize output from ring buffer if present
-  if (future_full->output_.total_written_.load() > 0) {
-    ctp::lbm::LbmContext ctx;
-    ctx.copy_space = future_full->copy_space;
-    ctx.shm_info_ = &future_full->output_;
-    clio::run::priv::vector<char> load_buf(CLIO_PRIV_ALLOC);
-    load_buf.reserve(256);
-    DefaultLoadArchive load_ar(load_buf);
-    load_ar.SetMsgType(LocalMsgType::kSerializeOut);
-    ctp::lbm::ShmTransport::Recv(load_ar, ctx);
-    task_ptr_->SerializeOut(load_ar);
-  }
+  // NOTE: the legacy GPU->CPU output ring-buffer deserialization read from the
+  // FutureShm's inline copy_space, which has been removed (the MPSC SHM
+  // transport carries output bytes over the named server instead). This
+  // host-side polling path is part of the deleted GPU-runtime concept and is
+  // retained only for compilation; output deserialization is a no-op here.
 
   if (reuse_task) task_ptr_.SetNull();
   Destroy(true);
@@ -2232,23 +2105,11 @@ CTP_CROSS_FUN void Future<TaskT, AllocT>::WaitRecv(float max_sec,
   if (fshm_full.IsNull()) return;
   auto *fshm = fshm_full.ptr_;
 
-  // Read output if any was written
-  size_t output_written = fshm->output_.total_written_.load_device();
-  if (output_written > 0) {
-    ctp::ipc::threadfence();
-
-    // Inline deserialization: create local buffer + archive
-    ctp::ipc::FullPtr<char> fp;
-    fp.ptr_ = fshm->copy_space;
-    fp.shm_.alloc_id_.SetNull();
-    fp.shm_.off_ = reinterpret_cast<size_t>(fp.ptr_);
-    ctp::priv::wrap_vector buffer;
-    buffer.set(fp, output_written);
-    buffer.resize(output_written);
-    GpuLoadTaskArchive load_ar(buffer);
-    load_ar.SetMsgType(LocalMsgType::kSerializeOut);
-    task_ptr_.ptr_->SerializeOut(load_ar);
-  }
+  // NOTE: the inline copy_space output buffer was removed from FutureShm; the
+  // device-side output deserialization that read from it is no longer
+  // applicable on clio::run::Future (gpu::Future handles the real GPU path).
+  // Retained only for compilation; reading output is a no-op here.
+  (void)fshm;
 
   // Cleanup
   Destroy(true);

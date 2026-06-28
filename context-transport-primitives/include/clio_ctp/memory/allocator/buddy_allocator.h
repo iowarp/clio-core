@@ -38,6 +38,7 @@
 #include "clio_ctp/memory/allocator/heap.h"
 #include "clio_ctp/data_structures/ipc/slist_pre.h"
 #include "clio_ctp/data_structures/ipc/rb_tree_pre.h"
+#include "clio_ctp/thread/lock/mutex.h"
 #include <cmath>
 #include <vector>
 
@@ -200,6 +201,14 @@ class _BuddyAllocator : public Allocator {
 
   ArenaState cur_arena_;  /**< Current bump arena (if active) */
 
+  // Serializes Allocate/Free. The free lists are intrusive slists with no
+  // internal synchronization; "kShared" only means position-independent
+  // (offset-based) nodes, NOT thread-safety. Concurrent allocators must hold
+  // this. (Thread-locality used to come from ProducerConsumerAllocator's
+  // per-thread PcThreadBlocks; this lock makes a single shared BuddyAllocator
+  // safe to use directly from many threads.)
+  ctp::Mutex lock_;
+
 #ifdef CTP_BUDDY_ALLOC_DEBUG
   size_t dbg_alloc_count_;
   size_t dbg_free_count_;
@@ -262,6 +271,7 @@ class _BuddyAllocator : public Allocator {
     big_heap_.Init(0, 0);
     small_arena_.Init(0, 0);
     cur_arena_ = ArenaState{};
+    lock_.Init();
     for (size_t i = 0; i < kMaxSmallPages; ++i) {
       small_pages_[i].Init();
     }
@@ -291,6 +301,7 @@ class _BuddyAllocator : public Allocator {
    * Allocate memory of specified size
    */
   CTP_CROSS_FUN OffsetPtr<> AllocateOffset(size_t requested_size) {
+    ScopedMutex guard(lock_, 0);
     // Fast path: bump-allocate from active arena
     if (cur_arena_.IsActive()) {
       constexpr size_t kAlign = 16;
@@ -373,6 +384,7 @@ class _BuddyAllocator : public Allocator {
    * Free previously allocated memory (without null check)
    */
   CTP_CROSS_FUN void FreeOffsetNoNullCheck(OffsetPtr<> offset) {
+    ScopedMutex guard(lock_, 0);
     size_t off = offset.load();
     // No-op for arena allocations
     if (cur_arena_.IsActive() &&

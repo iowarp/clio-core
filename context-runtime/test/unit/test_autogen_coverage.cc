@@ -13439,7 +13439,6 @@ TEST_CASE("Autogen - Task base operations", "[autogen][task][base]") {
     REQUIRE(task.pool_id_.IsNull());
     REQUIRE(task.method_ == 0);
     REQUIRE(!task.IsPeriodic());
-    REQUIRE(!task.IsRouted());
     REQUIRE(!task.IsDataOwner());
     REQUIRE(!task.IsRemote());
     REQUIRE(task.GetReturnCode() == 0);
@@ -13473,11 +13472,6 @@ TEST_CASE("Autogen - Task base operations", "[autogen][task][base]") {
     REQUIRE(task.IsPeriodic());
     task.ClearFlags(TASK_PERIODIC);
     REQUIRE(!task.IsPeriodic());
-
-    task.SetFlags(TASK_ROUTED);
-    REQUIRE(task.IsRouted());
-    task.ClearFlags(TASK_ROUTED);
-    REQUIRE(!task.IsRouted());
 
     task.SetFlags(TASK_DATA_OWNER);
     REQUIRE(task.IsDataOwner());
@@ -14109,29 +14103,25 @@ TEST_CASE("Autogen - CreateTaskId extended", "[autogen][types][createtaskid][ext
 TEST_CASE("Autogen - Task flag combinations", "[autogen][task][flags]") {
   SECTION("Multiple flags") {
     clio::run::Task task;
-    task.SetFlags(TASK_PERIODIC | TASK_ROUTED);
+    task.SetFlags(TASK_PERIODIC | TASK_REMOTE);
     REQUIRE(task.IsPeriodic());
-    REQUIRE(task.IsRouted());
+    REQUIRE(task.IsRemote());
     REQUIRE(!task.IsDataOwner());
-    REQUIRE(!task.IsRemote());
 
     task.ClearFlags(TASK_PERIODIC);
     REQUIRE(!task.IsPeriodic());
-    REQUIRE(task.IsRouted());
+    REQUIRE(task.IsRemote());
   }
 
   SECTION("All flags") {
     clio::run::Task task;
-    task.SetFlags(TASK_PERIODIC | TASK_ROUTED | TASK_DATA_OWNER | TASK_REMOTE | TASK_STARTED);
+    task.SetFlags(TASK_PERIODIC | TASK_DATA_OWNER | TASK_REMOTE);
     REQUIRE(task.IsPeriodic());
-    REQUIRE(task.IsRouted());
     REQUIRE(task.IsDataOwner());
     REQUIRE(task.IsRemote());
-    REQUIRE(task.task_flags_.Any(TASK_STARTED));
 
-    task.ClearFlags(TASK_PERIODIC | TASK_ROUTED | TASK_DATA_OWNER | TASK_REMOTE | TASK_STARTED);
+    task.ClearFlags(TASK_PERIODIC | TASK_DATA_OWNER | TASK_REMOTE);
     REQUIRE(!task.IsPeriodic());
-    REQUIRE(!task.IsRouted());
     REQUIRE(!task.IsDataOwner());
     REQUIRE(!task.IsRemote());
   }

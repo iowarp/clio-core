@@ -101,10 +101,10 @@ bool IpcGpu2Cpu::RecvIn(IpcManager *ipc, GpuTaskLane *gpu_lane, Worker *worker) 
 
   ctp::ipc::FullPtr<Task> task_full_ptr(task_raw);
 
-  Future<Task> future = ipc->MakePointerFuture(task_full_ptr);
+  Future<Task> future(pool_id, method_id, task_full_ptr);
   if (future.GetFutureShmPtr().IsNull()) {
     HLOG(kError,
-         "IpcGpu2Cpu::RecvIn: worker {} MakePointerFuture failed (pool={}, "
+         "IpcGpu2Cpu::RecvIn: worker {} Future construction failed (pool={}, "
          "method={})",
          worker_id, pool_id, method_id);
     if (!fshm_on_device) {
@@ -154,16 +154,9 @@ bool IpcGpu2Cpu::RecvIn(IpcManager *ipc, GpuTaskLane *gpu_lane, Worker *worker) 
     container->FixupAfterCopy(method_id, task_full_ptr);
   }
 
-  if (!task_full_ptr->task_flags_.Any(TASK_RUN_CTX_EXISTS)) {
-    ipc->BeginTask(future, container, worker->GetLane());
-  } else {
-    RunContext *run_ctx = task_full_ptr->GetRunCtx();
-    if (run_ctx) {
-      run_ctx->worker_id_ = worker_id;
-      run_ctx->lane_ = worker->GetLane();
-      run_ctx->event_queue_ = worker->GetEventQueue();
-    }
-  }
+  // Allocate the task's RunContext now that it is deserialized (bound to this
+  // worker, since gpu2cpu RecvIn runs on the worker that drains the GPU lane).
+  ipc->BeginTask(future, worker->GetLane());
 
   RouteResult route_result = ipc->RouteTask(future, /*force_enqueue=*/true);
   HLOG(kDebug,

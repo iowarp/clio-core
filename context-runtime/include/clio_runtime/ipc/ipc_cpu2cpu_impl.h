@@ -32,14 +32,11 @@ Future<TaskT> IpcCpu2Cpu::SendIn(IpcManager *ipc,
   task_ptr->task_id_.pid_ = static_cast<u32>(ctp::SystemInfo::GetPid());
   task_ptr->task_id_.tid_ = static_cast<u32>(ctp::SystemInfo::GetTid());
 
-  // FutureShm now lives in PRIVATE memory: the worker never touches it; the
-  // result returns over this client thread's MPSC server (clio-<pid>-<tid>).
-  ctp::ipc::FullPtr<char> buffer =
-      CTP_MALLOC->AllocateObjs<char>(sizeof(FutureShm));
-  if (buffer.IsNull()) return Future<TaskT>();
-  FutureShm *future_shm = new (buffer.ptr_) FutureShm();
-  future_shm->pool_id_ = task_ptr->pool_id_;
-  future_shm->method_id_ = task_ptr->method_;
+  // FutureShm now lives in PRIVATE memory owned by the Future's shared_ptr: the
+  // worker never touches it; the result returns over this client thread's MPSC
+  // server (clio-<pid>-<tid>).
+  Future<TaskT> future(task_ptr->pool_id_, task_ptr->method_, task_ptr);
+  FutureShm *future_shm = future.GetFutureShm().ptr_;
   future_shm->origin_ = FutureShm::FUTURE_CLIENT_SHM;
   future_shm->client_task_vaddr_ = net_key;
   // Ensure this thread's MPSC receive server exists before the response lands.
@@ -47,14 +44,12 @@ Future<TaskT> IpcCpu2Cpu::SendIn(IpcManager *ipc,
   future_shm->waiter_pid_ = static_cast<u32>(ctp::SystemInfo::GetPid());
   future_shm->waiter_tid_ = static_cast<u32>(ctp::SystemInfo::GetTid());
 
-  // Register for response matching.
+  // Register for response matching. The raw pointer stays valid as long as the
+  // returned Future (or a copy) is alive — the client holds it until Recv.
   {
     std::lock_guard<std::mutex> lock(ipc->pending_futures_mutex_);
     ipc->pending_zmq_futures_[net_key] = future_shm;
   }
-
-  auto future_shm_shmptr = buffer.shm_.template Cast<FutureShm>();
-  Future<TaskT> future(future_shm_shmptr, task_ptr);
 
   // Pick a worker and high-level Send the task to its server. The worker tid
   // comes from ClientConnect; the runtime pid keys the segment name.

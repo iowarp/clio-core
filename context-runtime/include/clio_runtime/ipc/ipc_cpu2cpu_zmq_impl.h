@@ -30,17 +30,9 @@ Future<TaskT> IpcCpu2CpuZmq::SendIn(IpcManager *ipc,
   archive.client_port_ = ipc->GetClientResponsePort();
   archive << (*task_ptr.ptr_);
 
-  // Allocate FutureShm via CTP_MALLOC (no copy_space needed)
-  size_t alloc_size = sizeof(FutureShm);
-  ctp::ipc::FullPtr<char> buffer = CTP_MALLOC->AllocateObjs<char>(alloc_size);
-  if (buffer.IsNull()) {
-    HLOG(kError, "SendZmq: Failed to allocate FutureShm ({} bytes)",
-         alloc_size);
-    return Future<TaskT>();
-  }
-  FutureShm *future_shm = new (buffer.ptr_) FutureShm();
-  future_shm->pool_id_ = task_ptr->pool_id_;
-  future_shm->method_id_ = task_ptr->method_;
+  // The Future owns a fresh FutureShm via shared_ptr (private memory).
+  Future<TaskT> future(task_ptr->pool_id_, task_ptr->method_, task_ptr);
+  FutureShm *future_shm = future.GetFutureShm().ptr_;
   future_shm->origin_ = (mode == IpcMode::kTcp)
                             ? FutureShm::FUTURE_CLIENT_TCP
                             : FutureShm::FUTURE_CLIENT_IPC;
@@ -65,9 +57,7 @@ Future<TaskT> IpcCpu2CpuZmq::SendIn(IpcManager *ipc,
     ipc->zmq_transport_->Send(archive, ctp::lbm::LbmContext());
   }
 
-  ctp::ipc::ShmPtr<FutureShm> future_shm_shmptr =
-      buffer.shm_.template Cast<FutureShm>();
-  return Future<TaskT>(future_shm_shmptr, task_ptr);
+  return future;
 }
 
 template <typename TaskT>

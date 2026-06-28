@@ -2828,8 +2828,7 @@ void IpcManager::FreeGpuBackend(u32 gpu_id,
 }
 #endif  // CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL
 
-void IpcManager::BeginTask(Future<Task> &future, Container *container,
-                           TaskLane *lane) {
+void IpcManager::BeginTask(Future<Task> &future, TaskLane *lane) {
   FullPtr<Task> task_ptr = future.GetTaskPtr();
   if (task_ptr.IsNull()) {
     HLOG(kError, "BeginTask: task_ptr is null!");
@@ -2837,8 +2836,14 @@ void IpcManager::BeginTask(Future<Task> &future, Container *container,
   }
 #if CTP_IS_HOST
   Worker *worker = CLIO_CUR_WORKER;
+  // Resolve the container from the task's pool (callers no longer pass it).
+  Container *container =
+      CLIO_POOL_MANAGER->GetStaticContainer(task_ptr->pool_id_);
 
-  // Initialize or reset the task's owned RunContext
+  // Replace any existing RunContext, then allocate this task's owned one.
+  // The defensive DestroyRunCtx keeps a double-begin (e.g. a re-received remote
+  // task) from leaking the prior RunContext.
+  task_ptr->DestroyRunCtx();
   task_ptr->SetRunCtx(new RunContext());
   RunContext *run_ctx = task_ptr->GetRunCtx();
 
@@ -2875,9 +2880,6 @@ void IpcManager::BeginTask(Future<Task> &future, Container *container,
     run_ctx->predicted_stat_ = container->GetTaskStats(task_ptr.ptr_);
   }
 
-  // Mark that RunContext now exists for this task
-  task_ptr->SetFlags(TASK_RUN_CTX_EXISTS);
-
   // NOTE: Do NOT call SetCurrentRunContext here. BeginTask may be called
   // from SendRuntimeClient inside a running coroutine. Overwriting the
   // current RunContext would cause await_suspend_impl to store the parent
@@ -2899,7 +2901,7 @@ RouteResult IpcManager::RouteTask(Future<Task> &future, bool force_enqueue) {
   }
 
   // Check if task has already been routed - if so, return ExecHere
-  if (task_ptr->IsRouted()) {
+  if (RunContext *rc = task_ptr->GetRunCtx(); rc && rc->IsRouted()) {
     return RouteResult::ExecHere;
   }
 
@@ -2982,7 +2984,7 @@ RouteResult IpcManager::RouteManyToOne(Future<Task> &future) {
     // batch flusher aggregates, runs once, and completes each member later.
     // RouteResult::Local tells the worker the task is owned elsewhere now and
     // must not be executed here.
-    task_ptr->SetFlags(TASK_ROUTED);
+    if (RunContext *rc = task_ptr->GetRunCtx()) rc->SetRouted();
     batch_manager_->Add(task_ptr);
     return RouteResult::Local;
   }
@@ -3072,7 +3074,7 @@ RouteResult IpcManager::RouteLocal(Future<Task> &future, bool force_enqueue) {
   FullPtr<Task> task_ptr = future.GetTaskPtr();
 
   // Mark as routed so the task is not re-routed on subsequent passes.
-  task_ptr->SetFlags(TASK_ROUTED);
+  if (RunContext *rc = task_ptr->GetRunCtx()) rc->SetRouted();
 
   // Resolve the actual execution container
   auto *pool_manager = CLIO_POOL_MANAGER;
@@ -3161,7 +3163,7 @@ RouteResult IpcManager::RouteGlobal(Future<Task> &future,
   EnqueueNetTask(future, sendin_prio);
 
   // Set TASK_ROUTED flag on original task
-  task_ptr->SetFlags(TASK_ROUTED);
+  if (RunContext *rc = task_ptr->GetRunCtx()) rc->SetRouted();
 
   Worker *worker = CLIO_CUR_WORKER;
   HLOG(kDebug, "Worker {}: RouteGlobal - task enqueued to net_queue",
@@ -3391,30 +3393,6 @@ std::vector<PoolQuery> IpcManager::ResolvePhysicalQuery(
   return {query};
 }
 
-ctp::ipc::FullPtr<Task> IpcManager::RecvRuntime(
-    Future<Task> &future, Container *container, u32 method_id,
-    ctp::lbm::Transport *recv_transport) {
-  auto future_shm = future.GetFutureShm();
-
-  // Self-send path: no deserialization needed
-  if (!future_shm->flags_.Any(FutureShm::FUTURE_COPY_FROM_CLIENT) ||
-      future_shm->flags_.Any(FutureShm::FUTURE_WAS_COPIED)) {
-    return IpcCpu2Self::RecvIn(future);
-  }
-
-  u32 origin = future_shm->origin_;
-  switch (origin) {
-#if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL
-    case FutureShm::FUTURE_CLIENT_GPU2CPU:
-      return IpcGpu2Cpu::RecvIn(this, future, container,
-                                      method_id, recv_transport);
-#endif
-    case FutureShm::FUTURE_CLIENT_SHM:
-    default:
-      return IpcCpu2Cpu::RecvIn(this, future, container,
-                                      method_id, recv_transport);
-  }
-}
 
 void IpcManager::SendRuntime(
     const FullPtr<Task> &task_ptr, RunContext *run_ctx,

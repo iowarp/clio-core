@@ -111,10 +111,10 @@ bool IpcCpu2CpuZmq::RecvIn(IpcManager *ipc, u32 &tasks_received) {
         task_ptr->SetFlags(TASK_DATA_OWNER);
       }
 
-      // Create FutureShm for the task (server-side)
-      ctp::ipc::FullPtr<FutureShm> future_shm = ipc->NewObj<FutureShm>();
-      future_shm->pool_id_ = pool_id;
-      future_shm->method_id_ = method_id;
+      // Create the Future (owns the FutureShm via shared_ptr; pushing onto the
+      // lane copies it so the FutureShm outlives this scope).
+      Future<Task> future(pool_id, method_id, task_ptr);
+      auto future_shm = future.GetFutureShm();
       future_shm->origin_ = (mode == IpcMode::kTcp)
                                 ? FutureShm::FUTURE_CLIENT_TCP
                                 : FutureShm::FUTURE_CLIENT_IPC;
@@ -183,8 +183,11 @@ bool IpcCpu2CpuZmq::RecvIn(IpcManager *ipc, u32 &tasks_received) {
       // Mark as copied so EndTask routes back via lightbeam
       future_shm->flags_.SetBits(FutureShm::FUTURE_WAS_COPIED);
 
-      // Create Future and enqueue to worker lane
-      Future<Task> future(future_shm.shm_, task_ptr);
+      // Allocate the task's RunContext now that it is deserialized, before it
+      // is enqueued (the worker no longer does this).
+      ipc->BeginTask(future, nullptr);
+
+      // Enqueue to worker lane
       LaneId lane_id =
           ipc->GetScheduler()->ClientMapTask(ipc, future);
       auto *worker_queues = ipc->GetTaskQueue();
@@ -347,15 +350,10 @@ bool IpcCpu2CpuZmq::SendOut(
         }
       }
 
-      // Free the server-side FutureShm allocated for this inbound request in
-      // RecvIn (NewObj<FutureShm>()). The queued Future here is never
-      // consumed_, so ~Future() never runs its FutureShm-free path; without
-      // this every cross-process RPC leaks one FutureShm. CleanupResponseArchive
-      // is intentionally not called — that map is client-side only (see
-      // ipc_cpu2cpu_zmq_impl.h RecvIn); on the server it would be a no-op.
-      if (!future_shm.IsNull()) {
-        ipc->FreeBuffer(future_shm.Cast<char>());
-      }
+      // The server-side FutureShm is owned by the queued Future's shared_ptr
+      // (created in RecvIn); when queued_future goes out of scope at the end of
+      // this loop iteration the FutureShm is freed automatically. No manual
+      // FreeBuffer is needed (and CleanupResponseArchive is client-side only).
 
       did_work = true;
       tasks_sent++;

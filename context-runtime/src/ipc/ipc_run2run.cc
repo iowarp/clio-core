@@ -317,19 +317,10 @@ void IpcManagerRun2Run::SendOut(ctp::ipc::FullPtr<clio::run::Task> origin_task) 
     return;
   }
 
-  // Capture the recv-side FutureShm before DelTask frees the task/RunContext.
-  // RecvInHandleOne created it via MakePointerFuture (NewObj<FutureShm> from the
-  // runtime's private CTP_MALLOC heap) and stored it in this task's RunContext.
-  // Unlike a client-origin Future it is never consumed_, so ~Future() never
-  // frees it; without the explicit FreeBuffer below every cross-node RPC leaks
-  // one FutureShm — the run2run analog of the cpu2cpu leak fixed in #560. The
-  // resolved FullPtr stays valid after DelTask (it points at the CTP_MALLOC
-  // buffer, which DelTask does not touch).
-  ctp::ipc::FullPtr<clio::run::FutureShm> recv_future_shm;
-  if (clio::run::RunContext *run_ctx = origin_task->GetRunCtx()) {
-    recv_future_shm = run_ctx->future_.GetFutureShm();
-  }
-
+  // The recv-side FutureShm is owned by the Future's shared_ptr (created in
+  // RecvInHandleOne and stored in this task's RunContext). It is freed
+  // automatically when the RunContext (and its Future copy) is destroyed by
+  // DelTask below — no manual capture/FreeBuffer needed.
   size_t recv_key = origin_task->task_id_.net_key_ ^
                     (static_cast<size_t>(origin_task->task_id_.replica_id_) *
                      0x9e3779b97f4a7c15ULL);
@@ -361,12 +352,6 @@ void IpcManagerRun2Run::SendOut(ctp::ipc::FullPtr<clio::run::Task> origin_task) 
                            target_host);
   if (rc == 0) {
     container->DelTask(origin_task->method_, origin_task);
-    // Free the recv-side FutureShm captured above (see comment). Only on
-    // success: on failure SendOutTransmit re-queued the task for retry, so its
-    // FutureShm must stay alive.
-    if (!recv_future_shm.IsNull()) {
-      ipc_manager->FreeBuffer(recv_future_shm.Cast<char>());
-    }
   }
 }
 
@@ -409,8 +394,9 @@ bool IpcManagerRun2Run::RecvInHandleOne(
     set_flags |= TASK_DATA_OWNER;
   }
   task_ptr->SetFlags(set_flags);
-  task_ptr->ClearFlags(TASK_PERIODIC | TASK_ROUTED | TASK_RUN_CTX_EXISTS |
-                       TASK_STARTED);
+  // routed_/started_ are fresh per-RunContext (BeginTask below); only the
+  // serialized TASK_PERIODIC flag needs resetting on receive.
+  task_ptr->ClearFlags(TASK_PERIODIC);
 
   size_t recv_key =
       task_ptr->task_id_.net_key_ ^
@@ -423,9 +409,10 @@ bool IpcManagerRun2Run::RecvInHandleOne(
   HLOG(kDebug, "[RecvIn] Task {} method={} pool_id={} dispatching to workers",
        task_ptr->task_id_, task_ptr->method_, task_ptr->pool_id_);
 
-  clio::run::Future<clio::run::Task> future = ipc_manager->MakePointerFuture(task_ptr);
+  clio::run::Future<clio::run::Task> future(task_ptr->pool_id_,
+                                            task_ptr->method_, task_ptr);
   if (future.GetFutureShm().IsNull()) {
-    HLOG(kError, "[RecvIn] MakePointerFuture failed for task {}",
+    HLOG(kError, "[RecvIn] Future construction failed for task {}",
          task_ptr->task_id_);
     return false;
   }
@@ -446,10 +433,9 @@ bool IpcManagerRun2Run::RecvInHandleOne(
     }
   }
 
-  if (!task_ptr->task_flags_.Any(TASK_RUN_CTX_EXISTS)) {
-    ipc_manager->BeginTask(future, container, nullptr);
-  }
-  task_ptr->SetFlags(TASK_ROUTED);
+  // Allocate the task's RunContext now that it is deserialized.
+  ipc_manager->BeginTask(future, nullptr);
+  if (RunContext *rc = task_ptr->GetRunCtx()) rc->SetRouted();
 
   if (ipc_manager->GetScheduler() != nullptr) {
     clio::run::u32 lane_id =

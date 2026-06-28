@@ -340,11 +340,6 @@ class Task {
     return task_flags_.Any(TASK_PERIODIC);
   }
 
-  /**
-   * Check if task has been routed
-   * @return true if task has routed flag set
-   */
-  CTP_CROSS_FUN bool IsRouted() const { return task_flags_.Any(TASK_ROUTED); }
 
   /**
    * Check if task is the data owner
@@ -529,16 +524,6 @@ class Task {
   }
 
   /**
-   * Get the copy space size for serialized task output
-   * Derived classes can override to specify custom copy space sizes
-   * Default is 4KB (4096 bytes) for most tasks
-   * @return Size in bytes for the serialized_task_ capacity
-   */
-  CTP_CROSS_FUN size_t GetCopySpaceSize() const {
-    return 4096;  // Default 4KB for most tasks
-  }
-
-  /**
    * Fix up internal pointers after a cudaMemcpy/memcpy (POD copy path).
    * Override in tasks that contain priv::vector or other pointer-bearing
    * fields to re-seat inline (SVO) pointers to the new host address.
@@ -668,6 +653,8 @@ struct RunContext {
   std::atomic<bool> coro_completed_;
   double true_period_ns_;         /**< Original period from task->period_ns_ */
   bool did_work_;            /**< Whether task did work in last execution */
+  bool routed_ = false;     /**< RouteTask has placed this task (was TASK_ROUTED) */
+  bool started_ = false;    /**< Execution has begun (was TASK_STARTED) */
   ctp::CpuTimer cpu_timer_; /**< Accumulates thread CPU time across yields */
   float predicted_load_ = 0; /**< Predicted CPU time from InferModel (us) */
   ctp::HighResMonotonicTimer wall_timer_; /**< Wall clock time across yields */
@@ -714,6 +701,8 @@ struct RunContext {
         coro_completed_(other.coro_completed_.load()),
         true_period_ns_(other.true_period_ns_),
         did_work_(other.did_work_),
+        routed_(other.routed_),
+        started_(other.started_),
         cpu_timer_(other.cpu_timer_),
         predicted_load_(other.predicted_load_),
         wall_timer_(other.wall_timer_),
@@ -750,6 +739,8 @@ struct RunContext {
       coro_completed_.store(other.coro_completed_.load());
       true_period_ns_ = other.true_period_ns_;
       did_work_ = other.did_work_;
+      routed_ = other.routed_;
+      started_ = other.started_;
       cpu_timer_ = other.cpu_timer_;
       predicted_load_ = other.predicted_load_;
       wall_timer_ = other.wall_timer_;
@@ -768,6 +759,18 @@ struct RunContext {
   // Delete copy constructor and copy assignment
   RunContext(const RunContext&) = delete;
   RunContext& operator=(const RunContext&) = delete;
+
+  // Execution-lifecycle flag accessors. These hold per-execution state that
+  // used to live in Task::task_flags_ (TASK_ROUTED / TASK_STARTED) but is
+  // runtime-local and must not be serialized with the task.
+  bool IsRouted() const { return routed_; }
+  void SetRouted(bool v = true) { routed_ = v; }
+  bool IsStarted() const { return started_; }
+  void SetStarted(bool v = true) { started_ = v; }
+  bool IsYielded() const { return is_yielded_; }
+  void SetYielded(bool v = true) { is_yielded_ = v; }
+  bool DidWork() const { return did_work_; }
+  void SetDidWork(bool v = true) { did_work_ = v; }
 
   /**
    * Clear all STL containers for reuse

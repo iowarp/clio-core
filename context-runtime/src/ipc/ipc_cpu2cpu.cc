@@ -42,9 +42,11 @@ bool IpcCpu2Cpu::RecvIn(IpcManager *ipc, TaskLane *lane) {
     return false;
   }
   tp->SetFlags(TASK_EXTERNAL_CLIENT);
-  ctp::ipc::FullPtr<FutureShm> fs = ipc->NewObj<FutureShm>();
-  fs->pool_id_ = ti.pool_id_;
-  fs->method_id_ = ti.method_id_;
+  // The Future owns the FutureShm via shared_ptr; pushing it onto the lane
+  // copies the Future, so the FutureShm stays alive until the worker (and its
+  // RunContext copy) is done with it.
+  Future<Task> f(ti.pool_id_, ti.method_id_, tp);
+  auto fs = f.GetFutureShm();
   fs->origin_ = FutureShm::FUTURE_CLIENT_SHM;
   fs->client_task_vaddr_ = ti.task_id_.net_key_;
   fs->client_pid_ = ti.task_id_.pid_;
@@ -53,7 +55,9 @@ bool IpcCpu2Cpu::RecvIn(IpcManager *ipc, TaskLane *lane) {
   fs->waiter_pid_ = ti.task_id_.pid_;
   fs->waiter_tid_ = ti.task_id_.tid_;
   fs->flags_.SetBits(FutureShm::FUTURE_WAS_COPIED);
-  Future<Task> f(fs.shm_, tp);
+  // Allocate the task's RunContext now that it is deserialized, before it is
+  // visible on the lane (the worker no longer does this).
+  ipc->BeginTask(f, lane);
   lane->Push(f);
   return true;
 }
@@ -61,47 +65,15 @@ bool IpcCpu2Cpu::RecvIn(IpcManager *ipc, TaskLane *lane) {
 ctp::ipc::FullPtr<Task> IpcCpu2Cpu::RecvIn(
     IpcManager *ipc, Future<Task> &future, Container *container,
     u32 method_id, ctp::lbm::Transport *recv_transport) {
-  auto future_shm = future.GetFutureShm();
-  FullPtr<Task> task_full_ptr = future.GetTaskPtr();
-
-  // Only deserialize if task was copied from client and not yet processed
-  if (!future_shm->flags_.Any(FutureShm::FUTURE_COPY_FROM_CLIENT) ||
-      future_shm->flags_.Any(FutureShm::FUTURE_WAS_COPIED)) {
-    return task_full_ptr;
-  }
-
-  // Build SHM context for transfer
-  ctp::lbm::LbmContext ctx;
-  ctx.copy_space = future_shm->copy_space;
-  ctx.shm_info_ = &future_shm->input_;
-
-  // Detect legacy GPU->CPU tasks by client_task_vaddr_ == 0
-  bool is_gpu_task = (future_shm->client_task_vaddr_ == 0);
-  if (is_gpu_task) {
-    clio::run::priv::vector<char> recv_buf(CLIO_PRIV_ALLOC);
-    recv_buf.reserve(256);
-    DefaultLoadArchive local_archive(recv_buf);
-    recv_transport->Recv(local_archive, ctx);
-    task_full_ptr = container->LocalAllocLoadTask(method_id, local_archive);
-  } else {
-    // Normal CPU->CPU SHM path: cereal serialization
-    LoadTaskArchive archive;
-    recv_transport->Recv(archive, ctx);
-    task_full_ptr = container->AllocLoadTask(method_id, archive);
-  }
-
-  // This task came straight from an external user client (the
-  // FUTURE_COPY_FROM_CLIENT guard above), so tag it for per-RPC access control.
-  // The flag is serialized in SerializeIn, so it survives if the task is later
-  // forwarded to a remote container owner.
-  if (!task_full_ptr.IsNull()) {
-    task_full_ptr->SetFlags(TASK_EXTERNAL_CLIENT);
-  }
-
-  // Update the Future's task pointer and mark as copied
-  future.GetTaskPtr() = task_full_ptr;
-  future_shm->flags_.SetBits(FutureShm::FUTURE_WAS_COPIED);
-  return task_full_ptr;
+  // The inbound MPSC SHM drain (the RecvIn(ipc, lane) overload above) already
+  // deserialized the task from the client's serialized bytes and stamped the
+  // Future's task pointer before enqueuing it. There is no inline copy_space to
+  // deserialize from here, so just return the already-resolved task pointer.
+  (void)ipc;
+  (void)container;
+  (void)method_id;
+  (void)recv_transport;
+  return future.GetTaskPtr();
 }
 
 void IpcCpu2Cpu::SendOut(

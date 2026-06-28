@@ -307,7 +307,8 @@ class Worker {
 
   /**
    * Process a single task from a GPU lane.
-   * Pops from the lane and invokes RecvRuntime for deserialization.
+   * Pops from the lane; the task pointer is already resolved by the inbound
+   * Ipc call that enqueued it.
    * @param gpu_lane TaskLane to poll
    * @return true if a task was processed
    */
@@ -375,18 +376,6 @@ class Worker {
    * @return true if a task was processed, false if lane was empty
    */
   bool ProcessNewTask(TaskLane *lane);
-
-  /**
-   * Get task pointer from Future, copying from client if needed
-   * Deserializes task if FUTURE_COPY_FROM_CLIENT flag is set
-   * @param future Future object containing FutureShm
-   * @param container Container to allocate task in
-   * @param method_id Method ID for task creation
-   * @return FullPtr to task (either existing or newly deserialized)
-   */
-  ctp::ipc::FullPtr<Task> GetOrCopyTaskFromFuture(Future<Task> &future,
-                                               Container *container,
-                                               u32 method_id);
 
   /**
    * Get the time remaining before the next periodic task should resume

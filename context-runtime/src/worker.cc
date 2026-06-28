@@ -386,13 +386,6 @@ bool Worker::ProcessNewTaskGpu(GpuTaskLane *gpu_lane) {
 #endif
 }
 
-ctp::ipc::FullPtr<Task> Worker::GetOrCopyTaskFromFuture(Future<Task> &future,
-                                                    Container *container,
-                                                    u32 method_id) {
-  return CLIO_IPC->RecvRuntime(future, container, method_id,
-                              shm_recv_transport_.get());
-}
-
 u32 Worker::ProcessNewTasks(TaskLane *lane) {
   const u32 MAX_TASKS_PER_ITERATION = 16;
   u32 tasks_processed = 0;
@@ -448,11 +441,11 @@ bool Worker::ProcessNewTask(TaskLane *lane) {
     return true;
   }
 
-  // Get or copy task from Future (handles deserialization if needed)
-  FullPtr<Task> task_full_ptr =
-      GetOrCopyTaskFromFuture(future, container, method_id);
+  // The Ipc call that enqueued this task onto the lane already deserialized /
+  // copied it, so the Future's task pointer is already resolved — just read it.
+  FullPtr<Task> task_full_ptr = future.GetTaskPtr();
 
-  // Check if task deserialization failed
+  // Check if the task pointer is missing (enqueue bug / failed deserialize)
   if (task_full_ptr.IsNull()) {
     HLOG(kError,
          "Worker {}: Failed to deserialize task for pool_id={}, method={}",
@@ -462,19 +455,15 @@ bool Worker::ProcessNewTask(TaskLane *lane) {
     return true;
   }
 
-  // Allocate RunContext before routing (skip if already created)
-  if (!task_full_ptr->task_flags_.Any(TASK_RUN_CTX_EXISTS)) {
-    CLIO_IPC->BeginTask(future, container, lane);
-  } else {
-    // Task was re-enqueued from another worker (e.g., by RouteLocal).
-    // Update worker-specific RunContext fields to match this worker,
-    // so subtask completion events go to the correct event queue.
-    RunContext *run_ctx = task_full_ptr->GetRunCtx();
-    if (run_ctx) {
-      run_ctx->worker_id_ = worker_id_;
-      run_ctx->lane_ = lane;
-      run_ctx->event_queue_ = event_queue_;
-    }
+  // The inbound Ipc transport allocated this task's RunContext at deserialize
+  // time (BeginTask). Bind it to THIS worker/lane so subtask completion events
+  // go to the right event queue — this also covers tasks re-enqueued across
+  // workers by RouteLocal.
+  RunContext *run_ctx = task_full_ptr->GetRunCtx();
+  if (run_ctx) {
+    run_ctx->worker_id_ = worker_id_;
+    run_ctx->lane_ = lane;
+    run_ctx->event_queue_ = event_queue_;
   }
 
   // Route task using consolidated routing function
@@ -482,9 +471,9 @@ bool Worker::ProcessNewTask(TaskLane *lane) {
   RouteResult route_result = CLIO_IPC->RouteTask(future);
   if (route_result == RouteResult::ExecHere) {
 #if CTP_IS_HOST
-    // Re-fetch task pointer from future in case RouteTask changed it
-    RunContext *run_ctx = task_full_ptr->GetRunCtx();
-    bool is_started = task_full_ptr->task_flags_.Any(TASK_STARTED);
+    // Re-fetch in case RouteTask changed the task's RunContext.
+    run_ctx = task_full_ptr->GetRunCtx();
+    bool is_started = run_ctx && run_ctx->IsStarted();
     ExecTask(task_full_ptr, run_ctx, is_started);
 #endif
   }
@@ -933,7 +922,7 @@ void Worker::ExecTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
     ResumeCoroutine(task_ptr, run_ctx);
   } else {
     StartCoroutine(task_ptr, run_ctx);
-    task_ptr->SetFlags(TASK_STARTED);
+    run_ctx->SetStarted();
 
     // Predict load for new tasks. predicted_stat_ is populated by
     // BeginTask via container->GetTaskStats(task), so derive the model
@@ -1117,7 +1106,7 @@ void Worker::ProcessBlockedQueue(std::queue<RunContext *> &queue,
 
     // Determine if this is a resume (task was started before) or first
     // execution
-    bool is_started = run_ctx->task_->task_flags_.Any(TASK_STARTED);
+    bool is_started = run_ctx->IsStarted();
 
     // Skip if task was started but coroutine already completed
     // This can happen with orphan events from parallel subtasks. Use the
@@ -1181,14 +1170,14 @@ void Worker::ProcessPeriodicQueue(std::queue<RunContext *> &queue,
     double elapsed_us = run_ctx->block_start_.GetUsecFromStart(batch_timestamp);
     if (elapsed_us + 2000.0 >= run_ctx->yield_time_us_) {
       // Time threshold reached (within tolerance) - execute the task
-      bool is_started = run_ctx->task_->task_flags_.Any(TASK_STARTED);
+      bool is_started = run_ctx->IsStarted();
 
       // CRITICAL: Clear the is_yielded_ flag before resuming the task
       // This allows the task to call Wait() again if needed
       run_ctx->is_yielded_ = false;
 
-      // For periodic tasks, unmark TASK_ROUTED and route again
-      run_ctx->task_->ClearFlags(TASK_ROUTED);
+      // For periodic tasks, unmark routed and route again
+      run_ctx->SetRouted(false);
       Container *container = run_ctx->container_;
 
       // Use batch timestamp for rescheduling to prevent desynchronization
@@ -1398,9 +1387,9 @@ void Worker::ProcessRetryQueue() {
       continue;  // Skip invalid entries
     }
 
-    // Clear TASK_ROUTED so RouteTask re-evaluates.
+    // Clear routed so RouteTask re-evaluates.
     // RouteTask handles Retry/Dne internally via AddToRetryQueue.
-    task_ptr->ClearFlags(TASK_ROUTED);
+    if (RunContext *rc = task_ptr->GetRunCtx()) rc->SetRouted(false);
     RouteResult result =
         CLIO_IPC->RouteTask(run_ctx->future_, /*force_enqueue=*/true);
     if (result == RouteResult::ExecHere) {
@@ -1430,8 +1419,8 @@ void Worker::ReschedulePeriodicTask(RunContext *run_ctx,
     return;
   }
 
-  // Unset TASK_STARTED when rescheduling periodic task
-  task_ptr->ClearFlags(TASK_STARTED);
+  // Unset started when rescheduling periodic task
+  if (RunContext *rc = task_ptr->GetRunCtx()) rc->SetStarted(false);
 
   // Adjust polling rate based on whether task did work
   if (scheduler_) {
