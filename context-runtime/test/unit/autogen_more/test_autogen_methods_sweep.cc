@@ -96,7 +96,6 @@ void SweepMethod(clio::run::Container &container, clio::run::u32 method) {
       auto loaded = container.NewTask(method);
       if (!loaded.IsNull()) {
         container.LoadTask(method, load_archive, loaded);
-        container.DelTask(method, loaded);
       }
     }
     {
@@ -104,7 +103,6 @@ void SweepMethod(clio::run::Container &container, clio::run::u32 method) {
       load_archive.msg_type_ = dir;
       auto alloc_loaded = container.AllocLoadTask(method, load_archive);
       if (!alloc_loaded.IsNull()) {
-        container.DelTask(method, alloc_loaded);
       }
     }
   }
@@ -121,14 +119,12 @@ void SweepMethod(clio::run::Container &container, clio::run::u32 method) {
       auto loaded = container.NewTask(method);
       if (!loaded.IsNull()) {
         container.LocalLoadTask(method, load_archive, loaded);
-        container.DelTask(method, loaded);
       }
     }
     {
       clio::run::DefaultLoadArchive load_archive(save_archive.GetMutableData());
       auto alloc_loaded = container.LocalAllocLoadTask(method, load_archive);
       if (!alloc_loaded.IsNull()) {
-        container.DelTask(method, alloc_loaded);
       }
     }
   }
@@ -137,11 +133,9 @@ void SweepMethod(clio::run::Container &container, clio::run::u32 method) {
   {
     auto copy = container.NewCopyTask(method, task, false);
     if (!copy.IsNull()) {
-      container.DelTask(method, copy);
     }
     auto deep_copy = container.NewCopyTask(method, task, true);
     if (!deep_copy.IsNull()) {
-      container.DelTask(method, deep_copy);
     }
   }
 
@@ -151,11 +145,9 @@ void SweepMethod(clio::run::Container &container, clio::run::u32 method) {
     auto replica = container.NewTask(method);
     if (!replica.IsNull()) {
       container.AggregateOut(method, task, replica);
-      container.DelTask(method, replica);
     }
   }
 
-  container.DelTask(method, task);
 }
 
 }  // namespace
@@ -169,7 +161,7 @@ TEST_CASE("AutogenSweep - Admin all methods full dispatch battery",
   EnsureInitialized();
 
   auto *pool_manager = CLIO_POOL_MANAGER;
-  auto *container = pool_manager->GetStaticContainer(clio::run::kAdminPoolId);
+  auto container = pool_manager->GetStaticContainer(clio::run::kAdminPoolId).get();
   if (container == nullptr) {
     INFO("Admin container not available - skipping test");
     return;
@@ -259,7 +251,7 @@ TEST_CASE("AutogenSweep - Admin Run battery for safe methods",
 
   auto *ipc_manager = CLIO_IPC;
   auto *pool_manager = CLIO_POOL_MANAGER;
-  auto *container = pool_manager->GetStaticContainer(clio::run::kAdminPoolId);
+  auto container = pool_manager->GetStaticContainer(clio::run::kAdminPoolId).get();
   if (container == nullptr) {
     INFO("Admin container not available - skipping test");
     return;
@@ -275,25 +267,26 @@ TEST_CASE("AutogenSweep - Admin Run battery for safe methods",
         clio::run::CreateTaskId(), clio::run::kAdminPoolId, clio::run::PoolQuery::Local(),
         std::string(q));
     if (task.IsNull()) continue;
-    clio::run::RunContext rctx;
+    task.template Cast<clio::run::Task>()->BeginRunContext();
+    clio::run::SetCurrentTask(task.template Cast<clio::run::Task>());
     auto tr = container->Run(adm::Method::kMonitor,
-                             task.template Cast<clio::run::Task>(), rctx);
+                             task.template Cast<clio::run::Task>());
     for (int spin = 0; !tr.done() && spin < 16; ++spin) {
       tr.resume();
     }
-    CLIO_IPC->DelTask(task);
+    task.reset();
   }
 
   SECTION("Heartbeat handler");
   {
     auto task = container->NewTask(adm::Method::kHeartbeat);
     if (!task.IsNull()) {
-      clio::run::RunContext rctx;
-      auto tr = container->Run(adm::Method::kHeartbeat, task, rctx);
+      task->BeginRunContext();
+      clio::run::SetCurrentTask(task);
+      auto tr = container->Run(adm::Method::kHeartbeat, task);
       for (int spin = 0; !tr.done() && spin < 16; ++spin) {
         tr.resume();
       }
-      container->DelTask(adm::Method::kHeartbeat, task);
     }
   }
 
@@ -301,12 +294,12 @@ TEST_CASE("AutogenSweep - Admin Run battery for safe methods",
   {
     auto task = container->NewTask(adm::Method::kWreapDeadIpcs);
     if (!task.IsNull()) {
-      clio::run::RunContext rctx;
-      auto tr = container->Run(adm::Method::kWreapDeadIpcs, task, rctx);
+      task->BeginRunContext();
+      clio::run::SetCurrentTask(task);
+      auto tr = container->Run(adm::Method::kWreapDeadIpcs, task);
       for (int spin = 0; !tr.done() && spin < 16; ++spin) {
         tr.resume();
       }
-      container->DelTask(adm::Method::kWreapDeadIpcs, task);
     }
   }
 
@@ -314,12 +307,12 @@ TEST_CASE("AutogenSweep - Admin Run battery for safe methods",
   {
     auto task = container->NewTask(adm::Method::kSystemMonitor);
     if (!task.IsNull()) {
-      clio::run::RunContext rctx;
-      auto tr = container->Run(adm::Method::kSystemMonitor, task, rctx);
+      task->BeginRunContext();
+      clio::run::SetCurrentTask(task);
+      auto tr = container->Run(adm::Method::kSystemMonitor, task);
       for (int spin = 0; !tr.done() && spin < 16; ++spin) {
         tr.resume();
       }
-      container->DelTask(adm::Method::kSystemMonitor, task);
     }
   }
 
@@ -327,12 +320,12 @@ TEST_CASE("AutogenSweep - Admin Run battery for safe methods",
   {
     auto task = container->NewTask(adm::Method::kMigrateContainers);
     if (!task.IsNull()) {
-      clio::run::RunContext rctx;
-      auto tr = container->Run(adm::Method::kMigrateContainers, task, rctx);
+      task->BeginRunContext();
+      clio::run::SetCurrentTask(task);
+      auto tr = container->Run(adm::Method::kMigrateContainers, task);
       for (int spin = 0; !tr.done() && spin < 16; ++spin) {
         tr.resume();
       }
-      container->DelTask(adm::Method::kMigrateContainers, task);
     }
   }
 
@@ -340,12 +333,12 @@ TEST_CASE("AutogenSweep - Admin Run battery for safe methods",
   {
     auto task = container->NewTask(adm::Method::kRecoverContainers);
     if (!task.IsNull()) {
-      clio::run::RunContext rctx;
-      auto tr = container->Run(adm::Method::kRecoverContainers, task, rctx);
+      task->BeginRunContext();
+      clio::run::SetCurrentTask(task);
+      auto tr = container->Run(adm::Method::kRecoverContainers, task);
       for (int spin = 0; !tr.done() && spin < 16; ++spin) {
         tr.resume();
       }
-      container->DelTask(adm::Method::kRecoverContainers, task);
     }
   }
 
@@ -353,12 +346,12 @@ TEST_CASE("AutogenSweep - Admin Run battery for safe methods",
   {
     auto task = container->NewTask(adm::Method::kChangeAddressTable);
     if (!task.IsNull()) {
-      clio::run::RunContext rctx;
-      auto tr = container->Run(adm::Method::kChangeAddressTable, task, rctx);
+      task->BeginRunContext();
+      clio::run::SetCurrentTask(task);
+      auto tr = container->Run(adm::Method::kChangeAddressTable, task);
       for (int spin = 0; !tr.done() && spin < 16; ++spin) {
         tr.resume();
       }
-      container->DelTask(adm::Method::kChangeAddressTable, task);
     }
   }
 
@@ -371,12 +364,12 @@ TEST_CASE("AutogenSweep - Admin Run battery for safe methods",
       typed->chimod_name_ =
           clio::run::priv::string(CTP_MALLOC, "no_such_module_xyz");
       typed->pool_name_ = clio::run::priv::string(CTP_MALLOC, "no_such_pool_xyz");
-      clio::run::RunContext rctx;
-      auto tr = container->Run(adm::Method::kGetOrCreatePool, task, rctx);
+      task->BeginRunContext();
+      clio::run::SetCurrentTask(task);
+      auto tr = container->Run(adm::Method::kGetOrCreatePool, task);
       for (int spin = 0; !tr.done() && spin < 64; ++spin) {
         tr.resume();
       }
-      container->DelTask(adm::Method::kGetOrCreatePool, task);
     }
   }
 
@@ -384,12 +377,12 @@ TEST_CASE("AutogenSweep - Admin Run battery for safe methods",
   {
     auto task = container->NewTask(adm::Method::kDestroyPool);
     if (!task.IsNull()) {
-      clio::run::RunContext rctx;
-      auto tr = container->Run(adm::Method::kDestroyPool, task, rctx);
+      task->BeginRunContext();
+      clio::run::SetCurrentTask(task);
+      auto tr = container->Run(adm::Method::kDestroyPool, task);
       for (int spin = 0; !tr.done() && spin < 64; ++spin) {
         tr.resume();
       }
-      container->DelTask(adm::Method::kDestroyPool, task);
     }
   }
 
@@ -397,12 +390,12 @@ TEST_CASE("AutogenSweep - Admin Run battery for safe methods",
   {
     auto task = container->NewTask(adm::Method::kRegisterMemory);
     if (!task.IsNull()) {
-      clio::run::RunContext rctx;
-      auto tr = container->Run(adm::Method::kRegisterMemory, task, rctx);
+      task->BeginRunContext();
+      clio::run::SetCurrentTask(task);
+      auto tr = container->Run(adm::Method::kRegisterMemory, task);
       for (int spin = 0; !tr.done() && spin < 16; ++spin) {
         tr.resume();
       }
-      container->DelTask(adm::Method::kRegisterMemory, task);
     }
   }
 

@@ -69,7 +69,7 @@ struct IpcCpu2Self {
    * @return Future wrapping the task pointer (no serialization)
    */
   static Future<Task> SendIn(IpcManager *ipc,
-                                 const ctp::ipc::FullPtr<Task> &task_ptr);
+                                 const clio::run::shared_ptr<Task> &task_ptr);
 
   /**
    * Runtime receives a self-sent task.
@@ -78,9 +78,9 @@ struct IpcCpu2Self {
    * Returns the task pointer directly from the future.
    *
    * @param future Future containing the task pointer
-   * @return FullPtr to the task (same pointer from SendIn)
+   * @return shared_ptr to the task (same handle from SendIn)
    */
-  static ctp::ipc::FullPtr<Task> RecvIn(Future<Task> &future);
+  static clio::run::shared_ptr<Task> RecvIn(Future<Task> &future);
 
   /**
    * Runtime sends the response after task execution.
@@ -92,13 +92,9 @@ struct IpcCpu2Self {
    *   3. Task was copied (FUTURE_WAS_COPIED): delegate to IpcManager::SendRuntime.
    *
    * @param task_ptr Executed task
-   * @param run_ctx RunContext with future and execution state
-   * @param container Container for serialization (only if was_copied)
    * @param send_transport SHM transport (only if was_copied)
    */
-  static void SendOut(const FullPtr<Task> &task_ptr,
-                           RunContext *run_ctx,
-                           Container *container,
+  static void SendOut(const clio::run::shared_ptr<Task> &task_ptr,
                            ctp::lbm::Transport *send_transport);
 
   /**

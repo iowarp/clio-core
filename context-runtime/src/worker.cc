@@ -63,26 +63,10 @@
 #include "clio_runtime/task_archives.h"
 #include "clio_runtime/local_task_archives.h"
 #include "clio_runtime/work_orchestrator.h"
+#include "clio_runtime/boost_stack_allocator.h"
 
 namespace clio::run {
 
-// Detect whether a task's coroutine has run to completion WITHOUT
-// dereferencing the coroutine frame. The top-level coroutine's final_suspend
-// sets run_ctx->coro_completed_ (issue #485); reading that flag is valid even
-// if a cross-thread completion already freed the frame, whereas
-// coro_handle_.done() would be a use-after-free (the GPFLT in
-// coroutine_handle::done() observed on macOS). The NVHPC fiber path has no
-// such flag and is not subject to the same cross-thread free, so it keeps
-// using FiberHandle::done().
-namespace {
-inline bool CoroCompleted(const RunContext *run_ctx) {
-#ifndef CLIO_ENABLE_BOOST_COROUTINES
-  return run_ctx->coro_completed_.load(std::memory_order_acquire);
-#else
-  return run_ctx->coro_handle_ && run_ctx->coro_handle_.done();
-#endif
-}
-}  // namespace
 
 // Stack detection is now handled by WorkOrchestrator during initialization
 
@@ -93,7 +77,7 @@ Worker::Worker(u32 worker_id)
       load_(0),
       did_work_(false),
       task_did_work_(false),
-      current_run_context_(nullptr),
+      current_task_(),
       assigned_lane_(nullptr),
       event_queue_(nullptr),
       num_tasks_processed_(0),
@@ -141,15 +125,8 @@ bool Worker::Init() {
               CTP_MALLOC, event_queue_depth)
           .ptr_;
 
-#if defined(CLIO_ENABLE_BOOST_COROUTINES)
-  // Per-worker freed-fiber-stack pool (see AllocateStack/FreeStack).
-  free_stacks_ =
-      CTP_MALLOC
-          ->template NewObj<ctp::ipc::ext_ring_buffer<
-              boost::context::stack_context, ctp::ipc::MallocAllocator>>(
-              CTP_MALLOC, STACK_POOL_DEPTH)
-          .ptr_;
-#endif
+  // Boost fiber stacks now come from the process-wide, per-thread-cached
+  // BoostStackPool() (see AllocateStack/FreeStack); no per-worker pool needed.
 
   // Get scheduler from IpcManager (IpcManager is the single owner)
   scheduler_ = CLIO_IPC->GetScheduler();
@@ -225,11 +202,10 @@ void Worker::Finalize() {
   // Clean up all blocked queues
   for (u32 i = 0; i < NUM_BLOCKED_QUEUES; ++i) {
     while (!blocked_queues_[i].empty()) {
-      RunContext *run_ctx = blocked_queues_[i].front();
+      // Each entry is an owning shared_ptr<Task>; popping drops the worker's
+      // reference. The task (and its RunContext) is freed once its last owner
+      // drops.
       blocked_queues_[i].pop();
-      // RunContexts in blocked queues are still in use - don't free them
-      // They will be cleaned up when the tasks complete or by stack cache
-      (void)run_ctx;  // Suppress unused variable warning
     }
   }
 
@@ -245,16 +221,9 @@ void Worker::Finalize() {
     retry_queue_.pop();
   }
 
-#if defined(CLIO_ENABLE_BOOST_COROUTINES)
-  // Free every pooled fiber stack (raw mallocs from boost::fixedsize_stack).
-  if (free_stacks_) {
-    boost::context::stack_context sctx;
-    while (free_stacks_->Pop(sctx)) {
-      boost::context::fixedsize_stack(clio::run::detail::boost_stack_size())
-          .deallocate(sctx);
-    }
-  }
-#endif
+  // Boost fiber stacks are owned by the process-wide BoostStackPool() (a
+  // per-thread SlabAllocator cache); cached stacks live for the process and are
+  // reclaimed at exit — no per-worker drain here.
 
   // Clear assigned lane reference (don't delete - it's in shared memory)
   assigned_lane_ = nullptr;
@@ -413,7 +382,7 @@ bool Worker::ProcessNewTask(TaskLane *lane) {
   }
 
 
-  SetCurrentRunContext(nullptr);
+  SetCurrentTask(clio::run::shared_ptr<Task>());
 
   // Get FutureShm (allocator is pre-registered by Admin::RegisterMemory)
   auto future_shm = future.GetFutureShm();
@@ -431,7 +400,7 @@ bool Worker::ProcessNewTask(TaskLane *lane) {
 
   // Get static container for task deserialization (stateless operation)
   auto *pool_manager = CLIO_POOL_MANAGER;
-  Container *container = pool_manager->GetStaticContainer(pool_id);
+  auto container = pool_manager->GetStaticContainer(pool_id).get();
 
   // No local container for this pool: fail the task so the client doesn't hang.
   if (!container) {
@@ -443,7 +412,7 @@ bool Worker::ProcessNewTask(TaskLane *lane) {
 
   // The Ipc call that enqueued this task onto the lane already deserialized /
   // copied it, so the Future's task pointer is already resolved — just read it.
-  FullPtr<Task> task_full_ptr = future.GetTaskPtr();
+  clio::run::shared_ptr<Task> task_full_ptr = future.GetTaskPtr();
 
   // Check if the task pointer is missing (enqueue bug / failed deserialize)
   if (task_full_ptr.IsNull()) {
@@ -455,26 +424,24 @@ bool Worker::ProcessNewTask(TaskLane *lane) {
     return true;
   }
 
-  // The inbound Ipc transport allocated this task's RunContext at deserialize
-  // time (BeginTask). Bind it to THIS worker/lane so subtask completion events
-  // go to the right event queue — this also covers tasks re-enqueued across
-  // workers by RouteLocal.
-  RunContext *run_ctx = task_full_ptr->GetRunCtx();
-  if (run_ctx) {
-    run_ctx->worker_id_ = worker_id_;
-    run_ctx->lane_ = lane;
-    run_ctx->event_queue_ = event_queue_;
-  }
+  // The RunContext (with its container resolved) was allocated by the ipc
+  // receive/send site that introduced this task (Task::BeginRunContext). Bind it
+  // to THIS worker/lane and record the future so subtask-completion events and
+  // the eventual response go to the right place — this also covers tasks
+  // re-enqueued across workers by RouteLocal.
+  task_full_ptr->SetRunWorkerId(worker_id_);
+  task_full_ptr->Lane() = lane;
+  task_full_ptr->SetEventQueue(event_queue_);
+  task_full_ptr->RunFuture() = future;
 
   // Route task using consolidated routing function
   // RouteTask handles Retry/Dne internally via AddToRetryQueue
   RouteResult route_result = CLIO_IPC->RouteTask(future);
   if (route_result == RouteResult::ExecHere) {
 #if CTP_IS_HOST
-    // Re-fetch in case RouteTask changed the task's RunContext.
-    run_ctx = task_full_ptr->GetRunCtx();
-    bool is_started = run_ctx && run_ctx->IsStarted();
-    ExecTask(task_full_ptr, run_ctx, is_started);
+    // Re-check in case RouteTask changed the task's RunContext.
+    bool is_started = task_full_ptr->IsStarted();
+    ExecTask(task_full_ptr, is_started);
 #endif
   }
 
@@ -489,7 +456,8 @@ double Worker::GetSuspendPeriod() const {
 
   // Check all periodic queues (0-3)
   for (u32 queue_idx = 0; queue_idx < NUM_PERIODIC_QUEUES; ++queue_idx) {
-    const std::queue<RunContext *> &queue = periodic_queues_[queue_idx];
+    const std::queue<clio::run::shared_ptr<Task>> &queue =
+        periodic_queues_[queue_idx];
 
     if (queue.empty()) {
       continue;
@@ -497,15 +465,14 @@ double Worker::GetSuspendPeriod() const {
 
     // Check just the front task of each queue (representative of the queue's
     // period)
-    RunContext *run_ctx = queue.front();
-
-    if (!run_ctx || run_ctx->task_.IsNull()) {
+    const clio::run::shared_ptr<Task> &task = queue.front();
+    if (task.IsNull()) {
       continue;
     }
 
     // Use the yield_time directly - this is the adaptive polling period
-    if (!found_task || run_ctx->yield_time_us_ < min_yield_time_us) {
-      min_yield_time_us = run_ctx->yield_time_us_;
+    if (!found_task || task->YieldTimeUs() < min_yield_time_us) {
+      min_yield_time_us = task->YieldTimeUs();
       found_task = true;
     }
   }
@@ -592,37 +559,17 @@ u32 Worker::GetId() const { return worker_id_; }
 
 bool Worker::IsRunning() const { return is_running_; }
 
-RunContext *Worker::GetCurrentRunContext() const {
-  return current_run_context_;
+void Worker::SetCurrentTask(const clio::run::shared_ptr<Task> &task) {
+  current_task_ = task;
 }
 
-RunContext *Worker::SetCurrentRunContext(RunContext *rctx) {
-  current_run_context_ = rctx;
-  return current_run_context_;
-}
-
-FullPtr<Task> Worker::GetCurrentTask() const {
-  RunContext *run_ctx = GetCurrentRunContext();
-  if (!run_ctx) {
-    return FullPtr<Task>::GetNull();
-  }
-  return run_ctx->task_;
-}
-
-Container *Worker::GetCurrentContainer() const {
-  RunContext *run_ctx = GetCurrentRunContext();
-  if (!run_ctx) {
-    return nullptr;
-  }
-  return run_ctx->container_;
-}
+clio::run::shared_ptr<Task> &Worker::GetCurrentTask() { return current_task_; }
 
 TaskLane *Worker::GetCurrentLane() const {
-  RunContext *run_ctx = GetCurrentRunContext();
-  if (!run_ctx) {
+  if (current_task_.IsNull()) {
     return nullptr;
   }
-  return run_ctx->lane_;
+  return current_task_->Lane();
 }
 
 void Worker::SetAsCurrentWorker() {
@@ -635,262 +582,22 @@ void Worker::ClearCurrentWorker() {
                             static_cast<class Worker *>(nullptr));
 }
 
-#if defined(CLIO_ENABLE_BOOST_COROUTINES)
-boost::context::stack_context Worker::AllocateStack() {
-  boost::context::stack_context sctx;
-  if (free_stacks_ && free_stacks_->Pop(sctx)) {
-    return sctx;  // reuse a freed stack
-  }
-  return boost::context::fixedsize_stack(clio::run::detail::boost_stack_size())
-      .allocate();
-}
-
-void Worker::FreeStack(boost::context::stack_context &sctx) {
-  // Cache for reuse; if the pool is full (ext_ring_buffer reports no space),
-  // free the stack outright.
-  if (!free_stacks_ || !free_stacks_->Emplace(sctx)) {
-    boost::context::fixedsize_stack(clio::run::detail::boost_stack_size())
-        .deallocate(sctx);
-  }
-}
-
-namespace {
-// Boost StackAllocator backed by the owning worker's stack pool. allocate()
-// always runs on the creating worker (make_task_fiber), so it draws from that
-// worker's pool. deallocate() returns the stack to that same pool only when run
-// on the owner's thread (the common case — the creating worker finishes the
-// task); off-thread reclaims free directly, keeping each pool single-threaded.
-struct WorkerStackAllocator {
-  Worker *worker_;
-  boost::context::stack_context allocate() { return worker_->AllocateStack(); }
-  void deallocate(boost::context::stack_context &sctx) noexcept {
-    if (CLIO_CUR_WORKER == worker_) {
-      worker_->FreeStack(sctx);
-    } else {
-      boost::context::fixedsize_stack(clio::run::detail::boost_stack_size())
-          .deallocate(sctx);
-    }
-  }
-};
-}  // namespace
-
-// Set up the task's RunContext to run on a fresh Boost.Context fiber, recording
-// `this` worker as the one responsible for the fiber state. The fiber state
-// lives in rctx->fiber_state_, and the fiber stack comes from this worker's
-// pool (WorkerStackAllocator), so a reused stack costs no malloc. The entry
-// captures the typed RunContext* (no callable type erasure) and runs the
-// container directly off it. Lazy: the body runs on first resume().
-clio::run::detail::FiberHandle Worker::make_task_fiber(RunContext *rctx) {
-  rctx->fiber_state_.done = false;
-  rctx->fiber_state_.worker_ = this;
-  rctx->fiber_state_.task_ = boost::context::fiber{
-      std::allocator_arg, WorkerStackAllocator{this},
-      [rctx](boost::context::fiber &&caller) -> boost::context::fiber {
-        rctx->fiber_state_.caller_ = std::move(caller);
-        // Must not let an exception escape the fiber entry (Boost.Context calls
-        // std::terminate if one does).
-        try {
-          rctx->container_->Run(rctx->task_->method_, rctx->task_, *rctx);
-        } catch (...) {
-        }
-        rctx->fiber_state_.done = true;
-        return std::move(rctx->fiber_state_.caller_);
-      }};
-  return clio::run::detail::FiberHandle(&rctx->fiber_state_);
-}
-#endif  // CLIO_ENABLE_BOOST_COROUTINES
-
-void Worker::StartCoroutine(const FullPtr<Task> &task_ptr,
-                            RunContext *run_ctx) {
-  // Set current run context
-  SetCurrentRunContext(run_ctx);
-
-  // New task execution - increment work count for non-periodic tasks
-  if (run_ctx->container_ && !task_ptr->IsPeriodic()) {
-    // Increment work remaining in the container for non-periodic tasks
-    run_ctx->container_->UpdateWork(task_ptr, *run_ctx, 1);
-  }
-
-  // Get the container from RunContext
-  Container *container = run_ctx->container_;
-  if (!container) {
-    HLOG(kWarning, "Container not found in RunContext for pool_id: {}",
-         task_ptr->pool_id_);
-    return;
-  }
-
-  // Call the container's Run function which returns a TaskResume coroutine/fiber
-  try {
-#if defined(CLIO_ENABLE_BOOST_COROUTINES)
-    // Boost.Context path (issue #620): the worker owns one fiber per task whose
-    // entry runs Container::Run natively on the fiber stack. The whole task —
-    // including nested helper coroutines, which run inline — executes as
-    // ordinary C++, so reference parameters and locals behave exactly as in the
-    // C++20 stackless backend. The fiber state lives in run_ctx->fiber_state_
-    // (only the stack is heap-allocated); make_task_fiber's entry dispatches
-    // container->Run() directly off the RunContext.
-    {
-      run_ctx->coro_completed_.store(false, std::memory_order_relaxed);
-      run_ctx->coro_handle_ = make_task_fiber(run_ctx);
-      if (run_ctx->coro_handle_) {
-        run_ctx->coro_handle_.resume();
-        if (run_ctx->coro_handle_.done()) {
-          run_ctx->coro_handle_.destroy();
-          run_ctx->coro_handle_ = clio::run::detail::FiberHandle{};
-        }
-      }
-    }
-#else
-    TaskResume task_resume =
-        container->Run(task_ptr->method_, task_ptr, *run_ctx);
-
-    // Standard C++20 coroutine path
-    auto handle = task_resume.release();
-    run_ctx->coro_handle_ = handle;
-
-    // Set the run context in the coroutine's promise so it can access it
-    if (handle) {
-      auto typed_handle =
-          TaskResume::handle_type::from_address(handle.address());
-      typed_handle.promise().set_run_context(run_ctx);
-      // Mark this as the top-level task coroutine so its (and only its)
-      // final_suspend raises run_ctx->coro_completed_ on real task completion
-      // (issue #485). Nested co_await'd coroutines are never marked.
-      typed_handle.promise().is_top_level_ = true;
-
-      // Fresh coroutine frame: clear the completion flag the promise's
-      // final_suspend will raise when this task finishes (issue #485).
-      run_ctx->coro_completed_.store(false, std::memory_order_relaxed);
-
-      // Resume the coroutine to run until first suspension point or completion
-      // initial_suspend returns suspend_always, so we need to resume to start
-      // execution
-      handle.resume();
-
-      // Check if coroutine completed (no suspension points). Read the
-      // RunContext completion flag rather than handle.done(): if the task
-      // completed cross-thread during resume() the frame may already be freed,
-      // and done() on a freed frame is a use-after-free (issue #485). When the
-      // flag is set, await_resume has repointed things so `handle` (the
-      // top-level frame) is still valid to destroy.
-      if (run_ctx->coro_completed_.load(std::memory_order_acquire)) {
-        // Coroutine completed - clean up
-        handle.destroy();
-        run_ctx->coro_handle_ = nullptr;
-      }
-    }
-#endif // CLIO_ENABLE_BOOST_COROUTINES vs C++20 stackless
-  } catch (const std::exception &e) {
-    HLOG(kError, "Task execution failed: {}", e.what());
-    // Clean up handle on exception
-    if (run_ctx->coro_handle_) {
-      run_ctx->coro_handle_.destroy();
-#ifndef CLIO_ENABLE_BOOST_COROUTINES
-      run_ctx->coro_handle_ = nullptr;
-#else
-      run_ctx->coro_handle_ = clio::run::detail::FiberHandle{};
-#endif
-    }
-  } catch (...) {
-    HLOG(kError, "Task execution failed with unknown exception");
-    // Clean up handle on exception
-    if (run_ctx->coro_handle_) {
-      run_ctx->coro_handle_.destroy();
-#ifndef CLIO_ENABLE_BOOST_COROUTINES
-      run_ctx->coro_handle_ = nullptr;
-#else
-      run_ctx->coro_handle_ = clio::run::detail::FiberHandle{};
-#endif
-    }
-  }
-}
-
-void Worker::ResumeCoroutine(const FullPtr<Task> &task_ptr,
-                             RunContext *run_ctx) {
-  // Set current run context
-  SetCurrentRunContext(run_ctx);
-
-  // Clear yielded flag before resumption
-  run_ctx->is_yielded_ = false;
-
-  // Check if we have a valid coroutine handle
-  if (!run_ctx->coro_handle_) {
-    HLOG(kWarning,
-         "Worker {}: Attempted to resume task without coroutine handle. "
-         "Task method: {} Pool: {}",
-         worker_id_, task_ptr->method_, task_ptr->pool_id_);
-    return;
-  }
-
-  // Resume the coroutine/fiber - it will run until next suspension or completion
-  try {
-    run_ctx->coro_handle_.resume();
-
-    // Check if coroutine/fiber completed after resumption. For C++20
-    // coroutines this reads the RunContext completion flag (set by the
-    // top-level coroutine's final_suspend) instead of coro_handle_.done(): the
-    // task may have completed cross-thread during resume() and freed the
-    // coroutine frame, which would make done() a use-after-free of a heap
-    // coro_handle_ (the GPFLT seen on macOS, issue #485). The RunContext
-    // outlives the frame; when the flag is set, await_resume has already
-    // repointed coro_handle_ to the (valid) top-level frame so destroy() is
-    // safe.
-    if (CoroCompleted(run_ctx)) {
-      // Completed - clean up
-      run_ctx->coro_handle_.destroy();
-#ifndef CLIO_ENABLE_BOOST_COROUTINES
-      run_ctx->coro_handle_ = nullptr;
-#else
-      run_ctx->coro_handle_ = clio::run::detail::FiberHandle{};
-#endif
-    }
-  } catch (const std::exception &e) {
-    HLOG(kError, "Task resume failed: {}", e.what());
-    // Clean up handle on exception
-    if (run_ctx->coro_handle_) {
-      run_ctx->coro_handle_.destroy();
-#ifndef CLIO_ENABLE_BOOST_COROUTINES
-      run_ctx->coro_handle_ = nullptr;
-#else
-      run_ctx->coro_handle_ = clio::run::detail::FiberHandle{};
-#endif
-    }
-  } catch (...) {
-    HLOG(kError, "Task resume failed with unknown exception");
-    // Clean up handle on exception
-    if (run_ctx->coro_handle_) {
-      run_ctx->coro_handle_.destroy();
-#ifndef CLIO_ENABLE_BOOST_COROUTINES
-      run_ctx->coro_handle_ = nullptr;
-#else
-      run_ctx->coro_handle_ = clio::run::detail::FiberHandle{};
-#endif
-    }
-  }
-}
-
-void Worker::ExecTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
-                      bool is_started) {
+void Worker::ExecTask(clio::run::shared_ptr<Task> &task_ptr, bool is_started) {
   // Non-periodic tasks always count as real work.
-  // Periodic tasks must express work via run_ctx->did_work_.
+  // Periodic tasks must express work via the task's did_work_ flag.
   if (!task_ptr->IsPeriodic()) {
     SetTaskDidWork(true);
   }
 
-  // Check if task is null or run context is null
-  if (task_ptr.IsNull() || !run_ctx) {
+  // Check if task is null or has no RunContext (not executing)
+  if (task_ptr.IsNull()) {
     return;
   }
 
-  // Resolve the container fresh each time (may change during migration)
-  auto *pool_manager = CLIO_POOL_MANAGER;
-  bool is_plugged = false;
-  ContainerId container_id = task_ptr->pool_query_.GetContainerId();
-  Container *exec_container =
-      pool_manager->GetContainer(task_ptr->pool_id_, container_id, is_plugged);
-  if (exec_container && !is_plugged) {
-    run_ctx->container_ = exec_container;
-  }
+  // The execution container was resolved once at routing time and cached in
+  // the task's RunContext (a DynamicContainer); read its current — i.e. most-
+  // recently-upgraded — version for this execution slice.
+  ContainerHold exec = task_ptr->ExecContainer().get();
 
   // Per-RPC access control. This is the owning host (the container is resolved
   // locally and the method is about to run) and the only place reached exactly
@@ -900,8 +607,8 @@ void Worker::ExecTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
   // handler runs; deliver EACCES through the normal completion path. Internal
   // callers and public methods pass through. Only on first execution (resumes
   // of an already-admitted task carry no new authorization decision).
-  if (!is_started && exec_container &&
-      !exec_container->IsRpcAllowed(
+  if (!is_started && exec &&
+      !exec->IsRpcAllowed(
           task_ptr->method_,
           task_ptr->task_flags_.Any(TASK_EXTERNAL_CLIENT))) {
     HLOG(kWarning,
@@ -909,40 +616,43 @@ void Worker::ExecTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
          "pool {}",
          worker_id_, task_ptr->method_, task_ptr->pool_id_);
     task_ptr->SetReturnCode(EACCES);
-    EndTask(task_ptr, run_ctx, /*can_resched=*/false);
+    EndTask(task_ptr, /*can_resched=*/false);
     return;
   }
 
   // Start CPU and wall timers before execution
-  run_ctx->cpu_timer_.Resume();
-  run_ctx->wall_timer_.Resume();
+  task_ptr->RunCpuTimer().Resume();
+  task_ptr->RunWallTimer().Resume();
 
-  // Call appropriate coroutine function based on task state
+  // Call appropriate coroutine function based on task state. Driving the
+  // coroutine is the Task's own responsibility (it owns its RunContext/frame).
   if (is_started) {
-    ResumeCoroutine(task_ptr, run_ctx);
+    task_ptr->ResumeCoroutine(task_ptr);
   } else {
-    StartCoroutine(task_ptr, run_ctx);
-    run_ctx->SetStarted();
+    task_ptr->StartCoroutine(task_ptr);
+    task_ptr->SetStarted();
 
     // Predict load for new tasks. predicted_stat_ is populated by
     // BeginTask via container->GetTaskStats(task), so derive the model
     // inferences from the already-cached stat instead of re-calling
     // GetTaskStats here.
-    if (run_ctx->container_) {
-      run_ctx->predicted_load_ = run_ctx->container_->InferCpuTime(task_ptr->method_, run_ctx->predicted_stat_);
-      run_ctx->predicted_wall_us_ = run_ctx->container_->InferWallClockTime(task_ptr->method_, run_ctx->predicted_stat_);
-      load_ += run_ctx->predicted_load_;
+    if (exec) {
+      task_ptr->SetPredictedLoad(
+          exec->InferCpuTime(task_ptr->method_, task_ptr->PredictedStat()));
+      task_ptr->SetPredictedWallUs(exec->InferWallClockTime(
+          task_ptr->method_, task_ptr->PredictedStat()));
+      load_ += task_ptr->PredictedLoad();
     }
   }
 
   // Pause CPU and wall timers after execution
-  run_ctx->cpu_timer_.Pause();
-  run_ctx->wall_timer_.Pause();
+  task_ptr->RunCpuTimer().Pause();
+  task_ptr->RunWallTimer().Pause();
 
   // For periodic tasks, only set task_did_work_ if the task reported
   // actual work done (e.g., received data, sent data). This prevents
   // idle polling from keeping the worker awake.
-  if (task_ptr->IsPeriodic() && run_ctx->did_work_) {
+  if (task_ptr->IsPeriodic() && task_ptr->DidWork()) {
     SetTaskDidWork(true);
   }
 
@@ -954,44 +664,43 @@ void Worker::ExecTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
   // Check if coroutine is done or yielded. Use the RunContext completion flag
   // (issue #485) rather than dereferencing the possibly-freed coroutine frame
   // via coro_handle_.done().
-  bool coro_done = CoroCompleted(run_ctx);
+  bool coro_done = task_ptr->IsCoroCompleted();
 
   // If coroutine yielded (not done and is_yielded_ set), don't clean up
-  if (run_ctx->is_yielded_ && !coro_done) {
+  if (task_ptr->IsYielded() && !coro_done) {
     // yield_time_us_ > 0 means cooperative yield (polling) — add to periodic
     // queue so the worker re-checks after the requested delay.
     // yield_time_us_ == 0 means waiting for a Future event — the event queue
     // will resume it, so we must NOT add it to any queue here.
-    if (run_ctx->yield_time_us_ > 0) {
-      AddToBlockedQueue(run_ctx);
+    if (task_ptr->YieldTimeUs() > 0) {
+      AddToBlockedQueue(task_ptr);
     }
-    // The worker is no longer running this coroutine; drop the current
-    // RunContext so between-task main-loop code (below) can't read it. See the
-    // note at the end of this function.
-    SetCurrentRunContext(nullptr);
+    // The worker is no longer running this coroutine; drop the current task so
+    // between-task main-loop code (below) can't read it. See the note at the
+    // end of this function.
+    SetCurrentTask(clio::run::shared_ptr<Task>());
     return;
   }
 
   // End task execution and cleanup (handles periodic rescheduling internally)
-  EndTask(task_ptr, run_ctx, true);
+  EndTask(task_ptr, true);
 
-  // Clear the worker's current RunContext now that this task is no longer
-  // executing. Main-loop code that runs *between* tasks — notably
+  // Clear the worker's current task now that it is no longer executing.
+  // Main-loop code that runs *between* tasks — notably
   // BatchManager::FlushDue -> CreateTaskId -> Worker::GetCurrentTask — must not
-  // dereference current_run_context_ after the task it pointed at has been
-  // freed. A completed remote task's RunContext is destroyed on the network
-  // (ZMQ) thread, so leaving current_run_context_ set here is a cross-thread
-  // dangling pointer (observed as a heap-use-after-free in CreateTaskId during
-  // a ManyToOne flush). run_ctx may itself be freed by EndTask above, so only
-  // store nullptr — never read run_ctx past this point.
-  SetCurrentRunContext(nullptr);
+  // observe a task whose RunContext has been freed. A completed remote task's
+  // RunContext is destroyed on the network (ZMQ) thread, so leaving the current
+  // task set here would let between-task code reach a freed RunContext (observed
+  // as a heap-use-after-free in CreateTaskId during a ManyToOne flush). Clear
+  // the handle so nothing dereferences it past this point.
+  SetCurrentTask(clio::run::shared_ptr<Task>());
 }
 
 
-void Worker::EndTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
-                     bool can_resched) {
-  // Check container once at the beginning
-  Container *container = run_ctx->container_;
+void Worker::EndTask(clio::run::shared_ptr<Task> &task_ptr, bool can_resched) {
+  // Hold a reader on the container for the whole of EndTask: ReinforceCpuModel /
+  // UpdateWork below touch it, and a migration must not swap it out mid-update.
+  ContainerHold container = task_ptr->ExecContainer().get();
   if (container == nullptr) {
     HLOG(kError, "EndTask: container is null");
     return;
@@ -1001,17 +710,17 @@ void Worker::EndTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
   ++num_tasks_processed_;
 
   // Subtract predicted load from worker
-  load_ -= run_ctx->predicted_load_;
+  load_ -= task_ptr->PredictedLoad();
 
   // Reinforce model with actual CPU and wall time
-  float actual_cpu_us = static_cast<float>(run_ctx->cpu_timer_.GetUsec());
-  float actual_wall_us = static_cast<float>(run_ctx->wall_timer_.GetUsec());
+  float actual_cpu_us = static_cast<float>(task_ptr->RunCpuTimer().GetUsec());
+  float actual_wall_us = static_cast<float>(task_ptr->RunWallTimer().GetUsec());
   container->ReinforceCpuModel(
-      task_ptr->method_, run_ctx->predicted_load_, actual_cpu_us,
-      run_ctx->predicted_stat_);
+      task_ptr->method_, task_ptr->PredictedLoad(), actual_cpu_us,
+      task_ptr->PredictedStat());
   container->ReinforceWallModel(
-      task_ptr->method_, run_ctx->predicted_wall_us_, actual_wall_us,
-      run_ctx->predicted_stat_);
+      task_ptr->method_, task_ptr->PredictedWallUs(), actual_wall_us,
+      task_ptr->PredictedStat());
 
   // ManyToOne aggregate task: this synthetic task has no external waiter. On
   // completion, broadcast its OUT to the batched originals (which completes
@@ -1020,11 +729,11 @@ void Worker::EndTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
   if (task_ptr->task_flags_.Any(TASK_BATCH_AGGREGATE)) {
     BatchManager *bm = CLIO_IPC->GetBatchManager();
     if (bm != nullptr) {
-      bm->OnAggregateComplete(this, task_ptr, run_ctx);
+      bm->OnAggregateComplete(this, task_ptr);
     }
-    container->UpdateWork(task_ptr, *run_ctx, -1);
+    container->UpdateWork(task_ptr, -1);
     task_ptr->ClearFlags(TASK_DATA_OWNER);
-    container->DelTask(task_ptr->method_, task_ptr);
+    // Task is freed via RAII when the RunContext's shared_ptr owners drop.
     return;
   }
 
@@ -1034,19 +743,19 @@ void Worker::EndTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
 
   // Handle periodic task rescheduling
   if (is_periodic && can_resched) {
-    ReschedulePeriodicTask(run_ctx, task_ptr);
+    ReschedulePeriodicTask(task_ptr);
     return;
   }
 
   // Decrement work remaining for non-periodic tasks
   if (!is_periodic) {
-    container->UpdateWork(task_ptr, *run_ctx, -1);
+    container->UpdateWork(task_ptr, -1);
   }
 
-  // Fire-and-forget: skip all response paths, just delete the task
+  // Fire-and-forget: skip all response paths. The task frees via RAII when the
+  // RunContext's shared_ptr owners drop.
   if (task_ptr->task_flags_.Any(TASK_FIRE_AND_FORGET)) {
     task_ptr->ClearFlags(TASK_DATA_OWNER);
-    container->DelTask(task_ptr->method_, task_ptr);
     return;
   }
 
@@ -1054,36 +763,35 @@ void Worker::EndTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
   // latency vs I/O lane from the task's cached predicted_stat_ so a
   // small ACK / heartbeat reply doesn't queue behind a 1 MiB GetBlob
   // response on the wire.
+  HLOG(kDebug, "[FNTRACE] EndTask: is_remote={} is_periodic={} method={}",
+       is_remote, is_periodic, task_ptr->method_);
   if (is_remote) {
-    size_t io_size = run_ctx->predicted_stat_.io_size_;
+    size_t io_size = task_ptr->PredictedStat().io_size_;
     NetQueuePriority prio = (io_size >= kNetQueueIoThreshold)
                                 ? NetQueuePriority::kSendOutIO
                                 : NetQueuePriority::kSendOutLatency;
-    CLIO_IPC->EnqueueNetTask(run_ctx->future_, prio);
+    HLOG(kDebug, "[FNTRACE] EndTask: EnqueueNetTask (remote)");
+    CLIO_IPC->EnqueueNetTask(task_ptr->RunFuture(), prio);
+    HLOG(kDebug, "[FNTRACE] EndTask: EnqueueNetTask done");
     return;
   }
 
   // Copy variables from future_shm to stack BEFORE any SetComplete() call
   // This prevents use-after-free since client may free future_shm after
   // SetComplete()
-  auto future_shm = run_ctx->future_.GetFutureShm();
+  auto future_shm = task_ptr->RunFuture().GetFutureShm();
   if (future_shm.IsNull()) {
     HLOG(kError, "EndTask: future_shm is NULL for pool={} method={}",
          task_ptr->pool_id_, task_ptr->method_);
     return;
   }
-  bool was_copied = future_shm->flags_.Any(FutureShm::FUTURE_WAS_COPIED);
-
-  // Copy parent task pointer before transfer begins (may be modified during
-  // transfer)
-  RunContext *parent_task = run_ctx->future_.GetParentTask();
-
   // Dispatch response via transport class
-  IpcCpu2Self::SendOut(task_ptr, run_ctx, container,
-                           shm_send_transport_.get());
+  HLOG(kDebug, "[FNTRACE] EndTask: calling IpcCpu2Self::SendOut");
+  IpcCpu2Self::SendOut(task_ptr, shm_send_transport_.get());
+  HLOG(kDebug, "[FNTRACE] EndTask: SendOut returned");
 }
 
-void Worker::ProcessBlockedQueue(std::queue<RunContext *> &queue,
+void Worker::ProcessBlockedQueue(std::queue<clio::run::shared_ptr<Task>> &queue,
                                  u32 queue_idx) {
   (void)queue_idx;  // Unused parameter, kept for API consistency
 
@@ -1096,46 +804,47 @@ void Worker::ProcessBlockedQueue(std::queue<RunContext *> &queue,
       break;
     }
 
-    RunContext *run_ctx = queue.front();
+    // The queue OWNS the task (shared_ptr), which keeps both the task and its
+    // RunContext (owned by the task) alive while blocked. The task's execution
+    // state is reached through its accessors.
+    clio::run::shared_ptr<Task> task = queue.front();
     queue.pop();
 
-    if (!run_ctx || run_ctx->task_.IsNull()) {
-      // Invalid entry, don't re-add
+    if (task.IsNull()) {
       continue;
     }
 
     // Determine if this is a resume (task was started before) or first
     // execution
-    bool is_started = run_ctx->IsStarted();
+    bool is_started = task->IsStarted();
 
-    // Skip if task was started but coroutine already completed
-    // This can happen with orphan events from parallel subtasks. Use the
-    // completion flag instead of coro_handle_.done() to avoid a use-after-free
-    // on a cross-thread-freed coroutine frame (issue #485).
-    if (is_started &&
-        (!run_ctx->coro_handle_ || CoroCompleted(run_ctx))) {
+    // Skip if task was started but coroutine already completed. This can happen
+    // with orphan events from parallel subtasks. Uses the task's completion
+    // query (which reads the completion flag, not coro_handle_.done(), to avoid
+    // a use-after-free on a cross-thread-freed coroutine frame — issue #485).
+    if (is_started && task->IsCoroCompleted()) {
       continue;
     }
 
-    run_ctx->yield_count_ = 0;
+    task->SetYieldCount(0);
 
     // CRITICAL: Clear the is_yielded_ flag before resuming the task
     // This allows the task to call Wait() again if needed
-    run_ctx->is_yielded_ = false;
+    task->SetYielded(false);
 
     // Execute task with existing RunContext
-    ExecTask(run_ctx->task_, run_ctx, is_started);
+    ExecTask(task, is_started);
 
     // Don't re-add to queue
     continue;
 
     // Re-add to appropriate blocked queue based on current block count
     // AddToBlockedQueue will increment yield_count_ and determine the queue
-    AddToBlockedQueue(run_ctx);
+    AddToBlockedQueue(task);
   }
 }
 
-void Worker::ProcessPeriodicQueue(std::queue<RunContext *> &queue,
+void Worker::ProcessPeriodicQueue(std::queue<clio::run::shared_ptr<Task>> &queue,
                                   u32 queue_idx) {
   (void)queue_idx;  // Unused parameter, kept for API consistency
 
@@ -1156,45 +865,43 @@ void Worker::ProcessPeriodicQueue(std::queue<RunContext *> &queue,
       break;
     }
 
-    RunContext *run_ctx = queue.front();
+    clio::run::shared_ptr<Task> task = queue.front();
     queue.pop();
 
-    if (!run_ctx || run_ctx->task_.IsNull()) {
-      // Invalid entry, don't re-add
+    if (task.IsNull()) {
       continue;
     }
 
     // Check if the time threshold has been surpassed using batch timestamp
     // Add 2ms tolerance to account for timing variance and ms/us precision
     // mismatch
-    double elapsed_us = run_ctx->block_start_.GetUsecFromStart(batch_timestamp);
-    if (elapsed_us + 2000.0 >= run_ctx->yield_time_us_) {
+    double elapsed_us = task->BlockStart().GetUsecFromStart(batch_timestamp);
+    if (elapsed_us + 2000.0 >= task->YieldTimeUs()) {
       // Time threshold reached (within tolerance) - execute the task
-      bool is_started = run_ctx->IsStarted();
+      bool is_started = task->IsStarted();
 
       // CRITICAL: Clear the is_yielded_ flag before resuming the task
       // This allows the task to call Wait() again if needed
-      run_ctx->is_yielded_ = false;
+      task->SetYielded(false);
 
       // For periodic tasks, unmark routed and route again
-      run_ctx->SetRouted(false);
-      Container *container = run_ctx->container_;
+      task->SetRouted(false);
 
       // Use batch timestamp for rescheduling to prevent desynchronization
       // This ensures all tasks in this batch get the same block_start time
-      run_ctx->block_start_ = batch_timestamp;
+      task->BlockStart() = batch_timestamp;
 
       // Route task again - this will handle both local and distributed routing
       // RouteTask handles Retry/Dne internally via AddToRetryQueue
-      if (CLIO_IPC->RouteTask(run_ctx->future_) == RouteResult::ExecHere) {
-        ExecTask(run_ctx->task_, run_ctx, is_started);
+      if (CLIO_IPC->RouteTask(task->RunFuture()) == RouteResult::ExecHere) {
+        ExecTask(task, is_started);
 
         // If task re-yielded with a polling interval, ExecTask already
         // re-added it to the periodic queue via AddToBlockedQueue.
       }
     } else {
       // Time threshold not reached yet - re-add to same queue
-      queue.push(run_ctx);
+      queue.push(task);
     }
   }
 }
@@ -1212,31 +919,31 @@ void Worker::ProcessEventQueue() {
     // Mark the subtask's future as complete
     future.Complete();
 
-    // Get the parent RunContext that is waiting for this subtask.
+    // Get the parent task that is waiting for this subtask.
     // Safe to dereference because FUTURE_COMPLETE was not set until just now,
     // so the parent coroutine could not have seen completion, could not have
     // finished, and its RunContext has not been freed.
-    RunContext *run_ctx = future.GetParentTask();
-    if (!run_ctx || run_ctx->task_.IsNull()) {
+    clio::run::shared_ptr<Task> &parent = future.GetParentTask();
+    if (parent.IsNull()) {
       continue;
     }
 
-    // Skip if coroutine handle is null or already completed. Use the
-    // completion flag instead of coro_handle_.done() to avoid dereferencing a
+    // Skip if the parent's coroutine already completed. Uses the completion
+    // query (the flag, not coro_handle_.done()) to avoid dereferencing a
     // coroutine frame a cross-thread completion may already have freed (#485).
-    if (!run_ctx->coro_handle_ || CoroCompleted(run_ctx)) {
+    if (parent->IsCoroCompleted()) {
       continue;
     }
 
     // Reset the is_yielded_ flag before executing the task
-    run_ctx->is_yielded_ = false;
+    parent->SetYielded(false);
 
     // Reset is_notified_ so this task can be notified again for subsequent
     // co_await
-    run_ctx->is_notified_.store(false);
+    parent->SetNotified(false);
 
     // Execute the task
-    ExecTask(run_ctx->task_, run_ctx, true);
+    ExecTask(parent, true);
   }
 }
 
@@ -1303,8 +1010,9 @@ void Worker::ContinueBlockedTasks(bool force) {
   }
 }
 
-void Worker::AddToBlockedQueue(RunContext *run_ctx, bool wait_for_task) {
-  if (!run_ctx || run_ctx->task_.IsNull()) {
+void Worker::AddToBlockedQueue(const clio::run::shared_ptr<Task> &task,
+                               bool wait_for_task) {
+  if (task.IsNull()) {
     return;
   }
 
@@ -1316,10 +1024,10 @@ void Worker::AddToBlockedQueue(RunContext *run_ctx, bool wait_for_task) {
 
   // Check if task should go to blocked queue or periodic queue
   // Go to blocked queue if: block_time is 0 OR task is already started
-  if (run_ctx->yield_time_us_ == 0.0) {
+  if (task->YieldTimeUs() == 0.0) {
     // Cooperative task waiting for subtasks - add to blocked queue
     // Increment block count for cooperative tasks
-    run_ctx->yield_count_++;
+    task->SetYieldCount(task->YieldCount() + 1);
 
     // Determine which blocked queue based on block count:
     // Queue[0]: Tasks blocked <=2 times (checked every % 2 iterations)
@@ -1327,26 +1035,27 @@ void Worker::AddToBlockedQueue(RunContext *run_ctx, bool wait_for_task) {
     // Queue[2]: Tasks blocked <= 8 times (checked every % 8 iterations)
     // Queue[3]: Tasks blocked > 8 times (checked every % 16 iterations)
     u32 queue_idx;
-    if (run_ctx->yield_count_ <= 2) {
+    if (task->YieldCount() <= 2) {
       queue_idx = 0;
-    } else if (run_ctx->yield_count_ <= 4) {
+    } else if (task->YieldCount() <= 4) {
       queue_idx = 1;
-    } else if (run_ctx->yield_count_ <= 8) {
+    } else if (task->YieldCount() <= 8) {
       queue_idx = 2;
     } else {
       queue_idx = 3;
     }
 
-    // Add to the appropriate blocked queue
-    blocked_queues_[queue_idx].push(run_ctx);
+    // Add to the appropriate blocked queue. Store the task (owning shared_ptr)
+    // so the task + its RunContext stay alive while blocked.
+    blocked_queues_[queue_idx].push(task);
   } else {
     // Time-based periodic task - add to periodic queue
     // Record the time when task was blocked (if not already set recently)
     // Check if timestamp was set within last 10ms (indicates batch processing)
-    double elapsed_since_block_us = run_ctx->block_start_.GetUsecFromStart();
+    double elapsed_since_block_us = task->BlockStart().GetUsecFromStart();
     if (elapsed_since_block_us > 10000.0 || elapsed_since_block_us < 0) {
       // Timestamp is stale or uninitialized - set it now
-      run_ctx->block_start_.Now();
+      task->BlockStart().Now();
     }
     // else: timestamp is fresh (< 10ms old), keep it to maintain
     // synchronization
@@ -1357,92 +1066,133 @@ void Worker::AddToBlockedQueue(RunContext *run_ctx, bool wait_for_task) {
     // Queue[2]: yield_time_us_ <= 50ms (50000us)
     // Queue[3]: yield_time_us_ > 50ms
     u32 queue_idx;
-    if (run_ctx->yield_time_us_ <= 50.0) {
+    if (task->YieldTimeUs() <= 50.0) {
       queue_idx = 0;
-    } else if (run_ctx->yield_time_us_ <= 200.0) {
+    } else if (task->YieldTimeUs() <= 200.0) {
       queue_idx = 1;
-    } else if (run_ctx->yield_time_us_ <= 50000.0) {
+    } else if (task->YieldTimeUs() <= 50000.0) {
       queue_idx = 2;
     } else {
       queue_idx = 3;
     }
 
-    // Add to the appropriate periodic queue
-    periodic_queues_[queue_idx].push(run_ctx);
+    // Add to the appropriate periodic queue (store the owning task handle).
+    periodic_queues_[queue_idx].push(task);
   }
 }
 
-void Worker::AddToRetryQueue(RunContext *run_ctx_ptr) {
-  retry_queue_.push(run_ctx_ptr);
+void Worker::AddToRetryQueue(const clio::run::shared_ptr<Task> &task) {
+  retry_queue_.push(task);
 }
 
 void Worker::ProcessRetryQueue() {
   size_t count = retry_queue_.size();
   for (size_t i = 0; i < count; ++i) {
-    RunContext *run_ctx = retry_queue_.front();
+    clio::run::shared_ptr<Task> task_ptr = retry_queue_.front();
     retry_queue_.pop();
 
-    FullPtr<Task> task_ptr = run_ctx->task_;
     if (task_ptr.IsNull()) {
       continue;  // Skip invalid entries
     }
 
     // Clear routed so RouteTask re-evaluates.
     // RouteTask handles Retry/Dne internally via AddToRetryQueue.
-    if (RunContext *rc = task_ptr->GetRunCtx()) rc->SetRouted(false);
+    task_ptr->SetRouted(false);
     RouteResult result =
-        CLIO_IPC->RouteTask(run_ctx->future_, /*force_enqueue=*/true);
+        CLIO_IPC->RouteTask(task_ptr->RunFuture(), /*force_enqueue=*/true);
     if (result == RouteResult::ExecHere) {
       // force_enqueue=true means this shouldn't happen, but handle it
-      ExecTask(task_ptr, run_ctx, false);
+      ExecTask(task_ptr, false);
     }
   }
 }
 
-void Worker::ReschedulePeriodicTask(RunContext *run_ctx,
-                                    const FullPtr<Task> &task_ptr) {
-  if (!run_ctx || task_ptr.IsNull() || !task_ptr->IsPeriodic()) {
+void Worker::ReschedulePeriodicTask(clio::run::shared_ptr<Task> &task_ptr) {
+  if (task_ptr.IsNull() || !task_ptr->IsPeriodic()) {
     return;
   }
 
   // Reset timers and predictions for next period
-  run_ctx->cpu_timer_.time_ns_ = 0;
-  run_ctx->wall_timer_.time_ns_ = 0;
-  run_ctx->predicted_load_ = 0;
-  run_ctx->predicted_wall_us_ = 0;
-  run_ctx->predicted_stat_ = TaskStat();
+  task_ptr->RunCpuTimer().time_ns_ = 0;
+  task_ptr->RunWallTimer().time_ns_ = 0;
+  task_ptr->SetPredictedLoad(0);
+  task_ptr->SetPredictedWallUs(0);
+  task_ptr->PredictedStat() = TaskStat();
 
   // Get the lane from the run context
-  TaskLane *lane = run_ctx->lane_;
+  TaskLane *lane = task_ptr->Lane();
   if (!lane) {
     // No lane information, cannot reschedule
     return;
   }
 
   // Unset started when rescheduling periodic task
-  if (RunContext *rc = task_ptr->GetRunCtx()) rc->SetStarted(false);
+  task_ptr->SetStarted(false);
 
   // Adjust polling rate based on whether task did work
   if (scheduler_) {
-    scheduler_->AdjustPolling(run_ctx);
+    scheduler_->AdjustPolling(task_ptr);
   } else {
     // Fallback: use the true period if no scheduler available
-    run_ctx->yield_time_us_ = task_ptr->period_ns_ / 1000.0;
+    task_ptr->SetYieldTimeUs(task_ptr->period_ns_ / 1000.0);
   }
 
   // Reset did_work_ for the next execution
-  run_ctx->did_work_ = false;
+  task_ptr->SetDidWork(false);
 
   // Add to blocked queue - block count will be incremented automatically
-  AddToBlockedQueue(run_ctx);
+  AddToBlockedQueue(task_ptr);
 }
 
-RunContext *GetCurrentRunContextFromWorker() {
+clio::run::shared_ptr<Task> &GetCurrentTask() {
   Worker *worker = CLIO_CUR_WORKER;
   if (worker) {
-    return worker->GetCurrentRunContext();
+    return worker->GetCurrentTask();
   }
-  return nullptr;
+  // Non-worker thread: consult the per-thread fallback holder (set by tests /
+  // direct Container::Run callers via clio::run::SetCurrentTask). The TLS slot
+  // stores a pointer to a heap-allocated shared_ptr<Task> so GetCurrentTask can
+  // hand back a stable reference. Lazily create it so a reader that runs before
+  // any SetCurrentTask still gets a valid (null) handle.
+  if (!chi_cur_runctx_key_created_) {
+    CTP_THREAD_MODEL->CreateTls<clio::run::shared_ptr<Task>>(
+        chi_cur_runctx_key_, nullptr);
+    chi_cur_runctx_key_created_ = true;
+  }
+  auto *holder = CTP_THREAD_MODEL->GetTls<clio::run::shared_ptr<Task>>(
+      chi_cur_runctx_key_);
+  if (!holder) {
+    holder = new clio::run::shared_ptr<Task>();
+    CTP_THREAD_MODEL->SetTls(chi_cur_runctx_key_, holder);
+  }
+  return *holder;
+}
+
+void SetCurrentTask(const clio::run::shared_ptr<Task> &task) {
+  // MUST mirror GetCurrentTask(): on a worker thread the current task lives in
+  // worker->current_task_, so set THAT (not the TLS fallback). Otherwise
+  // SetCurrentTask writes the TLS holder while GetCurrentTask reads the worker's
+  // (never-updated, null) current_task_, and every handler's GetCurrentTask()
+  // comes back null.
+  Worker *worker = CLIO_CUR_WORKER;
+  if (worker) {
+    worker->SetCurrentTask(task);
+    return;
+  }
+  // Non-worker thread: per-thread fallback holder (tests / direct
+  // Container::Run callers).
+  if (!chi_cur_runctx_key_created_) {
+    CTP_THREAD_MODEL->CreateTls<clio::run::shared_ptr<Task>>(
+        chi_cur_runctx_key_, nullptr);
+    chi_cur_runctx_key_created_ = true;
+  }
+  auto *holder = CTP_THREAD_MODEL->GetTls<clio::run::shared_ptr<Task>>(
+      chi_cur_runctx_key_);
+  if (!holder) {
+    holder = new clio::run::shared_ptr<Task>();
+    CTP_THREAD_MODEL->SetTls(chi_cur_runctx_key_, holder);
+  }
+  *holder = task;
 }
 
 }  // namespace clio::run

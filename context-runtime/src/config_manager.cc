@@ -57,7 +57,9 @@ bool ConfigManager::ClientInit() {
   config_file_path_ = GetServerConfigPath();
   HLOG(kInfo, "Config at: {}", config_file_path_);
 
-  // Load YAML configuration if path is provided
+  // Load YAML configuration if path is provided. LoadYaml re-applies the env
+  // overrides itself; do them explicitly here too so a missing/empty config
+  // path still honors CLIO_PORT et al.
   if (!config_file_path_.empty()) {
     if (!LoadYaml(config_file_path_)) {
       HLOG(kError,
@@ -65,9 +67,14 @@ bool ConfigManager::ClientInit() {
             config_file_path_);
     }
   }
+  ApplyEnvOverrides();
 
+  is_initialized_ = true;
+  return true;
+}
+
+void ConfigManager::ApplyEnvOverrides() {
   // Check CLIO_PORT env var (overrides YAML and default).
-  // GetCompat reads CLIO_PORT first, falls back to CLIO_PORT for old deployments.
   if (const char *env = clio::run::env::GetCompat("PORT")) {
     std::string port_env(env);
     if (!port_env.empty()) {
@@ -84,7 +91,6 @@ bool ConfigManager::ClientInit() {
   }
 
   // Check CLIO_SERVER_ADDR env var (overrides default 127.0.0.1).
-  // GetCompat reads CLIO_SERVER_ADDR first, falls back to CLIO_SERVER_ADDR.
   if (const char *env = clio::run::env::GetCompat("SERVER_ADDR")) {
     std::string addr_env(env);
     if (!addr_env.empty()) {
@@ -102,9 +108,6 @@ bool ConfigManager::ClientInit() {
       num_threads_ = static_cast<u32>(n);
     }
   }
-
-  is_initialized_ = true;
-  return true;
 }
 
 bool ConfigManager::ServerInit() {
@@ -114,8 +117,12 @@ bool ConfigManager::ServerInit() {
 
 bool ConfigManager::LoadYaml(const std::string &config_path) {
   try {
-    // Use CTP BaseConfig methods
+    // Use CTP BaseConfig methods. LoadFromFile(..., with_default=true) calls
+    // LoadDefault() first, which resets port_ (and other env-overridable
+    // fields) to compile-time defaults; re-apply the env overrides afterward so
+    // a config reload never silently drops CLIO_PORT et al.
     LoadFromFile(config_path, true);
+    ApplyEnvOverrides();
     return true;
   } catch (const std::exception &e) {
     return false;

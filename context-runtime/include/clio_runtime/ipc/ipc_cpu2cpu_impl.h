@@ -14,12 +14,20 @@ namespace clio::run {
 
 template <typename TaskT>
 Future<TaskT> IpcCpu2Cpu::SendIn(IpcManager *ipc,
-                                      const ctp::ipc::FullPtr<TaskT> &task_ptr) {
+                                      const clio::run::shared_ptr<TaskT> &task_ptr) {
+#if !CTP_IS_HOST
+  // Host-only SHM client path (MPSC server, SystemInfo, mutex). Never invoked
+  // from device kernels; provide an inert device definition so the template
+  // compiles in the GPU device pass.
+  (void)ipc;
+  (void)task_ptr;
+  return Future<TaskT>();
+#else
   if (task_ptr.IsNull()) return Future<TaskT>();
 
   // #642: the task's virtual address is the response key the worker echoes back
   // so this client thread can match the result to the right Future.
-  size_t net_key = reinterpret_cast<size_t>(task_ptr.ptr_);
+  size_t net_key = reinterpret_cast<size_t>(task_ptr.get());
   task_ptr->task_id_.net_key_ = net_key;
 
   // The worker routes the result to "clio-<task_id_.pid_>-<task_id_.tid_>", which
@@ -69,14 +77,21 @@ Future<TaskT> IpcCpu2Cpu::SendIn(IpcManager *ipc,
   // the archive; conn->Send performs the actual MPSC transfer (metadata+data).
   SaveTaskArchive archive(MsgType::kSerializeIn,
                            ipc->shm_send_transport_.get());
-  archive << (*task_ptr.ptr_);
+  archive << (*task_ptr);
   conn->Send(archive);
   return future;
+#endif  // CTP_IS_HOST
 }
 
 template <typename TaskT>
 bool IpcCpu2Cpu::RecvOut(IpcManager *ipc,
                              Future<TaskT> &future, float max_sec) {
+#if !CTP_IS_HOST
+  (void)ipc;
+  (void)future;
+  (void)max_sec;
+  return false;
+#else
   TaskT *task_ptr = future.get();
   auto *tls = ipc->GetTls();
 
@@ -105,6 +120,7 @@ bool IpcCpu2Cpu::RecvOut(IpcManager *ipc,
     }
     CTP_THREAD_MODEL->Yield();
   }
+#endif  // CTP_IS_HOST
 }
 
 }  // namespace clio::run

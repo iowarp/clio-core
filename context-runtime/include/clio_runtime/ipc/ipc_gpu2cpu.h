@@ -68,8 +68,8 @@ struct IpcGpu2Cpu {
    * Note: with the producer-only redesign this no longer touches a
    * lightbeam transport — the GPU never serializes through ZMQ.
    */
-  static ctp::ipc::FullPtr<Task> RecvIn(
-      IpcManager *ipc, Future<Task> &future, Container *container,
+  static clio::run::shared_ptr<Task> RecvIn(
+      IpcManager *ipc, Future<Task> &future,
       u32 method_id, ctp::lbm::Transport *recv_transport);
 
   /**
@@ -78,8 +78,7 @@ struct IpcGpu2Cpu {
    * unblocks.
    */
   static void SendOut(
-      IpcManager *ipc, const FullPtr<Task> &task_ptr,
-      RunContext *run_ctx, Container *container);
+      IpcManager *ipc, const clio::run::shared_ptr<Task> &task_ptr);
 };
 
 }  // namespace clio::run

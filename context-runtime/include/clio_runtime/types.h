@@ -46,10 +46,37 @@
 #include <clio_ctp/memory/allocator/malloc_allocator.h>
 #include <clio_ctp/memory/allocator/round_robin_allocator.h>
 #include <clio_ctp/memory/allocator/thread_allocator.h>
+#include <clio_ctp/memory/smart_ptr/shared_ptr.h>
+#include <clio_ctp/memory/smart_ptr/unique_ptr.h>
 #include <clio_ctp/util/env_compat.h>
 // CLIO_RUN_API + CLIO_RUN_DEFINE_GLOBAL_PTR_VAR_{H,CC} macros (per-DLL
 // export decoration so data globals work across DLL boundaries on Windows).
 #include "clio_runtime/api.h"
+
+/**
+ * Virtual/override qualifiers for Task types.
+ *
+ * The runtime (host) needs a virtual Task destructor so a
+ * clio::run::shared_ptr<clio::run::Task> base-view (allocated by runtime method
+ * id) destroys the concrete derived task. GPU/device code always uses TYPED
+ * tasks (never a base-Task view) and must stay non-virtual: a device class with
+ * a vtable is undesirable, and CUDA forbids a __host__ virtual base destructor
+ * being overridden by a __host__ __device__ derived destructor. So CLIO_VIRTUAL
+ * / CLIO_OVERRIDE expand to virtual/override on host and to nothing on device.
+ */
+#if CTP_IS_HOST
+#define CLIO_VIRTUAL virtual
+#define CLIO_OVERRIDE override
+#else
+#define CLIO_VIRTUAL
+#define CLIO_OVERRIDE
+#endif
+
+// CLIO_THROW: clio-namespaced alias of CTP_THROW. Expands to `throw X` on the
+// host and to nothing on a GPU/device pass (no exceptions there), so Task's
+// null-checked RunContext accessors compile unchanged in device code.
+// Usage: CLIO_THROW(std::runtime_error("..."));
+#define CLIO_THROW(X) CTP_THROW(X)
 
 /**
  * Core type definitions for CLIO Runtime distributed task execution framework
@@ -494,6 +521,21 @@ constexpr PoolId kAdminPoolId =
 //         kernels)
 #define CLIO_QUEUE_ALLOC_T ctp::ipc::BuddyAllocator
 
+/**
+ * Reference-counted, RAII handle to a Task (or any object) allocated from the
+ * private MallocAllocator. This is the canonical owning handle used by the
+ * runtime: IpcManager::NewTask returns one (via ctp::make_shared), Future
+ * stores one, and module methods receive a clio::run::shared_ptr<TaskT>&.
+ * Bridges to the FullPtr-based transport/serialization layer via .get().
+ */
+template <typename T>
+using shared_ptr = ctp::shared_ptr<T, ctp::ipc::MallocAllocator>;
+
+/** Single-owner RAII handle from the private MallocAllocator (host-only alloc).
+ *  Used e.g. for a Task's owned RunContext. */
+template <typename T>
+using unique_ptr = ctp::unique_ptr<T, ctp::ipc::MallocAllocator>;
+
 /** Allocator scope for NewObj: private (warp-local) or shared (cross-warp) */
 enum class AllocScope { kPrivate, kShared };
 
@@ -566,6 +608,9 @@ enum MemorySegment {
 // CTP Thread-local storage keys
 extern CLIO_RUN_API ctp::ThreadLocalKey chi_cur_worker_key_;
 extern CLIO_RUN_API bool chi_cur_worker_key_created_;
+// Fallback current-RunContext TLS for non-worker threads (see manager.cc).
+extern CLIO_RUN_API ctp::ThreadLocalKey chi_cur_runctx_key_;
+extern CLIO_RUN_API bool chi_cur_runctx_key_created_;
 extern CLIO_RUN_API ctp::ThreadLocalKey chi_task_counter_key_;
 // Guards chi_task_counter_key_ creation. Without it a second IpcManager bring-up
 // in the same process (the fallback runtime client) would re-create the global

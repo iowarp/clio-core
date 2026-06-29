@@ -87,7 +87,7 @@ public:
   /**
    * Execute a method on a task
    */
-  clio::run::TaskResume Run(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> task_ptr, clio::run::RunContext& rctx) override;
+  clio::run::TaskResume Run(clio::run::u32 method, clio::run::shared_ptr<clio::run::Task> task_ptr) override;
 
   //===========================================================================
   // Method implementations
@@ -96,17 +96,17 @@ public:
   /**
    * Handle Create task - Initialize the Simple Mod container
    */
-  void Create(ctp::ipc::FullPtr<CreateTask> task, clio::run::RunContext& rctx);
+  void Create(clio::run::shared_ptr<CreateTask> &task);
 
   /**
    * Handle Destroy task - Destroy the Simple Mod container
    */
-  void Destroy(ctp::ipc::FullPtr<DestroyTask> task, clio::run::RunContext& rctx);
+  void Destroy(clio::run::shared_ptr<DestroyTask> &task);
 
   /**
    * Handle Flush task - Flush simple mod operations
    */
-  void Flush(ctp::ipc::FullPtr<FlushTask> task, clio::run::RunContext& rctx);
+  void Flush(clio::run::shared_ptr<FlushTask> &task);
 
   /**
    * Get remaining work count for this simple mod container
@@ -124,41 +124,53 @@ public:
    * @param task_ptr The task to serialize
    */
   void SaveTask(clio::run::u32 method, clio::run::SaveTaskArchive& archive,
-                ctp::ipc::FullPtr<clio::run::Task> task_ptr) override;
+                clio::run::shared_ptr<clio::run::Task>& task_ptr) override;
 
   /**
-   * Deserialize task parameters from network transfer (auto-generated)
-   * @param method The method ID
-   * @param archive LoadTaskArchive for deserialization
-   * @return The deserialized task
+   * Deserialize task parameters into an existing task from network transfer
+   * (auto-generated)
    */
-  ctp::ipc::FullPtr<clio::run::Task> LoadTask(clio::run::u32 method, clio::run::LoadTaskArchive& archive) override;
+  void LoadTask(clio::run::u32 method, clio::run::LoadTaskArchive& archive,
+                clio::run::shared_ptr<clio::run::Task>& task_ptr) override;
 
   /**
-   * Deserialize task for local transfer (auto-generated)
+   * Allocate and deserialize task parameters from network transfer
+   * (auto-generated)
    */
-  ctp::ipc::FullPtr<clio::run::Task> LocalLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive& archive) override;
+  clio::run::shared_ptr<clio::run::Task> AllocLoadTask(clio::run::u32 method, clio::run::LoadTaskArchive& archive) override;
+
+  /**
+   * Deserialize task input parameters into an existing task for local transfer
+   * (auto-generated)
+   */
+  void LocalLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive& archive,
+                     clio::run::shared_ptr<clio::run::Task>& task_ptr) override;
+
+  /**
+   * Allocate and deserialize task input parameters for local transfer
+   * (auto-generated)
+   */
+  clio::run::shared_ptr<clio::run::Task> LocalAllocLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive& archive) override;
 
   /**
    * Serialize task for local transfer (auto-generated)
    */
   void LocalSaveTask(clio::run::u32 method, clio::run::DefaultSaveArchive& archive,
-                     ctp::ipc::FullPtr<clio::run::Task> task_ptr) override;
+                     clio::run::shared_ptr<clio::run::Task>& task_ptr) override;
 
   /**
    * Create a new copy of a task for distributed execution (auto-generated)
    */
-  ctp::ipc::FullPtr<clio::run::Task> NewCopyTask(clio::run::u32 method,
-                                        ctp::ipc::FullPtr<clio::run::Task> orig_task_ptr,
+  clio::run::shared_ptr<clio::run::Task> NewCopyTask(clio::run::u32 method,
+                                        clio::run::shared_ptr<clio::run::Task> &orig_task_ptr,
                                         bool deep) override;
 
   /**
    * Create a new task of the specified method type (auto-generated)
    */
-  ctp::ipc::FullPtr<clio::run::Task> NewTask(clio::run::u32 method) override;
-  void AggregateOut(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> orig_task,
-                 const ctp::ipc::FullPtr<clio::run::Task>& replica_task) override;
-  void DelTask(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> task_ptr) override;
+  clio::run::shared_ptr<clio::run::Task> NewTask(clio::run::u32 method) override;
+  void AggregateOut(clio::run::u32 method, clio::run::shared_ptr<clio::run::Task> &orig_task,
+                 const clio::run::shared_ptr<clio::run::Task>& replica_task) override;
 
 };
 

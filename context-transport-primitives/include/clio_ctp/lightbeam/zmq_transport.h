@@ -39,6 +39,7 @@
 #endif
 #include <zmq.h>
 
+#include <atomic>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -224,13 +225,20 @@ class ZeroMqTransport : public Transport {
       owns_ctx_ = false;
       socket_ = zmq_socket(ctx_, ZMQ_DEALER);
 
-      // ZMQ_IDENTITY: the server's ROUTER uses this as the response
-      // routing prefix.  hostname:pid keeps it debuggable and unique
-      // across processes.
+      // ZMQ_IDENTITY: the server's ROUTER uses this as the response routing
+      // prefix. It MUST be unique per DEALER socket: when several DEALERs in one
+      // process (e.g. per-thread client send sockets) connect to the same ROUTER
+      // with an identical identity, the ROUTER coalesces them onto one
+      // connection and silently drops every sender's frames but one. A
+      // per-process atomic sequence guarantees uniqueness; the host part (before
+      // the first ':') stays parseable for response dial-back.
       {
+        static std::atomic<uint64_t> dealer_seq{0};
         std::string hostname = ctp::SystemInfo::GetHostname();
         uint32_t pid = static_cast<uint32_t>(ctp::SystemInfo::GetPid());
-        std::string identity = hostname + ":" + std::to_string(pid);
+        uint64_t seq = dealer_seq.fetch_add(1, std::memory_order_relaxed);
+        std::string identity = hostname + ":" + std::to_string(pid) + ":" +
+                               std::to_string(seq);
         zmq_setsockopt(socket_, ZMQ_IDENTITY, identity.data(),
                         identity.size());
       }
@@ -590,18 +598,29 @@ class ZeroMqTransport : public Transport {
       meta.client_info_.identity_ = std::string(
           static_cast<char*>(zmq_msg_data(&identity_msg)),
           zmq_msg_size(&identity_msg));
+      int more_after_id = zmq_msg_more(&identity_msg);
       zmq_msg_close(&identity_msg);
+      HLOG(kDebug,
+           "[ZMQRECV] ROUTER got identity='{}' size={} more={} — blocking delim",
+           meta.client_info_.identity_, meta.client_info_.identity_.size(),
+           more_after_id);
 
       zmq_msg_t delim_msg;
       zmq_msg_init(&delim_msg);
       int rc_d = zmq_msg_recv_eintr(&delim_msg, socket_, 0);
+      int more_after_delim = zmq_msg_more(&delim_msg);
+      size_t delim_sz = zmq_msg_size(&delim_msg);
       zmq_msg_close(&delim_msg);
       if (rc_d == -1) {
         zmq_msg_close(&msg);
         return zmq_errno();
       }
+      HLOG(kDebug, "[ZMQRECV] ROUTER got delim size={} more={} — blocking meta",
+           delim_sz, more_after_delim);
 
       rc = zmq_msg_recv_eintr(&msg, socket_, 0);
+      HLOG(kDebug, "[ZMQRECV] ROUTER got meta rc={} size={} more={}", rc,
+           rc >= 0 ? zmq_msg_size(&msg) : 0, zmq_msg_more(&msg));
     } else {
       // DEALER: delim (DONTWAIT for EAGAIN check) then meta (blocking).
       zmq_msg_t delim_msg;

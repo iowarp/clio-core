@@ -57,6 +57,7 @@ using pid_t = int;
 #include <sstream>
 #include <vector>
 
+#include "clio_runtime/dynamic_container.h"
 #include "clio_runtime/pool_query.h"
 #include "clio_runtime/types.h"
 #include "clio_ctp/data_structures/ipc/shm_container.h"
@@ -169,14 +170,31 @@ class Container;
 class IpcManager;
 struct RunContext;
 class Worker;
+// Future is defined later in this header (after Task); forward-declared here so
+// Task's RunContext accessors can name Future<Task, AllocT> by reference.
+// (TaskLane is a `using` alias defined later and cannot be forward-declared, so
+// the lane accessor below uses a deduced return type instead.)
+template <typename TaskT, typename AllocT>
+class Future;
 
 /**
- * Get the current RunContext from thread-local Worker storage
- * This function is implemented in worker.cc to avoid circular dependency
- * between task.h and worker.h
- * @return Pointer to current RunContext, or nullptr if not in a worker thread
+ * Canonical accessor for the task currently executing on this worker thread.
+ * Module method handlers and runtime internals call this instead of receiving a
+ * RunContext (the worker sets the current task before every Run/resume), then
+ * reach the execution state through the Task's accessors. On a worker thread the
+ * worker's own current task is returned; off a worker thread a thread-local
+ * fallback (set via SetCurrentTask) is returned. The returned reference is to a
+ * shared_ptr<Task> that is null when nothing is executing. Defined in worker.cc.
  */
-RunContext* GetCurrentRunContextFromWorker();
+clio::run::shared_ptr<Task>& GetCurrentTask();
+
+/**
+ * Set the fallback current task for THIS thread (used by tests / non-worker
+ * callers that invoke Container::Run directly). On a worker thread the worker's
+ * own current task takes precedence in GetCurrentTask(); this only applies when
+ * there is no current worker. Pass a null handle to clear. Defined in worker.cc.
+ */
+void SetCurrentTask(const clio::run::shared_ptr<Task>& task);
 
 /**
  * TaskGroup - Identifies a scheduling affinity group
@@ -244,35 +262,133 @@ class Task {
   OUT ctp::ipc::atomic<ContainerId>
       completer_; /**< Container ID that completed this task */
   IN u32 pod_size_; /**< sizeof(TaskT) for POD copy transport */
-  /** Raw pointer to host RunContext (cast to RunContext* on CPU, always 0 on GPU).
-   *  Unconditional so sizeof(Task) is identical on CPU and GPU. */
-  TEMP uintptr_t host_run_ctx_ = 0;
+  /** Owned host RunContext (null on GPU and whenever the task is not executing).
+   *  A unique_ptr so the Task frees it automatically — no custom DestroyRunCtx.
+   *  Same size on CPU and GPU (three pointers); RunContext stays merely
+   *  forward-declared here because ctp::unique_ptr destroys via a type-erased
+   *  deleter captured by make_unique (where RunContext is complete). */
+  TEMP clio::run::unique_ptr<RunContext> run_ctx_;
 
 #if CTP_IS_HOST
-  RunContext* GetRunCtx() { return reinterpret_cast<RunContext*>(host_run_ctx_); }
-  const RunContext* GetRunCtx() const { return reinterpret_cast<const RunContext*>(host_run_ctx_); }
-  void SetRunCtx(RunContext* ctx) { host_run_ctx_ = reinterpret_cast<uintptr_t>(ctx); }
-  /** Implemented out-of-line (task.cc) because RunContext is incomplete here */
-  void DestroyRunCtx();
+  /** Allocate a fresh RunContext for this task (begin executing). Frees any
+   *  previously-held context. The RunContext is this Task's private execution-
+   *  state extension — there is deliberately NO accessor that returns it; all
+   *  access goes through the Task accessors below. Defined out-of-line once
+   *  RunContext is a complete type. Called at the ipc_*.cc BeginTask sites. */
+  void BeginRunContext();
+  /** Free this task's RunContext (back to not-executing). */
+  void ResetRunCtx() { run_ctx_.reset(); }
+
+#if CTP_IS_HOST
+  // Coroutine driving lives on the Task (not the Worker): the Task owns its
+  // RunContext and therefore its coroutine frame, so starting/resuming it is the
+  // Task's responsibility. `self` is this task's owning shared_ptr handle (the
+  // worker passes its current_task_); it is needed because Container::Run and the
+  // fiber entry take a shared_ptr<Task>&. Frame teardown is NOT done here — the
+  // RunContext destructor frees the frame when execution ends (RAII).
+  /** First execution: create the coroutine/fiber frame, wire its promise, and
+   *  run it to the first suspension (or completion). */
+  void StartCoroutine(clio::run::shared_ptr<Task> &self);
+  /** Resume a suspended coroutine/fiber after a subtask completes. */
+  void ResumeCoroutine(clio::run::shared_ptr<Task> &self);
+#if defined(CLIO_ENABLE_BOOST_COROUTINES)
+  /** Set up this task's RunContext to run on a fresh Boost.Context fiber (the
+   *  fiber state lives inline in the RunContext; only the stack is pooled). */
+  clio::run::detail::FiberHandle MakeTaskFiber(clio::run::shared_ptr<Task> &self);
+#endif
+#endif  // CTP_IS_HOST
+
+  // ---------------------------------------------------------------------------
+  // RunContext accessors. RunContext is the task's private execution-state
+  // extension; ALL access goes through these. Each one null-checks run_ctx_ and
+  // throws via CLIO_THROW, so callers never touch RunContext fields directly nor
+  // dereference a null RunContext. Defined out-of-line below, once RunContext is
+  // a complete type. Reference-returning accessors exist for the complex members
+  // (timers, future, vectors, coroutine handle) that callers mutate in place.
+  // ---------------------------------------------------------------------------
+  u32 RunWorkerId() const;
+  void SetRunWorkerId(u32 v);
+  bool IsYielded() const;
+  void SetYielded(bool v = true);
+  double YieldTimeUs() const;
+  void SetYieldTimeUs(double v);
+  ctp::Timepoint& BlockStart();
+  DynamicContainer& ExecContainer();
+  const DynamicContainer& ExecContainer() const;
+  /** Mutable reference to the lane pointer (TaskLane*&). Deduced return type so
+   *  this can be declared before TaskLane (a `using` alias) is defined.
+   *  Read: `task->Lane()`; write: `task->Lane() = lane`. */
+  auto &Lane();
+  void* EventQueue() const;
+  void SetEventQueue(void* v);
+  std::vector<PoolQuery>& PoolQueries();
+  std::vector<clio::run::shared_ptr<Task>>& Subtasks();
+  std::atomic<u32>& CompletedReplicas();
+  u32 YieldCount() const;
+  void SetYieldCount(u32 v);
+  Future<Task, CLIO_QUEUE_ALLOC_T>& RunFuture();
+  bool IsNotified() const;
+  void SetNotified(bool v);
+  /** Whether this task's coroutine/fiber has run to completion, without
+   *  dereferencing the (possibly cross-thread-freed) coroutine frame. */
+  bool IsCoroCompleted() const;
+  void SetCoroCompleted(bool v);
+  double TruePeriodNs() const;
+  void SetTruePeriodNs(double v);
+  bool DidWork() const;
+  void SetDidWork(bool v = true);
+  bool IsRouted() const;
+  void SetRouted(bool v = true);
+  bool IsStarted() const;
+  void SetStarted(bool v = true);
+  ctp::CpuTimer& RunCpuTimer();
+  float PredictedLoad() const;
+  void SetPredictedLoad(float v);
+  ctp::HighResMonotonicTimer& RunWallTimer();
+  float PredictedWallUs() const;
+  void SetPredictedWallUs(float v);
+  TaskStat& PredictedStat();
+  /** The parent task waiting on this task's completion (i.e. whose coroutine
+   *  resumes when this task finishes), read through this task's own future.
+   *  Null if this is a top-level / client-originated task. */
+  const clio::run::shared_ptr<Task>& GetParentTask() const;
+  // Coroutine/fiber handle accessor, used by the coroutine await machinery and
+  // this task's own coroutine drivers (StartCoroutine/ResumeCoroutine in
+  // task.cc). The worker does NOT touch the handle.
+#ifndef CLIO_ENABLE_BOOST_COROUTINES
+  std::coroutine_handle<>& CoroHandle();
+#else
+  clio::run::detail::FiberHandle& CoroHandle();
+  clio::run::detail::FiberState& FiberStateRef();
+#endif
+  /** Reset the per-execution STL/scalar state for reuse (RunContext::Clear). */
+  void ClearRunState();
 #endif
 
   /**
-   * Destructor — must explicitly free RunContext since we no longer use unique_ptr.
-   * Host pass uses the out-of-line definition in task.cc; any device pass
-   * (CUDA/ROCm/SYCL) uses `= default`. Switching from CTP_IS_HOST to
-   * !CTP_IS_DEVICE_PASS lets DPC++'s SYCL device pass — where CTP_IS_HOST=1 —
-   * pick the inline default destructor instead of an unresolved declaration.
+   * Destructor — VIRTUAL so that a clio::run::shared_ptr<Task> base view
+   * destructs the concrete derived task correctly when its last reference
+   * drops (tasks are allocated by runtime method id, so the owning handle is
+   * often the base Task type). Must also explicitly free the RunContext since
+   * we no longer use unique_ptr. Host pass uses the out-of-line definition in
+   * task.cc; any device pass (CUDA/ROCm/SYCL) uses `= default`. Switching from
+   * CTP_IS_HOST to !CTP_IS_DEVICE_PASS lets DPC++'s SYCL device pass — where
+   * CTP_IS_HOST=1 — pick the inline default destructor instead of an
+   * unresolved declaration. Virtual on both passes so sizeof(Task) (and the
+   * vptr offset) stays identical between CPU and GPU.
    */
-#if !CTP_IS_DEVICE_PASS
-  ~Task();
-#else
-  ~Task() = default;
-#endif
+  // CTP_CROSS_FUN so the destructor's execution space (__host__ __device__)
+  // matches the derived task destructors (which are CTP_CROSS_FUN); otherwise
+  // nvcc rejects a __host__ __device__ dtor "overriding" a __host__-only virtual
+  // base. CLIO_VIRTUAL makes it virtual on host only (RAII base-view destroy);
+  // on the device pass it is non-virtual so no GPU vtable is generated. The
+  // run_ctx_ unique_ptr member is destroyed automatically (type-erased deleter).
+  CTP_CROSS_FUN CLIO_VIRTUAL ~Task() {}
 
   /**
    * Default constructor
    */
-  CTP_CROSS_FUN Task() { pod_size_ = 0; host_run_ctx_ = 0; SetNull(); }
+  CTP_CROSS_FUN Task() { pod_size_ = 0; SetNull(); }
 
   /**
    * Emplace constructor with task initialization
@@ -288,7 +404,6 @@ class Task {
     pool_query_ = pool_query;
     period_ns_ = 0.0;
     pod_size_ = 0;
-    host_run_ctx_ = 0;
     return_code_.store(0);  // Initialize as success
     completer_.store(0);    // Initialize as null (0 is invalid container ID)
   }
@@ -308,7 +423,7 @@ class Task {
     method_ = other->method_;
     task_flags_ = other->task_flags_;
     period_ns_ = other->period_ns_;
-    // host_run_ctx_ is not copied — each task owns its own RunContext
+    // run_ctx_ is not copied — each task owns its own RunContext (unique_ptr)
     return_code_.store(other->return_code_.load());
     completer_.store(other->completer_.load());
     task_group_ = other->task_group_;
@@ -325,7 +440,7 @@ class Task {
     task_flags_.Clear();
     period_ns_ = 0.0;
 #if CTP_IS_HOST
-    DestroyRunCtx();
+    run_ctx_.reset();
 #endif
     return_code_.store(0);  // Initialize as success
     completer_.store(0);    // Initialize as null (0 is invalid container ID)
@@ -613,7 +728,13 @@ namespace clio::run {
  * handle for C++20 stackless coroutines. When a task yields (co_await),
  * the coro_handle_ is used to resume execution later.
  */
-struct RunContext {
+class RunContext {
+  // RunContext is the Task's PRIVATE execution-state extension: all data
+  // members are private and reached only through Task's accessors (Task is a
+  // friend). No code outside Task/RunContext touches these fields, so there is
+  // no way to dereference a null RunContext by accident.
+  friend class Task;
+
   /** Coroutine handle for C++20 stackless coroutines (or Boost fiber handle) */
 #ifndef CLIO_ENABLE_BOOST_COROUTINES
   std::coroutine_handle<> coro_handle_;
@@ -624,16 +745,18 @@ struct RunContext {
   clio::run::detail::FiberState fiber_state_;
 #endif
   u32 worker_id_;               /**< Worker ID executing this task */
-  FullPtr<Task> task_;          /**< Task being executed by this context */
   bool is_yielded_;             /**< Task is waiting for completion */
   double yield_time_us_;        /**< Time in microseconds for task to yield */
   ctp::Timepoint block_start_; /**< Time when task was blocked (real time) */
-  Container* container_;        /**< Current container being executed */
+  DynamicContainer container_;  /**< Resolved-once handle to the execution
+                                 *   container (always the most-recently-
+                                 *   upgraded version) */
   TaskLane* lane_;              /**< Current lane being processed */
   void* event_queue_;           /**< Pointer to worker's event queue */
   std::vector<PoolQuery>
       pool_queries_; /**< Pool queries for task distribution */
-  std::vector<FullPtr<Task>> subtasks_; /**< Replica tasks for this execution */
+  std::vector<clio::run::shared_ptr<Task>>
+      subtasks_; /**< Replica tasks for this execution (owning handles) */
   // Atomic so SendIn (net_send_worker), RecvOut (net_recv_worker) and
   // FlushStaleStateForNode can update it concurrently without losing
   // increments — a missed bump leaves completed_ < subtasks_.size()
@@ -663,13 +786,14 @@ struct RunContext {
   TaskStat
       predicted_stat_; /**< TaskStat used for prediction (for reinforcement) */
 
+ public:
   RunContext()
       : coro_handle_(),
         worker_id_(0),
         is_yielded_(false),
         yield_time_us_(0.0),
         block_start_(),
-        container_(nullptr),
+        container_(),
         lane_(nullptr),
         event_queue_(nullptr),
         completed_replicas_(0),
@@ -685,11 +809,10 @@ struct RunContext {
   RunContext(RunContext&& other) noexcept
       : coro_handle_(std::move(other.coro_handle_)),
         worker_id_(other.worker_id_),
-        task_(std::move(other.task_)),
         is_yielded_(other.is_yielded_),
         yield_time_us_(other.yield_time_us_),
         block_start_(other.block_start_),
-        container_(other.container_),
+        container_(std::move(other.container_)),
         lane_(other.lane_),
         event_queue_(other.event_queue_),
         pool_queries_(std::move(other.pool_queries_)),
@@ -723,11 +846,10 @@ struct RunContext {
     if (this != &other) {
       coro_handle_ = std::move(other.coro_handle_);
       worker_id_ = other.worker_id_;
-      task_ = std::move(other.task_);
       is_yielded_ = other.is_yielded_;
       yield_time_us_ = other.yield_time_us_;
       block_start_ = other.block_start_;
-      container_ = other.container_;
+      container_ = std::move(other.container_);
       lane_ = other.lane_;
       event_queue_ = other.event_queue_;
       pool_queries_ = std::move(other.pool_queries_);
@@ -754,6 +876,31 @@ struct RunContext {
       other.event_queue_ = nullptr;
     }
     return *this;
+  }
+
+  /**
+   * Destructor: frees the Boost fiber frame this RunContext owns.
+   *
+   * Boost backend: the fiber state lives INLINE in fiber_state_, so the fiber
+   * (and its pooled stack) is freed automatically when this RunContext is
+   * destroyed — frame lifetime is tied to the RunContext, and so to the Task
+   * that owns it via run_ctx_, with no scattered destroy() in the worker. We
+   * detach the FiberHandle first so it cannot be resumed after this point.
+   *
+   * Stackless backend: coro_handle_ is NOT destroyed here. Unlike the inline
+   * fiber state, a C++20 coroutine frame is a separately-heap-allocated object,
+   * and coro_handle_ is a *shared slot* that is repointed to whichever (top-
+   * level or nested-helper) coroutine is currently active — nested-helper frames
+   * are owned by their TaskResume awaiter. So the top-level frame is destroyed
+   * by the task driver on completion (see Task::StartCoroutine/ResumeCoroutine),
+   * not here.
+   */
+  ~RunContext() {
+#if defined(CLIO_ENABLE_BOOST_COROUTINES)
+    coro_handle_ = clio::run::detail::FiberHandle{};
+    // fiber_state_ (and its boost::context::fiber) destructs next, freeing the
+    // stack back to the pool.
+#endif
   }
 
   // Delete copy constructor and copy assignment
@@ -796,6 +943,158 @@ struct RunContext {
 };
 
 // ============================================================================
+// Task RunContext accessors (defined here, where RunContext is complete).
+// Each null-checks run_ctx_ and throws via CLIO_THROW so no caller ever
+// dereferences a null RunContext or touches a field directly. Host-only:
+// RunContext is incomplete on a device pass.
+// ============================================================================
+#if CTP_IS_HOST
+// Log + throw on a null RunContext so the failure is visible (not a silent
+// terminate inside a coroutine). pool/method/task id are logged for context.
+#define CLIO_RCTX_NULL(NAME)                                                   \
+  HLOG(kError,                                                                 \
+       "Task::" #NAME ": null RunContext — task not executing (pool={} "      \
+       "method={} task_id={})",                                               \
+       pool_id_, method_, task_id_.unique_);                                  \
+  CLIO_THROW(std::runtime_error(#NAME ": null RunContext"))
+// Value getter: `RET Task::NAME() const { return run_ctx_->FIELD; }`
+#define CLIO_RCTX_GET(RET, NAME, FIELD)                                       \
+  inline RET Task::NAME() const {                                            \
+    if (!run_ctx_) {                                                          \
+      CLIO_RCTX_NULL(NAME);                                                   \
+    }                                                                        \
+    return run_ctx_->FIELD;                                                  \
+  }
+// Value setter: `void Task::NAME(ARG v) { run_ctx_->FIELD = v; }`
+#define CLIO_RCTX_SET(ARG, NAME, FIELD)                                       \
+  inline void Task::NAME(ARG v) {                                            \
+    if (!run_ctx_) {                                                          \
+      CLIO_RCTX_NULL(NAME);                                                   \
+    }                                                                        \
+    run_ctx_->FIELD = v;                                                     \
+  }
+// Mutable reference accessor: `RET& Task::NAME() { return run_ctx_->FIELD; }`
+#define CLIO_RCTX_REF(RET, NAME, FIELD)                                       \
+  inline RET& Task::NAME() {                                                 \
+    if (!run_ctx_) {                                                          \
+      CLIO_RCTX_NULL(NAME);                                                   \
+    }                                                                        \
+    return run_ctx_->FIELD;                                                  \
+  }
+
+CLIO_RCTX_GET(u32, RunWorkerId, worker_id_)
+CLIO_RCTX_SET(u32, SetRunWorkerId, worker_id_)
+CLIO_RCTX_GET(bool, IsYielded, is_yielded_)
+CLIO_RCTX_SET(bool, SetYielded, is_yielded_)
+CLIO_RCTX_GET(double, YieldTimeUs, yield_time_us_)
+CLIO_RCTX_SET(double, SetYieldTimeUs, yield_time_us_)
+CLIO_RCTX_REF(ctp::Timepoint, BlockStart, block_start_)
+CLIO_RCTX_REF(DynamicContainer, ExecContainer, container_)
+CLIO_RCTX_GET(void*, EventQueue, event_queue_)
+CLIO_RCTX_SET(void*, SetEventQueue, event_queue_)
+CLIO_RCTX_REF(std::vector<PoolQuery>, PoolQueries, pool_queries_)
+CLIO_RCTX_REF(std::vector<clio::run::shared_ptr<Task>>, Subtasks, subtasks_)
+CLIO_RCTX_REF(std::atomic<u32>, CompletedReplicas, completed_replicas_)
+CLIO_RCTX_GET(u32, YieldCount, yield_count_)
+CLIO_RCTX_SET(u32, SetYieldCount, yield_count_)
+CLIO_RCTX_GET(double, TruePeriodNs, true_period_ns_)
+CLIO_RCTX_SET(double, SetTruePeriodNs, true_period_ns_)
+CLIO_RCTX_GET(bool, DidWork, did_work_)
+CLIO_RCTX_SET(bool, SetDidWork, did_work_)
+CLIO_RCTX_GET(bool, IsRouted, routed_)
+CLIO_RCTX_SET(bool, SetRouted, routed_)
+CLIO_RCTX_GET(bool, IsStarted, started_)
+CLIO_RCTX_SET(bool, SetStarted, started_)
+CLIO_RCTX_REF(ctp::CpuTimer, RunCpuTimer, cpu_timer_)
+CLIO_RCTX_GET(float, PredictedLoad, predicted_load_)
+CLIO_RCTX_SET(float, SetPredictedLoad, predicted_load_)
+CLIO_RCTX_REF(ctp::HighResMonotonicTimer, RunWallTimer, wall_timer_)
+CLIO_RCTX_GET(float, PredictedWallUs, predicted_wall_us_)
+CLIO_RCTX_SET(float, SetPredictedWallUs, predicted_wall_us_)
+CLIO_RCTX_REF(TaskStat, PredictedStat, predicted_stat_)
+#ifndef CLIO_ENABLE_BOOST_COROUTINES
+CLIO_RCTX_REF(std::coroutine_handle<>, CoroHandle, coro_handle_)
+#else
+CLIO_RCTX_REF(clio::run::detail::FiberHandle, CoroHandle, coro_handle_)
+CLIO_RCTX_REF(clio::run::detail::FiberState, FiberStateRef, fiber_state_)
+#endif
+
+#undef CLIO_RCTX_GET
+#undef CLIO_RCTX_SET
+#undef CLIO_RCTX_REF
+
+// BeginRunContext() is defined out-of-line in ipc_manager.cc: it allocates the
+// RunContext AND resolves the execution container (GetRealOrStaticContainer),
+// which needs the PoolManager singleton not visible here.
+
+// Deduced-return and atomic/aggregate accessors need bespoke bodies.
+inline auto &Task::Lane() {
+  if (!run_ctx_) {
+    CLIO_RCTX_NULL(Lane);
+  }
+  return run_ctx_->lane_;
+}
+inline Future<Task, CLIO_QUEUE_ALLOC_T>& Task::RunFuture() {
+  if (!run_ctx_) {
+    CLIO_RCTX_NULL(RunFuture);
+  }
+  return run_ctx_->future_;
+}
+inline const clio::run::shared_ptr<Task>& Task::GetParentTask() const {
+  if (!run_ctx_) {
+    CLIO_RCTX_NULL(GetParentTask);
+  }
+  return run_ctx_->future_.GetParentTask();
+}
+inline const DynamicContainer& Task::ExecContainer() const {
+  if (!run_ctx_) {
+    CLIO_RCTX_NULL(ExecContainer);
+  }
+  return run_ctx_->container_;
+}
+inline bool Task::IsNotified() const {
+  if (!run_ctx_) {
+    CLIO_RCTX_NULL(IsNotified);
+  }
+  return run_ctx_->is_notified_.load();
+}
+inline void Task::SetNotified(bool v) {
+  if (!run_ctx_) {
+    CLIO_RCTX_NULL(SetNotified);
+  }
+  run_ctx_->is_notified_.store(v);
+}
+inline bool Task::IsCoroCompleted() const {
+  if (!run_ctx_) {
+    CLIO_RCTX_NULL(IsCoroCompleted);
+  }
+#ifndef CLIO_ENABLE_BOOST_COROUTINES
+  // Stackless: read the flag the top-level coroutine's final_suspend sets
+  // (issue #485). Valid even if a cross-thread completion already freed the
+  // frame, whereas coro_handle_.done() would be a use-after-free.
+  return run_ctx_->coro_completed_.load();
+#else
+  // Boost fiber path has no such flag and is not subject to the same cross-
+  // thread free, so it uses the fiber's own done() state.
+  return run_ctx_->coro_handle_ && run_ctx_->coro_handle_.done();
+#endif
+}
+inline void Task::SetCoroCompleted(bool v) {
+  if (!run_ctx_) {
+    CLIO_RCTX_NULL(SetCoroCompleted);
+  }
+  run_ctx_->coro_completed_.store(v);
+}
+inline void Task::ClearRunState() {
+  if (!run_ctx_) {
+    CLIO_RCTX_NULL(ClearRunState);
+  }
+  run_ctx_->Clear();
+}
+#undef CLIO_RCTX_NULL
+#endif  // CTP_IS_HOST
+
+// ============================================================================
 // Future::await_suspend_impl implementation (must be after RunContext
 // definition)
 // ============================================================================
@@ -804,21 +1103,21 @@ struct RunContext {
 template <typename TaskT, typename AllocT>
 bool Future<TaskT, AllocT>::await_suspend_impl(
     std::coroutine_handle<> handle) noexcept {
-  // Get RunContext from the current worker's thread-local storage
+  // Get the executing task from the current worker's thread-local storage
   // Uses helper function to avoid circular dependency with worker.h
-  RunContext* run_ctx = GetCurrentRunContextFromWorker();
+  clio::run::shared_ptr<Task>& task = GetCurrentTask();
 
-  if (!run_ctx) {
-    // No RunContext available, don't suspend
-    HLOG(kWarning, "Future::await_suspend: run_ctx is null, not suspending!");
+  if (task.IsNull()) {
+    // No executing task available, don't suspend
+    HLOG(kWarning, "Future::await_suspend: no current task, not suspending!");
     return false;
   }
-  // Store parent context for resumption tracking
-  SetParentTask(run_ctx);
-  // Store coroutine handle in RunContext for worker to resume
-  run_ctx->coro_handle_ = handle;
-  run_ctx->is_yielded_ = true;
-  run_ctx->yield_time_us_ = 0.0;
+  // Store parent task for resumption tracking
+  SetParentTask(task);
+  // Store coroutine handle in the task's RunContext for worker to resume
+  task->CoroHandle() = handle;
+  task->SetYielded(true);
+  task->SetYieldTimeUs(0.0);
   return true;  // Suspend the coroutine
 }
 #endif // !CLIO_ENABLE_BOOST_COROUTINES
@@ -846,8 +1145,10 @@ class TaskResume {
    * - return_void: coroutines return void
    */
   struct promise_type {
-    /** Pointer to the RunContext for this coroutine */
-    RunContext* run_ctx_ = nullptr;
+    /** Non-owning pointer to the executing Task for this coroutine. The task
+     *  outlives its coroutine frame, and its RunContext is reached through Task
+     *  accessors — the coroutine never holds a bare RunContext pointer. */
+    Task* task_ = nullptr;
     /** Handle to the caller coroutine (for nested coroutine support) */
     std::coroutine_handle<> caller_handle_ = nullptr;
     /**
@@ -911,8 +1212,8 @@ class TaskResume {
       // frame. We gate on is_top_level_ (not caller_handle_): a nested
       // coroutine that completes synchronously also momentarily has a null
       // caller_handle_, and must NOT be mistaken for task completion.
-      if (is_top_level_ && run_ctx_ != nullptr) {
-        run_ctx_->coro_completed_.store(true, std::memory_order_release);
+      if (is_top_level_ && task_ != nullptr) {
+        task_->SetCoroCompleted(true);
       }
       return FinalAwaiter{caller_handle_};
     }
@@ -923,21 +1224,33 @@ class TaskResume {
     void return_void() {}
 
     /**
-     * Handle unhandled exceptions by terminating
+     * Log the unhandled coroutine exception (e.g. a CLIO_THROW from a null-
+     * RunContext accessor) BEFORE terminating, so the failure is visible in the
+     * log instead of being a silent std::terminate inside the coroutine frame.
      */
-    void unhandled_exception() { std::terminate(); }
+    void unhandled_exception() {
+      try {
+        std::rethrow_exception(std::current_exception());
+      } catch (const std::exception &e) {
+        HLOG(kError, "Coroutine task threw an unhandled exception: {}",
+             e.what());
+      } catch (...) {
+        HLOG(kError, "Coroutine task threw an unhandled (non-std) exception");
+      }
+      std::terminate();
+    }
 
     /**
-     * Set the RunContext for this coroutine
-     * @param ctx Pointer to RunContext
+     * Set the executing Task for this coroutine
+     * @param task Non-owning pointer to the Task
      */
-    void set_run_context(RunContext* ctx) { run_ctx_ = ctx; }
+    void set_task(Task* task) { task_ = task; }
 
     /**
-     * Get the RunContext for this coroutine
-     * @return Pointer to RunContext
+     * Get the executing Task for this coroutine
+     * @return Non-owning pointer to the Task
      */
-    RunContext* get_run_context() const { return run_ctx_; }
+    Task* get_task() const { return task_; }
 
     /**
      * Set the caller coroutine handle
@@ -1095,11 +1408,11 @@ class TaskResume {
     // Store caller handle for await_resume to use when updating run_ctx
     caller_handle_ = caller_handle;
 
-    // CRITICAL: Propagate RunContext from caller to inner coroutine
+    // CRITICAL: Propagate the executing Task from caller to inner coroutine
     // This allows nested co_await on Futures to properly suspend
-    RunContext* caller_run_ctx = caller_handle.promise().get_run_context();
-    if (caller_run_ctx) {
-      handle_.promise().set_run_context(caller_run_ctx);
+    Task* caller_task = caller_handle.promise().get_task();
+    if (caller_task) {
+      handle_.promise().set_task(caller_task);
     }
 
     // NOTE: We do NOT set caller_handle in inner's promise yet!
@@ -1143,20 +1456,22 @@ class TaskResume {
    *    properly resume the caller (outer) coroutine
    */
   void await_resume() noexcept {
-    // Get run_ctx from inner's promise before destroying
-    RunContext* run_ctx = nullptr;
+    // Get the executing task from inner's promise before destroying
+    Task* task = nullptr;
     if (handle_) {
-      run_ctx = handle_.promise().get_run_context();
+      task = handle_.promise().get_task();
       // Inner coroutine is done (final_suspend just resumed us), destroy it
       handle_.destroy();
       handle_ = nullptr;
     }
 
-    // Update run_ctx->coro_handle_ to caller's handle
-    // This ensures if caller suspends again on another co_await,
-    // or if caller completes, the worker can properly handle it
-    if (run_ctx != nullptr && caller_handle_) {
-      run_ctx->coro_handle_ = caller_handle_;
+    // Update the task's coro handle to caller's handle so that if the caller
+    // suspends again on another co_await, or completes, the worker can handle
+    // it. (When the inner completed synchronously inside await_suspend, handle_
+    // is already null and the caller never suspended, so there is nothing to
+    // restore — coro_handle_ still holds the caller's own handle.)
+    if (task != nullptr && caller_handle_) {
+      task->CoroHandle() = caller_handle_;
     }
   }
 };
@@ -1257,15 +1572,15 @@ class YieldAwaiter {
    */
   template <typename PromiseT>
   bool await_suspend(std::coroutine_handle<PromiseT> handle) noexcept {
-    auto* run_ctx = handle.promise().get_run_context();
-    if (!run_ctx) {
-      // No RunContext available, don't suspend
+    Task* task = handle.promise().get_task();
+    if (!task) {
+      // No executing task available, don't suspend
       return false;
     }
-    // Store coroutine handle in RunContext for worker to resume
-    run_ctx->coro_handle_ = handle;
-    run_ctx->is_yielded_ = true;
-    run_ctx->yield_time_us_ = yield_time_us_;
+    // Store coroutine handle in the task's RunContext for worker to resume
+    task->CoroHandle() = handle;
+    task->SetYielded(true);
+    task->SetYieldTimeUs(yield_time_us_);
     return true;  // Suspend the coroutine
   }
 #endif // !CLIO_ENABLE_BOOST_COROUTINES
@@ -1325,25 +1640,25 @@ namespace clio::run::detail {
 
 /// Yield: suspend the running fiber back to the worker.
 inline void boost_await(clio::run::YieldAwaiter ya) {
-  clio::run::RunContext* rctx = clio::run::GetCurrentRunContextFromWorker();
-  if (!rctx) return;
-  rctx->is_yielded_ = true;
-  rctx->yield_time_us_ = ya.get_yield_time_us();
-  fiber_suspend_to_caller(&rctx->fiber_state_);
-  rctx->is_yielded_ = false;
+  clio::run::shared_ptr<clio::run::Task>& task = clio::run::GetCurrentTask();
+  if (task.IsNull()) return;
+  task->SetYielded(true);
+  task->SetYieldTimeUs(ya.get_yield_time_us());
+  fiber_suspend_to_caller(&task->FiberStateRef());
+  task->SetYielded(false);
 }
 
 /// Future: suspend the fiber until the worker observes the future complete.
 template<typename TaskT, typename AllocT>
 inline void boost_await(clio::run::Future<TaskT, AllocT>& future) {
   if (future.IsComplete()) return;
-  clio::run::RunContext* rctx = clio::run::GetCurrentRunContextFromWorker();
-  if (!rctx) return;
-  future.SetParentTask(rctx);
-  rctx->is_yielded_ = true;
-  rctx->yield_time_us_ = 0.0;
-  fiber_suspend_to_caller(&rctx->fiber_state_);
-  rctx->is_yielded_ = false;
+  clio::run::shared_ptr<clio::run::Task>& task = clio::run::GetCurrentTask();
+  if (task.IsNull()) return;
+  future.SetParentTask(task);
+  task->SetYielded(true);
+  task->SetYieldTimeUs(0.0);
+  fiber_suspend_to_caller(&task->FiberStateRef());
+  task->SetYielded(false);
 }
 
 /// Future rvalue overload (for temporaries).

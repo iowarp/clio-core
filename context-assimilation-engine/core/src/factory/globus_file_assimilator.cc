@@ -61,7 +61,7 @@ GlobusFileAssimilator::GlobusFileAssimilator(
 clio::run::TaskResume GlobusFileAssimilator::Schedule(const AssimilationCtx& ctx,
                                                 int& error_code) {
 #ifdef CLIO_ENABLE_BOOST_COROUTINES
-  clio::run::RunContext& rctx = *clio::run::GetCurrentRunContextFromWorker();
+  clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
 #endif
   CLIO_TASK_BODY_BEGIN
 #ifndef CAE_ENABLE_GLOBUS

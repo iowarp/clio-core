@@ -126,7 +126,7 @@ TEST_CASE("SaveTask and LoadTask - Admin CreateTask full flow",
 
   // Get container for SaveTask/LoadTask
   auto *pool_manager = CLIO_POOL_MANAGER;
-  auto *container = pool_manager->GetStaticContainer(clio::run::kAdminPoolId);
+  auto container = pool_manager->GetStaticContainer(clio::run::kAdminPoolId).get();
   REQUIRE(container != nullptr);
 
   // Step 1: Create original task with input parameters
@@ -148,7 +148,7 @@ TEST_CASE("SaveTask and LoadTask - Admin CreateTask full flow",
 
   // Step 2: SaveIn - serialize IN/INOUT parameters
   clio::run::SaveTaskArchive save_in_archive(clio::run::MsgType::kSerializeIn);
-  ctp::ipc::FullPtr<clio::run::Task> orig_task_ptr = orig_task.template Cast<clio::run::Task>();
+  clio::run::shared_ptr<clio::run::Task> orig_task_ptr = orig_task.template Cast<clio::run::Task>();
   container->SaveTask(clio::run::admin::Method::kCreate, save_in_archive,
                       orig_task_ptr);
 
@@ -167,7 +167,7 @@ TEST_CASE("SaveTask and LoadTask - Admin CreateTask full flow",
   loaded_in_task->error_message_ = clio::run::priv::string(CTP_MALLOC, std::string(""));
   load_in_archive >> *loaded_in_task;
 
-  ctp::ipc::FullPtr<clio::run::Task> loaded_in_task_ptr = loaded_in_task.template Cast<clio::run::Task>();
+  clio::run::shared_ptr<clio::run::Task> loaded_in_task_ptr = loaded_in_task.template Cast<clio::run::Task>();
 
   REQUIRE(!loaded_in_task_ptr.IsNull());
 
@@ -194,7 +194,7 @@ TEST_CASE("SaveTask and LoadTask - Admin CreateTask full flow",
 
   // Step 6: SaveOut - serialize OUT/INOUT parameters
   clio::run::SaveTaskArchive save_out_archive(clio::run::MsgType::kSerializeOut);
-  ctp::ipc::FullPtr<clio::run::Task> loaded_in_task_ptr2 = loaded_in_task.template Cast<clio::run::Task>();
+  clio::run::shared_ptr<clio::run::Task> loaded_in_task_ptr2 = loaded_in_task.template Cast<clio::run::Task>();
   container->SaveTask(clio::run::admin::Method::kCreate, save_out_archive,
                       loaded_in_task_ptr2);
 
@@ -230,9 +230,9 @@ TEST_CASE("SaveTask and LoadTask - Admin CreateTask full flow",
   }
 
   // Cleanup
-  ipc_manager->DelTask(orig_task);
-  ipc_manager->DelTask(loaded_in_task);
-  ipc_manager->DelTask(loaded_out_task);
+  orig_task.reset();
+  loaded_in_task.reset();
+  loaded_out_task.reset();
 }
 
 TEST_CASE("SaveTask and LoadTask - Admin FlushTask full flow",
@@ -245,7 +245,7 @@ TEST_CASE("SaveTask and LoadTask - Admin FlushTask full flow",
 
   // Get container
   auto *pool_manager = CLIO_POOL_MANAGER;
-  auto *container = pool_manager->GetStaticContainer(clio::run::kAdminPoolId);
+  auto container = pool_manager->GetStaticContainer(clio::run::kAdminPoolId).get();
   REQUIRE(container != nullptr);
 
   // Step 1: Create original task
@@ -262,7 +262,7 @@ TEST_CASE("SaveTask and LoadTask - Admin FlushTask full flow",
 
   // Step 2: SaveIn - FlushTask has no IN parameters beyond base Task
   clio::run::SaveTaskArchive save_in_archive(clio::run::MsgType::kSerializeIn);
-  ctp::ipc::FullPtr<clio::run::Task> orig_task_ptr = orig_task.template Cast<clio::run::Task>();
+  clio::run::shared_ptr<clio::run::Task> orig_task_ptr = orig_task.template Cast<clio::run::Task>();
   container->SaveTask(clio::run::admin::Method::kFlush, save_in_archive,
                       orig_task_ptr);
 
@@ -289,7 +289,7 @@ TEST_CASE("SaveTask and LoadTask - Admin FlushTask full flow",
 
   // Step 6: SaveOut
   clio::run::SaveTaskArchive save_out_archive(clio::run::MsgType::kSerializeOut);
-  ctp::ipc::FullPtr<clio::run::Task> loaded_in_task_ptr2 = loaded_in_task.template Cast<clio::run::Task>();
+  clio::run::shared_ptr<clio::run::Task> loaded_in_task_ptr2 = loaded_in_task.template Cast<clio::run::Task>();
   container->SaveTask(clio::run::admin::Method::kFlush, save_out_archive,
                       loaded_in_task_ptr2);
 
@@ -310,9 +310,9 @@ TEST_CASE("SaveTask and LoadTask - Admin FlushTask full flow",
   }
 
   // Cleanup
-  ipc_manager->DelTask(orig_task);
-  ipc_manager->DelTask(loaded_in_task);
-  ipc_manager->DelTask(loaded_out_task);
+  orig_task.reset();
+  loaded_in_task.reset();
+  loaded_out_task.reset();
 }
 
 TEST_CASE("SaveTask and LoadTask - Admin SendTask full flow",
@@ -324,7 +324,7 @@ TEST_CASE("SaveTask and LoadTask - Admin SendTask full flow",
 
   // Get container
   auto *pool_manager = CLIO_POOL_MANAGER;
-  auto *container = pool_manager->GetStaticContainer(clio::run::kAdminPoolId);
+  auto container = pool_manager->GetStaticContainer(clio::run::kAdminPoolId).get();
   REQUIRE(container != nullptr);
 
   // Step 1: Create original SendTask (simplified - only transfer_flags parameter)
@@ -341,7 +341,7 @@ TEST_CASE("SaveTask and LoadTask - Admin SendTask full flow",
 
   // Step 2: SaveIn
   clio::run::SaveTaskArchive save_in_archive(clio::run::MsgType::kSerializeIn);
-  ctp::ipc::FullPtr<clio::run::Task> orig_task_ptr = orig_task.template Cast<clio::run::Task>();
+  clio::run::shared_ptr<clio::run::Task> orig_task_ptr = orig_task.template Cast<clio::run::Task>();
   container->SaveTask(clio::run::admin::Method::kSend, save_in_archive,
                       orig_task_ptr);
 
@@ -368,7 +368,7 @@ TEST_CASE("SaveTask and LoadTask - Admin SendTask full flow",
 
   // Step 6: SaveOut
   clio::run::SaveTaskArchive save_out_archive(clio::run::MsgType::kSerializeOut);
-  ctp::ipc::FullPtr<clio::run::Task> loaded_in_task_ptr2 = loaded_in_task.template Cast<clio::run::Task>();
+  clio::run::shared_ptr<clio::run::Task> loaded_in_task_ptr2 = loaded_in_task.template Cast<clio::run::Task>();
   container->SaveTask(clio::run::admin::Method::kSend, save_out_archive,
                       loaded_in_task_ptr2);
 
@@ -391,9 +391,9 @@ TEST_CASE("SaveTask and LoadTask - Admin SendTask full flow",
   }
 
   // Cleanup
-  ipc_manager->DelTask(orig_task);
-  ipc_manager->DelTask(loaded_in_task);
-  ipc_manager->DelTask(loaded_out_task);
+  orig_task.reset();
+  loaded_in_task.reset();
+  loaded_out_task.reset();
 }
 
 TEST_CASE("SaveTask and LoadTask - Admin DestroyPoolTask full flow",
@@ -405,7 +405,7 @@ TEST_CASE("SaveTask and LoadTask - Admin DestroyPoolTask full flow",
 
   // Get container
   auto *pool_manager = CLIO_POOL_MANAGER;
-  auto *container = pool_manager->GetStaticContainer(clio::run::kAdminPoolId);
+  auto container = pool_manager->GetStaticContainer(clio::run::kAdminPoolId).get();
   REQUIRE(container != nullptr);
 
   // Step 1: Create original task with IN parameters
@@ -424,7 +424,7 @@ TEST_CASE("SaveTask and LoadTask - Admin DestroyPoolTask full flow",
 
   // Step 2: SaveIn
   clio::run::SaveTaskArchive save_in_archive(clio::run::MsgType::kSerializeIn);
-  ctp::ipc::FullPtr<clio::run::Task> orig_task_ptr = orig_task.template Cast<clio::run::Task>();
+  clio::run::shared_ptr<clio::run::Task> orig_task_ptr = orig_task.template Cast<clio::run::Task>();
   container->SaveTask(clio::run::admin::Method::kDestroyPool, save_in_archive,
                       orig_task_ptr);
 
@@ -451,7 +451,7 @@ TEST_CASE("SaveTask and LoadTask - Admin DestroyPoolTask full flow",
 
   // Step 6: SaveOut
   clio::run::SaveTaskArchive save_out_archive(clio::run::MsgType::kSerializeOut);
-  ctp::ipc::FullPtr<clio::run::Task> loaded_in_task_ptr2 = loaded_in_task.template Cast<clio::run::Task>();
+  clio::run::shared_ptr<clio::run::Task> loaded_in_task_ptr2 = loaded_in_task.template Cast<clio::run::Task>();
   container->SaveTask(clio::run::admin::Method::kDestroyPool, save_out_archive,
                       loaded_in_task_ptr2);
 
@@ -472,9 +472,9 @@ TEST_CASE("SaveTask and LoadTask - Admin DestroyPoolTask full flow",
   }
 
   // Cleanup
-  ipc_manager->DelTask(orig_task);
-  ipc_manager->DelTask(loaded_in_task);
-  ipc_manager->DelTask(loaded_out_task);
+  orig_task.reset();
+  loaded_in_task.reset();
+  loaded_out_task.reset();
 }
 
 // Define main function for test executable

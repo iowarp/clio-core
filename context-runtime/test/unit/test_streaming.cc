@@ -334,7 +334,7 @@ TEST_CASE("Leak Detector - NewTask leak is detected",
 
   // Leak: allocate tasks via NewTask (global new — invisible to CTP_MALLOC, so
   // this exercises the NewTask/DelTask accounting) and DON'T DelTask them.
-  std::vector<ctp::ipc::FullPtr<TaskT>> tasks;
+  std::vector<clio::run::shared_ptr<TaskT>> tasks;
   tasks.reserve(kNumTasks);
   for (int i = 0; i < kNumTasks; ++i) {
     tasks.push_back(ipc->NewTask<TaskT>());
@@ -346,7 +346,7 @@ TEST_CASE("Leak Detector - NewTask leak is detected",
   REQUIRE(leaked >= before + expected);          // detector found the leak
 
   // Free them: the detector must drop back toward baseline.
-  for (auto &t : tasks) ipc->DelTask(t);
+  for (auto &t : tasks) t.reset();
   const size_t after_free = ipc->GetRuntimeHeapAllocatedBytes();
   REQUIRE(after_free < leaked);
   REQUIRE(after_free <= before + kSlack);

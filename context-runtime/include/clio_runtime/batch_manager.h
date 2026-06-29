@@ -51,9 +51,9 @@ class BatchManager {
   /**
    * Park a ManyToOne task into its batch group. Called on the neighborhood
    * leader from IpcManager::RouteTask. The task already has a RunContext and
-   * a future; both are reachable via task->GetRunCtx().
+   * a future; both are reachable via the task's accessors (e.g. RunFuture()).
    */
-  void Add(const ctp::ipc::FullPtr<Task> &task);
+  void Add(const clio::run::shared_ptr<Task> &task);
 
   /**
    * Flush every group whose batch window has elapsed. Called periodically from
@@ -64,14 +64,13 @@ class BatchManager {
   bool FlushDue(Worker *worker);
 
   /** True if `task` is a synthetic aggregate task produced by FlushDue. */
-  bool IsAggregate(const ctp::ipc::FullPtr<Task> &task) const;
+  bool IsAggregate(const clio::run::shared_ptr<Task> &task) const;
 
   /**
    * Broadcast a completed aggregate's OUT to its batched originals and
    * complete each one. Called from Worker::EndTask for aggregate tasks.
    */
-  void OnAggregateComplete(Worker *worker, const ctp::ipc::FullPtr<Task> &agg,
-                           RunContext *agg_rctx);
+  void OnAggregateComplete(Worker *worker, clio::run::shared_ptr<Task> &agg);
 
  private:
   /** Group identity: matching tasks aggregate together. */
@@ -99,7 +98,7 @@ class BatchManager {
     }
   };
   struct Group {
-    std::vector<ctp::ipc::FullPtr<Task>> members;
+    std::vector<clio::run::shared_ptr<Task>> members;
     u64 deadline_ns = 0;  /**< steady-clock ns of the first arrival + window */
     // AllToOne (count-based barrier): the aggregate does not run until tasks
     // from every container in the pool have arrived. When set, FlushDue ignores
@@ -127,7 +126,7 @@ class BatchManager {
   std::unordered_map<u64, GroupKey> agg_group_;
   /** agg task unique id → its batched originals, awaiting broadcast. */
   std::mutex pending_mu_;
-  std::unordered_map<u64, std::vector<ctp::ipc::FullPtr<Task>>> pending_;
+  std::unordered_map<u64, std::vector<clio::run::shared_ptr<Task>>> pending_;
 };
 
 }  // namespace clio::run

@@ -60,6 +60,11 @@ namespace clio::run {
 // CTP Thread-local storage key definitions
 CLIO_RUN_API ctp::ThreadLocalKey chi_cur_worker_key_;
 CLIO_RUN_API bool chi_cur_worker_key_created_ = false;
+// Fallback current-RunContext for threads that are NOT workers (e.g. tests that
+// invoke Container::Run directly). On a worker thread the worker's own context
+// takes precedence; this TLS is only consulted when there is no current worker.
+CLIO_RUN_API ctp::ThreadLocalKey chi_cur_runctx_key_;
+CLIO_RUN_API bool chi_cur_runctx_key_created_ = false;
 CLIO_RUN_API ctp::ThreadLocalKey chi_task_counter_key_;
 CLIO_RUN_API bool chi_task_counter_key_created_ = false;
 CLIO_RUN_API ctp::ThreadLocalKey chi_is_client_thread_key_;
@@ -87,7 +92,7 @@ TaskId CreateTaskId() {
     Worker *current_worker = CLIO_CUR_WORKER;
     if (current_worker) {
       // Get current task from worker
-      FullPtr<Task> current_task = current_worker->GetCurrentTask();
+      clio::run::shared_ptr<Task> current_task = current_worker->GetCurrentTask();
       if (!current_task.IsNull()) {
         // Copy TaskId from current task, keep replica_id_ same, and allocate
         // new unique from counter

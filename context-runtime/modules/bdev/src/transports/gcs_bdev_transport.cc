@@ -108,8 +108,7 @@ void GcsBdevTransport::FreeBlocks(int worker_id, const std::vector<Block>& block
   allocator_.FreeBlocks(worker_id, blocks);
 }
 
-clio::run::TaskResume GcsBdevTransport::WriteBlocks(ctp::ipc::FullPtr<WriteTask> task, clio::run::RunContext &ctx) {
-  clio::run::RunContext& rctx = ctx;
+clio::run::TaskResume GcsBdevTransport::WriteBlocks(ctp::ipc::FullPtr<WriteTask> task) {
   CLIO_TASK_BODY_BEGIN
 
 #ifdef CLIO_ENABLE_GOOGLE_CLOUD
@@ -161,8 +160,7 @@ clio::run::TaskResume GcsBdevTransport::WriteBlocks(ctp::ipc::FullPtr<WriteTask>
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume GcsBdevTransport::ReadBlocks(ctp::ipc::FullPtr<ReadTask> task, clio::run::RunContext &ctx) {
-  clio::run::RunContext& rctx = ctx;
+clio::run::TaskResume GcsBdevTransport::ReadBlocks(ctp::ipc::FullPtr<ReadTask> task) {
   CLIO_TASK_BODY_BEGIN
 
 #ifdef CLIO_ENABLE_GOOGLE_CLOUD

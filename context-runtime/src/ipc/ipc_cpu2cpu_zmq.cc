@@ -69,7 +69,7 @@ bool IpcCpu2CpuZmq::RecvIn(IpcManager *ipc, u32 &tasks_received) {
       u32 method_id = info.method_id_;
 
       // Get container for deserialization
-      Container *container = pool_manager->GetStaticContainer(pool_id);
+      auto container = pool_manager->GetStaticContainer(pool_id).get();
       if (!container) {
         HLOG(kError, "IpcCpu2CpuZmq::RecvIn: Container not found "
              "for pool_id {}", pool_id);
@@ -77,7 +77,7 @@ bool IpcCpu2CpuZmq::RecvIn(IpcManager *ipc, u32 &tasks_received) {
       }
 
       // Allocate and deserialize the task
-      ctp::ipc::FullPtr<Task> task_ptr =
+      clio::run::shared_ptr<clio::run::Task> task_ptr =
           container->AllocLoadTask(method_id, archive);
 
       // SerializeIn copied any zmq-owned BULK_XFER payloads into
@@ -158,34 +158,32 @@ bool IpcCpu2CpuZmq::RecvIn(IpcManager *ipc, u32 &tasks_received) {
           dial_back =
               ipc->GetOrCreateClientByIdentity(identity, host, client_port);
         }
+        // The inbound ROUTER is recv-only: responses NEVER go back over it (a
+        // worker Send racing the recv thread on the same non-thread-safe ZMQ
+        // socket is exactly what forced sock_mtx_ and deadlocked force_net).
+        // Every live client opens a response listener (client_port_ > 0) and
+        // connects with a "hostname:pid" identity, so dial-back always
+        // resolves. If it ever doesn't, the response is undeliverable — log and
+        // drop rather than echo over the ROUTER.
         if (dial_back) {
           future_shm->response_transport_ = dial_back;
           future_shm->response_identity_len_ = 0;  // DEALER: no identity frame
         } else {
-          // Fallback: echo the response back over the inbound ROUTER using the
-          // captured routing identity. Covers clients that cannot use the
-          // dial-back path: the synchronous fallback-runtime client (advertises
-          // client_port_ == 0 and block-polls its own request DEALER) and any
-          // peer that connected with a ZMQ auto-assigned identity. The ROUTER
-          // already knows this identity (the request just arrived on it), so
-          // the reply routes without parsing or a new connection — slower than
-          // dial-back (shares the socket mutex) but always deliverable.
-          future_shm->response_transport_ = transport;
-          size_t n = std::min(identity.size(),
-                              sizeof(future_shm->response_identity_));
-          std::memcpy(future_shm->response_identity_, identity.data(), n);
-          future_shm->response_identity_len_ = static_cast<u32>(n);
+          HLOG(kError,
+               "IpcCpu2CpuZmq::RecvIn: TCP client {} has no dial-back route "
+               "(client_port={}, identity='{}') — response undeliverable",
+               future_shm->client_pid_, client_port, identity);
+          future_shm->response_transport_ = nullptr;
+          future_shm->response_identity_len_ = 0;
         }
       } else {
         future_shm->response_transport_ = transport;
         future_shm->response_identity_len_ = 0;
       }
-      // Mark as copied so EndTask routes back via lightbeam
-      future_shm->flags_.SetBits(FutureShm::FUTURE_WAS_COPIED);
 
-      // Allocate the task's RunContext now that it is deserialized, before it
-      // is enqueued (the worker no longer does this).
-      ipc->BeginTask(future, nullptr);
+      // Allocate the task's RunContext (and resolve its container) now that it
+      // is deserialized, so RouteTask / the worker have an active RunContext.
+      future.GetTaskPtr()->BeginRunContext();
 
       // Enqueue to worker lane
       LaneId lane_id =
@@ -215,12 +213,13 @@ bool IpcCpu2CpuZmq::RecvIn(IpcManager *ipc, u32 &tasks_received) {
 // EnqueueSendOut: worker-inline enqueue to net_queue_
 //==============================================================================
 
-void IpcCpu2CpuZmq::EnqueueSendOut(IpcManager *ipc, RunContext *run_ctx,
+void IpcCpu2CpuZmq::EnqueueSendOut(IpcManager *ipc,
+                                         const clio::run::shared_ptr<Task> &task,
                                          u32 origin) {
   if (origin == FutureShm::FUTURE_CLIENT_TCP) {
-    ipc->EnqueueNetTask(run_ctx->future_, NetQueuePriority::kClientSendTcp);
+    ipc->EnqueueNetTask(task->RunFuture(), NetQueuePriority::kClientSendTcp);
   } else {
-    ipc->EnqueueNetTask(run_ctx->future_, NetQueuePriority::kClientSendIpc);
+    ipc->EnqueueNetTask(task->RunFuture(), NetQueuePriority::kClientSendIpc);
   }
 }
 
@@ -230,7 +229,7 @@ void IpcCpu2CpuZmq::EnqueueSendOut(IpcManager *ipc, RunContext *run_ctx,
 
 bool IpcCpu2CpuZmq::SendOut(
     IpcManager *ipc, u32 &tasks_sent,
-    std::vector<ctp::ipc::FullPtr<Task>> & /*deferred_deletes — unused*/) {
+    std::vector<clio::run::shared_ptr<Task>> & /*deferred_deletes — unused*/) {
   auto *pool_manager = CLIO_POOL_MANAGER;
   bool did_work = false;
   tasks_sent = 0;
@@ -276,8 +275,8 @@ bool IpcCpu2CpuZmq::SendOut(
       if (future_shm.IsNull()) continue;
 
       // Get container to serialize outputs
-      Container *container =
-          pool_manager->GetStaticContainer(origin_task->pool_id_);
+      auto container =
+          pool_manager->GetStaticContainer(origin_task->pool_id_).get();
       if (!container) {
         HLOG(kError, "IpcCpu2CpuZmq::SendOut: Container not found "
              "for pool_id {}", origin_task->pool_id_);
@@ -300,26 +299,19 @@ bool IpcCpu2CpuZmq::SendOut(
       SaveTaskArchive archive(MsgType::kSerializeOut, response_transport);
       container->SaveTask(origin_task->method_, archive, origin_task);
 
-      // Routing. TCP responses normally go over the dedicated dial-back DEALER
+      // Routing. TCP responses always go over the dedicated dial-back DEALER
       // resolved at RecvIn (response_transport_): a DEALER has exactly one
       // connected peer (the client's response ROUTER), so it auto-routes — no
-      // identity frame. When dial-back was not possible, response_transport_ is
-      // the inbound ROUTER and response_identity_len_ > 0; prepend the captured
-      // identity so the ROUTER routes the reply back over the request socket.
-      // IPC replies still carry the client's socket fd.
+      // identity frame, and crucially never touches the recv-only inbound
+      // ROUTER. IPC replies still carry the client's socket fd.
       if (mode == IpcMode::kIpc) {
         archive.client_info_.fd_ = future_shm->response_fd_;
-      } else if (mode == IpcMode::kTcp &&
-                 future_shm->response_identity_len_ > 0) {
-        archive.client_info_.identity_ =
-            std::string(future_shm->response_identity_,
-                        future_shm->response_identity_len_);
       }
 
       // SYNC send: lightbeam copies bulks into ZMQ inside this call and
       // holds no reference to origin_task's buffers after it returns, so
-      // we DelTask synchronously below.  No async callback, no I/O-thread
-      // race with the task's destructor.
+      // the task can be released as soon as this iteration ends (RAII).
+      // No async callback, no I/O-thread race with the task's destructor.
       //
       // On read responses each task ships a 1 MiB bulk frame; at high
       // concurrency the ROUTER socket can transiently return EAGAIN.
@@ -339,16 +331,9 @@ bool IpcCpu2CpuZmq::SendOut(
         continue;
       }
 
-      // Send succeeded — caller-side buffers are no longer referenced
-      // by ZMQ, so it's safe to delete the task here.
-      {
-        auto *pm = CLIO_POOL_MANAGER;
-        auto *del_container =
-            pm ? pm->GetStaticContainer(origin_task->pool_id_) : nullptr;
-        if (del_container) {
-          del_container->DelTask(origin_task->method_, origin_task);
-        }
-      }
+      // Send succeeded — caller-side buffers are no longer referenced by ZMQ.
+      // The task itself frees via RAII: queued_future (and the origin_task
+      // shared_ptr copy) drop at the end of this loop iteration.
 
       // The server-side FutureShm is owned by the queued Future's shared_ptr
       // (created in RecvIn); when queued_future goes out of scope at the end of

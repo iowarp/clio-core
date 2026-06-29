@@ -39,7 +39,7 @@
 namespace clio::run {
 
 Future<Task> IpcCpu2Self::SendIn(IpcManager *ipc,
-                                      const ctp::ipc::FullPtr<Task> &task_ptr) {
+                                      const clio::run::shared_ptr<Task> &task_ptr) {
   Worker *worker = CLIO_CUR_WORKER;
 
   // Create pointer future (no serialization): the Future owns a fresh FutureShm
@@ -54,16 +54,18 @@ Future<Task> IpcCpu2Self::SendIn(IpcManager *ipc,
   }
 
   if (worker != nullptr) {
-    // Worker thread path: set parent RunContext so EndTask can resume parent
-    RunContext *run_ctx = worker->GetCurrentRunContext();
-    if (run_ctx != nullptr) {
-      future.SetParentTask(run_ctx);
+    // Worker thread path: set the parent task so EndTask can resume its
+    // coroutine when this self-send completes.
+    clio::run::shared_ptr<Task> &cur_task = worker->GetCurrentTask();
+    if (!cur_task.IsNull()) {
+      future.SetParentTask(cur_task);
     }
 
-    // Allocate RunContext before enqueueing
-    ipc->BeginTask(future, nullptr);
+    // Allocate the task's RunContext (and resolve its container) before
+    // enqueueing, so RouteTask / the worker have an active RunContext.
+    future.GetTaskPtr()->BeginRunContext();
 
-    // Use ClientMapTask to pick a lane and enqueue
+    // Use ClientMapTask to pick a lane and enqueue.
     if (ipc->scheduler_ != nullptr) {
       u32 lane_id = ipc->scheduler_->ClientMapTask(ipc, future);
       if (!ipc->worker_queues_.IsNull()) {
@@ -74,49 +76,50 @@ Future<Task> IpcCpu2Self::SendIn(IpcManager *ipc,
       }
     }
   } else {
-    // Non-worker thread path: full routing with force_enqueue
-    ipc->BeginTask(future, nullptr);
+    // Non-worker thread path (e.g. ServerInit's synchronous admin pool
+    // creation, where CLIO_CUR_WORKER is null): allocate the RunContext +
+    // container, then full routing with force_enqueue. BeginRunContext does no
+    // worker-specific setup, so it is safe off a worker thread.
+    future.GetTaskPtr()->BeginRunContext();
     ipc->RouteTask(future, /*force_enqueue=*/true);
   }
 
   return future;
 }
 
-ctp::ipc::FullPtr<Task> IpcCpu2Self::RecvIn(Future<Task> &future) {
+clio::run::shared_ptr<Task> IpcCpu2Self::RecvIn(Future<Task> &future) {
   // No deserialization needed — task is a direct pointer
   return future.GetTaskPtr();
 }
 
-void IpcCpu2Self::SendOut(const FullPtr<Task> &task_ptr,
-                               RunContext *run_ctx,
-                               Container *container,
+void IpcCpu2Self::SendOut(const clio::run::shared_ptr<Task> &task_ptr,
                                ctp::lbm::Transport *send_transport) {
-  auto future_shm = run_ctx->future_.GetFutureShm();
+  auto future_shm = task_ptr->RunFuture().GetFutureShm();
   if (future_shm.IsNull()) {
     return;
   }
-  bool was_copied = future_shm->flags_.Any(FutureShm::FUTURE_WAS_COPIED);
   u32 origin = future_shm->origin_;
 
   // Delegate to origin-based SendRuntime for non-self origins
-  if (was_copied || origin != FutureShm::FUTURE_CLIENT_SHM) {
-    CLIO_IPC->SendRuntime(task_ptr, run_ctx, container, send_transport);
+  if (origin != FutureShm::FUTURE_CLIENT_SHM) {
+    CLIO_IPC->SendRuntime(task_ptr, send_transport);
     return;
   }
 
-  RunContext *parent_task = run_ctx->future_.GetParentTask();
-  if (parent_task && parent_task->event_queue_) {
+  const clio::run::shared_ptr<Task> &parent_task = task_ptr->GetParentTask();
+  if (!parent_task.IsNull() &&
+      parent_task->EventQueue()) {
     // Runtime subtask with parent: enqueue Future to parent worker's event
     // queue. FUTURE_COMPLETE is NOT set here — it will be set by
     // ProcessEventQueue on the parent's worker thread.
     auto *parent_event_queue =
         reinterpret_cast<ctp::ipc::mpsc_ring_buffer<Future<Task, CLIO_QUEUE_ALLOC_T>,
                                                 ctp::ipc::MallocAllocator> *>(
-            parent_task->event_queue_);
-    parent_event_queue->Emplace(run_ctx->future_);
-    if (parent_task->lane_) {
+            parent_task->EventQueue());
+    parent_event_queue->Emplace(task_ptr->RunFuture());
+    if (parent_task->Lane()) {
       // Always signal — see ipc_cpu2cpu_impl.h for the race.
-      CLIO_IPC->AwakenWorker(parent_task->lane_);
+      CLIO_IPC->AwakenWorker(parent_task->Lane());
     }
   } else {
     // Top-level client task: set FUTURE_COMPLETE directly.

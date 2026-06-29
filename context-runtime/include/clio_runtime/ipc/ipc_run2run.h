@@ -67,7 +67,7 @@ static constexpr float kRun2RunRetryTimeoutSec = 30.0f;
 
 /** Entry in a retry queue for tasks that could not be sent */
 struct RetryEntry {
-  ctp::ipc::FullPtr<clio::run::Task> task;
+  clio::run::shared_ptr<clio::run::Task> task;
   clio::run::u64 target_node_id;
   std::chrono::steady_clock::time_point enqueued_at;
 };
@@ -90,14 +90,14 @@ class IpcManagerRun2Run {
    * per replica, serializes, and sends via Lightbeam.  Dead/unreachable nodes
    * are queued in send_in_retry_ for later retry.
    */
-  void SendIn(ctp::ipc::FullPtr<clio::run::Task> origin_task);
+  void SendIn(clio::run::shared_ptr<clio::run::Task> origin_task);
 
   /**
    * Send task outputs back to the originating node.
    * Reads the return-node from pool_query_, serializes via Lightbeam, then
-   * calls DelTask on success.  Failures are queued in send_out_retry_.
+   * drops the task (RAII) on success.  Failures are queued in send_out_retry_.
    */
-  void SendOut(ctp::ipc::FullPtr<clio::run::Task> origin_task);
+  void SendOut(clio::run::shared_ptr<clio::run::Task> origin_task);
 
   /**
    * Receive task inputs from a remote node (inbound kSerializeIn messages).
@@ -170,7 +170,7 @@ class IpcManagerRun2Run {
   /** Resolve the target node_id for one pool query. Returns 0 to skip. */
   clio::run::u64 SendInResolveTargetNode(clio::run::IpcManager *ipc_manager,
                                     clio::run::PoolManager *pool_manager,
-                                    ctp::ipc::FullPtr<clio::run::Task> origin_task,
+                                    clio::run::shared_ptr<clio::run::Task> origin_task,
                                     const clio::run::PoolQuery &query);
 
   /**
@@ -178,11 +178,10 @@ class IpcManagerRun2Run {
    * On failure marks the node dead (if appropriate) and queues in
    * send_in_retry_.
    */
-  void SendInTransmitReplica(clio::run::Container *container,
-                              clio::run::IpcManager *ipc_manager,
-                              ctp::ipc::FullPtr<clio::run::Task> task_copy,
+  void SendInTransmitReplica(clio::run::IpcManager *ipc_manager,
+                              clio::run::shared_ptr<clio::run::Task> task_copy,
                               clio::run::u64 target_node_id,
-                              ctp::ipc::FullPtr<clio::run::Task> origin_task);
+                              clio::run::shared_ptr<clio::run::Task> origin_task);
 
   // ---------------------------------------------------------------------------
   // SendOut sub-functions
@@ -192,9 +191,8 @@ class IpcManagerRun2Run {
    * Serialize origin_task (out-direction) and send to target_node_id.
    * Queues in send_out_retry_ on failure.  Returns the Lightbeam rc.
    */
-  int SendOutTransmit(clio::run::Container *container,
-                      clio::run::IpcManager *ipc_manager,
-                      ctp::ipc::FullPtr<clio::run::Task> origin_task,
+  int SendOutTransmit(clio::run::IpcManager *ipc_manager,
+                      clio::run::shared_ptr<clio::run::Task> origin_task,
                       clio::run::u64 target_node_id,
                       const clio::run::Host *target_host);
 
@@ -236,8 +234,7 @@ class IpcManagerRun2Run {
    * delete replica tasks, remove from send_map_, and call EndTask.
    */
   void RecvOutCompleteOriginTask(size_t net_key,
-                                  ctp::ipc::FullPtr<clio::run::Task> origin_task,
-                                  clio::run::RunContext *origin_rctx);
+                                  clio::run::shared_ptr<clio::run::Task> origin_task);
 
   // ---------------------------------------------------------------------------
   // Retry helpers
@@ -283,8 +280,8 @@ class IpcManagerRun2Run {
   static constexpr size_t kNumMapBuckets = 1024;
   mutable std::mutex send_map_mutex_;
   mutable std::mutex recv_map_mutex_;
-  ctp::priv::unordered_map_ll<size_t, ctp::ipc::FullPtr<clio::run::Task>> send_map_;
-  ctp::priv::unordered_map_ll<size_t, ctp::ipc::FullPtr<clio::run::Task>> recv_map_;
+  ctp::priv::unordered_map_ll<size_t, clio::run::shared_ptr<clio::run::Task>> send_map_;
+  ctp::priv::unordered_map_ll<size_t, clio::run::shared_ptr<clio::run::Task>> recv_map_;
 
   // Retry queues for tasks that could not be sent due to dead / unreachable
   // nodes.  Guarded by retry_queues_mutex_.

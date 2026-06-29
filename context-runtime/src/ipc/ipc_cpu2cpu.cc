@@ -33,11 +33,12 @@ bool IpcCpu2Cpu::RecvIn(IpcManager *ipc, TaskLane *lane) {
     return false;
   }
   const auto &ti = tis[0];
-  Container *container = CLIO_POOL_MANAGER->GetStaticContainer(ti.pool_id_);
+  auto container = CLIO_POOL_MANAGER->GetStaticContainer(ti.pool_id_).get();
   if (container == nullptr) {
     return false;
   }
-  ctp::ipc::FullPtr<Task> tp = container->AllocLoadTask(ti.method_id_, archive);
+  clio::run::shared_ptr<clio::run::Task> tp =
+      container->AllocLoadTask(ti.method_id_, archive);
   if (tp.IsNull()) {
     return false;
   }
@@ -54,33 +55,32 @@ bool IpcCpu2Cpu::RecvIn(IpcManager *ipc, TaskLane *lane) {
   // routes the result back there using these (the OS tid stamped by SendIn).
   fs->waiter_pid_ = ti.task_id_.pid_;
   fs->waiter_tid_ = ti.task_id_.tid_;
-  fs->flags_.SetBits(FutureShm::FUTURE_WAS_COPIED);
-  // Allocate the task's RunContext now that it is deserialized, before it is
-  // visible on the lane (the worker no longer does this).
-  ipc->BeginTask(f, lane);
+  // Allocate the task's RunContext (and resolve its container) now that it is
+  // deserialized, so RouteTask / the worker have an active RunContext.
+  f.GetTaskPtr()->BeginRunContext();
   lane->Push(f);
   return true;
 }
 
-ctp::ipc::FullPtr<Task> IpcCpu2Cpu::RecvIn(
-    IpcManager *ipc, Future<Task> &future, Container *container,
+clio::run::shared_ptr<clio::run::Task> IpcCpu2Cpu::RecvIn(
+    IpcManager *ipc, Future<Task> &future,
     u32 method_id, ctp::lbm::Transport *recv_transport) {
   // The inbound MPSC SHM drain (the RecvIn(ipc, lane) overload above) already
   // deserialized the task from the client's serialized bytes and stamped the
   // Future's task pointer before enqueuing it. There is no inline copy_space to
   // deserialize from here, so just return the already-resolved task pointer.
   (void)ipc;
-  (void)container;
   (void)method_id;
   (void)recv_transport;
   return future.GetTaskPtr();
 }
 
 void IpcCpu2Cpu::SendOut(
-    IpcManager *ipc, const FullPtr<Task> &task_ptr,
-    RunContext *run_ctx, Container *container,
+    IpcManager *ipc, const clio::run::shared_ptr<Task> &task_ptr,
     ctp::lbm::Transport *send_transport) {
-  auto future_shm = run_ctx->future_.GetFutureShm();
+  clio::run::ContainerHold container =
+      CLIO_POOL_MANAGER->GetStaticContainer(task_ptr->pool_id_).get();
+  auto future_shm = task_ptr->RunFuture().GetFutureShm();
 
   // #642: serialize the result and high-level Send it to the originating client
   // thread's MPSC server ("clio-<client_pid>-<client_tid>"). send_transport is
@@ -91,16 +91,18 @@ void IpcCpu2Cpu::SendOut(
   ctp::lbm::ShmMpscTransport *conn = ipc->GetOrCreateShmConn(name);
   if (conn != nullptr) {
     SaveTaskArchive archive(MsgType::kSerializeOut, send_transport);
-    container->SaveTask(task_ptr->method_, archive, task_ptr);
+    // SaveTask takes a non-const shared_ptr&; copy the (const) handle.
+    clio::run::shared_ptr<clio::run::Task> save_handle = task_ptr;
+    container->SaveTask(save_handle->method_, archive, save_handle);
     conn->Send(archive);
   } else {
     HLOG(kError, "IpcCpu2Cpu::SendOut: no client server '{}'", name);
   }
 
-  // Signal completion and clean up
+  // Signal completion. The task frees via RAII when the owning shared_ptr
+  // (held by the worker's RunContext/Future) drops — no explicit DelTask.
   future_shm->flags_.SetBitsSystem(FutureShm::FUTURE_COMPLETE);
   task_ptr->ClearFlags(TASK_DATA_OWNER);
-  container->DelTask(task_ptr->method_, task_ptr);
 }
 
 }  // namespace clio::run

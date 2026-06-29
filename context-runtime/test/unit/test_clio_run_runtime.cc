@@ -99,7 +99,7 @@ public:
    * @return true if task completed, false if timeout
    */
   template <typename TaskT>
-  bool waitForTaskCompletion(ctp::ipc::FullPtr<TaskT> task,
+  bool waitForTaskCompletion(clio::run::shared_ptr<TaskT> task,
                              clio::run::u32 timeout_ms = kTestTimeoutMs) {
     if (task.IsNull()) {
       return false;
@@ -375,7 +375,7 @@ TEST_CASE("Concurrent Task Execution", "[concurrent][stress]") {
 
     // Submit multiple concurrent tasks
     constexpr int kNumTasks = 5;
-    std::vector<ctp::ipc::FullPtr<clio::run::MOD_NAME::CustomTask>> tasks;
+    std::vector<clio::run::shared_ptr<clio::run::MOD_NAME::CustomTask>> tasks;
 
     for (int i = 0; i < kNumTasks; ++i) {
       std::string input_data = "concurrent_test_" + std::to_string(i);

@@ -26,7 +26,7 @@ struct IpcCpu2CpuZmq {
   /** Serialize and send via ZMQ (inbound). */
   template <typename TaskT>
   static Future<TaskT> SendIn(IpcManager *ipc,
-                              const ctp::ipc::FullPtr<TaskT> &task_ptr,
+                              const clio::run::shared_ptr<TaskT> &task_ptr,
                               IpcMode mode);
 
   /**
@@ -43,7 +43,8 @@ struct IpcCpu2CpuZmq {
    * Worker-inline SendOut: enqueue completed task to net_queue_.
    * The actual ZMQ send happens in the net-worker SendOut phase.
    */
-  static void EnqueueSendOut(IpcManager *ipc, RunContext *run_ctx,
+  static void EnqueueSendOut(IpcManager *ipc,
+                             const clio::run::shared_ptr<Task> &task,
                              u32 origin);
 
   /**
@@ -56,7 +57,7 @@ struct IpcCpu2CpuZmq {
    * @return true if any work was done
    */
   static bool SendOut(IpcManager *ipc, u32 &tasks_sent,
-                      std::vector<ctp::ipc::FullPtr<Task>> &deferred_deletes);
+                      std::vector<clio::run::shared_ptr<Task>> &deferred_deletes);
 
   /** Wait for COMPLETE, deserialize from pending archives (outbound). */
   template <typename TaskT>

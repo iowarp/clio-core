@@ -58,21 +58,20 @@ class Runtime : public clio::run::Container {
   ~Runtime() override = default;
 
   // Virtual methods implemented in autogen/core_lib_exec.cc
-  clio::run::TaskResume Run(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> task_ptr, clio::run::RunContext& rctx) override;
+  clio::run::TaskResume Run(clio::run::u32 method, clio::run::shared_ptr<clio::run::Task> task_ptr) override;
   clio::run::u64 GetWorkRemaining() const override;
-  void SaveTask(clio::run::u32 method, clio::run::SaveTaskArchive& archive, ctp::ipc::FullPtr<clio::run::Task> task_ptr) override;
+  void SaveTask(clio::run::u32 method, clio::run::SaveTaskArchive& archive, clio::run::shared_ptr<clio::run::Task>& task_ptr) override;
   void LoadTask(clio::run::u32 method, clio::run::LoadTaskArchive& archive,
-                ctp::ipc::FullPtr<clio::run::Task> task_ptr) override;
-  ctp::ipc::FullPtr<clio::run::Task> AllocLoadTask(clio::run::u32 method, clio::run::LoadTaskArchive& archive) override;
+                clio::run::shared_ptr<clio::run::Task>& task_ptr) override;
+  clio::run::shared_ptr<clio::run::Task> AllocLoadTask(clio::run::u32 method, clio::run::LoadTaskArchive& archive) override;
   void LocalLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive& archive,
-                     ctp::ipc::FullPtr<clio::run::Task> task_ptr) override;
-  ctp::ipc::FullPtr<clio::run::Task> LocalAllocLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive& archive) override;
-  void LocalSaveTask(clio::run::u32 method, clio::run::DefaultSaveArchive& archive, ctp::ipc::FullPtr<clio::run::Task> task_ptr) override;
-  ctp::ipc::FullPtr<clio::run::Task> NewCopyTask(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> orig_task_ptr, bool deep) override;
-  ctp::ipc::FullPtr<clio::run::Task> NewTask(clio::run::u32 method) override;
-  void AggregateOut(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> orig_task,
-                 const ctp::ipc::FullPtr<clio::run::Task>& replica_task) override;
-  void DelTask(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> task_ptr) override;
+                     clio::run::shared_ptr<clio::run::Task>& task_ptr) override;
+  clio::run::shared_ptr<clio::run::Task> LocalAllocLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive& archive) override;
+  void LocalSaveTask(clio::run::u32 method, clio::run::DefaultSaveArchive& archive, clio::run::shared_ptr<clio::run::Task>& task_ptr) override;
+  clio::run::shared_ptr<clio::run::Task> NewCopyTask(clio::run::u32 method, clio::run::shared_ptr<clio::run::Task>& orig_task_ptr, bool deep) override;
+  clio::run::shared_ptr<clio::run::Task> NewTask(clio::run::u32 method) override;
+  void AggregateOut(clio::run::u32 method, clio::run::shared_ptr<clio::run::Task>& orig_task,
+                 const clio::run::shared_ptr<clio::run::Task>& replica_task) override;
   /**
    * Initialize container with pool information (REQUIRED)
    * This is called by the framework before Create is called
@@ -84,19 +83,19 @@ class Runtime : public clio::run::Container {
   /**
    * Monitor container state (Method::kMonitor)
    */
-  clio::run::TaskResume Monitor(ctp::ipc::FullPtr<MonitorTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume Monitor(clio::run::shared_ptr<MonitorTask> &task);
 
   /**
    * Create the container (Method::kCreate)
    * This method creates queues and sets up container resources
    * NOTE: Container is already initialized via Init() before Create is called
    */
-  clio::run::TaskResume Create(ctp::ipc::FullPtr<CreateTask> task, clio::run::RunContext& rctx);
+  clio::run::TaskResume Create(clio::run::shared_ptr<CreateTask> &task);
 
   /**
    * Destroy the container (Method::kDestroy)
    */
-  clio::run::TaskResume Destroy(ctp::ipc::FullPtr<DestroyTask> task, clio::run::RunContext& rctx) {
+  clio::run::TaskResume Destroy(clio::run::shared_ptr<DestroyTask> &task) {
     HLOG(kInfo, "Core container destroyed for pool: {} (ID: {})",
           pool_name_, pool_id_);
     CLIO_TASK_BODY_BEGIN
@@ -109,21 +108,21 @@ class Runtime : public clio::run::Container {
    * This is a coroutine that uses co_await for async assimilator operations.
    * @return TaskResume for coroutine suspension/resumption
    */
-  clio::run::TaskResume ParseOmni(ctp::ipc::FullPtr<ParseOmniTask> task, clio::run::RunContext& rctx);
+  clio::run::TaskResume ParseOmni(clio::run::shared_ptr<ParseOmniTask> &task);
 
   /**
    * ProcessHdf5Dataset - Process a single HDF5 dataset (Method::kProcessHdf5Dataset)
    * Used for distributed processing where each dataset task is routed to a specific node.
    * @return TaskResume for coroutine suspension/resumption
    */
-  clio::run::TaskResume ProcessHdf5Dataset(ctp::ipc::FullPtr<ProcessHdf5DatasetTask> task, clio::run::RunContext& rctx);
+  clio::run::TaskResume ProcessHdf5Dataset(clio::run::shared_ptr<ProcessHdf5DatasetTask> &task);
 
   /**
    * ExportData - Export all blobs in a CTE tag to a file (Method::kExportData)
    * Supports "hdf5" and "binary" formats.
    * @return TaskResume for coroutine suspension/resumption
    */
-  clio::run::TaskResume ExportData(ctp::ipc::FullPtr<ExportDataTask> task, clio::run::RunContext& rctx);
+  clio::run::TaskResume ExportData(clio::run::shared_ptr<ExportDataTask> &task);
 
   /**
    * CTE interceptor handlers (Method::kPutBlob / kGetBlob / kGetOrCreateTag).
@@ -131,21 +130,17 @@ class Runtime : public clio::run::Container {
    * labeling/intelligence yet — just passthrough so a client pointed at
    * the CAE pool transparently lands data in CTE behind it.
    */
-  clio::run::TaskResume PutBlob(ctp::ipc::FullPtr<PutBlobTask> task,
-                          clio::run::RunContext &rctx);
-  clio::run::TaskResume GetBlob(ctp::ipc::FullPtr<GetBlobTask> task,
-                          clio::run::RunContext &rctx);
-  clio::run::TaskResume GetOrCreateTag(ctp::ipc::FullPtr<GetOrCreateTagTask> task,
-                                 clio::run::RunContext &rctx);
-  clio::run::TaskResume SemanticSearch(ctp::ipc::FullPtr<SemanticSearchTask> task,
-                                 clio::run::RunContext &rctx);
+  clio::run::TaskResume PutBlob(clio::run::shared_ptr<PutBlobTask> &task);
+  clio::run::TaskResume GetBlob(clio::run::shared_ptr<GetBlobTask> &task);
+  clio::run::TaskResume GetOrCreateTag(clio::run::shared_ptr<GetOrCreateTagTask> &task);
+  clio::run::TaskResume SemanticSearch(clio::run::shared_ptr<SemanticSearchTask> &task);
 
   /**
    * Resolve PoolQuery::Dynamic() → PoolQuery::Local() for the interceptor
    * methods so they run on the receiving container without re-routing.
    */
   clio::run::PoolQuery ScheduleTask(
-      const ctp::ipc::FullPtr<clio::run::Task> &task) override;
+      const clio::run::shared_ptr<clio::run::Task> &task) override;
 
  private:
   /** Resolve the next pool ID (CTE core) we should forward to. */

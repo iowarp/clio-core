@@ -336,6 +336,15 @@ class ConfigManager : public ctp::BaseConfig {
    */
   void ParseYAML(YAML::Node& yaml_conf) override;
 
+  /**
+   * Apply environment-variable overrides (CLIO_PORT, CLIO_SERVER_ADDR, etc.).
+   * Must run after every (re)load: LoadFromFile resets to defaults via
+   * LoadDefault, so a config reload (e.g. parsing a compose file into this
+   * manager) would otherwise silently drop the env-configured port — which on
+   * the force-net path retargets every forward at the wrong port.
+   */
+  void ApplyEnvOverrides();
+
   bool is_initialized_ = false;
   std::string config_file_path_;
 

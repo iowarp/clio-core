@@ -189,6 +189,12 @@ struct RwLock {
     cur_writer_.fetch_add(1);
   }
 
+  /** @return true while a writer holds (or is waiting/draining for) this lock.
+   *  Used by ContainerPtr::IsPlugged() so a reader can observe that a
+   *  migration/upgrade writer is in progress on the container. */
+  CTP_CROSS_FUN
+  bool IsWriteLocked() const { return writers_.load() > 0; }
+
  private:
   /** Update the mode of the lock */
   CTP_INLINE_CROSS_FUN

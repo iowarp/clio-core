@@ -371,8 +371,8 @@ bool WorkOrchestrator::HasWorkRemaining(u64 &total_work_remaining) const {
     const PoolInfo *info = pool_manager->GetPoolInfo(pool_id);
     if (!info) continue;
     for (const auto &pair : info->containers_) {
-      if (pair.second) {
-        total_work_remaining += pair.second->GetWorkRemaining();
+      if (ContainerHold c = pair.second.get()) {
+        total_work_remaining += c->GetWorkRemaining();
       }
     }
   }

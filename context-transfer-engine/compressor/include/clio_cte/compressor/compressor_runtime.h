@@ -99,85 +99,79 @@ private:
    * Create the container (Method::kCreate)
    * Initializes predictors and loads AI models
    */
-  clio::run::TaskResume Create(ctp::ipc::FullPtr<CreateTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume Create(clio::run::shared_ptr<CreateTask> &task);
 
   /**
    * Destroy the container (Method::kDestroy)
    * Cleanup resources and predictors
    */
-  clio::run::TaskResume Destroy(ctp::ipc::FullPtr<DestroyTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume Destroy(clio::run::shared_ptr<DestroyTask> &task);
 
   /**
    * Monitor container state (Method::kMonitor)
    * Polls core for target information and serializes results with msgpack
    */
-  clio::run::TaskResume Monitor(ctp::ipc::FullPtr<MonitorTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume Monitor(clio::run::shared_ptr<MonitorTask> &task);
 
   /**
    * Dynamic compression scheduling (Method::kDynamicSchedule)
    * Analyzes data and determines optimal compression strategy
    */
-  clio::run::TaskResume DynamicSchedule(ctp::ipc::FullPtr<DynamicScheduleTask> task,
-                                   clio::run::RunContext &rctx);
+  clio::run::TaskResume DynamicSchedule(clio::run::shared_ptr<DynamicScheduleTask> &task);
 
   /**
    * Compress data (Method::kCompress)
    * Executes compression with specified library and parameters
    */
-  clio::run::TaskResume Compress(ctp::ipc::FullPtr<CompressTask> task,
-                            clio::run::RunContext &rctx);
+  clio::run::TaskResume Compress(clio::run::shared_ptr<CompressTask> &task);
 
   /**
    * Decompress data (Method::kDecompress)
    * Executes decompression with specified library and parameters
    */
-  clio::run::TaskResume Decompress(ctp::ipc::FullPtr<DecompressTask> task,
-                              clio::run::RunContext &rctx);
+  clio::run::TaskResume Decompress(clio::run::shared_ptr<DecompressTask> &task);
 
   /**
    * Sample this node's CPU utilization and aggregated worker load
    * (Method::kPollNodeLoad). Writes results into task->sample_.
    */
-  clio::run::TaskResume PollNodeLoad(ctp::ipc::FullPtr<PollNodeLoadTask> task,
-                                clio::run::RunContext &rctx);
+  clio::run::TaskResume PollNodeLoad(clio::run::shared_ptr<PollNodeLoadTask> &task);
 
   /**
    * Periodic task that iterates the tracked consumer list and dispatches
    * PollNodeLoad to each consumer node (Method::kPollConsumers).
    */
-  clio::run::TaskResume PollConsumers(ctp::ipc::FullPtr<PollConsumersTask> task,
-                                 clio::run::RunContext &rctx);
+  clio::run::TaskResume PollConsumers(clio::run::shared_ptr<PollConsumersTask> &task);
 
   /**
    * Schedule a task by resolving Dynamic pool queries.
    */
-  clio::run::PoolQuery ScheduleTask(const ctp::ipc::FullPtr<clio::run::Task> &task) override;
+  clio::run::PoolQuery ScheduleTask(const clio::run::shared_ptr<clio::run::Task> &task) override;
 
   // Autogen-provided methods
   void Init(const clio::run::PoolId &pool_id, const std::string &pool_name,
             clio::run::u32 container_id = 0) override;
-  clio::run::TaskResume Run(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> task_ptr,
-                      clio::run::RunContext &rctx) override;
+  clio::run::TaskResume Run(clio::run::u32 method,
+                      clio::run::shared_ptr<clio::run::Task> task_ptr) override;
   clio::run::u64 GetWorkRemaining() const override;
   void SaveTask(clio::run::u32 method, clio::run::SaveTaskArchive& archive,
-                ctp::ipc::FullPtr<clio::run::Task> task_ptr) override;
+                clio::run::shared_ptr<clio::run::Task>& task_ptr) override;
 
   // Container virtual method implementations (defined in autogen/compressor_lib_exec.cc)
   void LoadTask(clio::run::u32 method, clio::run::LoadTaskArchive &archive,
-                ctp::ipc::FullPtr<clio::run::Task> task_ptr) override;
-  ctp::ipc::FullPtr<clio::run::Task> AllocLoadTask(clio::run::u32 method, clio::run::LoadTaskArchive &archive) override;
-  ctp::ipc::FullPtr<clio::run::Task> NewCopyTask(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> orig_task_ptr,
+                clio::run::shared_ptr<clio::run::Task>& task_ptr) override;
+  clio::run::shared_ptr<clio::run::Task> AllocLoadTask(clio::run::u32 method, clio::run::LoadTaskArchive &archive) override;
+  clio::run::shared_ptr<clio::run::Task> NewCopyTask(clio::run::u32 method, clio::run::shared_ptr<clio::run::Task> &orig_task_ptr,
                                         bool deep) override;
-  ctp::ipc::FullPtr<clio::run::Task> NewTask(clio::run::u32 method) override;
-  void AggregateOut(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> orig_task,
-                 const ctp::ipc::FullPtr<clio::run::Task>& replica_task) override;
-  void DelTask(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> task_ptr) override;
+  clio::run::shared_ptr<clio::run::Task> NewTask(clio::run::u32 method) override;
+  void AggregateOut(clio::run::u32 method, clio::run::shared_ptr<clio::run::Task> &orig_task,
+                 const clio::run::shared_ptr<clio::run::Task>& replica_task) override;
   void LocalLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive &archive,
-                     ctp::ipc::FullPtr<clio::run::Task> task_ptr) override;
-  ctp::ipc::FullPtr<clio::run::Task> LocalAllocLoadTask(clio::run::u32 method,
+                     clio::run::shared_ptr<clio::run::Task>& task_ptr) override;
+  clio::run::shared_ptr<clio::run::Task> LocalAllocLoadTask(clio::run::u32 method,
                                                clio::run::DefaultLoadArchive &archive) override;
   void LocalSaveTask(clio::run::u32 method, clio::run::DefaultSaveArchive &archive,
-                     ctp::ipc::FullPtr<clio::run::Task> task_ptr) override;
+                     clio::run::shared_ptr<clio::run::Task>& task_ptr) override;
 
 private:
   // AI model predictors

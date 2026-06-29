@@ -108,6 +108,23 @@ if(CLIO_CORE_ENABLE_ZMQ)
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+
+    # Isolated reproduction of the runtime's concurrent ZMQ topology:
+    # 4 client senders, 1 client receiver, 1 server receiver, 1 server sender,
+    # the two receivers on separate ports. Driven per-scenario via argv.
+    add_executable(zmq_runtime_pattern_test zmq_runtime_pattern_test.cc)
+    target_link_libraries(zmq_runtime_pattern_test clio_ctp_host ctp::lightbeam ctp::serialize)
+    target_compile_definitions(zmq_runtime_pattern_test PRIVATE CTP_ENABLE_ZMQ)
+    add_test(NAME ctp_zmq_runtime_pattern COMMAND zmq_runtime_pattern_test both)
+    set_tests_properties(ctp_zmq_runtime_pattern PROPERTIES
+        LABELS "msan_skip"
+        RESOURCE_LOCK "lightbeam_port"
+        TIMEOUT 60
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}")
+    install(TARGETS zmq_runtime_pattern_test
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
 endif()
 
 # Thallium transport test (conditional on Thallium)

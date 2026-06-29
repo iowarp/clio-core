@@ -14,12 +14,19 @@ namespace clio::run {
 
 template <typename TaskT>
 Future<TaskT> IpcCpu2CpuZmq::SendIn(IpcManager *ipc,
-                                          const ctp::ipc::FullPtr<TaskT> &task_ptr,
+                                          const clio::run::shared_ptr<TaskT> &task_ptr,
                                           IpcMode mode) {
+#if !CTP_IS_HOST
+  // Host-only ZMQ client path; inert in the device pass (kernels never ZMQ-send).
+  (void)ipc;
+  (void)task_ptr;
+  (void)mode;
+  return Future<TaskT>();
+#else
   if (task_ptr.IsNull()) return Future<TaskT>();
 
   // Set net_key for response routing
-  size_t net_key = reinterpret_cast<size_t>(task_ptr.ptr_);
+  size_t net_key = reinterpret_cast<size_t>(task_ptr.get());
   task_ptr->task_id_.net_key_ = net_key;
 
   // Serialize task inputs
@@ -28,7 +35,7 @@ Future<TaskT> IpcCpu2CpuZmq::SendIn(IpcManager *ipc,
   // opens a dedicated dial-back connection for the response. 0 in IPC mode,
   // where the response returns over the same unix socket.
   archive.client_port_ = ipc->GetClientResponsePort();
-  archive << (*task_ptr.ptr_);
+  archive << (*task_ptr);
 
   // The Future owns a fresh FutureShm via shared_ptr (private memory).
   Future<TaskT> future(task_ptr->pool_id_, task_ptr->method_, task_ptr);
@@ -58,11 +65,18 @@ Future<TaskT> IpcCpu2CpuZmq::SendIn(IpcManager *ipc,
   }
 
   return future;
+#endif  // CTP_IS_HOST
 }
 
 template <typename TaskT>
 bool IpcCpu2CpuZmq::RecvOut(IpcManager *ipc,
                                  Future<TaskT> &future, float max_sec) {
+#if !CTP_IS_HOST
+  (void)ipc;
+  (void)future;
+  (void)max_sec;
+  return false;
+#else
   auto future_shm = future.GetFutureShm();
   TaskT *task_ptr = future.get();
   u32 origin = future_shm->origin_;
@@ -122,10 +136,16 @@ bool IpcCpu2CpuZmq::RecvOut(IpcManager *ipc,
     }
   }
   return true;
+#endif  // CTP_IS_HOST
 }
 
 template <typename TaskT>
 void IpcCpu2CpuZmq::ResendTask(IpcManager *ipc, Future<TaskT> &future) {
+#if !CTP_IS_HOST
+  (void)ipc;
+  (void)future;
+  return;
+#else
   auto future_shm = future.GetFutureShm();
   TaskT *task_ptr = future.get();
   size_t old_net_key = future_shm->client_task_vaddr_;
@@ -162,6 +182,7 @@ void IpcCpu2CpuZmq::ResendTask(IpcManager *ipc, Future<TaskT> &future) {
     std::lock_guard<std::mutex> lock(ipc->zmq_client_send_mutex_);
     ipc->zmq_transport_->Send(archive, ctp::lbm::LbmContext());
   }
+#endif  // CTP_IS_HOST
 }
 
 }  // namespace clio::run

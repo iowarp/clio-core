@@ -31,73 +31,73 @@ void Runtime::Init(const clio::run::PoolId &pool_id, const std::string &pool_nam
   SetMethodNames(Method::GetMethodNames());
 }
 
-clio::run::TaskResume Runtime::Run(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> task_ptr, clio::run::RunContext& rctx) {
+clio::run::TaskResume Runtime::Run(clio::run::u32 method, clio::run::shared_ptr<clio::run::Task> task_ptr) {
   CLIO_TASK_BODY_BEGIN
   switch (method) {
     case Method::kCreate: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<CreateTask> typed_task = task_ptr.template Cast<CreateTask>();
-      CLIO_CO_AWAIT(Create(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<CreateTask>();
+      CLIO_CO_AWAIT(Create(typed_task));
       break;
     }
     case Method::kDestroy: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<DestroyTask> typed_task = task_ptr.template Cast<DestroyTask>();
-      CLIO_CO_AWAIT(Destroy(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<DestroyTask>();
+      CLIO_CO_AWAIT(Destroy(typed_task));
       break;
     }
     case Method::kMonitor: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<MonitorTask> typed_task = task_ptr.template Cast<MonitorTask>();
-      CLIO_CO_AWAIT(Monitor(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<MonitorTask>();
+      CLIO_CO_AWAIT(Monitor(typed_task));
       break;
     }
     case Method::kCustom: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<CustomTask> typed_task = task_ptr.template Cast<CustomTask>();
-      CLIO_CO_AWAIT(Custom(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<CustomTask>();
+      CLIO_CO_AWAIT(Custom(typed_task));
       break;
     }
     case Method::kManyToOneSum: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<ManyToOneSumTask> typed_task = task_ptr.template Cast<ManyToOneSumTask>();
-      CLIO_CO_AWAIT(ManyToOneSum(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<ManyToOneSumTask>();
+      CLIO_CO_AWAIT(ManyToOneSum(typed_task));
       break;
     }
     case Method::kCoMutexTest: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<CoMutexTestTask> typed_task = task_ptr.template Cast<CoMutexTestTask>();
-      CLIO_CO_AWAIT(CoMutexTest(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<CoMutexTestTask>();
+      CLIO_CO_AWAIT(CoMutexTest(typed_task));
       break;
     }
     case Method::kCoRwLockTest: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<CoRwLockTestTask> typed_task = task_ptr.template Cast<CoRwLockTestTask>();
-      CLIO_CO_AWAIT(CoRwLockTest(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<CoRwLockTestTask>();
+      CLIO_CO_AWAIT(CoRwLockTest(typed_task));
       break;
     }
     case Method::kWaitTest: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<WaitTestTask> typed_task = task_ptr.template Cast<WaitTestTask>();
-      CLIO_CO_AWAIT(WaitTest(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<WaitTestTask>();
+      CLIO_CO_AWAIT(WaitTest(typed_task));
       break;
     }
     case Method::kTestLargeOutput: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<TestLargeOutputTask> typed_task = task_ptr.template Cast<TestLargeOutputTask>();
-      CLIO_CO_AWAIT(TestLargeOutput(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<TestLargeOutputTask>();
+      CLIO_CO_AWAIT(TestLargeOutput(typed_task));
       break;
     }
     case Method::kGpuSubmit: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<GpuSubmitTask> typed_task = task_ptr.template Cast<GpuSubmitTask>();
-      CLIO_CO_AWAIT(GpuSubmit(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<GpuSubmitTask>();
+      CLIO_CO_AWAIT(GpuSubmit(typed_task));
       break;
     }
     case Method::kSubtaskTest: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<SubtaskTestTask> typed_task = task_ptr.template Cast<SubtaskTestTask>();
-      CLIO_CO_AWAIT(SubtaskTest(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<SubtaskTestTask>();
+      CLIO_CO_AWAIT(SubtaskTest(typed_task));
       break;
     }
     default: {
@@ -110,61 +110,61 @@ clio::run::TaskResume Runtime::Run(clio::run::u32 method, ctp::ipc::FullPtr<clio
 }
 
 void Runtime::SaveTask(clio::run::u32 method, clio::run::SaveTaskArchive& archive, 
-                        ctp::ipc::FullPtr<clio::run::Task> task_ptr) {
+                        clio::run::shared_ptr<clio::run::Task>& task_ptr) {
   switch (method) {
     case Method::kCreate: {
-      auto typed_task = task_ptr.template Cast<CreateTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<CreateTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kDestroy: {
-      auto typed_task = task_ptr.template Cast<DestroyTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<DestroyTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kMonitor: {
-      auto typed_task = task_ptr.template Cast<MonitorTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<MonitorTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kCustom: {
-      auto typed_task = task_ptr.template Cast<CustomTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<CustomTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kManyToOneSum: {
-      auto typed_task = task_ptr.template Cast<ManyToOneSumTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<ManyToOneSumTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kCoMutexTest: {
-      auto typed_task = task_ptr.template Cast<CoMutexTestTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<CoMutexTestTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kCoRwLockTest: {
-      auto typed_task = task_ptr.template Cast<CoRwLockTestTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<CoRwLockTestTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kWaitTest: {
-      auto typed_task = task_ptr.template Cast<WaitTestTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<WaitTestTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kTestLargeOutput: {
-      auto typed_task = task_ptr.template Cast<TestLargeOutputTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<TestLargeOutputTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kGpuSubmit: {
-      auto typed_task = task_ptr.template Cast<GpuSubmitTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<GpuSubmitTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kSubtaskTest: {
-      auto typed_task = task_ptr.template Cast<SubtaskTestTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<SubtaskTestTask>();
+      archive << *typed_task;
       break;
     }
     default: {
@@ -175,61 +175,61 @@ void Runtime::SaveTask(clio::run::u32 method, clio::run::SaveTaskArchive& archiv
 }
 
 void Runtime::LoadTask(clio::run::u32 method, clio::run::LoadTaskArchive& archive,
-                        ctp::ipc::FullPtr<clio::run::Task> task_ptr) {
+                        clio::run::shared_ptr<clio::run::Task>& task_ptr) {
   switch (method) {
     case Method::kCreate: {
-      auto typed_task = task_ptr.template Cast<CreateTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<CreateTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kDestroy: {
-      auto typed_task = task_ptr.template Cast<DestroyTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<DestroyTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kMonitor: {
-      auto typed_task = task_ptr.template Cast<MonitorTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<MonitorTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kCustom: {
-      auto typed_task = task_ptr.template Cast<CustomTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<CustomTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kManyToOneSum: {
-      auto typed_task = task_ptr.template Cast<ManyToOneSumTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<ManyToOneSumTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kCoMutexTest: {
-      auto typed_task = task_ptr.template Cast<CoMutexTestTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<CoMutexTestTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kCoRwLockTest: {
-      auto typed_task = task_ptr.template Cast<CoRwLockTestTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<CoRwLockTestTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kWaitTest: {
-      auto typed_task = task_ptr.template Cast<WaitTestTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<WaitTestTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kTestLargeOutput: {
-      auto typed_task = task_ptr.template Cast<TestLargeOutputTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<TestLargeOutputTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kGpuSubmit: {
-      auto typed_task = task_ptr.template Cast<GpuSubmitTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<GpuSubmitTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kSubtaskTest: {
-      auto typed_task = task_ptr.template Cast<SubtaskTestTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<SubtaskTestTask>();
+      archive >> *typed_task;
       break;
     }
     default: {
@@ -239,8 +239,8 @@ void Runtime::LoadTask(clio::run::u32 method, clio::run::LoadTaskArchive& archiv
   }
 }
 
-ctp::ipc::FullPtr<clio::run::Task> Runtime::AllocLoadTask(clio::run::u32 method, clio::run::LoadTaskArchive& archive) {
-  ctp::ipc::FullPtr<clio::run::Task> task_ptr = NewTask(method);
+clio::run::shared_ptr<clio::run::Task> Runtime::AllocLoadTask(clio::run::u32 method, clio::run::LoadTaskArchive& archive) {
+  clio::run::shared_ptr<clio::run::Task> task_ptr = NewTask(method);
   if (!task_ptr.IsNull()) {
     LoadTask(method, archive, task_ptr);
   }
@@ -248,72 +248,72 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::AllocLoadTask(clio::run::u32 method,
 }
 
 void Runtime::LocalLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive& archive,
-                            ctp::ipc::FullPtr<clio::run::Task> task_ptr) {
+                            clio::run::shared_ptr<clio::run::Task>& task_ptr) {
   switch (method) {
     case Method::kCreate: {
-      auto typed_task = task_ptr.template Cast<CreateTask>();
+      auto& typed_task = task_ptr.template Cast<CreateTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kDestroy: {
-      auto typed_task = task_ptr.template Cast<DestroyTask>();
+      auto& typed_task = task_ptr.template Cast<DestroyTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kMonitor: {
-      auto typed_task = task_ptr.template Cast<MonitorTask>();
+      auto& typed_task = task_ptr.template Cast<MonitorTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kCustom: {
-      auto typed_task = task_ptr.template Cast<CustomTask>();
+      auto& typed_task = task_ptr.template Cast<CustomTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kManyToOneSum: {
-      auto typed_task = task_ptr.template Cast<ManyToOneSumTask>();
+      auto& typed_task = task_ptr.template Cast<ManyToOneSumTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kCoMutexTest: {
-      auto typed_task = task_ptr.template Cast<CoMutexTestTask>();
+      auto& typed_task = task_ptr.template Cast<CoMutexTestTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kCoRwLockTest: {
-      auto typed_task = task_ptr.template Cast<CoRwLockTestTask>();
+      auto& typed_task = task_ptr.template Cast<CoRwLockTestTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kWaitTest: {
-      auto typed_task = task_ptr.template Cast<WaitTestTask>();
+      auto& typed_task = task_ptr.template Cast<WaitTestTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kTestLargeOutput: {
-      auto typed_task = task_ptr.template Cast<TestLargeOutputTask>();
+      auto& typed_task = task_ptr.template Cast<TestLargeOutputTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kGpuSubmit: {
-      auto typed_task = task_ptr.template Cast<GpuSubmitTask>();
+      auto& typed_task = task_ptr.template Cast<GpuSubmitTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kSubtaskTest: {
-      auto typed_task = task_ptr.template Cast<SubtaskTestTask>();
+      auto& typed_task = task_ptr.template Cast<SubtaskTestTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     default: {
@@ -323,8 +323,8 @@ void Runtime::LocalLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive
   }
 }
 
-ctp::ipc::FullPtr<clio::run::Task> Runtime::LocalAllocLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive& archive) {
-  ctp::ipc::FullPtr<clio::run::Task> task_ptr = NewTask(method);
+clio::run::shared_ptr<clio::run::Task> Runtime::LocalAllocLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive& archive) {
+  clio::run::shared_ptr<clio::run::Task> task_ptr = NewTask(method);
   if (!task_ptr.IsNull()) {
     LocalLoadTask(method, archive, task_ptr);
   }
@@ -332,72 +332,72 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::LocalAllocLoadTask(clio::run::u32 me
 }
 
 void Runtime::LocalSaveTask(clio::run::u32 method, clio::run::DefaultSaveArchive& archive, 
-                             ctp::ipc::FullPtr<clio::run::Task> task_ptr) {
+                             clio::run::shared_ptr<clio::run::Task>& task_ptr) {
   switch (method) {
     case Method::kCreate: {
-      auto typed_task = task_ptr.template Cast<CreateTask>();
+      auto& typed_task = task_ptr.template Cast<CreateTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kDestroy: {
-      auto typed_task = task_ptr.template Cast<DestroyTask>();
+      auto& typed_task = task_ptr.template Cast<DestroyTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kMonitor: {
-      auto typed_task = task_ptr.template Cast<MonitorTask>();
+      auto& typed_task = task_ptr.template Cast<MonitorTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kCustom: {
-      auto typed_task = task_ptr.template Cast<CustomTask>();
+      auto& typed_task = task_ptr.template Cast<CustomTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kManyToOneSum: {
-      auto typed_task = task_ptr.template Cast<ManyToOneSumTask>();
+      auto& typed_task = task_ptr.template Cast<ManyToOneSumTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kCoMutexTest: {
-      auto typed_task = task_ptr.template Cast<CoMutexTestTask>();
+      auto& typed_task = task_ptr.template Cast<CoMutexTestTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kCoRwLockTest: {
-      auto typed_task = task_ptr.template Cast<CoRwLockTestTask>();
+      auto& typed_task = task_ptr.template Cast<CoRwLockTestTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kWaitTest: {
-      auto typed_task = task_ptr.template Cast<WaitTestTask>();
+      auto& typed_task = task_ptr.template Cast<WaitTestTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kTestLargeOutput: {
-      auto typed_task = task_ptr.template Cast<TestLargeOutputTask>();
+      auto& typed_task = task_ptr.template Cast<TestLargeOutputTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kGpuSubmit: {
-      auto typed_task = task_ptr.template Cast<GpuSubmitTask>();
+      auto& typed_task = task_ptr.template Cast<GpuSubmitTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kSubtaskTest: {
-      auto typed_task = task_ptr.template Cast<SubtaskTestTask>();
+      auto& typed_task = task_ptr.template Cast<SubtaskTestTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     default: {
@@ -407,10 +407,10 @@ void Runtime::LocalSaveTask(clio::run::u32 method, clio::run::DefaultSaveArchive
   }
 }
 
-ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> orig_task_ptr, bool deep) {
+clio::run::shared_ptr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, clio::run::shared_ptr<clio::run::Task>& orig_task_ptr, bool deep) {
   auto* ipc_manager = CLIO_IPC;
   if (!ipc_manager) {
-    return ctp::ipc::FullPtr<clio::run::Task>();
+    return clio::run::shared_ptr<clio::run::Task>();
   }
   
   switch (method) {
@@ -419,8 +419,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<CreateTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<CreateTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<CreateTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<CreateTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -430,8 +430,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<DestroyTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<DestroyTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<DestroyTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<DestroyTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -441,8 +441,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<MonitorTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<MonitorTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<MonitorTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<MonitorTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -452,8 +452,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<CustomTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<CustomTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<CustomTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<CustomTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -463,8 +463,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<ManyToOneSumTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<ManyToOneSumTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<ManyToOneSumTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<ManyToOneSumTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -474,8 +474,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<CoMutexTestTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<CoMutexTestTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<CoMutexTestTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<CoMutexTestTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -485,8 +485,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<CoRwLockTestTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<CoRwLockTestTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<CoRwLockTestTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<CoRwLockTestTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -496,8 +496,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<WaitTestTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<WaitTestTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<WaitTestTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<WaitTestTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -507,8 +507,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<TestLargeOutputTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<TestLargeOutputTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<TestLargeOutputTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<TestLargeOutputTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -518,8 +518,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<GpuSubmitTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<GpuSubmitTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<GpuSubmitTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<GpuSubmitTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -529,8 +529,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<SubtaskTestTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<SubtaskTestTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<SubtaskTestTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<SubtaskTestTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -539,7 +539,7 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       // For unknown methods, create base Task copy
       auto new_task_ptr = ipc_manager->NewTask<clio::run::Task>();
       if (!new_task_ptr.IsNull()) {
-        new_task_ptr->Copy(orig_task_ptr);
+        new_task_ptr->Copy(ctp::ipc::FullPtr<clio::run::Task>(orig_task_ptr.get()));
         return new_task_ptr;
       }
       break;
@@ -547,13 +547,13 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
   }
   
   (void)deep;    // Deep copy parameter reserved for future use
-  return ctp::ipc::FullPtr<clio::run::Task>();
+  return clio::run::shared_ptr<clio::run::Task>();
 }
 
-ctp::ipc::FullPtr<clio::run::Task> Runtime::NewTask(clio::run::u32 method) {
+clio::run::shared_ptr<clio::run::Task> Runtime::NewTask(clio::run::u32 method) {
   auto* ipc_manager = CLIO_IPC;
   if (!ipc_manager) {
-    return ctp::ipc::FullPtr<clio::run::Task>();
+    return clio::run::shared_ptr<clio::run::Task>();
   }
   
   switch (method) {
@@ -603,194 +603,140 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewTask(clio::run::u32 method) {
     }
     default: {
       // For unknown methods, return null pointer
-      return ctp::ipc::FullPtr<clio::run::Task>();
+      return clio::run::shared_ptr<clio::run::Task>();
     }
   }
 }
 
-void Runtime::AggregateOut(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> orig_task,
-                        const ctp::ipc::FullPtr<clio::run::Task>& replica_task) {
+void Runtime::AggregateOut(clio::run::u32 method, clio::run::shared_ptr<clio::run::Task>& orig_task,
+                        const clio::run::shared_ptr<clio::run::Task>& replica_task) {
   switch (method) {
     case Method::kCreate: {
-      auto typed_task = orig_task.template Cast<CreateTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<CreateTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kDestroy: {
-      auto typed_task = orig_task.template Cast<DestroyTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<DestroyTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kMonitor: {
-      auto typed_task = orig_task.template Cast<MonitorTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<MonitorTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kCustom: {
-      auto typed_task = orig_task.template Cast<CustomTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<CustomTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kManyToOneSum: {
-      auto typed_task = orig_task.template Cast<ManyToOneSumTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<ManyToOneSumTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kCoMutexTest: {
-      auto typed_task = orig_task.template Cast<CoMutexTestTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<CoMutexTestTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kCoRwLockTest: {
-      auto typed_task = orig_task.template Cast<CoRwLockTestTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<CoRwLockTestTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kWaitTest: {
-      auto typed_task = orig_task.template Cast<WaitTestTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<WaitTestTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kTestLargeOutput: {
-      auto typed_task = orig_task.template Cast<TestLargeOutputTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<TestLargeOutputTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kGpuSubmit: {
-      auto typed_task = orig_task.template Cast<GpuSubmitTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<GpuSubmitTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kSubtaskTest: {
-      auto typed_task = orig_task.template Cast<SubtaskTestTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<SubtaskTestTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     default: {
-      orig_task->AggregateOut(replica_task);
-      break;
-    }
-  }
-}
-
-void Runtime::AggregateIn(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> agg_task,
-                        const ctp::ipc::FullPtr<clio::run::Task>& member_task) {
-  switch (method) {
-    case Method::kCreate: {
-      auto typed_task = agg_task.template Cast<CreateTask>();
-      typed_task->AggregateIn(member_task);
-      break;
-    }
-    case Method::kDestroy: {
-      auto typed_task = agg_task.template Cast<DestroyTask>();
-      typed_task->AggregateIn(member_task);
-      break;
-    }
-    case Method::kMonitor: {
-      auto typed_task = agg_task.template Cast<MonitorTask>();
-      typed_task->AggregateIn(member_task);
-      break;
-    }
-    case Method::kCustom: {
-      auto typed_task = agg_task.template Cast<CustomTask>();
-      typed_task->AggregateIn(member_task);
-      break;
-    }
-    case Method::kManyToOneSum: {
-      auto typed_task = agg_task.template Cast<ManyToOneSumTask>();
-      typed_task->AggregateIn(member_task);
-      break;
-    }
-    case Method::kCoMutexTest: {
-      auto typed_task = agg_task.template Cast<CoMutexTestTask>();
-      typed_task->AggregateIn(member_task);
-      break;
-    }
-    case Method::kCoRwLockTest: {
-      auto typed_task = agg_task.template Cast<CoRwLockTestTask>();
-      typed_task->AggregateIn(member_task);
-      break;
-    }
-    case Method::kWaitTest: {
-      auto typed_task = agg_task.template Cast<WaitTestTask>();
-      typed_task->AggregateIn(member_task);
-      break;
-    }
-    case Method::kTestLargeOutput: {
-      auto typed_task = agg_task.template Cast<TestLargeOutputTask>();
-      typed_task->AggregateIn(member_task);
-      break;
-    }
-    case Method::kGpuSubmit: {
-      auto typed_task = agg_task.template Cast<GpuSubmitTask>();
-      typed_task->AggregateIn(member_task);
-      break;
-    }
-    case Method::kSubtaskTest: {
-      auto typed_task = agg_task.template Cast<SubtaskTestTask>();
-      typed_task->AggregateIn(member_task);
-      break;
-    }
-    default: {
-      agg_task->AggregateIn(member_task);
+      orig_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
   }
 }
 
-void Runtime::DelTask(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> task_ptr) {
-  auto* ipc_manager = CLIO_IPC;
-  if (!ipc_manager) return;
+void Runtime::AggregateIn(clio::run::u32 method, clio::run::shared_ptr<clio::run::Task>& agg_task,
+                        const clio::run::shared_ptr<clio::run::Task>& member_task) {
   switch (method) {
     case Method::kCreate: {
-      ipc_manager->DelTask(task_ptr.template Cast<CreateTask>());
+      auto& typed_task = agg_task.template Cast<CreateTask>();
+      typed_task->AggregateIn(ctp::ipc::FullPtr<clio::run::Task>(member_task.get()));
       break;
     }
     case Method::kDestroy: {
-      ipc_manager->DelTask(task_ptr.template Cast<DestroyTask>());
+      auto& typed_task = agg_task.template Cast<DestroyTask>();
+      typed_task->AggregateIn(ctp::ipc::FullPtr<clio::run::Task>(member_task.get()));
       break;
     }
     case Method::kMonitor: {
-      ipc_manager->DelTask(task_ptr.template Cast<MonitorTask>());
+      auto& typed_task = agg_task.template Cast<MonitorTask>();
+      typed_task->AggregateIn(ctp::ipc::FullPtr<clio::run::Task>(member_task.get()));
       break;
     }
     case Method::kCustom: {
-      ipc_manager->DelTask(task_ptr.template Cast<CustomTask>());
+      auto& typed_task = agg_task.template Cast<CustomTask>();
+      typed_task->AggregateIn(ctp::ipc::FullPtr<clio::run::Task>(member_task.get()));
       break;
     }
     case Method::kManyToOneSum: {
-      ipc_manager->DelTask(task_ptr.template Cast<ManyToOneSumTask>());
+      auto& typed_task = agg_task.template Cast<ManyToOneSumTask>();
+      typed_task->AggregateIn(ctp::ipc::FullPtr<clio::run::Task>(member_task.get()));
       break;
     }
     case Method::kCoMutexTest: {
-      ipc_manager->DelTask(task_ptr.template Cast<CoMutexTestTask>());
+      auto& typed_task = agg_task.template Cast<CoMutexTestTask>();
+      typed_task->AggregateIn(ctp::ipc::FullPtr<clio::run::Task>(member_task.get()));
       break;
     }
     case Method::kCoRwLockTest: {
-      ipc_manager->DelTask(task_ptr.template Cast<CoRwLockTestTask>());
+      auto& typed_task = agg_task.template Cast<CoRwLockTestTask>();
+      typed_task->AggregateIn(ctp::ipc::FullPtr<clio::run::Task>(member_task.get()));
       break;
     }
     case Method::kWaitTest: {
-      ipc_manager->DelTask(task_ptr.template Cast<WaitTestTask>());
+      auto& typed_task = agg_task.template Cast<WaitTestTask>();
+      typed_task->AggregateIn(ctp::ipc::FullPtr<clio::run::Task>(member_task.get()));
       break;
     }
     case Method::kTestLargeOutput: {
-      ipc_manager->DelTask(task_ptr.template Cast<TestLargeOutputTask>());
+      auto& typed_task = agg_task.template Cast<TestLargeOutputTask>();
+      typed_task->AggregateIn(ctp::ipc::FullPtr<clio::run::Task>(member_task.get()));
       break;
     }
     case Method::kGpuSubmit: {
-      ipc_manager->DelTask(task_ptr.template Cast<GpuSubmitTask>());
+      auto& typed_task = agg_task.template Cast<GpuSubmitTask>();
+      typed_task->AggregateIn(ctp::ipc::FullPtr<clio::run::Task>(member_task.get()));
       break;
     }
     case Method::kSubtaskTest: {
-      ipc_manager->DelTask(task_ptr.template Cast<SubtaskTestTask>());
+      auto& typed_task = agg_task.template Cast<SubtaskTestTask>();
+      typed_task->AggregateIn(ctp::ipc::FullPtr<clio::run::Task>(member_task.get()));
       break;
     }
     default: {
-      ipc_manager->DelTask(task_ptr);
+      agg_task->AggregateIn(ctp::ipc::FullPtr<clio::run::Task>(member_task.get()));
       break;
     }
   }
 }
+
 
 } // namespace clio::run::MOD_NAME

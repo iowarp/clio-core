@@ -251,7 +251,7 @@ class Client : public clio::run::ContainerClient {
     // cross-node comparisons assume NTP-synced wall clocks (ares is
     // ~ms-synced via the cluster's chrony). Set after NewTask so it
     // overwrites the ctor's 0.
-    task.ptr_->submit_ts_ns_ =
+    task.get()->submit_ts_ns_ =
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now().time_since_epoch())
             .count();

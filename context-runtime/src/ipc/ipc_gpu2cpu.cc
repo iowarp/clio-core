@@ -36,7 +36,7 @@ bool IpcGpu2Cpu::RecvIn(IpcManager *ipc, GpuTaskLane *gpu_lane, Worker *worker) 
   HLOG(kDebug, "IpcGpu2Cpu::RecvIn: worker {} popped task from gpu2cpu queue",
        worker_id);
 
-  worker->SetCurrentRunContext(nullptr);
+  worker->SetCurrentTask(clio::run::shared_ptr<Task>());
 
   ctp::ipc::ShmPtr<gpu::FutureShm> gpu_fshm_shmptr = gpu_future.GetFutureShmPtr();
   ctp::ipc::ShmPtr<Task> task_shmptr = gpu_future.GetTaskPtr().shm_;
@@ -99,9 +99,10 @@ bool IpcGpu2Cpu::RecvIn(IpcManager *ipc, GpuTaskLane *gpu_lane, Worker *worker) 
   PoolId pool_id = task_raw->pool_id_;
   u32 method_id = task_raw->method_;
 
-  ctp::ipc::FullPtr<Task> task_full_ptr(task_raw);
-
-  Future<Task> future(pool_id, method_id, task_full_ptr);
+  // task_raw points into a reused worker scratch buffer (or device memory), not
+  // a make_shared block — wrap it NON-OWNING so the Future frees nothing.
+  Future<Task> future(pool_id, method_id,
+                      clio::run::shared_ptr<Task>::WrapNonOwning(task_raw));
   if (future.GetFutureShmPtr().IsNull()) {
     HLOG(kError,
          "IpcGpu2Cpu::RecvIn: worker {} Future construction failed (pool={}, "
@@ -127,7 +128,7 @@ bool IpcGpu2Cpu::RecvIn(IpcManager *ipc, GpuTaskLane *gpu_lane, Worker *worker) 
   chi_fshm->gpu_task_size_ = task_pod_size;
 
   auto *pool_manager = CLIO_POOL_MANAGER;
-  Container *container = pool_manager->GetStaticContainer(pool_id);
+  auto container = pool_manager->GetStaticContainer(pool_id).get();
   if (!container) {
     HLOG(kError,
          "IpcGpu2Cpu::RecvIn: worker {} Container not found (pool={}, method={})",
@@ -151,12 +152,12 @@ bool IpcGpu2Cpu::RecvIn(IpcManager *ipc, GpuTaskLane *gpu_lane, Worker *worker) 
   // the per-task FixupAfterCopy(). Skip when the task never moved (kPinnedHost /
   // kManagedUvm path).
   if (task_on_device) {
-    container->FixupAfterCopy(method_id, task_full_ptr);
+    container->FixupAfterCopy(method_id, future.GetTaskPtr());
   }
 
-  // Allocate the task's RunContext now that it is deserialized (bound to this
-  // worker, since gpu2cpu RecvIn runs on the worker that drains the GPU lane).
-  ipc->BeginTask(future, worker->GetLane());
+  // Allocate the task's RunContext (and resolve its container) now that it is
+  // deserialized, so RouteTask / the worker have an active RunContext.
+  future.GetTaskPtr()->BeginRunContext();
 
   RouteResult route_result = ipc->RouteTask(future, /*force_enqueue=*/true);
   HLOG(kDebug,
@@ -170,10 +171,10 @@ bool IpcGpu2Cpu::RecvIn(IpcManager *ipc, GpuTaskLane *gpu_lane, Worker *worker) 
  * a task through lightbeam, and the gpu2cpu-pop RecvIn above already wrapped the
  * popped task pointer in a clio::run::Future<Task>. We just hand it back.
  */
-ctp::ipc::FullPtr<Task> IpcGpu2Cpu::RecvIn(
-    IpcManager *ipc, Future<Task> &future, Container *container,
+clio::run::shared_ptr<Task> IpcGpu2Cpu::RecvIn(
+    IpcManager *ipc, Future<Task> &future,
     u32 method_id, ctp::lbm::Transport *recv_transport) {
-  (void)ipc; (void)container; (void)method_id; (void)recv_transport;
+  (void)ipc; (void)method_id; (void)recv_transport;
   return future.GetTaskPtr();
 }
 
@@ -191,10 +192,8 @@ ctp::ipc::FullPtr<Task> IpcGpu2Cpu::RecvIn(
  * 32-bit writes are observed atomically by the device's volatile read.
  */
 void IpcGpu2Cpu::SendOut(
-    IpcManager *ipc, const FullPtr<Task> &task_ptr,
-    RunContext *run_ctx, Container *container) {
-  (void)container;
-  auto future_shm = run_ctx->future_.GetFutureShm();
+    IpcManager *ipc, const clio::run::shared_ptr<Task> &task_ptr) {
+  auto future_shm = task_ptr->RunFuture().GetFutureShm();
   HLOG(kDebug, "IpcGpu2Cpu::SendOut: pool={} method={}",
        task_ptr->pool_id_, task_ptr->method_);
 
@@ -203,7 +202,7 @@ void IpcGpu2Cpu::SendOut(
   //    gpu_task_device_ptr_ only when D2H-copy was needed.
   if (future_shm->gpu_task_device_ptr_ && future_shm->gpu_task_size_) {
     void *dst = reinterpret_cast<void *>(future_shm->gpu_task_device_ptr_);
-    ctp::DeviceAwareMemcpy(dst, task_ptr.ptr_, future_shm->gpu_task_size_);
+    ctp::DeviceAwareMemcpy(dst, task_ptr.get(), future_shm->gpu_task_size_);
   }
 
   // 2) Signal FUTURE_COMPLETE on the device-side gpu::FutureShm. For

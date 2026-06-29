@@ -338,7 +338,7 @@ class ChiModGenerator {
       oss << "\n";
     }
 
-    oss << "clio::run::TaskResume Runtime::Run(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> task_ptr, clio::run::RunContext& rctx) {\n";
+    oss << "clio::run::TaskResume Runtime::Run(clio::run::u32 method, clio::run::shared_ptr<clio::run::Task> task_ptr) {\n";
     // CLIO_TASK_BODY_BEGIN/END + CLIO_CO_AWAIT/CLIO_CO_RETURN abstract over the
     // C++20 stackless and the stackful (NVHPC/Boost) coroutine backends so the
     // generated dispatcher compiles under whichever is selected.
@@ -351,9 +351,9 @@ class ChiModGenerator {
     for (const auto& method : methods) {
       std::string task_type = GetTaskTypeName(method.method_name, chimod_name);
       oss << "    case Method::" << method.constant_name << ": {\n";
-      oss << "      // Cast task FullPtr to specific type\n";
-      oss << "      ctp::ipc::FullPtr<" << task_type << "> typed_task = task_ptr.template Cast<" << task_type << ">();\n";
-      oss << "      CLIO_CO_AWAIT(" << method.method_name << "(typed_task, rctx));\n";
+      oss << "      // Cast task handle to specific type (in-place reinterpret)\n";
+      oss << "      auto& typed_task = task_ptr.template Cast<" << task_type << ">();\n";
+      oss << "      CLIO_CO_AWAIT(" << method.method_name << "(typed_task));\n";
       oss << "      break;\n";
       oss << "    }\n";
     }
@@ -368,15 +368,15 @@ class ChiModGenerator {
     oss << "}\n";
     oss << "\n";
     oss << "void Runtime::SaveTask(clio::run::u32 method, clio::run::SaveTaskArchive& archive, \n";
-    oss << "                        ctp::ipc::FullPtr<clio::run::Task> task_ptr) {\n";
+    oss << "                        clio::run::shared_ptr<clio::run::Task> task_ptr) {\n";
     oss << "  switch (method) {\n";
 
     // Add SaveTask switch cases
     for (const auto& method : methods) {
       std::string task_type = GetTaskTypeName(method.method_name, chimod_name);
       oss << "    case Method::" << method.constant_name << ": {\n";
-      oss << "      auto typed_task = task_ptr.template Cast<" << task_type << ">();\n";
-      oss << "      archive << *typed_task.ptr_;\n";
+      oss << "      auto& typed_task = task_ptr.template Cast<" << task_type << ">();\n";
+      oss << "      archive << *typed_task;\n";
       oss << "      break;\n";
       oss << "    }\n";
     }
@@ -389,15 +389,15 @@ class ChiModGenerator {
     oss << "}\n";
     oss << "\n";
     oss << "void Runtime::LoadTask(clio::run::u32 method, clio::run::LoadTaskArchive& archive,\n";
-    oss << "                        ctp::ipc::FullPtr<clio::run::Task> task_ptr) {\n";
+    oss << "                        clio::run::shared_ptr<clio::run::Task> task_ptr) {\n";
     oss << "  switch (method) {\n";
 
     // Add LoadTask switch cases
     for (const auto& method : methods) {
       std::string task_type = GetTaskTypeName(method.method_name, chimod_name);
       oss << "    case Method::" << method.constant_name << ": {\n";
-      oss << "      auto typed_task = task_ptr.template Cast<" << task_type << ">();\n";
-      oss << "      archive >> *typed_task.ptr_;\n";
+      oss << "      auto& typed_task = task_ptr.template Cast<" << task_type << ">();\n";
+      oss << "      archive >> *typed_task;\n";
       oss << "      break;\n";
       oss << "    }\n";
     }
@@ -409,8 +409,8 @@ class ChiModGenerator {
     oss << "  }\n";
     oss << "}\n";
     oss << "\n";
-    oss << "ctp::ipc::FullPtr<clio::run::Task> Runtime::AllocLoadTask(clio::run::u32 method, clio::run::LoadTaskArchive& archive) {\n";
-    oss << "  ctp::ipc::FullPtr<clio::run::Task> task_ptr = NewTask(method);\n";
+    oss << "clio::run::shared_ptr<clio::run::Task> Runtime::AllocLoadTask(clio::run::u32 method, clio::run::LoadTaskArchive& archive) {\n";
+    oss << "  clio::run::shared_ptr<clio::run::Task> task_ptr = NewTask(method);\n";
     oss << "  if (!task_ptr.IsNull()) {\n";
     oss << "    LoadTask(method, archive, task_ptr);\n";
     oss << "  }\n";
@@ -418,16 +418,16 @@ class ChiModGenerator {
     oss << "}\n";
     oss << "\n";
     oss << "void Runtime::LocalLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive& archive,\n";
-    oss << "                            ctp::ipc::FullPtr<clio::run::Task> task_ptr) {\n";
+    oss << "                            clio::run::shared_ptr<clio::run::Task> task_ptr) {\n";
     oss << "  switch (method) {\n";
 
     // Add LocalLoadTask switch cases
     for (const auto& method : methods) {
       std::string task_type = GetTaskTypeName(method.method_name, chimod_name);
       oss << "    case Method::" << method.constant_name << ": {\n";
-      oss << "      auto typed_task = task_ptr.template Cast<" << task_type << ">();\n";
+      oss << "      auto& typed_task = task_ptr.template Cast<" << task_type << ">();\n";
       oss << "      // Use archive operator which respects msg_type\n";
-      oss << "      archive >> *typed_task.ptr_;\n";
+      oss << "      archive >> *typed_task;\n";
       oss << "      break;\n";
       oss << "    }\n";
     }
@@ -439,8 +439,8 @@ class ChiModGenerator {
     oss << "  }\n";
     oss << "}\n";
     oss << "\n";
-    oss << "ctp::ipc::FullPtr<clio::run::Task> Runtime::LocalAllocLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive& archive) {\n";
-    oss << "  ctp::ipc::FullPtr<clio::run::Task> task_ptr = NewTask(method);\n";
+    oss << "clio::run::shared_ptr<clio::run::Task> Runtime::LocalAllocLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive& archive) {\n";
+    oss << "  clio::run::shared_ptr<clio::run::Task> task_ptr = NewTask(method);\n";
     oss << "  if (!task_ptr.IsNull()) {\n";
     oss << "    LocalLoadTask(method, archive, task_ptr);\n";
     oss << "  }\n";
@@ -448,16 +448,16 @@ class ChiModGenerator {
     oss << "}\n";
     oss << "\n";
     oss << "void Runtime::LocalSaveTask(clio::run::u32 method, clio::run::DefaultSaveArchive& archive, \n";
-    oss << "                             ctp::ipc::FullPtr<clio::run::Task> task_ptr) {\n";
+    oss << "                             clio::run::shared_ptr<clio::run::Task> task_ptr) {\n";
     oss << "  switch (method) {\n";
 
     // Add LocalSaveTask switch cases
     for (const auto& method : methods) {
       std::string task_type = GetTaskTypeName(method.method_name, chimod_name);
       oss << "    case Method::" << method.constant_name << ": {\n";
-      oss << "      auto typed_task = task_ptr.template Cast<" << task_type << ">();\n";
+      oss << "      auto& typed_task = task_ptr.template Cast<" << task_type << ">();\n";
       oss << "      // Use archive operator which respects msg_type\n";
-      oss << "      archive << *typed_task.ptr_;\n";
+      oss << "      archive << *typed_task;\n";
       oss << "      break;\n";
       oss << "    }\n";
     }
@@ -469,10 +469,10 @@ class ChiModGenerator {
     oss << "  }\n";
     oss << "}\n";
     oss << "\n";
-    oss << "ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> orig_task_ptr, bool deep) {\n";
+    oss << "clio::run::shared_ptr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, clio::run::shared_ptr<clio::run::Task>& orig_task_ptr, bool deep) {\n";
     oss << "  auto* ipc_manager = CLIO_IPC;\n";
     oss << "  if (!ipc_manager) {\n";
-    oss << "    return ctp::ipc::FullPtr<clio::run::Task>();\n";
+    oss << "    return clio::run::shared_ptr<clio::run::Task>();\n";
     oss << "  }\n";
     oss << "  \n";
     oss << "  switch (method) {\n";
@@ -485,8 +485,8 @@ class ChiModGenerator {
       oss << "      auto new_task_ptr = ipc_manager->NewTask<" << task_type << ">();\n";
       oss << "      if (!new_task_ptr.IsNull()) {\n";
       oss << "        // Copy task fields (includes base Task fields)\n";
-      oss << "        auto task_typed = orig_task_ptr.template Cast<" << task_type << ">();\n";
-      oss << "        new_task_ptr->Copy(task_typed);\n";
+      oss << "        auto& task_typed = orig_task_ptr.template Cast<" << task_type << ">();\n";
+      oss << "        new_task_ptr->Copy(ctp::ipc::FullPtr<" << task_type << ">(task_typed.get()));\n";
       oss << "        return new_task_ptr.template Cast<clio::run::Task>();\n";
       oss << "      }\n";
       oss << "      break;\n";
@@ -497,7 +497,7 @@ class ChiModGenerator {
     oss << "      // For unknown methods, create base Task copy\n";
       oss << "      auto new_task_ptr = ipc_manager->NewTask<clio::run::Task>();\n";
     oss << "      if (!new_task_ptr.IsNull()) {\n";
-    oss << "        new_task_ptr->Copy(orig_task_ptr);\n";
+    oss << "        new_task_ptr->Copy(ctp::ipc::FullPtr<clio::run::Task>(orig_task_ptr.get()));\n";
     oss << "        return new_task_ptr;\n";
     oss << "      }\n";
     oss << "      break;\n";
@@ -505,13 +505,13 @@ class ChiModGenerator {
     oss << "  }\n";
     oss << "  \n";
     oss << "  (void)deep;    // Deep copy parameter reserved for future use\n";
-    oss << "  return ctp::ipc::FullPtr<clio::run::Task>();\n";
+    oss << "  return clio::run::shared_ptr<clio::run::Task>();\n";
     oss << "}\n";
     oss << "\n";
-    oss << "ctp::ipc::FullPtr<clio::run::Task> Runtime::NewTask(clio::run::u32 method) {\n";
+    oss << "clio::run::shared_ptr<clio::run::Task> Runtime::NewTask(clio::run::u32 method) {\n";
     oss << "  auto* ipc_manager = CLIO_IPC;\n";
     oss << "  if (!ipc_manager) {\n";
-    oss << "    return ctp::ipc::FullPtr<clio::run::Task>();\n";
+    oss << "    return clio::run::shared_ptr<clio::run::Task>();\n";
     oss << "  }\n";
     oss << "  \n";
     oss << "  switch (method) {\n";
@@ -527,27 +527,27 @@ class ChiModGenerator {
 
     oss << "    default: {\n";
     oss << "      // For unknown methods, return null pointer\n";
-    oss << "      return ctp::ipc::FullPtr<clio::run::Task>();\n";
+    oss << "      return clio::run::shared_ptr<clio::run::Task>();\n";
     oss << "    }\n";
     oss << "  }\n";
     oss << "}\n";
     oss << "\n";
     // Generate AggregateOut method - dispatches to typed task's AggregateOut
-    oss << "void Runtime::AggregateOut(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> orig_task,\n";
-    oss << "                        const ctp::ipc::FullPtr<clio::run::Task>& replica_task) {\n";
+    oss << "void Runtime::AggregateOut(clio::run::u32 method, clio::run::shared_ptr<clio::run::Task>& orig_task,\n";
+    oss << "                        const clio::run::shared_ptr<clio::run::Task>& replica_task) {\n";
     oss << "  switch (method) {\n";
 
     for (const auto& method : methods) {
       std::string task_type = GetTaskTypeName(method.method_name, chimod_name);
       oss << "    case Method::" << method.constant_name << ": {\n";
-      oss << "      auto typed_task = orig_task.template Cast<" << task_type << ">();\n";
-      oss << "      typed_task->AggregateOut(replica_task);\n";
+      oss << "      auto& typed_task = orig_task.template Cast<" << task_type << ">();\n";
+      oss << "      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));\n";
       oss << "      break;\n";
       oss << "    }\n";
     }
 
     oss << "    default: {\n";
-    oss << "      orig_task->AggregateOut(replica_task);\n";
+    oss << "      orig_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));\n";
     oss << "      break;\n";
     oss << "    }\n";
     oss << "  }\n";
@@ -555,48 +555,31 @@ class ChiModGenerator {
     oss << "\n";
     // Generate AggregateIn method - dispatches to typed task's AggregateIn
     // (ManyToOne collective input combine; default per-task is a no-op).
-    oss << "void Runtime::AggregateIn(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> agg_task,\n";
-    oss << "                        const ctp::ipc::FullPtr<clio::run::Task>& member_task) {\n";
+    oss << "void Runtime::AggregateIn(clio::run::u32 method, clio::run::shared_ptr<clio::run::Task>& agg_task,\n";
+    oss << "                        const clio::run::shared_ptr<clio::run::Task>& member_task) {\n";
     oss << "  switch (method) {\n";
 
     for (const auto& method : methods) {
       std::string task_type = GetTaskTypeName(method.method_name, chimod_name);
       oss << "    case Method::" << method.constant_name << ": {\n";
-      oss << "      auto typed_task = agg_task.template Cast<" << task_type << ">();\n";
-      oss << "      typed_task->AggregateIn(member_task);\n";
+      oss << "      auto& typed_task = agg_task.template Cast<" << task_type << ">();\n";
+      oss << "      typed_task->AggregateIn(ctp::ipc::FullPtr<clio::run::Task>(member_task.get()));\n";
       oss << "      break;\n";
       oss << "    }\n";
     }
 
     oss << "    default: {\n";
-    oss << "      agg_task->AggregateIn(member_task);\n";
+    oss << "      agg_task->AggregateIn(ctp::ipc::FullPtr<clio::run::Task>(member_task.get()));\n";
     oss << "      break;\n";
     oss << "    }\n";
     oss << "  }\n";
     oss << "}\n";
     oss << "\n";
 
-    // Generate DelTask method - dispatches to typed task deletion
-    oss << "void Runtime::DelTask(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> task_ptr) {\n";
-    oss << "  auto* ipc_manager = CLIO_IPC;\n";
-    oss << "  if (!ipc_manager) return;\n";
-    oss << "  switch (method) {\n";
-
-    for (const auto& method : methods) {
-      std::string task_type = GetTaskTypeName(method.method_name, chimod_name);
-      oss << "    case Method::" << method.constant_name << ": {\n";
-      oss << "      ipc_manager->DelTask(task_ptr.template Cast<" << task_type << ">());\n";
-      oss << "      break;\n";
-      oss << "    }\n";
-    }
-
-    oss << "    default: {\n";
-    oss << "      ipc_manager->DelTask(task_ptr);\n";
-    oss << "      break;\n";
-    oss << "    }\n";
-    oss << "  }\n";
-    oss << "}\n";
-    oss << "\n";
+    // NOTE: DelTask is intentionally NOT generated. Tasks are
+    // clio::run::shared_ptr handles freed automatically (RAII) when their last
+    // owner drops; type-correct destruction is guaranteed by the virtual Task
+    // destructor and the type-erased deleter in the control header.
     oss << "} // namespace " << namespace_name << "::" << chimod_name << "\n";
 
     return oss.str();

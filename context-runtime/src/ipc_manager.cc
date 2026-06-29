@@ -989,7 +989,7 @@ retry_attempt:
 
   // Wait for response with per-attempt timeout
   if (!future.Wait(per_attempt)) {
-    DelTask(task);
+    task.reset();
     float elapsed = std::chrono::duration<float>(
         std::chrono::steady_clock::now() - attempt_start).count();
     if (total_timeout > 0 && elapsed >= total_timeout) {
@@ -2828,70 +2828,28 @@ void IpcManager::FreeGpuBackend(u32 gpu_id,
 }
 #endif  // CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL
 
-void IpcManager::BeginTask(Future<Task> &future, TaskLane *lane) {
-  FullPtr<Task> task_ptr = future.GetTaskPtr();
-  if (task_ptr.IsNull()) {
-    HLOG(kError, "BeginTask: task_ptr is null!");
-    return;
-  }
+// Allocate this task's owned RunContext and resolve its execution container.
+//
+// Called at the ipc_*.cc receive/send sites (NOT necessarily on a worker
+// thread — e.g. the net recv worker, or the main thread during ServerInit's
+// synchronous admin pool creation). It therefore does ONLY thread-independent
+// setup: allocate the RunContext and resolve the container. The worker-specific
+// per-execution parameters (worker id, lane, event queue, future, polling,
+// predicted stats) are set later, on the worker, in Worker::ProcessNewTask and
+// Task::StartCoroutine. Giving the task an active RunContext here is what lets
+// RouteTask run before the worker picks the task up.
+void Task::BeginRunContext() {
+  run_ctx_ = ctp::make_unique<RunContext>(CTP_MALLOC);
 #if CTP_IS_HOST
-  Worker *worker = CLIO_CUR_WORKER;
-  // Resolve the container from the task's pool (callers no longer pass it).
-  Container *container =
-      CLIO_POOL_MANAGER->GetStaticContainer(task_ptr->pool_id_);
-
-  // Replace any existing RunContext, then allocate this task's owned one.
-  // The defensive DestroyRunCtx keeps a double-begin (e.g. a re-received remote
-  // task) from leaking the prior RunContext.
-  task_ptr->DestroyRunCtx();
-  task_ptr->SetRunCtx(new RunContext());
-  RunContext *run_ctx = task_ptr->GetRunCtx();
-
-  // Clear and initialize RunContext for new task execution
-  run_ctx->worker_id_ = worker ? worker->GetId() : 0;
-  run_ctx->task_ = task_ptr;        // Store task in RunContext
-  run_ctx->is_yielded_ = false;     // Initially not blocked
-  run_ctx->container_ = container;  // Store container for CLIO_CUR_CONTAINER
-  run_ctx->lane_ = lane;            // Store lane for CLIO_CUR_LANE
-  run_ctx->event_queue_ =
-      worker ? worker->GetEventQueue() : nullptr;  // Set event queue
-  run_ctx->future_ = future;        // Store future in RunContext
-  run_ctx->coro_handle_ = nullptr;  // Coroutine not started yet
-
-  // Initialize adaptive polling fields for periodic tasks
-  if (task_ptr->IsPeriodic()) {
-    run_ctx->true_period_ns_ = task_ptr->period_ns_;
-    run_ctx->yield_time_us_ =
-        task_ptr->period_ns_ / 1000.0;  // Initialize with true period
-    run_ctx->did_work_ = false;         // Initially no work done
-  } else {
-    run_ctx->true_period_ns_ = 0.0;
-    run_ctx->yield_time_us_ = 0.0;
-    run_ctx->did_work_ = false;
-  }
-
-  // Populate predicted_stat_ from the container so downstream routing
-  // (RouteGlobal's latency-vs-IO lane choice; worker.cc's predicted-load
-  // tracking) can read the task's actual payload size without re-doing
-  // the GetTaskStats(task) work. Scheduler-class code (RuntimeMapTask)
-  // already calls GetTaskStats; pre-populating it here keeps a single
-  // source of truth and makes the value available before RouteTask.
-  if (container) {
-    run_ctx->predicted_stat_ = container->GetTaskStats(task_ptr.ptr_);
-  }
-
-  // NOTE: Do NOT call SetCurrentRunContext here. BeginTask may be called
-  // from SendRuntimeClient inside a running coroutine. Overwriting the
-  // current RunContext would cause await_suspend_impl to store the parent
-  // coroutine handle on the subtask's RunContext instead of the parent's,
-  // leading to premature task completion. StartCoroutine and ResumeCoroutine
-  // already set the current RunContext before executing the task.
+  // Resolve the execution container: the real (local) container if one exists
+  // (the common case), otherwise the static container.
+  ExecContainer() = CLIO_POOL_MANAGER->GetRealOrStaticContainer(pool_id_);
 #endif
 }
 
 RouteResult IpcManager::RouteTask(Future<Task> &future, bool force_enqueue) {
   // Get task pointer from future
-  FullPtr<Task> task_ptr = future.GetTaskPtr();
+  clio::run::shared_ptr<Task> task_ptr = future.GetTaskPtr();
 
   if (task_ptr.IsNull()) {
     Worker *worker = CLIO_CUR_WORKER;
@@ -2901,7 +2859,7 @@ RouteResult IpcManager::RouteTask(Future<Task> &future, bool force_enqueue) {
   }
 
   // Check if task has already been routed - if so, return ExecHere
-  if (RunContext *rc = task_ptr->GetRunCtx(); rc && rc->IsRouted()) {
+  if (task_ptr->IsRouted()) {
     return RouteResult::ExecHere;
   }
 
@@ -2923,8 +2881,8 @@ RouteResult IpcManager::RouteTask(Future<Task> &future, bool force_enqueue) {
   // when tasks arrive at remote nodes (e.g., GetOrCreatePool returns
   // Broadcast on every node since the pool doesn't exist yet).
   auto *pool_manager = CLIO_POOL_MANAGER;
-  Container *static_container =
-      pool_manager->GetStaticContainer(task_ptr->pool_id_);
+  auto static_container =
+      pool_manager->GetStaticContainer(task_ptr->pool_id_).get();
   PoolQuery resolved_query = task_ptr->pool_query_;
   if (static_container && resolved_query.IsDynamicMode()) {
     resolved_query = static_container->ScheduleTask(task_ptr);
@@ -2966,8 +2924,8 @@ RouteResult IpcManager::RouteTask(Future<Task> &future, bool force_enqueue) {
       HLOG(kError, "RouteTask: RouteLocal returned {} for pool={} method={}, worker={}",
            (int)result, task_ptr->pool_id_, task_ptr->method_,
            worker ? (int)worker->GetId() : -1);
-      if (worker && task_ptr->GetRunCtx()) {
-        worker->AddToRetryQueue(task_ptr->GetRunCtx());
+      if (worker) {
+        worker->AddToRetryQueue(task_ptr);
       }
     }
     return result;
@@ -2977,14 +2935,14 @@ RouteResult IpcManager::RouteTask(Future<Task> &future, bool force_enqueue) {
 }
 
 RouteResult IpcManager::RouteManyToOne(Future<Task> &future) {
-  FullPtr<Task> task_ptr = future.GetTaskPtr();
+  clio::run::shared_ptr<Task> task_ptr = future.GetTaskPtr();
   u64 leader = GetNeighborhoodLeaderNodeId();
   if (leader == GetNodeId()) {
     // We are the neighborhood leader: park the task into its batch group. The
     // batch flusher aggregates, runs once, and completes each member later.
     // RouteResult::Local tells the worker the task is owned elsewhere now and
     // must not be executed here.
-    if (RunContext *rc = task_ptr->GetRunCtx()) rc->SetRouted();
+    task_ptr->SetRouted();
     batch_manager_->Add(task_ptr);
     return RouteResult::Local;
   }
@@ -2996,7 +2954,7 @@ RouteResult IpcManager::RouteManyToOne(Future<Task> &future) {
   return RouteGlobal(future, pool_queries);
 }
 
-bool IpcManager::IsTaskLocal(const FullPtr<Task> & /*task_ptr*/,
+bool IpcManager::IsTaskLocal(const clio::run::shared_ptr<Task> & /*task_ptr*/,
                              const std::vector<PoolQuery> &pool_queries,
                              bool originally_local) {
   // CLIO_FORCE_NET stress mode: routing is determined entirely by the
@@ -3071,24 +3029,25 @@ bool IpcManager::IsTaskLocal(const FullPtr<Task> & /*task_ptr*/,
 
 RouteResult IpcManager::RouteLocal(Future<Task> &future, bool force_enqueue) {
   // Get task pointer from future
-  FullPtr<Task> task_ptr = future.GetTaskPtr();
+  clio::run::shared_ptr<Task> task_ptr = future.GetTaskPtr();
 
   // Mark as routed so the task is not re-routed on subsequent passes.
-  if (RunContext *rc = task_ptr->GetRunCtx()) rc->SetRouted();
+  task_ptr->SetRouted();
 
-  // Resolve the actual execution container
+  // Resolve the actual execution container (resolve-once: this handle is cached
+  // in the RunContext below and reused for the task's whole lifetime).
   auto *pool_manager = CLIO_POOL_MANAGER;
-  bool is_plugged = false;
   ContainerId container_id = task_ptr->pool_query_.GetContainerId();
-  Container *exec_container =
-      pool_manager->GetContainer(task_ptr->pool_id_, container_id, is_plugged);
+  DynamicContainer exec_dc =
+      pool_manager->GetContainer(task_ptr->pool_id_, container_id);
+  ContainerHold exec_container = exec_dc.get();
 
   if (!exec_container) {
     HLOG(kError, "RouteLocal: Container not found for pool={} container_id={} method={}",
          task_ptr->pool_id_, container_id, task_ptr->method_);
     return RouteResult::Dne;
   }
-  if (is_plugged) {
+  if (exec_dc.IsPlugged()) {
     HLOG(kWarning, "RouteLocal: Container plugged for pool={}", task_ptr->pool_id_);
     return RouteResult::Retry;
   }
@@ -3101,9 +3060,7 @@ RouteResult IpcManager::RouteLocal(Future<Task> &future, bool force_enqueue) {
   task_ptr->SetCompleter(exec_container->container_id_);
 
   // Update RunContext to use the resolved execution container
-  if (task_ptr->GetRunCtx()) {
-    task_ptr->GetRunCtx()->container_ = exec_container;
-  }
+  task_ptr->ExecContainer() = exec_dc;
 
   // Use scheduler to pick the destination worker
   Worker *worker = CLIO_CUR_WORKER;
@@ -3128,7 +3085,7 @@ RouteResult IpcManager::RouteLocal(Future<Task> &future, bool force_enqueue) {
 RouteResult IpcManager::RouteGlobal(Future<Task> &future,
                              const std::vector<PoolQuery> &pool_queries) {
   // Get task pointer from future
-  FullPtr<Task> task_ptr = future.GetTaskPtr();
+  clio::run::shared_ptr<Task> task_ptr = future.GetTaskPtr();
 
   // Log the global routing for debugging
   if (!pool_queries.empty()) {
@@ -3142,10 +3099,7 @@ RouteResult IpcManager::RouteGlobal(Future<Task> &future,
   }
 
   // Store pool_queries in task's RunContext for SendIn to access
-  if (task_ptr->GetRunCtx()) {
-    RunContext *run_ctx = task_ptr->GetRunCtx();
-    run_ctx->pool_queries_ = pool_queries;
-  }
+  task_ptr->PoolQueries() = pool_queries;
 
   // Pick the latency vs I/O SendIn lane based on the task's actual
   // payload size — small probes / metadata sit on kSendInLatency so
@@ -3153,17 +3107,14 @@ RouteResult IpcManager::RouteGlobal(Future<Task> &future,
   // scheduler (BeginTask / pre-routing) populates RunContext::
   // predicted_stat_ from container->GetTaskStats(task), so we just
   // read it here instead of recomputing.
-  size_t io_size = 0;
-  if (task_ptr->GetRunCtx()) {
-    io_size = task_ptr->GetRunCtx()->predicted_stat_.io_size_;
-  }
+  size_t io_size = task_ptr->PredictedStat().io_size_;
   NetQueuePriority sendin_prio = (io_size >= kNetQueueIoThreshold)
                                      ? NetQueuePriority::kSendInIO
                                      : NetQueuePriority::kSendInLatency;
   EnqueueNetTask(future, sendin_prio);
 
   // Set TASK_ROUTED flag on original task
-  if (RunContext *rc = task_ptr->GetRunCtx()) rc->SetRouted();
+  task_ptr->SetRouted();
 
   Worker *worker = CLIO_CUR_WORKER;
   HLOG(kDebug, "Worker {}: RouteGlobal - task enqueued to net_queue",
@@ -3174,7 +3125,7 @@ RouteResult IpcManager::RouteGlobal(Future<Task> &future,
 
 
 std::vector<PoolQuery> IpcManager::ResolvePoolQuery(
-    const PoolQuery &query, PoolId pool_id, const FullPtr<Task> &task_ptr) {
+    const PoolQuery &query, PoolId pool_id, const clio::run::shared_ptr<Task> &task_ptr) {
   // Basic validation
   if (pool_id.IsNull()) {
     return {};  // Invalid pool ID
@@ -3232,13 +3183,13 @@ std::vector<PoolQuery> IpcManager::ResolvePoolQuery(
 }
 
 std::vector<PoolQuery> IpcManager::ResolveLocalQuery(
-    const PoolQuery &query, const FullPtr<Task> &task_ptr) {
+    const PoolQuery &query, const clio::run::shared_ptr<Task> &task_ptr) {
   // Local routing - process on current node
   return {query};
 }
 
 std::vector<PoolQuery> IpcManager::ResolveDirectIdQuery(
-    const PoolQuery &query, PoolId pool_id, const FullPtr<Task> &task_ptr) {
+    const PoolQuery &query, PoolId pool_id, const clio::run::shared_ptr<Task> &task_ptr) {
   auto *pool_manager = CLIO_POOL_MANAGER;
   if (pool_manager == nullptr) {
     return {query};  // Fallback to original query
@@ -3261,7 +3212,7 @@ std::vector<PoolQuery> IpcManager::ResolveDirectIdQuery(
 }
 
 std::vector<PoolQuery> IpcManager::ResolveDirectHashQuery(
-    const PoolQuery &query, PoolId pool_id, const FullPtr<Task> &task_ptr) {
+    const PoolQuery &query, PoolId pool_id, const clio::run::shared_ptr<Task> &task_ptr) {
   auto *pool_manager = CLIO_POOL_MANAGER;
   if (pool_manager == nullptr) {
     return {query};  // Fallback to original query
@@ -3301,7 +3252,7 @@ std::vector<PoolQuery> IpcManager::ResolveDirectHashQuery(
 }
 
 std::vector<PoolQuery> IpcManager::ResolveRangeQuery(
-    const PoolQuery &query, PoolId pool_id, const FullPtr<Task> &task_ptr) {
+    const PoolQuery &query, PoolId pool_id, const clio::run::shared_ptr<Task> &task_ptr) {
   auto *pool_manager = CLIO_POOL_MANAGER;
   if (pool_manager == nullptr) {
     return {query};  // Fallback to original query
@@ -3370,7 +3321,7 @@ std::vector<PoolQuery> IpcManager::ResolveRangeQuery(
 }
 
 std::vector<PoolQuery> IpcManager::ResolveBroadcastQuery(
-    const PoolQuery &query, PoolId pool_id, const FullPtr<Task> &task_ptr) {
+    const PoolQuery &query, PoolId pool_id, const clio::run::shared_ptr<Task> &task_ptr) {
   auto *pool_manager = CLIO_POOL_MANAGER;
   if (pool_manager == nullptr) {
     return {query};  // Fallback to original query
@@ -3388,31 +3339,30 @@ std::vector<PoolQuery> IpcManager::ResolveBroadcastQuery(
 }
 
 std::vector<PoolQuery> IpcManager::ResolvePhysicalQuery(
-    const PoolQuery &query, PoolId pool_id, const FullPtr<Task> &task_ptr) {
+    const PoolQuery &query, PoolId pool_id, const clio::run::shared_ptr<Task> &task_ptr) {
   // Physical routing - query is already resolved to a specific node
   return {query};
 }
 
 
 void IpcManager::SendRuntime(
-    const FullPtr<Task> &task_ptr, RunContext *run_ctx,
-    Container *container, ctp::lbm::Transport *send_transport) {
-  auto future_shm = run_ctx->future_.GetFutureShm();
+    const clio::run::shared_ptr<Task> &task_ptr,
+    ctp::lbm::Transport *send_transport) {
+  auto future_shm = task_ptr->RunFuture().GetFutureShm();
   u32 origin = future_shm->origin_;
 
   switch (origin) {
     case FutureShm::FUTURE_CLIENT_SHM:
     default:
-      IpcCpu2Cpu::SendOut(this, task_ptr, run_ctx, container,
-                               send_transport);
+      IpcCpu2Cpu::SendOut(this, task_ptr, send_transport);
       break;
     case FutureShm::FUTURE_CLIENT_TCP:
     case FutureShm::FUTURE_CLIENT_IPC:
-      IpcCpu2CpuZmq::EnqueueSendOut(this, run_ctx, origin);
+      IpcCpu2CpuZmq::EnqueueSendOut(this, task_ptr, origin);
       break;
 #if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL
     case FutureShm::FUTURE_CLIENT_GPU2CPU:
-      IpcGpu2Cpu::SendOut(this, task_ptr, run_ctx, container);
+      IpcGpu2Cpu::SendOut(this, task_ptr);
       break;
 #endif
     // FUTURE_CLIENT_CPU2GPU dispatch was removed with the GPU runtime.

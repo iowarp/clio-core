@@ -68,9 +68,6 @@ struct FutureShm {
   // Bitfield flags for flags_
   static constexpr u32 FUTURE_COMPLETE = 1; /**< Task execution is complete */
   static constexpr u32 FUTURE_NEW_DATA = 2; /**< New output data available */
-  static constexpr u32 FUTURE_WAS_COPIED =
-      8; /**< Task arrived from an external client (response must be routed
-            back via a transport, not by resuming a parent coroutine) */
   static constexpr u32 FUTURE_DEVICE_SCOPE =
       16; /**< GPU->GPU path: use device-scope atomics (no system fence) */
   static constexpr u32 FUTURE_POD_COPY =
@@ -282,8 +279,16 @@ class Future {
   friend struct IpcGpu2Cpu;
 
  private:
-  /** FullPtr to the task (wraps private memory with null allocator) */
+  /** Owning handle to the task.
+   *  Host: clio::run::shared_ptr (RAII, refcounted, private MallocAllocator) --
+   *  the Future is an owner; the last owner frees the task automatically.
+   *  Device: an offset/raw FullPtr (shared_ptr/make_shared are host-only), and
+   *  the kernel never owns/frees tasks. */
+#if CTP_IS_HOST
+  clio::run::shared_ptr<TaskT> task_ptr_;
+#else
   ctp::ipc::FullPtr<TaskT> task_ptr_;
+#endif
 
   /**
    * Handle to the FutureShm.
@@ -317,8 +322,29 @@ class Future {
 #endif
   }
 
-  /** Parent task RunContext pointer (nullptr if no parent waiting) */
-  RunContext* parent_task_;
+  /** Raw task pointer (host: shared_ptr::get; device: FullPtr::ptr_). */
+  CTP_CROSS_FUN TaskT* TaskRaw() const {
+#if CTP_IS_HOST
+    return task_ptr_.get();
+#else
+    return task_ptr_.ptr_;
+#endif
+  }
+
+  /** Drop/clear the task handle (host: shared_ptr::reset; device:
+   *  FullPtr::SetNull). On host this releases this Future's reference. */
+  CTP_CROSS_FUN void TaskSetNull() {
+#if CTP_IS_HOST
+    task_ptr_.reset();
+#else
+    task_ptr_.SetNull();
+#endif
+  }
+
+  /** Parent task whose coroutine resumes when this future completes (null if no
+   *  parent waiting). Stores the owning Task handle — not a RunContext pointer —
+   *  so RunContext is never held outside its Task. */
+  clio::run::shared_ptr<Task> parent_task_;
 
   /** Whether Destroy(true) was called (via Wait/await_resume) */
   bool consumed_;
@@ -354,15 +380,11 @@ class Future {
    */
 #if CTP_IS_HOST
   Future(PoolId pool_id, u32 method_id,
-         const ctp::ipc::FullPtr<TaskT>& task_ptr)
-      : future_shm_(std::make_shared<FutureT>(pool_id, method_id)),
-        parent_task_(nullptr),
-        consumed_(false) {
-    // Manually initialize task_ptr_ to avoid FullPtr copy constructor bug on
-    // GPU: copy shm_ directly, then reconstruct ptr_ from it.
-    task_ptr_.shm_ = task_ptr.shm_;
-    task_ptr_.ptr_ = task_ptr.ptr_;
-  }
+         clio::run::shared_ptr<TaskT> task_ptr)
+      : task_ptr_(std::move(task_ptr)),
+        future_shm_(std::make_shared<FutureT>(pool_id, method_id)),
+        parent_task_(),
+        consumed_(false) {}
 #endif
 
 #if !CTP_IS_HOST
@@ -373,7 +395,7 @@ class Future {
    */
   CTP_CROSS_FUN Future(ctp::ipc::ShmPtr<FutureT> future_shm,
                         const ctp::ipc::FullPtr<TaskT>& task_ptr)
-      : future_shm_(future_shm), parent_task_(nullptr), consumed_(false) {
+      : future_shm_(future_shm), parent_task_(), consumed_(false) {
     task_ptr_.shm_ = task_ptr.shm_;
     task_ptr_.ptr_ = task_ptr.ptr_;
   }
@@ -383,7 +405,7 @@ class Future {
    * @param future_shm_ptr ShmPtr to FutureShm object
    */
   CTP_CROSS_FUN explicit Future(const ctp::ipc::ShmPtr<FutureT>& future_shm_ptr)
-      : future_shm_(future_shm_ptr), parent_task_(nullptr), consumed_(false) {
+      : future_shm_(future_shm_ptr), parent_task_(), consumed_(false) {
     task_ptr_.SetNull();
   }
 #endif
@@ -391,37 +413,38 @@ class Future {
   /**
    * Default constructor - creates null future
    */
-  CTP_CROSS_FUN Future() : parent_task_(nullptr), consumed_(false) {}
+  CTP_CROSS_FUN Future() : parent_task_(), consumed_(false) {}
 
   /**
-   * Destructor - frees the task if this Future was consumed (via
-   * Wait/await_resume). Defined out-of-line in ipc_manager.h where
-   * CLIO_IPC is available.
+   * Destructor - drops this Future's reference to the task (RAII via the
+   * shared_ptr member on host) and cleans up the response archive if consumed.
+   * Defined out-of-line in ipc_manager.h where CLIO_IPC is available.
    */
   CTP_CROSS_FUN ~Future();
 
   /**
-   * Destroy the task using CLIO_IPC->DelTask if not null
-   * Sets the task pointer to null afterwards
+   * Mark the future consumed (calls PostWait on the task). The task is freed
+   * automatically when its last shared_ptr owner drops — no explicit delete.
    */
   CTP_CROSS_FUN void Destroy(bool post_wait = false);
-
-  /**
-   * Explicitly delete the underlying task via CLIO_IPC->DelTask
-   */
-  CTP_CROSS_FUN void DelTask();
 
   /**
    * Copy constructor - does not transfer ownership
    * @param other Future to copy from
    */
   CTP_CROSS_FUN Future(const Future& other)
-      : future_shm_(other.future_shm_),
+      :
+#if CTP_IS_HOST
+        task_ptr_(other.task_ptr_),  // shares ownership (increments refcount)
+#endif
+        future_shm_(other.future_shm_),
         parent_task_(other.parent_task_),
         consumed_(false) {  // Copy is not consumed
+#if !CTP_IS_HOST
     // Manually copy task_ptr_ to avoid FullPtr copy constructor bug on GPU
     task_ptr_.shm_ = other.task_ptr_.shm_;
     task_ptr_.ptr_ = other.task_ptr_.ptr_;
+#endif
   }
 
   /**
@@ -431,9 +454,13 @@ class Future {
    */
   CTP_CROSS_FUN Future& operator=(const Future& other) {
     if (this != &other) {
+#if CTP_IS_HOST
+      task_ptr_ = other.task_ptr_;  // shares ownership (refcount)
+#else
       // Manually copy task_ptr_ to avoid FullPtr copy assignment bug on GPU
       task_ptr_.shm_ = other.task_ptr_.shm_;
       task_ptr_.ptr_ = other.task_ptr_.ptr_;
+#endif
       future_shm_ = other.future_shm_;
       parent_task_ = other.parent_task_;
       consumed_ = false;  // Copy is not consumed
@@ -446,14 +473,20 @@ class Future {
    * @param other Future to move from
    */
   CTP_CROSS_FUN Future(Future&& other) noexcept
-      : future_shm_(std::move(other.future_shm_)),
+      :
+#if CTP_IS_HOST
+        task_ptr_(std::move(other.task_ptr_)),  // transfers ownership
+#endif
+        future_shm_(std::move(other.future_shm_)),
         parent_task_(other.parent_task_),
         consumed_(other.consumed_) {
+#if !CTP_IS_HOST
     // Manually move task_ptr_ to avoid FullPtr move constructor bug on GPU
     task_ptr_.shm_ = other.task_ptr_.shm_;
     task_ptr_.ptr_ = other.task_ptr_.ptr_;
     other.task_ptr_.SetNull();
-    other.parent_task_ = nullptr;
+#endif
+    other.parent_task_.reset();
     other.consumed_ = false;
   }
 
@@ -464,15 +497,19 @@ class Future {
    */
   CTP_CROSS_FUN Future& operator=(Future&& other) noexcept {
     if (this != &other) {
+#if CTP_IS_HOST
+      task_ptr_ = std::move(other.task_ptr_);  // transfers ownership
+#else
       // Manually move task_ptr_ to avoid FullPtr move assignment bug on GPU
       task_ptr_.shm_ = other.task_ptr_.shm_;
       task_ptr_.ptr_ = other.task_ptr_.ptr_;
+      other.task_ptr_.SetNull();
+#endif
       future_shm_ = std::move(other.future_shm_);
       parent_task_ = other.parent_task_;
       consumed_ = other.consumed_;
-      other.task_ptr_.SetNull();
       other.FutureShmSetNull();
-      other.parent_task_ = nullptr;
+      other.parent_task_.reset();
       other.consumed_ = false;
     }
     return *this;
@@ -482,19 +519,30 @@ class Future {
    * Get raw pointer to the task
    * @return Pointer to the task object
    */
-  CTP_CROSS_FUN TaskT* get() const { return task_ptr_.ptr_; }
+  CTP_CROSS_FUN TaskT* get() const { return TaskRaw(); }
 
   /**
-   * Get the FullPtr to the task (non-const version)
-   * @return FullPtr to the task object
+   * Get the owning task handle.
+   * Host: clio::run::shared_ptr<TaskT>&. Device: FullPtr<TaskT>&.
    */
+#if CTP_IS_HOST
+  clio::run::shared_ptr<TaskT>& GetTaskPtr() { return task_ptr_; }
+  const clio::run::shared_ptr<TaskT>& GetTaskPtr() const { return task_ptr_; }
+
+  /**
+   * Non-owning FullPtr view of the task (null allocator) for transport /
+   * serialization code that still speaks FullPtr. Does not affect ownership.
+   */
+  ctp::ipc::FullPtr<TaskT> GetTaskFullPtr() const {
+    return ctp::ipc::FullPtr<TaskT>(task_ptr_.get());
+  }
+#else
   ctp::ipc::FullPtr<TaskT>& GetTaskPtr() { return task_ptr_; }
-
-  /**
-   * Get the FullPtr to the task (const version)
-   * @return FullPtr to the task object
-   */
   const ctp::ipc::FullPtr<TaskT>& GetTaskPtr() const { return task_ptr_; }
+  CTP_CROSS_FUN ctp::ipc::FullPtr<TaskT> GetTaskFullPtr() const {
+    return task_ptr_;
+  }
+#endif
 
   /**
    * Fail-loud sanity check for the dereference operators below.
@@ -530,7 +578,7 @@ class Future {
    */
   CTP_CROSS_FUN TaskT& operator*() const {
     CheckDerefNonNull();
-    return *task_ptr_.ptr_;
+    return *TaskRaw();
   }
 
   /**
@@ -539,7 +587,7 @@ class Future {
    */
   CTP_CROSS_FUN TaskT* operator->() const {
     CheckDerefNonNull();
-    return task_ptr_.ptr_;
+    return TaskRaw();
   }
 
   /** Get the cross-warp range offset */
@@ -762,16 +810,19 @@ class Future {
   }
 
   /**
-   * Get the parent task RunContext pointer
-   * @return Pointer to parent RunContext or nullptr
+   * Get the parent task (whose coroutine resumes when this future completes).
+   * @return Owning handle to the parent Task (null if none)
    */
-  RunContext* GetParentTask() const { return parent_task_; }
+  clio::run::shared_ptr<Task>& GetParentTask() { return parent_task_; }
+  const clio::run::shared_ptr<Task>& GetParentTask() const { return parent_task_; }
 
   /**
-   * Set the parent task RunContext pointer
-   * @param parent_task Pointer to parent RunContext
+   * Set the parent task (whose coroutine resumes when this future completes).
+   * @param parent_task Owning handle to the parent Task
    */
-  void SetParentTask(RunContext* parent_task) { parent_task_ = parent_task; }
+  void SetParentTask(const clio::run::shared_ptr<Task>& parent_task) {
+    parent_task_ = parent_task;
+  }
 
   // =========================================================================
   // C++20 Coroutine Awaitable Interface
@@ -854,8 +905,9 @@ class Future {
     if (!task_ptr_.IsNull() &&
         task_ptr_->task_flags_.Any(TASK_FIRE_AND_FORGET)) {
       // Fire-and-forget: detach without destroying. The task is still
-      // in-flight on the network; the remote EndTask will clean it up.
-      task_ptr_.SetNull();
+      // in-flight on the network; the remote EndTask will clean it up. On host
+      // this drops our local reference (the serialized copy lives remotely).
+      TaskSetNull();
       FutureShmSetNull();
       return;
     }
