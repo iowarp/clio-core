@@ -187,20 +187,6 @@ struct ClientShmInfo {
  * and priority queues for task processing.
  * Uses CTP global cross pointer variable singleton pattern.
  */
-#if defined(CTP_ALLOC_TRACK_SIZE) && CTP_IS_HOST
-// Leak-check accounting for tasks. NewTask uses global operator new (not the
-// CTP_MALLOC allocator), so the allocator's GetCurrentlyAllocatedSize() does not
-// see task allocations. Track the net outstanding NewTask bytes here so that
-// GetRuntimeHeapAllocatedBytes() — and thus the leak detector — also catches an
-// unfreed NewTask. NewTask increments, DelTask decrements; AllocLoadTask routes
-// through NewTask, so client and runtime task allocations are both covered and
-// stay balanced. Only compiled in leak-check builds.
-inline std::atomic<long long> &RuntimeTaskAllocBytes() {
-  static std::atomic<long long> bytes{0};
-  return bytes;
-}
-#endif
-
 /**
  * Per-thread state for IpcManager, stored via CTP_THREAD_MODEL TLS and created
  * lazily by IpcManager::GetTls() on first use per thread. Holds an EventManager
@@ -377,9 +363,6 @@ class IpcManager {
         ctp::make_shared<TaskT>(CTP_MALLOC, std::forward<Args>(args)...);
     if (!sp.IsNull()) {
       sp->fut_.task_size_ = static_cast<u32>(sizeof(TaskT));
-#if defined(CTP_ALLOC_TRACK_SIZE) && CTP_IS_HOST
-      RuntimeTaskAllocBytes() += static_cast<long long>(sizeof(TaskT));
-#endif
     }
     return sp;
   }

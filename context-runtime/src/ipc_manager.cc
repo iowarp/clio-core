@@ -1614,16 +1614,14 @@ size_t IpcManager::GetRuntimeHeapAllocatedBytes() const {
   // CTP_MALLOC is the private heap backing NewObj and the client-ZMQ
   // AllocateBuffer path. GetCurrentlyAllocatedSize() returns 0 unless built
   // with CTP_ALLOC_TRACK_SIZE (CLIO_CORE_ENABLE_LEAK_CHECK).
+  // Tasks are carved from CTP_MALLOC (ctp::make_shared(CTP_MALLOC, ...) in
+  // NewTask) and freed by RAII when the last shared_ptr owner drops, so a leaked
+  // task is already visible in GetCurrentlyAllocatedSize() below. (The former
+  // RuntimeTaskAllocBytes side-counter — needed when NewTask used global
+  // operator new — was removed with DelTask; keeping its now-undecremented
+  // increment made every freed task look leaked.)
   size_t total = CTP_MALLOC->GetCurrentlyAllocatedSize();
 #if defined(CTP_ALLOC_TRACK_SIZE)
-  // NewTask uses global operator new, not CTP_MALLOC, so add the net outstanding
-  // task bytes (incremented by NewTask, decremented by DelTask) — otherwise an
-  // unfreed NewTask would be invisible to the leak detector. Clamp negatives
-  // (defensive; the NewTask/DelTask pairing should keep this >= 0).
-  long long task_bytes = RuntimeTaskAllocBytes().load();
-  if (task_bytes > 0) {
-    total += static_cast<size_t>(task_bytes);
-  }
   // The runtime's AllocateBuffer draws from the per-process SHM
   // MultiProcessAllocator segments (not CTP_MALLOC), so add their outstanding
   // bytes too — otherwise a leaked runtime buffer is invisible here.

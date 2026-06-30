@@ -721,6 +721,23 @@ void Worker::EndTask(clio::run::shared_ptr<Task> &task_ptr, bool can_resched) {
       task_ptr->method_, task_ptr->PredictedWallUs(), actual_wall_us,
       task_ptr->PredictedStat());
 
+  // Break the RunContext self-cycle for a task that is about to be released.
+  // ProcessNewTask binds RunFuture (run_ctx_->future_) with a copied task_ptr_
+  // that points back at this very task, so task -> RunContext -> future_ ->
+  // task_ptr_ -> task is a reference cycle that pins the whole graph once every
+  // external owner drops (one leaked task per RPC). RouteGlobal/RouteManyToOne
+  // already break it for origin/batch tasks; net-received tasks reach the
+  // worker via RouteLocal and are only broken here. Rebind as a NON-OWNING
+  // handle rather than reset(): GetFutureShm() now resolves THROUGH TaskRaw(),
+  // so a plain reset() would null the route and the in-flight response would
+  // never complete (see fix #c3e05ab). The non-owning handle keeps TaskRaw()
+  // valid while removing the ownership edge. NOT done on the periodic-reschedule
+  // path: a rescheduled task stays live and re-executes against this future.
+  auto break_self_cycle = [&]() {
+    task_ptr->RunFuture().GetTaskPtr() =
+        clio::run::shared_ptr<Task>::WrapNonOwning(task_ptr.get());
+  };
+
   // ManyToOne aggregate task: this synthetic task has no external waiter. On
   // completion, broadcast its OUT to the batched originals (which completes
   // each of them), then delete the aggregate. Done after the model
@@ -733,6 +750,7 @@ void Worker::EndTask(clio::run::shared_ptr<Task> &task_ptr, bool can_resched) {
     container->UpdateWork(task_ptr, -1);
     task_ptr->ClearFlags(TASK_DATA_OWNER);
     // Task is freed via RAII when the RunContext's shared_ptr owners drop.
+    break_self_cycle();
     return;
   }
 
@@ -755,6 +773,7 @@ void Worker::EndTask(clio::run::shared_ptr<Task> &task_ptr, bool can_resched) {
   // RunContext's shared_ptr owners drop.
   if (task_ptr->task_flags_.Any(TASK_FIRE_AND_FORGET)) {
     task_ptr->ClearFlags(TASK_DATA_OWNER);
+    break_self_cycle();
     return;
   }
 
@@ -768,6 +787,10 @@ void Worker::EndTask(clio::run::shared_ptr<Task> &task_ptr, bool can_resched) {
                                 ? NetQueuePriority::kSendOutIO
                                 : NetQueuePriority::kSendOutLatency;
     CLIO_IPC->EnqueueNetTask(task_ptr->RunFuture(), prio);
+    // EnqueueNetTask copied an owning Future into the net queue (keeps the task
+    // alive through SendOut), so this RunContext's back-reference can drop its
+    // ownership now.
+    break_self_cycle();
     return;
   }
 
@@ -782,6 +805,10 @@ void Worker::EndTask(clio::run::shared_ptr<Task> &task_ptr, bool can_resched) {
   }
   // Dispatch response via transport class
   IpcCpu2Self::SendOut(task_ptr, shm_send_transport_.get());
+  // SendOut has signaled the waiter (or, for a subtask, enqueued its Future copy
+  // onto the parent's event queue), so this RunContext's back-reference can drop
+  // its ownership and let the finished task free by RAII.
+  break_self_cycle();
 }
 
 void Worker::ProcessBlockedQueue(std::queue<clio::run::shared_ptr<Task>> &queue,
