@@ -1230,7 +1230,13 @@ class TaskResume {
       // coroutine that completes synchronously also momentarily has a null
       // caller_handle_, and must NOT be mistaken for task completion.
       if (is_top_level_ && task_ != nullptr) {
+        // SetCoroCompleted is a host-only RunContext accessor (declared under
+        // #if CTP_IS_HOST). The C++20 coroutine promise is parsed but never
+        // executed on the CUDA device pass (CTP_IS_HOST=0), so guard the call
+        // to keep that pass compiling.
+#if CTP_IS_HOST
         task_->SetCoroCompleted(true);
+#endif
       }
       return FinalAwaiter{caller_handle_};
     }
@@ -1488,7 +1494,11 @@ class TaskResume {
     // is already null and the caller never suspended, so there is nothing to
     // restore — coro_handle_ still holds the caller's own handle.)
     if (task != nullptr && caller_handle_) {
+      // CoroHandle() is a host-only RunContext accessor; this awaiter is parsed
+      // but never executed on the CUDA device pass (CTP_IS_HOST=0).
+#if CTP_IS_HOST
       task->CoroHandle() = caller_handle_;
+#endif
     }
   }
 };
