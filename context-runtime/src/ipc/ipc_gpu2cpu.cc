@@ -118,7 +118,7 @@ bool IpcGpu2Cpu::RecvIn(IpcManager *ipc, GpuTaskLane *gpu_lane, Worker *worker) 
   auto chi_fshm = future.GetFutureShm();
   chi_fshm->pool_id_ = pool_id;
   chi_fshm->method_id_ = method_id;
-  chi_fshm->origin_ = FutureShm::FUTURE_CLIENT_GPU2CPU;
+  chi_fshm->origin_ = ClientOrigin::kClientGpu2Cpu;
   // Stash original device-side pointers + size so SendOut can H2D-copy the
   // mutated POD back and signal FUTURE_COMPLETE on the device-side gpu::FutureShm
   // (cudaMemcpy when in kDeviceMem).

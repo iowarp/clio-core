@@ -49,7 +49,7 @@ Future<Task> IpcCpu2Self::SendIn(IpcManager *ipc,
   Future<Task> future(task_ptr->pool_id_, task_ptr->method_, task_ptr);
   {
     auto fs = future.GetFutureShm();
-    fs->origin_ = FutureShm::FUTURE_CLIENT_SHM;
+    fs->origin_ = ClientOrigin::kClientShm;
     fs->client_task_vaddr_ = 0;
   }
 
@@ -98,10 +98,10 @@ void IpcCpu2Self::SendOut(const clio::run::shared_ptr<Task> &task_ptr,
   if (future_shm.IsNull()) {
     return;
   }
-  u32 origin = future_shm->origin_;
+  ClientOrigin origin = future_shm->origin_;
 
   // Delegate to origin-based SendRuntime for non-self origins
-  if (origin != FutureShm::FUTURE_CLIENT_SHM) {
+  if (origin != ClientOrigin::kClientShm) {
     CLIO_IPC->SendRuntime(task_ptr, send_transport);
     return;
   }
@@ -122,9 +122,8 @@ void IpcCpu2Self::SendOut(const clio::run::shared_ptr<Task> &task_ptr,
       CLIO_IPC->AwakenWorker(parent_task->Lane());
     }
   } else {
-    // Top-level client task: set FUTURE_COMPLETE directly.
-    // Use SetBitsSystem for CPU→GPU visibility in UVM.
-    future_shm->flags_.SetBitsSystem(FutureShm::FUTURE_COMPLETE);
+    // Top-level client task: mark complete directly (per-process, this task).
+    task_ptr->SetComplete();
   }
 }
 

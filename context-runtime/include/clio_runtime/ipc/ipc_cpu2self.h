@@ -109,10 +109,11 @@ struct IpcCpu2Self {
   template <typename TaskT, typename AllocT>
   static bool RecvOut(Future<TaskT, AllocT> &future, float max_sec,
                          ctp::ipc::FullPtr<FutureShm> future_full) {
-    // Poll FUTURE_COMPLETE in shared memory
-    ctp::abitfield32_t &flags = future_full->flags_;
+    // Poll per-process completion on the task (set by SendOut on this runtime).
+    (void)future_full;
+    TaskT *task_ptr = future.get();
     auto start = std::chrono::steady_clock::now();
-    while (!flags.Any(FutureShm::FUTURE_COMPLETE)) {
+    while (!task_ptr->IsComplete()) {
       CTP_THREAD_MODEL->Yield();
       if (max_sec > 0) {
         float elapsed = std::chrono::duration<float>(

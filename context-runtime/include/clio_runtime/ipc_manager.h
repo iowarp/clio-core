@@ -593,9 +593,9 @@ class IpcManager {
     if (is_runtime) return true;
 
     auto future_shm = future.GetFutureShm();
-    u32 origin = future_shm->origin_;
+    ClientOrigin origin = future_shm->origin_;
 
-    if (origin == FutureShm::FUTURE_CLIENT_SHM && server_alive_.load()) {
+    if (origin == ClientOrigin::kClientShm && server_alive_.load()) {
       return IpcCpu2Cpu::RecvOut(this, future, max_sec);
     }
     return IpcCpu2CpuZmq::RecvOut(this, future, max_sec);
@@ -1442,8 +1442,16 @@ class IpcManager {
   std::atomic<bool> heartbeat_running_{false};
   std::atomic<bool> server_alive_{true};
 
+  // A client-side in-flight async submission, tracked by net_key. The async
+  // recv thread marks the task complete (Task::is_complete_/is_new_data_) and
+  // wakes the waiter thread recorded on the FutureShm. Both pointers stay valid
+  // while the client's Future (which owns them) is alive.
+  struct PendingClientFuture {
+    FutureShm *fshm = nullptr;  // waiter_pid_/tid_ + client-side bookkeeping
+    Task *task = nullptr;       // SetComplete()/SetNewData()
+  };
   // Pending futures (client-side, keyed by net_key)
-  std::unordered_map<size_t, FutureShm *> pending_zmq_futures_;
+  std::unordered_map<size_t, PendingClientFuture> pending_zmq_futures_;
   std::mutex pending_futures_mutex_;
 
   // Pending response archives (client-side, keyed by net_key)
@@ -1768,8 +1776,8 @@ CTP_CROSS_FUN Future<TaskT, AllocT>::~Future() {
     if (!FutureShmIsNull()) {
 #if CTP_IS_HOST
       ctp::ipc::FullPtr<FutureShm> fs = GetFutureShm();
-      if (!fs.IsNull() && (fs->origin_ == FutureShm::FUTURE_CLIENT_TCP ||
-                           fs->origin_ == FutureShm::FUTURE_CLIENT_IPC)) {
+      if (!fs.IsNull() && (fs->origin_ == ClientOrigin::kClientTcp ||
+                           fs->origin_ == ClientOrigin::kClientIpc)) {
         CLIO_CPU_IPC->CleanupResponseArchive(fs->client_task_vaddr_);
       }
       FutureShmSetNull();
@@ -1820,7 +1828,7 @@ CTP_CROSS_FUN bool Future<TaskT, AllocT>::IsComplete() const {
   if (future_shm.IsNull()) {
     return false;
   }
-  if (future_shm->origin_ == FutureShm::FUTURE_CLIENT_GPU2CPU) {
+  if (future_shm->origin_ == ClientOrigin::kClientGpu2Cpu) {
     return IsCompleteGpu2Cpu();
   }
   return IsCompleteCpu2Cpu();
@@ -1829,11 +1837,9 @@ CTP_CROSS_FUN bool Future<TaskT, AllocT>::IsComplete() const {
 
 template <typename TaskT, typename AllocT>
 CTP_HOST_FUN bool Future<TaskT, AllocT>::IsCompleteCpu2Cpu() const {
-  auto future_shm = GetFutureShm();
-  if (future_shm.IsNull()) {
-    return false;
-  }
-  return future_shm->flags_.Any(FutureShm::FUTURE_COMPLETE);
+  // CPU/host completion lives on the task (per-process), not FutureShm::flags_.
+  TaskT *task = TaskRaw();
+  return task != nullptr && task->IsComplete();
 }
 
 template <typename TaskT, typename AllocT>
@@ -1901,11 +1907,8 @@ CTP_CROSS_FUN bool Future<TaskT, AllocT>::Wait(float max_sec,
   // complete, fall through; the underlying recv will see the flag and
   // deserialize without blocking.
   if (max_sec == 0.0f) {
-    ctp::ipc::FullPtr<FutureShm> future_full_poll = GetFutureShm();
-    if (future_full_poll.IsNull()) {
-      return false;
-    }
-    if (!future_full_poll.ptr_->flags_.Any(FutureShm::FUTURE_COMPLETE)) {
+    // IsComplete() dispatches by origin (CPU → Task::is_complete_, GPU → flags_).
+    if (!IsComplete()) {
       return false;
     }
     // Complete -> fall through to normal wait path (cheap; flag is set).
@@ -1933,7 +1936,7 @@ CTP_CROSS_FUN bool Future<TaskT, AllocT>::Wait(float max_sec,
   }
 
   // Client path: detect GPU-originated futures
-  if (future_full->origin_ == FutureShm::FUTURE_CLIENT_GPU2CPU) {
+  if (future_full->origin_ == ClientOrigin::kClientGpu2Cpu) {
     return WaitGpu2Cpu(max_sec, reuse_task);
   }
   return WaitCpu2Cpu(max_sec, reuse_task);

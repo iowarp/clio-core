@@ -49,6 +49,18 @@ class Task;
 class IpcManager;
 struct RunContext;
 
+/**
+ * How the client submitted this task — selects the completion/response path.
+ * Stored in FutureShm::origin_ and read by Future::IsComplete()/Wait() dispatch.
+ */
+enum class ClientOrigin : u32 {
+  kClientShm = 0,      ///< Client used shared memory
+  kClientTcp = 1,      ///< Client used ZMQ TCP
+  kClientIpc = 2,      ///< Client used ZMQ IPC (Unix domain socket)
+  kClientCpu2Gpu = 3,  ///< CPU->GPU transfer via cudaMemcpy
+  kClientGpu2Cpu = 4,  ///< GPU->CPU transfer via cudaMemcpy
+};
+
 // ============================================================================
 // FutureShm - Shared memory container for task future state
 // ============================================================================
@@ -65,23 +77,9 @@ struct RunContext;
  * inline copy buffer.
  */
 struct FutureShm {
-  // Bitfield flags for flags_
+  // flags_ now carries only the GPU device-completion bit. CPU/host completion
+  // moved to Task::is_complete_ / Task::is_new_data_.
   static constexpr u32 FUTURE_COMPLETE = 1; /**< Task execution is complete */
-  static constexpr u32 FUTURE_NEW_DATA = 2; /**< New output data available */
-  static constexpr u32 FUTURE_DEVICE_SCOPE =
-      16; /**< GPU->GPU path: use device-scope atomics (no system fence) */
-  static constexpr u32 FUTURE_POD_COPY =
-      32; /**< POD cudaMemcpy path: no serialization, task is raw memcpy'd */
-
-  // Origin constants: how the client submitted this task
-  static constexpr u32 FUTURE_CLIENT_SHM = 0; /**< Client used shared memory */
-  static constexpr u32 FUTURE_CLIENT_TCP = 1; /**< Client used ZMQ TCP */
-  static constexpr u32 FUTURE_CLIENT_IPC =
-      2; /**< Client used ZMQ IPC (Unix domain socket) */
-  static constexpr u32 FUTURE_CLIENT_CPU2GPU =
-      3; /**< CPU->GPU transfer via cudaMemcpy */
-  static constexpr u32 FUTURE_CLIENT_GPU2CPU =
-      4; /**< GPU->CPU transfer via cudaMemcpy */
 
   /**
    * Get the sentinel AllocatorId used by SendCpuToGpu to mark ShmPtrs
@@ -101,8 +99,8 @@ struct FutureShm {
   /** Method ID for the task */
   u32 method_id_;
 
-  /** Origin transport mode (FUTURE_CLIENT_SHM, _TCP, or _IPC) */
-  u32 origin_;
+  /** Origin transport mode — selects the completion/response path. */
+  ClientOrigin origin_;
 
   /** Virtual address of client's task (for ZMQ response routing) */
   uintptr_t client_task_vaddr_;
@@ -153,22 +151,9 @@ struct FutureShm {
   /** Socket fd for routing response (IPC mode) */
   int response_fd_;
 
-  /** Atomic bitfield for completion and data availability flags */
+  /** GPU device-completion bit (gpu2gpu reads it on-device; gpu2cpu signals
+   *  the device gpu::FutureShm). CPU/host completion lives on Task instead. */
   ctp::abitfield32_t flags_;
-
-  /**
-   * Opaque pointer to the parent's GPU RunContext (clio::run::gpu::RunContext*).
-   * Set by Future::await_suspend on GPU so that the worker completing
-   * this sub-task can directly resume the parent coroutine (same thread,
-   * no event queue needed). Null for top-level (client-originated) tasks.
-   * Typed as void* to avoid circular dependency with gpu/container.h.
-   */
-  void *parent_gpu_rctx_;
-
-  /** Cross-warp: warps increment on done */
-  ctp::ipc::atomic<u32> completion_counter_;
-  /** Number of warps sharing this FutureShm */
-  u32 total_warps_;
 
   /**
    * GPU device-memory pointer to the *task POD* (set when the kernel
@@ -200,7 +185,7 @@ struct FutureShm {
   CTP_CROSS_FUN FutureShm() {
     pool_id_ = PoolId::GetNull();
     method_id_ = 0;
-    origin_ = FUTURE_CLIENT_SHM;
+    origin_ = ClientOrigin::kClientShm;
     client_task_vaddr_ = 0;
     client_pid_ = 0;
     waiter_pid_ = 0;
@@ -208,9 +193,6 @@ struct FutureShm {
     response_transport_ = nullptr;
     response_identity_len_ = 0;
     response_fd_ = -1;
-    parent_gpu_rctx_ = nullptr;
-    completion_counter_.store(0);
-    total_warps_ = 1;
     gpu_task_device_ptr_ = 0;
     gpu_task_size_ = 0;
     gpu_fshm_device_ptr_ = 0;
@@ -240,7 +222,6 @@ struct FutureShm {
     pool_id_ = pool_id;
     method_id_ = method_id;
     client_task_vaddr_ = 0;
-    parent_gpu_rctx_ = nullptr;
     gpu_task_device_ptr_ = 0;
     gpu_task_size_ = 0;
     gpu_fshm_device_ptr_ = 0;
@@ -703,14 +684,12 @@ class Future {
   CTP_CROSS_FUN void WaitRecv(float max_sec = 0, bool reuse_task = false);
 
   /**
-   * Mark the task as complete
+   * Mark the task as complete. CPU/host completion lives on Task::is_complete_
+   * (managed by the Future); the worker/client reads it via IsComplete().
    */
   void Complete() {
-    if (!FutureShmIsNull()) {
-      auto future_shm = GetFutureShm();
-      if (!future_shm.IsNull()) {
-        future_shm->flags_.SetBits(FutureT::FUTURE_COMPLETE);
-      }
+    if (!task_ptr_.IsNull()) {
+      task_ptr_->SetComplete();
     }
   }
 
@@ -884,9 +863,6 @@ class Future {
         auto fshm_full = GetFutureShm();
         ctx->awaited_fshm_ = fshm_full.IsNull() ? nullptr : fshm_full.ptr_;
         ctx->awaited_task_ = task_ptr_.IsNull() ? nullptr : task_ptr_.ptr_;
-        if (!fshm_full.IsNull()) {
-          fshm_full.ptr_->parent_gpu_rctx_ = ctx;
-        }
         return true;  // Genuinely suspend
       }
     }

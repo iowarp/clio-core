@@ -262,6 +262,16 @@ class Task {
   OUT ctp::ipc::atomic<ContainerId>
       completer_; /**< Container ID that completed this task */
   IN u32 pod_size_; /**< sizeof(TaskT) for POD copy transport */
+  /** Per-process CPU/host completion signal — set by the completing worker (or
+   *  the client's recv thread when the response lands), polled by the waiter;
+   *  managed by the Future. Deliberately NOT serialized or copied (per-process,
+   *  not the wire format) — like run_ctx_. ctp::ipc::atomic (not std::atomic) so
+   *  the Task POD layout stays identical on host and device. Replaces the old
+   *  FutureShm::flags_ FUTURE_COMPLETE on the CPU paths. */
+  TEMP ctp::ipc::atomic<u32> is_complete_;
+  /** Per-process "new streaming data available" signal (CPU streaming). Replaces
+   *  FutureShm::flags_ FUTURE_NEW_DATA. Same not-serialized/not-copied rules. */
+  TEMP ctp::ipc::atomic<u32> is_new_data_;
   /** Owned host RunContext (null on GPU and whenever the task is not executing).
    *  A unique_ptr so the Task frees it automatically — no custom DestroyRunCtx.
    *  Same size on CPU and GPU (three pointers); RunContext stays merely
@@ -405,6 +415,8 @@ class Task {
     pod_size_ = 0;
     return_code_.store(0);  // Initialize as success
     completer_.store(0);    // Initialize as null (0 is invalid container ID)
+    is_complete_.store(0);
+    is_new_data_.store(0);
   }
 
   /**
@@ -443,6 +455,8 @@ class Task {
 #endif
     return_code_.store(0);  // Initialize as success
     completer_.store(0);    // Initialize as null (0 is invalid container ID)
+    is_complete_.store(0);
+    is_new_data_.store(0);
     task_group_ = TaskGroup();  // null group
   }
 
@@ -575,6 +589,15 @@ class Task {
   CTP_CROSS_FUN void SetReturnCode(u32 return_code) {
     return_code_.store(return_code);
   }
+
+  // Per-process completion / new-data signals (CPU/host paths). Managed by the
+  // Future; replace FutureShm::flags_ FUTURE_COMPLETE / FUTURE_NEW_DATA.
+  CTP_CROSS_FUN void SetComplete() { is_complete_.store(1); }
+  CTP_CROSS_FUN void UnsetComplete() { is_complete_.store(0); }
+  CTP_CROSS_FUN bool IsComplete() const { return is_complete_.load() != 0; }
+  CTP_CROSS_FUN void SetNewData() { is_new_data_.store(1); }
+  CTP_CROSS_FUN void UnsetNewData() { is_new_data_.store(0); }
+  CTP_CROSS_FUN bool IsNewData() const { return is_new_data_.load() != 0; }
 
   /**
    * Get the completer container ID (which container completed this task)

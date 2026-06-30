@@ -116,8 +116,8 @@ bool IpcCpu2CpuZmq::RecvIn(IpcManager *ipc, u32 &tasks_received) {
       Future<Task> future(pool_id, method_id, task_ptr);
       auto future_shm = future.GetFutureShm();
       future_shm->origin_ = (mode == IpcMode::kTcp)
-                                ? FutureShm::FUTURE_CLIENT_TCP
-                                : FutureShm::FUTURE_CLIENT_IPC;
+                                ? ClientOrigin::kClientTcp
+                                : ClientOrigin::kClientIpc;
       future_shm->client_task_vaddr_ = info.task_id_.net_key_;
       future_shm->client_pid_ = info.task_id_.pid_;
       future_shm->response_fd_ = recv_info.fd_;
@@ -215,8 +215,8 @@ bool IpcCpu2CpuZmq::RecvIn(IpcManager *ipc, u32 &tasks_received) {
 
 void IpcCpu2CpuZmq::EnqueueSendOut(IpcManager *ipc,
                                          const clio::run::shared_ptr<Task> &task,
-                                         u32 origin) {
-  if (origin == FutureShm::FUTURE_CLIENT_TCP) {
+                                         ClientOrigin origin) {
+  if (origin == ClientOrigin::kClientTcp) {
     ipc->EnqueueNetTask(task->RunFuture(), NetQueuePriority::kClientSendTcp);
   } else {
     ipc->EnqueueNetTask(task->RunFuture(), NetQueuePriority::kClientSendIpc);

@@ -48,7 +48,7 @@ bool IpcCpu2Cpu::RecvIn(IpcManager *ipc, TaskLane *lane) {
   // RunContext copy) is done with it.
   Future<Task> f(ti.pool_id_, ti.method_id_, tp);
   auto fs = f.GetFutureShm();
-  fs->origin_ = FutureShm::FUTURE_CLIENT_SHM;
+  fs->origin_ = ClientOrigin::kClientShm;
   fs->client_task_vaddr_ = ti.task_id_.net_key_;
   fs->client_pid_ = ti.task_id_.pid_;
   // The SHM client blocks on its own MPSC server clio-<pid>-<tid>; SendOut
@@ -99,9 +99,10 @@ void IpcCpu2Cpu::SendOut(
     HLOG(kError, "IpcCpu2Cpu::SendOut: no client server '{}'", name);
   }
 
-  // Signal completion. The task frees via RAII when the owning shared_ptr
-  // (held by the worker's RunContext/Future) drops — no explicit DelTask.
-  future_shm->flags_.SetBitsSystem(FutureShm::FUTURE_COMPLETE);
+  // Signal completion (per-process: the client's own task is woken via the MPSC
+  // response above). The task frees via RAII when the owning shared_ptr (held by
+  // the worker's RunContext/Future) drops — no explicit DelTask.
+  task_ptr->SetComplete();
   task_ptr->ClearFlags(TASK_DATA_OWNER);
 }
 

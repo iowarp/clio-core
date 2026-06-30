@@ -406,7 +406,7 @@ bool Worker::ProcessNewTask(TaskLane *lane) {
   if (!container) {
     HLOG(kError, "Worker {}: cannot service pool_id={} method={}; "
          "container not found", worker_id_, pool_id, method_id);
-    future_shm->flags_.SetBits(1 | FutureShm::FUTURE_COMPLETE);
+    future.SetComplete();  // unblock the waiter on the error path
     return true;
   }
 
@@ -420,7 +420,7 @@ bool Worker::ProcessNewTask(TaskLane *lane) {
          "Worker {}: Failed to deserialize task for pool_id={}, method={}",
          worker_id_, pool_id, method_id);
     // Mark as complete with error so client doesn't hang
-    future_shm->flags_.SetBits(1 | FutureShm::FUTURE_COMPLETE);
+    future.SetComplete();
     return true;
   }
 

@@ -2693,7 +2693,8 @@ void IpcManager::RecvZmqClientThread() {
         continue;
       }
 
-      FutureShm *future_shm = it->second;
+      FutureShm *future_shm = it->second.fshm;
+      Task *task = it->second.task;
 
       // Store the archive for Recv() to pick up
       pending_response_archives_[net_key] = std::move(archive);
@@ -2701,12 +2702,13 @@ void IpcManager::RecvZmqClientThread() {
       // Memory fence before setting complete
       std::atomic_thread_fence(std::memory_order_release);
 
-      // Signal completion
-      future_shm->flags_.SetBits(FutureShm::FUTURE_NEW_DATA |
-                                 FutureShm::FUTURE_COMPLETE);
+      // Signal completion on the client's task (per-process; polled by the
+      // client thread's WaitCpu2Cpu loop).
+      task->SetNewData();
+      task->SetComplete();
       // Wake the client thread blocked in ClientRecv — it sleeps on its
-      // EventManager rather than busy-polling FUTURE_COMPLETE. waiter_(pid,tid)
-      // identify that client thread (recorded in ClientSend).
+      // EventManager rather than busy-polling. waiter_(pid,tid) identify that
+      // client thread (recorded in ClientSend).
       if (future_shm->waiter_pid_ != 0) {
         ctp::lbm::EventManager::Signal(
             static_cast<int>(future_shm->waiter_pid_),
@@ -2860,6 +2862,10 @@ void IpcManager::FreeGpuBackend(u32 gpu_id,
 // RouteTask run before the worker picks the task up.
 void Task::BeginRunContext() {
   run_ctx_ = ctp::make_unique<RunContext>(CTP_MALLOC);
+  // Fresh execution starts not-complete (the waiter must not observe a stale
+  // completion from a prior life of a recycled task).
+  UnsetComplete();
+  UnsetNewData();
 #if CTP_IS_HOST
   // Resolve the execution container: the real (local) container if one exists
   // (the common case), otherwise the static container.
@@ -3399,19 +3405,19 @@ void IpcManager::SendRuntime(
     const clio::run::shared_ptr<Task> &task_ptr,
     ctp::lbm::Transport *send_transport) {
   auto future_shm = task_ptr->RunFuture().GetFutureShm();
-  u32 origin = future_shm->origin_;
+  ClientOrigin origin = future_shm->origin_;
 
   switch (origin) {
-    case FutureShm::FUTURE_CLIENT_SHM:
+    case ClientOrigin::kClientShm:
     default:
       IpcCpu2Cpu::SendOut(this, task_ptr, send_transport);
       break;
-    case FutureShm::FUTURE_CLIENT_TCP:
-    case FutureShm::FUTURE_CLIENT_IPC:
+    case ClientOrigin::kClientTcp:
+    case ClientOrigin::kClientIpc:
       IpcCpu2CpuZmq::EnqueueSendOut(this, task_ptr, origin);
       break;
 #if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL
-    case FutureShm::FUTURE_CLIENT_GPU2CPU:
+    case ClientOrigin::kClientGpu2Cpu:
       IpcGpu2Cpu::SendOut(this, task_ptr);
       break;
 #endif
