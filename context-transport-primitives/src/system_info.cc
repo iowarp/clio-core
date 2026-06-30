@@ -51,7 +51,7 @@
 #include <fstream>
 #include <string>
 
-#if CTP_ENABLE_PROCFS_SYSINFO
+#if CTP_HAS_CURL
 #include <curl/curl.h>
 #endif
 
@@ -1163,7 +1163,7 @@ SharedLibrary &SharedLibrary::operator=(SharedLibrary &&other) noexcept {
   return *this;
 }
 
-#if CTP_ENABLE_PROCFS_SYSINFO
+#if CTP_HAS_CURL
 static size_t CurlWriteCallback(void *contents, size_t size, size_t nmemb, void *userp) {
     ((std::string*)userp)->append((char*)contents, size * nmemb);
     return size * nmemb;
@@ -1235,7 +1235,7 @@ std::string SystemInfo::GetDeviceHealthStats(const std::string &path) {
 
 /// @brief Predicts drive failure by calling local python server.
 std::string SystemInfo::PredictDriveFailure(const std::string &drive_type, const std::string &health_json, const std::string &drive_id) {
-#if defined(__linux__)
+#if CTP_HAS_CURL
   // Use host.docker.internal so the request reaches the Windows/Mac host
   // when running inside a Docker container. Falls back gracefully if
   // the prediction server is not running.

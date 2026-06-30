@@ -454,8 +454,11 @@ target_link_libraries(host_deps INTERFACE
     ${REAL_TIME_FLAGS}
 )
 
-find_package(CURL REQUIRED)
-target_link_libraries(host_deps INTERFACE curl)
+find_package(CURL QUIET)
+if(CURL_FOUND)
+    target_link_libraries(host_deps INTERFACE CURL::libcurl)
+    target_compile_definitions(host_deps INTERFACE CTP_HAS_CURL=1)
+endif()
 
 # Install interface libraries (compiled libraries are installed in src/CMakeLists.txt)
 install(TARGETS
