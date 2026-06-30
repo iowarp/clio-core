@@ -1,25 +1,33 @@
-name: Distributed Test
+name: Cluster Tests
 
-# Docker-based distributed integration CI.
+# Docker-based multi-node integration CI for every collective + distributed
+# suite, consolidated into ONE job so the project is compiled exactly ONCE and
+# every suite runs against that single build:
 #
-# Spins up multi-node clusters from the iowarp/deps-cpu image (and the
-# cte-xfstests image for the FUSE test) and runs EVERY docker integration
-# suite: the runtime distributed / expand / migrate / reconnect /
-# leader-election / recovery tests, plus the CTE distributed and CTE FUSE
-# tests. (cte_jarvis_deploy_integration_docker is intentionally NOT run here —
-# it needs the external Jarvis deployment tool + SSH, not just docker;
-# cte_restart_integration is a local non-docker test covered by the normal
-# ctest run.) This exercises
-# the run-to-run network path (SendIn/RecvIn/SendOut/RecvOut over SHM/TCP/IPC)
-# AND the node-failure paths (SWIM membership detection, dead-node broadcast
-# completion, container recovery, client failover) so regressions in those
-# paths are caught automatically instead of silently.
+#   * ManyToOne  — PoolQuery::ManyToOne (time-windowed batch + AggregateIn +
+#     1->N broadcast on the neighborhood leader). Single-node, run in-container:
+#       - clio_run_bdev_chimod_tests "[manytoone]" (bdev AllocateBlocks batch)
+#       - clio_run_cfs_test (context-filesystem deferred-append sequencer)
+#   * AllToOne   — PoolQuery::AllToOne count-based barrier: the aggregate is held
+#     until a task from EVERY container in the pool has arrived. Exercised on a
+#     real 4-node cluster.
+#   * Distributed — the run-to-run network path (SendIn/RecvIn/SendOut/RecvOut
+#     over SHM/TCP/IPC) and the node-failure paths (SWIM membership, dead-node
+#     broadcast completion, container recovery, client failover): distributed /
+#     expand / migrate / reconnect / leader-election / recovery, plus the CTE
+#     distributed and CTE FUSE tests.
 #
-# The project is compiled ONCE INSIDE the deps-cpu image so the binaries are
-# ABI compatible with the runtime node containers (which load the .so files
-# from the mounted build directory), then every suite runs against that single
-# build. The cte-xfstests image used by the FUSE test is also Ubuntu 24.04 /
-# glibc 2.39, so it runs the same mounted build.
+# The project is compiled ONCE inside the iowarp/deps-cpu image so the binaries
+# are ABI compatible with the runtime node containers (which load the .so files
+# from the mounted build directory). The single-node ManyToOne tests run in that
+# same image; the multi-node suites run their docker-compose clusters against the
+# mounted build. The cte-xfstests image is not published, so the FUSE test uses a
+# small fuse-capable image built locally from deps-cpu (same glibc/base).
+#
+# (cte_jarvis_deploy_integration_docker is intentionally NOT run here — it needs
+# the external Jarvis deployment tool + SSH, not just docker;
+# cte_restart_integration is a local non-docker test covered by the normal ctest
+# run.)
 
 on:
   push:
@@ -34,16 +42,16 @@ on:
       - 'context-transfer-engine/**'
       - 'context-transport-primitives/**'
       - 'docker/deps-cpu.Dockerfile'
-      - '.github/workflows/distributed-test.yml'
+      - '.github/workflows/cluster-tests.yml'
   workflow_dispatch:
 
 concurrency:
-  group: distributed-test-${{ github.ref }}
+  group: cluster-tests-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  distributed:
-    name: Distributed (multi-node docker integration suites)
+  cluster-tests:
+    name: Cluster Tests (ManyToOne + AllToOne + Distributed)
     runs-on: ubuntu-latest
     timeout-minutes: 150
     env:
@@ -83,8 +91,14 @@ jobs:
             && rm -rf /var/lib/apt/lists/*
           DOCKERFILE
 
-      # Build inside the deps-cpu image so the resulting binaries link against
-      # the same libraries the runtime node containers provide at runtime.
+      # Compile ONCE inside the deps-cpu image so the binaries link against the
+      # same libraries the runtime node containers provide at runtime. The flag
+      # set is the SUPERSET of all three suites' needs:
+      #   * CLIO_CTE_ENABLE_FILESYSTEM=ON   — builds clio_run_cfs_test (ManyToOne)
+      #   * CLIO_CTE_ENABLE_FUSE_ADAPTER=ON — builds clio_cte_fuse (needs libfuse3)
+      #   * CLIO_CORE_ENABLE_DOCKER_CI=ON   — builds the integration test binaries
+      #     (clio_run_{leader_elect,reconnect,recovery}_tests) the suites
+      #     docker-exec; without it every gated suite fails "command not found".
       - name: Build (inside deps-cpu)
         run: |
           docker run --rm \
@@ -95,16 +109,11 @@ jobs:
               export LD_LIBRARY_PATH=/usr/local/lib:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
               export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/lib/x86_64-linux-gnu/pkgconfig:$PKG_CONFIG_PATH
               git config --global --add safe.directory /workspace
-              # The deps-cpu image ships no FUSE3, so the adapter build below
-              # (CLIO_CTE_ENABLE_FUSE_ADAPTER=ON) would FATAL_ERROR without it.
-              # The cte-xfstests image that runs the FUSE test already carries
-              # the matching libfuse3.so.3 runtime + fusermount3.
+              # deps-cpu ships no FUSE3, so CLIO_CTE_ENABLE_FUSE_ADAPTER=ON would
+              # FATAL_ERROR without the headers.
               apt-get update -qq && apt-get install -y -qq libfuse3-dev
-              # DOCKER_CI=ON builds the integration test binaries
-              # (clio_run_{leader_elect,reconnect,recovery}_tests) the suites
-              # below docker-exec; the release preset leaves it OFF, so without
-              # this every gated suite fails with "command not found".
               cmake --preset release -DCLIO_CORE_ENABLE_PYTHON=OFF \
+                -DCLIO_CTE_ENABLE_FILESYSTEM=ON \
                 -DCLIO_CTE_ENABLE_FUSE_ADAPTER=ON \
                 -DCLIO_CORE_ENABLE_DOCKER_CI=ON
               cmake --build build -j"$(nproc)"
@@ -113,10 +122,44 @@ jobs:
               chown -R "$HOST_UID:$HOST_GID" build
             '
 
-      # Each step exports HOST_UID/HOST_GID so the container processes match
-      # host file ownership (coverage gcda + mounted build access), and uses
-      # `if: !cancelled()` so every suite reports a result even if an earlier
-      # one failed.
+      # ---- ManyToOne: single-node, run in-container against the prebuilt
+      # binaries (RuntimeServer spawns clio_run in-container, so binaries and the
+      # runtime share one ABI/environment). Each suite below uses
+      # `if: !cancelled()` so every suite reports a result even if an earlier one
+      # failed.
+      - name: ManyToOne collective tests (inside deps-cpu)
+        if: ${{ !cancelled() }}
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}":/workspace -w /workspace -u 0 \
+            -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+            "$DEPS_IMAGE" bash -c '
+              set -e
+              export LD_LIBRARY_PATH=/usr/local/lib:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
+              cd build/bin
+              export CLIO_REPO_PATH="$PWD"
+              export LD_LIBRARY_PATH="$PWD:$LD_LIBRARY_PATH"
+              export CLIO_BIND_ADDR=127.0.0.1
+
+              echo "==== ManyToOne collective (bdev AllocateBlocks batch) ===="
+              ./clio_run_bdev_chimod_tests "[manytoone]"
+
+              echo "==== ManyToOne via context-filesystem deferred append ===="
+              ./clio_run_cfs_test
+
+              # Hand back any root-owned artifacts the tests left behind.
+              chown -R "$HOST_UID:$HOST_GID" . 2>/dev/null || true
+            '
+
+      # ---- AllToOne: count-based barrier on a real 4-node cluster.
+      - name: AllToOne barrier test (4-node cluster)
+        if: ${{ !cancelled() }}
+        run: |
+          export HOST_UID="$(id -u)" HOST_GID="$(id -g)"
+          ./context-runtime/test/integration/alltoone/run_tests.sh all
+
+      # ---- Distributed: run-to-run network + node-failure suites. Each exports
+      # HOST_UID/HOST_GID so container processes match host file ownership.
       - name: Runtime distributed test (4-node, shm/tcp/ipc)
         if: ${{ !cancelled() }}
         run: |
@@ -153,7 +196,6 @@ jobs:
           export HOST_UID="$(id -u)" HOST_GID="$(id -g)"
           ./context-runtime/test/integration/recovery/run_tests.sh all
 
-      # Run even if a runtime suite failed so both projects report a result.
       # The "Distributed Execution Validation" cross-node assertions are
       # temporarily disabled in test_core_functionality.cc (#503) because every
       # CTE blob op currently resolves to the client node's local container;
@@ -172,12 +214,13 @@ jobs:
           export IOWARP_DOCKER_IMAGE="$FUSE_IMAGE"
           ./context-transfer-engine/test/integration/fuse/run_tests.sh
 
-      # The run_tests.sh scripts tear their clusters down on success and
-      # failure; this only fires if a step was killed before its own cleanup.
+      # The run_tests.sh scripts tear their clusters down on success and failure;
+      # this only fires if a step was killed before its own cleanup.
       - name: Cleanup clusters
         if: always()
         run: |
           for f in \
+            context-runtime/test/integration/alltoone/docker-compose.yml \
             context-runtime/test/integration/distributed/docker-compose.yml \
             context-runtime/test/integration/expand/docker-compose.yml \
             context-runtime/test/integration/migrate/docker-compose.yml \
