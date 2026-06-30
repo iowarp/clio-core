@@ -117,12 +117,13 @@ bool ConfigManager::ServerInit() {
 
 bool ConfigManager::LoadYaml(const std::string &config_path) {
   try {
-    // Use CTP BaseConfig methods. LoadFromFile(..., with_default=true) calls
-    // LoadDefault() first, which resets port_ (and other env-overridable
-    // fields) to compile-time defaults; re-apply the env overrides afterward so
-    // a config reload never silently drops CLIO_PORT et al.
+    // Parse the YAML as-is (yaml port/settings win). Env overrides (CLIO_PORT
+    // et al.) are applied by ClientInit/ServerInit via ApplyEnvOverrides(), not
+    // here — a bare LoadYaml must reflect the file so callers parsing arbitrary
+    // configs (e.g. a compose file into a local ConfigManager) get the file's
+    // values, and the runtime's operational config is never silently retargeted
+    // by a config reload.
     LoadFromFile(config_path, true);
-    ApplyEnvOverrides();
     return true;
   } catch (const std::exception &e) {
     return false;
