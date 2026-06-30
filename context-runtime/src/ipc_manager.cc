@@ -503,6 +503,10 @@ bool IpcManager::ServerInit() {
 }
 
 void IpcManager::ClientFinalize() {
+  // Mark shutdown so ZeroMqTransport leaks shared-context sockets instead of
+  // zmq_close-ing them on Windows (avoids libzmq's signaler WSASTARTUP abort).
+  ctp::lbm::sock::SetSocketLibShutdown();
+
   // Clean up thread-local task counter
   TaskCounter *counter =
       CTP_THREAD_MODEL->GetTls<TaskCounter>(chi_task_counter_key_);
@@ -582,6 +586,10 @@ void IpcManager::ServerFinalize() {
   if (!is_initialized_) {
     return;
   }
+
+  // Mark shutdown so ZeroMqTransport leaks shared-context sockets instead of
+  // zmq_close-ing them on Windows (avoids libzmq's signaler WSASTARTUP abort).
+  ctp::lbm::sock::SetSocketLibShutdown();
 
   // GPU orchestrator finalization removed along with the GPU runtime.
   // gpu2cpu_queue + gpu2cpu_copy_backend are torn down by

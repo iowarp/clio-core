@@ -407,6 +407,10 @@ void RuntimeManager::ClientFinalize() {
     return;
   }
 
+  // Leak shared-context ZMQ sockets on Windows during teardown (see
+  // ServerFinalize) to avoid libzmq's WSASTARTUP signaler assertion.
+  ctp::lbm::sock::SetSocketLibShutdown();
+
   // Finalize client components
   auto *pool_manager = CLIO_POOL_MANAGER;
   pool_manager->Finalize();
@@ -467,6 +471,12 @@ void RuntimeManager::ServerFinalize() {
   if (!is_initialized_ || !is_runtime_mode_) {
     return;
   }
+
+  // Mark shutdown before any transport teardown so ZeroMqTransport leaks
+  // shared-context sockets on Windows instead of zmq_close-ing them (which
+  // trips libzmq's signaler WSASTARTUP assert during teardown). Must precede
+  // StopWorkers / ClearClientPool below.
+  ctp::lbm::sock::SetSocketLibShutdown();
 
   // Flush in-flight (non-periodic) tasks and the net queues while the workers
   // are still running, so client/runtime work completes on its normal path and

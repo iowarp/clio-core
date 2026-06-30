@@ -40,6 +40,7 @@
 #include <zmq.h>
 
 #include <atomic>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -364,6 +365,17 @@ class ZeroMqTransport : public Transport {
       int sndtimeo = 1000;
       zmq_setsockopt(socket_, ZMQ_SNDTIMEO, &sndtimeo, sizeof(sndtimeo));
 
+      // Bound how long a blocking frame read (the flags=0 delim/meta/bulk reads
+      // in RecvMetadata/RecvBulks) can wait. The identity frame is read
+      // DONTWAIT, but if a multipart message is ever truncated on the wire the
+      // follow-on frames would block forever — wedging the recv thread so it
+      // can't honor recv_shutdown_ at teardown (the leaked Windows context
+      // sends no ETERM to wake it). 1 s lets the read fail with EAGAIN and the
+      // recv loop re-check the shutdown flag; well-formed messages arrive
+      // atomically so this never trips in steady state.
+      int rcvtimeo = 1000;
+      zmq_setsockopt(socket_, ZMQ_RCVTIMEO, &rcvtimeo, sizeof(rcvtimeo));
+
       // ZMTP heartbeat — same scale-friendly window as DEALER side.
       int hb_ivl = 5000;
       zmq_setsockopt(socket_, ZMQ_HEARTBEAT_IVL, &hb_ivl, sizeof(hb_ivl));
@@ -411,17 +423,29 @@ class ZeroMqTransport : public Transport {
   }
 
   ~ZeroMqTransport() {
-    HLOG(kDebug, "ZeroMqTransport destructor - closing socket to {}:{}", addr_,
-         port_);
+    HLOG(kDebug,
+         "ZeroMqTransport destructor - closing socket to {}:{} "
+         "(shutdown={} owns_ctx={})",
+         addr_, port_, sock::IsSocketLibShutdown(), owns_ctx_);
 
-    int linger = 0;  // Close immediately; don't wait for unsent messages
-    zmq_setsockopt(socket_, ZMQ_LINGER, &linger, sizeof(linger));
-
-    zmq_close(socket_);
-    if (owns_ctx_) {
-      zmq_ctx_destroy(ctx_);
+    // During process shutdown on Windows, tearing down a ZMQ socket OR a
+    // ZMQ context trips libzmq's signaler WSASTARTUP assertion: libzmq has
+    // already torn down its own Winsock state, so the signaler's wakeup send()
+    // aborts (signaler.cpp:163). The shared context is already leaked for this
+    // reason (see GetSharedContext's CtxOwner); do the same for every transport
+    // once shutdown has begun — skip both zmq_close and zmq_ctx_destroy and let
+    // the OS reclaim the socket (and any private context) at process exit. On
+    // POSIX IsSocketLibShutdown() is always false, so teardown is unchanged.
+    const bool leak = sock::IsSocketLibShutdown();
+    if (!leak) {
+      int linger = 0;  // Close immediately; don't wait for unsent messages
+      zmq_setsockopt(socket_, ZMQ_LINGER, &linger, sizeof(linger));
+      zmq_close(socket_);
+      if (owns_ctx_) {
+        zmq_ctx_destroy(ctx_);
+      }
     }
-    HLOG(kDebug, "ZeroMqTransport destructor - socket closed");
+    HLOG(kDebug, "ZeroMqTransport destructor - socket closed (leak={})", leak);
   }
 
   Bulk Expose(const ctp::ipc::FullPtr<char>& ptr, size_t data_size,
