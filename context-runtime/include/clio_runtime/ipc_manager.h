@@ -1790,21 +1790,13 @@ CTP_HOST_FUN Future<TaskT, AllocT>::~Future() {
 template <typename TaskT, typename AllocT>
 CTP_HOST_FUN ctp::ipc::FullPtr<typename Future<TaskT, AllocT>::FutureT>
 Future<TaskT, AllocT>::GetFutureShm() const {
-  if (FutureShmIsNull()) {
+  // The routing FutureShm is embedded in the task's RunContext (run_ctx_->route_);
+  // wrap it in a FullPtr with a null allocator. Requires an active RunContext.
+  TaskT* t = TaskRaw();
+  if (t == nullptr) {
     return ctp::ipc::FullPtr<FutureT>();
   }
-#if CTP_IS_HOST
-  // Host owns the FutureShm via shared_ptr in private memory; wrap the raw
-  // pointer in a FullPtr with a null allocator (no ShmPtr/ToFullPtr resolution).
-  return ctp::ipc::FullPtr<FutureT>(future_shm_.get());
-#else
-  // On device, ShmPtr::off_ already holds the resolved device-side address of
-  // the FutureShm (the host pre-built the task+FutureShm pair in a registered
-  // backend), so no allocator lookup / ToFullPtr is needed here — that path is
-  // host-only. Mirrors gpu::Future::GetFutureShmPtrRaw().
-  return ctp::ipc::FullPtr<FutureT>(
-      reinterpret_cast<FutureT *>(future_shm_.off_.load()));
-#endif
+  return ctp::ipc::FullPtr<FutureT>(t->RunRoute());
 }
 
 // ----------------------------------------------------------------

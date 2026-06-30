@@ -1240,10 +1240,10 @@ inline void Vector<T>::DrainHostPrefetchQueue(void *cuda_stream) {
                      b, s, p->page_idx);
       }
       impl_->async_inflight.fetch_add(1, std::memory_order_acq_rel);
-      futs.push_back(cte_client.AsyncGetBlob(view_.base.tag_id, blob_name,
-                                              /*offset=*/0, psz,
-                                              /*flags=*/0, blob_data,
-                                              clio::run::PoolQuery::ToLocalCpu()));
+      futs.push_back(cte_client.AsyncPodGetBlob(view_.base.tag_id, blob_name,
+                                                 /*offset=*/0, psz,
+                                                 /*flags=*/0, blob_data,
+                                                 clio::run::PoolQuery::ToLocalCpu()));
       impl_->clear_block_arr[n_to_clear] = b;
       impl_->clear_slot_arr[n_to_clear] = s;
       ++n_to_clear;

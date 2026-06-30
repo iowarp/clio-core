@@ -169,6 +169,7 @@ class Task;
 class Container;
 class IpcManager;
 struct RunContext;
+struct FutureShm;  // defined in future.h (included below); RunRoute() returns a ptr
 class Worker;
 // Future is defined later in this header (after Task); forward-declared here so
 // Task's RunContext accessors can name Future<Task, AllocT> by reference.
@@ -361,6 +362,9 @@ class Task {
   u32 YieldCount() const;
   void SetYieldCount(u32 v);
   Future<Task, CLIO_QUEUE_ALLOC_T>& RunFuture();
+  /** Embedded routing/transport state (former FutureShm); requires an active
+   *  RunContext (server: BeginRunContext at RecvIn; client: ensured at SendIn). */
+  FutureShm* RunRoute();
   bool IsNotified() const;
   void SetNotified(bool v);
   /** Whether this task's coroutine/fiber has run to completion, without
@@ -827,6 +831,10 @@ class RunContext {
   u32 yield_count_;                     /**< Number of times task has yielded */
   Future<Task, CLIO_QUEUE_ALLOC_T>
       future_;                    /**< Future for async completion tracking */
+  /** Embedded routing/transport state for this task (the former separately-
+   *  allocated FutureShm). Set on the server at RecvIn (and on the client at
+   *  SendIn) and read at SendOut; reached via Task::RunRoute(). */
+  FutureShm route_;
   std::atomic<bool> is_notified_; /**< Atomic flag to prevent duplicate event
                                      queue additions */
   // Set true by the top-level coroutine's final_suspend when the task
@@ -1110,6 +1118,12 @@ inline Future<Task, CLIO_QUEUE_ALLOC_T>& Task::RunFuture() {
     CLIO_RCTX_NULL(RunFuture);
   }
   return run_ctx_->future_;
+}
+inline FutureShm* Task::RunRoute() {
+  if (!run_ctx_) {
+    CLIO_RCTX_NULL(RunRoute);
+  }
+  return &run_ctx_->route_;
 }
 inline const clio::run::shared_ptr<Task>& Task::GetParentTask() const {
   if (!run_ctx_) {

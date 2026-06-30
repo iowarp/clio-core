@@ -77,8 +77,14 @@ enum class ClientOrigin : u32 {
  * inline copy buffer.
  */
 struct FutureShm {
-  // flags_ now carries only the GPU device-completion bit. CPU/host completion
-  // moved to Task::is_complete_ / Task::is_new_data_.
+  // The Future no longer OWNS a FutureShm via shared_ptr. These "remaining"
+  // routing fields now live embedded in the task's RunContext (member route_),
+  // set on the server at RecvIn (BeginRunContext) and read at SendOut; the
+  // client's SendIn likewise begins a RunContext and sets origin_ here.
+  // pool_id_/method_id_ read from the Task; is_complete_/task_size_/waiter_pid_/
+  // waiter_tid_ live on Task::fut_ (FutureInfo); client_task_vaddr_ is gone
+  // (response routing keys on task_id_.net_key_). flags_ carries only the GPU
+  // device-completion bit.
   static constexpr u32 FUTURE_COMPLETE = 1; /**< Task execution is complete */
 
   /**
@@ -93,29 +99,11 @@ struct FutureShm {
     return id;
   }
 
-  /** Pool ID for the task */
-  PoolId pool_id_;
-
-  /** Method ID for the task */
-  u32 method_id_;
-
   /** Origin transport mode — selects the completion/response path. */
   ClientOrigin origin_;
 
-  /** Virtual address of client's task (for ZMQ response routing) */
-  uintptr_t client_task_vaddr_;
-
   /** Client PID for per-client response routing */
   u32 client_pid_;
-
-  /** PID + TID of the thread blocked in Recv waiting for this task to
-   *  complete. The completer (SendOut) passes these to the transport via
-   *  LbmContext and, after a brief busy-wait, calls EventManager::Signal to
-   *  wake the waiter — replacing the busy-poll on FUTURE_COMPLETE. For an
-   *  external client this is the client thread; for a runtime self-send it is
-   *  the awaiting worker. 0 = no waiter registered (busy-poll fallback). */
-  u32 waiter_pid_;
-  u32 waiter_tid_;
 
   /** SHM transfer info for input direction (client -> worker) */
   ctp::lbm::ShmTransferInfo input_;
@@ -166,65 +154,34 @@ struct FutureShm {
   uintptr_t gpu_task_device_ptr_;
 
   /**
-   * sizeof(TaskT) for the H2D writeback copy. Mirrors
-   * gpu::FutureShm::task_size_ which the kernel filled in via Reset.
+   * sizeof(TaskT) for the H2D writeback copy. Mirrors Task::fut_.task_size_
+   * (stashed at gpu2cpu RecvIn so SendOut knows the POD size).
    */
   u32 gpu_task_size_;
 
   /**
-   * GPU device-memory pointer to the *gpu::FutureShm* co-located with
-   * the task. SendOut writes FUTURE_COMPLETE to this address (via
-   * cudaMemcpy when the FutureShm itself is in kDeviceMem) so the
-   * kernel poll-loop unblocks. Always non-zero on the GPU origin path.
-   */
-  uintptr_t gpu_fshm_device_ptr_;
-
-  /**
-   * Default constructor - initializes fields
+   * Default constructor - initializes the routing fields. The task identity
+   * (pool/method) is NOT stored here — it is read from the Task.
    */
   CTP_CROSS_FUN FutureShm() {
-    pool_id_ = PoolId::GetNull();
-    method_id_ = 0;
     origin_ = ClientOrigin::kClientShm;
-    client_task_vaddr_ = 0;
     client_pid_ = 0;
-    waiter_pid_ = 0;
-    waiter_tid_ = 0;
     response_transport_ = nullptr;
     response_identity_len_ = 0;
     response_fd_ = -1;
     gpu_task_device_ptr_ = 0;
     gpu_task_size_ = 0;
-    gpu_fshm_device_ptr_ = 0;
     flags_.Clear();
   }
 
   /**
-   * Parameterized constructor - initializes fields and stamps the task
-   * identity. Used by the Future constructor (via std::make_shared) so the
-   * pool/method are set at construction; transports then set origin_ and the
-   * client/waiter routing fields directly on the FutureShm.
+   * Reset the routing state for reuse (re-running a task through its
+   * RunContext). Clears the per-request fields; origin_/response_* are
+   * re-stamped by the transport at RecvIn.
    */
-  CTP_CROSS_FUN FutureShm(PoolId pool_id, u32 method_id) : FutureShm() {
-    pool_id_ = pool_id;
-    method_id_ = method_id;
-  }
-
-  /**
-   * Lightweight reset for per-task reuse on GPU.
-   * Only resets fields that change between tasks or that the
-   * orchestrator reads before processing. Avoids redundant atomic
-   * stores to fields that stay constant (origin_, response_*, etc.).
-   *
-   * Call this instead of placement-new when reusing a cached FutureShm.
-   */
-  CTP_CROSS_FUN void Reset(PoolId pool_id, u32 method_id) {
-    pool_id_ = pool_id;
-    method_id_ = method_id;
-    client_task_vaddr_ = 0;
+  CTP_CROSS_FUN void Reset() {
     gpu_task_device_ptr_ = 0;
     gpu_task_size_ = 0;
-    gpu_fshm_device_ptr_ = 0;
     flags_.Clear();
     input_.total_written_.store(0);
     input_.total_read_.store(0);
@@ -271,37 +228,15 @@ class Future {
   ctp::ipc::FullPtr<TaskT> task_ptr_;
 #endif
 
-  /**
-   * Handle to the FutureShm.
-   * Host: the Future OWNS the FutureShm via a std::shared_ptr created with
-   * std::make_shared in the parameterized constructor; copies/moves/Cast share
-   * the same object and the last owner frees it. Device: an offset-based ShmPtr
-   * (std::shared_ptr / make_shared are illegal in device code), unchanged.
-   */
-#if CTP_IS_HOST
-  std::shared_ptr<FutureT> future_shm_;
-#else
-  ctp::ipc::ShmPtr<FutureT> future_shm_;
-#endif
+  /** The Future no longer owns a FutureShm. The routing state (the slimmed
+   *  FutureShm) lives embedded in the task's RunContext (run_ctx_->route_),
+   *  reached lazily via Task::RunRoute(); completion/size/waiter live on
+   *  Task::fut_; pool/method are read from the Task. So a "null future" is
+   *  simply one with no task. */
+  CTP_HOST_FUN bool FutureShmIsNull() const { return TaskRaw() == nullptr; }
 
-  /** Null-check on future_shm_ that works for both the shared_ptr (host) and
-   *  the ShmPtr (device) representations. */
-  CTP_HOST_FUN bool FutureShmIsNull() const {
-#if CTP_IS_HOST
-    return future_shm_ == nullptr;
-#else
-    return future_shm_.IsNull();
-#endif
-  }
-
-  /** Null-out future_shm_ for both representations. */
-  CTP_HOST_FUN void FutureShmSetNull() {
-#if CTP_IS_HOST
-    future_shm_ = nullptr;
-#else
-    future_shm_.SetNull();
-#endif
-  }
+  /** No-op kept for call-site compatibility (no owned FutureShm to clear). */
+  CTP_HOST_FUN void FutureShmSetNull() {}
 
   /** Raw task pointer (host: shared_ptr::get; device: FullPtr::ptr_). */
   CTP_HOST_FUN TaskT* TaskRaw() const {
@@ -362,32 +297,11 @@ class Future {
 #if CTP_IS_HOST
   Future(PoolId pool_id, u32 method_id,
          clio::run::shared_ptr<TaskT> task_ptr)
-      : task_ptr_(std::move(task_ptr)),
-        future_shm_(std::make_shared<FutureT>(pool_id, method_id)),
-        parent_task_(),
-        consumed_(false) {}
-#endif
-
-#if !CTP_IS_HOST
-  /**
-   * Constructor from ShmPtr<FutureShm> and FullPtr<Task> (device).
-   * @param future_shm ShmPtr to existing FutureShm object
-   * @param task_ptr FullPtr to the task
-   */
-  CTP_HOST_FUN Future(ctp::ipc::ShmPtr<FutureT> future_shm,
-                        const ctp::ipc::FullPtr<TaskT>& task_ptr)
-      : future_shm_(future_shm), parent_task_(), consumed_(false) {
-    task_ptr_.shm_ = task_ptr.shm_;
-    task_ptr_.ptr_ = task_ptr.ptr_;
-  }
-
-  /**
-   * Constructor from ShmPtr<FutureShm> (device) - task pointer set later.
-   * @param future_shm_ptr ShmPtr to FutureShm object
-   */
-  CTP_HOST_FUN explicit Future(const ctp::ipc::ShmPtr<FutureT>& future_shm_ptr)
-      : future_shm_(future_shm_ptr), parent_task_(), consumed_(false) {
-    task_ptr_.SetNull();
+      : task_ptr_(std::move(task_ptr)), parent_task_(), consumed_(false) {
+    // pool/method now come from the Task itself; the routing state lives in the
+    // task's RunContext (reached via GetFutureShm() -> Task::RunRoute()).
+    (void)pool_id;
+    (void)method_id;
   }
 #endif
 
@@ -418,7 +332,6 @@ class Future {
 #if CTP_IS_HOST
         task_ptr_(other.task_ptr_),  // shares ownership (increments refcount)
 #endif
-        future_shm_(other.future_shm_),
         parent_task_(other.parent_task_),
         consumed_(false) {  // Copy is not consumed
 #if !CTP_IS_HOST
@@ -442,7 +355,6 @@ class Future {
       task_ptr_.shm_ = other.task_ptr_.shm_;
       task_ptr_.ptr_ = other.task_ptr_.ptr_;
 #endif
-      future_shm_ = other.future_shm_;
       parent_task_ = other.parent_task_;
       consumed_ = false;  // Copy is not consumed
     }
@@ -458,7 +370,6 @@ class Future {
 #if CTP_IS_HOST
         task_ptr_(std::move(other.task_ptr_)),  // transfers ownership
 #endif
-        future_shm_(std::move(other.future_shm_)),
         parent_task_(other.parent_task_),
         consumed_(other.consumed_) {
 #if !CTP_IS_HOST
@@ -486,10 +397,8 @@ class Future {
       task_ptr_.ptr_ = other.task_ptr_.ptr_;
       other.task_ptr_.SetNull();
 #endif
-      future_shm_ = std::move(other.future_shm_);
       parent_task_ = other.parent_task_;
       consumed_ = other.consumed_;
-      other.FutureShmSetNull();
       other.parent_task_.reset();
       other.consumed_ = false;
     }
@@ -709,21 +618,18 @@ class Future {
    * @return ShmPtr to the FutureShm object
    */
   CTP_HOST_FUN ctp::ipc::ShmPtr<FutureT> GetFutureShmPtr() const {
-#if CTP_IS_HOST
-    // Host owns the FutureShm via shared_ptr; synthesize a null-allocator
-    // ShmPtr whose offset is the raw address so .IsNull()/offset consumers
-    // keep working.
+    // The routing FutureShm is embedded in the task's RunContext. Synthesize a
+    // null-allocator ShmPtr whose offset is its raw address so .IsNull()/offset
+    // consumers keep working.
     ctp::ipc::ShmPtr<FutureT> p;
-    if (future_shm_ == nullptr) {
+    TaskT* t = TaskRaw();
+    if (t == nullptr) {
       p.SetNull();
       return p;
     }
     p.alloc_id_.SetNull();
-    p.off_ = reinterpret_cast<size_t>(future_shm_.get());
+    p.off_ = reinterpret_cast<size_t>(t->RunRoute());
     return p;
-#else
-    return future_shm_;
-#endif
   }
 
   /**
@@ -740,26 +646,18 @@ class Future {
    * @return Pool ID for the task
    */
   PoolId GetPoolId() const {
-    if (FutureShmIsNull()) {
-      return PoolId::GetNull();
-    }
-    auto future_shm = GetFutureShm();
-    if (future_shm.IsNull()) {
-      return PoolId::GetNull();
-    }
-    return future_shm->pool_id_;
+    TaskT* t = TaskRaw();
+    return t ? t->pool_id_ : PoolId::GetNull();
   }
 
   /**
-   * Set the pool ID in the FutureShm
+   * Set the pool ID on the task
    * @param pool_id Pool ID to set
    */
   void SetPoolId(const PoolId& pool_id) {
-    if (!FutureShmIsNull()) {
-      auto future_shm = GetFutureShm();
-      if (!future_shm.IsNull()) {
-        future_shm->pool_id_ = pool_id;
-      }
+    TaskT* t = TaskRaw();
+    if (t) {
+      t->pool_id_ = pool_id;
     }
   }
 
@@ -782,7 +680,6 @@ class Future {
     // This works because Future<TaskT> and Future<NewTaskT> have identical
     // sizes
     result.task_ptr_ = task_ptr_.template Cast<NewTaskT>();
-    result.future_shm_ = future_shm_;
     result.parent_task_ = parent_task_;
     result.consumed_ = false;  // Cast does not transfer ownership
     return result;
