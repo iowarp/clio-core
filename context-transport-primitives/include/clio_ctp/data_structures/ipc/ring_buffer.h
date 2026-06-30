@@ -596,6 +596,15 @@ class ring_buffer : public ShmContainer<AllocT> {
       return false;
     }
     val = entry.data_;
+    // Release the slot's copy of the element now that we have claimed it. The
+    // CAS above made this consumer the exclusive owner of the slot, and the
+    // producer cannot re-emplace here until head advances a full ring-lap (the
+    // head_.store below). Leaving the consumed copy in entry.data_ would pin any
+    // owning resources it holds — e.g. a Future<Task>'s shared_ptr<Task> — until
+    // the slot is eventually overwritten, which for a large/idle ring never
+    // happens (one leaked task per enqueue; see #620 force_net leak-check). For
+    // a trivially-copyable T this assignment is a cheap scalar store.
+    entry.data_ = T();
     // Use store_system so the updated head is globally visible (bypasses GPU L2).
     // Without this, head_.load_system() in the next Pop call would read the
     // stale value from DRAM, causing the GPU to repeatedly try the same slot.

@@ -342,8 +342,10 @@ void IpcManagerRun2Run::SendOut(clio::run::shared_ptr<clio::run::Task> origin_ta
                            target_node_id, target_host);
   (void)rc;
   // Task frees via RAII when its shared_ptr owners drop (the by-value
-  // origin_task handle here, plus the RunContext/send_map_ entry) — no
-  // explicit DelTask.
+  // origin_task handle here, plus the RunContext/send_map_ entry). The
+  // RunContext self-cycle (run_ctx_->future_->task_ptr_, bound by
+  // Worker::ProcessNewTask) was already broken in Worker::EndTask, on the
+  // is_remote path that enqueued this task for SendOut — no explicit DelTask.
 }
 
 // =============================================================================
