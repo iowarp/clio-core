@@ -27,6 +27,11 @@ kPutBlob: 15            # Store a blob
 kGetBlob: 16            # Retrieve a blob
 kReorganizeBlob: 17     # Change score for a single blob
 kDelBlob: 18            # Delete a blob
+
+# Fully-POD, GPU-compatible blob methods (fixed_string<32>, no SSO/SVO fixup)
+kPodPutBlob: 43         # POD variant of PutBlob
+kPodGetBlob: 44         # POD variant of GetBlob
+kPodReorganizeBlob: 45  # POD variant of ReorganizeBlob
 kGetBlobScore: 22       # Get the score of a blob
 kGetBlobSize: 23        # Get the size of a blob
 kGetBlobInfo: 25        # Get comprehensive blob metadata (score, size, blocks, targets)

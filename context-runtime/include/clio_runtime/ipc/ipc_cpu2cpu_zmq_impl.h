@@ -39,23 +39,23 @@ Future<TaskT> IpcCpu2CpuZmq::SendIn(IpcManager *ipc,
 
   // The Future owns a fresh FutureShm via shared_ptr (private memory).
   Future<TaskT> future(task_ptr->pool_id_, task_ptr->method_, task_ptr);
-  FutureShm *future_shm = future.GetFutureShm().ptr_;
+  RunContext *future_shm = future.GetFutureShm().ptr_;
   future_shm->origin_ = (mode == IpcMode::kTcp)
-                            ? FutureShm::FUTURE_CLIENT_TCP
-                            : FutureShm::FUTURE_CLIENT_IPC;
-  future_shm->client_task_vaddr_ = net_key;
+                            ? ClientOrigin::kClientTcp
+                            : ClientOrigin::kClientIpc;
   // Register this client thread as the waiter so the async recv thread can wake
   // it via EventManager::Signal when the response lands, instead of the client
-  // busy-polling FUTURE_COMPLETE. GetTls creates this thread's EventManager
-  // (its named (pid,tid) event) before the response can arrive.
+  // busy-polling. GetTls creates this thread's EventManager (its named (pid,tid)
+  // event) before the response can arrive. The waiter lives on the task's
+  // FutureInfo; the response routes by task_id_.net_key_ (set above).
   ipc->GetTls();
-  future_shm->waiter_pid_ = static_cast<u32>(ctp::SystemInfo::GetPid());
-  future_shm->waiter_tid_ = static_cast<u32>(ctp::SystemInfo::GetTid());
+  task_ptr->SetWaiter(static_cast<u32>(ctp::SystemInfo::GetPid()),
+                      static_cast<u32>(ctp::SystemInfo::GetTid()));
 
   // Register in pending futures map
   {
     std::lock_guard<std::mutex> lock(ipc->pending_futures_mutex_);
-    ipc->pending_zmq_futures_[net_key] = future_shm;
+    ipc->pending_zmq_futures_[net_key] = {task_ptr.get()};
   }
 
   // Send via lightbeam PUSH client
@@ -79,10 +79,10 @@ bool IpcCpu2CpuZmq::RecvOut(IpcManager *ipc,
 #else
   auto future_shm = future.GetFutureShm();
   TaskT *task_ptr = future.get();
-  u32 origin = future_shm->origin_;
+  ClientOrigin origin = future_shm->origin_;
 
   // If origin was SHM but server is dead, reconnect and resend via ZMQ
-  if (origin == FutureShm::FUTURE_CLIENT_SHM) {
+  if (origin == ClientOrigin::kClientShm) {
     if (ipc->client_retry_timeout_ == 0 && ipc->client_try_new_servers_ <= 0) {
       HLOG(kError,
            "Recv(SHM): Server dead, no retry/failover configured, failing");
@@ -101,7 +101,7 @@ bool IpcCpu2CpuZmq::RecvOut(IpcManager *ipc,
   // named auto-reset event latches a signal that races the Wait.
   ctp::lbm::EventManager *em = &ipc->GetTls()->event_manager_;
   auto start = std::chrono::steady_clock::now();
-  while (!future_shm->flags_.Any(FutureShm::FUTURE_COMPLETE)) {
+  while (!task_ptr->IsComplete()) {
     em->Wait(100);  // 100us bounded re-check; woken immediately by Signal
     float elapsed =
         std::chrono::duration<float>(std::chrono::steady_clock::now() - start)
@@ -124,7 +124,7 @@ bool IpcCpu2CpuZmq::RecvOut(IpcManager *ipc,
 
   // Memory fence + deserialize from pending_response_archives_
   std::atomic_thread_fence(std::memory_order_acquire);
-  size_t net_key = future_shm->client_task_vaddr_;
+  size_t net_key = task_ptr->task_id_.net_key_;
   {
     std::lock_guard<std::mutex> lock(ipc->pending_futures_mutex_);
     auto it = ipc->pending_response_archives_.find(net_key);
@@ -148,7 +148,7 @@ void IpcCpu2CpuZmq::ResendTask(IpcManager *ipc, Future<TaskT> &future) {
 #else
   auto future_shm = future.GetFutureShm();
   TaskT *task_ptr = future.get();
-  size_t old_net_key = future_shm->client_task_vaddr_;
+  size_t old_net_key = task_ptr->task_id_.net_key_;
 
   // Remove old pending entries
   {
@@ -168,15 +168,14 @@ void IpcCpu2CpuZmq::ResendTask(IpcManager *ipc, Future<TaskT> &future) {
   archive.client_port_ = ipc->GetClientResponsePort();
   archive << (*task_ptr);
 
-  future_shm->flags_.UnsetBits(FutureShm::FUTURE_COMPLETE);
+  task_ptr->UnsetComplete();
   future_shm->origin_ = (ipc->ipc_mode_ == IpcMode::kIpc)
-                            ? FutureShm::FUTURE_CLIENT_IPC
-                            : FutureShm::FUTURE_CLIENT_TCP;
-  future_shm->client_task_vaddr_ = net_key;
+                            ? ClientOrigin::kClientIpc
+                            : ClientOrigin::kClientTcp;
 
   {
     std::lock_guard<std::mutex> lock(ipc->pending_futures_mutex_);
-    ipc->pending_zmq_futures_[net_key] = future_shm.ptr_;
+    ipc->pending_zmq_futures_[net_key] = {task_ptr};
   }
   {
     std::lock_guard<std::mutex> lock(ipc->zmq_client_send_mutex_);

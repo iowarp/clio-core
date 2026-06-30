@@ -1495,6 +1495,310 @@ struct ReorganizeBlobTask : public clio::run::Task {
   }
 };
 
+// ===========================================================================
+// Fully-POD, GPU-compatible blob tasks (issue #556).
+//
+// These mirror PutBlob/GetBlob/ReorganizeBlob but carry the blob name in an
+// inline clio::run::priv::fixed_string<32> (no allocator, no SSO) instead of a
+// priv::string. Every field is therefore POD and the whole task is
+// bitwise-relocatable: a cudaMemcpy D<->H of the task is correct with ZERO
+// FixupAfterCopy (none is defined). Blob names are capped at 31 chars + NUL.
+// They share the runtime handler logic with the non-POD tasks via the
+// Runtime::*Impl<TaskT> member templates (same field names; both name types
+// expose .str()).
+// ===========================================================================
+
+/** Inline POD blob name used by all Pod*Blob tasks. */
+using PodBlobName = clio::run::priv::fixed_string<32>;
+
+/**
+ * PodPutBlob - fully-POD, GPU-compatible variant of PutBlobTask.
+ */
+struct PodPutBlobTask : public clio::run::Task {
+  IN TagId tag_id_;
+  INOUT PodBlobName blob_name_;
+  IN clio::run::u64 offset_;
+  IN clio::run::u64 size_;
+  IN ctp::ipc::ShmPtr<> blob_data_;
+  IN float score_;
+  INOUT Context context_;
+  IN clio::run::u32 flags_;
+  static constexpr clio::run::u32 kNoPageIdx = ~static_cast<clio::run::u32>(0);
+  IN clio::run::u32 gpu_page_idx_;
+  IN clio::run::u64 submit_ts_ns_;
+
+  // SHM constructor
+  CTP_CROSS_FUN PodPutBlobTask()
+      : clio::run::Task(),
+        tag_id_(TagId::GetNull()),
+        blob_name_(),
+        offset_(0),
+        size_(0),
+        blob_data_(ctp::ipc::ShmPtr<>::GetNull()),
+        score_(-1.0f),
+        context_(),
+        flags_(0),
+        gpu_page_idx_(kNoPageIdx),
+        submit_ts_ns_(0) {}
+
+  // GPU-compatible emplace constructor (const char* blob name, no allocator)
+  CTP_CROSS_FUN explicit PodPutBlobTask(
+      const clio::run::TaskId &task_id, const clio::run::PoolId &pool_id,
+      const clio::run::PoolQuery &pool_query, const TagId &tag_id,
+      const char *blob_name, clio::run::u64 offset, clio::run::u64 size,
+      ctp::ipc::ShmPtr<> blob_data, float score, const Context &context,
+      clio::run::u32 flags)
+      : clio::run::Task(task_id, pool_id, pool_query, Method::kPodPutBlob),
+        tag_id_(tag_id),
+        blob_name_(blob_name),
+        offset_(offset),
+        size_(size),
+        blob_data_(blob_data),
+        score_(score),
+        context_(context),
+        flags_(flags),
+        gpu_page_idx_(kNoPageIdx),
+        submit_ts_ns_(0) {
+    task_id_ = task_id;
+    pool_id_ = pool_id;
+    method_ = Method::kPodPutBlob;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+#if CTP_IS_HOST
+  // std::string convenience overload (host clients).
+  explicit PodPutBlobTask(const clio::run::TaskId &task_id,
+                          const clio::run::PoolId &pool_id,
+                          const clio::run::PoolQuery &pool_query,
+                          const TagId &tag_id, const std::string &blob_name,
+                          clio::run::u64 offset, clio::run::u64 size,
+                          ctp::ipc::ShmPtr<> blob_data, float score,
+                          const Context &context, clio::run::u32 flags)
+      : PodPutBlobTask(task_id, pool_id, pool_query, tag_id, blob_name.c_str(),
+                       offset, size, blob_data, score, context, flags) {}
+#endif
+
+  /** Destructor — frees blob_data_ when this task owns the buffer (see
+   *  PutBlobTask::~PutBlobTask for the TASK_DATA_OWNER rationale). */
+  CTP_CROSS_FUN ~PodPutBlobTask() {
+#if !CTP_IS_DEVICE_PASS
+    if (task_flags_.Any(TASK_DATA_OWNER) && !blob_data_.IsNull()) {
+      auto *ipc_manager = CLIO_CPU_IPC;
+      if (ipc_manager) {
+        ipc_manager->FreeBuffer(blob_data_.template Cast<char>());
+      }
+    }
+#endif
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+    ar(tag_id_, blob_name_, offset_, size_, blob_data_, score_, context_,
+       flags_, gpu_page_idx_, submit_ts_ns_);
+    ar.bulk(blob_data_, size_, BULK_XFER);
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+    // Only INOUT fields travel back (see PutBlobTask::SerializeOut for why
+    // blob_data_ must NOT be echoed).
+    ar(blob_name_, context_);
+  }
+
+  // No FixupAfterCopy — fixed_string is position-independent.
+
+  void Copy(const ctp::ipc::FullPtr<PodPutBlobTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+    tag_id_ = other->tag_id_;
+    blob_name_ = other->blob_name_;
+    offset_ = other->offset_;
+    size_ = other->size_;
+    blob_data_ = other->blob_data_;
+    score_ = other->score_;
+    context_ = other->context_;
+    flags_ = other->flags_;
+    gpu_page_idx_ = other->gpu_page_idx_;
+    submit_ts_ns_ = other->submit_ts_ns_;
+  }
+
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    Task::AggregateOut(other_base);
+    Copy(other_base.template Cast<PodPutBlobTask>());
+  }
+};
+
+/**
+ * PodGetBlob - fully-POD, GPU-compatible variant of GetBlobTask.
+ */
+struct PodGetBlobTask : public clio::run::Task {
+  IN TagId tag_id_;
+  IN PodBlobName blob_name_;
+  IN clio::run::u64 offset_;
+  IN clio::run::u64 size_;
+  IN clio::run::u32 flags_;
+  IN ctp::ipc::ShmPtr<> blob_data_;
+  static constexpr clio::run::u32 kNoPageIdx = ~static_cast<clio::run::u32>(0);
+  IN clio::run::u32 gpu_page_idx_;
+
+  // SHM constructor
+  CTP_CROSS_FUN PodGetBlobTask()
+      : clio::run::Task(),
+        tag_id_(TagId::GetNull()),
+        blob_name_(),
+        offset_(0),
+        size_(0),
+        flags_(0),
+        blob_data_(ctp::ipc::ShmPtr<>::GetNull()),
+        gpu_page_idx_(kNoPageIdx) {}
+
+  // GPU-compatible emplace constructor (const char* blob name, no allocator)
+  CTP_CROSS_FUN explicit PodGetBlobTask(
+      const clio::run::TaskId &task_id, const clio::run::PoolId &pool_id,
+      const clio::run::PoolQuery &pool_query, const TagId &tag_id,
+      const char *blob_name, clio::run::u64 offset, clio::run::u64 size,
+      clio::run::u32 flags, ctp::ipc::ShmPtr<> blob_data)
+      : clio::run::Task(task_id, pool_id, pool_query, Method::kPodGetBlob),
+        tag_id_(tag_id),
+        blob_name_(blob_name),
+        offset_(offset),
+        size_(size),
+        flags_(flags),
+        blob_data_(blob_data),
+        gpu_page_idx_(kNoPageIdx) {
+    task_id_ = task_id;
+    pool_id_ = pool_id;
+    method_ = Method::kPodGetBlob;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+#if CTP_IS_HOST
+  // std::string convenience overload (host clients).
+  explicit PodGetBlobTask(const clio::run::TaskId &task_id,
+                          const clio::run::PoolId &pool_id,
+                          const clio::run::PoolQuery &pool_query,
+                          const TagId &tag_id, const std::string &blob_name,
+                          clio::run::u64 offset, clio::run::u64 size,
+                          clio::run::u32 flags, ctp::ipc::ShmPtr<> blob_data)
+      : PodGetBlobTask(task_id, pool_id, pool_query, tag_id, blob_name.c_str(),
+                       offset, size, flags, blob_data) {}
+#endif
+
+  /** Destructor — frees blob_data_ when this task owns the buffer (see
+   *  GetBlobTask::~GetBlobTask for the TASK_DATA_OWNER rationale). */
+  CTP_CROSS_FUN ~PodGetBlobTask() {
+#if !CTP_IS_DEVICE_PASS
+    if (task_flags_.Any(TASK_DATA_OWNER) && !blob_data_.IsNull()) {
+      auto *ipc_manager = CLIO_CPU_IPC;
+      if (ipc_manager) {
+        ipc_manager->FreeBuffer(blob_data_.template Cast<char>());
+      }
+    }
+#endif
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+    ar(tag_id_, blob_name_, offset_, size_, flags_, blob_data_, gpu_page_idx_);
+    ar.bulk(blob_data_, size_, BULK_EXPOSE);
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+    ar.bulk(blob_data_, size_, BULK_XFER);
+  }
+
+  // No FixupAfterCopy — fixed_string is position-independent.
+
+  void Copy(const ctp::ipc::FullPtr<PodGetBlobTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+    tag_id_ = other->tag_id_;
+    blob_name_ = other->blob_name_;
+    offset_ = other->offset_;
+    size_ = other->size_;
+    flags_ = other->flags_;
+    blob_data_ = other->blob_data_;
+    gpu_page_idx_ = other->gpu_page_idx_;
+  }
+
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    Task::AggregateOut(other_base);
+    Copy(other_base.template Cast<PodGetBlobTask>());
+  }
+};
+
+/**
+ * PodReorganizeBlob - fully-POD, GPU-compatible variant of ReorganizeBlobTask.
+ */
+struct PodReorganizeBlobTask : public clio::run::Task {
+  IN TagId tag_id_;
+  IN PodBlobName blob_name_;
+  IN float new_score_;
+
+  // SHM constructor
+  CTP_CROSS_FUN PodReorganizeBlobTask()
+      : clio::run::Task(),
+        tag_id_(TagId::GetNull()),
+        blob_name_(),
+        new_score_(0.0f) {}
+
+  // GPU-compatible emplace constructor (const char* blob name, no allocator)
+  CTP_CROSS_FUN explicit PodReorganizeBlobTask(
+      const clio::run::TaskId &task_id, const clio::run::PoolId &pool_id,
+      const clio::run::PoolQuery &pool_query, const TagId &tag_id,
+      const char *blob_name, float new_score)
+      : clio::run::Task(task_id, pool_id, pool_query,
+                        Method::kPodReorganizeBlob),
+        tag_id_(tag_id),
+        blob_name_(blob_name),
+        new_score_(new_score) {
+    task_id_ = task_id;
+    pool_id_ = pool_id;
+    method_ = Method::kPodReorganizeBlob;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+#if CTP_IS_HOST
+  // std::string convenience overload (host clients).
+  explicit PodReorganizeBlobTask(const clio::run::TaskId &task_id,
+                                 const clio::run::PoolId &pool_id,
+                                 const clio::run::PoolQuery &pool_query,
+                                 const TagId &tag_id,
+                                 const std::string &blob_name, float new_score)
+      : PodReorganizeBlobTask(task_id, pool_id, pool_query, tag_id,
+                              blob_name.c_str(), new_score) {}
+#endif
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+    ar(tag_id_, blob_name_, new_score_);
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+  }
+
+  void Copy(const ctp::ipc::FullPtr<PodReorganizeBlobTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+    tag_id_ = other->tag_id_;
+    blob_name_ = other->blob_name_;
+    new_score_ = other->new_score_;
+  }
+
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    Task::AggregateOut(other_base);
+    Copy(other_base.template Cast<PodReorganizeBlobTask>());
+  }
+};
+
 /**
  * DelBlob task - Remove blob and decrement tag size
  */

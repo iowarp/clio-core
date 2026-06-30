@@ -198,8 +198,8 @@ __global__ void InitMetaKernel(DeviceViewBase v, char *pages_base,
     p->flags = 0;
     p->lru_clock = 0;
     p->score = 0.0f;
-    new (&p->active_put) clio::run::gpu::Future<clio::cte::core::PutBlobTask>();
-    new (&p->active_get) clio::run::gpu::Future<clio::cte::core::GetBlobTask>();
+    new (&p->active_put) clio::run::gpu::Future<clio::cte::core::PodPutBlobTask>();
+    new (&p->active_get) clio::run::gpu::Future<clio::cte::core::PodGetBlobTask>();
   }
 }
 
@@ -752,10 +752,11 @@ inline clio::run::u32 BlockStrideBytes(clio::run::u32 total_pages_per_block) {
   return static_cast<clio::run::u32>((raw + 15) & ~static_cast<size_t>(15));
 }
 
-/** Sum of sizeof(TaskT) + sizeof(gpu::FutureShm), 16-byte aligned. */
+/** sizeof(TaskT), 16-byte aligned. The Task is self-contained (its fut_ holds
+ *  the completion record), so there is no co-located gpu::FutureShm. */
 template <typename TaskT>
 inline clio::run::u32 TaskSlotStride() {
-  size_t raw = sizeof(TaskT) + sizeof(clio::run::gpu::FutureShm);
+  size_t raw = sizeof(TaskT);
   return static_cast<clio::run::u32>((raw + 15) & ~static_cast<size_t>(15));
 }
 
@@ -926,9 +927,9 @@ inline Vector<T>::Vector(const std::string &tag_name, clio::run::u32 nblocks,
 
   // 3. Task pools cover the FULL tier slot count.
   clio::run::u32 put_stride =
-      detail::TaskSlotStride<clio::cte::core::PutBlobTask>();
+      detail::TaskSlotStride<clio::cte::core::PodPutBlobTask>();
   clio::run::u32 get_stride =
-      detail::TaskSlotStride<clio::cte::core::GetBlobTask>();
+      detail::TaskSlotStride<clio::cte::core::PodGetBlobTask>();
   clio::run::u64 task_count = static_cast<clio::run::u64>(nblocks) * total_ppb;
   impl_->put_alloc_id = cpu_ipc->AllocateAndRegisterGpuBackend(
       gpu_id, clio::run::gpu::IpcManager::MemKind::kPinnedHost,
@@ -1038,22 +1039,20 @@ inline Vector<T>::Vector(const std::string &tag_name, clio::run::u32 nblocks,
       char *put_addr = impl_->put_base + slot_idx * put_stride;
       char *get_addr = impl_->get_base + slot_idx * get_stride;
       std::string blob_name = tag_name + "_b" + std::to_string(b);
-      auto put_task = new (put_addr) clio::cte::core::PutBlobTask(
+      auto put_task = new (put_addr) clio::cte::core::PodPutBlobTask(
           clio::run::CreateTaskId(), impl_->cte_pool_id,
           clio::run::PoolQuery::ToLocalCpu(), view_.base.tag_id,
           blob_name.c_str(), /*offset=*/0, /*size=*/0,
           ctp::ipc::ShmPtr<>::GetNull(), /*score=*/-1.0f,
           clio::cte::core::Context(), /*flags=*/0);
-      put_task->pod_size_ = static_cast<clio::run::u32>(sizeof(*put_task));
-      new (put_addr + sizeof(*put_task)) clio::run::gpu::FutureShm();
+      put_task->fut_.task_size_ = static_cast<clio::run::u32>(sizeof(*put_task));
 
-      auto get_task = new (get_addr) clio::cte::core::GetBlobTask(
+      auto get_task = new (get_addr) clio::cte::core::PodGetBlobTask(
           clio::run::CreateTaskId(), impl_->cte_pool_id,
           clio::run::PoolQuery::ToLocalCpu(), view_.base.tag_id,
           blob_name.c_str(), /*offset=*/0, /*size=*/0,
           /*flags=*/0, ctp::ipc::ShmPtr<>::GetNull());
-      get_task->pod_size_ = static_cast<clio::run::u32>(sizeof(*get_task));
-      new (get_addr + sizeof(*get_task)) clio::run::gpu::FutureShm();
+      get_task->fut_.task_size_ = static_cast<clio::run::u32>(sizeof(*get_task));
     }
   }
 
@@ -1212,7 +1211,7 @@ inline void Vector<T>::DrainHostPrefetchQueue(void *cuda_stream) {
   //   Pass 2: Wait on each future (they run in parallel through the
   //           runtime). Bump/decrement async_inflight bookkeeping.
   //   Pass 3 (after the loop): one batched clear-flags kernel.
-  std::vector<clio::run::Future<clio::cte::core::GetBlobTask>> futs;
+  std::vector<clio::run::Future<clio::cte::core::PodGetBlobTask>> futs;
   futs.reserve(static_cast<size_t>(detail::kClearBatchCap));
   for (clio::run::u32 b = 0; b < nb; ++b) {
     Block *bp = reinterpret_cast<Block *>(impl_->host_meta_scratch +
@@ -1241,10 +1240,10 @@ inline void Vector<T>::DrainHostPrefetchQueue(void *cuda_stream) {
                      b, s, p->page_idx);
       }
       impl_->async_inflight.fetch_add(1, std::memory_order_acq_rel);
-      futs.push_back(cte_client.AsyncGetBlob(view_.base.tag_id, blob_name,
-                                              /*offset=*/0, psz,
-                                              /*flags=*/0, blob_data,
-                                              clio::run::PoolQuery::ToLocalCpu()));
+      futs.push_back(cte_client.AsyncPodGetBlob(view_.base.tag_id, blob_name,
+                                                 /*offset=*/0, psz,
+                                                 /*flags=*/0, blob_data,
+                                                 clio::run::PoolQuery::ToLocalCpu()));
       impl_->clear_block_arr[n_to_clear] = b;
       impl_->clear_slot_arr[n_to_clear] = s;
       ++n_to_clear;

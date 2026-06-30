@@ -38,41 +38,32 @@ bool IpcGpu2Cpu::RecvIn(IpcManager *ipc, GpuTaskLane *gpu_lane, Worker *worker) 
 
   worker->SetCurrentTask(clio::run::shared_ptr<Task>());
 
-  ctp::ipc::ShmPtr<gpu::FutureShm> gpu_fshm_shmptr = gpu_future.GetFutureShmPtr();
   ctp::ipc::ShmPtr<Task> task_shmptr = gpu_future.GetTaskPtr().shm_;
-  if (gpu_fshm_shmptr.IsNull() || task_shmptr.IsNull()) {
-    HLOG(kError, "IpcGpu2Cpu::RecvIn: worker {} null ShmPtr in queue entry",
+  if (task_shmptr.IsNull()) {
+    HLOG(kError, "IpcGpu2Cpu::RecvIn: worker {} null task ShmPtr in queue entry",
          worker_id);
     return true;
   }
 
-  void *gpu_fshm_raw = reinterpret_cast<void *>(gpu_fshm_shmptr.off_.load());
   void *gpu_task_raw = reinterpret_cast<void *>(task_shmptr.off_.load());
-  if (!gpu_fshm_raw || !gpu_task_raw) {
-    HLOG(kError, "IpcGpu2Cpu::RecvIn: worker {} null off_ in queue entry",
+  if (!gpu_task_raw) {
+    HLOG(kError, "IpcGpu2Cpu::RecvIn: worker {} null task off_ in queue entry",
          worker_id);
     return true;
   }
 
-  // Detect whether the FutureShm / Task structs sit in pure device memory (host
-  // cannot dereference them). ctp::IsDevicePointer returns false on host builds.
-  bool fshm_on_device = ctp::IsDevicePointer(gpu_fshm_raw);
+  // Detect whether the Task struct sits in pure device memory (host cannot
+  // dereference it). ctp::IsDevicePointer returns false on host builds.
   bool task_on_device = ctp::IsDevicePointer(gpu_task_raw);
 
-  // Pull gpu::FutureShm contents into a local copy (D2H if needed). task_size_
-  // tells us how many bytes the Task POD occupies.
-  alignas(8) char fshm_buf[sizeof(gpu::FutureShm)];
-  if (fshm_on_device) {
-    ctp::DeviceAwareMemcpy(fshm_buf, gpu_fshm_raw, sizeof(gpu::FutureShm));
-  } else {
-    std::memcpy(fshm_buf, gpu_fshm_raw, sizeof(gpu::FutureShm));
-  }
-  auto &fshm_copy = *reinterpret_cast<gpu::FutureShm *>(fshm_buf);
-  u32 task_pod_size = fshm_copy.task_size_;
+  // The self-contained Task carries its POD size in fut_.task_size_; the kernel
+  // cached it in the queue entry so we know the copy size without reading the
+  // task first.
+  u32 task_pod_size = gpu_future.GetTaskSize();
   if (task_pod_size == 0) {
     HLOG(kError,
-         "IpcGpu2Cpu::RecvIn: worker {} gpu::FutureShm.task_size_=0 — kernel "
-         "did not call Reset(sizeof(TaskT)) before Send",
+         "IpcGpu2Cpu::RecvIn: worker {} queue task_size_=0 — kernel did not "
+         "stamp fut_.task_size_ before Send",
          worker_id);
     return true;
   }
@@ -96,6 +87,22 @@ bool IpcGpu2Cpu::RecvIn(IpcManager *ipc, GpuTaskLane *gpu_lane, Worker *worker) 
     task_raw = static_cast<Task *>(gpu_task_raw);
   }
 
+  // Signal completion directly on the (possibly device-resident) Task's
+  // embedded flag so the kernel poll-loop unblocks on the error paths below.
+  // is_complete_ is fut_'s first member (atomic<u32> whose storage is `.x`),
+  // so its device address is gpu_task_raw + (offset of fut_.is_complete_.x).
+  auto signal_task_complete = [&]() {
+    if (task_on_device) {
+      size_t off = reinterpret_cast<char *>(&task_raw->fut_.is_complete_.x) -
+                   reinterpret_cast<char *>(task_raw);
+      u32 one = 1;
+      ctp::DeviceAwareMemcpy(reinterpret_cast<char *>(gpu_task_raw) + off, &one,
+                             sizeof(u32));
+    } else {
+      task_raw->fut_.is_complete_.store(1);
+    }
+  };
+
   PoolId pool_id = task_raw->pool_id_;
   u32 method_id = task_raw->method_;
 
@@ -108,21 +115,15 @@ bool IpcGpu2Cpu::RecvIn(IpcManager *ipc, GpuTaskLane *gpu_lane, Worker *worker) 
          "IpcGpu2Cpu::RecvIn: worker {} Future construction failed (pool={}, "
          "method={})",
          worker_id, pool_id, method_id);
-    if (!fshm_on_device) {
-      static_cast<gpu::FutureShm *>(gpu_fshm_raw)
-          ->flags_.SetBitsSystem(gpu::FutureShm::FUTURE_COMPLETE);
-    }
+    signal_task_complete();
     return true;
   }
 
   auto chi_fshm = future.GetFutureShm();
-  chi_fshm->pool_id_ = pool_id;
-  chi_fshm->method_id_ = method_id;
-  chi_fshm->origin_ = FutureShm::FUTURE_CLIENT_GPU2CPU;
-  // Stash original device-side pointers + size so SendOut can H2D-copy the
-  // mutated POD back and signal FUTURE_COMPLETE on the device-side gpu::FutureShm
-  // (cudaMemcpy when in kDeviceMem).
-  chi_fshm->gpu_fshm_device_ptr_ = reinterpret_cast<uintptr_t>(gpu_fshm_raw);
+  chi_fshm->origin_ = ClientOrigin::kClientGpu2Cpu;
+  // Stash the device-side task pointer + size so SendOut can H2D-copy the
+  // mutated POD back and flip the task's completion flag (cudaMemcpy when in
+  // kDeviceMem). The Task is its own completion record — no gpu::FutureShm.
   chi_fshm->gpu_task_device_ptr_ =
       task_on_device ? reinterpret_cast<uintptr_t>(gpu_task_raw) : 0;
   chi_fshm->gpu_task_size_ = task_pod_size;
@@ -133,17 +134,8 @@ bool IpcGpu2Cpu::RecvIn(IpcManager *ipc, GpuTaskLane *gpu_lane, Worker *worker) 
     HLOG(kError,
          "IpcGpu2Cpu::RecvIn: worker {} Container not found (pool={}, method={})",
          worker_id, pool_id, method_id);
-    chi_fshm->flags_.SetBits(1 | FutureShm::FUTURE_COMPLETE);
-    if (!fshm_on_device) {
-      static_cast<gpu::FutureShm *>(gpu_fshm_raw)
-          ->flags_.SetBitsSystem(gpu::FutureShm::FUTURE_COMPLETE);
-    } else {
-      // Best-effort: still flip the device flag via cudaMemcpy.
-      u32 v = gpu::FutureShm::FUTURE_COMPLETE;
-      ctp::DeviceAwareMemcpy(
-          &static_cast<gpu::FutureShm *>(gpu_fshm_raw)->flags_.bits_.x, &v,
-          sizeof(u32));
-    }
+    task_raw->SetReturnCode(1);
+    signal_task_complete();
     return true;
   }
 
@@ -179,62 +171,48 @@ clio::run::shared_ptr<Task> IpcGpu2Cpu::RecvIn(
 }
 
 /**
- * SendOut: writes the (mutated) POD task bytes back to the original
- * device address (when the kernel allocated in kDeviceMem) and sets
- * FUTURE_COMPLETE on the device-side gpu::FutureShm so the kernel
- * poll-loop unblocks.
+ * SendOut: writes the (mutated) POD task bytes back to the original device
+ * address (when the kernel allocated in kDeviceMem) and flips the task's
+ * embedded completion flag (task->fut_.is_complete_) so the kernel poll-loop
+ * unblocks. There is no separate gpu::FutureShm — the Task is its own record.
  *
- * For kPinnedHost / kManagedUvm backends the host scratch copy IS the
- * authoritative storage (CPU and GPU share the same address) so no
- * writeback is needed; we just SetBits on the host-mapped flags. For
- * kDeviceMem we issue cudaMemcpy of the POD payload + a 4-byte cudaMemcpy
- * of the flag word to flip FUTURE_COMPLETE atomically — single-aligned-
- * 32-bit writes are observed atomically by the device's volatile read.
+ * For kPinnedHost / kManagedUvm the host scratch copy IS the authoritative
+ * storage (CPU and GPU share the address), so no writeback is needed and we
+ * just mark complete in place. For kDeviceMem we cudaMemcpy the POD payload,
+ * then a separate 4-byte cudaMemcpy of is_complete_=1 (ordered AFTER the POD,
+ * so the kernel never sees completion before the outputs are written) — a
+ * single aligned 32-bit write is observed whole by the device's volatile read.
  */
 void IpcGpu2Cpu::SendOut(
     IpcManager *ipc, const clio::run::shared_ptr<Task> &task_ptr) {
   auto future_shm = task_ptr->RunFuture().GetFutureShm();
   HLOG(kDebug, "IpcGpu2Cpu::SendOut: pool={} method={}",
        task_ptr->pool_id_, task_ptr->method_);
+  Task *host_task = task_ptr.get();
 
-  // 1) Writeback the POD task bytes to device memory if the kernel
-  //    allocated the task there. Worker::ProcessNewTaskGpu set
-  //    gpu_task_device_ptr_ only when D2H-copy was needed.
   if (future_shm->gpu_task_device_ptr_ && future_shm->gpu_task_size_) {
-    void *dst = reinterpret_cast<void *>(future_shm->gpu_task_device_ptr_);
-    ctp::DeviceAwareMemcpy(dst, task_ptr.get(), future_shm->gpu_task_size_);
+    // kDeviceMem: writeback the mutated POD (is_complete_ still 0 here), then
+    // flip the completion flag separately at its device address. is_complete_
+    // is fut_'s first member (atomic<u32> whose storage is `.x`).
+    ctp::DeviceAwareMemcpy(
+        reinterpret_cast<void *>(future_shm->gpu_task_device_ptr_), host_task,
+        future_shm->gpu_task_size_);
+    size_t complete_off =
+        reinterpret_cast<char *>(&host_task->fut_.is_complete_.x) -
+        reinterpret_cast<char *>(host_task);
+    u32 one = 1;
+    ctp::DeviceAwareMemcpy(
+        reinterpret_cast<char *>(future_shm->gpu_task_device_ptr_) +
+            complete_off,
+        &one, sizeof(u32));
   }
 
-  // 2) Signal FUTURE_COMPLETE on the device-side gpu::FutureShm. For
-  //    pinned host / UVM the address is dereferenceable and we use a
-  //    fenced atomic OR. For kDeviceMem we cudaMemcpy a 4-byte word.
-  if (future_shm->gpu_fshm_device_ptr_) {
-    auto *gpu_fshm = reinterpret_cast<gpu::FutureShm *>(
-        future_shm->gpu_fshm_device_ptr_);
-    bool fshm_on_device =
-        ctp::IsDevicePointer(static_cast<void *>(gpu_fshm));
-    if (fshm_on_device) {
-      // GPU's volatile read of bits_.x sees the 4-byte write whole.
-      // We OR-in the bit by reading then writing rather than racing
-      // against the kernel — the kernel never writes flags_ while a
-      // task is in-flight (it only reads), so a plain write of
-      // FUTURE_COMPLETE is safe here.
-      u32 new_flags = gpu::FutureShm::FUTURE_COMPLETE;
-      ctp::DeviceAwareMemcpy(&gpu_fshm->flags_.bits_.x, &new_flags,
-                             sizeof(u32));
-    } else {
-      // Atomic, system-scope OR of the completion bit. Use the bitfield's
-      // portable helper rather than __sync_fetch_and_or (a GCC builtin that
-      // MSVC does not provide).
-      gpu_fshm->flags_.SetBitsSystem(gpu::FutureShm::FUTURE_COMPLETE);
-    }
-  }
+  // Mark complete: for kPinnedHost / kManagedUvm this storage is shared with
+  // the device (the kernel's volatile poll sees it); also wakes host waiters.
+  host_task->SetComplete();
 
-  // Mark the chi-side future complete for any host-side waiters.
-  future_shm->flags_.SetBitsSystem(FutureShm::FUTURE_COMPLETE);
-
-  // Producer-only model: the client owns the device-memory backend that
-  // holds the task — the runtime does not free it.
+  // Producer-only model: the client owns the device-memory backend that holds
+  // the task — the runtime does not free it.
   task_ptr->ClearFlags(TASK_DATA_OWNER);
   (void)ipc;
 }

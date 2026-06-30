@@ -1614,14 +1614,16 @@ size_t IpcManager::GetRuntimeHeapAllocatedBytes() const {
   // CTP_MALLOC is the private heap backing NewObj and the client-ZMQ
   // AllocateBuffer path. GetCurrentlyAllocatedSize() returns 0 unless built
   // with CTP_ALLOC_TRACK_SIZE (CLIO_CORE_ENABLE_LEAK_CHECK).
-  // Tasks are carved from CTP_MALLOC (ctp::make_shared(CTP_MALLOC, ...) in
-  // NewTask) and freed by RAII when the last shared_ptr owner drops, so a leaked
-  // task is already visible in GetCurrentlyAllocatedSize() below. (The former
-  // RuntimeTaskAllocBytes side-counter — needed when NewTask used global
-  // operator new — was removed with DelTask; keeping its now-undecremented
-  // increment would have made every freed task look leaked.)
   size_t total = CTP_MALLOC->GetCurrentlyAllocatedSize();
 #if defined(CTP_ALLOC_TRACK_SIZE)
+  // NewTask uses global operator new, not CTP_MALLOC, so add the net outstanding
+  // task bytes (incremented by NewTask, decremented by DelTask) — otherwise an
+  // unfreed NewTask would be invisible to the leak detector. Clamp negatives
+  // (defensive; the NewTask/DelTask pairing should keep this >= 0).
+  long long task_bytes = RuntimeTaskAllocBytes().load();
+  if (task_bytes > 0) {
+    total += static_cast<size_t>(task_bytes);
+  }
   // The runtime's AllocateBuffer draws from the per-process SHM
   // MultiProcessAllocator segments (not CTP_MALLOC), so add their outstanding
   // bytes too — otherwise a leaked runtime buffer is invisible here.
@@ -2691,7 +2693,7 @@ void IpcManager::RecvZmqClientThread() {
         continue;
       }
 
-      FutureShm *future_shm = it->second;
+      Task *task = it->second.task;
 
       // Store the archive for Recv() to pick up
       pending_response_archives_[net_key] = std::move(archive);
@@ -2699,16 +2701,16 @@ void IpcManager::RecvZmqClientThread() {
       // Memory fence before setting complete
       std::atomic_thread_fence(std::memory_order_release);
 
-      // Signal completion
-      future_shm->flags_.SetBits(FutureShm::FUTURE_NEW_DATA |
-                                 FutureShm::FUTURE_COMPLETE);
+      // Signal completion on the client's task (per-process; polled by the
+      // client thread's WaitCpu2Cpu loop).
+      task->SetNewData();
+      task->SetComplete();
       // Wake the client thread blocked in ClientRecv — it sleeps on its
-      // EventManager rather than busy-polling FUTURE_COMPLETE. waiter_(pid,tid)
-      // identify that client thread (recorded in ClientSend).
-      if (future_shm->waiter_pid_ != 0) {
-        ctp::lbm::EventManager::Signal(
-            static_cast<int>(future_shm->waiter_pid_),
-            static_cast<int>(future_shm->waiter_tid_));
+      // EventManager rather than busy-polling. The waiter (pid,tid) lives on the
+      // task's FutureInfo (recorded in ClientSend).
+      if (task->WaiterPid() != 0) {
+        ctp::lbm::EventManager::Signal(static_cast<int>(task->WaiterPid()),
+                                       static_cast<int>(task->WaiterTid()));
       }
 
       // Remove from pending futures map
@@ -2856,8 +2858,26 @@ void IpcManager::FreeGpuBackend(u32 gpu_id,
 // predicted stats) are set later, on the worker, in Worker::ProcessNewTask and
 // Task::StartCoroutine. Giving the task an active RunContext here is what lets
 // RouteTask run before the worker picks the task up.
+void Task::EnsureRunCtx() {
+  // Allocate the RunContext storage if the task does not already have one. This
+  // is the lightweight half of BeginRunContext (no container resolution): it is
+  // what gives the task its embedded routing state (run_ctx_->route_) so the
+  // client SendIn / server RecvIn can stamp it via GetFutureShm() before the
+  // worker formally begins the task.
+  if (!run_ctx_) {
+    run_ctx_ = ctp::make_unique<RunContext>(CTP_MALLOC);
+  }
+}
+
 void Task::BeginRunContext() {
-  run_ctx_ = ctp::make_unique<RunContext>(CTP_MALLOC);
+  // Reuse an existing RunContext (e.g. one created at RecvIn to hold the
+  // response-routing state) rather than clobbering it — re-allocating here
+  // would wipe run_ctx_->route_ that the transport set before dispatch.
+  EnsureRunCtx();
+  // Fresh execution starts not-complete (the waiter must not observe a stale
+  // completion from a prior life of a recycled task).
+  UnsetComplete();
+  UnsetNewData();
 #if CTP_IS_HOST
   // Resolve the execution container: the real (local) container if one exists
   // (the common case), otherwise the static container.
@@ -2969,13 +2989,15 @@ RouteResult IpcManager::RouteManyToOne(Future<Task> &future) {
     // bind in RouteGlobal; the batch path skips ProcessNewTask, which is the
     // only other place RunFuture is bound.
     task_ptr->RunFuture() = future;
-    // Drop the Future's strong back-reference to this very task. The bind above
-    // exists only to keep the FutureShm alive for the response, but the copied
-    // task_ptr_ points at task_ptr itself, forming a
-    // task -> RunContext -> future_ -> task_ptr_ -> task cycle that leaks the
-    // task after the batch completes (the batch holds it by raw pointer, so
-    // nothing else recycles it). The response path reads only GetFutureShm().
-    task_ptr->RunFuture().GetTaskPtr().reset();
+    // Break the strong back-reference cycle (task -> RunContext -> future_ ->
+    // task_ptr_ -> task) that would otherwise leak the member after the batch
+    // completes, but keep the Future's task pointer pointing AT the member as a
+    // NON-OWNING handle: GetFutureShm() now resolves the routing state through
+    // the task (TaskRaw()->RunCtxPtr()), so a plain reset() would make
+    // OnAggregateComplete -> EndTask see a null route and never signal the
+    // member's waiter (the client's Wait() would hang).
+    task_ptr->RunFuture().GetTaskPtr() =
+        clio::run::shared_ptr<Task>::WrapNonOwning(task_ptr.get());
     task_ptr->SetRouted();
     batch_manager_->Add(task_ptr);
     return RouteResult::Local;
@@ -3143,11 +3165,14 @@ RouteResult IpcManager::RouteGlobal(Future<Task> &future,
   // hanging the waiting client. ProcessNewTask binds RunFuture for locally
   // executed tasks; net-routed tasks skip ProcessNewTask, so bind it here.
   task_ptr->RunFuture() = future;
-  // Drop the Future's strong self-reference: the copied task_ptr_ points at
-  // task_ptr itself, forming a task -> RunContext -> future_ -> task_ptr_ cycle
-  // that leaks the origin task after send_map_ erases it (run2run holds it by
-  // raw pointer). Only the FutureShm is needed for the response.
-  task_ptr->RunFuture().GetTaskPtr().reset();
+  // Break the strong self-reference cycle (task -> RunContext -> future_ ->
+  // task_ptr_ -> task) that would leak the origin task after send_map_ erases
+  // it, but keep the Future's task pointer pointing AT the task as a NON-OWNING
+  // handle: GetFutureShm() resolves the routing state through the task
+  // (TaskRaw()->RunCtxPtr()), so a plain reset() would make RecvIn/RecvOut ->
+  // EndTask see a null route and never send the response (hanging the client).
+  task_ptr->RunFuture().GetTaskPtr() =
+      clio::run::shared_ptr<Task>::WrapNonOwning(task_ptr.get());
 
   // Pick the latency vs I/O SendIn lane based on the task's actual
   // payload size — small probes / metadata sit on kSendInLatency so
@@ -3397,19 +3422,19 @@ void IpcManager::SendRuntime(
     const clio::run::shared_ptr<Task> &task_ptr,
     ctp::lbm::Transport *send_transport) {
   auto future_shm = task_ptr->RunFuture().GetFutureShm();
-  u32 origin = future_shm->origin_;
+  ClientOrigin origin = future_shm->origin_;
 
   switch (origin) {
-    case FutureShm::FUTURE_CLIENT_SHM:
+    case ClientOrigin::kClientShm:
     default:
       IpcCpu2Cpu::SendOut(this, task_ptr, send_transport);
       break;
-    case FutureShm::FUTURE_CLIENT_TCP:
-    case FutureShm::FUTURE_CLIENT_IPC:
+    case ClientOrigin::kClientTcp:
+    case ClientOrigin::kClientIpc:
       IpcCpu2CpuZmq::EnqueueSendOut(this, task_ptr, origin);
       break;
 #if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL
-    case FutureShm::FUTURE_CLIENT_GPU2CPU:
+    case ClientOrigin::kClientGpu2Cpu:
       IpcGpu2Cpu::SendOut(this, task_ptr);
       break;
 #endif

@@ -9,7 +9,7 @@
 /**
  * Focused proof-of-concept test for the producer-only GPU2CPU path with
  * **everything in device memory**:
- *   - Task POD (PutBlobTask / GetBlobTask) lives in a registered
+ *   - Task POD (PodPutBlobTask / PodGetBlobTask) lives in a registered
  *     kDeviceMem backend. The host pre-constructs a prototype via
  *     placement-new, then cudaMemcpy's it onto the device.
  *   - gpu::FutureShm sits co-located right after the task POD, also in
@@ -130,7 +130,7 @@ __global__ void DevMemFillKernel(char *buf, clio::run::u32 size, clio::run::u32 
 
 /** Submit one pre-built device-resident task and wait for completion. */
 __global__ void DevMemSubmitPutKernel(clio::run::IpcManagerGpuInfo info,
-                                       ctp::ipc::FullPtr<cte::PutBlobTask> task) {
+                                       ctp::ipc::FullPtr<cte::PodPutBlobTask> task) {
   CLIO_GPU_INIT(info, /*ipc_ptr=*/nullptr);
   if (threadIdx.x != 0) return;
   auto fut = g_ipc_manager_ptr->Send(task);
@@ -139,7 +139,7 @@ __global__ void DevMemSubmitPutKernel(clio::run::IpcManagerGpuInfo info,
 }
 
 __global__ void DevMemSubmitGetKernel(clio::run::IpcManagerGpuInfo info,
-                                       ctp::ipc::FullPtr<cte::GetBlobTask> task) {
+                                       ctp::ipc::FullPtr<cte::PodGetBlobTask> task) {
   CLIO_GPU_INIT(info, /*ipc_ptr=*/nullptr);
   if (threadIdx.x != 0) return;
   auto fut = g_ipc_manager_ptr->Send(task);
@@ -174,11 +174,10 @@ TEST_CASE("CTE PutBlob+GetBlob round trip with device-memory task & data",
   REQUIRE(gpu_info.gpu2cpu_queue != nullptr);
 
   // ---- 1) Allocate kDeviceMem backends ----
-  // (a) Task slots: PutBlobTask + FutureShm + GetBlobTask + FutureShm.
-  const clio::run::u32 kPutSlot = sizeof(cte::PutBlobTask) +
-                             sizeof(clio::run::gpu::FutureShm);
-  const clio::run::u32 kGetSlot = sizeof(cte::GetBlobTask) +
-                             sizeof(clio::run::gpu::FutureShm);
+  // (a) Task slots: PodPutBlobTask + PodGetBlobTask (each self-contained — the Task
+  //     carries its own completion record in fut_, no co-located FutureShm).
+  const clio::run::u32 kPutSlot = sizeof(cte::PodPutBlobTask);
+  const clio::run::u32 kGetSlot = sizeof(cte::PodGetBlobTask);
   const clio::run::u32 kTaskBackendBytes = kPutSlot + kGetSlot + 64;
   char *task_dev_base = nullptr;
   auto task_alloc_id = ipc->AllocateAndRegisterGpuBackend(
@@ -203,13 +202,12 @@ TEST_CASE("CTE PutBlob+GetBlob round trip with device-memory task & data",
   ctp::ipc::ShmPtr<> put_blob_shm;
   put_blob_shm.alloc_id_.SetNull();
   put_blob_shm.off_ = reinterpret_cast<clio::run::u64>(blob_dev);
-  auto *put_proto_task = new (put_proto) cte::PutBlobTask(
+  auto *put_proto_task = new (put_proto) cte::PodPutBlobTask(
       clio::run::CreateTaskId(), cte::kCtePoolId, clio::run::PoolQuery::ToLocalCpu(),
       g_tag_id, kBlobName, /*offset=*/clio::run::u64(0),
       static_cast<clio::run::u64>(kBlobBytes), put_blob_shm,
       /*score=*/-1.0f, cte::Context(), /*flags=*/clio::run::u32(0));
-  put_proto_task->pod_size_ = sizeof(cte::PutBlobTask);
-  new (put_proto + sizeof(cte::PutBlobTask)) clio::run::gpu::FutureShm();
+  put_proto_task->fut_.task_size_ = sizeof(cte::PodPutBlobTask);
   ctp::GpuApi::Memcpy(task_dev_base, put_proto, sizeof(put_proto));
 
   // GetBlob prototype:
@@ -218,13 +216,12 @@ TEST_CASE("CTE PutBlob+GetBlob round trip with device-memory task & data",
   ctp::ipc::ShmPtr<> get_blob_shm;
   get_blob_shm.alloc_id_.SetNull();
   get_blob_shm.off_ = reinterpret_cast<clio::run::u64>(blob_dev);
-  auto *get_proto_task = new (get_proto) cte::GetBlobTask(
+  auto *get_proto_task = new (get_proto) cte::PodGetBlobTask(
       clio::run::CreateTaskId(), cte::kCtePoolId, clio::run::PoolQuery::ToLocalCpu(),
       g_tag_id, kBlobName, /*offset=*/clio::run::u64(0),
       static_cast<clio::run::u64>(kBlobBytes), /*flags=*/clio::run::u32(0),
       get_blob_shm);
-  get_proto_task->pod_size_ = sizeof(cte::GetBlobTask);
-  new (get_proto + sizeof(cte::GetBlobTask)) clio::run::gpu::FutureShm();
+  get_proto_task->fut_.task_size_ = sizeof(cte::PodGetBlobTask);
   ctp::GpuApi::Memcpy(task_dev_base + kPutSlot, get_proto, sizeof(get_proto));
 
   // ---- 3) Fill blob_data on device with the source pattern. ----
@@ -236,15 +233,15 @@ TEST_CASE("CTE PutBlob+GetBlob round trip with device-memory task & data",
 
   // ---- 4) Build kernel-visible FullPtrs (raw device addresses
   //         stashed in off_, null alloc_id). ----
-  ctp::ipc::FullPtr<cte::PutBlobTask> put_fp;
+  ctp::ipc::FullPtr<cte::PodPutBlobTask> put_fp;
   put_fp.shm_.alloc_id_.SetNull();
   put_fp.shm_.off_ = reinterpret_cast<clio::run::u64>(task_dev_base);
-  put_fp.ptr_ = reinterpret_cast<cte::PutBlobTask *>(task_dev_base);
-  ctp::ipc::FullPtr<cte::GetBlobTask> get_fp;
+  put_fp.ptr_ = reinterpret_cast<cte::PodPutBlobTask *>(task_dev_base);
+  ctp::ipc::FullPtr<cte::PodGetBlobTask> get_fp;
   get_fp.shm_.alloc_id_.SetNull();
   get_fp.shm_.off_ =
       reinterpret_cast<clio::run::u64>(task_dev_base + kPutSlot);
-  get_fp.ptr_ = reinterpret_cast<cte::GetBlobTask *>(
+  get_fp.ptr_ = reinterpret_cast<cte::PodGetBlobTask *>(
       task_dev_base + kPutSlot);
 
   // ---- 5) Launch the PutBlob kernel and wait. ----
@@ -255,9 +252,9 @@ TEST_CASE("CTE PutBlob+GetBlob round trip with device-memory task & data",
   auto t1 = std::chrono::steady_clock::now();
 
   // Pull return_code_ back from device.
-  cte::PutBlobTask put_after{};
+  cte::PodPutBlobTask put_after{};
   ctp::GpuApi::Memcpy(reinterpret_cast<char *>(&put_after),
-                        task_dev_base, sizeof(cte::PutBlobTask));
+                        task_dev_base, sizeof(cte::PodPutBlobTask));
   std::fprintf(stderr, "[PUT] return_code=%u took=%lld ms\n",
                put_after.return_code_.load(),
                (long long)std::chrono::duration_cast<
@@ -276,10 +273,10 @@ TEST_CASE("CTE PutBlob+GetBlob round trip with device-memory task & data",
   ctp::GpuApi::Synchronize();
   auto g1 = std::chrono::steady_clock::now();
 
-  cte::GetBlobTask get_after{};
+  cte::PodGetBlobTask get_after{};
   ctp::GpuApi::Memcpy(reinterpret_cast<char *>(&get_after),
                         task_dev_base + kPutSlot,
-                        sizeof(cte::GetBlobTask));
+                        sizeof(cte::PodGetBlobTask));
   std::fprintf(stderr, "[GET] return_code=%u took=%lld ms\n",
                get_after.return_code_.load(),
                (long long)std::chrono::duration_cast<

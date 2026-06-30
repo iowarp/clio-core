@@ -254,7 +254,7 @@ int IpcManagerRun2Run::SendOutTransmit(
   // retry whose FutureShm was already freed).
   ctp::lbm::Transport *lbm_transport = nullptr;
   {
-    ctp::ipc::FullPtr<clio::run::FutureShm> fshm =
+    ctp::ipc::FullPtr<clio::run::RunContext> fshm =
         origin_task->RunFuture().GetFutureShm();
     if (!fshm.IsNull() && fshm->response_transport_ != nullptr) {
       lbm_transport = fshm->response_transport_;
@@ -342,10 +342,8 @@ void IpcManagerRun2Run::SendOut(clio::run::shared_ptr<clio::run::Task> origin_ta
                            target_node_id, target_host);
   (void)rc;
   // Task frees via RAII when its shared_ptr owners drop (the by-value
-  // origin_task handle here, plus the RunContext/send_map_ entry). The
-  // RunContext self-cycle (run_ctx_->future_->task_ptr_, bound by
-  // Worker::ProcessNewTask) was already broken in Worker::EndTask, on the
-  // is_remote path that enqueued this task for SendOut — no explicit DelTask.
+  // origin_task handle here, plus the RunContext/send_map_ entry) — no
+  // explicit DelTask.
 }
 
 // =============================================================================

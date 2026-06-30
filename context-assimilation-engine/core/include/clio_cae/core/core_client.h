@@ -273,17 +273,12 @@ bool CLIO_CAE_CLIENT_INIT(const std::string &config_path = "",
   (&(*CTP_GET_GLOBAL_PTR_VAR(clio::cae::core::Client,                         \
                               g_cae_client)))
 
-// Backward-compat aliases for the WRP_ -> CLIO_ rename. External code that
-// still uses wrp_cae::core::* resolves transparently to clio::cae::core::*.
-// Paired with the wrp_cae/ forwarder shim header tree. See rebranding.md.
-// Pre-`clio::cae`-rename intermediate spelling.  In-tree code now uses
-// `clio::cae::core::*`; downstream code that already migrated off
-// `wrp_cae::*` to the `clio_cae::*` waypoint keeps compiling via this
-// alias.  Safe to use the simple `namespace X = Y;` form because no
-// external chimod opens `namespace clio_cae::xxx {}`.
+// Intermediate `clio_cae` namespace-spelling alias. In-tree code uses
+// `clio::cae::core::*`; downstream that migrated to the `clio_cae::*` waypoint
+// keeps compiling via this alias. Safe to use the simple `namespace X = Y;`
+// form because no external chimod opens `namespace clio_cae::xxx {}`.
+// (The wrp_cae/ forwarder shim tree and the wrp_cae::/WRP_CAE_* compat aliases
+// were removed; downstream must use the clio_cae / clio::cae names.)
 namespace clio_cae = clio::cae;
-namespace wrp_cae = clio::cae;
-#define WRP_CAE_CLIENT CLIO_CAE_CLIENT
-#define WRP_CAE_CLIENT_INIT CLIO_CAE_CLIENT_INIT
 
 #endif  // CLIO_CAE_CORE_CLIENT_H_

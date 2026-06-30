@@ -384,17 +384,16 @@ bool Worker::ProcessNewTask(TaskLane *lane) {
 
   SetCurrentTask(clio::run::shared_ptr<Task>());
 
-  // Get FutureShm (allocator is pre-registered by Admin::RegisterMemory)
-  auto future_shm = future.GetFutureShm();
-  if (future_shm.IsNull()) {
-    HLOG(kError, "Worker {}: Failed to get FutureShm (null pointer)",
-         worker_id_);
+  // The task carries its own identity now (the Future no longer owns a FutureShm).
+  Task *new_task = future.get();
+  if (new_task == nullptr) {
+    HLOG(kError, "Worker {}: ProcessNewTask popped a null task", worker_id_);
     return true;
   }
 
-  // Get pool_id and method_id from FutureShm
-  PoolId pool_id = future_shm->pool_id_;
-  u32 method_id = future_shm->method_id_;
+  // Get pool_id and method_id from the task
+  PoolId pool_id = new_task->pool_id_;
+  u32 method_id = new_task->method_;
   HLOG(kDebug, "Worker {}: ProcessNewTask popped pool={} method={}",
        worker_id_, pool_id, method_id);
 
@@ -406,7 +405,7 @@ bool Worker::ProcessNewTask(TaskLane *lane) {
   if (!container) {
     HLOG(kError, "Worker {}: cannot service pool_id={} method={}; "
          "container not found", worker_id_, pool_id, method_id);
-    future_shm->flags_.SetBits(1 | FutureShm::FUTURE_COMPLETE);
+    future.SetComplete();  // unblock the waiter on the error path
     return true;
   }
 
@@ -420,7 +419,7 @@ bool Worker::ProcessNewTask(TaskLane *lane) {
          "Worker {}: Failed to deserialize task for pool_id={}, method={}",
          worker_id_, pool_id, method_id);
     // Mark as complete with error so client doesn't hang
-    future_shm->flags_.SetBits(1 | FutureShm::FUTURE_COMPLETE);
+    future.SetComplete();
     return true;
   }
 
@@ -722,22 +721,6 @@ void Worker::EndTask(clio::run::shared_ptr<Task> &task_ptr, bool can_resched) {
       task_ptr->method_, task_ptr->PredictedWallUs(), actual_wall_us,
       task_ptr->PredictedStat());
 
-  // Break the RunContext self-cycle for a task that is about to be released.
-  // ProcessNewTask binds RunFuture (run_ctx_->future_) with a copied task_ptr_
-  // that points back at this very task, so task -> RunContext -> future_ ->
-  // task_ptr_ -> task is a reference cycle. Every terminal EndTask path below
-  // frees the task by RAII, so the self-reference would otherwise pin the whole
-  // graph (task + RunContext) forever — one leaked task per RPC, across both the
-  // local and net paths. The FutureShm (the only thing the response paths still
-  // need) lives in future_ independently of task_ptr_, and the net path enqueues
-  // its own Future copy (which keeps task_ptr_) before we get here, so clearing
-  // the back-reference is safe. The periodic-reschedule path returns without
-  // calling this: a rescheduled task stays live and re-executes against this
-  // same future.
-  auto break_self_cycle = [&]() {
-    task_ptr->RunFuture().GetTaskPtr().reset();
-  };
-
   // ManyToOne aggregate task: this synthetic task has no external waiter. On
   // completion, broadcast its OUT to the batched originals (which completes
   // each of them), then delete the aggregate. Done after the model
@@ -750,7 +733,6 @@ void Worker::EndTask(clio::run::shared_ptr<Task> &task_ptr, bool can_resched) {
     container->UpdateWork(task_ptr, -1);
     task_ptr->ClearFlags(TASK_DATA_OWNER);
     // Task is freed via RAII when the RunContext's shared_ptr owners drop.
-    break_self_cycle();
     return;
   }
 
@@ -773,7 +755,6 @@ void Worker::EndTask(clio::run::shared_ptr<Task> &task_ptr, bool can_resched) {
   // RunContext's shared_ptr owners drop.
   if (task_ptr->task_flags_.Any(TASK_FIRE_AND_FORGET)) {
     task_ptr->ClearFlags(TASK_DATA_OWNER);
-    break_self_cycle();
     return;
   }
 
@@ -787,9 +768,6 @@ void Worker::EndTask(clio::run::shared_ptr<Task> &task_ptr, bool can_resched) {
                                 ? NetQueuePriority::kSendOutIO
                                 : NetQueuePriority::kSendOutLatency;
     CLIO_IPC->EnqueueNetTask(task_ptr->RunFuture(), prio);
-    // EnqueueNetTask copied the Future (with task_ptr_) into the net queue, so
-    // SendOut still recovers the task; clear only this RunContext's back-ref.
-    break_self_cycle();
     return;
   }
 
@@ -804,10 +782,6 @@ void Worker::EndTask(clio::run::shared_ptr<Task> &task_ptr, bool can_resched) {
   }
   // Dispatch response via transport class
   IpcCpu2Self::SendOut(task_ptr, shm_send_transport_.get());
-  // SendOut has signaled the waiter (or, for a subtask, enqueued its Future copy
-  // onto the parent's event queue), so this RunContext's task_ptr_ back-ref is
-  // no longer needed; clear it so the finished task frees by RAII.
-  break_self_cycle();
 }
 
 void Worker::ProcessBlockedQueue(std::queue<clio::run::shared_ptr<Task>> &queue,

@@ -116,9 +116,11 @@ bool IpcCpu2CpuZmq::RecvIn(IpcManager *ipc, u32 &tasks_received) {
       Future<Task> future(pool_id, method_id, task_ptr);
       auto future_shm = future.GetFutureShm();
       future_shm->origin_ = (mode == IpcMode::kTcp)
-                                ? FutureShm::FUTURE_CLIENT_TCP
-                                : FutureShm::FUTURE_CLIENT_IPC;
-      future_shm->client_task_vaddr_ = info.task_id_.net_key_;
+                                ? ClientOrigin::kClientTcp
+                                : ClientOrigin::kClientIpc;
+      // Capture the client's net_key so SendOut can stamp it back onto the
+      // response (AllocLoadTask reassigns the server task's identity).
+      future_shm->client_net_key_ = info.task_id_.net_key_;
       future_shm->client_pid_ = info.task_id_.pid_;
       future_shm->response_fd_ = recv_info.fd_;
       // Resolve the response transport. TCP clients advertise an ephemeral
@@ -215,8 +217,8 @@ bool IpcCpu2CpuZmq::RecvIn(IpcManager *ipc, u32 &tasks_received) {
 
 void IpcCpu2CpuZmq::EnqueueSendOut(IpcManager *ipc,
                                          const clio::run::shared_ptr<Task> &task,
-                                         u32 origin) {
-  if (origin == FutureShm::FUTURE_CLIENT_TCP) {
+                                         ClientOrigin origin) {
+  if (origin == ClientOrigin::kClientTcp) {
     ipc->EnqueueNetTask(task->RunFuture(), NetQueuePriority::kClientSendTcp);
   } else {
     ipc->EnqueueNetTask(task->RunFuture(), NetQueuePriority::kClientSendIpc);
@@ -292,8 +294,9 @@ bool IpcCpu2CpuZmq::SendOut(
         continue;
       }
 
-      // Preserve client's net_key for response routing
-      origin_task->task_id_.net_key_ = future_shm->client_task_vaddr_;
+      // Restore the client's net_key so the serialized response matches the
+      // pending future the ZMQ recv thread keyed by it.
+      origin_task->task_id_.net_key_ = future_shm->client_net_key_;
 
       // Serialize task outputs
       SaveTaskArchive archive(MsgType::kSerializeOut, response_transport);

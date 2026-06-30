@@ -132,22 +132,32 @@ public:
   clio::run::TaskResume GetOrCreateTag(clio::run::shared_ptr<GetOrCreateTagTask<CreateParamsT>> &task);
 
   /**
-   * Put blob (Method::kPutBlob) - allocates and writes data to blob
-   * Returns TaskResume for coroutine-based async operations
+   * Put/Get/Reorganize blob handlers. The real logic lives once in the
+   * *Impl<TaskT> member templates; the public handlers (and the POD variants
+   * Pod*Blob, Method::kPod*) are thin wrappers. Both the priv::string and
+   * fixed_string blob-name types expose .str(), so the impls are agnostic to
+   * which task carries them — that is the code-dedup for issue #556.
    */
+  template <typename TaskT>
+  clio::run::TaskResume PutBlobImpl(clio::run::shared_ptr<TaskT> &task);
+  template <typename TaskT>
+  clio::run::TaskResume GetBlobImpl(clio::run::shared_ptr<TaskT> &task);
+  template <typename TaskT>
+  clio::run::TaskResume ReorganizeBlobImpl(clio::run::shared_ptr<TaskT> &task);
+
+  /** Put blob (Method::kPutBlob) - allocates and writes data to blob. */
   clio::run::TaskResume PutBlob(clio::run::shared_ptr<PutBlobTask> &task);
-
-  /**
-   * Get blob (Method::kGetBlob) - reads data from existing blob
-   * Returns TaskResume for coroutine-based async operations
-   */
+  /** Get blob (Method::kGetBlob) - reads data from existing blob. */
   clio::run::TaskResume GetBlob(clio::run::shared_ptr<GetBlobTask> &task);
-
-  /**
-   * Reorganize single blob (Method::kReorganizeBlob) - update score for single
-   * blob. Returns TaskResume for coroutine-based async operations
-   */
+  /** Reorganize single blob (Method::kReorganizeBlob) - update score. */
   clio::run::TaskResume ReorganizeBlob(clio::run::shared_ptr<ReorganizeBlobTask> &task);
+
+  /** Fully-POD, GPU-compatible blob handlers (issue #556). Thin wrappers over
+   *  the *Impl<TaskT> templates above. */
+  clio::run::TaskResume PodPutBlob(clio::run::shared_ptr<PodPutBlobTask> &task);
+  clio::run::TaskResume PodGetBlob(clio::run::shared_ptr<PodGetBlobTask> &task);
+  clio::run::TaskResume PodReorganizeBlob(
+      clio::run::shared_ptr<PodReorganizeBlobTask> &task);
 
   /**
    * Delete blob operation - removes blob and decrements tag size

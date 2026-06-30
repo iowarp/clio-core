@@ -73,7 +73,7 @@ struct DeviceViewBase {
    */
   char *put_pool_base;            /**< pinned host. */
   char *get_pool_base;            /**< pinned host. */
-  clio::run::u32 put_slot_stride;       /**< sizeof(PutBlobTask)+sizeof(gpu::FutureShm). */
+  clio::run::u32 put_slot_stride;       /**< sizeof(PodPutBlobTask)+sizeof(gpu::FutureShm). */
   clio::run::u32 get_slot_stride;
   /**
    * Allocator ids of the page backends. The bdev runtime resolves
@@ -131,38 +131,26 @@ CTP_INLINE_CROSS_FUN Block *GetBlock(const DeviceViewBase &v,
 
 /** Resolve the i-th task in the put pool. `slot` indexes BOTH tiers
  *  (0..total_pages_per_block - 1). */
-CTP_INLINE_CROSS_FUN clio::cte::core::PutBlobTask *GetPutTask(
+CTP_INLINE_CROSS_FUN clio::cte::core::PodPutBlobTask *GetPutTask(
     const DeviceViewBase &v, clio::run::u32 block_idx, clio::run::u32 slot) {
   clio::run::u64 off =
       (static_cast<clio::run::u64>(block_idx) * TotalPagesPerBlock(v) + slot) *
       v.put_slot_stride;
-  return reinterpret_cast<clio::cte::core::PutBlobTask *>(v.put_pool_base + off);
+  return reinterpret_cast<clio::cte::core::PodPutBlobTask *>(v.put_pool_base + off);
 }
 
 /** Resolve the i-th task in the get pool. */
-CTP_INLINE_CROSS_FUN clio::cte::core::GetBlobTask *GetGetTask(
+CTP_INLINE_CROSS_FUN clio::cte::core::PodGetBlobTask *GetGetTask(
     const DeviceViewBase &v, clio::run::u32 block_idx, clio::run::u32 slot) {
   clio::run::u64 off =
       (static_cast<clio::run::u64>(block_idx) * TotalPagesPerBlock(v) + slot) *
       v.get_slot_stride;
-  return reinterpret_cast<clio::cte::core::GetBlobTask *>(v.get_pool_base + off);
+  return reinterpret_cast<clio::cte::core::PodGetBlobTask *>(v.get_pool_base + off);
 }
 
-/** Co-located gpu::FutureShm for a put task. */
-CTP_INLINE_CROSS_FUN clio::run::gpu::FutureShm *GetPutFutureShm(
-    const DeviceViewBase &v, clio::run::u32 block_idx, clio::run::u32 slot) {
-  return reinterpret_cast<clio::run::gpu::FutureShm *>(
-      reinterpret_cast<char *>(GetPutTask(v, block_idx, slot)) +
-      sizeof(clio::cte::core::PutBlobTask));
-}
-
-/** Co-located gpu::FutureShm for a get task. */
-CTP_INLINE_CROSS_FUN clio::run::gpu::FutureShm *GetGetFutureShm(
-    const DeviceViewBase &v, clio::run::u32 block_idx, clio::run::u32 slot) {
-  return reinterpret_cast<clio::run::gpu::FutureShm *>(
-      reinterpret_cast<char *>(GetGetTask(v, block_idx, slot)) +
-      sizeof(clio::cte::core::GetBlobTask));
-}
+// (Co-located gpu::FutureShm accessors removed — the Task carries its own
+//  completion record in fut_, so completion is polled via the task / its
+//  gpu::Future, not a separate FutureShm.)
 
 }  // namespace clio::cte::gpu_vector
 

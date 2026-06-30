@@ -84,8 +84,8 @@ struct Page {
   clio::run::u64 lru_clock;      /**< clock64() at last access (for LRU). */
   float score;             /**< Normalized priority, set by manager. */
   clio::run::u32 tier;           /**< 0 = HBM (kDeviceMem), 1 = DRAM (kPinnedHost). */
-  clio::run::gpu::Future<clio::cte::core::PutBlobTask> active_put;
-  clio::run::gpu::Future<clio::cte::core::GetBlobTask> active_get;
+  clio::run::gpu::Future<clio::cte::core::PodPutBlobTask> active_put;
+  clio::run::gpu::Future<clio::cte::core::PodGetBlobTask> active_get;
 };
 
 /**

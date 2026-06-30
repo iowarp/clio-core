@@ -45,7 +45,7 @@ struct IpcCpu2CpuZmq {
    */
   static void EnqueueSendOut(IpcManager *ipc,
                              const clio::run::shared_ptr<Task> &task,
-                             u32 origin);
+                             ClientOrigin origin);
 
   /**
    * Net-worker SendOut: serialize outputs and send via ZMQ.

@@ -240,6 +240,32 @@ struct TaskStat {
 #define CLASS_NEW_ARGS
 
 /**
+ * FutureInfo - self-contained completion state embedded in every Task.
+ *
+ * Holds the bits that must travel WITH the task so it is self-describing for
+ * completion + waiter wakeup, replacing the separate (gpu::)FutureShm:
+ *  - is_complete_: CPU/host completion signal, set by the completing worker (or
+ *    the client recv thread when the response lands) and polled by the waiter /
+ *    the GPU kernel. (Was Task::is_complete_ / FutureShm::flags_ FUTURE_COMPLETE.)
+ *  - task_size_: sizeof(the concrete TaskT) — the GPU worker needs it to D2H/H2D
+ *    the POD task; also the POD-transport size. (Was Task::pod_size_ /
+ *    FutureShm::gpu_task_size_ / gpu::FutureShm::task_size_.)
+ *  - waiter_pid_/waiter_tid_: the thread to EventManager::Signal on completion.
+ * Per-process / not the wire format (the enclosing member is TEMP). Uses
+ * ctp::ipc::atomic so the Task POD layout is identical on host and device.
+ */
+struct FutureInfo {
+  ctp::ipc::atomic<u32> is_complete_;  /**< CPU/host completion signal */
+  u32 task_size_;                      /**< sizeof(concrete TaskT) */
+  u32 waiter_pid_;                     /**< PID of the thread awaiting completion */
+  u32 waiter_tid_;                     /**< TID of the thread awaiting completion */
+
+  CTP_CROSS_FUN FutureInfo() : task_size_(0), waiter_pid_(0), waiter_tid_(0) {
+    is_complete_.store(0);
+  }
+};
+
+/**
  * Base task class for CLIO Runtime distributed execution
  *
  * All tasks represent C++ functions similar to RPCs that can be executed
@@ -261,7 +287,15 @@ class Task {
       return_code_; /**< Task return code (0=success, non-zero=error) */
   OUT ctp::ipc::atomic<ContainerId>
       completer_; /**< Container ID that completed this task */
-  IN u32 pod_size_; /**< sizeof(TaskT) for POD copy transport */
+  /** Self-contained completion state: completion flag, sizeof(TaskT), and the
+   *  awaiting thread's pid/tid. TEMP — per-process, NOT serialized or copied
+   *  (like run_ctx_); for the GPU POD path it rides along in the memcpy'd Task
+   *  bytes. Replaces the separate (gpu::)FutureShm: the Task is its own future
+   *  completion record. (task_size_ replaces the former pod_size_.) */
+  TEMP FutureInfo fut_;
+  /** Per-process "new streaming data available" signal (CPU streaming). Replaces
+   *  FutureShm::flags_ FUTURE_NEW_DATA. Same not-serialized/not-copied rules. */
+  TEMP ctp::ipc::atomic<u32> is_new_data_;
   /** Owned host RunContext (null on GPU and whenever the task is not executing).
    *  A unique_ptr so the Task frees it automatically — no custom DestroyRunCtx.
    *  Same size on CPU and GPU (three pointers); RunContext stays merely
@@ -276,6 +310,10 @@ class Task {
    *  access goes through the Task accessors below. Defined out-of-line once
    *  RunContext is a complete type. Called at the ipc_*.cc BeginTask sites. */
   void BeginRunContext();
+  /** Allocate the RunContext storage if absent (lightweight; no container
+   *  resolution) so the task's embedded routing state (run_ctx_->route_) exists.
+   *  Used by the Future ctor / client SendIn before GetFutureShm(). */
+  void EnsureRunCtx();
   /** Free this task's RunContext (back to not-executing). */
   void ResetRunCtx() { run_ctx_.reset(); }
 
@@ -327,6 +365,9 @@ class Task {
   u32 YieldCount() const;
   void SetYieldCount(u32 v);
   Future<Task, CLIO_QUEUE_ALLOC_T>& RunFuture();
+  /** Pointer to this task's RunContext (which now holds the routing/transport
+   *  state, formerly FutureShm). Null if the task has no active RunContext. */
+  RunContext* RunCtxPtr();
   bool IsNotified() const;
   void SetNotified(bool v);
   /** Whether this task's coroutine/fiber has run to completion, without
@@ -368,26 +409,23 @@ class Task {
    * Destructor — VIRTUAL so that a clio::run::shared_ptr<Task> base view
    * destructs the concrete derived task correctly when its last reference
    * drops (tasks are allocated by runtime method id, so the owning handle is
-   * often the base Task type). Must also explicitly free the RunContext since
-   * we no longer use unique_ptr. Host pass uses the out-of-line definition in
-   * task.cc; any device pass (CUDA/ROCm/SYCL) uses `= default`. Switching from
-   * CTP_IS_HOST to !CTP_IS_DEVICE_PASS lets DPC++'s SYCL device pass — where
-   * CTP_IS_HOST=1 — pick the inline default destructor instead of an
-   * unresolved declaration. Virtual on both passes so sizeof(Task) (and the
-   * vptr offset) stays identical between CPU and GPU.
+   * often the base Task type). The run_ctx_ unique_ptr member is destroyed
+   * automatically (type-erased deleter), so the body is empty.
+   *
+   * CLIO_VIRTUAL is now `virtual` on BOTH host and device (issue #556) so the
+   * vtable pointer — and therefore sizeof(Task) and every field offset — is
+   * identical across a host<->device cudaMemcpy. Device code never dispatches
+   * through this vtable (it uses typed tasks, never a base-Task view), so the
+   * host vtable is simply ignored on the device side. CTP_CROSS_FUN gives the
+   * dtor a __host__ __device__ execution space matching the derived task
+   * destructors (also CTP_CROSS_FUN), so nvcc accepts the override.
    */
-  // CTP_CROSS_FUN so the destructor's execution space (__host__ __device__)
-  // matches the derived task destructors (which are CTP_CROSS_FUN); otherwise
-  // nvcc rejects a __host__ __device__ dtor "overriding" a __host__-only virtual
-  // base. CLIO_VIRTUAL makes it virtual on host only (RAII base-view destroy);
-  // on the device pass it is non-virtual so no GPU vtable is generated. The
-  // run_ctx_ unique_ptr member is destroyed automatically (type-erased deleter).
   CTP_CROSS_FUN CLIO_VIRTUAL ~Task() {}
 
   /**
    * Default constructor
    */
-  CTP_CROSS_FUN Task() { pod_size_ = 0; SetNull(); }
+  CTP_CROSS_FUN Task() { fut_.task_size_ = 0; SetNull(); }
 
   /**
    * Emplace constructor with task initialization
@@ -402,9 +440,11 @@ class Task {
     task_flags_.SetBits(0);
     pool_query_ = pool_query;
     period_ns_ = 0.0;
-    pod_size_ = 0;
+    fut_.task_size_ = 0;
     return_code_.store(0);  // Initialize as success
     completer_.store(0);    // Initialize as null (0 is invalid container ID)
+    fut_.is_complete_.store(0);
+    is_new_data_.store(0);
   }
 
   /**
@@ -443,6 +483,8 @@ class Task {
 #endif
     return_code_.store(0);  // Initialize as success
     completer_.store(0);    // Initialize as null (0 is invalid container ID)
+    fut_.is_complete_.store(0);
+    is_new_data_.store(0);
     task_group_ = TaskGroup();  // null group
   }
 
@@ -575,6 +617,25 @@ class Task {
   CTP_CROSS_FUN void SetReturnCode(u32 return_code) {
     return_code_.store(return_code);
   }
+
+  // Per-process completion / new-data signals (CPU/host paths). Managed by the
+  // Future; replace FutureShm::flags_ FUTURE_COMPLETE / FUTURE_NEW_DATA.
+  CTP_CROSS_FUN void SetComplete() { fut_.is_complete_.store(1); }
+  CTP_CROSS_FUN void UnsetComplete() { fut_.is_complete_.store(0); }
+  CTP_CROSS_FUN bool IsComplete() const { return fut_.is_complete_.load() != 0; }
+  /** sizeof(concrete TaskT) carried with the task (replaces pod_size_). */
+  CTP_CROSS_FUN u32 GetTaskSize() const { return fut_.task_size_; }
+  CTP_CROSS_FUN void SetTaskSize(u32 v) { fut_.task_size_ = v; }
+  /** Thread to wake (EventManager::Signal) when this task completes. */
+  CTP_CROSS_FUN u32 WaiterPid() const { return fut_.waiter_pid_; }
+  CTP_CROSS_FUN u32 WaiterTid() const { return fut_.waiter_tid_; }
+  CTP_CROSS_FUN void SetWaiter(u32 pid, u32 tid) {
+    fut_.waiter_pid_ = pid;
+    fut_.waiter_tid_ = tid;
+  }
+  CTP_CROSS_FUN void SetNewData() { is_new_data_.store(1); }
+  CTP_CROSS_FUN void UnsetNewData() { is_new_data_.store(0); }
+  CTP_CROSS_FUN bool IsNewData() const { return is_new_data_.load() != 0; }
 
   /**
    * Get the completer container ID (which container completed this task)
@@ -773,6 +834,29 @@ class RunContext {
   u32 yield_count_;                     /**< Number of times task has yielded */
   Future<Task, CLIO_QUEUE_ALLOC_T>
       future_;                    /**< Future for async completion tracking */
+ public:
+  // ---- Routing / transport state (formerly the separate FutureShm; now just
+  //      public fields of the RunContext, reached via Future::GetFutureShm() ->
+  //      &run_ctx_). Set on the server at RecvIn (and on the client at SendIn)
+  //      and read at SendOut.
+  ClientOrigin origin_;            /**< Origin transport mode (completion path) */
+  u32 client_pid_;                 /**< Client PID for per-client routing */
+  /** Client's net_key (task vaddr) captured at RecvIn and restored onto
+   *  task_id_.net_key_ at SendOut, because AllocLoadTask reassigns the server
+   *  task's identity. The ZMQ recv thread keys pending_zmq_futures_ by this, so
+   *  the response must carry it for the client to match (else it hangs). */
+  uintptr_t client_net_key_;
+  ctp::lbm::ShmTransferInfo input_;   /**< SHM transfer info (client -> worker) */
+  ctp::lbm::ShmTransferInfo output_;  /**< SHM transfer info (worker -> client) */
+  ctp::lbm::Transport* response_transport_; /**< Transport for the response */
+  char response_identity_[64];     /**< ZMQ echo-back identity (fallback path) */
+  u32 response_identity_len_;
+  int response_fd_;                /**< Socket fd for routing response (IPC) */
+  ctp::abitfield32_t gpu_flags_;   /**< GPU device-completion bit (gpu2gpu) */
+  uintptr_t gpu_task_device_ptr_;  /**< Device addr of the task POD (kDeviceMem) */
+  u32 gpu_task_size_;              /**< sizeof(TaskT) for the H2D writeback */
+
+ private:
   std::atomic<bool> is_notified_; /**< Atomic flag to prevent duplicate event
                                      queue additions */
   // Set true by the top-level coroutine's final_suspend when the task
@@ -804,9 +888,30 @@ class RunContext {
         event_queue_(nullptr),
         completed_replicas_(0),
         yield_count_(0),
+        origin_(ClientOrigin::kClientShm),
+        client_pid_(0),
+        client_net_key_(0),
+        response_transport_(nullptr),
+        response_identity_len_(0),
+        response_fd_(-1),
+        gpu_task_device_ptr_(0),
+        gpu_task_size_(0),
         is_notified_(false),
         coro_completed_(false),
-        flags_() {}
+        flags_() {
+    gpu_flags_.Clear();
+  }
+
+  /** Sentinel AllocatorId used by SendCpuToGpu to mark ShmPtrs whose offset is
+   *  a raw pinned-host address (formerly FutureShm::GetCpu2GpuAllocId). */
+  static ctp::ipc::AllocatorId GetCpu2GpuAllocId() {
+    ctp::ipc::AllocatorId id;
+    id.major_ = UINT32_MAX - 1;
+    id.minor_ = 0;
+    return id;
+  }
+  /** GPU device-completion bit (formerly FutureShm::FUTURE_COMPLETE). */
+  static constexpr u32 FUTURE_COMPLETE = 1;
 
   /**
    * Move constructor
@@ -1057,6 +1162,13 @@ inline Future<Task, CLIO_QUEUE_ALLOC_T>& Task::RunFuture() {
   }
   return run_ctx_->future_;
 }
+inline RunContext* Task::RunCtxPtr() {
+  // Returns null (rather than throwing) when there is no RunContext, so the
+  // RunCtx().IsNull() defensive checks across the IPC paths keep working.
+  // Callers that must stamp routing (SendIn) ensure a RunContext first
+  // (the Future ctor calls EnsureRunCtx()).
+  return run_ctx_.get();
+}
 inline const clio::run::shared_ptr<Task>& Task::GetParentTask() const {
   if (!run_ctx_) {
     CLIO_RCTX_NULL(GetParentTask);
@@ -1116,7 +1228,11 @@ inline void Task::ClearRunState() {
 // definition)
 // ============================================================================
 
-#ifndef CLIO_ENABLE_BOOST_COROUTINES
+// CTP_IS_HOST so this host-only coroutine machinery is excluded from a GPU
+// device pass entirely: nvcc parses (and member-checks) the whole TU in the
+// device pass, and this body references #if CTP_IS_HOST-only Task accessors
+// (CoroHandle/SetYielded/...). The GPU path uses gpu::Future, never this.
+#if CTP_IS_HOST && !defined(CLIO_ENABLE_BOOST_COROUTINES)
 template <typename TaskT, typename AllocT>
 bool Future<TaskT, AllocT>::await_suspend_impl(
     std::coroutine_handle<> handle) noexcept {
@@ -1143,6 +1259,10 @@ bool Future<TaskT, AllocT>::await_suspend_impl(
 // TaskResume and YieldAwaiter (must be after RunContext for member access)
 // ============================================================================
 
+// Host-only: the coroutine return type / awaiters touch #if CTP_IS_HOST-only
+// Task accessors, and nvcc parses this in the device pass too. Excluded from
+// any device pass (the GPU path is producer-only and uses gpu::Future).
+#if CTP_IS_HOST
 #ifndef CLIO_ENABLE_BOOST_COROUTINES
 /**
  * TaskResume - Coroutine return type for runtime methods
@@ -1559,6 +1679,7 @@ public:
 };
 
 #endif // CLIO_ENABLE_BOOST_COROUTINES
+#endif // CTP_IS_HOST (TaskResume is host-only)
 
 /**
  * YieldAwaiter - Awaitable for yielding control in coroutines
@@ -1589,7 +1710,7 @@ class YieldAwaiter {
    */
   bool await_ready() const noexcept { return false; }
 
-#ifndef CLIO_ENABLE_BOOST_COROUTINES
+#if CTP_IS_HOST && !defined(CLIO_ENABLE_BOOST_COROUTINES)
   /**
    * Suspend the coroutine and mark for yielded resumption
    *
