@@ -181,52 +181,63 @@ int main(int argc, char **argv) {
                     true /*use_progress_thread*/,
                     cfg.rpc_threads /*rpc_thread_count*/);
 
-  // Handler: deserialize the payload string and respond with its size. Kept
-  // trivial so the measurement reflects RPC-engine overhead, not handler work.
-  tl::remote_procedure rpc = engine.define(
-      kRpcName, [](const tl::request &req, const std::string &payload) {
-        req.respond(static_cast<int>(payload.size()));
-      });
+  // Scope the RPC handle, the self endpoint, and the payload so they are all
+  // destroyed *before* engine.finalize() below. The endpoint destructor calls
+  // margo_addr_free(), which segfaults if margo has already been torn down --
+  // so the endpoint must die while the engine is still alive.
+  {
+    // Handler: deserialize the payload string and respond with its size. Kept
+    // trivial so the measurement reflects RPC-engine overhead, not handler
+    // work.
+    tl::remote_procedure rpc = engine.define(
+        kRpcName, [](const tl::request &req, const std::string &payload) {
+          req.respond(static_cast<int>(payload.size()));
+        });
 
-  // Client and server share the engine: look up our own self address and fire
-  // RPCs at it over the na+sm shared-memory loopback.
-  tl::endpoint self = engine.lookup(std::string(engine.self()));
+    // Client and server share the engine: look up our own self address and
+    // fire RPCs at it over the na+sm shared-memory loopback.
+    tl::endpoint self = engine.lookup(std::string(engine.self()));
 
-  std::string payload(static_cast<size_t>(cfg.payload), 'x');
+    std::string payload(static_cast<size_t>(cfg.payload), 'x');
 
-  std::cout << "thallium_bench\n"
-            << "  protocol     : " << cfg.protocol << "\n"
-            << "  self addr    : " << std::string(engine.self()) << "\n"
-            << "  rpc threads  : " << cfg.rpc_threads << "\n"
-            << "  batch size   : " << cfg.batch << "\n"
-            << "  iters        : " << cfg.iters << "\n"
-            << "  payload bytes: " << cfg.payload << "\n"
-            << "  warmup       : " << cfg.warmup << "\n"
-            << std::flush;
+    std::cout << "thallium_bench\n"
+              << "  protocol     : " << cfg.protocol << "\n"
+              << "  self addr    : " << std::string(engine.self()) << "\n"
+              << "  rpc threads  : " << cfg.rpc_threads << "\n"
+              << "  batch size   : " << cfg.batch << "\n"
+              << "  iters        : " << cfg.iters << "\n"
+              << "  payload bytes: " << cfg.payload << "\n"
+              << "  warmup       : " << cfg.warmup << "\n"
+              << std::flush;
 
-  // Warmup (untimed) to amortize connection/registration setup.
-  if (cfg.warmup > 0) {
-    RunPhase(rpc, self, payload, cfg.warmup, cfg.batch);
-  }
+    // Warmup (untimed) to amortize connection/registration setup.
+    if (cfg.warmup > 0) {
+      RunPhase(rpc, self, payload, cfg.warmup, cfg.batch);
+    }
 
-  auto t0 = std::chrono::steady_clock::now();
-  uint64_t checksum = RunPhase(rpc, self, payload, cfg.iters, cfg.batch);
-  auto t1 = std::chrono::steady_clock::now();
+    auto t0 = std::chrono::steady_clock::now();
+    uint64_t checksum = RunPhase(rpc, self, payload, cfg.iters, cfg.batch);
+    auto t1 = std::chrono::steady_clock::now();
 
-  double elapsed_s = std::chrono::duration<double>(t1 - t0).count();
-  double iops = elapsed_s > 0 ? cfg.iters / elapsed_s : 0.0;
-  // Amortized per-RPC latency: with `batch` requests in flight this is the
-  // throughput-derived latency, not the latency of a single isolated call.
-  double avg_lat_us = cfg.iters > 0 ? elapsed_s * 1e6 / cfg.iters : 0.0;
+    double elapsed_s = std::chrono::duration<double>(t1 - t0).count();
+    double iops = elapsed_s > 0 ? cfg.iters / elapsed_s : 0.0;
+    // Amortized per-RPC latency: with `batch` requests in flight this is the
+    // throughput-derived latency, not the latency of a single isolated call.
+    double avg_lat_us = cfg.iters > 0 ? elapsed_s * 1e6 / cfg.iters : 0.0;
 
-  std::cout << "results\n"
-            << "  elapsed (s)        : " << elapsed_s << "\n"
-            << "  total RPCs         : " << cfg.iters << "\n"
-            << "  overall IOPS       : " << iops << "\n"
-            << "  avg latency (us)   : " << avg_lat_us << "\n"
-            << "  checksum           : " << checksum << "\n"
-            << std::flush;
+    std::cout << "results\n"
+              << "  elapsed (s)        : " << elapsed_s << "\n"
+              << "  total RPCs         : " << cfg.iters << "\n"
+              << "  overall IOPS       : " << iops << "\n"
+              << "  avg latency (us)   : " << avg_lat_us << "\n"
+              << "  checksum           : " << checksum << "\n"
+              << std::flush;
+  }  // rpc / self / payload destroyed here, while margo is still alive.
 
+  // Now finalize the server-mode engine explicitly. Without this the engine
+  // destructor blocks forever (a server engine parks until it is finalized);
+  // calling it here stops the progress thread and lets the engine destructor
+  // run as a clean no-op. It must come *after* the endpoint above is gone.
   engine.finalize();
   return 0;
 }
