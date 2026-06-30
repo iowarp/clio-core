@@ -763,16 +763,12 @@ void Worker::EndTask(clio::run::shared_ptr<Task> &task_ptr, bool can_resched) {
   // latency vs I/O lane from the task's cached predicted_stat_ so a
   // small ACK / heartbeat reply doesn't queue behind a 1 MiB GetBlob
   // response on the wire.
-  HLOG(kDebug, "[FNTRACE] EndTask: is_remote={} is_periodic={} method={}",
-       is_remote, is_periodic, task_ptr->method_);
   if (is_remote) {
     size_t io_size = task_ptr->PredictedStat().io_size_;
     NetQueuePriority prio = (io_size >= kNetQueueIoThreshold)
                                 ? NetQueuePriority::kSendOutIO
                                 : NetQueuePriority::kSendOutLatency;
-    HLOG(kDebug, "[FNTRACE] EndTask: EnqueueNetTask (remote)");
     CLIO_IPC->EnqueueNetTask(task_ptr->RunFuture(), prio);
-    HLOG(kDebug, "[FNTRACE] EndTask: EnqueueNetTask done");
     return;
   }
 
@@ -786,9 +782,7 @@ void Worker::EndTask(clio::run::shared_ptr<Task> &task_ptr, bool can_resched) {
     return;
   }
   // Dispatch response via transport class
-  HLOG(kDebug, "[FNTRACE] EndTask: calling IpcCpu2Self::SendOut");
   IpcCpu2Self::SendOut(task_ptr, shm_send_transport_.get());
-  HLOG(kDebug, "[FNTRACE] EndTask: SendOut returned");
 }
 
 void Worker::ProcessBlockedQueue(std::queue<clio::run::shared_ptr<Task>> &queue,

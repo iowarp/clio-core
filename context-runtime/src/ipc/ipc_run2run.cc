@@ -136,12 +136,6 @@ void IpcManagerRun2Run::SendInTransmitReplica(
 
   ctp::lbm::LbmContext ctx(ctp::lbm::LBM_SYNC);
   int rc = lbm_transport->Send(archive, ctx);
-  HLOG(kDebug,
-       "[SENDDIAG] SendIn forward task={} target_node={} cfgmgr={} "
-       "GetPort={} host_ip={} dealer={} rc={}",
-       task_copy->task_id_, target_node_id, (void *)config_manager,
-       config_manager->GetPort(), target_host->ip_address,
-       (void *)lbm_transport, rc);
 
   if (rc != 0) {
     HLOG(kWarning, "[SendIn] Task {} Lightbeam Send rc={} — re-queueing",
@@ -162,7 +156,6 @@ void IpcManagerRun2Run::SendInTransmitReplica(
 
 void IpcManagerRun2Run::SendIn(clio::run::shared_ptr<clio::run::Task> origin_task) {
   auto *ipc_manager = CLIO_IPC;
-  HLOG(kDebug, "[FNTRACE] run2run SendIn: task pool={} method={}", origin_task.IsNull()?clio::run::PoolId():origin_task->pool_id_, origin_task.IsNull()?9999:origin_task->method_);
   auto *pool_manager = CLIO_POOL_MANAGER;
 
   if (origin_task.IsNull()) {
@@ -188,7 +181,6 @@ void IpcManagerRun2Run::SendIn(clio::run::shared_ptr<clio::run::Task> origin_tas
   const std::vector<clio::run::PoolQuery> &pool_queries =
       origin_task->PoolQueries();
   size_t num_replicas = pool_queries.size();
-  HLOG(kDebug, "[FNTRACE] SendIn: num_replicas={}", num_replicas);
   origin_task->Subtasks().resize(num_replicas);
 
   HLOG(kDebug, "[SendIn] Task {} to {} replicas", origin_task->task_id_,
@@ -237,11 +229,8 @@ void IpcManagerRun2Run::SendIn(clio::run::shared_ptr<clio::run::Task> origin_tas
       continue;
     }
 
-    HLOG(kDebug, "[FNTRACE] SendIn: transmitting replica {} to node {}", i,
-         target_node_id);
     SendInTransmitReplica(ipc_manager, task_copy,
                           target_node_id, origin_task);
-    HLOG(kDebug, "[FNTRACE] SendIn: transmit done replica {}", i);
   }
 }
 
@@ -290,10 +279,6 @@ int IpcManagerRun2Run::SendOutTransmit(
 
   ctp::lbm::LbmContext ctx(ctp::lbm::LBM_SYNC);
   int rc = lbm_transport->Send(archive, ctx);
-  HLOG(kDebug,
-       "[SENDDIAG] SendOut response task={} dealer={} target={}:{} rc={}",
-       origin_task->task_id_, (void *)lbm_transport, target_host->ip_address,
-       port, rc);
 
   if (rc != 0) {
     HLOG(kWarning, "[SendOut] Task {} Lightbeam Send rc={} — re-queueing",
@@ -316,7 +301,6 @@ int IpcManagerRun2Run::SendOutTransmit(
 
 void IpcManagerRun2Run::SendOut(clio::run::shared_ptr<clio::run::Task> origin_task) {
   auto *ipc_manager = CLIO_IPC;
-  HLOG(kDebug, "[FNTRACE] run2run SendOut: task pool={} method={}", origin_task.IsNull()?clio::run::PoolId():origin_task->pool_id_, origin_task.IsNull()?9999:origin_task->method_);
 
   if (origin_task.IsNull()) {
     HLOG(kError, "SendOut: origin_task is null");
@@ -461,7 +445,6 @@ bool IpcManagerRun2Run::RecvInHandleOne(
 
 int IpcManagerRun2Run::RecvIn(clio::run::LoadTaskArchive &archive,
                                ctp::lbm::Transport *lbm_transport) {
-  HLOG(kDebug, "[FNTRACE] run2run RecvIn: a task arrived");
   auto *ipc_manager = CLIO_IPC;
   auto *pool_manager = CLIO_POOL_MANAGER;
 
@@ -610,9 +593,7 @@ void IpcManagerRun2Run::RecvOutCompleteOriginTask(
     worker = scheduler ? scheduler->GetNetRecvWorker() : nullptr;
   }
   if (worker) {
-    HLOG(kDebug, "[FNTRACE] RecvOutComplete: calling EndTask on net thread");
     worker->EndTask(origin_task, true);
-    HLOG(kDebug, "[FNTRACE] RecvOutComplete: EndTask returned");
   } else {
     HLOG(kError,
          "[RecvOut] No worker available to call EndTask for task {}",
@@ -626,7 +607,6 @@ void IpcManagerRun2Run::RecvOutCompleteOriginTask(
 
 int IpcManagerRun2Run::RecvOut(clio::run::LoadTaskArchive &archive,
                                 ctp::lbm::Transport *lbm_transport) {
-  HLOG(kDebug, "[FNTRACE] run2run RecvOut: a response arrived");
   auto *pool_manager = CLIO_POOL_MANAGER;
 
   const auto &task_infos = archive.GetTaskInfos();
@@ -965,13 +945,7 @@ void IpcManagerRun2Run::StartRecvThreads() {
         lbm_transport->ClearRecvHandles(archive);
       }
       if (!drained_any && !recv_shutdown_.load(std::memory_order_acquire)) {
-        int pr = lbm_transport->PollRecv(kZmqPollTimeoutMs);
-        static std::atomic<long> hb{0};
-        long n = ++hb;
-        if (pr > 0 || (n % 3000) == 0) {
-          HLOG(kDebug, "[FNTRACE] PeerRecvThread alive: polls={} pollrecv={}", n,
-               pr);
-        }
+        lbm_transport->PollRecv(kZmqPollTimeoutMs);
       }
     }
     HLOG(kInfo, "[PeerRecvThread] shutting down");
