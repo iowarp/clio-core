@@ -124,6 +124,8 @@
 #include "data_structures/ipc/vector.h"
 
 // Private data structures (single-process containers)
+#include "data_structures/priv/array_vector.h"
+#include "data_structures/priv/fixed_string.h"
 #include "data_structures/priv/string.h"
 #include "data_structures/priv/vector.h"
 #include "data_structures/priv/unordered_map_ll.h"

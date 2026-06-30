@@ -56,21 +56,21 @@
 /**
  * Virtual/override qualifiers for Task types.
  *
- * The runtime (host) needs a virtual Task destructor so a
- * clio::run::shared_ptr<clio::run::Task> base-view (allocated by runtime method
- * id) destroys the concrete derived task. GPU/device code always uses TYPED
- * tasks (never a base-Task view) and must stay non-virtual: a device class with
- * a vtable is undesirable, and CUDA forbids a __host__ virtual base destructor
- * being overridden by a __host__ __device__ derived destructor. So CLIO_VIRTUAL
- * / CLIO_OVERRIDE expand to virtual/override on host and to nothing on device.
+ * Tasks must have the SAME layout and interpretation on host and device (issue
+ * #556): the runtime (host) destroys a concrete derived task through a
+ * clio::run::shared_ptr<clio::run::Task> base-view, which needs a virtual
+ * destructor. For the object layout (and field offsets) to be identical across
+ * a host<->device cudaMemcpy, the vtable pointer must therefore be present on
+ * BOTH passes. So CLIO_VIRTUAL/CLIO_OVERRIDE keep `virtual`/`override` on device
+ * too. Device code NEVER dispatches through these virtuals (it always uses TYPED
+ * tasks, never a base-Task view), so the (host) vtable is simply ignored there —
+ * we keep the keyword purely for layout parity. Both the base and derived Task
+ * destructors are CTP_CROSS_FUN, so they share the same __host__ __device__
+ * execution space and nvcc accepts the override (the earlier mismatch came from
+ * a __host__-only virtual base vs a __host__ __device__ derived override).
  */
-#if CTP_IS_HOST
 #define CLIO_VIRTUAL virtual
 #define CLIO_OVERRIDE override
-#else
-#define CLIO_VIRTUAL
-#define CLIO_OVERRIDE
-#endif
 
 // CLIO_THROW: clio-namespaced alias of CTP_THROW. Expands to `throw X` on the
 // host and to nothing on a GPU/device pass (no exceptions there), so Task's
@@ -710,6 +710,12 @@ enum class IpcMode : u32 {
 
 namespace clio::run::priv {
 typedef ctp::priv::string<CLIO_PRIV_ALLOC_T> string;
+
+/** Fixed-capacity, inline POD string (no allocator). Bitwise-relocatable with an
+ *  identical layout on host and device — used by GPU-compatible POD tasks in
+ *  place of `string` so no SSO/SVO fixup is needed after a cudaMemcpy. */
+template <size_t N = 32>
+using fixed_string = ctp::priv::fixed_string<N>;
 
 template <typename T>
 using vector = ctp::priv::vector<T, CLIO_PRIV_ALLOC_T>;
