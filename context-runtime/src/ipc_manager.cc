@@ -2693,7 +2693,6 @@ void IpcManager::RecvZmqClientThread() {
         continue;
       }
 
-      FutureShm *future_shm = it->second.fshm;
       Task *task = it->second.task;
 
       // Store the archive for Recv() to pick up
@@ -2707,12 +2706,11 @@ void IpcManager::RecvZmqClientThread() {
       task->SetNewData();
       task->SetComplete();
       // Wake the client thread blocked in ClientRecv — it sleeps on its
-      // EventManager rather than busy-polling. waiter_(pid,tid) identify that
-      // client thread (recorded in ClientSend).
-      if (future_shm->waiter_pid_ != 0) {
-        ctp::lbm::EventManager::Signal(
-            static_cast<int>(future_shm->waiter_pid_),
-            static_cast<int>(future_shm->waiter_tid_));
+      // EventManager rather than busy-polling. The waiter (pid,tid) lives on the
+      // task's FutureInfo (recorded in ClientSend).
+      if (task->WaiterPid() != 0) {
+        ctp::lbm::EventManager::Signal(static_cast<int>(task->WaiterPid()),
+                                       static_cast<int>(task->WaiterTid()));
       }
 
       // Remove from pending futures map
@@ -2860,8 +2858,22 @@ void IpcManager::FreeGpuBackend(u32 gpu_id,
 // predicted stats) are set later, on the worker, in Worker::ProcessNewTask and
 // Task::StartCoroutine. Giving the task an active RunContext here is what lets
 // RouteTask run before the worker picks the task up.
+void Task::EnsureRunCtx() {
+  // Allocate the RunContext storage if the task does not already have one. This
+  // is the lightweight half of BeginRunContext (no container resolution): it is
+  // what gives the task its embedded routing state (run_ctx_->route_) so the
+  // client SendIn / server RecvIn can stamp it via GetFutureShm() before the
+  // worker formally begins the task.
+  if (!run_ctx_) {
+    run_ctx_ = ctp::make_unique<RunContext>(CTP_MALLOC);
+  }
+}
+
 void Task::BeginRunContext() {
-  run_ctx_ = ctp::make_unique<RunContext>(CTP_MALLOC);
+  // Reuse an existing RunContext (e.g. one created at RecvIn to hold the
+  // response-routing state) rather than clobbering it — re-allocating here
+  // would wipe run_ctx_->route_ that the transport set before dispatch.
+  EnsureRunCtx();
   // Fresh execution starts not-complete (the waiter must not observe a stale
   // completion from a prior life of a recycled task).
   UnsetComplete();

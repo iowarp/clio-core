@@ -1029,7 +1029,7 @@ class IpcManager {
    * The (key_id, port) pair forms the cache key (hash(key_id + ":" + port)); a
    * cache miss opens a new ZeroMQ DEALER to dial_addr:port via GetOrCreateClient
    * (which owns it) and records the raw pointer in client_conn_cache_. Used at
-   * RecvIn to populate FutureShm::response_transport_.
+   * RecvIn to populate RunContext::response_transport_.
    * @param key_id Routing identity of the requesting client (e.g. ZMQ identity
    *               or peer address) used together with port as the cache key.
    * @param dial_addr Host/IP to connect the dial-back DEALER to.
@@ -1447,8 +1447,7 @@ class IpcManager {
   // wakes the waiter thread recorded on the FutureShm. Both pointers stay valid
   // while the client's Future (which owns them) is alive.
   struct PendingClientFuture {
-    FutureShm *fshm = nullptr;  // waiter_pid_/tid_ + client-side bookkeeping
-    Task *task = nullptr;       // SetComplete()/SetNewData()
+    Task *task = nullptr;  // waiter (task->fut_) + SetComplete()/SetNewData()
   };
   // Pending futures (client-side, keyed by net_key)
   std::unordered_map<size_t, PendingClientFuture> pending_zmq_futures_;
@@ -1497,7 +1496,7 @@ class IpcManager {
   // Keyed by hash(response-identity + client_port); value is a NON-owning raw
   // Transport* (ownership stays in client_pool_, keyed by "addr:port"). Built
   // at RecvIn from the requesting peer's transport identity and the archive's
-  // client_port_, then stashed in FutureShm::response_transport_ so SendOut
+  // client_port_, then stashed in RunContext::response_transport_ so SendOut
   // routes the response over a dedicated connection instead of the inbound
   // socket. Self-locking (per-bucket RwLocks), so no external mutex needed.
   // Host-only: the single-bucket-count unordered_map_ll constructor lives under
@@ -1775,10 +1774,13 @@ CTP_HOST_FUN Future<TaskT, AllocT>::~Future() {
     // FreeBuffer here.
     if (!FutureShmIsNull()) {
 #if CTP_IS_HOST
-      ctp::ipc::FullPtr<FutureShm> fs = GetFutureShm();
-      if (!fs.IsNull() && (fs->origin_ == ClientOrigin::kClientTcp ||
-                           fs->origin_ == ClientOrigin::kClientIpc)) {
-        CLIO_CPU_IPC->CleanupResponseArchive(fs->client_task_vaddr_);
+      ctp::ipc::FullPtr<FutureT> fs = GetFutureShm();
+      TaskT *t = TaskRaw();
+      if (!fs.IsNull() && t != nullptr &&
+          (fs->origin_ == ClientOrigin::kClientTcp ||
+           fs->origin_ == ClientOrigin::kClientIpc)) {
+        // Response archive is keyed by the client's net_key (task vaddr).
+        CLIO_CPU_IPC->CleanupResponseArchive(t->task_id_.net_key_);
       }
       FutureShmSetNull();
 #endif
@@ -1796,7 +1798,7 @@ Future<TaskT, AllocT>::GetFutureShm() const {
   if (t == nullptr) {
     return ctp::ipc::FullPtr<FutureT>();
   }
-  return ctp::ipc::FullPtr<FutureT>(t->RunRoute());
+  return ctp::ipc::FullPtr<FutureT>(t->RunCtxPtr());
 }
 
 // ----------------------------------------------------------------
@@ -1811,11 +1813,6 @@ CTP_HOST_FUN bool Future<TaskT, AllocT>::IsComplete() const {
 #if CTP_IS_GPU
   return IsCompleteGpu2Gpu();
 #else
-#if (CTP_ENABLE_CUDA || CTP_ENABLE_ROCM) && !CTP_IS_HOST
-  if (future_shm_.alloc_id_ == FutureShm::GetCpu2GpuAllocId()) {
-    return IsCompleteCpu2Gpu();
-  }
-#endif
   auto future_shm = GetFutureShm();
   if (future_shm.IsNull()) {
     return false;
@@ -1829,18 +1826,18 @@ CTP_HOST_FUN bool Future<TaskT, AllocT>::IsComplete() const {
 
 template <typename TaskT, typename AllocT>
 CTP_HOST_FUN bool Future<TaskT, AllocT>::IsCompleteCpu2Cpu() const {
-  // CPU/host completion lives on the task (per-process), not FutureShm::flags_.
+  // CPU/host completion lives on the task (per-process), not RunContext::flags_.
   TaskT *task = TaskRaw();
   return task != nullptr && task->IsComplete();
 }
 
 template <typename TaskT, typename AllocT>
 CTP_HOST_FUN bool Future<TaskT, AllocT>::IsCompleteGpu2Cpu() const {
-  auto future_shm = GetFutureShm();
-  if (future_shm.IsNull()) {
-    return false;
-  }
-  return future_shm->flags_.AnySystem(FutureShm::FUTURE_COMPLETE);
+  // Producer-only gpu2cpu: the CPU GPU-worker marks the task complete
+  // (task->fut_.is_complete_) once it has written the outputs back to the
+  // device; the host waiter polls that, not a separate flag.
+  TaskT *t = TaskRaw();
+  return t != nullptr && t->IsComplete();
 }
 
 template <typename TaskT, typename AllocT>
@@ -1856,11 +1853,10 @@ CTP_HOST_FUN bool Future<TaskT, AllocT>::IsCompleteCpu2Gpu() const {
 #if CTP_IS_GPU_COMPILER
 template <typename TaskT, typename AllocT>
 CTP_GPU_FUN bool Future<TaskT, AllocT>::IsCompleteGpu2Gpu() const {
-  auto future_shm = GetFutureShm();
-  if (future_shm.IsNull()) {
-    return false;
-  }
-  return future_shm->flags_.AnyDevice(FutureShm::FUTURE_COMPLETE);
+  // Vestigial: the regular Future is host-only under the producer-only GPU
+  // model (device code uses gpu::Future). RunContext (and its routing state)
+  // does not exist on device, so there is nothing to poll here.
+  return false;
 }
 #endif
 
@@ -1899,16 +1895,8 @@ CTP_HOST_FUN bool Future<TaskT, AllocT>::Wait(float max_sec,
 
   bool is_runtime = CLIO_RUNTIME_MANAGER->IsRuntime();
 
-#if (CTP_ENABLE_CUDA || CTP_ENABLE_ROCM) && !CTP_IS_HOST
-  // CPU→GPU POD path: sentinel allocator ID marks device pointers.
-  if (is_runtime &&
-      future_shm_.alloc_id_ == FutureShm::GetCpu2GpuAllocId()) {
-    return WaitCpu2Gpu(max_sec, reuse_task);
-  }
-#endif
-
-  // Resolve FutureShm for non-GPU paths
-  ctp::ipc::FullPtr<FutureShm> future_full = GetFutureShm();
+  // Resolve the task's RunContext (routing state) for non-GPU paths
+  ctp::ipc::FullPtr<FutureT> future_full = GetFutureShm();
   if (future_full.IsNull()) {
     HLOG(kError, "Future::Wait: GetFutureShm returned null");
     return false;
@@ -1961,7 +1949,7 @@ CTP_HOST_FUN bool Future<TaskT, AllocT>::WaitCpu2Cpu(float max_sec,
   bool is_runtime = CLIO_RUNTIME_MANAGER->IsRuntime();
   if (is_runtime) {
     // Runtime self-send: poll FUTURE_COMPLETE in SHM
-    ctp::ipc::FullPtr<FutureShm> future_full = GetFutureShm();
+    ctp::ipc::FullPtr<RunContext> future_full = GetFutureShm();
     if (future_full.IsNull()) return false;
     bool ok = IpcCpu2Self::RecvOut(*this, max_sec, future_full);
     if (!ok) return false;
@@ -1984,14 +1972,14 @@ CTP_HOST_FUN bool Future<TaskT, AllocT>::WaitGpu2Cpu(float max_sec,
   // Host-side polling path (test harness): polls clio::run::FutureShm with
   // system-scope atomics. The GPU kernel uses IpcGpu2Cpu::RecvOut
   // (device-side) which polls gpu::FutureShm instead.
-  ctp::ipc::FullPtr<FutureShm> future_full = GetFutureShm();
+  ctp::ipc::FullPtr<RunContext> future_full = GetFutureShm();
   if (future_full.IsNull()) {
     HLOG(kError, "Future::WaitGpu2Cpu: GetFutureShm returned null");
     return false;
   }
-  ctp::abitfield32_t &flags = future_full->flags_;
+  ctp::abitfield32_t &flags = future_full->gpu_flags_;
   auto start = std::chrono::steady_clock::now();
-  while (!flags.AnySystem(FutureShm::FUTURE_COMPLETE)) {
+  while (!flags.AnySystem(RunContext::FUTURE_COMPLETE)) {
     CTP_THREAD_MODEL->Yield();
     if (max_sec > 0) {
       float elapsed = std::chrono::duration<float>(
@@ -2046,7 +2034,7 @@ CTP_HOST_FUN void Future<TaskT, AllocT>::WaitPoll(float max_sec,
   auto *fshm = fshm_full.ptr_;
 
   // Spin-wait on FUTURE_COMPLETE (device-scope atomics)
-  while (!fshm->flags_.AnyDevice(FutureShm::FUTURE_COMPLETE)) {
+  while (!fshm->gpu_flags_.AnyDevice(RunContext::FUTURE_COMPLETE)) {
     CTP_THREAD_MODEL->Yield();
   }
   ctp::ipc::threadfence();

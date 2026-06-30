@@ -118,7 +118,9 @@ bool IpcCpu2CpuZmq::RecvIn(IpcManager *ipc, u32 &tasks_received) {
       future_shm->origin_ = (mode == IpcMode::kTcp)
                                 ? ClientOrigin::kClientTcp
                                 : ClientOrigin::kClientIpc;
-      future_shm->client_task_vaddr_ = info.task_id_.net_key_;
+      // Response routes by the client's net_key, already carried in the
+      // deserialized task_id_.net_key_ (no separate client_task_vaddr_).
+      task_ptr->task_id_.net_key_ = info.task_id_.net_key_;
       future_shm->client_pid_ = info.task_id_.pid_;
       future_shm->response_fd_ = recv_info.fd_;
       // Resolve the response transport. TCP clients advertise an ephemeral
@@ -292,8 +294,8 @@ bool IpcCpu2CpuZmq::SendOut(
         continue;
       }
 
-      // Preserve client's net_key for response routing
-      origin_task->task_id_.net_key_ = future_shm->client_task_vaddr_;
+      // The client's net_key rides on origin_task->task_id_.net_key_ (set at
+      // RecvIn, serialized back out so the client matches the response).
 
       // Serialize task outputs
       SaveTaskArchive archive(MsgType::kSerializeOut, response_transport);

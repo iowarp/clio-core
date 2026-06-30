@@ -61,134 +61,6 @@ enum class ClientOrigin : u32 {
   kClientGpu2Cpu = 4,  ///< GPU->CPU transfer via cudaMemcpy
 };
 
-// ============================================================================
-// FutureShm - Shared memory container for task future state
-// ============================================================================
-
-/**
- * FutureShm - Fixed-size structure for task future state
- *
- * This structure contains task metadata and completion/transfer state. It is a
- * plain fixed-size POD: the host-side Future owns it through a
- * std::shared_ptr<FutureShm> (allocated with std::make_shared in the Future
- * constructor), and device code references it via an offset-based ShmPtr. The
- * former flexible-array `copy_space[]` member has been removed — the MPSC SHM
- * transport carries serialized task bytes over the named MPSC server, not an
- * inline copy buffer.
- */
-struct FutureShm {
-  // The Future no longer OWNS a FutureShm via shared_ptr. These "remaining"
-  // routing fields now live embedded in the task's RunContext (member route_),
-  // set on the server at RecvIn (BeginRunContext) and read at SendOut; the
-  // client's SendIn likewise begins a RunContext and sets origin_ here.
-  // pool_id_/method_id_ read from the Task; is_complete_/task_size_/waiter_pid_/
-  // waiter_tid_ live on Task::fut_ (FutureInfo); client_task_vaddr_ is gone
-  // (response routing keys on task_id_.net_key_). flags_ carries only the GPU
-  // device-completion bit.
-  static constexpr u32 FUTURE_COMPLETE = 1; /**< Task execution is complete */
-
-  /**
-   * Get the sentinel AllocatorId used by SendCpuToGpu to mark ShmPtrs
-   * whose offset is a raw pinned-host address (not an SHM offset).
-   * @return AllocatorId sentinel {UINT32_MAX-1, 0}
-   */
-  CTP_CROSS_FUN static ctp::ipc::AllocatorId GetCpu2GpuAllocId() {
-    ctp::ipc::AllocatorId id;
-    id.major_ = UINT32_MAX - 1;
-    id.minor_ = 0;
-    return id;
-  }
-
-  /** Origin transport mode — selects the completion/response path. */
-  ClientOrigin origin_;
-
-  /** Client PID for per-client response routing */
-  u32 client_pid_;
-
-  /** SHM transfer info for input direction (client -> worker) */
-  ctp::lbm::ShmTransferInfo input_;
-
-  /** SHM transfer info for output direction (worker -> client) */
-  ctp::lbm::ShmTransferInfo output_;
-
-  /**
-   * Transport used to return this task's response to the originating client.
-   * Fast path (TCP): a dedicated dial-back DEALER, built (or fetched from the
-   * IpcManager connection cache) at RecvIn from the sender's "hostname:pid"
-   * identity + the archive's client_port_, then used verbatim by SendOut. A
-   * DEALER has a single peer so it auto-routes with no identity frame.
-   * Fallback path (TCP): when dial-back is impossible — the client advertised
-   * no response port (client_port_ == 0, e.g. the synchronous fallback-runtime
-   * client) or its routing identity is not a parseable "hostname:pid" (e.g. a
-   * ZMQ auto-assigned identity) — this points at the inbound ROUTER and the
-   * response is echoed back over it using response_identity_ (see below). Non-
-   * owning — lifetime is held by IpcManager's connection cache / the server.
-   */
-  ctp::lbm::Transport* response_transport_;
-
-  /**
-   * Captured ZMQ routing identity for the echo-back fallback path. Populated
-   * at RecvIn only when response_transport_ is the inbound ROUTER (dial-back
-   * was not possible); SendOut prepends it as the ROUTER identity frame so the
-   * response is delivered over the same socket the request arrived on. Length 0
-   * means the dial-back DEALER is in use and no identity frame is needed.
-   */
-  char response_identity_[64];
-  u32 response_identity_len_;
-
-  /** Socket fd for routing response (IPC mode) */
-  int response_fd_;
-
-  /** GPU device-completion bit (gpu2gpu reads it on-device; gpu2cpu signals
-   *  the device gpu::FutureShm). CPU/host completion lives on Task instead. */
-  ctp::abitfield32_t flags_;
-
-  /**
-   * GPU device-memory pointer to the *task POD* (set when the kernel
-   * placed the Task struct in kDeviceMem). The CPU worker D2H-copies
-   * `gpu_task_size_` bytes from here into a host scratch slot for
-   * dispatch, and on completion H2D-copies the (mutated) POD bytes
-   * back to this address so the kernel sees output fields. Zero when
-   * the task is in kPinnedHost / kManagedUvm (host-dereferenceable).
-   */
-  uintptr_t gpu_task_device_ptr_;
-
-  /**
-   * sizeof(TaskT) for the H2D writeback copy. Mirrors Task::fut_.task_size_
-   * (stashed at gpu2cpu RecvIn so SendOut knows the POD size).
-   */
-  u32 gpu_task_size_;
-
-  /**
-   * Default constructor - initializes the routing fields. The task identity
-   * (pool/method) is NOT stored here — it is read from the Task.
-   */
-  CTP_CROSS_FUN FutureShm() {
-    origin_ = ClientOrigin::kClientShm;
-    client_pid_ = 0;
-    response_transport_ = nullptr;
-    response_identity_len_ = 0;
-    response_fd_ = -1;
-    gpu_task_device_ptr_ = 0;
-    gpu_task_size_ = 0;
-    flags_.Clear();
-  }
-
-  /**
-   * Reset the routing state for reuse (re-running a task through its
-   * RunContext). Clears the per-request fields; origin_/response_* are
-   * re-stamped by the transport at RecvIn.
-   */
-  CTP_CROSS_FUN void Reset() {
-    gpu_task_device_ptr_ = 0;
-    gpu_task_size_ = 0;
-    flags_.Clear();
-    input_.total_written_.store(0);
-    input_.total_read_.store(0);
-    output_.total_written_.store(0);
-    output_.total_read_.store(0);
-  }
-};
 
 // ============================================================================
 // Future - Template class for asynchronous task operations
@@ -206,7 +78,10 @@ struct FutureShm {
 template <typename TaskT, typename AllocT = CLIO_QUEUE_ALLOC_T>
 class Future {
  public:
-  using FutureT = FutureShm;
+  // FutureShm is gone — its routing/transport fields are now plain members of
+  // RunContext. GetFutureShm()/GetFutureShmPtr() resolve to the task's
+  // RunContext, so existing `future_shm->origin_` etc. call-sites keep working.
+  using FutureT = RunContext;
 
   // Allow all Future instantiations to access each other's private members
   // This enables the Cast method to work across different task types
@@ -299,9 +174,13 @@ class Future {
          clio::run::shared_ptr<TaskT> task_ptr)
       : task_ptr_(std::move(task_ptr)), parent_task_(), consumed_(false) {
     // pool/method now come from the Task itself; the routing state lives in the
-    // task's RunContext (reached via GetFutureShm() -> Task::RunRoute()).
+    // task's RunContext (reached via GetFutureShm() -> Task::RunRoute()). Ensure
+    // the RunContext exists so SendIn can stamp origin_/routing before dispatch.
     (void)pool_id;
     (void)method_id;
+    if (!task_ptr_.IsNull()) {
+      task_ptr_->EnsureRunCtx();
+    }
   }
 #endif
 
@@ -628,7 +507,7 @@ class Future {
       return p;
     }
     p.alloc_id_.SetNull();
-    p.off_ = reinterpret_cast<size_t>(t->RunRoute());
+    p.off_ = reinterpret_cast<size_t>(t->RunCtxPtr());
     return p;
   }
 

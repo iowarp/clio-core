@@ -169,7 +169,6 @@ class Task;
 class Container;
 class IpcManager;
 struct RunContext;
-struct FutureShm;  // defined in future.h (included below); RunRoute() returns a ptr
 class Worker;
 // Future is defined later in this header (after Task); forward-declared here so
 // Task's RunContext accessors can name Future<Task, AllocT> by reference.
@@ -311,6 +310,10 @@ class Task {
    *  access goes through the Task accessors below. Defined out-of-line once
    *  RunContext is a complete type. Called at the ipc_*.cc BeginTask sites. */
   void BeginRunContext();
+  /** Allocate the RunContext storage if absent (lightweight; no container
+   *  resolution) so the task's embedded routing state (run_ctx_->route_) exists.
+   *  Used by the Future ctor / client SendIn before GetFutureShm(). */
+  void EnsureRunCtx();
   /** Free this task's RunContext (back to not-executing). */
   void ResetRunCtx() { run_ctx_.reset(); }
 
@@ -362,9 +365,9 @@ class Task {
   u32 YieldCount() const;
   void SetYieldCount(u32 v);
   Future<Task, CLIO_QUEUE_ALLOC_T>& RunFuture();
-  /** Embedded routing/transport state (former FutureShm); requires an active
-   *  RunContext (server: BeginRunContext at RecvIn; client: ensured at SendIn). */
-  FutureShm* RunRoute();
+  /** Pointer to this task's RunContext (which now holds the routing/transport
+   *  state, formerly FutureShm). Null if the task has no active RunContext. */
+  RunContext* RunCtxPtr();
   bool IsNotified() const;
   void SetNotified(bool v);
   /** Whether this task's coroutine/fiber has run to completion, without
@@ -831,10 +834,24 @@ class RunContext {
   u32 yield_count_;                     /**< Number of times task has yielded */
   Future<Task, CLIO_QUEUE_ALLOC_T>
       future_;                    /**< Future for async completion tracking */
-  /** Embedded routing/transport state for this task (the former separately-
-   *  allocated FutureShm). Set on the server at RecvIn (and on the client at
-   *  SendIn) and read at SendOut; reached via Task::RunRoute(). */
-  FutureShm route_;
+ public:
+  // ---- Routing / transport state (formerly the separate FutureShm; now just
+  //      public fields of the RunContext, reached via Future::GetFutureShm() ->
+  //      &run_ctx_). Set on the server at RecvIn (and on the client at SendIn)
+  //      and read at SendOut.
+  ClientOrigin origin_;            /**< Origin transport mode (completion path) */
+  u32 client_pid_;                 /**< Client PID for per-client routing */
+  ctp::lbm::ShmTransferInfo input_;   /**< SHM transfer info (client -> worker) */
+  ctp::lbm::ShmTransferInfo output_;  /**< SHM transfer info (worker -> client) */
+  ctp::lbm::Transport* response_transport_; /**< Transport for the response */
+  char response_identity_[64];     /**< ZMQ echo-back identity (fallback path) */
+  u32 response_identity_len_;
+  int response_fd_;                /**< Socket fd for routing response (IPC) */
+  ctp::abitfield32_t gpu_flags_;   /**< GPU device-completion bit (gpu2gpu) */
+  uintptr_t gpu_task_device_ptr_;  /**< Device addr of the task POD (kDeviceMem) */
+  u32 gpu_task_size_;              /**< sizeof(TaskT) for the H2D writeback */
+
+ private:
   std::atomic<bool> is_notified_; /**< Atomic flag to prevent duplicate event
                                      queue additions */
   // Set true by the top-level coroutine's final_suspend when the task
@@ -866,9 +883,29 @@ class RunContext {
         event_queue_(nullptr),
         completed_replicas_(0),
         yield_count_(0),
+        origin_(ClientOrigin::kClientShm),
+        client_pid_(0),
+        response_transport_(nullptr),
+        response_identity_len_(0),
+        response_fd_(-1),
+        gpu_task_device_ptr_(0),
+        gpu_task_size_(0),
         is_notified_(false),
         coro_completed_(false),
-        flags_() {}
+        flags_() {
+    gpu_flags_.Clear();
+  }
+
+  /** Sentinel AllocatorId used by SendCpuToGpu to mark ShmPtrs whose offset is
+   *  a raw pinned-host address (formerly FutureShm::GetCpu2GpuAllocId). */
+  static ctp::ipc::AllocatorId GetCpu2GpuAllocId() {
+    ctp::ipc::AllocatorId id;
+    id.major_ = UINT32_MAX - 1;
+    id.minor_ = 0;
+    return id;
+  }
+  /** GPU device-completion bit (formerly FutureShm::FUTURE_COMPLETE). */
+  static constexpr u32 FUTURE_COMPLETE = 1;
 
   /**
    * Move constructor
@@ -1119,11 +1156,12 @@ inline Future<Task, CLIO_QUEUE_ALLOC_T>& Task::RunFuture() {
   }
   return run_ctx_->future_;
 }
-inline FutureShm* Task::RunRoute() {
-  if (!run_ctx_) {
-    CLIO_RCTX_NULL(RunRoute);
-  }
-  return &run_ctx_->route_;
+inline RunContext* Task::RunCtxPtr() {
+  // Returns null (rather than throwing) when there is no RunContext, so the
+  // RunCtx().IsNull() defensive checks across the IPC paths keep working.
+  // Callers that must stamp routing (SendIn) ensure a RunContext first
+  // (the Future ctor calls EnsureRunCtx()).
+  return run_ctx_.get();
 }
 inline const clio::run::shared_ptr<Task>& Task::GetParentTask() const {
   if (!run_ctx_) {

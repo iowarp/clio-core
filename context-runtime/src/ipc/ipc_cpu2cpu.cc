@@ -46,15 +46,16 @@ bool IpcCpu2Cpu::RecvIn(IpcManager *ipc, TaskLane *lane) {
   // The Future owns the FutureShm via shared_ptr; pushing it onto the lane
   // copies the Future, so the FutureShm stays alive until the worker (and its
   // RunContext copy) is done with it.
+  // The Future ctor ensures tp's RunContext exists (its embedded route_ holds
+  // the routing state); BeginRunContext below reuses it (idempotent).
   Future<Task> f(ti.pool_id_, ti.method_id_, tp);
   auto fs = f.GetFutureShm();
   fs->origin_ = ClientOrigin::kClientShm;
-  fs->client_task_vaddr_ = ti.task_id_.net_key_;
   fs->client_pid_ = ti.task_id_.pid_;
-  // The SHM client blocks on its own MPSC server clio-<pid>-<tid>; SendOut
-  // routes the result back there using these (the OS tid stamped by SendIn).
-  fs->waiter_pid_ = ti.task_id_.pid_;
-  fs->waiter_tid_ = ti.task_id_.tid_;
+  // The SHM client blocks on its own MPSC server clio-<pid>-<tid>; SendOut routes
+  // the result back there using the waiter (the OS pid/tid stamped by SendIn,
+  // carried in task_id_). net_key (task_id_.net_key_) is already on the task.
+  tp->SetWaiter(ti.task_id_.pid_, ti.task_id_.tid_);
   // Allocate the task's RunContext (and resolve its container) now that it is
   // deserialized, so RouteTask / the worker have an active RunContext.
   f.GetTaskPtr()->BeginRunContext();
@@ -86,8 +87,8 @@ void IpcCpu2Cpu::SendOut(
   // thread's MPSC server ("clio-<client_pid>-<client_tid>"). send_transport is
   // used only to Expose bulk descriptors while building the archive; conn->Send
   // performs the actual MPSC transfer (metadata + data).
-  std::string name = "clio-" + std::to_string(future_shm->waiter_pid_) + "-" +
-                     std::to_string(future_shm->waiter_tid_);
+  std::string name = "clio-" + std::to_string(task_ptr->WaiterPid()) + "-" +
+                     std::to_string(task_ptr->WaiterTid());
   ctp::lbm::ShmMpscTransport *conn = ipc->GetOrCreateShmConn(name);
   if (conn != nullptr) {
     SaveTaskArchive archive(MsgType::kSerializeOut, send_transport);

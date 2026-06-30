@@ -108,7 +108,7 @@ struct IpcCpu2Self {
    */
   template <typename TaskT, typename AllocT>
   static bool RecvOut(Future<TaskT, AllocT> &future, float max_sec,
-                         ctp::ipc::FullPtr<FutureShm> future_full) {
+                         ctp::ipc::FullPtr<RunContext> future_full) {
     // Poll per-process completion on the task (set by SendOut on this runtime).
     (void)future_full;
     TaskT *task_ptr = future.get();

@@ -44,19 +44,20 @@ Future<TaskT> IpcCpu2Cpu::SendIn(IpcManager *ipc,
   // worker never touches it; the result returns over this client thread's MPSC
   // server (clio-<pid>-<tid>).
   Future<TaskT> future(task_ptr->pool_id_, task_ptr->method_, task_ptr);
-  FutureShm *future_shm = future.GetFutureShm().ptr_;
+  RunContext *future_shm = future.GetFutureShm().ptr_;
   future_shm->origin_ = ClientOrigin::kClientShm;
-  future_shm->client_task_vaddr_ = net_key;
   // Ensure this thread's MPSC receive server exists before the response lands.
   ipc->GetTls();
-  future_shm->waiter_pid_ = static_cast<u32>(ctp::SystemInfo::GetPid());
-  future_shm->waiter_tid_ = static_cast<u32>(ctp::SystemInfo::GetTid());
+  // The waiter (this client thread) lives on the task's FutureInfo; the response
+  // routes by task_id_.net_key_ (set above).
+  task_ptr->SetWaiter(static_cast<u32>(ctp::SystemInfo::GetPid()),
+                      static_cast<u32>(ctp::SystemInfo::GetTid()));
 
   // Register for response matching. The raw pointer stays valid as long as the
   // returned Future (or a copy) is alive — the client holds it until Recv.
   {
     std::lock_guard<std::mutex> lock(ipc->pending_futures_mutex_);
-    ipc->pending_zmq_futures_[net_key] = {future_shm, task_ptr.get()};
+    ipc->pending_zmq_futures_[net_key] = {task_ptr.get()};
   }
 
   // Pick a worker and high-level Send the task to its server. The worker tid

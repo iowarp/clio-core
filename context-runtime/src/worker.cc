@@ -384,17 +384,16 @@ bool Worker::ProcessNewTask(TaskLane *lane) {
 
   SetCurrentTask(clio::run::shared_ptr<Task>());
 
-  // Get FutureShm (allocator is pre-registered by Admin::RegisterMemory)
-  auto future_shm = future.GetFutureShm();
-  if (future_shm.IsNull()) {
-    HLOG(kError, "Worker {}: Failed to get FutureShm (null pointer)",
-         worker_id_);
+  // The task carries its own identity now (the Future no longer owns a FutureShm).
+  Task *new_task = future.get();
+  if (new_task == nullptr) {
+    HLOG(kError, "Worker {}: ProcessNewTask popped a null task", worker_id_);
     return true;
   }
 
-  // Get pool_id and method_id from FutureShm
-  PoolId pool_id = future_shm->pool_id_;
-  u32 method_id = future_shm->method_id_;
+  // Get pool_id and method_id from the task
+  PoolId pool_id = new_task->pool_id_;
+  u32 method_id = new_task->method_;
   HLOG(kDebug, "Worker {}: ProcessNewTask popped pool={} method={}",
        worker_id_, pool_id, method_id);
 

@@ -254,7 +254,7 @@ int IpcManagerRun2Run::SendOutTransmit(
   // retry whose FutureShm was already freed).
   ctp::lbm::Transport *lbm_transport = nullptr;
   {
-    ctp::ipc::FullPtr<clio::run::FutureShm> fshm =
+    ctp::ipc::FullPtr<clio::run::RunContext> fshm =
         origin_task->RunFuture().GetFutureShm();
     if (!fshm.IsNull() && fshm->response_transport_ != nullptr) {
       lbm_transport = fshm->response_transport_;

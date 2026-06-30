@@ -50,7 +50,6 @@ Future<Task> IpcCpu2Self::SendIn(IpcManager *ipc,
   {
     auto fs = future.GetFutureShm();
     fs->origin_ = ClientOrigin::kClientShm;
-    fs->client_task_vaddr_ = 0;
   }
 
   if (worker != nullptr) {
