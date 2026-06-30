@@ -70,6 +70,23 @@ CLIO_RUN_DEFINE_GLOBAL_PTR_VAR_CC(clio::run::IpcManager, g_ipc_manager);
 
 namespace clio::run {
 
+// Bind address for the local server sockets (client ROUTER, response listener,
+// single-node host). CLIO_BIND_ADDR wins; otherwise loopback under
+// CLIO_TEST_MODE so a unit-test binary binding a fresh port never trips the
+// Windows Defender Firewall "Allow access?" prompt — every unit test is
+// single-node loopback. Falls back to 0.0.0.0 for real multi-interface
+// deployments. Keep all bind sites going through this so none silently default
+// to 0.0.0.0 and accumulate per-binary firewall rules.
+static std::string DefaultServerBindAddr() {
+  if (const char *env = clio::run::env::GetCompat("BIND_ADDR")) {
+    if (*env) return std::string(env);
+  }
+  if (const char *tm = clio::run::env::GetCompat("TEST_MODE")) {
+    if (*tm && std::string(tm) != "0") return std::string("127.0.0.1");
+  }
+  return std::string("0.0.0.0");
+}
+
 // ChiServerBootstrap{Hip,Sycl}Gpu are defined in the GPU companion lib
 // (clio_run_cxx_gpu) and called from ServerInit below. Declare them at
 // namespace scope (not block scope) so MSVC mangles the references as
@@ -236,7 +253,8 @@ bool IpcManager::ClientInit() {
       try {
         client_response_listener_ = ctp::lbm::TransportPtr(
             new ctp::lbm::ZeroMqTransport(ctp::lbm::TransportMode::kServer,
-                                          "0.0.0.0", "tcp", /*port=*/0,
+                                          DefaultServerBindAddr(), "tcp",
+                                          /*port=*/0,
                                           /*use_shared_ctx=*/true));
         client_response_port_ = client_response_listener_->GetBoundPort();
         HLOG(kInfo, "IpcManager: client response listener bound to port {}",
@@ -449,14 +467,11 @@ bool IpcManager::ServerInit() {
     u32 port = config->GetPort();
 
     try {
-      // TCP ROUTER server on port+3. Honor CLIO_BIND_ADDR so this matches
-      // whatever LoadHostfile picked; otherwise tests on Windows can't
-      // avoid the Defender Firewall prompt on the ROUTER port even when
-      // the main server is on loopback.
-      std::string router_bind = "0.0.0.0";
-      if (const char *env = clio::run::env::GetCompat("BIND_ADDR")) {
-        if (*env) router_bind = env;
-      }
+      // TCP ROUTER server on port+3. Bind via DefaultServerBindAddr so it
+      // honors CLIO_BIND_ADDR / loopback-under-test-mode and never defaults to
+      // 0.0.0.0 (which trips the Windows Defender Firewall prompt on the ROUTER
+      // port even when the main server is on loopback).
+      std::string router_bind = DefaultServerBindAddr();
       if (UseLocalZmqIpc()) {
         // macOS (issue #482): bind the local client ROUTER on an ipc:// unix
         // socket so replies route reliably; same-host clients connect their
@@ -1168,10 +1183,7 @@ bool IpcManager::LoadHostfile() {
     // the requested address. Used by tests on Windows to pin to
     // 127.0.0.1 so the Defender Firewall doesn't pop "Allow access?"
     // for every new test binary that binds a fresh port.
-    std::string bind_addr = "0.0.0.0";
-    if (const char *env = clio::run::env::GetCompat("BIND_ADDR")) {
-      if (*env) bind_addr = env;
-    }
+    std::string bind_addr = DefaultServerBindAddr();
     HLOG(kDebug, "No hostfile configured, binding {} as node 0", bind_addr);
     Host host(bind_addr, 0);
     hostfile_map_[0] = host;
