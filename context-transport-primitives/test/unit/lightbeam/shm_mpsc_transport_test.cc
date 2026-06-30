@@ -57,6 +57,32 @@ void RunProducer(const std::string& name, size_t size, uint32_t idx,
   cli.Shutdown();
 }
 
+// Run one producer over a connection SHARED with other threads. SendBytes must
+// serialize per connection so the messages don't interleave under one conn_id.
+void RunProducerShared(ShmMpscTransport* cli, size_t size, uint32_t idx,
+                       std::atomic<int>* ok) {
+  std::vector<char> data = MakePattern(size, idx);
+  if (cli->SendBytes(data.data(), data.size()) == 0) ok->fetch_add(1);
+}
+
+// Drain `count` complete messages from `srv`, asserting each decodes a distinct
+// producer index in [0,count) and matches that producer's pattern.
+void DrainAndVerify(ShmMpscTransport* srv, int count, size_t size) {
+  std::vector<bool> seen(count, false);
+  for (int i = 0; i < count; ++i) {
+    std::vector<char> out;
+    ctp::u64 conn = 0;
+    REQUIRE(srv->RecvBytes(out, &conn, 0) == 0);
+    REQUIRE(out.size() == size);
+    uint32_t idx = 0;
+    std::memcpy(&idx, out.data(), 4);
+    REQUIRE(idx < static_cast<uint32_t>(count));
+    REQUIRE(!seen[idx]);
+    seen[idx] = true;
+    REQUIRE(CheckPattern(out, size));
+  }
+}
+
 }  // namespace
 
 TEST_CASE("ShmMpsc - single thread 16KB", "[shm_mpsc][single]") {
@@ -94,6 +120,61 @@ TEST_CASE("ShmMpsc - single thread 1MB", "[shm_mpsc][single][large]") {
 
   prod.join();
   REQUIRE(ok.load() == 1);
+  srv.Shutdown();
+}
+
+// Concurrency stress, scenario A: many threads, each with its OWN SHM client,
+// all sending into one server. Small ring (default 128KB) vs 512KB messages
+// forces heavy wraparound and slot contention across independent connections.
+TEST_CASE("ShmMpsc - concurrent per-thread clients", "[shm_mpsc][concurrent]") {
+  const std::string name = "clio-mpsc-utest-conc-own";
+  const int kProducers = 8;
+  const size_t kSize = 512 * 1024;
+  ShmMpscTransport srv;
+  REQUIRE(srv.ServerInit(name));  // default 128KB ring
+
+  std::atomic<int> ok{0};
+  std::vector<std::thread> prods;
+  prods.reserve(kProducers);
+  for (int t = 0; t < kProducers; ++t) {
+    prods.emplace_back(RunProducer, name, kSize, static_cast<uint32_t>(t), &ok);
+  }
+
+  DrainAndVerify(&srv, kProducers, kSize);
+
+  for (auto& p : prods) p.join();
+  REQUIRE(ok.load() == kProducers);
+  srv.Shutdown();
+}
+
+// Concurrency stress, scenario B: many threads SHARING a single SHM client
+// (mirrors IpcManager::GetOrCreateShmConn caching one conn per destination and
+// many workers sending through it). All share one conn_id, so SendBytes must
+// serialize each message; otherwise interleaved chunks corrupt the consumer's
+// per-conn reassembly.
+TEST_CASE("ShmMpsc - concurrent shared client", "[shm_mpsc][concurrent]") {
+  const std::string name = "clio-mpsc-utest-conc-shared";
+  const int kProducers = 8;
+  const size_t kSize = 512 * 1024;
+  ShmMpscTransport srv;
+  REQUIRE(srv.ServerInit(name));  // default 128KB ring
+
+  ShmMpscTransport cli;
+  REQUIRE(cli.ClientInit(name));  // ONE client, shared by every producer thread
+
+  std::atomic<int> ok{0};
+  std::vector<std::thread> prods;
+  prods.reserve(kProducers);
+  for (int t = 0; t < kProducers; ++t) {
+    prods.emplace_back(RunProducerShared, &cli, kSize, static_cast<uint32_t>(t),
+                       &ok);
+  }
+
+  DrainAndVerify(&srv, kProducers, kSize);
+
+  for (auto& p : prods) p.join();
+  REQUIRE(ok.load() == kProducers);
+  cli.Shutdown();
   srv.Shutdown();
 }
 

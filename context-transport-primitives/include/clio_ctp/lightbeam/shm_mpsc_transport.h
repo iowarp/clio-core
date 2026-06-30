@@ -92,6 +92,7 @@ struct ShmTransportHeader {
 
 #include <cerrno>
 #include <cstring>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -133,6 +134,16 @@ class ShmMpscTransport {
   bool inited_ = false;
   ctp::u64 conn_id_ = 0;  // this client's connection id (server: 0)
   std::string name_;
+
+  // Serializes this connection's producers. A conn_id is one ordered stream at
+  // the consumer (which reassembles a single message per conn_id at a time), so
+  // when one client object is shared by multiple sender threads — as
+  // IpcManager::GetOrCreateShmConn caches and shares one conn per destination —
+  // their messages must not interleave chunks under the shared conn_id. Held
+  // across the whole message; a blocking std::mutex (not a spinlock) because
+  // SendBytes yields waiting for ring capacity. Uncontended when each thread
+  // owns its own client.
+  std::mutex send_mu_;
 
   // Consumer-side per-connection reassembly state (single-threaded: the one
   // Recv consumer owns this map). TODO(#642): swap for mcsp_unordered_map once
@@ -227,6 +238,9 @@ class ShmMpscTransport {
    * success, -EPIPE if the server (consumer) process died mid-transfer.
    */
   int SendBytes(const char *data, size_t size) {
+    // One message at a time per connection (see send_mu_): keeps a shared
+    // client's threads from interleaving chunks under the same conn_id.
+    std::lock_guard<std::mutex> lk(send_mu_);
     ctp::u32 rem_off = 0;
     ctp::u32 rem_size = static_cast<ctp::u32>(size);
     while (rem_off < size) {
