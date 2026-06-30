@@ -13800,7 +13800,7 @@ TEST_CASE("Autogen - DefaultScheduler AdjustPolling", "[autogen][scheduler][adju
         ctp::make_shared<clio::run::Task>(CTP_MALLOC);
     t->BeginRunContext();
     t->SetDidWork(true);
-    t->SetTruePeriodNs(500000.0);
+    t->SetPeriod(500000.0, 1.0);  // true period is the task's own period_ns_
     t->SetYieldTimeUs(50000.0);
     clio::run::DefaultScheduler sched;
     double before = t->YieldTimeUs();
@@ -13976,7 +13976,7 @@ TEST_CASE("Autogen - RunContext via Task accessors", "[autogen][types][runcontex
     task->SetYielded(true);
     task->SetYieldCount(5);
     task->SetYieldTimeUs(1000.0);
-    task->SetTruePeriodNs(500000.0);
+    task->SetPeriod(500000.0, 1.0);  // true period == task period_ns_
     task->SetDidWork(true);
     task->SetRunWorkerId(3);
     REQUIRE(task->IsYielded() == true);

@@ -103,13 +103,12 @@ void Task::StartCoroutine(clio::run::shared_ptr<Task> &self) {
   // valid. Worker id / lane / event queue / future are already bound by
   // Worker::ProcessNewTask; here we set the remaining execution state.
   SetYielded(false);  // Initially not blocked
-  // Adaptive polling fields for periodic tasks.
+  // Adaptive polling fields for periodic tasks. TruePeriodNs() now reads
+  // period_ns_ directly, so there is nothing to copy here.
   if (IsPeriodic()) {
-    SetTruePeriodNs(period_ns_);
     SetYieldTimeUs(period_ns_ / 1000.0);  // Initialize with true period
     SetDidWork(false);                    // Initially no work done
   } else {
-    SetTruePeriodNs(0.0);
     SetYieldTimeUs(0.0);
     SetDidWork(false);
   }

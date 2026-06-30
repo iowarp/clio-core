@@ -334,7 +334,6 @@ class Task {
   bool IsCoroCompleted() const;
   void SetCoroCompleted(bool v);
   double TruePeriodNs() const;
-  void SetTruePeriodNs(double v);
   bool DidWork() const;
   void SetDidWork(bool v = true);
   bool IsRouted() const;
@@ -735,6 +734,15 @@ class RunContext {
   // no way to dereference a null RunContext by accident.
   friend class Task;
 
+  /** Per-execution lifecycle flags, packed into one word instead of four
+   *  separate bools (is_yielded_ / did_work_ / routed_ / started_). */
+  enum RunCtxFlag : u32 {
+    RCTX_YIELDED = 1u << 0,   /**< Task is waiting for completion */
+    RCTX_DID_WORK = 1u << 1,  /**< Task did work in last execution */
+    RCTX_ROUTED = 1u << 2,    /**< RouteTask has placed this task */
+    RCTX_STARTED = 1u << 3,   /**< Execution has begun */
+  };
+
   /** Coroutine handle for C++20 stackless coroutines (or Boost fiber handle) */
 #ifndef CLIO_ENABLE_BOOST_COROUTINES
   std::coroutine_handle<> coro_handle_;
@@ -745,7 +753,6 @@ class RunContext {
   clio::run::detail::FiberState fiber_state_;
 #endif
   u32 worker_id_;               /**< Worker ID executing this task */
-  bool is_yielded_;             /**< Task is waiting for completion */
   double yield_time_us_;        /**< Time in microseconds for task to yield */
   ctp::Timepoint block_start_; /**< Time when task was blocked (real time) */
   DynamicContainer container_;  /**< Resolved-once handle to the execution
@@ -774,10 +781,10 @@ class RunContext {
   // completion may already have freed — done() on a freed frame GPFLTs (issue
   // #485). The RunContext outlives the frame, so this read is always valid.
   std::atomic<bool> coro_completed_;
-  double true_period_ns_;         /**< Original period from task->period_ns_ */
-  bool did_work_;            /**< Whether task did work in last execution */
-  bool routed_ = false;     /**< RouteTask has placed this task (was TASK_ROUTED) */
-  bool started_ = false;    /**< Execution has begun (was TASK_STARTED) */
+  /** is_yielded_ / did_work_ / routed_ / started_ packed into one word. The
+   *  true period is NOT duplicated here — Task::TruePeriodNs() reads the task's
+   *  own period_ns_ directly. */
+  ctp::bitfield32_t flags_;
   ctp::CpuTimer cpu_timer_; /**< Accumulates thread CPU time across yields */
   float predicted_load_ = 0; /**< Predicted CPU time from InferModel (us) */
   ctp::HighResMonotonicTimer wall_timer_; /**< Wall clock time across yields */
@@ -790,7 +797,6 @@ class RunContext {
   RunContext()
       : coro_handle_(),
         worker_id_(0),
-        is_yielded_(false),
         yield_time_us_(0.0),
         block_start_(),
         container_(),
@@ -800,8 +806,7 @@ class RunContext {
         yield_count_(0),
         is_notified_(false),
         coro_completed_(false),
-        true_period_ns_(0.0),
-        did_work_(false) {}
+        flags_() {}
 
   /**
    * Move constructor
@@ -809,7 +814,6 @@ class RunContext {
   RunContext(RunContext&& other) noexcept
       : coro_handle_(std::move(other.coro_handle_)),
         worker_id_(other.worker_id_),
-        is_yielded_(other.is_yielded_),
         yield_time_us_(other.yield_time_us_),
         block_start_(other.block_start_),
         container_(std::move(other.container_)),
@@ -822,10 +826,7 @@ class RunContext {
         future_(std::move(other.future_)),
         is_notified_(other.is_notified_.load()),
         coro_completed_(other.coro_completed_.load()),
-        true_period_ns_(other.true_period_ns_),
-        did_work_(other.did_work_),
-        routed_(other.routed_),
-        started_(other.started_),
+        flags_(other.flags_),
         cpu_timer_(other.cpu_timer_),
         predicted_load_(other.predicted_load_),
         wall_timer_(other.wall_timer_),
@@ -846,7 +847,6 @@ class RunContext {
     if (this != &other) {
       coro_handle_ = std::move(other.coro_handle_);
       worker_id_ = other.worker_id_;
-      is_yielded_ = other.is_yielded_;
       yield_time_us_ = other.yield_time_us_;
       block_start_ = other.block_start_;
       container_ = std::move(other.container_);
@@ -859,10 +859,7 @@ class RunContext {
       future_ = std::move(other.future_);
       is_notified_.store(other.is_notified_.load());
       coro_completed_.store(other.coro_completed_.load());
-      true_period_ns_ = other.true_period_ns_;
-      did_work_ = other.did_work_;
-      routed_ = other.routed_;
-      started_ = other.started_;
+      flags_ = other.flags_;
       cpu_timer_ = other.cpu_timer_;
       predicted_load_ = other.predicted_load_;
       wall_timer_ = other.wall_timer_;
@@ -910,14 +907,22 @@ class RunContext {
   // Execution-lifecycle flag accessors. These hold per-execution state that
   // used to live in Task::task_flags_ (TASK_ROUTED / TASK_STARTED) but is
   // runtime-local and must not be serialized with the task.
-  bool IsRouted() const { return routed_; }
-  void SetRouted(bool v = true) { routed_ = v; }
-  bool IsStarted() const { return started_; }
-  void SetStarted(bool v = true) { started_ = v; }
-  bool IsYielded() const { return is_yielded_; }
-  void SetYielded(bool v = true) { is_yielded_ = v; }
-  bool DidWork() const { return did_work_; }
-  void SetDidWork(bool v = true) { did_work_ = v; }
+  // Each flag lives in flags_; setting passes the bit, clearing unsets it.
+  void SetFlag(RunCtxFlag f, bool v) {
+    if (v) {
+      flags_.SetBits(f);
+    } else {
+      flags_.UnsetBits(f);
+    }
+  }
+  bool IsRouted() const { return flags_.Any(RCTX_ROUTED); }
+  void SetRouted(bool v = true) { SetFlag(RCTX_ROUTED, v); }
+  bool IsStarted() const { return flags_.Any(RCTX_STARTED); }
+  void SetStarted(bool v = true) { SetFlag(RCTX_STARTED, v); }
+  bool IsYielded() const { return flags_.Any(RCTX_YIELDED); }
+  void SetYielded(bool v = true) { SetFlag(RCTX_YIELDED, v); }
+  bool DidWork() const { return flags_.Any(RCTX_DID_WORK); }
+  void SetDidWork(bool v = true) { SetFlag(RCTX_DID_WORK, v); }
 
   /**
    * Clear all STL containers for reuse
@@ -932,8 +937,7 @@ class RunContext {
     yield_count_ = 0;
     is_notified_.store(false);
     coro_completed_.store(false);
-    true_period_ns_ = 0.0;
-    did_work_ = false;
+    flags_.UnsetBits(RCTX_DID_WORK);
     cpu_timer_.time_ns_ = 0;
     predicted_load_ = 0;
     wall_timer_.time_ns_ = 0;
@@ -984,8 +988,22 @@ class RunContext {
 
 CLIO_RCTX_GET(u32, RunWorkerId, worker_id_)
 CLIO_RCTX_SET(u32, SetRunWorkerId, worker_id_)
-CLIO_RCTX_GET(bool, IsYielded, is_yielded_)
-CLIO_RCTX_SET(bool, SetYielded, is_yielded_)
+// Flag accessors delegate to the RunContext's bitfield (flags_); they can't use
+// the plain-field CLIO_RCTX_GET/SET macros.
+#define CLIO_RCTX_FLAG(GETTER, SETTER)                                          \
+  inline bool Task::GETTER() const {                                           \
+    if (!run_ctx_) {                                                           \
+      CLIO_RCTX_NULL(GETTER);                                                  \
+    }                                                                          \
+    return run_ctx_->GETTER();                                                 \
+  }                                                                            \
+  inline void Task::SETTER(bool v) {                                           \
+    if (!run_ctx_) {                                                           \
+      CLIO_RCTX_NULL(SETTER);                                                  \
+    }                                                                          \
+    run_ctx_->SETTER(v);                                                       \
+  }
+CLIO_RCTX_FLAG(IsYielded, SetYielded)
 CLIO_RCTX_GET(double, YieldTimeUs, yield_time_us_)
 CLIO_RCTX_SET(double, SetYieldTimeUs, yield_time_us_)
 CLIO_RCTX_REF(ctp::Timepoint, BlockStart, block_start_)
@@ -997,14 +1015,13 @@ CLIO_RCTX_REF(std::vector<clio::run::shared_ptr<Task>>, Subtasks, subtasks_)
 CLIO_RCTX_REF(std::atomic<u32>, CompletedReplicas, completed_replicas_)
 CLIO_RCTX_GET(u32, YieldCount, yield_count_)
 CLIO_RCTX_SET(u32, SetYieldCount, yield_count_)
-CLIO_RCTX_GET(double, TruePeriodNs, true_period_ns_)
-CLIO_RCTX_SET(double, SetTruePeriodNs, true_period_ns_)
-CLIO_RCTX_GET(bool, DidWork, did_work_)
-CLIO_RCTX_SET(bool, SetDidWork, did_work_)
-CLIO_RCTX_GET(bool, IsRouted, routed_)
-CLIO_RCTX_SET(bool, SetRouted, routed_)
-CLIO_RCTX_GET(bool, IsStarted, started_)
-CLIO_RCTX_SET(bool, SetStarted, started_)
+// The "true period" is the task's own period_ns_ (set via SetPeriod); it is no
+// longer duplicated in the RunContext, so this reads the task field directly
+// and needs no RunContext.
+inline double Task::TruePeriodNs() const { return period_ns_; }
+CLIO_RCTX_FLAG(DidWork, SetDidWork)
+CLIO_RCTX_FLAG(IsRouted, SetRouted)
+CLIO_RCTX_FLAG(IsStarted, SetStarted)
 CLIO_RCTX_REF(ctp::CpuTimer, RunCpuTimer, cpu_timer_)
 CLIO_RCTX_GET(float, PredictedLoad, predicted_load_)
 CLIO_RCTX_SET(float, SetPredictedLoad, predicted_load_)
