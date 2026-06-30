@@ -80,6 +80,13 @@ add_subdirectory(modules)
 if(CLIO_CORE_ENABLE_BENCHMARKS)
   add_subdirectory(benchmark)
   message(STATUS "Benchmarks enabled - added benchmark subdirectory")
+
+  # Raw libthallium async-RPC microbenchmark (issue #647). Only builds when
+  # thallium is available; it links the `thallium` imported target directly.
+  if(CLIO_CORE_ENABLE_THALLIUM)
+    add_subdirectory(benchmarks/thallium-bench)
+    message(STATUS "Thallium enabled - added benchmarks/thallium-bench")
+  endif()
 endif()
 
 # Add test subdirectory if testing is enabled
