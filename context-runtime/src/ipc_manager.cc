@@ -2950,6 +2950,15 @@ RouteResult IpcManager::RouteManyToOne(Future<Task> &future) {
     // batch flusher aggregates, runs once, and completes each member later.
     // RouteResult::Local tells the worker the task is owned elsewhere now and
     // must not be executed here.
+    //
+    // Anchor the FutureShm to the task's RunContext: the batch holds the member
+    // task by pointer, and the queued Future that owns the FutureShm is dropped
+    // once routing returns. Without this bind the FutureShm is freed before the
+    // batch flusher runs, so OnAggregateComplete can't signal the member's
+    // waiter (future_shm is null) and the client's Wait() hangs. Mirrors the
+    // bind in RouteGlobal; the batch path skips ProcessNewTask, which is the
+    // only other place RunFuture is bound.
+    task_ptr->RunFuture() = future;
     task_ptr->SetRouted();
     batch_manager_->Add(task_ptr);
     return RouteResult::Local;
