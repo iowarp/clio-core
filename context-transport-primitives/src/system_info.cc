@@ -1272,9 +1272,9 @@ std::string SystemInfo::PredictDriveFailure(const std::string &drive_type, const
 #else
   (void)drive_type;
   (void)health_json;
+  (void)drive_id;
   return "{}";
 #endif
 }
 
->>>>>>> Stashed changes
 }  // namespace ctp
