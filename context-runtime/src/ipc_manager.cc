@@ -2989,13 +2989,15 @@ RouteResult IpcManager::RouteManyToOne(Future<Task> &future) {
     // bind in RouteGlobal; the batch path skips ProcessNewTask, which is the
     // only other place RunFuture is bound.
     task_ptr->RunFuture() = future;
-    // Drop the Future's strong back-reference to this very task. The bind above
-    // exists only to keep the FutureShm alive for the response, but the copied
-    // task_ptr_ points at task_ptr itself, forming a
-    // task -> RunContext -> future_ -> task_ptr_ -> task cycle that leaks the
-    // task after the batch completes (the batch holds it by raw pointer, so
-    // nothing else recycles it). The response path reads only GetFutureShm().
-    task_ptr->RunFuture().GetTaskPtr().reset();
+    // Break the strong back-reference cycle (task -> RunContext -> future_ ->
+    // task_ptr_ -> task) that would otherwise leak the member after the batch
+    // completes, but keep the Future's task pointer pointing AT the member as a
+    // NON-OWNING handle: GetFutureShm() now resolves the routing state through
+    // the task (TaskRaw()->RunCtxPtr()), so a plain reset() would make
+    // OnAggregateComplete -> EndTask see a null route and never signal the
+    // member's waiter (the client's Wait() would hang).
+    task_ptr->RunFuture().GetTaskPtr() =
+        clio::run::shared_ptr<Task>::WrapNonOwning(task_ptr.get());
     task_ptr->SetRouted();
     batch_manager_->Add(task_ptr);
     return RouteResult::Local;
@@ -3163,11 +3165,14 @@ RouteResult IpcManager::RouteGlobal(Future<Task> &future,
   // hanging the waiting client. ProcessNewTask binds RunFuture for locally
   // executed tasks; net-routed tasks skip ProcessNewTask, so bind it here.
   task_ptr->RunFuture() = future;
-  // Drop the Future's strong self-reference: the copied task_ptr_ points at
-  // task_ptr itself, forming a task -> RunContext -> future_ -> task_ptr_ cycle
-  // that leaks the origin task after send_map_ erases it (run2run holds it by
-  // raw pointer). Only the FutureShm is needed for the response.
-  task_ptr->RunFuture().GetTaskPtr().reset();
+  // Break the strong self-reference cycle (task -> RunContext -> future_ ->
+  // task_ptr_ -> task) that would leak the origin task after send_map_ erases
+  // it, but keep the Future's task pointer pointing AT the task as a NON-OWNING
+  // handle: GetFutureShm() resolves the routing state through the task
+  // (TaskRaw()->RunCtxPtr()), so a plain reset() would make RecvIn/RecvOut ->
+  // EndTask see a null route and never send the response (hanging the client).
+  task_ptr->RunFuture().GetTaskPtr() =
+      clio::run::shared_ptr<Task>::WrapNonOwning(task_ptr.get());
 
   // Pick the latency vs I/O SendIn lane based on the task's actual
   // payload size — small probes / metadata sit on kSendInLatency so

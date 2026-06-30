@@ -841,6 +841,11 @@ class RunContext {
   //      and read at SendOut.
   ClientOrigin origin_;            /**< Origin transport mode (completion path) */
   u32 client_pid_;                 /**< Client PID for per-client routing */
+  /** Client's net_key (task vaddr) captured at RecvIn and restored onto
+   *  task_id_.net_key_ at SendOut, because AllocLoadTask reassigns the server
+   *  task's identity. The ZMQ recv thread keys pending_zmq_futures_ by this, so
+   *  the response must carry it for the client to match (else it hangs). */
+  uintptr_t client_net_key_;
   ctp::lbm::ShmTransferInfo input_;   /**< SHM transfer info (client -> worker) */
   ctp::lbm::ShmTransferInfo output_;  /**< SHM transfer info (worker -> client) */
   ctp::lbm::Transport* response_transport_; /**< Transport for the response */
@@ -885,6 +890,7 @@ class RunContext {
         yield_count_(0),
         origin_(ClientOrigin::kClientShm),
         client_pid_(0),
+        client_net_key_(0),
         response_transport_(nullptr),
         response_identity_len_(0),
         response_fd_(-1),
