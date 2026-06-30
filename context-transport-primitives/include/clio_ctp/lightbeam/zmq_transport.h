@@ -601,6 +601,25 @@ class ZeroMqTransport : public Transport {
   }
 
  private:
+  // After a partial/truncated multipart read, discard any frames still pending
+  // for the current logical message so the next Recv() starts cleanly on a
+  // message boundary (prevents a one-time wire glitch from desyncing the
+  // stream permanently). Non-blocking throughout.
+  void DrainToMessageBoundary() {
+    while (true) {
+      int more = 0;
+      size_t more_sz = sizeof(more);
+      if (zmq_getsockopt(socket_, ZMQ_RCVMORE, &more, &more_sz) != 0 || !more) {
+        break;
+      }
+      zmq_msg_t junk;
+      zmq_msg_init(&junk);
+      int rc = zmq_msg_recv(&junk, socket_, ZMQ_DONTWAIT);
+      zmq_msg_close(&junk);
+      if (rc == -1) break;
+    }
+  }
+
   template <typename MetaT>
   int RecvMetadata(MetaT& meta, const LbmContext& ctx = LbmContext()) {
     (void)ctx;
@@ -608,8 +627,12 @@ class ZeroMqTransport : public Transport {
     zmq_msg_init(&msg);
     int rc;
     if (IsServer()) {
-      // ROUTER: identity frame first (DONTWAIT so polling callers can
-      // see EAGAIN cleanly), then a blocking delim and meta.
+      // ROUTER: [identity, delim, meta]. The identity is read DONTWAIT so a
+      // polling caller sees EAGAIN cleanly when nothing is queued. ZMQ delivers
+      // a multipart message atomically, so once the identity is in hand the
+      // delim and meta are already buffered — read them DONTWAIT too. Staying
+      // non-blocking is what lets the recv thread always honor its shutdown
+      // flag; a blocking flags=0 read on a truncated message would wedge it.
       zmq_msg_t identity_msg;
       zmq_msg_init(&identity_msg);
       int rc_id = zmq_msg_recv(&identity_msg, socket_, ZMQ_DONTWAIT);
@@ -622,31 +645,22 @@ class ZeroMqTransport : public Transport {
       meta.client_info_.identity_ = std::string(
           static_cast<char*>(zmq_msg_data(&identity_msg)),
           zmq_msg_size(&identity_msg));
-      int more_after_id = zmq_msg_more(&identity_msg);
       zmq_msg_close(&identity_msg);
-      HLOG(kDebug,
-           "[ZMQRECV] ROUTER got identity='{}' size={} more={} — blocking delim",
-           meta.client_info_.identity_, meta.client_info_.identity_.size(),
-           more_after_id);
 
       zmq_msg_t delim_msg;
       zmq_msg_init(&delim_msg);
-      int rc_d = zmq_msg_recv_eintr(&delim_msg, socket_, 0);
-      int more_after_delim = zmq_msg_more(&delim_msg);
-      size_t delim_sz = zmq_msg_size(&delim_msg);
+      int rc_d = zmq_msg_recv(&delim_msg, socket_, ZMQ_DONTWAIT);
       zmq_msg_close(&delim_msg);
       if (rc_d == -1) {
+        DrainToMessageBoundary();
         zmq_msg_close(&msg);
         return zmq_errno();
       }
-      HLOG(kDebug, "[ZMQRECV] ROUTER got delim size={} more={} — blocking meta",
-           delim_sz, more_after_delim);
 
-      rc = zmq_msg_recv_eintr(&msg, socket_, 0);
-      HLOG(kDebug, "[ZMQRECV] ROUTER got meta rc={} size={} more={}", rc,
-           rc >= 0 ? zmq_msg_size(&msg) : 0, zmq_msg_more(&msg));
+      rc = zmq_msg_recv(&msg, socket_, ZMQ_DONTWAIT);
     } else {
-      // DEALER: delim (DONTWAIT for EAGAIN check) then meta (blocking).
+      // DEALER: [delim, meta]. Delim DONTWAIT to detect "no message"; meta is
+      // buffered with it (atomic multipart), so read it DONTWAIT as well.
       zmq_msg_t delim_msg;
       zmq_msg_init(&delim_msg);
       int rc_d = zmq_msg_recv(&delim_msg, socket_, ZMQ_DONTWAIT);
@@ -657,11 +671,12 @@ class ZeroMqTransport : public Transport {
         return err;
       }
       zmq_msg_close(&delim_msg);
-      rc = zmq_msg_recv_eintr(&msg, socket_, 0);
+      rc = zmq_msg_recv(&msg, socket_, ZMQ_DONTWAIT);
     }
 
     if (rc == -1) {
       int err = zmq_errno();
+      DrainToMessageBoundary();
       zmq_msg_close(&msg);
       return err;
     }
@@ -692,7 +707,11 @@ class ZeroMqTransport : public Transport {
         continue;
       }
       recv_count++;
-      int flags = (recv_count < meta.send_bulks) ? ZMQ_RCVMORE : 0;
+      // Bulks ride in the same atomic multipart message as the meta, so they're
+      // already buffered by the time we get here — read DONTWAIT to stay
+      // non-blocking. (The previous ZMQ_RCVMORE-as-recv-flag was a no-op-ish
+      // misuse: ZMQ_RCVMORE is a getsockopt option, not a recv flag.)
+      int flags = ZMQ_DONTWAIT;
 
       if (meta.recv[i].data.ptr_) {
         zmq_msg_t zmq_msg;
