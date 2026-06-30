@@ -79,6 +79,7 @@ using namespace std::chrono_literals;
 #include <clio_runtime/bdev/bdev_tasks.h>
 
 // Include admin client for pool management
+#include "clio_ctp/serialize/msgpack_wrapper.h"
 #include <clio_runtime/admin/admin_client.h>
 #include <clio_runtime/admin/admin_tasks.h>
 
@@ -640,6 +641,31 @@ TEST_CASE("bdev_performance_metrics", "[bdev][performance][metrics]") {
     REQUIRE(initial_remaining > 0);
     REQUIRE(initial_metrics.read_bandwidth_mbps_ >= 0.0);
     REQUIRE(initial_metrics.write_bandwidth_mbps_ >= 0.0);
+
+    // [INJECTED] Trigger the bdev Monitor with "stats" to hit our prediction server
+    {
+      HLOG(kInfo, "Triggering bdev Monitor(stats) to test Prediction Server Integration...");
+      auto monitor_task = client.AsyncMonitor(chi::PoolQuery::Local(), "stats");
+      monitor_task.Wait();
+      if (!monitor_task->results_.empty()) {
+        HLOG(kInfo, "Prediction server hook fired! bdev Monitor returned {} result entries",
+             monitor_task->results_.size());
+             
+        for (const auto& [node_id, result] : monitor_task->results_) {
+            std::cout << "\n\n========== PREDICTION RESULT ==========\n";
+            std::cout << "Node ID: " << node_id << ", Raw result size: " << result.size() << "\n";
+            std::string readable;
+            for (char c : result) {
+                if (c >= 32 && c <= 126) readable += c;
+                else readable += ' ';
+            }
+            std::cout << "Raw Payload Content:\n" << readable << "\n";
+            std::cout << "=======================================\n\n";
+        }
+      } else {
+        HLOG(kInfo, "bdev Monitor returned no results (prediction server may not be running)");
+      }
+    }
 
     // Perform I/O operations using DirectHash for distributed execution
     for (int i = 0; i < 16; ++i) {

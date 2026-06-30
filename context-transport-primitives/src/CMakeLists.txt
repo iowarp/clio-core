@@ -41,6 +41,7 @@ target_link_libraries(clio_ctp_host PUBLIC
     ${REAL_TIME_FLAGS}
     configure
     thread_all
+    curl
 )
 if(WIN32)
     target_link_libraries(clio_ctp_host PUBLIC ws2_32)

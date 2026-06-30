@@ -51,6 +51,10 @@
 #include <fstream>
 #include <string>
 
+#if CTP_ENABLE_PROCFS_SYSINFO
+#include <curl/curl.h>
+#endif
+
 #include "clio_ctp/constants/macros.h"
 // MSan: inform sanitizer that mmap-backed memory is initialized by the kernel
 #if defined(__has_feature)
@@ -1159,6 +1163,13 @@ SharedLibrary &SharedLibrary::operator=(SharedLibrary &&other) noexcept {
   return *this;
 }
 
+#if CTP_ENABLE_PROCFS_SYSINFO
+static size_t CurlWriteCallback(void *contents, size_t size, size_t nmemb, void *userp) {
+    ((std::string*)userp)->append((char*)contents, size * nmemb);
+    return size * nmemb;
+}
+#endif
+
 /// @brief Retrieves storage device hardware health statistics.
 ///
 /// Reads a JSON file left by an external admin service
@@ -1222,4 +1233,48 @@ std::string SystemInfo::GetDeviceHealthStats(const std::string &path) {
 #endif
 }
 
+/// @brief Predicts drive failure by calling local python server.
+std::string SystemInfo::PredictDriveFailure(const std::string &drive_type, const std::string &health_json, const std::string &drive_id) {
+#if defined(__linux__)
+  // Use host.docker.internal so the request reaches the Windows/Mac host
+  // when running inside a Docker container. Falls back gracefully if
+  // the prediction server is not running.
+  const char *url = "http://host.docker.internal:8000/predict/auto";
+
+  std::string payload = "{\"drive_type\": \"" + drive_type + "\", "
+      + "\"drive_id\": \"" + drive_id + "\", "
+      + "\"metrics\": "
+      + (health_json.empty() || health_json == "{}" ? "{}" : health_json) + "}";
+  std::string read_buffer;
+
+  CURL *curl = curl_easy_init();
+  if (curl) {
+    struct curl_slist *headers = nullptr;
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, payload.c_str());
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, CurlWriteCallback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &read_buffer);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L);
+
+    CURLcode res = curl_easy_perform(curl);
+    if (res != CURLE_OK) {
+      read_buffer = std::string("{\"error\": \"Prediction server unreachable: ")
+                    + curl_easy_strerror(res) + "\"}";
+    }
+
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+  }
+  return read_buffer.empty() ? "{}" : read_buffer;
+#else
+  (void)drive_type;
+  (void)health_json;
+  return "{}";
+#endif
+}
+
+>>>>>>> Stashed changes
 }  // namespace ctp

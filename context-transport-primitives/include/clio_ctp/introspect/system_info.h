@@ -297,6 +297,12 @@ class SystemInfo {
   /** Directory of the shared library containing the given symbol. */
   CTP_DLL static std::string GetModuleDirectoryFor(void *symbol);
 
+  /// @brief Retrieves storage device hardware health statistics.
+  CTP_DLL static std::string GetDeviceHealthStats(const std::string &path);
+
+  /// @brief Predicts drive failure by calling local python server.
+  CTP_DLL static std::string PredictDriveFailure(const std::string &drive_type, const std::string &health_json, const std::string &drive_id);
+
   CTP_DLL static std::string GetLibrarySearchPathVar();
 
   CTP_DLL static char GetPathListSeparator();
