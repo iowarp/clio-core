@@ -376,7 +376,7 @@ class IpcManager {
     clio::run::shared_ptr<TaskT> sp =
         ctp::make_shared<TaskT>(CTP_MALLOC, std::forward<Args>(args)...);
     if (!sp.IsNull()) {
-      sp->pod_size_ = static_cast<u32>(sizeof(TaskT));
+      sp->fut_.task_size_ = static_cast<u32>(sizeof(TaskT));
 #if defined(CTP_ALLOC_TRACK_SIZE) && CTP_IS_HOST
       RuntimeTaskAllocBytes() += static_cast<long long>(sizeof(TaskT));
 #endif

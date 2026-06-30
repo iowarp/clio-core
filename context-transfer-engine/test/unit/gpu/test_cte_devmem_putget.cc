@@ -208,7 +208,7 @@ TEST_CASE("CTE PutBlob+GetBlob round trip with device-memory task & data",
       g_tag_id, kBlobName, /*offset=*/clio::run::u64(0),
       static_cast<clio::run::u64>(kBlobBytes), put_blob_shm,
       /*score=*/-1.0f, cte::Context(), /*flags=*/clio::run::u32(0));
-  put_proto_task->pod_size_ = sizeof(cte::PutBlobTask);
+  put_proto_task->fut_.task_size_ = sizeof(cte::PutBlobTask);
   new (put_proto + sizeof(cte::PutBlobTask)) clio::run::gpu::FutureShm();
   ctp::GpuApi::Memcpy(task_dev_base, put_proto, sizeof(put_proto));
 
@@ -223,7 +223,7 @@ TEST_CASE("CTE PutBlob+GetBlob round trip with device-memory task & data",
       g_tag_id, kBlobName, /*offset=*/clio::run::u64(0),
       static_cast<clio::run::u64>(kBlobBytes), /*flags=*/clio::run::u32(0),
       get_blob_shm);
-  get_proto_task->pod_size_ = sizeof(cte::GetBlobTask);
+  get_proto_task->fut_.task_size_ = sizeof(cte::GetBlobTask);
   new (get_proto + sizeof(cte::GetBlobTask)) clio::run::gpu::FutureShm();
   ctp::GpuApi::Memcpy(task_dev_base + kPutSlot, get_proto, sizeof(get_proto));
 

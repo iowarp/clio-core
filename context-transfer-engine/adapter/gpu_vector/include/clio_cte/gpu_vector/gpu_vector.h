@@ -1044,7 +1044,7 @@ inline Vector<T>::Vector(const std::string &tag_name, clio::run::u32 nblocks,
           blob_name.c_str(), /*offset=*/0, /*size=*/0,
           ctp::ipc::ShmPtr<>::GetNull(), /*score=*/-1.0f,
           clio::cte::core::Context(), /*flags=*/0);
-      put_task->pod_size_ = static_cast<clio::run::u32>(sizeof(*put_task));
+      put_task->fut_.task_size_ = static_cast<clio::run::u32>(sizeof(*put_task));
       new (put_addr + sizeof(*put_task)) clio::run::gpu::FutureShm();
 
       auto get_task = new (get_addr) clio::cte::core::GetBlobTask(
@@ -1052,7 +1052,7 @@ inline Vector<T>::Vector(const std::string &tag_name, clio::run::u32 nblocks,
           clio::run::PoolQuery::ToLocalCpu(), view_.base.tag_id,
           blob_name.c_str(), /*offset=*/0, /*size=*/0,
           /*flags=*/0, ctp::ipc::ShmPtr<>::GetNull());
-      get_task->pod_size_ = static_cast<clio::run::u32>(sizeof(*get_task));
+      get_task->fut_.task_size_ = static_cast<clio::run::u32>(sizeof(*get_task));
       new (get_addr + sizeof(*get_task)) clio::run::gpu::FutureShm();
     }
   }

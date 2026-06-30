@@ -240,6 +240,32 @@ struct TaskStat {
 #define CLASS_NEW_ARGS
 
 /**
+ * FutureInfo - self-contained completion state embedded in every Task.
+ *
+ * Holds the bits that must travel WITH the task so it is self-describing for
+ * completion + waiter wakeup, replacing the separate (gpu::)FutureShm:
+ *  - is_complete_: CPU/host completion signal, set by the completing worker (or
+ *    the client recv thread when the response lands) and polled by the waiter /
+ *    the GPU kernel. (Was Task::is_complete_ / FutureShm::flags_ FUTURE_COMPLETE.)
+ *  - task_size_: sizeof(the concrete TaskT) — the GPU worker needs it to D2H/H2D
+ *    the POD task; also the POD-transport size. (Was Task::pod_size_ /
+ *    FutureShm::gpu_task_size_ / gpu::FutureShm::task_size_.)
+ *  - waiter_pid_/waiter_tid_: the thread to EventManager::Signal on completion.
+ * Per-process / not the wire format (the enclosing member is TEMP). Uses
+ * ctp::ipc::atomic so the Task POD layout is identical on host and device.
+ */
+struct FutureInfo {
+  ctp::ipc::atomic<u32> is_complete_;  /**< CPU/host completion signal */
+  u32 task_size_;                      /**< sizeof(concrete TaskT) */
+  u32 waiter_pid_;                     /**< PID of the thread awaiting completion */
+  u32 waiter_tid_;                     /**< TID of the thread awaiting completion */
+
+  CTP_CROSS_FUN FutureInfo() : task_size_(0), waiter_pid_(0), waiter_tid_(0) {
+    is_complete_.store(0);
+  }
+};
+
+/**
  * Base task class for CLIO Runtime distributed execution
  *
  * All tasks represent C++ functions similar to RPCs that can be executed
@@ -261,14 +287,12 @@ class Task {
       return_code_; /**< Task return code (0=success, non-zero=error) */
   OUT ctp::ipc::atomic<ContainerId>
       completer_; /**< Container ID that completed this task */
-  IN u32 pod_size_; /**< sizeof(TaskT) for POD copy transport */
-  /** Per-process CPU/host completion signal — set by the completing worker (or
-   *  the client's recv thread when the response lands), polled by the waiter;
-   *  managed by the Future. Deliberately NOT serialized or copied (per-process,
-   *  not the wire format) — like run_ctx_. ctp::ipc::atomic (not std::atomic) so
-   *  the Task POD layout stays identical on host and device. Replaces the old
-   *  FutureShm::flags_ FUTURE_COMPLETE on the CPU paths. */
-  TEMP ctp::ipc::atomic<u32> is_complete_;
+  /** Self-contained completion state: completion flag, sizeof(TaskT), and the
+   *  awaiting thread's pid/tid. TEMP — per-process, NOT serialized or copied
+   *  (like run_ctx_); for the GPU POD path it rides along in the memcpy'd Task
+   *  bytes. Replaces the separate (gpu::)FutureShm: the Task is its own future
+   *  completion record. (task_size_ replaces the former pod_size_.) */
+  TEMP FutureInfo fut_;
   /** Per-process "new streaming data available" signal (CPU streaming). Replaces
    *  FutureShm::flags_ FUTURE_NEW_DATA. Same not-serialized/not-copied rules. */
   TEMP ctp::ipc::atomic<u32> is_new_data_;
@@ -394,7 +418,7 @@ class Task {
   /**
    * Default constructor
    */
-  CTP_CROSS_FUN Task() { pod_size_ = 0; SetNull(); }
+  CTP_CROSS_FUN Task() { fut_.task_size_ = 0; SetNull(); }
 
   /**
    * Emplace constructor with task initialization
@@ -409,10 +433,10 @@ class Task {
     task_flags_.SetBits(0);
     pool_query_ = pool_query;
     period_ns_ = 0.0;
-    pod_size_ = 0;
+    fut_.task_size_ = 0;
     return_code_.store(0);  // Initialize as success
     completer_.store(0);    // Initialize as null (0 is invalid container ID)
-    is_complete_.store(0);
+    fut_.is_complete_.store(0);
     is_new_data_.store(0);
   }
 
@@ -452,7 +476,7 @@ class Task {
 #endif
     return_code_.store(0);  // Initialize as success
     completer_.store(0);    // Initialize as null (0 is invalid container ID)
-    is_complete_.store(0);
+    fut_.is_complete_.store(0);
     is_new_data_.store(0);
     task_group_ = TaskGroup();  // null group
   }
@@ -589,9 +613,19 @@ class Task {
 
   // Per-process completion / new-data signals (CPU/host paths). Managed by the
   // Future; replace FutureShm::flags_ FUTURE_COMPLETE / FUTURE_NEW_DATA.
-  CTP_CROSS_FUN void SetComplete() { is_complete_.store(1); }
-  CTP_CROSS_FUN void UnsetComplete() { is_complete_.store(0); }
-  CTP_CROSS_FUN bool IsComplete() const { return is_complete_.load() != 0; }
+  CTP_CROSS_FUN void SetComplete() { fut_.is_complete_.store(1); }
+  CTP_CROSS_FUN void UnsetComplete() { fut_.is_complete_.store(0); }
+  CTP_CROSS_FUN bool IsComplete() const { return fut_.is_complete_.load() != 0; }
+  /** sizeof(concrete TaskT) carried with the task (replaces pod_size_). */
+  CTP_CROSS_FUN u32 GetTaskSize() const { return fut_.task_size_; }
+  CTP_CROSS_FUN void SetTaskSize(u32 v) { fut_.task_size_ = v; }
+  /** Thread to wake (EventManager::Signal) when this task completes. */
+  CTP_CROSS_FUN u32 WaiterPid() const { return fut_.waiter_pid_; }
+  CTP_CROSS_FUN u32 WaiterTid() const { return fut_.waiter_tid_; }
+  CTP_CROSS_FUN void SetWaiter(u32 pid, u32 tid) {
+    fut_.waiter_pid_ = pid;
+    fut_.waiter_tid_ = tid;
+  }
   CTP_CROSS_FUN void SetNewData() { is_new_data_.store(1); }
   CTP_CROSS_FUN void UnsetNewData() { is_new_data_.store(0); }
   CTP_CROSS_FUN bool IsNewData() const { return is_new_data_.load() != 0; }
