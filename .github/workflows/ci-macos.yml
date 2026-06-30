@@ -1,0 +1,168 @@
+name: CI macOS
+
+# Consolidated macOS build-and-test pipeline (issue #649). One workflow per OS:
+# the real macOS unit-test build (formerly mac-test.yml — build-and-test.yml's
+# macOS half only built the conda package and never ran ctest) plus the
+# Boost.Context coroutine variant as a parallel job, replacing the macOS halves
+# of build-and-test.yml, mac-test.yml, and boost-coroutines.yml.
+# Runs on every PR and on push to main/dev (per #649 decision).
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-macos-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---- Standard build + ctest (arm64 + Intel, macOS 14 -> 26) ---------------
+  build-test:
+    name: build-test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-14         # arm64, macOS 14 (Sonoma)
+          - macos-15         # arm64, macOS 15 (Sequoia)
+          - macos-15-intel   # x86_64, macOS 15 (Sequoia)
+          - macos-26         # arm64, macOS 26 (Tahoe)
+          - macos-26-intel   # x86_64, macOS 26 (Tahoe)
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Install dependencies (conda)
+        run: |
+          chmod +x install.sh
+          ./install.sh --only-deps release
+
+      - name: Configure and build
+        run: |
+          set -x
+          # Re-activate the conda env created by install.sh (env vars do
+          # not persist across GitHub Actions steps).
+          if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
+            source "$HOME/miniconda3/etc/profile.d/conda.sh"
+          elif [ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]; then
+            source "$HOME/anaconda3/etc/profile.d/conda.sh"
+          elif command -v conda >/dev/null 2>&1; then
+            eval "$(conda shell.bash hook)"
+          fi
+          conda activate iowarp
+
+          export CMAKE_PREFIX_PATH="${CONDA_PREFIX}${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
+          export PKG_CONFIG_PATH="${CONDA_PREFIX}/lib/pkgconfig:${CONDA_PREFIX}/share/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+
+          # SITE/BUILDNAME label the CDash build (cnd = conda deps, d = debug).
+          cmake --preset=debug \
+            -DSITE="${{ matrix.os }}" \
+            -DBUILDNAME="cnd/d" \
+            -DCLIO_CORE_ENABLE_COVERAGE=OFF \
+            -DCLIO_CORE_ENABLE_CONDA=ON \
+            -DCLIO_CORE_ENABLE_DOCKER_CI=OFF \
+            -DCLIO_CTE_ENABLE_ADIOS2_ADAPTER=OFF \
+            -DCLIO_CTE_ENABLE_COMPRESS=OFF \
+            -DCLIO_CORE_ENABLE_GRAY_SCOTT=OFF
+
+          cmake --build build -- -j"$(sysctl -n hw.ncpu)"
+
+      - name: Run ctest
+        run: |
+          if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
+            source "$HOME/miniconda3/etc/profile.d/conda.sh"
+          elif [ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]; then
+            source "$HOME/anaconda3/etc/profile.d/conda.sh"
+          elif command -v conda >/dev/null 2>&1; then
+            eval "$(conda shell.bash hook)"
+          fi
+          conda activate iowarp
+
+          cd build
+          # -T Test writes the dashboard XML once for the CDash step. Retry
+          # intermittently-flaky in-process-runtime tests up to 3x (#482/#485).
+          ctest -T Test --output-on-failure --timeout 120 --repeat until-pass:3 \
+            -LE "integration|restart|functional|query|stress|docker" \
+            -E "cr_bdev_|cr_mpi_|cr_per_process_shm_stress"
+
+      - name: Submit results to CDash
+        if: always()
+        continue-on-error: true
+        run: |
+          if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
+            source "$HOME/miniconda3/etc/profile.d/conda.sh"
+          elif [ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]; then
+            source "$HOME/anaconda3/etc/profile.d/conda.sh"
+          elif command -v conda >/dev/null 2>&1; then
+            eval "$(conda shell.bash hook)"
+          fi
+          conda activate iowarp || true
+          cd build
+          ctest -T Submit || true
+
+      - name: Summarize failed tests
+        if: always()
+        run: |
+          LOG="build/Testing/Temporary/LastTest.log"
+          echo "## macOS test summary (${{ matrix.os }})" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f "$LOG" ]; then
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            grep -E "Test #|\*\*\*Failed|\*\*\*Exception|Passed|Failed" "$LOG" \
+              | grep -E "Failed|Exception" >> "$GITHUB_STEP_SUMMARY" || \
+              echo "(no failures parsed from LastTest.log)" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "(LastTest.log not found)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mac-test-logs-${{ matrix.os }}
+          path: |
+            build/Testing/Temporary/LastTest.log
+            build/Testing/Temporary/CTestCostData.txt
+          if-no-files-found: warn
+
+  # ---- Boost.Context stackful coroutine backend (#620) ----------------------
+  boost:
+    name: boost (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-15]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - name: Install dependencies (conda env, incl. Boost.Context)
+        run: |
+          chmod +x install.sh
+          ./install.sh --only-deps release
+      - name: Build with Boost backend + run ctest
+        run: |
+          if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
+            source "$HOME/miniconda3/etc/profile.d/conda.sh"
+          elif [ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]; then
+            source "$HOME/anaconda3/etc/profile.d/conda.sh"
+          elif command -v conda &>/dev/null; then
+            eval "$(conda shell.bash hook)"
+          fi
+          conda activate iowarp
+          cmake --preset boost
+          cmake --build build-boost -j"$(sysctl -n hw.ncpu)"
+          # #619's fallback-runtime punting has no macOS support yet (#634);
+          # those cases are excluded until it lands.
+          ctest --test-dir build-boost --output-on-failure --timeout 180 --repeat until-pass:3 \
+            -LE "ollama" -E "cr_cli_cte_fallback|cr_cli_fallback_runtime"

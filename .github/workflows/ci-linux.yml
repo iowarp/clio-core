@@ -1,0 +1,208 @@
+name: CI Linux
+
+# Consolidated Linux build-and-test pipeline (issue #649). One workflow per OS:
+# the standard release+coverage build plus every Linux flag-variant as a
+# parallel job in the SAME workflow, replacing four separate files —
+#   build-and-test.yml (Linux half), boost-coroutines.yml (docker/linux/arm),
+#   sanitizers.yml (asan/ubsan/msan), and leak-check.yml.
+# All variants run on every PR and on push to main/dev (per #649 decision).
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-linux-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---- Standard release build + ctest + coverage (amd64, arm64) -------------
+  build-test:
+    name: build-test (${{ matrix.flags }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            site: ubu-24.amd64
+            flags: amd64
+          - os: ubuntu-24.04-arm
+            site: ubu-24.arm64
+            flags: arm64
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - name: Install lcov
+        run: sudo apt-get update && sudo apt-get install -y lcov
+      - name: Build and test using install.sh
+        run: |
+          chmod +x install.sh
+          ./install.sh
+      - name: Calculate coverage
+        run: |
+          if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
+            source "$HOME/miniconda3/etc/profile.d/conda.sh"
+          elif [ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]; then
+            source "$HOME/anaconda3/etc/profile.d/conda.sh"
+          elif command -v conda &>/dev/null; then
+            eval "$(conda shell.bash hook)"
+          fi
+          conda activate iowarp
+          ./CI/calculate_coverage.sh --build --run-ctest --clean --site ${{ matrix.site }}
+      - name: Upload coverage to Codecov
+        if: always()
+        uses: codecov/codecov-action@v5
+        with:
+          files: build/coverage_filtered.info
+          flags: ${{ matrix.flags }}
+          token: ${{ secrets.CODECOV_TOKEN }}
+          slug: iowarp/clio-core
+
+  # ---- Boost.Context stackful coroutine backend (#620) ----------------------
+  # Docker (deps-cpu) is the canonical reproducible build; native + arm64 cover
+  # the io_uring path the container seccomp profile blocks, and the arm64 memory
+  # model.
+  boost-docker:
+    name: boost (docker deps-cpu)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - name: Build with Boost backend + run ctest (inside deps-cpu)
+        run: |
+          docker run --rm -v "${{ github.workspace }}":/workspace -w /workspace -u 0 \
+            iowarp/deps-cpu:latest bash -c '
+              set -e
+              export LD_LIBRARY_PATH=/usr/local/lib:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
+              export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/lib/x86_64-linux-gnu/pkgconfig:$PKG_CONFIG_PATH
+              git config --global --add safe.directory /workspace
+              (dpkg -s libboost-context-dev >/dev/null 2>&1) || \
+                (apt-get update -qq && apt-get install -y -qq libboost-context-dev libboost-dev)
+              cmake --preset boost
+              cmake --build build-boost -j"$(nproc)"
+              cd build-boost
+              ctest --output-on-failure --timeout 180 --repeat until-pass:3 -LE "ollama" -E "ctp_async_io"
+            '
+
+  boost-native:
+    name: boost (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - name: Install system libraries
+        run: sudo apt-get update && sudo apt-get install -y libhdf5-dev liburing-dev
+      - name: Install dependencies (conda env, incl. Boost.Context)
+        run: |
+          chmod +x install.sh
+          ./install.sh --only-deps
+      - name: Build with Boost backend + run ctest
+        run: |
+          if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
+            source "$HOME/miniconda3/etc/profile.d/conda.sh"
+          elif [ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]; then
+            source "$HOME/anaconda3/etc/profile.d/conda.sh"
+          elif command -v conda &>/dev/null; then
+            eval "$(conda shell.bash hook)"
+          fi
+          conda activate iowarp
+          cmake --preset boost
+          cmake --build build-boost -j"$(nproc)"
+          ctest --test-dir build-boost --output-on-failure --timeout 180 --repeat until-pass:3 -LE "ollama"
+
+  # ---- Sanitizers: asan / ubsan / msan --------------------------------------
+  sanitizers:
+    name: sanitizer (${{ matrix.sanitizer }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [asan, ubsan, msan]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - name: Install sanitizer runtime libraries (ASan/UBSan)
+        if: matrix.sanitizer != 'msan'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasan8 libubsan1 libhdf5-dev
+      - name: Install Clang for MSan
+        if: matrix.sanitizer == 'msan'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm libhdf5-dev
+      - name: Build and test with ${{ matrix.sanitizer }}
+        run: |
+          chmod +x install.sh CI/run_sanitizers.sh
+          ./install.sh
+          if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
+            source "$HOME/miniconda3/etc/profile.d/conda.sh"
+          elif [ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]; then
+            source "$HOME/anaconda3/etc/profile.d/conda.sh"
+          elif command -v conda &>/dev/null; then
+            eval "$(conda shell.bash hook)"
+          fi
+          conda activate iowarp
+          ./CI/run_sanitizers.sh \
+            --${{ matrix.sanitizer }} \
+            --build \
+            --site "ubu-24.amd64"
+
+  # ---- Leak check (gating allocation-leak detection, #560/#563) -------------
+  leak-check:
+    name: leak-check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - name: Install system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libhdf5-dev liburing-dev
+      - name: Install dependencies (conda env)
+        run: |
+          chmod +x install.sh
+          ./install.sh --only-deps
+      - name: Build with leak tracking and run leak tests
+        run: |
+          if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
+            source "$HOME/miniconda3/etc/profile.d/conda.sh"
+          elif [ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]; then
+            source "$HOME/anaconda3/etc/profile.d/conda.sh"
+          elif command -v conda &>/dev/null; then
+            eval "$(conda shell.bash hook)"
+          fi
+          conda activate iowarp
+          cmake --preset=leak-check
+          cmake --build build-leak -j"$(nproc)"
+          # In a leak-tracking build every test auto-checks that the runtime
+          # private heap returns to its pre-test level. Run the calibrated
+          # force-net suites + the per-RPC leak test. cte_tag_force_net /
+          # cte_query_force_net are excluded (pre-existing CI-only hang, #579).
+          ctest --test-dir build-leak \
+            -R "leak|cr_streaming_force_net|cte_.*force_net" \
+            -E "cte_tag_force_net|cte_query_force_net" \
+            --output-on-failure --no-tests=error
