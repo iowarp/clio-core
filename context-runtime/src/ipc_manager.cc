@@ -2971,6 +2971,13 @@ RouteResult IpcManager::RouteManyToOne(Future<Task> &future) {
     // bind in RouteGlobal; the batch path skips ProcessNewTask, which is the
     // only other place RunFuture is bound.
     task_ptr->RunFuture() = future;
+    // Drop the Future's strong back-reference to this very task. The bind above
+    // exists only to keep the FutureShm alive for the response, but the copied
+    // task_ptr_ points at task_ptr itself, forming a
+    // task -> RunContext -> future_ -> task_ptr_ -> task cycle that leaks the
+    // task after the batch completes (the batch holds it by raw pointer, so
+    // nothing else recycles it). The response path reads only GetFutureShm().
+    task_ptr->RunFuture().GetTaskPtr().reset();
     task_ptr->SetRouted();
     batch_manager_->Add(task_ptr);
     return RouteResult::Local;
@@ -3138,6 +3145,11 @@ RouteResult IpcManager::RouteGlobal(Future<Task> &future,
   // hanging the waiting client. ProcessNewTask binds RunFuture for locally
   // executed tasks; net-routed tasks skip ProcessNewTask, so bind it here.
   task_ptr->RunFuture() = future;
+  // Drop the Future's strong self-reference: the copied task_ptr_ points at
+  // task_ptr itself, forming a task -> RunContext -> future_ -> task_ptr_ cycle
+  // that leaks the origin task after send_map_ erases it (run2run holds it by
+  // raw pointer). Only the FutureShm is needed for the response.
+  task_ptr->RunFuture().GetTaskPtr().reset();
 
   // Pick the latency vs I/O SendIn lane based on the task's actual
   // payload size — small probes / metadata sit on kSendInLatency so
