@@ -645,7 +645,7 @@ TEST_CASE("bdev_performance_metrics", "[bdev][performance][metrics]") {
     // [INJECTED] Trigger the bdev Monitor with "stats" to hit our prediction server
     {
       HLOG(kInfo, "Triggering bdev Monitor(stats) to test Prediction Server Integration...");
-      auto monitor_task = client.AsyncMonitor(chi::PoolQuery::Local(), "stats");
+      auto monitor_task = client.AsyncMonitor(clio::run::PoolQuery::Local(), "stats");
       monitor_task.Wait();
       if (!monitor_task->results_.empty()) {
         HLOG(kInfo, "Prediction server hook fired! bdev Monitor returned {} result entries",
