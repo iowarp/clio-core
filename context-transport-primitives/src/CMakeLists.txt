@@ -41,8 +41,11 @@ target_link_libraries(clio_ctp_host PUBLIC
     ${REAL_TIME_FLAGS}
     configure
     thread_all
-    curl
 )
+if(CURL_FOUND)
+    target_link_libraries(clio_ctp_host PUBLIC CURL::libcurl)
+    target_compile_definitions(clio_ctp_host PUBLIC CTP_HAS_CURL=1)
+endif()
 if(WIN32)
     target_link_libraries(clio_ctp_host PUBLIC ws2_32)
 endif()
