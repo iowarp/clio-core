@@ -92,12 +92,10 @@ bool PoolManager::ServerInit() {
       PoolQuery::Local(), "clio_admin", "admin", kAdminPoolId,
       nullptr);  // No client for internal admin pool creation
 
-  RunContext run_ctx;
-
   // CreatePool is now a coroutine - we need to run it to completion
   // For admin pool creation during ServerInit, the coroutine won't yield
   // (admin Create doesn't co_await anything), so we can run it synchronously
-  TaskResume task_resume = CreatePool(admin_task.Cast<Task>(), &run_ctx);
+  TaskResume task_resume = CreatePool(admin_task.Cast<Task>());
   auto handle = task_resume.release();
   if (handle) {
     // Run the coroutine to completion
@@ -106,7 +104,6 @@ bool PoolManager::ServerInit() {
     if (!handle.done()) {
       HLOG(kError, "PoolManager: Admin pool creation coroutine didn't complete");
       handle.destroy();
-      ipc_manager->DelTask(admin_task);
       return false;
     }
     handle.destroy();
@@ -115,7 +112,6 @@ bool PoolManager::ServerInit() {
   // Check if pool creation succeeded by examining the task return code
   if (admin_task->GetReturnCode() != 0) {
     // Cleanup the task we created
-    ipc_manager->DelTask(admin_task);
     HLOG(kError,
          "PoolManager: Failed to create admin chimod pool during ServerInit");
     return false;
@@ -125,7 +121,6 @@ bool PoolManager::ServerInit() {
   admin_pool_id = admin_task->new_pool_id_;
 
   // Cleanup the task after successful pool creation
-  ipc_manager->DelTask(admin_task);
 
   HLOG(kInfo,
        "PoolManager: Admin chimod pool created successfully with PoolId {}",
@@ -160,14 +155,14 @@ void PoolManager::DestroyAllContainers() {
   for (auto &pair : pool_metadata_) {
     PoolInfo &info = pair.second;
     for (auto &cpair : info.containers_) {
-      if (cpair.second) {
-        module_manager->DestroyContainer(info.chimod_name_, cpair.second);
+      if (ContainerHold c = cpair.second.get()) {
+        c.Destroy(info.chimod_name_);
         ++destroyed;
       }
     }
     info.containers_.clear();
-    info.static_container_ = nullptr;
-    info.local_container_ = nullptr;
+    info.static_container_ = DynamicContainer();
+    info.local_container_ = DynamicContainer();
   }
   if (destroyed > 0) {
     HLOG(kInfo, "PoolManager: Destroyed {} container(s) on shutdown", destroyed);
@@ -187,8 +182,8 @@ void PoolManager::Finalize() {
     PoolMetaWriteLock lock(pool_metadata_mutex_);
     for (auto &pair : pool_metadata_) {
       pair.second.containers_.clear();
-      pair.second.static_container_ = nullptr;
-      pair.second.local_container_ = nullptr;
+      pair.second.static_container_ = DynamicContainer();
+      pair.second.local_container_ = DynamicContainer();
     }
     pool_metadata_.clear();
   }
@@ -197,8 +192,8 @@ void PoolManager::Finalize() {
 }
 
 bool PoolManager::RegisterContainer(PoolId pool_id, ContainerId container_id,
-                                     Container* container, bool is_static) {
-  if (!is_initialized_ || container == nullptr) {
+                                     DynamicContainer container, bool is_static) {
+  if (!is_initialized_ || !container) {
     return false;
   }
 
@@ -209,13 +204,16 @@ bool PoolManager::RegisterContainer(PoolId pool_id, ContainerId container_id,
   }
 
   PoolInfo &info = it->second;
+  // Publish the (already-built) DynamicContainer handle. Copies are by value, so
+  // any handle already cached in a RunContext keeps pointing at the same
+  // ModuleManager-owned container. Store is serialized by pool_metadata_mutex_.
   info.containers_[container_id] = container;
 
-  if (is_static || info.static_container_ == nullptr) {
-    info.static_container_ = container;
+  if (is_static || !info.static_container_.IsValid()) {
+    info.static_container_ = info.containers_[container_id];
   }
-  if (info.local_container_ == nullptr) {
-    info.local_container_ = container;
+  if (!info.local_container_.IsValid()) {
+    info.local_container_ = info.containers_[container_id];
   }
 
   return true;
@@ -238,12 +236,12 @@ bool PoolManager::UnregisterContainer(PoolId pool_id, ContainerId container_id) 
     return false;
   }
 
-  Container *removed = cit->second;
+  ContainerHold removed = cit->second.get();
   info.containers_.erase(cit);
 
   // static_container_ is never modified after pool creation — it is a
   // persistent reference used for stateless operations (task deserialization).
-  if (info.local_container_ == removed) {
+  if (info.local_container_.get() == removed) {
     info.RecalculateLocalContainer();
   }
 
@@ -263,72 +261,84 @@ void PoolManager::UnregisterAllContainers(PoolId pool_id) {
 
   PoolInfo &info = it->second;
   info.containers_.clear();
-  info.static_container_ = nullptr;
-  info.local_container_ = nullptr;
+  info.static_container_ = DynamicContainer();
+  info.local_container_ = DynamicContainer();
 }
 
-Container* PoolManager::GetContainer(PoolId pool_id, ContainerId container_id,
-                                      bool &is_plugged) const {
-  is_plugged = false;
+DynamicContainer PoolManager::GetContainer(PoolId pool_id,
+                                           ContainerId container_id) const {
   if (!is_initialized_) {
-    return nullptr;
+    return DynamicContainer();
   }
 
   PoolMetaReadLock lock(pool_metadata_mutex_);
   auto it = pool_metadata_.find(pool_id);
   if (it == pool_metadata_.end()) {
-    return nullptr;
+    return DynamicContainer();
   }
 
   const PoolInfo &info = it->second;
-  Container *container = nullptr;
   if (container_id != kInvalidContainerId) {
     auto cit = info.containers_.find(container_id);
     if (cit != info.containers_.end()) {
-      container = cit->second;
+      return cit->second;  // copy the handle (shared_ptr refcount bump)
     }
   }
-  if (!container) {
-    container = info.local_container_;
-  }
-  if (container) {
-    is_plugged = container->IsPlugged();
-  }
-  return container;
+  return info.local_container_;  // copy (may be invalid)
 }
 
-Container* PoolManager::GetContainerRaw(PoolId pool_id, ContainerId container_id) const {
+DynamicContainer PoolManager::GetContainerRaw(PoolId pool_id,
+                                              ContainerId container_id) const {
   if (!is_initialized_) {
-    return nullptr;
+    return DynamicContainer();
   }
 
   PoolMetaReadLock lock(pool_metadata_mutex_);
   auto it = pool_metadata_.find(pool_id);
   if (it == pool_metadata_.end()) {
-    return nullptr;
+    return DynamicContainer();
   }
 
   const PoolInfo &info = it->second;
   auto cit = info.containers_.find(container_id);
-  return (cit != info.containers_.end()) ? cit->second : nullptr;
+  return (cit != info.containers_.end()) ? cit->second : DynamicContainer();
 }
 
-Container* PoolManager::GetStaticContainer(PoolId pool_id) const {
+DynamicContainer PoolManager::GetStaticContainer(PoolId pool_id) const {
   if (!is_initialized_) {
-    return nullptr;
+    return DynamicContainer();
   }
 
   PoolMetaReadLock lock(pool_metadata_mutex_);
   auto it = pool_metadata_.find(pool_id);
   if (it == pool_metadata_.end()) {
-    return nullptr;
+    return DynamicContainer();
   }
 
   return it->second.static_container_;
 }
 
+DynamicContainer PoolManager::GetRealOrStaticContainer(PoolId pool_id) const {
+  if (!is_initialized_) {
+    return DynamicContainer();
+  }
+
+  PoolMetaReadLock lock(pool_metadata_mutex_);
+  auto it = pool_metadata_.find(pool_id);
+  if (it == pool_metadata_.end()) {
+    return DynamicContainer();
+  }
+
+  // Prefer the real (local) container if this node hosts one; fall back to the
+  // static container otherwise.
+  const PoolInfo &info = it->second;
+  return info.local_container_.IsValid() ? info.local_container_
+                                         : info.static_container_;
+}
+
 void PoolManager::PlugContainer(PoolId pool_id, ContainerId container_id) {
-  Container *container = GetContainerRaw(pool_id, container_id);
+  DynamicContainer dc = GetContainerRaw(pool_id, container_id);
+  ContainerHold container = dc.get();
   if (!container) {
     return;
   }
@@ -495,13 +505,7 @@ void PoolManager::InitAddressMap(PoolId pool_id, u32 num_containers) {
   HLOG(kDebug, "=== Address Map Complete ===");
 }
 
-TaskResume PoolManager::CreatePool(FullPtr<Task> task, RunContext* run_ctx) {
-  // Fiber backends (NVHPC / Boost): create a RunContext reference alias so the
-  // CLIO_TASK_BODY_BEGIN lambda can capture it by reference (the macro uses
-  // [=, &rctx]). The C++20 stackless macro is empty and needs no rctx.
-#ifdef CLIO_ENABLE_BOOST_COROUTINES
-  RunContext& rctx = *run_ctx;
-#endif
+TaskResume PoolManager::CreatePool(clio::run::shared_ptr<Task> &task) {
   CLIO_TASK_BODY_BEGIN
   if (!is_initialized_) {
     HLOG(kError, "PoolManager: Not initialized for pool creation");
@@ -511,7 +515,7 @@ TaskResume PoolManager::CreatePool(FullPtr<Task> task, RunContext* run_ctx) {
   // Cast generic Task to BaseCreateTask to access pool operation parameters
   auto* create_task = reinterpret_cast<
       clio::run::admin::BaseCreateTask<clio::run::admin::CreateParams>*>(
-      task.ptr_);
+      task.get());
 
   // Debug: Log do_compose_ value after cast
   HLOG(kDebug, "PoolManager::CreatePool: After cast, do_compose_={}, is_admin_={}",
@@ -593,13 +597,13 @@ TaskResume PoolManager::CreatePool(FullPtr<Task> task, RunContext* run_ctx) {
     CLIO_CO_RETURN;
   }
 
-  Container* container = nullptr;
+  DynamicContainer container;
   auto* ipc_manager2 = CLIO_IPC;
   u32 node_id = ipc_manager2->GetNodeId();
   try {
-    // Create container
-    container =
-        module_manager->CreateContainer(chimod_name, target_pool_id, pool_name);
+    // Create container in-place via the ModuleManager (DynamicContainer builds
+    // its ContainerHold from the chimod/pool identity).
+    container = DynamicContainer(chimod_name, target_pool_id, pool_name);
     if (!container) {
       HLOG(kError, "PoolManager: Failed to create container for ChiMod: {}",
            chimod_name);
@@ -626,33 +630,26 @@ TaskResume PoolManager::CreatePool(FullPtr<Task> task, RunContext* run_ctx) {
     // Initialize container with pool ID, name, and container ID
     if (is_restart) {
       HLOG(kInfo, "PoolManager: Restart detected for pool {}, calling Restart()", pool_name);
-      container->Restart(target_pool_id, pool_name, node_id);
+      container.get()->Restart(target_pool_id, pool_name, node_id);
     } else {
-      container->Init(target_pool_id, pool_name, node_id);
+      container.get()->Init(target_pool_id, pool_name, node_id);
     }
 
     // Apply per-RPC access control now that the module's Init has populated the
     // method-name table (via SetMethodNames). Defaults (public, no overrides)
     // make this a no-op for pools that don't opt in.
-    container->ConfigureAcl(pool_config.container_visibility_,
-                            pool_config.rpc_acl_);
-
-    // pool_external: this is a stub for a pool hosted on the fallback runtime.
-    // Mark it external (tasks targeting it are punted to the fallback) and skip
-    // running its Create method below — the real resources live on the fallback.
-    container->SetExternal(pool_config.external_);
+    container.get()->ConfigureAcl(pool_config.container_visibility_,
+                                  pool_config.rpc_acl_);
 
     HLOG(kInfo,
-         "Container initialized with pool ID {}, name {}, and container ID {} "
-         "(external={})",
-         target_pool_id, pool_name, container->container_id_,
-         pool_config.external_);
+         "Container initialized with pool ID {}, name {}, and container ID {}",
+         target_pool_id, pool_name, container.get()->container_id_);
 
     // Register the container BEFORE running Create method
     // This allows Create to spawn tasks that can find this container in the map
     if (!RegisterContainer(target_pool_id, node_id, container, /*is_static=*/true)) {
       HLOG(kError, "PoolManager: Failed to register container");
-      module_manager->DestroyContainer(chimod_name, container);
+      container.get().Destroy(chimod_name);
       ErasePoolMetadata(target_pool_id);
       CLIO_CO_RETURN;
     }
@@ -663,30 +660,20 @@ TaskResume PoolManager::CreatePool(FullPtr<Task> task, RunContext* run_ctx) {
     // By using co_await, we properly suspend and resume, allowing the worker
     // to process nested tasks while we wait.
     //
-    // External stubs skip Create entirely: the real container (and its
-    // resources) live on the fallback runtime, so there is nothing to allocate
-    // here — running Create would build local resources we never use.
-    if (!pool_config.external_) {
-      HLOG(kInfo, "CreatePool: Running Create method for pool {}",
-           target_pool_id);
-      CLIO_CO_AWAIT(container->Run(0, task, *run_ctx));  // Method::kCreate = 0
-      HLOG(kInfo, "CreatePool: Create method completed for pool {}",
-           target_pool_id);
+    HLOG(kInfo, "CreatePool: Running Create method for pool {}",
+         target_pool_id);
+    CLIO_CO_AWAIT(container.get()->Run(0, task));  // Method::kCreate = 0
+    HLOG(kInfo, "CreatePool: Create method completed for pool {}",
+         target_pool_id);
 
-      if (task->GetReturnCode() != 0) {
-        HLOG(kError, "PoolManager: Failed to create container for ChiMod: {}",
-             chimod_name);
-        // Unregister the container since Create failed
-        UnregisterContainer(target_pool_id, node_id);
-        module_manager->DestroyContainer(chimod_name, container);
-        ErasePoolMetadata(target_pool_id);
-        CLIO_CO_RETURN;
-      }
-    } else {
-      HLOG(kInfo,
-           "CreatePool: pool {} is external (hosted on fallback runtime); "
-           "skipping local Create",
-           target_pool_id);
+    if (task->GetReturnCode() != 0) {
+      HLOG(kError, "PoolManager: Failed to create container for ChiMod: {}",
+           chimod_name);
+      // Unregister the container since Create failed
+      UnregisterContainer(target_pool_id, node_id);
+      container.get().Destroy(chimod_name);
+      ErasePoolMetadata(target_pool_id);
+      CLIO_CO_RETURN;
     }
 
     // GPU container allocation removed along with the GPU runtime.
@@ -699,7 +686,7 @@ TaskResume PoolManager::CreatePool(FullPtr<Task> task, RunContext* run_ctx) {
     if (container) {
       // Unregister if it was registered before the exception
       UnregisterContainer(target_pool_id, node_id);
-      module_manager->DestroyContainer(chimod_name, container);
+      container.get().Destroy(chimod_name);
     }
     ErasePoolMetadata(target_pool_id);
     CLIO_CO_RETURN;
@@ -718,13 +705,6 @@ TaskResume PoolManager::CreatePool(FullPtr<Task> task, RunContext* run_ctx) {
 }
 
 TaskResume PoolManager::DestroyPool(PoolId pool_id) {
-  // Fiber backends (NVHPC / Boost): provide a dummy RunContext reference so the
-  // CLIO_TASK_BODY_BEGIN lambda can compile (the macro captures rctx by ref,
-  // but we never use it). The C++20 stackless macro is empty and needs no rctx.
-#ifdef CLIO_ENABLE_BOOST_COROUTINES
-  clio::run::RunContext _dummy_rctx;
-  clio::run::RunContext& rctx = _dummy_rctx;
-#endif
   CLIO_TASK_BODY_BEGIN
   if (!is_initialized_) {
     HLOG(kError, "PoolManager: Not initialized for pool destruction");

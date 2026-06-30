@@ -111,8 +111,8 @@ struct CustomTask : public clio::run::Task {
     pool_query_ = pool_query;
   }
 
-  /** Destructor */
-  ~CustomTask() {
+  /** Destructor (cross-fun to match the cross-fun virtual base Task dtor) */
+  CTP_CROSS_FUN ~CustomTask() {
   }
 
   /**
@@ -187,7 +187,7 @@ struct ManyToOneSumTask : public clio::run::Task {
     pool_query_ = pool_query;
   }
 
-  ~ManyToOneSumTask() {}
+  CTP_CROSS_FUN ~ManyToOneSumTask() {}
 
   template <typename Archive>
   CTP_CROSS_FUN void SerializeIn(Archive &ar) {

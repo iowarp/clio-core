@@ -55,9 +55,9 @@ class LocalScheduler : public Scheduler {
   void DivideWorkers(WorkOrchestrator *work_orch) override;
   u32 ClientMapTask(IpcManager *ipc_manager, const Future<Task> &task) override;
   u32 RuntimeMapTask(Worker *worker, const Future<Task> &task,
-                     Container *container) override;
+                     ContainerHold container) override;
   void RebalanceWorker(Worker *worker) override;
-  void AdjustPolling(RunContext *run_ctx) override;
+  void AdjustPolling(const clio::run::shared_ptr<Task> &task) override;
   Worker *GetGpuWorker() const override { return gpu_worker_; }
   Worker *GetNetWorker() const override { return net_worker_; }
 

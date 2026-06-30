@@ -40,6 +40,7 @@
 #include <atomic>
 #include <shared_mutex>
 #include "clio_runtime/types.h"
+#include "clio_runtime/dynamic_container.h"
 
 namespace clio::run {
 
@@ -61,15 +62,17 @@ struct PoolInfo {
   u32 num_containers_;
   bool is_active_;
 
-  /** Containers on THIS node (ContainerId -> Container*) */
-  std::unordered_map<ContainerId, Container*> containers_;
+  /** Containers on THIS node (ContainerId -> DynamicContainer). Each entry is
+      a by-value handle sharing one ContainerPtr; copies handed out by
+      GetContainer stay valid even if the entry is later erased. */
+  std::unordered_map<ContainerId, DynamicContainer> containers_;
   /** ALL container address mappings across cluster (ContainerId -> NodeId) */
   std::unordered_map<ContainerId, u32> address_map_;
   /** Static container for stateless APIs (alloc, serialize, deserialize tasks) */
-  Container* static_container_ = nullptr;
+  DynamicContainer static_container_;
   /** Local (default) container for this node. Initially static_container_.
       When migrated away, another from containers_ is chosen. If none, falls back to static. */
-  Container* local_container_ = nullptr;
+  DynamicContainer local_container_;
   /** GPU device pointer to gpu::Container (nullptr if no GPU companion) */
   void* gpu_container_ptr_ = nullptr;
 
@@ -132,7 +135,7 @@ class PoolManager {
    * @return true if registration successful, false otherwise
    */
   bool RegisterContainer(PoolId pool_id, ContainerId container_id,
-                          Container* container, bool is_static = false);
+                          DynamicContainer container, bool is_static = false);
 
   /**
    * Unregister a specific Container
@@ -156,22 +159,31 @@ class PoolManager {
   void PlugContainer(PoolId pool_id, ContainerId container_id);
 
   /**
-   * Get Container by PoolId and ContainerId, with plug state
+   * Get a DynamicContainer handle by PoolId and ContainerId.
    * If container_id is kInvalidContainerId, falls back to local container.
+   * Callers check the result with DynamicContainer::IsValid()/IsPlugged().
    * @param pool_id Pool identifier
    * @param container_id Container identifier
-   * @param is_plugged Output: true if the container is plugged
-   * @return Pointer to Container or nullptr if not found
+   * @return DynamicContainer handle (invalid if not found)
    */
-  Container* GetContainer(PoolId pool_id, ContainerId container_id,
-                           bool &is_plugged) const;
+  DynamicContainer GetContainer(PoolId pool_id, ContainerId container_id) const;
 
   /**
-   * Get the static container for a pool (for stateless ops: alloc, serialize, etc.)
+   * Get the static container for a pool (for stateless ops: alloc, serialize,
+   * deserialize). Returns the by-value DynamicContainer handle; stateless
+   * callers deref it via operator-> / current().
    * @param pool_id Pool identifier
-   * @return Pointer to static Container or nullptr if not found
+   * @return DynamicContainer handle to the static container (invalid if not found)
    */
-  Container* GetStaticContainer(PoolId pool_id) const;
+  DynamicContainer GetStaticContainer(PoolId pool_id) const;
+
+  /**
+   * Get the real (local) container for a pool if this node hosts one, falling
+   * back to the static container otherwise.
+   * @param pool_id Pool identifier
+   * @return DynamicContainer handle (invalid if the pool is unknown)
+   */
+  DynamicContainer GetRealOrStaticContainer(PoolId pool_id) const;
 
   /**
    * Check if pool exists on this node
@@ -233,10 +245,9 @@ class PoolManager {
    * Extracts all parameters from the task (chimod_name, pool_name, chimod_params)
    * This is a coroutine that can co_await nested Create methods
    * @param task Task containing pool creation parameters (updated with final pool ID)
-   * @param run_ctx RunContext for container initialization
    * @return TaskResume coroutine handle
    */
-  TaskResume CreatePool(FullPtr<Task> task, RunContext* run_ctx);
+  TaskResume CreatePool(clio::run::shared_ptr<Task> &task);
 
 
   /**
@@ -309,12 +320,13 @@ class PoolManager {
 
  private:
   /**
-   * Internal: Get Container by PoolId and ContainerId (no plug check)
+   * Internal: Get a DynamicContainer by PoolId and ContainerId (no fallback to
+   * local container; no plug check)
    * @param pool_id Pool identifier
    * @param container_id Container identifier
-   * @return Pointer to Container or nullptr if not found
+   * @return DynamicContainer handle (invalid if not found)
    */
-  Container* GetContainerRaw(PoolId pool_id, ContainerId container_id) const;
+  DynamicContainer GetContainerRaw(PoolId pool_id, ContainerId container_id) const;
 
   /**
    * Internal: erase a pool's metadata entry under the write lock. Used by the

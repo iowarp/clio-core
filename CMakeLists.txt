@@ -1158,6 +1158,22 @@ if(CLIO_CORE_ENABLE_TESTS)
           TIMEOUT 30
           FIXTURES_CLEANUP clio_test_cleanup_fixture
       )
+
+      # Pre-allow every test binary through Windows Defender Firewall so ctest
+      # doesn't pop a per-binary "Allow access?" prompt. The script self-elevates
+      # only when new binaries appear (it caches the allowed set in a marker), so
+      # a normal "build once, run ctest repeatedly" loop triggers at most one UAC
+      # prompt right after a fresh build. It is best-effort (always exits 0), and
+      # is a SETUP for the shared fixture so it runs before any networked test.
+      add_test(
+          NAME cr_firewall_allow
+          COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+                  -File "${CMAKE_SOURCE_DIR}/scripts/windows/allow_firewall.ps1"
+      )
+      set_tests_properties(cr_firewall_allow PROPERTIES
+          TIMEOUT 300
+          FIXTURES_SETUP clio_test_cleanup_fixture
+      )
     endif()
 endif()
 

@@ -47,7 +47,6 @@
 #include <vector>
 
 #include "clio_runtime/container.h"
-#include "clio_runtime/ipc/ipc_run2fallback.h"
 #include "clio_runtime/pool_query.h"
 #include "clio_runtime/task.h"
 #include "clio_runtime/types.h"
@@ -117,7 +116,7 @@ struct WorkerStats {
 // This macro allows access to the current worker from any thread
 // Example usage in ChiMod container code:
 //   Worker* worker = CLIO_CUR_WORKER;
-//   FullPtr<Task> current_task = worker->GetCurrentTask();
+//   clio::run::shared_ptr<Task> current_task = worker->GetCurrentTask();
 //   RunContext* run_ctx = worker->GetCurrentRunContext();
 #define CLIO_CUR_WORKER \
   (CTP_THREAD_MODEL->GetTls<clio::run::Worker>(clio::run::chi_cur_worker_key_))
@@ -170,6 +169,9 @@ class Worker {
    */
   u32 GetId() const;
 
+  /** OS thread id of this worker (valid once Run() has started). #642 */
+  u32 GetTid() const { return tid_; }
+
   /**
    * Get the event queue for this worker
    * @return Pointer to this worker's event queue
@@ -183,29 +185,17 @@ class Worker {
   bool IsRunning() const;
 
   /**
-   * Get current RunContext for this worker thread
-   * @return Pointer to current RunContext or nullptr
+   * Set the task currently executing on this worker thread (the worker sets
+   * this before every Run/resume so handlers can reach it via GetCurrentTask).
+   * @param task The executing task (null to clear)
    */
-  RunContext *GetCurrentRunContext() const;
+  void SetCurrentTask(const clio::run::shared_ptr<Task> &task);
 
   /**
-   * Set current RunContext for this worker thread
-   * @param rctx Pointer to RunContext to set as current
-   * @return Pointer to the set RunContext
+   * Get the task currently executing on this worker thread.
+   * @return Reference to the current task handle (null if idle)
    */
-  RunContext *SetCurrentRunContext(RunContext *rctx);
-
-  /**
-   * Get current task from the current RunContext
-   * @return FullPtr to current task or null if no RunContext
-   */
-  FullPtr<Task> GetCurrentTask() const;
-
-  /**
-   * Get current container from the current RunContext
-   * @return Pointer to current container or nullptr if no RunContext
-   */
-  Container *GetCurrentContainer() const;
+  clio::run::shared_ptr<Task> &GetCurrentTask();
 
   /**
    * Get current lane from the current RunContext
@@ -248,29 +238,27 @@ class Worker {
   ctp::lbm::EventManager& GetEventManager();
 
   /**
-   * Add run context to blocked queue based on block count
-   * @param run_ctx_ptr Pointer to run context (task accessible via
-   * run_ctx_ptr->task)
+   * Add a task to the blocked queue based on block count
+   * @param task The blocked task
    * @param wait_for_task If true, do not add to blocked queue (task is waiting
    * for subtask completion)
    */
-  void AddToBlockedQueue(RunContext *run_ctx_ptr, bool wait_for_task = false);
+  void AddToBlockedQueue(const clio::run::shared_ptr<Task> &task,
+                         bool wait_for_task = false);
 
   /**
    * Add a task to the retry queue (container migrated or plugged)
-   * @param run_ctx_ptr Pointer to RunContext for the task
+   * @param task The task to retry
    */
-  void AddToRetryQueue(RunContext *run_ctx_ptr);
+  void AddToRetryQueue(const clio::run::shared_ptr<Task> &task);
 
   /**
    * Reschedule a periodic task for next execution
    * Checks if lane still maps to this worker - if so, adds to blocked queue
    * Otherwise, reschedules task back to the lane
-   * @param run_ctx_ptr Pointer to run context
    * @param task_ptr Full pointer to the periodic task
    */
-  void ReschedulePeriodicTask(RunContext *run_ctx_ptr,
-                              const FullPtr<Task> &task_ptr);
+  void ReschedulePeriodicTask(clio::run::shared_ptr<Task> &task_ptr);
 
   /**
    * Set the worker's assigned lane
@@ -305,7 +293,8 @@ class Worker {
 
   /**
    * Process a single task from a GPU lane.
-   * Pops from the lane and invokes RecvRuntime for deserialization.
+   * Pops from the lane; the task pointer is already resolved by the inbound
+   * Ipc call that enqueued it.
    * @param gpu_lane TaskLane to poll
    * @return true if a task was processed
    */
@@ -317,14 +306,14 @@ class Worker {
    * @param queue Reference to the ext_ring_buffer to process
    * @param queue_idx Index of the queue being processed (0-3)
    */
-  void ProcessBlockedQueue(std::queue<RunContext *> &queue, u32 queue_idx);
+  void ProcessBlockedQueue(std::queue<clio::run::shared_ptr<Task>> &queue, u32 queue_idx);
 
   /**
    * Process a periodic queue, checking time-based tasks and executing if ready
    * @param queue Reference to the ext_ring_buffer to process
    * @param queue_idx Index of the queue being processed (0-3)
    */
-  void ProcessPeriodicQueue(std::queue<RunContext *> &queue, u32 queue_idx);
+  void ProcessPeriodicQueue(std::queue<clio::run::shared_ptr<Task>> &queue, u32 queue_idx);
 
   /**
    * Process event queue for waking up tasks when subtasks complete
@@ -332,16 +321,6 @@ class Worker {
    * ExecTask
    */
   void ProcessEventQueue();
-
-  /**
-   * Poll outstanding cross-runtime punts (PuntCopyIn) for in-place completion
-   * by the main runtime. For each PendingPunt whose shared FutureShm main has
-   * marked FUTURE_COMPLETE, deserialize the outputs back into the original task
-   * and resume the parent coroutine, then drop the entry. Called once per loop
-   * iteration.
-   * @return true if any punt is still in flight (worker should keep polling).
-   */
-  bool PollPendingPunts();
 
   /**
    * Process retry queue: re-check containers and re-route as needed
@@ -355,11 +334,9 @@ class Worker {
   /**
    * End task execution and perform cleanup
    * @param task_ptr Full pointer to task to end
-   * @param run_ctx Pointer to RunContext for task
    * @param can_resched Whether task can be rescheduled (false on error)
    */
-  void EndTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx,
-               bool can_resched);
+  void EndTask(clio::run::shared_ptr<Task> &task_ptr, bool can_resched);
 
  private:
   /**
@@ -385,18 +362,6 @@ class Worker {
   bool ProcessNewTask(TaskLane *lane);
 
   /**
-   * Get task pointer from Future, copying from client if needed
-   * Deserializes task if FUTURE_COPY_FROM_CLIENT flag is set
-   * @param future Future object containing FutureShm
-   * @param container Container to allocate task in
-   * @param method_id Method ID for task creation
-   * @return FullPtr to task (either existing or newly deserialized)
-   */
-  ctp::ipc::FullPtr<Task> GetOrCopyTaskFromFuture(Future<Task> &future,
-                                               Container *container,
-                                               u32 method_id);
-
-  /**
    * Get the time remaining before the next periodic task should resume
    * Scans all periodic queues to find the task with the shortest remaining time
    * @return Time in microseconds until next periodic task, or 0 if no periodic tasks
@@ -413,55 +378,17 @@ class Worker {
    * Execute task with context switching capability
    * Uses C++20 coroutines for suspension and resumption
    * @param task_ptr Full pointer to task to execute
-   * @param run_ctx_ptr Pointer to existing RunContext
    * @param is_started True if task is resuming, false for new task
    */
-  void ExecTask(const FullPtr<Task> &task_ptr, RunContext *run_ctx_ptr,
-                bool is_started);
+  void ExecTask(clio::run::shared_ptr<Task> &task_ptr, bool is_started);
 
-  /**
-   * Start coroutine execution for a new task
-   * Creates the coroutine and runs until first suspension point
-   * @param task_ptr Full pointer to task to execute
-   * @param run_ctx Pointer to RunContext for task
-   */
-  void StartCoroutine(const FullPtr<Task> &task_ptr, RunContext *run_ctx);
-
-#if defined(CLIO_ENABLE_BOOST_COROUTINES)
- public:
-  /**
-   * Create the Boost.Context fiber for a task and record this worker as the one
-   * responsible for its fiber state (run_ctx->fiber_state_). Only the fiber
-   * stack is allocated (and that is pooled — see AllocateStack).
-   * @param run_ctx RunContext whose task the fiber will run
-   * @return Handle to the created fiber
-   */
-  clio::run::detail::FiberHandle make_task_fiber(RunContext *run_ctx);
-
-  /**
-   * Allocate a Boost fiber stack, reusing one from this worker's free pool if
-   * available (else allocating fresh). The worker that creates a task's fiber is
-   * the one that finishes/frees it, so the pool is single-thread (SPSC).
-   */
-  boost::context::stack_context AllocateStack();
-
-  /**
-   * Return a fiber stack to this worker's free pool for reuse (frees it outright
-   * if the pool is full).
-   */
-  void FreeStack(boost::context::stack_context &sctx);
-
- private:
-#endif
-
-  /**
-   * Resume coroutine execution for a yielded/blocked task
-   * @param task_ptr Full pointer to task to resume
-   * @param run_ctx Pointer to RunContext for task
-   */
-  void ResumeCoroutine(const FullPtr<Task> &task_ptr, RunContext *run_ctx);
+  // NOTE: StartCoroutine / ResumeCoroutine / MakeTaskFiber now live on Task —
+  // the task owns its RunContext (and thus its coroutine frame), so driving the
+  // coroutine is the task's responsibility. ExecTask calls task->StartCoroutine
+  // / task->ResumeCoroutine.
 
   u32 worker_id_;
+  u32 tid_ = 0;  /**< OS thread id, set in Run() (#642) */
   bool is_running_;
   bool is_initialized_;
   float load_;          // Estimated total CPU time (us) of active tasks
@@ -469,8 +396,9 @@ class Worker {
   bool task_did_work_;  // Tracks if current task did actual work (set by tasks
                         // via CLIO_CUR_WORKER)
 
-  // Current RunContext for this worker thread
-  RunContext *current_run_context_;
+  // Task currently executing on this worker thread (null when idle). The
+  // RunContext lives inside this Task; it is never held as a bare pointer.
+  clio::run::shared_ptr<Task> current_task_;
 
   // Single lane assigned to this worker (one lane per worker)
   TaskLane *assigned_lane_;
@@ -488,14 +416,14 @@ class Worker {
   // Using std::queue for O(1) enqueue/dequeue operations
   static constexpr u32 NUM_BLOCKED_QUEUES = 4;
   static constexpr u32 BLOCKED_QUEUE_SIZE = 1024;
-  std::queue<RunContext *> blocked_queues_[NUM_BLOCKED_QUEUES];
+  std::queue<clio::run::shared_ptr<Task>> blocked_queues_[NUM_BLOCKED_QUEUES];
 
   // Retry queue for tasks whose containers migrated away
   // Tasks are retried every 32 iterations. During retry:
   //   - If container is plugged: put back in retry queue
   //   - If container is nullptr: re-route via RouteGlobal
   //   - If container is available: execute locally
-  std::queue<RunContext *> retry_queue_;
+  std::queue<clio::run::shared_ptr<Task>> retry_queue_;
 
   // Event queue for completing subtask futures on the parent worker's thread.
   // Stores Future<Task> objects to set FUTURE_COMPLETE, avoiding stale
@@ -508,21 +436,9 @@ class Worker {
   static constexpr u32 EVENT_QUEUE_DEPTH_MULTIPLIER = 2;
   ctp::ipc::mpsc_ring_buffer<Future<Task, CLIO_QUEUE_ALLOC_T>, ctp::ipc::MallocAllocator> *event_queue_;
 
-#if defined(CLIO_ENABLE_BOOST_COROUTINES)
-  // Per-worker pool of freed Boost fiber stacks, reused by AllocateStack to
-  // avoid malloc/free of the (256 KiB) stack on every task. Extensible SPSC:
-  // only this worker pushes/pops it (the worker that creates a fiber finishes
-  // it). Allocated in Init, drained + freed in Finalize.
-  static constexpr u32 STACK_POOL_DEPTH = 1024;
-  ctp::ipc::ext_ring_buffer<boost::context::stack_context, ctp::ipc::MallocAllocator>
-      *free_stacks_ = nullptr;
-#endif
-
-  // Cross-runtime subtasks this worker punted to the main runtime and is
-  // awaiting in-place completion of (see IpcRun2Fallback::PuntCopyIn). Owned by
-  // this worker only (no cross-thread access), polled each loop iteration by
-  // PollPendingPunts.
-  std::vector<PendingPunt> pending_punts_;
+  // Boost fiber stacks are pooled by the process-wide BoostStackPool() (a
+  // per-thread SlabAllocator over BoostStackAllocator), reused by AllocateStack
+  // to avoid malloc/free of the (256 KiB) stack per task. No per-worker member.
 
   // Periodic queue system for time-based periodic tasks:
   // - Queue[0]: Tasks with yield_time_us_ <= 50us (checked every 16 iterations)
@@ -534,7 +450,7 @@ class Worker {
   // Using std::queue for O(1) enqueue/dequeue operations
   static constexpr u32 NUM_PERIODIC_QUEUES = 4;
   static constexpr u32 PERIODIC_QUEUE_SIZE = 1024;
-  std::queue<RunContext *> periodic_queues_[NUM_PERIODIC_QUEUES];
+  std::queue<clio::run::shared_ptr<Task>> periodic_queues_[NUM_PERIODIC_QUEUES];
 
   // Worker spawn time
   ctp::Timepoint spawn_time_;  // Time when worker was spawned

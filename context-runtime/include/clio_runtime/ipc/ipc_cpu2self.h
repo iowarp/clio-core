@@ -50,10 +50,10 @@ class Worker;
  * non-worker threads use full RouteTask with force_enqueue.
  *
  * Lifecycle:
- *   ClientSend  -> enqueue Future<Task> to worker lane
- *   RuntimeRecv -> no-op (task is already a pointer)
- *   RuntimeSend -> set FUTURE_COMPLETE or enqueue to parent event queue
- *   ClientRecv  -> poll FUTURE_COMPLETE in shared memory
+ *   SendIn  -> enqueue Future<Task> to worker lane
+ *   RecvIn  -> no-op (task is already a pointer)
+ *   SendOut -> set FUTURE_COMPLETE or enqueue to parent event queue
+ *   RecvOut -> poll FUTURE_COMPLETE in shared memory
  */
 struct IpcCpu2Self {
   /**
@@ -68,8 +68,8 @@ struct IpcCpu2Self {
    * @param task_ptr Task to enqueue
    * @return Future wrapping the task pointer (no serialization)
    */
-  static Future<Task> ClientSend(IpcManager *ipc,
-                                 const ctp::ipc::FullPtr<Task> &task_ptr);
+  static Future<Task> SendIn(IpcManager *ipc,
+                                 const clio::run::shared_ptr<Task> &task_ptr);
 
   /**
    * Runtime receives a self-sent task.
@@ -78,9 +78,9 @@ struct IpcCpu2Self {
    * Returns the task pointer directly from the future.
    *
    * @param future Future containing the task pointer
-   * @return FullPtr to the task (same pointer from ClientSend)
+   * @return shared_ptr to the task (same handle from SendIn)
    */
-  static ctp::ipc::FullPtr<Task> RuntimeRecv(Future<Task> &future);
+  static clio::run::shared_ptr<Task> RecvIn(Future<Task> &future);
 
   /**
    * Runtime sends the response after task execution.
@@ -92,13 +92,9 @@ struct IpcCpu2Self {
    *   3. Task was copied (FUTURE_WAS_COPIED): delegate to IpcManager::SendRuntime.
    *
    * @param task_ptr Executed task
-   * @param run_ctx RunContext with future and execution state
-   * @param container Container for serialization (only if was_copied)
    * @param send_transport SHM transport (only if was_copied)
    */
-  static void RuntimeSend(const FullPtr<Task> &task_ptr,
-                           RunContext *run_ctx,
-                           Container *container,
+  static void SendOut(const clio::run::shared_ptr<Task> &task_ptr,
                            ctp::lbm::Transport *send_transport);
 
   /**
@@ -111,12 +107,13 @@ struct IpcCpu2Self {
    * @return true if completed, false if timed out
    */
   template <typename TaskT, typename AllocT>
-  static bool ClientRecv(Future<TaskT, AllocT> &future, float max_sec,
-                         ctp::ipc::FullPtr<FutureShm> future_full) {
-    // Poll FUTURE_COMPLETE in shared memory
-    ctp::abitfield32_t &flags = future_full->flags_;
+  static bool RecvOut(Future<TaskT, AllocT> &future, float max_sec,
+                         ctp::ipc::FullPtr<RunContext> future_full) {
+    // Poll per-process completion on the task (set by SendOut on this runtime).
+    (void)future_full;
+    TaskT *task_ptr = future.get();
     auto start = std::chrono::steady_clock::now();
-    while (!flags.Any(FutureShm::FUTURE_COMPLETE)) {
+    while (!task_ptr->IsComplete()) {
       CTP_THREAD_MODEL->Yield();
       if (max_sec > 0) {
         float elapsed = std::chrono::duration<float>(

@@ -31,169 +31,169 @@ void Runtime::Init(const clio::run::PoolId &pool_id, const std::string &pool_nam
   SetMethodNames(Method::GetMethodNames());
 }
 
-clio::run::TaskResume Runtime::Run(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> task_ptr, clio::run::RunContext& rctx) {
+clio::run::TaskResume Runtime::Run(clio::run::u32 method, clio::run::shared_ptr<clio::run::Task> task_ptr) {
   CLIO_TASK_BODY_BEGIN
   switch (method) {
     case Method::kCreate: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<CreateTask> typed_task = task_ptr.template Cast<CreateTask>();
-      CLIO_CO_AWAIT(Create(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<CreateTask>();
+      CLIO_CO_AWAIT(Create(typed_task));
       break;
     }
     case Method::kDestroy: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<DestroyTask> typed_task = task_ptr.template Cast<DestroyTask>();
-      CLIO_CO_AWAIT(Destroy(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<DestroyTask>();
+      CLIO_CO_AWAIT(Destroy(typed_task));
       break;
     }
     case Method::kMonitor: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<MonitorTask> typed_task = task_ptr.template Cast<MonitorTask>();
-      CLIO_CO_AWAIT(Monitor(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<MonitorTask>();
+      CLIO_CO_AWAIT(Monitor(typed_task));
       break;
     }
     case Method::kGetOrCreatePool: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<admin::GetOrCreatePoolTask<admin::CreateParams>> typed_task = task_ptr.template Cast<admin::GetOrCreatePoolTask<admin::CreateParams>>();
-      CLIO_CO_AWAIT(GetOrCreatePool(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<admin::GetOrCreatePoolTask<admin::CreateParams>>();
+      CLIO_CO_AWAIT(GetOrCreatePool(typed_task));
       break;
     }
     case Method::kDestroyPool: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<DestroyPoolTask> typed_task = task_ptr.template Cast<DestroyPoolTask>();
-      CLIO_CO_AWAIT(DestroyPool(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<DestroyPoolTask>();
+      CLIO_CO_AWAIT(DestroyPool(typed_task));
       break;
     }
     case Method::kStopRuntime: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<StopRuntimeTask> typed_task = task_ptr.template Cast<StopRuntimeTask>();
-      CLIO_CO_AWAIT(StopRuntime(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<StopRuntimeTask>();
+      CLIO_CO_AWAIT(StopRuntime(typed_task));
       break;
     }
     case Method::kFlush: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<FlushTask> typed_task = task_ptr.template Cast<FlushTask>();
-      CLIO_CO_AWAIT(Flush(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<FlushTask>();
+      CLIO_CO_AWAIT(Flush(typed_task));
       break;
     }
     case Method::kSend: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<SendTask> typed_task = task_ptr.template Cast<SendTask>();
-      CLIO_CO_AWAIT(Send(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<SendTask>();
+      CLIO_CO_AWAIT(Send(typed_task));
       break;
     }
     case Method::kRecv: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<RecvTask> typed_task = task_ptr.template Cast<RecvTask>();
-      CLIO_CO_AWAIT(Recv(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<RecvTask>();
+      CLIO_CO_AWAIT(Recv(typed_task));
       break;
     }
     case Method::kClientConnect: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<ClientConnectTask> typed_task = task_ptr.template Cast<ClientConnectTask>();
-      CLIO_CO_AWAIT(ClientConnect(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<ClientConnectTask>();
+      CLIO_CO_AWAIT(ClientConnect(typed_task));
       break;
     }
     case Method::kSubmitBatch: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<SubmitBatchTask> typed_task = task_ptr.template Cast<SubmitBatchTask>();
-      CLIO_CO_AWAIT(SubmitBatch(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<SubmitBatchTask>();
+      CLIO_CO_AWAIT(SubmitBatch(typed_task));
       break;
     }
     case Method::kWreapDeadIpcs: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<WreapDeadIpcsTask> typed_task = task_ptr.template Cast<WreapDeadIpcsTask>();
-      CLIO_CO_AWAIT(WreapDeadIpcs(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<WreapDeadIpcsTask>();
+      CLIO_CO_AWAIT(WreapDeadIpcs(typed_task));
       break;
     }
     case Method::kClientRecv: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<ClientRecvTask> typed_task = task_ptr.template Cast<ClientRecvTask>();
-      CLIO_CO_AWAIT(ClientRecv(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<ClientRecvTask>();
+      CLIO_CO_AWAIT(ClientRecv(typed_task));
       break;
     }
     case Method::kClientSend: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<ClientSendTask> typed_task = task_ptr.template Cast<ClientSendTask>();
-      CLIO_CO_AWAIT(ClientSend(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<ClientSendTask>();
+      CLIO_CO_AWAIT(ClientSend(typed_task));
       break;
     }
     case Method::kRegisterMemory: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<RegisterMemoryTask> typed_task = task_ptr.template Cast<RegisterMemoryTask>();
-      CLIO_CO_AWAIT(RegisterMemory(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<RegisterMemoryTask>();
+      CLIO_CO_AWAIT(RegisterMemory(typed_task));
       break;
     }
     case Method::kRestartContainers: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<RestartContainersTask> typed_task = task_ptr.template Cast<RestartContainersTask>();
-      CLIO_CO_AWAIT(RestartContainers(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<RestartContainersTask>();
+      CLIO_CO_AWAIT(RestartContainers(typed_task));
       break;
     }
     case Method::kAddNode: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<AddNodeTask> typed_task = task_ptr.template Cast<AddNodeTask>();
-      CLIO_CO_AWAIT(AddNode(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<AddNodeTask>();
+      CLIO_CO_AWAIT(AddNode(typed_task));
       break;
     }
     case Method::kChangeAddressTable: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<ChangeAddressTableTask> typed_task = task_ptr.template Cast<ChangeAddressTableTask>();
-      CLIO_CO_AWAIT(ChangeAddressTable(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<ChangeAddressTableTask>();
+      CLIO_CO_AWAIT(ChangeAddressTable(typed_task));
       break;
     }
     case Method::kMigrateContainers: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<MigrateContainersTask> typed_task = task_ptr.template Cast<MigrateContainersTask>();
-      CLIO_CO_AWAIT(MigrateContainers(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<MigrateContainersTask>();
+      CLIO_CO_AWAIT(MigrateContainers(typed_task));
       break;
     }
     case Method::kHeartbeat: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<HeartbeatTask> typed_task = task_ptr.template Cast<HeartbeatTask>();
-      CLIO_CO_AWAIT(Heartbeat(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<HeartbeatTask>();
+      CLIO_CO_AWAIT(Heartbeat(typed_task));
       break;
     }
     case Method::kHeartbeatProbe: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<HeartbeatProbeTask> typed_task = task_ptr.template Cast<HeartbeatProbeTask>();
-      CLIO_CO_AWAIT(HeartbeatProbe(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<HeartbeatProbeTask>();
+      CLIO_CO_AWAIT(HeartbeatProbe(typed_task));
       break;
     }
     case Method::kProbeRequest: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<ProbeRequestTask> typed_task = task_ptr.template Cast<ProbeRequestTask>();
-      CLIO_CO_AWAIT(ProbeRequest(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<ProbeRequestTask>();
+      CLIO_CO_AWAIT(ProbeRequest(typed_task));
       break;
     }
     case Method::kRecoverContainers: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<RecoverContainersTask> typed_task = task_ptr.template Cast<RecoverContainersTask>();
-      CLIO_CO_AWAIT(RecoverContainers(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<RecoverContainersTask>();
+      CLIO_CO_AWAIT(RecoverContainers(typed_task));
       break;
     }
     case Method::kSystemMonitor: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<SystemMonitorTask> typed_task = task_ptr.template Cast<SystemMonitorTask>();
-      CLIO_CO_AWAIT(SystemMonitor(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<SystemMonitorTask>();
+      CLIO_CO_AWAIT(SystemMonitor(typed_task));
       break;
     }
     case Method::kAnnounceShutdown: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<AnnounceShutdownTask> typed_task = task_ptr.template Cast<AnnounceShutdownTask>();
-      CLIO_CO_AWAIT(AnnounceShutdown(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<AnnounceShutdownTask>();
+      CLIO_CO_AWAIT(AnnounceShutdown(typed_task));
       break;
     }
     case Method::kRegisterGpuContainer: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<RegisterGpuContainerTask> typed_task = task_ptr.template Cast<RegisterGpuContainerTask>();
-      CLIO_CO_AWAIT(RegisterGpuContainer(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<RegisterGpuContainerTask>();
+      CLIO_CO_AWAIT(RegisterGpuContainer(typed_task));
       break;
     }
     case Method::kListContainers: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<ListContainersTask> typed_task = task_ptr.template Cast<ListContainersTask>();
-      CLIO_CO_AWAIT(ListContainers(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<ListContainersTask>();
+      CLIO_CO_AWAIT(ListContainers(typed_task));
       break;
     }
     default: {
@@ -206,141 +206,141 @@ clio::run::TaskResume Runtime::Run(clio::run::u32 method, ctp::ipc::FullPtr<clio
 }
 
 void Runtime::SaveTask(clio::run::u32 method, clio::run::SaveTaskArchive& archive, 
-                        ctp::ipc::FullPtr<clio::run::Task> task_ptr) {
+                        clio::run::shared_ptr<clio::run::Task>& task_ptr) {
   switch (method) {
     case Method::kCreate: {
-      auto typed_task = task_ptr.template Cast<CreateTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<CreateTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kDestroy: {
-      auto typed_task = task_ptr.template Cast<DestroyTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<DestroyTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kMonitor: {
-      auto typed_task = task_ptr.template Cast<MonitorTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<MonitorTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kGetOrCreatePool: {
-      auto typed_task = task_ptr.template Cast<admin::GetOrCreatePoolTask<admin::CreateParams>>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<admin::GetOrCreatePoolTask<admin::CreateParams>>();
+      archive << *typed_task;
       break;
     }
     case Method::kDestroyPool: {
-      auto typed_task = task_ptr.template Cast<DestroyPoolTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<DestroyPoolTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kStopRuntime: {
-      auto typed_task = task_ptr.template Cast<StopRuntimeTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<StopRuntimeTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kFlush: {
-      auto typed_task = task_ptr.template Cast<FlushTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<FlushTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kSend: {
-      auto typed_task = task_ptr.template Cast<SendTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<SendTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kRecv: {
-      auto typed_task = task_ptr.template Cast<RecvTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<RecvTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kClientConnect: {
-      auto typed_task = task_ptr.template Cast<ClientConnectTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<ClientConnectTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kSubmitBatch: {
-      auto typed_task = task_ptr.template Cast<SubmitBatchTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<SubmitBatchTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kWreapDeadIpcs: {
-      auto typed_task = task_ptr.template Cast<WreapDeadIpcsTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<WreapDeadIpcsTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kClientRecv: {
-      auto typed_task = task_ptr.template Cast<ClientRecvTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<ClientRecvTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kClientSend: {
-      auto typed_task = task_ptr.template Cast<ClientSendTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<ClientSendTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kRegisterMemory: {
-      auto typed_task = task_ptr.template Cast<RegisterMemoryTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<RegisterMemoryTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kRestartContainers: {
-      auto typed_task = task_ptr.template Cast<RestartContainersTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<RestartContainersTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kAddNode: {
-      auto typed_task = task_ptr.template Cast<AddNodeTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<AddNodeTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kChangeAddressTable: {
-      auto typed_task = task_ptr.template Cast<ChangeAddressTableTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<ChangeAddressTableTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kMigrateContainers: {
-      auto typed_task = task_ptr.template Cast<MigrateContainersTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<MigrateContainersTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kHeartbeat: {
-      auto typed_task = task_ptr.template Cast<HeartbeatTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<HeartbeatTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kHeartbeatProbe: {
-      auto typed_task = task_ptr.template Cast<HeartbeatProbeTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<HeartbeatProbeTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kProbeRequest: {
-      auto typed_task = task_ptr.template Cast<ProbeRequestTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<ProbeRequestTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kRecoverContainers: {
-      auto typed_task = task_ptr.template Cast<RecoverContainersTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<RecoverContainersTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kSystemMonitor: {
-      auto typed_task = task_ptr.template Cast<SystemMonitorTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<SystemMonitorTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kAnnounceShutdown: {
-      auto typed_task = task_ptr.template Cast<AnnounceShutdownTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<AnnounceShutdownTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kRegisterGpuContainer: {
-      auto typed_task = task_ptr.template Cast<RegisterGpuContainerTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<RegisterGpuContainerTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kListContainers: {
-      auto typed_task = task_ptr.template Cast<ListContainersTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<ListContainersTask>();
+      archive << *typed_task;
       break;
     }
     default: {
@@ -351,141 +351,141 @@ void Runtime::SaveTask(clio::run::u32 method, clio::run::SaveTaskArchive& archiv
 }
 
 void Runtime::LoadTask(clio::run::u32 method, clio::run::LoadTaskArchive& archive,
-                        ctp::ipc::FullPtr<clio::run::Task> task_ptr) {
+                        clio::run::shared_ptr<clio::run::Task>& task_ptr) {
   switch (method) {
     case Method::kCreate: {
-      auto typed_task = task_ptr.template Cast<CreateTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<CreateTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kDestroy: {
-      auto typed_task = task_ptr.template Cast<DestroyTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<DestroyTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kMonitor: {
-      auto typed_task = task_ptr.template Cast<MonitorTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<MonitorTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kGetOrCreatePool: {
-      auto typed_task = task_ptr.template Cast<admin::GetOrCreatePoolTask<admin::CreateParams>>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<admin::GetOrCreatePoolTask<admin::CreateParams>>();
+      archive >> *typed_task;
       break;
     }
     case Method::kDestroyPool: {
-      auto typed_task = task_ptr.template Cast<DestroyPoolTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<DestroyPoolTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kStopRuntime: {
-      auto typed_task = task_ptr.template Cast<StopRuntimeTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<StopRuntimeTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kFlush: {
-      auto typed_task = task_ptr.template Cast<FlushTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<FlushTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kSend: {
-      auto typed_task = task_ptr.template Cast<SendTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<SendTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kRecv: {
-      auto typed_task = task_ptr.template Cast<RecvTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<RecvTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kClientConnect: {
-      auto typed_task = task_ptr.template Cast<ClientConnectTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<ClientConnectTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kSubmitBatch: {
-      auto typed_task = task_ptr.template Cast<SubmitBatchTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<SubmitBatchTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kWreapDeadIpcs: {
-      auto typed_task = task_ptr.template Cast<WreapDeadIpcsTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<WreapDeadIpcsTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kClientRecv: {
-      auto typed_task = task_ptr.template Cast<ClientRecvTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<ClientRecvTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kClientSend: {
-      auto typed_task = task_ptr.template Cast<ClientSendTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<ClientSendTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kRegisterMemory: {
-      auto typed_task = task_ptr.template Cast<RegisterMemoryTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<RegisterMemoryTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kRestartContainers: {
-      auto typed_task = task_ptr.template Cast<RestartContainersTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<RestartContainersTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kAddNode: {
-      auto typed_task = task_ptr.template Cast<AddNodeTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<AddNodeTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kChangeAddressTable: {
-      auto typed_task = task_ptr.template Cast<ChangeAddressTableTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<ChangeAddressTableTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kMigrateContainers: {
-      auto typed_task = task_ptr.template Cast<MigrateContainersTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<MigrateContainersTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kHeartbeat: {
-      auto typed_task = task_ptr.template Cast<HeartbeatTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<HeartbeatTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kHeartbeatProbe: {
-      auto typed_task = task_ptr.template Cast<HeartbeatProbeTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<HeartbeatProbeTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kProbeRequest: {
-      auto typed_task = task_ptr.template Cast<ProbeRequestTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<ProbeRequestTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kRecoverContainers: {
-      auto typed_task = task_ptr.template Cast<RecoverContainersTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<RecoverContainersTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kSystemMonitor: {
-      auto typed_task = task_ptr.template Cast<SystemMonitorTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<SystemMonitorTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kAnnounceShutdown: {
-      auto typed_task = task_ptr.template Cast<AnnounceShutdownTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<AnnounceShutdownTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kRegisterGpuContainer: {
-      auto typed_task = task_ptr.template Cast<RegisterGpuContainerTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<RegisterGpuContainerTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kListContainers: {
-      auto typed_task = task_ptr.template Cast<ListContainersTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<ListContainersTask>();
+      archive >> *typed_task;
       break;
     }
     default: {
@@ -495,8 +495,8 @@ void Runtime::LoadTask(clio::run::u32 method, clio::run::LoadTaskArchive& archiv
   }
 }
 
-ctp::ipc::FullPtr<clio::run::Task> Runtime::AllocLoadTask(clio::run::u32 method, clio::run::LoadTaskArchive& archive) {
-  ctp::ipc::FullPtr<clio::run::Task> task_ptr = NewTask(method);
+clio::run::shared_ptr<clio::run::Task> Runtime::AllocLoadTask(clio::run::u32 method, clio::run::LoadTaskArchive& archive) {
+  clio::run::shared_ptr<clio::run::Task> task_ptr = NewTask(method);
   if (!task_ptr.IsNull()) {
     LoadTask(method, archive, task_ptr);
   }
@@ -504,168 +504,168 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::AllocLoadTask(clio::run::u32 method,
 }
 
 void Runtime::LocalLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive& archive,
-                            ctp::ipc::FullPtr<clio::run::Task> task_ptr) {
+                            clio::run::shared_ptr<clio::run::Task>& task_ptr) {
   switch (method) {
     case Method::kCreate: {
-      auto typed_task = task_ptr.template Cast<CreateTask>();
+      auto& typed_task = task_ptr.template Cast<CreateTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kDestroy: {
-      auto typed_task = task_ptr.template Cast<DestroyTask>();
+      auto& typed_task = task_ptr.template Cast<DestroyTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kMonitor: {
-      auto typed_task = task_ptr.template Cast<MonitorTask>();
+      auto& typed_task = task_ptr.template Cast<MonitorTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kGetOrCreatePool: {
-      auto typed_task = task_ptr.template Cast<admin::GetOrCreatePoolTask<admin::CreateParams>>();
+      auto& typed_task = task_ptr.template Cast<admin::GetOrCreatePoolTask<admin::CreateParams>>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kDestroyPool: {
-      auto typed_task = task_ptr.template Cast<DestroyPoolTask>();
+      auto& typed_task = task_ptr.template Cast<DestroyPoolTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kStopRuntime: {
-      auto typed_task = task_ptr.template Cast<StopRuntimeTask>();
+      auto& typed_task = task_ptr.template Cast<StopRuntimeTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kFlush: {
-      auto typed_task = task_ptr.template Cast<FlushTask>();
+      auto& typed_task = task_ptr.template Cast<FlushTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kSend: {
-      auto typed_task = task_ptr.template Cast<SendTask>();
+      auto& typed_task = task_ptr.template Cast<SendTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kRecv: {
-      auto typed_task = task_ptr.template Cast<RecvTask>();
+      auto& typed_task = task_ptr.template Cast<RecvTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kClientConnect: {
-      auto typed_task = task_ptr.template Cast<ClientConnectTask>();
+      auto& typed_task = task_ptr.template Cast<ClientConnectTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kSubmitBatch: {
-      auto typed_task = task_ptr.template Cast<SubmitBatchTask>();
+      auto& typed_task = task_ptr.template Cast<SubmitBatchTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kWreapDeadIpcs: {
-      auto typed_task = task_ptr.template Cast<WreapDeadIpcsTask>();
+      auto& typed_task = task_ptr.template Cast<WreapDeadIpcsTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kClientRecv: {
-      auto typed_task = task_ptr.template Cast<ClientRecvTask>();
+      auto& typed_task = task_ptr.template Cast<ClientRecvTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kClientSend: {
-      auto typed_task = task_ptr.template Cast<ClientSendTask>();
+      auto& typed_task = task_ptr.template Cast<ClientSendTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kRegisterMemory: {
-      auto typed_task = task_ptr.template Cast<RegisterMemoryTask>();
+      auto& typed_task = task_ptr.template Cast<RegisterMemoryTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kRestartContainers: {
-      auto typed_task = task_ptr.template Cast<RestartContainersTask>();
+      auto& typed_task = task_ptr.template Cast<RestartContainersTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kAddNode: {
-      auto typed_task = task_ptr.template Cast<AddNodeTask>();
+      auto& typed_task = task_ptr.template Cast<AddNodeTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kChangeAddressTable: {
-      auto typed_task = task_ptr.template Cast<ChangeAddressTableTask>();
+      auto& typed_task = task_ptr.template Cast<ChangeAddressTableTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kMigrateContainers: {
-      auto typed_task = task_ptr.template Cast<MigrateContainersTask>();
+      auto& typed_task = task_ptr.template Cast<MigrateContainersTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kHeartbeat: {
-      auto typed_task = task_ptr.template Cast<HeartbeatTask>();
+      auto& typed_task = task_ptr.template Cast<HeartbeatTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kHeartbeatProbe: {
-      auto typed_task = task_ptr.template Cast<HeartbeatProbeTask>();
+      auto& typed_task = task_ptr.template Cast<HeartbeatProbeTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kProbeRequest: {
-      auto typed_task = task_ptr.template Cast<ProbeRequestTask>();
+      auto& typed_task = task_ptr.template Cast<ProbeRequestTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kRecoverContainers: {
-      auto typed_task = task_ptr.template Cast<RecoverContainersTask>();
+      auto& typed_task = task_ptr.template Cast<RecoverContainersTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kSystemMonitor: {
-      auto typed_task = task_ptr.template Cast<SystemMonitorTask>();
+      auto& typed_task = task_ptr.template Cast<SystemMonitorTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kAnnounceShutdown: {
-      auto typed_task = task_ptr.template Cast<AnnounceShutdownTask>();
+      auto& typed_task = task_ptr.template Cast<AnnounceShutdownTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kRegisterGpuContainer: {
-      auto typed_task = task_ptr.template Cast<RegisterGpuContainerTask>();
+      auto& typed_task = task_ptr.template Cast<RegisterGpuContainerTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kListContainers: {
-      auto typed_task = task_ptr.template Cast<ListContainersTask>();
+      auto& typed_task = task_ptr.template Cast<ListContainersTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     default: {
@@ -675,8 +675,8 @@ void Runtime::LocalLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive
   }
 }
 
-ctp::ipc::FullPtr<clio::run::Task> Runtime::LocalAllocLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive& archive) {
-  ctp::ipc::FullPtr<clio::run::Task> task_ptr = NewTask(method);
+clio::run::shared_ptr<clio::run::Task> Runtime::LocalAllocLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive& archive) {
+  clio::run::shared_ptr<clio::run::Task> task_ptr = NewTask(method);
   if (!task_ptr.IsNull()) {
     LocalLoadTask(method, archive, task_ptr);
   }
@@ -684,168 +684,168 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::LocalAllocLoadTask(clio::run::u32 me
 }
 
 void Runtime::LocalSaveTask(clio::run::u32 method, clio::run::DefaultSaveArchive& archive, 
-                             ctp::ipc::FullPtr<clio::run::Task> task_ptr) {
+                             clio::run::shared_ptr<clio::run::Task>& task_ptr) {
   switch (method) {
     case Method::kCreate: {
-      auto typed_task = task_ptr.template Cast<CreateTask>();
+      auto& typed_task = task_ptr.template Cast<CreateTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kDestroy: {
-      auto typed_task = task_ptr.template Cast<DestroyTask>();
+      auto& typed_task = task_ptr.template Cast<DestroyTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kMonitor: {
-      auto typed_task = task_ptr.template Cast<MonitorTask>();
+      auto& typed_task = task_ptr.template Cast<MonitorTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kGetOrCreatePool: {
-      auto typed_task = task_ptr.template Cast<admin::GetOrCreatePoolTask<admin::CreateParams>>();
+      auto& typed_task = task_ptr.template Cast<admin::GetOrCreatePoolTask<admin::CreateParams>>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kDestroyPool: {
-      auto typed_task = task_ptr.template Cast<DestroyPoolTask>();
+      auto& typed_task = task_ptr.template Cast<DestroyPoolTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kStopRuntime: {
-      auto typed_task = task_ptr.template Cast<StopRuntimeTask>();
+      auto& typed_task = task_ptr.template Cast<StopRuntimeTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kFlush: {
-      auto typed_task = task_ptr.template Cast<FlushTask>();
+      auto& typed_task = task_ptr.template Cast<FlushTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kSend: {
-      auto typed_task = task_ptr.template Cast<SendTask>();
+      auto& typed_task = task_ptr.template Cast<SendTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kRecv: {
-      auto typed_task = task_ptr.template Cast<RecvTask>();
+      auto& typed_task = task_ptr.template Cast<RecvTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kClientConnect: {
-      auto typed_task = task_ptr.template Cast<ClientConnectTask>();
+      auto& typed_task = task_ptr.template Cast<ClientConnectTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kSubmitBatch: {
-      auto typed_task = task_ptr.template Cast<SubmitBatchTask>();
+      auto& typed_task = task_ptr.template Cast<SubmitBatchTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kWreapDeadIpcs: {
-      auto typed_task = task_ptr.template Cast<WreapDeadIpcsTask>();
+      auto& typed_task = task_ptr.template Cast<WreapDeadIpcsTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kClientRecv: {
-      auto typed_task = task_ptr.template Cast<ClientRecvTask>();
+      auto& typed_task = task_ptr.template Cast<ClientRecvTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kClientSend: {
-      auto typed_task = task_ptr.template Cast<ClientSendTask>();
+      auto& typed_task = task_ptr.template Cast<ClientSendTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kRegisterMemory: {
-      auto typed_task = task_ptr.template Cast<RegisterMemoryTask>();
+      auto& typed_task = task_ptr.template Cast<RegisterMemoryTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kRestartContainers: {
-      auto typed_task = task_ptr.template Cast<RestartContainersTask>();
+      auto& typed_task = task_ptr.template Cast<RestartContainersTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kAddNode: {
-      auto typed_task = task_ptr.template Cast<AddNodeTask>();
+      auto& typed_task = task_ptr.template Cast<AddNodeTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kChangeAddressTable: {
-      auto typed_task = task_ptr.template Cast<ChangeAddressTableTask>();
+      auto& typed_task = task_ptr.template Cast<ChangeAddressTableTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kMigrateContainers: {
-      auto typed_task = task_ptr.template Cast<MigrateContainersTask>();
+      auto& typed_task = task_ptr.template Cast<MigrateContainersTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kHeartbeat: {
-      auto typed_task = task_ptr.template Cast<HeartbeatTask>();
+      auto& typed_task = task_ptr.template Cast<HeartbeatTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kHeartbeatProbe: {
-      auto typed_task = task_ptr.template Cast<HeartbeatProbeTask>();
+      auto& typed_task = task_ptr.template Cast<HeartbeatProbeTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kProbeRequest: {
-      auto typed_task = task_ptr.template Cast<ProbeRequestTask>();
+      auto& typed_task = task_ptr.template Cast<ProbeRequestTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kRecoverContainers: {
-      auto typed_task = task_ptr.template Cast<RecoverContainersTask>();
+      auto& typed_task = task_ptr.template Cast<RecoverContainersTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kSystemMonitor: {
-      auto typed_task = task_ptr.template Cast<SystemMonitorTask>();
+      auto& typed_task = task_ptr.template Cast<SystemMonitorTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kAnnounceShutdown: {
-      auto typed_task = task_ptr.template Cast<AnnounceShutdownTask>();
+      auto& typed_task = task_ptr.template Cast<AnnounceShutdownTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kRegisterGpuContainer: {
-      auto typed_task = task_ptr.template Cast<RegisterGpuContainerTask>();
+      auto& typed_task = task_ptr.template Cast<RegisterGpuContainerTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kListContainers: {
-      auto typed_task = task_ptr.template Cast<ListContainersTask>();
+      auto& typed_task = task_ptr.template Cast<ListContainersTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     default: {
@@ -855,10 +855,10 @@ void Runtime::LocalSaveTask(clio::run::u32 method, clio::run::DefaultSaveArchive
   }
 }
 
-ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> orig_task_ptr, bool deep) {
+clio::run::shared_ptr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, clio::run::shared_ptr<clio::run::Task>& orig_task_ptr, bool deep) {
   auto* ipc_manager = CLIO_IPC;
   if (!ipc_manager) {
-    return ctp::ipc::FullPtr<clio::run::Task>();
+    return clio::run::shared_ptr<clio::run::Task>();
   }
   
   switch (method) {
@@ -867,8 +867,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<CreateTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<CreateTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<CreateTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<CreateTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -878,8 +878,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<DestroyTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<DestroyTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<DestroyTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<DestroyTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -889,8 +889,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<MonitorTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<MonitorTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<MonitorTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<MonitorTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -900,8 +900,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<admin::GetOrCreatePoolTask<admin::CreateParams>>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<admin::GetOrCreatePoolTask<admin::CreateParams>>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<admin::GetOrCreatePoolTask<admin::CreateParams>>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<admin::GetOrCreatePoolTask<admin::CreateParams>>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -911,8 +911,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<DestroyPoolTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<DestroyPoolTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<DestroyPoolTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<DestroyPoolTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -922,8 +922,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<StopRuntimeTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<StopRuntimeTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<StopRuntimeTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<StopRuntimeTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -933,8 +933,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<FlushTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<FlushTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<FlushTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<FlushTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -944,8 +944,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<SendTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<SendTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<SendTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<SendTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -955,8 +955,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<RecvTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<RecvTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<RecvTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<RecvTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -966,8 +966,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<ClientConnectTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<ClientConnectTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<ClientConnectTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<ClientConnectTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -977,8 +977,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<SubmitBatchTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<SubmitBatchTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<SubmitBatchTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<SubmitBatchTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -988,8 +988,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<WreapDeadIpcsTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<WreapDeadIpcsTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<WreapDeadIpcsTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<WreapDeadIpcsTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -999,8 +999,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<ClientRecvTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<ClientRecvTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<ClientRecvTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<ClientRecvTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -1010,8 +1010,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<ClientSendTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<ClientSendTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<ClientSendTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<ClientSendTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -1021,8 +1021,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<RegisterMemoryTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<RegisterMemoryTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<RegisterMemoryTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<RegisterMemoryTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -1032,8 +1032,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<RestartContainersTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<RestartContainersTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<RestartContainersTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<RestartContainersTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -1043,8 +1043,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<AddNodeTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<AddNodeTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<AddNodeTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<AddNodeTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -1054,8 +1054,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<ChangeAddressTableTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<ChangeAddressTableTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<ChangeAddressTableTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<ChangeAddressTableTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -1065,8 +1065,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<MigrateContainersTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<MigrateContainersTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<MigrateContainersTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<MigrateContainersTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -1076,8 +1076,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<HeartbeatTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<HeartbeatTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<HeartbeatTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<HeartbeatTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -1087,8 +1087,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<HeartbeatProbeTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<HeartbeatProbeTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<HeartbeatProbeTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<HeartbeatProbeTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -1098,8 +1098,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<ProbeRequestTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<ProbeRequestTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<ProbeRequestTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<ProbeRequestTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -1109,8 +1109,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<RecoverContainersTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<RecoverContainersTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<RecoverContainersTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<RecoverContainersTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -1120,8 +1120,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<SystemMonitorTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<SystemMonitorTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<SystemMonitorTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<SystemMonitorTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -1131,8 +1131,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<AnnounceShutdownTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<AnnounceShutdownTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<AnnounceShutdownTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<AnnounceShutdownTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -1142,8 +1142,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<RegisterGpuContainerTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<RegisterGpuContainerTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<RegisterGpuContainerTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<RegisterGpuContainerTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -1153,8 +1153,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<ListContainersTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<ListContainersTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<ListContainersTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<ListContainersTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -1163,7 +1163,7 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       // For unknown methods, create base Task copy
       auto new_task_ptr = ipc_manager->NewTask<clio::run::Task>();
       if (!new_task_ptr.IsNull()) {
-        new_task_ptr->Copy(orig_task_ptr);
+        new_task_ptr->Copy(ctp::ipc::FullPtr<clio::run::Task>(orig_task_ptr.get()));
         return new_task_ptr;
       }
       break;
@@ -1171,13 +1171,13 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
   }
   
   (void)deep;    // Deep copy parameter reserved for future use
-  return ctp::ipc::FullPtr<clio::run::Task>();
+  return clio::run::shared_ptr<clio::run::Task>();
 }
 
-ctp::ipc::FullPtr<clio::run::Task> Runtime::NewTask(clio::run::u32 method) {
+clio::run::shared_ptr<clio::run::Task> Runtime::NewTask(clio::run::u32 method) {
   auto* ipc_manager = CLIO_IPC;
   if (!ipc_manager) {
-    return ctp::ipc::FullPtr<clio::run::Task>();
+    return clio::run::shared_ptr<clio::run::Task>();
   }
   
   switch (method) {
@@ -1291,273 +1291,155 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewTask(clio::run::u32 method) {
     }
     default: {
       // For unknown methods, return null pointer
-      return ctp::ipc::FullPtr<clio::run::Task>();
+      return clio::run::shared_ptr<clio::run::Task>();
     }
   }
 }
 
-void Runtime::AggregateOut(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> orig_task,
-                        const ctp::ipc::FullPtr<clio::run::Task>& replica_task) {
+void Runtime::AggregateOut(clio::run::u32 method, clio::run::shared_ptr<clio::run::Task>& orig_task,
+                        const clio::run::shared_ptr<clio::run::Task>& replica_task) {
   switch (method) {
     case Method::kCreate: {
-      auto typed_task = orig_task.template Cast<CreateTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<CreateTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kDestroy: {
-      auto typed_task = orig_task.template Cast<DestroyTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<DestroyTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kMonitor: {
-      auto typed_task = orig_task.template Cast<MonitorTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<MonitorTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kGetOrCreatePool: {
-      auto typed_task = orig_task.template Cast<admin::GetOrCreatePoolTask<admin::CreateParams>>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<admin::GetOrCreatePoolTask<admin::CreateParams>>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kDestroyPool: {
-      auto typed_task = orig_task.template Cast<DestroyPoolTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<DestroyPoolTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kStopRuntime: {
-      auto typed_task = orig_task.template Cast<StopRuntimeTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<StopRuntimeTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kFlush: {
-      auto typed_task = orig_task.template Cast<FlushTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<FlushTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kSend: {
-      auto typed_task = orig_task.template Cast<SendTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<SendTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kRecv: {
-      auto typed_task = orig_task.template Cast<RecvTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<RecvTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kClientConnect: {
-      auto typed_task = orig_task.template Cast<ClientConnectTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<ClientConnectTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kSubmitBatch: {
-      auto typed_task = orig_task.template Cast<SubmitBatchTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<SubmitBatchTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kWreapDeadIpcs: {
-      auto typed_task = orig_task.template Cast<WreapDeadIpcsTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<WreapDeadIpcsTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kClientRecv: {
-      auto typed_task = orig_task.template Cast<ClientRecvTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<ClientRecvTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kClientSend: {
-      auto typed_task = orig_task.template Cast<ClientSendTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<ClientSendTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kRegisterMemory: {
-      auto typed_task = orig_task.template Cast<RegisterMemoryTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<RegisterMemoryTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kRestartContainers: {
-      auto typed_task = orig_task.template Cast<RestartContainersTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<RestartContainersTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kAddNode: {
-      auto typed_task = orig_task.template Cast<AddNodeTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<AddNodeTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kChangeAddressTable: {
-      auto typed_task = orig_task.template Cast<ChangeAddressTableTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<ChangeAddressTableTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kMigrateContainers: {
-      auto typed_task = orig_task.template Cast<MigrateContainersTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<MigrateContainersTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kHeartbeat: {
-      auto typed_task = orig_task.template Cast<HeartbeatTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<HeartbeatTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kHeartbeatProbe: {
-      auto typed_task = orig_task.template Cast<HeartbeatProbeTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<HeartbeatProbeTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kProbeRequest: {
-      auto typed_task = orig_task.template Cast<ProbeRequestTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<ProbeRequestTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kRecoverContainers: {
-      auto typed_task = orig_task.template Cast<RecoverContainersTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<RecoverContainersTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kSystemMonitor: {
-      auto typed_task = orig_task.template Cast<SystemMonitorTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<SystemMonitorTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kAnnounceShutdown: {
-      auto typed_task = orig_task.template Cast<AnnounceShutdownTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<AnnounceShutdownTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kRegisterGpuContainer: {
-      auto typed_task = orig_task.template Cast<RegisterGpuContainerTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<RegisterGpuContainerTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kListContainers: {
-      auto typed_task = orig_task.template Cast<ListContainersTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<ListContainersTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     default: {
-      orig_task->AggregateOut(replica_task);
+      orig_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
   }
 }
 
-void Runtime::DelTask(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> task_ptr) {
-  auto* ipc_manager = CLIO_IPC;
-  if (!ipc_manager) return;
-  switch (method) {
-    case Method::kCreate: {
-      ipc_manager->DelTask(task_ptr.template Cast<CreateTask>());
-      break;
-    }
-    case Method::kDestroy: {
-      ipc_manager->DelTask(task_ptr.template Cast<DestroyTask>());
-      break;
-    }
-    case Method::kMonitor: {
-      ipc_manager->DelTask(task_ptr.template Cast<MonitorTask>());
-      break;
-    }
-    case Method::kGetOrCreatePool: {
-      ipc_manager->DelTask(task_ptr.template Cast<admin::GetOrCreatePoolTask<admin::CreateParams>>());
-      break;
-    }
-    case Method::kDestroyPool: {
-      ipc_manager->DelTask(task_ptr.template Cast<DestroyPoolTask>());
-      break;
-    }
-    case Method::kStopRuntime: {
-      ipc_manager->DelTask(task_ptr.template Cast<StopRuntimeTask>());
-      break;
-    }
-    case Method::kFlush: {
-      ipc_manager->DelTask(task_ptr.template Cast<FlushTask>());
-      break;
-    }
-    case Method::kSend: {
-      ipc_manager->DelTask(task_ptr.template Cast<SendTask>());
-      break;
-    }
-    case Method::kRecv: {
-      ipc_manager->DelTask(task_ptr.template Cast<RecvTask>());
-      break;
-    }
-    case Method::kClientConnect: {
-      ipc_manager->DelTask(task_ptr.template Cast<ClientConnectTask>());
-      break;
-    }
-    case Method::kSubmitBatch: {
-      ipc_manager->DelTask(task_ptr.template Cast<SubmitBatchTask>());
-      break;
-    }
-    case Method::kWreapDeadIpcs: {
-      ipc_manager->DelTask(task_ptr.template Cast<WreapDeadIpcsTask>());
-      break;
-    }
-    case Method::kClientRecv: {
-      ipc_manager->DelTask(task_ptr.template Cast<ClientRecvTask>());
-      break;
-    }
-    case Method::kClientSend: {
-      ipc_manager->DelTask(task_ptr.template Cast<ClientSendTask>());
-      break;
-    }
-    case Method::kRegisterMemory: {
-      ipc_manager->DelTask(task_ptr.template Cast<RegisterMemoryTask>());
-      break;
-    }
-    case Method::kRestartContainers: {
-      ipc_manager->DelTask(task_ptr.template Cast<RestartContainersTask>());
-      break;
-    }
-    case Method::kAddNode: {
-      ipc_manager->DelTask(task_ptr.template Cast<AddNodeTask>());
-      break;
-    }
-    case Method::kChangeAddressTable: {
-      ipc_manager->DelTask(task_ptr.template Cast<ChangeAddressTableTask>());
-      break;
-    }
-    case Method::kMigrateContainers: {
-      ipc_manager->DelTask(task_ptr.template Cast<MigrateContainersTask>());
-      break;
-    }
-    case Method::kHeartbeat: {
-      ipc_manager->DelTask(task_ptr.template Cast<HeartbeatTask>());
-      break;
-    }
-    case Method::kHeartbeatProbe: {
-      ipc_manager->DelTask(task_ptr.template Cast<HeartbeatProbeTask>());
-      break;
-    }
-    case Method::kProbeRequest: {
-      ipc_manager->DelTask(task_ptr.template Cast<ProbeRequestTask>());
-      break;
-    }
-    case Method::kRecoverContainers: {
-      ipc_manager->DelTask(task_ptr.template Cast<RecoverContainersTask>());
-      break;
-    }
-    case Method::kSystemMonitor: {
-      ipc_manager->DelTask(task_ptr.template Cast<SystemMonitorTask>());
-      break;
-    }
-    case Method::kAnnounceShutdown: {
-      ipc_manager->DelTask(task_ptr.template Cast<AnnounceShutdownTask>());
-      break;
-    }
-    case Method::kRegisterGpuContainer: {
-      ipc_manager->DelTask(task_ptr.template Cast<RegisterGpuContainerTask>());
-      break;
-    }
-    case Method::kListContainers: {
-      ipc_manager->DelTask(task_ptr.template Cast<ListContainersTask>());
-      break;
-    }
-    default: {
-      ipc_manager->DelTask(task_ptr);
-      break;
-    }
-  }
-}
 
 } // namespace clio::run::admin

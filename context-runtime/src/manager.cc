@@ -60,6 +60,11 @@ namespace clio::run {
 // CTP Thread-local storage key definitions
 CLIO_RUN_API ctp::ThreadLocalKey chi_cur_worker_key_;
 CLIO_RUN_API bool chi_cur_worker_key_created_ = false;
+// Fallback current-RunContext for threads that are NOT workers (e.g. tests that
+// invoke Container::Run directly). On a worker thread the worker's own context
+// takes precedence; this TLS is only consulted when there is no current worker.
+CLIO_RUN_API ctp::ThreadLocalKey chi_cur_runctx_key_;
+CLIO_RUN_API bool chi_cur_runctx_key_created_ = false;
 CLIO_RUN_API ctp::ThreadLocalKey chi_task_counter_key_;
 CLIO_RUN_API bool chi_task_counter_key_created_ = false;
 CLIO_RUN_API ctp::ThreadLocalKey chi_is_client_thread_key_;
@@ -87,7 +92,7 @@ TaskId CreateTaskId() {
     Worker *current_worker = CLIO_CUR_WORKER;
     if (current_worker) {
       // Get current task from worker
-      FullPtr<Task> current_task = current_worker->GetCurrentTask();
+      clio::run::shared_ptr<Task> current_task = current_worker->GetCurrentTask();
       if (!current_task.IsNull()) {
         // Copy TaskId from current task, keep replica_id_ same, and allocate
         // new unique from counter
@@ -402,6 +407,10 @@ void RuntimeManager::ClientFinalize() {
     return;
   }
 
+  // Leak shared-context ZMQ sockets on Windows during teardown (see
+  // ServerFinalize) to avoid libzmq's WSASTARTUP signaler assertion.
+  ctp::lbm::sock::SetSocketLibShutdown();
+
   // Finalize client components
   auto *pool_manager = CLIO_POOL_MANAGER;
   pool_manager->Finalize();
@@ -462,6 +471,12 @@ void RuntimeManager::ServerFinalize() {
   if (!is_initialized_ || !is_runtime_mode_) {
     return;
   }
+
+  // Mark shutdown before any transport teardown so ZeroMqTransport leaks
+  // shared-context sockets on Windows instead of zmq_close-ing them (which
+  // trips libzmq's signaler WSASTARTUP assert during teardown). Must precede
+  // StopWorkers / ClearClientPool below.
+  ctp::lbm::sock::SetSocketLibShutdown();
 
   // Flush in-flight (non-periodic) tasks and the net queues while the workers
   // are still running, so client/runtime work completes on its normal path and

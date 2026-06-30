@@ -66,8 +66,8 @@ LockOwnerId GetCurrentLockOwnerId() {
   LockOwnerId id;
   Worker *worker = CLIO_CUR_WORKER;
   if (!worker) return id;
-  FullPtr<Task> task = worker->GetCurrentTask();
-  if (task.ptr_ == nullptr) return id;
+  clio::run::shared_ptr<Task> task = worker->GetCurrentTask();
+  if (task.IsNull()) return id;
   id.worker_id_ = worker->GetId();
   id.pid_ = task->task_id_.pid_;
   id.tid_ = task->task_id_.tid_;

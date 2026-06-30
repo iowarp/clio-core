@@ -39,6 +39,8 @@
 #endif
 #include <zmq.h>
 
+#include <atomic>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -224,13 +226,20 @@ class ZeroMqTransport : public Transport {
       owns_ctx_ = false;
       socket_ = zmq_socket(ctx_, ZMQ_DEALER);
 
-      // ZMQ_IDENTITY: the server's ROUTER uses this as the response
-      // routing prefix.  hostname:pid keeps it debuggable and unique
-      // across processes.
+      // ZMQ_IDENTITY: the server's ROUTER uses this as the response routing
+      // prefix. It MUST be unique per DEALER socket: when several DEALERs in one
+      // process (e.g. per-thread client send sockets) connect to the same ROUTER
+      // with an identical identity, the ROUTER coalesces them onto one
+      // connection and silently drops every sender's frames but one. A
+      // per-process atomic sequence guarantees uniqueness; the host part (before
+      // the first ':') stays parseable for response dial-back.
       {
+        static std::atomic<uint64_t> dealer_seq{0};
         std::string hostname = ctp::SystemInfo::GetHostname();
         uint32_t pid = static_cast<uint32_t>(ctp::SystemInfo::GetPid());
-        std::string identity = hostname + ":" + std::to_string(pid);
+        uint64_t seq = dealer_seq.fetch_add(1, std::memory_order_relaxed);
+        std::string identity = hostname + ":" + std::to_string(pid) + ":" +
+                               std::to_string(seq);
         zmq_setsockopt(socket_, ZMQ_IDENTITY, identity.data(),
                         identity.size());
       }
@@ -356,6 +365,17 @@ class ZeroMqTransport : public Transport {
       int sndtimeo = 1000;
       zmq_setsockopt(socket_, ZMQ_SNDTIMEO, &sndtimeo, sizeof(sndtimeo));
 
+      // Bound how long a blocking frame read (the flags=0 delim/meta/bulk reads
+      // in RecvMetadata/RecvBulks) can wait. The identity frame is read
+      // DONTWAIT, but if a multipart message is ever truncated on the wire the
+      // follow-on frames would block forever — wedging the recv thread so it
+      // can't honor recv_shutdown_ at teardown (the leaked Windows context
+      // sends no ETERM to wake it). 1 s lets the read fail with EAGAIN and the
+      // recv loop re-check the shutdown flag; well-formed messages arrive
+      // atomically so this never trips in steady state.
+      int rcvtimeo = 1000;
+      zmq_setsockopt(socket_, ZMQ_RCVTIMEO, &rcvtimeo, sizeof(rcvtimeo));
+
       // ZMTP heartbeat — same scale-friendly window as DEALER side.
       int hb_ivl = 5000;
       zmq_setsockopt(socket_, ZMQ_HEARTBEAT_IVL, &hb_ivl, sizeof(hb_ivl));
@@ -403,17 +423,29 @@ class ZeroMqTransport : public Transport {
   }
 
   ~ZeroMqTransport() {
-    HLOG(kDebug, "ZeroMqTransport destructor - closing socket to {}:{}", addr_,
-         port_);
+    HLOG(kDebug,
+         "ZeroMqTransport destructor - closing socket to {}:{} "
+         "(shutdown={} owns_ctx={})",
+         addr_, port_, sock::IsSocketLibShutdown(), owns_ctx_);
 
-    int linger = 0;  // Close immediately; don't wait for unsent messages
-    zmq_setsockopt(socket_, ZMQ_LINGER, &linger, sizeof(linger));
-
-    zmq_close(socket_);
-    if (owns_ctx_) {
-      zmq_ctx_destroy(ctx_);
+    // During process shutdown on Windows, tearing down a ZMQ socket OR a
+    // ZMQ context trips libzmq's signaler WSASTARTUP assertion: libzmq has
+    // already torn down its own Winsock state, so the signaler's wakeup send()
+    // aborts (signaler.cpp:163). The shared context is already leaked for this
+    // reason (see GetSharedContext's CtxOwner); do the same for every transport
+    // once shutdown has begun — skip both zmq_close and zmq_ctx_destroy and let
+    // the OS reclaim the socket (and any private context) at process exit. On
+    // POSIX IsSocketLibShutdown() is always false, so teardown is unchanged.
+    const bool leak = sock::IsSocketLibShutdown();
+    if (!leak) {
+      int linger = 0;  // Close immediately; don't wait for unsent messages
+      zmq_setsockopt(socket_, ZMQ_LINGER, &linger, sizeof(linger));
+      zmq_close(socket_);
+      if (owns_ctx_) {
+        zmq_ctx_destroy(ctx_);
+      }
     }
-    HLOG(kDebug, "ZeroMqTransport destructor - socket closed");
+    HLOG(kDebug, "ZeroMqTransport destructor - socket closed (leak={})", leak);
   }
 
   Bulk Expose(const ctp::ipc::FullPtr<char>& ptr, size_t data_size,
@@ -569,6 +601,25 @@ class ZeroMqTransport : public Transport {
   }
 
  private:
+  // After a partial/truncated multipart read, discard any frames still pending
+  // for the current logical message so the next Recv() starts cleanly on a
+  // message boundary (prevents a one-time wire glitch from desyncing the
+  // stream permanently). Non-blocking throughout.
+  void DrainToMessageBoundary() {
+    while (true) {
+      int more = 0;
+      size_t more_sz = sizeof(more);
+      if (zmq_getsockopt(socket_, ZMQ_RCVMORE, &more, &more_sz) != 0 || !more) {
+        break;
+      }
+      zmq_msg_t junk;
+      zmq_msg_init(&junk);
+      int rc = zmq_msg_recv(&junk, socket_, ZMQ_DONTWAIT);
+      zmq_msg_close(&junk);
+      if (rc == -1) break;
+    }
+  }
+
   template <typename MetaT>
   int RecvMetadata(MetaT& meta, const LbmContext& ctx = LbmContext()) {
     (void)ctx;
@@ -576,8 +627,12 @@ class ZeroMqTransport : public Transport {
     zmq_msg_init(&msg);
     int rc;
     if (IsServer()) {
-      // ROUTER: identity frame first (DONTWAIT so polling callers can
-      // see EAGAIN cleanly), then a blocking delim and meta.
+      // ROUTER: [identity, delim, meta]. The identity is read DONTWAIT so a
+      // polling caller sees EAGAIN cleanly when nothing is queued. ZMQ delivers
+      // a multipart message atomically, so once the identity is in hand the
+      // delim and meta are already buffered — read them DONTWAIT too. Staying
+      // non-blocking is what lets the recv thread always honor its shutdown
+      // flag; a blocking flags=0 read on a truncated message would wedge it.
       zmq_msg_t identity_msg;
       zmq_msg_init(&identity_msg);
       int rc_id = zmq_msg_recv(&identity_msg, socket_, ZMQ_DONTWAIT);
@@ -594,16 +649,18 @@ class ZeroMqTransport : public Transport {
 
       zmq_msg_t delim_msg;
       zmq_msg_init(&delim_msg);
-      int rc_d = zmq_msg_recv_eintr(&delim_msg, socket_, 0);
+      int rc_d = zmq_msg_recv(&delim_msg, socket_, ZMQ_DONTWAIT);
       zmq_msg_close(&delim_msg);
       if (rc_d == -1) {
+        DrainToMessageBoundary();
         zmq_msg_close(&msg);
         return zmq_errno();
       }
 
-      rc = zmq_msg_recv_eintr(&msg, socket_, 0);
+      rc = zmq_msg_recv(&msg, socket_, ZMQ_DONTWAIT);
     } else {
-      // DEALER: delim (DONTWAIT for EAGAIN check) then meta (blocking).
+      // DEALER: [delim, meta]. Delim DONTWAIT to detect "no message"; meta is
+      // buffered with it (atomic multipart), so read it DONTWAIT as well.
       zmq_msg_t delim_msg;
       zmq_msg_init(&delim_msg);
       int rc_d = zmq_msg_recv(&delim_msg, socket_, ZMQ_DONTWAIT);
@@ -614,11 +671,12 @@ class ZeroMqTransport : public Transport {
         return err;
       }
       zmq_msg_close(&delim_msg);
-      rc = zmq_msg_recv_eintr(&msg, socket_, 0);
+      rc = zmq_msg_recv(&msg, socket_, ZMQ_DONTWAIT);
     }
 
     if (rc == -1) {
       int err = zmq_errno();
+      DrainToMessageBoundary();
       zmq_msg_close(&msg);
       return err;
     }
@@ -649,7 +707,11 @@ class ZeroMqTransport : public Transport {
         continue;
       }
       recv_count++;
-      int flags = (recv_count < meta.send_bulks) ? ZMQ_RCVMORE : 0;
+      // Bulks ride in the same atomic multipart message as the meta, so they're
+      // already buffered by the time we get here — read DONTWAIT to stay
+      // non-blocking. (The previous ZMQ_RCVMORE-as-recv-flag was a no-op-ish
+      // misuse: ZMQ_RCVMORE is a getsockopt option, not a recv flag.)
+      int flags = ZMQ_DONTWAIT;
 
       if (meta.recv[i].data.ptr_) {
         zmq_msg_t zmq_msg;

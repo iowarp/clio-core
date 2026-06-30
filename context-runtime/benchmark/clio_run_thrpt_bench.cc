@@ -265,12 +265,12 @@ void TaskAllocationWorkerThread(size_t thread_id, const BenchmarkConfig &config,
     // Create and delete AllocateBlocksTask
     auto alloc_task = ipc_manager->NewTask<clio::run::bdev::AllocateBlocksTask>(
         clio::run::CreateTaskId(), pool_id, clio::run::PoolQuery::Local(), alloc_size);
-    ipc_manager->DelTask(alloc_task);
+    alloc_task.reset();
 
     // Create and delete FreeBlocksTask
     auto free_task = ipc_manager->NewTask<clio::run::bdev::FreeBlocksTask>(
         clio::run::CreateTaskId(), pool_id, clio::run::PoolQuery::Local(), dummy_blocks);
-    ipc_manager->DelTask(free_task);
+    free_task.reset();
 
     local_ops += 2; // Count both allocate and free task creations
 

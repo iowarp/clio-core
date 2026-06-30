@@ -48,10 +48,11 @@ RUN if id ubuntu >/dev/null 2>&1; then \
       groupmod -g 59999 ubuntu; \
     fi && \
     OLD_UID=$(id -u iowarp) && OLD_GID=$(id -g iowarp) && \
-    if [ "${HOST_UID}" != "${OLD_UID}" ] || [ "${HOST_GID}" != "${OLD_GID}" ]; then \
-      groupmod -o -g "${HOST_GID}" iowarp && \
-      usermod  -o -u "${HOST_UID}" -g "${HOST_GID}" iowarp && \
-      chown -R "${HOST_UID}:${HOST_GID}" /home/iowarp; \
+    NEW_UID="${HOST_UID:-1000}" && NEW_GID="${HOST_GID:-1000}" && \
+    if [ "${NEW_UID}" != "${OLD_UID}" ] || [ "${NEW_GID}" != "${OLD_GID}" ]; then \
+      groupmod -o -g "${NEW_GID}" iowarp && \
+      usermod  -o -u "${NEW_UID}" -g "${NEW_GID}" iowarp && \
+      chown -R "${NEW_UID}:${NEW_GID}" /home/iowarp; \
     fi
 
 USER iowarp

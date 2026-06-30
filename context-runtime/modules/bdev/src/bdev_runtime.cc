@@ -53,9 +53,9 @@ size_t Runtime::GetWorkerID(clio::run::RunContext &rctx) {
   return worker->GetId();
 }
 
-clio::run::TaskResume Runtime::Create(ctp::ipc::FullPtr<CreateTask> task, clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   CLIO_TASK_BODY_BEGIN
-  
+
   CreateParams params = task->GetParams();
   bdev_type_ = params.bdev_type_;
   
@@ -90,7 +90,7 @@ clio::run::TaskResume Runtime::Create(ctp::ipc::FullPtr<CreateTask> task, clio::
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::AllocateBlocks(ctp::ipc::FullPtr<AllocateBlocksTask> task, clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::AllocateBlocks(clio::run::shared_ptr<AllocateBlocksTask> &task) {
   CLIO_TASK_BODY_BEGIN
 
   if (bdev_type_ == BdevType::kNoop) {
@@ -98,7 +98,8 @@ clio::run::TaskResume Runtime::AllocateBlocks(ctp::ipc::FullPtr<AllocateBlocksTa
     CLIO_CO_RETURN;
   }
 
-  int worker_id = static_cast<int>(GetWorkerID(rctx));
+  clio::run::Worker *worker = CLIO_CUR_WORKER;
+  int worker_id = (worker != nullptr) ? static_cast<int>(worker->GetId()) : 0;
   std::vector<Block> local_blocks;
 
   if (!transport_->AllocateBlocks(task->size_, worker_id, local_blocks)) {
@@ -116,7 +117,7 @@ clio::run::TaskResume Runtime::AllocateBlocks(ctp::ipc::FullPtr<AllocateBlocksTa
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::FreeBlocks(ctp::ipc::FullPtr<FreeBlocksTask> task, clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::FreeBlocks(clio::run::shared_ptr<FreeBlocksTask> &task) {
   CLIO_TASK_BODY_BEGIN
 
   if (bdev_type_ == BdevType::kNoop) {
@@ -124,7 +125,8 @@ clio::run::TaskResume Runtime::FreeBlocks(ctp::ipc::FullPtr<FreeBlocksTask> task
     CLIO_CO_RETURN;
   }
 
-  int worker_id = static_cast<int>(GetWorkerID(rctx));
+  clio::run::Worker *worker = CLIO_CUR_WORKER;
+  int worker_id = (worker != nullptr) ? static_cast<int>(worker->GetId()) : 0;
   std::vector<Block> local_blocks;
   for (size_t i = 0; i < task->blocks_.size(); ++i) {
     local_blocks.push_back(task->blocks_[i]);
@@ -137,7 +139,7 @@ clio::run::TaskResume Runtime::FreeBlocks(ctp::ipc::FullPtr<FreeBlocksTask> task
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::Write(ctp::ipc::FullPtr<WriteTask> task, clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::Write(clio::run::shared_ptr<WriteTask> &task) {
   CLIO_TASK_BODY_BEGIN
 
   if (bdev_type_ == BdevType::kNoop) {
@@ -147,7 +149,7 @@ clio::run::TaskResume Runtime::Write(ctp::ipc::FullPtr<WriteTask> task, clio::ru
   }
 
   if (transport_) {
-    CLIO_CO_AWAIT(transport_->WriteBlocks(task, rctx));
+    CLIO_CO_AWAIT(transport_->WriteBlocks(ctp::ipc::FullPtr<WriteTask>(task.get())));
     total_writes_.fetch_add(1);
     total_bytes_written_.fetch_add(task->bytes_written_);
   } else {
@@ -159,7 +161,7 @@ clio::run::TaskResume Runtime::Write(ctp::ipc::FullPtr<WriteTask> task, clio::ru
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::Read(ctp::ipc::FullPtr<ReadTask> task, clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::Read(clio::run::shared_ptr<ReadTask> &task) {
   CLIO_TASK_BODY_BEGIN
 
   if (bdev_type_ == BdevType::kNoop) {
@@ -169,7 +171,7 @@ clio::run::TaskResume Runtime::Read(ctp::ipc::FullPtr<ReadTask> task, clio::run:
   }
 
   if (transport_) {
-    CLIO_CO_AWAIT(transport_->ReadBlocks(task, rctx));
+    CLIO_CO_AWAIT(transport_->ReadBlocks(ctp::ipc::FullPtr<ReadTask>(task.get())));
     total_reads_.fetch_add(1);
     total_bytes_read_.fetch_add(task->bytes_read_);
   } else {
@@ -181,14 +183,14 @@ clio::run::TaskResume Runtime::Read(ctp::ipc::FullPtr<ReadTask> task, clio::run:
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::Update(ctp::ipc::FullPtr<UpdateTask> task, clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::Update(clio::run::shared_ptr<UpdateTask> &task) {
   CLIO_TASK_BODY_BEGIN
   task->return_code_ = 0;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::GetStats(ctp::ipc::FullPtr<GetStatsTask> task, clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::GetStats(clio::run::shared_ptr<GetStatsTask> &task) {
   CLIO_TASK_BODY_BEGIN
   ReadTask r_synthetic;
   r_synthetic.method_ = Method::kRead;
@@ -221,7 +223,7 @@ clio::run::TaskResume Runtime::GetStats(ctp::ipc::FullPtr<GetStatsTask> task, cl
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::Destroy(ctp::ipc::FullPtr<DestroyTask> task, clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::Destroy(clio::run::shared_ptr<DestroyTask> &task) {
   CLIO_TASK_BODY_BEGIN
   if (transport_) {
     transport_->Destroy();
@@ -234,9 +236,8 @@ clio::run::TaskResume Runtime::Destroy(ctp::ipc::FullPtr<DestroyTask> task, clio
 
 clio::run::u64 Runtime::GetWorkRemaining() const { return 0; }
 
-clio::run::TaskResume Runtime::Monitor(ctp::ipc::FullPtr<MonitorTask> task, clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::Monitor(clio::run::shared_ptr<MonitorTask> &task) {
   CLIO_TASK_BODY_BEGIN
-  (void)rctx;
   if (task->query_ == "stats") {
     ReadTask r_synthetic;
     r_synthetic.method_ = Method::kRead;

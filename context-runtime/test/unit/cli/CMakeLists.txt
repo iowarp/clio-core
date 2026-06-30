@@ -3,6 +3,14 @@
 # migrate/start/stop) plus the clio_run binary's argument dispatch.
 cmake_minimum_required(VERSION 3.10)
 
+# The runtime-fallback (crash-isolation punt-to-main) feature was removed pending
+# a more foundational design. Its end-to-end tests (clio_run_cte_fallback_test,
+# clio_run_fallback_runtime_test) are kept in-tree but gated OFF so they are
+# neither built nor run until the feature is reintroduced. Flip this ON to
+# resurrect them alongside a fallback implementation.
+option(CLIO_CORE_ENABLE_RUNTIME_FALLBACK
+       "Build/run the runtime-fallback (crash-isolation) integration tests" OFF)
+
 # POSIX-only: the test drives the clio_run binary as a subprocess and
 # inspects exit codes via <sys/wait.h>.
 if(NOT WIN32)
@@ -208,8 +216,9 @@ if(CLIO_CORE_ENABLE_TESTS)
     )
 
     # Fallback-runtime CTE test: CTE on a USER runtime backed by a bdev on a
-    # MAIN runtime. CTE's internal bdev calls are serialize-relayed across the
-    # fallback. Two ephemeral runtimes on ports 10670/10680.
+    # MAIN runtime. Gated OFF — the runtime-fallback feature was removed (see
+    # CLIO_CORE_ENABLE_RUNTIME_FALLBACK at the top of this file).
+    if(CLIO_CORE_ENABLE_RUNTIME_FALLBACK)
     add_executable(clio_run_cte_fallback_test test_cte_fallback.cc)
     target_include_directories(clio_run_cte_fallback_test PRIVATE
       ${CLIO_RUN_ROOT}/include
@@ -232,13 +241,6 @@ if(CLIO_CORE_ENABLE_TESTS)
       CXX_STANDARD_REQUIRED ON
       RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     )
-    # TEMPORARILY skipped under Boost coroutines on Linux: the user-runtime
-    # compose step hangs there (pre-existing dev regression — dev's
-    # boost-coroutines CI was green 2026-06-25, red 2026-06-27). Still built
-    # (compile coverage) and still run in the stackless build and on macOS.
-    # Re-enable once the fallback compose is fixed. Tracked in
-    # https://github.com/iowarp/clio-core/issues/641
-    if(NOT (CLIO_CORE_ENABLE_BOOST_COROUTINES AND CMAKE_SYSTEM_NAME STREQUAL "Linux"))
     add_test(
       NAME cr_cli_cte_fallback
       COMMAND clio_run_cte_fallback_test
@@ -290,10 +292,12 @@ if(CLIO_CORE_ENABLE_TESTS)
     LABELS "msan_skip"
   )
 
-  # Fallback-runtime (crash isolation) test: spawns TWO runtimes (main on 10650
-  # with a bdev, user on 10651 with CLIO_FALLBACK_PORT=10650 and no bdev), then
-  # an SHM client calls the bdev through the user runtime, which punts to main.
-  # Serialize with other live-runtime tests (shared per-user SHM segments).
+  # Fallback-runtime (crash isolation) test: spawns TWO runtimes (main with a
+  # bdev, user with CLIO_FALLBACK_PORT and no bdev), then an SHM client calls the
+  # bdev through the user runtime, which punts to main. Gated OFF — the
+  # runtime-fallback feature was removed (see CLIO_CORE_ENABLE_RUNTIME_FALLBACK
+  # at the top of this file).
+  if(CLIO_CORE_ENABLE_RUNTIME_FALLBACK)
   add_executable(clio_run_fallback_runtime_test test_fallback_runtime.cc)
   target_include_directories(clio_run_fallback_runtime_test PRIVATE
     ${CLIO_RUN_ROOT}/include
@@ -314,13 +318,6 @@ if(CLIO_CORE_ENABLE_TESTS)
     CXX_STANDARD_REQUIRED ON
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
-  # TEMPORARILY skipped under Boost coroutines on Linux: the user-runtime
-  # compose step hangs there (pre-existing dev regression — dev's
-  # boost-coroutines CI was green 2026-06-25, red 2026-06-27). Still built
-  # (compile coverage) and still run in the stackless build and on macOS.
-  # Re-enable once the fallback compose is fixed. Tracked in
-  # https://github.com/iowarp/clio-core/issues/641
-  if(NOT (CLIO_CORE_ENABLE_BOOST_COROUTINES AND CMAKE_SYSTEM_NAME STREQUAL "Linux"))
   add_test(
     NAME cr_cli_fallback_runtime
     COMMAND clio_run_fallback_runtime_test

@@ -220,28 +220,27 @@ clio::run::u64 Runtime::ParseCapacityToBytes(const std::string &capacity_str) {
 }
 
 void Runtime::FixupAfterCopy(clio::run::u32 method,
-                              ctp::ipc::FullPtr<clio::run::Task> task_ptr) {
+                              clio::run::shared_ptr<clio::run::Task> &task_ptr) {
   switch (method) {
     case Method::kRegisterTarget:
-      task_ptr.template Cast<RegisterTargetTask>().ptr_->FixupAfterCopy();
+      task_ptr.template Cast<RegisterTargetTask>().get()->FixupAfterCopy();
       break;
     case Method::kGetOrCreateTag:
       task_ptr.template Cast<GetOrCreateTagTask<CreateParams>>()
-          .ptr_->FixupAfterCopy();
+          .get()->FixupAfterCopy();
       break;
     case Method::kPutBlob:
-      task_ptr.template Cast<PutBlobTask>().ptr_->FixupAfterCopy();
+      task_ptr.template Cast<PutBlobTask>().get()->FixupAfterCopy();
       break;
     case Method::kGetBlob:
-      task_ptr.template Cast<GetBlobTask>().ptr_->FixupAfterCopy();
+      task_ptr.template Cast<GetBlobTask>().get()->FixupAfterCopy();
       break;
     default:
       break;
   }
 }
 
-clio::run::TaskResume Runtime::Create(ctp::ipc::FullPtr<CreateTask> task,
-                                clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   CLIO_TASK_BODY_BEGIN
   // Initialize unordered_map_ll instances with appropriately sized bucket
   // counts. Tag/blob maps are large to avoid excessive collisions at scale.
@@ -503,8 +502,7 @@ Runtime::~Runtime() {
   tag_locks_.clear();
 }
 
-clio::run::TaskResume Runtime::Destroy(ctp::ipc::FullPtr<DestroyTask> task,
-                                 clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::Destroy(clio::run::shared_ptr<DestroyTask> &task) {
   CLIO_TASK_BODY_BEGIN
   try {
     // Close WAL files before clearing data structures
@@ -547,7 +545,7 @@ clio::run::TaskResume Runtime::Destroy(ctp::ipc::FullPtr<DestroyTask> task,
   CLIO_TASK_BODY_END
 }
 
-clio::run::PoolQuery Runtime::ScheduleTask(const ctp::ipc::FullPtr<clio::run::Task> &task) {
+clio::run::PoolQuery Runtime::ScheduleTask(const clio::run::shared_ptr<clio::run::Task> &task) {
   using namespace clio::cte::core;
   switch (task->method_) {
     // Methods that route locally
@@ -617,8 +615,7 @@ clio::run::PoolQuery Runtime::ScheduleTask(const ctp::ipc::FullPtr<clio::run::Ta
   }
 }
 
-clio::run::TaskResume Runtime::RegisterTarget(ctp::ipc::FullPtr<RegisterTargetTask> task,
-                                        clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::RegisterTarget(clio::run::shared_ptr<RegisterTargetTask> &task) {
   CLIO_TASK_BODY_BEGIN
   try {
     std::string target_name = task->target_name_.str();
@@ -767,7 +764,7 @@ clio::run::TaskResume Runtime::RegisterTarget(ctp::ipc::FullPtr<RegisterTargetTa
 }
 
 clio::run::TaskResume Runtime::UnregisterTarget(
-    ctp::ipc::FullPtr<UnregisterTargetTask> task, clio::run::RunContext &rctx) {
+    clio::run::shared_ptr<UnregisterTargetTask> &task) {
   CLIO_TASK_BODY_BEGIN
   try {
     std::string target_name = task->target_name_.str();
@@ -816,8 +813,7 @@ clio::run::TaskResume Runtime::UnregisterTarget(
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::ListTargets(ctp::ipc::FullPtr<ListTargetsTask> task,
-                                     clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::ListTargets(clio::run::shared_ptr<ListTargetsTask> &task) {
   CLIO_TASK_BODY_BEGIN
   try {
     // Clear the output vector and populate with current target names
@@ -840,8 +836,7 @@ clio::run::TaskResume Runtime::ListTargets(ctp::ipc::FullPtr<ListTargetsTask> ta
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::StatTargets(ctp::ipc::FullPtr<StatTargetsTask> task,
-                                     clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::StatTargets(clio::run::shared_ptr<StatTargetsTask> &task) {
   CLIO_TASK_BODY_BEGIN
   try {
     // Collect all target IDs under read lock (can't co_await inside lambda)
@@ -927,8 +922,7 @@ clio::run::TaskResume Runtime::StatTargets(ctp::ipc::FullPtr<StatTargetsTask> ta
 
 template <typename CreateParamsT>
 clio::run::TaskResume Runtime::GetOrCreateTag(
-    ctp::ipc::FullPtr<GetOrCreateTagTask<CreateParamsT>> task,
-    clio::run::RunContext &rctx) {
+    clio::run::shared_ptr<GetOrCreateTagTask<CreateParamsT>> &task) {
   CLIO_TASK_BODY_BEGIN
   try {
     std::string tag_name = task->tag_name_.str();
@@ -982,8 +976,7 @@ clio::run::TaskResume Runtime::GetOrCreateTag(
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::GetTargetInfo(ctp::ipc::FullPtr<GetTargetInfoTask> task,
-                                       clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::GetTargetInfo(clio::run::shared_ptr<GetTargetInfoTask> &task) {
   CLIO_TASK_BODY_BEGIN
   try {
     std::string target_name = task->target_name_.str();
@@ -1022,8 +1015,8 @@ clio::run::TaskResume Runtime::GetTargetInfo(ctp::ipc::FullPtr<GetTargetInfoTask
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::PutBlob(ctp::ipc::FullPtr<PutBlobTask> task,
-                                 clio::run::RunContext &rctx) {
+template <typename TaskT>
+clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
   CLIO_TASK_BODY_BEGIN
   // Per-PutBlob diagnostic logging — disabled in perf builds. Was burning
   // an atomic fetch_add + clock_gettime + branch on every 64 KB chunk plus
@@ -1095,7 +1088,7 @@ clio::run::TaskResume Runtime::PutBlob(ctp::ipc::FullPtr<PutBlobTask> task,
     // routed this put through a per-(block, page) sub-blob — keeps cache
     // pages from colliding on a shared blob name. Sentinel kNoPageIdx
     // means "no suffix", which is the path non-GPU clients take.
-    if (task->gpu_page_idx_ != PutBlobTask::kNoPageIdx) {
+    if (task->gpu_page_idx_ != TaskT::kNoPageIdx) {
       blob_name += "_pi" + std::to_string(task->gpu_page_idx_);
     }
     clio::run::u64 offset = task->offset_;
@@ -1286,14 +1279,14 @@ clio::run::TaskResume Runtime::PutBlob(ctp::ipc::FullPtr<PutBlobTask> task,
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::GetBlob(ctp::ipc::FullPtr<GetBlobTask> task,
-                                 clio::run::RunContext &rctx) {
+template <typename TaskT>
+clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
   CLIO_TASK_BODY_BEGIN
   try {
     // Extract input parameters
     TagId tag_id = task->tag_id_;
     std::string blob_name = task->blob_name_.str();
-    if (task->gpu_page_idx_ != GetBlobTask::kNoPageIdx) {
+    if (task->gpu_page_idx_ != TaskT::kNoPageIdx) {
       blob_name += "_pi" + std::to_string(task->gpu_page_idx_);
     }
     clio::run::u64 offset = task->offset_;
@@ -1356,8 +1349,9 @@ clio::run::TaskResume Runtime::GetBlob(ctp::ipc::FullPtr<GetBlobTask> task,
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::ReorganizeBlob(ctp::ipc::FullPtr<ReorganizeBlobTask> task,
-                                        clio::run::RunContext &rctx) {
+template <typename TaskT>
+clio::run::TaskResume Runtime::ReorganizeBlobImpl(
+    clio::run::shared_ptr<TaskT> &task) {
   CLIO_TASK_BODY_BEGIN
   try {
     // Extract input parameters
@@ -1471,8 +1465,33 @@ clio::run::TaskResume Runtime::ReorganizeBlob(ctp::ipc::FullPtr<ReorganizeBlobTa
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::DelBlob(ctp::ipc::FullPtr<DelBlobTask> task,
-                                 clio::run::RunContext &rctx) {
+// Thin dispatchers over the *Impl<TaskT> templates above. Defining them in this
+// TU instantiates each template for both the priv::string task and its
+// fixed_string POD variant (issue #556) — the handler logic is written once.
+clio::run::TaskResume Runtime::PutBlob(clio::run::shared_ptr<PutBlobTask> &task) {
+  return PutBlobImpl(task);
+}
+clio::run::TaskResume Runtime::PodPutBlob(
+    clio::run::shared_ptr<PodPutBlobTask> &task) {
+  return PutBlobImpl(task);
+}
+clio::run::TaskResume Runtime::GetBlob(clio::run::shared_ptr<GetBlobTask> &task) {
+  return GetBlobImpl(task);
+}
+clio::run::TaskResume Runtime::PodGetBlob(
+    clio::run::shared_ptr<PodGetBlobTask> &task) {
+  return GetBlobImpl(task);
+}
+clio::run::TaskResume Runtime::ReorganizeBlob(
+    clio::run::shared_ptr<ReorganizeBlobTask> &task) {
+  return ReorganizeBlobImpl(task);
+}
+clio::run::TaskResume Runtime::PodReorganizeBlob(
+    clio::run::shared_ptr<PodReorganizeBlobTask> &task) {
+  return ReorganizeBlobImpl(task);
+}
+
+clio::run::TaskResume Runtime::DelBlob(clio::run::shared_ptr<DelBlobTask> &task) {
   CLIO_TASK_BODY_BEGIN
   try {
     // Extract input parameters
@@ -1557,8 +1576,7 @@ clio::run::TaskResume Runtime::DelBlob(ctp::ipc::FullPtr<DelBlobTask> task,
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::TruncateBlob(ctp::ipc::FullPtr<TruncateBlobTask> task,
-                                      clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::TruncateBlob(clio::run::shared_ptr<TruncateBlobTask> &task) {
   CLIO_TASK_BODY_BEGIN
   try {
     TagId tag_id = task->tag_id_;
@@ -1636,8 +1654,7 @@ clio::run::TaskResume Runtime::TruncateBlob(ctp::ipc::FullPtr<TruncateBlobTask> 
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::RenameTag(ctp::ipc::FullPtr<RenameTagTask> task,
-                                   clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::RenameTag(clio::run::shared_ptr<RenameTagTask> &task) {
   CLIO_TASK_BODY_BEGIN
   try {
     TagId tag_id = task->tag_id_;
@@ -1769,7 +1786,7 @@ clio::run::TaskResume Runtime::RenameTag(ctp::ipc::FullPtr<RenameTagTask> task,
 }
 
 clio::run::TaskResume Runtime::GetOrCreateTagAlias(
-    ctp::ipc::FullPtr<GetOrCreateTagAliasTask> task, clio::run::RunContext &rctx) {
+    clio::run::shared_ptr<GetOrCreateTagAliasTask> &task) {
   CLIO_TASK_BODY_BEGIN
   try {
     TagId tag_id = task->tag_id_;
@@ -1859,8 +1876,7 @@ clio::run::TaskResume Runtime::GetOrCreateTagAlias(
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::DelTag(ctp::ipc::FullPtr<DelTagTask> task,
-                                clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::DelTag(clio::run::shared_ptr<DelTagTask> &task) {
   CLIO_TASK_BODY_BEGIN
   try {
     TagId tag_id = task->tag_id_;
@@ -2204,8 +2220,7 @@ clio::run::TaskResume Runtime::DelTag(ctp::ipc::FullPtr<DelTagTask> task,
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::GetTagName(ctp::ipc::FullPtr<GetTagNameTask> task,
-                                    clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::GetTagName(clio::run::shared_ptr<GetTagNameTask> &task) {
   CLIO_TASK_BODY_BEGIN
   try {
     TagId tag_id = task->tag_id_;
@@ -2235,8 +2250,7 @@ clio::run::TaskResume Runtime::GetTagName(ctp::ipc::FullPtr<GetTagNameTask> task
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::GetTagSize(ctp::ipc::FullPtr<GetTagSizeTask> task,
-                                    clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::GetTagSize(clio::run::shared_ptr<GetTagSizeTask> &task) {
   CLIO_TASK_BODY_BEGIN
   try {
     TagId tag_id = task->tag_id_;
@@ -2274,7 +2288,7 @@ clio::run::TaskResume Runtime::GetTagSize(ctp::ipc::FullPtr<GetTagSizeTask> task
 }
 
 clio::run::TaskResume Runtime::GetCapacity(
-    ctp::ipc::FullPtr<GetCapacityTask> task, clio::run::RunContext &rctx) {
+    clio::run::shared_ptr<GetCapacityTask> &task) {
   CLIO_TASK_BODY_BEGIN
   // Sum the total and remaining capacity of every target registered on this
   // node. A Local query returns this node's capacity; the task's AggregateOut
@@ -2303,7 +2317,7 @@ clio::run::TaskResume Runtime::GetCapacity(
 }
 
 clio::run::TaskResume Runtime::GetNumAliases(
-    ctp::ipc::FullPtr<GetNumAliasesTask> task, clio::run::RunContext &rctx) {
+    clio::run::shared_ptr<GetNumAliasesTask> &task) {
   CLIO_TASK_BODY_BEGIN
   try {
     task->num_aliases_ = 0;
@@ -2529,8 +2543,7 @@ TagId Runtime::GetOrCreateTagChain(const std::string &name,
   return parent;
 }
 
-clio::run::TaskResume Runtime::FlushMetadata(ctp::ipc::FullPtr<FlushMetadataTask> task,
-                                       clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::FlushMetadata(clio::run::shared_ptr<FlushMetadataTask> &task) {
   CLIO_TASK_BODY_BEGIN
   task->entries_flushed_ = 0;
 
@@ -2657,8 +2670,7 @@ clio::run::TaskResume Runtime::FlushMetadata(ctp::ipc::FullPtr<FlushMetadataTask
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::FlushData(ctp::ipc::FullPtr<FlushDataTask> task,
-                                   clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::FlushData(clio::run::shared_ptr<FlushDataTask> &task) {
   CLIO_TASK_BODY_BEGIN
   task->bytes_flushed_ = 0;
   task->blobs_flushed_ = 0;
@@ -3220,7 +3232,7 @@ TagId Runtime::GenerateNewTagId() {
 
 // Explicit template instantiations for required template methods
 template clio::run::TaskResume Runtime::GetOrCreateTag<CreateParams>(
-    ctp::ipc::FullPtr<GetOrCreateTagTask<CreateParams>> task, clio::run::RunContext &rctx);
+    clio::run::shared_ptr<GetOrCreateTagTask<CreateParams>> &task);
 
 // Blob management helper functions
 BlobInfo *Runtime::CheckBlobExists(const std::string &blob_name,
@@ -3292,7 +3304,7 @@ clio::run::TaskResume Runtime::ExtendBlob(BlobInfo &blob_info, clio::run::u64 of
                                     clio::run::u32 &error_code,
                                     int min_persistence_level) {
 #ifdef CLIO_ENABLE_BOOST_COROUTINES
-  clio::run::RunContext& rctx = *clio::run::GetCurrentRunContextFromWorker();
+  clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
 #endif
   CLIO_TASK_BODY_BEGIN
   // Calculate required additional space
@@ -3431,7 +3443,7 @@ clio::run::TaskResume Runtime::ResizeBlob(BlobInfo &blob_info, clio::run::u64 ne
                                     float blob_score, clio::run::u32 &error_code,
                                     int min_persistence_level) {
 #ifdef CLIO_ENABLE_BOOST_COROUTINES
-  clio::run::RunContext& rctx = *clio::run::GetCurrentRunContextFromWorker();
+  clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
 #endif
   CLIO_TASK_BODY_BEGIN
   error_code = 0;
@@ -3540,7 +3552,7 @@ clio::run::TaskResume Runtime::ModifyExistingData(
     const clio::run::priv::vector<BlobBlock> &blocks, ctp::ipc::ShmPtr<> data, size_t data_size,
     size_t data_offset_in_blob, clio::run::u32 &error_code) {
 #ifdef CLIO_ENABLE_BOOST_COROUTINES
-  clio::run::RunContext& rctx = *clio::run::GetCurrentRunContextFromWorker();
+  clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
 #endif
   CLIO_TASK_BODY_BEGIN
   HLOG(kDebug,
@@ -3660,7 +3672,7 @@ clio::run::TaskResume Runtime::ReadData(const clio::run::priv::vector<BlobBlock>
                                   size_t data_offset_in_blob,
                                   clio::run::u32 &error_code) {
 #ifdef CLIO_ENABLE_BOOST_COROUTINES
-  clio::run::RunContext& rctx = *clio::run::GetCurrentRunContextFromWorker();
+  clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
 #endif
   CLIO_TASK_BODY_BEGIN
   HLOG(kDebug, "ReadData: blocks={}, data_size={}, data_offset_in_blob={}",
@@ -3781,7 +3793,7 @@ clio::run::TaskResume Runtime::AllocateFromTarget(TargetInfo &target_info,
                                             clio::run::u64 &allocated_offset,
                                             bool &success) {
 #ifdef CLIO_ENABLE_BOOST_COROUTINES
-  clio::run::RunContext& rctx = *clio::run::GetCurrentRunContextFromWorker();
+  clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
 #endif
   CLIO_TASK_BODY_BEGIN
   HLOG(kDebug,
@@ -3860,7 +3872,7 @@ clio::run::TaskResume Runtime::ClearBlob(BlobInfo &blob_info, float blob_score,
                                    clio::run::u64 offset, clio::run::u64 size,
                                    bool &cleared) {
 #ifdef CLIO_ENABLE_BOOST_COROUTINES
-  clio::run::RunContext& rctx = *clio::run::GetCurrentRunContextFromWorker();
+  clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
 #endif
   CLIO_TASK_BODY_BEGIN
   cleared = false;
@@ -3886,7 +3898,7 @@ clio::run::TaskResume Runtime::ClearBlob(BlobInfo &blob_info, float blob_score,
 clio::run::TaskResume Runtime::FreeAllBlobBlocks(BlobInfo &blob_info,
                                            clio::run::u32 &error_code) {
 #ifdef CLIO_ENABLE_BOOST_COROUTINES
-  clio::run::RunContext& rctx = *clio::run::GetCurrentRunContextFromWorker();
+  clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
 #endif
   CLIO_TASK_BODY_BEGIN
   // Map: PoolId -> (target_query, vector<Block>)
@@ -4008,7 +4020,7 @@ size_t Runtime::GetTelemetryEntries(std::vector<CteTelemetry> &entries,
 }
 
 clio::run::TaskResume Runtime::PollTelemetryLog(
-    ctp::ipc::FullPtr<PollTelemetryLogTask> task, clio::run::RunContext &rctx) {
+    clio::run::shared_ptr<PollTelemetryLogTask> &task) {
   CLIO_TASK_BODY_BEGIN
   try {
     std::uint64_t minimum_logical_time = task->minimum_logical_time_;
@@ -4040,8 +4052,7 @@ clio::run::TaskResume Runtime::PollTelemetryLog(
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::GetBlobScore(ctp::ipc::FullPtr<GetBlobScoreTask> task,
-                                      clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::GetBlobScore(clio::run::shared_ptr<GetBlobScoreTask> &task) {
   CLIO_TASK_BODY_BEGIN
   try {
     // Extract input parameters
@@ -4086,8 +4097,7 @@ clio::run::TaskResume Runtime::GetBlobScore(ctp::ipc::FullPtr<GetBlobScoreTask> 
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::GetBlobSize(ctp::ipc::FullPtr<GetBlobSizeTask> task,
-                                     clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::GetBlobSize(clio::run::shared_ptr<GetBlobSizeTask> &task) {
   CLIO_TASK_BODY_BEGIN
   try {
     // Extract input parameters
@@ -4131,8 +4141,7 @@ clio::run::TaskResume Runtime::GetBlobSize(ctp::ipc::FullPtr<GetBlobSizeTask> ta
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::GetBlobInfo(ctp::ipc::FullPtr<GetBlobInfoTask> task,
-                                     clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::GetBlobInfo(clio::run::shared_ptr<GetBlobInfoTask> &task) {
   CLIO_TASK_BODY_BEGIN
   try {
     // Extract input parameters
@@ -4186,7 +4195,7 @@ clio::run::TaskResume Runtime::GetBlobInfo(ctp::ipc::FullPtr<GetBlobInfoTask> ta
 }
 
 clio::run::TaskResume Runtime::GetContainedBlobs(
-    ctp::ipc::FullPtr<GetContainedBlobsTask> task, clio::run::RunContext &rctx) {
+    clio::run::shared_ptr<GetContainedBlobsTask> &task) {
   CLIO_TASK_BODY_BEGIN
   try {
     // Extract input parameters
@@ -4237,8 +4246,7 @@ clio::run::TaskResume Runtime::GetContainedBlobs(
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::TagQuery(ctp::ipc::FullPtr<TagQueryTask> task,
-                                  clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::TagQuery(clio::run::shared_ptr<TagQueryTask> &task) {
   CLIO_TASK_BODY_BEGIN
   try {
     std::string tag_regex = task->tag_regex_.str();
@@ -4286,8 +4294,7 @@ clio::run::TaskResume Runtime::TagQuery(ctp::ipc::FullPtr<TagQueryTask> task,
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::BlobQuery(ctp::ipc::FullPtr<BlobQueryTask> task,
-                                   clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::BlobQuery(clio::run::shared_ptr<BlobQueryTask> &task) {
   CLIO_TASK_BODY_BEGIN
   try {
     std::string tag_regex = task->tag_regex_.str();
@@ -4395,7 +4402,7 @@ struct SemSearchDoc {
 }  // namespace
 
 clio::run::TaskResume Runtime::SemanticSearch(
-    ctp::ipc::FullPtr<SemanticSearchTask> task, clio::run::RunContext &rctx) {
+    clio::run::shared_ptr<SemanticSearchTask> &task) {
   CLIO_TASK_BODY_BEGIN
   task->results_.clear();
   task->return_code_ = 0;
@@ -4562,7 +4569,7 @@ clio::run::TaskResume Runtime::SemanticSearch(
 // ==============================================================================
 
 clio::run::TaskResume Runtime::TemporalSearch(
-    ctp::ipc::FullPtr<TemporalSearchTask> task, clio::run::RunContext &rctx) {
+    clio::run::shared_ptr<TemporalSearchTask> &task) {
   CLIO_TASK_BODY_BEGIN
   task->results_.clear();
   task->return_code_ = 0;
@@ -4652,11 +4659,9 @@ clio::run::PoolQuery Runtime::HashBlobToContainer(const TagId &tag_id,
   return clio::run::PoolQuery::DirectHash(hash_value);
 }
 
-clio::run::TaskResume Runtime::Monitor(ctp::ipc::FullPtr<MonitorTask> task,
-                                 clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::Monitor(clio::run::shared_ptr<MonitorTask> &task) {
   CLIO_TASK_BODY_BEGIN
   task->SetReturnCode(0);
-  (void)rctx;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }

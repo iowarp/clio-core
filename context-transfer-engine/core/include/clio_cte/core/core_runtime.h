@@ -47,7 +47,7 @@
 #include <clio_cte/core/core_tasks.h>
 #include <clio_cte/core/gpu_metadata_cache.h>
 #include <clio_cte/core/transaction_log.h>
-#include <search/regex_search_engine.h>
+#include <clio_ctp/search/regex_search_engine.h>
 
 // Forward declarations to avoid circular dependency
 namespace clio::cte::core {
@@ -79,131 +79,134 @@ public:
    * path on the worker before Run.
    */
   void FixupAfterCopy(clio::run::u32 method,
-                      ctp::ipc::FullPtr<clio::run::Task> task_ptr) override;
+                      clio::run::shared_ptr<clio::run::Task>& task_ptr) override;
 
   /**
    * Create the container (Method::kCreate)
    * This method both creates and initializes the container
    * Returns TaskResume for coroutine-based async operations
    */
-  clio::run::TaskResume Create(ctp::ipc::FullPtr<CreateTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume Create(clio::run::shared_ptr<CreateTask> &task);
 
   /**
    * Monitor container state (Method::kMonitor)
    */
-  clio::run::TaskResume Monitor(ctp::ipc::FullPtr<MonitorTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume Monitor(clio::run::shared_ptr<MonitorTask> &task);
 
   /**
    * Destroy the container (Method::kDestroy)
    */
-  clio::run::TaskResume Destroy(ctp::ipc::FullPtr<DestroyTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume Destroy(clio::run::shared_ptr<DestroyTask> &task);
 
   /**
    * Register a target (Method::kRegisterTarget)
    * Returns TaskResume for coroutine-based async operations
    */
-  clio::run::TaskResume RegisterTarget(ctp::ipc::FullPtr<RegisterTargetTask> task,
-                                 clio::run::RunContext &rctx);
+  clio::run::TaskResume RegisterTarget(clio::run::shared_ptr<RegisterTargetTask> &task);
 
   /**
    * Unregister a target (Method::kUnregisterTarget)
    */
-  clio::run::TaskResume UnregisterTarget(ctp::ipc::FullPtr<UnregisterTargetTask> task,
-                        clio::run::RunContext &rctx);
+  clio::run::TaskResume UnregisterTarget(clio::run::shared_ptr<UnregisterTargetTask> &task);
 
   /**
    * List registered targets (Method::kListTargets)
    */
-  clio::run::TaskResume ListTargets(ctp::ipc::FullPtr<ListTargetsTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume ListTargets(clio::run::shared_ptr<ListTargetsTask> &task);
 
   /**
    * Update target statistics (Method::kStatTargets)
    */
-  clio::run::TaskResume StatTargets(ctp::ipc::FullPtr<StatTargetsTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume StatTargets(clio::run::shared_ptr<StatTargetsTask> &task);
 
   /**
    * Get target information (Method::kGetTargetInfo)
    * Returns target score, remaining space, and performance metrics
    */
-  clio::run::TaskResume GetTargetInfo(ctp::ipc::FullPtr<GetTargetInfoTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume GetTargetInfo(clio::run::shared_ptr<GetTargetInfoTask> &task);
 
   /**
    * Get or create a tag (Method::kGetOrCreateTag)
    */
   template <typename CreateParamsT = CreateParams>
-  clio::run::TaskResume GetOrCreateTag(ctp::ipc::FullPtr<GetOrCreateTagTask<CreateParamsT>> task,
-                      clio::run::RunContext &rctx);
+  clio::run::TaskResume GetOrCreateTag(clio::run::shared_ptr<GetOrCreateTagTask<CreateParamsT>> &task);
 
   /**
-   * Put blob (Method::kPutBlob) - allocates and writes data to blob
-   * Returns TaskResume for coroutine-based async operations
+   * Put/Get/Reorganize blob handlers. The real logic lives once in the
+   * *Impl<TaskT> member templates; the public handlers (and the POD variants
+   * Pod*Blob, Method::kPod*) are thin wrappers. Both the priv::string and
+   * fixed_string blob-name types expose .str(), so the impls are agnostic to
+   * which task carries them — that is the code-dedup for issue #556.
    */
-  clio::run::TaskResume PutBlob(ctp::ipc::FullPtr<PutBlobTask> task, clio::run::RunContext &rctx);
+  template <typename TaskT>
+  clio::run::TaskResume PutBlobImpl(clio::run::shared_ptr<TaskT> &task);
+  template <typename TaskT>
+  clio::run::TaskResume GetBlobImpl(clio::run::shared_ptr<TaskT> &task);
+  template <typename TaskT>
+  clio::run::TaskResume ReorganizeBlobImpl(clio::run::shared_ptr<TaskT> &task);
 
-  /**
-   * Get blob (Method::kGetBlob) - reads data from existing blob
-   * Returns TaskResume for coroutine-based async operations
-   */
-  clio::run::TaskResume GetBlob(ctp::ipc::FullPtr<GetBlobTask> task, clio::run::RunContext &rctx);
+  /** Put blob (Method::kPutBlob) - allocates and writes data to blob. */
+  clio::run::TaskResume PutBlob(clio::run::shared_ptr<PutBlobTask> &task);
+  /** Get blob (Method::kGetBlob) - reads data from existing blob. */
+  clio::run::TaskResume GetBlob(clio::run::shared_ptr<GetBlobTask> &task);
+  /** Reorganize single blob (Method::kReorganizeBlob) - update score. */
+  clio::run::TaskResume ReorganizeBlob(clio::run::shared_ptr<ReorganizeBlobTask> &task);
 
-  /**
-   * Reorganize single blob (Method::kReorganizeBlob) - update score for single
-   * blob. Returns TaskResume for coroutine-based async operations
-   */
-  clio::run::TaskResume ReorganizeBlob(ctp::ipc::FullPtr<ReorganizeBlobTask> task,
-                                 clio::run::RunContext &rctx);
+  /** Fully-POD, GPU-compatible blob handlers (issue #556). Thin wrappers over
+   *  the *Impl<TaskT> templates above. */
+  clio::run::TaskResume PodPutBlob(clio::run::shared_ptr<PodPutBlobTask> &task);
+  clio::run::TaskResume PodGetBlob(clio::run::shared_ptr<PodGetBlobTask> &task);
+  clio::run::TaskResume PodReorganizeBlob(
+      clio::run::shared_ptr<PodReorganizeBlobTask> &task);
 
   /**
    * Delete blob operation - removes blob and decrements tag size
    * Returns TaskResume for coroutine-based async operations
    */
-  clio::run::TaskResume DelBlob(ctp::ipc::FullPtr<DelBlobTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume DelBlob(clio::run::shared_ptr<DelBlobTask> &task);
 
   /**
    * Truncate blob (Method::kTruncateBlob) - resize a blob to an exact logical
    * size (grow/shrink) via the shared ResizeBlob helper.
    */
-  clio::run::TaskResume TruncateBlob(ctp::ipc::FullPtr<TruncateBlobTask> task,
-                               clio::run::RunContext &rctx);
+  clio::run::TaskResume TruncateBlob(clio::run::shared_ptr<TruncateBlobTask> &task);
 
   /**
    * Rename tag (Method::kRenameTag) - change a tag's name in place, keeping
    * its TagId (and all blobs). Broadcast op; shares no data movement.
    */
-  clio::run::TaskResume RenameTag(ctp::ipc::FullPtr<RenameTagTask> task,
-                            clio::run::RunContext &rctx);
+  clio::run::TaskResume RenameTag(clio::run::shared_ptr<RenameTagTask> &task);
 
   /**
    * GetOrCreateTagAlias (Method::kGetOrCreateTagAlias) - bind an extra name to
    * an existing tag's id (hard link at the tag level). Broadcast op.
    */
   clio::run::TaskResume GetOrCreateTagAlias(
-      ctp::ipc::FullPtr<GetOrCreateTagAliasTask> task, clio::run::RunContext &rctx);
+      clio::run::shared_ptr<GetOrCreateTagAliasTask> &task);
 
   /**
    * Delete tag operation - removes all blobs from tag and removes tag
    * Returns TaskResume for coroutine-based async operations
    */
-  clio::run::TaskResume DelTag(ctp::ipc::FullPtr<DelTagTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume DelTag(clio::run::shared_ptr<DelTagTask> &task);
 
   /**
    * GetTagName (Method::kGetTagName) - resolve a TagId to its full, absolute
    * tag name by walking the stored relative "$tagid{parent}/leaf" references.
    * Broadcast op; the container owning the tag's metadata answers.
    */
-  clio::run::TaskResume GetTagName(ctp::ipc::FullPtr<GetTagNameTask> task,
-                             clio::run::RunContext &rctx);
+  clio::run::TaskResume GetTagName(clio::run::shared_ptr<GetTagNameTask> &task);
 
   /**
    * Get tag size operation - returns total size of all blobs in tag
    */
-  clio::run::TaskResume GetTagSize(ctp::ipc::FullPtr<GetTagSizeTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume GetTagSize(clio::run::shared_ptr<GetTagSizeTask> &task);
 
   /**
    * Get max (total) capacity — sum of max_capacity_ over targets registered on
    * this node. Broadcast to sum across the cluster (AggregateOut adds replicas).
    */
-  clio::run::TaskResume GetCapacity(ctp::ipc::FullPtr<GetCapacityTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume GetCapacity(clio::run::shared_ptr<GetCapacityTask> &task);
 
   /**
    * GetNumAliases (Method::kGetNumAliases) - number of extra names (tag-level
@@ -211,21 +214,20 @@ public:
    * the POSIX link count is num_aliases_ + 1. Broadcast op; the container that
    * owns the tag answers.
    */
-  clio::run::TaskResume GetNumAliases(ctp::ipc::FullPtr<GetNumAliasesTask> task,
-                                clio::run::RunContext &rctx);
+  clio::run::TaskResume GetNumAliases(clio::run::shared_ptr<GetNumAliasesTask> &task);
 
   /**
    * Schedule a task by resolving Dynamic pool queries.
    */
-  clio::run::PoolQuery ScheduleTask(const ctp::ipc::FullPtr<clio::run::Task> &task) override;
+  clio::run::PoolQuery ScheduleTask(const clio::run::shared_ptr<clio::run::Task> &task) override;
 
   // Pure virtual methods - implementations are in autogen/core_lib_exec.cc
   void Init(const clio::run::PoolId &pool_id, const std::string &pool_name,
             clio::run::u32 container_id = 0) override;
   void Restart(const clio::run::PoolId &pool_id, const std::string &pool_name,
                clio::run::u32 container_id = 0) override;
-  clio::run::TaskResume Run(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> task_ptr,
-                      clio::run::RunContext &rctx) override;
+  clio::run::TaskResume Run(clio::run::u32 method,
+                      clio::run::shared_ptr<clio::run::Task> task_ptr) override;
   clio::run::u64 GetWorkRemaining() const override;
 
   /**
@@ -239,22 +241,21 @@ public:
 
   // Container virtual method implementations (defined in autogen/core_lib_exec.cc)
   void SaveTask(clio::run::u32 method, clio::run::SaveTaskArchive &archive,
-                ctp::ipc::FullPtr<clio::run::Task> task_ptr) override;
+                clio::run::shared_ptr<clio::run::Task>& task_ptr) override;
   void LoadTask(clio::run::u32 method, clio::run::LoadTaskArchive &archive,
-                ctp::ipc::FullPtr<clio::run::Task> task_ptr) override;
-  ctp::ipc::FullPtr<clio::run::Task> AllocLoadTask(clio::run::u32 method, clio::run::LoadTaskArchive &archive) override;
-  ctp::ipc::FullPtr<clio::run::Task> NewCopyTask(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> orig_task_ptr,
+                clio::run::shared_ptr<clio::run::Task>& task_ptr) override;
+  clio::run::shared_ptr<clio::run::Task> AllocLoadTask(clio::run::u32 method, clio::run::LoadTaskArchive &archive) override;
+  clio::run::shared_ptr<clio::run::Task> NewCopyTask(clio::run::u32 method, clio::run::shared_ptr<clio::run::Task> &orig_task_ptr,
                                         bool deep) override;
-  ctp::ipc::FullPtr<clio::run::Task> NewTask(clio::run::u32 method) override;
-  void AggregateOut(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> orig_task,
-                 const ctp::ipc::FullPtr<clio::run::Task>& replica_task) override;
-  void DelTask(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> task_ptr) override;
+  clio::run::shared_ptr<clio::run::Task> NewTask(clio::run::u32 method) override;
+  void AggregateOut(clio::run::u32 method, clio::run::shared_ptr<clio::run::Task> &orig_task,
+                 const clio::run::shared_ptr<clio::run::Task>& replica_task) override;
   void LocalLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive &archive,
-                     ctp::ipc::FullPtr<clio::run::Task> task_ptr) override;
-  ctp::ipc::FullPtr<clio::run::Task> LocalAllocLoadTask(clio::run::u32 method,
+                     clio::run::shared_ptr<clio::run::Task>& task_ptr) override;
+  clio::run::shared_ptr<clio::run::Task> LocalAllocLoadTask(clio::run::u32 method,
                                                clio::run::DefaultLoadArchive &archive) override;
   void LocalSaveTask(clio::run::u32 method, clio::run::DefaultSaveArchive &archive,
-                     ctp::ipc::FullPtr<clio::run::Task> task_ptr) override;
+                     clio::run::shared_ptr<clio::run::Task>& task_ptr) override;
 
 private:
   // Queue ID constants (REQUIRED: Use semantic names, not raw integers)
@@ -635,44 +636,42 @@ private:
    * @param task PollTelemetryLog task containing parameters and results
    * @param rctx Runtime context for task execution
    */
-  clio::run::TaskResume PollTelemetryLog(ctp::ipc::FullPtr<PollTelemetryLogTask> task,
-                        clio::run::RunContext &rctx);
+  clio::run::TaskResume PollTelemetryLog(clio::run::shared_ptr<PollTelemetryLogTask> &task);
 
   /**
    * Get blob score operation - returns the score of a blob
    * @param task GetBlobScore task containing blob lookup parameters and results
    * @param rctx Runtime context for task execution
    */
-  clio::run::TaskResume GetBlobScore(ctp::ipc::FullPtr<GetBlobScoreTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume GetBlobScore(clio::run::shared_ptr<GetBlobScoreTask> &task);
 
   /**
    * Get blob size operation - returns the size of a blob in bytes
    * @param task GetBlobSize task containing blob lookup parameters and results
    * @param rctx Runtime context for task execution
    */
-  clio::run::TaskResume GetBlobSize(ctp::ipc::FullPtr<GetBlobSizeTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume GetBlobSize(clio::run::shared_ptr<GetBlobSizeTask> &task);
 
   /**
    * Get contained blobs operation - returns all blob names in a tag
    * @param task GetContainedBlobs task containing tag ID and results
    * @param rctx Runtime context for task execution
    */
-  clio::run::TaskResume GetContainedBlobs(ctp::ipc::FullPtr<GetContainedBlobsTask> task,
-                         clio::run::RunContext &rctx);
+  clio::run::TaskResume GetContainedBlobs(clio::run::shared_ptr<GetContainedBlobsTask> &task);
 
   /**
    * Query tags by regex pattern (Method::kTagQuery)
    * @param task TagQuery task containing regex pattern and results
    * @param rctx Runtime context for task execution
    */
-  clio::run::TaskResume TagQuery(ctp::ipc::FullPtr<TagQueryTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume TagQuery(clio::run::shared_ptr<TagQueryTask> &task);
 
   /**
    * Query blobs by tag and blob regex patterns (Method::kBlobQuery)
    * @param task BlobQuery task containing regex patterns and results
    * @param rctx Runtime context for task execution
    */
-  clio::run::TaskResume BlobQuery(ctp::ipc::FullPtr<BlobQueryTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume BlobQuery(clio::run::shared_ptr<BlobQueryTask> &task);
 
   /**
    * BM25 keyword search over blob contents (Method::kSemanticSearch).
@@ -681,8 +680,7 @@ private:
    * Okapi BM25 with corpus stats computed over the matched working
    * set. Returns top-k results sorted by descending score.
    */
-  clio::run::TaskResume SemanticSearch(ctp::ipc::FullPtr<SemanticSearchTask> task,
-                                 clio::run::RunContext &rctx);
+  clio::run::TaskResume SemanticSearch(clio::run::shared_ptr<SemanticSearchTask> &task);
 
   /**
    * Timestamp-window search over blob metadata (Method::kTemporalSearch).
@@ -690,8 +688,7 @@ private:
    * regex then returns blobs whose last_modified_ falls within
    * [time_begin_, time_end_], sorted by ascending last_modified_.
    */
-  clio::run::TaskResume TemporalSearch(ctp::ipc::FullPtr<TemporalSearchTask> task,
-                                 clio::run::RunContext &rctx);
+  clio::run::TaskResume TemporalSearch(clio::run::shared_ptr<TemporalSearchTask> &task);
 
   /**
    * Get comprehensive blob metadata (Method::kGetBlobInfo)
@@ -699,17 +696,17 @@ private:
    * @param task GetBlobInfo task containing blob lookup parameters and results
    * @param rctx Runtime context for task execution
    */
-  clio::run::TaskResume GetBlobInfo(ctp::ipc::FullPtr<GetBlobInfoTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume GetBlobInfo(clio::run::shared_ptr<GetBlobInfoTask> &task);
 
   /**
    * Flush metadata to durable storage (Method::kFlushMetadata)
    */
-  clio::run::TaskResume FlushMetadata(ctp::ipc::FullPtr<FlushMetadataTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume FlushMetadata(clio::run::shared_ptr<FlushMetadataTask> &task);
 
   /**
    * Flush data from volatile to non-volatile targets (Method::kFlushData)
    */
-  clio::run::TaskResume FlushData(ctp::ipc::FullPtr<FlushDataTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume FlushData(clio::run::shared_ptr<FlushDataTask> &task);
 
 private:
   /**

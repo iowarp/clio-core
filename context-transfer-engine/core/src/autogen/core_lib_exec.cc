@@ -37,193 +37,208 @@ void Runtime::Restart(const clio::run::PoolId &pool_id, const std::string &pool_
   Init(pool_id, pool_name, container_id);
 }
 
-clio::run::TaskResume Runtime::Run(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> task_ptr, clio::run::RunContext& rctx) {
+clio::run::TaskResume Runtime::Run(clio::run::u32 method, clio::run::shared_ptr<clio::run::Task> task_ptr) {
   CLIO_TASK_BODY_BEGIN
   switch (method) {
     case Method::kCreate: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<CreateTask> typed_task = task_ptr.template Cast<CreateTask>();
-      CLIO_CO_AWAIT(Create(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<CreateTask>();
+      CLIO_CO_AWAIT(Create(typed_task));
       break;
     }
     case Method::kDestroy: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<DestroyTask> typed_task = task_ptr.template Cast<DestroyTask>();
-      CLIO_CO_AWAIT(Destroy(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<DestroyTask>();
+      CLIO_CO_AWAIT(Destroy(typed_task));
       break;
     }
     case Method::kMonitor: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<MonitorTask> typed_task = task_ptr.template Cast<MonitorTask>();
-      CLIO_CO_AWAIT(Monitor(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<MonitorTask>();
+      CLIO_CO_AWAIT(Monitor(typed_task));
       break;
     }
     case Method::kRegisterTarget: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<RegisterTargetTask> typed_task = task_ptr.template Cast<RegisterTargetTask>();
-      CLIO_CO_AWAIT(RegisterTarget(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<RegisterTargetTask>();
+      CLIO_CO_AWAIT(RegisterTarget(typed_task));
       break;
     }
     case Method::kUnregisterTarget: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<UnregisterTargetTask> typed_task = task_ptr.template Cast<UnregisterTargetTask>();
-      CLIO_CO_AWAIT(UnregisterTarget(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<UnregisterTargetTask>();
+      CLIO_CO_AWAIT(UnregisterTarget(typed_task));
       break;
     }
     case Method::kListTargets: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<ListTargetsTask> typed_task = task_ptr.template Cast<ListTargetsTask>();
-      CLIO_CO_AWAIT(ListTargets(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<ListTargetsTask>();
+      CLIO_CO_AWAIT(ListTargets(typed_task));
       break;
     }
     case Method::kStatTargets: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<StatTargetsTask> typed_task = task_ptr.template Cast<StatTargetsTask>();
-      CLIO_CO_AWAIT(StatTargets(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<StatTargetsTask>();
+      CLIO_CO_AWAIT(StatTargets(typed_task));
       break;
     }
     case Method::kGetOrCreateTag: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<core::GetOrCreateTagTask<core::CreateParams>> typed_task = task_ptr.template Cast<core::GetOrCreateTagTask<core::CreateParams>>();
-      CLIO_CO_AWAIT(GetOrCreateTag(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<core::GetOrCreateTagTask<core::CreateParams>>();
+      CLIO_CO_AWAIT(GetOrCreateTag(typed_task));
       break;
     }
     case Method::kPutBlob: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<PutBlobTask> typed_task = task_ptr.template Cast<PutBlobTask>();
-      CLIO_CO_AWAIT(PutBlob(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<PutBlobTask>();
+      CLIO_CO_AWAIT(PutBlob(typed_task));
       break;
     }
     case Method::kGetBlob: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<GetBlobTask> typed_task = task_ptr.template Cast<GetBlobTask>();
-      CLIO_CO_AWAIT(GetBlob(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<GetBlobTask>();
+      CLIO_CO_AWAIT(GetBlob(typed_task));
       break;
     }
     case Method::kReorganizeBlob: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<ReorganizeBlobTask> typed_task = task_ptr.template Cast<ReorganizeBlobTask>();
-      CLIO_CO_AWAIT(ReorganizeBlob(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<ReorganizeBlobTask>();
+      CLIO_CO_AWAIT(ReorganizeBlob(typed_task));
+      break;
+    }
+    case Method::kPodPutBlob: {
+      auto& typed_task = task_ptr.template Cast<PodPutBlobTask>();
+      CLIO_CO_AWAIT(PodPutBlob(typed_task));
+      break;
+    }
+    case Method::kPodGetBlob: {
+      auto& typed_task = task_ptr.template Cast<PodGetBlobTask>();
+      CLIO_CO_AWAIT(PodGetBlob(typed_task));
+      break;
+    }
+    case Method::kPodReorganizeBlob: {
+      auto& typed_task = task_ptr.template Cast<PodReorganizeBlobTask>();
+      CLIO_CO_AWAIT(PodReorganizeBlob(typed_task));
       break;
     }
     case Method::kDelBlob: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<DelBlobTask> typed_task = task_ptr.template Cast<DelBlobTask>();
-      CLIO_CO_AWAIT(DelBlob(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<DelBlobTask>();
+      CLIO_CO_AWAIT(DelBlob(typed_task));
       break;
     }
     case Method::kTruncateBlob: {
-      ctp::ipc::FullPtr<TruncateBlobTask> typed_task = task_ptr.template Cast<TruncateBlobTask>();
-      CLIO_CO_AWAIT(TruncateBlob(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<TruncateBlobTask>();
+      CLIO_CO_AWAIT(TruncateBlob(typed_task));
       break;
     }
     case Method::kDelTag: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<DelTagTask> typed_task = task_ptr.template Cast<DelTagTask>();
-      CLIO_CO_AWAIT(DelTag(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<DelTagTask>();
+      CLIO_CO_AWAIT(DelTag(typed_task));
       break;
     }
     case Method::kRenameTag: {
-      ctp::ipc::FullPtr<RenameTagTask> typed_task = task_ptr.template Cast<RenameTagTask>();
-      CLIO_CO_AWAIT(RenameTag(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<RenameTagTask>();
+      CLIO_CO_AWAIT(RenameTag(typed_task));
       break;
     }
     case Method::kGetOrCreateTagAlias: {
-      ctp::ipc::FullPtr<GetOrCreateTagAliasTask> typed_task = task_ptr.template Cast<GetOrCreateTagAliasTask>();
-      CLIO_CO_AWAIT(GetOrCreateTagAlias(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<GetOrCreateTagAliasTask>();
+      CLIO_CO_AWAIT(GetOrCreateTagAlias(typed_task));
       break;
     }
     case Method::kGetTagName: {
-      ctp::ipc::FullPtr<GetTagNameTask> typed_task = task_ptr.template Cast<GetTagNameTask>();
-      CLIO_CO_AWAIT(GetTagName(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<GetTagNameTask>();
+      CLIO_CO_AWAIT(GetTagName(typed_task));
       break;
     }
     case Method::kGetTagSize: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<GetTagSizeTask> typed_task = task_ptr.template Cast<GetTagSizeTask>();
-      CLIO_CO_AWAIT(GetTagSize(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<GetTagSizeTask>();
+      CLIO_CO_AWAIT(GetTagSize(typed_task));
       break;
     }
     case Method::kGetCapacity: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<GetCapacityTask> typed_task = task_ptr.template Cast<GetCapacityTask>();
-      CLIO_CO_AWAIT(GetCapacity(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<GetCapacityTask>();
+      CLIO_CO_AWAIT(GetCapacity(typed_task));
       break;
     }
     case Method::kGetNumAliases: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<GetNumAliasesTask> typed_task = task_ptr.template Cast<GetNumAliasesTask>();
-      CLIO_CO_AWAIT(GetNumAliases(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<GetNumAliasesTask>();
+      CLIO_CO_AWAIT(GetNumAliases(typed_task));
       break;
     }
     case Method::kPollTelemetryLog: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<PollTelemetryLogTask> typed_task = task_ptr.template Cast<PollTelemetryLogTask>();
-      CLIO_CO_AWAIT(PollTelemetryLog(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<PollTelemetryLogTask>();
+      CLIO_CO_AWAIT(PollTelemetryLog(typed_task));
       break;
     }
     case Method::kGetBlobScore: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<GetBlobScoreTask> typed_task = task_ptr.template Cast<GetBlobScoreTask>();
-      CLIO_CO_AWAIT(GetBlobScore(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<GetBlobScoreTask>();
+      CLIO_CO_AWAIT(GetBlobScore(typed_task));
       break;
     }
     case Method::kGetBlobSize: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<GetBlobSizeTask> typed_task = task_ptr.template Cast<GetBlobSizeTask>();
-      CLIO_CO_AWAIT(GetBlobSize(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<GetBlobSizeTask>();
+      CLIO_CO_AWAIT(GetBlobSize(typed_task));
       break;
     }
     case Method::kGetContainedBlobs: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<GetContainedBlobsTask> typed_task = task_ptr.template Cast<GetContainedBlobsTask>();
-      CLIO_CO_AWAIT(GetContainedBlobs(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<GetContainedBlobsTask>();
+      CLIO_CO_AWAIT(GetContainedBlobs(typed_task));
       break;
     }
     case Method::kGetBlobInfo: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<GetBlobInfoTask> typed_task = task_ptr.template Cast<GetBlobInfoTask>();
-      CLIO_CO_AWAIT(GetBlobInfo(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<GetBlobInfoTask>();
+      CLIO_CO_AWAIT(GetBlobInfo(typed_task));
       break;
     }
     case Method::kTagQuery: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<TagQueryTask> typed_task = task_ptr.template Cast<TagQueryTask>();
-      CLIO_CO_AWAIT(TagQuery(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<TagQueryTask>();
+      CLIO_CO_AWAIT(TagQuery(typed_task));
       break;
     }
     case Method::kBlobQuery: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<BlobQueryTask> typed_task = task_ptr.template Cast<BlobQueryTask>();
-      CLIO_CO_AWAIT(BlobQuery(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<BlobQueryTask>();
+      CLIO_CO_AWAIT(BlobQuery(typed_task));
       break;
     }
     case Method::kGetTargetInfo: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<GetTargetInfoTask> typed_task = task_ptr.template Cast<GetTargetInfoTask>();
-      CLIO_CO_AWAIT(GetTargetInfo(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<GetTargetInfoTask>();
+      CLIO_CO_AWAIT(GetTargetInfo(typed_task));
       break;
     }
     case Method::kFlushMetadata: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<FlushMetadataTask> typed_task = task_ptr.template Cast<FlushMetadataTask>();
-      CLIO_CO_AWAIT(FlushMetadata(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<FlushMetadataTask>();
+      CLIO_CO_AWAIT(FlushMetadata(typed_task));
       break;
     }
     case Method::kFlushData: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<FlushDataTask> typed_task = task_ptr.template Cast<FlushDataTask>();
-      CLIO_CO_AWAIT(FlushData(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<FlushDataTask>();
+      CLIO_CO_AWAIT(FlushData(typed_task));
       break;
     }
     case Method::kSemanticSearch: {
-      ctp::ipc::FullPtr<SemanticSearchTask> typed_task = task_ptr.template Cast<SemanticSearchTask>();
-      CLIO_CO_AWAIT(SemanticSearch(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<SemanticSearchTask>();
+      CLIO_CO_AWAIT(SemanticSearch(typed_task));
       break;
     }
     case Method::kTemporalSearch: {
-      ctp::ipc::FullPtr<TemporalSearchTask> typed_task = task_ptr.template Cast<TemporalSearchTask>();
-      CLIO_CO_AWAIT(TemporalSearch(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<TemporalSearchTask>();
+      CLIO_CO_AWAIT(TemporalSearch(typed_task));
       break;
     }
     default: {
@@ -236,166 +251,181 @@ clio::run::TaskResume Runtime::Run(clio::run::u32 method, ctp::ipc::FullPtr<clio
 }
 
 void Runtime::SaveTask(clio::run::u32 method, clio::run::SaveTaskArchive& archive, 
-                        ctp::ipc::FullPtr<clio::run::Task> task_ptr) {
+                        clio::run::shared_ptr<clio::run::Task>& task_ptr) {
   switch (method) {
     case Method::kCreate: {
-      auto typed_task = task_ptr.template Cast<CreateTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<CreateTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kDestroy: {
-      auto typed_task = task_ptr.template Cast<DestroyTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<DestroyTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kMonitor: {
-      auto typed_task = task_ptr.template Cast<MonitorTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<MonitorTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kRegisterTarget: {
-      auto typed_task = task_ptr.template Cast<RegisterTargetTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<RegisterTargetTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kUnregisterTarget: {
-      auto typed_task = task_ptr.template Cast<UnregisterTargetTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<UnregisterTargetTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kListTargets: {
-      auto typed_task = task_ptr.template Cast<ListTargetsTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<ListTargetsTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kStatTargets: {
-      auto typed_task = task_ptr.template Cast<StatTargetsTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<StatTargetsTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kGetOrCreateTag: {
-      auto typed_task = task_ptr.template Cast<core::GetOrCreateTagTask<core::CreateParams>>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<core::GetOrCreateTagTask<core::CreateParams>>();
+      archive << *typed_task;
       break;
     }
     case Method::kPutBlob: {
-      auto typed_task = task_ptr.template Cast<PutBlobTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<PutBlobTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kGetBlob: {
-      auto typed_task = task_ptr.template Cast<GetBlobTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<GetBlobTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kReorganizeBlob: {
-      auto typed_task = task_ptr.template Cast<ReorganizeBlobTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<ReorganizeBlobTask>();
+      archive << *typed_task;
+      break;
+    }
+    case Method::kPodPutBlob: {
+      auto& typed_task = task_ptr.template Cast<PodPutBlobTask>();
+      archive << *typed_task;
+      break;
+    }
+    case Method::kPodGetBlob: {
+      auto& typed_task = task_ptr.template Cast<PodGetBlobTask>();
+      archive << *typed_task;
+      break;
+    }
+    case Method::kPodReorganizeBlob: {
+      auto& typed_task = task_ptr.template Cast<PodReorganizeBlobTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kDelBlob: {
-      auto typed_task = task_ptr.template Cast<DelBlobTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<DelBlobTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kTruncateBlob: {
-      auto typed_task = task_ptr.template Cast<TruncateBlobTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<TruncateBlobTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kDelTag: {
-      auto typed_task = task_ptr.template Cast<DelTagTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<DelTagTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kRenameTag: {
-      auto typed_task = task_ptr.template Cast<RenameTagTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<RenameTagTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kGetOrCreateTagAlias: {
-      auto typed_task = task_ptr.template Cast<GetOrCreateTagAliasTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<GetOrCreateTagAliasTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kGetTagName: {
-      auto typed_task = task_ptr.template Cast<GetTagNameTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<GetTagNameTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kGetTagSize: {
-      auto typed_task = task_ptr.template Cast<GetTagSizeTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<GetTagSizeTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kGetCapacity: {
-      auto typed_task = task_ptr.template Cast<GetCapacityTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<GetCapacityTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kGetNumAliases: {
-      auto typed_task = task_ptr.template Cast<GetNumAliasesTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<GetNumAliasesTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kPollTelemetryLog: {
-      auto typed_task = task_ptr.template Cast<PollTelemetryLogTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<PollTelemetryLogTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kGetBlobScore: {
-      auto typed_task = task_ptr.template Cast<GetBlobScoreTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<GetBlobScoreTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kGetBlobSize: {
-      auto typed_task = task_ptr.template Cast<GetBlobSizeTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<GetBlobSizeTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kGetContainedBlobs: {
-      auto typed_task = task_ptr.template Cast<GetContainedBlobsTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<GetContainedBlobsTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kGetBlobInfo: {
-      auto typed_task = task_ptr.template Cast<GetBlobInfoTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<GetBlobInfoTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kTagQuery: {
-      auto typed_task = task_ptr.template Cast<TagQueryTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<TagQueryTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kBlobQuery: {
-      auto typed_task = task_ptr.template Cast<BlobQueryTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<BlobQueryTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kGetTargetInfo: {
-      auto typed_task = task_ptr.template Cast<GetTargetInfoTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<GetTargetInfoTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kFlushMetadata: {
-      auto typed_task = task_ptr.template Cast<FlushMetadataTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<FlushMetadataTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kFlushData: {
-      auto typed_task = task_ptr.template Cast<FlushDataTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<FlushDataTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kSemanticSearch: {
-      auto typed_task = task_ptr.template Cast<SemanticSearchTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<SemanticSearchTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kTemporalSearch: {
-      auto typed_task = task_ptr.template Cast<TemporalSearchTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<TemporalSearchTask>();
+      archive << *typed_task;
       break;
     }
     default: {
@@ -406,166 +436,181 @@ void Runtime::SaveTask(clio::run::u32 method, clio::run::SaveTaskArchive& archiv
 }
 
 void Runtime::LoadTask(clio::run::u32 method, clio::run::LoadTaskArchive& archive,
-                        ctp::ipc::FullPtr<clio::run::Task> task_ptr) {
+                        clio::run::shared_ptr<clio::run::Task>& task_ptr) {
   switch (method) {
     case Method::kCreate: {
-      auto typed_task = task_ptr.template Cast<CreateTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<CreateTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kDestroy: {
-      auto typed_task = task_ptr.template Cast<DestroyTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<DestroyTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kMonitor: {
-      auto typed_task = task_ptr.template Cast<MonitorTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<MonitorTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kRegisterTarget: {
-      auto typed_task = task_ptr.template Cast<RegisterTargetTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<RegisterTargetTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kUnregisterTarget: {
-      auto typed_task = task_ptr.template Cast<UnregisterTargetTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<UnregisterTargetTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kListTargets: {
-      auto typed_task = task_ptr.template Cast<ListTargetsTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<ListTargetsTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kStatTargets: {
-      auto typed_task = task_ptr.template Cast<StatTargetsTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<StatTargetsTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kGetOrCreateTag: {
-      auto typed_task = task_ptr.template Cast<core::GetOrCreateTagTask<core::CreateParams>>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<core::GetOrCreateTagTask<core::CreateParams>>();
+      archive >> *typed_task;
       break;
     }
     case Method::kPutBlob: {
-      auto typed_task = task_ptr.template Cast<PutBlobTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<PutBlobTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kGetBlob: {
-      auto typed_task = task_ptr.template Cast<GetBlobTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<GetBlobTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kReorganizeBlob: {
-      auto typed_task = task_ptr.template Cast<ReorganizeBlobTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<ReorganizeBlobTask>();
+      archive >> *typed_task;
+      break;
+    }
+    case Method::kPodPutBlob: {
+      auto& typed_task = task_ptr.template Cast<PodPutBlobTask>();
+      archive >> *typed_task;
+      break;
+    }
+    case Method::kPodGetBlob: {
+      auto& typed_task = task_ptr.template Cast<PodGetBlobTask>();
+      archive >> *typed_task;
+      break;
+    }
+    case Method::kPodReorganizeBlob: {
+      auto& typed_task = task_ptr.template Cast<PodReorganizeBlobTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kDelBlob: {
-      auto typed_task = task_ptr.template Cast<DelBlobTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<DelBlobTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kTruncateBlob: {
-      auto typed_task = task_ptr.template Cast<TruncateBlobTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<TruncateBlobTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kDelTag: {
-      auto typed_task = task_ptr.template Cast<DelTagTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<DelTagTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kRenameTag: {
-      auto typed_task = task_ptr.template Cast<RenameTagTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<RenameTagTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kGetOrCreateTagAlias: {
-      auto typed_task = task_ptr.template Cast<GetOrCreateTagAliasTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<GetOrCreateTagAliasTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kGetTagName: {
-      auto typed_task = task_ptr.template Cast<GetTagNameTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<GetTagNameTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kGetTagSize: {
-      auto typed_task = task_ptr.template Cast<GetTagSizeTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<GetTagSizeTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kGetCapacity: {
-      auto typed_task = task_ptr.template Cast<GetCapacityTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<GetCapacityTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kGetNumAliases: {
-      auto typed_task = task_ptr.template Cast<GetNumAliasesTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<GetNumAliasesTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kPollTelemetryLog: {
-      auto typed_task = task_ptr.template Cast<PollTelemetryLogTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<PollTelemetryLogTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kGetBlobScore: {
-      auto typed_task = task_ptr.template Cast<GetBlobScoreTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<GetBlobScoreTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kGetBlobSize: {
-      auto typed_task = task_ptr.template Cast<GetBlobSizeTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<GetBlobSizeTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kGetContainedBlobs: {
-      auto typed_task = task_ptr.template Cast<GetContainedBlobsTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<GetContainedBlobsTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kGetBlobInfo: {
-      auto typed_task = task_ptr.template Cast<GetBlobInfoTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<GetBlobInfoTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kTagQuery: {
-      auto typed_task = task_ptr.template Cast<TagQueryTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<TagQueryTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kBlobQuery: {
-      auto typed_task = task_ptr.template Cast<BlobQueryTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<BlobQueryTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kGetTargetInfo: {
-      auto typed_task = task_ptr.template Cast<GetTargetInfoTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<GetTargetInfoTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kFlushMetadata: {
-      auto typed_task = task_ptr.template Cast<FlushMetadataTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<FlushMetadataTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kFlushData: {
-      auto typed_task = task_ptr.template Cast<FlushDataTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<FlushDataTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kSemanticSearch: {
-      auto typed_task = task_ptr.template Cast<SemanticSearchTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<SemanticSearchTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kTemporalSearch: {
-      auto typed_task = task_ptr.template Cast<TemporalSearchTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<TemporalSearchTask>();
+      archive >> *typed_task;
       break;
     }
     default: {
@@ -575,8 +620,8 @@ void Runtime::LoadTask(clio::run::u32 method, clio::run::LoadTaskArchive& archiv
   }
 }
 
-ctp::ipc::FullPtr<clio::run::Task> Runtime::AllocLoadTask(clio::run::u32 method, clio::run::LoadTaskArchive& archive) {
-  ctp::ipc::FullPtr<clio::run::Task> task_ptr = NewTask(method);
+clio::run::shared_ptr<clio::run::Task> Runtime::AllocLoadTask(clio::run::u32 method, clio::run::LoadTaskArchive& archive) {
+  clio::run::shared_ptr<clio::run::Task> task_ptr = NewTask(method);
   if (!task_ptr.IsNull()) {
     LoadTask(method, archive, task_ptr);
   }
@@ -584,194 +629,209 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::AllocLoadTask(clio::run::u32 method,
 }
 
 void Runtime::LocalLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive& archive,
-                            ctp::ipc::FullPtr<clio::run::Task> task_ptr) {
+                            clio::run::shared_ptr<clio::run::Task>& task_ptr) {
   switch (method) {
     case Method::kCreate: {
-      auto typed_task = task_ptr.template Cast<CreateTask>();
+      auto& typed_task = task_ptr.template Cast<CreateTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kDestroy: {
-      auto typed_task = task_ptr.template Cast<DestroyTask>();
+      auto& typed_task = task_ptr.template Cast<DestroyTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kMonitor: {
-      auto typed_task = task_ptr.template Cast<MonitorTask>();
+      auto& typed_task = task_ptr.template Cast<MonitorTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kRegisterTarget: {
-      auto typed_task = task_ptr.template Cast<RegisterTargetTask>();
+      auto& typed_task = task_ptr.template Cast<RegisterTargetTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kUnregisterTarget: {
-      auto typed_task = task_ptr.template Cast<UnregisterTargetTask>();
+      auto& typed_task = task_ptr.template Cast<UnregisterTargetTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kListTargets: {
-      auto typed_task = task_ptr.template Cast<ListTargetsTask>();
+      auto& typed_task = task_ptr.template Cast<ListTargetsTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kStatTargets: {
-      auto typed_task = task_ptr.template Cast<StatTargetsTask>();
+      auto& typed_task = task_ptr.template Cast<StatTargetsTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kGetOrCreateTag: {
-      auto typed_task = task_ptr.template Cast<core::GetOrCreateTagTask<core::CreateParams>>();
+      auto& typed_task = task_ptr.template Cast<core::GetOrCreateTagTask<core::CreateParams>>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kPutBlob: {
-      auto typed_task = task_ptr.template Cast<PutBlobTask>();
+      auto& typed_task = task_ptr.template Cast<PutBlobTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kGetBlob: {
-      auto typed_task = task_ptr.template Cast<GetBlobTask>();
+      auto& typed_task = task_ptr.template Cast<GetBlobTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kReorganizeBlob: {
-      auto typed_task = task_ptr.template Cast<ReorganizeBlobTask>();
+      auto& typed_task = task_ptr.template Cast<ReorganizeBlobTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
+      break;
+    }
+    case Method::kPodPutBlob: {
+      auto& typed_task = task_ptr.template Cast<PodPutBlobTask>();
+      archive >> *typed_task;
+      break;
+    }
+    case Method::kPodGetBlob: {
+      auto& typed_task = task_ptr.template Cast<PodGetBlobTask>();
+      archive >> *typed_task;
+      break;
+    }
+    case Method::kPodReorganizeBlob: {
+      auto& typed_task = task_ptr.template Cast<PodReorganizeBlobTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kDelBlob: {
-      auto typed_task = task_ptr.template Cast<DelBlobTask>();
+      auto& typed_task = task_ptr.template Cast<DelBlobTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kTruncateBlob: {
-      auto typed_task = task_ptr.template Cast<TruncateBlobTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<TruncateBlobTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kDelTag: {
-      auto typed_task = task_ptr.template Cast<DelTagTask>();
+      auto& typed_task = task_ptr.template Cast<DelTagTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kRenameTag: {
-      auto typed_task = task_ptr.template Cast<RenameTagTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<RenameTagTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kGetOrCreateTagAlias: {
-      auto typed_task = task_ptr.template Cast<GetOrCreateTagAliasTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<GetOrCreateTagAliasTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kGetTagName: {
-      auto typed_task = task_ptr.template Cast<GetTagNameTask>();
+      auto& typed_task = task_ptr.template Cast<GetTagNameTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kGetTagSize: {
-      auto typed_task = task_ptr.template Cast<GetTagSizeTask>();
+      auto& typed_task = task_ptr.template Cast<GetTagSizeTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kGetCapacity: {
-      auto typed_task = task_ptr.template Cast<GetCapacityTask>();
+      auto& typed_task = task_ptr.template Cast<GetCapacityTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kGetNumAliases: {
-      auto typed_task = task_ptr.template Cast<GetNumAliasesTask>();
+      auto& typed_task = task_ptr.template Cast<GetNumAliasesTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kPollTelemetryLog: {
-      auto typed_task = task_ptr.template Cast<PollTelemetryLogTask>();
+      auto& typed_task = task_ptr.template Cast<PollTelemetryLogTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kGetBlobScore: {
-      auto typed_task = task_ptr.template Cast<GetBlobScoreTask>();
+      auto& typed_task = task_ptr.template Cast<GetBlobScoreTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kGetBlobSize: {
-      auto typed_task = task_ptr.template Cast<GetBlobSizeTask>();
+      auto& typed_task = task_ptr.template Cast<GetBlobSizeTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kGetContainedBlobs: {
-      auto typed_task = task_ptr.template Cast<GetContainedBlobsTask>();
+      auto& typed_task = task_ptr.template Cast<GetContainedBlobsTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kGetBlobInfo: {
-      auto typed_task = task_ptr.template Cast<GetBlobInfoTask>();
+      auto& typed_task = task_ptr.template Cast<GetBlobInfoTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kTagQuery: {
-      auto typed_task = task_ptr.template Cast<TagQueryTask>();
+      auto& typed_task = task_ptr.template Cast<TagQueryTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kBlobQuery: {
-      auto typed_task = task_ptr.template Cast<BlobQueryTask>();
+      auto& typed_task = task_ptr.template Cast<BlobQueryTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kGetTargetInfo: {
-      auto typed_task = task_ptr.template Cast<GetTargetInfoTask>();
+      auto& typed_task = task_ptr.template Cast<GetTargetInfoTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kFlushMetadata: {
-      auto typed_task = task_ptr.template Cast<FlushMetadataTask>();
+      auto& typed_task = task_ptr.template Cast<FlushMetadataTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kFlushData: {
-      auto typed_task = task_ptr.template Cast<FlushDataTask>();
+      auto& typed_task = task_ptr.template Cast<FlushDataTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kSemanticSearch: {
-      auto typed_task = task_ptr.template Cast<SemanticSearchTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<SemanticSearchTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kTemporalSearch: {
-      auto typed_task = task_ptr.template Cast<TemporalSearchTask>();
+      auto& typed_task = task_ptr.template Cast<TemporalSearchTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     default: {
@@ -781,8 +841,8 @@ void Runtime::LocalLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive
   }
 }
 
-ctp::ipc::FullPtr<clio::run::Task> Runtime::LocalAllocLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive& archive) {
-  ctp::ipc::FullPtr<clio::run::Task> task_ptr = NewTask(method);
+clio::run::shared_ptr<clio::run::Task> Runtime::LocalAllocLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive& archive) {
+  clio::run::shared_ptr<clio::run::Task> task_ptr = NewTask(method);
   if (!task_ptr.IsNull()) {
     LocalLoadTask(method, archive, task_ptr);
   }
@@ -790,194 +850,209 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::LocalAllocLoadTask(clio::run::u32 me
 }
 
 void Runtime::LocalSaveTask(clio::run::u32 method, clio::run::DefaultSaveArchive& archive, 
-                             ctp::ipc::FullPtr<clio::run::Task> task_ptr) {
+                             clio::run::shared_ptr<clio::run::Task>& task_ptr) {
   switch (method) {
     case Method::kCreate: {
-      auto typed_task = task_ptr.template Cast<CreateTask>();
+      auto& typed_task = task_ptr.template Cast<CreateTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kDestroy: {
-      auto typed_task = task_ptr.template Cast<DestroyTask>();
+      auto& typed_task = task_ptr.template Cast<DestroyTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kMonitor: {
-      auto typed_task = task_ptr.template Cast<MonitorTask>();
+      auto& typed_task = task_ptr.template Cast<MonitorTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kRegisterTarget: {
-      auto typed_task = task_ptr.template Cast<RegisterTargetTask>();
+      auto& typed_task = task_ptr.template Cast<RegisterTargetTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kUnregisterTarget: {
-      auto typed_task = task_ptr.template Cast<UnregisterTargetTask>();
+      auto& typed_task = task_ptr.template Cast<UnregisterTargetTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kListTargets: {
-      auto typed_task = task_ptr.template Cast<ListTargetsTask>();
+      auto& typed_task = task_ptr.template Cast<ListTargetsTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kStatTargets: {
-      auto typed_task = task_ptr.template Cast<StatTargetsTask>();
+      auto& typed_task = task_ptr.template Cast<StatTargetsTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kGetOrCreateTag: {
-      auto typed_task = task_ptr.template Cast<core::GetOrCreateTagTask<core::CreateParams>>();
+      auto& typed_task = task_ptr.template Cast<core::GetOrCreateTagTask<core::CreateParams>>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kPutBlob: {
-      auto typed_task = task_ptr.template Cast<PutBlobTask>();
+      auto& typed_task = task_ptr.template Cast<PutBlobTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kGetBlob: {
-      auto typed_task = task_ptr.template Cast<GetBlobTask>();
+      auto& typed_task = task_ptr.template Cast<GetBlobTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kReorganizeBlob: {
-      auto typed_task = task_ptr.template Cast<ReorganizeBlobTask>();
+      auto& typed_task = task_ptr.template Cast<ReorganizeBlobTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
+      break;
+    }
+    case Method::kPodPutBlob: {
+      auto& typed_task = task_ptr.template Cast<PodPutBlobTask>();
+      archive << *typed_task;
+      break;
+    }
+    case Method::kPodGetBlob: {
+      auto& typed_task = task_ptr.template Cast<PodGetBlobTask>();
+      archive << *typed_task;
+      break;
+    }
+    case Method::kPodReorganizeBlob: {
+      auto& typed_task = task_ptr.template Cast<PodReorganizeBlobTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kDelBlob: {
-      auto typed_task = task_ptr.template Cast<DelBlobTask>();
+      auto& typed_task = task_ptr.template Cast<DelBlobTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kTruncateBlob: {
-      auto typed_task = task_ptr.template Cast<TruncateBlobTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<TruncateBlobTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kDelTag: {
-      auto typed_task = task_ptr.template Cast<DelTagTask>();
+      auto& typed_task = task_ptr.template Cast<DelTagTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kRenameTag: {
-      auto typed_task = task_ptr.template Cast<RenameTagTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<RenameTagTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kGetOrCreateTagAlias: {
-      auto typed_task = task_ptr.template Cast<GetOrCreateTagAliasTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<GetOrCreateTagAliasTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kGetTagName: {
-      auto typed_task = task_ptr.template Cast<GetTagNameTask>();
+      auto& typed_task = task_ptr.template Cast<GetTagNameTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kGetTagSize: {
-      auto typed_task = task_ptr.template Cast<GetTagSizeTask>();
+      auto& typed_task = task_ptr.template Cast<GetTagSizeTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kGetCapacity: {
-      auto typed_task = task_ptr.template Cast<GetCapacityTask>();
+      auto& typed_task = task_ptr.template Cast<GetCapacityTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kGetNumAliases: {
-      auto typed_task = task_ptr.template Cast<GetNumAliasesTask>();
+      auto& typed_task = task_ptr.template Cast<GetNumAliasesTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kPollTelemetryLog: {
-      auto typed_task = task_ptr.template Cast<PollTelemetryLogTask>();
+      auto& typed_task = task_ptr.template Cast<PollTelemetryLogTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kGetBlobScore: {
-      auto typed_task = task_ptr.template Cast<GetBlobScoreTask>();
+      auto& typed_task = task_ptr.template Cast<GetBlobScoreTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kGetBlobSize: {
-      auto typed_task = task_ptr.template Cast<GetBlobSizeTask>();
+      auto& typed_task = task_ptr.template Cast<GetBlobSizeTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kGetContainedBlobs: {
-      auto typed_task = task_ptr.template Cast<GetContainedBlobsTask>();
+      auto& typed_task = task_ptr.template Cast<GetContainedBlobsTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kGetBlobInfo: {
-      auto typed_task = task_ptr.template Cast<GetBlobInfoTask>();
+      auto& typed_task = task_ptr.template Cast<GetBlobInfoTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kTagQuery: {
-      auto typed_task = task_ptr.template Cast<TagQueryTask>();
+      auto& typed_task = task_ptr.template Cast<TagQueryTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kBlobQuery: {
-      auto typed_task = task_ptr.template Cast<BlobQueryTask>();
+      auto& typed_task = task_ptr.template Cast<BlobQueryTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kGetTargetInfo: {
-      auto typed_task = task_ptr.template Cast<GetTargetInfoTask>();
+      auto& typed_task = task_ptr.template Cast<GetTargetInfoTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kFlushMetadata: {
-      auto typed_task = task_ptr.template Cast<FlushMetadataTask>();
+      auto& typed_task = task_ptr.template Cast<FlushMetadataTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kFlushData: {
-      auto typed_task = task_ptr.template Cast<FlushDataTask>();
+      auto& typed_task = task_ptr.template Cast<FlushDataTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kSemanticSearch: {
-      auto typed_task = task_ptr.template Cast<SemanticSearchTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<SemanticSearchTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kTemporalSearch: {
-      auto typed_task = task_ptr.template Cast<TemporalSearchTask>();
+      auto& typed_task = task_ptr.template Cast<TemporalSearchTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     default: {
@@ -987,10 +1062,10 @@ void Runtime::LocalSaveTask(clio::run::u32 method, clio::run::DefaultSaveArchive
   }
 }
 
-ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> orig_task_ptr, bool deep) {
+clio::run::shared_ptr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, clio::run::shared_ptr<clio::run::Task>& orig_task_ptr, bool deep) {
   auto* ipc_manager = CLIO_IPC;
   if (!ipc_manager) {
-    return ctp::ipc::FullPtr<clio::run::Task>();
+    return clio::run::shared_ptr<clio::run::Task>();
   }
   
   switch (method) {
@@ -999,8 +1074,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<CreateTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<CreateTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<CreateTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<CreateTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -1010,8 +1085,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<DestroyTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<DestroyTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<DestroyTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<DestroyTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -1021,8 +1096,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<MonitorTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<MonitorTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<MonitorTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<MonitorTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -1032,8 +1107,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<RegisterTargetTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<RegisterTargetTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<RegisterTargetTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<RegisterTargetTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -1043,8 +1118,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<UnregisterTargetTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<UnregisterTargetTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<UnregisterTargetTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<UnregisterTargetTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -1054,8 +1129,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<ListTargetsTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<ListTargetsTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<ListTargetsTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<ListTargetsTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -1065,8 +1140,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<StatTargetsTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<StatTargetsTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<StatTargetsTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<StatTargetsTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -1076,8 +1151,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<core::GetOrCreateTagTask<core::CreateParams>>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<core::GetOrCreateTagTask<core::CreateParams>>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<core::GetOrCreateTagTask<core::CreateParams>>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<core::GetOrCreateTagTask<core::CreateParams>>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -1087,8 +1162,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<PutBlobTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<PutBlobTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<PutBlobTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<PutBlobTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -1098,8 +1173,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<GetBlobTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<GetBlobTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<GetBlobTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<GetBlobTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -1109,8 +1184,35 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<ReorganizeBlobTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<ReorganizeBlobTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<ReorganizeBlobTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<ReorganizeBlobTask>(task_typed.get()));
+        return new_task_ptr.template Cast<clio::run::Task>();
+      }
+      break;
+    }
+    case Method::kPodPutBlob: {
+      auto new_task_ptr = ipc_manager->NewTask<PodPutBlobTask>();
+      if (!new_task_ptr.IsNull()) {
+        auto& task_typed = orig_task_ptr.template Cast<PodPutBlobTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<PodPutBlobTask>(task_typed.get()));
+        return new_task_ptr.template Cast<clio::run::Task>();
+      }
+      break;
+    }
+    case Method::kPodGetBlob: {
+      auto new_task_ptr = ipc_manager->NewTask<PodGetBlobTask>();
+      if (!new_task_ptr.IsNull()) {
+        auto& task_typed = orig_task_ptr.template Cast<PodGetBlobTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<PodGetBlobTask>(task_typed.get()));
+        return new_task_ptr.template Cast<clio::run::Task>();
+      }
+      break;
+    }
+    case Method::kPodReorganizeBlob: {
+      auto new_task_ptr = ipc_manager->NewTask<PodReorganizeBlobTask>();
+      if (!new_task_ptr.IsNull()) {
+        auto& task_typed = orig_task_ptr.template Cast<PodReorganizeBlobTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<PodReorganizeBlobTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -1120,8 +1222,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<DelBlobTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<DelBlobTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<DelBlobTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<DelBlobTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -1129,8 +1231,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
     case Method::kTruncateBlob: {
       auto new_task_ptr = ipc_manager->NewTask<TruncateBlobTask>();
       if (!new_task_ptr.IsNull()) {
-        auto task_typed = orig_task_ptr.template Cast<TruncateBlobTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<TruncateBlobTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<TruncateBlobTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -1138,8 +1240,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
     case Method::kRenameTag: {
       auto new_task_ptr = ipc_manager->NewTask<RenameTagTask>();
       if (!new_task_ptr.IsNull()) {
-        auto task_typed = orig_task_ptr.template Cast<RenameTagTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<RenameTagTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<RenameTagTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -1147,8 +1249,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
     case Method::kGetOrCreateTagAlias: {
       auto new_task_ptr = ipc_manager->NewTask<GetOrCreateTagAliasTask>();
       if (!new_task_ptr.IsNull()) {
-        auto task_typed = orig_task_ptr.template Cast<GetOrCreateTagAliasTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<GetOrCreateTagAliasTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<GetOrCreateTagAliasTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -1158,8 +1260,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<DelTagTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<DelTagTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<DelTagTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<DelTagTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -1167,8 +1269,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
     case Method::kGetTagName: {
       auto new_task_ptr = ipc_manager->NewTask<GetTagNameTask>();
       if (!new_task_ptr.IsNull()) {
-        auto task_typed = orig_task_ptr.template Cast<GetTagNameTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<GetTagNameTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<GetTagNameTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -1178,8 +1280,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<GetTagSizeTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<GetTagSizeTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<GetTagSizeTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<GetTagSizeTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -1189,8 +1291,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<GetCapacityTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<GetCapacityTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<GetCapacityTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<GetCapacityTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -1200,8 +1302,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<GetNumAliasesTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<GetNumAliasesTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<GetNumAliasesTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<GetNumAliasesTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -1211,8 +1313,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<PollTelemetryLogTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<PollTelemetryLogTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<PollTelemetryLogTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<PollTelemetryLogTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -1222,8 +1324,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<GetBlobScoreTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<GetBlobScoreTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<GetBlobScoreTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<GetBlobScoreTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -1233,8 +1335,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<GetBlobSizeTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<GetBlobSizeTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<GetBlobSizeTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<GetBlobSizeTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -1244,8 +1346,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<GetContainedBlobsTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<GetContainedBlobsTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<GetContainedBlobsTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<GetContainedBlobsTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -1255,8 +1357,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<GetBlobInfoTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<GetBlobInfoTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<GetBlobInfoTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<GetBlobInfoTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -1266,8 +1368,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<TagQueryTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<TagQueryTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<TagQueryTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<TagQueryTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -1277,8 +1379,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<BlobQueryTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<BlobQueryTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<BlobQueryTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<BlobQueryTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -1288,8 +1390,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<GetTargetInfoTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<GetTargetInfoTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<GetTargetInfoTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<GetTargetInfoTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -1299,8 +1401,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<FlushMetadataTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<FlushMetadataTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<FlushMetadataTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<FlushMetadataTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -1310,8 +1412,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<FlushDataTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<FlushDataTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<FlushDataTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<FlushDataTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -1319,8 +1421,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
     case Method::kSemanticSearch: {
       auto new_task_ptr = ipc_manager->NewTask<SemanticSearchTask>();
       if (!new_task_ptr.IsNull()) {
-        auto task_typed = orig_task_ptr.template Cast<SemanticSearchTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<SemanticSearchTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<SemanticSearchTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -1328,8 +1430,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
     case Method::kTemporalSearch: {
       auto new_task_ptr = ipc_manager->NewTask<TemporalSearchTask>();
       if (!new_task_ptr.IsNull()) {
-        auto task_typed = orig_task_ptr.template Cast<TemporalSearchTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<TemporalSearchTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<TemporalSearchTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -1338,7 +1440,7 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       // For unknown methods, create base Task copy
       auto new_task_ptr = ipc_manager->NewTask<clio::run::Task>();
       if (!new_task_ptr.IsNull()) {
-        new_task_ptr->Copy(orig_task_ptr);
+        new_task_ptr->Copy(ctp::ipc::FullPtr<clio::run::Task>(orig_task_ptr.get()));
         return new_task_ptr;
       }
       break;
@@ -1346,13 +1448,13 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
   }
   
   (void)deep;    // Deep copy parameter reserved for future use
-  return ctp::ipc::FullPtr<clio::run::Task>();
+  return clio::run::shared_ptr<clio::run::Task>();
 }
 
-ctp::ipc::FullPtr<clio::run::Task> Runtime::NewTask(clio::run::u32 method) {
+clio::run::shared_ptr<clio::run::Task> Runtime::NewTask(clio::run::u32 method) {
   auto* ipc_manager = CLIO_IPC;
   if (!ipc_manager) {
-    return ctp::ipc::FullPtr<clio::run::Task>();
+    return clio::run::shared_ptr<clio::run::Task>();
   }
   
   switch (method) {
@@ -1398,6 +1500,18 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewTask(clio::run::u32 method) {
     }
     case Method::kReorganizeBlob: {
       auto new_task_ptr = ipc_manager->NewTask<ReorganizeBlobTask>();
+      return new_task_ptr.template Cast<clio::run::Task>();
+    }
+    case Method::kPodPutBlob: {
+      auto new_task_ptr = ipc_manager->NewTask<PodPutBlobTask>();
+      return new_task_ptr.template Cast<clio::run::Task>();
+    }
+    case Method::kPodGetBlob: {
+      auto new_task_ptr = ipc_manager->NewTask<PodGetBlobTask>();
+      return new_task_ptr.template Cast<clio::run::Task>();
+    }
+    case Method::kPodReorganizeBlob: {
+      auto new_task_ptr = ipc_manager->NewTask<PodReorganizeBlobTask>();
       return new_task_ptr.template Cast<clio::run::Task>();
     }
     case Method::kDelBlob: {
@@ -1486,318 +1600,195 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewTask(clio::run::u32 method) {
     }
     default: {
       // For unknown methods, return null pointer
-      return ctp::ipc::FullPtr<clio::run::Task>();
+      return clio::run::shared_ptr<clio::run::Task>();
     }
   }
 }
 
-void Runtime::AggregateOut(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> orig_task,
-                        const ctp::ipc::FullPtr<clio::run::Task>& replica_task) {
+void Runtime::AggregateOut(clio::run::u32 method, clio::run::shared_ptr<clio::run::Task>& orig_task,
+                        const clio::run::shared_ptr<clio::run::Task>& replica_task) {
   switch (method) {
     case Method::kCreate: {
-      auto typed_task = orig_task.template Cast<CreateTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<CreateTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kDestroy: {
-      auto typed_task = orig_task.template Cast<DestroyTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<DestroyTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kMonitor: {
-      auto typed_task = orig_task.template Cast<MonitorTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<MonitorTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kRegisterTarget: {
-      auto typed_task = orig_task.template Cast<RegisterTargetTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<RegisterTargetTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kUnregisterTarget: {
-      auto typed_task = orig_task.template Cast<UnregisterTargetTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<UnregisterTargetTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kListTargets: {
-      auto typed_task = orig_task.template Cast<ListTargetsTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<ListTargetsTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kStatTargets: {
-      auto typed_task = orig_task.template Cast<StatTargetsTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<StatTargetsTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kGetOrCreateTag: {
-      auto typed_task = orig_task.template Cast<core::GetOrCreateTagTask<core::CreateParams>>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<core::GetOrCreateTagTask<core::CreateParams>>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kPutBlob: {
-      auto typed_task = orig_task.template Cast<PutBlobTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<PutBlobTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kGetBlob: {
-      auto typed_task = orig_task.template Cast<GetBlobTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<GetBlobTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kReorganizeBlob: {
-      auto typed_task = orig_task.template Cast<ReorganizeBlobTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<ReorganizeBlobTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
+      break;
+    }
+    case Method::kPodPutBlob: {
+      auto& typed_task = orig_task.template Cast<PodPutBlobTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
+      break;
+    }
+    case Method::kPodGetBlob: {
+      auto& typed_task = orig_task.template Cast<PodGetBlobTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
+      break;
+    }
+    case Method::kPodReorganizeBlob: {
+      auto& typed_task = orig_task.template Cast<PodReorganizeBlobTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kDelBlob: {
-      auto typed_task = orig_task.template Cast<DelBlobTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<DelBlobTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kTruncateBlob: {
-      auto typed_task = orig_task.template Cast<TruncateBlobTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<TruncateBlobTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kDelTag: {
-      auto typed_task = orig_task.template Cast<DelTagTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<DelTagTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kRenameTag: {
-      auto typed_task = orig_task.template Cast<RenameTagTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<RenameTagTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kGetOrCreateTagAlias: {
-      auto typed_task = orig_task.template Cast<GetOrCreateTagAliasTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<GetOrCreateTagAliasTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kGetTagName: {
-      auto typed_task = orig_task.template Cast<GetTagNameTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<GetTagNameTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kGetTagSize: {
-      auto typed_task = orig_task.template Cast<GetTagSizeTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<GetTagSizeTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kGetCapacity: {
-      auto typed_task = orig_task.template Cast<GetCapacityTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<GetCapacityTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kGetNumAliases: {
-      auto typed_task = orig_task.template Cast<GetNumAliasesTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<GetNumAliasesTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kPollTelemetryLog: {
-      auto typed_task = orig_task.template Cast<PollTelemetryLogTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<PollTelemetryLogTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kGetBlobScore: {
-      auto typed_task = orig_task.template Cast<GetBlobScoreTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<GetBlobScoreTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kGetBlobSize: {
-      auto typed_task = orig_task.template Cast<GetBlobSizeTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<GetBlobSizeTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kGetContainedBlobs: {
-      auto typed_task = orig_task.template Cast<GetContainedBlobsTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<GetContainedBlobsTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kGetBlobInfo: {
-      auto typed_task = orig_task.template Cast<GetBlobInfoTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<GetBlobInfoTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kTagQuery: {
-      auto typed_task = orig_task.template Cast<TagQueryTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<TagQueryTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kBlobQuery: {
-      auto typed_task = orig_task.template Cast<BlobQueryTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<BlobQueryTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kGetTargetInfo: {
-      auto typed_task = orig_task.template Cast<GetTargetInfoTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<GetTargetInfoTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kFlushMetadata: {
-      auto typed_task = orig_task.template Cast<FlushMetadataTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<FlushMetadataTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kFlushData: {
-      auto typed_task = orig_task.template Cast<FlushDataTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<FlushDataTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kSemanticSearch: {
-      auto typed_task = orig_task.template Cast<SemanticSearchTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<SemanticSearchTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kTemporalSearch: {
-      auto typed_task = orig_task.template Cast<TemporalSearchTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<TemporalSearchTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     default: {
-      orig_task->AggregateOut(replica_task);
+      orig_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
   }
 }
 
-void Runtime::DelTask(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> task_ptr) {
-  auto* ipc_manager = CLIO_IPC;
-  if (!ipc_manager) return;
-  switch (method) {
-    case Method::kCreate: {
-      ipc_manager->DelTask(task_ptr.template Cast<CreateTask>());
-      break;
-    }
-    case Method::kDestroy: {
-      ipc_manager->DelTask(task_ptr.template Cast<DestroyTask>());
-      break;
-    }
-    case Method::kMonitor: {
-      ipc_manager->DelTask(task_ptr.template Cast<MonitorTask>());
-      break;
-    }
-    case Method::kRegisterTarget: {
-      ipc_manager->DelTask(task_ptr.template Cast<RegisterTargetTask>());
-      break;
-    }
-    case Method::kUnregisterTarget: {
-      ipc_manager->DelTask(task_ptr.template Cast<UnregisterTargetTask>());
-      break;
-    }
-    case Method::kListTargets: {
-      ipc_manager->DelTask(task_ptr.template Cast<ListTargetsTask>());
-      break;
-    }
-    case Method::kStatTargets: {
-      ipc_manager->DelTask(task_ptr.template Cast<StatTargetsTask>());
-      break;
-    }
-    case Method::kGetOrCreateTag: {
-      ipc_manager->DelTask(task_ptr.template Cast<core::GetOrCreateTagTask<core::CreateParams>>());
-      break;
-    }
-    case Method::kPutBlob: {
-      ipc_manager->DelTask(task_ptr.template Cast<PutBlobTask>());
-      break;
-    }
-    case Method::kGetBlob: {
-      ipc_manager->DelTask(task_ptr.template Cast<GetBlobTask>());
-      break;
-    }
-    case Method::kReorganizeBlob: {
-      ipc_manager->DelTask(task_ptr.template Cast<ReorganizeBlobTask>());
-      break;
-    }
-    case Method::kDelBlob: {
-      ipc_manager->DelTask(task_ptr.template Cast<DelBlobTask>());
-      break;
-    }
-    case Method::kTruncateBlob: {
-      ipc_manager->DelTask(task_ptr.template Cast<TruncateBlobTask>());
-      break;
-    }
-    case Method::kDelTag: {
-      ipc_manager->DelTask(task_ptr.template Cast<DelTagTask>());
-      break;
-    }
-    case Method::kRenameTag: {
-      ipc_manager->DelTask(task_ptr.template Cast<RenameTagTask>());
-      break;
-    }
-    case Method::kGetOrCreateTagAlias: {
-      ipc_manager->DelTask(task_ptr.template Cast<GetOrCreateTagAliasTask>());
-      break;
-    }
-    case Method::kGetTagName: {
-      ipc_manager->DelTask(task_ptr.template Cast<GetTagNameTask>());
-      break;
-    }
-    case Method::kGetTagSize: {
-      ipc_manager->DelTask(task_ptr.template Cast<GetTagSizeTask>());
-      break;
-    }
-    case Method::kGetCapacity: {
-      ipc_manager->DelTask(task_ptr.template Cast<GetCapacityTask>());
-      break;
-    }
-    case Method::kGetNumAliases: {
-      ipc_manager->DelTask(task_ptr.template Cast<GetNumAliasesTask>());
-      break;
-    }
-    case Method::kPollTelemetryLog: {
-      ipc_manager->DelTask(task_ptr.template Cast<PollTelemetryLogTask>());
-      break;
-    }
-    case Method::kGetBlobScore: {
-      ipc_manager->DelTask(task_ptr.template Cast<GetBlobScoreTask>());
-      break;
-    }
-    case Method::kGetBlobSize: {
-      ipc_manager->DelTask(task_ptr.template Cast<GetBlobSizeTask>());
-      break;
-    }
-    case Method::kGetContainedBlobs: {
-      ipc_manager->DelTask(task_ptr.template Cast<GetContainedBlobsTask>());
-      break;
-    }
-    case Method::kGetBlobInfo: {
-      ipc_manager->DelTask(task_ptr.template Cast<GetBlobInfoTask>());
-      break;
-    }
-    case Method::kTagQuery: {
-      ipc_manager->DelTask(task_ptr.template Cast<TagQueryTask>());
-      break;
-    }
-    case Method::kBlobQuery: {
-      ipc_manager->DelTask(task_ptr.template Cast<BlobQueryTask>());
-      break;
-    }
-    case Method::kGetTargetInfo: {
-      ipc_manager->DelTask(task_ptr.template Cast<GetTargetInfoTask>());
-      break;
-    }
-    case Method::kFlushMetadata: {
-      ipc_manager->DelTask(task_ptr.template Cast<FlushMetadataTask>());
-      break;
-    }
-    case Method::kFlushData: {
-      ipc_manager->DelTask(task_ptr.template Cast<FlushDataTask>());
-      break;
-    }
-    case Method::kSemanticSearch: {
-      ipc_manager->DelTask(task_ptr.template Cast<SemanticSearchTask>());
-      break;
-    }
-    case Method::kTemporalSearch: {
-      ipc_manager->DelTask(task_ptr.template Cast<TemporalSearchTask>());
-      break;
-    }
-    default: {
-      ipc_manager->DelTask(task_ptr);
-      break;
-    }
-  }
-}
 
 } // namespace clio::cte::core

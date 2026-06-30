@@ -94,7 +94,7 @@ public:
   /**
    * Execute a method on a task
    */
-  clio::run::TaskResume Run(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> task_ptr, clio::run::RunContext& rctx) override;
+  clio::run::TaskResume Run(clio::run::u32 method, clio::run::shared_ptr<clio::run::Task> task_ptr) override;
 
   //===========================================================================
   // Method implementations
@@ -104,64 +104,64 @@ public:
    * Handle Create task
    * Returns TaskResume for consistency with Run method
    */
-  clio::run::TaskResume Create(ctp::ipc::FullPtr<CreateTask> task, clio::run::RunContext& rctx);
+  clio::run::TaskResume Create(clio::run::shared_ptr<CreateTask> &task);
 
   /**
    * Handle Custom task
    * Returns TaskResume for consistency with Run method
    */
-  clio::run::TaskResume Custom(ctp::ipc::FullPtr<CustomTask> task, clio::run::RunContext& rctx);
+  clio::run::TaskResume Custom(clio::run::shared_ptr<CustomTask> &task);
 
   /**
    * Handle CoMutexTest task
    * Returns TaskResume for consistency with Run method
    */
-  clio::run::TaskResume CoMutexTest(ctp::ipc::FullPtr<CoMutexTestTask> task, clio::run::RunContext& rctx);
+  clio::run::TaskResume CoMutexTest(clio::run::shared_ptr<CoMutexTestTask> &task);
 
   /**
    * Handle CoRwLockTest task
    * Returns TaskResume for consistency with Run method
    */
-  clio::run::TaskResume CoRwLockTest(ctp::ipc::FullPtr<CoRwLockTestTask> task, clio::run::RunContext& rctx);
+  clio::run::TaskResume CoRwLockTest(clio::run::shared_ptr<CoRwLockTestTask> &task);
 
   /**
    * Handle WaitTest task
    * Returns TaskResume for coroutine-based async operations
    */
-  clio::run::TaskResume WaitTest(ctp::ipc::FullPtr<WaitTestTask> task, clio::run::RunContext& rctx);
+  clio::run::TaskResume WaitTest(clio::run::shared_ptr<WaitTestTask> &task);
 
   /**
    * Handle TestLargeOutput task
    * Returns TaskResume for coroutine-based async operations
    */
-  clio::run::TaskResume TestLargeOutput(ctp::ipc::FullPtr<TestLargeOutputTask> task, clio::run::RunContext& rctx);
+  clio::run::TaskResume TestLargeOutput(clio::run::shared_ptr<TestLargeOutputTask> &task);
 
   /**
    * Handle GpuSubmit task (GPU-compatible task for Part 3 testing)
    * Returns TaskResume for coroutine-based async operations
    */
-  clio::run::TaskResume GpuSubmit(ctp::ipc::FullPtr<GpuSubmitTask> task, clio::run::RunContext& rctx);
+  clio::run::TaskResume GpuSubmit(clio::run::shared_ptr<GpuSubmitTask> &task);
 
-  clio::run::TaskResume SubtaskTest(ctp::ipc::FullPtr<SubtaskTestTask> task, clio::run::RunContext& rctx);
+  clio::run::TaskResume SubtaskTest(clio::run::shared_ptr<SubtaskTestTask> &task);
 
   /**
    * Handle ManyToOneSum task — the aggregate task's value_ already holds the
    * summed batch input (folded by AggregateIn); echo it into sum_, which is
    * broadcast back to every batched submitter.
    */
-  clio::run::TaskResume ManyToOneSum(ctp::ipc::FullPtr<ManyToOneSumTask> task, clio::run::RunContext& rctx);
+  clio::run::TaskResume ManyToOneSum(clio::run::shared_ptr<ManyToOneSumTask> &task);
 
   /**
    * Handle Monitor task - return msgpack-encoded test data
    * Part of the unified kMonitor:9 interface
    */
-  clio::run::TaskResume Monitor(ctp::ipc::FullPtr<MonitorTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume Monitor(clio::run::shared_ptr<MonitorTask> &task);
 
   /**
    * Handle Destroy task - Alias for DestroyPool (DestroyTask = DestroyPoolTask)
    * Returns TaskResume for consistency with Run method
    */
-  clio::run::TaskResume Destroy(ctp::ipc::FullPtr<DestroyTask> task, clio::run::RunContext& rctx);
+  clio::run::TaskResume Destroy(clio::run::shared_ptr<DestroyTask> &task);
 
   /**
    * Get remaining work count for this container
@@ -176,51 +176,50 @@ public:
   /**
    * Serialize task parameters for network transfer (unified method)
    */
-  void SaveTask(clio::run::u32 method, clio::run::SaveTaskArchive& archive, ctp::ipc::FullPtr<clio::run::Task> task_ptr) override;
+  void SaveTask(clio::run::u32 method, clio::run::SaveTaskArchive& archive, clio::run::shared_ptr<clio::run::Task>& task_ptr) override;
 
   /**
    * Deserialize task parameters into an existing task from network transfer
    */
   void LoadTask(clio::run::u32 method, clio::run::LoadTaskArchive& archive,
-                ctp::ipc::FullPtr<clio::run::Task> task_ptr) override;
+                clio::run::shared_ptr<clio::run::Task>& task_ptr) override;
 
   /**
    * Allocate and deserialize task parameters from network transfer
    */
-  ctp::ipc::FullPtr<clio::run::Task> AllocLoadTask(clio::run::u32 method, clio::run::LoadTaskArchive& archive) override;
+  clio::run::shared_ptr<clio::run::Task> AllocLoadTask(clio::run::u32 method, clio::run::LoadTaskArchive& archive) override;
 
   /**
    * Deserialize task input parameters into an existing task using LocalSerialize
    */
   void LocalLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive& archive,
-                     ctp::ipc::FullPtr<clio::run::Task> task_ptr) override;
+                     clio::run::shared_ptr<clio::run::Task>& task_ptr) override;
 
   /**
    * Allocate and deserialize task input parameters using LocalSerialize
    */
-  ctp::ipc::FullPtr<clio::run::Task> LocalAllocLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive& archive) override;
+  clio::run::shared_ptr<clio::run::Task> LocalAllocLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive& archive) override;
 
   /**
    * Serialize task output parameters using LocalSerialize (for local transfers)
    */
   void LocalSaveTask(clio::run::u32 method, clio::run::DefaultSaveArchive& archive,
-                     ctp::ipc::FullPtr<clio::run::Task> task_ptr) override;
+                     clio::run::shared_ptr<clio::run::Task>& task_ptr) override;
 
   /**
    * Create a new copy of a task (deep copy for distributed execution)
    */
-  ctp::ipc::FullPtr<clio::run::Task> NewCopyTask(clio::run::u32 method,
-                                        ctp::ipc::FullPtr<clio::run::Task> orig_task_ptr, bool deep) override;
+  clio::run::shared_ptr<clio::run::Task> NewCopyTask(clio::run::u32 method,
+                                        clio::run::shared_ptr<clio::run::Task> &orig_task_ptr, bool deep) override;
 
   /**
    * Create a new task of the specified method type
    */
-  ctp::ipc::FullPtr<clio::run::Task> NewTask(clio::run::u32 method) override;
-  void AggregateOut(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> orig_task,
-                 const ctp::ipc::FullPtr<clio::run::Task>& replica_task) override;
-  void AggregateIn(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> agg_task,
-                   const ctp::ipc::FullPtr<clio::run::Task>& member_task) override;
-  void DelTask(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> task_ptr) override;
+  clio::run::shared_ptr<clio::run::Task> NewTask(clio::run::u32 method) override;
+  void AggregateOut(clio::run::u32 method, clio::run::shared_ptr<clio::run::Task> &orig_task,
+                 const clio::run::shared_ptr<clio::run::Task>& replica_task) override;
+  void AggregateIn(clio::run::u32 method, clio::run::shared_ptr<clio::run::Task> &agg_task,
+                   const clio::run::shared_ptr<clio::run::Task>& member_task) override;
 
 };
 

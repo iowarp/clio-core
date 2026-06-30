@@ -64,7 +64,7 @@ IpcManagerRun2Run::IpcManagerRun2Run()
 clio::run::u64 IpcManagerRun2Run::SendInResolveTargetNode(
     clio::run::IpcManager *ipc_manager,
     clio::run::PoolManager *pool_manager,
-    ctp::ipc::FullPtr<clio::run::Task> origin_task,
+    clio::run::shared_ptr<clio::run::Task> origin_task,
     const clio::run::PoolQuery &query) {
   if (query.IsLocalMode()) {
     return ipc_manager->GetNodeId();
@@ -103,11 +103,12 @@ clio::run::u64 IpcManagerRun2Run::SendInResolveTargetNode(
 }
 
 void IpcManagerRun2Run::SendInTransmitReplica(
-    clio::run::Container *container,
     clio::run::IpcManager *ipc_manager,
-    ctp::ipc::FullPtr<clio::run::Task> task_copy,
+    clio::run::shared_ptr<clio::run::Task> task_copy,
     clio::run::u64 target_node_id,
-    ctp::ipc::FullPtr<clio::run::Task> origin_task) {
+    clio::run::shared_ptr<clio::run::Task> origin_task) {
+  clio::run::ContainerHold container =
+      CLIO_POOL_MANAGER->GetStaticContainer(task_copy->pool_id_).get();
   auto *config_manager = CLIO_CONFIG_MANAGER;
   const clio::run::Host *target_host = ipc_manager->GetHost(target_node_id);
 
@@ -153,7 +154,7 @@ void IpcManagerRun2Run::SendInTransmitReplica(
 // SendIn
 // =============================================================================
 
-void IpcManagerRun2Run::SendIn(ctp::ipc::FullPtr<clio::run::Task> origin_task) {
+void IpcManagerRun2Run::SendIn(clio::run::shared_ptr<clio::run::Task> origin_task) {
   auto *ipc_manager = CLIO_IPC;
   auto *pool_manager = CLIO_POOL_MANAGER;
 
@@ -162,29 +163,25 @@ void IpcManagerRun2Run::SendIn(ctp::ipc::FullPtr<clio::run::Task> origin_task) {
     return;
   }
 
-  clio::run::Container *container =
-      pool_manager->GetStaticContainer(origin_task->pool_id_);
+  auto container =
+      pool_manager->GetStaticContainer(origin_task->pool_id_).get();
   if (container == nullptr) {
     HLOG(kError, "SendIn: container not found for pool_id {}",
          origin_task->pool_id_);
     return;
   }
 
-  size_t send_map_key = size_t(origin_task.ptr_);
+  size_t send_map_key = size_t(origin_task.get());
   {
     std::lock_guard<std::mutex> lk(send_map_mutex_);
     send_map_[send_map_key] = origin_task;
   }
 
-  if (!origin_task->GetRunCtx()) {
-    HLOG(kError, "SendIn: origin_task has no RunContext");
-    return;
-  }
-  clio::run::RunContext *origin_rctx = origin_task->GetRunCtx();
 
-  const std::vector<clio::run::PoolQuery> &pool_queries = origin_rctx->pool_queries_;
+  const std::vector<clio::run::PoolQuery> &pool_queries =
+      origin_task->PoolQueries();
   size_t num_replicas = pool_queries.size();
-  origin_rctx->subtasks_.resize(num_replicas);
+  origin_task->Subtasks().resize(num_replicas);
 
   HLOG(kDebug, "[SendIn] Task {} to {} replicas", origin_task->task_id_,
        num_replicas);
@@ -205,9 +202,9 @@ void IpcManagerRun2Run::SendIn(ctp::ipc::FullPtr<clio::run::Task> origin_task) {
       continue;
     }
 
-    ctp::ipc::FullPtr<clio::run::Task> task_copy =
+    clio::run::shared_ptr<clio::run::Task> task_copy =
         container->NewCopyTask(origin_task->method_, origin_task, true);
-    origin_rctx->subtasks_[i] = task_copy;
+    origin_task->Subtasks()[i] = task_copy;
 
     task_copy->task_id_.net_key_ = send_map_key;
     task_copy->task_id_.replica_id_ = i;
@@ -220,7 +217,7 @@ void IpcManagerRun2Run::SendIn(ctp::ipc::FullPtr<clio::run::Task> origin_task) {
         HLOG(kWarning,
              "[SendIn] Task {} target node {} is dead, net_timeout=0 -> skip",
              origin_task->task_id_, target_node_id);
-        origin_rctx->completed_replicas_++;
+        origin_task->CompletedReplicas()++;
         continue;
       }
       HLOG(kWarning,
@@ -232,8 +229,8 @@ void IpcManagerRun2Run::SendIn(ctp::ipc::FullPtr<clio::run::Task> origin_task) {
       continue;
     }
 
-    SendInTransmitReplica(container, ipc_manager, task_copy, target_node_id,
-                          origin_task);
+    SendInTransmitReplica(ipc_manager, task_copy,
+                          target_node_id, origin_task);
   }
 }
 
@@ -242,11 +239,12 @@ void IpcManagerRun2Run::SendIn(ctp::ipc::FullPtr<clio::run::Task> origin_task) {
 // =============================================================================
 
 int IpcManagerRun2Run::SendOutTransmit(
-    clio::run::Container *container,
     clio::run::IpcManager *ipc_manager,
-    ctp::ipc::FullPtr<clio::run::Task> origin_task,
+    clio::run::shared_ptr<clio::run::Task> origin_task,
     clio::run::u64 target_node_id,
     const clio::run::Host *target_host) {
+  clio::run::ContainerHold container =
+      CLIO_POOL_MANAGER->GetStaticContainer(origin_task->pool_id_).get();
   auto *config_manager = CLIO_CONFIG_MANAGER;
   int port = static_cast<int>(config_manager->GetPort());
 
@@ -255,8 +253,9 @@ int IpcManagerRun2Run::SendOutTransmit(
   // it is absent (e.g. a legacy sender that advertised no client_port_, or a
   // retry whose FutureShm was already freed).
   ctp::lbm::Transport *lbm_transport = nullptr;
-  if (clio::run::RunContext *run_ctx = origin_task->GetRunCtx()) {
-    ctp::ipc::FullPtr<clio::run::FutureShm> fshm = run_ctx->future_.GetFutureShm();
+  {
+    ctp::ipc::FullPtr<clio::run::RunContext> fshm =
+        origin_task->RunFuture().GetFutureShm();
     if (!fshm.IsNull() && fshm->response_transport_ != nullptr) {
       lbm_transport = fshm->response_transport_;
     }
@@ -300,36 +299,18 @@ int IpcManagerRun2Run::SendOutTransmit(
 // SendOut
 // =============================================================================
 
-void IpcManagerRun2Run::SendOut(ctp::ipc::FullPtr<clio::run::Task> origin_task) {
+void IpcManagerRun2Run::SendOut(clio::run::shared_ptr<clio::run::Task> origin_task) {
   auto *ipc_manager = CLIO_IPC;
-  auto *pool_manager = CLIO_POOL_MANAGER;
 
   if (origin_task.IsNull()) {
     HLOG(kError, "SendOut: origin_task is null");
     return;
   }
 
-  clio::run::Container *container =
-      pool_manager->GetStaticContainer(origin_task->pool_id_);
-  if (container == nullptr) {
-    HLOG(kError, "SendOut: container not found for pool_id {}",
-         origin_task->pool_id_);
-    return;
-  }
-
-  // Capture the recv-side FutureShm before DelTask frees the task/RunContext.
-  // RecvInHandleOne created it via MakePointerFuture (NewObj<FutureShm> from the
-  // runtime's private CTP_MALLOC heap) and stored it in this task's RunContext.
-  // Unlike a client-origin Future it is never consumed_, so ~Future() never
-  // frees it; without the explicit FreeBuffer below every cross-node RPC leaks
-  // one FutureShm — the run2run analog of the cpu2cpu leak fixed in #560. The
-  // resolved FullPtr stays valid after DelTask (it points at the CTP_MALLOC
-  // buffer, which DelTask does not touch).
-  ctp::ipc::FullPtr<clio::run::FutureShm> recv_future_shm;
-  if (clio::run::RunContext *run_ctx = origin_task->GetRunCtx()) {
-    recv_future_shm = run_ctx->future_.GetFutureShm();
-  }
-
+  // The recv-side FutureShm is owned by the Future's shared_ptr (created in
+  // RecvInHandleOne and stored in this task's RunContext). It is freed
+  // automatically when the RunContext (and its Future copy) is destroyed by
+  // DelTask below — no manual capture/FreeBuffer needed.
   size_t recv_key = origin_task->task_id_.net_key_ ^
                     (static_cast<size_t>(origin_task->task_id_.replica_id_) *
                      0x9e3779b97f4a7c15ULL);
@@ -357,17 +338,12 @@ void IpcManagerRun2Run::SendOut(ctp::ipc::FullPtr<clio::run::Task> origin_task) 
     return;
   }
 
-  int rc = SendOutTransmit(container, ipc_manager, origin_task, target_node_id,
-                           target_host);
-  if (rc == 0) {
-    container->DelTask(origin_task->method_, origin_task);
-    // Free the recv-side FutureShm captured above (see comment). Only on
-    // success: on failure SendOutTransmit re-queued the task for retry, so its
-    // FutureShm must stay alive.
-    if (!recv_future_shm.IsNull()) {
-      ipc_manager->FreeBuffer(recv_future_shm.Cast<char>());
-    }
-  }
+  int rc = SendOutTransmit(ipc_manager, origin_task,
+                           target_node_id, target_host);
+  (void)rc;
+  // Task frees via RAII when its shared_ptr owners drop (the by-value
+  // origin_task handle here, plus the RunContext/send_map_ entry) — no
+  // explicit DelTask.
 }
 
 // =============================================================================
@@ -380,14 +356,14 @@ bool IpcManagerRun2Run::RecvInHandleOne(
     const clio::run::TaskInfo &task_info,
     clio::run::LoadTaskArchive &archive,
     ctp::lbm::Transport *lbm_transport) {
-  clio::run::Container *container =
-      pool_manager->GetStaticContainer(task_info.pool_id_);
+  auto container =
+      pool_manager->GetStaticContainer(task_info.pool_id_).get();
   if (!container) {
     HLOG(kError, "Admin: Container not found for pool_id {}", task_info.pool_id_);
     return false;
   }
 
-  ctp::ipc::FullPtr<clio::run::Task> task_ptr =
+  clio::run::shared_ptr<clio::run::Task> task_ptr =
       container->AllocLoadTask(task_info.method_id_, archive);
 
   if (task_ptr.IsNull()) {
@@ -409,8 +385,9 @@ bool IpcManagerRun2Run::RecvInHandleOne(
     set_flags |= TASK_DATA_OWNER;
   }
   task_ptr->SetFlags(set_flags);
-  task_ptr->ClearFlags(TASK_PERIODIC | TASK_ROUTED | TASK_RUN_CTX_EXISTS |
-                       TASK_STARTED);
+  // routed_/started_ are fresh per-RunContext (BeginTask below); only the
+  // serialized TASK_PERIODIC flag needs resetting on receive.
+  task_ptr->ClearFlags(TASK_PERIODIC);
 
   size_t recv_key =
       task_ptr->task_id_.net_key_ ^
@@ -423,33 +400,27 @@ bool IpcManagerRun2Run::RecvInHandleOne(
   HLOG(kDebug, "[RecvIn] Task {} method={} pool_id={} dispatching to workers",
        task_ptr->task_id_, task_ptr->method_, task_ptr->pool_id_);
 
-  clio::run::Future<clio::run::Task> future = ipc_manager->MakePointerFuture(task_ptr);
+  clio::run::Future<clio::run::Task> future(task_ptr->pool_id_,
+                                            task_ptr->method_, task_ptr);
   if (future.GetFutureShm().IsNull()) {
-    HLOG(kError, "[RecvIn] MakePointerFuture failed for task {}",
+    HLOG(kError, "[RecvIn] Future construction failed for task {}",
          task_ptr->task_id_);
     return false;
   }
 
-  // Open (or reuse from the connection cache) a dedicated dial-back connection
-  // to the requesting node's server at <return-host>:<client_port> and stash it
-  // on this task's FutureShm. SendOut routes the response over it instead of
-  // re-resolving the peer connection. Keyed in the cache by return-host + port.
-  {
-    int client_port = archive.client_port_;
-    const clio::run::Host *return_host = ipc_manager->GetHost(sender_node);
-    if (return_host != nullptr && client_port > 0) {
-      ctp::lbm::Transport *dial_back = ipc_manager->GetOrCreateClientByIdentity(
-          return_host->ip_address, return_host->ip_address, client_port);
-      if (dial_back != nullptr) {
-        future.GetFutureShm()->response_transport_ = dial_back;
-      }
-    }
-  }
+  // NOTE: the response connection is intentionally NOT opened here. A ZMQ socket
+  // must be created and used by the same thread; this RecvIn runs on the recv
+  // thread, but the response is sent by net_send_worker_ in SendOutTransmit.
+  // Opening the dial-back DEALER here and sending on it there is exactly the
+  // cross-thread socket sharing that forced sock_mtx_ and wedged force_net.
+  // SendOut re-resolves the return node (pool_query_.GetReturnNode()) and
+  // GetOrCreateClient's the connection on the send worker — same cache, same
+  // endpoint (return-host:cluster-port), but single-threaded socket ownership.
 
-  if (!task_ptr->task_flags_.Any(TASK_RUN_CTX_EXISTS)) {
-    ipc_manager->BeginTask(future, container, nullptr);
-  }
-  task_ptr->SetFlags(TASK_ROUTED);
+  // Allocate the task's RunContext (and resolve its container) now that it is
+  // deserialized, so RouteTask / the worker have an active RunContext.
+  future.GetTaskPtr()->BeginRunContext();
+  task_ptr->SetRouted();
 
   if (ipc_manager->GetScheduler() != nullptr) {
     clio::run::u32 lane_id =
@@ -499,7 +470,7 @@ int IpcManagerRun2Run::RecvOutDeserialize(
     clio::run::LoadTaskArchive &archive) {
   for (const auto &task_info : task_infos) {
     size_t net_key = task_info.task_id_.net_key_;
-    ctp::ipc::FullPtr<clio::run::Task> origin_task;
+    clio::run::shared_ptr<clio::run::Task> origin_task;
     {
       std::lock_guard<std::mutex> lk(send_map_mutex_);
       auto send_it = send_map_.find(net_key);
@@ -513,23 +484,19 @@ int IpcManagerRun2Run::RecvOutDeserialize(
       origin_task = *send_it;
     }
 
-    if (!origin_task->GetRunCtx()) {
-      HLOG(kError, "Admin: origin_task has no RunContext");
-      return 6;
-    }
-    clio::run::RunContext *origin_rctx = origin_task->GetRunCtx();
 
     clio::run::u32 replica_id = task_info.task_id_.replica_id_;
-    if (replica_id >= origin_rctx->subtasks_.size()) {
+    if (replica_id >= origin_task->Subtasks().size()) {
       HLOG(kError, "Admin: Invalid replica_id {} (subtasks size: {})",
-           replica_id, origin_rctx->subtasks_.size());
+           replica_id, origin_task->Subtasks().size());
       return 7;
     }
 
-    ctp::ipc::FullPtr<clio::run::Task> replica = origin_rctx->subtasks_[replica_id];
+    clio::run::shared_ptr<clio::run::Task> replica =
+        origin_task->Subtasks()[replica_id];
 
-    clio::run::Container *container =
-        pool_manager->GetStaticContainer(origin_task->pool_id_);
+    auto container =
+        pool_manager->GetStaticContainer(origin_task->pool_id_).get();
     if (!container) {
       HLOG(kError, "Admin: Container not found for pool_id {}",
            origin_task->pool_id_);
@@ -548,7 +515,7 @@ int IpcManagerRun2Run::RecvOutAggregate(
 
   for (const auto &task_info : task_infos) {
     size_t net_key = task_info.task_id_.net_key_;
-    ctp::ipc::FullPtr<clio::run::Task> origin_task;
+    clio::run::shared_ptr<clio::run::Task> origin_task;
     {
       std::lock_guard<std::mutex> lk(send_map_mutex_);
       auto send_it = send_map_.find(net_key);
@@ -560,28 +527,24 @@ int IpcManagerRun2Run::RecvOutAggregate(
       origin_task = *send_it;
     }
 
-    if (!origin_task->GetRunCtx()) {
-      HLOG(kError, "Admin: origin_task has no RunContext");
-      continue;
-    }
-    clio::run::RunContext *origin_rctx = origin_task->GetRunCtx();
 
     clio::run::u32 replica_id = task_info.task_id_.replica_id_;
-    if (replica_id >= origin_rctx->subtasks_.size()) {
+    if (replica_id >= origin_task->Subtasks().size()) {
       HLOG(kError, "Admin: Invalid replica_id {} (subtasks size: {})",
-           replica_id, origin_rctx->subtasks_.size());
+           replica_id, origin_task->Subtasks().size());
       continue;
     }
 
-    ctp::ipc::FullPtr<clio::run::Task> replica = origin_rctx->subtasks_[replica_id];
+    clio::run::shared_ptr<clio::run::Task> replica =
+        origin_task->Subtasks()[replica_id];
 
     // AggregateOut via the Container so the concrete task type's AggregateOut()
     // runs (which merges OUT fields like bdev's blocks_). Task::AggregateOut is
     // intentionally non-virtual to keep Task vtable-free, so calling
     // origin_task->AggregateOut(replica) here would slice to the base and drop
     // every derived OUT field — leaving callers with empty results.
-    clio::run::Container *container =
-        CLIO_POOL_MANAGER->GetStaticContainer(origin_task->pool_id_);
+    auto container =
+        CLIO_POOL_MANAGER->GetStaticContainer(origin_task->pool_id_).get();
     if (!container) {
       HLOG(kError, "[RecvOut] Container not found for pool_id {}",
            origin_task->pool_id_);
@@ -592,9 +555,9 @@ int IpcManagerRun2Run::RecvOutAggregate(
     HLOG(kDebug, "[RecvOut] Task {}", origin_task->task_id_);
 
     clio::run::u32 completed =
-        origin_rctx->completed_replicas_.fetch_add(1) + 1;
-    if (completed == origin_rctx->subtasks_.size()) {
-      RecvOutCompleteOriginTask(net_key, origin_task, origin_rctx);
+        origin_task->CompletedReplicas().fetch_add(1) + 1;
+    if (completed == origin_task->Subtasks().size()) {
+      RecvOutCompleteOriginTask(net_key, origin_task);
     }
   }
 
@@ -603,26 +566,21 @@ int IpcManagerRun2Run::RecvOutAggregate(
 
 void IpcManagerRun2Run::RecvOutCompleteOriginTask(
     size_t net_key,
-    ctp::ipc::FullPtr<clio::run::Task> origin_task,
-    clio::run::RunContext *origin_rctx) {
+    clio::run::shared_ptr<clio::run::Task> origin_task) {
   auto *ipc_manager = CLIO_IPC;
 
-  clio::run::Container *container =
+  clio::run::DynamicContainer container =
       CLIO_POOL_MANAGER->GetStaticContainer(origin_task->pool_id_);
-  if (container != nullptr) {
-    origin_rctx->container_ = container;
+  if (container) {
+    origin_task->ExecContainer() = container;
   }
 
-  for (const auto &subtask_ptr : origin_rctx->subtasks_) {
+  for (const auto &subtask_ptr : origin_task->Subtasks()) {
     subtask_ptr->ClearFlags(TASK_DATA_OWNER);
-    if (container != nullptr) {
-      container->DelTask(subtask_ptr->method_, subtask_ptr);
-    } else {
-      HLOG(kError, "[RecvOut] Container not found for pool_id {} while deleting subtask",
-           origin_task->pool_id_);
-    }
   }
-  origin_rctx->subtasks_.clear();
+  // Clearing the vector drops the last shared_ptr owner of each replica subtask,
+  // freeing them via RAII (replaces the former per-subtask DelTask).
+  origin_task->Subtasks().clear();
 
   {
     std::lock_guard<std::mutex> lk(send_map_mutex_);
@@ -635,7 +593,7 @@ void IpcManagerRun2Run::RecvOutCompleteOriginTask(
     worker = scheduler ? scheduler->GetNetRecvWorker() : nullptr;
   }
   if (worker) {
-    worker->EndTask(origin_task, origin_rctx, true);
+    worker->EndTask(origin_task, true);
   } else {
     HLOG(kError,
          "[RecvOut] No worker available to call EndTask for task {}",
@@ -687,8 +645,8 @@ bool IpcManagerRun2Run::RetrySendToNode(RetryEntry &entry, clio::run::u64 node_i
     return false;
   }
 
-  clio::run::Container *container =
-      pool_manager->GetStaticContainer(entry.task->pool_id_);
+  auto container =
+      pool_manager->GetStaticContainer(entry.task->pool_id_).get();
   if (!container) {
     return false;
   }
@@ -786,7 +744,7 @@ void IpcManagerRun2Run::ProcessRetryQueues() {
            elapsed, it->target_node_id);
       it = send_out_retry_.erase(it);
     } else if (ipc_manager->IsAlive(it->target_node_id)) {
-      ctp::ipc::FullPtr<clio::run::Task> retry_task = it->task;
+      clio::run::shared_ptr<clio::run::Task> retry_task = it->task;
       it = send_out_retry_.erase(it);
       _rqlk.unlock();
       SendOut(retry_task);
@@ -816,16 +774,15 @@ void IpcManagerRun2Run::ScanSendMapTimeouts() {
     dead_map[entry.node_id] = entry.detected_at;
   }
 
-  std::vector<std::pair<size_t, ctp::ipc::FullPtr<clio::run::Task>>> to_complete;
+  std::vector<std::pair<size_t, clio::run::shared_ptr<clio::run::Task>>> to_complete;
   {
     std::lock_guard<std::mutex> lk(send_map_mutex_);
     send_map_.for_each(
-        [&](const size_t &key, ctp::ipc::FullPtr<clio::run::Task> &origin_task) {
-          if (origin_task.IsNull() || !origin_task->GetRunCtx()) {
+        [&](const size_t &key, clio::run::shared_ptr<clio::run::Task> &origin_task) {
+          if (origin_task.IsNull()) {
             return;
           }
 
-          clio::run::RunContext *rctx = origin_task->GetRunCtx();
           float task_timeout = kRun2RunRetryTimeoutSec;
           float task_net_timeout = origin_task->pool_query_.GetNetTimeout();
           if (task_net_timeout >= 0) {
@@ -833,7 +790,7 @@ void IpcManagerRun2Run::ScanSendMapTimeouts() {
           }
 
           bool any_timed_out = false;
-          for (const auto &pq : rctx->pool_queries_) {
+          for (const auto &pq : origin_task->PoolQueries()) {
             if (!pq.IsPhysicalMode()) {
               continue;
             }
@@ -857,16 +814,12 @@ void IpcManagerRun2Run::ScanSendMapTimeouts() {
 
   for (auto &entry : to_complete) {
     auto &origin_task = entry.second;
-    clio::run::RunContext *rctx = origin_task->GetRunCtx();
-    if (!rctx) {
-      continue;
-    }
     HLOG(kError,
          "[ScanSendMapTimeouts] Task {} timed out waiting for dead node",
          origin_task->task_id_);
     origin_task->SetReturnCode(kRun2RunNetworkTimeoutRC);
     auto *worker = CLIO_CUR_WORKER;
-    worker->EndTask(origin_task, rctx, true);
+    worker->EndTask(origin_task, true);
   }
 
   if (!to_complete.empty()) {
@@ -890,7 +843,7 @@ void IpcManagerRun2Run::FlushStaleStateForNode(clio::run::u64 node_id) {
       continue;
     }
     size_t net_key = it->task->task_id_.net_key_;
-    ctp::ipc::FullPtr<clio::run::Task> origin;
+    clio::run::shared_ptr<clio::run::Task> origin;
     {
       std::lock_guard<std::mutex> lk(send_map_mutex_);
       auto send_it = send_map_.find(net_key);
@@ -898,8 +851,8 @@ void IpcManagerRun2Run::FlushStaleStateForNode(clio::run::u64 node_id) {
         origin = *send_it;
       }
     }
-    if (!origin.IsNull() && origin->GetRunCtx()) {
-      origin->GetRunCtx()->completed_replicas_++;
+    if (!origin.IsNull()) {
+      origin->CompletedReplicas()++;
     }
     HLOG(kInfo,
          "[FlushStale] Discarding SendIn retry for restarted node {}",
@@ -999,7 +952,7 @@ void IpcManagerRun2Run::StartRecvThreads() {
   });
 
   // Dedicated single client recv thread: drains TCP (port 9416) and IPC
-  // (unix socket) client transports via IpcCpu2CpuZmq::RuntimeRecv.
+  // (unix socket) client transports via IpcCpu2CpuZmq::RecvIn.
   client_recv_thread_ = std::thread([this]() {
     ctp::SystemInfo::SetCurrentThreadName("chi-client-recv");
     auto *ipc_manager = CLIO_IPC;
@@ -1021,7 +974,7 @@ void IpcManagerRun2Run::StartRecvThreads() {
     HLOG(kInfo, "[ClientRecvThread] started");
     while (!recv_shutdown_.load(std::memory_order_acquire)) {
       clio::run::u32 tasks_received = 0;
-      bool did_work = clio::run::IpcCpu2CpuZmq::RuntimeRecv(ipc_manager,
+      bool did_work = clio::run::IpcCpu2CpuZmq::RecvIn(ipc_manager,
                                                        tasks_received);
       if (!did_work && !recv_shutdown_.load(std::memory_order_acquire)) {
         // Nothing drained: block on the IPC socket via the EventManager (its

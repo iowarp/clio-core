@@ -150,7 +150,7 @@ TEST_CASE("Task Streaming - Large Output (1MB)", "[streaming][large]") {
   INFO("Streaming mechanism tested successfully for output > 4KB copy space");
 }
 
-TEST_CASE("FutureShm Bitfield Operations", "[streaming][bitfield]") {
+TEST_CASE("Task completion signals", "[streaming][completion]") {
   StreamingTestFixture fixture;
   REQUIRE(g_initialized);
 
@@ -168,41 +168,34 @@ TEST_CASE("FutureShm Bitfield Operations", "[streaming][bitfield]") {
   // Submit a simple task
   auto task = client.AsyncCustom(pool_query, "bitfield test", 1);
 
-  // Get the future's shared memory structure
-  auto future_shm = task.GetFutureShm();
-  REQUIRE(!future_shm.IsNull());
+  // Wait returns true once the task completes. CPU/host completion now lives on
+  // Task::is_complete_ (managed by the Future), replacing FutureShm::flags_
+  // FUTURE_COMPLETE.
+  INFO("Testing completion via Task::is_complete_");
+  REQUIRE(task.Wait());
 
-  // Test initial state (task not complete yet)
-  INFO("Testing initial bitfield state");
-  // Note: We can't reliably test the state before Wait() as the task might complete very fast
+  // Exercise the Task completion / new-data signal accessors directly.
+  INFO("Testing Task is_complete_ / is_new_data_ accessors");
+  auto t = ctp::make_shared<clio::run::Task>(CTP_MALLOC);
+  t->UnsetComplete();
+  t->UnsetNewData();
+  REQUIRE_FALSE(t->IsComplete());
+  t->SetComplete();
+  REQUIRE(t->IsComplete());
 
-  // Wait for task to complete
-  task.Wait();
+  REQUIRE_FALSE(t->IsNewData());
+  t->SetNewData();
+  REQUIRE(t->IsNewData());
+  REQUIRE(t->IsComplete());  // new-data is independent of completion
 
-  // After completion, FUTURE_COMPLETE should be set
-  INFO("Testing FUTURE_COMPLETE flag after Wait()");
-  using FutureShm = clio::run::FutureShm;
-  REQUIRE(future_shm->flags_.Any(FutureShm::FUTURE_COMPLETE));
+  t->UnsetNewData();
+  REQUIRE_FALSE(t->IsNewData());
+  REQUIRE(t->IsComplete());  // completion still set
 
-  // Test manual flag operations on a separate bitfield
-  ctp::abitfield32_t test_flags;
-  test_flags.SetBits(0);  // Initialize
+  t->UnsetComplete();
+  REQUIRE_FALSE(t->IsComplete());
 
-  INFO("Testing manual FUTURE_COMPLETE flag set");
-  test_flags.SetBits(FutureShm::FUTURE_COMPLETE);
-  REQUIRE(test_flags.Any(FutureShm::FUTURE_COMPLETE));
-
-  INFO("Testing FUTURE_NEW_DATA flag set");
-  test_flags.SetBits(FutureShm::FUTURE_NEW_DATA);
-  REQUIRE(test_flags.Any(FutureShm::FUTURE_NEW_DATA));
-  REQUIRE(test_flags.Any(FutureShm::FUTURE_COMPLETE)); // Should still be set
-
-  INFO("Testing flag unset");
-  test_flags.UnsetBits(FutureShm::FUTURE_NEW_DATA);
-  REQUIRE_FALSE(test_flags.Any(FutureShm::FUTURE_NEW_DATA));
-  REQUIRE(test_flags.Any(FutureShm::FUTURE_COMPLETE)); // Should still be set
-
-  INFO("Bitfield operations verified successfully");
+  INFO("Task completion-signal accessors verified successfully");
 }
 
 // Regression guard for runtime-internal allocation leaks (e.g. #560: the
@@ -236,7 +229,7 @@ TEST_CASE("Runtime Heap Leak Check", "[streaming][leak]") {
   };
 
   // The server frees its per-request FutureShm *after* sending the response
-  // (RuntimeSend), so the free can lag the client's Wait(). Poll until the
+  // (SendOut), so the free can lag the client's Wait(). Poll until the
   // runtime private-heap usage stops moving before snapshotting.
   auto stabilized_heap = [&]() -> size_t {
     size_t prev = ipc->GetRuntimeHeapAllocatedBytes();
@@ -334,7 +327,7 @@ TEST_CASE("Leak Detector - NewTask leak is detected",
 
   // Leak: allocate tasks via NewTask (global new — invisible to CTP_MALLOC, so
   // this exercises the NewTask/DelTask accounting) and DON'T DelTask them.
-  std::vector<ctp::ipc::FullPtr<TaskT>> tasks;
+  std::vector<clio::run::shared_ptr<TaskT>> tasks;
   tasks.reserve(kNumTasks);
   for (int i = 0; i < kNumTasks; ++i) {
     tasks.push_back(ipc->NewTask<TaskT>());
@@ -346,7 +339,7 @@ TEST_CASE("Leak Detector - NewTask leak is detected",
   REQUIRE(leaked >= before + expected);          // detector found the leak
 
   // Free them: the detector must drop back toward baseline.
-  for (auto &t : tasks) ipc->DelTask(t);
+  for (auto &t : tasks) t.reset();
   const size_t after_free = ipc->GetRuntimeHeapAllocatedBytes();
   REQUIRE(after_free < leaked);
   REQUIRE(after_free <= before + kSlack);

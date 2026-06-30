@@ -324,7 +324,10 @@ TEST_CASE("RefreshRepo - generates methods header and lib_exec source",
   REQUIRE(Contains(s, "Runtime::NewCopyTask("));
   REQUIRE(Contains(s, "Runtime::NewTask("));
   REQUIRE(Contains(s, "void Runtime::AggregateOut("));
-  REQUIRE(Contains(s, "void Runtime::DelTask("));
+  // DelTask is no longer generated — tasks are clio::run::shared_ptr handles
+  // freed via RAII. NewTask now returns a shared_ptr.
+  REQUIRE_FALSE(Contains(s, "void Runtime::DelTask("));
+  REQUIRE(Contains(s, "clio::run::shared_ptr<clio::run::Task> Runtime::NewTask("));
   REQUIRE(Contains(s, "case Method::kGetOrCreateThing:"));
 
   SECTION("missing module directory produced no output but no failure");

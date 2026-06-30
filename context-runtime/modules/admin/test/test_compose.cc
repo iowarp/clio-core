@@ -131,14 +131,16 @@ TEST_CASE("Parse compose configuration", "[compose]") {
   // Create config file
   std::string config_path = CreateComposeConfig();
 
-  // Load configuration
-  auto* config_manager = CLIO_CONFIG_MANAGER;
-  REQUIRE(config_manager != nullptr);
-
-  REQUIRE(config_manager->LoadYaml(config_path));
+  // Load configuration into a LOCAL ConfigManager — exactly as the runtime
+  // parses compose files (admin_runtime.cc / manager.cc). Loading into the
+  // global CLIO_CONFIG_MANAGER would run LoadDefault() and reset the live
+  // runtime port (CLIO_PORT) to the 9413 default, which under force_net retargets
+  // every forward at a dead port.
+  clio::run::ConfigManager file_config;
+  REQUIRE(file_config.LoadYaml(config_path));
 
   // Get compose config
-  const auto& compose_config = config_manager->GetComposeConfig();
+  const auto& compose_config = file_config.GetComposeConfig();
 
   // Verify compose section was parsed - at least 1 pool should exist
   // (there may be more from server initialization)
@@ -169,18 +171,19 @@ TEST_CASE("Admin client Compose method", "[compose]") {
   // Create config file
   std::string config_path = CreateComposeConfig();
 
-  // Load configuration
-  auto* config_manager = CLIO_CONFIG_MANAGER;
-  REQUIRE(config_manager != nullptr);
-
-  REQUIRE(config_manager->LoadYaml(config_path));
+  // Load the compose file into a LOCAL ConfigManager (mirrors the runtime's
+  // admin_runtime.cc / manager.cc). Reloading the global CLIO_CONFIG_MANAGER
+  // here would reset the live runtime port via LoadDefault() and break force_net
+  // routing (forwards would target the 9413 default instead of CLIO_PORT).
+  clio::run::ConfigManager file_config;
+  REQUIRE(file_config.LoadYaml(config_path));
 
   // Get admin client
   auto* admin_client = CLIO_ADMIN;
   REQUIRE(admin_client != nullptr);
 
   // Get compose config
-  const auto& compose_config = config_manager->GetComposeConfig();
+  const auto& compose_config = file_config.GetComposeConfig();
   REQUIRE(!compose_config.pools_.empty());
 
   // Call AsyncCompose for each pool - tasks auto-freed when Future goes out of scope

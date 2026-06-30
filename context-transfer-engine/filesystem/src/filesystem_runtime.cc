@@ -87,8 +87,7 @@ inline clio::run::u64 InoFromTag(const clio::cte::core::TagId &t) {
 }
 }  // namespace
 
-clio::run::TaskResume Runtime::Create(ctp::ipc::FullPtr<CreateTask> task,
-                                clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   CLIO_TASK_BODY_BEGIN
   FilesystemConfig cfg = task->GetParams();
   next_pool_id_ = cfg.next_pool_id_;
@@ -119,24 +118,21 @@ clio::run::TaskResume Runtime::Create(ctp::ipc::FullPtr<CreateTask> task,
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::Destroy(ctp::ipc::FullPtr<DestroyTask> task,
-                                 clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::Destroy(clio::run::shared_ptr<DestroyTask> &task) {
   CLIO_TASK_BODY_BEGIN
   task->return_code_ = 0;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::Monitor(ctp::ipc::FullPtr<MonitorTask> task,
-                                 clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::Monitor(clio::run::shared_ptr<MonitorTask> &task) {
   CLIO_TASK_BODY_BEGIN
   task->SetReturnCode(0);
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::Open(ctp::ipc::FullPtr<OpenTask> task,
-                              clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::Open(clio::run::shared_ptr<OpenTask> &task) {
   CLIO_TASK_BODY_BEGIN
   std::string path = task->path_.str();
 
@@ -206,8 +202,7 @@ clio::run::TaskResume Runtime::Open(ctp::ipc::FullPtr<OpenTask> task,
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::Close(ctp::ipc::FullPtr<CloseTask> task,
-                               clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::Close(clio::run::shared_ptr<CloseTask> &task) {
   CLIO_TASK_BODY_BEGIN
   {
     std::lock_guard<std::mutex> g(meta_mu_);
@@ -227,8 +222,7 @@ clio::run::TaskResume Runtime::Close(ctp::ipc::FullPtr<CloseTask> task,
     if (it != handles_.end()) fi = it->second;           \
   } while (0)
 
-clio::run::TaskResume Runtime::Read(ctp::ipc::FullPtr<ReadTask> task,
-                              clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::Read(clio::run::shared_ptr<ReadTask> &task) {
   CLIO_TASK_BODY_BEGIN
   CLIO_FS_LOOKUP(fi, task->handle_);
   if (!fi) {
@@ -284,8 +278,7 @@ clio::run::TaskResume Runtime::Read(ctp::ipc::FullPtr<ReadTask> task,
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::Write(ctp::ipc::FullPtr<WriteTask> task,
-                               clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::Write(clio::run::shared_ptr<WriteTask> &task) {
   CLIO_TASK_BODY_BEGIN
   CLIO_FS_LOOKUP(fi, task->handle_);
   if (!fi) {
@@ -328,8 +321,7 @@ clio::run::TaskResume Runtime::Write(ctp::ipc::FullPtr<WriteTask> task,
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::Append(ctp::ipc::FullPtr<AppendTask> task,
-                                clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::Append(clio::run::shared_ptr<AppendTask> &task) {
   CLIO_TASK_BODY_BEGIN
   CLIO_FS_LOOKUP(fi, task->handle_);
   if (!fi) {
@@ -391,8 +383,7 @@ clio::run::TaskResume Runtime::Append(ctp::ipc::FullPtr<AppendTask> task,
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::Getattr(ctp::ipc::FullPtr<GetattrTask> task,
-                                 clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::Getattr(clio::run::shared_ptr<GetattrTask> &task) {
   CLIO_TASK_BODY_BEGIN
   std::string path = task->path_.str();
 
@@ -481,8 +472,7 @@ clio::run::TaskResume Runtime::Getattr(ctp::ipc::FullPtr<GetattrTask> task,
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::Truncate(ctp::ipc::FullPtr<TruncateTask> task,
-                                  clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::Truncate(clio::run::shared_ptr<TruncateTask> &task) {
   CLIO_TASK_BODY_BEGIN
   std::string path = task->path_.str();
   clio::run::u64 new_size = task->new_size_;
@@ -556,8 +546,7 @@ clio::run::TaskResume Runtime::Truncate(ctp::ipc::FullPtr<TruncateTask> task,
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::Unlink(ctp::ipc::FullPtr<UnlinkTask> task,
-                                clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::Unlink(clio::run::shared_ptr<UnlinkTask> &task) {
   CLIO_TASK_BODY_BEGIN
   std::string path = StripTrailingSlash(task->path_.str());
 
@@ -585,8 +574,7 @@ clio::run::TaskResume Runtime::Unlink(ctp::ipc::FullPtr<UnlinkTask> task,
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::Mkdir(ctp::ipc::FullPtr<MkdirTask> task,
-                               clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::Mkdir(clio::run::shared_ptr<MkdirTask> &task) {
   CLIO_TASK_BODY_BEGIN
   std::string path = StripTrailingSlash(task->path_.str());
 
@@ -622,8 +610,7 @@ clio::run::TaskResume Runtime::Mkdir(ctp::ipc::FullPtr<MkdirTask> task,
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::Rmdir(ctp::ipc::FullPtr<RmdirTask> task,
-                               clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::Rmdir(clio::run::shared_ptr<RmdirTask> &task) {
   CLIO_TASK_BODY_BEGIN
   std::string path = StripTrailingSlash(task->path_.str());
 
@@ -659,8 +646,7 @@ clio::run::TaskResume Runtime::Rmdir(ctp::ipc::FullPtr<RmdirTask> task,
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::Rename(ctp::ipc::FullPtr<RenameTask> task,
-                                clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::Rename(clio::run::shared_ptr<RenameTask> &task) {
   CLIO_TASK_BODY_BEGIN
   std::string src = task->src_.str();
   std::string dst = task->dst_.str();
@@ -781,8 +767,7 @@ clio::run::TaskResume Runtime::Rename(ctp::ipc::FullPtr<RenameTask> task,
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::Link(ctp::ipc::FullPtr<LinkTask> task,
-                              clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::Link(clio::run::shared_ptr<LinkTask> &task) {
   CLIO_TASK_BODY_BEGIN
   std::string target = StripTrailingSlash(task->target_.str());
   std::string link = StripTrailingSlash(task->link_.str());
@@ -812,8 +797,7 @@ clio::run::TaskResume Runtime::Link(ctp::ipc::FullPtr<LinkTask> task,
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::Readdir(ctp::ipc::FullPtr<ReaddirTask> task,
-                                 clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::Readdir(clio::run::shared_ptr<ReaddirTask> &task) {
   CLIO_TASK_BODY_BEGIN
   // Direct children: tags whose resolved name is "<dir>/<name>" with no
   // further slash. Returns full resolved paths; the adapter strips the prefix.
@@ -843,8 +827,7 @@ clio::run::TaskResume Runtime::Readdir(ctp::ipc::FullPtr<ReaddirTask> task,
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::StatSize(ctp::ipc::FullPtr<StatSizeTask> task,
-                                  clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::StatSize(clio::run::shared_ptr<StatSizeTask> &task) {
   CLIO_TASK_BODY_BEGIN
   std::string path = task->path_.str();
   {
@@ -881,7 +864,7 @@ clio::run::TaskResume Runtime::StatSize(ctp::ipc::FullPtr<StatSizeTask> task,
 // ===========================================================================
 
 clio::run::TaskResume Runtime::AppendSequence(
-    ctp::ipc::FullPtr<AppendSequenceTask> task, clio::run::RunContext &rctx) {
+    clio::run::shared_ptr<AppendSequenceTask> &task) {
   CLIO_TASK_BODY_BEGIN
   // Drain the per-node pending queue, then group entries by tag.
   std::vector<PendingAppend> drained;
@@ -920,7 +903,7 @@ clio::run::TaskResume Runtime::AppendSequence(
 }
 
 clio::run::TaskResume Runtime::AppendCollect(
-    ctp::ipc::FullPtr<AppendCollectTask> task, clio::run::RunContext &rctx) {
+    clio::run::shared_ptr<AppendCollectTask> &task) {
   CLIO_TASK_BODY_BEGIN
   // Runs ONCE per batch as the ManyToOne aggregate; task->entries_ holds every
   // node's pending entries for this tag (combined via AggregateIn). The actual
@@ -952,8 +935,7 @@ clio::run::TaskResume Runtime::AppendCollect(
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::AppendPlan(ctp::ipc::FullPtr<AppendPlanTask> task,
-                                    clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::AppendPlan(clio::run::shared_ptr<AppendPlanTask> &task) {
   CLIO_TASK_BODY_BEGIN
   // Regular (suspendable) task: sort the batch, read the file tail, build the
   // 1 MiB-page merge plan, and dispatch AppendExecution slices.
@@ -1037,7 +1019,7 @@ clio::run::TaskResume Runtime::AppendPlan(ctp::ipc::FullPtr<AppendPlanTask> task
 }
 
 clio::run::TaskResume Runtime::AppendExecution(
-    ctp::ipc::FullPtr<AppendExecutionTask> task, clio::run::RunContext &rctx) {
+    clio::run::shared_ptr<AppendExecutionTask> &task) {
   CLIO_TASK_BODY_BEGIN
   clio::cte::core::TagId tag_id = task->tag_id_;        // destination file tag
   clio::cte::core::TagId staging = task->staging_tag_id_;  // source staged blobs

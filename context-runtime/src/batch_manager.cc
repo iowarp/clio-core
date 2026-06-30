@@ -32,7 +32,7 @@ u64 BatchManager::NowNs() {
           .count());
 }
 
-void BatchManager::Add(const ctp::ipc::FullPtr<Task> &task) {
+void BatchManager::Add(const clio::run::shared_ptr<Task> &task) {
   const PoolQuery &q = task->pool_query_;
   GroupKey key{task->pool_id_, task->method_, q.GetContainerHash(),
                q.GetBatchKey()};
@@ -116,7 +116,7 @@ void BatchManager::BuildAndSubmit(Worker * /*worker*/, const GroupKey &key,
     return;
   }
   auto *pool_manager = CLIO_POOL_MANAGER;
-  Container *container = pool_manager->GetStaticContainer(key.pool_id);
+  auto container = pool_manager->GetStaticContainer(key.pool_id).get();
   if (container == nullptr) {
     HLOG(kError, "BatchManager: no container for pool {} (dropping {} tasks)",
          key.pool_id, group.members.size());
@@ -126,7 +126,7 @@ void BatchManager::BuildAndSubmit(Worker * /*worker*/, const GroupKey &key,
   }
 
   // Aggregate task = a copy of the first member; combine the rest in as inputs.
-  ctp::ipc::FullPtr<Task> agg =
+  clio::run::shared_ptr<Task> agg =
       container->NewCopyTask(key.method, group.members[0], /*deep=*/true);
   if (agg.IsNull()) {
     HLOG(kError, "BatchManager: NewCopyTask failed for pool {} method {}",
@@ -143,16 +143,15 @@ void BatchManager::BuildAndSubmit(Worker * /*worker*/, const GroupKey &key,
   }
 
   // Run the aggregate locally on the leader as a fresh, self-owned task.
-  // NewCopyTask copied the member's task_flags_ but NOT its host_run_ctx_
+  // NewCopyTask copied the member's task_flags_ but NOT its run_ctx_
   // (Task::Copy leaves run ctx per-task). Clear the execution-lifecycle flags
-  // the member had accumulated (routed/started/run-ctx-exists) so the submit
-  // path runs BeginTask and gives this aggregate its OWN RunContext + future.
-  // Without this the aggregate inherits TASK_RUN_CTX_EXISTS with a null run
-  // ctx, BeginTask is skipped, and the aggregate never executes (members hang).
+  // the member had accumulated so the submit path (ipc_->Send -> IpcCpu2Self::
+  // SendIn -> BeginTask) gives this aggregate its OWN RunContext + future.
   agg->task_id_ = CreateTaskId();
   agg->pool_query_ = PoolQuery::Local();
   agg->SetFlags(TASK_BATCH_AGGREGATE);
-  agg->ClearFlags(TASK_ROUTED | TASK_STARTED | TASK_RUN_CTX_EXISTS);
+  // routed_/started_ now live on the aggregate's own (fresh) RunContext, which
+  // ipc_->Send -> IpcCpu2Self::SendIn -> BeginTask allocates below.
 
   // Remember the originals to broadcast to when the aggregate completes, and
   // map the aggregate back to its group key so OnAggregateComplete can release
@@ -169,13 +168,12 @@ void BatchManager::BuildAndSubmit(Worker * /*worker*/, const GroupKey &key,
   ipc_->Send(agg);
 }
 
-bool BatchManager::IsAggregate(const ctp::ipc::FullPtr<Task> &task) const {
+bool BatchManager::IsAggregate(const clio::run::shared_ptr<Task> &task) const {
   return !task.IsNull() && task->task_flags_.Any(TASK_BATCH_AGGREGATE);
 }
 
 void BatchManager::OnAggregateComplete(Worker *worker,
-                                       const ctp::ipc::FullPtr<Task> &agg,
-                                       RunContext *agg_rctx) {
+                                       clio::run::shared_ptr<Task> &agg) {
   // Release the in-flight claim for this group key first, so a fresh batch can
   // start now that this aggregate's effects are fully settled. Done before the
   // broadcast below (which only signals the original submitters) so the leader
@@ -189,7 +187,7 @@ void BatchManager::OnAggregateComplete(Worker *worker,
     }
   }
 
-  std::vector<ctp::ipc::FullPtr<Task>> members;
+  std::vector<clio::run::shared_ptr<Task>> members;
   {
     std::lock_guard<std::mutex> lk(pending_mu_);
     auto it = pending_.find(agg->task_id_.unique_);
@@ -201,11 +199,12 @@ void BatchManager::OnAggregateComplete(Worker *worker,
   }
 
   auto *pool_manager = CLIO_POOL_MANAGER;
-  Container *container =
-      (agg_rctx != nullptr && agg_rctx->container_ != nullptr)
-          ? agg_rctx->container_
+  DynamicContainer container =
+      (agg->ExecContainer().IsValid())
+          ? agg->ExecContainer()
           : pool_manager->GetStaticContainer(agg->pool_id_);
-  if (container == nullptr) {
+  ContainerHold cont = container.get();
+  if (cont == nullptr) {
     HLOG(kError, "BatchManager: no container to broadcast aggregate for pool {}",
          agg->pool_id_);
     return;
@@ -221,23 +220,18 @@ void BatchManager::OnAggregateComplete(Worker *worker,
   // replica-gather (N->1) merge. Here it is one result broadcast 1->N.
   clio::run::priv::vector<char> out_buf(CLIO_PRIV_ALLOC);
   clio::run::DefaultSaveArchive save_ar(clio::run::LocalMsgType::kSerializeOut, out_buf);
-  container->LocalSaveTask(method, save_ar, agg);
+  cont->LocalSaveTask(method, save_ar, agg);
 
   for (auto &member : members) {
     // Copy the aggregate's OUT into this member (broadcast).
     clio::run::DefaultLoadArchive load_ar(save_ar.GetMutableData());
     load_ar.Reset(clio::run::LocalMsgType::kSerializeOut);
-    container->LocalLoadTask(member->method_, load_ar, member);
+    cont->LocalLoadTask(member->method_, load_ar, member);
     member->SetReturnCode(rc);
     member->SetCompleter(completer);
     // Complete the original: local future signal or remote SendOut.
-    RunContext *m_rctx = member->GetRunCtx();
-    if (m_rctx == nullptr) {
-      HLOG(kError, "BatchManager: batched task has no RunContext, cannot end");
-      continue;
-    }
-    m_rctx->container_ = container;
-    worker->EndTask(member, m_rctx, false);
+    member->ExecContainer() = container;  // DynamicContainer copy (handle)
+    worker->EndTask(member, false);
   }
 }
 

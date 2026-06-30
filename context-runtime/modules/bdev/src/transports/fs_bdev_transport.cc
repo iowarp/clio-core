@@ -158,7 +158,7 @@ WorkerIOContext *FsBdevTransport::GetWorkerIOContext(size_t worker_id) {
   return ctx;
 }
 
-clio::run::TaskResume FsBdevTransport::WriteBlocks(ctp::ipc::FullPtr<WriteTask> task, clio::run::RunContext &rctx) {
+clio::run::TaskResume FsBdevTransport::WriteBlocks(ctp::ipc::FullPtr<WriteTask> task) {
   CLIO_TASK_BODY_BEGIN
   clio::run::Worker *worker = CLIO_CUR_WORKER;
   size_t worker_id = worker ? worker->GetId() : 0;
@@ -226,7 +226,7 @@ clio::run::TaskResume FsBdevTransport::WriteBlocks(ctp::ipc::FullPtr<WriteTask> 
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume FsBdevTransport::ReadBlocks(ctp::ipc::FullPtr<ReadTask> task, clio::run::RunContext &rctx) {
+clio::run::TaskResume FsBdevTransport::ReadBlocks(ctp::ipc::FullPtr<ReadTask> task) {
   CLIO_TASK_BODY_BEGIN
   clio::run::Worker *worker = CLIO_CUR_WORKER;
   size_t worker_id = worker ? worker->GetId() : 0;

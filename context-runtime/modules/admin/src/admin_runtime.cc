@@ -78,8 +78,7 @@ namespace clio::run::admin {
 
 Runtime::~Runtime() {}
 
-clio::run::TaskResume Runtime::Create(ctp::ipc::FullPtr<CreateTask> task,
-                                clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   CLIO_TASK_BODY_BEGIN
   // Admin container creation logic (IS_ADMIN=true)
   HLOG(kDebug, "Admin: Initializing admin container");
@@ -104,11 +103,11 @@ clio::run::TaskResume Runtime::Create(ctp::ipc::FullPtr<CreateTask> task,
   // lbm_transport->Recv() directly and dispatch via RecvIn / RecvOut.
   //
   // Inbound dispatch only pushes Futures to worker lanes:
-  //   - RecvIn  -> IpcManager::Send -> IpcCpu2Self::ClientSend (non-worker
+  //   - RecvIn  -> IpcManager::Send -> IpcCpu2Self::SendIn (non-worker
   //                branch: RouteTask(force_enqueue=true), which is safe
   //                from a non-worker thread)
   //   - RecvOut -> direct worker_queues_->GetLane(...).Push(future)
-  //   - RuntimeRecv (client TCP/IPC) -> direct lane push
+  //   - RecvIn (client TCP/IPC) -> direct lane push
   //
   // None of these go through CLIO_CUR_WORKER (TLS) for anything that matters.
   // The outbound Send path is unchanged: still served by the net_send_worker
@@ -151,12 +150,11 @@ clio::run::TaskResume Runtime::Create(ctp::ipc::FullPtr<CreateTask> task,
   HLOG(kDebug,
        "Admin: Spawned periodic Recv, Send, ClientConnect, ClientRecv, "
        "ClientSend tasks");
-  (void)rctx;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
 
-clio::run::PoolQuery Runtime::ScheduleTask(const ctp::ipc::FullPtr<clio::run::Task> &task) {
+clio::run::PoolQuery Runtime::ScheduleTask(const clio::run::shared_ptr<clio::run::Task> &task) {
   using namespace clio::run::admin;
   switch (task->method_) {
     case Method::kGetOrCreatePool: {
@@ -175,10 +173,9 @@ clio::run::PoolQuery Runtime::ScheduleTask(const ctp::ipc::FullPtr<clio::run::Ta
 }
 
 clio::run::TaskResume Runtime::GetOrCreatePool(
-    ctp::ipc::FullPtr<
+    clio::run::shared_ptr<
         clio::run::admin::GetOrCreatePoolTask<clio::run::admin::CreateParams>>
-        task,
-    clio::run::RunContext &rctx) {
+        &task) {
   CLIO_TASK_BODY_BEGIN
   // Debug: Log do_compose_ value
   HLOG(kDebug,
@@ -200,7 +197,8 @@ clio::run::TaskResume Runtime::GetOrCreatePool(
   try {
     // Use the simplified PoolManager API that extracts all parameters from the
     // task. CreatePool is now a coroutine that co_awaits nested Create methods.
-    CLIO_CO_AWAIT(pool_manager->CreatePool(task.Cast<clio::run::Task>(), &rctx));
+    CLIO_CO_AWAIT(pool_manager->CreatePool(
+        task.Cast<clio::run::Task>()));
 
     // Check if CreatePool set an error (return code is set on the task)
     if (task->return_code_ != 0) {
@@ -228,17 +226,15 @@ clio::run::TaskResume Runtime::GetOrCreatePool(
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::Destroy(ctp::ipc::FullPtr<DestroyTask> task,
-                                 clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::Destroy(clio::run::shared_ptr<DestroyTask> &task) {
   CLIO_TASK_BODY_BEGIN
   // DestroyTask is aliased to DestroyPoolTask, so delegate to DestroyPool
-  CLIO_CO_AWAIT(DestroyPool(task, rctx));
+  CLIO_CO_AWAIT(DestroyPool(task));
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::DestroyPool(ctp::ipc::FullPtr<DestroyPoolTask> task,
-                                     clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::DestroyPool(clio::run::shared_ptr<DestroyPoolTask> &task) {
   CLIO_TASK_BODY_BEGIN
   HLOG(kDebug, "Admin: Executing DestroyPool task - Pool ID: {}",
        task->target_pool_id_);
@@ -282,8 +278,7 @@ clio::run::TaskResume Runtime::DestroyPool(ctp::ipc::FullPtr<DestroyPoolTask> ta
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::StopRuntime(ctp::ipc::FullPtr<StopRuntimeTask> task,
-                                     clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::StopRuntime(clio::run::shared_ptr<StopRuntimeTask> &task) {
   CLIO_TASK_BODY_BEGIN
   HLOG(kDebug, "Admin: Executing StopRuntime task - Grace period: {}ms",
        task->grace_period_ms_);
@@ -296,7 +291,6 @@ clio::run::TaskResume Runtime::StopRuntime(ctp::ipc::FullPtr<StopRuntimeTask> ta
   is_shutdown_requested_ = true;
   HLOG(kInfo, "Admin: Runtime shutdown initiated successfully");
   InitiateShutdown(task->grace_period_ms_);
-  (void)rctx;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
@@ -327,8 +321,7 @@ void Runtime::InitiateShutdown(clio::run::u32 grace_period_ms) {
   std::abort();
 }
 
-clio::run::TaskResume Runtime::Flush(ctp::ipc::FullPtr<FlushTask> task,
-                               clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::Flush(clio::run::shared_ptr<FlushTask> &task) {
   CLIO_TASK_BODY_BEGIN
   HLOG(kDebug, "Admin: Executing Flush task");
 
@@ -399,9 +392,9 @@ clio::run::TaskResume Runtime::Flush(ctp::ipc::FullPtr<FlushTask> task,
  *
  * Retry-queue + dead-node scans still run unconditionally each tick.
  */
-clio::run::TaskResume Runtime::Send(ctp::ipc::FullPtr<SendTask> task,
-                              clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::Send(clio::run::shared_ptr<SendTask> &task) {
   CLIO_TASK_BODY_BEGIN
+  clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
   auto *ipc_manager = CLIO_IPC;
   clio::run::Future<clio::run::Task> queued_future;
   bool did_send = false;
@@ -457,9 +450,7 @@ clio::run::TaskResume Runtime::Send(ctp::ipc::FullPtr<SendTask> task,
                                    queued_future)) {
       auto origin_task = queued_future.GetTaskPtr();
       if (!origin_task.IsNull()) {
-        size_t sz = origin_task->GetRunCtx()
-                        ? origin_task->GetRunCtx()->predicted_stat_.io_size_
-                        : 0;
+        size_t sz = origin_task->PredictedStat().io_size_;
         ipc_manager->GetRun2Run()->SendIn(origin_task);
         did_send = true;
         io_budget = (sz >= io_budget) ? 0 : (io_budget - sz);
@@ -473,9 +464,7 @@ clio::run::TaskResume Runtime::Send(ctp::ipc::FullPtr<SendTask> task,
                                    queued_future)) {
       auto origin_task = queued_future.GetTaskPtr();
       if (!origin_task.IsNull()) {
-        size_t sz = origin_task->GetRunCtx()
-                        ? origin_task->GetRunCtx()->predicted_stat_.io_size_
-                        : 0;
+        size_t sz = origin_task->PredictedStat().io_size_;
         ipc_manager->GetRun2Run()->SendOut(origin_task);
         did_send = true;
         io_budget = (sz >= io_budget) ? 0 : (io_budget - sz);
@@ -486,7 +475,7 @@ clio::run::TaskResume Runtime::Send(ctp::ipc::FullPtr<SendTask> task,
     if (!did_any) break;
   }
 
-  rctx.did_work_ = did_send;
+  cur_task->SetDidWork(did_send);
   task->SetReturnCode(0);
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -496,9 +485,9 @@ clio::run::TaskResume Runtime::Send(ctp::ipc::FullPtr<SendTask> task,
  * Main Recv function - receives metadata and dispatches based on mode
  * Note: This is a periodic task - only logs when actual work is done
  */
-clio::run::TaskResume Runtime::Recv(ctp::ipc::FullPtr<RecvTask> task,
-                              clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::Recv(clio::run::shared_ptr<RecvTask> &task) {
   CLIO_TASK_BODY_BEGIN
+  clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
   // Get the main server from CLIO_IPC (already bound during initialization)
   auto *ipc_manager = CLIO_IPC;
 
@@ -516,7 +505,7 @@ clio::run::TaskResume Runtime::Recv(ctp::ipc::FullPtr<RecvTask> task,
   if (rc == EAGAIN) {
     // No message available - this is normal for polling, mark as no work done
     task->SetReturnCode(0);
-    rctx.did_work_ = false;
+    cur_task->SetDidWork(false);
     CLIO_CO_RETURN;
   }
 
@@ -525,12 +514,12 @@ clio::run::TaskResume Runtime::Recv(ctp::ipc::FullPtr<RecvTask> task,
       HLOG(kError, "Admin: Lightbeam Recv failed with error code {}", rc);
     }
     task->SetReturnCode(2);
-    rctx.did_work_ = false;
+    cur_task->SetDidWork(false);
     CLIO_CO_RETURN;
   }
 
   // Mark that we received data (did work)
-  rctx.did_work_ = true;
+  cur_task->SetDidWork(true);
 
   clio::run::MsgType msg_type = archive.GetMsgType();
   HLOG(kDebug, "[Recv] Received message with msg_type={}",
@@ -584,11 +573,10 @@ clio::run::TaskResume Runtime::Recv(ctp::ipc::FullPtr<RecvTask> task,
  * Handle ClientConnect - Respond to client connection request
  * Polls connect server for ZMQ REQ/REP requests and responds
  * @param task The connect task
- * @param rctx Run context
  */
-clio::run::TaskResume Runtime::ClientConnect(ctp::ipc::FullPtr<ClientConnectTask> task,
-                                       clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::ClientConnect(clio::run::shared_ptr<ClientConnectTask> &task) {
   CLIO_TASK_BODY_BEGIN
+  clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
   task->response_ = 0;
   task->server_generation_ = CLIO_IPC->GetServerGeneration();
   task->server_pid_ = static_cast<int32_t>(getpid());
@@ -597,6 +585,24 @@ clio::run::TaskResume Runtime::ClientConnect(ctp::ipc::FullPtr<ClientConnectTask
   // correct allocators (segments are no longer the hardcoded (1,0)/(2,0)).
   task->main_alloc_id_ = CLIO_IPC->GetMainAllocatorId();
   task->queue_alloc_id_ = CLIO_IPC->GetQueueAllocatorId();
+
+  // #642: publish worker OS thread ids so SHM clients can address each worker's
+  // "clio-<server_pid>-<worker_tid>" MPSC receive server.
+  {
+    auto *wo = CLIO_WORK_ORCHESTRATOR;
+    clio::run::u32 n = 0;
+    if (wo != nullptr) {
+      size_t cnt = wo->GetWorkerCount();
+      for (size_t i = 0;
+           i < cnt && n < ClientConnectTask::kMaxWorkerTids; ++i) {
+        clio::run::Worker *w = wo->GetWorker(static_cast<clio::run::u32>(i));
+        if (w != nullptr && w->GetTid() != 0) {
+          task->worker_tids_[n++] = w->GetTid();
+        }
+      }
+    }
+    task->num_worker_tids_ = n;
+  }
 
   // GPU queue info for client attachment.
   //
@@ -608,23 +614,23 @@ clio::run::TaskResume Runtime::ClientConnect(ctp::ipc::FullPtr<ClientConnectTask
   task->gpu_queue_depth_ = 0;
 
   task->SetReturnCode(0);
-  rctx.did_work_ = true;
+  cur_task->SetDidWork(true);
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
 
 /**
  * Handle ClientRecv - Receive tasks from lightbeam client servers
- * Delegates to IpcCpu2CpuZmq::RuntimeRecv for the actual transport logic.
+ * Delegates to IpcCpu2CpuZmq::RecvIn for the actual transport logic.
  */
-clio::run::TaskResume Runtime::ClientRecv(ctp::ipc::FullPtr<ClientRecvTask> task,
-                                    clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::ClientRecv(clio::run::shared_ptr<ClientRecvTask> &task) {
   CLIO_TASK_BODY_BEGIN
+  clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
   clio::run::u32 tasks_received = 0;
-  bool did_work = clio::run::IpcCpu2CpuZmq::RuntimeRecv(CLIO_IPC, tasks_received);
+  bool did_work = clio::run::IpcCpu2CpuZmq::RecvIn(CLIO_IPC, tasks_received);
   task->tasks_received_ = tasks_received;
 
-  rctx.did_work_ = did_work;
+  cur_task->SetDidWork(did_work);
   task->SetReturnCode(0);
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
@@ -632,25 +638,24 @@ clio::run::TaskResume Runtime::ClientRecv(ctp::ipc::FullPtr<ClientRecvTask> task
 
 /**
  * Handle ClientSend - Send completed task outputs to clients via lightbeam
- * Delegates to IpcCpu2CpuZmq::RuntimeSend for the actual transport logic.
+ * Delegates to IpcCpu2CpuZmq::SendOut for the actual transport logic.
  */
-clio::run::TaskResume Runtime::ClientSend(ctp::ipc::FullPtr<ClientSendTask> task,
-                                    clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::ClientSend(clio::run::shared_ptr<ClientSendTask> &task) {
   CLIO_TASK_BODY_BEGIN
-  static std::vector<ctp::ipc::FullPtr<clio::run::Task>> deferred_deletes;
+  clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
+  static std::vector<clio::run::shared_ptr<clio::run::Task>> deferred_deletes;
   clio::run::u32 tasks_sent = 0;
-  bool did_work = clio::run::IpcCpu2CpuZmq::RuntimeSend(
+  bool did_work = clio::run::IpcCpu2CpuZmq::SendOut(
       CLIO_IPC, tasks_sent, deferred_deletes);
   task->tasks_sent_ = tasks_sent;
 
-  rctx.did_work_ = did_work;
+  cur_task->SetDidWork(did_work);
   task->SetReturnCode(0);
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::Monitor(ctp::ipc::FullPtr<MonitorTask> task,
-                                 clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::Monitor(clio::run::shared_ptr<MonitorTask> &task) {
   CLIO_TASK_BODY_BEGIN
   if (task->query_ == "worker_stats") {
     MonitorWorkerStats(task);
@@ -668,12 +673,11 @@ clio::run::TaskResume Runtime::Monitor(ctp::ipc::FullPtr<MonitorTask> task,
     // Unknown queries get empty results (forward-compatible)
     task->SetReturnCode(0);
   }
-  (void)rctx;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
 
-void Runtime::MonitorWorkerStats(ctp::ipc::FullPtr<MonitorTask> task) {
+void Runtime::MonitorWorkerStats(clio::run::shared_ptr<MonitorTask> &task) {
   auto *work_orchestrator = CLIO_WORK_ORCHESTRATOR;
   if (!work_orchestrator) {
     task->SetReturnCode(1);
@@ -723,7 +727,7 @@ void Runtime::MonitorWorkerStats(ctp::ipc::FullPtr<MonitorTask> task) {
   task->results_[container_id_] = std::string(sbuf.data(), sbuf.size());
 }
 
-void Runtime::MonitorContainerStats(ctp::ipc::FullPtr<MonitorTask> task) {
+void Runtime::MonitorContainerStats(clio::run::shared_ptr<MonitorTask> &task) {
   auto *pool_manager = CLIO_POOL_MANAGER;
   if (!pool_manager) {
     task->SetReturnCode(1);
@@ -741,7 +745,7 @@ void Runtime::MonitorContainerStats(ctp::ipc::FullPtr<MonitorTask> task) {
     if (!info) continue;
 
     // Get the static container for model data
-    clio::run::Container *container = pool_manager->GetStaticContainer(pid);
+    auto container = pool_manager->GetStaticContainer(pid).get();
 
     pk.pack_map(6);
 
@@ -796,11 +800,7 @@ void Runtime::MonitorContainerStats(ctp::ipc::FullPtr<MonitorTask> task) {
   task->results_[container_id_] = std::string(sbuf.data(), sbuf.size());
 }
 
-clio::run::TaskResume Runtime::MonitorPoolStats(ctp::ipc::FullPtr<MonitorTask> task) {
-#ifdef CLIO_ENABLE_BOOST_COROUTINES
-  clio::run::RunContext _dummy_rctx;
-  clio::run::RunContext& rctx = _dummy_rctx;
-#endif
+clio::run::TaskResume Runtime::MonitorPoolStats(clio::run::shared_ptr<MonitorTask> &task) {
   CLIO_TASK_BODY_BEGIN
   // Parse pool_stats://PoolId:PoolQuery:selector
   // Format: pool_stats://<major.minor>:<routing_mode[:params...]>:<selector>
@@ -892,7 +892,7 @@ clio::run::TaskResume Runtime::MonitorPoolStats(ctp::ipc::FullPtr<MonitorTask> t
 
   // 4. Verify the target pool exists
   auto *pool_manager = CLIO_POOL_MANAGER;
-  clio::run::Container *container = pool_manager->GetStaticContainer(target_pool_id);
+  auto container = pool_manager->GetStaticContainer(target_pool_id).get();
   if (!container) {
     task->SetReturnCode(3);
     HLOG(kError, "Monitor(pool_stats): pool {} not found", target_pool_id);
@@ -919,7 +919,7 @@ clio::run::TaskResume Runtime::MonitorPoolStats(ctp::ipc::FullPtr<MonitorTask> t
   CLIO_TASK_BODY_END
 }
 
-void Runtime::MonitorSystemStats(ctp::ipc::FullPtr<MonitorTask> task) {
+void Runtime::MonitorSystemStats(clio::run::shared_ptr<MonitorTask> &task) {
   // system_stats or system_stats:<min_event_id>
   uint64_t min_event_id = 0;
   if (task->query_.size() > 13 && task->query_[12] == ':') {
@@ -991,7 +991,7 @@ void Runtime::MonitorSystemStats(ctp::ipc::FullPtr<MonitorTask> task) {
   task->SetReturnCode(0);
 }
 
-void Runtime::MonitorGetHostInfo(ctp::ipc::FullPtr<MonitorTask> task) {
+void Runtime::MonitorGetHostInfo(clio::run::shared_ptr<MonitorTask> &task) {
   msgpack::sbuffer sbuf;
   msgpack::packer<msgpack::sbuffer> pk(sbuf);
   pk.pack_map(3);
@@ -1006,7 +1006,7 @@ void Runtime::MonitorGetHostInfo(ctp::ipc::FullPtr<MonitorTask> task) {
 }
 
 clio::run::TaskResume Runtime::AnnounceShutdown(
-    ctp::ipc::FullPtr<AnnounceShutdownTask> task, clio::run::RunContext &rctx) {
+    clio::run::shared_ptr<AnnounceShutdownTask> &task) {
   CLIO_TASK_BODY_BEGIN
   clio::run::u64 dead_node_id = task->shutting_down_node_id_;
   auto *ipc_manager = CLIO_IPC;
@@ -1023,16 +1023,11 @@ clio::run::TaskResume Runtime::AnnounceShutdown(
   }
 
   task->SetReturnCode(0);
-  (void)rctx;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::MonitorBdevStats(ctp::ipc::FullPtr<MonitorTask> task) {
-#ifdef CLIO_ENABLE_BOOST_COROUTINES
-  clio::run::RunContext _dummy_rctx;
-  clio::run::RunContext& rctx = _dummy_rctx;
-#endif
+clio::run::TaskResume Runtime::MonitorBdevStats(clio::run::shared_ptr<MonitorTask> &task) {
   CLIO_TASK_BODY_BEGIN
   // Collect stats from all bdev pools on this node
   auto *pool_manager = CLIO_POOL_MANAGER;
@@ -1086,8 +1081,7 @@ clio::run::TaskResume Runtime::MonitorBdevStats(ctp::ipc::FullPtr<MonitorTask> t
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::SubmitBatch(ctp::ipc::FullPtr<SubmitBatchTask> task,
-                                     clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::SubmitBatch(clio::run::shared_ptr<SubmitBatchTask> &task) {
   CLIO_TASK_BODY_BEGIN
   HLOG(kInfo, "Admin: Executing SubmitBatch task with {} tasks",
        task->task_infos_.size());
@@ -1131,8 +1125,8 @@ clio::run::TaskResume Runtime::SubmitBatch(ctp::ipc::FullPtr<SubmitBatchTask> ta
       const clio::run::LocalTaskInfo &task_info = task->task_infos_[task_idx];
 
       // Get the container for this task's pool
-      clio::run::Container *container =
-          pool_manager->GetStaticContainer(task_info.pool_id_);
+      auto container =
+          pool_manager->GetStaticContainer(task_info.pool_id_).get();
       if (!container) {
         HLOG(kError, "SubmitBatch: Container not found for pool_id {}",
              task_info.pool_id_);
@@ -1140,7 +1134,7 @@ clio::run::TaskResume Runtime::SubmitBatch(ctp::ipc::FullPtr<SubmitBatchTask> ta
       }
 
       // Deserialize and allocate the task
-      ctp::ipc::FullPtr<clio::run::Task> sub_task_ptr =
+      clio::run::shared_ptr<clio::run::Task> sub_task_ptr =
           container->LocalAllocLoadTask(task_info.method_id_, archive);
 
       if (sub_task_ptr.IsNull()) {
@@ -1167,13 +1161,11 @@ clio::run::TaskResume Runtime::SubmitBatch(ctp::ipc::FullPtr<SubmitBatchTask> ta
   HLOG(kInfo, "SubmitBatch: Completed {} of {} tasks", task->tasks_completed_,
        total_tasks);
 
-  (void)rctx;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::RegisterMemory(ctp::ipc::FullPtr<RegisterMemoryTask> task,
-                                        clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::RegisterMemory(clio::run::shared_ptr<RegisterMemoryTask> &task) {
   CLIO_TASK_BODY_BEGIN
   auto *ipc_manager = CLIO_IPC;
   MemoryType mem_type = static_cast<MemoryType>(task->memory_type_);
@@ -1242,13 +1234,12 @@ clio::run::TaskResume Runtime::RegisterMemory(ctp::ipc::FullPtr<RegisterMemoryTa
   }
 
   task->SetReturnCode(task->success_ ? 0 : 1);
-  (void)rctx;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
 
 clio::run::TaskResume Runtime::RestartContainers(
-    ctp::ipc::FullPtr<RestartContainersTask> task, clio::run::RunContext &rctx) {
+    clio::run::shared_ptr<RestartContainersTask> &task) {
   CLIO_TASK_BODY_BEGIN
   HLOG(kDebug, "Admin: Executing RestartContainers task");
 
@@ -1319,13 +1310,12 @@ clio::run::TaskResume Runtime::RestartContainers(
     task->error_message_ = clio::run::priv::string(CTP_MALLOC, error_msg);
     HLOG(kError, "Admin: RestartContainers failed: {}", e.what());
   }
-  (void)rctx;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
 
 clio::run::TaskResume Runtime::ListContainers(
-    ctp::ipc::FullPtr<ListContainersTask> task, clio::run::RunContext &rctx) {
+    clio::run::shared_ptr<ListContainersTask> &task) {
   CLIO_TASK_BODY_BEGIN
   HLOG(kDebug, "Admin: Executing ListContainers task");
 
@@ -1345,15 +1335,12 @@ clio::run::TaskResume Runtime::ListContainers(
   task->SetReturnCode(0);
   HLOG(kDebug, "Admin: ListContainers found {} active pools",
        task->pool_names_.size());
-  (void)rctx;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::AddNode(ctp::ipc::FullPtr<AddNodeTask> task,
-                                 clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::AddNode(clio::run::shared_ptr<AddNodeTask> &task) {
   CLIO_TASK_BODY_BEGIN
-  (void)rctx;
   HLOG(kInfo, "Admin: Executing AddNode for {}:{}", task->new_node_ip_.str(),
        task->new_node_port_);
 
@@ -1369,9 +1356,9 @@ clio::run::TaskResume Runtime::AddNode(ctp::ipc::FullPtr<AddNodeTask> task,
   clio::run::Host new_host(task->new_node_ip_.str(), new_node_id);
   std::vector<clio::run::PoolId> pool_ids = pool_manager->GetAllPoolIds();
   for (const auto &pool_id : pool_ids) {
-    bool is_plugged = false;
-    clio::run::Container *container = pool_manager->GetContainer(
-        pool_id, clio::run::kInvalidContainerId, is_plugged);
+    clio::run::ContainerHold container =
+        pool_manager->GetContainer(pool_id, clio::run::kInvalidContainerId)
+            .get();
     if (container) {
       container->Expand(new_host);
     }
@@ -1383,9 +1370,9 @@ clio::run::TaskResume Runtime::AddNode(ctp::ipc::FullPtr<AddNodeTask> task,
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::WreapDeadIpcs(ctp::ipc::FullPtr<WreapDeadIpcsTask> task,
-                                       clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::WreapDeadIpcs(clio::run::shared_ptr<WreapDeadIpcsTask> &task) {
   CLIO_TASK_BODY_BEGIN
+  clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
   auto *ipc_manager = CLIO_IPC;
 
   // Call IpcManager::WreapDeadIpcs to reap shared memory from dead processes
@@ -1394,11 +1381,11 @@ clio::run::TaskResume Runtime::WreapDeadIpcs(ctp::ipc::FullPtr<WreapDeadIpcsTask
 
   // Mark whether we did work (for periodic task efficiency tracking)
   if (task->reaped_count_ > 0) {
-    rctx.did_work_ = true;
+    cur_task->SetDidWork(true);
     HLOG(kInfo, "Admin: WreapDeadIpcs reaped {} shared memory segments",
          task->reaped_count_);
   } else {
-    rctx.did_work_ = false;
+    cur_task->SetDidWork(false);
   }
 
   task->SetReturnCode(0);
@@ -1407,9 +1394,8 @@ clio::run::TaskResume Runtime::WreapDeadIpcs(ctp::ipc::FullPtr<WreapDeadIpcsTask
 }
 
 clio::run::TaskResume Runtime::ChangeAddressTable(
-    ctp::ipc::FullPtr<ChangeAddressTableTask> task, clio::run::RunContext &rctx) {
+    clio::run::shared_ptr<ChangeAddressTableTask> &task) {
   CLIO_TASK_BODY_BEGIN
-  (void)rctx;
   auto *pool_manager = CLIO_POOL_MANAGER;
 
   clio::run::PoolId target_pool_id = task->target_pool_id_;
@@ -1440,9 +1426,8 @@ clio::run::TaskResume Runtime::ChangeAddressTable(
 }
 
 clio::run::TaskResume Runtime::MigrateContainers(
-    ctp::ipc::FullPtr<MigrateContainersTask> task, clio::run::RunContext &rctx) {
+    clio::run::shared_ptr<MigrateContainersTask> &task) {
   CLIO_TASK_BODY_BEGIN
-  (void)rctx;
   HLOG(kInfo, "Admin: Executing MigrateContainers task");
 
   auto *pool_manager = CLIO_POOL_MANAGER;
@@ -1466,12 +1451,13 @@ clio::run::TaskResume Runtime::MigrateContainers(
     // Plug the container to stop new tasks and wait for work to complete
     pool_manager->PlugContainer(info.pool_id_, info.container_id_);
 
-    // Get the specific Container on this node and call Migrate
-    bool is_plugged = false;
-    clio::run::Container *container = pool_manager->GetContainer(
-        info.pool_id_, info.container_id_, is_plugged);
-    if (container) {
-      container->Migrate(info.dest_);
+    // Migrate the specific container on this node. DynamicContainer::Migrate
+    // takes the write side of the slot lock, so the container-level state move
+    // is serialized against any task still executing against it.
+    clio::run::DynamicContainer dc =
+        pool_manager->GetContainer(info.pool_id_, info.container_id_);
+    if (dc) {
+      CLIO_CO_AWAIT(dc.Migrate(info.dest_));
     }
 
     // Broadcast ChangeAddressTable to all nodes
@@ -1506,18 +1492,18 @@ clio::run::TaskResume Runtime::MigrateContainers(
 }
 
 
-clio::run::TaskResume Runtime::Heartbeat(ctp::ipc::FullPtr<HeartbeatTask> task,
-                                   clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::Heartbeat(clio::run::shared_ptr<HeartbeatTask> &task) {
   CLIO_TASK_BODY_BEGIN
+  clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
   task->SetReturnCode(0);
-  rctx.did_work_ = true;
+  cur_task->SetDidWork(true);
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::HeartbeatProbe(ctp::ipc::FullPtr<HeartbeatProbeTask> task,
-                                        clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::HeartbeatProbe(clio::run::shared_ptr<HeartbeatProbeTask> &task) {
   CLIO_TASK_BODY_BEGIN
+  clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
   auto *ipc_manager = CLIO_IPC;
   auto *config_manager = CLIO_CONFIG_MANAGER;
 
@@ -1529,7 +1515,7 @@ clio::run::TaskResume Runtime::HeartbeatProbe(ctp::ipc::FullPtr<HeartbeatProbeTa
   // state, so without SWIM mutating it, IsAlive() trivially returns true
   // and the cross-node paths just keep retrying on transient errors.
   if (!config_manager->GetSwimEnabled()) {
-    rctx.did_work_ = false;
+    cur_task->SetDidWork(false);
     task->SetReturnCode(0);
     CLIO_CO_RETURN;
   }
@@ -1758,15 +1744,15 @@ clio::run::TaskResume Runtime::HeartbeatProbe(ctp::ipc::FullPtr<HeartbeatProbeTa
     }
   }
 
-  rctx.did_work_ = did_work;
+  cur_task->SetDidWork(did_work);
   task->SetReturnCode(0);
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::ProbeRequest(ctp::ipc::FullPtr<ProbeRequestTask> task,
-                                      clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::ProbeRequest(clio::run::shared_ptr<ProbeRequestTask> &task) {
   CLIO_TASK_BODY_BEGIN
+  clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
   // Probe the target node on behalf of the requester using cooperative yield
   auto future =
       client_.AsyncHeartbeat(clio::run::PoolQuery::Physical(task->target_node_id_));
@@ -1790,7 +1776,7 @@ clio::run::TaskResume Runtime::ProbeRequest(ctp::ipc::FullPtr<ProbeRequestTask> 
   }
 
   task->SetReturnCode(0);
-  rctx.did_work_ = true;
+  cur_task->SetDidWork(true);
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
@@ -1858,8 +1844,8 @@ std::vector<clio::run::RecoveryAssignment> Runtime::ComputeRecoveryPlan(
         ra.container_id_ = container_id;
         ra.dead_node_id_ = static_cast<clio::run::u32>(dead_node_id);
         clio::run::u32 dest = static_cast<clio::run::u32>(-1);
-        if (info->local_container_) {
-          dest = info->local_container_->ScheduleRecover();
+        if (clio::run::ContainerHold local = info->local_container_.get()) {
+          dest = local->ScheduleRecover();
         }
         if (dest == static_cast<clio::run::u32>(-1)) {
           dest =
@@ -1875,10 +1861,6 @@ std::vector<clio::run::RecoveryAssignment> Runtime::ComputeRecoveryPlan(
 }
 
 clio::run::TaskResume Runtime::TriggerRecovery(clio::run::u64 dead_node_id) {
-#ifdef CLIO_ENABLE_BOOST_COROUTINES
-  clio::run::RunContext _dummy_rctx;
-  clio::run::RunContext& rctx = _dummy_rctx;
-#endif
   CLIO_TASK_BODY_BEGIN
   auto *ipc_manager = CLIO_IPC;
   if (!ipc_manager->IsLeader()) CLIO_CO_RETURN;
@@ -1906,8 +1888,9 @@ clio::run::TaskResume Runtime::TriggerRecovery(clio::run::u64 dead_node_id) {
 }
 
 clio::run::TaskResume Runtime::RecoverContainers(
-    ctp::ipc::FullPtr<RecoverContainersTask> task, clio::run::RunContext &rctx) {
+    clio::run::shared_ptr<RecoverContainersTask> &task) {
   CLIO_TASK_BODY_BEGIN
+  clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
   auto *ipc_manager = CLIO_IPC;
   auto *pool_manager = CLIO_POOL_MANAGER;
   auto *module_manager = CLIO_MODULE_MANAGER;
@@ -1935,21 +1918,21 @@ clio::run::TaskResume Runtime::RecoverContainers(
 
     HLOG(kInfo, "Recovery: Creating container {} for pool {} ({})",
          ra.container_id_, ra.pool_name_, ra.chimod_name_);
-    clio::run::Container *container = module_manager->CreateContainer(
-        ra.chimod_name_, ra.pool_id_, ra.pool_name_);
+    clio::run::DynamicContainer container(ra.chimod_name_, ra.pool_id_,
+                                          ra.pool_name_);
     if (!container) {
       HLOG(kError, "Recovery: Failed to create container for {}",
            ra.chimod_name_);
       continue;
     }
-    container->Recover(ra.pool_id_, ra.pool_name_, ra.container_id_);
+    container.get()->Recover(ra.pool_id_, ra.pool_name_, ra.container_id_);
     pool_manager->RegisterContainer(ra.pool_id_, ra.container_id_, container,
                                     false);
     task->num_recovered_++;
   }
 
   task->SetReturnCode(0);
-  rctx.did_work_ = true;
+  cur_task->SetDidWork(true);
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
@@ -1958,9 +1941,9 @@ clio::run::TaskResume Runtime::RecoverContainers(
 // System Monitor
 //===========================================================================
 
-clio::run::TaskResume Runtime::SystemMonitor(ctp::ipc::FullPtr<SystemMonitorTask> task,
-                                       clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::SystemMonitor(clio::run::shared_ptr<SystemMonitorTask> &task) {
   CLIO_TASK_BODY_BEGIN
+  clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
   SystemStats stats;
 
   // Timestamps
@@ -1998,15 +1981,16 @@ clio::run::TaskResume Runtime::SystemMonitor(ctp::ipc::FullPtr<SystemMonitorTask
     system_stats_ring_->Push(stats);
   }
 
-  rctx.did_work_ = true;
+  cur_task->SetDidWork(true);
   (void)task;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
 
 clio::run::TaskResume Runtime::RegisterGpuContainer(
-    ctp::ipc::FullPtr<RegisterGpuContainerTask> task, clio::run::RunContext &rctx) {
+    clio::run::shared_ptr<RegisterGpuContainerTask> &task) {
   CLIO_TASK_BODY_BEGIN
+  clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
   // This task is handled on the CPU side.
   // The GPU orchestrator's gpu::PoolManager is updated via a GPU kernel launch,
   // not directly from the admin runtime. The pool_manager.cc CreatePool
@@ -2014,7 +1998,7 @@ clio::run::TaskResume Runtime::RegisterGpuContainer(
   // This method exists as a no-op placeholder for task routing completeness.
   HLOG(kDebug, "RegisterGpuContainer: pool_id={}, container_id={}",
        task->target_pool_id_, task->container_id_);
-  rctx.did_work_ = true;
+  cur_task->SetDidWork(true);
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }

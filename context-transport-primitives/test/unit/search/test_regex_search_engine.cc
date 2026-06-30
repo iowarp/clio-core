@@ -38,7 +38,7 @@
 #include <string>
 #include <vector>
 
-#include "search/regex_search_engine.h"
+#include "clio_ctp/search/regex_search_engine.h"
 
 using ctp::search::RegexSearchEngine;
 

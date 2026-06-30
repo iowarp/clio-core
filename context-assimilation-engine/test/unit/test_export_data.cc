@@ -165,7 +165,7 @@ TEST_CASE("ExportData - Task default constructor", "[cae][export][task]") {
   REQUIRE(task->tag_name_.str() == "");
   REQUIRE(task->output_path_.str() == "");
   REQUIRE(task->format_.str() == "");
-  ipc->DelTask(task);
+  task.reset();
 
   INFO("ExportDataTask default constructor OK");
 }
@@ -186,7 +186,7 @@ TEST_CASE("ExportData - Task emplace constructor", "[cae][export][task]") {
   REQUIRE(task->bytes_exported_ == 0);
   REQUIRE(task->method_ == Method::kExportData);
 
-  ipc->DelTask(task);
+  task.reset();
   INFO("ExportDataTask emplace constructor OK");
 }
 
@@ -212,8 +212,8 @@ TEST_CASE("ExportData - Task Copy", "[cae][export][task]") {
   REQUIRE(dst->result_code_ == 7);
   REQUIRE(dst->error_message_.str() == "copy_err");
 
-  ipc->DelTask(src);
-  ipc->DelTask(dst);
+  src.reset();
+  dst.reset();
   INFO("ExportDataTask Copy OK");
 }
 
@@ -241,8 +241,8 @@ TEST_CASE("ExportData - Task AggregateOut", "[cae][export][task]") {
   REQUIRE(orig->bytes_exported_ == 200);
   REQUIRE(orig->result_code_ == 5);
 
-  ipc->DelTask(orig);
-  ipc->DelTask(replica);
+  orig.reset();
+  replica.reset();
   INFO("ExportDataTask AggregateOut OK");
 }
 
@@ -274,8 +274,8 @@ TEST_CASE("ExportData - Task SerializeIn roundtrip", "[cae][export][task]") {
   REQUIRE(t2->output_path_.str() == "/tmp/ser.bin");
   REQUIRE(t2->format_.str() == "binary");
 
-  ipc->DelTask(task);
-  ipc->DelTask(t2);
+  task.reset();
+  t2.reset();
   INFO("ExportDataTask SerializeIn roundtrip OK");
 }
 
@@ -306,8 +306,8 @@ TEST_CASE("ExportData - Task SerializeOut roundtrip", "[cae][export][task]") {
   REQUIRE(t2->bytes_exported_ == 777);
   REQUIRE(t2->error_message_.str() == "err_msg");
 
-  ipc->DelTask(task);
-  ipc->DelTask(t2);
+  task.reset();
+  t2.reset();
   INFO("ExportDataTask SerializeOut roundtrip OK");
 }
 
@@ -482,7 +482,7 @@ TEST_CASE("ParseOmni - Task default constructor", "[cae][export][task]") {
   REQUIRE(task->num_tasks_scheduled_ == 0);
   REQUIRE(task->result_code_ == 0);
   REQUIRE(task->error_message_.str() == "");
-  ipc->DelTask(task);
+  task.reset();
 
   INFO("ParseOmniTask default constructor OK");
 }
@@ -503,7 +503,7 @@ TEST_CASE("ParseOmni - Task emplace constructor", "[cae][export][task]") {
   REQUIRE(task->result_code_ == 0);
   REQUIRE(task->method_ == Method::kParseOmni);
 
-  ipc->DelTask(task);
+  task.reset();
   INFO("ParseOmniTask emplace constructor OK");
 }
 
@@ -530,8 +530,8 @@ TEST_CASE("ParseOmni - Task Copy", "[cae][export][task]") {
   REQUIRE(dst->result_code_ == 2);
   REQUIRE(dst->error_message_.str() == "omni_err");
 
-  ipc->DelTask(src);
-  ipc->DelTask(dst);
+  src.reset();
+  dst.reset();
   INFO("ParseOmniTask Copy OK");
 }
 
@@ -559,8 +559,8 @@ TEST_CASE("ParseOmni - Task AggregateOut", "[cae][export][task]") {
   REQUIRE(orig->num_tasks_scheduled_ == 5);
   REQUIRE(orig->result_code_ == 9);
 
-  ipc->DelTask(orig);
-  ipc->DelTask(rep);
+  orig.reset();
+  rep.reset();
   INFO("ParseOmniTask AggregateOut OK");
 }
 
@@ -591,8 +591,8 @@ TEST_CASE("ParseOmni - Task SerializeIn roundtrip", "[cae][export][task]") {
 
   REQUIRE(t2->serialized_ctx_.str() == ser_data);
 
-  ipc->DelTask(task);
-  ipc->DelTask(t2);
+  task.reset();
+  t2.reset();
   INFO("ParseOmniTask SerializeIn roundtrip OK");
 }
 
@@ -622,8 +622,8 @@ TEST_CASE("ParseOmni - Task SerializeOut roundtrip", "[cae][export][task]") {
   REQUIRE(t2->result_code_ == 4);
   REQUIRE(t2->error_message_.str() == "out_err");
 
-  ipc->DelTask(task);
-  ipc->DelTask(t2);
+  task.reset();
+  t2.reset();
   INFO("ParseOmniTask SerializeOut roundtrip OK");
 }
 
@@ -642,7 +642,7 @@ TEST_CASE("ProcessHdf5Dataset - Task default constructor",
   REQUIRE(task->tag_prefix_.str() == "");
   REQUIRE(task->result_code_ == 0);
   REQUIRE(task->error_message_.str() == "");
-  ipc->DelTask(task);
+  task.reset();
 
   INFO("ProcessHdf5DatasetTask default constructor OK");
 }
@@ -664,7 +664,7 @@ TEST_CASE("ProcessHdf5Dataset - Task emplace constructor",
   REQUIRE(task->result_code_ == 0);
   REQUIRE(task->method_ == Method::kProcessHdf5Dataset);
 
-  ipc->DelTask(task);
+  task.reset();
   INFO("ProcessHdf5DatasetTask emplace constructor OK");
 }
 
@@ -690,8 +690,8 @@ TEST_CASE("ProcessHdf5Dataset - Task Copy", "[cae][export][task]") {
   REQUIRE(dst->result_code_ == 5);
   REQUIRE(dst->error_message_.str() == "hdf5_err");
 
-  ipc->DelTask(src);
-  ipc->DelTask(dst);
+  src.reset();
+  dst.reset();
   INFO("ProcessHdf5DatasetTask Copy OK");
 }
 
@@ -720,8 +720,8 @@ TEST_CASE("ProcessHdf5Dataset - Task AggregateOut keeps first error",
   REQUIRE(orig->result_code_ == -1);
   REQUIRE(orig->error_message_.str() == "first_err");
 
-  ipc->DelTask(orig);
-  ipc->DelTask(rep);
+  orig.reset();
+  rep.reset();
   INFO("ProcessHdf5DatasetTask AggregateOut keeps first error OK");
 }
 
@@ -749,8 +749,8 @@ TEST_CASE("ProcessHdf5Dataset - Task AggregateOut adopts replica error",
   REQUIRE(orig->result_code_ == -3);
   REQUIRE(orig->error_message_.str() == "rep_err");
 
-  ipc->DelTask(orig);
-  ipc->DelTask(rep);
+  orig.reset();
+  rep.reset();
   INFO("ProcessHdf5DatasetTask AggregateOut adopts replica error OK");
 }
 
@@ -782,8 +782,8 @@ TEST_CASE("ProcessHdf5Dataset - Task SerializeIn roundtrip",
   REQUIRE(t2->dataset_path_.str() == "/ser/dataset");
   REQUIRE(t2->tag_prefix_.str() == "ser_prefix");
 
-  ipc->DelTask(task);
-  ipc->DelTask(t2);
+  task.reset();
+  t2.reset();
   INFO("ProcessHdf5DatasetTask SerializeIn roundtrip OK");
 }
 
@@ -812,8 +812,8 @@ TEST_CASE("ProcessHdf5Dataset - Task SerializeOut roundtrip",
   REQUIRE(t2->result_code_ == 8);
   REQUIRE(t2->error_message_.str() == "ds_err");
 
-  ipc->DelTask(task);
-  ipc->DelTask(t2);
+  task.reset();
+  t2.reset();
   INFO("ProcessHdf5DatasetTask SerializeOut roundtrip OK");
 }
 

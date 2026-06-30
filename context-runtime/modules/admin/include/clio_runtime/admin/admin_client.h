@@ -348,7 +348,9 @@ class Client : public clio::run::ContainerClient {
     auto task = ipc_manager->NewTask<RegisterMemoryTask>(
         clio::run::CreateTaskId(), pool_id_, pool_query, alloc_id);
 
-    return clio::run::IpcCpu2CpuZmq::ClientSend(ipc_manager, task, clio::run::IpcMode::kTcp);
+    return clio::run::IpcCpu2CpuZmq::SendIn(
+        ipc_manager, task,
+        clio::run::IpcMode::kTcp);
   }
   /**
    * RestartContainers - Re-create pools from saved restart configs

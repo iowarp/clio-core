@@ -64,6 +64,20 @@ install(TARGETS shm_transfer_test
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
 
+# Named MPSC SHM transport test (issue #642): 16KB/1MB single-thread + multi-
+# producer 1MB into one consumer.
+add_executable(shm_mpsc_transport_test shm_mpsc_transport_test.cc)
+target_link_libraries(shm_mpsc_transport_test clio_ctp_host ctp::lightbeam Catch2::Catch2WithMain)
+add_test(NAME ctp_shm_mpsc_transport COMMAND shm_mpsc_transport_test)
+# Skip under MSan: Catch2 precompiled without MSan ignorelist; mmap-backed SHM.
+set_tests_properties(ctp_shm_mpsc_transport PROPERTIES
+    LABELS "msan_skip"
+    ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}")
+install(TARGETS shm_mpsc_transport_test
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+
 # EventManager test (always enabled - uses pipe/epoll + socket transport)
 add_executable(event_manager_test event_manager_test.cc)
 target_link_libraries(event_manager_test clio_ctp_host ctp::lightbeam ctp::serialize)
@@ -91,6 +105,23 @@ if(CLIO_CORE_ENABLE_ZMQ)
         RESOURCE_LOCK "lightbeam_port"
         ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}")
     install(TARGETS zmq_transport_full_test
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+
+    # Isolated reproduction of the runtime's concurrent ZMQ topology:
+    # 4 client senders, 1 client receiver, 1 server receiver, 1 server sender,
+    # the two receivers on separate ports. Driven per-scenario via argv.
+    add_executable(zmq_runtime_pattern_test zmq_runtime_pattern_test.cc)
+    target_link_libraries(zmq_runtime_pattern_test clio_ctp_host ctp::lightbeam ctp::serialize)
+    target_compile_definitions(zmq_runtime_pattern_test PRIVATE CTP_ENABLE_ZMQ)
+    add_test(NAME ctp_zmq_runtime_pattern COMMAND zmq_runtime_pattern_test both)
+    set_tests_properties(ctp_zmq_runtime_pattern PROPERTIES
+        LABELS "msan_skip"
+        RESOURCE_LOCK "lightbeam_port"
+        TIMEOUT 60
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}")
+    install(TARGETS zmq_runtime_pattern_test
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})

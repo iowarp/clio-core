@@ -487,7 +487,12 @@ struct rocm_atomic {
                            static_cast<unsigned long long>(
                                static_cast<T>(count)));
     } else {
-      return atomicExch(&x, static_cast<T>(count));
+      // CUDA atomicExch only overloads int / unsigned int / unsigned long long
+      // / float. Route any 4-byte T (incl. unsigned long, enums, signed) through
+      // the unsigned-int overload to stay compatible across toolkit versions
+      // (CUDA 13.x dropped the implicit narrowing matches).
+      return (T)atomicExch(reinterpret_cast<unsigned int*>(&x),
+                           static_cast<unsigned int>(static_cast<T>(count)));
     }
 #else
     T old = x;

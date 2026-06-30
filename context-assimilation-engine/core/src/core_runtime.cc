@@ -58,16 +58,14 @@ CLIO_TASK_CC(clio::cae::core::Runtime)
 
 namespace clio::cae::core {
 
-clio::run::TaskResume Runtime::Monitor(ctp::ipc::FullPtr<MonitorTask> task,
-                                 clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::Monitor(clio::run::shared_ptr<MonitorTask> &task) {
   CLIO_TASK_BODY_BEGIN
   task->SetReturnCode(0);
-  (void)rctx;
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::Create(ctp::ipc::FullPtr<CreateTask> task, clio::run::RunContext& rctx) {
+clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   CLIO_TASK_BODY_BEGIN
   // Container is already initialized via Init() before Create is called
   // Do NOT call Init() here
@@ -104,7 +102,7 @@ clio::run::PoolId Runtime::ResolveNextPoolId() const {
 }
 
 clio::run::PoolQuery Runtime::ScheduleTask(
-    const ctp::ipc::FullPtr<clio::run::Task> &task) {
+    const clio::run::shared_ptr<clio::run::Task> &task) {
   // Interceptor methods always run locally — they immediately forward
   // synchronously to the configured CTE core pool, so there is no value
   // in bouncing the task across nodes. Mirrors compressor_runtime.cc
@@ -147,8 +145,7 @@ static const LabelMatch *FindLabelMatch(
   return nullptr;
 }
 
-clio::run::TaskResume Runtime::PutBlob(ctp::ipc::FullPtr<PutBlobTask> task,
-                                 clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::PutBlob(clio::run::shared_ptr<PutBlobTask> &task) {
   CLIO_TASK_BODY_BEGIN
   if (!cte_client_) {
     cte_client_ = std::make_shared<clio::cte::core::Client>(ResolveNextPoolId());
@@ -294,8 +291,7 @@ clio::run::TaskResume Runtime::PutBlob(ctp::ipc::FullPtr<PutBlobTask> task,
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::GetBlob(ctp::ipc::FullPtr<GetBlobTask> task,
-                                 clio::run::RunContext &rctx) {
+clio::run::TaskResume Runtime::GetBlob(clio::run::shared_ptr<GetBlobTask> &task) {
   CLIO_TASK_BODY_BEGIN
   if (!cte_client_) {
     cte_client_ = std::make_shared<clio::cte::core::Client>(ResolveNextPoolId());
@@ -310,7 +306,7 @@ clio::run::TaskResume Runtime::GetBlob(ctp::ipc::FullPtr<GetBlobTask> task,
 }
 
 clio::run::TaskResume Runtime::GetOrCreateTag(
-    ctp::ipc::FullPtr<GetOrCreateTagTask> task, clio::run::RunContext &rctx) {
+    clio::run::shared_ptr<GetOrCreateTagTask> &task) {
   CLIO_TASK_BODY_BEGIN
   if (!cte_client_) {
     cte_client_ = std::make_shared<clio::cte::core::Client>(ResolveNextPoolId());
@@ -334,7 +330,7 @@ clio::run::TaskResume Runtime::GetOrCreateTag(
 }
 
 clio::run::TaskResume Runtime::SemanticSearch(
-    ctp::ipc::FullPtr<SemanticSearchTask> task, clio::run::RunContext &rctx) {
+    clio::run::shared_ptr<SemanticSearchTask> &task) {
   CLIO_TASK_BODY_BEGIN
   if (!cte_client_) {
     cte_client_ = std::make_shared<clio::cte::core::Client>(ResolveNextPoolId());
@@ -359,8 +355,7 @@ clio::run::u64 Runtime::GetWorkRemaining() const {
   return 0;
 }
 
-clio::run::TaskResume Runtime::ParseOmni(ctp::ipc::FullPtr<ParseOmniTask> task,
-                                   clio::run::RunContext& rctx) {
+clio::run::TaskResume Runtime::ParseOmni(clio::run::shared_ptr<ParseOmniTask> &task) {
   CLIO_TASK_BODY_BEGIN
   HLOG(kInfo, "ParseOmni called with {} bytes of serialized data",
        task->serialized_ctx_.size());
@@ -438,7 +433,7 @@ clio::run::TaskResume Runtime::ParseOmni(ctp::ipc::FullPtr<ParseOmniTask> task,
 }
 
 clio::run::TaskResume Runtime::ProcessHdf5Dataset(
-    ctp::ipc::FullPtr<ProcessHdf5DatasetTask> task, clio::run::RunContext& rctx) {
+    clio::run::shared_ptr<ProcessHdf5DatasetTask> &task) {
   CLIO_TASK_BODY_BEGIN
 #ifdef CLIO_CAE_ENABLE_HDF5
   HLOG(kInfo, "ProcessHdf5Dataset: file='{}', dataset='{}', tag_prefix='{}'",
@@ -487,8 +482,7 @@ clio::run::TaskResume Runtime::ProcessHdf5Dataset(
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::ExportData(ctp::ipc::FullPtr<ExportDataTask> task,
-                                    clio::run::RunContext& rctx) {
+clio::run::TaskResume Runtime::ExportData(clio::run::shared_ptr<ExportDataTask> &task) {
   CLIO_TASK_BODY_BEGIN
   task->result_code_ = 0;
   task->bytes_exported_ = 0;

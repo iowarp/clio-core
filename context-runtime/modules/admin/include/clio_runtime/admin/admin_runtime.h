@@ -113,13 +113,13 @@ public:
   /**
    * Schedule a task by resolving Dynamic pool queries.
    */
-  clio::run::PoolQuery ScheduleTask(const ctp::ipc::FullPtr<clio::run::Task> &task) override;
+  clio::run::PoolQuery ScheduleTask(const clio::run::shared_ptr<clio::run::Task> &task) override;
 
   /**
    * Execute a method on a task
    */
-  clio::run::TaskResume Run(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> task_ptr,
-                      clio::run::RunContext &rctx) override;
+  clio::run::TaskResume Run(clio::run::u32 method,
+                      clio::run::shared_ptr<clio::run::Task> task_ptr) override;
 
   //===========================================================================
   // Method implementations
@@ -129,40 +129,39 @@ public:
    * Handle Create task - Initialize the Admin container (IS_ADMIN=true)
    * Returns TaskResume for consistency with other methods called from Run
    */
-  clio::run::TaskResume Create(ctp::ipc::FullPtr<CreateTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume Create(clio::run::shared_ptr<CreateTask> &task);
 
   /**
    * Handle GetOrCreatePool task - Pool get-or-create operation (IS_ADMIN=false)
    * This is a coroutine that can co_await nested Create methods
    */
   clio::run::TaskResume GetOrCreatePool(
-      ctp::ipc::FullPtr<
+      clio::run::shared_ptr<
           clio::run::admin::GetOrCreatePoolTask<clio::run::admin::CreateParams>>
-          task,
-      clio::run::RunContext &rctx);
+          &task);
 
   /**
    * Handle Destroy task - Alias for DestroyPool (DestroyTask = DestroyPoolTask)
    * This is a coroutine for consistency with GetOrCreatePool
    */
-  clio::run::TaskResume Destroy(ctp::ipc::FullPtr<DestroyTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume Destroy(clio::run::shared_ptr<DestroyTask> &task);
 
   /**
    * Handle DestroyPool task - Destroy an existing ChiPool
    * This is a coroutine that can co_await pool destruction
    */
-  clio::run::TaskResume DestroyPool(ctp::ipc::FullPtr<DestroyPoolTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume DestroyPool(clio::run::shared_ptr<DestroyPoolTask> &task);
 
   /**
    * Handle StopRuntime task - Stop the entire runtime
    * Returns TaskResume for consistency with other methods called from Run
    */
-  clio::run::TaskResume StopRuntime(ctp::ipc::FullPtr<StopRuntimeTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume StopRuntime(clio::run::shared_ptr<StopRuntimeTask> &task);
 
   /**
    * Handle Flush task - Flush administrative operations
    */
-  clio::run::TaskResume Flush(ctp::ipc::FullPtr<FlushTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume Flush(clio::run::shared_ptr<FlushTask> &task);
 
   //===========================================================================
   // Distributed Task Scheduling Methods
@@ -172,38 +171,38 @@ public:
    * Handle Send - Send task inputs or outputs over network
    * Returns TaskResume for consistency with other methods called from Run
    */
-  clio::run::TaskResume Send(ctp::ipc::FullPtr<SendTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume Send(clio::run::shared_ptr<SendTask> &task);
 
   /**
    * Handle Recv - Receive task inputs or outputs from network
    * Returns TaskResume for consistency with other methods called from Run
    */
-  clio::run::TaskResume Recv(ctp::ipc::FullPtr<RecvTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume Recv(clio::run::shared_ptr<RecvTask> &task);
 
   /**
    * Handle ClientConnect - Respond to client connection request
    * Sets response to 0 to indicate runtime is healthy
    */
-  clio::run::TaskResume ClientConnect(ctp::ipc::FullPtr<ClientConnectTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume ClientConnect(clio::run::shared_ptr<ClientConnectTask> &task);
 
   /**
    * Handle ClientRecv - Receive tasks from ZMQ clients (TCP/IPC)
    * Polls ZMQ ROUTER sockets for incoming task submissions
    */
-  clio::run::TaskResume ClientRecv(ctp::ipc::FullPtr<ClientRecvTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume ClientRecv(clio::run::shared_ptr<ClientRecvTask> &task);
 
   /**
    * Handle ClientSend - Send completed task outputs to ZMQ clients
    * Polls net_queue_ kClientSendTcp/kClientSendIpc priorities
    */
-  clio::run::TaskResume ClientSend(ctp::ipc::FullPtr<ClientSendTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume ClientSend(clio::run::shared_ptr<ClientSendTask> &task);
 
   /**
    * Handle WreapDeadIpcs - Periodic task to reap shared memory from dead processes
    * Calls IpcManager::WreapDeadIpcs() to clean up orphaned shared memory segments
    * Returns TaskResume for consistency with other methods called from Run
    */
-  clio::run::TaskResume WreapDeadIpcs(ctp::ipc::FullPtr<WreapDeadIpcsTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume WreapDeadIpcs(clio::run::shared_ptr<WreapDeadIpcsTask> &task);
 
   /**
    * Handle Monitor - Unified monitor query for admin chimod
@@ -213,39 +212,38 @@ public:
    *   "system_stats[:<min_event_id>]" - system resource utilization
    *   "bdev_stats" - block device statistics
    */
-  clio::run::TaskResume Monitor(ctp::ipc::FullPtr<MonitorTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume Monitor(clio::run::shared_ptr<MonitorTask> &task);
 
   /** Monitor sub-handler: collect per-worker statistics. */
-  void MonitorWorkerStats(ctp::ipc::FullPtr<MonitorTask> task);
+  void MonitorWorkerStats(clio::run::shared_ptr<MonitorTask> &task);
 
   /** Monitor sub-handler: return per-container model statistics. */
-  void MonitorContainerStats(ctp::ipc::FullPtr<MonitorTask> task);
+  void MonitorContainerStats(clio::run::shared_ptr<MonitorTask> &task);
 
   /** Monitor sub-handler: delegate query to a specific pool. */
-  clio::run::TaskResume MonitorPoolStats(ctp::ipc::FullPtr<MonitorTask> task);
+  clio::run::TaskResume MonitorPoolStats(clio::run::shared_ptr<MonitorTask> &task);
 
   /** Monitor sub-handler: return system_stats ring buffer entries. */
-  void MonitorSystemStats(ctp::ipc::FullPtr<MonitorTask> task);
+  void MonitorSystemStats(clio::run::shared_ptr<MonitorTask> &task);
 
   /** Monitor sub-handler: collect bdev pool statistics. */
-  clio::run::TaskResume MonitorBdevStats(ctp::ipc::FullPtr<MonitorTask> task);
+  clio::run::TaskResume MonitorBdevStats(clio::run::shared_ptr<MonitorTask> &task);
 
   /** Monitor sub-handler: return host info (hostname, IP, node_id). */
-  void MonitorGetHostInfo(ctp::ipc::FullPtr<MonitorTask> task);
+  void MonitorGetHostInfo(clio::run::shared_ptr<MonitorTask> &task);
 
   /**
    * Handle AnnounceShutdown - Mark a departing node as dead immediately
    * and trigger recovery if this node is the new leader.
    */
-  clio::run::TaskResume AnnounceShutdown(ctp::ipc::FullPtr<AnnounceShutdownTask> task,
-                                    clio::run::RunContext &rctx);
+  clio::run::TaskResume AnnounceShutdown(clio::run::shared_ptr<AnnounceShutdownTask> &task);
 
   /**
    * Handle RegisterMemory - Register client shared memory with runtime
    * Called by SHM-mode clients after IncreaseMemory() to tell the runtime
    * to attach to the new shared memory segment
    */
-  clio::run::TaskResume RegisterMemory(ctp::ipc::FullPtr<RegisterMemoryTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume RegisterMemory(clio::run::shared_ptr<RegisterMemoryTask> &task);
 
   /**
    * Handle RestartContainers - Re-create pools from the restart registry.
@@ -253,19 +251,19 @@ public:
    * persistent registry replayed at startup, and re-composes each registered
    * compose file.
    */
-  clio::run::TaskResume RestartContainers(ctp::ipc::FullPtr<RestartContainersTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume RestartContainers(clio::run::shared_ptr<RestartContainersTask> &task);
 
   /**
    * Handle ListContainers - Enumerate active pools/containers in this daemon.
    * Fills the task's pool_names_ / pool_ids_ output vectors.
    */
-  clio::run::TaskResume ListContainers(ctp::ipc::FullPtr<ListContainersTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume ListContainers(clio::run::shared_ptr<ListContainersTask> &task);
 
   /**
    * Handle AddNode - Register a new node with this runtime
    * Updates IpcManager's hostfile and calls Expand on all containers
    */
-  clio::run::TaskResume AddNode(ctp::ipc::FullPtr<AddNodeTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume AddNode(clio::run::shared_ptr<AddNodeTask> &task);
 
   /**
    * Handle SubmitBatch - Submit a batch of tasks in a single RPC
@@ -274,54 +272,54 @@ public:
    * @param task The SubmitBatchTask containing serialized tasks
    * @param rctx Runtime context for the current worker
    */
-  clio::run::TaskResume SubmitBatch(ctp::ipc::FullPtr<SubmitBatchTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume SubmitBatch(clio::run::shared_ptr<SubmitBatchTask> &task);
 
   /**
    * Handle ChangeAddressTable - Update ContainerId->NodeId mapping
    * Writes WAL entry and updates pool manager's address table
    */
-  clio::run::TaskResume ChangeAddressTable(ctp::ipc::FullPtr<ChangeAddressTableTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume ChangeAddressTable(clio::run::shared_ptr<ChangeAddressTableTask> &task);
 
   /**
    * Handle MigrateContainers - Orchestrate container migration
    * Processes each MigrateInfo entry and broadcasts address table changes
    */
-  clio::run::TaskResume MigrateContainers(ctp::ipc::FullPtr<MigrateContainersTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume MigrateContainers(clio::run::shared_ptr<MigrateContainersTask> &task);
 
   /**
    * Handle Heartbeat - Liveness probe, just returns success
    */
-  clio::run::TaskResume Heartbeat(ctp::ipc::FullPtr<HeartbeatTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume Heartbeat(clio::run::shared_ptr<HeartbeatTask> &task);
 
   /**
    * Handle HeartbeatProbe - Periodic SWIM failure detector
    * Sends direct probes, escalates to indirect probes, manages suspicion
    */
-  clio::run::TaskResume HeartbeatProbe(ctp::ipc::FullPtr<HeartbeatProbeTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume HeartbeatProbe(clio::run::shared_ptr<HeartbeatProbeTask> &task);
 
   /**
    * Handle ProbeRequest - Indirect probe on behalf of another node
    * Probes target node and returns result to requester
    */
-  clio::run::TaskResume ProbeRequest(ctp::ipc::FullPtr<ProbeRequestTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume ProbeRequest(clio::run::shared_ptr<ProbeRequestTask> &task);
 
   /**
    * Handle RecoverContainers - Recreate containers from dead nodes
    * All nodes update address_map_, only dest node creates the container
    */
-  clio::run::TaskResume RecoverContainers(ctp::ipc::FullPtr<RecoverContainersTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume RecoverContainers(clio::run::shared_ptr<RecoverContainersTask> &task);
 
   /**
    * Handle SystemMonitor - Periodic system resource utilization sampling
    * Samples DRAM, CPU, and (optionally) GPU/HBM utilization into ring buffer
    */
-  clio::run::TaskResume SystemMonitor(ctp::ipc::FullPtr<SystemMonitorTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume SystemMonitor(clio::run::shared_ptr<SystemMonitorTask> &task);
 
   /**
    * Handle RegisterGpuContainer - Register a GPU container with the GPU orchestrator
    * The GPU orchestrator's gpu::PoolManager will be updated with the new container
    */
-  clio::run::TaskResume RegisterGpuContainer(ctp::ipc::FullPtr<RegisterGpuContainerTask> task, clio::run::RunContext &rctx);
+  clio::run::TaskResume RegisterGpuContainer(clio::run::shared_ptr<RegisterGpuContainerTask> &task);
 
   /**
    * Get live task statistics for this task instance.
@@ -344,49 +342,48 @@ public:
    * Serialize task parameters (IN or OUT based on archive mode)
    */
   void SaveTask(clio::run::u32 method, clio::run::SaveTaskArchive &archive,
-                ctp::ipc::FullPtr<clio::run::Task> task_ptr) override;
+                clio::run::shared_ptr<clio::run::Task>& task_ptr) override;
 
   /**
    * Deserialize task parameters into an existing task (IN or OUT based on archive mode)
    */
   void LoadTask(clio::run::u32 method, clio::run::LoadTaskArchive &archive,
-                ctp::ipc::FullPtr<clio::run::Task> task_ptr) override;
+                clio::run::shared_ptr<clio::run::Task>& task_ptr) override;
 
   /**
    * Allocate and deserialize task parameters from network transfer
    */
-  ctp::ipc::FullPtr<clio::run::Task> AllocLoadTask(clio::run::u32 method, clio::run::LoadTaskArchive &archive) override;
+  clio::run::shared_ptr<clio::run::Task> AllocLoadTask(clio::run::u32 method, clio::run::LoadTaskArchive &archive) override;
 
   /**
    * Deserialize task input parameters into an existing task using LocalSerialize
    */
   void LocalLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive &archive,
-                     ctp::ipc::FullPtr<clio::run::Task> task_ptr) override;
+                     clio::run::shared_ptr<clio::run::Task>& task_ptr) override;
 
   /**
    * Allocate and deserialize task input parameters using LocalSerialize
    */
-  ctp::ipc::FullPtr<clio::run::Task> LocalAllocLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive &archive) override;
+  clio::run::shared_ptr<clio::run::Task> LocalAllocLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive &archive) override;
 
   /**
    * Serialize task output parameters using LocalSerialize (for local transfers)
    */
   void LocalSaveTask(clio::run::u32 method, clio::run::DefaultSaveArchive &archive,
-                     ctp::ipc::FullPtr<clio::run::Task> task_ptr) override;
+                     clio::run::shared_ptr<clio::run::Task>& task_ptr) override;
 
   /**
    * Create a new copy of a task (deep copy for distributed execution)
    */
-  ctp::ipc::FullPtr<clio::run::Task> NewCopyTask(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> orig_task_ptr,
+  clio::run::shared_ptr<clio::run::Task> NewCopyTask(clio::run::u32 method, clio::run::shared_ptr<clio::run::Task> &orig_task_ptr,
                                         bool deep) override;
 
   /**
    * Create a new task of the specified method type
    */
-  ctp::ipc::FullPtr<clio::run::Task> NewTask(clio::run::u32 method) override;
-  void AggregateOut(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> orig_task,
-                 const ctp::ipc::FullPtr<clio::run::Task>& replica_task) override;
-  void DelTask(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> task_ptr) override;
+  clio::run::shared_ptr<clio::run::Task> NewTask(clio::run::u32 method) override;
+  void AggregateOut(clio::run::u32 method, clio::run::shared_ptr<clio::run::Task> &orig_task,
+                 const clio::run::shared_ptr<clio::run::Task>& replica_task) override;
 
 private:
   /**
