@@ -120,8 +120,19 @@ void IpcCpu2Self::SendOut(const clio::run::shared_ptr<Task> &task_ptr,
       // Always signal — see ipc_cpu2cpu_impl.h for the race.
       CLIO_IPC->AwakenWorker(parent_task->Lane());
     }
+  } else if (task_ptr->task_flags_.Any(TASK_EXTERNAL_CLIENT)) {
+    // Top-level task from an EXTERNAL (cross-process) SHM client. This is a
+    // daemon-local deserialized copy (IpcCpu2Cpu::RecvIn AllocLoadTask'd it and
+    // stamped TASK_EXTERNAL_CLIENT + the waiter pid/tid); the client process is
+    // blocked polling its own MPSC mailbox clio-<pid>-<tid>, not this copy's
+    // is_complete_ flag. Just flipping the local flag (the in-process branch
+    // below) would never reach it — the client hangs forever (the
+    // cr_ipc_transport_shm / cr_client_retry_*_shm timeouts on the macOS + boost
+    // configs). Serialize the result and send it to the client's mailbox.
+    IpcCpu2Cpu::SendOut(CLIO_IPC, task_ptr, send_transport);
   } else {
-    // Top-level client task: mark complete directly (per-process, this task).
+    // Top-level in-process self-send: client and runtime share this task
+    // object, so flipping the completion flag is observed directly.
     task_ptr->SetComplete();
   }
 }

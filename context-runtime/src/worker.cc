@@ -537,10 +537,22 @@ void Worker::SuspendMe() {
       }
     }
 
-    // Calculate timeout from periodic tasks
+    // Calculate timeout from periodic tasks, then cap it by max_sleep so a
+    // worker NEVER sleeps indefinitely. GetSuspendPeriod() returns -1 when this
+    // worker has no periodic task, which previously became an infinite epoll
+    // wait: the worker then only wakes on the producer's SIGUSR1. That is a
+    // cross-process lost-wakeup hang — an external SHM client pushes a task to a
+    // shared lane and signals this worker out of epoll_pwait2, but if the signal
+    // is ever missed (it races the worker's commit to epoll_pwait2, and on
+    // macOS/boost configs the timing reliably loses) the worker sleeps forever
+    // with a task pending (the cr_ipc_transport_shm / cr_client_retry_*_shm
+    // timeouts). max_sleep (50 ms) is exactly the "maximum sleep" knob meant to
+    // bound this; honor it so the worker self-heals by re-polling its lane.
     double suspend_period_us = GetSuspendPeriod();
-    int timeout_us =
-        (suspend_period_us < 0) ? -1 : static_cast<int>(suspend_period_us);
+    int timeout_us = (suspend_period_us < 0)
+                         ? static_cast<int>(max_sleep)
+                         : std::min(static_cast<int>(suspend_period_us),
+                                    static_cast<int>(max_sleep));
 
     // Wait for signal using EventManager
     int nfds = event_manager_.Wait(timeout_us);

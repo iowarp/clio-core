@@ -1788,7 +1788,16 @@ namespace clio::run::detail {
 
 /// Yield: suspend the running fiber back to the worker.
 inline void boost_await(clio::run::YieldAwaiter ya) {
-  clio::run::shared_ptr<clio::run::Task>& task = clio::run::GetCurrentTask();
+  // Hold the running task by VALUE, not by reference into the worker's
+  // current_task_ slot: the worker reassigns that slot (to null, then to other
+  // tasks) while this fiber is suspended, and with shared_ptr-owned tasks that
+  // reassignment can drop the slot's reference. A by-reference capture would
+  // then dangle and the post-resume task->SetYielded(false) would touch a freed
+  // (or wrong) task — the boost-backend SEGFAULT on every co_await/yield path
+  // (bdev WriteBlocks, the co-aware locks behind cte_query/cte_tag, etc.). The
+  // owning copy keeps this task alive across the suspend and is correct
+  // regardless of which worker resumes the fiber.
+  clio::run::shared_ptr<clio::run::Task> task = clio::run::GetCurrentTask();
   if (task.IsNull()) return;
   task->SetYielded(true);
   task->SetYieldTimeUs(ya.get_yield_time_us());
@@ -1800,7 +1809,9 @@ inline void boost_await(clio::run::YieldAwaiter ya) {
 template<typename TaskT, typename AllocT>
 inline void boost_await(clio::run::Future<TaskT, AllocT>& future) {
   if (future.IsComplete()) return;
-  clio::run::shared_ptr<clio::run::Task>& task = clio::run::GetCurrentTask();
+  // By value — see the YieldAwaiter overload above for why a reference into
+  // current_task_ dangles across the suspend.
+  clio::run::shared_ptr<clio::run::Task> task = clio::run::GetCurrentTask();
   if (task.IsNull()) return;
   future.SetParentTask(task);
   task->SetYielded(true);
