@@ -1853,21 +1853,12 @@ CTP_HOST_FUN bool Future<TaskT, AllocT>::IsCompleteGpu2Cpu() const {
 
 template <typename TaskT, typename AllocT>
 CTP_HOST_FUN bool Future<TaskT, AllocT>::IsCompleteCpu2Gpu() const {
-#if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM
-  // ShmPtr offset points to pinned-host gpu::FutureShm. GetFutureShmPtr()
-  // exposes that offset for both the host shared_ptr and device ShmPtr forms.
-  void *host_fshm = reinterpret_cast<void *>(GetFutureShmPtr().off_.load());
-  u32 flags_val = 0;
-  size_t flags_offset = offsetof(gpu::FutureShm, flags_);
-  ctp::GpuApi::Memcpy(
-      &flags_val,
-      reinterpret_cast<u32 *>(
-          static_cast<char *>(host_fshm) + flags_offset),
-      sizeof(u32));
-  return (flags_val & gpu::FutureShm::FUTURE_COMPLETE) != 0;
-#else
-  return false;
-#endif
+  // The Task is its own completion record now (task->fut_.is_complete_); for the
+  // Cpu2Gpu path the task lives in host-readable pinned/UVM memory, so read its
+  // flag directly. (This path is vestigial under the producer-only GPU model and
+  // is reworked with the rest of the Future completion machinery in phase 3.)
+  TaskT *t = TaskRaw();
+  return t != nullptr && t->IsComplete();
 }
 
 #if CTP_IS_GPU_COMPILER

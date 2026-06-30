@@ -166,7 +166,7 @@ CTP_GPU_FUN void FlushPageBase(::clio::run::gpu::IpcManager *ipc,
       (page->tier == 0) ? v.pages_alloc_id : v.host_pages_alloc_id;
   task->blob_data_ = detail::MakeBlobShmPtr(page->device_ptr, alloc);
 
-  ctp::ipc::FullPtr<clio::cte::core::PutBlobTask> fp;
+  ctp::ipc::FullPtr<clio::cte::core::PodPutBlobTask> fp;
   fp.shm_.alloc_id_ = v.put_pool_alloc_id;
   fp.shm_.off_ = reinterpret_cast<clio::run::u64>(task);
   fp.ptr_ = task;
@@ -216,7 +216,7 @@ CTP_GPU_FUN void FlushPage(::clio::run::gpu::IpcManager *ipc,
   task->blob_data_ = detail::MakeBlobShmPtr(
       reinterpret_cast<char *>(page->device_ptr) + mn_b, alloc);
 
-  ctp::ipc::FullPtr<clio::cte::core::PutBlobTask> fp;
+  ctp::ipc::FullPtr<clio::cte::core::PodPutBlobTask> fp;
   fp.shm_.alloc_id_ = v.base.put_pool_alloc_id;
   fp.shm_.off_ = reinterpret_cast<clio::run::u64>(task);
   fp.ptr_ = task;
@@ -241,7 +241,7 @@ CTP_GPU_FUN void FaultPage(::clio::run::gpu::IpcManager *ipc,
   ctp::ipc::AllocatorId alloc =
       (page->tier == 0) ? v.base.pages_alloc_id : v.base.host_pages_alloc_id;
   task->blob_data_ = detail::MakeBlobShmPtr(page->device_ptr, alloc);
-  ctp::ipc::FullPtr<clio::cte::core::GetBlobTask> fp;
+  ctp::ipc::FullPtr<clio::cte::core::PodGetBlobTask> fp;
   fp.shm_.alloc_id_ = v.base.get_pool_alloc_id;
   fp.shm_.off_ = reinterpret_cast<clio::run::u64>(task);
   fp.ptr_ = task;
@@ -252,7 +252,7 @@ CTP_GPU_FUN void FaultPage(::clio::run::gpu::IpcManager *ipc,
 CTP_GPU_FUN void DrainPut(Page *page) {
   if (!page->active_put.IsNull()) {
     page->active_put.Wait();
-    page->active_put = clio::run::gpu::Future<clio::cte::core::PutBlobTask>();
+    page->active_put = clio::run::gpu::Future<clio::cte::core::PodPutBlobTask>();
     detail::AtomicClearBitsU32(&page->flags, kPagePutInFlight);
   }
 }
@@ -261,7 +261,7 @@ CTP_GPU_FUN void DrainPut(Page *page) {
 CTP_GPU_FUN void DrainGet(Page *page) {
   if (!page->active_get.IsNull()) {
     page->active_get.Wait();
-    page->active_get = clio::run::gpu::Future<clio::cte::core::GetBlobTask>();
+    page->active_get = clio::run::gpu::Future<clio::cte::core::PodGetBlobTask>();
     detail::AtomicClearBitsU32(&page->flags, kPageGetInFlight);
   }
 }
