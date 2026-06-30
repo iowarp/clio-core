@@ -3109,6 +3109,15 @@ RouteResult IpcManager::RouteGlobal(Future<Task> &future,
   // Store pool_queries in task's RunContext for SendIn to access
   task_ptr->PoolQueries() = pool_queries;
 
+  // Anchor the FutureShm to the task's RunContext. run2run's send_map_ holds a
+  // net-forwarded task by Task pointer only; the queued Future that owns the
+  // FutureShm is dropped as soon as the net-send worker pops and forwards it.
+  // Without this bind the FutureShm is freed before the peer response returns,
+  // so RecvOut -> EndTask sees a null future_shm and never sends the response,
+  // hanging the waiting client. ProcessNewTask binds RunFuture for locally
+  // executed tasks; net-routed tasks skip ProcessNewTask, so bind it here.
+  task_ptr->RunFuture() = future;
+
   // Pick the latency vs I/O SendIn lane based on the task's actual
   // payload size — small probes / metadata sit on kSendInLatency so
   // they're not buried behind 1 MiB PutBlob bulks on the wire. The
