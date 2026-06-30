@@ -368,20 +368,17 @@ class Task {
    * Destructor — VIRTUAL so that a clio::run::shared_ptr<Task> base view
    * destructs the concrete derived task correctly when its last reference
    * drops (tasks are allocated by runtime method id, so the owning handle is
-   * often the base Task type). Must also explicitly free the RunContext since
-   * we no longer use unique_ptr. Host pass uses the out-of-line definition in
-   * task.cc; any device pass (CUDA/ROCm/SYCL) uses `= default`. Switching from
-   * CTP_IS_HOST to !CTP_IS_DEVICE_PASS lets DPC++'s SYCL device pass — where
-   * CTP_IS_HOST=1 — pick the inline default destructor instead of an
-   * unresolved declaration. Virtual on both passes so sizeof(Task) (and the
-   * vptr offset) stays identical between CPU and GPU.
+   * often the base Task type). The run_ctx_ unique_ptr member is destroyed
+   * automatically (type-erased deleter), so the body is empty.
+   *
+   * CLIO_VIRTUAL is now `virtual` on BOTH host and device (issue #556) so the
+   * vtable pointer — and therefore sizeof(Task) and every field offset — is
+   * identical across a host<->device cudaMemcpy. Device code never dispatches
+   * through this vtable (it uses typed tasks, never a base-Task view), so the
+   * host vtable is simply ignored on the device side. CTP_CROSS_FUN gives the
+   * dtor a __host__ __device__ execution space matching the derived task
+   * destructors (also CTP_CROSS_FUN), so nvcc accepts the override.
    */
-  // CTP_CROSS_FUN so the destructor's execution space (__host__ __device__)
-  // matches the derived task destructors (which are CTP_CROSS_FUN); otherwise
-  // nvcc rejects a __host__ __device__ dtor "overriding" a __host__-only virtual
-  // base. CLIO_VIRTUAL makes it virtual on host only (RAII base-view destroy);
-  // on the device pass it is non-virtual so no GPU vtable is generated. The
-  // run_ctx_ unique_ptr member is destroyed automatically (type-erased deleter).
   CTP_CROSS_FUN CLIO_VIRTUAL ~Task() {}
 
   /**
@@ -1116,7 +1113,11 @@ inline void Task::ClearRunState() {
 // definition)
 // ============================================================================
 
-#ifndef CLIO_ENABLE_BOOST_COROUTINES
+// CTP_IS_HOST so this host-only coroutine machinery is excluded from a GPU
+// device pass entirely: nvcc parses (and member-checks) the whole TU in the
+// device pass, and this body references #if CTP_IS_HOST-only Task accessors
+// (CoroHandle/SetYielded/...). The GPU path uses gpu::Future, never this.
+#if CTP_IS_HOST && !defined(CLIO_ENABLE_BOOST_COROUTINES)
 template <typename TaskT, typename AllocT>
 bool Future<TaskT, AllocT>::await_suspend_impl(
     std::coroutine_handle<> handle) noexcept {
@@ -1143,6 +1144,10 @@ bool Future<TaskT, AllocT>::await_suspend_impl(
 // TaskResume and YieldAwaiter (must be after RunContext for member access)
 // ============================================================================
 
+// Host-only: the coroutine return type / awaiters touch #if CTP_IS_HOST-only
+// Task accessors, and nvcc parses this in the device pass too. Excluded from
+// any device pass (the GPU path is producer-only and uses gpu::Future).
+#if CTP_IS_HOST
 #ifndef CLIO_ENABLE_BOOST_COROUTINES
 /**
  * TaskResume - Coroutine return type for runtime methods
@@ -1549,6 +1554,7 @@ public:
 };
 
 #endif // CLIO_ENABLE_BOOST_COROUTINES
+#endif // CTP_IS_HOST (TaskResume is host-only)
 
 /**
  * YieldAwaiter - Awaitable for yielding control in coroutines
@@ -1579,7 +1585,7 @@ class YieldAwaiter {
    */
   bool await_ready() const noexcept { return false; }
 
-#ifndef CLIO_ENABLE_BOOST_COROUTINES
+#if CTP_IS_HOST && !defined(CLIO_ENABLE_BOOST_COROUTINES)
   /**
    * Suspend the coroutine and mark for yielded resumption
    *

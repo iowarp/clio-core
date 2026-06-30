@@ -187,7 +187,7 @@ class Future {
    * Always produces an empty clio::run::Future on the host (host-side Send is
    * not GPU-aware in the producer-only model).
    */
-  CTP_CROSS_FUN operator clio::run::Future<TaskT, AllocT>() const {
+  CTP_HOST_FUN operator clio::run::Future<TaskT, AllocT>() const {
     return clio::run::Future<TaskT, AllocT>();
   }
 };

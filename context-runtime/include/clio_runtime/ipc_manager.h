@@ -1759,7 +1759,7 @@ namespace clio::run {
 // Wait/await_resume). The task itself is freed automatically by task_ptr_'s
 // shared_ptr destructor (host) when the last owner drops — no explicit free.
 template <typename TaskT, typename AllocT>
-CTP_CROSS_FUN Future<TaskT, AllocT>::~Future() {
+CTP_HOST_FUN Future<TaskT, AllocT>::~Future() {
   if (consumed_) {
     // Clean up zero-copy response archive (TCP/IPC only, never used on GPU).
     // The FutureShm itself is owned by the host shared_ptr and freed
@@ -1780,7 +1780,7 @@ CTP_CROSS_FUN Future<TaskT, AllocT>::~Future() {
 
 // GetFutureShm() - converts internal ShmPtr to FullPtr
 template <typename TaskT, typename AllocT>
-CTP_CROSS_FUN ctp::ipc::FullPtr<typename Future<TaskT, AllocT>::FutureT>
+CTP_HOST_FUN ctp::ipc::FullPtr<typename Future<TaskT, AllocT>::FutureT>
 Future<TaskT, AllocT>::GetFutureShm() const {
   if (FutureShmIsNull()) {
     return ctp::ipc::FullPtr<FutureT>();
@@ -1804,7 +1804,7 @@ Future<TaskT, AllocT>::GetFutureShm() const {
 // ----------------------------------------------------------------
 
 template <typename TaskT, typename AllocT>
-CTP_CROSS_FUN bool Future<TaskT, AllocT>::IsComplete() const {
+CTP_HOST_FUN bool Future<TaskT, AllocT>::IsComplete() const {
   if (FutureShmIsNull()) {
     return false;
   }
@@ -1880,7 +1880,7 @@ CTP_GPU_FUN bool Future<TaskT, AllocT>::IsCompleteGpu2Gpu() const {
 // ----------------------------------------------------------------
 
 template <typename TaskT, typename AllocT>
-CTP_CROSS_FUN bool Future<TaskT, AllocT>::Wait(float max_sec,
+CTP_HOST_FUN bool Future<TaskT, AllocT>::Wait(float max_sec,
                                                  bool reuse_task) {
 #if CTP_IS_GPU
   return WaitGpu2Gpu(max_sec, reuse_task);
@@ -2034,11 +2034,11 @@ CTP_HOST_FUN bool Future<TaskT, AllocT>::WaitGpu2Cpu(float max_sec,
 }
 
 // ----------------------------------------------------------------
-// Shared helpers (CTP_CROSS_FUN)
+// Shared helpers (CTP_HOST_FUN)
 // ----------------------------------------------------------------
 
 template <typename TaskT, typename AllocT>
-CTP_CROSS_FUN void Future<TaskT, AllocT>::Destroy(bool post_wait) {
+CTP_HOST_FUN void Future<TaskT, AllocT>::Destroy(bool post_wait) {
   if (post_wait && !task_ptr_.IsNull()) {
     task_ptr_->PostWait();
   }
@@ -2050,7 +2050,7 @@ CTP_CROSS_FUN void Future<TaskT, AllocT>::Destroy(bool post_wait) {
 // ----------------------------------------------------------------
 
 template <typename TaskT, typename AllocT>
-CTP_CROSS_FUN void Future<TaskT, AllocT>::WaitPoll(float max_sec,
+CTP_HOST_FUN void Future<TaskT, AllocT>::WaitPoll(float max_sec,
                                                      bool reuse_task) {
   (void)max_sec; (void)reuse_task;
 #if CTP_IS_GPU
@@ -2068,7 +2068,7 @@ CTP_CROSS_FUN void Future<TaskT, AllocT>::WaitPoll(float max_sec,
 }
 
 template <typename TaskT, typename AllocT>
-CTP_CROSS_FUN void Future<TaskT, AllocT>::WaitRecv(float max_sec,
+CTP_HOST_FUN void Future<TaskT, AllocT>::WaitRecv(float max_sec,
                                                      bool reuse_task) {
   (void)max_sec; (void)reuse_task;
 #if CTP_IS_GPU

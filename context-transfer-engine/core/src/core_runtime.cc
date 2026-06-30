@@ -1015,7 +1015,8 @@ clio::run::TaskResume Runtime::GetTargetInfo(clio::run::shared_ptr<GetTargetInfo
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::PutBlob(clio::run::shared_ptr<PutBlobTask> &task) {
+template <typename TaskT>
+clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
   CLIO_TASK_BODY_BEGIN
   // Per-PutBlob diagnostic logging — disabled in perf builds. Was burning
   // an atomic fetch_add + clock_gettime + branch on every 64 KB chunk plus
@@ -1087,7 +1088,7 @@ clio::run::TaskResume Runtime::PutBlob(clio::run::shared_ptr<PutBlobTask> &task)
     // routed this put through a per-(block, page) sub-blob — keeps cache
     // pages from colliding on a shared blob name. Sentinel kNoPageIdx
     // means "no suffix", which is the path non-GPU clients take.
-    if (task->gpu_page_idx_ != PutBlobTask::kNoPageIdx) {
+    if (task->gpu_page_idx_ != TaskT::kNoPageIdx) {
       blob_name += "_pi" + std::to_string(task->gpu_page_idx_);
     }
     clio::run::u64 offset = task->offset_;
@@ -1278,13 +1279,14 @@ clio::run::TaskResume Runtime::PutBlob(clio::run::shared_ptr<PutBlobTask> &task)
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::GetBlob(clio::run::shared_ptr<GetBlobTask> &task) {
+template <typename TaskT>
+clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
   CLIO_TASK_BODY_BEGIN
   try {
     // Extract input parameters
     TagId tag_id = task->tag_id_;
     std::string blob_name = task->blob_name_.str();
-    if (task->gpu_page_idx_ != GetBlobTask::kNoPageIdx) {
+    if (task->gpu_page_idx_ != TaskT::kNoPageIdx) {
       blob_name += "_pi" + std::to_string(task->gpu_page_idx_);
     }
     clio::run::u64 offset = task->offset_;
@@ -1347,7 +1349,9 @@ clio::run::TaskResume Runtime::GetBlob(clio::run::shared_ptr<GetBlobTask> &task)
   CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::ReorganizeBlob(clio::run::shared_ptr<ReorganizeBlobTask> &task) {
+template <typename TaskT>
+clio::run::TaskResume Runtime::ReorganizeBlobImpl(
+    clio::run::shared_ptr<TaskT> &task) {
   CLIO_TASK_BODY_BEGIN
   try {
     // Extract input parameters
@@ -1459,6 +1463,32 @@ clio::run::TaskResume Runtime::ReorganizeBlob(clio::run::shared_ptr<ReorganizeBl
   }
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
+}
+
+// Thin dispatchers over the *Impl<TaskT> templates above. Defining them in this
+// TU instantiates each template for both the priv::string task and its
+// fixed_string POD variant (issue #556) — the handler logic is written once.
+clio::run::TaskResume Runtime::PutBlob(clio::run::shared_ptr<PutBlobTask> &task) {
+  return PutBlobImpl(task);
+}
+clio::run::TaskResume Runtime::PodPutBlob(
+    clio::run::shared_ptr<PodPutBlobTask> &task) {
+  return PutBlobImpl(task);
+}
+clio::run::TaskResume Runtime::GetBlob(clio::run::shared_ptr<GetBlobTask> &task) {
+  return GetBlobImpl(task);
+}
+clio::run::TaskResume Runtime::PodGetBlob(
+    clio::run::shared_ptr<PodGetBlobTask> &task) {
+  return GetBlobImpl(task);
+}
+clio::run::TaskResume Runtime::ReorganizeBlob(
+    clio::run::shared_ptr<ReorganizeBlobTask> &task) {
+  return ReorganizeBlobImpl(task);
+}
+clio::run::TaskResume Runtime::PodReorganizeBlob(
+    clio::run::shared_ptr<PodReorganizeBlobTask> &task) {
+  return ReorganizeBlobImpl(task);
 }
 
 clio::run::TaskResume Runtime::DelBlob(clio::run::shared_ptr<DelBlobTask> &task) {
