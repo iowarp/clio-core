@@ -218,10 +218,23 @@ bool IpcCpu2CpuZmq::RecvIn(IpcManager *ipc, u32 &tasks_received) {
 void IpcCpu2CpuZmq::EnqueueSendOut(IpcManager *ipc,
                                          const clio::run::shared_ptr<Task> &task,
                                          ClientOrigin origin) {
+  // Enqueue a future that OWNS the task. task->RunFuture()'s task_ptr_ may be a
+  // NON-OWNING self-handle: RouteGlobal / RouteManyToOne rebind it non-owning to
+  // break the leak cycle, so a collective/broadcast origin (e.g. GetOrCreatePool
+  // creating one container per node) reaches here with a non-owning RunFuture.
+  // Enqueuing that handle puts a non-owning reference on the net queue, so the
+  // origin task can be freed before net_send_worker drains it — GetFutureShm()
+  // then resolves through the freed task, returns null, the SendOut loop skips
+  // the response, and the client's Wait() hangs forever (the multi-node AllToOne
+  // / Distributed cluster tests). An owning copy keeps the task alive until the
+  // response is on the wire; run_ctx_->future_ stays non-owning, so this adds no
+  // leak — the net-queue copy drops once the response is sent.
+  clio::run::Future<Task> owning = task->RunFuture();
+  owning.GetTaskPtr() = task;
   if (origin == ClientOrigin::kClientTcp) {
-    ipc->EnqueueNetTask(task->RunFuture(), NetQueuePriority::kClientSendTcp);
+    ipc->EnqueueNetTask(owning, NetQueuePriority::kClientSendTcp);
   } else {
-    ipc->EnqueueNetTask(task->RunFuture(), NetQueuePriority::kClientSendIpc);
+    ipc->EnqueueNetTask(owning, NetQueuePriority::kClientSendIpc);
   }
 }
 
