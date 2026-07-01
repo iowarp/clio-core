@@ -268,6 +268,18 @@ class ConfigManager : public ctp::BaseConfig {
   u32 GetFirstBusyWait() const { return first_busy_wait_; }
 
   /**
+   * Get the task-progress validity-check interval in milliseconds.
+   *
+   * How long an outstanding cross-node task may sit quietly before the origin
+   * runs a QueryTaskProgress liveness check on it (issue #628), then re-checks
+   * each interval. This is the anti-hang mechanism that works even when a
+   * task's ttl is infinite. 0 disables the periodic check.
+   * Overridable via env CLIO_TASK_PROGRESS_INTERVAL_MS.
+   * @return Interval in ms (default: 0 = disabled)
+   */
+  u32 GetTaskProgressIntervalMs() const { return task_progress_interval_ms_; }
+
+  /**
    * Get maximum sleep duration in microseconds
    * @return Maximum sleep duration cap (default: 50000us = 50ms)
    */
@@ -378,6 +390,7 @@ class ConfigManager : public ctp::BaseConfig {
 
   // Worker sleep configuration (in microseconds)
   u32 first_busy_wait_ = 10000;              // Default: 10000us (10ms) busy wait
+  u32 task_progress_interval_ms_ = 0;        // #628: 0 = periodic validity check disabled
   u32 max_sleep_ = 50000;                    // Default: 50000us (50ms) maximum sleep
 
   // Task load prediction model

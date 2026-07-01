@@ -277,6 +277,12 @@ void ConfigManager::ParseYAML(YAML::Node &yaml_conf) {
       first_busy_wait_ = runtime["first_busy_wait"].as<u32>();
     }
 
+    // Periodic cross-node task-validity check interval (issue #628)
+    if (runtime["task_progress_interval_ms"]) {
+      task_progress_interval_ms_ =
+          runtime["task_progress_interval_ms"].as<u32>();
+    }
+
     // Configuration directory for persistent runtime config
     if (runtime["conf_dir"]) {
       conf_dir_ = runtime["conf_dir"].as<std::string>();
@@ -289,6 +295,12 @@ void ConfigManager::ParseYAML(YAML::Node &yaml_conf) {
 
     // Note: stack_size parameter removed (was never used)
     // Note: heartbeat_interval parsing removed (not used by runtime)
+  }
+
+  // Env override for the task-progress validity-check interval (issue #628):
+  // env wins over yaml so it can be tuned per-run without editing a config.
+  if (const char *env = std::getenv("CLIO_TASK_PROGRESS_INTERVAL_MS")) {
+    task_progress_interval_ms_ = static_cast<u32>(std::atoi(env));
   }
 
   // Parse GPU orchestrator configuration
