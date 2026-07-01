@@ -232,6 +232,16 @@ class IpcManager {
 
  public:
   /**
+   * Destructor. In leak-tracking builds it scans the runtime-owned allocators
+   * (see ReportRuntimeLeaks). Note the CLIO_IPC global is intentionally leaked
+   * (GetGlobalPtrVar new's it and never deletes), so this rarely runs in
+   * practice — ServerFinalize() is the guaranteed shutdown hook that performs
+   * the same scan. Declared so the scan still fires if the object is ever
+   * explicitly destroyed.
+   */
+  ~IpcManager();
+
+  /**
    * Get the run-to-run IPC manager (cross-node task transfer logic).
    * @return Pointer to the IpcManagerRun2Run instance owned by this IpcManager.
    */
@@ -1566,6 +1576,21 @@ class IpcManager {
    * @return true if successful, false otherwise
    */
   bool IncreaseClientShm(size_t size);
+
+  /**
+   * Leak scan over the runtime-owned allocators, tagged with \a phase. The
+   * per-process SHM segments in alloc_vector_ (where AllocateBuffer draws from)
+   * MUST be empty at shutdown, so any outstanding bytes there are logged as an
+   * ERROR-level leak -- this is the ONLY observation point for those
+   * placement-constructed allocators, whose C++ destructors never run (so the
+   * AllocatorLeakChecker destructor path cannot see them). CTP_MALLOC's private
+   * heap is only reported at INFO (it legitimately holds process-lifetime state
+   * at shutdown; real CTP_MALLOC leaks are caught by the MallocAllocator
+   * destructor at static teardown). Compiles to a no-op unless
+   * CTP_ALLOC_TRACK_SIZE is set (CLIO_CORE_ENABLE_LEAK_CHECK). Returns the total
+   * outstanding SHM bytes (the actionable leak signal).
+   */
+  size_t ReportRuntimeLeaks(const char *phase) const;
 
   /**
    * Vector of allocators owned by this process
