@@ -38,17 +38,20 @@
 #include <string>
 #include <vector>
 
+#include <unistd.h>               // read, getuid, getgid
+#include <cerrno>                 // errno
+#include <cstdio>                 // snprintf, fprintf
+
+#ifndef __APPLE__
 #include <fuse3/fuse_lowlevel.h>  // fuse_session_custom_io, struct fuse_custom_io
 #include <dlfcn.h>                // dlsym (resolve fuse_session_custom_io at runtime
                                   // so we can link against system libfuse 3.10.5
                                   // which lacks the symbol; only used in the
                                   // apptainer --fusemount fd-injection path)
-#include <sys/uio.h>              // struct iovec, writev
 #include <sys/mount.h>            // mount syscall
+#include <sys/uio.h>              // struct iovec, writev
+#endif
 #include <sys/statvfs.h>          // struct statvfs (statfs op)
-#include <unistd.h>               // read, getuid, getgid
-#include <cerrno>                 // errno
-#include <cstdio>                 // snprintf, fprintf
 #include <fcntl.h>                // O_CREAT, O_RDWR
 
 #include "clio_runtime/clio_runtime.h"
@@ -139,8 +142,8 @@ static void cte_fuse_destroy(void *private_data) {
 // Metadata
 // ============================================================================
 
-static int cte_fuse_getattr(const char *path, struct stat *stbuf,
-                            struct fuse_file_info *fi) {
+static int cte_fuse_getattr_stat(const char *path, struct stat *stbuf,
+                                 struct fuse_file_info *fi) {
   (void)fi;
   memset(stbuf, 0, sizeof(struct stat));
 
@@ -194,6 +197,41 @@ static int cte_fuse_getattr(const char *path, struct stat *stbuf,
   return 0;
 }
 
+#ifdef __APPLE__
+static void CopyStatToDarwinAttr(const struct stat &st,
+                                 struct fuse_darwin_attr *attr) {
+  memset(attr, 0, sizeof(*attr));
+  attr->ino = st.st_ino;
+  attr->mode = st.st_mode;
+  attr->nlink = st.st_nlink;
+  attr->uid = st.st_uid;
+  attr->gid = st.st_gid;
+  attr->rdev = st.st_rdev;
+  attr->size = st.st_size;
+  attr->blocks = st.st_blocks;
+  attr->blksize = st.st_blksize;
+  attr->flags = st.st_flags;
+  attr->atimespec = st.st_atimespec;
+  attr->mtimespec = st.st_mtimespec;
+  attr->ctimespec = st.st_ctimespec;
+  attr->btimespec = st.st_birthtimespec;
+}
+
+static int cte_fuse_getattr(const char *path, struct fuse_darwin_attr *attr,
+                            struct fuse_file_info *fi) {
+  struct stat stbuf;
+  int rc = cte_fuse_getattr_stat(path, &stbuf, fi);
+  if (rc != 0) return rc;
+  CopyStatToDarwinAttr(stbuf, attr);
+  return 0;
+}
+#else
+static int cte_fuse_getattr(const char *path, struct stat *stbuf,
+                            struct fuse_file_info *fi) {
+  return cte_fuse_getattr_stat(path, stbuf, fi);
+}
+#endif
+
 static int cte_fuse_utimens(const char *path, const struct timespec tv[2],
                             struct fuse_file_info *fi) {
   (void)path;
@@ -207,8 +245,14 @@ static int cte_fuse_utimens(const char *path, const struct timespec tv[2],
 // Directory operations
 // ============================================================================
 
+#ifdef __APPLE__
+using ClioFuseFillDirT = fuse_darwin_fill_dir_t;
+#else
+using ClioFuseFillDirT = fuse_fill_dir_t;
+#endif
+
 static int cte_fuse_readdir(const char *path, void *buf,
-                            fuse_fill_dir_t filler, off_t offset,
+                            ClioFuseFillDirT filler, off_t offset,
                             struct fuse_file_info *fi,
                             enum fuse_readdir_flags flags) {
   (void)offset;
@@ -511,6 +555,7 @@ static const struct fuse_operations cte_fuse_ops = {
 // /dev/fuse fd, we need to drive the FUSE protocol on that fd directly
 // instead of having libfuse mount its own. Plain read/writev syscalls
 // suffice; splice is optional.
+#ifndef __APPLE__
 static ssize_t cte_custom_writev(int fd, struct iovec *iov, int count,
                                  void * /*userdata*/) {
   return writev(fd, iov, count);
@@ -519,8 +564,12 @@ static ssize_t cte_custom_read(int fd, void *buf, size_t buf_len,
                                void * /*userdata*/) {
   return read(fd, buf, buf_len);
 }
+#endif
 
 int main(int argc, char *argv[]) {
+#ifdef __APPLE__
+  return fuse_main(argc, argv, &cte_fuse_ops, nullptr);
+#else
   // Apptainer's --fusemount opens /dev/fuse on the host, performs the
   // kernel mount, and passes the fd to the FUSE binary as the last
   // argv ("/dev/fd/<N>"). libfuse 3's high-level argv parser doesn't
@@ -650,4 +699,5 @@ int main(int argc, char *argv[]) {
   fuse_destroy(fuse);
   fuse_opt_free_args(&args);
   return ret;
+#endif
 }

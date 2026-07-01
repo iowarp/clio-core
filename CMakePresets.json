@@ -533,6 +533,41 @@
       }
     },
     {
+      "name": "release-mac-fuse",
+      "displayName": "macOS Release with macFUSE adapter",
+      "description": "Release build for macOS with the FUSE adapter enabled via macFUSE.",
+      "hidden": false,
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build-mac-fuse",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CLIO_CORE_ENABLE_RUNTIME": "ON",
+        "CLIO_CORE_ENABLE_CTE": "ON",
+        "CLIO_CORE_ENABLE_CAE": "ON",
+        "CLIO_CORE_ENABLE_CEE": "ON",
+        "CLIO_CORE_ENABLE_TESTS": "ON",
+        "CLIO_CORE_ENABLE_ELF": "OFF",
+        "CLIO_CTE_ENABLE_COMPRESS": "OFF",
+        "CLIO_CTE_ENABLE_FUSE_ADAPTER": "ON",
+        "CLIO_CORE_ENABLE_GRAY_SCOTT": "OFF",
+        "CLIO_CTE_ENABLE_ADIOS2_ADAPTER": "OFF",
+        "CLIO_CORE_ENABLE_CONDA": "OFF",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "CLIO_CORE_ENABLE_ASAN": "OFF",
+        "CLIO_CORE_ENABLE_PYTHON": "ON",
+        "CLIO_CORE_ENABLE_COVERAGE": "OFF",
+        "CLIO_CORE_ENABLE_ZMQ": "ON",
+        "CLIO_CORE_ENABLE_CEREAL": "ON",
+        "CLIO_CTP_LOG_LEVEL": "1",
+        "CLIO_CORE_ENABLE_IO_URING": "OFF"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      }
+    },
+    {
       "name": "llm-debug",
       "hidden": false,
       "generator": "Unix Makefiles",

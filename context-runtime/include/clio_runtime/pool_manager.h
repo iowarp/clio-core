@@ -336,6 +336,14 @@ class PoolManager {
    */
   void ErasePoolMetadata(PoolId pool_id);
 
+  /**
+   * Internal: erase a pool's metadata entry under the write lock. Used by the
+   * CreatePool error paths and DestroyPool so they don't touch pool_metadata_
+   * without holding pool_metadata_mutex_.
+   * @param pool_id Pool identifier
+   */
+  void ErasePoolMetadata(PoolId pool_id);
+
   bool is_initialized_ = false;
 
   // Map PoolId to pool metadata (contains containers, address map, etc.)
