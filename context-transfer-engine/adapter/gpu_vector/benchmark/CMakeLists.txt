@@ -56,6 +56,35 @@ if(CLIO_CORE_ENABLE_CUDA)
     )
     install(TARGETS clio_cte_gpu_vector_bench RUNTIME DESTINATION bin)
 
+    # Gray-Scott async-compressed PutBlob bench (production-vector-shaped):
+    # ships each per-block snapshot to storage via a CLIO compressed PutBlob.
+    # Needs the compressor chimod, so only built when compression is enabled.
+    if(CLIO_CTE_ENABLE_COMPRESS)
+        add_cuda_executable(clio_gs_putblob_compress_bench FALSE
+            clio_gs_putblob_compress_bench.cc
+            INCLUDE_DIRS
+                ${CMAKE_SOURCE_DIR}/context-runtime/include
+                ${CMAKE_SOURCE_DIR}/context-runtime/modules/admin/include
+                ${CMAKE_SOURCE_DIR}/context-transfer-engine/core/include
+                ${CMAKE_SOURCE_DIR}/context-transfer-engine/compressor/include
+            LINK_LIBS
+                clio_run_cxx
+                clio_run_cxx_gpu
+                clio_admin_client
+                clio_bdev_client
+                clio_cte_core_client
+                clio_cte_core_runtime
+                clio_cte_compressor_client
+                clio_cte_compressor_runtime
+                ctp::cuda_cxx
+                ${CMAKE_THREAD_LIBS_INIT}
+        )
+        set_target_properties(clio_gs_putblob_compress_bench PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+        )
+        install(TARGETS clio_gs_putblob_compress_bench RUNTIME DESTINATION bin)
+    endif()
+
     # Traditional out-of-memory baseline: synchronous D2H + synchronous PutBlob.
     add_cuda_executable(clio_traditional_oom_bench FALSE
         clio_traditional_oom_bench.cc

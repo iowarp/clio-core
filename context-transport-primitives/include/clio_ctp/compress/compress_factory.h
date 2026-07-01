@@ -185,6 +185,19 @@ class CompressionFactory {
   }
 
   /**
+   * Reverse of NameForWireId: resolve a canonical compressor name to its wire
+   * ID (compress_lib_). Returns -1 if the name is unknown, so callers can tell
+   * "not found" apart from wire ID 0.
+   *
+   * @param name Canonical lowercase library name (e.g. "nvcomp-lz4")
+   * @return Wire ID, or -1 if unknown
+   */
+  static int WireIdForName(const std::string& name) {
+    const CompressorInfo* info = FindByName(name);
+    return info ? info->wire_id : -1;
+  }
+
+  /**
    * Get string name for preset.
    *
    * @param preset Compression preset

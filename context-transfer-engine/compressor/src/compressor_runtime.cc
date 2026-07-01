@@ -38,6 +38,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <limits>
@@ -59,6 +60,66 @@ namespace clio::cte::compressor {
 // Bring chi namespace items into scope for CLIO_CUR_WORKER macro
 using clio::run::chi_cur_worker_key_;
 using clio::run::Worker;
+
+/**
+ * Environment-variable compressor pin.
+ *
+ * When `CLIO_CTE_COMPRESS_LIB` is set, it FORCES every compression performed by
+ * this module to use one specific library, overriding both the dynamic
+ * predictor (DynamicSchedule) and any caller-supplied `context.compress_lib_`.
+ * This is the operator-facing knob for "pin a GPU compressor" — set e.g.
+ * `CLIO_CTE_COMPRESS_LIB=nvcomp-lz4` (a canonical name from CompressionFactory)
+ * or a raw wire ID integer. `CLIO_CTE_COMPRESS_PRESET` optionally pins the
+ * preset (`fast` | `balanced` | `best`, or 1 | 2 | 3); default balanced.
+ *
+ * The env is read once and cached (the pin is a deployment-time decision, not a
+ * per-request one). Returns the pinned wire ID, or -1 when no valid pin is set.
+ * `out_preset` receives the pinned preset integer (1/2/3) when the return is >=0.
+ */
+static int CompressorPinWireId(int* out_preset) {
+  // Cache: -2 = not yet parsed, -1 = no pin, >=0 = pinned wire id.
+  static int cached_wire = -2;
+  static int cached_preset = 2;  // BALANCED
+  if (cached_wire == -2) {
+    cached_wire = -1;
+    const char* lib = std::getenv("CLIO_CTE_COMPRESS_LIB");
+    if (lib != nullptr && lib[0] != '\0') {
+      // Accept a canonical name or a raw integer wire id.
+      int wire = ctp::CompressionFactory::WireIdForName(lib);
+      if (wire < 0) {
+        char* end = nullptr;
+        long parsed = std::strtol(lib, &end, 10);
+        if (end != lib && *end == '\0') wire = static_cast<int>(parsed);
+      }
+      if (wire >= 0) {
+        cached_wire = wire;
+        const char* pre = std::getenv("CLIO_CTE_COMPRESS_PRESET");
+        if (pre != nullptr && pre[0] != '\0') {
+          if (std::strcmp(pre, "fast") == 0 || std::strcmp(pre, "1") == 0) {
+            cached_preset = 1;
+          } else if (std::strcmp(pre, "best") == 0 ||
+                     std::strcmp(pre, "3") == 0) {
+            cached_preset = 3;
+          } else {
+            cached_preset = 2;  // balanced / default
+          }
+        }
+        HLOG(kInfo,
+             "Compressor pinned via CLIO_CTE_COMPRESS_LIB: {} (wire={}, "
+             "preset={})",
+             ctp::CompressionFactory::NameForWireId(cached_wire), cached_wire,
+             cached_preset);
+      } else {
+        HLOG(kWarning,
+             "CLIO_CTE_COMPRESS_LIB='{}' is not a known compressor name or "
+             "wire id; ignoring pin",
+             lib);
+      }
+    }
+  }
+  if (cached_wire >= 0 && out_preset != nullptr) *out_preset = cached_preset;
+  return cached_wire;
+}
 
 /**
  * Compression header prepended to compressed data for self-describing format.
@@ -581,6 +642,28 @@ clio::run::TaskResume Runtime::DynamicSchedule(
       CLIO_CO_RETURN;
     }
 
+    // Operator pin: if CLIO_CTE_COMPRESS_LIB is set, bypass the predictor
+    // entirely and compress with the pinned library. Keeps the dynamic path
+    // deterministic under a pin (and avoids paying for stat estimation).
+    {
+      int pin_preset = 2;
+      int pin_wire = CompressorPinWireId(&pin_preset);
+      if (pin_wire >= 0) {
+        context.compress_lib_ = pin_wire;
+        context.compress_preset_ = pin_preset;
+        auto compress_task = client_.AsyncCompress(
+            clio::run::PoolQuery::Local(), task->tag_id_,
+            task->blob_name_.str(), task->offset_, task->size_,
+            task->blob_data_, task->score_, context, task->flags_,
+            task->core_pool_id_);
+        compress_task.Wait();
+        task->context_ = compress_task->context_;
+        task->tier_score_ = compress_task->tier_score_;
+        task->return_code_ = compress_task->return_code_;
+        CLIO_CO_RETURN;
+      }
+    }
+
     // Get compression stats
     auto stats = EstCompressionStats(chunk_data, chunk_size, context);
 
@@ -658,6 +741,19 @@ clio::run::TaskResume Runtime::Compress(ctp::ipc::FullPtr<CompressTask> task,
     if (task->blob_data_.IsNull() || input_size == 0) {
       task->return_code_ = 1;  // Invalid input
       CLIO_CO_RETURN;
+    }
+
+    // Operator pin: CLIO_CTE_COMPRESS_LIB forces a specific compressor here,
+    // overriding both the dynamic predictor and the caller's compress_lib_.
+    // Applied at the single chokepoint where wire id -> factory lib happens, so
+    // it governs every compression path (static, dynamic, explicit).
+    {
+      int pin_preset = 2;
+      int pin_wire = CompressorPinWireId(&pin_preset);
+      if (pin_wire >= 0) {
+        context.compress_lib_ = pin_wire;
+        context.compress_preset_ = pin_preset;
+      }
     }
 
     // Initialize core client if needed (from compose next_pool_id or task param)
