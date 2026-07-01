@@ -169,10 +169,30 @@ class unordered_map_ll {
     return hash_fn_(key) % buckets_.size();
   }
 
-  /** Read-lock a bucket (no-op when locking is disabled). */
+  /** Read-lock a bucket (no-op when locking is disabled).
+   *
+   *  Writer-preference throttle: ctp::RwLock is reader-preferring (a reader
+   *  enters whenever the lock is already in read mode, regardless of a waiting
+   *  writer), so a sustained find() stream keeps a bucket's readers_ > 0 and can
+   *  starve insert/erase on that bucket indefinitely. That livelock is exactly
+   *  what the global_lock_ pending_writers_ counter guards against map-wide; the
+   *  per-bucket locks need the same guard or the starvation just moves down a
+   *  level (observed as a Windows/icx-only timeout in the find-during-expansion
+   *  stress test, where readers hammer a tiny bucket set while writers grow it).
+   *  Defer new readers while a writer is waiting on or holds the bucket.
+   *  Stragglers that slip past before a writer bumps writers_ are bounded — the
+   *  writer's ticket-based WriteLock drains them — so this throttles new readers
+   *  without ever blocking one forever (writers are finite per operation). */
   CTP_INLINE_CROSS_FUN
   void read_lock_bucket(size_type b) {
-    if constexpr (EnableLocking) locks_[b].ReadLock(0);
+    if constexpr (EnableLocking) {
+      while (locks_[b].writers_.load() > 0) {
+#if !CTP_IS_DEVICE_PASS
+        CTP_THREAD_MODEL->Yield();
+#endif
+      }
+      locks_[b].ReadLock(0);
+    }
   }
   CTP_INLINE_CROSS_FUN
   void read_unlock_bucket(size_type b) {
