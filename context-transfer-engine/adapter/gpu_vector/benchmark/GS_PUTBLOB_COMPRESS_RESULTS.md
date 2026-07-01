@@ -40,12 +40,14 @@ compressor changes.
 
 | pin  | type | ratio | stored (of 200 MB) | total | logical throughput | put failures |
 |------|------|------:|-------------------:|------:|-------------------:|---:|
-| lz4  | lossless          | 1.00×  | 200.5 MiB | 95.9 ms | 2085 MiB/s | 0 |
-| zstd | lossless          | 1.19×  | 168.8 MiB | 93.4 ms | 2141 MiB/s | 0 |
-| **zfp**  | **lossy (fixed-rate)**   | **2.00×**  | 100.0 MiB | 93.9 ms | 2130 MiB/s | 0 |
-| **sz3**  | **lossy (error-bounded)** | **26.94×** | 7.4 MiB   | 94.0 ms | 2128 MiB/s | 0 |
+| lz4   | lossless (CPU)          | 1.00×  | 200.5 MiB | 95.9 ms  | 2085 MiB/s | 0 |
+| zstd  | lossless (CPU)          | 1.19×  | 168.8 MiB | 93.4 ms  | 2141 MiB/s | 0 |
+| zfp   | lossy, fixed-rate (CPU) | 2.00×  | 100.0 MiB | 93.9 ms  | 2130 MiB/s | 0 |
+| **cuszp** | **lossy, error-bounded (GPU)** | **5.69×** | 35.2 MiB | 100.3 ms | 1994 MiB/s | 0 |
+| sz3   | lossy, error-bounded (CPU) | 26.94× | 7.4 MiB | 94.9 ms  | 2108 MiB/s | 0 |
 
-(Also verified at 800 MB / 4096 blocks: lz4 1.00×, zstd 1.18×, ~1.6–2.0 GiB/s.)
+(Also verified at 800 MB / 4096 blocks: lz4 1.00×, zstd 1.18×, **cuszp 5.68×**,
+zfp 2.00×, sz3 31.45×; all 0 put failures, ~1.7–2.1 GiB/s.)
 
 - **The pipeline runs end-to-end, scales, and is compressor-agnostic** — 0 put
   failures for every library; ~2.1 GiB/s logical throughput regardless of pin.
@@ -60,9 +62,15 @@ compressor changes.
   lossless variants (nvcomp-*) are the same family and would behave the same.
   High-entropy 32-bit floats have little byte-level redundancy to exploit.
 - **Error-bounded lossy compressors deliver the capacity expansion.** zfp gives a
-  clean **2.00×** (its balanced preset is a fixed ~16-bit/float rate), and sz3
-  gives **26.94×** on this data. This is precisely the project thesis — trade a
-  bounded amount of precision for making the fast tier hold many times more data.
+  clean **2.00×** (fixed ~16-bit/float rate), **cuszp gives 5.69× ON THE GPU**,
+  and sz3 gives **26.94×** on this data. This is precisely the project thesis —
+  trade a bounded amount of precision to make the fast tier hold many times more.
+- **cuszp keeps compression on the GPU.** It is an error-bounded lossy float
+  codec whose host API launches its kernels on a stream, so a GPU-resident buffer
+  never has to leave the device to be compressed — the architecturally important
+  property for the compressed GPU vector (CPU lossy libs must D2H first). Wired
+  into the CompressionFactory as `cuszp` (wire id 18); the preset maps to the
+  absolute error bound (FAST 1e-2, BALANCED 1e-3, BEST 1e-4).
 - **Ratios come with a preset error bound** (the "balanced" preset). sz3's very
   high ratio implies a loose tolerance for this field; fidelity vs. ratio is a
   knob (per-tier error bound) the tier-aware selector will set deliberately.
@@ -71,14 +79,19 @@ Net: the transparent-PutBlob compression machinery is done and works with any
 library in the factory; **selecting a lossy compressor turns the pipeline from a
 plumbing demo into a real capacity win (2×–27× here).**
 
+## Build notes (cuszp)
+
+cuSZp is wired into the factory behind `CTP_ENABLE_CUSZP`, auto-detected from
+`-DCLIO_CUSZP_ROOT=<prefix>` (headers `include/cuSZp.h`, lib `lib/libcuSZp.so`).
+Build cuSZp in the same container (CUDA 12.6, sm_80) so it matches the CLIO
+toolchain. Wrapper: `context-transport-primitives/include/clio_ctp/compress/cuszp.h`.
+
 ## Known gaps / follow-ups
 
-1. **GPU-side lossy compressor.** zfp/sz3 here run on the CPU (LibPressio). A
-   GPU error-bounded compressor (**cuSZp**, already built at `/u/rpawar/cuSZp`;
-   or zfp-sycl) would keep compression on-device and off the PCIe path. Wiring
-   cuSZp into the factory (a `Compressor` subclass + registry row + build flag,
-   mirroring `nvcomp.h`) is the natural next step; the env pin then selects it
-   unchanged.
+1. **cuszp error bound is fixed per preset** (absolute 1e-2/1e-3/1e-4). The
+   tier-aware selector should set it per-tier/per-field against a fidelity target
+   (PSNR); it is not yet self-describing in the stream (Decompress relies on the
+   same preset, which the runtime already carries in its CompressionHeader).
 2. **Runtime-reported ratio** does not propagate back through the transparent
    chimod chain (the bench measures it directly instead). Surfacing
    `actual_compressed_size_` on the client task is a separate runtime fix.

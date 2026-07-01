@@ -547,6 +547,27 @@ if(CLIO_CTE_ENABLE_COMPRESS)
         message(STATUS "SYCL libzfp not found under ${CLIO_ZFP_SYCL_ROOT} - zfp-sycl compression disabled")
     endif()
 
+    # cuSZp: GPU error-bounded LOSSY float compressor. Needs CUDA. Point
+    # CLIO_CUSZP_ROOT at a cuSZp install prefix (headers in include/, lib in
+    # lib64/). Off unless found.
+    set(CLIO_CTP_ENABLE_CUSZP OFF)
+    set(CLIO_CUSZP_ROOT "/opt/cuSZp/install" CACHE PATH
+        "Install prefix of cuSZp (for the cuszp GPU lossy compressor)")
+    if(CLIO_CORE_ENABLE_CUDA)
+        find_library(CUSZP_LIBRARY NAMES cuSZp
+            HINTS ${CLIO_CUSZP_ROOT}/lib ${CLIO_CUSZP_ROOT}/lib64
+            NO_DEFAULT_PATH)
+        find_path(CUSZP_INCLUDE_DIR NAMES cuSZp.h
+            HINTS ${CLIO_CUSZP_ROOT}/include
+            NO_DEFAULT_PATH)
+        if(CUSZP_LIBRARY AND CUSZP_INCLUDE_DIR)
+            message(STATUS "found cuSZp at ${CUSZP_LIBRARY} (cuszp GPU lossy compression)")
+            set(CLIO_CTP_ENABLE_CUSZP ON)
+        else()
+            message(STATUS "cuSZp not found under ${CLIO_CUSZP_ROOT} - cuszp compression disabled")
+        endif()
+    endif()
+
     set(COMPRESS_LIBS
         bz2
         ${lzo2_LIBRARIES}
@@ -598,6 +619,14 @@ if(CLIO_CTE_ENABLE_COMPRESS)
         list(APPEND COMPRESS_INCLUDES ${ZFP_SYCL_INCLUDE_DIR})
     endif()
 
+    # Only add cuSZp if found. libcuSZp already links cudart transitively, and
+    # the CTP CUDA target links cudart itself, so we don't add CUDA::cudart here
+    # (this variable is expanded as plain -l names, which would mangle a target).
+    if(CLIO_CTP_ENABLE_CUSZP)
+        list(APPEND COMPRESS_LIBS ${CUSZP_LIBRARY})
+        list(APPEND COMPRESS_INCLUDES ${CUSZP_INCLUDE_DIR})
+    endif()
+
     # Make CTP_ENABLE_LIBPRESSIO available to subdirectories (CTP)
     set(CLIO_CTP_ENABLE_LIBPRESSIO ${CLIO_CTP_ENABLE_LIBPRESSIO} CACHE BOOL "Enable LibPressio wrapper (auto-detected)" FORCE)
     # Make CTP_ENABLE_NVCOMP available to subdirectories (CTP)
@@ -605,6 +634,8 @@ if(CLIO_CTE_ENABLE_COMPRESS)
     # Make CLIO_CTP_ENABLE_ZFP_SYCL available to subdirectories (CTP). Distinct
     # from CLIO_CTP_ENABLE_SYCL (the SYCL-language switch) -- do not conflate.
     set(CLIO_CTP_ENABLE_ZFP_SYCL ${CLIO_CTP_ENABLE_ZFP_SYCL} CACHE BOOL "Enable zfp-sycl GPU compression (auto-detected)" FORCE)
+    # Make CLIO_CTP_ENABLE_CUSZP available to subdirectories (CTP)
+    set(CLIO_CTP_ENABLE_CUSZP ${CLIO_CTP_ENABLE_CUSZP} CACHE BOOL "Enable cuSZp GPU lossy compression (auto-detected)" FORCE)
 endif()
 
 # Encryption libraries (conditional)

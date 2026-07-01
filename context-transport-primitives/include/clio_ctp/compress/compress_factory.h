@@ -56,6 +56,9 @@
 #if CTP_ENABLE_ZFP_SYCL
 #include "sycl_zfp.h"
 #endif
+#if CTP_ENABLE_CUSZP
+#include "cuszp.h"
+#endif
 
 namespace ctp {
 
@@ -340,6 +343,25 @@ class CompressionFactory {
 #endif
   }
 
+  // GPU error-bounded LOSSY float compressor (cuSZp). Preset maps to an absolute
+  // error bound: FAST trades more precision for ratio, BEST keeps more fidelity.
+  static std::unique_ptr<Compressor> MakeCuszp(CompressionPreset preset) {
+#if CTP_ENABLE_CUSZP
+    float eb;
+    switch (preset) {
+      case CompressionPreset::FAST: eb = 1e-2f; break;
+      case CompressionPreset::BEST: eb = 1e-4f; break;
+      case CompressionPreset::BALANCED:
+      case CompressionPreset::DEFAULT:
+      default: eb = 1e-3f; break;
+    }
+    return std::make_unique<Cuszp>(eb);
+#else
+    (void)preset;
+    return nullptr;
+#endif
+  }
+
   /**
    * The compressor registry: the single source of truth (see CompressorInfo).
    * constexpr std::array -> constant-initialized static data: no heap allocation
@@ -368,6 +390,7 @@ class CompressionFactory {
         CompressorInfo{"nvcomp-deflate",  15, 17, true, &MakeNvCompDeflate},
         CompressorInfo{"nvcomp-ans",      16, 18, true, &MakeNvCompAns},
         CompressorInfo{"zfp-sycl",        17, 19, false, &MakeSyclZfp},
+        CompressorInfo{"cuszp",           18, 20, false, &MakeCuszp},
     };
     return kRegistry;
   }
