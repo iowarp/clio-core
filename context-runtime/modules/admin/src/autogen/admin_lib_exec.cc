@@ -196,6 +196,11 @@ clio::run::TaskResume Runtime::Run(clio::run::u32 method, clio::run::shared_ptr<
       CLIO_CO_AWAIT(ListContainers(typed_task));
       break;
     }
+    case Method::kQueryTaskProgress: {
+      auto& typed_task = task_ptr.template Cast<QueryTaskProgressTask>();
+      CLIO_CO_AWAIT(QueryTaskProgress(typed_task));
+      break;
+    }
     default: {
       // Unknown method - do nothing
       break;
@@ -343,6 +348,11 @@ void Runtime::SaveTask(clio::run::u32 method, clio::run::SaveTaskArchive& archiv
       archive << *typed_task;
       break;
     }
+    case Method::kQueryTaskProgress: {
+      auto& typed_task = task_ptr.template Cast<QueryTaskProgressTask>();
+      archive << *typed_task;
+      break;
+    }
     default: {
       // Unknown method - do nothing
       break;
@@ -485,6 +495,11 @@ void Runtime::LoadTask(clio::run::u32 method, clio::run::LoadTaskArchive& archiv
     }
     case Method::kListContainers: {
       auto& typed_task = task_ptr.template Cast<ListContainersTask>();
+      archive >> *typed_task;
+      break;
+    }
+    case Method::kQueryTaskProgress: {
+      auto& typed_task = task_ptr.template Cast<QueryTaskProgressTask>();
       archive >> *typed_task;
       break;
     }
@@ -664,6 +679,12 @@ void Runtime::LocalLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive
     }
     case Method::kListContainers: {
       auto& typed_task = task_ptr.template Cast<ListContainersTask>();
+      // Use archive operator which respects msg_type
+      archive >> *typed_task;
+      break;
+    }
+    case Method::kQueryTaskProgress: {
+      auto& typed_task = task_ptr.template Cast<QueryTaskProgressTask>();
       // Use archive operator which respects msg_type
       archive >> *typed_task;
       break;

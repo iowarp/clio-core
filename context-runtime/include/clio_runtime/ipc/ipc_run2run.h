@@ -162,6 +162,19 @@ class IpcManagerRun2Run {
     return recv_map_.size();
   }
 
+  /**
+   * Whether this node currently holds the replica task identified by an
+   * origin's (net_key, replica_id) -- i.e. it was received in RecvIn and has
+   * not yet been responded to in SendOut (issue #628). Backs the
+   * QueryTaskProgress admin method's kRunning/kGone answer.
+   */
+  bool HasRecvTask(clio::run::u64 net_key, clio::run::u32 replica_id) const {
+    size_t recv_key = static_cast<size_t>(net_key) ^
+                      (static_cast<size_t>(replica_id) * 0x9e3779b97f4a7c15ULL);
+    std::lock_guard<std::mutex> lk(recv_map_mutex_);
+    return recv_map_.find(recv_key) != nullptr;
+  }
+
  private:
   // ---------------------------------------------------------------------------
   // SendIn sub-functions

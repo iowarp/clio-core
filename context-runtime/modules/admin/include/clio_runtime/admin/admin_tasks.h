@@ -1756,6 +1756,65 @@ struct HeartbeatTask : public clio::run::Task {
 };
 
 /**
+ * QueryTaskProgressTask - ask a node whether a specific in-flight replica task
+ * is still alive (issue #628). Sent by the origin to a replica's target node
+ * when the origin has been waiting on that replica beyond the task-progress
+ * interval. The target answers from its recv_map_: kRunning if the replica is
+ * still present (received, not yet responded), kGone otherwise (never received,
+ * already responded, or dropped by a restart).
+ */
+struct QueryTaskProgressTask : public clio::run::Task {
+  IN clio::run::u64 query_net_key_;    // origin's send_map key (origin task ptr)
+  IN clio::run::u32 query_replica_id_; // which replica of that origin
+  OUT clio::run::u32 status_;          // 0 = kGone, 1 = kRunning
+
+  /** SHM default constructor */
+  QueryTaskProgressTask()
+      : clio::run::Task(), query_net_key_(0), query_replica_id_(0), status_(0) {}
+
+  /** Emplace constructor */
+  explicit QueryTaskProgressTask(const clio::run::TaskId &task_node,
+                                 const clio::run::PoolId &pool_id,
+                                 const clio::run::PoolQuery &pool_query,
+                                 clio::run::u64 query_net_key,
+                                 clio::run::u32 query_replica_id)
+      : clio::run::Task(task_node, pool_id, pool_query,
+                        Method::kQueryTaskProgress),
+        query_net_key_(query_net_key), query_replica_id_(query_replica_id),
+        status_(0) {
+    task_id_ = task_node;
+    pool_id_ = pool_id;
+    method_ = Method::kQueryTaskProgress;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+    ar(query_net_key_, query_replica_id_);
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+    ar(status_);
+  }
+
+  void Copy(const ctp::ipc::FullPtr<QueryTaskProgressTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+    query_net_key_ = other->query_net_key_;
+    query_replica_id_ = other->query_replica_id_;
+    status_ = other->status_;
+  }
+
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    Task::AggregateOut(other_base);
+    Copy(other_base.template Cast<QueryTaskProgressTask>());
+  }
+};
+
+/**
  * HeartbeatProbeTask - Periodic SWIM failure detector
  * Local periodic task, no extra fields needed
  */

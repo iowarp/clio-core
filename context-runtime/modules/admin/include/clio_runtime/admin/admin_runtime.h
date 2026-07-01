@@ -292,6 +292,13 @@ public:
   clio::run::TaskResume Heartbeat(clio::run::shared_ptr<HeartbeatTask> &task);
 
   /**
+   * Handle QueryTaskProgress - report whether a specific replica task is still
+   * alive on this node (issue #628), answered from the run2run recv_map_.
+   */
+  clio::run::TaskResume QueryTaskProgress(
+      clio::run::shared_ptr<QueryTaskProgressTask> &task);
+
+  /**
    * Handle HeartbeatProbe - Periodic SWIM failure detector
    * Sends direct probes, escalates to indirect probes, manages suspicion
    */

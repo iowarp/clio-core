@@ -433,6 +433,25 @@ class Client : public clio::run::ContainerClient {
   }
 
   /**
+   * QueryTaskProgress - ask a node whether a specific replica task is still
+   * alive (issue #628). Route with Physical(node_id) to the replica's node.
+   * The task's status_ is 1 (kRunning) if that node still holds the replica,
+   * 0 (kGone) otherwise.
+   * @param pool_query Pool routing (use Physical(node_id) to target a node)
+   * @param net_key The origin's send_map key (origin task pointer)
+   * @param replica_id Which replica of that origin
+   * @return Future for the QueryTaskProgressTask
+   */
+  clio::run::Future<QueryTaskProgressTask> AsyncQueryTaskProgress(
+      const clio::run::PoolQuery& pool_query, clio::run::u64 net_key,
+      clio::run::u32 replica_id) {
+    auto* ipc_manager = CLIO_IPC;
+    auto task = ipc_manager->NewTask<QueryTaskProgressTask>(
+        clio::run::CreateTaskId(), pool_id_, pool_query, net_key, replica_id);
+    return ipc_manager->Send(task);
+  }
+
+  /**
    * HeartbeatProbe - Periodic SWIM failure detector
    * @param pool_query Pool routing (use Local())
    * @param period_us Period in microseconds (default 2000000us = 2s)

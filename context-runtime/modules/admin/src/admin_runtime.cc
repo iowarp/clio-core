@@ -1501,6 +1501,22 @@ clio::run::TaskResume Runtime::Heartbeat(clio::run::shared_ptr<HeartbeatTask> &t
   CLIO_TASK_BODY_END
 }
 
+clio::run::TaskResume Runtime::QueryTaskProgress(
+    clio::run::shared_ptr<QueryTaskProgressTask> &task) {
+  CLIO_TASK_BODY_BEGIN
+  clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
+  // Answer from run2run's recv_map_: kRunning (1) if this node still holds the
+  // queried replica task, kGone (0) otherwise (never received / already
+  // responded / dropped by a restart). Issue #628.
+  bool present = CLIO_IPC->GetRun2Run()->HasRecvTask(task->query_net_key_,
+                                                     task->query_replica_id_);
+  task->status_ = present ? 1u : 0u;
+  task->SetReturnCode(0);
+  cur_task->SetDidWork(true);
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
 clio::run::TaskResume Runtime::HeartbeatProbe(clio::run::shared_ptr<HeartbeatProbeTask> &task) {
   CLIO_TASK_BODY_BEGIN
   clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
