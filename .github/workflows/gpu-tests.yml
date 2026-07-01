@@ -11,16 +11,6 @@ on:
       - 'CMakePresets.json'
       - 'installers/conda/**'
       - '.github/workflows/gpu-tests.yml'
-  pull_request:
-    branches: [main, dev]
-    paths:
-      - 'context-runtime/**'
-      - 'context-transfer-engine/**'
-      - 'context-transport-primitives/**'
-      - 'CMakeLists.txt'
-      - 'CMakePresets.json'
-      - 'installers/conda/**'
-      - '.github/workflows/gpu-tests.yml'
   workflow_dispatch:
 
 jobs:

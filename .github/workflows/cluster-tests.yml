@@ -32,17 +32,6 @@ name: Cluster Tests
 on:
   push:
     branches: [main, dev]
-  pull_request:
-    branches: [main, dev]
-    paths:
-      - 'CMakeLists.txt'
-      - 'CMakePresets.json'
-      - 'cmake/**'
-      - 'context-runtime/**'
-      - 'context-transfer-engine/**'
-      - 'context-transport-primitives/**'
-      - 'docker/deps-cpu.Dockerfile'
-      - '.github/workflows/cluster-tests.yml'
   workflow_dispatch:
 
 concurrency:
