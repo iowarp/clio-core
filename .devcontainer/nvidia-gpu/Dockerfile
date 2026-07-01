@@ -49,6 +49,97 @@ RUN set -eux; \
     ldconfig; \
     rm -rf /tmp/nvcomp*
 
+# Scientific-data GPU compressors that back three more entries in the GPU
+# compression factory (ctp::Cusz / ctp::Ndzip / ctp::Cuszp), complementing
+# nvcomp's general-purpose byte codecs. All are built from source against the
+# CUDA 12 toolkit and installed into /usr/local so the root CMake auto-detects
+# them (CLIO_CTP_ENABLE_CUSZ / CLIO_CTP_ENABLE_NDZIP / CLIO_CTP_ENABLE_CUSZP):
+#   - cuSZ  (szcompressor/cuSZ)  : error-bounded LOSSY float compression
+#   - ndzip (celerity/ndzip)     : high-throughput LOSSLESS float compression
+#   - cuSZp (szcompressor/cuSZp) : ultra-fast single-kernel LOSSY float compression
+# ndzip and cuSZp have no upstream Spack/apt package, so source-building them here
+# is the only option; cuSZ is also a Spack package (see installers/spack) but is
+# source-built here to match the nvcomp/zfp-sycl pattern. Target SM versions are
+# overridable (default spans Volta..Hopper).
+ARG CUDA_ARCHS="70;75;80;86;89;90"
+
+# cuSZ - GPU error-bounded lossy compressor. Pinned to master; the ctp::Cusz
+# wrapper targets cuSZ's psz_* resource-manager C API.
+RUN set -eux; \
+    cd /tmp; \
+    git clone --depth 1 --recurse-submodules --shallow-submodules \
+      https://github.com/szcompressor/cuSZ.git cusz_src; \
+    cmake -S cusz_src -B cusz_src/build \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX=/usr/local \
+      -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHS}" \
+      -DPSZ_BACKEND=cuda \
+      -DPSZ_BUILD_EXAMPLES=off \
+      -DBUILD_TESTING=off \
+      -DCMAKE_POLICY_VERSION_MINIMUM=3.5; \
+    cmake --build cusz_src/build -j"$(nproc)"; \
+    cmake --install cusz_src/build; \
+    ldconfig; \
+    rm -rf /tmp/cusz_src
+
+# cuSZp - GPU ultra-fast single-kernel error-bounded lossy compressor. Pinned to
+# cuSZp-V3.0.0; the ctp::Cuszp wrapper targets the cuSZp v3 C API
+# (cuSZp_compress / cuSZp_decompress, header <cuSZp.h>, library -lcuSZp).
+RUN set -eux; \
+    cd /tmp; \
+    git clone --depth 1 --branch cuSZp-V3.0.0 \
+      https://github.com/szcompressor/cuSZp.git cuszp_src; \
+    cmake -S cuszp_src -B cuszp_src/build \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX=/usr/local \
+      -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHS}" \
+      -DcuSZp_BUILD_EXAMPLES=off \
+      -DCMAKE_POLICY_VERSION_MINIMUM=3.5; \
+    cmake --build cuszp_src/build -j"$(nproc)"; \
+    cmake --install cuszp_src/build; \
+    ldconfig; \
+    rm -rf /tmp/cuszp_src
+
+# ndzip - GPU high-throughput lossless compressor (CUDA backend).
+#
+# Built with CLANG as the CUDA compiler (clang++ -x cuda), per ndzip's own build
+# docs -- NOT nvcc. nvcc's crt/host_defines.h defines __noinline__ as a macro
+# (__attribute__((noinline))) that nests illegally inside libstdc++'s own
+# __attribute__((__noinline__)) when ndzip's device TUs pull in <memory>/<string>,
+# so the nvcc build fails (ndzip ships a single #undef workaround that is mis-
+# ordered for this toolchain). clang-18 (already installed above for CUDA kernels)
+# does not have that macro and compiles ndzip cleanly. Notes:
+#   - libomp (clang OpenMP) is required by ndzip's CPU codec (cpu_codec.inl).
+#   - -march=native is recommended by ndzip's docs (affects the host/CPU codec; the
+#     CUDA kernels are arch-targeted via CMAKE_CUDA_ARCHITECTURES). Relax it if this
+#     image must run on a different CPU than it was built on.
+#   - ndzip ships no install() rules, so the libs + headers are copied manually.
+#   - clang-18 targets up to sm_90; PTX from the highest arch JITs forward to newer
+#     GPUs (e.g. sm_120 / Blackwell) at runtime.
+RUN set -eux; \
+    apt-get update && apt-get install -y --no-install-recommends libomp-18-dev; \
+    rm -rf /var/lib/apt/lists/*; \
+    cd /tmp; \
+    git clone --depth 1 --recurse-submodules --shallow-submodules \
+      https://github.com/celerity/ndzip.git ndzip_src; \
+    cmake -S ndzip_src -B ndzip_src/build \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_C_COMPILER=clang-18 -DCMAKE_CXX_COMPILER=clang++-18 \
+      -DCMAKE_CUDA_COMPILER=clang++-18 \
+      -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHS}" \
+      -DCMAKE_CXX_FLAGS="-march=native" \
+      -DCMAKE_CUDA_FLAGS="--cuda-path=${CUDA_HOME} -Wno-unknown-cuda-version" \
+      -DNDZIP_WITH_CUDA=ON \
+      -DNDZIP_WITH_MT=OFF \
+      -DNDZIP_BUILD_BENCHMARK=OFF \
+      -DNDZIP_BUILD_TEST=OFF \
+      -DCMAKE_POLICY_VERSION_MINIMUM=3.5; \
+    cmake --build ndzip_src/build -j"$(nproc)"; \
+    cp ndzip_src/build/libndzip.so ndzip_src/build/libndzip-cuda.so /usr/local/lib/; \
+    cp -r ndzip_src/include/ndzip /usr/local/include/; \
+    ldconfig; \
+    rm -rf /tmp/ndzip_src
+
 # Intel oneAPI 2024.2 (SYCL/DPC++) toolchain for the GPU compression factory's
 # SYCL backend (zfp's SYCL execution policy, mirroring how nvcomp backs the CUDA
 # path). Pinned to 2024.2 on purpose: the zfp SYCL port

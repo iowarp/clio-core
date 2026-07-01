@@ -57,6 +57,18 @@
 #include "sycl_zfp.h"
 #endif
 
+#if CTP_ENABLE_CUSZ
+#include "cusz.h"
+#endif
+
+#if CTP_ENABLE_NDZIP
+#include "ndzip.h"
+#endif
+
+#if CTP_ENABLE_CUSZP
+#include "cuszp.h"
+#endif
+
 namespace ctp {
 
 /**
@@ -89,6 +101,9 @@ class CompressionFactory {
    *                                "nvcomp-gdeflate", "nvcomp-deflate",
    *                                "nvcomp-ans" (if nvcomp enabled)
    *                                "zfp-sycl" (lossy fixed-rate, if SYCL enabled)
+   *                                "cusz" (GPU lossy float, if cuSZ enabled)
+   *                                "ndzip" (GPU lossless float, if ndzip enabled)
+   *                                "cuszp" (GPU lossy float, if cuSZp enabled)
    * @param preset Compression preset level (FAST/BALANCED/BEST/DEFAULT)
    * @return Unique pointer to configured compressor instance,
    *         or nullptr if library not found
@@ -326,6 +341,55 @@ class CompressionFactory {
     return nullptr;
 #endif
   }
+  // cuSZ: GPU error-bounded LOSSY float compressor. Multi-mode like the lossy
+  // CPU entries -- presets map to error bounds (FAST=1e-2 loose, BALANCED=1e-3,
+  // BEST=1e-4 tight); higher fidelity -> lower compression. Returns nullptr when
+  // cuSZ is not available in this build.
+  static std::unique_ptr<Compressor> MakeCusz(CompressionPreset preset) {
+#if CTP_ENABLE_CUSZ
+    double eb;
+    switch (preset) {
+      case CompressionPreset::FAST: eb = 1e-2; break;
+      case CompressionPreset::BEST: eb = 1e-4; break;
+      case CompressionPreset::BALANCED:
+      case CompressionPreset::DEFAULT:
+      default: eb = 1e-3; break;
+    }
+    return std::make_unique<Cusz>(eb);
+#else
+    (void)preset;
+    return nullptr;
+#endif
+  }
+  // ndzip: GPU high-throughput LOSSLESS float compressor. Single-mode (no preset
+  // levels), like snappy/blosc2. Returns nullptr when ndzip is not available.
+  static std::unique_ptr<Compressor> MakeNdzip(CompressionPreset) {
+#if CTP_ENABLE_NDZIP
+    return std::make_unique<Ndzip>();
+#else
+    return nullptr;
+#endif
+  }
+  // cuSZp: GPU ultra-fast error-bounded LOSSY float compressor (single-kernel).
+  // Multi-mode like cusz/the lossy CPU entries -- presets map to ABSOLUTE error
+  // bounds (FAST=1e-2 loose, BALANCED=1e-3, BEST=1e-4 tight). Returns nullptr
+  // when cuSZp is not available in this build.
+  static std::unique_ptr<Compressor> MakeCuszp(CompressionPreset preset) {
+#if CTP_ENABLE_CUSZP
+    float eb;
+    switch (preset) {
+      case CompressionPreset::FAST: eb = 1e-2f; break;
+      case CompressionPreset::BEST: eb = 1e-4f; break;
+      case CompressionPreset::BALANCED:
+      case CompressionPreset::DEFAULT:
+      default: eb = 1e-3f; break;
+    }
+    return std::make_unique<Cuszp>(eb);
+#else
+    (void)preset;
+    return nullptr;
+#endif
+  }
 
   /**
    * The compressor registry: the single source of truth (see CompressorInfo).
@@ -355,6 +419,9 @@ class CompressionFactory {
         CompressorInfo{"nvcomp-deflate",  15, 17, true, &MakeNvCompDeflate},
         CompressorInfo{"nvcomp-ans",      16, 18, true, &MakeNvCompAns},
         CompressorInfo{"zfp-sycl",        17, 19, false, &MakeSyclZfp},
+        CompressorInfo{"cusz",            18, 20, false, &MakeCusz},
+        CompressorInfo{"ndzip",           19, 21, true,  &MakeNdzip},
+        CompressorInfo{"cuszp",           20, 22, false, &MakeCuszp},
     };
     return kRegistry;
   }

@@ -46,6 +46,14 @@
 #include <vector>
 #endif
 
+#if CTP_ENABLE_CUSZ || CTP_ENABLE_NDZIP || CTP_ENABLE_CUSZP
+#include <cuda_runtime.h>
+
+#include <algorithm>
+#include <cmath>
+#include <vector>
+#endif
+
 TEST_CASE("TestCompress") {
   std::string raw = "Hello, World!";
   std::vector<char> compressed(1024);
@@ -218,10 +226,13 @@ TEST_CASE("CompressorRegistryMappings") {
     REQUIRE(CompressionFactory::NameForWireId(15) == "nvcomp-deflate");
     REQUIRE(CompressionFactory::NameForWireId(16) == "nvcomp-ans");
     REQUIRE(CompressionFactory::NameForWireId(17) == "zfp-sycl");
+    REQUIRE(CompressionFactory::NameForWireId(18) == "cusz");
+    REQUIRE(CompressionFactory::NameForWireId(19) == "ndzip");
+    REQUIRE(CompressionFactory::NameForWireId(20) == "cuszp");
     // Out-of-range falls back to the historical default. (Registry rows are
     // build-independent, so the GPU names above resolve even without nvcomp.)
     REQUIRE(CompressionFactory::NameForWireId(-1) == "zstd");
-    REQUIRE(CompressionFactory::NameForWireId(18) == "zstd");
+    REQUIRE(CompressionFactory::NameForWireId(21) == "zstd");
     REQUIRE(CompressionFactory::NameForWireId(9999) == "zstd");
   }
 
@@ -255,8 +266,9 @@ TEST_CASE("CompressorRegistryMappings") {
     // Unknown library -> 0.
     REQUIRE(CompressionFactory::GetLibraryId("does-not-exist", BAL) == 0);
 
-    // GPU compressors: single-mode (preset forced to 2), base_ids 13-19. These
-    // are build-independent -- the registry rows resolve even without nvcomp.
+    // GPU compressors: base_ids 13-21. The nvcomp/ndzip rows are single-mode
+    // (preset forced to 2); zfp-sycl/cusz are multi-mode. All are build-
+    // independent -- the registry rows resolve even without the backend.
     REQUIRE(CompressionFactory::GetLibraryId("nvcomp-lz4", FAST) == 132);
     REQUIRE(CompressionFactory::GetLibraryId("nvcomp-lz4", BEST) == 132);
     REQUIRE(CompressionFactory::GetLibraryId("nvcomp-snappy", BAL) == 142);
@@ -269,6 +281,20 @@ TEST_CASE("CompressorRegistryMappings") {
     REQUIRE(CompressionFactory::GetLibraryId("zfp-sycl", FAST) == 191);
     REQUIRE(CompressionFactory::GetLibraryId("zfp-sycl", BAL) == 192);
     REQUIRE(CompressionFactory::GetLibraryId("zfp-sycl", BEST) == 193);
+
+    // cusz: multi-mode lossy GPU (base_id 20), preset varies the error bound.
+    REQUIRE(CompressionFactory::GetLibraryId("cusz", FAST) == 201);
+    REQUIRE(CompressionFactory::GetLibraryId("cusz", BAL) == 202);
+    REQUIRE(CompressionFactory::GetLibraryId("cusz", BEST) == 203);
+
+    // ndzip: single-mode lossless GPU (base_id 21), preset forced to 2.
+    REQUIRE(CompressionFactory::GetLibraryId("ndzip", FAST) == 212);
+    REQUIRE(CompressionFactory::GetLibraryId("ndzip", BEST) == 212);
+
+    // cuszp: multi-mode lossy GPU (base_id 22), preset varies the error bound.
+    REQUIRE(CompressionFactory::GetLibraryId("cuszp", FAST) == 221);
+    REQUIRE(CompressionFactory::GetLibraryId("cuszp", BAL) == 222);
+    REQUIRE(CompressionFactory::GetLibraryId("cuszp", BEST) == 223);
   }
 
   PAGE_DIVIDE("ML library id -> name + preset (reverse)") {
@@ -294,6 +320,11 @@ TEST_CASE("CompressorRegistryMappings") {
     REQUIRE(CompressionFactory::GetLibraryInfo(172).first == "nvcomp-deflate");
     REQUIRE(CompressionFactory::GetLibraryInfo(182).first == "nvcomp-ans");
     REQUIRE(CompressionFactory::GetLibraryInfo(192).first == "zfp-sycl");
+    REQUIRE(CompressionFactory::GetLibraryInfo(202).first == "cusz");
+    REQUIRE(CompressionFactory::GetLibraryInfo(222).first == "cuszp");
+    REQUIRE(CompressionFactory::GetLibraryInfo(201).second ==
+            CompressionPreset::FAST);
+    REQUIRE(CompressionFactory::GetLibraryInfo(212).first == "ndzip");
   }
 
   PAGE_DIVIDE("GetPreset constructs known CPU compressors (incl. alias)") {
@@ -489,3 +520,170 @@ TEST_CASE("TestNvCompGpu") {
   }
 }
 #endif  // CTP_ENABLE_NVCOMP
+
+#if CTP_ENABLE_CUSZ
+// cuSZ is GPU error-bounded LOSSY float compression. Needs a real GPU; skip
+// gracefully where none is present so the suite stays green everywhere.
+TEST_CASE("TestCuszGpu") {
+  int device_count = 0;
+  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+    WARN("No CUDA device available; skipping cuSZ GPU compression test");
+    return;
+  }
+
+  // 8192 floats of a smooth signal -- the regime cuSZ's Lorenzo predictor wins.
+  const size_t n = 8192;
+  std::vector<float> orig(n), deco(n, 0.0f);
+  for (size_t i = 0; i < n; ++i) {
+    orig[i] = std::sin(static_cast<float>(i) * 0.01f) * 100.0f;
+  }
+  const size_t raw_bytes = n * sizeof(float);
+
+  // Device-pointer (zero-copy) round-trip with a fixed error bound.
+  PAGE_DIVIDE("cusz (device pointers, BALANCED) round-trips within eb") {
+    void *d_in = nullptr, *d_comp = nullptr, *d_out = nullptr;
+    REQUIRE(cudaMalloc(&d_in, raw_bytes) == cudaSuccess);
+    REQUIRE(cudaMalloc(&d_comp, raw_bytes + 4096) == cudaSuccess);
+    REQUIRE(cudaMalloc(&d_out, raw_bytes) == cudaSuccess);
+    REQUIRE(cudaMemcpy(d_in, orig.data(), raw_bytes,
+                       cudaMemcpyHostToDevice) == cudaSuccess);
+
+    auto comp = ctp::CompressionFactory::GetPreset(
+        "cusz", ctp::CompressionPreset::BALANCED);
+    REQUIRE(comp != nullptr);
+    size_t cmpr_size = raw_bytes + 4096;
+    REQUIRE(comp->Compress(d_comp, cmpr_size, d_in, raw_bytes));
+    REQUIRE(cmpr_size > 0);
+
+    auto dcmp = ctp::CompressionFactory::GetPreset("cusz");
+    REQUIRE(dcmp != nullptr);
+    size_t deco_size = raw_bytes;
+    REQUIRE(dcmp->Decompress(d_out, deco_size, d_comp, cmpr_size));
+    REQUIRE(deco_size == raw_bytes);
+
+    REQUIRE(cudaMemcpy(deco.data(), d_out, raw_bytes,
+                       cudaMemcpyDeviceToHost) == cudaSuccess);
+    // Lossy within the BALANCED relative error bound (1e-3) on a [-100,100]
+    // signal -> generous absolute slack.
+    double max_err = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+      max_err = std::max(max_err,
+                         std::abs(static_cast<double>(orig[i] - deco[i])));
+    }
+    REQUIRE(max_err < 1.0);
+
+    cudaFree(d_in);
+    cudaFree(d_comp);
+    cudaFree(d_out);
+  }
+}
+#endif  // CTP_ENABLE_CUSZ
+
+#if CTP_ENABLE_NDZIP
+// ndzip is GPU high-throughput LOSSLESS float compression. Needs a real GPU;
+// skip gracefully where none is present.
+TEST_CASE("TestNdzipGpu") {
+  int device_count = 0;
+  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+    WARN("No CUDA device available; skipping ndzip GPU compression test");
+    return;
+  }
+
+  const size_t n = 8192;
+  std::vector<float> orig(n), deco(n, 0.0f);
+  for (size_t i = 0; i < n; ++i) {
+    orig[i] = std::sin(static_cast<float>(i) * 0.01f) * 100.0f;
+  }
+  const size_t raw_bytes = n * sizeof(float);
+
+  // Lossless: device round-trip must reconstruct the input bit-exactly.
+  PAGE_DIVIDE("ndzip (device pointers) round-trips bit-exactly") {
+    void *d_in = nullptr, *d_comp = nullptr, *d_out = nullptr;
+    REQUIRE(cudaMalloc(&d_in, raw_bytes) == cudaSuccess);
+    REQUIRE(cudaMalloc(&d_comp, raw_bytes * 2 + 4096) == cudaSuccess);
+    REQUIRE(cudaMalloc(&d_out, raw_bytes) == cudaSuccess);
+    REQUIRE(cudaMemcpy(d_in, orig.data(), raw_bytes,
+                       cudaMemcpyHostToDevice) == cudaSuccess);
+
+    auto comp = ctp::CompressionFactory::GetPreset("ndzip");
+    REQUIRE(comp != nullptr);
+    size_t cmpr_size = raw_bytes * 2 + 4096;
+    REQUIRE(comp->Compress(d_comp, cmpr_size, d_in, raw_bytes));
+    REQUIRE(cmpr_size > 0);
+
+    auto dcmp = ctp::CompressionFactory::GetPreset("ndzip");
+    REQUIRE(dcmp != nullptr);
+    size_t deco_size = raw_bytes;
+    REQUIRE(dcmp->Decompress(d_out, deco_size, d_comp, cmpr_size));
+    REQUIRE(deco_size == raw_bytes);
+
+    REQUIRE(cudaMemcpy(deco.data(), d_out, raw_bytes,
+                       cudaMemcpyDeviceToHost) == cudaSuccess);
+    REQUIRE(orig == deco);  // lossless: exact
+    cudaFree(d_in);
+    cudaFree(d_comp);
+    cudaFree(d_out);
+  }
+}
+#endif  // CTP_ENABLE_NDZIP
+
+#if CTP_ENABLE_CUSZP
+// cuSZp is GPU ultra-fast error-bounded LOSSY float compression. Needs a real
+// GPU; skip gracefully where none is present.
+TEST_CASE("TestCuszpGpu") {
+  int device_count = 0;
+  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+    WARN("No CUDA device available; skipping cuSZp GPU compression test");
+    return;
+  }
+
+  // Use a multi-block input (> 32768 elements). cuSZp only reports a complete
+  // compressed size for multi-block inputs; smaller single-block inputs still
+  // round-trip correctly but are stored uncompressed (see ctp::Cuszp), so a
+  // multi-block size exercises the real, compressing path.
+  const size_t n = 65536;
+  std::vector<float> orig(n), deco(n, 0.0f);
+  for (size_t i = 0; i < n; ++i) {
+    orig[i] = std::sin(static_cast<float>(i) * 0.01f) * 100.0f;
+  }
+  const size_t raw_bytes = n * sizeof(float);
+
+  // Device-pointer (zero-copy) round-trip within the absolute error bound.
+  PAGE_DIVIDE("cuszp (device pointers, BALANCED) round-trips within eb") {
+    void *d_in = nullptr, *d_comp = nullptr, *d_out = nullptr;
+    REQUIRE(cudaMalloc(&d_in, raw_bytes) == cudaSuccess);
+    REQUIRE(cudaMalloc(&d_comp, raw_bytes + 4096) == cudaSuccess);
+    REQUIRE(cudaMalloc(&d_out, raw_bytes) == cudaSuccess);
+    REQUIRE(cudaMemcpy(d_in, orig.data(), raw_bytes,
+                       cudaMemcpyHostToDevice) == cudaSuccess);
+
+    auto comp = ctp::CompressionFactory::GetPreset(
+        "cuszp", ctp::CompressionPreset::BALANCED);
+    REQUIRE(comp != nullptr);
+    size_t cmpr_size = raw_bytes + 4096;
+    REQUIRE(comp->Compress(d_comp, cmpr_size, d_in, raw_bytes));
+    REQUIRE(cmpr_size > 0);
+    REQUIRE(cmpr_size < raw_bytes);  // multi-block -> actually compresses
+
+    auto dcmp = ctp::CompressionFactory::GetPreset("cuszp");
+    REQUIRE(dcmp != nullptr);
+    size_t deco_size = raw_bytes;
+    REQUIRE(dcmp->Decompress(d_out, deco_size, d_comp, cmpr_size));
+    REQUIRE(deco_size == raw_bytes);
+
+    REQUIRE(cudaMemcpy(deco.data(), d_out, raw_bytes,
+                       cudaMemcpyDeviceToHost) == cudaSuccess);
+    // Lossy within the BALANCED absolute error bound (1e-3) -> generous slack.
+    double max_err = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+      max_err = std::max(max_err,
+                         std::abs(static_cast<double>(orig[i] - deco[i])));
+    }
+    REQUIRE(max_err < 1.0);
+
+    cudaFree(d_in);
+    cudaFree(d_comp);
+    cudaFree(d_out);
+  }
+}
+#endif  // CTP_ENABLE_CUSZP

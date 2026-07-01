@@ -99,6 +99,14 @@ class Iowarp(CMakePackage):
     depends_on('snappy', when='+compress')
     depends_on('c-blosc2', when='+compress')
 
+    # GPU compression libraries (conditional on +compress +cuda). These operate
+    # on device pointers and back the ctp::Cusz / ctp::Ndzip / ctp::Cuszp wrappers.
+    #   - cuSZ has an upstream Spack package.
+    #   - ndzip and cuSZp have NO upstream Spack package; they are source-built in
+    #     the NVIDIA devcontainer (.devcontainer/nvidia-gpu/Dockerfile) instead.
+    #     Add a depends_on here if/when a Spack package becomes available.
+    depends_on('cusz', when='+compress +cuda')
+
     # Encryption libraries (conditional on +encrypt)
     depends_on('openssl', when='+encrypt')
 
