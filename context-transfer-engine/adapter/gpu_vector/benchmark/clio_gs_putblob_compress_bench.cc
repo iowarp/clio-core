@@ -54,6 +54,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -198,8 +199,21 @@ int main(int argc, char *argv[]) {
   const clio::run::u64 field_bytes = (clio::run::u64)rows * cols * sizeof(float);
   const clio::run::u64 snap_bytes = opts.per_block_bytes;
 
-  int compress_lib = ctp::CompressionFactory::WireIdForName(opts.compress_lib);
-  if (compress_lib < 0) compress_lib = ctp::CompressionFactory::WireIdForName("lz4");
+  // Effective compressor = the CLIO_CTE_COMPRESS_LIB pin if set (name or wire
+  // id), else --compress-lib. This is exactly what the runtime will use, so the
+  // measured ratio below reflects the real pipeline.
+  std::string eff_lib = opts.compress_lib;
+  if (const char *penv = std::getenv("CLIO_CTE_COMPRESS_LIB")) {
+    if (penv[0]) {
+      int w = ctp::CompressionFactory::WireIdForName(penv);
+      if (w < 0) { char *e = nullptr; long p = std::strtol(penv, &e, 10);
+                   if (e != penv && *e == '\0') w = (int)p; }
+      if (w >= 0) eff_lib = ctp::CompressionFactory::NameForWireId(w);
+    }
+  }
+  int compress_lib = ctp::CompressionFactory::WireIdForName(eff_lib);
+  if (compress_lib < 0) { eff_lib = "lz4";
+    compress_lib = ctp::CompressionFactory::WireIdForName("lz4"); }
 
   clio::run::u64 logical_total = snap_bytes * (clio::run::u64)rows * opts.nsteps;
   clio::run::u64 capacity_mib =
@@ -240,6 +254,38 @@ int main(int argc, char *argv[]) {
 
   GsInitKernel<<<rows, 128>>>(u, v, rows, cols);
   ctp::GpuApi::Synchronize();
+
+  // --- Direct compression-ratio measurement ---
+  // The runtime does not propagate the compressed size back to the client task,
+  // so we measure the ratio the pinned library actually achieves on a real GS
+  // snapshot, using the SAME CompressionFactory the runtime uses. A throwaway GS
+  // step (no swap) produces a representative field; u/v are left untouched for
+  // the timed loop.
+  double measured_ratio = 0.0;
+  {
+    GsStepKernel<<<rows, 128>>>(u, v, u2, v2, snap_dev[0], rows, cols);
+    ctp::GpuApi::Synchronize();
+    ctp::GpuApi::Memcpy<float>(reinterpret_cast<float *>(shm_buf[0].ptr_),
+                               snap_dev[0], field_bytes);
+    auto comp = ctp::CompressionFactory::GetPreset(
+        eff_lib, ctp::CompressionPreset::BALANCED);
+    if (comp) {
+      std::vector<char> out(field_bytes + field_bytes / 2 + 4096);
+      size_t out_sz = out.size();
+      if (comp->Compress(out.data(), out_sz, shm_buf[0].ptr_, field_bytes) &&
+          out_sz > 0) {
+        measured_ratio = (double)field_bytes / (double)out_sz;
+        std::fprintf(stderr,
+                     "[BENCH] measured ratio (%s on GS snapshot): %.2fx "
+                     "(%llu -> %llu B)\n",
+                     eff_lib.c_str(), measured_ratio,
+                     (unsigned long long)field_bytes, (unsigned long long)out_sz);
+      }
+    }
+    if (measured_ratio == 0.0)
+      std::fprintf(stderr, "[BENCH] ratio unavailable for '%s'\n",
+                   eff_lib.c_str());
+  }
 
   using PFut = clio::run::Future<clio::cte::core::PutBlobTask>;
   std::vector<PFut> inflight[2];
@@ -300,16 +346,26 @@ int main(int argc, char *argv[]) {
   drain_slot(1);
 
   double ms = std::chrono::duration<double, std::milli>(clock::now() - t0).count();
-  double ratio = total_compressed > 0
-                     ? (double)logical_total / (double)total_compressed : 0.0;
+  // Prefer the directly-measured ratio; fall back to runtime-reported size if it
+  // ever starts propagating (currently it does not, so total_compressed==0).
+  double ratio = measured_ratio > 0.0
+                     ? measured_ratio
+                     : (total_compressed > 0
+                            ? (double)logical_total / (double)total_compressed
+                            : 0.0);
+  double stored_mib = ratio > 0.0
+                          ? (logical_total / ratio) / (double)(1ULL << 20)
+                          : 0.0;
   std::fprintf(stderr,
                "\n[SUMMARY] steps=%u blocks=%d put_failures=%d\n"
                "[SUMMARY] total=%.3f ms  %.2f us/step  logical=%llu MB\n"
-               "[SUMMARY] compressed=%llu B  ratio=%.2fx  logical throughput=%.1f MiB/s\n",
+               "[SUMMARY] compressor=%s  ratio=%.2fx  stored~%.1f MiB\n"
+               "[SUMMARY] logical throughput=%.1f MiB/s  effective(stored)=%.1f MiB/s\n",
                opts.nsteps, rows, put_failures, ms, (ms * 1e3) / opts.nsteps,
                (unsigned long long)(logical_total >> 20),
-               (unsigned long long)total_compressed, ratio,
-               (logical_total / (double)(1ULL << 20)) / (ms / 1e3));
+               eff_lib.c_str(), ratio, stored_mib,
+               (logical_total / (double)(1ULL << 20)) / (ms / 1e3),
+               ratio > 0.0 ? (stored_mib) / (ms / 1e3) : 0.0);
 
   ctp::GpuApi::Free<float>(u);  ctp::GpuApi::Free<float>(v);
   ctp::GpuApi::Free<float>(u2); ctp::GpuApi::Free<float>(v2);

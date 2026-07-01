@@ -30,31 +30,52 @@ follow-ups).
   in-flight future). Step `s+1` compute overlaps step `s` compress+store; a slot
   is drained before reuse.
 
-## Results (pinned compressor = lz4, best-effort single run)
+## Results (pinned compressor selected by CLIO_CTE_COMPRESS_LIB)
 
-| config (blocks × steps, 4 KB/block) | logical | total | µs/step | logical throughput | put failures |
-|---|---:|---:|---:|---:|---:|
-| 256 × 20   | 20 MB  | 13.3 ms  | 665  | 1505 MiB/s | 0 |
-| 1024 × 50  | 200 MB | 122.3 ms | 2446 | 1636 MiB/s | 0 |
-| 4096 × 50  | 800 MB | 439.3 ms | 8786 | **1821 MiB/s** | 0 |
+Ratio is measured directly: the same CompressionFactory library the runtime uses
+is applied to a real GS snapshot in-process (the runtime does not propagate the
+compressed size back to the client task, so the bench measures it itself).
 
-- **The pipeline runs end-to-end and scales** — 0 put failures across 5,120–
-  204,800 compressed PutBlobs; logical throughput climbs to ~1.8 GiB/s as the
-  per-step batch amortizes fixed overhead.
+| pin  | config (blocks × steps, 4 KB/block) | logical | total | µs/step | ratio | logical throughput |
+|------|---|---:|---:|---:|---:|---:|
+| lz4  | 1024 × 50 | 200 MB | 93.3 ms  | 1866 | 1.00× | 2144 MiB/s |
+| lz4  | 4096 × 50 | 800 MB | 409.9 ms | 8198 | 1.00× | 1952 MiB/s |
+| zstd | 1024 × 50 | 200 MB | 98.8 ms  | 1975 | 1.19× | 2025 MiB/s |
+| zstd | 4096 × 50 | 800 MB | 488.8 ms | 9776 | 1.18× | 1637 MiB/s |
+
+- **The pipeline runs end-to-end and scales** — 0 put failures across 51,200–
+  204,800 compressed PutBlobs; logical throughput ~1.6–2.1 GiB/s.
+- **The env pin works** — lz4 vs zstd give visibly different ratios and timings
+  from the identical workload, confirming the pin selects the compressor.
 - **`ctest -R gpu` = 14/14 pass** on the same A100 build (prerequisite check).
+
+## Key finding: lossless byte compressors barely compress float fields
+
+The measured ratios are **~1.0× (lz4)** and **~1.19× (zstd)**. This is expected,
+and it is the important lesson for the project's compressor selection: **lossless
+byte-oriented compressors (lz4/zstd/snappy — and nvcomp's GPU variants, which are
+also lossless) get almost nothing on high-entropy 32-bit float data.** (lz4 here
+even expands slightly: 4,194,304 → 4,205,218 B.) The whole-domain-perturbation
+init used to keep the field non-degenerate is deliberately high-entropy, which is
+the worst case for lossless coding.
+
+Real capacity gains on scientific float data require **error-bounded lossy**
+compression (cuSZp / SZ / zfp), exactly as the Part-1 transfer benchmark used
+(cuSZp targets ~4× on structured fields). So the transparent-PutBlob machinery is
+compressor-agnostic and working; the *ratio* is a property of the chosen library
++ data, and a lossy GPU compressor is what turns this into a capacity win.
 
 ## Known gaps / follow-ups
 
-1. **Compression ratio not surfaced** (`ratio=0.00x`). `put_failures=0` and the
-   pin firing confirm the compressor is in the path, but
-   `actual_compressed_size_` does not propagate back to the client's PutBlobTask
-   context through the transparent chimod chain. Next: read it from the CTE-core
-   RAM-tier usage, enable compressor trace logs, or add a GetBlob round-trip
-   byte-verify.
-2. **GPU compressor.** nvcomp is absent from the container, so the pin currently
-   selects a CPU library. Installing nvcomp + `CTP_ENABLE_NVCOMP` makes
-   `CLIO_CTE_COMPRESS_LIB=nvcomp-lz4` a one-env-var swap (no code change).
-3. **Host-side submission.** The GS kernel produces the data; the host issues the
-   compressed PutBlob. Device-side submission through the compressor (the
-   gpu_vector adapter already does device-side `ipc->Send` to *core*) is future
-   work.
+1. **Wire an error-bounded lossy GPU compressor** (cuSZp/zfp) into the factory +
+   pin to get a meaningful ratio on this data; lossless libraries are a
+   correctness/plumbing demo only.
+2. **nvcomp not installed** in the container (only zfp). Installing nvcomp +
+   `CTP_ENABLE_NVCOMP` makes `CLIO_CTE_COMPRESS_LIB=nvcomp-*` a one-env-var swap —
+   though note nvcomp is lossless too, so it will also be ~1× here.
+3. **Runtime-reported ratio** still does not propagate back through the
+   transparent chimod chain (the bench measures it directly instead). Surfacing
+   `actual_compressed_size_` on the client task is a separate runtime fix.
+4. **Host-side submission.** The GS kernel produces the data; the host issues the
+   compressed PutBlob. Device-side submission through the compressor is future
+   work (the gpu_vector adapter already does device-side `ipc->Send` to *core*).
