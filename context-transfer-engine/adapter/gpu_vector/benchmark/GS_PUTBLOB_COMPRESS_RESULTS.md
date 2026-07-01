@@ -34,48 +34,54 @@ follow-ups).
 
 Ratio is measured directly: the same CompressionFactory library the runtime uses
 is applied to a real GS snapshot in-process (the runtime does not propagate the
-compressed size back to the client task, so the bench measures it itself).
+compressed size back to the client task, so the bench measures it itself). Same
+workload (1024 blocks × 50 steps, 4 KB/block = 200 MB logical), only the pinned
+compressor changes.
 
-| pin  | config (blocks × steps, 4 KB/block) | logical | total | µs/step | ratio | logical throughput |
-|------|---|---:|---:|---:|---:|---:|
-| lz4  | 1024 × 50 | 200 MB | 93.3 ms  | 1866 | 1.00× | 2144 MiB/s |
-| lz4  | 4096 × 50 | 800 MB | 409.9 ms | 8198 | 1.00× | 1952 MiB/s |
-| zstd | 1024 × 50 | 200 MB | 98.8 ms  | 1975 | 1.19× | 2025 MiB/s |
-| zstd | 4096 × 50 | 800 MB | 488.8 ms | 9776 | 1.18× | 1637 MiB/s |
+| pin  | type | ratio | stored (of 200 MB) | total | logical throughput | put failures |
+|------|------|------:|-------------------:|------:|-------------------:|---:|
+| lz4  | lossless          | 1.00×  | 200.5 MiB | 95.9 ms | 2085 MiB/s | 0 |
+| zstd | lossless          | 1.19×  | 168.8 MiB | 93.4 ms | 2141 MiB/s | 0 |
+| **zfp**  | **lossy (fixed-rate)**   | **2.00×**  | 100.0 MiB | 93.9 ms | 2130 MiB/s | 0 |
+| **sz3**  | **lossy (error-bounded)** | **26.94×** | 7.4 MiB   | 94.0 ms | 2128 MiB/s | 0 |
 
-- **The pipeline runs end-to-end and scales** — 0 put failures across 51,200–
-  204,800 compressed PutBlobs; logical throughput ~1.6–2.1 GiB/s.
-- **The env pin works** — lz4 vs zstd give visibly different ratios and timings
-  from the identical workload, confirming the pin selects the compressor.
-- **`ctest -R gpu` = 14/14 pass** on the same A100 build (prerequisite check).
+(Also verified at 800 MB / 4096 blocks: lz4 1.00×, zstd 1.18×, ~1.6–2.0 GiB/s.)
 
-## Key finding: lossless byte compressors barely compress float fields
+- **The pipeline runs end-to-end, scales, and is compressor-agnostic** — 0 put
+  failures for every library; ~2.1 GiB/s logical throughput regardless of pin.
+- **The env pin works** — swapping `CLIO_CTE_COMPRESS_LIB` alone changes the
+  compressor and the ratio, no rebuild, no code change.
+- **`ctest -R gpu` = 14/14 pass** on the same A100 build.
 
-The measured ratios are **~1.0× (lz4)** and **~1.19× (zstd)**. This is expected,
-and it is the important lesson for the project's compressor selection: **lossless
-byte-oriented compressors (lz4/zstd/snappy — and nvcomp's GPU variants, which are
-also lossless) get almost nothing on high-entropy 32-bit float data.** (lz4 here
-even expands slightly: 4,194,304 → 4,205,218 B.) The whole-domain-perturbation
-init used to keep the field non-degenerate is deliberately high-entropy, which is
-the worst case for lossless coding.
+## Key finding: lossy compression is what delivers the capacity win
 
-Real capacity gains on scientific float data require **error-bounded lossy**
-compression (cuSZp / SZ / zfp), exactly as the Part-1 transfer benchmark used
-(cuSZp targets ~4× on structured fields). So the transparent-PutBlob machinery is
-compressor-agnostic and working; the *ratio* is a property of the chosen library
-+ data, and a lossy GPU compressor is what turns this into a capacity win.
+- **Lossless byte compressors barely compress float fields.** lz4 = 1.00×
+  (it even expands slightly, 4,194,304 → 4,205,218 B), zstd = 1.19×. The GPU
+  lossless variants (nvcomp-*) are the same family and would behave the same.
+  High-entropy 32-bit floats have little byte-level redundancy to exploit.
+- **Error-bounded lossy compressors deliver the capacity expansion.** zfp gives a
+  clean **2.00×** (its balanced preset is a fixed ~16-bit/float rate), and sz3
+  gives **26.94×** on this data. This is precisely the project thesis — trade a
+  bounded amount of precision for making the fast tier hold many times more data.
+- **Ratios come with a preset error bound** (the "balanced" preset). sz3's very
+  high ratio implies a loose tolerance for this field; fidelity vs. ratio is a
+  knob (per-tier error bound) the tier-aware selector will set deliberately.
+
+Net: the transparent-PutBlob compression machinery is done and works with any
+library in the factory; **selecting a lossy compressor turns the pipeline from a
+plumbing demo into a real capacity win (2×–27× here).**
 
 ## Known gaps / follow-ups
 
-1. **Wire an error-bounded lossy GPU compressor** (cuSZp/zfp) into the factory +
-   pin to get a meaningful ratio on this data; lossless libraries are a
-   correctness/plumbing demo only.
-2. **nvcomp not installed** in the container (only zfp). Installing nvcomp +
-   `CTP_ENABLE_NVCOMP` makes `CLIO_CTE_COMPRESS_LIB=nvcomp-*` a one-env-var swap —
-   though note nvcomp is lossless too, so it will also be ~1× here.
-3. **Runtime-reported ratio** still does not propagate back through the
-   transparent chimod chain (the bench measures it directly instead). Surfacing
+1. **GPU-side lossy compressor.** zfp/sz3 here run on the CPU (LibPressio). A
+   GPU error-bounded compressor (**cuSZp**, already built at `/u/rpawar/cuSZp`;
+   or zfp-sycl) would keep compression on-device and off the PCIe path. Wiring
+   cuSZp into the factory (a `Compressor` subclass + registry row + build flag,
+   mirroring `nvcomp.h`) is the natural next step; the env pin then selects it
+   unchanged.
+2. **Runtime-reported ratio** does not propagate back through the transparent
+   chimod chain (the bench measures it directly instead). Surfacing
    `actual_compressed_size_` on the client task is a separate runtime fix.
-4. **Host-side submission.** The GS kernel produces the data; the host issues the
+3. **Host-side submission.** The GS kernel produces the data; the host issues the
    compressed PutBlob. Device-side submission through the compressor is future
    work (the gpu_vector adapter already does device-side `ipc->Send` to *core*).
