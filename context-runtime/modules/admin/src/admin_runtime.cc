@@ -402,6 +402,7 @@ clio::run::TaskResume Runtime::Send(clio::run::shared_ptr<SendTask> &task) {
   // Per-tick maintenance: retries and dead-node fanout.
   CLIO_IPC->GetRun2Run()->ProcessRetryQueues();
   CLIO_IPC->GetRun2Run()->ScanSendMapTimeouts();
+  ScanTaskProgress();  // #628: cross-node task-progress validity check
 
   // Snapshot the depth of each priority at function entry so a hot
   // producer can't monopolise this tick.
@@ -1515,6 +1516,65 @@ clio::run::TaskResume Runtime::QueryTaskProgress(
   cur_task->SetDidWork(true);
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
+}
+
+// Origin-side periodic task-progress validity check (issue #628). Fire-and-poll:
+// reap completed probes, then fire new ones for replicas outstanding beyond the
+// configured interval. Never awaits, so the net-processing tick that drives the
+// probes' own transmission is never blocked waiting on itself.
+void Runtime::ScanTaskProgress() {
+  auto *ipc_manager = CLIO_IPC;
+  auto *run2run = ipc_manager->GetRun2Run();
+
+  // 1. Reap completed probes.
+  for (auto it = pending_progress_queries_.begin();
+       it != pending_progress_queries_.end();) {
+    if (!it->future.IsComplete()) {
+      ++it;
+      continue;
+    }
+    // A failed probe (target died after we picked it) is inconclusive -- the
+    // dead-node timeout path handles that. Only a successful answer decides.
+    HLOG(kDebug, "[TaskProgress] reap probe net_key={} replica={} rc={} status={}",
+         it->net_key, it->replica_id, it->future->GetReturnCode(),
+         it->future->status_);
+    if (it->future->GetReturnCode() == 0) {
+      bool gone = (it->future->status_ == 0);
+      run2run->HandleTaskProgressResult(
+          static_cast<clio::run::u64>(it->net_key), it->replica_id, gone);
+    }
+    it = pending_progress_queries_.erase(it);
+  }
+
+  // 2. Fire new probes for replicas outstanding beyond the interval.
+  clio::run::u32 interval_ms = CLIO_CONFIG_MANAGER->GetTaskProgressIntervalMs();
+  auto stuck = run2run->CollectStuckReplicas(interval_ms);
+  for (const auto &sr : stuck) {
+    bool already = false;
+    for (const auto &pq : pending_progress_queries_) {
+      if (pq.net_key == static_cast<size_t>(sr.net_key) &&
+          pq.replica_id == sr.replica_id) {
+        already = true;
+        break;
+      }
+    }
+    if (already) {
+      continue;
+    }
+    // Probe the replica's node. Bounded net_timeout so a target that dies
+    // mid-probe fails fast instead of leaking an in-flight entry.
+    clio::run::PoolQuery q =
+        clio::run::PoolQuery::Physical(static_cast<clio::run::u32>(sr.target_node_id));
+    q.SetNetTimeout(5.0f);
+    auto task = ipc_manager->NewTask<QueryTaskProgressTask>(
+        clio::run::CreateTaskId(), clio::run::kAdminPoolId, q, sr.net_key,
+        sr.replica_id);
+    auto fut = ipc_manager->Send(task);
+    HLOG(kDebug, "[TaskProgress] fire probe net_key={} replica={} -> node {}",
+         sr.net_key, sr.replica_id, sr.target_node_id);
+    pending_progress_queries_.push_back(
+        {std::move(fut), static_cast<size_t>(sr.net_key), sr.replica_id});
+  }
 }
 
 clio::run::TaskResume Runtime::HeartbeatProbe(clio::run::shared_ptr<HeartbeatProbeTask> &task) {

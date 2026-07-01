@@ -183,6 +183,11 @@ void IpcManagerRun2Run::SendIn(clio::run::shared_ptr<clio::run::Task> origin_tas
   size_t num_replicas = pool_queries.size();
   origin_task->Subtasks().resize(num_replicas);
 
+  // Per-replica target node, for the #628 task-progress scan. Left as
+  // kInvalidNodeId for replicas that were never dispatched to a live/queued
+  // node (those never wait on a network response, so the scan skips them).
+  std::vector<clio::run::u64> replica_targets(num_replicas, kInvalidNodeId);
+
   HLOG(kDebug, "[SendIn] Task {} to {} replicas", origin_task->task_id_,
        num_replicas);
 
@@ -223,14 +228,23 @@ void IpcManagerRun2Run::SendIn(clio::run::shared_ptr<clio::run::Task> origin_tas
       HLOG(kWarning,
            "[SendIn] Task {} target node {} is dead, queuing for retry",
            origin_task->task_id_, target_node_id);
+      replica_targets[i] = target_node_id;
       std::lock_guard<std::mutex> _rqlk(retry_queues_mutex_);
       send_in_retry_.push_back(
           {task_copy, target_node_id, std::chrono::steady_clock::now()});
       continue;
     }
 
+    replica_targets[i] = target_node_id;
     SendInTransmitReplica(ipc_manager, task_copy,
                           target_node_id, origin_task);
+  }
+
+  // Register this origin for the #628 task-progress scan. Admin-pool tasks are
+  // excluded: QueryTaskProgress is itself an admin cross-node task, so tracking
+  // it (and the other admin liveness/control probes) would recurse.
+  if (!(origin_task->pool_id_ == clio::run::kAdminPoolId)) {
+    RegisterOriginProgress(send_map_key, replica_targets);
   }
 }
 
@@ -554,6 +568,13 @@ int IpcManagerRun2Run::RecvOutAggregate(
 
     HLOG(kDebug, "[RecvOut] Task {}", origin_task->task_id_);
 
+    // Count toward completion only if this replica was not already accounted
+    // for by the #628 progress scan (a Gone verdict that raced this response);
+    // untracked (admin) origins always count, preserving prior behaviour.
+    if (!MarkReplicaAccounted(net_key, replica_id)) {
+      continue;
+    }
+
     clio::run::u32 completed =
         origin_task->CompletedReplicas().fetch_add(1) + 1;
     if (completed == origin_task->Subtasks().size()) {
@@ -585,6 +606,7 @@ void IpcManagerRun2Run::RecvOutCompleteOriginTask(
   {
     std::lock_guard<std::mutex> lk(send_map_mutex_);
     send_map_.erase(net_key);
+    progress_map_.erase(net_key);  // #628: drop task-progress tracking
   }
 
   auto *worker = CLIO_CUR_WORKER;
@@ -598,6 +620,115 @@ void IpcManagerRun2Run::RecvOutCompleteOriginTask(
     HLOG(kError,
          "[RecvOut] No worker available to call EndTask for task {}",
          origin_task->task_id_);
+  }
+}
+
+// =============================================================================
+// Cross-node task-progress tracking (issue #628)
+// =============================================================================
+
+void IpcManagerRun2Run::RegisterOriginProgress(
+    size_t net_key, const std::vector<clio::run::u64> &replica_targets) {
+  OriginProgress prog;
+  prog.enqueue_time = std::chrono::steady_clock::now();
+  prog.replicas.resize(replica_targets.size());
+  for (size_t i = 0; i < replica_targets.size(); ++i) {
+    prog.replicas[i].target_node_id = replica_targets[i];
+    // A replica never dispatched to a node has nothing to wait on -> accounted,
+    // so the scan skips it and it never blocks completion.
+    prog.replicas[i].accounted = (replica_targets[i] == kInvalidNodeId);
+  }
+  std::lock_guard<std::mutex> lk(send_map_mutex_);
+  progress_map_[net_key] = std::move(prog);
+}
+
+bool IpcManagerRun2Run::MarkReplicaAccounted(size_t net_key,
+                                             clio::run::u32 replica_id) {
+  std::lock_guard<std::mutex> lk(send_map_mutex_);
+  auto it = progress_map_.find(net_key);
+  if (it == progress_map_.end()) {
+    return true;  // untracked (admin) origin -> caller counts unconditionally
+  }
+  if (replica_id >= it->second.replicas.size()) {
+    return true;  // defensive: out-of-range, don't suppress the count
+  }
+  if (it->second.replicas[replica_id].accounted) {
+    return false;  // already accounted -> caller must not double-count
+  }
+  it->second.replicas[replica_id].accounted = true;
+  return true;
+}
+
+std::vector<StuckReplica> IpcManagerRun2Run::CollectStuckReplicas(
+    clio::run::u32 interval_ms) {
+  std::vector<StuckReplica> stuck;
+  if (interval_ms == 0) {
+    return stuck;  // periodic validity check disabled
+  }
+  auto *ipc_manager = CLIO_IPC;
+  auto now = std::chrono::steady_clock::now();
+  auto interval = std::chrono::milliseconds(interval_ms);
+
+  std::lock_guard<std::mutex> lk(send_map_mutex_);
+  // Throttle: run a scan pass at most once per interval.
+  if (last_progress_scan_.time_since_epoch().count() != 0 &&
+      now - last_progress_scan_ < interval) {
+    return stuck;
+  }
+  last_progress_scan_ = now;
+
+  for (auto &kv : progress_map_) {
+    OriginProgress &prog = kv.second;
+    if (now - prog.enqueue_time < interval) {
+      continue;  // give the task at least one interval before probing
+    }
+    for (clio::run::u32 rid = 0; rid < prog.replicas.size(); ++rid) {
+      ReplicaProgress &rp = prog.replicas[rid];
+      if (rp.accounted || rp.target_node_id == kInvalidNodeId) {
+        continue;
+      }
+      // A dead target is handled by the dead-node timeout path; only probe
+      // nodes that are (still / again) alive.
+      if (!ipc_manager->IsAlive(rp.target_node_id)) {
+        continue;
+      }
+      stuck.push_back({static_cast<clio::run::u64>(kv.first), rid,
+                       rp.target_node_id});
+    }
+  }
+  return stuck;
+}
+
+void IpcManagerRun2Run::HandleTaskProgressResult(clio::run::u64 net_key,
+                                                 clio::run::u32 replica_id,
+                                                 bool gone) {
+  if (!gone) {
+    return;  // still running on its node -> keep waiting
+  }
+  // Claim the accounting transition; bail if a real response already took it.
+  if (!MarkReplicaAccounted(static_cast<size_t>(net_key), replica_id)) {
+    return;
+  }
+  clio::run::shared_ptr<clio::run::Task> origin_task;
+  {
+    std::lock_guard<std::mutex> lk(send_map_mutex_);
+    auto sit = send_map_.find(static_cast<size_t>(net_key));
+    if (sit == nullptr) {
+      return;  // origin already completed/erased
+    }
+    origin_task = *sit;
+  }
+  HLOG(kWarning,
+       "[TaskProgress] replica {} of task {} is Gone on its node; completing "
+       "origin with network-timeout RC (#628)",
+       replica_id, origin_task->task_id_);
+  // Preserve partial results already aggregated from replicas that answered;
+  // signal the shortfall with a network-timeout RC.
+  origin_task->SetReturnCode(kRun2RunNetworkTimeoutRC);
+  clio::run::u32 completed =
+      origin_task->CompletedReplicas().fetch_add(1) + 1;
+  if (completed == origin_task->Subtasks().size()) {
+    RecvOutCompleteOriginTask(static_cast<size_t>(net_key), origin_task);
   }
 }
 
@@ -818,14 +949,28 @@ void IpcManagerRun2Run::ScanSendMapTimeouts() {
          "[ScanSendMapTimeouts] Task {} timed out waiting for dead node",
          origin_task->task_id_);
     origin_task->SetReturnCode(kRun2RunNetworkTimeoutRC);
+    // Fix B (#628): this runs on the net worker's periodic tick, where
+    // CLIO_CUR_WORKER can be null. Fall back to the net-recv worker rather than
+    // dereferencing null (mirrors RecvOutCompleteOriginTask).
     auto *worker = CLIO_CUR_WORKER;
-    worker->EndTask(origin_task, true);
+    if (worker == nullptr) {
+      auto *scheduler = CLIO_IPC->GetScheduler();
+      worker = scheduler ? scheduler->GetNetRecvWorker() : nullptr;
+    }
+    if (worker != nullptr) {
+      worker->EndTask(origin_task, true);
+    } else {
+      HLOG(kError,
+           "[ScanSendMapTimeouts] No worker available to complete task {}",
+           origin_task->task_id_);
+    }
   }
 
   if (!to_complete.empty()) {
     std::lock_guard<std::mutex> lk(send_map_mutex_);
     for (auto &entry : to_complete) {
       send_map_.erase(entry.first);
+      progress_map_.erase(entry.first);  // #628: drop task-progress tracking
     }
   }
 }

@@ -414,6 +414,24 @@ private:
   size_t probe_round_robin_idx_ = 0;
   std::vector<PendingProbe> pending_direct_probes_;
   std::vector<PendingIndirectProbe> pending_indirect_probes_;
+
+  // #628: in-flight QueryTaskProgress probes for the cross-node task-progress
+  // validity check. Fired (fire-and-poll) by ScanTaskProgress and reaped on a
+  // later tick via Future::IsComplete() -- never awaited, so the net-processing
+  // tick that drives their transmission is never blocked on itself.
+  struct PendingProgressQuery {
+    clio::run::Future<QueryTaskProgressTask> future;
+    size_t net_key;
+    clio::run::u32 replica_id;
+  };
+  std::vector<PendingProgressQuery> pending_progress_queries_;
+
+  /**
+   * Periodic cross-node task-progress validity check (issue #628). Reaps
+   * completed probes (Gone -> complete the origin) and fires new probes for
+   * replicas the origin has waited on beyond task_progress_interval_ms.
+   */
+  void ScanTaskProgress();
   std::mt19937 probe_rng_{std::random_device{}()};
 
   // SWIM probe / suspicion timeouts. The prior 5 s direct + 3 s

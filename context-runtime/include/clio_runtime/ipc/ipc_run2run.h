@@ -72,6 +72,25 @@ struct RetryEntry {
   std::chrono::steady_clock::time_point enqueued_at;
 };
 
+/** Per-replica progress state for an in-flight cross-node origin (issue #628). */
+struct ReplicaProgress {
+  clio::run::u64 target_node_id = kInvalidNodeId;
+  bool accounted = false;  // response received, or the replica was declared lost
+};
+
+/** Per-origin progress state, keyed by net_key in progress_map_ (issue #628). */
+struct OriginProgress {
+  std::chrono::steady_clock::time_point enqueue_time;
+  std::vector<ReplicaProgress> replicas;  // indexed by replica_id
+};
+
+/** A replica the origin is still waiting on, to be probed via QueryTaskProgress. */
+struct StuckReplica {
+  clio::run::u64 net_key;
+  clio::run::u32 replica_id;
+  clio::run::u64 target_node_id;
+};
+
 /**
  * Encapsulates all run-to-run IPC state and logic: the send/recv maps,
  * retry queues, per-peer network statistics, and the SendIn / SendOut /
@@ -174,6 +193,30 @@ class IpcManagerRun2Run {
     std::lock_guard<std::mutex> lk(recv_map_mutex_);
     return recv_map_.find(recv_key) != nullptr;
   }
+
+  // ---------------------------------------------------------------------------
+  // Cross-node task-progress tracking (issue #628). The origin periodically
+  // asks each still-outstanding replica's node whether it is still alive; a
+  // Gone answer means the response will never come (lost / node restarted),
+  // so the origin completes the collective instead of hanging forever.
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Collect replicas the origin has been waiting on beyond interval_ms, to be
+   * probed via QueryTaskProgress. Only replicas whose target node is currently
+   * alive are returned (a dead target is handled by the dead-node timeout
+   * path). Throttled internally to at most once per interval_ms.
+   */
+  std::vector<StuckReplica> CollectStuckReplicas(clio::run::u32 interval_ms);
+
+  /**
+   * Record the result of a QueryTaskProgress probe. When gone is true and the
+   * replica is still outstanding, mark it lost and, once every replica is
+   * accounted for, complete the origin with a network-timeout RC (partial
+   * results from the replicas that did answer are preserved).
+   */
+  void HandleTaskProgressResult(clio::run::u64 net_key,
+                                clio::run::u32 replica_id, bool gone);
 
  private:
   // ---------------------------------------------------------------------------
@@ -295,6 +338,25 @@ class IpcManagerRun2Run {
   mutable std::mutex recv_map_mutex_;
   ctp::priv::unordered_map_ll<size_t, clio::run::shared_ptr<clio::run::Task>> send_map_;
   ctp::priv::unordered_map_ll<size_t, clio::run::shared_ptr<clio::run::Task>> recv_map_;
+
+  // Per-origin cross-node progress state, keyed by net_key (issue #628).
+  // Guarded by send_map_mutex_ (updated in lock-step with send_map_).
+  std::unordered_map<size_t, OriginProgress> progress_map_;
+  // Throttle: last time CollectStuckReplicas actually ran a scan pass.
+  std::chrono::steady_clock::time_point last_progress_scan_{};
+
+  /** Register an origin's replicas for progress tracking (called from SendIn). */
+  void RegisterOriginProgress(size_t net_key,
+                              const std::vector<clio::run::u64> &replica_targets);
+  /**
+   * Mark a replica as accounted for (a response arrived, or it was declared
+   * lost). Returns whether the caller should count it toward completion:
+   * true if this call transitioned the replica to accounted, or the origin is
+   * untracked (admin tasks -- preserve the pre-#628 unconditional count);
+   * false if the replica was already accounted (avoids double-counting when a
+   * real response races a Gone verdict).
+   */
+  bool MarkReplicaAccounted(size_t net_key, clio::run::u32 replica_id);
 
   // Retry queues for tasks that could not be sent due to dead / unreachable
   // nodes.  Guarded by retry_queues_mutex_.
