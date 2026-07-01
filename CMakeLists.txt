@@ -284,7 +284,7 @@ if(CLIO_CORE_ENABLE_DOXYGEN)
     message(STATUS "found doxygen at ${DOXYGEN_EXECUTABLE}")
 endif()
 
-# YAML-CPP - find from system or install.sh installation
+# YAML-CPP - find from system or CI/ci-deps.sh installation
 find_package(yaml-cpp REQUIRED)
 if(yaml-cpp_FOUND)
     message(STATUS "found yaml-cpp at ${yaml-cpp_DIR}")
@@ -319,7 +319,7 @@ if(CLIO_CORE_STATIC_DEPS AND NOT WIN32 AND NOT APPLE)
     endif()
 endif()
 
-# Cereal - find from system or install.sh installation
+# Cereal - find from system or CI/ci-deps.sh installation
 find_package(cereal REQUIRED)
 if(cereal_FOUND)
     message(STATUS "found cereal at ${cereal_DIR}")
@@ -670,7 +670,7 @@ if(CLIO_CORE_ENABLE_ZMQ)
         endif()
     endif()
     if(NOT _ZMQ_FOUND)
-        message(FATAL_ERROR "ZeroMQ not found. Please install ZeroMQ or run install.sh to build from submodules.")
+        message(FATAL_ERROR "ZeroMQ not found. Please install ZeroMQ or run CI/ci-deps.sh to build from submodules.")
     endif()
 endif()
 
@@ -733,7 +733,7 @@ if(CLIO_CTE_ENABLE_HDF5_VOL)
             list(APPEND HDF5_LIBRARIES CURL::libcurl)
         endif()
     else()
-        message(FATAL_ERROR "HDF5 not found. Please install HDF5 or run install.sh to build from submodules.")
+        message(FATAL_ERROR "HDF5 not found. Please install HDF5 or run CI/ci-deps.sh to build from submodules.")
     endif()
 else()
     message(STATUS "HDF5 support disabled")
@@ -1209,7 +1209,7 @@ endif()
 
 # yaml-cpp is already found by ClioCoreCommon (line 202)
 if(NOT TARGET yaml-cpp AND NOT TARGET yaml-cpp::yaml-cpp)
-  message(FATAL_ERROR "yaml-cpp was not found. Please run install.sh to install dependencies.")
+  message(FATAL_ERROR "yaml-cpp was not found. Please run CI/ci-deps.sh to install dependencies.")
 endif()
 message(STATUS "yaml-cpp already found by ClioCoreCommon")
 

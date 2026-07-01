@@ -13,7 +13,7 @@
 #   2. Starts a container and runs pip install inside it
 #   3. Installs IOWarp Core to the container's virtual environment (/opt/venv)
 #   4. Verifies the installation by checking for libraries and CMake configs
-#   Note: Dependencies are automatically downloaded/built by install.sh if not found
+#   Note: Dependencies are automatically downloaded/built by CI/ci-deps.sh if not found
 #==============================================================================
 
 set -e  # Exit on error
@@ -39,13 +39,13 @@ if [ ! -f "$PROJECT_ROOT/setup.py" ]; then
     exit 1
 fi
 
-if [ ! -f "$PROJECT_ROOT/install.sh" ]; then
-    echo "ERROR: install.sh not found in $PROJECT_ROOT"
+if [ ! -f "$PROJECT_ROOT/CI/ci-deps.sh" ]; then
+    echo "ERROR: CI/ci-deps.sh not found in $PROJECT_ROOT"
     echo "Please run this script from the docker/ directory"
     exit 1
 fi
 
-echo "✓ Found setup.py and install.sh in project root"
+echo "✓ Found setup.py and CI/ci-deps.sh in project root"
 echo ""
 
 #------------------------------------------------------------------------------
@@ -89,7 +89,7 @@ else
     echo 'Not a git repository'
 fi
 
-echo 'Note: Dependencies will be downloaded/built by install.sh if not found on system'
+echo 'Note: Dependencies will be downloaded/built by CI/ci-deps.sh if not found on system'
 
 echo ''
 echo '==================================================================='
@@ -110,7 +110,7 @@ echo '==================================================================='
 echo 'Step 2: Installing IOWarp Core with pip'
 echo '==================================================================='
 echo 'This will:'
-echo '  - Run setup.py which calls install.sh'
+echo '  - Run setup.py which calls CI/ci-deps.sh'
 echo '  - Download and build missing dependencies from GitHub releases'
 echo '  - Build and install IOWarp Core libraries'
 echo '  - Install to virtual environment at /opt/venv'
@@ -121,7 +121,7 @@ ls -la | head -20
 echo ''
 
 # pip install -v .
-bash install.sh
+bash CI/ci-deps.sh
 
 echo ''
 echo '==================================================================='

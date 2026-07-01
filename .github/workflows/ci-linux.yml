@@ -41,10 +41,10 @@ jobs:
           submodules: recursive
       - name: Install lcov
         run: sudo apt-get update && sudo apt-get install -y lcov
-      - name: Build and test using install.sh
+      - name: Build and test using CI/ci-deps.sh
         run: |
-          chmod +x install.sh
-          ./install.sh
+          chmod +x CI/ci-deps.sh
+          ./CI/ci-deps.sh
       - name: Calculate coverage
         run: |
           if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
@@ -111,8 +111,8 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libhdf5-dev liburing-dev
       - name: Install dependencies (conda env, incl. Boost.Context)
         run: |
-          chmod +x install.sh
-          ./install.sh --only-deps
+          chmod +x CI/ci-deps.sh
+          ./CI/ci-deps.sh --only-deps
       - name: Build with Boost backend + run ctest
         run: |
           if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
@@ -153,8 +153,8 @@ jobs:
           sudo apt-get install -y clang llvm libhdf5-dev
       - name: Build and test with ${{ matrix.sanitizer }}
         run: |
-          chmod +x install.sh CI/run_sanitizers.sh
-          ./install.sh
+          chmod +x CI/ci-deps.sh CI/run_sanitizers.sh
+          ./CI/ci-deps.sh
           if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
             source "$HOME/miniconda3/etc/profile.d/conda.sh"
           elif [ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]; then
@@ -184,8 +184,8 @@ jobs:
           sudo apt-get install -y libhdf5-dev liburing-dev
       - name: Install dependencies (conda env)
         run: |
-          chmod +x install.sh
-          ./install.sh --only-deps
+          chmod +x CI/ci-deps.sh
+          ./CI/ci-deps.sh --only-deps
       - name: Build with leak tracking and run leak tests
         run: |
           if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then

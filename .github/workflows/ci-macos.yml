@@ -41,13 +41,13 @@ jobs:
 
       - name: Install dependencies (conda)
         run: |
-          chmod +x install.sh
-          ./install.sh --only-deps release
+          chmod +x CI/ci-deps.sh
+          ./CI/ci-deps.sh --only-deps release
 
       - name: Configure and build
         run: |
           set -x
-          # Re-activate the conda env created by install.sh (env vars do
+          # Re-activate the conda env created by CI/ci-deps.sh (env vars do
           # not persist across GitHub Actions steps).
           if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
             source "$HOME/miniconda3/etc/profile.d/conda.sh"
@@ -148,8 +148,8 @@ jobs:
           submodules: recursive
       - name: Install dependencies (conda env, incl. Boost.Context)
         run: |
-          chmod +x install.sh
-          ./install.sh --only-deps release
+          chmod +x CI/ci-deps.sh
+          ./CI/ci-deps.sh --only-deps release
       - name: Build with Boost backend + run ctest
         run: |
           if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
