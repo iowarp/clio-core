@@ -63,7 +63,7 @@ set_tests_properties(
 # End-to-end I/O test: drives real HDF5 file/dataset/group/attr operations
 # through the connector against an in-process Chimaera/CTE runtime. Unlike the
 # registration-only suite above, this links the CTE core + admin + bdev
-# runtimes so CHIMAERA_INIT(kClient, true) stands up an in-process runtime.
+# runtimes so CLIO_INIT(kClient, true) stands up an in-process runtime.
 #------------------------------------------------------------------------------
 add_executable(test_hdf5_vol_io
     test_hdf5_vol_io.cc
