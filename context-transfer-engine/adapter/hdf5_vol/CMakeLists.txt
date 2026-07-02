@@ -50,6 +50,9 @@ set_target_properties(iowarp_hdf5_vol PROPERTIES
     CXX_STANDARD_REQUIRED ON
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    # Export all symbols so the DLL exposes H5VL_iowarp_register (and friends)
+    # to tests/consumers on Windows, where symbols are hidden by default.
+    WINDOWS_EXPORT_ALL_SYMBOLS ON
 )
 
 install(TARGETS iowarp_hdf5_vol
