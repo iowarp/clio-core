@@ -147,12 +147,12 @@ The devcontainer automatically forwards from the host:
 
 ## Path 2: Native Linux Build
 
-### Using install.sh (Recommended)
+### Using CI/ci-deps.sh (Recommended)
 
 ```bash
 git clone --recurse-submodules https://github.com/iowarp/clio-core.git
 cd clio-core
-bash install.sh release
+bash CI/ci-deps.sh release
 ```
 
 This installs Miniconda, rattler-build, and IOWarp in one script. Variants are stored in `installers/conda/variants/` — create a new one for custom machine configs.

@@ -35,6 +35,7 @@
 #define HERMES_SHM_MEMORY_ALLOCATOR_MALLOC_ALLOCATOR_H_
 
 #include "clio_ctp/memory/allocator/allocator.h"
+#include "clio_ctp/memory/allocator/leak_checker.h"
 #include <memory>
 
 namespace ctp::ipc {
@@ -94,6 +95,25 @@ class _MallocAllocator : public Allocator {
     // Always zero-initialize the tracking counter (atomic's default ctor does
     // not), so GetCurrentlyAllocatedSize() reads 0 even when tracking is off.
     total_alloc_ = 0;
+  }
+
+  /**
+   * Destructor. In leak-tracking builds (CTP_ALLOC_TRACK_SIZE) report to the
+   * process-global AllocatorLeakChecker if this allocator is being torn down
+   * with a non-empty heap — e.g. CTP_MALLOC (MallocAllocatorSingleton) at
+   * static teardown after a task/buffer/NewObj was never freed. A no-op in
+   * normal builds (total_alloc_ is a constant 0) and on the device (no
+   * process-lifetime teardown to observe).
+   */
+  CTP_CROSS_FUN
+  ~_MallocAllocator() {
+#if CTP_IS_HOST && defined(CTP_ALLOC_TRACK_SIZE)
+    size_t outstanding = static_cast<size_t>(total_alloc_.load());
+    if (outstanding != 0) {
+      ::ctp::ipc::AllocatorLeakChecker::Get().Report("MallocAllocator",
+                                                     outstanding);
+    }
+#endif
   }
 
   /**

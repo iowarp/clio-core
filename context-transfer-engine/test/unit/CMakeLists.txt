@@ -74,6 +74,12 @@ add_executable(test_reorganize_blob
     test_reorganize_blob.cc
 )
 
+# BDEV leak stress: PutBlob/DelBlob loop for a wall-clock minute, then assert
+# the bdev used capacity is 0 and the runtime leak-checker heap counter is flat.
+add_executable(test_bdev_leak_stress
+    test_bdev_leak_stress.cc
+)
+
 # GPU-runtime-era CUDA tests were removed when the GPU runtime concept
 # was retired. The kernel→CPU submission path is now exercised by:
 #   - context-runtime/test/unit/gpu/test_gpu_kernel_stress_*
@@ -265,6 +271,18 @@ target_link_libraries(test_blob_block_reuse
 
 # Link test_reorganize_blob - using simple_test.h framework (NOT Catch2)
 target_link_libraries(test_reorganize_blob
+    clio_cte_core_runtime         # CTE core runtime library
+    clio_cte_core_client          # CTE core client library
+    clio::run::admin_runtime      # Admin module runtime (required for runtime mode)
+    clio::run::admin_client       # Admin module client
+    clio::run::bdev_runtime       # Bdev module runtime (required for runtime mode)
+    clio::run::bdev_client        # Bdev client for BdevType enum
+    ctp::cxx                    # ClioCtp library
+    ${CMAKE_THREAD_LIBS_INIT}    # Threading support
+)
+
+# Link test_bdev_leak_stress - using simple_test.h framework (NOT Catch2)
+target_link_libraries(test_bdev_leak_stress
     clio_cte_core_runtime         # CTE core runtime library
     clio_cte_core_client          # CTE core client library
     clio::run::admin_runtime      # Admin module runtime (required for runtime mode)
@@ -491,6 +509,17 @@ set_tests_properties(cte_runtime_coverage_all PROPERTIES
     ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
 )
 
+# BDEV leak stress: a 1-minute PutBlob/DelBlob churn that asserts the bdev used
+# capacity returns to 0 and the runtime leak-checker heap counter stays flat.
+# Name contains "leak" so the Leak Check CI (-R "leak|...force_net") runs it.
+add_test(NAME cte_bdev_leak_stress
+    COMMAND test_bdev_leak_stress)
+set_tests_properties(cte_bdev_leak_stress PROPERTIES
+    TIMEOUT 180
+    LABELS "unit;cte;bdev;leak;stress;msan_skip"
+    ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1;CTE_LEAK_STRESS_SECONDS=60"
+)
+
 # Add tiered storage stress tests
 # NOTE: These tests are chained (Put -> Reorganize -> Integrity -> Cleanup)
 # and share global state via g_fixture, so they must run together in a single
@@ -581,6 +610,12 @@ clio_add_force_net_test(NAME cte_client_config_force_net
     COMMAND test_core_client_config ENVIRONMENT "${_cte_fn_env_basic}" TIMEOUT 600)
 clio_add_force_net_test(NAME cte_config_dpe_force_net
     COMMAND test_cte_config_dpe ENVIRONMENT "${_cte_fn_env_basic}")
+# BDEV leak stress over the loopback net path. Each Put/Del round-trips the net
+# transport (far slower than in-process), so use a shorter window — still enough
+# churn to expose a per-op leak, while keeping the CI job bounded.
+clio_add_force_net_test(NAME cte_bdev_leak_stress_force_net
+    COMMAND test_bdev_leak_stress
+    ENVIRONMENT "${_cte_fn_env_data};CTE_LEAK_STRESS_SECONDS=20" TIMEOUT 180)
 
 # NOTE: the legacy GPU CTE tests cte_gpu_coroutine / cte_gpu_core_all /
 # cte_gpu_create were removed — their executables (test_cte_gpu_coroutine /

@@ -47,9 +47,12 @@
 #include <list>
 #include <mutex>
 #include <string>
-#include <sys/stat.h>
-#include <unistd.h>
 #include <vector>
+
+#ifndef _WIN32
+#include <sys/stat.h>  // struct stat + S_IF* for fuse_cte.cc's getattr (Linux)
+#include <unistd.h>    // getuid/getgid/read used by fuse_cte.cc on Linux
+#endif
 
 #include "clio_cte/core/core_client.h"
 #include "clio_cte/core/core_tasks.h"

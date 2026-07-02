@@ -1,24 +1,24 @@
 #!/bin/bash
-# install.sh - Install IOWarp Core using conda-build
+# CI/ci-deps.sh - Install IOWarp Core using conda-build
 # This script builds and installs IOWarp Core from source
 # It will automatically install Miniconda if conda is not detected
 #
 # Usage:
-#   ./install.sh                          # Build with default (release) preset
-#   ./install.sh release                  # Build with release preset
-#   ./install.sh release-fuse             # Build with FUSE adapter enabled
-#   ./install.sh debug                    # Build with debug preset
-#   ./install.sh conda                    # Build with conda-optimized preset
-#   ./install.sh cuda                     # Build with CUDA preset
-#   ./install.sh rocm                     # Build with ROCm preset
-#   ./install.sh --only-deps [preset]     # Install ONLY iowarp-core's deps
+#   ./CI/ci-deps.sh                          # Build with default (release) preset
+#   ./CI/ci-deps.sh release                  # Build with release preset
+#   ./CI/ci-deps.sh release-fuse             # Build with FUSE adapter enabled
+#   ./CI/ci-deps.sh debug                    # Build with debug preset
+#   ./CI/ci-deps.sh conda                    # Build with conda-optimized preset
+#   ./CI/ci-deps.sh cuda                     # Build with CUDA preset
+#   ./CI/ci-deps.sh rocm                     # Build with ROCm preset
+#   ./CI/ci-deps.sh --only-deps [preset]     # Install ONLY iowarp-core's deps
 #                                         # (build+host+run from the recipe),
 #                                         # skip conda-build of iowarp-core itself.
 
 set -e  # Exit on error
 
-# Get script directory
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Get the repo root. This script lives in CI/, so the root is its parent dir.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$SCRIPT_DIR"
 
 # Parse arguments: --only-deps flag + optional positional preset

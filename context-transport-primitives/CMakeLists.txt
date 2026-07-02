@@ -332,10 +332,13 @@ if(CLIO_CTE_ENABLE_COMPRESS)
     if(TARGET dense_nn_predictor)
         target_link_libraries(compress INTERFACE dense_nn_predictor)
     endif()
-    # nvcomp.h includes <cuda_runtime.h>; the nvcomp imported target does not
-    # propagate the CUDA toolkit include dir, so link CUDA::cudart to provide it
-    # to every consumer of ctp::compress (test + CTE compressor module).
-    if(CLIO_CTP_ENABLE_NVCOMP AND TARGET CUDA::cudart)
+    # nvcomp.h / cusz.h / ndzip.h include <cuda_runtime.h>; the GPU compressor
+    # imported targets do not all propagate the CUDA toolkit include dir, so link
+    # CUDA::cudart to provide it to every consumer of ctp::compress (test + CTE
+    # compressor module) whenever any CUDA-backed compressor is enabled.
+    if((CLIO_CTP_ENABLE_NVCOMP OR CLIO_CTP_ENABLE_CUSZ OR CLIO_CTP_ENABLE_NDZIP
+        OR CLIO_CTP_ENABLE_CUSZP)
+       AND TARGET CUDA::cudart)
         target_link_libraries(compress INTERFACE CUDA::cudart)
     endif()
 endif()
@@ -344,6 +347,9 @@ target_compile_definitions(compress INTERFACE
     CTP_ENABLE_LIBPRESSIO=$<BOOL:${CLIO_CTP_ENABLE_LIBPRESSIO}>
     CTP_ENABLE_NVCOMP=$<BOOL:${CLIO_CTP_ENABLE_NVCOMP}>
     CTP_ENABLE_ZFP_SYCL=$<BOOL:${CLIO_CTP_ENABLE_ZFP_SYCL}>
+    CTP_ENABLE_CUSZ=$<BOOL:${CLIO_CTP_ENABLE_CUSZ}>
+    CTP_ENABLE_NDZIP=$<BOOL:${CLIO_CTP_ENABLE_NDZIP}>
+    CTP_ENABLE_CUSZP=$<BOOL:${CLIO_CTP_ENABLE_CUSZP}>
 )
 add_library(ctp::compress ALIAS compress)
 

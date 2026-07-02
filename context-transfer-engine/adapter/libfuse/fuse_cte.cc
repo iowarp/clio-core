@@ -37,27 +37,42 @@
 #include <cstring>
 #include <string>
 #include <vector>
-
-#include <unistd.h>               // read, getuid, getgid
 #include <cerrno>                 // errno
 #include <cstdio>                 // snprintf, fprintf
+#include <fcntl.h>                // O_CREAT, O_RDWR
 
+#ifndef _WIN32
+#include <sys/statvfs.h>          // struct statvfs (statfs op)
+#include <unistd.h>               // read, getuid, getgid
 #ifndef __APPLE__
+// Linux-only apptainer --fusemount fd-injection path: macFUSE lacks
+// fuse_session_custom_io and needs none of the mount/uio/dlsym machinery.
 #include <fuse3/fuse_lowlevel.h>  // fuse_session_custom_io, struct fuse_custom_io
 #include <dlfcn.h>                // dlsym (resolve fuse_session_custom_io at runtime
                                   // so we can link against system libfuse 3.10.5
-                                  // which lacks the symbol; only used in the
-                                  // apptainer --fusemount fd-injection path)
+                                  // which lacks the symbol)
 #include <sys/mount.h>            // mount syscall
 #include <sys/uio.h>              // struct iovec, writev
-#endif
-#include <sys/statvfs.h>          // struct statvfs (statfs op)
-#include <fcntl.h>                // O_CREAT, O_RDWR
+#endif  // __APPLE__
+#endif  // _WIN32
 
 #include "clio_runtime/clio_runtime.h"
 #include "clio_cte/core/content_transfer_engine.h"
 #include "clio_cte/core/core_client.h"  // CLIO_CTE_CLIENT + GetCapacity
 #include "clio_cte/filesystem/filesystem_client.h"
+
+// Bridge the POSIX type spellings the callbacks use to the concrete types
+// each platform's FUSE layer expects in `struct fuse_operations`. On Linux
+// (libfuse) the high-level API uses the POSIX types directly; on Windows the
+// shim maps them to WinFsp's fuse_* types and supplies getuid/getgid/S_IF*.
+#ifdef _WIN32
+#include "fuse_win_compat.h"
+#else
+using cte_stat_t = struct stat;
+using cte_off_t = off_t;
+using cte_mode_t = mode_t;
+using cte_timespec_t = struct timespec;
+#endif
 
 using namespace clio::cae::fuse;
 
@@ -142,10 +157,10 @@ static void cte_fuse_destroy(void *private_data) {
 // Metadata
 // ============================================================================
 
-static int cte_fuse_getattr_stat(const char *path, struct stat *stbuf,
+static int cte_fuse_getattr_stat(const char *path, cte_stat_t *stbuf,
                                  struct fuse_file_info *fi) {
   (void)fi;
-  memset(stbuf, 0, sizeof(struct stat));
+  memset(stbuf, 0, sizeof(*stbuf));
 
   std::string p(path);
 
@@ -186,7 +201,8 @@ static int cte_fuse_getattr_stat(const char *path, struct stat *stbuf,
       }
     }
     stbuf->st_nlink = nlink;
-    stbuf->st_size = static_cast<off_t>(t->size_);
+    // cte_off_t is off_t on Linux; the WinFsp shim maps it for Windows.
+    stbuf->st_size = static_cast<cte_off_t>(t->size_);
   }
   // Change time (ctime): the tag's last_changed_, in ns since the epoch. Tags
   // only; 0 means the chimod had no value (leave st_ctim at the epoch).
@@ -198,6 +214,8 @@ static int cte_fuse_getattr_stat(const char *path, struct stat *stbuf,
 }
 
 #ifdef __APPLE__
+// macFUSE's high-level getattr callback fills a fuse_darwin_attr, not a
+// struct stat. Compute into a struct stat (== cte_stat_t here) and translate.
 static void CopyStatToDarwinAttr(const struct stat &st,
                                  struct fuse_darwin_attr *attr) {
   memset(attr, 0, sizeof(*attr));
@@ -226,13 +244,14 @@ static int cte_fuse_getattr(const char *path, struct fuse_darwin_attr *attr,
   return 0;
 }
 #else
-static int cte_fuse_getattr(const char *path, struct stat *stbuf,
+// Linux (struct stat) and Windows (WinFsp stat via cte_stat_t).
+static int cte_fuse_getattr(const char *path, cte_stat_t *stbuf,
                             struct fuse_file_info *fi) {
   return cte_fuse_getattr_stat(path, stbuf, fi);
 }
 #endif
 
-static int cte_fuse_utimens(const char *path, const struct timespec tv[2],
+static int cte_fuse_utimens(const char *path, const cte_timespec_t tv[2],
                             struct fuse_file_info *fi) {
   (void)path;
   (void)tv;
@@ -252,7 +271,7 @@ using ClioFuseFillDirT = fuse_fill_dir_t;
 #endif
 
 static int cte_fuse_readdir(const char *path, void *buf,
-                            ClioFuseFillDirT filler, off_t offset,
+                            ClioFuseFillDirT filler, cte_off_t offset,
                             struct fuse_file_info *fi,
                             enum fuse_readdir_flags flags) {
   (void)offset;
@@ -294,7 +313,7 @@ static int cte_fuse_readdir(const char *path, void *buf,
   return 0;
 }
 
-static int cte_fuse_mkdir(const char *path, mode_t mode) {
+static int cte_fuse_mkdir(const char *path, cte_mode_t mode) {
   (void)mode;
   auto *cfs = CLIO_CFS_CLIENT;
   auto t = cfs->AsyncMkdir(std::string(path));
@@ -315,7 +334,7 @@ static int cte_fuse_rmdir(const char *path) {
 // File lifecycle
 // ============================================================================
 
-static int cte_fuse_create(const char *path, mode_t mode,
+static int cte_fuse_create(const char *path, cte_mode_t mode,
                            struct fuse_file_info *fi) {
   std::string p(path);
   auto *cfs = CLIO_CFS_CLIENT;
@@ -380,7 +399,7 @@ static int cte_fuse_release(const char *path, struct fuse_file_info *fi) {
 // ============================================================================
 
 static int cte_fuse_read(const char *path, char *buf, size_t size,
-                         off_t offset, struct fuse_file_info *fi) {
+                         cte_off_t offset, struct fuse_file_info *fi) {
   (void)path;
   auto *handle = GetHandle(fi);
   if (!handle) return -EBADF;
@@ -411,7 +430,7 @@ static int cte_fuse_read(const char *path, char *buf, size_t size,
 }
 
 static int cte_fuse_write(const char *path, const char *buf, size_t size,
-                          off_t offset, struct fuse_file_info *fi) {
+                          cte_off_t offset, struct fuse_file_info *fi) {
   (void)path;
   auto *handle = GetHandle(fi);
   if (!handle) return -EBADF;
@@ -452,7 +471,7 @@ static int cte_fuse_unlink(const char *path) {
   return rc == 0 ? 0 : -rc;
 }
 
-static int cte_fuse_truncate(const char *path, off_t size,
+static int cte_fuse_truncate(const char *path, cte_off_t size,
                              struct fuse_file_info *fi) {
   (void)fi;
   auto *cfs = CLIO_CFS_CLIENT;
@@ -551,6 +570,7 @@ static const struct fuse_operations cte_fuse_ops = {
     .utimens = cte_fuse_utimens,
 };
 
+#ifndef _WIN32
 // custom_io callbacks: when apptainer hands us an already-mounted
 // /dev/fuse fd, we need to drive the FUSE protocol on that fd directly
 // instead of having libfuse mount its own. Plain read/writev syscalls
@@ -564,10 +584,16 @@ static ssize_t cte_custom_read(int fd, void *buf, size_t buf_len,
                                void * /*userdata*/) {
   return read(fd, buf, buf_len);
 }
-#endif
+#endif  // __APPLE__
+#endif  // _WIN32
 
 int main(int argc, char *argv[]) {
-#ifdef __APPLE__
+#if defined(_WIN32) || defined(__APPLE__)
+  // Native Windows (WinFsp) and macOS (macFUSE): no Apptainer-style
+  // /dev/fuse fd injection. fuse_main() parses argv (on Windows the
+  // mountpoint is a drive letter like "Z:" or a host directory) and drives
+  // the FUSE protocol. The callbacks and the entire CTE data path below them
+  // are identical to the Linux build.
   return fuse_main(argc, argv, &cte_fuse_ops, nullptr);
 #else
   // Apptainer's --fusemount opens /dev/fuse on the host, performs the
@@ -699,5 +725,5 @@ int main(int argc, char *argv[]) {
   fuse_destroy(fuse);
   fuse_opt_free_args(&args);
   return ret;
-#endif
+#endif  // _WIN32 || __APPLE__
 }
