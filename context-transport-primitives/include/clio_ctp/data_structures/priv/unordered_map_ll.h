@@ -139,15 +139,12 @@ class unordered_map_ll {
   // it; rehash/clear/for_each take it in WRITE mode (exclusive), which drains
   // all in-flight ops first. See the THREAD-SAFETY CONTRACT above.
   ctp::RwLock global_lock_;
-  // Writer-preference signal for global_lock_. ctp::RwLock is reader-preferring:
-  // ReadLock enters whenever the lock is already in read mode, regardless of a
-  // waiting writer, and the mode only drops to "none" once readers_ hits 0. A
-  // sustained stream of inserts/finds therefore keeps readers_ > 0 forever and
-  // the rehash WriteLock can starve indefinitely (observed as a Windows
-  // livelock/timeout in the concurrent-growth stress test). This counter rises
-  // only around the rare grow/clear/iterate path; readers yield while it is
-  // nonzero so in-flight readers drain and the writer can acquire.
-  ctp::ipc::atomic<size_type> pending_writers_;
+  // Reader/writer starvation note: ctp::RwLock is reader-preferring, so a
+  // sustained insert/find stream would keep readers_ > 0 and starve the rehash
+  // WriteLock (a Windows/icx livelock/timeout in the growth stress test). Both
+  // global_read_lock() and read_lock_bucket() therefore request RwLock's opt-in
+  // writer_priority mode, which defers new readers while a writer is waiting —
+  // so no separate hand-rolled writer-preference counter is needed here.
   ctp::ipc::atomic<size_type> size_;
   AllocT *alloc_;
   Hash hash_fn_;
@@ -169,30 +166,13 @@ class unordered_map_ll {
     return hash_fn_(key) % buckets_.size();
   }
 
-  /** Read-lock a bucket (no-op when locking is disabled).
-   *
-   *  Writer-preference throttle: ctp::RwLock is reader-preferring (a reader
-   *  enters whenever the lock is already in read mode, regardless of a waiting
-   *  writer), so a sustained find() stream keeps a bucket's readers_ > 0 and can
-   *  starve insert/erase on that bucket indefinitely. That livelock is exactly
-   *  what the global_lock_ pending_writers_ counter guards against map-wide; the
-   *  per-bucket locks need the same guard or the starvation just moves down a
-   *  level (observed as a Windows/icx-only timeout in the find-during-expansion
-   *  stress test, where readers hammer a tiny bucket set while writers grow it).
-   *  Defer new readers while a writer is waiting on or holds the bucket.
-   *  Stragglers that slip past before a writer bumps writers_ are bounded — the
-   *  writer's ticket-based WriteLock drains them — so this throttles new readers
-   *  without ever blocking one forever (writers are finite per operation). */
+  /** Read-lock a bucket (no-op when locking is disabled). Uses RwLock's opt-in
+   *  writer_priority mode so a sustained find() stream can't starve insert/erase
+   *  on the bucket (see the global_lock_ starvation note above). */
   CTP_INLINE_CROSS_FUN
   void read_lock_bucket(size_type b) {
-    if constexpr (EnableLocking) {
-      while (locks_[b].writers_.load() > 0) {
-#if !CTP_IS_DEVICE_PASS
-        CTP_THREAD_MODEL->Yield();
-#endif
-      }
-      locks_[b].ReadLock(0);
-    }
+    if constexpr (EnableLocking)
+      locks_[b].ReadLock(0, /*writer_priority=*/true);
   }
   CTP_INLINE_CROSS_FUN
   void read_unlock_bucket(size_type b) {
@@ -210,38 +190,23 @@ class unordered_map_ll {
 
   /** Map-wide read lock — shared; held during every single-key operation so a
    *  concurrent rehash (which needs the write lock) cannot reallocate the
-   *  bucket/lock arrays mid-operation. No-op when locking is disabled. */
+   *  bucket/lock arrays mid-operation. Uses writer_priority so a steady op
+   *  stream can't starve the rehash writer. No-op when locking is disabled. */
   CTP_INLINE_CROSS_FUN void global_read_lock() {
-    if constexpr (EnableLocking) {
-      // Defer to a pending writer (rehash) so it cannot starve — see the
-      // pending_writers_ comment. Stragglers that slip past this check before a
-      // writer bumps the counter are bounded (the writer's WriteLock simply
-      // drains them), so this throttles new readers without blocking forever.
-      while (pending_writers_.load() > 0) {
-#if !CTP_IS_DEVICE_PASS
-        CTP_THREAD_MODEL->Yield();
-#endif
-      }
-      global_lock_.ReadLock(0);
-    }
+    if constexpr (EnableLocking)
+      global_lock_.ReadLock(0, /*writer_priority=*/true);
   }
   CTP_INLINE_CROSS_FUN void global_read_unlock() {
     if constexpr (EnableLocking) global_lock_.ReadUnlock();
   }
   /** Map-wide write lock — exclusive; taken only to grow/clear/iterate. Drains
-   *  all in-flight single-key ops (their read locks) before proceeding. Bumps
-   *  pending_writers_ first so new readers back off (writer preference). */
+   *  all in-flight single-key ops (their read locks) before proceeding; new
+   *  readers back off via RwLock's writer_priority mode (writer preference). */
   CTP_INLINE_CROSS_FUN void global_write_lock() {
-    if constexpr (EnableLocking) {
-      pending_writers_.fetch_add(1);
-      global_lock_.WriteLock(0);
-    }
+    if constexpr (EnableLocking) global_lock_.WriteLock(0);
   }
   CTP_INLINE_CROSS_FUN void global_write_unlock() {
-    if constexpr (EnableLocking) {
-      global_lock_.WriteUnlock();
-      pending_writers_.fetch_sub(1);
-    }
+    if constexpr (EnableLocking) global_lock_.WriteUnlock();
   }
 
   /** Acquire every bucket's write lock. Used for rehash / clear / for_each. */
@@ -358,7 +323,7 @@ class unordered_map_ll {
    *  @param ext_mult    multiply bucket_count by this on each rehash (>= 2) */
   explicit unordered_map_ll(size_type num_buckets = 16,
                             double ext_percent = 0.6, size_type ext_mult = 2)
-      : buckets_(CTP_MALLOC), locks_(CTP_MALLOC), pending_writers_(0), size_(0),
+      : buckets_(CTP_MALLOC), locks_(CTP_MALLOC), size_(0),
         alloc_(CTP_MALLOC), hash_fn_(), key_eq_(),
         ext_percent_(ext_percent), ext_mult_(ext_mult < 2 ? 2 : ext_mult) {
     init_buckets(num_buckets);
@@ -368,7 +333,7 @@ class unordered_map_ll {
    *  one-per-bucket and toggled by the EnableLocking template arg). */
   CTP_CROSS_FUN
   unordered_map_ll(size_type num_buckets, size_type /*num_locks_ignored*/)
-      : buckets_(CTP_MALLOC), locks_(CTP_MALLOC), pending_writers_(0), size_(0),
+      : buckets_(CTP_MALLOC), locks_(CTP_MALLOC), size_(0),
         alloc_(CTP_MALLOC), hash_fn_(), key_eq_(),
         ext_percent_(0.6), ext_mult_(2) {
     init_buckets(num_buckets);
@@ -379,7 +344,7 @@ class unordered_map_ll {
   CTP_CROSS_FUN
   explicit unordered_map_ll(AllocT *alloc, size_type num_buckets = 16,
                             double ext_percent = 0.6, size_type ext_mult = 2)
-      : buckets_(alloc), locks_(alloc), pending_writers_(0), size_(0),
+      : buckets_(alloc), locks_(alloc), size_(0),
         alloc_(alloc), hash_fn_(), key_eq_(),
         ext_percent_(ext_percent), ext_mult_(ext_mult < 2 ? 2 : ext_mult) {
     init_buckets(num_buckets);
@@ -389,7 +354,7 @@ class unordered_map_ll {
   CTP_CROSS_FUN
   unordered_map_ll(AllocT *alloc, size_type num_buckets,
                    size_type /*num_locks_ignored*/)
-      : buckets_(alloc), locks_(alloc), pending_writers_(0), size_(0),
+      : buckets_(alloc), locks_(alloc), size_(0),
         alloc_(alloc), hash_fn_(), key_eq_(),
         ext_percent_(0.6), ext_mult_(2) {
     init_buckets(num_buckets);

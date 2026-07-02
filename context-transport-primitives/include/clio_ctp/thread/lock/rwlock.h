@@ -121,10 +121,34 @@ struct RwLock {
     return *this;
   }
 
-  /** Acquire read lock */
+  /** Acquire read lock.
+   *
+   *  @param owner           legacy/unused owner id.
+   *  @param writer_priority when true, make this otherwise reader-preferring
+   *         lock writer-preferring for THIS acquisition: defer entering while a
+   *         writer is waiting on or holds the lock. This prevents a sustained
+   *         reader stream from starving writers — the reader-preferring default
+   *         lets a reader in whenever the lock is already in read mode,
+   *         regardless of a waiting writer, so writers can livelock (observed as
+   *         an icx/Windows ctest timeout in the unordered_map_ll growth stress
+   *         test). The wait happens BEFORE registering as a reader: incrementing
+   *         readers_ first and only then waiting for writers_==0 would deadlock
+   *         the writer, which spins for readers_==0. Stragglers that slip past
+   *         before a writer bumps writers_ are bounded — the writer's
+   *         ticket-based WriteLock drains them — so no reader is blocked
+   *         forever. Default false preserves the reader-preferring behavior that
+   *         reentrant callers (e.g. CoRwLock's read->read nesting) depend on. */
   CTP_CROSS_FUN
-  void ReadLock(uint32_t owner) {
+  void ReadLock(uint32_t owner, bool writer_priority = false) {
     RwLockMode::Type mode;
+
+    if (writer_priority) {
+      while (writers_.load() > 0) {
+#if !CTP_IS_DEVICE_PASS
+        CTP_THREAD_MODEL->Yield();
+#endif
+      }
+    }
 
     // Increment # readers. Check if in read mode.
     readers_.fetch_add(1);
