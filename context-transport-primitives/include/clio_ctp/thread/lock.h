@@ -34,6 +34,7 @@
 #ifndef CTP_THREAD_LOCK_H_
 #define CTP_THREAD_LOCK_H_
 
+#include "lock/cvrwlock.h"
 #include "lock/mutex.h"
 #include "lock/rwlock.h"
 #include "thread_model_manager.h"

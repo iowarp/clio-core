@@ -35,6 +35,7 @@
 #include "clio_ctp/thread/lock.h"
 #include "omp.h"
 
+using ctp::CvRwLock;
 using ctp::Mutex;
 using ctp::RwLock;
 
@@ -99,6 +100,48 @@ TEST_CASE("RwLock") {
   RwLockTest(8, 0, 1000000);
   RwLockTest(7, 1, 1000000);
   RwLockTest(4, 4, 1000000);
+}
+
+void CvRwLockTest(int producers, int consumers, size_t loop_count) {
+  size_t nthreads = producers + consumers;
+  size_t count = 0;
+  CvRwLock lock;
+
+  omp_set_dynamic(0);
+#pragma omp parallel shared(lock, nthreads, producers, consumers, loop_count, \
+                                count) num_threads(nthreads)
+  {  // NOLINT
+    int tid = omp_get_thread_num();
+
+#pragma omp barrier
+    size_t total_size = producers * loop_count;
+    if (tid < consumers) {
+      // Readers observe the shared counter under the (parallel) read lock; it
+      // must never exceed the final total while writers are still running.
+      lock.ReadLock();
+      for (size_t i = 0; i < loop_count; ++i) {
+        REQUIRE(count <= total_size);
+      }
+      lock.ReadUnlock();
+    } else {
+      // Writers increment under the exclusive lock; mutual exclusion means no
+      // increment is lost.
+      lock.WriteLock();
+      for (size_t i = 0; i < loop_count; ++i) {
+        count += 1;
+      }
+      lock.WriteUnlock();
+    }
+
+#pragma omp barrier
+    REQUIRE(count == total_size);
+  }
+}
+
+TEST_CASE("CvRwLock") {
+  CvRwLockTest(8, 0, 1000000);
+  CvRwLockTest(7, 1, 1000000);
+  CvRwLockTest(4, 4, 1000000);
 }
 
 #if CTP_ENABLE_THALLIUM

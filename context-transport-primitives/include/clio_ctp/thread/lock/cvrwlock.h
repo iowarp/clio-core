@@ -34,34 +34,41 @@
 #ifndef CTP_THREAD_CVRWLOCK_H_
 #define CTP_THREAD_CVRWLOCK_H_
 
-// `CvRwLock` -- a fair reader/writer lock built on std::mutex +
-// std::condition_variable, as an alternative to the spin-based ctp::RwLock.
+// `CvRwLock` -- a writer-preferring reader/writer lock that blocks (parks) on a
+// condition variable instead of spinning, as a sleep-friendly alternative to
+// the spin-based ctp::RwLock.
 //
-// It is writer-fair: an arriving writer announces itself (waiting_writers_)
-// which blocks NEW readers from entering, so a steady reader stream cannot
-// starve writers. Threads block on the condition variable instead of spinning,
-// so it trades the spin lock's low uncontended latency for zero CPU burn while
-// waiting. This header exists primarily so the lock-latency benchmark can
-// compare the two approaches head-to-head.
+// Readers are PARALLEL: the common no-writer read path is lock-free (a single
+// atomic increment on `readers_` guarded by an optimistic re-check of the
+// writer-intent counter) and never touches the mutex, so concurrent readers do
+// not serialize on it. The mutex + condition variable are used only on the slow
+// path -- when a reader must park behind a writer, or when a writer must wait
+// for readers to drain. (The earlier version took the mutex on every
+// ReadLock/ReadUnlock, which serialized readers and defeated the point of a
+// shared lock.)
 //
-// HOST ONLY: std::mutex / std::condition_variable are not device-safe, so the
-// class is compiled only on the host pass (mirrors mutex.h's <thread> guard).
+// Writer preference: a writer bumps `write_intent_` on arrival, which makes new
+// readers back off, so a steady reader stream cannot starve writers.
+//
+// HOST ONLY: std::atomic is fine on device, but std::mutex / condition_variable
+// are not, so the class is compiled only on the host pass (mirrors mutex.h).
 
 #include "clio_ctp/constants/macros.h"
 
 #if !CTP_IS_DEVICE_PASS
+#include <atomic>
 #include <condition_variable>
+#include <cstdint>
 #include <mutex>
 
 namespace ctp {
 
 /**
- * Fair reader/writer lock using a condition variable.
+ * Writer-preferring reader/writer lock with a lock-free parallel reader path
+ * and condition-variable blocking on the slow path.
  *
  * Method names mirror ctp::RwLock (ReadLock/ReadUnlock/WriteLock/WriteUnlock)
- * so it can be swapped in for comparison. Unlike ctp::RwLock, acquisition
- * blocks on a condition variable rather than spinning, and writers are given
- * priority over newly-arriving readers.
+ * so it can be swapped in for comparison.
  */
 class CvRwLock {
  public:
@@ -76,53 +83,68 @@ class CvRwLock {
 
   // -- reader side ----------------------------------------------------
 
-  /** Acquire the lock in shared (read) mode. Blocks while a writer holds the
-   *  lock or is waiting, so writers are not starved by a reader stream. */
+  /** Acquire the lock in shared (read) mode. Lock-free when no writer is
+   *  waiting/active; otherwise parks on the condition variable. */
   void ReadLock() {
-    std::unique_lock<std::mutex> lock(mtx_);
-    cv_.wait(lock, [this]() {
-      return !writer_active_ && waiting_writers_ == 0;
-    });
-    ++active_readers_;
+    for (;;) {
+      if (write_intent_.load() == 0) {
+        // Optimistically register as a reader, then re-check for a writer that
+        // may have arrived in between. If none, we hold the lock -- no mutex.
+        readers_.fetch_add(1);
+        if (write_intent_.load() == 0) {
+          return;
+        }
+        // A writer appeared; back out. If we were the last reader, wake it.
+        if (readers_.fetch_sub(1) == 1) {
+          std::lock_guard<std::mutex> lk(mtx_);
+          cv_.notify_all();
+        }
+      }
+      // Slow path: park until no writer is waiting/active, then retry.
+      std::unique_lock<std::mutex> lk(mtx_);
+      cv_.wait(lk, [this]() { return write_intent_.load() == 0; });
+    }
   }
 
-  /** Release a shared (read) hold. Wakes waiters once the last reader leaves. */
+  /** Release a shared (read) hold. Lock-free unless we are the last reader and
+   *  a writer is waiting, in which case we wake it. */
   void ReadUnlock() {
-    std::unique_lock<std::mutex> lock(mtx_);
-    --active_readers_;
-    if (active_readers_ == 0) {
+    if (readers_.fetch_sub(1) == 1 && write_intent_.load() > 0) {
+      std::lock_guard<std::mutex> lk(mtx_);
       cv_.notify_all();
     }
   }
 
   // -- writer side ----------------------------------------------------
 
-  /** Acquire the lock in exclusive (write) mode. Announces its arrival so new
-   *  readers back off, then waits until no reader or writer holds the lock. */
+  /** Acquire the lock in exclusive (write) mode. Announces intent so new
+   *  readers back off, then waits until no writer holds it and readers drain. */
   void WriteLock() {
-    std::unique_lock<std::mutex> lock(mtx_);
-    ++waiting_writers_;  // announce arrival to stop new readers
-    cv_.wait(lock, [this]() {
-      return !writer_active_ && active_readers_ == 0;
+    write_intent_.fetch_add(1);  // block new readers (writer preference)
+    std::unique_lock<std::mutex> lk(mtx_);
+    cv_.wait(lk, [this]() {
+      return !writer_active_ && readers_.load() == 0;
     });
-    --waiting_writers_;
     writer_active_ = true;
   }
 
-  /** Release an exclusive (write) hold and wake all waiters. Waiting writers
-   *  win the next round via the reader wait predicate (writer preference). */
+  /** Release an exclusive (write) hold; wake the next writer and/or readers. */
   void WriteUnlock() {
-    std::unique_lock<std::mutex> lock(mtx_);
+    std::lock_guard<std::mutex> lk(mtx_);
     writer_active_ = false;
+    write_intent_.fetch_sub(1);  // re-admit readers if no other writer waits
     cv_.notify_all();
   }
 
  private:
+  // Active readers. Modified lock-free on the reader fast path; read under the
+  // mutex by a waiting writer's predicate.
+  std::atomic<std::int64_t> readers_{0};
+  // Writers waiting OR active. Readers back off (do not enter) while > 0.
+  std::atomic<std::int64_t> write_intent_{0};
   std::mutex mtx_;
   std::condition_variable cv_;
-  int active_readers_ = 0;
-  bool writer_active_ = false;
-  int waiting_writers_ = 0;
+  bool writer_active_ = false;  // guarded by mtx_
 };
 
 }  // namespace ctp
