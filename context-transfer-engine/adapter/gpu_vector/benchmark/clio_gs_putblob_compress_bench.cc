@@ -64,25 +64,37 @@ using namespace std::chrono_literals;
 namespace {
 
 struct BenchOpts {
-  clio::run::u32 nblocks = 1024;
-  clio::run::u64 per_block_bytes = 4096;  // bytes each block emits per step
-  clio::run::u32 nsteps = 100;
+  // --- The core evaluation knobs ---
+  clio::run::u32 nblocks = 1024;        // number of GPU blocks (GS rows)
+  clio::run::u32 threads = 128;         // GPU threads per block
+  clio::run::u32 nsteps = 100;          // total number of GS steps
+  clio::run::u32 checkpoint_interval = 1;  // steps to wait between checkpoints
+                                           // (a checkpoint = one PutBlob/block)
+  clio::run::u32 grid_size = 1024;      // L: floats each block generates per step
+                                        // (per-block row width; bytes = 4L)
+  // --- Ancillary ---
+  clio::run::u64 per_block_bytes = 0;   // derived from grid_size (=4L); or set
+                                        // directly to override L.
+  clio::run::u64 capacity_mib = 0;      // storage/bdev capacity; 0 = auto
   clio::run::u32 gpu_id = 0;
-  clio::run::u64 capacity_mib = 0;        // storage/bdev capacity; 0 = auto
-  std::string compress_lib = "lz4";       // overridden by CLIO_CTE_COMPRESS_LIB
+  std::string compress_lib = "lz4";     // overridden by CLIO_CTE_COMPRESS_LIB
 };
 
 void PrintUsage(const char *prog) {
   std::fprintf(stderr,
                "Usage: %s [options]\n"
-               "  --blocks N            Number of GS blocks/rows (default 1024)\n"
-               "  --per-block-bytes B   Bytes each block emits per step (default 4096)\n"
-               "  --steps N             Number of GS steps (default 100)\n"
-               "  --compress-lib NAME   Compressor name (default lz4; e.g. nvcomp-lz4).\n"
-               "                        CLIO_CTE_COMPRESS_LIB env pin overrides this.\n"
-               "  --capacity-mib N      RAM storage capacity (default = 2x logical, min 256)\n"
-               "  --gpu-id N            GPU index (default 0)\n"
-               "  --help                Show this message\n",
+               "  --blocks N              Number of GPU blocks / GS rows (default 1024)\n"
+               "  --threads-per-block N   GPU threads per block (default 128)\n"
+               "  --steps N               Total number of GS steps (default 100)\n"
+               "  --checkpoint-interval N Steps to wait between checkpoints; a checkpoint\n"
+               "                          issues one compressed PutBlob per block (default 1)\n"
+               "  --grid-size L           Floats each block generates per step (row width L;\n"
+               "                          per-block bytes = 4L) (default 1024)\n"
+               "  --per-block-bytes B     Override: bytes/block/step directly (= 4L)\n"
+               "  --compress-lib NAME     Compressor (default lz4; CLIO_CTE_COMPRESS_LIB overrides)\n"
+               "  --capacity-mib N        RAM storage capacity (default = 2x stored, min 256)\n"
+               "  --gpu-id N              GPU index (default 0)\n"
+               "  --help                  Show this message\n",
                prog);
 }
 
@@ -95,15 +107,25 @@ bool ParseOpts(int argc, char *argv[], BenchOpts &opts) {
     };
     if (a == "--help" || a == "-h") { PrintUsage(argv[0]); std::exit(0); }
     else if (a == "--blocks") opts.nblocks = std::atoi(next("--blocks"));
+    else if (a == "--threads-per-block") opts.threads = std::atoi(next("--threads-per-block"));
+    else if (a == "--steps") opts.nsteps = std::atoi(next("--steps"));
+    else if (a == "--checkpoint-interval")
+      opts.checkpoint_interval = std::atoi(next("--checkpoint-interval"));
+    else if (a == "--grid-size") opts.grid_size = std::atoi(next("--grid-size"));
     else if (a == "--per-block-bytes")
       opts.per_block_bytes = std::strtoull(next("--per-block-bytes"), nullptr, 10);
-    else if (a == "--steps") opts.nsteps = std::atoi(next("--steps"));
     else if (a == "--compress-lib") opts.compress_lib = next("--compress-lib");
     else if (a == "--capacity-mib")
       opts.capacity_mib = std::strtoull(next("--capacity-mib"), nullptr, 10);
     else if (a == "--gpu-id") opts.gpu_id = std::atoi(next("--gpu-id"));
     else { std::fprintf(stderr, "Unknown arg: %s\n", a.c_str()); PrintUsage(argv[0]); return false; }
   }
+  // grid_size (L) is the primary knob; per_block_bytes derives from it unless
+  // the user set per_block_bytes explicitly.
+  if (opts.per_block_bytes == 0) opts.per_block_bytes = (clio::run::u64)opts.grid_size * sizeof(float);
+  else opts.grid_size = (clio::run::u32)(opts.per_block_bytes / sizeof(float));
+  if (opts.checkpoint_interval == 0) opts.checkpoint_interval = 1;
+  if (opts.threads == 0) opts.threads = 128;
   return true;
 }
 
@@ -215,18 +237,25 @@ int main(int argc, char *argv[]) {
   if (compress_lib < 0) { eff_lib = "lz4";
     compress_lib = ctp::CompressionFactory::WireIdForName("lz4"); }
 
-  clio::run::u64 logical_total = snap_bytes * (clio::run::u64)rows * opts.nsteps;
+  // A checkpoint (one PutBlob/block) happens every `checkpoint_interval` steps,
+  // plus a final flush. Data actually stored = snapshots at checkpoints only.
+  const clio::run::u32 num_ckpts =
+      (opts.nsteps + opts.checkpoint_interval - 1) / opts.checkpoint_interval;
+  clio::run::u64 logical_total = snap_bytes * (clio::run::u64)rows * num_ckpts;
   clio::run::u64 capacity_mib =
       opts.capacity_mib > 0 ? opts.capacity_mib
                             : std::max<clio::run::u64>(256, (logical_total >> 20) * 2 + 64);
 
   std::fprintf(stderr,
                "[BENCH] GS transparent-compressed PutBlob\n"
-               "[BENCH] blocks=%d cols=%d snap/step=%llu B steps=%u logical=%llu MB\n"
+               "[BENCH] blocks=%u threads/block=%u grid L=%u (snap/block=%llu B)\n"
+               "[BENCH] steps=%u checkpoint-interval=%u -> %u checkpoints, logical=%llu MB\n"
                "[BENCH] compress-lib=%s (wire=%d; CLIO_CTE_COMPRESS_LIB pin overrides)\n",
-               rows, cols, (unsigned long long)snap_bytes, opts.nsteps,
+               opts.nblocks, opts.threads, opts.grid_size,
+               (unsigned long long)snap_bytes,
+               opts.nsteps, opts.checkpoint_interval, num_ckpts,
                (unsigned long long)(logical_total >> 20),
-               opts.compress_lib.c_str(), compress_lib);
+               eff_lib.c_str(), compress_lib);
 
   EnsureInit(capacity_mib);
   auto *cte_client = CLIO_CTE_CLIENT;
@@ -252,7 +281,7 @@ int main(int argc, char *argv[]) {
   std::memset(shm_buf[0].ptr_, 0, field_bytes);
   std::memset(shm_buf[1].ptr_, 0, field_bytes);
 
-  GsInitKernel<<<rows, 128>>>(u, v, rows, cols);
+  GsInitKernel<<<rows, opts.threads>>>(u, v, rows, cols);
   ctp::GpuApi::Synchronize();
 
   // --- Direct compression-ratio measurement ---
@@ -263,7 +292,7 @@ int main(int argc, char *argv[]) {
   // the timed loop.
   double measured_ratio = 0.0;
   {
-    GsStepKernel<<<rows, 128>>>(u, v, u2, v2, snap_dev[0], rows, cols);
+    GsStepKernel<<<rows, opts.threads>>>(u, v, u2, v2, snap_dev[0], rows, cols);
     ctp::GpuApi::Synchronize();
     ctp::GpuApi::Memcpy<float>(reinterpret_cast<float *>(shm_buf[0].ptr_),
                                snap_dev[0], field_bytes);
@@ -315,29 +344,42 @@ int main(int argc, char *argv[]) {
   using clock = std::chrono::steady_clock;
   auto t0 = clock::now();
 
+  clio::run::u32 ckpt = 0;  // checkpoint counter (drives the double buffer)
   for (clio::run::u32 s = 0; s < opts.nsteps; ++s) {
-    const int slot = s & 1;
-    drain_slot(slot);  // finish this slot's prior in-flight puts before reuse
+    // A checkpoint fires every `checkpoint_interval` steps, plus the final step.
+    const bool is_ckpt = ((s + 1) % opts.checkpoint_interval == 0) ||
+                         (s + 1 == opts.nsteps);
+    const int slot = ckpt & 1;
 
-    GsStepKernel<<<rows, 128>>>(u, v, u2, v2, snap_dev[slot], rows, cols);
+    // The GS step always advances the field, writing its snapshot into the
+    // upcoming checkpoint's device buffer (overwritten harmlessly on the
+    // non-checkpoint steps in between).
+    GsStepKernel<<<rows, opts.threads>>>(u, v, u2, v2, snap_dev[slot], rows, cols);
     ctp::GpuApi::Synchronize();
-    ctp::GpuApi::Memcpy<float>(reinterpret_cast<float *>(shm_buf[slot].ptr_),
-                               snap_dev[slot], field_bytes);
 
-    for (int b = 0; b < rows; ++b) {
-      clio::cte::core::Context ctx;
+    if (is_ckpt) {
+      // Free this slot's staging buffer (previous checkpoint's puts) before we
+      // overwrite it, so compute of the next interval overlaps this store.
+      drain_slot(slot);
+      ctp::GpuApi::Memcpy<float>(reinterpret_cast<float *>(shm_buf[slot].ptr_),
+                                 snap_dev[slot], field_bytes);
+      for (int b = 0; b < rows; ++b) {
+        clio::cte::core::Context ctx;
 #if CTP_ENABLE_COMPRESS
-      ctx.dynamic_compress_ = 1;          // static compression path
-      ctx.compress_lib_ = compress_lib;   // env pin overrides in the runtime
-      ctx.compress_preset_ = 2;           // balanced
+        ctx.dynamic_compress_ = 1;          // static compression path
+        ctx.compress_lib_ = compress_lib;   // env pin overrides in the runtime
+        ctx.compress_preset_ = 2;           // balanced
 #endif
-      ctp::ipc::ShmPtr<> ptr = shm_buf[slot].shm_.template Cast<void>();
-      ptr.off_ += (clio::run::u64)b * cols * sizeof(float);
-      std::string blob_name = "gs_b" + std::to_string(b) + "_s" + std::to_string(s);
-      inflight[slot][b] = cte_client->AsyncPutBlob(
-          tag_id, blob_name, /*offset=*/clio::run::u64(0), snap_bytes, ptr,
-          /*score=*/0.5f, ctx, /*flags=*/clio::run::u32(0));
-      busy[slot][b] = 1;
+        ctp::ipc::ShmPtr<> ptr = shm_buf[slot].shm_.template Cast<void>();
+        ptr.off_ += (clio::run::u64)b * cols * sizeof(float);
+        std::string blob_name =
+            "gs_b" + std::to_string(b) + "_c" + std::to_string(ckpt);
+        inflight[slot][b] = cte_client->AsyncPutBlob(
+            tag_id, blob_name, /*offset=*/clio::run::u64(0), snap_bytes, ptr,
+            /*score=*/0.5f, ctx, /*flags=*/clio::run::u32(0));
+        busy[slot][b] = 1;
+      }
+      ++ckpt;
     }
     std::swap(u, u2);
     std::swap(v, v2);
@@ -357,11 +399,15 @@ int main(int argc, char *argv[]) {
                           ? (logical_total / ratio) / (double)(1ULL << 20)
                           : 0.0;
   std::fprintf(stderr,
-               "\n[SUMMARY] steps=%u blocks=%d put_failures=%d\n"
-               "[SUMMARY] total=%.3f ms  %.2f us/step  logical=%llu MB\n"
+               "\n[SUMMARY] blocks=%u threads/block=%u grid_L=%u steps=%u "
+               "ckpt_interval=%u checkpoints=%u put_failures=%d\n"
+               "[SUMMARY] total=%.3f ms  %.2f us/step  %.2f us/ckpt  logical=%llu MB\n"
                "[SUMMARY] compressor=%s  ratio=%.2fx  stored~%.1f MiB\n"
                "[SUMMARY] logical throughput=%.1f MiB/s  effective(stored)=%.1f MiB/s\n",
-               opts.nsteps, rows, put_failures, ms, (ms * 1e3) / opts.nsteps,
+               opts.nblocks, opts.threads, opts.grid_size, opts.nsteps,
+               opts.checkpoint_interval, num_ckpts, put_failures,
+               ms, (ms * 1e3) / opts.nsteps,
+               num_ckpts ? (ms * 1e3) / num_ckpts : 0.0,
                (unsigned long long)(logical_total >> 20),
                eff_lib.c_str(), ratio, stored_mib,
                (logical_total / (double)(1ULL << 20)) / (ms / 1e3),
