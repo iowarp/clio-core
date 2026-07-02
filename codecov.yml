@@ -9,6 +9,38 @@ coverage:
         target: 50%
         threshold: 5%
 
+# Phased coverage (build-and-test phases: unit, fuse, cae, cee, cluster). Each
+# phase runs only its tests and uploads only the coverage for the code it
+# exercises, under its own flag. carryforward keeps a phase's coverage in the
+# merged report on commits where that phase didn't run (or a matrix leg was
+# skipped), so total/patch coverage stays complete.
+flag_management:
+  default_rules:
+    carryforward: true
+
+# Path-based components give per-area coverage independent of which phase
+# produced the data.
+component_management:
+  individual_components:
+    - component_id: runtime
+      name: Context Runtime
+      paths: ["context-runtime/**"]
+    - component_id: ctp
+      name: Context Transport Primitives
+      paths: ["context-transport-primitives/**"]
+    - component_id: cte
+      name: Context Transfer Engine
+      paths: ["context-transfer-engine/core/**"]
+    - component_id: fuse
+      name: FUSE adapter
+      paths: ["context-transfer-engine/adapter/**"]
+    - component_id: cae
+      name: Context Assimilation Engine
+      paths: ["context-assimilation-engine/**"]
+    - component_id: cee
+      name: Context Exploration Engine
+      paths: ["context-exploration-engine/**"]
+
 ignore:
   - "**/test/**"
   - "**/tests/**"

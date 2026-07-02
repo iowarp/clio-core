@@ -19,33 +19,88 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # ---- Standard release build + ctest + coverage (amd64, arm64) -------------
+  # ---- Phased build + ctest + coverage --------------------------------------
+  # Each phase builds only the config it needs, runs only its labeled tests, and
+  # uploads coverage scoped to the code it exercises under its own Codecov flag
+  # (issue: phased coverage). Codecov merges the flags (carryforward on) into one
+  # report. The multi-node cluster phase (deps-cpu container + docker-compose
+  # node containers, with gcov pulled out of the nodes) is folded in next; until
+  # then it still runs, without coverage, in cluster-tests.yml.
   build-test:
-    name: build-test (${{ matrix.flags }})
+    name: build-test (${{ matrix.phase }} ${{ matrix.arch }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-24.04
-            site: ubu-24.amd64
-            flags: amd64
-          - os: ubuntu-24.04-arm
-            site: ubu-24.arm64
-            flags: arm64
+          # Core unit tests: everything except adapter/integration/docker/cae/cee
+          # (PHASE_CTEST_INCLUDE_LABELS empty => script's default exclude set).
+          - phase: unit
+            arch: amd64
+            os: ubuntu-24.04
+            site: ubu-24.amd64.unit
+            flag: unit
+            apt: ""
+            cmake_args: ""
+            labels: ""
+            extract: ""
+          - phase: unit
+            arch: arm64
+            os: ubuntu-24.04-arm
+            site: ubu-24.arm64.unit
+            flag: unit
+            apt: ""
+            cmake_args: ""
+            labels: ""
+            extract: ""
+          # FUSE adapter: native libfuse3, run FUSE/adapter tests, scope coverage
+          # to the adapter tree.
+          - phase: fuse
+            arch: amd64
+            os: ubuntu-24.04
+            site: ubu-24.amd64.fuse
+            flag: fuse
+            apt: "libfuse3-dev fuse3"
+            cmake_args: "-DCLIO_CTE_ENABLE_FUSE_ADAPTER=ON -DCLIO_CTE_ENABLE_FILESYSTEM=ON"
+            labels: "fuse|adapter|copy_workspace"
+            extract: "*/context-transfer-engine/adapter/*"
+          # Context Assimilation Engine
+          - phase: cae
+            arch: amd64
+            os: ubuntu-24.04
+            site: ubu-24.amd64.cae
+            flag: cae
+            apt: ""
+            cmake_args: "-DCLIO_CORE_ENABLE_CAE=ON"
+            labels: "cae"
+            extract: "*/context-assimilation-engine/*"
+          # Context Exploration Engine
+          - phase: cee
+            arch: amd64
+            os: ubuntu-24.04
+            site: ubu-24.amd64.cee
+            flag: cee
+            apt: ""
+            cmake_args: "-DCLIO_CORE_ENABLE_CEE=ON"
+            labels: "cee"
+            extract: "*/context-exploration-engine/*"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
         with:
           submodules: recursive
-      - name: Install lcov
-        run: sudo apt-get update && sudo apt-get install -y lcov
-      - name: Build and test using CI/ci-deps.sh
+      - name: Install lcov (+ phase deps)
+        run: sudo apt-get update && sudo apt-get install -y lcov ${{ matrix.apt }}
+      - name: Install project dependencies (CI/ci-deps.sh)
         run: |
           chmod +x CI/ci-deps.sh
           ./CI/ci-deps.sh
-      - name: Calculate coverage
+      - name: Calculate coverage (${{ matrix.phase }})
+        env:
+          PHASE_CMAKE_ARGS: ${{ matrix.cmake_args }}
+          PHASE_CTEST_INCLUDE_LABELS: ${{ matrix.labels }}
+          PHASE_EXTRACT_PATHS: ${{ matrix.extract }}
         run: |
           if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
             source "$HOME/miniconda3/etc/profile.d/conda.sh"
@@ -61,7 +116,7 @@ jobs:
         uses: codecov/codecov-action@v5
         with:
           files: build/coverage_filtered.info
-          flags: ${{ matrix.flags }}
+          flags: ${{ matrix.flag }}
           token: ${{ secrets.CODECOV_TOKEN }}
           slug: iowarp/clio-core
 
