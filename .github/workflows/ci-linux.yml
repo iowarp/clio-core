@@ -62,8 +62,14 @@ jobs:
             site: ubu-24.amd64.fuse
             flag: fuse
             apt: "libfuse3-dev fuse3"
+            # System libfuse3's fuse3.pc lives here; the conda build otherwise
+            # only sees the conda env's pkg-config path and reports FUSE3 missing.
+            pkgconfig: "/usr/lib/x86_64-linux-gnu/pkgconfig"
             cmake_args: "-DCLIO_CTE_ENABLE_FUSE_ADAPTER=ON -DCLIO_CTE_ENABLE_FILESYSTEM=ON"
-            labels: "fuse|adapter|copy_workspace"
+            labels: "fuse|adapter"
+            # Skip the live-mount suites (real FUSE mount needs /dev/fuse +
+            # privileges); those run in ci-adapters' mount-smoke step for now.
+            exclude_labels: "docker|copy_workspace|integration"
             extract: "*/context-transfer-engine/adapter/*"
           # Context Assimilation Engine
           - phase: cae
@@ -100,7 +106,9 @@ jobs:
         env:
           PHASE_CMAKE_ARGS: ${{ matrix.cmake_args }}
           PHASE_CTEST_INCLUDE_LABELS: ${{ matrix.labels }}
+          PHASE_CTEST_EXCLUDE_LABELS: ${{ matrix.exclude_labels }}
           PHASE_EXTRACT_PATHS: ${{ matrix.extract }}
+          PKG_CONFIG_PATH: ${{ matrix.pkgconfig }}
         run: |
           if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
             source "$HOME/miniconda3/etc/profile.d/conda.sh"

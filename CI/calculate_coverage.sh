@@ -153,6 +153,7 @@ COVERAGE_EXCLUDE_NAMES="cr_bdev_|cr_mpi_|cr_per_process_shm_stress"
 # ---------------------------------------------------------------------------
 PHASE_CMAKE_ARGS="${PHASE_CMAKE_ARGS:-}"
 PHASE_CTEST_INCLUDE_LABELS="${PHASE_CTEST_INCLUDE_LABELS:-}"
+PHASE_CTEST_EXCLUDE_LABELS="${PHASE_CTEST_EXCLUDE_LABELS:-}"
 PHASE_EXTRACT_PATHS="${PHASE_EXTRACT_PATHS:-}"
 if [ -n "${PHASE_CTEST_INCLUDE_LABELS}" ]; then
     print_info "Phased run: labels='${PHASE_CTEST_INCLUDE_LABELS}' extra_cmake='${PHASE_CMAKE_ARGS}'"
@@ -245,6 +246,9 @@ if [ "$DO_CTEST" = true ]; then
     # (unit) run keeps the historical slow/daemon/integration exclusions.
     if [ -n "${PHASE_CTEST_INCLUDE_LABELS}" ]; then
         CTEST_TEST_SELECT="INCLUDE_LABEL \"${PHASE_CTEST_INCLUDE_LABELS}\""
+        if [ -n "${PHASE_CTEST_EXCLUDE_LABELS}" ]; then
+            CTEST_TEST_SELECT="${CTEST_TEST_SELECT} EXCLUDE_LABEL \"${PHASE_CTEST_EXCLUDE_LABELS}\""
+        fi
     else
         CTEST_TEST_SELECT="EXCLUDE_LABEL \"${COVERAGE_EXCLUDE_LABELS}\" EXCLUDE \"${COVERAGE_EXCLUDE_NAMES}\""
     fi
@@ -275,9 +279,11 @@ EOFCMAKE
     else
         CTEST_EXIT_CODE=0
         if [ -n "${PHASE_CTEST_INCLUDE_LABELS}" ]; then
-            print_info "Running phase tests (labels: ${PHASE_CTEST_INCLUDE_LABELS})..."
+            print_info "Running phase tests (labels: ${PHASE_CTEST_INCLUDE_LABELS}, exclude: ${PHASE_CTEST_EXCLUDE_LABELS:-none})..."
+            PHASE_LE_ARGS=()
+            [ -n "${PHASE_CTEST_EXCLUDE_LABELS}" ] && PHASE_LE_ARGS=(-LE "${PHASE_CTEST_EXCLUDE_LABELS}")
             ctest --output-on-failure --timeout 120 \
-                -L "${PHASE_CTEST_INCLUDE_LABELS}" || CTEST_EXIT_CODE=$?
+                -L "${PHASE_CTEST_INCLUDE_LABELS}" "${PHASE_LE_ARGS[@]}" || CTEST_EXIT_CODE=$?
         else
             print_info "Running unit tests (excluding slow/daemon tests)..."
             ctest --output-on-failure --timeout 120 \

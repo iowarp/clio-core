@@ -207,14 +207,14 @@ static std::vector<fs::path> CollectFiles() {
 
 class CopyWorkspaceFixture {
  public:
-  static constexpr chi::u64 kCopyTargetSize = 64ULL * 1024 * 1024;
+  static constexpr clio::run::u64 kCopyTargetSize = 64ULL * 1024 * 1024;
   static inline bool g_initialized = false;
 
   CopyWorkspaceFixture() {
     if (!g_initialized) {
       bool success = clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true);
       REQUIRE(success);
-      SimpleTest::g_test_finalize = chi::CHIMAERA_FINALIZE;
+      SimpleTest::g_test_finalize = clio::run::CLIO_RUNTIME_FINALIZE;
 
       std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
@@ -233,11 +233,11 @@ class CopyWorkspaceFixture {
       create_task.Wait();
       REQUIRE(create_task->GetReturnCode() == 0);
 
-      chi::PoolId bdev_pool_id(951, 0);
+      clio::run::PoolId bdev_pool_id(951, 0);
       std::string target_name = "cte_fuse_copy_workspace_ram";
       auto reg_task = cte_client->AsyncRegisterTarget(
           target_name, clio::run::bdev::BdevType::kRam, kCopyTargetSize,
-          chi::PoolQuery::DirectHash(0), bdev_pool_id);
+          clio::run::PoolQuery::DirectHash(0), bdev_pool_id);
       reg_task.Wait();
       REQUIRE(reg_task->GetReturnCode() == 0);
 
