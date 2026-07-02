@@ -213,7 +213,14 @@ CONDA_BIN="${CONDA_BASE}/bin/conda"
 
 if ! "$CONDA_BIN" build --version &> /dev/null; then
     echo -e "${YELLOW}Installing conda-build into base environment...${NC}"
-    "$CONDA_BIN" install -n base -y conda-build -c conda-forge
+    # Retry: conda's package-cache sqlite can transiently report
+    # "database is locked" and conda-forge occasionally 502s during the
+    # solve; a short back-off clears both (observed as an arm64 CI flake).
+    for _attempt in 1 2 3; do
+        "$CONDA_BIN" install -n base -y conda-build -c conda-forge && break
+        echo -e "${YELLOW}conda-build install failed (attempt $_attempt/3), retrying in $((10 * _attempt))s...${NC}"
+        sleep $((10 * _attempt))
+    done
     echo ""
 fi
 
@@ -293,9 +300,20 @@ if [ "$ONLY_DEPS" = true ]; then
     # No --python: the recipe's conda_build_config.yaml `python:` pin
     # drives the variant. Passing --python on the CLI overrides that
     # pin and trips conda-build's execute_download_actions IndexError.
-    if ! "$CONDA_BIN" render "$RECIPE_DIR" \
-            -c conda-forge \
-            -f "$RENDERED" >/dev/null 2>&1; then
+    # Retry: render performs a solve and can hit the same transient
+    # "database is locked" / conda-forge 502 flakes as the installs above.
+    _render_ok=0
+    for _attempt in 1 2 3; do
+        if "$CONDA_BIN" render "$RECIPE_DIR" \
+                -c conda-forge \
+                -f "$RENDERED" >/dev/null 2>&1; then
+            _render_ok=1
+            break
+        fi
+        echo -e "${YELLOW}conda render failed (attempt $_attempt/3), retrying in $((10 * _attempt))s...${NC}"
+        sleep $((10 * _attempt))
+    done
+    if [ "$_render_ok" -ne 1 ]; then
         echo -e "${RED}conda render failed${NC}"
         rm -f "$RENDERED"
         exit 1
