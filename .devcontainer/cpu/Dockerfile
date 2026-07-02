@@ -12,10 +12,18 @@ RUN userdel -r ubuntu || true
 # so a devcontainer rebuild picks it up immediately; it is also in the base
 # image (docker/iowarp-base.Dockerfile) as the canonical default. The
 # container runs --privileged, so /dev/fuse + SYS_ADMIN are available.
-RUN apt-get update && apt-get install -y --no-install-recommends \
+#
+# deps-cpu has no ROCm, so apt is healthy here — but keep the same self-healing
+# form as the nvidia/ml devcontainers (issue #670) so the three stay in sync.
+# The HIP purge is a harmless no-op on this image.
+RUN set -eux; \
+    dpkg -P --force-all hipcc hip-dev hip-runtime-amd rocm-llvm hsa-rocr-dev rocm-device-libs 2>/dev/null || true; \
+    apt-get update; \
+    DEBIAN_FRONTEND=noninteractive apt-get --fix-broken install -y || true; \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       fuse3 libfuse3-dev \
-      libboost-context-dev libboost-dev \
-    && rm -rf /var/lib/apt/lists/*
+      libboost-context-dev libboost-dev; \
+    rm -rf /var/lib/apt/lists/*
 
 # Build the Boost.Context stackful coroutine backend by default in the
 # devcontainer so it is exercised during development (issue #620). Build tooling

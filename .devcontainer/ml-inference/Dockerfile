@@ -9,10 +9,22 @@ USER root
 # so a devcontainer rebuild picks it up immediately; it is also in the base
 # image (docker/iowarp-base.Dockerfile) as the canonical default. The
 # container runs --privileged, so /dev/fuse + SYS_ADMIN are available.
-RUN apt-get update && apt-get install -y --no-install-recommends \
+#
+# deps-ml inherits deps-nvidia, which force-installs the HIP-NVCC `hip-dev`
+# headers with `dpkg -i --force-depends` and deliberately never installs the
+# AMD-flavored hip-runtime-amd / rocm-llvm / hsa-rocr-dev / hipcc, leaving apt
+# in a broken-deps state (deps-nvidia.Dockerfile:196-199). apt refuses to run
+# ANY install while those phantom deps are unmet, which aborts this layer with
+# exit 100 (issue #670). Purge the unsatisfiable HIP metapackages and repair
+# the dependency tree first so the fuse/boost install can proceed.
+RUN set -eux; \
+    dpkg -P --force-all hipcc hip-dev hip-runtime-amd rocm-llvm hsa-rocr-dev rocm-device-libs 2>/dev/null || true; \
+    apt-get update; \
+    DEBIAN_FRONTEND=noninteractive apt-get --fix-broken install -y || true; \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       fuse3 libfuse3-dev \
-      libboost-context-dev libboost-dev \
-    && rm -rf /var/lib/apt/lists/*
+      libboost-context-dev libboost-dev; \
+    rm -rf /var/lib/apt/lists/*
 
 # Boost.Context stackful coroutine backend available + on by default (issue #620).
 ENV CLIO_CORE_ENABLE_BOOST_COROUTINES=ON
