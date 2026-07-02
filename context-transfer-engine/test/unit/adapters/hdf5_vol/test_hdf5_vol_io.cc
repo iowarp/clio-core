@@ -54,8 +54,12 @@ hid_t setupVolEnvironment() {
   }
 
   // Small chunk size so the multi-chunk AsyncPutBlob loop is exercised even by
-  // a modest dataset (16 KiB / 4 KiB = 4 chunks).
+  // a modest dataset (16 KiB / 4 KiB = 4 chunks). setenv is POSIX-only.
+#ifdef _WIN32
+  _putenv_s("IOWARP_VOL_CHUNK_SIZE", "4096");
+#else
   setenv("IOWARP_VOL_CHUNK_SIZE", "4096", 1);
+#endif
 
   REQUIRE(clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true));
   SimpleTest::g_test_finalize = clio::run::CLIO_RUNTIME_FINALIZE;
