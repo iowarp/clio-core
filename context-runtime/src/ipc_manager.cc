@@ -622,6 +622,12 @@ void IpcManager::ServerFinalize() {
   // Clear main allocator pointer
   main_allocator_ = nullptr;
 
+  // Leak scan while the SHM segments are still mapped (alloc_vector_ is not
+  // cleared here). This is the reliable trigger for the IpcManager leak scan:
+  // the CLIO_IPC global is intentionally leaked, so ~IpcManager rarely runs.
+  // No-op unless built with CTP_ALLOC_TRACK_SIZE (CLIO_CORE_ENABLE_LEAK_CHECK).
+  ReportRuntimeLeaks("ServerFinalize");
+
   is_initialized_ = false;
 }
 
@@ -1637,6 +1643,66 @@ size_t IpcManager::GetRuntimeHeapAllocatedBytes() const {
   return total;
 #else
   return 0;
+#endif
+}
+
+size_t IpcManager::ReportRuntimeLeaks(const char *phase) const {
+#if defined(CTP_ALLOC_TRACK_SIZE) && CTP_IS_HOST
+  // Private heap (NewTask/NewObj/client-ZMQ buffers). At shutdown this
+  // legitimately still holds process-lifetime runtime state (pools, config,
+  // module manager) that is only released at static teardown -- so report it at
+  // INFO, NOT as a leak, to avoid false positives. Genuinely unfreed CTP_MALLOC
+  // allocations are caught for real by the MallocAllocator destructor
+  // (ctp::ipc::AllocatorLeakChecker) which runs at static teardown, after that
+  // process-lifetime state is gone.
+  const size_t priv = CTP_MALLOC->GetCurrentlyAllocatedSize();
+  if (priv != 0) {
+    HLOG(kInfo,
+         "[leak][runtime] {}: CTP_MALLOC private heap holds {} bytes (may be "
+         "process-lifetime state; verified clean at static teardown)",
+         phase, priv);
+  }
+
+  // Per-process SHM segments the runtime's AllocateBuffer draws from. These
+  // MultiProcessAllocators are placement-constructed in shared memory and never
+  // get a C++ destructor, so this scan is the ONLY place their leaks surface.
+  // Every buffer MUST be freed by shutdown, so any outstanding bytes here are a
+  // real shared-memory leak (reported at ERROR). This is the return value.
+  size_t shm_leaked = 0;
+  {
+    std::lock_guard<std::mutex> lock(shm_mutex_);
+    for (size_t i = 0; i < alloc_vector_.size(); ++i) {
+      auto *alloc = alloc_vector_[i];
+      if (alloc == nullptr) {
+        continue;
+      }
+      const size_t out = alloc->GetCurrentlyAllocatedSize();
+      if (out != 0) {
+        shm_leaked += out;
+        HLOG(kError,
+             "[leak][runtime] {}: SHM allocator #{} leaked {} bytes "
+             "(outstanding at shutdown)",
+             phase, i, out);
+      }
+    }
+  }
+
+  if (shm_leaked == 0) {
+    HLOG(kInfo, "[leak][runtime] {}: no outstanding SHM buffers", phase);
+  } else {
+    HLOG(kError, "[leak][runtime] {}: {} total SHM bytes leaked", phase,
+         shm_leaked);
+  }
+  return shm_leaked;
+#else
+  (void)phase;
+  return 0;
+#endif
+}
+
+IpcManager::~IpcManager() {
+#if defined(CTP_ALLOC_TRACK_SIZE) && CTP_IS_HOST
+  ReportRuntimeLeaks("~IpcManager");
 #endif
 }
 

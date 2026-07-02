@@ -249,7 +249,7 @@ NEVER DO MOCK CODE OR STUB CODE UNLESS SPECIFICALLY STATED OTHERWISE. ALWAYS IMP
 - Do NOT use conda in the devcontainer — it is not configured there
 
 **Outside the Devcontainer:**
-- Option 1 (Recommended): Run `install.sh` to build dependencies from source
+- Option 1 (Recommended): Run `CI/ci-deps.sh` to build dependencies from source
 - Option 2: Use system packages via apt
 - Option 3: Use conda via `installers/conda/` recipes
 
@@ -939,7 +939,7 @@ export CLIO_X=IPC
 
 ### Building Bundled Wheels
 
-IOWarp Core can be packaged as a self-contained Python wheel that includes all dependencies installed by `install.sh`.
+IOWarp Core can be packaged as a self-contained Python wheel that includes all dependencies installed by `CI/ci-deps.sh`.
 
 **Quick Build:**
 ```bash
@@ -953,7 +953,7 @@ python -m build --wheel
 
 **What Gets Bundled:**
 - All IOWarp libraries (libclio_run_cxx.so, libclio_ctp_host.so, Module libraries)
-- Dependencies from install.sh (Boost, HDF5, ZeroMQ, yaml-cpp, etc.)
+- Dependencies from CI/ci-deps.sh (Boost, HDF5, ZeroMQ, yaml-cpp, etc.)
 - Command-line tools (clio_cte, clio_cae, clio_run, etc.)
 - Headers and CMake configuration files
 - Conda dependencies (if building in a Conda environment)
