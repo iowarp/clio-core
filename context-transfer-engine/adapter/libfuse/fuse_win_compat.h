@@ -61,6 +61,17 @@ using cte_stat_t = struct fuse_stat;
 using cte_off_t = fuse_off_t;
 using cte_mode_t = fuse_mode_t;
 using cte_timespec_t = struct fuse_timespec;
+// statfs() reports through struct fuse_statvfs on WinFsp; the callback param
+// uses cte_statvfs_t so its signature matches fuse_operations::statfs on both
+// platforms (the bare `struct statvfs` spelling is not declared on MSVC).
+using cte_statvfs_t = struct fuse_statvfs;
+
+// Integer field types the shared callback bodies spell the POSIX way, but which
+// WinFsp only provides under fuse_-prefixed names (MSVC has no <sys/stat.h> /
+// <sys/statvfs.h> to declare the bare spellings).
+using nlink_t = fuse_nlink_t;
+using fsblkcnt_t = fuse_fsblkcnt_t;
+using fsfilcnt_t = fuse_fsfilcnt_t;
 
 // --- File mode bits --------------------------------------------------------
 // POSIX octal values; fuse_stat::st_mode uses the same encoding. Guarded in

@@ -69,6 +69,7 @@ using cte_stat_t = struct stat;
 using cte_off_t = off_t;
 using cte_mode_t = mode_t;
 using cte_timespec_t = struct timespec;
+using cte_statvfs_t = struct statvfs;
 #endif
 
 using namespace clio::cae::fuse;
@@ -258,7 +259,7 @@ static int cte_fuse_readdir(const char *path, void *buf,
     // a subsequent stat (generic/637). Leave st_mode = 0 (DT_UNKNOWN): the entry
     // type is not reliably known here, so the kernel issues a getattr to resolve
     // it — setting a wrong d_type would mislead `rm -rf`/`find`.
-    struct stat st;
+    cte_stat_t st;
     memset(&st, 0, sizeof(st));
     st.st_ino = i < t->inos_.size() ? static_cast<ino_t>(t->inos_[i]) : 0;
     filler(buf, name.c_str(), &st, 0, static_cast<fuse_fill_dir_flags>(0));
@@ -467,7 +468,7 @@ static int cte_fuse_rename(const char *from, const char *to,
 // Reporting a non-zero capacity also matters operationally: a 0-block fs is
 // hidden by `df` (which lists no path), which breaks tools that probe free
 // space and xfstests' mount detection.
-static int cte_fuse_statfs(const char *path, struct statvfs *stbuf) {
+static int cte_fuse_statfs(const char *path, cte_statvfs_t *stbuf) {
   (void)path;
   std::memset(stbuf, 0, sizeof(*stbuf));
   constexpr fsblkcnt_t kBlockSize = 4096;
