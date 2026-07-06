@@ -221,21 +221,24 @@ int main(int argc, char *argv[]) {
   const clio::run::u64 field_bytes = (clio::run::u64)rows * cols * sizeof(float);
   const clio::run::u64 snap_bytes = opts.per_block_bytes;
 
-  // Effective compressor = the CLIO_CTE_COMPRESS_LIB pin if set (name or wire
-  // id), else --compress-lib. This is exactly what the runtime will use, so the
-  // measured ratio below reflects the real pipeline.
-  std::string eff_lib = opts.compress_lib;
+  // Requested compressor = the CLIO_CTE_COMPRESS_LIB pin if set, else
+  // --compress-lib (this is exactly what the runtime will use). The special
+  // value "none"/"raw"/"off" is a NO-COMPRESSION baseline: the PutBlob goes
+  // straight to core storage, so we can measure the slowdown compression adds.
+  std::string req = opts.compress_lib;
   if (const char *penv = std::getenv("CLIO_CTE_COMPRESS_LIB")) {
-    if (penv[0]) {
-      int w = ctp::CompressionFactory::WireIdForName(penv);
-      if (w < 0) { char *e = nullptr; long p = std::strtol(penv, &e, 10);
-                   if (e != penv && *e == '\0') w = (int)p; }
-      if (w >= 0) eff_lib = ctp::CompressionFactory::NameForWireId(w);
-    }
+    if (penv[0]) req = penv;
   }
-  int compress_lib = ctp::CompressionFactory::WireIdForName(eff_lib);
-  if (compress_lib < 0) { eff_lib = "lz4";
-    compress_lib = ctp::CompressionFactory::WireIdForName("lz4"); }
+  const bool no_compress = (req == "none" || req == "raw" || req == "off");
+  std::string eff_lib = req;
+  int compress_lib = 0;
+  if (!no_compress) {
+    int w = ctp::CompressionFactory::WireIdForName(req);
+    if (w < 0) { char *e = nullptr; long p = std::strtol(req.c_str(), &e, 10);
+                 if (e != req.c_str() && *e == '\0') w = (int)p; }
+    if (w >= 0) { compress_lib = w; eff_lib = ctp::CompressionFactory::NameForWireId(w); }
+    else { eff_lib = "lz4"; compress_lib = ctp::CompressionFactory::WireIdForName("lz4"); }
+  }
 
   // A checkpoint (one PutBlob/block) happens every `checkpoint_interval` steps,
   // plus a final flush. Data actually stored = snapshots at checkpoints only.
@@ -291,7 +294,10 @@ int main(int argc, char *argv[]) {
   // step (no swap) produces a representative field; u/v are left untouched for
   // the timed loop.
   double measured_ratio = 0.0;
-  {
+  if (no_compress) {
+    measured_ratio = 1.0;  // baseline stores raw bytes
+    std::fprintf(stderr, "[BENCH] no compression (raw PutBlob baseline)\n");
+  } else {
     GsStepKernel<<<rows, opts.threads>>>(u, v, u2, v2, snap_dev[0], rows, cols);
     ctp::GpuApi::Synchronize();
     ctp::GpuApi::Memcpy<float>(reinterpret_cast<float *>(shm_buf[0].ptr_),
@@ -366,8 +372,11 @@ int main(int argc, char *argv[]) {
       for (int b = 0; b < rows; ++b) {
         clio::cte::core::Context ctx;
 #if CTP_ENABLE_COMPRESS
-        ctx.dynamic_compress_ = 1;          // static compression path
-        ctx.compress_lib_ = compress_lib;   // env pin overrides in the runtime
+        // no_compress -> compress_lib_=0, dynamic_compress_=0: the compressor
+        // pool forwards straight to core PutBlob (measures the pipeline without
+        // any compression cost).
+        ctx.dynamic_compress_ = no_compress ? 0 : 1;
+        ctx.compress_lib_ = compress_lib;   // 0 when no_compress; env pin overrides
         ctx.compress_preset_ = 2;           // balanced
 #endif
         ctp::ipc::ShmPtr<> ptr = shm_buf[slot].shm_.template Cast<void>();
