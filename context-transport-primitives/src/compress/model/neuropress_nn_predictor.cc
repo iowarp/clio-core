@@ -197,9 +197,9 @@ std::vector<float> NeuroPressNNPredictor::FeaturesTo8Input(
   if (algo_id >= 8) algo_id = 7;
 
   return {algo_id,
-          0.0f,  // quant (0 for our interface)
-          0.0f,  // shuffle (0 for our interface)
-          0.0f,  // error_bound (0 for lossless)
+          static_cast<float>(features.quantize),      // quant preprocessor
+          static_cast<float>(features.byte_shuffle),  // shuffle preprocessor
+          static_cast<float>(features.error_bound),   // lossy/quant bound
           static_cast<float>(features.chunk_size_bytes),
           static_cast<float>(features.shannon_entropy),
           static_cast<float>(features.mad),

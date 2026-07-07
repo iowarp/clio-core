@@ -21,6 +21,7 @@
 #include "clio_ctp/compress/model/linreg_table_predictor.h"
 #include "clio_ctp/compress/model/neuropress_nn_predictor.h"
 #include "clio_ctp/compress/model/qtable_predictor.h"
+#include "clio_ctp/compress/model/ranking.h"
 #include "clio_ctp/compress/model/xgboost_predictor.h"
 
 using namespace ctp::compress::model;  // NOLINT(build/namespaces)
@@ -133,6 +134,56 @@ TEST_CASE("NeuroPressNNPredictor is safe before a model is loaded") {
   // Loading a non-existent model directory fails cleanly.
   REQUIRE_FALSE(nn.Load(TempDir("nn_missing") + "/does_not_exist"));
   REQUIRE_FALSE(nn.IsReady());
+}
+
+TEST_CASE("Rank() bulk-ranks candidates best-first (primary API)") {
+  auto feats = MakeFeatures();
+  auto labels = MakeLabels(feats);
+  QTablePredictor q;
+  REQUIRE(q.Train(feats, labels));
+
+  DataFeatures data;
+  data.chunk_size_bytes = 4096;
+  data.shannon_entropy = 3.0;
+  data.mad = 0.3;
+  data.second_derivative_mean = 0.03;
+  data.data_type_float = 1.0;
+
+  // CPU-only default candidate set: every known CPU compressor x 3 presets.
+  auto candidates = DefaultCandidates(/*include_gpu=*/false);
+  REQUIRE(candidates.size() > 1);
+
+  auto ranked = q.Rank(data, candidates);
+  REQUIRE(ranked.size() == candidates.size());
+  // Results must be sorted best-first and carry finite predictions.
+  for (size_t i = 0; i < ranked.size(); ++i) {
+    REQUIRE(std::isfinite(ranked[i].prediction.compression_ratio));
+    REQUIRE(std::isfinite(ranked[i].score));
+    if (i > 0) REQUIRE(ranked[i - 1].score >= ranked[i].score);
+  }
+
+  // Weighting by compression time must be able to reorder the ranking away
+  // from the ratio-only default (different objective -> different winner set).
+  RankingWeights time_first;
+  time_first.w_ratio = 0.0;
+  time_first.w_compress_time = 1.0;  // Score = -time: prefer the fastest.
+  auto ranked_time = q.Rank(data, candidates, time_first);
+  REQUIRE(ranked_time.size() == candidates.size());
+  for (size_t i = 1; i < ranked_time.size(); ++i) {
+    REQUIRE(ranked_time[i - 1].score >= ranked_time[i].score);
+  }
+}
+
+TEST_CASE("Rank() is safe on a not-ready model") {
+  NeuroPressNNPredictor nn;  // never loaded
+  DataFeatures data;
+  data.chunk_size_bytes = 2048;
+  data.shannon_entropy = 5.0;
+  auto ranked = nn.Rank(data, DefaultCandidates(false));
+  REQUIRE(ranked.size() == DefaultCandidates(false).size());
+  for (const auto &r : ranked) {
+    REQUIRE(std::isfinite(r.prediction.compression_ratio));
+  }
 }
 
 TEST_CASE("XGBoostPredictor degrades gracefully when disabled") {

@@ -90,9 +90,10 @@ def main():
     # Build 8-input NeuroPress feature vector
     X_8 = np.zeros((len(df), 8), dtype=np.float32)
     X_8[:, 0] = (df["library_config_id"].values.astype(np.int32) // 10) % 8  # algo_id
-    X_8[:, 1] = 0.0  # quant
-    X_8[:, 2] = 0.0  # shuffle
-    X_8[:, 3] = 0.0  # error_bound
+    # Read preprocessor flags from CSV if available, otherwise default to 0
+    X_8[:, 1] = df["quantize"].values if "quantize" in df.columns else 0.0  # quant
+    X_8[:, 2] = df["byte_shuffle"].values if "byte_shuffle" in df.columns else 0.0  # shuffle
+    X_8[:, 3] = df["error_bound"].values if "error_bound" in df.columns else 0.0  # error_bound
     X_8[:, 4] = df["chunk_size_bytes"].values  # data_size
     X_8[:, 5] = df["shannon_entropy"].values  # entropy
     X_8[:, 6] = df["mad"].values  # mad

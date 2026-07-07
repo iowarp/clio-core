@@ -21,6 +21,7 @@
 #ifndef CLIO_CTP_COMPRESS_MODEL_PREDICTOR_H_
 #define CLIO_CTP_COMPRESS_MODEL_PREDICTOR_H_
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -48,6 +49,13 @@ struct CompressionFeatures {
   double config_best = 0;            /**< One-hot: 1 if BEST preset */
   double data_type_char = 0;         /**< One-hot: 1 if char/int data */
   double data_type_float = 0;        /**< One-hot: 1 if float data */
+
+  // Preprocessor selection for this candidate. Modeled by the NeuroPress NN
+  // (see FeaturesTo8Input); intentionally NOT part of ToVector()'s 11 features
+  // so previously trained tree/table models remain valid.
+  double quantize = 0;      /**< 1 if error-bounded quantization applied */
+  double byte_shuffle = 0;  /**< 1 if byte-plane shuffle applied */
+  double error_bound = 0;   /**< Error bound for lossy / quantized paths */
 
   /** @brief Flatten to the fixed 11-feature model-input order. */
   std::vector<float> ToVector() const {
@@ -98,6 +106,98 @@ struct CompressionPrediction {
 };
 
 /**
+ * @brief Data-intrinsic features (independent of the compressor choice).
+ *
+ * These come from preprocessing the actual data buffer (see
+ * clio_ctp/compress/preprocess/FeatureExtractor). They are the fixed part of a
+ * bulk ranking query: one DataFeatures is scored against many CandidateConfig.
+ */
+struct DataFeatures {
+  double chunk_size_bytes = 0;
+  double target_cpu_util = 0;
+  double shannon_entropy = 0;
+  double mad = 0;
+  double second_derivative_mean = 0;
+  double data_type_char = 0;   /**< One-hot: 1 if char/int data */
+  double data_type_float = 0;  /**< One-hot: 1 if float data */
+};
+
+/**
+ * @brief One compressor+preset+preprocessor combination to evaluate.
+ *
+ * base_id/preset_id follow the CompressionFactory encoding
+ * (library_config_id = base_id * 10 + preset_id; preset FAST=1, BALANCED=2,
+ * BEST=3). quantize/byte_shuffle select preprocessors applied before the
+ * compressor.
+ */
+struct CandidateConfig {
+  int base_id = 0;             /**< Compressor library base id (frozen) */
+  int preset_id = 2;           /**< 1 FAST, 2 BALANCED, 3 BEST */
+  bool quantize = false;       /**< Apply error-bounded quantization first */
+  bool byte_shuffle = false;   /**< Apply byte-plane shuffle first */
+  double error_bound = 0;      /**< Error bound for lossy / quantized paths */
+  std::string library_name;    /**< Optional human-readable label */
+
+  /** @brief CompressionFactory-style encoded id (base_id*10 + preset_id). */
+  double LibraryConfigId() const {
+    return static_cast<double>(base_id * 10 + preset_id);
+  }
+};
+
+/**
+ * @brief Scalar scoring of a prediction for ranking (higher = better).
+ *
+ * The default rewards compression ratio only. Penalize time or reward PSNR by
+ * setting the corresponding weights; e.g. w_compress_time>0 to prefer faster
+ * compressors, w_psnr>0 to value lossy reconstruction quality.
+ */
+struct RankingWeights {
+  double w_ratio = 1.0;          /**< Reward per unit compression ratio */
+  double w_compress_time = 0.0;  /**< Penalty per ms of compression time */
+  double w_psnr = 0.0;           /**< Reward per dB of PSNR */
+
+  double Score(const CompressionPrediction &p) const {
+    return w_ratio * p.compression_ratio -
+           w_compress_time * p.compression_time_ms + w_psnr * p.psnr_db;
+  }
+};
+
+/**
+ * @brief A candidate paired with its predicted metrics and ranking score.
+ */
+struct RankedPrediction {
+  CandidateConfig candidate;
+  CompressionPrediction prediction;
+  double score = 0;  /**< Per RankingWeights; results are sorted by this. */
+};
+
+/**
+ * @brief Compose the full model feature vector from data + a candidate.
+ *
+ * Bridges the bulk-ranking inputs (DataFeatures + CandidateConfig) to the
+ * per-config CompressionFeatures the models consume.
+ */
+inline CompressionFeatures MakeCompressionFeatures(const DataFeatures &d,
+                                                   const CandidateConfig &c) {
+  CompressionFeatures f;
+  f.chunk_size_bytes = d.chunk_size_bytes;
+  f.target_cpu_util = d.target_cpu_util;
+  f.shannon_entropy = d.shannon_entropy;
+  f.mad = d.mad;
+  f.second_derivative_mean = d.second_derivative_mean;
+  f.data_type_char = d.data_type_char;
+  f.data_type_float = d.data_type_float;
+  f.library_config_id = c.LibraryConfigId();
+  f.config_fast = (c.preset_id == 1) ? 1.0 : 0.0;
+  f.config_balanced = (c.preset_id == 2) ? 1.0 : 0.0;
+  f.config_best = (c.preset_id == 3) ? 1.0 : 0.0;
+  f.quantize = c.quantize ? 1.0 : 0.0;
+  f.byte_shuffle = c.byte_shuffle ? 1.0 : 0.0;
+  f.error_bound = c.error_bound;
+  return f;
+}
+
+/**
  * @brief Training labels for the multi-output model.
  */
 struct TrainingLabels {
@@ -122,10 +222,11 @@ enum class ModelType {
 /**
  * @brief Abstract base for all compression-metric predictors.
  *
- * Load()/Save() persist a model to/from a directory; Predict() runs one
- * inference; PredictBatch() runs many. Train() and the reinforcement-learning
- * hooks are optional (default no-op) so pure-inference models need not
- * implement them.
+ * The PRIMARY entry point is Rank(): given the data statistics and a set of
+ * candidate compressor/preprocessor configurations, it returns every candidate
+ * scored and sorted best-first. Predict()/PredictBatch() are the per-config
+ * primitives Rank() is built on. Train() and the reinforcement-learning hooks
+ * are optional (default no-op) so pure-inference models need not implement them.
  */
 class CompressionPredictor {
  public:
@@ -151,6 +252,42 @@ class CompressionPredictor {
     out.reserve(batch.size());
     for (const auto &f : batch) out.push_back(Predict(f));
     return out;
+  }
+
+  /**
+   * @brief PRIMARY API: bulk-rank candidate configurations for one data buffer.
+   *
+   * Scores each CandidateConfig (compressor + preset + preprocessor combo)
+   * against the given DataFeatures and returns them sorted best-first by
+   * RankingWeights::Score. Every model supports this via the default
+   * implementation, which composes CompressionFeatures per candidate and calls
+   * PredictBatch once; models with a native multi-config forward pass (e.g. the
+   * NeuroPress NN) may override for efficiency without changing the semantics.
+   *
+   * @param data       Data-intrinsic statistics (fixed across candidates).
+   * @param candidates Compressor/preprocessor combinations to evaluate.
+   * @param weights    How to score a prediction into a rank (default: ratio).
+   * @return Ranked results, highest score first.
+   */
+  virtual std::vector<RankedPrediction> Rank(
+      const DataFeatures &data, const std::vector<CandidateConfig> &candidates,
+      const RankingWeights &weights = RankingWeights()) {
+    std::vector<CompressionFeatures> feats;
+    feats.reserve(candidates.size());
+    for (const auto &c : candidates) {
+      feats.push_back(MakeCompressionFeatures(data, c));
+    }
+    std::vector<CompressionPrediction> preds = PredictBatch(feats);
+    std::vector<RankedPrediction> ranked;
+    ranked.reserve(candidates.size());
+    for (size_t i = 0; i < candidates.size(); ++i) {
+      ranked.push_back({candidates[i], preds[i], weights.Score(preds[i])});
+    }
+    std::sort(ranked.begin(), ranked.end(),
+              [](const RankedPrediction &a, const RankedPrediction &b) {
+                return a.score > b.score;
+              });
+    return ranked;
   }
 
   /** @brief Optionally (re)train from features+labels. */
