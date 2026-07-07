@@ -26,6 +26,12 @@ if(CLIO_CTE_ENABLE_COMPRESS)
     add_subdirectory(compress)
 endif()
 
+# Unified compression-metric model + preprocessor tests (issue #693). Pure C++,
+# independent of the compressor backends, so they build/run in the default CI
+# even when CLIO_CTE_ENABLE_COMPRESS is OFF.
+add_subdirectory(compress/model)
+add_subdirectory(compress/preprocess)
+
 if(CLIO_CORE_ENABLE_ENCRYPT)
     add_subdirectory(encrypt)
 endif()

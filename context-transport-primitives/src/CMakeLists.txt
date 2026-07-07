@@ -33,8 +33,9 @@ set_target_properties(clio_ctp_host PROPERTIES
 )
 
 #------------------------------------------------------------------------------
-# Note: Compression Predictor Libraries (XGBoost, Dense NN, Q-Table, LinReg)
-# have been moved to the compressor chimod in context-transfer-engine/compressor
+# Compression-metric predictors (XGBoost, Q-Table, LinReg, NeuroPress NN) are
+# unified here under compress/model (issue #693); see the add_subdirectory
+# below. clio_ctp_host itself stays predictor-free.
 #------------------------------------------------------------------------------
 
 target_link_libraries(clio_ctp_host PUBLIC
@@ -69,6 +70,12 @@ if(CLIO_CORE_ENABLE_PCH)
     )
 endif()
 list(APPEND CLIO_CTP_LIBS clio_ctp_host)
+
+# Unified compression-metric prediction models (issue #693): builds
+# clio_ctp_compress_model (Q-table, linreg, XGBoost, NeuroPress NN).
+add_subdirectory(compress)
+list(APPEND CLIO_CTP_LIBS clio_ctp_compress_model)
+
 add_library(cxx INTERFACE)
 target_link_libraries(cxx INTERFACE clio_ctp_host)
 target_include_directories(cxx INTERFACE
