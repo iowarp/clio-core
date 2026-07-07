@@ -31,6 +31,7 @@
 
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -39,6 +40,7 @@
 #include <vector>
 
 #include "clio_ctp/compress/compress_factory.h"
+#include "clio_ctp/compress/preprocess/byte_shuffle.h"
 #include "clio_ctp/compress/preprocess/feature_extractor.h"
 
 using namespace ctp;
@@ -101,15 +103,18 @@ class SyntheticDataGenerator {
 };
 
 /**
- * Run a single compression trial and emit metrics.
+ * Run a single compression trial with optional preprocessing.
  * Returns CSV row as string, or empty string if compression failed.
  */
 static std::string RunCompressionTrial(
     const std::string& library_name,
     CompressionPreset preset,
     const std::string& distribution,
-    const std::vector<float>& data) {
-  // Extract features.
+    const std::vector<float>& data,
+    int quantize,
+    int byte_shuffle,
+    double error_bound) {
+  // Extract features from original data.
   auto features = FeatureExtractor::ExtractFeatures(
       data.data(), data.size() * sizeof(float), DataKind::kFloat);
 
@@ -130,8 +135,23 @@ static std::string RunCompressionTrial(
     return "";  // Backend disabled or not available
   }
 
-  // Allocate output buffer (2x input + 1KB safety margin).
+  // Apply preprocessing if requested.
+  std::vector<uint8_t> to_compress;
+  std::vector<uint8_t> shuffled_copy;
   size_t input_size = data.size() * sizeof(float);
+  const uint8_t* data_ptr = reinterpret_cast<const uint8_t*>(data.data());
+
+  if (byte_shuffle) {
+    shuffled_copy = ByteShuffleVector(data_ptr, input_size, sizeof(float));
+    if (shuffled_copy.empty()) {
+      return "";  // Shuffle failed
+    }
+    to_compress = shuffled_copy;
+  } else {
+    to_compress.assign(data_ptr, data_ptr + input_size);
+  }
+
+  // Allocate output buffer (2x input + 1KB safety margin).
   size_t output_buffer_size = 2 * input_size + 1024;
   std::vector<uint8_t> output_buffer(output_buffer_size);
   std::vector<uint8_t> decompressed(input_size);
@@ -141,7 +161,7 @@ static std::string RunCompressionTrial(
   size_t compressed_size = output_buffer_size;
   bool compress_ok = compressor->Compress(
       output_buffer.data(), compressed_size,
-      const_cast<void*>(static_cast<const void*>(data.data())), input_size);
+      to_compress.data(), input_size);
   auto compress_end = std::chrono::high_resolution_clock::now();
   double compress_time_ms =
       std::chrono::duration<double, std::milli>(compress_end - compress_start)
@@ -164,8 +184,28 @@ static std::string RunCompressionTrial(
                                                 decompress_start)
           .count();
 
-  // Check round-trip for lossless (verify sizes match).
-  int success = (decompress_ok && decompressed_size == input_size) ? 1 : 0;
+  if (!decompress_ok || decompressed_size != input_size) {
+    return "";
+  }
+
+  // If byte-shuffled, unshuffle to validate round-trip.
+  int success = 1;
+  if (byte_shuffle) {
+    std::vector<uint8_t> unshuffled = ByteUnshuffleVector(
+        decompressed.data(), input_size, sizeof(float));
+    if (unshuffled.empty()) {
+      return "";  // Unshuffle failed
+    }
+    // Verify round-trip matches original
+    if (std::memcmp(unshuffled.data(), data_ptr, input_size) != 0) {
+      success = 0;  // Mismatch in round-trip
+    }
+  } else {
+    // For non-shuffled, verify decompressed matches original
+    if (std::memcmp(decompressed.data(), data_ptr, input_size) != 0) {
+      success = 0;
+    }
+  }
 
   // Compute compression ratio.
   double compression_ratio =
@@ -178,8 +218,8 @@ static std::string RunCompressionTrial(
   // Emit CSV row: library,preset,distribution,data_type,chunk_size_bytes,
   // shannon_entropy,mad,second_derivative_mean,library_config_id,
   // config_fast,config_balanced,config_best,data_type_char,data_type_float,
-  // original_bytes,compressed_bytes,compression_ratio,compression_time_ms,
-  // decompression_time_ms,psnr_db,success
+  // quantize,byte_shuffle,error_bound,original_bytes,compressed_bytes,
+  // compression_ratio,compression_time_ms,decompression_time_ms,psnr_db,success
   std::string row;
   row += library_name + ",";
   row += preset_str + ",";
@@ -195,6 +235,9 @@ static std::string RunCompressionTrial(
   row += std::to_string(features.config_best) + ",";
   row += std::to_string(features.data_type_char) + ",";
   row += std::to_string(features.data_type_float) + ",";
+  row += std::to_string(quantize) + ",";
+  row += std::to_string(byte_shuffle) + ",";
+  row += std::to_string(error_bound) + ",";
   row += std::to_string(input_size) + ",";
   row += std::to_string(compressed_size) + ",";
   row += std::to_string(compression_ratio) + ",";
@@ -211,12 +254,13 @@ static std::string RunCompressionTrial(
  */
 static void PrintUsage(const char* prog) {
   std::cerr << "Usage: " << prog
-            << " [--rows N] [--chunk-bytes B] [--out FILE] [--seed S]\n";
-  std::cerr << "  --rows N:        Number of chunks per compressor/preset "
+            << " [--rows N] [--chunk-bytes B] [--out FILE] [--seed S] [--preprocessors]\n";
+  std::cerr << "  --rows N:         Number of chunks per compressor/preset "
                "(default 50)\n";
-  std::cerr << "  --chunk-bytes B: Chunk size in bytes (default 1048576)\n";
-  std::cerr << "  --out FILE:      Output CSV file (default stdout)\n";
-  std::cerr << "  --seed S:        Random seed (default 42)\n";
+  std::cerr << "  --chunk-bytes B:  Chunk size in bytes (default 1048576)\n";
+  std::cerr << "  --out FILE:       Output CSV file (default stdout)\n";
+  std::cerr << "  --seed S:         Random seed (default 42)\n";
+  std::cerr << "  --preprocessors:  Sweep preprocessor variants (byte-shuffle)\n";
 }
 
 int main(int argc, char** argv) {
@@ -224,6 +268,7 @@ int main(int argc, char** argv) {
   size_t chunk_bytes = 1 << 20;  // 1 MB
   std::string output_file = "";
   uint32_t seed = 42;
+  bool preprocessors = false;
 
   // Parse command-line arguments.
   for (int i = 1; i < argc; ++i) {
@@ -236,6 +281,8 @@ int main(int argc, char** argv) {
       output_file = argv[++i];
     } else if (arg == "--seed" && i + 1 < argc) {
       seed = std::stoul(argv[++i]);
+    } else if (arg == "--preprocessors") {
+      preprocessors = true;
     } else {
       PrintUsage(argv[0]);
       return 1;
@@ -264,9 +311,9 @@ int main(int argc, char** argv) {
   *out << "library,preset,distribution,data_type,chunk_size_bytes,"
        << "shannon_entropy,mad,second_derivative_mean,library_config_id,"
        << "config_fast,config_balanced,config_best,data_type_char,"
-       << "data_type_float,original_bytes,compressed_bytes,"
-       << "compression_ratio,compression_time_ms,decompression_time_ms,"
-       << "psnr_db,success\n";
+       << "data_type_float,quantize,byte_shuffle,error_bound,original_bytes,"
+       << "compressed_bytes,compression_ratio,compression_time_ms,"
+       << "decompression_time_ms,psnr_db,success\n";
 
   // List of compressor names to test.
   std::vector<std::string> compressor_names = {
@@ -296,12 +343,20 @@ int main(int argc, char** argv) {
           auto [chunk_data, dist_name] =
               generator.GenerateChunk(distribution, num_elements, chunk_index++);
 
-          // Run trial and emit CSV row.
+          // Emit base row (no preprocessors).
           std::string csv_row = RunCompressionTrial(
-              compressor_name, preset, dist_name, chunk_data);
-
+              compressor_name, preset, dist_name, chunk_data, 0, 0, 0.0);
           if (!csv_row.empty()) {
             *out << csv_row << "\n";
+          }
+
+          // If preprocessors flag, emit byte-shuffle variant.
+          if (preprocessors) {
+            csv_row = RunCompressionTrial(
+                compressor_name, preset, dist_name, chunk_data, 0, 1, 0.0);
+            if (!csv_row.empty()) {
+              *out << csv_row << "\n";
+            }
           }
         }
       }

@@ -147,6 +147,31 @@ class FeatureExtractor {
   }
 
   /**
+   * @brief Extract the data-intrinsic features for bulk ranking.
+   *
+   * Returns a DataFeatures (statistics + data-type one-hots, no compressor
+   * identity) suitable as the fixed input to CompressionPredictor::Rank().
+   *
+   * @param data       Raw data buffer (any type)
+   * @param size_bytes Total buffer size in bytes
+   * @param kind       Data kind (kChar, kInt, kFloat, kDouble)
+   * @return DataFeatures with statistics populated.
+   */
+  static ctp::compress::model::DataFeatures ExtractDataFeatures(
+      const void* data, size_t size_bytes, DataKind kind) {
+    ctp::compress::model::CompressionFeatures f =
+        ExtractFeatures(data, size_bytes, kind);
+    ctp::compress::model::DataFeatures d;
+    d.chunk_size_bytes = f.chunk_size_bytes;
+    d.shannon_entropy = f.shannon_entropy;
+    d.mad = f.mad;
+    d.second_derivative_mean = f.second_derivative_mean;
+    d.data_type_char = f.data_type_char;
+    d.data_type_float = f.data_type_float;
+    return d;
+  }
+
+  /**
    * @brief Set library_config_id and preset one-hots.
    *
    * Encodes library_config_id as base_id * 10 + preset_id, and sets the

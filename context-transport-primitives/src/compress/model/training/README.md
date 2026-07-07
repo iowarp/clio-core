@@ -9,21 +9,27 @@ All trainers consume a single unified benchmark CSV with the following columns:
 ```
 library, preset, distribution, data_type, chunk_size_bytes, shannon_entropy,
 mad, second_derivative_mean, library_config_id, config_fast, config_balanced,
-config_best, data_type_char, data_type_float, original_bytes, compressed_bytes,
-compression_ratio, compression_time_ms, decompression_time_ms, psnr_db, success
+config_best, data_type_char, data_type_float, quantize, byte_shuffle,
+error_bound, original_bytes, compressed_bytes, compression_ratio,
+compression_time_ms, decompression_time_ms, psnr_db, success
 ```
 
 ### Filtering
 - Only rows with `success == 1` are used for training.
 - Empty or malformed CSV raises an error.
 
-### Generated CSV
+### Generated CSV and Preprocessor Sweep
 The unified benchmark CSV is produced by the `benchmark_compress_metrics_exec` (defined in `/workspace/test/unit/compress/model`). Run it to generate the training data:
 
 ```bash
-# (See the benchmark code for exact invocation and options)
-benchmark_compress_metrics_exec --output-csv metrics.csv
+# Basic run (no preprocessor variants)
+benchmark_compress_metrics_exec --rows 50 --chunk-bytes 1048576 --out metrics.csv
+
+# With preprocessor sweep (also emits byte-shuffle variants)
+benchmark_compress_metrics_exec --rows 50 --chunk-bytes 1048576 --preprocessors --out metrics.csv
 ```
+
+The `--preprocessors` flag causes the benchmark to emit additional rows for each baseline configuration with `byte_shuffle=1` set, allowing the models (especially NeuroPress NN) to learn the effect of preprocessing.
 
 ## The 11 Model Features
 
@@ -149,11 +155,11 @@ python3 train_neuropress_nn.py --csv metrics.csv --out-dir ./neuropress_models \
 - Output: 8-dimensional prediction vector
 - Activation: ReLU hidden, linear output
 
-**Input feature mapping** (8-dim from 11-dim):
+**Input feature mapping** (8-dim):
 1. `algo_id` = (library_config_id // 10) % 8
-2. `quant` = 0 (constant)
-3. `shuffle` = 0 (constant)
-4. `error_bound` = 0 (constant)
+2. `quant` = quantize (from CSV, default 0 if missing)
+3. `shuffle` = byte_shuffle (from CSV, default 0 if missing)
+4. `error_bound` = error_bound (from CSV, default 0 if missing)
 5. `data_size` = chunk_size_bytes
 6. `entropy` = shannon_entropy
 7. `mad`
@@ -201,6 +207,11 @@ After training, the script verifies:
 **Training modes:**
 - **PyTorch (preferred):** Uses `torch.nn` with Adam optimizer if available
 - **NumPy fallback:** Simple SGD implementation if PyTorch is not installed
+
+### Preprocessor Column Usage
+- **NeuroPress NN (`train_neuropress_nn.py`)**: Reads `quantize`, `byte_shuffle`, `error_bound` columns from CSV if present (defaults to 0 if missing for backward compatibility)
+- **XGBoost (`train_xgboost.py`)**: Uses the 11-feature `ToVector()` only; preprocessor columns are ignored
+- **Q-Table (`train_qtable.py`)**: Uses the 11-feature `ToVector()` only; preprocessor columns are ignored
 
 ## Python Dependencies
 
