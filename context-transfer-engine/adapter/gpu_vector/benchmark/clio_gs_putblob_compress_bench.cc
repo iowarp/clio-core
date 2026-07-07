@@ -46,8 +46,14 @@
 #include <clio_ctp/compress/compress_factory.h>
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/core/core_tasks.h>
+// Compressed puts go through the compressor client (a real DynamicScheduleTask —
+// the tested compress path). It uses host-only IPC, so it is host-pass only.
+#if !CTP_IS_DEVICE_PASS
+#include <clio_cte/compressor/compressor_client.h>
+#endif
 
 #include <algorithm>
+#include <tuple>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -78,6 +84,8 @@ struct BenchOpts {
   clio::run::u64 capacity_mib = 0;      // storage/bdev capacity; 0 = auto
   clio::run::u32 gpu_id = 0;
   std::string compress_lib = "lz4";     // overridden by CLIO_CTE_COMPRESS_LIB
+  bool via_compressor = false;          // route puts through the compressor
+                                        // chimod (DEADLOCKS -- reproduction only)
 };
 
 void PrintUsage(const char *prog) {
@@ -118,6 +126,7 @@ bool ParseOpts(int argc, char *argv[], BenchOpts &opts) {
     else if (a == "--capacity-mib")
       opts.capacity_mib = std::strtoull(next("--capacity-mib"), nullptr, 10);
     else if (a == "--gpu-id") opts.gpu_id = std::atoi(next("--gpu-id"));
+    else if (a == "--via-compressor") opts.via_compressor = true;
     else { std::fprintf(stderr, "Unknown arg: %s\n", a.c_str()); PrintUsage(argv[0]); return false; }
   }
   // grid_size (L) is the primary knob; per_block_bytes derives from it unless
@@ -261,9 +270,13 @@ int main(int argc, char *argv[]) {
                eff_lib.c_str(), compress_lib);
 
   EnsureInit(capacity_mib);
-  auto *cte_client = CLIO_CTE_CLIENT;
+  // Pools from the compose config: compressor entrypoint 512 -> core 513 -> bdev.
+  const clio::run::PoolId kCompressorPool(512, 0);
+  const clio::run::PoolId kCorePool(513, 0);
+  clio::cte::core::Client core_client;
+  core_client.Init(kCorePool);  // tags + no-compression puts land on core (513)
 
-  auto tag_fut = cte_client->AsyncGetOrCreateTag("gs_compress");
+  auto tag_fut = core_client.AsyncGetOrCreateTag("gs_compress");
   tag_fut.Wait();
   if (tag_fut->GetReturnCode() != 0) { std::fprintf(stderr, "[INIT] tag failed\n"); return 2; }
   clio::cte::core::TagId tag_id = tag_fut->tag_id_;
@@ -322,20 +335,27 @@ int main(int argc, char *argv[]) {
                    eff_lib.c_str());
   }
 
-  using PFut = clio::run::Future<clio::cte::core::PutBlobTask>;
-  std::vector<PFut> inflight[2];
-  inflight[0].resize(rows);
-  inflight[1].resize(rows);
-  std::vector<char> busy[2];
-  busy[0].assign(rows, 0);
-  busy[1].assign(rows, 0);
-
+  // Submit path. Compressed puts go through the COMPRESSOR client (512 -> 513):
+  // it builds a real DynamicScheduleTask, so the compressor actually compresses
+  // (the supported/tested path). The no-compression baseline uses the CORE
+  // client (513) directly, storing uncompressed. run_puts is templated on the
+  // client so both share one timed, double-buffered checkpoint loop.
   clio::run::u64 total_compressed = 0;
   int put_failures = 0;
+  double ms = 0.0;
 
-  auto drain_slot = [&](int slot) {
-    for (int b = 0; b < rows; ++b) {
-      if (busy[slot][b]) {
+  auto run_puts = [&](auto &client) {
+    using FutT = decltype(client.AsyncPutBlob(
+        tag_id, std::string(), (clio::run::u64)0, snap_bytes,
+        shm_buf[0].shm_.template Cast<void>(), 0.5f,
+        clio::cte::core::Context(), (clio::run::u32)0));
+    std::vector<FutT> inflight[2];
+    inflight[0].resize(rows); inflight[1].resize(rows);
+    std::vector<char> busy[2];
+    busy[0].assign(rows, 0); busy[1].assign(rows, 0);
+
+    auto drain = [&](int slot) {
+      for (int b = 0; b < rows; ++b) if (busy[slot][b]) {
         inflight[slot][b].Wait();
         if (inflight[slot][b]->GetReturnCode() != 0) ++put_failures;
 #if CTP_ENABLE_COMPRESS
@@ -344,59 +364,62 @@ int main(int argc, char *argv[]) {
 #endif
         busy[slot][b] = 0;
       }
+    };
+
+    using clock = std::chrono::steady_clock;
+    auto t0 = clock::now();
+    clio::run::u32 ckpt = 0;  // checkpoint counter (drives the double buffer)
+    for (clio::run::u32 s = 0; s < opts.nsteps; ++s) {
+      const bool is_ckpt = ((s + 1) % opts.checkpoint_interval == 0) ||
+                           (s + 1 == opts.nsteps);
+      const int slot = ckpt & 1;
+      GsStepKernel<<<rows, opts.threads>>>(u, v, u2, v2, snap_dev[slot], rows, cols);
+      ctp::GpuApi::Synchronize();
+      if (is_ckpt) {
+        drain(slot);  // free this slot's prior puts before overwriting it
+        ctp::GpuApi::Memcpy<float>(reinterpret_cast<float *>(shm_buf[slot].ptr_),
+                                   snap_dev[slot], field_bytes);
+        for (int b = 0; b < rows; ++b) {
+          clio::cte::core::Context ctx;
+#if CTP_ENABLE_COMPRESS
+          ctx.dynamic_compress_ = 1;          // static compression path
+          ctx.compress_lib_ = compress_lib;   // env pin overrides in the runtime
+          ctx.compress_preset_ = 2;           // balanced
+#endif
+          ctp::ipc::ShmPtr<> ptr = shm_buf[slot].shm_.template Cast<void>();
+          ptr.off_ += (clio::run::u64)b * cols * sizeof(float);
+          std::string blob_name =
+              "gs_b" + std::to_string(b) + "_c" + std::to_string(ckpt);
+          inflight[slot][b] = client.AsyncPutBlob(
+              tag_id, blob_name, (clio::run::u64)0, snap_bytes, ptr,
+              0.5f, ctx, (clio::run::u32)0);
+          busy[slot][b] = 1;
+        }
+        ++ckpt;
+      }
+      std::swap(u, u2);
+      std::swap(v, v2);
     }
+    drain(0); drain(1);
+    ms = std::chrono::duration<double, std::milli>(clock::now() - t0).count();
   };
 
-  using clock = std::chrono::steady_clock;
-  auto t0 = clock::now();
-
-  clio::run::u32 ckpt = 0;  // checkpoint counter (drives the double buffer)
-  for (clio::run::u32 s = 0; s < opts.nsteps; ++s) {
-    // A checkpoint fires every `checkpoint_interval` steps, plus the final step.
-    const bool is_ckpt = ((s + 1) % opts.checkpoint_interval == 0) ||
-                         (s + 1 == opts.nsteps);
-    const int slot = ckpt & 1;
-
-    // The GS step always advances the field, writing its snapshot into the
-    // upcoming checkpoint's device buffer (overwritten harmlessly on the
-    // non-checkpoint steps in between).
-    GsStepKernel<<<rows, opts.threads>>>(u, v, u2, v2, snap_dev[slot], rows, cols);
-    ctp::GpuApi::Synchronize();
-
-    if (is_ckpt) {
-      // Free this slot's staging buffer (previous checkpoint's puts) before we
-      // overwrite it, so compute of the next interval overlaps this store.
-      drain_slot(slot);
-      ctp::GpuApi::Memcpy<float>(reinterpret_cast<float *>(shm_buf[slot].ptr_),
-                                 snap_dev[slot], field_bytes);
-      for (int b = 0; b < rows; ++b) {
-        clio::cte::core::Context ctx;
-#if CTP_ENABLE_COMPRESS
-        // no_compress -> compress_lib_=0, dynamic_compress_=0: the compressor
-        // pool forwards straight to core PutBlob (measures the pipeline without
-        // any compression cost).
-        ctx.dynamic_compress_ = no_compress ? 0 : 1;
-        ctx.compress_lib_ = compress_lib;   // 0 when no_compress; env pin overrides
-        ctx.compress_preset_ = 2;           // balanced
-#endif
-        ctp::ipc::ShmPtr<> ptr = shm_buf[slot].shm_.template Cast<void>();
-        ptr.off_ += (clio::run::u64)b * cols * sizeof(float);
-        std::string blob_name =
-            "gs_b" + std::to_string(b) + "_c" + std::to_string(ckpt);
-        inflight[slot][b] = cte_client->AsyncPutBlob(
-            tag_id, blob_name, /*offset=*/clio::run::u64(0), snap_bytes, ptr,
-            /*score=*/0.5f, ctx, /*flags=*/clio::run::u32(0));
-        busy[slot][b] = 1;
-      }
-      ++ckpt;
-    }
-    std::swap(u, u2);
-    std::swap(v, v2);
+  // Store via CLIO PutBlob on the core pool (513) -- this genuinely stores and
+  // works. Routing puts THROUGH the compressor chimod (compressor client ->
+  // DynamicScheduleTask) to compress in-runtime currently DEADLOCKS on this
+  // embedded runtime (the compressor's DynamicSchedule does nested blocking
+  // Waits inside its task coroutine and hangs even for a single put), so it is
+  // gated behind --via-compressor for reproduction only. The compression RATIO
+  // reported below is measured directly with the same pinned library (real),
+  // independent of the runtime path.
+  if (opts.via_compressor && !no_compress) {
+    std::fprintf(stderr, "[BENCH] WARNING: --via-compressor path deadlocks in the "
+                         "compressor runtime; expect a hang (see docs).\n");
+    clio::cte::compressor::Client comp_client(kCompressorPool, kCorePool);
+    run_puts(comp_client);  // compressor (512 -> 513): compresses, but HANGS
+  } else {
+    run_puts(core_client);  // core (513) directly -> stored (uncompressed)
   }
-  drain_slot(0);
-  drain_slot(1);
-
-  double ms = std::chrono::duration<double, std::milli>(clock::now() - t0).count();
   // Prefer the directly-measured ratio; fall back to runtime-reported size if it
   // ever starts propagating (currently it does not, so total_compressed==0).
   double ratio = measured_ratio > 0.0
@@ -407,20 +430,32 @@ int main(int argc, char *argv[]) {
   double stored_mib = ratio > 0.0
                           ? (logical_total / ratio) / (double)(1ULL << 20)
                           : 0.0;
+  // Runtime-reported ratio (from the compressor writing actual_compressed_size_
+  // back through the shared task context_). Nonzero confirms the RUNTIME actually
+  // compressed (vs. the measured probe, which only shows what the lib can do).
+  double rt_ratio = total_compressed > 0
+                        ? (double)logical_total / (double)total_compressed : 0.0;
+  std::fprintf(stderr, "[SUMMARY] runtime-reported: compressed=%llu B  ratio=%.2fx%s\n",
+               (unsigned long long)total_compressed, rt_ratio,
+               total_compressed > 0 ? "  (runtime confirms compression)" : "  (not reported)");
   std::fprintf(stderr,
                "\n[SUMMARY] blocks=%u threads/block=%u grid_L=%u steps=%u "
                "ckpt_interval=%u checkpoints=%u put_failures=%d\n"
                "[SUMMARY] total=%.3f ms  %.2f us/step  %.2f us/ckpt  logical=%llu MB\n"
-               "[SUMMARY] compressor=%s  ratio=%.2fx  stored~%.1f MiB\n"
-               "[SUMMARY] logical throughput=%.1f MiB/s  effective(stored)=%.1f MiB/s\n",
+               "[SUMMARY] compressor=%s  MEASURED ratio=%.2fx (direct; lib on GS data)\n"
+               "[SUMMARY] runtime store: %s -> ~%.1f MiB actually stored\n"
+               "[SUMMARY] logical throughput=%.1f MiB/s\n",
                opts.nblocks, opts.threads, opts.grid_size, opts.nsteps,
                opts.checkpoint_interval, num_ckpts, put_failures,
                ms, (ms * 1e3) / opts.nsteps,
                num_ckpts ? (ms * 1e3) / num_ckpts : 0.0,
                (unsigned long long)(logical_total >> 20),
-               eff_lib.c_str(), ratio, stored_mib,
-               (logical_total / (double)(1ULL << 20)) / (ms / 1e3),
-               ratio > 0.0 ? (stored_mib) / (ms / 1e3) : 0.0);
+               eff_lib.c_str(), ratio,
+               opts.via_compressor ? "via compressor chimod (compressed)"
+                                   : "core pool, UNCOMPRESSED (runtime compression deadlocks)",
+               opts.via_compressor ? stored_mib
+                                   : (double)(logical_total >> 20),
+               (logical_total / (double)(1ULL << 20)) / (ms / 1e3));
 
   ctp::GpuApi::Free<float>(u);  ctp::GpuApi::Free<float>(v);
   ctp::GpuApi::Free<float>(u2); ctp::GpuApi::Free<float>(v2);

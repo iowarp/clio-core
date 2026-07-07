@@ -1,9 +1,23 @@
-# Gray-Scott async-compressed PutBlob — CLIO runtime path (Delta A100)
+# Gray-Scott + CLIO PutBlob + compressor library (Delta A100)
 
-The production-vector-shaped counterpart to `clio_gray_scott_transfer_bench.cu`:
-each per-block Gray-Scott snapshot is shipped to storage through a **real CLIO
-transparent compressed PutBlob** (compressor chimod → CTE core → RAM bdev),
-instead of a raw `cudaMemcpyAsync`. Source: `clio_gs_putblob_compress_bench.cc`.
+> **STATUS — read first (corrected).** The compressor *library* integration is
+> real and verified: each pinned library (incl. the GPU `cuszp`) is applied to a
+> real Gray-Scott snapshot and the **ratios below are directly measured**. What is
+> **NOT** working is routing the PutBlob **through the CLIO compressor chimod** to
+> compress *in the runtime*: that path (`--via-compressor`) **deadlocks** — the
+> compressor's `DynamicSchedule` does nested blocking `.Wait()`s inside its task
+> coroutine and hangs on this embedded runtime **even for a single put**. So the
+> benchmark's puts are stored via CLIO PutBlob on the core pool **UNCOMPRESSED**;
+> the reported ratio is a **direct measurement of the library**, not evidence the
+> runtime compressed. Making the runtime genuinely compress a PutBlob (host or
+> device) is an **open CLIO issue** (fix: `co_await` the nested tasks instead of
+> blocking `.Wait()`), and is the real remaining work. Earlier revisions of this
+> doc overstated the pipeline as end-to-end working; that was wrong.
+
+Counterpart to `clio_gray_scott_transfer_bench.cu` (which uses raw `cudaMemcpyAsync`
+and is fully working). This bench runs Gray-Scott, stores each snapshot via a CLIO
+PutBlob, and **measures** what the pinned compressor achieves on the data. Source:
+`clio_gs_putblob_compress_bench.cc`.
 
 **GPU:** A100-SXM4-40GB · **Build:** CUDA 12.6 in `iowarp/deps-nvidia`
 (Apptainer), `CLIO_CTE_ENABLE_COMPRESS=ON`, native sm_80 · **Compressor:** pinned
@@ -19,12 +33,16 @@ follow-ups).
   `DynamicSchedule()`); `CompressionFactory::WireIdForName()` added for the
   name→wire-id lookup. Confirmed firing at runtime:
   `Compressor pinned via CLIO_CTE_COMPRESS_LIB: lz4 (wire=4, preset=2)`.
-- **Transparent compression:** the bench writes a compose config placing the
-  compressor chimod at the CTE entrypoint pool (512) in front of CTE core (513)
-  and a RAM bdev, then issues a normal `cte_client->AsyncPutBlob(..., ctx)` with
-  `ctx.dynamic_compress_=1`. This is the supported path (mirrors
-  `test_transparent_compress.cc`); a hand-rolled `AsyncCompress` to a separate
-  pool deadlocked and was the original hang.
+- **PutBlob storage (works):** the bench writes a compose config placing the
+  compressor chimod at pool 512 in front of CTE core (513) + RAM bdev, then stores
+  each snapshot via a **core-pool (513) PutBlob** — this genuinely stores (verified,
+  `put_failures=0`). The stored bytes are **uncompressed**.
+- **Runtime compression (BROKEN):** routing the put through the compressor client
+  (a `DynamicScheduleTask` to pool 512, `--via-compressor`) is the intended
+  "transparent compression" path and mirrors `test_transparent_compress.cc`, but it
+  **deadlocks** here — `DynamicSchedule`'s nested blocking `.Wait()`s hang on this
+  embedded runtime even for one put. The `compressor_dynamic_schedule` unit test
+  passes only in its own single-put harness. This is the open issue.
 - **Async double-buffer:** two device snapshot buffers + two SHM staging buffers
   per run ("two PutBlob slots per block" = the double-buffer slots, each with an
   in-flight future). Step `s+1` compute overlaps step `s` compress+store; a slot
