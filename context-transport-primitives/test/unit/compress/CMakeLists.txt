@@ -14,6 +14,9 @@ add_executable(test_compress_exec
 # Note: AI model predictor tests (Q-Table, LinReg, Distribution, Contention)
 # have been moved to context-transfer-engine/compressor/test
 
+# Unified synthetic compressor benchmark
+add_subdirectory(benchmark)
+
 #------------------------------------------------------------------------------
 # Link Dependencies
 #------------------------------------------------------------------------------

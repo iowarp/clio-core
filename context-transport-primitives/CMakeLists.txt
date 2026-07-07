@@ -324,13 +324,10 @@ if(CLIO_CTE_ENABLE_COMPRESS)
     target_link_libraries(compress INTERFACE ${COMPRESS_LIBS})
     target_link_directories(compress INTERFACE ${COMPRESS_LIB_DIRS})
     target_include_directories(compress INTERFACE ${COMPRESS_INCLUDES})
-    # Link qtable_predictor if it was built
-    if(TARGET qtable_predictor)
-        target_link_libraries(compress INTERFACE qtable_predictor)
-    endif()
-    # Link dense_nn_predictor if it was built (requires Eigen3)
-    if(TARGET dense_nn_predictor)
-        target_link_libraries(compress INTERFACE dense_nn_predictor)
+    # Unified compression-metric prediction models (issue #693): Q-table,
+    # linreg, XGBoost (optional), and the NeuroPress NN, in one library.
+    if(TARGET clio_ctp_compress_model)
+        target_link_libraries(compress INTERFACE clio_ctp_compress_model)
     endif()
     # nvcomp.h / cusz.h / ndzip.h include <cuda_runtime.h>; the GPU compressor
     # imported targets do not all propagate the CUDA toolkit include dir, so link
