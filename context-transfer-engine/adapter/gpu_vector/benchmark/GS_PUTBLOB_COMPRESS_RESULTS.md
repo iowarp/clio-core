@@ -1,18 +1,25 @@
 # Gray-Scott + CLIO PutBlob + compressor library (Delta A100)
 
-> **STATUS — read first (corrected).** The compressor *library* integration is
-> real and verified: each pinned library (incl. the GPU `cuszp`) is applied to a
-> real Gray-Scott snapshot and the **ratios below are directly measured**. What is
-> **NOT** working is routing the PutBlob **through the CLIO compressor chimod** to
-> compress *in the runtime*: that path (`--via-compressor`) **deadlocks** — the
-> compressor's `DynamicSchedule` does nested blocking `.Wait()`s inside its task
-> coroutine and hangs on this embedded runtime **even for a single put**. So the
-> benchmark's puts are stored via CLIO PutBlob on the core pool **UNCOMPRESSED**;
-> the reported ratio is a **direct measurement of the library**, not evidence the
-> runtime compressed. Making the runtime genuinely compress a PutBlob (host or
-> device) is an **open CLIO issue** (fix: `co_await` the nested tasks instead of
-> blocking `.Wait()`), and is the real remaining work. Earlier revisions of this
-> doc overstated the pipeline as end-to-end working; that was wrong.
+> **STATUS — FIXED.** The CLIO runtime now **genuinely compresses** PutBlobs
+> through the compressor chimod, end-to-end (`--via-compressor`). This required a
+> real bug fix in the compressor: `DynamicSchedule`/`Compress`/`Decompress` were
+> using **blocking `.Wait()`** on their nested sub-tasks, which deadlocks the
+> worker's coroutine (the core runtime uses non-blocking `CLIO_CO_AWAIT`; the
+> compressor did not). Switching those waits to `CLIO_CO_AWAIT`
+> (`compressor_runtime.cc`) resolves it — verified: 1 → 2048 blocks, 0 put
+> failures, and a **nonzero runtime-reported compressed size** confirming the
+> runtime (not just a probe) compressed. Concurrency also needs a large
+> `queue_depth` (the bench uses 65536): each put spawns a nested core put, so ~2×
+> in-flight tasks must fit the queue.
+>
+> Two honesty notes: (1) an **earlier revision of this doc wrongly said the
+> pipeline worked, then wrongly said it was unfixable** — both are superseded by
+> this working fix. (2) The runtime path is **functional but slow** (~11 MiB/s;
+> ~356 µs/put of compress+store task overhead, largely cuSZp's per-call
+> stream/malloc) vs. the ~2 GiB/s uncompressed core path — a real characteristic,
+> not hidden. The `ratio` numbers below are **directly measured** with the same
+> library; the runtime-reported ratio (e.g. cuszp **3.91×** per-block) matches
+> within per-chunk-size effects.
 
 Counterpart to `clio_gray_scott_transfer_bench.cu` (which uses raw `cudaMemcpyAsync`
 and is fully working). This bench runs Gray-Scott, stores each snapshot via a CLIO
@@ -33,16 +40,18 @@ follow-ups).
   `DynamicSchedule()`); `CompressionFactory::WireIdForName()` added for the
   name→wire-id lookup. Confirmed firing at runtime:
   `Compressor pinned via CLIO_CTE_COMPRESS_LIB: lz4 (wire=4, preset=2)`.
-- **PutBlob storage (works):** the bench writes a compose config placing the
-  compressor chimod at pool 512 in front of CTE core (513) + RAM bdev, then stores
-  each snapshot via a **core-pool (513) PutBlob** — this genuinely stores (verified,
-  `put_failures=0`). The stored bytes are **uncompressed**.
-- **Runtime compression (BROKEN):** routing the put through the compressor client
-  (a `DynamicScheduleTask` to pool 512, `--via-compressor`) is the intended
-  "transparent compression" path and mirrors `test_transparent_compress.cc`, but it
-  **deadlocks** here — `DynamicSchedule`'s nested blocking `.Wait()`s hang on this
-  embedded runtime even for one put. The `compressor_dynamic_schedule` unit test
-  passes only in its own single-put harness. This is the open issue.
+- **Compose:** the bench writes a compose config placing the compressor chimod at
+  pool 512 in front of CTE core (513) + RAM bdev (`num_threads: 8`,
+  `queue_depth: 65536`).
+- **Runtime compression (WORKS, `--via-compressor`, default OFF):** each snapshot
+  is stored via `compressor.AsyncCompress(...)` → the compressor `Compress()`
+  handler compresses (the pinned library) and forwards to core PutBlob (513). The
+  runtime-reported compressed size is nonzero, confirming genuine in-runtime
+  compression. Fixed by the `.Wait()` → `CLIO_CO_AWAIT` change in
+  `compressor_runtime.cc`. Functional but slow (per-put task overhead).
+- **Default path (`none`/no `--via-compressor`):** stores each snapshot via a
+  **core-pool (513) PutBlob** (uncompressed, ~2 GiB/s) — fast, for the transfer
+  mechanics and knob sweeps. The ratio is still measured directly.
 - **Async double-buffer:** two device snapshot buffers + two SHM staging buffers
   per run ("two PutBlob slots per block" = the double-buffer slots, each with an
   in-flight future). Step `s+1` compute overlaps step `s` compress+store; a slot

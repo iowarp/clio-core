@@ -314,12 +314,12 @@ clio::run::TaskResume Runtime::Monitor(ctp::ipc::FullPtr<MonitorTask> task,
   // Poll target states
   try {
     auto list_task = core_client_->AsyncListTargets();
-    list_task.Wait();
+    CLIO_CO_AWAIT(list_task);
     if (list_task->GetReturnCode() == 0) {
       std::lock_guard<std::mutex> lock(target_states_mutex_);
       for (auto &target_name : list_task->target_names_) {
         auto stat_task = core_client_->AsyncGetTargetInfo(target_name);
-        stat_task.Wait();
+        CLIO_CO_AWAIT(stat_task);
         if (stat_task->GetReturnCode() == 0) {
           auto &state = target_states_[target_name];
           state.target_name_ = target_name;
@@ -656,7 +656,7 @@ clio::run::TaskResume Runtime::DynamicSchedule(
             task->blob_name_.str(), task->offset_, task->size_,
             task->blob_data_, task->score_, context, task->flags_,
             task->core_pool_id_);
-        compress_task.Wait();
+        CLIO_CO_AWAIT(compress_task);
         task->context_ = compress_task->context_;
         task->tier_score_ = compress_task->tier_score_;
         task->return_code_ = compress_task->return_code_;
@@ -715,7 +715,7 @@ clio::run::TaskResume Runtime::DynamicSchedule(
         clio::run::PoolQuery::Local(), task->tag_id_, task->blob_name_.str(),
         task->offset_, task->size_, task->blob_data_, task->score_, context,
         task->flags_, task->core_pool_id_);
-    compress_task.Wait();
+    CLIO_CO_AWAIT(compress_task);
 
     // Copy results back
     task->context_ = compress_task->context_;
@@ -783,7 +783,7 @@ clio::run::TaskResume Runtime::Compress(ctp::ipc::FullPtr<CompressTask> task,
           task->tag_id_, task->blob_name_.str(), task->offset_, task->size_,
           task->blob_data_, task->score_, context, task->flags_,
           clio::run::PoolQuery::Local());
-      put_task.Wait();
+      CLIO_CO_AWAIT(put_task);
       task->context_ = put_task->context_;
       task->return_code_ = put_task->return_code_;
       CLIO_CO_RETURN;
@@ -875,7 +875,7 @@ clio::run::TaskResume Runtime::Compress(ctp::ipc::FullPtr<CompressTask> task,
           task->tag_id_, task->blob_name_.str(), task->offset_,
           total_stored_size, compressed_shm_ptr, task->score_, context,
           task->flags_, clio::run::PoolQuery::Local());
-      put_task.Wait();
+      CLIO_CO_AWAIT(put_task);
 
       // Free compressed data buffer
       CLIO_IPC->FreeBuffer(compressed_shm);
@@ -904,7 +904,7 @@ clio::run::TaskResume Runtime::Compress(ctp::ipc::FullPtr<CompressTask> task,
           task->tag_id_, task->blob_name_.str(), task->offset_, task->size_,
           task->blob_data_, task->score_, context, task->flags_,
           clio::run::PoolQuery::Local());
-      put_task.Wait();
+      CLIO_CO_AWAIT(put_task);
 
       context.compress_lib_ = 0;  // Mark as uncompressed
       task->context_ = put_task->context_;
@@ -962,7 +962,7 @@ clio::run::TaskResume Runtime::Decompress(ctp::ipc::FullPtr<DecompressTask> task
     auto get_task = core_client_->AsyncGetBlob(
         task->tag_id_, task->blob_name_.str(), task->offset_, expected_size,
         task->flags_, temp_buffer_ptr, clio::run::PoolQuery::Local());
-    get_task.Wait();
+    CLIO_CO_AWAIT(get_task);
 
     if (get_task->return_code_ != 0) {
       CLIO_IPC->FreeBuffer(temp_buffer);

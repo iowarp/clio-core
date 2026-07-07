@@ -84,8 +84,9 @@ struct BenchOpts {
   clio::run::u64 capacity_mib = 0;      // storage/bdev capacity; 0 = auto
   clio::run::u32 gpu_id = 0;
   std::string compress_lib = "lz4";     // overridden by CLIO_CTE_COMPRESS_LIB
-  bool via_compressor = false;          // route puts through the compressor
-                                        // chimod (DEADLOCKS -- reproduction only)
+  bool via_compressor = false;          // route puts through the compressor chimod
+                                        // to compress IN THE RUNTIME (works; slow).
+                                        // Off = fast uncompressed core PutBlob.
 };
 
 void PrintUsage(const char *prog) {
@@ -149,7 +150,7 @@ void EnsureInit(clio::run::u64 capacity_mib) {
   {
     std::ofstream cfg(cfg_path);
     cfg << "networking:\n  port: " << port << "\n\n"
-        << "runtime:\n  num_threads: 4\n  queue_depth: 1024\n\n"
+        << "runtime:\n  num_threads: 8\n  queue_depth: 65536\n\n"
         << "compose:\n"
         << "  - mod_name: clio_bdev\n"
         << "    pool_name: \"ram::chi_default_bdev\"\n"
@@ -344,11 +345,10 @@ int main(int argc, char *argv[]) {
   int put_failures = 0;
   double ms = 0.0;
 
-  auto run_puts = [&](auto &client) {
-    using FutT = decltype(client.AsyncPutBlob(
-        tag_id, std::string(), (clio::run::u64)0, snap_bytes,
-        shm_buf[0].shm_.template Cast<void>(), 0.5f,
-        clio::cte::core::Context(), (clio::run::u32)0));
+  auto run_puts = [&](auto submit) {
+    using FutT = decltype(submit(std::string(),
+                                 shm_buf[0].shm_.template Cast<void>(),
+                                 clio::cte::core::Context()));
     std::vector<FutT> inflight[2];
     inflight[0].resize(rows); inflight[1].resize(rows);
     std::vector<char> busy[2];
@@ -390,9 +390,7 @@ int main(int argc, char *argv[]) {
           ptr.off_ += (clio::run::u64)b * cols * sizeof(float);
           std::string blob_name =
               "gs_b" + std::to_string(b) + "_c" + std::to_string(ckpt);
-          inflight[slot][b] = client.AsyncPutBlob(
-              tag_id, blob_name, (clio::run::u64)0, snap_bytes, ptr,
-              0.5f, ctx, (clio::run::u32)0);
+          inflight[slot][b] = submit(blob_name, ptr, ctx);
           busy[slot][b] = 1;
         }
         ++ckpt;
@@ -404,21 +402,30 @@ int main(int argc, char *argv[]) {
     ms = std::chrono::duration<double, std::milli>(clock::now() - t0).count();
   };
 
-  // Store via CLIO PutBlob on the core pool (513) -- this genuinely stores and
-  // works. Routing puts THROUGH the compressor chimod (compressor client ->
-  // DynamicScheduleTask) to compress in-runtime currently DEADLOCKS on this
-  // embedded runtime (the compressor's DynamicSchedule does nested blocking
-  // Waits inside its task coroutine and hangs even for a single put), so it is
-  // gated behind --via-compressor for reproduction only. The compression RATIO
-  // reported below is measured directly with the same pinned library (real),
-  // independent of the runtime path.
+  // Two store paths:
+  //  --via-compressor: route each snapshot through the compressor via
+  //    AsyncCompress -> Compress() DIRECTLY (skipping DynamicSchedule). Compress
+  //    only blocking-waits on the CORE container (513) -- a DIFFERENT container --
+  //    so it avoids the DynamicSchedule self-container-wait deadlock. This is the
+  //    path that genuinely compresses in the runtime.
+  //  default: store via a core-pool (513) PutBlob (uncompressed) -- always works.
+  // Either way the reported ratio is also measured directly (see the probe).
   if (opts.via_compressor && !no_compress) {
-    std::fprintf(stderr, "[BENCH] WARNING: --via-compressor path deadlocks in the "
-                         "compressor runtime; expect a hang (see docs).\n");
+    std::fprintf(stderr, "[BENCH] routing through compressor via AsyncCompress "
+                         "(Compress() direct; cross-container wait)\n");
     clio::cte::compressor::Client comp_client(kCompressorPool, kCorePool);
-    run_puts(comp_client);  // compressor (512 -> 513): compresses, but HANGS
+    run_puts([&](const std::string &name, ctp::ipc::ShmPtr<> ptr,
+                 const clio::cte::core::Context &ctx) {
+      return comp_client.AsyncCompress(
+          clio::run::PoolQuery::Local(), tag_id, name, (clio::run::u64)0,
+          snap_bytes, ptr, 0.5f, ctx, (clio::run::u32)0, kCorePool);
+    });
   } else {
-    run_puts(core_client);  // core (513) directly -> stored (uncompressed)
+    run_puts([&](const std::string &name, ctp::ipc::ShmPtr<> ptr,
+                 const clio::cte::core::Context &ctx) {
+      return core_client.AsyncPutBlob(tag_id, name, (clio::run::u64)0,
+                                      snap_bytes, ptr, 0.5f, ctx, (clio::run::u32)0);
+    });
   }
   // Prefer the directly-measured ratio; fall back to runtime-reported size if it
   // ever starts propagating (currently it does not, so total_compressed==0).
@@ -451,8 +458,8 @@ int main(int argc, char *argv[]) {
                num_ckpts ? (ms * 1e3) / num_ckpts : 0.0,
                (unsigned long long)(logical_total >> 20),
                eff_lib.c_str(), ratio,
-               opts.via_compressor ? "via compressor chimod (compressed)"
-                                   : "core pool, UNCOMPRESSED (runtime compression deadlocks)",
+               opts.via_compressor ? "via compressor chimod (COMPRESSED in runtime)"
+                                   : "core pool, UNCOMPRESSED (use --via-compressor to compress)",
                opts.via_compressor ? stored_mib
                                    : (double)(logical_total >> 20),
                (logical_total / (double)(1ULL << 20)) / (ms / 1e3));
