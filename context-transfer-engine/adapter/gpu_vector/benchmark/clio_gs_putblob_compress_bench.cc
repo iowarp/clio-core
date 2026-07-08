@@ -83,7 +83,7 @@ struct BenchOpts {
                                         // directly to override L.
   clio::run::u64 capacity_mib = 0;      // storage/bdev capacity; 0 = auto
   clio::run::u32 gpu_id = 0;
-  std::string compress_lib = "lz4";     // overridden by CLIO_CTE_COMPRESS_LIB
+  std::string compress_lib = "cuszp";   // GPU lossy; overridden by CLIO_CTE_COMPRESS_LIB
   bool via_compressor = false;          // route puts through the compressor chimod
                                         // to compress IN THE RUNTIME (works; slow).
                                         // Off = fast uncompressed core PutBlob.
@@ -100,7 +100,7 @@ void PrintUsage(const char *prog) {
                "  --grid-size L           Floats each block generates per step (row width L;\n"
                "                          per-block bytes = 4L) (default 1024)\n"
                "  --per-block-bytes B     Override: bytes/block/step directly (= 4L)\n"
-               "  --compress-lib NAME     Compressor (default lz4; CLIO_CTE_COMPRESS_LIB overrides)\n"
+               "  --compress-lib NAME     GPU compressor (default cuszp; CLIO_CTE_COMPRESS_LIB overrides)\n"
                "  --capacity-mib N        RAM storage capacity (default = 2x stored, min 256)\n"
                "  --gpu-id N              GPU index (default 0)\n"
                "  --help                  Show this message\n",
@@ -194,7 +194,10 @@ __global__ void GsInitKernel(float *u, float *v, int rows, int cols) {
   }
 }
 
-// One GS step for all blocks; snapshots the v-field for `row` into out.
+// One GS step for all blocks. Advances u/v -> u2/v2; if `out` is non-null,
+// also writes the v-field snapshot into `out` (a HBM buffer the compressor then
+// reads in place). `out` is null on non-checkpoint steps so the snapshot buffer
+// is never disturbed while a compression is in flight against it.
 __global__ void GsStepKernel(const float *u, const float *v, float *u2,
                              float *v2, float *out, int rows, int cols) {
   const int row = blockIdx.x;
@@ -212,7 +215,7 @@ __global__ void GsStepKernel(const float *u, const float *v, float *u2,
     const float uvv = uc * vc * vc;
     u2[idx] = uc + (Du * lap_u - uvv + F * (1.0f - uc)) * dt;
     v2[idx] = vc + (Dv * lap_v + uvv - (F + k) * vc) * dt;
-    out[idx] = v2[idx];
+    if (out) out[idx] = v2[idx];
   }
 }
 
@@ -286,17 +289,24 @@ int main(int argc, char *argv[]) {
   float *v  = ctp::GpuApi::Malloc<float>(field_bytes);
   float *u2 = ctp::GpuApi::Malloc<float>(field_bytes);
   float *v2 = ctp::GpuApi::Malloc<float>(field_bytes);
+  // Two HBM snapshot buffers (double-buffered). The compressor reads these
+  // device pointers IN PLACE -- there is no HBM->DRAM staging of the
+  // uncompressed snapshot anywhere in this benchmark.
   float *snap_dev[2] = { ctp::GpuApi::Malloc<float>(field_bytes),
                          ctp::GpuApi::Malloc<float>(field_bytes) };
-  auto *ipc = CLIO_IPC;
-  ctp::ipc::FullPtr<char> shm_buf[2] = { ipc->AllocateBuffer(field_bytes),
-                                         ipc->AllocateBuffer(field_bytes) };
-  if (!u || !v || !u2 || !v2 || !snap_dev[0] || !snap_dev[1] ||
-      shm_buf[0].IsNull() || shm_buf[1].IsNull()) {
-    std::fprintf(stderr, "[BENCH] allocation failed\n"); return 2;
+  if (!u || !v || !u2 || !v2 || !snap_dev[0] || !snap_dev[1]) {
+    std::fprintf(stderr, "[BENCH] device allocation failed\n"); return 2;
   }
-  std::memset(shm_buf[0].ptr_, 0, field_bytes);
-  std::memset(shm_buf[1].ptr_, 0, field_bytes);
+
+  // A blob_data ShmPtr that points DIRECTLY at HBM: null alloc-id + raw device
+  // address. ToFullPtr resolves it to that pointer, and the GPU compressor
+  // (cuSZp) reads it in place -- compression happens entirely in HBM (cuSZp
+  // allocates its own temporary HBM output buffer).
+  auto dev_ptr = [](void *addr) {
+    ctp::ipc::ShmPtr<> p; p.alloc_id_.SetNull();
+    p.off_ = reinterpret_cast<clio::run::u64>(addr);
+    return p;
+  };
 
   GsInitKernel<<<rows, opts.threads>>>(u, v, rows, cols);
   ctp::GpuApi::Synchronize();
@@ -314,14 +324,13 @@ int main(int argc, char *argv[]) {
   } else {
     GsStepKernel<<<rows, opts.threads>>>(u, v, u2, v2, snap_dev[0], rows, cols);
     ctp::GpuApi::Synchronize();
-    ctp::GpuApi::Memcpy<float>(reinterpret_cast<float *>(shm_buf[0].ptr_),
-                               snap_dev[0], field_bytes);
     auto comp = ctp::CompressionFactory::GetPreset(
         eff_lib, ctp::CompressionPreset::BALANCED);
     if (comp) {
       std::vector<char> out(field_bytes + field_bytes / 2 + 4096);
       size_t out_sz = out.size();
-      if (comp->Compress(out.data(), out_sz, shm_buf[0].ptr_, field_bytes) &&
+      // Input is the HBM device pointer -- cuSZp compresses it in place.
+      if (comp->Compress(out.data(), out_sz, snap_dev[0], field_bytes) &&
           out_sz > 0) {
         measured_ratio = (double)field_bytes / (double)out_sz;
         std::fprintf(stderr,
@@ -346,8 +355,7 @@ int main(int argc, char *argv[]) {
   double ms = 0.0;
 
   auto run_puts = [&](auto submit) {
-    using FutT = decltype(submit(std::string(),
-                                 shm_buf[0].shm_.template Cast<void>(),
+    using FutT = decltype(submit(std::string(), dev_ptr(snap_dev[0]),
                                  clio::cte::core::Context()));
     std::vector<FutT> inflight[2];
     inflight[0].resize(rows); inflight[1].resize(rows);
@@ -373,12 +381,16 @@ int main(int argc, char *argv[]) {
       const bool is_ckpt = ((s + 1) % opts.checkpoint_interval == 0) ||
                            (s + 1 == opts.nsteps);
       const int slot = ckpt & 1;
-      GsStepKernel<<<rows, opts.threads>>>(u, v, u2, v2, snap_dev[slot], rows, cols);
+      // Drain this slot's prior in-flight compressions BEFORE the kernel writes
+      // snap_dev[slot] -- the compressor reads that HBM buffer directly, so it
+      // must not be overwritten while a compress against it is still running.
+      if (is_ckpt) drain(slot);
+      // Advance the simulation every step; write the snapshot into snap_dev[slot]
+      // only on checkpoint steps (null otherwise), so the buffer stays stable.
+      GsStepKernel<<<rows, opts.threads>>>(
+          u, v, u2, v2, is_ckpt ? snap_dev[slot] : nullptr, rows, cols);
       ctp::GpuApi::Synchronize();
       if (is_ckpt) {
-        drain(slot);  // free this slot's prior puts before overwriting it
-        ctp::GpuApi::Memcpy<float>(reinterpret_cast<float *>(shm_buf[slot].ptr_),
-                                   snap_dev[slot], field_bytes);
         for (int b = 0; b < rows; ++b) {
           clio::cte::core::Context ctx;
 #if CTP_ENABLE_COMPRESS
@@ -386,8 +398,10 @@ int main(int argc, char *argv[]) {
           ctx.compress_lib_ = compress_lib;   // env pin overrides in the runtime
           ctx.compress_preset_ = 2;           // balanced
 #endif
-          ctp::ipc::ShmPtr<> ptr = shm_buf[slot].shm_.template Cast<void>();
-          ptr.off_ += (clio::run::u64)b * cols * sizeof(float);
+          // blob_data points straight at this block's row in HBM -- no copy.
+          ctp::ipc::ShmPtr<> ptr = dev_ptr(
+              reinterpret_cast<char *>(snap_dev[slot]) +
+              (clio::run::u64)b * cols * sizeof(float));
           std::string blob_name =
               "gs_b" + std::to_string(b) + "_c" + std::to_string(ckpt);
           inflight[slot][b] = submit(blob_name, ptr, ctx);
@@ -467,8 +481,6 @@ int main(int argc, char *argv[]) {
   ctp::GpuApi::Free<float>(u);  ctp::GpuApi::Free<float>(v);
   ctp::GpuApi::Free<float>(u2); ctp::GpuApi::Free<float>(v2);
   ctp::GpuApi::Free<float>(snap_dev[0]); ctp::GpuApi::Free<float>(snap_dev[1]);
-  ipc->FreeBuffer(shm_buf[0]);
-  ipc->FreeBuffer(shm_buf[1]);
   return put_failures == 0 ? 0 : 1;
 }
 
