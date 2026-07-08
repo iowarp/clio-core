@@ -107,6 +107,25 @@ class Vector {
    *  put / get futures. */
   void FlushAllSync();
 
+  /**
+   * Host-driven materialization of every stored page into its HBM slot.
+   *
+   * Read-side counterpart to eviction, needed for the COMPRESSED vector: an
+   * on-device page fault spin-waits on the GPU, but a compressor GetBlob is
+   * serviced by launching a GPU decompression kernel (cuSZp, which internally
+   * cudaMalloc/cudaMemcpy-synchronizes the device) -- so the fault kernel and
+   * the decompressor deadlock on a single GPU. FaultAllSync avoids this by
+   * decompressing from the HOST while the GPU is idle: for every HBM slot it
+   * issues a GetBlob (routed through the storage pool; if that pool is a
+   * compressor, it decompresses) straight INTO the slot's HBM address, then
+   * marks the slot resident. A subsequent device read kernel finds every page
+   * present -- no on-device fault, no spin, no deadlock.
+   *
+   * Legacy/single-tier only (host_pages_per_block == 0): the HBM tier holds the
+   * whole logical extent, so materializing every slot materializes the vector.
+   */
+  void FaultAllSync();
+
   /** Cache-thread-only: drains the per-block host_prefetch_q, issues
    *  AsyncGetBlob via the CPU-side CTE client for each directive,
    *  waits for completion, then launches a tiny kernel to clear
@@ -225,6 +244,27 @@ __global__ void LegacyFlushKernel(::clio::run::IpcManagerGpuInfo info,
   }
   FlushPageBase(g_ipc_manager_ptr, v, b_idx, p, slot);
   (void)g_ipc_manager;
+}
+
+/** Mark every HBM slot resident and clean, binding slot (block, s) to the
+ *  global logical page (block * gpu_pages_per_block + s). Used by
+ *  Vector::FaultAllSync after the host has decompressed each page's bytes
+ *  into the slot's device_ptr; the read kernel's Resolve then finds every
+ *  page present (page_idx set) instead of cold-faulting. Legacy/single-tier
+ *  only. */
+__global__ void MarkAllResidentKernel(DeviceViewBase v) {
+  if (blockIdx.x >= v.nblocks) return;
+  Block *b = GetBlock(v, blockIdx.x);
+  for (clio::run::u32 s = threadIdx.x; s < v.gpu_pages_per_block;
+       s += blockDim.x) {
+    Page *p = &b->pages[s];
+    p->page_idx = static_cast<int32_t>(
+        static_cast<clio::run::u64>(blockIdx.x) * v.gpu_pages_per_block + s);
+    p->modify_min = -1;
+    p->modify_max = -1;
+    p->flags = 0;
+    p->tier = 0;
+  }
 }
 
 /** Atomic-clear kPageBusy + kPageGetInFlight on a single (block, slot).
@@ -1285,6 +1325,62 @@ inline void Vector<T>::FlushAllSync() {
   // continuously. The Vector is automatically coherent — the user
   // never needs to flush. This method is retained as a no-op so
   // legacy callers compile, but it does NOT do anything.
+#endif
+}
+
+template <typename T>
+inline void Vector<T>::FaultAllSync() {
+#if !CTP_IS_DEVICE_PASS
+  if (impl_->host_ppb_cached != 0) {
+    throw std::runtime_error(
+        "gpu_vector: FaultAllSync is single-tier (legacy) only");
+  }
+  const clio::run::u32 nblocks = impl_->nblocks_cached;
+  const clio::run::u32 gpu_ppb = impl_->gpu_ppb_cached;
+  const clio::run::u64 page_size = impl_->page_size_cached;
+
+  // Decompress every page from the store straight into its HBM slot. The
+  // GetBlob is routed to impl_->cte_pool_id (the storage pool); when that is a
+  // compressor it decompresses. blob_data is a zero-copy ShmPtr whose off_ is
+  // the slot's HBM device address (MakeBlobShmPtr), so the (de)compressor
+  // writes the page bytes directly into HBM. The GPU is idle here (no user
+  // kernel), so the on-GPU decompressor runs without contending with a
+  // spin-waiting fault kernel.
+  clio::cte::core::Client client(impl_->cte_pool_id);
+  for (clio::run::u32 b = 0; b < nblocks; ++b) {
+    for (clio::run::u32 s = 0; s < gpu_ppb; ++s) {
+      clio::run::u64 gp = static_cast<clio::run::u64>(b) * gpu_ppb + s;
+      char *hbm = static_cast<char *>(impl_->pages_base) + gp * page_size;
+      // Matches the eviction name: writer stores "<tag>_b<block>" and the
+      // (de)compressor appends "_pi<gpu_page_idx>" where gpu_page_idx is the
+      // global page index. Legacy slot (b,s) holds global page b*gpu_ppb+s.
+      std::string name = impl_->tag_name + "_b" + std::to_string(b) + "_pi" +
+                         std::to_string(gp);
+      // Zero-copy blob_data: null alloc id + off_ = the slot's HBM device
+      // address, so the (de)compressor writes decompressed bytes straight into
+      // HBM. (Host-side equivalent of detail::MakeBlobShmPtr, which is
+      // device-only.)
+      ctp::ipc::ShmPtr<> blob_data;
+      blob_data.alloc_id_ = ctp::ipc::AllocatorId::GetNull();
+      blob_data.off_ = reinterpret_cast<clio::run::u64>(hbm);
+      auto gf = client.AsyncGetBlob(view_.base.tag_id, name, /*offset=*/0,
+                                    page_size, /*flags=*/0, blob_data,
+                                    clio::run::PoolQuery::Local());
+      gf.Wait();
+      if (gf->GetReturnCode() != 0) {
+        throw std::runtime_error(
+            "gpu_vector: FaultAllSync GetBlob failed for '" + name +
+            "' rc=" + std::to_string(gf->GetReturnCode()));
+      }
+    }
+  }
+
+  // Bind every slot to its global page and mark resident/clean so the read
+  // kernel's Resolve finds the page present instead of cold-faulting.
+  clio::run::u32 threads = (gpu_ppb < 256u) ? gpu_ppb : 256u;
+  if (threads == 0) threads = 1;
+  detail::MarkAllResidentKernel<<<nblocks, threads>>>(view_.base);
+  ctp::GpuApi::Synchronize();
 #endif
 }
 

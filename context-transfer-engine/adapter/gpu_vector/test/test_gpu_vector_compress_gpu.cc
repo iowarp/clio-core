@@ -209,79 +209,64 @@ TEST_CASE("gpu_vector: compressed write/evict then fault/read round-trip",
                  (unsigned long long)total);
   }  // writer destroyed: all resident HBM pages dropped
 
-  // ---- Phase B: verify every flushed page decompresses correctly ----
+  // ---- Phase B: DEVICE-SIDE read of the compressed vector ----
   //
-  // NOTE on the device fault path: reading the vector back on-device (a fresh
-  // Vector whose read kernel cold-faults each page) DEADLOCKS on a single GPU.
-  // The fault kernel spin-waits on-device for its GetBlob, but the compressor
-  // services that GetBlob by launching cuSZp's *decompression kernel on the
-  // same GPU* -- which cannot make progress while the fault kernel monopolizes
-  // the device. (Uncompressed faults work because they are serviced by a CPU
-  // memcpy, needing no GPU kernel.) The eviction/flush direction has no such
-  // problem: flush kernels EXIT before the compressor runs. GPU-side page-fault
-  // decompression therefore needs an async fault-completion model (out of scope
-  // here); see GS_PUTBLOB_COMPRESS_RESULTS.md.
+  // A fresh reader Vector on the same tag/geometry. An on-device page fault
+  // (read_range cold-miss) would DEADLOCK on a single GPU: the fault kernel
+  // spin-waits on-device for its GetBlob, but the compressor services it by
+  // launching cuSZp's decompression kernel -- which internally cudaMalloc/
+  // cudaMemcpy-synchronizes the device -- so it cannot make progress while the
+  // fault kernel monopolizes the GPU. (Uncompressed faults are fine: a CPU
+  // memcpy services them, no GPU kernel.)
   //
-  // We instead verify the eviction result via the host decompress path: fetch
-  // each per-page blob the Vector flushed back through the compressor (GetBlob
-  // -> DecompressGetBlob -> cuSZp decompress on an idle GPU) and compare. This
-  // proves the Vector's pages were genuinely compressed in HBM AND round-trip
-  // within cuSZp's error bound -- i.e. a real compressed GPU vector eviction.
-  clio::cte::core::Client core512;
-  core512.Init(clio::cte::core::kCtePoolId);
-  auto tagf = core512.AsyncGetOrCreateTag(tag);
-  tagf.Wait();
-  REQUIRE(tagf->GetReturnCode() == 0);
-  auto tag_id = tagf->tag_id_;
+  // FaultAllSync() sidesteps this: it decompresses every stored page into its
+  // HBM slot from the HOST while the GPU is idle (no spin-waiting kernel to
+  // starve the decompressor), then marks the slots resident. The device read
+  // kernel below then reads resident HBM pages -- a genuine device-side read of
+  // compressed-at-rest data, no on-device fault, no deadlock.
+  auto *result = ctp::GpuApi::MallocHost<float>(total * sizeof(float));
+  REQUIRE(result != nullptr);
+  std::memset(result, 0, total * sizeof(float));
+  {
+    gv::Vector<float> vec(tag, nblocks, /*gpu_id=*/0, pages_per_block,
+                          /*host_pages_per_block=*/0, page_size_bytes,
+                          /*cache_period_us=*/20000, gv::CacheMode::kLegacy,
+                          /*manager_threads_per_block=*/32,
+                          /*allow_cold_miss_fault=*/true,
+                          /*storage_pool_id=*/StoragePool());
+    vec.FaultAllSync();  // host-decompress every page into HBM, mark resident
+    std::fprintf(stderr, "[GPUVEC-C] FaultAllSync: materialized all pages\n");
+    auto view = vec.Device();
+    GpuVecCompressReadKernel<<<nblocks, 32>>>(gpu_info, view, result, total);
+    ctp::GpuApi::Synchronize();
+  }
 
-  clio::cte::core::Client c600;
-  c600.Init(StoragePool());  // compressor entrypoint (decompresses on GetBlob)
-
+  // ---- Verify within cuSZp's absolute error bound ----
   double max_abs_err = 0.0, mean_abs_err = 0.0;
-  clio::run::u64 checked = 0, first_bad = total;
-  for (clio::run::u32 b = 0; b < nblocks; ++b) {
-    for (clio::run::u32 p = 0; p < pages_per_block; ++p) {
-      // The writer names each page blob "<tag>_b<block>" and the core/compressor
-      // append "_pi<gpu_page_idx>", where gpu_page_idx is the GLOBAL page index
-      // (element / page_capacity). Block b owns global pages [b*ppb, (b+1)*ppb).
-      clio::run::u64 gp = static_cast<clio::run::u64>(b) * pages_per_block + p;
-      std::string name = std::string(tag) + "_b" + std::to_string(b) + "_pi" +
-                         std::to_string(gp);
-      auto out = ipc->AllocateBuffer(page_size_bytes);
-      REQUIRE(!out.IsNull());
-      std::memset(out.ptr_, 0, page_size_bytes);
-      auto gf = c600.AsyncGetBlob(tag_id, name, /*offset=*/0, page_size_bytes,
-                                  /*flags=*/0, out.shm_.template Cast<void>(),
-                                  clio::run::PoolQuery::Local());
-      gf.Wait();
-      REQUIRE(gf->GetReturnCode() == 0);
-      const float *pg = reinterpret_cast<const float *>(out.ptr_);
-      for (clio::run::u64 j = 0; j < elems_per_page; ++j) {
-        clio::run::u64 i = gp * elems_per_page + j;
-        double e = std::fabs((double)pg[j] - (double)Expected(i));
-        mean_abs_err += e;
-        if (e > max_abs_err) max_abs_err = e;
-        if (e > 2.0e-3 && first_bad == total) first_bad = i;
-        ++checked;
-      }
-      ipc->FreeBuffer(out);
-    }
+  clio::run::u64 first_bad = total;
+  for (clio::run::u64 i = 0; i < total; ++i) {
+    double e = std::fabs((double)result[i] - (double)Expected(i));
+    mean_abs_err += e;
+    if (e > max_abs_err) max_abs_err = e;
+    if (e > 2.0e-3 && first_bad == total) first_bad = i;
   }
-  mean_abs_err /= (double)checked;
+  mean_abs_err /= (double)total;
   std::fprintf(stderr,
-               "[GPUVEC-C] decompressed %llu elems  max_abs_err=%.3e "
+               "[GPUVEC-C] device read %llu elems  max_abs_err=%.3e "
                "mean_abs_err=%.3e (eb=1e-3)\n",
-               (unsigned long long)checked, max_abs_err, mean_abs_err);
+               (unsigned long long)total, max_abs_err, mean_abs_err);
   if (first_bad != total) {
-    std::fprintf(stderr, "[GPUVEC-C] first out-of-bound at %llu: exp %.6f\n",
-                 (unsigned long long)first_bad, Expected(first_bad));
+    std::fprintf(stderr, "[GPUVEC-C] first out-of-bound at %llu: got %.6f exp %.6f\n",
+                 (unsigned long long)first_bad, result[first_bad],
+                 Expected(first_bad));
   }
-  REQUIRE(checked == total);
   REQUIRE(max_abs_err <= 2.0e-3);
   std::fprintf(stderr,
-               "[GPUVEC-C] PASS: compressed GPU-vector eviction round-trips "
+               "[GPUVEC-C] PASS: compressed GPU-vector device round-trips "
                "%llu elems within error bound\n",
                (unsigned long long)total);
+
+  ctp::GpuApi::FreeHost(result);
 }
 
 SIMPLE_TEST_MAIN()
