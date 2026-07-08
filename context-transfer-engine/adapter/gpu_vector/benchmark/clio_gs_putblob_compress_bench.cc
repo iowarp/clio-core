@@ -55,6 +55,7 @@
 #include <algorithm>
 #include <tuple>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -87,6 +88,9 @@ struct BenchOpts {
   bool via_compressor = false;          // route puts through the compressor chimod
                                         // to compress IN THE RUNTIME (works; slow).
                                         // Off = fast uncompressed core PutBlob.
+  bool verify = false;                  // round-trip: compress a HBM snapshot ->
+                                        // store -> read back decompressed ->
+                                        // compare (checks compress+decompress).
 };
 
 void PrintUsage(const char *prog) {
@@ -128,6 +132,7 @@ bool ParseOpts(int argc, char *argv[], BenchOpts &opts) {
       opts.capacity_mib = std::strtoull(next("--capacity-mib"), nullptr, 10);
     else if (a == "--gpu-id") opts.gpu_id = std::atoi(next("--gpu-id"));
     else if (a == "--via-compressor") opts.via_compressor = true;
+    else if (a == "--verify") opts.verify = true;
     else { std::fprintf(stderr, "Unknown arg: %s\n", a.c_str()); PrintUsage(argv[0]); return false; }
   }
   // grid_size (L) is the primary knob; per_block_bytes derives from it unless
@@ -310,6 +315,54 @@ int main(int argc, char *argv[]) {
 
   GsInitKernel<<<rows, opts.threads>>>(u, v, rows, cols);
   ctp::GpuApi::Synchronize();
+
+  // --- Round-trip verification (--verify) ---
+  // Compress a real GS snapshot (HBM) through the compressor -> store -> read it
+  // back DECOMPRESSED through the compressor -> compare. This is the correctness
+  // check the transparent-compress test lacks: it confirms compress AND decompress
+  // both work in the runtime (cuSZp is lossy, so we report the max abs error vs
+  // the compressor's absolute error bound).
+  if (opts.verify) {
+    GsStepKernel<<<rows, opts.threads>>>(u, v, u2, v2, snap_dev[0], rows, cols);
+    ctp::GpuApi::Synchronize();
+    const clio::run::u64 field_elems = (clio::run::u64)rows * cols;
+    float *got_dev = ctp::GpuApi::Malloc<float>(field_bytes);
+    std::vector<float> orig(field_elems), got(field_elems);
+    ctp::GpuApi::Memcpy<float>(orig.data(), snap_dev[0], field_bytes);
+
+    clio::cte::compressor::Client comp(kCompressorPool, kCorePool);
+    clio::cte::core::Context ctx;
+#if CTP_ENABLE_COMPRESS
+    ctx.dynamic_compress_ = 1; ctx.compress_lib_ = compress_lib; ctx.compress_preset_ = 2;
+#endif
+    auto pf = comp.AsyncCompress(clio::run::PoolQuery::Local(), tag_id, "verify_blob",
+        (clio::run::u64)0, field_bytes, dev_ptr(snap_dev[0]), 0.5f, ctx,
+        (clio::run::u32)0, kCorePool);
+    pf.Wait();
+    int put_rc = pf->GetReturnCode();
+    auto gf = comp.AsyncGetBlob(tag_id, "verify_blob", (clio::run::u64)0, field_bytes,
+        (clio::run::u32)0, dev_ptr(got_dev));
+    gf.Wait();
+    int get_rc = gf->GetReturnCode();
+    ctp::GpuApi::Memcpy<float>(got.data(), got_dev, field_bytes);
+
+    double max_err = 0.0, sum_err = 0.0;
+    for (clio::run::u64 i = 0; i < field_elems; ++i) {
+      double e = std::fabs((double)orig[i] - (double)got[i]);
+      if (e > max_err) max_err = e; sum_err += e;
+    }
+    std::fprintf(stderr,
+        "[VERIFY] compressor=%s  put_rc=%d get_rc=%d  elems=%llu\n"
+        "[VERIFY] max_abs_err=%.3e  mean_abs_err=%.3e  (cuSZp eb=1e-3)  %s\n",
+        eff_lib.c_str(), put_rc, get_rc, (unsigned long long)field_elems,
+        max_err, sum_err / (double)field_elems,
+        (put_rc == 0 && get_rc == 0 && max_err <= 2e-3) ? "PASS" : "CHECK");
+    ctp::GpuApi::Free<float>(got_dev);
+    ctp::GpuApi::Free<float>(u);  ctp::GpuApi::Free<float>(v);
+    ctp::GpuApi::Free<float>(u2); ctp::GpuApi::Free<float>(v2);
+    ctp::GpuApi::Free<float>(snap_dev[0]); ctp::GpuApi::Free<float>(snap_dev[1]);
+    return (put_rc == 0 && get_rc == 0 && max_err <= 2e-3) ? 0 : 1;
+  }
 
   // --- Direct compression-ratio measurement ---
   // The runtime does not propagate the compressed size back to the client task,
