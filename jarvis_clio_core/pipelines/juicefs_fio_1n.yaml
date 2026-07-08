@@ -1,0 +1,68 @@
+# JuiceFS single-node fio performance sweep.
+#
+# Brings up a Redis metadata engine, formats + FUSE-mounts a JuiceFS
+# filesystem backed by a local directory (--storage file), then drives an
+# fio workload against the mount. The juicefs_bench package parses fio's
+# JSON report into results.csv columns.
+#
+# Experiment matrix (cross product x 3 repeats => 4 x 4 x 3 = 48 runs):
+#   * I/O size (fio --bs):     4k, 16k, 64k, 128k
+#   * threads (fio --numjobs): 1, 2, 4, 8
+#   * 60 seconds per run (fio --runtime=60 --time_based)
+#
+# Package start order is significant: redis must accept connections before
+# `juicefs format` runs, so redis is listed first (the runner stops in
+# reverse order, unmounting JuiceFS before shutting Redis down).
+#
+# Requires on PATH: redis-server, redis-cli, juicefs, fio.
+#
+# Usage:
+#   jarvis ppl run yaml jarvis_clio_core/pipelines/juicefs_fio_1n.yaml
+# Output:
+#   ${HOME}/juicefs_results/results.csv  (48 rows: io_size, threads +
+#   juicefs_bench.write.{agg_bw_mbps,iops,lat_mean_us,lat_p99_us,total_io_mb})
+
+config:
+  name: juicefs_fio_1n
+  pkgs:
+    # --- Redis metadata engine ---
+    - pkg_type: jarvis_clio_core.redis
+      pkg_name: redis
+      port: 6379
+      sleep: 4
+
+    # --- JuiceFS: format (storage=file) + FUSE mount ---
+    - pkg_type: jarvis_clio_core.juicefs
+      pkg_name: juicefs
+      meta_url: "redis://127.0.0.1:6379/1"
+      storage: file
+      data_dir: ${HOME}/juicefs_data
+      mountpoint: ${HOME}/juicefs_mnt
+      cache_dir: ${HOME}/juicefs_cache
+      name: jfsbench
+      format_fresh: true
+      mount_wait: 20
+
+    # --- fio benchmark driver (metrics -> results.csv) ---
+    - pkg_type: jarvis_clio_core.juicefs_bench
+      pkg_name: juicefs_bench
+      target_dir: ${HOME}/juicefs_mnt
+      io_size: "4k"
+      num_threads: 1
+      runtime: 60
+      mode: write
+      size_per_job: "1G"
+      ioengine: psync
+      direct: false
+      output_file: fio_output.json
+
+vars:
+  juicefs_bench.io_size:     ["4k", "16k", "64k", "128k"]
+  juicefs_bench.num_threads: [1, 2, 4, 8]
+
+loop:
+  - [juicefs_bench.io_size]      # outer
+  - [juicefs_bench.num_threads]  # inner -> 16 combos
+
+repeat: 3                        # x3 repeats -> 48 runs
+output: "${HOME}/juicefs_results"

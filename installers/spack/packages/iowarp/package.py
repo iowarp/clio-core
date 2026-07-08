@@ -17,6 +17,11 @@ class Iowarp(CMakePackage):
     # Branch versions
     version('main', branch='main', submodules=True, preferred=True)
     version('dev', branch='dev', submodules=True)
+    # #526 regression fork branch. Uses a per-version git override so `main`/
+    # `dev` keep resolving to upstream while `iowarp@526` builds THIS fork's
+    # branch under test (it is pushed to origin). Used by the regression image.
+    version('526', branch='jarvis-pipelines-526', submodules=True,
+            git='https://github.com/eDoggo3779/clio-core-fork.git')
 
     # Build variants
     variant('debug', default=False, description='Build in Debug mode')
@@ -46,6 +51,9 @@ class Iowarp(CMakePackage):
     variant('rocm', default=False, description='Enable ROCm support')
     variant('adios2', default=False, description='Build with ADIOS2 support')
     variant('fuse', default=False, description='Enable FUSE3 adapter (CTE)')
+    variant('redis', default=False,
+            description='Build the Redis comparison benchmark '
+                        '(clio_redis_bench); requires hiredis')
     variant('boost_coro', default=False,
             description='Use Boost.Context stackful coroutine backend (issue #620)')
 
@@ -75,6 +83,7 @@ class Iowarp(CMakePackage):
     depends_on('hdf5', when='+hdf5')
     depends_on('adios2', when='+adios2')
     depends_on('libfuse@3:', when='+fuse')
+    depends_on('hiredis', when='+redis')
     depends_on('boost+context', when='+boost_coro')
 
     conflicts('+fuse', when='~cte', msg='fuse adapter lives under CTE; enable +cte')
@@ -219,6 +228,10 @@ class Iowarp(CMakePackage):
                 args.append(self.define('CTE_ENABLE_ROCM', 'ON'))
             if '+fuse' in self.spec:
                 args.append(self.define('CLIO_CTE_ENABLE_FUSE_ADAPTER', 'ON'))
+            if '+redis' in self.spec:
+                # Builds clio_redis_bench (the apples-to-apples redis peer of
+                # clio_cte_bench) — the #526 single_node redis experiment.
+                args.append(self.define('CLIO_CORE_ENABLE_REDIS', 'ON'))
 
         # Context-assimilation-engine (CAE) options (if enabled)
         if '+cae' in self.spec:

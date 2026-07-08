@@ -8,6 +8,7 @@ from jarvis_cd.core.pkg import Service
 from jarvis_cd.util import SizeType
 from jarvis_cd.shell.process import Rm, Mkdir
 from jarvis_cd.shell import PsshExecInfo, Exec
+from jarvis_clio_core.container_utils import container_kwargs
 import yaml
 import os
 import re
@@ -166,6 +167,12 @@ class ClioCte(Service):
             parent_dir = os.path.dirname(path)
             if not parent_dir:
                 continue
+            # NOTE: configure runs BEFORE the pipeline's container instance
+            # starts, so this Mkdir cannot be container-wrapped. It is fine
+            # for host-visible paths ($HOME, shared storage); a file device
+            # under /tmp (remapped in-container via tmp_bind_root) would need
+            # its dir created at start() time instead. Both #526 pipelines
+            # use ram:: tiers only, so this loop is a no-op there.
             Mkdir(parent_dir,
                   PsshExecInfo(env=self.mod_env, hostfile=self.hostfile)).run()
 
@@ -226,10 +233,9 @@ class ClioCte(Service):
         Exec(cmd, PsshExecInfo(
             env=self.mod_env,
             hostfile=self.hostfile,
-            container=getattr(self, '_container_engine', 'none'),
-            container_image=self.deploy_image_name(),
             private_dir=self.private_dir,
             bind_mounts=self.container_mounts,
+            **container_kwargs(self),
         )).run()
 
         self.log("CTE started successfully")
@@ -255,10 +261,15 @@ class ClioCte(Service):
             if path.startswith('ram::'):
                 continue
             try:
-                Rm(path, PsshExecInfo(hostfile=self.hostfile)).run()
+                # Wrapped: file devices may live under /tmp, which the
+                # container remaps via tmp_bind_root. Best-effort no-op if
+                # the instance is already down.
+                Rm(path, PsshExecInfo(hostfile=self.hostfile,
+                                      **container_kwargs(self))).run()
                 parent_dir = os.path.dirname(path)
                 if parent_dir:
-                    Rm(parent_dir, PsshExecInfo(hostfile=self.hostfile)).run()
+                    Rm(parent_dir, PsshExecInfo(hostfile=self.hostfile,
+                                                **container_kwargs(self))).run()
             except Exception as e:
                 self.log(f"Error cleaning {path}: {e}")
 

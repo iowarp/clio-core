@@ -1,5 +1,7 @@
 from jarvis_cd.core.pkg import Application
 from jarvis_cd.shell import Exec, PsshExecInfo, LocalExecInfo
+from jarvis_clio_core.container_utils import container_kwargs
+import glob
 import os
 import re
 
@@ -17,6 +19,22 @@ class ClioCteBench(Application):
 
     It supports async operation depth configuration for testing concurrent I/O.
     """
+
+    # How each metric folds when more than one rank/host reports (multi-node,
+    # nprocs>1 with ppn=1 -> one bench rank per host). Mirrors mofka_bench so
+    # the CTE and Mofka multi-node CSVs aggregate the same way:
+    #   _FOLD_SUM  cumulative system totals  -> SUM across hosts (true 2n agg)
+    #   _FOLD_MAX  wall-clock                 -> MAX (run ends with slowest host)
+    #   everything else (per-thread/latency descriptive stats) -> mean.
+    _FOLD_SUM = {
+        'agg_bw_mbps',
+        'agg_ops_per_sec',
+        'total_data_mb',
+        'total_ops',
+    }
+    _FOLD_MAX = {
+        'time_max_us',
+    }
 
     def _init(self):
         """
@@ -128,6 +146,18 @@ class ClioCteBench(Application):
                         'PoolQuery::DirectHash(0) -- explicit non-Local '
                         'routing to node 0, useful for measuring '
                         'cross-node CTE paths.'
+            },
+            {
+                'name': 'bin_dir',
+                'msg': 'Directory holding clio_cte_bench (absolute). Empty = '
+                       'resolve via PATH.',
+                'type': str,
+                'default': '',
+                'help': 'For the apptainer deploy set this to the SIF spack-view '
+                        'bin (/opt/iowarp-view/bin): jarvis runs the bench in a '
+                        'shell whose PATH does NOT include the view bin, so the '
+                        'bare name is "command not found". An ABSOLUTE path needs '
+                        'no PATH lookup. Empty (bare-metal) uses PATH as before.',
             }
         ]
 
@@ -204,12 +234,20 @@ class ClioCteBench(Application):
         """
         self.log(f"Starting CTE benchmark: {self.config['test_case']}")
 
+        # Resolve the executable. In the apptainer deploy bin_dir is the SIF
+        # spack-view bin (/opt/iowarp-view/bin); an ABSOLUTE path sidesteps the
+        # fact that jarvis's exec shell PATH omits the view bin (bare name ->
+        # "command not found"). Empty bin_dir (bare-metal) keeps the bare name.
+        bin_dir = str(self.config.get('bin_dir', '') or '')
+        exe = os.path.join(bin_dir, self.benchmark_executable) if bin_dir \
+            else self.benchmark_executable
+
         # Semantic-flag CLI (bench_common.h). Use --time-limit when set,
         # otherwise --io-count. (The binary still accepts the legacy
         # positional form, but flags make time_limit/max_total_blobs
         # possible.)
         cmd = [
-            self.benchmark_executable,
+            exe,
             '--op', str(self.config['test_case']),
             '--threads', str(self.config['num_threads']),
             '--depth', str(self.config['depth']),
@@ -227,28 +265,38 @@ class ClioCteBench(Application):
         output_path = os.path.join(self.shared_dir, 'bench_output.txt')
 
         if self.config['nprocs'] > 1:
-            # Multi-rank: redirect in the shell so every rank's output lands
-            # in the shared file (shared_dir is on a shared FS on Ares).
+            # Multi-rank / multi-node: with ppn=1 each host runs one bench rank.
+            # Redirect each rank to a PER-HOST file (bench_output.txt.<hostname>)
+            # so concurrent ranks never clobber one shared file on the NFS
+            # shared_dir; _get_stat globs + folds them. container_kwargs routes
+            # the command into the run's apptainer instance (jarvis only wraps
+            # when exec_info.container is set; nothing wraps automatically).
+            # The command stays RAW — the whole string, redirect included,
+            # lands inside the wrap's `bash -c '...'`, so `$(hostname)`
+            # expands per-host in-container.
             self.log(
                 f"Running benchmark via Pssh: {self.config['nprocs']} procs, "
-                f"{self.config['ppn']} per node"
+                f"{self.config['ppn']} per node (per-host output capture)"
             )
             exec_info = PsshExecInfo(
                 env=self.mod_env,
                 hostfile=self.hostfile,
                 nprocs=self.config['nprocs'],
                 ppn=self.config['ppn'],
+                **container_kwargs(self),
             )
-            cmd_str += f' > {output_path} 2>&1'
+            cmd_str = f'{cmd_str} > {output_path}.$(hostname) 2>&1'
         else:
-            # Single-rank: pipe both streams to the file via LocalExecInfo
-            # (matches the proven archived capture path; HLOG -> stderr).
+            # Single-rank: container_kwargs routes the command into the run's
+            # apptainer instance, where the SIF's clio_cte_bench exists and
+            # shares the runtime's namespaces. Keep the command RAW — redirect
+            # and all — so it rides inside the wrap's `bash -c '...'`. exe is
+            # the absolute view-bin path (bin_dir); output_path is on the
+            # auto-mounted shared_dir.
             self.log("Running benchmark locally (single rank)")
-            exec_info = LocalExecInfo(
-                env=self.mod_env,
-                pipe_stdout=output_path,
-                pipe_stderr=output_path,
-            )
+            exec_info = PsshExecInfo(env=self.mod_env, hostfile=self.hostfile,
+                                     **container_kwargs(self))
+            cmd_str = f'{cmd_str} > {output_path} 2>&1'
 
         self.log(f"Executing: {cmd_str}")
         Exec(cmd_str, exec_info).run()
@@ -270,8 +318,10 @@ class ClioCteBench(Application):
         """
         self.log("Cleaning up CTE benchmark output files...")
 
-        # The canonical results file parsed by _get_stat.
-        paths = [os.path.join(self.shared_dir, 'bench_output.txt')]
+        # The canonical results file parsed by _get_stat, plus any per-host
+        # siblings (bench_output.txt.<hostname>) written in multi-node mode.
+        canonical = os.path.join(self.shared_dir, 'bench_output.txt')
+        paths = [canonical] + glob.glob(canonical + '.*')
         # Plus the optional user-facing copy, if one was configured.
         if self.output_file:
             paths.append(self.output_file)
@@ -290,37 +340,88 @@ class ClioCteBench(Application):
     # Statistics collection
     # ------------------------------------------------------------------
 
+    def _fold_host_stats(self, per_host_stats, stat_dict):
+        """
+        Aggregate per-host stat dicts into ``stat_dict``.
+
+        SUM for cumulative system totals (aggregate bandwidth, aggregate
+        IOPS, total data, total ops), MAX for wall-clock (the run is only
+        over once the slowest host finishes), and mean for everything else
+        (per-thread bandwidth, per-op latency, latency stddev — descriptive
+        stats that don't add across nodes). A single host folds to itself,
+        so the single-node path is unchanged. Mirrors mofka_bench so the CTE
+        and Mofka multi-node CSVs aggregate identically.
+
+        :param per_host_stats: List of ``<pkg_id>.<op>.<metric>`` -> value
+                               dicts, one per host.
+        :param stat_dict: Dict the framework serialises into results.csv.
+        """
+        from collections import defaultdict
+        buckets = defaultdict(list)
+        for host_stat in per_host_stats:
+            for key, value in host_stat.items():
+                buckets[key].append(value)
+        for key, values in buckets.items():
+            metric = key.rsplit('.', 1)[-1]
+            if metric in self._FOLD_SUM:
+                stat_dict[key] = sum(values)
+            elif metric in self._FOLD_MAX:
+                stat_dict[key] = max(values)
+            else:
+                stat_dict[key] = sum(values) / len(values)
+
     def _get_stat(self, stat_dict):
         """
         Parse the captured benchmark output and populate ``stat_dict``.
 
         Called by the jarvis_cd sweep runner after each pipeline run (on a
         freshly-loaded package instance), which is why the metrics are read
-        back from ``<shared_dir>/bench_output.txt`` rather than from an
-        in-memory buffer. Each extracted metric becomes a results.csv column.
+        back from disk rather than from an in-memory buffer. Each extracted
+        metric becomes a results.csv column.
+
+        Single-node (nprocs=1) parses the one ``<shared_dir>/bench_output.txt``
+        — identical to before this change. Multi-node (nprocs>1, ppn=1) globs
+        the per-host ``bench_output.txt.<hostname>`` files, parses each into
+        its own dict, and folds them via :meth:`_fold_host_stats`.
 
         :param stat_dict: Dict the framework serialises into results.csv;
                           keys are ``<pkg_id>.<operation>.<metric>``.
         """
-        output_path = os.path.join(self.shared_dir, 'bench_output.txt')
-        if not os.path.exists(output_path):
-            self.log(f'No output file found at {output_path}')
+        canonical = os.path.join(self.shared_dir, 'bench_output.txt')
+        per_host = sorted(glob.glob(canonical + '.*'))
+        if per_host:
+            files = per_host
+        elif os.path.exists(canonical):
+            files = [canonical]
+        else:
+            self.log(f'No output file found at {canonical} (or per-host '
+                     f'{canonical}.<hostname>)')
             return
 
-        with open(output_path, 'r') as f:
-            output = f.read()
+        per_host_stats = []
+        for fpath in files:
+            with open(fpath, 'r') as f:
+                output = f.read()
+            if not output.strip():
+                self.log(f'Output file is empty: {fpath}')
+                continue
+            host_stat = {}
+            self._parse_output(output, host_stat)
+            if host_stat:
+                per_host_stats.append(host_stat)
+            else:
+                self.log(f'Warning: No metrics extracted from {fpath} '
+                         f'({len(output)} bytes). '
+                         f'Check if benchmark results are present in output.')
 
-        if not output.strip():
-            self.log(f'Output file is empty: {output_path}')
+        if not per_host_stats:
             return
-
-        before_count = len(stat_dict)
-        self._parse_output(output, stat_dict)
-        after_count = len(stat_dict)
-        if after_count == before_count:
-            self.log(f'Warning: No metrics extracted from {output_path} '
-                     f'({len(output)} bytes). '
-                     f'Check if benchmark results are present in output.')
+        if len(per_host_stats) == 1:
+            stat_dict.update(per_host_stats[0])
+        else:
+            self.log(f'Folding stats across {len(per_host_stats)} hosts '
+                     f'(SUM aggregates, MAX wall-clock, mean the rest)')
+            self._fold_host_stats(per_host_stats, stat_dict)
 
     def _parse_output(self, output, stat_dict):
         """

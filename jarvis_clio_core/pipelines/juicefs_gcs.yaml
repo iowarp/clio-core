@@ -1,0 +1,59 @@
+# JuiceFS formatted + FUSE-mounted on REAL Google Cloud Storage (NO benchmark).
+#
+# Brings up a Redis metadata engine, then formats + FUSE-mounts a JuiceFS
+# filesystem whose object backend is a real gs:// bucket (--storage gs). This is
+# a configuration / connectivity pipeline: it proves the jarvis juicefs package
+# config drives a live GCS link. The fio sweep is intentionally OUT OF SCOPE
+# here -- see juicefs_fio_1n.yaml for the benchmark variant.
+#
+# After `jarvis ppl run`, validate the link end-to-end with:
+#   bash jarvis_clio_core/scripts/smoke_juicefs_gcs.sh
+#
+# Package start order matters: redis must accept connections before
+# `juicefs format` runs, so redis is listed first (the runner stops in reverse,
+# unmounting JuiceFS before shutting Redis down).
+#
+# Requires on PATH: redis-server, redis-cli, juicefs.
+# Requires GCP credentials reachable by Google's ADC chain. Two auth paths:
+#
+#   D2 (user ADC -- recommended for laptop/WSL; the default below):
+#     gcloud auth application-default login   # writes ~/.config/gcloud/application_default_credentials.json
+#     Leave gcs_credentials EMPTY -> the package injects no GOOGLE_APPLICATION_CREDENTIALS,
+#     so juicefs falls through the ADC chain to that file. Run the login in the SAME
+#     environment that runs the pipeline (WSL ADC != Windows ADC).
+#
+#   D1 (service-account key -- for unattended/headless hosts):
+#     Set gcs_credentials below to the key path; the package turns it into
+#     GOOGLE_APPLICATION_CREDENTIALS for the format/mount subprocesses, e.g.
+#       gcs_credentials: "${HOME}/gcs-sa.json"
+#     (Key creation may be blocked by the iam.disableServiceAccountKeyCreation org policy.)
+#
+# Either path: edit `bucket:` below to YOUR globally-unique gs:// bucket, and optionally
+#   export GCS_PROJECT_ID=<PROJECT_ID>   # only consulted if a bucket auto-create happens
+#
+# Usage:
+#   jarvis ppl run yaml jarvis_clio_core/pipelines/juicefs_gcs.yaml
+
+config:
+  name: juicefs_gcs
+  pkgs:
+    # --- Redis metadata engine ---
+    - pkg_type: jarvis_clio_core.redis
+      pkg_name: redis
+      port: 6379
+      sleep: 4
+
+    # --- JuiceFS: format (storage=gs) + FUSE mount on real GCS ---
+    - pkg_type: jarvis_clio_core.juicefs
+      pkg_name: juicefs
+      meta_url: "redis://127.0.0.1:6379/1"
+      storage: gs
+      bucket: "gs://<your-bucket>"            # <-- EDIT to your globally-unique GCS bucket
+      gcs_credentials: ""                     # D2/user-ADC default: EMPTY -> use the ADC chain.
+                                              # D1: set to the SA key PATH (never the key itself),
+                                              # e.g. "${HOME}/gcs-sa.json".
+      mountpoint: ${HOME}/juicefs_mnt
+      cache_dir: ${HOME}/juicefs_cache
+      name: jfsgcs
+      format_fresh: true                      # safe no-op for storage=gs (bucket not wiped)
+      mount_wait: 30                          # cloud first-byte latency > local; allow more

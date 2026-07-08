@@ -6,7 +6,8 @@ the `clio_cte_fuse` binary (built with CLIO_CTE_ENABLE_FUSE_ADAPTER=ON).
 """
 from jarvis_cd.core.pkg import Service
 from jarvis_cd.shell import Exec, PsshExecInfo
-from jarvis_cd.shell.process import Mkdir, Kill
+from jarvis_cd.shell.process import Kill
+from jarvis_clio_core.container_utils import container_kwargs
 import time
 
 
@@ -61,22 +62,43 @@ class ClioCteLibfuse(Service):
         # of the binary; calling it here just makes start() idempotent.
         self.stop()
 
-        Mkdir(mp, PsshExecInfo(env=self.mod_env, hostfile=self.hostfile)).run()
+        # container_kwargs routes the mkdir into the run's apptainer instance
+        # (jarvis only wraps when exec_info.container is set). REQUIRED here:
+        # under tmp_bind_root the in-container /tmp is a different directory
+        # from the host /tmp, so the mountpoint must be created in-container.
+        Exec(f'mkdir -p {mp}',
+             PsshExecInfo(env=self.mod_env, hostfile=self.hostfile,
+                          **container_kwargs(self))).run()
 
         fuse_cmd = f'{self.binary} {mp} {extra}'.strip()
         self.log(f"Mounting IOWarp CTE FUSE at {mp}: {fuse_cmd}")
-        Exec(fuse_cmd, PsshExecInfo(
+        # Shell-background the daemon inside a synchronous wrapped Exec: the
+        # `nohup ... &` detaches it from the wrap's `bash -c` shell, and it
+        # parents into the apptainer instance, whose mount/shm namespaces it
+        # must share with the runtime and the fio that writes through the
+        # mount. Daemon output goes to a per-host log on the auto-mounted
+        # shared_dir (not /dev/null — a masked mount failure here previously
+        # surfaced only as downstream ENOSPC).
+        fuse_log = f'{self.shared_dir}/cte_fuse.$(hostname).log'
+        bg_cmd = f'nohup {fuse_cmd} </dev/null >{fuse_log} 2>&1 &'
+        Exec(bg_cmd, PsshExecInfo(
             env=self.mod_env, hostfile=self.hostfile,
-            exec_async=True)).run()
+            **container_kwargs(self))).run()
         time.sleep(self.config.get('sleep', 2))
 
     def stop(self):
         mp = self.config['mountpoint']
         self.log(f"Unmounting {mp}")
+        # Both teardown steps must run inside the instance: the FUSE mount
+        # exists only in the instance's mount namespace (host-side
+        # fusermount3 sees "not found in /etc/mtab"), and the wrapped Kill
+        # scopes pkill to this run's PID namespace.
         Exec(f'fusermount3 -u {mp}', PsshExecInfo(
-            env=self.mod_env, hostfile=self.hostfile)).run()
+            env=self.mod_env, hostfile=self.hostfile,
+            **container_kwargs(self))).run()
         Kill(self.binary, PsshExecInfo(
-            env=self.mod_env, hostfile=self.hostfile)).run()
+            env=self.mod_env, hostfile=self.hostfile,
+            **container_kwargs(self))).run()
 
     def clean(self):
         self.stop()

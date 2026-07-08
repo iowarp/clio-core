@@ -1,0 +1,88 @@
+# CLIO Core (CTE) single-node performance sweep — mirrors the JuiceFS fio sweep.
+#
+# Brings up the Chimaera runtime + a CTE pool with a single RAM tier, then
+# drives clio_cte_bench (Put / write) against it across the SAME knob grid the
+# JuiceFS fio sweep used, so the two are directly comparable:
+#
+#   * I/O size (--io-size):  4k, 16k, 64k, 128k
+#   * threads  (--threads):  1, 2, 4, 8
+#   * 60 s per run (--time-limit 60)  <- mirrors fio --runtime=60 --time_based
+#   * 3 repeats                       => 4 x 4 x 3 = 48 runs
+#
+# Operation is **Put** to match the JuiceFS benchmark, which ran `mode: write`
+# (fio --rw=write) and recorded write-only metrics. Flip test_case to PutGet or
+# Get if you later want read numbers too.
+#
+# Keyspace is bounded to a fixed ~1 GiB GLOBAL working set per io_size via
+# --max-total-blobs (total unique bytes = max_total_blobs * io_size, split
+# evenly across threads — see clio_cte_bench help). This keeps the RAM tier from
+# overflowing under a 60 s time-limited Put at any thread count, and isolates the
+# thread-scaling effect by holding the working set constant. The values zip with
+# io_size: 4k->262144, 16k->65536, 64k->16384, 128k->8192 (each = 1 GiB / io_size).
+#
+# clio_cte_bench._get_stat writes results.csv columns:
+#   cte_bench.put.{agg_bw_mbps, agg_ops_per_sec, avg_latency_per_op_us,
+#                  bw_per_thread_avg_mbps, total_data_mb, total_ops, ...}
+#
+# Requires on PATH (inside the iowarp conda env): clio_cte_bench, plus the
+# clio_run runtime. Launch on a compute node via scripts/run_cte_sweep_ares.sbatch
+# (which calls `jarvis ppl run yaml` on this file — the runner auto-detects the
+# vars:+loop: sweep and writes ${output}/results.csv).
+#
+# Usage (inside an allocation):
+#   jarvis ppl run yaml jarvis_clio_core/pipelines/ares/cte_sweep_1n.yaml
+# Output:
+#   ${HOME}/cte_sweep_results/results.csv  (48 rows)
+
+config:
+  name: cte_sweep_1n
+  pkgs:
+    # --- Chimaera runtime (owns the daemon; shm IPC for single-node) ---
+    - pkg_type: jarvis_clio_core.clio_runtime
+      pkg_name: runtime
+      num_threads: 4
+      port: 9413
+      ipc_mode: "shm"
+      log_level: "info"
+      sleep: 4
+
+    # --- CTE core: single RAM tier (16 GiB -> ~16x headroom over the 1 GiB set) ---
+    - pkg_type: jarvis_clio_core.clio_cte
+      pkg_name: cte_core
+      devices:
+        - ["ram::cte_ram_tier1", "16GB", 1.0]
+      dpe_type: "max_bw"
+      neighborhood: 1
+      default_target_timeout_ms: 30000
+      poll_period_ms: 5000
+
+    # --- CTE benchmark (Put / write; metrics -> results.csv) ---
+    - pkg_type: jarvis_clio_core.clio_cte_bench
+      pkg_name: cte_bench
+      test_case: "Put"
+      num_threads: 1
+      depth: 1
+      io_size: "4k"
+      time_limit: 60
+      max_total_blobs: 262144
+      nprocs: 1
+      ppn: 1
+      init_runtime: false
+      output_file: cte_bench.log
+
+vars:
+  # I/O size + matching 1 GiB-unique GLOBAL keyspace (zipped so 4k<->262144,
+  # 16k<->65536, 64k<->16384, 128k<->8192 stay paired). Because
+  # --max-total-blobs is split across threads, these are thread-independent.
+  cte_bench.io_size:         ["4k",   "16k",  "64k",  "128k"]
+  cte_bench.max_total_blobs: [262144, 65536,  16384,  8192]
+
+  # Client thread scaling.
+  cte_bench.num_threads:     [1, 2, 4, 8]
+
+loop:
+  - [cte_bench.io_size, cte_bench.max_total_blobs]   # outer (zipped pair)
+  - [cte_bench.num_threads]                          # inner -> 16 combos
+
+repeat: 3                       # x3 repeats -> 48 runs
+output: "${HOME}/cte_sweep_results"
