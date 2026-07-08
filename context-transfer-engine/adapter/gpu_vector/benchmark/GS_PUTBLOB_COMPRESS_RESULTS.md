@@ -16,13 +16,23 @@
 > Vector's `tag` stays on the core (`kCtePoolId`) while page traffic goes to the
 > compressor pool, which forwards to that same core.
 >
-> **Known limitation:** reading the vector back *on-device* (a fault kernel that
-> spin-waits for a `GetBlob`) **deadlocks on a single GPU** — the compressor
-> services the fault by launching cuSZp's decompress kernel on the *same* GPU,
-> which cannot run while the fault kernel monopolizes the device. Uncompressed
-> faults are fine (serviced by a CPU memcpy). The **eviction/flush direction has
-> no such issue** (flush kernels exit before the compressor runs). GPU-side
-> page-fault decompression needs an async fault-completion model — future work.
+> **Device-side reads work via `Vector::FaultAllSync()`.** An *on-device* page
+> fault (a read kernel that spin-waits for a `GetBlob`) **deadlocks on a single
+> GPU**: the compressor services the fault by launching cuSZp's decompress
+> kernel, which internally `cudaMalloc`/`cudaMemcpy`-**synchronizes the device**,
+> so it can never run while the fault kernel monopolizes the GPU. (Uncompressed
+> faults are fine — serviced by a CPU memcpy, no GPU kernel; forking cuSZp to be
+> fully stream-ordered is fragile since its own entry functions device-sync.)
+> `FaultAllSync()` sidesteps this by decoupling decompression from the spinning
+> kernel: from the **host**, GPU idle, it decompresses every stored page straight
+> into its HBM slot (zero-copy `blob_data` → slot's HBM address) and marks slots
+> resident; a subsequent device read kernel finds every page present — no
+> on-device fault, no spin. **Verified:** writer evicts 4 pages compressed
+> ~16:1; `FaultAllSync` decompresses all 4; the **device read kernel** reads
+> them; `max_abs_err 1.0e-3 == eb`. The full write→evict→compress→store→
+> decompress→**device-read** loop passes. (The transparent on-*access* device
+> fault would need an async fault-completion model that doesn't hold the GPU —
+> that remains future work; `FaultAllSync` is the working prefetch-style path.)
 > No data is copied to DRAM to compress: compression is HBM→HBM (cuSZp temp HBM
 > buffer), only the small compressed result leaves the device.
 
