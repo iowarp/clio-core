@@ -95,7 +95,8 @@ class Vector {
          clio::run::u32 cache_period_us = 50000,
          CacheMode mode = CacheMode::kLegacy,
          clio::run::u32 manager_threads_per_block = 32,
-         bool allow_cold_miss_fault = false);
+         bool allow_cold_miss_fault = false,
+         clio::run::PoolId storage_pool_id = clio::run::PoolId(0, 0));
   ~Vector();
 
   Vector(const Vector &) = delete;
@@ -838,7 +839,8 @@ inline Vector<T>::Vector(const std::string &tag_name, clio::run::u32 nblocks,
                           clio::run::u32 cache_period_us,
                           CacheMode mode,
                           clio::run::u32 manager_threads_per_block,
-                          bool allow_cold_miss_fault) {
+                          bool allow_cold_miss_fault,
+                          clio::run::PoolId storage_pool_id) {
 #if !CTP_IS_DEVICE_PASS
   // Body gated for the host pass only.
   if (nblocks == 0 || gpu_pages_per_block == 0 || page_size_bytes == 0) {
@@ -989,7 +991,17 @@ inline Vector<T>::Vector(const std::string &tag_name, clio::run::u32 nblocks,
   }
   view_.base.tag_id = tag_fut->tag_id_;
   impl_->tag_name = tag_name;
-  impl_->cte_pool_id = clio::cte::core::kCtePoolId;
+  // Per-page PutBlob/GetBlob routing. Default (null storage_pool_id) sends
+  // page traffic straight to the CTE core (kCtePoolId). Passing a compressor
+  // pool here makes this a *compressed* vector: page evictions are routed to
+  // the compressor, which compresses in HBM and forwards the compressed blob
+  // to its downstream core (next_pool_id_ == kCtePoolId), and page faults are
+  // routed to the compressor, which fetches + decompresses. The CTE tag is
+  // always created on kCtePoolId above, so the tag_id is valid at the core the
+  // compressor forwards to regardless of where page traffic is routed.
+  impl_->cte_pool_id = storage_pool_id.IsNull()
+                           ? clio::cte::core::kCtePoolId
+                           : storage_pool_id;
 
   // 5. Populate DeviceView.
   view_.base.blocks = reinterpret_cast<Block *>(impl_->meta_base);

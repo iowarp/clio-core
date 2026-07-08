@@ -1118,6 +1118,8 @@ clio::run::TaskResume Runtime::CompressPutBlob(
     size_t hsz = sizeof(CompressionHeader);
     size_t total = csize + hsz;
 
+    HLOG(kInfo, "[CompressPutBlob] name={} off={} in={} csize={} ok={}",
+         name, task->offset_, input_size, csize, ok);
     if (ok && total < input_size) {
       context.actual_original_size_ = input_size;
       context.actual_compressed_size_ = total;
@@ -1178,6 +1180,9 @@ clio::run::TaskResume Runtime::DecompressGetBlob(
 
     auto* header = reinterpret_cast<CompressionHeader*>(tmp.ptr_);
     auto out = CLIO_IPC->ToFullPtr<char>(task->blob_data_.template Cast<char>());
+    HLOG(kInfo, "[DecompressGetBlob] name={} off={} req={} get_rc={} valid={}",
+         name, task->offset_, expected_size, gt->return_code_,
+         header->IsValid());
     if (header->IsValid()) {
       std::string lib = ctp::CompressionFactory::NameForWireId(header->compress_lib_);
       ctp::CompressionPreset preset = ctp::CompressionPreset::BALANCED;

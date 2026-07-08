@@ -145,6 +145,16 @@ void Runtime::SaveTask(clio::run::u32 method, clio::run::SaveTaskArchive& archiv
       archive << *typed_task.ptr_;
       break;
     }
+    case 15: {
+      auto typed_task = task_ptr.template Cast<clio::cte::core::PutBlobTask>();
+      archive << *typed_task.ptr_;
+      break;
+    }
+    case 16: {
+      auto typed_task = task_ptr.template Cast<clio::cte::core::GetBlobTask>();
+      archive << *typed_task.ptr_;
+      break;
+    }
     default: {
       // Unknown method - do nothing
       break;
@@ -192,6 +202,16 @@ void Runtime::LoadTask(clio::run::u32 method, clio::run::LoadTaskArchive& archiv
     }
     case Method::kPollConsumers: {
       auto typed_task = task_ptr.template Cast<PollConsumersTask>();
+      archive >> *typed_task.ptr_;
+      break;
+    }
+    case 15: {
+      auto typed_task = task_ptr.template Cast<clio::cte::core::PutBlobTask>();
+      archive >> *typed_task.ptr_;
+      break;
+    }
+    case 16: {
+      auto typed_task = task_ptr.template Cast<clio::cte::core::GetBlobTask>();
       archive >> *typed_task.ptr_;
       break;
     }
@@ -259,6 +279,16 @@ void Runtime::LocalLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive
       archive >> *typed_task.ptr_;
       break;
     }
+    case 15: {
+      auto typed_task = task_ptr.template Cast<clio::cte::core::PutBlobTask>();
+      archive >> *typed_task.ptr_;
+      break;
+    }
+    case 16: {
+      auto typed_task = task_ptr.template Cast<clio::cte::core::GetBlobTask>();
+      archive >> *typed_task.ptr_;
+      break;
+    }
     default: {
       // Unknown method - do nothing
       break;
@@ -320,6 +350,16 @@ void Runtime::LocalSaveTask(clio::run::u32 method, clio::run::DefaultSaveArchive
     }
     case Method::kPollConsumers: {
       auto typed_task = task_ptr.template Cast<PollConsumersTask>();
+      archive << *typed_task.ptr_;
+      break;
+    }
+    case 15: {
+      auto typed_task = task_ptr.template Cast<clio::cte::core::PutBlobTask>();
+      archive << *typed_task.ptr_;
+      break;
+    }
+    case 16: {
+      auto typed_task = task_ptr.template Cast<clio::cte::core::GetBlobTask>();
       archive << *typed_task.ptr_;
       break;
     }
@@ -421,6 +461,24 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       }
       break;
     }
+    case 15: {
+      auto new_task_ptr = ipc_manager->NewTask<clio::cte::core::PutBlobTask>();
+      if (!new_task_ptr.IsNull()) {
+        auto task_typed = orig_task_ptr.template Cast<clio::cte::core::PutBlobTask>();
+        new_task_ptr->Copy(task_typed);
+        return new_task_ptr.template Cast<clio::run::Task>();
+      }
+      break;
+    }
+    case 16: {
+      auto new_task_ptr = ipc_manager->NewTask<clio::cte::core::GetBlobTask>();
+      if (!new_task_ptr.IsNull()) {
+        auto task_typed = orig_task_ptr.template Cast<clio::cte::core::GetBlobTask>();
+        new_task_ptr->Copy(task_typed);
+        return new_task_ptr.template Cast<clio::run::Task>();
+      }
+      break;
+    }
     default: {
       // For unknown methods, create base Task copy
       auto new_task_ptr = ipc_manager->NewTask<clio::run::Task>();
@@ -475,6 +533,14 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewTask(clio::run::u32 method) {
       auto new_task_ptr = ipc_manager->NewTask<PollConsumersTask>();
       return new_task_ptr.template Cast<clio::run::Task>();
     }
+    case 15: {
+      auto new_task_ptr = ipc_manager->NewTask<clio::cte::core::PutBlobTask>();
+      return new_task_ptr.template Cast<clio::run::Task>();
+    }
+    case 16: {
+      auto new_task_ptr = ipc_manager->NewTask<clio::cte::core::GetBlobTask>();
+      return new_task_ptr.template Cast<clio::run::Task>();
+    }
     default: {
       // For unknown methods, return null pointer
       return ctp::ipc::FullPtr<clio::run::Task>();
@@ -525,6 +591,16 @@ void Runtime::AggregateOut(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::T
       typed_task->AggregateOut(replica_task);
       break;
     }
+    case 15: {
+      auto typed_task = orig_task.template Cast<clio::cte::core::PutBlobTask>();
+      typed_task->AggregateOut(replica_task);
+      break;
+    }
+    case 16: {
+      auto typed_task = orig_task.template Cast<clio::cte::core::GetBlobTask>();
+      typed_task->AggregateOut(replica_task);
+      break;
+    }
     default: {
       orig_task->AggregateOut(replica_task);
       break;
@@ -566,6 +642,14 @@ void Runtime::DelTask(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> 
     }
     case Method::kPollConsumers: {
       ipc_manager->DelTask(task_ptr.template Cast<PollConsumersTask>());
+      break;
+    }
+    case 15: {
+      ipc_manager->DelTask(task_ptr.template Cast<clio::cte::core::PutBlobTask>());
+      break;
+    }
+    case 16: {
+      ipc_manager->DelTask(task_ptr.template Cast<clio::cte::core::GetBlobTask>());
       break;
     }
     default: {

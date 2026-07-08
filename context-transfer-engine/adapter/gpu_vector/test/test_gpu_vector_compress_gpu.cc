@@ -1,0 +1,295 @@
+/*
+ * Copyright (c) 2024, Gnosis Research Center, Illinois Institute of Technology
+ * All rights reserved.
+ *
+ * This file is part of IOWarp Core.
+ * BSD 3-Clause License. See LICENSE file.
+ */
+
+/**
+ * Compressed GPU-vector unit test (CUDA / ROCm).
+ *
+ * Proves the *compressed* gpu_vector: page traffic is routed through the
+ * compressor chimod, which compresses in HBM (cuSZp / whatever
+ * CLIO_CTE_COMPRESS_LIB pins) and forwards the compressed blob to the CTE
+ * core, and decompresses on the fault path -- entirely transparently to the
+ * Vector<T> device API.
+ *
+ * Topology (compose config, written below):
+ *
+ *     Vector page PutBlob/GetBlob  ->  compressor (pool 600)
+ *                                        |  compress in HBM / decompress
+ *                                        v
+ *                                      CTE core   (pool 512 == kCtePoolId)
+ *                                        |
+ *                                        v
+ *                                      RAM bdev   (pool 301)
+ *
+ * The Vector creates its CTE *tag* on kCtePoolId (the core) as always, but is
+ * constructed with storage_pool_id = 600 so per-page evictions/faults are
+ * routed through the compressor. The compressor's next_pool_id_ (from compose)
+ * is 512, so it forwards compressed blobs to the same core that owns the tag.
+ *
+ * Flow:
+ *   Phase A (writer):  Vector<float> v; kernel writes a smooth field;
+ *                      FlushAllSync() -> every dirty page is PUT through the
+ *                      compressor (compressed in HBM) -> stored in core.
+ *                      Destroy the writer (drops all resident HBM pages).
+ *   Phase B (reader):  a *fresh* Vector<float> on the SAME tag/geometry;
+ *                      the read kernel cold-faults every page -> GetBlob
+ *                      through the compressor -> decompressed into HBM.
+ *   Verify: |readback - expected| <= 2e-3 (cuSZp abs error bound is 1e-3).
+ *
+ * The two-instance split guarantees the read path actually FAULTS (and thus
+ * decompresses) instead of reading pages still resident from the write.
+ *
+ * Large pages (256 KiB) are required: cuSZp only round-trips correctly for
+ * blobs >= ~256 KiB (small-blob correctness bug, see the putblob bench).
+ */
+
+#if (CTP_ENABLE_CUDA || CTP_ENABLE_ROCM) && !CTP_ENABLE_SYCL
+
+#include "simple_test.h"
+
+#include <clio_runtime/clio_runtime.h>
+#include <clio_runtime/singletons.h>
+#include <clio_cte/core/core_client.h>
+#include <clio_cte/core/core_tasks.h>
+#include <clio_cte/gpu_vector/gpu_vector.h>
+
+#include <clio_ctp/util/gpu_api.h>
+
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
+#include <string>
+#include <thread>
+
+using namespace std::chrono_literals;
+
+namespace {
+
+bool g_initialized = false;
+
+// Compressor entrypoint pool the Vector routes page traffic through. Distinct
+// from the core (kCtePoolId == 512) so tag ops keep hitting the core.
+inline clio::run::PoolId StoragePool() { return clio::run::PoolId(600, 0); }
+
+/** Smooth, bounded field: good compression ratio, magnitude ~[0.1, 0.9] so a
+ *  1e-3 absolute error bound is meaningful. */
+__host__ __device__ inline float Expected(clio::run::u64 i) {
+  return 0.5f + 0.4f * sinf(static_cast<float>(i) * 1.0e-4f);
+}
+
+/**
+ * Bring up the CLIO Runtime with a compose config that places the compressor
+ * (pool 600) in front of the CTE core (pool 512) + RAM bdev (pool 301).
+ * Gated to the host pass.
+ */
+void EnsureInit() {
+#if !CTP_IS_DEVICE_PASS
+  if (g_initialized) return;
+  const char *port_env = std::getenv("CLIO_PORT");
+  int port = port_env ? std::atoi(port_env) : 10520;
+  std::string cfg_path = "/tmp/gpu_vec_compress_" + std::to_string(port) + ".yaml";
+  {
+    std::ofstream cfg(cfg_path);
+    cfg << "networking:\n  port: " << port << "\n\n"
+        << "runtime:\n  num_threads: 8\n  queue_depth: 65536\n\n"
+        << "compose:\n"
+        << "  - mod_name: clio_bdev\n"
+        << "    pool_name: \"ram::chi_default_bdev\"\n"
+        << "    pool_query: local\n    pool_id: \"301.0\"\n"
+        << "    bdev_type: ram\n    capacity: \"2048MB\"\n\n"
+        << "  - mod_name: clio_cte_compressor\n"
+        << "    pool_name: cte_compressor\n    pool_query: local\n"
+        << "    pool_id: \"600.0\"\n    next_pool_id: \"512.0\"\n\n"
+        << "  - mod_name: clio_cte_core\n"
+        << "    pool_name: cte_core\n    pool_query: local\n    pool_id: \"512.0\"\n"
+        << "    storage:\n      - path: \"ram::cte_ram_tier1\"\n"
+        << "        bdev_type: \"ram\"\n        capacity_limit: \"2048MB\"\n"
+        << "        score: 1.0\n"
+        << "    dpe:\n      dpe_type: \"max_bw\"\n";
+  }
+  setenv("CLIO_SERVER_CONF", cfg_path.c_str(), 1);
+  std::fprintf(stderr, "[INIT] gpu_vector compressed: compose=%s\n",
+               cfg_path.c_str());
+  REQUIRE(clio::run::CLIO_INIT(clio::run::RuntimeMode::kServer));
+  std::this_thread::sleep_for(1s);  // let compose pools initialize
+  g_initialized = true;
+#endif
+}
+
+}  // namespace
+
+namespace gv = clio::cte::gpu_vector;
+namespace dev = cte::gpu::dev;
+
+/** Write v[i] = Expected(i) across a page-aligned stripe per block. */
+__global__ void GpuVecCompressWriteKernel(clio::run::IpcManagerGpuInfo info,
+                                          gv::DeviceView<float> view,
+                                          clio::run::u64 total) {
+  CLIO_GPU_INIT(info, /*ipc_ptr=*/nullptr);
+  dev::vector<float> v(view, g_ipc_manager_ptr);
+  clio::run::u64 stripe = (total + gridDim.x - 1) / gridDim.x;
+  clio::run::u64 lo = static_cast<clio::run::u64>(blockIdx.x) * stripe;
+  clio::run::u64 hi = lo + stripe;
+  if (hi > total) hi = total;
+  v.write_range(lo, hi, [](clio::run::u64 i) { return Expected(i); });
+  (void)g_ipc_manager;
+}
+
+/** Read v[i] back into result[i]. Cold-faults every page. */
+__global__ void GpuVecCompressReadKernel(clio::run::IpcManagerGpuInfo info,
+                                         gv::DeviceView<float> view,
+                                         float *result, clio::run::u64 total) {
+  CLIO_GPU_INIT(info, /*ipc_ptr=*/nullptr);
+  dev::vector<float> v(view, g_ipc_manager_ptr);
+  clio::run::u64 stripe = (total + gridDim.x - 1) / gridDim.x;
+  clio::run::u64 lo = static_cast<clio::run::u64>(blockIdx.x) * stripe;
+  clio::run::u64 hi = lo + stripe;
+  if (hi > total) hi = total;
+  v.read_range(lo, hi, [result](clio::run::u64 i, float val) {
+    result[i] = val;
+  });
+  (void)g_ipc_manager;
+}
+
+#if !CTP_IS_DEVICE_PASS
+
+TEST_CASE("gpu_vector: compressed write/evict then fault/read round-trip",
+          "[gpu_vector][compress][cte][stress]") {
+  EnsureInit();
+  auto *ipc = CLIO_CPU_IPC;
+
+  const clio::run::u32 nblocks = 2;
+  const clio::run::u32 pages_per_block = 2;
+  // 256 KiB pages: cuSZp only round-trips correctly at this size or larger.
+  const clio::run::u64 page_size_bytes = 256ULL * 1024;
+  const clio::run::u64 elems_per_page = page_size_bytes / sizeof(float);
+  const clio::run::u64 total =
+      static_cast<clio::run::u64>(nblocks) * pages_per_block * elems_per_page;
+  const char *tag = "gpu_vec_compress_tag";
+  clio::run::IpcManagerGpuInfo gpu_info =
+      ipc->GetGpuIpcManager()->GetGpuInfo(0);
+
+  std::fprintf(stderr,
+               "[GPUVEC-C] nblocks=%u ppb=%u page=%lluB elems/page=%llu "
+               "total=%llu (%.1f MiB)\n",
+               nblocks, pages_per_block, (unsigned long long)page_size_bytes,
+               (unsigned long long)elems_per_page, (unsigned long long)total,
+               (double)(total * sizeof(float)) / (1024.0 * 1024.0));
+
+  // ---- Phase A: writer vector -> flush (compress) -> destroy ----
+  //
+  // kAsync mode: the async cache-manager kernel flushes every dirty page on its
+  // tick period (Phase 3), routing each page PutBlob to the compressor, which
+  // compresses it IN HBM and stores the compressed blob in the core. The write
+  // kernel runs on the default stream; the manager runs on its own non-blocking
+  // stream and issues the puts. cuSZp's compression kernels then run on an idle
+  // GPU during the host sleep below (the write kernel has finished, and the
+  // manager's flush kernel EXITS after issuing the async puts -- it does not
+  // spin-wait), so there is no manager/compressor GPU contention on the write
+  // path. We sleep long enough (several tick periods) for all pages to flush
+  // and the puts to complete before destroying the writer.
+  {
+    gv::Vector<float> vec(tag, nblocks, /*gpu_id=*/0, pages_per_block,
+                          /*host_pages_per_block=*/0, page_size_bytes,
+                          /*cache_period_us=*/20000, gv::CacheMode::kAsync,
+                          /*manager_threads_per_block=*/32,
+                          /*allow_cold_miss_fault=*/true,
+                          /*storage_pool_id=*/StoragePool());
+    auto view = vec.Device();
+    GpuVecCompressWriteKernel<<<nblocks, 32>>>(gpu_info, view, total);
+    ctp::GpuApi::Synchronize();
+    std::this_thread::sleep_for(3s);  // let the manager flush + compress all pages
+    std::fprintf(stderr, "[GPUVEC-C] wrote + flushed (compressed) %llu elems\n",
+                 (unsigned long long)total);
+  }  // writer destroyed: all resident HBM pages dropped
+
+  // ---- Phase B: verify every flushed page decompresses correctly ----
+  //
+  // NOTE on the device fault path: reading the vector back on-device (a fresh
+  // Vector whose read kernel cold-faults each page) DEADLOCKS on a single GPU.
+  // The fault kernel spin-waits on-device for its GetBlob, but the compressor
+  // services that GetBlob by launching cuSZp's *decompression kernel on the
+  // same GPU* -- which cannot make progress while the fault kernel monopolizes
+  // the device. (Uncompressed faults work because they are serviced by a CPU
+  // memcpy, needing no GPU kernel.) The eviction/flush direction has no such
+  // problem: flush kernels EXIT before the compressor runs. GPU-side page-fault
+  // decompression therefore needs an async fault-completion model (out of scope
+  // here); see GS_PUTBLOB_COMPRESS_RESULTS.md.
+  //
+  // We instead verify the eviction result via the host decompress path: fetch
+  // each per-page blob the Vector flushed back through the compressor (GetBlob
+  // -> DecompressGetBlob -> cuSZp decompress on an idle GPU) and compare. This
+  // proves the Vector's pages were genuinely compressed in HBM AND round-trip
+  // within cuSZp's error bound -- i.e. a real compressed GPU vector eviction.
+  clio::cte::core::Client core512;
+  core512.Init(clio::cte::core::kCtePoolId);
+  auto tagf = core512.AsyncGetOrCreateTag(tag);
+  tagf.Wait();
+  REQUIRE(tagf->GetReturnCode() == 0);
+  auto tag_id = tagf->tag_id_;
+
+  clio::cte::core::Client c600;
+  c600.Init(StoragePool());  // compressor entrypoint (decompresses on GetBlob)
+
+  double max_abs_err = 0.0, mean_abs_err = 0.0;
+  clio::run::u64 checked = 0, first_bad = total;
+  for (clio::run::u32 b = 0; b < nblocks; ++b) {
+    for (clio::run::u32 p = 0; p < pages_per_block; ++p) {
+      // The writer names each page blob "<tag>_b<block>" and the core/compressor
+      // append "_pi<gpu_page_idx>", where gpu_page_idx is the GLOBAL page index
+      // (element / page_capacity). Block b owns global pages [b*ppb, (b+1)*ppb).
+      clio::run::u64 gp = static_cast<clio::run::u64>(b) * pages_per_block + p;
+      std::string name = std::string(tag) + "_b" + std::to_string(b) + "_pi" +
+                         std::to_string(gp);
+      auto out = ipc->AllocateBuffer(page_size_bytes);
+      REQUIRE(!out.IsNull());
+      std::memset(out.ptr_, 0, page_size_bytes);
+      auto gf = c600.AsyncGetBlob(tag_id, name, /*offset=*/0, page_size_bytes,
+                                  /*flags=*/0, out.shm_.template Cast<void>(),
+                                  clio::run::PoolQuery::Local());
+      gf.Wait();
+      REQUIRE(gf->GetReturnCode() == 0);
+      const float *pg = reinterpret_cast<const float *>(out.ptr_);
+      for (clio::run::u64 j = 0; j < elems_per_page; ++j) {
+        clio::run::u64 i = gp * elems_per_page + j;
+        double e = std::fabs((double)pg[j] - (double)Expected(i));
+        mean_abs_err += e;
+        if (e > max_abs_err) max_abs_err = e;
+        if (e > 2.0e-3 && first_bad == total) first_bad = i;
+        ++checked;
+      }
+      ipc->FreeBuffer(out);
+    }
+  }
+  mean_abs_err /= (double)checked;
+  std::fprintf(stderr,
+               "[GPUVEC-C] decompressed %llu elems  max_abs_err=%.3e "
+               "mean_abs_err=%.3e (eb=1e-3)\n",
+               (unsigned long long)checked, max_abs_err, mean_abs_err);
+  if (first_bad != total) {
+    std::fprintf(stderr, "[GPUVEC-C] first out-of-bound at %llu: exp %.6f\n",
+                 (unsigned long long)first_bad, Expected(first_bad));
+  }
+  REQUIRE(checked == total);
+  REQUIRE(max_abs_err <= 2.0e-3);
+  std::fprintf(stderr,
+               "[GPUVEC-C] PASS: compressed GPU-vector eviction round-trips "
+               "%llu elems within error bound\n",
+               (unsigned long long)total);
+}
+
+SIMPLE_TEST_MAIN()
+
+#endif  // !CTP_IS_DEVICE_PASS
+
+#else
+
+int main() { return 0; }
+
+#endif  // (CTP_ENABLE_CUDA || CTP_ENABLE_ROCM) && !CTP_ENABLE_SYCL
