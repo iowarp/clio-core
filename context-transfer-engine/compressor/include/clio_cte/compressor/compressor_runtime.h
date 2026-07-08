@@ -135,6 +135,27 @@ private:
                               clio::run::RunContext &ctx);
 
   /**
+   * Handle a RAW core PutBlobTask that arrived at the compressor entrypoint
+   * (core Method::kPutBlob = 15) -- e.g. a gpu_vector page eviction submitted
+   * from device code. Compresses blob_data (a GPU/HBM pointer, in place) and
+   * forwards the compressed bytes to the core pool, preserving the per-page
+   * "_pi<gpu_page_idx_>" blob name so each cache page resolves to its own blob.
+   */
+  clio::run::TaskResume CompressPutBlob(
+      ctp::ipc::FullPtr<clio::cte::core::PutBlobTask> task,
+      clio::run::RunContext &ctx);
+
+  /**
+   * Handle a RAW core GetBlobTask at the compressor entrypoint (core
+   * Method::kGetBlob = 16) -- a gpu_vector page fault. Fetches the compressed
+   * blob from core (same "_pi" naming) and decompresses into the caller's
+   * (HBM) buffer.
+   */
+  clio::run::TaskResume DecompressGetBlob(
+      ctp::ipc::FullPtr<clio::cte::core::GetBlobTask> task,
+      clio::run::RunContext &ctx);
+
+  /**
    * Sample this node's CPU utilization and aggregated worker load
    * (Method::kPollNodeLoad). Writes results into task->sample_.
    */

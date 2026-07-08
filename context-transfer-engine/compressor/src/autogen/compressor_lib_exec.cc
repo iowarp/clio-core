@@ -80,6 +80,19 @@ clio::run::TaskResume Runtime::Run(clio::run::u32 method, ctp::ipc::FullPtr<clio
       CLIO_CO_AWAIT(PollConsumers(typed_task, rctx));
       break;
     }
+    // MANUAL (not from codegen): transparently compress/decompress RAW core
+    // PutBlob/GetBlob (method ids 15/16) that arrive at the compressor entrypoint
+    // -- e.g. gpu_vector page evictions/faults submitted from device code.
+    case 15: {  // clio::cte::core::kPutBlob
+      auto pt = task_ptr.template Cast<clio::cte::core::PutBlobTask>();
+      CLIO_CO_AWAIT(CompressPutBlob(pt, rctx));
+      break;
+    }
+    case 16: {  // clio::cte::core::kGetBlob
+      auto gt = task_ptr.template Cast<clio::cte::core::GetBlobTask>();
+      CLIO_CO_AWAIT(DecompressGetBlob(gt, rctx));
+      break;
+    }
     default: {
       // Unknown method - do nothing
       break;

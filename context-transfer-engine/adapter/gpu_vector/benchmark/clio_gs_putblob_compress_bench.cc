@@ -330,17 +330,20 @@ int main(int argc, char *argv[]) {
     std::vector<float> orig(field_elems), got(field_elems);
     ctp::GpuApi::Memcpy<float>(orig.data(), snap_dev[0], field_bytes);
 
-    clio::cte::compressor::Client comp(kCompressorPool, kCorePool);
+    // Route through the compressor's kPutBlob/kGetBlob handlers -- exactly the
+    // path a gpu_vector page eviction/fault takes: a CORE PutBlob/GetBlob sent to
+    // the compressor entrypoint pool (512), which compresses/decompresses and
+    // forwards to core (513).
+    clio::cte::core::Client c512; c512.Init(kCompressorPool);
     clio::cte::core::Context ctx;
 #if CTP_ENABLE_COMPRESS
     ctx.dynamic_compress_ = 1; ctx.compress_lib_ = compress_lib; ctx.compress_preset_ = 2;
 #endif
-    auto pf = comp.AsyncCompress(clio::run::PoolQuery::Local(), tag_id, "verify_blob",
-        (clio::run::u64)0, field_bytes, dev_ptr(snap_dev[0]), 0.5f, ctx,
-        (clio::run::u32)0, kCorePool);
+    auto pf = c512.AsyncPutBlob(tag_id, "verify_blob", (clio::run::u64)0,
+        field_bytes, dev_ptr(snap_dev[0]), 0.5f, ctx, (clio::run::u32)0);
     pf.Wait();
     int put_rc = pf->GetReturnCode();
-    auto gf = comp.AsyncGetBlob(tag_id, "verify_blob", (clio::run::u64)0, field_bytes,
+    auto gf = c512.AsyncGetBlob(tag_id, "verify_blob", (clio::run::u64)0, field_bytes,
         (clio::run::u32)0, dev_ptr(got_dev));
     gf.Wait();
     int get_rc = gf->GetReturnCode();

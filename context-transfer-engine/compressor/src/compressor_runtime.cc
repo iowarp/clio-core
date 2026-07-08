@@ -1070,6 +1070,139 @@ clio::run::TaskResume Runtime::Decompress(ctp::ipc::FullPtr<DecompressTask> task
   CLIO_CO_RETURN;
 }
 
+// Compress a RAW core PutBlobTask (method kPutBlob=15) that landed at the
+// compressor entrypoint -- e.g. a gpu_vector page eviction from device code.
+// blob_data_ is a GPU/HBM pointer; cuSZp compresses it in place. The compressed
+// bytes (with a CompressionHeader) are forwarded to the core pool under the same
+// per-page name the core handler would have composed ("<name>_pi<gpu_page_idx_>").
+clio::run::TaskResume Runtime::CompressPutBlob(
+    ctp::ipc::FullPtr<clio::cte::core::PutBlobTask> task,
+    clio::run::RunContext& ctx) {
+  try {
+    clio::run::u64 input_size = task->size_;
+    clio::cte::core::Context& context = task->context_;
+    if (task->blob_data_.IsNull() || input_size == 0) {
+      task->return_code_ = 1; CLIO_CO_RETURN;
+    }
+    { int pin_preset = 2; int pin_wire = CompressorPinWireId(&pin_preset);
+      if (pin_wire >= 0) { context.compress_lib_ = pin_wire;
+                           context.compress_preset_ = pin_preset; } }
+    if (!core_client_ && !config_.next_pool_id_.IsNull())
+      core_client_ = std::make_unique<clio::cte::core::Client>(config_.next_pool_id_);
+    if (!core_client_) { task->return_code_ = 9; CLIO_CO_RETURN; }
+
+    // Per-page name: what the core PutBlob handler composes from gpu_page_idx_.
+    std::string name = task->blob_name_.str();
+    if (task->gpu_page_idx_ != clio::cte::core::PutBlobTask::kNoPageIdx)
+      name += "_pi" + std::to_string(task->gpu_page_idx_);
+
+    if (context.compress_lib_ <= 0) {  // no compression -> forward as-is
+      auto pt = core_client_->AsyncPutBlob(task->tag_id_, name, task->offset_,
+          input_size, task->blob_data_, task->score_, context, task->flags_,
+          clio::run::PoolQuery::Local());
+      CLIO_CO_AWAIT(pt);
+      task->return_code_ = pt->return_code_; CLIO_CO_RETURN;
+    }
+
+    std::string lib = ctp::CompressionFactory::NameForWireId(context.compress_lib_);
+    ctp::CompressionPreset preset = ctp::CompressionPreset::BALANCED;
+    if (context.compress_preset_ == 1) preset = ctp::CompressionPreset::FAST;
+    else if (context.compress_preset_ == 3) preset = ctp::CompressionPreset::BEST;
+    auto compressor = ctp::CompressionFactory::GetPreset(lib, preset);
+    if (!compressor) { task->return_code_ = 3; CLIO_CO_RETURN; }
+
+    std::vector<char> cbuf(input_size + (input_size / 20) + 1024);
+    size_t csize = cbuf.size();
+    auto in = CLIO_IPC->ToFullPtr<char>(task->blob_data_.template Cast<char>());
+    bool ok = compressor->Compress(cbuf.data(), csize, in.ptr_, input_size);
+    size_t hsz = sizeof(CompressionHeader);
+    size_t total = csize + hsz;
+
+    if (ok && total < input_size) {
+      context.actual_original_size_ = input_size;
+      context.actual_compressed_size_ = total;
+      context.actual_compression_ratio_ = (double)input_size / (double)total;
+      auto shm = CLIO_IPC->AllocateBuffer(total);
+      if (shm.IsNull()) { task->return_code_ = 4; CLIO_CO_RETURN; }
+      CompressionHeader hdr(context.compress_lib_, context.compress_preset_, input_size);
+      std::memcpy(shm.ptr_, &hdr, hsz);
+      std::memcpy(shm.ptr_ + hsz, cbuf.data(), csize);
+      ctp::ipc::ShmPtr<> sp = shm.shm_.template Cast<void>();
+      auto pt = core_client_->AsyncPutBlob(task->tag_id_, name, task->offset_,
+          total, sp, task->score_, context, task->flags_, clio::run::PoolQuery::Local());
+      CLIO_CO_AWAIT(pt);
+      CLIO_IPC->FreeBuffer(shm);
+      task->context_ = context;
+      task->return_code_ = pt->return_code_;
+    } else {  // not beneficial -> store original (device blob) uncompressed
+      auto pt = core_client_->AsyncPutBlob(task->tag_id_, name, task->offset_,
+          input_size, task->blob_data_, task->score_, context, task->flags_,
+          clio::run::PoolQuery::Local());
+      CLIO_CO_AWAIT(pt);
+      task->return_code_ = pt->return_code_;
+    }
+  } catch (const std::exception& e) {
+    HLOG(kError, "Exception in CompressPutBlob: {}", e.what());
+    task->return_code_ = 6;
+  }
+  CLIO_CO_RETURN;
+}
+
+// Decompress a RAW core GetBlobTask (method kGetBlob=16) -- a gpu_vector page
+// fault. Fetches the (compressed) blob from core under the "_pi" name and
+// decompresses into the caller's HBM buffer. Mirrors Decompress(); the
+// compressed size is over-estimated (cuSZp's stream is self-delimiting).
+clio::run::TaskResume Runtime::DecompressGetBlob(
+    ctp::ipc::FullPtr<clio::cte::core::GetBlobTask> task,
+    clio::run::RunContext& ctx) {
+  try {
+    clio::run::u64 expected_size = task->size_;
+    if (task->blob_data_.IsNull()) { task->return_code_ = 1; CLIO_CO_RETURN; }
+    if (!core_client_ && !config_.next_pool_id_.IsNull())
+      core_client_ = std::make_unique<clio::cte::core::Client>(config_.next_pool_id_);
+    if (!core_client_) { task->return_code_ = 9; CLIO_CO_RETURN; }
+
+    std::string name = task->blob_name_.str();
+    if (task->gpu_page_idx_ != clio::cte::core::GetBlobTask::kNoPageIdx)
+      name += "_pi" + std::to_string(task->gpu_page_idx_);
+
+    size_t hsz = sizeof(CompressionHeader);
+    auto tmp = CLIO_IPC->AllocateBuffer(expected_size + hsz + 1024);
+    if (tmp.IsNull()) { task->return_code_ = 2; CLIO_CO_RETURN; }
+    ctp::ipc::ShmPtr<> tmpp = tmp.shm_.template Cast<void>();
+    auto gt = core_client_->AsyncGetBlob(task->tag_id_, name, task->offset_,
+        expected_size + hsz + 1024, task->flags_, tmpp, clio::run::PoolQuery::Local());
+    CLIO_CO_AWAIT(gt);
+    if (gt->return_code_ != 0) { CLIO_IPC->FreeBuffer(tmp);
+      task->return_code_ = 10 + gt->return_code_; CLIO_CO_RETURN; }
+
+    auto* header = reinterpret_cast<CompressionHeader*>(tmp.ptr_);
+    auto out = CLIO_IPC->ToFullPtr<char>(task->blob_data_.template Cast<char>());
+    if (header->IsValid()) {
+      std::string lib = ctp::CompressionFactory::NameForWireId(header->compress_lib_);
+      ctp::CompressionPreset preset = ctp::CompressionPreset::BALANCED;
+      if (header->compress_preset_ == 1) preset = ctp::CompressionPreset::FAST;
+      else if (header->compress_preset_ == 3) preset = ctp::CompressionPreset::BEST;
+      auto dec = ctp::CompressionFactory::GetPreset(lib, preset);
+      if (!dec) { CLIO_IPC->FreeBuffer(tmp); task->return_code_ = 3; CLIO_CO_RETURN; }
+      char* cdata = tmp.ptr_ + hsz;
+      size_t csize = expected_size;  // over-estimate; cuSZp reads its own length
+      size_t dsize = header->original_size_;
+      bool ok = dec->Decompress(out.ptr_, dsize, cdata, csize);
+      CLIO_IPC->FreeBuffer(tmp);
+      task->return_code_ = ok ? 0 : 5;
+    } else {  // stored uncompressed -> copy through
+      std::memcpy(out.ptr_, tmp.ptr_, expected_size);
+      CLIO_IPC->FreeBuffer(tmp);
+      task->return_code_ = 0;
+    }
+  } catch (const std::exception& e) {
+    HLOG(kError, "Exception in DecompressGetBlob: {}", e.what());
+    task->return_code_ = 6;
+  }
+  CLIO_CO_RETURN;
+}
+
 void Runtime::LogCompressionTelemetry(const CompressionTelemetry& telemetry) {
   // Log to compression telemetry buffer if available
   if (!compression_telemetry_log_.IsNull()) {
