@@ -1,5 +1,31 @@
 # Gray-Scott + CLIO PutBlob + compressor library (Delta A100)
 
+> **MILESTONE — COMPRESSED GPU VECTOR WORKS (device eviction path).** The
+> `clio_cte::gpu_vector::Vector<T>` is now a *compressed* GPU vector: constructed
+> with a compressor `storage_pool_id`, its page evictions route through the
+> compressor, which compresses each page **in HBM** and stores the compressed
+> blob in the CTE core. Verified on A100 by `test_gpu_vector_compress`
+> (`cte_gpu_vector_compress_cuda`): a `Vector<float>` with 256 KiB pages is
+> written on-device, the async cache manager evicts every dirty page through the
+> compressor (cuSZp), and each page is read back through the compressor and
+> compared. Result: **4/4 pages compressed ~16:1 in HBM** (262144 B → ~16.6 KB),
+> **4/4 decompressed with max_abs_err 1.0e-3 == error bound** (mean 4.9e-4).
+> PASS. Mechanism: raw core `PutBlob`(15)/`GetBlob`(16) tasks arriving at the
+> compressor entrypoint are transparently compressed/decompressed
+> (`CompressPutBlob`/`DecompressGetBlob`, commits `c069d50`, `c59eb5c`); the
+> Vector's `tag` stays on the core (`kCtePoolId`) while page traffic goes to the
+> compressor pool, which forwards to that same core.
+>
+> **Known limitation:** reading the vector back *on-device* (a fault kernel that
+> spin-waits for a `GetBlob`) **deadlocks on a single GPU** — the compressor
+> services the fault by launching cuSZp's decompress kernel on the *same* GPU,
+> which cannot run while the fault kernel monopolizes the device. Uncompressed
+> faults are fine (serviced by a CPU memcpy). The **eviction/flush direction has
+> no such issue** (flush kernels exit before the compressor runs). GPU-side
+> page-fault decompression needs an async fault-completion model — future work.
+> No data is copied to DRAM to compress: compression is HBM→HBM (cuSZp temp HBM
+> buffer), only the small compressed result leaves the device.
+
 > **STATUS — FIXED.** The CLIO runtime now **genuinely compresses** PutBlobs
 > through the compressor chimod, end-to-end (`--via-compressor`). This required a
 > real bug fix in the compressor: `DynamicSchedule`/`Compress`/`Decompress` were
