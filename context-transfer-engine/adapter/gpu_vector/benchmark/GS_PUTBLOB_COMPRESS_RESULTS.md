@@ -1,5 +1,17 @@
 # Gray-Scott + CLIO PutBlob + compressor library (Delta A100)
 
+> **HEAD-TO-HEAD vs. TRADITIONAL CHECKPOINT PATH.** Same canonical Gray-Scott
+> loop (iterate steps, checkpoint the field every N steps) checkpointed two ways,
+> timed on the same evolving snapshots (`clio_gs_checkpoint_bench`, A100,
+> 4096×4096 field = 64 MiB, 200 steps, ckpt every 25). **Traditional**
+> (cudaMemcpy D2H + write full uncompressed field to a Lustre/PFS file — what an
+> HDF5 checkpoint does): **96.7 ms/ckpt, 0.65 GiB/s, 512 MiB to disk (off-GPU)**.
+> **Compressed GPU vector** (compress in HBM, stays on GPU): **14.6 ms/ckpt,
+> 4.27 GiB/s, 68 MiB in HBM**. Net: **6.6× faster, 7.5× smaller footprint,
+> disk→HBM.** The traditional path is PFS-write-bound; the compressed path is
+> cuSZp-compute-bound but never leaves the GPU and writes 7.5× fewer bytes. (The
+> ratio is ~7.5× here, not 16×, because an evolved GS snapshot has real entropy.)
+>
 > **CAPACITY WIN — a dataset 2× the GPU-memory budget fits entirely on the
 > GPU.** Because compression shrinks cold pages and the compressor's storage
 > tier is a **kHbm bdev (device memory)**, compressed cold pages live in HBM.
