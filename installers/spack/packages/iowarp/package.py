@@ -46,6 +46,9 @@ class Iowarp(CMakePackage):
     variant('rocm', default=False, description='Enable ROCm support')
     variant('adios2', default=False, description='Build with ADIOS2 support')
     variant('fuse', default=False, description='Enable FUSE3 adapter (CTE)')
+    variant('redis', default=False,
+            description='Build the Redis comparison benchmark '
+                        '(clio_redis_bench); requires hiredis')
     variant('s3', default=False,
             description='Enable Amazon S3 (s3://) import in CAE (aws-sdk-cpp)')
     variant('gcs', default=False,
@@ -80,6 +83,7 @@ class Iowarp(CMakePackage):
     depends_on('hdf5', when='+hdf5')
     depends_on('adios2', when='+adios2')
     depends_on('libfuse@3:', when='+fuse')
+    depends_on('hiredis', when='+redis')
     depends_on('boost+context', when='+boost_coro')
 
     # CAE cloud import backends (opt-in). aws-sdk-cpp for the S3 assimilator
@@ -233,6 +237,10 @@ class Iowarp(CMakePackage):
                 args.append(self.define('CTE_ENABLE_ROCM', 'ON'))
             if '+fuse' in self.spec:
                 args.append(self.define('CLIO_CTE_ENABLE_FUSE_ADAPTER', 'ON'))
+            if '+redis' in self.spec:
+                # Builds clio_redis_bench (the apples-to-apples redis peer of
+                # clio_cte_bench) — the #526 single_node redis experiment.
+                args.append(self.define('CLIO_CORE_ENABLE_REDIS', 'ON'))
 
         # Context-assimilation-engine (CAE) options (if enabled)
         if '+cae' in self.spec:

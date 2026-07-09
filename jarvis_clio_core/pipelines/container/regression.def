@@ -1,0 +1,93 @@
+# =============================================================================
+# regression.def — Docker-free APPTAINER build of the #526 regression image.
+# =============================================================================
+# Strategy B FALLBACK. The PRIMARY path (Strategy A) reuses Dockerfile.regression:
+#   docker build ... && apptainer build <sif> docker-daemon://iowarp-regression:526
+# (see scripts/build_regression_image.sh). Use this .def only when Docker is
+# unavailable on the build host. It mirrors Dockerfile.regression stage-for-stage.
+#
+# Build (needs --fakeroot; Ares has /etc/subuid + /etc/subgid maps). Run from the
+# REPO ROOT so the %files source paths resolve against the build CWD:
+#   apptainer build --fakeroot \
+#     "$(grep -hE '^[[:space:]]*shared_dir:' ~/.ppi-jarvis/*.yaml | head -1 \
+#         | sed -E 's/.*shared_dir:[[:space:]]*//; s/["'"'"']//g')/containers/iowarp-regression-526.sif" \
+#     jarvis_clio_core/pipelines/container/regression.def
+#
+# NOTE: this is the UNTESTED fallback — Strategy A is the validated path. The
+# final %post block is the same install-cleanliness gate as the Dockerfile.
+
+Bootstrap: docker
+From: iowarp/iowarp-build:latest
+
+%arguments
+    IOWARP_SPEC=iowarp@dev +fuse +redis
+    JUICEFS_VERSION=1.2.3
+    JARVIS_REF=2925ee8
+    SPACK_SETUP=/home/iowarp/spack/share/spack/setup-env.sh
+    SPACK_USER=iowarp
+
+%files
+    # Bake in the repo's EXTENDED spack recipe (adds the `redis` variant) and
+    # the local jarvis_clio_core edits — same as the Dockerfile's COPYs.
+    installers/spack /opt/clio-core/installers/spack
+    jarvis_clio_core /opt/clio-core/jarvis_clio_core
+
+%post
+    set -e
+    export DEBIAN_FRONTEND=noninteractive
+
+    # 1) System deps (root).
+    apt-get update && apt-get install -y --no-install-recommends \
+        fuse3 libfuse3-3 \
+        openmpi-bin libopenmpi-dev \
+        redis-server redis-tools \
+        fio \
+        git curl ca-certificates \
+        python3 python3-pip python3-venv \
+        openssh-server openssh-client
+    rm -rf /var/lib/apt/lists/*
+
+    # 2) JuiceFS — official single static binary.
+    curl -fsSL "https://github.com/juicedata/juicefs/releases/download/v{{JUICEFS_VERSION}}/juicefs-{{JUICEFS_VERSION}}-linux-amd64.tar.gz" \
+      | tar -xz -C /usr/local/bin juicefs
+    juicefs version
+
+    # 3) A spack view dir owned by the spack user; the fork recipe is already
+    #    staged under /opt/clio-core/installers (via %files).
+    mkdir -p /opt/iowarp-view
+    chown {{SPACK_USER}}:{{SPACK_USER}} /opt/iowarp-view
+    chown -R {{SPACK_USER}}:{{SPACK_USER}} /opt/clio-core/installers
+
+    # 4) IOWarp (+FUSE +redis) via spack, run as the user that OWNS spack. Register
+    #    the local recipe FIRST so iowarp@dev resolves to the extended recipe (+redis).
+    su {{SPACK_USER}} -c '. "{{SPACK_SETUP}}" \
+        && spack repo add /opt/clio-core/installers/spack \
+        && spack install --fail-fast {{IOWARP_SPEC}} \
+        && spack view --dependencies yes symlink -i /opt/iowarp-view {{IOWARP_SPEC}}'
+
+    # 5) Put the view on PATH, install jarvis at the pinned ref, register this repo,
+    #    prepare sshd (root).
+    export PATH=/opt/iowarp-view/bin:$PATH
+    export LD_LIBRARY_PATH=/opt/iowarp-view/lib:/opt/iowarp-view/lib64:$LD_LIBRARY_PATH
+    git clone https://github.com/grc-iit/jarvis-cd.git /opt/jarvis-cd
+    git -C /opt/jarvis-cd checkout {{JARVIS_REF}}
+    pip3 install -e /opt/jarvis-cd || pip3 install --break-system-packages -e /opt/jarvis-cd
+    jarvis init
+    jarvis repo add /opt/clio-core/jarvis_clio_core
+    jarvis repo list
+    mkdir -p /run/sshd /root/.ssh && chmod 700 /root/.ssh
+
+    # 6) GATE — fail the build if a REQUIRED binary is missing (same set as the
+    #    Dockerfile; clio_redis_bench is required for the #526 redis experiment).
+    for b in clio_run clio_cte_fuse clio_cte_bench clio_redis_bench \
+             juicefs fio redis-server redis-cli redis-benchmark mpiexec jarvis; do
+        command -v "$b" >/dev/null || { echo "MISSING REQUIRED BINARY: $b"; exit 1; }
+    done
+    echo "iowarp-regression image: required binaries present"
+
+%environment
+    export PATH=/opt/iowarp-view/bin:$PATH
+    export LD_LIBRARY_PATH=/opt/iowarp-view/lib:/opt/iowarp-view/lib64:$LD_LIBRARY_PATH
+
+%runscript
+    exec "$@"
