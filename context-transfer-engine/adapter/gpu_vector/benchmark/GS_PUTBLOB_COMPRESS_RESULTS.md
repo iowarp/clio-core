@@ -1,5 +1,18 @@
 # Gray-Scott + CLIO PutBlob + compressor library (Delta A100)
 
+> **CAPACITY WIN — a dataset 2× the GPU-memory budget fits entirely on the
+> GPU.** Because compression shrinks cold pages and the compressor's storage
+> tier is a **kHbm bdev (device memory)**, compressed cold pages live in HBM.
+> A Gray-Scott field of logical size **2× the HBM budget** was streamed through
+> the compressed vector (`test_gpu_vector_capacity`, `cte_gpu_vector_capacity_cuda`):
+> **256 MiB logical stored in 16 MiB HBM (15.9×)**, inside a 128 MiB budget it
+> exceeds 2×; **uncompressed would need 256 MiB and not fit**. Chunk-0 read-back
+> (FaultAllSync) matched within the error bound. Footprint is the real measured
+> kHbm-tier used bytes (bdev `GetStats` on the core's HBM tier `512.1`). Streaming
+> is chunked + host-paced because paging larger-than-HBM *on-device* deadlocks
+> under GPU compression (`EvictSlot`/fault spin-wait on-device for a cuSZp op that
+> needs the same GPU). PASS.
+>
 > **MILESTONE — COMPRESSED GPU VECTOR WORKS (device eviction path).** The
 > `clio_cte::gpu_vector::Vector<T>` is now a *compressed* GPU vector: constructed
 > with a compressor `storage_pool_id`, its page evictions route through the
