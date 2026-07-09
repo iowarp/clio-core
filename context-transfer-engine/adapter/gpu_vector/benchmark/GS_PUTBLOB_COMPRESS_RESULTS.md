@@ -1,5 +1,12 @@
 # Gray-Scott + CLIO PutBlob + compressor library (Delta A100)
 
+> **Figures** (regenerate with `gsbench/plot_new_results.py`; palette validated
+> with the dataviz validator — blue `#2a78d6` traditional / green `#008300`
+> compressed-GPU, CVD ΔE 104 deutan, all checks PASS):
+> `fig_checkpoint_compare.{png,pdf}` (checkpoint latency + footprint, traditional
+> vs compressed) and `fig_capacity.{png,pdf}` (256 MiB dataset vs 128 MiB GPU
+> budget). Both are embedded in `GS_CLIO_compression_report.pdf`.
+>
 > **HEAD-TO-HEAD vs. TRADITIONAL CHECKPOINT PATH.** Same canonical Gray-Scott
 > loop (iterate steps, checkpoint the field every N steps) checkpointed two ways,
 > timed on the same evolving snapshots (`clio_gs_checkpoint_bench`, A100,
