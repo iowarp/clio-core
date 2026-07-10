@@ -91,15 +91,26 @@
 > library; the runtime-reported ratio (e.g. cuszp **3.91×** per-block) matches
 > within per-chunk-size effects.
 
+**Scope of this document.** The banners above are the current headline results of
+the compressed GPU vector (checkpoint comparison, capacity, device round-trip),
+from `test_gpu_vector_compress`, `test_gpu_vector_capacity`, and
+`clio_gs_checkpoint_bench` (compressor pool `600` → CTE core `512` → kHbm/RAM
+bdev). The sections **below** are the earlier PutBlob *library sweep* that
+established the ratios, from `clio_gs_putblob_compress_bench.cc` (a different,
+self-contained topology: compressor `512` → core `513` → RAM bdev). Both are
+valid; they use different pool ids because they are separate benchmarks.
+
 Counterpart to `clio_gray_scott_transfer_bench.cu` (which uses raw `cudaMemcpyAsync`
 and is fully working). This bench runs Gray-Scott, stores each snapshot via a CLIO
 PutBlob, and **measures** what the pinned compressor achieves on the data. Source:
 `clio_gs_putblob_compress_bench.cc`.
 
 **GPU:** A100-SXM4-40GB · **Build:** CUDA 12.6 in `iowarp/deps-nvidia`
-(Apptainer), `CLIO_CTE_ENABLE_COMPRESS=ON`, native sm_80 · **Compressor:** pinned
-to **lz4** (CPU) via `CLIO_CTE_COMPRESS_LIB` (nvcomp not yet installed; see
-follow-ups).
+(Apptainer), `CLIO_CTE_ENABLE_COMPRESS=ON`, native sm_80 · **Compressor:** the
+compressed GPU vector and the checkpoint/capacity results above use **cuSZp**
+(GPU, error-bounded lossy float) pinned via `CLIO_CTE_COMPRESS_LIB=cuszp`; the
+PutBlob library sweep below also pins lz4 / zstd / zfp / sz3 for comparison.
+(nvcomp not installed.)
 
 ## How it is wired
 
@@ -150,7 +161,10 @@ zfp 2.00×, sz3 31.45×; all 0 put failures, ~1.7–2.1 GiB/s.)
   failures for every library; ~2.1 GiB/s logical throughput regardless of pin.
 - **The env pin works** — swapping `CLIO_CTE_COMPRESS_LIB` alone changes the
   compressor and the ratio, no rebuild, no code change.
-- **`ctest -R gpu` = 14/14 pass** on the same A100 build.
+- **The pre-existing `ctest -R gpu` suite still passes** on the same A100 build,
+  plus the two new compressed-vector tests added by this work
+  (`cte_gpu_vector_compress_cuda`, `cte_gpu_vector_capacity_cuda`) — see the top
+  of this doc — with no regression in `cte_gpu_vector_cuda`.
 
 ## Key finding: lossy compression is what delivers the capacity win
 
@@ -192,6 +206,12 @@ toolchain. Wrapper: `context-transport-primitives/include/clio_ctp/compress/cusz
 2. **Runtime-reported ratio** does not propagate back through the transparent
    chimod chain (the bench measures it directly instead). Surfacing
    `actual_compressed_size_` on the client task is a separate runtime fix.
-3. **Host-side submission.** The GS kernel produces the data; the host issues the
-   compressed PutBlob. Device-side submission through the compressor is future
-   work (the gpu_vector adapter already does device-side `ipc->Send` to *core*).
+3. ~~**Host-side submission.** Device-side submission through the compressor is
+   future work.~~ **DONE** (see top of doc): the compressed `Vector<T>` submits
+   page evictions/faults *from device code* through the compressor — raw core
+   `PutBlob`(15)/`GetBlob`(16) tasks are reconstructed at the compressor
+   entrypoint (serialization cases) and transparently (de)compressed. The one
+   remaining device-side gap is the transparent *on-access* fault, which
+   deadlocks on a single GPU (a spin-waiting kernel vs. cuSZp needing the same
+   GPU); `Vector::FaultAllSync()` is the working host-orchestrated read path, and
+   an async fault-completion model is the future work.
