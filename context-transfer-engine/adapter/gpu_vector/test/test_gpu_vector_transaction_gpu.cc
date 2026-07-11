@@ -35,6 +35,7 @@
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/core/core_tasks.h>
 #include <clio_cte/gpu_vector/gpu_vector.h>
+#include <clio_cte/gpu_vector/transaction.h>
 
 #include <clio_ctp/util/gpu_api.h>
 
@@ -45,6 +46,7 @@
 #include <fstream>
 #include <string>
 #include <thread>
+#include <vector>
 
 using namespace std::chrono_literals;
 
@@ -191,41 +193,61 @@ TEST_CASE("gpu_vector: SequentialTransaction windowed prefetch over a dataset "
   auto *result = ctp::GpuApi::MallocHost<float>(window * epp * sizeof(float));
   REQUIRE(result != nullptr);
 
+  // The body reads the (now-resident) window and verifies it against Field().
   double max_abs_err = 0.0;
   clio::run::u64 checked = 0, first_bad = (clio::run::u64)K * epp;
-  const clio::run::u32 nwin = K / window;
-  for (clio::run::u32 w = 0; w < nwin; ++w) {
-    clio::run::u64 first_page = (clio::run::u64)w * window;
-    vec.PrefetchWindowSync(first_page);  // host decompress window into HBM, GPU idle
-    clio::run::u64 lo = first_page * epp;
-    clio::run::u64 hi = lo + (clio::run::u64)window * epp;
+  auto body = [&](clio::run::u64 lo, clio::run::u64 hi,
+                  gv::DeviceView<float> v) {
     std::memset(result, 0, window * epp * sizeof(float));
     // nblocks==1: read_range uses blockIdx.x as the block index, so launch a
     // single block (one warp) that reads the whole window range.
-    WindowReadKernel<<<1, 32>>>(gpu_info, view, result, lo, hi);
+    WindowReadKernel<<<1, 32>>>(gpu_info, v, result, lo, hi);
     ctp::GpuApi::Synchronize();
-    for (clio::run::u64 j = 0; j < (clio::run::u64)window * epp; ++j) {
+    for (clio::run::u64 j = 0; j < hi - lo; ++j) {
       clio::run::u64 gi = lo + j;
       double e = std::fabs((double)result[j] - (double)Field(gi));
       if (e > max_abs_err) max_abs_err = e;
       if (e > 2.0e-3 && first_bad == (clio::run::u64)K * epp) first_bad = gi;
       ++checked;
     }
-  }
-  ctp::GpuApi::FreeHost(result);
+  };
 
+  // ---- 1) SequentialTransaction: ascending sweep ----
+  gv::SequentialTransaction<float> seq(vec, /*first_page=*/0, /*npages=*/K);
+  seq.Iterate(body);
   std::fprintf(stderr,
-      "[TXN] swept %u windows, read %llu elems  max_abs_err=%.3e (eb=1e-3)\n",
-      nwin, (unsigned long long)checked, max_abs_err);
+      "[TXN] Sequential: read %llu elems  max_abs_err=%.3e (eb=1e-3)\n",
+      (unsigned long long)checked, max_abs_err);
+  REQUIRE(checked == (clio::run::u64)K * epp);
+  REQUIRE(max_abs_err <= 2.0e-3);
+
+  // ---- 2) PseudoRandomTransaction: same windows, shuffled order ----
+  std::vector<clio::run::u64> starts;
+  for (clio::run::u32 w = 0; w < K / window; ++w)
+    starts.push_back((clio::run::u64)w * window);
+  // Deterministic shuffle (no RNG needed): reverse + odd/even interleave.
+  std::vector<clio::run::u64> shuffled;
+  for (size_t i = 0; i < starts.size(); i += 2) shuffled.push_back(starts[i]);
+  for (size_t i = 1; i < starts.size(); i += 2) shuffled.push_back(starts[i]);
+  checked = 0;
+  max_abs_err = 0.0;
+  first_bad = (clio::run::u64)K * epp;
+  gv::PseudoRandomTransaction<float> rnd(vec, shuffled);
+  rnd.Iterate(body);
+  std::fprintf(stderr,
+      "[TXN] PseudoRandom: read %llu elems  max_abs_err=%.3e (eb=1e-3)\n",
+      (unsigned long long)checked, max_abs_err);
   if (first_bad != (clio::run::u64)K * epp) {
     std::fprintf(stderr, "[TXN] first out-of-bound at %llu: exp %.6f\n",
                  (unsigned long long)first_bad, Field(first_bad));
   }
   REQUIRE(checked == (clio::run::u64)K * epp);
   REQUIRE(max_abs_err <= 2.0e-3);
+
+  ctp::GpuApi::FreeHost(result);
   std::fprintf(stderr,
-      "[TXN] PASS: %lluMiB dataset swept correctly with only %lluMiB resident "
-      "(windowed prefetch, no on-device fault).\n",
+      "[TXN] PASS: %lluMiB dataset swept correctly (Sequential + PseudoRandom) "
+      "with only %lluMiB resident (windowed prefetch, no on-device fault).\n",
       (unsigned long long)((clio::run::u64)K * page_size >> 20),
       (unsigned long long)((clio::run::u64)window * page_size >> 20));
 }
