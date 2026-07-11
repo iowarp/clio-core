@@ -126,6 +126,22 @@ class Vector {
    */
   void FaultAllSync();
 
+  /**
+   * Windowed host-driven prefetch (the #700 SequentialTransaction primitive).
+   *
+   * Decompress the contiguous run of `gpu_pages_per_block` global pages starting
+   * at `first_page` into this (single-block) vector's HBM slots and mark them
+   * resident, binding slot s -> global page (first_page + s). The GPU is idle
+   * during the decompress (no on-device fault). Unlike FaultAllSync (which loads
+   * the whole vector), this loads only ONE window, so a dataset far larger than
+   * the HBM cache can be swept window-by-window: prefetch a window -> read it
+   * on-device (pages resident) -> advance. Single-block, single-tier only
+   * (nblocks == 1, host_pages_per_block == 0); the window size is the HBM cache
+   * (gpu_pages_per_block). Pages are named "<tag>_b0_pi<global_page>" to match
+   * the store.
+   */
+  void PrefetchWindowSync(clio::run::u64 first_page);
+
   /** Cache-thread-only: drains the per-block host_prefetch_q, issues
    *  AsyncGetBlob via the CPU-side CTE client for each directive,
    *  waits for completion, then launches a tiny kernel to clear
@@ -260,6 +276,23 @@ __global__ void MarkAllResidentKernel(DeviceViewBase v) {
     Page *p = &b->pages[s];
     p->page_idx = static_cast<int32_t>(
         static_cast<clio::run::u64>(blockIdx.x) * v.gpu_pages_per_block + s);
+    p->modify_min = -1;
+    p->modify_max = -1;
+    p->flags = 0;
+    p->tier = 0;
+  }
+}
+
+/** Windowed variant for Vector::PrefetchWindowSync: single-block, bind slot s to
+ *  global page (first_page + s) so the read kernel's Resolve finds the just-
+ *  prefetched window resident. */
+__global__ void MarkWindowResidentKernel(DeviceViewBase v,
+                                         clio::run::u64 first_page) {
+  Block *b = GetBlock(v, 0);
+  for (clio::run::u32 s = threadIdx.x; s < v.gpu_pages_per_block;
+       s += blockDim.x) {
+    Page *p = &b->pages[s];
+    p->page_idx = static_cast<int32_t>(first_page + s);
     p->modify_min = -1;
     p->modify_max = -1;
     p->flags = 0;
@@ -1380,6 +1413,45 @@ inline void Vector<T>::FaultAllSync() {
   clio::run::u32 threads = (gpu_ppb < 256u) ? gpu_ppb : 256u;
   if (threads == 0) threads = 1;
   detail::MarkAllResidentKernel<<<nblocks, threads>>>(view_.base);
+  ctp::GpuApi::Synchronize();
+#endif
+}
+
+template <typename T>
+inline void Vector<T>::PrefetchWindowSync(clio::run::u64 first_page) {
+#if !CTP_IS_DEVICE_PASS
+  if (impl_->nblocks_cached != 1 || impl_->host_ppb_cached != 0) {
+    throw std::runtime_error(
+        "gpu_vector: PrefetchWindowSync is single-block single-tier only");
+  }
+  const clio::run::u32 gpu_ppb = impl_->gpu_ppb_cached;
+  const clio::run::u64 page_size = impl_->page_size_cached;
+
+  // Decompress the window's pages [first_page, first_page+gpu_ppb) into the HBM
+  // slots. GPU is idle here (host-orchestrated), so the compressor's decompress
+  // runs without contending with a spin-waiting fault kernel.
+  clio::cte::core::Client client(impl_->cte_pool_id);
+  for (clio::run::u32 s = 0; s < gpu_ppb; ++s) {
+    clio::run::u64 gp = first_page + s;
+    char *hbm = static_cast<char *>(impl_->pages_base) + s * page_size;
+    std::string name =
+        impl_->tag_name + "_b0_pi" + std::to_string(gp);  // global page name
+    ctp::ipc::ShmPtr<> blob_data;
+    blob_data.alloc_id_ = ctp::ipc::AllocatorId::GetNull();
+    blob_data.off_ = reinterpret_cast<clio::run::u64>(hbm);
+    auto gf = client.AsyncGetBlob(view_.base.tag_id, name, /*offset=*/0,
+                                  page_size, /*flags=*/0, blob_data,
+                                  clio::run::PoolQuery::Local());
+    gf.Wait();
+    if (gf->GetReturnCode() != 0) {
+      throw std::runtime_error(
+          "gpu_vector: PrefetchWindowSync GetBlob failed for '" + name +
+          "' rc=" + std::to_string(gf->GetReturnCode()));
+    }
+  }
+  clio::run::u32 threads = (gpu_ppb < 256u) ? gpu_ppb : 256u;
+  if (threads == 0) threads = 1;
+  detail::MarkWindowResidentKernel<<<1, threads>>>(view_.base, first_page);
   ctp::GpuApi::Synchronize();
 #endif
 }
