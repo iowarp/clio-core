@@ -1,5 +1,32 @@
 # Gray-Scott + CLIO PutBlob + compressor library (Delta A100)
 
+> **DEVICE-SIDE READS: TRANSACTION (WINDOWED PREFETCH) WORKS; ON-DEVICE FAULT
+> DOES NOT.** The transparent *on-access* device page fault cannot be serviced
+> by a GPU compressor on one device: the fault kernel spin-waits ON-DEVICE for a
+> `GetBlob` while the compressor must run cuSZp's decompress kernel on the SAME
+> device — and the two do not co-schedule, so they deadlock. Two fixes were
+> tried and both **failed** (verified A100): (1) a dedicated non-blocking stream
+> + `cudaMallocAsync` in the wrapper *and* a cuSZp source patch
+> ([`../../../context-transport-primitives/.../compress/patches`](../../../context-transport-primitives/include/clio_ctp/compress/patches));
+> (2) a preallocated pinned staging pool + pre-warmed mempool. Both remove every
+> device-synchronizing CUDA call, yet the fault still hangs — proving the
+> residual cause is kernel **co-scheduling**, not device-sync. (Commits
+> `a00592f`, `cf6b80f`; no regression in the host-orchestrated paths.)
+>
+> The working path is the **issue #700 Transaction API** — host-orchestrated
+> *windowed prefetch*. Pages are pulled into HBM AHEAD of use while the GPU is
+> idle, so the device kernel only ever reads resident pages (no on-device fault).
+> `transaction.h` provides `Transaction<T>` + `SequentialTransaction` +
+> `PseudoRandomTransaction` (each window is `gpu_pages_per_block` pages;
+> `Vector::PrefetchWindowSync` is the primitive, `FaultAllSync` the whole-vector
+> special case). **Verified A100** (`test_gpu_vector_transaction`,
+> `cte_gpu_vector_transaction_cuda`): an **8 MiB dataset swept in 1 MiB windows
+> (8× the resident footprint)** through BOTH a Sequential and a PseudoRandom
+> transaction — 2,097,152 elems each, `max_abs_err 1.0e-3 == eb`, PASS. Reads
+> scale past the HBM cache with a bounded resident footprint. Commits `0f9a256`,
+> `89c4735`. (Remaining perf work: pipeline window W+1 prefetch on a copy stream
+> while the kernel reads W; multi-block windows.)
+>
 > **Figures** — committed in [`results/`](results/), regenerate with
 > `python3 results/plot_new_results.py`. Palette validated with the dataviz
 > validator (blue `#2a78d6` traditional / green `#008300` compressed-GPU, CVD
@@ -65,8 +92,10 @@
 > ~16:1; `FaultAllSync` decompresses all 4; the **device read kernel** reads
 > them; `max_abs_err 1.0e-3 == eb`. The full write→evict→compress→store→
 > decompress→**device-read** loop passes. (The transparent on-*access* device
-> fault would need an async fault-completion model that doesn't hold the GPU —
-> that remains future work; `FaultAllSync` is the working prefetch-style path.)
+> fault was later shown to be undeadlockable by removing device-syncs alone —
+> the cause is kernel co-scheduling; the working answer is the #700 Transaction /
+> windowed-prefetch API — see the top banner. `FaultAllSync` /
+> `PrefetchWindowSync` are the working host-orchestrated read paths.)
 > No data is copied to DRAM to compress: compression is HBM→HBM (cuSZp temp HBM
 > buffer), only the small compressed result leaves the device.
 
