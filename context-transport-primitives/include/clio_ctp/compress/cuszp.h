@@ -15,8 +15,76 @@
 #include <cuSZp.h>
 
 #include <cstdint>
+#include <cstring>
+#include <mutex>
+#include <vector>
 
 #include "compress.h"
+
+namespace ctp {
+namespace cuszp_detail {
+
+// Process-global pinned-host staging pool + pre-warmed stream-ordered mempool.
+//
+// The compressed GPU-vector fault path decompresses while a caller kernel
+// spin-waits ON-DEVICE for that decompress. To not deadlock, the decompress
+// must issue ZERO device-synchronizing CUDA calls. Two would otherwise remain:
+//   (1) the first cudaMallocAsync (lazy mempool creation) device-syncs, and
+//   (2) staging the compressed bytes host->device from PAGEABLE memory makes
+//       cudaMemcpyAsync behave synchronously (a device sync).
+// This pool fixes both: its constructor warms the mempool and preallocates
+// pinned staging buffers, and it is constructed lazily on the FIRST compress --
+// which always happens during page eviction (GPU idle), strictly before any
+// read fault can occur (a page must be written before it can be faulted back).
+// Pageable inputs are then bounced through a pinned buffer so the H2D is a true
+// async copy.
+struct PinnedPool {
+  std::mutex m;
+  std::vector<uint8_t *> free_;
+  std::vector<uint8_t *> all_;
+  size_t buf_ = 0;
+
+  PinnedPool() {
+    cudaFree(0);  // ensure a context exists
+    // Warm the default stream-ordered mempool so later cudaMallocAsync calls
+    // (during an on-device fault) are pure stream ops, not a syncing pool init.
+    void *w = nullptr;
+    if (cudaMallocAsync(&w, size_t(8) << 20, 0) == cudaSuccess) {
+      cudaFreeAsync(w, 0);
+      cudaStreamSynchronize(0);
+    }
+    buf_ = size_t(8) << 20;  // 8 MiB covers typical gpu_vector page sizes
+    for (int i = 0; i < 16; ++i) {
+      uint8_t *p = nullptr;
+      if (cudaMallocHost((void **)&p, buf_) == cudaSuccess) {
+        all_.push_back(p);
+        free_.push_back(p);
+      }
+    }
+  }
+
+  uint8_t *Acquire(size_t need) {
+    if (need > buf_) return nullptr;
+    std::lock_guard<std::mutex> g(m);
+    if (free_.empty()) return nullptr;
+    uint8_t *p = free_.back();
+    free_.pop_back();
+    return p;
+  }
+  void Release(uint8_t *p) {
+    if (!p) return;
+    std::lock_guard<std::mutex> g(m);
+    free_.push_back(p);
+  }
+};
+
+inline PinnedPool &Pool() {
+  static PinnedPool pool;  // thread-safe lazy init; first touch = first compress
+  return pool;
+}
+
+}  // namespace cuszp_detail
+}  // namespace ctp
 
 namespace ctp {
 
@@ -48,12 +116,15 @@ class Cuszp : public Compressor {
                 size_t input_size) override {
     if (input_size == 0 || (input_size % sizeof(float)) != 0) return false;
     const size_t nbEle = input_size / sizeof(float);
+    // Force the pinned pool + mempool warm on the FIRST compress (page eviction,
+    // GPU idle) so it exists before any on-device read fault.
+    (void)cuszp_detail::Pool();
     cudaStream_t stream = Stream();  // persistent, non-blocking, per-thread
     if (!stream) return false;
-    uint8_t *d_in = nullptr, *d_cmp = nullptr;
+    uint8_t *d_in = nullptr, *d_cmp = nullptr, *pin = nullptr;
     bool free_in = false, ok = false;
     do {
-      d_in = ToDeviceInput(input, input_size, stream, &free_in);
+      d_in = ToDeviceInput(input, input_size, stream, &free_in, &pin);
       if (!d_in) break;
       // cuSZp worst case is ~the input size; add slack and always use a temp so
       // we can bounds-check the caller's buffer against the real cmp size.
@@ -76,6 +147,7 @@ class Cuszp : public Compressor {
     } while (false);
     if (d_cmp) cudaFreeAsync(d_cmp, stream);
     if (free_in) cudaFreeAsync(d_in, stream);
+    if (pin) cuszp_detail::Pool().Release(pin);  // safe: stream synced above
     return ok;
   }
 
@@ -83,12 +155,13 @@ class Cuszp : public Compressor {
                   size_t input_size) override {
     if (output_size == 0 || (output_size % sizeof(float)) != 0) return false;
     const size_t nbEle = output_size / sizeof(float);
+    (void)cuszp_detail::Pool();  // normally already warm from the first compress
     cudaStream_t stream = Stream();
     if (!stream) return false;
-    uint8_t *d_cmp = nullptr, *d_dec = nullptr;
+    uint8_t *d_cmp = nullptr, *d_dec = nullptr, *pin = nullptr;
     bool free_in = false, ok = false;
     do {
-      d_cmp = ToDeviceInput(input, input_size, stream, &free_in);
+      d_cmp = ToDeviceInput(input, input_size, stream, &free_in, &pin);
       if (!d_cmp) break;
       if (cudaMallocAsync(&d_dec, output_size, stream) != cudaSuccess) break;
       uint3 dims = {0, 0, 0};
@@ -107,6 +180,7 @@ class Cuszp : public Compressor {
     } while (false);
     if (d_dec) cudaFreeAsync(d_dec, stream);
     if (free_in) cudaFreeAsync(d_cmp, stream);
+    if (pin) cuszp_detail::Pool().Release(pin);  // safe: stream synced above
     return ok;
   }
 
@@ -141,16 +215,38 @@ class Cuszp : public Compressor {
            attr.type == cudaMemoryTypeManaged;
   }
 
+  // Stage `input` onto the device. Device/managed pointers are used in place.
+  // A PAGEABLE host pointer is bounced through a preallocated PINNED buffer so
+  // the H2D is a TRUE async copy (a direct async copy from pageable memory is
+  // silently synchronous, which device-syncs and would deadlock an on-device
+  // caller). `*pinned_out` receives the borrowed pinned buffer to release AFTER
+  // the stream is synchronized.
   static uint8_t *ToDeviceInput(void *input, size_t size, cudaStream_t stream,
-                                bool *owned) {
+                                bool *owned, uint8_t **pinned_out) {
     *owned = false;
+    *pinned_out = nullptr;
     if (IsDeviceAccessible(input)) return static_cast<uint8_t *>(input);
     uint8_t *d = nullptr;
     if (cudaMallocAsync(&d, size, stream) != cudaSuccess) return nullptr;
-    if (cudaMemcpyAsync(d, input, size, cudaMemcpyHostToDevice, stream) !=
-        cudaSuccess) {
-      cudaFreeAsync(d, stream);
-      return nullptr;
+    uint8_t *pin = cuszp_detail::Pool().Acquire(size);
+    if (pin) {
+      std::memcpy(pin, input, size);  // pageable->pinned on CPU (no device sync)
+      if (cudaMemcpyAsync(d, pin, size, cudaMemcpyHostToDevice, stream) !=
+          cudaSuccess) {
+        cudaFreeAsync(d, stream);
+        cuszp_detail::Pool().Release(pin);
+        return nullptr;
+      }
+      *pinned_out = pin;
+    } else {
+      // Pool exhausted / oversized: fall back to a direct (possibly syncing)
+      // copy. Fine for host-orchestrated paths; only a risk if this happens on
+      // an on-device fault with the pool full.
+      if (cudaMemcpyAsync(d, input, size, cudaMemcpyHostToDevice, stream) !=
+          cudaSuccess) {
+        cudaFreeAsync(d, stream);
+        return nullptr;
+      }
     }
     *owned = true;
     return d;
