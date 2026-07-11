@@ -48,8 +48,8 @@ class Cuszp : public Compressor {
                 size_t input_size) override {
     if (input_size == 0 || (input_size % sizeof(float)) != 0) return false;
     const size_t nbEle = input_size / sizeof(float);
-    cudaStream_t stream = nullptr;
-    if (cudaStreamCreate(&stream) != cudaSuccess) return false;
+    cudaStream_t stream = Stream();  // persistent, non-blocking, per-thread
+    if (!stream) return false;
     uint8_t *d_in = nullptr, *d_cmp = nullptr;
     bool free_in = false, ok = false;
     do {
@@ -58,22 +58,24 @@ class Cuszp : public Compressor {
       // cuSZp worst case is ~the input size; add slack and always use a temp so
       // we can bounds-check the caller's buffer against the real cmp size.
       const size_t cap = input_size + input_size / 8 + 1024;
-      if (cudaMalloc(&d_cmp, cap) != cudaSuccess) break;
+      if (cudaMallocAsync(&d_cmp, cap, stream) != cudaSuccess) break;
       size_t cmp_size = 0;
       uint3 dims = {0, 0, 0};
+      // cuSZp (patched) is fully stream-ordered and syncs only `stream`
+      // internally to read back cmp_size, so it never device-synchronizes.
       cuSZp_compress(d_in, d_cmp, nbEle, &cmp_size, eb_, CUSZP_DIM_1D, dims,
                      CUSZP_TYPE_FLOAT, CUSZP_MODE_OUTLIER, stream);
-      if (cudaStreamSynchronize(stream) != cudaSuccess) break;
       if (cmp_size == 0 || cmp_size > output_size) break;  // caller buffer small
       cudaMemcpyKind kind = IsDeviceAccessible(output) ? cudaMemcpyDeviceToDevice
                                                        : cudaMemcpyDeviceToHost;
-      if (cudaMemcpy(output, d_cmp, cmp_size, kind) != cudaSuccess) break;
+      if (cudaMemcpyAsync(output, d_cmp, cmp_size, kind, stream) != cudaSuccess)
+        break;
+      if (cudaStreamSynchronize(stream) != cudaSuccess) break;  // this stream only
       output_size = cmp_size;
       ok = true;
     } while (false);
-    if (free_in) cudaFree(d_in);
-    if (d_cmp) cudaFree(d_cmp);
-    cudaStreamDestroy(stream);
+    if (d_cmp) cudaFreeAsync(d_cmp, stream);
+    if (free_in) cudaFreeAsync(d_in, stream);
     return ok;
   }
 
@@ -81,30 +83,53 @@ class Cuszp : public Compressor {
                   size_t input_size) override {
     if (output_size == 0 || (output_size % sizeof(float)) != 0) return false;
     const size_t nbEle = output_size / sizeof(float);
-    cudaStream_t stream = nullptr;
-    if (cudaStreamCreate(&stream) != cudaSuccess) return false;
+    cudaStream_t stream = Stream();
+    if (!stream) return false;
     uint8_t *d_cmp = nullptr, *d_dec = nullptr;
     bool free_in = false, ok = false;
     do {
       d_cmp = ToDeviceInput(input, input_size, stream, &free_in);
       if (!d_cmp) break;
-      if (cudaMalloc(&d_dec, output_size) != cudaSuccess) break;
+      if (cudaMallocAsync(&d_dec, output_size, stream) != cudaSuccess) break;
       uint3 dims = {0, 0, 0};
       cuSZp_decompress(d_dec, d_cmp, nbEle, input_size, eb_, CUSZP_DIM_1D, dims,
                        CUSZP_TYPE_FLOAT, CUSZP_MODE_OUTLIER, stream);
-      if (cudaStreamSynchronize(stream) != cudaSuccess) break;
       cudaMemcpyKind kind = IsDeviceAccessible(output) ? cudaMemcpyDeviceToDevice
                                                        : cudaMemcpyDeviceToHost;
-      if (cudaMemcpy(output, d_dec, output_size, kind) != cudaSuccess) break;
+      if (cudaMemcpyAsync(output, d_dec, output_size, kind, stream) !=
+          cudaSuccess)
+        break;
+      // Sync ONLY this stream (not the whole device), so a caller kernel
+      // spin-waiting on-device (the gpu_vector page fault) does not deadlock us:
+      // the decompress + copy run on `stream`, concurrently with that kernel.
+      if (cudaStreamSynchronize(stream) != cudaSuccess) break;
       ok = true;
     } while (false);
-    if (free_in) cudaFree(d_cmp);
-    if (d_dec) cudaFree(d_dec);
-    cudaStreamDestroy(stream);
+    if (d_dec) cudaFreeAsync(d_dec, stream);
+    if (free_in) cudaFreeAsync(d_cmp, stream);
     return ok;
   }
 
  private:
+  // One persistent non-blocking stream per worker thread. Not the default
+  // stream (which serializes with everything) and never destroyed per call.
+  // The first use also warms the stream-ordered memory pool so later
+  // cudaMallocAsync calls (e.g. during an on-device page fault) are pure
+  // stream-ordered ops with no device synchronization.
+  static cudaStream_t Stream() {
+    static thread_local cudaStream_t s = nullptr;
+    if (!s) {
+      if (cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking) != cudaSuccess)
+        return nullptr;
+      void *warm = nullptr;
+      if (cudaMallocAsync(&warm, 1 << 20, s) == cudaSuccess) {
+        cudaFreeAsync(warm, s);
+        cudaStreamSynchronize(s);
+      }
+    }
+    return s;
+  }
+
   static bool IsDeviceAccessible(const void *ptr) {
     cudaPointerAttributes attr;
     cudaError_t err = cudaPointerGetAttributes(&attr, ptr);
@@ -121,10 +146,10 @@ class Cuszp : public Compressor {
     *owned = false;
     if (IsDeviceAccessible(input)) return static_cast<uint8_t *>(input);
     uint8_t *d = nullptr;
-    if (cudaMalloc(&d, size) != cudaSuccess) return nullptr;
+    if (cudaMallocAsync(&d, size, stream) != cudaSuccess) return nullptr;
     if (cudaMemcpyAsync(d, input, size, cudaMemcpyHostToDevice, stream) !=
         cudaSuccess) {
-      cudaFree(d);
+      cudaFreeAsync(d, stream);
       return nullptr;
     }
     *owned = true;

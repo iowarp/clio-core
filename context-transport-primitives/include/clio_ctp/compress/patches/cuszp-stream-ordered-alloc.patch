@@ -1,0 +1,87 @@
+diff --git a/src/cuSZp_entry_1D_f32.cu b/src/cuSZp_entry_1D_f32.cu
+index 5c27af0..1a0e212 100644
+--- a/src/cuSZp_entry_1D_f32.cu
++++ b/src/cuSZp_entry_1D_f32.cu
+@@ -206,26 +206,32 @@ void cuSZp_compress_1D_outlier_f32(float* d_oriData, unsigned char* d_cmpBytes,
+     unsigned int* d_locOffset;
+     int* d_flag;
+     unsigned int glob_sync;
+-    cudaMalloc((void**)&d_cmpOffset, sizeof(unsigned int)*cmpOffSize);
+-    cudaMemset(d_cmpOffset, 0, sizeof(unsigned int)*cmpOffSize);
+-    cudaMalloc((void**)&d_locOffset, sizeof(unsigned int)*cmpOffSize);
+-    cudaMemset(d_locOffset, 0, sizeof(unsigned int)*cmpOffSize);
+-    cudaMalloc((void**)&d_flag, sizeof(int)*cmpOffSize);
+-    cudaMemset(d_flag, 0, sizeof(int)*cmpOffSize);
++    // Stream-ordered allocations so compression never device-synchronizes
++    // either (the gpu_vector write-eviction path also spin-waits on-device for
++    // this compress). See the decompress path for the rationale.
++    cudaMallocAsync((void**)&d_cmpOffset, sizeof(unsigned int)*cmpOffSize, stream);
++    cudaMemsetAsync(d_cmpOffset, 0, sizeof(unsigned int)*cmpOffSize, stream);
++    cudaMallocAsync((void**)&d_locOffset, sizeof(unsigned int)*cmpOffSize, stream);
++    cudaMemsetAsync(d_locOffset, 0, sizeof(unsigned int)*cmpOffSize, stream);
++    cudaMallocAsync((void**)&d_flag, sizeof(int)*cmpOffSize, stream);
++    cudaMemsetAsync(d_flag, 0, sizeof(int)*cmpOffSize, stream);
+ 
+     // cuSZp GPU compression.
+     dim3 blockSize(bsize);
+     dim3 gridSize(gsize);
+     cuSZp_compress_kernel_1D_outlier_f32<<<gridSize, blockSize, sizeof(unsigned int)*2, stream>>>(d_oriData, d_cmpBytes, d_cmpOffset, d_locOffset, d_flag, errorBound, nbEle);
+ 
+-    // Obtain compression ratio and move data back to CPU.  
+-    cudaMemcpy(&glob_sync, d_cmpOffset+cmpOffSize-1, sizeof(unsigned int), cudaMemcpyDeviceToHost);
++    // Obtain compressed size: async D2H on the stream, then sync only THIS
++    // stream (not the whole device), so a spin-waiting caller kernel on another
++    // stream does not block us.
++    cudaMemcpyAsync(&glob_sync, d_cmpOffset+cmpOffSize-1, sizeof(unsigned int), cudaMemcpyDeviceToHost, stream);
++    cudaStreamSynchronize(stream);
+     *cmpSize = (size_t)glob_sync + (nbEle+tblock_size*thread_chunk-1)/(tblock_size*thread_chunk)*(tblock_size*thread_chunk)/32;
+ 
+-    // Free memory that is used.
+-    cudaFree(d_cmpOffset);
+-    cudaFree(d_locOffset);
+-    cudaFree(d_flag);
++    // Free memory that is used (stream-ordered).
++    cudaFreeAsync(d_cmpOffset, stream);
++    cudaFreeAsync(d_locOffset, stream);
++    cudaFreeAsync(d_flag, stream);
+ }
+ 
+  /** ************************************************************************
+@@ -253,20 +259,25 @@ void cuSZp_decompress_1D_outlier_f32(float* d_decData, unsigned char* d_cmpBytes
+     unsigned int* d_cmpOffset;
+     unsigned int* d_locOffset;
+     int* d_flag;
+-    cudaMalloc((void**)&d_cmpOffset, sizeof(unsigned int)*cmpOffSize);
+-    cudaMemset(d_cmpOffset, 0, sizeof(unsigned int)*cmpOffSize);
+-    cudaMalloc((void**)&d_locOffset, sizeof(unsigned int)*cmpOffSize);
+-    cudaMemset(d_locOffset, 0, sizeof(unsigned int)*cmpOffSize);
+-    cudaMalloc((void**)&d_flag, sizeof(int)*cmpOffSize);
+-    cudaMemset(d_flag, 0, sizeof(int)*cmpOffSize);
++    // Stream-ordered allocations (cudaMallocAsync/cudaFreeAsync) so this whole
++    // decompress path NEVER device-synchronizes. Plain cudaMalloc/cudaFree block
++    // the host until the device is idle, which deadlocks when a caller kernel is
++    // spin-waiting on-device for this decompress (the gpu_vector page-fault
++    // path). Async alloc is stream-ordered and pool-backed -> no device sync.
++    cudaMallocAsync((void**)&d_cmpOffset, sizeof(unsigned int)*cmpOffSize, stream);
++    cudaMemsetAsync(d_cmpOffset, 0, sizeof(unsigned int)*cmpOffSize, stream);
++    cudaMallocAsync((void**)&d_locOffset, sizeof(unsigned int)*cmpOffSize, stream);
++    cudaMemsetAsync(d_locOffset, 0, sizeof(unsigned int)*cmpOffSize, stream);
++    cudaMallocAsync((void**)&d_flag, sizeof(int)*cmpOffSize, stream);
++    cudaMemsetAsync(d_flag, 0, sizeof(int)*cmpOffSize, stream);
+ 
+     // cuSZp GPU decompression.
+     dim3 blockSize(bsize);
+     dim3 gridSize(gsize);
+     cuSZp_decompress_kernel_1D_outlier_f32<<<gridSize, blockSize, sizeof(unsigned int)*2, stream>>>(d_decData, d_cmpBytes, d_cmpOffset, d_locOffset, d_flag, errorBound, nbEle);
+-    
+-    // Free memory that is used.
+-    cudaFree(d_cmpOffset);
+-    cudaFree(d_locOffset);
+-    cudaFree(d_flag);
++
++    // Free memory that is used (stream-ordered).
++    cudaFreeAsync(d_cmpOffset, stream);
++    cudaFreeAsync(d_locOffset, stream);
++    cudaFreeAsync(d_flag, stream);
+ }
+\ No newline at end of file

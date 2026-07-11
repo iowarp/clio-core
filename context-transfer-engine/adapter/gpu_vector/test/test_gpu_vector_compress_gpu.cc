@@ -227,6 +227,13 @@ TEST_CASE("gpu_vector: compressed write/evict then fault/read round-trip",
   auto *result = ctp::GpuApi::MallocHost<float>(total * sizeof(float));
   REQUIRE(result != nullptr);
   std::memset(result, 0, total * sizeof(float));
+  // Two read modes. Default: host-orchestrated FaultAllSync. With
+  // CLIO_GV_ONDEVICE_FAULT=1: the read kernel cold-faults every page ON-DEVICE
+  // (the path that used to deadlock under GPU compression) -- used to verify the
+  // cuSZp stream-ordered-allocation fix (compressor runs concurrently with the
+  // spin-waiting fault kernel instead of device-syncing against it).
+  const char *ondev = std::getenv("CLIO_GV_ONDEVICE_FAULT");
+  const bool on_device_fault = ondev && ondev[0] == '1';
   {
     gv::Vector<float> vec(tag, nblocks, /*gpu_id=*/0, pages_per_block,
                           /*host_pages_per_block=*/0, page_size_bytes,
@@ -234,11 +241,17 @@ TEST_CASE("gpu_vector: compressed write/evict then fault/read round-trip",
                           /*manager_threads_per_block=*/32,
                           /*allow_cold_miss_fault=*/true,
                           /*storage_pool_id=*/StoragePool());
-    vec.FaultAllSync();  // host-decompress every page into HBM, mark resident
-    std::fprintf(stderr, "[GPUVEC-C] FaultAllSync: materialized all pages\n");
     auto view = vec.Device();
-    GpuVecCompressReadKernel<<<nblocks, 32>>>(gpu_info, view, result, total);
-    ctp::GpuApi::Synchronize();
+    if (on_device_fault) {
+      std::fprintf(stderr, "[GPUVEC-C] ON-DEVICE fault path (no FaultAllSync)\n");
+      GpuVecCompressReadKernel<<<nblocks, 32>>>(gpu_info, view, result, total);
+      ctp::GpuApi::Synchronize();
+    } else {
+      vec.FaultAllSync();  // host-decompress every page into HBM, mark resident
+      std::fprintf(stderr, "[GPUVEC-C] FaultAllSync: materialized all pages\n");
+      GpuVecCompressReadKernel<<<nblocks, 32>>>(gpu_info, view, result, total);
+      ctp::GpuApi::Synchronize();
+    }
   }
 
   // ---- Verify within cuSZp's absolute error bound ----
