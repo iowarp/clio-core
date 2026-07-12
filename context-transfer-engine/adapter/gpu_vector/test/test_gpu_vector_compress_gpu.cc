@@ -227,13 +227,14 @@ TEST_CASE("gpu_vector: compressed write/evict then fault/read round-trip",
   auto *result = ctp::GpuApi::MallocHost<float>(total * sizeof(float));
   REQUIRE(result != nullptr);
   std::memset(result, 0, total * sizeof(float));
-  // Two read modes. Default: host-orchestrated FaultAllSync. With
-  // CLIO_GV_ONDEVICE_FAULT=1: the read kernel cold-faults every page ON-DEVICE
-  // (the path that used to deadlock under GPU compression) -- used to verify the
-  // cuSZp stream-ordered-allocation fix (compressor runs concurrently with the
-  // spin-waiting fault kernel instead of device-syncing against it).
+  // Two read modes. DEFAULT: the read kernel cold-faults every page ON-DEVICE.
+  // This deadlocked under GPU compression until the compressor was moved to a
+  // dedicated CUDA context (A100 compute preemption lets its decompress run
+  // while the fault kernel spins; cross-context UVA writes into the HBM page) --
+  // so the transparent on-access fault now works and is the default guard here.
+  // CLIO_GV_ONDEVICE_FAULT=0 selects the host-orchestrated FaultAllSync path.
   const char *ondev = std::getenv("CLIO_GV_ONDEVICE_FAULT");
-  const bool on_device_fault = ondev && ondev[0] == '1';
+  const bool on_device_fault = !ondev || ondev[0] != '0';
   {
     gv::Vector<float> vec(tag, nblocks, /*gpu_id=*/0, pages_per_block,
                           /*host_pages_per_block=*/0, page_size_bytes,

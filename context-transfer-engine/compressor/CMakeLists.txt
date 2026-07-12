@@ -46,6 +46,15 @@ if(xgboost_FOUND)
     target_link_libraries(clio_cte_compressor_runtime PRIVATE xgboost::xgboost)
 endif()
 
+# cuszp.h runs cuSZp in a dedicated CUDA context (driver API: cuCtxCreate/cuInit/
+# cuCtxPushCurrent). Link the CUDA driver library so the dlopen'd module .so
+# resolves those symbols at load time (else the ChiMod fails to load).
+if(TARGET CUDA::cuda_driver)
+    target_link_libraries(clio_cte_compressor_runtime PRIVATE CUDA::cuda_driver)
+else()
+    target_link_libraries(clio_cte_compressor_runtime PRIVATE cuda)
+endif()
+
 add_clio_module_client(
   SOURCES
     src/compressor_client.cc

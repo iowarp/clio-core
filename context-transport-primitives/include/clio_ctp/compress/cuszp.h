@@ -11,6 +11,7 @@
 
 #if CTP_ENABLE_COMPRESS && CTP_ENABLE_CUSZP
 
+#include <cuda.h>          // driver API: separate CUDA context for the compressor
 #include <cuda_runtime.h>
 #include <cuSZp.h>
 
@@ -23,6 +24,42 @@
 
 namespace ctp {
 namespace cuszp_detail {
+
+// A dedicated CUDA context for all compressor GPU work. Running cuSZp in a
+// SEPARATE context (not the app's primary context) is what makes the on-device
+// page fault non-deadlocking: A100 compute preemption lets the decompress kernel
+// in this context run while the app's fault kernel spin-waits in the primary
+// context (verified -- streams within one context do NOT preempt; a separate
+// context does). Cross-context UVA lets the decompress write straight into the
+// vector's HBM page (allocated in the primary context). Created once, lazily, on
+// the first compress (page eviction, GPU idle). A context may be current on many
+// threads at once (CUDA 4.0+), so all compressor workers share it.
+inline CUcontext CompressorContext() {
+  static CUcontext ctx = nullptr;
+  static std::once_flag once;
+  std::call_once(once, [] {
+    cuInit(0);
+    CUdevice dev;
+    if (cuDeviceGet(&dev, 0) != CUDA_SUCCESS) return;
+    if (cuCtxCreate(&ctx, 0, dev) != CUDA_SUCCESS) { ctx = nullptr; return; }
+    CUcontext popped;
+    cuCtxPopCurrent(&popped);  // cuCtxCreate left it current; restore the caller's
+  });
+  return ctx;
+}
+
+// RAII: make the compressor context current for the enclosing scope, restore the
+// previous (app) context on exit -- so the rest of the runtime is unaffected.
+struct ContextScope {
+  bool active = false;
+  ContextScope() {
+    CUcontext c = CompressorContext();
+    if (c && cuCtxPushCurrent(c) == CUDA_SUCCESS) active = true;
+  }
+  ~ContextScope() {
+    if (active) { CUcontext popped; cuCtxPopCurrent(&popped); }
+  }
+};
 
 // Process-global pinned-host staging pool + pre-warmed stream-ordered mempool.
 //
@@ -116,6 +153,10 @@ class Cuszp : public Compressor {
                 size_t input_size) override {
     if (input_size == 0 || (input_size % sizeof(float)) != 0) return false;
     const size_t nbEle = input_size / sizeof(float);
+    // Run all GPU work in the dedicated compressor context (see ContextScope):
+    // preemptable against a spin-waiting app kernel, cross-context UVA to the
+    // caller's device pointers. The stream/pool below are created in it.
+    cuszp_detail::ContextScope _cctx;
     // Force the pinned pool + mempool warm on the FIRST compress (page eviction,
     // GPU idle) so it exists before any on-device read fault.
     (void)cuszp_detail::Pool();
@@ -155,6 +196,7 @@ class Cuszp : public Compressor {
                   size_t input_size) override {
     if (output_size == 0 || (output_size % sizeof(float)) != 0) return false;
     const size_t nbEle = output_size / sizeof(float);
+    cuszp_detail::ContextScope _cctx;  // dedicated preemptable compressor context
     (void)cuszp_detail::Pool();  // normally already warm from the first compress
     cudaStream_t stream = Stream();
     if (!stream) return false;
