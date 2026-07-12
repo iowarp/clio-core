@@ -39,6 +39,7 @@
 
 #include <clio_ctp/util/gpu_api.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -122,6 +123,29 @@ __global__ void WindowReadKernel(clio::run::IpcManagerGpuInfo info,
   CLIO_GPU_INIT(info, /*ipc_ptr=*/nullptr);
   dev::vector<float> v(view, g_ipc_manager_ptr);
   v.read_range(lo, hi, [result, lo](clio::run::u64 i, float val) {
+    result[i - lo] = val;
+  });
+  (void)g_ipc_manager;
+}
+
+/** Compute-heavy body over a resident window: reads each element and does
+ *  `iters` of busy arithmetic (guarded by a runtime `sentinel` so it is not
+ *  optimized away yet never alters the output), writing the ORIGINAL value to
+ *  result[i-lo]. Represents a per-window simulation step whose compute time the
+ *  pipeline hides the next window's prefetch behind. */
+__global__ void WindowComputeKernel(clio::run::IpcManagerGpuInfo info,
+                                    gv::DeviceView<float> view, float *result,
+                                    clio::run::u64 lo, clio::run::u64 hi,
+                                    int iters, unsigned sentinel) {
+  CLIO_GPU_INIT(info, /*ipc_ptr=*/nullptr);
+  dev::vector<float> v(view, g_ipc_manager_ptr);
+  v.read_range(lo, hi, [=](clio::run::u64 i, float val) {
+    float busy = val;
+#pragma unroll 1
+    for (int k = 0; k < iters; ++k) busy = busy * 0.9999999f + 1.0e-7f;
+    // Never taken (threadIdx.x < 32 != sentinel), but the compiler cannot prove
+    // it, so the loop stays; result is always the untouched value.
+    if (threadIdx.x == sentinel) result[i - lo] = busy;
     result[i - lo] = val;
   });
   (void)g_ipc_manager;
@@ -244,10 +268,87 @@ TEST_CASE("gpu_vector: SequentialTransaction windowed prefetch over a dataset "
   REQUIRE(checked == (clio::run::u64)K * epp);
   REQUIRE(max_abs_err <= 2.0e-3);
 
+  // ---- 3) PIPELINED double-buffered prefetch: overlap prefetch(w+1) with
+  //         compute(w). gpu_pages_per_block = 2*window (buffer A = [0,window),
+  //         buffer B = [window,2*window)); window w lives in buffer (w%2). ----
+  const clio::run::u32 pf_win = window;              // pages per window
+  const clio::run::u32 nwin = K / pf_win;
+  // Compute load tuned so per-window compute ~ per-window prefetch (decompress),
+  // which is where pipelined overlap pays off most.
+  const int iters = 30;                              // per-element compute load
+  const unsigned kNever = 0xFFFFFFFFu;
+  gv::Vector<float> vec2(tag, /*nblocks=*/1, /*gpu_id=*/0,
+                         /*gpu_pages_per_block=*/2 * pf_win,
+                         /*host_pages_per_block=*/0, page_size,
+                         /*cache_period_us=*/20000, gv::CacheMode::kLegacy,
+                         /*manager_threads_per_block=*/32,
+                         /*allow_cold_miss_fault=*/false,
+                         /*storage_pool_id=*/StoragePool());
+  auto view2 = vec2.Device();
+  auto *res2 = ctp::GpuApi::MallocHost<float>(pf_win * epp * sizeof(float));
+  REQUIRE(res2 != nullptr);
+  using Clock = std::chrono::steady_clock;
+  auto ms = [](Clock::time_point a, Clock::time_point b) {
+    return std::chrono::duration<double, std::milli>(b - a).count();
+  };
+
+  auto verify_win = [&](clio::run::u64 lo) {
+    double e = 0.0;
+    for (clio::run::u64 j = 0; j < (clio::run::u64)pf_win * epp; ++j)
+      e = std::max(e, std::fabs((double)res2[j] - (double)Field(lo + j)));
+    return e;
+  };
+
+  // SERIAL: prefetch(w) then compute(w), fully sequential.
+  double serr = 0.0;
+  auto s0 = Clock::now();
+  for (clio::run::u32 w = 0; w < nwin; ++w) {
+    vec2.PrefetchPagesSync((clio::run::u64)w * pf_win, pf_win,
+                           (w % 2) * pf_win);
+    clio::run::u64 lo = (clio::run::u64)w * pf_win * epp;
+    WindowComputeKernel<<<1, 32>>>(gpu_info, view2, res2, lo, lo + pf_win * epp,
+                                   iters, kNever);
+    ctp::GpuApi::Synchronize();
+    serr = std::max(serr, verify_win(lo));
+  }
+  double serial_ms = ms(s0, Clock::now());
+
+  // PIPELINED: read/compute window w overlaps prefetch of window w+1 into the
+  // OTHER buffer. The prefetch (host-blocking GetBlobs) runs while the async
+  // compute kernel executes on the GPU; neither device-synchronizes the other.
+  cudaStream_t cstream = nullptr;
+  cudaStreamCreateWithFlags(&cstream, cudaStreamNonBlocking);
+  double perr = 0.0;
+  auto p0 = Clock::now();
+  vec2.PrefetchPagesSync(0, pf_win, 0);  // prime buffer 0 with window 0
+  for (clio::run::u32 w = 0; w < nwin; ++w) {
+    clio::run::u64 lo = (clio::run::u64)w * pf_win * epp;
+    WindowComputeKernel<<<1, 32, 0, cstream>>>(gpu_info, view2, res2, lo,
+                                               lo + pf_win * epp, iters, kNever);
+    if (w + 1 < nwin) {
+      vec2.PrefetchPagesSync((clio::run::u64)(w + 1) * pf_win, pf_win,
+                             ((w + 1) % 2) * pf_win);  // overlaps compute(w)
+    }
+    cudaStreamSynchronize(cstream);       // wait compute(w)
+    perr = std::max(perr, verify_win(lo));  // process before next reuse of res2
+  }
+  double pipe_ms = ms(p0, Clock::now());
+  cudaStreamDestroy(cstream);
+  ctp::GpuApi::FreeHost(res2);
+
+  std::fprintf(stderr,
+      "[TXN] pipeline: serial=%.1fms  pipelined=%.1fms  speedup=%.2fx  "
+      "(serr=%.2e perr=%.2e)\n",
+      serial_ms, pipe_ms, serial_ms / pipe_ms, serr, perr);
+  REQUIRE(serr <= 2.0e-3);
+  REQUIRE(perr <= 2.0e-3);                  // pipelined result correct
+  REQUIRE(pipe_ms <= serial_ms * 1.10);     // pipelining does not regress (speedup logged)
+
   ctp::GpuApi::FreeHost(result);
   std::fprintf(stderr,
-      "[TXN] PASS: %lluMiB dataset swept correctly (Sequential + PseudoRandom) "
-      "with only %lluMiB resident (windowed prefetch, no on-device fault).\n",
+      "[TXN] PASS: %lluMiB dataset swept correctly (Sequential + PseudoRandom + "
+      "pipelined) with only %lluMiB resident (windowed prefetch, no on-device "
+      "fault).\n",
       (unsigned long long)((clio::run::u64)K * page_size >> 20),
       (unsigned long long)((clio::run::u64)window * page_size >> 20));
 }

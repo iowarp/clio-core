@@ -142,6 +142,19 @@ class Vector {
    */
   void PrefetchWindowSync(clio::run::u64 first_page);
 
+  /**
+   * Prefetch `count` global pages [first_page, first_page+count) into HBM slots
+   * [slot_base, slot_base+count) and bind them resident. The building block for
+   * PIPELINED (double-buffered) prefetch: keep gpu_pages_per_block == 2*window
+   * and alternate slot_base between 0 and window, so window W+1 can be prefetched
+   * into one buffer while a device kernel reads window W from the other. Unlike
+   * PrefetchWindowSync this does NOT device-synchronize (it syncs only its own
+   * mark stream), so it will not stall a concurrently-running read kernel.
+   * Single-block, single-tier; slot_base + count <= gpu_pages_per_block.
+   */
+  void PrefetchPagesSync(clio::run::u64 first_page, clio::run::u32 count,
+                         clio::run::u32 slot_base);
+
   /** Cache-thread-only: drains the per-block host_prefetch_q, issues
    *  AsyncGetBlob via the CPU-side CTE client for each directive,
    *  waits for completion, then launches a tiny kernel to clear
@@ -293,6 +306,25 @@ __global__ void MarkWindowResidentKernel(DeviceViewBase v,
        s += blockDim.x) {
     Page *p = &b->pages[s];
     p->page_idx = static_cast<int32_t>(first_page + s);
+    p->modify_min = -1;
+    p->modify_max = -1;
+    p->flags = 0;
+    p->tier = 0;
+  }
+}
+
+/** Bind slots [slot_base, slot_base+count) to global pages
+ *  [first_page, first_page+count). Used by Vector::PrefetchPagesSync for
+ *  double-buffered (pipelined) prefetch: two windows live in disjoint slot
+ *  ranges, so the next window's prefetch never touches the window being read. */
+__global__ void MarkPagesResidentKernel(DeviceViewBase v,
+                                        clio::run::u64 first_page,
+                                        clio::run::u32 count,
+                                        clio::run::u32 slot_base) {
+  Block *b = GetBlock(v, 0);
+  for (clio::run::u32 i = threadIdx.x; i < count; i += blockDim.x) {
+    Page *p = &b->pages[slot_base + i];
+    p->page_idx = static_cast<int32_t>(first_page + i);
     p->modify_min = -1;
     p->modify_max = -1;
     p->flags = 0;
@@ -1453,6 +1485,48 @@ inline void Vector<T>::PrefetchWindowSync(clio::run::u64 first_page) {
   if (threads == 0) threads = 1;
   detail::MarkWindowResidentKernel<<<1, threads>>>(view_.base, first_page);
   ctp::GpuApi::Synchronize();
+#endif
+}
+
+template <typename T>
+inline void Vector<T>::PrefetchPagesSync(clio::run::u64 first_page,
+                                         clio::run::u32 count,
+                                         clio::run::u32 slot_base) {
+#if !CTP_IS_DEVICE_PASS
+  if (impl_->nblocks_cached != 1 || impl_->host_ppb_cached != 0) {
+    throw std::runtime_error(
+        "gpu_vector: PrefetchPagesSync is single-block single-tier only");
+  }
+  const clio::run::u64 page_size = impl_->page_size_cached;
+  clio::cte::core::Client client(impl_->cte_pool_id);
+  for (clio::run::u32 i = 0; i < count; ++i) {
+    clio::run::u64 gp = first_page + i;
+    char *hbm =
+        static_cast<char *>(impl_->pages_base) + (slot_base + i) * page_size;
+    std::string name = impl_->tag_name + "_b0_pi" + std::to_string(gp);
+    ctp::ipc::ShmPtr<> blob_data;
+    blob_data.alloc_id_ = ctp::ipc::AllocatorId::GetNull();
+    blob_data.off_ = reinterpret_cast<clio::run::u64>(hbm);
+    auto gf = client.AsyncGetBlob(view_.base.tag_id, name, /*offset=*/0,
+                                  page_size, /*flags=*/0, blob_data,
+                                  clio::run::PoolQuery::Local());
+    gf.Wait();
+    if (gf->GetReturnCode() != 0) {
+      throw std::runtime_error(
+          "gpu_vector: PrefetchPagesSync GetBlob failed for '" + name +
+          "' rc=" + std::to_string(gf->GetReturnCode()));
+    }
+  }
+  // Mark resident on a dedicated stream and sync only that stream, so this
+  // prefetch does not device-synchronize (and thus won't stall a concurrently
+  // running read kernel on another stream) -- the key to overlap.
+  static thread_local cudaStream_t mark_stream = nullptr;
+  if (!mark_stream) cudaStreamCreateWithFlags(&mark_stream, cudaStreamNonBlocking);
+  clio::run::u32 threads = (count < 256u) ? count : 256u;
+  if (threads == 0) threads = 1;
+  detail::MarkPagesResidentKernel<<<1, threads, 0, mark_stream>>>(
+      view_.base, first_page, count, slot_base);
+  cudaStreamSynchronize(mark_stream);
 #endif
 }
 
