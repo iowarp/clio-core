@@ -1,19 +1,33 @@
 # Gray-Scott + CLIO PutBlob + compressor library (Delta A100)
 
-> **DEVICE-SIDE READS: TRANSACTION (WINDOWED PREFETCH) WORKS; ON-DEVICE FAULT
-> DOES NOT.** The transparent *on-access* device page fault cannot be serviced
-> by a GPU compressor on one device: the fault kernel spin-waits ON-DEVICE for a
-> `GetBlob` while the compressor must run cuSZp's decompress kernel on the SAME
-> device — and the two do not co-schedule, so they deadlock. Two fixes were
-> tried and both **failed** (verified A100): (1) a dedicated non-blocking stream
-> + `cudaMallocAsync` in the wrapper *and* a cuSZp source patch
-> ([`../../../context-transport-primitives/.../compress/patches`](../../../context-transport-primitives/include/clio_ctp/compress/patches));
-> (2) a preallocated pinned staging pool + pre-warmed mempool. Both remove every
-> device-synchronizing CUDA call, yet the fault still hangs — proving the
-> residual cause is kernel **co-scheduling**, not device-sync. (Commits
-> `a00592f`, `cf6b80f`; no regression in the host-orchestrated paths.)
+> **ON-DEVICE FAULT NOW WORKS — separate CUDA context (`750f5ff`).** The
+> transparent *on-access* device page fault (a read kernel that cold-misses,
+> submits a `GetBlob` from device code, and spin-waits ON-DEVICE for it) now
+> round-trips correctly through the GPU compressor. **Verified A100**
+> (`cte_gpu_vector_compress_cuda`, default path): 4/4 pages faulted and
+> decompressed on-device, `max_abs_err 1.0e-3 == eb`, **0 deadlock**.
 >
-> The working path is the **issue #700 Transaction API** — host-orchestrated
+> The fix is to run the compressor's cuSZp work in a **dedicated CUDA context**
+> (`cuszp.h` `ContextScope`, driver-API `cuCtxCreate`, pushed/popped per
+> (de)compress; the module links `libcuda`). A100 **compute preemption** lets the
+> decompress kernel in that context run while the app's fault kernel spin-waits
+> in the primary context, and **cross-context UVA** lets it write the
+> decompressed page straight into the vector's HBM slot. Two standalone probes
+> ([`ctx_probes/`](ctx_probes/)) established both properties before integration.
+>
+> *Correction to an earlier claim:* this doc previously said the on-device fault
+> was "undeadlockable (kernel co-scheduling)". That was **wrong** — it was based
+> only on separate-**stream** attempts (same context, which do NOT preempt). A
+> separate **context** does preempt. The earlier stream + preallocation work
+> (`a00592f`, `cf6b80f`) removed the device-syncs but couldn't preempt; they are
+> superseded by the context fix (and remain as safe groundwork, no regression).
+>
+> Host-orchestrated **windowed prefetch** (below) is still available and is the
+> better choice when the access pattern is known ahead (it avoids faulting
+> entirely and bounds the resident footprint); the on-device fault is the
+> transparent fallback for unpredictable access.
+>
+> The **issue #700 Transaction API** — host-orchestrated
 > *windowed prefetch*. Pages are pulled into HBM AHEAD of use while the GPU is
 > idle, so the device kernel only ever reads resident pages (no on-device fault).
 > `transaction.h` provides `Transaction<T>` + `SequentialTransaction` +
@@ -103,10 +117,9 @@
 > ~16:1; `FaultAllSync` decompresses all 4; the **device read kernel** reads
 > them; `max_abs_err 1.0e-3 == eb`. The full write→evict→compress→store→
 > decompress→**device-read** loop passes. (The transparent on-*access* device
-> fault was later shown to be undeadlockable by removing device-syncs alone —
-> the cause is kernel co-scheduling; the working answer is the #700 Transaction /
-> windowed-prefetch API — see the top banner. `FaultAllSync` /
-> `PrefetchWindowSync` are the working host-orchestrated read paths.)
+> fault also works now via the dedicated-context fix — see the top banner;
+> `FaultAllSync` / `PrefetchWindowSync` remain the host-orchestrated read paths,
+> preferable when the access pattern is known ahead.)
 > No data is copied to DRAM to compress: compression is HBM→HBM (cuSZp temp HBM
 > buffer), only the small compressed result leaves the device.
 

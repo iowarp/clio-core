@@ -238,34 +238,37 @@ story.append(fig("fig_compression_ratio.png", 2.35))
 story.append(fig("fig_slowdown.png", 2.35))
 
 story.append(Paragraph("Device-side reads: the fault deadlock, and the fix", H2))
-story.append(banner("The transparent on-ACCESS device fault is undeadlockable on "
-                    "one GPU (kernel co-scheduling). The fix is the #700 "
-                    "Transaction API: host-orchestrated WINDOWED PREFETCH.",
-                    GREEN))
+story.append(banner("Fixed. The transparent on-ACCESS device fault now works &mdash; "
+                    "run the compressor in a DEDICATED CUDA CONTEXT so its "
+                    "decompress preempts the spin-waiting fault kernel.", GREEN))
 story.append(Spacer(1, 6))
 story.append(Paragraph(
-    "An on-device page fault spin-waits on the GPU for its GetBlob, but the "
-    "compressor services that fault by launching cuSZp's decompress kernel on the "
-    "<b>same</b> GPU &mdash; and a spin-waiting kernel and the decompress kernel "
-    "do not co-schedule, so they deadlock. Two fixes were tried and both failed: "
-    "(1) a dedicated non-blocking stream + <code>cudaMallocAsync</code> in the "
-    "wrapper and a cuSZp source patch; (2) a preallocated pinned staging pool + "
-    "pre-warmed mempool. Both remove every device-synchronizing CUDA call, yet the "
-    "fault still hangs &mdash; proving the residual cause is kernel "
-    "<b>co-scheduling</b>, not device-sync. (Uncompressed faults are fine: "
-    "serviced by a CPU memcpy, no GPU kernel. Eviction is fine too: flush kernels "
-    "exit before the compressor runs.)", BODY))
+    "An on-device page fault spin-waits on the GPU for its GetBlob, and the "
+    "compressor services it by launching cuSZp's decompress kernel on the "
+    "<b>same</b> GPU. The fix: run all cuSZp work in a <b>dedicated CUDA context</b> "
+    "(<code>cuszp.h</code> ContextScope). A100 <b>compute preemption</b> lets the "
+    "decompress kernel in that context run while the app's fault kernel spins in "
+    "the primary context, and <b>cross-context UVA</b> lets it write the "
+    "decompressed page straight into the vector's HBM slot. Verified A100: on-device "
+    "fault round-trip PASS, max_abs_err 1.0e-3 == eb, 4/4 pages, 0 deadlock. Two "
+    "standalone probes confirmed preemption + cross-context memory before "
+    "integration.", BODY))
 story.append(Paragraph(
-    "<b>The working answer</b> is the issue-#700 Transaction API &mdash; "
-    "host-orchestrated <b>windowed prefetch</b>. Pages are pulled into HBM "
-    "<i>ahead</i> of use while the GPU is idle, so the device kernel only ever "
-    "reads resident pages. <code>Transaction&lt;T&gt;</code> + "
-    "<code>SequentialTransaction</code> / <code>PseudoRandomTransaction</code> "
-    "(with <code>Vector::PrefetchWindowSync</code>) sweep a dataset far larger than "
-    "the HBM cache one window at a time. Verified A100: an 8 MiB dataset swept in "
-    "1 MiB windows (8&times; the resident footprint) through both a Sequential and "
-    "a PseudoRandom transaction &mdash; 2,097,152 elems each, max_abs_err 1.0e-3 "
-    "== eb, no on-device fault.", BODY))
+    "<i>Correction:</i> an earlier revision of this report called the on-access "
+    "fault “undeadlockable (kernel co-scheduling)”. That was based only on "
+    "separate-<i>stream</i> attempts (same context &mdash; streams do not preempt); "
+    "a separate <i>context</i> does. The stream + preallocation work removed the "
+    "device-syncs but couldn't preempt, and is superseded by the context fix (kept "
+    "as safe groundwork, no regression).", SMALL))
+story.append(Paragraph(
+    "<b>Also available: host-orchestrated windowed prefetch (issue #700).</b> When "
+    "the access pattern is known ahead, prefetching pages into HBM before use "
+    "avoids faulting entirely and bounds the resident footprint. "
+    "<code>Transaction&lt;T&gt;</code> + <code>SequentialTransaction</code> / "
+    "<code>PseudoRandomTransaction</code> sweep a dataset far larger than the HBM "
+    "cache one window at a time &mdash; verified A100: an 8 MiB dataset swept in "
+    "1 MiB windows (8&times; the resident footprint), both access patterns, "
+    "max_abs_err 1.0e-3 == eb.", BODY))
 story.append(Paragraph(
     "<b>Pipelining &amp; batching (measured).</b> Double-buffered prefetch that "
     "overlaps window W+1's decompress with window W's compute gives <b>1.20&times;</b> "
