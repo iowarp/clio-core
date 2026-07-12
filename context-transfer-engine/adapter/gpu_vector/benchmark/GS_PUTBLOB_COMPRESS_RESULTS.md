@@ -24,8 +24,19 @@
 > (8× the resident footprint)** through BOTH a Sequential and a PseudoRandom
 > transaction — 2,097,152 elems each, `max_abs_err 1.0e-3 == eb`, PASS. Reads
 > scale past the HBM cache with a bounded resident footprint. Commits `0f9a256`,
-> `89c4735`. (Remaining perf work: pipeline window W+1 prefetch on a copy stream
-> while the kernel reads W; multi-block windows.)
+> `89c4735`.
+>
+> *Pipelining (`7616728`):* double-buffered prefetch (`gpu_pages_per_block =
+> 2·window`, `PrefetchPagesSync` marks residency on its own stream, no device
+> sync) overlaps window W+1's decompress with window W's compute — **1.20×**
+> (66.3 vs 79.2 ms), output correct. *Batched-async prefetch (`3cc5102`):* issuing
+> a window's GetBlobs concurrently was **measured SLOWER — 0.73×** (8.1 vs 5.9 ms,
+> 16 pages/batch) — so serial per-page is the default. The reason (and the key
+> perf takeaway): the decompress bottleneck is **GPU-compute-bound**, not
+> IPC-bound — cuSZp decompress kernels serialize on one device regardless of
+> host-side concurrency, so throughput scales with GPU decompress speed (and
+> larger pages to amortize per-page overhead), not with batching/pipelining.
+> Remaining: multi-block windows; faster/larger-page decompress.
 >
 > **Figures** — committed in [`results/`](results/), regenerate with
 > `python3 results/plot_new_results.py`. Palette validated with the dataviz

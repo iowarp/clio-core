@@ -265,8 +265,17 @@ story.append(Paragraph(
     "the HBM cache one window at a time. Verified A100: an 8 MiB dataset swept in "
     "1 MiB windows (8&times; the resident footprint) through both a Sequential and "
     "a PseudoRandom transaction &mdash; 2,097,152 elems each, max_abs_err 1.0e-3 "
-    "== eb, no on-device fault. Remaining perf work: pipeline the next window's "
-    "prefetch on a copy stream while the kernel reads the current one.", BODY))
+    "== eb, no on-device fault.", BODY))
+story.append(Paragraph(
+    "<b>Pipelining &amp; batching (measured).</b> Double-buffered prefetch that "
+    "overlaps window W+1's decompress with window W's compute gives <b>1.20&times;</b> "
+    "(66 vs 79 ms), output correct. Batched-async prefetch (issue a window's "
+    "GetBlobs concurrently) was measured <b>slower &mdash; 0.73&times;</b>, so serial "
+    "is the default. The reason is the key perf takeaway: the decompress is "
+    "<b>GPU-compute-bound, not IPC-bound</b> &mdash; cuSZp kernels serialize on one "
+    "device regardless of host-side concurrency, so sweep throughput scales with GPU "
+    "decompress speed and larger pages, not with batching. Remaining: multi-block "
+    "windows.", BODY))
 story.append(Spacer(1, 8))
 story.append(HRFlowable(width="100%", thickness=0.6,
                         color=colors.HexColor("#dcdcdc")))
