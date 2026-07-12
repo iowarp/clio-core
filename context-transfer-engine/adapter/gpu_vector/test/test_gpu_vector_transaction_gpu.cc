@@ -344,6 +344,31 @@ TEST_CASE("gpu_vector: SequentialTransaction windowed prefetch over a dataset "
   REQUIRE(perr <= 2.0e-3);                  // pipelined result correct
   REQUIRE(pipe_ms <= serial_ms * 1.10);     // pipelining does not regress (speedup logged)
 
+  // ---- 4) Batched vs serial prefetch throughput (isolates the compressor-side
+  //         concurrency win; prefetch only, no compute) ----
+  {
+    const clio::run::u32 bw = 16;  // pages per batch
+    gv::Vector<float> vec3(tag, /*nblocks=*/1, /*gpu_id=*/0,
+                           /*gpu_pages_per_block=*/bw, /*host_pages_per_block=*/0,
+                           page_size, /*cache_period_us=*/20000,
+                           gv::CacheMode::kLegacy, /*manager_threads_per_block=*/32,
+                           /*allow_cold_miss_fault=*/false,
+                           /*storage_pool_id=*/StoragePool());
+    const clio::run::u32 nb = K / bw;
+    auto b0 = Clock::now();
+    for (clio::run::u32 w = 0; w < nb; ++w)
+      vec3.PrefetchPagesSync((clio::run::u64)w * bw, bw, 0, /*batched=*/false);
+    double serial_pf = ms(b0, Clock::now());
+    auto b1 = Clock::now();
+    for (clio::run::u32 w = 0; w < nb; ++w)
+      vec3.PrefetchPagesSync((clio::run::u64)w * bw, bw, 0, /*batched=*/true);
+    double batched_pf = ms(b1, Clock::now());
+    std::fprintf(stderr,
+        "[TXN] prefetch throughput (%u pages/batch): serial=%.1fms "
+        "batched=%.1fms  speedup=%.2fx\n",
+        bw, serial_pf, batched_pf, serial_pf / batched_pf);
+  }
+
   ctp::GpuApi::FreeHost(result);
   std::fprintf(stderr,
       "[TXN] PASS: %lluMiB dataset swept correctly (Sequential + PseudoRandom + "
