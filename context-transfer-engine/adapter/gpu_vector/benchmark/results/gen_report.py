@@ -271,14 +271,16 @@ story.append(Paragraph(
     "max_abs_err 1.0e-3 == eb.", BODY))
 story.append(Paragraph(
     "<b>Pipelining &amp; batching (measured).</b> Double-buffered prefetch that "
-    "overlaps window W+1's decompress with window W's compute gives <b>1.20&times;</b> "
-    "(66 vs 79 ms), output correct. Batched-async prefetch (issue a window's "
-    "GetBlobs concurrently) was measured <b>slower &mdash; 0.73&times;</b>, so serial "
-    "is the default. The reason is the key perf takeaway: the decompress is "
-    "<b>GPU-compute-bound, not IPC-bound</b> &mdash; cuSZp kernels serialize on one "
-    "device regardless of host-side concurrency, so sweep throughput scales with GPU "
-    "decompress speed and larger pages, not with batching. Remaining: multi-block "
-    "windows.", BODY))
+    "overlaps window W+1's decompress with window W's compute is <b>roughly "
+    "break-even &mdash; ~1.0&times; (0.9&ndash;1.2&times; across runs, within "
+    "noise)</b>, output correct; the overlap is small and the dedicated compressor "
+    "context's small per-call cost offsets it. Batched-async prefetch (issue a "
+    "window's GetBlobs concurrently) was measured <b>slower &mdash; ~0.7&times;</b>, "
+    "so serial is the default. Both point to the key perf takeaway: the decompress "
+    "is <b>GPU-compute-bound, not IPC-bound</b> &mdash; cuSZp kernels serialize on "
+    "one device regardless of host-side concurrency, so sweep throughput scales with "
+    "GPU decompress speed and larger pages, not with host-side pipelining/batching. "
+    "Remaining: multi-block windows.", BODY))
 story.append(Spacer(1, 8))
 story.append(HRFlowable(width="100%", thickness=0.6,
                         color=colors.HexColor("#dcdcdc")))
