@@ -281,6 +281,7 @@ class Client : public clio::run::ContainerClient {
    * @param flags Operation flags
    * @param blob_data Shared memory pointer for output
    * @param pool_query Pool query for task routing (default: Dynamic)
+   * @param context Context for I/O emulation control (issue #747)
    */
   clio::run::Future<GetBlobTask> AsyncGetBlob(
       const TagId &tag_id,
@@ -288,12 +289,13 @@ class Client : public clio::run::ContainerClient {
       clio::run::u64 offset, clio::run::u64 size,
       clio::run::u32 flags,
       ctp::ipc::ShmPtr<> blob_data,
-      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic(),
+      const Context &context = Context()) {
     auto *ipc_manager = CLIO_CPU_IPC;
 
     auto task = ipc_manager->NewTask<GetBlobTask>(
         clio::run::CreateTaskId(), pool_id_, pool_query, tag_id,
-        blob_name, offset, size, flags, blob_data);
+        blob_name, offset, size, flags, blob_data, context);
 
     return ipc_manager->Send(task);
   }
@@ -305,9 +307,10 @@ class Client : public clio::run::ContainerClient {
       clio::run::u64 offset, clio::run::u64 size,
       clio::run::u32 flags,
       ctp::ipc::ShmPtr<> blob_data,
-      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic(),
+      const Context &context = Context()) {
     return AsyncGetBlob(tag_id, blob_name.c_str(), offset, size,
-                        flags, blob_data, pool_query);
+                        flags, blob_data, pool_query, context);
   }
 
   /**

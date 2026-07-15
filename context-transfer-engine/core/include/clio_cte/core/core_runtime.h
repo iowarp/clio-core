@@ -650,6 +650,25 @@ private:
                            size_t data_size, size_t data_offset_in_blob, clio::run::u32 &error_code);
 
   /**
+   * Model the wall time of a data transfer over the blocks overlapping
+   * [offset, offset+size) WITHOUT performing it (I/O emulation, issue #747).
+   * Bytes are aggregated per target; each target contributes
+   * latency + bytes/bandwidth from its measured PerfMetrics (fallback
+   * constants when a target is unknown or reports zero), and the result is
+   * the max across targets — blocks on different targets transfer
+   * concurrently, blocks on the same target serialize on the device.
+   * @param blocks Block layout of the blob (snapshot or live under the
+   *        write token)
+   * @param offset Transfer start offset within the blob
+   * @param size Transfer size in bytes
+   * @param is_write true = use write latency/bandwidth, false = read
+   * @return Modeled duration in nanoseconds (0 if no blocks overlap)
+   */
+  clio::run::u64 EstimateIoTimeNs(const clio::run::priv::vector<BlobBlock> &blocks,
+                                  clio::run::u64 offset, clio::run::u64 size,
+                                  bool is_write);
+
+  /**
    * Log telemetry data for CTE operations
    * @param op Operation type
    * @param off Offset within blob

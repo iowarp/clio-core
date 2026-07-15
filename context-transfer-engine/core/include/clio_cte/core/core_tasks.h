@@ -998,6 +998,18 @@ struct Context {
   clio::run::u64 preallocate_;  // Preallocate this many bytes for GPU block storage
                           // (0 = disabled)
 
+  // I/O emulation (issue #747). When emulate_ is set, PutBlob/GetBlob skip
+  // the data-transfer phase (and all WAL logging) and instead estimate how
+  // long the I/O WOULD have taken from the targets' latency-bandwidth model,
+  // returned in emulated_time_ns_. Metadata effects (blob creation, block
+  // allocation, tag sizes, access stats) still happen, so tier capacities
+  // and placement decisions stay realistic — but emulated blob bytes are
+  // never written (reads of them return whatever the recycled blocks hold).
+  // Built for training RL data-organization policies without paying for the
+  // actual I/O.
+  bool emulate_;                    // IN: skip real I/O, model the time
+  clio::run::u64 emulated_time_ns_;  // OUT: modeled duration of the skipped I/O
+
 #if CTP_ENABLE_COMPRESS
   int dynamic_compress_;  // 0 - skip, 1 - static, 2 - dynamic
   int compress_lib_;      // The compression library to apply (0-10)
@@ -1027,7 +1039,9 @@ struct Context {
   CTP_CROSS_FUN Context()
       : persistence_target_(-1),
         min_persistence_level_(0),
-        preallocate_(0)
+        preallocate_(0),
+        emulate_(false),
+        emulated_time_ns_(0)
 #if CTP_ENABLE_COMPRESS
         ,
         dynamic_compress_(0),
@@ -1052,7 +1066,8 @@ struct Context {
 
   template <class Archive>
   CTP_CROSS_FUN void serialize(Archive &ar) {
-    ar.range(persistence_target_, min_persistence_level_, preallocate_);
+    ar.range(persistence_target_, min_persistence_level_, preallocate_,
+             emulate_, emulated_time_ns_);
 #if CTP_ENABLE_COMPRESS
     ar.range(dynamic_compress_, compress_lib_, compress_preset_, target_psnr_,
              psnr_chance_, max_performance_, consumer_node_, data_type_,
@@ -1065,6 +1080,13 @@ struct Context {
   CTP_CROSS_FUN static Context Preallocate(clio::run::u64 size) {
     Context ctx;
     ctx.preallocate_ = size;
+    return ctx;
+  }
+
+  /** Convenience: a context with I/O emulation enabled (issue #747). */
+  CTP_CROSS_FUN static Context Emulate() {
+    Context ctx;
+    ctx.emulate_ = true;
     return ctx;
   }
 };
@@ -1345,7 +1367,13 @@ struct PutBlobTask : public clio::run::Task {
     ar(tag_id_, blob_name_, offset_, size_, blob_data_,
        score_, context_, flags_, gpu_page_idx_, submit_ts_ns_);
     ar.PopPod();
-    ar.bulk(blob_data_, size_, BULK_XFER);
+    // Emulated puts (issue #747) never write the payload, so don't ship it
+    // over the wire either — the whole point is to not pay for the I/O.
+    // context_ is (de)serialized above, so both the save and load sides
+    // agree on whether the bulk follows.
+    if (!context_.emulate_) {
+      ar.bulk(blob_data_, size_, BULK_XFER);
+    }
   }
 
   /**
@@ -1417,6 +1445,7 @@ struct GetBlobTask : public clio::run::Task {
    */
   static constexpr clio::run::u32 kNoPageIdx = ~static_cast<clio::run::u32>(0);
   IN clio::run::u32 gpu_page_idx_;
+  INOUT Context context_;  // Emulation control + modeled time (issue #747)
 
   // SHM constructor
   CTP_CROSS_FUN GetBlobTask()
@@ -1427,7 +1456,8 @@ struct GetBlobTask : public clio::run::Task {
         size_(0),
         flags_(0),
         blob_data_(ctp::ipc::ShmPtr<>::GetNull()),
-        gpu_page_idx_(kNoPageIdx) {}
+        gpu_page_idx_(kNoPageIdx),
+        context_() {}
 
   // Emplace constructor
   CTP_CROSS_FUN explicit GetBlobTask(const clio::run::TaskId &task_id,
@@ -1436,7 +1466,8 @@ struct GetBlobTask : public clio::run::Task {
                                       const TagId &tag_id,
                                       const std::string &blob_name,
                                       clio::run::u64 offset, clio::run::u64 size,
-                                      clio::run::u32 flags, ctp::ipc::ShmPtr<> blob_data)
+                                      clio::run::u32 flags, ctp::ipc::ShmPtr<> blob_data,
+                                      const Context &context = Context())
       : clio::run::Task(task_id, pool_id, pool_query, Method::kGetBlob),
         tag_id_(tag_id),
         blob_name_(CLIO_PRIV_ALLOC, blob_name),
@@ -1444,7 +1475,8 @@ struct GetBlobTask : public clio::run::Task {
         size_(size),
         flags_(flags),
         blob_data_(blob_data),
-        gpu_page_idx_(kNoPageIdx) {
+        gpu_page_idx_(kNoPageIdx),
+        context_(context) {
     task_id_ = task_id;
     pool_id_ = pool_id;
     method_ = Method::kGetBlob;
@@ -1489,7 +1521,8 @@ struct GetBlobTask : public clio::run::Task {
                                       const TagId &tag_id,
                                       const char *blob_name, clio::run::u64 offset,
                                       clio::run::u64 size, clio::run::u32 flags,
-                                      ctp::ipc::ShmPtr<> blob_data)
+                                      ctp::ipc::ShmPtr<> blob_data,
+                                      const Context &context = Context())
       : clio::run::Task(task_id, pool_id, pool_query, Method::kGetBlob),
         tag_id_(tag_id),
         blob_name_(CLIO_PRIV_ALLOC, blob_name),
@@ -1497,7 +1530,8 @@ struct GetBlobTask : public clio::run::Task {
         size_(size),
         flags_(flags),
         blob_data_(blob_data),
-        gpu_page_idx_(kNoPageIdx) {
+        gpu_page_idx_(kNoPageIdx),
+        context_(context) {
     task_id_ = task_id;
     pool_id_ = pool_id;
     method_ = Method::kGetBlob;
@@ -1513,9 +1547,13 @@ struct GetBlobTask : public clio::run::Task {
     ar.PushPod(blob_name_.UsingSso());
     Task::SerializeIn(ar);
     ar(tag_id_, blob_name_, offset_, size_, flags_, blob_data_,
-       gpu_page_idx_);
+       gpu_page_idx_, context_);
     ar.PopPod();
-    ar.bulk(blob_data_, size_, BULK_EXPOSE);
+    // Emulated gets (issue #747) return no data, so the caller's buffer
+    // does not need to be exposed for the response.
+    if (!context_.emulate_) {
+      ar.bulk(blob_data_, size_, BULK_EXPOSE);
+    }
   }
 
   /**
@@ -1524,7 +1562,13 @@ struct GetBlobTask : public clio::run::Task {
   template <typename Archive>
   CTP_CROSS_FUN void SerializeOut(Archive &ar) {
     Task::SerializeOut(ar);
-    ar.bulk(blob_data_, size_, BULK_XFER);
+    // context_ is INOUT: carries emulated_time_ns_ back (issue #747). An
+    // emulated get read nothing, so no data bulk follows — the caller's
+    // buffer is left untouched and the wire cost is metadata-only.
+    ar(context_);
+    if (!context_.emulate_) {
+      ar.bulk(blob_data_, size_, BULK_XFER);
+    }
   }
 
   /** Fix up priv::string SSO pointer after cudaMemcpy D→H */
@@ -1545,6 +1589,7 @@ struct GetBlobTask : public clio::run::Task {
     flags_ = other->flags_;
     blob_data_ = other->blob_data_;
     gpu_page_idx_ = other->gpu_page_idx_;
+    context_ = other->context_;
   }
 
   /**
@@ -1731,7 +1776,11 @@ struct PodPutBlobTask : public clio::run::Task {
     Task::SerializeIn(ar);
     ar(tag_id_, blob_name_, offset_, size_, blob_data_, score_, context_,
        flags_, gpu_page_idx_, submit_ts_ns_);
-    ar.bulk(blob_data_, size_, BULK_XFER);
+    // Emulated puts never write the payload — skip the wire transfer too
+    // (issue #747; see PutBlobTask::SerializeIn).
+    if (!context_.emulate_) {
+      ar.bulk(blob_data_, size_, BULK_XFER);
+    }
   }
 
   template <typename Archive>
@@ -1776,6 +1825,7 @@ struct PodGetBlobTask : public clio::run::Task {
   IN ctp::ipc::ShmPtr<> blob_data_;
   static constexpr clio::run::u32 kNoPageIdx = ~static_cast<clio::run::u32>(0);
   IN clio::run::u32 gpu_page_idx_;
+  INOUT Context context_;  // Emulation control + modeled time (issue #747)
 
   // SHM constructor
   CTP_CROSS_FUN PodGetBlobTask()
@@ -1786,14 +1836,16 @@ struct PodGetBlobTask : public clio::run::Task {
         size_(0),
         flags_(0),
         blob_data_(ctp::ipc::ShmPtr<>::GetNull()),
-        gpu_page_idx_(kNoPageIdx) {}
+        gpu_page_idx_(kNoPageIdx),
+        context_() {}
 
   // GPU-compatible emplace constructor (const char* blob name, no allocator)
   CTP_CROSS_FUN explicit PodGetBlobTask(
       const clio::run::TaskId &task_id, const clio::run::PoolId &pool_id,
       const clio::run::PoolQuery &pool_query, const TagId &tag_id,
       const char *blob_name, clio::run::u64 offset, clio::run::u64 size,
-      clio::run::u32 flags, ctp::ipc::ShmPtr<> blob_data)
+      clio::run::u32 flags, ctp::ipc::ShmPtr<> blob_data,
+      const Context &context = Context())
       : clio::run::Task(task_id, pool_id, pool_query, Method::kPodGetBlob),
         tag_id_(tag_id),
         blob_name_(blob_name),
@@ -1801,7 +1853,8 @@ struct PodGetBlobTask : public clio::run::Task {
         size_(size),
         flags_(flags),
         blob_data_(blob_data),
-        gpu_page_idx_(kNoPageIdx) {
+        gpu_page_idx_(kNoPageIdx),
+        context_(context) {
     task_id_ = task_id;
     pool_id_ = pool_id;
     method_ = Method::kPodGetBlob;
@@ -1816,9 +1869,10 @@ struct PodGetBlobTask : public clio::run::Task {
                           const clio::run::PoolQuery &pool_query,
                           const TagId &tag_id, const std::string &blob_name,
                           clio::run::u64 offset, clio::run::u64 size,
-                          clio::run::u32 flags, ctp::ipc::ShmPtr<> blob_data)
+                          clio::run::u32 flags, ctp::ipc::ShmPtr<> blob_data,
+                          const Context &context = Context())
       : PodGetBlobTask(task_id, pool_id, pool_query, tag_id, blob_name.c_str(),
-                       offset, size, flags, blob_data) {}
+                       offset, size, flags, blob_data, context) {}
 #endif
 
   /** Destructor — frees blob_data_ when this task owns the buffer (see
@@ -1837,14 +1891,23 @@ struct PodGetBlobTask : public clio::run::Task {
   template <typename Archive>
   CTP_CROSS_FUN void SerializeIn(Archive &ar) {
     Task::SerializeIn(ar);
-    ar(tag_id_, blob_name_, offset_, size_, flags_, blob_data_, gpu_page_idx_);
-    ar.bulk(blob_data_, size_, BULK_EXPOSE);
+    ar(tag_id_, blob_name_, offset_, size_, flags_, blob_data_, gpu_page_idx_,
+       context_);
+    // Emulated gets return no data — no buffer expose needed (issue #747).
+    if (!context_.emulate_) {
+      ar.bulk(blob_data_, size_, BULK_EXPOSE);
+    }
   }
 
   template <typename Archive>
   CTP_CROSS_FUN void SerializeOut(Archive &ar) {
     Task::SerializeOut(ar);
-    ar.bulk(blob_data_, size_, BULK_XFER);
+    // context_ is INOUT: carries emulated_time_ns_ back (issue #747). No
+    // data bulk on the emulated path — the caller's buffer stays untouched.
+    ar(context_);
+    if (!context_.emulate_) {
+      ar.bulk(blob_data_, size_, BULK_XFER);
+    }
   }
 
   // No FixupAfterCopy — fixed_string is position-independent.
@@ -1858,6 +1921,7 @@ struct PodGetBlobTask : public clio::run::Task {
     flags_ = other->flags_;
     blob_data_ = other->blob_data_;
     gpu_page_idx_ = other->gpu_page_idx_;
+    context_ = other->context_;
   }
 
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {

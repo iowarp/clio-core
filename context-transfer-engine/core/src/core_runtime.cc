@@ -1152,7 +1152,9 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
       task->return_code_ = 2;
       CLIO_CO_RETURN;
     }
-    if (blob_data.IsNull()) {
+    // Emulated puts (issue #747) skip the data write AND its wire transfer,
+    // so on a cross-node receiver blob_data_ is legitimately null.
+    if (blob_data.IsNull() && !task->context_.emulate_) {
       task->return_code_ = 3;
       CLIO_CO_RETURN;
     }
@@ -1259,8 +1261,12 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
         (tail_write && old_num_blocks > 0) ? (old_blob_size - old_last_blk_size)
                                            : 0;
 
-    // WAL: log all current blocks (full replacement semantics)
-    if (!blob_txn_logs_.empty() && !blob_info_ptr->blocks_.empty()) {
+    // WAL: log all current blocks (full replacement semantics).
+    // Skipped in emulation mode (issue #747): emulated puts are training
+    // traffic, not recoverable state — no data was written, so replaying
+    // their block layout after a crash would resurrect garbage.
+    if (!task->context_.emulate_ && !blob_txn_logs_.empty() &&
+        !blob_info_ptr->blocks_.empty()) {
       clio::run::u32 wid = CLIO_CUR_WORKER->GetWorkerStats().worker_id_;
       TxnExtendBlob txn;
       txn.tag_major_ = tag_id.major_;
@@ -1279,40 +1285,52 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
                                                        txn);
     }
 
-    // Step 2.5: Zero any hole created by writing past the old end-of-blob
-    // (sparse write). Newly allocated space is NOT guaranteed to be zero — the
-    // bdev recycles freed blocks, so a fresh block can hold stale data — and
-    // POSIX requires allocated-but-unwritten bytes to read as zeros. Only the
-    // gap [old_blob_size, offset) needs it; sequential appends (offset ==
-    // old_blob_size) and overwrites (offset < old_blob_size) create no hole.
-    if (offset > old_blob_size) {
-      clio::run::u64 hole = offset - old_blob_size;
-      auto *ipc_mgr = CLIO_IPC;
-      ctp::ipc::FullPtr<char> zbuf = ipc_mgr->AllocateBuffer(hole);
-      if (zbuf.IsNull()) {
-        task->return_code_ = 6;
-        CLIO_CO_RETURN;
+    if (task->context_.emulate_) {
+      // I/O emulation (issue #747): the placement above (DPE selection +
+      // block allocation) is real so tier capacities stay honest, but the
+      // data transfer is skipped — model its wall time from the selected
+      // targets' latency-bandwidth metrics instead. The blob's bytes are
+      // never written; reads return whatever the recycled blocks hold.
+      task->context_.emulated_time_ns_ =
+          EstimateIoTimeNs(blob_info_ptr->blocks_, offset, size,
+                           /*is_write=*/true);
+    } else {
+      // Step 2.5: Zero any hole created by writing past the old end-of-blob
+      // (sparse write). Newly allocated space is NOT guaranteed to be zero —
+      // the bdev recycles freed blocks, so a fresh block can hold stale data
+      // — and POSIX requires allocated-but-unwritten bytes to read as zeros.
+      // Only the gap [old_blob_size, offset) needs it; sequential appends
+      // (offset == old_blob_size) and overwrites (offset < old_blob_size)
+      // create no hole.
+      if (offset > old_blob_size) {
+        clio::run::u64 hole = offset - old_blob_size;
+        auto *ipc_mgr = CLIO_IPC;
+        ctp::ipc::FullPtr<char> zbuf = ipc_mgr->AllocateBuffer(hole);
+        if (zbuf.IsNull()) {
+          task->return_code_ = 6;
+          CLIO_CO_RETURN;
+        }
+        std::memset(zbuf.ptr_, 0, hole);
+        clio::run::u32 zero_result = 0;
+        CLIO_CO_AWAIT(ModifyExistingData(blob_info_ptr->blocks_,
+                                    zbuf.shm_.template Cast<void>(), hole,
+                                    old_blob_size, zero_result, hint_idx,
+                                    hint_off));
+        ipc_mgr->FreeBuffer(zbuf);
+        if (zero_result != 0) {
+          task->return_code_ = 20 + zero_result;
+          CLIO_CO_RETURN;
+        }
       }
-      std::memset(zbuf.ptr_, 0, hole);
-      clio::run::u32 zero_result = 0;
-      CLIO_CO_AWAIT(ModifyExistingData(blob_info_ptr->blocks_,
-                                  zbuf.shm_.template Cast<void>(), hole,
-                                  old_blob_size, zero_result, hint_idx,
-                                  hint_off));
-      ipc_mgr->FreeBuffer(zbuf);
-      if (zero_result != 0) {
-        task->return_code_ = 20 + zero_result;
-        CLIO_CO_RETURN;
-      }
-    }
 
-    // Step 3: ModifyExistingData — write data to blocks
-    clio::run::u32 write_result = 0;
-    CLIO_CO_AWAIT(ModifyExistingData(blob_info_ptr->blocks_, blob_data, size, offset,
-                                write_result, hint_idx, hint_off));
-    if (write_result != 0) {
-      task->return_code_ = 20 + write_result;
-      CLIO_CO_RETURN;
+      // Step 3: ModifyExistingData — write data to blocks
+      clio::run::u32 write_result = 0;
+      CLIO_CO_AWAIT(ModifyExistingData(blob_info_ptr->blocks_, blob_data, size,
+                                  offset, write_result, hint_idx, hint_off));
+      if (write_result != 0) {
+        task->return_code_ = 20 + write_result;
+        CLIO_CO_RETURN;
+      }
     }
 
 #if CTP_ENABLE_COMPRESS
@@ -1382,6 +1400,63 @@ clio::run::TaskResume Runtime::PutBlobImpl(clio::run::shared_ptr<TaskT> &task) {
   CLIO_TASK_BODY_END
 }
 
+clio::run::u64 Runtime::EstimateIoTimeNs(
+    const clio::run::priv::vector<BlobBlock> &blocks, clio::run::u64 offset,
+    clio::run::u64 size, bool is_write) {
+  // Fallbacks when a target is unknown or reports zeroed metrics — same
+  // defaults the bdev module seeds for un-benchmarked devices.
+  static constexpr double kFallbackReadBwMbps = 100.0;
+  static constexpr double kFallbackWriteBwMbps = 80.0;
+  static constexpr double kFallbackReadLatUs = 1000.0;
+  static constexpr double kFallbackWriteLatUs = 1200.0;
+
+  // Aggregate the transfer bytes per target. Blocks are laid out
+  // sequentially in the blob, so walk them accumulating each block's
+  // overlap with [offset, offset+size).
+  std::unordered_map<clio::run::PoolId, clio::run::u64> bytes_per_target;
+  const clio::run::u64 end = offset + size;
+  clio::run::u64 cur = 0;
+  for (size_t i = 0; i < blocks.size() && cur < end; ++i) {
+    const BlobBlock &blk = blocks[i];
+    const clio::run::u64 blk_start = cur;
+    const clio::run::u64 blk_end = cur + blk.size_;
+    cur = blk_end;
+    const clio::run::u64 lo = std::max(blk_start, offset);
+    const clio::run::u64 hi = std::min(blk_end, end);
+    if (hi > lo) {
+      bytes_per_target[blk.bdev_client_.pool_id_] += hi - lo;
+    }
+  }
+  if (bytes_per_target.empty()) {
+    return 0;
+  }
+
+  // Per target: latency + bytes/bandwidth. Targets transfer concurrently
+  // (the real Put/Get issues all block I/Os and waits for them), so the
+  // modeled duration is the max across targets.
+  double max_ns = 0.0;
+  {
+    clio::run::ScopedCoRwReadLock read_lock(target_lock_);
+    for (const auto &entry : bytes_per_target) {
+      double lat_us = is_write ? kFallbackWriteLatUs : kFallbackReadLatUs;
+      double bw_mbps = is_write ? kFallbackWriteBwMbps : kFallbackReadBwMbps;
+      TargetInfo *tinfo = registered_targets_.find(entry.first);
+      if (tinfo != nullptr) {
+        const clio::run::bdev::PerfMetrics &pm = tinfo->perf_metrics_;
+        double lat = is_write ? pm.write_latency_us_ : pm.read_latency_us_;
+        double bw = is_write ? pm.write_bandwidth_mbps_ : pm.read_bandwidth_mbps_;
+        if (lat > 0.0) lat_us = lat;
+        if (bw > 0.0) bw_mbps = bw;
+      }
+      const double bytes = static_cast<double>(entry.second);
+      // bandwidth is in MB/s with MB = 1024*1024 (matches bdev GetStats math)
+      const double ns = lat_us * 1e3 + (bytes / (bw_mbps * 1048576.0)) * 1e9;
+      max_ns = std::max(max_ns, ns);
+    }
+  }
+  return static_cast<clio::run::u64>(max_ns);
+}
+
 template <typename TaskT>
 clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
   CLIO_TASK_BODY_BEGIN
@@ -1434,13 +1509,21 @@ clio::run::TaskResume Runtime::GetBlobImpl(clio::run::shared_ptr<TaskT> &task) {
     // stable copy. #680 read-vs-write safety.
     clio::run::priv::vector<BlobBlock> blocks_snapshot(blob_info_ptr->blocks_);
 
-    // Step 2: Read data from blob blocks (no lock held during I/O)
-    clio::run::u32 read_result = 0;
-    CLIO_CO_AWAIT(ReadData(blocks_snapshot, blob_data_ptr, size, offset,
-                      read_result));
-    if (read_result != 0) {
-      task->return_code_ = read_result;
-      CLIO_CO_RETURN;
+    // Step 2: Read data from blob blocks (no lock held during I/O).
+    // In emulation mode (issue #747) the read is skipped entirely — the
+    // caller's buffer is left untouched and no WAL/bdev traffic happens;
+    // the modeled wall time is returned via context_.emulated_time_ns_.
+    if (task->context_.emulate_) {
+      task->context_.emulated_time_ns_ =
+          EstimateIoTimeNs(blocks_snapshot, offset, size, /*is_write=*/false);
+    } else {
+      clio::run::u32 read_result = 0;
+      CLIO_CO_AWAIT(ReadData(blocks_snapshot, blob_data_ptr, size, offset,
+                        read_result));
+      if (read_result != 0) {
+        task->return_code_ = read_result;
+        CLIO_CO_RETURN;
+      }
     }
 
     // Step 3: Update timestamp (no lock needed - just updating values, not
