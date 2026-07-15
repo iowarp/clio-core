@@ -1,6 +1,9 @@
 #include "simple_test.h"
 #include <clio_cte/core/core_config.h>
-#include <clio_cte/core/core_dpe.h>
+#include <clio_cte/core/dpe/dpe.h>
+#include <clio_cte/core/dpe/random_dpe.h>
+#include <clio_cte/core/dpe/round_robin_dpe.h>
+#include <clio_cte/core/dpe/max_bw_dpe.h>
 #include <fstream>
 #include <cstdlib>
 #include <filesystem>

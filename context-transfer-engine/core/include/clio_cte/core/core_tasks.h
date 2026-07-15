@@ -159,6 +159,9 @@ struct CreateParams {
        config_.gpu_metadata_cache_.max_blobs_,
        config_.gpu_metadata_cache_.max_tags_,
        config_.performance_.stat_targets_period_ms_,
+       config_.organizer_.name_,
+       config_.organizer_.organizer_tasks_,
+       config_.organizer_.period_ms_,
        gpu_cache_ptr_);
   }
 
@@ -787,6 +790,12 @@ struct BlobInfo {
   float score_;  // 0-1 score for reorganization
   Timestamp last_modified_;
   Timestamp last_read_;
+  // Number of data ops (PutBlob/GetBlob) served by this blob since creation.
+  // Consumed by the frecency data organizer (issue #738) as the "frequency"
+  // half of the frecency score. Transient runtime stat — not persisted to
+  // the WAL/metadata log, so it resets on restart (organizers must treat a
+  // zero count as "cold or freshly restored", which decays gracefully).
+  clio::run::u64 access_count_;
   int compress_lib_;     // Compression library ID used for this blob (0 = no
                          // compression)
   int compress_preset_;  // Compression preset used (1=FAST, 2=BALANCED, 3=BEST)
@@ -818,6 +827,7 @@ struct BlobInfo {
         score_(0.0f),
         last_modified_(0),
         last_read_(0),
+        access_count_(0),
         compress_lib_(0),
         compress_preset_(2),
         trace_key_(0),
@@ -833,6 +843,7 @@ struct BlobInfo {
         score_(score),
         last_modified_(0),
         last_read_(0),
+        access_count_(0),
         compress_lib_(0),
         compress_preset_(2),
         trace_key_(0),
@@ -849,6 +860,7 @@ struct BlobInfo {
         score_(score),
         last_modified_(GetCurrentTimeNs()),
         last_read_(GetCurrentTimeNs()),
+        access_count_(0),
         compress_lib_(0),
         compress_preset_(2),
         trace_key_(0),
@@ -865,6 +877,7 @@ struct BlobInfo {
         score_(other.score_),
         last_modified_(other.last_modified_),
         last_read_(other.last_read_),
+        access_count_(other.access_count_),
         compress_lib_(other.compress_lib_),
         compress_preset_(other.compress_preset_),
         trace_key_(other.trace_key_),
@@ -881,6 +894,7 @@ struct BlobInfo {
       score_ = other.score_;
       last_modified_ = other.last_modified_;
       last_read_ = other.last_read_;
+      access_count_ = other.access_count_;
       compress_lib_ = other.compress_lib_;
       compress_preset_ = other.compress_preset_;
       trace_key_ = other.trace_key_;
@@ -3208,6 +3222,59 @@ struct FlushDataTask : public clio::run::Task {
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
     Copy(other_base.template Cast<FlushDataTask>());
+  }
+};
+
+/**
+ * DynamicReorganizeTask - Periodic driver for the internal data organizer
+ * (issue #738).
+ *
+ * Spawned `organizer_tasks` times from Create() when an organizer is
+ * configured; each firing delegates to the configured DataOrganizer:
+ * organizer->Reorganize(this, task->replica_id_). replica_id_ identifies
+ * which of the parallel organizer replicas this task is (0-based) so the
+ * organizer can partition the blob space across replicas.
+ */
+struct DynamicReorganizeTask : public clio::run::Task {
+  IN clio::run::u32 replica_id_;  // 0-based organizer replica index
+
+  /** SHM default constructor */
+  DynamicReorganizeTask() : clio::run::Task(), replica_id_(0) {}
+
+  /** Emplace constructor */
+  CTP_CROSS_FUN explicit DynamicReorganizeTask(
+      const clio::run::TaskId &task_node, const clio::run::PoolId &pool_id,
+      const clio::run::PoolQuery &pool_query, clio::run::u32 replica_id = 0)
+      : clio::run::Task(task_node, pool_id, pool_query,
+                        Method::kDynamicReorganize),
+        replica_id_(replica_id) {
+    task_id_ = task_node;
+    pool_id_ = pool_id;
+    method_ = Method::kDynamicReorganize;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+    ar(replica_id_);
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+    // No output parameters (return_code_ handled by base class)
+  }
+
+  void Copy(const ctp::ipc::FullPtr<DynamicReorganizeTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+    replica_id_ = other->replica_id_;
+  }
+
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    Task::AggregateOut(other_base);
+    Copy(other_base.template Cast<DynamicReorganizeTask>());
   }
 };
 

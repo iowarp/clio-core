@@ -141,6 +141,25 @@ struct DpeConfig {
 };
 
 /**
+ * Data organizer configuration.
+ *
+ * The organizer is the CTE's built-in, periodically-driven reorganization
+ * engine (issue #738). When enabled, Create() spawns `organizer_tasks_`
+ * periodic DynamicReorganize tasks; each invokes the configured
+ * DataOrganizer (e.g. "frecency"), which rescores blobs and moves them
+ * between tiers through the server's ReorganizeBlob logic. "none" (the
+ * default) disables periodic reorganization entirely.
+ */
+struct OrganizerConfig {
+  std::string name_;         // Organizer name ("none", "frecency")
+  clio::run::u32 organizer_tasks_;  // Periodic task replicas to spawn
+                                    // (parallelizes the organization work)
+  clio::run::u32 period_ms_;        // Period between organizer invocations
+
+  OrganizerConfig() : name_("none"), organizer_tasks_(1), period_ms_(5000) {}
+};
+
+/**
  * GPU metadata cache configuration.
  *
  * When enabled, CTE Core allocates a chunk of GPU-accessible memory
@@ -193,6 +212,11 @@ class Config {
    * Data Placement Engine configuration
    */
   DpeConfig dpe_;
+
+  /**
+   * Data organizer configuration (periodic reorganization; off by default)
+   */
+  OrganizerConfig organizer_;
 
   /**
    * GPU metadata cache (optional, off by default).

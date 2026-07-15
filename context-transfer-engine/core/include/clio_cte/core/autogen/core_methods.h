@@ -53,7 +53,10 @@ GLOBAL_CROSS_CONST clio::run::u32 kPodPutBlob = 43;
 GLOBAL_CROSS_CONST clio::run::u32 kPodGetBlob = 44;
 GLOBAL_CROSS_CONST clio::run::u32 kPodReorganizeBlob = 45;
 
-GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 46;
+// Periodic internal data-organizer driver (issue #738)
+GLOBAL_CROSS_CONST clio::run::u32 kDynamicReorganize = 46;
+
+GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 47;
 
 inline const std::vector<std::string>& GetMethodNames() {
   static const std::vector<std::string> names = [] {
@@ -93,6 +96,7 @@ inline const std::vector<std::string>& GetMethodNames() {
     v[43] = "PodPutBlob";
     v[44] = "PodGetBlob";
     v[45] = "PodReorganizeBlob";
+    v[46] = "DynamicReorganize";
     return v;
   }();
   return names;

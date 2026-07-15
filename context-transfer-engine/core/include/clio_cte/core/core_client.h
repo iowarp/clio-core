@@ -814,6 +814,31 @@ class Client : public clio::run::ContainerClient {
 
     return ipc_manager->Send(task);
   }
+
+  /**
+   * Asynchronous dynamic reorganize - periodic internal data-organizer driver
+   * (issue #738). Spawned from the CTE server's Create() once per configured
+   * organizer replica; each firing delegates to the configured DataOrganizer.
+   * @param pool_query Pool query for task routing (default: Local)
+   * @param replica_id 0-based organizer replica index (partitions blob space)
+   * @param period_us Period in microseconds (0 = one-shot)
+   */
+  clio::run::Future<DynamicReorganizeTask> AsyncDynamicReorganize(
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Local(),
+      clio::run::u32 replica_id = 0,
+      double period_us = 0) {
+    auto *ipc_manager = CLIO_CPU_IPC;
+
+    auto task = ipc_manager->NewTask<DynamicReorganizeTask>(
+        clio::run::CreateTaskId(), pool_id_, pool_query, replica_id);
+
+    if (period_us > 0) {
+      task->SetPeriod(period_us, clio::run::kMicro);
+      task->SetFlags(TASK_PERIODIC);
+    }
+
+    return ipc_manager->Send(task);
+  }
 #endif  // CTP_IS_HOST
 };
 

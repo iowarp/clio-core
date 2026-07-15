@@ -288,6 +288,29 @@ bool Config::ParseYamlNode(const YAML::Node &node) {
     }
   }
 
+  // Parse data organizer configuration (top-level keys, issue #738)
+  if (node["organizer"]) {
+    std::string organizer = node["organizer"].as<std::string>();
+    if (organizer != "none" && organizer != "frecency") {
+      HLOG(kError,
+           "Config error: Invalid organizer '{}' (must be 'none' or "
+           "'frecency')",
+           organizer);
+      return false;
+    }
+    organizer_.name_ = organizer;
+  }
+  if (node["organizer_tasks"]) {
+    organizer_.organizer_tasks_ = node["organizer_tasks"].as<clio::run::u32>();
+    if (organizer_.organizer_tasks_ == 0) {
+      HLOG(kError, "Config error: organizer_tasks must be >= 1");
+      return false;
+    }
+  }
+  if (node["organizer_period_ms"]) {
+    organizer_.period_ms_ = node["organizer_period_ms"].as<clio::run::u32>();
+  }
+
   // Parse GPU metadata cache configuration (optional)
   if (node["gpu_metadata_cache"]) {
     const YAML::Node &gmc = node["gpu_metadata_cache"];
@@ -366,6 +389,13 @@ void Config::EmitYaml(YAML::Emitter &emitter) const {
   emitter << YAML::Key << "dpe" << YAML::Value << YAML::BeginMap;
   emitter << YAML::Key << "dpe_type" << YAML::Value << dpe_.dpe_type_;
   emitter << YAML::EndMap;
+
+  // Emit data organizer configuration (top-level keys)
+  emitter << YAML::Key << "organizer" << YAML::Value << organizer_.name_;
+  emitter << YAML::Key << "organizer_tasks" << YAML::Value
+          << organizer_.organizer_tasks_;
+  emitter << YAML::Key << "organizer_period_ms" << YAML::Value
+          << organizer_.period_ms_;
 
   emitter << YAML::EndMap;
 }

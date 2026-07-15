@@ -121,6 +121,11 @@ clio::run::TaskResume Runtime::Run(clio::run::u32 method, clio::run::shared_ptr<
       CLIO_CO_AWAIT(PodReorganizeBlob(typed_task));
       break;
     }
+    case Method::kDynamicReorganize: {
+      auto& typed_task = task_ptr.template Cast<DynamicReorganizeTask>();
+      CLIO_CO_AWAIT(DynamicReorganize(typed_task));
+      break;
+    }
     case Method::kDelBlob: {
       // Cast task FullPtr to specific type
       auto& typed_task = task_ptr.template Cast<DelBlobTask>();
@@ -323,6 +328,11 @@ void Runtime::SaveTask(clio::run::u32 method, clio::run::SaveTaskArchive& archiv
       archive << *typed_task;
       break;
     }
+    case Method::kDynamicReorganize: {
+      auto& typed_task = task_ptr.template Cast<DynamicReorganizeTask>();
+      archive << *typed_task;
+      break;
+    }
     case Method::kDelBlob: {
       auto& typed_task = task_ptr.template Cast<DelBlobTask>();
       archive << *typed_task;
@@ -505,6 +515,11 @@ void Runtime::LoadTask(clio::run::u32 method, clio::run::LoadTaskArchive& archiv
     }
     case Method::kPodReorganizeBlob: {
       auto& typed_task = task_ptr.template Cast<PodReorganizeBlobTask>();
+      archive >> *typed_task;
+      break;
+    }
+    case Method::kDynamicReorganize: {
+      auto& typed_task = task_ptr.template Cast<DynamicReorganizeTask>();
       archive >> *typed_task;
       break;
     }
@@ -709,6 +724,11 @@ void Runtime::LocalLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive
     }
     case Method::kPodReorganizeBlob: {
       auto& typed_task = task_ptr.template Cast<PodReorganizeBlobTask>();
+      archive >> *typed_task;
+      break;
+    }
+    case Method::kDynamicReorganize: {
+      auto& typed_task = task_ptr.template Cast<DynamicReorganizeTask>();
       archive >> *typed_task;
       break;
     }
@@ -930,6 +950,11 @@ void Runtime::LocalSaveTask(clio::run::u32 method, clio::run::DefaultSaveArchive
     }
     case Method::kPodReorganizeBlob: {
       auto& typed_task = task_ptr.template Cast<PodReorganizeBlobTask>();
+      archive << *typed_task;
+      break;
+    }
+    case Method::kDynamicReorganize: {
+      auto& typed_task = task_ptr.template Cast<DynamicReorganizeTask>();
       archive << *typed_task;
       break;
     }
@@ -1213,6 +1238,15 @@ clio::run::shared_ptr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 metho
       if (!new_task_ptr.IsNull()) {
         auto& task_typed = orig_task_ptr.template Cast<PodReorganizeBlobTask>();
         new_task_ptr->Copy(ctp::ipc::FullPtr<PodReorganizeBlobTask>(task_typed.get()));
+        return new_task_ptr.template Cast<clio::run::Task>();
+      }
+      break;
+    }
+    case Method::kDynamicReorganize: {
+      auto new_task_ptr = ipc_manager->NewTask<DynamicReorganizeTask>();
+      if (!new_task_ptr.IsNull()) {
+        auto& task_typed = orig_task_ptr.template Cast<DynamicReorganizeTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<DynamicReorganizeTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -1514,6 +1548,10 @@ clio::run::shared_ptr<clio::run::Task> Runtime::NewTask(clio::run::u32 method) {
       auto new_task_ptr = ipc_manager->NewTask<PodReorganizeBlobTask>();
       return new_task_ptr.template Cast<clio::run::Task>();
     }
+    case Method::kDynamicReorganize: {
+      auto new_task_ptr = ipc_manager->NewTask<DynamicReorganizeTask>();
+      return new_task_ptr.template Cast<clio::run::Task>();
+    }
     case Method::kDelBlob: {
       auto new_task_ptr = ipc_manager->NewTask<DelBlobTask>();
       return new_task_ptr.template Cast<clio::run::Task>();
@@ -1675,6 +1713,11 @@ void Runtime::AggregateOut(clio::run::u32 method, clio::run::shared_ptr<clio::ru
     }
     case Method::kPodReorganizeBlob: {
       auto& typed_task = orig_task.template Cast<PodReorganizeBlobTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
+      break;
+    }
+    case Method::kDynamicReorganize: {
+      auto& typed_task = orig_task.template Cast<DynamicReorganizeTask>();
       typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }

@@ -44,8 +44,9 @@
 #include <clio_ctp/memory/allocator/malloc_allocator.h>
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/core/core_config.h>
-#include <clio_cte/core/core_dpe.h>
+#include <clio_cte/core/dpe/dpe.h>
 #include <clio_cte/core/core_tasks.h>
+#include <clio_cte/core/data_organizer/data_organizer.h>
 #include <clio_cte/core/gpu_metadata_cache.h>
 #include <clio_cte/core/transaction_log.h>
 #include <clio_ctp/search/regex_search_engine.h>
@@ -152,6 +153,42 @@ public:
   clio::run::TaskResume GetBlob(clio::run::shared_ptr<GetBlobTask> &task);
   /** Reorganize single blob (Method::kReorganizeBlob) - update score. */
   clio::run::TaskResume ReorganizeBlob(clio::run::shared_ptr<ReorganizeBlobTask> &task);
+
+  /**
+   * Rescore-and-move one blob without spawning a ReorganizeBlobTask (issue
+   * #738). This is the body shared by the ReorganizeBlob task handler and
+   * the internal data organizers, which call it directly from the periodic
+   * DynamicReorganize coroutine. Applies the configured
+   * score_difference_threshold (small deltas are a successful no-op).
+   * @param tag_id Owning tag
+   * @param blob_name Blob to rescore
+   * @param new_score Target score in [0, 1]
+   * @param rc Output: 0 on success/skip, non-zero error code otherwise
+   */
+  clio::run::TaskResume ReorganizeBlobInternal(const TagId &tag_id,
+                                               const std::string &blob_name,
+                                               float new_score,
+                                               clio::run::u32 &rc);
+
+  /**
+   * Periodic internal data-organizer driver (Method::kDynamicReorganize).
+   * One-liner delegation: all organization logic lives in the configured
+   * DataOrganizer (issue #738).
+   */
+  clio::run::TaskResume DynamicReorganize(
+      clio::run::shared_ptr<DynamicReorganizeTask> &task);
+
+  /**
+   * Snapshot organizer-relevant metadata for this replica's partition of the
+   * local blob map. Partitioning hashes each blob's composite key modulo the
+   * configured organizer_tasks, so the `organizer_tasks` periodic replicas
+   * cover the blob space disjointly. Empty blobs are skipped (nothing to
+   * move).
+   * @param replica_id 0-based replica index of the calling organizer task
+   * @param out Filled with one entry per blob owned by this replica
+   */
+  void CollectOrganizerBlobStats(clio::run::u32 replica_id,
+                                 std::vector<OrganizerBlobStat> &out);
 
   /** Fully-POD, GPU-compatible blob handlers (issue #556). Thin wrappers over
    *  the *Impl<TaskT> templates above. */
@@ -335,6 +372,11 @@ private:
   // Cached Data Placement Engine — built once from config_ in Create() so
   // ExtendBlob does not allocate a fresh DPE on every PutBlob.
   std::unique_ptr<DataPlacementEngine> dpe_;
+
+  // Internal data organizer — built once from config_ in Create() (issue
+  // #738). nullptr when config_.organizer_.name_ is "none"/unknown; the
+  // periodic DynamicReorganize task then degrades to a no-op.
+  std::unique_ptr<DataOrganizer> organizer_;
 
   // Restart flag: set by Restart() before calling Init()/Create()
   bool is_restart_ = false;
