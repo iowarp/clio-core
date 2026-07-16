@@ -42,15 +42,11 @@
 //! The implementation uses AVX2 SIMD intrinsics for batch decay operations when
 //! available (processes 4 f64 values per cycle), with scalar fallback otherwise.
 
-use std::collections::HashMap;
-use std::hash::BuildHasherDefault;
-use std::mem;
 use crate::ffi::ffi;
 
-// Use fxhash for faster HashMap operations (if available)
-// Otherwise fall back to std DefaultHasher
-type FastHashMap<K, V> =
-    HashMap<K, V, BuildHasherDefault<std::collections::hash_map::DefaultHasher>>;
+// Use foldhash for faster HashMap operations (3-5x faster than DefaultHasher)
+// Keys are internal u64 blob hashes, not user-controlled — no DoS concern
+type FastHashMap<K, V> = hashbrown::HashMap<K, V, foldhash::fast::RandomState>;
 
 /// Number of hot set entries (fixed size for direct indexing)
 pub const HOT_SET_SIZE: usize = 512;
@@ -143,7 +139,7 @@ impl HotSet {
             keys: vec![0; HOT_SET_SIZE],
             key_to_slot: FastHashMap::with_capacity_and_hasher(
                 HOT_SET_SIZE,
-                BuildHasherDefault::default(),
+                foldhash::fast::RandomState::default(),
             ),
             free_slots,
             current_tick: 0,
@@ -349,16 +345,16 @@ impl HotSet {
         for chunk in 0..chunks {
             let offset = chunk * 4;
 
-            // Load 4 scores (aligned load)
+            // Load 4 scores (unaligned load - safe for any alignment)
             let scores_ptr = self.scores.as_ptr().add(offset) as *const f64;
-            let scores_vec = _mm256_load_pd(scores_ptr);
+            let scores_vec = _mm256_loadu_pd(scores_ptr);
 
             // Multiply by decay factor
             let decayed = _mm256_mul_pd(scores_vec, decay_vec);
 
-            // Store back (aligned store)
+            // Store back (unaligned store - safe for any alignment)
             let dest_ptr = self.scores.as_mut_ptr().add(offset) as *mut f64;
-            _mm256_store_pd(dest_ptr, decayed);
+            _mm256_storeu_pd(dest_ptr, decayed);
         }
 
         // Handle remaining elements (if HOT_SET_SIZE is not divisible by 4)
@@ -399,7 +395,7 @@ impl FrecencyEngine {
     pub fn new() -> Self {
         FrecencyEngine {
             hot: HotSet::new(),
-            cold: FastHashMap::with_hasher(BuildHasherDefault::default()),
+            cold: FastHashMap::with_hasher(foldhash::fast::RandomState::default()),
             tick: 0,
         }
     }

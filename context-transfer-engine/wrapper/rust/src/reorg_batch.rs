@@ -185,7 +185,7 @@ impl<T> LockFreeQueue<T> {
 
         // Check if full
         let next_head = head.wrapping_add(1);
-        if next_head.wrapping_sub(tail) > self.capacity {
+        if next_head.wrapping_sub(tail) >= self.capacity {
             return false;
         }
 
