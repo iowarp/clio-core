@@ -1,0 +1,13 @@
+[package]
+name = "ctp-util"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "CTP utilities: timer, config parsing, random, errors, logging (Rust adaptation, issue #756)"
+
+[lib]
+name = "ctp_util"
+
+[dependencies]
+ctp-types = { workspace = true }

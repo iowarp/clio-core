@@ -8,6 +8,8 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod hash;
+
 use std::sync::atomic::{AtomicU32, Ordering};
 
 // ---------------------------------------------------------------------------
