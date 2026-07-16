@@ -1,0 +1,14 @@
+[package]
+name = "clio-run-types"
+version = "0.1.0"
+edition = "2021"
+license = "BSD-3-Clause"
+repository = "https://github.com/iowarp/clio-core"
+description = "context-runtime core POD types: UniqueId/PoolId/TaskId/PoolQuery (issue #756)"
+
+[lib]
+name = "clio_run_types"
+
+# Standalone workspace during development (the CTP workspace is being
+# written by parallel porting workflows); folds in at integration.
+[workspace]
