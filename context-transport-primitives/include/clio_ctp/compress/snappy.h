@@ -34,7 +34,7 @@
 #ifndef CTP_SHM_INCLUDE_HSHM_SHM_COMPRESS_Snappy_H_
 #define CTP_SHM_INCLUDE_HSHM_SHM_COMPRESS_Snappy_H_
 
-#if CTP_ENABLE_COMPRESS
+#if CTP_ENABLE_COMPRESS && CTP_ENABLE_SNAPPY
 
 #include <snappy-sinksource.h>
 #include <snappy.h>
@@ -67,6 +67,6 @@ class Snappy : public Compressor {
 
 }  // namespace ctp
 
-#endif  // CTP_ENABLE_COMPRESS
+#endif  // CTP_ENABLE_COMPRESS && CTP_ENABLE_SNAPPY
 
 #endif  // CTP_SHM_INCLUDE_HSHM_SHM_COMPRESS_Snappy_H_
