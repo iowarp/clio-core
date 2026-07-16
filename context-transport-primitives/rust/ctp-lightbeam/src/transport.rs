@@ -361,6 +361,35 @@ pub(crate) unsafe fn bulk_bytes<'a>(bulk: &Bulk) -> &'a [u8] {
     unsafe { std::slice::from_raw_parts(bulk.data.ptr as *const u8, bulk.size) }
 }
 
+/// C++ `Bulk::serialize` — `ar(size, flags)` and nothing else.
+///
+/// `data`, `desc` and `mr` are process-local: an address, an RDMA descriptor
+/// and a memory-region handle mean nothing in the receiving process, which
+/// re-resolves or re-allocates its own. See [`Bulk::SERIALIZED_FIELDS`].
+impl ctp_ds::global_serialize::GlobalSave for Bulk {
+    fn global_save(&self, ar: &mut ctp_ds::global_serialize::GlobalSerialize) {
+        ar.save(&self.size);
+        ar.save(&self.flags);
+    }
+}
+
+impl ctp_ds::global_serialize::GlobalLoad for Bulk {
+    fn global_load(
+        ar: &mut ctp_ds::global_serialize::GlobalDeserialize<'_>,
+    ) -> ctp_ds::global_serialize::Result<Self> {
+        // The local half is deliberately not restored: the receiver either
+        // resolves the ShmPtr through its own registry or allocates its own
+        // buffer, which is what makes the descriptor portable at all.
+        Ok(Self {
+            data: FullPtr::null(),
+            size: ar.load()?,
+            flags: ar.load()?,
+            desc: 0,
+            mr: 0,
+        })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ClientInfo (lightbeam.h "--- Client Info ---")
 // ---------------------------------------------------------------------------
@@ -495,6 +524,11 @@ impl LbmMeta {
 // ---------------------------------------------------------------------------
 // Events (event_manager.h — platform-neutral half; divergences 7 and 8)
 // ---------------------------------------------------------------------------
+
+/// `EAGAIN` — nothing available right now (C++ `errno` / `EAGAIN`).
+///
+/// Spelled out rather than taken from `libc`, which is not a dependency here.
+pub const EAGAIN: i32 = 11;
 
 /// Platform-neutral read-event constant (C++ `kDefaultReadEvent`):
 /// `POLLRDNORM` on Windows, `EPOLLIN` elsewhere.

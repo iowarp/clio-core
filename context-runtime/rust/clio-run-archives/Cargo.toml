@@ -1,0 +1,21 @@
+[package]
+name = "clio-run-archives"
+version = "0.1.0"
+edition = "2021"
+license = "BSD-3-Clause"
+repository = "https://github.com/iowarp/clio-core"
+description = "context-runtime network task archives: how a task crosses a process boundary (issue #756)"
+
+[lib]
+name = "clio_run_archives"
+
+[dependencies]
+clio-run-types = { path = "../clio-run-types" }
+ctp-ds = { path = "../../../context-transport-primitives/rust/ctp-ds" }
+ctp-lightbeam = { path = "../../../context-transport-primitives/rust/ctp-lightbeam" }
+ctp-memory = { path = "../../../context-transport-primitives/rust/ctp-memory" }
+ctp-types = { path = "../../../context-transport-primitives/rust/ctp-types" }
+
+# Standalone workspace during development, matching the other context-runtime
+# crates; folds into a context-runtime workspace at integration.
+[workspace]

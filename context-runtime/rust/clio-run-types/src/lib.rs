@@ -458,6 +458,67 @@ impl PoolQuery {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Wire format (ctp-ds global archives)
+// ---------------------------------------------------------------------------
+//
+// These impls live here, not beside the archives that use them: the orphan
+// rule allows `impl <foreign trait> for <local type>` only in the type's own
+// crate. That is the right direction anyway — the runtime depends on CTP, and
+// CTP must never depend back.
+
+/// C++ `UniqueId::serialize` — `major` then `minor`.
+impl ctp_ds::global_serialize::GlobalSave for UniqueId {
+    fn global_save(&self, ar: &mut ctp_ds::global_serialize::GlobalSerialize) {
+        ar.save(&self.major);
+        ar.save(&self.minor);
+    }
+}
+
+impl ctp_ds::global_serialize::GlobalLoad for UniqueId {
+    fn global_load(
+        ar: &mut ctp_ds::global_serialize::GlobalDeserialize<'_>,
+    ) -> ctp_ds::global_serialize::Result<Self> {
+        Ok(Self {
+            major: ar.load()?,
+            minor: ar.load()?,
+        })
+    }
+}
+
+/// C++ `TaskId::serialize` — the seven fields in declaration order.
+///
+/// `net_key` travels despite being a process-local vaddr on the sending side:
+/// the C++ serializes it, and the receiver restores it onto the response so
+/// the client can match its pending future. See `ToU64`, which excludes it.
+impl ctp_ds::global_serialize::GlobalSave for TaskId {
+    fn global_save(&self, ar: &mut ctp_ds::global_serialize::GlobalSerialize) {
+        ar.save(&self.pid);
+        ar.save(&self.tid);
+        ar.save(&self.major);
+        ar.save(&self.replica_id);
+        ar.save(&self.unique);
+        ar.save(&self.node_id);
+        ar.save(&self.net_key);
+    }
+}
+
+impl ctp_ds::global_serialize::GlobalLoad for TaskId {
+    fn global_load(
+        ar: &mut ctp_ds::global_serialize::GlobalDeserialize<'_>,
+    ) -> ctp_ds::global_serialize::Result<Self> {
+        Ok(Self {
+            pid: ar.load()?,
+            tid: ar.load()?,
+            major: ar.load()?,
+            replica_id: ar.load()?,
+            unique: ar.load()?,
+            node_id: ar.load()?,
+            net_key: ar.load()?,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

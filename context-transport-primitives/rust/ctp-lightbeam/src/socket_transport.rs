@@ -210,33 +210,21 @@ use std::os::windows::io::AsRawSocket;
 use crate::transport::{EventManager, TransportCtor, TransportFactory, TransportParams, TransportPtr};
 use ctp_memory::ShmPtr;
 use std::sync::Arc;
-use ctp_types::bit_opt;
 
 // ---------------------------------------------------------------------------
 // Constants (lightbeam.h / event_manager.h / posix_socket.h)
 // ---------------------------------------------------------------------------
 
-/// `BULK_EXPOSE` — bulk metadata is sent, but no payload bytes are.
-pub const BULK_EXPOSE: u32 = bit_opt(0);
 
-/// `BULK_XFER` — bulk is marked for data transmission.
-pub const BULK_XFER: u32 = bit_opt(1);
 
-/// `LBM_SYNC` — retained as a no-op flag, exactly as in C++.
-pub const LBM_SYNC: u32 = 0x1;
 
-/// `<cerrno>` `EAGAIN`. 11 on Linux and MSVC alike; this is the value the C++
-/// `rc == EAGAIN` comparisons test against on every platform (divergence 6).
-pub const EAGAIN: i32 = 11;
 
 pub use crate::transport::INVALID_SOCKET;
 
-/// `kDefaultReadEvent` — `EPOLLIN` on POSIX.
-#[cfg(not(windows))]
-pub const DEFAULT_READ_EVENT: u32 = 0x001;
-/// `kDefaultReadEvent` — `POLLRDNORM` on Windows.
-#[cfg(windows)]
-pub const DEFAULT_READ_EVENT: u32 = 0x0100;
+/// The bulk flags, `LBM_SYNC`, the read-event constant and `EAGAIN` — all
+/// from [`crate::transport`] (`lightbeam.h`), which declares them once. This
+/// module used to re-declare each with an identical value.
+pub use crate::transport::{BULK_EXPOSE, BULK_XFER, DEFAULT_READ_EVENT, EAGAIN, LBM_SYNC};
 
 /// Default port of the C++ constructor's `int port = 8193`.
 pub const DEFAULT_PORT: i32 = 8193;

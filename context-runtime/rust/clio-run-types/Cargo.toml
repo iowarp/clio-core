@@ -6,6 +6,9 @@ license = "BSD-3-Clause"
 repository = "https://github.com/iowarp/clio-core"
 description = "context-runtime core POD types: UniqueId/PoolId/TaskId/PoolQuery (issue #756)"
 
+[dependencies]
+ctp-ds = { path = "../../../context-transport-primitives/rust/ctp-ds" }
+
 [lib]
 name = "clio_run_types"
 

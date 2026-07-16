@@ -229,25 +229,16 @@ use ctp_types::Bitfield32;
 
 /// `EIO` — malformed frame.
 pub const EIO: i32 = 5;
-/// `EAGAIN` — nothing available (deadline hit, or `SHM_MPSC_DONTWAIT`).
-pub const EAGAIN: i32 = 11;
 /// `EINVAL` — invalid ring geometry or bulk descriptor (divergences 9, 10).
 pub const EINVAL: i32 = 22;
 /// `EPIPE` — the consumer process died mid-transfer.
 pub const EPIPE: i32 = 32;
 
 // ---------------------------------------------------------------------------
-// lightbeam.h surface (divergence 2 — move to transport.rs when it lands)
+// lightbeam.h surface (from transport.rs, which ports it)
 // ---------------------------------------------------------------------------
 
-/// `BULK_EXPOSE`: bulk metadata is sent, no data transfer.
-pub const BULK_EXPOSE: u32 = ctp_types::bit_opt(0);
-/// `BULK_XFER`: bulk is marked for data transmission.
-pub const BULK_XFER: u32 = ctp_types::bit_opt(1);
 
-/// `LBM_SYNC` — a no-op flag, retained exactly as in C++ (Send is always
-/// synchronous).
-pub const LBM_SYNC: u32 = 0x1;
 
 /// C++ `ctp::lbm::TransportType` / `ctp::lbm::TransportMode`.
 ///
@@ -266,6 +257,11 @@ pub use crate::transport::{TransportMode, TransportType};
 /// (the C++ `MallocAllocator` convention), which this module must **not** put
 /// on the wire — see [`wire_shm`].
 pub use crate::transport::{Bulk, FullPtr};
+
+/// The bulk flags, `LBM_SYNC` and `EAGAIN` — all from [`crate::transport`]
+/// (`lightbeam.h`), which declares them once. This module used to re-declare
+/// each with an identical value.
+pub use crate::transport::{BULK_EXPOSE, BULK_XFER, EAGAIN, LBM_SYNC};
 pub use crate::transport::INVALID_SOCKET;
 use crate::transport::{alloc_recv_buffer, bulk_bytes, free_recv_buffer};
 use crate::transport::{TransportCtor, TransportFactory, TransportParams, TransportPtr};

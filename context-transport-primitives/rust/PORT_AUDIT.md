@@ -404,6 +404,25 @@ outside `#[cfg(test)]`. That one grep is what turned this audit from
       on repeat. Seen before and after the Bulk work, so not caused by it —
       most likely an ephemeral-port race. Worth pinning down before it gets
       blamed for a real regression.
-- [ ] §2 — archives out of `ctp-ds` into context-runtime.
+- [x] §2 — **done for the global archives**. `NetTaskArchive`,
+      `SaveTaskArchive`, `LoadTaskArchive`, `TaskInfo`, `MsgType`,
+      `BulkAllocator`, the `BULK_*` flags, the recv sentinel and the duplicate
+      `UniqueId`/`TaskId` are out of `ctp-ds` (806 lines) and now live in
+      `context-runtime/rust/clio-run-archives`. `ctp-ds` keeps the byte engine.
+      No CTP crate defines a `clio::run` type any more.
+- [ ] §2b — `ctp-ds/src/local_serialize.rs` may have the same problem: its
+      module doc says it ports `clio::run::Default{Save,Load}Archive` /
+      `LocalSaveTask` / `LocalLoadTask`, which are runtime types
+      (`container.h` takes `DefaultLoadArchive&`), while the C++
+      `clio_ctp/.../local_serialize.h` defines only `CalculateSizeArchive`,
+      `LocalSerialize` and `LocalDeserialize`. Needs the same triage: which of
+      `LocalSaveArchive`/`LocalLoadArchive` are CTP's and which are the
+      runtime's.
 - [ ] §3 — triage `RingBufferEntry`, the GPU look-alikes.
+- [x] `BulkAllocator`'s hollowness explained, not fixed: it models
+      `CLIO_IPC->AllocateBuffer` — the runtime's `IpcManager` seen from the
+      archives. It has no implementor because the thing that implements it is
+      not ported. It moved to `clio-run-archives` with the archives, which is
+      where it always belonged; it was never a hollow abstraction, just a
+      not-yet on the wrong side of a layer.
 - [ ] Re-audit the other crates the same way (`impl … for` outside tests).

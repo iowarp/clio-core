@@ -11,5 +11,6 @@ name = "ctp_lightbeam"
 
 [dependencies]
 ctp-types = { workspace = true }
+ctp-ds = { workspace = true }
 ctp-memory = { workspace = true }
 ctp-thread = { workspace = true }
