@@ -198,11 +198,33 @@ cannot. It is the price of a bulk that can point into a shared segment, and
 the C++ pays it too. If we ever want the check back, it belongs on the
 *archive* side, which does know how long the buffer it exposed is.
 
-Ownership of *received* buffers rides on the allocator id, as in the C++, via
-the new `RECV_ALLOCATED_ID` sentinel (`AllocatorId(u32::MAX-1, u32::MAX-1)`)
-and `Bulk::is_recv_allocated`. This is the part `owned: bool` gets wrong, and
-it is worth being precise about: the sentinel does not record *that* a buffer
-is owned, it records *which allocator* owns it. A recv `Bulk` may hold either
+Ownership of *received* buffers rides on the allocator id **in the socket
+transport**, as in the C++, via the `RECV_ALLOCATED_ID` sentinel
+(`AllocatorId(u32::MAX-1, u32::MAX-1)`) and `Bulk::is_recv_allocated`. This is
+the part `owned: bool` gets wrong, and it is worth being precise about: the
+sentinel does not record *that* a buffer is owned, it records *which
+allocator* owns it.
+
+**The shm transport uses a different rule, and so does the C++.** This looked
+like an inconsistency to fix until the headers settled it:
+
+```cpp
+// ShmTransport::ClearRecvHandles          // SocketTransport::ClearRecvHandles
+if (bulk.data.ptr_ && !bulk.desc)          if (ptr_ && alloc_id_ == SENTINEL)
+```
+
+The shm path frees any local buffer on a recv bulk, guarded only by `desc`,
+because only its own `malloc` ever sets `ptr_` there. The socket path needs
+the sentinel because *its* recv bulks can carry a CTP-allocator buffer the
+task archive swapped in. Two rules, each right for its transport — which is
+precisely why the two Rust ports diverged: each was faithful to a different
+one, and neither knew the other existed.
+
+For shm the sentinel is not merely unnecessary but *unavailable*:
+`alloc_id == null` is already the shm wire protocol's "private memory,
+payload follows" discriminant, so it cannot also mean "we allocated this".
+One field, two jobs. So `shm_transport` keeps `alloc_id == null` and frees on
+`ptr != 0 && desc == 0`, exactly as the C++ does. A recv `Bulk` may hold either
 a buffer the transport allocated on the system allocator, or one belonging to
 a CTP allocator that the task archive swapped in for the `BULK_EXPOSE`/copy
 routes. Freeing the second as if it were the first is a **crash, not a leak**
@@ -317,9 +339,16 @@ outside `#[cfg(test)]`. That one grep is what turned this audit from
 
 ## 6. Status
 
-- [x] `FullPtr` → `ctp-memory` (commit `a77f2a9f`). One definition again.
+- [x] `FullPtr` → `ctp-memory` (`a77f2a9f`). One definition again.
+- [x] `TransportType`/`TransportMode`/`ClientInfo` unified (`734369a2`), fixing
+      a `Default` that zeroed `fd` where C++ initializes it to -1.
+- [x] `RECV_ALLOCATED_ID` + the ownership model (`018c7943`).
+- [x] `Bulk` unified across both transports (`4cc5881f`, this commit).
+      Lightbeam has exactly one; five declarations are down to three
+      (`ctp-ds`'s, which §2 removes, and `ctp-net`'s thallium-local one).
 - [ ] §1a — real transports implement `Transport`; factory registers them.
-- [ ] §1 — one `Bulk`/`LbmMeta`/`ClientInfo`/`TransportType`.
+- [ ] `LbmMeta` — blocked only on socket's `ClientInfo.fd` width
+      (`SocketId`/`u64` vs the C++ `int`; a real Windows `SOCKET` question).
 - [ ] §2 — archives out of `ctp-ds` into context-runtime.
 - [ ] §3 — triage `RingBufferEntry`, the GPU look-alikes.
 - [ ] Re-audit the other crates the same way (`impl … for` outside tests).

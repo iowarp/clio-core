@@ -274,6 +274,7 @@ pub use crate::transport::{TransportMode, TransportType};
 /// [`RECV_ALLOCATED_ID`] for why the buffer is pointed at rather than owned,
 /// and why ownership rides on the allocator id rather than a flag.
 pub use crate::transport::{Bulk, FullPtr, RECV_ALLOCATED_ID};
+use crate::transport::{alloc_recv_buffer, bulk_bytes, free_recv_buffer};
 
 /// `ctp::lbm::ClientInfo` — returned by `Recv`, consumed by `Send` for routing.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -848,54 +849,6 @@ fn try_alloc_zeroed(len: usize) -> Option<Vec<u8>> {
     v.try_reserve_exact(len).ok()?;
     v.resize(len, 0);
     Some(v)
-}
-
-/// Allocate a zeroed receive buffer of exactly `len` bytes and leak it,
-/// returning its address (0 is never returned).
-///
-/// C++ `RecvBulks` does `malloc(size)` here. The buffer is owned by the `Bulk`
-/// that points at it and is reclaimed by [`SocketTransport::clear_recv_handles`]
-/// via [`free_recv_buffer`] — so `Bulk`, like the C++ one, holds a location
-/// rather than storage.
-///
-/// Fallible (`try_reserve_exact`): a bad `size` off the wire must not abort.
-/// `into_boxed_slice` pins capacity to `len`, which is what makes freeing with
-/// the recorded size sound.
-fn alloc_recv_buffer(len: usize) -> Option<usize> {
-    let mut v: Vec<u8> = Vec::new();
-    v.try_reserve_exact(len).ok()?;
-    v.resize(len, 0);
-    let mut b = v.into_boxed_slice();
-    let addr = b.as_mut_ptr() as usize;
-    std::mem::forget(b);
-    Some(addr)
-}
-
-/// Free a buffer from [`alloc_recv_buffer`].
-///
-/// # Safety
-///
-/// `addr` must come from [`alloc_recv_buffer`], and `len` must be the exact
-/// length it was allocated with — `Bulk::size`, which must not have been
-/// changed since. Nothing else may free it. C++ gets to use size-agnostic
-/// `free` here; Rust's allocator wants the layout back, so the size invariant
-/// is the price of the same operation.
-unsafe fn free_recv_buffer(addr: usize, len: usize) {
-    let slice = std::ptr::slice_from_raw_parts_mut(addr as *mut u8, len);
-    drop(unsafe { Box::from_raw(slice) });
-}
-
-/// The bytes a `Bulk` points at.
-///
-/// # Safety
-///
-/// `bulk.data.ptr` must address at least `bulk.size` valid, initialized bytes
-/// that stay alive and unaliased for `'a`. This is the C++ contract verbatim:
-/// `Bulk` carries a location and the sender guarantees the memory. It is also
-/// the one place the safety has to be given up — a `FullPtr` may point into a
-/// shared segment, and a cross-process pointer cannot be a safe slice.
-unsafe fn bulk_bytes<'a>(bulk: &Bulk) -> &'a [u8] {
-    unsafe { std::slice::from_raw_parts(bulk.data.ptr as *const u8, bulk.size) }
 }
 
 // ---------------------------------------------------------------------------

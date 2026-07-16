@@ -257,30 +257,16 @@ pub const LBM_SYNC: u32 = 0x1;
 /// spellings are the same type.
 pub use crate::transport::{TransportMode, TransportType};
 
-/// C++ `ctp::lbm::Bulk` fused with `ctp::ipc::FullPtr<char>` (divergence 3).
+/// `ctp::lbm::Bulk` — from [`crate::transport`] (`lightbeam.h`), which declares
+/// it once. This module used to declare its own as `{ data: Vec<u8>, shm }`;
+/// the canonical `FullPtr` carries exactly that pair, so the split is gone.
 ///
-/// `data` is the process-local payload (empty when the bulk is shared-memory
-/// backed); `shm` is the cross-process `(alloc_id, off)` pointer — a null
-/// `alloc_id` means "private memory", which is what makes `send` stream the
-/// bytes instead of passing the pointer through.
-#[derive(Debug, Clone)]
-pub struct Bulk {
-    pub data: Vec<u8>,
-    pub shm: ShmPtr<u8>,
-    pub size: usize,
-    pub flags: Bitfield32,
-}
-
-impl Default for Bulk {
-    fn default() -> Self {
-        Self {
-            data: Vec::new(),
-            shm: ShmPtr::null(),
-            size: 0,
-            flags: Bitfield32::default(),
-        }
-    }
-}
+/// A private-memory bulk is still `alloc_id == null`, unchanged. What differs
+/// is that `FullPtr::from_local` also records the local address in `shm.off`
+/// (the C++ `MallocAllocator` convention), which this module must **not** put
+/// on the wire — see [`wire_shm`].
+pub use crate::transport::{Bulk, FullPtr};
+use crate::transport::{alloc_recv_buffer, bulk_bytes, free_recv_buffer};
 
 /// C++ `ctp::lbm::ClientInfo`.
 ///
@@ -425,12 +411,8 @@ fn get_bulk_vec(buf: &[u8], pos: &mut usize) -> Option<Vec<Bulk>> {
     for _ in 0..n {
         let size = get_u64(buf, pos)? as usize;
         let flags = Bitfield32::new(get_u32(buf, pos)?);
-        v.push(Bulk {
-            data: Vec::new(),
-            shm: ShmPtr::null(),
-            size,
-            flags,
-        });
+        // Descriptor only: recv_bulks fills in the pointer.
+        v.push(Bulk::new(FullPtr::null(), size, flags.bits()));
     }
     Some(v)
 }
@@ -896,27 +878,41 @@ pub fn recv_bulks_impl(meta: &mut LbmMeta, ring: &ShmRing) -> i32 {
             // BULK_EXPOSE: read only the ShmPtr (no data transfer).
             let mut raw = [0u8; SHM_PTR_WIRE_LEN];
             read_transfer(&mut raw, ring);
-            bulk.shm = shm_from_bytes(&raw);
-            bulk.data.clear();
+            bulk.data = FullPtr::new(0, shm_from_bytes(&raw));
         } else if bulk.flags.any(BULK_XFER) {
             // BULK_XFER: read the ShmPtr first, then data if private memory.
             let mut raw = [0u8; SHM_PTR_WIRE_LEN];
             read_transfer(&mut raw, ring);
             let shm = shm_from_bytes(&raw);
             if !shm.alloc_id.is_null() {
-                // Shared memory — ShmPtr passthrough, no data transfer.
-                bulk.shm = shm;
-                bulk.data.clear();
-            } else {
-                // Private memory — read the full data bytes. The C++ reuses a
-                // caller-provided `ptr_` when present, else mallocs; here the Vec
-                // is grown only when it cannot already hold `size`
-                // (divergence 3).
-                if bulk.data.len() < bulk.size {
-                    bulk.data.resize(bulk.size, 0);
+                // Shared memory — ShmPtr passthrough, no data transfer. The
+                // local half stays 0: resolving it is the receiver's business,
+                // through its own allocator registry.
+                bulk.data = FullPtr::new(0, shm);
+            } else if bulk.size > 0 {
+                // Private memory — the payload follows on the wire. C++ reuses
+                // a caller-provided ptr_ when present, else mallocs; do the
+                // same, and tag ours so clear_recv_handles knows it owns it.
+                if bulk.data.ptr == 0 {
+                    let Some(addr) = alloc_recv_buffer(bulk.size) else {
+                        return EINVAL;
+                    };
+                    // Local half only. Unlike the socket transport, this one
+                    // does NOT tag the ShmPtr: `alloc_id == null` is the shm
+                    // wire protocol's "private memory, payload follows"
+                    // discriminant, so it cannot double as an ownership mark.
+                    // C++ stuffs the address into shm_.off_ here; that is not
+                    // reproduced (divergence 3a) — the off would ride into the
+                    // ring, and an absolute pointer inside a segment is exactly
+                    // what Pillar 3 forbids.
+                    bulk.data =
+                        FullPtr::new(addr, ShmPtr::new(AllocatorId::null(), NULL_OFFSET));
                 }
-                read_transfer(&mut bulk.data[..bulk.size], ring);
-                bulk.shm = ShmPtr::new(AllocatorId::null(), NULL_OFFSET);
+                // SAFETY: `size` bytes live at this address — either just
+                // allocated, or promised by the caller who supplied the buffer.
+                let dst =
+                    unsafe { std::slice::from_raw_parts_mut(bulk.data.ptr as *mut u8, bulk.size) };
+                read_transfer(dst, ring);
             }
         }
     }
@@ -935,6 +931,29 @@ pub fn recv_bulks_impl(meta: &mut LbmMeta, ring: &ShmRing) -> i32 {
 pub struct ShmTransport {
     pub mode: TransportMode,
     pub transport_type: TransportType,
+}
+
+/// The `ShmPtr` for `bulk` **as it may be written into the ring**.
+///
+/// A `FullPtr` over private memory carries the local address in `shm.off`
+/// (`FullPtr::from_local`, the C++ `MallocAllocator` convention). That address
+/// is meaningless to the peer, and the ring lives in a shared segment — so
+/// writing it there would put an absolute pointer inside a segment, which
+/// MEMORY_DESIGN Pillar 3 forbids outright, and would leak a heap address
+/// across a process boundary for nothing. The receiver ignores `off` when
+/// `alloc_id` is null anyway (it reads the payload that follows instead), so
+/// normalizing it to `NULL_OFFSET` costs nothing and keeps the segment
+/// position-independent.
+///
+/// This is the one place the in-process `FullPtr` convention and the on-wire
+/// format genuinely disagree, and the disagreement resolves here rather than
+/// by giving either side a different `Bulk`.
+fn wire_shm(bulk: &Bulk) -> ShmPtr<u8> {
+    if bulk.data.shm.alloc_id.is_null() {
+        ShmPtr::new(AllocatorId::null(), NULL_OFFSET)
+    } else {
+        bulk.data.shm
+    }
 }
 
 impl ShmTransport {
@@ -957,13 +976,8 @@ impl ShmTransport {
     }
 
     /// C++ `ShmTransport::Expose`.
-    pub fn expose(&self, data: Vec<u8>, shm: ShmPtr<u8>, data_size: usize, flags: u32) -> Bulk {
-        Bulk {
-            data,
-            shm,
-            size: data_size,
-            flags: Bitfield32::new(flags),
-        }
+    pub fn expose(&self, ptr: FullPtr, data_size: usize, flags: u32) -> Bulk {
+        Bulk::new(ptr, data_size, flags)
     }
 
     /// C++ `ShmTransport::GetAddress`.
@@ -980,7 +994,26 @@ impl ShmTransport {
     /// buffers. Dropping the `Vec`s is the `std::free` (divergence 3).
     pub fn clear_recv_handles(meta: &mut LbmMeta) {
         for bulk in meta.recv.iter_mut() {
-            bulk.data = Vec::new();
+            // Only buffers recv_bulks allocated (RECV_ALLOCATED_ID). A
+            // shm-backed bulk points into a segment owned by an allocator, and
+            // a caller-provided one is the caller's — neither is ours to free.
+            // C++ `ShmTransport::ClearRecvHandles`: free when there is a local
+            // pointer and no RDMA registration (`if (bulk.data.ptr_ &&
+            // !bulk.desc)`). Deliberately NOT the socket transport's sentinel
+            // rule: there, alloc_id can mark ownership, but here alloc_id ==
+            // null is the wire protocol's "private memory" discriminant and
+            // cannot mean two things at once. The C++ uses two different rules
+            // for the same reason.
+            //
+            // As in C++, this frees any local buffer on a recv bulk — only
+            // recv_bulks ever sets one on this path, so "local pointer" and
+            // "ours" coincide.
+            if bulk.data.ptr != 0 && bulk.desc == 0 {
+                // SAFETY: recv_bulks allocated this with exactly `size` bytes
+                // via alloc_recv_buffer, and `size` has not changed.
+                unsafe { free_recv_buffer(bulk.data.ptr, bulk.size) };
+                bulk.data.ptr = 0;
+            }
         }
     }
 
@@ -998,7 +1031,7 @@ impl ShmTransport {
         // Validate every private-memory bulk BEFORE writing anything, so a short
         // payload can't leave a half-framed message in the ring.
         for bulk in &meta.send {
-            if bulk_needs_data(bulk) && bulk.data.len() < bulk.size {
+            if bulk_needs_data(bulk) && bulk.size > 0 && bulk.data.ptr == 0 {
                 return EINVAL;
             }
         }
@@ -1018,12 +1051,14 @@ impl ShmTransport {
         for bulk in &meta.send {
             if bulk.flags.any(BULK_EXPOSE) {
                 // BULK_EXPOSE: send only the ShmPtr (no data transfer).
-                write_transfer(&shm_to_bytes(&bulk.shm), &ring);
+                write_transfer(&shm_to_bytes(&wire_shm(bulk)), &ring);
             } else if bulk.flags.any(BULK_XFER) {
                 // BULK_XFER: send the ShmPtr first, then data if private memory.
-                write_transfer(&shm_to_bytes(&bulk.shm), &ring);
-                if bulk.shm.alloc_id.is_null() {
-                    write_transfer(&bulk.data[..bulk.size], &ring);
+                write_transfer(&shm_to_bytes(&wire_shm(bulk)), &ring);
+                if bulk.data.shm.alloc_id.is_null() {
+                    // SAFETY: the sender exposed `size` bytes at this address
+                    // and keeps them alive for the call.
+                    write_transfer(unsafe { bulk_bytes(bulk) }, &ring);
                 }
             }
         }
@@ -1073,12 +1108,7 @@ impl ShmTransport {
         let new_recv: Vec<Bulk> = meta
             .send
             .iter()
-            .map(|b| Bulk {
-                data: Vec::new(),
-                shm: ShmPtr::null(),
-                size: b.size,
-                flags: b.flags,
-            })
+            .map(|b| Bulk::new(FullPtr::null(), b.size, b.flags.bits()))
             .collect();
         meta.recv.extend(new_recv);
 
@@ -1092,7 +1122,7 @@ impl ShmTransport {
 
 /// True when `send` must stream this bulk's bytes (private memory transfer).
 fn bulk_needs_data(bulk: &Bulk) -> bool {
-    !bulk.flags.any(BULK_EXPOSE) && bulk.flags.any(BULK_XFER) && bulk.shm.alloc_id.is_null()
+    !bulk.flags.any(BULK_EXPOSE) && bulk.flags.any(BULK_XFER) && bulk.data.shm.alloc_id.is_null()
 }
 
 // ---------------------------------------------------------------------------
@@ -1542,13 +1572,8 @@ impl ShmMpscTransport {
     // --- High-level metadata + bulk API (mirrors ShmTransport::Send/Recv) ---
 
     /// C++ `ShmMpscTransport::Expose` (Transport::Expose parity).
-    pub fn expose(&self, data: Vec<u8>, shm: ShmPtr<u8>, data_size: usize, flags: u32) -> Bulk {
-        Bulk {
-            data,
-            shm,
-            size: data_size,
-            flags: Bitfield32::new(flags),
-        }
+    pub fn expose(&self, ptr: FullPtr, data_size: usize, flags: u32) -> Bulk {
+        Bulk::new(ptr, data_size, flags)
     }
 
     /// C++ `ShmMpscTransport::Send`: serialize metadata + bulk data into ONE
@@ -1556,7 +1581,7 @@ impl ShmMpscTransport {
     /// with another's at the consumer.
     pub fn send(&self, meta: &LbmMeta) -> i32 {
         for bulk in &meta.send {
-            if bulk_needs_data(bulk) && bulk.data.len() < bulk.size {
+            if bulk_needs_data(bulk) && bulk.size > 0 && bulk.data.ptr == 0 {
                 return -EINVAL; // divergence 9
             }
         }
@@ -1566,11 +1591,13 @@ impl ShmMpscTransport {
         msg.extend_from_slice(&meta_buf);
         for bulk in &meta.send {
             if bulk.flags.any(BULK_EXPOSE) {
-                msg.extend_from_slice(&shm_to_bytes(&bulk.shm));
+                msg.extend_from_slice(&shm_to_bytes(&wire_shm(bulk)));
             } else if bulk.flags.any(BULK_XFER) {
-                msg.extend_from_slice(&shm_to_bytes(&bulk.shm));
-                if bulk.shm.alloc_id.is_null() {
-                    msg.extend_from_slice(&bulk.data[..bulk.size]);
+                msg.extend_from_slice(&shm_to_bytes(&wire_shm(bulk)));
+                if bulk.data.shm.alloc_id.is_null() {
+                    // SAFETY: the sender exposed `size` bytes at this address
+                    // and keeps them alive for the call.
+                    msg.extend_from_slice(unsafe { bulk_bytes(bulk) });
                 }
             }
         }
@@ -1612,15 +1639,10 @@ impl ShmMpscTransport {
         let descs: Vec<(usize, Bitfield32)> =
             meta.send.iter().map(|b| (b.size, b.flags)).collect();
         for (size, flags) in descs {
-            let mut recv_bulk = Bulk {
-                data: Vec::new(),
-                shm: ShmPtr::null(),
-                size,
-                flags,
-            };
+            let mut recv_bulk = Bulk::new(FullPtr::null(), size, flags.bits());
             if flags.any(BULK_EXPOSE) {
                 match read_shm(&msg, &mut pos) {
-                    Some(shm) => recv_bulk.shm = shm,
+                    Some(shm) => recv_bulk.data = FullPtr::new(0, shm),
                     None => {
                         info.rc = EIO;
                         return info;
@@ -1635,12 +1657,31 @@ impl ShmMpscTransport {
                     }
                 };
                 if !shm.alloc_id.is_null() {
-                    recv_bulk.shm = shm;
+                    // Shared memory — pointer passthrough; the local half is
+                    // the receiver's to resolve via its allocator registry.
+                    recv_bulk.data = FullPtr::new(0, shm);
                 } else {
                     match read_raw(&msg, &mut pos, recv_bulk.size) {
                         Some(b) => {
-                            recv_bulk.data = b.to_vec();
-                            recv_bulk.shm = ShmPtr::new(AllocatorId::null(), NULL_OFFSET);
+                            // Private memory: copy the payload into a buffer we
+                            // own, tagged so clear_recv_handles frees it.
+                            if !b.is_empty() {
+                                let Some(addr) = alloc_recv_buffer(b.len()) else {
+                                    info.rc = EIO;
+                                    return info;
+                                };
+                                // SAFETY: `addr` is `b.len()` bytes we just
+                                // allocated and nothing else references it.
+                                unsafe {
+                                    std::ptr::copy_nonoverlapping(
+                                        b.as_ptr(),
+                                        addr as *mut u8,
+                                        b.len(),
+                                    )
+                                };
+                                recv_bulk.data =
+                                    FullPtr::new(addr, ShmPtr::new(AllocatorId::null(), NULL_OFFSET));
+                            }
                         }
                         None => {
                             info.rc = EIO;
@@ -1732,6 +1773,39 @@ impl Drop for ShmMpscTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A bulk over private memory holding `data`.
+    ///
+    /// `Bulk` points at memory rather than owning it, so the bytes must outlive
+    /// the transfer — a real sender keeps them in the task archive. Tests leak.
+    fn priv_bulk(data: &[u8], size: usize, flags: u32) -> Bulk {
+        if data.is_empty() {
+            return Bulk::new(FullPtr::null(), size, flags);
+        }
+        let leaked: &'static mut [u8] = Box::leak(data.to_vec().into_boxed_slice());
+        Bulk::new(FullPtr::from_local(leaked.as_mut_ptr() as usize), size, flags)
+    }
+
+    /// A bulk over segment memory at `shm` (no local half — the receiver
+    /// resolves it).
+    fn shm_bulk(shm: ShmPtr<u8>, size: usize, flags: u32) -> Bulk {
+        Bulk::new(FullPtr::new(1, shm), size, flags)
+    }
+
+    /// The bytes a bulk points at, for assertions.
+    fn bytes(b: &Bulk) -> &[u8] {
+        if b.data.ptr == 0 || b.size == 0 {
+            return &[];
+        }
+        // SAFETY: every bulk in these tests points at `size` live bytes.
+        unsafe { bulk_bytes(b) }
+    }
+
+    /// True when the bulk carries no local buffer.
+    fn no_buffer(b: &Bulk) -> bool {
+        b.data.ptr == 0
+    }
+
 
     static NAME_COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -1921,12 +1995,7 @@ mod tests {
     fn serialize_meta_roundtrip() {
         let mut meta = LbmMeta::new();
         for i in 0..3usize {
-            meta.send.push(Bulk {
-                data: vec![0u8; i],
-                shm: ShmPtr::null(),
-                size: i * 10,
-                flags: Bitfield32::new(if i % 2 == 0 { BULK_XFER } else { BULK_EXPOSE }),
-            });
+            meta.send.push(priv_bulk(&vec![0u8; i], i * 10, if i % 2 == 0 { BULK_XFER } else { BULK_EXPOSE }));
         }
         meta.send_bulks = 2;
         meta.recv_bulks = 5;
@@ -1941,7 +2010,7 @@ mod tests {
             assert_eq!(got.send[i].size, i * 10);
             assert_eq!(got.send[i].flags, meta.send[i].flags);
             // Payloads are NOT part of the metadata frame.
-            assert!(got.send[i].data.is_empty());
+            assert!(no_buffer(&got.send[i]));
         }
     }
 
@@ -2042,14 +2111,8 @@ mod tests {
         let buf = ShmRingBuffer::new(4096);
         let ctx = LbmContext::new().with_ring(buf.ring());
         let payload: Vec<u8> = (0..64u8).collect();
-        let t = ShmTransport::new(TransportMode::Client);
         let mut meta = LbmMeta::new();
-        meta.send.push(t.expose(
-            payload.clone(),
-            ShmPtr::new(AllocatorId::null(), NULL_OFFSET),
-            payload.len(),
-            BULK_XFER,
-        ));
+        meta.send.push(priv_bulk(&payload, payload.len(), BULK_XFER));
         assert_eq!(ShmTransport::send(&mut meta, &ctx), 0);
 
         let mut got = LbmMeta::new();
@@ -2057,15 +2120,15 @@ mod tests {
         assert_eq!(info.rc, 0);
         assert_eq!(got.recv.len(), 1);
         assert_eq!(got.recv[0].size, payload.len());
-        assert_eq!(got.recv[0].data, payload);
+        assert_eq!(bytes(&got.recv[0]), &payload[..]);
         // Private memory: alloc_id stays null and the C++ address stuffing is
         // NOT reproduced (divergence 3a).
-        assert!(got.recv[0].shm.alloc_id.is_null());
-        assert_eq!(got.recv[0].shm.off, NULL_OFFSET);
+        assert!(got.recv[0].data.shm.alloc_id.is_null());
+        assert_eq!(got.recv[0].data.shm.off, NULL_OFFSET);
 
         // clear_recv_handles releases the private buffers (C++ std::free).
         ShmTransport::clear_recv_handles(&mut got);
-        assert!(got.recv[0].data.is_empty());
+        assert!(no_buffer(&got.recv[0]));
     }
 
     #[test]
@@ -2073,18 +2136,13 @@ mod tests {
         let buf = ShmRingBuffer::new(256);
         let ctx = LbmContext::new().with_ring(buf.ring());
         let mut meta = LbmMeta::new();
-        meta.send.push(Bulk {
-            data: Vec::new(),
-            shm: ShmPtr::new(AllocatorId::null(), NULL_OFFSET),
-            size: 0,
-            flags: Bitfield32::new(BULK_XFER),
-        });
+        meta.send.push(priv_bulk(&[], 0, BULK_XFER));
         assert_eq!(ShmTransport::send(&mut meta, &ctx), 0);
         let mut got = LbmMeta::new();
         assert_eq!(ShmTransport::recv(&mut got, &ctx).rc, 0);
         assert_eq!(got.recv.len(), 1);
         assert_eq!(got.recv[0].size, 0);
-        assert!(got.recv[0].data.is_empty());
+        assert!(no_buffer(&got.recv[0]));
         assert_eq!(buf.ring().info().avail(), 0);
     }
 
@@ -2096,30 +2154,20 @@ mod tests {
         let shm_b = ShmPtr::<u8>::new(AllocatorId::new(3, 7), 8192);
         let mut meta = LbmMeta::new();
         // BULK_EXPOSE: pointer only — `data` must NOT be transferred.
-        meta.send.push(Bulk {
-            data: vec![0xFF; 32],
-            shm: shm_a,
-            size: 32,
-            flags: Bitfield32::new(BULK_EXPOSE),
-        });
+        meta.send.push(shm_bulk(shm_a, 32, BULK_EXPOSE));
         // BULK_XFER with a real alloc_id: pointer passthrough, no data.
-        meta.send.push(Bulk {
-            data: Vec::new(),
-            shm: shm_b,
-            size: 16,
-            flags: Bitfield32::new(BULK_XFER),
-        });
+        meta.send.push(shm_bulk(shm_b, 16, BULK_XFER));
         assert_eq!(ShmTransport::send(&mut meta, &ctx), 0);
 
         let mut got = LbmMeta::new();
         assert_eq!(ShmTransport::recv(&mut got, &ctx).rc, 0);
         assert_eq!(got.recv.len(), 2);
-        assert_eq!(got.recv[0].shm.alloc_id, shm_a.alloc_id);
-        assert_eq!(got.recv[0].shm.off, shm_a.off);
-        assert!(got.recv[0].data.is_empty());
-        assert_eq!(got.recv[1].shm.alloc_id, shm_b.alloc_id);
-        assert_eq!(got.recv[1].shm.off, shm_b.off);
-        assert!(got.recv[1].data.is_empty());
+        assert_eq!(got.recv[0].data.shm.alloc_id, shm_a.alloc_id);
+        assert_eq!(got.recv[0].data.shm.off, shm_a.off);
+        assert!(no_buffer(&got.recv[0]));
+        assert_eq!(got.recv[1].data.shm.alloc_id, shm_b.alloc_id);
+        assert_eq!(got.recv[1].data.shm.off, shm_b.off);
+        assert!(no_buffer(&got.recv[1]));
         assert_eq!(buf.ring().info().avail(), 0);
     }
 
@@ -2136,12 +2184,10 @@ mod tests {
         let buf = ShmRingBuffer::new(256);
         let ctx = LbmContext::new().with_ring(buf.ring());
         let mut meta = LbmMeta::new();
-        meta.send.push(Bulk {
-            data: vec![1, 2, 3], // shorter than `size`
-            shm: ShmPtr::new(AllocatorId::null(), NULL_OFFSET),
-            size: 64,
-            flags: Bitfield32::new(BULK_XFER),
-        });
+        // A Bulk points at memory now, so there is no buffer length to
+        // compare against `size` — the sender's word is all there is, exactly
+        // as in C++. What is still checkable is a non-zero size over no buffer.
+        meta.send.push(priv_bulk(&[], 64, BULK_XFER));
         assert_eq!(ShmTransport::send(&mut meta, &ctx), EINVAL);
         // Nothing was written: the ring is untouched (divergence 9).
         assert_eq!(buf.ring().info().avail(), 0);
@@ -2185,12 +2231,7 @@ mod tests {
         let sender = std::thread::spawn(move || {
             let mut meta = LbmMeta::new();
             let len = payload.len();
-            meta.send.push(Bulk {
-                data: payload,
-                shm: ShmPtr::new(AllocatorId::null(), NULL_OFFSET),
-                size: len,
-                flags: Bitfield32::new(BULK_XFER),
-            });
+            meta.send.push(priv_bulk(&payload, len, BULK_XFER));
             let ctx = LbmContext::new().with_ring(send_ring);
             ShmTransport::send(&mut meta, &ctx)
         });
@@ -2201,7 +2242,7 @@ mod tests {
         assert_eq!(sender.join().unwrap(), 0);
         assert_eq!(info.rc, 0);
         assert_eq!(got.recv.len(), 1);
-        assert_eq!(got.recv[0].data, expect);
+        assert_eq!(bytes(&got.recv[0]), &expect[..]);
     }
 
     #[test]
@@ -2400,13 +2441,8 @@ mod tests {
         let payload: Vec<u8> = (0..200u32).map(|i| (i % 255) as u8).collect();
         let shm = ShmPtr::<u8>::new(AllocatorId::new(5, 6), 1024);
         let mut meta = LbmMeta::new();
-        meta.send.push(c.expose(
-            payload.clone(),
-            ShmPtr::new(AllocatorId::null(), NULL_OFFSET),
-            payload.len(),
-            BULK_XFER,
-        ));
-        meta.send.push(c.expose(Vec::new(), shm, 64, BULK_EXPOSE));
+        meta.send.push(priv_bulk(&payload, payload.len(), BULK_XFER));
+        meta.send.push(shm_bulk(shm, 64, BULK_EXPOSE));
         meta.send_bulks = 1;
         assert_eq!(c.send(&meta), 0);
 
@@ -2416,11 +2452,11 @@ mod tests {
         assert_eq!(got.send.len(), 2);
         assert_eq!(got.recv.len(), 2);
         assert_eq!(got.send_bulks, 1);
-        assert_eq!(got.recv[0].data, payload);
-        assert!(got.recv[0].shm.alloc_id.is_null());
-        assert!(got.recv[1].data.is_empty());
-        assert_eq!(got.recv[1].shm.alloc_id, shm.alloc_id);
-        assert_eq!(got.recv[1].shm.off, shm.off);
+        assert_eq!(bytes(&got.recv[0]), &payload[..]);
+        assert!(got.recv[0].data.shm.alloc_id.is_null());
+        assert!(no_buffer(&got.recv[1]));
+        assert_eq!(got.recv[1].data.shm.alloc_id, shm.alloc_id);
+        assert_eq!(got.recv[1].data.shm.off, shm.off);
     }
 
     #[test]
@@ -2440,12 +2476,9 @@ mod tests {
         let _s = server(&name);
         let c = client(&name);
         let mut meta = LbmMeta::new();
-        meta.send.push(Bulk {
-            data: vec![1, 2],
-            shm: ShmPtr::new(AllocatorId::null(), NULL_OFFSET),
-            size: 99,
-            flags: Bitfield32::new(BULK_XFER),
-        });
+        // See transport_rejects_short_payload_before_writing: a length check
+        // is no longer possible; a missing buffer still is.
+        meta.send.push(priv_bulk(&[], 99, BULK_XFER));
         assert_eq!(c.send(&meta), -EINVAL);
     }
 
