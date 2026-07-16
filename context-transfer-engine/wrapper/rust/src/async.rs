@@ -240,7 +240,11 @@ unsafe impl Sync for SendableClient {}
 /// Provides async methods for client-level operations.
 /// Uses spawn_blocking to bridge C++ blocking calls.
 pub struct Client {
-    _marker: std::marker::PhantomData<()>,
+    /// Shared stateless C++ client, reused across all async calls (avoids a
+    /// per-call client_new() heap alloc). SendableClient is Send+Sync (see its
+    /// SAFETY docs at line ~206); Arc lets each spawn_blocking closure borrow
+    /// it cheaply. The C++ Client is stateless so sharing is safe.
+    inner: Arc<SendableClient>,
 }
 
 impl Client {
@@ -271,7 +275,7 @@ impl Client {
         // This check is thread-safe via OnceLock in sync::init
         crate::sync::init("")?;
         Ok(Self {
-            _marker: std::marker::PhantomData,
+            inner: Arc::new(SendableClient(ffi::client_new())),
         })
     }
 
@@ -279,12 +283,23 @@ impl Client {
     ///
     /// # Arguments
     /// * `min_time` - Minimum timestamp to fetch (0 for all)
+    /// * `timeout_sec` - Timeout in seconds. If <= 0, returns immediately (non-blocking peek).
     ///
     /// # Returns
     /// Vector of telemetry entries
+    ///
+    /// # Note
+    /// The `timeout_sec <= 0` peek path uses `block_in_place`, which requires the
+    /// multi-threaded tokio runtime (rt-multi-thread, which this crate enables).
+    /// It will panic on the current_thread runtime flavor.
     pub async fn poll_telemetry(&self, min_time: u64, timeout_sec: f32) -> CteResult<Vec<crate::ffi::CteTelemetry>> {
-        tokio::task::spawn_blocking(move || {
-            let client = SendableClient(ffi::client_new());
+        // Fast path: a non-blocking peek (timeout <= 0) returns instantly from
+        // C++, so wrap it in block_in_place (runs on the current worker thread
+        // slot) instead of spawn_blocking (which spawns a blocking-pool task and
+        // adds 1-3 us overhead). For a real timeout (timeout > 0) the C++ call
+        // genuinely blocks, so keep spawn_blocking to avoid stalling a worker.
+        let client = Arc::clone(&self.inner);
+        let do_poll = move || {
             let mut raw = Vec::new();
             let ret = ffi::client_poll_telemetry_raw(&client.0, min_time, timeout_sec, &mut raw);
             match ret {
@@ -299,11 +314,16 @@ impl Client {
                     message: format!("Unknown return code: {}", code),
                 }),
             }
-        })
-        .await
-        .map_err(|e| CteError::FfiError {
-            message: format!("Failed to poll telemetry: spawn_blocking error: {}", e),
-        })?
+        };
+        if timeout_sec <= 0.0 {
+            tokio::task::block_in_place(do_poll)
+        } else {
+            tokio::task::spawn_blocking(do_poll)
+                .await
+                .map_err(|e| CteError::FfiError {
+                    message: format!("Failed to poll telemetry: spawn_blocking error: {}", e),
+                })?
+        }
     }
 
     /// Trigger the CTE's internal DynamicReorganize task (async).
@@ -366,8 +386,8 @@ impl Client {
             });
         }
 
+        let client = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || {
-            let client = SendableClient(ffi::client_new());
             let rc = ffi::client_reorganize_blob(
                 &client.0,
                 tag_id.major,
@@ -411,8 +431,8 @@ impl Client {
             });
         }
 
+        let client = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || {
-            let client = SendableClient(ffi::client_new());
             let rc = ffi::client_del_blob(
                 &client.0,
                 tag_id.major,
