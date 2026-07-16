@@ -15,6 +15,73 @@ and wiring them together is what porting context-runtime requires.
 Nothing here is a code-generation slip to be patched. These are structural
 and want deliberate consolidation.
 
+## 1a. `ctp-lightbeam`'s abstraction is implemented only by its test doubles
+
+Found while scoping the fix in §1, and it is the more serious half.
+
+`ctp-lightbeam` has **zero `use crate::`** statements. `transport.rs`,
+`shm_transport.rs` and `socket_transport.rs` never reference each other.
+They are three parallel ports that share a crate and nothing else.
+
+`transport.rs` defines `pub trait Transport` (:647) and `TransportFactory`
+(:835), a runtime registry keyed by `TransportType`. In C++, `Transport` is
+a base class and `ShmMpscTransport`/`SocketTransport` derive from it, with
+the factory handing back a base pointer.
+
+In Rust today:
+
+- The only `impl Transport for` types are `MinimalTransport` (:983) and
+  `EmTransport` (:1011) — **both inside `transport.rs`'s own `#[cfg(test)]`
+  module**, which starts at :948.
+- `ShmMpscTransport` and `SocketTransport` do **not** implement `Transport`.
+  `transport.rs` never names them.
+- Every `TransportFactory::register` call is at :1658 or later — also inside
+  `#[cfg(test)]` — and registers `make_minimal`/`make_nothing`.
+
+So at runtime `TransportFactory::get(TransportType::Shm, …)` returns `None`:
+no real backend is registered, and none could be, because the real transports
+do not implement the trait the registry stores. The abstraction is exercised
+exclusively by mocks defined next to it.
+
+This is why the 140 tests pass while nothing is connected. The trait's tests
+test the trait against doubles; each transport's tests test that transport
+against itself. Both halves are green and there is no test that could notice
+the gap, because a test that used a real transport *through* the factory is
+exactly the test nobody wrote.
+
+Consequence for the estimate: §1 is not "unify some type declarations". It is
+"connect the port to its own abstraction" — make the real transports
+implement `Transport`, unify the types they exchange, and register them with
+the factory. That is the largest single item in this audit.
+
+### How widespread is this? Bounded — and mostly good news
+
+Running the §5 grep across every trait in the tranche (counting implementors
+outside `#[cfg(test)]` against implementors inside it):
+
+| Trait | Crate | Real impls | Test-only impls |
+|---|---|---|---|
+| `Transport` | ctp-lightbeam | **0** | 2 |
+| `EventManager` | ctp-lightbeam | **0** | 1 |
+| `BulkAllocator` | ctp-ds | **0** | 1 |
+| `Compressor` | ctp-compress | 11 | 0 |
+| `Distribution` | ctp-util | 5 | 0 |
+| `Coroutine` | ctp-coroutine | 2 | 0 |
+| `RegionSource` | ctp-memory | 2 | 0 |
+| `AsyncIo`, `ThreadModel`, `Aes256BlockCipher`, `RegexMatcher`, `RegexCompiler`, `RingLane` | various | 1 each | — |
+
+So the hollowness is **not** systemic. It is three abstractions, two of them
+in `ctp-lightbeam` and one in `ctp-ds`. Everything else — the compression
+backends, the coroutine executors, the thread models, the allocator region
+sources — has real implementors.
+
+That fits the §5 story rather than contradicting it. `Transport` and
+`EventManager` are precisely the two places where C++ puts a base class in
+one header and its derived classes in *other* headers, so they are what got
+split across agents. Traits whose implementors live in the same header as the
+trait (`Compressor`'s backends, `Distribution`'s variants) came through
+intact, because no split ran through them.
+
 ## 1. `ctp-lightbeam` declares the same C++ types three times
 
 C++ `clio_ctp/lightbeam/lightbeam.h` defines **one** `Bulk`, `LbmMeta`,
@@ -144,3 +211,27 @@ For the remaining work, shared types should be ported **first and once**, and
 the module agents made to import them. Where a C++ header is `#include`d by
 two others, that header is a contract, and it needs an owner before its
 consumers are parallelised.
+
+The sharper version, from §1a: **inheritance across headers did not survive
+the split.** Every place the C++ has a base class in one header and its
+derived classes in others, the port produced the base (with mock implementors
+beside it) and the deriveds (standing alone), and nothing joined them. The
+tests cannot catch it, because both halves are independently testable and the
+only test that would fail — a real implementation reached through the
+abstraction — spans exactly the boundary the agents were split along.
+
+So the test count was never evidence of integration. It measured what each
+agent could see. When resuming, the useful question about any ported
+abstraction is not "do its tests pass" but **"what non-test type implements
+it?"** — `grep` for `impl <Trait> for` and check whether the answers live
+outside `#[cfg(test)]`. That one grep is what turned this audit from
+"duplicated types" into "unimplemented abstraction".
+
+## 6. Status
+
+- [x] `FullPtr` → `ctp-memory` (commit `a77f2a9f`). One definition again.
+- [ ] §1a — real transports implement `Transport`; factory registers them.
+- [ ] §1 — one `Bulk`/`LbmMeta`/`ClientInfo`/`TransportType`.
+- [ ] §2 — archives out of `ctp-ds` into context-runtime.
+- [ ] §3 — triage `RingBufferEntry`, the GPU look-alikes.
+- [ ] Re-audit the other crates the same way (`impl … for` outside tests).
