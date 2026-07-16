@@ -1,3 +1,36 @@
+/*
+ * Copyright (c) 2024, Gnosis Research Center, Illinois Institute of Technology
+ * All rights reserved.
+ *
+ * This file is part of IOWarp Core.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice,
+ *    this list of conditions and the following disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * 3. Neither the name of the copyright holder nor the names of its
+ *    contributors may be used to endorse or promote products derived from
+ *    this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+
 //! C-ABI exports for calling CTE from non-Rust languages (e.g., TypeScript via Bun FFI).
 //!
 //! All functions use C-compatible types and return 0 on success, -1 on failure.
@@ -11,7 +44,7 @@ use std::panic::catch_unwind;
 use std::ptr;
 use std::slice;
 
-use crate::{Client, Tag};
+use crate::sync::Tag;
 
 /// Helper: convert a `*const c_char` to `&str`, returning `Err` on null or invalid UTF-8.
 unsafe fn cstr_to_str<'a>(p: *const c_char) -> Result<&'a str, ()> {
@@ -34,7 +67,7 @@ pub unsafe extern "C" fn cte_c_init(config: *const c_char) -> i32 {
         }
     };
     let path = path.to_owned();
-    match catch_unwind(move || crate::init(&path)) {
+    match catch_unwind(move || crate::sync::init(&path)) {
         Ok(Ok(_)) => 0,
         _ => -1,
     }
@@ -92,6 +125,10 @@ pub unsafe extern "C" fn cte_c_tag_put_blob(
         Err(_) => return -1,
     };
     let data = unsafe { slice::from_raw_parts(data, len as usize) };
+    // Validate score
+    if score < 0.0 || score > 1.0 {
+        return -1;
+    }
     // Tag is not UnwindSafe, so use AssertUnwindSafe
     let tag_ptr = std::panic::AssertUnwindSafe(tag_ref as *const Tag);
     let data_ptr = data.as_ptr();
@@ -100,20 +137,18 @@ pub unsafe extern "C" fn cte_c_tag_put_blob(
     match catch_unwind(move || {
         let tag = unsafe { &*tag_ptr.0 };
         let data = unsafe { slice::from_raw_parts(data_ptr, data_len) };
-        tag.put_blob_with_options(&name, data, offset, score);
+        tag.put_blob_with_options(&name, data, offset, score)
     }) {
-        Ok(_) => 0,
+        Ok(Ok(())) => 0,
+        Ok(Err(_)) => -1, // Validation error
         Err(_) => -1,
     }
 }
 
 /// Get the size of a blob in bytes.
-/// Returns 0 if the tag or name is invalid.
+/// Returns 0 if the tag or name is invalid or if validation fails.
 #[no_mangle]
-pub unsafe extern "C" fn cte_c_tag_get_blob_size(
-    tag: *mut c_void,
-    name: *const c_char,
-) -> u64 {
+pub unsafe extern "C" fn cte_c_tag_get_blob_size(tag: *mut c_void, name: *const c_char) -> u64 {
     if tag.is_null() {
         return 0;
     }
@@ -127,7 +162,8 @@ pub unsafe extern "C" fn cte_c_tag_get_blob_size(
         let tag = unsafe { &*tag_ptr.0 };
         tag.get_blob_size(&name)
     }) {
-        Ok(size) => size,
+        Ok(Ok(size)) => size,
+        Ok(Err(_)) => 0, // Validation error
         Err(_) => 0,
     }
 }
@@ -154,11 +190,16 @@ pub unsafe extern "C" fn cte_c_tag_get_blob(
     let buf_ptr = buf;
     match catch_unwind(move || {
         let tag = unsafe { &*tag_ptr.0 };
-        let data = tag.get_blob_with_offset(&name, size, offset);
-        let copy_len = std::cmp::min(data.len(), size as usize);
-        unsafe { ptr::copy_nonoverlapping(data.as_ptr(), buf_ptr, copy_len) };
+        match tag.get_blob(&name, size, offset) {
+            Ok(data) => {
+                let copy_len = std::cmp::min(data.len(), size as usize);
+                unsafe { ptr::copy_nonoverlapping(data.as_ptr(), buf_ptr, copy_len) };
+                0i32
+            }
+            Err(_) => -1i32, // Validation error
+        }
     }) {
-        Ok(_) => 0,
+        Ok(rc) => rc,
         Err(_) => -1,
     }
 }
@@ -206,33 +247,39 @@ pub unsafe extern "C" fn cte_c_tag_get_contained_blobs(
 
 /// Delete a tag by name.
 /// Returns 0 on success, -1 on failure.
+///
+/// NOTE: This function requires a Client instance to operate. Create a client first
+/// using cte_c_client_new() and use the client's del_tag method. This standalone
+/// function returns -1 (not implemented) for backward compatibility.
 #[no_mangle]
 pub unsafe extern "C" fn cte_c_del_tag(name: *const c_char) -> i32 {
-    let name = match unsafe { cstr_to_str(name) } {
-        Ok(s) => s.to_owned(),
+    // TODO: Implement properly by creating a Client instance and calling del_tag
+    // For now, return -1 to indicate this function is not implemented
+    // The sync::Client struct doesn't have a del_tag method - it needs to be added
+    let _name = match unsafe { cstr_to_str(name) } {
+        Ok(s) => s,
         Err(_) => return -1,
     };
-    match catch_unwind(move || Client::del_tag(&name)) {
-        Ok(true) => 0,
-        _ => -1,
-    }
+    -1 // Not implemented - use cte_c_client_del_tag instead
 }
 
 /// Register a file-backed storage target.
 /// Returns 0 on success, -1 on failure.
+///
+/// NOTE: This function requires a Client instance to operate. Create a client first
+/// using cte_c_client_new() and use the client's register_target method. This standalone
+/// function returns -1 (not implemented) for backward compatibility.
 #[no_mangle]
-pub unsafe extern "C" fn cte_c_register_target(
-    path: *const c_char,
-    size: u64,
-) -> i32 {
-    let path = match unsafe { cstr_to_str(path) } {
-        Ok(s) => s.to_owned(),
+pub unsafe extern "C" fn cte_c_register_target(path: *const c_char, size: u64) -> i32 {
+    // TODO: Implement properly by creating a Client instance and calling register_target
+    // For now, return -1 to indicate this function is not implemented
+    // The sync::Client struct doesn't have a register_target method - it needs to be added
+    let _path = match unsafe { cstr_to_str(path) } {
+        Ok(s) => s,
         Err(_) => return -1,
     };
-    match catch_unwind(move || Client::register_target(&path, size)) {
-        Ok(true) => 0,
-        _ => -1,
-    }
+    let _ = size;
+    -1 // Not implemented - use cte_c_client_register_target instead
 }
 
 /// Free a string previously allocated by CTE (e.g., from `cte_c_tag_get_contained_blobs`).
@@ -240,5 +287,46 @@ pub unsafe extern "C" fn cte_c_register_target(
 pub unsafe extern "C" fn cte_c_free_string(ptr: *mut c_char) {
     if !ptr.is_null() {
         drop(unsafe { CString::from_raw(ptr) });
+    }
+}
+
+/// Compute the frecency score via C++ (C-ABI).
+///
+/// Formula: score = 0.5 * 2^(-age/600) + 0.5 * (n/(n+10)), clamped to [0,1]
+///
+/// @param access_count      Number of data ops on the blob
+/// @param last_access_nanos Last access time (steady-clock ns)
+/// @param now_nanos         Current steady-clock time (ns)
+/// @return Score as f32 in [0, 1]
+#[no_mangle]
+pub extern "C" fn cte_c_frecency_compute_score(
+    access_count: u64,
+    last_access_nanos: u64,
+    now_nanos: u64,
+) -> f32 {
+    crate::sync::frecency_compute_score(access_count, last_access_nanos, now_nanos)
+}
+
+/// Trigger the CTE's internal DynamicReorganize task (C-ABI).
+///
+/// Delegates reorganization to the built-in data organizer (issue #738)
+/// instead of running a per-blob reorganization loop in Rust.
+///
+/// @param replica_id Which replica (0-based) to fire
+/// @param period_us  Period in microseconds for the periodic task
+/// @return 0 on success, non-zero on error
+#[no_mangle]
+pub extern "C" fn cte_c_dynamic_reorganize(replica_id: u32, period_us: f64) -> i32 {
+    match catch_unwind(move || {
+        match crate::sync::Client::new() {
+            Ok(client) => match client.dynamic_reorganize(replica_id, period_us) {
+                Ok(rc) => rc,
+                Err(_) => -1,
+            },
+            Err(_) => -2,
+        }
+    }) {
+        Ok(rc) => rc,
+        Err(_) => -3,
     }
 }
