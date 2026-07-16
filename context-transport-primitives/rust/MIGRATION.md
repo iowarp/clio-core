@@ -83,7 +83,7 @@ code should use the stackless backend.
 | 1 (this PR) | `introspect/SystemInfo`, core `types` | `ctp-introspect`, `ctp-types` | OS abstraction; proves FFI + build end-to-end |
 | 1 (this PR) | coroutine abstraction | `ctp-coroutine` | trait + async backend; boost backend feature-gated |
 | 2 | `util` (logging, config parse), `serialize` | | serde ecosystem |
-| 3 | `memory` (backends, allocators, smart_ptr) | | unsafe-heavy SHM core; needs careful parity tests + miri where possible |
+| 3 | `memory` (backends, allocators, smart_ptr) | `ctp-memory` | STARTED: MEMORY_DESIGN.md contract, SharedMemBackend (Win/POSIX), frozen ShmPtr ABI, registry, v1 free-list allocator, cross-process proof test. Remaining: buddy/slab/thread-local ports, GPU segments, C++ header regen |
 | 4 | `data_structures` (ipc ring buffers, priv maps) | | depends on 3 |
 | 5 | `lightbeam` (zmq/socket/shm transports) | | thallium stays C++ behind a wrapper crate; zmq via `zmq` crate or FFI to the vendored libzmq |
 | 6 | `thread` (CTP_THREAD_MODEL), `io`, `compress`, `search`, `solver` | | compress backends largely stay C/C++ libs behind FFI |

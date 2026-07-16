@@ -11,3 +11,4 @@ date,git_sha,crate,loc,unsafe_count,clippy_warnings,cold_build_s,warm_build_s,te
 2026-07-16,f739cfa1,ctp-introspect,462,27,0,0.51,0.39,5
 2026-07-16,f739cfa1,ctp-types,433,0,0,0.11,0.23,12
 2026-07-16,f739cfa1,ctp-util,3592,1,0,0.65,0.64,132
+2026-07-16,8aa53f2b,ctp-memory,1039,59,0,1.24,0.42,10

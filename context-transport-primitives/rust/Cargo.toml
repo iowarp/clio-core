@@ -5,6 +5,7 @@ members = [
     "ctp-introspect",
     "ctp-coroutine",
     "ctp-util",
+    "ctp-memory",
     "ctp-gpu",
     "ctp-ffi",
 ]
