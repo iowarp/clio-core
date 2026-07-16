@@ -219,9 +219,8 @@ void tag_get_blob(const Tag& tag, rust::Str name, uint64_t size,
                     static_cast<size_t>(size), static_cast<size_t>(offset));
   out.clear();
   out.reserve(buf.size());
-  for (auto b : buf) {
-    out.push_back(b);
-  }
+  std::memcpy(out.data(), buf.data(), buf.size());
+  out.truncate(buf.size());
 }
 
 /// Get all blob names contained in this tag.
@@ -262,61 +261,45 @@ int32_t client_poll_telemetry_raw(const Client& client, uint64_t min_time,
     return 2;
   }
 
-  out.clear();
-  out.reserve(task->entries_.size() * 52);
+  // PERFORMANCE: Use std::vector as intermediate buffer for memcpy serialization
+  // rust::Vec lacks resize(), so we serialize to std::vector first, then copy
+  const size_t kRecordSize = 52;
+  const size_t total_size = task->entries_.size() * kRecordSize;
+  std::vector<uint8_t> buf(total_size);
+  uint8_t* w = buf.data();
 
   for (const auto& entry : task->entries_) {
     // op (u32)
     uint32_t op = static_cast<uint32_t>(entry.op_);
-    out.push_back(static_cast<uint8_t>((op >> 0) & 0xFF));
-    out.push_back(static_cast<uint8_t>((op >> 8) & 0xFF));
-    out.push_back(static_cast<uint8_t>((op >> 16) & 0xFF));
-    out.push_back(static_cast<uint8_t>((op >> 24) & 0xFF));
+    std::memcpy(w, &op, 4); w += 4;
 
     // off (u64)
-    uint64_t off = entry.off_;
-    for (int i = 0; i < 8; ++i) {
-      out.push_back(static_cast<uint8_t>((off >> (i * 8)) & 0xFF));
-    }
+    std::memcpy(w, &entry.off_, 8); w += 8;
 
     // size (u64)
-    uint64_t sz = entry.size_;
-    for (int i = 0; i < 8; ++i) {
-      out.push_back(static_cast<uint8_t>((sz >> (i * 8)) & 0xFF));
-    }
+    std::memcpy(w, &entry.size_, 8); w += 8;
 
     // tag_major (u32)
-    uint32_t major = entry.tag_id_.major_;
-    out.push_back(static_cast<uint8_t>((major >> 0) & 0xFF));
-    out.push_back(static_cast<uint8_t>((major >> 8) & 0xFF));
-    out.push_back(static_cast<uint8_t>((major >> 16) & 0xFF));
-    out.push_back(static_cast<uint8_t>((major >> 24) & 0xFF));
+    std::memcpy(w, &entry.tag_id_.major_, 4); w += 4;
 
     // tag_minor (u32)
-    uint32_t minor = entry.tag_id_.minor_;
-    out.push_back(static_cast<uint8_t>((minor >> 0) & 0xFF));
-    out.push_back(static_cast<uint8_t>((minor >> 8) & 0xFF));
-    out.push_back(static_cast<uint8_t>((minor >> 16) & 0xFF));
-    out.push_back(static_cast<uint8_t>((minor >> 24) & 0xFF));
+    std::memcpy(w, &entry.tag_id_.minor_, 4); w += 4;
 
     // mod_time_nanos (u64) - Timestamp is now clio::run::u64 typedef
-    uint64_t mod_time = entry.mod_time_;
-    for (int i = 0; i < 8; ++i) {
-      out.push_back(static_cast<uint8_t>((mod_time >> (i * 8)) & 0xFF));
-    }
+    std::memcpy(w, &entry.mod_time_, 8); w += 8;
 
     // read_time_nanos (u64) - Timestamp is now clio::run::u64 typedef
-    uint64_t read_time = entry.read_time_;
-    for (int i = 0; i < 8; ++i) {
-      out.push_back(static_cast<uint8_t>((read_time >> (i * 8)) & 0xFF));
-    }
+    std::memcpy(w, &entry.read_time_, 8); w += 8;
 
     // logical_time (u64)
-    uint64_t logical = entry.logical_time_;
-    for (int i = 0; i < 8; ++i) {
-      out.push_back(static_cast<uint8_t>((logical >> (i * 8)) & 0xFF));
-    }
+    std::memcpy(w, &entry.logical_time_, 8); w += 8;
   }
+
+  // ONE bulk copy into the rust::Vec
+  out.clear();
+  out.reserve(buf.size());
+  std::memcpy(out.data(), buf.data(), buf.size());
+  out.truncate(buf.size());
 
   return 0;  // Success
 }
@@ -343,52 +326,45 @@ int32_t client_get_blob_info_raw(const Client& client, uint32_t major,
     return task->GetReturnCode();
   }
 
-  // PERFORMANCE: Pre-allocate exact size to avoid reallocations
-  const size_t total_size = 16 + task->blocks_.size() * 24;
-  out.clear();
-  out.reserve(total_size);
+  // PERFORMANCE: Serialize into std::vector first, then ONE bulk memcpy to rust::Vec
+  const size_t kHeaderSize = 16;
+  const size_t kBlockSize = 24;
+  const size_t buf_total_size = kHeaderSize + task->blocks_.size() * kBlockSize;
+  std::vector<uint8_t> buf(buf_total_size);
+  uint8_t* w = buf.data();
 
-  // Serialize score (f32) - use memcpy for performance
+  // score (f32) via uint32_t bits
   uint32_t score_bits;
   static_assert(sizeof(score_bits) == sizeof(task->score_), "Size mismatch");
   std::memcpy(&score_bits, &task->score_, sizeof(float));
-  for (int i = 0; i < 4; ++i) {
-    out.push_back(static_cast<uint8_t>((score_bits >> (i * 8)) & 0xFF));
-  }
+  std::memcpy(w, &score_bits, 4); w += 4;
 
-  // Serialize total_size (u64)
-  uint64_t total_size_val = task->total_size_;
-  for (int i = 0; i < 8; ++i) {
-    out.push_back(static_cast<uint8_t>((total_size_val >> (i * 8)) & 0xFF));
-  }
+  // total_size (u64)
+  std::memcpy(w, &task->total_size_, 8); w += 8;
 
-  // Serialize blocks_count (u32)
+  // blocks_count (u32)
   uint32_t blocks_count = static_cast<uint32_t>(task->blocks_.size());
-  for (int i = 0; i < 4; ++i) {
-    out.push_back(static_cast<uint8_t>((blocks_count >> (i * 8)) & 0xFF));
-  }
+  std::memcpy(w, &blocks_count, 4); w += 4;
 
-  // Serialize each block - direct field access for performance
+  // each block
   for (const auto& block : task->blocks_) {
-    // target_pool_id (u64)
+    // target_pool_id (u64) - PoolId is a class, convert to u64 first
     uint64_t pool_id =
         block.target_pool_id_.IsNull() ? 0 : block.target_pool_id_.ToU64();
-    for (int i = 0; i < 8; ++i) {
-      out.push_back(static_cast<uint8_t>((pool_id >> (i * 8)) & 0xFF));
-    }
+    std::memcpy(w, &pool_id, 8); w += 8;
 
     // block_size (u64)
-    uint64_t block_size = block.block_size_;
-    for (int i = 0; i < 8; ++i) {
-      out.push_back(static_cast<uint8_t>((block_size >> (i * 8)) & 0xFF));
-    }
+    std::memcpy(w, &block.block_size_, 8); w += 8;
 
     // block_offset (u64)
-    uint64_t block_offset = block.block_offset_;
-    for (int i = 0; i < 8; ++i) {
-      out.push_back(static_cast<uint8_t>((block_offset >> (i * 8)) & 0xFF));
-    }
+    std::memcpy(w, &block.block_offset_, 8); w += 8;
   }
+
+  // ONE bulk copy into the rust::Vec
+  out.clear();
+  out.reserve(buf.size());
+  std::memcpy(out.data(), buf.data(), buf.size());
+  out.truncate(buf.size());
 
   return 0;
 }
