@@ -4,10 +4,17 @@
 //! The context-runtime core POD types — the first layer of the task ABI
 //! (see `context-runtime/rust/TASK_ABI.md`).
 //!
-//! Every type here is `#[repr(C)]`, POD, and frozen: they appear inside
-//! shared-memory task records and in serialized archives, so their layout
-//! and their *behavior* (routing decisions, null semantics, string forms)
-//! are a contract with the C++ side, not an implementation detail.
+//! Every type here is `#[repr(C)]`, POD, and frozen: they appear in
+//! serialized task archives and the WAL, so their layout and their
+//! *behavior* (routing decisions, null semantics, string forms) are a
+//! contract with the C++ side, not an implementation detail.
+//!
+//! Note that tasks themselves are **not** stored in shared memory: they are
+//! allocated privately and serialized into a buffer which is then copied
+//! through shared memory. So what freezes these types is the archive and the
+//! WAL — data at rest and in flight — not a live cross-process object.
+//! `#[repr(C)]` is kept regardless: it costs nothing, keeps these diffable
+//! against the C++, and the GPU path does memcpy task bytes wholesale.
 //!
 //! # C++ → Rust mapping
 //!

@@ -29,13 +29,20 @@ both sides are Rust. The rest falls out:
 | 6 | promote the `TASK_DATA_OWNER` conditional free to a spec clause | ownership. An owning field frees; a borrowing one does not |
 | 7 | Pattern A / Pattern B adoption routes | there is nothing to adopt *from* until bindings return |
 
-The §2 hazard that motivated the split — a task record in shared memory
-carrying a vptr and a `unique_ptr` that are garbage in any other process —
-is real and still worth fixing. It is a *shared-memory* bug, not a
-cross-language one, and it is fixed the same way regardless: execution state
-is process-local and must never ride in a shared record. `RunContext` being
-un-copied and un-serialized (enforced here by living behind `TaskBase`'s
-accessors, not by an annotation macro) is that fix.
+§2 also claimed a second motivation for the split — that a task record in
+shared memory carries a vptr and a `unique_ptr` which are garbage to every
+other process. **That hazard does not exist**, and §2 now carries the
+correction: tasks live in private memory, and cross a boundary by being
+*serialized into a buffer that is copied through* shared memory. A live task
+object is never placed in a shared segment, so there is nothing there to
+misinterpret. Cross-language interop was the only real motivation, and it is
+deferred.
+
+What survives from that discussion is smaller but still true: execution
+state is process-local and must not be serialized. Both implementations
+already honor it — C++ omits `run_ctx_` from the archive, and this port
+keeps `RunContext` behind `TaskBase`'s accessors so a task that is not
+executing simply has none.
 
 **What still stands**, unaffected by the pivot, because it concerns data at
 rest and on the wire rather than object layout:
@@ -82,15 +89,34 @@ Reading `task.h`, the fields fall into two disjoint groups:
 | **Task record** | `pool_id_`, `task_id_`, `pool_query_`, `method_`, `task_flags_`, `period_ns_`, `task_group_`, `return_code_`, `completer_`, `fut_.{is_complete_, task_size_, waiter_pid_, waiter_tid_}` | ✅ POD, meaningful in any process |
 | **Execution state** | `run_ctx_` (a `unique_ptr` to process-local heap!), `coro_handle_`/`fiber_state_`, `worker_id_`, `container_` (`DynamicContainer`), `is_new_data_` | ❌ process-local; a pointer into *this* process's heap |
 
-The second group is already meaningless in another process — today's C++ SHM
-tasks carry it across the boundary anyway and simply never touch it there
-(a latent hazard: a task record in SHM contains a `unique_ptr` and a vptr
-that are garbage to every other process).
+The second group is meaningless in another process.
+
+> **Correction (2026-07-16).** This section originally went on to claim that
+> "today's C++ SHM tasks carry it across the boundary anyway and simply never
+> touch it there", making a task record in shared memory a latent hazard: a
+> live `unique_ptr` and vptr that are garbage to every other process. **That
+> is not how tasks travel, and no such hazard exists.**
+>
+> Tasks are allocated in *private* memory with ordinary `new`/`delete` —
+> `task.h` says so in the `class Task` comment ("Tasks are now allocated in
+> private memory"; the "now" is why this doc's claim was plausible, and it
+> describes a design that is gone). To cross a process boundary a task is
+> **serialized into an archive buffer, and the buffer is copied through
+> shared memory** — see `ipc_cpu2cpu.cc`, which builds a `SaveTaskArchive`,
+> fills it via `container->SaveTask(method, ...)`, and sends it over a
+> `ShmMpscTransport`. Serialization writes named fields, so `run_ctx_`, the
+> vptr and the rest of group 2 are simply never written. The GPU POD path
+> memcpy's task bytes D2H/H2D, which is likewise a *copy*, not shared storage.
+>
+> The distinction matters beyond pedantry: "a live C++ object sits in a
+> shared segment" and "a serialized snapshot is copied through a shared
+> segment" have different failure modes, and only the first needs a frozen
+> layout to be safe at all. The split below is therefore motivated **solely**
+> by cross-language interop — which §0 has since deferred.
 
 **The split is the design.** `TaskPodBase` is group 1 only. Group 2 moves to
 a **process-local side table** in the runtime, keyed by task id. This is
-what makes tasks language-neutral, and it removes the vptr/`unique_ptr`-in-
-shared-memory hazard as a side effect.
+what makes tasks language-neutral.
 
 ## 3. Frozen layout: `TaskPodBase`
 
