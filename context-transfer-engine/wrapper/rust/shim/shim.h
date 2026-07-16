@@ -146,3 +146,80 @@ float cte_frecency_compute_score(uint64_t access_count,
                                  uint64_t now_nanos);
 
 }  // namespace cte_ffi
+
+// ---- Zero-copy SHM buffer C-ABI (parallel to the cxx bridge above) ----
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/**
+ * FFI-safe SHM buffer handle, bit-identical to ctp::ipc::ShmPtr<char>
+ * (ShmPtrBase<char, false>) layout: {AllocatorId {u32,u32}, OffsetPtr {u64}}.
+ * 16 bytes. Passed across the Rust<->C++ boundary as the zero-copy buffer
+ * handle. Rust mirrors this as #[repr(C)] CteShmHandle.
+ *
+ * NEVER construct this manually on the Rust side — always obtain it from
+ * cte_alloc_shm_buffer, and release it with cte_free_shm_buffer. The
+ * alloc_id + off pair is meaningless without the IpcManager allocator map.
+ */
+struct CteShmHandle {
+  uint32_t alloc_id_major;  ///< AllocatorId.major_ (e.g. PID)
+  uint32_t alloc_id_minor;  ///< AllocatorId.minor_
+  uint64_t off;             ///< Offset within the allocator's region
+};
+static_assert(sizeof(CteShmHandle) == 16,
+              "CteShmHandle must be 16 bytes to match ShmPtr<char>");
+
+/**
+ * Opaque handle to a C++ clio::run::Future<...> (PutBlob/GetBlob task future).
+ * Rust treats this as *mut c_void. The C++ side wraps the concrete Future in
+ * a type-erased holder (CteFutureInner) so the C-ABI can wait/destroy it
+ * without templating the boundary.
+ */
+typedef void *CteFutureHandle;
+
+/**
+ * Allocate a shared-memory buffer of `bytes` bytes.
+ * @param bytes Size to allocate
+ * @param out_ptr Set to a writable raw pointer into the SHM segment (the
+ *        pointer the CTE runtime will read from). Set to nullptr on failure.
+ * @return A CteShmHandle identifying the buffer (use cte_free_shm_buffer to
+ *         release). A null handle (alloc_id_major==0 && alloc_id_minor==0 &&
+ *         off==0) means allocation failed.
+ */
+CteShmHandle cte_alloc_shm_buffer(uint64_t bytes, uint8_t **out_ptr);
+
+/**
+ * Free a SHM buffer obtained from cte_alloc_shm_buffer.
+ * No-op on a null handle (off==0 && alloc_id all zero). After this call the
+ * handle is invalid and must not be reused — the runtime must have completed
+ * any AsyncPutBlob/AsyncGetBlob using it (call cte_future_wait first).
+ */
+void cte_free_shm_buffer(CteShmHandle handle);
+
+/**
+ * Resolve a CteShmHandle back to a raw pointer (e.g. to read data the runtime
+ * wrote into a get_blob buffer). Returns nullptr if the handle is null or
+ * unresolvable.
+ */
+uint8_t *cte_shm_handle_to_ptr(CteShmHandle handle);
+
+/**
+ * Block until the future completes or timeout elapses.
+ * @param future The opaque future handle from cte_tag_async_put_shm/get_shm
+ * @param timeout_sec Max seconds to wait (<=0 = wait forever)
+ * @param out_rc Set to the task's return code on completion (0 = success)
+ * @return 0 on completion, 1 on timeout, negative on error
+ */
+int32_t cte_future_wait(CteFutureHandle future, float timeout_sec,
+                        int32_t *out_rc);
+
+/**
+ * Destroy a future handle (releases the C++ Future wrapper). No-op on null.
+ */
+void cte_future_destroy(CteFutureHandle future);
+
+#ifdef __cplusplus
+}
+#endif

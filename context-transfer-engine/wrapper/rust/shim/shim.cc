@@ -37,6 +37,7 @@
 #include <clio_cte/core/core_client.h>
 #include <clio_cte/core/data_organizer/frecency_organizer.h>
 #include <clio_cte/core/data_organizer/data_organizer.h>
+#include <clio_runtime/ipc_manager.h>
 
 #include <cstring>
 
@@ -405,3 +406,106 @@ float cte_frecency_compute_score(uint64_t access_count,
 }
 
 }  // namespace cte_ffi
+
+// ---- Zero-copy SHM buffer C-ABI implementations ----
+
+namespace {
+/// Type-erased future wrapper so the C-ABI can wait/destroy a concrete
+/// clio::run::Future<PutBlobTask> or Future<GetBlobTask> without templating
+/// the boundary. Each cte_tag_async_*_shm allocates one of these and returns
+/// it as CteFutureHandle; cte_future_wait/destroy cast back and dispatch.
+struct CteFutureInner {
+  /// Wait for completion. Returns 0 on completion, 1 timeout, <0 error.
+  int32_t (*wait_fn)(void *future, float timeout_sec, int32_t *out_rc);
+  /// Destroy the future (called from cte_future_destroy).
+  void (*destroy_fn)(void *future);
+  /// The concrete Future<...> pointer (owned).
+  void *future;
+};
+}  // namespace
+
+/**
+ * Allocate a shared-memory buffer of `bytes` bytes.
+ * @param bytes Size to allocate
+ * @param out_ptr Set to a writable raw pointer into the SHM segment (the
+ *        pointer the CTE runtime will read from). Set to nullptr on failure.
+ * @return A CteShmHandle identifying the buffer (use cte_free_shm_buffer to
+ *         release). A null handle (alloc_id_major==0 && alloc_id_minor==0 &&
+ *         off==0) means allocation failed.
+ */
+CteShmHandle cte_alloc_shm_buffer(uint64_t bytes, uint8_t **out_ptr) {
+  if (out_ptr) *out_ptr = nullptr;
+  auto *ipc = CLIO_IPC;
+  if (ipc == nullptr) return CteShmHandle{0, 0, 0};
+  ctp::ipc::FullPtr<char> buf = ipc->AllocateBuffer(static_cast<size_t>(bytes));
+  if (buf.IsNull()) return CteShmHandle{0, 0, 0};
+  if (out_ptr) *out_ptr = reinterpret_cast<uint8_t *>(buf.ptr_);
+  // Extract the ShmPtr from the FullPtr: FullPtr has a .shm_ member (ShmPtr<char>)
+  CteShmHandle handle;
+  handle.alloc_id_major = buf.shm_.alloc_id_.major_;
+  handle.alloc_id_minor = buf.shm_.alloc_id_.minor_;
+  handle.off = buf.shm_.off_.load();
+  return handle;
+}
+
+/**
+ * Free a SHM buffer obtained from cte_alloc_shm_buffer.
+ * No-op on a null handle (off==0 && alloc_id all zero). After this call the
+ * handle is invalid and must not be reused — the runtime must have completed
+ * any AsyncPutBlob/AsyncGetBlob using it (call cte_future_wait first).
+ */
+void cte_free_shm_buffer(CteShmHandle handle) {
+  if (handle.off == 0 && handle.alloc_id_major == 0 && handle.alloc_id_minor == 0) {
+    return;  // null handle, no-op
+  }
+  auto *ipc = CLIO_IPC;
+  if (ipc == nullptr) return;
+  // Reconstruct a ShmPtr<char> from the handle and free it
+  ctp::ipc::ShmPtr<char> shm_ptr;
+  shm_ptr.alloc_id_ = ctp::ipc::AllocatorId(handle.alloc_id_major, handle.alloc_id_minor);
+  shm_ptr.off_ = static_cast<size_t>(handle.off);
+  ipc->FreeBuffer(shm_ptr);  // the ShmPtr overload (ipc_manager.h:456) converts via ToFullPtr
+}
+
+/**
+ * Resolve a CteShmHandle back to a raw pointer (e.g. to read data the runtime
+ * wrote into a get_blob buffer). Returns nullptr if the handle is null or
+ * unresolvable.
+ */
+uint8_t *cte_shm_handle_to_ptr(CteShmHandle handle) {
+  if (handle.off == 0 && handle.alloc_id_major == 0 && handle.alloc_id_minor == 0) {
+    return nullptr;
+  }
+  auto *ipc = CLIO_IPC;
+  if (ipc == nullptr) return nullptr;
+  ctp::ipc::ShmPtr<char> shm_ptr;
+  shm_ptr.alloc_id_ = ctp::ipc::AllocatorId(handle.alloc_id_major, handle.alloc_id_minor);
+  shm_ptr.off_ = static_cast<size_t>(handle.off);
+  ctp::ipc::FullPtr<char> full = ipc->ToFullPtr<char>(shm_ptr);
+  if (full.IsNull()) return nullptr;
+  return reinterpret_cast<uint8_t *>(full.ptr_);
+}
+
+/**
+ * Block until the future completes or timeout elapses.
+ * @param future The opaque future handle from cte_tag_async_put_shm/get_shm
+ * @param timeout_sec Max seconds to wait (<=0 = wait forever)
+ * @param out_rc Set to the task's return code on completion (0 = success)
+ * @return 0 on completion, 1 on timeout, negative on error
+ */
+int32_t cte_future_wait(CteFutureHandle future, float timeout_sec, int32_t *out_rc) {
+  if (out_rc) *out_rc = 0;
+  if (future == nullptr) return -1;
+  auto *inner = static_cast<CteFutureInner *>(future);
+  return inner->wait_fn(inner->future, timeout_sec, out_rc);
+}
+
+/**
+ * Destroy a future handle (releases the C++ Future wrapper). No-op on null.
+ */
+void cte_future_destroy(CteFutureHandle future) {
+  if (future == nullptr) return;
+  auto *inner = static_cast<CteFutureInner *>(future);
+  inner->destroy_fn(inner->future);
+  delete inner;
+}

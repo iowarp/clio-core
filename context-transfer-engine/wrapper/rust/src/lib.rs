@@ -93,6 +93,7 @@ pub mod frecency_engine;
 pub mod reorg_batch;
 pub mod types;
 pub mod tier_tracker;
+pub mod zerocopy;
 
 // Feature-gated API modules
 #[cfg(feature = "async")]

@@ -116,6 +116,13 @@ pub enum CteError {
         feature: String,
         reason: String,
     },
+
+    /// SHM buffer allocation failed (IpcManager::AllocateBuffer returned null —
+    /// the SHM segment may be exhausted).
+    ShmAllocFailed,
+
+    /// A null SHM handle was passed to an operation that requires a valid buffer.
+    ShmNullHandle,
 }
 
 impl Clone for CteError {
@@ -164,6 +171,8 @@ impl Clone for CteError {
                 feature: feature.clone(),
                 reason: reason.clone(),
             },
+            CteError::ShmAllocFailed => CteError::ShmAllocFailed,
+            CteError::ShmNullHandle => CteError::ShmNullHandle,
         }
     }
 }
@@ -218,6 +227,12 @@ impl fmt::Display for CteError {
             }
             CteError::NotImplemented { feature, reason } => {
                 write!(f, "Feature not implemented: {} - {}", feature, reason)
+            }
+            CteError::ShmAllocFailed => {
+                write!(f, "SHM buffer allocation failed")
+            }
+            CteError::ShmNullHandle => {
+                write!(f, "null SHM handle")
             }
         }
     }

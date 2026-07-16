@@ -330,3 +330,64 @@ pub extern "C" fn cte_c_dynamic_reorganize(replica_id: u32, period_us: f64) -> i
         Err(_) => -3,
     }
 }
+
+// ---- Zero-copy SHM buffer C-ABI (links to shim.cc extern "C" fns) ----
+
+/// FFI-safe SHM buffer handle, bit-identical to the C++ `ctp::ipc::ShmPtr<char>`
+/// layout `{AllocatorId {u32,u32}, OffsetPtr {u64}}` = 16 bytes.
+///
+/// NEVER construct this manually — obtain it from `ShmBuffer::alloc` (which
+/// calls `cte_alloc_shm_buffer`) and let `ShmBuffer`'s `Drop` release it via
+/// `cte_free_shm_buffer`. The `alloc_id` + `off` pair is meaningless without
+/// the C++ IpcManager allocator map.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CteShmHandle {
+    pub alloc_id_major: u32,
+    pub alloc_id_minor: u32,
+    pub off: u64,
+}
+
+impl CteShmHandle {
+    /// The null handle (allocation failed or uninitialized).
+    pub const fn null() -> Self {
+        Self {
+            alloc_id_major: 0,
+            alloc_id_minor: 0,
+            off: 0,
+        }
+    }
+
+    /// True if this is the null handle.
+    pub fn is_null(&self) -> bool {
+        self.off == 0 && self.alloc_id_major == 0 && self.alloc_id_minor == 0
+    }
+}
+
+/// Opaque handle to a C++ `Future<PutBlobTask>` / `Future<GetBlobTask>`.
+/// The C++ side wraps the concrete Future in a type-erased `CteFutureInner`.
+pub type CteFutureHandle = *mut std::ffi::c_void;
+
+extern "C" {
+    /// Allocate a SHM buffer of `bytes` bytes.
+    /// On success sets `*out_ptr` to a writable raw pointer into the SHM segment
+    /// and returns a valid `CteShmHandle`. On failure returns the null handle
+    /// and sets `*out_ptr` to null.
+    pub fn cte_alloc_shm_buffer(bytes: u64, out_ptr: *mut *mut u8) -> CteShmHandle;
+
+    /// Free a SHM buffer. No-op on a null handle. The runtime must have
+    /// completed any async op using it (call `cte_future_wait` first).
+    pub fn cte_free_shm_buffer(handle: CteShmHandle);
+
+    /// Resolve a handle to a raw pointer (e.g. to read data the runtime wrote).
+    /// Returns null on a null/unresolvable handle.
+    pub fn cte_shm_handle_to_ptr(handle: CteShmHandle) -> *mut u8;
+
+    /// Block until the future completes or `timeout_sec` elapses.
+    /// Sets `*out_rc` to the task return code (0 = success). Returns 0 on
+    /// completion, 1 on timeout, negative on error.
+    pub fn cte_future_wait(future: CteFutureHandle, timeout_sec: f32, out_rc: *mut i32) -> i32;
+
+    /// Destroy a future handle. No-op on null.
+    pub fn cte_future_destroy(future: CteFutureHandle);
+}
