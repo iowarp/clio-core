@@ -207,7 +207,9 @@ use std::os::unix::net::{UnixListener, UnixStream};
 #[cfg(windows)]
 use std::os::windows::io::AsRawSocket;
 
+use crate::transport::{EventManager, TransportCtor, TransportFactory, TransportParams, TransportPtr};
 use ctp_memory::ShmPtr;
+use std::sync::Arc;
 use ctp_types::bit_opt;
 
 // ---------------------------------------------------------------------------
@@ -284,30 +286,14 @@ pub use crate::transport::{Bulk, FullPtr, RECV_ALLOCATED_ID};
 pub use crate::transport::{ClientInfo, LbmMeta};
 use crate::transport::{alloc_recv_buffer, bulk_bytes, free_recv_buffer};
 
-/// `ctp::lbm::LbmContext`. Ignored by the socket backend (divergence 16).
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct LbmContext {
-    /// Combination of `LBM_*` flags.
-    pub flags: u32,
-    /// Timeout in **milliseconds** (0 = no timeout).
-    pub timeout_ms: i32,
-}
-
-impl LbmContext {
-    pub const fn new(flags: u32, timeout_ms: i32) -> Self {
-        Self { flags, timeout_ms }
-    }
-
-    /// `IsSync()`.
-    pub const fn is_sync(&self) -> bool {
-        (self.flags & LBM_SYNC) != 0
-    }
-
-    /// `HasTimeout()`.
-    pub const fn has_timeout(&self) -> bool {
-        self.timeout_ms > 0
-    }
-}
+/// `ctp::lbm::LbmContext` — from [`crate::transport`] (`lightbeam.h`), which
+/// declares it once.
+///
+/// This module used to declare a two-field subset (`flags`, `timeout_ms`) —
+/// everything the socket backend reads (divergence 16). The canonical type is
+/// a superset, so the extra fields are simply ignored here, as they are in the
+/// C++. Note it is not `Copy`: it carries an `Arc<dyn EventManager>`.
+pub use crate::transport::LbmContext;
 
 /// `ctp::lbm::EventTrigger`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1352,9 +1338,95 @@ impl Drop for SocketTransport {
 // Tests
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Transport (lightbeam.h's polymorphic surface)
+
+/// Build a [`SocketTransport`] from factory params (a [`TransportCtor`]).
+///
+/// Returns `None` when construction fails — the factory's contract, and what
+/// the C++ `TransportFactory::Get` reports by returning a null `TransportPtr`.
+pub fn transport_ctor(p: &TransportParams) -> Option<TransportPtr> {
+    SocketTransport::new(p.mode, &p.addr, &p.protocol, p.port)
+        .ok()
+        .map(|t| Box::new(t) as TransportPtr)
+}
+
+/// Register this backend with [`TransportFactory`] under
+/// [`TransportType::Socket`].
+///
+/// C++ compiles its backends into the factory's `switch` behind
+/// `#if CTP_ENABLE_*`; this port uses a runtime registry instead (divergence
+/// 9), which means somebody has to actually register — and until now nobody
+/// did outside tests, so `TransportFactory::get(Socket, …)` always returned
+/// `None`. See [`crate::register_builtin_transports`].
+pub fn register() -> Option<TransportCtor> {
+    TransportFactory::register(TransportType::Socket, transport_ctor)
+}
+// ---------------------------------------------------------------------------
+
+impl crate::transport::Transport for SocketTransport {
+    fn transport_type(&self) -> TransportType {
+        self.type_
+    }
+
+    fn mode(&self) -> TransportMode {
+        self.mode_
+    }
+
+    fn expose(&mut self, ptr: FullPtr, data_size: usize, flags: u32) -> Bulk {
+        SocketTransport::expose(self, ptr, data_size, flags)
+    }
+
+    fn send(&mut self, meta: &mut LbmMeta, ctx: &LbmContext) -> i32 {
+        // The inherent `send` only reads `meta`; the trait takes `&mut` because
+        // other backends rewrite descriptors in place.
+        SocketTransport::send(self, meta, ctx)
+    }
+
+    fn recv(&mut self, meta: &mut LbmMeta, ctx: &LbmContext) -> ClientInfo {
+        SocketTransport::recv(self, meta, ctx)
+    }
+
+    fn address(&self) -> String {
+        SocketTransport::get_address(self).to_string()
+    }
+
+    fn clear_recv_handles(&mut self, meta: &mut LbmMeta) {
+        SocketTransport::clear_recv_handles(self, meta);
+    }
+
+    fn register_event_manager(&mut self, em: Arc<dyn EventManager>) {
+        // C++ `RegisterEventManager(EventManager&)` hands the transport the
+        // manager and it adds its fds to it. This port inverts that: the
+        // transport records which fds *want* registration
+        // (`event_registrations()`) and the caller drives the manager. So the
+        // handle is not retained — the registration still happens, the
+        // ownership just points the other way.
+        let _ = em;
+        SocketTransport::register_event_manager(self);
+    }
+
+    fn unregister_event_manager(&mut self) {
+        SocketTransport::unregister_event_manager(self);
+    }
+
+    fn bound_port(&self) -> i32 {
+        // C++ `GetBoundPort()` returns int; the OS port space is u16.
+        i32::from(SocketTransport::bound_port(self))
+    }
+
+    fn is_server_alive(&self, ctx: &LbmContext) -> bool {
+        SocketTransport::is_server_alive(self, ctx)
+    }
+
+    // poll_recv: the default 0 is correct here. C++ only overrides it for ZMQ
+    // (zmq_poll); every other backend blocks through the EventManager.
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::Transport;
     use ctp_memory::AllocatorId;
 
     const LOCALHOST: &str = "127.0.0.1";
@@ -2197,11 +2269,11 @@ mod tests {
         let c = LbmContext::default();
         assert!(!c.is_sync());
         assert!(!c.has_timeout());
-        let c = LbmContext::new(LBM_SYNC, 250);
+        let c = LbmContext::with_timeout(LBM_SYNC, 250);
         assert!(c.is_sync());
         assert!(c.has_timeout(), "250 ms is a timeout");
-        assert!(!LbmContext::new(0, 0).has_timeout());
-        assert!(!LbmContext::new(0, -1).has_timeout());
+        assert!(!LbmContext::with_timeout(0, 0).has_timeout());
+        assert!(!LbmContext::with_timeout(0, -1).has_timeout());
     }
 
     #[test]
@@ -2269,5 +2341,85 @@ mod tests {
             matches!(r, Err(SocketTransportError::UnsupportedProtocol(_))),
             "windows: std has no AF_UNIX (divergence 11)"
         );
+    }
+
+    #[test]
+    fn socket_transport_is_reachable_through_the_transport_trait() {
+        // The audit's §1a: this trait had no non-test implementor, so a real
+        // transport could never be reached through it. A dyn round trip is the
+        // test that would have caught that, and the one nobody wrote.
+        let mut server = server_on_ephemeral_port();
+        let mut client = client_to(server.bound_port());
+
+        let payload = b"through the trait";
+        let bulk = xfer(payload);
+
+        {
+            let c: &mut dyn Transport = &mut client;
+            assert_eq!(c.transport_type(), TransportType::Socket);
+            assert_eq!(c.mode(), TransportMode::Client);
+            assert!(c.is_client() && !c.is_server());
+            // Defaults the socket backend inherits rather than overrides.
+            assert_eq!(c.poll_recv(0), 0, "non-ZMQ blocks via the EventManager");
+
+            let mut out = LbmMeta::default();
+            out.send.push(c.expose(bulk.data, payload.len(), BULK_XFER));
+            out.send_bulks = 1;
+            assert_eq!(c.send(&mut out, &LbmContext::default()), 0);
+        }
+
+        let s: &mut dyn Transport = &mut server;
+        assert_eq!(s.mode(), TransportMode::Server);
+        assert!(s.bound_port() > 0, "server resolves its ephemeral port");
+
+        let mut got = LbmMeta::default();
+        let mut info = ClientInfo::default();
+        let deadline = Instant::now() + Duration::from_millis(5_000);
+        while Instant::now() < deadline {
+            info = s.recv(&mut got, &LbmContext::default());
+            if info.rc != EAGAIN {
+                break;
+            }
+        }
+        assert_eq!(info.rc, 0);
+        assert_eq!(bytes(&got.recv[0]), payload);
+
+        // And the release path works through the trait too.
+        s.clear_recv_handles(&mut got);
+        assert!(is_empty(&got.recv[0]));
+    }
+
+    #[test]
+    fn the_factory_can_build_a_real_socket_transport() {
+        // Before this, every TransportFactory::register call in the crate was
+        // inside a #[cfg(test)] block registering a mock, so
+        // TransportFactory::get(Socket, ..) returned None at runtime — the
+        // registry had no real backend and could not have had one, since no
+        // real transport implemented the trait it stores (PORT_AUDIT §1a).
+        crate::register_builtin_transports();
+        assert!(TransportFactory::is_registered(TransportType::Socket));
+
+        // A server on an ephemeral port, reached only through the factory.
+        let t = TransportFactory::get(
+            "127.0.0.1",
+            TransportType::Socket,
+            TransportMode::Server,
+            "tcp",
+            0,
+        );
+        let t = t.expect("the factory must now produce a real socket transport");
+        assert_eq!(t.transport_type(), TransportType::Socket);
+        assert_eq!(t.mode(), TransportMode::Server);
+        assert!(t.bound_port() > 0, "port 0 resolves to a real bound port");
+
+        // Failure still surfaces as None, per the factory's contract.
+        assert!(TransportFactory::get(
+            "127.0.0.1",
+            TransportType::Socket,
+            TransportMode::Client,
+            "tcp",
+            1, // nothing is listening on port 1
+        )
+        .is_none());
     }
 }

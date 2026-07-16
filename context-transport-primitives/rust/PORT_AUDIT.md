@@ -368,7 +368,13 @@ outside `#[cfg(test)]`. That one grep is what turned this audit from
 - [x] `Bulk` unified across both transports (`4cc5881f`, this commit).
       Lightbeam has exactly one; five declarations are down to three
       (`ctp-ds`'s, which §2 removes, and `ctp-net`'s thallium-local one).
-- [ ] §1a — real transports implement `Transport`; factory registers them.
+- [~] §1a — `SocketTransport` implements `Transport` and
+      `register_builtin_transports()` registers it, so
+      `TransportFactory::get(Socket, …)` returns a real backend. `Transport`
+      has its first non-test implementor. `ShmTransport` still does not — its
+      `LbmContext` carries a typed `ring: Option<ShmRing>` where the canonical
+      one has opaque `copy_space`/`shm_info` handles (C++ `char*` +
+      `ShmTransferInfo*`), and that wants deciding rather than papering over.
 - [x] `ClientInfo`/`LbmMeta`/`SocketId` unified (`this commit`). §1 is done:
       every shared lightbeam type is declared once, in `transport.rs`, and
       `use crate::` across the crate went 0 → 12.
