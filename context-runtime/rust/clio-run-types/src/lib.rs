@@ -171,18 +171,39 @@ impl TaskId {
 // Task flags (TASK_* bits)
 // ---------------------------------------------------------------------------
 
-/// Task property bits (C++ `TASK_*`, stored in `task_flags_`).
+/// Task property bits (C++ `TASK_*` in `types.h`, stored in `task_flags_`).
 ///
 /// These are **append-only** wire values: they travel in serialized task
 /// archives (TASK_ABI.md §4 rationale applies equally here).
+///
+/// **Bit numbers, not an ordinal sequence.** Several bits are retired but
+/// stay reserved so persisted and in-flight flag words keep their meaning —
+/// the C++ header is explicit about this. Densely repacking these to close
+/// the gaps would make a Rust `DATA_OWNER` read as a C++ `TASK_ROUTED`, and
+/// a Rust `REMOTE` read as a C++ `TASK_DATA_OWNER` — i.e. silently freeing
+/// a buffer the task does not own. Mirror the C++ numbering exactly.
 pub mod task_flags {
     /// The task repeats on a period (`period_ns`).
     pub const PERIODIC: u32 = 1 << 0;
+    // Bit 1 retired: TASK_ROUTED — now execution-local `RunContext::routed_`.
     /// This task instance owns its data buffer and must free it at teardown
     /// (the conditional-free rule; TASK_ABI.md §6).
-    pub const DATA_OWNER: u32 = 1 << 1;
+    pub const DATA_OWNER: u32 = 1 << 2;
     /// The task executes on a remote node.
-    pub const REMOTE: u32 = 1 << 2;
+    pub const REMOTE: u32 = 1 << 3;
+    // Bit 4 retired: TASK_FORCE_NET — superseded by the CLIO_FORCE_NET env var.
+    // Bit 5 retired: TASK_STARTED — now `RunContext::started_`.
+    // Bit 6 retired: TASK_RUN_CTX_EXISTS — RunContext is allocated exactly once.
+    /// The task needs no response: waits return instantly and the send-out
+    /// paths are skipped.
+    pub const FIRE_AND_FORGET: u32 = 1 << 7;
+    /// `ManyToOne`: the synthetic aggregate task the neighborhood leader runs
+    /// for a batch; its OUT is broadcast back to the batched originals.
+    pub const BATCH_AGGREGATE: u32 = 1 << 8;
+    /// The task ingressed from an external user client. Serialized so it
+    /// rides a remote hop to the container owner, which enforces per-RPC
+    /// access control against it.
+    pub const EXTERNAL_CLIENT: u32 = 1 << 9;
 }
 
 // ---------------------------------------------------------------------------
@@ -223,6 +244,12 @@ pub enum RoutingMode {
 /// Container identity within a pool (C++ `ContainerId`, a `u32` alias).
 pub type ContainerId = u32;
 
+/// "No container specified" (C++ `kInvalidContainerId`, `ContainerId(-1)`).
+///
+/// This is the *default* container id, not `0` — `0` is a perfectly valid
+/// container. See [`PoolQuery::has_container_id`].
+pub const INVALID_CONTAINER_ID: ContainerId = u32::MAX;
+
 /// Where and how a task should execute (C++ `PoolQuery`).
 ///
 /// Layout is frozen (TASK_ABI.md §5). Note that parity here is
@@ -249,6 +276,7 @@ pub struct PoolQuery {
     /// Task TTL in seconds (#628); < 0 = infinite.
     pub ttl: f32,
     /// GPU parallelism: 1 = lane 0, 32 = full warp, > 32 = multi-warp.
+    /// Defaults to 32 (full warp), as the C++ ctor does.
     pub parallelism: u32,
     /// `ManyToOne` batch sub-key.
     pub batch_key: u64,
@@ -257,18 +285,21 @@ pub struct PoolQuery {
 }
 
 impl Default for PoolQuery {
+    /// Mirrors the C++ default ctor field-for-field. Note the two values that
+    /// are *not* zero: `container_id` is [`INVALID_CONTAINER_ID`] (0 is a
+    /// real container) and `parallelism` is 32 (a full warp).
     fn default() -> Self {
         Self {
             routing_mode: RoutingMode::Local,
             hash_value: 0,
-            container_id: 0,
+            container_id: INVALID_CONTAINER_ID,
             range_offset: 0,
             range_count: 0,
             node_id: 0,
             ret_node: 0,
             net_timeout: -1.0,
             ttl: -1.0,
-            parallelism: 1,
+            parallelism: 32,
             batch_key: 0,
             batch_for_ns: 0,
         }
@@ -276,9 +307,21 @@ impl Default for PoolQuery {
 }
 
 impl PoolQuery {
-    /// C++ `PoolQuery::Local()`.
+    /// Default batching window for [`PoolQuery::many_to_one`], nanoseconds
+    /// (the C++ `batch_for_ns = 10000` default argument).
+    pub const DEFAULT_BATCH_FOR_NS: u64 = 10_000;
+
+    /// C++ `PoolQuery::Local()` — a full warp, no container pinned.
     pub fn local() -> Self {
         Self::default()
+    }
+
+    /// C++ `PoolQuery::Local(parallelism)`.
+    pub fn local_with_parallelism(parallelism: u32) -> Self {
+        Self {
+            parallelism,
+            ..Self::default()
+        }
     }
 
     /// C++ `PoolQuery::DirectId(container_id, net_timeout)`.
@@ -296,6 +339,7 @@ impl PoolQuery {
         Self {
             routing_mode: RoutingMode::DirectHash,
             hash_value: hash,
+            container_id: 0,
             net_timeout,
             ..Self::default()
         }
@@ -307,6 +351,7 @@ impl PoolQuery {
             routing_mode: RoutingMode::Range,
             range_offset: offset,
             range_count: count,
+            container_id: 0,
             net_timeout,
             ..Self::default()
         }
@@ -316,6 +361,7 @@ impl PoolQuery {
     pub fn broadcast(net_timeout: f32) -> Self {
         Self {
             routing_mode: RoutingMode::Broadcast,
+            container_id: 0,
             net_timeout,
             ..Self::default()
         }
@@ -326,6 +372,7 @@ impl PoolQuery {
         Self {
             routing_mode: RoutingMode::Physical,
             node_id,
+            container_id: 0,
             net_timeout,
             ..Self::default()
         }
@@ -335,16 +382,19 @@ impl PoolQuery {
     pub fn dynamic(net_timeout: f32) -> Self {
         Self {
             routing_mode: RoutingMode::Dynamic,
+            container_id: 0,
             net_timeout,
             ..Self::default()
         }
     }
 
     /// C++ `PoolQuery::ManyToOne(container_hash, batch_key, batch_for_ns)`.
+    /// Pass [`Self::DEFAULT_BATCH_FOR_NS`] for the C++ default window.
     pub fn many_to_one(container_hash: u32, batch_key: u64, batch_for_ns: u64) -> Self {
         Self {
             routing_mode: RoutingMode::ManyToOne,
             hash_value: container_hash,
+            container_id: 0,
             batch_key,
             batch_for_ns,
             ..Self::default()
@@ -352,20 +402,37 @@ impl PoolQuery {
     }
 
     /// C++ `PoolQuery::AllToOne(container_hash, batch_key)`.
+    ///
+    /// `batch_for_ns` is unused here (the barrier is count-based, not
+    /// time-based) but is pinned to 0 to keep the raw-byte/memcmp roundtrip
+    /// deterministic, exactly as the C++ does.
     pub fn all_to_one(container_hash: u32, batch_key: u64) -> Self {
         Self {
             routing_mode: RoutingMode::AllToOne,
             hash_value: container_hash,
+            container_id: 0,
             batch_key,
+            batch_for_ns: 0,
             ..Self::default()
         }
     }
 
-    /// True when the query targets more than one container.
-    pub fn is_collective(&self) -> bool {
+    /// C++ `HasContainerId()` — whether a container was explicitly pinned.
+    pub fn has_container_id(&self) -> bool {
+        self.container_id != INVALID_CONTAINER_ID
+    }
+
+    /// C++ `IsCollectiveMode()` — the batch-and-aggregate modes.
+    ///
+    /// This is the predicate `ipc_manager.cc` routes on, so it is a
+    /// *behavioral* ABI clause (TASK_ABI.md §5): it must mean exactly what
+    /// the C++ means. Note that `Broadcast` and `Range` fan out to many
+    /// containers but are **not** collective in this sense — they are not
+    /// batched and aggregated at a leader.
+    pub fn is_collective_mode(&self) -> bool {
         matches!(
             self.routing_mode,
-            RoutingMode::Broadcast | RoutingMode::Range | RoutingMode::AllToOne
+            RoutingMode::ManyToOne | RoutingMode::AllToOne
         )
     }
 }
@@ -435,7 +502,9 @@ mod tests {
         assert_eq!(l.routing_mode, RoutingMode::Local);
         assert_eq!(l.net_timeout, -1.0); // "use default"
         assert_eq!(l.ttl, -1.0); // infinite
-        assert_eq!(l.parallelism, 1); // lane 0
+        assert_eq!(l.parallelism, 32); // full warp, per the C++ ctor
+        assert_eq!(l.container_id, INVALID_CONTAINER_ID);
+        assert_eq!(PoolQuery::local_with_parallelism(1).parallelism, 1);
 
         assert_eq!(PoolQuery::direct_hash(42, -1.0).hash_value, 42);
         assert_eq!(PoolQuery::direct_id(3, -1.0).container_id, 3);
@@ -444,19 +513,82 @@ mod tests {
         assert_eq!(PoolQuery::physical(9, -1.0).node_id, 9);
         let m = PoolQuery::many_to_one(7, 11, 1_000);
         assert_eq!((m.hash_value, m.batch_key, m.batch_for_ns), (7, 11, 1_000));
+        // AllToOne pins batch_for_ns to 0 for the memcmp roundtrip.
+        assert_eq!(PoolQuery::all_to_one(1, 5).batch_for_ns, 0);
+    }
 
-        assert!(PoolQuery::broadcast(-1.0).is_collective());
-        assert!(PoolQuery::range(0, 4, -1.0).is_collective());
-        assert!(PoolQuery::all_to_one(1, 0).is_collective());
-        assert!(!PoolQuery::local().is_collective());
-        assert!(!PoolQuery::direct_hash(1, -1.0).is_collective());
+    #[test]
+    fn pool_query_container_id_default_is_invalid_not_zero() {
+        // 0 is a real container: the "unset" sentinel must be kInvalid, or
+        // every non-DirectId query silently claims to target container 0.
+        assert_eq!(INVALID_CONTAINER_ID, u32::MAX);
+        assert!(!PoolQuery::local().has_container_id());
+        assert!(!PoolQuery::default().has_container_id());
+        assert!(PoolQuery::direct_id(0, -1.0).has_container_id());
+        assert!(PoolQuery::direct_id(7, -1.0).has_container_id());
+
+        // Every other C++ factory explicitly resets container_id_ to 0, so
+        // they DO report a container id (matching pool_query.cc).
+        for q in [
+            PoolQuery::direct_hash(1, -1.0),
+            PoolQuery::range(0, 4, -1.0),
+            PoolQuery::broadcast(-1.0),
+            PoolQuery::physical(2, -1.0),
+            PoolQuery::dynamic(-1.0),
+            PoolQuery::many_to_one(1, 0, 10_000),
+            PoolQuery::all_to_one(1, 0),
+        ] {
+            assert_eq!(q.container_id, 0, "{:?}", q.routing_mode);
+            assert_eq!(q.parallelism, 32, "{:?}", q.routing_mode);
+        }
+    }
+
+    #[test]
+    fn is_collective_mode_matches_cpp_routing_predicate() {
+        // C++ IsCollectiveMode() == ManyToOne || AllToOne (ipc_manager.cc
+        // routes on this). Broadcast/Range fan out but are NOT collective.
+        assert!(PoolQuery::many_to_one(1, 0, 10_000).is_collective_mode());
+        assert!(PoolQuery::all_to_one(1, 0).is_collective_mode());
+        assert!(!PoolQuery::broadcast(-1.0).is_collective_mode());
+        assert!(!PoolQuery::range(0, 4, -1.0).is_collective_mode());
+        assert!(!PoolQuery::local().is_collective_mode());
+        assert!(!PoolQuery::direct_hash(1, -1.0).is_collective_mode());
     }
 
     #[test]
     fn task_flags_are_stable_bits() {
-        assert_eq!(task_flags::PERIODIC, 1);
-        assert_eq!(task_flags::DATA_OWNER, 2);
-        assert_eq!(task_flags::REMOTE, 4);
+        // Bit NUMBERS copied from the C++ TASK_* macros (types.h), gaps and
+        // all. Retired bits 1, 4, 5, 6 stay reserved, so these are not a
+        // dense 1,2,4 sequence — see the module docs.
+        assert_eq!(task_flags::PERIODIC, 1 << 0);
+        assert_eq!(task_flags::DATA_OWNER, 1 << 2);
+        assert_eq!(task_flags::REMOTE, 1 << 3);
+        assert_eq!(task_flags::FIRE_AND_FORGET, 1 << 7);
+        assert_eq!(task_flags::BATCH_AGGREGATE, 1 << 8);
+        assert_eq!(task_flags::EXTERNAL_CLIENT, 1 << 9);
+    }
+
+    #[test]
+    fn task_flags_do_not_alias_each_other() {
+        let all = [
+            task_flags::PERIODIC,
+            task_flags::DATA_OWNER,
+            task_flags::REMOTE,
+            task_flags::FIRE_AND_FORGET,
+            task_flags::BATCH_AGGREGATE,
+            task_flags::EXTERNAL_CLIENT,
+        ];
+        // Each is a single distinct bit; ORing all must not lose any.
+        let mut acc = 0u32;
+        for f in all {
+            assert_eq!(f.count_ones(), 1, "{f:#x} is not a single bit");
+            assert_eq!(acc & f, 0, "{f:#x} aliases an earlier flag");
+            acc |= f;
+        }
+        // Retired-but-reserved bits must stay clear of every live flag.
+        for retired in [1u32 << 1, 1 << 4, 1 << 5, 1 << 6] {
+            assert_eq!(acc & retired, 0, "{retired:#x} is retired/reserved");
+        }
     }
 
     #[test]

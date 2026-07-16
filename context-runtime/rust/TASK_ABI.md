@@ -107,6 +107,40 @@ net_timeout). It is frozen field-for-field; modes: `DirectId`, `DirectHash`,
 identical inputs — this is a *behavioral* ABI, not just a layout one, so the
 port owes a shared conformance test vector set.
 
+### 5.1 Conformance harness (partially delivered)
+
+`clio-run-types/tests/cpp_abi_conformance.rs` reads the authoritative C++
+headers out of the repo and asserts the Rust port agrees: `RoutingMode`
+declaration order (= wire values), `TASK_*` bit numbers, `PoolQuery`/`TaskId`
+field order, the `PoolQuery()` ctor initializers, `kInvalidContainerId`, and
+the `IsCollectiveMode()` body. It needs no C++ toolchain, so it runs on a
+bare host and in CI.
+
+This exists because hand-transcription is not reliable and unit tests cannot
+catch it — a Rust-only test asserts that Rust equals *what the porter typed*.
+Three such bugs shipped into the first cut of `clio-run-types` and were found
+only by diffing against the headers:
+
+| Bug | Consequence had it shipped |
+|---|---|
+| `PoolQuery::default()` used `container_id = 0` instead of `kInvalidContainerId` | `HasContainerId()` true for every default query — Local tasks silently pinned to container 0 |
+| `PoolQuery::default()` used `parallelism = 1` instead of `32` | every Rust-built query ran on one GPU lane instead of a full warp |
+| `TASK_DATA_OWNER`/`TASK_REMOTE` packed at bits 1/2 instead of 2/3 | Rust `REMOTE` **aliases** C++ `TASK_DATA_OWNER` — the conditional free (§6) triggers on a buffer the task does not own |
+
+The last one is the cautionary tale for §6: bits 1, 4, 5 and 6 are retired
+but **reserved**, and `types.h` says so explicitly. Densely repacking flag
+bits to close the gaps is a silent, cross-language memory-corruption bug.
+
+**Known gap:** the harness verifies *declared* facts (parsed from header
+text), not *realized* layout — `sizeof`/`offsetof`/padding are questions only
+a C++ compiler can answer. Field order plus the Rust-side size asserts in
+`abi_layouts_are_frozen` cover most of the risk, but a compiled probe that
+prints `offsetof` for each frozen struct and is diffed against the Rust
+`std::mem::offset_of!` is the real check. It needs the CTP include stack
+(yaml-cpp et al.), so it belongs in the devcontainer build behind
+`CLIO_CTP_ENABLE_RUST`. This is the highest-value follow-up before any new
+`#[repr(C)]` type joins the ABI.
+
 ## 6. Teardown: from virtual dtor to dispatch table
 
 Replace `~Task()` with a per-method teardown specification, mirroring how
