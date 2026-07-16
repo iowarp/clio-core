@@ -64,6 +64,7 @@ option(CLIO_CORE_ENABLE_RPM_PACKAGE "Build RPM .rpm package via CPack" OFF)
 option(CLIO_CORE_ENABLE_APPIMAGE "Build portable AppImage via appimagetool" OFF)
 option(CLIO_CORE_ENABLE_CONDA "Enable Conda environment configuration (adds Conda paths to include/link directories)" OFF)
 option(CLIO_CORE_ENABLE_DOCKER_CI "Enable Docker-based integration tests (requires Docker)" OFF)
+option(CLIO_CORE_ENABLE_RUST "Enable Rust bindings for CTE (requires Rust toolchain + Corrosion)" OFF)
 option(BUILD_SHARED_LIBS "Build shared libraries (.dll/.so) instead of static ones (.lib/.a)" ON)
 option(CLIO_CORE_STATIC_DEPS "Link external dependencies statically (for self-contained wheels)" OFF)
 
@@ -968,6 +969,18 @@ if(CLIO_CORE_ENABLE_PYTHON)
   message(STATUS "  Site-packages:      ${PYTHON_SITE_PACKAGES}")
 else()
   message(STATUS "Python bindings disabled")
+endif()
+
+# Rust Bindings Configuration (Corrosion) — gated by CLIO_CORE_ENABLE_RUST
+if(CLIO_CORE_ENABLE_RUST)
+    message(STATUS "Rust bindings enabled - configuring Corrosion")
+    include(FetchContent)
+    FetchContent_Declare(corrosion
+        GIT_REPOSITORY https://github.com/corrosion-rs/corrosion.git
+        GIT_TAG v0.5.2
+    )
+    FetchContent_MakeAvailable(corrosion)
+    message(STATUS "Rust bindings enabled: Corrosion ${corrosion_VERSION}")
 endif()
 
 #------------------------------------------------------------------------------

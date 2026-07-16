@@ -6,6 +6,10 @@ else()
     message(STATUS "CTE Python bindings disabled: CLIO_CORE_ENABLE_PYTHON is OFF")
 endif()
 
-# Rust bindings (built independently via cargo)
-# Build with: cd rust && cargo build
-# See rust/README for details
+# Rust bindings (built via Corrosion when CLIO_CORE_ENABLE_RUST=ON)
+if(CLIO_CORE_ENABLE_RUST)
+    message(STATUS "CTE Rust bindings enabled")
+    add_subdirectory(rust)
+else()
+    message(STATUS "CTE Rust bindings disabled: CLIO_CORE_ENABLE_RUST is OFF")
+endif()
