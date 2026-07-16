@@ -181,6 +181,7 @@
 /// (Rust spells the byte `u8`), and lets `FullPtr::null()` and friends infer
 /// their type parameter as they did when this was a concrete struct.
 pub type FullPtr = ctp_memory::FullPtr<u8>;
+use ctp_memory::AllocatorId;
 use ctp_types::{bit_opt, Bitfield32};
 use std::collections::HashMap;
 use std::fmt;
@@ -231,10 +232,42 @@ pub struct Bulk {
     pub mr: usize,
 }
 
+/// Marks a receive buffer the **transport itself** allocated, and which
+/// [`Transport::clear_recv_handles`] must therefore free (C++
+/// `AllocatorId(UINT32_MAX - 1, UINT32_MAX - 1)`).
+///
+/// This is not a decoration on "is it owned" — it records *which allocator*
+/// owns the buffer, and that distinction is load-bearing. A recv `Bulk` can
+/// end up holding either:
+///
+/// - a buffer this transport allocated on the raw system allocator, which
+///   `clear_recv_handles` frees; or
+/// - a buffer belonging to a CTP allocator, swapped in by the task archive's
+///   bulk path for the `BULK_EXPOSE` / copy routes. Those are reclaimed by the
+///   task instead (`daemon_allocated_bulk_count_` / `TASK_DATA_OWNER`).
+///
+/// Freeing the second kind as if it were the first is a real crash, not a
+/// leak: a CTP `MallocAllocator`'s user pointer sits 16 bytes inside the true
+/// malloc region, so handing it to `free` gives glibc "free(): invalid
+/// pointer" (ASan: bad-free). The sentinel is what keeps the two apart, which
+/// is why it is a distinctive id rather than a bool.
+pub const RECV_ALLOCATED_ID: AllocatorId = AllocatorId::new(u32::MAX - 1, u32::MAX - 1);
+
 impl Bulk {
     /// The exact field set C++ `Bulk::serialize` writes, in order
     /// (divergence 4). `data`, `desc`, and `mr` are local state and stay home.
     pub const SERIALIZED_FIELDS: [&'static str; 2] = ["size", "flags"];
+
+    /// True when this descriptor's buffer was allocated by the transport's
+    /// receive path and so must be freed by `clear_recv_handles`.
+    ///
+    /// Mirrors the C++ guard: a non-null local half **and** the
+    /// [`RECV_ALLOCATED_ID`] sentinel. Both halves matter — a null pointer
+    /// has nothing to free, and a different allocator id means somebody else
+    /// owns it.
+    pub fn is_recv_allocated(&self) -> bool {
+        self.data.ptr != 0 && self.data.shm.alloc_id == RECV_ALLOCATED_ID
+    }
 
     /// A bulk descriptor over `data` of `size` bytes with `flags`.
     pub fn new(data: FullPtr, size: usize, flags: u32) -> Self {
@@ -958,8 +991,44 @@ pub const fn default_cq_size() -> usize {
 mod tests {
     use super::*;
     // FullPtr's halves are only constructed in tests here; the library code
-    // passes FullPtr values around whole.
-    use ctp_memory::{AllocatorId, ShmPtr};
+    // passes FullPtr values around whole. (AllocatorId comes via super::*.)
+    use ctp_memory::ShmPtr;
+
+    #[test]
+    fn recv_allocated_sentinel_distinguishes_owners() {
+        assert_eq!(RECV_ALLOCATED_ID, AllocatorId::new(u32::MAX - 1, u32::MAX - 1));
+        // Distinct from null: private memory is NOT transport-allocated.
+        assert_ne!(RECV_ALLOCATED_ID, AllocatorId::null());
+
+        // A buffer the transport's recv path allocated: free it.
+        let mine = Bulk::new(
+            FullPtr::new(0x1000, ShmPtr::new(RECV_ALLOCATED_ID, 0x1000)),
+            64,
+            BULK_XFER,
+        );
+        assert!(mine.is_recv_allocated());
+
+        // A CTP-allocator buffer swapped in by the archive: NOT ours. Freeing
+        // it would be a bad-free, not a leak — its user pointer sits inside a
+        // larger malloc region.
+        let theirs = Bulk::new(
+            FullPtr::new(0x2000, ShmPtr::new(AllocatorId::new(1, 0), 16)),
+            64,
+            BULK_XFER,
+        );
+        assert!(!theirs.is_recv_allocated());
+
+        // Private (stack/heap) memory: null allocator id, address as offset.
+        assert!(!Bulk::new(FullPtr::from_local(0x3000), 64, BULK_XFER).is_recv_allocated());
+
+        // Nothing to free when the local half is null, even if tagged.
+        let empty = Bulk::new(
+            FullPtr::new(0, ShmPtr::new(RECV_ALLOCATED_ID, 0)),
+            0,
+            BULK_XFER,
+        );
+        assert!(!empty.is_recv_allocated());
+    }
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Barrier, Mutex, MutexGuard};
 

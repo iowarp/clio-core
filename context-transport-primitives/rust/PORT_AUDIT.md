@@ -161,6 +161,45 @@ transport's `shm: ShmPtr<u8>` and the socket transport's `owned: bool` have
 to be re-expressed in terms of the canonical `FullPtr`/`desc`/`mr` (which is
 how the C++ carries exactly this information).
 
+### Progress and the ownership decision
+
+Done: `TransportType`, `TransportMode` and `ClientInfo` are unified
+(`734369a2`). `LbmMeta` needs no work of its own — all three declarations are
+already field-for-field identical, and differ *only* because their `Bulk` and
+`ClientInfo` differ. So **`Bulk` is the single keystone**: unify it and
+`LbmMeta` follows.
+
+The decision `Bulk` turns on is where the payload's storage lives.
+
+- The two invented `Bulk`s own a `Vec<u8>`. Safe, and it works today.
+- The canonical `Bulk` (and the C++) holds a `FullPtr` — a *location* —
+  and the buffer is owned elsewhere.
+
+**Keep the canonical `FullPtr` form.** A `Vec<u8>` cannot express "this
+payload lives in the shared segment at `(alloc_id, off)`", which is the whole
+point of bulk transfer; owning the bytes forces a copy exactly where the
+design exists to avoid one. The `Vec` form only looks adequate because no
+shared-segment payload has reached these transports yet.
+
+That costs safety at one seam — turning a `FullPtr` into bytes needs
+`unsafe` — but the cost is inherent, not a porting artifact: a cross-process
+pointer cannot be a safe slice. Contain it in one helper per transport.
+
+Ownership of *received* buffers rides on the allocator id, as in the C++, via
+the new `RECV_ALLOCATED_ID` sentinel (`AllocatorId(u32::MAX-1, u32::MAX-1)`)
+and `Bulk::is_recv_allocated`. This is the part `owned: bool` gets wrong, and
+it is worth being precise about: the sentinel does not record *that* a buffer
+is owned, it records *which allocator* owns it. A recv `Bulk` may hold either
+a buffer the transport allocated on the system allocator, or one belonging to
+a CTP allocator that the task archive swapped in for the `BULK_EXPOSE`/copy
+routes. Freeing the second as if it were the first is a **crash, not a leak**
+— a CTP `MallocAllocator`'s user pointer sits 16 bytes inside the real malloc
+region, so `free` on it yields glibc "free(): invalid pointer". The C++
+carries a long comment about this; it is a bug someone already paid for.
+`owned: bool` flattens the distinction away and is only survivable today
+because the archives are not wired up yet — i.e. it would fail exactly when
+§2 lands.
+
 ## 2. `ctp-ds/src/global_serialize.rs` contains context-runtime, not CTP
 
 CTP is the bottom layer; context-runtime sits on top. The C++ respects this:
