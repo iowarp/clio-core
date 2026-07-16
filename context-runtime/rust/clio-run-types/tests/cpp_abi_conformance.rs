@@ -333,6 +333,31 @@ fn pool_query_field_order_matches_cpp() {
 }
 
 #[test]
+fn task_id_to_u64_matches_the_cpp_fold() {
+    // ToU64 was missing from the first cut of this port entirely — the field
+    // layout was checked, the behavior was not. Pin the C++ body so the fold
+    // cannot be changed on one side only.
+    let src = strip_comments(&read_header("context-runtime/include/clio_runtime/types.h"));
+    // Scope to TaskId first: `ToU64` is not a unique marker in this header —
+    // UniqueId declares one too, and it is a lossless pack rather than a fold.
+    let task_id = block_after(&src, "struct TaskId");
+    let body = block_after(task_id, "u64 ToU64() const");
+    let normalized: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+    assert_eq!(
+        normalized,
+        "u64hash1=(static_cast<u64>(pid_)<<32)|static_cast<u64>(tid_);\
+         u64hash2=(static_cast<u64>(major_)<<32)|static_cast<u64>(replica_id_);\
+         u64hash3=(static_cast<u64>(unique_)<<32)|static_cast<u64>(node_id_&0xFFFFFFFF);\
+         returnhash1^hash2^hash3;",
+        "TaskId::ToU64's C++ body changed; update TaskId::to_u64 to match"
+    );
+
+    let id = TaskId::new(1, 2, 3, 4, 5, 6, 7);
+    let expect = (((1u64) << 32) | 2) ^ (((3u64) << 32) | 4) ^ (((5u64) << 32) | 6);
+    assert_eq!(id.to_u64(), expect);
+}
+
+#[test]
 fn task_id_field_order_matches_cpp() {
     let src = strip_comments(&read_header("context-runtime/include/clio_runtime/types.h"));
     let cpp = cpp_fields(block_after(&src, "struct TaskId"));

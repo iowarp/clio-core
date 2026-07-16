@@ -172,6 +172,20 @@ impl TaskId {
     pub const fn is_null(&self) -> bool {
         self.pid == 0 && self.tid == 0 && self.major == 0 && self.unique == 0
     }
+
+    /// C++ `ToU64()` — XOR-folds the fields into a hash.
+    ///
+    /// Note this is a *hash*, not a lossless encoding, unlike
+    /// [`UniqueId::to_u64`]: it folds six 32-bit fields into 64 bits, so
+    /// distinct task ids can collide. `net_key` is deliberately excluded
+    /// (it is a process-local vaddr, meaningless to another process), and
+    /// `node_id` is masked to 32 bits — both exactly as the C++ does.
+    pub const fn to_u64(&self) -> u64 {
+        let hash1 = ((self.pid as u64) << 32) | (self.tid as u64);
+        let hash2 = ((self.major as u64) << 32) | (self.replica_id as u64);
+        let hash3 = ((self.unique as u64) << 32) | ((self.node_id as u64) & 0xFFFF_FFFF);
+        hash1 ^ hash2 ^ hash3
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -603,5 +617,32 @@ mod tests {
         assert!(TaskId::null().is_null());
         assert!(TaskId::default().is_null());
         assert!(!TaskId::new(1, 2, 3, 0, 4, 0, 0).is_null());
+    }
+
+    #[test]
+    fn task_id_to_u64_folds_like_cpp() {
+        // hash1 ^ hash2 ^ hash3, per the C++ ToU64().
+        let id = TaskId::new(1, 2, 3, 4, 5, 6, 7);
+        let h1 = (1u64 << 32) | 2;
+        let h2 = (3u64 << 32) | 4;
+        let h3 = (5u64 << 32) | 6;
+        assert_eq!(id.to_u64(), h1 ^ h2 ^ h3);
+        assert_eq!(TaskId::null().to_u64(), 0);
+
+        // net_key is excluded: it is a process-local vaddr.
+        let a = TaskId::new(1, 2, 3, 4, 5, 6, 0);
+        let b = TaskId::new(1, 2, 3, 4, 5, 6, 0xDEAD_BEEF);
+        assert_eq!(a.to_u64(), b.to_u64());
+
+        // node_id is masked to 32 bits (it is a u32 field, so this is
+        // vacuous here, but the C++ masks explicitly and we mirror it).
+        assert_eq!(TaskId::new(0, 0, 0, 0, 0, u32::MAX, 0).to_u64(), u32::MAX as u64);
+
+        // It is a fold, not an encoding — collisions are expected and fine.
+        assert_eq!(
+            TaskId::new(1, 0, 1, 0, 0, 0, 0).to_u64(),
+            TaskId::new(2, 0, 2, 0, 0, 0, 0).to_u64(),
+            "pid^major cancel; documents that this is a hash, not an id"
+        );
     }
 }
