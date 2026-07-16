@@ -161,6 +161,28 @@ transport's `shm: ShmPtr<u8>` and the socket transport's `owned: bool` have
 to be re-expressed in terms of the canonical `FullPtr`/`desc`/`mr` (which is
 how the C++ carries exactly this information).
 
+### Resolved: the `ClientInfo.fd` width
+
+The last thing keeping `LbmMeta` split was `ClientInfo.fd`: `SocketId` (`u64`)
+in `socket_transport` against the C++ `int`. It looked like a portability
+question to escalate. It is not — the C++ answers it in a comment:
+
+```cpp
+ClientInfo client_info_;  // Client routing info (not serialized, host-only)
+```
+
+`ClientInfo` never crosses the wire, so `fd`'s width carries **no ABI
+consequence at all**; it is a free implementation choice. And `int` is simply
+wrong on Windows, where `SOCKET` is a `UINT_PTR` — the C++ would truncate a
+real handle. `socket_transport`'s divergence note had already worked this out
+and picked one `u64` id on both platforms, from `AsRawFd`/`AsRawSocket`, with
+`INVALID_SOCKET = u64::MAX` standing in for the C++ `fd_ = -1`.
+
+So the canonical `ClientInfo` takes the `u64`, and `SocketId`/`INVALID_SOCKET`
+move to `transport.rs`. This is the one place so far where a divergence from
+the C++ is kept *because it is better*, rather than reverted for fidelity —
+which the "not serialized" comment is what makes safe.
+
 ### Progress and the ownership decision
 
 Done: `TransportType`, `TransportMode` and `ClientInfo` are unified
@@ -347,8 +369,13 @@ outside `#[cfg(test)]`. That one grep is what turned this audit from
       Lightbeam has exactly one; five declarations are down to three
       (`ctp-ds`'s, which §2 removes, and `ctp-net`'s thallium-local one).
 - [ ] §1a — real transports implement `Transport`; factory registers them.
-- [ ] `LbmMeta` — blocked only on socket's `ClientInfo.fd` width
-      (`SocketId`/`u64` vs the C++ `int`; a real Windows `SOCKET` question).
+- [x] `ClientInfo`/`LbmMeta`/`SocketId` unified (`this commit`). §1 is done:
+      every shared lightbeam type is declared once, in `transport.rs`, and
+      `use crate::` across the crate went 0 → 12.
+- [ ] Known flake: a socket test fails intermittently (~1 run in 5) and passes
+      on repeat. Seen before and after the Bulk work, so not caused by it —
+      most likely an ephemeral-port race. Worth pinning down before it gets
+      blamed for a real regression.
 - [ ] §2 — archives out of `ctp-ds` into context-runtime.
 - [ ] §3 — triage `RingBufferEntry`, the GPU look-alikes.
 - [ ] Re-audit the other crates the same way (`impl … for` outside tests).

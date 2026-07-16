@@ -266,6 +266,7 @@ pub use crate::transport::{TransportMode, TransportType};
 /// (the C++ `MallocAllocator` convention), which this module must **not** put
 /// on the wire — see [`wire_shm`].
 pub use crate::transport::{Bulk, FullPtr};
+pub use crate::transport::INVALID_SOCKET;
 use crate::transport::{alloc_recv_buffer, bulk_bytes, free_recv_buffer};
 
 /// C++ `ctp::lbm::ClientInfo`.
@@ -276,25 +277,11 @@ use crate::transport::{alloc_recv_buffer, bulk_bytes, free_recv_buffer};
 pub use crate::transport::ClientInfo;
 
 /// C++ `ctp::lbm::LbmMeta<AllocT>` (divergence 4: no allocator parameter).
-#[derive(Debug, Default, Clone)]
-pub struct LbmMeta {
-    /// Sender's bulk descriptors (`BULK_EXPOSE` or `BULK_XFER`).
-    pub send: Vec<Bulk>,
-    /// Receiver's bulk descriptors (copy of `send` with local payloads).
-    pub recv: Vec<Bulk>,
-    /// Count of `BULK_XFER` entries in `send`.
-    pub send_bulks: usize,
-    /// Count of `BULK_XFER` entries in `recv`.
-    pub recv_bulks: usize,
-    /// Client routing info (not serialized).
-    pub client_info: ClientInfo,
-}
-
-impl LbmMeta {
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
+///
+/// From [`crate::transport`] (`lightbeam.h`), which declares it once. All
+/// three copies of this type were already field-for-field identical — they
+/// existed only because `Bulk` and `ClientInfo` did.
+pub use crate::transport::LbmMeta;
 
 /// C++ `ctp::lbm::LbmContext`. Fields meaningless to the SHM path (`meta_buf_`,
 /// `warp_parallel_`, `dst_fd_`, `dst_offset_`) are omitted; `signal_pid` /
@@ -2100,7 +2087,7 @@ mod tests {
         let mut got = LbmMeta::new();
         let info = ShmTransport::recv(&mut got, &ctx);
         assert_eq!(info.rc, 0);
-        assert_eq!(info.fd, -1);
+        assert_eq!(info.fd, INVALID_SOCKET, "no socket: the C++ fd_ = -1");
         assert_eq!(got.send_bulks, 3);
         assert!(got.recv.is_empty());
         assert_eq!(buf.ring().info().avail(), 0);

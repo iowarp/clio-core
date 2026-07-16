@@ -364,14 +364,32 @@ pub(crate) unsafe fn bulk_bytes<'a>(bulk: &Bulk) -> &'a [u8] {
 // ClientInfo (lightbeam.h "--- Client Info ---")
 // ---------------------------------------------------------------------------
 
+/// A socket handle, as an opaque routing id (C++ `sock::socket_t`).
+///
+/// One `u64` on every platform, from `AsRawFd`/`AsRawSocket`. The C++ stores
+/// this in `ClientInfo` as an `int`, which **truncates a Windows `SOCKET`**
+/// (a `UINT_PTR`); that is a latent bug rather than a contract, and it costs
+/// nothing to fix here because `ClientInfo` is never serialized — the C++
+/// marks the field "not serialized, host-only" — so its width is an
+/// implementation choice with no ABI consequence.
+///
+/// Ids are handles for routing and lookup only; the sockets themselves are
+/// owned `TcpStream`/`UnixStream` values.
+pub type SocketId = u64;
+
+/// "No socket" (C++ `sock::kInvalidSocket`, the Windows `INVALID_SOCKET`/`~0`
+/// convention). This is what the C++ `fd_ = -1` initializer means.
+pub const INVALID_SOCKET: SocketId = u64::MAX;
+
 /// Routing info returned by [`Transport::recv`], consumed by
 /// [`Transport::send`] (C++ `ClientInfo`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientInfo {
     /// Return code: 0 = success, `EAGAIN` = no data, etc. (divergence 11).
     pub rc: i32,
-    /// Socket fd (socket-transport server mode); -1 = none. C++ `fd_`.
-    pub fd: i32,
+    /// Socket handle (socket-transport server mode); [`INVALID_SOCKET`] =
+    /// none. C++ `fd_`, an `int` there — see [`SocketId`].
+    pub fd: SocketId,
     /// ZMQ identity (ZMQ server mode). C++ `identity_`, host-only.
     pub identity: String,
 }
@@ -391,12 +409,12 @@ impl Default for ClientInfo {
 }
 
 impl ClientInfo {
-    /// C++ default member initializers: `rc = 0`, `fd_ = -1`, empty identity.
-    /// Same as [`Default::default`].
+    /// C++ default member initializers: `rc = 0`, `fd_ = -1` (spelled
+    /// [`INVALID_SOCKET`] here), empty identity. Same as [`Default::default`].
     pub fn new() -> Self {
         Self {
             rc: 0,
-            fd: -1,
+            fd: INVALID_SOCKET,
             identity: String::new(),
         }
     }
@@ -405,7 +423,7 @@ impl ClientInfo {
     pub fn failed() -> Self {
         Self {
             rc: -1,
-            fd: -1,
+            fd: INVALID_SOCKET,
             identity: String::new(),
         }
     }
@@ -414,7 +432,7 @@ impl ClientInfo {
     pub fn err(rc: i32) -> Self {
         Self {
             rc,
-            fd: -1,
+            fd: INVALID_SOCKET,
             identity: String::new(),
         }
     }
@@ -1365,7 +1383,7 @@ mod tests {
     fn client_info_defaults_match_cpp_initializers() {
         let ci = ClientInfo::new();
         assert_eq!(ci.rc, 0);
-        assert_eq!(ci.fd, -1, "C++ fd_ = -1");
+        assert_eq!(ci.fd, INVALID_SOCKET, "C++ fd_ = -1 means 'no socket'");
         assert!(ci.identity.is_empty());
         assert!(ci.is_ok());
     }
@@ -1374,12 +1392,12 @@ mod tests {
     fn client_info_failure_matches_cpp_dispatch_default_arm() {
         // C++: return ClientInfo{-1, -1, {}};
         let ci = ClientInfo::failed();
-        assert_eq!((ci.rc, ci.fd), (-1, -1));
+        assert_eq!((ci.rc, ci.fd), (-1, INVALID_SOCKET));
         assert!(ci.identity.is_empty());
         assert!(!ci.is_ok());
         // EAGAIN-style: a non-zero rc is not ok, and fd defaults to -1.
         assert!(!ClientInfo::err(11).is_ok());
-        assert_eq!(ClientInfo::err(11).fd, -1);
+        assert_eq!(ClientInfo::err(11).fd, INVALID_SOCKET);
     }
 
     #[test]
@@ -1392,7 +1410,11 @@ mod tests {
         // standard input, so that gap was a bug waiting for its first caller.
         // Default is hand-written now and agrees with new().
         assert_eq!(ClientInfo::default().rc, 0);
-        assert_eq!(ClientInfo::default().fd, -1, "C++ initializes fd_ to -1");
+        assert_eq!(
+            ClientInfo::default().fd,
+            INVALID_SOCKET,
+            "C++ initializes fd_ to -1: no socket"
+        );
         assert!(ClientInfo::default().identity.is_empty());
         assert_eq!(ClientInfo::default(), ClientInfo::new());
 

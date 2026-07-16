@@ -227,8 +227,7 @@ pub const LBM_SYNC: u32 = 0x1;
 /// `rc == EAGAIN` comparisons test against on every platform (divergence 6).
 pub const EAGAIN: i32 = 11;
 
-/// `sock::kInvalidSocket` (the Windows `INVALID_SOCKET` / `~0` convention).
-pub const INVALID_SOCKET: SocketId = u64::MAX;
+pub use crate::transport::INVALID_SOCKET;
 
 /// `kDefaultReadEvent` — `EPOLLIN` on POSIX.
 #[cfg(not(windows))]
@@ -253,8 +252,7 @@ const POLL_MAX_SLEEP: Duration = Duration::from_millis(1);
 /// Bytes each serialized `Bulk` occupies: `size: u64` + `flags: u32`.
 const BULK_WIRE_BYTES: usize = 12;
 
-/// A socket handle. See divergence 3.
-pub type SocketId = u64;
+pub use crate::transport::SocketId;
 
 // ---------------------------------------------------------------------------
 // lightbeam.h types
@@ -274,45 +272,17 @@ pub use crate::transport::{TransportMode, TransportType};
 /// [`RECV_ALLOCATED_ID`] for why the buffer is pointed at rather than owned,
 /// and why ownership rides on the allocator id rather than a flag.
 pub use crate::transport::{Bulk, FullPtr, RECV_ALLOCATED_ID};
-use crate::transport::{alloc_recv_buffer, bulk_bytes, free_recv_buffer};
 
-/// `ctp::lbm::ClientInfo` — returned by `Recv`, consumed by `Send` for routing.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ClientInfo {
-    /// 0 = success, [`EAGAIN`] = no data, otherwise an error code.
-    pub rc: i32,
-    /// Socket handle the data arrived on (server-mode routing).
-    pub fd: SocketId,
-}
-
-impl Default for ClientInfo {
-    fn default() -> Self {
-        // C++ `int fd_ = -1`; the portable id space uses INVALID_SOCKET.
-        Self {
-            rc: 0,
-            fd: INVALID_SOCKET,
-        }
-    }
-}
-
-/// `ctp::lbm::LbmMeta<>` — the transport's metadata envelope.
+/// `ctp::lbm::ClientInfo` and `LbmMeta` — from [`crate::transport`]
+/// (`lightbeam.h`), which declares them once.
 ///
-/// The C++ template parameterizes the bulk vectors on a CTP allocator so they
-/// can live in GPU-accessible memory; the socket backend is host-only, so the
-/// Rust port uses plain `Vec` and drops the `AllocT`/`alloc_` parameter.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct LbmMeta {
-    /// Sender's bulk descriptors.
-    pub send: Vec<Bulk>,
-    /// Receiver's bulk descriptors (built from `send` on arrival).
-    pub recv: Vec<Bulk>,
-    /// Count of `BULK_XFER` entries in `send`.
-    pub send_bulks: usize,
-    /// Count of `BULK_XFER` entries in `recv`.
-    pub recv_bulks: usize,
-    /// Routing info; not serialized (host-only in C++ too).
-    pub client_info: ClientInfo,
-}
+/// This module used to declare its own of each. `ClientInfo` differed only in
+/// `fd`'s width, and that was the last thing keeping `LbmMeta` split three
+/// ways: `LbmMeta` embeds a `ClientInfo`, so it could not unify until the
+/// width was settled. It is settled in favour of the `u64` this module argued
+/// for — see [`SocketId`].
+pub use crate::transport::{ClientInfo, LbmMeta};
+use crate::transport::{alloc_recv_buffer, bulk_bytes, free_recv_buffer};
 
 /// `ctp::lbm::LbmContext`. Ignored by the socket backend (divergence 16).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -1168,12 +1138,8 @@ impl SocketTransport {
         if self.is_client() {
             let fd = match &self.stream {
                 Some(s) => s.id(),
-                None => {
-                    return ClientInfo {
-                        rc: -1,
-                        fd: INVALID_SOCKET,
-                    }
-                }
+                // The C++ dispatch's failure value.
+                None => return ClientInfo::failed(),
             };
             if self.em_registered {
                 if let Some(pos) = self.fired_events.iter().position(|e| e.trigger.fd == fd) {
@@ -1779,7 +1745,11 @@ mod tests {
         let reply = LbmMeta {
             send: vec![xfer(b"pong")],
             send_bulks: 1,
-            client_info: ClientInfo { rc: 0, fd: info.fd },
+            client_info: ClientInfo {
+                rc: 0,
+                fd: info.fd,
+                ..ClientInfo::default()
+            },
             ..Default::default()
         };
         assert_eq!(server.send(&reply, &LbmContext::default()), 0);
@@ -1855,7 +1825,11 @@ mod tests {
 
         // An fd that is not a live client is equally unroutable.
         let stale = LbmMeta {
-            client_info: ClientInfo { rc: 0, fd: 12345 },
+            client_info: ClientInfo {
+                rc: 0,
+                fd: 12345,
+                ..ClientInfo::default()
+            },
             ..Default::default()
         };
         assert_eq!(server.send(&stale, &LbmContext::default()), -1);
@@ -2002,7 +1976,11 @@ mod tests {
         let reply = LbmMeta {
             send: vec![xfer(b"y")],
             send_bulks: 1,
-            client_info: ClientInfo { rc: 0, fd: info.fd },
+            client_info: ClientInfo {
+                rc: 0,
+                fd: info.fd,
+                ..ClientInfo::default()
+            },
             ..Default::default()
         };
         assert_eq!(server.send(&reply, &LbmContext::default()), 0);
