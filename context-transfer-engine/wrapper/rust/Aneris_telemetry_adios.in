@@ -1,0 +1,289 @@
+#!/bin/bash
+#
+# Copyright (c) 2024, Gnosis Research Center, Illinois Institute of Technology
+# All rights reserved.
+#
+# BSD 3-Clause License
+#
+# Aneris Telemetry Script for ADIOS2 Applications
+#
+# This script runs an ADIOS2 application that uses the IowarpEngine plugin
+# and captures telemetry data from the CTE runtime.
+#
+# Usage: Aneris_telemetry_adios <executable> [args...]
+#
+# Prerequisites:
+#   - Application must use io.SetEngine("IowarpEngine") 
+#   - Chimaera runtime must be running (or auto-started)
+#   - ADIOS2_PLUGIN_PATH must include libiowarp_engine.so
+#
+
+set -e
+
+#==============================================================================
+# Configuration (filled in by CMake)
+#==============================================================================
+IOWARP_BUILD_DIR="@CMAKE_BINARY_DIR@"
+IOWARP_SOURCE_DIR="@CMAKE_SOURCE_DIR@"
+
+#==============================================================================
+# Default Configuration
+#==============================================================================
+# CTE configuration file
+DEFAULT_CTE_CONFIG="${IOWARP_SOURCE_DIR}/context-runtime/config/clio_default.yaml"
+
+# ADIOS2 configuration file (can be set via environment variable)
+# Use pattern: ${VAR:-default} to provide default if not set
+ADIOS_CONFIG_FILE="${ADIOS_CONFIG_FILE:-""}"
+
+# Default ADIOS2 config location if not specified
+DEFAULT_ADIOS_CONFIG="${IOWARP_SOURCE_DIR}/context-transfer-engine/adapter/adios2/iowarp_default.xml"
+
+#==============================================================================
+# Functions
+#==============================================================================
+
+show_help() {
+    cat << EOF
+Aneris Telemetry for ADIOS2
+
+Usage: $0 [options] <executable> [args...]
+
+Options:
+    -h, --help              Show this help message
+    -c, --config <file>     CTE configuration file (default: ${DEFAULT_CTE_CONFIG})
+    -o, --output <file>     Output file for telemetry data
+    -v, --verbose           Enable verbose output
+    -r, --realtime          Enable real-time telemetry output
+    -n, --no-profile        Disable telemetry profiling (intercept only)
+                            Note: --realtime has no effect with --no-profile
+
+Environment Variables:
+    ADIOS_CONFIG_FILE      Path to ADIOS2 XML config file
+                          (default: ${DEFAULT_ADIOS_CONFIG} if exists)
+
+Prerequisites:
+    1. Your ADIOS2 application must use the IowarpEngine:
+
+       adios2::IO io = adios.DeclareIO("myIO");
+       io.SetEngine("IowarpEngine");  // Required!
+
+    2. Chimaera runtime should be running, or will auto-start
+
+Example:
+    $0 ./my_adios_simulation --config simulation.xml
+    $0 -c /path/to/custom.yaml ./gray-scott
+    $0 --realtime ./my_adios_simulation  # Real-time output
+    $0 --no-profile ./my_adios_simulation  # Intercept only, no telemetry
+
+EOF
+}
+
+#==============================================================================
+# Parse Arguments
+#==============================================================================
+
+CTE_CONFIG="${DEFAULT_CTE_CONFIG}"
+OUTPUT_FILE=""
+VERBOSE=0
+REALTIME=0
+NO_PROFILE=0
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        -c|--config)
+            CTE_CONFIG="$2"
+            shift 2
+            ;;
+        -o|--output)
+            OUTPUT_FILE="$2"
+            shift 2
+            ;;
+        -v|--verbose)
+            VERBOSE=1
+            shift
+            ;;
+        -r|--realtime)
+            REALTIME=1
+            shift
+            ;;
+        -n|--no-profile)
+            NO_PROFILE=1
+            shift
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            echo "Error: Unknown option $1"
+            show_help
+            exit 1
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+# Check for executable
+if [ $# -eq 0 ]; then
+    echo "Error: No executable specified"
+    show_help
+    exit 1
+fi
+
+EXECUTABLE="$1"
+shift
+
+if [ ! -x "$EXECUTABLE" ]; then
+    echo "Error: '$EXECUTABLE' is not executable or not found"
+    exit 1
+fi
+
+#==============================================================================
+# Setup Environment
+#==============================================================================
+
+# Library paths
+export LD_LIBRARY_PATH="${IOWARP_BUILD_DIR}/bin:${LD_LIBRARY_PATH}"
+export ADIOS2_PLUGIN_PATH="${IOWARP_BUILD_DIR}/bin"
+
+# CTE configuration
+export WRP_RUNTIME_CONF="${CTE_CONFIG}"
+export CHI_WITH_RUNTIME=1
+
+# Output file for telemetry
+if [ -n "$OUTPUT_FILE" ]; then
+    export ANERIS_TELEMETRY_OUTPUT="$OUTPUT_FILE"
+fi
+
+# ADIOS2 configuration
+if [ -n "$ADIOS_CONFIG_FILE" ]; then
+    # Use user-specified config
+    export ADIOS2_CONFIG_FILE="$ADIOS_CONFIG_FILE"
+    if [ $VERBOSE -eq 1 ]; then
+        echo "Using ADIOS2 config: $ADIOS_CONFIG_FILE"
+    fi
+elif [ -f "$DEFAULT_ADIOS_CONFIG" ]; then
+    # Use default config if it exists
+    export ADIOS2_CONFIG_FILE="$DEFAULT_ADIOS_CONFIG"
+    if [ $VERBOSE -eq 1 ]; then
+        echo "Using default ADIOS2 config: $DEFAULT_ADIOS_CONFIG"
+    fi
+else
+    # Create temporary config with IowarpEngine
+    TEMP_ADIOS_CONFIG=$(mktemp /tmp/iowarp_adios_config.XXXXXX.xml)
+    cat > "$TEMP_ADIOS_CONFIG" << 'EOF'
+<?xml version="1.0"?>
+<adios-config>
+    <io name="*">
+        <engine type="Plugin">
+            <parameter key="PluginName" value="IowarpEngine"/>
+            <parameter key="PluginLibrary" value="iowarp_engine"/>
+        </engine>
+    </io>
+</adios-config>
+EOF
+    export ADIOS2_CONFIG_FILE="$TEMP_ADIOS_CONFIG"
+    TEMP_FILES="$TEMP_ADIOS_CONFIG"
+    if [ $VERBOSE -eq 1 ]; then
+        echo "Created temporary ADIOS2 config: $TEMP_ADIOS_CONFIG"
+    fi
+fi
+
+#==============================================================================
+# Print Info
+#==============================================================================
+
+echo "=========================================="
+echo "Aneris Telemetry (ADIOS2)"
+echo "=========================================="
+echo "Executable: $EXECUTABLE"
+echo "CTE Config: $CTE_CONFIG"
+echo "ADIOS2 Plugin: ${IOWARP_BUILD_DIR}/bin/libiowarp_engine.so"
+echo ""
+echo "Note: Make sure your application uses:"
+echo "  io.SetEngine(\"IowarpEngine\")"
+echo "=========================================="
+echo ""
+
+if [ $VERBOSE -eq 1 ]; then
+    echo "LD_LIBRARY_PATH: $LD_LIBRARY_PATH"
+    echo "ADIOS2_PLUGIN_PATH: $ADIOS2_PLUGIN_PATH"
+    echo "WRP_RUNTIME_CONF: $WRP_RUNTIME_CONF"
+    echo "ADIOS2_CONFIG_FILE: $ADIOS2_CONFIG_FILE"
+    echo ""
+fi
+
+#==============================================================================
+# Check Prerequisites
+#==============================================================================
+
+# Check if IowarpEngine plugin exists
+if [ ! -f "${IOWARP_BUILD_DIR}/bin/libiowarp_engine.so" ]; then
+    echo "Error: IowarpEngine plugin not found at ${IOWARP_BUILD_DIR}/bin/libiowarp_engine.so"
+    echo "Please build with: cmake --build . --target iowarp_engine"
+    exit 1
+fi
+
+# Check if Aneris profiler exists
+ANERIS_PROFILER="${IOWARP_BUILD_DIR}/bin/aneris-profiler"
+if [ ! -x "$ANERIS_PROFILER" ]; then
+    echo "Warning: Aneris profiler not found at $ANERIS_PROFILER"
+    if [ $NO_PROFILE -eq 0 ]; then
+        echo "Running application without telemetry capture..."
+    fi
+    echo ""
+    # Run the application directly
+    exec "$EXECUTABLE" "$@"
+fi
+
+#==============================================================================
+# Run with Telemetry
+#==============================================================================
+
+# Cleanup temporary files on exit
+cleanup() {
+    # Clean up temporary files
+    if [ -n "$TEMP_FILES" ]; then
+        rm -f $TEMP_FILES
+    fi
+}
+trap cleanup EXIT
+
+# Run application based on NO_PROFILE flag
+if [ $NO_PROFILE -eq 1 ]; then
+    echo "=== Interception Only (No Telemetry) ==="
+    echo "Running with CTE I/O interception but NO telemetry collection"
+    echo ""
+    
+    # Use aneris-profiler with --no-telemetry flag
+    ANERIS_ARGS="--no-telemetry"
+    if [ $REALTIME -eq 1 ]; then
+        # Note: --realtime has no effect with --no-telemetry, but allow it
+        echo "Note: --realtime flag ignored when using --no-profile"
+    fi
+    
+    # Run through aneris-profiler which handles CTE runtime
+    exec "$ANERIS_PROFILER" $ANERIS_ARGS "$EXECUTABLE" "$@"
+else
+    # Build aneris-profiler arguments
+    ANERIS_ARGS=""
+    if [ $REALTIME -eq 1 ]; then
+        ANERIS_ARGS="$ANERIS_ARGS --realtime"
+    fi
+    if [ -n "$OUTPUT_FILE" ]; then
+        ANERIS_ARGS="$ANERIS_ARGS -o $OUTPUT_FILE"
+    fi
+    
+    echo "Starting telemetry capture..."
+    echo ""
+    
+    # Run the application through aneris-profiler
+    exec "$ANERIS_PROFILER" $ANERIS_ARGS "$EXECUTABLE" "$@"
+fi
