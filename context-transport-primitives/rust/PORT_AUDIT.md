@@ -161,6 +161,27 @@ transport's `shm: ShmPtr<u8>` and the socket transport's `owned: bool` have
 to be re-expressed in terms of the canonical `FullPtr`/`desc`/`mr` (which is
 how the C++ carries exactly this information).
 
+### Resolved: `LbmContext`'s ring
+
+The last blocker for `ShmTransport`. The canonical context carried C++'s
+`char* copy_space` and `ShmTransferInfo* shm_info_` as two opaque `usize`
+handles; the shm port had fused them into a typed
+`ring: Option<ShmRing>`, whose own doc explains why: *"neither is meaningful
+without the other"*.
+
+Resolved in favour of the typed handle, on two grounds:
+
+1. **It cannot be half-populated.** Two independent opaque addresses let a
+   caller set one and forget the other; one handle cannot be wrong that way.
+2. **The layering objection is void.** It looked like an inversion —
+   `lightbeam.h`'s context knowing a type from `shm_transport.h` — until the
+   C++ turned out to do exactly that: `lightbeam.h:56` forward-declares
+   `struct ShmTransferInfo;`, defined at `shm_transport.h:63`, and holds a
+   pointer to it for precisely this purpose.
+
+So this is the second divergence kept because it is better, and again the
+deciding evidence was in the C++ rather than in taste.
+
 ### Resolved: the `ClientInfo.fd` width
 
 The last thing keeping `LbmMeta` split was `ClientInfo.fd`: `SocketId` (`u64`)
@@ -368,13 +389,14 @@ outside `#[cfg(test)]`. That one grep is what turned this audit from
 - [x] `Bulk` unified across both transports (`4cc5881f`, this commit).
       Lightbeam has exactly one; five declarations are down to three
       (`ctp-ds`'s, which §2 removes, and `ctp-net`'s thallium-local one).
-- [~] §1a — `SocketTransport` implements `Transport` and
-      `register_builtin_transports()` registers it, so
-      `TransportFactory::get(Socket, …)` returns a real backend. `Transport`
-      has its first non-test implementor. `ShmTransport` still does not — its
-      `LbmContext` carries a typed `ring: Option<ShmRing>` where the canonical
-      one has opaque `copy_space`/`shm_info` handles (C++ `char*` +
-      `ShmTransferInfo*`), and that wants deciding rather than papering over.
+- [x] §1a — **done**. `SocketTransport` and `ShmTransport` both implement
+      `Transport`, `register_builtin_transports()` registers both, and
+      `TransportFactory::get()` returns real backends for `Socket` and `Shm`.
+      Each has a test that drives a payload end to end through `dyn Transport`
+      and builds the transport only through the factory.
+- [x] `LbmContext` unified. The canonical one now carries the typed
+      `ring: Option<ShmRing>` the shm port invented, replacing the opaque
+      `copy_space`/`shm_info` pair — see below.
 - [x] `ClientInfo`/`LbmMeta`/`SocketId` unified (`this commit`). §1 is done:
       every shared lightbeam type is declared once, in `transport.rs`, and
       `use crate::` across the crate went 0 → 12.

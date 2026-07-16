@@ -17,5 +17,5 @@ pub mod socket_transport;
 /// Idempotent: re-registering replaces the entry with the same function.
 pub fn register_builtin_transports() {
     socket_transport::register();
-    // ShmTransport follows once its LbmContext carries the ring (PORT_AUDIT §1).
+    shm_transport::register();
 }

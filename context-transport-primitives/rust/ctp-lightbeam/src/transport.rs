@@ -181,6 +181,7 @@
 /// (Rust spells the byte `u8`), and lets `FullPtr::null()` and friends infer
 /// their type parameter as they did when this was a concrete struct.
 pub type FullPtr = ctp_memory::FullPtr<u8>;
+use crate::shm_transport::ShmRing;
 use ctp_memory::AllocatorId;
 use ctp_types::{bit_opt, Bitfield32};
 use std::collections::HashMap;
@@ -595,19 +596,25 @@ pub trait EventManager: Send + Sync {
 
 /// Per-call transport options (C++ `LbmContext`).
 ///
-/// The raw backend pointers (`copy_space`, `shm_info`, `meta_buf`) cross as
-/// opaque addresses — divergence 6.
+/// The remaining raw backend pointer (`meta_buf`) crosses as an opaque
+/// address — divergence 6.
 #[derive(Clone, Default)]
 pub struct LbmContext {
     /// Combination of `LBM_*` flags (C++ `flags`).
     pub flags: u32,
     /// Timeout in **milliseconds**; 0 = no timeout (C++ `timeout_ms`).
     pub timeout_ms: i32,
-    /// Shared buffer for chunked transfer (C++ `char* copy_space`); 0 = none.
-    pub copy_space: usize,
-    /// Transfer info in shared memory (C++ `ShmTransferInfo* shm_info_`);
-    /// 0 = none. The type lives in the SHM backend module.
-    pub shm_info: usize,
+    /// The SPSC ring this transfer runs over: C++ `char* copy_space` and
+    /// `ShmTransferInfo* shm_info_` fused into one handle.
+    ///
+    /// The two C++ fields are a pair — neither is meaningful without the
+    /// other — so they cross as a single [`ShmRing`] that cannot be
+    /// half-populated, rather than as two independent opaque addresses.
+    ///
+    /// That `lightbeam.h`'s context knows a type from `shm_transport.h` is not
+    /// an inversion this port invents: the C++ header forward-declares
+    /// `struct ShmTransferInfo;` and holds a pointer to it for exactly this.
+    pub ring: Option<ShmRing>,
     /// Pre-allocated framing buffer for the SHM transport, avoiding a heap
     /// allocation (C++ `char* meta_buf_`); 0 = none.
     pub meta_buf: usize,
@@ -638,8 +645,7 @@ impl LbmContext {
         Self {
             flags: 0,
             timeout_ms: 0,
-            copy_space: 0,
-            shm_info: 0,
+            ring: None,
             meta_buf: 0,
             meta_buf_size: 0,
             warp_parallel: false,
@@ -658,6 +664,16 @@ impl LbmContext {
             flags,
             ..Self::new()
         }
+    }
+
+    /// Attach the SPSC ring this transfer streams through (builder style).
+    ///
+    /// **Rust addition**: C++ callers assign `copy_space` and `shm_info_`
+    /// separately, which allows setting one and forgetting the other. One
+    /// handle, set once, cannot be half-populated.
+    pub fn with_ring(mut self, ring: ShmRing) -> Self {
+        self.ring = Some(ring);
+        self
     }
 
     /// C++ `LbmContext(uint32_t f, int timeout)`. `timeout_ms` is
@@ -704,8 +720,7 @@ impl fmt::Debug for LbmContext {
         f.debug_struct("LbmContext")
             .field("flags", &self.flags)
             .field("timeout_ms", &self.timeout_ms)
-            .field("copy_space", &self.copy_space)
-            .field("shm_info", &self.shm_info)
+            .field("ring", &self.ring)
             .field("meta_buf", &self.meta_buf)
             .field("meta_buf_size", &self.meta_buf_size)
             .field("warp_parallel", &self.warp_parallel)
@@ -1473,8 +1488,8 @@ mod tests {
         let c = LbmContext::new();
         assert_eq!(c.flags, 0);
         assert_eq!(c.timeout_ms, 0);
-        assert_eq!(c.copy_space, 0);
-        assert_eq!(c.shm_info, 0);
+        // C++ `copy_space = nullptr` + `shm_info_ = nullptr`, fused.
+        assert!(c.ring.is_none());
         assert_eq!(c.meta_buf, 0);
         assert_eq!(c.meta_buf_size, 0);
         assert!(!c.warp_parallel);
@@ -1528,7 +1543,7 @@ mod tests {
         assert!(c.has_file_dst() && c.has_timeout());
         // Everything the ctor doesn't touch stays at its default.
         assert_eq!(c.server_pid, 0);
-        assert_eq!(c.copy_space, 0);
+        assert!(c.ring.is_none());
         assert!(c.event_manager.is_none());
     }
 

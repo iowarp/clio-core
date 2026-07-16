@@ -268,6 +268,7 @@ pub use crate::transport::{TransportMode, TransportType};
 pub use crate::transport::{Bulk, FullPtr};
 pub use crate::transport::INVALID_SOCKET;
 use crate::transport::{alloc_recv_buffer, bulk_bytes, free_recv_buffer};
+use crate::transport::{TransportCtor, TransportFactory, TransportParams, TransportPtr};
 
 /// C++ `ctp::lbm::ClientInfo`.
 ///
@@ -283,63 +284,15 @@ pub use crate::transport::ClientInfo;
 /// existed only because `Bulk` and `ClientInfo` did.
 pub use crate::transport::LbmMeta;
 
-/// C++ `ctp::lbm::LbmContext`. Fields meaningless to the SHM path (`meta_buf_`,
-/// `warp_parallel_`, `dst_fd_`, `dst_offset_`) are omitted; `signal_pid` /
-/// `signal_tid` are retained but inert (divergence 7).
-#[derive(Debug, Default, Clone, Copy)]
-pub struct LbmContext {
-    /// Combination of `LBM_*` flags.
-    pub flags: u32,
-    /// Timeout in **milliseconds** (0 = no timeout).
-    pub timeout_ms: i32,
-    /// The SPSC ring this transfer runs over (C++ `copy_space` + `shm_info_`).
-    pub ring: Option<ShmRing>,
-    /// Server PID for the SHM liveness check (divergence 8).
-    pub server_pid: i32,
-    /// Waiter PID for `EventManager::Signal` (divergence 7).
-    pub signal_pid: i32,
-    /// Waiter TID for `EventManager::Signal` (divergence 7).
-    pub signal_tid: i32,
-}
+/// C++ `ctp::lbm::LbmContext` — from [`crate::transport`] (`lightbeam.h`),
+/// which declares it once.
+///
+/// This module used to declare a SHM-shaped subset. The canonical type now
+/// carries the same typed `ring` handle this module introduced (the C++
+/// `copy_space` + `shm_info_` pair fused), so the subset bought nothing; the
+/// fields meaningless to the SHM path are simply ignored here, as in the C++.
+pub use crate::transport::LbmContext;
 
-impl LbmContext {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// C++ `LbmContext(uint32_t f)`.
-    pub fn with_flags(flags: u32) -> Self {
-        Self {
-            flags,
-            ..Self::default()
-        }
-    }
-
-    /// C++ `LbmContext(uint32_t f, int timeout)`.
-    pub fn with_timeout(flags: u32, timeout_ms: i32) -> Self {
-        Self {
-            flags,
-            timeout_ms,
-            ..Self::default()
-        }
-    }
-
-    /// Attach the ring this transfer streams through (builder style).
-    pub fn with_ring(mut self, ring: ShmRing) -> Self {
-        self.ring = Some(ring);
-        self
-    }
-
-    /// C++ `IsSync()`.
-    pub fn is_sync(&self) -> bool {
-        (self.flags & LBM_SYNC) != 0
-    }
-
-    /// C++ `HasTimeout()`.
-    pub fn has_timeout(&self) -> bool {
-        self.timeout_ms > 0
-    }
-}
 
 // ---------------------------------------------------------------------------
 // LocalSerialize equivalent (divergence 13)
@@ -1757,6 +1710,64 @@ impl Drop for ShmMpscTransport {
 // Tests
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Transport (lightbeam.h's polymorphic surface)
+// ---------------------------------------------------------------------------
+
+impl crate::transport::Transport for ShmTransport {
+    fn transport_type(&self) -> TransportType {
+        self.transport_type
+    }
+
+    fn mode(&self) -> TransportMode {
+        self.mode
+    }
+
+    fn expose(&mut self, ptr: FullPtr, data_size: usize, flags: u32) -> Bulk {
+        ShmTransport::expose(self, ptr, data_size, flags)
+    }
+
+    fn send(&mut self, meta: &mut LbmMeta, ctx: &LbmContext) -> i32 {
+        // Free functions: this transport is stateless — the ring it streams
+        // over arrives in the context, not in `self`.
+        ShmTransport::send(meta, ctx)
+    }
+
+    fn recv(&mut self, meta: &mut LbmMeta, ctx: &LbmContext) -> ClientInfo {
+        ShmTransport::recv(meta, ctx)
+    }
+
+    fn address(&self) -> String {
+        ShmTransport::address(self).to_string()
+    }
+
+    fn clear_recv_handles(&mut self, meta: &mut LbmMeta) {
+        ShmTransport::clear_recv_handles(meta);
+    }
+
+    fn is_server_alive(&self, ctx: &LbmContext) -> bool {
+        ShmTransport::is_server_alive(self, ctx)
+    }
+
+    // register_event_manager / poll_recv / bound_port keep their defaults —
+    // the trait documents each default as the SHM arm's behavior already.
+}
+
+/// Build a [`ShmTransport`] from factory params (a [`TransportCtor`]).
+///
+/// Infallible: the transport carries only its mode and type; the ring it
+/// streams over is supplied per-call in the [`LbmContext`]. `addr`,
+/// `protocol` and `port` are meaningless here and ignored, as in the C++.
+pub fn transport_ctor(p: &TransportParams) -> Option<TransportPtr> {
+    Some(Box::new(ShmTransport::new(p.mode)) as TransportPtr)
+}
+
+/// Register this backend with [`TransportFactory`] under
+/// [`TransportType::Shm`]. See [`crate::register_builtin_transports`].
+pub fn register() -> Option<TransportCtor> {
+    TransportFactory::register(TransportType::Shm, transport_ctor)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2519,5 +2530,47 @@ mod tests {
         assert_eq!(out, msg);
         assert_eq!(conn, c.conn_id);
         assert!(start.elapsed() >= Duration::from_micros(SHM_MPSC_DEAD_XFER_US));
+    }
+
+    #[test]
+    fn shm_transport_round_trips_through_the_transport_trait() {
+        crate::register_builtin_transports();
+        assert!(TransportFactory::is_registered(TransportType::Shm));
+
+        // Built only through the factory, driven only through the trait.
+        let mut t = TransportFactory::get(
+            "",
+            TransportType::Shm,
+            TransportMode::Client,
+            "",
+            0,
+        )
+        .expect("the factory must produce a real shm transport");
+        assert_eq!(t.transport_type(), TransportType::Shm);
+        assert_eq!(t.mode(), TransportMode::Client);
+        assert_eq!(t.address(), "shm");
+        // Defaults the SHM arm inherits rather than overrides.
+        assert_eq!(t.bound_port(), 0, "not a TCP backend");
+        assert_eq!(t.poll_recv(0), 0, "blocks via the EventManager, not natively");
+
+        let buf = ShmRingBuffer::new(4096);
+        let ctx = LbmContext::new().with_ring(buf.ring());
+        let payload: Vec<u8> = (0..48u8).collect();
+
+        let mut out = LbmMeta::new();
+        out.send.push(priv_bulk(&payload, payload.len(), BULK_XFER));
+        out.send_bulks = 1;
+        assert_eq!(t.send(&mut out, &ctx), 0);
+
+        let mut got = LbmMeta::new();
+        got.send = out.send.clone();
+        let info = t.recv(&mut got, &ctx);
+        assert_eq!(info.rc, 0);
+        assert_eq!(bytes(&got.recv[0]), &payload[..]);
+
+        // The release path works through the trait too, and is idempotent.
+        t.clear_recv_handles(&mut got);
+        assert!(no_buffer(&got.recv[0]));
+        t.clear_recv_handles(&mut got);
     }
 }
