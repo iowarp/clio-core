@@ -1,0 +1,10 @@
+[package]
+name = "ctp-types"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Core CTP types (Rust adaptation, issue #756)"
+
+[lib]
+name = "ctp_types"

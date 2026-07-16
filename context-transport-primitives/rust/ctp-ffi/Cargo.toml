@@ -1,0 +1,19 @@
+[package]
+name = "ctp-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "C ABI over the ctp-rs crates for C++ consumers (issue #756)"
+
+[lib]
+name = "ctp_rs"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]
+ctp-types = { workspace = true }
+ctp-introspect = { workspace = true }
+ctp-coroutine = { workspace = true }
+
+[features]
+boost-fibers = ["ctp-coroutine/boost-fibers"]

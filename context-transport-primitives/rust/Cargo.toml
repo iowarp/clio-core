@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = [
+    "ctp-types",
+    "ctp-introspect",
+    "ctp-coroutine",
+    "ctp-ffi",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "BSD-3-Clause"
+repository = "https://github.com/iowarp/clio-core"
+
+[workspace.dependencies]
+ctp-types = { path = "ctp-types" }
+ctp-introspect = { path = "ctp-introspect" }
+ctp-coroutine = { path = "ctp-coroutine" }
+libc = "0.2"
+cc = "1"
+
+[profile.release]
+lto = "thin"

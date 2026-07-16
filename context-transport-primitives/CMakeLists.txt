@@ -540,3 +540,33 @@ install(EXPORT ${CLIO_CTP_EXPORTED_TARGETS}
 if(CLIO_CORE_ENABLE_JARVIS)
     jarvis_repo_add("${CTP_ROOT}/test/jarvis_hshm")
 endif()
+
+# ------------------------------------------------------------------------------
+# ctp-rs: Rust adaptation of CTP (issue #756). Default OFF — existing builds
+# and CI are unaffected until opted in. Builds the cargo workspace under
+# rust/ and registers `cargo test` as a ctest. The C ABI header for C++
+# consumers is rust/ctp-ffi/include/ctp_rs.h.
+# ------------------------------------------------------------------------------
+option(CLIO_CTP_ENABLE_RUST "Build the ctp-rs Rust workspace (issue #756)" OFF)
+
+if(CLIO_CTP_ENABLE_RUST)
+    find_program(CARGO_EXECUTABLE cargo REQUIRED
+        DOC "cargo is required when CLIO_CTP_ENABLE_RUST=ON")
+    set(CTP_RS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/rust)
+    # Keep cargo's artifacts inside the CMake build tree (never in-source).
+    set(CTP_RS_TARGET_DIR ${CMAKE_BINARY_DIR}/ctp-rs-target)
+
+    add_custom_target(ctp_rs ALL
+        COMMAND ${CMAKE_COMMAND} -E env CARGO_TARGET_DIR=${CTP_RS_TARGET_DIR}
+                ${CARGO_EXECUTABLE} build --release --workspace
+        WORKING_DIRECTORY ${CTP_RS_DIR}
+        COMMENT "Building ctp-rs cargo workspace (Rust CTP, issue #756)")
+
+    add_test(NAME ctp_rs_cargo_test
+        COMMAND ${CMAKE_COMMAND} -E env CARGO_TARGET_DIR=${CTP_RS_TARGET_DIR}
+                ${CARGO_EXECUTABLE} test --workspace
+        WORKING_DIRECTORY ${CTP_RS_DIR})
+    set_tests_properties(ctp_rs_cargo_test PROPERTIES
+        TIMEOUT 600
+        LABELS "unit;rust;ctp")
+endif()

@@ -1,0 +1,21 @@
+[package]
+name = "ctp-coroutine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Coroutine abstraction with stackless (Rust async) and stackful (Boost.Context) backends (issue #756)"
+build = "build.rs"
+
+[lib]
+name = "ctp_coroutine"
+
+[features]
+default = []
+# Stackful fibers wrapping Boost.Context via shim/boost_fiber_shim.cc.
+# Requires boost headers + libboost_context; see build.rs for the
+# BOOST_ROOT / BOOST_INCLUDE_DIR / BOOST_LIB_DIR environment variables.
+boost-fibers = []
+
+[build-dependencies]
+cc = { workspace = true }
