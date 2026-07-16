@@ -63,6 +63,15 @@ pub trait BulkAllocator {
 // Domain types (clio_runtime/types.h)
 // ---------------------------------------------------------------------------
 
+/// The local archives (`local_task_archives.h`) are not ported yet. When they
+/// are, they should reuse [`TaskInfo`] rather than port `LocalTaskInfo`
+/// alongside it: the two C++ structs are field-for-field identical
+/// (`TaskId task_id_; PoolId pool_id_; u32 method_id_;`) and differ only in
+/// how they serialize — `TaskInfo::serialize` delegates (`ar(task_id_,
+/// pool_id_, method_id_)`), while `LocalTaskInfo` expands the fields by hand
+/// and adds `ctp::ipc::save`/`load` overloads. That is one type with two wire
+/// encodings, which in Rust is one struct with two trait impls.
+///
 /// C++ `clio::run::TaskInfo` — task metadata carried per serialized task
 /// (44 wire bytes).
 #[repr(C)]

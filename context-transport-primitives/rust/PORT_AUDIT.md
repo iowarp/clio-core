@@ -410,14 +410,19 @@ outside `#[cfg(test)]`. That one grep is what turned this audit from
       `UniqueId`/`TaskId` are out of `ctp-ds` (806 lines) and now live in
       `context-runtime/rust/clio-run-archives`. `ctp-ds` keeps the byte engine.
       No CTP crate defines a `clio::run` type any more.
-- [ ] §2b — `ctp-ds/src/local_serialize.rs` may have the same problem: its
-      module doc says it ports `clio::run::Default{Save,Load}Archive` /
-      `LocalSaveTask` / `LocalLoadTask`, which are runtime types
-      (`container.h` takes `DefaultLoadArchive&`), while the C++
-      `clio_ctp/.../local_serialize.h` defines only `CalculateSizeArchive`,
-      `LocalSerialize` and `LocalDeserialize`. Needs the same triage: which of
-      `LocalSaveArchive`/`LocalLoadArchive` are CTP's and which are the
-      runtime's.
+- [x] §2b — **false alarm, and a misread on my part.** `local_serialize.rs`
+      is clean: `LocalSaveArchive`/`LocalLoadArchive` are plain byte
+      serializers (`&mut Vec<u8>` + cursor), i.e. CTP's `LocalSerialize`/
+      `LocalDeserialize`. The module doc even carries a section headed *"Not
+      in this module (the task-archive layer)"* stating that
+      `Default{Save,Load}Archive` "live in `context-runtime` … not in
+      `ctp-ds`. This module is the complete `ctp::ipc` substrate they are
+      built from." I grepped for `clio::run`, hit that *"what is not here"*
+      note, and read it as *"what is here"*.
+      Two lessons. A `grep` for a name finds prose as readily as code, and the
+      prose may be saying the opposite. And this agent got the boundary right
+      *and wrote it down* — the tranche is not uniformly careless, so a
+      finding needs the same verification as a fix.
 - [ ] §3 — triage `RingBufferEntry`, the GPU look-alikes.
 - [x] `BulkAllocator`'s hollowness explained, not fixed: it models
       `CLIO_IPC->AllocateBuffer` — the runtime's `IpcManager` seen from the
