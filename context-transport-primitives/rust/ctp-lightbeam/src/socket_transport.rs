@@ -207,7 +207,8 @@ use std::os::unix::net::{UnixListener, UnixStream};
 #[cfg(windows)]
 use std::os::windows::io::AsRawSocket;
 
-use ctp_types::{bit_opt, Bitfield32};
+use ctp_memory::ShmPtr;
+use ctp_types::bit_opt;
 
 // ---------------------------------------------------------------------------
 // Constants (lightbeam.h / event_manager.h / posix_socket.h)
@@ -267,24 +268,12 @@ pub type SocketId = u64;
 /// includes. Re-exported so this module's spelling is the same type.
 pub use crate::transport::{TransportMode, TransportType};
 
-/// `ctp::lbm::Bulk` — a bulk descriptor plus (in Rust) its buffer.
-///
-/// `size` is the descriptor's authoritative length and the only payload field
-/// on the wire; `data` is the local buffer. `desc`/`mr` (RDMA registration
-/// handles, unused by the socket backend) are not ported.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct Bulk {
-    /// Payload buffer. Empty for `BULK_EXPOSE`-only descriptors.
-    pub data: Vec<u8>,
-    /// Logical payload size (serialized).
-    pub size: usize,
-    /// `BULK_EXPOSE` and/or `BULK_XFER`.
-    pub flags: Bitfield32,
-    /// True when `recv_bulks` allocated `data` itself — the Rust stand-in for
-    /// the C++ `AllocatorId(UINT32_MAX-1, UINT32_MAX-1)` sentinel
-    /// (divergence 7).
-    pub owned: bool,
-}
+/// `ctp::lbm::Bulk` — from [`crate::transport`] (`lightbeam.h`), which
+/// declares it once. This module used to declare its own, holding an owned
+/// `Vec<u8>` plus an `owned: bool`; see the type's docs and
+/// [`RECV_ALLOCATED_ID`] for why the buffer is pointed at rather than owned,
+/// and why ownership rides on the allocator id rather than a flag.
+pub use crate::transport::{Bulk, FullPtr, RECV_ALLOCATED_ID};
 
 /// `ctp::lbm::ClientInfo` — returned by `Recv`, consumed by `Send` for routing.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -820,12 +809,12 @@ impl<'a> MetaCursor<'a> {
         for _ in 0..count {
             let size = self.u64()?;
             let flags = self.u32()?;
-            out.push(Bulk {
-                data: Vec::new(),
-                size: usize::try_from(size).map_err(|_| ())?,
-                flags: Bitfield32::new(flags),
-                owned: false,
-            });
+            // No buffer yet: recv_bulks allocates one if this is a XFER.
+            out.push(Bulk::new(
+                FullPtr::null(),
+                usize::try_from(size).map_err(|_| ())?,
+                flags,
+            ));
         }
         Ok(out)
     }
@@ -848,11 +837,65 @@ fn decode_meta(buf: &[u8], meta: &mut LbmMeta) -> Result<(), ()> {
 
 /// Allocate `len` zeroed bytes, or `None` if the allocation would fail —
 /// std's `vec![0; len]` aborts the process instead (divergence 8).
+/// A zeroed `Vec` of `len` bytes, or `None` if the allocation fails.
+///
+/// Fallible on purpose: `len` comes off the wire, so a bogus length must fail
+/// rather than abort the process. Used for the metadata buffer, which is
+/// genuinely owned by its local variable — unlike a bulk payload, which is
+/// pointed at rather than owned.
 fn try_alloc_zeroed(len: usize) -> Option<Vec<u8>> {
     let mut v: Vec<u8> = Vec::new();
     v.try_reserve_exact(len).ok()?;
     v.resize(len, 0);
     Some(v)
+}
+
+/// Allocate a zeroed receive buffer of exactly `len` bytes and leak it,
+/// returning its address (0 is never returned).
+///
+/// C++ `RecvBulks` does `malloc(size)` here. The buffer is owned by the `Bulk`
+/// that points at it and is reclaimed by [`SocketTransport::clear_recv_handles`]
+/// via [`free_recv_buffer`] — so `Bulk`, like the C++ one, holds a location
+/// rather than storage.
+///
+/// Fallible (`try_reserve_exact`): a bad `size` off the wire must not abort.
+/// `into_boxed_slice` pins capacity to `len`, which is what makes freeing with
+/// the recorded size sound.
+fn alloc_recv_buffer(len: usize) -> Option<usize> {
+    let mut v: Vec<u8> = Vec::new();
+    v.try_reserve_exact(len).ok()?;
+    v.resize(len, 0);
+    let mut b = v.into_boxed_slice();
+    let addr = b.as_mut_ptr() as usize;
+    std::mem::forget(b);
+    Some(addr)
+}
+
+/// Free a buffer from [`alloc_recv_buffer`].
+///
+/// # Safety
+///
+/// `addr` must come from [`alloc_recv_buffer`], and `len` must be the exact
+/// length it was allocated with — `Bulk::size`, which must not have been
+/// changed since. Nothing else may free it. C++ gets to use size-agnostic
+/// `free` here; Rust's allocator wants the layout back, so the size invariant
+/// is the price of the same operation.
+unsafe fn free_recv_buffer(addr: usize, len: usize) {
+    let slice = std::ptr::slice_from_raw_parts_mut(addr as *mut u8, len);
+    drop(unsafe { Box::from_raw(slice) });
+}
+
+/// The bytes a `Bulk` points at.
+///
+/// # Safety
+///
+/// `bulk.data.ptr` must address at least `bulk.size` valid, initialized bytes
+/// that stay alive and unaliased for `'a`. This is the C++ contract verbatim:
+/// `Bulk` carries a location and the sender guarantees the memory. It is also
+/// the one place the safety has to be given up — a `FullPtr` may point into a
+/// shared segment, and a cross-process pointer cannot be a safe slice.
+unsafe fn bulk_bytes<'a>(bulk: &Bulk) -> &'a [u8] {
+    unsafe { std::slice::from_raw_parts(bulk.data.ptr as *const u8, bulk.size) }
 }
 
 // ---------------------------------------------------------------------------
@@ -879,14 +922,22 @@ struct Conn {
 /// let mut client =
 ///     SocketTransport::new(TransportMode::Client, "127.0.0.1", "tcp", port).unwrap();
 ///
+/// // A Bulk points at memory rather than owning it, so the payload has to
+/// // outlive the transfer — here the local `payload`, in the runtime the
+/// // task archive that exposed it.
+/// let payload = b"hello".to_vec();
+/// let ptr = FullPtr::from_local(payload.as_ptr() as usize);
+///
 /// let mut out = LbmMeta::default();
-/// out.send.push(SocketTransport::expose(b"hello".to_vec(), 5, BULK_XFER));
+/// out.send.push(client.expose(ptr, payload.len(), BULK_XFER));
 /// assert_eq!(client.send(&out, &LbmContext::default()), 0);
 ///
 /// let mut got = LbmMeta::default();
 /// let info = server.recv(&mut got, &LbmContext::default());
 /// if info.rc == 0 {
-///     assert_eq!(got.recv[0].data, b"hello".to_vec());
+///     // recv allocated this buffer, so the server must release it.
+///     assert_eq!(got.recv[0].size, 5);
+///     server.clear_recv_handles(&mut got);
 /// }
 /// ```
 #[derive(Debug)]
@@ -987,13 +1038,12 @@ impl SocketTransport {
 
     /// `Expose(ptr, data_size, flags)`. Takes ownership of the buffer, since
     /// `Bulk::data` is an owned `Vec` here (divergence 7).
-    pub fn expose(data: Vec<u8>, data_size: usize, flags: u32) -> Bulk {
-        Bulk {
-            data,
-            size: data_size,
-            flags: Bitfield32::new(flags),
-            owned: false,
-        }
+    /// `Expose(ptr, data_size, flags)` — describe caller-owned memory.
+    ///
+    /// The C++ body is exactly this: copy the pointer in, record size and
+    /// flags. The memory belongs to the caller and must outlive the transfer.
+    pub fn expose(&self, ptr: FullPtr, data_size: usize, flags: u32) -> Bulk {
+        Bulk::new(ptr, data_size, flags)
     }
 
     /// `ClearRecvHandles(meta)` — release the buffers this transport allocated.
@@ -1003,9 +1053,17 @@ impl SocketTransport {
     /// `Vec` handles the rest (divergence 7).
     pub fn clear_recv_handles(&self, meta: &mut LbmMeta) {
         for bulk in &mut meta.recv {
-            if bulk.owned {
-                bulk.data = Vec::new();
-                bulk.owned = false;
+            // Only free buffers recv_bulks allocated itself, tagged with
+            // RECV_ALLOCATED_ID. A CTP-allocator buffer swapped in by the task
+            // archive must NOT be freed here — its user pointer sits inside a
+            // larger region, so this would be a bad-free rather than a leak.
+            if bulk.is_recv_allocated() {
+                // SAFETY: is_recv_allocated proves the buffer came from
+                // alloc_recv_buffer; `size` is unchanged since it was set.
+                unsafe { free_recv_buffer(bulk.data.ptr, bulk.size) };
+                // Null only the local half, as the C++ does: that alone makes
+                // is_recv_allocated false, so a second call is a no-op.
+                bulk.data.ptr = 0;
             }
         }
     }
@@ -1116,12 +1174,21 @@ impl SocketTransport {
             if !b.flags.any(BULK_XFER) {
                 continue;
             }
-            // C++ reads `size` bytes from the raw pointer — out of bounds when
-            // the two disagree (divergence 14).
-            if b.data.len() != b.size {
+            // A zero-length bulk carries no bytes, so a null pointer is fine
+            // and there is nothing to read.
+            if b.size == 0 {
+                continue;
+            }
+            // C++ reads `size` bytes straight from the pointer. Refuse a null
+            // one rather than inherit that dereference — but note this is the
+            // only check left: `size` is now the sender's word, exactly as in
+            // C++, because a pointer has no length to cross-check it against.
+            if b.data.ptr == 0 {
                 return -1;
             }
-            iov.push(IoSlice::new(&b.data));
+            // SAFETY: the sender exposed this region and keeps it alive for
+            // the call; `size` is the length it exposed.
+            iov.push(IoSlice::new(unsafe { bulk_bytes(b) }));
         }
 
         // 4. Single vectored write.
@@ -1240,12 +1307,11 @@ impl SocketTransport {
         meta.client_info.fd = fd;
         // Set up recv entries from the send descriptors.
         for i in 0..meta.send.len() {
-            let recv_bulk = Bulk {
-                data: Vec::new(),
-                size: meta.send[i].size,
-                flags: meta.send[i].flags,
-                owned: false,
-            };
+            let recv_bulk = Bulk::new(
+                FullPtr::null(),
+                meta.send[i].size,
+                meta.send[i].flags.bits(),
+            );
             meta.recv.push(recv_bulk);
         }
         Self::recv_bulks(s, meta, ctx)
@@ -1283,18 +1349,30 @@ impl SocketTransport {
                 continue;
             }
             let size = bulk.size;
-            // C++: `buf == nullptr` → malloc. Here: no buffer big enough yet.
-            let allocated = bulk.data.len() < size;
+            // Nothing to receive, so nothing to allocate. Rust's zero-length
+            // allocations hand back a dangling-but-non-null pointer, which
+            // would look like a real buffer to clear_recv_handles and cost a
+            // pointless round trip through the allocator.
+            if size == 0 {
+                continue;
+            }
+            // C++: `buf == nullptr` → malloc, tagged with the sentinel so
+            // ClearRecvHandles knows this buffer is ours to free.
+            let allocated = bulk.data.ptr == 0;
             if allocated {
-                let Some(buf) = try_alloc_zeroed(size) else {
+                let Some(addr) = alloc_recv_buffer(size) else {
                     return -1;
                 };
-                bulk.data = buf;
+                bulk.data = FullPtr::new(addr, ShmPtr::new(RECV_ALLOCATED_ID, addr as u64));
             }
 
+            // SAFETY: either we just allocated `size` bytes at this address, or
+            // the caller supplied a region it promised is `size` bytes. No
+            // other reference to it exists while we fill it.
+            let dst = unsafe { std::slice::from_raw_parts_mut(bulk.data.ptr as *mut u8, size) };
             let mut rc;
             loop {
-                rc = recv_exact(s, &mut bulk.data[..size]);
+                rc = recv_exact(s, dst);
                 if rc != EAGAIN {
                     break;
                 }
@@ -1306,15 +1384,11 @@ impl SocketTransport {
 
             if rc != 0 {
                 if allocated {
-                    bulk.data = Vec::new();
+                    // SAFETY: allocated by us above, size unchanged.
+                    unsafe { free_recv_buffer(bulk.data.ptr, size) };
+                    bulk.data = FullPtr::null();
                 }
                 return last_os_error();
-            }
-
-            if allocated {
-                // C++ tags the buffer with the malloc sentinel here so
-                // ClearRecvHandles knows it owns it (divergence 7).
-                bulk.owned = true;
             }
         }
         0
@@ -1362,6 +1436,7 @@ impl Drop for SocketTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ctp_memory::AllocatorId;
 
     const LOCALHOST: &str = "127.0.0.1";
 
@@ -1402,8 +1477,36 @@ mod tests {
             .expect("connecting to a listening port must succeed")
     }
 
+    /// A XFER bulk over `data`.
+    ///
+    /// `Bulk` points at memory rather than owning it, so the bytes must
+    /// outlive the transfer — a real sender keeps them alive in the task
+    /// archive. Tests leak instead, which costs a few bytes per case and
+    /// keeps the lifetime out of the assertions.
     fn xfer(data: &[u8]) -> Bulk {
-        SocketTransport::expose(data.to_vec(), data.len(), BULK_XFER)
+        let leaked: &'static mut [u8] = Box::leak(data.to_vec().into_boxed_slice());
+        let addr = leaked.as_mut_ptr() as usize;
+        Bulk::new(FullPtr::from_local(addr), data.len(), BULK_XFER)
+    }
+
+    /// An EXPOSE-only bulk of `size` bytes over no buffer.
+    fn expose_only(size: usize) -> Bulk {
+        Bulk::new(FullPtr::null(), size, BULK_EXPOSE)
+    }
+
+    /// The bytes a bulk points at, for assertions.
+    fn bytes(b: &Bulk) -> &[u8] {
+        if b.data.ptr == 0 {
+            return &[];
+        }
+        // SAFETY: every bulk in these tests points at `size` live bytes —
+        // either leaked by `xfer` or allocated by the transport's recv path.
+        unsafe { bulk_bytes(b) }
+    }
+
+    /// True when the bulk has no buffer at all.
+    fn is_empty(b: &Bulk) -> bool {
+        b.data.ptr == 0
     }
 
     // -- byte order --------------------------------------------------------
@@ -1424,13 +1527,9 @@ mod tests {
         let mut meta = LbmMeta {
             send: vec![
                 xfer(&[1, 2, 3]),
-                SocketTransport::expose(Vec::new(), 4096, BULK_EXPOSE),
+                expose_only(4096),
             ],
-            recv: vec![SocketTransport::expose(
-                Vec::new(),
-                7,
-                BULK_XFER | BULK_EXPOSE,
-            )],
+            recv: vec![Bulk::new(FullPtr::null(), 7, BULK_XFER | BULK_EXPOSE)],
             send_bulks: 1,
             recv_bulks: 1,
             client_info: ClientInfo::default(),
@@ -1451,7 +1550,7 @@ mod tests {
         assert_eq!(out.send_bulks, 1);
         assert_eq!(out.recv_bulks, 1);
         // Only descriptors travel — never the payload.
-        assert!(out.send[0].data.is_empty());
+        assert!(is_empty(&out.send[0]));
 
         // client_info_ is not serialized, so encoding stays byte-identical.
         let before = buf.clone();
@@ -1582,13 +1681,13 @@ mod tests {
         // recv entries are appended one per send descriptor.
         assert_eq!(got.recv.len(), 1);
         assert_eq!(got.recv[0].size, payload.len());
-        assert_eq!(got.recv[0].data, payload);
-        assert!(got.recv[0].owned, "the transport allocated this buffer");
+        assert_eq!(bytes(&got.recv[0]), &payload[..]);
+        assert!(got.recv[0].is_recv_allocated(), "the transport allocated this buffer");
 
         // ClearRecvHandles releases only what the transport owns.
         server.clear_recv_handles(&mut got);
-        assert!(got.recv[0].data.is_empty());
-        assert!(!got.recv[0].owned);
+        assert!(is_empty(&got.recv[0]));
+        assert!(!got.recv[0].is_recv_allocated());
     }
 
     #[test]
@@ -1602,7 +1701,7 @@ mod tests {
             send: vec![
                 xfer(&a),
                 // EXPOSE-only: the descriptor travels, the payload does not.
-                SocketTransport::expose(Vec::new(), 999, BULK_EXPOSE),
+                expose_only(999),
                 xfer(&b),
             ],
             send_bulks: 2,
@@ -1613,13 +1712,13 @@ mod tests {
         let mut got = LbmMeta::default();
         assert_eq!(recv_until(&mut server, &mut got, 5_000).rc, 0);
         assert_eq!(got.recv.len(), 3);
-        assert_eq!(got.recv[0].data, a);
-        assert!(got.recv[0].owned);
+        assert_eq!(bytes(&got.recv[0]), &a[..]);
+        assert!(got.recv[0].is_recv_allocated());
         // The EXPOSE-only descriptor keeps its size but gets no buffer.
         assert_eq!(got.recv[1].size, 999);
-        assert!(got.recv[1].data.is_empty());
-        assert!(!got.recv[1].owned);
-        assert_eq!(got.recv[2].data, b);
+        assert!(is_empty(&got.recv[1]));
+        assert!(!got.recv[1].is_recv_allocated());
+        assert_eq!(bytes(&got.recv[2]), &b[..]);
     }
 
     #[test]
@@ -1641,7 +1740,7 @@ mod tests {
         let mut client = client_to(server.bound_port());
 
         let out = LbmMeta {
-            send: vec![SocketTransport::expose(Vec::new(), 0, BULK_XFER)],
+            send: vec![Bulk::new(FullPtr::null(), 0, BULK_XFER)],
             send_bulks: 1,
             ..Default::default()
         };
@@ -1651,7 +1750,7 @@ mod tests {
         assert_eq!(recv_until(&mut server, &mut got, 5_000).rc, 0);
         assert_eq!(got.recv.len(), 1);
         assert_eq!(got.recv[0].size, 0);
-        assert!(got.recv[0].data.is_empty());
+        assert!(is_empty(&got.recv[0]));
     }
 
     #[test]
@@ -1677,8 +1776,8 @@ mod tests {
         let info = recv_until(&mut server, &mut got, 30_000);
         assert_eq!(sender.join().expect("sender thread"), 0);
         assert_eq!(info.rc, 0);
-        assert_eq!(got.recv[0].data.len(), expected.len());
-        assert_eq!(got.recv[0].data, expected);
+        assert_eq!(bytes(&got.recv[0]).len(), expected.len());
+        assert_eq!(bytes(&got.recv[0]), &expected[..]);
     }
 
     #[test]
@@ -1702,7 +1801,7 @@ mod tests {
         assert_eq!(recv_until(&mut server, &mut got, 5_000).rc, 0);
         assert_eq!(got.recv.len(), n);
         for (i, b) in got.recv.iter().enumerate() {
-            assert_eq!(b.data, vec![i as u8; 8], "bulk {i} must survive intact");
+            assert_eq!(bytes(b), &vec![i as u8; 8][..], "bulk {i} must survive intact");
         }
     }
 
@@ -1721,7 +1820,7 @@ mod tests {
         let mut got = LbmMeta::default();
         let info = recv_until(&mut server, &mut got, 5_000);
         assert_eq!(info.rc, 0);
-        assert_eq!(got.recv[0].data, b"ping".to_vec());
+        assert_eq!(bytes(&got.recv[0]), b"ping");
 
         // Reply on the fd Recv reported.
         let reply = LbmMeta {
@@ -1734,7 +1833,7 @@ mod tests {
 
         let mut back = LbmMeta::default();
         assert_eq!(recv_until(&mut client, &mut back, 5_000).rc, 0);
-        assert_eq!(back.recv[0].data, b"pong".to_vec());
+        assert_eq!(bytes(&back.recv[0]), b"pong");
     }
 
     #[test]
@@ -1761,7 +1860,7 @@ mod tests {
             let mut got = LbmMeta::default();
             let info = server.recv(&mut got, &LbmContext::default());
             if info.rc == 0 {
-                seen.push(got.recv[0].data[0]);
+                seen.push(bytes(&got.recv[0])[0]);
             }
         }
         seen.sort_unstable();
@@ -1810,17 +1909,30 @@ mod tests {
     }
 
     #[test]
-    fn send_rejects_a_bulk_whose_size_disagrees_with_its_buffer() {
-        // C++ would read `size` bytes past the end of the buffer
-        // (divergence 14).
+    fn send_refuses_a_null_buffer_but_trusts_the_size() {
+        // `size` is the sender's word. This port previously carried a Vec and
+        // could reject `data.len() != size`; a Bulk now holds a FullPtr, which
+        // has no length to cross-check against, so that net is gone — the same
+        // contract C++ has always had. It is the price of letting a bulk point
+        // into a shared segment instead of owning a copy.
         let server = server_on_ephemeral_port();
         let mut client = client_to(server.bound_port());
-        let out = LbmMeta {
-            send: vec![SocketTransport::expose(vec![1, 2, 3], 64, BULK_XFER)],
+
+        // The one thing still checkable: a non-zero size over a null pointer.
+        let bad = LbmMeta {
+            send: vec![Bulk::new(FullPtr::null(), 64, BULK_XFER)],
             send_bulks: 1,
             ..Default::default()
         };
-        assert_eq!(client.send(&out, &LbmContext::default()), -1);
+        assert_eq!(client.send(&bad, &LbmContext::default()), -1);
+
+        // A zero-sized bulk over a null pointer is legitimate, not an error.
+        let empty = LbmMeta {
+            send: vec![Bulk::new(FullPtr::null(), 0, BULK_XFER)],
+            send_bulks: 1,
+            ..Default::default()
+        };
+        assert_eq!(client.send(&empty, &LbmContext::default()), 0);
     }
 
     #[test]
@@ -2037,7 +2149,7 @@ mod tests {
         let mut got = LbmMeta::default();
         let info = recv_until(&mut server, &mut got, 5_000);
         assert_eq!(info.rc, 0);
-        assert_eq!(got.recv[0].data, b"data".to_vec());
+        assert_eq!(bytes(&got.recv[0]), b"data");
     }
 
     #[test]
@@ -2132,11 +2244,17 @@ mod tests {
 
     #[test]
     fn expose_builds_the_descriptor() {
-        let b = SocketTransport::expose(vec![1, 2, 3, 4], 4, BULK_XFER | BULK_EXPOSE);
+        let t = server_on_ephemeral_port();
+        let src = xfer(&[1, 2, 3, 4]);
+        let b = t.expose(src.data, 4, BULK_XFER | BULK_EXPOSE);
         assert_eq!(b.size, 4);
         assert!(b.flags.all(BULK_XFER | BULK_EXPOSE));
-        assert!(!b.owned, "Expose never allocates on the transport's behalf");
-        assert_eq!(b.data, vec![1, 2, 3, 4]);
+        assert!(
+            !b.is_recv_allocated(),
+            "Expose never allocates on the transport's behalf — it only              describes memory the caller already owns"
+        );
+        assert_eq!(bytes(&b), &[1, 2, 3, 4][..], "the pointer is passed through");
+        assert_eq!(b.data, src.data, "Expose copies the FullPtr verbatim");
 
         // Bit positions must match the C++ BIT_OPT(u32, 0/1).
         assert_eq!(BULK_EXPOSE, 1);
@@ -2156,28 +2274,55 @@ mod tests {
     }
 
     #[test]
-    fn clear_recv_handles_leaves_unowned_buffers_alone() {
+    fn clear_recv_handles_frees_only_what_the_transport_allocated() {
         let server = server_on_ephemeral_port();
+
+        // 1. A buffer the recv path allocated: tagged with the sentinel, so
+        //    clear_recv_handles owns it and must free it.
+        let ours = alloc_recv_buffer(3).expect("alloc");
+        // 2. A caller-provided buffer (private memory: null allocator id).
+        let theirs = xfer(&[4, 5, 6]);
+        // 3. The case the C++ comment is about: a CTP-allocator buffer swapped
+        //    in by the task archive. Its id is neither null nor the sentinel,
+        //    and freeing it here would be a bad-free, not a leak — the task
+        //    reclaims it via TASK_DATA_OWNER.
+        let ctp_addr = xfer(&[7, 8, 9]).data.ptr;
+        let ctp_owned = Bulk::new(
+            FullPtr::new(ctp_addr, ShmPtr::new(AllocatorId::new(1, 0), 16)),
+            3,
+            BULK_XFER,
+        );
+
         let mut meta = LbmMeta {
             recv: vec![
-                Bulk {
-                    data: vec![1, 2, 3],
-                    size: 3,
-                    flags: Bitfield32::new(BULK_XFER),
-                    owned: true,
-                },
-                Bulk {
-                    data: vec![4, 5, 6],
-                    size: 3,
-                    flags: Bitfield32::new(BULK_XFER),
-                    owned: false, // caller-provided — not ours to release
-                },
+                Bulk::new(
+                    FullPtr::new(ours, ShmPtr::new(RECV_ALLOCATED_ID, ours as u64)),
+                    3,
+                    BULK_XFER,
+                ),
+                theirs,
+                ctp_owned,
             ],
             ..Default::default()
         };
+        assert!(meta.recv[0].is_recv_allocated());
+        assert!(!meta.recv[1].is_recv_allocated());
+        assert!(!meta.recv[2].is_recv_allocated());
+
         server.clear_recv_handles(&mut meta);
-        assert!(meta.recv[0].data.is_empty());
-        assert_eq!(meta.recv[1].data, vec![4, 5, 6]);
+
+        // Ours is released and the entry is inert.
+        assert!(is_empty(&meta.recv[0]));
+        assert!(!meta.recv[0].is_recv_allocated());
+        // Everyone else's is untouched.
+        assert_eq!(bytes(&meta.recv[1]), &[4, 5, 6][..]);
+        assert_eq!(bytes(&meta.recv[2]), &[7, 8, 9][..]);
+        assert_eq!(meta.recv[2].data.shm.alloc_id, AllocatorId::new(1, 0));
+
+        // Idempotent: a second call must not double-free.
+        server.clear_recv_handles(&mut meta);
+        assert!(is_empty(&meta.recv[0]));
+        assert_eq!(bytes(&meta.recv[1]), &[4, 5, 6][..]);
     }
 
     #[test]

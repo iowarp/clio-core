@@ -185,6 +185,19 @@ That costs safety at one seam — turning a `FullPtr` into bytes needs
 `unsafe` — but the cost is inherent, not a porting artifact: a cross-process
 pointer cannot be a safe slice. Contain it in one helper per transport.
 
+**The bill, itemised.** `socket_transport` had a guard the C++ never had: it
+rejected a send whose `data.len()` disagreed with `size`, and a test pinned
+it ("C++ would read `size` bytes past the end of the buffer — divergence
+14"). A `FullPtr` has no length, so that guard is now impossible and `size`
+is the sender's word, exactly as in C++. What survives is the one check a
+pointer still permits — refusing a non-zero `size` over a null pointer.
+
+This is a genuine regression and worth stating rather than burying: the
+Vec-based port could catch a class of caller bug that the faithful one
+cannot. It is the price of a bulk that can point into a shared segment, and
+the C++ pays it too. If we ever want the check back, it belongs on the
+*archive* side, which does know how long the buffer it exposed is.
+
 Ownership of *received* buffers rides on the allocator id, as in the C++, via
 the new `RECV_ALLOCATED_ID` sentinel (`AllocatorId(u32::MAX-1, u32::MAX-1)`)
 and `Bulk::is_recv_allocated`. This is the part `owned: bool` gets wrong, and
