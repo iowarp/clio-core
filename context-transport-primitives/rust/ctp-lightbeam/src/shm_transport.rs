@@ -249,22 +249,13 @@ pub const BULK_XFER: u32 = ctp_types::bit_opt(1);
 /// synchronous).
 pub const LBM_SYNC: u32 = 0x1;
 
-/// C++ `ctp::lbm::TransportType`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TransportType {
-    ZeroMq,
-    Socket,
-    Shm,
-    Nixl,
-    Thallium,
-}
-
-/// C++ `ctp::lbm::TransportMode`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TransportMode {
-    Client,
-    Server,
-}
+/// C++ `ctp::lbm::TransportType` / `ctp::lbm::TransportMode`.
+///
+/// Both live in [`crate::transport`], which ports `lightbeam.h` — the header
+/// that declares them once and that this module's C++ counterpart includes.
+/// This module used to re-declare them; they are re-exported now so the two
+/// spellings are the same type.
+pub use crate::transport::{TransportMode, TransportType};
 
 /// C++ `ctp::lbm::Bulk` fused with `ctp::ipc::FullPtr<char>` (divergence 3).
 ///
@@ -292,25 +283,11 @@ impl Default for Bulk {
 }
 
 /// C++ `ctp::lbm::ClientInfo`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ClientInfo {
-    /// 0 = success, `EAGAIN` = no data, …
-    pub rc: i32,
-    /// Socket fd (socket transport, server mode).
-    pub fd: i32,
-    /// ZMQ identity (ZMQ transport, server mode).
-    pub identity: String,
-}
-
-impl Default for ClientInfo {
-    fn default() -> Self {
-        Self {
-            rc: 0,
-            fd: -1,
-            identity: String::new(),
-        }
-    }
-}
+///
+/// From [`crate::transport`] (`lightbeam.h`), which declares it once. This
+/// module used to carry an identical copy; the only thing that differed was
+/// which `Default` you got, and both now mean the C++ `fd_ = -1`.
+pub use crate::transport::ClientInfo;
 
 /// C++ `ctp::lbm::LbmMeta<AllocT>` (divergence 4: no allocator parameter).
 #[derive(Debug, Default, Clone)]

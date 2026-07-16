@@ -24,19 +24,55 @@ Found while scoping the fix in §1, and it is the more serious half.
 They are three parallel ports that share a crate and nothing else.
 
 `transport.rs` defines `pub trait Transport` (:647) and `TransportFactory`
-(:835), a runtime registry keyed by `TransportType`. In C++, `Transport` is
-a base class and `ShmMpscTransport`/`SocketTransport` derive from it, with
-the factory handing back a base pointer.
+(:835), a runtime registry keyed by `TransportType`.
+
+> **Correction (first draft of this section was wrong).** It claimed "in C++,
+> `Transport` is a base class and `ShmMpscTransport`/`SocketTransport` derive
+> from it". Half of that is false and the mechanism is not what it says.
+>
+> C++ `Transport` has **no virtual functions at all** — `~Transport()` is
+> `= default`, not virtual, and `Send`/`Recv` are `template <typename MetaT>`,
+> which cannot be virtual. It is a tagged base carrying `type_`/`mode_`, and
+> `transport_factory_impl.h` dispatches by hand: `Transport::Expose` does
+> `switch (type_) { case …: return static_cast<ZeroMqTransport*>(this)->Expose(…); }`,
+> and destruction is the same switch over `delete static_cast<Concrete*>(t)`.
+> It is the same vtable-free dispatch the runtime uses for task method ids.
+> (`static_cast` base→derived does still require inheritance, which is why
+> those classes derive.)
+>
+> And who derives is not what the draft said:
+>
+> | C++ class | derives `Transport`? |
+> |---|---|
+> | `ShmTransport` (`shm_transport.h`) | yes, `#if CTP_IS_HOST` |
+> | `SocketTransport`, `ZeroMqTransport`, `ThalliumTransport`, `NixlTransport` | yes |
+> | **`ShmMpscTransport`** (`shm_mpsc_transport.h`) | **no — standalone** |
+>
+> `ShmMpscTransport` is a different class from `ShmTransport`: the named MPSC
+> segment transport (issue #642), used directly by `ipc_cpu2cpu.cc` rather
+> than through the factory. Rust's `shm_transport.rs` ports *both* headers,
+> which is what made them easy to conflate.
+>
+> The finding survives the correction, but state it properly: **`ShmTransport`
+> and `SocketTransport` should be reachable through the abstraction and are
+> not.** `ShmMpscTransport` standing alone is faithful, not a defect.
 
 In Rust today:
 
 - The only `impl Transport for` types are `MinimalTransport` (:983) and
   `EmTransport` (:1011) — **both inside `transport.rs`'s own `#[cfg(test)]`
   module**, which starts at :948.
-- `ShmMpscTransport` and `SocketTransport` do **not** implement `Transport`.
-  `transport.rs` never names them.
+- `ShmTransport` (`shm_transport.rs:958`) and `SocketTransport`
+  (`socket_transport.rs:902`) do **not** implement `Transport`, though their
+  C++ counterparts derive from it. `transport.rs` never names them.
+- `ShmMpscTransport` (`shm_transport.rs:1247`) correctly does not — its C++
+  counterpart has no base either.
 - Every `TransportFactory::register` call is at :1658 or later — also inside
   `#[cfg(test)]` — and registers `make_minimal`/`make_nothing`.
+
+Note the Rust trait is itself a deliberate divergence, and a good one: it
+replaces the C++ `switch` + `static_cast` with something the compiler checks.
+Worth keeping — but it has to be *implemented* to mean anything.
 
 So at runtime `TransportFactory::get(TransportType::Shm, …)` returns `None`:
 no real backend is registered, and none could be, because the real transports
@@ -50,9 +86,9 @@ the gap, because a test that used a real transport *through* the factory is
 exactly the test nobody wrote.
 
 Consequence for the estimate: §1 is not "unify some type declarations". It is
-"connect the port to its own abstraction" — make the real transports
-implement `Transport`, unify the types they exchange, and register them with
-the factory. That is the largest single item in this audit.
+"connect the port to its own abstraction" — make `ShmTransport` and
+`SocketTransport` implement `Transport`, unify the types they exchange, and
+register them with the factory. That is the largest single item in this audit.
 
 ### How widespread is this? Bounded — and mostly good news
 

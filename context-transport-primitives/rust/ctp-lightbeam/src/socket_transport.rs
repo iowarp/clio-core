@@ -256,25 +256,16 @@ const BULK_WIRE_BYTES: usize = 12;
 pub type SocketId = u64;
 
 // ---------------------------------------------------------------------------
-// lightbeam.h types, declared locally until transport.rs lands (divergence 1)
+// lightbeam.h types
 // ---------------------------------------------------------------------------
 
-/// `ctp::lbm::TransportType`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TransportType {
-    ZeroMq,
-    Socket,
-    Shm,
-    Nixl,
-    Thallium,
-}
-
-/// `ctp::lbm::TransportMode`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TransportMode {
-    Client,
-    Server,
-}
+/// `ctp::lbm::TransportType` / `ctp::lbm::TransportMode`.
+///
+/// These were "declared locally until transport.rs lands". It has landed, so
+/// they come from [`crate::transport`] — the module that ports `lightbeam.h`,
+/// the header declaring them once that this module's C++ counterpart
+/// includes. Re-exported so this module's spelling is the same type.
+pub use crate::transport::{TransportMode, TransportType};
 
 /// `ctp::lbm::Bulk` — a bulk descriptor plus (in Rust) its buffer.
 ///

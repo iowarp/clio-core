@@ -278,7 +278,7 @@ impl Default for Bulk {
 
 /// Routing info returned by [`Transport::recv`], consumed by
 /// [`Transport::send`] (C++ `ClientInfo`).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientInfo {
     /// Return code: 0 = success, `EAGAIN` = no data, etc. (divergence 11).
     pub rc: i32,
@@ -288,10 +288,23 @@ pub struct ClientInfo {
     pub identity: String,
 }
 
+impl Default for ClientInfo {
+    /// The C++ default member initializers: `rc = 0`, **`fd_ = -1`**, empty
+    /// identity.
+    ///
+    /// Hand-written rather than derived, because a derived `Default` would
+    /// zero `fd` — and `fd = 0` is not "no fd", it is standard input. C++
+    /// default-constructs a `ClientInfo` with `fd_ = -1`, so this must too;
+    /// the two differ in exactly the case that matters and agree everywhere
+    /// else, which is how the derive survived: nothing called it.
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ClientInfo {
     /// C++ default member initializers: `rc = 0`, `fd_ = -1`, empty identity.
-    ///
-    /// Note this is **not** `Default::default()`, which zeroes `fd`.
+    /// Same as [`Default::default`].
     pub fn new() -> Self {
         Self {
             rc: 0,
@@ -1246,12 +1259,22 @@ mod tests {
     }
 
     #[test]
-    fn client_info_derive_default_differs_from_cpp_default_ctor() {
-        // derive(Default) zeroes fd, but the C++ member initializer is -1 —
-        // ClientInfo::new() is the C++-faithful constructor.
+    fn client_info_default_matches_the_cpp_default_ctor() {
+        // C++: `int rc = 0; int fd_ = -1; std::string identity_;` — so a
+        // default-constructed ClientInfo has fd_ == -1.
+        //
+        // This previously derived Default (zeroing fd) and a test asserted
+        // the difference rather than fixing it. fd = 0 is not "no fd", it is
+        // standard input, so that gap was a bug waiting for its first caller.
+        // Default is hand-written now and agrees with new().
         assert_eq!(ClientInfo::default().rc, 0);
-        assert_eq!(ClientInfo::default().fd, 0);
-        assert_ne!(ClientInfo::default(), ClientInfo::new());
+        assert_eq!(ClientInfo::default().fd, -1, "C++ initializes fd_ to -1");
+        assert!(ClientInfo::default().identity.is_empty());
+        assert_eq!(ClientInfo::default(), ClientInfo::new());
+
+        // The dispatch's failure value stays distinct from the default.
+        assert_eq!(ClientInfo::failed().rc, -1);
+        assert_ne!(ClientInfo::failed(), ClientInfo::default());
     }
 
     // -- LbmMeta ------------------------------------------------------------
