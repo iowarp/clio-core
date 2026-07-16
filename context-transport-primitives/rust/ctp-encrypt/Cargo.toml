@@ -1,0 +1,14 @@
+[package]
+name = "ctp-encrypt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Encryption wrappers (Rust port of clio_ctp/encrypt, issue #756)"
+
+[lib]
+name = "ctp_encrypt"
+
+[dependencies]
+ctp-types = { workspace = true }
+

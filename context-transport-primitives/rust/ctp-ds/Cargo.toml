@@ -1,0 +1,16 @@
+        [package]
+        name = "ctp-ds"
+        version.workspace = true
+        edition.workspace = true
+        license.workspace = true
+        repository.workspace = true
+        description = "Shared-memory data structures (Rust port of clio_ctp/data_structures, issue #756)"
+
+        [lib]
+        name = "ctp_ds"
+
+        [dependencies]
+        ctp-types = { workspace = true }
+ctp-memory = { workspace = true }
+ctp-thread = { workspace = true }
+

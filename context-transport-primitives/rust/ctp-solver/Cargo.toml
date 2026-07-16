@@ -1,0 +1,14 @@
+[package]
+name = "ctp-solver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Numeric solvers (Rust port of clio_ctp/solver, issue #756)"
+
+[lib]
+name = "ctp_solver"
+
+[dependencies]
+ctp-types = { workspace = true }
+

@@ -6,6 +6,14 @@ members = [
     "ctp-coroutine",
     "ctp-util",
     "ctp-memory",
+    "ctp-solver",
+    "ctp-lightbeam",
+    "ctp-search",
+    "ctp-encrypt",
+    "ctp-io",
+    "ctp-serialize",
+    "ctp-ds",
+    "ctp-thread",
     "ctp-gpu",
     "ctp-ffi",
 ]
@@ -20,6 +28,15 @@ repository = "https://github.com/iowarp/clio-core"
 ctp-types = { path = "ctp-types" }
 ctp-introspect = { path = "ctp-introspect" }
 ctp-coroutine = { path = "ctp-coroutine" }
+ctp-memory = { path = "ctp-memory" }
+ctp-thread = { path = "ctp-thread" }
+ctp-ds = { path = "ctp-ds" }
+ctp-serialize = { path = "ctp-serialize" }
+ctp-io = { path = "ctp-io" }
+ctp-encrypt = { path = "ctp-encrypt" }
+ctp-search = { path = "ctp-search" }
+ctp-solver = { path = "ctp-solver" }
+ctp-lightbeam = { path = "ctp-lightbeam" }
 libc = "0.2"
 cc = "1"
 

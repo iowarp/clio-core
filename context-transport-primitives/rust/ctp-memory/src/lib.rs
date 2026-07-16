@@ -13,6 +13,16 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod leak_checker;
+
+pub mod smart_ptr;
+
+pub mod arena;
+
+pub mod slab;
+
+pub mod buddy;
+
 pub mod allocator;
 pub mod backend;
 pub mod ptr;

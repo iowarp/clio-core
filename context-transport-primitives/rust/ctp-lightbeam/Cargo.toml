@@ -1,0 +1,15 @@
+[package]
+name = "ctp-lightbeam"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Lightbeam transports: trait + shm/socket backends (Rust port, issue #756)"
+
+[lib]
+name = "ctp_lightbeam"
+
+[dependencies]
+ctp-types = { workspace = true }
+ctp-memory = { workspace = true }
+ctp-thread = { workspace = true }

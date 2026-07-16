@@ -1,0 +1,28 @@
+    [package]
+    name = "ctp-compress"
+    version = "0.1.0"
+    edition = "2021"
+    license = "BSD-3-Clause"
+    repository = "https://github.com/iowarp/clio-core"
+    description = "FFI wrappers for the C/C++ compression libraries CTP uses (issue #756)"
+
+    [lib]
+    name = "ctp_compress"
+
+    [features]
+    default = []
+    all = ["brotli", "bzip2", "blosc2", "fpzip", "lz4", "lzma", "snappy", "sz3", "zfp", "zlib", "zstd"]
+    brotli = []
+bzip2 = []
+blosc2 = []
+fpzip = []
+lz4 = []
+lzma = []
+snappy = []
+sz3 = []
+zfp = []
+zlib = []
+zstd = []
+
+    # Standalone workspace during development; folds into rust/Cargo.toml at integration.
+    [workspace]

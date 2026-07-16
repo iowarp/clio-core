@@ -1,0 +1,21 @@
+[package]
+name = "ctp-gpu-backends"
+version = "0.1.0"
+edition = "2021"
+license = "BSD-3-Clause"
+repository = "https://github.com/iowarp/clio-core"
+description = "GPU FFI wrappers beyond CUDA: HIP/ROCm, SYCL, and GPU memory backends (issue #756)"
+
+[lib]
+name = "ctp_gpu_backends"
+
+[features]
+default = []
+hip = []
+sycl = []
+cuda = []
+
+[build-dependencies]
+cc = "1"
+
+[workspace]

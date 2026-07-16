@@ -8,6 +8,10 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod atomic;
+
+pub mod argpack;
+
 pub mod hash;
 
 use std::sync::atomic::{AtomicU32, Ordering};

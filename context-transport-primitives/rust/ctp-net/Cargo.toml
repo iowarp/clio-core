@@ -1,0 +1,21 @@
+[package]
+name = "ctp-net"
+version = "0.1.0"
+edition = "2021"
+license = "BSD-3-Clause"
+repository = "https://github.com/iowarp/clio-core"
+description = "FFI wrappers for the C/C++ networking libraries CTP uses: libzmq, thallium, NIXL (issue #756)"
+
+[lib]
+name = "ctp_net"
+
+[features]
+default = []
+zmq = []
+thallium = []
+nixl = []
+
+[build-dependencies]
+cc = "1"
+
+[workspace]
