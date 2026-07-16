@@ -8,6 +8,50 @@ and so the C++ APIs survive the migration as facades.
 Read alongside `context-transport-primitives/rust/MEMORY_DESIGN.md` (the
 segment/pointer contract this builds on).
 
+## 0. Status: the POD split is on hold — Task stays non-POD
+
+**Decided 2026-07-16, superseding the premise of §§1–3 and §§6–9.** The port
+now assumes **everything is Rust**, structured like the C++, with C++
+bindings for tasks deferred rather than co-designed. `Task` therefore stays
+an ordinary **non-POD** Rust type: `clio-run-task`'s `TaskBase` + `Task`
+trait, with `Box<dyn Task>`/`Arc<dyn Task>` handles.
+
+Why this is a simplification rather than a retreat: every constraint below
+is downstream of *cross-language* interop. §1's "the C++ `Task` cannot simply
+move" is really "a C++ vtable cannot be handed to Rust" — true, and moot once
+both sides are Rust. The rest falls out:
+
+| §  | What it demanded | Why it is no longer needed |
+|---|---|---|
+| 1 | no vtables, no templates, no allocator-backed members | a Rust-only task may have all three |
+| 2, 3 | split `Task` into `TaskPodBase` + a process-local side table | `RunContext` is just a private `Option<Box<RunContext>>` field, as it already was in C++ |
+| 6 | replace `~Task()` with a per-method teardown dispatch table | `Drop`. The compiler writes it, and it cannot disagree between languages |
+| 6 | promote the `TASK_DATA_OWNER` conditional free to a spec clause | ownership. An owning field frees; a borrowing one does not |
+| 7 | Pattern A / Pattern B adoption routes | there is nothing to adopt *from* until bindings return |
+
+The §2 hazard that motivated the split — a task record in shared memory
+carrying a vptr and a `unique_ptr` that are garbage in any other process —
+is real and still worth fixing. It is a *shared-memory* bug, not a
+cross-language one, and it is fixed the same way regardless: execution state
+is process-local and must never ride in a shared record. `RunContext` being
+un-copied and un-serialized (enforced here by living behind `TaskBase`'s
+accessors, not by an annotation macro) is that fix.
+
+**What still stands**, unaffected by the pivot, because it concerns data at
+rest and on the wire rather than object layout:
+
+- **§4, the method-id registry** — still append-only; ids are in the WAL.
+- **§5, `PoolQuery` behavior** — still a frozen wire format and still owed
+  identical routing decisions. §5.1's conformance harness stands, and
+  `clio-run-types` remains a faithful mirror of the C++ POD types.
+- **§10, the audit of un-shareable members** — still the right audit; a
+  `std::vector<std::string>` OUT field is no more shareable between two C++
+  processes than between C++ and Rust.
+
+When bindings come back, this document is the starting point rather than the
+plan: §§3/6/7 describe a real design for a problem that will exist again, and
+`clio-run-types` is already conformance-tested for it. Reopen it then.
+
 ## 1. Why the C++ `Task` cannot simply move
 
 `clio::run::Task` (context-runtime/include/clio_runtime/task.h) has three
