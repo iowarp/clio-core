@@ -30,5 +30,5 @@ pub mod registry;
 
 pub use allocator::FreeListAllocator;
 pub use backend::SharedMemBackend;
-pub use ptr::{AllocatorId, OffsetPtr, ShmPtr, ShmSafe, NULL_OFFSET};
+pub use ptr::{AllocatorId, FullPtr, OffsetPtr, ShmPtr, ShmSafe, NULL_OFFSET};
 pub use registry::{register_allocator, resolve, unregister_allocator};

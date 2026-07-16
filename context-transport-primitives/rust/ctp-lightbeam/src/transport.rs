@@ -85,16 +85,13 @@
 //!    `(send, recv, send_bulks, recv_bulks)` — never `client_info_` or
 //!    `alloc_`; `FullPtr::serialize` writes only `shm_`. See
 //!    [`Bulk::SERIALIZED_FIELDS`] / [`LbmMeta::SERIALIZED_FIELDS`].
-//! 5. **`FullPtr` mirrored locally.** `ctp-memory` exposes `ShmPtr` but no
-//!    `FullPtr`, and `Bulk::data` needs both halves (a socket transport may
-//!    expose plain heap memory that lives in no registered segment). Only the
-//!    `FullPtr<char>` instantiation lightbeam uses is modeled, with the C++
-//!    field order (`ptr_` then `shm_`), the OR-shaped null test
-//!    (`ptr_ == nullptr || shm_.IsNull()`), and the raw-pointer ctor's
-//!    `(AllocatorId::GetNull(), address)` convention. Pointer arithmetic uses
-//!    `wrapping_add`/`wrapping_sub`: C++ unsigned overflow wraps, and a Rust
-//!    debug-build overflow panic would be a *behavior* change. If `ctp-memory`
-//!    later grows a `FullPtr`, this should become a re-export.
+//! 5. **`FullPtr` comes from `ctp-memory`.** `Bulk::data` needs both halves
+//!    (a socket transport may expose plain heap memory that lives in no
+//!    registered segment). This module used to mirror `FullPtr` locally
+//!    because `ctp-memory` had none; it has one now — in the same layer the
+//!    C++ keeps it (`memory/allocator/allocator.h`) — so the mirror is gone
+//!    and [`FullPtr`] is an alias pinning the `FullPtr<char>` instantiation
+//!    lightbeam uses. Resolved: there is one `FullPtr` again.
 //! 6. **Raw backend pointers → opaque handles.** `Bulk::desc`/`Bulk::mr`
 //!    (libfabric `fid_mr*` etc.) and `LbmContext::copy_space`/`shm_info_`/
 //!    `meta_buf_` are `void*`/`ShmTransferInfo*` in C++. Their pointee types
@@ -173,7 +170,17 @@
 //!     predicates, and server-only methods are documented as such.
 //! 17. **`char` → `u8`.** `FullPtr<char>` addresses bytes, not text.
 
-use ctp_memory::{AllocatorId, ShmPtr};
+
+/// The `(process-local address, shared-memory pointer)` pair lightbeam
+/// exposes for bulk transfer.
+///
+/// Lives in `ctp-memory` now, where the C++ also keeps it
+/// (`memory/allocator/allocator.h`); this module used to carry a local mirror
+/// because `ctp-memory` had no `FullPtr` yet, so there were two. This alias
+/// pins the instantiation lightbeam uses, mirroring the C++ `FullPtr<char>`
+/// (Rust spells the byte `u8`), and lets `FullPtr::null()` and friends infer
+/// their type parameter as they did when this was a concrete struct.
+pub type FullPtr = ctp_memory::FullPtr<u8>;
 use ctp_types::{bit_opt, Bitfield32};
 use std::collections::HashMap;
 use std::fmt;
@@ -198,93 +205,6 @@ pub const LBM_SYNC: u32 = 0x1;
 // ---------------------------------------------------------------------------
 // FullPtr (mirror of ctp::ipc::FullPtr<char> — divergence 5)
 // ---------------------------------------------------------------------------
-
-/// The `(process-local address, shared-memory pointer)` pair that lightbeam
-/// exposes for bulk transfer — a local mirror of C++ `ctp::ipc::FullPtr<char>`.
-///
-/// Field order matches the C++ struct (`T* ptr_` then `ShmPtrBase<T> shm_`).
-/// `ptr` is an opaque address (0 = `nullptr`, see divergence 6): this type
-/// carries locations, it never dereferences them.
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct FullPtr {
-    /// C++ `T* ptr_` — process-local address; 0 is `nullptr`.
-    pub ptr: usize,
-    /// C++ `ShmPtrBase<T> shm_` — the cross-process half.
-    pub shm: ShmPtr<u8>,
-}
-
-impl FullPtr {
-    /// C++ `FullPtr(const T*, const PointerT&)`.
-    pub const fn new(ptr: usize, shm: ShmPtr<u8>) -> Self {
-        Self { ptr, shm }
-    }
-
-    /// C++ `FullPtr::GetNull()` / the default ctor.
-    pub const fn null() -> Self {
-        Self {
-            ptr: 0,
-            shm: ShmPtr::null(),
-        }
-    }
-
-    /// C++ `explicit FullPtr(T* ptr)` — wrap private/stack/heap memory: null
-    /// allocator id, with the address itself as the "offset" (the
-    /// `MallocAllocator` convention).
-    pub const fn from_local(addr: usize) -> Self {
-        Self {
-            ptr: addr,
-            shm: ShmPtr::new(AllocatorId::null(), addr as u64),
-        }
-    }
-
-    /// C++ `IsNull()`: **either** half being null makes the pair null.
-    pub const fn is_null(&self) -> bool {
-        self.ptr == 0 || self.shm.is_null()
-    }
-
-    /// C++ `SetNull()`.
-    pub fn set_null(&mut self) {
-        *self = Self::null();
-    }
-
-    /// C++ `operator+(size_t)`: advances **both** halves.
-    ///
-    /// Wraps on overflow (divergence 5): C++ unsigned arithmetic wraps, and a
-    /// debug-build panic here would change behavior rather than preserve it.
-    pub const fn offset_by(&self, size: usize) -> Self {
-        Self {
-            ptr: self.ptr.wrapping_add(size),
-            shm: ShmPtr::new(self.shm.alloc_id, self.shm.off.wrapping_add(size as u64)),
-        }
-    }
-
-    /// C++ `operator-(size_t)`: rewinds both halves. Wraps — see
-    /// [`FullPtr::offset_by`].
-    pub const fn rewind_by(&self, size: usize) -> Self {
-        Self {
-            ptr: self.ptr.wrapping_sub(size),
-            shm: ShmPtr::new(self.shm.alloc_id, self.shm.off.wrapping_sub(size as u64)),
-        }
-    }
-}
-
-impl Default for FullPtr {
-    fn default() -> Self {
-        Self::null()
-    }
-}
-
-impl PartialEq for FullPtr {
-    /// C++ `operator==`: both halves must match.
-    fn eq(&self, other: &Self) -> bool {
-        self.ptr == other.ptr
-            && self.shm.alloc_id == other.shm.alloc_id
-            && self.shm.off == other.shm.off
-    }
-}
-
-impl Eq for FullPtr {}
 
 // ---------------------------------------------------------------------------
 // Bulk (lightbeam.h "--- Types ---")
@@ -1024,6 +944,9 @@ pub const fn default_cq_size() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // FullPtr's halves are only constructed in tests here; the library code
+    // passes FullPtr values around whole.
+    use ctp_memory::{AllocatorId, ShmPtr};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Barrier, Mutex, MutexGuard};
 

@@ -171,6 +171,138 @@ impl<T> OffsetPtr<T> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// FullPtr
+// ---------------------------------------------------------------------------
+
+/// Both halves of a pointer: the process-local address and the cross-process
+/// [`ShmPtr`] (C++ `ctp::ipc::FullPtr<T>`, `memory/allocator/allocator.h`).
+///
+/// Field order matches the C++ (`T* ptr_` then `ShmPtrBase<T> shm_`).
+///
+/// `ptr` is an **opaque address**, not a `*mut T`: this type carries
+/// locations, it never dereferences them. That keeps it a plain value —
+/// `Copy`, `Send`, `Sync`, no lifetime — which is what the C++ struct is too.
+/// Resolve it with [`crate::registry::resolve`] when you actually need memory.
+///
+/// Only the `shm` half is serialized (C++ `serialize` writes `shm_` alone):
+/// `ptr` is meaningless in another process. See [`Bulk`]-style users, which
+/// re-resolve `ptr` locally after a load.
+///
+/// # Note on the private-memory encoding
+///
+/// [`FullPtr::from_local`] wraps ordinary (stack/heap) memory as a null
+/// allocator id with **the address itself as the offset** — the
+/// `MallocAllocator` convention. So a `FullPtr` over private memory is not
+/// null, and `shm.off` is an address rather than an offset. This is why the
+/// C++ takes such care to use integer arithmetic rather than `char* +
+/// offset`: `GetBackendData()` is null for the `MallocAllocator`, and
+/// `nullptr + off` is UB that macOS clang folds to null at -O2 (issue #620).
+/// Rust's `wrapping_add` on `usize` sidesteps that whole class.
+#[repr(C)]
+pub struct FullPtr<T = u8> {
+    /// C++ `T* ptr_` — process-local address; 0 is `nullptr`.
+    pub ptr: usize,
+    /// C++ `ShmPtrBase<T> shm_` — the cross-process half.
+    pub shm: ShmPtr<T>,
+}
+
+impl<T> Clone for FullPtr<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<T> Copy for FullPtr<T> {}
+
+impl<T> std::fmt::Debug for FullPtr<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FullPtr")
+            .field("ptr", &self.ptr)
+            .field("shm", &self.shm)
+            .finish()
+    }
+}
+
+impl<T> FullPtr<T> {
+    /// C++ `FullPtr(const T*, const PointerT&)`.
+    pub const fn new(ptr: usize, shm: ShmPtr<T>) -> Self {
+        Self { ptr, shm }
+    }
+
+    /// C++ `FullPtr::GetNull()` / the default ctor.
+    pub const fn null() -> Self {
+        Self {
+            ptr: 0,
+            shm: ShmPtr::null(),
+        }
+    }
+
+    /// C++ `explicit FullPtr(T* ptr)` — wrap private/stack/heap memory: null
+    /// allocator id, with the address itself as the "offset". See the type
+    /// docs on this encoding.
+    pub const fn from_local(addr: usize) -> Self {
+        Self {
+            ptr: addr,
+            shm: ShmPtr::new(AllocatorId::null(), addr as u64),
+        }
+    }
+
+    /// C++ `IsNull()`: **either** half being null makes the pair null.
+    pub const fn is_null(&self) -> bool {
+        self.ptr == 0 || self.shm.is_null()
+    }
+
+    /// C++ `SetNull()`.
+    pub fn set_null(&mut self) {
+        *self = Self::null();
+    }
+
+    /// C++ `operator+(size_t)`: advances **both** halves.
+    ///
+    /// Wraps on overflow: C++ unsigned arithmetic wraps, and a debug-build
+    /// panic here would change behavior rather than preserve it.
+    pub const fn offset_by(&self, size: usize) -> Self {
+        Self {
+            ptr: self.ptr.wrapping_add(size),
+            shm: ShmPtr::new(self.shm.alloc_id, self.shm.off.wrapping_add(size as u64)),
+        }
+    }
+
+    /// C++ `operator-(size_t)`: rewinds both halves. Wraps — see
+    /// [`FullPtr::offset_by`].
+    pub const fn rewind_by(&self, size: usize) -> Self {
+        Self {
+            ptr: self.ptr.wrapping_sub(size),
+            shm: ShmPtr::new(self.shm.alloc_id, self.shm.off.wrapping_sub(size as u64)),
+        }
+    }
+
+    /// Reinterpret the pointee type, as [`ShmPtr::cast`] does.
+    pub const fn cast<U>(self) -> FullPtr<U> {
+        FullPtr {
+            ptr: self.ptr,
+            shm: self.shm.cast::<U>(),
+        }
+    }
+}
+
+impl<T> Default for FullPtr<T> {
+    fn default() -> Self {
+        Self::null()
+    }
+}
+
+impl<T> PartialEq for FullPtr<T> {
+    /// C++ `operator==`: both halves must match.
+    fn eq(&self, other: &Self) -> bool {
+        self.ptr == other.ptr
+            && self.shm.alloc_id == other.shm.alloc_id
+            && self.shm.off == other.shm.off
+    }
+}
+
+impl<T> Eq for FullPtr<T> {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,5 +338,81 @@ mod tests {
         assert_eq!(q.off, 128);
         assert_eq!(q.alloc_id, AllocatorId::new(3, 4));
         assert_eq!(p.to_offset().to_shm(p.alloc_id).off, p.off);
+    }
+
+    #[test]
+    fn full_ptr_null_semantics() {
+        assert!(FullPtr::<u8>::null().is_null());
+        assert!(FullPtr::<u8>::default().is_null());
+
+        // EITHER half null makes the pair null, per the C++ IsNull().
+        let shm = ShmPtr::<u8>::new(AllocatorId::new(1, 0), 64);
+        assert!(FullPtr::new(0, shm).is_null(), "null local half");
+        assert!(
+            FullPtr::new(0x1000, ShmPtr::<u8>::null()).is_null(),
+            "null shm half"
+        );
+        assert!(!FullPtr::new(0x1000, shm).is_null());
+
+        let mut p = FullPtr::new(0x1000, shm);
+        p.set_null();
+        assert!(p.is_null());
+    }
+
+    #[test]
+    fn full_ptr_from_local_uses_the_address_as_offset() {
+        // The MallocAllocator convention: private memory is a null allocator
+        // id with the address itself as the offset. So a FullPtr over private
+        // memory is NOT null, despite the null allocator id.
+        let addr = 0xDEAD_BEEFusize;
+        let p = FullPtr::<u8>::from_local(addr);
+        assert_eq!(p.ptr, addr);
+        assert_eq!(p.shm.alloc_id, AllocatorId::null());
+        assert_eq!(p.shm.off, addr as u64);
+        assert!(!p.is_null(), "private memory is addressable, not null");
+
+        // Address 0 is the one case that is null on both halves.
+        assert!(FullPtr::<u8>::from_local(0).is_null());
+    }
+
+    #[test]
+    fn full_ptr_offset_moves_both_halves_and_wraps() {
+        let p = FullPtr::new(0x1000, ShmPtr::<u8>::new(AllocatorId::new(2, 1), 64));
+        let q = p.offset_by(16);
+        assert_eq!(q.ptr, 0x1010);
+        assert_eq!(q.shm.off, 80);
+        assert_eq!(q.shm.alloc_id, AllocatorId::new(2, 1), "id is preserved");
+        assert_eq!(q.rewind_by(16), p, "offset then rewind round-trips");
+
+        // Wraps like C++ unsigned arithmetic rather than panicking.
+        let hi = FullPtr::new(usize::MAX, ShmPtr::<u8>::new(AllocatorId::new(1, 1), u64::MAX));
+        assert_eq!(hi.offset_by(1).ptr, 0);
+        assert_eq!(hi.offset_by(1).shm.off, 0);
+    }
+
+    #[test]
+    fn full_ptr_equality_needs_both_halves() {
+        let a = FullPtr::new(0x1000, ShmPtr::<u8>::new(AllocatorId::new(1, 0), 8));
+        assert_eq!(a, a);
+        assert_ne!(a, FullPtr::new(0x2000, a.shm), "local half differs");
+        assert_ne!(
+            a,
+            FullPtr::new(0x1000, ShmPtr::<u8>::new(AllocatorId::new(1, 0), 9)),
+            "offset differs"
+        );
+        assert_ne!(
+            a,
+            FullPtr::new(0x1000, ShmPtr::<u8>::new(AllocatorId::new(2, 0), 8)),
+            "allocator differs"
+        );
+    }
+
+    #[test]
+    fn full_ptr_cast_keeps_both_halves() {
+        let p = FullPtr::<u8>::new(0x1000, ShmPtr::new(AllocatorId::new(1, 2), 24));
+        let q: FullPtr<u64> = p.cast();
+        assert_eq!(q.ptr, p.ptr);
+        assert_eq!(q.shm.off, p.shm.off);
+        assert_eq!(q.shm.alloc_id, p.shm.alloc_id);
     }
 }
