@@ -959,6 +959,166 @@ impl Tag {
         })?
     }
 
+    /// Zero-copy async get. Allocates an SHM output buffer, submits AsyncGetBlob
+    /// so CTE writes the blob directly into SHM, waits, reads the bytes into a
+    /// `Vec<u8>`, and frees the SHM. This is ONE copy (SHM -> Vec) — better than
+    /// the old copying `get_blob` (2 copies). For true zero-copy async, call the
+    /// sync `get_blob_shm` inside your own `spawn_blocking` and read `as_slice()`.
+    ///
+    /// LIFETIME (read-before-free): the closure does submit -> wait -> read ->
+    /// destroy -> free. The SHM is not read or freed before the wait completes.
+    ///
+    /// # Arguments
+    /// * `name` - Blob name (must not be empty)
+    /// * `size` - Number of bytes to read
+    /// * `offset` - Offset within the blob to read from
+    ///
+    /// # Returns
+    /// * `Ok(Vec<u8>)` - Data read from blob (one copy from SHM)
+    /// * `Err(CteError::InvalidParameter)` if name is empty, offset overflows,
+    ///   or size exceeds MAX_BLOB_SIZE
+    /// * `Err(CteError::ShmAllocFailed)` if SHM buffer allocation fails
+    /// * `Err(CteError::ShmNullHandle)` if the buffer handle is null
+    /// * `Err(CteError::FfiError)` on FFI failure or spawn_blocking error
+    ///
+    /// # Example
+    /// ```no_run
+    /// use clio_cte::Tag;
+    ///
+    /// #[tokio::main]
+    /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    ///     let tag = Tag::new("my_dataset").await?;
+    ///     let data = tag.get_blob_shm("data.bin".to_string(), 1024, 0).await?;
+    ///     assert_eq!(data.len(), 1024);
+    ///     Ok(())
+    /// }
+    /// ```
+    pub async fn get_blob_shm(
+        &self,
+        name: String,
+        size: u64,
+        offset: u64,
+    ) -> CteResult<Vec<u8>> {
+        // Validate inputs (mirror async get_blob validation)
+        if name.is_empty() {
+            return Err(CteError::InvalidParameter {
+                message: "Blob name cannot be empty".to_string(),
+            });
+        }
+
+        // Check for offset overflow
+        let end_offset = offset.checked_add(size).ok_or_else(|| CteError::InvalidParameter {
+            message: format!(
+                "Offset {} + size {} would overflow u64",
+                offset, size
+            ),
+        })?;
+
+        // Check blob size limit
+        if end_offset > MAX_BLOB_SIZE {
+            return Err(CteError::InvalidParameter {
+                message: format!(
+                    "Total read size {} exceeds maximum {}",
+                    end_offset, MAX_BLOB_SIZE
+                ),
+            });
+        }
+
+        // Allocate the output SHM buffer OUTSIDE the closure (ShmBuffer is !Send,
+        // can't move into spawn_blocking). into_parts extracts the Send handle;
+        // _ptr/_len are dropped here (not captured by the closure).
+        let buf = crate::zerocopy::ShmBuffer::alloc(size as usize)?;
+        let (handle, _ptr, _len) = buf.into_parts();
+        if handle.is_null() {
+            return Err(CteError::ShmNullHandle);
+        }
+
+        let inner = Arc::clone(&self.inner);
+
+        tokio::task::spawn_blocking(move || {
+            // Build a null-terminated C name
+            let c_name = std::ffi::CString::new(name).map_err(|e| CteError::FfiError {
+                message: format!("blob name has interior NUL: {}", e),
+            })?;
+
+            // Get the raw Tag pointer (SendableTag wraps UniquePtr<ffi::Tag>)
+            let tag_ref = inner.0.as_ref().ok_or_else(|| CteError::FfiError {
+                message: "Tag inner UniquePtr is null".to_string(),
+            })?;
+            let tag_ptr = std::ptr::addr_of!(*tag_ref) as *const std::ffi::c_void;
+
+            // Submit
+            let mut future: crate::ffi_c::CteFutureHandle = std::ptr::null_mut();
+            let rc = unsafe {
+                crate::ffi_c::cte_tag_async_get_shm(
+                    tag_ptr,
+                    c_name.as_ptr(),
+                    offset,
+                    size,
+                    handle,
+                    &mut future,
+                )
+            };
+
+            if rc != 0 {
+                // Submit failed — free the SHM buffer (no future to wait on)
+                unsafe { crate::ffi_c::cte_free_shm_buffer(handle) };
+                return Err(CteError::FfiError {
+                    message: format!("cte_tag_async_get_shm failed rc={}", rc),
+                });
+            }
+
+            // WAIT before read — CTE is writing into the SHM region right now
+            let mut wait_rc: i32 = 0;
+            let wait_status = unsafe {
+                crate::ffi_c::cte_future_wait(future, -1.0, &mut wait_rc)
+            };
+
+            // Resolve the handle to a read pointer (created inside the closure —
+            // safe to use here). Valid only after wait completes (CTE has written).
+            let read_ptr = unsafe { crate::ffi_c::cte_shm_handle_to_ptr(handle) };
+
+            // Destroy the future
+            unsafe { crate::ffi_c::cte_future_destroy(future) };
+
+            // Check wait/task status
+            if wait_status != 0 {
+                unsafe { crate::ffi_c::cte_free_shm_buffer(handle) };
+                return Err(CteError::FfiError {
+                    message: format!(
+                        "get_blob_shm wait failed (status={}, rc={})",
+                        wait_status, wait_rc
+                    ),
+                });
+            }
+
+            if wait_rc != 0 {
+                unsafe { crate::ffi_c::cte_free_shm_buffer(handle) };
+                return Err(CteError::FfiError {
+                    message: format!("get_blob_shm task failed rc={}", wait_rc),
+                });
+            }
+
+            // READ the bytes from SHM into a Vec (the one copy). Then free the SHM.
+            let mut out = Vec::with_capacity(size as usize);
+            if !read_ptr.is_null() {
+                // SAFETY: read_ptr is valid for `size as usize` bytes (CTE wrote them,
+                // wait confirmed). The SHM region is alive until we free it below.
+                let slice = unsafe { std::slice::from_raw_parts(read_ptr, size as usize) };
+                out.extend_from_slice(slice);
+            }
+
+            // NOW free the SHM buffer — runtime is done writing, we've read.
+            unsafe { crate::ffi_c::cte_free_shm_buffer(handle) };
+
+            Ok(out)
+        })
+        .await
+        .map_err(|e| CteError::FfiError {
+            message: format!("get_blob_shm spawn_blocking error: {}", e),
+        })?
+    }
+
     /// Read data from a blob
     ///
     /// # Arguments

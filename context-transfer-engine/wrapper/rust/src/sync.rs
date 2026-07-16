@@ -703,6 +703,113 @@ impl Tag {
         Ok(())
     }
 
+    /// Zero-copy get: allocate an output SHM buffer, submit AsyncGetBlob so CTE
+    /// writes the blob bytes directly into it, wait, and return the ShmBuffer for
+    /// the caller to read zero-copy (via `as_slice()`). The caller drops the
+    /// buffer when done (which frees the SHM).
+    ///
+    /// LIFETIME (read-before-free): CTE writes the SHM region asynchronously
+    /// after submit. This function enforces: alloc -> submit -> wait -> (return
+    /// buffer to caller) -> destroy future. The buffer is NOT read or freed
+    /// before the wait completes. The caller must not drop the returned ShmBuffer
+    /// until they're done reading `as_slice()`.
+    ///
+    /// # Arguments
+    /// * `name` - Blob name (must not be empty)
+    /// * `size` - Number of bytes to read (the buffer is allocated to this size)
+    /// * `offset` - Offset within the blob to read from
+    ///
+    /// # Returns
+    /// * `Ok(ShmBuffer)` - Contains the blob bytes (read via as_slice, then drop)
+    /// * `Err(CteError::FfiError)` - On FFI/validation failure
+    /// * `Err(CteError::ShmAllocFailed)` - If SHM buffer allocation failed
+    ///
+    /// # Example
+    /// ```
+    /// use clio_cte::sync::Tag;
+    /// use clio_cte::zerocopy::ShmBuffer;
+    ///
+    /// let tag = Tag::new("my_dataset");
+    /// let buf = tag.get_blob_shm("data.bin", 1024, 0).expect("get failed");
+    /// let data = buf.as_slice(); // Zero-copy read
+    /// // buf drops here (frees SHM)
+    /// ```
+    pub fn get_blob_shm(&self, name: &str, size: u64, offset: u64) -> CteResult<crate::zerocopy::ShmBuffer> {
+        // 1. Validate
+        if name.is_empty() {
+            return Err(CteError::FfiError {
+                message: "blob name must not be empty".to_string(),
+            });
+        }
+
+        // 2. Allocate the output SHM buffer (CTE will write into it). Owned by us
+        //    until we return it. If alloc fails, no future to wait on — return err.
+        let buf = crate::zerocopy::ShmBuffer::alloc(size as usize)?;
+
+        // 3. Build a null-terminated C string for blob_name
+        let c_name = std::ffi::CString::new(name).map_err(|e| CteError::FfiError {
+            message: format!("blob name has interior NUL: {}", e),
+        })?;
+
+        // 4. Get the raw Tag pointer (same pattern as put_blob_shm)
+        let tag_ptr = std::ptr::addr_of!(*self.inner) as *const std::ffi::c_void;
+
+        // 5. Submit the async get. Pass buf's handle (by value — CteShmHandle is Copy).
+        //    CTE writes into the buffer asynchronously after this returns.
+        let mut future: crate::ffi_c::CteFutureHandle = std::ptr::null_mut();
+        let rc = unsafe {
+            crate::ffi_c::cte_tag_async_get_shm(
+                tag_ptr,
+                c_name.as_ptr(),
+                offset,
+                size,
+                buf.handle(),
+                &mut future,
+            )
+        };
+
+        if rc != 0 {
+            // Submit failed — no future to wait on. buf drops here (frees SHM). Safe.
+            return Err(CteError::FfiError {
+                message: format!("cte_tag_async_get_shm failed rc={}", rc),
+            });
+        }
+
+        // 6. WAIT before read/free — CTE is writing into buf's SHM region right now.
+        //    buf is still alive (owned by this scope) so its SHM stays valid.
+        let mut wait_rc: i32 = 0;
+        let wait_status = unsafe {
+            crate::ffi_c::cte_future_wait(future, /*timeout_sec=*/ -1.0, &mut wait_rc)
+        };
+
+        // 7. Destroy the future (releases the C++ Future<GetBlobTask> wrapper).
+        //    Do this BEFORE returning buf so the future is gone before the caller
+        //    touches the buffer. buf is still alive (still in scope).
+        unsafe { crate::ffi_c::cte_future_destroy(future) };
+
+        // 8. Check wait/task status. On failure we still drop buf (frees SHM) — the
+        //    buffer contents are undefined on failure, so don't return it.
+        if wait_status != 0 {
+            return Err(CteError::FfiError {
+                message: format!(
+                    "get_blob_shm future wait failed (status={}, rc={})",
+                    wait_status, wait_rc
+                ),
+            });
+        }
+
+        if wait_rc != 0 {
+            return Err(CteError::FfiError {
+                message: format!("get_blob_shm task failed rc={}", wait_rc),
+            });
+        }
+
+        // 9. Success — buf now contains `size` bytes of blob data. Return it to
+        //    the caller, who reads `as_slice()` and drops to free. The move
+        //    transfers ownership; buf does NOT drop here.
+        Ok(buf)
+    }
+
     /// Read data from a blob
     ///
     /// # Arguments

@@ -243,6 +243,26 @@ int32_t cte_tag_async_put_shm(const void *tag, const char *blob_name,
                               CteShmHandle data, float score,
                               CteFutureHandle *out_future);
 
+/**
+ * Submit a zero-copy AsyncGetBlob into a caller-allocated SHM output buffer.
+ * Caller must cte_future_wait(out_future) THEN read via cte_shm_handle_to_ptr
+ * THEN cte_free_shm_buffer(out_buf) — reading/freeing before the future
+ * completes is a data race / use-after-free (CTE writes the buffer async).
+ * @param tag The CTE tag to read from (opaque pointer to cte_ffi::Tag)
+ * @param blob_name Null-terminated blob name
+ * @param offset Offset within the blob to read from
+ * @param size Number of bytes to read (must match the allocated buffer size)
+ * @param out_buf CteShmHandle of the caller-allocated output SHM buffer
+ * @param out_future Set to an opaque CteFutureHandle on success (wait on it,
+ *        then read the buffer, then destroy the future, then free the buffer).
+ *        Set to nullptr on failure.
+ * @return 0 on success, negative on error
+ */
+int32_t cte_tag_async_get_shm(const void *tag, const char *blob_name,
+                              uint64_t offset, uint64_t size,
+                              CteShmHandle out_buf,
+                              CteFutureHandle *out_future);
+
 #ifdef __cplusplus
 }
 #endif

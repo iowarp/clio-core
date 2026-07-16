@@ -534,6 +534,26 @@ void cte_put_future_destroy_fn(void *future) {
   using FutureT = clio::run::Future<clio::cte::core::PutBlobTask>;
   delete static_cast<FutureT *>(future);
 }
+
+/// Concrete wait_fn for Future<GetBlobTask>: calls Wait, reads return code.
+int32_t cte_get_future_wait_fn(void *future, float timeout_sec, int32_t *out_rc) {
+  if (out_rc) *out_rc = 0;
+  if (future == nullptr) return -1;
+  using FutureT = clio::run::Future<clio::cte::core::GetBlobTask>;
+  auto *f = static_cast<FutureT *>(future);
+  float max_sec = (timeout_sec <= 0.0f) ? -1.0f : timeout_sec;
+  bool completed = f->Wait(max_sec, /*reuse_task=*/false);
+  if (!completed) return 1;  // timeout
+  if (out_rc) *out_rc = (*f)->GetReturnCode();
+  return 0;
+}
+
+/// Concrete destroy_fn for Future<GetBlobTask>: deletes the future.
+void cte_get_future_destroy_fn(void *future) {
+  if (future == nullptr) return;
+  using FutureT = clio::run::Future<clio::cte::core::GetBlobTask>;
+  delete static_cast<FutureT *>(future);
+}
 }  // namespace
 
 /**
@@ -588,6 +608,59 @@ extern "C" int32_t cte_tag_async_put_shm(const void *tag, const char *blob_name,
   auto *boxed = new FutureT(std::move(future));
   auto *inner = new CteFutureInner{cte_put_future_wait_fn,
                                    cte_put_future_destroy_fn,
+                                   static_cast<void *>(boxed)};
+  if (out_future) *out_future = static_cast<CteFutureHandle>(inner);
+  return 0;
+}
+
+/**
+ * Submit a zero-copy AsyncGetBlob into a caller-allocated SHM output buffer.
+ * The caller (Rust) allocates the buffer via cte_alloc_shm_buffer of `size`
+ * bytes and passes its handle here. CTE writes the blob bytes into that SHM
+ * region asynchronously after this call returns. The caller MUST wait on the
+ * returned future (cte_future_wait) BEFORE reading the buffer (via
+ * cte_shm_handle_to_ptr) or freeing it (cte_free_shm_buffer). Reading or
+ * freeing before the future completes is a data race / use-after-free.
+ *
+ * LIFETIME: the `out_buf` handle's SHM region is written by the runtime
+ * asynchronously after submit. Caller MUST: cte_future_wait(out_future) ->
+ * (read via cte_shm_handle_to_ptr) -> cte_future_destroy -> cte_free_shm_buffer.
+ *
+ * @param tag The CTE tag to read from (opaque pointer to cte_ffi::Tag)
+ * @param blob_name Null-terminated blob name
+ * @param offset Offset within the blob to read from
+ * @param size Number of bytes to read (must match the allocated buffer size)
+ * @param out_buf CteShmHandle of the caller-allocated output SHM buffer
+ * @param out_future Set to an opaque CteFutureHandle on success. nullptr on failure.
+ * @return 0 on success, negative on error
+ */
+extern "C" int32_t cte_tag_async_get_shm(const void *tag, const char *blob_name,
+                                          uint64_t offset, uint64_t size,
+                                          CteShmHandle out_buf,
+                                          CteFutureHandle *out_future) {
+  if (out_future) *out_future = nullptr;
+  if (tag == nullptr || blob_name == nullptr) return -1;
+  if (out_buf.off == 0 && out_buf.alloc_id_major == 0 && out_buf.alloc_id_minor == 0) {
+    return -2;  // null SHM handle
+  }
+  // Reconstruct the ShmPtr<> (void) from the handle (same as put)
+  ctp::ipc::ShmPtr<> shm_ptr;
+  shm_ptr.alloc_id_ = ctp::ipc::AllocatorId(out_buf.alloc_id_major, out_buf.alloc_id_minor);
+  shm_ptr.off_ = static_cast<size_t>(out_buf.off);
+  // Use the global CTE client (matches put + FUSE + dynamic_reorganize)
+  auto *cte_client = ::clio::cte::core::g_cte_client;
+  if (cte_client == nullptr) return -3;
+  // Cast the opaque tag pointer back to the actual Tag type
+  const cte_ffi::Tag *tag_wrapper = static_cast<const cte_ffi::Tag *>(tag);
+  auto future = cte_client->AsyncGetBlob(
+      tag_wrapper->inner.GetTagId(), blob_name,
+      static_cast<clio::run::u64>(offset), static_cast<clio::run::u64>(size),
+      /*flags=*/0u, shm_ptr, clio::run::PoolQuery::Local());
+  // Box the future on the heap + wrap in CteFutureInner for type-erased C-ABI
+  using FutureT = clio::run::Future<clio::cte::core::GetBlobTask>;
+  auto *boxed = new FutureT(std::move(future));
+  auto *inner = new CteFutureInner{cte_get_future_wait_fn,
+                                   cte_get_future_destroy_fn,
                                    static_cast<void *>(boxed)};
   if (out_future) *out_future = static_cast<CteFutureHandle>(inner);
   return 0;

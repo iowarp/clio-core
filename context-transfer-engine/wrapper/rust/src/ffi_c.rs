@@ -404,4 +404,19 @@ extern "C" {
         score: f32,
         out_future: *mut CteFutureHandle,
     ) -> i32;
+
+    /// Submit a zero-copy AsyncGetBlob into a caller-allocated SHM output buffer.
+    /// Caller must `cte_future_wait(out_future)` THEN read via
+    /// `cte_shm_handle_to_ptr` THEN `cte_free_shm_buffer(out_buf)` — reading or
+    /// freeing before the future completes is a data race / use-after-free
+    /// (CTE writes the buffer asynchronously after submit).
+    /// @return 0 on success, negative on error
+    pub fn cte_tag_async_get_shm(
+        tag: *const std::ffi::c_void,
+        blob_name: *const std::ffi::c_char,
+        offset: u64,
+        size: u64,
+        out_buf: CteShmHandle,
+        out_future: *mut CteFutureHandle,
+    ) -> i32;
 }
