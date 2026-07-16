@@ -390,4 +390,18 @@ extern "C" {
 
     /// Destroy a future handle. No-op on null.
     pub fn cte_future_destroy(future: CteFutureHandle);
+
+    /// Submit a zero-copy AsyncPutBlob using a caller-allocated SHM buffer.
+    /// Caller must `cte_future_wait(out_future)` THEN `cte_free_shm_buffer(data)`
+    /// — freeing the buffer before the future completes is use-after-free.
+    /// @return 0 on success, negative on error
+    pub fn cte_tag_async_put_shm(
+        tag: *const std::ffi::c_void,
+        blob_name: *const std::ffi::c_char,
+        offset: u64,
+        size: u64,
+        data: CteShmHandle,
+        score: f32,
+        out_future: *mut CteFutureHandle,
+    ) -> i32;
 }

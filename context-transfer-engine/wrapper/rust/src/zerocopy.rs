@@ -130,6 +130,26 @@ impl ShmBuffer {
         // null/unresolvable handle.
         unsafe { cte_shm_handle_to_ptr(handle) }
     }
+
+    /// Decompose the ShmBuffer into its raw parts (handle, ptr, len) for
+    /// moving across threads (e.g. into a spawn_blocking closure). The
+    /// `ShmBuffer`'s `Drop` is prevented (the caller becomes responsible for
+    /// calling `cte_free_shm_buffer(handle)` — which the async put/get paths
+    /// do after the future completes).
+    ///
+    /// SAFETY: the returned (handle, ptr, len) must outlive any runtime op
+    /// using the handle, and must be freed via `cte_free_shm_buffer` exactly
+    /// once. The `ptr` is valid for `len` bytes until `cte_free_shm_buffer`.
+    pub fn into_parts(mut self) -> (CteShmHandle, *mut u8, usize) {
+        let handle = self.handle;
+        let ptr = self.ptr;
+        let len = self.len;
+        // Prevent Drop from running (we transferred ownership of the parts)
+        // Nulling handle+ptr makes Drop a no-op (Drop checks !handle.is_null())
+        self.handle = CteShmHandle::null();
+        self.ptr = std::ptr::null_mut();
+        (handle, ptr, len)
+    }
 }
 
 impl Drop for ShmBuffer {

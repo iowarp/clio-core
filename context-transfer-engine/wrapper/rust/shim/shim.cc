@@ -509,3 +509,86 @@ void cte_future_destroy(CteFutureHandle future) {
   inner->destroy_fn(inner->future);
   delete inner;
 }
+
+// ---- AsyncPutBlob SHM entry point (cte_tag_async_put_shm) ----
+
+namespace {
+/// Concrete wait_fn for Future<PutBlobTask>: calls Wait, reads return code.
+int32_t cte_put_future_wait_fn(void *future, float timeout_sec, int32_t *out_rc) {
+  if (out_rc) *out_rc = 0;
+  if (future == nullptr) return -1;
+  using FutureT = clio::run::Future<clio::cte::core::PutBlobTask>;
+  auto *f = static_cast<FutureT *>(future);
+  // timeout_sec <= 0 means wait forever (Wait uses -1 for that)
+  float max_sec = (timeout_sec <= 0.0f) ? -1.0f : timeout_sec;
+  bool completed = f->Wait(max_sec, /*reuse_task=*/false);
+  if (!completed) return 1;  // timeout
+  // f->operator->() returns PutBlobTask*, which inherits from clio::run::Task
+  if (out_rc) *out_rc = (*f)->GetReturnCode();
+  return 0;
+}
+
+/// Concrete destroy_fn for Future<PutBlobTask>: deletes the future.
+void cte_put_future_destroy_fn(void *future) {
+  if (future == nullptr) return;
+  using FutureT = clio::run::Future<clio::cte::core::PutBlobTask>;
+  delete static_cast<FutureT *>(future);
+}
+}  // namespace
+
+/**
+ * Submit a zero-copy AsyncPutBlob using a caller-allocated SHM buffer.
+ * The caller (Rust) allocated the buffer via cte_alloc_shm_buffer and wrote
+ * the blob data into it. This passes the ShmPtr to AsyncPutBlob WITHOUT
+ * copying, and returns an opaque future the caller must wait on (via
+ * cte_future_wait) BEFORE freeing the buffer (via cte_free_shm_buffer).
+ *
+ * LIFETIME: the `data` handle's SHM region is read by the runtime
+ * asynchronously after this call returns. The caller MUST call
+ * cte_future_wait on the returned future and only then cte_free_shm_buffer.
+ * Freeing the buffer before the future completes is use-after-free.
+ *
+ * @param tag The CTE tag to put into
+ * @param blob_name Null-terminated blob name
+ * @param offset Offset within the blob
+ * @param size Number of bytes in the SHM buffer
+ * @param data CteShmHandle of the caller-allocated, data-filled SHM buffer
+ * @param score Placement score (-1.0 = auto, 0.0-1.0 = explicit)
+ * @param out_future Set to an opaque CteFutureHandle on success (wait on it,
+ *        then destroy it, then free the buffer). Set to nullptr on failure.
+ * @return 0 on success, negative on error
+ */
+extern "C" int32_t cte_tag_async_put_shm(const void *tag, const char *blob_name,
+                                         uint64_t offset, uint64_t size,
+                                         CteShmHandle data, float score,
+                                         CteFutureHandle *out_future) {
+  if (out_future) *out_future = nullptr;
+  if (tag == nullptr || blob_name == nullptr) return -1;
+  if (data.off == 0 && data.alloc_id_major == 0 && data.alloc_id_minor == 0) {
+    return -2;  // null SHM handle
+  }
+  // Reconstruct the ShmPtr<> (void) from the handle
+  // AsyncPutBlob takes ShmPtr<> = ShmPtr<void>, so construct that directly
+  ctp::ipc::ShmPtr<> shm_ptr;
+  shm_ptr.alloc_id_ = ctp::ipc::AllocatorId(data.alloc_id_major, data.alloc_id_minor);
+  shm_ptr.off_ = static_cast<size_t>(data.off);
+  // Submit the async put (zero-copy: no memcpy of blob data here)
+  // Use the global CTE client (matches FUSE adapter + client_dynamic_reorganize)
+  auto *cte_client = ::clio::cte::core::g_cte_client;
+  if (cte_client == nullptr) return -3;  // CTE client not initialized
+  // Cast the opaque tag pointer back to the actual Tag type
+  const cte_ffi::Tag *tag_wrapper = static_cast<const cte_ffi::Tag *>(tag);
+  auto future = cte_client->AsyncPutBlob(
+      tag_wrapper->inner.GetTagId(), blob_name,
+      static_cast<clio::run::u64>(offset), static_cast<clio::run::u64>(size),
+      shm_ptr, score, clio::cte::core::Context(), /*flags=*/0u,
+      clio::run::PoolQuery::Local());
+  // Box the future on the heap + wrap in CteFutureInner for type-erased C-ABI
+  using FutureT = clio::run::Future<clio::cte::core::PutBlobTask>;
+  auto *boxed = new FutureT(std::move(future));
+  auto *inner = new CteFutureInner{cte_put_future_wait_fn,
+                                   cte_put_future_destroy_fn,
+                                   static_cast<void *>(boxed)};
+  if (out_future) *out_future = static_cast<CteFutureHandle>(inner);
+  return 0;
+}

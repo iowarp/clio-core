@@ -573,6 +573,136 @@ impl Tag {
         self.put_blob_with_options(name, data, 0, 1.0)
     }
 
+    /// Zero-copy put: write `data` into the caller-provided SHM buffer, then
+    /// submit it to AsyncPutBlob without copying the blob bytes across the FFI.
+    ///
+    /// The `ShmBuffer` is consumed (owned by this call). The function enforces
+    /// the wait-before-free lifetime: it holds the buffer until `cte_future_wait`
+    /// returns, destroys the future, and only then drops the buffer (which calls
+    /// `cte_free_shm_buffer`). The CTE runtime reads the SHM region
+    /// asynchronously between submit and wait-completion, so freeing earlier
+    /// would be use-after-free.
+    ///
+    /// # Arguments
+    /// * `name` - Blob name (must not be empty)
+    /// * `buf` - Caller-allocated SHM buffer containing the blob data. Its
+    ///   `len()` is the byte count; `offset` is the blob offset (not the
+    ///   buffer offset — the whole buffer is the blob slice).
+    /// * `offset` - Offset within the blob to write at
+    /// * `score` - Placement score (-1.0 = auto, 0.0-1.0 = explicit)
+    ///
+    /// # Returns
+    /// * `Ok(())` on success
+    /// * `Err(CteError::FfiError)` on FFI/validation failure
+    /// * `Err(CteError::ShmNullHandle)` if the buffer handle is null
+    ///
+    /// # Example
+    /// ```
+    /// use clio_cte::sync::Tag;
+    /// use clio_cte::zerocopy::ShmBuffer;
+    ///
+    /// let tag = Tag::new("my_dataset");
+    /// let mut buf = ShmBuffer::alloc(1024).expect("alloc failed");
+    /// buf.as_mut_slice().copy_from_slice(b"hello");
+    /// tag.put_blob_shm("data.bin", buf, 0, 1.0).expect("put failed");
+    /// ```
+    pub fn put_blob_shm(
+        &self,
+        name: &str,
+        buf: crate::zerocopy::ShmBuffer,
+        offset: u64,
+        score: f32,
+    ) -> CteResult<()> {
+        // Validate inputs
+        if name.is_empty() {
+            // Free the buffer before returning the error (it's owned by us now)
+            drop(buf);
+            return Err(CteError::FfiError {
+                message: "blob name must not be empty".to_string(),
+            });
+        }
+
+        // Validate score
+        if score < 0.0 || score > 1.0 || score.is_nan() {
+            drop(buf);
+            return Err(CteError::InvalidParameter {
+                message: format!("Score must be between 0.0 and 1.0, got {}", score),
+            });
+        }
+
+        // Check for null handle (shouldn't happen if ShmBuffer::alloc succeeded,
+        // but defend against it anyway)
+        if buf.handle().is_null() {
+            return Err(CteError::ShmNullHandle);
+        }
+
+        let size = buf.len() as u64;
+
+        // Build a null-terminated C string for blob_name
+        let c_name = std::ffi::CString::new(name).map_err(|e| CteError::FfiError {
+            message: format!("blob name has interior NUL: {}", e),
+        })?;
+
+        // Get the raw pointer to the cxx::Tag for the extern "C" call.
+        // Pattern: UniquePtr derefs to &T, so we use std::ptr::addr_of! to get
+        // a raw pointer without creating an intermediate reference, then cast
+        // to *const c_void (matches what cte_tag_async_put_shm expects).
+        let tag_ptr = std::ptr::addr_of!(*self.inner) as *const std::ffi::c_void;
+
+        // Submit the async put. Pass the buffer's handle (by value — CteShmHandle is Copy).
+        // The C++ side reconstructs the ShmPtr and calls AsyncPutBlob WITHOUT copying.
+        let mut future: crate::ffi_c::CteFutureHandle = std::ptr::null_mut();
+        let rc = unsafe {
+            crate::ffi_c::cte_tag_async_put_shm(
+                tag_ptr,
+                c_name.as_ptr(),
+                offset,
+                size,
+                buf.handle(),
+                score,
+                &mut future,
+            )
+        };
+
+        if rc != 0 {
+            // Submit failed — no future to wait on. buf drops here (frees SHM). Safe.
+            return Err(CteError::FfiError {
+                message: format!("cte_tag_async_put_shm failed rc={}", rc),
+            });
+        }
+
+        // WAIT on the future BEFORE dropping buf. The runtime is reading buf's
+        // SHM region asynchronously right now. We must not let buf drop until
+        // wait returns. Keep buf alive by holding it in scope past the wait.
+        let mut wait_rc: i32 = 0;
+        let wait_status = unsafe {
+            crate::ffi_c::cte_future_wait(future, /*timeout_sec=*/ -1.0, &mut wait_rc)
+        };
+
+        // Destroy the future (releases the C++ Future<PutBlobTask> wrapper).
+        unsafe { crate::ffi_c::cte_future_destroy(future) };
+
+        // NOW buf can drop (end of scope) — the runtime has finished reading.
+        // The drop order is: future destroyed above (explicit), then buf drops
+        // at scope end. This is the wait-before-free guarantee.
+        if wait_status != 0 {
+            return Err(CteError::FfiError {
+                message: format!(
+                    "put_blob_shm future wait failed (status={}, rc={})",
+                    wait_status, wait_rc
+                ),
+            });
+        }
+
+        if wait_rc != 0 {
+            return Err(CteError::FfiError {
+                message: format!("put_blob_shm task failed rc={}", wait_rc),
+            });
+        }
+
+        Ok(())
+    }
+
     /// Read data from a blob
     ///
     /// # Arguments

@@ -153,6 +153,10 @@ float cte_frecency_compute_score(uint64_t access_count,
 extern "C" {
 #endif
 
+// Forward-declare Tag for C-ABI functions (Tag is defined in cte_ffi namespace)
+// We use an opaque struct here since the C-ABI only needs a pointer
+struct Tag;
+
 /**
  * FFI-safe SHM buffer handle, bit-identical to ctp::ipc::ShmPtr<char>
  * (ShmPtrBase<char, false>) layout: {AllocatorId {u32,u32}, OffsetPtr {u64}}.
@@ -219,6 +223,25 @@ int32_t cte_future_wait(CteFutureHandle future, float timeout_sec,
  * Destroy a future handle (releases the C++ Future wrapper). No-op on null.
  */
 void cte_future_destroy(CteFutureHandle future);
+
+/**
+ * Submit a zero-copy AsyncPutBlob using a caller-allocated SHM buffer.
+ * Caller must cte_future_wait(out_future) THEN cte_free_shm_buffer(data) —
+ * freeing the buffer before the future completes is use-after-free.
+ * @param tag The CTE tag to put into (opaque pointer to cte_ffi::Tag)
+ * @param blob_name Null-terminated blob name
+ * @param offset Offset within the blob
+ * @param size Number of bytes in the SHM buffer
+ * @param data CteShmHandle of the caller-allocated, data-filled SHM buffer
+ * @param score Placement score (-1.0 = auto, 0.0-1.0 = explicit)
+ * @param out_future Set to an opaque CteFutureHandle on success (wait on it,
+ *        then destroy it, then free the buffer). Set to nullptr on failure.
+ * @return 0 on success, negative on error
+ */
+int32_t cte_tag_async_put_shm(const void *tag, const char *blob_name,
+                              uint64_t offset, uint64_t size,
+                              CteShmHandle data, float score,
+                              CteFutureHandle *out_future);
 
 #ifdef __cplusplus
 }
