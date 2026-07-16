@@ -1,0 +1,7 @@
+date,git_sha,crate,loc,unsafe_count,clippy_warnings,cold_build_s,warm_build_s,tests_passed
+2026-07-16,4580d0b4,ctp-coroutine,554,8,0,2.25,0.24,3
+2026-07-16,4580d0b4,ctp-ffi,291,27,0,2.2,0.74,2
+2026-07-16,4580d0b4,ctp-gpu,623,20,0,0.67,0.3,2
+2026-07-16,4580d0b4,ctp-introspect,462,27,0,1.11,0.36,5
+2026-07-16,4580d0b4,ctp-types,169,0,0,0.1,0.19,2
+2026-07-16,4580d0b4,cpp-baseline-clio_ctp_host,72012,,,83.17,,

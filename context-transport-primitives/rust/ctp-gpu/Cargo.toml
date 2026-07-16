@@ -1,0 +1,19 @@
+[package]
+name = "ctp-gpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "GPU extension wrapper: CUDA C++ kernels behind a safe Rust API (issue #756)"
+build = "build.rs"
+
+[lib]
+name = "ctp_gpu"
+
+[features]
+default = []
+# CUDA support: links the CUDA driver API (nvcuda/libcuda) and NVRTC.
+# Kernels remain CUDA C++ (kernels/*.cu), JIT-compiled by NVRTC at runtime —
+# no nvcc/cl.exe needed at build time, so `cargo build --features cuda`
+# works anywhere the CUDA toolkit is installed.
+cuda = []

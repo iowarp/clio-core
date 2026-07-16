@@ -4,6 +4,7 @@ members = [
     "ctp-types",
     "ctp-introspect",
     "ctp-coroutine",
+    "ctp-gpu",
     "ctp-ffi",
 ]
 

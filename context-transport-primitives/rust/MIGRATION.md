@@ -1,12 +1,53 @@
 # CTP → Rust Migration Plan (issue #756)
 
-Long-term goal: context-exploration-engine, context-runtime, context-transfer-engine,
-and most of context-transport-primitives move to Rust. Some components are
-unavoidably C++ and stay behind wrapper crates:
+Goal: migrate the ENTIRE system to Rust — context-exploration-engine,
+context-runtime, context-transfer-engine, context-assimilation-engine, and
+context-transport-primitives — tracking how compilation times and code
+quality are affected at every step (see Metrics below). Measured scope of
+the C++ codebase (2026-07-16, excluding build dirs and external/):
 
-- **GPU kernels** (CUDA/ROCm/SYCL device code)
+| Component | Files | Lines |
+|---|---|---|
+| context-transport-primitives | 248 | 72,012 |
+| context-runtime | 185 | 83,085 |
+| context-transfer-engine | 179 | 76,894 |
+| context-assimilation-engine | 48 | 12,739 |
+| context-exploration-engine | 8 | 2,146 |
+| **Total** | **668** | **~247k** |
+
+Some components are unavoidably C++ and stay behind wrapper crates:
+
+- **GPU kernels** (CUDA/ROCm/SYCL device code) — see "GPU extensions" below
 - **libthallium transport** (Mochi/Argobots C++ API)
 - Anything else with a C++-template-shaped API surface consumed by device code
+
+## GPU extensions (ctp-gpu)
+
+Kernels remain CUDA C++ (`ctp-gpu/kernels/*.cu`); the `ctp-gpu` crate wraps
+them for Rust callers, mirroring the C++ `GpuApi` surface (device/managed
+alloc, memcpy, launch, synchronize). Mechanism: kernel source is embedded
+at build time and **JIT-compiled by NVRTC at runtime for the local device's
+exact SM (CUBIN)** — no nvcc/host-C++-compiler needed at build time, and no
+driver-JIT PTX-version skew (a 13.x NVRTC emits PTX a 12.x-era driver can't
+load; compiling to the device's own SM sidesteps it). `--features cuda`
+links the driver API + NVRTC via CUDA_PATH/CUDA_HOME//usr/local/cuda.
+Verified on RTX 5080 (sm_120, CUDA 13.3) and buildable against the
+devcontainer's CUDA 12.6. ROCm/SYCL backends follow the same pattern when
+their modules migrate.
+
+## Metrics: compile time + code quality
+
+`metrics/collect.py` appends one row per crate per run to
+`metrics/history.csv`: LOC (incl. wrapped .cc/.cu), `unsafe` count, clippy
+warnings, cold/warm build seconds, tests passed. `--cpp-cmd` times an
+equivalent C++ build as the `cpp-baseline` row. First datapoint
+(2026-07-16): the 5-crate Rust workspace cold-builds in **~6.5 s** and
+warm-rebuilds in **<1 s per crate** vs **83 s** for a clean `clio_ctp_host`
+C++ build in the devcontainer — NOT yet apples-to-apples (2.1k Rust lines
+vs the full 72k-line C++ lib); the honest comparison emerges as Rust
+coverage approaches the C++ module's scope, which is exactly what the
+history file tracks. Quality snapshot: 0 clippy warnings; 82 `unsafe`
+tokens, all confined to the FFI/GPU boundary crates (ctp-types has zero).
 
 ## Strategy: parallel crate + C ABI
 
