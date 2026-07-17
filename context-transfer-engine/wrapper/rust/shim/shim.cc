@@ -236,78 +236,9 @@ void tag_get_contained_blobs(const Tag& tag, rust::Vec<rust::String>& out) {
   }
 }
 
-/// Poll the telemetry log and return raw encoded entries.
-/// Each entry: op(u32) + off(u64) + size(u64) + tag_major(u32) + tag_minor(u32) +
-///             mod_time_nanos(u64) + read_time_nanos(u64) + logical_time(u64)
-///             = 4 + 8 + 8 + 4 + 4 + 8 + 8 + 8 = 52 bytes per entry
-/// @param client The client to poll
-/// @param min_time Minimum timestamp to fetch entries from
-/// @param timeout_sec Timeout in seconds (0 = no timeout)
-/// @param out Output vector of raw bytes
-/// @return 0 on success, 1 on timeout, 2 on error
-int32_t client_poll_telemetry_raw(const Client& client, uint64_t min_time,
-                                  float timeout_sec, rust::Vec<uint8_t>& out) {
-  auto task = client.inner.AsyncPollTelemetryLog(min_time);
-
-  // Wait with timeout (0 means no timeout, but we use passed timeout_sec)
-  bool completed = task.Wait(timeout_sec);
-
-  if (!completed) {
-    // Timeout occurred
-    return 1;
-  }
-
-  // Check for errors
-  if (task->GetReturnCode() != 0) {
-    return 2;
-  }
-
-  // PERFORMANCE: Use std::vector as intermediate buffer for memcpy serialization
-  // rust::Vec lacks resize(), so we serialize to std::vector first, then copy
-  const size_t kRecordSize = 52;
-  const size_t total_size = task->entries_.size() * kRecordSize;
-  std::vector<uint8_t> buf(total_size);
-  uint8_t* w = buf.data();
-
-  for (const auto& entry : task->entries_) {
-    // op (u32)
-    uint32_t op = static_cast<uint32_t>(entry.op_);
-    std::memcpy(w, &op, 4); w += 4;
-
-    // off (u64)
-    std::memcpy(w, &entry.off_, 8); w += 8;
-
-    // size (u64)
-    std::memcpy(w, &entry.size_, 8); w += 8;
-
-    // tag_major (u32)
-    std::memcpy(w, &entry.tag_id_.major_, 4); w += 4;
-
-    // tag_minor (u32)
-    std::memcpy(w, &entry.tag_id_.minor_, 4); w += 4;
-
-    // mod_time_nanos (u64) - Timestamp is now clio::run::u64 typedef
-    std::memcpy(w, &entry.mod_time_, 8); w += 8;
-
-    // read_time_nanos (u64) - Timestamp is now clio::run::u64 typedef
-    std::memcpy(w, &entry.read_time_, 8); w += 8;
-
-    // logical_time (u64)
-    std::memcpy(w, &entry.logical_time_, 8); w += 8;
-  }
-
-  // ONE bulk copy into the rust::Vec
-  out.clear();
-  out.reserve(buf.size());
-  std::memcpy(out.data(), buf.data(), buf.size());
-  out.truncate(buf.size());
-
-  return 0;  // Success
-}
-
 /// T23: Poll telemetry and return typed CteTelemetryEntry records directly
-/// (no byte buffer serialization). Replaces client_poll_telemetry_raw +
-/// Rust from_le_bytes re-parse.
+/// (no byte buffer serialization). Returns typed records without byte buffer
+/// or Rust from_le_bytes re-parse.
 /// @param client The client to poll
 /// @param min_time Minimum logical time filter
 /// @param timeout_sec Timeout in seconds (0 = no timeout)
@@ -350,74 +281,9 @@ int32_t client_poll_telemetry_bulk(const Client& client, uint64_t min_time,
   return 0;  // Success
 }
 
-/// Get blob info with performance-critical serialization.
-/// Format: score(f32) + total_size(u64) + blocks_count(u32) + blocks[...]
-/// Each block: target_pool_id(u64) + block_size(u64) + block_offset(u64) = 24 bytes
-/// @param client The client to query
-/// @param major Tag ID major component
-/// @param minor Tag ID minor component
-/// @param name The blob name
-/// @param out Output vector of raw bytes
-/// @return Task return code (0 = success)
-int32_t client_get_blob_info_raw(const Client& client, uint32_t major,
-                                 uint32_t minor, rust::Str name,
-                                 rust::Vec<uint8_t>& out) {
-  clio::run::UniqueId tag_id(major, minor);
-  std::string blob_name(name.data(), name.size());
-
-  auto task = client.inner.AsyncGetBlobInfo(tag_id, blob_name);
-  task.Wait();
-
-  if (task->GetReturnCode() != 0) {
-    return task->GetReturnCode();
-  }
-
-  // PERFORMANCE: Serialize into std::vector first, then ONE bulk memcpy to rust::Vec
-  const size_t kHeaderSize = 16;
-  const size_t kBlockSize = 24;
-  const size_t buf_total_size = kHeaderSize + task->blocks_.size() * kBlockSize;
-  std::vector<uint8_t> buf(buf_total_size);
-  uint8_t* w = buf.data();
-
-  // score (f32) via uint32_t bits
-  uint32_t score_bits;
-  static_assert(sizeof(score_bits) == sizeof(task->score_), "Size mismatch");
-  std::memcpy(&score_bits, &task->score_, sizeof(float));
-  std::memcpy(w, &score_bits, 4); w += 4;
-
-  // total_size (u64)
-  std::memcpy(w, &task->total_size_, 8); w += 8;
-
-  // blocks_count (u32)
-  uint32_t blocks_count = static_cast<uint32_t>(task->blocks_.size());
-  std::memcpy(w, &blocks_count, 4); w += 4;
-
-  // each block
-  for (const auto& block : task->blocks_) {
-    // target_pool_id (u64) - PoolId is a class, convert to u64 first
-    uint64_t pool_id =
-        block.target_pool_id_.IsNull() ? 0 : block.target_pool_id_.ToU64();
-    std::memcpy(w, &pool_id, 8); w += 8;
-
-    // block_size (u64)
-    std::memcpy(w, &block.block_size_, 8); w += 8;
-
-    // block_offset (u64)
-    std::memcpy(w, &block.block_offset_, 8); w += 8;
-  }
-
-  // ONE bulk copy into the rust::Vec
-  out.clear();
-  out.reserve(buf.size());
-  std::memcpy(out.data(), buf.data(), buf.size());
-  out.truncate(buf.size());
-
-  return 0;
-}
-
 /// T23: Get blob info and return a typed BlobInfoBulk struct directly
-/// (no byte buffer serialization). Replaces client_get_blob_info_raw +
-/// Rust from_le_bytes re-parse. cxx shared structs cannot contain Vec,
+/// (no byte buffer serialization). Returns typed records without byte buffer
+/// or Rust from_le_bytes re-parse. cxx shared structs cannot contain Vec,
 /// so blocks is returned as a separate out-param.
 /// @param client The client to query
 /// @param major Tag ID major component

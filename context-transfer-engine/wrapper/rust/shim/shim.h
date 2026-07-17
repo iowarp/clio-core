@@ -186,28 +186,13 @@ void tag_get_blob(const Tag& tag, rust::Str name, uint64_t size,
 
 void tag_get_contained_blobs(const Tag& tag, rust::Vec<rust::String>& out);
 
-// Telemetry - returns flat array: each entry is (op:u32, off:u64, size:u64,
-// tag_major:u32, tag_minor:u32, mod_time_nanos:i64, read_time_nanos:i64,
-// logical_time:u64) Total 52 bytes per entry. Caller interprets the byte
-// buffer.
-// Returns: 0 on success with data, 1 on timeout, 2 on error
-int32_t client_poll_telemetry_raw(const Client& client, uint64_t min_time,
-                                  float timeout_sec, rust::Vec<uint8_t>& out);
-
 // T23: Bulk telemetry - returns typed CteTelemetryEntry records directly
 // (no byte buffer serialization). The CteTelemetryEntry struct is defined
 // by cxx from the Rust bridge (shared struct).
-// Returns: 0 success, 1 timeout, 2 error (same codes as client_poll_telemetry_raw)
+// Returns: 0 success, 1 timeout, 2 error
 int32_t client_poll_telemetry_bulk(const Client& client, uint64_t min_time,
                                    float timeout_sec,
                                    rust::Vec<CteTelemetryEntry>& out_entries);
-
-// GetBlobInfo - returns blob metadata with block placement
-// Format: score(f32) + total_size(u64) + blocks_count(u32) + blocks[...]
-// Each block: pool_id(u64) + block_size(u64) + block_offset(u64) = 24 bytes
-int32_t client_get_blob_info_raw(const Client& client, uint32_t major,
-                                 uint32_t minor, rust::Str name,
-                                 rust::Vec<uint8_t>& out);
 
 // T23: Bulk blob_info - returns typed BlobInfoBulk + blocks Vec directly (no
 // byte buffer). cxx shared structs cannot contain Vec, so blocks is a separate

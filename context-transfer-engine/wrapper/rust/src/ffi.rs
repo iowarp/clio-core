@@ -215,7 +215,7 @@ pub struct BlobInfo {
 /// - `tag_get_blob_score`: Get blob placement score
 /// - `tag_get_blob_size`: Get blob size in bytes
 /// - `tag_get_contained_blobs`: List all blobs in a tag
-/// - `client_poll_telemetry_raw`: Poll telemetry entries
+/// - `client_poll_telemetry_bulk`: Poll telemetry entries
 ///
 /// ## Mutation Functions
 /// - `tag_put_blob`: Write data to a blob
@@ -372,31 +372,16 @@ pub mod ffi {
         // when the UniquePtr is dropped.
         fn client_new() -> UniquePtr<Client>;
 
-        // Poll telemetry entries after min_time with timeout
-        //
-        // Returns: 0 on success with data, 1 on timeout, 2 on error
-        //
-        // SAFETY: The output vector is properly initialized by Rust before being
-        // passed to C++. C++ appends bytes using resize/append, ensuring correct
-        // capacity and size management.
-        fn client_poll_telemetry_raw(
-            client: &Client,
-            min_time: u64,
-            timeout_sec: f32,
-            out: &mut Vec<u8>,
-        ) -> i32;
-
         // ---- T23: Bulk metadata transfer (typed structs, no byte buffer) ----
 
         /// Poll telemetry and return typed CteTelemetryEntry records directly
-        /// (no byte buffer serialization). Replaces client_poll_telemetry_raw +
-        /// Rust from_le_bytes re-parse. Returns the entries by value via the
+        /// (no byte buffer serialization). Returns the entries by value via the
         /// cxx Vec.
         /// @param client The client
         /// @param min_time Minimum logical time filter
         /// @param timeout_sec Timeout (0 = no timeout)
         /// @param out_entries Output: the typed telemetry records (cleared + filled)
-        /// @return 0 success, 1 timeout, 2 error (same codes as client_poll_telemetry_raw)
+        /// @return 0 success, 1 timeout, 2 error
         fn client_poll_telemetry_bulk(
             client: &Client,
             min_time: u64,
@@ -422,22 +407,9 @@ pub mod ffi {
         // SAFETY: Same guarantees as client_reorganize_blob.
         fn client_del_blob(client: &Client, major: u32, minor: u32, name: &str) -> i32;
 
-        // Get blob info (comprehensive metadata with block placement)
-        //
-        // SAFETY: The output vector is properly initialized by Rust before being
-        // passed to C++. C++ appends bytes using resize/append, ensuring correct
-        // capacity and size management.
-        fn client_get_blob_info_raw(
-            client: &Client,
-            major: u32,
-            minor: u32,
-            name: &str,
-            out: &mut Vec<u8>,
-        ) -> i32;
-
         /// Get blob info and return typed BlobInfoBulk + blocks Vec directly (no byte
-        /// buffer). Replaces client_get_blob_info_raw + Rust from_le_bytes re-parse.
-        /// cxx shared structs cannot contain Vec, so blocks is a separate out-param.
+        /// buffer). cxx shared structs cannot contain Vec, so blocks is a separate
+        /// out-param.
         /// @param client The client
         /// @param major/minor Tag ID
         /// @param name Blob name
