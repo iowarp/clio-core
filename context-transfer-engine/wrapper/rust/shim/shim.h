@@ -69,6 +69,66 @@ static_assert(sizeof(CteShmHandle) == 16,
               "CteShmHandle must be 16 bytes to match ShmPtr<char>");
 #endif  // CXXBRIDGE1_STRUCT_CteShmHandle
 
+// ---- T23: FFI-internal shared structs for metadata bulk transfer ----
+// These are defined here so cxx uses our definitions (cxx checks guards
+// before defining). Rust mirrors these as #[repr(C)] shared structs.
+
+#ifndef CXXBRIDGE1_STRUCT_CteTelemetryEntry
+#define CXXBRIDGE1_STRUCT_CteTelemetryEntry
+/**
+ * FFI-internal telemetry record. C++ fills fields directly (no byte
+ * serialization). Rust reads fields directly — no from_le_bytes re-parse.
+ * 56 bytes with C padding (op_ has 4 bytes padding before off_).
+ */
+struct CteTelemetryEntry {
+  uint32_t op;           // CteOp as u32 (4 bytes)
+  uint64_t off;          // 8 bytes
+  uint64_t size;         // 8 bytes
+  uint32_t tag_major;    // 4 bytes
+  uint32_t tag_minor;    // 4 bytes
+  uint64_t mod_time;     // 8 bytes
+  uint64_t read_time;    // 8 bytes
+  uint64_t logical_time; // 8 bytes
+
+  // Comparison operators (cxx generates implementations for PartialEq)
+  bool operator==(const CteTelemetryEntry& rhs) const noexcept;
+  bool operator!=(const CteTelemetryEntry& rhs) const noexcept;
+};
+#endif  // CXXBRIDGE1_STRUCT_CteTelemetryEntry
+
+#ifndef CXXBRIDGE1_STRUCT_BlobBlock
+#define CXXBRIDGE1_STRUCT_BlobBlock
+/**
+ * FFI-internal block placement info. target_pool_id is u64 (the C++ PoolId
+ * class is converted via IsNull()?0:ToU64() in the bulk fn).
+ */
+struct BlobBlock {
+  uint64_t pool_id;
+  uint64_t block_size;
+  uint64_t block_offset;
+
+  // Comparison operators (cxx generates implementations for PartialEq)
+  bool operator==(const BlobBlock& rhs) const noexcept;
+  bool operator!=(const BlobBlock& rhs) const noexcept;
+};
+#endif  // CXXBRIDGE1_STRUCT_BlobBlock
+
+#ifndef CXXBRIDGE1_STRUCT_BlobInfoBulk
+#define CXXBRIDGE1_STRUCT_BlobInfoBulk
+/**
+ * FFI-internal blob_info header (score + total_size). The blocks Vec is
+ * returned as a separate out-param (cxx shared structs cannot contain Vec).
+ */
+struct BlobInfoBulk {
+  float score;
+  uint64_t total_size;
+
+  // Comparison operators (cxx generates implementations for PartialEq)
+  bool operator==(const BlobInfoBulk& rhs) const noexcept;
+  bool operator!=(const BlobInfoBulk& rhs) const noexcept;
+};
+#endif  // CXXBRIDGE1_STRUCT_BlobInfoBulk
+
 namespace cte_ffi {
 
 // Thread-safe initialization
@@ -134,12 +194,30 @@ void tag_get_contained_blobs(const Tag& tag, rust::Vec<rust::String>& out);
 int32_t client_poll_telemetry_raw(const Client& client, uint64_t min_time,
                                   float timeout_sec, rust::Vec<uint8_t>& out);
 
+// T23: Bulk telemetry - returns typed CteTelemetryEntry records directly
+// (no byte buffer serialization). The CteTelemetryEntry struct is defined
+// by cxx from the Rust bridge (shared struct).
+// Returns: 0 success, 1 timeout, 2 error (same codes as client_poll_telemetry_raw)
+int32_t client_poll_telemetry_bulk(const Client& client, uint64_t min_time,
+                                   float timeout_sec,
+                                   rust::Vec<CteTelemetryEntry>& out_entries);
+
 // GetBlobInfo - returns blob metadata with block placement
 // Format: score(f32) + total_size(u64) + blocks_count(u32) + blocks[...]
 // Each block: pool_id(u64) + block_size(u64) + block_offset(u64) = 24 bytes
 int32_t client_get_blob_info_raw(const Client& client, uint32_t major,
                                  uint32_t minor, rust::Str name,
                                  rust::Vec<uint8_t>& out);
+
+// T23: Bulk blob_info - returns typed BlobInfoBulk + blocks Vec directly (no
+// byte buffer). cxx shared structs cannot contain Vec, so blocks is a separate
+// out-param. The BlobInfoBulk/BlobBlock structs are defined by cxx from the
+// Rust bridge (shared structs).
+// Returns: Task return code (0 = success)
+int32_t client_get_blob_info_bulk(const Client& client, uint32_t major,
+                                  uint32_t minor, rust::Str name,
+                                  BlobInfoBulk& out_info,
+                                  rust::Vec<BlobBlock>& out_blocks);
 
 // Tag ID helpers (exposed for Rust-side conversion)
 uint32_t tag_get_id_major(const Tag& tag);

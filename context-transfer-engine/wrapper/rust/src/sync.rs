@@ -215,10 +215,10 @@ impl Client {
         min_time: u64,
         timeout_sec: f32,
     ) -> CteResult<Vec<crate::ffi::CteTelemetry>> {
-        let mut raw = Vec::new();
-        let ret = ffi::client_poll_telemetry_raw(&self.inner, min_time, timeout_sec, &mut raw);
+        let mut entries: Vec<ffi::CteTelemetryEntry> = Vec::new();
+        let ret = ffi::client_poll_telemetry_bulk(&self.inner, min_time, timeout_sec, &mut entries);
         match ret {
-            0 => Ok(crate::ffi::parse_telemetry(&raw)),
+            0 => Ok(entries.iter().map(crate::ffi::telemetry_entry_to_telemetry).collect()),
             1 => Err(crate::CteError::Timeout),
             2 => Err(crate::CteError::RuntimeError {
                 code: 1,

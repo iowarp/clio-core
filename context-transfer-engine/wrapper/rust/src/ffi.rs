@@ -71,134 +71,48 @@
 // Import error types from parent module
 use crate::{CteError, CteResult};
 
-/// Telemetry entry size in bytes: op(4) + off(8) + size(8) + tag_major(4) + tag_minor(4) +
-/// mod_time_nanos(8) + read_time_nanos(8) + logical_time(8) = 52 bytes
-pub const TELEMETRY_ENTRY_SIZE: usize = 52;
-
-/// Offsets for parsing telemetry entries
-mod offsets {
-    pub const OP: usize = 0;
-    pub const OFF: usize = 4;
-    pub const SIZE: usize = 12;
-    pub const TAG_MAJOR: usize = 20;
-    pub const TAG_MINOR: usize = 24;
-    pub const MOD_TIME: usize = 28;
-    pub const READ_TIME: usize = 36;
-    pub const LOGICAL_TIME: usize = 44;
-}
-
 // Re-export types from types module for consistency
 pub use crate::types::{CteOp, CteTagId, CteTelemetry, SteadyTime};
 
-/// Parse telemetry entries from raw byte buffer
-///
-/// # Safety
-///
-/// This function is safe because:
-/// - It only reads from the provided slice without mutation
-/// - Uses little-endian byte order matching the C++ serialization
-/// - Validates buffer bounds before each read operation
-/// - Returns an empty vector for invalid/truncated data
-pub fn parse_telemetry(data: &[u8]) -> Vec<CteTelemetry> {
-    let mut entries = Vec::new();
-    let mut offset = 0;
+// ---- Conversion helpers for bulk FFI functions (T24) ----
+// These convert FFI-internal shared structs to the public types.
+// FFI-internal only — not re-exported in lib.rs.
 
-    while offset + TELEMETRY_ENTRY_SIZE <= data.len() {
-        let op = u32::from_le_bytes([
-            data[offset + offsets::OP],
-            data[offset + offsets::OP + 1],
-            data[offset + offsets::OP + 2],
-            data[offset + offsets::OP + 3],
-        ]);
-
-        let off = u64::from_le_bytes([
-            data[offset + offsets::OFF],
-            data[offset + offsets::OFF + 1],
-            data[offset + offsets::OFF + 2],
-            data[offset + offsets::OFF + 3],
-            data[offset + offsets::OFF + 4],
-            data[offset + offsets::OFF + 5],
-            data[offset + offsets::OFF + 6],
-            data[offset + offsets::OFF + 7],
-        ]);
-
-        let size = u64::from_le_bytes([
-            data[offset + offsets::SIZE],
-            data[offset + offsets::SIZE + 1],
-            data[offset + offsets::SIZE + 2],
-            data[offset + offsets::SIZE + 3],
-            data[offset + offsets::SIZE + 4],
-            data[offset + offsets::SIZE + 5],
-            data[offset + offsets::SIZE + 6],
-            data[offset + offsets::SIZE + 7],
-        ]);
-
-        let tag_major = u32::from_le_bytes([
-            data[offset + offsets::TAG_MAJOR],
-            data[offset + offsets::TAG_MAJOR + 1],
-            data[offset + offsets::TAG_MAJOR + 2],
-            data[offset + offsets::TAG_MAJOR + 3],
-        ]);
-
-        let tag_minor = u32::from_le_bytes([
-            data[offset + offsets::TAG_MINOR],
-            data[offset + offsets::TAG_MINOR + 1],
-            data[offset + offsets::TAG_MINOR + 2],
-            data[offset + offsets::TAG_MINOR + 3],
-        ]);
-
-        // mod_time_nanos (u64) - Timestamp type from CTE
-        let mod_time = u64::from_le_bytes([
-            data[offset + offsets::MOD_TIME],
-            data[offset + offsets::MOD_TIME + 1],
-            data[offset + offsets::MOD_TIME + 2],
-            data[offset + offsets::MOD_TIME + 3],
-            data[offset + offsets::MOD_TIME + 4],
-            data[offset + offsets::MOD_TIME + 5],
-            data[offset + offsets::MOD_TIME + 6],
-            data[offset + offsets::MOD_TIME + 7],
-        ]);
-
-        // read_time_nanos (u64) - Timestamp type from CTE
-        let read_time = u64::from_le_bytes([
-            data[offset + offsets::READ_TIME],
-            data[offset + offsets::READ_TIME + 1],
-            data[offset + offsets::READ_TIME + 2],
-            data[offset + offsets::READ_TIME + 3],
-            data[offset + offsets::READ_TIME + 4],
-            data[offset + offsets::READ_TIME + 5],
-            data[offset + offsets::READ_TIME + 6],
-            data[offset + offsets::READ_TIME + 7],
-        ]);
-
-        let logical_time = u64::from_le_bytes([
-            data[offset + offsets::LOGICAL_TIME],
-            data[offset + offsets::LOGICAL_TIME + 1],
-            data[offset + offsets::LOGICAL_TIME + 2],
-            data[offset + offsets::LOGICAL_TIME + 3],
-            data[offset + offsets::LOGICAL_TIME + 4],
-            data[offset + offsets::LOGICAL_TIME + 5],
-            data[offset + offsets::LOGICAL_TIME + 6],
-            data[offset + offsets::LOGICAL_TIME + 7],
-        ]);
-
-        entries.push(CteTelemetry {
-            op: CteOp::from(op),
-            off,
-            size,
-            tag_id: CteTagId {
-                major: tag_major,
-                minor: tag_minor,
-            },
-            mod_time,
-            read_time,
-            logical_time,
-        });
-
-        offset += TELEMETRY_ENTRY_SIZE;
+/// Convert FFI-internal CteTelemetryEntry (cxx shared struct) to the public CteTelemetry.
+/// FFI-internal — used by the bulk-fn callers. The public CteTelemetry stays the API.
+pub(crate) fn telemetry_entry_to_telemetry(e: &ffi::CteTelemetryEntry) -> CteTelemetry {
+    CteTelemetry {
+        op: CteOp::from(e.op),
+        off: e.off,
+        size: e.size,
+        tag_id: CteTagId {
+            major: e.tag_major,
+            minor: e.tag_minor,
+        },
+        mod_time: e.mod_time,
+        read_time: e.read_time,
+        logical_time: e.logical_time,
     }
+}
 
-    entries
+/// Convert FFI-internal BlobInfoBulk + Vec<BlobBlock> to the public BlobInfo.
+/// FFI-internal — used by the bulk-fn caller. The public BlobInfo stays the API.
+pub(crate) fn blob_info_bulk_to_blob_info(
+    info: &ffi::BlobInfoBulk,
+    blocks: Vec<ffi::BlobBlock>,
+) -> BlobInfo {
+    BlobInfo {
+        score: info.score,
+        total_size: info.total_size,
+        blocks: blocks
+            .iter()
+            .map(|b| BlobBlockInfo {
+                pool_id: b.pool_id,
+                block_size: b.block_size,
+                block_offset: b.block_offset,
+            })
+            .collect(),
+    }
 }
 
 /// Block placement information from GetBlobInfo
@@ -323,6 +237,59 @@ pub mod ffi {
         pub off: u64,
     }
 
+    // ---- FFI-internal shared structs for metadata bulk transfer (T23) ----
+    // These are defined in shim.h (cxx uses the C++ definitions).
+    // Rust mirrors them here as opaque shared structs. sync.rs converts
+    // them to the public types (CteTelemetry, BlobInfo, BlobBlockInfo).
+    // NOTE: These stay in the ffi mod (NOT re-exported).
+
+    /// FFI-internal telemetry record (defined in shim.h). C++ fills fields
+    /// directly (no byte serialization). Rust reads fields directly — no
+    /// from_le_bytes re-parse. The public crate::CteTelemetry type (in
+    /// types.rs) stays the high-level API.
+    ///
+    /// NOTE: No PartialEq/Eq derives — these are C++ shared structs, and cxx
+    /// generates comparison operators. Manual derives would cause duplicate symbols.
+    #[derive(Debug, Clone, Copy)]
+    #[namespace = ""]
+    pub struct CteTelemetryEntry {
+        pub op: u32,
+        pub off: u64,
+        pub size: u64,
+        pub tag_major: u32,
+        pub tag_minor: u32,
+        pub mod_time: u64,
+        pub read_time: u64,
+        pub logical_time: u64,
+    }
+
+    /// FFI-internal block placement info (defined in shim.h). target_pool_id
+    /// is u64 (the C++ PoolId class is converted via IsNull()?0:ToU64()).
+    /// The public crate::BlobBlockInfo stays the high-level API.
+    ///
+    /// NOTE: No PartialEq/Eq derives — these are C++ shared structs, and cxx
+    /// generates comparison operators. Manual derives would cause duplicate symbols.
+    #[derive(Debug, Clone, Copy)]
+    #[namespace = ""]
+    pub struct BlobBlock {
+        pub pool_id: u64,
+        pub block_size: u64,
+        pub block_offset: u64,
+    }
+
+    /// FFI-internal blob_info header (defined in shim.h). The blocks Vec is
+    /// returned as a separate out-param. The public crate::BlobInfo stays
+    /// the high-level API; sync.rs converts these to that.
+    ///
+    /// NOTE: No PartialEq/Eq derives — these are C++ shared structs, and cxx
+    /// generates comparison operators. Manual derives would cause duplicate symbols.
+    #[derive(Debug, Clone, Copy)]
+    #[namespace = ""]
+    pub struct BlobInfoBulk {
+        pub score: f32,
+        pub total_size: u64,
+    }
+
     unsafe extern "C++" {
         include!("shim/shim.h");
 
@@ -419,6 +386,24 @@ pub mod ffi {
             out: &mut Vec<u8>,
         ) -> i32;
 
+        // ---- T23: Bulk metadata transfer (typed structs, no byte buffer) ----
+
+        /// Poll telemetry and return typed CteTelemetryEntry records directly
+        /// (no byte buffer serialization). Replaces client_poll_telemetry_raw +
+        /// Rust from_le_bytes re-parse. Returns the entries by value via the
+        /// cxx Vec.
+        /// @param client The client
+        /// @param min_time Minimum logical time filter
+        /// @param timeout_sec Timeout (0 = no timeout)
+        /// @param out_entries Output: the typed telemetry records (cleared + filled)
+        /// @return 0 success, 1 timeout, 2 error (same codes as client_poll_telemetry_raw)
+        fn client_poll_telemetry_bulk(
+            client: &Client,
+            min_time: u64,
+            timeout_sec: f32,
+            out_entries: &mut Vec<CteTelemetryEntry>,
+        ) -> i32;
+
         // Reorganize blob (change placement score)
         //
         // SAFETY: All parameters are primitive types with guaranteed matching
@@ -448,6 +433,24 @@ pub mod ffi {
             minor: u32,
             name: &str,
             out: &mut Vec<u8>,
+        ) -> i32;
+
+        /// Get blob info and return typed BlobInfoBulk + blocks Vec directly (no byte
+        /// buffer). Replaces client_get_blob_info_raw + Rust from_le_bytes re-parse.
+        /// cxx shared structs cannot contain Vec, so blocks is a separate out-param.
+        /// @param client The client
+        /// @param major/minor Tag ID
+        /// @param name Blob name
+        /// @param out_info Output: the typed blob info header (score, total_size)
+        /// @param out_blocks Output: the block placement info Vec
+        /// @return Task return code (0 = success)
+        fn client_get_blob_info_bulk(
+            client: &Client,
+            major: u32,
+            minor: u32,
+            name: &str,
+            out_info: &mut BlobInfoBulk,
+            out_blocks: &mut Vec<BlobBlock>,
         ) -> i32;
 
         // NEW: Trigger the CTE's internal DynamicReorganize task for one replica.
@@ -543,10 +546,10 @@ impl Client {
     /// * `Err(CteError::Timeout)` - Operation timed out
     /// * `Err(CteError::RuntimeError)` - Runtime error occurred
     pub fn poll_telemetry(&self, min_time: u64, timeout_sec: f32) -> CteResult<Vec<CteTelemetry>> {
-        let mut data = Vec::new();
-        let ret = ffi::client_poll_telemetry_raw(&self.inner, min_time, timeout_sec, &mut data);
+        let mut entries: Vec<ffi::CteTelemetryEntry> = Vec::new();
+        let ret = ffi::client_poll_telemetry_bulk(&self.inner, min_time, timeout_sec, &mut entries);
         match ret {
-            0 => Ok(parse_telemetry(&data)),
+            0 => Ok(entries.iter().map(telemetry_entry_to_telemetry).collect()),
             1 => Err(CteError::Timeout),
             2 => Err(CteError::RuntimeError {
                 code: 1,
@@ -573,88 +576,23 @@ impl Client {
     ///
     /// PERFORMANCE: Pre-allocates buffer, single FFI call
     pub fn get_blob_info(&self, tag_id: &CteTagId, name: &str) -> Result<BlobInfo, i32> {
-        let mut data = Vec::with_capacity(256); // Most blobs have few blocks
-        let ret =
-            ffi::client_get_blob_info_raw(&self.inner, tag_id.major, tag_id.minor, name, &mut data);
+        let mut info = ffi::BlobInfoBulk {
+            score: 0.0,
+            total_size: 0,
+        };
+        let mut blocks: Vec<ffi::BlobBlock> = Vec::new();
+        let ret = ffi::client_get_blob_info_bulk(
+            &self.inner,
+            tag_id.major,
+            tag_id.minor,
+            name,
+            &mut info,
+            &mut blocks,
+        );
         if ret != 0 {
             return Err(ret);
         }
-
-        // Parse blob info from flat buffer
-        // Format: score(4) + total_size(8) + blocks_count(4) + blocks[...](24 each)
-        if data.len() < 16 {
-            return Err(-1);
-        }
-
-        // Parse score (f32 at offset 0)
-        let score = f32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-
-        // Parse total_size (u64 at offset 4)
-        let total_size = u64::from_le_bytes([
-            data[4], data[5], data[6], data[7], data[8], data[9], data[10], data[11],
-        ]);
-
-        // Parse blocks_count (u32 at offset 12)
-        let blocks_count = u32::from_le_bytes([data[12], data[13], data[14], data[15]]) as usize;
-
-        // Validate buffer size
-        let expected_size = 16 + blocks_count * 24;
-        if data.len() < expected_size {
-            return Err(-1);
-        }
-
-        // Parse blocks
-        let mut blocks = Vec::with_capacity(blocks_count);
-        let mut offset = 16;
-        for _ in 0..blocks_count {
-            let pool_id = u64::from_le_bytes([
-                data[offset],
-                data[offset + 1],
-                data[offset + 2],
-                data[offset + 3],
-                data[offset + 4],
-                data[offset + 5],
-                data[offset + 6],
-                data[offset + 7],
-            ]);
-            offset += 8;
-
-            let block_size = u64::from_le_bytes([
-                data[offset],
-                data[offset + 1],
-                data[offset + 2],
-                data[offset + 3],
-                data[offset + 4],
-                data[offset + 5],
-                data[offset + 6],
-                data[offset + 7],
-            ]);
-            offset += 8;
-
-            let block_offset = u64::from_le_bytes([
-                data[offset],
-                data[offset + 1],
-                data[offset + 2],
-                data[offset + 3],
-                data[offset + 4],
-                data[offset + 5],
-                data[offset + 6],
-                data[offset + 7],
-            ]);
-            offset += 8;
-
-            blocks.push(BlobBlockInfo {
-                pool_id,
-                block_size,
-                block_offset,
-            });
-        }
-
-        Ok(BlobInfo {
-            score,
-            total_size,
-            blocks,
-        })
+        Ok(blob_info_bulk_to_blob_info(&info, blocks))
     }
 
     /// Trigger the CTE's internal DynamicReorganize task for one replica.
@@ -765,33 +703,57 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_telemetry_parsing() {
-        // Create a sample telemetry buffer
-        let mut data = vec![0u8; TELEMETRY_ENTRY_SIZE * 2];
+    fn test_telemetry_entry_conversion() {
+        // Test the conversion helper from FFI-internal to public type
+        let entry = ffi::CteTelemetryEntry {
+            op: 1, // GetBlob
+            off: 100,
+            size: 200,
+            tag_major: 1,
+            tag_minor: 2,
+            mod_time: 1000,
+            read_time: 2000,
+            logical_time: 3000,
+        };
 
-        // Entry 1: op=1, off=100, size=200, tag_major=1, tag_minor=2, mod_time=1000, read_time=2000, logical=3000
-        data[0..4].copy_from_slice(&1u32.to_le_bytes()); // op
-        data[4..12].copy_from_slice(&100u64.to_le_bytes()); // off
-        data[12..20].copy_from_slice(&200u64.to_le_bytes()); // size
-        data[20..24].copy_from_slice(&1u32.to_le_bytes()); // tag_major
-        data[24..28].copy_from_slice(&2u32.to_le_bytes()); // tag_minor
-        data[28..36].copy_from_slice(&1000u64.to_le_bytes()); // mod_time
-        data[36..44].copy_from_slice(&2000u64.to_le_bytes()); // read_time
-        data[44..52].copy_from_slice(&3000u64.to_le_bytes()); // logical_time
+        let telemetry = telemetry_entry_to_telemetry(&entry);
+        assert_eq!(telemetry.op, CteOp::GetBlob);
+        assert_eq!(telemetry.off, 100);
+        assert_eq!(telemetry.size, 200);
+        assert_eq!(telemetry.tag_id.major, 1);
+        assert_eq!(telemetry.tag_id.minor, 2);
+        assert_eq!(telemetry.mod_time, 1000);
+        assert_eq!(telemetry.read_time, 2000);
+        assert_eq!(telemetry.logical_time, 3000);
+    }
 
-        // Entry 2
-        let offset = TELEMETRY_ENTRY_SIZE;
-        data[offset..offset + 4].copy_from_slice(&2u32.to_le_bytes()); // op
+    #[test]
+    fn test_blob_info_bulk_conversion() {
+        // Test the conversion helper from FFI-internal to public type
+        let info = ffi::BlobInfoBulk {
+            score: 0.75,
+            total_size: 4096,
+        };
+        let blocks = vec![
+            ffi::BlobBlock {
+                pool_id: 1,
+                block_size: 1024,
+                block_offset: 0,
+            },
+            ffi::BlobBlock {
+                pool_id: 2,
+                block_size: 3072,
+                block_offset: 1024,
+            },
+        ];
 
-        let entries = parse_telemetry(&data);
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].op, CteOp::GetBlob);
-        assert_eq!(entries[0].off, 100);
-        assert_eq!(entries[0].size, 200);
-        assert_eq!(entries[0].tag_id.major, 1);
-        assert_eq!(entries[0].tag_id.minor, 2);
-        assert_eq!(entries[0].mod_time, 1000);
-        assert_eq!(entries[0].read_time, 2000);
-        assert_eq!(entries[1].op, CteOp::DelBlob);
+        let blob_info = blob_info_bulk_to_blob_info(&info, blocks.clone());
+        assert_eq!(blob_info.score, 0.75);
+        assert_eq!(blob_info.total_size, 4096);
+        assert_eq!(blob_info.blocks.len(), 2);
+        assert_eq!(blob_info.blocks[0].pool_id, 1);
+        assert_eq!(blob_info.blocks[0].block_size, 1024);
+        assert_eq!(blob_info.blocks[1].pool_id, 2);
+        assert_eq!(blob_info.blocks[1].block_size, 3072);
     }
 }

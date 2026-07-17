@@ -305,6 +305,51 @@ int32_t client_poll_telemetry_raw(const Client& client, uint64_t min_time,
   return 0;  // Success
 }
 
+/// T23: Poll telemetry and return typed CteTelemetryEntry records directly
+/// (no byte buffer serialization). Replaces client_poll_telemetry_raw +
+/// Rust from_le_bytes re-parse.
+/// @param client The client to poll
+/// @param min_time Minimum logical time filter
+/// @param timeout_sec Timeout in seconds (0 = no timeout)
+/// @param out_entries Output vector of typed telemetry records
+/// @return 0 on success, 1 on timeout, 2 on error
+int32_t client_poll_telemetry_bulk(const Client& client, uint64_t min_time,
+                                   float timeout_sec,
+                                   rust::Vec<CteTelemetryEntry>& out_entries) {
+  auto task = client.inner.AsyncPollTelemetryLog(min_time);
+
+  // Wait with timeout (0 means no timeout, but we use passed timeout_sec)
+  bool completed = task.Wait(timeout_sec);
+
+  if (!completed) {
+    // Timeout occurred
+    return 1;
+  }
+
+  // Check for errors
+  if (task->GetReturnCode() != 0) {
+    return 2;
+  }
+
+  // Fill typed structs directly (no byte buffer memcpy)
+  out_entries.clear();
+  out_entries.reserve(task->entries_.size());
+  for (const auto& entry : task->entries_) {
+    CteTelemetryEntry rec;
+    rec.op = static_cast<uint32_t>(entry.op_);
+    rec.off = entry.off_;
+    rec.size = entry.size_;
+    rec.tag_major = entry.tag_id_.major_;
+    rec.tag_minor = entry.tag_id_.minor_;
+    rec.mod_time = entry.mod_time_;
+    rec.read_time = entry.read_time_;
+    rec.logical_time = entry.logical_time_;
+    out_entries.push_back(rec);
+  }
+
+  return 0;  // Success
+}
+
 /// Get blob info with performance-critical serialization.
 /// Format: score(f32) + total_size(u64) + blocks_count(u32) + blocks[...]
 /// Each block: target_pool_id(u64) + block_size(u64) + block_offset(u64) = 24 bytes
@@ -366,6 +411,48 @@ int32_t client_get_blob_info_raw(const Client& client, uint32_t major,
   out.reserve(buf.size());
   std::memcpy(out.data(), buf.data(), buf.size());
   out.truncate(buf.size());
+
+  return 0;
+}
+
+/// T23: Get blob info and return a typed BlobInfoBulk struct directly
+/// (no byte buffer serialization). Replaces client_get_blob_info_raw +
+/// Rust from_le_bytes re-parse. cxx shared structs cannot contain Vec,
+/// so blocks is returned as a separate out-param.
+/// @param client The client to query
+/// @param major Tag ID major component
+/// @param minor Tag ID minor component
+/// @param name The blob name
+/// @param out_info Output: the typed blob info header (score, total_size)
+/// @param out_blocks Output: the block placement info Vec
+/// @return Task return code (0 = success)
+int32_t client_get_blob_info_bulk(const Client& client, uint32_t major,
+                                  uint32_t minor, rust::Str name,
+                                  BlobInfoBulk& out_info,
+                                  rust::Vec<BlobBlock>& out_blocks) {
+  clio::run::UniqueId tag_id(major, minor);
+  std::string blob_name(name.data(), name.size());
+
+  auto task = client.inner.AsyncGetBlobInfo(tag_id, blob_name);
+  task.Wait();
+
+  if (task->GetReturnCode() != 0) {
+    return task->GetReturnCode();
+  }
+
+  // Fill typed structs directly (no byte buffer memcpy)
+  out_info.score = task->score_;
+  out_info.total_size = task->total_size_;
+  out_blocks.clear();
+  out_blocks.reserve(task->blocks_.size());
+  for (const auto& block : task->blocks_) {
+    BlobBlock blk;
+    // PoolId is a class, convert via IsNull()?0:ToU64()
+    blk.pool_id = block.target_pool_id_.IsNull() ? 0 : block.target_pool_id_.ToU64();
+    blk.block_size = block.block_size_;
+    blk.block_offset = block.block_offset_;
+    out_blocks.push_back(blk);
+  }
 
   return 0;
 }
@@ -580,3 +667,33 @@ std::unique_ptr<FutureHandle> async_get_shm(const Tag& tag, rust::Str blob_name,
 }
 
 }  // namespace cte_ffi
+
+// ---- Operator implementations for cxx shared structs (T23) ----
+
+bool CteTelemetryEntry::operator==(const CteTelemetryEntry& rhs) const noexcept {
+  return op == rhs.op && off == rhs.off && size == rhs.size &&
+         tag_major == rhs.tag_major && tag_minor == rhs.tag_minor &&
+         mod_time == rhs.mod_time && read_time == rhs.read_time &&
+         logical_time == rhs.logical_time;
+}
+
+bool CteTelemetryEntry::operator!=(const CteTelemetryEntry& rhs) const noexcept {
+  return !(*this == rhs);
+}
+
+bool BlobBlock::operator==(const BlobBlock& rhs) const noexcept {
+  return pool_id == rhs.pool_id && block_size == rhs.block_size &&
+         block_offset == rhs.block_offset;
+}
+
+bool BlobBlock::operator!=(const BlobBlock& rhs) const noexcept {
+  return !(*this == rhs);
+}
+
+bool BlobInfoBulk::operator==(const BlobInfoBulk& rhs) const noexcept {
+  return score == rhs.score && total_size == rhs.total_size;
+}
+
+bool BlobInfoBulk::operator!=(const BlobInfoBulk& rhs) const noexcept {
+  return !(*this == rhs);
+}

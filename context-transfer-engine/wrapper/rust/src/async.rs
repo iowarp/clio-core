@@ -300,10 +300,10 @@ impl Client {
         // genuinely blocks, so keep spawn_blocking to avoid stalling a worker.
         let client = Arc::clone(&self.inner);
         let do_poll = move || {
-            let mut raw = Vec::new();
-            let ret = ffi::client_poll_telemetry_raw(&client.0, min_time, timeout_sec, &mut raw);
+            let mut entries: Vec<ffi::CteTelemetryEntry> = Vec::new();
+            let ret = ffi::client_poll_telemetry_bulk(&client.0, min_time, timeout_sec, &mut entries);
             match ret {
-                0 => Ok(crate::ffi::parse_telemetry(&raw)),
+                0 => Ok(entries.iter().map(crate::ffi::telemetry_entry_to_telemetry).collect()),
                 1 => Err(crate::CteError::Timeout),
                 2 => Err(crate::CteError::RuntimeError {
                     code: 1,
