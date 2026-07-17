@@ -311,6 +311,18 @@ pub struct BlobInfo {
 /// - `client_reorganize_blob`: Change blob score via client API
 #[cxx::bridge(namespace = "cte_ffi")]
 pub mod ffi {
+    /// FFI-safe SHM buffer handle, bit-identical to ctp::ipc::ShmPtr<char>.
+    /// 16 bytes: {u32 alloc_id_major, u32 alloc_id_minor, u64 off}.
+    /// NEVER construct manually — obtain from cte_alloc_shm_buffer, release with cte_free_shm_buffer.
+    /// This is a SHARED struct: defined here in Rust, mirrored in shim.h (global scope).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[namespace = ""]
+    pub struct CteShmHandle {
+        pub alloc_id_major: u32,
+        pub alloc_id_minor: u32,
+        pub off: u64,
+    }
+
     unsafe extern "C++" {
         include!("shim/shim.h");
 
@@ -328,6 +340,55 @@ pub mod ffi {
         // 4. Automatic RAII cleanup via UniquePtr drop impl
         type Client;
         type Tag;
+
+        // ---- Zero-copy SHM buffer + future handle (migrated from raw extern "C") ----
+
+        /// Opaque handle to a C++ Future<PutBlobTask>/Future<GetBlobTask>.
+        /// Rust holds UniquePtr<FutureHandle>; the C++ destructor (~FutureHandle)
+        /// replaces the old cte_future_destroy. Callers MUST drop(future) explicitly
+        /// before freeing the SHM buffer (wait-before-free invariant).
+        type FutureHandle;
+
+        /// Allocate a SHM buffer of `bytes` bytes. Returns a null handle on failure.
+        /// Resolve the write pointer via cte_shm_handle_to_ptr(handle) separately.
+        fn cte_alloc_shm_buffer(bytes: u64) -> CteShmHandle;
+
+        /// Free a SHM buffer. No-op on a null handle. The runtime must have completed
+        /// any async op using it (call future_wait + drop(future) first).
+        fn cte_free_shm_buffer(handle: CteShmHandle);
+
+        /// Resolve a CteShmHandle to a raw address (as usize; cast to *mut u8 on the
+        /// Rust side — cxx can't express *mut u8 returns directly). Returns 0 on null.
+        /// NOTE: usize->*mut u8 cast preserves the pointer value on all current targets.
+        fn cte_shm_handle_to_ptr(handle: CteShmHandle) -> usize;
+
+        /// Block until the future completes or timeout elapses.
+        /// @param handle The FutureHandle to wait on
+        /// @param timeout_sec <=0 = wait forever
+        /// @param out_rc set to the task return code (0 = success)
+        /// @return 0 on completion, 1 on timeout, negative on error
+        fn future_wait(handle: &FutureHandle, timeout_sec: f32, out_rc: &mut i32) -> i32;
+
+        /// Submit a zero-copy AsyncPutBlob. Returns a FutureHandle (null on failure).
+        /// LIFETIME: caller must future_wait(&handle) then drop(handle) BEFORE cte_free_shm_buffer.
+        fn async_put_shm(
+            tag: &Tag,
+            blob_name: &str,
+            offset: u64,
+            size: u64,
+            data: CteShmHandle,
+            score: f32,
+        ) -> UniquePtr<FutureHandle>;
+
+        /// Submit a zero-copy AsyncGetBlob into a caller SHM buffer. Returns FutureHandle (null on failure).
+        /// LIFETIME: caller must future_wait then read via cte_shm_handle_to_ptr then drop(future) then cte_free_shm_buffer.
+        fn async_get_shm(
+            tag: &Tag,
+            blob_name: &str,
+            offset: u64,
+            size: u64,
+            out_buf: CteShmHandle,
+        ) -> UniquePtr<FutureHandle>;
 
         // Initialization
         //
@@ -439,6 +500,22 @@ pub mod ffi {
         fn tag_put_blob(tag: &Tag, name: &str, data: &[u8], offset: u64, score: f32) -> i32;
         fn tag_get_blob(tag: &Tag, name: &str, size: u64, offset: u64, out: &mut Vec<u8>);
         fn tag_get_contained_blobs(tag: &Tag, out: &mut Vec<String>);
+    }
+}
+
+impl ffi::CteShmHandle {
+    /// The null handle (allocation failed or uninitialized).
+    pub const fn null() -> Self {
+        Self {
+            alloc_id_major: 0,
+            alloc_id_minor: 0,
+            off: 0,
+        }
+    }
+
+    /// True if this is the null handle.
+    pub fn is_null(&self) -> bool {
+        self.off == 0 && self.alloc_id_major == 0 && self.alloc_id_minor == 0
     }
 }
 

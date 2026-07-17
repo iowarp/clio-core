@@ -48,17 +48,16 @@
 //! wait-before-free by holding the buffer until `cte_future_wait` returns.
 
 use crate::error::{CteError, CteResult};
-use crate::ffi_c::{
-    cte_alloc_shm_buffer, cte_free_shm_buffer, cte_shm_handle_to_ptr, CteShmHandle,
-};
+use crate::ffi::ffi;  // the cxx bridge module
+// CteShmHandle is now ffi::CteShmHandle (cxx shared struct)
 
-/// A zero-copy SHM buffer. Owns a `CteShmHandle` + the raw pointer + length.
+/// A zero-copy SHM buffer. Owns a `ffi::CteShmHandle` + the raw pointer + length.
 ///
 /// Not `Send`/`Sync` by default (the raw pointer is non-Send); the async
 /// wrappers (Phases 04/05) move it into a `spawn_blocking` closure where
 /// single-threaded access is guaranteed.
 pub struct ShmBuffer {
-    handle: CteShmHandle,
+    handle: ffi::CteShmHandle,
     ptr: *mut u8,
     len: usize,
     // !Send marker — keep the buffer pinned to the constructing thread by
@@ -71,23 +70,31 @@ impl ShmBuffer {
     /// Allocate a SHM buffer of `len` bytes.
     /// Returns `Err(CteError::ShmAllocFailed)` if the C++ allocator fails.
     pub fn alloc(len: usize) -> CteResult<Self> {
-        let mut out_ptr: *mut u8 = std::ptr::null_mut();
-        // SAFETY: cte_alloc_shm_buffer writes the handle + out_ptr. The
-        // handle is POD; out_ptr is a valid out-param.
-        let handle = unsafe { cte_alloc_shm_buffer(len as u64, &mut out_ptr) };
-        if handle.is_null() || out_ptr.is_null() {
+        // cxx bridge call: alloc returns handle directly (no out_ptr).
+        // Then resolve the write pointer via cte_shm_handle_to_ptr separately.
+        let handle = ffi::cte_alloc_shm_buffer(len as u64);
+        if handle.is_null() {
+            return Err(CteError::ShmAllocFailed);
+        }
+        // Resolve the handle to a raw pointer.
+        // NOTE: usize→*mut u8 cast preserves the pointer value on all current targets
+        // (strict provenance not enabled; works because usize and ptr have same bits).
+        let ptr = ffi::cte_shm_handle_to_ptr(handle) as *mut u8;
+        if ptr.is_null() {
+            // alloc succeeded but ptr resolution failed — free the handle
+            ffi::cte_free_shm_buffer(handle);
             return Err(CteError::ShmAllocFailed);
         }
         Ok(Self {
             handle,
-            ptr: out_ptr,
+            ptr,
             len,
             _not_send: std::marker::PhantomData,
         })
     }
 
     /// The underlying handle (for passing to async put/get FFI in Phases 04/05).
-    pub fn handle(&self) -> CteShmHandle {
+    pub fn handle(&self) -> ffi::CteShmHandle {
         self.handle
     }
 
@@ -122,13 +129,13 @@ impl ShmBuffer {
         self.ptr
     }
 
-    /// Resolve a `CteShmHandle` (e.g. one returned from a get_blob) to a raw
+    /// Resolve a `ffi::CteShmHandle` (e.g. one returned from a get_blob) to a raw
     /// pointer, without taking ownership. The caller must NOT free the handle
     /// via this — use `ShmBuffer`/`cte_free_shm_buffer` for that.
-    pub fn ptr_for_handle(handle: CteShmHandle) -> *mut u8 {
-        // SAFETY: cte_shm_handle_to_ptr is a pure lookup; returns null on
-        // null/unresolvable handle.
-        unsafe { cte_shm_handle_to_ptr(handle) }
+    pub fn ptr_for_handle(handle: ffi::CteShmHandle) -> *mut u8 {
+        // cxx bridge call is safe.
+        // NOTE: usize→*mut u8 cast preserves the pointer value on all current targets.
+        ffi::cte_shm_handle_to_ptr(handle) as *mut u8
     }
 
     /// Decompose the ShmBuffer into its raw parts (handle, ptr, len) for
@@ -140,13 +147,13 @@ impl ShmBuffer {
     /// SAFETY: the returned (handle, ptr, len) must outlive any runtime op
     /// using the handle, and must be freed via `cte_free_shm_buffer` exactly
     /// once. The `ptr` is valid for `len` bytes until `cte_free_shm_buffer`.
-    pub fn into_parts(mut self) -> (CteShmHandle, *mut u8, usize) {
+    pub fn into_parts(mut self) -> (ffi::CteShmHandle, *mut u8, usize) {
         let handle = self.handle;
         let ptr = self.ptr;
         let len = self.len;
         // Prevent Drop from running (we transferred ownership of the parts)
         // Nulling handle+ptr makes Drop a no-op (Drop checks !handle.is_null())
-        self.handle = CteShmHandle::null();
+        self.handle = ffi::CteShmHandle::null();
         self.ptr = std::ptr::null_mut();
         (handle, ptr, len)
     }
@@ -155,11 +162,11 @@ impl ShmBuffer {
 impl Drop for ShmBuffer {
     fn drop(&mut self) {
         if !self.handle.is_null() {
-            // SAFETY: the handle was obtained from cte_alloc_shm_buffer and
-            // not yet freed. The async wrappers guarantee any runtime op
-            // using this buffer has completed before Drop runs.
-            unsafe { cte_free_shm_buffer(self.handle) };
-            self.handle = CteShmHandle::null();
+            // cxx bridge call is safe.
+            // The async wrappers guarantee any runtime op using this buffer
+            // has completed before Drop runs.
+            ffi::cte_free_shm_buffer(self.handle);
+            self.handle = ffi::CteShmHandle::null();
             self.ptr = std::ptr::null_mut();
         }
     }

@@ -912,65 +912,44 @@ impl Tag {
         let inner = Arc::clone(&self.inner);
 
         tokio::task::spawn_blocking(move || {
-            // Build a null-terminated C name
-            let c_name = std::ffi::CString::new(name).map_err(|e| CteError::FfiError {
-                message: format!("blob name has interior NUL: {}", e),
-            })?;
-
-            // Get the raw Tag pointer (SendableTag wraps UniquePtr<ffi::Tag>)
+            // Get the Tag reference (SendableTag wraps UniquePtr<ffi::Tag>). cxx bridge
+            // async_put_shm takes &Tag directly — no CString, no addr_of cast.
             let tag_ref = inner.0.as_ref().ok_or_else(|| CteError::FfiError {
                 message: "Tag inner UniquePtr is null".to_string(),
             })?;
-            let tag_ptr = std::ptr::addr_of!(*tag_ref) as *const std::ffi::c_void;
 
-            // Submit
-            let mut future: crate::ffi_c::CteFutureHandle = std::ptr::null_mut();
-            let rc = unsafe {
-                crate::ffi_c::cte_tag_async_put_shm(
-                    tag_ptr,
-                    c_name.as_ptr(),
-                    offset,
-                    size,
-                    handle,
-                    score,
-                    &mut future,
-                )
-            };
-
-            if rc != 0 {
+            // Submit the async put. cxx bridge: &Tag + &str (name is String, pass &name).
+            // Returns UniquePtr<FutureHandle> (null on failure). handle is ffi::CteShmHandle (Send).
+            let future = ffi::async_put_shm(tag_ref, &name, offset, size, handle, score);
+            if future.is_null() {
                 // Submit failed — free the SHM buffer (no future to wait on)
-                unsafe { crate::ffi_c::cte_free_shm_buffer(handle) };
+                ffi::cte_free_shm_buffer(handle);
                 return Err(CteError::FfiError {
-                    message: format!("cte_tag_async_put_shm failed rc={}", rc),
+                    message: "async_put_shm failed (null future)".to_string(),
                 });
             }
 
             // WAIT before free — runtime is reading the SHM region asynchronously
             let mut wait_rc: i32 = 0;
-            let wait_status = unsafe {
-                crate::ffi_c::cte_future_wait(future, -1.0, &mut wait_rc)
-            };
+            let wait_status = ffi::future_wait(&future, -1.0, &mut wait_rc);
 
-            unsafe { crate::ffi_c::cte_future_destroy(future) };
+            // CRITICAL: drop(future) BEFORE freeing the buffer. The C++ ~FutureHandle
+            // destructor runs (replaces cte_future_destroy). handle is still alive.
+            drop(future);
 
             // NOW free the SHM buffer (runtime has finished reading)
-            unsafe { crate::ffi_c::cte_free_shm_buffer(handle) };
+            ffi::cte_free_shm_buffer(handle);
 
             if wait_status != 0 {
                 return Err(CteError::FfiError {
-                    message: format!(
-                        "put_blob_shm wait failed (status={}, rc={})",
-                        wait_status, wait_rc
-                    ),
+                    message: format!("put_blob_shm wait failed (status={}, rc={})", wait_status, wait_rc),
                 });
             }
-
             if wait_rc != 0 {
                 return Err(CteError::FfiError {
                     message: format!("put_blob_shm task failed rc={}", wait_rc),
                 });
             }
-
             Ok(())
         })
         .await
@@ -1056,64 +1035,39 @@ impl Tag {
         let inner = Arc::clone(&self.inner);
 
         tokio::task::spawn_blocking(move || {
-            // Build a null-terminated C name
-            let c_name = std::ffi::CString::new(name).map_err(|e| CteError::FfiError {
-                message: format!("blob name has interior NUL: {}", e),
-            })?;
-
-            // Get the raw Tag pointer (SendableTag wraps UniquePtr<ffi::Tag>)
             let tag_ref = inner.0.as_ref().ok_or_else(|| CteError::FfiError {
                 message: "Tag inner UniquePtr is null".to_string(),
             })?;
-            let tag_ptr = std::ptr::addr_of!(*tag_ref) as *const std::ffi::c_void;
 
-            // Submit
-            let mut future: crate::ffi_c::CteFutureHandle = std::ptr::null_mut();
-            let rc = unsafe {
-                crate::ffi_c::cte_tag_async_get_shm(
-                    tag_ptr,
-                    c_name.as_ptr(),
-                    offset,
-                    size,
-                    handle,
-                    &mut future,
-                )
-            };
-
-            if rc != 0 {
-                // Submit failed — free the SHM buffer (no future to wait on)
-                unsafe { crate::ffi_c::cte_free_shm_buffer(handle) };
+            // Submit the async get. Returns UniquePtr<FutureHandle> (null on failure).
+            let future = ffi::async_get_shm(tag_ref, &name, offset, size, handle);
+            if future.is_null() {
+                ffi::cte_free_shm_buffer(handle);
                 return Err(CteError::FfiError {
-                    message: format!("cte_tag_async_get_shm failed rc={}", rc),
+                    message: "async_get_shm failed (null future)".to_string(),
                 });
             }
 
             // WAIT before read — CTE is writing into the SHM region right now
             let mut wait_rc: i32 = 0;
-            let wait_status = unsafe {
-                crate::ffi_c::cte_future_wait(future, -1.0, &mut wait_rc)
-            };
+            let wait_status = ffi::future_wait(&future, -1.0, &mut wait_rc);
 
-            // Resolve the handle to a read pointer (created inside the closure —
-            // safe to use here). Valid only after wait completes (CTE has written).
-            let read_ptr = unsafe { crate::ffi_c::cte_shm_handle_to_ptr(handle) };
+            // Resolve the handle to a read pointer (after wait — CTE has written). cxx
+            // cte_shm_handle_to_ptr returns usize; cast to *const u8 for reading.
+            let read_ptr = ffi::cte_shm_handle_to_ptr(handle) as *const u8;
 
-            // Destroy the future
-            unsafe { crate::ffi_c::cte_future_destroy(future) };
+            // CRITICAL: drop(future) BEFORE freeing the buffer. ~FutureHandle runs.
+            drop(future);
 
-            // Check wait/task status
+            // Check wait/task status (free on error)
             if wait_status != 0 {
-                unsafe { crate::ffi_c::cte_free_shm_buffer(handle) };
+                ffi::cte_free_shm_buffer(handle);
                 return Err(CteError::FfiError {
-                    message: format!(
-                        "get_blob_shm wait failed (status={}, rc={})",
-                        wait_status, wait_rc
-                    ),
+                    message: format!("get_blob_shm wait failed (status={}, rc={})", wait_status, wait_rc),
                 });
             }
-
             if wait_rc != 0 {
-                unsafe { crate::ffi_c::cte_free_shm_buffer(handle) };
+                ffi::cte_free_shm_buffer(handle);
                 return Err(CteError::FfiError {
                     message: format!("get_blob_shm task failed rc={}", wait_rc),
                 });
@@ -1122,14 +1076,13 @@ impl Tag {
             // READ the bytes from SHM into a Vec (the one copy). Then free the SHM.
             let mut out = Vec::with_capacity(size as usize);
             if !read_ptr.is_null() {
-                // SAFETY: read_ptr is valid for `size as usize` bytes (CTE wrote them,
-                // wait confirmed). The SHM region is alive until we free it below.
+                // SAFETY: read_ptr is valid for `size as usize` bytes (CTE wrote them, wait confirmed).
                 let slice = unsafe { std::slice::from_raw_parts(read_ptr, size as usize) };
                 out.extend_from_slice(slice);
             }
 
-            // NOW free the SHM buffer — runtime is done writing, we've read.
-            unsafe { crate::ffi_c::cte_free_shm_buffer(handle) };
+            // NOW free the SHM buffer — runtime done writing, we've read. LAST.
+            ffi::cte_free_shm_buffer(handle);
 
             Ok(out)
         })

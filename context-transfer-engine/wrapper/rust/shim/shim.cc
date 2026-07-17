@@ -407,110 +407,7 @@ float cte_frecency_compute_score(uint64_t access_count,
 
 }  // namespace cte_ffi
 
-// ---- Zero-copy SHM buffer C-ABI implementations ----
-
-namespace {
-/// Type-erased future wrapper so the C-ABI can wait/destroy a concrete
-/// clio::run::Future<PutBlobTask> or Future<GetBlobTask> without templating
-/// the boundary. Each cte_tag_async_*_shm allocates one of these and returns
-/// it as CteFutureHandle; cte_future_wait/destroy cast back and dispatch.
-struct CteFutureInner {
-  /// Wait for completion. Returns 0 on completion, 1 timeout, <0 error.
-  int32_t (*wait_fn)(void *future, float timeout_sec, int32_t *out_rc);
-  /// Destroy the future (called from cte_future_destroy).
-  void (*destroy_fn)(void *future);
-  /// The concrete Future<...> pointer (owned).
-  void *future;
-};
-}  // namespace
-
-/**
- * Allocate a shared-memory buffer of `bytes` bytes.
- * @param bytes Size to allocate
- * @param out_ptr Set to a writable raw pointer into the SHM segment (the
- *        pointer the CTE runtime will read from). Set to nullptr on failure.
- * @return A CteShmHandle identifying the buffer (use cte_free_shm_buffer to
- *         release). A null handle (alloc_id_major==0 && alloc_id_minor==0 &&
- *         off==0) means allocation failed.
- */
-CteShmHandle cte_alloc_shm_buffer(uint64_t bytes, uint8_t **out_ptr) {
-  if (out_ptr) *out_ptr = nullptr;
-  auto *ipc = CLIO_IPC;
-  if (ipc == nullptr) return CteShmHandle{0, 0, 0};
-  ctp::ipc::FullPtr<char> buf = ipc->AllocateBuffer(static_cast<size_t>(bytes));
-  if (buf.IsNull()) return CteShmHandle{0, 0, 0};
-  if (out_ptr) *out_ptr = reinterpret_cast<uint8_t *>(buf.ptr_);
-  // Extract the ShmPtr from the FullPtr: FullPtr has a .shm_ member (ShmPtr<char>)
-  CteShmHandle handle;
-  handle.alloc_id_major = buf.shm_.alloc_id_.major_;
-  handle.alloc_id_minor = buf.shm_.alloc_id_.minor_;
-  handle.off = buf.shm_.off_.load();
-  return handle;
-}
-
-/**
- * Free a SHM buffer obtained from cte_alloc_shm_buffer.
- * No-op on a null handle (off==0 && alloc_id all zero). After this call the
- * handle is invalid and must not be reused — the runtime must have completed
- * any AsyncPutBlob/AsyncGetBlob using it (call cte_future_wait first).
- */
-void cte_free_shm_buffer(CteShmHandle handle) {
-  if (handle.off == 0 && handle.alloc_id_major == 0 && handle.alloc_id_minor == 0) {
-    return;  // null handle, no-op
-  }
-  auto *ipc = CLIO_IPC;
-  if (ipc == nullptr) return;
-  // Reconstruct a ShmPtr<char> from the handle and free it
-  ctp::ipc::ShmPtr<char> shm_ptr;
-  shm_ptr.alloc_id_ = ctp::ipc::AllocatorId(handle.alloc_id_major, handle.alloc_id_minor);
-  shm_ptr.off_ = static_cast<size_t>(handle.off);
-  ipc->FreeBuffer(shm_ptr);  // the ShmPtr overload (ipc_manager.h:456) converts via ToFullPtr
-}
-
-/**
- * Resolve a CteShmHandle back to a raw pointer (e.g. to read data the runtime
- * wrote into a get_blob buffer). Returns nullptr if the handle is null or
- * unresolvable.
- */
-uint8_t *cte_shm_handle_to_ptr(CteShmHandle handle) {
-  if (handle.off == 0 && handle.alloc_id_major == 0 && handle.alloc_id_minor == 0) {
-    return nullptr;
-  }
-  auto *ipc = CLIO_IPC;
-  if (ipc == nullptr) return nullptr;
-  ctp::ipc::ShmPtr<char> shm_ptr;
-  shm_ptr.alloc_id_ = ctp::ipc::AllocatorId(handle.alloc_id_major, handle.alloc_id_minor);
-  shm_ptr.off_ = static_cast<size_t>(handle.off);
-  ctp::ipc::FullPtr<char> full = ipc->ToFullPtr<char>(shm_ptr);
-  if (full.IsNull()) return nullptr;
-  return reinterpret_cast<uint8_t *>(full.ptr_);
-}
-
-/**
- * Block until the future completes or timeout elapses.
- * @param future The opaque future handle from cte_tag_async_put_shm/get_shm
- * @param timeout_sec Max seconds to wait (<=0 = wait forever)
- * @param out_rc Set to the task's return code on completion (0 = success)
- * @return 0 on completion, 1 on timeout, negative on error
- */
-int32_t cte_future_wait(CteFutureHandle future, float timeout_sec, int32_t *out_rc) {
-  if (out_rc) *out_rc = 0;
-  if (future == nullptr) return -1;
-  auto *inner = static_cast<CteFutureInner *>(future);
-  return inner->wait_fn(inner->future, timeout_sec, out_rc);
-}
-
-/**
- * Destroy a future handle (releases the C++ Future wrapper). No-op on null.
- */
-void cte_future_destroy(CteFutureHandle future) {
-  if (future == nullptr) return;
-  auto *inner = static_cast<CteFutureInner *>(future);
-  inner->destroy_fn(inner->future);
-  delete inner;
-}
-
-// ---- AsyncPutBlob SHM entry point (cte_tag_async_put_shm) ----
+// ---- Zero-copy SHM buffer cxx-bridge implementations ----
 
 namespace {
 /// Concrete wait_fn for Future<PutBlobTask>: calls Wait, reads return code.
@@ -556,112 +453,130 @@ void cte_get_future_destroy_fn(void *future) {
 }
 }  // namespace
 
+namespace cte_ffi {
+
 /**
- * Submit a zero-copy AsyncPutBlob using a caller-allocated SHM buffer.
- * The caller (Rust) allocated the buffer via cte_alloc_shm_buffer and wrote
- * the blob data into it. This passes the ShmPtr to AsyncPutBlob WITHOUT
- * copying, and returns an opaque future the caller must wait on (via
- * cte_future_wait) BEFORE freeing the buffer (via cte_free_shm_buffer).
- *
- * LIFETIME: the `data` handle's SHM region is read by the runtime
- * asynchronously after this call returns. The caller MUST call
- * cte_future_wait on the returned future and only then cte_free_shm_buffer.
- * Freeing the buffer before the future completes is use-after-free.
- *
- * @param tag The CTE tag to put into
- * @param blob_name Null-terminated blob name
- * @param offset Offset within the blob
- * @param size Number of bytes in the SHM buffer
- * @param data CteShmHandle of the caller-allocated, data-filled SHM buffer
- * @param score Placement score (-1.0 = auto, 0.0-1.0 = explicit)
- * @param out_future Set to an opaque CteFutureHandle on success (wait on it,
- *        then destroy it, then free the buffer). Set to nullptr on failure.
- * @return 0 on success, negative on error
+ * Allocate a shared-memory buffer of `bytes` bytes.
+ * @param bytes Size to allocate
+ * @return A CteShmHandle identifying the buffer (use cte_free_shm_buffer to
+ *         release). A null handle (alloc_id_major==0 && alloc_id_minor==0 &&
+ *         off==0) means allocation failed.
  */
-extern "C" int32_t cte_tag_async_put_shm(const void *tag, const char *blob_name,
-                                         uint64_t offset, uint64_t size,
-                                         CteShmHandle data, float score,
-                                         CteFutureHandle *out_future) {
-  if (out_future) *out_future = nullptr;
-  if (tag == nullptr || blob_name == nullptr) return -1;
-  if (data.off == 0 && data.alloc_id_major == 0 && data.alloc_id_minor == 0) {
-    return -2;  // null SHM handle
-  }
-  // Reconstruct the ShmPtr<> (void) from the handle
-  // AsyncPutBlob takes ShmPtr<> = ShmPtr<void>, so construct that directly
-  ctp::ipc::ShmPtr<> shm_ptr;
-  shm_ptr.alloc_id_ = ctp::ipc::AllocatorId(data.alloc_id_major, data.alloc_id_minor);
-  shm_ptr.off_ = static_cast<size_t>(data.off);
-  // Submit the async put (zero-copy: no memcpy of blob data here)
-  // Use the global CTE client (matches FUSE adapter + client_dynamic_reorganize)
-  auto *cte_client = ::clio::cte::core::g_cte_client;
-  if (cte_client == nullptr) return -3;  // CTE client not initialized
-  // Cast the opaque tag pointer back to the actual Tag type
-  const cte_ffi::Tag *tag_wrapper = static_cast<const cte_ffi::Tag *>(tag);
-  auto future = cte_client->AsyncPutBlob(
-      tag_wrapper->inner.GetTagId(), blob_name,
-      static_cast<clio::run::u64>(offset), static_cast<clio::run::u64>(size),
-      shm_ptr, score, clio::cte::core::Context(), /*flags=*/0u,
-      clio::run::PoolQuery::Local());
-  // Box the future on the heap + wrap in CteFutureInner for type-erased C-ABI
-  using FutureT = clio::run::Future<clio::cte::core::PutBlobTask>;
-  auto *boxed = new FutureT(std::move(future));
-  auto *inner = new CteFutureInner{cte_put_future_wait_fn,
-                                   cte_put_future_destroy_fn,
-                                   static_cast<void *>(boxed)};
-  if (out_future) *out_future = static_cast<CteFutureHandle>(inner);
-  return 0;
+CteShmHandle cte_alloc_shm_buffer(uint64_t bytes) {
+  auto *ipc = CLIO_IPC;
+  if (ipc == nullptr) return CteShmHandle{0, 0, 0};
+  ctp::ipc::FullPtr<char> buf = ipc->AllocateBuffer(static_cast<size_t>(bytes));
+  if (buf.IsNull()) return CteShmHandle{0, 0, 0};
+  // Extract the ShmPtr from the FullPtr: FullPtr has a .shm_ member (ShmPtr<char>)
+  CteShmHandle handle;
+  handle.alloc_id_major = buf.shm_.alloc_id_.major_;
+  handle.alloc_id_minor = buf.shm_.alloc_id_.minor_;
+  handle.off = buf.shm_.off_.load();
+  return handle;
 }
 
 /**
- * Submit a zero-copy AsyncGetBlob into a caller-allocated SHM output buffer.
- * The caller (Rust) allocates the buffer via cte_alloc_shm_buffer of `size`
- * bytes and passes its handle here. CTE writes the blob bytes into that SHM
- * region asynchronously after this call returns. The caller MUST wait on the
- * returned future (cte_future_wait) BEFORE reading the buffer (via
- * cte_shm_handle_to_ptr) or freeing it (cte_free_shm_buffer). Reading or
- * freeing before the future completes is a data race / use-after-free.
- *
- * LIFETIME: the `out_buf` handle's SHM region is written by the runtime
- * asynchronously after submit. Caller MUST: cte_future_wait(out_future) ->
- * (read via cte_shm_handle_to_ptr) -> cte_future_destroy -> cte_free_shm_buffer.
- *
- * @param tag The CTE tag to read from (opaque pointer to cte_ffi::Tag)
- * @param blob_name Null-terminated blob name
- * @param offset Offset within the blob to read from
- * @param size Number of bytes to read (must match the allocated buffer size)
- * @param out_buf CteShmHandle of the caller-allocated output SHM buffer
- * @param out_future Set to an opaque CteFutureHandle on success. nullptr on failure.
- * @return 0 on success, negative on error
+ * Free a SHM buffer obtained from cte_alloc_shm_buffer.
+ * No-op on a null handle (off==0 && alloc_id all zero). After this call the
+ * handle is invalid and must not be reused — the runtime must have completed
+ * any AsyncPutBlob/AsyncGetBlob using it (wait on the future first).
  */
-extern "C" int32_t cte_tag_async_get_shm(const void *tag, const char *blob_name,
-                                          uint64_t offset, uint64_t size,
-                                          CteShmHandle out_buf,
-                                          CteFutureHandle *out_future) {
-  if (out_future) *out_future = nullptr;
-  if (tag == nullptr || blob_name == nullptr) return -1;
-  if (out_buf.off == 0 && out_buf.alloc_id_major == 0 && out_buf.alloc_id_minor == 0) {
-    return -2;  // null SHM handle
+void cte_free_shm_buffer(CteShmHandle handle) {
+  if (handle.off == 0 && handle.alloc_id_major == 0 && handle.alloc_id_minor == 0) {
+    return;  // null handle, no-op
   }
-  // Reconstruct the ShmPtr<> (void) from the handle (same as put)
+  auto *ipc = CLIO_IPC;
+  if (ipc == nullptr) return;
+  // Reconstruct a ShmPtr<char> from the handle and free it
+  ctp::ipc::ShmPtr<char> shm_ptr;
+  shm_ptr.alloc_id_ = ctp::ipc::AllocatorId(handle.alloc_id_major, handle.alloc_id_minor);
+  shm_ptr.off_ = static_cast<size_t>(handle.off);
+  ipc->FreeBuffer(shm_ptr);  // the ShmPtr overload (ipc_manager.h:456) converts via ToFullPtr
+}
+
+/**
+ * Resolve a CteShmHandle back to a raw pointer value (e.g. to read data the
+ * runtime wrote into a get_blob buffer). Returns 0 if the handle is null or
+ * unresolvable.
+ */
+size_t cte_shm_handle_to_ptr(CteShmHandle handle) {
+  if (handle.off == 0 && handle.alloc_id_major == 0 && handle.alloc_id_minor == 0) {
+    return 0;
+  }
+  auto *ipc = CLIO_IPC;
+  if (ipc == nullptr) return 0;
+  ctp::ipc::ShmPtr<char> shm_ptr;
+  shm_ptr.alloc_id_ = ctp::ipc::AllocatorId(handle.alloc_id_major, handle.alloc_id_minor);
+  shm_ptr.off_ = static_cast<size_t>(handle.off);
+  ctp::ipc::FullPtr<char> full = ipc->ToFullPtr<char>(shm_ptr);
+  if (full.IsNull()) return 0;
+  return reinterpret_cast<size_t>(full.ptr_);
+}
+
+}  // namespace cte_ffi
+
+// ---- cxx-bridge async SHM operations (cte_ffi namespace) ----
+
+namespace cte_ffi {
+
+/// Block until the future completes (dispatches to FutureHandle::wait).
+int32_t future_wait(const FutureHandle& handle, float timeout_sec, int32_t& out_rc) {
+  return handle.wait(timeout_sec, &out_rc);
+}
+
+/// Submit a zero-copy AsyncPutBlob. Returns a FutureHandle (null on failure).
+std::unique_ptr<FutureHandle> async_put_shm(const Tag& tag, rust::Str blob_name,
+                                             uint64_t offset, uint64_t size,
+                                             CteShmHandle data, float score) {
+  if (data.off == 0 && data.alloc_id_major == 0 && data.alloc_id_minor == 0) {
+    return nullptr;  // null SHM handle
+  }
+  ctp::ipc::ShmPtr<> shm_ptr;
+  shm_ptr.alloc_id_ = ctp::ipc::AllocatorId(data.alloc_id_major, data.alloc_id_minor);
+  shm_ptr.off_ = static_cast<size_t>(data.off);
+  auto *cte_client = ::clio::cte::core::g_cte_client;
+  if (cte_client == nullptr) return nullptr;
+  std::string name_str(blob_name.data(), blob_name.size());
+  auto future = cte_client->AsyncPutBlob(
+      tag.inner.GetTagId(), name_str.c_str(),
+      static_cast<clio::run::u64>(offset), static_cast<clio::run::u64>(size),
+      shm_ptr, score, clio::cte::core::Context(), /*flags=*/0u,
+      clio::run::PoolQuery::Local());
+  using FutureT = clio::run::Future<clio::cte::core::PutBlobTask>;
+  auto *boxed = new FutureT(std::move(future));
+  // Wrap in FutureHandle (the type-erased holder). FutureHandle owns the boxed Future;
+  // ~FutureHandle calls destroy_fn_ (cte_put_future_destroy_fn) which deletes it.
+  auto handle = std::make_unique<FutureHandle>();
+  handle->wait_fn_ = cte_put_future_wait_fn;
+  handle->destroy_fn_ = cte_put_future_destroy_fn;
+  handle->future_ = static_cast<void*>(boxed);
+  return handle;
+}
+
+/// Submit a zero-copy AsyncGetBlob into a caller SHM buffer. Returns FutureHandle (null on failure).
+std::unique_ptr<FutureHandle> async_get_shm(const Tag& tag, rust::Str blob_name,
+                                             uint64_t offset, uint64_t size,
+                                             CteShmHandle out_buf) {
+  if (out_buf.off == 0 && out_buf.alloc_id_major == 0 && out_buf.alloc_id_minor == 0) {
+    return nullptr;
+  }
   ctp::ipc::ShmPtr<> shm_ptr;
   shm_ptr.alloc_id_ = ctp::ipc::AllocatorId(out_buf.alloc_id_major, out_buf.alloc_id_minor);
   shm_ptr.off_ = static_cast<size_t>(out_buf.off);
-  // Use the global CTE client (matches put + FUSE + dynamic_reorganize)
   auto *cte_client = ::clio::cte::core::g_cte_client;
-  if (cte_client == nullptr) return -3;
-  // Cast the opaque tag pointer back to the actual Tag type
-  const cte_ffi::Tag *tag_wrapper = static_cast<const cte_ffi::Tag *>(tag);
+  if (cte_client == nullptr) return nullptr;
+  std::string name_str(blob_name.data(), blob_name.size());
   auto future = cte_client->AsyncGetBlob(
-      tag_wrapper->inner.GetTagId(), blob_name,
+      tag.inner.GetTagId(), name_str.c_str(),
       static_cast<clio::run::u64>(offset), static_cast<clio::run::u64>(size),
       /*flags=*/0u, shm_ptr, clio::run::PoolQuery::Local());
-  // Box the future on the heap + wrap in CteFutureInner for type-erased C-ABI
   using FutureT = clio::run::Future<clio::cte::core::GetBlobTask>;
   auto *boxed = new FutureT(std::move(future));
-  auto *inner = new CteFutureInner{cte_get_future_wait_fn,
-                                   cte_get_future_destroy_fn,
-                                   static_cast<void *>(boxed)};
-  if (out_future) *out_future = static_cast<CteFutureHandle>(inner);
-  return 0;
+  auto handle = std::make_unique<FutureHandle>();
+  handle->wait_fn_ = cte_get_future_wait_fn;
+  handle->destroy_fn_ = cte_get_future_destroy_fn;
+  handle->future_ = static_cast<void*>(boxed);
+  return handle;
 }
+
+}  // namespace cte_ffi

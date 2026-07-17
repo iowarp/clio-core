@@ -638,36 +638,14 @@ impl Tag {
 
         let size = buf.len() as u64;
 
-        // Build a null-terminated C string for blob_name
-        let c_name = std::ffi::CString::new(name).map_err(|e| CteError::FfiError {
-            message: format!("blob name has interior NUL: {}", e),
-        })?;
-
-        // Get the raw pointer to the cxx::Tag for the extern "C" call.
-        // Pattern: UniquePtr derefs to &T, so we use std::ptr::addr_of! to get
-        // a raw pointer without creating an intermediate reference, then cast
-        // to *const c_void (matches what cte_tag_async_put_shm expects).
-        let tag_ptr = std::ptr::addr_of!(*self.inner) as *const std::ffi::c_void;
-
-        // Submit the async put. Pass the buffer's handle (by value — CteShmHandle is Copy).
-        // The C++ side reconstructs the ShmPtr and calls AsyncPutBlob WITHOUT copying.
-        let mut future: crate::ffi_c::CteFutureHandle = std::ptr::null_mut();
-        let rc = unsafe {
-            crate::ffi_c::cte_tag_async_put_shm(
-                tag_ptr,
-                c_name.as_ptr(),
-                offset,
-                size,
-                buf.handle(),
-                score,
-                &mut future,
-            )
-        };
-
-        if rc != 0 {
-            // Submit failed — no future to wait on. buf drops here (frees SHM). Safe.
+        // Submit the async put via cxx bridge. The cxx bridge takes &Tag directly
+        // (no *const c_void cast) and &str directly (no CString). Returns
+        // UniquePtr<FutureHandle> (null on failure).
+        let future = ffi::async_put_shm(&self.inner, name, offset, size, buf.handle(), score);
+        if future.is_null() {
+            // Submit failed — buf drops at scope end (frees SHM). No future to wait on.
             return Err(CteError::FfiError {
-                message: format!("cte_tag_async_put_shm failed rc={}", rc),
+                message: "async_put_shm failed (null future)".to_string(),
             });
         }
 
@@ -675,15 +653,15 @@ impl Tag {
         // SHM region asynchronously right now. We must not let buf drop until
         // wait returns. Keep buf alive by holding it in scope past the wait.
         let mut wait_rc: i32 = 0;
-        let wait_status = unsafe {
-            crate::ffi_c::cte_future_wait(future, /*timeout_sec=*/ -1.0, &mut wait_rc)
-        };
+        let wait_status = ffi::future_wait(&future, /*timeout_sec=*/ -1.0, &mut wait_rc);
 
-        // Destroy the future (releases the C++ Future<PutBlobTask> wrapper).
-        unsafe { crate::ffi_c::cte_future_destroy(future) };
+        // CRITICAL: explicitly drop(future) BEFORE buf drops at scope end.
+        // The C++ ~FutureHandle destructor runs (replaces cte_future_destroy).
+        // buf is still alive here — drops after this point.
+        drop(future);
 
         // NOW buf can drop (end of scope) — the runtime has finished reading.
-        // The drop order is: future destroyed above (explicit), then buf drops
+        // The drop order is: future dropped above (explicit), then buf drops
         // at scope end. This is the wait-before-free guarantee.
         if wait_status != 0 {
             return Err(CteError::FfiError {
@@ -746,48 +724,30 @@ impl Tag {
         //    until we return it. If alloc fails, no future to wait on — return err.
         let buf = crate::zerocopy::ShmBuffer::alloc(size as usize)?;
 
-        // 3. Build a null-terminated C string for blob_name
-        let c_name = std::ffi::CString::new(name).map_err(|e| CteError::FfiError {
-            message: format!("blob name has interior NUL: {}", e),
-        })?;
-
-        // 4. Get the raw Tag pointer (same pattern as put_blob_shm)
-        let tag_ptr = std::ptr::addr_of!(*self.inner) as *const std::ffi::c_void;
-
-        // 5. Submit the async get. Pass buf's handle (by value — CteShmHandle is Copy).
-        //    CTE writes into the buffer asynchronously after this returns.
-        let mut future: crate::ffi_c::CteFutureHandle = std::ptr::null_mut();
-        let rc = unsafe {
-            crate::ffi_c::cte_tag_async_get_shm(
-                tag_ptr,
-                c_name.as_ptr(),
-                offset,
-                size,
-                buf.handle(),
-                &mut future,
-            )
-        };
-
-        if rc != 0 {
-            // Submit failed — no future to wait on. buf drops here (frees SHM). Safe.
+        // 3. Submit the async get via cxx bridge. The cxx bridge takes &Tag directly
+        //    (no *const c_void cast) and &str directly (no CString). Returns
+        //    UniquePtr<FutureHandle> (null on failure).
+        let future = ffi::async_get_shm(&self.inner, name, offset, size, buf.handle());
+        if future.is_null() {
+            // Submit failed — buf drops at scope end (frees SHM). No future to wait on.
             return Err(CteError::FfiError {
-                message: format!("cte_tag_async_get_shm failed rc={}", rc),
+                message: "async_get_shm failed (null future)".to_string(),
             });
         }
 
-        // 6. WAIT before read/free — CTE is writing into buf's SHM region right now.
+        // 4. WAIT before read/free — CTE is writing into buf's SHM region right now.
         //    buf is still alive (owned by this scope) so its SHM stays valid.
         let mut wait_rc: i32 = 0;
-        let wait_status = unsafe {
-            crate::ffi_c::cte_future_wait(future, /*timeout_sec=*/ -1.0, &mut wait_rc)
-        };
+        let wait_status = ffi::future_wait(&future, /*timeout_sec=*/ -1.0, &mut wait_rc);
 
-        // 7. Destroy the future (releases the C++ Future<GetBlobTask> wrapper).
-        //    Do this BEFORE returning buf so the future is gone before the caller
-        //    touches the buffer. buf is still alive (still in scope).
-        unsafe { crate::ffi_c::cte_future_destroy(future) };
+        // 5. CRITICAL: drop(future) BEFORE returning buf to caller.
+        //    The C++ ~FutureHandle destructor runs (replaces cte_future_destroy).
+        //    buf is still alive (still in scope) — it's MOVED out via Ok(buf) AFTER
+        //    drop(future). The caller receives buf and reads as_slice then drops.
+        //    The future was destroyed before buf left this fn. read-before-free OK.
+        drop(future);
 
-        // 8. Check wait/task status. On failure we still drop buf (frees SHM) — the
+        // 6. Check wait/task status. On failure we still drop buf (frees SHM) — the
         //    buffer contents are undefined on failure, so don't return it.
         if wait_status != 0 {
             return Err(CteError::FfiError {
@@ -804,9 +764,11 @@ impl Tag {
             });
         }
 
-        // 9. Success — buf now contains `size` bytes of blob data. Return it to
+        // 7. Success — buf now contains `size` bytes of blob data. Return it to
         //    the caller, who reads `as_slice()` and drops to free. The move
-        //    transfers ownership; buf does NOT drop here.
+        //    transfers ownership; buf does NOT drop here. future already dropped
+        //    above (before Ok(buf)) — the caller receives buf and reads as_slice
+        //    then drops. The future was destroyed before buf left this fn.
         Ok(buf)
     }
 
