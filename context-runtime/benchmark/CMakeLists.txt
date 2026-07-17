@@ -67,3 +67,23 @@ endif()
 # runtime concept. Kernels now submit tasks to the CPU runtime via the
 # gpu2cpu_queue; benchmark coverage of that path is via the unit tests
 # in test/unit/gpu/test_sycl_*.cc.
+
+# Safe-bdev migration benchmark
+add_executable(clio_safe_bdev_mig_bench
+  clio_safe_bdev_mig_bench.cc
+)
+
+target_link_libraries(clio_safe_bdev_mig_bench
+  cxx                             # Core CLIO Runtime
+  clio::run::bdev_client
+  clio_bdev_runtime
+  clio::run::safe_bdev_client
+  clio_safe_bdev_runtime
+  clio::run::admin_client
+  clio_admin_runtime
+  ctp::cxx
+)
+
+install(TARGETS clio_safe_bdev_mig_bench
+  DESTINATION bin
+)
