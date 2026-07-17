@@ -9,20 +9,33 @@ vcpkg_from_github(
     HEAD_REF main
 )
 
+# Build the CMake options (base + feature-conditional)
+set(OPTIONS
+    -DCLIO_CORE_ENABLE_TESTS=OFF
+    -DCLIO_CORE_ENABLE_BENCHMARKS=OFF
+    -DCLIO_CORE_ENABLE_PYTHON=OFF
+    -DCLIO_CORE_ENABLE_DOXYGEN=OFF
+    -DCLIO_CORE_ENABLE_COVERAGE=OFF
+    -DCLIO_CORE_ENABLE_ASAN=OFF
+)
+
+# Rust bindings feature (requires cargo/rustc on PATH)
+if("rust" IN_LIST FEATURES)
+    list(APPEND OPTIONS -DCLIO_CORE_ENABLE_RUST=ON)
+    # Verify the Rust toolchain is available
+    find_program(CARGO_BIN cargo)
+    find_program(RUSTC_BIN rustc)
+    if(NOT CARGO_BIN OR NOT RUSTC_BIN)
+        message(FATAL_ERROR "The 'rust' feature requires cargo + rustc on PATH. Install the Rust toolchain (https://rustup.rs) and retry.")
+    endif()
+else()
+    list(APPEND OPTIONS -DCLIO_CORE_ENABLE_RUST=OFF)
+endif()
+
 # Configure CMake
 vcpkg_cmake_configure(
     SOURCE_PATH "${SOURCE_PATH}"
-    OPTIONS
-        -DWRP_CORE_ENABLE_TESTS=OFF
-        -DWRP_CORE_ENABLE_BENCHMARKS=OFF
-        -DWRP_CORE_ENABLE_PYTHON=OFF
-        -DWRP_CORE_ENABLE_DOXYGEN=OFF
-        -DWRP_CORE_ENABLE_COVERAGE=OFF
-        -DWRP_CORE_ENABLE_ASAN=OFF
-        -DHSHM_ENABLE_TESTS=OFF
-        -DHSHM_ENABLE_BENCHMARKS=OFF
-        -DCLIO_CORE_ENABLE_TESTS=OFF
-        -DCLIO_CORE_ENABLE_BENCHMARKS=OFF
+    OPTIONS ${OPTIONS}
 )
 
 # Build
