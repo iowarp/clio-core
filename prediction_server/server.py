@@ -507,8 +507,12 @@ def drive_history(drive_id: str):
 
 if __name__ == "__main__":
     import argparse
+    import os
+    # Resolve the models directory relative to this script's location
+    default_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'models')
+    
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model-dir', type=str, default='models')
+    parser.add_argument('--model-dir', type=str, default=default_dir)
     parser.add_argument('--port', type=int, default=8000)
     parser.add_argument('--db', type=str, default='drive_history.db')
     args = parser.parse_args()

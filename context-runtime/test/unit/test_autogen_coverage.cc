@@ -1632,6 +1632,65 @@ TEST_CASE("Autogen - CTE Task AggregateOut operations", "[autogen][cte][aggregat
     }
   }
 
+  // GetTagSize is a Broadcast SUM whose replicas are per-container: a container
+  // holding none of the tag's blobs returns rc=1 (no local TagInfo), which is a
+  // zero contribution, NOT an error. The aggregate must be "found if ANY" — rc=0
+  // (and the summed size preserved) if any replica found the tag, and rc=1 only
+  // if every container missed. Regression guard for the cross-node 0-byte read
+  // in #714, where a not-found replica's rc=1 poisoned the aggregate and the
+  // filesystem adapter then discarded the correctly-summed size.
+  SECTION("AggregateOut for GetTagSizeTask is found-if-any") {
+    // Both constructors seed the accumulator "not found" (rc=1) so the aggregate
+    // reports rc=1 only when every replica missed. Cover the emplace ctor too
+    // (NewTask below exercises the default ctor).
+    clio::cte::core::GetTagSizeTask emplaced(
+        clio::run::TaskId(1, 2, 3), clio::run::PoolId(560, 0),
+        clio::run::PoolQuery::Local(), clio::cte::core::TagId::GetNull());
+    REQUIRE(emplaced.GetReturnCode() != 0);
+
+    // A freshly constructed GetTagSizeTask is seeded "not found" (rc=1) so the
+    // aggregate reports rc=1 only when every replica missed.
+    auto origin = ipc_manager->NewTask<clio::cte::core::GetTagSizeTask>();
+    auto missing = ipc_manager->NewTask<clio::cte::core::GetTagSizeTask>();
+    auto found = ipc_manager->NewTask<clio::cte::core::GetTagSizeTask>();
+    if (!origin.IsNull() && !missing.IsNull() && !found.IsNull()) {
+      REQUIRE(origin->GetReturnCode() != 0);  // seeded not-found
+
+      // A replica that holds none of the tag's blobs: rc=1, size 0.
+      missing->SetReturnCode(1);
+      missing->tag_size_ = 0;
+      // A replica that holds the tag's bytes: rc=0, real share.
+      found->SetReturnCode(0);
+      found->tag_size_ = 28;
+
+      // Aggregating the not-found replica first must NOT flip the aggregate to
+      // "found", and must not poison a later found result.
+      origin->AggregateOut(missing.template Cast<clio::run::Task>());
+      REQUIRE(origin->GetReturnCode() != 0);  // still not found
+      REQUIRE(origin->tag_size_ == 0);
+
+      // Aggregating the found replica makes the whole query succeed with the
+      // real size, regardless of the earlier not-found replica.
+      origin->AggregateOut(found.template Cast<clio::run::Task>());
+      REQUIRE(origin->GetReturnCode() == 0);  // found-if-any
+      REQUIRE(origin->tag_size_ == 28);
+
+      // A subsequent not-found replica must not re-poison the found aggregate.
+      auto missing2 = ipc_manager->NewTask<clio::cte::core::GetTagSizeTask>();
+      if (!missing2.IsNull()) {
+        missing2->SetReturnCode(1);
+        missing2->tag_size_ = 0;
+        origin->AggregateOut(missing2.template Cast<clio::run::Task>());
+        REQUIRE(origin->GetReturnCode() == 0);
+        REQUIRE(origin->tag_size_ == 28);
+        missing2.reset();
+      }
+      origin.reset();
+      missing.reset();
+      found.reset();
+    }
+  }
+
   SECTION("AggregateOut for GetContainedBlobsTask") {
     auto origin_task = ipc_manager->NewTask<clio::cte::core::GetContainedBlobsTask>();
     auto replica_task = ipc_manager->NewTask<clio::cte::core::GetContainedBlobsTask>();

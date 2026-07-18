@@ -217,6 +217,60 @@ def get_bdev_stats_for_node(node_id):
     return _monitor(f"physical:{node_id}", "bdev_stats")
 
 
+def get_safe_bdev_stats(pool_id, routing="local"):
+    """Query a safe_bdev pool's live stats: recovery progress + member roster.
+
+    pool_id is a 'major.minor' string (e.g. '350.0'). The query is routed to
+    the specific pool via the admin pool_stats:// forwarder. Returns the decoded
+    stats dict (recovery_ops_*, members, ...) or {} if the pool is unreachable
+    or returned nothing.
+    """
+    raw = _monitor("local", f"pool_stats://{pool_id}:{routing}:stats")
+    for _cid, data in raw.items():
+        if isinstance(data, dict) and "recovery_ops_total" in data:
+            return data
+    return {}
+
+
+# --- Safe-bdev member management (write path) --------------------------------
+# These drive the dashboard add/remove/replace controls. They require the
+# runtime python bindings (clio_runtime_ext) to expose the safe_bdev
+# AddBdev/RemoveBdev/RecoverBdev + pool-compose calls; until then they raise
+# NotImplementedError, which the API layer maps to HTTP 501.
+
+def _require_safe_bdev_bindings():
+    _ensure_init()
+    if not hasattr(_chi, "safe_bdev_add_bdev"):
+        raise NotImplementedError(
+            "runtime python bindings do not expose safe_bdev member management "
+            "(rebuild clio_runtime_ext with the safe_bdev bindings)")
+
+
+def safe_bdev_add_member(pool_id, member_path, capacity, node_id, as_parity):
+    """Grow the array with a new member bdev (data or parity)."""
+    _require_safe_bdev_bindings()
+    return _chi_worker.submit(
+        _chi.safe_bdev_add_bdev, pool_id, member_path, capacity,
+        int(node_id), int(as_parity)).result(timeout=30)
+
+
+def safe_bdev_remove_member(pool_id, target_pool_id, was_faulty):
+    """Take a member out of service (mark faulty or unlink)."""
+    _require_safe_bdev_bindings()
+    return _chi_worker.submit(
+        _chi.safe_bdev_remove_bdev, pool_id, target_pool_id,
+        int(was_faulty)).result(timeout=30)
+
+
+def safe_bdev_replace_member(pool_id, failed_pool_id, member_path, capacity,
+                             node_id):
+    """Remove a failed member, compose a fresh bdev, and auto-recover onto it."""
+    _require_safe_bdev_bindings()
+    return _chi_worker.submit(
+        _chi.safe_bdev_replace_bdev, pool_id, failed_pool_id, member_path,
+        capacity, int(node_id)).result(timeout=120)
+
+
 def get_container_stats(pool_query="local"):
     """Query container_stats from the admin pool."""
     return _monitor(pool_query, "container_stats")
@@ -272,9 +326,10 @@ def restart_node(ip_address, port=9413):
     """Restart a node's Clio runtime (non-blocking).
 
     Assumes the runtime is already dead (shutdown_node was called first).
-    Launches ``clio_run runtime restart`` (WAL replay) so the node rejoins
-    the existing cluster. Returns immediately — the dashboard's topology
-    polling (TCP-based) will detect when the node comes back.
+    Launches ``clio_run runtime start`` (persistent: recomposes saved pools
+    and replays the WAL) so the node rejoins the existing cluster. Returns
+    immediately — the dashboard's topology polling (TCP-based) will detect
+    when the node comes back.
     """
     import os
     import subprocess
@@ -314,7 +369,7 @@ def restart_node(ip_address, port=9413):
         env_str = ("export " + " ".join(env_parts) + " && ") if env_parts else ""
         remote_cmd = (
             f"{env_str}"
-            f"nohup setsid clio_run runtime restart "
+            f"nohup setsid clio_run runtime start "
             f"</dev/null >/dev/null 2>&1 & disown; exit 0"
         )
         cmd = [

@@ -143,6 +143,47 @@ if(CLIO_CORE_ENABLE_TESTS)
     TIMEOUT 110
     LABELS "msan_skip"
   )
+  # Client-crash PutBlob test (issues #722 + "client dies mid-op"): spawns its
+  # own daemon, forks a client that fires a PutBlob burst then _exit()s without
+  # waiting, and asserts the daemon (a) drops the undeliverable responses and
+  # (b) leaks no SHM (ReportRuntimeLeaks at graceful shutdown). Name contains
+  # "leak" so the Leak Check CI (-R "leak|...") runs it. Serialize with the other
+  # live-runtime tests via the shared RESOURCE_LOCK.
+  add_executable(clio_run_client_crash_putblob_test test_client_crash_putblob.cc)
+  target_include_directories(clio_run_client_crash_putblob_test PRIVATE
+    ${CLIO_RUN_ROOT}/include
+    ${CLIO_RUN_ROOT}/test
+  )
+  target_link_libraries(clio_run_client_crash_putblob_test
+    clio_cte_core_client
+    clio_admin_client
+    clio_run_cxx
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+  )
+  target_compile_definitions(clio_run_client_crash_putblob_test PRIVATE
+    CLIO_RUN_EXE="$<TARGET_FILE:clio_run>")
+  # The forked client PutBlobs against the daemon's default compose, so the CTE
+  # core + bdev module runtimes must be built for the daemon to load them.
+  add_dependencies(clio_run_client_crash_putblob_test
+    clio_run clio_cte_core_runtime clio_bdev_runtime)
+  set_target_properties(clio_run_client_crash_putblob_test PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  add_test(
+    NAME cr_cli_client_crash_leak
+    COMMAND clio_run_client_crash_putblob_test
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_cli_client_crash_leak PROPERTIES
+    ENVIRONMENT "${_cli_live_env}"
+    RESOURCE_LOCK "clio_runtime_port"
+    TIMEOUT 180
+    LABELS "msan_skip;leak;crash"
+  )
+
   # Filesystem chimod test: compose bdev->cte_core->filesystem, drive the cfs
   # client (open/write/getattr/read/truncate), assert EXACT logical size.
   # Only built when the filesystem chimod is enabled.

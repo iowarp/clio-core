@@ -14,7 +14,7 @@ namespace kvhdf5 {
 // Group hierarchy is carried in the path string for now; a real Group tree and
 // path->TagId resolution land in Slice 2. DatasetMeta is heap-owned so its
 // address stays stable across rehash (Dataset holds a DatasetMeta*).
-template<BlobBackend B>
+template<KVHDF5_BLOB_BACKEND B>
 class File {
     B backend_;
     std::unordered_map<std::string, std::unique_ptr<DatasetMeta>> datasets_;

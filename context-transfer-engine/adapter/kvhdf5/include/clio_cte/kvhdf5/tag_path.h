@@ -12,7 +12,8 @@
 // Convention (mirrors chunking::ChunkCoordToName): an empty result == failure. A
 // valid tag is always non-empty, so the empty string is an unambiguous sentinel.
 
-#include <span>
+#include "defines.h"
+#include <cuda/std/span>
 #include <string>
 #include <string_view>
 
@@ -43,7 +44,7 @@ inline constexpr char kTagSep = '/';
 // Build a canonical tag from already-separated hierarchy components (file name,
 // group names, dataset name). Strict: returns "" if any component is empty or
 // itself contains the separator (an embedded '/' would corrupt the path depth).
-[[nodiscard]] inline std::string JoinTag(std::span<const std::string_view> components) {
+[[nodiscard]] inline std::string JoinTag(cstd::span<const std::string_view> components) {
     std::string out;
     for (std::string_view c : components) {
         if (c.empty() || c.find(kTagSep) != std::string_view::npos) return {};

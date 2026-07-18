@@ -1,0 +1,72 @@
+{% extends "base.html" %}
+{% block title %}Safe BDev -- Clio Visualizer{% endblock %}
+
+{% block content %}
+<h1>Safe BDev</h1>
+
+<!-- Pool selector -->
+<div class="chart-container">
+    <label for="poolSelect"><strong>Safe-bdev pool:</strong></label>
+    <select id="poolSelect"></select>
+    <span id="poolMeta" class="muted"></span>
+</div>
+
+<!-- Recovery panel: ops in flight vs remaining -->
+<h2>Recovery</h2>
+<div class="card-grid" id="recoveryCards">
+    <div class="card">
+        <div class="card-label">Status</div>
+        <div class="card-value" id="rec-status">--</div>
+    </div>
+    <div class="card">
+        <div class="card-label">In flight</div>
+        <div class="card-value" id="rec-inflight">--</div>
+    </div>
+    <div class="card">
+        <div class="card-label">Remaining</div>
+        <div class="card-value" id="rec-remaining">--</div>
+    </div>
+    <div class="card">
+        <div class="card-label">Completed</div>
+        <div class="card-value" id="rec-completed">--</div>
+    </div>
+    <div class="card">
+        <div class="card-label">Total ops</div>
+        <div class="card-value" id="rec-total">--</div>
+    </div>
+</div>
+<div class="progress-outer">
+    <div class="progress-inner" id="rec-progress" style="width:0%"></div>
+    <span class="progress-label" id="rec-progress-label"></span>
+</div>
+
+<!-- Members -->
+<h2>Members
+    <button id="addMemberBtn" class="btn btn-add">+ Add bdev</button>
+</h2>
+<table class="member-table">
+    <thead>
+        <tr><th>Role</th><th>Index</th><th>Name</th><th>Pool ID</th>
+            <th>State</th><th>Actions</th></tr>
+    </thead>
+    <tbody id="memberBody"><!-- populated by JS --></tbody>
+</table>
+
+<!-- Add-member form (hidden until +Add) -->
+<div id="addMemberForm" class="add-form" style="display:none">
+    <h3>Add bdev</h3>
+    <label>Backing path <input id="am-path" placeholder="/mnt/bdevN.dat"></label>
+    <label>Capacity <input id="am-capacity" value="256MB"></label>
+    <label>Node id <input id="am-node" type="number" value="0"></label>
+    <label>As parity <input id="am-parity" type="checkbox"></label>
+    <button id="am-submit" class="btn btn-add">Add</button>
+    <button id="am-cancel" class="btn">Cancel</button>
+    <span id="am-msg" class="muted"></span>
+</div>
+
+<div id="toast" class="toast" style="display:none"></div>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/safe_bdev.js') }}"></script>
+{% endblock %}

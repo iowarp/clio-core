@@ -129,6 +129,13 @@ install(
 # compatibility state rather than masking gaps, so any future regression fails the
 # test. Run it for the authoritative, always-current status; do not rely on numbers
 # copied into comments/prose.
+#
+# Finding Python3 is necessary but NOT sufficient: the suite is a differential
+# test against a native HDF5 stack and also needs the h5py module plus the HDF5
+# CLI tools (h5diff/h5dump/h5ls/h5cc). Those are absent on some CDash builders
+# (e.g. macmini-m1). Rather than gate registration on every dependency here, the
+# suite self-detects a missing toolchain and exits SKIP_RETURN_CODE, so CDash
+# shows it as "Not Run" instead of a wall of false failures.
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if(Python3_FOUND)
     add_test(NAME cte_hdf5_vol_compat_suite
@@ -141,6 +148,7 @@ if(Python3_FOUND)
         TIMEOUT 900
         RUN_SERIAL TRUE
         RESOURCE_LOCK "clio_runtime"
+        SKIP_RETURN_CODE 125
         LABELS "integration;adapter;hdf5_vol;compat;cte"
         ENVIRONMENT "CLIO_HOME_DIR=$ENV{HOME};LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}"
     )

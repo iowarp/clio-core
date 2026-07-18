@@ -14,7 +14,7 @@ target_include_directories(clio_cte_vfd_unit_tests SYSTEM PUBLIC
     ${HDF5_INCLUDE_DIRS})
 
 target_link_libraries(clio_cte_vfd_unit_tests
-    clio_cte_hdf5_vfd         # the driver under test
+    clio_vfd         # the driver under test
     clio_cte_cfs_adapter
     clio_cte_filesystem_client
     clio_cte_core_client

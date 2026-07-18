@@ -255,6 +255,46 @@ if [ "$DO_CTEST" = true ]; then
 
     if [ -n "${SITE_NAME}" ]; then
         print_info "Running tests and submitting to CDash (site: ${SITE_NAME})..."
+
+        # Scope the CDash coverage submission to the subtree this phase owns
+        # (PHASE_CDASH_KEEP, e.g. "context-transfer-engine/adapter" for the fuse
+        # phase). ctest_coverage() has no include filter and otherwise reports
+        # WHOLE-BUILD coverage measured under a partial (labelled) test run, so
+        # the fuse adapter's ~97% got diluted into a ~36% whole-repo headline.
+        # We exclude every OTHER source component so the CDash phase build
+        # reports the phase's own code, mirroring the Codecov extract scoping.
+        CDASH_SCOPE_BLOCK=""
+        if [ -n "${PHASE_CDASH_KEEP:-}" ]; then
+            print_info "Scoping CDash coverage to: ${PHASE_CDASH_KEEP}"
+            _excludes=""
+            while IFS= read -r comp; do
+                [ -z "${comp}" ] && continue
+                rel="${comp#"${REPO_ROOT}/"}"
+                keep_it=0
+                for k in ${PHASE_CDASH_KEEP}; do
+                    k="${k%/}"
+                    # keep if the component is under a kept path, OR is an
+                    # ancestor of one (so parents like context-transfer-engine
+                    # are not excluded wholesale).
+                    case "${rel}/" in "${k}"/*) keep_it=1;; esac
+                    case "${k}/" in "${rel}"/*) keep_it=1;; esac
+                done
+                [ "${keep_it}" = 0 ] && _excludes="${_excludes}    \".*/${rel}/.*\"\n"
+            done < <(
+                { find "${REPO_ROOT}" -mindepth 1 -maxdepth 1 -type d \
+                       \( -name 'context-*' -o -name 'prediction_server' \);
+                  find "${REPO_ROOT}/context-transfer-engine" -mindepth 1 -maxdepth 1 \
+                       -type d 2>/dev/null; } | sort -u
+            )
+            if [ -n "${_excludes}" ]; then
+                # Seed CTEST_CUSTOM_COVERAGE_EXCLUDE with the complement of the
+                # kept subtree. The build's generated CTestCustom.cmake (read by
+                # ctest_coverage()) then appends its own entries (e.g.
+                # fuse_cte_main.cc) to this, so both are honoured.
+                CDASH_SCOPE_BLOCK=$(printf 'set(CTEST_CUSTOM_COVERAGE_EXCLUDE\n%b)' "${_excludes}")
+            fi
+        fi
+
         # Generate CTest dashboard script for CDash submission
         cat > "${BUILD_DIR}/cdash_coverage.cmake" << EOFCMAKE
 set(CTEST_SITE "${SITE_NAME}")
@@ -266,6 +306,7 @@ set(CTEST_DROP_SITE "my.cdash.org")
 set(CTEST_DROP_LOCATION "/submit.php?project=HERMES")
 set(CTEST_DROP_SITE_CDASH TRUE)
 set(CTEST_COVERAGE_COMMAND "gcov")
+${CDASH_SCOPE_BLOCK}
 ctest_start("Experimental")
 ctest_test(RETURN_VALUE test_result ${CTEST_TEST_SELECT})
 ctest_coverage()
@@ -464,6 +505,7 @@ lcov --remove coverage_all.info \
      '*/benchmark/*' \
      '*/local_sched.cc' \
      '*/globus_file_assimilator.cc' \
+     '*/fuse_cte_main.cc' \
      --output-file coverage_filtered.info \
      "${LCOV_IGNORE_OPTS[@]}" \
      2>&1 | grep -E "Removed|Summary|lines|functions" | tail -5 || true

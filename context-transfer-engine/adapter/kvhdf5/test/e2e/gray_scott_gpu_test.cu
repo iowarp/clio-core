@@ -115,6 +115,16 @@ TEST_CASE("GPU Gray-Scott end-to-end snapshots via dataset handle",
       ipc->GetGpuIpcManager()->GetGpuInfo(/*gpu_id=*/0);
   REQUIRE(gpu_info.gpu2cpu_queue != nullptr);
 
+  // Pin THIS host thread to the same GPU the datasets and snapshot kernels use
+  // (gpu 0). The shared CLIO runtime initialises every GPU on the node and
+  // leaves the current device set to the last one, so on a multi-GPU host the
+  // working grids below would otherwise be cudaMalloc'd on a different device
+  // than where GsSnapKernel launches — the dataset ctor's SetDevice(0) only
+  // runs later, mid-loop — making the kernel's read of `src` an illegal access
+  // (CUDA Error 700). Setting it up front keeps grids, dataset buffers, and
+  // launches all on gpu 0. (Single-GPU CI never exposed this.)
+  ctp::GpuApi::SetDevice(/*gpu_id=*/0);
+
   // ---- Working grids: 4 plain device buffers, ping-pong u/v. ----
   float *u_curr = nullptr, *u_next = nullptr, *v_curr = nullptr, *v_next = nullptr;
   REQUIRE(cudaMalloc(&u_curr, kBytes) == cudaSuccess);

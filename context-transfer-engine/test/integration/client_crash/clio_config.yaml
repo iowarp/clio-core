@@ -1,0 +1,44 @@
+---
+# Client-crash integration test config (issues #722 + "client dies mid-op").
+# A single daemon node hosting a ram-backed CTE core pool (512.0). A client in a
+# SEPARATE container connects over the network (it cannot attach this daemon's
+# /dev/shm, so it is forced onto the TCP path), issues PutBlobs, then terminates
+# mid-operation. The daemon must (1) not leak and (2) drop the undeliverable
+# response instead of re-queueing it forever.
+
+memory:
+  main_segment_size: auto
+  client_data_segment_size: 2GB
+  runtime_data_segment_size: 2GB
+
+networking:
+  port: 8080
+  neighborhood_size: 2
+  hostfile: /workspace/context-transfer-engine/test/integration/client_crash/hostfile
+
+logging:
+  level: info
+  file: /tmp/clio.log
+
+runtime:
+  num_threads: 8
+  queue_depth: 1024
+  local_sched: "default"
+  heartbeat_interval: 1000
+
+compose:
+  # CTE Core pool (512.0), ram-backed so the suite is self-contained.
+  - mod_name: clio_cte_core
+    pool_name: cte_client_crash
+    pool_query: local
+    pool_id: "512.0"
+    storage:
+      - path: /mnt/cte_ram
+        bdev_type: ram
+        capacity_limit: 512mb
+    dpe:
+      dpe_type: random
+    targets:
+      neighborhood: 2
+      default_target_timeout_ms: 30000
+      poll_period_ms: 5000

@@ -10,6 +10,7 @@ if(CLIO_CORE_ENABLE_DOCKER_CI)
     add_subdirectory(distributed)
     add_subdirectory(cfs_distributed)  # #685: cross-node CFS namespace test
     add_subdirectory(mpi_producer_consumer)  # #714: cross-node blob data (MPI)
+    add_subdirectory(client_crash)  # #722: client dies mid-PutBlob (runtime robustness)
     add_subdirectory(jarvis_deploy)
 
     # FUSE integration test requires Docker with FUSE support

@@ -68,8 +68,14 @@ function(kvhdf5_add_gpu_test_target target)
             HSHM_ENABLE_CUDA=1
     )
 
+    # kvhdf5's device-facing headers use C++20 (std::span, the BlobBackend
+    # concept), matching the codebase-wide CMAKE_CXX_STANDARD 20. Pin CUDA to 20
+    # too so the .cu translation units compile them, regardless of any global
+    # CMAKE_CUDA_STANDARD (e.g. a build that forces 17).
     set_target_properties(${target} PROPERTIES
         CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
+        CUDA_STANDARD 20
+        CUDA_STANDARD_REQUIRED ON
         RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     )
 

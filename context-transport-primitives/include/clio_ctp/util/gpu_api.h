@@ -288,6 +288,12 @@ class GpuApi {
     }
     return attributes.type == cudaMemoryTypeDevice;
 #elif CTP_ENABLE_SYCL
+    // On a host with no GPU no USM *device* allocation can exist, so any pointer
+    // is host memory. Short-circuit before touching SyclQueue(): constructing a
+    // sycl::queue throws when no SYCL device is present, and an unhandled throw
+    // inside a coroutine task aborts the whole runtime server (mirrors the
+    // CUDA/ROCm "failed query -> host pointer" degradation above).
+    if (!HasSyclGpuDevice()) return false;
     auto kind = sycl::get_pointer_type(static_cast<const void *>(ptr),
                                         SyclQueue().get_context());
     return kind == sycl::usm::alloc::device;
@@ -440,6 +446,32 @@ class GpuApi {
 #endif
 
 #if CTP_ENABLE_SYCL
+  /**
+   * True if at least one SYCL GPU device is visible. Cached on first use:
+   * enumerating platforms on every per-op IsDevicePointer call would be far too
+   * slow. This is the guard that keeps a GPU-enabled build running on a host
+   * with no GPU — see SyclQueue()/IsDevicePointer() for why constructing a queue
+   * unconditionally is fatal there.
+   */
+  static bool HasSyclGpuDevice() {
+    static const bool has = [] {
+      try {
+        return !sycl::device::get_devices(sycl::info::device_type::gpu).empty();
+      } catch (const sycl::exception &) {
+        return false;
+      }
+    }();
+    return has;
+  }
+
+  /**
+   * Shared SYCL queue backing the GPU host-side helpers (Memcpy, Free,
+   * Synchronize) and the device-pointer probe. Only ever call this when
+   * HasSyclGpuDevice() is true: sycl::gpu_selector_v (and even the default
+   * selector on this environment) throws "No device of requested type
+   * available" when no SYCL device is present, and an unhandled throw inside a
+   * coroutine task aborts the whole runtime server.
+   */
   static sycl::queue &SyclQueue() {
     static sycl::queue q{sycl::gpu_selector_v};
     return q;

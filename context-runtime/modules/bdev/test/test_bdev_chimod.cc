@@ -78,6 +78,9 @@ using namespace std::chrono_literals;
 // Include bdev client and tasks
 #include <clio_runtime/bdev/bdev_client.h>
 #include <clio_runtime/bdev/bdev_tasks.h>
+// Include the allocator WAL directly for the compaction test (drives the log
+// without a runtime).
+#include <clio_runtime/bdev/bdev_alloc_log.h>
 
 // Include admin client for pool management
 #include "clio_ctp/serialize/msgpack_wrapper.h"
@@ -818,6 +821,33 @@ TEST_CASE("bdev_failure_prediction_integration", "[bdev][prediction][integration
 
   std::error_code ec;
   std::filesystem::remove(health_path, ec);
+}
+
+TEST_CASE("bdev_set_lifespan_overrides_stats", "[bdev][health][ttl]") {
+  BdevChimodFixture fixture;
+  REQUIRE(g_initialized);
+  REQUIRE(fixture.createTestFile(kDefaultFileSize));
+
+  clio::run::PoolId custom_pool_id(9141, 0);
+  clio::run::bdev::Client client(custom_pool_id);
+  bool created = BdevChimodFixture::CreateBdevAsync(
+      client, clio::run::PoolQuery::Broadcast(), fixture.getTestFile(),
+      custom_pool_id, clio::run::bdev::BdevType::kFile);
+  REQUIRE(created);
+
+  auto set_lifespan = client.AsyncSetLifespan(clio::run::PoolQuery::Local(), 3);
+  set_lifespan.Wait();
+  REQUIRE(set_lifespan->GetReturnCode() == 0);
+
+  clio::run::u64 remaining_size = 0;
+  auto stats_task = client.AsyncGetStats();
+  stats_task.Wait();
+  remaining_size = stats_task->remaining_size_;
+
+  REQUIRE(stats_task->predicted_ttl_days_ == 3);
+  REQUIRE(remaining_size > 0);
+
+  HLOG(kInfo, "Injected bdev lifespan: {} days", stats_task->predicted_ttl_days_);
 }
 
 TEST_CASE("bdev_error_conditions", "[bdev][error][edge_cases]") {
@@ -1767,6 +1797,281 @@ TEST_CASE("bdev_parallel_io_operations", "[bdev][parallel][io]") {
     REQUIRE(ops_per_sec > 0);
   }
 }
+
+//==============================================================================
+// ALLOCATOR WAL (PERSISTENT ALLOCATOR STATE) TESTS
+//==============================================================================
+#if 0  // WIP (PR #663): the bdev alloc-log WAL is dormant on dev's rewritten
+       // bdev_runtime (FlushAllocLog handler + persistence not yet ported).
+       // Re-enable these tests once the bdev WAL is wired up.
+//
+// These tests exercise the persistent allocator-state log (WAL). They use a
+// FILE-backed bdev so written data survives a pool destroy, and a SECOND bdev
+// pool pointing at the SAME data file + SAME alloc-log file to simulate
+// recovery. Routed Local() so a single container owns the whole allocator.
+
+namespace {
+
+// Create a file bdev with an explicit alloc-log path. Returns success.
+bool CreateBdevWithLog(clio::run::bdev::Client& client,
+                       const std::string& data_file,
+                       const clio::run::PoolId& pool_id,
+                       const std::string& log_path,
+                       clio::run::u64 total_size = 0) {
+  auto create_task = client.AsyncCreate(
+      clio::run::PoolQuery::Dynamic(), data_file, pool_id,
+      clio::run::bdev::BdevType::kFile, total_size, 32, 4096,
+      /*perf_metrics=*/nullptr, log_path);
+  create_task.Wait();
+  client.pool_id_ = create_task->new_pool_id_;
+  client.return_code_ = create_task->return_code_;
+  return create_task->GetReturnCode() == 0;
+}
+
+// Allocate one block of `size` via Local() routing.
+clio::run::bdev::Block AllocOne(clio::run::bdev::Client& client,
+                                clio::run::u64 size) {
+  auto alloc_task =
+      client.AsyncAllocateBlocks(clio::run::PoolQuery::Local(), size);
+  alloc_task.Wait();
+  REQUIRE(alloc_task->return_code_ == 0);
+  REQUIRE(alloc_task->blocks_.size() > 0);
+  return alloc_task->blocks_[0];
+}
+
+// Deterministically flush the allocator WAL to disk via a one-shot
+// FlushAllocLog task (period 0). The PoolManager-level DestroyPool does not
+// invoke the bdev container's Destroy handler, so we cannot rely on Destroy
+// to persist buffered records — issue an explicit flush before destroying.
+void FlushLog(clio::run::bdev::Client& client) {
+  auto task = client.AsyncFlushAllocLog(clio::run::PoolQuery::Local(), /*period=*/0);
+  task.Wait();
+}
+
+// Whether two [offset,size) ranges overlap.
+bool RangesOverlap(clio::run::u64 a_off, clio::run::u64 a_size, clio::run::u64 b_off,
+                   clio::run::u64 b_size) {
+  return a_off < b_off + b_size && b_off < a_off + a_size;
+}
+
+}  // namespace
+
+TEST_CASE("bdev_alloc_log_recover_no_collision",
+          "[bdev][alloc_log][recover]") {
+  BdevChimodFixture fixture;
+  REQUIRE(g_initialized);
+  REQUIRE(fixture.createTestFile(kLargeFileSize));
+
+  const std::string log_path = fixture.getTestFile() + ".alog";
+  ctp::SystemInfo::RemoveFile(log_path);
+
+  // --- First pool: allocate several blocks, write known data ---
+  std::vector<clio::run::bdev::Block> orig_blocks;
+  std::vector<std::vector<ctp::u8>> orig_data;
+  {
+    clio::run::PoolId pool_id(9100, 0);
+    clio::run::bdev::Client client(pool_id);
+    REQUIRE(CreateBdevWithLog(client, fixture.getTestFile(), pool_id,
+                              log_path));
+
+    for (int i = 0; i < 8; ++i) {
+      clio::run::bdev::Block block = AllocOne(client, k4KB);
+      std::vector<ctp::u8> data = fixture.generateTestData(k4KB, 0x10 + i);
+
+      auto wbuf = CLIO_IPC->AllocateBuffer(data.size());
+      REQUIRE_FALSE(wbuf.IsNull());
+      memcpy(wbuf.ptr_, data.data(), data.size());
+      auto wtask = client.AsyncWrite(
+          clio::run::PoolQuery::Local(), WrapBlock(block),
+          wbuf.shm_.template Cast<void>().template Cast<void>(), data.size());
+      wtask.Wait();
+      REQUIRE(wtask->return_code_ == 0);
+      CLIO_IPC->FreeBuffer(wbuf);
+
+      orig_blocks.push_back(block);
+      orig_data.push_back(std::move(data));
+    }
+
+    // Persist the WAL, then destroy the pool. (PoolManager DestroyPool does
+    // not call the bdev Destroy handler, so flush explicitly.)
+    FlushLog(client);
+    auto destroy_task =
+        CLIO_ADMIN->AsyncDestroyPool(clio::run::PoolQuery::Local(), pool_id);
+    destroy_task.Wait();
+    std::this_thread::sleep_for(200ms);
+  }
+
+  // --- Second pool: same data file + same alloc log => recovery ---
+  {
+    clio::run::PoolId pool_id(9101, 0);
+    clio::run::bdev::Client client(pool_id);
+    REQUIRE(CreateBdevWithLog(client, fixture.getTestFile(), pool_id,
+                              log_path));
+
+    // New allocations must NOT overlap any recovered live block.
+    std::vector<clio::run::bdev::Block> new_blocks;
+    for (int i = 0; i < 8; ++i) {
+      clio::run::bdev::Block nb = AllocOne(client, k4KB);
+      for (const auto& ob : orig_blocks) {
+        REQUIRE_FALSE(RangesOverlap(nb.offset_, nb.size_, ob.offset_,
+                                    ob.size_));
+      }
+      for (const auto& other : new_blocks) {
+        REQUIRE_FALSE(RangesOverlap(nb.offset_, nb.size_, other.offset_,
+                                    other.size_));
+      }
+      new_blocks.push_back(nb);
+    }
+
+    // Earlier blocks' data must still be intact (file backend preserved it).
+    for (size_t i = 0; i < orig_blocks.size(); ++i) {
+      auto rbuf = CLIO_IPC->AllocateBuffer(k4KB);
+      REQUIRE_FALSE(rbuf.IsNull());
+      auto rtask = client.AsyncRead(
+          clio::run::PoolQuery::Local(), WrapBlock(orig_blocks[i]),
+          rbuf.shm_.template Cast<void>().template Cast<void>(), k4KB);
+      rtask.Wait();
+      REQUIRE(rtask->return_code_ == 0);
+      REQUIRE(rtask->bytes_read_ == k4KB);
+      std::vector<ctp::u8> got(rtask->bytes_read_);
+      memcpy(got.data(), rbuf.ptr_, rtask->bytes_read_);
+      REQUIRE(std::equal(orig_data[i].begin(), orig_data[i].end(),
+                         got.begin()));
+      CLIO_IPC->FreeBuffer(rbuf);
+    }
+
+    auto destroy_task =
+        CLIO_ADMIN->AsyncDestroyPool(clio::run::PoolQuery::Local(), pool_id);
+    destroy_task.Wait();
+  }
+
+  ctp::SystemInfo::RemoveFile(log_path);
+}
+
+TEST_CASE("bdev_alloc_log_free_then_recover_reuse",
+          "[bdev][alloc_log][reuse]") {
+  BdevChimodFixture fixture;
+  REQUIRE(g_initialized);
+  REQUIRE(fixture.createTestFile(kLargeFileSize));
+
+  const std::string log_path = fixture.getTestFile() + ".alog";
+  ctp::SystemInfo::RemoveFile(log_path);
+
+  clio::run::bdev::Block a, b, c;
+  {
+    clio::run::PoolId pool_id(9110, 0);
+    clio::run::bdev::Client client(pool_id);
+    REQUIRE(CreateBdevWithLog(client, fixture.getTestFile(), pool_id,
+                              log_path));
+
+    a = AllocOne(client, k64KB);
+    b = AllocOne(client, k64KB);
+    c = AllocOne(client, k64KB);
+    // Distinct, non-overlapping.
+    REQUIRE_FALSE(RangesOverlap(a.offset_, a.size_, b.offset_, b.size_));
+    REQUIRE_FALSE(RangesOverlap(b.offset_, b.size_, c.offset_, c.size_));
+
+    // Free B only.
+    std::vector<clio::run::bdev::Block> free_b{b};
+    auto ftask = client.AsyncFreeBlocks(clio::run::PoolQuery::Local(), free_b);
+    ftask.Wait();
+    REQUIRE(ftask->return_code_ == 0);
+
+    // Persist the WAL (allocs of A/B/C + free of B) before destroying.
+    FlushLog(client);
+    auto destroy_task =
+        CLIO_ADMIN->AsyncDestroyPool(clio::run::PoolQuery::Local(), pool_id);
+    destroy_task.Wait();
+    std::this_thread::sleep_for(200ms);
+  }
+
+  // Recover: B's range must be reusable; A and C must NOT be re-handed-out.
+  {
+    clio::run::PoolId pool_id(9111, 0);
+    clio::run::bdev::Client client(pool_id);
+    REQUIRE(CreateBdevWithLog(client, fixture.getTestFile(), pool_id,
+                              log_path));
+
+    // Next 64KB allocation should land exactly in B's freed gap.
+    clio::run::bdev::Block reuse = AllocOne(client, k64KB);
+    REQUIRE(reuse.offset_ == b.offset_);
+    // It must NOT overlap A or C.
+    REQUIRE_FALSE(RangesOverlap(reuse.offset_, reuse.size_, a.offset_,
+                                a.size_));
+    REQUIRE_FALSE(RangesOverlap(reuse.offset_, reuse.size_, c.offset_,
+                                c.size_));
+
+    // A further allocation must avoid A and C too.
+    clio::run::bdev::Block more = AllocOne(client, k64KB);
+    REQUIRE_FALSE(RangesOverlap(more.offset_, more.size_, a.offset_, a.size_));
+    REQUIRE_FALSE(RangesOverlap(more.offset_, more.size_, c.offset_, c.size_));
+
+    auto destroy_task =
+        CLIO_ADMIN->AsyncDestroyPool(clio::run::PoolQuery::Local(), pool_id);
+    destroy_task.Wait();
+  }
+
+  ctp::SystemInfo::RemoveFile(log_path);
+}
+
+TEST_CASE("bdev_alloc_log_compaction", "[bdev][alloc_log][compact]") {
+  // This test drives the AllocatorLog directly (no runtime) so it can call
+  // Compact() and inspect the on-disk file size deterministically.
+  BdevChimodFixture fixture;
+  const std::string log_path = fixture.getTestFile() + ".alog";
+  ctp::SystemInfo::RemoveFile(log_path);
+
+  const clio::run::u64 rec_size =
+      sizeof(clio::run::bdev::AllocLogRecord);  // 40 bytes
+
+  // --- Build a churny log: many allocs, free most of them ---
+  const int kNumAlloc = 500;
+  const int kNumLive = 50;  // keep first 50, free the rest
+  {
+    clio::run::bdev::AllocatorLog log;
+    REQUIRE(log.Open(log_path, /*recover=*/false));
+    for (int i = 0; i < kNumAlloc; ++i) {
+      log.LogAlloc(0, static_cast<clio::run::u64>(i) * 4096, 4096, 0);
+    }
+    for (int i = kNumLive; i < kNumAlloc; ++i) {
+      log.LogFree(0, static_cast<clio::run::u64>(i) * 4096, 4096, 0);
+    }
+    log.Flush();
+
+    // On disk: kNumAlloc allocs + (kNumAlloc - kNumLive) frees.
+    clio::run::u64 expected_recs = kNumAlloc + (kNumAlloc - kNumLive);
+    REQUIRE(log.file_size() == expected_recs * rec_size);
+    REQUIRE(log.live_block_count() == static_cast<clio::run::u64>(kNumLive));
+
+    // Compact: file should shrink to ~kNumLive alloc records.
+    log.Compact();
+    REQUIRE(log.file_size() == static_cast<clio::run::u64>(kNumLive) * rec_size);
+    REQUIRE(log.records_on_disk() == static_cast<clio::run::u64>(kNumLive));
+  }
+
+  // --- Recovery from the compacted log yields the correct live set ---
+  {
+    clio::run::bdev::AllocatorLog log2;
+    REQUIRE(log2.Open(log_path, /*recover=*/true));
+    const auto& live = log2.live(0);
+    REQUIRE(live.size() == static_cast<size_t>(kNumLive));
+
+    std::set<clio::run::u64> got;
+    for (const auto& lb : live) {
+      got.insert(lb.offset);
+    }
+    for (int i = 0; i < kNumLive; ++i) {
+      REQUIRE(got.count(static_cast<clio::run::u64>(i) * 4096) == 1);
+    }
+    // None of the freed offsets should be present.
+    for (int i = kNumLive; i < kNumAlloc; ++i) {
+      REQUIRE(got.count(static_cast<clio::run::u64>(i) * 4096) == 0);
+    }
+  }
+
+  ctp::SystemInfo::RemoveFile(log_path);
+}
+#endif  // WIP #663: bdev alloc-log WAL tests (dormant feature)
 
 //==============================================================================
 // ManyToOne collective batch + aggregate (#587)

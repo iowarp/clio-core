@@ -44,7 +44,8 @@ endif()
 message(STATUS "Found FUSE3: ${FUSE3_VERSION}")
 
 add_executable(clio_cte_fuse
-    fuse_cte.cc)
+    fuse_cte.cc       # FUSE operation callbacks (unit-tested, coverage-tracked)
+    fuse_cte_main.cc) # process entry / mount glue (coverage-excluded)
 
 target_compile_definitions(clio_cte_fuse PRIVATE
     FUSE_USE_VERSION=35

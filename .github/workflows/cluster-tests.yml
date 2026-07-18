@@ -195,6 +195,17 @@ jobs:
           export HOST_UID="$(id -u)" HOST_GID="$(id -g)"
           ./context-transfer-engine/test/integration/distributed/run_tests.sh
 
+      # Client-crash robustness (#722 / client dies mid-PutBlob): a client in a
+      # SEPARATE container (no shared /dev/shm, so forced onto the network path)
+      # fires PutBlobs then terminates. The daemon must survive, not runaway
+      # re-queue the undeliverable response, and stay responsive to a follow-up
+      # client.
+      - name: CTE client-crash test (daemon + separate-container client, #722)
+        if: ${{ !cancelled() }}
+        run: |
+          export HOST_UID="$(id -u)" HOST_GID="$(id -g)"
+          ./context-transfer-engine/test/integration/client_crash/run_tests.sh
+
       # CTE filesystem (CFS) cross-node correctness (#685): a file created via the
       # CFS client on node 1 must be readable, byte-identical, via the CFS client
       # on node 2. Fails hard if the CFS namespace is node-local (the pre-#685
@@ -228,6 +239,7 @@ jobs:
             context-runtime/test/integration/recovery/docker-compose.yml \
             context-transfer-engine/test/integration/distributed/docker-compose.yaml \
             context-transfer-engine/test/integration/cfs_distributed/docker-compose.yaml \
+            context-transfer-engine/test/integration/client_crash/docker-compose.yaml \
             context-transfer-engine/test/integration/fuse/docker-compose.yaml ; do
             docker compose -f "$f" down -v 2>/dev/null || true
           done

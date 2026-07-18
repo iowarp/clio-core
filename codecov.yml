@@ -50,3 +50,8 @@ ignore:
   - "**/benchmark/**"
   - "**/globus_file_assimilator.cc"
   - "**/local_sched.cc"
+  # FUSE process-entry / mount glue: fuse_main + the apptainer --fusemount
+  # fd-injection path. Not unit-testable (blocks in the FUSE event loop / needs
+  # a real kernel mount); the operation callbacks it dispatches to live in
+  # fuse_cte.cc and are covered by test_fuse_ops.
+  - "**/fuse_cte_main.cc"

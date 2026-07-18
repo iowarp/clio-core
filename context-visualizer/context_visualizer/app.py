@@ -17,6 +17,7 @@ def create_app():
     from .api.system import bp as system_bp
     from .api.topology import bp as topology_bp
     from .api.node import bp as node_bp
+    from .api.safe_bdev import bp as safe_bdev_bp
 
     app.register_blueprint(workers_bp, url_prefix="/api")
     app.register_blueprint(pools_bp, url_prefix="/api")
@@ -24,6 +25,7 @@ def create_app():
     app.register_blueprint(system_bp, url_prefix="/api")
     app.register_blueprint(topology_bp, url_prefix="/api")
     app.register_blueprint(node_bp, url_prefix="/api")
+    app.register_blueprint(safe_bdev_bp, url_prefix="/api")
 
     # Template routes
     @app.route("/")
@@ -41,6 +43,10 @@ def create_app():
     @app.route("/node/<int:node_id>")
     def node(node_id):
         return render_template("node.html", node_id=node_id)
+
+    @app.route("/safe_bdev")
+    def safe_bdev():
+        return render_template("safe_bdev.html")
 
     # Clean shutdown
     atexit.register(clio_client.finalize)

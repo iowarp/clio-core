@@ -91,4 +91,38 @@ NB_MODULE(clio_runtime_ext, m) {
   }, "pool_query"_a, "grace_period_ms"_a = 5000,
      "Send stop-runtime command to a node. Fire-and-forget.");
 
+  // ---- Safe-bdev member management (dashboard controls) -------------------
+  m.def("safe_bdev_remove_bdev",
+        [](const std::string& safe_pool_id, const std::string& target_pool_id,
+           uint32_t was_faulty) -> uint32_t {
+          nb::gil_scoped_release release;
+          return py_safe_bdev_remove_bdev(safe_pool_id, target_pool_id,
+                                          was_faulty);
+        },
+        "safe_pool_id"_a, "target_pool_id"_a, "was_faulty"_a = 1,
+        "Remove a member from a safe_bdev. Returns task return code.");
+
+  m.def("safe_bdev_add_bdev",
+        [](const std::string& safe_pool_id, const std::string& member_path,
+           const std::string& capacity, uint32_t node_id,
+           uint32_t as_parity) -> std::string {
+          nb::gil_scoped_release release;
+          return py_safe_bdev_add_bdev(safe_pool_id, member_path, capacity,
+                                       node_id, as_parity);
+        },
+        "safe_pool_id"_a, "member_path"_a, "capacity"_a = "256MB",
+        "node_id"_a = 0, "as_parity"_a = 0,
+        "Compose a fresh bdev and add it to a safe_bdev. Returns new pool id.");
+
+  m.def("safe_bdev_replace_bdev",
+        [](const std::string& safe_pool_id, const std::string& failed_pool_id,
+           const std::string& member_path, const std::string& capacity,
+           uint32_t node_id) -> std::string {
+          nb::gil_scoped_release release;
+          return py_safe_bdev_replace_bdev(safe_pool_id, failed_pool_id,
+                                           member_path, capacity, node_id);
+        },
+        "safe_pool_id"_a, "failed_pool_id"_a, "member_path"_a,
+        "capacity"_a = "256MB", "node_id"_a = 0,
+        "Replace a failed member and auto-recover onto it. Returns new pool id.");
 }

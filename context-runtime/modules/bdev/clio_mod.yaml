@@ -21,3 +21,5 @@ kWrite: 12              # Write data with libaio
 kRead: 13               # Read data with libaio
 kGetStats: 14           # Get performance statistics
 kUpdate: 15             # Update GPU container with device pointers
+kSetLifespan: 16        # Inject predicted device lifespan in days
+kFlushAllocLog: 17      # Flush/compact the persistent allocator-state WAL

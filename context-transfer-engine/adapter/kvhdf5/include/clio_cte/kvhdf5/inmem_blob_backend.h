@@ -41,6 +41,8 @@ public:
     [[nodiscard]] size_t ChunkCount() const { return blobs_.size(); }
 };
 
+#if defined(__cpp_concepts) && __cpp_concepts >= 201907L
 static_assert(BlobBackend<InMemBlobBackend>);
+#endif
 
 }  // namespace kvhdf5

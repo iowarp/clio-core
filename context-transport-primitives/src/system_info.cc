@@ -89,9 +89,11 @@
 #include <sys/socket.h>
 // LINUX
 #include <fcntl.h>
+#include <spawn.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #if __linux__
 #include <sys/sysinfo.h>
 #else
@@ -118,6 +120,14 @@
 #else
 #error \
     "Must define either CTP_ENABLE_PROCFS_SYSINFO or CTP_ENABLE_WINDOWS_SYSINFO"
+#endif
+
+#if CTP_ENABLE_PROCFS_SYSINFO
+// The process environment for posix_spawn. glibc only declares `environ` in
+// <unistd.h> under _GNU_SOURCE/_DEFAULT_SOURCE, so declare it here at GLOBAL
+// scope (declaring it inside namespace ctp would bind to a non-existent
+// ctp::environ).
+extern "C" char **environ;
 #endif
 
 namespace ctp {
@@ -787,6 +797,136 @@ void SystemInfo::TerminateProcessNow(int exit_code) {
   // Fallback in case TerminateProcess somehow returns (it shouldn't).
   ::_exit(exit_code);
 #endif
+}
+
+SpawnedProcess SystemInfo::SpawnProcess(const std::string &exe,
+                                        const std::vector<std::string> &args,
+                                        const std::string &log_path,
+                                        bool detached) {
+  SpawnedProcess proc;
+#if CTP_ENABLE_PROCFS_SYSINFO
+  posix_spawn_file_actions_t actions;
+  posix_spawn_file_actions_init(&actions);
+  // Redirect stdout(1) to the log file, then dup stderr(2) onto it.
+  posix_spawn_file_actions_addopen(&actions, 1, log_path.c_str(),
+                                   O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  posix_spawn_file_actions_adddup2(&actions, 1, 2);
+  posix_spawnattr_t attr;
+  posix_spawnattr_t *attrp = nullptr;
+#ifdef POSIX_SPAWN_SETSID
+  if (detached) {
+    // New session => no controlling terminal, mirroring Windows DETACHED_PROCESS.
+    posix_spawnattr_init(&attr);
+    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSID);
+    attrp = &attr;
+  }
+#else
+  (void)detached;
+#endif
+  std::vector<char *> argv;
+  argv.push_back(const_cast<char *>(exe.c_str()));
+  for (const auto &a : args) argv.push_back(const_cast<char *>(a.c_str()));
+  argv.push_back(nullptr);
+  pid_t pid = -1;
+  int rc =
+      posix_spawn(&pid, exe.c_str(), &actions, attrp, argv.data(), environ);
+  posix_spawn_file_actions_destroy(&actions);
+  if (attrp != nullptr) posix_spawnattr_destroy(attrp);
+  if (rc == 0) {
+    proc.pid = static_cast<int>(pid);
+    proc.valid = true;
+  }
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  std::string cmd = "\"" + exe + "\"";
+  for (const auto &a : args) cmd += " " + a;
+  STARTUPINFOA si;
+  ZeroMemory(&si, sizeof(si));
+  si.cb = sizeof(si);
+  SECURITY_ATTRIBUTES sa;
+  sa.nLength = sizeof(sa);
+  sa.lpSecurityDescriptor = nullptr;
+  sa.bInheritHandle = TRUE;
+  HANDLE hlog = CreateFileA(log_path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, &sa,
+                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (hlog != INVALID_HANDLE_VALUE) {
+    si.dwFlags |= STARTF_USESTDHANDLES;
+    si.hStdOutput = hlog;
+    si.hStdError = hlog;
+    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+  }
+  PROCESS_INFORMATION pi;
+  ZeroMemory(&pi, sizeof(pi));
+  std::vector<char> mutable_cmd(cmd.begin(), cmd.end());
+  mutable_cmd.push_back('\0');
+  // #721: DETACHED_PROCESS gives the child no console; CREATE_NEW_PROCESS_GROUP
+  // detaches it from the parent's Ctrl-C group. This is the flag combination
+  // under which libzmq's ROUTER failed WSAStartup and went silently dead.
+  DWORD flags = detached ? (DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP) : 0;
+  BOOL ok = CreateProcessA(nullptr, mutable_cmd.data(), nullptr, nullptr, TRUE,
+                           flags, nullptr, nullptr, &si, &pi);
+  if (hlog != INVALID_HANDLE_VALUE) CloseHandle(hlog);
+  if (ok) {
+    proc.pid = static_cast<int>(pi.dwProcessId);
+    proc.win_process = reinterpret_cast<uint64_t>(pi.hProcess);
+    proc.win_thread = reinterpret_cast<uint64_t>(pi.hThread);
+    proc.valid = true;
+  }
+#endif
+  return proc;
+}
+
+bool SystemInfo::IsChildRunning(const SpawnedProcess &proc) {
+  if (!proc.valid) return false;
+#if CTP_ENABLE_PROCFS_SYSINFO
+  if (proc.pid <= 0) return false;
+  int status;
+  // 0 => still running; >0 => exited (and now reaped); -1 => already reaped.
+  return waitpid(proc.pid, &status, WNOHANG) == 0;
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  HANDLE h = reinterpret_cast<HANDLE>(proc.win_process);
+  if (h == NULL) return false;
+  DWORD code = 0;
+  if (!GetExitCodeProcess(h, &code)) return false;
+  return code == STILL_ACTIVE;
+#endif
+}
+
+void SystemInfo::TerminateChild(SpawnedProcess &proc, int grace_ms) {
+  if (!proc.valid) return;
+#if CTP_ENABLE_PROCFS_SYSINFO
+  if (proc.pid > 0) {
+    int status;
+    // If a prior IsChildRunning() already reaped it (or it exits right now),
+    // don't send a signal to a possibly-recycled pid.
+    pid_t r = waitpid(proc.pid, &status, WNOHANG);
+    if (r == 0) {  // still running: graceful SIGTERM, then SIGKILL
+      kill(proc.pid, SIGTERM);
+      bool reaped = false;
+      for (int i = 0; i < grace_ms / 100; ++i) {
+        if (waitpid(proc.pid, &status, WNOHANG) != 0) { reaped = true; break; }
+        struct timespec ts = {0, 100 * 1000 * 1000};  // 100 ms
+        nanosleep(&ts, nullptr);
+      }
+      if (!reaped) {
+        kill(proc.pid, SIGKILL);
+        waitpid(proc.pid, &status, 0);
+      }
+    }
+  }
+  proc.pid = -1;
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  HANDLE hp = reinterpret_cast<HANDLE>(proc.win_process);
+  HANDLE ht = reinterpret_cast<HANDLE>(proc.win_thread);
+  if (hp != NULL) {
+    ::TerminateProcess(hp, 0);
+    WaitForSingleObject(hp, static_cast<DWORD>(grace_ms));
+    CloseHandle(hp);
+  }
+  if (ht != NULL) CloseHandle(ht);
+  proc.win_process = 0;
+  proc.win_thread = 0;
+#endif
+  proc.valid = false;
 }
 
 #if CTP_ENABLE_WINDOWS_SYSINFO

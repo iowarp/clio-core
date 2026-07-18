@@ -78,6 +78,12 @@ jobs:
             # making filesystem_client/runtime/tasks read 0% on Codecov even
             # though the fuse phase runs them.
             extract: "*/context-transfer-engine/adapter/* */context-transfer-engine/filesystem/*"
+            # CDash coverage headline is scoped to the FUSE adapter (== the
+            # codecov "fuse" component), so the phase build reports the adapter
+            # at ~97% instead of a whole-repo number diluted by the runtime/CTE
+            # core that the fuse-only test selection doesn't exercise. The
+            # filesystem tree still reaches Codecov via the broader `extract`.
+            cdash_scope: "context-transfer-engine/adapter"
           # Context Assimilation Engine
           - phase: cae
             arch: amd64
@@ -147,6 +153,10 @@ jobs:
           PHASE_CTEST_INCLUDE_LABELS: ${{ matrix.labels }}
           PHASE_CTEST_EXCLUDE_LABELS: ${{ matrix.exclude_labels }}
           PHASE_EXTRACT_PATHS: ${{ matrix.extract }}
+          # Scope the CDash coverage submission (ctest_coverage has no include
+          # filter, so the script excludes every other component). Unset phases
+          # keep whole-build CDash coverage.
+          PHASE_CDASH_KEEP: ${{ matrix.cdash_scope }}
           PKG_CONFIG_PATH: ${{ matrix.pkgconfig }}
         run: |
           if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then

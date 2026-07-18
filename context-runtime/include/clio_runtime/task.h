@@ -856,6 +856,14 @@ class RunContext {
   char response_identity_[64];     /**< ZMQ echo-back identity (fallback path) */
   u32 response_identity_len_;
   int response_fd_;                /**< Socket fd for routing response (IPC) */
+  /** #722 bounded-drop of an undeliverable client response. When SendOut's
+   *  network Send keeps failing (a client that submitted over TCP/IPC then
+   *  disconnected), these bound the re-queue: after kMaxClientResponseRetries
+   *  attempts OR kClientResponseRetryDropSec seconds the response is dropped
+   *  (task freed via RAII) instead of re-queued forever. Non-serialized;
+   *  meaningful only on the server's outbound response future. */
+  u32 send_fail_count_;            /**< Consecutive response-Send failures */
+  ctp::Timepoint first_send_fail_; /**< Time of the first failure (for timeout) */
   ctp::abitfield32_t gpu_flags_;   /**< GPU device-completion bit (gpu2gpu) */
   uintptr_t gpu_task_device_ptr_;  /**< Device addr of the task POD (kDeviceMem) */
   u32 gpu_task_size_;              /**< sizeof(TaskT) for the H2D writeback */
@@ -908,6 +916,7 @@ class RunContext {
         response_transport_(nullptr),
         response_identity_len_(0),
         response_fd_(-1),
+        send_fail_count_(0),
         gpu_task_device_ptr_(0),
         gpu_task_size_(0),
         is_notified_(false),

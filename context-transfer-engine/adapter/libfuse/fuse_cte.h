@@ -468,4 +468,12 @@ static inline std::string RegexEscape(const std::string &s) {
 
 }  // namespace clio::cae::fuse
 
+#ifdef CLIO_CTE_FUSE_ENABLED
+// The FUSE operation table lives in fuse_cte.cc (defined at global scope, next
+// to the callbacks it points at). fuse_cte_main.cc — the process-entry / mount
+// glue — references it, so it is declared here with external linkage. Only the
+// FUSE builds (which include <fuse3/fuse.h> above) see this declaration.
+extern const struct fuse_operations cte_fuse_ops;
+#endif  // CLIO_CTE_FUSE_ENABLED
+
 #endif  // CLIO_CTE_ADAPTER_LIBFUSE_FUSE_CTE_H_

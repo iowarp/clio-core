@@ -342,6 +342,32 @@ set_target_properties(${EXTERNAL_CLIENT_TEST_TARGET} PROPERTIES
 )
 endif()
 
+# #721 console-less (detached) daemon spawn. Verifies the daemon's transport
+# initializes and stays serviceable when spawned WITHOUT a controlling console
+# (the Windows WSAStartup regression the daemon originally hit). CROSS-PLATFORM:
+# the process spawn/wait/kill now live in ctp::SystemInfo, so runtime_server.h no
+# longer pulls <windows.h> and this test builds on Windows too (it uses no
+# fork()). On Windows it spawns with DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
+# on POSIX with POSIX_SPAWN_SETSID.
+add_executable(clio_run_detached_spawn_tests test_daemon_detached_spawn.cc)
+target_include_directories(clio_run_detached_spawn_tests PRIVATE
+  ${CLIO_RUN_ROOT}/include
+  ${CLIO_RUN_ROOT}/test  # For simple_test.h / runtime_server.h
+)
+target_link_libraries(clio_run_detached_spawn_tests
+  clio_run_cxx
+  ctp::cxx
+  ${CMAKE_THREAD_LIBS_INIT}
+)
+add_dependencies(clio_run_detached_spawn_tests clio_run)
+target_compile_definitions(clio_run_detached_spawn_tests PRIVATE
+  CLIO_RUN_EXE="$<TARGET_FILE:clio_run>")
+set_target_properties(clio_run_detached_spawn_tests PROPERTIES
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED ON
+  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+
 # Create Runtime Cleanup test executable
 add_executable(${RUNTIME_CLEANUP_TEST_TARGET} ${RUNTIME_CLEANUP_TEST_SOURCES})
 
@@ -836,6 +862,22 @@ if(CLIO_CORE_ENABLE_TESTS)
   )
   endif()
 
+  # #721: console-less daemon spawn stays serviceable. Cross-platform (registered
+  # outside the NOT WIN32 block above): the SystemInfo spawn refactor lets it run
+  # on Windows CI, where the WSAStartup regression actually lived. Spawns its own
+  # daemon on port 10615 — serialize with the other live-runtime tests.
+  add_test(
+    NAME cr_detached_spawn
+    COMMAND clio_run_detached_spawn_tests
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_detached_spawn PROPERTIES
+    ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10615"
+    RESOURCE_LOCK "clio_runtime_port"
+    TIMEOUT 120
+    LABELS "runtime;transport;detached"
+  )
+
   # Runtime Cleanup Tests
   add_test(
     NAME cr_runtime_cleanup_tests
@@ -1006,6 +1048,7 @@ if(CLIO_CORE_ENABLE_TESTS)
       cr_external_client_multiple_clients
       cr_external_client_without_server
       cr_external_client_operations
+      cr_detached_spawn
       cr_client_retry_server_restart_tcp
       cr_client_retry_server_restart_ipc
       cr_client_retry_server_restart_shm

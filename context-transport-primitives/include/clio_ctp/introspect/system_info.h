@@ -108,6 +108,19 @@ struct CpuTimes {
   uint64_t Total() const { return TotalActive() + idle + iowait; }
 };
 
+/** Handle to a child process spawned by SystemInfo::SpawnProcess. Deliberately
+ *  platform-opaque so this header pulls in NO OS headers (the project keeps
+ *  <windows.h> / <winsock2.h> out of shared headers to avoid macro pollution and
+ *  the Winsock1/Winsock2 clash — see issue #476): on Windows win_process /
+ *  win_thread hold the process/thread HANDLEs as integers; on POSIX `pid` is the
+ *  child pid. Hold one and pass it by reference to IsChildRunning/TerminateChild. */
+struct SpawnedProcess {
+  int pid = -1;
+  uint64_t win_process = 0;
+  uint64_t win_thread = 0;
+  bool valid = false;
+};
+
 /** A unification of certain OS system calls */
 class SystemInfo {
  public:
@@ -268,6 +281,29 @@ class SystemInfo {
    *  marked [[noreturn]] — its no-op behaviour on Linux means it can
    *  fall through. */
   CTP_DLL static void TerminateProcessNow(int exit_code);
+
+  /** Spawn `exe` as a child process with arguments `args` (which do NOT include
+   *  argv[0] — `exe` is prepended). The child's stdout AND stderr are redirected
+   *  (truncated) to `log_path`. When `detached` is true the child is spawned with
+   *  NO controlling console/terminal (Windows: DETACHED_PROCESS |
+   *  CREATE_NEW_PROCESS_GROUP; POSIX: POSIX_SPAWN_SETSID) — the console-less spawn
+   *  from issue #721. Returns a handle whose `valid` is false on failure.
+   *  Cross-platform so callers (e.g. the test RuntimeServer) need no OS headers. */
+  CTP_DLL static SpawnedProcess SpawnProcess(const std::string &exe,
+                                             const std::vector<std::string> &args,
+                                             const std::string &log_path,
+                                             bool detached = false);
+
+  /** True while a child spawned by SpawnProcess is still running. On POSIX this
+   *  reaps the child if it has exited (so the caller sees it stop); TerminateChild
+   *  tolerates an already-reaped child. */
+  CTP_DLL static bool IsChildRunning(const SpawnedProcess &proc);
+
+  /** Stop and reap a child spawned by SpawnProcess. POSIX: SIGTERM, wait up to
+   *  `grace_ms`, then SIGKILL — so the child runs its graceful shutdown / atexit
+   *  handlers (e.g. the daemon's ServerFinalize leak report) before being forced.
+   *  Windows: TerminateProcess. Idempotent; marks `proc` invalid. */
+  CTP_DLL static void TerminateChild(SpawnedProcess &proc, int grace_ms = 5000);
 
   /** Sleep for `us` microseconds at the platform's best available precision.
    *  Windows uses a one-shot high-resolution waitable timer

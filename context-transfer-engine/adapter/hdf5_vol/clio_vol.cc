@@ -143,6 +143,11 @@ static void drain_dataset_puts(clio_dataset_t *dset) {
 struct clio_wrap_ctx_t {
   hid_t under_vol_id;
   void *under_wrap_ctx;
+  /* The clio_file_t the wrapped-over container belongs to, so datasets
+     re-wrapped during H5Literate/H5Ovisit iteration inherit their file (and
+     thus its CLIO_VOL_TRACE FileTrace). Without it, iterated datasets get a
+     null file and their reads/writes go untraced. */
+  clio_file_t *parent_file;
 };
 
 /* ========================================================================
@@ -201,6 +206,7 @@ static herr_t clio_get_wrap_ctx(const void *obj, void **wrap_ctx) {
   ctx->under_vol_id = o->under_vol_id;
   H5Iinc_ref(ctx->under_vol_id);
   ctx->under_wrap_ctx = nullptr;
+  ctx->parent_file = o->parent_file;
   H5VLget_wrap_ctx(o->under_object, o->under_vol_id, &ctx->under_wrap_ctx);
   *wrap_ctx = ctx;
   return 0;
@@ -219,17 +225,20 @@ static void *clio_wrap_object(void *under_obj, H5I_type_t obj_type,
                                 under_wrap_ctx);
   if (!under) return nullptr;
 
-  /* parent_file is unknown during iteration, so everything wrapped here falls
-     back to the native VOL (correct, just uncached). A wrapped *dataset* must
-     still be a full clio_dataset_t (non-cacheable), or a later
-     dataset_read/close would mis-cast it. */
+  /* The stable dataset *path* is still unknown during iteration, so wrapped
+     datasets stay non-cacheable (make_dataset_wrapper keys cacheability on a
+     non-empty path) and their transfers fall back to the native VOL. But the
+     parent file IS known via the wrap context, so thread it through: a wrapped
+     dataset then inherits file->trace and its reads/writes are recorded by
+     CLIO_VOL_TRACE (previously they were silently dropped). */
+  clio_file_t *parent_file = ctx ? ctx->parent_file : nullptr;
   if (obj_type == H5I_DATASET) {
-    return make_dataset_wrapper(under, under_vol_id, nullptr, nullptr);
+    return make_dataset_wrapper(under, under_vol_id, parent_file, nullptr);
   }
   auto *o = new clio_obj_t;
   o->under_object = under;
   o->under_vol_id = under_vol_id;
-  o->parent_file = nullptr;
+  o->parent_file = parent_file;
   return o;
 }
 
@@ -489,6 +498,94 @@ static bool clio_type_is_cacheable(hid_t type_id) {
     default:           /* compound, array, vlen, reference, opaque, time */
       return false;
   }
+}
+
+/**
+ * Recursively true when a datatype is a fixed-size, self-contained POD image —
+ * no embedded pointers — so its in-memory transfer buffer can be byte-copied
+ * into / out of the linear CTE cache. Extends clio_type_is_cacheable to fixed
+ * COMPOUND types (whose members are themselves flat), which the READ cache can
+ * safely mirror: on a miss we cache exactly what the native VOL produced and
+ * serve those same bytes on a hit, so no divergence is possible.
+ * Excluded (return false):
+ *   - vlen sequences, variable-length strings, object/region references — the
+ *     buffer holds POINTERS, so a raw copy caches addresses, not content.
+ *   - ARRAY datatypes — their element image round-trips incorrectly through the
+ *     byte cache (the VOL compat suite's array_dtype roundtrip regressed), so
+ *     they stay on the native path with the atomic/compound scalars below. Also
+ *     excludes any compound with a nested array member (recursion returns false).
+ *
+ * NOTE: read-only. The write path keeps clio_type_is_cacheable (atomic-only),
+ * because a *written* compound buffer can differ from the element image HDF5
+ * actually persists (member padding), which would let a cached read return
+ * bytes native never wrote.
+ */
+static bool clio_type_is_read_cacheable(hid_t t) {
+  if (t < 0) return false;
+  switch (H5Tget_class(t)) {
+    case H5T_INTEGER:
+    case H5T_FLOAT:
+    case H5T_ENUM:
+    case H5T_BITFIELD:
+    case H5T_OPAQUE:
+    case H5T_TIME:
+      return true;
+    case H5T_STRING:
+      return H5Tis_variable_str(t) <= 0;  /* fixed-length only */
+    case H5T_COMPOUND: {
+      int n = H5Tget_nmembers(t);
+      if (n < 0) return false;
+      for (int i = 0; i < n; ++i) {
+        hid_t m = H5Tget_member_type(t, i);
+        bool ok = clio_type_is_read_cacheable(m);
+        if (m >= 0) H5Tclose(m);
+        if (!ok) return false;
+      }
+      return true;
+    }
+    default:  /* H5T_ARRAY, H5T_VLEN, H5T_REFERENCE, ... — unsafe to byte-cache */
+      return false;
+  }
+}
+
+/**
+ * True when a dataspace selection is the ENTIRE extent in natural, contiguous
+ * order — i.e. equivalent to a whole read for linear-cache purposes. Accepts
+ * H5S_ALL, H5S_SEL_ALL, and a single regular hyperslab that starts at the origin
+ * and covers every dimension with unit stride (start=0, stride=block,
+ * count*block=dims). This is what h5dump / H5Dread of a full dataset issue —
+ * often as a full hyperslab rather than H5S_ALL — so treating it as whole lets
+ * those reads populate and be served from the CTE tier instead of falling into
+ * the serve-only partial path (which never stages).
+ */
+static bool clio_space_is_natural_full(hid_t s) {
+  if (s == H5S_ALL) return true;
+  int rank = H5Sget_simple_extent_ndims(s);
+  if (rank < 0) return false;
+  hssize_t sel = H5Sget_select_npoints(s);
+  hssize_t ext = H5Sget_simple_extent_npoints(s);
+  if (sel <= 0 || sel != ext) return false;
+  H5S_sel_type st = H5Sget_select_type(s);
+  if (st == H5S_SEL_ALL) return true;
+  if (st != H5S_SEL_HYPERSLABS) return false;
+  if (H5Sis_regular_hyperslab(s) <= 0) return false;
+  hsize_t start[H5S_MAX_RANK], stride[H5S_MAX_RANK], cnt[H5S_MAX_RANK],
+      blk[H5S_MAX_RANK], dims[H5S_MAX_RANK];
+  if (H5Sget_regular_hyperslab(s, start, stride, cnt, blk) < 0) return false;
+  if (H5Sget_simple_extent_dims(s, dims, nullptr) < 0) return false;
+  for (int i = 0; i < rank; ++i) {
+    if (start[i] != 0) return false;
+    if (stride[i] != blk[i]) return false;      /* contiguous, no gaps */
+    if (cnt[i] * blk[i] != dims[i]) return false; /* covers the full extent */
+  }
+  return true;
+}
+
+/** Read counterpart to clio_is_whole_read that also accepts a full-extent
+ *  selection (see clio_space_is_natural_full). */
+static bool clio_read_is_whole(hid_t mem_space_id, hid_t file_space_id) {
+  return clio_space_is_natural_full(mem_space_id) &&
+         clio_space_is_natural_full(file_space_id);
 }
 
 static void *clio_dataset_create(void *obj,
@@ -898,7 +995,7 @@ static herr_t clio_dataset_read(size_t count, void *dset[],
     /* Native passthrough when there is no file reference, the type is not flat,
        or the read is collective. The native VOL always produces correct data. */
     bool cacheable_flat = dataset->file && dataset->cacheable &&
-                          clio_type_is_cacheable(mem_type_id[d]) &&
+                          clio_type_is_read_cacheable(mem_type_id[d]) &&
                           !clio_is_collective(dxpl_id);
     if (!cacheable_flat) {
       H5VLdataset_read(1, &dataset->obj.under_object,
@@ -913,10 +1010,11 @@ static herr_t clio_dataset_read(size_t count, void *dset[],
       continue;
     }
 
-    /* Partial (hyperslab/point) selection → serve from the CTE tier when the
+    /* Partial (non-full-extent) selection → serve from the CTE tier when the
        linear cache is already populated (serve-only). On a miss, fall back to
-       native (unchanged). */
-    if (!clio_is_whole_read(mem_space_id[d], file_space_id[d])) {
+       native (unchanged). A full-extent selection (incl. a full hyperslab, as
+       h5dump issues) is treated as whole so it populates/serves via CTE. */
+    if (!clio_read_is_whole(mem_space_id[d], file_space_id[d])) {
       bool served = clio_serve_selection(dataset, mem_type_id[d],
                                            mem_space_id[d], file_space_id[d],
                                            dxpl_id, buf[d]);

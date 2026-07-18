@@ -144,6 +144,7 @@ RUN set -eux; \
       -DCMAKE_CUDA_FLAGS="--cuda-path=${CUDA_HOME} -Wno-unknown-cuda-version" \
       -DNDZIP_WITH_CUDA=ON \
       -DNDZIP_WITH_MT=OFF \
+      -DHIPSYCL_TARGETS="omp" \
       -DNDZIP_BUILD_BENCHMARK=OFF \
       -DNDZIP_BUILD_TEST=OFF \
       -DCMAKE_POLICY_VERSION_MINIMUM=3.5; \

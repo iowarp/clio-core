@@ -223,7 +223,10 @@ class Logger {
 #if CTP_IS_HOST && !CTP_IS_DEVICE_PASS
     std::string msg = ctp::Formatter::format(fmt, std::forward<Args>(args)...);
     std::string out = ctp::Formatter::format("{}\n", msg);
-    std::cout << out;
+    // Logs go to stderr, never stdout: stdout is reserved for a program's actual
+    // data output (e.g. h5dump through the CTE VOL connector), which log lines
+    // would otherwise corrupt.
+    std::cerr << out;
     if (fout_) {
       fwrite(out.data(), 1, out.size(), fout_);
     }
@@ -248,15 +251,11 @@ class Logger {
         "{}{}:{} {} {} {} {}{}\n",
         color, path, line, level, tid, func, msg, reset);
 
-    // Route to appropriate output stream
-    // Debug, Info, and Success go to stdout; Warning/Error/Fatal go to stderr
-    if (LOG_CODE <= kSuccess) {
-      std::cout << out;
-      fflush(stdout);
-    } else {
-      std::cerr << out;
-      fflush(stderr);
-    }
+    // All log levels go to stderr. stdout is reserved for a program's actual
+    // data output — e.g. h5dump reading through the CTE HDF5 VOL connector emits
+    // the dumped dataset on stdout, and any log line written there corrupts it.
+    std::cerr << out;
+    fflush(stderr);
 
     // Write to file without color codes
     if (fout_) {

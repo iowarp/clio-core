@@ -120,6 +120,7 @@ void PrintRuntimeRestartUsage() {
 
 int RuntimeStart(int argc, char* argv[]) {
   bool induct = false;
+  bool ephemeral = false;
   for (int i = 0; i < argc; ++i) {
     if (std::strcmp(argv[i], "--induct") == 0) {
       induct = true;

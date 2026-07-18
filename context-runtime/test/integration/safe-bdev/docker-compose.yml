@@ -1,0 +1,40 @@
+# Safe-BDev interactive integration test.
+# Single-node container running: clio runtime + safe-bdev + CTE + clio-fs (FUSE)
+# + context-visualizer dashboard (:5000).
+#
+# Usage:  ./run_tests.sh            # interactive (dashboard stays up)
+#         MODE=smoke ./run_tests.sh # automated CI smoke check
+#
+# Requirements: Docker with --cap-add SYS_ADMIN + /dev/fuse; a build with
+# -DCLIO_CTE_ENABLE_FUSE_ADAPTER=ON; a container image carrying fuse3 + flask.
+
+services:
+  safe-bdev-test:
+    image: ${IOWARP_DOCKER_IMAGE:-iowarp/cte-xfstests:latest}
+    security_opt:
+      - seccomp:unconfined
+      - apparmor:unconfined      # host AppArmor denies mount(2) even with CAP_SYS_ADMIN
+    cap_add:
+      - SYS_ADMIN
+    devices:
+      - /dev/fuse
+    container_name: safe-bdev-test
+    hostname: iowarp-safebdev
+    ports:
+      - "5000:5000"              # context-visualizer dashboard
+    volumes:
+      - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-/workspace}}:/workspace:rw
+    tmpfs:
+      - /tmp:mode=1777
+      - /mnt:mode=1777           # 256 MB file bdevs live here
+    environment:
+      - MODE=${MODE:-interactive}
+      - CLIO_SERVER_CONF=/workspace/context-runtime/test/integration/safe-bdev/clio_conf.yaml
+      - CLIO_BIND_ADDR=127.0.0.1
+      - PATH=/workspace/build/bin:/usr/local/bin:/usr/bin:/bin
+      - LD_LIBRARY_PATH=/workspace/build/bin
+    mem_limit: 6g
+    working_dir: /workspace
+    entrypoint:
+      - /bin/bash
+      - /workspace/context-runtime/test/integration/safe-bdev/node_entrypoint.sh

@@ -1181,6 +1181,10 @@ if(NOT CLIO_CORE_MSVC_LIKE)
                             $<$<NOT:$<COMPILE_LANGUAGE:CUDA>>:-fprofile-arcs>
                             $<$<NOT:$<COMPILE_LANGUAGE:CUDA>>:-ftest-coverage>)
         add_link_options(--coverage)
+        # Lets tests that must exit via _exit() (skipping a crash-prone global
+        # teardown) still flush gcov counters explicitly via __gcov_dump(); the
+        # symbol only exists in coverage builds, so it is gated on this define.
+        add_compile_definitions(CLIO_COVERAGE_ENABLED)
     endif()
 else()
     # MSVC compiler flags
@@ -1247,6 +1251,17 @@ endforeach()
 if(CLIO_CORE_ENABLE_TESTS)
     enable_testing()
     include(CTest)
+
+    # CTest coverage exclusions (honoured by ctest_coverage(), which drives the
+    # CDash coverage submission — unlike lcov it has no per-line exclusion, so
+    # untestable whole files are dropped here by filename regex). Keep this in
+    # sync with the lcov --remove list in CI/calculate_coverage.sh and the
+    # codecov.yml ignore list.
+    #   * fuse_cte_main.cc — FUSE process entry / mount glue (fuse_main + the
+    #     apptainer --fusemount fd-injection path); not unit-testable.
+    file(WRITE "${CMAKE_BINARY_DIR}/CTestCustom.cmake"
+         "set(CTEST_CUSTOM_COVERAGE_EXCLUDE \${CTEST_CUSTOM_COVERAGE_EXCLUDE}\n"
+         "    \".*/fuse_cte_main\\\\.cc\")\n")
 
     # -----------------------------------------------------------------------
     # Test cleanup fixture (pre + post)

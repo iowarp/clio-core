@@ -15,7 +15,7 @@ if(CLIO_CORE_ENABLE_ELF AND CLIO_CTE_ENABLE_MPIIO_ADAPTER AND CLIO_CORE_ENABLE_M
 endif()
 
 # HDF5 VFD smoke test (requires the VFD target, which requires HDF5 >= 1.14).
-if(CLIO_CTE_ENABLE_VFD AND TARGET clio_cte_hdf5_vfd)
+if(CLIO_CTE_ENABLE_VFD AND TARGET clio_vfd)
     add_subdirectory(vfd)
 endif()
 

@@ -1,0 +1,110 @@
+# IOWarp compose example: 4 file bdevs + an erasure-coded safe-bdev + CAE + CTE.
+#
+# Topology
+#   * 4 file-backed block devices, all under ~/bdevs (2 GiB each).
+#   * One safe-bdev ("safe0") built over ONLY bdev0 to start. You add the other
+#     drives at runtime (as data or parity) via the safe-bdev AddBdev API; the
+#     group + allocator state is persisted in safe0.alog, so add/remove survives
+#     a restart.
+#   * CAE (assimilation) and CTE (transfer engine) pools.
+#
+# Paths use /home/iowarp (== ~ for this user). Edit them for your $HOME.
+# The compose list is processed top-to-bottom, so each member bdev is created
+# BEFORE the safe-bdev that references it.
+#
+# Prereqs — the file bdevs must exist at full size before launch:
+#   mkdir -p ~/bdevs
+#   for i in 0 1 2 3; do truncate -s 2G ~/bdevs/bdev$i.dat; done
+
+runtime:
+  num_threads: 4
+  queue_depth: 1024
+
+compose:
+  # ---------------------------------------------------------------------------
+  # 4 file-backed block devices (pool_name == the backing file path).
+  # alloc_log persists each bdev's allocator state (WAL) so it recovers on start.
+  # ---------------------------------------------------------------------------
+  - mod_name: clio_bdev
+    pool_name: "/home/iowarp/bdevs/bdev0.dat"
+    pool_query: local
+    pool_id: "301.0"
+    bdev_type: file
+    capacity: "2GB"
+    alloc_log: "/home/iowarp/bdevs/bdev0.alog"
+
+  - mod_name: clio_bdev
+    pool_name: "/home/iowarp/bdevs/bdev1.dat"
+    pool_query: local
+    pool_id: "302.0"
+    bdev_type: file
+    capacity: "2GB"
+    alloc_log: "/home/iowarp/bdevs/bdev1.alog"
+
+  - mod_name: clio_bdev
+    pool_name: "/home/iowarp/bdevs/bdev2.dat"
+    pool_query: local
+    pool_id: "303.0"
+    bdev_type: file
+    capacity: "2GB"
+    alloc_log: "/home/iowarp/bdevs/bdev2.alog"
+
+  - mod_name: clio_bdev
+    pool_name: "/home/iowarp/bdevs/bdev3.dat"
+    pool_query: local
+    pool_id: "304.0"
+    bdev_type: file
+    capacity: "2GB"
+    alloc_log: "/home/iowarp/bdevs/bdev3.alog"
+
+  # ---------------------------------------------------------------------------
+  # safe-bdev over ONLY bdev0 to start. max_failures=2 is the TARGET tolerance;
+  # with a single data drive there is no protection yet — add the other drives
+  # (bdev1..bdev3) at runtime as parity/data via AddBdev to reach it.
+  # The member references the already-composed bdev0 by name + pool_id (301.0).
+  # ---------------------------------------------------------------------------
+  - mod_name: clio_safe_bdev
+    pool_name: "safe0"
+    pool_query: local
+    pool_id: "350.0"
+    max_failures: 2
+    alloc_log: "/home/iowarp/bdevs/safe0.alog"
+    members:
+      - pool_name: "/home/iowarp/bdevs/bdev0.dat"
+        node_id: 0
+        pool_id_major: 301
+        pool_id_minor: 0
+
+  # ---------------------------------------------------------------------------
+  # CAE (assimilation) — canonical pool 400.0; forwards to CTE at 512.0.
+  # ---------------------------------------------------------------------------
+  - mod_name: clio_cae_core
+    pool_name: cae_main
+    pool_query: local
+    pool_id: "400.0"
+    next_pool_id: "512.0"
+
+  # ---------------------------------------------------------------------------
+  # CTE (transfer engine) — canonical pool 512.0 / name clio_cte_core (the FUSE
+  # adapter connects here).
+  # NOTE: CTE now buffers onto the safe-bdev pool above. Instead of creating its
+  # own bdev, the (only) storage target BINDS to the already-existing safe-bdev
+  # pool "safe0" (350.0) via `existing_pool_id`. safe-bdev implements the same
+  # bdev task interface (AllocateBlocks/FreeBlocks/Write/Read/GetStats), so CTE
+  # PutBlob/GetBlob I/O flows through the erasure-coded safe-bdev target.
+  # ---------------------------------------------------------------------------
+  - mod_name: clio_cte_core
+    pool_name: clio_cte_core
+    pool_query: local
+    pool_id: "512.0"
+    targets:
+      neighborhood: 1
+      default_target_timeout_ms: 30000
+      poll_period_ms: 5000
+    storage:
+      - path: "safe0"
+        existing_pool_id: "350.0"
+        existing_pool_module: "clio_safe_bdev"
+        score: 1.0
+    dpe:
+      dpe_type: "max_bw"

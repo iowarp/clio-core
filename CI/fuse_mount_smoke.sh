@@ -74,6 +74,36 @@ if [ ! -x "$BIN/clio_cte_fuse" ]; then
   exit 1
 fi
 
+# --- Ensure a clean runtime slot --------------------------------------------
+# A prior adapter test in this CI job can leak a Clio runtime (embedded in a
+# test binary) that stays bound to the runtime port; our `runtime start` below
+# would then die with "Address already in use". Best-effort clear any leftover
+# and wait for the port to free -- bounded so we never hang.
+RUNTIME_PORT="${CLIO_PORT:-9413}"
+port_busy() {
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltn 2>/dev/null | grep -q ":${RUNTIME_PORT}[[:space:]]"
+  elif command -v lsof >/dev/null 2>&1; then
+    lsof -iTCP:"${RUNTIME_PORT}" -sTCP:LISTEN >/dev/null 2>&1
+  else
+    return 1  # no probe available -> assume free
+  fi
+}
+if port_busy; then
+  info "runtime port ${RUNTIME_PORT} busy (leftover runtime); clearing"
+  clio_run runtime stop >/dev/null 2>&1 || true
+  for _ in $(seq 1 15); do port_busy || break; sleep 1; done
+  if port_busy; then
+    # Graceful stop did not free it: force-kill whatever still holds the port.
+    if command -v lsof >/dev/null 2>&1; then
+      lsof -ti tcp:"${RUNTIME_PORT}" 2>/dev/null | xargs -r kill -9 2>/dev/null || true
+    fi
+    command -v fuser >/dev/null 2>&1 && fuser -k "${RUNTIME_PORT}/tcp" >/dev/null 2>&1 || true
+    pkill -9 -f clio_run >/dev/null 2>&1 || true
+    for _ in $(seq 1 10); do port_busy || break; sleep 1; done
+  fi
+fi
+
 # --- Start runtime ----------------------------------------------------------
 info "starting Clio runtime"
 clio_run runtime start &

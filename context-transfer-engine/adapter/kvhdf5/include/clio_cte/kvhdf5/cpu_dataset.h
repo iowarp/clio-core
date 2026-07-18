@@ -49,7 +49,7 @@ enum class IoError : uint8_t { BadLayout, SizeMismatch, Unsupported, NotFound, B
 //
 // MVP: one chunk per dataset. `data`/`out` are the full row-major array. The
 // multi-chunk gather/scatter is Phase 1+ (returns Unsupported until then).
-template<BlobBackend B>
+template<KVHDF5_BLOB_BACKEND B>
 class Dataset {
     DatasetMeta* meta_;
     B* backend_;
