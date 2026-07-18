@@ -23,6 +23,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <new>
@@ -1516,6 +1517,21 @@ inline void Vector<T>::PrefetchPagesSync(clio::run::u64 first_page,
       gf.Wait();
       check(gf, i);
     }
+  }
+  // Optional MODELED slow-tier read latency. On this cluster, GPU compression
+  // shrinks each page ~16x, so the real Lustre read is sub-ms and the reader is
+  // compute-bound, not IO-bound -- prefetch then has almost nothing to hide.
+  // IOWarp tiers, however, span HBM (~ns) -> NVMe (~us) -> PFS (~ms) -> object
+  // store / tape (~10-100ms). Setting CLIO_CTE_SLOW_TIER_US models such a slow
+  // tier's per-page read latency so the IO-bound regime -- and the value of
+  // prefetch-ahead -- can be demonstrated. It is a latency MODEL, not a measured
+  // read; it is off (0) unless the benchmark sets it.
+  static const clio::run::u64 slow_us = [] {
+    const char *e = std::getenv("CLIO_CTE_SLOW_TIER_US");
+    return e ? std::strtoull(e, nullptr, 10) : 0ULL;
+  }();
+  if (slow_us) {
+    std::this_thread::sleep_for(std::chrono::microseconds(slow_us * count));
   }
   // Mark resident on a dedicated stream and sync only that stream, so this
   // prefetch does not device-synchronize (and thus won't stall a concurrently

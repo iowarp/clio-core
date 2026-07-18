@@ -62,6 +62,41 @@ using clio::run::chi_cur_worker_key_;
 using clio::run::Worker;
 
 /**
+ * Routing for the compressor's forward (de)compress store to the next pool
+ * (cte_core). By default the compressor forwards with PoolQuery::Local(), so a
+ * compressed page is stored on the SAME node that compressed it -- fine on one
+ * node, but it never distributes across a multi-node cluster.
+ *
+ * When CLIO_CTE_COMPRESS_DISTRIBUTE=1, forward instead by HASHING (tag_id,
+ * blob_name) to a container -- the SAME scheme cte_core uses for blobs
+ * (Runtime::HashBlobToContainer, core_runtime.cc), so compressed pages fan out
+ * across the distributed cte_core and a later GetBlob for the same page routes
+ * back to the node that holds it. On a single node DirectHash resolves to the
+ * only node, so this is transparent there; it is opt-in only to keep existing
+ * single-node behavior byte-for-byte unchanged.
+ *
+ * PutBlob and GetBlob MUST use identical routing for a given blob_name, so all
+ * forward sites call this one helper.
+ */
+inline clio::run::PoolQuery ForwardQuery(const clio::cte::core::TagId &tag_id,
+                                         const std::string &blob_name) {
+  static const bool distribute = [] {
+    const char *e = std::getenv("CLIO_CTE_COMPRESS_DISTRIBUTE");
+    return e && e[0] == '1';
+  }();
+  if (!distribute) return clio::run::PoolQuery::Local();
+  // Mirror Runtime::HashBlobToContainer exactly (core_runtime.cc:4794).
+  std::hash<std::string> string_hasher;
+  std::hash<clio::run::u32> u32_hasher;
+  clio::run::u32 hash_value = u32_hasher(tag_id.major_);
+  hash_value ^= u32_hasher(tag_id.minor_) + 0x9e3779b9 + (hash_value << 6) +
+                (hash_value >> 2);
+  hash_value ^= static_cast<clio::run::u32>(string_hasher(blob_name)) +
+                0x9e3779b9 + (hash_value << 6) + (hash_value >> 2);
+  return clio::run::PoolQuery::DirectHash(hash_value);
+}
+
+/**
  * Environment-variable compressor pin.
  *
  * When `CLIO_CTE_COMPRESS_LIB` is set, it FORCES every compression performed by
@@ -782,7 +817,7 @@ clio::run::TaskResume Runtime::Compress(ctp::ipc::FullPtr<CompressTask> task,
       auto put_task = core_client_->AsyncPutBlob(
           task->tag_id_, task->blob_name_.str(), task->offset_, task->size_,
           task->blob_data_, task->score_, context, task->flags_,
-          clio::run::PoolQuery::Local());
+          ForwardQuery(task->tag_id_, task->blob_name_.str()));
       CLIO_CO_AWAIT(put_task);
       task->context_ = put_task->context_;
       task->return_code_ = put_task->return_code_;
@@ -874,7 +909,7 @@ clio::run::TaskResume Runtime::Compress(ctp::ipc::FullPtr<CompressTask> task,
       auto put_task = core_client_->AsyncPutBlob(
           task->tag_id_, task->blob_name_.str(), task->offset_,
           total_stored_size, compressed_shm_ptr, task->score_, context,
-          task->flags_, clio::run::PoolQuery::Local());
+          task->flags_, ForwardQuery(task->tag_id_, task->blob_name_.str()));
       CLIO_CO_AWAIT(put_task);
 
       // Free compressed data buffer
@@ -903,7 +938,7 @@ clio::run::TaskResume Runtime::Compress(ctp::ipc::FullPtr<CompressTask> task,
       auto put_task = core_client_->AsyncPutBlob(
           task->tag_id_, task->blob_name_.str(), task->offset_, task->size_,
           task->blob_data_, task->score_, context, task->flags_,
-          clio::run::PoolQuery::Local());
+          ForwardQuery(task->tag_id_, task->blob_name_.str()));
       CLIO_CO_AWAIT(put_task);
 
       context.compress_lib_ = 0;  // Mark as uncompressed
@@ -958,10 +993,13 @@ clio::run::TaskResume Runtime::Decompress(ctp::ipc::FullPtr<DecompressTask> task
     }
     ctp::ipc::ShmPtr<> temp_buffer_ptr = temp_buffer.shm_.template Cast<void>();
 
-    // Call GetBlob to retrieve the (potentially compressed) data
+    // Call GetBlob to retrieve the (potentially compressed) data. MUST use the
+    // same routing as the PutBlob above so the read reaches the node that holds
+    // this page in a distributed cte_core.
     auto get_task = core_client_->AsyncGetBlob(
         task->tag_id_, task->blob_name_.str(), task->offset_, expected_size,
-        task->flags_, temp_buffer_ptr, clio::run::PoolQuery::Local());
+        task->flags_, temp_buffer_ptr,
+        ForwardQuery(task->tag_id_, task->blob_name_.str()));
     CLIO_CO_AWAIT(get_task);
 
     if (get_task->return_code_ != 0) {
@@ -1099,7 +1137,7 @@ clio::run::TaskResume Runtime::CompressPutBlob(
     if (context.compress_lib_ <= 0) {  // no compression -> forward as-is
       auto pt = core_client_->AsyncPutBlob(task->tag_id_, name, task->offset_,
           input_size, task->blob_data_, task->score_, context, task->flags_,
-          clio::run::PoolQuery::Local());
+          ForwardQuery(task->tag_id_, name));
       CLIO_CO_AWAIT(pt);
       task->return_code_ = pt->return_code_; CLIO_CO_RETURN;
     }
@@ -1131,7 +1169,8 @@ clio::run::TaskResume Runtime::CompressPutBlob(
       std::memcpy(shm.ptr_ + hsz, cbuf.data(), csize);
       ctp::ipc::ShmPtr<> sp = shm.shm_.template Cast<void>();
       auto pt = core_client_->AsyncPutBlob(task->tag_id_, name, task->offset_,
-          total, sp, task->score_, context, task->flags_, clio::run::PoolQuery::Local());
+          total, sp, task->score_, context, task->flags_,
+          ForwardQuery(task->tag_id_, name));
       CLIO_CO_AWAIT(pt);
       CLIO_IPC->FreeBuffer(shm);
       task->context_ = context;
@@ -1139,7 +1178,7 @@ clio::run::TaskResume Runtime::CompressPutBlob(
     } else {  // not beneficial -> store original (device blob) uncompressed
       auto pt = core_client_->AsyncPutBlob(task->tag_id_, name, task->offset_,
           input_size, task->blob_data_, task->score_, context, task->flags_,
-          clio::run::PoolQuery::Local());
+          ForwardQuery(task->tag_id_, name));
       CLIO_CO_AWAIT(pt);
       task->return_code_ = pt->return_code_;
     }
@@ -1173,7 +1212,8 @@ clio::run::TaskResume Runtime::DecompressGetBlob(
     if (tmp.IsNull()) { task->return_code_ = 2; CLIO_CO_RETURN; }
     ctp::ipc::ShmPtr<> tmpp = tmp.shm_.template Cast<void>();
     auto gt = core_client_->AsyncGetBlob(task->tag_id_, name, task->offset_,
-        expected_size + hsz + 1024, task->flags_, tmpp, clio::run::PoolQuery::Local());
+        expected_size + hsz + 1024, task->flags_, tmpp,
+        ForwardQuery(task->tag_id_, name));
     CLIO_CO_AWAIT(gt);
     if (gt->return_code_ != 0) { CLIO_IPC->FreeBuffer(tmp);
       task->return_code_ = 10 + gt->return_code_; CLIO_CO_RETURN; }

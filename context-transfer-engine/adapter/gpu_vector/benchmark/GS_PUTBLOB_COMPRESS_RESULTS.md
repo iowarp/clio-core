@@ -245,6 +245,62 @@ Net: the transparent-PutBlob compression machinery is done and works with any
 library in the factory; **selecting a lossy compressor turns the pipeline from a
 plumbing demo into a real capacity win (2×–27× here).**
 
+## Reader prefetch — Transaction API (issue #700), IO-bound benchmark
+
+`test_gpu_vector_prefetch` sweeps a dataset larger than the HBM cache one page
+*window* at a time and compares two readers over IOWarp's automatic tiering
+(`max_bw` DPE; a 256 KiB fast RAM tier + a Lustre `file` tier, so pages spill to
+storage):
+
+- **NO-PREFETCH** — read window *w* (blocking), compute on it, then read *w+1*.
+- **`SequentialTransaction`** (#700) — while the body computes window *w*, the
+  host prefetches window *w+1* into the other of two buffers (`gpu_pages_per_block
+  = 2·window`), so the fetch/decompress of *w+1* overlaps the compute of *w*.
+
+Both readers reconstruct the field within the cuszp error bound
+(`max_abs_err = 1.0e-3`); the vector never holds more than `2·window` pages
+resident while sweeping the whole dataset.
+
+**What the benchmark first showed (and why it matters).** With the *real* store,
+`io` is flat at ~10 ms for the whole dataset regardless of the compute load — the
+reader is **compute-bound, not IO-bound**. The reason is the headline result of
+this whole project: GPU compression shrinks each page ~16:1, so only a few KiB
+per page ever reach storage and the read is sub-millisecond. **Compression itself
+removes the I/O bottleneck.** Prefetch therefore has almost nothing to hide
+(≈1.0×), which is also why the earlier batched / pipelined variants came out
+break-even.
+
+**Demonstrating the IO-bound regime.** IOWarp tiers span HBM (~ns) → NVMe (~µs) →
+PFS (~ms) → object store / tape (~10–100 ms). To exercise the regime where
+prefetch is supposed to help, the reader can model a slow tier's per-page read
+latency via `CLIO_CTE_SLOW_TIER_US` (a latency *model*, off by default, applied
+uniformly to both readers so only the *overlap* differs). Sweeping it at a fixed
+moderate compute load (32 windows, ~12 ms compute/window, A100):
+
+| slow-tier model | regime (io vs compute) | no-prefetch | SequentialTransaction | speedup |
+|-----------------|------------------------|------------:|----------------------:|--------:|
+| 0 µs (real Lustre) | compute-bound (37 vs 421 ms) | 458 ms | 435 ms | 1.05× |
+| 3000 µs (**io ≈ compute**) | balanced (421 vs 396 ms) | 817 ms | **705 ms** | **1.16×** |
+| 6000 µs | io-bound (827 vs 493 ms) | 1320 ms | 1154 ms | 1.14× |
+
+- **Prefetch-ahead wins whenever a genuinely slow tier is in play, and peaks at
+  io ≈ compute** — exactly where `min(io, compute)` (the time prefetch can hide)
+  is largest. This is the #700 Transaction API doing what it is meant to do.
+- **The overlap ceiling is capped below the (L+C)/max(L,C) ideal** (~1.16× vs a
+  ~1.9× theoretical at 32 windows). The cause is GPU-side contention: the
+  compressor's decompress kernels run in a *separate CUDA context* (the fix that
+  makes device-side compressed access deadlock-free) and, without MPS, the A100
+  time-slices them against the reader's compute kernel rather than co-running
+  them. This is the *same* mechanism behind the break-even batched/pipeline
+  results — decompress is GPU-compute-bound, so it competes with, rather than
+  hides behind, the workload.
+
+Net: the Transaction prefetch is correct and helps in the IO-bound regime, but
+the more important finding is structural — **on a compressed GPU vector the
+reader is usually compute-bound because compression already removed the I/O**, so
+the lever that matters most is decompress throughput (page size, codec, and
+eventually MPS/concurrent-context co-scheduling), not prefetch depth.
+
 ## Build notes (cuszp)
 
 cuSZp is wired into the factory behind `CTP_ENABLE_CUSZP`, auto-detected from
@@ -265,8 +321,12 @@ toolchain. Wrapper: `context-transport-primitives/include/clio_ctp/compress/cusz
    future work.~~ **DONE** (see top of doc): the compressed `Vector<T>` submits
    page evictions/faults *from device code* through the compressor — raw core
    `PutBlob`(15)/`GetBlob`(16) tasks are reconstructed at the compressor
-   entrypoint (serialization cases) and transparently (de)compressed. The one
-   remaining device-side gap is the transparent *on-access* fault, which
-   deadlocks on a single GPU (a spin-waiting kernel vs. cuSZp needing the same
-   GPU); `Vector::FaultAllSync()` is the working host-orchestrated read path, and
-   an async fault-completion model is the future work.
+   entrypoint (serialization cases) and transparently (de)compressed. The
+   transparent *on-access* device fault — previously reported here as an
+   undeadlockable single-GPU hang — **now works**: running the compressor's
+   (de)compress in a **dedicated CUDA context** (A100 compute preemption +
+   cross-context UVA) lets the decompress kernel make progress while the faulting
+   kernel waits, so the spin-wait no longer deadlocks. `Vector::FaultAllSync()`
+   remains as the host-orchestrated path; the #700 `SequentialTransaction`
+   prefetch (see above) is the host-orchestrated *windowed* path for datasets
+   larger than the HBM cache.
