@@ -57,6 +57,16 @@ struct RwLock {
   ipc::atomic<ctp::reg_uint> writers_;
   ipc::atomic<ctp::reg_uint> cur_writer_;
   ipc::atomic<ctp::big_uint> ticket_;
+  // Batched-fairness counter: acquisitions granted since the last mode switch
+  // (reset to 0 in UpdateMode when the lock flips to kNone). Once a phase has
+  // served kFairnessBatch ops AND the opposite side is waiting, new same-side
+  // acquirers defer so the phase drains and the lock can flip. This bounds
+  // starvation (the pathology of the plain reader-preferring lock) while
+  // keeping the throughput of batching -- unlike a strict per-op handoff or a
+  // condition-variable lock's per-op mutex cost.
+  ipc::atomic<ctp::reg_uint> ops_since_switch_;
+  /** Ops granted in one phase before yielding to a waiting opposite side. */
+  static constexpr ctp::reg_uint kFairnessBatch = 32;
   /** Default constructor */
   CTP_CROSS_FUN
   RwLock()
@@ -64,7 +74,8 @@ struct RwLock {
         writers_(0),
         ticket_(0),
         mode_(RwLockMode::kNone),
-        cur_writer_(0) {}
+        cur_writer_(0),
+        ops_since_switch_(0) {}
 
   /** Explicit constructor */
   CTP_CROSS_FUN
@@ -74,6 +85,7 @@ struct RwLock {
     ticket_ = 0;
     mode_ = RwLockMode::kNone;
     cur_writer_ = 0;
+    ops_since_switch_ = 0;
   }
 
   /** Copy constructor (no-op, mirrors ctp::Mutex): copying a live
@@ -86,7 +98,8 @@ struct RwLock {
         writers_(0),
         ticket_(0),
         mode_(RwLockMode::kNone),
-        cur_writer_(0) {}
+        cur_writer_(0),
+        ops_since_switch_(0) {}
 
   /** Copy assignment (no-op for state, same rationale as copy ctor). */
   CTP_CROSS_FUN
@@ -96,6 +109,7 @@ struct RwLock {
     ticket_.store(0);
     mode_.store(RwLockMode::kNone);
     cur_writer_.store(0);
+    ops_since_switch_.store(0);
     return *this;
   }
 
@@ -106,7 +120,8 @@ struct RwLock {
         writers_(other.writers_.load()),
         ticket_(other.ticket_.load()),
         mode_(other.mode_.load()),
-        cur_writer_(other.cur_writer_.load()) {}
+        cur_writer_(other.cur_writer_.load()),
+        ops_since_switch_(other.ops_since_switch_.load()) {}
 
   /** Move assignment operator */
   CTP_CROSS_FUN
@@ -117,14 +132,53 @@ struct RwLock {
       ticket_ = other.ticket_.load();
       mode_ = other.mode_.load();
       cur_writer_ = other.cur_writer_.load();
+      ops_since_switch_ = other.ops_since_switch_.load();
     }
     return *this;
   }
 
-  /** Acquire read lock */
+  /** Acquire read lock.
+   *
+   *  @param owner           legacy/unused owner id.
+   *  @param writer_priority when true, make this otherwise reader-preferring
+   *         lock writer-preferring for THIS acquisition: defer entering while a
+   *         writer is waiting on or holds the lock. This prevents a sustained
+   *         reader stream from starving writers — the reader-preferring default
+   *         lets a reader in whenever the lock is already in read mode,
+   *         regardless of a waiting writer, so writers can livelock (observed as
+   *         an icx/Windows ctest timeout in the unordered_map_ll growth stress
+   *         test). The wait happens BEFORE registering as a reader: incrementing
+   *         readers_ first and only then waiting for writers_==0 would deadlock
+   *         the writer, which spins for readers_==0. Stragglers that slip past
+   *         before a writer bumps writers_ are bounded — the writer's
+   *         ticket-based WriteLock drains them — so no reader is blocked
+   *         forever. Default false preserves the reader-preferring behavior that
+   *         reentrant callers (e.g. CoRwLock's read->read nesting) depend on. */
   CTP_CROSS_FUN
-  void ReadLock(uint32_t owner) {
-    RwLockMode::Type mode;
+  void ReadLock(uint32_t owner, bool writer_priority = false) {
+    RwLockMode::Type mode = mode_.load_device();
+
+    // Batched fairness: if a writer is waiting and this read phase has already
+    // served a full batch, let the current readers drain (readers_ -> 0) so the
+    // waiting writer can take over before we pile on another reader. New readers
+    // gate here too, so readers_ actually reaches 0. Checked once (bounded).
+    if (writers_.load_device() > 0 && mode == RwLockMode::kRead &&
+        ops_since_switch_.load_device() >= kFairnessBatch) {
+      while (readers_.load_device() > 0) {
+#if !CTP_IS_DEVICE_PASS
+        CTP_THREAD_MODEL->Yield();
+#endif
+      }
+    }
+    ops_since_switch_.fetch_add(1);
+
+    if (writer_priority) {
+      while (writers_.load() > 0) {
+#if !CTP_IS_DEVICE_PASS
+        CTP_THREAD_MODEL->Yield();
+#endif
+      }
+    }
 
     // Increment # readers. Check if in read mode.
     readers_.fetch_add(1);
@@ -154,8 +208,22 @@ struct RwLock {
   /** Acquire write lock */
   CTP_CROSS_FUN
   void WriteLock(uint32_t owner) {
-    RwLockMode::Type mode;
+    RwLockMode::Type mode = mode_.load_device();
     uint32_t cur_writer;
+
+    // Batched fairness: if readers are waiting and this write phase has served a
+    // full batch, let the current writers drain (writers_ -> 0) so the waiting
+    // readers can take over before we queue another writer. New writers gate
+    // here too, so writers_ actually reaches 0. Checked once (bounded).
+    if (readers_.load_device() > 0 && mode == RwLockMode::kWrite &&
+        ops_since_switch_.load_device() >= kFairnessBatch) {
+      while (writers_.load_device() > 0) {
+#if !CTP_IS_DEVICE_PASS
+        CTP_THREAD_MODEL->Yield();
+#endif
+      }
+    }
+    ops_since_switch_.fetch_add(1);
 
     // Increment # writers & get ticket
     writers_.fetch_add(1);
@@ -189,6 +257,12 @@ struct RwLock {
     cur_writer_.fetch_add(1);
   }
 
+  /** @return true while a writer holds (or is waiting/draining for) this lock.
+   *  Used by ContainerPtr::IsPlugged() so a reader can observe that a
+   *  migration/upgrade writer is in progress on the container. */
+  CTP_CROSS_FUN
+  bool IsWriteLocked() const { return writers_.load() > 0; }
+
  private:
   /** Update the mode of the lock */
   CTP_INLINE_CROSS_FUN
@@ -199,7 +273,11 @@ struct RwLock {
     mode = mode_.load_device();
     if ((readers_.load_device() == 0 && mode == RwLockMode::kRead) ||
         (writers_.load_device() == 0 && mode == RwLockMode::kWrite)) {
-      mode_.compare_exchange_weak(mode, RwLockMode::kNone);
+      if (mode_.compare_exchange_weak(mode, RwLockMode::kNone)) {
+        // The phase just ended -- restart the batch counter so the next phase
+        // (read or write) gets a fresh kFairnessBatch budget.
+        ops_since_switch_.store(0);
+      }
     }
   }
 };

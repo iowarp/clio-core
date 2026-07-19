@@ -82,6 +82,17 @@ class WorkOrchestrator {
   void StopWorkers();
 
   /**
+   * Wake EVERY worker thread out of its epoll sleep by signalling each
+   * worker's assigned-lane tid. Used as a lost-wakeup safety net: a task can be
+   * parked on a lane whose GetTid() is 0 (only a worker's own assigned_lane_
+   * ever gets a tid, so any secondary lane reads 0), which makes a targeted
+   * AwakenWorker(lane) a no-op even though some worker owns that task's event
+   * queue. Waking all workers guarantees the owner re-checks its event queue
+   * and resumes the parked parent. Cheap: only hit on the rare tid==0 path.
+   */
+  void AwakenAllWorkers();
+
+  /**
    * Get worker by ID
    * @param worker_id Worker identifier
    * @return Pointer to worker or nullptr if not found

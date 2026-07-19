@@ -119,21 +119,19 @@ u32 LocalScheduler::ClientMapTask(IpcManager *ipc_manager,
 }
 
 u32 LocalScheduler::RuntimeMapTask(Worker *worker, const Future<Task> &task,
-                                    Container *container) {
+                                    ContainerHold container) {
   Task *task_ptr = task.get();
 
   // ---- Task group affinity: return early if group already pinned ----
   // Use the caller-supplied container directly (no static container lookup).
-  Container *grp_container =
+  const bool has_group =
       (container != nullptr && task_ptr != nullptr &&
-       !task_ptr->task_group_.IsNull())
-          ? container
-          : nullptr;
-  if (grp_container != nullptr) {
+       !task_ptr->task_group_.IsNull());
+  if (has_group) {
     int64_t group_id = task_ptr->task_group_.id_;
-    ScopedCoRwReadLock read_lock(grp_container->task_group_lock_);
-    auto it = grp_container->task_group_map_.find(group_id);
-    if (it != grp_container->task_group_map_.end() && it->second != nullptr) {
+    ScopedCoRwReadLock read_lock(container->task_group_lock_);
+    auto it = container->task_group_map_.find(group_id);
+    if (it != container->task_group_map_.end() && it->second != nullptr) {
       return it->second->GetId();
     }
   }
@@ -175,12 +173,12 @@ u32 LocalScheduler::RuntimeMapTask(Worker *worker, const Future<Task> &task,
   }
 
   // ---- Update group map after routing decision ----
-  if (grp_container != nullptr && task_ptr != nullptr && selected != nullptr) {
+  if (has_group && task_ptr != nullptr && selected != nullptr) {
     int64_t group_id = task_ptr->task_group_.id_;
-    ScopedCoRwWriteLock write_lock(grp_container->task_group_lock_);
-    auto it = grp_container->task_group_map_.find(group_id);
-    if (it == grp_container->task_group_map_.end() || it->second == nullptr) {
-      grp_container->task_group_map_[group_id] = selected;
+    ScopedCoRwWriteLock write_lock(container->task_group_lock_);
+    auto it = container->task_group_map_.find(group_id);
+    if (it == container->task_group_map_.end() || it->second == nullptr) {
+      container->task_group_map_[group_id] = selected;
     }
   }
 
@@ -194,14 +192,14 @@ void LocalScheduler::RebalanceWorker(Worker *worker) {
   (void)worker;
 }
 
-void LocalScheduler::AdjustPolling(RunContext *run_ctx) {
-  if (!run_ctx) {
+void LocalScheduler::AdjustPolling(const clio::run::shared_ptr<Task> &task) {
+  if (task.IsNull()) {
     return;
   }
   // Adaptive polling disabled for now - restore the true period
   // This is critical because co_await on Futures sets yield_time_us_ = 0,
   // so we must restore it here to prevent periodic tasks from busy-looping
-  run_ctx->yield_time_us_ = run_ctx->true_period_ns_ / 1000.0;
+  task->SetYieldTimeUs(task->TruePeriodNs() / 1000.0);
 }
 
 u32 LocalScheduler::MapByPidTid(u32 num_lanes) {

@@ -6,16 +6,17 @@ This directory contains various installation methods for IOWarp Core.
 
 ### 1. Conda Package (`conda/`)
 
-Build and install IOWarp Core using conda-build.
+Install the prebuilt `iowarp-core` package, or build the recipe from source.
 
 **Quick Start:**
 ```bash
-# Use the install.sh script (recommended)
-./install.sh
+# Install the prebuilt package from the iowarp channel (recommended)
+conda install -c iowarp -c conda-forge iowarp-core
 
-# Or manually build the conda package
-conda build installers/conda/ -c conda-forge
-conda install /path/to/built/package.tar.bz2
+# Or build the recipe from source (IOWARP_PRESET selects a CMake preset)
+conda install -n base -y conda-build -c conda-forge
+IOWARP_PRESET=release conda build installers/conda/ -c conda-forge --output-folder build/conda-output
+conda install -c conda-forge build/conda-output/*/iowarp-core-*.conda
 ```
 
 **Documentation:** See [`conda/README.md`](conda/README.md)

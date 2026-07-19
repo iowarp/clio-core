@@ -102,6 +102,35 @@ class Client : public clio::cte::core::Client {
     return ipc->Send(task);
   }
 
+  clio::run::Future<UtimensTask> AsyncUtimens(const std::string &path,
+                                              clio::run::u64 atime_ns,
+                                              clio::run::u64 mtime_ns,
+                                              clio::run::u32 flags) {
+    auto *ipc = CLIO_CPU_IPC;
+    auto task = ipc->NewTask<UtimensTask>(clio::run::CreateTaskId(), pool_id_,
+                                          clio::run::PoolQuery::Local(), path,
+                                          atime_ns, mtime_ns, flags);
+    return ipc->Send(task);
+  }
+
+  clio::run::Future<ChownTask> AsyncChown(const std::string &path,
+                                          clio::run::u32 uid,
+                                          clio::run::u32 gid,
+                                          clio::run::u32 mode = 0xFFFFFFFFu) {
+    auto *ipc = CLIO_CPU_IPC;
+    auto task = ipc->NewTask<ChownTask>(clio::run::CreateTaskId(), pool_id_,
+                                        clio::run::PoolQuery::Local(), path, uid,
+                                        gid, mode);
+    return ipc->Send(task);
+  }
+
+  // chmod reuses the ChownTask (per-file mode override) with uid/gid left
+  // unchanged, avoiding a separate RPC method for a single stored field.
+  clio::run::Future<ChownTask> AsyncChmod(const std::string &path,
+                                          clio::run::u32 mode) {
+    return AsyncChown(path, 0xFFFFFFFFu, 0xFFFFFFFFu, mode);
+  }
+
   clio::run::Future<MkdirTask> AsyncMkdir(const std::string &path) {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<MkdirTask>(clio::run::CreateTaskId(), pool_id_,
@@ -129,6 +158,59 @@ class Client : public clio::cte::core::Client {
     auto *ipc = CLIO_CPU_IPC;
     auto task = ipc->NewTask<LinkTask>(clio::run::CreateTaskId(), pool_id_,
                                        clio::run::PoolQuery::Local(), target, link);
+    return ipc->Send(task);
+  }
+
+  clio::run::Future<SymlinkTask> AsyncSymlink(const std::string &target,
+                                              const std::string &path) {
+    auto *ipc = CLIO_CPU_IPC;
+    auto task = ipc->NewTask<SymlinkTask>(clio::run::CreateTaskId(), pool_id_,
+                                          clio::run::PoolQuery::Local(), target,
+                                          path);
+    return ipc->Send(task);
+  }
+
+  clio::run::Future<ReadlinkTask> AsyncReadlink(const std::string &path) {
+    auto *ipc = CLIO_CPU_IPC;
+    auto task = ipc->NewTask<ReadlinkTask>(clio::run::CreateTaskId(), pool_id_,
+                                           clio::run::PoolQuery::Local(), path);
+    return ipc->Send(task);
+  }
+
+  clio::run::Future<SetxattrTask> AsyncSetxattr(const std::string &path,
+                                                const std::string &name,
+                                                const std::string &value,
+                                                clio::run::u32 flags) {
+    auto *ipc = CLIO_CPU_IPC;
+    auto task = ipc->NewTask<SetxattrTask>(clio::run::CreateTaskId(), pool_id_,
+                                           clio::run::PoolQuery::Local(), path,
+                                           name, value, flags);
+    return ipc->Send(task);
+  }
+
+  clio::run::Future<GetxattrTask> AsyncGetxattr(const std::string &path,
+                                                const std::string &name) {
+    auto *ipc = CLIO_CPU_IPC;
+    auto task = ipc->NewTask<GetxattrTask>(clio::run::CreateTaskId(), pool_id_,
+                                           clio::run::PoolQuery::Local(), path,
+                                           name);
+    return ipc->Send(task);
+  }
+
+  clio::run::Future<ListxattrTask> AsyncListxattr(const std::string &path) {
+    auto *ipc = CLIO_CPU_IPC;
+    auto task = ipc->NewTask<ListxattrTask>(clio::run::CreateTaskId(), pool_id_,
+                                            clio::run::PoolQuery::Local(), path);
+    return ipc->Send(task);
+  }
+
+  clio::run::Future<RemovexattrTask> AsyncRemovexattr(const std::string &path,
+                                                      const std::string &name) {
+    auto *ipc = CLIO_CPU_IPC;
+    auto task = ipc->NewTask<RemovexattrTask>(clio::run::CreateTaskId(),
+                                              pool_id_,
+                                              clio::run::PoolQuery::Local(),
+                                              path, name);
     return ipc->Send(task);
   }
 

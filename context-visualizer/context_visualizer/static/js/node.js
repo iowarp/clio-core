@@ -298,6 +298,66 @@
                     var color = utilizationColor(usedPct);
                     var typeLabel = dev.bdev_type === 1 ? "RAM" : "File";
 
+                    // Parse ML Health Data
+                    var healthHtml = "";
+                    try {
+                        if (dev.device_health || dev.failure_prediction) {
+                            var health = dev.device_health && dev.device_health !== "{}" ? JSON.parse(dev.device_health) : null;
+                            var pred = dev.failure_prediction && dev.failure_prediction !== "{}" ? JSON.parse(dev.failure_prediction) : null;
+                            
+                            if (health || pred) {
+                                healthHtml += '<div class="bdev-health-section">';
+                                
+                                // Prediction Badge
+                                if (pred && pred.predicted_status) {
+                                    var pStatus = pred.predicted_status.toLowerCase();
+                                    var badgeClass = "badge-healthy";
+                                    var badgeText = "Healthy";
+                                    
+                                    if (pStatus === "failing") {
+                                        badgeClass = "badge-critical";
+                                        badgeText = "Failing (" + (pred.days_to_failure || 0).toFixed(1) + " days left)";
+                                    } else if (pStatus === "warning" || pStatus === "degraded") {
+                                        badgeClass = "badge-warning";
+                                        badgeText = "Warning";
+                                    }
+                                    
+                                    healthHtml += '<div><span class="health-badge ' + badgeClass + '">' + badgeText + '</span></div>';
+                                } else if (health) {
+                                    // Fallback to basic health status if no ML prediction available
+                                    var smartStatus = health.smart_status ? health.smart_status.toLowerCase() : "passed";
+                                    if (smartStatus !== "passed" && smartStatus !== "ok") {
+                                        healthHtml += '<div><span class="health-badge badge-critical">SMART ' + smartStatus + '</span></div>';
+                                    } else {
+                                        healthHtml += '<div><span class="health-badge badge-healthy">SMART Passed</span></div>';
+                                    }
+                                }
+
+                                // SMART Metrics
+                                if (health) {
+                                    healthHtml += '<div class="smart-metrics">';
+                                    if (health.power_on_hours !== undefined) {
+                                        healthHtml += '<div class="smart-metric-item"><span class="smart-label">Power On</span><span class="smart-val">' + health.power_on_hours + 'h</span></div>';
+                                    }
+                                    if (health.temperature_celsius !== undefined) {
+                                        healthHtml += '<div class="smart-metric-item"><span class="smart-label">Temp</span><span class="smart-val">' + health.temperature_celsius + '&deg;C</span></div>';
+                                    }
+                                    if (health.reallocated_sectors !== undefined) {
+                                        healthHtml += '<div class="smart-metric-item"><span class="smart-label">Realloc</span><span class="smart-val">' + health.reallocated_sectors + '</span></div>';
+                                    }
+                                    if (health.media_wearout_indicator !== undefined) {
+                                        healthHtml += '<div class="smart-metric-item"><span class="smart-label">Wearout</span><span class="smart-val">' + health.media_wearout_indicator + '%</span></div>';
+                                    }
+                                    healthHtml += '</div>';
+                                }
+                                
+                                healthHtml += '</div>';
+                            }
+                        }
+                    } catch (e) {
+                        console.error("Failed to parse device health JSON", e);
+                    }
+
                     card.innerHTML =
                         '<div class="bdev-card-header">' +
                         '<span class="bdev-name">' + (dev.pool_name || dev.pool_id || "bdev") + '</span>' +
@@ -318,7 +378,7 @@
                         '<div class="bdev-stat"><span>IOPS</span><span>' + (dev.iops || 0).toFixed(0) + '</span></div>' +
                         '<div class="bdev-stat"><span>Reads</span><span>' + (dev.total_reads || 0) + '</span></div>' +
                         '<div class="bdev-stat"><span>Writes</span><span>' + (dev.total_writes || 0) + '</span></div>' +
-                        '</div>';
+                        '</div>' + healthHtml;
 
                     grid.appendChild(card);
                 });

@@ -62,6 +62,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <string>
 #include <thread>
 
@@ -152,7 +153,20 @@ compose:
     dpe:
       dpe_type: "max_bw"
 )";
+    f.flush();
+    REQUIRE(f.good());
     f.close();
+
+    // Read the file back before CLIO_INIT parses it. The runtime treats an
+    // empty config as a successful parse and silently falls back to the
+    // default config — no storage tier, so the first PutBlob fails with
+    // out-of-space (seen once on Windows CI). Fail here, at the source,
+    // instead.
+    std::ifstream check(config_path_);
+    REQUIRE(check.is_open());
+    std::string content((std::istreambuf_iterator<char>(check)),
+                        std::istreambuf_iterator<char>());
+    REQUIRE(!content.empty());
   }
 };
 

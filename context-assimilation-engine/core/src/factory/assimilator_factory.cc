@@ -40,6 +40,12 @@
 #ifdef CAE_ENABLE_GLOBUS
 #include <clio_cae/core/factory/globus_file_assimilator.h>
 #endif
+#ifdef CAE_ENABLE_S3
+#include <clio_cae/core/factory/s3_file_assimilator.h>
+#endif
+#ifdef CAE_ENABLE_GCS
+#include <clio_cae/core/factory/gcs_file_assimilator.h>
+#endif
 #include <clio_runtime/clio_runtime.h>
 
 #include <memory>
@@ -113,6 +119,35 @@ std::unique_ptr<BaseAssimilator> AssimilatorFactory::Get(
          "AssimilatorFactory: Globus protocol requested but Globus support not "
          "compiled in. "
          "Rebuild with -DCAE_ENABLE_GLOBUS=ON to enable Globus support.");
+    return nullptr;
+#endif
+  } else if (protocol == "s3") {
+#ifdef CAE_ENABLE_S3
+    HLOG(kDebug,
+         "AssimilatorFactory: Creating S3FileAssimilator for 's3' protocol");
+    // For s3 protocol, return an S3FileAssimilator
+    return std::make_unique<S3FileAssimilator>(cte_client_);
+#else
+    // S3 support not compiled in
+    HLOG(kError,
+         "AssimilatorFactory: S3 protocol requested but S3 support not compiled "
+         "in. "
+         "Rebuild with -DCAE_ENABLE_S3=ON to enable S3 support.");
+    return nullptr;
+#endif
+  } else if (protocol == "gs" || protocol == "gcs") {
+#ifdef CAE_ENABLE_GCS
+    HLOG(kDebug,
+         "AssimilatorFactory: Creating GcsFileAssimilator for 'gs'/'gcs' "
+         "protocol");
+    // For gs/gcs protocol, return a GcsFileAssimilator
+    return std::make_unique<GcsFileAssimilator>(cte_client_);
+#else
+    // GCS support not compiled in
+    HLOG(kError,
+         "AssimilatorFactory: GCS protocol requested but GCS support not "
+         "compiled in. "
+         "Rebuild with -DCAE_ENABLE_GCS=ON to enable GCS support.");
     return nullptr;
 #endif
   }

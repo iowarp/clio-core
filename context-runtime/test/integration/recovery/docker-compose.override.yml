@@ -1,0 +1,20 @@
+# Coverage support for builds made OUTSIDE /workspace (e.g. a native
+# checkout at $HOME/clio-core): gcov bakes absolute .gcda paths into the
+# objects at compile time, so the workspace must also be visible inside
+# the container at its real host path or daemon-side counters are
+# silently dropped. Mounting the same source twice (here and at
+# /workspace in docker-compose.yml) is harmless; when the host workspace
+# IS /workspace the two mounts coincide.
+services:
+  iowarp-node1:
+    volumes:
+      - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-/workspace}}:${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-/workspace}}:rw
+  iowarp-node2:
+    volumes:
+      - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-/workspace}}:${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-/workspace}}:rw
+  iowarp-node3:
+    volumes:
+      - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-/workspace}}:${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-/workspace}}:rw
+  iowarp-node4:
+    volumes:
+      - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-/workspace}}:${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-/workspace}}:rw

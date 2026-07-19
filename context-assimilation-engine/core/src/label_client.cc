@@ -75,10 +75,13 @@ bool OllamaGenerate(const std::string &endpoint_base,
   std::string body_str = body.dump();
 
   CURL *curl = curl_easy_init();
+  // LCOV_EXCL_START: curl_easy_init() only fails on libcurl-internal
+  // out-of-memory / init faults that cannot be provoked from a test.
   if (!curl) {
     HLOG(kWarning, "OllamaGenerate: curl_easy_init failed");
     return false;
   }
+  // LCOV_EXCL_STOP
 
   std::string resp_buf;
   struct curl_slist *headers = nullptr;

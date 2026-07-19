@@ -127,6 +127,7 @@ option(CLIO_CORE_ENABLE_CEREAL "Enable serialization using cereal" ON)
 option(CLIO_CTE_ENABLE_COMPRESS "Enable compression support (builds compressor chimod and tests)" OFF)
 option(CLIO_CORE_ENABLE_ENCRYPT "Enable encryption" OFF)
 option(CLIO_CORE_ENABLE_IO_URING "Enable io_uring async I/O backend (Linux 5.1+, requires liburing)" OFF)
+option(CLIO_CORE_ENABLE_BOOST_COROUTINES "Use Boost.Context stackful coroutines for task execution instead of C++20 stackless coroutines (issue #620). Opt-in; reuses fiber stacks to avoid the per-task heap frame the stackless backend allocates." OFF)
 
 # Set internal compression flags from CLIO_CTE_ENABLE_COMPRESS
 if(CLIO_CTE_ENABLE_COMPRESS)
@@ -148,6 +149,7 @@ option(CLIO_CORE_ENABLE_NVSHMEM "Enable NVSHMEM GPU-to-GPU communication library
 option(CLIO_CORE_ENABLE_SYCL "Enable Intel GPU support via SYCL/oneAPI (icpx -fsycl)" OFF)
 option(CLIO_CORE_ENABLE_JARVIS "Enable Jarvis CI infrastructure installation" OFF)
 option(CLIO_ENABLE_AMAZON_DRIVE "Enable Amazon S3 intermediate storage" OFF)
+option(CLIO_ENABLE_GOOGLE_CLOUD "Enable Google Cloud Storage intermediate storage" OFF)
 
 #------------------------------------------------------------------------------
 # ClioCtp (context-transport-primitives) Options
@@ -179,6 +181,8 @@ option(CLIO_CTE_ENABLE_HDF5_VOL "Enable HDF5 VOL connector (requires HDF5 >= 1.1
 # CAE (context-assimilation-engine) Options
 #------------------------------------------------------------------------------
 option(CAE_ENABLE_GLOBUS "Enable Globus transfer support in CAE" OFF)
+option(CAE_ENABLE_S3 "Enable Amazon S3 (s3://) import in CAE" OFF)
+option(CAE_ENABLE_GCS "Enable Google Cloud Storage (gs://) import in CAE" OFF)
 # LLM labeling/summary + semantic-search features and their integration tests
 # require a running Ollama service. OFF by default so default builds don't
 # build or run them without Ollama.
@@ -282,7 +286,7 @@ if(CLIO_CORE_ENABLE_DOXYGEN)
     message(STATUS "found doxygen at ${DOXYGEN_EXECUTABLE}")
 endif()
 
-# YAML-CPP - find from system or install.sh installation
+# YAML-CPP - find from system or CI/ci-deps.sh installation
 find_package(yaml-cpp REQUIRED)
 if(yaml-cpp_FOUND)
     message(STATUS "found yaml-cpp at ${yaml-cpp_DIR}")
@@ -317,7 +321,7 @@ if(CLIO_CORE_STATIC_DEPS AND NOT WIN32 AND NOT APPLE)
     endif()
 endif()
 
-# Cereal - find from system or install.sh installation
+# Cereal - find from system or CI/ci-deps.sh installation
 find_package(cereal REQUIRED)
 if(cereal_FOUND)
     message(STATUS "found cereal at ${cereal_DIR}")
@@ -547,25 +551,93 @@ if(CLIO_CTE_ENABLE_COMPRESS)
         message(STATUS "SYCL libzfp not found under ${CLIO_ZFP_SYCL_ROOT} - zfp-sycl compression disabled")
     endif()
 
-    # cuSZp: GPU error-bounded LOSSY float compressor. Needs CUDA. Point
-    # CLIO_CUSZP_ROOT at a cuSZp install prefix (headers in include/, lib in
-    # lib64/). Off unless found.
-    set(CLIO_CTP_ENABLE_CUSZP OFF)
-    set(CLIO_CUSZP_ROOT "/opt/cuSZp/install" CACHE PATH
-        "Install prefix of cuSZp (for the cuszp GPU lossy compressor)")
+    # cuSZ (https://github.com/szcompressor/cuSZ) - GPU error-bounded lossy
+    # compressor for floating-point data. Optional, requires CUDA. Auto-detected
+    # via its CMake config (target CUSZ::cusz) with a raw find_library fallback.
+    set(CLIO_CTP_ENABLE_CUSZ OFF)
     if(CLIO_CORE_ENABLE_CUDA)
-        find_library(CUSZP_LIBRARY NAMES cuSZp
-            HINTS ${CLIO_CUSZP_ROOT}/lib ${CLIO_CUSZP_ROOT}/lib64
-            NO_DEFAULT_PATH)
-        find_path(CUSZP_INCLUDE_DIR NAMES cuSZp.h
-            HINTS ${CLIO_CUSZP_ROOT}/include
-            NO_DEFAULT_PATH)
-        if(CUSZP_LIBRARY AND CUSZP_INCLUDE_DIR)
-            message(STATUS "found cuSZp at ${CUSZP_LIBRARY} (cuszp GPU lossy compression)")
-            set(CLIO_CTP_ENABLE_CUSZP ON)
+        find_package(CUSZ QUIET)
+        if(CUSZ_FOUND)
+            set(cusz_LIBRARIES CUSZ::cusz)
+            set(cusz_INCLUDE_DIRS ${CUSZ_INCLUDE_DIRS})
+            set(CLIO_CTP_ENABLE_CUSZ ON)
+            message(STATUS "found cuSZ via CMake config (GPU lossy compression)")
         else()
-            message(STATUS "cuSZp not found under ${CLIO_CUSZP_ROOT} - cuszp compression disabled")
+            find_path(cusz_INCLUDE_DIR cusz.h PATH_SUFFIXES cusz)
+            find_library(cusz_LIBRARY NAMES cusz pszcuda cuszapi)
+            if(cusz_INCLUDE_DIR AND cusz_LIBRARY)
+                set(cusz_LIBRARIES ${cusz_LIBRARY})
+                set(cusz_INCLUDE_DIRS ${cusz_INCLUDE_DIR})
+                set(CLIO_CTP_ENABLE_CUSZ ON)
+                message(STATUS "found cusz.h at ${cusz_INCLUDE_DIRS}")
+            else()
+                message(STATUS "cuSZ not found - cuSZ GPU compression disabled")
+            endif()
         endif()
+    else()
+        message(STATUS "CLIO_CORE_ENABLE_CUDA is OFF - cuSZ GPU compression disabled")
+    endif()
+
+    # ndzip (https://github.com/celerity/ndzip) - GPU high-throughput lossless
+    # compressor for floating-point data. Optional, requires CUDA and an ndzip
+    # built with NDZIP_WITH_CUDA=ON (provides the ndzip-cuda library). Auto-
+    # detected via its CMake config (ndzip::ndzip-cuda) with a find_library
+    # fallback.
+    set(CLIO_CTP_ENABLE_NDZIP OFF)
+    if(CLIO_CORE_ENABLE_CUDA)
+        find_package(ndzip QUIET)
+        if(ndzip_FOUND AND TARGET ndzip::ndzip-cuda)
+            set(ndzip_LIBRARIES ndzip::ndzip ndzip::ndzip-cuda)
+            set(ndzip_INCLUDE_DIRS "")
+            set(CLIO_CTP_ENABLE_NDZIP ON)
+            message(STATUS "found ndzip via CMake config (GPU lossless compression)")
+        else()
+            find_path(ndzip_INCLUDE_DIR ndzip/ndzip.hh)
+            find_library(ndzip_LIBRARY NAMES ndzip)
+            find_library(ndzip_cuda_LIBRARY NAMES ndzip-cuda)
+            if(ndzip_INCLUDE_DIR AND ndzip_LIBRARY AND ndzip_cuda_LIBRARY)
+                set(ndzip_LIBRARIES ${ndzip_cuda_LIBRARY} ${ndzip_LIBRARY})
+                set(ndzip_INCLUDE_DIRS ${ndzip_INCLUDE_DIR})
+                set(CLIO_CTP_ENABLE_NDZIP ON)
+                message(STATUS "found ndzip.hh at ${ndzip_INCLUDE_DIRS}")
+            else()
+                message(STATUS "ndzip not found - ndzip GPU compression disabled")
+            endif()
+        endif()
+    else()
+        message(STATUS "CLIO_CORE_ENABLE_CUDA is OFF - ndzip GPU compression disabled")
+    endif()
+
+    # cuSZp (https://github.com/szcompressor/cuSZp) - GPU ultra-fast error-bounded
+    # lossy compressor for floating-point data. Optional, requires CUDA. Auto-
+    # detected via its CMake config (cuSZp::cuSZp) with a find_library fallback.
+    set(CLIO_CTP_ENABLE_CUSZP OFF)
+    if(CLIO_CORE_ENABLE_CUDA)
+        find_package(cuSZp QUIET)
+        if(cuSZp_FOUND AND TARGET cuSZp::cuSZp)
+            set(cuszp_LIBRARIES cuSZp::cuSZp)
+            set(cuszp_INCLUDE_DIRS "")
+            set(CLIO_CTP_ENABLE_CUSZP ON)
+            message(STATUS "found cuSZp via CMake config (GPU lossy compression)")
+        else()
+            # CLIO_CUSZP_ROOT points at a cuSZp prefix find_package cannot see
+            # (e.g. a container-local build); searched before the default paths.
+            set(CLIO_CUSZP_ROOT "" CACHE PATH
+                "Install prefix of cuSZp (headers in include/, lib in lib/ or lib64/)")
+            find_path(cuszp_INCLUDE_DIR cuSZp.h HINTS ${CLIO_CUSZP_ROOT}/include)
+            find_library(cuszp_LIBRARY NAMES cuSZp
+                HINTS ${CLIO_CUSZP_ROOT}/lib ${CLIO_CUSZP_ROOT}/lib64)
+            if(cuszp_INCLUDE_DIR AND cuszp_LIBRARY)
+                set(cuszp_LIBRARIES ${cuszp_LIBRARY})
+                set(cuszp_INCLUDE_DIRS ${cuszp_INCLUDE_DIR})
+                set(CLIO_CTP_ENABLE_CUSZP ON)
+                message(STATUS "found cuSZp.h at ${cuszp_INCLUDE_DIRS}")
+            else()
+                message(STATUS "cuSZp not found - cuSZp GPU compression disabled")
+            endif()
+        endif()
+    else()
+        message(STATUS "CLIO_CORE_ENABLE_CUDA is OFF - cuSZp GPU compression disabled")
     endif()
 
     set(COMPRESS_LIBS
@@ -619,12 +691,22 @@ if(CLIO_CTE_ENABLE_COMPRESS)
         list(APPEND COMPRESS_INCLUDES ${ZFP_SYCL_INCLUDE_DIR})
     endif()
 
-    # Only add cuSZp if found. libcuSZp already links cudart transitively, and
-    # the CTP CUDA target links cudart itself, so we don't add CUDA::cudart here
-    # (this variable is expanded as plain -l names, which would mangle a target).
+    # Only add cuSZ if found
+    if(CLIO_CTP_ENABLE_CUSZ)
+        list(APPEND COMPRESS_LIBS ${cusz_LIBRARIES})
+        list(APPEND COMPRESS_INCLUDES ${cusz_INCLUDE_DIRS})
+    endif()
+
+    # Only add ndzip if found
+    if(CLIO_CTP_ENABLE_NDZIP)
+        list(APPEND COMPRESS_LIBS ${ndzip_LIBRARIES})
+        list(APPEND COMPRESS_INCLUDES ${ndzip_INCLUDE_DIRS})
+    endif()
+
+    # Only add cuSZp if found
     if(CLIO_CTP_ENABLE_CUSZP)
-        list(APPEND COMPRESS_LIBS ${CUSZP_LIBRARY})
-        list(APPEND COMPRESS_INCLUDES ${CUSZP_INCLUDE_DIR})
+        list(APPEND COMPRESS_LIBS ${cuszp_LIBRARIES})
+        list(APPEND COMPRESS_INCLUDES ${cuszp_INCLUDE_DIRS})
     endif()
 
     # Make CTP_ENABLE_LIBPRESSIO available to subdirectories (CTP)
@@ -634,8 +716,10 @@ if(CLIO_CTE_ENABLE_COMPRESS)
     # Make CLIO_CTP_ENABLE_ZFP_SYCL available to subdirectories (CTP). Distinct
     # from CLIO_CTP_ENABLE_SYCL (the SYCL-language switch) -- do not conflate.
     set(CLIO_CTP_ENABLE_ZFP_SYCL ${CLIO_CTP_ENABLE_ZFP_SYCL} CACHE BOOL "Enable zfp-sycl GPU compression (auto-detected)" FORCE)
-    # Make CLIO_CTP_ENABLE_CUSZP available to subdirectories (CTP)
-    set(CLIO_CTP_ENABLE_CUSZP ${CLIO_CTP_ENABLE_CUSZP} CACHE BOOL "Enable cuSZp GPU lossy compression (auto-detected)" FORCE)
+    # Make CLIO_CTP_ENABLE_CUSZ / CLIO_CTP_ENABLE_NDZIP available to subdirs (CTP)
+    set(CLIO_CTP_ENABLE_CUSZ ${CLIO_CTP_ENABLE_CUSZ} CACHE BOOL "Enable cuSZ GPU compression (auto-detected)" FORCE)
+    set(CLIO_CTP_ENABLE_NDZIP ${CLIO_CTP_ENABLE_NDZIP} CACHE BOOL "Enable ndzip GPU compression (auto-detected)" FORCE)
+    set(CLIO_CTP_ENABLE_CUSZP ${CLIO_CTP_ENABLE_CUSZP} CACHE BOOL "Enable cuSZp GPU compression (auto-detected)" FORCE)
 endif()
 
 # Encryption libraries (conditional)
@@ -699,7 +783,7 @@ if(CLIO_CORE_ENABLE_ZMQ)
         endif()
     endif()
     if(NOT _ZMQ_FOUND)
-        message(FATAL_ERROR "ZeroMQ not found. Please install ZeroMQ or run install.sh to build from submodules.")
+        message(FATAL_ERROR "ZeroMQ not found. Please install ZeroMQ or run CI/ci-deps.sh to build from submodules.")
     endif()
 endif()
 
@@ -762,13 +846,14 @@ if(CLIO_CTE_ENABLE_HDF5_VOL)
             list(APPEND HDF5_LIBRARIES CURL::libcurl)
         endif()
     else()
-        message(FATAL_ERROR "HDF5 not found. Please install HDF5 or run install.sh to build from submodules.")
+        message(FATAL_ERROR "HDF5 not found. Please install HDF5 or run CI/ci-deps.sh to build from submodules.")
     endif()
 else()
     message(STATUS "HDF5 support disabled")
 endif()
 
-# Poco and nlohmann_json (optional - for CAE Globus support)
+# Poco and nlohmann_json (optional - for CAE Globus support and the Google
+# Cloud Storage bdev adapter, which uses Poco::Net for HTTPS + Poco::JSON).
 find_package(Poco COMPONENTS Net NetSSL Crypto JSON QUIET)
 find_package(nlohmann_json QUIET)
 if(NOT nlohmann_json_FOUND)
@@ -780,6 +865,51 @@ if(NOT nlohmann_json_FOUND)
   )
   FetchContent_MakeAvailable(nlohmann_json)
   set(nlohmann_json_FOUND TRUE)
+endif()
+
+# The Google Cloud Storage adapter (kGcs bdev transport) talks to GCS over HTTPS
+# via Poco. If the option is requested but Poco isn't available, warn and disable
+# rather than fail the configure (mirrors the CAE Globus dependency check).
+if(CLIO_ENABLE_GOOGLE_CLOUD AND NOT Poco_FOUND)
+  message(WARNING "CLIO_ENABLE_GOOGLE_CLOUD is ON but the Poco library "
+                  "(Net, NetSSL, Crypto, JSON components) was not found. "
+                  "Google Cloud Storage support will be disabled. "
+                  "Install Poco (libpoco-dev) to enable it.")
+  set(CLIO_ENABLE_GOOGLE_CLOUD OFF)
+endif()
+if(CLIO_ENABLE_GOOGLE_CLOUD)
+  message(STATUS "Google Cloud Storage bdev support: ENABLED (Poco found)")
+endif()
+
+# AWS SDK for C++ (optional - for the CAE S3 assimilator, s3://). Reuses the
+# same dependency the bdev S3 transport links (aws-cpp-sdk-s3/-core). If the
+# option is requested but the SDK isn't found, warn and disable rather than
+# fail the configure (mirrors the CAE Globus dependency check).
+if(CAE_ENABLE_S3)
+  find_package(AWSSDK COMPONENTS s3 QUIET)
+  if(AWSSDK_FOUND)
+    message(STATUS "found AWS SDK for C++ (CAE S3 support: ENABLED)")
+  else()
+    message(WARNING "CAE_ENABLE_S3 is ON but the AWS SDK for C++ (component s3) "
+                    "was not found. S3 import will be disabled. "
+                    "Install aws-sdk-cpp to enable it.")
+    set(CAE_ENABLE_S3 OFF)
+  endif()
+endif()
+
+# google-cloud-cpp (optional - for the CAE GCS assimilator, gs://). A new
+# optional dependency (the storage component). If requested but not found,
+# warn and disable rather than fail the configure.
+if(CAE_ENABLE_GCS)
+  find_package(google_cloud_cpp_storage QUIET)
+  if(google_cloud_cpp_storage_FOUND)
+    message(STATUS "found google-cloud-cpp storage (CAE GCS support: ENABLED)")
+  else()
+    message(WARNING "CAE_ENABLE_GCS is ON but google-cloud-cpp (storage "
+                    "component) was not found. GCS import will be disabled. "
+                    "Install google-cloud-cpp to enable it.")
+    set(CAE_ENABLE_GCS OFF)
+  endif()
 endif()
 
 if (CLIO_CTE_ENABLE_ADIOS2_ADAPTER OR CLIO_CORE_ENABLE_GRAY_SCOTT)
@@ -866,10 +996,14 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   add_compile_options(-fcoroutines)
   message(STATUS "GCC detected - enabling coroutines with -fcoroutines")
 elseif(CMAKE_CXX_COMPILER_ID STREQUAL "NVHPC")
-  # NVHPC 25.5 crashes (ICE in llc) when compiling GCC 14 libstdc++ coroutines.
-  # CLIO Runtime uses ucontext_t fibers via CLIO_CO_AWAIT/CLIO_CO_RETURN macros instead.
-  # No __cpp_impl_coroutine needed - we do not include <coroutine> for NVHPC.
-  message(STATUS "NVHPC detected - using ucontext_t fiber fallback for C++20 coroutines")
+  # NVHPC 25.5 crashes (ICE in llc) when compiling GCC 14 libstdc++ coroutines,
+  # so it cannot use the C++20 stackless backend. Force the Boost.Context
+  # stackful backend instead (issue #620). The C++ carries no NVHPC-specific
+  # coroutine path anymore: the compiler decision is made here, in the build,
+  # and the runtime never includes <coroutine> when the Boost backend is on.
+  set(CLIO_CORE_ENABLE_BOOST_COROUTINES ON CACHE BOOL
+      "Forced ON: NVHPC cannot compile C++20 coroutines (issue #620)" FORCE)
+  message(STATUS "NVHPC detected - C++20 coroutines unsupported; forcing Boost.Context stackful backend")
 elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
   # Clang 16+ enables C++20 coroutines natively (no flags needed for CXX).
   # NVCC host compilation uses GCC which needs -fcoroutines for the builtins.
@@ -880,6 +1014,20 @@ elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
   else()
     message(STATUS "Clang ${CMAKE_CXX_COMPILER_VERSION} detected - C++20 coroutines enabled natively")
   endif()
+endif()
+
+# Boost.Context stackful coroutine backend (issue #620). Opt-in alternative to
+# the C++20 stackless coroutines above. Selected globally (the coroutine return
+# type / macros are header-driven, so the whole program must agree) and links
+# Boost::context into every target via the runtime's public interface.
+if(CLIO_CORE_ENABLE_BOOST_COROUTINES)
+  find_package(Boost REQUIRED COMPONENTS context)
+  add_compile_definitions(CLIO_ENABLE_BOOST_COROUTINES=1)
+  # make_task_fiber() (boost::context::fiber) is header-instantiated in every
+  # module's task methods, so every target must link Boost::context. This block
+  # runs before any add_subdirectory(), so link_libraries() reaches them all.
+  link_libraries(Boost::context)
+  message(STATUS "Boost stackful coroutine backend ENABLED (Boost::context ${Boost_VERSION})")
 endif()
 
 # Export compile commands for IDE integration - Applied to all subdirectories
@@ -1010,6 +1158,10 @@ if(NOT CLIO_CORE_MSVC_LIKE)
                             $<$<NOT:$<COMPILE_LANGUAGE:CUDA>>:-fprofile-arcs>
                             $<$<NOT:$<COMPILE_LANGUAGE:CUDA>>:-ftest-coverage>)
         add_link_options(--coverage)
+        # Lets tests that must exit via _exit() (skipping a crash-prone global
+        # teardown) still flush gcov counters explicitly via __gcov_dump(); the
+        # symbol only exists in coverage builds, so it is gated on this define.
+        add_compile_definitions(CLIO_COVERAGE_ENABLED)
     endif()
 else()
     # MSVC compiler flags
@@ -1076,6 +1228,17 @@ endforeach()
 if(CLIO_CORE_ENABLE_TESTS)
     enable_testing()
     include(CTest)
+
+    # CTest coverage exclusions (honoured by ctest_coverage(), which drives the
+    # CDash coverage submission — unlike lcov it has no per-line exclusion, so
+    # untestable whole files are dropped here by filename regex). Keep this in
+    # sync with the lcov --remove list in CI/calculate_coverage.sh and the
+    # codecov.yml ignore list.
+    #   * fuse_cte_main.cc — FUSE process entry / mount glue (fuse_main + the
+    #     apptainer --fusemount fd-injection path); not unit-testable.
+    file(WRITE "${CMAKE_BINARY_DIR}/CTestCustom.cmake"
+         "set(CTEST_CUSTOM_COVERAGE_EXCLUDE \${CTEST_CUSTOM_COVERAGE_EXCLUDE}\n"
+         "    \".*/fuse_cte_main\\\\.cc\")\n")
 
     # -----------------------------------------------------------------------
     # Test cleanup fixture (pre + post)
@@ -1154,6 +1317,22 @@ if(CLIO_CORE_ENABLE_TESTS)
           TIMEOUT 30
           FIXTURES_CLEANUP clio_test_cleanup_fixture
       )
+
+      # Pre-allow every test binary through Windows Defender Firewall so ctest
+      # doesn't pop a per-binary "Allow access?" prompt. The script self-elevates
+      # only when new binaries appear (it caches the allowed set in a marker), so
+      # a normal "build once, run ctest repeatedly" loop triggers at most one UAC
+      # prompt right after a fresh build. It is best-effort (always exits 0), and
+      # is a SETUP for the shared fixture so it runs before any networked test.
+      add_test(
+          NAME cr_firewall_allow
+          COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+                  -File "${CMAKE_SOURCE_DIR}/scripts/windows/allow_firewall.ps1"
+      )
+      set_tests_properties(cr_firewall_allow PROPERTIES
+          TIMEOUT 300
+          FIXTURES_SETUP clio_test_cleanup_fixture
+      )
     endif()
 endif()
 
@@ -1189,7 +1368,7 @@ endif()
 
 # yaml-cpp is already found by ClioCoreCommon (line 202)
 if(NOT TARGET yaml-cpp AND NOT TARGET yaml-cpp::yaml-cpp)
-  message(FATAL_ERROR "yaml-cpp was not found. Please run install.sh to install dependencies.")
+  message(FATAL_ERROR "yaml-cpp was not found. Please run CI/ci-deps.sh to install dependencies.")
 endif()
 message(STATUS "yaml-cpp already found by ClioCoreCommon")
 

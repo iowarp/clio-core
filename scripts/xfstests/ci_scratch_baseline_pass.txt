@@ -1,0 +1,92 @@
+# xfstests SCRATCH baseline: generic/* tests that require a SCRATCH device and
+# pass against the clio FUSE filesystem. CI runs ONLY these via
+# scripts/xfstests/run_ci_scratch_xfstests.sh and every one must pass.
+#
+# These are complementary to ci_baseline_pass.txt: those tests use only
+# TEST_DIR, while these need a second, independently-formattable scratch fs.
+# The clio FUSE fs can't be reformatted (no mkfs), and a single runtime serves
+# one global namespace, so the scratch driver instead brings up TWO isolated
+# persistent runtimes (one backs TEST_DIR, one SCRATCH_MNT) and wires xfstests'
+# native fuse mount-helper support so ./check mounts/unmounts each device
+# itself. No clio adapter changes are required for the harness.
+#
+# How this list was produced (not hand-curated): all 527 scratch-requiring
+# generic/* tests were swept against the clio FUSE fs on the merged build
+# (fallocate + mtime/atime + O_TRUNC fixes; runtimes given a 2 GB DRAM tier).
+# 482 are notrun (fuse feature gaps: shutdown, dm targets, symlinks-on-fuse,
+# ...), 9 FAIL and 11 HANG. The 25 below passed a discovery run AND two
+# independent verification runs.
+#
+# Failing/hanging scratch tests (tracked, not run in CI):
+#   FAIL: 003 120 452 615   (346/403/460 now pass -- already embedded-gated;
+#     519 now passes and is gated below. 2026-07-05 recheck on current build.)
+#     Root causes found 2026-07-05: 003 + 120 = atime relatime/noatime semantics
+#     (clio updates atime unconditionally, so "atime must NOT change" assertions
+#     fail); 452 = cannot exec a binary copied onto the fs ("Permission denied")
+#     -- clio getattr hardcodes regular files to mode 0644 (no +x) and chmod is a
+#     no-op, so the execute bit never sticks; 615 = stat st_blocks always 0 (clio
+#     getattr never populates st_blocks). 452 + 615 are addressable clio gaps.
+#   HANG: 347 (needs _require_dm_target -> really NOTRUN, not a hang) 707
+#   SLOW-PASS (not deadlocks; complete correctly given time, but run ~40-64s so
+#     they exceed a tight cap -- NOT gated to avoid CI-load flakiness near the
+#     90s cap, same policy as embedded 208/323): 339 (dir hash order) 464
+#     (delalloc/append/sync writeback race). Verified pass at CLIO_XFS_PERTEST_
+#     TIMEOUT=90 and 150 across multiple runs 2026-07-05.
+# Established 2026-07-03.
+#
+# 2026-07-04 update: the O_APPEND hang class 069/129/476/642 now PASS and are
+# gated below. Root cause was an O(N^2) append path: each tiny O_APPEND
+# allocated a new BlobBlock + burned a 4 KB bdev slab, so a multi-million-int
+# append grew the block list O(N) (O(N^2) read/write scans) and hit ENOSPC.
+# Fixed by BlobBlock capacity_/spare-fill (reuse a block's spare slab) +
+# CLIO_IPC_MODE=SHM in the driver (cross-process 3k->27k ops/s). Verified twice.
+# 551 + 750 remain NOT gated: they no longer hang but CRASH the client mount
+# daemon ("Transport endpoint is not connected") under their much heavier stress
+# (551 = aio-dio-write-verify, 750 = fsstress soak) -- a cross-process SHM
+# transport robustness issue under load, NOT the append fix (embedded fsstress
+# is clean) and NOT the O_APPEND pattern; tracked separately.
+# 2026-07-05 update: added 192 (atime) 258 (negative timestamps) 639 (write past
+# EOF after remount). These FAIL under the embedded harness only because it can't
+# remount TEST_DIR (_test_cycle_mount execs a nonexistent "clio_test" helper), so
+# the file vanishes -- NOT a clio atime/timestamp/persistence bug (the feature
+# logic is correct). Under this two-runtime driver the keeper survives the client
+# remount via the fuse mount-helper, and all three pass 3 independent runs.
+# 2026-07-05 update: added 344 + 345 (mmap-vs-buffered-write / mmap-vs-mmap race
+# tests via src/holetest). Both were previously listed above as FAIL(344)/HANG(345)
+# but now pass a discovery run + two verification runs on the two-runtime driver
+# (removed from the FAIL/HANG lists above).
+generic/029
+generic/030
+generic/069
+generic/071
+generic/084
+generic/098
+generic/124
+generic/129
+generic/130
+generic/132
+generic/135
+generic/141
+generic/169
+generic/192
+generic/258
+generic/340
+generic/344
+generic/345
+generic/354
+generic/393
+generic/406
+generic/412
+generic/422
+generic/476
+generic/519
+generic/524
+generic/525
+generic/565
+generic/604
+generic/634
+generic/639
+generic/642
+generic/732
+generic/749
+generic/761

@@ -16,7 +16,7 @@ class Iowarp(CMakePackage):
 
     # Branch versions
     version('main', branch='main', submodules=True, preferred=True)
-    version('dev', branch='74-fix-context-transport-primitives-for-the-gpu', submodules=True)
+    version('dev', branch='dev', submodules=True)
 
     # Build variants
     variant('debug', default=False, description='Build in Debug mode')
@@ -46,6 +46,13 @@ class Iowarp(CMakePackage):
     variant('rocm', default=False, description='Enable ROCm support')
     variant('adios2', default=False, description='Build with ADIOS2 support')
     variant('fuse', default=False, description='Enable FUSE3 adapter (CTE)')
+    variant('s3', default=False,
+            description='Enable Amazon S3 (s3://) import in CAE (aws-sdk-cpp)')
+    variant('gcs', default=False,
+            description='Enable Google Cloud Storage (gs://) import in CAE '
+                        '(google-cloud-cpp storage)')
+    variant('boost_coro', default=False,
+            description='Use Boost.Context stackful coroutine backend (issue #620)')
 
     # Core dependencies (always required)
     depends_on('cmake@3.25:')
@@ -73,6 +80,16 @@ class Iowarp(CMakePackage):
     depends_on('hdf5', when='+hdf5')
     depends_on('adios2', when='+adios2')
     depends_on('libfuse@3:', when='+fuse')
+    depends_on('boost+context', when='+boost_coro')
+
+    # CAE cloud import backends (opt-in). aws-sdk-cpp for the S3 assimilator
+    # (find_package(AWSSDK COMPONENTS s3)); the iowarp-overlay storage-only
+    # google-cloud-cpp for the GCS assimilator (find_package(google_cloud_cpp_storage)).
+    depends_on('aws-sdk-cpp', when='+s3')
+    depends_on('google-cloud-cpp', when='+gcs')
+
+    conflicts('+s3', when='~cae', msg='S3 import lives under CAE; enable +cae')
+    conflicts('+gcs', when='~cae', msg='GCS import lives under CAE; enable +cae')
 
     conflicts('+fuse', when='~cte', msg='fuse adapter lives under CTE; enable +cte')
 
@@ -95,6 +112,14 @@ class Iowarp(CMakePackage):
     depends_on('brotli', when='+compress')
     depends_on('snappy', when='+compress')
     depends_on('c-blosc2', when='+compress')
+
+    # GPU compression libraries (conditional on +compress +cuda). These operate
+    # on device pointers and back the ctp::Cusz / ctp::Ndzip / ctp::Cuszp wrappers.
+    #   - cuSZ has an upstream Spack package.
+    #   - ndzip and cuSZp have NO upstream Spack package; they are source-built in
+    #     the NVIDIA devcontainer (.devcontainer/nvidia-gpu/Dockerfile) instead.
+    #     Add a depends_on here if/when a Spack package becomes available.
+    depends_on('cusz', when='+compress +cuda')
 
     # Encryption libraries (conditional on +encrypt)
     depends_on('openssl', when='+encrypt')
@@ -120,6 +145,8 @@ class Iowarp(CMakePackage):
         args.append(self.define_from_variant('CLIO_CORE_ENABLE_CTE', 'cte'))
         args.append(self.define_from_variant('CLIO_CORE_ENABLE_CAE', 'cae'))
         args.append(self.define_from_variant('CLIO_CORE_ENABLE_CEE', 'cee'))
+        args.append(self.define_from_variant(
+            'CLIO_CORE_ENABLE_BOOST_COROUTINES', 'boost_coro'))
 
         # Context-transport-primitives (CTP) options
         if '+hdf5' in self.spec:
@@ -225,6 +252,10 @@ class Iowarp(CMakePackage):
                 args.append(self.define('CAE_ENABLE_CUDA', 'ON'))
             if '+rocm' in self.spec:
                 args.append(self.define('CAE_ENABLE_ROCM', 'ON'))
+            if '+s3' in self.spec:
+                args.append(self.define('CAE_ENABLE_S3', 'ON'))
+            if '+gcs' in self.spec:
+                args.append(self.define('CAE_ENABLE_GCS', 'ON'))
 
         return args
 

@@ -46,10 +46,24 @@
 #define PATH_MAX 4096  // POSIX default; not always in <climits> under NVHPC
 #endif
 // LCOV_EXCL_STOP
+#include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <string>
+
+#if CTP_HAS_POCO
+#include <Poco/Exception.h>
+#include <Poco/StreamCopier.h>
+#include <Poco/Timespan.h>
+#include <Poco/URI.h>
+#include <Poco/Net/HTTPClientSession.h>
+#include <Poco/Net/HTTPMessage.h>
+#include <Poco/Net/HTTPRequest.h>
+#include <Poco/Net/HTTPResponse.h>
+#include <istream>
+#endif
 
 #include "clio_ctp/constants/macros.h"
 // MSan: inform sanitizer that mmap-backed memory is initialized by the kernel
@@ -75,15 +89,18 @@
 #include <sys/socket.h>
 // LINUX
 #include <fcntl.h>
+#include <spawn.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #if __linux__
 #include <sys/sysinfo.h>
 #else
 #include <sys/sysctl.h>
 #endif
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 #if __linux__
 #include <linux/memfd.h>
@@ -97,12 +114,22 @@
 #include <ws2tcpip.h>
 #include <iphlpapi.h>
 #include <windows.h>
+#include <timeapi.h>
 #include <filesystem>
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "winmm.lib")
 #else
 #error \
     "Must define either CTP_ENABLE_PROCFS_SYSINFO or CTP_ENABLE_WINDOWS_SYSINFO"
+#endif
+
+#if CTP_ENABLE_PROCFS_SYSINFO
+// The process environment for posix_spawn. glibc only declares `environ` in
+// <unistd.h> under _GNU_SOURCE/_DEFAULT_SOURCE, so declare it here at GLOBAL
+// scope (declaring it inside namespace ctp would bind to a non-existent
+// ctp::environ).
+extern "C" char **environ;
 #endif
 
 namespace ctp {
@@ -539,12 +566,12 @@ bool SystemInfo::CreateNewSharedMemory(File &fd, const std::string &name,
   // not be reopened by name, breaking every OpenSharedMemory.
   std::string win_name = WinShmName(name);
   fd.windows_fd_ =
-      CreateFileMapping(INVALID_HANDLE_VALUE,    // use paging file
-                        nullptr,                 // default security
-                        PAGE_READWRITE,          // read/write access
-                        0,           // maximum object size (high-order DWORD)
-                        static_cast<DWORD>(size),  // low-order DWORD
-                        win_name.c_str());         // mapping object name
+      CreateFileMappingA(INVALID_HANDLE_VALUE,   // use paging file
+                         nullptr,                // default security
+                         PAGE_READWRITE,         // read/write access
+                         0,          // maximum object size (high-order DWORD)
+                         static_cast<DWORD>(size),  // low-order DWORD
+                         win_name.c_str());         // mapping object name
   return fd.windows_fd_ != nullptr;
 #endif
 }
@@ -565,7 +592,7 @@ bool SystemInfo::OpenSharedMemory(File &fd, const std::string &name) {
 #elif CTP_ENABLE_WINDOWS_SYSINFO
   std::string win_name = WinShmName(name);
   fd.windows_fd_ =
-      OpenFileMapping(FILE_MAP_ALL_ACCESS, FALSE, win_name.c_str());
+      OpenFileMappingA(FILE_MAP_ALL_ACCESS, FALSE, win_name.c_str());
   return fd.windows_fd_ != nullptr;
 #endif
 }
@@ -576,6 +603,18 @@ void SystemInfo::CloseSharedMemory(File &file) {
 #elif CTP_ENABLE_WINDOWS_SYSINFO
   CloseHandle(file.windows_fd_);
 #endif
+}
+
+bool SystemInfo::SharedMemoryExists(const std::string &name) {
+  // Open-then-close: cheaper than shm_attach (no header/data mapping) and
+  // side-effect free. A same-host runtime always creates its main segment
+  // (ServerInitShm is unconditional), so segment-present == local server up.
+  File probe;
+  if (!OpenSharedMemory(probe, name)) {
+    return false;
+  }
+  CloseSharedMemory(probe);
+  return true;
 }
 
 void SystemInfo::DestroySharedMemory(const std::string &name) {
@@ -641,10 +680,10 @@ void *SystemInfo::MapSharedMemory(const File &fd, size_t size, i64 off) {
   if (ret == nullptr) {
     DWORD error = GetLastError();
     LPVOID msg_buf;
-    FormatMessage(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM |
-                      FORMAT_MESSAGE_IGNORE_INSERTS,
-                  NULL, error, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
-                  (LPTSTR)&msg_buf, 0, NULL);
+    FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM |
+                       FORMAT_MESSAGE_IGNORE_INSERTS,
+                   NULL, error, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+                   (LPSTR)&msg_buf, 0, NULL);
     printf("MapViewOfFile failed with error: %s\n", (char *)msg_buf);
     LocalFree(msg_buf);
   }
@@ -771,6 +810,208 @@ void SystemInfo::TerminateProcessNow(int exit_code) {
   ::TerminateProcess(::GetCurrentProcess(), static_cast<UINT>(exit_code));
   // Fallback in case TerminateProcess somehow returns (it shouldn't).
   ::_exit(exit_code);
+#endif
+}
+
+SpawnedProcess SystemInfo::SpawnProcess(const std::string &exe,
+                                        const std::vector<std::string> &args,
+                                        const std::string &log_path,
+                                        bool detached) {
+  SpawnedProcess proc;
+#if CTP_ENABLE_PROCFS_SYSINFO
+  posix_spawn_file_actions_t actions;
+  posix_spawn_file_actions_init(&actions);
+  // Redirect stdout(1) to the log file, then dup stderr(2) onto it.
+  posix_spawn_file_actions_addopen(&actions, 1, log_path.c_str(),
+                                   O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  posix_spawn_file_actions_adddup2(&actions, 1, 2);
+  posix_spawnattr_t attr;
+  posix_spawnattr_t *attrp = nullptr;
+#ifdef POSIX_SPAWN_SETSID
+  if (detached) {
+    // New session => no controlling terminal, mirroring Windows DETACHED_PROCESS.
+    posix_spawnattr_init(&attr);
+    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSID);
+    attrp = &attr;
+  }
+#else
+  (void)detached;
+#endif
+  std::vector<char *> argv;
+  argv.push_back(const_cast<char *>(exe.c_str()));
+  for (const auto &a : args) argv.push_back(const_cast<char *>(a.c_str()));
+  argv.push_back(nullptr);
+  pid_t pid = -1;
+  int rc =
+      posix_spawn(&pid, exe.c_str(), &actions, attrp, argv.data(), environ);
+  posix_spawn_file_actions_destroy(&actions);
+  if (attrp != nullptr) posix_spawnattr_destroy(attrp);
+  if (rc == 0) {
+    proc.pid = static_cast<int>(pid);
+    proc.valid = true;
+  }
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  std::string cmd = "\"" + exe + "\"";
+  for (const auto &a : args) cmd += " " + a;
+  STARTUPINFOA si;
+  ZeroMemory(&si, sizeof(si));
+  si.cb = sizeof(si);
+  SECURITY_ATTRIBUTES sa;
+  sa.nLength = sizeof(sa);
+  sa.lpSecurityDescriptor = nullptr;
+  sa.bInheritHandle = TRUE;
+  HANDLE hlog = CreateFileA(log_path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, &sa,
+                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (hlog != INVALID_HANDLE_VALUE) {
+    si.dwFlags |= STARTF_USESTDHANDLES;
+    si.hStdOutput = hlog;
+    si.hStdError = hlog;
+    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+  }
+  PROCESS_INFORMATION pi;
+  ZeroMemory(&pi, sizeof(pi));
+  std::vector<char> mutable_cmd(cmd.begin(), cmd.end());
+  mutable_cmd.push_back('\0');
+  // #721: DETACHED_PROCESS gives the child no console; CREATE_NEW_PROCESS_GROUP
+  // detaches it from the parent's Ctrl-C group. This is the flag combination
+  // under which libzmq's ROUTER failed WSAStartup and went silently dead.
+  DWORD flags = detached ? (DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP) : 0;
+  BOOL ok = CreateProcessA(nullptr, mutable_cmd.data(), nullptr, nullptr, TRUE,
+                           flags, nullptr, nullptr, &si, &pi);
+  if (hlog != INVALID_HANDLE_VALUE) CloseHandle(hlog);
+  if (ok) {
+    proc.pid = static_cast<int>(pi.dwProcessId);
+    proc.win_process = reinterpret_cast<uint64_t>(pi.hProcess);
+    proc.win_thread = reinterpret_cast<uint64_t>(pi.hThread);
+    proc.valid = true;
+  }
+#endif
+  return proc;
+}
+
+bool SystemInfo::IsChildRunning(const SpawnedProcess &proc) {
+  if (!proc.valid) return false;
+#if CTP_ENABLE_PROCFS_SYSINFO
+  if (proc.pid <= 0) return false;
+  int status;
+  // 0 => still running; >0 => exited (and now reaped); -1 => already reaped.
+  return waitpid(proc.pid, &status, WNOHANG) == 0;
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  HANDLE h = reinterpret_cast<HANDLE>(proc.win_process);
+  if (h == NULL) return false;
+  DWORD code = 0;
+  if (!GetExitCodeProcess(h, &code)) return false;
+  return code == STILL_ACTIVE;
+#endif
+}
+
+void SystemInfo::TerminateChild(SpawnedProcess &proc, int grace_ms) {
+  if (!proc.valid) return;
+#if CTP_ENABLE_PROCFS_SYSINFO
+  if (proc.pid > 0) {
+    int status;
+    // If a prior IsChildRunning() already reaped it (or it exits right now),
+    // don't send a signal to a possibly-recycled pid.
+    pid_t r = waitpid(proc.pid, &status, WNOHANG);
+    if (r == 0) {  // still running: graceful SIGTERM, then SIGKILL
+      kill(proc.pid, SIGTERM);
+      bool reaped = false;
+      for (int i = 0; i < grace_ms / 100; ++i) {
+        if (waitpid(proc.pid, &status, WNOHANG) != 0) { reaped = true; break; }
+        struct timespec ts = {0, 100 * 1000 * 1000};  // 100 ms
+        nanosleep(&ts, nullptr);
+      }
+      if (!reaped) {
+        kill(proc.pid, SIGKILL);
+        waitpid(proc.pid, &status, 0);
+      }
+    }
+  }
+  proc.pid = -1;
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  HANDLE hp = reinterpret_cast<HANDLE>(proc.win_process);
+  HANDLE ht = reinterpret_cast<HANDLE>(proc.win_thread);
+  if (hp != NULL) {
+    ::TerminateProcess(hp, 0);
+    WaitForSingleObject(hp, static_cast<DWORD>(grace_ms));
+    CloseHandle(hp);
+  }
+  if (ht != NULL) CloseHandle(ht);
+  proc.win_process = 0;
+  proc.win_thread = 0;
+#endif
+  proc.valid = false;
+}
+
+#if CTP_ENABLE_WINDOWS_SYSINFO
+// Defined in winnt.h for SDK 10.0.17134 (Windows 10 1803) and later; define
+// defensively so an older SDK still compiles (the flag is simply ignored, and
+// the null-handle fallback below downgrades to a standard-resolution timer).
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+#endif
+
+void SystemInfo::RequestTimerResolutionFromEnv() {
+#if CTP_ENABLE_WINDOWS_SYSINFO
+  // Diagnostic / workaround knob for the tick-quantized waits behind the
+  // Windows TCP latency (issue #768). WaitForMultipleObjectsEx and ::Sleep
+  // expire their timeouts only at timer interrupts (~15.6ms default), so a
+  // Wait(100us) that nothing signals wakes up to 15.6ms late. Setting
+  // CLIO_WIN_TIMER_MS=1 raises this process's timer resolution to 1ms
+  // (timeBeginPeriod is per-process since Windows 10 2004, so BOTH the
+  // daemon and the client must set it). Never released deliberately: the
+  // request must live as long as the process serves traffic.
+  static bool requested = false;
+  if (requested) return;
+  const char *env = std::getenv("CLIO_WIN_TIMER_MS");
+  if (env == nullptr || *env == '\0') return;
+  UINT ms = static_cast<UINT>(std::atoi(env));
+  if (ms == 0) return;
+  MMRESULT rc = ::timeBeginPeriod(ms);
+  requested = true;
+  // This file sits below the logging layer; a diagnostic knob still deserves
+  // one line of confirmation.
+  std::fprintf(stderr, "SystemInfo: timeBeginPeriod(%u) -> %s\n", ms,
+               rc == TIMERR_NOERROR ? "ok" : "FAILED");
+#endif
+}
+
+void SystemInfo::SleepForUs(size_t us) {
+  if (us == 0) return;
+#if CTP_ENABLE_PROCFS_SYSINFO
+  // POSIX: nanosleep already honors sub-microsecond requests (subject to the
+  // hrtimer slack, ~50us by default), so no special handling is needed.
+  struct timespec ts;
+  ts.tv_sec = static_cast<time_t>(us / 1000000);
+  ts.tv_nsec = static_cast<long>((us % 1000000) * 1000);
+  nanosleep(&ts, nullptr);
+#elif CTP_ENABLE_WINDOWS_SYSINFO
+  // One-shot high-resolution waitable timer. Unlike std::this_thread::sleep_for
+  // (which rounds up to the ~1-15.6ms global timer tick), this gives
+  // sub-millisecond accuracy without calling timeBeginPeriod (no global timer
+  // rate change). The timer is created/closed per call rather than cached in a
+  // thread_local (a project rule + per-DLL duplication hazard on Windows); the
+  // CreateWaitableTimer cost is a few microseconds, dwarfed by any sleep long
+  // enough to be worth issuing.
+  HANDLE timer = ::CreateWaitableTimerExW(
+      nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+  if (timer == nullptr) {
+    // Pre-1803: high-resolution flag unsupported. Standard-resolution timer.
+    timer = ::CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_ALL_ACCESS);
+  }
+  if (timer != nullptr) {
+    LARGE_INTEGER due;
+    // Negative => relative due time, expressed in 100ns units.
+    due.QuadPart = -static_cast<LONGLONG>(us) * 10;
+    if (::SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) {
+      ::WaitForSingleObject(timer, INFINITE);
+    }
+    ::CloseHandle(timer);
+    return;
+  }
+  // Last resort: coarse Sleep, rounded up to >= 1ms.
+  ::Sleep(static_cast<DWORD>((us + 999) / 1000));
 #endif
 }
 
@@ -998,8 +1239,8 @@ std::string SystemInfo::Getenv(const char *name, size_t max_size) {
 #elif CTP_ENABLE_WINDOWS_SYSINFO
   std::string var;
   var.resize(max_size);
-  DWORD len = GetEnvironmentVariable(name, var.data(),
-                                     static_cast<DWORD>(var.size()));
+  DWORD len = GetEnvironmentVariableA(name, var.data(),
+                                      static_cast<DWORD>(var.size()));
   if (len == 0) {
     return "";
   }
@@ -1170,6 +1411,96 @@ std::string SystemInfo::GetDeviceHealthStats(const std::string &path) {
   return result.empty() ? "{}" : result;
 #else
   (void)path;
+  return "{}";
+#endif
+}
+
+/// @brief Derive the drive type ("hdd" or "ssd") from a pool/drive name.
+std::string SystemInfo::DeriveDriveType(const std::string &pool_name) {
+  // Case-insensitive substring match on "hdd"; default to "ssd" otherwise so
+  // an unlabelled pool routes to the flash model rather than failing.
+  std::string lower = pool_name;
+  std::transform(lower.begin(), lower.end(), lower.begin(),
+                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  return lower.find("hdd") != std::string::npos ? "hdd" : "ssd";
+}
+
+#if CTP_HAS_POCO
+namespace {
+// Minimal JSON string escaping so an error message embedded in the fallback
+// payload can never produce invalid JSON (quotes/backslashes/control chars).
+std::string JsonEscape(const std::string &s) {
+  std::string out;
+  out.reserve(s.size() + 8);
+  for (char c : s) {
+    switch (c) {
+      case '"': out += "\\\""; break;
+      case '\\': out += "\\\\"; break;
+      case '\n':
+      case '\r':
+      case '\t': out += ' '; break;
+      default:
+        if (static_cast<unsigned char>(c) < 0x20) {
+          out += ' ';
+        } else {
+          out += c;
+        }
+    }
+  }
+  return out;
+}
+}  // namespace
+#endif
+
+/// @brief Predicts drive failure by POSTing health metrics to a local
+/// prediction server. See the header for the graceful-degradation contract.
+std::string SystemInfo::PredictDriveFailure(const std::string &drive_type,
+                                            const std::string &health_json,
+                                            const std::string &drive_id) {
+  // The request body is identical regardless of transport availability so the
+  // payload contract is stable; only the actual send is Poco-gated.
+  const std::string metrics =
+      (health_json.empty() || health_json == "{}") ? "{}" : health_json;
+  const std::string payload = "{\"drive_type\": \"" + drive_type + "\", " +
+                              "\"drive_id\": \"" + drive_id + "\", " +
+                              "\"metrics\": " + metrics + "}";
+
+#if CTP_HAS_POCO
+  // Endpoint is overridable via CLIO_PREDICT_URL so tests and non-Docker
+  // deployments can target a reachable server. The default host.docker.internal
+  // only resolves under Docker Desktop; on any other host the connect fails
+  // fast and we return an {"error": ...} JSON object rather than throwing.
+  const char *env_url = std::getenv("CLIO_PREDICT_URL");
+  const std::string url =
+      (env_url && *env_url) ? env_url
+                            : "http://host.docker.internal:8000/predict/auto";
+  try {
+    Poco::URI uri(url);
+    std::string path = uri.getPathAndQuery();
+    if (path.empty()) {
+      path = "/";
+    }
+
+    Poco::Net::HTTPClientSession session(uri.getHost(), uri.getPort());
+    session.setTimeout(Poco::Timespan(5, 0));  // 5s for connect/send/receive
+
+    Poco::Net::HTTPRequest req(Poco::Net::HTTPRequest::HTTP_POST, path,
+                               Poco::Net::HTTPMessage::HTTP_1_1);
+    req.setContentType("application/json");
+    req.setContentLength(static_cast<std::streamsize>(payload.size()));
+    session.sendRequest(req) << payload;
+
+    Poco::Net::HTTPResponse res;
+    std::istream &rs = session.receiveResponse(res);
+    std::string body;
+    Poco::StreamCopier::copyToString(rs, body);
+    return body.empty() ? "{}" : body;
+  } catch (const Poco::Exception &e) {
+    return std::string("{\"error\": \"Prediction server unreachable: ") +
+           JsonEscape(e.displayText()) + "\"}";
+  }
+#else
+  (void)payload;
   return "{}";
 #endif
 }

@@ -142,12 +142,21 @@ fi
 COVERAGE_EXCLUDE_LABELS="integration|restart|functional|query|stress|docker"
 COVERAGE_EXCLUDE_NAMES="cr_bdev_|cr_mpi_|cr_per_process_shm_stress"
 
-# macOS-only: cr_cli_fallback_runtime brings up two in-process runtimes and
-# completes a punted task's FutureShm in place across them, which hangs on macOS
-# (consistent 120s timeout) — the same in-process-runtime concurrency class as
-# #482/#485. It passes on Linux (~18s), where it stays enabled.
-if [ "$(uname -s)" = "Darwin" ]; then
-    COVERAGE_EXCLUDE_NAMES="${COVERAGE_EXCLUDE_NAMES}|cr_cli_fallback_runtime"
+# ---------------------------------------------------------------------------
+# Phased coverage. When PHASE_CTEST_INCLUDE_LABELS is set, this run is one
+# phase of the build-and-test pipeline: it builds with PHASE_CMAKE_ARGS, runs
+# ONLY the ctests carrying those labels, and scopes the emitted coverage to
+# PHASE_EXTRACT_PATHS (space-separated lcov path globs). Left unset, the script
+# keeps its original behavior: the "unit" phase that runs everything except the
+# slow/daemon/integration labels above. Each phase uploads under its own
+# Codecov flag so Codecov merges them into one report (see codecov.yml).
+# ---------------------------------------------------------------------------
+PHASE_CMAKE_ARGS="${PHASE_CMAKE_ARGS:-}"
+PHASE_CTEST_INCLUDE_LABELS="${PHASE_CTEST_INCLUDE_LABELS:-}"
+PHASE_CTEST_EXCLUDE_LABELS="${PHASE_CTEST_EXCLUDE_LABELS:-}"
+PHASE_EXTRACT_PATHS="${PHASE_EXTRACT_PATHS:-}"
+if [ -n "${PHASE_CTEST_INCLUDE_LABELS}" ]; then
+    print_info "Phased run: labels='${PHASE_CTEST_INCLUDE_LABELS}' extra_cmake='${PHASE_CMAKE_ARGS}'"
 fi
 
 # Detect lcov version for RC option compatibility.
@@ -192,7 +201,7 @@ if [ "$DO_BUILD" = true ]; then
         print_info "Installing build dependencies into conda env..."
         conda install -y -c conda-forge \
             cmake make pkg-config cereal yaml-cpp zeromq \
-            msgpack-c hdf5 catch2 libaio liburing 2>&1 | tail -3
+            msgpack-c hdf5 catch2 libaio liburing poco 2>&1 | tail -3
     fi
 
     print_info "Configuring build with coverage enabled..."
@@ -207,7 +216,8 @@ if [ "$DO_BUILD" = true ]; then
         -DCLIO_CORE_ENABLE_DOCKER_CI=OFF \
         -DCLIO_CTE_ENABLE_ADIOS2_ADAPTER=OFF \
         -DCLIO_CTE_ENABLE_COMPRESS=OFF \
-        -DCLIO_CORE_ENABLE_GRAY_SCOTT=OFF
+        -DCLIO_CORE_ENABLE_GRAY_SCOTT=OFF \
+        ${PHASE_CMAKE_ARGS}
 
     print_info "Building project..."
     NUM_CORES=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
@@ -232,8 +242,59 @@ if [ "$DO_CTEST" = true ]; then
 
     cd "${BUILD_DIR}"
 
+    # Phase-aware test selection: a phase runs ONLY its labels; the default
+    # (unit) run keeps the historical slow/daemon/integration exclusions.
+    if [ -n "${PHASE_CTEST_INCLUDE_LABELS}" ]; then
+        CTEST_TEST_SELECT="INCLUDE_LABEL \"${PHASE_CTEST_INCLUDE_LABELS}\""
+        if [ -n "${PHASE_CTEST_EXCLUDE_LABELS}" ]; then
+            CTEST_TEST_SELECT="${CTEST_TEST_SELECT} EXCLUDE_LABEL \"${PHASE_CTEST_EXCLUDE_LABELS}\""
+        fi
+    else
+        CTEST_TEST_SELECT="EXCLUDE_LABEL \"${COVERAGE_EXCLUDE_LABELS}\" EXCLUDE \"${COVERAGE_EXCLUDE_NAMES}\""
+    fi
+
     if [ -n "${SITE_NAME}" ]; then
         print_info "Running tests and submitting to CDash (site: ${SITE_NAME})..."
+
+        # Scope the CDash coverage submission to the subtree this phase owns
+        # (PHASE_CDASH_KEEP, e.g. "context-transfer-engine/adapter" for the fuse
+        # phase). ctest_coverage() has no include filter and otherwise reports
+        # WHOLE-BUILD coverage measured under a partial (labelled) test run, so
+        # the fuse adapter's ~97% got diluted into a ~36% whole-repo headline.
+        # We exclude every OTHER source component so the CDash phase build
+        # reports the phase's own code, mirroring the Codecov extract scoping.
+        CDASH_SCOPE_BLOCK=""
+        if [ -n "${PHASE_CDASH_KEEP:-}" ]; then
+            print_info "Scoping CDash coverage to: ${PHASE_CDASH_KEEP}"
+            _excludes=""
+            while IFS= read -r comp; do
+                [ -z "${comp}" ] && continue
+                rel="${comp#"${REPO_ROOT}/"}"
+                keep_it=0
+                for k in ${PHASE_CDASH_KEEP}; do
+                    k="${k%/}"
+                    # keep if the component is under a kept path, OR is an
+                    # ancestor of one (so parents like context-transfer-engine
+                    # are not excluded wholesale).
+                    case "${rel}/" in "${k}"/*) keep_it=1;; esac
+                    case "${k}/" in "${rel}"/*) keep_it=1;; esac
+                done
+                [ "${keep_it}" = 0 ] && _excludes="${_excludes}    \".*/${rel}/.*\"\n"
+            done < <(
+                { find "${REPO_ROOT}" -mindepth 1 -maxdepth 1 -type d \
+                       \( -name 'context-*' -o -name 'prediction_server' \);
+                  find "${REPO_ROOT}/context-transfer-engine" -mindepth 1 -maxdepth 1 \
+                       -type d 2>/dev/null; } | sort -u
+            )
+            if [ -n "${_excludes}" ]; then
+                # Seed CTEST_CUSTOM_COVERAGE_EXCLUDE with the complement of the
+                # kept subtree. The build's generated CTestCustom.cmake (read by
+                # ctest_coverage()) then appends its own entries (e.g.
+                # fuse_cte_main.cc) to this, so both are honoured.
+                CDASH_SCOPE_BLOCK=$(printf 'set(CTEST_CUSTOM_COVERAGE_EXCLUDE\n%b)' "${_excludes}")
+            fi
+        fi
+
         # Generate CTest dashboard script for CDash submission
         cat > "${BUILD_DIR}/cdash_coverage.cmake" << EOFCMAKE
 set(CTEST_SITE "${SITE_NAME}")
@@ -245,8 +306,9 @@ set(CTEST_DROP_SITE "my.cdash.org")
 set(CTEST_DROP_LOCATION "/submit.php?project=HERMES")
 set(CTEST_DROP_SITE_CDASH TRUE)
 set(CTEST_COVERAGE_COMMAND "gcov")
+${CDASH_SCOPE_BLOCK}
 ctest_start("Experimental")
-ctest_test(RETURN_VALUE test_result EXCLUDE_LABEL "${COVERAGE_EXCLUDE_LABELS}" EXCLUDE "${COVERAGE_EXCLUDE_NAMES}")
+ctest_test(RETURN_VALUE test_result ${CTEST_TEST_SELECT})
 ctest_coverage()
 ctest_submit()
 if(NOT test_result EQUAL 0)
@@ -256,11 +318,19 @@ EOFCMAKE
         ctest -S "${BUILD_DIR}/cdash_coverage.cmake" -VV || true
         print_success "CDash submission complete"
     else
-        print_info "Running unit tests (excluding slow/daemon tests)..."
         CTEST_EXIT_CODE=0
-        ctest --output-on-failure --timeout 120 \
-            -LE "${COVERAGE_EXCLUDE_LABELS}" \
-            -E "${COVERAGE_EXCLUDE_NAMES}" || CTEST_EXIT_CODE=$?
+        if [ -n "${PHASE_CTEST_INCLUDE_LABELS}" ]; then
+            print_info "Running phase tests (labels: ${PHASE_CTEST_INCLUDE_LABELS}, exclude: ${PHASE_CTEST_EXCLUDE_LABELS:-none})..."
+            PHASE_LE_ARGS=()
+            [ -n "${PHASE_CTEST_EXCLUDE_LABELS}" ] && PHASE_LE_ARGS=(-LE "${PHASE_CTEST_EXCLUDE_LABELS}")
+            ctest --output-on-failure --timeout 120 \
+                -L "${PHASE_CTEST_INCLUDE_LABELS}" "${PHASE_LE_ARGS[@]}" || CTEST_EXIT_CODE=$?
+        else
+            print_info "Running unit tests (excluding slow/daemon tests)..."
+            ctest --output-on-failure --timeout 120 \
+                -LE "${COVERAGE_EXCLUDE_LABELS}" \
+                -E "${COVERAGE_EXCLUDE_NAMES}" || CTEST_EXIT_CODE=$?
+        fi
         if [ $CTEST_EXIT_CODE -eq 0 ]; then
             print_success "All CTest tests passed"
         else
@@ -435,6 +505,7 @@ lcov --remove coverage_all.info \
      '*/benchmark/*' \
      '*/local_sched.cc' \
      '*/globus_file_assimilator.cc' \
+     '*/fuse_cte_main.cc' \
      --output-file coverage_filtered.info \
      "${LCOV_IGNORE_OPTS[@]}" \
      2>&1 | grep -E "Removed|Summary|lines|functions" | tail -5 || true
@@ -445,6 +516,23 @@ if [ ! -f coverage_filtered.info ] || [ ! -s coverage_filtered.info ]; then
 fi
 
 print_success "Coverage data filtered"
+
+# Phased coverage: scope this phase's report to only the code it exercises, so
+# each Codecov flag reports coverage for its own component (not the whole tree).
+if [ -n "${PHASE_EXTRACT_PATHS}" ]; then
+    print_info "Scoping coverage to phase paths: ${PHASE_EXTRACT_PATHS}"
+    # shellcheck disable=SC2086  # intentional word-splitting of the glob list
+    lcov --extract coverage_filtered.info ${PHASE_EXTRACT_PATHS} \
+         --output-file coverage_phase.info \
+         "${LCOV_IGNORE_OPTS[@]}" \
+         2>&1 | grep -E "Removed|Summary|lines|functions" | tail -3 || true
+    if [ -f coverage_phase.info ] && [ -s coverage_phase.info ]; then
+        mv coverage_phase.info coverage_filtered.info
+        print_success "Coverage scoped to phase paths"
+    else
+        print_warning "Phase extract produced no data; keeping full filtered set"
+    fi
+fi
 
 ################################################################################
 # Step 7: Generate HTML report

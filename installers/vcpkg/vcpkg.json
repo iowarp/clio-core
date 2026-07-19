@@ -19,5 +19,13 @@
     "msgpack-c",
     "hdf5",
     "catch2"
-  ]
+  ],
+  "features": {
+    "boost-coroutines": {
+      "description": "Boost.Context stackful coroutine backend (CLIO_CORE_ENABLE_BOOST_COROUTINES, issue #620)",
+      "dependencies": [
+        "boost-context"
+      ]
+    }
+  }
 }

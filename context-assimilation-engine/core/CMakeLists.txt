@@ -121,6 +121,30 @@ if(GLOBUS_ENABLED)
   list(APPEND RUNTIME_LINK_LIBRARIES Poco::Net Poco::NetSSL Poco::Crypto Poco::JSON nlohmann_json::nlohmann_json)
 endif()
 
+# Conditionally add S3 assimilator if enabled (AWS SDK found by root CMakeLists).
+# NOTE: the AWS SDK is intentionally NOT linked into the CAE runtime library.
+# Loading libaws-cpp-sdk-core.so into the CLIO runtime process corrupts runtime
+# startup (its load-time global ctors / static-baked s2n collide with CLIO init).
+# The assimilator instead shells out to the standalone `cae_s3_tool` helper
+# (defined below), which is the only target that links the AWS SDK.
+if(CAE_ENABLE_S3)
+  message(STATUS "CAE S3 support: ENABLED")
+  add_compile_definitions(CAE_ENABLE_S3)
+  list(APPEND RUNTIME_SOURCES src/factory/s3_file_assimilator.cc)
+else()
+  message(STATUS "CAE S3 support: DISABLED")
+endif()
+
+# Conditionally add GCS assimilator if enabled (google-cloud-cpp found by root).
+if(CAE_ENABLE_GCS)
+  message(STATUS "CAE GCS support: ENABLED")
+  add_compile_definitions(CAE_ENABLE_GCS)
+  list(APPEND RUNTIME_SOURCES src/factory/gcs_file_assimilator.cc)
+  list(APPEND RUNTIME_LINK_LIBRARIES google-cloud-cpp::storage)
+else()
+  message(STATUS "CAE GCS support: DISABLED")
+endif()
+
 add_clio_module_runtime(
   SOURCES
     ${RUNTIME_SOURCES}
@@ -142,6 +166,16 @@ endif()
 #------------------------------------------------------------------------------
 # Utilities
 #------------------------------------------------------------------------------
+
+# cae_s3_tool: standalone S3 helper executable. This is the ONLY target that
+# links the AWS SDK; S3FileAssimilator fork+execs it so the SDK never loads into
+# the CLIO runtime process (which would corrupt runtime startup). It links no
+# CLIO libraries. Installed to bin/ alongside the runtime.
+if(CAE_ENABLE_S3)
+  add_executable(cae_s3_tool src/factory/tools/s3_tool_main.cc)
+  target_link_libraries(cae_s3_tool PRIVATE aws-cpp-sdk-s3 aws-cpp-sdk-core)
+  install(TARGETS cae_s3_tool DESTINATION bin)
+endif()
 
 # clio_cae utility (CAE OMNI ingest driver). Installed as `clio_cae`;
 # the legacy `clio_cae_omni` name is preserved as an install-time symlink

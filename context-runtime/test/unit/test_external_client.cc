@@ -193,12 +193,17 @@ TEST_CASE("ExternalClient - Client Operations", "[external_client][ipc]") {
   auto *ipc = CLIO_IPC;
   REQUIRE(ipc != nullptr);
 
-  // In TCP mode (default), num_sched_queues_ is not set so
-  // GetNumSchedQueues returns 0. In SHM mode it would be > 0.
-  u32 num_queues = ipc->GetNumSchedQueues();
-  if (ipc->GetIpcMode() == IpcMode::kShm) {
-    REQUIRE(num_queues > 0);
-  }
+  // num_sched_queues_ is a server-side scheduler concept: only
+  // ServerInitQueues and the schedulers' DivideWorkers ever set it. No client
+  // path populates it in ANY mode -- an SHM client attaches the task queue
+  // (see the Basic Connection test) but never the scheduler queue count.
+  //
+  // The old REQUIRE(num_queues > 0) under SHM here was dead code: with
+  // CLIO_IPC_MODE unset the client always defaulted to TCP, so the branch
+  // never ran. IPC auto-select (#768) now picks SHM for a same-host client
+  // and exposed that the assertion never described client behavior. Assert
+  // the truthful invariant instead: clients report 0 regardless of mode.
+  REQUIRE(ipc->GetNumSchedQueues() == 0);
 
   // Note: GetNumHosts, GetHost, and GetAllHosts are server-only operations.
   // The hostfile_map_ is populated during ServerInit and is NOT shared via

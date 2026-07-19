@@ -144,3 +144,7 @@ models/
 #external/libzmq/
 
 claude-log.json
+
+# Windows firewall allow-rule marker (scripts/windows/allow_firewall.ps1)
+.clio_firewall_allowed
+context-runtime/test/integration/collective_restart/docker-compose.override.yml

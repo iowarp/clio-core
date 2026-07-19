@@ -6,6 +6,7 @@
 #include <iomanip>
 
 #include <clio_ctp/serialize/msgpack_wrapper.h>
+#include <clio_ctp/thread/thread_model_manager.h>
 
 #include "clio_runtime/clio_runtime.h"
 #include "clio_runtime/singletons.h"
@@ -237,7 +238,7 @@ int Monitor(int argc, char* argv[]) {
       if (opts.once) break;
 
       for (int i = 0; i < opts.interval_sec && g_monitor_running; ++i) {
-        std::this_thread::sleep_for(std::chrono::seconds(1));
+        CTP_THREAD_MODEL->SleepForUs(1000000);
       }
 
     } catch (const std::exception& e) {

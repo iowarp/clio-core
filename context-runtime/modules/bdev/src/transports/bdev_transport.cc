@@ -11,6 +11,10 @@
 #include <clio_runtime/bdev/transports/s3_bdev_transport.h>
 #endif
 
+#ifdef CLIO_ENABLE_GOOGLE_CLOUD
+#include <clio_runtime/bdev/transports/gcs_bdev_transport.h>
+#endif
+
 namespace clio::run::bdev {
 
 std::unique_ptr<BdevTransport> BdevTransportFactory::Create(BdevType type) {
@@ -24,6 +28,10 @@ std::unique_ptr<BdevTransport> BdevTransportFactory::Create(BdevType type) {
 #ifdef CLIO_ENABLE_AMAZON_DRIVE
     case BdevType::kS3:
       return std::make_unique<S3BdevTransport>();
+#endif
+#ifdef CLIO_ENABLE_GOOGLE_CLOUD
+    case BdevType::kGcs:
+      return std::make_unique<GcsBdevTransport>();
 #endif
     default:
       return nullptr;

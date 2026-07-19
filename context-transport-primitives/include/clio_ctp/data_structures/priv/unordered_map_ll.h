@@ -80,6 +80,12 @@
 
 namespace ctp::priv {
 
+/** Lock mode for unordered_map_ll::for_each(). kExclusive = map-wide write lock
+ *  (quiescent map; callback may mutate values). kShared = map-wide read lock +
+ *  per-bucket read lock (runs concurrently with readers/single-key ops;
+ *  READ-ONLY callbacks only). See for_each() for the full contract. */
+enum class ForEachLock { kExclusive, kShared };
+
 #ifndef CTP_PRIV_INSERT_RESULT_DEFINED_
 #define CTP_PRIV_INSERT_RESULT_DEFINED_
 /** Result of insert / insert_or_assign operations. Guard-shared with
@@ -139,15 +145,12 @@ class unordered_map_ll {
   // it; rehash/clear/for_each take it in WRITE mode (exclusive), which drains
   // all in-flight ops first. See the THREAD-SAFETY CONTRACT above.
   ctp::RwLock global_lock_;
-  // Writer-preference signal for global_lock_. ctp::RwLock is reader-preferring:
-  // ReadLock enters whenever the lock is already in read mode, regardless of a
-  // waiting writer, and the mode only drops to "none" once readers_ hits 0. A
-  // sustained stream of inserts/finds therefore keeps readers_ > 0 forever and
-  // the rehash WriteLock can starve indefinitely (observed as a Windows
-  // livelock/timeout in the concurrent-growth stress test). This counter rises
-  // only around the rare grow/clear/iterate path; readers yield while it is
-  // nonzero so in-flight readers drain and the writer can acquire.
-  ctp::ipc::atomic<size_type> pending_writers_;
+  // Reader/writer starvation note: ctp::RwLock is reader-preferring, so a
+  // sustained insert/find stream would keep readers_ > 0 and starve the rehash
+  // WriteLock (a Windows/icx livelock/timeout in the growth stress test). Both
+  // global_read_lock() and read_lock_bucket() therefore request RwLock's opt-in
+  // writer_priority mode, which defers new readers while a writer is waiting —
+  // so no separate hand-rolled writer-preference counter is needed here.
   ctp::ipc::atomic<size_type> size_;
   AllocT *alloc_;
   Hash hash_fn_;
@@ -169,10 +172,13 @@ class unordered_map_ll {
     return hash_fn_(key) % buckets_.size();
   }
 
-  /** Read-lock a bucket (no-op when locking is disabled). */
+  /** Read-lock a bucket (no-op when locking is disabled). Uses RwLock's opt-in
+   *  writer_priority mode so a sustained find() stream can't starve insert/erase
+   *  on the bucket (see the global_lock_ starvation note above). */
   CTP_INLINE_CROSS_FUN
   void read_lock_bucket(size_type b) {
-    if constexpr (EnableLocking) locks_[b].ReadLock(0);
+    if constexpr (EnableLocking)
+      locks_[b].ReadLock(0, /*writer_priority=*/true);
   }
   CTP_INLINE_CROSS_FUN
   void read_unlock_bucket(size_type b) {
@@ -190,38 +196,23 @@ class unordered_map_ll {
 
   /** Map-wide read lock — shared; held during every single-key operation so a
    *  concurrent rehash (which needs the write lock) cannot reallocate the
-   *  bucket/lock arrays mid-operation. No-op when locking is disabled. */
+   *  bucket/lock arrays mid-operation. Uses writer_priority so a steady op
+   *  stream can't starve the rehash writer. No-op when locking is disabled. */
   CTP_INLINE_CROSS_FUN void global_read_lock() {
-    if constexpr (EnableLocking) {
-      // Defer to a pending writer (rehash) so it cannot starve — see the
-      // pending_writers_ comment. Stragglers that slip past this check before a
-      // writer bumps the counter are bounded (the writer's WriteLock simply
-      // drains them), so this throttles new readers without blocking forever.
-      while (pending_writers_.load() > 0) {
-#if !CTP_IS_DEVICE_PASS
-        CTP_THREAD_MODEL->Yield();
-#endif
-      }
-      global_lock_.ReadLock(0);
-    }
+    if constexpr (EnableLocking)
+      global_lock_.ReadLock(0, /*writer_priority=*/true);
   }
   CTP_INLINE_CROSS_FUN void global_read_unlock() {
     if constexpr (EnableLocking) global_lock_.ReadUnlock();
   }
   /** Map-wide write lock — exclusive; taken only to grow/clear/iterate. Drains
-   *  all in-flight single-key ops (their read locks) before proceeding. Bumps
-   *  pending_writers_ first so new readers back off (writer preference). */
+   *  all in-flight single-key ops (their read locks) before proceeding; new
+   *  readers back off via RwLock's writer_priority mode (writer preference). */
   CTP_INLINE_CROSS_FUN void global_write_lock() {
-    if constexpr (EnableLocking) {
-      pending_writers_.fetch_add(1);
-      global_lock_.WriteLock(0);
-    }
+    if constexpr (EnableLocking) global_lock_.WriteLock(0);
   }
   CTP_INLINE_CROSS_FUN void global_write_unlock() {
-    if constexpr (EnableLocking) {
-      global_lock_.WriteUnlock();
-      pending_writers_.fetch_sub(1);
-    }
+    if constexpr (EnableLocking) global_lock_.WriteUnlock();
   }
 
   /** Acquire every bucket's write lock. Used for rehash / clear / for_each. */
@@ -338,7 +329,7 @@ class unordered_map_ll {
    *  @param ext_mult    multiply bucket_count by this on each rehash (>= 2) */
   explicit unordered_map_ll(size_type num_buckets = 16,
                             double ext_percent = 0.6, size_type ext_mult = 2)
-      : buckets_(CTP_MALLOC), locks_(CTP_MALLOC), pending_writers_(0), size_(0),
+      : buckets_(CTP_MALLOC), locks_(CTP_MALLOC), size_(0),
         alloc_(CTP_MALLOC), hash_fn_(), key_eq_(),
         ext_percent_(ext_percent), ext_mult_(ext_mult < 2 ? 2 : ext_mult) {
     init_buckets(num_buckets);
@@ -348,7 +339,7 @@ class unordered_map_ll {
    *  one-per-bucket and toggled by the EnableLocking template arg). */
   CTP_CROSS_FUN
   unordered_map_ll(size_type num_buckets, size_type /*num_locks_ignored*/)
-      : buckets_(CTP_MALLOC), locks_(CTP_MALLOC), pending_writers_(0), size_(0),
+      : buckets_(CTP_MALLOC), locks_(CTP_MALLOC), size_(0),
         alloc_(CTP_MALLOC), hash_fn_(), key_eq_(),
         ext_percent_(0.6), ext_mult_(2) {
     init_buckets(num_buckets);
@@ -359,7 +350,7 @@ class unordered_map_ll {
   CTP_CROSS_FUN
   explicit unordered_map_ll(AllocT *alloc, size_type num_buckets = 16,
                             double ext_percent = 0.6, size_type ext_mult = 2)
-      : buckets_(alloc), locks_(alloc), pending_writers_(0), size_(0),
+      : buckets_(alloc), locks_(alloc), size_(0),
         alloc_(alloc), hash_fn_(), key_eq_(),
         ext_percent_(ext_percent), ext_mult_(ext_mult < 2 ? 2 : ext_mult) {
     init_buckets(num_buckets);
@@ -369,7 +360,7 @@ class unordered_map_ll {
   CTP_CROSS_FUN
   unordered_map_ll(AllocT *alloc, size_type num_buckets,
                    size_type /*num_locks_ignored*/)
-      : buckets_(alloc), locks_(alloc), pending_writers_(0), size_(0),
+      : buckets_(alloc), locks_(alloc), size_(0),
         alloc_(alloc), hash_fn_(), key_eq_(),
         ext_percent_(0.6), ext_mult_(2) {
     init_buckets(num_buckets);
@@ -530,7 +521,9 @@ class unordered_map_ll {
     return ref;
   }
 
-  /** Lookup (mutable) returning a pointer or nullptr. */
+  /** Lookup (mutable) returning a pointer or nullptr. WARNING: the returned
+   *  pointer is only valid while no other thread erases `key`; for concurrent
+   *  find-then-use, prefer get() with a shared_ptr value type. */
   CTP_CROSS_FUN
   T *find(const Key &key) {
     global_read_lock();
@@ -540,6 +533,25 @@ class unordered_map_ll {
     T *res = n != nullptr ? &n->value_ : nullptr;
     read_unlock_bucket(b);
     global_read_unlock();
+    return res;
+  }
+
+  /** Return a COPY of the value bound to `key`, taken WHILE the read lock is
+   *  held (or a default-constructed T if absent). When T is a shared_ptr<V>,
+   *  the copy is an owning handle that stays valid even if another thread
+   *  erases the entry concurrently -- erase just drops the map's reference, and
+   *  the pointee lives until the last handle is gone. This is the safe way to
+   *  find-then-use a value without an external lock. */
+  CTP_CROSS_FUN
+  T get(const Key &key) const {
+    auto *self = const_cast<unordered_map_ll *>(this);
+    self->global_read_lock();
+    size_type b = bucket_of(key);
+    self->read_lock_bucket(b);
+    Node *n = find_in_bucket(b, key);
+    T res = (n != nullptr) ? n->value_ : T{};
+    self->read_unlock_bucket(b);
+    self->global_read_unlock();
     return res;
   }
 
@@ -596,35 +608,62 @@ class unordered_map_ll {
     global_write_unlock();
   }
 
-  /** Apply `fn(key, value)` to every entry. Takes the map-wide write lock so
-   *  the callback sees a consistent snapshot (no concurrent mutation or
-   *  rehash). The callback MUST NOT re-enter this same map (it would deadlock
-   *  on the exclusive lock). */
+  /** Lock mode for for_each().
+   *  - kExclusive (default): takes the map-wide WRITE lock, so the callback sees
+   *    a fully quiescent map -- no concurrent single-key op or rehash runs, and
+   *    the callback may safely MUTATE values. Use this when the scan writes, or
+   *    needs an atomic snapshot. Cost: it serializes against every reader, so a
+   *    hot scan under a steady op stream is heavily contended.
+   *  - kShared: takes the map-wide READ lock plus a per-bucket READ lock, so the
+   *    scan runs CONCURRENTLY with other readers and single-key ops (a
+   *    concurrent erase can't free the node being walked -- it needs the bucket
+   *    WRITE lock -- and growth can't reallocate buckets_ -- it needs the map
+   *    WRITE lock). Use this ONLY for READ-ONLY callbacks that never mutate a
+   *    value or re-enter this map. It avoids the exclusive-lock contention that
+   *    wedged DelTag's full-map blob scan under concurrent renames (issue #680).
+   */
+
+  /** Apply `fn(key, value)` to every entry under `mode` (see ForEachLock).
+   *  The callback MUST NOT re-enter this same map. */
   template <typename Func>
-  CTP_CROSS_FUN void for_each(Func fn) {
-    global_write_lock();
-    for (size_type i = 0; i < buckets_.size(); ++i) {
-      Node *cur = buckets_[i];
-      while (cur != nullptr) {
-        fn(cur->key_, cur->value_);
-        cur = cur->next_;
+  CTP_CROSS_FUN void for_each(Func fn,
+                              ForEachLock mode = ForEachLock::kExclusive) {
+    if (mode == ForEachLock::kShared) {
+      // Fine-grained shared scan: hold the map-wide lock in READ (shared) mode
+      // so a concurrent rehash (which needs it in WRITE mode) can't reallocate
+      // buckets_/locks_ mid-scan, and take each bucket's read lock so a
+      // concurrent single-key write can't mutate the chain being walked.
+      // Crucially we request writer_priority=false here: unlike the single-key
+      // read path, this scan must NOT defer to a waiting writer -- that map-wide
+      // deferral is what wedged DelTag under concurrent renames (issue #680).
+      // Because single-key ops DO use writer_priority, a waiting rehash still
+      // drains and runs once this (bounded) scan finishes -- no writer
+      // starvation. Callback must be READ-ONLY (no value mutation, no re-entry).
+      if constexpr (EnableLocking) global_lock_.ReadLock(0, false);
+      const size_type nb = buckets_.size();
+      for (size_type i = 0; i < nb; ++i) {
+        read_lock_bucket(i);
+        for (Node *cur = buckets_[i]; cur != nullptr; cur = cur->next_) {
+          fn(cur->key_, cur->value_);
+        }
+        read_unlock_bucket(i);
       }
+      if constexpr (EnableLocking) global_lock_.ReadUnlock();
+    } else {
+      global_write_lock();
+      for (size_type i = 0; i < buckets_.size(); ++i) {
+        for (Node *cur = buckets_[i]; cur != nullptr; cur = cur->next_) {
+          fn(cur->key_, cur->value_);
+        }
+      }
+      global_write_unlock();
     }
-    global_write_unlock();
   }
 
   template <typename Func>
-  CTP_CROSS_FUN void for_each(Func fn) const {
-    auto *self = const_cast<unordered_map_ll *>(this);
-    self->global_write_lock();
-    for (size_type i = 0; i < buckets_.size(); ++i) {
-      Node *cur = buckets_[i];
-      while (cur != nullptr) {
-        fn(cur->key_, cur->value_);
-        cur = cur->next_;
-      }
-    }
-    self->global_write_unlock();
+  CTP_CROSS_FUN void for_each(Func fn,
+                              ForEachLock mode = ForEachLock::kExclusive) const {
+    const_cast<unordered_map_ll *>(this)->for_each(std::move(fn), mode);
   }
 };
 

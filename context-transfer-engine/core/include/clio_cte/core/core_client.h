@@ -123,12 +123,13 @@ class Client : public clio::run::ContainerClient {
       clio::run::u64 total_size,
       const clio::run::PoolQuery &target_query = clio::run::PoolQuery::Local(),
       const clio::run::PoolId &bdev_id = clio::run::PoolId::GetNull(),
-      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic(),
+      clio::run::u32 attach_existing = 0) {
     auto *ipc_manager = CLIO_CPU_IPC;
 
     auto task = ipc_manager->NewTask<RegisterTargetTask>(
         clio::run::CreateTaskId(), pool_id_, pool_query, target_name,
-        bdev_type, total_size, target_query, bdev_id);
+        bdev_type, total_size, target_query, bdev_id, attach_existing);
 
     return ipc_manager->Send(task);
   }
@@ -251,7 +252,7 @@ class Client : public clio::run::ContainerClient {
     // cross-node comparisons assume NTP-synced wall clocks (ares is
     // ~ms-synced via the cluster's chrony). Set after NewTask so it
     // overwrites the ctor's 0.
-    task.ptr_->submit_ts_ns_ =
+    task.get()->submit_ts_ns_ =
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now().time_since_epoch())
             .count();
@@ -281,6 +282,7 @@ class Client : public clio::run::ContainerClient {
    * @param flags Operation flags
    * @param blob_data Shared memory pointer for output
    * @param pool_query Pool query for task routing (default: Dynamic)
+   * @param context Context for I/O emulation control (issue #747)
    */
   clio::run::Future<GetBlobTask> AsyncGetBlob(
       const TagId &tag_id,
@@ -288,12 +290,13 @@ class Client : public clio::run::ContainerClient {
       clio::run::u64 offset, clio::run::u64 size,
       clio::run::u32 flags,
       ctp::ipc::ShmPtr<> blob_data,
-      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic(),
+      const Context &context = Context()) {
     auto *ipc_manager = CLIO_CPU_IPC;
 
     auto task = ipc_manager->NewTask<GetBlobTask>(
         clio::run::CreateTaskId(), pool_id_, pool_query, tag_id,
-        blob_name, offset, size, flags, blob_data);
+        blob_name, offset, size, flags, blob_data, context);
 
     return ipc_manager->Send(task);
   }
@@ -305,9 +308,10 @@ class Client : public clio::run::ContainerClient {
       clio::run::u64 offset, clio::run::u64 size,
       clio::run::u32 flags,
       ctp::ipc::ShmPtr<> blob_data,
-      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic(),
+      const Context &context = Context()) {
     return AsyncGetBlob(tag_id, blob_name.c_str(), offset, size,
-                        flags, blob_data, pool_query);
+                        flags, blob_data, pool_query, context);
   }
 
   /**
@@ -326,6 +330,68 @@ class Client : public clio::run::ContainerClient {
         clio::run::CreateTaskId(), pool_id_, pool_query, tag_id,
         blob_name, new_score);
 
+    return ipc_manager->Send(task);
+  }
+
+  // ===========================================================================
+  // Fully-POD, GPU-compatible blob ops (issue #556). Same parameters as the
+  // non-POD versions; the task carries the blob name in an inline
+  // fixed_string<32> (capped at 31 chars), so no SSO/SVO fixup is ever needed.
+  // ===========================================================================
+
+  clio::run::Future<PodPutBlobTask> AsyncPodPutBlob(
+      const TagId &tag_id, const char *blob_name, clio::run::u64 offset,
+      clio::run::u64 size, ctp::ipc::ShmPtr<> blob_data, float score = -1.0f,
+      const Context &context = Context(), clio::run::u32 flags = 0,
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
+    auto *ipc_manager = CLIO_CPU_IPC;
+    auto task = ipc_manager->NewTask<PodPutBlobTask>(
+        clio::run::CreateTaskId(), pool_id_, pool_query, tag_id, blob_name,
+        offset, size, blob_data, score, context, flags);
+    task.get()->submit_ts_ns_ =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    return ipc_manager->Send(task);
+  }
+
+  /** std::string overload */
+  clio::run::Future<PodPutBlobTask> AsyncPodPutBlob(
+      const TagId &tag_id, const std::string &blob_name, clio::run::u64 offset,
+      clio::run::u64 size, ctp::ipc::ShmPtr<> blob_data, float score = -1.0f,
+      const Context &context = Context(), clio::run::u32 flags = 0,
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
+    return AsyncPodPutBlob(tag_id, blob_name.c_str(), offset, size, blob_data,
+                           score, context, flags, pool_query);
+  }
+
+  clio::run::Future<PodGetBlobTask> AsyncPodGetBlob(
+      const TagId &tag_id, const char *blob_name, clio::run::u64 offset,
+      clio::run::u64 size, clio::run::u32 flags, ctp::ipc::ShmPtr<> blob_data,
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
+    auto *ipc_manager = CLIO_CPU_IPC;
+    auto task = ipc_manager->NewTask<PodGetBlobTask>(
+        clio::run::CreateTaskId(), pool_id_, pool_query, tag_id, blob_name,
+        offset, size, flags, blob_data);
+    return ipc_manager->Send(task);
+  }
+
+  /** std::string overload */
+  clio::run::Future<PodGetBlobTask> AsyncPodGetBlob(
+      const TagId &tag_id, const std::string &blob_name, clio::run::u64 offset,
+      clio::run::u64 size, clio::run::u32 flags, ctp::ipc::ShmPtr<> blob_data,
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
+    return AsyncPodGetBlob(tag_id, blob_name.c_str(), offset, size, flags,
+                           blob_data, pool_query);
+  }
+
+  clio::run::Future<PodReorganizeBlobTask> AsyncPodReorganizeBlob(
+      const TagId &tag_id, const std::string &blob_name, float new_score,
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
+    auto *ipc_manager = CLIO_CPU_IPC;
+    auto task = ipc_manager->NewTask<PodReorganizeBlobTask>(
+        clio::run::CreateTaskId(), pool_id_, pool_query, tag_id,
+        blob_name.c_str(), new_score);
     return ipc_manager->Send(task);
   }
 
@@ -391,11 +457,14 @@ class Client : public clio::run::ContainerClient {
    */
   clio::run::Future<DelTagTask> AsyncDelTag(
       const std::string &tag_name,
-      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic()) {
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Dynamic(),
+      bool posix_unlink = false) {
     auto *ipc_manager = CLIO_CPU_IPC;
 
     auto task = ipc_manager->NewTask<DelTagTask>(
         clio::run::CreateTaskId(), pool_id_, pool_query, tag_name);
+    // POSIX unlink (#680): promote a surviving alias instead of cascade-deleting.
+    task->posix_unlink_ = posix_unlink ? 1u : 0u;
 
     return ipc_manager->Send(task);
   }
@@ -749,6 +818,31 @@ class Client : public clio::run::ContainerClient {
 
     return ipc_manager->Send(task);
   }
+
+  /**
+   * Asynchronous dynamic reorganize - periodic internal data-organizer driver
+   * (issue #738). Spawned from the CTE server's Create() once per configured
+   * organizer replica; each firing delegates to the configured DataOrganizer.
+   * @param pool_query Pool query for task routing (default: Local)
+   * @param replica_id 0-based organizer replica index (partitions blob space)
+   * @param period_us Period in microseconds (0 = one-shot)
+   */
+  clio::run::Future<DynamicReorganizeTask> AsyncDynamicReorganize(
+      const clio::run::PoolQuery &pool_query = clio::run::PoolQuery::Local(),
+      clio::run::u32 replica_id = 0,
+      double period_us = 0) {
+    auto *ipc_manager = CLIO_CPU_IPC;
+
+    auto task = ipc_manager->NewTask<DynamicReorganizeTask>(
+        clio::run::CreateTaskId(), pool_id_, pool_query, replica_id);
+
+    if (period_us > 0) {
+      task->SetPeriod(period_us, clio::run::kMicro);
+      task->SetFlags(TASK_PERIODIC);
+    }
+
+    return ipc_manager->Send(task);
+  }
 #endif  // CTP_IS_HOST
 };
 
@@ -908,26 +1002,12 @@ void FlushPutBlobTiming(const char *label);
   (&(*CTP_GET_GLOBAL_PTR_VAR(clio::cte::core::Client, \
                               clio::cte::core::g_cte_client)))
 
-// Backward-compat aliases for the WRP_ -> CLIO_ rename. External code that
-// still uses wrp_cte::core::* (e.g. wrp_cte::core::g_cte_client) resolves
-// transparently to clio::cte::core::*. Paired with the wrp_cte/ forwarder
-// shim header tree, this gives source-level compat for downstream projects
-// that haven't migrated their identifiers yet. See rebranding.md.
-// Pre-`clio::cte`-rename intermediate spelling.  In-tree code now uses
-// `clio::cte::core::*`; downstream that already migrated off `wrp_cte::*`
-// to the `clio_cte::*` waypoint keeps compiling via this alias.  Safe to
-// use the simple `namespace X = Y;` form because no external chimod opens
-// `namespace clio_cte::xxx {}`.
+// Intermediate `clio_cte` namespace-spelling alias. In-tree code uses
+// `clio::cte::core::*`; downstream that migrated to the `clio_cte::*` waypoint
+// keeps compiling via this alias. Safe to use the simple `namespace X = Y;`
+// form because no external chimod opens `namespace clio_cte::xxx {}`.
+// (The wrp_cte/ forwarder shim tree and the wrp_cte::/WRP_CTE_* compat aliases
+// were removed; downstream must use the clio_cte / clio::cte names.)
 namespace clio_cte = clio::cte;
-namespace wrp_cte = clio::cte;
-
-// Client singleton accessor macro: legacy name.
-#define WRP_CTE_CLIENT CLIO_CTE_CLIENT
-
-// Client init function: legacy name aliased to canonical via #define so the
-// call `wrp_cte::core::WRP_CTE_CLIENT_INIT(...)` expands to
-// `wrp_cte::core::CLIO_CTE_CLIENT_INIT(...)` and resolves through the
-// `wrp_cte = clio_cte` namespace alias.
-#define WRP_CTE_CLIENT_INIT CLIO_CTE_CLIENT_INIT
 
 #endif  // WRPCTE_CORE_CLIENT_H_

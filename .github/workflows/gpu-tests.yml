@@ -11,16 +11,6 @@ on:
       - 'CMakePresets.json'
       - 'installers/conda/**'
       - '.github/workflows/gpu-tests.yml'
-  pull_request:
-    branches: [main, dev]
-    paths:
-      - 'context-runtime/**'
-      - 'context-transfer-engine/**'
-      - 'context-transport-primitives/**'
-      - 'CMakeLists.txt'
-      - 'CMakePresets.json'
-      - 'installers/conda/**'
-      - '.github/workflows/gpu-tests.yml'
   workflow_dispatch:
 
 jobs:
@@ -58,16 +48,22 @@ jobs:
         python-version: '3.12'
         activate-environment: iowarp
 
+    # conda-build is a plugin registered against the BASE env's conda CLI and
+    # must be installed there (see installers/conda + CI/ci-deps.sh). Without
+    # `-n base` this installs conda-build into the active `iowarp` env, leaving
+    # an `iowarp/bin/conda` ahead of base on PATH that can't import the `conda`
+    # module — so conda-build's build-env activation crashes the recipe with
+    # "ModuleNotFoundError: No module named 'conda'".
     - name: Install conda-build
       shell: bash -el {0}
-      run: conda install -y conda-build -c conda-forge
+      run: conda install -n base -y conda-build -c conda-forge
 
-    # ── Build CUDA conda package via install.sh ──────────────────────
+    # ── Build CUDA conda package via CI/ci-deps.sh ──────────────────────
     - name: Build CUDA conda package
       shell: bash -el {0}
       run: |
-        chmod +x install.sh
-        ./install.sh cuda-release
+        chmod +x CI/ci-deps.sh
+        ./CI/ci-deps.sh cuda-release
 
     # ── Verify installation ──────────────────────────────────────────
     - name: Verify CUDA package installed

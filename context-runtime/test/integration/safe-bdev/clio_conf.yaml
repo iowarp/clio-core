@@ -1,0 +1,90 @@
+---
+# Safe-BDev interactive integration test configuration.
+#
+# Topology (single node):
+#   * 3 file-backed block devices, 256 MB each (bdev0..bdev2) -- the safe-bdev
+#     DATA members. A 4th 256 MB device (bdev3) is added as PARITY at startup by
+#     node_entrypoint.sh (safe_bdev_add_bdev), giving 3 data + 1 parity =>
+#     tolerates 1 drive failure using exactly 4 devices.
+#   * safe0: the safe-bdev, max_failures=1.
+#   * cte_main: a CTE bound to safe0 as its backing store.
+#   * clio_fs: a POSIX filesystem (clio-fs) over the CTE, mounted via FUSE.
+#
+# The operator removes a bdev and replaces it from the context-visualizer
+# safe-bdev dashboard; recovery progress (ops in flight vs remaining) is shown
+# live.
+
+runtime:
+  num_threads: 4
+  queue_depth: 1024
+  first_busy_wait: 10000
+  max_sleep: 50000
+
+compose:
+  # ---- 3 file-backed data devices (256 MB each) --------------------------
+  - mod_name: clio_bdev
+    pool_name: "/mnt/bdev0.dat"
+    pool_query: local
+    pool_id: "301.0"
+    bdev_type: file
+    capacity: "256MB"
+    alloc_log: "/mnt/bdev0.alog"
+
+  - mod_name: clio_bdev
+    pool_name: "/mnt/bdev1.dat"
+    pool_query: local
+    pool_id: "302.0"
+    bdev_type: file
+    capacity: "256MB"
+    alloc_log: "/mnt/bdev1.alog"
+
+  - mod_name: clio_bdev
+    pool_name: "/mnt/bdev2.dat"
+    pool_query: local
+    pool_id: "303.0"
+    bdev_type: file
+    capacity: "256MB"
+    alloc_log: "/mnt/bdev2.alog"
+
+  # ---- safe-bdev over the 3 data devices (parity added at startup) -------
+  - mod_name: clio_safe_bdev
+    pool_name: "safe0"
+    pool_query: local
+    pool_id: "350.0"
+    max_failures: 1
+    alloc_log: "/mnt/safe0.alog"
+    members:
+      - pool_name: "/mnt/bdev0.dat"
+        node_id: 0
+        pool_id_major: 301
+        pool_id_minor: 0
+      - pool_name: "/mnt/bdev1.dat"
+        node_id: 0
+        pool_id_major: 302
+        pool_id_minor: 0
+      - pool_name: "/mnt/bdev2.dat"
+        node_id: 0
+        pool_id_major: 303
+        pool_id_minor: 0
+
+  # ---- CTE bound to the safe-bdev ----------------------------------------
+  - mod_name: clio_cte_core
+    pool_name: cte_main
+    pool_query: local
+    pool_id: "512.0"
+    storage:
+      - path: "safe0"
+        existing_pool_id: "350.0"
+        existing_pool_module: "clio_safe_bdev"
+        score: 1.0
+    dpe:
+      dpe_type: "max_bw"
+
+  # ---- clio-fs (POSIX filesystem) over the CTE ---------------------------
+  - mod_name: clio_cte_filesystem
+    pool_name: clio_fs
+    pool_query: local
+    pool_id: "560.0"
+    next_pool_id: "512.0"
+    targets:
+      neighborhood: 1

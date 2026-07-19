@@ -1,0 +1,64 @@
+---
+# Distributed CTE filesystem (CFS) correctness test config (issue #685).
+# Two-node cluster: composes the CTE core pool (512.0) AND the CTE filesystem
+# adapter pool (560.0) so the CFS client is usable on every node, and the
+# writer/reader on different nodes exercise the SHARED path->container routing.
+
+memory:
+  main_segment_size: auto
+  client_data_segment_size: 2GB
+  runtime_data_segment_size: 2GB
+
+networking:
+  port: 8080
+  neighborhood_size: 2
+  hostfile: /workspace/context-transfer-engine/test/integration/cfs_distributed/hostfile
+
+logging:
+  level: info
+  file: /tmp/clio.log
+
+runtime:
+  num_threads: 8
+  queue_depth: 1024
+  local_sched: "default"
+  heartbeat_interval: 1000
+
+compose:
+  # CTE Core storage pool — one container per node (pool_query: local + the
+  # neighborhood below), so tags/blobs are distributed across the cluster.
+  - mod_name: clio_cte_core
+    pool_name: cte_main
+    pool_query: local
+    pool_id: "512.0"
+    storage:
+      - path: /mnt/hdd1
+        bdev_type: file
+        capacity_limit: 4GB
+        score: 0.5
+      - path: /mnt/hdd2
+        bdev_type: file
+        capacity_limit: 4GB
+        score: 0.5
+    dpe:
+      dpe_type: max_bw
+    targets:
+      neighborhood: 2
+      default_target_timeout_ms: 30000
+      poll_period_ms: 5000
+    performance:
+      target_stat_interval_ms: 5000
+      blob_cache_size_mb: 4096
+      max_concurrent_operations: 64
+      score_threshold: 0.7
+      score_difference_threshold: 0.05
+
+  # CTE filesystem (CFS) adapter pool over the core pool above. Canonical
+  # kCfsPoolId is 560.0; next_pool_id points the adapter at the CTE core (512.0).
+  - mod_name: clio_cte_filesystem
+    pool_name: clio_cte_filesystem
+    pool_query: local
+    pool_id: "560.0"
+    next_pool_id: "512.0"
+    targets:
+      neighborhood: 2

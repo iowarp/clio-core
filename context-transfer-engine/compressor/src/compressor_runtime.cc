@@ -78,6 +78,18 @@ using clio::run::Worker;
  * PutBlob and GetBlob MUST use identical routing for a given blob_name, so all
  * forward sites call this one helper.
  */
+
+// The regular tasks carry a shm string (.str()); the POD tasks a fixed_string
+// (.c_str()). One overload pair lets the handler bodies be shared verbatim.
+static inline std::string CompressorBlobName(
+    const clio::cte::core::PutBlobTask &t) { return t.blob_name_.str(); }
+static inline std::string CompressorBlobName(
+    const clio::cte::core::GetBlobTask &t) { return t.blob_name_.str(); }
+static inline std::string CompressorBlobName(
+    const clio::cte::core::PodPutBlobTask &t) { return t.blob_name_.c_str(); }
+static inline std::string CompressorBlobName(
+    const clio::cte::core::PodGetBlobTask &t) { return t.blob_name_.c_str(); }
+
 inline clio::run::PoolQuery ForwardQuery(const clio::cte::core::TagId &tag_id,
                                          const std::string &blob_name) {
   static const bool distribute = [] {
@@ -184,8 +196,8 @@ struct CompressionHeader {
 static_assert(sizeof(CompressionHeader) == 24,
               "CompressionHeader must be 24 bytes");
 
-clio::run::TaskResume Runtime::Create(ctp::ipc::FullPtr<CreateTask> task,
-                                clio::run::RunContext& ctx) {
+clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
+  CLIO_TASK_BODY_BEGIN
   // Load configuration from compose YAML (or direct CreateParams)
   config_ = task->GetParams();
 
@@ -288,10 +300,11 @@ clio::run::TaskResume Runtime::Create(ctp::ipc::FullPtr<CreateTask> task,
   client_.AsyncPollConsumers(clio::run::PoolQuery::Local(), 5000000);
 
   CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::Destroy(ctp::ipc::FullPtr<DestroyTask> task,
-                                 clio::run::RunContext& ctx) {
+clio::run::TaskResume Runtime::Destroy(clio::run::shared_ptr<DestroyTask> &task) {
+  CLIO_TASK_BODY_BEGIN
   try {
     // Reset predictors
     qtable_predictor_.reset();
@@ -310,16 +323,17 @@ clio::run::TaskResume Runtime::Destroy(ctp::ipc::FullPtr<DestroyTask> task,
     HLOG(kError, "Exception during compressor destroy: {}", e.what());
   }
   CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
 }
 
-clio::run::PoolQuery Runtime::ScheduleTask(const ctp::ipc::FullPtr<clio::run::Task> &task) {
+clio::run::PoolQuery Runtime::ScheduleTask(const clio::run::shared_ptr<clio::run::Task> &task) {
   // Compress placement: consult per-tag consumer tracking (when enabled)
   // so the compressed copy lands on the node that most recently read
   // the tag. Falls through to DirectHash(tag_id) when tracking is off
   // or the tag has no known consumers yet — keeps placement
   // deterministic per tag without the tracking overhead.
   if (task->method_ == Method::kCompress) {
-    auto compress_task = task.template Cast<CompressTask>();
+    auto& compress_task = task.template Cast<CompressTask>();
     clio::run::u32 consumer_node = 0;
     if (PickConsumerForTag(compress_task->tag_id_, consumer_node)) {
       return clio::run::PoolQuery::Physical(consumer_node);
@@ -334,13 +348,7 @@ clio::run::PoolQuery Runtime::ScheduleTask(const ctp::ipc::FullPtr<clio::run::Ta
   return clio::run::PoolQuery::Local();
 }
 
-clio::run::TaskResume Runtime::Monitor(ctp::ipc::FullPtr<MonitorTask> task,
-                                 clio::run::RunContext &ctx) {
-#ifdef __NVCOMPILER
-  clio::run::RunContext& rctx = ctx;
-#else
-  (void)ctx;
-#endif
+clio::run::TaskResume Runtime::Monitor(clio::run::shared_ptr<MonitorTask> &task) {
   CLIO_TASK_BODY_BEGIN
   if (!core_client_) {
     task->SetReturnCode(0);
@@ -651,7 +659,8 @@ static void WriteTraceLog(const std::string& trace_folder,
 }
 
 clio::run::TaskResume Runtime::DynamicSchedule(
-    ctp::ipc::FullPtr<DynamicScheduleTask> task, clio::run::RunContext& ctx) {
+    clio::run::shared_ptr<DynamicScheduleTask> &task) {
+  CLIO_TASK_BODY_BEGIN
   try {
     // Extract task parameters (same as PutBlobTask)
     clio::run::u64 chunk_size = task->size_;
@@ -763,10 +772,11 @@ clio::run::TaskResume Runtime::DynamicSchedule(
   }
 
   CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::Compress(ctp::ipc::FullPtr<CompressTask> task,
-                                  clio::run::RunContext& ctx) {
+clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &task) {
+  CLIO_TASK_BODY_BEGIN
   try {
     // Extract task parameters (same as PutBlobTask)
     clio::run::u64 input_size = task->size_;
@@ -952,10 +962,11 @@ clio::run::TaskResume Runtime::Compress(ctp::ipc::FullPtr<CompressTask> task,
   }
 
   CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::Decompress(ctp::ipc::FullPtr<DecompressTask> task,
-                                    clio::run::RunContext& ctx) {
+clio::run::TaskResume Runtime::Decompress(clio::run::shared_ptr<DecompressTask> &task) {
+  CLIO_TASK_BODY_BEGIN
   try {
     // Record the originating node (the consumer that issued this Decompress)
     // against this specific tag. pool_query_.ret_node_ was stamped by the
@@ -1106,6 +1117,7 @@ clio::run::TaskResume Runtime::Decompress(ctp::ipc::FullPtr<DecompressTask> task
   }
 
   CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
 }
 
 // Compress a RAW core PutBlobTask (method kPutBlob=15) that landed at the
@@ -1113,9 +1125,9 @@ clio::run::TaskResume Runtime::Decompress(ctp::ipc::FullPtr<DecompressTask> task
 // blob_data_ is a GPU/HBM pointer; cuSZp compresses it in place. The compressed
 // bytes (with a CompressionHeader) are forwarded to the core pool under the same
 // per-page name the core handler would have composed ("<name>_pi<gpu_page_idx_>").
-clio::run::TaskResume Runtime::CompressPutBlob(
-    ctp::ipc::FullPtr<clio::cte::core::PutBlobTask> task,
-    clio::run::RunContext& ctx) {
+template <typename PutT>
+clio::run::TaskResume Runtime::CompressPutBlobImpl(
+    clio::run::shared_ptr<PutT>& task) {
   try {
     clio::run::u64 input_size = task->size_;
     clio::cte::core::Context& context = task->context_;
@@ -1130,8 +1142,8 @@ clio::run::TaskResume Runtime::CompressPutBlob(
     if (!core_client_) { task->return_code_ = 9; CLIO_CO_RETURN; }
 
     // Per-page name: what the core PutBlob handler composes from gpu_page_idx_.
-    std::string name = task->blob_name_.str();
-    if (task->gpu_page_idx_ != clio::cte::core::PutBlobTask::kNoPageIdx)
+    std::string name = CompressorBlobName(*task);
+    if (task->gpu_page_idx_ != PutT::kNoPageIdx)
       name += "_pi" + std::to_string(task->gpu_page_idx_);
 
     if (context.compress_lib_ <= 0) {  // no compression -> forward as-is
@@ -1193,9 +1205,9 @@ clio::run::TaskResume Runtime::CompressPutBlob(
 // fault. Fetches the (compressed) blob from core under the "_pi" name and
 // decompresses into the caller's HBM buffer. Mirrors Decompress(); the
 // compressed size is over-estimated (cuSZp's stream is self-delimiting).
-clio::run::TaskResume Runtime::DecompressGetBlob(
-    ctp::ipc::FullPtr<clio::cte::core::GetBlobTask> task,
-    clio::run::RunContext& ctx) {
+template <typename GetT>
+clio::run::TaskResume Runtime::DecompressGetBlobImpl(
+    clio::run::shared_ptr<GetT>& task) {
   try {
     clio::run::u64 expected_size = task->size_;
     if (task->blob_data_.IsNull()) { task->return_code_ = 1; CLIO_CO_RETURN; }
@@ -1203,8 +1215,8 @@ clio::run::TaskResume Runtime::DecompressGetBlob(
       core_client_ = std::make_unique<clio::cte::core::Client>(config_.next_pool_id_);
     if (!core_client_) { task->return_code_ = 9; CLIO_CO_RETURN; }
 
-    std::string name = task->blob_name_.str();
-    if (task->gpu_page_idx_ != clio::cte::core::GetBlobTask::kNoPageIdx)
+    std::string name = CompressorBlobName(*task);
+    if (task->gpu_page_idx_ != GetT::kNoPageIdx)
       name += "_pi" + std::to_string(task->gpu_page_idx_);
 
     size_t hsz = sizeof(CompressionHeader);
@@ -1351,9 +1363,8 @@ bool Runtime::PickConsumerForTag(const clio::cte::core::TagId &tag_id,
 // Node Load Sampling
 // ==============================================================================
 
-clio::run::TaskResume Runtime::PollNodeLoad(ctp::ipc::FullPtr<PollNodeLoadTask> task,
-                                      clio::run::RunContext& ctx) {
-  (void)ctx;
+clio::run::TaskResume Runtime::PollNodeLoad(clio::run::shared_ptr<PollNodeLoadTask> &task) {
+  CLIO_TASK_BODY_BEGIN
   NodeLoadSample sample;
   auto* ipc_manager = CLIO_IPC;
   sample.node_id_ = ipc_manager ? static_cast<clio::run::u32>(ipc_manager->GetNodeId())
@@ -1389,12 +1400,12 @@ clio::run::TaskResume Runtime::PollNodeLoad(ctp::ipc::FullPtr<PollNodeLoadTask> 
   task->sample_ = sample;
   task->SetReturnCode(0);
   CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
 }
 
-clio::run::TaskResume Runtime::PollConsumers(ctp::ipc::FullPtr<PollConsumersTask> task,
-                                       clio::run::RunContext& ctx) {
+clio::run::TaskResume Runtime::PollConsumers(clio::run::shared_ptr<PollConsumersTask> &task) {
+  CLIO_TASK_BODY_BEGIN
   (void)task;
-  (void)ctx;
   // No-op when tracking is disabled.
   if (!config_.tracking_enabled_) {
     CLIO_CO_RETURN;
@@ -1444,6 +1455,33 @@ clio::run::TaskResume Runtime::PollConsumers(ctp::ipc::FullPtr<PollConsumersTask
     }
   }
 
+  CLIO_CO_RETURN;
+  CLIO_TASK_BODY_END
+}
+
+
+// ---- Public entrypoints -----------------------------------------------------
+// Regular (kPutBlob=15 / kGetBlob=16) come from host clients; the POD variants
+// (kPodPutBlob=43 / kPodGetBlob=44) are what the gpu_vector's cache manager
+// submits from DEVICE code. Both share one implementation.
+clio::run::TaskResume Runtime::CompressPutBlob(
+    clio::run::shared_ptr<clio::cte::core::PutBlobTask>& task) {
+  CLIO_CO_AWAIT(CompressPutBlobImpl(task));
+  CLIO_CO_RETURN;
+}
+clio::run::TaskResume Runtime::CompressPodPutBlob(
+    clio::run::shared_ptr<clio::cte::core::PodPutBlobTask>& task) {
+  CLIO_CO_AWAIT(CompressPutBlobImpl(task));
+  CLIO_CO_RETURN;
+}
+clio::run::TaskResume Runtime::DecompressGetBlob(
+    clio::run::shared_ptr<clio::cte::core::GetBlobTask>& task) {
+  CLIO_CO_AWAIT(DecompressGetBlobImpl(task));
+  CLIO_CO_RETURN;
+}
+clio::run::TaskResume Runtime::DecompressPodGetBlob(
+    clio::run::shared_ptr<clio::cte::core::PodGetBlobTask>& task) {
+  CLIO_CO_AWAIT(DecompressGetBlobImpl(task));
   CLIO_CO_RETURN;
 }
 

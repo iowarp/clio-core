@@ -274,6 +274,20 @@ int main(int argc, char* argv[]) {
       tests_passed++;
     }
 
+    // Test 3b: Destination with no "::" delimiter at all. The binary backend
+    // is selected from the valid "file::" source, then GetUrlProtocol(dst)
+    // returns "" (no delimiter) which fails the "iowarp" check.
+    tests_total++;
+    clio::cae::core::AssimilationCtx ctx3b;
+    ctx3b.src = "file::" + kTestFileName;
+    ctx3b.dst = "iowarp_no_delimiter";
+    ctx3b.format = "binary";
+    ctx3b.range_off = 0;
+    ctx3b.range_size = 0;
+    if (TestErrorCase(cae_client, "DestinationNoDelimiter", ctx3b, true)) {
+      tests_passed++;
+    }
+
     // Test 4: Out-of-range offset
     tests_total++;
     clio::cae::core::AssimilationCtx ctx4;

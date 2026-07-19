@@ -348,7 +348,9 @@ class Client : public clio::run::ContainerClient {
     auto task = ipc_manager->NewTask<RegisterMemoryTask>(
         clio::run::CreateTaskId(), pool_id_, pool_query, alloc_id);
 
-    return clio::run::IpcCpu2CpuZmq::ClientSend(ipc_manager, task, clio::run::IpcMode::kTcp);
+    return clio::run::IpcCpu2CpuZmq::SendIn(
+        ipc_manager, task,
+        clio::run::IpcMode::kTcp);
   }
   /**
    * RestartContainers - Re-create pools from saved restart configs
@@ -427,6 +429,25 @@ class Client : public clio::run::ContainerClient {
     auto* ipc_manager = CLIO_IPC;
     auto task = ipc_manager->NewTask<HeartbeatTask>(
         clio::run::CreateTaskId(), pool_id_, pool_query);
+    return ipc_manager->Send(task);
+  }
+
+  /**
+   * QueryTaskProgress - ask a node whether a specific replica task is still
+   * alive (issue #628). Route with Physical(node_id) to the replica's node.
+   * The task's status_ is 1 (kRunning) if that node still holds the replica,
+   * 0 (kGone) otherwise.
+   * @param pool_query Pool routing (use Physical(node_id) to target a node)
+   * @param net_key The origin's send_map key (origin task pointer)
+   * @param replica_id Which replica of that origin
+   * @return Future for the QueryTaskProgressTask
+   */
+  clio::run::Future<QueryTaskProgressTask> AsyncQueryTaskProgress(
+      const clio::run::PoolQuery& pool_query, clio::run::u64 net_key,
+      clio::run::u32 replica_id) {
+    auto* ipc_manager = CLIO_IPC;
+    auto task = ipc_manager->NewTask<QueryTaskProgressTask>(
+        clio::run::CreateTaskId(), pool_id_, pool_query, net_key, replica_id);
     return ipc_manager->Send(task);
   }
 

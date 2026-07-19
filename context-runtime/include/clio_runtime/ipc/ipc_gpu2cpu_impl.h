@@ -17,13 +17,15 @@ namespace clio::run {
 
 #if CTP_IS_GPU_COMPILER || CTP_IS_SYCL_COMPILER
 /**
- * GPU-side ClientSend.
+ * GPU-side SendIn.
  *
- * Producer-only design: the host pre-allocated Task+FutureShm in a
- * registered backend and passed `task_ptr` to the kernel. The kernel
- * already mutated POD input fields. We just clear the FutureShm flags,
- * build a gpu::Future<TaskT> carrying ShmPtrs to both the task and its
- * co-located FutureShm, then push onto gpu2cpu_queue with a system fence.
+ * Producer-only design: the host pre-allocated the (self-contained) Task in a
+ * registered backend and passed `task_ptr` to the kernel, which already
+ * mutated the POD input fields. We stamp the task's size + clear its
+ * completion flag in the embedded FutureInfo (task->fut_), build a
+ * gpu::Future<TaskT>, and push a base-Task handle onto gpu2cpu_queue with a
+ * system fence. There is no separate gpu::FutureShm — the Task is its own
+ * completion record.
  *
  * Threading:
  *   - CUDA/ROCm: only thread 0 of the block enqueues; other threads
@@ -31,7 +33,7 @@ namespace clio::run {
  *   - SYCL: kernels are single_task by convention, so the full WI runs.
  */
 template <typename TaskT>
-CTP_GPU_FUN gpu::Future<TaskT> IpcGpu2Cpu::ClientSend(
+CTP_GPU_FUN gpu::Future<TaskT> IpcGpu2Cpu::SendIn(
     gpu::IpcManager *ipc, const ctp::ipc::FullPtr<TaskT> &task_ptr) {
   gpu::Future<TaskT> future;
 
@@ -43,32 +45,23 @@ CTP_GPU_FUN gpu::Future<TaskT> IpcGpu2Cpu::ClientSend(
     return future;
   }
 
-  // Co-located FutureShm sits immediately after the POD task struct.
-  gpu::FutureShm *fshm = reinterpret_cast<gpu::FutureShm *>(
-      reinterpret_cast<char *>(task_ptr.ptr_) + sizeof(TaskT));
-  fshm->Reset(static_cast<u32>(sizeof(TaskT)));
+  // Self-contained Task: stamp its POD size + clear its completion flag in the
+  // embedded FutureInfo (no co-located gpu::FutureShm).
+  const u32 task_size = static_cast<u32>(sizeof(TaskT));
+  task_ptr.ptr_->fut_.task_size_ = task_size;
+  task_ptr.ptr_->fut_.is_complete_.store(0);
 
-  // For kPinnedHost / kManagedUvm backends the host_view pointer is also
-  // the device-accessible address — the kernel and the CPU worker can both
-  // dereference it directly. We therefore stash the *raw address* in off_
-  // and keep the AllocatorId for backend lookup. The worker pop path
-  // dereferences off_ directly without per-backend resolution math. When
-  // kDeviceMem is wired up the worker will branch on `kind` and issue a
-  // cudaMemcpy of size sizeof(FutureShm) from device_ptr+task_off instead.
-  ctp::ipc::ShmPtr<gpu::FutureShm> fshmptr;
-  fshmptr.alloc_id_ = task_ptr.shm_.alloc_id_;
-  fshmptr.off_ = reinterpret_cast<size_t>(fshm);
+  future = gpu::Future<TaskT>(task_ptr, task_size);
 
-  // Mirror raw addressing for the task ShmPtr in the queue entry so the
-  // CPU worker can dereference the task pointer the same way.
+  // Queue entry uses the base Task type with raw addressing so the CPU worker
+  // can dereference the task pointer directly; task_size rides along so it does
+  // not need to read the task first.
   ctp::ipc::FullPtr<Task> task_for_queue;
   task_for_queue.shm_.alloc_id_ = task_ptr.shm_.alloc_id_;
   task_for_queue.shm_.off_ = reinterpret_cast<size_t>(task_ptr.ptr_);
   task_for_queue.ptr_ = static_cast<Task *>(task_ptr.ptr_);
+  gpu::Future<Task> task_future(task_for_queue, task_size);
 
-  future = gpu::Future<TaskT>(fshmptr, task_ptr);
-
-  gpu::Future<Task> task_future(fshmptr, task_for_queue);
   CTP_DEVICE_FENCE_SYSTEM();
   auto &qlane = ipc->gpu_info_.gpu2cpu_queue->GetLane(0, 0);
   qlane.Push(task_future);
@@ -80,9 +73,11 @@ CTP_GPU_FUN gpu::Future<TaskT> IpcGpu2Cpu::ClientSend(
 /**
  * GPU-side Wait.
  *
- * Polls FUTURE_COMPLETE via volatile read on the FutureShm. Backend is
- * pinned host or UVM, so the CPU's system-scope SetBitsSystem write is
- * visible to a device-side volatile read through PCIe cache snooping.
+ * Polls the task's embedded completion flag (task->fut_.is_complete_) via a
+ * volatile read. Backend is pinned host or UVM, so the CPU GPU-worker's
+ * system-scope write is visible to a device-side volatile read through PCIe
+ * cache snooping. is_complete_ is a ctp::ipc::atomic<u32> whose storage is its
+ * first member `.x`.
  */
 template <typename TaskT, typename AllocT>
 CTP_CROSS_FUN void gpu::Future<TaskT, AllocT>::Wait() {
@@ -90,12 +85,10 @@ CTP_CROSS_FUN void gpu::Future<TaskT, AllocT>::Wait() {
 #if CTP_IS_GPU_COMPILER
   if (threadIdx.x != 0) return;
 #endif
-  if (future_shm_.IsNull()) return;
-  gpu::FutureShm *fshm = GetFutureShmPtrRaw();
-  if (!fshm) return;
-  volatile unsigned int *fp =
-      reinterpret_cast<volatile unsigned int *>(&fshm->flags_.bits_.x);
-  while (!((*fp) & gpu::FutureShm::FUTURE_COMPLETE)) {}
+  if (task_ptr_.IsNull()) return;
+  volatile unsigned int *fp = reinterpret_cast<volatile unsigned int *>(
+      &task_ptr_.ptr_->fut_.is_complete_.x);
+  while (((*fp) & 1u) == 0u) {}
   CTP_DEVICE_FENCE_SYSTEM();
 #endif
 }

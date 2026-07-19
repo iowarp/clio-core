@@ -14,10 +14,10 @@
  * full pipeline runs:
  *
  *   per-block thread 0: CLIO_IPC->Send(task_fp[blockIdx.x])
- *                       -> IpcGpu2Cpu::ClientSend pushes onto the
+ *                       -> IpcGpu2Cpu::SendIn pushes onto the
  *                          per-device gpu2cpu_queue
  *                       -> CPU GPU worker pops, dispatches MOD_NAME::Runtime::GpuSubmit
- *                       -> RuntimeSend signals FUTURE_COMPLETE
+ *                       -> SendOut signals FUTURE_COMPLETE
  *                       -> kernel block returns from future.Wait()
  *
  * Suffix `_gpu.cc` matches the `*_gpu.cc` glob in
@@ -39,7 +39,7 @@ namespace {
 /**
  * Stress kernel: one grid block per task slot. Thread 0 of each block
  * performs the Send + Wait; all other threads in the block return
- * immediately because IpcGpu2Cpu::ClientSend is gated on
+ * immediately because IpcGpu2Cpu::SendIn is gated on
  * `threadIdx.x == 0` (other lanes get an empty future).
  */
 __global__ void ChiGpuKernelStress(clio::run::IpcManagerGpuInfo gpu_info,

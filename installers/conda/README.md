@@ -1,164 +1,71 @@
 # IOWarp Core - Conda Package
 
-This directory contains the conda recipe for building IOWarp Core using [rattler-build](https://prefix-dev.github.io/rattler-build/).
+This directory contains the conda recipe (`meta.yaml`, built with
+[conda-build](https://docs.conda.io/projects/conda-build/)) for `iowarp-core`.
 
-## Quick Start (Recommended)
+## Install (Recommended)
 
-The easiest way to install IOWarp Core is using the main install script at the repository root:
+Prebuilt `iowarp-core` packages are published to the
+**[`iowarp` channel on Anaconda.org](https://anaconda.org/iowarp/iowarp-core)**
+(CI builds and uploads them on each `v*` release tag).
 
-```bash
-# Clone the repository
-git clone --recursive https://github.com/iowarp/clio-core.git
-cd clio-core
-
-# Install with default (release) variant
-./install.sh
-
-# Or specify a variant
-./install.sh debug
-./install.sh cuda
-./install.sh rocm
-```
-
-The install script will:
-1. Install Miniconda if conda is not detected
-2. Create and activate an `iowarp` conda environment (if not already in one)
-3. Install rattler-build if not present
-4. Build the conda package using the specified variant
-5. Install the package directly into the current environment
-
-## Alternative: Using conda-local.sh
-
-If you're already in a conda environment and want more control:
+**1. Install Miniconda** (skip if you already have conda or mamba). Download and
+run the binary installer for your platform:
 
 ```bash
-# Activate your conda environment
-conda activate myenv
-
-# Build with default (release) variant
-./installers/conda/conda-local.sh
-
-# Or specify a variant
-./installers/conda/conda-local.sh cuda
-./installers/conda/conda-local.sh mpi
-./installers/conda/conda-local.sh custom
+# Linux x86_64
+curl -fsSL https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -o miniconda.sh
+bash miniconda.sh -b -p "$HOME/miniconda3"
+source "$HOME/miniconda3/etc/profile.d/conda.sh"
 ```
 
-## Installation Modes
+For other platforms, use the matching installer from the
+[Miniconda downloads](https://www.anaconda.com/download/success):
 
-IOWarp Core supports two installation modes:
+| Platform | Installer |
+|----------|-----------|
+| Linux aarch64 | `Miniconda3-latest-Linux-aarch64.sh` |
+| macOS (Apple Silicon) | `Miniconda3-latest-MacOSX-arm64.sh` |
+| macOS (Intel) | `Miniconda3-latest-MacOSX-x86_64.sh` |
+| Windows | `Miniconda3-latest-Windows-x86_64.exe` (run the installer) |
 
-### 1. Precompiled Binary (Recommended)
-
-Uses CMakePresets.json directly for reproducible builds:
+**2. Install `iowarp-core`** from the `iowarp` channel (with `conda-forge` for
+its dependencies):
 
 ```bash
-# Build with a specific preset
-./conda-local.sh release    # Standard release build
-./conda-local.sh debug      # Debug build with symbols
-./conda-local.sh conda      # Conda-optimized release build
-./conda-local.sh cuda       # CUDA-enabled build (Linux only)
-./conda-local.sh rocm       # ROCm-enabled build (Linux only)
+# Into a fresh environment (recommended)
+conda create -n iowarp -c iowarp -c conda-forge iowarp-core
+conda activate iowarp
+
+# ...or into the current environment
+conda install -c iowarp -c conda-forge iowarp-core
 ```
 
-### 2. Custom Source Build
+This installs the command-line tools, Python bindings, C++ headers, and CMake
+package configs (see [Installation Layout](#installation-layout)).
 
-Allows fine-grained control over build options:
+## Building from source
+
+To build the package yourself (e.g. to enable CUDA/ROCm/MPI or to test local
+changes), build the recipe with `conda-build`. `IOWARP_PRESET` selects a
+[CMake preset](../../CMakePresets.json); this mirrors what CI runs.
 
 ```bash
-# Use the custom variant as a template
-./conda-local.sh custom
+# conda-build is a plugin registered against the BASE env's conda CLI,
+# so it must be installed there.
+conda install -n base -y conda-build -c conda-forge
 
-# Or create your own variant file
-cp variants/custom.yaml variants/my-config.yaml
-# Edit my-config.yaml to your needs
-./conda-local.sh variants/my-config.yaml
+# From the repository root. Common presets: release, debug,
+# cuda-release, rocm-release (see CMakePresets.json for the full list).
+IOWARP_PRESET=release conda build installers/conda/ \
+    -c conda-forge \
+    --output-folder build/conda-output
+
+# Install the package you just built (conda-forge supplies runtime deps)
+conda install -c conda-forge build/conda-output/*/iowarp-core-*.conda
 ```
 
-## Available Variants
-
-| Variant | Description | Preset Used |
-|---------|-------------|-------------|
-| `release` | Standard release build | `release` |
-| `debug` | Debug build with symbols | `debug` |
-| `conda` | Conda-optimized build | `conda` |
-| `cuda` | CUDA-enabled (Linux) | `cuda-debug` |
-| `rocm` | ROCm-enabled (Linux) | `rocm-debug` |
-| `mpi` | MPI-enabled build | `custom` |
-| `full` | All features enabled | `custom` |
-| `custom` | Template for custom builds | `custom` |
-
-## Custom Variant Options
-
-When using `preset: custom`, you can set these options:
-
-```yaml
-# Build configuration
-preset: custom
-python: "3.11"
-build_type: Release  # or Debug
-
-# GPU support (choose one or none)
-cuda_enabled: "OFF"
-rocm_enabled: "OFF"
-
-# Distributed computing
-mpi_enabled: "OFF"
-mpi_impl: nompi  # openmpi, mpich, msmpi (Windows)
-
-# Core components
-runtime_enabled: "ON"
-cte_enabled: "ON"
-cae_enabled: "ON"
-cee_enabled: "ON"
-
-# Optional features
-zmq_enabled: "ON"
-hdf5_enabled: "ON"
-elf_enabled: "OFF"
-```
-
-## Directory Structure
-
-```
-installers/conda/
-├── meta.yaml                 # Main recipe (conda-build format)
-├── conda_build_config.yaml  # Variant definitions
-├── conda-forge.yml          # conda-forge CI configuration
-├── conda-local.sh           # Local build script
-├── variants/                # Predefined variant files
-│   ├── release.yaml
-│   ├── debug.yaml
-│   ├── conda.yaml
-│   ├── cuda.yaml
-│   ├── rocm.yaml
-│   ├── mpi.yaml
-│   ├── full.yaml
-│   └── custom.yaml
-└── README.md
-```
-
-## Manual Build Commands
-
-If you prefer to run rattler-build directly:
-
-```bash
-# Install rattler-build if not present
-conda install -y rattler-build -c conda-forge
-
-# From repository root, build the package
-rattler-build build \
-    --recipe installers/conda/ \
-    --variant-config installers/conda/variants/release.yaml \
-    --output-dir build/conda-output \
-    -c conda-forge
-
-# Find the built package
-PACKAGE=$(find build/conda-output -name "iowarp-core-*.conda" | head -1)
-
-# Install directly from the package file
-conda install "$PACKAGE" -y
-```
+> Git submodules must be initialized first: `git submodule update --init --recursive`.
 
 ## Dependencies
 
@@ -245,6 +152,18 @@ target_link_libraries(your_app
 )
 ```
 
+## Directory Structure
+
+```
+installers/conda/
+├── meta.yaml                 # Main recipe (conda-build format)
+├── conda_build_config.yaml   # Variant / pin definitions (e.g. python)
+├── conda-forge.yml           # conda-forge feedstock configuration
+├── build.sh                  # Recipe build script (runs cmake via IOWARP_PRESET)
+├── variants/                 # Preset variant configs
+└── README.md
+```
+
 ## conda-forge Submission
 
 To submit to conda-forge:
@@ -253,19 +172,14 @@ To submit to conda-forge:
 2. Copy `meta.yaml` and `conda_build_config.yaml` to `recipes/iowarp-core/`
 3. Submit a pull request
 
-The CI will automatically build all variant combinations defined in `conda_build_config.yaml`.
+The CI will automatically build all variant combinations defined in
+`conda_build_config.yaml`.
 
 ## Troubleshooting
 
-### rattler-build not found
-
-```bash
-conda install rattler-build -c conda-forge
-```
-
 ### Build fails with missing dependencies
 
-Ensure conda-forge channel is configured:
+Ensure the conda-forge channel is configured:
 
 ```bash
 conda config --add channels conda-forge
@@ -282,21 +196,15 @@ git submodule update --init --recursive
 
 ### CUDA/ROCm builds fail
 
-GPU builds are only supported on Linux. Check that you have the appropriate toolkit installed:
+GPU builds are only supported on Linux. Check that you have the appropriate
+toolkit installed:
 
 ```bash
 # For CUDA
 conda install cuda-toolkit -c nvidia
 
-# For ROCm
-# Follow AMD's ROCm installation guide
+# For ROCm — follow AMD's ROCm installation guide
 ```
-
-## Requirements
-
-- conda or mamba
-- rattler-build (`conda install rattler-build -c conda-forge`)
-- Git (for submodule initialization)
 
 ## More Information
 
@@ -304,3 +212,5 @@ conda install cuda-toolkit -c nvidia
 - Build wheel guide: `../../BUILD_WHEEL.md`
 - Contributing guide: `../../docs/contributing.md`
 - CMake presets: `../../CMakePresets.json`
+</content>
+</invoke>

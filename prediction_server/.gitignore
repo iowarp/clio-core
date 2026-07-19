@@ -1,0 +1,4 @@
+data/
+drive_history.db
+__pycache__/
+*.pyc

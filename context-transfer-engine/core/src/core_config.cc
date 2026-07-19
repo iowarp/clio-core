@@ -288,6 +288,29 @@ bool Config::ParseYamlNode(const YAML::Node &node) {
     }
   }
 
+  // Parse data organizer configuration (top-level keys, issue #738)
+  if (node["organizer"]) {
+    std::string organizer = node["organizer"].as<std::string>();
+    if (organizer != "none" && organizer != "frecency") {
+      HLOG(kError,
+           "Config error: Invalid organizer '{}' (must be 'none' or "
+           "'frecency')",
+           organizer);
+      return false;
+    }
+    organizer_.name_ = organizer;
+  }
+  if (node["organizer_tasks"]) {
+    organizer_.organizer_tasks_ = node["organizer_tasks"].as<clio::run::u32>();
+    if (organizer_.organizer_tasks_ == 0) {
+      HLOG(kError, "Config error: organizer_tasks must be >= 1");
+      return false;
+    }
+  }
+  if (node["organizer_period_ms"]) {
+    organizer_.period_ms_ = node["organizer_period_ms"].as<clio::run::u32>();
+  }
+
   // Parse GPU metadata cache configuration (optional)
   if (node["gpu_metadata_cache"]) {
     const YAML::Node &gmc = node["gpu_metadata_cache"];
@@ -367,6 +390,13 @@ void Config::EmitYaml(YAML::Emitter &emitter) const {
   emitter << YAML::Key << "dpe_type" << YAML::Value << dpe_.dpe_type_;
   emitter << YAML::EndMap;
 
+  // Emit data organizer configuration (top-level keys)
+  emitter << YAML::Key << "organizer" << YAML::Value << organizer_.name_;
+  emitter << YAML::Key << "organizer_tasks" << YAML::Value
+          << organizer_.organizer_tasks_;
+  emitter << YAML::Key << "organizer_period_ms" << YAML::Value
+          << organizer_.period_ms_;
+
   emitter << YAML::EndMap;
 }
 
@@ -443,62 +473,120 @@ bool Config::ParseStorageConfig(const YAML::Node &node) {
   
   for (const auto& device_node : node) {
     StorageDeviceConfig device_config;
-    
-    // Parse path (required)
+
+    // Parse existing_pool_id (optional). When present, this target binds to an
+    // ALREADY-EXISTING pool (e.g. a safe-bdev pool composed elsewhere) instead
+    // of having CTE create its own bdev. In that case path/bdev_type/
+    // capacity_limit become OPTIONAL.
+    if (device_node["existing_pool_id"]) {
+      std::string pool_id_str = device_node["existing_pool_id"].as<std::string>();
+      device_config.existing_pool_id_ = clio::run::PoolId::FromString(pool_id_str);
+      if (!device_config.HasExistingPool()) {
+        HLOG(kError,
+             "Config error: Invalid existing_pool_id '{}' (expected "
+             "'MAJOR.MINOR' with MAJOR != 0)",
+             pool_id_str);
+        return false;
+      }
+    }
+    if (device_node["existing_pool_module"]) {
+      device_config.existing_pool_module_ =
+          device_node["existing_pool_module"].as<std::string>();
+    }
+    const bool attach_existing = device_config.HasExistingPool();
+
+    // Parse path (required unless binding to an existing pool, where it is an
+    // optional friendly label for the target)
     if (!device_node["path"]) {
-      HLOG(kError, "Config error: Storage device missing required 'path' field");
-      return false;
+      if (!attach_existing) {
+        HLOG(kError,
+             "Config error: Storage device missing required 'path' field");
+        return false;
+      }
+    } else {
+      std::string path = device_node["path"].as<std::string>();
+      device_config.path_ = ctp::ConfigParse::ExpandPath(path);
     }
-    std::string path = device_node["path"].as<std::string>();
-    device_config.path_ = ctp::ConfigParse::ExpandPath(path);
-    
-    // Parse bdev_type (required)
+
+    // Parse bdev_type (required unless binding to an existing pool)
     if (!device_node["bdev_type"]) {
-      HLOG(kError, "Config error: Storage device missing required 'bdev_type' field");
-      return false;
+      if (!attach_existing) {
+        HLOG(kError,
+             "Config error: Storage device missing required 'bdev_type' field");
+        return false;
+      }
+    } else {
+      device_config.bdev_type_ = device_node["bdev_type"].as<std::string>();
+
+      // Validate bdev_type
+      if (device_config.bdev_type_ != "file" &&
+          device_config.bdev_type_ != "ram" &&
+          device_config.bdev_type_ != "hbm" &&
+          device_config.bdev_type_ != "pinned" &&
+          device_config.bdev_type_ != "noop") {
+        HLOG(kError,
+             "Config error: Invalid bdev_type '{}' (must be 'file', 'ram', "
+             "'hbm', 'pinned', or 'noop')",
+             device_config.bdev_type_);
+        return false;
+      }
     }
-    device_config.bdev_type_ = device_node["bdev_type"].as<std::string>();
-    
-    // Validate bdev_type
-    if (device_config.bdev_type_ != "file" && device_config.bdev_type_ != "ram" &&
-        device_config.bdev_type_ != "hbm" && device_config.bdev_type_ != "pinned" &&
-        device_config.bdev_type_ != "noop") {
-      HLOG(kError, "Config error: Invalid bdev_type '{}' (must be 'file', 'ram', 'hbm', 'pinned', or 'noop')", device_config.bdev_type_);
-      return false;
-    }
-    
-    // Parse capacity_limit (required)
+
+    // Parse capacity_limit (required unless binding to an existing pool, where
+    // the existing pool's GetStats provides the real remaining space)
     if (!device_node["capacity_limit"]) {
-      HLOG(kError, "Config error: Storage device missing required 'capacity_limit' field");
-      return false;
+      if (!attach_existing) {
+        HLOG(kError,
+             "Config error: Storage device missing required 'capacity_limit' "
+             "field");
+        return false;
+      }
+    } else {
+      std::string capacity_str = device_node["capacity_limit"].as<std::string>();
+      // Parse size string to bytes
+      if (!ParseSizeString(capacity_str, device_config.capacity_limit_)) {
+        HLOG(kError,
+             "Config error: Invalid capacity_limit format '{}' for device {}",
+             capacity_str, device_config.path_);
+        return false;
+      }
     }
-    std::string capacity_str = device_node["capacity_limit"].as<std::string>();
-    
-    // Parse size string to bytes
-    if (!ParseSizeString(capacity_str, device_config.capacity_limit_)) {
-      HLOG(kError, "Config error: Invalid capacity_limit format '{}' for device {}", capacity_str, device_config.path_);
-      return false;
-    }
-    
+
     // Parse score (optional)
     if (device_node["score"]) {
       device_config.score_ = device_node["score"].as<float>();
-      
+
       // Validate score range
       if (device_config.score_ < 0.0f || device_config.score_ > 1.0f) {
-        HLOG(kError, "Config error: Storage device score {} must be between 0.0 and 1.0 for device {}", 
+        HLOG(kError, "Config error: Storage device score {} must be between 0.0 and 1.0 for device {}",
               device_config.score_, device_config.path_);
         return false;
       }
     }
     // score_ defaults to -1.0f (use automatic scoring) if not specified
-    
+
+    // Targets that bind to an existing pool skip the path/capacity validation
+    // below — routing is purely by existing_pool_id_.
+    if (attach_existing) {
+      HLOG(kInfo,
+           "Storage device binds to existing pool {}.{} (module='{}', "
+           "score={})",
+           device_config.existing_pool_id_.major_,
+           device_config.existing_pool_id_.minor_,
+           device_config.existing_pool_module_.empty()
+               ? "<unset>"
+               : device_config.existing_pool_module_.c_str(),
+           device_config.score_);
+      storage_.devices_.push_back(std::move(device_config));
+      continue;
+    }
+
     // Validate parsed values
     if (device_config.path_.empty()) {
       HLOG(kError, "Config error: Storage device path cannot be empty");
       return false;
     }
-    
+
     if (device_config.capacity_limit_ == 0) {
       // Policy: a RAM device configured with capacity 0 ("0g") defaults
       // to 80% of total system DRAM — identical to the bdev module's

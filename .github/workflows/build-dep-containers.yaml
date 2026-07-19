@@ -10,6 +10,18 @@ on:
     paths:
       - 'docker/deps-cpu.Dockerfile'
       - 'docker/deps-nvidia.Dockerfile'
+  # NOTE: intentionally no pull_request trigger and no concurrency group here.
+  # On PRs this workflow runs only as a reusable workflow (workflow_call) via
+  # build-core-containers.yaml's rebuild-deps job -- that single path does the
+  # build-only dependency validation (publish steps below are still gated on
+  # github.event_name != 'pull_request'). A ref-scoped concurrency group here
+  # made the standalone run collide with the reusable invocation in the same
+  # group and cancel it, so all PR builds are routed through build-core instead.
+
+env:
+  # Present on push + internal-branch PRs; empty on forked-PR runs, which skips
+  # the Docker Hub login below (public base images still pull fine anonymously).
+  DOCKER_HUB_USERNAME: ${{ secrets.DOCKER_HUB_USERNAME }}
 
 jobs:
   # Build AMD64 on native x86_64 runner
@@ -24,6 +36,7 @@ jobs:
           submodules: recursive
 
       - name: Login to Docker Hub
+        if: ${{ env.DOCKER_HUB_USERNAME != '' }}
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_HUB_USERNAME }}
@@ -38,10 +51,10 @@ jobs:
           context: .
           file: ./docker/deps-cpu.Dockerfile
           platforms: linux/amd64
-          push: true
+          push: ${{ github.event_name != 'pull_request' }}
           tags: iowarp/deps-cpu:latest-amd64
           cache-from: type=registry,ref=iowarp/deps-cpu:buildcache-amd64
-          cache-to: type=registry,ref=iowarp/deps-cpu:buildcache-amd64,mode=max
+          cache-to: ${{ github.event_name != 'pull_request' && 'type=registry,ref=iowarp/deps-cpu:buildcache-amd64,mode=max' || '' }}
 
   # Build ARM64 on native ARM64 runner (much faster than QEMU emulation)
   build-deps-cpu-arm64:
@@ -55,6 +68,7 @@ jobs:
           submodules: recursive
 
       - name: Login to Docker Hub
+        if: ${{ env.DOCKER_HUB_USERNAME != '' }}
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_HUB_USERNAME }}
@@ -69,10 +83,10 @@ jobs:
           context: .
           file: ./docker/deps-cpu.Dockerfile
           platforms: linux/arm64
-          push: true
+          push: ${{ github.event_name != 'pull_request' }}
           tags: iowarp/deps-cpu:latest-arm64
           cache-from: type=registry,ref=iowarp/deps-cpu:buildcache-arm64
-          cache-to: type=registry,ref=iowarp/deps-cpu:buildcache-arm64,mode=max
+          cache-to: ${{ github.event_name != 'pull_request' && 'type=registry,ref=iowarp/deps-cpu:buildcache-arm64,mode=max' || '' }}
 
   # Create multi-arch manifest after both builds complete
   create-deps-cpu-manifest:
@@ -81,12 +95,16 @@ jobs:
     needs: [build-deps-cpu-amd64, build-deps-cpu-arm64]
     steps:
       - name: Login to Docker Hub
+        if: ${{ env.DOCKER_HUB_USERNAME != '' }}
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_HUB_USERNAME }}
           password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
 
       - name: Create and push multi-arch manifest
+        # No per-arch tags were pushed on a PR, so there is nothing to stitch;
+        # the job still succeeds so build-deps-nvidia (which needs it) can build.
+        if: ${{ github.event_name != 'pull_request' }}
         run: |
           docker buildx imagetools create \
             --tag iowarp/deps-cpu:latest \
@@ -105,6 +123,7 @@ jobs:
           submodules: recursive
 
       - name: Login to Docker Hub
+        if: ${{ env.DOCKER_HUB_USERNAME != '' }}
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_HUB_USERNAME }}
@@ -120,7 +139,7 @@ jobs:
           file: ./docker/deps-nvidia.Dockerfile
           # NVIDIA container only supports x86_64 due to CUDA packages
           platforms: linux/amd64
-          push: true
+          push: ${{ github.event_name != 'pull_request' }}
           tags: iowarp/deps-nvidia:latest
           cache-from: type=registry,ref=iowarp/deps-nvidia:buildcache
-          cache-to: type=registry,ref=iowarp/deps-nvidia:buildcache,mode=max
+          cache-to: ${{ github.event_name != 'pull_request' && 'type=registry,ref=iowarp/deps-nvidia:buildcache,mode=max' || '' }}

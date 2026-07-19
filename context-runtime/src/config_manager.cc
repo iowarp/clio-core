@@ -57,7 +57,9 @@ bool ConfigManager::ClientInit() {
   config_file_path_ = GetServerConfigPath();
   HLOG(kInfo, "Config at: {}", config_file_path_);
 
-  // Load YAML configuration if path is provided
+  // Load YAML configuration if path is provided. LoadYaml re-applies the env
+  // overrides itself; do them explicitly here too so a missing/empty config
+  // path still honors CLIO_PORT et al.
   if (!config_file_path_.empty()) {
     if (!LoadYaml(config_file_path_)) {
       HLOG(kError,
@@ -65,9 +67,14 @@ bool ConfigManager::ClientInit() {
             config_file_path_);
     }
   }
+  ApplyEnvOverrides();
 
+  is_initialized_ = true;
+  return true;
+}
+
+void ConfigManager::ApplyEnvOverrides() {
   // Check CLIO_PORT env var (overrides YAML and default).
-  // GetCompat reads CLIO_PORT first, falls back to CLIO_PORT for old deployments.
   if (const char *env = clio::run::env::GetCompat("PORT")) {
     std::string port_env(env);
     if (!port_env.empty()) {
@@ -75,27 +82,15 @@ bool ConfigManager::ClientInit() {
     }
   }
 
-  // Check CLIO_FALLBACK_PORT env var (overrides YAML and default). Setting it
-  // makes this runtime forward tasks for pools it does not own to the runtime
-  // on that port (fallback-runtime crash isolation).
-  if (const char *env = clio::run::env::GetCompat("FALLBACK_PORT")) {
-    std::string fb_env(env);
-    if (!fb_env.empty()) {
-      fallback_port_ = std::stoul(fb_env);
-    }
-  }
-
   // Check CLIO_EPHEMERAL env var (set by `clio_run start --ephemeral`). An
   // ephemeral runtime skips the default compose section — it starts bare (just
-  // admin) and is composed explicitly, e.g. a spawned per-app runtime that
-  // points at a main runtime via the fallback.
+  // admin) and is composed explicitly.
   if (const char *env = clio::run::env::GetCompat("EPHEMERAL")) {
     std::string e(env);
     ephemeral_ = !e.empty() && e != "0";
   }
 
   // Check CLIO_SERVER_ADDR env var (overrides default 127.0.0.1).
-  // GetCompat reads CLIO_SERVER_ADDR first, falls back to CLIO_SERVER_ADDR.
   if (const char *env = clio::run::env::GetCompat("SERVER_ADDR")) {
     std::string addr_env(env);
     if (!addr_env.empty()) {
@@ -103,8 +98,16 @@ bool ConfigManager::ClientInit() {
     }
   }
 
-  is_initialized_ = true;
-  return true;
+  // CLIO_NUM_THREADS overrides the configured worker-thread count (last word,
+  // after any config file). Useful for forcing a single worker, e.g. to test
+  // whether a failure depends on cross-thread task migration.
+  if (const char *env = clio::run::env::GetCompat("NUM_THREADS")) {
+    char *end = nullptr;
+    unsigned long n = std::strtoul(env, &end, 10);
+    if (end != env && n >= 1) {
+      num_threads_ = static_cast<u32>(n);
+    }
+  }
 }
 
 bool ConfigManager::ServerInit() {
@@ -114,7 +117,27 @@ bool ConfigManager::ServerInit() {
 
 bool ConfigManager::LoadYaml(const std::string &config_path) {
   try {
-    // Use CTP BaseConfig methods
+    // An empty file yields a YAML null node: every section lookup in
+    // ParseYAML misses and the runtime silently comes up with the default
+    // config (default port, default workers, empty compose — so no storage
+    // tiers). A caller that explicitly pointed CLIO_SERVER_CONF at a file
+    // almost certainly did not mean that, and the resulting failures surface
+    // far downstream (e.g. PutBlob out-of-space on the very first write).
+    // Report it as a load failure so ClientInit warns loudly.
+    std::error_code ec;
+    const std::string real_path = ctp::ConfigParse::ExpandPath(config_path);
+    const auto size = std::filesystem::file_size(real_path, ec);
+    if (!ec && size == 0) {
+      HLOG(kError, "Config file {} exists but is empty", real_path);
+      return false;
+    }
+
+    // Parse the YAML as-is (yaml port/settings win). Env overrides (CLIO_PORT
+    // et al.) are applied by ClientInit/ServerInit via ApplyEnvOverrides(), not
+    // here — a bare LoadYaml must reflect the file so callers parsing arbitrary
+    // configs (e.g. a compose file into a local ConfigManager) get the file's
+    // values, and the runtime's operational config is never silently retargeted
+    // by a config reload.
     LoadFromFile(config_path, true);
     return true;
   } catch (const std::exception &e) {
@@ -166,8 +189,6 @@ size_t ConfigManager::GetMemorySegmentSize(MemorySegment segment) const {
 }
 
 u32 ConfigManager::GetPort() const { return port_; }
-
-u32 ConfigManager::GetFallbackPort() const { return fallback_port_; }
 
 bool ConfigManager::IsEphemeral() const { return ephemeral_; }
 
@@ -271,6 +292,12 @@ void ConfigManager::ParseYAML(YAML::Node &yaml_conf) {
       first_busy_wait_ = runtime["first_busy_wait"].as<u32>();
     }
 
+    // Periodic cross-node task-validity check interval (issue #628)
+    if (runtime["task_progress_interval_ms"]) {
+      task_progress_interval_ms_ =
+          runtime["task_progress_interval_ms"].as<u32>();
+    }
+
     // Configuration directory for persistent runtime config
     if (runtime["conf_dir"]) {
       conf_dir_ = runtime["conf_dir"].as<std::string>();
@@ -283,6 +310,12 @@ void ConfigManager::ParseYAML(YAML::Node &yaml_conf) {
 
     // Note: stack_size parameter removed (was never used)
     // Note: heartbeat_interval parsing removed (not used by runtime)
+  }
+
+  // Env override for the task-progress validity-check interval (issue #628):
+  // env wins over yaml so it can be tuned per-run without editing a config.
+  if (const char *env = std::getenv("CLIO_TASK_PROGRESS_INTERVAL_MS")) {
+    task_progress_interval_ms_ = static_cast<u32>(std::atoi(env));
   }
 
   // Parse GPU orchestrator configuration
@@ -313,9 +346,6 @@ void ConfigManager::ParseYAML(YAML::Node &yaml_conf) {
     auto networking = yaml_conf["networking"];
     if (networking["port"]) {
       port_ = networking["port"].as<u32>();
-    }
-    if (networking["fallback_port"]) {
-      fallback_port_ = networking["fallback_port"].as<u32>();
     }
     if (networking["neighborhood_size"]) {
       neighborhood_size_ = networking["neighborhood_size"].as<u32>();
@@ -390,14 +420,6 @@ void ConfigManager::ParseYAML(YAML::Node &yaml_conf) {
         // Parse restart field if present
         if (pool_node["restart"]) {
           pool_config.restart_ = pool_node["restart"].as<bool>();
-        }
-
-        // pool_external: the pool's real container lives on the fallback
-        // ("main") runtime. We still create a local static container (a stub)
-        // so the pool resolves + tasks serialize, but mark it external so its
-        // tasks are punted to the fallback instead of executed here.
-        if (pool_node["pool_external"]) {
-          pool_config.external_ = pool_node["pool_external"].as<bool>();
         }
 
         // Optional RPC access control. container_visibility sets the default

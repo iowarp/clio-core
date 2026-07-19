@@ -129,12 +129,12 @@ class ClioAdapters(Interceptor):
             has_one = True
 
         if self.config['vol']:
-            lib = self._find_adapter_lib('iowarp_hdf5_vol')
+            lib = self._find_adapter_lib('clio_hdf5_vol')
             if lib is None:
-                raise Exception('Could not find iowarp_hdf5_vol library')
+                raise Exception('Could not find clio_hdf5_vol library')
             self.env['CLIO_CTE_VOL'] = lib
             self.env['CLIO_CTE_ROOT'] = str(pathlib.Path(lib).parent.parent)
-            self.log(f'Found libiowarp_hdf5_vol.so at {lib}')
+            self.log(f'Found libclio_hdf5_vol.so at {lib}')
             has_one = True
 
         if self.config['nvidia_gds']:
@@ -186,8 +186,8 @@ class ClioAdapters(Interceptor):
 
         if self.config['vol']:
             self.prepend_env('LD_PRELOAD', self.env['CLIO_CTE_VOL'])
-            self.setenv('HDF5_VOL_CONNECTOR', 'iowarp')
-            self.log("Added HDF5 VOL connector + set HDF5_VOL_CONNECTOR=iowarp")
+            self.setenv('HDF5_VOL_CONNECTOR', 'clio')
+            self.log("Added HDF5 VOL connector + set HDF5_VOL_CONNECTOR=clio")
 
         if self.config['nvidia_gds']:
             self.prepend_env('LD_PRELOAD', self.env['CLIO_CTE_NVIDIA_GDS'])

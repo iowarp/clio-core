@@ -1,12 +1,12 @@
 # Pipeline: IOWarp HDF5 VOL + IOR (Aurora)
 # Purpose: Same workload shape as ior_libfuse.yaml, but routes IOR's
 # HDF5 traffic through the clio_adapters HDF5 VOL connector
-# (libiowarp_hdf5_vol.so) instead of mounting a libfuse filesystem.
+# (libclio_hdf5_vol.so) instead of mounting a libfuse filesystem.
 #
 # How it differs from the libfuse variant:
 #  - No FUSE: no CAP_SYS_ADMIN, no /dev/fuse bind, no mountpoint pkg.
 #    clio_adapters preloads the VOL connector and sets
-#    HDF5_VOL_CONNECTOR=iowarp, so HDF5 dataset I/O is intercepted in
+#    HDF5_VOL_CONNECTOR=clio, so HDF5 dataset I/O is intercepted in
 #    the IOR process directly.
 #  - IOR uses api: HDF5 (not posix) so its writes go through H5Fcreate /
 #    H5Dwrite, which is what the VOL connector intercepts.

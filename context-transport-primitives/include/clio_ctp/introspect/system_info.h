@@ -108,6 +108,19 @@ struct CpuTimes {
   uint64_t Total() const { return TotalActive() + idle + iowait; }
 };
 
+/** Handle to a child process spawned by SystemInfo::SpawnProcess. Deliberately
+ *  platform-opaque so this header pulls in NO OS headers (the project keeps
+ *  <windows.h> / <winsock2.h> out of shared headers to avoid macro pollution and
+ *  the Winsock1/Winsock2 clash — see issue #476): on Windows win_process /
+ *  win_thread hold the process/thread HANDLEs as integers; on POSIX `pid` is the
+ *  child pid. Hold one and pass it by reference to IsChildRunning/TerminateChild. */
+struct SpawnedProcess {
+  int pid = -1;
+  uint64_t win_process = 0;
+  uint64_t win_thread = 0;
+  bool valid = false;
+};
+
 /** A unification of certain OS system calls */
 class SystemInfo {
  public:
@@ -200,6 +213,11 @@ class SystemInfo {
 
   CTP_DLL static void CloseSharedMemory(File &file);
 
+  /** True if a shared-memory segment named `name` currently exists.
+   *  A cheap open-then-close probe (no mapping); used to detect whether a
+   *  same-host runtime is present without fully attaching. */
+  CTP_DLL static bool SharedMemoryExists(const std::string &name);
+
   CTP_DLL static void DestroySharedMemory(const std::string &name);
 
   CTP_DLL static void *MapPrivateMemory(size_t size);
@@ -269,6 +287,44 @@ class SystemInfo {
    *  fall through. */
   CTP_DLL static void TerminateProcessNow(int exit_code);
 
+  /** Spawn `exe` as a child process with arguments `args` (which do NOT include
+   *  argv[0] — `exe` is prepended). The child's stdout AND stderr are redirected
+   *  (truncated) to `log_path`. When `detached` is true the child is spawned with
+   *  NO controlling console/terminal (Windows: DETACHED_PROCESS |
+   *  CREATE_NEW_PROCESS_GROUP; POSIX: POSIX_SPAWN_SETSID) — the console-less spawn
+   *  from issue #721. Returns a handle whose `valid` is false on failure.
+   *  Cross-platform so callers (e.g. the test RuntimeServer) need no OS headers. */
+  CTP_DLL static SpawnedProcess SpawnProcess(const std::string &exe,
+                                             const std::vector<std::string> &args,
+                                             const std::string &log_path,
+                                             bool detached = false);
+
+  /** True while a child spawned by SpawnProcess is still running. On POSIX this
+   *  reaps the child if it has exited (so the caller sees it stop); TerminateChild
+   *  tolerates an already-reaped child. */
+  CTP_DLL static bool IsChildRunning(const SpawnedProcess &proc);
+
+  /** Stop and reap a child spawned by SpawnProcess. POSIX: SIGTERM, wait up to
+   *  `grace_ms`, then SIGKILL — so the child runs its graceful shutdown / atexit
+   *  handlers (e.g. the daemon's ServerFinalize leak report) before being forced.
+   *  Windows: TerminateProcess. Idempotent; marks `proc` invalid. */
+  CTP_DLL static void TerminateChild(SpawnedProcess &proc, int grace_ms = 5000);
+
+  /** Sleep for `us` microseconds at the platform's best available precision.
+   *  Windows uses a one-shot high-resolution waitable timer
+   *  (CREATE_WAITABLE_TIMER_HIGH_RESOLUTION) for sub-millisecond accuracy
+   *  instead of std::this_thread::sleep_for, which rounds up to the ~1-15.6ms
+   *  system tick; POSIX uses nanosleep. The Win32 timer API is confined to
+   *  system_info.cc so <windows.h> never leaks into headers. us == 0 returns
+   *  immediately. */
+  CTP_DLL static void SleepForUs(size_t us);
+
+  /** Windows: raise this process's timer-interrupt resolution when the env
+   *  var CLIO_WIN_TIMER_MS is set (e.g. 1 -> timeBeginPeriod(1)). No-op
+   *  elsewhere or when unset. Diagnostic/workaround for tick-quantized
+   *  timeout waits (issue #768); per-process since Windows 10 2004. */
+  CTP_DLL static void RequestTimerResolutionFromEnv();
+
   /** IPv4/IPv6 addresses bound to local interfaces (loopback included). */
   CTP_DLL static std::vector<std::string> GetLocalInterfaceIps();
 
@@ -288,6 +344,24 @@ class SystemInfo {
   /** Directory of the shared library containing the given symbol. */
   CTP_DLL static std::string GetModuleDirectoryFor(void *symbol);
 
+  /// @brief Retrieves storage device hardware health statistics.
+  CTP_DLL static std::string GetDeviceHealthStats(const std::string &path);
+
+  /// @brief Derive the drive type ("hdd" or "ssd") from a pool/drive name.
+  /// A name containing the substring "hdd" (case-insensitive) is treated as
+  /// spinning disk; everything else defaults to "ssd". Extracted as a pure,
+  /// side-effect-free helper so the routing decision is unit-testable without
+  /// standing up the runtime.
+  CTP_DLL static std::string DeriveDriveType(const std::string &pool_name);
+
+  /// @brief Predicts drive failure by POSTing health metrics to a local
+  /// prediction server (Poco::Net HTTP). The endpoint is overridable via the
+  /// CLIO_PREDICT_URL environment variable (default: the Docker-host address
+  /// http://host.docker.internal:8000/predict/auto). Degrades gracefully: any
+  /// transport failure — or a build without Poco — returns a JSON object
+  /// ("{}" or {"error": ...}), never throws, and is bounded by a short timeout.
+  CTP_DLL static std::string PredictDriveFailure(const std::string &drive_type, const std::string &health_json, const std::string &drive_id);
+
   CTP_DLL static std::string GetLibrarySearchPathVar();
 
   CTP_DLL static char GetPathListSeparator();
@@ -301,8 +375,6 @@ class SystemInfo {
    *  Windows: "ucrtbase.dll" (UCRT exports the C math entry points). */
   CTP_DLL static std::string GetMathLibraryName();
 
-  /** Get device health statistics via smartctl */
-  CTP_DLL static std::string GetDeviceHealthStats(const std::string &path);
 };
 
 }  // namespace ctp

@@ -32,7 +32,7 @@
  */
 
 /**
- * Unit tests for the IOWarp HDF5 VOL connector (iowarp_hdf5_vol).
+ * Unit tests for the Clio HDF5 VOL connector (clio_hdf5_vol).
  *
  * Exercises the connector through its public surface only: the HDF5 plugin
  * discovery entry points and the H5VL registration / property-list APIs.
@@ -47,7 +47,7 @@
 
 #include "simple_test.h"
 
-#include "iowarp_vol.h"
+#include "clio_vol.h"
 
 #include <cstring>
 
@@ -55,14 +55,14 @@
    library is guaranteed to export on Windows (H5PLextern.h marks them
    dllexport inside the plugin). Declare them locally instead of including
    H5PLextern.h, which would re-declare them dllexport in this consumer TU.
-   H5VL_iowarp_cls / H5VL_iowarp_register carry no export decoration, so
+   H5VL_clio_cls / H5VL_clio_register carry no export decoration, so
    they must not be referenced directly here. */
 extern "C" H5PL_type_t H5PLget_plugin_type(void);
 extern "C" const void *H5PLget_plugin_info(void);
 
 namespace {
 
-const H5VL_class_t *GetIowarpVolClass() {
+const H5VL_class_t *GetClioVolClass() {
   return static_cast<const H5VL_class_t *>(H5PLget_plugin_info());
 }
 
@@ -71,21 +71,21 @@ const H5VL_class_t *GetIowarpVolClass() {
 TEST_CASE("HDF5 VOL - Plugin Entry Points", "[hdf5_vol]") {
   REQUIRE(H5PLget_plugin_type() == H5PL_TYPE_VOL);
 
-  const H5VL_class_t *cls = GetIowarpVolClass();
+  const H5VL_class_t *cls = GetClioVolClass();
   REQUIRE(cls != nullptr);
   /* The same class pointer must be returned on every call (HDF5 caches it) */
-  REQUIRE(GetIowarpVolClass() == cls);
+  REQUIRE(GetClioVolClass() == cls);
 }
 
 TEST_CASE("HDF5 VOL - Connector Class Definition", "[hdf5_vol]") {
-  const H5VL_class_t *cls = GetIowarpVolClass();
+  const H5VL_class_t *cls = GetClioVolClass();
   REQUIRE(cls != nullptr);
 
   SECTION("identification");
-  REQUIRE(std::strcmp(cls->name, IOWARP_VOL_CONNECTOR_NAME) == 0);
-  REQUIRE(cls->value == IOWARP_VOL_CONNECTOR_VALUE);
+  REQUIRE(std::strcmp(cls->name, CLIO_VOL_CONNECTOR_NAME) == 0);
+  REQUIRE(cls->value == CLIO_VOL_CONNECTOR_VALUE);
   REQUIRE(cls->version == H5VL_VERSION);
-  REQUIRE(cls->conn_version == IOWARP_VOL_CONNECTOR_VERSION);
+  REQUIRE(cls->conn_version == CLIO_VOL_CONNECTOR_VERSION);
 
   SECTION("capability flags");
   REQUIRE((cls->cap_flags & H5VL_CAP_FLAG_FILE_BASIC) != 0);
@@ -94,7 +94,7 @@ TEST_CASE("HDF5 VOL - Connector Class Definition", "[hdf5_vol]") {
   REQUIRE((cls->cap_flags & H5VL_CAP_FLAG_ATTR_BASIC) != 0);
 
   SECTION("required callbacks are wired");
-  REQUIRE(cls->info_cls.size == sizeof(iowarp_vol_info_t));
+  REQUIRE(cls->info_cls.size == sizeof(clio_vol_info_t));
   REQUIRE(cls->info_cls.copy != nullptr);
   REQUIRE(cls->info_cls.free != nullptr);
   REQUIRE(cls->file_cls.create != nullptr);
@@ -117,34 +117,34 @@ TEST_CASE("HDF5 VOL - Connector Class Definition", "[hdf5_vol]") {
 TEST_CASE("HDF5 VOL - Registration Lifecycle", "[hdf5_vol]") {
   REQUIRE(H5open() >= 0);
 
-  const H5VL_class_t *cls = GetIowarpVolClass();
+  const H5VL_class_t *cls = GetClioVolClass();
   REQUIRE(cls != nullptr);
 
   SECTION("register");
   hid_t connector_id = H5VLregister_connector(cls, H5P_DEFAULT);
   REQUIRE(connector_id >= 0);
-  REQUIRE(H5VLis_connector_registered_by_name(IOWARP_VOL_CONNECTOR_NAME) > 0);
+  REQUIRE(H5VLis_connector_registered_by_name(CLIO_VOL_CONNECTOR_NAME) > 0);
   REQUIRE(H5VLis_connector_registered_by_value(
-              static_cast<H5VL_class_value_t>(IOWARP_VOL_CONNECTOR_VALUE)) > 0);
+              static_cast<H5VL_class_value_t>(CLIO_VOL_CONNECTOR_VALUE)) > 0);
 
   SECTION("lookup by name and value");
-  hid_t by_name = H5VLget_connector_id_by_name(IOWARP_VOL_CONNECTOR_NAME);
+  hid_t by_name = H5VLget_connector_id_by_name(CLIO_VOL_CONNECTOR_NAME);
   REQUIRE(by_name >= 0);
   hid_t by_value = H5VLget_connector_id_by_value(
-      static_cast<H5VL_class_value_t>(IOWARP_VOL_CONNECTOR_VALUE));
+      static_cast<H5VL_class_value_t>(CLIO_VOL_CONNECTOR_VALUE));
   REQUIRE(by_value >= 0);
   REQUIRE(H5VLclose(by_name) >= 0);
   REQUIRE(H5VLclose(by_value) >= 0);
 
   SECTION("unregister");
   REQUIRE(H5VLunregister_connector(connector_id) >= 0);
-  REQUIRE(H5VLis_connector_registered_by_name(IOWARP_VOL_CONNECTOR_NAME) == 0);
+  REQUIRE(H5VLis_connector_registered_by_name(CLIO_VOL_CONNECTOR_NAME) == 0);
 }
 
 TEST_CASE("HDF5 VOL - File Access Property List", "[hdf5_vol]") {
   REQUIRE(H5open() >= 0);
 
-  const H5VL_class_t *cls = GetIowarpVolClass();
+  const H5VL_class_t *cls = GetClioVolClass();
   hid_t connector_id = H5VLregister_connector(cls, H5P_DEFAULT);
   REQUIRE(connector_id >= 0);
 
@@ -152,10 +152,10 @@ TEST_CASE("HDF5 VOL - File Access Property List", "[hdf5_vol]") {
   hid_t fapl = H5Pcreate(H5P_FILE_ACCESS);
   REQUIRE(fapl >= 0);
 
-  iowarp_vol_info_t info;
+  clio_vol_info_t info;
   info.under_vol_id = H5I_INVALID_HID;
   info.under_vol_info = nullptr;
-  info.chunk_size = IOWARP_VOL_DEFAULT_CHUNK_SIZE;
+  info.chunk_size = CLIO_VOL_DEFAULT_CHUNK_SIZE;
   REQUIRE(H5Pset_vol(fapl, connector_id, &info) >= 0);
 
   SECTION("read the connector back from the FAPL");
@@ -164,13 +164,13 @@ TEST_CASE("HDF5 VOL - File Access Property List", "[hdf5_vol]") {
   REQUIRE(fapl_vol_id >= 0);
   REQUIRE(H5VLclose(fapl_vol_id) >= 0);
 
-  /* Closing the FAPL routes through iowarp_info_free for the copied info */
+  /* Closing the FAPL routes through clio_info_free for the copied info */
   REQUIRE(H5Pclose(fapl) >= 0);
   REQUIRE(H5VLunregister_connector(connector_id) >= 0);
 }
 
 TEST_CASE("HDF5 VOL - Introspect Callbacks", "[hdf5_vol]") {
-  const H5VL_class_t *cls = GetIowarpVolClass();
+  const H5VL_class_t *cls = GetClioVolClass();
   REQUIRE(cls != nullptr);
 
   SECTION("get_conn_cls returns this connector");
@@ -200,10 +200,10 @@ TEST_CASE("HDF5 VOL - Introspect Callbacks", "[hdf5_vol]") {
 }
 
 TEST_CASE("HDF5 VOL - Info Copy And Free", "[hdf5_vol]") {
-  const H5VL_class_t *cls = GetIowarpVolClass();
+  const H5VL_class_t *cls = GetClioVolClass();
   REQUIRE(cls != nullptr);
 
-  iowarp_vol_info_t info;
+  clio_vol_info_t info;
   info.under_vol_id = H5I_INVALID_HID;
   info.under_vol_info = nullptr;
   info.chunk_size = 4 * 1024;
@@ -212,7 +212,7 @@ TEST_CASE("HDF5 VOL - Info Copy And Free", "[hdf5_vol]") {
   void *copied = cls->info_cls.copy(&info);
   REQUIRE(copied != nullptr);
   REQUIRE(copied != static_cast<void *>(&info));
-  auto *copy = static_cast<iowarp_vol_info_t *>(copied);
+  auto *copy = static_cast<clio_vol_info_t *>(copied);
   REQUIRE(copy->under_vol_id == info.under_vol_id);
   REQUIRE(copy->under_vol_info == nullptr);
   REQUIRE(copy->chunk_size == info.chunk_size);

@@ -105,6 +105,16 @@ CTP_DLL void InitSocketLib();
 /** Cleanup platform socket library (WSACleanup on Windows, no-op on POSIX) */
 CTP_DLL void CleanupSocketLib();
 
+/** Mark that process shutdown has begun. On Windows this tells ZeroMqTransport
+ *  to leak shared-context sockets instead of zmq_close-ing them (which would
+ *  trip libzmq's signaler WSASTARTUP assertion during teardown). No-op on
+ *  POSIX. */
+CTP_DLL void SetSocketLibShutdown();
+
+/** @return true once SetSocketLibShutdown() has been called. Always false on
+ *  POSIX (sockets close normally there). */
+CTP_DLL bool IsSocketLibShutdown();
+
 /** Scatter-gather send. Returns total bytes sent or -1 on error. */
 CTP_DLL ssize_t SendV(socket_t fd, const IoBuffer* iov, int count);
 

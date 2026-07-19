@@ -41,6 +41,13 @@ requirements:
     - liburing    # [linux]
     - nlohmann_json
     - libcurl
+    - poco            # Poco::Net: HTTP client for the drive-failure prediction path
+    - libboost-devel  # Boost.Context: optional stackful coroutine backend (#620)
+    # Optional cloud-import SDKs for the CAE assimilator. Uncomment alongside
+    # the matching CMake flag: aws-sdk-cpp for -DCAE_ENABLE_S3=ON (s3://),
+    # google-cloud-cpp for -DCAE_ENABLE_GCS=ON (gs://).
+    # - aws-sdk-cpp
+    # - google-cloud-cpp
   run:
     - python
     - zeromq
@@ -53,6 +60,10 @@ requirements:
     - liburing    # [linux]
     - nlohmann_json
     - libcurl
+    - poco            # Poco::Net: HTTP client for the drive-failure prediction path
+    # Optional cloud-import SDKs for the CAE assimilator (see build/host notes).
+    # - aws-sdk-cpp
+    # - google-cloud-cpp
     - pyyaml
     - msgpack-python
     - flask

@@ -1,0 +1,4 @@
+# OpenMPI hostfile: one slot per node so `mpirun -np 2` lands rank 0 on node1
+# and rank 1 on node2 (one producer/consumer rank per physical node).
+iowarp-node1 slots=1
+iowarp-node2 slots=1

@@ -70,6 +70,23 @@ CLIO_RUN_DEFINE_GLOBAL_PTR_VAR_CC(clio::run::IpcManager, g_ipc_manager);
 
 namespace clio::run {
 
+// Bind address for the local server sockets (client ROUTER, response listener,
+// single-node host). CLIO_BIND_ADDR wins; otherwise loopback under
+// CLIO_TEST_MODE so a unit-test binary binding a fresh port never trips the
+// Windows Defender Firewall "Allow access?" prompt — every unit test is
+// single-node loopback. Falls back to 0.0.0.0 for real multi-interface
+// deployments. Keep all bind sites going through this so none silently default
+// to 0.0.0.0 and accumulate per-binary firewall rules.
+static std::string DefaultServerBindAddr() {
+  if (const char *env = clio::run::env::GetCompat("BIND_ADDR")) {
+    if (*env) return std::string(env);
+  }
+  if (const char *tm = clio::run::env::GetCompat("TEST_MODE")) {
+    if (*tm && std::string(tm) != "0") return std::string("127.0.0.1");
+  }
+  return std::string("0.0.0.0");
+}
+
 // ChiServerBootstrap{Hip,Sycl}Gpu are defined in the GPU companion lib
 // (clio_run_cxx_gpu) and called from ServerInit below. Declare them at
 // namespace scope (not block scope) so MSVC mangles the references as
@@ -121,32 +138,83 @@ inline std::string LocalZmqIpcPath(u32 port) {
 
 // Constructor and destructor removed - handled by CTP singleton pattern
 
+// Auto-select the fastest client IPC transport that is actually usable, when
+// CLIO_IPC_MODE is unset. Probe order (fastest first, issue #768):
+//
+//   1. SHM  -- a same-host runtime always creates its main shared segment
+//              (ServerInitShm is unconditional), so the segment existing means
+//              a local server is up and the shared-memory data path is usable.
+//   2. IPC  -- a unix-domain (AF_UNIX) socket the server bound for the local
+//              control path; only present when the server itself runs in IPC
+//              mode (or on macOS, issue #482). Probed by the socket file.
+//   3. TCP  -- always available; the cross-host and last-resort fallback.
+//
+// The probes are cheap and side-effect free (an open/close on the segment
+// handle; a filesystem stat on the socket path). An explicit CLIO_IPC_MODE
+// bypasses this entirely.
+IpcMode IpcManager::SelectBestIpcMode() {
+  ConfigManager *config = CLIO_CONFIG_MANAGER;
+
+  // 1. SHM: is the server's main segment present on this host?
+  if (config) {
+    std::string main_seg = config->GetSharedMemorySegmentName(kMainSegment);
+    if (ctp::SystemInfo::SharedMemoryExists(main_seg)) {
+      HLOG(kDebug, "SelectBestIpcMode: SHM segment '{}' present -> SHM",
+           main_seg);
+      return IpcMode::kShm;
+    }
+    HLOG(kDebug, "SelectBestIpcMode: SHM segment '{}' absent", main_seg);
+  }
+
+  // 2. IPC: did the server bind a local unix-domain socket?
+  u32 port = GetEffectivePort();
+  std::string ipc_path =
+      ctp::SystemInfo::GetMemfdPath("clio_" + std::to_string(port) + ".ipc");
+  std::error_code ec;
+  if (std::filesystem::exists(ipc_path, ec) && !ec) {
+    HLOG(kDebug, "SelectBestIpcMode: IPC socket '{}' present -> IPC", ipc_path);
+    return IpcMode::kIpc;
+  }
+  HLOG(kDebug, "SelectBestIpcMode: IPC socket '{}' absent", ipc_path);
+
+  // 3. TCP: always available.
+  HLOG(kDebug, "SelectBestIpcMode: falling back to TCP");
+  return IpcMode::kTcp;
+}
+
 bool IpcManager::ClientInit() {
   HLOG(kDebug, "IpcManager::ClientInit");
   if (is_initialized_) {
     return true;
   }
+  // Optional Windows timer-resolution bump (CLIO_WIN_TIMER_MS, issue #768).
+  ctp::SystemInfo::RequestTimerResolutionFromEnv();
 
-  // Parse CLIO_IPC_MODE environment variable (default: TCP).
-  // A fallback client (port_override_ set) is pinned to SHM regardless of the
-  // env: punted tasks are completed in place in shared memory by the main
-  // runtime, which only works over the SHM data path.
-  if (port_override_ != 0) {
-    ipc_mode_ = IpcMode::kShm;
-  } else if (const char *ipc_mode_env = clio::run::env::GetCompat("IPC_MODE")) {
+  // Resolve the client IPC mode. An explicit CLIO_IPC_MODE forces that exact
+  // transport (no probing); when unset, auto-select the fastest path that is
+  // actually available. On this host a same-host SHM round-trip is ~190x
+  // faster than TCP and ~5x faster than the unix-socket path (issue #768), so
+  // defaulting to TCP left the slowest transport as the default.
+  if (const char *ipc_mode_env = clio::run::env::GetCompat("IPC_MODE")) {
     std::string mode_str(ipc_mode_env);
     if (mode_str == "SHM" || mode_str == "shm") {
       ipc_mode_ = IpcMode::kShm;
     } else if (mode_str == "IPC" || mode_str == "ipc") {
       ipc_mode_ = IpcMode::kIpc;
     } else {
-      ipc_mode_ = IpcMode::kTcp;  // Default
+      ipc_mode_ = IpcMode::kTcp;
     }
+    HLOG(kInfo, "IpcManager::ClientInit: IPC mode = {} (from CLIO_IPC_MODE)",
+         ipc_mode_ == IpcMode::kShm   ? "SHM"
+         : ipc_mode_ == IpcMode::kIpc ? "IPC"
+                                      : "TCP");
+  } else {
+    ipc_mode_ = SelectBestIpcMode();
+    HLOG(kInfo, "IpcManager::ClientInit: IPC mode = {} (auto-selected)",
+         ipc_mode_ == IpcMode::kShm   ? "SHM"
+         : ipc_mode_ == IpcMode::kIpc ? "IPC"
+                                      : "TCP");
   }
-  HLOG(kInfo, "IpcManager::ClientInit: IPC mode = {}",
-       ipc_mode_ == IpcMode::kShm   ? "SHM"
-       : ipc_mode_ == IpcMode::kIpc ? "IPC"
-                                    : "TCP");
 
   // Parse retry timeout environment variable
   // Semantics: 0 = fail immediately, -1 = wait forever, >0 = timeout in seconds
@@ -223,6 +291,37 @@ bool IpcManager::ClientInit() {
              e.what());
         return false;
       }
+
+      // Decoupled response path: bind an ephemeral ROUTER on which this client
+      // receives task responses, independent of the request DEALER above. Its
+      // OS-assigned port is advertised to the runtime via client_port_ so the
+      // runtime opens a dedicated dial-back connection (see RecvIn). This
+      // keeps the client's RX off the request socket — no shared sock_mtx_
+      // between send and recv.
+      //
+      // Constructed directly (not via the factory) for two reasons: (1) the
+      // factory maps port 0 -> 8192, but we need a genuinely OS-assigned
+      // ephemeral port so multiple clients on one host don't collide; (2) it
+      // must bind on the shared, leaked-at-exit ZMQ context (use_shared_ctx)
+      // — a ROUTER on its own owned context would zmq_ctx_destroy at clean exit
+      // and abort on Windows (libzmq signaler WSASTARTUP assertion).
+#if CTP_ENABLE_ZMQ
+      try {
+        client_response_listener_ = ctp::lbm::TransportPtr(
+            new ctp::lbm::ZeroMqTransport(ctp::lbm::TransportMode::kServer,
+                                          DefaultServerBindAddr(), "tcp",
+                                          /*port=*/0,
+                                          /*use_shared_ctx=*/true));
+        client_response_port_ = client_response_listener_->GetBoundPort();
+        HLOG(kInfo, "IpcManager: client response listener bound to port {}",
+             client_response_port_);
+      } catch (const std::exception &e) {
+        HLOG(kError,
+             "IpcManager::ClientInit: Failed to bind response listener: {}",
+             e.what());
+        return false;
+      }
+#endif
     }
 
     zmq_recv_running_.store(true);
@@ -315,6 +414,8 @@ bool IpcManager::ClientInit() {
 }
 
 bool IpcManager::ServerInit() {
+  // Optional Windows timer-resolution bump (CLIO_WIN_TIMER_MS, issue #768).
+  ctp::SystemInfo::RequestTimerResolutionFromEnv();
   if (is_initialized_) {
     return true;
   }
@@ -424,14 +525,11 @@ bool IpcManager::ServerInit() {
     u32 port = config->GetPort();
 
     try {
-      // TCP ROUTER server on port+3. Honor CLIO_BIND_ADDR so this matches
-      // whatever LoadHostfile picked; otherwise tests on Windows can't
-      // avoid the Defender Firewall prompt on the ROUTER port even when
-      // the main server is on loopback.
-      std::string router_bind = "0.0.0.0";
-      if (const char *env = clio::run::env::GetCompat("BIND_ADDR")) {
-        if (*env) router_bind = env;
-      }
+      // TCP ROUTER server on port+3. Bind via DefaultServerBindAddr so it
+      // honors CLIO_BIND_ADDR / loopback-under-test-mode and never defaults to
+      // 0.0.0.0 (which trips the Windows Defender Firewall prompt on the ROUTER
+      // port even when the main server is on loopback).
+      std::string router_bind = DefaultServerBindAddr();
       if (UseLocalZmqIpc()) {
         // macOS (issue #482): bind the local client ROUTER on an ipc:// unix
         // socket so replies route reliably; same-host clients connect their
@@ -474,50 +572,14 @@ bool IpcManager::ServerInit() {
 
   is_initialized_ = true;
 
-  // Bring up the fallback ("main") runtime connection if configured. This
-  // runtime punts tasks for pools it does not own to the main runtime (crash
-  // isolation). The fallback is a nested IpcManager acting as an SHM client of
-  // the main runtime: port_override_ makes its connect target + segment names
-  // resolve to the main runtime, and ipc_mode_ is pinned to SHM so punted tasks
-  // complete in place. ClientInit already retries for CLIO_CLIENT_RETRY_TIMEOUT
-  // via WaitForLocalServer, so a failed bring-up means the main runtime stayed
-  // unreachable — warn and run standalone (unknown-pool tasks then fail locally
-  // exactly as before, no punting).
-  {
-    ConfigManager *config = CLIO_CONFIG_MANAGER;
-    u32 fb_port = config->GetFallbackPort();
-    if (fb_port != 0 && fb_port != config->GetPort()) {
-      HLOG(kInfo,
-           "IpcManager: connecting fallback client to main runtime on port {}",
-           fb_port);
-      auto fb = std::make_unique<IpcManager>();
-      // Dedicated minimal bring-up (NOT full ClientInit): a second full client
-      // in this server process collides on process-global ZMQ recv/heartbeat
-      // state. FallbackClientInit does only the SHM attach + a synchronous
-      // ClientConnect + worker-queue rebuild.
-      if (fb->FallbackClientInit(fb_port)) {
-        fallback_ = std::move(fb);
-        HLOG(kSuccess,
-             "IpcManager: fallback client connected to main runtime (port {})",
-             fb_port);
-      } else {
-        HLOG(kWarning,
-             "IpcManager: fallback runtime on port {} unreachable; running "
-             "standalone (tasks for non-local pools will fail locally)",
-             fb_port);
-      }
-    } else if (fb_port != 0) {
-      HLOG(kError,
-           "IpcManager: fallback_port ({}) equals this runtime's port; "
-           "ignoring self-referential fallback",
-           fb_port);
-    }
-  }
-
   return true;
 }
 
 void IpcManager::ClientFinalize() {
+  // Mark shutdown so ZeroMqTransport leaks shared-context sockets instead of
+  // zmq_close-ing them on Windows (avoids libzmq's signaler WSASTARTUP abort).
+  ctp::lbm::sock::SetSocketLibShutdown();
+
   // Clean up thread-local task counter
   TaskCounter *counter =
       CTP_THREAD_MODEL->GetTls<TaskCounter>(chi_task_counter_key_);
@@ -543,7 +605,16 @@ void IpcManager::ClientFinalize() {
     }
   }
 
-  // Clean up lightbeam transport objects
+  // Clean up lightbeam transport objects. The recv thread that reads the
+  // response listener is already stopped above, so closing it here is safe.
+  // NOTE (Windows): the listener is a ROUTER on the shared ZMQ context; at
+  // process exit libzmq's static-destructor context shutdown touches it and
+  // can abort in the signaler ("Successful WSASTARTUP not yet performed") —
+  // the same teardown landmine the codebase bypasses via TerminateProcess in
+  // tests. Closing vs leaking the listener does not change that, so we close
+  // it cleanly (no leak on POSIX, where teardown is well-behaved).
+  client_response_listener_.reset();
+  ClearClientPool();
   zmq_transport_.reset();
 
   // Clients should not destroy shared resources
@@ -589,6 +660,10 @@ void IpcManager::ServerFinalize() {
     return;
   }
 
+  // Mark shutdown so ZeroMqTransport leaks shared-context sockets instead of
+  // zmq_close-ing them on Windows (avoids libzmq's signaler WSASTARTUP abort).
+  ctp::lbm::sock::SetSocketLibShutdown();
+
   // GPU orchestrator finalization removed along with the GPU runtime.
   // gpu2cpu_queue + gpu2cpu_copy_backend are torn down by
   // gpu::IpcManager::FinalizeGpuQueuesHip / FinalizeGpuQueuesSycl
@@ -604,6 +679,12 @@ void IpcManager::ServerFinalize() {
 
   // Clear main allocator pointer
   main_allocator_ = nullptr;
+
+  // Leak scan while the SHM segments are still mapped (alloc_vector_ is not
+  // cleared here). This is the reliable trigger for the IpcManager leak scan:
+  // the CLIO_IPC global is intentionally leaked, so ~IpcManager rarely runs.
+  // No-op unless built with CTP_ALLOC_TRACK_SIZE (CLIO_CORE_ENABLE_LEAK_CHECK).
+  ReportRuntimeLeaks("ServerFinalize");
 
   is_initialized_ = false;
 }
@@ -630,7 +711,10 @@ void IpcManager::SetNumSchedQueues(u32 num_sched_queues) {
 
 void IpcManager::AwakenWorker(TaskLane *lane) {
   if (!lane) {
-    HLOG(kWarning, "AwakenWorker: lane is null");
+    // No lane to target — wake every worker so a task parked with no resolvable
+    // owning lane is still re-checked (lost-wakeup safety net).
+    HLOG(kWarning, "AwakenWorker: lane is null; waking all workers");
+    CLIO_WORK_ORCHESTRATOR->AwakenAllWorkers();
     return;
   }
 
@@ -659,8 +743,52 @@ void IpcManager::AwakenWorker(TaskLane *lane) {
            runtime_pid, tid, lane->IsActive(), errno);
     }
   } else {
-    HLOG(kWarning, "AwakenWorker: tid={} (invalid), cannot send signal", tid);
+    // The target lane has no worker tid (only a worker's OWN assigned_lane_
+    // ever gets a tid, so a task parked on any secondary lane reads tid==0).
+    // A targeted signal is impossible, but some worker DOES own this task's
+    // event queue, so wake them all and let the owner re-check and resume the
+    // parked parent. This closes a lost-wakeup that hung sustained O_APPEND
+    // writes (#680 generic/069): a completed PutBlob subtask emplaced its
+    // result on the parent WriteTask's event queue but could not signal, so
+    // the parent slept forever while all workers idled in epoll.
+    CLIO_WORK_ORCHESTRATOR->AwakenAllWorkers();
   }
+}
+
+IpcManagerTls *IpcManager::GetTls() {
+  // One-time key registration (double-checked under the mutex). The key is
+  // process-wide; the per-thread value below is what differs per thread.
+  if (!ipc_tls_key_created_.load(std::memory_order_acquire)) {
+    std::lock_guard<std::mutex> lk(ipc_tls_key_mutex_);
+    if (!ipc_tls_key_created_.load(std::memory_order_relaxed)) {
+      CTP_THREAD_MODEL->CreateTls<IpcManagerTls>(ipc_tls_key_, nullptr);
+      ipc_tls_key_created_.store(true, std::memory_order_release);
+    }
+  }
+  // Lazily allocate this thread's IpcManagerTls. Its EventManager ctor runs on
+  // THIS thread, registering this thread's (pid, tid) signal event.
+  IpcManagerTls *tls = CTP_THREAD_MODEL->GetTls<IpcManagerTls>(ipc_tls_key_);
+  if (tls == nullptr) {
+    tls = new IpcManagerTls();
+    CTP_THREAD_MODEL->SetTls(ipc_tls_key_, tls);
+  }
+  return tls;
+}
+
+ctp::lbm::ShmMpscTransport *IpcManager::GetOrCreateShmConn(
+    const std::string &name) {
+  std::lock_guard<std::mutex> lk(shm_conns_mutex_);
+  auto it = shm_conns_.find(name);
+  if (it != shm_conns_.end()) {
+    return it->second.get();
+  }
+  auto conn = std::make_unique<ctp::lbm::ShmMpscTransport>();
+  if (!conn->ClientInit(name)) {
+    return nullptr;
+  }
+  ctp::lbm::ShmMpscTransport *raw = conn.get();
+  shm_conns_[name] = std::move(conn);
+  return raw;
 }
 
 bool IpcManager::ServerInitShm() {
@@ -733,17 +861,13 @@ bool IpcManager::ClientInitShm() {
   try {
     // Allocator IDs are NOT hardcoded: the server's are pid-based (pid.1 main,
     // pid.2 queue) and differ per runtime. They are recovered from each
-    // segment's header on attach (and also reported by ClientConnect), so a
-    // fallback client attaching the main runtime's segments gets the main
-    // runtime's IDs — not a colliding (1,0)/(2,0).
+    // segment's header on attach (and also reported by ClientConnect).
 
     // Get configurable segment names with environment variable expansion.
-    // port_override_ (non-zero on a fallback client) names the MAIN runtime's
-    // segments so this client attaches them instead of this runtime's own.
     std::string main_segment_name =
-        config->GetSharedMemorySegmentName(kMainSegment, port_override_);
+        config->GetSharedMemorySegmentName(kMainSegment);
     std::string queue_segment_name =
-        config->GetSharedMemorySegmentName(kQueueSegment, port_override_);
+        config->GetSharedMemorySegmentName(kQueueSegment);
 
     // Attach to existing main shared memory segment created by server
     if (!main_backend_.shm_attach(main_segment_name)) {
@@ -895,146 +1019,6 @@ bool IpcManager::ClientInitQueues() {
   }
 }
 
-namespace {
-// Synchronous request/reply over a DEALER transport: serialize + send the
-// task, then block-poll the SAME socket for the matching reply and deserialize
-// it inline. The fallback client uses this instead of the async recv-thread
-// path (two full clients in one process collide on that path). Retries the send
-// every ~2s until total_timeout. The mutex serializes concurrent round-trips on
-// the shared dealer. Returns true if a reply for this task was deserialized
-// (caller inspects the task's OUT fields); false on timeout.
-template <typename TaskT>
-bool FallbackSyncRoundtrip(ctp::lbm::Transport *dealer, std::mutex &mtx,
-                           const ctp::ipc::FullPtr<TaskT> &task,
-                           float total_timeout) {
-  size_t net_key = reinterpret_cast<size_t>(task.ptr_);
-  task->task_id_.net_key_ = net_key;
-  auto start = std::chrono::steady_clock::now();
-  while (std::chrono::duration<float>(std::chrono::steady_clock::now() - start)
-             .count() < total_timeout) {
-    {
-      std::lock_guard<std::mutex> lock(mtx);
-      SaveTaskArchive send_archive(MsgType::kSerializeIn, dealer);
-      send_archive << (*task.ptr_);
-      dealer->Send(send_archive, ctp::lbm::LbmContext());
-
-      // Poll for the reply for up to ~2s before re-sending (covers the ZMTP
-      // handshake window on a freshly-created DEALER).
-      auto attempt_start = std::chrono::steady_clock::now();
-      while (std::chrono::duration<float>(std::chrono::steady_clock::now() -
-                                          attempt_start)
-                 .count() < 2.0f) {
-        auto archive = std::make_unique<LoadTaskArchive>();
-        auto info = dealer->Recv(*archive);
-        if (info.rc == EAGAIN) {
-          std::this_thread::sleep_for(std::chrono::milliseconds(2));
-          continue;
-        }
-        if (info.rc != 0) {
-          dealer->ClearRecvHandles(*archive);
-          break;  // re-send
-        }
-        if (archive->task_infos_.empty() ||
-            archive->task_infos_[0].task_id_.net_key_ != net_key) {
-          dealer->ClearRecvHandles(*archive);
-          continue;  // not our reply
-        }
-        archive->msg_type_ = MsgType::kSerializeOut;
-        *archive >> (*task.ptr_);
-        dealer->ClearRecvHandles(*archive);
-        return true;
-      }
-    }
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  }
-  return false;
-}
-}  // namespace
-
-bool IpcManager::FallbackClientInit(u32 main_port) {
-  ConfigManager *config = CLIO_CONFIG_MANAGER;
-  port_override_ = main_port;        // segment names + (for consistency) port
-  ipc_mode_ = IpcMode::kShm;         // punted tasks complete in place via SHM
-
-  // Per-attempt + total wait budget (same env as the normal client path).
-  const char *wait_env = clio::run::env::GetCompat("WAIT_SERVER");
-  float total_timeout = wait_env ? static_cast<float>(std::atof(wait_env)) : 30.0f;
-  if (total_timeout <= 0) total_timeout = 30.0f;
-
-  // A dedicated DEALER to the MAIN runtime's control ROUTER (main_port + 3).
-  try {
-    zmq_transport_ = ctp::lbm::TransportFactory::Get(
-        config->GetServerAddr(), ctp::lbm::TransportType::kZeroMq,
-        ctp::lbm::TransportMode::kClient, "tcp", main_port + 3);
-  } catch (const std::exception &e) {
-    HLOG(kError, "FallbackClientInit: failed to create DEALER to main: {}",
-         e.what());
-    return false;
-  }
-
-  // CreateTaskId() needs a per-thread TaskCounter (guard the global key, then
-  // ensure this thread has a counter value).
-  if (!chi_task_counter_key_created_) {
-    CTP_THREAD_MODEL->CreateTls<TaskCounter>(chi_task_counter_key_, nullptr);
-    chi_task_counter_key_created_ = true;
-  }
-  if (CTP_THREAD_MODEL->GetTls<TaskCounter>(chi_task_counter_key_) == nullptr) {
-    CTP_THREAD_MODEL->SetTls(chi_task_counter_key_, new TaskCounter());
-  }
-
-  // Synchronous ClientConnect (no async recv thread — see FallbackSyncRoundtrip).
-  auto task = NewTask<clio::run::admin::ClientConnectTask>(
-      CreateTaskId(), kAdminPoolId, PoolQuery::Local());
-  bool connected =
-      FallbackSyncRoundtrip(zmq_transport_.get(), zmq_client_send_mutex_, task,
-                            total_timeout) &&
-      task->response_ == 0;
-  if (connected) {
-    worker_queues_off_ = task->worker_queues_off_;
-    runtime_pid_ = task->server_pid_;
-    server_generation_.store(task->server_generation_);
-    // Adopt the main runtime's dynamic (pid-based) allocator ids.
-    main_allocator_id_ = task->main_alloc_id_;
-    queue_allocator_id_ = task->queue_alloc_id_;
-  }
-  DelTask(task);
-  if (!connected) {
-    HLOG(kError,
-         "FallbackClientInit: main runtime on port {} did not answer "
-         "ClientConnect within {}s",
-         main_port, total_timeout);
-    return false;
-  }
-
-  // Attach the main runtime's segments (port-keyed via port_override_) and
-  // rebuild its worker queues from the offset learned above.
-  if (!ClientInitShm() || !ClientInitQueues()) {
-    HLOG(kError, "FallbackClientInit: failed to attach main runtime segments");
-    return false;
-  }
-
-  // Scheduler for ClientMapTask (lane selection on the main runtime's queues).
-  if (config && config->IsValid()) {
-    scheduler_ = SchedulerFactory::Get(config->GetLocalSched());
-  }
-
-  // SHM lightbeam transports used to serialize a punted internal subtask into
-  // its (shared) FutureShm copy_space and to deserialize the outputs main wrote
-  // back. The kShm transport is segment-agnostic — it operates on the
-  // per-call ctx.copy_space — so these can serialize into any copy_space the
-  // owning runtime allocated. See IpcRun2Fallback::PuntCopyIn / CompletePunt.
-  shm_send_transport_ = ctp::lbm::TransportFactory::Get(
-      "", ctp::lbm::TransportType::kShm, ctp::lbm::TransportMode::kClient);
-  shm_recv_transport_ = ctp::lbm::TransportFactory::Get(
-      "", ctp::lbm::TransportType::kShm, ctp::lbm::TransportMode::kServer);
-
-  is_initialized_ = true;
-  HLOG(kSuccess,
-       "FallbackClientInit: connected to main runtime (port {}, pid {})",
-       main_port, runtime_pid_);
-  return true;
-}
-
 bool IpcManager::StartLocalServer() {
   ConfigManager *config = CLIO_CONFIG_MANAGER;
 
@@ -1099,11 +1083,11 @@ retry_attempt:
   // Send a ClientConnectTask via the lightbeam transport
   auto task = NewTask<clio::run::admin::ClientConnectTask>(
       CreateTaskId(), kAdminPoolId, PoolQuery::Local());
-  auto future = IpcCpu2CpuZmq::ClientSend(this,task, ipc_mode_);
+  auto future = IpcCpu2CpuZmq::SendIn(this,task, ipc_mode_);
 
   // Wait for response with per-attempt timeout
   if (!future.Wait(per_attempt)) {
-    DelTask(task);
+    task.reset();
     float elapsed = std::chrono::duration<float>(
         std::chrono::steady_clock::now() - attempt_start).count();
     if (total_timeout > 0 && elapsed >= total_timeout) {
@@ -1160,6 +1144,8 @@ retry_attempt:
   if (task->response_ == 0) {
     client_generation_ = task->server_generation_;
     worker_queues_off_ = task->worker_queues_off_;
+    worker_tids_.assign(task->worker_tids_,
+                        task->worker_tids_ + task->num_worker_tids_);
     // Adopt the runtime's dynamic (pid-based) allocator ids rather than
     // assuming (1,0)/(2,0).
     main_allocator_id_ = task->main_alloc_id_;
@@ -1220,7 +1206,7 @@ bool IpcManager::WaitForLocalRuntimeStop(u32 timeout_sec) {
     // Send a ClientConnectTask with a 1-second timeout
     auto task = NewTask<clio::run::admin::ClientConnectTask>(
         CreateTaskId(), kAdminPoolId, PoolQuery::Local());
-    auto future = IpcCpu2CpuZmq::ClientSend(this,task, ipc_mode_);
+    auto future = IpcCpu2CpuZmq::SendIn(this,task, ipc_mode_);
 
     if (!future.Wait(1.0f)) {
       // Timeout or server dead: runtime is no longer responding
@@ -1272,10 +1258,7 @@ bool IpcManager::LoadHostfile() {
     // the requested address. Used by tests on Windows to pin to
     // 127.0.0.1 so the Defender Firewall doesn't pop "Allow access?"
     // for every new test binary that binds a fresh port.
-    std::string bind_addr = "0.0.0.0";
-    if (const char *env = clio::run::env::GetCompat("BIND_ADDR")) {
-      if (*env) bind_addr = env;
-    }
+    std::string bind_addr = DefaultServerBindAddr();
     HLOG(kDebug, "No hostfile configured, binding {} as node 0", bind_addr);
     Host host(bind_addr, 0);
     hostfile_map_[0] = host;
@@ -1679,11 +1662,11 @@ bool IpcManager::TryStartMainServer(const std::string &hostname) {
     return true;
 
   } catch (const std::exception &e) {
-    HLOG(kDebug, "Failed to start main server on {}:{} - exception: {}",
+    HLOG(kError, "Failed to start main server on {}:{} - exception: {}",
          hostname, config->GetPort(), e.what());
     return false;
   } catch (...) {
-    HLOG(kDebug, "Failed to start main server on {}:{} - unknown exception",
+    HLOG(kError, "Failed to start main server on {}:{} - unknown exception",
          hostname, config->GetPort());
     return false;
   }
@@ -1706,16 +1689,14 @@ size_t IpcManager::GetRuntimeHeapAllocatedBytes() const {
   // CTP_MALLOC is the private heap backing NewObj and the client-ZMQ
   // AllocateBuffer path. GetCurrentlyAllocatedSize() returns 0 unless built
   // with CTP_ALLOC_TRACK_SIZE (CLIO_CORE_ENABLE_LEAK_CHECK).
+  // Tasks are carved from CTP_MALLOC (ctp::make_shared(CTP_MALLOC, ...) in
+  // NewTask) and freed by RAII when the last shared_ptr owner drops, so a leaked
+  // task is already visible in GetCurrentlyAllocatedSize() below. (The former
+  // RuntimeTaskAllocBytes side-counter — needed when NewTask used global
+  // operator new — was removed with DelTask; keeping its now-undecremented
+  // increment made every freed task look leaked.)
   size_t total = CTP_MALLOC->GetCurrentlyAllocatedSize();
 #if defined(CTP_ALLOC_TRACK_SIZE)
-  // NewTask uses global operator new, not CTP_MALLOC, so add the net outstanding
-  // task bytes (incremented by NewTask, decremented by DelTask) — otherwise an
-  // unfreed NewTask would be invisible to the leak detector. Clamp negatives
-  // (defensive; the NewTask/DelTask pairing should keep this >= 0).
-  long long task_bytes = RuntimeTaskAllocBytes().load();
-  if (task_bytes > 0) {
-    total += static_cast<size_t>(task_bytes);
-  }
   // The runtime's AllocateBuffer draws from the per-process SHM
   // MultiProcessAllocator segments (not CTP_MALLOC), so add their outstanding
   // bytes too — otherwise a leaked runtime buffer is invisible here.
@@ -1731,6 +1712,66 @@ size_t IpcManager::GetRuntimeHeapAllocatedBytes() const {
   return total;
 #else
   return 0;
+#endif
+}
+
+size_t IpcManager::ReportRuntimeLeaks(const char *phase) const {
+#if defined(CTP_ALLOC_TRACK_SIZE) && CTP_IS_HOST
+  // Private heap (NewTask/NewObj/client-ZMQ buffers). At shutdown this
+  // legitimately still holds process-lifetime runtime state (pools, config,
+  // module manager) that is only released at static teardown -- so report it at
+  // INFO, NOT as a leak, to avoid false positives. Genuinely unfreed CTP_MALLOC
+  // allocations are caught for real by the MallocAllocator destructor
+  // (ctp::ipc::AllocatorLeakChecker) which runs at static teardown, after that
+  // process-lifetime state is gone.
+  const size_t priv = CTP_MALLOC->GetCurrentlyAllocatedSize();
+  if (priv != 0) {
+    HLOG(kInfo,
+         "[leak][runtime] {}: CTP_MALLOC private heap holds {} bytes (may be "
+         "process-lifetime state; verified clean at static teardown)",
+         phase, priv);
+  }
+
+  // Per-process SHM segments the runtime's AllocateBuffer draws from. These
+  // MultiProcessAllocators are placement-constructed in shared memory and never
+  // get a C++ destructor, so this scan is the ONLY place their leaks surface.
+  // Every buffer MUST be freed by shutdown, so any outstanding bytes here are a
+  // real shared-memory leak (reported at ERROR). This is the return value.
+  size_t shm_leaked = 0;
+  {
+    std::lock_guard<std::mutex> lock(shm_mutex_);
+    for (size_t i = 0; i < alloc_vector_.size(); ++i) {
+      auto *alloc = alloc_vector_[i];
+      if (alloc == nullptr) {
+        continue;
+      }
+      const size_t out = alloc->GetCurrentlyAllocatedSize();
+      if (out != 0) {
+        shm_leaked += out;
+        HLOG(kError,
+             "[leak][runtime] {}: SHM allocator #{} leaked {} bytes "
+             "(outstanding at shutdown)",
+             phase, i, out);
+      }
+    }
+  }
+
+  if (shm_leaked == 0) {
+    HLOG(kInfo, "[leak][runtime] {}: no outstanding SHM buffers", phase);
+  } else {
+    HLOG(kError, "[leak][runtime] {}: {} total SHM bytes leaked", phase,
+         shm_leaked);
+  }
+  return shm_leaked;
+#else
+  (void)phase;
+  return 0;
+#endif
+}
+
+IpcManager::~IpcManager() {
+#if defined(CTP_ALLOC_TRACK_SIZE) && CTP_IS_HOST
+  ReportRuntimeLeaks("~IpcManager");
 #endif
 }
 
@@ -1897,11 +1938,21 @@ ctp::lbm::Transport *IpcManager::GetOrCreateClient(const std::string &addr,
     return it->second.get();
   }
 
-  // Create new persistent client connection
+  // Create new persistent client connection. TransportFactory::Get throws
+  // (std::runtime_error) when the address is unroutable; a malformed client
+  // identity must never terminate the whole runtime, so swallow it and return
+  // nullptr — the caller falls back to echoing the response over the inbound
+  // ROUTER (see IpcCpu2CpuZmq::RecvIn).
   HLOG(kInfo, "[ClientPool] Creating new persistent connection to {}", key);
-  auto transport = ctp::lbm::TransportFactory::Get(
-      addr, ctp::lbm::TransportType::kZeroMq,
-      ctp::lbm::TransportMode::kClient, "tcp", port);
+  ctp::lbm::TransportPtr transport;
+  try {
+    transport = ctp::lbm::TransportFactory::Get(
+        addr, ctp::lbm::TransportType::kZeroMq,
+        ctp::lbm::TransportMode::kClient, "tcp", port);
+  } catch (const std::exception &e) {
+    HLOG(kError, "[ClientPool] Failed to dial {}: {}", key, e.what());
+    return nullptr;
+  }
 
   if (!transport) {
     HLOG(kError, "[ClientPool] Failed to create client for {}", key);
@@ -1916,10 +1967,38 @@ ctp::lbm::Transport *IpcManager::GetOrCreateClient(const std::string &addr,
   return raw_ptr;
 }
 
+ctp::lbm::Transport *IpcManager::GetOrCreateClientByIdentity(
+    const std::string &key_id, const std::string &dial_addr, int port) {
+  // Cache key: routing identity + advertised response port. Two clients that
+  // happen to pick the same ephemeral port still differ by identity, and the
+  // same client reusing a port across reconnects re-resolves to a fresh dial.
+  size_t hkey = std::hash<std::string>{}(key_id + ":" + std::to_string(port));
+
+  // Fast path: already have a dial-back connection for this client.
+  if (ctp::lbm::Transport **found = client_conn_cache_.find(hkey)) {
+    return *found;
+  }
+
+  // Miss: open (and own, via client_pool_) a DEALER to the client's listener.
+  ctp::lbm::Transport *transport = GetOrCreateClient(dial_addr, port);
+  if (transport == nullptr) {
+    HLOG(kError, "[ConnCache] Failed to dial back to {}:{} (id={})", dial_addr,
+         port, key_id);
+    return nullptr;
+  }
+  // insert_or_assign is idempotent under a race: whichever thread lands second
+  // just overwrites with the same client_pool_-owned pointer.
+  client_conn_cache_.insert_or_assign(hkey, transport);
+  HLOG(kDebug, "[ConnCache] dial-back to {}:{} cached (id={}, key={})",
+       dial_addr, port, key_id, hkey);
+  return transport;
+}
+
 void IpcManager::ClearClientPool() {
   std::lock_guard<std::mutex> lock(client_pool_mutex_);
   HLOG(kInfo, "[ClientPool] Clearing {} persistent connections",
        client_pool_.size());
+  client_conn_cache_.clear();
   client_pool_.clear();
 }
 
@@ -1958,6 +2037,15 @@ void IpcManager::EnqueueNetTask(Future<Task> future,
     if (wake_lane) {
       AwakenWorker(wake_lane);
     }
+    HLOG(kDebug,
+         "[TRACE768] t={} EnqueueNetTask prio={} was_empty={} wake_lane={} "
+         "lane_tid={} send_lane_set={} recv_lane_set={} net_lane_set={}",
+         std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(), priority_idx, was_empty, wake_lane != nullptr,
+         wake_lane ? wake_lane->GetTid() : -1, net_send_lane_ != nullptr,
+         net_recv_lane_ != nullptr, net_lane_ != nullptr);
+  } else {
+    HLOG(kDebug, "[TRACE768] t={} EnqueueNetTask prio={} was_empty=FALSE (no wake)",
+         std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(), priority_idx);
   }
 
   HLOG(kDebug,
@@ -1986,29 +2074,6 @@ bool IpcManager::TryPopNetTask(NetQueuePriority priority,
 //==============================================================================
 // Per-Process Shared Memory Management
 //==============================================================================
-
-void IpcManager::RegisterMemoryWithFallback(
-    const ctp::ipc::AllocatorId &alloc_id) {
-  if (fallback_ == nullptr) {
-    return;
-  }
-  HLOG(kInfo,
-       "IpcManager::RegisterMemoryWithFallback: forwarding ({}.{}) registration "
-       "to main runtime",
-       alloc_id.major_, alloc_id.minor_);
-  auto fb_reg_task = fallback_->NewTask<clio::run::admin::RegisterMemoryTask>(
-      clio::run::CreateTaskId(), clio::run::kAdminPoolId,
-      clio::run::PoolQuery::Local(), alloc_id);
-  if (!FallbackSyncRoundtrip(fallback_->zmq_transport_.get(),
-                             fallback_->zmq_client_send_mutex_, fb_reg_task,
-                             30.0f)) {
-    HLOG(kWarning,
-         "IpcManager::RegisterMemoryWithFallback: main runtime did not ack "
-         "({}.{}); punted tasks using it may fail to resolve",
-         alloc_id.major_, alloc_id.minor_);
-  }
-  fallback_->DelTask(fb_reg_task);
-}
 
 bool IpcManager::IncreaseClientShm(size_t size) {
   HLOG(kDebug, "IncreaseClientShm CALLED: size={}", size);
@@ -2082,15 +2147,8 @@ bool IpcManager::IncreaseClientShm(size_t size) {
     // RUNTIME PATH: the server owns this segment and already inserted it into
     // its own alloc_map_ above, so it resolves its own buffers/FutureShm
     // directly — there is no server to ask and no client DEALER to send on (a
-    // self-directed ClientSend().Wait() would block forever). If this runtime
-    // has a fallback (main) runtime, register the new segment with main over
-    // the fallback DEALER so main can resolve this runtime's FutureShm when a
-    // punted task completes in place. Done synchronously (no async recv thread
-    // on the fallback connection), mirroring the dual-RegisterMemory path.
+    // self-directed ClientSend().Wait() would block forever).
     if (CLIO_RUNTIME_MANAGER && CLIO_RUNTIME_MANAGER->IsRuntime()) {
-      if (fallback_ != nullptr) {
-        RegisterMemoryWithFallback(alloc_id);
-      }
       return true;
     }
 
@@ -2100,7 +2158,7 @@ bool IpcManager::IncreaseClientShm(size_t size) {
     auto reg_task = NewTask<clio::run::admin::RegisterMemoryTask>(
         clio::run::CreateTaskId(), clio::run::kAdminPoolId, clio::run::PoolQuery::Local(),
         alloc_id);
-    IpcCpu2CpuZmq::ClientSend(this,reg_task, IpcMode::kTcp).Wait();
+    IpcCpu2CpuZmq::SendIn(this,reg_task, IpcMode::kTcp).Wait();
 
     return true;
 
@@ -2174,11 +2232,6 @@ bool IpcManager::RegisterMemory(const ctp::ipc::AllocatorId &alloc_id) {
 
     // Release the lock before returning
     allocator_map_lock_.WriteUnlock();
-
-    // Fallback mode: also register this client segment on the main runtime so
-    // it can resolve + complete FutureShms for tasks this runtime punts to it
-    // (a punted task's FutureShm lives in this client segment).
-    RegisterMemoryWithFallback(alloc_id);
 
     return true;
 
@@ -2511,7 +2564,7 @@ bool IpcManager::ReconnectToOriginalHost() {
       auto reg_task = NewTask<clio::run::admin::RegisterMemoryTask>(
           clio::run::CreateTaskId(), clio::run::kAdminPoolId, clio::run::PoolQuery::Local(),
           alloc_id);
-      IpcCpu2CpuZmq::ClientSend(this,reg_task, IpcMode::kTcp).Wait();
+      IpcCpu2CpuZmq::SendIn(this,reg_task, IpcMode::kTcp).Wait();
     }
   }
 
@@ -2657,7 +2710,7 @@ bool IpcManager::WaitForServerAndReconnect(
              "after {}s", elapsed);
         break;
       }
-      std::this_thread::sleep_for(std::chrono::seconds(1));
+      CTP_THREAD_MODEL->SleepForUs(1000000);
       if (ReconnectToOriginalHost()) {
         wait_server_timeout_ = saved_timeout;
         reconnecting_.store(false, std::memory_order_release);
@@ -2710,19 +2763,31 @@ bool IpcManager::WaitForServerAndReconnect(
 // ZMQ Transport Methods
 //==============================================================================
 
+// Milliseconds a blocking zmq_poll waits before returning to re-check the
+// running flag. zmq_poll returns immediately when a response is ready, so this
+// only bounds idle re-poll + shutdown-join latency; while idle it also caps how
+// long a concurrent Send can be held off (PollRecv holds the socket mutex).
+// Replaces the EventManager/WSAEventSelect wait, which can't watch ZMQ_FD on
+// Windows and there falls back to a tick-floored ::Sleep (~15.6ms → the 40ms
+// TCP round-trip).
+static constexpr int kZmqPollTimeoutMs = 1;
+
 void IpcManager::RecvZmqClientThread() {
-  // Client-side thread: polls for completed task responses from the server
-  // DEALER transport receives responses on the same socket used for sending
-  if (!zmq_transport_) {
-    HLOG(kError, "RecvZmqClientThread: No DEALER transport");
+  // Client-side thread: blocks for completed task responses. In TCP mode these
+  // arrive on the dedicated response listener (an ephemeral ROUTER bound in
+  // ClientInit) that the runtime dials back into — fully decoupled from the
+  // request DEALER, so there is no shared sock_mtx_ between send and recv. In
+  // IPC mode there is no listener; responses come back over the unix-socket
+  // transport (zmq_transport_) as before. Uses ZMQ's native zmq_poll (via
+  // Transport::PollRecv) rather than the EventManager, because ZMQ_FD cannot be
+  // registered with WSAEventSelect on Windows.
+  ctp::lbm::Transport *recv_transport = client_response_listener_
+                                            ? client_response_listener_.get()
+                                            : zmq_transport_.get();
+  if (!recv_transport) {
+    HLOG(kError, "RecvZmqClientThread: No response transport");
     return;
   }
-
-  // Set up EventManager for ZMQ transport polling.
-  // Use the member zmq_client_em_ (not a local) so the EventManager outlives
-  // the transport reset in ClientFinalize() and the ~SocketTransport()
-  // destructor can safely call em_->RemoveEvent().
-  zmq_transport_->RegisterEventManager(zmq_client_em_);
 
   // Instrumentation: count of responses this client has received and signaled
   // (FUTURE_COMPLETE set). Mismatch vs daemon-side send count = lost responses.
@@ -2736,11 +2801,11 @@ void IpcManager::RecvZmqClientThread() {
     while (got_message) {
       got_message = false;
       auto archive = std::make_unique<LoadTaskArchive>();
-      auto info = zmq_transport_->Recv(*archive);
+      auto info = recv_transport->Recv(*archive);
       int rc = info.rc;
       if (rc == EAGAIN) break;
       if (rc != 0) {
-        zmq_transport_->ClearRecvHandles(*archive);
+        recv_transport->ClearRecvHandles(*archive);
         if (!zmq_recv_running_.load()) break;
         // ETERM means the ZMQ context is being shut down (zmq_ctx_shutdown was
         // called).  Exit immediately so the context destructor is not blocked.
@@ -2766,11 +2831,11 @@ void IpcManager::RecvZmqClientThread() {
              "[CountClientRecv] miss#{}: No pending future for net_key {} "
              "(received={}, misses={})",
              miss_count, net_key, recv_count, miss_count);
-        zmq_transport_->ClearRecvHandles(*archive);
+        recv_transport->ClearRecvHandles(*archive);
         continue;
       }
 
-      FutureShm *future_shm = it->second;
+      Task *task = it->second.task;
 
       // Store the archive for Recv() to pick up
       pending_response_archives_[net_key] = std::move(archive);
@@ -2778,9 +2843,17 @@ void IpcManager::RecvZmqClientThread() {
       // Memory fence before setting complete
       std::atomic_thread_fence(std::memory_order_release);
 
-      // Signal completion
-      future_shm->flags_.SetBits(FutureShm::FUTURE_NEW_DATA |
-                                 FutureShm::FUTURE_COMPLETE);
+      // Signal completion on the client's task (per-process; polled by the
+      // client thread's WaitCpu2Cpu loop).
+      task->SetNewData();
+      task->SetComplete();
+      // Wake the client thread blocked in ClientRecv — it sleeps on its
+      // EventManager rather than busy-polling. The waiter (pid,tid) lives on the
+      // task's FutureInfo (recorded in ClientSend).
+      if (task->WaiterPid() != 0) {
+        ctp::lbm::EventManager::Signal(static_cast<int>(task->WaiterPid()),
+                                       static_cast<int>(task->WaiterTid()));
+      }
 
       // Remove from pending futures map
       pending_zmq_futures_.erase(it);
@@ -2793,19 +2866,12 @@ void IpcManager::RecvZmqClientThread() {
       }
     }
 
-    // Only block on epoll when the drain loop found nothing;
-    // if we just processed messages, loop back immediately.
+    // Only block when the drain loop found nothing; if we just processed
+    // messages, loop back immediately to drain more. zmq_poll wakes the instant
+    // a response arrives, so this adds no latency to message delivery.
     if (!drained_any) {
-      zmq_client_em_.Wait(100);  // 100μs (precise with epoll_pwait2)
+      recv_transport->PollRecv(kZmqPollTimeoutMs);
     }
-  }
-  // `em` is about to be destroyed (stack-allocated). The transport
-  // stashed a raw pointer to it in RegisterEventManager — clear that
-  // before unwinding, otherwise ClientFinalize's later ~SocketTransport
-  // calls em_->RemoveEvent on freed memory (ASan: heap-use-after-free
-  // in EventManager::RemoveEvent → std::unordered_map::find).
-  if (zmq_transport_) {
-    zmq_transport_->UnregisterEventManager();
   }
 }
 
@@ -2813,7 +2879,7 @@ void IpcManager::HeartbeatThread() {
   while (heartbeat_running_.load()) {
     bool alive = IsServerAlive();
     server_alive_.store(alive, std::memory_order_release);
-    std::this_thread::sleep_for(std::chrono::seconds(1));
+    CTP_THREAD_MODEL->SleepForUs(1000000);
   }
 }
 
@@ -2904,7 +2970,7 @@ ctp::ipc::AllocatorId IpcManager::AllocateAndRegisterGpuBackend(
         clio::run::CreateTaskId(), clio::run::kAdminPoolId, clio::run::PoolQuery::Local(),
         backend_id, admin_kind, gpu_id, static_cast<u64>(bytes),
         ipc_handle_bytes);
-    IpcCpu2CpuZmq::ClientSend(this, reg_task, IpcMode::kTcp).Wait();
+    IpcCpu2CpuZmq::SendIn(this, reg_task, IpcMode::kTcp).Wait();
   }
 
   result = alloc_id;
@@ -2924,68 +2990,46 @@ void IpcManager::FreeGpuBackend(u32 gpu_id,
 }
 #endif  // CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL
 
-void IpcManager::BeginTask(Future<Task> &future, Container *container,
-                           TaskLane *lane) {
-  FullPtr<Task> task_ptr = future.GetTaskPtr();
-  if (task_ptr.IsNull()) {
-    HLOG(kError, "BeginTask: task_ptr is null!");
-    return;
+// Allocate this task's owned RunContext and resolve its execution container.
+//
+// Called at the ipc_*.cc receive/send sites (NOT necessarily on a worker
+// thread — e.g. the net recv worker, or the main thread during ServerInit's
+// synchronous admin pool creation). It therefore does ONLY thread-independent
+// setup: allocate the RunContext and resolve the container. The worker-specific
+// per-execution parameters (worker id, lane, event queue, future, polling,
+// predicted stats) are set later, on the worker, in Worker::ProcessNewTask and
+// Task::StartCoroutine. Giving the task an active RunContext here is what lets
+// RouteTask run before the worker picks the task up.
+void Task::EnsureRunCtx() {
+  // Allocate the RunContext storage if the task does not already have one. This
+  // is the lightweight half of BeginRunContext (no container resolution): it is
+  // what gives the task its embedded routing state (run_ctx_->route_) so the
+  // client SendIn / server RecvIn can stamp it via GetFutureShm() before the
+  // worker formally begins the task.
+  if (!run_ctx_) {
+    run_ctx_ = ctp::make_unique<RunContext>(CTP_MALLOC);
   }
+}
+
+void Task::BeginRunContext() {
+  // Reuse an existing RunContext (e.g. one created at RecvIn to hold the
+  // response-routing state) rather than clobbering it — re-allocating here
+  // would wipe run_ctx_->route_ that the transport set before dispatch.
+  EnsureRunCtx();
+  // Fresh execution starts not-complete (the waiter must not observe a stale
+  // completion from a prior life of a recycled task).
+  UnsetComplete();
+  UnsetNewData();
 #if CTP_IS_HOST
-  Worker *worker = CLIO_CUR_WORKER;
-
-  // Initialize or reset the task's owned RunContext
-  task_ptr->SetRunCtx(new RunContext());
-  RunContext *run_ctx = task_ptr->GetRunCtx();
-
-  // Clear and initialize RunContext for new task execution
-  run_ctx->worker_id_ = worker ? worker->GetId() : 0;
-  run_ctx->task_ = task_ptr;        // Store task in RunContext
-  run_ctx->is_yielded_ = false;     // Initially not blocked
-  run_ctx->container_ = container;  // Store container for CLIO_CUR_CONTAINER
-  run_ctx->lane_ = lane;            // Store lane for CLIO_CUR_LANE
-  run_ctx->event_queue_ =
-      worker ? worker->GetEventQueue() : nullptr;  // Set event queue
-  run_ctx->future_ = future;        // Store future in RunContext
-  run_ctx->coro_handle_ = nullptr;  // Coroutine not started yet
-
-  // Initialize adaptive polling fields for periodic tasks
-  if (task_ptr->IsPeriodic()) {
-    run_ctx->true_period_ns_ = task_ptr->period_ns_;
-    run_ctx->yield_time_us_ =
-        task_ptr->period_ns_ / 1000.0;  // Initialize with true period
-    run_ctx->did_work_ = false;         // Initially no work done
-  } else {
-    run_ctx->true_period_ns_ = 0.0;
-    run_ctx->yield_time_us_ = 0.0;
-    run_ctx->did_work_ = false;
-  }
-
-  // Populate predicted_stat_ from the container so downstream routing
-  // (RouteGlobal's latency-vs-IO lane choice; worker.cc's predicted-load
-  // tracking) can read the task's actual payload size without re-doing
-  // the GetTaskStats(task) work. Scheduler-class code (RuntimeMapTask)
-  // already calls GetTaskStats; pre-populating it here keeps a single
-  // source of truth and makes the value available before RouteTask.
-  if (container) {
-    run_ctx->predicted_stat_ = container->GetTaskStats(task_ptr.ptr_);
-  }
-
-  // Mark that RunContext now exists for this task
-  task_ptr->SetFlags(TASK_RUN_CTX_EXISTS);
-
-  // NOTE: Do NOT call SetCurrentRunContext here. BeginTask may be called
-  // from SendRuntimeClient inside a running coroutine. Overwriting the
-  // current RunContext would cause await_suspend_impl to store the parent
-  // coroutine handle on the subtask's RunContext instead of the parent's,
-  // leading to premature task completion. StartCoroutine and ResumeCoroutine
-  // already set the current RunContext before executing the task.
+  // Resolve the execution container: the real (local) container if one exists
+  // (the common case), otherwise the static container.
+  ExecContainer() = CLIO_POOL_MANAGER->GetRealOrStaticContainer(pool_id_);
 #endif
 }
 
 RouteResult IpcManager::RouteTask(Future<Task> &future, bool force_enqueue) {
   // Get task pointer from future
-  FullPtr<Task> task_ptr = future.GetTaskPtr();
+  clio::run::shared_ptr<Task> task_ptr = future.GetTaskPtr();
 
   if (task_ptr.IsNull()) {
     Worker *worker = CLIO_CUR_WORKER;
@@ -3017,8 +3061,8 @@ RouteResult IpcManager::RouteTask(Future<Task> &future, bool force_enqueue) {
   // when tasks arrive at remote nodes (e.g., GetOrCreatePool returns
   // Broadcast on every node since the pool doesn't exist yet).
   auto *pool_manager = CLIO_POOL_MANAGER;
-  Container *static_container =
-      pool_manager->GetStaticContainer(task_ptr->pool_id_);
+  auto static_container =
+      pool_manager->GetStaticContainer(task_ptr->pool_id_).get();
   PoolQuery resolved_query = task_ptr->pool_query_;
   if (static_container && resolved_query.IsDynamicMode()) {
     resolved_query = static_container->ScheduleTask(task_ptr);
@@ -3060,8 +3104,8 @@ RouteResult IpcManager::RouteTask(Future<Task> &future, bool force_enqueue) {
       HLOG(kError, "RouteTask: RouteLocal returned {} for pool={} method={}, worker={}",
            (int)result, task_ptr->pool_id_, task_ptr->method_,
            worker ? (int)worker->GetId() : -1);
-      if (worker && task_ptr->GetRunCtx()) {
-        worker->AddToRetryQueue(task_ptr->GetRunCtx());
+      if (worker) {
+        worker->AddToRetryQueue(task_ptr);
       }
     }
     return result;
@@ -3071,14 +3115,32 @@ RouteResult IpcManager::RouteTask(Future<Task> &future, bool force_enqueue) {
 }
 
 RouteResult IpcManager::RouteManyToOne(Future<Task> &future) {
-  FullPtr<Task> task_ptr = future.GetTaskPtr();
+  clio::run::shared_ptr<Task> task_ptr = future.GetTaskPtr();
   u64 leader = GetNeighborhoodLeaderNodeId();
   if (leader == GetNodeId()) {
     // We are the neighborhood leader: park the task into its batch group. The
     // batch flusher aggregates, runs once, and completes each member later.
     // RouteResult::Local tells the worker the task is owned elsewhere now and
     // must not be executed here.
-    task_ptr->SetFlags(TASK_ROUTED);
+    //
+    // Anchor the FutureShm to the task's RunContext: the batch holds the member
+    // task by pointer, and the queued Future that owns the FutureShm is dropped
+    // once routing returns. Without this bind the FutureShm is freed before the
+    // batch flusher runs, so OnAggregateComplete can't signal the member's
+    // waiter (future_shm is null) and the client's Wait() hangs. Mirrors the
+    // bind in RouteGlobal; the batch path skips ProcessNewTask, which is the
+    // only other place RunFuture is bound.
+    task_ptr->RunFuture() = future;
+    // Break the strong back-reference cycle (task -> RunContext -> future_ ->
+    // task_ptr_ -> task) that would otherwise leak the member after the batch
+    // completes, but keep the Future's task pointer pointing AT the member as a
+    // NON-OWNING handle: GetFutureShm() now resolves the routing state through
+    // the task (TaskRaw()->RunCtxPtr()), so a plain reset() would make
+    // OnAggregateComplete -> EndTask see a null route and never signal the
+    // member's waiter (the client's Wait() would hang).
+    task_ptr->RunFuture().GetTaskPtr() =
+        clio::run::shared_ptr<Task>::WrapNonOwning(task_ptr.get());
+    task_ptr->SetRouted();
     batch_manager_->Add(task_ptr);
     return RouteResult::Local;
   }
@@ -3090,7 +3152,7 @@ RouteResult IpcManager::RouteManyToOne(Future<Task> &future) {
   return RouteGlobal(future, pool_queries);
 }
 
-bool IpcManager::IsTaskLocal(const FullPtr<Task> & /*task_ptr*/,
+bool IpcManager::IsTaskLocal(const clio::run::shared_ptr<Task> & /*task_ptr*/,
                              const std::vector<PoolQuery> &pool_queries,
                              bool originally_local) {
   // CLIO_FORCE_NET stress mode: routing is determined entirely by the
@@ -3165,24 +3227,25 @@ bool IpcManager::IsTaskLocal(const FullPtr<Task> & /*task_ptr*/,
 
 RouteResult IpcManager::RouteLocal(Future<Task> &future, bool force_enqueue) {
   // Get task pointer from future
-  FullPtr<Task> task_ptr = future.GetTaskPtr();
+  clio::run::shared_ptr<Task> task_ptr = future.GetTaskPtr();
 
   // Mark as routed so the task is not re-routed on subsequent passes.
-  task_ptr->SetFlags(TASK_ROUTED);
+  task_ptr->SetRouted();
 
-  // Resolve the actual execution container
+  // Resolve the actual execution container (resolve-once: this handle is cached
+  // in the RunContext below and reused for the task's whole lifetime).
   auto *pool_manager = CLIO_POOL_MANAGER;
-  bool is_plugged = false;
   ContainerId container_id = task_ptr->pool_query_.GetContainerId();
-  Container *exec_container =
-      pool_manager->GetContainer(task_ptr->pool_id_, container_id, is_plugged);
+  DynamicContainer exec_dc =
+      pool_manager->GetContainer(task_ptr->pool_id_, container_id);
+  ContainerHold exec_container = exec_dc.get();
 
   if (!exec_container) {
     HLOG(kError, "RouteLocal: Container not found for pool={} container_id={} method={}",
          task_ptr->pool_id_, container_id, task_ptr->method_);
     return RouteResult::Dne;
   }
-  if (is_plugged) {
+  if (exec_dc.IsPlugged()) {
     HLOG(kWarning, "RouteLocal: Container plugged for pool={}", task_ptr->pool_id_);
     return RouteResult::Retry;
   }
@@ -3195,9 +3258,7 @@ RouteResult IpcManager::RouteLocal(Future<Task> &future, bool force_enqueue) {
   task_ptr->SetCompleter(exec_container->container_id_);
 
   // Update RunContext to use the resolved execution container
-  if (task_ptr->GetRunCtx()) {
-    task_ptr->GetRunCtx()->container_ = exec_container;
-  }
+  task_ptr->ExecContainer() = exec_dc;
 
   // Use scheduler to pick the destination worker
   Worker *worker = CLIO_CUR_WORKER;
@@ -3209,20 +3270,43 @@ RouteResult IpcManager::RouteLocal(Future<Task> &future, bool force_enqueue) {
     return RouteResult::ExecHere;
   }
 
-  // Enqueue to the destination worker's lane
-  auto &dest_lane = worker_queues_->GetLane(dest_worker_id, 0);
-  bool was_empty = dest_lane.Empty();
-  dest_lane.Push(future);
-  if (was_empty) {
-    AwakenWorker(&dest_lane);
+  // Self-send deadlock avoidance: a worker force-enqueuing a subtask onto its
+  // OWN lane busy-spins in the WAIT_FOR_SPACE ring Push when the lane is full,
+  // and can never drain it — it IS the consumer, blocked here in Push rather
+  // than in its Run loop. Redirect to an alternate worker whose own thread
+  // drains it, converting the deadlock into transient backpressure. An earlier
+  // "only redirect to a non-full sibling" guard failed under the mmap-writeback
+  // storm (all lanes saturate → no non-full sibling → fell back to self-spin);
+  // redirect UNCONDITIONALLY — briefly spinning on a *sibling's* full lane is
+  // safe because that sibling's thread drains it. (generic/438: mmap read fault
+  // -> GetBlob -> bdev::AsyncRead -> SendIn all on the scheduler worker; the
+  // bdev subtask's predicted io_size is 0 so RuntimeMapTask routes it back to
+  // the scheduler worker = self.)
+  if (force_enqueue && worker && dest_worker_id == worker->GetId()) {
+    Worker *alt = scheduler_->PickAltWorker(dest_worker_id);
+    if (alt != nullptr) {
+      dest_worker_id = alt->GetId();
+    }
   }
+
+  // Enqueue to the destination worker's lane, then ALWAYS signal. Gating the
+  // wakeup on was_empty is the exact lost-wakeup race AwakenWorker's own
+  // comment warns against: the consumer can drain the lane and park in
+  // epoll_pwait2 in the window between our Empty() check and Push, so a
+  // "non-empty" observation skips a wakeup the worker actually needed. The
+  // extra SIGUSR1 is absorbed harmlessly by signalfd if the worker is already
+  // awake. (Surfaced as a permanent hang in generic/208 aio-dio once self-sent
+  // subtasks began routing to otherwise-idle I/O workers.)
+  auto &dest_lane = worker_queues_->GetLane(dest_worker_id, 0);
+  dest_lane.Push(future);
+  AwakenWorker(&dest_lane);
   return RouteResult::Local;
 }
 
 RouteResult IpcManager::RouteGlobal(Future<Task> &future,
                              const std::vector<PoolQuery> &pool_queries) {
   // Get task pointer from future
-  FullPtr<Task> task_ptr = future.GetTaskPtr();
+  clio::run::shared_ptr<Task> task_ptr = future.GetTaskPtr();
 
   // Log the global routing for debugging
   if (!pool_queries.empty()) {
@@ -3236,10 +3320,24 @@ RouteResult IpcManager::RouteGlobal(Future<Task> &future,
   }
 
   // Store pool_queries in task's RunContext for SendIn to access
-  if (task_ptr->GetRunCtx()) {
-    RunContext *run_ctx = task_ptr->GetRunCtx();
-    run_ctx->pool_queries_ = pool_queries;
-  }
+  task_ptr->PoolQueries() = pool_queries;
+
+  // Anchor the FutureShm to the task's RunContext. run2run's send_map_ holds a
+  // net-forwarded task by Task pointer only; the queued Future that owns the
+  // FutureShm is dropped as soon as the net-send worker pops and forwards it.
+  // Without this bind the FutureShm is freed before the peer response returns,
+  // so RecvOut -> EndTask sees a null future_shm and never sends the response,
+  // hanging the waiting client. ProcessNewTask binds RunFuture for locally
+  // executed tasks; net-routed tasks skip ProcessNewTask, so bind it here.
+  task_ptr->RunFuture() = future;
+  // Break the strong self-reference cycle (task -> RunContext -> future_ ->
+  // task_ptr_ -> task) that would leak the origin task after send_map_ erases
+  // it, but keep the Future's task pointer pointing AT the task as a NON-OWNING
+  // handle: GetFutureShm() resolves the routing state through the task
+  // (TaskRaw()->RunCtxPtr()), so a plain reset() would make RecvIn/RecvOut ->
+  // EndTask see a null route and never send the response (hanging the client).
+  task_ptr->RunFuture().GetTaskPtr() =
+      clio::run::shared_ptr<Task>::WrapNonOwning(task_ptr.get());
 
   // Pick the latency vs I/O SendIn lane based on the task's actual
   // payload size — small probes / metadata sit on kSendInLatency so
@@ -3247,17 +3345,14 @@ RouteResult IpcManager::RouteGlobal(Future<Task> &future,
   // scheduler (BeginTask / pre-routing) populates RunContext::
   // predicted_stat_ from container->GetTaskStats(task), so we just
   // read it here instead of recomputing.
-  size_t io_size = 0;
-  if (task_ptr->GetRunCtx()) {
-    io_size = task_ptr->GetRunCtx()->predicted_stat_.io_size_;
-  }
+  size_t io_size = task_ptr->PredictedStat().io_size_;
   NetQueuePriority sendin_prio = (io_size >= kNetQueueIoThreshold)
                                      ? NetQueuePriority::kSendInIO
                                      : NetQueuePriority::kSendInLatency;
   EnqueueNetTask(future, sendin_prio);
 
   // Set TASK_ROUTED flag on original task
-  task_ptr->SetFlags(TASK_ROUTED);
+  task_ptr->SetRouted();
 
   Worker *worker = CLIO_CUR_WORKER;
   HLOG(kDebug, "Worker {}: RouteGlobal - task enqueued to net_queue",
@@ -3268,7 +3363,7 @@ RouteResult IpcManager::RouteGlobal(Future<Task> &future,
 
 
 std::vector<PoolQuery> IpcManager::ResolvePoolQuery(
-    const PoolQuery &query, PoolId pool_id, const FullPtr<Task> &task_ptr) {
+    const PoolQuery &query, PoolId pool_id, const clio::run::shared_ptr<Task> &task_ptr) {
   // Basic validation
   if (pool_id.IsNull()) {
     return {};  // Invalid pool ID
@@ -3326,13 +3421,13 @@ std::vector<PoolQuery> IpcManager::ResolvePoolQuery(
 }
 
 std::vector<PoolQuery> IpcManager::ResolveLocalQuery(
-    const PoolQuery &query, const FullPtr<Task> &task_ptr) {
+    const PoolQuery &query, const clio::run::shared_ptr<Task> &task_ptr) {
   // Local routing - process on current node
   return {query};
 }
 
 std::vector<PoolQuery> IpcManager::ResolveDirectIdQuery(
-    const PoolQuery &query, PoolId pool_id, const FullPtr<Task> &task_ptr) {
+    const PoolQuery &query, PoolId pool_id, const clio::run::shared_ptr<Task> &task_ptr) {
   auto *pool_manager = CLIO_POOL_MANAGER;
   if (pool_manager == nullptr) {
     return {query};  // Fallback to original query
@@ -3355,7 +3450,7 @@ std::vector<PoolQuery> IpcManager::ResolveDirectIdQuery(
 }
 
 std::vector<PoolQuery> IpcManager::ResolveDirectHashQuery(
-    const PoolQuery &query, PoolId pool_id, const FullPtr<Task> &task_ptr) {
+    const PoolQuery &query, PoolId pool_id, const clio::run::shared_ptr<Task> &task_ptr) {
   auto *pool_manager = CLIO_POOL_MANAGER;
   if (pool_manager == nullptr) {
     return {query};  // Fallback to original query
@@ -3395,7 +3490,7 @@ std::vector<PoolQuery> IpcManager::ResolveDirectHashQuery(
 }
 
 std::vector<PoolQuery> IpcManager::ResolveRangeQuery(
-    const PoolQuery &query, PoolId pool_id, const FullPtr<Task> &task_ptr) {
+    const PoolQuery &query, PoolId pool_id, const clio::run::shared_ptr<Task> &task_ptr) {
   auto *pool_manager = CLIO_POOL_MANAGER;
   if (pool_manager == nullptr) {
     return {query};  // Fallback to original query
@@ -3464,7 +3559,7 @@ std::vector<PoolQuery> IpcManager::ResolveRangeQuery(
 }
 
 std::vector<PoolQuery> IpcManager::ResolveBroadcastQuery(
-    const PoolQuery &query, PoolId pool_id, const FullPtr<Task> &task_ptr) {
+    const PoolQuery &query, PoolId pool_id, const clio::run::shared_ptr<Task> &task_ptr) {
   auto *pool_manager = CLIO_POOL_MANAGER;
   if (pool_manager == nullptr) {
     return {query};  // Fallback to original query
@@ -3482,55 +3577,30 @@ std::vector<PoolQuery> IpcManager::ResolveBroadcastQuery(
 }
 
 std::vector<PoolQuery> IpcManager::ResolvePhysicalQuery(
-    const PoolQuery &query, PoolId pool_id, const FullPtr<Task> &task_ptr) {
+    const PoolQuery &query, PoolId pool_id, const clio::run::shared_ptr<Task> &task_ptr) {
   // Physical routing - query is already resolved to a specific node
   return {query};
 }
 
-ctp::ipc::FullPtr<Task> IpcManager::RecvRuntime(
-    Future<Task> &future, Container *container, u32 method_id,
-    ctp::lbm::Transport *recv_transport) {
-  auto future_shm = future.GetFutureShm();
-
-  // Self-send path: no deserialization needed
-  if (!future_shm->flags_.Any(FutureShm::FUTURE_COPY_FROM_CLIENT) ||
-      future_shm->flags_.Any(FutureShm::FUTURE_WAS_COPIED)) {
-    return IpcCpu2Self::RuntimeRecv(future);
-  }
-
-  u32 origin = future_shm->origin_;
-  switch (origin) {
-#if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL
-    case FutureShm::FUTURE_CLIENT_GPU2CPU:
-      return IpcGpu2Cpu::RuntimeRecv(this, future, container,
-                                      method_id, recv_transport);
-#endif
-    case FutureShm::FUTURE_CLIENT_SHM:
-    default:
-      return IpcCpu2Cpu::RuntimeRecv(this, future, container,
-                                      method_id, recv_transport);
-  }
-}
 
 void IpcManager::SendRuntime(
-    const FullPtr<Task> &task_ptr, RunContext *run_ctx,
-    Container *container, ctp::lbm::Transport *send_transport) {
-  auto future_shm = run_ctx->future_.GetFutureShm();
-  u32 origin = future_shm->origin_;
+    const clio::run::shared_ptr<Task> &task_ptr,
+    ctp::lbm::Transport *send_transport) {
+  auto future_shm = task_ptr->RunFuture().GetFutureShm();
+  ClientOrigin origin = future_shm->origin_;
 
   switch (origin) {
-    case FutureShm::FUTURE_CLIENT_SHM:
+    case ClientOrigin::kClientShm:
     default:
-      IpcCpu2Cpu::RuntimeSend(this, task_ptr, run_ctx, container,
-                               send_transport);
+      IpcCpu2Cpu::SendOut(this, task_ptr, send_transport);
       break;
-    case FutureShm::FUTURE_CLIENT_TCP:
-    case FutureShm::FUTURE_CLIENT_IPC:
-      IpcCpu2CpuZmq::EnqueueRuntimeSend(this, run_ctx, origin);
+    case ClientOrigin::kClientTcp:
+    case ClientOrigin::kClientIpc:
+      IpcCpu2CpuZmq::EnqueueSendOut(this, task_ptr, origin);
       break;
 #if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL
-    case FutureShm::FUTURE_CLIENT_GPU2CPU:
-      IpcGpu2Cpu::RuntimeSend(this, task_ptr, run_ctx, container);
+    case ClientOrigin::kClientGpu2Cpu:
+      IpcGpu2Cpu::SendOut(this, task_ptr);
       break;
 #endif
     // FUTURE_CLIENT_CPU2GPU dispatch was removed with the GPU runtime.

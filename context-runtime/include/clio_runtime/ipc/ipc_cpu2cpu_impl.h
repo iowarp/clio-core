@@ -10,100 +10,189 @@
 
 #include "clio_runtime/ipc/ipc_cpu2cpu.h"
 
+#include <unordered_map>
+
 namespace clio::run {
 
+#if CTP_IS_HOST
+/**
+ * Thread-local demux stash for SHM task responses (issue #768).
+ *
+ * A client thread's MPSC server (clio-<pid>-<tid>) receives the responses for
+ * EVERY task this thread submitted. When the thread has more than one async op
+ * outstanding, RecvOut(future_A) may pull future_B's response off the ring
+ * first. Blindly deserializing it into A corrupts both (a variable-size
+ * ReaddirTask read into a RenameTask slot trips GlobalDeserialize's
+ * "beyond end of data"). Park the mismatched response here, keyed by its
+ * net_key (the task's own address, stamped in SendIn), so the RecvOut that
+ * actually owns that future can claim it. Over TCP a single net-worker
+ * serializes responses, so this never surfaces there.
+ *
+ * Inline function-local thread_local => exactly one map per thread across the
+ * whole program, shared by every RecvOut<TaskT> instantiation.
+ */
+inline std::unordered_map<size_t, LoadTaskArchive> &ShmOutResponseStash() {
+  thread_local std::unordered_map<size_t, LoadTaskArchive> stash;
+  return stash;
+}
+#endif  // CTP_IS_HOST
+
 template <typename TaskT>
-Future<TaskT> IpcCpu2Cpu::ClientSend(IpcManager *ipc,
-                                      const ctp::ipc::FullPtr<TaskT> &task_ptr) {
+Future<TaskT> IpcCpu2Cpu::SendIn(IpcManager *ipc,
+                                      const clio::run::shared_ptr<TaskT> &task_ptr) {
+#if !CTP_IS_HOST
+  // Host-only SHM client path (MPSC server, SystemInfo, mutex). Never invoked
+  // from device kernels; provide an inert device definition so the template
+  // compiles in the GPU device pass.
+  (void)ipc;
+  (void)task_ptr;
+  return Future<TaskT>();
+#else
   if (task_ptr.IsNull()) return Future<TaskT>();
 
-  // Allocate FutureShm with copy_space
-  size_t copy_space_size = task_ptr->GetCopySpaceSize();
-  if (copy_space_size == 0) copy_space_size = KILOBYTES(4);
-  size_t alloc_size = sizeof(FutureShm) + copy_space_size;
-  auto buffer = ipc->AllocateBuffer(alloc_size);
-  if (buffer.IsNull()) return Future<TaskT>();
+  // #642: the task's virtual address is the response key the worker echoes back
+  // so this client thread can match the result to the right Future.
+  size_t net_key = reinterpret_cast<size_t>(task_ptr.get());
+  task_ptr->task_id_.net_key_ = net_key;
 
-  FutureShm *future_shm = new (buffer.ptr_) FutureShm();
-  future_shm->pool_id_ = task_ptr->pool_id_;
-  future_shm->method_id_ = task_ptr->method_;
-  future_shm->origin_ = FutureShm::FUTURE_CLIENT_SHM;
-  future_shm->client_task_vaddr_ = reinterpret_cast<uintptr_t>(task_ptr.ptr_);
-  future_shm->input_.copy_space_size_ = copy_space_size;
-  future_shm->output_.copy_space_size_ = copy_space_size;
-  future_shm->flags_.SetBits(FutureShm::FUTURE_COPY_FROM_CLIENT);
+  // The worker routes the result to "clio-<task_id_.pid_>-<task_id_.tid_>", which
+  // MUST equal this client thread's MPSC server name. IpcManagerTls names that
+  // server with ctp::SystemInfo::GetPid()/GetTid() (the OS tid), but CreateTaskId
+  // stamps task_id_.tid_ from the thread model's *logical* id (PthreadModel hands
+  // out a TLS counter, not the OS tid) — so without this the response is addressed
+  // to a non-existent segment and the client hangs forever. Stamp the routing
+  // identity from the same SystemInfo source the server is named with.
+  task_ptr->task_id_.pid_ = static_cast<u32>(ctp::SystemInfo::GetPid());
+  task_ptr->task_id_.tid_ = static_cast<u32>(ctp::SystemInfo::GetTid());
 
-  // Create Future
-  auto future_shm_shmptr = buffer.shm_.template Cast<FutureShm>();
-  Future<TaskT> future(future_shm_shmptr, task_ptr);
+  // FutureShm now lives in PRIVATE memory owned by the Future's shared_ptr: the
+  // worker never touches it; the result returns over this client thread's MPSC
+  // server (clio-<pid>-<tid>).
+  Future<TaskT> future(task_ptr->pool_id_, task_ptr->method_, task_ptr);
+  RunContext *future_shm = future.GetFutureShm().ptr_;
+  future_shm->origin_ = ClientOrigin::kClientShm;
+  // Ensure this thread's MPSC receive server exists before the response lands.
+  ipc->GetTls();
+  // The waiter (this client thread) lives on the task's FutureInfo; the response
+  // routes by task_id_.net_key_ (set above).
+  task_ptr->SetWaiter(static_cast<u32>(ctp::SystemInfo::GetPid()),
+                      static_cast<u32>(ctp::SystemInfo::GetTid()));
 
-  // Build SHM context for transfer
-  ctp::lbm::LbmContext ctx;
-  ctx.copy_space = future_shm->copy_space;
-  ctx.shm_info_ = &future_shm->input_;
+  // Register for response matching. The raw pointer stays valid as long as the
+  // returned Future (or a copy) is alive — the client holds it until Recv.
+  {
+    std::lock_guard<std::mutex> lock(ipc->pending_futures_mutex_);
+    ipc->pending_zmq_futures_[net_key] = {task_ptr.get()};
+  }
 
-  // Enqueue BEFORE sending (worker must start RecvMetadata concurrently)
-  LaneId lane_id =
-      ipc->scheduler_->ClientMapTask(ipc, future.template Cast<Task>());
-  auto &lane = ipc->worker_queues_->GetLane(lane_id, 0);
-  lane.Push(future.template Cast<Task>());
-  // Always signal — the prior `if (was_empty)` gate let producers skip
-  // SIGUSR1 whenever any other producer's task was visible in the lane,
-  // assuming the worker was already processing. Under FUSE-adapter load
-  // (20+ ranks pushing nearly-simultaneous GetTagSize / GetBlob futures)
-  // the assumption fails: the worker is in epoll_pwait2 past its own
-  // recheck, the lane shows non-empty, and nobody sends the wakeup. The
-  // syscall is cheap; correctness wins.
-  ipc->AwakenWorker(&lane);
-
+  // Pick a worker and high-level Send the task to its server. The worker tid
+  // comes from ClientConnect; the runtime pid keys the segment name.
+  ctp::lbm::ShmMpscTransport *conn = nullptr;
+  if (!ipc->worker_tids_.empty()) {
+    u32 wtid = ipc->worker_tids_[net_key % ipc->worker_tids_.size()];
+    conn = ipc->GetOrCreateShmConn(
+        "clio-" + std::to_string(ipc->runtime_pid_) + "-" +
+        std::to_string(wtid));
+  }
+  if (conn == nullptr) {
+    HLOG(kError, "IpcCpu2Cpu::SendIn: no MPSC worker server available");
+    task_ptr->SetComplete();  // unblock the waiter on the error path
+    return future;
+  }
+  // shm_send_transport_ is only used to Expose bulk descriptors while building
+  // the archive; conn->Send performs the actual MPSC transfer (metadata+data).
   SaveTaskArchive archive(MsgType::kSerializeIn,
                            ipc->shm_send_transport_.get());
-  archive << (*task_ptr.ptr_);
-  ipc->shm_send_transport_->Send(archive, ctx);
-
+  archive << (*task_ptr);
+  conn->Send(archive);
   return future;
+#endif  // CTP_IS_HOST
 }
 
 template <typename TaskT>
-bool IpcCpu2Cpu::ClientRecv(IpcManager *ipc,
+bool IpcCpu2Cpu::RecvOut(IpcManager *ipc,
                              Future<TaskT> &future, float max_sec) {
-  auto future_shm = future.GetFutureShm();
+#if !CTP_IS_HOST
+  (void)ipc;
+  (void)future;
+  (void)max_sec;
+  return false;
+#else
   TaskT *task_ptr = future.get();
+  auto *tls = ipc->GetTls();
 
-  // Normal SHM path: server is alive, use ring buffer recv
-  ctp::lbm::LbmContext ctx;
-  ctx.copy_space = future_shm->copy_space;
-  ctx.shm_info_ = &future_shm->output_;
+  // This thread's MPSC server receives the results for EVERY task this thread
+  // sent (the worker routes responses to clio-<this_pid>-<this_tid>). The
+  // response we want is identified by this task's net_key (its own address,
+  // stamped in SendIn). With multiple async ops outstanding on this thread, a
+  // Recv can return a sibling's response, so demux by net_key: claim ours,
+  // park the rest for the RecvOut that owns them. (issue #768)
+  const size_t want_key = task_ptr->task_id_.net_key_;
+  auto &stash = ShmOutResponseStash();
 
-  LoadTaskArchive archive;
-  ipc->shm_recv_transport_->Recv(archive, ctx);
-
-  // Wait for FUTURE_COMPLETE, but bail if the server dies or times out
-  ctp::abitfield32_t &flags = future_shm->flags_;
-  auto shm_start = std::chrono::steady_clock::now();
-  while (!flags.Any(FutureShm::FUTURE_COMPLETE)) {
-    CTP_THREAD_MODEL->Yield();
-    if (!ipc->server_alive_.load()) {
-      HLOG(kWarning, "Recv(SHM): Server died while waiting for response");
-      // Fall through to ZMQ reconnect path
-      return IpcCpu2CpuZmq::ClientRecv(ipc, future, max_sec);
-    }
-    if (max_sec > 0) {
-      float elapsed = std::chrono::duration<float>(
-                          std::chrono::steady_clock::now() - shm_start)
-                          .count();
-      if (elapsed >= max_sec) {
-        HLOG(kWarning, "Recv(SHM): Timeout after {}s", elapsed);
-        return false;
-      }
+  // A prior RecvOut on this thread may have already pulled our response off the
+  // ring while waiting for a different future — take it from the stash.
+  {
+    auto it = stash.find(want_key);
+    if (it != stash.end()) {
+      it->second.ResetBulkIndex();
+      it->second.msg_type_ = MsgType::kSerializeOut;
+      it->second >> (*task_ptr);
+      stash.erase(it);
+      return true;
     }
   }
 
-  // Deserialize outputs
-  archive.ResetBulkIndex();
-  archive.msg_type_ = MsgType::kSerializeOut;
-  archive >> (*task_ptr);
-  return true;
+  ctp::Timepoint start;
+  start.Now();
+  size_t spins = 0;
+  while (true) {
+    LoadTaskArchive archive;
+    ctp::lbm::ClientInfo info =
+        tls->shm_server_.Recv(archive, ctp::lbm::SHM_MPSC_DONTWAIT);
+    if (info.rc == 0) {
+      // Match the response to a future by net_key; a heartbeat / infoless
+      // message (no task_infos_) is treated as ours to preserve prior behavior.
+      const size_t got_key =
+          archive.GetTaskInfos().empty()
+              ? want_key
+              : archive.GetTaskInfos().front().task_id_.net_key_;
+      if (got_key != want_key) {
+        // A sibling async op's response arrived first. Park it for the RecvOut
+        // that owns it (another call on this same thread) and keep receiving.
+        stash.erase(got_key);  // guard against a reused net_key slot
+        stash.emplace(got_key, std::move(archive));
+        continue;
+      }
+      archive.ResetBulkIndex();
+      archive.msg_type_ = MsgType::kSerializeOut;
+      archive >> (*task_ptr);
+      return true;
+    }
+    if (max_sec > 0) {
+      ctp::Timepoint now;
+      now.Now();
+      if (start.GetUsecFromStart(now) >= static_cast<double>(max_sec) * 1e6) {
+        return false;
+      }
+    }
+    // Adaptive backoff. Busy-yield for the first burst so the common case (the
+    // worker completes our task in microseconds) stays low-latency, then sleep
+    // so we CEDE the CPU to the runtime workers. Without the sleep, many client
+    // threads waiting concurrently (same-blob write stress, a FUSE thread pool,
+    // etc.) all spin in Yield() and starve the very workers that must run their
+    // tasks -- a livelock. std::this_thread::yield() does not cede to the
+    // workers on Windows, so this shows up as a deterministic hang there
+    // (cte_concurrent_same_blob_all) while Linux only slows down; reproduced on
+    // Linux with 64 waiter threads pinned to 1 CPU. Same oversubscription class
+    // as the FUSE xfstests hangs.
+    if (++spins < 2048) {
+      CTP_THREAD_MODEL->Yield();
+    } else {
+      CTP_THREAD_MODEL->SleepForUs(20);
+    }
+  }
+#endif  // CTP_IS_HOST
 }
 
 }  // namespace clio::run

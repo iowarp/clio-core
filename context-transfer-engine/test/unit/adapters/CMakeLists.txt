@@ -15,7 +15,7 @@ if(CLIO_CORE_ENABLE_ELF AND CLIO_CTE_ENABLE_MPIIO_ADAPTER AND CLIO_CORE_ENABLE_M
 endif()
 
 # HDF5 VFD smoke test (requires the VFD target, which requires HDF5 >= 1.14).
-if(CLIO_CTE_ENABLE_VFD AND TARGET clio_cte_hdf5_vfd)
+if(CLIO_CTE_ENABLE_VFD AND TARGET clio_vfd)
     add_subdirectory(vfd)
 endif()
 
@@ -33,6 +33,6 @@ endif()
 # HDF5 VOL connector tests (doesn't require ELF or a running runtime).
 # The TARGET guard skips them when the connector itself was skipped
 # (HDF5 missing or < 1.14).
-if(CLIO_CTE_ENABLE_HDF5_VOL AND TARGET iowarp_hdf5_vol)
+if(CLIO_CTE_ENABLE_HDF5_VOL AND TARGET clio_hdf5_vol)
     add_subdirectory(hdf5_vol)
 endif()

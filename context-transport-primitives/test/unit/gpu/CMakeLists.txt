@@ -48,6 +48,17 @@ if(CLIO_CORE_ENABLE_CUDA)
   add_test(NAME test_local_transfer_gpu COMMAND test_local_transfer_gpu)
   set_tests_properties(test_local_transfer_gpu PROPERTIES TIMEOUT 60)
 
+  # Async copy primitives test (StreamQuery / MemcpyAsync / MemsetAsync) used by
+  # the async memory-bdev transport.
+  add_cuda_executable(test_gpu_async_copy_gpu TRUE test_gpu_async_copy_gpu.cc
+    INCLUDE_DIRS ${CLIO_CTP_GPU_INCLUDE_DIRS})
+  target_link_libraries(test_gpu_async_copy_gpu
+    ctp::cuda_cxx
+    Catch2::Catch2WithMain
+  )
+  add_test(NAME test_gpu_async_copy_gpu COMMAND test_gpu_async_copy_gpu)
+  set_tests_properties(test_gpu_async_copy_gpu PROPERTIES TIMEOUT 60)
+
   # BuddyAllocator GPU test
   add_cuda_executable(test_buddy_alloc_gpu TRUE test_buddy_alloc_gpu.cc
     INCLUDE_DIRS ${CLIO_CTP_GPU_INCLUDE_DIRS})

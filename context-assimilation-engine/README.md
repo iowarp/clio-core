@@ -2,7 +2,8 @@
 
 A CLIO ChiMod for high-performance data ingestion into the IOWarp ecosystem.
 CAE assimilates data from external sources — local binary files, HDF5
-datasets, and Globus endpoints — into the [Context Transfer
+datasets, Globus endpoints, and cloud object stores (Amazon S3 and Google
+Cloud Storage) — into the [Context Transfer
 Engine](../context-transfer-engine) (CTE) for distributed storage and
 retrieval.
 
@@ -19,6 +20,9 @@ External Source          CAE Module              CTE Module
 ```
 
 **Supported formats:** `binary`, `hdf5`, `globus`
+
+**Supported source schemes:** `file::`, `string::`, `hdf5::`, `globus://`,
+`s3://` (Amazon S3 / MinIO), `gs://` and `gcs://` (Google Cloud Storage)
 
 ## Building
 
@@ -40,6 +44,12 @@ cmake --preset release -DCLIO_CORE_ENABLE_HDF5=ON
 
 Globus ingestion is opt-in via `-DCAE_ENABLE_GLOBUS=ON` and requires the
 Globus toolkit on `PATH`.
+
+S3 ingestion is opt-in via `-DCAE_ENABLE_S3=ON` and requires the AWS SDK for
+C++ (the same dependency the bdev S3 transport uses). GCS ingestion is opt-in
+via `-DCAE_ENABLE_GCS=ON` and requires `google-cloud-cpp` (storage component).
+Both default to OFF and self-disable with a warning if their SDK is not found,
+so a default build is unaffected.
 
 ## Running
 
@@ -103,11 +113,35 @@ transfers:
         - "/sensors/raw/*"
 ```
 
+**Cloud object stores (S3 / GCS):**
+
+```yaml
+transfers:
+  - src: s3://my-bucket/data.bin       # Amazon S3 / MinIO (s3:// or s3::)
+    dst: iowarp::my_tag
+    format: binary
+  - src: gs://my-bucket/data.bin       # Google Cloud Storage (gs:// or gcs://)
+    dst: iowarp::my_other_tag
+    format: binary
+    range_off: 0                       # optional ranged read
+    range_size: 0
+```
+
+Credentials and endpoints are resolved from the standard cloud environment at
+assimilation time (no secrets are placed in the OMNI file):
+
+- **S3:** `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`
+  (or profiles / instance roles), `AWS_DEFAULT_REGION`, and an optional
+  S3-compatible endpoint via `S3_ENDPOINT` or `AWS_ENDPOINT_URL` (e.g. MinIO).
+- **GCS:** Application Default Credentials (`GOOGLE_APPLICATION_CREDENTIALS`,
+  gcloud ADC, or the GCE/GKE metadata server), and an optional endpoint via
+  `GCS_ENDPOINT` (e.g. fake-gcs-server).
+
 **Key fields:**
 
 | Field | Description |
 |---|---|
-| `src` | Source URL (`file::`, `globus::`) |
+| `src` | Source URL (`file::`, `string::`, `hdf5::`, `globus://`, `s3://`, `gs://`) |
 | `dst` | CTE destination tag (`iowarp::tag_name`) |
 | `format` | `binary`, `hdf5`, or `globus` |
 | `range_off` / `range_size` | Byte range within source (0 = full file) |

@@ -3,4 +3,9 @@ venv/
 .claude/
 installers/pip/build/
 installers/pip/test/wheelhouse/
-external/
+external/*
+# Keep the tracked Gray-Scott example source: it is a normal directory (not a
+# submodule), so it only reaches the image via the build context. The
+# build-cpu-release preset used by the deploy/benchmark Dockerfiles forces
+# CLIO_CORE_ENABLE_GRAY_SCOTT=ON, and cmake add_subdirectory() needs it present.
+!external/iowarp-gray-scott

@@ -1,0 +1,14 @@
+name: test_s3_assim
+
+# Example OMNI transfer importing an object directly from Amazon S3 (or any
+# S3-compatible store such as MinIO) into CTE. Credentials, region, and an
+# optional S3-compatible endpoint are resolved from the standard AWS
+# environment (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_SESSION_TOKEN,
+# AWS_DEFAULT_REGION, S3_ENDPOINT or AWS_ENDPOINT_URL).
+transfers:
+  - src: s3://clio-cae-test/example_key
+    dst: iowarp::test_s3_assim_tag
+    format: binary
+    depends_on: ""
+    range_off: 0
+    range_size: 0

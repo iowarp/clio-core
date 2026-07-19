@@ -340,6 +340,37 @@ set_target_properties(${RECOVERY_TEST_TARGET} PROPERTIES
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 
+# Collective-restart reproducer (issue #628: cross-node collective must not
+# hang when a participant is restarted mid-flight and never declared dead)
+set(COLLECTIVE_RESTART_TEST_TARGET clio_run_collective_restart_tests)
+set(COLLECTIVE_RESTART_TEST_SOURCES
+  ${CLIO_RUN_ROOT}/test/integration/collective_restart/test_collective_restart.cc
+)
+
+add_executable(${COLLECTIVE_RESTART_TEST_TARGET} ${COLLECTIVE_RESTART_TEST_SOURCES})
+
+target_include_directories(${COLLECTIVE_RESTART_TEST_TARGET} PRIVATE
+  ${CLIO_RUN_ROOT}/include
+  ${CLIO_RUN_ROOT}/test  # For simple_test.h
+  ${CLIO_RUN_ROOT}/modules/admin/include
+  ${CLIO_RUN_ROOT}/modules/MOD_NAME/include
+)
+
+target_link_libraries(${COLLECTIVE_RESTART_TEST_TARGET}
+  clio_admin_runtime
+  clio_admin_client
+  clio_MOD_NAME_runtime
+  clio_MOD_NAME_client
+  ctp::cxx
+  ${CMAKE_THREAD_LIBS_INIT}
+)
+
+set_target_properties(${COLLECTIVE_RESTART_TEST_TARGET} PROPERTIES
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED ON
+  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+
 # Reconnect test executable (integration test binary for client failover)
 set(RECONNECT_TEST_TARGET clio_run_reconnect_tests)
 set(RECONNECT_TEST_SOURCES

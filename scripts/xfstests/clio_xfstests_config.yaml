@@ -1,0 +1,43 @@
+# Storage capacity config for xfstests: the embedded FUSE runtime otherwise
+# defaults to a tiny (~100 MB) DRAM tier, which starves large-write tests
+# (fsx/fstest torture, generic/074/091/...). 2 GB is ample for the suite while
+# staying modest on RAM. No networking section, so CLIO_PORT/defaults still win.
+
+# Cap the runtime worker pool at a single compute thread (num_threads=1 => 1
+# compute + 1 network worker). The default of 4 spawns 5 busy-spinning workers;
+# on a CPU-constrained CI runner (the deps-cpu docker on a 4-vCPU GitHub runner)
+# those workers, plus libfuse's own thread pool and the ZMQ I/O threads,
+# oversubscribe the cores. The workers busy-poll their lanes (ProcessNewTasks)
+# and the ManyToOne batch mutex (BatchManager::FlushDue) without yielding, so a
+# worker holding a blocked task's dependency gets starved and the whole pipeline
+# livelocks — reproduced locally by pinning to 2 CPUs (generic/006/007/011/013/
+# 089/100/113/286/363/438/471 all hang; they pass on a 16-core box). The
+# embedded FUSE adapter is a single-client filesystem front-end that does not
+# need a compute-worker fan-out, so undersubscribing here is both correct and
+# the robust fix. (num_threads=2 => 3 workers still livelocks on 2 CPUs; 1 is
+# the value that fits even a 2-core runner.) See scripts/xfstests/REMAINING_WORK.md.
+runtime:
+  num_threads: 1
+
+compose:
+  - mod_name: clio_bdev
+    pool_name: "ram::chi_default_bdev"
+    pool_query: local
+    pool_id: "301.0"
+    bdev_type: ram
+    capacity: "2g"
+  - mod_name: clio_cte_core
+    pool_name: cte_main
+    pool_query: local
+    pool_id: "512.0"
+    storage:
+      - path: "ram::cte_ram_tier1"
+        bdev_type: "ram"
+        capacity_limit: "2g"
+        score: 1.0
+    dpe:
+      dpe_type: "max_bw"
+    targets:
+      neighborhood: 1
+      default_target_timeout_ms: 30000
+      poll_period_ms: 5000

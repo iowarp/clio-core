@@ -1,0 +1,14 @@
+name: test_gcs_assim
+
+# Example OMNI transfer importing an object directly from Google Cloud Storage
+# into CTE. Credentials resolve through Google Application Default Credentials
+# (GOOGLE_APPLICATION_CREDENTIALS, gcloud ADC, or the GCE/GKE metadata server);
+# an optional GCS-compatible endpoint (e.g. fake-gcs-server) is set via
+# GCS_ENDPOINT. Both gs:// and gcs:// source schemes are accepted.
+transfers:
+  - src: gs://clio-cae-test/example_object
+    dst: iowarp::test_gcs_assim_tag
+    format: binary
+    depends_on: ""
+    range_off: 0
+    range_size: 0

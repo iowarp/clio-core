@@ -26,6 +26,12 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 BUILD_BIN="${CLIO_BUILD_DIR:-${REPO_ROOT}/build}/bin"
 FUSE_BIN="${BUILD_BIN}/clio_cte_fuse"
 
+# Give the embedded runtime a larger DRAM tier than its ~100 MB default so
+# large-write tests (fsx/fstest, generic/074, generic/091, ...) aren't starved
+# by ENOSPC. The config is compose-only (no networking), so CLIO_PORT and other
+# env still win. Override by exporting CLIO_SERVER_CONF before invoking.
+export CLIO_SERVER_CONF="${CLIO_SERVER_CONF:-${SCRIPT_DIR}/clio_xfstests_config.yaml}"
+
 # --- locate xfstests --------------------------------------------------------
 if [ -z "${XFSTESTS_DIR:-}" ]; then
   for cand in /opt/xfstests "${REPO_ROOT}/external/xfstests"; do
@@ -138,9 +144,14 @@ for t in "${LIST[@]}"; do
   remount >/dev/null 2>&1 || { echo "${t}: MOUNTFAIL"; fail=$((fail+1)); failed_list="${failed_list} ${t}"; continue; }
   out=$(timeout "${CLIO_XFS_PERTEST_TIMEOUT:-90}" ./check "${t}" 2>/dev/null)
   rc=$?
+  # NOTE: check "Not run:" BEFORE "Passed all". ./check prints BOTH
+  # "Not run: <t>" AND "Passed all 0 tests" when the only test notruns, so
+  # matching "^Passed all" first miscounts a notrun test as a pass -- which
+  # would silently admit a scratch/hardware-requiring test into the CI gate
+  # where it tests nothing. "Not run:" is the authoritative signal.
   if [ "${rc}" -eq 124 ]; then echo "${t}: HANG"; hang=$((hang+1)); failed_list="${failed_list} ${t}(hang)"
-  elif echo "${out}" | grep -q "^Passed all"; then echo "${t}: pass"; pass=$((pass+1))
   elif echo "${out}" | grep -q "^Not run:"; then echo "${t}: notrun"; notrun=$((notrun+1))
+  elif echo "${out}" | grep -q "^Passed all"; then echo "${t}: pass"; pass=$((pass+1))
   else echo "${t}: FAIL"; fail=$((fail+1)); failed_list="${failed_list} ${t}"; fi
 done
 

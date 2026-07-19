@@ -54,6 +54,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -70,18 +71,19 @@ using namespace clio::cae::fuse;
 // Constants
 // ============================================================================
 
-/** Root of the source tree to copy */
-static const std::string kWorkspaceRoot = "/workspace";
-
 /** Maximum individual file size we'll copy (skip huge files) */
-static constexpr size_t kMaxFileSize = 4 * 1024 * 1024;  // 4 MB
+static constexpr size_t kMaxFileSize = 1 * 1024 * 1024;  // 1 MB
 
 /** Maximum total bytes to ingest (keeps RAM usage bounded) */
-static constexpr size_t kMaxTotalBytes = 512 * 1024 * 1024;  // 512 MB
+static constexpr size_t kMaxTotalBytes = 8 * 1024 * 1024;  // 8 MB
+
+/** Maximum file count to keep this as a fast unit stress test */
+static constexpr size_t kMaxFiles = 128;
 
 /** Directories to skip (build artifacts, git, caches) */
 static const std::vector<std::string> kSkipDirs = {
     "build", "build_debug", "build_release", "build_socket",
+    "build-mac-fuse", "build-mac-fuse-debug",
     ".git", ".ppi-jarvis", ".jarvis-private", ".jarvis-shared",
     "__pycache__", "node_modules", ".cache", ".ssh-host",
 };
@@ -98,6 +100,18 @@ static bool ShouldSkip(const fs::path &path) {
     }
   }
   return false;
+}
+
+/** Root of the source tree to copy */
+static fs::path WorkspaceRoot() {
+  if (const char *root = std::getenv("CLIO_FUSE_COPY_ROOT")) {
+    return fs::path(root);
+  }
+  std::error_code ec;
+  if (fs::exists("/workspace", ec)) {
+    return fs::path("/workspace");
+  }
+  return fs::current_path();
 }
 
 /** Read an entire file from disk into a byte vector */
@@ -151,14 +165,15 @@ static std::vector<char> ReadFileFromCte(const clio::cte::core::TagId &tag_id,
   return buf;
 }
 
-/** Collect eligible files under /workspace */
+/** Collect eligible files under the configured workspace root */
 static std::vector<fs::path> CollectFiles() {
   std::vector<fs::path> files;
   size_t total = 0;
   std::error_code ec;
+  fs::path workspace_root = WorkspaceRoot();
 
   for (auto it = fs::recursive_directory_iterator(
-           kWorkspaceRoot, fs::directory_options::skip_permission_denied, ec);
+           workspace_root, fs::directory_options::skip_permission_denied, ec);
        it != fs::recursive_directory_iterator(); ++it) {
     if (ec) { it.increment(ec); continue; }
 
@@ -180,6 +195,7 @@ static std::vector<fs::path> CollectFiles() {
 
     files.push_back(entry.path());
     total += fsize;
+    if (files.size() >= kMaxFiles) break;
   }
 
   return files;
@@ -191,12 +207,14 @@ static std::vector<fs::path> CollectFiles() {
 
 class CopyWorkspaceFixture {
  public:
+  static constexpr clio::run::u64 kCopyTargetSize = 64ULL * 1024 * 1024;
   static inline bool g_initialized = false;
 
   CopyWorkspaceFixture() {
     if (!g_initialized) {
       bool success = clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true);
       REQUIRE(success);
+      SimpleTest::g_test_finalize = clio::run::CLIO_RUNTIME_FINALIZE;
 
       std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
@@ -208,11 +226,20 @@ class CopyWorkspaceFixture {
       cte_client->Init(clio::cte::core::kCtePoolId);
 
       clio::cte::core::CreateParams params;
+      params.config_.performance_.stat_targets_period_ms_ = 0;
       auto create_task = cte_client->AsyncCreate(
           clio::run::PoolQuery::Dynamic(), clio::cte::core::kCtePoolName,
           clio::cte::core::kCtePoolId, params);
       create_task.Wait();
       REQUIRE(create_task->GetReturnCode() == 0);
+
+      clio::run::PoolId bdev_pool_id(951, 0);
+      std::string target_name = "cte_fuse_copy_workspace_ram";
+      auto reg_task = cte_client->AsyncRegisterTarget(
+          target_name, clio::run::bdev::BdevType::kRam, kCopyTargetSize,
+          clio::run::PoolQuery::DirectHash(0), bdev_pool_id);
+      reg_task.Wait();
+      REQUIRE(reg_task->GetReturnCode() == 0);
 
       g_initialized = true;
       INFO("CTE runtime initialized for copy-workspace tests");

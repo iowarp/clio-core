@@ -5,7 +5,14 @@ add_clio_module_runtime(
   SOURCES
     src/core_runtime.cc
     src/core_config.cc
-    src/core_dpe.cc
+    # Data placement engine: one source file per placement policy
+    src/dpe/dpe.cc
+    src/dpe/random_dpe.cc
+    src/dpe/round_robin_dpe.cc
+    src/dpe/max_bw_dpe.cc
+    # Data organizer (issue #738): one source file per organization policy
+    src/data_organizer/data_organizer.cc
+    src/data_organizer/frecency_organizer.cc
     src/autogen/core_lib_exec.cc
     # GPU runtime concept removed — kernels submit tasks to the CPU runtime
     # via gpu2cpu_queue and the CPU executes them through the standard

@@ -1,6 +1,10 @@
 #include "simple_test.h"
 #include <clio_cte/core/core_config.h>
-#include <clio_cte/core/core_dpe.h>
+#include <clio_cte/core/dpe/dpe.h>
+#include <clio_cte/core/dpe/random_dpe.h>
+#include <clio_cte/core/dpe/round_robin_dpe.h>
+#include <clio_cte/core/dpe/max_bw_dpe.h>
+#include <clio_cte/core/core_runtime.h>
 #include <fstream>
 #include <cstdlib>
 #include <filesystem>
@@ -660,6 +664,33 @@ TEST_CASE("MaxBwDpe SelectTargets - Score Filtering", "[cte][dpe]") {
   // Blob score is 0.3, should filter targets with score > 0.3
   std::vector<TargetInfo> result = dpe.SelectTargets(targets, 0.3f, 64 * 1024);
   REQUIRE(result.size() > 0);
+}
+
+TEST_CASE("IsTargetEligibleForBlob - TTL policy", "[cte][ttl]") {
+  TargetInfo healthy;
+  healthy.expected_ttl_days_ = 14;
+  healthy.persistence_level_ = clio::run::bdev::PersistenceLevel::kLongTerm;
+  REQUIRE(IsTargetEligibleForBlob(healthy,
+                                  static_cast<int>(
+                                      clio::run::bdev::PersistenceLevel::kLongTerm)));
+
+  TargetInfo degrading_short_lived;
+  degrading_short_lived.expected_ttl_days_ = 3;
+  degrading_short_lived.persistence_level_ =
+      clio::run::bdev::PersistenceLevel::kVolatile;
+  REQUIRE(IsTargetEligibleForBlob(
+      degrading_short_lived,
+      static_cast<int>(clio::run::bdev::PersistenceLevel::kVolatile)));
+  REQUIRE_FALSE(IsTargetEligibleForBlob(
+      degrading_short_lived,
+      static_cast<int>(clio::run::bdev::PersistenceLevel::kLongTerm)));
+
+  TargetInfo failing;
+  failing.expected_ttl_days_ = 0;
+  failing.persistence_level_ = clio::run::bdev::PersistenceLevel::kVolatile;
+  REQUIRE_FALSE(IsTargetEligibleForBlob(
+      failing,
+      static_cast<int>(clio::run::bdev::PersistenceLevel::kVolatile)));
 }
 
 TEST_CASE("DpeFactory CreateDpe - By Enum kRandom", "[cte][dpe]") {

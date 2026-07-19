@@ -55,10 +55,8 @@ BinaryFileAssimilator::BinaryFileAssimilator(
 
 clio::run::TaskResume BinaryFileAssimilator::Schedule(const AssimilationCtx& ctx,
                                                 int& error_code) {
-#ifdef __NVCOMPILER
-  thread_local clio::run::RunContext _fb_rctx;
-  clio::run::RunContext* _fp = clio::run::GetCurrentRunContextFromWorker();
-  clio::run::RunContext& rctx = _fp ? *_fp : _fb_rctx;
+#ifdef CLIO_ENABLE_BOOST_COROUTINES
+  clio::run::shared_ptr<clio::run::Task> cur_task = clio::run::GetCurrentTask();
 #endif
   CLIO_TASK_BODY_BEGIN
   HLOG(kDebug,
@@ -374,9 +372,13 @@ std::string BinaryFileAssimilator::GetUrlProtocol(const std::string& url) {
 
 std::string BinaryFileAssimilator::GetUrlPath(const std::string& url) {
   size_t pos = url.find("::");
+  // LCOV_EXCL_START: unreachable. The assimilator factory only selects the
+  // binary backend when ctx.src already carries a "<proto>::" prefix, so by
+  // the time Schedule() calls GetUrlPath(ctx.src) the "::" is always present.
   if (pos == std::string::npos) {
     return "";
   }
+  // LCOV_EXCL_STOP
   return url.substr(pos + 2);
 }
 

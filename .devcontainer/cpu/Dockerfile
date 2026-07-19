@@ -12,9 +12,23 @@ RUN userdel -r ubuntu || true
 # so a devcontainer rebuild picks it up immediately; it is also in the base
 # image (docker/iowarp-base.Dockerfile) as the canonical default. The
 # container runs --privileged, so /dev/fuse + SYS_ADMIN are available.
-RUN apt-get update && apt-get install -y --no-install-recommends \
+#
+# deps-cpu has no ROCm, so apt is healthy here — but keep the same self-healing
+# form as the nvidia/ml devcontainers (issue #670) so the three stay in sync.
+# The HIP purge is a harmless no-op on this image.
+RUN set -eux; \
+    dpkg -P --force-all hipcc hip-dev hip-runtime-amd rocm-llvm hsa-rocr-dev rocm-device-libs 2>/dev/null || true; \
+    apt-get update; \
+    DEBIAN_FRONTEND=noninteractive apt-get --fix-broken install -y || true; \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       fuse3 libfuse3-dev \
-    && rm -rf /var/lib/apt/lists/*
+      libboost-context-dev libboost-dev; \
+    rm -rf /var/lib/apt/lists/*
+
+# Build the Boost.Context stackful coroutine backend by default in the
+# devcontainer so it is exercised during development (issue #620). Build tooling
+# that honors this passes -DCLIO_CORE_ENABLE_BOOST_COROUTINES=ON.
+ENV CLIO_CORE_ENABLE_BOOST_COROUTINES=ON
 
 # The deps-cpu image already includes:
 # - All apt + source-built dependencies (boost, hdf5, yaml-cpp, zeromq, cereal, etc.)
@@ -42,10 +56,11 @@ RUN if id ubuntu >/dev/null 2>&1; then \
       groupmod -g 59999 ubuntu; \
     fi && \
     OLD_UID=$(id -u iowarp) && OLD_GID=$(id -g iowarp) && \
-    if [ "${HOST_UID}" != "${OLD_UID}" ] || [ "${HOST_GID}" != "${OLD_GID}" ]; then \
-      groupmod -o -g "${HOST_GID}" iowarp && \
-      usermod  -o -u "${HOST_UID}" -g "${HOST_GID}" iowarp && \
-      chown -R "${HOST_UID}:${HOST_GID}" /home/iowarp; \
+    NEW_UID="${HOST_UID:-1000}" && NEW_GID="${HOST_GID:-1000}" && \
+    if [ "${NEW_UID}" != "${OLD_UID}" ] || [ "${NEW_GID}" != "${OLD_GID}" ]; then \
+      groupmod -o -g "${NEW_GID}" iowarp && \
+      usermod  -o -u "${NEW_UID}" -g "${NEW_GID}" iowarp && \
+      chown -R "${NEW_UID}:${NEW_GID}" /home/iowarp; \
     fi
 
 USER iowarp

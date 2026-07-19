@@ -11,7 +11,7 @@
  * Producer-only design: per detected GPU, allocate one pinned-host backend
  * holding a clio::run::GpuTaskQueue. The CPU GPU worker polls each queue;
  * kernels push admin-registered task allocations onto them via
- * IpcGpu2Cpu::ClientSend. There is no longer a per-device "copy_backend"
+ * IpcGpu2Cpu::SendIn. There is no longer a per-device "copy_backend"
  * — clients allocate their own task and data backends on the host and
  * register them through admin RegisterMemory.
  */

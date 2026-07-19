@@ -57,9 +57,11 @@ namespace chi_test_gpu_stress {
 /** Number of tasks submitted from the GPU per test run. */
 inline constexpr clio::run::u32 kNumTasks = 64;
 
-/** Stride between adjacent (TaskT + FutureShm) pairs in the backend. */
+/** Stride between adjacent self-contained tasks in the backend. The Task
+ *  carries its own completion record (fut_), so there is no co-located
+ *  gpu::FutureShm — one slot is just the task. */
 inline constexpr size_t kSlotBytes =
-    sizeof(clio::run::MOD_NAME::GpuSubmitTask) + sizeof(clio::run::gpu::FutureShm);
+    sizeof(clio::run::MOD_NAME::GpuSubmitTask);
 
 /** Total backend size: kNumTasks slots + a few extra bytes of slack. */
 inline constexpr size_t kBackendBytes =
@@ -123,12 +125,10 @@ PlaceTaskSlots(char *base, ctp::ipc::AllocatorId alloc_id, clio::run::u32 gpu_id
   for (clio::run::u32 i = 0; i < kNumTasks; ++i) {
     size_t task_off = static_cast<size_t>(i) * kSlotBytes;
     char *task_addr = base + task_off;
-    char *fshm_addr = task_addr + sizeof(TaskT);
     auto *task = new (task_addr) TaskT(
         clio::run::CreateTaskId(), GetTestPoolId(),
         clio::run::PoolQuery::ToLocalCpu(), gpu_id, /*test_value=*/i);
-    task->pod_size_ = static_cast<clio::run::u32>(sizeof(TaskT));
-    new (fshm_addr) clio::run::gpu::FutureShm();
+    task->fut_.task_size_ = static_cast<clio::run::u32>(sizeof(TaskT));
 
     ctp::ipc::FullPtr<TaskT> fp;
     fp.shm_.alloc_id_ = alloc_id;

@@ -42,3 +42,4 @@ kSystemMonitor: 31       # Periodic system resource utilization monitor
 kAnnounceShutdown: 32    # Broadcast shutdown announcement to all nodes
 kRegisterGpuContainer: 33  # Register a GPU container with the GPU orchestrator
 kListContainers: 34        # List active pools/containers in the local daemon
+kQueryTaskProgress: 35     # #628: ask a node whether a specific replica task is still alive

@@ -11,7 +11,7 @@ and the `apt` / `dnf` package names that satisfy them.
 > | Channel  | Command                                  | Includes                                                                 |
 > | -------- | ---------------------------------------- | ------------------------------------------------------------------------ |
 > | pip      | `pip install iowarp-core`                | CLIO runtime, CTE, CAE, CEE; `clio_run` / `clio_cte_bench` CLIs; Python `clio_cee` |
-> | conda    | `bash install.sh release` (uses Miniconda) | Same as pip; pulls deps from conda-forge instead of statically linking |
+> | conda    | `conda install -c iowarp -c conda-forge iowarp-core` | Same as pip; pulls deps from conda-forge instead of statically linking |
 > | release  | [GitHub Releases](https://github.com/iowarp/clio-core/releases) | `.deb`, `.rpm`, `.AppImage` per tag (currently v1.9.1+) |
 >
 > Source builds are necessary only when you want CUDA / ROCm / SYCL,
@@ -126,6 +126,8 @@ distro repos).
 | Redis bench            | `CLIO_CORE_ENABLE_REDIS=ON`          | Builds the head-to-head Redis comparison benchmark. `libhiredis-dev` / `hiredis-devel`. |
 | LLM hooks (llama.cpp)  | `CLIO_CORE_ENABLE_LLAMA=ON`          | Integrates the bundled `external/llama.cpp` submodule.             |
 | Globus transfer (CAE)  | `CAE_ENABLE_GLOBUS=ON`               | Globus toolkit installed and on PATH.                              |
+| S3 import (CAE)        | `CAE_ENABLE_S3=ON`                   | Imports `s3://bucket/key` into CTE. Requires the AWS SDK for C++ (`aws-sdk-cpp`, component `s3`). OFF by default; self-disables with a warning if the SDK is not found. |
+| GCS import (CAE)       | `CAE_ENABLE_GCS=ON`                  | Imports `gs://bucket/object` into CTE. Requires `google-cloud-cpp` (storage component). OFF by default; self-disables with a warning if the SDK is not found. |
 
 ### Testing + diagnostics
 
@@ -225,6 +227,8 @@ Misc
 [ ] CLIO_CORE_ENABLE_REDIS=ON         Redis comparison benchmark (hiredis)
 [ ] CLIO_CORE_ENABLE_LLAMA=ON         llama.cpp LLM hooks
 [ ] CAE_ENABLE_GLOBUS=ON              Globus transfers in CAE
+[ ] CAE_ENABLE_S3=ON                  S3 (s3://) imports in CAE (aws-sdk-cpp)
+[ ] CAE_ENABLE_GCS=ON                 GCS (gs://) imports in CAE (google-cloud-cpp)
 
 Build profiles (mutually exclusive)
 ─────────────────────────────────

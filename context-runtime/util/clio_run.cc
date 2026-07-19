@@ -21,6 +21,8 @@ void PrintUsage() {
             << "  monitor         Monitor worker statistics\n"
             << "  compose         Manage pools from a compose config:\n"
             << "                  compose <start|stop|rm|list> (see compose --help)\n"
+            << "  config          Export node configuration:\n"
+            << "                  config export --path <file>\n"
             << "  refresh         Autogenerate ChiMod method files\n"
             << "\n"
             << "Legacy nested forms (still supported):\n"
@@ -73,6 +75,8 @@ int main(int argc, char* argv[]) {
       return Monitor(new_argc, new_argv);
     } else if (cmd == "compose") {
       return Compose(new_argc, new_argv);
+    } else if (cmd == "config") {
+      return Config(new_argc, new_argv);
     }
   }
 

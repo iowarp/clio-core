@@ -36,8 +36,16 @@ GLOBAL_CROSS_CONST clio::run::u32 kAppendSequence = 24;   // periodic local queu
 GLOBAL_CROSS_CONST clio::run::u32 kAppendCollect = 25;    // ManyToOne collect (synchronous)
 GLOBAL_CROSS_CONST clio::run::u32 kAppendExecution = 26;  // merge a plan slice into pages
 GLOBAL_CROSS_CONST clio::run::u32 kAppendPlan = 27;       // sort+plan+dispatch (suspendable)
+GLOBAL_CROSS_CONST clio::run::u32 kUtimens = 28;          // set file atime/mtime
+GLOBAL_CROSS_CONST clio::run::u32 kSymlink = 29;          // create a symlink
+GLOBAL_CROSS_CONST clio::run::u32 kReadlink = 30;         // read a symlink target
+GLOBAL_CROSS_CONST clio::run::u32 kSetxattr = 31;         // set an extended attr
+GLOBAL_CROSS_CONST clio::run::u32 kGetxattr = 32;         // get an extended attr
+GLOBAL_CROSS_CONST clio::run::u32 kListxattr = 33;        // list extended attrs
+GLOBAL_CROSS_CONST clio::run::u32 kRemovexattr = 34;      // remove an extended attr
+GLOBAL_CROSS_CONST clio::run::u32 kChown = 35;            // set file owner uid/gid
 
-GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 28;
+GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 36;
 
 inline const std::vector<std::string>& GetMethodNames() {
   static const std::vector<std::string> names = [] {
@@ -63,6 +71,14 @@ inline const std::vector<std::string>& GetMethodNames() {
     v[25] = "AppendCollect";
     v[26] = "AppendExecution";
     v[27] = "AppendPlan";
+    v[28] = "Utimens";
+    v[29] = "Symlink";
+    v[30] = "Readlink";
+    v[31] = "Setxattr";
+    v[32] = "Getxattr";
+    v[33] = "Listxattr";
+    v[34] = "Removexattr";
+    v[35] = "Chown";
     return v;
   }();
   return names;

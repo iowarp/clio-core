@@ -13,7 +13,10 @@
 #include "clio_ctp/data_structures/priv/unordered_map_ll.h"
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <cstdlib>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -184,6 +187,112 @@ TEST_CASE("umap_ll: concurrent insert/erase/find churn with growth",
       REQUIRE(map.find(base + i) == nullptr);
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// for_each(WRITE lock) concurrent with insert/erase/find (read locks) + growth.
+//
+// This mirrors the CTE-core workload that wedges under generic/089: DelTag
+// scans the whole blob map with for_each() -- which takes the map-wide RwLock
+// in WRITE (exclusive) mode -- while other coroutines (PutBlob/DelBlob/GetBlob)
+// insert/erase/find blobs, i.e. take the RwLock in READ mode and (on growth)
+// WRITE mode via rehash. Keys are compound "major.minor.blobname" strings like
+// the real blob keys, and the for_each body does the same read-only
+// prefix-collect DelTag does. If for_each's write lock deadlocks or is starved
+// by the sustained reader stream, the scanner threads stop making progress; a
+// watchdog detects "no progress" and fails (set CTP_UMAP_HANG_GDB=1 to instead
+// pause so a debugger can attach to the wedged for_each).
+// ---------------------------------------------------------------------------
+TEST_CASE("umap_ll: for_each(write) vs concurrent insert/erase/find (089 repro)",
+          "[priv_umap_ll]") {
+  // Heap + leaked: if we bail out on a detected deadlock we detach the still
+  // wedged worker threads, so the map must outlive them.
+  auto *map = new unordered_map_ll<std::string, uint64_t>(4, 0.6, 2);
+
+  constexpr uint64_t kSpace = 3000;  // distinct blob keys touched
+  auto key = [](uint64_t i) {
+    // "major.minor.blobname", like tag_blob_name_to_info_ keys.
+    return std::string("1.0.blob") + std::to_string(i % kSpace);
+  };
+  const std::string kPrefix = "1.0.";
+  for (uint64_t i = 0; i < kSpace; i += 2) map->insert(key(i), i);
+
+  std::atomic<bool> stop{false};
+  std::atomic<uint64_t> scans{0}, writer_ops{0}, finder_ops{0};
+
+  // Writers: insert/erase (read lock + bucket write lock + rehash write lock).
+  auto writer = [&](uint64_t seed) {
+    uint64_t x = seed;
+    while (!stop.load(std::memory_order_relaxed)) {
+      x = x * 6364136223846793005ULL + 1442695040888963407ULL;
+      uint64_t i = x % kSpace;
+      if (x & 0x10) {
+        map->insert(key(i), i);
+      } else {
+        map->erase(key(i));
+      }
+      writer_ops.fetch_add(1, std::memory_order_relaxed);
+    }
+  };
+  // Scanners: for_each == the DelTag full-map scan (GLOBAL WRITE lock).
+  auto scanner = [&]() {
+    while (!stop.load(std::memory_order_relaxed)) {
+      std::vector<std::string> matched;  // exactly what DelTag collects
+      map->for_each([&](const std::string &k, const uint64_t &) {
+        if (k.compare(0, kPrefix.size(), kPrefix) == 0) matched.push_back(k);
+      });
+      scans.fetch_add(1, std::memory_order_relaxed);
+    }
+  };
+  // Finders: find (read lock).
+  auto finder = [&](uint64_t seed) {
+    uint64_t x = seed;
+    while (!stop.load(std::memory_order_relaxed)) {
+      x = x * 2862933555777941757ULL + 3037000493ULL;
+      map->find(key(x % kSpace));
+      finder_ops.fetch_add(1, std::memory_order_relaxed);
+    }
+  };
+
+  std::vector<std::thread> ts;
+  for (int i = 0; i < 4; ++i) ts.emplace_back(writer, 1000 + i);
+  for (int i = 0; i < 3; ++i) ts.emplace_back(scanner);
+  for (int i = 0; i < 2; ++i) ts.emplace_back(finder, 7000 + i);
+
+  // Watchdog: a deadlock shows up as "combined progress counter stops moving".
+  uint64_t last = 0, frozen_secs = 0;
+  bool deadlock = false;
+  for (int sec = 0; sec < 30 && !deadlock; ++sec) {
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+    uint64_t cur = scans.load() + writer_ops.load() + finder_ops.load();
+    if (cur == last) {
+      if (++frozen_secs >= 5) deadlock = true;
+    } else {
+      frozen_secs = 0;
+      last = cur;
+    }
+  }
+
+  if (deadlock) {
+    // scans stalled but writer/finder maybe too (writer_priority defers new
+    // readers behind the waiting for_each writer). Report the split.
+    if (std::getenv("CTP_UMAP_HANG_GDB") != nullptr) {
+      // Pause (threads still wedged) so a debugger can dump the stuck for_each.
+      std::this_thread::sleep_for(std::chrono::seconds(120));
+    }
+    for (auto &th : ts) th.detach();
+    FAIL(std::string("for_each(write) DEADLOCK/STARVATION: no progress for 5s"
+                     " -- scans=") + std::to_string(scans.load()) +
+         " writer_ops=" + std::to_string(writer_ops.load()) +
+         " finder_ops=" + std::to_string(finder_ops.load()));
+  }
+
+  stop.store(true, std::memory_order_relaxed);
+  for (auto &th : ts) th.join();
+  REQUIRE(scans.load() > 0);
+  REQUIRE(writer_ops.load() > 0);
+  REQUIRE(finder_ops.load() > 0);
+  delete map;
 }
 
 SIMPLE_TEST_MAIN()

@@ -167,6 +167,44 @@ target_link_libraries(test_cae_comprehensive
 # Install test binary
 install(TARGETS test_cae_comprehensive DESTINATION bin)
 
+#------------------------------------------------------------------------------
+# Test 4b: CAE Config/Task Unit Tests (pure, no runtime)
+#------------------------------------------------------------------------------
+# Header-only coverage for core_tasks.h that the runtime tests never touch:
+#   - CreateParams::LoadConfig YAML parsing (all fields + empty + malformed)
+#   - CreateParams / LabelMatch serialize round-trips
+#   - CreateParams copy and compose-pool-id constructors
+# No CLIO runtime, CTE client, or network — runs in milliseconds.
+#------------------------------------------------------------------------------
+resolve_yaml_cpp_target()
+add_executable(test_cae_config_units
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_cae_config_units.cc
+)
+
+target_include_directories(test_cae_config_units
+  PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/context-runtime/test
+)
+
+target_link_libraries(test_cae_config_units
+  PRIVATE
+    clio_cae_core_client
+    clio_cte_core_client
+    clio::run::cxx
+    ctp::cxx
+    ${YAML_CPP_LIBS}
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+
+install(TARGETS test_cae_config_units DESTINATION bin)
+
+add_test(NAME cae_config_units COMMAND test_cae_config_units)
+set_tests_properties(cae_config_units PROPERTIES
+  TIMEOUT 60
+  LABELS "coverage;cae;config;msan_skip"
+)
+
 # Register individual test cases with CTest
 add_test(NAME cae_clientinit COMMAND test_cae_comprehensive "[cae][core][init]")
 add_test(NAME cae_assimilationctx_default COMMAND test_cae_comprehensive "[cae][ctx]")
@@ -197,7 +235,7 @@ set_tests_properties(
   cae_hdf5format cae_unknownformat
   PROPERTIES
     TIMEOUT 120
-    LABELS "coverage;comprehensive;msan_skip"
+    LABELS "coverage;cae;comprehensive;msan_skip"
     ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500"
 )
 
@@ -219,7 +257,81 @@ if(HDF5_ENABLED)
   )
 
   # Set test labels
-  set_tests_properties(cae_hdf5_assim PROPERTIES LABELS "format;hdf5;msan_skip")
+  set_tests_properties(cae_hdf5_assim PROPERTIES LABELS "format;cae;hdf5;msan_skip")
+endif()
+
+#------------------------------------------------------------------------------
+# Test: Cloud Assimilator Factory Guard (always on)
+#------------------------------------------------------------------------------
+# Exercises AssimilatorFactory protocol dispatch for s3://, gs://, gcs:// — the
+# loud-fail guard returns nullptr when a backend is compiled out, and a backend
+# when it is compiled in. Touches no cloud service. Links the runtime library
+# (where the factory + backends live) and is told which backends are enabled.
+#------------------------------------------------------------------------------
+add_cae_unit_test(cae_cloud_factory_guard
+  ${CMAKE_CURRENT_SOURCE_DIR}/cloud_factory_guard/test_cloud_factory_guard.cc
+  EXTRA_LIBS clio_cae_core_runtime
+)
+if(CAE_ENABLE_S3)
+  target_compile_definitions(cae_cloud_factory_guard PRIVATE CAE_ENABLE_S3)
+endif()
+if(CAE_ENABLE_GCS)
+  target_compile_definitions(cae_cloud_factory_guard PRIVATE CAE_ENABLE_GCS)
+endif()
+# The test's #ifdef branches must match how clio_cae_core_runtime compiled the
+# factory, so mirror the HDF5 and Globus build flags onto the test target too.
+if(HDF5_ENABLED)
+  target_compile_definitions(cae_cloud_factory_guard PRIVATE CLIO_CAE_ENABLE_HDF5)
+endif()
+if(CAE_ENABLE_GLOBUS)
+  target_compile_definitions(cae_cloud_factory_guard PRIVATE CAE_ENABLE_GLOBUS)
+endif()
+set_tests_properties(cae_cloud_factory_guard PROPERTIES LABELS "cloud;cae;factory;msan_skip")
+
+#------------------------------------------------------------------------------
+# Test: S3 (s3://) Assimilation (Conditional, self-skips without S3_ENDPOINT)
+#------------------------------------------------------------------------------
+# Seeds an object into an S3-compatible store (MinIO) and imports it through
+# ParseOmni, verifying the bytes landed in CTE. Both seeding and the import run
+# the AWS SDK out-of-process via the cae_s3_tool helper, so the test binary links
+# NO AWS SDK (linking it would corrupt CLIO runtime startup). Requires
+# -DCAE_ENABLE_S3=ON; the test self-skips at runtime unless S3_ENDPOINT is set.
+#------------------------------------------------------------------------------
+if(CAE_ENABLE_S3)
+  add_cae_unit_test(cae_s3_assim
+    ${CMAKE_CURRENT_SOURCE_DIR}/s3_assim/test_s3_assim.cc
+  )
+  set_tests_properties(cae_s3_assim PROPERTIES LABELS "cloud;cae;s3;msan_skip")
+  # Build the helper before the test, and point both the test (seeding) and the
+  # in-process assimilator (import) at the build-tree helper binary.
+  add_dependencies(cae_s3_assim cae_s3_tool)
+  set_property(TEST cae_s3_assim APPEND PROPERTY
+    ENVIRONMENT "CAE_S3_TOOL=$<TARGET_FILE:cae_s3_tool>")
+
+  install(FILES
+    ${CMAKE_CURRENT_SOURCE_DIR}/s3_assim/s3_assim_omni.yaml
+    DESTINATION share/clio_cae/test/s3_assim
+  )
+endif()
+
+#------------------------------------------------------------------------------
+# Test: GCS (gs://) Assimilation (Conditional, self-skips without GCS_ENDPOINT)
+#------------------------------------------------------------------------------
+# Seeds an object into GCS (fake-gcs-server / real GCS) via google-cloud-cpp,
+# imports it through ParseOmni, and verifies the bytes landed in CTE. Requires
+# -DCAE_ENABLE_GCS=ON; self-skips at runtime unless GCS_ENDPOINT is set.
+#------------------------------------------------------------------------------
+if(CAE_ENABLE_GCS)
+  add_cae_unit_test(cae_gcs_assim
+    ${CMAKE_CURRENT_SOURCE_DIR}/gcs_assim/test_gcs_assim.cc
+    EXTRA_LIBS google-cloud-cpp::storage
+  )
+  set_tests_properties(cae_gcs_assim PROPERTIES LABELS "cloud;cae;gcs;msan_skip")
+
+  install(FILES
+    ${CMAKE_CURRENT_SOURCE_DIR}/gcs_assim/gcs_assim_omni.yaml
+    DESTINATION share/clio_cae/test/gcs_assim
+  )
 endif()
 
 #------------------------------------------------------------------------------
@@ -237,9 +349,9 @@ endif()
 # Create test labels for selective execution
 # Skip under MSan: CAE tests use uninstrumented HDF5/yaml-cpp/ZMQ deps and
 # the clio_run runtime which involves shared memory and forked processes.
-set_tests_properties(cae_binary_assim PROPERTIES LABELS "core;basic;msan_skip")
-set_tests_properties(cae_range_assim PROPERTIES LABELS "core;advanced;msan_skip")
-set_tests_properties(cae_error_handling PROPERTIES LABELS "core;validation;msan_skip")
+set_tests_properties(cae_binary_assim PROPERTIES LABELS "core;cae;basic;msan_skip")
+set_tests_properties(cae_range_assim PROPERTIES LABELS "core;cae;advanced;msan_skip")
+set_tests_properties(cae_error_handling PROPERTIES LABELS "core;cae;validation;msan_skip")
 
 #------------------------------------------------------------------------------
 # Test 6: ExportData Tests
@@ -295,7 +407,7 @@ set_tests_properties(
   cae_exportdata_runtime
   PROPERTIES
     TIMEOUT 300
-    LABELS "coverage;export;msan_skip"
+    LABELS "coverage;cae;export;msan_skip"
     ENVIRONMENT "CLIO_WITH_RUNTIME=1;CLIO_SERVER_CONF=${CMAKE_CURRENT_SOURCE_DIR}/clio_config.yaml;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500"
 )
 
@@ -350,6 +462,65 @@ set_tests_properties(
     PROPERTIES
         TIMEOUT 180
         LABELS "cae;interceptor;integration;msan_skip"
+        RESOURCE_LOCK "clio_runtime"
+)
+
+#------------------------------------------------------------------------------
+# Test 7b: CAE labeling-dispatch + semantic-search forward (no Ollama)
+#------------------------------------------------------------------------------
+# Exercises the CAE-side transparent-labeling dispatch that runs before any LLM
+# call (FindLabelMatch incl. its regex_error catch, the matching + no-match
+# paths, prompt resolution/chunking, and the graceful OllamaGenerate failure)
+# plus the SemanticSearch BM25 forward. The label_endpoint is a dead port, so
+# unlike the Ollama-gated labeling tests this one needs no live model.
+#------------------------------------------------------------------------------
+add_executable(test_cae_labeling_dispatch
+  ${CMAKE_CURRENT_SOURCE_DIR}/test_cae_labeling_dispatch.cc
+)
+
+target_include_directories(test_cae_labeling_dispatch
+  PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/context-runtime/test
+)
+
+target_link_libraries(test_cae_labeling_dispatch
+  PRIVATE
+    clio_cae_core_client
+    clio_cae_core_runtime
+    clio_cte_core_client
+    clio_cte_core_runtime
+    clio::run::admin_runtime
+    clio::run::admin_client
+    clio::run::bdev_runtime
+    clio::run::bdev_client
+    clio::run::cxx
+    ctp::cxx
+    ctp::configure
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+
+add_custom_command(TARGET test_cae_labeling_dispatch POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_cae_labeling_dispatch_config.yaml
+    ${CMAKE_CURRENT_BINARY_DIR}/test_cae_labeling_dispatch_config.yaml
+)
+
+install(TARGETS test_cae_labeling_dispatch DESTINATION bin)
+
+add_test(NAME cae_labeling_dispatch COMMAND test_cae_labeling_dispatch)
+
+set_tests_properties(
+    cae_labeling_dispatch
+    PROPERTIES
+        TIMEOUT 180
+        # Labeled "cae" so the CI coverage `cae` phase (`ctest -L cae`) runs it
+        # and counts its coverage. Also labeled "integration" so the macOS and
+        # default runs (`ctest -LE integration`) SKIP it: like the interceptor
+        # and string-assim tests it drives the CAE->CTE forward GetBlob path,
+        # which hangs on the macOS loopback data path (issue #504). `-L cae`
+        # ignores the integration exclusion, so coverage is unaffected.
+        LABELS "coverage;cae;labeling;dispatch;integration;msan_skip"
         RESOURCE_LOCK "clio_runtime"
 )
 
@@ -542,6 +713,16 @@ clio_add_force_net_test(NAME cae_string_assim_force_net
     COMMAND test_cae_string_assim
     ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500")
 
+# The force-net helper only sets "msan_skip"; add "cae" so these variants are
+# picked up by the CI coverage phase's `ctest -L cae` selection alongside the
+# rest of the CAE suite. clio_add_force_net_test() is a no-op on Apple (the
+# loopback data path hangs there, issue #504), so these tests only exist on
+# non-Apple platforms — guard the set_property to match.
+if(NOT APPLE)
+  set_property(TEST cae_exportdata_force_net cae_comprehensive_force_net
+               cae_string_assim_force_net APPEND PROPERTY LABELS "cae")
+endif()
+
 #------------------------------------------------------------------------------
 # Test Summary Target
 #------------------------------------------------------------------------------
@@ -627,7 +808,7 @@ if(CAE_LABELING_ENABLED)
   # reads originate in third-party libraries MSan cannot instrument.
   set_tests_properties(cae_label_client_all PROPERTIES
     TIMEOUT 60
-    LABELS "msan_skip"
+    LABELS "cae;msan_skip"
     ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH}"
   )
 

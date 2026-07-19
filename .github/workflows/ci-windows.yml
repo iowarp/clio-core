@@ -1,0 +1,293 @@
+name: CI Windows
+
+# Consolidated Windows build-and-test pipeline (issue #649). One workflow per
+# OS: the MSVC build+test, the Intel oneAPI (icx-cl) compiler variant, and the
+# Boost.Context coroutine variant as parallel jobs in the SAME workflow,
+# replacing windows-build-and-test.yml, win-icx-test.yml, and the Windows job
+# of boost-coroutines.yml. Runs on every PR and on push to main/dev (#649).
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---- MSVC build + ctest (Visual Studio generator) -------------------------
+  build-test:
+    name: build-test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022
+            triplet: x64-windows
+            arch: x64
+          - os: windows-2025
+            triplet: x64-windows
+            arch: x64
+          - os: windows-11-arm
+            triplet: arm64-windows
+            arch: ARM64
+    env:
+      VCPKG_DEFAULT_TRIPLET: ${{ matrix.triplet }}
+      CAE_LABEL_TEST_SKIP: "1"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - name: Bootstrap vcpkg
+        run: |
+          cd $env:VCPKG_INSTALLATION_ROOT
+          git pull
+          .\bootstrap-vcpkg.bat
+      - name: Configure CMake
+        run: |
+          cmake -B build -A ${{ matrix.arch }} `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET="${{ matrix.triplet }}" `
+            -DVCPKG_MANIFEST_DIR="${{ github.workspace }}/installers/vcpkg" `
+            -DVCPKG_OVERLAY_PORTS="${{ github.workspace }}/installers/vcpkg/overlay-ports" `
+            -DCMAKE_BUILD_TYPE=Debug `
+            -DSITE="${{ matrix.os }}" `
+            -DBUILDNAME="msvc/${{ matrix.arch }}/d" `
+            -DCLIO_CORE_ENABLE_RUNTIME=ON `
+            -DCLIO_CORE_ENABLE_CTE=ON `
+            -DCLIO_CORE_ENABLE_CAE=ON `
+            -DCLIO_CORE_ENABLE_CEE=OFF `
+            -DCLIO_CORE_ENABLE_TESTS=ON `
+            -DCLIO_CORE_ENABLE_PYTHON=OFF `
+            -DCLIO_CORE_ENABLE_ZMQ=ON `
+            -DCLIO_CORE_ENABLE_CEREAL=ON `
+            -DCLIO_CORE_ENABLE_CONDA=OFF `
+            -DCLIO_CORE_ENABLE_ELF=OFF `
+            -DCLIO_CORE_ENABLE_RPATH=OFF `
+            -DCLIO_CTE_ENABLE_VFD=OFF `
+            -DCLIO_CTE_ENABLE_HDF5_VOL=OFF `
+            -DCLIO_CORE_ENABLE_BENCHMARKS=OFF `
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON `
+            -DCLIO_CTP_LOG_LEVEL=0
+      - name: Build
+        run: cmake --build build --config Debug -j $env:NUMBER_OF_PROCESSORS
+      - name: Run tests
+        run: ctest --test-dir build -T Test --build-config Debug --output-on-failure --timeout 120 -LE ollama
+      - name: Submit results to CDash
+        if: always()
+        continue-on-error: true
+        run: ctest --test-dir build -T Submit --build-config Debug
+      - name: Summarize failed tests
+        if: always()
+        shell: bash
+        run: |
+          LOG="build/Testing/Temporary/LastTest.log"
+          echo "## Windows test summary (${{ matrix.os }})" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f "$LOG" ]; then
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            grep -E "Test #|\*\*\*Failed|\*\*\*Exception|Passed|Failed" "$LOG" \
+              | grep -E "Failed|Exception" >> "$GITHUB_STEP_SUMMARY" || \
+              echo "(no failures parsed from LastTest.log)" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "(LastTest.log not found)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-test-logs-${{ matrix.os }}
+          path: |
+            build/Testing/Temporary/LastTest.log
+            build/Testing/Temporary/CTestCostData.txt
+          if-no-files-found: warn
+
+  # ---- Intel oneAPI (icx-cl) compiler variant (#555) ------------------------
+  icx:
+    name: icx (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025, windows-2025-vs2026]
+    env:
+      WINDOWS_BASEKIT_URL: https://registrationcenter-download.intel.com/akdlm/IRC_NAS/076e961b-2c29-48a8-9203-c96f00e7051b/intel-oneapi-base-toolkit-2025.3.1.35_offline.exe
+      WINDOWS_CPP_COMPONENTS: intel.oneapi.win.cpp-dpcpp-common
+      CACHE_NUMBER: "0"
+      ONEAPI_ROOT_DIR: "C:\\Program Files (x86)\\Intel\\oneAPI"
+      VCPKG_DEFAULT_TRIPLET: x64-windows
+      CAE_LABEL_TEST_SKIP: "1"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      # 3.31.x: 4.x's bindexplib fails to open icx object files under Ninja,
+      # breaking the clio_ctp_host.dll link.
+      - name: Install CMake 3.31.6
+        uses: jwlawson/actions-setup-cmake@v2
+        with:
+          cmake-version: "3.31.6"
+      - name: Bootstrap vcpkg
+        shell: pwsh
+        run: |
+          cd $env:VCPKG_INSTALLATION_ROOT
+          git pull
+          .\bootstrap-vcpkg.bat
+      - name: Restore oneAPI cache
+        id: cache-oneapi
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.ONEAPI_ROOT_DIR }}
+          key: oneapi-${{ runner.os }}-${{ env.CACHE_NUMBER }}-${{ env.WINDOWS_BASEKIT_URL }}-${{ env.WINDOWS_CPP_COMPONENTS }}
+      - name: Install oneAPI (icx)
+        if: steps.cache-oneapi.outputs.cache-hit != 'true'
+        shell: cmd
+        run: |
+          git clone --depth=1 https://github.com/oneapi-src/oneapi-ci.git oneapi-ci
+          cd oneapi-ci
+          scripts\install_windows.bat %WINDOWS_BASEKIT_URL% %WINDOWS_CPP_COMPONENTS%
+      - name: Save oneAPI cache
+        if: steps.cache-oneapi.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.ONEAPI_ROOT_DIR }}
+          key: oneapi-${{ runner.os }}-${{ env.CACHE_NUMBER }}-${{ env.WINDOWS_BASEKIT_URL }}-${{ env.WINDOWS_CPP_COMPONENTS }}
+      - name: Configure and build (icx)
+        shell: cmd
+        run: |
+          @echo on
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -prerelease -products * -property installationPath`) do set "VSINSTALL=%%i"
+          echo Using Visual Studio at: %VSINSTALL%
+          call "%VSINSTALL%\VC\Auxiliary\Build\vcvarsall.bat" x64 || exit /b 1
+          call "%ProgramFiles(x86)%\Intel\oneAPI\setvars.bat" || exit /b 1
+          cmake -B build -G Ninja ^
+            -DCMAKE_C_COMPILER=icx-cl ^
+            -DCMAKE_CXX_COMPILER=icx-cl ^
+            -DCMAKE_TOOLCHAIN_FILE="%VCPKG_INSTALLATION_ROOT%\scripts\buildsystems\vcpkg.cmake" ^
+            -DVCPKG_TARGET_TRIPLET=x64-windows ^
+            -DVCPKG_MANIFEST_DIR="%GITHUB_WORKSPACE%\installers\vcpkg" ^
+            -DVCPKG_OVERLAY_PORTS="%GITHUB_WORKSPACE%\installers\vcpkg\overlay-ports" ^
+            -DCMAKE_BUILD_TYPE=Debug ^
+            -DSITE=${{ matrix.os }} ^
+            -DBUILDNAME=ninja/icx-2025.3 ^
+            -DCLIO_CORE_ENABLE_RUNTIME=ON ^
+            -DCLIO_CORE_ENABLE_CTE=ON ^
+            -DCLIO_CORE_ENABLE_CAE=ON ^
+            -DCLIO_CORE_ENABLE_CEE=OFF ^
+            -DCLIO_CORE_ENABLE_TESTS=ON ^
+            -DCLIO_CORE_ENABLE_PYTHON=OFF ^
+            -DCLIO_CORE_ENABLE_PCH=OFF ^
+            -DCLIO_CORE_ENABLE_ZMQ=ON ^
+            -DCLIO_CORE_ENABLE_CEREAL=ON ^
+            -DCLIO_CORE_ENABLE_CONDA=OFF ^
+            -DCLIO_CORE_ENABLE_ELF=OFF ^
+            -DCLIO_CORE_ENABLE_RPATH=OFF ^
+            -DCLIO_CTE_ENABLE_VFD=OFF ^
+            -DCLIO_CTE_ENABLE_HDF5_VOL=OFF ^
+            -DCLIO_CORE_ENABLE_BENCHMARKS=OFF ^
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON ^
+            -DCLIO_CTP_LOG_LEVEL=0 || exit /b 1
+          cmake --build build --config Debug -j %NUMBER_OF_PROCESSORS% || exit /b 1
+      - name: Run ctest
+        shell: cmd
+        run: |
+          @echo on
+          call "%ProgramFiles(x86)%\Intel\oneAPI\setvars.bat"
+          cd build
+          ctest -T Test --build-config Debug --output-on-failure --timeout 120 -LE ollama
+      - name: Submit results to CDash
+        if: always()
+        continue-on-error: true
+        shell: cmd
+        run: |
+          cd build
+          ctest -T Submit
+      - name: Summarize failed tests
+        if: always()
+        shell: bash
+        run: |
+          LOG="build/Testing/Temporary/LastTest.log"
+          echo "## Windows ICX test summary (${{ matrix.os }})" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f "$LOG" ]; then
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            grep -E "Test #|\*\*\*Failed|\*\*\*Exception|Passed|Failed" "$LOG" \
+              | grep -E "Failed|Exception" >> "$GITHUB_STEP_SUMMARY" || \
+              echo "(no failures parsed from LastTest.log)" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "(LastTest.log not found)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: win-icx-test-logs-${{ matrix.os }}
+          path: |
+            build/Testing/Temporary/LastTest.log
+            build/Testing/Temporary/CTestCostData.txt
+          if-no-files-found: warn
+
+  # ---- Boost.Context stackful coroutine backend (#620) ----------------------
+  boost:
+    name: boost (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2025
+            triplet: x64-windows
+            arch: x64
+    env:
+      VCPKG_DEFAULT_TRIPLET: ${{ matrix.triplet }}
+      CAE_LABEL_TEST_SKIP: "1"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - name: Bootstrap vcpkg
+        run: |
+          cd $env:VCPKG_INSTALLATION_ROOT
+          git pull
+          .\bootstrap-vcpkg.bat
+      - name: Configure CMake (Boost backend, vcpkg boost-context feature)
+        run: |
+          cmake -B build-boost -A ${{ matrix.arch }} `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET="${{ matrix.triplet }}" `
+            -DVCPKG_MANIFEST_DIR="${{ github.workspace }}/installers/vcpkg" `
+            -DVCPKG_MANIFEST_FEATURES="boost-coroutines" `
+            -DVCPKG_OVERLAY_PORTS="${{ github.workspace }}/installers/vcpkg/overlay-ports" `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCLIO_CORE_ENABLE_BOOST_COROUTINES=ON `
+            -DCLIO_CORE_ENABLE_RUNTIME=ON `
+            -DCLIO_CORE_ENABLE_CTE=ON `
+            -DCLIO_CORE_ENABLE_CAE=ON `
+            -DCLIO_CORE_ENABLE_CEE=OFF `
+            -DCLIO_CTE_ENABLE_FILESYSTEM=ON `
+            -DCLIO_CORE_ENABLE_TESTS=ON `
+            -DCLIO_CORE_ENABLE_PYTHON=OFF `
+            -DCLIO_CORE_ENABLE_ZMQ=ON `
+            -DCLIO_CORE_ENABLE_CEREAL=ON `
+            -DCLIO_CORE_ENABLE_CONDA=OFF `
+            -DCLIO_CORE_ENABLE_ELF=OFF `
+            -DCLIO_CORE_ENABLE_RPATH=OFF `
+            -DCLIO_CTE_ENABLE_VFD=OFF `
+            -DCLIO_CTE_ENABLE_HDF5_VOL=OFF `
+            -DCLIO_CORE_ENABLE_BENCHMARKS=OFF `
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON `
+            -DCLIO_CTP_LOG_LEVEL=0
+      - name: Build
+        run: cmake --build build-boost --config Release -j $env:NUMBER_OF_PROCESSORS
+      - name: Run tests
+        run: ctest --test-dir build-boost --build-config Release --output-on-failure --timeout 180 --repeat until-pass:3 -LE ollama

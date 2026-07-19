@@ -55,6 +55,13 @@ void CleanupSocketLib() {
   // No-op on POSIX
 }
 
+void SetSocketLibShutdown() {
+  // No-op on POSIX: zmq sockets close cleanly there (no WSASTARTUP teardown
+  // hazard), so there is nothing to leak.
+}
+
+bool IsSocketLibShutdown() { return false; }
+
 void Close(socket_t fd) {
   if (fd != kInvalidSocket) {
     ::close(fd);

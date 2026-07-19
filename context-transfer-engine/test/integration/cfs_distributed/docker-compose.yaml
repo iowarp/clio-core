@@ -1,0 +1,100 @@
+# Distributed CTE filesystem (CFS) correctness test (issue #685).
+#
+# Two nodes, one clio daemon each, on a private docker network. Node 1 runs the
+# WRITER role (creates+writes a shared CFS file); node 2 runs the READER role
+# (must see and read that file cross-node). Ordering/liveness needs no shared
+# state: the reader delays then retries the open (CFS_READ_DELAY_SEC) and the
+# writer stays alive (CFS_KEEPALIVE_SEC) so the path's owning container survives.
+#
+# Usage: ./run_tests.sh   (see that script; it keys the result on the reader).
+
+services:
+  # Node 1 — WRITER
+  cfs-node1:
+    image: ${IOWARP_DOCKER_IMAGE:-iowarp/deps-cpu:latest}
+    security_opt:
+      - seccomp:unconfined
+    container_name: cfs-dist-node1
+    hostname: iowarp-node1
+    networks:
+      cfs-cluster:
+        ipv4_address: 172.29.0.10
+    volumes:
+      - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-/workspace}}:/workspace:rw
+    tmpfs:
+      - /mnt:mode=1777
+    environment:
+      - NODE_ID=1
+      - NODE_IP=172.29.0.10
+      - CLIO_SERVER_CONF=/workspace/context-transfer-engine/test/integration/cfs_distributed/clio_config.yaml
+      - CONTAINER_HOSTFILE=/workspace/context-transfer-engine/test/integration/cfs_distributed/hostfile
+      - CLIO_WITH_RUNTIME=0
+      - CFS_DIST_ROLE=writer
+      - PATH=/workspace/build/bin:/usr/local/bin:/usr/bin:/bin
+      - LD_LIBRARY_PATH=/workspace/build/bin:/usr/local/cuda/lib64:/usr/local/lib
+    mem_limit: 8g
+    working_dir: /workspace
+    entrypoint: [ "/bin/bash", "-c" ]
+    command: >
+      "
+        set -x &&
+        echo 'Node 1 (writer): starting Clio runtime in background' &&
+        /workspace/build/bin/clio_run runtime start &
+        RUNTIME_PID=$$! &&
+        echo \"Node 1: runtime PID $$RUNTIME_PID; waiting for cluster to form\" &&
+        sleep 6 &&
+        echo 'Node 1: running CFS distributed WRITER' &&
+        /workspace/build/bin/test_cfs_distributed
+        EXIT=$$? &&
+        echo \"Node 1: writer exit $$EXIT\" &&
+        exit $$EXIT
+      "
+
+  # Node 2 — READER
+  cfs-node2:
+    image: ${IOWARP_DOCKER_IMAGE:-iowarp/deps-cpu:latest}
+    security_opt:
+      - seccomp:unconfined
+    container_name: cfs-dist-node2
+    hostname: iowarp-node2
+    networks:
+      cfs-cluster:
+        ipv4_address: 172.29.0.11
+    volumes:
+      - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-/workspace}}:/workspace:rw
+    tmpfs:
+      - /mnt:mode=1777
+    environment:
+      - NODE_ID=2
+      - NODE_IP=172.29.0.11
+      - CLIO_SERVER_CONF=/workspace/context-transfer-engine/test/integration/cfs_distributed/clio_config.yaml
+      - CONTAINER_HOSTFILE=/workspace/context-transfer-engine/test/integration/cfs_distributed/hostfile
+      - CLIO_WITH_RUNTIME=0
+      - CFS_DIST_ROLE=reader
+      - PATH=/workspace/build/bin:/usr/local/bin:/usr/bin:/bin
+      - LD_LIBRARY_PATH=/workspace/build/bin:/usr/local/cuda/lib64:/usr/local/lib
+    mem_limit: 8g
+    working_dir: /workspace
+    entrypoint: [ "/bin/bash", "-c" ]
+    command: >
+      "
+        set -x &&
+        echo 'Node 2 (reader): starting Clio runtime in background' &&
+        /workspace/build/bin/clio_run runtime start &
+        RUNTIME_PID=$$! &&
+        echo \"Node 2: runtime PID $$RUNTIME_PID; waiting for cluster to form\" &&
+        sleep 6 &&
+        echo 'Node 2: running CFS distributed READER' &&
+        /workspace/build/bin/test_cfs_distributed
+        EXIT=$$? &&
+        echo \"Node 2: reader exit $$EXIT\" &&
+        exit $$EXIT
+      "
+
+networks:
+  cfs-cluster:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.29.0.0/24
+

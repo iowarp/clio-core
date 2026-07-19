@@ -102,6 +102,25 @@ leak:BlobQuery
 leak:clio::run::CreateTaskId
 
 # ---------------------------------------------------------------------------
+# Chi runtime: per-worker-thread IPC TLS in IpcManager::GetTls()
+# Worker::Run() lazily allocates the worker thread's IpcManager thread-local
+# state via new (ipc_manager.cc). Worker threads spawned by
+# WorkOrchestrator::SpawnWorkerThreads() may not run the TLS destructor on
+# exit, so the per-worker TLS is unreachable at process exit. Same
+# architectural TLS-lifetime pattern as CreateTaskId(); reclaimed by the OS.
+# ---------------------------------------------------------------------------
+leak:clio::run::IpcManager::GetTls
+
+# ---------------------------------------------------------------------------
+# Chi runtime: admin EventManager registration map
+# ctp::lbm::EventManager keeps an unordered_map of EventRegistration built at
+# runtime/admin init. The admin module container is a runtime-lifetime object
+# that the server does not destroy on shutdown, so the map's bucket array is
+# unreachable at exit (same class as the other container-lifetime leaks).
+# ---------------------------------------------------------------------------
+leak:ctp::lbm::EventManager
+
+# ---------------------------------------------------------------------------
 # Chi modules: new_chimod container objects leak on server shutdown
 # ModuleManager::CreateContainer() calls new_chimod() to instantiate each
 # ChiMod object (CAE, CTE, bdev, etc.) with operator new. On server shutdown

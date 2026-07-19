@@ -3,6 +3,14 @@
 # migrate/start/stop) plus the clio_run binary's argument dispatch.
 cmake_minimum_required(VERSION 3.10)
 
+# The runtime-fallback (crash-isolation punt-to-main) feature was removed pending
+# a more foundational design. Its end-to-end tests (clio_run_cte_fallback_test,
+# clio_run_fallback_runtime_test) are kept in-tree but gated OFF so they are
+# neither built nor run until the feature is reintroduced. Flip this ON to
+# resurrect them alongside a fallback implementation.
+option(CLIO_CORE_ENABLE_RUNTIME_FALLBACK
+       "Build/run the runtime-fallback (crash-isolation) integration tests" OFF)
+
 # POSIX-only: the test drives the clio_run binary as a subprocess and
 # inspects exit codes via <sys/wait.h>.
 if(NOT WIN32)
@@ -135,6 +143,47 @@ if(CLIO_CORE_ENABLE_TESTS)
     TIMEOUT 110
     LABELS "msan_skip"
   )
+  # Client-crash PutBlob test (issues #722 + "client dies mid-op"): spawns its
+  # own daemon, forks a client that fires a PutBlob burst then _exit()s without
+  # waiting, and asserts the daemon (a) drops the undeliverable responses and
+  # (b) leaks no SHM (ReportRuntimeLeaks at graceful shutdown). Name contains
+  # "leak" so the Leak Check CI (-R "leak|...") runs it. Serialize with the other
+  # live-runtime tests via the shared RESOURCE_LOCK.
+  add_executable(clio_run_client_crash_putblob_test test_client_crash_putblob.cc)
+  target_include_directories(clio_run_client_crash_putblob_test PRIVATE
+    ${CLIO_RUN_ROOT}/include
+    ${CLIO_RUN_ROOT}/test
+  )
+  target_link_libraries(clio_run_client_crash_putblob_test
+    clio_cte_core_client
+    clio_admin_client
+    clio_run_cxx
+    ctp::cxx
+    ${CMAKE_THREAD_LIBS_INIT}
+  )
+  target_compile_definitions(clio_run_client_crash_putblob_test PRIVATE
+    CLIO_RUN_EXE="$<TARGET_FILE:clio_run>")
+  # The forked client PutBlobs against the daemon's default compose, so the CTE
+  # core + bdev module runtimes must be built for the daemon to load them.
+  add_dependencies(clio_run_client_crash_putblob_test
+    clio_run clio_cte_core_runtime clio_bdev_runtime)
+  set_target_properties(clio_run_client_crash_putblob_test PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  add_test(
+    NAME cr_cli_client_crash_leak
+    COMMAND clio_run_client_crash_putblob_test
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+  )
+  set_tests_properties(cr_cli_client_crash_leak PROPERTIES
+    ENVIRONMENT "${_cli_live_env}"
+    RESOURCE_LOCK "clio_runtime_port"
+    TIMEOUT 180
+    LABELS "msan_skip;leak;crash"
+  )
+
   # Filesystem chimod test: compose bdev->cte_core->filesystem, drive the cfs
   # client (open/write/getattr/read/truncate), assert EXACT logical size.
   # Only built when the filesystem chimod is enabled.
@@ -207,9 +256,46 @@ if(CLIO_CORE_ENABLE_TESTS)
       LABELS "msan_skip"
     )
 
+    # Parallel CFS overlap stress: many threads race read/write/append/unlink/
+    # rmdir/readdir over a tiny shared namespace (4 files + 4 dirs). Success =
+    # no crash, hang, or leak.
+    add_executable(clio_run_cfs_parallel_stress_test test_cfs_parallel_stress.cc)
+    target_include_directories(clio_run_cfs_parallel_stress_test PRIVATE
+      ${CLIO_RUN_ROOT}/include
+      ${CLIO_RUN_ROOT}/test
+    )
+    target_link_libraries(clio_run_cfs_parallel_stress_test
+      clio_cte_filesystem_client
+      clio_cte_core_client
+      clio_admin_client
+      clio_run_cxx
+      ctp::cxx
+      ${CMAKE_THREAD_LIBS_INIT}
+    )
+    target_compile_definitions(clio_run_cfs_parallel_stress_test PRIVATE
+      CLIO_RUN_EXE="$<TARGET_FILE:clio_run>")
+    add_dependencies(clio_run_cfs_parallel_stress_test clio_run clio_cte_filesystem_runtime)
+    set_target_properties(clio_run_cfs_parallel_stress_test PROPERTIES
+      CXX_STANDARD 20
+      CXX_STANDARD_REQUIRED ON
+      RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    add_test(
+      NAME cr_cli_cfs_parallel_stress
+      COMMAND clio_run_cfs_parallel_stress_test
+      WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    )
+    set_tests_properties(cr_cli_cfs_parallel_stress PROPERTIES
+      ENVIRONMENT "${_cli_live_env}"
+      RESOURCE_LOCK "clio_runtime_port"
+      TIMEOUT 300
+      LABELS "msan_skip"
+    )
+
     # Fallback-runtime CTE test: CTE on a USER runtime backed by a bdev on a
-    # MAIN runtime. CTE's internal bdev calls are serialize-relayed across the
-    # fallback. Two ephemeral runtimes on ports 10670/10680.
+    # MAIN runtime. Gated OFF — the runtime-fallback feature was removed (see
+    # CLIO_CORE_ENABLE_RUNTIME_FALLBACK at the top of this file).
+    if(CLIO_CORE_ENABLE_RUNTIME_FALLBACK)
     add_executable(clio_run_cte_fallback_test test_cte_fallback.cc)
     target_include_directories(clio_run_cte_fallback_test PRIVATE
       ${CLIO_RUN_ROOT}/include
@@ -243,6 +329,7 @@ if(CLIO_CORE_ENABLE_TESTS)
       TIMEOUT 180
       LABELS "msan_skip"
     )
+    endif()
   endif()
 
   # Per-RPC access-control test (private containers/methods). Composes ram bdev
@@ -282,10 +369,12 @@ if(CLIO_CORE_ENABLE_TESTS)
     LABELS "msan_skip"
   )
 
-  # Fallback-runtime (crash isolation) test: spawns TWO runtimes (main on 10650
-  # with a bdev, user on 10651 with CLIO_FALLBACK_PORT=10650 and no bdev), then
-  # an SHM client calls the bdev through the user runtime, which punts to main.
-  # Serialize with other live-runtime tests (shared per-user SHM segments).
+  # Fallback-runtime (crash isolation) test: spawns TWO runtimes (main with a
+  # bdev, user with CLIO_FALLBACK_PORT and no bdev), then an SHM client calls the
+  # bdev through the user runtime, which punts to main. Gated OFF — the
+  # runtime-fallback feature was removed (see CLIO_CORE_ENABLE_RUNTIME_FALLBACK
+  # at the top of this file).
+  if(CLIO_CORE_ENABLE_RUNTIME_FALLBACK)
   add_executable(clio_run_fallback_runtime_test test_fallback_runtime.cc)
   target_include_directories(clio_run_fallback_runtime_test PRIVATE
     ${CLIO_RUN_ROOT}/include
@@ -317,6 +406,7 @@ if(CLIO_CORE_ENABLE_TESTS)
     TIMEOUT 180
     LABELS "msan_skip"
   )
+  endif()
 
   # RestartLog unit test: pure file-level WAL behavior (no daemon).
   add_executable(clio_run_restart_log_test test_restart_log.cc)

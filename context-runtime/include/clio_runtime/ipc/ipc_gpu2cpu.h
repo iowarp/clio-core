@@ -13,9 +13,12 @@
 
 #if CTP_ENABLE_CUDA || CTP_ENABLE_ROCM || CTP_ENABLE_SYCL
 
+#include "clio_runtime/gpu/future.h"  // GpuTaskLane
+
 namespace clio::run {
 
 class IpcManager;
+class Worker;
 namespace gpu { class IpcManager; }
 
 /**
@@ -23,11 +26,11 @@ namespace gpu { class IpcManager; }
  *
  * Producer-only design: kernels do not allocate. The host pre-allocates
  * Task+FutureShm pairs in a registered device-memory backend before
- * launch. ClientSend just initializes the FutureShm flags and pushes
+ * launch. SendIn just initializes the FutureShm flags and pushes
  * onto gpu2cpu_queue. The CPU worker (Worker::ProcessNewTaskGpu in
  * worker.cc) resolves both ShmPtrs via the per-device registered
  * backend map, copies the POD task into a CPU-side scratch slot, and
- * dispatches it on the local runtime. RuntimeSend writes the POD output
+ * dispatches it on the local runtime. SendOut writes the POD output
  * bytes back to the original device buffer and sets FUTURE_COMPLETE on
  * the gpu::FutureShm so the kernel poll-loop unblocks.
  */
@@ -43,8 +46,19 @@ struct IpcGpu2Cpu {
    * @return gpu::Future<TaskT> bound to the FutureShm.
    */
   template <typename TaskT>
-  static CTP_GPU_FUN gpu::Future<TaskT> ClientSend(
+  static CTP_GPU_FUN gpu::Future<TaskT> SendIn(
       gpu::IpcManager *ipc, const ctp::ipc::FullPtr<TaskT> &task_ptr);
+
+  /**
+   * CPU-side inbound receive for the producer-only gpu2cpu queue: pop one
+   * gpu::Future<Task> off `gpu_lane`, D2H-copy the gpu::FutureShm + POD task out
+   * of device memory if needed, wrap it in a host-side Future, stash the device
+   * pointers for SendOut, and route it for dispatch. All GPU task/future
+   * deserialization lives here so the worker never touches device bytes.
+   * @param worker the calling worker (for its id/lane/event-queue + run context).
+   * @return true if a task was popped (the caller did work).
+   */
+  static bool RecvIn(IpcManager *ipc, GpuTaskLane *gpu_lane, Worker *worker);
 
   /**
    * CPU-side: resolve the popped gpu::Future<Task> into a host-readable
@@ -54,8 +68,8 @@ struct IpcGpu2Cpu {
    * Note: with the producer-only redesign this no longer touches a
    * lightbeam transport — the GPU never serializes through ZMQ.
    */
-  static ctp::ipc::FullPtr<Task> RuntimeRecv(
-      IpcManager *ipc, Future<Task> &future, Container *container,
+  static clio::run::shared_ptr<Task> RecvIn(
+      IpcManager *ipc, Future<Task> &future,
       u32 method_id, ctp::lbm::Transport *recv_transport);
 
   /**
@@ -63,9 +77,8 @@ struct IpcGpu2Cpu {
    * and signal FUTURE_COMPLETE on the gpu::FutureShm so the kernel
    * unblocks.
    */
-  static void RuntimeSend(
-      IpcManager *ipc, const FullPtr<Task> &task_ptr,
-      RunContext *run_ctx, Container *container);
+  static void SendOut(
+      IpcManager *ipc, const clio::run::shared_ptr<Task> &task_ptr);
 };
 
 }  // namespace clio::run

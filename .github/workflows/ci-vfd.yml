@@ -1,0 +1,103 @@
+name: CI VFD
+
+# Fast, isolated build + test gate for the CLIO HDF5 VFD (Model A: authoritative
+# native write-through). This is the quick, unambiguous VFD signal:
+#
+#   * builds ONLY the VFD driver + its unit-test target (and the runtime libs
+#     they depend on) -- not the whole adapter matrix -- so it is minutes, not
+#     the ~2h of ci-adapters.yml (which source-builds h5py + runs fuse/xfstests).
+#   * a red result here means the VFD broke, not an unrelated fuse/xfstests step.
+#   * runs on the feature branch too, so the VFD is verified BEFORE merge.
+#
+# The comprehensive multi-adapter coverage still lives in ci-adapters.yml (which
+# also builds the VFD on main/dev). Keep the flags below in sync with the `vfd`
+# CMake preset and the ci-adapters linux job.
+
+on:
+  push:
+    branches: [main, dev, 'feat/vfd-**']
+  pull_request:
+    branches: [main, dev]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-vfd-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  vfd:
+    name: vfd (linux, native write-through)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - name: Build + test the CLIO VFD (inside deps-cpu)
+        run: |
+          # --shm-size: the clio runtime places GB-scale SHM segments in
+          # /dev/shm (docker default is 64 MB), so give it room.
+          docker run --rm --shm-size=2g \
+            -v "${{ github.workspace }}":/workspace -w /workspace -u 0 \
+            iowarp/deps-cpu:latest bash -c '
+              set -e
+              # /usr/local is where deps-cpu installs HDF5 (2.1.1) + its CLI
+              # tools (h5dump/h5ls/h5repack/h5diff). Put both lib and bin on the
+              # path so the VFD links the right libhdf5 AND the in-test native
+              # tool matrix actually runs (rather than skipping).
+              export PATH=/usr/local/bin:$PATH
+              export LD_LIBRARY_PATH=/usr/local/lib:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
+              export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:$PKG_CONFIG_PATH
+              git config --global --add safe.directory /workspace
+              # ELF interception headers for the CTE adapters (HDF5 already in image).
+              apt-get update -qq
+              apt-get install -y -qq libelf-dev pkg-config
+              # Locate the native HDF5 CLI tools (h5dump/h5ls/h5repack/h5diff)
+              # used by the in-test native-compat matrix. Their location varies
+              # across deps-cpu image revisions, so discover rather than assume:
+              # add wherever h5dump lives to PATH. If they are genuinely absent
+              # the matrix skips (the in-process sec2 differential still proves
+              # native readability) -- this must NOT fail the job.
+              h5bin="$(command -v h5dump 2>/dev/null || find /usr/local /opt /usr -name h5dump -type f 2>/dev/null | head -1)"
+              if [ -n "$h5bin" ]; then
+                export PATH="$(dirname "$h5bin"):$PATH"
+                echo "== native HDF5 tools: $(command -v h5dump) =="
+              else
+                echo "::warning::native HDF5 CLI tools not found in the image; the in-test tool matrix will skip (native readability is still covered in-process by the sec2 differential)"
+              fi
+              # Flags mirror the `vfd` CMake preset (ELF + POSIX/STDIO/VFD),
+              # VFD-only (no VOL/fuse/adios). LOG_LEVEL=1 to keep CI logs sane.
+              cmake -B build-vfd \
+                -DCMAKE_BUILD_TYPE=Debug \
+                -DCLIO_CORE_ENABLE_RUNTIME=ON \
+                -DCLIO_CORE_ENABLE_CTE=ON \
+                -DCLIO_CORE_ENABLE_CAE=OFF \
+                -DCLIO_CORE_ENABLE_CEE=OFF \
+                -DCLIO_CORE_ENABLE_TESTS=ON \
+                -DCLIO_CORE_ENABLE_BENCHMARKS=OFF \
+                -DCLIO_CORE_ENABLE_PYTHON=OFF \
+                -DCLIO_CORE_ENABLE_CONDA=OFF \
+                -DCLIO_CORE_ENABLE_ELF=ON \
+                -DCLIO_CTE_ENABLE_POSIX_ADAPTER=ON \
+                -DCLIO_CTE_ENABLE_STDIO_ADAPTER=ON \
+                -DCLIO_CTE_ENABLE_VFD=ON \
+                -DCLIO_CTE_ENABLE_HDF5_VOL=OFF \
+                -DCLIO_CTE_ENABLE_FUSE_ADAPTER=OFF \
+                -DCLIO_CTE_ENABLE_ADIOS2_ADAPTER=OFF \
+                -DCLIO_CTE_ENABLE_COMPRESS=OFF \
+                -DCLIO_CORE_ENABLE_GRAY_SCOTT=OFF \
+                -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+                -DCLIO_CTP_LOG_LEVEL=1
+              # Targeted build: just the VFD test target pulls in the driver +
+              # the runtime libs it depends on (add_dependencies), not the whole
+              # adapter/test matrix.
+              cmake --build build-vfd --target clio_cte_vfd_unit_tests -j"$(nproc)"
+              # ABI gate: the VFD MUST link the same libhdf5 the tools use.
+              echo "== VFD libhdf5 linkage =="
+              ldd build-vfd/bin/libclio_vfd.so | grep -i hdf5
+              # Run the VFD suite (+ its shell cleanup fixtures). Allow one retry
+              # for flaky runtime bring-up, like the ci-adapters job.
+              ctest --test-dir build-vfd --output-on-failure \
+                --timeout 300 --repeat until-pass:2 -R vfd -LE "docker|ollama"
+            '

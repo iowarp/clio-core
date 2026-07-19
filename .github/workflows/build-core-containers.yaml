@@ -16,6 +16,37 @@ on:
       - 'context-assimilation-engine/**'
       - 'context-exploration-engine/**'
       - 'context-transport-primitives/**'
+  # Build-only regression gate on PRs: build the deploy + benchmark images (and,
+  # via rebuild-deps, the dependency images) to catch container breakage before
+  # merge. Nothing is pushed or tagged into a manifest -- every publish step is
+  # guarded on github.event_name != 'pull_request'. Also covers the benchmark
+  # Dockerfiles, which the push trigger above does not watch.
+  pull_request:
+    branches: [main, dev]
+    paths:
+      - 'docker/deploy-cpu.Dockerfile'
+      - 'docker/deps-cpu.Dockerfile'
+      - 'docker/deps-nvidia.Dockerfile'
+      - 'docker/redis_bench/Dockerfile'
+      - 'docker/clio_cte_bench/Dockerfile'
+      - 'CMakeLists.txt'
+      - 'CMakePresets.json'
+      - 'context-runtime/**'
+      - 'context-transfer-engine/**'
+      - 'context-assimilation-engine/**'
+      - 'context-exploration-engine/**'
+      - 'context-transport-primitives/**'
+      - '.github/workflows/build-core-containers.yaml'
+      - '.github/workflows/build-dep-containers.yaml'
+
+concurrency:
+  group: build-core-containers-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Present on push + internal-branch PRs; empty on forked-PR runs, which skips
+  # the Docker Hub login below (public base images still pull fine anonymously).
+  DOCKER_HUB_USERNAME: ${{ secrets.DOCKER_HUB_USERNAME }}
 
 jobs:
   # Rebuild deps-cpu image first when its Dockerfile changed in this push.
@@ -37,6 +68,7 @@ jobs:
           submodules: recursive
 
       - name: Login to Docker Hub
+        if: ${{ env.DOCKER_HUB_USERNAME != '' }}
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_HUB_USERNAME }}
@@ -51,7 +83,7 @@ jobs:
           context: .
           file: ./docker/deploy-cpu.Dockerfile
           platforms: linux/amd64
-          push: true
+          push: ${{ github.event_name != 'pull_request' }}
           tags: iowarp/deploy-cpu:latest-amd64
           # GitHub Actions cache, not Docker Hub registry cache. The
           # deploy-cpu buildcache caches the full compiled clio-core
@@ -77,6 +109,7 @@ jobs:
           submodules: recursive
 
       - name: Login to Docker Hub
+        if: ${{ env.DOCKER_HUB_USERNAME != '' }}
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_HUB_USERNAME }}
@@ -91,7 +124,7 @@ jobs:
           context: .
           file: ./docker/deploy-cpu.Dockerfile
           platforms: linux/arm64
-          push: true
+          push: ${{ github.event_name != 'pull_request' }}
           tags: iowarp/deploy-cpu:latest-arm64
           # See the amd64 job above: type=gha avoids the Docker Hub
           # registry-buildcache pull that stalled this job out at 60min.
@@ -103,8 +136,11 @@ jobs:
     name: Create Multi-Arch Manifest (deploy-cpu)
     runs-on: ubuntu-latest
     needs: [deploy-cpu-amd64, deploy-cpu-arm64]
+    # No per-arch tags are pushed on a PR, so there is no manifest to stitch.
+    if: ${{ github.event_name != 'pull_request' }}
     steps:
       - name: Login to Docker Hub
+        if: ${{ env.DOCKER_HUB_USERNAME != '' }}
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_HUB_USERNAME }}
@@ -130,6 +166,7 @@ jobs:
           submodules: recursive
 
       - name: Login to Docker Hub
+        if: ${{ env.DOCKER_HUB_USERNAME != '' }}
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_HUB_USERNAME }}
@@ -144,7 +181,7 @@ jobs:
           context: .
           file: ./docker/redis_bench/Dockerfile
           platforms: linux/amd64
-          push: true
+          push: ${{ github.event_name != 'pull_request' }}
           tags: iowarp/redis-bench:latest-amd64
 
       - name: Build and push CTE benchmark (AMD64)
@@ -153,7 +190,7 @@ jobs:
           context: .
           file: ./docker/clio_cte_bench/Dockerfile
           platforms: linux/amd64
-          push: true
+          push: ${{ github.event_name != 'pull_request' }}
           tags: iowarp/cte-bench:latest-amd64
 
   # Benchmark containers - ARM64
@@ -169,6 +206,7 @@ jobs:
           submodules: recursive
 
       - name: Login to Docker Hub
+        if: ${{ env.DOCKER_HUB_USERNAME != '' }}
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_HUB_USERNAME }}
@@ -183,7 +221,7 @@ jobs:
           context: .
           file: ./docker/redis_bench/Dockerfile
           platforms: linux/arm64
-          push: true
+          push: ${{ github.event_name != 'pull_request' }}
           tags: iowarp/redis-bench:latest-arm64
 
       - name: Build and push CTE benchmark (ARM64)
@@ -192,7 +230,7 @@ jobs:
           context: .
           file: ./docker/clio_cte_bench/Dockerfile
           platforms: linux/arm64
-          push: true
+          push: ${{ github.event_name != 'pull_request' }}
           tags: iowarp/cte-bench:latest-arm64
 
   # Create multi-arch manifests for benchmarks
@@ -200,8 +238,11 @@ jobs:
     name: Create Multi-Arch Manifests (benchmarks)
     runs-on: ubuntu-latest
     needs: [build-benchmarks-amd64, build-benchmarks-arm64]
+    # No per-arch tags are pushed on a PR, so there is no manifest to stitch.
+    if: ${{ github.event_name != 'pull_request' }}
     steps:
       - name: Login to Docker Hub
+        if: ${{ env.DOCKER_HUB_USERNAME != '' }}
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_HUB_USERNAME }}

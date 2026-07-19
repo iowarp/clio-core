@@ -9,7 +9,8 @@ nanobind_add_module(
 )
 
 # Link against the admin client library (provides MonitorTask, admin::Client, clio_run headers)
-target_link_libraries(clio_runtime_ext PRIVATE clio_admin_client)
+# and the safe_bdev client (AddBdev/RemoveBdev/RecoverBdev for dashboard controls).
+target_link_libraries(clio_runtime_ext PRIVATE clio_admin_client clio_safe_bdev_client)
 
 # Local includes only
 target_include_directories(clio_runtime_ext PRIVATE

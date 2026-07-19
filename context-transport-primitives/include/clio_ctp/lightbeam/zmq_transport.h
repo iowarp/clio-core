@@ -39,6 +39,8 @@
 #endif
 #include <zmq.h>
 
+#include <atomic>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -109,15 +111,21 @@ class ZeroMqTransport : public Transport {
           (void)ctx;
 #else
           // zmq_ctx_shutdown() causes all blocking ZMQ calls on open sockets
-          // to return immediately with ETERM.  This unblocks any background
-          // receive threads (e.g. RecvZmqClientThread) that are polling the
-          // socket, allowing them to exit cleanly.  zmq_ctx_destroy() would
-          // otherwise block forever if a socket is still open (because the
-          // CLIO Runtime singleton is heap-allocated and its destructor --
-          // which calls ClientFinalize / closes the socket -- is never
-          // invoked).
+          // to return immediately with ETERM, unblocking background receive
+          // threads (e.g. RecvZmqClientThread) so they can exit.
+          //
+          // We deliberately do NOT call zmq_ctx_destroy()/zmq_ctx_term() here:
+          // it blocks until every socket opened on the context has been closed
+          // with zmq_close(), and the CLIO Runtime singleton is heap-allocated
+          // with a destructor (ClientFinalize, which closes the socket) that is
+          // never invoked. Some workloads (force-net tag/query/compose,
+          // assimilation) reach process exit with a DEALER socket on this
+          // shared context still open, so zmq_ctx_term would hang forever
+          // (observed: main thread parked in poll(-1) inside ctx_t::terminate
+          // at atexit). The process is exiting anyway, so we leak the context
+          // and let the OS reclaim it — a one-time leak at exit is strictly
+          // better than a shutdown deadlock. Mirrors the Windows path above.
           zmq_ctx_shutdown(ctx);
-          zmq_ctx_destroy(ctx);
 #endif
           ctx = nullptr;
         }
@@ -136,6 +144,11 @@ class ZeroMqTransport : public Transport {
       int iot = (iot_env && *iot_env) ? std::atoi(iot_env) : 8;
       if (iot < 1) iot = 1;
       zmq_ctx_set(owner.ctx, ZMQ_IO_THREADS, iot);
+      // Non-blocking termination semantics: new sockets default to LINGER=0 so
+      // a close never waits for unsent messages, and blocking calls return
+      // ETERM promptly on shutdown. Belt-and-suspenders alongside the leak in
+      // ~CtxOwner (we never call the blocking zmq_ctx_term).
+      zmq_ctx_set(owner.ctx, ZMQ_BLOCKY, 0);
       HLOG(kInfo, "[ZeroMqTransport] Created shared context with {} I/O threads", iot);
     }
     return owner.ctx;
@@ -150,11 +163,13 @@ class ZeroMqTransport : public Transport {
   // back to the originating client by identity).  The previous
   // kPushPull alternative (PUSH/PULL, unidirectional) has been removed.
   explicit ZeroMqTransport(TransportMode mode, const std::string& addr,
-                           const std::string& protocol = "tcp", int port = 8192)
+                           const std::string& protocol = "tcp", int port = 8192,
+                           bool use_shared_ctx = false)
       : Transport(mode),
         addr_(addr),
         protocol_(protocol),
         port_(port),
+        use_shared_ctx_(use_shared_ctx),
         zmq_fired_action_(nullptr) {
     type_ = TransportType::kZeroMq;
     sock::InitSocketLib();
@@ -211,13 +226,20 @@ class ZeroMqTransport : public Transport {
       owns_ctx_ = false;
       socket_ = zmq_socket(ctx_, ZMQ_DEALER);
 
-      // ZMQ_IDENTITY: the server's ROUTER uses this as the response
-      // routing prefix.  hostname:pid keeps it debuggable and unique
-      // across processes.
+      // ZMQ_IDENTITY: the server's ROUTER uses this as the response routing
+      // prefix. It MUST be unique per DEALER socket: when several DEALERs in one
+      // process (e.g. per-thread client send sockets) connect to the same ROUTER
+      // with an identical identity, the ROUTER coalesces them onto one
+      // connection and silently drops every sender's frames but one. A
+      // per-process atomic sequence guarantees uniqueness; the host part (before
+      // the first ':') stays parseable for response dial-back.
       {
+        static std::atomic<uint64_t> dealer_seq{0};
         std::string hostname = ctp::SystemInfo::GetHostname();
         uint32_t pid = static_cast<uint32_t>(ctp::SystemInfo::GetPid());
-        std::string identity = hostname + ":" + std::to_string(pid);
+        uint64_t seq = dealer_seq.fetch_add(1, std::memory_order_relaxed);
+        std::string identity = hostname + ":" + std::to_string(pid) + ":" +
+                               std::to_string(seq);
         zmq_setsockopt(socket_, ZMQ_IDENTITY, identity.data(),
                         identity.size());
       }
@@ -290,12 +312,24 @@ class ZeroMqTransport : public Transport {
       zmq_fired_action_.socket_ = socket_;
     } else {
       // Server socket: ROUTER, bind-style.
-      ctx_ = zmq_ctx_new();
-      owns_ctx_ = true;
-      const char *iot_env = ctp::env::GetCompat("ZMQ_IO_THREADS");
-      int iot = (iot_env && *iot_env) ? std::atoi(iot_env) : 8;
-      if (iot < 1) iot = 1;
-      zmq_ctx_set(ctx_, ZMQ_IO_THREADS, iot);
+      if (use_shared_ctx_) {
+        // Bind on the process-wide shared context, which is intentionally
+        // leaked at exit (see GetSharedContext / CtxOwner) and never
+        // zmq_ctx_destroy'd. On Windows that destroy aborts inside libzmq's
+        // signaler ("WSASTARTUP not yet performed"); a ROUTER on its own owned
+        // context in a clean-exit process (e.g. the client response listener)
+        // would trip it. IO_THREADS are already configured on the shared
+        // context, so don't re-set them here.
+        ctx_ = GetSharedContext();
+        owns_ctx_ = false;
+      } else {
+        ctx_ = zmq_ctx_new();
+        owns_ctx_ = true;
+        const char *iot_env = ctp::env::GetCompat("ZMQ_IO_THREADS");
+        int iot = (iot_env && *iot_env) ? std::atoi(iot_env) : 8;
+        if (iot < 1) iot = 1;
+        zmq_ctx_set(ctx_, ZMQ_IO_THREADS, iot);
+      }
       socket_ = zmq_socket(ctx_, ZMQ_ROUTER);
 
       // Mandatory routing makes zmq_send fail loudly if the destination
@@ -331,6 +365,17 @@ class ZeroMqTransport : public Transport {
       int sndtimeo = 1000;
       zmq_setsockopt(socket_, ZMQ_SNDTIMEO, &sndtimeo, sizeof(sndtimeo));
 
+      // Bound how long a blocking frame read (the flags=0 delim/meta/bulk reads
+      // in RecvMetadata/RecvBulks) can wait. The identity frame is read
+      // DONTWAIT, but if a multipart message is ever truncated on the wire the
+      // follow-on frames would block forever — wedging the recv thread so it
+      // can't honor recv_shutdown_ at teardown (the leaked Windows context
+      // sends no ETERM to wake it). 1 s lets the read fail with EAGAIN and the
+      // recv loop re-check the shutdown flag; well-formed messages arrive
+      // atomically so this never trips in steady state.
+      int rcvtimeo = 1000;
+      zmq_setsockopt(socket_, ZMQ_RCVTIMEO, &rcvtimeo, sizeof(rcvtimeo));
+
       // ZMTP heartbeat — same scale-friendly window as DEALER side.
       int hb_ivl = 5000;
       zmq_setsockopt(socket_, ZMQ_HEARTBEAT_IVL, &hb_ivl, sizeof(hb_ivl));
@@ -351,22 +396,56 @@ class ZeroMqTransport : public Transport {
       }
       HLOG(kDebug, "ZeroMqTransport(ROUTER) bound successfully to {}",
            full_url);
+
+      // Resolve the actual bound TCP port. When the caller asked for an
+      // ephemeral port (port_ == 0), the kernel assigns one; ZMQ_LAST_ENDPOINT
+      // reports the concrete "tcp://addr:port" it bound, whose trailing port is
+      // what clients advertise for dial-back. For a fixed bind, that port is
+      // simply port_.
+      if (protocol_ == "tcp") {
+        if (port_ != 0) {
+          bound_port_ = port_;
+        } else {
+          char endpoint[256];
+          size_t endpoint_len = sizeof(endpoint);
+          if (zmq_getsockopt(socket_, ZMQ_LAST_ENDPOINT, endpoint,
+                             &endpoint_len) == 0) {
+            std::string ep(endpoint);
+            size_t colon = ep.find_last_of(':');
+            if (colon != std::string::npos) {
+              bound_port_ = std::atoi(ep.c_str() + colon + 1);
+            }
+          }
+        }
+      }
       zmq_fired_action_.socket_ = socket_;
     }
   }
 
   ~ZeroMqTransport() {
-    HLOG(kDebug, "ZeroMqTransport destructor - closing socket to {}:{}", addr_,
-         port_);
+    HLOG(kDebug,
+         "ZeroMqTransport destructor - closing socket to {}:{} "
+         "(shutdown={} owns_ctx={})",
+         addr_, port_, sock::IsSocketLibShutdown(), owns_ctx_);
 
-    int linger = 0;  // Close immediately; don't wait for unsent messages
-    zmq_setsockopt(socket_, ZMQ_LINGER, &linger, sizeof(linger));
-
-    zmq_close(socket_);
-    if (owns_ctx_) {
-      zmq_ctx_destroy(ctx_);
+    // During process shutdown on Windows, tearing down a ZMQ socket OR a
+    // ZMQ context trips libzmq's signaler WSASTARTUP assertion: libzmq has
+    // already torn down its own Winsock state, so the signaler's wakeup send()
+    // aborts (signaler.cpp:163). The shared context is already leaked for this
+    // reason (see GetSharedContext's CtxOwner); do the same for every transport
+    // once shutdown has begun — skip both zmq_close and zmq_ctx_destroy and let
+    // the OS reclaim the socket (and any private context) at process exit. On
+    // POSIX IsSocketLibShutdown() is always false, so teardown is unchanged.
+    const bool leak = sock::IsSocketLibShutdown();
+    if (!leak) {
+      int linger = 0;  // Close immediately; don't wait for unsent messages
+      zmq_setsockopt(socket_, ZMQ_LINGER, &linger, sizeof(linger));
+      zmq_close(socket_);
+      if (owns_ctx_) {
+        zmq_ctx_destroy(ctx_);
+      }
     }
-    HLOG(kDebug, "ZeroMqTransport destructor - socket closed");
+    HLOG(kDebug, "ZeroMqTransport destructor - socket closed (leak={})", leak);
   }
 
   Bulk Expose(const ctp::ipc::FullPtr<char>& ptr, size_t data_size,
@@ -522,6 +601,25 @@ class ZeroMqTransport : public Transport {
   }
 
  private:
+  // After a partial/truncated multipart read, discard any frames still pending
+  // for the current logical message so the next Recv() starts cleanly on a
+  // message boundary (prevents a one-time wire glitch from desyncing the
+  // stream permanently). Non-blocking throughout.
+  void DrainToMessageBoundary() {
+    while (true) {
+      int more = 0;
+      size_t more_sz = sizeof(more);
+      if (zmq_getsockopt(socket_, ZMQ_RCVMORE, &more, &more_sz) != 0 || !more) {
+        break;
+      }
+      zmq_msg_t junk;
+      zmq_msg_init(&junk);
+      int rc = zmq_msg_recv(&junk, socket_, ZMQ_DONTWAIT);
+      zmq_msg_close(&junk);
+      if (rc == -1) break;
+    }
+  }
+
   template <typename MetaT>
   int RecvMetadata(MetaT& meta, const LbmContext& ctx = LbmContext()) {
     (void)ctx;
@@ -529,8 +627,12 @@ class ZeroMqTransport : public Transport {
     zmq_msg_init(&msg);
     int rc;
     if (IsServer()) {
-      // ROUTER: identity frame first (DONTWAIT so polling callers can
-      // see EAGAIN cleanly), then a blocking delim and meta.
+      // ROUTER: [identity, delim, meta]. The identity is read DONTWAIT so a
+      // polling caller sees EAGAIN cleanly when nothing is queued. ZMQ delivers
+      // a multipart message atomically, so once the identity is in hand the
+      // delim and meta are already buffered — read them DONTWAIT too. Staying
+      // non-blocking is what lets the recv thread always honor its shutdown
+      // flag; a blocking flags=0 read on a truncated message would wedge it.
       zmq_msg_t identity_msg;
       zmq_msg_init(&identity_msg);
       int rc_id = zmq_msg_recv(&identity_msg, socket_, ZMQ_DONTWAIT);
@@ -547,16 +649,18 @@ class ZeroMqTransport : public Transport {
 
       zmq_msg_t delim_msg;
       zmq_msg_init(&delim_msg);
-      int rc_d = zmq_msg_recv_eintr(&delim_msg, socket_, 0);
+      int rc_d = zmq_msg_recv(&delim_msg, socket_, ZMQ_DONTWAIT);
       zmq_msg_close(&delim_msg);
       if (rc_d == -1) {
+        DrainToMessageBoundary();
         zmq_msg_close(&msg);
         return zmq_errno();
       }
 
-      rc = zmq_msg_recv_eintr(&msg, socket_, 0);
+      rc = zmq_msg_recv(&msg, socket_, ZMQ_DONTWAIT);
     } else {
-      // DEALER: delim (DONTWAIT for EAGAIN check) then meta (blocking).
+      // DEALER: [delim, meta]. Delim DONTWAIT to detect "no message"; meta is
+      // buffered with it (atomic multipart), so read it DONTWAIT as well.
       zmq_msg_t delim_msg;
       zmq_msg_init(&delim_msg);
       int rc_d = zmq_msg_recv(&delim_msg, socket_, ZMQ_DONTWAIT);
@@ -567,11 +671,12 @@ class ZeroMqTransport : public Transport {
         return err;
       }
       zmq_msg_close(&delim_msg);
-      rc = zmq_msg_recv_eintr(&msg, socket_, 0);
+      rc = zmq_msg_recv(&msg, socket_, ZMQ_DONTWAIT);
     }
 
     if (rc == -1) {
       int err = zmq_errno();
+      DrainToMessageBoundary();
       zmq_msg_close(&msg);
       return err;
     }
@@ -602,7 +707,11 @@ class ZeroMqTransport : public Transport {
         continue;
       }
       recv_count++;
-      int flags = (recv_count < meta.send_bulks) ? ZMQ_RCVMORE : 0;
+      // Bulks ride in the same atomic multipart message as the meta, so they're
+      // already buffered by the time we get here — read DONTWAIT to stay
+      // non-blocking. (The previous ZMQ_RCVMORE-as-recv-flag was a no-op-ish
+      // misuse: ZMQ_RCVMORE is a getsockopt option, not a recv flag.)
+      int flags = ZMQ_DONTWAIT;
 
       if (meta.recv[i].data.ptr_) {
         zmq_msg_t zmq_msg;
@@ -650,6 +759,20 @@ class ZeroMqTransport : public Transport {
     }
   }
 
+  /** Block up to timeout_ms until this socket is readable, using ZMQ's native
+   *  zmq_poll. This is the correct readiness primitive for a ZMQ socket: it
+   *  checks ZMQ_EVENTS rather than the raw ZMQ_FD, so it works on Windows where
+   *  WSAEventSelect/epoll cannot watch ZMQ_FD. Holds sock_mtx_ so it never runs
+   *  concurrently with Send/Recv on this non-thread-safe socket; zmq_poll
+   *  returns the instant data is ready, so it only blocks a would-be sender for
+   *  at most timeout_ms while the socket is genuinely idle. Returns >0 if
+   *  readable, 0 on timeout, <0 on error. */
+  int PollRecv(int timeout_ms) {
+    std::lock_guard<std::mutex> lock(sock_mtx_);
+    zmq_pollitem_t item = {socket_, 0, ZMQ_POLLIN, 0};
+    return zmq_poll(&item, 1, timeout_ms);
+  }
+
   std::string GetAddress() const { return addr_; }
 
   /** Check if the server is still alive via a connect probe. The actual
@@ -660,10 +783,18 @@ class ZeroMqTransport : public Transport {
     return sock::IsServerAlive(addr_, port_, protocol_);
   }
 
+ public:
+  /** Actual bound TCP port for a server socket. Equals port_ for a fixed
+   *  bind; resolved from ZMQ_LAST_ENDPOINT when bound to ephemeral port 0.
+   *  0 for client sockets / ipc:// servers. */
+  int GetBoundPort() const { return bound_port_; }
+
  private:
   std::string addr_;
   std::string protocol_;
   int port_;
+  int bound_port_ = 0;
+  bool use_shared_ctx_ = false;
   void* ctx_;
   bool owns_ctx_;
   void* socket_;

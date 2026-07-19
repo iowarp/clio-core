@@ -85,7 +85,7 @@ class PoolQuery {
       : routing_mode_(RoutingMode::Local), hash_value_(0),
         container_id_(kInvalidContainerId),
         range_offset_(0), range_count_(0), node_id_(0), ret_node_(0),
-        net_timeout_(-1.0f), parallelism_(32),
+        net_timeout_(-1.0f), ttl_(-1.0f), parallelism_(32),
         batch_key_(0), batch_for_ns_(0) {}
 
   // Copy/move/destructor are intentionally left implicit (compiler-generated)
@@ -381,6 +381,22 @@ class PoolQuery {
   CTP_CROSS_FUN void SetNetTimeout(float t) { net_timeout_ = t; }
 
   /**
+   * Get the task time-to-live: a hard upper bound on how long the origin
+   * waits for this (cross-node) task before completing it with a timeout RC,
+   * independent of node liveness (issue #628).
+   * @return TTL in seconds, or < 0 for infinity (the default) -- no hard cap;
+   *         liveness is then governed solely by the periodic QueryTaskProgress
+   *         check (GetTaskProgressIntervalMs).
+   */
+  CTP_CROSS_FUN float GetTtl() const { return ttl_; }
+
+  /**
+   * Set the task time-to-live in seconds. Negative = infinity (default).
+   * Overridable on any PoolQuery regardless of routing mode.
+   */
+  CTP_CROSS_FUN void SetTtl(float t) { ttl_ = t; }
+
+  /**
    * Get the parallelism level for GPU task dispatch
    * @return Number of threads (1 = lane 0 only, 32 = full warp, >32 = multi-warp)
    */
@@ -442,7 +458,7 @@ class PoolQuery {
   template <class Archive>
   CTP_CROSS_FUN void serialize(Archive& ar) {
     ar.range(routing_mode_, hash_value_, container_id_, range_offset_,
-             range_count_, node_id_, ret_node_, net_timeout_, parallelism_,
+             range_count_, node_id_, ret_node_, net_timeout_, ttl_, parallelism_,
              batch_key_, batch_for_ns_);
   }
 
@@ -455,6 +471,7 @@ class PoolQuery {
   u32 node_id_;              /**< Node ID for physical routing */
   u32 ret_node_;             /**< Return node ID for distributed responses */
   float net_timeout_;        /**< Per-task network timeout in seconds (-1 = use default) */
+  float ttl_;                /**< #628: task TTL in seconds; <0 = infinity (no hard cap) */
   u32 parallelism_;          /**< GPU parallelism: 1 (lane 0), 32 (full warp), >32 (multi-warp) */
   u64 batch_key_;            /**< ManyToOne: batch sub-key */
   u64 batch_for_ns_;         /**< ManyToOne: batch window in nanoseconds */

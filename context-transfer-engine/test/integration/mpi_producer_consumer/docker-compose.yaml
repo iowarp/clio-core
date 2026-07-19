@@ -1,0 +1,75 @@
+# Multi-node MPI producer/consumer test (issue #714).
+#
+# Two nodes, one clio daemon each, on a private docker network. Both run their
+# own local daemon; node 1 additionally sets up passwordless SSH and launches
+# `mpirun -np 2` across both containers (rank 0 producer on node 1, rank 1
+# consumer on node 2). node 2 serves sshd so mpirun can start rank 1 there.
+#
+# Hostnames MUST be iowarp-node1/iowarp-node2 to match hostfile + mpi_hostfile.
+# Usage: ./run_tests.sh  (keys the result on node 1, the mpirun launcher).
+
+services:
+  # Node 1 — mpirun launcher; hosts rank 0 (producer)
+  pc-node1:
+    image: ${IOWARP_DOCKER_IMAGE:-iowarp/deps-cpu:latest}
+    security_opt:
+      - seccomp:unconfined
+    container_name: pc-node1
+    hostname: iowarp-node1
+    networks:
+      pc-cluster:
+        ipv4_address: 172.30.0.10
+    volumes:
+      - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-/workspace}}:/workspace:rw
+    tmpfs:
+      - /mnt:mode=1777
+    environment:
+      - NODE_ID=1
+      - CLIO_SERVER_CONF=/workspace/context-transfer-engine/test/integration/mpi_producer_consumer/clio_config.yaml
+      - CONTAINER_HOSTFILE=/workspace/context-transfer-engine/test/integration/mpi_producer_consumer/hostfile
+      - CLIO_WITH_RUNTIME=0
+      - PATH=/workspace/build/bin:/usr/local/bin:/usr/bin:/bin
+      - LD_LIBRARY_PATH=/workspace/build/bin:/usr/local/cuda/lib64:/usr/local/lib
+      - OMPI_ALLOW_RUN_AS_ROOT=1
+      - OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
+    mem_limit: 8g
+    working_dir: /workspace
+    entrypoint:
+      - /bin/bash
+      - /workspace/context-transfer-engine/test/integration/mpi_producer_consumer/node1_entrypoint.sh
+
+  # Node 2 — sshd server; hosts rank 1 (consumer)
+  pc-node2:
+    image: ${IOWARP_DOCKER_IMAGE:-iowarp/deps-cpu:latest}
+    security_opt:
+      - seccomp:unconfined
+    container_name: pc-node2
+    hostname: iowarp-node2
+    networks:
+      pc-cluster:
+        ipv4_address: 172.30.0.11
+    volumes:
+      - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-/workspace}}:/workspace:rw
+    tmpfs:
+      - /mnt:mode=1777
+    environment:
+      - NODE_ID=2
+      - CLIO_SERVER_CONF=/workspace/context-transfer-engine/test/integration/mpi_producer_consumer/clio_config.yaml
+      - CONTAINER_HOSTFILE=/workspace/context-transfer-engine/test/integration/mpi_producer_consumer/hostfile
+      - CLIO_WITH_RUNTIME=0
+      - PATH=/workspace/build/bin:/usr/local/bin:/usr/bin:/bin
+      - LD_LIBRARY_PATH=/workspace/build/bin:/usr/local/cuda/lib64:/usr/local/lib
+      - OMPI_ALLOW_RUN_AS_ROOT=1
+      - OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
+    mem_limit: 8g
+    working_dir: /workspace
+    entrypoint:
+      - /bin/bash
+      - /workspace/context-transfer-engine/test/integration/mpi_producer_consumer/node2_entrypoint.sh
+
+networks:
+  pc-cluster:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24

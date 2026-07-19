@@ -82,6 +82,19 @@ The wheel includes the CLIO runtime, the `clio_run` CLI, the CTE, CAE, and
 CEE engines, and the `clio_cee` Python bindings. A default configuration is
 seeded at `~/.clio/clio.yaml` on first import.
 
+### Conda
+
+Prebuilt `iowarp-core` packages are published to the
+[`iowarp` channel on Anaconda.org](https://anaconda.org/iowarp/iowarp-core).
+With [Miniconda](https://www.anaconda.com/download/success) installed:
+
+```bash
+conda create -n iowarp -c iowarp -c conda-forge iowarp-core
+conda activate iowarp
+```
+
+Dependencies are pulled from conda-forge instead of being statically linked.
+
 Switch to a source build below if you need any of:
 
 - NVIDIA GPU (CUDA) or AMD GPU (ROCm) acceleration
@@ -94,15 +107,21 @@ Switch to a source build below if you need any of:
 
 ### Source build (Conda)
 
+Build the conda recipe yourself to enable extra features. `IOWARP_PRESET`
+selects a [CMake preset](CMakePresets.json):
+
 ```bash
 git clone --recurse-submodules https://github.com/iowarp/clio-core.git
 cd clio-core
-bash install.sh release
-```
 
-`release` corresponds to a variant under `installers/conda/variants/`. Other
-variants (`cuda`, `rocm`, `mpi`, `full`, `release-fuse`, `debug`, ...) enable
-the corresponding features.
+# conda-build is a base-env plugin — install it there
+conda install -n base -y conda-build -c conda-forge
+
+# Common presets: release, debug, cuda-release, rocm-release
+IOWARP_PRESET=release conda build installers/conda/ \
+    -c conda-forge --output-folder build/conda-output
+conda install -c conda-forge build/conda-output/*/iowarp-core-*.conda
+```
 
 For a full **bare-metal source build** (without Conda) with the per-feature
 apt / dnf dependency list and the complete `CLIO_*_ENABLE_*` flag checklist,

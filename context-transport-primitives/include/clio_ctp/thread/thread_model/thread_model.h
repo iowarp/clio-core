@@ -36,6 +36,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -149,6 +150,25 @@ class ThreadModel {
   /** Get the thread model type */
   CTP_INLINE_CROSS_FUN
   ThreadType GetType() { return type_; }
+
+#if CTP_IS_HOST
+  /**
+   * Wait until cond() returns true, escalating so the fast path stays
+   * low-latency without pinning a core indefinitely on slow waits:
+   *   1. Tight spin (no yield) for ~200us  — reacts within ~one cond() check
+   *      of completion (~100ns), avoiding the tens-of-microseconds scheduling
+   *      latency a bare Yield()/Sleep() costs on Windows.
+   *   2. Yield-spin for ~5ms               — hands the time slice back each
+   *      iteration but stays hot.
+   *   3. Exponentially growing SleepForUs  — near-zero CPU for long waits.
+   *
+   * Defined once in thread_model.cc against CTP_THREAD_MODEL's uniform
+   * Yield()/SleepForUs(), so a single implementation serves every thread
+   * model. The condition is evaluated frequently; keep it cheap and
+   * side-effect-free (e.g. an atomic flag load).
+   */
+  CTP_DLL void BusyWait(const std::function<bool()> &cond);
+#endif
 };
 
 }  // namespace ctp::thread

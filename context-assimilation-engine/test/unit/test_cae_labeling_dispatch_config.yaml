@@ -1,0 +1,58 @@
+# Compose config for the CAE labeling-dispatch + semantic-search test.
+#
+# CAE core sits at the CTE entrypoint (512.0) with transparent-labeling rules
+# configured and forwards to the real CTE core at 513.0. The label_endpoint
+# points at a dead port so OllamaGenerate always fails fast — the test only
+# exercises the CAE-side match/dispatch logic (FindLabelMatch, the labeling
+# branch of PutBlob, and the SemanticSearch forward), NOT a real LLM.
+
+networking:
+  port: 9414
+
+runtime:
+  num_threads: 4
+  queue_depth: 1024
+
+compose:
+  - mod_name: clio_bdev
+    pool_name: "ram::chi_default_bdev"
+    pool_query: local
+    pool_id: "301.0"
+    bdev_type: ram
+    capacity: "256MB"
+
+  # CAE core at the entrypoint (512.0), labeling enabled.
+  - mod_name: clio_cae_core
+    pool_name: cae_label
+    pool_query: local
+    pool_id: "512.0"
+    next_pool_id: "513.0"
+    label_endpoint: "http://127.0.0.1:1"
+    label_prompts:
+      summarize: "Summarize this document:"
+    label_matches:
+      # First rule has an intentionally invalid regex ("[") so FindLabelMatch
+      # hits its std::regex_error catch and moves on to the next rule.
+      - tag_re: "["
+        blob_re: ".*"
+        model: "test-model"
+        prompt: "summarize"
+      # Second rule is valid and matches tag "label_tag" + blobs named "doc_*".
+      - tag_re: "label_tag"
+        blob_re: "doc_.*"
+        model: "test-model"
+        prompt: "summarize"
+        context_length: 4096
+        num_predict: 32
+
+  - mod_name: clio_cte_core
+    pool_name: cte_core
+    pool_query: local
+    pool_id: "513.0"
+    storage:
+      - path: "ram::cte_ram_tier1"
+        bdev_type: "ram"
+        capacity_limit: "128MB"
+        score: 1.0
+    dpe:
+      dpe_type: "max_bw"

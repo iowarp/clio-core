@@ -533,8 +533,7 @@ public:
     return 0; // Test implementation returns no work
   }
 
-  clio::run::TaskResume Run(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> task_ptr,
-                      clio::run::RunContext &rctx) override {
+  clio::run::TaskResume Run(clio::run::u32 method, clio::run::shared_ptr<clio::run::Task> task_ptr) override {
     // Test implementation - do nothing
     (void)method;
     (void)task_ptr;
@@ -544,29 +543,29 @@ public:
   }
 
   void SaveTask(clio::run::u32 method, clio::run::SaveTaskArchive &archive,
-                ctp::ipc::FullPtr<clio::run::Task> task_ptr) override {
+                clio::run::shared_ptr<clio::run::Task> &task_ptr) override {
     // Test implementation - just call task serialization
     (void)method;
     archive << *task_ptr;
   }
 
   void LoadTask(clio::run::u32 method, clio::run::LoadTaskArchive &archive,
-                ctp::ipc::FullPtr<clio::run::Task> task_ptr) override {
+                clio::run::shared_ptr<clio::run::Task> &task_ptr) override {
     // Test implementation - just call task deserialization
     (void)method;
     archive >> *task_ptr;
   }
 
-  ctp::ipc::FullPtr<clio::run::Task> AllocLoadTask(clio::run::u32 method, clio::run::LoadTaskArchive &archive) override {
+  clio::run::shared_ptr<clio::run::Task> AllocLoadTask(clio::run::u32 method, clio::run::LoadTaskArchive &archive) override {
     // Test implementation - allocate task and call LoadTask
-    ctp::ipc::FullPtr<clio::run::Task> task_ptr = NewTask(method);
+    clio::run::shared_ptr<clio::run::Task> task_ptr = NewTask(method);
     if (!task_ptr.IsNull()) {
       LoadTask(method, archive, task_ptr);
     }
     return task_ptr;
   }
 
-  ctp::ipc::FullPtr<clio::run::Task> NewCopyTask(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> orig_task_ptr,
+  clio::run::shared_ptr<clio::run::Task> NewCopyTask(clio::run::u32 method, clio::run::shared_ptr<clio::run::Task> &orig_task_ptr,
                                         bool deep) override {
     // Test implementation - create new task and copy
     (void)method;
@@ -579,30 +578,30 @@ public:
       }
       return new_task_ptr;
     }
-    return ctp::ipc::FullPtr<clio::run::Task>();
+    return clio::run::shared_ptr<clio::run::Task>();
   }
 
-  ctp::ipc::FullPtr<clio::run::Task> NewTask(clio::run::u32 method) override {
+  clio::run::shared_ptr<clio::run::Task> NewTask(clio::run::u32 method) override {
     // Test implementation - create a basic Task
     (void)method;
     auto *ipc_manager = CLIO_IPC;
     if (ipc_manager) {
       return ipc_manager->NewTask<clio::run::Task>();
     }
-    return ctp::ipc::FullPtr<clio::run::Task>();
+    return clio::run::shared_ptr<clio::run::Task>();
   }
 
   void LocalLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive &archive,
-                     ctp::ipc::FullPtr<clio::run::Task> task_ptr) override {
+                     clio::run::shared_ptr<clio::run::Task> &task_ptr) override {
     // Test implementation - do nothing for now
     (void)method;
     (void)archive;
     (void)task_ptr;
   }
 
-  ctp::ipc::FullPtr<clio::run::Task> LocalAllocLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive &archive) override {
+  clio::run::shared_ptr<clio::run::Task> LocalAllocLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive &archive) override {
     // Test implementation - allocate task and call LocalLoadTask
-    ctp::ipc::FullPtr<clio::run::Task> task_ptr = NewTask(method);
+    clio::run::shared_ptr<clio::run::Task> task_ptr = NewTask(method);
     if (!task_ptr.IsNull()) {
       LocalLoadTask(method, archive, task_ptr);
     }
@@ -610,33 +609,27 @@ public:
   }
 
   void LocalSaveTask(clio::run::u32 method, clio::run::DefaultSaveArchive &archive,
-                     ctp::ipc::FullPtr<clio::run::Task> task_ptr) override {
+                     clio::run::shared_ptr<clio::run::Task> &task_ptr) override {
     // Test implementation - do nothing
     (void)method;
     (void)archive;
     (void)task_ptr;
   }
 
-  void AggregateOut(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> orig_task,
-                 const ctp::ipc::FullPtr<clio::run::Task>& replica_task) override {
+  void AggregateOut(clio::run::u32 method, clio::run::shared_ptr<clio::run::Task> &orig_task,
+                 const clio::run::shared_ptr<clio::run::Task>& replica_task) override {
     (void)method;
     orig_task->AggregateOut(replica_task);
   }
 
-  void DelTask(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> task_ptr) override {
-    (void)method;
-    auto *ipc_manager = CLIO_IPC;
-    if (ipc_manager) {
-      ipc_manager->DelTask(task_ptr);
-    }
-  }
+  // DelTask removed: tasks are clio::run::shared_ptr handles freed via RAII.
 };
 
 TEST_CASE("Container Serialization Methods", "[task_archive][container]") {
   SECTION("Container SaveTask/LoadTask with SerializeIn mode") {
     TestContainer container;
     auto original_task = CreateTestTask();
-    ctp::ipc::FullPtr<clio::run::Task> task_ptr(original_task.get());
+    auto task_ptr = clio::run::shared_ptr<clio::run::Task>::WrapNonOwning(original_task.get());
 
     // Test SaveTask with SerializeIn mode (inputs)
     clio::run::SaveTaskArchive save_archive(clio::run::MsgType::kSerializeIn);
@@ -651,14 +644,14 @@ TEST_CASE("Container Serialization Methods", "[task_archive][container]") {
     // Test AllocLoadTask with SerializeIn mode (inputs)
     clio::run::LoadTaskArchive load_archive(serialized_data);
     load_archive.msg_type_ = clio::run::MsgType::kSerializeIn;
-    ctp::ipc::FullPtr<clio::run::Task> new_task_ptr;
+    clio::run::shared_ptr<clio::run::Task> new_task_ptr;
     REQUIRE_NOTHROW(new_task_ptr = container.AllocLoadTask(method, load_archive));
   }
 
   SECTION("Container SaveTask/LoadTask with SerializeOut mode") {
     TestContainer container;
     auto original_task = CreateTestTask();
-    ctp::ipc::FullPtr<clio::run::Task> task_ptr(original_task.get());
+    auto task_ptr = clio::run::shared_ptr<clio::run::Task>::WrapNonOwning(original_task.get());
 
     // Test SaveTask with SerializeOut mode (outputs)
     clio::run::SaveTaskArchive save_archive(clio::run::MsgType::kSerializeOut);
@@ -670,7 +663,7 @@ TEST_CASE("Container Serialization Methods", "[task_archive][container]") {
     // Test AllocLoadTask with SerializeOut mode (outputs)
     clio::run::LoadTaskArchive load_archive(serialized_data);
     load_archive.msg_type_ = clio::run::MsgType::kSerializeOut;
-    ctp::ipc::FullPtr<clio::run::Task> new_task_ptr;
+    clio::run::shared_ptr<clio::run::Task> new_task_ptr;
     REQUIRE_NOTHROW(new_task_ptr = container.AllocLoadTask(method, load_archive));
   }
 }

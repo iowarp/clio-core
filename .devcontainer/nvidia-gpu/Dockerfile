@@ -12,9 +12,26 @@ RUN userdel -r ubuntu || true
 # so a devcontainer rebuild picks it up immediately; it is also in the base
 # image (docker/iowarp-base.Dockerfile) as the canonical default. The
 # container runs --privileged, so /dev/fuse + SYS_ADMIN are available.
-RUN apt-get update && apt-get install -y --no-install-recommends \
+#
+# deps-nvidia force-installs the HIP-NVCC `hip-dev` headers with
+# `dpkg -i --force-depends` and deliberately never installs the AMD-flavored
+# hip-runtime-amd / rocm-llvm / hsa-rocr-dev / hipcc, leaving apt in a
+# broken-deps state (deps-nvidia.Dockerfile:196-199). apt refuses to run ANY
+# install while those phantom deps are unmet, which aborts this layer with
+# exit 100 (issue #670). Purge the unsatisfiable HIP metapackages and repair
+# the dependency tree first so the fuse/boost install can proceed. The oneAPI
+# step below re-runs the same purge (a no-op after this).
+RUN set -eux; \
+    dpkg -P --force-all hipcc hip-dev hip-runtime-amd rocm-llvm hsa-rocr-dev rocm-device-libs 2>/dev/null || true; \
+    apt-get update; \
+    DEBIAN_FRONTEND=noninteractive apt-get --fix-broken install -y || true; \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
       fuse3 libfuse3-dev \
-    && rm -rf /var/lib/apt/lists/*
+      libboost-context-dev libboost-dev; \
+    rm -rf /var/lib/apt/lists/*
+
+# Boost.Context stackful coroutine backend available + on by default (issue #620).
+ENV CLIO_CORE_ENABLE_BOOST_COROUTINES=ON
 
 # The deps-nvidia image already includes (inherited from deps-cpu):
 # - All apt + source-built dependencies (boost, hdf5, yaml-cpp, zeromq, cereal, etc.)
@@ -44,6 +61,98 @@ RUN set -eux; \
     cp -a "${archive}/lib/." /usr/local/lib/; \
     ldconfig; \
     rm -rf /tmp/nvcomp*
+
+# Scientific-data GPU compressors that back three more entries in the GPU
+# compression factory (ctp::Cusz / ctp::Ndzip / ctp::Cuszp), complementing
+# nvcomp's general-purpose byte codecs. All are built from source against the
+# CUDA 12 toolkit and installed into /usr/local so the root CMake auto-detects
+# them (CLIO_CTP_ENABLE_CUSZ / CLIO_CTP_ENABLE_NDZIP / CLIO_CTP_ENABLE_CUSZP):
+#   - cuSZ  (szcompressor/cuSZ)  : error-bounded LOSSY float compression
+#   - ndzip (celerity/ndzip)     : high-throughput LOSSLESS float compression
+#   - cuSZp (szcompressor/cuSZp) : ultra-fast single-kernel LOSSY float compression
+# ndzip and cuSZp have no upstream Spack/apt package, so source-building them here
+# is the only option; cuSZ is also a Spack package (see installers/spack) but is
+# source-built here to match the nvcomp/zfp-sycl pattern. Target SM versions are
+# overridable (default spans Volta..Hopper).
+ARG CUDA_ARCHS="70;75;80;86;89;90"
+
+# cuSZ - GPU error-bounded lossy compressor. Pinned to master; the ctp::Cusz
+# wrapper targets cuSZ's psz_* resource-manager C API.
+RUN set -eux; \
+    cd /tmp; \
+    git clone --depth 1 --recurse-submodules --shallow-submodules \
+      https://github.com/szcompressor/cuSZ.git cusz_src; \
+    cmake -S cusz_src -B cusz_src/build \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX=/usr/local \
+      -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHS}" \
+      -DPSZ_BACKEND=cuda \
+      -DPSZ_BUILD_EXAMPLES=off \
+      -DBUILD_TESTING=off \
+      -DCMAKE_POLICY_VERSION_MINIMUM=3.5; \
+    cmake --build cusz_src/build -j"$(nproc)"; \
+    cmake --install cusz_src/build; \
+    ldconfig; \
+    rm -rf /tmp/cusz_src
+
+# cuSZp - GPU ultra-fast single-kernel error-bounded lossy compressor. Pinned to
+# cuSZp-V3.0.0; the ctp::Cuszp wrapper targets the cuSZp v3 C API
+# (cuSZp_compress / cuSZp_decompress, header <cuSZp.h>, library -lcuSZp).
+RUN set -eux; \
+    cd /tmp; \
+    git clone --depth 1 --branch cuSZp-V3.0.0 \
+      https://github.com/szcompressor/cuSZp.git cuszp_src; \
+    cmake -S cuszp_src -B cuszp_src/build \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX=/usr/local \
+      -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHS}" \
+      -DcuSZp_BUILD_EXAMPLES=off \
+      -DCMAKE_POLICY_VERSION_MINIMUM=3.5; \
+    cmake --build cuszp_src/build -j"$(nproc)"; \
+    cmake --install cuszp_src/build; \
+    ldconfig; \
+    rm -rf /tmp/cuszp_src
+
+# ndzip - GPU high-throughput lossless compressor (CUDA backend).
+#
+# Built with CLANG as the CUDA compiler (clang++ -x cuda), per ndzip's own build
+# docs -- NOT nvcc. nvcc's crt/host_defines.h defines __noinline__ as a macro
+# (__attribute__((noinline))) that nests illegally inside libstdc++'s own
+# __attribute__((__noinline__)) when ndzip's device TUs pull in <memory>/<string>,
+# so the nvcc build fails (ndzip ships a single #undef workaround that is mis-
+# ordered for this toolchain). clang-18 (already installed above for CUDA kernels)
+# does not have that macro and compiles ndzip cleanly. Notes:
+#   - libomp (clang OpenMP) is required by ndzip's CPU codec (cpu_codec.inl).
+#   - -march=native is recommended by ndzip's docs (affects the host/CPU codec; the
+#     CUDA kernels are arch-targeted via CMAKE_CUDA_ARCHITECTURES). Relax it if this
+#     image must run on a different CPU than it was built on.
+#   - ndzip ships no install() rules, so the libs + headers are copied manually.
+#   - clang-18 targets up to sm_90; PTX from the highest arch JITs forward to newer
+#     GPUs (e.g. sm_120 / Blackwell) at runtime.
+RUN set -eux; \
+    apt-get update && apt-get install -y --no-install-recommends libomp-18-dev; \
+    rm -rf /var/lib/apt/lists/*; \
+    cd /tmp; \
+    git clone --depth 1 --recurse-submodules --shallow-submodules \
+      https://github.com/celerity/ndzip.git ndzip_src; \
+    cmake -S ndzip_src -B ndzip_src/build \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_C_COMPILER=clang-18 -DCMAKE_CXX_COMPILER=clang++-18 \
+      -DCMAKE_CUDA_COMPILER=clang++-18 \
+      -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHS}" \
+      -DCMAKE_CXX_FLAGS="-march=native" \
+      -DCMAKE_CUDA_FLAGS="--cuda-path=${CUDA_HOME} -Wno-unknown-cuda-version" \
+      -DNDZIP_WITH_CUDA=ON \
+      -DNDZIP_WITH_MT=OFF \
+      -DHIPSYCL_TARGETS="omp" \
+      -DNDZIP_BUILD_BENCHMARK=OFF \
+      -DNDZIP_BUILD_TEST=OFF \
+      -DCMAKE_POLICY_VERSION_MINIMUM=3.5; \
+    cmake --build ndzip_src/build -j"$(nproc)"; \
+    cp ndzip_src/build/libndzip.so ndzip_src/build/libndzip-cuda.so /usr/local/lib/; \
+    cp -r ndzip_src/include/ndzip /usr/local/include/; \
+    ldconfig; \
+    rm -rf /tmp/ndzip_src
 
 # Intel oneAPI 2024.2 (SYCL/DPC++) toolchain for the GPU compression factory's
 # SYCL backend (zfp's SYCL execution policy, mirroring how nvcomp backs the CUDA
@@ -126,10 +235,11 @@ RUN if id ubuntu >/dev/null 2>&1; then \
       groupmod -g 59999 ubuntu; \
     fi && \
     OLD_UID=$(id -u iowarp) && OLD_GID=$(id -g iowarp) && \
-    if [ "${HOST_UID}" != "${OLD_UID}" ] || [ "${HOST_GID}" != "${OLD_GID}" ]; then \
-      groupmod -o -g "${HOST_GID}" iowarp && \
-      usermod  -o -u "${HOST_UID}" -g "${HOST_GID}" iowarp && \
-      chown -R "${HOST_UID}:${HOST_GID}" /home/iowarp; \
+    NEW_UID="${HOST_UID:-1000}" && NEW_GID="${HOST_GID:-1000}" && \
+    if [ "${NEW_UID}" != "${OLD_UID}" ] || [ "${NEW_GID}" != "${OLD_GID}" ]; then \
+      groupmod -o -g "${NEW_GID}" iowarp && \
+      usermod  -o -u "${NEW_UID}" -g "${NEW_GID}" iowarp && \
+      chown -R "${NEW_UID}:${NEW_GID}" /home/iowarp; \
     fi
 
 USER iowarp

@@ -34,7 +34,7 @@ $SUDO apt-get install -y --no-install-recommends \
   uuid-dev libattr1-dev libacl1-dev libaio-dev libgdbm-dev \
   xfslibs-dev \
   autoconf automake libtool-bin pkg-config gcc g++ make gawk \
-  xfsprogs e2fsprogs attr acl quota \
+  xfsprogs e2fsprogs attr acl quota bc \
   git
 
 echo "==> [2/4] Cloning xfstests (if missing) into ${XFSTESTS_DIR}"

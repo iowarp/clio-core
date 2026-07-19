@@ -14,5 +14,8 @@ add_subdirectory(admin)
 # Add bdev module (block device operations)
 add_subdirectory(bdev)
 
+# Add safe-bdev module (declustered, erasure-coded block device)
+add_subdirectory(safe-bdev)
+
 # Additional modules can be added here as they are developed
 # add_subdirectory(other_module_name)

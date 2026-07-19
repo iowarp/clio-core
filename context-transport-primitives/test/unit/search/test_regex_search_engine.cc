@@ -32,13 +32,15 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <catch2/catch_all.hpp>
 #include <random>
 #include <regex>
 #include <string>
+#include <thread>
 #include <vector>
 
-#include "search/regex_search_engine.h"
+#include "clio_ctp/search/regex_search_engine.h"
 
 using ctp::search::RegexSearchEngine;
 
@@ -303,4 +305,92 @@ TEST_CASE("RegexSearch: consistent after delete/rename churn", "[regex_search]")
     INFO("pattern: " << pat);
     REQUIRE(SearchKeys(eng, pat) == BruteForce(final_keys, pat));
   }
+}
+
+// Concurrent Insert / Delete / Search stress test. RegexSearchEngine is
+// internally synchronized (a shared_mutex), so many threads may mutate and
+// query it simultaneously without external locking. This exercises exactly
+// that: writers hammer Insert/Delete while readers run Search in parallel.
+// Without the internal lock this races entries_/index_ and corrupts/crashes
+// (best surfaced under ThreadSanitizer, but the stress alone catches most).
+TEST_CASE("RegexSearch: parallel insert/delete/search", "[regex_search][parallel]") {
+  RegexSearchEngine<int> eng;
+
+  constexpr int kKeySpace = 400;   // distinct keys touched
+  constexpr int kIters = 4000;     // mutations per writer thread
+  constexpr int kInserters = 4;
+  constexpr int kDeleters = 4;
+  constexpr int kSearchers = 3;
+
+  // Keys live in 20 directories so the search prefilter has real work.
+  auto key = [](int i) {
+    return "/p/dir" + std::to_string(i % 20) + "/file" + std::to_string(i) +
+           ".dat";
+  };
+
+  // Seed half the space so deleters have targets from the start.
+  for (int i = 0; i < kKeySpace; i += 2) {
+    eng.Insert(key(i), i);
+  }
+
+  std::atomic<bool> stop{false};
+  std::atomic<size_t> search_count{0};
+  std::atomic<size_t> bad_match{0};  // any Search result not matching the regex
+
+  auto writer = [&](int seed, bool do_insert) {
+    std::mt19937 rng(seed);
+    std::uniform_int_distribution<int> pick(0, kKeySpace - 1);
+    for (int n = 0; n < kIters; ++n) {
+      int i = pick(rng);
+      if (do_insert) {
+        eng.Insert(key(i), i);
+      } else {
+        eng.Delete(key(i));
+      }
+    }
+  };
+
+  auto searcher = [&]() {
+    // The pattern matches every key in the space; results are a live subset.
+    const std::string pat = "^/p/dir[0-9]+/file[0-9]+\\.dat$";
+    std::regex re(pat);
+    while (!stop.load(std::memory_order_relaxed)) {
+      auto res = eng.Search(pat);
+      // keys() is a snapshot — safe to walk with no external lock. Every key
+      // it reports must genuinely match the pattern (proves Search returned a
+      // consistent, non-corrupt view even under concurrent mutation).
+      for (const auto &k : res.keys()) {
+        if (!std::regex_match(k, re)) {
+          bad_match.fetch_add(1, std::memory_order_relaxed);
+        }
+      }
+      search_count.fetch_add(1, std::memory_order_relaxed);
+    }
+  };
+
+  std::vector<std::thread> threads;
+  for (int t = 0; t < kInserters; ++t) threads.emplace_back(writer, 100 + t, true);
+  for (int t = 0; t < kDeleters; ++t) threads.emplace_back(writer, 900 + t, false);
+  for (int t = 0; t < kSearchers; ++t) threads.emplace_back(searcher);
+
+  // Join the writers first, then signal searchers to stop.
+  for (int t = 0; t < kInserters + kDeleters; ++t) threads[t].join();
+  stop.store(true, std::memory_order_relaxed);
+  for (int t = kInserters + kDeleters;
+       t < kInserters + kDeleters + kSearchers; ++t) {
+    threads[t].join();
+  }
+
+  // No search ever saw a non-matching (corrupted) key.
+  REQUIRE(bad_match.load() == 0);
+  // Searchers actually ran concurrently with the writers.
+  REQUIRE(search_count.load() > 0);
+
+  // Engine is still fully consistent after the storm: every key a final Search
+  // returns is present via Contains(), and Size() agrees with a full scan.
+  auto final_res = eng.Search("^/p/.*");
+  for (const auto &k : final_res.keys()) {
+    REQUIRE(eng.Contains(k));
+  }
+  REQUIRE(eng.Size() == final_res.keys().size());
 }

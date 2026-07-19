@@ -220,14 +220,17 @@ TEST_CASE("IpcTransportMode - IPC Client Connection",
   SubmitTasksForMode("ipc");
 }
 
-TEST_CASE("IpcTransportMode - Default Mode Is TCP",
-          "[ipc_transport][default]") {
-  // Start the runtime daemon out-of-process
+TEST_CASE("IpcTransportMode - Default Auto-Selects SHM When Local",
+          "[ipc_transport][default][autoselect]") {
+  // With CLIO_IPC_MODE unset and a same-host runtime up, ClientInit auto-
+  // selects the fastest available path. The server unconditionally creates its
+  // main SHM segment, so the probe finds it and picks SHM -- ~190x faster than
+  // the old TCP default (issue #768). An explicit CLIO_IPC_MODE still forces
+  // its exact mode; those cases are covered by the SHM/TCP/IPC tests above.
   clio::run::test::RuntimeServer server;
   REQUIRE(server.Start());
   REQUIRE(server.WaitForReady());
 
-  // Unset CLIO_IPC_MODE to test default behavior
   clio::run::test::UnsetEnvVar("CLIO_IPC_MODE");
   clio::run::test::SetEnvVar("CLIO_WITH_RUNTIME", "0");
   bool success = CLIO_INIT(RuntimeMode::kClient, false);
@@ -236,7 +239,8 @@ TEST_CASE("IpcTransportMode - Default Mode Is TCP",
   auto *ipc = CLIO_IPC;
   REQUIRE(ipc != nullptr);
   REQUIRE(ipc->IsInitialized());
-  REQUIRE(ipc->GetIpcMode() == IpcMode::kTcp);
+  // Same-host server present -> SHM is available and preferred.
+  REQUIRE(ipc->GetIpcMode() == IpcMode::kShm);
 }
 
 SIMPLE_TEST_MAIN()

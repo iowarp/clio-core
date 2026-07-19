@@ -1,0 +1,34 @@
+# Clio config for the collective-restart reproducer (issue #628).
+# 4-node cluster. SWIM failure detection is deliberately SLOW so that a fast
+# `docker restart` of a participant brings it back BEFORE it is ever declared
+# dead. This isolates the "live node, dropped task" case: the origin gets no
+# dead-node signal, so completion must come from the periodic task-validity
+# check (QueryTaskProgress), not from dead-node timeouts.
+
+networking:
+  port: 9428
+  neighborhood_size: 4
+  hostfile: "/workspace/context-runtime/test/integration/collective_restart/hostfile"
+
+logging:
+  level: "info"
+  file: "/tmp/clio.log"
+
+runtime:
+  num_threads: 8
+  queue_depth: 1024
+  local_sched: "default"
+  first_busy_wait: 50
+  # How long an outstanding cross-node task may sit quietly before the origin
+  # runs a QueryTaskProgress validity check on it (then re-checks each interval).
+  # This is the anti-hang mechanism that works even with ttl = infinity.
+  # Overridable via env CLIO_TASK_PROGRESS_INTERVAL_MS.
+  task_progress_interval_ms: 3000
+
+# SWIM intentionally slow: a `docker restart` (a few seconds) completes well
+# inside the suspicion window, so the node is never marked dead during the test.
+swim:
+  enabled: true
+  direct_probe_timeout_sec: 30.0
+  indirect_probe_timeout_sec: 30.0
+  suspicion_timeout_sec: 120.0

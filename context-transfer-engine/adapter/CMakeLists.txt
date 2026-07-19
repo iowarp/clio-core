@@ -56,6 +56,11 @@ if (CLIO_CORE_ENABLE_CUDA OR CLIO_CORE_ENABLE_ROCM)
     add_subdirectory(gpu_vector)
 endif()
 
+# kvhdf5 adapter (CUDA only; HDF5-like producer surface over the CTE KV store)
+if (CLIO_CORE_ENABLE_CUDA)
+    add_subdirectory(kvhdf5)
+endif()
+
 #-----------------------------------------------------------------------------
 # Install adapter headers
 #-----------------------------------------------------------------------------

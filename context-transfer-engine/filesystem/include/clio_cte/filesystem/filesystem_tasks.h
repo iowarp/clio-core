@@ -243,23 +243,35 @@ struct GetattrTask : public clio::run::Task {
   OUT clio::run::u64 size_;
   OUT clio::run::u64 ino_;     // stable inode = packed TagId (0 when nonexistent)
   OUT clio::run::u64 ctime_;   // tag change-time (ns); 0 if unknown
+  OUT clio::run::u64 mtime_;   // tag modify-time (ns); 0 if unknown
+  OUT clio::run::u64 atime_;   // tag access-time (ns); 0 if unknown
+  OUT clio::run::u32 is_symlink_;  // 1 if the entry is a symlink (S_IFLNK)
+  OUT clio::run::u32 uid_;  // chown'd owner uid; 0xFFFFFFFF = defer to default
+  OUT clio::run::u32 gid_;  // chown'd owner gid; 0xFFFFFFFF = defer to default
+  OUT clio::run::u32 mode_;  // chmod'd/created mode bits; 0xFFFFFFFF = default
   GetattrTask()
       : clio::run::Task(), path_(CTP_MALLOC), exists_(0), is_dir_(0), size_(0),
-        ino_(0), ctime_(0) {}
+        ino_(0), ctime_(0), mtime_(0), atime_(0), is_symlink_(0),
+        uid_(0xFFFFFFFFu), gid_(0xFFFFFFFFu), mode_(0xFFFFFFFFu) {}
   explicit GetattrTask(const clio::run::TaskId &task_id, const clio::run::PoolId &pool_id,
                        const clio::run::PoolQuery &pool_query, const std::string &path)
       : clio::run::Task(task_id, pool_id, pool_query, Method::kGetattr),
         path_(CTP_MALLOC, path), exists_(0), is_dir_(0), size_(0), ino_(0),
-        ctime_(0) {}
+        ctime_(0), mtime_(0), atime_(0), is_symlink_(0),
+        uid_(0xFFFFFFFFu), gid_(0xFFFFFFFFu), mode_(0xFFFFFFFFu) {}
   void Copy(const ctp::ipc::FullPtr<GetattrTask>& o) {
     path_ = o->path_; exists_ = o->exists_; is_dir_ = o->is_dir_;
     size_ = o->size_; ino_ = o->ino_; ctime_ = o->ctime_;
+    mtime_ = o->mtime_; atime_ = o->atime_; is_symlink_ = o->is_symlink_;
+    uid_ = o->uid_; gid_ = o->gid_; mode_ = o->mode_;
   }
   template <typename Ar> void SerializeIn(Ar &ar) {
     Task::SerializeIn(ar); ar(path_);
   }
   template <typename Ar> void SerializeOut(Ar &ar) {
-    Task::SerializeOut(ar); ar(exists_, is_dir_, size_, ino_, ctime_);
+    Task::SerializeOut(ar);
+    ar(exists_, is_dir_, size_, ino_, ctime_, mtime_, atime_, is_symlink_,
+       uid_, gid_, mode_);
   }
 };
 
@@ -278,6 +290,62 @@ struct TruncateTask : public clio::run::Task {
   }
   template <typename Ar> void SerializeIn(Ar &ar) {
     Task::SerializeIn(ar); ar(path_, new_size_);
+  }
+  template <typename Ar> void SerializeOut(Ar &ar) { Task::SerializeOut(ar); }
+};
+
+/** Utimens: set a file's atime/mtime (ns). flags bit0=set atime, bit1=set
+ *  mtime; a cleared bit means UTIME_OMIT (leave that stamp). ctime always
+ *  bumps. UTIME_NOW is resolved to a concrete ns value by the adapter. */
+struct UtimensTask : public clio::run::Task {
+  IN clio::run::priv::string path_;
+  IN clio::run::u64 atime_ns_;
+  IN clio::run::u64 mtime_ns_;
+  IN clio::run::u32 flags_;  // bit0: set atime, bit1: set mtime
+  UtimensTask()
+      : clio::run::Task(), path_(CTP_MALLOC), atime_ns_(0), mtime_ns_(0),
+        flags_(0) {}
+  explicit UtimensTask(const clio::run::TaskId &task_id, const clio::run::PoolId &pool_id,
+                       const clio::run::PoolQuery &pool_query, const std::string &path,
+                       clio::run::u64 atime_ns, clio::run::u64 mtime_ns,
+                       clio::run::u32 flags)
+      : clio::run::Task(task_id, pool_id, pool_query, Method::kUtimens),
+        path_(CTP_MALLOC, path), atime_ns_(atime_ns), mtime_ns_(mtime_ns),
+        flags_(flags) {}
+  void Copy(const ctp::ipc::FullPtr<UtimensTask>& o) {
+    path_ = o->path_; atime_ns_ = o->atime_ns_; mtime_ns_ = o->mtime_ns_;
+    flags_ = o->flags_;
+  }
+  template <typename Ar> void SerializeIn(Ar &ar) {
+    Task::SerializeIn(ar); ar(path_, atime_ns_, mtime_ns_, flags_);
+  }
+  template <typename Ar> void SerializeOut(Ar &ar) { Task::SerializeOut(ar); }
+};
+
+/**
+ * Chown: set the owner uid/gid of the file at `path_`. A field equal to
+ * 0xFFFFFFFF (the POSIX uid_t/gid_t == (uid_t)-1 convention) means "leave this
+ * field unchanged". The override is stored per-file and surfaced by getattr.
+ */
+struct ChownTask : public clio::run::Task {
+  IN clio::run::priv::string path_;
+  IN clio::run::u32 uid_;  // new uid, or 0xFFFFFFFF to leave unchanged
+  IN clio::run::u32 gid_;  // new gid, or 0xFFFFFFFF to leave unchanged
+  IN clio::run::u32 mode_;  // new mode bits, or 0xFFFFFFFF to leave unchanged
+  ChownTask()
+      : clio::run::Task(), path_(CTP_MALLOC), uid_(0xFFFFFFFFu),
+        gid_(0xFFFFFFFFu), mode_(0xFFFFFFFFu) {}
+  explicit ChownTask(const clio::run::TaskId &task_id, const clio::run::PoolId &pool_id,
+                     const clio::run::PoolQuery &pool_query, const std::string &path,
+                     clio::run::u32 uid, clio::run::u32 gid,
+                     clio::run::u32 mode = 0xFFFFFFFFu)
+      : clio::run::Task(task_id, pool_id, pool_query, Method::kChown),
+        path_(CTP_MALLOC, path), uid_(uid), gid_(gid), mode_(mode) {}
+  void Copy(const ctp::ipc::FullPtr<ChownTask>& o) {
+    path_ = o->path_; uid_ = o->uid_; gid_ = o->gid_; mode_ = o->mode_;
+  }
+  template <typename Ar> void SerializeIn(Ar &ar) {
+    Task::SerializeIn(ar); ar(path_, uid_, gid_, mode_);
   }
   template <typename Ar> void SerializeOut(Ar &ar) { Task::SerializeOut(ar); }
 };
@@ -341,6 +409,161 @@ struct LinkTask : public clio::run::Task {
   }
   template <typename Ar> void SerializeIn(Ar &ar) {
     Task::SerializeIn(ar); ar(target_, link_);
+  }
+  template <typename Ar> void SerializeOut(Ar &ar) { Task::SerializeOut(ar); }
+};
+
+/**
+ * Symlink: create a symbolic link at `path_` whose target string is `target_`.
+ * The symlink is a CTE tag at `path_` carrying a reserved marker blob that
+ * stores the target bytes. Returns errno-style codes (0 / EEXIST / EIO).
+ */
+struct SymlinkTask : public clio::run::Task {
+  IN clio::run::priv::string target_;  // link target string (contents)
+  IN clio::run::priv::string path_;    // path of the new symlink
+  SymlinkTask() : clio::run::Task(), target_(CTP_MALLOC), path_(CTP_MALLOC) {}
+  explicit SymlinkTask(const clio::run::TaskId &task_id, const clio::run::PoolId &pool_id,
+                       const clio::run::PoolQuery &pool_query,
+                       const std::string &target, const std::string &path)
+      : clio::run::Task(task_id, pool_id, pool_query, Method::kSymlink),
+        target_(CTP_MALLOC, target), path_(CTP_MALLOC, path) {}
+  void Copy(const ctp::ipc::FullPtr<SymlinkTask>& o) {
+    target_ = o->target_; path_ = o->path_;
+  }
+  template <typename Ar> void SerializeIn(Ar &ar) {
+    Task::SerializeIn(ar); ar(target_, path_);
+  }
+  template <typename Ar> void SerializeOut(Ar &ar) { Task::SerializeOut(ar); }
+};
+
+/**
+ * Readlink: read the target string of the symlink at `path_`. Returns the
+ * bytes in `target_`; errno-style codes (0 / ENOENT / EINVAL) in return_code_.
+ */
+struct ReadlinkTask : public clio::run::Task {
+  IN clio::run::priv::string path_;    // path of the symlink
+  OUT clio::run::priv::string target_;  // resolved target string
+  ReadlinkTask() : clio::run::Task(), path_(CTP_MALLOC), target_(CTP_MALLOC) {}
+  explicit ReadlinkTask(const clio::run::TaskId &task_id, const clio::run::PoolId &pool_id,
+                        const clio::run::PoolQuery &pool_query, const std::string &path)
+      : clio::run::Task(task_id, pool_id, pool_query, Method::kReadlink),
+        path_(CTP_MALLOC, path), target_(CTP_MALLOC) {}
+  void Copy(const ctp::ipc::FullPtr<ReadlinkTask>& o) {
+    path_ = o->path_; target_ = o->target_;
+  }
+  template <typename Ar> void SerializeIn(Ar &ar) {
+    Task::SerializeIn(ar); ar(path_);
+  }
+  template <typename Ar> void SerializeOut(Ar &ar) {
+    Task::SerializeOut(ar); ar(target_);
+  }
+};
+
+/**
+ * Setxattr: set extended attribute `name_` to `value_` on the file at `path_`.
+ * `value_` may contain NUL bytes (raw byte string). `flags_` carries
+ * XATTR_CREATE (1) / XATTR_REPLACE (2) semantics. Returns errno-style codes
+ * (0 / EEXIST / ENODATA / ENOENT / EIO) in return_code_.
+ */
+struct SetxattrTask : public clio::run::Task {
+  IN clio::run::priv::string path_;   // file path
+  IN clio::run::priv::string name_;   // attribute name
+  IN clio::run::priv::string value_;  // attribute value bytes (may hold NULs)
+  IN clio::run::u32 flags_;           // XATTR_CREATE=1 / XATTR_REPLACE=2
+  SetxattrTask()
+      : clio::run::Task(), path_(CTP_MALLOC), name_(CTP_MALLOC),
+        value_(CTP_MALLOC), flags_(0) {}
+  explicit SetxattrTask(const clio::run::TaskId &task_id, const clio::run::PoolId &pool_id,
+                        const clio::run::PoolQuery &pool_query,
+                        const std::string &path, const std::string &name,
+                        const std::string &value, clio::run::u32 flags)
+      : clio::run::Task(task_id, pool_id, pool_query, Method::kSetxattr),
+        path_(CTP_MALLOC, path), name_(CTP_MALLOC, name),
+        value_(CTP_MALLOC, value), flags_(flags) {}
+  void Copy(const ctp::ipc::FullPtr<SetxattrTask>& o) {
+    path_ = o->path_; name_ = o->name_; value_ = o->value_; flags_ = o->flags_;
+  }
+  template <typename Ar> void SerializeIn(Ar &ar) {
+    Task::SerializeIn(ar); ar(path_, name_, value_, flags_);
+  }
+  template <typename Ar> void SerializeOut(Ar &ar) { Task::SerializeOut(ar); }
+};
+
+/**
+ * Getxattr: read extended attribute `name_` of the file at `path_`. On success
+ * `found_`=1 and `value_` holds the raw bytes; `found_`=0 means the attribute
+ * is absent (adapter maps to -ENODATA). return_code_ is errno-style (0 /
+ * ENOENT).
+ */
+struct GetxattrTask : public clio::run::Task {
+  IN clio::run::priv::string path_;   // file path
+  IN clio::run::priv::string name_;   // attribute name
+  OUT clio::run::priv::string value_;  // attribute value bytes (may hold NULs)
+  OUT clio::run::u32 found_;           // 1 if the attribute exists
+  GetxattrTask()
+      : clio::run::Task(), path_(CTP_MALLOC), name_(CTP_MALLOC),
+        value_(CTP_MALLOC), found_(0) {}
+  explicit GetxattrTask(const clio::run::TaskId &task_id, const clio::run::PoolId &pool_id,
+                        const clio::run::PoolQuery &pool_query,
+                        const std::string &path, const std::string &name)
+      : clio::run::Task(task_id, pool_id, pool_query, Method::kGetxattr),
+        path_(CTP_MALLOC, path), name_(CTP_MALLOC, name), value_(CTP_MALLOC),
+        found_(0) {}
+  void Copy(const ctp::ipc::FullPtr<GetxattrTask>& o) {
+    path_ = o->path_; name_ = o->name_; value_ = o->value_; found_ = o->found_;
+  }
+  template <typename Ar> void SerializeIn(Ar &ar) {
+    Task::SerializeIn(ar); ar(path_, name_);
+  }
+  template <typename Ar> void SerializeOut(Ar &ar) {
+    Task::SerializeOut(ar); ar(value_, found_);
+  }
+};
+
+/**
+ * Listxattr: list all extended attribute names of the file at `path_`. `names_`
+ * is the NUL-separated concatenation of names, each NUL-terminated (the POSIX
+ * listxattr wire format). return_code_ is errno-style (0 / ENOENT).
+ */
+struct ListxattrTask : public clio::run::Task {
+  IN clio::run::priv::string path_;   // file path
+  OUT clio::run::priv::string names_;  // NUL-terminated name list
+  ListxattrTask() : clio::run::Task(), path_(CTP_MALLOC), names_(CTP_MALLOC) {}
+  explicit ListxattrTask(const clio::run::TaskId &task_id, const clio::run::PoolId &pool_id,
+                         const clio::run::PoolQuery &pool_query,
+                         const std::string &path)
+      : clio::run::Task(task_id, pool_id, pool_query, Method::kListxattr),
+        path_(CTP_MALLOC, path), names_(CTP_MALLOC) {}
+  void Copy(const ctp::ipc::FullPtr<ListxattrTask>& o) {
+    path_ = o->path_; names_ = o->names_;
+  }
+  template <typename Ar> void SerializeIn(Ar &ar) {
+    Task::SerializeIn(ar); ar(path_);
+  }
+  template <typename Ar> void SerializeOut(Ar &ar) {
+    Task::SerializeOut(ar); ar(names_);
+  }
+};
+
+/**
+ * Removexattr: remove extended attribute `name_` from the file at `path_`.
+ * Returns errno-style codes (0 / ENODATA / ENOENT / EIO) in return_code_.
+ */
+struct RemovexattrTask : public clio::run::Task {
+  IN clio::run::priv::string path_;   // file path
+  IN clio::run::priv::string name_;   // attribute name
+  RemovexattrTask()
+      : clio::run::Task(), path_(CTP_MALLOC), name_(CTP_MALLOC) {}
+  explicit RemovexattrTask(const clio::run::TaskId &task_id, const clio::run::PoolId &pool_id,
+                           const clio::run::PoolQuery &pool_query,
+                           const std::string &path, const std::string &name)
+      : clio::run::Task(task_id, pool_id, pool_query, Method::kRemovexattr),
+        path_(CTP_MALLOC, path), name_(CTP_MALLOC, name) {}
+  void Copy(const ctp::ipc::FullPtr<RemovexattrTask>& o) {
+    path_ = o->path_; name_ = o->name_;
+  }
+  template <typename Ar> void SerializeIn(Ar &ar) {
+    Task::SerializeIn(ar); ar(path_, name_);
   }
   template <typename Ar> void SerializeOut(Ar &ar) { Task::SerializeOut(ar); }
 };

@@ -1,0 +1,109 @@
+# Client-crash integration test (issues #722 + "client dies mid-op").
+#
+# Topology: ONE daemon container hosting a ram-backed CTE core pool, and ONE
+# driver container that acts as an EXTERNAL client. Because the two live in
+# separate containers they do not share /dev/shm, so the client is forced onto
+# the TCP network path (a co-located client would use shared memory and never
+# exercise the daemon's client-response network path).
+#
+# The driver runs two phases against the daemon:
+#   Phase 1 (crash):  fire a burst of AsyncPutBlobs, then terminate immediately
+#                     WITHOUT waiting — the daemon's responses become
+#                     undeliverable. The runtime must neither wedge nor spin
+#                     re-queueing the undeliverable response forever (#722).
+#   Phase 2 (verify): reconnect and do successful PutBlobs — proving the daemon
+#                     survived the crash and is still responsive.
+#
+# run_tests.sh waits on the driver, then additionally asserts the daemon is
+# still running and its log shows no runaway re-queue.
+#
+# Client addressing note: an external client sets CLIO_SERVER_ADDR to the
+# daemon's IP (the DEALER connect target) and CLIO_BIND_ADDR to its OWN IP (its
+# response-listener bind + dial-back address). Co-located clients share one
+# address; cross-container clients must split them.
+
+services:
+  cc-daemon:
+    image: ${IOWARP_DOCKER_IMAGE:-iowarp/deps-cpu:latest}
+    security_opt:
+      - seccomp:unconfined
+    container_name: cc-crash-daemon
+    hostname: iowarp-node1
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    networks:
+      cc-cluster:
+        ipv4_address: 172.30.0.10
+    volumes:
+      - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-/workspace}}:/workspace:rw
+    tmpfs:
+      - /mnt:mode=1777
+    environment:
+      - CLIO_SERVER_CONF=/workspace/context-transfer-engine/test/integration/client_crash/clio_config.yaml
+      - CLIO_BIND_ADDR=172.30.0.10
+      - CLIO_PORT=8080
+      - CTP_LOG_LEVEL=info
+      - CLIO_REPO_PATH=/workspace/build/bin
+      - PATH=/workspace/build/bin:/usr/local/bin:/usr/bin:/bin
+      - LD_LIBRARY_PATH=/workspace/build/bin:/usr/local/cuda/lib64:/usr/local/lib
+    mem_limit: 8g
+    working_dir: /workspace
+    entrypoint: ["/bin/bash", "-c"]
+    command: >
+      "
+        mkdir -p /mnt/cte_ram &&
+        echo 'cc-daemon: starting clio_run runtime' &&
+        exec /workspace/build/bin/clio_run runtime start
+      "
+
+  cc-driver:
+    image: ${IOWARP_DOCKER_IMAGE:-iowarp/deps-cpu:latest}
+    security_opt:
+      - seccomp:unconfined
+    container_name: cc-crash-driver
+    hostname: iowarp-client
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    depends_on:
+      - cc-daemon
+    networks:
+      cc-cluster:
+        ipv4_address: 172.30.0.11
+    volumes:
+      - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-/workspace}}:/workspace:rw
+    environment:
+      - CLIO_WITH_RUNTIME=0
+      - CLIO_IPC_MODE=tcp
+      - CLIO_SERVER_ADDR=172.30.0.10
+      - CLIO_BIND_ADDR=172.30.0.11
+      - CLIO_PORT=8080
+      - CLIO_SERVER_CONF=/workspace/context-transfer-engine/test/integration/client_crash/clio_config.yaml
+      - CLIO_WAIT_SERVER=40
+      - CTP_LOG_LEVEL=info
+      - CLIO_REPO_PATH=/workspace/build/bin
+      - PATH=/workspace/build/bin:/usr/local/bin:/usr/bin:/bin
+      - LD_LIBRARY_PATH=/workspace/build/bin:/usr/local/cuda/lib64:/usr/local/lib
+    mem_limit: 8g
+    working_dir: /workspace
+    entrypoint: ["/bin/bash", "-c"]
+    command: >
+      "
+        BIN=/workspace/build/bin/clio_run_client_crash_putblob_test &&
+        echo 'cc-driver: waiting for daemon to be reachable' &&
+        sleep 6 &&
+        echo '===== PHASE 1: crash client (fire PutBlobs, then terminate) =====' &&
+        CRASH_BURST=800 CRASH_BLOB_KB=64 CRASH_FLUSH_MS=100 timeout 90 $$BIN crash-client ;
+        echo \"crash phase exit=$$?\" &&
+        echo 'cc-driver: waiting past the undeliverable-response drop window' &&
+        sleep 12 &&
+        echo '===== PHASE 2: verify daemon is still responsive =====' &&
+        CRASH_NOCRASH=1 CRASH_BURST=20 CRASH_BLOB_KB=64 timeout 90 $$BIN crash-client ;
+        VERIFY_RC=$$? ;
+        echo \"VERIFY_RC=$$VERIFY_RC\" ;
+        exit $$VERIFY_RC
+      "
+
+networks:
+  cc-cluster:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24

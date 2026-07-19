@@ -31,7 +31,7 @@ Now we must tell the HDF5 library where to find the Clio VFD. That is done
 with the following environment variable:
 
 ```sh
-HDF5_PLUGIN_PATH=<HRUN_INSTALL_prefix>/lib/hermes_vfd
+HDF5_PLUGIN_PATH=<HRUN_INSTALL_prefix>/lib/clio_vfd
 ```
 
 The Clio VFD has two configuration options.
@@ -64,31 +64,31 @@ Finally we need to provide a configuration file for Clio itself, and
 initialization and finalization:
 
 ```sh
-HERMES_CONF=<path_to>/clio.yaml
-LD_PRELOAD=<HRUN_INSTALL_prefix>/hermes_vfd/libhdf5_hermes_vfd.so
+CLIO_CONF=<path_to>/clio.yaml
+LD_PRELOAD=<HRUN_INSTALL_prefix>/clio_vfd/libclio_vfd.so
 ```
 
 Heres is a full example of running an HDF5 app with the Clio VFD:
 
 ```sh
 HDF5_DRIVER=clio                                                    \
-  HDF5_PLUGIN_PATH=<HRUN_INSTALL_prefix/lib/hermes_vfd              \
+  HDF5_PLUGIN_PATH=<HRUN_INSTALL_prefix/lib/clio_vfd              \
   HDF5_DRIVER_CONFIG="true 65536"                                     \
-  HERMES_CONF=<path_to>/clio.yaml                                   \
+  CLIO_CONF=<path_to>/clio.yaml                                   \
   ./my_hdf5_app
 ```
 
 ### Method 2: Linked into application
 
 To link the Clio VFD into an HDF5 application, the application should include
-the `H5FDhermes.h` header and should link the installed VFD library,
-`libhdf5_hermes_vfd.so`, into the application. Once this has been done, Clio
-VFD access can be set up by calling `H5Pset_fapl_hermes()` on a FAPL within the
+the `H5FDclio.h` header and should link the installed VFD library,
+`libclio_vfd.so`, into the application. Once this has been done, Clio
+VFD access can be set up by calling `H5Pset_fapl_clio()` on a FAPL within the
 HDF5 application. In this case, the `persistence` and `page_size` configuration
 options are pass directly to this function:
 
 ```C
-herr_t H5Pset_fapl_hermes(hid_t fapl_id, hbool_t persistence, size_t page_size)
+herr_t H5Pset_fapl_clio(hid_t fapl_id, hbool_t persistence, size_t page_size)
 ```
 
 The resulting `fapl_id` should then be passed to each file open or creation for
@@ -97,5 +97,5 @@ which you wish to use the Clio VFD.
 ## 4. More Information
 * [Clio VFD performance results](https://github.com/HDFGroup/clio/wiki/HDF5-Clio-VFD)
 
-* [Clio VFD with hdf5-iotest](https://github.com/HDFGroup/clio/tree/master/benchmarks/HermesVFD)
+* [Clio VFD with hdf5-iotest](https://github.com/HDFGroup/clio/tree/master/benchmarks/ClioVFD)
 * [HDF5 VFD Plugins RFC](https://github.com/HDFGroup/hdf5doc/blob/master/RFCs/HDF5_Library/VFL_DriverPlugins/RFC__A_Plugin_Interface_for_HDF5_Virtual_File_Drivers.pdf)

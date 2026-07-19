@@ -82,6 +82,21 @@ if(BUILD_TESTING)
         DEPENDS clio_cte_core_ext
     )
 
+    # Runtime-free coverage of the CTE binding value types (UniqueId,
+    # PoolQuery, search-result repr, CteTelemetry, enums). No runtime needed.
+    add_test(
+        NAME python_types_test
+        COMMAND ${Python_EXECUTABLE} -I ${CMAKE_CURRENT_SOURCE_DIR}/test_cte_types.py
+        WORKING_DIRECTORY $<TARGET_FILE_DIR:clio_cte_core_ext>
+    )
+    set_tests_properties(
+        python_types_test
+        PROPERTIES
+        LABELS "python;bindings"
+        TIMEOUT 60
+        DEPENDS clio_cte_core_ext
+    )
+
     # PollTelemetryLog focused test (requires runtime initialization).
     # Requires CLIO_WITH_RUNTIME=1 and CLIO_SERVER_CONF set.
     # NOTE: test reads the CLIO_-prefixed names verbatim (not GetCompat),

@@ -31,63 +31,63 @@ void Runtime::Init(const clio::run::PoolId &pool_id, const std::string &pool_nam
   SetMethodNames(Method::GetMethodNames());
 }
 
-clio::run::TaskResume Runtime::Run(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> task_ptr, clio::run::RunContext& rctx) {
+clio::run::TaskResume Runtime::Run(clio::run::u32 method, clio::run::shared_ptr<clio::run::Task> task_ptr) {
   CLIO_TASK_BODY_BEGIN
   switch (method) {
     case Method::kCreate: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<CreateTask> typed_task = task_ptr.template Cast<CreateTask>();
-      CLIO_CO_AWAIT(Create(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<CreateTask>();
+      CLIO_CO_AWAIT(Create(typed_task));
       break;
     }
     case Method::kDestroy: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<DestroyTask> typed_task = task_ptr.template Cast<DestroyTask>();
-      CLIO_CO_AWAIT(Destroy(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<DestroyTask>();
+      CLIO_CO_AWAIT(Destroy(typed_task));
       break;
     }
     case Method::kMonitor: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<MonitorTask> typed_task = task_ptr.template Cast<MonitorTask>();
-      CLIO_CO_AWAIT(Monitor(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<MonitorTask>();
+      CLIO_CO_AWAIT(Monitor(typed_task));
       break;
     }
     case Method::kParseOmni: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<ParseOmniTask> typed_task = task_ptr.template Cast<ParseOmniTask>();
-      CLIO_CO_AWAIT(ParseOmni(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<ParseOmniTask>();
+      CLIO_CO_AWAIT(ParseOmni(typed_task));
       break;
     }
     case Method::kProcessHdf5Dataset: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<ProcessHdf5DatasetTask> typed_task = task_ptr.template Cast<ProcessHdf5DatasetTask>();
-      CLIO_CO_AWAIT(ProcessHdf5Dataset(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<ProcessHdf5DatasetTask>();
+      CLIO_CO_AWAIT(ProcessHdf5Dataset(typed_task));
       break;
     }
     case Method::kExportData: {
       // Cast task FullPtr to specific type
-      ctp::ipc::FullPtr<ExportDataTask> typed_task = task_ptr.template Cast<ExportDataTask>();
-      CLIO_CO_AWAIT(ExportData(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<ExportDataTask>();
+      CLIO_CO_AWAIT(ExportData(typed_task));
       break;
     }
     case Method::kPutBlob: {
-      ctp::ipc::FullPtr<PutBlobTask> typed_task = task_ptr.template Cast<PutBlobTask>();
-      CLIO_CO_AWAIT(PutBlob(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<PutBlobTask>();
+      CLIO_CO_AWAIT(PutBlob(typed_task));
       break;
     }
     case Method::kGetBlob: {
-      ctp::ipc::FullPtr<GetBlobTask> typed_task = task_ptr.template Cast<GetBlobTask>();
-      CLIO_CO_AWAIT(GetBlob(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<GetBlobTask>();
+      CLIO_CO_AWAIT(GetBlob(typed_task));
       break;
     }
     case Method::kGetOrCreateTag: {
-      ctp::ipc::FullPtr<GetOrCreateTagTask> typed_task = task_ptr.template Cast<GetOrCreateTagTask>();
-      CLIO_CO_AWAIT(GetOrCreateTag(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<GetOrCreateTagTask>();
+      CLIO_CO_AWAIT(GetOrCreateTag(typed_task));
       break;
     }
     case Method::kSemanticSearch: {
-      ctp::ipc::FullPtr<SemanticSearchTask> typed_task = task_ptr.template Cast<SemanticSearchTask>();
-      CLIO_CO_AWAIT(SemanticSearch(typed_task, rctx));
+      auto& typed_task = task_ptr.template Cast<SemanticSearchTask>();
+      CLIO_CO_AWAIT(SemanticSearch(typed_task));
       break;
     }
     default: {
@@ -100,56 +100,56 @@ clio::run::TaskResume Runtime::Run(clio::run::u32 method, ctp::ipc::FullPtr<clio
 }
 
 void Runtime::SaveTask(clio::run::u32 method, clio::run::SaveTaskArchive& archive, 
-                        ctp::ipc::FullPtr<clio::run::Task> task_ptr) {
+                        clio::run::shared_ptr<clio::run::Task>& task_ptr) {
   switch (method) {
     case Method::kCreate: {
-      auto typed_task = task_ptr.template Cast<CreateTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<CreateTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kDestroy: {
-      auto typed_task = task_ptr.template Cast<DestroyTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<DestroyTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kMonitor: {
-      auto typed_task = task_ptr.template Cast<MonitorTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<MonitorTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kParseOmni: {
-      auto typed_task = task_ptr.template Cast<ParseOmniTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<ParseOmniTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kProcessHdf5Dataset: {
-      auto typed_task = task_ptr.template Cast<ProcessHdf5DatasetTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<ProcessHdf5DatasetTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kExportData: {
-      auto typed_task = task_ptr.template Cast<ExportDataTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<ExportDataTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kPutBlob: {
-      auto typed_task = task_ptr.template Cast<PutBlobTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<PutBlobTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kGetBlob: {
-      auto typed_task = task_ptr.template Cast<GetBlobTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<GetBlobTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kGetOrCreateTag: {
-      auto typed_task = task_ptr.template Cast<GetOrCreateTagTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<GetOrCreateTagTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kSemanticSearch: {
-      auto typed_task = task_ptr.template Cast<SemanticSearchTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<SemanticSearchTask>();
+      archive << *typed_task;
       break;
     }
     default: {
@@ -160,56 +160,56 @@ void Runtime::SaveTask(clio::run::u32 method, clio::run::SaveTaskArchive& archiv
 }
 
 void Runtime::LoadTask(clio::run::u32 method, clio::run::LoadTaskArchive& archive,
-                        ctp::ipc::FullPtr<clio::run::Task> task_ptr) {
+                        clio::run::shared_ptr<clio::run::Task>& task_ptr) {
   switch (method) {
     case Method::kCreate: {
-      auto typed_task = task_ptr.template Cast<CreateTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<CreateTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kDestroy: {
-      auto typed_task = task_ptr.template Cast<DestroyTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<DestroyTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kMonitor: {
-      auto typed_task = task_ptr.template Cast<MonitorTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<MonitorTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kParseOmni: {
-      auto typed_task = task_ptr.template Cast<ParseOmniTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<ParseOmniTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kProcessHdf5Dataset: {
-      auto typed_task = task_ptr.template Cast<ProcessHdf5DatasetTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<ProcessHdf5DatasetTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kExportData: {
-      auto typed_task = task_ptr.template Cast<ExportDataTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<ExportDataTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kPutBlob: {
-      auto typed_task = task_ptr.template Cast<PutBlobTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<PutBlobTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kGetBlob: {
-      auto typed_task = task_ptr.template Cast<GetBlobTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<GetBlobTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kGetOrCreateTag: {
-      auto typed_task = task_ptr.template Cast<GetOrCreateTagTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<GetOrCreateTagTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kSemanticSearch: {
-      auto typed_task = task_ptr.template Cast<SemanticSearchTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<SemanticSearchTask>();
+      archive >> *typed_task;
       break;
     }
     default: {
@@ -219,8 +219,8 @@ void Runtime::LoadTask(clio::run::u32 method, clio::run::LoadTaskArchive& archiv
   }
 }
 
-ctp::ipc::FullPtr<clio::run::Task> Runtime::AllocLoadTask(clio::run::u32 method, clio::run::LoadTaskArchive& archive) {
-  ctp::ipc::FullPtr<clio::run::Task> task_ptr = NewTask(method);
+clio::run::shared_ptr<clio::run::Task> Runtime::AllocLoadTask(clio::run::u32 method, clio::run::LoadTaskArchive& archive) {
+  clio::run::shared_ptr<clio::run::Task> task_ptr = NewTask(method);
   if (!task_ptr.IsNull()) {
     LoadTask(method, archive, task_ptr);
   }
@@ -228,62 +228,62 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::AllocLoadTask(clio::run::u32 method,
 }
 
 void Runtime::LocalLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive& archive,
-                            ctp::ipc::FullPtr<clio::run::Task> task_ptr) {
+                            clio::run::shared_ptr<clio::run::Task>& task_ptr) {
   switch (method) {
     case Method::kCreate: {
-      auto typed_task = task_ptr.template Cast<CreateTask>();
+      auto& typed_task = task_ptr.template Cast<CreateTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kDestroy: {
-      auto typed_task = task_ptr.template Cast<DestroyTask>();
+      auto& typed_task = task_ptr.template Cast<DestroyTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kMonitor: {
-      auto typed_task = task_ptr.template Cast<MonitorTask>();
+      auto& typed_task = task_ptr.template Cast<MonitorTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kParseOmni: {
-      auto typed_task = task_ptr.template Cast<ParseOmniTask>();
+      auto& typed_task = task_ptr.template Cast<ParseOmniTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kProcessHdf5Dataset: {
-      auto typed_task = task_ptr.template Cast<ProcessHdf5DatasetTask>();
+      auto& typed_task = task_ptr.template Cast<ProcessHdf5DatasetTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kExportData: {
-      auto typed_task = task_ptr.template Cast<ExportDataTask>();
+      auto& typed_task = task_ptr.template Cast<ExportDataTask>();
       // Use archive operator which respects msg_type
-      archive >> *typed_task.ptr_;
+      archive >> *typed_task;
       break;
     }
     case Method::kPutBlob: {
-      auto typed_task = task_ptr.template Cast<PutBlobTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<PutBlobTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kGetBlob: {
-      auto typed_task = task_ptr.template Cast<GetBlobTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<GetBlobTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kGetOrCreateTag: {
-      auto typed_task = task_ptr.template Cast<GetOrCreateTagTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<GetOrCreateTagTask>();
+      archive >> *typed_task;
       break;
     }
     case Method::kSemanticSearch: {
-      auto typed_task = task_ptr.template Cast<SemanticSearchTask>();
-      archive >> *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<SemanticSearchTask>();
+      archive >> *typed_task;
       break;
     }
     default: {
@@ -293,8 +293,8 @@ void Runtime::LocalLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive
   }
 }
 
-ctp::ipc::FullPtr<clio::run::Task> Runtime::LocalAllocLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive& archive) {
-  ctp::ipc::FullPtr<clio::run::Task> task_ptr = NewTask(method);
+clio::run::shared_ptr<clio::run::Task> Runtime::LocalAllocLoadTask(clio::run::u32 method, clio::run::DefaultLoadArchive& archive) {
+  clio::run::shared_ptr<clio::run::Task> task_ptr = NewTask(method);
   if (!task_ptr.IsNull()) {
     LocalLoadTask(method, archive, task_ptr);
   }
@@ -302,62 +302,62 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::LocalAllocLoadTask(clio::run::u32 me
 }
 
 void Runtime::LocalSaveTask(clio::run::u32 method, clio::run::DefaultSaveArchive& archive, 
-                             ctp::ipc::FullPtr<clio::run::Task> task_ptr) {
+                             clio::run::shared_ptr<clio::run::Task>& task_ptr) {
   switch (method) {
     case Method::kCreate: {
-      auto typed_task = task_ptr.template Cast<CreateTask>();
+      auto& typed_task = task_ptr.template Cast<CreateTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kDestroy: {
-      auto typed_task = task_ptr.template Cast<DestroyTask>();
+      auto& typed_task = task_ptr.template Cast<DestroyTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kMonitor: {
-      auto typed_task = task_ptr.template Cast<MonitorTask>();
+      auto& typed_task = task_ptr.template Cast<MonitorTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kParseOmni: {
-      auto typed_task = task_ptr.template Cast<ParseOmniTask>();
+      auto& typed_task = task_ptr.template Cast<ParseOmniTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kProcessHdf5Dataset: {
-      auto typed_task = task_ptr.template Cast<ProcessHdf5DatasetTask>();
+      auto& typed_task = task_ptr.template Cast<ProcessHdf5DatasetTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kExportData: {
-      auto typed_task = task_ptr.template Cast<ExportDataTask>();
+      auto& typed_task = task_ptr.template Cast<ExportDataTask>();
       // Use archive operator which respects msg_type
-      archive << *typed_task.ptr_;
+      archive << *typed_task;
       break;
     }
     case Method::kPutBlob: {
-      auto typed_task = task_ptr.template Cast<PutBlobTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<PutBlobTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kGetBlob: {
-      auto typed_task = task_ptr.template Cast<GetBlobTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<GetBlobTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kGetOrCreateTag: {
-      auto typed_task = task_ptr.template Cast<GetOrCreateTagTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<GetOrCreateTagTask>();
+      archive << *typed_task;
       break;
     }
     case Method::kSemanticSearch: {
-      auto typed_task = task_ptr.template Cast<SemanticSearchTask>();
-      archive << *typed_task.ptr_;
+      auto& typed_task = task_ptr.template Cast<SemanticSearchTask>();
+      archive << *typed_task;
       break;
     }
     default: {
@@ -367,10 +367,10 @@ void Runtime::LocalSaveTask(clio::run::u32 method, clio::run::DefaultSaveArchive
   }
 }
 
-ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> orig_task_ptr, bool deep) {
+clio::run::shared_ptr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, clio::run::shared_ptr<clio::run::Task>& orig_task_ptr, bool deep) {
   auto* ipc_manager = CLIO_IPC;
   if (!ipc_manager) {
-    return ctp::ipc::FullPtr<clio::run::Task>();
+    return clio::run::shared_ptr<clio::run::Task>();
   }
   
   switch (method) {
@@ -379,8 +379,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<CreateTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<CreateTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<CreateTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<CreateTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -390,8 +390,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<DestroyTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<DestroyTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<DestroyTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<DestroyTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -401,8 +401,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<MonitorTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<MonitorTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<MonitorTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<MonitorTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -412,8 +412,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<ParseOmniTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<ParseOmniTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<ParseOmniTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<ParseOmniTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -423,8 +423,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<ProcessHdf5DatasetTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<ProcessHdf5DatasetTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<ProcessHdf5DatasetTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<ProcessHdf5DatasetTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -434,8 +434,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       auto new_task_ptr = ipc_manager->NewTask<ExportDataTask>();
       if (!new_task_ptr.IsNull()) {
         // Copy task fields (includes base Task fields)
-        auto task_typed = orig_task_ptr.template Cast<ExportDataTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<ExportDataTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<ExportDataTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -443,8 +443,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
     case Method::kPutBlob: {
       auto new_task_ptr = ipc_manager->NewTask<PutBlobTask>();
       if (!new_task_ptr.IsNull()) {
-        auto task_typed = orig_task_ptr.template Cast<PutBlobTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<PutBlobTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<PutBlobTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -452,8 +452,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
     case Method::kGetBlob: {
       auto new_task_ptr = ipc_manager->NewTask<GetBlobTask>();
       if (!new_task_ptr.IsNull()) {
-        auto task_typed = orig_task_ptr.template Cast<GetBlobTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<GetBlobTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<GetBlobTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -461,8 +461,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
     case Method::kGetOrCreateTag: {
       auto new_task_ptr = ipc_manager->NewTask<GetOrCreateTagTask>();
       if (!new_task_ptr.IsNull()) {
-        auto task_typed = orig_task_ptr.template Cast<GetOrCreateTagTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<GetOrCreateTagTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<GetOrCreateTagTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -470,8 +470,8 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
     case Method::kSemanticSearch: {
       auto new_task_ptr = ipc_manager->NewTask<SemanticSearchTask>();
       if (!new_task_ptr.IsNull()) {
-        auto task_typed = orig_task_ptr.template Cast<SemanticSearchTask>();
-        new_task_ptr->Copy(task_typed);
+        auto& task_typed = orig_task_ptr.template Cast<SemanticSearchTask>();
+        new_task_ptr->Copy(ctp::ipc::FullPtr<SemanticSearchTask>(task_typed.get()));
         return new_task_ptr.template Cast<clio::run::Task>();
       }
       break;
@@ -480,7 +480,7 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
       // For unknown methods, create base Task copy
       auto new_task_ptr = ipc_manager->NewTask<clio::run::Task>();
       if (!new_task_ptr.IsNull()) {
-        new_task_ptr->Copy(orig_task_ptr);
+        new_task_ptr->Copy(ctp::ipc::FullPtr<clio::run::Task>(orig_task_ptr.get()));
         return new_task_ptr;
       }
       break;
@@ -488,13 +488,13 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewCopyTask(clio::run::u32 method, c
   }
   
   (void)deep;    // Deep copy parameter reserved for future use
-  return ctp::ipc::FullPtr<clio::run::Task>();
+  return clio::run::shared_ptr<clio::run::Task>();
 }
 
-ctp::ipc::FullPtr<clio::run::Task> Runtime::NewTask(clio::run::u32 method) {
+clio::run::shared_ptr<clio::run::Task> Runtime::NewTask(clio::run::u32 method) {
   auto* ipc_manager = CLIO_IPC;
   if (!ipc_manager) {
-    return ctp::ipc::FullPtr<clio::run::Task>();
+    return clio::run::shared_ptr<clio::run::Task>();
   }
   
   switch (method) {
@@ -540,120 +540,70 @@ ctp::ipc::FullPtr<clio::run::Task> Runtime::NewTask(clio::run::u32 method) {
     }
     default: {
       // For unknown methods, return null pointer
-      return ctp::ipc::FullPtr<clio::run::Task>();
+      return clio::run::shared_ptr<clio::run::Task>();
     }
   }
 }
 
-void Runtime::AggregateOut(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> orig_task,
-                        const ctp::ipc::FullPtr<clio::run::Task>& replica_task) {
+void Runtime::AggregateOut(clio::run::u32 method, clio::run::shared_ptr<clio::run::Task>& orig_task,
+                        const clio::run::shared_ptr<clio::run::Task>& replica_task) {
   switch (method) {
     case Method::kCreate: {
-      auto typed_task = orig_task.template Cast<CreateTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<CreateTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kDestroy: {
-      auto typed_task = orig_task.template Cast<DestroyTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<DestroyTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kMonitor: {
-      auto typed_task = orig_task.template Cast<MonitorTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<MonitorTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kParseOmni: {
-      auto typed_task = orig_task.template Cast<ParseOmniTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<ParseOmniTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kProcessHdf5Dataset: {
-      auto typed_task = orig_task.template Cast<ProcessHdf5DatasetTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<ProcessHdf5DatasetTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kExportData: {
-      auto typed_task = orig_task.template Cast<ExportDataTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<ExportDataTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kPutBlob: {
-      auto typed_task = orig_task.template Cast<PutBlobTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<PutBlobTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kGetBlob: {
-      auto typed_task = orig_task.template Cast<GetBlobTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<GetBlobTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kGetOrCreateTag: {
-      auto typed_task = orig_task.template Cast<GetOrCreateTagTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<GetOrCreateTagTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     case Method::kSemanticSearch: {
-      auto typed_task = orig_task.template Cast<SemanticSearchTask>();
-      typed_task->AggregateOut(replica_task);
+      auto& typed_task = orig_task.template Cast<SemanticSearchTask>();
+      typed_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
     default: {
-      orig_task->AggregateOut(replica_task);
+      orig_task->AggregateOut(ctp::ipc::FullPtr<clio::run::Task>(replica_task.get()));
       break;
     }
   }
 }
 
-void Runtime::DelTask(clio::run::u32 method, ctp::ipc::FullPtr<clio::run::Task> task_ptr) {
-  auto* ipc_manager = CLIO_IPC;
-  if (!ipc_manager) return;
-  switch (method) {
-    case Method::kCreate: {
-      ipc_manager->DelTask(task_ptr.template Cast<CreateTask>());
-      break;
-    }
-    case Method::kDestroy: {
-      ipc_manager->DelTask(task_ptr.template Cast<DestroyTask>());
-      break;
-    }
-    case Method::kMonitor: {
-      ipc_manager->DelTask(task_ptr.template Cast<MonitorTask>());
-      break;
-    }
-    case Method::kParseOmni: {
-      ipc_manager->DelTask(task_ptr.template Cast<ParseOmniTask>());
-      break;
-    }
-    case Method::kProcessHdf5Dataset: {
-      ipc_manager->DelTask(task_ptr.template Cast<ProcessHdf5DatasetTask>());
-      break;
-    }
-    case Method::kExportData: {
-      ipc_manager->DelTask(task_ptr.template Cast<ExportDataTask>());
-      break;
-    }
-    case Method::kPutBlob: {
-      ipc_manager->DelTask(task_ptr.template Cast<PutBlobTask>());
-      break;
-    }
-    case Method::kGetBlob: {
-      ipc_manager->DelTask(task_ptr.template Cast<GetBlobTask>());
-      break;
-    }
-    case Method::kGetOrCreateTag: {
-      ipc_manager->DelTask(task_ptr.template Cast<GetOrCreateTagTask>());
-      break;
-    }
-    case Method::kSemanticSearch: {
-      ipc_manager->DelTask(task_ptr.template Cast<SemanticSearchTask>());
-      break;
-    }
-    default: {
-      ipc_manager->DelTask(task_ptr);
-      break;
-    }
-  }
-}
 
 } // namespace clio::cae::core

@@ -108,8 +108,21 @@ struct StorageDeviceConfig {
                  // scoring
   std::string persistence_level_;  // "volatile", "temporary", "long_term"
 
+  // When set (major_ != 0), this storage target binds to an ALREADY-EXISTING
+  // pool (e.g. a safe-bdev pool composed elsewhere) instead of having CTE
+  // create its own bdev. The pool must implement the bdev task interface
+  // (AllocateBlocks/FreeBlocks/Write/Read/GetStats). When attaching, path_,
+  // bdev_type_, and capacity_limit_ become optional; score_ still applies.
+  clio::run::PoolId existing_pool_id_;
+  // Optional module name of the existing pool, for logging/validation only
+  // (e.g. "clio_safe_bdev"). Not used to route — routing is purely by pool id.
+  std::string existing_pool_module_;
+
   StorageDeviceConfig()
-      : capacity_limit_(0), score_(-1.0f), persistence_level_("volatile") {}
+      : capacity_limit_(0),
+        score_(-1.0f),
+        persistence_level_("volatile"),
+        existing_pool_id_(clio::run::PoolId::GetNull()) {}
   StorageDeviceConfig(const std::string &path, const std::string &bdev_type,
                       clio::run::u64 capacity, float score = -1.0f,
                       const std::string &persistence_level = "volatile")
@@ -117,7 +130,13 @@ struct StorageDeviceConfig {
         bdev_type_(bdev_type),
         capacity_limit_(capacity),
         score_(score),
-        persistence_level_(persistence_level) {}
+        persistence_level_(persistence_level),
+        existing_pool_id_(clio::run::PoolId::GetNull()) {}
+
+  // True when this target should bind to an existing pool rather than create
+  // its own bdev. Pool-id major 0 is reserved for "not set" (CTE/admin pools
+  // never use major 0 for storage targets here).
+  bool HasExistingPool() const { return existing_pool_id_.major_ != 0; }
 };
 
 /**
@@ -138,6 +157,25 @@ struct DpeConfig {
 
   DpeConfig() : dpe_type_("max_bw") {}
   explicit DpeConfig(const std::string &dpe_type) : dpe_type_(dpe_type) {}
+};
+
+/**
+ * Data organizer configuration.
+ *
+ * The organizer is the CTE's built-in, periodically-driven reorganization
+ * engine (issue #738). When enabled, Create() spawns `organizer_tasks_`
+ * periodic DynamicReorganize tasks; each invokes the configured
+ * DataOrganizer (e.g. "frecency"), which rescores blobs and moves them
+ * between tiers through the server's ReorganizeBlob logic. "none" (the
+ * default) disables periodic reorganization entirely.
+ */
+struct OrganizerConfig {
+  std::string name_;         // Organizer name ("none", "frecency")
+  clio::run::u32 organizer_tasks_;  // Periodic task replicas to spawn
+                                    // (parallelizes the organization work)
+  clio::run::u32 period_ms_;        // Period between organizer invocations
+
+  OrganizerConfig() : name_("none"), organizer_tasks_(1), period_ms_(5000) {}
 };
 
 /**
@@ -193,6 +231,11 @@ class Config {
    * Data Placement Engine configuration
    */
   DpeConfig dpe_;
+
+  /**
+   * Data organizer configuration (periodic reorganization; off by default)
+   */
+  OrganizerConfig organizer_;
 
   /**
    * GPU metadata cache (optional, off by default).

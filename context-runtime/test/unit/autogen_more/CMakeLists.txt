@@ -49,10 +49,16 @@ if(CLIO_CORE_ENABLE_TESTS)
     COMMAND ${AUTOGEN_SWEEP_TEST_TARGET}
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}/bin
   )
+  # "cae": this sweep is the ONLY test that exercises the CAE (and CTE) autogen
+  # lib_exec Save/Load/LocalSave/LocalLoad/NewCopy/Aggregate dispatch in-process
+  # — those arms only otherwise run when a task crosses the network, so the
+  # single-node CAE coverage phase (`ctest -L cae`, clean build) left
+  # context-assimilation-engine/.../autogen/core_lib_exec.cc at ~2%. Labeling
+  # it "cae" makes the CAE phase run it, lifting that file to ~90%+.
   set_tests_properties(cr_autogen_sweep_tests PROPERTIES
     ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10597"
     TIMEOUT 120
-    LABELS "msan_skip"
+    LABELS "cae;msan_skip"
   )
 endif()
 

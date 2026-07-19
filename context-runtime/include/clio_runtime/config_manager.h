@@ -60,11 +60,6 @@ struct PoolConfig {
   /** Per-RPC visibility overrides, keyed by RPC method NAME -> 0 public /
    *  1 private. Methods absent here inherit container_visibility_. */
   std::unordered_map<std::string, u32> rpc_acl_;
-  /** If true, this pool's container is hosted on the fallback ("main") runtime,
-   *  not here. We still create a local static container (so the pool resolves
-   *  and tasks can be serialized), but mark it external; tasks targeting it are
-   *  punted to the fallback instead of executed locally. Default false. */
-  bool external_ = false;
 
   PoolConfig() = default;
 
@@ -84,7 +79,7 @@ struct PoolConfig {
   template <class Archive>
   void serialize(Archive& ar) {
     ar(mod_name_, pool_name_, pool_id_, pool_query_, config_, restart_,
-       container_visibility_, rpc_acl_, external_);
+       container_visibility_, rpc_acl_);
   }
 };
 
@@ -193,18 +188,9 @@ class ConfigManager : public ctp::BaseConfig {
   u32 GetPort() const;
 
   /**
-   * Get the fallback ("main") runtime port. When non-zero, this runtime forwards
-   * tasks for pools it does not own to the runtime listening on this port (see
-   * the fallback-runtime / crash-isolation design). 0 = no fallback configured.
-   * @return Fallback runtime port, or 0 if disabled
-   */
-  u32 GetFallbackPort() const;
-
-  /**
    * @return true if this runtime is ephemeral (started with --ephemeral /
    * CLIO_EPHEMERAL): it skips the default compose section and starts bare
-   * (admin only), to be composed explicitly. Used for spawned per-app runtimes
-   * that back onto a main runtime via the fallback.
+   * (admin only), to be composed explicitly.
    */
   bool IsEphemeral() const;
 
@@ -282,6 +268,18 @@ class ConfigManager : public ctp::BaseConfig {
   u32 GetFirstBusyWait() const { return first_busy_wait_; }
 
   /**
+   * Get the task-progress validity-check interval in milliseconds.
+   *
+   * How long an outstanding cross-node task may sit quietly before the origin
+   * runs a QueryTaskProgress liveness check on it (issue #628), then re-checks
+   * each interval. This is the anti-hang mechanism that works even when a
+   * task's ttl is infinite. 0 disables the periodic check.
+   * Overridable via env CLIO_TASK_PROGRESS_INTERVAL_MS.
+   * @return Interval in ms (default: 0 = disabled)
+   */
+  u32 GetTaskProgressIntervalMs() const { return task_progress_interval_ms_; }
+
+  /**
    * Get maximum sleep duration in microseconds
    * @return Maximum sleep duration cap (default: 50000us = 50ms)
    */
@@ -350,6 +348,15 @@ class ConfigManager : public ctp::BaseConfig {
    */
   void ParseYAML(YAML::Node& yaml_conf) override;
 
+  /**
+   * Apply environment-variable overrides (CLIO_PORT, CLIO_SERVER_ADDR, etc.).
+   * Must run after every (re)load: LoadFromFile resets to defaults via
+   * LoadDefault, so a config reload (e.g. parsing a compose file into this
+   * manager) would otherwise silently drop the env-configured port — which on
+   * the force-net path retargets every forward at the wrong port.
+   */
+  void ApplyEnvOverrides();
+
   bool is_initialized_ = false;
   std::string config_file_path_;
 
@@ -361,9 +368,6 @@ class ConfigManager : public ctp::BaseConfig {
   size_t client_data_segment_size_ = ctp::Unit<size_t>::Megabytes(256);
 
   u32 port_ = 9413;
-  // Fallback ("main") runtime port. 0 = no fallback (standalone runtime).
-  // When set, tasks for pools this runtime does not own are punted to it.
-  u32 fallback_port_ = 0;
   // If true (CLIO_EPHEMERAL / --ephemeral), skip the default compose at startup.
   bool ephemeral_ = false;
   std::string server_addr_ = "127.0.0.1";
@@ -386,6 +390,7 @@ class ConfigManager : public ctp::BaseConfig {
 
   // Worker sleep configuration (in microseconds)
   u32 first_busy_wait_ = 10000;              // Default: 10000us (10ms) busy wait
+  u32 task_progress_interval_ms_ = 0;        // #628: 0 = periodic validity check disabled
   u32 max_sleep_ = 50000;                    // Default: 50000us (50ms) maximum sleep
 
   // Task load prediction model

@@ -48,7 +48,15 @@ GLOBAL_CROSS_CONST clio::run::u32 kGetTagName = 40;
 GLOBAL_CROSS_CONST clio::run::u32 kGetCapacity = 41;
 GLOBAL_CROSS_CONST clio::run::u32 kGetNumAliases = 42;
 
-GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 43;
+// Fully-POD, GPU-compatible blob methods (fixed_string<32>, no SSO/SVO fixup).
+GLOBAL_CROSS_CONST clio::run::u32 kPodPutBlob = 43;
+GLOBAL_CROSS_CONST clio::run::u32 kPodGetBlob = 44;
+GLOBAL_CROSS_CONST clio::run::u32 kPodReorganizeBlob = 45;
+
+// Periodic internal data-organizer driver (issue #738)
+GLOBAL_CROSS_CONST clio::run::u32 kDynamicReorganize = 46;
+
+GLOBAL_CROSS_CONST clio::run::u32 kMaxMethodId = 47;
 
 inline const std::vector<std::string>& GetMethodNames() {
   static const std::vector<std::string> names = [] {
@@ -85,6 +93,10 @@ inline const std::vector<std::string>& GetMethodNames() {
     v[40] = "GetTagName";
     v[41] = "GetCapacity";
     v[42] = "GetNumAliases";
+    v[43] = "PodPutBlob";
+    v[44] = "PodGetBlob";
+    v[45] = "PodReorganizeBlob";
+    v[46] = "DynamicReorganize";
     return v;
   }();
   return names;

@@ -35,6 +35,8 @@
 
 #include "clio_ctp/lightbeam/posix_socket.h"
 
+#include <atomic>
+
 // Windows socket API headers belong here in the .cc, never in a header — they
 // leak function-like macros (Yield, min, max, ...). posix_socket.h
 // deliberately no longer pulls these in.
@@ -97,6 +99,18 @@ void InitSocketLib() {
 void CleanupSocketLib() {
   // No-op. See the WinsockStartup comment above for why we don't pair a
   // WSACleanup with the WSAStartup.
+}
+
+// Set once during process shutdown; never cleared. A plain bool guarded by the
+// process-wide monotonic transition is sufficient (no concurrent clear).
+static std::atomic<bool> g_socket_lib_shutdown{false};
+
+void SetSocketLibShutdown() {
+  g_socket_lib_shutdown.store(true, std::memory_order_release);
+}
+
+bool IsSocketLibShutdown() {
+  return g_socket_lib_shutdown.load(std::memory_order_acquire);
 }
 
 void Close(socket_t fd) {

@@ -1449,7 +1449,9 @@ endmacro()
 # the original cr_bdev_force_net stress test.
 #
 # Such tests are always:
-#   * LABELS "msan_skip"            (libzmq is uninstrumented)
+#   * LABELS "msan_skip;force_net" (libzmq is uninstrumented; the "force_net"
+#       label lets CI variants that don't want the loopback-network path
+#       exclude the whole family with -LE "force_net" instead of naming each)
 #   * RESOURCE_LOCK "clio_runtime" (one runtime owns the fixed port at a time)
 #   * given CLIO_FORCE_NET=1 appended to the supplied ENVIRONMENT
 #
@@ -1485,7 +1487,7 @@ function(clio_add_force_net_test)
   add_test(NAME ${FN_NAME} COMMAND ${FN_COMMAND})
   set_tests_properties(${FN_NAME} PROPERTIES
     TIMEOUT ${FN_TIMEOUT}
-    LABELS "msan_skip"
+    LABELS "msan_skip;force_net"
     RESOURCE_LOCK "clio_runtime"
     ENVIRONMENT "${FN_ENVIRONMENT};CLIO_FORCE_NET=1")
   if(FN_WORKING_DIRECTORY)

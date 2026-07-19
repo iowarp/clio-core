@@ -3,7 +3,32 @@
  * All rights reserved.
  *
  * This file is part of IOWarp Core.
- * BSD 3-Clause License. See LICENSE file.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice,
+ *    this list of conditions and the following disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * 3. Neither the name of the copyright holder nor the names of its
+ *    contributors may be used to endorse or promote products derived from
+ *    this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
  */
 
 #ifndef CTP_SHM_INCLUDE_HSHM_SHM_COMPRESS_CUSZP_H_
@@ -11,14 +36,14 @@
 
 #if CTP_ENABLE_COMPRESS && CTP_ENABLE_CUSZP
 
-#include <cuda.h>          // driver API: separate CUDA context for the compressor
+#include <cuda.h>  // driver API: dedicated CUDA context for the compressor
 #include <cuda_runtime.h>
 #include <cuSZp.h>
+#include <mutex>
+#include <vector>
 
 #include <cstdint>
 #include <cstring>
-#include <mutex>
-#include <vector>
 
 #include "compress.h"
 
@@ -121,180 +146,293 @@ inline PinnedPool &Pool() {
 }
 
 }  // namespace cuszp_detail
-}  // namespace ctp
 
-namespace ctp {
+
 
 /**
- * GPU error-bounded LOSSY float compressor backed by cuSZp.
+ * cuSZp GPU error-bounded LOSSY compressor for floating-point data -- the
+ * ultra-fast single-kernel sibling of cuSZ from the same szcompressor family.
+ * cuSZp fuses the whole compress/decompress pipeline into one CUDA kernel for
+ * very high end-to-end throughput.
  *
- * Unlike the byte-oriented lossless codecs (lz4/zstd/nvcomp-*), cuSZp is an
- * error-bounded lossy compressor for 32-bit float fields: it trades a bounded
- * amount of precision (the absolute error bound `eb`) for large ratios on smooth
- * / scientific data, and — critically for the compressed GPU vector — it runs
- * ENTIRELY ON THE GPU (the host API launches its kernels on a stream), so data
- * never has to leave the device to be compressed.
+ * https://github.com/szcompressor/cuSZp  (cuSZp v3 API)
  *
- * Implements the synchronous ctp::Compressor interface. cuSZp requires device
- * pointers, so buffers are handled adaptively like the nvcomp wrapper: a
- * GPU-resident pointer is used in place (zero-copy); a host pointer is staged
- * through a temporary device buffer (H2D in, D2H out). The compressed stream is
- * NOT self-describing about `eb` or element count, so Decompress reuses the same
- * `eb` (from the preset) and derives nbEle from the caller's output size — the
- * runtime already carries the original size in its CompressionHeader.
+ * cuSZp operates directly on GPU device memory. Like NvComp/Cusz, this wrapper
+ * is adaptive: a GPU-accessible pointer is used in place (zero-copy); otherwise
+ * data is staged through a temporary device buffer (H2D for inputs, D2H for
+ * outputs), so host callers (and the unit test harness) work too.
  *
- * The input byte length must be a whole number of floats.
+ * Constrained by the byte-stream Compressor interface (no type/shape), the input
+ * is interpreted as a 1D array of 32-bit floats; Compress requires input_size to
+ * be a multiple of sizeof(float).
+ *
+ * Self-describing framing: the output blob is laid out as
+ *   [ Prefix (magic + mode + error bound + elem count + cmp_size) ][ stream ]
+ * so Decompress reconstructs with the exact error bound and mode used at
+ * compression (cuSZp's decompress requires both), independent of the preset this
+ * object was built with.
+ *
+ * cuSZp quirk: its reported cmp_size only covers the full compressed payload for
+ * MULTI-block inputs (> 32768 elements); for a single-block input it omits the
+ * payload, so this wrapper retains the whole compress buffer in that case (still
+ * a correct round-trip, but uncompressed). Real GPU-resident blobs are larger
+ * than 128 KB and hit the multi-block, fully-compressed path. See Compress.
+ *
+ * IMPORTANT -- LOSSY. Each value is reconstructed within the configured ABSOLUTE
+ * error bound, not bit-exact. Presets map to error bounds: FAST=1e-2 (loose),
+ * BALANCED=1e-3, BEST=1e-4 (tight).
+ *
+ * NOTE on GPU arch: cuSZp (like cuSZ) currently builds for compute capabilities
+ * up to ~sm_86. On a newer GPU only reachable via forward-compat PTX-JIT (e.g.
+ * Blackwell sm_120), its JIT'd kernels can be clobbered by other CUDA modules in
+ * the same process and return wrong results -- use a natively-supported GPU until
+ * upstream adds the newer arch.
+ *
+ * Tested against the cuSZp v3 C API (cuSZp_compress / cuSZp_decompress). The
+ * NVIDIA devcontainer pins cuSZp-V3.0.0.
  */
 class Cuszp : public Compressor {
  public:
-  explicit Cuszp(float error_bound = 1e-3f) : eb_(error_bound) {}
+  /**
+   * @param eb absolute error bound (default 1e-3).
+   * @param mode cuSZp encoding mode (default CUSZP_MODE_OUTLIER).
+   */
+  explicit Cuszp(float eb = 1e-3f, cuszp_mode_t mode = CUSZP_MODE_OUTLIER)
+      : eb_(eb), mode_(mode) {}
 
   bool Compress(void *output, size_t &output_size, void *input,
                 size_t input_size) override {
-    if (input_size == 0 || (input_size % sizeof(float)) != 0) return false;
-    const size_t nbEle = input_size / sizeof(float);
-    // Run all GPU work in the dedicated compressor context (see ContextScope):
-    // preemptable against a spin-waiting app kernel, cross-context UVA to the
-    // caller's device pointers. The stream/pool below are created in it.
+    if (input == nullptr || (input_size % sizeof(float)) != 0) {
+      return false;  // float codec; need whole 32-bit floats
+    }
+    if (output_size < sizeof(Prefix)) {
+      return false;
+    }
+    const size_t n = input_size / sizeof(float);
+
+    // Dedicated CUDA context: A100 compute preemption lets this run while an app
+    // kernel spin-waits in the primary context (cross-context UVA reaches HBM).
     cuszp_detail::ContextScope _cctx;
-    // Force the pinned pool + mempool warm on the FIRST compress (page eviction,
-    // GPU idle) so it exists before any on-device read fault.
-    (void)cuszp_detail::Pool();
-    cudaStream_t stream = Stream();  // persistent, non-blocking, per-thread
-    if (!stream) return false;
-    uint8_t *d_in = nullptr, *d_cmp = nullptr, *pin = nullptr;
-    bool free_in = false, ok = false;
+    (void)cuszp_detail::Pool();  // warm pinned pool + mempool on first compress
+
+    cudaStream_t stream = nullptr;
+    if (cudaStreamCreate(&stream) != cudaSuccess) {
+      return false;
+    }
+    float *d_in = nullptr;
+    bool free_in = false;
+    unsigned char *d_cmp = nullptr;  // temp worst-case device output buffer
+    bool ok = false;
     do {
-      d_in = ToDeviceInput(input, input_size, stream, &free_in, &pin);
-      if (!d_in) break;
-      // cuSZp worst case is ~the input size; add slack and always use a temp so
-      // we can bounds-check the caller's buffer against the real cmp size.
-      const size_t cap = input_size + input_size / 8 + 1024;
-      if (cudaMallocAsync(&d_cmp, cap, stream) != cudaSuccess) break;
+      d_in = static_cast<float *>(
+          ToDeviceInput(input, input_size, stream, &free_in));
+      if (d_in == nullptr) break;
+
+      // cuSZp writes into a caller-provided device buffer; size it for the
+      // worst case (no larger than the original data).
+      if (cudaMallocAsync(&d_cmp, input_size, stream) != cudaSuccess) break;
+
       size_t cmp_size = 0;
-      uint3 dims = {0, 0, 0};
-      // cuSZp (patched) is fully stream-ordered and syncs only `stream`
-      // internally to read back cmp_size, so it never device-synchronizes.
-      cuSZp_compress(d_in, d_cmp, nbEle, &cmp_size, eb_, CUSZP_DIM_1D, dims,
-                     CUSZP_TYPE_FLOAT, CUSZP_MODE_OUTLIER, stream);
-      if (cmp_size == 0 || cmp_size > output_size) break;  // caller buffer small
-      cudaMemcpyKind kind = IsDeviceAccessible(output) ? cudaMemcpyDeviceToDevice
-                                                       : cudaMemcpyDeviceToHost;
-      if (cudaMemcpyAsync(output, d_cmp, cmp_size, kind, stream) != cudaSuccess)
+      uint3 dims = {0, 0, 0};  // ignored for 1D
+      cuSZp_compress(d_in, d_cmp, n, &cmp_size, eb_, CUSZP_DIM_1D, dims,
+                     CUSZP_TYPE_FLOAT, mode_, stream);
+      if (cudaStreamSynchronize(stream) != cudaSuccess) break;
+      if (cudaGetLastError() != cudaSuccess || cmp_size == 0) break;
+
+      // How many bytes of the compressed buffer must be retained so that
+      // Decompress can read everything cuSZp's decompressor touches. cuSZp's
+      // reported cmp_size is the meaningful compressed size for MULTI-block
+      // inputs, but for a SINGLE-block input (nbEle <= kBlockElems) cuSZp's
+      // cross-block offset sync degenerates and cmp_size omits the payload
+      // (it reports only the fixed per-group "rate" region). The decompressor
+      // still reads the payload that physically follows, which cuSZp does not
+      // expose a size for -- so for the single-block case we conservatively
+      // retain the whole compress buffer (<= the original size). Net effect:
+      // full compression for blobs > kBlockElems*4 bytes (the common case for
+      // GPU-resident data); small blobs round-trip correctly but uncompressed.
+      const size_t retain = (n > kBlockElems) ? cmp_size : input_size;
+
+      const size_t total = sizeof(Prefix) + retain;
+      if (total > output_size) break;  // caller buffer too small
+
+      Prefix prefix;
+      std::memset(&prefix, 0, sizeof(prefix));
+      prefix.magic = kMagic;
+      prefix.mode = static_cast<uint32_t>(mode_);
+      prefix.eb = eb_;
+      prefix.elems = static_cast<uint64_t>(n);
+      prefix.cmp_size = static_cast<uint64_t>(cmp_size);  // decompress arg
+
+      // Frame: [prefix][cuSZp stream].
+      const bool out_is_device = IsDeviceAccessible(output);
+      uint8_t *out = static_cast<uint8_t *>(output);
+      const cudaMemcpyKind kind =
+          out_is_device ? cudaMemcpyDeviceToDevice : cudaMemcpyDeviceToHost;
+      if (out_is_device) {
+        if (cudaMemcpyAsync(out, &prefix, sizeof(Prefix),
+                            cudaMemcpyHostToDevice, stream) != cudaSuccess) {
+          break;
+        }
+      } else {
+        std::memcpy(out, &prefix, sizeof(Prefix));
+      }
+      if (cudaMemcpyAsync(out + sizeof(Prefix), d_cmp, retain, kind, stream) !=
+          cudaSuccess) {
         break;
-      if (cudaStreamSynchronize(stream) != cudaSuccess) break;  // this stream only
-      output_size = cmp_size;
+      }
+      if (cudaStreamSynchronize(stream) != cudaSuccess) break;
+      output_size = total;
       ok = true;
     } while (false);
-    if (d_cmp) cudaFreeAsync(d_cmp, stream);
+
+    if (d_cmp != nullptr) cudaFreeAsync(d_cmp, stream);
     if (free_in) cudaFreeAsync(d_in, stream);
-    if (pin) cuszp_detail::Pool().Release(pin);  // safe: stream synced above
+    cudaStreamDestroy(stream);
     return ok;
   }
 
   bool Decompress(void *output, size_t &output_size, void *input,
                   size_t input_size) override {
-    if (output_size == 0 || (output_size % sizeof(float)) != 0) return false;
-    const size_t nbEle = output_size / sizeof(float);
-    cuszp_detail::ContextScope _cctx;  // dedicated preemptable compressor context
-    (void)cuszp_detail::Pool();  // normally already warm from the first compress
-    cudaStream_t stream = Stream();
-    if (!stream) return false;
-    uint8_t *d_cmp = nullptr, *d_dec = nullptr, *pin = nullptr;
-    bool free_in = false, ok = false;
+    if (output == nullptr || input == nullptr || input_size < sizeof(Prefix)) {
+      return false;
+    }
+
+    cuszp_detail::ContextScope _cctx;
+    (void)cuszp_detail::Pool();
+
+    cudaStream_t stream = nullptr;
+    if (cudaStreamCreate(&stream) != cudaSuccess) {
+      return false;
+    }
+    float *d_out = nullptr;
+    bool free_out = false;
+    unsigned char *d_stream = nullptr;
+    bool free_stream = false;
+    bool ok = false;
     do {
-      d_cmp = ToDeviceInput(input, input_size, stream, &free_in, &pin);
-      if (!d_cmp) break;
-      if (cudaMallocAsync(&d_dec, output_size, stream) != cudaSuccess) break;
+      Prefix prefix;
+      if (IsDeviceAccessible(input)) {
+        if (cudaMemcpyAsync(&prefix, input, sizeof(Prefix),
+                            cudaMemcpyDeviceToHost, stream) != cudaSuccess ||
+            cudaStreamSynchronize(stream) != cudaSuccess) {
+          break;
+        }
+      } else {
+        std::memcpy(&prefix, input, sizeof(Prefix));
+      }
+      if (prefix.magic != kMagic) break;  // not one of our blobs
+
+      const size_t n = static_cast<size_t>(prefix.elems);
+      if (n * sizeof(float) > output_size) break;  // caller buffer too small
+      // `avail` = compressed bytes physically present in the blob (what Compress
+      // retained: cuSZp's cmp_size for multi-block, or the full buffer for the
+      // single-block case). `cmp_arg` = the cmp_size value cuSZp itself reported,
+      // which is what its decompressor expects as the size argument.
+      const size_t avail = input_size - sizeof(Prefix);
+      const size_t cmp_arg = static_cast<size_t>(prefix.cmp_size);
+
+      const bool out_is_device = IsDeviceAccessible(output);
+      if (out_is_device) {
+        d_out = static_cast<float *>(output);
+      } else {
+        if (cudaMallocAsync(&d_out, n * sizeof(float), stream) != cudaSuccess) break;
+        free_out = true;
+      }
+
+      // The compressed stream must be device-resident for cuSZp.
+      uint8_t *stream_src = static_cast<uint8_t *>(input) + sizeof(Prefix);
+      if (IsDeviceAccessible(input)) {
+        d_stream = stream_src;
+      } else {
+        if (cudaMallocAsync(&d_stream, avail, stream) != cudaSuccess) break;
+        free_stream = true;
+        if (cudaMemcpyAsync(d_stream, stream_src, avail,
+                            cudaMemcpyHostToDevice, stream) != cudaSuccess) {
+          break;
+        }
+      }
+
       uint3 dims = {0, 0, 0};
-      cuSZp_decompress(d_dec, d_cmp, nbEle, input_size, eb_, CUSZP_DIM_1D, dims,
-                       CUSZP_TYPE_FLOAT, CUSZP_MODE_OUTLIER, stream);
-      cudaMemcpyKind kind = IsDeviceAccessible(output) ? cudaMemcpyDeviceToDevice
-                                                       : cudaMemcpyDeviceToHost;
-      if (cudaMemcpyAsync(output, d_dec, output_size, kind, stream) !=
-          cudaSuccess)
-        break;
-      // Sync ONLY this stream (not the whole device), so a caller kernel
-      // spin-waiting on-device (the gpu_vector page fault) does not deadlock us:
-      // the decompress + copy run on `stream`, concurrently with that kernel.
-      if (cudaStreamSynchronize(stream) != cudaSuccess) break;
-      ok = true;
+      cuSZp_decompress(d_out, d_stream, n, cmp_arg, prefix.eb, CUSZP_DIM_1D,
+                       dims, CUSZP_TYPE_FLOAT,
+                       static_cast<cuszp_mode_t>(prefix.mode), stream);
+      bool decoded = cudaStreamSynchronize(stream) == cudaSuccess &&
+                     cudaGetLastError() == cudaSuccess;
+      if (decoded) {
+        if (!out_is_device) {
+          decoded = cudaMemcpyAsync(output, d_out, n * sizeof(float),
+                                    cudaMemcpyDeviceToHost, stream) == cudaSuccess &&
+                    cudaStreamSynchronize(stream) == cudaSuccess;
+        }
+        if (decoded) {
+          output_size = n * sizeof(float);
+          ok = true;
+        }
+      }
     } while (false);
-    if (d_dec) cudaFreeAsync(d_dec, stream);
-    if (free_in) cudaFreeAsync(d_cmp, stream);
-    if (pin) cuszp_detail::Pool().Release(pin);  // safe: stream synced above
+
+    if (free_stream) cudaFreeAsync(d_stream, stream);
+    if (free_out) cudaFreeAsync(d_out, stream);
+    cudaStreamDestroy(stream);
     return ok;
   }
 
- private:
-  // One persistent non-blocking stream per worker thread. Not the default
-  // stream (which serializes with everything) and never destroyed per call.
-  // The first use also warms the stream-ordered memory pool so later
-  // cudaMallocAsync calls (e.g. during an on-device page fault) are pure
-  // stream-ordered ops with no device synchronization.
-  static cudaStream_t Stream() {
-    static thread_local cudaStream_t s = nullptr;
-    if (!s) {
-      if (cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking) != cudaSuccess)
-        return nullptr;
-      void *warm = nullptr;
-      if (cudaMallocAsync(&warm, 1 << 20, s) == cudaSuccess) {
-        cudaFreeAsync(warm, s);
-        cudaStreamSynchronize(s);
-      }
-    }
-    return s;
-  }
+  /** Set the absolute error bound. */
+  void SetErrorBound(float eb) { eb_ = eb; }
+  /** Get the absolute error bound. */
+  float GetErrorBound() const { return eb_; }
 
+ private:
+  static constexpr uint32_t kMagic = 0x435A5370u;  // "pSZC"
+  // Elements processed per cuSZp thread block (tblock_size 32 * thread_chunk
+  // 1024). Inputs with nbEle <= this are single-block; see the retain logic in
+  // Compress for why that case is handled specially.
+  static constexpr size_t kBlockElems = 32 * 1024;
+
+  // Self-describing prefix carried ahead of the cuSZp codestream. 32 bytes,
+  // 8-aligned so the codestream that follows stays aligned for cuSZp.
+  struct Prefix {
+    uint32_t magic;
+    uint32_t mode;      // cuszp_mode_t used at compression
+    float eb;           // absolute error bound used at compression
+    uint32_t pad;       // keep the 64-bit fields 8-aligned
+    uint64_t elems;     // float element count
+    uint64_t cmp_size;  // cuSZp's reported cmp_size (decompress size argument)
+  };
+
+  /** See ctp::Cusz::IsDeviceAccessible. */
   static bool IsDeviceAccessible(const void *ptr) {
     cudaPointerAttributes attr;
-    cudaError_t err = cudaPointerGetAttributes(&attr, ptr);
-    if (err != cudaSuccess) {
-      cudaGetLastError();  // clear sticky error from the failed query
+    if (cudaPointerGetAttributes(&attr, ptr) != cudaSuccess) {
+      cudaGetLastError();  // reset the sticky error from the failed query
       return false;
     }
     return attr.type == cudaMemoryTypeDevice ||
            attr.type == cudaMemoryTypeManaged;
   }
 
-  // Stage `input` onto the device. Device/managed pointers are used in place.
-  // A PAGEABLE host pointer is bounced through a preallocated PINNED buffer so
-  // the H2D is a TRUE async copy (a direct async copy from pageable memory is
-  // silently synchronous, which device-syncs and would deadlock an on-device
-  // caller). `*pinned_out` receives the borrowed pinned buffer to release AFTER
-  // the stream is synchronized.
-  static uint8_t *ToDeviceInput(void *input, size_t size, cudaStream_t stream,
-                                bool *owned, uint8_t **pinned_out) {
+  /** See ctp::Cusz::ToDeviceInput. */
+  static void *ToDeviceInput(void *input, size_t size, cudaStream_t stream,
+                             bool *owned) {
     *owned = false;
-    *pinned_out = nullptr;
-    if (IsDeviceAccessible(input)) return static_cast<uint8_t *>(input);
-    uint8_t *d = nullptr;
-    if (cudaMallocAsync(&d, size, stream) != cudaSuccess) return nullptr;
-    uint8_t *pin = cuszp_detail::Pool().Acquire(size);
-    if (pin) {
-      std::memcpy(pin, input, size);  // pageable->pinned on CPU (no device sync)
-      if (cudaMemcpyAsync(d, pin, size, cudaMemcpyHostToDevice, stream) !=
-          cudaSuccess) {
-        cudaFreeAsync(d, stream);
-        cuszp_detail::Pool().Release(pin);
-        return nullptr;
-      }
-      *pinned_out = pin;
-    } else {
-      // Pool exhausted / oversized: fall back to a direct (possibly syncing)
-      // copy. Fine for host-orchestrated paths; only a risk if this happens on
-      // an on-device fault with the pool full.
-      if (cudaMemcpyAsync(d, input, size, cudaMemcpyHostToDevice, stream) !=
-          cudaSuccess) {
-        cudaFreeAsync(d, stream);
-        return nullptr;
-      }
+    if (IsDeviceAccessible(input)) {
+      return input;
+    }
+    void *d = nullptr;
+    if (cudaMallocAsync(&d, size, stream) != cudaSuccess) {
+      return nullptr;
+    }
+    if (cudaMemcpyAsync(d, input, size, cudaMemcpyHostToDevice, stream) !=
+        cudaSuccess) {
+      cudaFreeAsync(d, stream);
+      return nullptr;
     }
     *owned = true;
     return d;
   }
 
-  float eb_;  // absolute error bound
+  float eb_;          // absolute error bound
+  cuszp_mode_t mode_;  // cuSZp encoding mode
 };
 
 }  // namespace ctp

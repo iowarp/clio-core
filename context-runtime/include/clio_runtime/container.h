@@ -123,11 +123,6 @@ class Container {
    *  container_rpc_acl). Built once in ConfigureAcl, then read-only — no
    *  locking needed on the enforcement hot path. */
   std::unordered_map<u32, MethodProperty> method_acl_;
-  /** True if this is a stub for a pool whose real container lives on the
-   *  fallback ("main") runtime (compose pool_external: true). The pool resolves
-   *  locally (so tasks can be serialized), but tasks are punted to the fallback
-   *  rather than executed here. Set once at pool creation. */
-  bool is_external_ = false;
 
  public:
   Container() = default;
@@ -218,14 +213,6 @@ class Container {
         (it != method_acl_.end()) ? it->second : container_visibility_;
     return !mp.IsPrivate();
   }
-
-  /** Mark this container as a stub for a pool hosted on the fallback runtime
-   *  (compose pool_external: true). */
-  void SetExternal(bool external) { is_external_ = external; }
-
-  /** @return true if this pool's real container lives on the fallback runtime;
-   *  tasks targeting it are punted there rather than executed locally. */
-  bool IsExternal() const { return is_external_; }
 
   /**
    * Get live task statistics for THIS specific task instance.
@@ -347,7 +334,8 @@ class Container {
    * @param task Full pointer to the task being scheduled
    * @return The PoolQuery to use for routing this task
    */
-  virtual PoolQuery ScheduleTask(const ctp::ipc::FullPtr<Task> &task) {
+  virtual PoolQuery ScheduleTask(
+      const clio::run::shared_ptr<Task> &task) {
     return task->pool_query_;
   }
 
@@ -356,10 +344,12 @@ class Container {
    *
    * This method returns TaskResume to support C++20 coroutine-based execution.
    * The returned TaskResume holds the coroutine handle that the worker uses
-   * to suspend and resume task execution.
+   * to suspend and resume task execution. The RunContext is obtained inside
+   * handlers via clio::run::GetCurrentRunContext() (the worker sets it before
+   * every Run/resume), so it is no longer a parameter.
    */
-  virtual TaskResume Run(u32 method, ctp::ipc::FullPtr<Task> task_ptr,
-                         RunContext& rctx) = 0;
+  virtual TaskResume Run(u32 method,
+                         clio::run::shared_ptr<Task> task_ptr) = 0;
 
   /**
    * Fix up POD bytewise-copied tasks (clio::run::priv::string SSO data_
@@ -374,7 +364,8 @@ class Container {
    * has SSO/SVO members should override and dispatch per method to
    * the per-task `FixupAfterCopy()`.
    */
-  virtual void FixupAfterCopy(u32 method, ctp::ipc::FullPtr<Task> task_ptr) {
+  virtual void FixupAfterCopy(u32 method,
+                              clio::run::shared_ptr<Task> &task_ptr) {
     (void)method;
     (void)task_ptr;
   }
@@ -393,11 +384,10 @@ class Container {
    * @param rctx Current run context
    * @param increment Work count change (positive or negative)
    */
-  virtual void UpdateWork(ctp::ipc::FullPtr<Task> task_ptr, RunContext& rctx,
+  virtual void UpdateWork(clio::run::shared_ptr<Task> &task_ptr,
                           i64 increment) {
     // Default: no work tracking
     (void)task_ptr;
-    (void)rctx;
     (void)increment;  // Suppress unused warnings
   }
 
@@ -476,7 +466,7 @@ class Container {
    * @param task_ptr Full pointer to the task to serialize
    */
   virtual void SaveTask(u32 method, SaveTaskArchive& archive,
-                        ctp::ipc::FullPtr<Task> task_ptr) = 0;
+                        clio::run::shared_ptr<Task> &task_ptr) = 0;
 
   /**
    * Deserialize task parameters into an existing task from network transfer
@@ -488,7 +478,7 @@ class Container {
    * @param task_ptr Full pointer to the pre-allocated task to load into
    */
   virtual void LoadTask(u32 method, LoadTaskArchive& archive,
-                        ctp::ipc::FullPtr<Task> task_ptr) = 0;
+                        clio::run::shared_ptr<Task> &task_ptr) = 0;
 
   /**
    * Allocate and deserialize task parameters from network transfer
@@ -497,7 +487,7 @@ class Container {
    * @param archive LoadTaskArchive configured with srl_mode (true=In, false=Out)
    * @return Full pointer to the newly allocated and deserialized task
    */
-  virtual ctp::ipc::FullPtr<Task> AllocLoadTask(u32 method, LoadTaskArchive& archive) = 0;
+  virtual clio::run::shared_ptr<Task> AllocLoadTask(u32 method, LoadTaskArchive& archive) = 0;
 
   /**
    * Deserialize task input parameters into an existing task using LocalSerialize
@@ -509,7 +499,7 @@ class Container {
    * @param task_ptr Full pointer to the pre-allocated task to load into
    */
   virtual void LocalLoadTask(u32 method, DefaultLoadArchive& archive,
-                             ctp::ipc::FullPtr<Task> task_ptr) = 0;
+                             clio::run::shared_ptr<Task> &task_ptr) = 0;
 
   /**
    * Allocate and deserialize task input parameters using LocalSerialize
@@ -518,7 +508,7 @@ class Container {
    * @param archive DefaultLoadArchive for deserializing inputs
    * @return Full pointer to the newly allocated and loaded task
    */
-  virtual ctp::ipc::FullPtr<Task> LocalAllocLoadTask(u32 method, DefaultLoadArchive& archive) = 0;
+  virtual clio::run::shared_ptr<Task> LocalAllocLoadTask(u32 method, DefaultLoadArchive& archive) = 0;
 
   /**
    * Serialize task output parameters using LocalSerialize (for local transfers)
@@ -529,7 +519,7 @@ class Container {
    * @param task_ptr Full pointer to the task to save outputs from
    */
   virtual void LocalSaveTask(u32 method, DefaultSaveArchive& archive,
-                              ctp::ipc::FullPtr<Task> task_ptr) = 0;
+                              clio::run::shared_ptr<Task> &task_ptr) = 0;
 
   /**
    * Create a new copy of a task (deep copy for distributed execution) - must be
@@ -540,8 +530,8 @@ class Container {
    * @param deep Whether to perform a deep copy
    * @return Full pointer to the newly created copy
    */
-  CTP_DLL virtual ctp::ipc::FullPtr<Task> NewCopyTask(u32 method,
-                                                    ctp::ipc::FullPtr<Task> orig_task_ptr,
+  CTP_DLL virtual clio::run::shared_ptr<Task> NewCopyTask(u32 method,
+                                                    clio::run::shared_ptr<Task> &orig_task_ptr,
                                                     bool deep) = 0;
 
   /**
@@ -551,7 +541,7 @@ class Container {
    * @param method The method ID for the task type to create
    * @return Full pointer to the newly allocated task (cast to base Task type)
    */
-  CTP_DLL virtual ctp::ipc::FullPtr<Task> NewTask(u32 method) = 0;
+  CTP_DLL virtual clio::run::shared_ptr<Task> NewTask(u32 method) = 0;
 
   /**
    * AggregateOut replica OUTPUTS into the origin task via Container dispatch
@@ -564,8 +554,8 @@ class Container {
    * @param orig_task The origin task to aggregate into
    * @param replica_task The replica task to aggregate from
    */
-  virtual void AggregateOut(u32 method, ctp::ipc::FullPtr<Task> orig_task,
-                          const ctp::ipc::FullPtr<Task>& replica_task) = 0;
+  virtual void AggregateOut(u32 method, clio::run::shared_ptr<Task> &orig_task,
+                          const clio::run::shared_ptr<Task>& replica_task) = 0;
 
   /**
    * AggregateOut member INPUTS into a collective aggregate task (ManyToOne).
@@ -579,21 +569,16 @@ class Container {
    * @param agg_task The synthetic aggregate task to combine into
    * @param member_task A batched member whose inputs are folded in
    */
-  virtual void AggregateIn(u32 method, ctp::ipc::FullPtr<Task> agg_task,
-                           const ctp::ipc::FullPtr<Task>& member_task) {
+  virtual void AggregateIn(u32 method, clio::run::shared_ptr<Task> &agg_task,
+                           const clio::run::shared_ptr<Task>& member_task) {
     (void)method;
     (void)agg_task;
     (void)member_task;
   }
 
-  /**
-   * Delete a task via Container dispatch with proper type casting
-   * Replaces direct CLIO_IPC->DelTask(base_ptr) to ensure correct destructor
-   * @param method The method ID for proper task type casting
-   * @param task_ptr The task to delete
-   */
-  virtual void DelTask(u32 method, ctp::ipc::FullPtr<Task> task_ptr) = 0;
-
+  // NOTE: There is no DelTask virtual. Tasks are clio::run::shared_ptr handles
+  // freed automatically (RAII) when their last owner drops. Type-correct
+  // destruction is guaranteed by the type-erased deleter in the control header.
 };
 
 /**
@@ -676,7 +661,7 @@ class ContainerClient {
    * @return Full pointer to allocated task
    */
   template <typename TaskT, typename... Args>
-  ctp::ipc::FullPtr<TaskT> AllocateTask(MemorySegment segment, Args&&... args);
+  clio::run::shared_ptr<TaskT> AllocateTask(MemorySegment segment, Args&&... args);
 };
 
 }  // namespace clio::run

@@ -154,6 +154,19 @@ bool WorkOrchestrator::StartWorkers() {
   return true;
 }
 
+void WorkOrchestrator::AwakenAllWorkers() {
+  int runtime_pid = ctp::SystemInfo::GetPid();
+  for (auto *worker : all_workers_) {
+    if (!worker) continue;
+    TaskLane *lane = worker->GetLane();
+    if (!lane) continue;
+    int tid = lane->GetTid();
+    if (tid > 0) {
+      ctp::lbm::EventManager::Signal(runtime_pid, tid);
+    }
+  }
+}
+
 void WorkOrchestrator::StopWorkers() {
   if (!workers_running_) {
     return;
@@ -371,8 +384,8 @@ bool WorkOrchestrator::HasWorkRemaining(u64 &total_work_remaining) const {
     const PoolInfo *info = pool_manager->GetPoolInfo(pool_id);
     if (!info) continue;
     for (const auto &pair : info->containers_) {
-      if (pair.second) {
-        total_work_remaining += pair.second->GetWorkRemaining();
+      if (ContainerHold c = pair.second.get()) {
+        total_work_remaining += c->GetWorkRemaining();
       }
     }
   }

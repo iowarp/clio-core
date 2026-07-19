@@ -114,4 +114,59 @@ set_tests_properties(
 
 install(TARGETS test_fuse_adapter test_fuse_copy_workspace RUNTIME DESTINATION bin)
 
+# ------------------------------------------------------------------------------
+# Callback coverage test: drives the fuse_cte.cc FUSE operation callbacks
+# directly (in-process, no real mount) against a live embedded runtime. Only
+# built when libfuse3 is available (the callbacks and the cte_fuse_ops table
+# need <fuse3/fuse.h>); the adapter binary (clio_cte_fuse) is the signal for
+# that having succeeded at configure time.
+# ------------------------------------------------------------------------------
+if(TARGET clio_cte_fuse)
+  find_package(PkgConfig QUIET)
+  if(PkgConfig_FOUND)
+    pkg_check_modules(FUSE3 QUIET fuse3)
+  endif()
+
+  if(FUSE3_FOUND)
+    add_executable(test_fuse_ops test_fuse_ops.cc)
+
+    target_compile_definitions(test_fuse_ops PRIVATE
+        FUSE_USE_VERSION=35
+        CLIO_CTE_FUSE_ENABLED)
+
+    target_include_directories(test_fuse_ops PRIVATE
+        ${CLIO_CTE_ROOT}
+        ${CLIO_CTE_ROOT}/adapter/libfuse
+        ${CMAKE_SOURCE_DIR}/context-transfer-engine/filesystem/include
+        ${FUSE3_INCLUDE_DIRS})
+
+    target_link_directories(test_fuse_ops PRIVATE ${FUSE3_LIBRARY_DIRS})
+    target_link_libraries(test_fuse_ops
+        clio_cte_filesystem_client
+        clio_cte_core_runtime
+        clio_cte_core_client
+        clio::run::admin_runtime
+        clio::run::admin_client
+        clio::run::bdev_runtime
+        clio::run::bdev_client
+        ctp::cxx
+        ${FUSE3_LIBRARIES}
+        ${CMAKE_THREAD_LIBS_INIT})
+
+    add_custom_command(TARGET test_fuse_ops POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${CMAKE_CURRENT_SOURCE_DIR}/cte_config.yaml
+            ${CMAKE_CURRENT_BINARY_DIR}/cte_config.yaml)
+
+    add_test(NAME fuse_ops COMMAND test_fuse_ops)
+    set_tests_properties(fuse_ops PROPERTIES
+        TIMEOUT 300
+        LABELS "unit;adapter;fuse"
+        ENVIRONMENT "CLIO_WITH_RUNTIME=1;CTP_LOG_LEVEL=error;CLIO_SERVER_CONF=${CMAKE_CURRENT_SOURCE_DIR}/cte_config.yaml;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500"
+        RESOURCE_LOCK "clio_runtime")
+
+    install(TARGETS test_fuse_ops RUNTIME DESTINATION bin)
+  endif()
+endif()
+
 message(STATUS "FUSE adapter tests configured successfully")

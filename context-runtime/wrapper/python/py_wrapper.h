@@ -37,7 +37,10 @@
 #include <clio_runtime/admin/admin_client.h>
 #include <clio_runtime/admin/admin_tasks.h>
 #include <clio_runtime/clio_runtime.h>
+#include <clio_runtime/config_manager.h>
+#include <clio_runtime/safe_bdev/safe_bdev_client.h>
 
+#include <atomic>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -167,6 +170,89 @@ inline void py_stop_runtime(const std::string& pool_query_str,
   auto* admin = CLIO_ADMIN;
   clio::run::PoolQuery pq = clio::run::PoolQuery::FromString(pool_query_str);
   admin->AsyncStopRuntime(pq, 0, grace_period_ms);
+}
+
+//============================================================================
+// Safe-bdev member management (dashboard add / remove / replace controls).
+//
+// AddBdev and RecoverBdev both require the NEW member bdev pool to already
+// exist, so add/replace first compose a fresh file-backed clio_bdev pool and
+// then attach/recover onto it. Fresh pool ids come from a high monotonic
+// counter to avoid clashing with config-declared ids.
+//============================================================================
+
+inline std::string py_pool_id_str(const clio::run::PoolId& id) {
+  return std::to_string(id.major_) + "." + std::to_string(id.minor_);
+}
+
+/** Compose a fresh file-backed clio_bdev pool at `path`; return its PoolId. */
+inline clio::run::PoolId py_compose_bdev_pool(const std::string& path,
+                                              const std::string& capacity) {
+  static std::atomic<uint32_t> next_major{40000};
+  clio::run::PoolId new_id(next_major.fetch_add(1), 0);
+  clio::run::PoolConfig pc;
+  pc.mod_name_ = "clio_bdev";
+  pc.pool_name_ = path;
+  pc.pool_id_ = new_id;
+  pc.pool_query_ = clio::run::PoolQuery::Local();
+  pc.config_ = "bdev_type: file\ncapacity: " + capacity + "\nalloc_log: " +
+               path + ".alog\n";
+  auto fut = CLIO_ADMIN->AsyncCompose(pc);
+  fut.Wait();
+  return new_id;
+}
+
+/** Mark a member faulty / unlink it. Returns the task return code (0 = ok). */
+inline uint32_t py_safe_bdev_remove_bdev(const std::string& safe_pool_id_str,
+                                         const std::string& target_pool_id_str,
+                                         uint32_t was_faulty) {
+  clio::run::safe_bdev::Client safe(
+      clio::run::PoolId::FromString(safe_pool_id_str));
+  auto fut = safe.AsyncRemoveBdev(
+      clio::run::PoolQuery::Dynamic(),
+      clio::run::PoolId::FromString(target_pool_id_str), was_faulty);
+  fut.Wait();
+  return fut->GetReturnCode();
+}
+
+/** Grow the array: compose a fresh bdev and attach it (data or parity).
+ *  Returns the new member's "major.minor" pool id, or "" on failure. */
+inline std::string py_safe_bdev_add_bdev(const std::string& safe_pool_id_str,
+                                         const std::string& member_path,
+                                         const std::string& capacity,
+                                         uint32_t node_id, uint32_t as_parity) {
+  clio::run::PoolId member_id = py_compose_bdev_pool(member_path, capacity);
+  clio::run::safe_bdev::Client safe(
+      clio::run::PoolId::FromString(safe_pool_id_str));
+  auto fut = safe.AsyncAddBdev(clio::run::PoolQuery::Dynamic(), member_path,
+                               node_id, member_id, as_parity);
+  fut.Wait();
+  return (fut->GetReturnCode() == 0) ? py_pool_id_str(member_id) : std::string();
+}
+
+/** Replace a failed member: mark it faulty, compose a fresh bdev, and recover
+ *  the lost shards onto it (the "add another to trigger recovery" flow).
+ *  Returns the replacement's pool id, or "" on failure. */
+inline std::string py_safe_bdev_replace_bdev(
+    const std::string& safe_pool_id_str, const std::string& failed_pool_id_str,
+    const std::string& member_path, const std::string& capacity,
+    uint32_t node_id) {
+  clio::run::safe_bdev::Client safe(
+      clio::run::PoolId::FromString(safe_pool_id_str));
+  clio::run::PoolId failed = clio::run::PoolId::FromString(failed_pool_id_str);
+  // 1. Mark the failed member faulty (idempotent if already faulty).
+  {
+    auto rm =
+        safe.AsyncRemoveBdev(clio::run::PoolQuery::Dynamic(), failed, 1);
+    rm.Wait();
+  }
+  // 2. Compose the replacement bdev.
+  clio::run::PoolId new_id = py_compose_bdev_pool(member_path, capacity);
+  // 3. Reconstruct onto it. Recovery progress is now visible via Monitor.
+  auto rec = safe.AsyncRecoverBdev(clio::run::PoolQuery::Dynamic(), failed,
+                                   member_path, node_id, new_id);
+  rec.Wait();
+  return (rec->GetReturnCode() == 0) ? py_pool_id_str(new_id) : std::string();
 }
 
 #endif  // PY_WRAPPER_H_

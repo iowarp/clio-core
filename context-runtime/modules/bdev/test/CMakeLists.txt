@@ -114,6 +114,31 @@ if(CLIO_CORE_ENABLE_TESTS)
     LABELS "msan_skip"
     ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_MODE=1;CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10500;CLIO_FORCE_NET=1"
   )
+
+  # Full-chain bdev -> ML prediction integration (Linux only). A driver script
+  # stands up the live Python model server, then runs the
+  # bdev_failure_prediction_integration case: a real bdev's Monitor("stats")
+  # collects device health, derives the drive type, and calls the live model for
+  # a real inference that must round-trip back through the bdev payload. SKIPs
+  # (SKIP_RETURN_CODE 77) when python deps or the git-lfs models are absent, so
+  # an ordinary build never fails on it; the dedicated CI section installs the
+  # deps and runs `ctest -L prediction_e2e`. The env mirrors the other bdev
+  # tests (embedded runtime needs CLIO_TEST_MODE/BIND_ADDR/REPO_PATH) with a
+  # distinct CLIO_PORT so it can run alongside them.
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_test(
+      NAME cr_bdev_prediction_integration
+      COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/run_bdev_prediction_integration.sh
+              $<TARGET_FILE:${BDEV_TEST_TARGET}>
+              ${CMAKE_SOURCE_DIR}/prediction_server
+    )
+    set_tests_properties(cr_bdev_prediction_integration PROPERTIES
+      TIMEOUT 300
+      SKIP_RETURN_CODE 77
+      LABELS "prediction_e2e;msan_skip"
+      ENVIRONMENT "CLIO_REPO_PATH=${CMAKE_BINARY_DIR}/bin;LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_MODE=1;CLIO_BIND_ADDR=127.0.0.1;CLIO_PORT=10600"
+    )
+  endif()
 endif()
 
 # Custom targets for bdev tests

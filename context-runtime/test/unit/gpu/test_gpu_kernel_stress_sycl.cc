@@ -11,7 +11,7 @@
  *
  * SYCL twin of test_gpu_kernel_stress_gpu.cc. SYCL kernels run as
  * single_task by convention in this codebase (the CLIO_GPU_INIT
- * macro and IpcGpu2Cpu::ClientSend assume one work-item per kernel),
+ * macro and IpcGpu2Cpu::SendIn assume one work-item per kernel),
  * so we serialize submissions on the host: per slot, launch a
  * single_task that does Send + Wait, queue them all without waiting,
  * then wait_and_throw on the SYCL queue. The CPU GPU worker pops them

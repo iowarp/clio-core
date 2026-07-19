@@ -787,6 +787,12 @@ struct ClientConnectTask : public clio::run::Task {
   // Worker task queue SHM offset (for SHM-mode client attach)
   OUT clio::run::u64 worker_queues_off_;  ///< SHM offset of worker_queues_ within queue allocator
 
+  // #642: worker OS thread ids so an SHM client can address each worker's
+  // "clio-<server_pid>-<worker_tid>" MPSC receive server.
+  static constexpr clio::run::u32 kMaxWorkerTids = 64;
+  OUT clio::run::u32 num_worker_tids_;
+  OUT clio::run::u32 worker_tids_[kMaxWorkerTids];
+
   // Pid-based allocator ids of the server's SHM segments (pid.1 main, pid.2
   // queue). Returned dynamically so the client attaches the right allocators
   // rather than assuming (1,0)/(2,0).
@@ -810,8 +816,10 @@ struct ClientConnectTask : public clio::run::Task {
         server_generation_(0),
         server_pid_(0),
         worker_queues_off_(0),
+        num_worker_tids_(0),
         num_gpus_(0),
         gpu_queue_depth_(0) {
+    memset(worker_tids_, 0, sizeof(worker_tids_));
     memset(cpu2gpu_queue_off_, 0, sizeof(cpu2gpu_queue_off_));
     memset(gpu2cpu_queue_off_, 0, sizeof(gpu2cpu_queue_off_));
     memset(gpu2gpu_queue_off_, 0, sizeof(gpu2gpu_queue_off_));
@@ -829,8 +837,10 @@ struct ClientConnectTask : public clio::run::Task {
         server_generation_(0),
         server_pid_(0),
         worker_queues_off_(0),
+        num_worker_tids_(0),
         num_gpus_(0),
         gpu_queue_depth_(0) {
+    memset(worker_tids_, 0, sizeof(worker_tids_));
     task_id_ = task_node;
     pool_id_ = pool_id;
     method_ = Method::kClientConnect;
@@ -854,6 +864,10 @@ struct ClientConnectTask : public clio::run::Task {
     Task::SerializeOut(ar);
     ar(response_, server_generation_, server_pid_, worker_queues_off_,
        main_alloc_id_, queue_alloc_id_, num_gpus_, gpu_queue_depth_);
+    ar(num_worker_tids_);
+    for (clio::run::u32 i = 0; i < kMaxWorkerTids; ++i) {
+      ar(worker_tids_[i]);
+    }
     for (clio::run::u32 i = 0; i < kMaxGpuDevices; ++i) {
       ar(cpu2gpu_queue_off_[i], gpu2cpu_queue_off_[i], gpu2gpu_queue_off_[i],
          cpu2gpu_backend_size_[i], gpu2cpu_backend_size_[i]);
@@ -1738,6 +1752,65 @@ struct HeartbeatTask : public clio::run::Task {
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
     Copy(other_base.template Cast<HeartbeatTask>());
+  }
+};
+
+/**
+ * QueryTaskProgressTask - ask a node whether a specific in-flight replica task
+ * is still alive (issue #628). Sent by the origin to a replica's target node
+ * when the origin has been waiting on that replica beyond the task-progress
+ * interval. The target answers from its recv_map_: kRunning if the replica is
+ * still present (received, not yet responded), kGone otherwise (never received,
+ * already responded, or dropped by a restart).
+ */
+struct QueryTaskProgressTask : public clio::run::Task {
+  IN clio::run::u64 query_net_key_;    // origin's send_map key (origin task ptr)
+  IN clio::run::u32 query_replica_id_; // which replica of that origin
+  OUT clio::run::u32 status_;          // 0 = kGone, 1 = kRunning
+
+  /** SHM default constructor */
+  QueryTaskProgressTask()
+      : clio::run::Task(), query_net_key_(0), query_replica_id_(0), status_(0) {}
+
+  /** Emplace constructor */
+  explicit QueryTaskProgressTask(const clio::run::TaskId &task_node,
+                                 const clio::run::PoolId &pool_id,
+                                 const clio::run::PoolQuery &pool_query,
+                                 clio::run::u64 query_net_key,
+                                 clio::run::u32 query_replica_id)
+      : clio::run::Task(task_node, pool_id, pool_query,
+                        Method::kQueryTaskProgress),
+        query_net_key_(query_net_key), query_replica_id_(query_replica_id),
+        status_(0) {
+    task_id_ = task_node;
+    pool_id_ = pool_id;
+    method_ = Method::kQueryTaskProgress;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+    ar(query_net_key_, query_replica_id_);
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+    ar(status_);
+  }
+
+  void Copy(const ctp::ipc::FullPtr<QueryTaskProgressTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+    query_net_key_ = other->query_net_key_;
+    query_replica_id_ = other->query_replica_id_;
+    status_ = other->status_;
+  }
+
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    Task::AggregateOut(other_base);
+    Copy(other_base.template Cast<QueryTaskProgressTask>());
   }
 };
 

@@ -1,5 +1,5 @@
 # ------------------------------------------------------------------------------
-# IOWarp HDF5 VOL Connector
+# Clio HDF5 VOL Connector
 # Requires: CLIO_CTE_ENABLE_HDF5_VOL=ON and HDF5 >= 1.14
 #
 # NOTE: the VOL connector API this source targets (H5VL_VERSION 3, the
@@ -21,19 +21,19 @@ if(HDF5_VERSION VERSION_LESS "1.14.0")
   return()
 endif()
 
-message(STATUS "Building HDF5 VOL adapter (iowarp_hdf5_vol)")
+message(STATUS "Building HDF5 VOL adapter (clio_hdf5_vol)")
 
-add_library(iowarp_hdf5_vol SHARED
-    iowarp_vol.cc
+add_library(clio_hdf5_vol SHARED
+    clio_vol.cc
 )
 
-target_include_directories(iowarp_hdf5_vol PRIVATE
+target_include_directories(clio_hdf5_vol PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${HDF5_INCLUDE_DIRS}
     ${HDF5_C_INCLUDE_DIRS}
 )
 
-target_link_libraries(iowarp_hdf5_vol
+target_link_libraries(clio_hdf5_vol
     clio_cte_core_client
     clio_cte_core_runtime
     clio::run::admin_runtime
@@ -45,14 +45,17 @@ target_link_libraries(iowarp_hdf5_vol
     ${CMAKE_THREAD_LIBS_INIT}
 )
 
-set_target_properties(iowarp_hdf5_vol PROPERTIES
+set_target_properties(clio_hdf5_vol PROPERTIES
     CXX_STANDARD 17
     CXX_STANDARD_REQUIRED ON
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+    # Export all symbols so the DLL exposes H5VL_clio_register (and friends)
+    # to tests/consumers on Windows, where symbols are hidden by default.
+    WINDOWS_EXPORT_ALL_SYMBOLS ON
 )
 
-install(TARGETS iowarp_hdf5_vol
+install(TARGETS clio_hdf5_vol
     LIBRARY DESTINATION lib
     ARCHIVE DESTINATION lib
 )

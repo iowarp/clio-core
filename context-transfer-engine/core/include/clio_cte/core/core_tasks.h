@@ -35,6 +35,7 @@
 #define WRPCTE_CORE_TASKS_H_
 
 #include <algorithm>
+#include <cassert>
 
 #include <clio_runtime/clio_runtime.h>
 #include <clio_cte/core/autogen/core_methods.h>
@@ -47,6 +48,8 @@
 #include <clio_runtime/bdev/bdev_client.h>
 // Include mutex for BlobInfo prealloc_lock_
 #include <clio_ctp/thread/lock/mutex.h>
+// Include atomic_ref for BlobInfo write_owner_ (per-blob async write lock)
+#include <clio_ctp/types/atomic.h>
 #if CTP_IS_HOST
 #include <yaml-cpp/yaml.h>
 
@@ -155,6 +158,10 @@ struct CreateParams {
        config_.gpu_metadata_cache_.capacity_bytes_,
        config_.gpu_metadata_cache_.max_blobs_,
        config_.gpu_metadata_cache_.max_tags_,
+       config_.performance_.stat_targets_period_ms_,
+       config_.organizer_.name_,
+       config_.organizer_.organizer_tasks_,
+       config_.organizer_.period_ms_,
        gpu_cache_ptr_);
   }
 
@@ -219,6 +226,7 @@ struct TargetInfo {
   clio::run::u64 remaining_space_;  // Remaining allocatable space in bytes
   clio::run::u64 max_capacity_;     // Total (max) capacity in bytes, fixed at register
   clio::run::bdev::PerfMetrics perf_metrics_;  // Performance metrics from bdev
+  clio::run::u32 expected_ttl_days_; // Predictive device TTL (defaults to 999999)
   clio::run::bdev::PersistenceLevel persistence_level_;
   // Underlying bdev type, captured at RegisterTarget time. Used by the
   // GPU metadata cache projection to decide whether a blob landed in a
@@ -235,6 +243,7 @@ struct TargetInfo {
         target_score_(0.0f),
         remaining_space_(0),
         max_capacity_(0),
+        expected_ttl_days_(999999),
         persistence_level_(clio::run::bdev::PersistenceLevel::kVolatile),
         bdev_type_(clio::run::bdev::BdevType::kFile) {}
 
@@ -249,6 +258,7 @@ struct TargetInfo {
         target_score_(0.0f),
         remaining_space_(0),
         max_capacity_(0),
+        expected_ttl_days_(999999),
         persistence_level_(clio::run::bdev::PersistenceLevel::kVolatile) {}
 #endif
 
@@ -265,6 +275,7 @@ struct TargetInfo {
         remaining_space_(other.remaining_space_),
         max_capacity_(other.max_capacity_),
         perf_metrics_(other.perf_metrics_),
+        expected_ttl_days_(other.expected_ttl_days_),
         persistence_level_(other.persistence_level_),
         bdev_type_(other.bdev_type_) {}
 
@@ -282,6 +293,7 @@ struct TargetInfo {
       remaining_space_ = other.remaining_space_;
       max_capacity_ = other.max_capacity_;
       perf_metrics_ = other.perf_metrics_;
+      expected_ttl_days_ = other.expected_ttl_days_;
       persistence_level_ = other.persistence_level_;
       bdev_type_ = other.bdev_type_;
     }
@@ -300,6 +312,11 @@ struct RegisterTargetTask : public clio::run::Task {
   IN clio::run::u64 total_size_;                 // Total size for allocation
   IN clio::run::PoolQuery target_query_;  // Target pool query for bdev API calls
   IN clio::run::PoolId bdev_id_;          // PoolId to create for the underlying bdev
+  // 0 = create a new bdev at bdev_id_ (default, as before); 1 = bind to the
+  // ALREADY-EXISTING pool at bdev_id_ without creating it (e.g. a safe-bdev
+  // pool). When attaching, the handler validates the pool via GetStats and
+  // skips AsyncCreate.
+  IN clio::run::u32 attach_existing_;
 
   // SHM constructor
   CTP_CROSS_FUN RegisterTargetTask()
@@ -307,20 +324,23 @@ struct RegisterTargetTask : public clio::run::Task {
         target_name_(CLIO_PRIV_ALLOC),
         bdev_type_(clio::run::bdev::BdevType::kFile),
         total_size_(0),
-        bdev_id_(clio::run::PoolId::GetNull()) {}
+        bdev_id_(clio::run::PoolId::GetNull()),
+        attach_existing_(0) {}
 
   // Emplace constructor
   CTP_CROSS_FUN explicit RegisterTargetTask(
       const clio::run::TaskId &task_id, const clio::run::PoolId &pool_id,
       const clio::run::PoolQuery &pool_query, const std::string &target_name,
       clio::run::bdev::BdevType bdev_type, clio::run::u64 total_size,
-      const clio::run::PoolQuery &target_query, const clio::run::PoolId &bdev_id)
+      const clio::run::PoolQuery &target_query, const clio::run::PoolId &bdev_id,
+      clio::run::u32 attach_existing = 0)
       : clio::run::Task(task_id, pool_id, pool_query, Method::kRegisterTarget),
         target_name_(CLIO_PRIV_ALLOC, target_name),
         bdev_type_(bdev_type),
         total_size_(total_size),
         target_query_(target_query),
-        bdev_id_(bdev_id) {
+        bdev_id_(bdev_id),
+        attach_existing_(attach_existing) {
     task_id_ = task_id;
     pool_id_ = pool_id;
     method_ = Method::kRegisterTarget;
@@ -334,7 +354,8 @@ struct RegisterTargetTask : public clio::run::Task {
   template <typename Archive>
   CTP_CROSS_FUN void SerializeIn(Archive &ar) {
     Task::SerializeIn(ar);
-    ar(target_name_, bdev_type_, total_size_, target_query_, bdev_id_);
+    ar(target_name_, bdev_type_, total_size_, target_query_, bdev_id_,
+       attach_existing_);
   }
 
   /**
@@ -363,6 +384,7 @@ struct RegisterTargetTask : public clio::run::Task {
     total_size_ = other->total_size_;
     target_query_ = other->target_query_;
     bdev_id_ = other->bdev_id_;
+    attach_existing_ = other->attach_existing_;
   }
 
   /**
@@ -742,9 +764,18 @@ struct BlobBlock {
   clio::run::bdev::Client bdev_client_;  // Bdev client for this block's target
   clio::run::PoolQuery target_query_;         // Target pool query for bdev API calls
   clio::run::u64 target_offset_;  // Offset within target where this block is stored
-  clio::run::u64 size_;           // Size of this block in bytes
+  clio::run::u64 size_;           // Logical bytes used in this block
+  // Physical bytes allocated on the bdev (>= size_). The bdev rounds every
+  // allocation up to a 4 KB slab, so a tiny append otherwise burns a whole slab
+  // for a few bytes AND pushes a new block. Tracking the slab capacity lets
+  // ExtendBlob grow size_ into a block's spare capacity on the next append
+  // instead of allocating a fresh block -- collapsing the O(writes) block list
+  // and physical waste that made generic/069 O(N^2)+ENOSPC. Frees and
+  // remaining_space_ accounting use capacity_ (the real footprint). The 4-arg
+  // ctor defaults capacity_ = size_ (no spare) so legacy call sites are safe.
+  clio::run::u64 capacity_;
 
-  CTP_CROSS_FUN BlobBlock() : target_offset_(0), size_(0) {}
+  CTP_CROSS_FUN BlobBlock() : target_offset_(0), size_(0), capacity_(0) {}
 
   CTP_CROSS_FUN BlobBlock(const clio::run::bdev::Client &client,
                            const clio::run::PoolQuery &target_query, clio::run::u64 offset,
@@ -752,7 +783,17 @@ struct BlobBlock {
       : bdev_client_(client),
         target_query_(target_query),
         target_offset_(offset),
-        size_(size) {}
+        size_(size),
+        capacity_(size) {}
+
+  CTP_CROSS_FUN BlobBlock(const clio::run::bdev::Client &client,
+                           const clio::run::PoolQuery &target_query, clio::run::u64 offset,
+                           clio::run::u64 size, clio::run::u64 capacity)
+      : bdev_client_(client),
+        target_query_(target_query),
+        target_offset_(offset),
+        size_(size),
+        capacity_(capacity) {}
 };
 
 /**
@@ -764,6 +805,12 @@ struct BlobInfo {
   float score_;  // 0-1 score for reorganization
   Timestamp last_modified_;
   Timestamp last_read_;
+  // Number of data ops (PutBlob/GetBlob) served by this blob since creation.
+  // Consumed by the frecency data organizer (issue #738) as the "frequency"
+  // half of the frecency score. Transient runtime stat — not persisted to
+  // the WAL/metadata log, so it resets on restart (organizers must treat a
+  // zero count as "cold or freshly restored", which decays gracefully).
+  clio::run::u64 access_count_;
   int compress_lib_;     // Compression library ID used for this blob (0 = no
                          // compression)
   int compress_preset_;  // Compression preset used (1=FAST, 2=BALANCED, 3=BEST)
@@ -771,6 +818,23 @@ struct BlobInfo {
       trace_key_;  // Unique trace ID for linking to trace logs (0 = not traced)
   clio::run::u64 preallocated_size_;  // Total preallocated capacity in bytes
   ctp::Mutex prealloc_lock_;   // Mutex for preallocation
+  // Per-blob async write-serialization token (issue #680 / generic/074).
+  // Concurrent PutBlob/Resize/Truncate tasks for the SAME blob hash to the same
+  // container and interleave on ONE worker across co_await points, racing on
+  // blocks_ (the block layout) and the size read-modify-write — corrupting
+  // data (fsx O_DIRECT mismatches). This token serializes them WITHOUT blocking
+  // the worker thread: a contender busy-polls via `co_await yield()` (see
+  // PutBlobImpl), which is lost-wakeup-proof because it re-checks every worker
+  // iteration. A thread-blocking lock (ctp::Mutex / CoRwLock) CANNOT be used
+  // here — it would deadlock the single worker the instant the holder suspends
+  // at a co_await. 0 == unlocked; otherwise a non-zero per-task owner token.
+  clio::run::u64 write_owner_;
+  // Maintained mirror of sum(blocks_[i].size_). GetTotalSize() returns this in
+  // O(1) instead of an O(blocks) sum; every blocks_ mutation MUST keep it in
+  // sync (ExtendBlob updates it incrementally; cold paths call
+  // RecomputeTotalSize()). Without it, a file built by millions of tiny
+  // O_APPEND writes pays an O(blocks) sum on every put -> O(N^2) (generic/069).
+  clio::run::u64 total_size_cache_;
 
   CTP_CROSS_FUN BlobInfo()
       : blob_name_(CLIO_PRIV_ALLOC),
@@ -778,10 +842,13 @@ struct BlobInfo {
         score_(0.0f),
         last_modified_(0),
         last_read_(0),
+        access_count_(0),
         compress_lib_(0),
         compress_preset_(2),
         trace_key_(0),
-        preallocated_size_(0) {
+        preallocated_size_(0),
+        write_owner_(0),
+        total_size_cache_(0) {
     prealloc_lock_.Init();
   }
 
@@ -791,10 +858,13 @@ struct BlobInfo {
         score_(score),
         last_modified_(0),
         last_read_(0),
+        access_count_(0),
         compress_lib_(0),
         compress_preset_(2),
         trace_key_(0),
-        preallocated_size_(0) {
+        preallocated_size_(0),
+        write_owner_(0),
+        total_size_cache_(0) {
     prealloc_lock_.Init();
   }
 
@@ -805,10 +875,13 @@ struct BlobInfo {
         score_(score),
         last_modified_(GetCurrentTimeNs()),
         last_read_(GetCurrentTimeNs()),
+        access_count_(0),
         compress_lib_(0),
         compress_preset_(2),
         trace_key_(0),
-        preallocated_size_(0) {
+        preallocated_size_(0),
+        write_owner_(0),
+        total_size_cache_(0) {
     prealloc_lock_.Init();
   }
 #endif
@@ -819,10 +892,13 @@ struct BlobInfo {
         score_(other.score_),
         last_modified_(other.last_modified_),
         last_read_(other.last_read_),
+        access_count_(other.access_count_),
         compress_lib_(other.compress_lib_),
         compress_preset_(other.compress_preset_),
         trace_key_(other.trace_key_),
-        preallocated_size_(other.preallocated_size_) {
+        preallocated_size_(other.preallocated_size_),
+        write_owner_(0),  // a fresh copy is unlocked; never inherit lock state
+        total_size_cache_(other.total_size_cache_) {
     prealloc_lock_.Init();
   }
 
@@ -833,22 +909,96 @@ struct BlobInfo {
       score_ = other.score_;
       last_modified_ = other.last_modified_;
       last_read_ = other.last_read_;
+      access_count_ = other.access_count_;
       compress_lib_ = other.compress_lib_;
       compress_preset_ = other.compress_preset_;
       trace_key_ = other.trace_key_;
       preallocated_size_ = other.preallocated_size_;
+      total_size_cache_ = other.total_size_cache_;
     }
     return *this;
   }
 
-  CTP_CROSS_FUN clio::run::u64 GetTotalSize() const {
+  // Authoritative O(blocks) sum; the source of truth for total_size_cache_.
+  CTP_CROSS_FUN clio::run::u64 ComputeTotalSizeSlow() const {
     clio::run::u64 total = 0;
     for (size_t i = 0; i < blocks_.size(); ++i) {
       total += blocks_[i].size_;
     }
     return total;
   }
+
+  // Reset the cache to the authoritative sum. Call after any blocks_ mutation
+  // that does not update the cache incrementally (Resize/Truncate/WAL replay/
+  // restore) -- these are cold paths where the O(blocks) recompute is fine.
+  CTP_CROSS_FUN void RecomputeTotalSize() {
+    total_size_cache_ = ComputeTotalSizeSlow();
+  }
+
+  // O(1) total size. Returns the maintained cache; a debug/sanitizer build
+  // asserts it still equals the authoritative sum so any missed mutation site
+  // is caught during testing before it can corrupt a size in release.
+  CTP_CROSS_FUN clio::run::u64 GetTotalSize() const {
+#if !defined(NDEBUG) && CTP_IS_HOST
+    assert(ComputeTotalSizeSlow() == total_size_cache_ &&
+           "BlobInfo::total_size_cache_ drifted from sum(blocks_)");
+#endif
+    return total_size_cache_;
+  }
+
+#if CTP_IS_HOST
+  /**
+   * Try to acquire the per-blob write lock for owner token `tok` (must be
+   * non-zero). Returns true if it was free (now held by `tok`) or already held
+   * by `tok` (reentrant, same task). There is NO co_await inside, so this whole
+   * method is atomic with respect to other coroutines on the same worker
+   * (cooperative scheduling only switches at co_await). The atomic_ref makes it
+   * additionally safe if the container is ever serviced from another thread.
+   * @param tok Non-zero per-task owner token (e.g. the Task pointer).
+   * @return true if the caller now holds the lock.
+   */
+  bool TryLockWrite(clio::run::u64 tok) {
+    ctp::ipc::atomic_ref<clio::run::u64> ref(write_owner_);
+    clio::run::u64 expected = 0;
+    if (ref.compare_exchange_strong(expected, tok)) return true;
+    return ref.load() == tok;  // reentrant: already ours
+  }
+
+  /**
+   * Release the per-blob write lock if (and only if) it is held by `tok`.
+   * Synchronous (no co_await), so it is safe to call from a RAII destructor on
+   * any coroutine exit path.
+   * @param tok The owner token used to acquire.
+   */
+  void UnlockWrite(clio::run::u64 tok) {
+    ctp::ipc::atomic_ref<clio::run::u64> ref(write_owner_);
+    clio::run::u64 expected = tok;
+    ref.compare_exchange_strong(expected, 0);
+  }
+#endif  // CTP_IS_HOST
 };
+
+#if CTP_IS_HOST
+/**
+ * RAII release guard for BlobInfo's per-blob write lock. Acquisition is done by
+ * the caller (it needs `co_await yield()` to busy-poll, which cannot live in a
+ * constructor); this guard only guarantees the lock is released on EVERY scope
+ * exit — normal return, early CLIO_CO_RETURN, or a thrown exception — so no
+ * error path can leak the lock and wedge the blob. UnlockWrite is a plain CAS,
+ * legal in a destructor (no co_await).
+ */
+struct BlobWriteLockGuard {
+  BlobInfo *blob_;
+  clio::run::u64 tok_;
+  BlobWriteLockGuard(BlobInfo *blob, clio::run::u64 tok)
+      : blob_(blob), tok_(tok) {}
+  ~BlobWriteLockGuard() {
+    if (blob_ != nullptr) blob_->UnlockWrite(tok_);
+  }
+  BlobWriteLockGuard(const BlobWriteLockGuard &) = delete;
+  BlobWriteLockGuard &operator=(const BlobWriteLockGuard &) = delete;
+};
+#endif  // CTP_IS_HOST
 
 /**
  * Context structure for workflow-aware compression
@@ -862,6 +1012,18 @@ struct Context {
 
   clio::run::u64 preallocate_;  // Preallocate this many bytes for GPU block storage
                           // (0 = disabled)
+
+  // I/O emulation (issue #747). When emulate_ is set, PutBlob/GetBlob skip
+  // the data-transfer phase (and all WAL logging) and instead estimate how
+  // long the I/O WOULD have taken from the targets' latency-bandwidth model,
+  // returned in emulated_time_ns_. Metadata effects (blob creation, block
+  // allocation, tag sizes, access stats) still happen, so tier capacities
+  // and placement decisions stay realistic — but emulated blob bytes are
+  // never written (reads of them return whatever the recycled blocks hold).
+  // Built for training RL data-organization policies without paying for the
+  // actual I/O.
+  bool emulate_;                    // IN: skip real I/O, model the time
+  clio::run::u64 emulated_time_ns_;  // OUT: modeled duration of the skipped I/O
 
 #if CTP_ENABLE_COMPRESS
   int dynamic_compress_;  // 0 - skip, 1 - static, 2 - dynamic
@@ -892,7 +1054,9 @@ struct Context {
   CTP_CROSS_FUN Context()
       : persistence_target_(-1),
         min_persistence_level_(0),
-        preallocate_(0)
+        preallocate_(0),
+        emulate_(false),
+        emulated_time_ns_(0)
 #if CTP_ENABLE_COMPRESS
         ,
         dynamic_compress_(0),
@@ -917,7 +1081,8 @@ struct Context {
 
   template <class Archive>
   CTP_CROSS_FUN void serialize(Archive &ar) {
-    ar.range(persistence_target_, min_persistence_level_, preallocate_);
+    ar.range(persistence_target_, min_persistence_level_, preallocate_,
+             emulate_, emulated_time_ns_);
 #if CTP_ENABLE_COMPRESS
     ar.range(dynamic_compress_, compress_lib_, compress_preset_, target_psnr_,
              psnr_chance_, max_performance_, consumer_node_, data_type_,
@@ -930,6 +1095,13 @@ struct Context {
   CTP_CROSS_FUN static Context Preallocate(clio::run::u64 size) {
     Context ctx;
     ctx.preallocate_ = size;
+    return ctx;
+  }
+
+  /** Convenience: a context with I/O emulation enabled (issue #747). */
+  CTP_CROSS_FUN static Context Emulate() {
+    Context ctx;
+    ctx.emulate_ = true;
     return ctx;
   }
 };
@@ -1210,7 +1382,13 @@ struct PutBlobTask : public clio::run::Task {
     ar(tag_id_, blob_name_, offset_, size_, blob_data_,
        score_, context_, flags_, gpu_page_idx_, submit_ts_ns_);
     ar.PopPod();
-    ar.bulk(blob_data_, size_, BULK_XFER);
+    // Emulated puts (issue #747) never write the payload, so don't ship it
+    // over the wire either — the whole point is to not pay for the I/O.
+    // context_ is (de)serialized above, so both the save and load sides
+    // agree on whether the bulk follows.
+    if (!context_.emulate_) {
+      ar.bulk(blob_data_, size_, BULK_XFER);
+    }
   }
 
   /**
@@ -1282,6 +1460,7 @@ struct GetBlobTask : public clio::run::Task {
    */
   static constexpr clio::run::u32 kNoPageIdx = ~static_cast<clio::run::u32>(0);
   IN clio::run::u32 gpu_page_idx_;
+  INOUT Context context_;  // Emulation control + modeled time (issue #747)
 
   // SHM constructor
   CTP_CROSS_FUN GetBlobTask()
@@ -1292,7 +1471,8 @@ struct GetBlobTask : public clio::run::Task {
         size_(0),
         flags_(0),
         blob_data_(ctp::ipc::ShmPtr<>::GetNull()),
-        gpu_page_idx_(kNoPageIdx) {}
+        gpu_page_idx_(kNoPageIdx),
+        context_() {}
 
   // Emplace constructor
   CTP_CROSS_FUN explicit GetBlobTask(const clio::run::TaskId &task_id,
@@ -1301,7 +1481,8 @@ struct GetBlobTask : public clio::run::Task {
                                       const TagId &tag_id,
                                       const std::string &blob_name,
                                       clio::run::u64 offset, clio::run::u64 size,
-                                      clio::run::u32 flags, ctp::ipc::ShmPtr<> blob_data)
+                                      clio::run::u32 flags, ctp::ipc::ShmPtr<> blob_data,
+                                      const Context &context = Context())
       : clio::run::Task(task_id, pool_id, pool_query, Method::kGetBlob),
         tag_id_(tag_id),
         blob_name_(CLIO_PRIV_ALLOC, blob_name),
@@ -1309,7 +1490,8 @@ struct GetBlobTask : public clio::run::Task {
         size_(size),
         flags_(flags),
         blob_data_(blob_data),
-        gpu_page_idx_(kNoPageIdx) {
+        gpu_page_idx_(kNoPageIdx),
+        context_(context) {
     task_id_ = task_id;
     pool_id_ = pool_id;
     method_ = Method::kGetBlob;
@@ -1354,7 +1536,8 @@ struct GetBlobTask : public clio::run::Task {
                                       const TagId &tag_id,
                                       const char *blob_name, clio::run::u64 offset,
                                       clio::run::u64 size, clio::run::u32 flags,
-                                      ctp::ipc::ShmPtr<> blob_data)
+                                      ctp::ipc::ShmPtr<> blob_data,
+                                      const Context &context = Context())
       : clio::run::Task(task_id, pool_id, pool_query, Method::kGetBlob),
         tag_id_(tag_id),
         blob_name_(CLIO_PRIV_ALLOC, blob_name),
@@ -1362,7 +1545,8 @@ struct GetBlobTask : public clio::run::Task {
         size_(size),
         flags_(flags),
         blob_data_(blob_data),
-        gpu_page_idx_(kNoPageIdx) {
+        gpu_page_idx_(kNoPageIdx),
+        context_(context) {
     task_id_ = task_id;
     pool_id_ = pool_id;
     method_ = Method::kGetBlob;
@@ -1378,9 +1562,13 @@ struct GetBlobTask : public clio::run::Task {
     ar.PushPod(blob_name_.UsingSso());
     Task::SerializeIn(ar);
     ar(tag_id_, blob_name_, offset_, size_, flags_, blob_data_,
-       gpu_page_idx_);
+       gpu_page_idx_, context_);
     ar.PopPod();
-    ar.bulk(blob_data_, size_, BULK_EXPOSE);
+    // Emulated gets (issue #747) return no data, so the caller's buffer
+    // does not need to be exposed for the response.
+    if (!context_.emulate_) {
+      ar.bulk(blob_data_, size_, BULK_EXPOSE);
+    }
   }
 
   /**
@@ -1389,7 +1577,13 @@ struct GetBlobTask : public clio::run::Task {
   template <typename Archive>
   CTP_CROSS_FUN void SerializeOut(Archive &ar) {
     Task::SerializeOut(ar);
-    ar.bulk(blob_data_, size_, BULK_XFER);
+    // context_ is INOUT: carries emulated_time_ns_ back (issue #747). An
+    // emulated get read nothing, so no data bulk follows — the caller's
+    // buffer is left untouched and the wire cost is metadata-only.
+    ar(context_);
+    if (!context_.emulate_) {
+      ar.bulk(blob_data_, size_, BULK_XFER);
+    }
   }
 
   /** Fix up priv::string SSO pointer after cudaMemcpy D→H */
@@ -1410,6 +1604,7 @@ struct GetBlobTask : public clio::run::Task {
     flags_ = other->flags_;
     blob_data_ = other->blob_data_;
     gpu_page_idx_ = other->gpu_page_idx_;
+    context_ = other->context_;
   }
 
   /**
@@ -1491,6 +1686,329 @@ struct ReorganizeBlobTask : public clio::run::Task {
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
     Copy(other_base.template Cast<ReorganizeBlobTask>());
+  }
+};
+
+// ===========================================================================
+// Fully-POD, GPU-compatible blob tasks (issue #556).
+//
+// These mirror PutBlob/GetBlob/ReorganizeBlob but carry the blob name in an
+// inline clio::run::priv::fixed_string<32> (no allocator, no SSO) instead of a
+// priv::string. Every field is therefore POD and the whole task is
+// bitwise-relocatable: a cudaMemcpy D<->H of the task is correct with ZERO
+// FixupAfterCopy (none is defined). Blob names are capped at 31 chars + NUL.
+// They share the runtime handler logic with the non-POD tasks via the
+// Runtime::*Impl<TaskT> member templates (same field names; both name types
+// expose .str()).
+// ===========================================================================
+
+/** Inline POD blob name used by all Pod*Blob tasks. */
+using PodBlobName = clio::run::priv::fixed_string<32>;
+
+/**
+ * PodPutBlob - fully-POD, GPU-compatible variant of PutBlobTask.
+ */
+struct PodPutBlobTask : public clio::run::Task {
+  IN TagId tag_id_;
+  INOUT PodBlobName blob_name_;
+  IN clio::run::u64 offset_;
+  IN clio::run::u64 size_;
+  IN ctp::ipc::ShmPtr<> blob_data_;
+  IN float score_;
+  INOUT Context context_;
+  IN clio::run::u32 flags_;
+  static constexpr clio::run::u32 kNoPageIdx = ~static_cast<clio::run::u32>(0);
+  IN clio::run::u32 gpu_page_idx_;
+  IN clio::run::u64 submit_ts_ns_;
+
+  // SHM constructor
+  CTP_CROSS_FUN PodPutBlobTask()
+      : clio::run::Task(),
+        tag_id_(TagId::GetNull()),
+        blob_name_(),
+        offset_(0),
+        size_(0),
+        blob_data_(ctp::ipc::ShmPtr<>::GetNull()),
+        score_(-1.0f),
+        context_(),
+        flags_(0),
+        gpu_page_idx_(kNoPageIdx),
+        submit_ts_ns_(0) {}
+
+  // GPU-compatible emplace constructor (const char* blob name, no allocator)
+  CTP_CROSS_FUN explicit PodPutBlobTask(
+      const clio::run::TaskId &task_id, const clio::run::PoolId &pool_id,
+      const clio::run::PoolQuery &pool_query, const TagId &tag_id,
+      const char *blob_name, clio::run::u64 offset, clio::run::u64 size,
+      ctp::ipc::ShmPtr<> blob_data, float score, const Context &context,
+      clio::run::u32 flags)
+      : clio::run::Task(task_id, pool_id, pool_query, Method::kPodPutBlob),
+        tag_id_(tag_id),
+        blob_name_(blob_name),
+        offset_(offset),
+        size_(size),
+        blob_data_(blob_data),
+        score_(score),
+        context_(context),
+        flags_(flags),
+        gpu_page_idx_(kNoPageIdx),
+        submit_ts_ns_(0) {
+    task_id_ = task_id;
+    pool_id_ = pool_id;
+    method_ = Method::kPodPutBlob;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+#if CTP_IS_HOST
+  // std::string convenience overload (host clients).
+  explicit PodPutBlobTask(const clio::run::TaskId &task_id,
+                          const clio::run::PoolId &pool_id,
+                          const clio::run::PoolQuery &pool_query,
+                          const TagId &tag_id, const std::string &blob_name,
+                          clio::run::u64 offset, clio::run::u64 size,
+                          ctp::ipc::ShmPtr<> blob_data, float score,
+                          const Context &context, clio::run::u32 flags)
+      : PodPutBlobTask(task_id, pool_id, pool_query, tag_id, blob_name.c_str(),
+                       offset, size, blob_data, score, context, flags) {}
+#endif
+
+  /** Destructor — frees blob_data_ when this task owns the buffer (see
+   *  PutBlobTask::~PutBlobTask for the TASK_DATA_OWNER rationale). */
+  CTP_CROSS_FUN ~PodPutBlobTask() {
+#if !CTP_IS_DEVICE_PASS
+    if (task_flags_.Any(TASK_DATA_OWNER) && !blob_data_.IsNull()) {
+      auto *ipc_manager = CLIO_CPU_IPC;
+      if (ipc_manager) {
+        ipc_manager->FreeBuffer(blob_data_.template Cast<char>());
+      }
+    }
+#endif
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+    ar(tag_id_, blob_name_, offset_, size_, blob_data_, score_, context_,
+       flags_, gpu_page_idx_, submit_ts_ns_);
+    // Emulated puts never write the payload — skip the wire transfer too
+    // (issue #747; see PutBlobTask::SerializeIn).
+    if (!context_.emulate_) {
+      ar.bulk(blob_data_, size_, BULK_XFER);
+    }
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+    // Only INOUT fields travel back (see PutBlobTask::SerializeOut for why
+    // blob_data_ must NOT be echoed).
+    ar(blob_name_, context_);
+  }
+
+  // No FixupAfterCopy — fixed_string is position-independent.
+
+  void Copy(const ctp::ipc::FullPtr<PodPutBlobTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+    tag_id_ = other->tag_id_;
+    blob_name_ = other->blob_name_;
+    offset_ = other->offset_;
+    size_ = other->size_;
+    blob_data_ = other->blob_data_;
+    score_ = other->score_;
+    context_ = other->context_;
+    flags_ = other->flags_;
+    gpu_page_idx_ = other->gpu_page_idx_;
+    submit_ts_ns_ = other->submit_ts_ns_;
+  }
+
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    Task::AggregateOut(other_base);
+    Copy(other_base.template Cast<PodPutBlobTask>());
+  }
+};
+
+/**
+ * PodGetBlob - fully-POD, GPU-compatible variant of GetBlobTask.
+ */
+struct PodGetBlobTask : public clio::run::Task {
+  IN TagId tag_id_;
+  IN PodBlobName blob_name_;
+  IN clio::run::u64 offset_;
+  IN clio::run::u64 size_;
+  IN clio::run::u32 flags_;
+  IN ctp::ipc::ShmPtr<> blob_data_;
+  static constexpr clio::run::u32 kNoPageIdx = ~static_cast<clio::run::u32>(0);
+  IN clio::run::u32 gpu_page_idx_;
+  INOUT Context context_;  // Emulation control + modeled time (issue #747)
+
+  // SHM constructor
+  CTP_CROSS_FUN PodGetBlobTask()
+      : clio::run::Task(),
+        tag_id_(TagId::GetNull()),
+        blob_name_(),
+        offset_(0),
+        size_(0),
+        flags_(0),
+        blob_data_(ctp::ipc::ShmPtr<>::GetNull()),
+        gpu_page_idx_(kNoPageIdx),
+        context_() {}
+
+  // GPU-compatible emplace constructor (const char* blob name, no allocator)
+  CTP_CROSS_FUN explicit PodGetBlobTask(
+      const clio::run::TaskId &task_id, const clio::run::PoolId &pool_id,
+      const clio::run::PoolQuery &pool_query, const TagId &tag_id,
+      const char *blob_name, clio::run::u64 offset, clio::run::u64 size,
+      clio::run::u32 flags, ctp::ipc::ShmPtr<> blob_data,
+      const Context &context = Context())
+      : clio::run::Task(task_id, pool_id, pool_query, Method::kPodGetBlob),
+        tag_id_(tag_id),
+        blob_name_(blob_name),
+        offset_(offset),
+        size_(size),
+        flags_(flags),
+        blob_data_(blob_data),
+        gpu_page_idx_(kNoPageIdx),
+        context_(context) {
+    task_id_ = task_id;
+    pool_id_ = pool_id;
+    method_ = Method::kPodGetBlob;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+#if CTP_IS_HOST
+  // std::string convenience overload (host clients).
+  explicit PodGetBlobTask(const clio::run::TaskId &task_id,
+                          const clio::run::PoolId &pool_id,
+                          const clio::run::PoolQuery &pool_query,
+                          const TagId &tag_id, const std::string &blob_name,
+                          clio::run::u64 offset, clio::run::u64 size,
+                          clio::run::u32 flags, ctp::ipc::ShmPtr<> blob_data,
+                          const Context &context = Context())
+      : PodGetBlobTask(task_id, pool_id, pool_query, tag_id, blob_name.c_str(),
+                       offset, size, flags, blob_data, context) {}
+#endif
+
+  /** Destructor — frees blob_data_ when this task owns the buffer (see
+   *  GetBlobTask::~GetBlobTask for the TASK_DATA_OWNER rationale). */
+  CTP_CROSS_FUN ~PodGetBlobTask() {
+#if !CTP_IS_DEVICE_PASS
+    if (task_flags_.Any(TASK_DATA_OWNER) && !blob_data_.IsNull()) {
+      auto *ipc_manager = CLIO_CPU_IPC;
+      if (ipc_manager) {
+        ipc_manager->FreeBuffer(blob_data_.template Cast<char>());
+      }
+    }
+#endif
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+    ar(tag_id_, blob_name_, offset_, size_, flags_, blob_data_, gpu_page_idx_,
+       context_);
+    // Emulated gets return no data — no buffer expose needed (issue #747).
+    if (!context_.emulate_) {
+      ar.bulk(blob_data_, size_, BULK_EXPOSE);
+    }
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+    // context_ is INOUT: carries emulated_time_ns_ back (issue #747). No
+    // data bulk on the emulated path — the caller's buffer stays untouched.
+    ar(context_);
+    if (!context_.emulate_) {
+      ar.bulk(blob_data_, size_, BULK_XFER);
+    }
+  }
+
+  // No FixupAfterCopy — fixed_string is position-independent.
+
+  void Copy(const ctp::ipc::FullPtr<PodGetBlobTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+    tag_id_ = other->tag_id_;
+    blob_name_ = other->blob_name_;
+    offset_ = other->offset_;
+    size_ = other->size_;
+    flags_ = other->flags_;
+    blob_data_ = other->blob_data_;
+    gpu_page_idx_ = other->gpu_page_idx_;
+    context_ = other->context_;
+  }
+
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    Task::AggregateOut(other_base);
+    Copy(other_base.template Cast<PodGetBlobTask>());
+  }
+};
+
+/**
+ * PodReorganizeBlob - fully-POD, GPU-compatible variant of ReorganizeBlobTask.
+ */
+struct PodReorganizeBlobTask : public clio::run::Task {
+  IN TagId tag_id_;
+  IN PodBlobName blob_name_;
+  IN float new_score_;
+
+  // SHM constructor
+  CTP_CROSS_FUN PodReorganizeBlobTask()
+      : clio::run::Task(),
+        tag_id_(TagId::GetNull()),
+        blob_name_(),
+        new_score_(0.0f) {}
+
+  // GPU-compatible emplace constructor (const char* blob name, no allocator)
+  CTP_CROSS_FUN explicit PodReorganizeBlobTask(
+      const clio::run::TaskId &task_id, const clio::run::PoolId &pool_id,
+      const clio::run::PoolQuery &pool_query, const TagId &tag_id,
+      const char *blob_name, float new_score)
+      : clio::run::Task(task_id, pool_id, pool_query,
+                        Method::kPodReorganizeBlob),
+        tag_id_(tag_id),
+        blob_name_(blob_name),
+        new_score_(new_score) {
+    task_id_ = task_id;
+    pool_id_ = pool_id;
+    method_ = Method::kPodReorganizeBlob;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+#if CTP_IS_HOST
+  // std::string convenience overload (host clients).
+  explicit PodReorganizeBlobTask(const clio::run::TaskId &task_id,
+                                 const clio::run::PoolId &pool_id,
+                                 const clio::run::PoolQuery &pool_query,
+                                 const TagId &tag_id,
+                                 const std::string &blob_name, float new_score)
+      : PodReorganizeBlobTask(task_id, pool_id, pool_query, tag_id,
+                              blob_name.c_str(), new_score) {}
+#endif
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+    ar(tag_id_, blob_name_, new_score_);
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+  }
+
+  void Copy(const ctp::ipc::FullPtr<PodReorganizeBlobTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+    tag_id_ = other->tag_id_;
+    blob_name_ = other->blob_name_;
+    new_score_ = other->new_score_;
+  }
+
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    Task::AggregateOut(other_base);
+    Copy(other_base.template Cast<PodReorganizeBlobTask>());
   }
 };
 
@@ -1625,6 +2143,12 @@ struct TruncateBlobTask : public clio::run::Task {
 struct DelTagTask : public clio::run::Task {
   INOUT TagId tag_id_;             // Tag ID to delete (input or lookup result)
   IN clio::run::priv::string tag_name_;  // Tag name for lookup (optional)
+  // POSIX-unlink semantics (#680): when 1, deleting a tag's canonical NAME while
+  // hard-link aliases remain promotes a surviving alias and keeps the tag/blobs
+  // alive (the file survives until its last link is removed). When 0 (default),
+  // deleting the canonical name/id cascade-deletes the tag and all its aliases.
+  // The FUSE/filesystem unlink+rename set this; direct core "delete tag" does not.
+  IN clio::run::u32 posix_unlink_ = 0;
 
   // SHM constructor
   DelTagTask()
@@ -1666,7 +2190,7 @@ struct DelTagTask : public clio::run::Task {
   template <typename Archive>
   CTP_CROSS_FUN void SerializeIn(Archive &ar) {
     Task::SerializeIn(ar);
-    ar(tag_id_, tag_name_);
+    ar(tag_id_, tag_name_, posix_unlink_);
   }
 
   /**
@@ -1686,6 +2210,7 @@ struct DelTagTask : public clio::run::Task {
     Task::Copy(other.template Cast<Task>());
     tag_id_ = other->tag_id_;
     tag_name_ = other->tag_name_;
+    posix_unlink_ = other->posix_unlink_;
   }
 
   /**
@@ -1901,10 +2426,23 @@ struct GetTagSizeTask : public clio::run::Task {
   IN TagId tag_id_;      // Tag ID to query
   OUT size_t tag_size_;  // Total size of all blobs in tag
   OUT clio::run::u64 ctime_;   // Tag change-time (last_changed_), ns; 0 if unknown
+  OUT clio::run::u64 mtime_;   // Tag modify-time (last_modified_), ns; 0 if unknown
+  OUT clio::run::u64 atime_;   // Tag access-time (last_read_), ns; 0 if unknown
 
   // SHM constructor
   GetTagSizeTask()
-      : clio::run::Task(), tag_id_(TagId::GetNull()), tag_size_(0), ctime_(0) {}
+      : clio::run::Task(),
+        tag_id_(TagId::GetNull()),
+        tag_size_(0),
+        ctime_(0),
+        mtime_(0),
+        atime_(0) {
+    // Seed the aggregate accumulator as "not found" so a Broadcast GetTagSize
+    // reports rc=1 only when EVERY container missed the tag; AggregateOut flips
+    // it to 0 as soon as any container reports a share (see AggregateOut). A
+    // locally-executed task overwrites this in Runtime::GetTagSize.
+    return_code_.store(1);
+  }
 
   // Emplace constructor
   CTP_CROSS_FUN explicit GetTagSizeTask(const clio::run::TaskId &task_id,
@@ -1914,12 +2452,16 @@ struct GetTagSizeTask : public clio::run::Task {
       : clio::run::Task(task_id, pool_id, pool_query, Method::kGetTagSize),
         tag_id_(tag_id),
         tag_size_(0),
-        ctime_(0) {
+        ctime_(0),
+        mtime_(0),
+        atime_(0) {
     task_id_ = task_id;
     pool_id_ = pool_id;
     method_ = Method::kGetTagSize;
     task_flags_.Clear();
     pool_query_ = pool_query;
+    // See the SHM constructor: seed "not found" for the Broadcast aggregate.
+    return_code_.store(1);
   }
 
   /**
@@ -1937,7 +2479,7 @@ struct GetTagSizeTask : public clio::run::Task {
   template <typename Archive>
   CTP_CROSS_FUN void SerializeOut(Archive &ar) {
     Task::SerializeOut(ar);
-    ar(tag_size_, ctime_);
+    ar(tag_size_, ctime_, mtime_, atime_);
   }
 
   /**
@@ -1949,17 +2491,56 @@ struct GetTagSizeTask : public clio::run::Task {
     tag_id_ = other->tag_id_;
     tag_size_ = other->tag_size_;
     ctime_ = other->ctime_;
+    mtime_ = other->mtime_;
+    atime_ = other->atime_;
   }
 
   /**
-   * AggregateOut results from a replica task
-   * Sums the tag_size_ values from multiple nodes; keeps the newest ctime.
+   * AggregateOut results from a replica task.
+   *
+   * GetTagSize is a Broadcast SUM: the tag's bytes are spread across every
+   * container that `HashBlobToContainer` routed one of its blobs to, and each
+   * such container carries a TagInfo holding its share. A container that holds
+   * NONE of the tag's blobs has no local TagInfo and legitimately returns
+   * return_code_=1 ("not found here") with tag_size_=0 — that is a zero
+   * contribution to the sum, NOT an error for the whole query.
+   *
+   * The base Task::AggregateOut propagates any non-zero replica return code onto
+   * the aggregate, which poisoned the result: on a multi-node cluster the
+   * reader's own container often holds none of a just-written file's blobs, so
+   * its rc=1 replica made the aggregate rc=1 even though another container
+   * returned the real size. CfsIo::Open only trusts the size when rc==0, so it
+   * discarded the correct size and every cross-node read of that file returned
+   * 0 bytes (issue #714, Bug 2).
+   *
+   * Correct semantics — "found if ANY": the aggregate succeeds (rc=0) if at
+   * least one replica found the tag, summing the found replicas' shares; it
+   * stays "not found" (rc=1) only if EVERY replica missed (e.g. the tag was
+   * deleted cluster-wide — readdir's liveness check relies on this). The origin
+   * accumulator is seeded rc=1 in the constructors so that this holds
+   * regardless of the order replicas are aggregated in.
    */
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
-    Task::AggregateOut(other_base);
+    if (other_base.IsNull()) return;
     auto replica = other_base.template Cast<GetTagSizeTask>();
+    // Keep the base completer bookkeeping, but NOT its return-code poisoning.
+    SetCompleter(other_base->GetCompleter());
+    // Sum each container's share. A container that holds none of the tag's
+    // blobs reports tag_size_=0, so summing it is a no-op — the total is the
+    // sum of the found containers' shares.
     tag_size_ += replica->tag_size_;
+    // "found if ANY": the tag exists cluster-wide if at least one container has
+    // a local TagInfo (rc==0). Clear the "not found" seed as soon as a replica
+    // reports the tag; a not-found replica (rc=1) must NEVER poison the
+    // aggregate (that discarded correctly-summed sizes on cross-node reads --
+    // #714). rc stays 1 only if every container missed (tag deleted
+    // cluster-wide), which readdir's liveness check relies on.
+    if (replica->GetReturnCode() == 0) {
+      SetReturnCode(0);
+    }
     if (replica->ctime_ > ctime_) ctime_ = replica->ctime_;
+    if (replica->mtime_ > mtime_) mtime_ = replica->mtime_;
+    if (replica->atime_ > atime_) atime_ = replica->atime_;
   }
 };
 
@@ -2763,6 +3344,59 @@ struct FlushDataTask : public clio::run::Task {
   void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
     Task::AggregateOut(other_base);
     Copy(other_base.template Cast<FlushDataTask>());
+  }
+};
+
+/**
+ * DynamicReorganizeTask - Periodic driver for the internal data organizer
+ * (issue #738).
+ *
+ * Spawned `organizer_tasks` times from Create() when an organizer is
+ * configured; each firing delegates to the configured DataOrganizer:
+ * organizer->Reorganize(this, task->replica_id_). replica_id_ identifies
+ * which of the parallel organizer replicas this task is (0-based) so the
+ * organizer can partition the blob space across replicas.
+ */
+struct DynamicReorganizeTask : public clio::run::Task {
+  IN clio::run::u32 replica_id_;  // 0-based organizer replica index
+
+  /** SHM default constructor */
+  DynamicReorganizeTask() : clio::run::Task(), replica_id_(0) {}
+
+  /** Emplace constructor */
+  CTP_CROSS_FUN explicit DynamicReorganizeTask(
+      const clio::run::TaskId &task_node, const clio::run::PoolId &pool_id,
+      const clio::run::PoolQuery &pool_query, clio::run::u32 replica_id = 0)
+      : clio::run::Task(task_node, pool_id, pool_query,
+                        Method::kDynamicReorganize),
+        replica_id_(replica_id) {
+    task_id_ = task_node;
+    pool_id_ = pool_id;
+    method_ = Method::kDynamicReorganize;
+    task_flags_.Clear();
+    pool_query_ = pool_query;
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeIn(Archive &ar) {
+    Task::SerializeIn(ar);
+    ar(replica_id_);
+  }
+
+  template <typename Archive>
+  CTP_CROSS_FUN void SerializeOut(Archive &ar) {
+    Task::SerializeOut(ar);
+    // No output parameters (return_code_ handled by base class)
+  }
+
+  void Copy(const ctp::ipc::FullPtr<DynamicReorganizeTask> &other) {
+    Task::Copy(other.template Cast<Task>());
+    replica_id_ = other->replica_id_;
+  }
+
+  void AggregateOut(const ctp::ipc::FullPtr<clio::run::Task> &other_base) {
+    Task::AggregateOut(other_base);
+    Copy(other_base.template Cast<DynamicReorganizeTask>());
   }
 };
 

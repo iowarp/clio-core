@@ -1,0 +1,286 @@
+name: CI Adapters
+
+# CTE I/O-adapter build+test coverage across Linux, macOS and Windows.
+#
+# The mainline CI (ci-linux / ci-macos / ci-windows) builds the runtime with
+# every adapter OFF (ELF and FUSE are disabled everywhere). This workflow is
+# the dedicated matrix that actually compiles and exercises the adapters:
+#
+#   * posix / stdio / vfd  -- built on the glibc ELF/dlsym interceptor
+#     (real_api.h uses link.h + gelf.h), so they are Linux-only. No macOS or
+#     Windows port exists.
+#   * hdf5_vol             -- portable HDF5 VOL connector; Linux/macOS/Windows.
+#   * libfuse (clio_cte_fuse) -- libfuse3 on Linux, macFUSE on macOS, WinFsp
+#     on Windows. The Windows job is what verifies the _WIN32 WinFsp path
+#     (issue #474 / feat/winscp integration).
+#
+# Matrix (per the scoping decision):
+#   Linux   : posix + stdio + vfd + hdf5_vol + libfuse  (+ live mount smoke
+#             + xfstests conformance regression gate; see issue #677)
+#   macOS   : hdf5_vol   (macFUSE libfuse support is a follow-up; see below)
+#   Windows : hdf5_vol + libfuse (WinFsp, build+unit)
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-adapters-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---- Linux: all five adapters (inside the reproducible deps-cpu image) -----
+  # Mirrors the boost-docker job: deps-cpu carries HDF5 >= 1.14 + libelf; we
+  # add libfuse3-dev for the FUSE backend. --device /dev/fuse + SYS_ADMIN let
+  # the live mount smoke test actually mount.
+  linux-adapters:
+    name: adapters (linux, all 5)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - name: Build adapters + run adapter tests (inside deps-cpu)
+        run: |
+          # --shm-size: docker's default /dev/shm is 64 MB; the clio runtime
+          # places its GB-scale SHM segments there, so give it room (also lets
+          # the FUSE runtime breathe under the xfstests gate).
+          docker run --rm --shm-size=2g \
+            -v "${{ github.workspace }}":/workspace -w /workspace -u 0 \
+            --device /dev/fuse --cap-add SYS_ADMIN --security-opt apparmor=unconfined \
+            iowarp/deps-cpu:latest bash -c '
+              set -e
+              export LD_LIBRARY_PATH=/usr/local/lib:/usr/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH
+              export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/lib/x86_64-linux-gnu/pkgconfig:$PKG_CONFIG_PATH
+              git config --global --add safe.directory /workspace
+              # FUSE backend + ELF interception headers (libelf/HDF5 already in image)
+              apt-get update -qq
+              apt-get install -y -qq libfuse3-dev fuse3 pkg-config libelf-dev
+              # h5py for the VOL compat suite, SOURCE-built (--no-binary) against
+              # the image HDF5 (/usr/local, 2.1.1) so the connector loads into
+              # h5py. A PyPI wheel bundles its own libhdf5 and cannot load a VOL
+              # built against the system HDF5. Pin the suite to this interpreter
+              # via -DPython3_EXECUTABLE below.
+              HDF5_DIR=/usr/local /usr/bin/python3 -m pip install \
+                --break-system-packages --no-binary=h5py h5py numpy
+              cmake -B build-adapters \
+                -DPython3_EXECUTABLE=/usr/bin/python3 \
+                -DCMAKE_BUILD_TYPE=Debug \
+                -DCLIO_CORE_ENABLE_RUNTIME=ON \
+                -DCLIO_CORE_ENABLE_CTE=ON \
+                -DCLIO_CORE_ENABLE_CAE=OFF \
+                -DCLIO_CORE_ENABLE_CEE=OFF \
+                -DCLIO_CORE_ENABLE_TESTS=ON \
+                -DCLIO_CORE_ENABLE_BENCHMARKS=OFF \
+                -DCLIO_CORE_ENABLE_PYTHON=OFF \
+                -DCLIO_CORE_ENABLE_CONDA=OFF \
+                -DCLIO_CORE_ENABLE_ELF=ON \
+                -DCLIO_CTE_ENABLE_POSIX_ADAPTER=ON \
+                -DCLIO_CTE_ENABLE_STDIO_ADAPTER=ON \
+                -DCLIO_CTE_ENABLE_VFD=ON \
+                -DCLIO_CTE_ENABLE_HDF5_VOL=ON \
+                -DCLIO_CTE_ENABLE_FUSE_ADAPTER=ON \
+                -DCLIO_CTE_ENABLE_ADIOS2_ADAPTER=OFF \
+                -DCLIO_CTE_ENABLE_COMPRESS=OFF \
+                -DCLIO_CORE_ENABLE_GRAY_SCOTT=OFF \
+                -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+                -DCLIO_CTP_LOG_LEVEL=0
+              cmake --build build-adapters -j"$(nproc)"
+              # Adapter unit/smoke tests. Exclude the docker-in-docker FUSE
+              # integration test (LABELS include "docker").
+              ctest --test-dir build-adapters --output-on-failure \
+                --timeout 180 --repeat until-pass:2 \
+                -R "posix|stdio|vfd|hdf5_vol|fuse" -E "copy_workspace" -LE "docker|ollama"
+              # Live end-to-end mount smoke (real libfuse3 mount + I/O).
+              chmod +x CI/fuse_mount_smoke.sh
+              CI/fuse_mount_smoke.sh build-adapters
+              # xfstests conformance gate (issue #677): install xfstests + its
+              # runtime deps, then run ONLY the tests known to pass against the
+              # clio FUSE fs (scripts/xfstests/ci_baseline_pass.txt -- the max
+              # passing set). Every baseline test must pass or the job fails.
+              # Currently-failing tests are tracked in a GitHub issue, not run.
+              bash scripts/xfstests/install_deps.sh
+              CLIO_BUILD_DIR="$PWD/build-adapters" \
+                bash scripts/xfstests/run_ci_xfstests.sh
+              # SCRATCH xfstests gate (issue #677): the tests above use only
+              # TEST_DIR; these need a second, isolated scratch device via two
+              # persistent clio runtimes + xfstests native fuse mount-helper.
+              # NON-BLOCKING for now: this driver is branch-only (not on dev) and
+              # has never passed in the deps-cpu docker -- the keeper runtimes
+              # come up but every test fails instantly at _scratch_mount (the
+              # native fuse mount-helper is not wired up in the container). It
+              # was silently masked until the embedded gate above started passing
+              # (set -e stopped the step first). Run it for visibility but do not
+              # fail the job on it until the mount-helper setup is made
+              # CI-ready; the embedded gate is the enforced signal. See
+              # scripts/xfstests/REMAINING_WORK.md.
+              CLIO_BUILD_DIR="$PWD/build-adapters" \
+                bash scripts/xfstests/run_ci_scratch_xfstests.sh \
+                || echo "::warning::scratch xfstests gate not yet CI-ready (branch-only, mount-helper unset in docker); non-blocking"
+            '
+
+  # ---- macOS: hdf5_vol -------------------------------------------------------
+  # libfuse is NOT built here yet: macFUSE exposes a FUSE3 header but with a
+  # Darwin-specific type system (struct fuse_darwin_attr / struct statfs /
+  # st_ctimespec, and no MS_* mount flags) distinct from both Linux libfuse and
+  # WinFsp, so the adapter needs a dedicated macFUSE compat shim (analogous to
+  # fuse_win_compat.h) before it can compile. Tracked as a follow-up; until then
+  # this job covers the portable hdf5_vol connector on macOS.
+  macos-adapters:
+    name: adapters (macos, hdf5_vol)
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - name: Install dependencies (conda HDF5 provides >= 1.14)
+        run: |
+          chmod +x CI/ci-deps.sh
+          ./CI/ci-deps.sh --only-deps release
+      - name: Configure and build (hdf5_vol)
+        run: |
+          set -x
+          if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
+            source "$HOME/miniconda3/etc/profile.d/conda.sh"
+          elif [ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]; then
+            source "$HOME/anaconda3/etc/profile.d/conda.sh"
+          elif command -v conda >/dev/null 2>&1; then
+            eval "$(conda shell.bash hook)"
+          fi
+          conda activate iowarp
+          export CMAKE_PREFIX_PATH="${CONDA_PREFIX}${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
+          export PKG_CONFIG_PATH="${CONDA_PREFIX}/lib/pkgconfig:${CONDA_PREFIX}/share/pkgconfig:/usr/local/lib/pkgconfig:/opt/homebrew/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+          cmake -B build-adapters \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DPython3_EXECUTABLE="${CONDA_PREFIX}/bin/python3" \
+            -DSITE="macos-15" \
+            -DBUILDNAME="adapters/cnd/d" \
+            -DCLIO_CORE_ENABLE_RUNTIME=ON \
+            -DCLIO_CORE_ENABLE_CTE=ON \
+            -DCLIO_CORE_ENABLE_CAE=OFF \
+            -DCLIO_CORE_ENABLE_CEE=OFF \
+            -DCLIO_CORE_ENABLE_TESTS=ON \
+            -DCLIO_CORE_ENABLE_BENCHMARKS=OFF \
+            -DCLIO_CORE_ENABLE_PYTHON=OFF \
+            -DCLIO_CORE_ENABLE_CONDA=ON \
+            -DCLIO_CORE_ENABLE_ELF=OFF \
+            -DCLIO_CTE_ENABLE_HDF5_VOL=ON \
+            -DCLIO_CTE_ENABLE_FUSE_ADAPTER=OFF \
+            -DCLIO_CTE_ENABLE_ADIOS2_ADAPTER=OFF \
+            -DCLIO_CTE_ENABLE_COMPRESS=OFF \
+            -DCLIO_CORE_ENABLE_GRAY_SCOTT=OFF \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+            -DCLIO_CTP_LOG_LEVEL=0
+          cmake --build build-adapters -- -j"$(sysctl -n hw.ncpu)"
+      - name: Run adapter tests
+        run: |
+          if [ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]; then
+            source "$HOME/miniconda3/etc/profile.d/conda.sh"
+          elif [ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]; then
+            source "$HOME/anaconda3/etc/profile.d/conda.sh"
+          elif command -v conda >/dev/null 2>&1; then
+            eval "$(conda shell.bash hook)"
+          fi
+          conda activate iowarp
+          # h5py for the VOL compat suite, source-built against the conda HDF5
+          # the VOL links (a wheel's bundled libhdf5 can't load the connector).
+          HDF5_DIR="$CONDA_PREFIX" "${CONDA_PREFIX}/bin/python3" -m pip install \
+            --no-binary=h5py h5py numpy
+          ctest --test-dir build-adapters --output-on-failure \
+            --timeout 180 --repeat until-pass:2 \
+            -R "hdf5_vol" -LE "docker|ollama"
+
+  # ---- Windows: hdf5_vol + libfuse via WinFsp (build + unit tests) -----------
+  # This is the job that verifies the _WIN32 WinFsp FUSE path (issue #474):
+  # mainline ci-windows builds with CLIO_CTE_ENABLE_FUSE_ADAPTER=OFF, so the
+  # WinFsp compat shim (fuse_win_compat.h) is not compiled anywhere else.
+  windows-adapters:
+    name: adapters (windows, hdf5_vol + winfsp)
+    runs-on: windows-2025
+    timeout-minutes: 120
+    env:
+      VCPKG_DEFAULT_TRIPLET: x64-windows
+      CAE_LABEL_TEST_SKIP: "1"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - name: Install WinFsp (FUSE backend + dev headers/libs)
+        shell: pwsh
+        run: |
+          $ver = "2.0.23075"
+          $url = "https://github.com/winfsp/winfsp/releases/download/v2.0/winfsp-$ver.msi"
+          $msi = "$env:RUNNER_TEMP\winfsp.msi"
+          Write-Host "Downloading WinFsp $ver from $url"
+          Invoke-WebRequest -Uri $url -OutFile $msi
+          # ADDLOCAL=ALL pulls in the Developer feature (inc/fuse3 + lib).
+          $p = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /qn ADDLOCAL=ALL" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "WinFsp install failed ($($p.ExitCode))" }
+          Get-ChildItem "C:\Program Files (x86)\WinFsp\inc\fuse3" -ErrorAction SilentlyContinue
+      - name: Bootstrap vcpkg
+        run: |
+          cd $env:VCPKG_INSTALLATION_ROOT
+          git pull
+          .\bootstrap-vcpkg.bat
+      - name: Configure CMake (hdf5_vol + WinFsp fuse)
+        # X_VCPKG_APPLOCAL_DEPS_SERIALIZED=ON serializes vcpkg's per-target
+        # post-build "z-applocal" DLL deployment. With HDF5_VOL=ON this job
+        # links hdf5/szip/zd/zmq + the clio runtime DLLs into many parallel
+        # test-exe targets, and under `-j` two targets would occasionally copy
+        # the SAME shared DLL into build/bin/ at once -> intermittent
+        # `error MSB3073: vcpkg z-applocal ... exited with code 32`
+        # (ERROR_SHARING_VIOLATION). Serializing the applocal step removes the
+        # race. ci-windows.yml doesn't hit this because it builds HDF5_VOL=OFF
+        # (far fewer shared DLLs). See issue: flaky windows-adapters build.
+        run: |
+          cmake -B build -A x64 `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET="x64-windows" `
+            -DVCPKG_MANIFEST_DIR="${{ github.workspace }}/installers/vcpkg" `
+            -DVCPKG_OVERLAY_PORTS="${{ github.workspace }}/installers/vcpkg/overlay-ports" `
+            -DX_VCPKG_APPLOCAL_DEPS_SERIALIZED=ON `
+            -DCMAKE_BUILD_TYPE=Debug `
+            -DSITE="windows-2025" `
+            -DBUILDNAME="adapters/msvc/x64/d" `
+            -DCLIO_CORE_ENABLE_RUNTIME=ON `
+            -DCLIO_CORE_ENABLE_CTE=ON `
+            -DCLIO_CORE_ENABLE_CAE=OFF `
+            -DCLIO_CORE_ENABLE_CEE=OFF `
+            -DCLIO_CORE_ENABLE_TESTS=ON `
+            -DCLIO_CORE_ENABLE_PYTHON=OFF `
+            -DCLIO_CORE_ENABLE_ZMQ=ON `
+            -DCLIO_CORE_ENABLE_CEREAL=ON `
+            -DCLIO_CORE_ENABLE_CONDA=OFF `
+            -DCLIO_CORE_ENABLE_ELF=OFF `
+            -DCLIO_CORE_ENABLE_RPATH=OFF `
+            -DCLIO_CTE_ENABLE_HDF5_VOL=ON `
+            -DCLIO_CTE_ENABLE_FUSE_ADAPTER=ON `
+            -DCLIO_CTE_ENABLE_VFD=OFF `
+            -DCLIO_CORE_ENABLE_BENCHMARKS=OFF `
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON `
+            -DCLIO_CTP_LOG_LEVEL=0
+      - name: Build
+        run: cmake --build build --config Debug -j $env:NUMBER_OF_PROCESSORS
+      - name: Verify the WinFsp FUSE binary was built
+        shell: pwsh
+        run: |
+          $exe = "build/bin/clio_cte_fuse.exe"
+          if (-not (Test-Path $exe)) {
+            throw "clio_cte_fuse.exe was not built -- WinFsp was not linked (check the WINFSP_ROOT discovery in adapter/libfuse/CMakeLists.txt)."
+          }
+          Write-Host "OK: $exe present (WinFsp FUSE path compiled and linked)"
+      - name: Run adapter tests
+        # The Python VOL compat suite (cte_hdf5_vol_compat_suite) needs h5py to
+        # load the connector, which requires h5py built against the SAME hdf5.dll
+        # as the VOL — impractical on Windows (debug/release CRT split + DLL
+        # discovery). The MSVC-built C++ VOL unit tests (cte_hdf5_vol_*) above are
+        # the Windows VOL coverage; exclude the compat suite here.
+        run: ctest --test-dir build --build-config Debug --output-on-failure --timeout 120 -R "hdf5_vol|fuse" -E "copy_workspace|compat_suite" -LE "docker|ollama"

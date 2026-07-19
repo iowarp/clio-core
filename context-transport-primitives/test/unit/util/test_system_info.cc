@@ -133,3 +133,25 @@ TEST_CASE("SystemInfoListDirectory") {
       SystemInfo::ListDirectory("/nonexistent_ctp_dir");
   REQUIRE(missing.empty());
 }
+
+TEST_CASE("SystemInfoProcessAndModule") {
+  // The current process must report as alive; a clearly-unused PID must not.
+  REQUIRE(SystemInfo::IsProcessAlive(SystemInfo::GetPid()));
+  // PID 0x7FFFFFFF is not a realistic live process on this host.
+  REQUIRE_FALSE(SystemInfo::IsProcessAlive(0x7FFFFFFF));
+
+  // GetModuleDirectory resolves the directory of the loaded module via
+  // dladdr/realpath (POSIX) or GetModuleFileNameA (Windows); it must return a
+  // non-empty absolute path for this binary.
+  std::string mod_dir = SystemInfo::GetModuleDirectory();
+  REQUIRE(!mod_dir.empty());
+#ifdef _WIN32
+  // Windows absolute paths are drive-letter rooted ("D:\...") or UNC ("\\...").
+  bool is_absolute = (mod_dir.size() >= 2 && mod_dir[1] == ':') ||
+                     (mod_dir.size() >= 2 && mod_dir[0] == '\\' &&
+                      mod_dir[1] == '\\');
+  REQUIRE(is_absolute);
+#else
+  REQUIRE(mod_dir.front() == '/');
+#endif
+}

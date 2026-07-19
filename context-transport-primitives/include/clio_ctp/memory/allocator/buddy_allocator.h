@@ -38,6 +38,7 @@
 #include "clio_ctp/memory/allocator/heap.h"
 #include "clio_ctp/data_structures/ipc/slist_pre.h"
 #include "clio_ctp/data_structures/ipc/rb_tree_pre.h"
+#include "clio_ctp/thread/lock/mutex.h"
 #include <cmath>
 #include <vector>
 
@@ -200,6 +201,14 @@ class _BuddyAllocator : public Allocator {
 
   ArenaState cur_arena_;  /**< Current bump arena (if active) */
 
+  // Serializes Allocate/Free. The free lists are intrusive slists with no
+  // internal synchronization; "kShared" only means position-independent
+  // (offset-based) nodes, NOT thread-safety. Concurrent allocators must hold
+  // this. (Thread-locality used to come from ProducerConsumerAllocator's
+  // per-thread PcThreadBlocks; this lock makes a single shared BuddyAllocator
+  // safe to use directly from many threads.)
+  ctp::Mutex lock_;
+
 #ifdef CTP_BUDDY_ALLOC_DEBUG
   size_t dbg_alloc_count_;
   size_t dbg_free_count_;
@@ -262,6 +271,7 @@ class _BuddyAllocator : public Allocator {
     big_heap_.Init(0, 0);
     small_arena_.Init(0, 0);
     cur_arena_ = ArenaState{};
+    lock_.Init();
     for (size_t i = 0; i < kMaxSmallPages; ++i) {
       small_pages_[i].Init();
     }
@@ -291,6 +301,7 @@ class _BuddyAllocator : public Allocator {
    * Allocate memory of specified size
    */
   CTP_CROSS_FUN OffsetPtr<> AllocateOffset(size_t requested_size) {
+    ScopedMutex guard(lock_, 0);
     // Fast path: bump-allocate from active arena
     if (cur_arena_.IsActive()) {
       constexpr size_t kAlign = 16;
@@ -373,6 +384,7 @@ class _BuddyAllocator : public Allocator {
    * Free previously allocated memory (without null check)
    */
   CTP_CROSS_FUN void FreeOffsetNoNullCheck(OffsetPtr<> offset) {
+    ScopedMutex guard(lock_, 0);
     size_t off = offset.load();
     // No-op for arena allocations
     if (cur_arena_.IsActive() &&
@@ -584,13 +596,14 @@ class _BuddyAllocator : public Allocator {
         size_t page_total_size = page_data_size + sizeof(PageT);
 
         if (page_total_size > total_size &&
-            (page_total_size - total_size) > sizeof(PageT)) {
+            (page_total_size - total_size) >= sizeof(PageT) + kMinSize) {
           AddRemainderToFreeList(found_offset + total_size,
                                 page_total_size - total_size);
           return FinalizeAllocation(found_offset, size);
         }
-        // Remainder too small to split — keep full page size to avoid
-        // permanently losing the unsplittable tail bytes.
+        // Remainder too small to form a valid page (data < kMinSize) — keep
+        // full page size to avoid both losing the tail bytes AND handing out
+        // an undersized page that the caller would overflow (#680).
         return FinalizeAllocation(found_offset, page_data_size);
       }
     }
@@ -654,12 +667,18 @@ class _BuddyAllocator : public Allocator {
       size_t offset = FindFirstFit(list_idx, arena_size);
       if (offset != 0) {
         PageT *page = OffsetToPage(offset);
-        size_t page_total_size = page->size_ + sizeof(PageT);
+        // Use GetSize() to mask off kFreeMask (bit 63). FindFirstFit pops the
+        // page but leaves it MarkFree'd, so reading page->size_ raw carries the
+        // free flag into the arithmetic: page_total_size explodes to ~2^63 and
+        // AddRemainderToFreeList below emplaces a bogus multi-GB "remainder"
+        // that runs off the real page into live memory, corrupting the free
+        // list. Every other size read here already uses GetSize().
+        size_t page_total_size = page->GetSize() + sizeof(PageT);
 
         small_arena_.Init(offset, offset + arena_size);
 
         if (page_total_size > arena_size &&
-            (page_total_size - arena_size) > sizeof(PageT)) {
+            (page_total_size - arena_size) >= sizeof(PageT) + kMinSize) {
           AddRemainderToFreeList(offset + arena_size,
                                 page_total_size - arena_size);
         }
@@ -704,7 +723,11 @@ class _BuddyAllocator : public Allocator {
    */
   CTP_CROSS_FUN void AddRemainderToFreeList(size_t page_offset,
                                                size_t total_size) {
-    if (total_size <= sizeof(PageT)) {
+    // A page must hold at least kMinSize of data; otherwise it is filed in
+    // small_pages_[0] and later handed out for a kMinSize request, letting the
+    // caller overflow its short buffer into the next page's header and corrupt
+    // the free list (#680).
+    if (total_size < sizeof(PageT) + kMinSize) {
       return;
     }
     size_t data_size = total_size - sizeof(PageT);

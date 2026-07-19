@@ -544,3 +544,156 @@ tr.row-idle { background: rgba(76, 175, 80, 0.08); }
 .gpu-section {
     /* Just a marker class for JS toggle; no special style needed */
 }
+
+/* =========================================================
+   Device Health & ML Prediction UI (Context Visualizer)
+   ========================================================= */
+
+.bdev-health-section {
+    margin-top: 1rem;
+    padding-top: 0.8rem;
+    border-top: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+
+/* Prediction Badge (Glassmorphism + Gradients) */
+.health-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0.4rem 0.8rem;
+    border-radius: 6px;
+    font-size: 0.75rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: #fff;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+    backdrop-filter: blur(4px);
+    transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+.health-badge:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 6px 16px rgba(0, 0, 0, 0.15);
+}
+
+.badge-healthy {
+    background: linear-gradient(135deg, #4caf50 0%, #2e7d32 100%);
+    border: 1px solid rgba(76, 175, 80, 0.3);
+}
+
+.badge-warning {
+    background: linear-gradient(135deg, #ff9800 0%, #f57c00 100%);
+    border: 1px solid rgba(255, 152, 0, 0.3);
+    animation: pulse-warning 2s infinite;
+}
+
+.badge-critical {
+    background: linear-gradient(135deg, #f44336 0%, #c62828 100%);
+    border: 1px solid rgba(244, 67, 54, 0.3);
+    animation: pulse-critical 1.5s infinite;
+}
+
+@keyframes pulse-warning {
+    0% { box-shadow: 0 0 0 0 rgba(255, 152, 0, 0.4); }
+    70% { box-shadow: 0 0 0 6px rgba(255, 152, 0, 0); }
+    100% { box-shadow: 0 0 0 0 rgba(255, 152, 0, 0); }
+}
+
+@keyframes pulse-critical {
+    0% { box-shadow: 0 0 0 0 rgba(244, 67, 54, 0.5); }
+    70% { box-shadow: 0 0 0 8px rgba(244, 67, 54, 0); }
+    100% { box-shadow: 0 0 0 0 rgba(244, 67, 54, 0); }
+}
+
+/* SMART Metrics Table */
+.smart-metrics {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.4rem;
+    font-size: 0.75rem;
+    margin-top: 0.4rem;
+    background: rgba(0, 0, 0, 0.15);
+    padding: 0.6rem;
+    border-radius: 4px;
+}
+
+.smart-metric-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.smart-label {
+    color: var(--text-muted);
+}
+
+.smart-val {
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    color: var(--text);
+}
+
+/* ===== Safe-bdev dashboard ===== */
+.muted { color: var(--text-muted); margin-left: 0.75rem; font-size: 0.85rem; }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.85rem; }
+
+.progress-outer {
+    position: relative;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    height: 26px;
+    margin: 0.5rem 0 1.5rem;
+    overflow: hidden;
+}
+.progress-inner {
+    height: 100%;
+    background: #3fb950;
+    transition: width 0.4s ease;
+}
+.progress-inner.progress-active {
+    background: #d29922;
+    animation: pulse-warning 1.5s infinite;
+}
+.progress-label {
+    position: absolute; top: 0; left: 0; right: 0;
+    line-height: 26px; text-align: center; font-size: 0.8rem;
+}
+.status-recovering { color: #d29922; }
+.status-ok { color: #3fb950; }
+
+.member-table {
+    width: 100%; border-collapse: collapse; margin-bottom: 1.5rem;
+    background: var(--bg-card); border: 1px solid var(--border); border-radius: 8px;
+}
+.member-table th, .member-table td {
+    padding: 0.6rem 0.9rem; text-align: left; border-bottom: 1px solid var(--border);
+}
+.member-table th { color: var(--text-muted); text-transform: uppercase; font-size: 0.78rem; }
+.member-state { padding: 0.2rem 0.6rem; border-radius: 6px; font-size: 0.78rem; font-weight: 600; }
+.state-active { background: rgba(63,185,80,0.18); color: #3fb950; }
+.state-faulty { background: rgba(248,81,73,0.18); color: #f85149; }
+.state-removed { background: rgba(139,148,158,0.18); color: #8b949e; }
+.state-recovering { background: rgba(210,153,34,0.18); color: #d29922; animation: pulse-warning 1.5s infinite; }
+
+.btn { padding: 0.35rem 0.8rem; border-radius: 6px; border: 1px solid var(--border);
+    background: var(--bg-card); color: inherit; cursor: pointer; margin-left: 0.4rem; font-size: 0.82rem; }
+.btn:hover { border-color: #58a6ff; }
+.btn-add { background: #238636; border-color: #238636; color: #fff; }
+.btn-danger { background: #a12b25; border-color: #a12b25; color: #fff; }
+.btn-warn { background: #9e6a03; border-color: #9e6a03; color: #fff; }
+
+.add-form { background: var(--bg-card); border: 1px solid var(--border); border-radius: 8px;
+    padding: 1rem; margin-bottom: 1.5rem; }
+.add-form label { display: inline-block; margin-right: 1rem; font-size: 0.85rem; }
+.add-form input[type=text], .add-form input:not([type]) , .add-form input[type=number] {
+    background: #0d1117; border: 1px solid var(--border); color: inherit;
+    border-radius: 4px; padding: 0.25rem 0.4rem; margin-left: 0.3rem; }
+
+.toast { position: fixed; bottom: 1.5rem; right: 1.5rem; background: #238636; color: #fff;
+    padding: 0.7rem 1.1rem; border-radius: 8px; z-index: 1000; }
+.toast-err { background: #a12b25; }

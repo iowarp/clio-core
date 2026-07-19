@@ -1511,7 +1511,20 @@ class vector {
       }
       if constexpr (!kIsPod) {
         for (size_type i = size_; i < new_size; ++i) {
-          new (&data_.ptr_[i]) T();
+          // Propagate the vector's allocator to allocator-aware elements (e.g.
+          // priv::string/priv::vector). A plain T() leaves the element's alloc_
+          // null; if that element later heap-allocates (a priv::string whose
+          // content exceeds its SSO buffer) it dereferences the null allocator
+          // and SEGVs. This bit the cross-process readdir path: the client
+          // deserializes ReaddirTask::entries_ via load_vec -> resize(), and a
+          // directory entry name longer than the SSO size crashed the client
+          // (generic/551,750). Elements that don't take an allocator fall back
+          // to the default ctor.
+          if constexpr (std::is_constructible_v<T, AllocT*>) {
+            new (&data_.ptr_[i]) T(alloc_);
+          } else {
+            new (&data_.ptr_[i]) T();
+          }
         }
       } else {
         memset(data_.ptr_ + size_, 0, (new_size - size_) * sizeof(T));

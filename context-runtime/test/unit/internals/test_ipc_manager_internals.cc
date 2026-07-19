@@ -227,6 +227,16 @@ TEST_CASE("IpcInternals - ConfigManager yaml sections and env overrides",
   // NOTE: LoadYaml on a missing file is HLOG(kFatal) (process exit), so the
   // not-found path is intentionally not probed here.
 
+  SECTION("Empty config file is reported as a load failure");
+  // An empty file parses as a YAML null node — every section lookup misses
+  // and the caller would silently keep the default config (no compose, so no
+  // storage tiers). LoadYaml must flag it so ClientInit warns loudly.
+  fs::path zero_cfg = fs::temp_directory_path() / "clio_test_zero_cfg.yaml";
+  { std::ofstream f(zero_cfg); }
+  REQUIRE(fs::file_size(zero_cfg) == 0);
+  REQUIRE_FALSE(config->LoadYaml(zero_cfg.string()));
+  fs::remove(zero_cfg);
+
   // Restore default-ish config for any later singleton users.
   fs::remove(cfg);
   fs::path empty_cfg = fs::temp_directory_path() / "clio_test_plain_cfg.yaml";

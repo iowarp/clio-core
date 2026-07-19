@@ -18,36 +18,37 @@ class IpcManager;
 /**
  * IPC transport for CPU client → CPU runtime via ZeroMQ (TCP or IPC).
  *
- * Two-phase RuntimeSend/RuntimeRecv:
- *   Phase 1 (worker inline): EnqueueRuntimeSend enqueues to net_queue_
- *   Phase 2 (net worker periodic): RuntimeSend/RuntimeRecv do actual I/O
+ * Two-phase SendOut/RecvIn:
+ *   Phase 1 (worker inline): EnqueueSendOut enqueues to net_queue_
+ *   Phase 2 (net worker periodic): SendOut/RecvIn do actual I/O
  */
 struct IpcCpu2CpuZmq {
-  /** Serialize and send via ZMQ. */
+  /** Serialize and send via ZMQ (inbound). */
   template <typename TaskT>
-  static Future<TaskT> ClientSend(IpcManager *ipc,
-                                   const ctp::ipc::FullPtr<TaskT> &task_ptr,
-                                   IpcMode mode);
+  static Future<TaskT> SendIn(IpcManager *ipc,
+                              const clio::run::shared_ptr<TaskT> &task_ptr,
+                              IpcMode mode);
 
   /**
-   * Net-worker RuntimeRecv: poll ZMQ transports for incoming tasks.
+   * Net-worker RecvIn: poll ZMQ transports for incoming tasks.
    * Called by Admin::ClientRecv periodic coroutine.
    * Deserializes tasks, creates FutureShm, enqueues to worker lanes.
    * @param ipc IpcManager
    * @param tasks_received Output: number of tasks received
    * @return true if any work was done
    */
-  static bool RuntimeRecv(IpcManager *ipc, u32 &tasks_received);
+  static bool RecvIn(IpcManager *ipc, u32 &tasks_received);
 
   /**
-   * Worker-inline RuntimeSend: enqueue completed task to net_queue_.
-   * The actual ZMQ send happens in RuntimeSendOut (net worker phase).
+   * Worker-inline SendOut: enqueue completed task to net_queue_.
+   * The actual ZMQ send happens in the net-worker SendOut phase.
    */
-  static void EnqueueRuntimeSend(IpcManager *ipc, RunContext *run_ctx,
-                                  u32 origin);
+  static void EnqueueSendOut(IpcManager *ipc,
+                             const clio::run::shared_ptr<Task> &task,
+                             ClientOrigin origin);
 
   /**
-   * Net-worker RuntimeSend: serialize outputs and send via ZMQ.
+   * Net-worker SendOut: serialize outputs and send via ZMQ.
    * Called by Admin::ClientSend periodic coroutine.
    * Pops from net_queue_, serializes, sends response to client.
    * @param ipc IpcManager
@@ -55,13 +56,13 @@ struct IpcCpu2CpuZmq {
    * @param deferred_deletes Tasks to delete on next invocation (zero-copy safety)
    * @return true if any work was done
    */
-  static bool RuntimeSend(IpcManager *ipc, u32 &tasks_sent,
-                           std::vector<ctp::ipc::FullPtr<Task>> &deferred_deletes);
+  static bool SendOut(IpcManager *ipc, u32 &tasks_sent,
+                      std::vector<clio::run::shared_ptr<Task>> &deferred_deletes);
 
-  /** Wait for COMPLETE, deserialize from pending archives. */
+  /** Wait for COMPLETE, deserialize from pending archives (outbound). */
   template <typename TaskT>
-  static bool ClientRecv(IpcManager *ipc,
-                          Future<TaskT> &future, float max_sec);
+  static bool RecvOut(IpcManager *ipc,
+                      Future<TaskT> &future, float max_sec);
 
   /** Re-send a task via ZMQ after server restart. */
   template <typename TaskT>
