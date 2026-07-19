@@ -33,6 +33,7 @@
 
 #include <clio_cae/core/factory/assimilator_factory.h>
 #include <clio_cae/core/factory/binary_file_assimilator.h>
+#include <clio_cae/core/factory/model_weights_assimilator.h>
 #include <clio_cae/core/factory/string_data_assimilator.h>
 #ifdef CLIO_CAE_ENABLE_HDF5
 #include <clio_cae/core/factory/hdf5_file_assimilator.h>
@@ -91,6 +92,13 @@ std::unique_ptr<BaseAssimilator> AssimilatorFactory::Get(
          "protocol");
     // For string protocol, the payload travels in AssimilationCtx::src_data
     return std::make_unique<StringDataAssimilator>(cte_client_);
+  } else if (protocol == "modelweights") {
+    HLOG(kDebug,
+         "AssimilatorFactory: Creating ModelWeightsAssimilator for "
+         "'modelweights' protocol");
+    // Assimilate a model weight file into a single CTE tag using the
+    // gpu_vector page-blob layout (<tag>_b<block>_pi<page>).
+    return std::make_unique<ModelWeightsAssimilator>(cte_client_);
   } else if (protocol == "hdf5") {
 #ifdef CLIO_CAE_ENABLE_HDF5
     HLOG(
