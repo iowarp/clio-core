@@ -92,9 +92,18 @@ EOF
 echo "=== config ==="; cat "$RUNDIR/clio_config.yaml"
 
 export RUNDIR LOCAL_STORE CTE_NUM_NODES="$NNODES" CLIO_BIN_DIR="$BIN"
-export CTE_TEST_BIN="test_gpu_vector_distributed" CTE_CLIENT_MODE="server_rank0"
+# CTE_TEST_BIN overridable: test_gpu_vector_distributed (raw compressor path,
+# default) or test_gpu_vector_compress (the real Vector<T> object, which needs
+# CLIO_GV_EXTERNAL_CONF=1 to use this harness's distributed compose).
+export CTE_TEST_BIN="${CTE_TEST_BIN:-test_gpu_vector_distributed}"
+export CTE_CLIENT_MODE="server_rank0"
 export TEST_FILTER=""
 export CLIO_REPO_PATH="$BIN"
+export CLIO_GV_EXTERNAL_CONF="1"     # test_gpu_vector_compress uses harness conf
+# For test_gpu_vector_compress: default to host-orchestrated FaultAllSync over the
+# distributed store (robust); set CLIO_GV_ONDEVICE_FAULT=1 for the transparent
+# on-device fault (cross-node GetBlob + decompress under the fault kernel).
+export CLIO_GV_ONDEVICE_FAULT="${CLIO_GV_ONDEVICE_FAULT:-0}"
 # GPU-specific: cuSZp on the lib path, pin cuszp, enable distributed forwarding.
 export CLIO_EXTRA_LDPATH="$CUSZP"
 export CLIO_CTE_COMPRESS_LIB="cuszp"

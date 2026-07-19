@@ -91,6 +91,20 @@ __host__ __device__ inline float Expected(clio::run::u64 i) {
 void EnsureInit() {
 #if !CTP_IS_DEVICE_PASS
   if (g_initialized) return;
+  // Distributed reuse: when CLIO_GV_EXTERNAL_CONF is set, the harness has already
+  // provided CLIO_SERVER_CONF (a multi-node compose: compressor 600 -> a cte_core
+  // 512 that spans the cluster, + hostfile). Use it as-is so this exact Vector<T>
+  // write/evict/fault/read test runs over the DISTRIBUTED store. Single-node
+  // ctest never sets it, so that path is unchanged.
+  if (std::getenv("CLIO_GV_EXTERNAL_CONF")) {
+    std::fprintf(stderr, "[INIT] gpu_vector compressed: external distributed "
+                         "conf=%s\n",
+                 std::getenv("CLIO_SERVER_CONF"));
+    REQUIRE(clio::run::CLIO_INIT(clio::run::RuntimeMode::kServer));
+    std::this_thread::sleep_for(2s);  // let compose pools + cluster settle
+    g_initialized = true;
+    return;
+  }
   const char *port_env = std::getenv("CLIO_PORT");
   int port = port_env ? std::atoi(port_env) : 10520;
   std::string cfg_path = "/tmp/gpu_vec_compress_" + std::to_string(port) + ".yaml";

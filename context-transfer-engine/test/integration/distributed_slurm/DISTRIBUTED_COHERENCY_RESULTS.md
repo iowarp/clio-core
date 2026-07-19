@@ -127,6 +127,27 @@ Harness: [`run_slurm_gpu.sbatch`](run_slurm_gpu.sbatch) (`CTE_CLIENT_MODE=
 server_rank0`); test:
 [`../../../adapter/gpu_vector/test/test_gpu_vector_distributed_gpu.cc`](../../../adapter/gpu_vector/test/test_gpu_vector_distributed_gpu.cc).
 
+### The real `Vector<T>` object over the distributed store
+
+The two tests above drive the compressor's PutBlob/GetBlob path directly. To close
+the loop, the actual **`Vector<T>` object** (async cache-manager writer → page
+eviction → compress → distribute; then fault/read) was run over the 4-node
+distributed `cte_core` by pointing `test_gpu_vector_compress` at this harness's
+compose (`CLIO_GV_EXTERNAL_CONF=1`, `CTE_TEST_BIN=test_gpu_vector_compress`):
+
+- **`FaultAllSync` read path: PASS** — the vector round-trips 262,144 elements
+  within the error bound; pages distribute across the nodes. So the full vector
+  lifecycle — not just the raw compressor path — works over a distributed store.
+- **Transparent on-device fault: HANGS cross-node.** The on-device fault kernel
+  spin-waits on the GPU while the compressor must now do a *network* GetBlob
+  (fetch the compressed page from a remote node) and then decompress. The
+  dedicated-CUDA-context fix handles the *local* decompress (and single-node
+  on-device fault works — see the single-node suite), but a cross-node round-trip
+  under a spin-waiting kernel does not resolve; the run times out. **Distributed
+  reads must use the host-orchestrated path (`FaultAllSync` / the #700
+  Transaction prefetch), not the on-device fault.** This is a real boundary of
+  the transparent-fault model, not a bug in distribution.
+
 ### Single node, all 4 GPUs
 
 The same test also runs **one Gray-Scott checkpoint per GPU, concurrently, on a
