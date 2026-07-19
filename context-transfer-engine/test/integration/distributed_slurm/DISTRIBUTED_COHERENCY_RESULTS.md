@@ -11,7 +11,7 @@ Verifies memory **coherency** of the distributed CTE blob store across four
 > with/without comparison lives in the GPU-compression work
 > (`adapter/gpu_vector/benchmark/GS_PUTBLOB_COMPRESS_RESULTS.md`: 6.6× vs. the
 > traditional checkpoint path). The one quantitative result here is *where data
-> lands* (the figure below).
+> lands* — the per-node byte accounting below.
 
 ## Setup
 
@@ -65,8 +65,6 @@ Per-node allocated (`find -printf '%b'`): `16,384 + 69,632 + 53,248 + 73,728 =`
 
 ## Data distribution & the #503 finding
 
-![Per-node blob distribution](fig_distribution.png)
-
 A separate single-client run wrote 16 × 4 KB blobs; measuring **allocated
 blocks** per node shows them fanning out **1 / 7 / 3 / 5** (sums to 16) across the
 four machines — normal variance for hashing 16 items into 4 buckets.
@@ -91,8 +89,6 @@ routing:
 Beyond the plain blob store, we ran the **compressed GPU vector** distributed
 across **4 physical A100 nodes**, checkpointing a **real Gray-Scott** field — HBM
 compression on one GPU, compressed pages living across the cluster.
-
-![Per-node compressed-page footprint](fig_gpu_distribution.png)
 
 - **Node 0 evolves a 2048×2048 Gray-Scott** reaction-diffusion field (200 steps),
   then **compresses its 64 × 256 KiB pages IN HBM** (16 MiB logical, cuSZp, error
