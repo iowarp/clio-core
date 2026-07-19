@@ -294,6 +294,18 @@ eventually MPS/concurrent-context co-scheduling), not prefetch depth.
 
 ## Build notes (cuszp)
 
+**Stock cuSZp — no patch required.** An earlier iteration carried a patch making
+cuSZp's 1D-f32 entry functions stream-ordered (`cudaMalloc`→`cudaMallocAsync`
+etc.), because stock cuSZp device-synchronizes inside every (de)compress and that
+deadlocked the on-device fault. The **dedicated CUDA context** fix superseded it:
+A100 compute preemption lets the decompress run even though cuSZp still
+device-syncs internally. Verified by building stock (unpatched) cuSZp into its own
+prefix and running the on-device-fault test against it — `max_abs_err = 1.0e-3`,
+PASS, identical to the patched build (load order confirmed via `RUNPATH`, which
+is searched after `LD_LIBRARY_PATH`). The patch has been removed; build cuSZp
+unmodified.
+
+
 cuSZp is wired into the factory behind `CTP_ENABLE_CUSZP`, auto-detected from
 `-DCLIO_CUSZP_ROOT=<prefix>` (headers `include/cuSZp.h`, lib `lib/libcuSZp.so`).
 Build cuSZp in the same container (CUDA 12.6, sm_80) so it matches the CLIO
