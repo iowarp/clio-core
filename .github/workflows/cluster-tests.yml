@@ -216,6 +216,20 @@ jobs:
           export HOST_UID="$(id -u)" HOST_GID="$(id -g)"
           ./context-transfer-engine/test/integration/cfs_distributed/run_tests.sh
 
+      # Cross-node SHM-client gate (#774): direct CTE-core Puts/Gets from an
+      # ipc_mode=shm client whose blob names HashBlobToContainer-route to the
+      # OTHER node's container. This exact combination (SHM client x multi-node
+      # x client-origin cross-node routing) had ZERO coverage: it hung forever
+      # (run2run repurposes task_id_.net_key_, the response returned bearing
+      # the daemon's key, and the client demux parked it) and no suite noticed
+      # because cross-node blob assertions were disabled (#503) and every other
+      # distributed test used TCP clients or the CFS adapter. Hard gate.
+      - name: CTE cross-node SHM client gate (2-node, issue #774)
+        if: ${{ !cancelled() }}
+        run: |
+          export HOST_UID="$(id -u)" HOST_GID="$(id -g)"
+          ./context-transfer-engine/test/integration/grayscott_congestion/run_tests.sh tiny
+
       - name: CTE FUSE test (mount + POSIX I/O)
         if: ${{ !cancelled() }}
         run: |

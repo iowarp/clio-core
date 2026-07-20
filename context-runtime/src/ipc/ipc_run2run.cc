@@ -370,6 +370,26 @@ bool IpcManagerRun2Run::RecvInHandleOne(
     const clio::run::TaskInfo &task_info,
     clio::run::LoadTaskArchive &archive,
     ctp::lbm::Transport *lbm_transport) {
+  // Receipt is proof of life (issue #774): a task arriving from a node we had
+  // SWIM-marked dead proves it is alive NOW. Without this, a one-sided death
+  // verdict is TERMINAL: our revival probes to the "dead" node are themselves
+  // gated on IsAlive (SendIn queues them for retry, never sends), and nothing
+  // else clears the flag — meanwhile every response we owe that node (data,
+  // probe ACKs, heartbeat replies) parks in send_out_retry_ until the 30s
+  // drop. Observed live: node 2 held node 1 "dead" indefinitely while
+  // ingesting node 1's healthy probe traffic the whole time, wedging the
+  // entire remote half of the workload.
+  {
+    clio::run::u64 sender = task_info.task_id_.node_id_;
+    auto *im = CLIO_IPC;
+    if (im != nullptr && sender != im->GetNodeId() && !im->IsAlive(sender)) {
+      HLOG(kWarning,
+           "[RecvIn] node {} was marked dead but just sent us a task — "
+           "reviving it (receipt is proof of life)",
+           sender);
+      im->SetAlive(sender);
+    }
+  }
   auto container =
       pool_manager->GetStaticContainer(task_info.pool_id_).get();
   if (!container) {
@@ -822,6 +842,11 @@ void IpcManagerRun2Run::ProcessRetryQueues() {
 
   std::unique_lock<std::mutex> _rqlk(retry_queues_mutex_);
 
+  // Replicas whose delivery timed out; their ORIGIN tasks must be failed after
+  // the lock is dropped (HandleTaskProgressResult takes send_map_mutex_ and can
+  // complete the origin via EndTask — neither belongs under retry_queues_mutex_).
+  std::vector<std::pair<clio::run::u64, clio::run::u32>> send_in_failures;
+
   for (auto it = send_in_retry_.begin(); it != send_in_retry_.end();) {
     float elapsed = std::chrono::duration<float>(now - it->enqueued_at).count();
     float task_timeout = kRun2RunRetryTimeoutSec;
@@ -833,7 +858,18 @@ void IpcManagerRun2Run::ProcessRetryQueues() {
     if (elapsed >= task_timeout) {
       HLOG(kError, "[RetryQueue] SendIn task timed out after {}s for node {}",
            elapsed, it->target_node_id);
-      it->task->SetReturnCode(kRun2RunNetworkTimeoutRC);
+      // Do NOT just drop the entry: the replica copy's return code is invisible
+      // to anyone, the origin task stays in send_map_ with this replica
+      // unaccounted, and the client's Future::Wait() hangs FOREVER (issue #774
+      // — the gray-scott L=512 writers parked at output 1: a receiver that
+      // grinds >30s under large-payload load looks exactly like an
+      // undeliverable peer). Account the replica as gone via the #628 path so
+      // the origin completes with kRun2RunNetworkTimeoutRC — the client gets a
+      // retryable ERROR instead of an infinite hang. (The task_id_ of the
+      // retry entry's copy carries net_key = send_map key and its replica_id.)
+      send_in_failures.emplace_back(
+          static_cast<clio::run::u64>(it->task->task_id_.net_key_),
+          it->task->task_id_.replica_id_);
       it = send_in_retry_.erase(it);
     } else if (ipc_manager->IsAlive(it->target_node_id)) {
       if (RetrySendToNode(*it, it->target_node_id)) {
@@ -860,6 +896,16 @@ void IpcManagerRun2Run::ProcessRetryQueues() {
       }
       ++it;
     }
+  }
+
+  // Fail the origins of timed-out SendIn replicas outside the retry lock
+  // (mirrors the unlock dance the SendOut retry below already uses).
+  if (!send_in_failures.empty()) {
+    _rqlk.unlock();
+    for (const auto &f : send_in_failures) {
+      HandleTaskProgressResult(f.first, f.second, /*gone=*/true);
+    }
+    _rqlk.lock();
   }
 
   for (auto it = send_out_retry_.begin(); it != send_out_retry_.end();) {
