@@ -620,8 +620,13 @@ if(CLIO_CTE_ENABLE_COMPRESS)
             set(CLIO_CTP_ENABLE_CUSZP ON)
             message(STATUS "found cuSZp via CMake config (GPU lossy compression)")
         else()
-            find_path(cuszp_INCLUDE_DIR cuSZp.h)
-            find_library(cuszp_LIBRARY NAMES cuSZp)
+            # CLIO_CUSZP_ROOT points at a cuSZp prefix find_package cannot see
+            # (e.g. a container-local build); searched before the default paths.
+            set(CLIO_CUSZP_ROOT "" CACHE PATH
+                "Install prefix of cuSZp (headers in include/, lib in lib/ or lib64/)")
+            find_path(cuszp_INCLUDE_DIR cuSZp.h HINTS ${CLIO_CUSZP_ROOT}/include)
+            find_library(cuszp_LIBRARY NAMES cuSZp
+                HINTS ${CLIO_CUSZP_ROOT}/lib ${CLIO_CUSZP_ROOT}/lib64)
             if(cuszp_INCLUDE_DIR AND cuszp_LIBRARY)
                 set(cuszp_LIBRARIES ${cuszp_LIBRARY})
                 set(cuszp_INCLUDE_DIRS ${cuszp_INCLUDE_DIR})

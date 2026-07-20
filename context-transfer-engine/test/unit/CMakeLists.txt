@@ -32,6 +32,13 @@ add_executable(test_core_functionality
     test_core_functionality.cc
 )
 
+# Multi-node coherency tests (write-only / read-only / append-only). Every rank
+# is a client, so different NODES touch the same blobs. Driven by
+# test/integration/distributed_slurm; single-rank by default (CTE_NUM_NODES=1).
+add_executable(test_cte_coherency
+    test_cte_coherency.cc
+)
+
 # Create test_query executable for query API tests (TagQuery, BlobQuery)
 add_executable(test_query
     test_query.cc
@@ -193,6 +200,18 @@ target_link_libraries(cte_core_functionality_simple_tests
 
 # Link test_core_functionality - using simple_test.h framework (NOT Catch2)
 target_link_libraries(test_core_functionality
+    clio_cte_core_runtime         # CTE core runtime library
+    clio_cte_core_client          # CTE core client library
+    clio::run::admin_runtime      # Admin module runtime (required for runtime mode)
+    clio::run::admin_client       # Admin module client
+    clio::run::bdev_runtime       # Bdev module runtime (required for runtime mode)
+    clio::run::bdev_client        # Bdev client for BdevType enum
+    ctp::cxx                    # ClioCtp library
+    ${CMAKE_THREAD_LIBS_INIT}    # Threading support
+)
+
+# Link test_cte_coherency - using simple_test.h framework (NOT Catch2)
+target_link_libraries(test_cte_coherency
     clio_cte_core_runtime         # CTE core runtime library
     clio_cte_core_client          # CTE core client library
     clio::run::admin_runtime      # Admin module runtime (required for runtime mode)

@@ -38,6 +38,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <limits>
@@ -59,6 +60,113 @@ namespace clio::cte::compressor {
 // Bring chi namespace items into scope for CLIO_CUR_WORKER macro
 using clio::run::chi_cur_worker_key_;
 using clio::run::Worker;
+
+/**
+ * Routing for the compressor's forward (de)compress store to the next pool
+ * (cte_core). By default the compressor forwards with PoolQuery::Local(), so a
+ * compressed page is stored on the SAME node that compressed it -- fine on one
+ * node, but it never distributes across a multi-node cluster.
+ *
+ * When CLIO_CTE_COMPRESS_DISTRIBUTE=1, forward instead by HASHING (tag_id,
+ * blob_name) to a container -- the SAME scheme cte_core uses for blobs
+ * (Runtime::HashBlobToContainer, core_runtime.cc), so compressed pages fan out
+ * across the distributed cte_core and a later GetBlob for the same page routes
+ * back to the node that holds it. On a single node DirectHash resolves to the
+ * only node, so this is transparent there; it is opt-in only to keep existing
+ * single-node behavior byte-for-byte unchanged.
+ *
+ * PutBlob and GetBlob MUST use identical routing for a given blob_name, so all
+ * forward sites call this one helper.
+ */
+
+// The regular tasks carry a shm string (.str()); the POD tasks a fixed_string
+// (.c_str()). One overload pair lets the handler bodies be shared verbatim.
+static inline std::string CompressorBlobName(
+    const clio::cte::core::PutBlobTask &t) { return t.blob_name_.str(); }
+static inline std::string CompressorBlobName(
+    const clio::cte::core::GetBlobTask &t) { return t.blob_name_.str(); }
+static inline std::string CompressorBlobName(
+    const clio::cte::core::PodPutBlobTask &t) { return t.blob_name_.c_str(); }
+static inline std::string CompressorBlobName(
+    const clio::cte::core::PodGetBlobTask &t) { return t.blob_name_.c_str(); }
+
+inline clio::run::PoolQuery ForwardQuery(const clio::cte::core::TagId &tag_id,
+                                         const std::string &blob_name) {
+  static const bool distribute = [] {
+    const char *e = std::getenv("CLIO_CTE_COMPRESS_DISTRIBUTE");
+    return e && e[0] == '1';
+  }();
+  if (!distribute) return clio::run::PoolQuery::Local();
+  // Mirror Runtime::HashBlobToContainer exactly (core_runtime.cc:4794).
+  std::hash<std::string> string_hasher;
+  std::hash<clio::run::u32> u32_hasher;
+  clio::run::u32 hash_value = u32_hasher(tag_id.major_);
+  hash_value ^= u32_hasher(tag_id.minor_) + 0x9e3779b9 + (hash_value << 6) +
+                (hash_value >> 2);
+  hash_value ^= static_cast<clio::run::u32>(string_hasher(blob_name)) +
+                0x9e3779b9 + (hash_value << 6) + (hash_value >> 2);
+  return clio::run::PoolQuery::DirectHash(hash_value);
+}
+
+/**
+ * Environment-variable compressor pin.
+ *
+ * When `CLIO_CTE_COMPRESS_LIB` is set, it FORCES every compression performed by
+ * this module to use one specific library, overriding both the dynamic
+ * predictor (DynamicSchedule) and any caller-supplied `context.compress_lib_`.
+ * This is the operator-facing knob for "pin a GPU compressor" — set e.g.
+ * `CLIO_CTE_COMPRESS_LIB=nvcomp-lz4` (a canonical name from CompressionFactory)
+ * or a raw wire ID integer. `CLIO_CTE_COMPRESS_PRESET` optionally pins the
+ * preset (`fast` | `balanced` | `best`, or 1 | 2 | 3); default balanced.
+ *
+ * The env is read once and cached (the pin is a deployment-time decision, not a
+ * per-request one). Returns the pinned wire ID, or -1 when no valid pin is set.
+ * `out_preset` receives the pinned preset integer (1/2/3) when the return is >=0.
+ */
+static int CompressorPinWireId(int* out_preset) {
+  // Cache: -2 = not yet parsed, -1 = no pin, >=0 = pinned wire id.
+  static int cached_wire = -2;
+  static int cached_preset = 2;  // BALANCED
+  if (cached_wire == -2) {
+    cached_wire = -1;
+    const char* lib = std::getenv("CLIO_CTE_COMPRESS_LIB");
+    if (lib != nullptr && lib[0] != '\0') {
+      // Accept a canonical name or a raw integer wire id.
+      int wire = ctp::CompressionFactory::WireIdForName(lib);
+      if (wire < 0) {
+        char* end = nullptr;
+        long parsed = std::strtol(lib, &end, 10);
+        if (end != lib && *end == '\0') wire = static_cast<int>(parsed);
+      }
+      if (wire >= 0) {
+        cached_wire = wire;
+        const char* pre = std::getenv("CLIO_CTE_COMPRESS_PRESET");
+        if (pre != nullptr && pre[0] != '\0') {
+          if (std::strcmp(pre, "fast") == 0 || std::strcmp(pre, "1") == 0) {
+            cached_preset = 1;
+          } else if (std::strcmp(pre, "best") == 0 ||
+                     std::strcmp(pre, "3") == 0) {
+            cached_preset = 3;
+          } else {
+            cached_preset = 2;  // balanced / default
+          }
+        }
+        HLOG(kInfo,
+             "Compressor pinned via CLIO_CTE_COMPRESS_LIB: {} (wire={}, "
+             "preset={})",
+             ctp::CompressionFactory::NameForWireId(cached_wire), cached_wire,
+             cached_preset);
+      } else {
+        HLOG(kWarning,
+             "CLIO_CTE_COMPRESS_LIB='{}' is not a known compressor name or "
+             "wire id; ignoring pin",
+             lib);
+      }
+    }
+  }
+  if (cached_wire >= 0 && out_preset != nullptr) *out_preset = cached_preset;
+  return cached_wire;
+}
 
 /**
  * Compression header prepended to compressed data for self-describing format.
@@ -249,12 +357,12 @@ clio::run::TaskResume Runtime::Monitor(clio::run::shared_ptr<MonitorTask> &task)
   // Poll target states
   try {
     auto list_task = core_client_->AsyncListTargets();
-    list_task.Wait();
+    CLIO_CO_AWAIT(list_task);
     if (list_task->GetReturnCode() == 0) {
       std::lock_guard<std::mutex> lock(target_states_mutex_);
       for (auto &target_name : list_task->target_names_) {
         auto stat_task = core_client_->AsyncGetTargetInfo(target_name);
-        stat_task.Wait();
+        CLIO_CO_AWAIT(stat_task);
         if (stat_task->GetReturnCode() == 0) {
           auto &state = target_states_[target_name];
           state.target_name_ = target_name;
@@ -578,6 +686,28 @@ clio::run::TaskResume Runtime::DynamicSchedule(
       CLIO_CO_RETURN;
     }
 
+    // Operator pin: if CLIO_CTE_COMPRESS_LIB is set, bypass the predictor
+    // entirely and compress with the pinned library. Keeps the dynamic path
+    // deterministic under a pin (and avoids paying for stat estimation).
+    {
+      int pin_preset = 2;
+      int pin_wire = CompressorPinWireId(&pin_preset);
+      if (pin_wire >= 0) {
+        context.compress_lib_ = pin_wire;
+        context.compress_preset_ = pin_preset;
+        auto compress_task = client_.AsyncCompress(
+            clio::run::PoolQuery::Local(), task->tag_id_,
+            task->blob_name_.str(), task->offset_, task->size_,
+            task->blob_data_, task->score_, context, task->flags_,
+            task->core_pool_id_);
+        CLIO_CO_AWAIT(compress_task);
+        task->context_ = compress_task->context_;
+        task->tier_score_ = compress_task->tier_score_;
+        task->return_code_ = compress_task->return_code_;
+        CLIO_CO_RETURN;
+      }
+    }
+
     // Get compression stats
     auto stats = EstCompressionStats(chunk_data, chunk_size, context);
 
@@ -629,7 +759,7 @@ clio::run::TaskResume Runtime::DynamicSchedule(
         clio::run::PoolQuery::Local(), task->tag_id_, task->blob_name_.str(),
         task->offset_, task->size_, task->blob_data_, task->score_, context,
         task->flags_, task->core_pool_id_);
-    compress_task.Wait();
+    CLIO_CO_AWAIT(compress_task);
 
     // Copy results back
     task->context_ = compress_task->context_;
@@ -658,6 +788,19 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
       CLIO_CO_RETURN;
     }
 
+    // Operator pin: CLIO_CTE_COMPRESS_LIB forces a specific compressor here,
+    // overriding both the dynamic predictor and the caller's compress_lib_.
+    // Applied at the single chokepoint where wire id -> factory lib happens, so
+    // it governs every compression path (static, dynamic, explicit).
+    {
+      int pin_preset = 2;
+      int pin_wire = CompressorPinWireId(&pin_preset);
+      if (pin_wire >= 0) {
+        context.compress_lib_ = pin_wire;
+        context.compress_preset_ = pin_preset;
+      }
+    }
+
     // Initialize core client if needed (from compose next_pool_id or task param)
     if (!core_client_) {
       clio::run::PoolId core_id = !config_.next_pool_id_.IsNull()
@@ -684,8 +827,8 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
       auto put_task = core_client_->AsyncPutBlob(
           task->tag_id_, task->blob_name_.str(), task->offset_, task->size_,
           task->blob_data_, task->score_, context, task->flags_,
-          clio::run::PoolQuery::Local());
-      put_task.Wait();
+          ForwardQuery(task->tag_id_, task->blob_name_.str()));
+      CLIO_CO_AWAIT(put_task);
       task->context_ = put_task->context_;
       task->return_code_ = put_task->return_code_;
       CLIO_CO_RETURN;
@@ -776,8 +919,8 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
       auto put_task = core_client_->AsyncPutBlob(
           task->tag_id_, task->blob_name_.str(), task->offset_,
           total_stored_size, compressed_shm_ptr, task->score_, context,
-          task->flags_, clio::run::PoolQuery::Local());
-      put_task.Wait();
+          task->flags_, ForwardQuery(task->tag_id_, task->blob_name_.str()));
+      CLIO_CO_AWAIT(put_task);
 
       // Free compressed data buffer
       CLIO_IPC->FreeBuffer(compressed_shm);
@@ -805,8 +948,8 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
       auto put_task = core_client_->AsyncPutBlob(
           task->tag_id_, task->blob_name_.str(), task->offset_, task->size_,
           task->blob_data_, task->score_, context, task->flags_,
-          clio::run::PoolQuery::Local());
-      put_task.Wait();
+          ForwardQuery(task->tag_id_, task->blob_name_.str()));
+      CLIO_CO_AWAIT(put_task);
 
       context.compress_lib_ = 0;  // Mark as uncompressed
       task->context_ = put_task->context_;
@@ -861,11 +1004,14 @@ clio::run::TaskResume Runtime::Decompress(clio::run::shared_ptr<DecompressTask> 
     }
     ctp::ipc::ShmPtr<> temp_buffer_ptr = temp_buffer.shm_.template Cast<void>();
 
-    // Call GetBlob to retrieve the (potentially compressed) data
+    // Call GetBlob to retrieve the (potentially compressed) data. MUST use the
+    // same routing as the PutBlob above so the read reaches the node that holds
+    // this page in a distributed cte_core.
     auto get_task = core_client_->AsyncGetBlob(
         task->tag_id_, task->blob_name_.str(), task->offset_, expected_size,
-        task->flags_, temp_buffer_ptr, clio::run::PoolQuery::Local());
-    get_task.Wait();
+        task->flags_, temp_buffer_ptr,
+        ForwardQuery(task->tag_id_, task->blob_name_.str()));
+    CLIO_CO_AWAIT(get_task);
 
     if (get_task->return_code_ != 0) {
       CLIO_IPC->FreeBuffer(temp_buffer);
@@ -972,6 +1118,146 @@ clio::run::TaskResume Runtime::Decompress(clio::run::shared_ptr<DecompressTask> 
 
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
+}
+
+// Compress a RAW core PutBlobTask (method kPutBlob=15) that landed at the
+// compressor entrypoint -- e.g. a gpu_vector page eviction from device code.
+// blob_data_ is a GPU/HBM pointer; cuSZp compresses it in place. The compressed
+// bytes (with a CompressionHeader) are forwarded to the core pool under the same
+// per-page name the core handler would have composed ("<name>_pi<gpu_page_idx_>").
+template <typename PutT>
+clio::run::TaskResume Runtime::CompressPutBlobImpl(
+    clio::run::shared_ptr<PutT>& task) {
+  try {
+    clio::run::u64 input_size = task->size_;
+    clio::cte::core::Context& context = task->context_;
+    if (task->blob_data_.IsNull() || input_size == 0) {
+      task->return_code_ = 1; CLIO_CO_RETURN;
+    }
+    { int pin_preset = 2; int pin_wire = CompressorPinWireId(&pin_preset);
+      if (pin_wire >= 0) { context.compress_lib_ = pin_wire;
+                           context.compress_preset_ = pin_preset; } }
+    if (!core_client_ && !config_.next_pool_id_.IsNull())
+      core_client_ = std::make_unique<clio::cte::core::Client>(config_.next_pool_id_);
+    if (!core_client_) { task->return_code_ = 9; CLIO_CO_RETURN; }
+
+    // Per-page name: what the core PutBlob handler composes from gpu_page_idx_.
+    std::string name = CompressorBlobName(*task);
+    if (task->gpu_page_idx_ != PutT::kNoPageIdx)
+      name += "_pi" + std::to_string(task->gpu_page_idx_);
+
+    if (context.compress_lib_ <= 0) {  // no compression -> forward as-is
+      auto pt = core_client_->AsyncPutBlob(task->tag_id_, name, task->offset_,
+          input_size, task->blob_data_, task->score_, context, task->flags_,
+          ForwardQuery(task->tag_id_, name));
+      CLIO_CO_AWAIT(pt);
+      task->return_code_ = pt->return_code_; CLIO_CO_RETURN;
+    }
+
+    std::string lib = ctp::CompressionFactory::NameForWireId(context.compress_lib_);
+    ctp::CompressionPreset preset = ctp::CompressionPreset::BALANCED;
+    if (context.compress_preset_ == 1) preset = ctp::CompressionPreset::FAST;
+    else if (context.compress_preset_ == 3) preset = ctp::CompressionPreset::BEST;
+    auto compressor = ctp::CompressionFactory::GetPreset(lib, preset);
+    if (!compressor) { task->return_code_ = 3; CLIO_CO_RETURN; }
+
+    std::vector<char> cbuf(input_size + (input_size / 20) + 1024);
+    size_t csize = cbuf.size();
+    auto in = CLIO_IPC->ToFullPtr<char>(task->blob_data_.template Cast<char>());
+    bool ok = compressor->Compress(cbuf.data(), csize, in.ptr_, input_size);
+    size_t hsz = sizeof(CompressionHeader);
+    size_t total = csize + hsz;
+
+    HLOG(kInfo, "[CompressPutBlob] name={} off={} in={} csize={} ok={}",
+         name, task->offset_, input_size, csize, ok);
+    if (ok && total < input_size) {
+      context.actual_original_size_ = input_size;
+      context.actual_compressed_size_ = total;
+      context.actual_compression_ratio_ = (double)input_size / (double)total;
+      auto shm = CLIO_IPC->AllocateBuffer(total);
+      if (shm.IsNull()) { task->return_code_ = 4; CLIO_CO_RETURN; }
+      CompressionHeader hdr(context.compress_lib_, context.compress_preset_, input_size);
+      std::memcpy(shm.ptr_, &hdr, hsz);
+      std::memcpy(shm.ptr_ + hsz, cbuf.data(), csize);
+      ctp::ipc::ShmPtr<> sp = shm.shm_.template Cast<void>();
+      auto pt = core_client_->AsyncPutBlob(task->tag_id_, name, task->offset_,
+          total, sp, task->score_, context, task->flags_,
+          ForwardQuery(task->tag_id_, name));
+      CLIO_CO_AWAIT(pt);
+      CLIO_IPC->FreeBuffer(shm);
+      task->context_ = context;
+      task->return_code_ = pt->return_code_;
+    } else {  // not beneficial -> store original (device blob) uncompressed
+      auto pt = core_client_->AsyncPutBlob(task->tag_id_, name, task->offset_,
+          input_size, task->blob_data_, task->score_, context, task->flags_,
+          ForwardQuery(task->tag_id_, name));
+      CLIO_CO_AWAIT(pt);
+      task->return_code_ = pt->return_code_;
+    }
+  } catch (const std::exception& e) {
+    HLOG(kError, "Exception in CompressPutBlob: {}", e.what());
+    task->return_code_ = 6;
+  }
+  CLIO_CO_RETURN;
+}
+
+// Decompress a RAW core GetBlobTask (method kGetBlob=16) -- a gpu_vector page
+// fault. Fetches the (compressed) blob from core under the "_pi" name and
+// decompresses into the caller's HBM buffer. Mirrors Decompress(); the
+// compressed size is over-estimated (cuSZp's stream is self-delimiting).
+template <typename GetT>
+clio::run::TaskResume Runtime::DecompressGetBlobImpl(
+    clio::run::shared_ptr<GetT>& task) {
+  try {
+    clio::run::u64 expected_size = task->size_;
+    if (task->blob_data_.IsNull()) { task->return_code_ = 1; CLIO_CO_RETURN; }
+    if (!core_client_ && !config_.next_pool_id_.IsNull())
+      core_client_ = std::make_unique<clio::cte::core::Client>(config_.next_pool_id_);
+    if (!core_client_) { task->return_code_ = 9; CLIO_CO_RETURN; }
+
+    std::string name = CompressorBlobName(*task);
+    if (task->gpu_page_idx_ != GetT::kNoPageIdx)
+      name += "_pi" + std::to_string(task->gpu_page_idx_);
+
+    size_t hsz = sizeof(CompressionHeader);
+    auto tmp = CLIO_IPC->AllocateBuffer(expected_size + hsz + 1024);
+    if (tmp.IsNull()) { task->return_code_ = 2; CLIO_CO_RETURN; }
+    ctp::ipc::ShmPtr<> tmpp = tmp.shm_.template Cast<void>();
+    auto gt = core_client_->AsyncGetBlob(task->tag_id_, name, task->offset_,
+        expected_size + hsz + 1024, task->flags_, tmpp,
+        ForwardQuery(task->tag_id_, name));
+    CLIO_CO_AWAIT(gt);
+    if (gt->return_code_ != 0) { CLIO_IPC->FreeBuffer(tmp);
+      task->return_code_ = 10 + gt->return_code_; CLIO_CO_RETURN; }
+
+    auto* header = reinterpret_cast<CompressionHeader*>(tmp.ptr_);
+    auto out = CLIO_IPC->ToFullPtr<char>(task->blob_data_.template Cast<char>());
+    HLOG(kInfo, "[DecompressGetBlob] name={} off={} req={} get_rc={} valid={}",
+         name, task->offset_, expected_size, gt->return_code_,
+         header->IsValid());
+    if (header->IsValid()) {
+      std::string lib = ctp::CompressionFactory::NameForWireId(header->compress_lib_);
+      ctp::CompressionPreset preset = ctp::CompressionPreset::BALANCED;
+      if (header->compress_preset_ == 1) preset = ctp::CompressionPreset::FAST;
+      else if (header->compress_preset_ == 3) preset = ctp::CompressionPreset::BEST;
+      auto dec = ctp::CompressionFactory::GetPreset(lib, preset);
+      if (!dec) { CLIO_IPC->FreeBuffer(tmp); task->return_code_ = 3; CLIO_CO_RETURN; }
+      char* cdata = tmp.ptr_ + hsz;
+      size_t csize = expected_size;  // over-estimate; cuSZp reads its own length
+      size_t dsize = header->original_size_;
+      bool ok = dec->Decompress(out.ptr_, dsize, cdata, csize);
+      CLIO_IPC->FreeBuffer(tmp);
+      task->return_code_ = ok ? 0 : 5;
+    } else {  // stored uncompressed -> copy through
+      std::memcpy(out.ptr_, tmp.ptr_, expected_size);
+      CLIO_IPC->FreeBuffer(tmp);
+      task->return_code_ = 0;
+    }
+  } catch (const std::exception& e) {
+    HLOG(kError, "Exception in DecompressGetBlob: {}", e.what());
+    task->return_code_ = 6;
+  }
+  CLIO_CO_RETURN;
 }
 
 void Runtime::LogCompressionTelemetry(const CompressionTelemetry& telemetry) {
@@ -1171,6 +1457,32 @@ clio::run::TaskResume Runtime::PollConsumers(clio::run::shared_ptr<PollConsumers
 
   CLIO_CO_RETURN;
   CLIO_TASK_BODY_END
+}
+
+
+// ---- Public entrypoints -----------------------------------------------------
+// Regular (kPutBlob=15 / kGetBlob=16) come from host clients; the POD variants
+// (kPodPutBlob=43 / kPodGetBlob=44) are what the gpu_vector's cache manager
+// submits from DEVICE code. Both share one implementation.
+clio::run::TaskResume Runtime::CompressPutBlob(
+    clio::run::shared_ptr<clio::cte::core::PutBlobTask>& task) {
+  CLIO_CO_AWAIT(CompressPutBlobImpl(task));
+  CLIO_CO_RETURN;
+}
+clio::run::TaskResume Runtime::CompressPodPutBlob(
+    clio::run::shared_ptr<clio::cte::core::PodPutBlobTask>& task) {
+  CLIO_CO_AWAIT(CompressPutBlobImpl(task));
+  CLIO_CO_RETURN;
+}
+clio::run::TaskResume Runtime::DecompressGetBlob(
+    clio::run::shared_ptr<clio::cte::core::GetBlobTask>& task) {
+  CLIO_CO_AWAIT(DecompressGetBlobImpl(task));
+  CLIO_CO_RETURN;
+}
+clio::run::TaskResume Runtime::DecompressPodGetBlob(
+    clio::run::shared_ptr<clio::cte::core::PodGetBlobTask>& task) {
+  CLIO_CO_AWAIT(DecompressGetBlobImpl(task));
+  CLIO_CO_RETURN;
 }
 
 }  // namespace clio::cte::compressor

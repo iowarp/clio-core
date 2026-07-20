@@ -32,9 +32,24 @@
 namespace ctp::lbm {
 
 // --- Tunables ---------------------------------------------------------------
-// Default transfer space when the caller does not specify one (128KB total,
-// minus the header, is available as ring capacity).
-static constexpr size_t kShmMpscDefaultSegmentSize = 128 * 1024;
+// Default transfer space when the caller does not specify one (minus the
+// header, this is the ring capacity).
+//
+// Sizing note (issue #768 deadlock): the ring holds
+// (segment / kShmMpscChunkSize) fixed slots, which bounds the number of
+// in-flight messages per direction. SendBytes()/WaitSlotFree() BLOCK when the
+// ring is full (they only bail if the peer process dies). A client that issues
+// N async ops before waiting (e.g. cr_cli_cfs fires 16 AsyncAppend, cr_cli_cfs
+// rename fires 12 renames + 12 readdirs) needs the ring to hold ~N messages in
+// EACH direction: with too few slots the client blocks in SendIn (request ring
+// full) while the worker blocks in SendOut (response ring full) and neither
+// drains the other -> a bidirectional deadlock (reproduced under boost
+// coroutines in the deps-cpu container). 128KB gave only 4 slots. 1MB gives 32
+// slots, comfortably above the runtime's realistic per-thread async fan-out
+// (>=16-24 outstanding), which restores forward progress. (A fully
+// deadlock-proof design would make SendOut non-blocking/deferred; tracked
+// separately.)
+static constexpr size_t kShmMpscDefaultSegmentSize = 1024 * 1024;
 // Per-chunk cap: SendBytes/RecvBytes move at most this many bytes per xfer slot.
 static constexpr size_t kShmMpscChunkSize = 32 * 1024;
 // Number of in-flight transfer slots the ring tracks (bounds concurrency).

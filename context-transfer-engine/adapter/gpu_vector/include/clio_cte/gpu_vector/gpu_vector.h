@@ -23,6 +23,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <new>
@@ -95,7 +96,8 @@ class Vector {
          clio::run::u32 cache_period_us = 50000,
          CacheMode mode = CacheMode::kLegacy,
          clio::run::u32 manager_threads_per_block = 32,
-         bool allow_cold_miss_fault = false);
+         bool allow_cold_miss_fault = false,
+         clio::run::PoolId storage_pool_id = clio::run::PoolId(0, 0));
   ~Vector();
 
   Vector(const Vector &) = delete;
@@ -105,6 +107,61 @@ class Vector {
    *  kernel once and a drain kernel that calls Wait() on all in-flight
    *  put / get futures. */
   void FlushAllSync();
+
+  /**
+   * Host-driven materialization of every stored page into its HBM slot.
+   *
+   * Read-side counterpart to eviction, needed for the COMPRESSED vector: an
+   * on-device page fault spin-waits on the GPU, but a compressor GetBlob is
+   * serviced by launching a GPU decompression kernel (cuSZp, which internally
+   * cudaMalloc/cudaMemcpy-synchronizes the device) -- so the fault kernel and
+   * the decompressor deadlock on a single GPU. FaultAllSync avoids this by
+   * decompressing from the HOST while the GPU is idle: for every HBM slot it
+   * issues a GetBlob (routed through the storage pool; if that pool is a
+   * compressor, it decompresses) straight INTO the slot's HBM address, then
+   * marks the slot resident. A subsequent device read kernel finds every page
+   * present -- no on-device fault, no spin, no deadlock.
+   *
+   * Legacy/single-tier only (host_pages_per_block == 0): the HBM tier holds the
+   * whole logical extent, so materializing every slot materializes the vector.
+   */
+  void FaultAllSync();
+
+  /**
+   * Windowed host-driven prefetch (the #700 SequentialTransaction primitive).
+   *
+   * Decompress the contiguous run of `gpu_pages_per_block` global pages starting
+   * at `first_page` into this (single-block) vector's HBM slots and mark them
+   * resident, binding slot s -> global page (first_page + s). The GPU is idle
+   * during the decompress (no on-device fault). Unlike FaultAllSync (which loads
+   * the whole vector), this loads only ONE window, so a dataset far larger than
+   * the HBM cache can be swept window-by-window: prefetch a window -> read it
+   * on-device (pages resident) -> advance. Single-block, single-tier only
+   * (nblocks == 1, host_pages_per_block == 0); the window size is the HBM cache
+   * (gpu_pages_per_block). Pages are named "<tag>_b0_pi<global_page>" to match
+   * the store.
+   */
+  void PrefetchWindowSync(clio::run::u64 first_page);
+
+  /**
+   * Prefetch `count` global pages [first_page, first_page+count) into HBM slots
+   * [slot_base, slot_base+count) and bind them resident. The building block for
+   * PIPELINED (double-buffered) prefetch: keep gpu_pages_per_block == 2*window
+   * and alternate slot_base between 0 and window, so window W+1 can be prefetched
+   * into one buffer while a device kernel reads window W from the other. Unlike
+   * PrefetchWindowSync this does NOT device-synchronize (it syncs only its own
+   * mark stream), so it will not stall a concurrently-running read kernel.
+   * Single-block, single-tier; slot_base + count <= gpu_pages_per_block.
+   *
+   * `batched`: issue all `count` GetBlobs asynchronously then wait for them
+   * together (vs one serial round-trip per page). Intended to let the compressor
+   * decompress a window's pages concurrently -- but MEASURED SLOWER on a single
+   * GPU (the cuSZp decompress kernels serialize on the device anyway, so
+   * concurrent issue only adds scheduling / pinned-pool contention). Default is
+   * therefore FALSE (serial); the flag is kept for A/B measurement.
+   */
+  void PrefetchPagesSync(clio::run::u64 first_page, clio::run::u32 count,
+                         clio::run::u32 slot_base, bool batched = false);
 
   /** Cache-thread-only: drains the per-block host_prefetch_q, issues
    *  AsyncGetBlob via the CPU-side CTE client for each directive,
@@ -224,6 +281,63 @@ __global__ void LegacyFlushKernel(::clio::run::IpcManagerGpuInfo info,
   }
   FlushPageBase(g_ipc_manager_ptr, v, b_idx, p, slot);
   (void)g_ipc_manager;
+}
+
+/** Mark every HBM slot resident and clean, binding slot (block, s) to the
+ *  global logical page (block * gpu_pages_per_block + s). Used by
+ *  Vector::FaultAllSync after the host has decompressed each page's bytes
+ *  into the slot's device_ptr; the read kernel's Resolve then finds every
+ *  page present (page_idx set) instead of cold-faulting. Legacy/single-tier
+ *  only. */
+__global__ void MarkAllResidentKernel(DeviceViewBase v) {
+  if (blockIdx.x >= v.nblocks) return;
+  Block *b = GetBlock(v, blockIdx.x);
+  for (clio::run::u32 s = threadIdx.x; s < v.gpu_pages_per_block;
+       s += blockDim.x) {
+    Page *p = &b->pages[s];
+    p->page_idx = static_cast<int32_t>(
+        static_cast<clio::run::u64>(blockIdx.x) * v.gpu_pages_per_block + s);
+    p->modify_min = -1;
+    p->modify_max = -1;
+    p->flags = 0;
+    p->tier = 0;
+  }
+}
+
+/** Windowed variant for Vector::PrefetchWindowSync: single-block, bind slot s to
+ *  global page (first_page + s) so the read kernel's Resolve finds the just-
+ *  prefetched window resident. */
+__global__ void MarkWindowResidentKernel(DeviceViewBase v,
+                                         clio::run::u64 first_page) {
+  Block *b = GetBlock(v, 0);
+  for (clio::run::u32 s = threadIdx.x; s < v.gpu_pages_per_block;
+       s += blockDim.x) {
+    Page *p = &b->pages[s];
+    p->page_idx = static_cast<int32_t>(first_page + s);
+    p->modify_min = -1;
+    p->modify_max = -1;
+    p->flags = 0;
+    p->tier = 0;
+  }
+}
+
+/** Bind slots [slot_base, slot_base+count) to global pages
+ *  [first_page, first_page+count). Used by Vector::PrefetchPagesSync for
+ *  double-buffered (pipelined) prefetch: two windows live in disjoint slot
+ *  ranges, so the next window's prefetch never touches the window being read. */
+__global__ void MarkPagesResidentKernel(DeviceViewBase v,
+                                        clio::run::u64 first_page,
+                                        clio::run::u32 count,
+                                        clio::run::u32 slot_base) {
+  Block *b = GetBlock(v, 0);
+  for (clio::run::u32 i = threadIdx.x; i < count; i += blockDim.x) {
+    Page *p = &b->pages[slot_base + i];
+    p->page_idx = static_cast<int32_t>(first_page + i);
+    p->modify_min = -1;
+    p->modify_max = -1;
+    p->flags = 0;
+    p->tier = 0;
+  }
 }
 
 /** Atomic-clear kPageBusy + kPageGetInFlight on a single (block, slot).
@@ -839,7 +953,8 @@ inline Vector<T>::Vector(const std::string &tag_name, clio::run::u32 nblocks,
                           clio::run::u32 cache_period_us,
                           CacheMode mode,
                           clio::run::u32 manager_threads_per_block,
-                          bool allow_cold_miss_fault) {
+                          bool allow_cold_miss_fault,
+                          clio::run::PoolId storage_pool_id) {
 #if !CTP_IS_DEVICE_PASS
   // Body gated for the host pass only.
   if (nblocks == 0 || gpu_pages_per_block == 0 || page_size_bytes == 0) {
@@ -990,7 +1105,17 @@ inline Vector<T>::Vector(const std::string &tag_name, clio::run::u32 nblocks,
   }
   view_.base.tag_id = tag_fut->tag_id_;
   impl_->tag_name = tag_name;
-  impl_->cte_pool_id = clio::cte::core::kCtePoolId;
+  // Per-page PutBlob/GetBlob routing. Default (null storage_pool_id) sends
+  // page traffic straight to the CTE core (kCtePoolId). Passing a compressor
+  // pool here makes this a *compressed* vector: page evictions are routed to
+  // the compressor, which compresses in HBM and forwards the compressed blob
+  // to its downstream core (next_pool_id_ == kCtePoolId), and page faults are
+  // routed to the compressor, which fetches + decompresses. The CTE tag is
+  // always created on kCtePoolId above, so the tag_id is valid at the core the
+  // compressor forwards to regardless of where page traffic is routed.
+  impl_->cte_pool_id = storage_pool_id.IsNull()
+                           ? clio::cte::core::kCtePoolId
+                           : storage_pool_id;
 
   // 5. Populate DeviceView.
   view_.base.blocks = reinterpret_cast<Block *>(impl_->meta_base);
@@ -1272,6 +1397,151 @@ inline void Vector<T>::FlushAllSync() {
   // continuously. The Vector is automatically coherent — the user
   // never needs to flush. This method is retained as a no-op so
   // legacy callers compile, but it does NOT do anything.
+#endif
+}
+
+template <typename T>
+inline void Vector<T>::FaultAllSync() {
+#if !CTP_IS_DEVICE_PASS
+  if (impl_->host_ppb_cached != 0) {
+    throw std::runtime_error(
+        "gpu_vector: FaultAllSync is single-tier (legacy) only");
+  }
+  const clio::run::u32 nblocks = impl_->nblocks_cached;
+  const clio::run::u32 gpu_ppb = impl_->gpu_ppb_cached;
+  const clio::run::u64 page_size = impl_->page_size_cached;
+
+  // Decompress every page from the store straight into its HBM slot. The
+  // GetBlob is routed to impl_->cte_pool_id (the storage pool); when that is a
+  // compressor it decompresses. blob_data is a zero-copy ShmPtr whose off_ is
+  // the slot's HBM device address (MakeBlobShmPtr), so the (de)compressor
+  // writes the page bytes directly into HBM. The GPU is idle here (no user
+  // kernel), so the on-GPU decompressor runs without contending with a
+  // spin-waiting fault kernel.
+  clio::cte::core::Client client(impl_->cte_pool_id);
+  for (clio::run::u32 b = 0; b < nblocks; ++b) {
+    for (clio::run::u32 s = 0; s < gpu_ppb; ++s) {
+      clio::run::u64 gp = static_cast<clio::run::u64>(b) * gpu_ppb + s;
+      char *hbm = static_cast<char *>(impl_->pages_base) + gp * page_size;
+      // Matches the eviction name: writer stores "<tag>_b<block>" and the
+      // (de)compressor appends "_pi<gpu_page_idx>" where gpu_page_idx is the
+      // global page index. Legacy slot (b,s) holds global page b*gpu_ppb+s.
+      std::string name = impl_->tag_name + "_b" + std::to_string(b) + "_pi" +
+                         std::to_string(gp);
+      // Zero-copy blob_data: null alloc id + off_ = the slot's HBM device
+      // address, so the (de)compressor writes decompressed bytes straight into
+      // HBM. (Host-side equivalent of detail::MakeBlobShmPtr, which is
+      // device-only.)
+      ctp::ipc::ShmPtr<> blob_data;
+      blob_data.alloc_id_ = ctp::ipc::AllocatorId::GetNull();
+      blob_data.off_ = reinterpret_cast<clio::run::u64>(hbm);
+      auto gf = client.AsyncGetBlob(view_.base.tag_id, name, /*offset=*/0,
+                                    page_size, /*flags=*/0, blob_data,
+                                    clio::run::PoolQuery::Local());
+      gf.Wait();
+      if (gf->GetReturnCode() != 0) {
+        throw std::runtime_error(
+            "gpu_vector: FaultAllSync GetBlob failed for '" + name +
+            "' rc=" + std::to_string(gf->GetReturnCode()));
+      }
+    }
+  }
+
+  // Bind every slot to its global page and mark resident/clean so the read
+  // kernel's Resolve finds the page present instead of cold-faulting.
+  clio::run::u32 threads = (gpu_ppb < 256u) ? gpu_ppb : 256u;
+  if (threads == 0) threads = 1;
+  detail::MarkAllResidentKernel<<<nblocks, threads>>>(view_.base);
+  ctp::GpuApi::Synchronize();
+#endif
+}
+
+template <typename T>
+inline void Vector<T>::PrefetchWindowSync(clio::run::u64 first_page) {
+#if !CTP_IS_DEVICE_PASS
+  // Load the whole cache (gpu_pages_per_block) starting at first_page into
+  // slots [0, gpu_pages_per_block). Serial per-page prefetch (batched showed no
+  // benefit on a single GPU -- see PrefetchPagesSync).
+  PrefetchPagesSync(first_page, impl_->gpu_ppb_cached, /*slot_base=*/0,
+                    /*batched=*/false);
+#endif
+}
+
+template <typename T>
+inline void Vector<T>::PrefetchPagesSync(clio::run::u64 first_page,
+                                         clio::run::u32 count,
+                                         clio::run::u32 slot_base,
+                                         bool batched) {
+#if !CTP_IS_DEVICE_PASS
+  if (impl_->nblocks_cached != 1 || impl_->host_ppb_cached != 0) {
+    throw std::runtime_error(
+        "gpu_vector: PrefetchPagesSync is single-block single-tier only");
+  }
+  const clio::run::u64 page_size = impl_->page_size_cached;
+  clio::cte::core::Client client(impl_->cte_pool_id);
+  auto issue = [&](clio::run::u32 i) {
+    clio::run::u64 gp = first_page + i;
+    char *hbm =
+        static_cast<char *>(impl_->pages_base) + (slot_base + i) * page_size;
+    std::string name = impl_->tag_name + "_b0_pi" + std::to_string(gp);
+    ctp::ipc::ShmPtr<> blob_data;
+    blob_data.alloc_id_ = ctp::ipc::AllocatorId::GetNull();
+    blob_data.off_ = reinterpret_cast<clio::run::u64>(hbm);
+    return client.AsyncGetBlob(view_.base.tag_id, name, /*offset=*/0, page_size,
+                               /*flags=*/0, blob_data,
+                               clio::run::PoolQuery::Local());
+  };
+  auto check = [&](clio::run::Future<clio::cte::core::GetBlobTask> &gf,
+                   clio::run::u32 i) {
+    if (gf->GetReturnCode() != 0) {
+      throw std::runtime_error(
+          "gpu_vector: PrefetchPagesSync GetBlob failed for '" +
+          impl_->tag_name + "_b0_pi" + std::to_string(first_page + i) +
+          "' rc=" + std::to_string(gf->GetReturnCode()));
+    }
+  };
+  if (batched) {
+    // Issue every page's GetBlob, THEN wait -- the compressor decompresses them
+    // concurrently across its worker pool instead of one serial round-trip each.
+    std::vector<clio::run::Future<clio::cte::core::GetBlobTask>> futs;
+    futs.reserve(count);
+    for (clio::run::u32 i = 0; i < count; ++i) futs.push_back(issue(i));
+    for (clio::run::u32 i = 0; i < count; ++i) {
+      futs[i].Wait();
+      check(futs[i], i);
+    }
+  } else {
+    for (clio::run::u32 i = 0; i < count; ++i) {
+      auto gf = issue(i);
+      gf.Wait();
+      check(gf, i);
+    }
+  }
+  // Optional MODELED slow-tier read latency. On this cluster, GPU compression
+  // shrinks each page ~16x, so the real Lustre read is sub-ms and the reader is
+  // compute-bound, not IO-bound -- prefetch then has almost nothing to hide.
+  // IOWarp tiers, however, span HBM (~ns) -> NVMe (~us) -> PFS (~ms) -> object
+  // store / tape (~10-100ms). Setting CLIO_CTE_SLOW_TIER_US models such a slow
+  // tier's per-page read latency so the IO-bound regime -- and the value of
+  // prefetch-ahead -- can be demonstrated. It is a latency MODEL, not a measured
+  // read; it is off (0) unless the benchmark sets it.
+  static const clio::run::u64 slow_us = [] {
+    const char *e = std::getenv("CLIO_CTE_SLOW_TIER_US");
+    return e ? std::strtoull(e, nullptr, 10) : 0ULL;
+  }();
+  if (slow_us) {
+    std::this_thread::sleep_for(std::chrono::microseconds(slow_us * count));
+  }
+  // Mark resident on a dedicated stream and sync only that stream, so this
+  // prefetch does not device-synchronize (and thus won't stall a concurrently
+  // running read kernel on another stream) -- the key to overlap.
+  static thread_local cudaStream_t mark_stream = nullptr;
+  if (!mark_stream) cudaStreamCreateWithFlags(&mark_stream, cudaStreamNonBlocking);
+  clio::run::u32 threads = (count < 256u) ? count : 256u;
+  if (threads == 0) threads = 1;
+  detail::MarkPagesResidentKernel<<<1, threads, 0, mark_stream>>>(
+      view_.base, first_page, count, slot_base);
+  cudaStreamSynchronize(mark_stream);
 #endif
 }
 

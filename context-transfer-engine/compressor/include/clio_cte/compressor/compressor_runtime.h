@@ -132,6 +132,39 @@ private:
   clio::run::TaskResume Decompress(clio::run::shared_ptr<DecompressTask> &task);
 
   /**
+   * Handle a RAW core PutBlobTask that arrived at the compressor entrypoint
+   * (core Method::kPutBlob = 15) -- e.g. a gpu_vector page eviction submitted
+   * from device code. Compresses blob_data (a GPU/HBM pointer, in place) and
+   * forwards the compressed bytes to the core pool, preserving the per-page
+   * "_pi<gpu_page_idx_>" blob name so each cache page resolves to its own blob.
+   */
+  /** Shared implementation for both the regular (15) and POD (43) PutBlob:
+   *  the two task types have identical field names. */
+  template <typename PutT>
+  clio::run::TaskResume CompressPutBlobImpl(clio::run::shared_ptr<PutT> &task);
+  template <typename GetT>
+  clio::run::TaskResume DecompressGetBlobImpl(clio::run::shared_ptr<GetT> &task);
+
+  clio::run::TaskResume CompressPutBlob(
+      clio::run::shared_ptr<clio::cte::core::PutBlobTask> &task);
+  /** POD variant (method kPodPutBlob=43): device-submitted page evictions.
+   *  Same logic; PodPutBlobTask has identical field names. */
+  clio::run::TaskResume CompressPodPutBlob(
+      clio::run::shared_ptr<clio::cte::core::PodPutBlobTask> &task);
+
+  /**
+   * Handle a RAW core GetBlobTask at the compressor entrypoint (core
+   * Method::kGetBlob = 16) -- a gpu_vector page fault. Fetches the compressed
+   * blob from core (same "_pi" naming) and decompresses into the caller's
+   * (HBM) buffer.
+   */
+  clio::run::TaskResume DecompressGetBlob(
+      clio::run::shared_ptr<clio::cte::core::GetBlobTask> &task);
+  /** POD variant (method kPodGetBlob=44): device-submitted page faults. */
+  clio::run::TaskResume DecompressPodGetBlob(
+      clio::run::shared_ptr<clio::cte::core::PodGetBlobTask> &task);
+
+  /**
    * Sample this node's CPU utilization and aggregated worker load
    * (Method::kPollNodeLoad). Writes results into task->sample_.
    */

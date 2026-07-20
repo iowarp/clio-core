@@ -10,7 +10,32 @@
 
 #include "clio_runtime/ipc/ipc_cpu2cpu.h"
 
+#include <unordered_map>
+
 namespace clio::run {
+
+#if CTP_IS_HOST
+/**
+ * Thread-local demux stash for SHM task responses (issue #768).
+ *
+ * A client thread's MPSC server (clio-<pid>-<tid>) receives the responses for
+ * EVERY task this thread submitted. When the thread has more than one async op
+ * outstanding, RecvOut(future_A) may pull future_B's response off the ring
+ * first. Blindly deserializing it into A corrupts both (a variable-size
+ * ReaddirTask read into a RenameTask slot trips GlobalDeserialize's
+ * "beyond end of data"). Park the mismatched response here, keyed by its
+ * net_key (the task's own address, stamped in SendIn), so the RecvOut that
+ * actually owns that future can claim it. Over TCP a single net-worker
+ * serializes responses, so this never surfaces there.
+ *
+ * Inline function-local thread_local => exactly one map per thread across the
+ * whole program, shared by every RecvOut<TaskT> instantiation.
+ */
+inline std::unordered_map<size_t, LoadTaskArchive> &ShmOutResponseStash() {
+  thread_local std::unordered_map<size_t, LoadTaskArchive> stash;
+  return stash;
+}
+#endif  // CTP_IS_HOST
 
 template <typename TaskT>
 Future<TaskT> IpcCpu2Cpu::SendIn(IpcManager *ipc,
@@ -96,10 +121,28 @@ bool IpcCpu2Cpu::RecvOut(IpcManager *ipc,
   TaskT *task_ptr = future.get();
   auto *tls = ipc->GetTls();
 
-  // This thread's MPSC server only receives results for tasks this thread sent
-  // (the worker routes responses to clio-<this_pid>-<this_tid>). For the common
-  // one-outstanding-per-thread case the next result IS ours; deserialize it.
-  // (Per-net_key demux for concurrent async sends is a later refinement.)
+  // This thread's MPSC server receives the results for EVERY task this thread
+  // sent (the worker routes responses to clio-<this_pid>-<this_tid>). The
+  // response we want is identified by this task's net_key (its own address,
+  // stamped in SendIn). With multiple async ops outstanding on this thread, a
+  // Recv can return a sibling's response, so demux by net_key: claim ours,
+  // park the rest for the RecvOut that owns them. (issue #768)
+  const size_t want_key = task_ptr->task_id_.net_key_;
+  auto &stash = ShmOutResponseStash();
+
+  // A prior RecvOut on this thread may have already pulled our response off the
+  // ring while waiting for a different future — take it from the stash.
+  {
+    auto it = stash.find(want_key);
+    if (it != stash.end()) {
+      it->second.ResetBulkIndex();
+      it->second.msg_type_ = MsgType::kSerializeOut;
+      it->second >> (*task_ptr);
+      stash.erase(it);
+      return true;
+    }
+  }
+
   ctp::Timepoint start;
   start.Now();
   size_t spins = 0;
@@ -108,6 +151,19 @@ bool IpcCpu2Cpu::RecvOut(IpcManager *ipc,
     ctp::lbm::ClientInfo info =
         tls->shm_server_.Recv(archive, ctp::lbm::SHM_MPSC_DONTWAIT);
     if (info.rc == 0) {
+      // Match the response to a future by net_key; a heartbeat / infoless
+      // message (no task_infos_) is treated as ours to preserve prior behavior.
+      const size_t got_key =
+          archive.GetTaskInfos().empty()
+              ? want_key
+              : archive.GetTaskInfos().front().task_id_.net_key_;
+      if (got_key != want_key) {
+        // A sibling async op's response arrived first. Park it for the RecvOut
+        // that owns it (another call on this same thread) and keep receiving.
+        stash.erase(got_key);  // guard against a reused net_key slot
+        stash.emplace(got_key, std::move(archive));
+        continue;
+      }
       archive.ResetBulkIndex();
       archive.msg_type_ = MsgType::kSerializeOut;
       archive >> (*task_ptr);

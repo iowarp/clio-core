@@ -56,6 +56,9 @@
 #if CTP_ENABLE_ZFP_SYCL
 #include "sycl_zfp.h"
 #endif
+#if CTP_ENABLE_CUSZP
+#include "cuszp.h"
+#endif
 
 #if CTP_ENABLE_CUSZ
 #include "cusz.h"
@@ -197,6 +200,19 @@ class CompressionFactory {
   static std::string NameForWireId(int wire_id) {
     const CompressorInfo* info = FindByWireId(wire_id);
     return info ? info->name : "zstd";
+  }
+
+  /**
+   * Reverse of NameForWireId: resolve a canonical compressor name to its wire
+   * ID (compress_lib_). Returns -1 if the name is unknown, so callers can tell
+   * "not found" apart from wire ID 0.
+   *
+   * @param name Canonical lowercase library name (e.g. "nvcomp-lz4")
+   * @return Wire ID, or -1 if unknown
+   */
+  static int WireIdForName(const std::string& name) {
+    const CompressorInfo* info = FindByName(name);
+    return info ? info->wire_id : -1;
   }
 
   /**
@@ -390,6 +406,7 @@ class CompressionFactory {
     return nullptr;
 #endif
   }
+
 
   /**
    * The compressor registry: the single source of truth (see CompressorInfo).
