@@ -49,10 +49,17 @@ endif()
 # cuszp.h runs cuSZp in a dedicated CUDA context (driver API: cuCtxCreate/cuInit/
 # cuCtxPushCurrent). Link the CUDA driver library so the dlopen'd module .so
 # resolves those symbols at load time (else the ChiMod fails to load).
-if(TARGET CUDA::cuda_driver)
-    target_link_libraries(clio_cte_compressor_runtime PRIVATE CUDA::cuda_driver)
-else()
-    target_link_libraries(clio_cte_compressor_runtime PRIVATE cuda)
+#
+# Only when CUDA is actually enabled: a CPU-only build (CLIO_CORE_ENABLE_CUDA=OFF,
+# e.g. the deploy-cpu container) does NOT compile the cuSZp path, so it must not
+# link the CUDA driver — libcuda is absent there and the bare `-lcuda` fallback
+# below fails the link ("cannot find -lcuda").
+if(CLIO_CORE_ENABLE_CUDA)
+    if(TARGET CUDA::cuda_driver)
+        target_link_libraries(clio_cte_compressor_runtime PRIVATE CUDA::cuda_driver)
+    else()
+        target_link_libraries(clio_cte_compressor_runtime PRIVATE cuda)
+    endif()
 endif()
 
 add_clio_module_client(
