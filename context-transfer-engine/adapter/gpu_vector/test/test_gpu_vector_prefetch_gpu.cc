@@ -38,6 +38,7 @@
 #include <clio_cte/gpu_vector/transaction.h>
 
 #include <clio_ctp/util/gpu_api.h>
+#include <clio_ctp/introspect/system_info.h>
 
 #include <algorithm>
 #include <chrono>
@@ -101,7 +102,7 @@ void EnsureInit() {
       << "        score: 0.2\n"
       << "    dpe:\n      dpe_type: \"max_bw\"\n";
   }
-  setenv("CLIO_SERVER_CONF", cfg.c_str(), 1);
+  ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", cfg.c_str(), 1);
   std::fprintf(stderr, "[PF] compose=%s  slow_tier=%s\n", cfg.c_str(), slow.c_str());
   REQUIRE(clio::run::CLIO_INIT(clio::run::RuntimeMode::kServer));
   std::this_thread::sleep_for(1s);

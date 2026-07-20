@@ -54,6 +54,7 @@
 #include "clio_ctp/compress/compress_factory.h"
 #include "clio_ctp/compress/data_stats.h"
 #include "clio_ctp/util/logging.h"
+#include "clio_ctp/util/gpu_api.h"
 
 namespace clio::cte::compressor {
 
@@ -178,23 +179,32 @@ struct CompressionHeader {
   uint32_t compress_lib_;     // Compression library ID
   uint32_t compress_preset_;  // Compression preset
   uint64_t original_size_;    // Original uncompressed size
+  // Exact compressed payload size (bytes after this header). Required by
+  // frame-exact codecs like zstd/lz4: ZSTD_decompress needs the precise
+  // compressed length, and the reader over-allocates its fetch buffer (it
+  // does not know the compressed size a priori), so the trailing bytes are
+  // garbage. Passing that over-estimate as the input size makes zstd fail.
+  uint64_t compressed_size_;
 
   CompressionHeader()
       : magic_(kMagic),
         compress_lib_(0),
         compress_preset_(0),
-        original_size_(0) {}
+        original_size_(0),
+        compressed_size_(0) {}
 
-  CompressionHeader(uint32_t lib, uint32_t preset, uint64_t orig_size)
+  CompressionHeader(uint32_t lib, uint32_t preset, uint64_t orig_size,
+                    uint64_t comp_size = 0)
       : magic_(kMagic),
         compress_lib_(lib),
         compress_preset_(preset),
-        original_size_(orig_size) {}
+        original_size_(orig_size),
+        compressed_size_(comp_size) {}
 
   bool IsValid() const { return magic_ == kMagic; }
 };
-static_assert(sizeof(CompressionHeader) == 24,
-              "CompressionHeader must be 24 bytes");
+static_assert(sizeof(CompressionHeader) == 32,
+              "CompressionHeader must be 32 bytes (added compressed_size_)");
 
 clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
   CLIO_TASK_BODY_BEGIN
@@ -906,7 +916,7 @@ clio::run::TaskResume Runtime::Compress(clio::run::shared_ptr<CompressTask> &tas
 
       // Write compression header
       CompressionHeader header(context.compress_lib_, context.compress_preset_,
-                               input_size);
+                               input_size, compressed_size);
       std::memcpy(compressed_shm.ptr_, &header, header_size);
 
       // Write compressed data after header
@@ -1056,9 +1066,13 @@ clio::run::TaskResume Runtime::Decompress(clio::run::shared_ptr<DecompressTask> 
 
       auto decompress_start = std::chrono::high_resolution_clock::now();
 
-      // Get compressed data (after header)
+      // Get compressed data (after header). Prefer the exact compressed length
+      // recorded at Put time (frame-exact codecs like zstd need it); fall back
+      // to the over-estimate for legacy blobs written without the field.
       char* compressed_data = temp_buffer.ptr_ + header_size;
-      size_t compressed_size = expected_size - header_size;
+      size_t compressed_size = header->compressed_size_ != 0
+                                   ? static_cast<size_t>(header->compressed_size_)
+                                   : expected_size - header_size;
 
       // Decompress to output buffer
       auto output_fullptr =
@@ -1176,7 +1190,8 @@ clio::run::TaskResume Runtime::CompressPutBlobImpl(
       context.actual_compression_ratio_ = (double)input_size / (double)total;
       auto shm = CLIO_IPC->AllocateBuffer(total);
       if (shm.IsNull()) { task->return_code_ = 4; CLIO_CO_RETURN; }
-      CompressionHeader hdr(context.compress_lib_, context.compress_preset_, input_size);
+      CompressionHeader hdr(context.compress_lib_, context.compress_preset_,
+                            input_size, csize);
       std::memcpy(shm.ptr_, &hdr, hsz);
       std::memcpy(shm.ptr_ + hsz, cbuf.data(), csize);
       ctp::ipc::ShmPtr<> sp = shm.shm_.template Cast<void>();
@@ -1235,6 +1250,29 @@ clio::run::TaskResume Runtime::DecompressGetBlobImpl(
     HLOG(kInfo, "[DecompressGetBlob] name={} off={} req={} get_rc={} valid={}",
          name, task->offset_, expected_size, gt->return_code_,
          header->IsValid());
+    // Copy `n` bytes into `dst`, which may be an HBM slot on the on-device fault
+    // path. A raw cudaMemcpy on a thread_local stream (ctp::DeviceAwareMemcpy)
+    // fails here with "invalid argument": this Decompress runs as a coroutine and
+    // can resume on a different worker thread than the one that lazily created
+    // that stream, so the stream belongs to a foreign CUDA context. Mirror the
+    // proven mem-bdev device path (MemBdevTransport::LaunchReadBlocksGpu): create
+    // a FRESH stream in the current context, copy on it, and synchronize -- no
+    // co_await between create and sync, so no thread migration.
+    auto write_out = [](char *dst, const char *src, size_t n) {
+      if (ctp::IsDevicePointer(dst)) {
+        // Host codec output must be pushed into the HBM slot with a device
+        // copy. Mirror the mem-bdev GPU write path
+        // (MemBdevTransport::LaunchReadBlocksGpu): a fresh stream in the current
+        // context, copy, synchronize -- no co_await between, so this coroutine
+        // stays on one thread and the stream/context stay consistent.
+        void *stream = ctp::GpuApi::CreateStream();
+        ctp::GpuApi::MemcpyAsync(dst, src, n, stream);
+        ctp::GpuApi::Synchronize(stream);
+        ctp::GpuApi::DestroyStream(stream);
+      } else {
+        std::memcpy(dst, src, n);
+      }
+    };
     if (header->IsValid()) {
       std::string lib = ctp::CompressionFactory::NameForWireId(header->compress_lib_);
       ctp::CompressionPreset preset = ctp::CompressionPreset::BALANCED;
@@ -1243,13 +1281,33 @@ clio::run::TaskResume Runtime::DecompressGetBlobImpl(
       auto dec = ctp::CompressionFactory::GetPreset(lib, preset);
       if (!dec) { CLIO_IPC->FreeBuffer(tmp); task->return_code_ = 3; CLIO_CO_RETURN; }
       char* cdata = tmp.ptr_ + hsz;
-      size_t csize = expected_size;  // over-estimate; cuSZp reads its own length
+      // Use the EXACT compressed size recorded at Put time. cuSZp is self-
+      // delimiting and tolerates an over-estimate, but zstd/lz4 require the
+      // precise frame length or ZSTD_decompress fails ("Src size incorrect")
+      // on the trailing garbage in the over-allocated fetch buffer. Fall back
+      // to the (legacy) over-estimate only for blobs written before this field
+      // existed (compressed_size_ == 0).
+      size_t csize = header->compressed_size_ != 0
+                         ? static_cast<size_t>(header->compressed_size_)
+                         : expected_size;
       size_t dsize = header->original_size_;
-      bool ok = dec->Decompress(out.ptr_, dsize, cdata, csize);
+      // On the on-device fault path task->blob_data_ is an HBM slot, so out.ptr_
+      // is a DEVICE pointer. A host codec (zstd/lz4) decompresses on the CPU and
+      // cannot write there directly -- doing so segfaults. Decompress into a host
+      // staging buffer and device-aware-copy it across. Host destinations keep
+      // the original zero-copy path (no extra allocation or memcpy).
+      bool ok;
+      if (ctp::IsDevicePointer(out.ptr_)) {
+        std::vector<char> staging(dsize);
+        ok = dec->Decompress(staging.data(), dsize, cdata, csize);
+        if (ok) write_out(out.ptr_, staging.data(), dsize);
+      } else {
+        ok = dec->Decompress(out.ptr_, dsize, cdata, csize);
+      }
       CLIO_IPC->FreeBuffer(tmp);
       task->return_code_ = ok ? 0 : 5;
-    } else {  // stored uncompressed -> copy through
-      std::memcpy(out.ptr_, tmp.ptr_, expected_size);
+    } else {  // stored uncompressed -> copy through (out may be an HBM slot)
+      write_out(out.ptr_, tmp.ptr_, expected_size);
       CLIO_IPC->FreeBuffer(tmp);
       task->return_code_ = 0;
     }

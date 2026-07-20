@@ -103,6 +103,36 @@ bool IpcGpu2Cpu::RecvIn(IpcManager *ipc, GpuTaskLane *gpu_lane, Worker *worker) 
     }
   };
 
+  // GPU task slots are PREALLOCATED AND REUSED: gpu_vector keeps one
+  // PodGetBlobTask / PodPutBlobTask per (block, cache slot) and re-submits the
+  // same object every time that slot faults or flushes. The kernel resets what
+  // it can reach before Send (task_flags_, return_code_, a fresh task_id_), but
+  // the ROUTED and STARTED lifecycle bits no longer live in task_flags_ — they
+  // were retired into the host-side RunContext (types.h: "Bit 5 retired:
+  // TASK_STARTED — now RunContext::started_"), which the device cannot touch.
+  // Nothing calls ResetRunCtx() on completion, so a reused task still carries
+  // the RunContext of its previous execution:
+  //   - stale ROUTED  -> RouteTask short-circuits to ExecHere and never enqueues
+  //   - stale STARTED -> the worker resumes an already-finished coroutine
+  // Either way the task never executes, SendOut never runs, and the kernel
+  // spins forever in gpu::Future::Wait(). This is invisible until the cache is
+  // small enough to evict — the first slot reuse is the first hang.
+  //
+  // A task arriving here is by definition a fresh submission (the kernel only
+  // reuses a slot after Wait()ing on its previous completion), so clearing the
+  // bits is always correct. Clear in place rather than ResetRunCtx(): the
+  // completing worker may still be in EndTask on this RunContext, so freeing it
+  // here would be a use-after-free. StartCoroutine re-initializes the rest of
+  // the execution state (and builds a fresh frame) on its own.
+  //
+  // Only for the shared-memory backends, where task_raw IS the reused object.
+  // In the kDeviceMem path task_raw points at a private D2H scratch copy whose
+  // run_ctx_ bytes are meaningless; that path is left alone here.
+  if (!task_on_device && task_raw->RunCtxPtr() != nullptr) {
+    task_raw->SetRouted(false);
+    task_raw->SetStarted(false);
+  }
+
   PoolId pool_id = task_raw->pool_id_;
   u32 method_id = task_raw->method_;
 

@@ -58,6 +58,7 @@
 #include <clio_cte/gpu_vector/gpu_vector.h>
 
 #include <clio_ctp/util/gpu_api.h>
+#include <clio_ctp/introspect/system_info.h>
 
 #include <chrono>
 #include <cmath>
@@ -127,7 +128,7 @@ void EnsureInit() {
         << "        score: 1.0\n"
         << "    dpe:\n      dpe_type: \"max_bw\"\n";
   }
-  setenv("CLIO_SERVER_CONF", cfg_path.c_str(), 1);
+  ctp::SystemInfo::Setenv("CLIO_SERVER_CONF", cfg_path.c_str(), 1);
   std::fprintf(stderr, "[INIT] gpu_vector compressed: compose=%s\n",
                cfg_path.c_str());
   REQUIRE(clio::run::CLIO_INIT(clio::run::RuntimeMode::kServer));
