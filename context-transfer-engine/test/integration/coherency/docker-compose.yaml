@@ -1,0 +1,181 @@
+# 4-node CTE memory-coherency integration test.
+#
+# Every node runs test_cte_coherency as a CLIENT against its LOCAL daemon
+# (differs from the `distributed` suite, where only node1 is a client). Nodes
+# coordinate through file barriers on a SHARED docker volume (coh_rundir),
+# mounted at CTE_RUNDIR on all four nodes -- both the test's own bar_* barriers
+# and this suite's READY/TESTDONE orchestration barriers live there.
+#
+# Subnet 172.31.0.0/24 (distributed=.28, cfs/jarvis=.29, client_crash/mpi=.30).
+#
+# NOTE: in compose command strings, $$ is a literal $ for the container shell.
+
+services:
+  # One-shot: make the shared barrier volume world-writable BEFORE the nodes
+  # start. A named volume is root-owned by default, but the nodes run as a
+  # non-root user and must write barrier files (coh_*, bar_*) into CTE_RUNDIR.
+  coh-init:
+    image: ${IOWARP_DOCKER_IMAGE:-iowarp/deps-cpu:latest}
+    container_name: cte-coherency-init
+    user: "0:0"
+    volumes:
+      - coh_rundir:/coh_rundir
+    command: [ "/bin/bash", "-c", "chmod 1777 /coh_rundir && echo rundir-ready" ]
+
+  cte-coh-node1:
+    image: ${IOWARP_DOCKER_IMAGE:-iowarp/deps-cpu:latest}
+    security_opt:
+      - seccomp:unconfined
+    container_name: cte-coherency-node1
+    hostname: iowarp-node1
+    depends_on:
+      coh-init:
+        condition: service_completed_successfully
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    networks:
+      coh-cluster:
+        ipv4_address: 172.31.0.10
+    volumes:
+      - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-/workspace}}:/workspace:rw
+      - coh_rundir:/coh_rundir
+    tmpfs:
+      - /mnt:mode=1777
+    environment:
+      - NODE_ID=1
+      - NODE_IP=172.31.0.10
+      - CTE_RANK=0
+      - CTE_NUM_NODES=4
+      - CTE_RUNDIR=/coh_rundir
+      - CLIO_WITH_RUNTIME=0
+      - CLIO_SERVER_CONF=/workspace/context-transfer-engine/test/integration/coherency/clio_config.yaml
+      - CONTAINER_HOSTFILE=/workspace/context-transfer-engine/test/integration/coherency/hostfile
+      - PATH=/workspace/build/bin:/usr/local/bin:/usr/bin:/bin
+      - LD_LIBRARY_PATH=/workspace/build/bin:/usr/local/cuda/lib64:/usr/local/lib
+    mem_limit: 16g
+    working_dir: /workspace
+    entrypoint: [ "/bin/bash", "-c" ]
+    command:
+      - |
+        sed 's/\r$//' /workspace/context-transfer-engine/test/integration/coherency/node_entrypoint.sh > /tmp/node_entrypoint.sh
+        exec bash /tmp/node_entrypoint.sh
+
+  cte-coh-node2:
+    image: ${IOWARP_DOCKER_IMAGE:-iowarp/deps-cpu:latest}
+    security_opt:
+      - seccomp:unconfined
+    container_name: cte-coherency-node2
+    hostname: iowarp-node2
+    depends_on:
+      coh-init:
+        condition: service_completed_successfully
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    networks:
+      coh-cluster:
+        ipv4_address: 172.31.0.11
+    volumes:
+      - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-/workspace}}:/workspace:rw
+      - coh_rundir:/coh_rundir
+    tmpfs:
+      - /mnt:mode=1777
+    environment:
+      - NODE_ID=2
+      - NODE_IP=172.31.0.11
+      - CTE_RANK=1
+      - CTE_NUM_NODES=4
+      - CTE_RUNDIR=/coh_rundir
+      - CLIO_WITH_RUNTIME=0
+      - CLIO_SERVER_CONF=/workspace/context-transfer-engine/test/integration/coherency/clio_config.yaml
+      - CONTAINER_HOSTFILE=/workspace/context-transfer-engine/test/integration/coherency/hostfile
+      - PATH=/workspace/build/bin:/usr/local/bin:/usr/bin:/bin
+      - LD_LIBRARY_PATH=/workspace/build/bin:/usr/local/cuda/lib64:/usr/local/lib
+    mem_limit: 16g
+    working_dir: /workspace
+    entrypoint: [ "/bin/bash", "-c" ]
+    command:
+      - |
+        sed 's/\r$//' /workspace/context-transfer-engine/test/integration/coherency/node_entrypoint.sh > /tmp/node_entrypoint.sh
+        exec bash /tmp/node_entrypoint.sh
+
+  cte-coh-node3:
+    image: ${IOWARP_DOCKER_IMAGE:-iowarp/deps-cpu:latest}
+    security_opt:
+      - seccomp:unconfined
+    container_name: cte-coherency-node3
+    hostname: iowarp-node3
+    depends_on:
+      coh-init:
+        condition: service_completed_successfully
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    networks:
+      coh-cluster:
+        ipv4_address: 172.31.0.12
+    volumes:
+      - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-/workspace}}:/workspace:rw
+      - coh_rundir:/coh_rundir
+    tmpfs:
+      - /mnt:mode=1777
+    environment:
+      - NODE_ID=3
+      - NODE_IP=172.31.0.12
+      - CTE_RANK=2
+      - CTE_NUM_NODES=4
+      - CTE_RUNDIR=/coh_rundir
+      - CLIO_WITH_RUNTIME=0
+      - CLIO_SERVER_CONF=/workspace/context-transfer-engine/test/integration/coherency/clio_config.yaml
+      - CONTAINER_HOSTFILE=/workspace/context-transfer-engine/test/integration/coherency/hostfile
+      - PATH=/workspace/build/bin:/usr/local/bin:/usr/bin:/bin
+      - LD_LIBRARY_PATH=/workspace/build/bin:/usr/local/cuda/lib64:/usr/local/lib
+    mem_limit: 16g
+    working_dir: /workspace
+    entrypoint: [ "/bin/bash", "-c" ]
+    command:
+      - |
+        sed 's/\r$//' /workspace/context-transfer-engine/test/integration/coherency/node_entrypoint.sh > /tmp/node_entrypoint.sh
+        exec bash /tmp/node_entrypoint.sh
+
+  cte-coh-node4:
+    image: ${IOWARP_DOCKER_IMAGE:-iowarp/deps-cpu:latest}
+    security_opt:
+      - seccomp:unconfined
+    container_name: cte-coherency-node4
+    hostname: iowarp-node4
+    depends_on:
+      coh-init:
+        condition: service_completed_successfully
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    networks:
+      coh-cluster:
+        ipv4_address: 172.31.0.13
+    volumes:
+      - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-/workspace}}:/workspace:rw
+      - coh_rundir:/coh_rundir
+    tmpfs:
+      - /mnt:mode=1777
+    environment:
+      - NODE_ID=4
+      - NODE_IP=172.31.0.13
+      - CTE_RANK=3
+      - CTE_NUM_NODES=4
+      - CTE_RUNDIR=/coh_rundir
+      - CLIO_WITH_RUNTIME=0
+      - CLIO_SERVER_CONF=/workspace/context-transfer-engine/test/integration/coherency/clio_config.yaml
+      - CONTAINER_HOSTFILE=/workspace/context-transfer-engine/test/integration/coherency/hostfile
+      - PATH=/workspace/build/bin:/usr/local/bin:/usr/bin:/bin
+      - LD_LIBRARY_PATH=/workspace/build/bin:/usr/local/cuda/lib64:/usr/local/lib
+    mem_limit: 16g
+    working_dir: /workspace
+    entrypoint: [ "/bin/bash", "-c" ]
+    command:
+      - |
+        sed 's/\r$//' /workspace/context-transfer-engine/test/integration/coherency/node_entrypoint.sh > /tmp/node_entrypoint.sh
+        exec bash /tmp/node_entrypoint.sh
+
+networks:
+  coh-cluster:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.31.0.0/24
+
+volumes:
+  coh_rundir:
