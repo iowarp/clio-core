@@ -36,6 +36,14 @@
 
 #if CTP_ENABLE_COMPRESS && CTP_ENABLE_CUSZP
 
+// Build note: STOCK cuSZp is sufficient -- do NOT patch it. Stock cuSZp
+// device-synchronizes inside every (de)compress, which once deadlocked the
+// compressed gpu_vector's on-device fault path; that is handled here by running
+// all cuSZp work in a dedicated CUDA context (see cuszp_detail::ContextScope),
+// where A100 compute preemption lets the decompress proceed while the caller's
+// fault kernel spin-waits. Verified against an unpatched cuSZp build:
+// on-device-fault round-trip max_abs_err = 1.0e-3, identical to a patched build.
+
 #include <cuda.h>  // driver API: dedicated CUDA context for the compressor
 #include <cuda_runtime.h>
 #include <cuSZp.h>

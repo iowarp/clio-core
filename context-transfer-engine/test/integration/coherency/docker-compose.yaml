@@ -1,0 +1,133 @@
+# CTE multi-node COHERENCY integration test (Docker, 4 nodes).
+#
+# Verifies memory coherency of the distributed CTE blob store for three
+# workloads -- write-only, read-only, append-only -- with EVERY node acting as a
+# client, so different nodes touch the same blobs. (The sibling `distributed`
+# suite runs the test client on one node only.)
+#
+# Usage:
+#   ./run_tests.sh                 # standard run
+#   HOST_WORKSPACE=/path ./run_tests.sh
+#
+# Each node: starts a clio_run daemon, waits for all peers, runs
+# test_cte_coherency as a client, then waits for peers to finish before shutting
+# its daemon down -- a node must not disappear while a peer is still reading
+# blobs that hash-routed to it.
+#
+# `coh-rundir` is a shared volume used only for cross-node file barriers
+# (READY.<rank> / TESTDONE.<rank> / EXIT.<rank>); the test reads it via
+# CTE_RUNDIR. run_tests.sh removes it between runs so stale barriers cannot
+# make a run appear to pass.
+
+x-coh-node: &coh-node
+  image: ${IOWARP_DOCKER_IMAGE:-iowarp/deps-cpu:latest}
+  security_opt:
+    - seccomp:unconfined
+  user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+  volumes:
+    - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-/workspace}}:/workspace:rw
+    - coh-rundir:/rundir
+  tmpfs:
+    - /mnt:mode=1777
+  mem_limit: 4g
+  working_dir: /workspace
+  entrypoint: [ "/bin/bash", "-c" ]
+
+x-coh-env: &coh-env
+  CLIO_SERVER_CONF: /workspace/context-transfer-engine/test/integration/coherency/clio_config.yaml
+  CTE_NUM_NODES: 4
+  CTE_RUNDIR: /rundir
+  CLIO_WITH_RUNTIME: 0
+  PATH: /workspace/build/bin:/usr/local/bin:/usr/bin:/bin
+  LD_LIBRARY_PATH: /workspace/build/bin:/usr/local/lib
+
+# Per-node script: daemon -> ready barrier -> test -> done barrier -> shutdown.
+x-coh-cmd: &coh-cmd >
+  "
+    set -u
+    R=$${CTE_RANK}; N=$${CTE_NUM_NODES}; D=$${CTE_RUNDIR}
+    echo \"[rank $$R] starting clio_run daemon\"
+    /workspace/build/bin/clio_run runtime start > /tmp/daemon.log 2>&1 &
+    DPID=$$!
+    sleep $${CLIO_DAEMON_WARMUP:-8}
+    if ! kill -0 $$DPID 2>/dev/null; then
+      echo \"[rank $$R] DAEMON DIED\"; tail -30 /tmp/daemon.log; exit 1
+    fi
+    touch $$D/READY.$$R
+    w=0
+    while [ \$$(ls $$D/READY.* 2>/dev/null | wc -l) -lt $$N ]; do
+      sleep 1; w=$$((w+1))
+      [ $$w -gt 120 ] && { echo \"[rank $$R] TIMEOUT waiting for peers\"; exit 1; }
+    done
+    echo \"[rank $$R] all $$N daemons ready -- running coherency test\"
+    /workspace/build/bin/test_cte_coherency; rc=$$?
+    # A run where nothing executed is not a pass.
+    echo $$rc > $$D/EXIT.$$R
+    touch $$D/TESTDONE.$$R
+    w=0
+    while [ \$$(ls $$D/TESTDONE.* 2>/dev/null | wc -l) -lt $$N ]; do
+      sleep 1; w=$$((w+1)); [ $$w -gt 300 ] && break
+    done
+    echo \"[rank $$R] done rc=$$rc\"
+    kill $$DPID 2>/dev/null
+    exit $$rc
+  "
+
+services:
+  coh-node1:
+    <<: *coh-node
+    container_name: cte-coherency-node1
+    hostname: iowarp-coh-node1
+    networks:
+      coh-cluster:
+        ipv4_address: 172.29.0.10
+    environment:
+      <<: *coh-env
+      CTE_RANK: 0
+    command: *coh-cmd
+
+  coh-node2:
+    <<: *coh-node
+    container_name: cte-coherency-node2
+    hostname: iowarp-coh-node2
+    networks:
+      coh-cluster:
+        ipv4_address: 172.29.0.11
+    environment:
+      <<: *coh-env
+      CTE_RANK: 1
+    command: *coh-cmd
+
+  coh-node3:
+    <<: *coh-node
+    container_name: cte-coherency-node3
+    hostname: iowarp-coh-node3
+    networks:
+      coh-cluster:
+        ipv4_address: 172.29.0.12
+    environment:
+      <<: *coh-env
+      CTE_RANK: 2
+    command: *coh-cmd
+
+  coh-node4:
+    <<: *coh-node
+    container_name: cte-coherency-node4
+    hostname: iowarp-coh-node4
+    networks:
+      coh-cluster:
+        ipv4_address: 172.29.0.13
+    environment:
+      <<: *coh-env
+      CTE_RANK: 3
+    command: *coh-cmd
+
+networks:
+  coh-cluster:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.29.0.0/24
+
+volumes:
+  coh-rundir:
