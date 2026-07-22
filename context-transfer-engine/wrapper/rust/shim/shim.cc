@@ -1,121 +1,565 @@
-#include <clio_runtime/bdev/bdev_client.h>
-#include <clio_cte/core/content_transfer_engine.h>
+/*
+ * Copyright (c) 2024, Gnosis Research Center, Illinois Institute of Technology
+ * All rights reserved.
+ *
+ * This file is part of IOWarp Core.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice,
+ *    this list of conditions and the following disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * 3. Neither the name of the copyright holder nor the names of its
+ *    contributors may be used to endorse or promote products derived from
+ *    this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
 
-// cxx-generated header: defines CteTagId shared struct
-#include "wrp-cte-rs/src/lib.rs.h"
+#include "shim/shim.h"
+
+#include <clio_runtime/bdev/bdev_client.h>
+#include <clio_cte/core/core_client.h>
+#include <clio_cte/core/data_organizer/frecency_organizer.h>
+#include <clio_cte/core/data_organizer/data_organizer.h>
+#include <clio_runtime/ipc_manager.h>
+
+#include <cstring>
 
 namespace cte_ffi {
 
-bool cte_init(rust::Str config_path) {
-  std::string path(config_path.data(), config_path.size());
-  bool ok = clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true);
-  if (!ok) return false;
-  return clio::cte::core::CLIO_CTE_CLIENT_INIT(path);
+// Maximum blob size (16 GB) - must match Rust constant
+constexpr uint64_t MAX_BLOB_SIZE = 16ULL * 1024ULL * 1024ULL * 1024ULL;
+
+// Thread-safe initialization globals
+std::once_flag g_init_flag;
+bool g_init_done = false;
+
+/// Initialize the CTE client with the given config path.
+/// Thread-safe: only initializes once even if called multiple times.
+/// @param config_path Path to the CTE configuration file
+/// @return 0 on success, -1 on failure
+int32_t cte_init(rust::Str config_path) {
+  std::call_once(g_init_flag, [&]() {
+    std::string path(config_path.data(), config_path.size());
+    bool ok = clio::run::CLIO_INIT(clio::run::RuntimeMode::kClient, true);
+    if (!ok) {
+      g_init_done = false;
+      return;
+    }
+    // CLIO_CTE_CLIENT_INIT is in clio::cte::core namespace (inside the namespace
+    // block)
+    g_init_done = ::clio::cte::core::CLIO_CTE_CLIENT_INIT(path);
+  });
+  return g_init_done ? 0 : -1;
 }
 
-std::unique_ptr<CteTag> tag_new(rust::Str tag_name) {
-  std::string name(tag_name.data(), tag_name.size());
-  return std::make_unique<CteTag>(name);
-}
-
-std::unique_ptr<CteTag> tag_from_id(uint32_t major, uint32_t minor) {
-  clio::cte::core::TagId tid(major, minor);
-  return std::make_unique<CteTag>(tid);
-}
-
-void tag_put_blob(const CteTag &tag, rust::Str name,
-                  rust::Slice<const uint8_t> data, uint64_t offset,
-                  float score) {
-  std::string blob_name(name.data(), name.size());
-  tag.inner.PutBlob(blob_name, reinterpret_cast<const char *>(data.data()),
-                    data.size(), static_cast<size_t>(offset), score);
-}
-
-std::unique_ptr<std::vector<uint8_t>> tag_get_blob(const CteTag &tag,
-                                                    rust::Str name,
-                                                    uint64_t size,
-                                                    uint64_t offset) {
-  std::string blob_name(name.data(), name.size());
-  auto buf = std::make_unique<std::vector<uint8_t>>(size);
-  tag.inner.GetBlob(blob_name, reinterpret_cast<char *>(buf->data()),
-                    static_cast<size_t>(size), static_cast<size_t>(offset));
-  return buf;
-}
-
-float tag_get_blob_score(const CteTag &tag, rust::Str name) {
-  std::string blob_name(name.data(), name.size());
-  return tag.inner.GetBlobScore(blob_name);
-}
-
-uint64_t tag_get_blob_size(const CteTag &tag, rust::Str name) {
-  std::string blob_name(name.data(), name.size());
-  return tag.inner.GetBlobSize(blob_name);
-}
-
-std::unique_ptr<std::vector<std::string>> tag_get_contained_blobs(
-    const CteTag &tag) {
-  auto blobs = tag.inner.GetContainedBlobs();
-  return std::make_unique<std::vector<std::string>>(std::move(blobs));
-}
-
-void tag_reorganize_blob(const CteTag &tag, rust::Str name, float score) {
-  std::string blob_name(name.data(), name.size());
-  tag.inner.ReorganizeBlob(blob_name, score);
-}
-
-CteTagId tag_get_id(const CteTag &tag) {
-  const auto &id = tag.inner.GetTagId();
-  return CteTagId{id.major_, id.minor_};
-}
-
-bool client_register_target(rust::Str target_path, uint64_t size) {
-  std::string path(target_path.data(), target_path.size());
-  // Create a bdev pool for this target
-  clio::run::PoolId bdev_pool_id(800, 0);
-  clio::run::bdev::Client bdev_client(bdev_pool_id);
-  auto create_task = bdev_client.AsyncCreate(
-      clio::run::PoolQuery::Dynamic(), path, bdev_pool_id,
-      clio::run::bdev::BdevType::kFile);
-  create_task.Wait();
-  // Register with CTE
-  auto *client = CLIO_CTE_CLIENT;
-  auto reg_task = client->AsyncRegisterTarget(
-      path, clio::run::bdev::BdevType::kFile, size,
-      clio::run::PoolQuery::Local(), bdev_pool_id);
-  reg_task.Wait();
-  return true;
-}
-
-bool client_del_tag(rust::Str name) {
-  std::string tag_name(name.data(), name.size());
-  auto *client = CLIO_CTE_CLIENT;
-  auto task = client->AsyncDelTag(tag_name);
-  task.Wait();
-  return true;
-}
-
-std::unique_ptr<std::vector<std::string>> client_tag_query(rust::Str regex,
-                                                            uint32_t max_tags) {
-  std::string re(regex.data(), regex.size());
-  auto *mgr = CTE_MANAGER;
-  auto results = mgr->TagQuery(re, max_tags);
-  return std::make_unique<std::vector<std::string>>(std::move(results));
-}
-
-std::unique_ptr<std::vector<std::string>> client_blob_query(rust::Str tag_re,
-                                                             rust::Str blob_re,
-                                                             uint32_t max_results) {
-  std::string tre(tag_re.data(), tag_re.size());
-  std::string bre(blob_re.data(), blob_re.size());
-  auto *mgr = CTE_MANAGER;
-  auto pairs = mgr->BlobQuery(tre, bre, max_results);
-  auto out = std::make_unique<std::vector<std::string>>();
-  out->reserve(pairs.size() * 2);
-  for (auto &p : pairs) {
-    out->push_back(std::move(p.first));
-    out->push_back(std::move(p.second));
+/// Create a new CTE client instance.
+/// Uses the globally initialized CTE client pool_id.
+/// @return Unique pointer to a new Client instance
+std::unique_ptr<Client> client_new() {
+  // Get the global CTE client that was initialized by CLIO_CTE_CLIENT_INIT
+  auto* global_client = clio::cte::core::g_cte_client;
+  if (global_client == nullptr) {
+    // Fallback: create a client (will fail later when used)
+    return std::make_unique<Client>();
   }
-  return out;
+  // Create a client with the proper pool_id from the global client
+  auto client = std::make_unique<Client>();
+  client->inner.pool_id_ = global_client->pool_id_;
+  return client;
+}
+
+/// Create a new Tag from a name string.
+/// @param name The tag name
+/// @return Unique pointer to a new Tag instance
+std::unique_ptr<Tag> tag_new(rust::Str name) {
+  std::string n(name.data(), name.size());
+  return std::make_unique<Tag>(n);
+}
+
+/// Create a new Tag from a unique ID (major, minor).
+/// @param major Major component of the unique ID
+/// @param minor Minor component of the unique ID
+/// @return Unique pointer to a new Tag instance
+std::unique_ptr<Tag> tag_from_id(uint32_t major, uint32_t minor) {
+  clio::run::UniqueId id(major, minor);
+  return std::make_unique<Tag>(id);
+}
+
+/// Get the major component of a tag's unique ID.
+/// @param tag The tag to query
+/// @return The major component
+uint32_t tag_get_id_major(const Tag& tag) {
+  return tag.inner.GetTagId().major_;
+}
+
+/// Get the minor component of a tag's unique ID.
+/// @param tag The tag to query
+/// @return The minor component
+uint32_t tag_get_id_minor(const Tag& tag) {
+  return tag.inner.GetTagId().minor_;
+}
+
+/// Get the score associated with a blob in this tag.
+/// @param tag The tag containing the blob
+/// @param name The blob name
+/// @return The blob's score
+float tag_get_blob_score(const Tag& tag, rust::Str name) {
+  std::string n(name.data(), name.size());
+  return tag.inner.GetBlobScore(n);
+}
+
+/// Reorganize a blob within this tag with the given score.
+/// @param tag The tag containing the blob
+/// @param name The blob name
+/// @param score The new score for the blob
+/// @return 0 on success (synchronous operation, no error detection)
+int32_t tag_reorganize_blob(const Tag& tag, rust::Str name, float score) {
+  std::string n(name.data(), name.size());
+  tag.inner.ReorganizeBlob(n, score);
+  // Tag::ReorganizeBlob is synchronous and returns void
+  // Return 0 for success (no error detection available from sync API)
+  return 0;
+}
+
+/// Get the size of a blob in this tag.
+/// @param tag The tag containing the blob
+/// @param name The blob name
+/// @return The blob size in bytes
+uint64_t tag_get_blob_size(const Tag& tag, rust::Str name) {
+  std::string n(name.data(), name.size());
+  return tag.inner.GetBlobSize(n);
+}
+
+/// Reorganize a blob via the client (async operation).
+/// @param client The client to use
+/// @param major Tag ID major component
+/// @param minor Tag ID minor component
+/// @param name The blob name
+/// @param score The new score for the blob
+/// @return Task return code (0 = success)
+int32_t client_reorganize_blob(const Client& client, uint32_t major,
+                               uint32_t minor, rust::Str name, float score) {
+  clio::run::UniqueId tag_id(major, minor);
+  std::string blob_name(name.data(), name.size());
+  auto task = client.inner.AsyncReorganizeBlob(tag_id, blob_name, score);
+  task.Wait();
+  return task->GetReturnCode();
+}
+
+/// Delete a blob via the client (async operation).
+/// @param client The client to use
+/// @param major Tag ID major component
+/// @param minor Tag ID minor component
+/// @param name The blob name
+/// @return Task return code (0 = success)
+int32_t client_del_blob(const Client& client, uint32_t major, uint32_t minor,
+                        rust::Str name) {
+  clio::run::UniqueId tag_id(major, minor);
+  std::string blob_name(name.data(), name.size());
+  auto task = client.inner.AsyncDelBlob(tag_id, blob_name);
+  task.Wait();
+  return task->GetReturnCode();
+}
+
+/// Put a blob into the tag at the given offset with a score.
+/// @param tag The tag to put the blob into
+/// @param name The blob name
+/// @param data The blob data bytes
+/// @param offset The offset within the blob
+/// @param score The score for the blob
+/// @return 0 on success, -1 if data too large, -2 if offset overflow
+int32_t tag_put_blob(const Tag& tag, rust::Str name,
+                     rust::Slice<const uint8_t> data, uint64_t offset,
+                     float score) {
+  std::string n(name.data(), name.size());
+
+  // Validate blob size
+  uint64_t data_size = data.size();
+  if (data_size > MAX_BLOB_SIZE) {
+    return -1;  // Error: data too large
+  }
+
+  // Check for offset overflow
+  if (offset > MAX_BLOB_SIZE - data_size) {
+    return -2;  // Error: offset + size overflow
+  }
+
+  tag.inner.PutBlob(n, reinterpret_cast<const char*>(data.data()), data.size(),
+                    static_cast<size_t>(offset), score);
+  return 0;  // Success
+}
+
+/// Get a blob from the tag into an output buffer.
+/// @param tag The tag containing the blob
+/// @param name The blob name
+/// @param size Number of bytes to read
+/// @param offset Offset within the blob
+/// @param out Output vector to store the data
+void tag_get_blob(const Tag& tag, rust::Str name, uint64_t size,
+                  uint64_t offset, rust::Vec<uint8_t>& out) {
+  std::string n(name.data(), name.size());
+  auto buf = std::vector<uint8_t>(size);
+  tag.inner.GetBlob(n, reinterpret_cast<char*>(buf.data()),
+                    static_cast<size_t>(size), static_cast<size_t>(offset));
+  out.clear();
+  out.reserve(buf.size());
+  std::memcpy(out.data(), buf.data(), buf.size());
+  out.truncate(buf.size());
+}
+
+/// Get all blob names contained in this tag.
+/// @param tag The tag to query
+/// @param out Output vector of blob names
+void tag_get_contained_blobs(const Tag& tag, rust::Vec<rust::String>& out) {
+  auto blobs = tag.inner.GetContainedBlobs();
+  out.clear();
+  out.reserve(blobs.size());
+  for (const auto& b : blobs) {
+    out.push_back(rust::String(b));
+  }
+}
+
+/// T23: Poll telemetry and return typed CteTelemetryEntry records directly
+/// (no byte buffer serialization). Returns typed records without byte buffer
+/// or Rust from_le_bytes re-parse.
+/// @param client The client to poll
+/// @param min_time Minimum logical time filter
+/// @param timeout_sec Timeout in seconds (0 = no timeout)
+/// @param out_entries Output vector of typed telemetry records
+/// @return 0 on success, 1 on timeout, 2 on error
+int32_t client_poll_telemetry_bulk(const Client& client, uint64_t min_time,
+                                   float timeout_sec,
+                                   rust::Vec<CteTelemetryEntry>& out_entries) {
+  auto task = client.inner.AsyncPollTelemetryLog(min_time);
+
+  // Wait with timeout (0 means no timeout, but we use passed timeout_sec)
+  bool completed = task.Wait(timeout_sec);
+
+  if (!completed) {
+    // Timeout occurred
+    return 1;
+  }
+
+  // Check for errors
+  if (task->GetReturnCode() != 0) {
+    return 2;
+  }
+
+  // Fill typed structs directly (no byte buffer memcpy)
+  out_entries.clear();
+  out_entries.reserve(task->entries_.size());
+  for (const auto& entry : task->entries_) {
+    CteTelemetryEntry rec;
+    rec.op = static_cast<uint32_t>(entry.op_);
+    rec.off = entry.off_;
+    rec.size = entry.size_;
+    rec.tag_major = entry.tag_id_.major_;
+    rec.tag_minor = entry.tag_id_.minor_;
+    rec.mod_time = entry.mod_time_;
+    rec.read_time = entry.read_time_;
+    rec.logical_time = entry.logical_time_;
+    out_entries.push_back(rec);
+  }
+
+  return 0;  // Success
+}
+
+/// T23: Get blob info and return a typed BlobInfoBulk struct directly
+/// (no byte buffer serialization). Returns typed records without byte buffer
+/// or Rust from_le_bytes re-parse. cxx shared structs cannot contain Vec,
+/// so blocks is returned as a separate out-param.
+/// @param client The client to query
+/// @param major Tag ID major component
+/// @param minor Tag ID minor component
+/// @param name The blob name
+/// @param out_info Output: the typed blob info header (score, total_size)
+/// @param out_blocks Output: the block placement info Vec
+/// @return Task return code (0 = success)
+int32_t client_get_blob_info_bulk(const Client& client, uint32_t major,
+                                  uint32_t minor, rust::Str name,
+                                  BlobInfoBulk& out_info,
+                                  rust::Vec<BlobBlock>& out_blocks) {
+  clio::run::UniqueId tag_id(major, minor);
+  std::string blob_name(name.data(), name.size());
+
+  auto task = client.inner.AsyncGetBlobInfo(tag_id, blob_name);
+  task.Wait();
+
+  if (task->GetReturnCode() != 0) {
+    return task->GetReturnCode();
+  }
+
+  // Fill typed structs directly (no byte buffer memcpy)
+  out_info.score = task->score_;
+  out_info.total_size = task->total_size_;
+  out_blocks.clear();
+  out_blocks.reserve(task->blocks_.size());
+  for (const auto& block : task->blocks_) {
+    BlobBlock blk;
+    // PoolId is a class, convert via IsNull()?0:ToU64()
+    blk.pool_id = block.target_pool_id_.IsNull() ? 0 : block.target_pool_id_.ToU64();
+    blk.block_size = block.block_size_;
+    blk.block_offset = block.block_offset_;
+    out_blocks.push_back(blk);
+  }
+
+  return 0;
+}
+
+/// Trigger the CTE's internal DynamicReorganize task for one replica.
+/// This delegates reorganization to the built-in data organizer (issue #738)
+/// instead of Aneris running its own per-blob reorganization loop.
+/// @param replica_id Which replica (0-based) to fire
+/// @param period_us   Period in microseconds for the periodic task
+/// @return 0 on success, non-zero on error
+int32_t client_dynamic_reorganize(uint32_t replica_id, double period_us) {
+  auto* global_client = ::clio::cte::core::g_cte_client;
+  if (global_client == nullptr) {
+    return -1;  // CTE client not initialized
+  }
+  auto task = global_client->AsyncDynamicReorganize(
+      clio::run::PoolQuery::Local(), replica_id, period_us);
+  task.Wait();
+  return task->GetReturnCode();
+}
+
+/// Compute the frecency score using the C++ FrecencyDataOrganizer formula.
+/// Lets Rust validate its own frecency implementation against the C++ source
+/// of truth (formula: 0.5 * 2^(-age/600) + 0.5 * (n/(n+10)), clamped to [0,1]).
+/// @param access_count      Number of data ops on the blob (Put+Get)
+/// @param last_access_nanos Last access time (steady-clock ns) = max(last_read, last_modified)
+/// @param now_nanos         Current steady-clock time (ns)
+/// @return Score as float in [0, 1]
+float cte_frecency_compute_score(uint64_t access_count,
+                                 uint64_t last_access_nanos,
+                                 uint64_t now_nanos) {
+  clio::cte::core::OrganizerBlobStat stat;
+  stat.access_count_ = static_cast<clio::run::u64>(access_count);
+  stat.last_read_ = static_cast<clio::cte::core::Timestamp>(last_access_nanos);
+  stat.last_modified_ = static_cast<clio::cte::core::Timestamp>(last_access_nanos);
+  return clio::cte::core::FrecencyDataOrganizer::ComputeScore(
+      stat, static_cast<clio::cte::core::Timestamp>(now_nanos));
 }
 
 }  // namespace cte_ffi
+
+// ---- Zero-copy SHM buffer cxx-bridge implementations ----
+
+namespace {
+/// Concrete wait_fn for Future<PutBlobTask>: calls Wait, reads return code.
+int32_t cte_put_future_wait_fn(void *future, float timeout_sec, int32_t *out_rc) {
+  if (out_rc) *out_rc = 0;
+  if (future == nullptr) return -1;
+  using FutureT = clio::run::Future<clio::cte::core::PutBlobTask>;
+  auto *f = static_cast<FutureT *>(future);
+  // timeout_sec <= 0 means wait forever (Wait uses -1 for that)
+  float max_sec = (timeout_sec <= 0.0f) ? -1.0f : timeout_sec;
+  bool completed = f->Wait(max_sec, /*reuse_task=*/false);
+  if (!completed) return 1;  // timeout
+  // f->operator->() returns PutBlobTask*, which inherits from clio::run::Task
+  if (out_rc) *out_rc = (*f)->GetReturnCode();
+  return 0;
+}
+
+/// Concrete destroy_fn for Future<PutBlobTask>: deletes the future.
+void cte_put_future_destroy_fn(void *future) {
+  if (future == nullptr) return;
+  using FutureT = clio::run::Future<clio::cte::core::PutBlobTask>;
+  delete static_cast<FutureT *>(future);
+}
+
+/// Concrete wait_fn for Future<GetBlobTask>: calls Wait, reads return code.
+int32_t cte_get_future_wait_fn(void *future, float timeout_sec, int32_t *out_rc) {
+  if (out_rc) *out_rc = 0;
+  if (future == nullptr) return -1;
+  using FutureT = clio::run::Future<clio::cte::core::GetBlobTask>;
+  auto *f = static_cast<FutureT *>(future);
+  float max_sec = (timeout_sec <= 0.0f) ? -1.0f : timeout_sec;
+  bool completed = f->Wait(max_sec, /*reuse_task=*/false);
+  if (!completed) return 1;  // timeout
+  if (out_rc) *out_rc = (*f)->GetReturnCode();
+  return 0;
+}
+
+/// Concrete destroy_fn for Future<GetBlobTask>: deletes the future.
+void cte_get_future_destroy_fn(void *future) {
+  if (future == nullptr) return;
+  using FutureT = clio::run::Future<clio::cte::core::GetBlobTask>;
+  delete static_cast<FutureT *>(future);
+}
+}  // namespace
+
+namespace cte_ffi {
+
+/**
+ * Allocate a shared-memory buffer of `bytes` bytes.
+ * @param bytes Size to allocate
+ * @return A CteShmHandle identifying the buffer (use cte_free_shm_buffer to
+ *         release). A null handle (alloc_id_major==0 && alloc_id_minor==0 &&
+ *         off==0) means allocation failed.
+ */
+CteShmHandle cte_alloc_shm_buffer(uint64_t bytes) {
+  auto *ipc = CLIO_IPC;
+  if (ipc == nullptr) return CteShmHandle{0, 0, 0};
+  ctp::ipc::FullPtr<char> buf = ipc->AllocateBuffer(static_cast<size_t>(bytes));
+  if (buf.IsNull()) return CteShmHandle{0, 0, 0};
+  // Extract the ShmPtr from the FullPtr: FullPtr has a .shm_ member (ShmPtr<char>)
+  CteShmHandle handle;
+  handle.alloc_id_major = buf.shm_.alloc_id_.major_;
+  handle.alloc_id_minor = buf.shm_.alloc_id_.minor_;
+  handle.off = buf.shm_.off_.load();
+  return handle;
+}
+
+/**
+ * Free a SHM buffer obtained from cte_alloc_shm_buffer.
+ * No-op on a null handle (off==0 && alloc_id all zero). After this call the
+ * handle is invalid and must not be reused — the runtime must have completed
+ * any AsyncPutBlob/AsyncGetBlob using it (wait on the future first).
+ */
+void cte_free_shm_buffer(CteShmHandle handle) {
+  if (handle.off == 0 && handle.alloc_id_major == 0 && handle.alloc_id_minor == 0) {
+    return;  // null handle, no-op
+  }
+  auto *ipc = CLIO_IPC;
+  if (ipc == nullptr) return;
+  // Reconstruct a ShmPtr<char> from the handle and free it
+  ctp::ipc::ShmPtr<char> shm_ptr;
+  shm_ptr.alloc_id_ = ctp::ipc::AllocatorId(handle.alloc_id_major, handle.alloc_id_minor);
+  shm_ptr.off_ = static_cast<size_t>(handle.off);
+  ipc->FreeBuffer(shm_ptr);  // the ShmPtr overload (ipc_manager.h:456) converts via ToFullPtr
+}
+
+/**
+ * Resolve a CteShmHandle back to a raw pointer value (e.g. to read data the
+ * runtime wrote into a get_blob buffer). Returns 0 if the handle is null or
+ * unresolvable.
+ */
+size_t cte_shm_handle_to_ptr(CteShmHandle handle) {
+  if (handle.off == 0 && handle.alloc_id_major == 0 && handle.alloc_id_minor == 0) {
+    return 0;
+  }
+  auto *ipc = CLIO_IPC;
+  if (ipc == nullptr) return 0;
+  ctp::ipc::ShmPtr<char> shm_ptr;
+  shm_ptr.alloc_id_ = ctp::ipc::AllocatorId(handle.alloc_id_major, handle.alloc_id_minor);
+  shm_ptr.off_ = static_cast<size_t>(handle.off);
+  ctp::ipc::FullPtr<char> full = ipc->ToFullPtr<char>(shm_ptr);
+  if (full.IsNull()) return 0;
+  return reinterpret_cast<size_t>(full.ptr_);
+}
+
+}  // namespace cte_ffi
+
+// ---- cxx-bridge async SHM operations (cte_ffi namespace) ----
+
+namespace cte_ffi {
+
+/// Block until the future completes (dispatches to FutureHandle::wait).
+int32_t future_wait(const FutureHandle& handle, float timeout_sec, int32_t& out_rc) {
+  return handle.wait(timeout_sec, &out_rc);
+}
+
+/// Submit a zero-copy AsyncPutBlob. Returns a FutureHandle (null on failure).
+std::unique_ptr<FutureHandle> async_put_shm(const Tag& tag, rust::Str blob_name,
+                                             uint64_t offset, uint64_t size,
+                                             CteShmHandle data, float score) {
+  if (data.off == 0 && data.alloc_id_major == 0 && data.alloc_id_minor == 0) {
+    return nullptr;  // null SHM handle
+  }
+  ctp::ipc::ShmPtr<> shm_ptr;
+  shm_ptr.alloc_id_ = ctp::ipc::AllocatorId(data.alloc_id_major, data.alloc_id_minor);
+  shm_ptr.off_ = static_cast<size_t>(data.off);
+  auto *cte_client = ::clio::cte::core::g_cte_client;
+  if (cte_client == nullptr) return nullptr;
+  std::string name_str(blob_name.data(), blob_name.size());
+  auto future = cte_client->AsyncPutBlob(
+      tag.inner.GetTagId(), name_str.c_str(),
+      static_cast<clio::run::u64>(offset), static_cast<clio::run::u64>(size),
+      shm_ptr, score, clio::cte::core::Context(), /*flags=*/0u,
+      clio::run::PoolQuery::Local());
+  using FutureT = clio::run::Future<clio::cte::core::PutBlobTask>;
+  auto *boxed = new FutureT(std::move(future));
+  // Wrap in FutureHandle (the type-erased holder). FutureHandle owns the boxed Future;
+  // ~FutureHandle calls destroy_fn_ (cte_put_future_destroy_fn) which deletes it.
+  auto handle = std::make_unique<FutureHandle>();
+  handle->wait_fn_ = cte_put_future_wait_fn;
+  handle->destroy_fn_ = cte_put_future_destroy_fn;
+  handle->future_ = static_cast<void*>(boxed);
+  return handle;
+}
+
+/// Submit a zero-copy AsyncGetBlob into a caller SHM buffer. Returns FutureHandle (null on failure).
+std::unique_ptr<FutureHandle> async_get_shm(const Tag& tag, rust::Str blob_name,
+                                             uint64_t offset, uint64_t size,
+                                             CteShmHandle out_buf) {
+  if (out_buf.off == 0 && out_buf.alloc_id_major == 0 && out_buf.alloc_id_minor == 0) {
+    return nullptr;
+  }
+  ctp::ipc::ShmPtr<> shm_ptr;
+  shm_ptr.alloc_id_ = ctp::ipc::AllocatorId(out_buf.alloc_id_major, out_buf.alloc_id_minor);
+  shm_ptr.off_ = static_cast<size_t>(out_buf.off);
+  auto *cte_client = ::clio::cte::core::g_cte_client;
+  if (cte_client == nullptr) return nullptr;
+  std::string name_str(blob_name.data(), blob_name.size());
+  auto future = cte_client->AsyncGetBlob(
+      tag.inner.GetTagId(), name_str.c_str(),
+      static_cast<clio::run::u64>(offset), static_cast<clio::run::u64>(size),
+      /*flags=*/0u, shm_ptr, clio::run::PoolQuery::Local());
+  using FutureT = clio::run::Future<clio::cte::core::GetBlobTask>;
+  auto *boxed = new FutureT(std::move(future));
+  auto handle = std::make_unique<FutureHandle>();
+  handle->wait_fn_ = cte_get_future_wait_fn;
+  handle->destroy_fn_ = cte_get_future_destroy_fn;
+  handle->future_ = static_cast<void*>(boxed);
+  return handle;
+}
+
+}  // namespace cte_ffi
+
+// ---- Operator implementations for cxx shared structs (T23) ----
+
+bool CteTelemetryEntry::operator==(const CteTelemetryEntry& rhs) const noexcept {
+  return op == rhs.op && off == rhs.off && size == rhs.size &&
+         tag_major == rhs.tag_major && tag_minor == rhs.tag_minor &&
+         mod_time == rhs.mod_time && read_time == rhs.read_time &&
+         logical_time == rhs.logical_time;
+}
+
+bool CteTelemetryEntry::operator!=(const CteTelemetryEntry& rhs) const noexcept {
+  return !(*this == rhs);
+}
+
+bool BlobBlock::operator==(const BlobBlock& rhs) const noexcept {
+  return pool_id == rhs.pool_id && block_size == rhs.block_size &&
+         block_offset == rhs.block_offset;
+}
+
+bool BlobBlock::operator!=(const BlobBlock& rhs) const noexcept {
+  return !(*this == rhs);
+}
+
+bool BlobInfoBulk::operator==(const BlobInfoBulk& rhs) const noexcept {
+  return score == rhs.score && total_size == rhs.total_size;
+}
+
+bool BlobInfoBulk::operator!=(const BlobInfoBulk& rhs) const noexcept {
+  return !(*this == rhs);
+}

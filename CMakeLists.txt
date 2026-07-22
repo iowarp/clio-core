@@ -64,6 +64,7 @@ option(CLIO_CORE_ENABLE_RPM_PACKAGE "Build RPM .rpm package via CPack" OFF)
 option(CLIO_CORE_ENABLE_APPIMAGE "Build portable AppImage via appimagetool" OFF)
 option(CLIO_CORE_ENABLE_CONDA "Enable Conda environment configuration (adds Conda paths to include/link directories)" OFF)
 option(CLIO_CORE_ENABLE_DOCKER_CI "Enable Docker-based integration tests (requires Docker)" OFF)
+option(CLIO_CORE_ENABLE_RUST "Enable Rust bindings for CTE (requires Rust toolchain + Corrosion)" OFF)
 option(BUILD_SHARED_LIBS "Build shared libraries (.dll/.so) instead of static ones (.lib/.a)" ON)
 option(CLIO_CORE_STATIC_DEPS "Link external dependencies statically (for self-contained wheels)" OFF)
 
@@ -440,8 +441,14 @@ if(CLIO_CTE_ENABLE_COMPRESS)
     pkg_check_modules(libbrotlicommon REQUIRED libbrotlicommon libbrotlidec libbrotlienc)
     message(STATUS "found libbrotli.h at ${libbrotlicommon_INCLUDE_DIRS}")
 
-    pkg_check_modules(blosc2 REQUIRED blosc2)
-    message(STATUS "found blosc2.h at ${blosc2_INCLUDE_DIRS}")
+    pkg_check_modules(blosc2 blosc2)
+    if(blosc2_FOUND)
+        message(STATUS "found blosc2.h at ${blosc2_INCLUDE_DIRS}")
+        set(CLIO_CTP_ENABLE_BLOSC2 ON CACHE BOOL "Blosc2 compression support (auto-detected)" FORCE)
+    else()
+        message(STATUS "blosc2 not found - blosc2 compression will be disabled")
+        set(CLIO_CTP_ENABLE_BLOSC2 OFF CACHE BOOL "Blosc2 compression support (auto-detected)" FORCE)
+    endif()
 
     # bzip2
     find_path(bzip2_INCLUDE_DIR bzlib.h REQUIRED)
@@ -469,15 +476,17 @@ if(CLIO_CTE_ENABLE_COMPRESS)
     endif()
 
     # snappy
-    find_path(snappy_INCLUDE_DIR snappy.h REQUIRED)
-    find_library(snappy_LIBRARY snappy REQUIRED)
+    find_path(snappy_INCLUDE_DIR snappy.h)
+    find_library(snappy_LIBRARY snappy)
     if(snappy_INCLUDE_DIR AND snappy_LIBRARY)
         set(snappy_INCLUDE_DIRS ${snappy_INCLUDE_DIR})
         set(snappy_LIBRARIES snappy)
         get_filename_component(snappy_LIBRARY_DIRS "${snappy_LIBRARY}" DIRECTORY)
         message(STATUS "found snappy.h at ${snappy_INCLUDE_DIRS}")
+        set(CLIO_CTP_ENABLE_SNAPPY ON CACHE BOOL "Snappy compression support (auto-detected)" FORCE)
     else()
-        message(FATAL_ERROR "snappy not found. Install with: apt-get install libsnappy-dev")
+        message(STATUS "snappy not found - snappy compression will be disabled")
+        set(CLIO_CTP_ENABLE_SNAPPY OFF CACHE BOOL "Snappy compression support (auto-detected)" FORCE)
     endif()
 
     # LibPressio - try find_package first (CMake-based), fall back to pkg-config
@@ -908,12 +917,19 @@ if(CAE_ENABLE_GCS)
 endif()
 
 if (CLIO_CTE_ENABLE_ADIOS2_ADAPTER OR CLIO_CORE_ENABLE_GRAY_SCOTT)
-    # Find ADIOS2
-    find_package(ADIOS2 REQUIRED)
+    # Find ADIOS2 (optional — auto-disable dependent features if not found)
+    find_package(ADIOS2 QUIET)
     if(ADIOS2_FOUND)
         message(STATUS "found ADIOS2 at ${ADIOS2_DIR}")
     else()
-        message(FATAL_ERROR "CLIO_CORE_ENABLE_GRAY_SCOTT is ON but ADIOS2 not found. Please install ADIOS2 or disable the option.")
+        if(CLIO_CORE_ENABLE_GRAY_SCOTT)
+            message(WARNING "CLIO_CORE_ENABLE_GRAY_SCOTT is ON but ADIOS2 not found - disabling Gray-Scott")
+            set(CLIO_CORE_ENABLE_GRAY_SCOTT OFF)
+        endif()
+        if(CLIO_CTE_ENABLE_ADIOS2_ADAPTER)
+            message(STATUS "ADIOS2 not found - ADIOS2 adapter will be disabled")
+            set(CLIO_CTE_ENABLE_ADIOS2_ADAPTER OFF)
+        endif()
     endif()
 endif()
 
@@ -968,6 +984,18 @@ if(CLIO_CORE_ENABLE_PYTHON)
   message(STATUS "  Site-packages:      ${PYTHON_SITE_PACKAGES}")
 else()
   message(STATUS "Python bindings disabled")
+endif()
+
+# Rust Bindings Configuration (Corrosion) — gated by CLIO_CORE_ENABLE_RUST
+if(CLIO_CORE_ENABLE_RUST)
+    message(STATUS "Rust bindings enabled - configuring Corrosion")
+    include(FetchContent)
+    FetchContent_Declare(corrosion
+        GIT_REPOSITORY https://github.com/corrosion-rs/corrosion.git
+        GIT_TAG v0.5.2
+    )
+    FetchContent_MakeAvailable(corrosion)
+    message(STATUS "Rust bindings enabled: Corrosion ${corrosion_VERSION}")
 endif()
 
 #------------------------------------------------------------------------------

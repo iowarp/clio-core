@@ -1,13 +1,54 @@
 [package]
-name = "wrp-cte-rs"
-version = "0.1.0"
+name = "clio-cte-rs"
+version = "0.2.0"
 edition = "2021"
+authors = ["IOWarp Team"]
+description = "Rust bindings for IOWarp Context Transfer Engine"
+license = "BSD-3-Clause"
+repository = "https://github.com/iowarp/clio-core"
 
 [lib]
+name = "clio_cte"
 crate-type = ["cdylib", "rlib"]
 
+[features]
+default = ["async"]
+sync = []
+async = ["sync", "dep:tokio"]
+
 [dependencies]
-cxx = "1"
+caps = "0.5"
+cxx = "1.0"
+foldhash = "0.1"
+hashbrown = "0.15"
+tokio = { version = "1.50", optional = true, default-features = false, features = ["rt", "rt-multi-thread", "signal", "time", "sync", "macros"] }
 
 [build-dependencies]
-cxx-build = "1"
+cxx-build = "1.0"
+
+[dev-dependencies]
+tokio = { version = "1.50", features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }
+
+[[bin]]
+name = "aneris-profiler"
+path = "src/bin/aneris/main.rs"
+
+[[bin]]
+name = "aneris-rescorer"
+path = "src/bin/aneris-rescorer/main.rs"
+
+[[bin]]
+name = "aneris-tune"
+path = "src/bin/aneris-tune/main.rs"
+
+# Release profile with aggressive optimizations for ~10-30% performance gain
+# lto = "fat": cross-crate link-time optimization, enables inlining across crate boundaries
+# codegen-units = 1: single codegen unit for optimal register allocation and cross-function inlining
+# panic = "abort": smaller binaries, no unwinding machinery overhead
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(aneris_build_dir)'] }

@@ -1,0 +1,222 @@
+#!/bin/bash
+#
+# Copyright (c) 2024, Gnosis Research Center, Illinois Institute of Technology
+# All rights reserved.
+#
+# BSD 3-Clause License
+#
+# Aneris Intercept Script for ADIOS2 Applications
+#
+# This script runs an ADIOS2 application with I/O interception only,
+# WITHOUT starting Chimaera runtime or collecting telemetry.
+#
+# Usage: Aneris_intercept_adios <executable> [args...]
+#
+# Prerequisites:
+#   - Application must use io.SetEngine("IowarpEngine")
+#   - ADIOS2_PLUGIN_PATH must include libiowarp_engine.so
+#
+
+set -e
+
+#==============================================================================
+# Configuration (filled in by CMake)
+#==============================================================================
+IOWARP_BUILD_DIR="@CMAKE_BINARY_DIR@"
+IOWARP_SOURCE_DIR="@CMAKE_SOURCE_DIR@"
+
+#==============================================================================
+# Default Configuration
+#==============================================================================
+# ADIOS2 configuration file (can be set via environment variable)
+# Use pattern: ${VAR:-default} to provide default if not set
+ADIOS_CONFIG_FILE="${ADIOS_CONFIG_FILE:-""}"
+
+# Default ADIOS2 config location if not specified
+DEFAULT_ADIOS_CONFIG="${IOWARP_SOURCE_DIR}/context-transfer-engine/adapter/adios2/iowarp_default.xml"
+
+#==============================================================================
+# Functions
+#==============================================================================
+
+show_help() {
+    cat << EOF
+Aneris I/O Intercept for ADIOS2 (No Runtime)
+
+Usage: $0 [options] <executable> [args...]
+
+Options:
+    -h, --help              Show this help message
+    -v, --verbose           Enable verbose output
+    --adios-config <file>   ADIOS2 XML config file
+
+Environment Variables:
+    ADIOS_CONFIG_FILE       Path to ADIOS2 XML config file
+                          (default: ${DEFAULT_ADIOS_CONFIG} if exists)
+
+Prerequisites:
+    1. Your ADIOS2 application must use the IowarpEngine:
+
+       adios2::IO io = adios.DeclareIO("myIO");
+       io.SetEngine("IowarpEngine");  // Required!
+
+    2. libiowarp_engine.so must be built
+
+    3. No Chimaera runtime required - this mode is for pure I/O interception
+
+    4. CHI_WITH_RUNTIME=0 will be set automatically
+
+Example:
+    $0 ./my_adios_simulation --input data.txt
+    $0 --verbose ./my_adios_app
+    $0 --adios-config /path/to/adios.xml ./lmp -in input.lammps
+
+EOF
+}
+
+#==============================================================================
+# Parse Arguments
+#==============================================================================
+
+VERBOSE=0
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        -v|--verbose)
+            VERBOSE=1
+            shift
+            ;;
+        --adios-config)
+            ADIOS_CONFIG_FILE="$2"
+            shift 2
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            echo "Error: Unknown option $1"
+            show_help
+            exit 1
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+# Check for executable
+if [ $# -eq 0 ]; then
+    echo "Error: No executable specified"
+    show_help
+    exit 1
+fi
+
+EXECUTABLE="$1"
+shift
+
+if [ ! -x "$EXECUTABLE" ]; then
+    echo "Error: '$EXECUTABLE' is not executable or not found"
+    exit 1
+fi
+
+#==============================================================================
+# Setup Environment
+#==============================================================================
+
+# Library paths
+export LD_LIBRARY_PATH="${IOWARP_BUILD_DIR}/bin:${LD_LIBRARY_PATH}"
+export ADIOS2_PLUGIN_PATH="${IOWARP_BUILD_DIR}/bin"
+
+# CRITICAL: Disable Chimaera runtime startup
+# This prevents automatic runtime initialization in the plugin
+export CHI_WITH_RUNTIME=0
+
+# ADIOS2 configuration
+if [ -n "$ADIOS_CONFIG_FILE" ]; then
+    # Use user-specified config
+    export ADIOS2_CONFIG_FILE="$ADIOS_CONFIG_FILE"
+    if [ $VERBOSE -eq 1 ]; then
+        echo "Using ADIOS2 config: $ADIOS_CONFIG_FILE"
+    fi
+elif [ -f "$DEFAULT_ADIOS_CONFIG" ]; then
+    # Use default config if it exists
+    export ADIOS2_CONFIG_FILE="$DEFAULT_ADIOS_CONFIG"
+    if [ $VERBOSE -eq 1 ]; then
+        echo "Using default ADIOS2 config: $DEFAULT_ADIOS_CONFIG"
+    fi
+else
+    # Create temporary config with IowarpEngine
+    TEMP_ADIOS_CONFIG=$(mktemp /tmp/iowarp_adios_config.XXXXXX.xml)
+    cat > "$TEMP_ADIOS_CONFIG" << 'EOF'
+<?xml version="1.0"?>
+<adios-config>
+    <io name="*">
+        <engine type="Plugin">
+            <parameter key="PluginName" value="IowarpEngine"/>
+            <parameter key="PluginLibrary" value="iowarp_engine"/>
+        </engine>
+    </io>
+</adios-config>
+EOF
+    export ADIOS2_CONFIG_FILE="$TEMP_ADIOS_CONFIG"
+    TEMP_FILES="$TEMP_ADIOS_CONFIG"
+    if [ $VERBOSE -eq 1 ]; then
+        echo "Created temporary ADIOS2 config: $TEMP_ADIOS_CONFIG"
+    fi
+fi
+
+#==============================================================================
+# Print Info
+#==============================================================================
+
+echo "=========================================="
+echo "Aneris I/O Intercept (ADIOS2)"
+echo "=========================================="
+echo "Executable: $EXECUTABLE"
+echo "Mode: I/O Interception Only (No Runtime)"
+echo "ADIOS2 Plugin: ${IOWARP_BUILD_DIR}/bin/libiowarp_engine.so"
+echo ""
+echo "Note: Make sure your application uses:"
+echo "  io.SetEngine(\"IowarpEngine\")"
+echo "=========================================="
+echo ""
+
+if [ $VERBOSE -eq 1 ]; then
+    echo "LD_LIBRARY_PATH: $LD_LIBRARY_PATH"
+    echo "ADIOS2_PLUGIN_PATH: $ADIOS2_PLUGIN_PATH"
+    echo "CHI_WITH_RUNTIME: $CHI_WITH_RUNTIME"
+    echo "ADIOS2_CONFIG_FILE: $ADIOS2_CONFIG_FILE"
+    echo ""
+fi
+
+#==============================================================================
+# Check Prerequisites
+#==============================================================================
+
+# Check if IowarpEngine plugin exists
+if [ ! -f "${IOWARP_BUILD_DIR}/bin/libiowarp_engine.so" ]; then
+    echo "Error: IowarpEngine plugin not found at ${IOWARP_BUILD_DIR}/bin/libiowarp_engine.so"
+    echo "Please build with: cmake --build . --target iowarp_engine"
+    exit 1
+fi
+
+#==============================================================================
+# Run Application
+#==============================================================================
+
+# Cleanup temporary files on exit
+cleanup() {
+    # Clean up temporary files
+    if [ -n "$TEMP_FILES" ]; then
+        rm -f $TEMP_FILES
+    fi
+}
+trap cleanup EXIT
+
+# Run the application directly with interception environment set up
+exec "$EXECUTABLE" "$@"

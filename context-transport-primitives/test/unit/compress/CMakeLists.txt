@@ -5,6 +5,7 @@ project(clio_ctp)
 #------------------------------------------------------------------------------
 
 # Basic compression unit tests
+if(CLIO_CTE_ENABLE_COMPRESS)
 add_executable(test_compress_exec
         ${TEST_MAIN}/main.cc
         test_init.cc
@@ -40,5 +41,6 @@ install(TARGETS
         LIBRARY DESTINATION lib
         ARCHIVE DESTINATION lib
         RUNTIME DESTINATION bin)
+endif()
 
 #------------------------------------------------------------------------------

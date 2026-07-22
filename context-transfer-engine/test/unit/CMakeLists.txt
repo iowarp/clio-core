@@ -80,6 +80,13 @@ add_executable(test_data_organizer
     test_data_organizer.cc
 )
 
+# Reorganizer checkpoint-restart end-to-end test: sequential checkpoint
+# cycles with the frecency organizer automatically rescoring + moving blobs
+# between tiers. Validates data integrity + score differentiation.
+add_executable(test_reorganizer_checkpoint_restart
+    test_reorganizer_checkpoint_restart.cc
+)
+
 # I/O emulation (issue #747): Context::emulate_ on PutBlob/GetBlob (modeled
 # time, buffer untouched, WAL skipped) + bdev perf-stats persistence.
 add_executable(test_io_emulation
@@ -313,6 +320,18 @@ target_link_libraries(test_reorganize_blob
 
 # Link test_data_organizer - using simple_test.h framework (NOT Catch2)
 target_link_libraries(test_data_organizer
+    clio_cte_core_runtime         # CTE core runtime library
+    clio_cte_core_client          # CTE core client library
+    clio::run::admin_runtime      # Admin module runtime (required for runtime mode)
+    clio::run::admin_client       # Admin module client
+    clio::run::bdev_runtime       # Bdev module runtime (required for runtime mode)
+    clio::run::bdev_client        # Bdev client for BdevType enum
+    ctp::cxx                    # ClioCtp library
+    ${CMAKE_THREAD_LIBS_INIT}    # Threading support
+)
+
+# Link test_reorganizer_checkpoint_restart - using simple_test.h framework (NOT Catch2)
+target_link_libraries(test_reorganizer_checkpoint_restart
     clio_cte_core_runtime         # CTE core runtime library
     clio_cte_core_client          # CTE core client library
     clio::run::admin_runtime      # Admin module runtime (required for runtime mode)
@@ -737,6 +756,21 @@ set_tests_properties(
         ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
 )
 
+# Reorganizer checkpoint-restart test (issue #738 + Aneris data movement)
+# NOTE: like the data_organizer test, the cases share global fixture state
+# (blobs put in one case are checked/cleaned in later cases), so they run
+# together in a single process.
+add_test(NAME cte_reorganizer_checkpoint_restart_all
+    COMMAND test_reorganizer_checkpoint_restart)
+
+set_tests_properties(
+    cte_reorganizer_checkpoint_restart_all
+    PROPERTIES
+        TIMEOUT 300  # 5 minute timeout
+        LABELS "unit;organizer;checkpoint;cte"
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_TEST_DATA_DIR=${CMAKE_BINARY_DIR};CLIO_BIND_ADDR=127.0.0.1"
+)
+
 # Add I/O emulation tests (issue #747)
 # NOTE: like the reorganize tests, the cases share global fixture state, so
 # they run together in a single process.
@@ -852,6 +886,7 @@ set_tests_properties(
     cte_block_reuse_all
     cte_reorganize_all
     cte_data_organizer_all
+    cte_reorganizer_checkpoint_restart_all
     cte_io_emulation_all
     PROPERTIES LABELS "msan_skip"
 )
@@ -892,6 +927,7 @@ set_tests_properties(
     cte_block_reuse_all
     cte_reorganize_all
     cte_data_organizer_all
+    cte_reorganizer_checkpoint_restart_all
     cte_io_emulation_all
     PROPERTIES
         RESOURCE_LOCK "clio_runtime"
@@ -937,6 +973,7 @@ set_property(TEST
     cte_block_reuse_all
     cte_reorganize_all
     cte_data_organizer_all
+    cte_reorganizer_checkpoint_restart_all
     cte_io_emulation_all
     APPEND PROPERTY ENVIRONMENT "CLIO_PORT=10500"
 )
@@ -965,7 +1002,7 @@ set_tests_properties(
 # ------------------------------------------------------------------------------
 # Install Targets
 # ------------------------------------------------------------------------------
-set(_CTE_TEST_TARGETS cte_core_unit_tests cte_core_functionality_simple_tests test_core_functionality test_query test_cte_config_dpe test_tag_operations test_core_client_config test_core_runtime_coverage test_tiered_storage_stress test_tiered_storage_dram_default test_blob_block_reuse test_reorganize_blob test_data_organizer test_io_emulation)
+set(_CTE_TEST_TARGETS cte_core_unit_tests cte_core_functionality_simple_tests test_core_functionality test_query test_cte_config_dpe test_tag_operations test_core_client_config test_core_runtime_coverage test_tiered_storage_stress test_tiered_storage_dram_default test_blob_block_reuse test_reorganize_blob test_data_organizer test_reorganizer_checkpoint_restart test_io_emulation)
 # (The legacy test_cte_gpu_coroutine / test_gpu_core / test_gpu_create targets
 # and their ctest registrations were removed along with the GPU runtime. CTE
 # GPU coverage now lives in test_cte_devmem_putget (cte_devmem_putget_cuda).)

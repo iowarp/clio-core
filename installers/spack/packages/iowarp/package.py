@@ -53,6 +53,10 @@ class Iowarp(CMakePackage):
                         '(google-cloud-cpp storage)')
     variant('boost_coro', default=False,
             description='Use Boost.Context stackful coroutine backend (issue #620)')
+    variant('rust', default=False, description='Enable Rust bindings for CTE '
+                                                   '(clio-cte-rs crate via '
+                                                   'Corrosion; requires Rust '
+                                                   'toolchain)')
 
     # Core dependencies (always required)
     depends_on('cmake@3.25:')
@@ -82,6 +86,10 @@ class Iowarp(CMakePackage):
     depends_on('libfuse@3:', when='+fuse')
     depends_on('boost+context', when='+boost_coro')
 
+    # Rust toolchain (conditional on +rust). Corrosion drives cargo to build
+    # the clio-cte-rs crate, so the Rust toolchain (cargo + rustc) is required.
+    depends_on('rust', when='+rust')
+
     # CAE cloud import backends (opt-in). aws-sdk-cpp for the S3 assimilator
     # (find_package(AWSSDK COMPONENTS s3)); the iowarp-overlay storage-only
     # google-cloud-cpp for the GCS assimilator (find_package(google_cloud_cpp_storage)).
@@ -92,6 +100,7 @@ class Iowarp(CMakePackage):
     conflicts('+gcs', when='~cae', msg='GCS import lives under CAE; enable +cae')
 
     conflicts('+fuse', when='~cte', msg='fuse adapter lives under CTE; enable +cte')
+    conflicts('+rust', when='~cte', msg='Rust bindings live under CTE; enable +cte')
 
     # Networking libraries
     # +ares: build libfabric with the full Ares-rail fabric set. The
@@ -147,6 +156,7 @@ class Iowarp(CMakePackage):
         args.append(self.define_from_variant('CLIO_CORE_ENABLE_CEE', 'cee'))
         args.append(self.define_from_variant(
             'CLIO_CORE_ENABLE_BOOST_COROUTINES', 'boost_coro'))
+        args.append(self.define_from_variant('CLIO_CORE_ENABLE_RUST', 'rust'))
 
         # Context-transport-primitives (CTP) options
         if '+hdf5' in self.spec:

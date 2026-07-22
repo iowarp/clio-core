@@ -245,10 +245,18 @@ class CompressionFactory {
   // Construction helpers for single-mode and backend-guarded compressors.
   // (Multi-mode lossless compressors use CreateLossless<T> directly.)
   static std::unique_ptr<Compressor> MakeSnappy(CompressionPreset) {
+#if CTP_ENABLE_SNAPPY
     return std::make_unique<Snappy>();
+#else
+    return nullptr;
+#endif
   }
   static std::unique_ptr<Compressor> MakeBlosc(CompressionPreset) {
+#if CTP_ENABLE_BLOSC2
     return std::make_unique<Blosc>();
+#else
+    return nullptr;
+#endif
   }
   static std::unique_ptr<Compressor> MakeZfp(CompressionPreset preset) {
 #if CTP_ENABLE_LIBPRESSIO

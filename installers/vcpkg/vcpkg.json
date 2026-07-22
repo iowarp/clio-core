@@ -26,6 +26,9 @@
       "dependencies": [
         "boost-context"
       ]
+    },
+    "rust": {
+      "description": "Rust bindings for CTE (clio-cte-rs crate via Corrosion; CLIO_CORE_ENABLE_RUST). Requires the Rust toolchain (cargo + rustc) on PATH."
     }
   }
 }
