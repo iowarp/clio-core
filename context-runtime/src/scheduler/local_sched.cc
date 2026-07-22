@@ -99,24 +99,8 @@ void LocalScheduler::DivideWorkers(WorkOrchestrator *work_orch) {
        gpu_worker_ ? (int)gpu_worker_->GetId() : -1);
 }
 
-u32 LocalScheduler::ClientMapTask(IpcManager *ipc_manager,
-                                   const Future<Task> &task) {
-  u32 num_lanes = ipc_manager->GetNumSchedQueues();
-  if (num_lanes == 0) {
-    return 0;
-  }
-
-  Task *task_ptr = task.get();
-  if (task_ptr != nullptr && task_ptr->pool_id_ == clio::run::kAdminPoolId) {
-    u32 method_id = task_ptr->method_;
-    if (method_id == 14 || method_id == 15 || method_id == 20 || method_id == 21) {
-      return num_lanes - 1;
-    }
-  }
-
-  u32 lane = MapByPidTid(num_lanes);
-  return lane;
-}
+// NOTE (issue #781): ClientMapTask + MapByPidTid removed — client/recv ingress
+// no longer hashes to a lane; the runtime maps tasks to workers (RuntimeMapTask).
 
 u32 LocalScheduler::RuntimeMapTask(Worker *worker, const Future<Task> &task,
                                     ContainerHold container) {
@@ -188,8 +172,15 @@ u32 LocalScheduler::RuntimeMapTask(Worker *worker, const Future<Task> &task,
   return 0;
 }
 
-void LocalScheduler::RebalanceWorker(Worker *worker) {
-  (void)worker;
+// issue #781 — SCAFFOLD ONLY (not yet wired). See DefaultScheduler::LoadBalance.
+void LocalScheduler::LoadBalance() {
+  // TODO(#781): stall detection + elastic spawn + steal + retire + telemetry.
+}
+
+bool LocalScheduler::StealWork(Worker *thief) {
+  (void)thief;
+  // TODO(#781): neighbour + most-loaded steal.
+  return false;
 }
 
 void LocalScheduler::AdjustPolling(const clio::run::shared_ptr<Task> &task) {
@@ -200,16 +191,6 @@ void LocalScheduler::AdjustPolling(const clio::run::shared_ptr<Task> &task) {
   // This is critical because co_await on Futures sets yield_time_us_ = 0,
   // so we must restore it here to prevent periodic tasks from busy-looping
   task->SetYieldTimeUs(task->TruePeriodNs() / 1000.0);
-}
-
-u32 LocalScheduler::MapByPidTid(u32 num_lanes) {
-  auto *sys_info = CTP_SYSTEM_INFO;
-  pid_t pid = sys_info->pid_;
-  auto tid = CTP_THREAD_MODEL->GetTid();
-
-  size_t combined_hash =
-      std::hash<pid_t>{}(pid) ^ (std::hash<ctp::u64>{}(tid.tid_) << 1);
-  return static_cast<u32>(combined_hash % num_lanes);
 }
 
 }  // namespace clio::run

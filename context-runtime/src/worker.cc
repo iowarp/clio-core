@@ -264,12 +264,10 @@ void Worker::Run() {
     did_work_ = false;  // Reset work tracker at start of each loop iteration
     task_did_work_ = false;  // Reset task-level work tracker
 
-    // Drain this worker's MPSC SHM server for inbound client tasks. All
-    // deserialization lives in IpcCpu2Cpu::RecvIn — the worker never touches
-    // serialized task/future bytes.
-    if (assigned_lane_ && IpcCpu2Cpu::RecvIn(CLIO_IPC, assigned_lane_)) {
-      did_work_ = true;
-    }
+    // NOTE: the inbound SHM ring is NOT drained here. A dedicated thread
+    // (IpcManager::RecvShmServerThread) owns it and pushes tasks onto worker
+    // lanes, mirroring the ZMQ path's ClientRecvThread. Workers therefore never
+    // touch serialized task bytes and need no knowledge of the transport.
 
     // Process tasks from assigned lane
     if (assigned_lane_) {
@@ -642,6 +640,18 @@ void Worker::ExecTask(clio::run::shared_ptr<Task> &task_ptr, bool is_started) {
     return;
   }
 
+  // issue #781: stamp the wall-clock entry time so the monitor thread can see a
+  // worker that never returns from a non-yielding task. Set BEFORE driving the
+  // coroutine; cleared after it returns/yields below. A cooperative task that
+  // co_awaits returns here (clears), so it never looks stalled; a spinning task
+  // never returns, so last_exec_start_us_ stays set and IsStalled() fires.
+  last_exec_start_us_.store(
+      static_cast<long long>(
+          std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::steady_clock::now().time_since_epoch())
+              .count()),
+      std::memory_order_relaxed);
+
   // Start CPU and wall timers before execution
   task_ptr->RunCpuTimer().Resume();
   task_ptr->RunWallTimer().Resume();
@@ -658,18 +668,36 @@ void Worker::ExecTask(clio::run::shared_ptr<Task> &task_ptr, bool is_started) {
     // BeginTask via container->GetTaskStats(task), so derive the model
     // inferences from the already-cached stat instead of re-calling
     // GetTaskStats here.
+    // issue #781: if RuntimeMapTask already predicted this task's cost at map
+    // time (sched_reserved_us_ != 0), that value is AUTHORITATIVE — it was
+    // computed from a fresh GetTaskStats, whereas PredictedStat() here can still
+    // be 0 (BeginTask populates it just now). So only (re)compute PredictedLoad
+    // when the task was NOT map-accounted.
+    float reserved = task_ptr->SchedReservedUs();
     if (exec) {
-      task_ptr->SetPredictedLoad(
-          exec->InferCpuTime(task_ptr->method_, task_ptr->PredictedStat()));
+      if (reserved == 0.0f) {
+        task_ptr->SetPredictedLoad(
+            exec->InferCpuTime(task_ptr->method_, task_ptr->PredictedStat()));
+      }
       task_ptr->SetPredictedWallUs(exec->InferWallClockTime(
           task_ptr->method_, task_ptr->PredictedStat()));
-      load_ += task_ptr->PredictedLoad();
+    }
+    // The task is now EXECUTING: count its predicted cost in load_ (whether the
+    // value came from the map or from here), and release the queued reservation
+    // so it is not double-counted. EndTask subtracts the same PredictedLoad.
+    load_ += task_ptr->PredictedLoad();
+    if (reserved != 0.0f) {
+      ReleaseReservation(reserved);
+      task_ptr->SetSchedReservedUs(0);
     }
   }
 
   // Pause CPU and wall timers after execution
   task_ptr->RunCpuTimer().Pause();
   task_ptr->RunWallTimer().Pause();
+
+  // issue #781: task returned/yielded — no longer stalling this worker.
+  last_exec_start_us_.store(0, std::memory_order_relaxed);
 
   // For periodic tasks, only set task_did_work_ if the task reported
   // actual work done (e.g., received data, sent data). This prevents
@@ -734,6 +762,16 @@ void Worker::EndTask(clio::run::shared_ptr<Task> &task_ptr, bool can_resched) {
   // Subtract predicted load from worker
   load_ -= task_ptr->PredictedLoad();
 
+  // issue #781: defensively release any still-held queued reservation for tasks
+  // that reach EndTask WITHOUT executing (e.g. the early-error EACCES path), so a
+  // reservation can never leak onto queued_load_. Normal tasks already released
+  // it in ExecTask (sched_reserved_us_ == 0 here), so this is a no-op for them.
+  float reserved = task_ptr->SchedReservedUs();
+  if (reserved != 0.0f) {
+    ReleaseReservation(reserved);
+    task_ptr->SetSchedReservedUs(0);
+  }
+
   // Reinforce model with actual CPU and wall time
   float actual_cpu_us = static_cast<float>(task_ptr->RunCpuTimer().GetUsec());
   float actual_wall_us = static_cast<float>(task_ptr->RunWallTimer().GetUsec());
@@ -743,6 +781,12 @@ void Worker::EndTask(clio::run::shared_ptr<Task> &task_ptr, bool can_resched) {
   container->ReinforceWallModel(
       task_ptr->method_, task_ptr->PredictedWallUs(), actual_wall_us,
       task_ptr->PredictedStat());
+  // issue #781: fold the measured cost into the scheduler's perf-bin PDF so the
+  // monitor thread can report the live workload distribution (telemetry).
+  if (scheduler_ != nullptr) {
+    scheduler_->RecordCompletion(task_ptr->method_, actual_cpu_us,
+                                 actual_wall_us);
+  }
 
   // Break the RunContext self-cycle for a task that is about to be released.
   // ProcessNewTask binds RunFuture (run_ctx_->future_) with a copied task_ptr_

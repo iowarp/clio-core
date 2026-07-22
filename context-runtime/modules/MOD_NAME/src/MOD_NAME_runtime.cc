@@ -75,8 +75,17 @@ clio::run::TaskResume Runtime::Custom(clio::run::shared_ptr<CustomTask> &task) {
 
   custom_count_++;
 
-  // Process custom task here
-  // In a real implementation, this would perform the custom operation
+  // issue #781 scheduler-variety benchmark: busy-spin for the requested compute
+  // time. This is a NON-YIELDING spin on purpose — it models the mislabeled /
+  // long-running task class the anti-deadlock scheduler must tolerate, and lets
+  // the benchmark sweep 1us..1s to measure quick-task p99 / starvation.
+  if (task->spin_us_ > 0) {
+    auto deadline = std::chrono::steady_clock::now() +
+                    std::chrono::microseconds(task->spin_us_);
+    while (std::chrono::steady_clock::now() < deadline) {
+      // spin (no yield)
+    }
+  }
 
   HLOG(kDebug, "MOD_NAME: Custom completed (count: {})", custom_count_);
   CLIO_CO_RETURN;

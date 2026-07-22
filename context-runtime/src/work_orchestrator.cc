@@ -151,6 +151,7 @@ bool WorkOrchestrator::StartWorkers() {
   }
 
   workers_running_ = true;
+  StartMonitorThread();  // issue #781: periodic LoadBalance / stall rescue
   return true;
 }
 
@@ -171,6 +172,8 @@ void WorkOrchestrator::StopWorkers() {
   if (!workers_running_) {
     return;
   }
+
+  StopMonitorThread();  // issue #781: join monitor before tearing down workers
 
   HLOG(kDebug, "Stopping {} worker threads...", all_workers_.size());
 
@@ -391,6 +394,51 @@ bool WorkOrchestrator::HasWorkRemaining(u64 &total_work_remaining) const {
   }
 
   return total_work_remaining > 0;
+}
+
+// ===========================================================================
+// issue #781: monitor thread + elastic worker pool (SCAFFOLD — not yet wired)
+// ===========================================================================
+
+void WorkOrchestrator::StartMonitorThread() {
+  if (monitor_running_.exchange(true)) {
+    return;  // already running (idempotent)
+  }
+  monitor_thread_ = std::thread([this]() { MonitorLoop(); });
+}
+
+void WorkOrchestrator::StopMonitorThread() {
+  if (!monitor_running_.exchange(false)) {
+    return;
+  }
+  if (monitor_thread_.joinable()) {
+    monitor_thread_.join();
+  }
+}
+
+void WorkOrchestrator::MonitorLoop() {
+  // Dedicated (non-worker) thread. Every kMonitorPeriodMs it hands off to the
+  // scheduler's LoadBalance(), which owns stall detection, elastic spawn, work
+  // stealing, retirement, and telemetry. Kept intentionally thin here so all
+  // policy lives in the Scheduler. LoadBalance() is a no-op stub today (#781).
+  while (monitor_running_.load(std::memory_order_relaxed)) {
+    if (scheduler_) {
+      scheduler_->LoadBalance();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(kMonitorPeriodMs));
+  }
+}
+
+Worker *WorkOrchestrator::SpawnAdditionalWorker() {
+  // TODO(#781): create a Worker + lane, register in all_workers_/worker_threads_,
+  // and thread_model_->Spawn its Run() — the dynamic-growth path the fixed-pool
+  // Init does not provide today. Returns nullptr until wired.
+  return nullptr;
+}
+
+void WorkOrchestrator::RetireWorker(Worker *worker) {
+  // TODO(#781): park + join an idle elastic worker and drop it from the pool.
+  (void)worker;
 }
 
 }  // namespace clio::run

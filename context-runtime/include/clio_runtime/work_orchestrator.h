@@ -36,6 +36,7 @@
 
 #include <atomic>
 #include <memory>
+#include <thread>
 #include <vector>
 
 #include "clio_runtime/task.h"
@@ -152,7 +153,42 @@ class WorkOrchestrator {
    */
   u32 GetTotalWorkerCount() const { return static_cast<u32>(all_workers_.size()); }
 
+  // --- issue #781: monitor thread + elastic (unbounded) worker pool ---
+
+  /**
+   * Start the dedicated monitor thread. Not a worker: every ~500ms it samples
+   * worker progress/load and calls scheduler_->LoadBalance(), which detects
+   * stalled workers and grows/rebalances the pool. Idempotent.
+   */
+  void StartMonitorThread();
+
+  /** Stop and join the monitor thread. */
+  void StopMonitorThread();
+
+  /**
+   * Elastically add ONE worker + lane at runtime and spawn its thread (issue
+   * #781). Called by LoadBalance when a worker stalls on a non-yielding task so
+   * the stalled worker's backlog can be stolen onto a fresh thread. Unbounded by
+   * design (see issue #781 Observability) — emits metrics/warnings instead of a
+   * hard cap. Today the pool is created once at Init; this is the dynamic path.
+   * @return the new worker, or nullptr on failure.
+   */
+  Worker *SpawnAdditionalWorker();
+
+  /**
+   * Retire an idle elastic worker spawned by SpawnAdditionalWorker (issue #781):
+   * park it, join its thread, and drop it from the pool — the hysteresis that
+   * returns the runtime to the minimum thread count after a burst clears.
+   */
+  void RetireWorker(Worker *worker);
+
+  /** Interval between monitor-thread LoadBalance() ticks. */
+  static constexpr u32 kMonitorPeriodMs = 500;
+
  private:
+  /** Monitor-thread body: LoadBalance() loop on a kMonitorPeriodMs cadence. */
+  void MonitorLoop();
+
   /**
    * Spawn worker threads using CTP thread model
    * @return true if spawning successful, false otherwise
@@ -196,6 +232,10 @@ class WorkOrchestrator {
   // CTP threads (will be filled during initialization)
   std::vector<ctp::thread::Thread> worker_threads_;
   ctp::thread::ThreadGroup thread_group_;
+
+  // issue #781: dedicated monitor thread (not a worker) that drives LoadBalance.
+  std::thread monitor_thread_;
+  std::atomic<bool> monitor_running_{false};
 
   // Scheduler pointer (owned by IpcManager, not WorkOrchestrator)
   Scheduler *scheduler_;

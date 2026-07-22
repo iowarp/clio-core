@@ -197,13 +197,13 @@ struct ClientShmInfo {
 class IpcManagerTls {
  public:
   ctp::lbm::EventManager event_manager_;
-#if CTP_IS_HOST
-  // This thread's named MPSC SHM receive server "clio-<tid>" (issue #642).
-  // Producers (clients / other runtimes) connect to it by name to deliver task
-  // bytes; Worker::Run drains it with DONTWAIT. Host-only (drives OS shm).
-  ctp::lbm::ShmMpscTransport shm_server_;
-  bool shm_server_ok_ = false;
-#endif
+
+  // NOTE (SHM refactor): the per-thread MPSC receive server ("clio-<pid>-<tid>")
+  // that used to live here is gone. The runtime now owns ONE inbound ring
+  // (IpcManager::shm_in_server_) and each client owns ONE response ring
+  // (IpcManager::shm_out_server_), mirroring the ZMQ model. Only the
+  // EventManager remains per-thread — it registers this thread's named (pid,tid)
+  // signal event so a completer (the client shm/zmq recv thread) can wake it.
 
   IpcManagerTls() {
     // Register the named signal event for the CURRENT thread's (pid, tid) so a
@@ -211,14 +211,6 @@ class IpcManagerTls {
     // owning thread (it does — GetTls creates it on first call from that
     // thread).
     event_manager_.AddSignalEvent();
-#if CTP_IS_HOST
-    // pid+tid so a client thread's server can't collide with a runtime worker's
-    // that happens to share a tid in another process. Producers form the same
-    // name from the worker PIDs (Admin::ClientConnect) + the target tid.
-    shm_server_ok_ = shm_server_.ServerInit(
-        "clio-" + std::to_string(ctp::SystemInfo::GetPid()) + "-" +
-        std::to_string(ctp::SystemInfo::GetTid()));
-#endif
   }
 };
 
@@ -879,6 +871,36 @@ class IpcManager {
   void RecvZmqClientThread();
 
   /**
+   * Client-side thread that drains the single per-process SHM response ring
+   * (shm_out_server_) in SHM mode. Demuxes each response by net_key against
+   * pending_zmq_futures_, parks the archive in pending_response_archives_,
+   * marks the client task complete, and wakes the waiting thread via
+   * EventManager::Signal — the SHM analogue of RecvZmqClientThread.
+   */
+  void RecvShmClientThread();
+
+  /**
+   * Runtime-side thread that drains the single inbound SHM ring
+   * (shm_in_server_) in SHM mode, deserializing each client task and pushing it
+   * onto a scheduler-chosen worker lane via IpcCpu2Cpu::RecvIn. The server-side
+   * analogue of the ZMQ path's ClientRecvThread, and the reason no worker or
+   * scheduler needs to know the ring exists: this thread IS the ring's single
+   * consumer.
+   */
+  void RecvShmServerThread();
+
+  /**
+   * Start RecvShmServerThread. Called once from the admin ChiMod's Create,
+   * next to IpcManagerRun2Run::StartRecvThreads — by then the pool manager,
+   * task queue and scheduler the thread pushes into all exist. No-op unless
+   * this process is a SHM-mode runtime with a live inbound ring.
+   */
+  void StartShmServerRecvThread();
+
+  /** Stop and join RecvShmServerThread. Idempotent; safe if never started. */
+  void StopShmServerRecvThread();
+
+  /**
    * Clean up a response archive and its zmq_msg_t handles
    * Called from Future::Destroy() to free zero-copy recv buffers
    * @param net_key Net key (client_task_vaddr_) used as map key
@@ -1369,11 +1391,27 @@ class IpcManager {
   // server ("clio-<runtime_pid_>-<worker_tid>").
   std::vector<u32> worker_tids_;
 #if CTP_IS_HOST
-  // Cached MPSC client connections keyed by server name ("clio-<pid>-<tid>"):
-  // clients → worker servers, and the runtime → client servers for responses.
+  // Cached MPSC client connections keyed by server name: the client's
+  // connection to the runtime's single inbound ring ("clio-<runtime_pid>-shm-in")
+  // and the runtime's connections to each client's response ring
+  // ("clio-<client_pid>-shm-out").
   std::unordered_map<std::string, std::unique_ptr<ctp::lbm::ShmMpscTransport>>
       shm_conns_;
   std::mutex shm_conns_mutex_;
+
+  // The single named MPSC receive rings that replace the old per-thread servers.
+  // Runtime: shm_in_server_ ("clio-<runtime_pid>-shm-in", ~128MB) receives every
+  //   client's serialized tasks; drained by the dedicated RecvShmServerThread
+  //   (see IpcCpu2Cpu::RecvIn), which fans them out to worker lanes.
+  // Client: shm_out_server_ ("clio-<client_pid>-shm-out", ~1MB) receives this
+  //   process's task responses; drained by the dedicated shm recv thread
+  //   (RecvShmClientThread), which demuxes by net_key and wakes waiters. This
+  //   mirrors the ZMQ model (one recv path, event-woken waiters) instead of
+  //   clients load-balancing across per-worker rings.
+  ctp::lbm::ShmMpscTransport shm_in_server_;
+  bool shm_in_server_ok_ = false;
+  ctp::lbm::ShmMpscTransport shm_out_server_;
+  bool shm_out_server_ok_ = false;
 
  public:
   /** Get (or lazily create) a cached MPSC client connection to `name`. Returns
@@ -1441,6 +1479,18 @@ class IpcManager {
   // Client recv thread (receives completed task outputs via lightbeam)
   std::thread zmq_recv_thread_;
   std::atomic<bool> zmq_recv_running_{false};
+
+  // Client SHM recv thread (SHM mode): drains shm_out_server_ (the single
+  // per-process response ring) and wakes waiters, mirroring RecvZmqClientThread.
+  std::thread shm_recv_thread_;
+  std::atomic<bool> shm_recv_running_{false};
+
+  // Runtime SHM recv thread (SHM mode): drains shm_in_server_ (the single
+  // inbound ring) and pushes tasks onto worker lanes, mirroring the ZMQ path's
+  // ClientRecvThread. Owning the drain here — rather than on a designated
+  // worker — is what keeps the schedulers and Worker free of transport state.
+  std::thread shm_in_recv_thread_;
+  std::atomic<bool> shm_in_recv_running_{false};
 
   // Background heartbeat thread for server liveness detection
   std::thread heartbeat_thread_;
@@ -1798,8 +1848,13 @@ CTP_HOST_FUN Future<TaskT, AllocT>::~Future() {
       TaskT *t = TaskRaw();
       if (!fs.IsNull() && t != nullptr &&
           (fs->origin_ == ClientOrigin::kClientTcp ||
-           fs->origin_ == ClientOrigin::kClientIpc)) {
+           fs->origin_ == ClientOrigin::kClientIpc ||
+           fs->origin_ == ClientOrigin::kClientShm)) {
         // Response archive is keyed by the client's net_key (task vaddr).
+        // kClientShm parks archives in pending_response_archives_ too (via
+        // RecvShmClientThread), so a future dropped without a Recv would
+        // otherwise leak its parked archive. RecvOut already erases the entry on
+        // the consumed path, so this is a no-op there.
         CLIO_CPU_IPC->CleanupResponseArchive(t->task_id_.net_key_);
       }
       FutureShmSetNull();

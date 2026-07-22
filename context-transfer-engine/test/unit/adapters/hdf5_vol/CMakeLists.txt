@@ -109,7 +109,21 @@ if(NOT WIN32)
       PROPERTIES
           TIMEOUT 300
           LABELS "unit;adapter;hdf5_vol;cte"
-          ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1"
+          # HDF5_USE_FILE_LOCKING=FALSE: these tests close a file and
+          # immediately reopen it. H5Fclose() returns success before the
+          # OS-level flock is released, so the reopen intermittently fails on
+          # macOS with:
+          #   H5FD__sec2_lock(): unable to lock file, errno = 35,
+          #                      'Resource temporarily unavailable'
+          # Each test owns its own .h5 path and is single-writer, so the lock
+          # buys nothing here; it only adds a race.
+          #
+          # CAVEAT: this is a mitigation, not a root-cause fix. The holder of
+          # the lingering descriptor was not identified, and one candidate is
+          # the clio VOL connector keeping a runtime-side handle open past
+          # H5Fclose(). If that is real, disabling the lock hides it rather
+          # than fixing it -- worth chasing separately.
+          ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/bin:$ENV{LD_LIBRARY_PATH};CLIO_BIND_ADDR=127.0.0.1;HDF5_USE_FILE_LOCKING=FALSE"
   )
 endif()
 

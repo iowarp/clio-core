@@ -140,9 +140,27 @@ class BdevLeakStressFixture {
 
 static BdevLeakStressFixture *g_fixture = nullptr;
 
-// Query the bdev target's remaining allocatable bytes via the CTE client.
+/**
+ * Query the bdev target's remaining allocatable bytes via the CTE client.
+ *
+ * GetTargetInfo does NOT query the allocator — it returns the cached
+ * TargetInfo::remaining_space_, which is only refreshed when a StatTargets
+ * task runs. That task is periodic at config_.performance_.stat_targets_
+ * period_ms_, default *5000 ms*. Reading GetTargetInfo on its own therefore
+ * reports whatever the allocator looked like up to five seconds ago.
+ *
+ * So force a one-shot StatTargets and wait for it before reading. Without
+ * this, the value below is a stale snapshot and any leak assertion built on
+ * it is a coin flip.
+ */
 static clio::run::u64 TargetRemaining() {
   auto *cte = CLIO_CTE_CLIENT;
+  // period_ms = 0 -> one-shot: refresh the cache now rather than waiting for
+  // the next periodic tick.
+  auto refresh = cte->AsyncStatTargets();
+  refresh.Wait();
+  REQUIRE(refresh->GetReturnCode() == 0);
+
   auto info = cte->AsyncGetTargetInfo(kTargetName);
   info.Wait();
   REQUIRE(info->GetReturnCode() == 0);
@@ -151,6 +169,36 @@ static clio::run::u64 TargetRemaining() {
 
 // Poll the runtime-heap counter until it stops changing (so async server-side
 // frees that lag the client's Wait() have settled), or a short bound elapses.
+/**
+ * Read the bdev target's remaining bytes, waiting for it to stop moving first.
+ *
+ * DelBlob's block free completes asynchronously, so sampling immediately after
+ * the loop can catch the tail of the last cycle still in flight.
+ *
+ * Mirrors StabilizeRuntimeHeap: poll until two consecutive reads agree, with a
+ * bounded wait so a genuine leak still fails rather than hanging. This is only
+ * meaningful because TargetRemaining() forces a StatTargets refresh per read —
+ * polling the cached value alone would "stabilize" instantly on a stale number
+ * that nothing was updating, since the periodic refresh (5 s) is far longer
+ * than this loop's 1 s bound.
+ *
+ * NOTE: an earlier revision of this comment claimed the Windows force-net
+ * failure was simply this settling race, with a "constant 65536-byte residue"
+ * as the tell. That was wrong — adding the stabilize loop did not fix it (see
+ * issue #791). The stale-cache problem described above is a real defect in how
+ * this test measures, but whether it fully accounts for #791 is unconfirmed.
+ */
+static clio::run::u64 StabilizeTargetRemaining() {
+  clio::run::u64 prev = TargetRemaining();
+  for (int i = 0; i < 50; ++i) {  // up to ~1 s
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    clio::run::u64 cur = TargetRemaining();
+    if (cur == prev) return cur;
+    prev = cur;
+  }
+  return prev;
+}
+
 static size_t StabilizeRuntimeHeap() {
   auto *ipc = CLIO_IPC;
   size_t prev = ipc->GetRuntimeHeapAllocatedBytes();
@@ -197,7 +245,7 @@ TEST_CASE("BdevLeakStress - PutBlob/DelBlob loop leaves no leaks",
     REQUIRE(del->GetReturnCode() == 0);
   }
 
-  const clio::run::u64 remaining_before = TargetRemaining();
+  const clio::run::u64 remaining_before = StabilizeTargetRemaining();
   const size_t heap_before = StabilizeRuntimeHeap();
 
   INFO("Baseline: bdev remaining=" << remaining_before
@@ -209,6 +257,14 @@ TEST_CASE("BdevLeakStress - PutBlob/DelBlob loop leaves no leaks",
   long iters = 0;
   int put_fail = 0;
   int del_fail = 0;
+  // Sampled once, after the very first completed cycle. If a residue is
+  // present here it is a one-time cost paid at loop entry; if it only shows
+  // up in the final reading it accrues later. Issue #791 sees a residue of
+  // exactly 65536 on Windows whose origin is not yet identified, and this
+  // narrows where to look without needing another CI round-trip. Sampled
+  // once rather than per-iteration because TargetRemaining() now forces a
+  // StatTargets round-trip and would otherwise distort the loop.
+  clio::run::u64 remaining_after_first = 0;
 
   while (std::chrono::steady_clock::now() < deadline) {
     auto put = tag.AsyncPutBlob(blob_name, shm_ptr, kBlobSize, 0, 1.0f);
@@ -229,12 +285,16 @@ TEST_CASE("BdevLeakStress - PutBlob/DelBlob loop leaves no leaks",
       break;
     }
     ++iters;
+    if (iters == 1) remaining_after_first = TargetRemaining();
   }
 
   CLIO_IPC->FreeBuffer(shm);
 
-  // Let any trailing async frees settle before measuring.
-  const clio::run::u64 remaining_after = TargetRemaining();
+  // Let any trailing async frees settle before measuring. This MUST stabilize
+  // rather than sample once: the previous code took this reading before
+  // StabilizeRuntimeHeap() ran, so nothing had actually settled despite the
+  // comment saying so.
+  const clio::run::u64 remaining_after = StabilizeTargetRemaining();
   const size_t heap_after = StabilizeRuntimeHeap();
 
   const clio::run::u64 bdev_used =
@@ -246,6 +306,9 @@ TEST_CASE("BdevLeakStress - PutBlob/DelBlob loop leaves no leaks",
   INFO("Completed " << iters << " Put/Del cycles ("
        << (static_cast<double>(iters) * kBlobSize / (1024.0 * 1024.0))
        << " MiB cumulative); bdev_used_after=" << bdev_used
+       << " remaining_before=" << remaining_before
+       << " remaining_after_first_cycle=" << remaining_after_first
+       << " remaining_after=" << remaining_after
        << " runtime_heap_growth=" << heap_growth
        << " allocator_leak_checker_total="
        << ctp::ipc::AllocatorLeakChecker::Get().TotalLeakedBytes());

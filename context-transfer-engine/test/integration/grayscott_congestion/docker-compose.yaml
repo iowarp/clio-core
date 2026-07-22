@@ -1,0 +1,103 @@
+# Gray-Scott L=512 congestion-collapse repro cluster (issue #774).
+#
+# Two nodes, one clio daemon each (4 worker threads — Delta parity), both
+# running the SYMMETRIC producer from test_grayscott_congestion.cc. Payload
+# scale comes from GS_BLOB_KB / GS_BLOBS / GS_OUTPUTS (exported by
+# run_tests.sh): the L=256 analog must complete; the L=512 analog is expected
+# to hit the throughput cliff (STALL, exit 42).
+
+services:
+  gs-node1:
+    image: ${IOWARP_DOCKER_IMAGE:-iowarp/deps-cpu:latest}
+    security_opt:
+      - seccomp:unconfined
+    container_name: gs-congest-node1
+    hostname: iowarp-node1
+    networks:
+      gs-cluster:
+        ipv4_address: 172.30.0.10
+    volumes:
+      - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-/workspace}}:/workspace:rw
+    tmpfs:
+      - /mnt:mode=1777
+    environment:
+      - NODE_ID=1
+      - NODE_IP=172.30.0.10
+      - CLIO_SERVER_CONF=/workspace/context-transfer-engine/test/integration/grayscott_congestion/clio_config.yaml
+      - CONTAINER_HOSTFILE=/workspace/context-transfer-engine/test/integration/grayscott_congestion/hostfile
+      - CLIO_WITH_RUNTIME=0
+      - GS_NODE_ID=1
+      - GS_BLOB_KB=${GS_BLOB_KB:-512}
+      - GS_BLOBS=${GS_BLOBS:-64}
+      - GS_OUTPUTS=${GS_OUTPUTS:-3}
+      - GS_GET_PASSES=${GS_GET_PASSES:-2}
+      - GS_OUTPUT_TIMEOUT_SEC=${GS_OUTPUT_TIMEOUT_SEC:-300}
+      - PATH=/workspace/build/bin:/usr/local/bin:/usr/bin:/bin
+      - LD_LIBRARY_PATH=/workspace/build/bin:/usr/local/cuda/lib64:/usr/local/lib
+    mem_limit: 8g
+    working_dir: /workspace
+    entrypoint: [ "/bin/bash", "-c" ]
+    command: >
+      "
+        set -x &&
+        echo 'gs-node1: starting Clio runtime' &&
+        /workspace/build/bin/clio_run runtime start &
+        RUNTIME_PID=$$! &&
+        sleep 6 &&
+        echo 'gs-node1: running congestion producer' &&
+        /workspace/build/bin/test_grayscott_congestion
+        EXIT=$$? &&
+        echo \"gs-node1: producer exit $$EXIT\" &&
+        exit $$EXIT
+      "
+
+  gs-node2:
+    image: ${IOWARP_DOCKER_IMAGE:-iowarp/deps-cpu:latest}
+    security_opt:
+      - seccomp:unconfined
+    container_name: gs-congest-node2
+    hostname: iowarp-node2
+    networks:
+      gs-cluster:
+        ipv4_address: 172.30.0.11
+    volumes:
+      - ${HOST_WORKSPACE:-${IOWARP_CORE_ROOT:-/workspace}}:/workspace:rw
+    tmpfs:
+      - /mnt:mode=1777
+    environment:
+      - NODE_ID=2
+      - NODE_IP=172.30.0.11
+      - CLIO_SERVER_CONF=/workspace/context-transfer-engine/test/integration/grayscott_congestion/clio_config.yaml
+      - CONTAINER_HOSTFILE=/workspace/context-transfer-engine/test/integration/grayscott_congestion/hostfile
+      - CLIO_WITH_RUNTIME=0
+      - GS_NODE_ID=2
+      - GS_BLOB_KB=${GS_BLOB_KB:-512}
+      - GS_BLOBS=${GS_BLOBS:-64}
+      - GS_OUTPUTS=${GS_OUTPUTS:-3}
+      - GS_GET_PASSES=${GS_GET_PASSES:-2}
+      - GS_OUTPUT_TIMEOUT_SEC=${GS_OUTPUT_TIMEOUT_SEC:-300}
+      - PATH=/workspace/build/bin:/usr/local/bin:/usr/bin:/bin
+      - LD_LIBRARY_PATH=/workspace/build/bin:/usr/local/cuda/lib64:/usr/local/lib
+    mem_limit: 8g
+    working_dir: /workspace
+    entrypoint: [ "/bin/bash", "-c" ]
+    command: >
+      "
+        set -x &&
+        echo 'gs-node2: starting Clio runtime' &&
+        /workspace/build/bin/clio_run runtime start &
+        RUNTIME_PID=$$! &&
+        sleep 6 &&
+        echo 'gs-node2: running congestion producer' &&
+        /workspace/build/bin/test_grayscott_congestion
+        EXIT=$$? &&
+        echo \"gs-node2: producer exit $$EXIT\" &&
+        exit $$EXIT
+      "
+
+networks:
+  gs-cluster:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24

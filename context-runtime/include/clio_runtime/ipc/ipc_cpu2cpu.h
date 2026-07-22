@@ -25,15 +25,19 @@ struct IpcCpu2Cpu {
                               const clio::run::shared_ptr<TaskT> &task_ptr);
 
   /**
-   * Drain this worker thread's named MPSC SHM receive server (clio-<pid>-<tid>,
-   * DONTWAIT). If a client task is waiting, deserialize it, build a server-side
-   * FutureShm carrying the client's response identity, and push the resulting
-   * Future onto `lane` for the normal dispatch path. Keeps all task/future
-   * deserialization off the worker. Must run on the worker's own thread (the
-   * per-thread server is keyed by tid).
-   * @return true if a task was received and enqueued (the caller did work).
+   * Drain one message from the runtime's single inbound MPSC SHM ring
+   * (IpcManager::shm_in_server_, DONTWAIT). If a client task is waiting,
+   * deserialize it, build a server-side FutureShm carrying the client's
+   * response identity, pick a worker lane via Scheduler::ClientMapTask, and
+   * push the Future there for the normal dispatch path.
+   *
+   * Called ONLY from IpcManager::RecvShmServerThread — a dedicated non-worker
+   * thread, exactly like the ZMQ path's ClientRecvThread. The ring is
+   * single-consumer, so that one caller is the whole contract; no worker or
+   * scheduler involvement is needed to establish it.
+   * @return true if a task was received and enqueued.
    */
-  static bool RecvIn(IpcManager *ipc, TaskLane *lane);
+  static bool RecvIn(IpcManager *ipc);
 
   /** Deserialize task from SHM ring buffer on runtime side (inbound). */
   static clio::run::shared_ptr<clio::run::Task> RecvIn(

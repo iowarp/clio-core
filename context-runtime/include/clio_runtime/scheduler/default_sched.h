@@ -40,6 +40,10 @@
 
 #include "clio_runtime/scheduler/scheduler.h"
 
+#include <array>
+#include <atomic>
+#include <vector>
+
 namespace clio::run {
 
 /**
@@ -59,10 +63,11 @@ class DefaultScheduler : public Scheduler {
   ~DefaultScheduler() override = default;
 
   void DivideWorkers(WorkOrchestrator *work_orch) override;
-  u32 ClientMapTask(IpcManager *ipc_manager, const Future<Task> &task) override;
   u32 RuntimeMapTask(Worker *worker, const Future<Task> &task,
                      ContainerHold container) override;
-  void RebalanceWorker(Worker *worker) override;
+  void LoadBalance() override;         // issue #781 — safety net, every 500ms
+  bool StealWork(Worker *thief) override;  // issue #781 — work-conserving steal
+  void RecordCompletion(u32 method, double cpu_us, double wall_us) override;
   void AdjustPolling(const clio::run::shared_ptr<Task> &task) override;
   Worker *GetGpuWorker() const override { return gpu_worker_; }
   // Legacy alias — admin_runtime.cc:Create registers transport FDs with the
@@ -75,6 +80,29 @@ class DefaultScheduler : public Scheduler {
 
  private:
   static constexpr size_t kLargeIOThreshold = 4096;  ///< I/O size threshold
+  static constexpr double kStallThresholdSec = 1.0;  ///< #781: worker stall cutoff
+  static constexpr double kRetireCooldownSec = 5.0;  ///< #781: idle elastic retire
+  static constexpr u32 kStealBatch = 4;              ///< #781: tasks stolen per victim
+
+  /// #781 telemetry-only histogram of completed-task exec times. NOT used for
+  /// routing (routing uses measured realtime load, not predictions).
+  enum PerfBin {
+    kLt10us = 0, kLt50us, kLt500us, kLt10ms, kLt50ms, kLt500ms, kLt1s, kGe1s,
+    kNumPerfBins
+  };
+  static PerfBin BinFor(double exec_us) {
+    if (exec_us < 10) return kLt10us;
+    if (exec_us < 50) return kLt50us;
+    if (exec_us < 500) return kLt500us;
+    if (exec_us < 10000) return kLt10ms;
+    if (exec_us < 50000) return kLt50ms;
+    if (exec_us < 500000) return kLt500ms;
+    if (exec_us < 1000000) return kLt1s;
+    return kGe1s;
+  }
+  std::array<std::atomic<u64>, kNumPerfBins> perf_pdf_{};  ///< #781 telemetry
+  std::atomic<u64> load_balance_ticks_{0};  ///< #781 monitor ticks observed
+  std::atomic<u64> stalls_detected_{0};     ///< #781 cumulative stall events
 
   Worker *scheduler_worker_;              ///< Worker 0: metadata + small I/O
   std::vector<Worker *> io_workers_;      ///< Workers 1..N-3: large I/O
@@ -82,6 +110,7 @@ class DefaultScheduler : public Scheduler {
   Worker *net_recv_worker_;               ///< Worker N-1: kRecv / kClientRecv
   Worker *gpu_worker_;                    ///< GPU queue polling worker
   std::atomic<u32> next_io_idx_{0};       ///< Round-robin index for I/O workers
+  WorkOrchestrator *work_orch_ = nullptr; ///< #781 set in DivideWorkers; elastic spawn
 };
 
 }  // namespace clio::run

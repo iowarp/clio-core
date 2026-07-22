@@ -120,6 +120,78 @@ fi
 # Core function: build and/or run memcheck for one sanitizer mode
 ################################################################################
 
+# Write what the sanitizer actually found into the GitHub step summary.
+#
+# These jobs are non-gating by construction: the ctest invocation is followed by
+# `|| true` and this script ends with `exit 0`, so a sanitizer finding can never
+# turn a job red. That is not obviously wrong -- ubsan currently flags 151 of
+# 259 tests, and flipping the jobs to gating today would simply pin CI red --
+# but it does mean the findings are invisible unless somebody opens the raw log
+# and knows what to grep for. Nobody does, so nothing gets triaged.
+#
+# This prints the ctest pass/fail line, the per-test defect counts, and a sample
+# of the actual sanitizer messages from the MemoryChecker output files, which
+# otherwise only reach CDash. Purely additive: no job changes colour. Issue #803
+# tracks triaging the backlog and then ratcheting these to gating.
+emit_findings_summary() {
+    local MODE="$1"
+    local CTEST_LOG="$2"
+
+    # Local runs have no step summary; do nothing rather than fail.
+    [ -n "${GITHUB_STEP_SUMMARY:-}" ] || return 0
+    [ -f "${CTEST_LOG}" ] || return 0
+
+    {
+        echo "## Sanitizer findings: ${MODE}"
+        echo ""
+
+        local SUMMARY_LINE
+        SUMMARY_LINE=$(grep -oE "[0-9]+% tests passed, [0-9]+ tests failed out of [0-9]+" \
+                       "${CTEST_LOG}" | tail -1 || true)
+        echo "${SUMMARY_LINE:-(no ctest summary line found)}"
+        echo ""
+
+        local DEFECT_COUNT
+        DEFECT_COUNT=$(grep -c "Defects: " "${CTEST_LOG}" || true)
+        echo "Tests reporting defects: ${DEFECT_COUNT:-0}"
+        echo ""
+        echo "> These jobs are non-gating: this is a report, not a gate (issue #803)."
+        echo ""
+
+        if [ "${DEFECT_COUNT:-0}" != "0" ]; then
+            echo "<details><summary>Tests with defects</summary>"
+            echo ""
+            echo '```'
+            grep -E "Defects: [0-9]+" "${CTEST_LOG}" | sed 's/^[0-9]*: //' | head -60 || true
+            echo '```'
+            echo ""
+            echo "</details>"
+            echo ""
+        fi
+
+        # The per-defect detail lives in the MemoryChecker files, not stdout, so
+        # the console alone cannot tell you WHAT the undefined behaviour was.
+        # Surface a sample so a reader can judge real-vs-artifact without
+        # fetching anything from CDash.
+        local MEMCHECK_DIR="${BUILD_DIR}/Testing/Temporary"
+        if compgen -G "${MEMCHECK_DIR}/MemoryChecker.*.log" > /dev/null 2>&1; then
+            echo "<details><summary>Sample sanitizer messages</summary>"
+            echo ""
+            echo '```'
+            grep -hoE "(runtime error: .*|ERROR: [A-Za-z]+Sanitizer: .*|SUMMARY: [A-Za-z]+Sanitizer: .*)" \
+                 "${MEMCHECK_DIR}"/MemoryChecker.*.log 2>/dev/null \
+                 | sort | uniq -c | sort -rn | head -40 || true
+            echo '```'
+            echo ""
+            echo "</details>"
+        else
+            echo "_No MemoryChecker output files found under ${MEMCHECK_DIR}._"
+        fi
+    } >> "${GITHUB_STEP_SUMMARY}" 2>/dev/null || true
+
+    return 0
+}
+
 run_sanitizer_mode() {
     local MODE="$1"          # asan | ubsan | msan | sanitize
     local MEMCHECK_TYPE="$2" # AddressSanitizer | UndefinedBehaviorSanitizer | MemorySanitizer
@@ -227,8 +299,13 @@ EOFCMAKE
     fi
 
     cd "${BUILD_DIR}"
-    ctest -S "${DASHBOARD_SCRIPT}" -VV || true
+    local CTEST_LOG="${BUILD_DIR}/sanitizer-ctest-${MODE}.log"
+    # `|| true` keeps this non-gating -- see emit_findings_summary() for why
+    # that is deliberate for now, and issue #803 for the plan to change it.
+    ctest -S "${DASHBOARD_SCRIPT}" -VV 2>&1 | tee "${CTEST_LOG}" || true
     cd "${REPO_ROOT}"
+
+    emit_findings_summary "${MODE}" "${CTEST_LOG}"
 
     print_success "Done: ${MODE}"
     echo ""

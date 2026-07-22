@@ -40,8 +40,11 @@
  * - Round-trip latency using MOD_NAME Custom function
  */
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
+#include <random>
 #include <cstring>
 #include <filesystem>
 #include <iomanip>
@@ -76,7 +79,8 @@ enum class TestCase {
   kBDevIO,         // Full I/O (Allocate -> Write -> Free)
   kBDevAllocation, // Allocation only (Allocate -> Free)
   kBDevTaskAlloc,  // Task allocation/deletion (NewTask -> DelTask)
-  kLatency         // Round-trip latency using MOD_NAME Custom
+  kLatency,        // Round-trip latency using MOD_NAME Custom
+  kSchedVariety    // issue #781: mixed 1us..1s compute; p99 by class (starvation)
 };
 
 /**
@@ -111,6 +115,9 @@ bool ParseTestCase(const std::string &str, TestCase &test_case) {
   } else if (str == "latency") {
     test_case = TestCase::kLatency;
     return true;
+  } else if (str == "sched_variety") {
+    test_case = TestCase::kSchedVariety;
+    return true;
   }
   return false;
 }
@@ -124,7 +131,7 @@ bool ParseArgs(int argc, char **argv, BenchmarkConfig &config) {
 
     if (arg == "--test-case" && i + 1 < argc) {
       if (!ParseTestCase(argv[++i], config.test_case)) {
-        HLOG(kError, "ERROR: Invalid test case. Valid options: bdev_io, bdev_allocation, bdev_task_alloc, latency");
+        HLOG(kError, "ERROR: Invalid test case. Valid options: bdev_io, bdev_allocation, bdev_task_alloc, latency, sched_variety");
         return false;
       }
     } else if (arg == "--threads" && i + 1 < argc) {
@@ -144,7 +151,7 @@ bool ParseArgs(int argc, char **argv, BenchmarkConfig &config) {
     } else if (arg == "--help" || arg == "-h") {
       HIPRINT("Usage: {} [options]", argv[0]);
       HIPRINT("Options:");
-      HIPRINT("  --test-case <case>      Test case: bdev_io, bdev_allocation, bdev_task_alloc, latency (default: bdev_io)");
+      HIPRINT("  --test-case <case>      Test case: bdev_io, bdev_allocation, bdev_task_alloc, latency, sched_variety (default: bdev_io)");
       HIPRINT("  --threads <N>           Number of client threads (default: 4)");
       HIPRINT("  --duration <seconds>    Duration to run benchmark in seconds (default: 10.0)");
       HIPRINT("  --max-file-size <size>  Maximum file size with suffix: k, m, g (default: 1g)");
@@ -447,6 +454,87 @@ void LatencyWorkerThread(size_t thread_id, const BenchmarkConfig &config,
   }
 }
 
+// ===========================================================================
+// issue #781: scheduler-variety benchmark. Each client thread submits a stream
+// of Custom tasks whose compute time (spin_us) is drawn from a mixed 1us..1s
+// distribution (mostly quick, a few heavy/mislabeled). We record every request's
+// round-trip latency and its class, then report avg / p50 / p99 / max PER CLASS.
+// The headline metric is QUICK-class p99: with a scheduler that funnels quick
+// tasks behind heavy ones it explodes; the anti-deadlock scheduler keeps it low.
+// ===========================================================================
+
+struct VarietySample {
+  clio::run::u32 spin_us;
+  double lat_us;
+};
+
+enum VarietyClass { kQuick = 0, kMedium, kHeavy, kNumVarietyClasses };
+static VarietyClass ClassOf(clio::run::u32 spin_us) {
+  if (spin_us < 100) return kQuick;      // < 100 us
+  if (spin_us < 10000) return kMedium;   // 100 us .. 10 ms
+  return kHeavy;                         // >= 10 ms
+}
+static const char *ClassName(int c) {
+  switch (c) {
+  case kQuick: return "quick  (<100us)   ";
+  case kMedium: return "medium (100us-10ms)";
+  default: return "heavy  (>=10ms)   ";
+  }
+}
+// v must be pre-sorted ascending.
+static double Pctl(const std::vector<double> &v, double p) {
+  if (v.empty()) return 0.0;
+  size_t idx = static_cast<size_t>(p * (v.size() - 1) + 0.5);
+  if (idx >= v.size()) idx = v.size() - 1;
+  return v[idx];
+}
+
+// Log-uniform draw within a mixed distribution: 90% quick, 9% medium, 1% heavy.
+static clio::run::u32 DrawSpinUs(std::mt19937 &rng) {
+  std::uniform_real_distribution<double> u(0.0, 1.0);
+  double r = u(rng), lo, hi;
+  if (r < 0.01) { lo = 10000; hi = 2000000; }        // heavy  10ms..2s (some >1s
+                                                      // to exercise stall detect)
+  else if (r < 0.10) { lo = 100; hi = 10000; }       // medium 100us..10ms
+  else { lo = 1; hi = 100; }                          // quick  1us..100us
+  double e = std::log(lo) + u(rng) * (std::log(hi) - std::log(lo));
+  clio::run::u32 s = static_cast<clio::run::u32>(std::exp(e));
+  return s == 0 ? 1 : s;
+}
+
+void SchedVarietyWorkerThread(size_t thread_id, const BenchmarkConfig &config,
+                              clio::run::PoolId pool_id,
+                              std::atomic<bool> &stop_flag,
+                              std::atomic<size_t> &completed_ops,
+                              std::vector<VarietySample> &out) {
+  clio::run::MOD_NAME::Client mod_client(pool_id);
+  std::mt19937 rng(static_cast<uint32_t>(0x9e3779b9u ^
+                                         (thread_id * 2654435761u)));
+  std::string input_data = "v";
+  out.reserve(1 << 16);
+  size_t local_ops = 0;
+  while (!stop_flag.load(std::memory_order_relaxed)) {
+    clio::run::u32 spin_us = DrawSpinUs(rng);
+    auto t0 = std::chrono::high_resolution_clock::now();
+    auto task = mod_client.AsyncCustom(clio::run::PoolQuery::Broadcast(),
+                                       input_data, 0, spin_us);
+    task.Wait();
+    auto t1 = std::chrono::high_resolution_clock::now();
+    if (task->return_code_ != 0) {
+      HLOG(kError, "variety: thread {} rc={}", thread_id, task->return_code_);
+      stop_flag.store(true, std::memory_order_relaxed);
+      break;
+    }
+    double lat_us =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count() /
+        1e3;
+    out.push_back({spin_us, lat_us});
+    local_ops++;
+  }
+  completed_ops.fetch_add(local_ops, std::memory_order_relaxed);
+  (void)config;
+}
+
 int main(int argc, char **argv) {
   BenchmarkConfig config;
 
@@ -496,8 +584,9 @@ int main(int argc, char **argv) {
 
   // Create pool based on test case
   clio::run::PoolId test_pool_id;
-  if (config.test_case == TestCase::kLatency) {
-    // Create MOD_NAME container for latency test
+  if (config.test_case == TestCase::kLatency ||
+      config.test_case == TestCase::kSchedVariety) {
+    // Create MOD_NAME container for latency / scheduler-variety tests (#781)
     test_pool_id = clio::run::PoolId(8000, 0);
     clio::run::MOD_NAME::Client mod_client(test_pool_id);
     auto create_task = mod_client.AsyncCreate(clio::run::PoolQuery::Broadcast(),
@@ -568,6 +657,9 @@ int main(int argc, char **argv) {
   // Storage for per-thread elapsed times
   std::vector<std::chrono::nanoseconds> thread_times(config.num_threads);
 
+  // issue #781: per-thread latency samples for the variety benchmark
+  std::vector<std::vector<VarietySample>> variety_samples(config.num_threads);
+
   // Spawn worker threads
   std::vector<std::thread> threads;
   threads.reserve(config.num_threads);
@@ -608,6 +700,16 @@ int main(int argc, char **argv) {
       threads.emplace_back(LatencyWorkerThread, i, std::ref(config),
                            test_pool_id, std::ref(stop_flag),
                            std::ref(completed_ops), std::ref(thread_times[i]));
+    }
+    break;
+
+  case TestCase::kSchedVariety:
+    // issue #781: mixed-compute workers, each recording per-request samples
+    for (size_t i = 0; i < config.num_threads; i++) {
+      threads.emplace_back(SchedVarietyWorkerThread, i, std::ref(config),
+                           test_pool_id, std::ref(stop_flag),
+                           std::ref(completed_ops),
+                           std::ref(variety_samples[i]));
     }
     break;
   }
@@ -679,6 +781,38 @@ int main(int argc, char **argv) {
     HIPRINT("Throughput: {} Custom ops/sec", throughput);
     HIPRINT("Avg round-trip latency: {} us/op", avg_latency_us);
     break;
+
+  case TestCase::kSchedVariety: {
+    // issue #781: bucket every request by its requested compute class and report
+    // avg / p50 / p99 / max round-trip latency per class. QUICK p99 is the
+    // starvation metric — how badly quick tasks are delayed by heavy ones.
+    std::vector<double> lat[kNumVarietyClasses];
+    for (auto &thread_vec : variety_samples) {
+      for (const auto &s : thread_vec) {
+        lat[ClassOf(s.spin_us)].push_back(s.lat_us);
+      }
+    }
+    // ctp::Formatter supports only plain {} (stream insertion), no specs — round
+    // to 1 decimal so the columns stay readable.
+    auto r1 = [](double x) { return std::round(x * 10.0) / 10.0; };
+    HIPRINT("Throughput: {} Custom ops/sec", throughput);
+    HIPRINT("\n  class                  count   avg_us   p50_us   p99_us   max_us");
+    for (int c = 0; c < kNumVarietyClasses; ++c) {
+      auto &v = lat[c];
+      if (v.empty()) continue;
+      std::sort(v.begin(), v.end());
+      double sum = 0.0;
+      for (double x : v) sum += x;
+      HIPRINT("  {}   {}   {}   {}   {}   {}", ClassName(c), v.size(),
+              r1(sum / v.size()), r1(Pctl(v, 0.50)), r1(Pctl(v, 0.99)),
+              r1(v.back()));
+    }
+    if (!lat[kQuick].empty()) {
+      HIPRINT("\n  >>> STARVATION METRIC: quick-task p99 = {} us (p50 = {} us)",
+              r1(Pctl(lat[kQuick], 0.99)), r1(Pctl(lat[kQuick], 0.50)));
+    }
+    break;
+  }
   }
 
   BENCH_EXIT(0);

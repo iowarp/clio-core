@@ -34,6 +34,9 @@
 // Copyright 2024 IOWarp contributors
 #include "clio_runtime/scheduler/default_sched.h"
 
+#include <chrono>
+#include <cstdlib>
+
 #include "clio_runtime/config_manager.h"
 #include "clio_runtime/container.h"
 #include "clio_runtime/ipc_manager.h"
@@ -43,10 +46,21 @@
 
 namespace clio::run {
 
+// issue #781: steady-clock "now" in microseconds, matching the clock
+// Worker::ExecTask stamps into last_exec_start_us_ so RealtimeLoad/IsStalled
+// compare against the same timebase.
+static inline double NowUs() {
+  return static_cast<double>(
+      std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count());
+}
+
 void DefaultScheduler::DivideWorkers(WorkOrchestrator *work_orch) {
   if (!work_orch) {
     return;
   }
+  work_orch_ = work_orch;  // #781: retained for elastic SpawnAdditionalWorker
 
   u32 total_workers = work_orch->GetTotalWorkerCount();
 
@@ -127,26 +141,10 @@ void DefaultScheduler::DivideWorkers(WorkOrchestrator *work_orch) {
        gpu_worker_ ? (int)gpu_worker_->GetId() : -1);
 }
 
-u32 DefaultScheduler::ClientMapTask(IpcManager *ipc_manager,
-                                    const Future<Task> &task) {
-  u32 num_lanes = ipc_manager->GetNumSchedQueues();
-  if (num_lanes == 0) {
-    return 0;
-  }
-
-  Task *task_ptr = task.get();
-
-  // Network tasks (Send/Recv from admin pool) → last lane
-  if (task_ptr != nullptr && task_ptr->pool_id_ == clio::run::kAdminPoolId) {
-    u32 method_id = task_ptr->method_;
-    if (method_id == 14 || method_id == 15 || method_id == 20 || method_id == 21) {
-      return num_lanes - 1;
-    }
-  }
-
-  // Default: scheduler worker (lane 0)
-  return 0;
-}
+// NOTE (issue #781): ClientMapTask has been removed. Client/recv-thread ingress
+// no longer picks a worker lane directly — tasks are mapped to workers ONLY in
+// the runtime (RuntimeMapTask via RouteTask). The recv threads now deposit onto
+// the shared ingress lane and the runtime places the task.
 
 u32 DefaultScheduler::RuntimeMapTask(Worker *worker, const Future<Task> &task,
                                       ContainerHold container) {
@@ -208,9 +206,73 @@ u32 DefaultScheduler::RuntimeMapTask(Worker *worker, const Future<Task> &task,
     }
   }
 
-  // Small I/O / metadata → scheduler worker
-  if (selected == nullptr && scheduler_worker_ != nullptr) {
+  // issue #781: measured-load routing for compute / small-I/O / metadata tasks.
+  // Instead of funnelling everything onto the scheduler worker (where one
+  // non-yielding/mislabeled task starves every task behind it), pick the
+  // general-purpose worker with the SMALLEST measured real-time load. A worker
+  // stuck spinning on a heavy task has an enormous RealtimeLoad (load_ + how
+  // long its current task has already run), so new quick tasks are steered away
+  // from it automatically — no cost prediction, no labels. This is the primary
+  // anti-starvation mechanism; LoadBalance() handles any already-queued backlog.
+  // A/B toggle (issue #781 evaluation): CLIO_SCHED_FUNNEL=1 restores the legacy
+  // "everything to the scheduler worker" routing so the sched_variety benchmark
+  // can measure quick-task p99 with vs without measured-load routing. Value-based
+  // (must be "1"/"true") — an unset OR empty/0 value means measured-load routing.
+  static const bool kFunnel = []() {
+    const char *v = std::getenv("CLIO_SCHED_FUNNEL");
+    return v != nullptr && (v[0] == '1' || v[0] == 't' || v[0] == 'T');
+  }();
+  if (selected == nullptr && kFunnel && scheduler_worker_ != nullptr) {
     selected = scheduler_worker_;
+  }
+
+  if (selected == nullptr) {
+    // Build the compute candidate pool. Prefer the dedicated I/O workers so the
+    // scheduler worker (lane 0) stays a pure INGRESS DISPATCHER — a heavy task
+    // executing there would stall the dispatch of every incoming task. Only fall
+    // back to the scheduler worker when there are no I/O workers.
+    Worker *cand[64];
+    u32 n = 0;
+    for (Worker *w : io_workers_) {
+      if (w != nullptr && n < 64) cand[n++] = w;
+    }
+    if (n == 0 && scheduler_worker_ != nullptr) cand[n++] = scheduler_worker_;
+    if (n > 0) {
+      double now_us = NowUs();
+      // Scan from a rotating offset so that when loads tie (e.g. all idle at 0)
+      // selection round-robins instead of always funnelling to the first worker.
+      u32 start = next_io_idx_.fetch_add(1, std::memory_order_relaxed) % n;
+      double best_load = 0.0;
+      for (u32 k = 0; k < n; ++k) {
+        Worker *w = cand[(start + k) % n];
+        double rl = w->RealtimeLoad(now_us);
+        if (selected == nullptr || rl < best_load) {
+          selected = w;
+          best_load = rl;
+        }
+      }
+      // issue #781: reserve the incoming task's PREDICTED cost on the chosen
+      // worker so the NEXT mapping sees it as queued load — the quick-behind-
+      // heavy fix. The prediction comes from the learned per-method model via
+      // the populated PredictedStat (MOD_NAME::GetTaskStats reports the compute
+      // counter); it converges to ~the real cost after a few runs. Released in
+      // Worker::ExecTask when the task actually starts.
+      if (selected != nullptr && task_ptr != nullptr && container != nullptr) {
+        // Read the compute counter FRESH here: RunContext::predicted_stat_ is
+        // only populated at EXECUTION time (BeginTask on the destination worker),
+        // so it is still empty during routing. GetTaskStats is cheap + const.
+        clio::run::TaskStat stat = container->GetTaskStats(task_ptr);
+        double predicted = container->InferCpuTime(task_ptr->method_, stat);
+        if (predicted > 0.0) {
+          // Set PredictedLoad too so ExecTask/EndTask account the SAME value
+          // (its own PredictedStat() lookup would still read 0 during the window
+          // before BeginTask). sched_reserved_us_ marks it as map-accounted.
+          task_ptr->SetPredictedLoad(static_cast<float>(predicted));
+          task_ptr->SetSchedReservedUs(static_cast<float>(predicted));
+          selected->ReserveLoad(predicted);
+        }
+      }
+    }
   }
 
   // Fallback to current worker
@@ -257,7 +319,93 @@ Worker *DefaultScheduler::PickAltWorker(u32 avoid_id) const {
   return nullptr;
 }
 
-void DefaultScheduler::RebalanceWorker(Worker *worker) { (void)worker; }
+// issue #781 — SCAFFOLD ONLY (not yet wired). Called by the WorkOrchestrator
+// monitor thread every ~500ms. Real implementation will:
+//   1. detect a worker stuck > kStallThresholdSec inside one ExecTask
+//      (worker->IsStalled()) and, if so, work_orch_->SpawnAdditionalWorker()
+//      + StealAll(from stalled lane -> new worker) so the pathological task
+//      strands one thread, never the runtime;
+//   2. update perf_pdf_ from recently-completed exec times (telemetry);
+//   3. retire elastic workers idle > kRetireCooldownSec (hysteresis);
+//   4. emit sched.threads.* metrics; WARN when live threads are abnormal.
+void DefaultScheduler::LoadBalance() {
+  // Runs on the WorkOrchestrator monitor thread every ~500ms (NOT a worker).
+  // This pass implements the OBSERVABILITY half of the safety net: detect a
+  // worker stuck > kStallThresholdSec inside one ExecTask (a non-yielding /
+  // mislabeled task) and warn loudly with live/stalled counts. Because
+  // RuntimeMapTask already steers NEW tasks away from a stalled worker (its
+  // RealtimeLoad is enormous), the runtime keeps making progress on quick tasks
+  // even while a worker is wedged. The backlog-rescue (spawn a replacement +
+  // steal the stalled lane) needs a steal-safe MPSC pop and lands in a
+  // follow-up — see project_scheduler_antideadlock.md.
+  u64 tick = load_balance_ticks_.fetch_add(1, std::memory_order_relaxed) + 1;
+  double now_us = NowUs();
+
+  // Telemetry dump every ~5s: the perf-bin PDF is the runtime's OBSERVED live
+  // workload distribution (how many quick vs 1-second tasks it actually ran).
+  // It adapts continuously as RecordCompletion folds in each finished task.
+  if (tick % 10 == 0) {
+    HLOG(kWarning,
+         "[#781 PDF] observed exec-time bins (cumulative): "
+         "<10us={} <50us={} <500us={} <10ms={} <50ms={} <500ms={} <1s={} "
+         ">=1s={} | stalls_detected={}",
+         perf_pdf_[kLt10us].load(), perf_pdf_[kLt50us].load(),
+         perf_pdf_[kLt500us].load(), perf_pdf_[kLt10ms].load(),
+         perf_pdf_[kLt50ms].load(), perf_pdf_[kLt500ms].load(),
+         perf_pdf_[kLt1s].load(), perf_pdf_[kGe1s].load(),
+         stalls_detected_.load());
+  }
+
+  auto check = [&](Worker *w) -> bool {
+    if (w == nullptr || !w->IsExecuting()) return false;
+    if (!w->IsStalled(now_us, kStallThresholdSec)) return false;
+    stalls_detected_.fetch_add(1, std::memory_order_relaxed);
+    HLOG(kWarning,
+         "[#781] worker {} STALLED on one task (load_us={} realtime_load_us={} "
+         "threshold_s={}) — routing new work around it; backlog awaits rescue",
+         w->GetId(), (double)w->Load(), w->RealtimeLoad(now_us),
+         kStallThresholdSec);
+    return true;
+  };
+
+  u32 stalled = 0;
+  if (check(scheduler_worker_)) ++stalled;
+  for (Worker *w : io_workers_) if (check(w)) ++stalled;
+  if (check(net_send_worker_)) ++stalled;
+  if (check(net_recv_worker_)) ++stalled;
+
+  // Observability for the unbounded-pool design (#781): if EVERY general-purpose
+  // worker is stalled, no routing target can make progress — this is exactly the
+  // "flood of non-yielding tasks" case where the follow-up must SpawnAdditional-
+  // Worker(). Make it loud rather than silently wedging.
+  u32 compute_workers = (scheduler_worker_ ? 1u : 0u) +
+                        static_cast<u32>(io_workers_.size());
+  if (compute_workers > 0 && stalled >= compute_workers) {
+    HLOG(kWarning,
+         "[#781] ALL {} compute workers stalled — runtime cannot place new "
+         "tasks; elastic SpawnAdditionalWorker() needed (follow-up)",
+         compute_workers);
+    // TODO(#781): work_orch_->SpawnAdditionalWorker() + steal a stalled lane.
+  }
+}
+
+void DefaultScheduler::RecordCompletion(u32 method, double cpu_us,
+                                        double wall_us) {
+  // Telemetry only (issue #781): bin the measured wall time. This is the
+  // runtime OBSERVING what it actually ran — it is not used for routing.
+  (void)method;
+  (void)cpu_us;
+  perf_pdf_[BinFor(wall_us)].fetch_add(1, std::memory_order_relaxed);
+}
+
+// issue #781 — SCAFFOLD ONLY (not yet wired). Move up to kStealBatch tasks from
+// each ring neighbour (then the most-loaded worker) onto thief's lane using a
+// steal-safe lane pop, keeping the pool work-conserving.
+bool DefaultScheduler::StealWork(Worker *thief) {
+  (void)thief;
+  // TODO(#781): neighbour + most-loaded steal.
+  return false;
+}
 
 void DefaultScheduler::AdjustPolling(const clio::run::shared_ptr<Task> &task) {
   if (task.IsNull()) {

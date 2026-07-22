@@ -13874,10 +13874,10 @@ TEST_CASE("Autogen - DefaultScheduler AdjustPolling", "[autogen][scheduler][adju
     INFO("AdjustPolling(nullptr) did not crash");
   }
 
-  SECTION("RebalanceWorker noop") {
+  SECTION("LoadBalance noop") {  // issue #781: replaced RebalanceWorker
     clio::run::DefaultScheduler sched;
-    sched.RebalanceWorker(nullptr);  // Should not crash
-    INFO("RebalanceWorker(nullptr) did not crash");
+    sched.LoadBalance();  // Should not crash (stub today)
+    INFO("LoadBalance() did not crash");
   }
 
   SECTION("RuntimeMapTask with null worker") {

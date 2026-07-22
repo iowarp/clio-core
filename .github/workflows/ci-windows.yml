@@ -44,6 +44,44 @@ jobs:
         uses: actions/checkout@v6
         with:
           submodules: recursive
+      # Windows link steps intermittently fail with "Access is denied" or
+      # "The process cannot access the file because it is being used by another
+      # process" while cmake replaces a freshly written .exe. The holder is
+      # Defender's real-time scanner opening the new binary the instant it
+      # lands. Observed on 3 of the last 5 dev CI Windows runs, hitting a
+      # different random target each time (test_blob_block_reuse,
+      # test_ring_buffer_ext, ...), which is why it reads as a flake.
+      #
+      # Excluding the workspace and the toolchain processes removes the
+      # scanner from the link path. Best-effort: if Defender is absent or the
+      # runner refuses the call, the build proceeds exactly as before.
+      #
+      # vcpkg.exe/MSBuild.exe and the vcpkg root are excluded too, after a
+      # "Access is denied" failure in the `vcpkg z-applocal` DLL-deployment
+      # step (MSB3075) whose source DLLs live under VCPKG_INSTALLATION_ROOT,
+      # which the workspace exclusion does not cover.
+      #
+      # Caveat: that applocal failure has been seen once, and Defender is not
+      # the only candidate. MSBuild builds many test executables in parallel
+      # and each runs applocal deployment, so two projects copying the same
+      # DLL into build/bin concurrently would also produce a sharing
+      # violation reported as "Access is denied" -- and exclusions would not
+      # help that. If MSB3075 recurs with these exclusions in place, the
+      # parallel-copy explanation is the one to pursue.
+      - name: Exclude workspace from Defender (link-flake mitigation)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          try {
+            Add-MpPreference -ExclusionPath "${{ github.workspace }}" -ErrorAction Stop
+            Add-MpPreference -ExclusionProcess "link.exe","lld-link.exe","cl.exe","icx.exe","mspdbsrv.exe","ninja.exe","vcpkg.exe","MSBuild.exe" -ErrorAction Stop
+            if ($env:VCPKG_INSTALLATION_ROOT) {
+              Add-MpPreference -ExclusionPath "$env:VCPKG_INSTALLATION_ROOT" -ErrorAction SilentlyContinue
+            }
+            Write-Host "Defender exclusions added for ${{ github.workspace }}"
+          } catch {
+            Write-Host "Could not add Defender exclusions (continuing): $_"
+          }
       - name: Bootstrap vcpkg
         run: |
           cd $env:VCPKG_INSTALLATION_ROOT
@@ -75,8 +113,67 @@ jobs:
             -DCLIO_CORE_ENABLE_BENCHMARKS=OFF `
             -DCMAKE_EXPORT_COMPILE_COMMANDS=ON `
             -DCLIO_CTP_LOG_LEVEL=0
+      # Retry the build once on failure. Windows link steps intermittently fail
+      # with "Access is denied" / "being used by another process" while cmake
+      # replaces a freshly written .exe (issue #800). The Defender exclusions
+      # above cut that rate ~3x but did NOT eliminate it, and the process
+      # actually holding the file is still unconfirmed — so this retry is a
+      # mitigation that works whoever the holder turns out to be.
+      #
+      # Safe against masking real breakage: the build is incremental, so a
+      # genuine compile error fails identically on the second pass and the step
+      # still goes red. The only cost is one extra attempt. Transient link
+      # locks, by contrast, clear in seconds and the retry completes just the
+      # failed link.
+      #
+      # The retry emits a ::warning:: so it appears in the run summary — these
+      # stay countable rather than silently absorbing the flake.
+      # Proves the retry control flow below is actually reachable. The risk it
+      # guards is specific: if a future PowerShell makes a native command's
+      # non-zero exit a terminating error (via
+      # $PSNativeCommandUseErrorActionPreference under 'Stop'), the script would
+      # abort at the first cmake failure and the retry would never run — CI
+      # would look exactly as it does today and we would silently lose the
+      # mitigation. Two seconds here turns that silent regression into a loud
+      # one. Deliberately does NOT invoke cmake: it tests the shell semantics,
+      # not the build.
+      - name: Verify build-retry control flow is reachable
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $PSNativeCommandUseErrorActionPreference = $false
+          cmd /c "exit 3"
+          if ($LASTEXITCODE -ne 3) {
+            Write-Host "::error::RETRY-SELFTEST: expected exit 3, got $LASTEXITCODE"
+            exit 1
+          }
+          Write-Host "RETRY-SELFTEST: ok - native non-zero exit is branchable (LASTEXITCODE=$LASTEXITCODE)"
+          # The shell is `pwsh -command ". '<script>'"` with no exit-code
+          # wrapper, so pwsh's implicit exit status reflects the last native
+          # command — which we deliberately made fail. Without this the step
+          # reports failure even though the check passed. The Build step below
+          # does not need it: its last statement is a successful cmake (or an
+          # explicit `exit`), so $LASTEXITCODE is already 0 there.
+          exit 0
       - name: Build
-        run: cmake --build build --config Debug -j $env:NUMBER_OF_PROCESSORS
+        shell: pwsh
+        run: |
+          # GitHub's pwsh shell runs with $ErrorActionPreference = 'Stop'. In
+          # PowerShell 7.3+ that can also apply to NATIVE commands via
+          # $PSNativeCommandUseErrorActionPreference, in which case a non-zero
+          # exit from cmake throws and terminates the script — the retry below
+          # would never run and this step would behave exactly as it does today,
+          # silently. Force both off so a failed build is an exit code we can
+          # branch on rather than a terminating error.
+          $ErrorActionPreference = 'Continue'
+          $PSNativeCommandUseErrorActionPreference = $false
+          cmake --build build --config Debug -j $env:NUMBER_OF_PROCESSORS
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::warning::BUILD-RETRY: first build attempt failed (exit $LASTEXITCODE); retrying once — see issue #800"
+            Start-Sleep -Seconds 5
+            cmake --build build --config Debug -j $env:NUMBER_OF_PROCESSORS
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
       - name: Run tests
         run: ctest --test-dir build -T Test --build-config Debug --output-on-failure --timeout 120 -LE ollama
       - name: Submit results to CDash
@@ -129,6 +226,44 @@ jobs:
         uses: actions/checkout@v6
         with:
           submodules: recursive
+      # Windows link steps intermittently fail with "Access is denied" or
+      # "The process cannot access the file because it is being used by another
+      # process" while cmake replaces a freshly written .exe. The holder is
+      # Defender's real-time scanner opening the new binary the instant it
+      # lands. Observed on 3 of the last 5 dev CI Windows runs, hitting a
+      # different random target each time (test_blob_block_reuse,
+      # test_ring_buffer_ext, ...), which is why it reads as a flake.
+      #
+      # Excluding the workspace and the toolchain processes removes the
+      # scanner from the link path. Best-effort: if Defender is absent or the
+      # runner refuses the call, the build proceeds exactly as before.
+      #
+      # vcpkg.exe/MSBuild.exe and the vcpkg root are excluded too, after a
+      # "Access is denied" failure in the `vcpkg z-applocal` DLL-deployment
+      # step (MSB3075) whose source DLLs live under VCPKG_INSTALLATION_ROOT,
+      # which the workspace exclusion does not cover.
+      #
+      # Caveat: that applocal failure has been seen once, and Defender is not
+      # the only candidate. MSBuild builds many test executables in parallel
+      # and each runs applocal deployment, so two projects copying the same
+      # DLL into build/bin concurrently would also produce a sharing
+      # violation reported as "Access is denied" -- and exclusions would not
+      # help that. If MSB3075 recurs with these exclusions in place, the
+      # parallel-copy explanation is the one to pursue.
+      - name: Exclude workspace from Defender (link-flake mitigation)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          try {
+            Add-MpPreference -ExclusionPath "${{ github.workspace }}" -ErrorAction Stop
+            Add-MpPreference -ExclusionProcess "link.exe","lld-link.exe","cl.exe","icx.exe","mspdbsrv.exe","ninja.exe","vcpkg.exe","MSBuild.exe" -ErrorAction Stop
+            if ($env:VCPKG_INSTALLATION_ROOT) {
+              Add-MpPreference -ExclusionPath "$env:VCPKG_INSTALLATION_ROOT" -ErrorAction SilentlyContinue
+            }
+            Write-Host "Defender exclusions added for ${{ github.workspace }}"
+          } catch {
+            Write-Host "Could not add Defender exclusions (continuing): $_"
+          }
       # 3.31.x: 4.x's bindexplib fails to open icx object files under Ninja,
       # breaking the clio_ctp_host.dll link.
       - name: Install CMake 3.31.6
@@ -160,6 +295,19 @@ jobs:
         with:
           path: ${{ env.ONEAPI_ROOT_DIR }}
           key: oneapi-${{ runner.os }}-${{ env.CACHE_NUMBER }}-${{ env.WINDOWS_BASEKIT_URL }}-${{ env.WINDOWS_CPP_COMPONENTS }}
+      # cmd counterpart of the build-test self-test: proves `if errorlevel 1`
+      # branches on a failing command under Actions' cmd shell, so the retry in
+      # the build step below is reachable.
+      - name: Verify build-retry control flow is reachable (cmd)
+        shell: cmd
+        run: |
+          cmd /c "exit 3"
+          if errorlevel 1 (
+            echo RETRY-SELFTEST: ok - errorlevel branch reached
+            exit /b 0
+          )
+          echo ::error::RETRY-SELFTEST: errorlevel branch NOT reached
+          exit /b 1
       - name: Configure and build (icx)
         shell: cmd
         run: |
@@ -195,7 +343,21 @@ jobs:
             -DCLIO_CORE_ENABLE_BENCHMARKS=OFF ^
             -DCMAKE_EXPORT_COMPILE_COMMANDS=ON ^
             -DCLIO_CTP_LOG_LEVEL=0 || exit /b 1
-          cmake --build build --config Debug -j %NUMBER_OF_PROCESSORS% || exit /b 1
+          rem Retry once on a transient Windows link lock — see the Build step
+          rem in build-test and issue #800. A real compile error fails the same
+          rem way on the retry, so this cannot turn genuine breakage green.
+          rem The retry sleeps with ping, not `timeout /t`: the latter aborts
+          rem with "Input redirection is not supported" when stdin is
+          rem redirected, which it is under Actions. ping -n 6 waits ~5s.
+          rem Comments are kept OUTSIDE the parenthesised block below — a rem
+          rem line inside one is parsed with it, so a stray closing paren in a
+          rem comment would terminate the block early.
+          cmake --build build --config Debug -j %NUMBER_OF_PROCESSORS%
+          if errorlevel 1 (
+            echo ::warning::BUILD-RETRY: first icx build attempt failed; retrying once - see issue #800
+            ping -n 6 127.0.0.1 >nul
+            cmake --build build --config Debug -j %NUMBER_OF_PROCESSORS% || exit /b 1
+          )
       - name: Run ctest
         shell: cmd
         run: |
@@ -255,6 +417,44 @@ jobs:
         uses: actions/checkout@v6
         with:
           submodules: recursive
+      # Windows link steps intermittently fail with "Access is denied" or
+      # "The process cannot access the file because it is being used by another
+      # process" while cmake replaces a freshly written .exe. The holder is
+      # Defender's real-time scanner opening the new binary the instant it
+      # lands. Observed on 3 of the last 5 dev CI Windows runs, hitting a
+      # different random target each time (test_blob_block_reuse,
+      # test_ring_buffer_ext, ...), which is why it reads as a flake.
+      #
+      # Excluding the workspace and the toolchain processes removes the
+      # scanner from the link path. Best-effort: if Defender is absent or the
+      # runner refuses the call, the build proceeds exactly as before.
+      #
+      # vcpkg.exe/MSBuild.exe and the vcpkg root are excluded too, after a
+      # "Access is denied" failure in the `vcpkg z-applocal` DLL-deployment
+      # step (MSB3075) whose source DLLs live under VCPKG_INSTALLATION_ROOT,
+      # which the workspace exclusion does not cover.
+      #
+      # Caveat: that applocal failure has been seen once, and Defender is not
+      # the only candidate. MSBuild builds many test executables in parallel
+      # and each runs applocal deployment, so two projects copying the same
+      # DLL into build/bin concurrently would also produce a sharing
+      # violation reported as "Access is denied" -- and exclusions would not
+      # help that. If MSB3075 recurs with these exclusions in place, the
+      # parallel-copy explanation is the one to pursue.
+      - name: Exclude workspace from Defender (link-flake mitigation)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          try {
+            Add-MpPreference -ExclusionPath "${{ github.workspace }}" -ErrorAction Stop
+            Add-MpPreference -ExclusionProcess "link.exe","lld-link.exe","cl.exe","icx.exe","mspdbsrv.exe","ninja.exe","vcpkg.exe","MSBuild.exe" -ErrorAction Stop
+            if ($env:VCPKG_INSTALLATION_ROOT) {
+              Add-MpPreference -ExclusionPath "$env:VCPKG_INSTALLATION_ROOT" -ErrorAction SilentlyContinue
+            }
+            Write-Host "Defender exclusions added for ${{ github.workspace }}"
+          } catch {
+            Write-Host "Could not add Defender exclusions (continuing): $_"
+          }
       - name: Bootstrap vcpkg
         run: |
           cd $env:VCPKG_INSTALLATION_ROOT
@@ -287,7 +487,21 @@ jobs:
             -DCLIO_CORE_ENABLE_BENCHMARKS=OFF `
             -DCMAKE_EXPORT_COMPILE_COMMANDS=ON `
             -DCLIO_CTP_LOG_LEVEL=0
+      # Retry once on a transient Windows link lock — see the build-test Build
+      # step and issue #800.
       - name: Build
-        run: cmake --build build-boost --config Release -j $env:NUMBER_OF_PROCESSORS
+        shell: pwsh
+        run: |
+          # See the build-test Build step: pwsh 'Stop' + native-command error
+          # preference would abort before the retry could run.
+          $ErrorActionPreference = 'Continue'
+          $PSNativeCommandUseErrorActionPreference = $false
+          cmake --build build-boost --config Release -j $env:NUMBER_OF_PROCESSORS
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::warning::BUILD-RETRY: first boost build attempt failed (exit $LASTEXITCODE); retrying once — see issue #800"
+            Start-Sleep -Seconds 5
+            cmake --build build-boost --config Release -j $env:NUMBER_OF_PROCESSORS
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
       - name: Run tests
         run: ctest --test-dir build-boost --build-config Release --output-on-failure --timeout 180 --repeat until-pass:3 -LE ollama

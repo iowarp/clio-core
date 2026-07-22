@@ -124,9 +124,14 @@ clio::run::TaskResume Runtime::Create(clio::run::shared_ptr<CreateTask> &task) {
 
   // Start dedicated recv threads in IpcManagerRun2Run.
   CLIO_IPC->GetRun2Run()->StartRecvThreads();
+  // Start the dedicated inbound-SHM-ring recv thread (SHM mode only; a no-op
+  // otherwise). Same rationale and same lifetime as the threads above: by this
+  // point the pool manager, task queue and scheduler it pushes into all exist.
+  CLIO_IPC->StartShmServerRecvThread();
   // Stop recv threads before the main transport is freed.
   CLIO_IPC->RegisterTransportShutdownHook([]() {
     CLIO_IPC->GetRun2Run()->StopRecvThreads();
+    CLIO_IPC->StopShmServerRecvThread();
   });
 
   // Spawn periodic WreapDeadIpcs task with 1 second period

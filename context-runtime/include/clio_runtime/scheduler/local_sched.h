@@ -53,17 +53,15 @@ class LocalScheduler : public Scheduler {
   ~LocalScheduler() override = default;
 
   void DivideWorkers(WorkOrchestrator *work_orch) override;
-  u32 ClientMapTask(IpcManager *ipc_manager, const Future<Task> &task) override;
   u32 RuntimeMapTask(Worker *worker, const Future<Task> &task,
                      ContainerHold container) override;
-  void RebalanceWorker(Worker *worker) override;
+  void LoadBalance() override;             // issue #781
+  bool StealWork(Worker *thief) override;  // issue #781
   void AdjustPolling(const clio::run::shared_ptr<Task> &task) override;
   Worker *GetGpuWorker() const override { return gpu_worker_; }
   Worker *GetNetWorker() const override { return net_worker_; }
 
  private:
-  u32 MapByPidTid(u32 num_lanes);
-
   std::vector<Worker *> scheduler_workers_;
   Worker *net_worker_;
   Worker *gpu_worker_;

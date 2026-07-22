@@ -87,11 +87,16 @@ struct CustomTask : public clio::run::Task {
   // Task-specific data
   INOUT clio::run::priv::string data_;
   IN clio::run::u32 operation_id_;
+  // issue #781 scheduler-variety benchmark: requested busy-spin compute time in
+  // microseconds. The handler spins for this long, letting the benchmark
+  // generate a controlled mix of 1us..1s (non-yielding) tasks to measure
+  // starvation / p99 under the scheduler.
+  IN clio::run::u32 spin_us_;
 
   /** SHM default constructor */
   CustomTask()
       : clio::run::Task(),
-        data_(CLIO_PRIV_ALLOC), operation_id_(0) {
+        data_(CLIO_PRIV_ALLOC), operation_id_(0), spin_us_(0) {
   }
 
   /** Emplace constructor */
@@ -100,9 +105,11 @@ struct CustomTask : public clio::run::Task {
       const clio::run::PoolId &pool_id,
       const clio::run::PoolQuery &pool_query,
       const std::string &data,
-      clio::run::u32 operation_id)
+      clio::run::u32 operation_id,
+      clio::run::u32 spin_us = 0)
       : clio::run::Task(task_node, pool_id, pool_query, 10),
-        data_(CLIO_PRIV_ALLOC, data), operation_id_(operation_id) {
+        data_(CLIO_PRIV_ALLOC, data), operation_id_(operation_id),
+        spin_us_(spin_us) {
     // Initialize task
     task_id_ = task_node;
     pool_id_ = pool_id;
@@ -122,7 +129,7 @@ struct CustomTask : public clio::run::Task {
   template<typename Archive>
   CTP_CROSS_FUN void SerializeIn(Archive& ar) {
     Task::SerializeIn(ar);
-    ar(data_, operation_id_);
+    ar(data_, operation_id_, spin_us_);
   }
 
   template<typename Archive>

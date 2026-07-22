@@ -392,6 +392,13 @@ bool IpcManager::ClientInit() {
         "", ctp::lbm::TransportType::kShm, ctp::lbm::TransportMode::kClient);
     shm_recv_transport_ = ctp::lbm::TransportFactory::Get(
         "", ctp::lbm::TransportType::kShm, ctp::lbm::TransportMode::kServer);
+
+    // Start the dedicated SHM response recv thread: it drains shm_out_server_
+    // and wakes waiters (the SHM analogue of zmq_recv_thread_). App threads now
+    // block on their EventManager in RecvOut instead of polling a per-thread
+    // ring, so this thread MUST be running before any response can land.
+    shm_recv_running_.store(true);
+    shm_recv_thread_ = std::thread([this]() { RecvShmClientThread(); });
   }
 
   // Default host until identified
@@ -605,6 +612,23 @@ void IpcManager::ClientFinalize() {
     }
   }
 
+  // Stop the SHM response recv thread and tear down the response ring. Join
+  // BEFORE Shutdown so the thread cannot touch a detached segment.
+#if CTP_IS_HOST
+  if (shm_recv_running_.load()) {
+    shm_recv_running_.store(false);
+    // Wake it if parked so the join is prompt (see StopShmServerRecvThread).
+    shm_out_server_.SignalConsumerIfParked();
+    if (shm_recv_thread_.joinable()) {
+      shm_recv_thread_.join();
+    }
+  }
+  if (shm_out_server_ok_) {
+    shm_out_server_.Shutdown();  // unmap + unlink "clio-<pid>-shm-out"
+    shm_out_server_ok_ = false;
+  }
+#endif
+
   // Clean up lightbeam transport objects. The recv thread that reads the
   // response listener is already stopped above, so closing it here is safe.
   // NOTE (Windows): the listener is a ROUTER on the shared ZMQ context; at
@@ -676,6 +700,18 @@ void IpcManager::ServerFinalize() {
   // earlier in the shutdown sequence before workers are freed); these are
   // no-ops in that case.
   ClearTransports();
+
+  // Tear down the single inbound SHM ring. Join its recv thread FIRST so it
+  // cannot touch a detached segment (or push onto lanes whose workers are
+  // already stopped). The admin ChiMod also stops it via a transport-shutdown
+  // hook on the normal path; both call sites are idempotent.
+#if CTP_IS_HOST
+  StopShmServerRecvThread();
+  if (shm_in_server_ok_) {
+    shm_in_server_.Shutdown();  // unmap + unlink "clio-<pid>-shm-in"
+    shm_in_server_ok_ = false;
+  }
+#endif
 
   // Clear main allocator pointer
   main_allocator_ = nullptr;
@@ -849,6 +885,28 @@ bool IpcManager::ServerInitShm() {
     // main/queue. Clients use a different pid, so they keep starting at 0.
     shm_count_.store(3, std::memory_order_relaxed);
 
+#if CTP_IS_HOST
+    // Single inbound MPSC ring shared by every SHM client (replaces the old
+    // per-worker "clio-<pid>-<tid>" servers). Clients SendBytes serialized tasks
+    // here; the dedicated RecvShmServerThread drains it (-> IpcCpu2Cpu::RecvIn)
+    // and fans tasks out to worker lanes, mirroring how the ZMQ path funnels
+    // all inbound client traffic through one dedicated recv thread. Sized
+    // large (~128MB) so bursty async fan-out from many clients rarely blocks a
+    // producer in SendBytes. The name is derived from the runtime pid so a
+    // client can form it from the server_pid_ it learns via ClientConnect.
+    {
+      std::string in_name = "clio-" + std::to_string(pid) + "-shm-in";
+      shm_in_server_ok_ =
+          shm_in_server_.ServerInit(in_name, ctp::Unit<size_t>::Megabytes(128));
+      if (!shm_in_server_ok_) {
+        HLOG(kError, "ServerInitShm: failed to create inbound SHM ring '{}'",
+             in_name);
+        return false;
+      }
+      HLOG(kInfo, "ServerInitShm: inbound SHM ring '{}' (128MB)", in_name);
+    }
+#endif
+
     return true;
   } catch (const std::exception &e) {
     return false;
@@ -899,6 +957,26 @@ bool IpcManager::ClientInitShm() {
       return false;
     }
     queue_allocator_id_ = queue_allocator_->GetId();
+
+#if CTP_IS_HOST
+    // Single per-process response ring (replaces the old per-thread
+    // "clio-<pid>-<tid>" servers). The runtime routes every response for this
+    // process here (IpcCpu2Cpu::SendOut -> "clio-<client_pid>-shm-out"); the
+    // dedicated RecvShmClientThread drains it and wakes waiters. ~1MB is ample
+    // for the response stream from one runtime, continuously drained.
+    {
+      std::string out_name =
+          "clio-" + std::to_string(ctp::SystemInfo::GetPid()) + "-shm-out";
+      shm_out_server_ok_ =
+          shm_out_server_.ServerInit(out_name, ctp::Unit<size_t>::Megabytes(1));
+      if (!shm_out_server_ok_) {
+        HLOG(kError, "ClientInitShm: failed to create response SHM ring '{}'",
+             out_name);
+        return false;
+      }
+      HLOG(kInfo, "ClientInitShm: response SHM ring '{}' (1MB)", out_name);
+    }
+#endif
 
     return true;
   } catch (const std::exception &e) {
@@ -2875,6 +2953,204 @@ void IpcManager::RecvZmqClientThread() {
   }
 }
 
+namespace {
+/**
+ * Lost-wakeup safety net for the parked SHM drain loops.
+ *
+ * The park/signal handshake (ShmMpscTransport::SignalConsumerIfParked) is
+ * designed so a wake can never be missed, so in principle these threads could
+ * block forever. They don't: a bounded wait means a bug in that handshake — or
+ * a producer killed between reserving its slot and signalling — degrades to a
+ * few milliseconds of extra latency instead of a permanently wedged runtime.
+ * This codebase has shipped that exact failure mode more than once (#768,
+ * #774), and 20 idle wakeups/sec/thread is not a measurable cost.
+ *
+ * This is NOT the polling interval: under load the drainer is woken by the
+ * producer's signal and never reaches the timeout.
+ */
+constexpr int kShmParkTimeoutUs = 50'000;  // 50ms
+
+/**
+ * How long a drainer stays hot before parking, in failed drain attempts.
+ *
+ * Parking is not free: the wake costs the producer a tgkill and the consumer a
+ * signalfd read plus an epoll wakeup. Measured on the task round-trip, parking
+ * on EVERY message is worse than either alternative — the drain thread ends up
+ * asleep whenever a request arrives, so the signal round-trip lands on the
+ * critical path:
+ *
+ *   bdev_allocation, 4 threads    park always   spin always   spin-then-park
+ *   SHM throughput                  5,303/s      14,227/s        (below)
+ *
+ * So spin while there is any reason to believe more work is imminent, and park
+ * only once the ring has been quiet for a while. Under load the drainer never
+ * reaches the budget, stays unparked, and producers skip the signal entirely
+ * (SignalConsumerIfParked checks parked_ first) — the fast path costs nothing.
+ * When traffic genuinely stops, the drainer parks once and the machine goes
+ * fully idle: no polling, no periodic wakeups beyond the safety-net timeout.
+ */
+constexpr size_t kShmSpinBudget = 4096;
+
+/**
+ * Block until this ring has work, using the park/signal handshake.
+ *
+ * Publishing `parked` BEFORE the final IsEmpty() re-check is what makes this
+ * race-free: a producer that reserves its slot after our re-check must observe
+ * parked_ and signal us, and one that reserved before it is seen by the
+ * re-check so we never block on a non-empty ring.
+ */
+void ShmParkUntilWork(ctp::lbm::ShmMpscTransport &ring,
+                      ctp::lbm::EventManager *em) {
+  ring.SetConsumerParked(true);
+  if (ring.IsEmpty()) {
+    em->Wait(kShmParkTimeoutUs);
+  }
+  ring.SetConsumerParked(false);
+}
+
+/**
+ * One idle iteration of a drain loop: spin while warm, then park.
+ * `spins` is the caller's counter; it is reset by the caller on any work, and
+ * here after a park so a woken drainer gets a fresh hot window.
+ */
+void ShmDrainIdle(ctp::lbm::ShmMpscTransport &ring, ctp::lbm::EventManager *em,
+                  size_t &spins) {
+  if (++spins < kShmSpinBudget) {
+    CTP_THREAD_MODEL->Yield();
+    return;
+  }
+  ShmParkUntilWork(ring, em);
+  spins = 0;
+}
+}  // namespace
+
+void IpcManager::RecvShmClientThread() {
+#if CTP_IS_HOST
+  // Client-side SHM analogue of RecvZmqClientThread. Drains the single
+  // per-process response ring (shm_out_server_). For each response: match it to
+  // the waiting Future by net_key (stamped in SendIn, echoed by SendOut), park
+  // the archive for RecvOut to deserialize (RecvOut owns the concrete task
+  // type), mark the client task complete, and wake its waiter via
+  // EventManager::Signal. This replaces the old model where every client thread
+  // polled its own per-thread ring in RecvOut.
+  size_t recv_count = 0;
+  size_t miss_count = 0;
+  // GetTls() registers this thread's signalfd-backed EventManager (its ctor
+  // calls AddSignalEvent, which also BLOCKS SIGUSR1 here — mandatory before
+  // publishing ourselves as the drainer, or a producer's wake would kill the
+  // process via SIGUSR1's default disposition).
+  ctp::lbm::EventManager *em = &GetTls()->event_manager_;
+  shm_out_server_.RegisterConsumer();
+  size_t idle_spins = 0;
+  while (shm_recv_running_.load()) {
+    bool drained_any = false;
+    // Drain everything currently available before parking.
+    while (shm_recv_running_.load()) {
+      auto archive = std::make_unique<LoadTaskArchive>();
+      ctp::lbm::ClientInfo info =
+          shm_out_server_.Recv(*archive, ctp::lbm::SHM_MPSC_DONTWAIT);
+      if (info.rc != 0) break;  // EAGAIN: nothing more in flight right now
+      drained_any = true;
+
+      if (archive->GetTaskInfos().empty()) {
+        HLOG(kError, "RecvShmClientThread: response with no task_infos");
+        continue;
+      }
+      size_t net_key = archive->GetTaskInfos()[0].task_id_.net_key_;
+
+      std::lock_guard<std::mutex> lock(pending_futures_mutex_);
+      auto it = pending_zmq_futures_.find(net_key);
+      if (it == pending_zmq_futures_.end()) {
+        ++miss_count;
+        HLOG(kError,
+             "RecvShmClientThread: no pending future for net_key {} "
+             "(received={}, misses={})",
+             net_key, recv_count, miss_count);
+        continue;
+      }
+      Task *task = it->second.task;
+      // Park the archive; RecvOut moves it out and deserializes into the task.
+      pending_response_archives_[net_key] = std::move(archive);
+      // Publish the parked archive before the waiter observes completion.
+      std::atomic_thread_fence(std::memory_order_release);
+      task->SetNewData();
+      task->SetComplete();
+      if (task->WaiterPid() != 0) {
+        ctp::lbm::EventManager::Signal(static_cast<int>(task->WaiterPid()),
+                                       static_cast<int>(task->WaiterTid()));
+      }
+      pending_zmq_futures_.erase(it);
+      ++recv_count;
+    }
+    if (drained_any) {
+      idle_spins = 0;
+    } else {
+      ShmDrainIdle(shm_out_server_, em, idle_spins);
+    }
+  }
+  shm_out_server_.UnregisterConsumer();
+#endif
+}
+
+void IpcManager::RecvShmServerThread() {
+#if CTP_IS_HOST
+  ctp::SystemInfo::SetCurrentThreadName("chi-shm-in-recv");
+  // Runtime-side analogue of the ZMQ ClientRecvThread. This thread is the
+  // inbound ring's single consumer, which is the whole reason the schedulers
+  // and Worker need no knowledge of it: there is no "which worker drains it"
+  // question to answer. IpcCpu2Cpu::RecvIn deserializes one task per call and
+  // pushes it onto a scheduler-chosen lane.
+  // Same rendezvous as the client drainer: our signalfd EventManager (which
+  // blocks SIGUSR1 on this thread) plus publishing our tid in the ring header
+  // so producing clients know whom to wake.
+  ctp::lbm::EventManager *em = &GetTls()->event_manager_;
+  shm_in_server_.RegisterConsumer();
+  size_t idle_spins = 0;
+  while (shm_in_recv_running_.load(std::memory_order_acquire)) {
+    bool drained_any = false;
+    // Drain everything currently queued before parking, so a burst is ingested
+    // in one pass rather than one task per wakeup.
+    while (shm_in_recv_running_.load(std::memory_order_acquire) &&
+           IpcCpu2Cpu::RecvIn(this)) {
+      drained_any = true;
+    }
+    if (drained_any) {
+      idle_spins = 0;
+    } else {
+      ShmDrainIdle(shm_in_server_, em, idle_spins);
+    }
+  }
+  shm_in_server_.UnregisterConsumer();
+  HLOG(kInfo, "[ShmServerRecvThread] shutting down");
+#endif
+}
+
+void IpcManager::StartShmServerRecvThread() {
+#if CTP_IS_HOST
+  // Only a SHM-mode runtime has an inbound ring; every other configuration
+  // (client processes, ZMQ/TCP/IPC runtimes) makes this a no-op.
+  if (!shm_in_server_ok_ || shm_in_recv_running_.load()) {
+    return;
+  }
+  shm_in_recv_running_.store(true, std::memory_order_release);
+  shm_in_recv_thread_ = std::thread([this]() { RecvShmServerThread(); });
+  HLOG(kInfo, "[ShmServerRecvThread] started");
+#endif
+}
+
+void IpcManager::StopShmServerRecvThread() {
+#if CTP_IS_HOST
+  shm_in_recv_running_.store(false, std::memory_order_release);
+  // Kick the drainer in case it is parked, so the join doesn't wait out the
+  // park timeout. Harmless if it is awake, and the bounded wait bounds the
+  // worst case anyway if this signal races the park.
+  shm_in_server_.SignalConsumerIfParked();
+  if (shm_in_recv_thread_.joinable()) {
+    shm_in_recv_thread_.join();
+  }
+#endif
+}
+
 void IpcManager::HeartbeatThread() {
   while (heartbeat_running_.load()) {
     bool alive = IsServerAlive();
@@ -2887,6 +3163,14 @@ void IpcManager::CleanupResponseArchive(size_t net_key) {
   std::lock_guard<std::mutex> lock(pending_futures_mutex_);
   auto it = pending_response_archives_.find(net_key);
   if (it != pending_response_archives_.end()) {
+    // Frees ZMQ zero-copy recv handles (bulk.desc); a no-op for a SHM archive
+    // (its recv bulks carry no desc). Reaching here means the future was dropped
+    // WITHOUT a Recv — the consumed path erases the entry in RecvOut. NOTE: a
+    // SHM archive's malloc'd recv payloads (bulk.data.ptr_) are intentionally
+    // NOT freed here: bulk.data.ptr_ on the TCP/IPC path can be a CHI-allocated
+    // (non-malloc) buffer, so a blanket free corrupts the heap. The consumed
+    // path adopts SHM payloads into the task (TASK_DATA_OWNER); only a truly
+    // dropped-before-Recv SHM future leaks its payload, which is rare and bounded.
     zmq_transport_->ClearRecvHandles(*(it->second));
     pending_response_archives_.erase(it);
   }

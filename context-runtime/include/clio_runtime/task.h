@@ -388,6 +388,8 @@ class Task {
   ctp::CpuTimer& RunCpuTimer();
   float PredictedLoad() const;
   void SetPredictedLoad(float v);
+  float SchedReservedUs() const;       // issue #781 queued-load reservation
+  void SetSchedReservedUs(float v);    // issue #781
   ctp::HighResMonotonicTimer& RunWallTimer();
   float PredictedWallUs() const;
   void SetPredictedWallUs(float v);
@@ -893,6 +895,9 @@ class RunContext {
   ctp::bitfield32_t flags_;
   ctp::CpuTimer cpu_timer_; /**< Accumulates thread CPU time across yields */
   float predicted_load_ = 0; /**< Predicted CPU time from InferModel (us) */
+  float sched_reserved_us_ = 0; /**< #781 queued-load reservation on a worker
+                                  * (predicted cost added to worker.queued_load_
+                                  * at map, released when the task starts) */
   ctp::HighResMonotonicTimer wall_timer_; /**< Wall clock time across yields */
   float predicted_wall_us_ =
       0; /**< Predicted wall time from InferWallClockTime */
@@ -1072,6 +1077,7 @@ class RunContext {
     flags_.UnsetBits(RCTX_DID_WORK);
     cpu_timer_.time_ns_ = 0;
     predicted_load_ = 0;
+    sched_reserved_us_ = 0;
     wall_timer_.time_ns_ = 0;
     predicted_wall_us_ = 0;
     predicted_stat_ = TaskStat();
@@ -1157,6 +1163,8 @@ CLIO_RCTX_FLAG(IsStarted, SetStarted)
 CLIO_RCTX_REF(ctp::CpuTimer, RunCpuTimer, cpu_timer_)
 CLIO_RCTX_GET(float, PredictedLoad, predicted_load_)
 CLIO_RCTX_SET(float, SetPredictedLoad, predicted_load_)
+CLIO_RCTX_GET(float, SchedReservedUs, sched_reserved_us_)
+CLIO_RCTX_SET(float, SetSchedReservedUs, sched_reserved_us_)
 CLIO_RCTX_REF(ctp::HighResMonotonicTimer, RunWallTimer, wall_timer_)
 CLIO_RCTX_GET(float, PredictedWallUs, predicted_wall_us_)
 CLIO_RCTX_SET(float, SetPredictedWallUs, predicted_wall_us_)

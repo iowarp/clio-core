@@ -203,7 +203,8 @@ if(CLIO_CORE_ENABLE_TESTS)
     )
     target_compile_definitions(clio_run_cfs_test PRIVATE
       CLIO_RUN_EXE="$<TARGET_FILE:clio_run>")
-    add_dependencies(clio_run_cfs_test clio_run clio_cte_filesystem_runtime)
+    add_dependencies(clio_run_cfs_test clio_run clio_cte_filesystem_runtime
+                     clio_cte_core_runtime clio_bdev_runtime)
     set_target_properties(clio_run_cfs_test PROPERTIES
       CXX_STANDARD 20
       CXX_STANDARD_REQUIRED ON
@@ -238,7 +239,8 @@ if(CLIO_CORE_ENABLE_TESTS)
     )
     target_compile_definitions(clio_run_cfs_rename_test PRIVATE
       CLIO_RUN_EXE="$<TARGET_FILE:clio_run>")
-    add_dependencies(clio_run_cfs_rename_test clio_run clio_cte_filesystem_runtime)
+    add_dependencies(clio_run_cfs_rename_test clio_run clio_cte_filesystem_runtime
+                     clio_cte_core_runtime clio_bdev_runtime)
     set_target_properties(clio_run_cfs_rename_test PROPERTIES
       CXX_STANDARD 20
       CXX_STANDARD_REQUIRED ON
@@ -274,7 +276,8 @@ if(CLIO_CORE_ENABLE_TESTS)
     )
     target_compile_definitions(clio_run_cfs_parallel_stress_test PRIVATE
       CLIO_RUN_EXE="$<TARGET_FILE:clio_run>")
-    add_dependencies(clio_run_cfs_parallel_stress_test clio_run clio_cte_filesystem_runtime)
+    add_dependencies(clio_run_cfs_parallel_stress_test clio_run clio_cte_filesystem_runtime
+                     clio_cte_core_runtime clio_bdev_runtime)
     set_target_properties(clio_run_cfs_parallel_stress_test PROPERTIES
       CXX_STANDARD 20
       CXX_STANDARD_REQUIRED ON

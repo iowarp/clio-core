@@ -196,9 +196,9 @@ bool IpcCpu2CpuZmq::RecvIn(IpcManager *ipc, u32 &tasks_received) {
       // is deserialized, so RouteTask / the worker have an active RunContext.
       future.GetTaskPtr()->BeginRunContext();
 
-      // Enqueue to worker lane
-      LaneId lane_id =
-          ipc->GetScheduler()->ClientMapTask(ipc, future);
+      // issue #781: ClientMapTask removed. Recv threads deposit on the shared
+      // ingress lane (0); the runtime maps to a worker via RuntimeMapTask.
+      LaneId lane_id = 0;
       auto *worker_queues = ipc->GetTaskQueue();
       auto &lane_ref = worker_queues->GetLane(lane_id, 0);
       lane_ref.Push(future);
